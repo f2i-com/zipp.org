@@ -31,9 +31,13 @@ class Unpickler:
         self.persistent_load = persistent_load
         self._find_class = find_class
         self.memo = {}
+        # ids of the objects REDUCE/NEWOBJ made during this load: the only
+        # ones BUILD may set state on (never a class find_class handed out).
+        self._made = set()
 
     def _read(self, n):
-        if self._pos + n > len(self._data):
+        # A negative length must never move the read position backwards.
+        if n < 0 or self._pos + n > len(self._data):
             raise UnpicklingError("pickle data was truncated")
         out = self._data[self._pos:self._pos + n]
         self._pos += n
@@ -51,7 +55,8 @@ class Unpickler:
         if module == "collections" and name == "OrderedDict":
             return OrderedDict
         if module == "builtins" and name in ("set", "frozenset", "list", "dict", "tuple", "bytearray", "complex", "range", "slice"):
-            return {"set": set, "frozenset": frozenset, "list": list, "dict": dict, "tuple": tuple, "range": range, "slice": slice}[name]
+            return {"set": set, "frozenset": frozenset, "list": list, "dict": dict, "tuple": tuple, "bytearray": bytearray,
+                    "complex": complex, "range": range, "slice": slice}[name]
         raise UnpicklingError("global %s.%s is forbidden" % (module, name))
 
     def load(self):
@@ -59,6 +64,8 @@ class Unpickler:
         metastack = []
         data = self._data
         while True:
+            if self._pos >= len(data):
+                raise EOFError("Ran out of input")
             op = data[self._pos]
             self._pos += 1
             if op == 0x80:  # PROTO
@@ -85,6 +92,8 @@ class Unpickler:
                 stack.append(_decode_long(self._read(n)))
             elif op == 0x8b:  # LONG4
                 n = struct.unpack("<i", self._read(4))[0]
+                if n < 0:
+                    raise UnpicklingError("LONG pickle has negative byte count")
                 stack.append(_decode_long(self._read(n)))
             elif op == 0x49:  # INT (text)
                 text = self._line()
@@ -111,6 +120,8 @@ class Unpickler:
                 stack.append(self._read(n).decode("latin-1"))
             elif op == 0x54:  # BINSTRING
                 n = struct.unpack("<i", self._read(4))[0]
+                if n < 0:
+                    raise UnpicklingError("BINSTRING pickle has negative byte count")
                 stack.append(self._read(n).decode("latin-1"))
             elif op == 0x43:  # SHORT_BINBYTES
                 n = self._read(1)[0]
@@ -202,19 +213,32 @@ class Unpickler:
             elif op == 0x52:  # REDUCE
                 args = stack.pop()
                 fn = stack.pop()
-                stack.append(fn(*args))
+                obj = fn(*args)
+                self._made.add(id(obj))
+                stack.append(obj)
             elif op == 0x81:  # NEWOBJ
                 args = stack.pop()
                 cls = stack.pop()
-                stack.append(_new_object(cls, args))
+                obj = _new_object(cls, args)
+                self._made.add(id(obj))
+                stack.append(obj)
             elif op == 0x92:  # NEWOBJ_EX
                 kwargs = stack.pop()
                 args = stack.pop()
                 cls = stack.pop()
-                stack.append(_new_object(cls, args, kwargs))
+                obj = _new_object(cls, args, kwargs)
+                self._made.add(id(obj))
+                stack.append(obj)
             elif op == 0x62:  # BUILD
                 state = stack.pop()
                 obj = stack[-1]
+                # State goes only onto instances this pickle created: a class,
+                # function or singleton from find_class is shared by the whole
+                # program and must not be patched by a data file.
+                if isinstance(obj, type):
+                    raise TypeError("'mappingproxy' object does not support item assignment")
+                if id(obj) not in self._made:
+                    raise UnpicklingError("BUILD is only allowed on objects created by this pickle")
                 if hasattr(obj, "__setstate__"):
                     obj.__setstate__(state)
                 elif isinstance(state, dict):

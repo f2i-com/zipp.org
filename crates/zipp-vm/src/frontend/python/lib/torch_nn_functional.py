@@ -6,7 +6,7 @@ import _zipp_tensor as _k
 
 
 def linear(x, weight, bias=None):
-    if getattr(x, "_zipp_graph", False):
+    if torch._graph_recording and getattr(x, "_zipp_graph", False):
         return x.linear(weight, bias)
     out = torch.matmul(x, weight.transpose(0, 1))
     return out if bias is None else out + bias
@@ -75,7 +75,7 @@ def _conv_pair(value, name, minimum=1):
 
 
 def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-    if getattr(x, "_zipp_graph", False):
+    if torch._graph_recording and getattr(x, "_zipp_graph", False):
         raise NotImplementedError("conv2d currently supports eager CPU tensors only")
     stride = _conv_pair(stride, "stride")
     padding = _conv_pair(padding, "padding", 0)
@@ -220,8 +220,17 @@ def binary_cross_entropy_with_logits(logits, target, weight=None, reduction="mea
 
 
 def binary_cross_entropy(probs, target, weight=None, reduction="mean"):
-    p = probs.clamp(1e-12, 1 - 1e-12)
-    loss = -(target * torch.log(p) + (1 - target) * torch.log(1 - p))
+    # PyTorch's values: each log is clamped to >= -100, so an exact 0 or 1
+    # gives a finite loss, and the gradient is (p - y) / max(p (1 - p), 1e-12),
+    # applied through a detached coefficient.
+    p = probs.detach()
+    loss = -(target * torch.log(p).clamp(min=-100) + (1 - target) * torch.log(1 - p).clamp(min=-100))
+    grad = (p - target) / torch.clamp(p * (1 - p), min=1e-12)
+    if weight is not None:
+        loss = loss * weight
+        grad = grad * weight
+    if probs.requires_grad:
+        loss = loss + (probs - p) * grad.detach()
     return loss.mean() if reduction == "mean" else loss.sum() if reduction == "sum" else loss
 
 

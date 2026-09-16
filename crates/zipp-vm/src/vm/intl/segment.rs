@@ -68,15 +68,16 @@ impl<'p> Vm<'p> {
             HeapObj::Str(js) => js.slice_units(start, end),
             _ => return Value::UNDEFINED,
         };
+        // Read off the segment's own first scalar, not by copying the whole
+        // input and walking it from 0 on every step of an iteration.
+        let word_like = crate::vm::segmenter::is_word_like_start(piece.code_points().next());
         let seg = Value::heap(self.heap.alloc_js(piece));
         let mut o = ObjMap::new();
         o.set("segment", seg);
         o.set("index", Value::num(start as f64));
         o.set("input", input);
         if granularity == "word" {
-            let text = self.display(input);
-            let wl = crate::vm::segmenter::is_word_like(&text, start);
-            o.set("isWordLike", Value::bool(wl));
+            o.set("isWordLike", Value::bool(word_like));
         }
         Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
     }

@@ -122,7 +122,6 @@ pub(crate) fn time_string(f: &[i64; 6]) -> String {
 }
 /// Parse "HH:MM[:SS[.fff]]" (separators optional) → [h,mi,s,ms,us,ns].
 pub(crate) fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
-    let s = s.trim();
     // Allow a leading "T".
     let s = s.strip_prefix(['T', 't']).unwrap_or(s);
     let b: Vec<char> = s.chars().collect();
@@ -257,9 +256,8 @@ pub(crate) fn ambiguous_with_date(s: &str) -> bool {
 /// designator (ambiguous — the grammar requires a `T`). A date-only string
 /// (e.g. "2021-08-19") is therefore rejected (no implicit midnight).
 pub(crate) fn parse_temporal_time(s: &str) -> Option<[i64; 6]> {
-    let s = s.trim();
     let main = match s.find('[') {
-        Some(i) => s[..i].trim_end(),
+        Some(i) => &s[..i],
         None => s,
     };
     // Explicit time designator "T<time>".
@@ -283,8 +281,8 @@ pub(crate) fn parse_temporal_time(s: &str) -> Option<[i64; 6]> {
     // A bare DATE carrying a UTC designator / numeric offset but NO time
     // ("2022-09-15Z", "2022-09-15+00:00", "2022-09-15-02:30") is not a valid
     // PlainTime string — the date "YYYY-MM-DD" is followed by Z/±offset, not a time.
-    if main.len() >= 10 {
-        let (date_candidate, rest) = main.split_at(10);
+    // (`split_at_checked`: byte 10 may fall inside a non-ASCII scalar.)
+    if let Some((date_candidate, rest)) = main.split_at_checked(10) {
         if parse_iso_date(date_candidate).is_some()
             && matches!(rest.chars().next(), Some('Z' | 'z' | '+' | '-'))
         {
@@ -296,7 +294,13 @@ pub(crate) fn parse_temporal_time(s: &str) -> Option<[i64; 6]> {
 
 /// Parse "YYYY-MM-DD[THH:MM:SS.fff]" → [y,mo,d,h,mi,s,ms,us,ns] (time defaults 0).
 pub(crate) fn parse_iso_datetime(s: &str) -> Option<[i64; 9]> {
-    let s = s.trim();
+    // The separator is searched for only BEFORE the annotation suffix: a
+    // date-only "2020-01-01[UTC]" or "…[u-ca=ethiopic]" has a `t` inside its
+    // brackets, and splitting there left "2020-01-01[U" as the date.
+    let s = match s.find('[') {
+        Some(i) => &s[..i],
+        None => s,
+    };
     let (date_s, time_s) = match s.find(['T', 't']) {
         Some(i) => (&s[..i], Some(&s[i + 1..])),
         None => match s.find(' ') {
@@ -380,7 +384,6 @@ pub(crate) fn parse_offset_ns(s: &str) -> Option<i128> {
 
 /// Parse an ISO instant string ("…Z" or "…±HH:MM") → epoch nanoseconds (UTC).
 pub(crate) fn instant_str_to_ns(s: &str) -> Option<i128> {
-    let s = s.trim();
     // Drop a trailing [...] annotation block (its validity is enforced upstream by
     // temporal_string_ok); the remaining "main" must be DateTime + (Z | numeric UTC
     // offset) with NOTHING after the designator.
@@ -480,7 +483,6 @@ pub(crate) fn parse_month_code_syntax(s: &str) -> Option<(i64, bool)> {
 
 /// Parse "YYYY-MM" (or a fuller ISO date) → (year, month, referenceISODay).
 pub(crate) fn parse_iso_year_month(s: &str) -> Option<(i64, i64, i64)> {
-    let s = s.trim();
     if let Some((y, m, d)) = parse_iso_date(s) {
         return Some((y, m, d));
     }
@@ -503,10 +505,7 @@ pub(crate) fn parse_iso_year_month(s: &str) -> Option<(i64, i64, i64)> {
     let y = sign * yv;
     let after = &rest[ylen..];
     let after = after.strip_prefix('-').unwrap_or(after);
-    if after.len() < 2 {
-        return None;
-    }
-    let m = after[..2].parse::<i64>().ok()?;
+    let m = two_ascii_digits(after)?;
     if !(1..=12).contains(&m) {
         return None;
     }
@@ -522,23 +521,16 @@ pub(crate) fn parse_iso_year_month(s: &str) -> Option<(i64, i64, i64)> {
 
 /// Parse "MM-DD" / "--MM-DD" (or a fuller ISO date) → (referenceISOYear, month, day).
 pub(crate) fn parse_iso_month_day(s: &str) -> Option<(i64, i64, i64)> {
-    let s = s.trim();
     // A full date string yields its month/day with the ISO reference year 1972
     // (a leap year, so "02-29" stays valid), NOT the string's own year.
     if let Some((_, m, d)) = parse_iso_date(s) {
         return Some((1972, m, d));
     }
     let body = s.strip_prefix("--").unwrap_or(s);
-    if body.len() < 4 {
-        return None;
-    }
-    let m = body.get(..2)?.parse::<i64>().ok()?;
+    let m = two_ascii_digits(body)?;
     let after = &body[2..];
     let after = after.strip_prefix('-').unwrap_or(after);
-    if after.len() < 2 {
-        return None;
-    }
-    let d = after[..2].parse::<i64>().ok()?;
+    let d = two_ascii_digits(after)?;
     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(1972, m) {
         return None;
     }
@@ -587,6 +579,103 @@ pub(crate) struct NumFmtParams<'a> {
     /// property of the WHOLE integer part, not of the leading group: 1000000
     /// still groups fully even though its leading group is one digit.
     pub group_min2: bool,
+}
+
+/// An Intl mathematical value (ECMA-402 ToIntlMathematicalValue): a Number, or
+/// the EXACT decimal a BigInt or a decimal numeric string denotes. Formatting a
+/// BigInt through f64 printed 1234567890123456789n as "…456,800".
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum IntlMv {
+    Num(f64),
+    /// A finite, nonzero decimal: the sign, the integer digits (no leading
+    /// zeros; "0" when there are none) and the fraction digits.
+    Dec {
+        neg: bool,
+        int: String,
+        frac: String,
+    },
+}
+
+impl IntlMv {
+    pub(crate) fn is_nan(&self) -> bool {
+        matches!(self, IntlMv::Num(n) if n.is_nan())
+    }
+
+    /// The exact decimal of a decimal StrNumericLiteral whose Number value is
+    /// `number` (already computed by ToNumber, which validated the grammar).
+    /// Only a finite, nonzero value keeps its digits: an overflow is ±∞ and an
+    /// underflow ±0 exactly as the Number is, and a non-decimal literal
+    /// ("0x1F", "Infinity") stays the Number.
+    pub(crate) fn from_numeric_string(s: &str, number: f64) -> IntlMv {
+        if !number.is_finite() || number == 0.0 {
+            return IntlMv::Num(number);
+        }
+        parse_decimal_literal(s).unwrap_or(IntlMv::Num(number))
+    }
+
+    /// The exact decimal of a BigInt's base-10 string ("-123").
+    pub(crate) fn from_bigint_string(s: &str) -> IntlMv {
+        let (neg, digits) = match s.strip_prefix('-') {
+            Some(d) => (true, d),
+            None => (false, s),
+        };
+        let int = digits.trim_start_matches('0');
+        if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) {
+            return IntlMv::Num(0.0);
+        }
+        IntlMv::Dec {
+            neg,
+            int: int.to_string(),
+            frac: String::new(),
+        }
+    }
+}
+
+/// `[+-] digits [. digits] [(e|E) [+-] digits]`, surrounded by whitespace, as an
+/// exact (integer, fraction) decimal. `None` for anything else.
+fn parse_decimal_literal(s: &str) -> Option<IntlMv> {
+    let t = s.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-')));
+    let (neg, t) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let (mantissa, exp) = match t.find(['e', 'E']) {
+        Some(i) => (&t[..i], t[i + 1..].parse::<i64>().ok()?),
+        None => (t, 0),
+    };
+    let (ip, fp) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if ip.is_empty() && fp.is_empty() || !ip.bytes().chain(fp.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // value = ip.fp × 10^exp: move the point `exp` places right.
+    let digits = format!("{ip}{fp}");
+    let point = (ip.len() as i64).checked_add(exp)?;
+    if point.unsigned_abs() > digits.len() as u64 + 1100 {
+        return None; // far outside the Number range the caller already checked
+    }
+    let (int, frac) = if point <= 0 {
+        (
+            "0".to_string(),
+            format!("{}{digits}", "0".repeat((-point) as usize)),
+        )
+    } else if point as usize >= digits.len() {
+        (
+            format!("{digits}{}", "0".repeat(point as usize - digits.len())),
+            String::new(),
+        )
+    } else {
+        (
+            digits[..point as usize].to_string(),
+            digits[point as usize..].to_string(),
+        )
+    };
+    let int = match int.trim_start_matches('0') {
+        "" => "0".to_string(),
+        t => t.to_string(),
+    };
+    let frac = frac.trim_end_matches('0').to_string();
+    Some(IntlMv::Dec { neg, int, frac })
 }
 
 /// The decimal digits a non-negative finite f64 rounds from, as (integer,
@@ -748,9 +837,13 @@ fn decimal_exponent(int_s: &str, frac_s: &str) -> i64 {
     }
 }
 
-/// Round to a multiple of `inc` at fraction position `k`. The scaled value is
-/// held in i128, which covers every roundingIncrement the spec allows against a
-/// realistic magnitude; anything wider falls back to plain rounding.
+/// Round to a multiple of `inc` at fraction position `k`, exactly, at any
+/// magnitude. Every roundingIncrement the spec allows (1, 2, 5 … 5000) has
+/// `2 × inc` dividing 10^5, so the scaled value's position against `inc` — the
+/// offset from the lower multiple and that multiple's parity — lives entirely
+/// in its last five digits. The prefix above them only ever takes a carry.
+/// (The i128 this used to parse into became 0 above ~1.7e38, so 1e19 at 20
+/// fraction digits printed "0.000…".)
 fn round_to_increment(
     int_s: &str,
     frac_s: &str,
@@ -758,6 +851,8 @@ fn round_to_increment(
     inc: i64,
     mode: &str,
 ) -> Option<(String, String)> {
+    const TAIL: usize = 5;
+    const TAIL_MOD: i64 = 100_000;
     let k = k.max(0) as usize;
     let mut scaled = String::from(int_s);
     let f: String = frac_s
@@ -766,10 +861,18 @@ fn round_to_increment(
         .take(k)
         .collect();
     scaled.push_str(&f);
-    let q: i128 = scaled.trim_start_matches('0').parse().unwrap_or(0);
+    if !(1..=5000).contains(&inc) || TAIL_MOD % (2 * inc) != 0 {
+        return None;
+    }
+    let split = scaled.len().saturating_sub(TAIL);
+    let (prefix, tail) = scaled.split_at(split);
+    let q: i64 = if tail.is_empty() {
+        0
+    } else {
+        tail.parse().ok()?
+    };
     let rest = &frac_s[k.min(frac_s.len())..];
     let rest_nonzero = rest.bytes().any(|b| b != b'0');
-    let inc = inc as i128;
     let lo = (q / inc) * inc;
     // Where the value sits relative to the MIDPOINT of [lo, lo+inc]. The exact
     // distance from `lo` is `off + 0.rest`, so the comparison is
@@ -811,7 +914,19 @@ fn round_to_increment(
     } else {
         lo
     };
-    let mut s = v.to_string();
+    // Reassemble: the prefix digits, bumped on a carry out of the tail.
+    let mut digits: Vec<u8> = prefix.bytes().map(|b| b - b'0').collect();
+    if v >= TAIL_MOD {
+        bump(&mut digits);
+    }
+    let mut s: String = digits.iter().map(|d| (d + b'0') as char).collect();
+    s.push_str(&format!("{:05}", v % TAIL_MOD));
+    let s = s.trim_start_matches('0');
+    let mut s = if s.is_empty() {
+        "0".to_string()
+    } else {
+        s.to_string()
+    };
     while s.len() <= k {
         s.insert(0, '0');
     }
@@ -887,6 +1002,16 @@ fn compact_affix(exponent: i64, int_s: &str, frac_s: &str, display: &str) -> &'s
 /// sign display, then en-US decoration ("," grouping, "." decimal; percent
 /// multiplies by 100).
 pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
+    format_intl_mv(&IntlMv::Num(n), p)
+}
+
+/// `format_number_intl` over an Intl mathematical value, so a BigInt or a
+/// numeric string rounds from its exact digits.
+pub(crate) fn format_intl_mv(v: &IntlMv, p: &NumFmtParams) -> String {
+    let (n, exact) = match v {
+        IntlMv::Num(n) => (*n, None),
+        IntlMv::Dec { neg, int, frac } => (if *neg { -1.0 } else { 1.0 }, Some((int, frac))),
+    };
     // The sign comes from the INPUT, so -0.0001 rounded to "0" still prints
     // "-0" under signDisplay "auto"; only exceptZero/negative consult the
     // ROUNDED magnitude (below).
@@ -927,23 +1052,28 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
         };
         format!("{sign}{body}")
     };
+    // The percent pattern wraps every body, NaN's included ("NaN%").
+    let pct = if p.style == "percent" { "%" } else { "" };
     if n.is_nan() {
-        return decorate("NaN".to_string(), false, false, true);
+        return decorate(format!("NaN{pct}"), false, false, true);
     }
-    let mut x = n.abs();
-    if p.style == "percent" {
-        x *= 100.0;
-    }
-    if x.is_infinite() {
-        let body = if p.style == "percent" {
-            "∞%".to_string()
-        } else {
-            "∞".to_string()
-        };
-        return decorate(body, neg, false, false);
+    if n.is_infinite() {
+        return decorate(format!("∞{pct}"), neg, false, false);
     }
     let mode = fold_rounding_mode(p.rounding_mode, neg);
-    let (int_s, frac_s) = exact_decimal(x);
+    let (int_s, frac_s) = match exact {
+        Some((i, f)) => (i.clone(), f.clone()),
+        None => exact_decimal(n.abs()),
+    };
+    // Percent is 100 × the mathematical value, so the point moves two places in
+    // the DECIMAL string. Multiplying the f64 first rounded ties the wrong way
+    // (0.145 × 100 is 14.499999999999998, formatted "14%") and overflowed a
+    // finite 1e307 to "∞%".
+    let (int_s, frac_s) = if p.style == "percent" {
+        shift_decimal(&int_s, &frac_s, -2)
+    } else {
+        (int_s, frac_s)
+    };
     // ComputeExponent (ECMA-402 15.5.11): scientific puts one digit before the
     // point, engineering rounds that exponent down to a multiple of three. The
     // mantissa is produced by SHIFTING the decimal string, not by dividing —
@@ -1110,9 +1240,7 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
             res.push_str(&e.abs().to_string());
         }
     }
-    if p.style == "percent" {
-        res.push('%');
-    }
+    res.push_str(pct);
     decorate(res, neg, is_zero, false)
 }
 
@@ -1757,9 +1885,20 @@ pub(crate) fn iso_day_of_week(y: i64, m: i64, d: i64) -> i64 {
     let ed = iso_to_epoch_days(y, m, d);
     (((ed % 7) + 3) % 7 + 7) % 7 + 1
 }
+/// The two-digit ISO field (month, day) at the start of `s`. Both BYTES must be
+/// ASCII digits: slicing `s[..2]` would panic when a multi-byte scalar starts at
+/// byte 1, and `str::parse` would also take a sign ("+1").
+fn two_ascii_digits(s: &str) -> Option<i64> {
+    match s.as_bytes() {
+        [a, b, ..] if a.is_ascii_digit() && b.is_ascii_digit() => {
+            Some(((a - b'0') * 10 + (b - b'0')) as i64)
+        }
+        _ => None,
+    }
+}
+
 /// Parse "YYYY-MM-DD" (optionally with time/zone/calendar suffix) → (y,m,d).
 pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
-    let s = s.trim();
     // Optional leading sign for expanded years (±YYYYYY).
     let bytes = s.as_bytes();
     let (sign, rest) = match bytes.first() {
@@ -1784,17 +1923,11 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
     let after = &rest[ylen..];
     let had_ym_sep = after.starts_with('-');
     let after = after.strip_prefix('-').unwrap_or(after);
-    if after.len() < 2 {
-        return None;
-    }
-    let m = after[..2].parse::<i64>().ok()?;
+    let m = two_ascii_digits(after)?;
     let after = &after[2..];
     let had_md_sep = after.starts_with('-');
     let after = after.strip_prefix('-').unwrap_or(after);
-    if after.len() < 2 {
-        return None;
-    }
-    let d = after[..2].parse::<i64>().ok()?;
+    let d = two_ascii_digits(after)?;
     // The year-month and month-day separators must match — both '-' (extended) or
     // both absent (basic). Reject mixed forms "2020-0101" / "202001-01".
     if had_ym_sep != had_md_sep {
@@ -1966,7 +2099,6 @@ pub(crate) fn duration_to_string_opts(f: &[f64; 10], digits: i32, mode: &str) ->
 /// Parse an ISO-8601 duration string into `[y,mo,w,d,h,mi,s,ms,us,ns]`. Handles
 /// integer date/time units and a fractional seconds field. `None` if malformed.
 pub(crate) fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
-    let s = s.trim();
     let (sign, rest) = match s.strip_prefix('-') {
         Some(r) => (-1i64, r),
         None => (1, s.strip_prefix('+').unwrap_or(s)),

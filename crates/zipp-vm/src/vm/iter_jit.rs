@@ -38,10 +38,11 @@ pub(crate) fn tierc_iter_enabled() -> bool {
 }
 
 /// `GetIterator { dst, src }` — the pristine dense-array identity subset. All
-/// four proofs are pure reads: no own `@@iterator` (or any named override) on
+/// five proofs are pure reads: no own `@@iterator` (or any named override) on
 /// the array, the DEFAULT `%Array.prototype%` link, `%Array.prototype%`'s own
-/// `@@iterator` being the pristine data method, and the pristine
-/// `%ArrayIteratorPrototype%.next`. Anything else — including the observable
+/// `@@iterator` being the pristine data method, the pristine
+/// `%ArrayIteratorPrototype%.next`, and no `return` reachable from it for a
+/// `break` to call. Anything else — including the observable
 /// replaced-iterator call and every non-array iterable — declines so the
 /// interpreter performs the real protocol exactly once.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -73,9 +74,17 @@ pub(crate) extern "win64" fn jit_get_iterator(vm: *mut core::ffi::c_void, v_bits
                 _ => false,
             }
         };
-        if !pristine_data(vm.arr_proto, "@@iterator", vm.default_array_iter)
-            || !pristine_data(vm.array_iter_proto, "next", vm.default_array_iter_next)
-        {
+        // The last two proofs include no `return` reachable for a `break` to
+        // call: only a real iterator carries one (the interpreter arm makes
+        // it). The root realm serves all three from the version memos.
+        let proven = if vm.realm_global_objs.is_empty() {
+            vm.builtin_iter_fast(v, true)
+        } else {
+            pristine_data(vm.arr_proto, "@@iterator", vm.default_array_iter)
+                && pristine_data(vm.array_iter_proto, "next", vm.default_array_iter_next)
+                && vm.array_iter_proto_pristine()
+        };
+        if !proven {
             return crate::codegen::SELF_CALL_DEOPT;
         }
         v_bits

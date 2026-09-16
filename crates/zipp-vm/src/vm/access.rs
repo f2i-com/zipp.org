@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+use super::props::ClassLookup;
 use super::*;
 use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
@@ -376,7 +377,8 @@ impl<'p> Vm<'p> {
         if !Self::delete_fastpath_key_ok(key) {
             return None;
         }
-        if !matches!(self.heap.get(idx), HeapObj::Object(m) if !m.is_ctor && m.class.is_none()) {
+        if !matches!(self.heap.get(idx), HeapObj::Object(m) if !m.is_ctor && m.class.is_none() && !m.class_proto)
+        {
             return None;
         }
         if (idx == self.global_this && self.global_this != 0)
@@ -446,6 +448,12 @@ impl<'p> Vm<'p> {
                 if !m.attr_at(i).configurable {
                     return Value::bool(false);
                 }
+                // Deleting a member a class declares from its prototype
+                // retires the class's member tables.
+                if m.class_proto {
+                    self.note_class_proto_mutation(idx, Some(key));
+                }
+                self.note_ctor_name_mutation(idx, key);
             }
         }
         // `delete globalThis.X` for a built-in global (Number/Date/…): these live in
@@ -629,11 +637,14 @@ impl<'p> Vm<'p> {
             if let Some(i) = canonical_u32_key(key) {
                 let i = i as usize;
                 // A sealed/frozen array's existing elements are non-configurable,
-                // so an in-bounds index can't be deleted (an out-of-range index is
-                // not an own property and deletes vacuously).
-                let in_bounds =
-                    matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len());
-                if in_bounds
+                // so a present index can't be deleted (an out-of-range index or a
+                // HOLE is not an own property and deletes vacuously; an override
+                // on a hole placeholder is judged by its own attributes below).
+                let present = matches!(
+                    self.heap.get(idx),
+                    HeapObj::Array(items) if i < items.len() && !items[i].is_hole()
+                );
+                if present
                     && self
                         .arr_props
                         .get(&idx)
@@ -1012,9 +1023,11 @@ impl<'p> Vm<'p> {
         // `m.class.is_some()` is load-bearing: a class instance resolves
         // accessors through its ClassData, which `proto_chain_blocks_set` does
         // not walk, so `class C { set x(v){…} }` would be appended over.
+        // `m.class_proto` too: a class prototype's writes must reach the general
+        // path, which records when they make the class's member tables stale.
         matches!(
             self.heap.get(oi),
-            HeapObj::Object(m) if m.extensible && !m.is_ctor && m.class.is_none()
+            HeapObj::Object(m) if m.extensible && !m.is_ctor && m.class.is_none() && !m.class_proto
         )
     }
 
@@ -1056,7 +1069,14 @@ impl<'p> Vm<'p> {
     /// property makes the write fail). `None` means the chain is not walkable
     /// cheaply (a proxy or exotic link) and the caller must take the slow path.
     fn proto_chain_blocks_set(&self, oi: u32, key: &str) -> Option<bool> {
-        let mut cur = self.proto_of.get(&oi).copied();
+        self.proto_chain_blocks_set_from(self.proto_of.get(&oi).copied(), key)
+    }
+
+    /// [`Self::proto_chain_blocks_set`] from an explicit starting prototype:
+    /// a class instance asks from the tail of its class prototypes, where the
+    /// tables have already answered for every declared member.
+    fn proto_chain_blocks_set_from(&self, start: Option<Value>, key: &str) -> Option<bool> {
+        let mut cur = start;
         let mut hops = 0;
         while let Some(p) = cur {
             if p.is_null() || !p.is_heap() {
@@ -1080,6 +1100,12 @@ impl<'p> Vm<'p> {
             }
             if !self.arr_props.is_empty() && self.arr_props.contains_key(&pi) {
                 return None;
+            }
+            // %Object.prototype% ends every ordinary chain, and the tail check
+            // below is this same probe: answer now rather than walk to it and
+            // repeat the lookup (this is the hot `this.x = v` path).
+            if pi == self.obj_proto {
+                return Some(false);
             }
             cur = self.proto_of.get(&pi).copied();
         }
@@ -1304,6 +1330,12 @@ impl<'p> Vm<'p> {
         }
         let idx = obj.heap_index();
         self.materialize_regexp_result_prop_for_key(idx, key);
+        // A class's materialized prototype: writing a member its class declares
+        // retires the class's member tables (`note_class_proto_mutation`) before
+        // any instance can observe the new value.
+        if matches!(self.heap.get(idx), HeapObj::Object(m) if m.class_proto) {
+            self.note_class_proto_mutation(idx, Some(key));
+        }
         // A Module Namespace exotic: [[Set]] ALWAYS returns false — strict
         // assignment TypeError, sloppy no-op, even for the SAME value.
         if self.module_namespaces.contains_key(&idx) {
@@ -1419,6 +1451,8 @@ impl<'p> Vm<'p> {
             if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
                 *last_index = val;
             }
+            // The RegExp is usually old by the time its lastIndex is assigned.
+            self.heap.write_barrier_val(idx, val);
             return Ok(true);
         }
         if key == "length"
@@ -1623,65 +1657,69 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
         ) && !self.has_own_property(obj, key));
         if needs_proto_walk {
-            match self.proto_chain_set(idx, key, val, obj)? {
-                ProtoSet::Setter(setter) => {
-                    self.call_value(setter, obj, &[val])?;
-                    return Ok(true);
-                }
-                ProtoSet::GetterOnly => return self.reject_write(key, strict),
-                ProtoSet::Proxy(true) => return Ok(true), // chain proxy's set trap handled it
-                ProtoSet::Absorbed => return Ok(true),    // TA chain node absorbed the index
-                ProtoSet::Proxy(false) => return self.reject_write(key, strict),
-                ProtoSet::NonWritable => return self.reject_write(key, strict),
-                ProtoSet::DataWrite => {
-                    // The chain walk may have run user code — a proxy's missing
-                    // `set` trap is looked up on the HANDLER, whose getters fire
-                    // — that defined an own `key` on the receiver meanwhile.
-                    // OrdinarySetWithOwnDescriptor consults the receiver's own
-                    // descriptor AFTER the walk: an accessor, or a non-writable
-                    // data property, now present rejects the write
-                    // (staging/sm/Proxy/regress-bug1062349).
-                    let now_own = match self.heap.get(idx) {
-                        HeapObj::Object(m) => m.pos(key).map(|i| m.attr_at(i)),
-                        HeapObj::Func(_)
-                        | HeapObj::Closure { .. }
-                        | HeapObj::Bound { .. }
-                        | HeapObj::Wrapped { .. }
-                        | HeapObj::Native(_)
-                        | HeapObj::NativeClosure { .. }
-                        | HeapObj::Class(_) => None,
-                        _ => self
-                            .arr_props
-                            .get(&idx)
-                            .and_then(|m| m.pos(key).map(|i| m.attr_at(i))),
-                    };
-                    if let Some(a) = now_own {
-                        if a.accessor || !a.writable {
-                            return self.reject_write(key, strict);
-                        }
-                    }
-                }
+            let r = self.proto_chain_set(idx, key, val, obj)?;
+            if let Some(done) = self.finish_inherited_set(r, idx, obj, key, val, strict)? {
+                return Ok(done);
             }
         }
-        // A class instance with an inherited `set x(v)` accessor: assigning a
-        // property that is NOT an own data property invokes the setter (own data
-        // properties shadow an inherited accessor, per JS [[Set]]).
-        if let HeapObj::Object(map) = self.heap.get(idx) {
-            if map.class.is_some() && map.get(key).is_none() {
-                if let Some(setter) = self.lookup_setter(map.class, key) {
+        // A class instance writing a key it does not own: OrdinarySet over its
+        // prototype chain, whose DECLARED members the class's member tables
+        // answer while they still describe it (an own data property shadows
+        // an inherited one, per JS [[Set]]).
+        let class_inst = match self.heap.get(idx) {
+            HeapObj::Object(map) if map.get(key).is_none() => map.class,
+            _ => None,
+        };
+        if let Some(class) = class_inst {
+            if is_private_key(key) {
+                if let Some(setter) = self.lookup_setter(Some(class), key) {
                     self.call_value(setter, obj, &[val])?;
                     return Ok(true);
                 }
                 // A PRIVATE method or getter-only accessor is not assignable:
                 // `this.#m = v` / `this.#g = v` (incl. compound assignment) throws
-                // TypeError. Gated on a private key — a public method is a writable
-                // prototype data property and stays shadowable, and a private FIELD
-                // is an own data property (so map.get(key) is Some and this branch
-                // is skipped, leaving it writable).
-                if is_private_key(key) && self.lookup_instance_method_or_getter(map.class, key) {
+                // TypeError. A private FIELD is an own data property (so
+                // map.get(key) is Some and this branch is skipped, leaving it
+                // writable).
+                if self.lookup_instance_method_or_getter(Some(class), key) {
                     return Err(Thrown(format!(
                         "TypeError: Cannot write to private member '{key}': it is a method or a getter-only accessor"
                     )));
+                }
+            } else {
+                let walk_from = match self.class_member_lookup(idx, class, key) {
+                    // A declared accessor governs the write: its setter runs; a
+                    // getter-only one rejects it (strict TypeError).
+                    ClassLookup::Accessor { setter, .. } => {
+                        if setter != Value::UNDEFINED {
+                            self.call_value(setter, obj, &[val])?;
+                            return Ok(true);
+                        }
+                        return self.reject_write(key, strict);
+                    }
+                    // A declared method is a writable data property: shadow it.
+                    ClassLookup::Method(_) => None,
+                    // The tables stopped describing the chain: walk it live.
+                    ClassLookup::Live(p) => Some(p),
+                    // No level declares `key`, and every level's prototype still
+                    // matches its tables (an undeclared accessor or non-writable
+                    // property retires a level), so only the chain beyond the
+                    // class prototypes can intercept. Probe that tail cheaply
+                    // first: for the common `this.x = v` on a fresh instance
+                    // nothing there does, and the walk is pure cost.
+                    ClassLookup::Miss => {
+                        let tail = self.class_chain_tail_proto(class);
+                        match self.proto_chain_blocks_set_from(Some(tail), key) {
+                            Some(false) => None,
+                            _ => Some(tail),
+                        }
+                    }
+                };
+                if let Some(start) = walk_from {
+                    let r = self.proto_chain_set_from(start, key, val, obj)?;
+                    if let Some(done) = self.finish_inherited_set(r, idx, obj, key, val, strict)? {
+                        return Ok(done);
+                    }
                 }
             }
         }
@@ -1797,21 +1835,20 @@ impl<'p> Vm<'p> {
                         self.heap.bump_version(idx);
                         return Ok(true);
                     }
-                    // A NEW index (past the current length) on a non-extensible array
-                    // adds an own property → rejected (sloppy no-op / strict TypeError).
-                    // An in-range index is already present and stays writable.
-                    let present =
-                        matches!(self.heap.get(idx), HeapObj::Array(items) if n < items.len());
-                    // Extending past the current length grows `length`; a non-writable
-                    // `length` (defineProperty / freeze) rejects that — Array
-                    // [[DefineOwnProperty]]: index >= oldLen && length non-writable →
-                    // false. (An index below a sparse array's VIRTUAL length doesn't
-                    // grow it.)
-                    if !present
-                        && (self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
-                            || (self.array_length_nonwritable.contains(&idx)
-                                && n >= self.js_array_len(idx)))
-                    {
+                    // The integrity level, through the SAME predicate the
+                    // numeric-key `set_index` path uses: a frozen element is
+                    // non-writable, and a new index (past the length, or a HOLE)
+                    // on a non-extensible array — or past a non-writable
+                    // `length` — adds an own property [[DefineOwnProperty]]
+                    // refuses. This branch used to omit the FROZEN case, which
+                    // only a STRING-keyed write reaches, so
+                    // `Object.assign(Object.freeze([1,2]), {0:5})` and
+                    // `new Proxy(frozen, {})["0"] = 5` overwrote the element.
+                    let present = matches!(
+                        self.heap.get(idx),
+                        HeapObj::Array(items) if n < items.len() && !items[n].is_hole()
+                    );
+                    if self.array_index_write_rejected(idx, n) {
                         return self.reject_write(key, strict);
                     }
                     // Past the eager-materialization cap AND the dense prefix:
@@ -2065,6 +2102,78 @@ impl<'p> Vm<'p> {
         self.proto_chain_set_from(start, key, val, receiver)
     }
 
+    /// Settle an inherited-chain [[Set]] verdict for receiver `obj` (heap `idx`):
+    /// `Some(result)` when the verdict decides the write, `None` when the
+    /// caller's own-data write should proceed.
+    fn finish_inherited_set(
+        &mut self,
+        r: ProtoSet,
+        idx: u32,
+        obj: Value,
+        key: &str,
+        val: Value,
+        strict: bool,
+    ) -> Result<Option<bool>, Thrown> {
+        match r {
+            ProtoSet::Setter(setter) => {
+                self.call_value(setter, obj, &[val])?;
+                Ok(Some(true))
+            }
+            ProtoSet::GetterOnly | ProtoSet::Proxy(false) | ProtoSet::NonWritable => {
+                self.reject_write(key, strict).map(Some)
+            }
+            // A chain proxy's set trap handled it / a TA chain node absorbed the index.
+            ProtoSet::Proxy(true) | ProtoSet::Absorbed => Ok(Some(true)),
+            ProtoSet::DataWrite => {
+                // The chain walk may have run user code — a proxy's missing
+                // `set` trap is looked up on the HANDLER, whose getters fire
+                // — that defined an own `key` on the receiver meanwhile.
+                // OrdinarySetWithOwnDescriptor consults the receiver's own
+                // descriptor AFTER the walk: an accessor, or a non-writable
+                // data property, now present rejects the write
+                // (staging/sm/Proxy/regress-bug1062349).
+                let now_own = match self.heap.get(idx) {
+                    HeapObj::Object(m) => m.pos(key).map(|i| m.attr_at(i)),
+                    HeapObj::Func(_)
+                    | HeapObj::Closure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Wrapped { .. }
+                    | HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. }
+                    | HeapObj::Class(_) => None,
+                    _ => self
+                        .arr_props
+                        .get(&idx)
+                        .and_then(|m| m.pos(key).map(|i| m.attr_at(i))),
+                };
+                if let Some(a) = now_own {
+                    if a.accessor || !a.writable {
+                        return self.reject_write(key, strict).map(Some);
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// The `[[Prototype]]` of the prototype object of the farthest CLASS on
+    /// `class`'s extends chain — where a class instance's prototype chain leaves
+    /// the class prototypes (%Object.prototype%, a built-in parent's prototype,
+    /// or null for `extends null`).
+    fn class_chain_tail_proto(&mut self, class: u32) -> Value {
+        let mut last = class;
+        while let HeapObj::Class(c) = self.heap.get(last) {
+            match c.parent {
+                Some(p) if matches!(self.heap.get(p), HeapObj::Class(_)) => last = p,
+                _ => break,
+            }
+        }
+        match self.prototype_of(Value::heap(last)) {
+            Some(p) => self.object_get_prototype_of(p),
+            None => Value::NULL,
+        }
+    }
+
     /// `proto_chain_set` starting AT `cur` itself (inclusive) — the entry point
     /// for a PRIMITIVE-base [[Set]], whose walk begins at the primitive's
     /// wrapper prototype (the conceptual ToObject(base)'s [[Prototype]]).
@@ -2075,6 +2184,9 @@ impl<'p> Vm<'p> {
         val: Value,
         receiver: Value,
     ) -> Result<ProtoSet, Thrown> {
+        // Parsed ONCE: the walk below consults it at every chain node, and
+        // `canonical_index_str` allocates on a key that does parse.
+        let key_index = canonical_index_str(key);
         for _ in 0..1000 {
             if !cur.is_heap() {
                 return Ok(ProtoSet::DataWrite);
@@ -2111,28 +2223,140 @@ impl<'p> Vm<'p> {
                     ProtoSet::Absorbed
                 });
             }
-            if let HeapObj::Object(m) = self.heap.get(cidx) {
-                if let Some(i) = m.pos(key) {
-                    let a = m.attr_at(i);
-                    if a.accessor {
-                        return Ok(if a.setter != Value::UNDEFINED {
-                            ProtoSet::Setter(a.setter)
-                        } else {
-                            ProtoSet::GetterOnly
-                        });
-                    }
-                    // An inherited WRITABLE data property is shadowed by an own
-                    // write; a NON-WRITABLE one rejects the write (OrdinarySet).
-                    return Ok(if a.writable {
-                        ProtoSet::DataWrite
-                    } else {
+            // An ARRAY chain node's dense element is an own data property too,
+            // but it lives in the backing Vec rather than an ObjMap, so the
+            // probe below never saw it. Its writability is the array's integrity
+            // level: a FROZEN element rejects the write instead of being
+            // shadowed (`Object.create(Object.freeze([1,2]))[0] = 9`). An index
+            // carrying a `defineProperty` override keeps the pre-existing
+            // fall-through — its attributes are not consulted here.
+            if let Some(i) = key_index {
+                let present = matches!(
+                    self.heap.get(cidx),
+                    HeapObj::Array(items) if i < items.len() && !items[i].is_hole()
+                );
+                if present && self.array_index_override(cidx, i).is_none() {
+                    return Ok(if self.array_index_write_rejected(cidx, i) {
                         ProtoSet::NonWritable
+                    } else {
+                        ProtoSet::DataWrite
                     });
                 }
+            }
+            let own = match self.heap.get(cidx) {
+                HeapObj::Object(m) => m.pos(key).map(|i| m.attr_at(i)),
+                // A function, class, array or other exotic chain node keeps its
+                // own properties in a side table or synthesizes them: its
+                // accessors and non-writable data properties govern the write
+                // exactly as an ordinary prototype's do.
+                _ => self.exotic_own_attr(cidx, key),
+            };
+            if let Some(a) = own {
+                if a.accessor {
+                    return Ok(if a.setter != Value::UNDEFINED {
+                        ProtoSet::Setter(a.setter)
+                    } else {
+                        ProtoSet::GetterOnly
+                    });
+                }
+                // An inherited WRITABLE data property is shadowed by an own
+                // write; a NON-WRITABLE one rejects the write (OrdinarySet).
+                return Ok(if a.writable {
+                    ProtoSet::DataWrite
+                } else {
+                    ProtoSet::NonWritable
+                });
             }
             cur = self.object_get_prototype_of(cur);
         }
         Ok(ProtoSet::DataWrite)
+    }
+
+    /// The attributes of the own property `key` of a NON-ordinary object
+    /// (anything but `HeapObj::Object`), classified as
+    /// `object_get_own_property_descriptor` classifies it — attributes only,
+    /// which is all the [[Set]] walk needs (an accessor's setter rides in
+    /// `PropAttr::setter`). Proxies and TypedArray indices are the walk's own
+    /// cases and never reach here.
+    fn exotic_own_attr(&mut self, idx: u32, key: &str) -> Option<PropAttr> {
+        let obj = Value::heap(idx);
+        let data = |writable: bool| PropAttr {
+            writable,
+            enumerable: false,
+            configurable: false,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        // A callable's synthesized `name`/`length` and a legacy sloppy
+        // function's `caller`/`arguments` are non-writable.
+        if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
+            return Some(data(false));
+        }
+        if self.fn_has_legacy_caller_prop(idx, key)
+            && self.fn_props.get(&idx).map_or(true, |m| m.pos(key).is_none())
+        {
+            return Some(data(false));
+        }
+        // `prototype`: writable on a function, non-writable on a class
+        // (`callable_has_prototype` is exactly when `prototype_of` would
+        // synthesize one, so it need not be materialized here).
+        if key == "prototype" && self.callable_has_prototype(obj) {
+            let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
+            return Some(data(!is_class || self.fn_proto_override.contains_key(&idx)));
+        }
+        // A String wrapper's index/`length` and a RegExp's `lastIndex`.
+        if let Some((_, len)) = self.string_exotic_chars(obj) {
+            if key == "length"
+                || key
+                    .parse::<usize>()
+                    .is_ok_and(|i| i.to_string() == key && i < len)
+            {
+                return Some(data(false));
+            }
+        }
+        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+            return Some(data(self.regexp_last_index_writable(idx)));
+        }
+        let side = |m: &ObjMap| m.pos(key).map(|i| m.attr_at(i));
+        match self.heap.get(idx) {
+            HeapObj::Array(items) => {
+                if key == "length" && !self.arguments_objs.contains_key(&idx) {
+                    return Some(data(!self.array_length_nonwritable.contains(&idx)));
+                }
+                if let Some(a) = self.arr_props.get(&idx).and_then(side) {
+                    return Some(a);
+                }
+                match key.parse::<usize>() {
+                    Ok(i) if i.to_string() == key && i < items.len() && !items[i].is_hole() => {
+                        let frozen = self.arr_props.get(&idx).is_some_and(|m| m.frozen);
+                        Some(data(!frozen))
+                    }
+                    _ => None,
+                }
+            }
+            HeapObj::Class(_) if is_private_key(key) => None,
+            HeapObj::Class(c) => {
+                if let Some(a) = side(&c.statics) {
+                    return Some(a);
+                }
+                let getter = c.static_getters.iter().any(|(n, _)| n == key);
+                let setter = c.static_setters.iter().find(|(n, _)| n == key).map(|(_, s)| *s);
+                (getter || setter.is_some()).then(|| PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                    setter: setter.unwrap_or(Value::UNDEFINED),
+                })
+            }
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => self.fn_props.get(&idx).and_then(side),
+            _ => self.arr_props.get(&idx).and_then(side),
+        }
     }
 
     /// Install an object-literal accessor (`{ get k(){…} }` / `{ set k(v){…} }`)
@@ -2234,14 +2458,29 @@ impl<'p> Vm<'p> {
         while let Some(cidx) = cur {
             match self.heap.get(cidx) {
                 HeapObj::Class(c) => {
+                    // A `statics` entry is the property's current descriptor
+                    // (defineProperty lands here, over any syntax accessor): an
+                    // accessor's setter governs the write, and a getter-only
+                    // accessor or non-writable data property rejects it.
+                    if let Some(i) = c.statics.pos(key) {
+                        let a = c.statics.attr_at(i);
+                        if a.accessor {
+                            return Some(if a.setter.is_undefined() {
+                                None
+                            } else {
+                                Some(a.setter)
+                            });
+                        }
+                        if !a.writable {
+                            return Some(None);
+                        }
+                        return None; // own data property shadows inherited accessors
+                    }
                     if let Some((_, s)) = c.static_setters.iter().find(|(k, _)| k == key) {
                         return Some(Some(*s));
                     }
                     if c.static_getters.iter().any(|(k, _)| k == key) {
                         return Some(None); // accessor with no setter ⇒ sloppy no-op
-                    }
-                    if c.statics.get(key).is_some() {
-                        return None; // own data property shadows inherited accessors
                     }
                     cur = c.parent;
                 }

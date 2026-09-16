@@ -1,0 +1,37 @@
+binop=7 a b c
+pow=8 a b c
+sub=-4 a b c
+chain=False a b c
+chain2=True a b c d
+or=3 a b c
+and=0 a b
+ifexp=5 cond x
+not=True a
+args=6 a b c
+kwargs=10 pos kw-b kw-z kw-y
+star=6 star after
+dstar=6 p dstar q
+subscript=20 obj key idx
+slice=[1, 3] seq lo hi step
+store-subscript=[0, 99, 0] value container index
+chained-store=[('a', 1), ('b', 1)] v k1 k2
+tuple-assign=1,2 rhs1 rhs2
+store-attr=7 val obj
+augassign={'n': 5} aug-obj aug-key aug-val
+aug-attr=8 inc
+list=[1, 2, 3, 4] l1 l2 lstar l4
+tuple=(1, 2) t1 t2
+dict=[('a', 1), ('b', 2), ('c', 3)] k1 v1 k2 v2 dd
+set=[1, 2] s1 s2
+listcomp=[0, 2] iterable cond0 elem0 cond1 cond2 elem2
+dictcomp={0: 0, 1: 1} key0 val0 key1 val1
+fstring=1-2-3 f1 f2 f3
+percent=1 2 m1 m2
+in=True needle hay
+target-order=1,[10, 99, 30] 
+generator created gen-start y1 body1 gen-mid y2 body2 gen-end
+try try exc-arg except finally
+return-finally return-expr finally
+with ctx with-body
+builtin-args=3 m1 m2 keyfn
+lambda-default default-eval

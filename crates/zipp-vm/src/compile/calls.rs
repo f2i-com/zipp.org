@@ -75,7 +75,7 @@ fn strict_call_order() -> bool {
 /// which are not analysed) can — a closure literal that wrote it would have
 /// made the binding a cell rather than a register, and a call cannot reach a
 /// register local. Anything unfamiliar answers `true`.
-fn expr_may_assign_name(e: &Expr, name: &str) -> bool {
+pub(crate) fn expr_may_assign_name(e: &Expr, name: &str) -> bool {
     let rec = |x: &Expr| expr_may_assign_name(x, name);
     let args_rec = |args: &[Arg]| {
         args.iter().any(|a| match a {
@@ -773,10 +773,15 @@ impl<'a> FnCompiler<'a> {
         if !bound_here && self.inherited_with_shadows.contains_key("Math") {
             return None;
         }
+        // The slot must also sit below the provisional class-register range:
+        // `check_regs` renumbers every operand in `BOOL_BASE..` as a boolean /
+        // receiver register, and cannot tell this global index from one, so a
+        // program whose `Math` slot was ≥ 0x8000 had its bare Math calls read
+        // some unrelated global instead.
         match self.resolve("Math") {
             Binding::Global(idx) => Reg::try_from(idx)
                 .ok()
-                .filter(|&r| r != crate::bytecode::NO_REG),
+                .filter(|&r| r != crate::bytecode::NO_REG && r < BOOL_BASE),
             _ => None,
         }
     }

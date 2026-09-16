@@ -242,3 +242,28 @@ test assertion was changed. Both tests in `typedarray_interp_index_fast` pass
 locally with Node 24.19.0, including interpreter GC-stress comparison, and
 actionlint passes. The updated PR head requires fresh CI; merge and tagging
 remain gated on those results.
+
+## Later changes (not part of this run)
+
+The "eleven-entry" figure above was accurate when written.
+`tools/test262-expected-failures.txt` is the only authority, and `1539eb4b`
+(14 September 2026) cut the manifest to **nine** by dropping the two
+`staging/sm/String/internalUsage.js` entries.
+
+The 15 September infrastructure review then closed a scoring hole in
+`tools/run_test262.py`: a positive non-async test whose assertion failed inside
+a promise job or a timer callback exited 0 with nothing on stderr and scored
+PASS. `ZIPP_REPORT_UNHANDLED=1` now makes the engine name every exception that
+escaped a promise job unhandled, plus every exception a timer callback threw,
+and the runner fails a positive non-async test whose report names a
+`Test262Error`. The nine-entry manifest is unchanged by that work.
+
+That report also surfaced an UPSTREAM test bug, recorded here rather than
+scored: `staging/explicit-resource-management/await-using-in-async-generator-body.js`
+asserts, inside an unawaited `.then`, that the second `next()` of a completed
+`async function*` yields `1` where the spec-correct value is `undefined`. ZIPP
+and Node 24 agree on the value and both lose the assertion as an unhandled
+rejection while still printing `Test262:AsyncTestComplete`, so every engine
+"passes" it. INTERPRETING.md makes that printed string the verdict for
+`flags: [async]`, so the runner keeps scoring it PASS and only logs the
+diagnostic; the pinned corpus and the five corrections are untouched.

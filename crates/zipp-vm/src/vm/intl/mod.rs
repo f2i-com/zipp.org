@@ -645,7 +645,14 @@ impl<'p> Vm<'p> {
                 }
                 self.store_digit_options(&mut r, &digits);
                 // PluralRules has no `numberingSystem` in its resolvedOptions table.
-                let cats = ["one", "other"]
+                // `en`'s categories, in CLDR order: the ordinal rules add
+                // "two" and "few" (1st, 2nd, 3rd, 4th).
+                let cat_names: &[&str] = if self.display(tv) == "ordinal" {
+                    &["one", "two", "few", "other"]
+                } else {
+                    &["one", "other"]
+                };
+                let cats = cat_names
                     .iter()
                     .map(|c| self.alloc_str(c.to_string()))
                     .collect::<Vec<_>>();

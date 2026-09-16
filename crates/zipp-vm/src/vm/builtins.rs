@@ -470,14 +470,16 @@ impl<'p> Vm<'p> {
         if !recv.is_heap()
             || !self.array_method_is_intrinsic("push")
             || self.array_proto_has_index
-            // Frozen, or carrying an OWN `push` (B289: `arr.push = fn;
-            // arr.push(1)` must call `fn` — a real Get finds the own
-            // property before the prototype intrinsic).
+            // Non-extensible (a push always adds an index, so frozen, sealed
+            // and preventExtensions'd arrays all reject it — `is_frozen()` let
+            // a sealed array with a named own prop through), or carrying an
+            // OWN `push` (B289: `arr.push = fn; arr.push(1)` must call `fn` — a
+            // real Get finds the own property before the prototype intrinsic).
             || (!self.arr_props.is_empty()
                 && self
                     .arr_props
                     .get(&recv.heap_index())
-                    .map_or(false, |m| m.is_frozen() || m.pos("push").is_some()))
+                    .map_or(false, |m| !m.extensible || m.pos("push").is_some()))
             // A subclass instance or a replaced/null [[Prototype]] does not
             // inherit %Array.prototype%'s push (B289).
             || (!self.proto_of.is_empty()
@@ -1057,12 +1059,32 @@ impl<'p> Vm<'p> {
                     let arr = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                     // argArray null/undefined -> no args; else CreateListFromArrayLike
                     // (an array-like — `{length, 0, …}` — not necessarily iterable).
+                    // A hole-free dense array with no side table hands over its
+                    // own elements, which stay reachable through `arr` (a
+                    // caller register) until the callee's frame owns the list —
+                    // no guest code runs in between. Anything the walk could
+                    // have MADE instead (an array-like's Gets, a hole's
+                    // prototype getter, a Proxy trap) is a Rust local until
+                    // then, so that list is rooted across the call.
+                    let elements_are_arrs = arr.is_heap()
+                        && !self.arr_props.contains_key(&arr.heap_index())
+                        && matches!(self.heap.get(arr.heap_index()),
+                            HeapObj::Array(items) if !items.iter().any(|v| v.is_hole()));
                     let callargs = if arr.is_nullish() {
                         Vec::new()
                     } else {
                         self.create_list_from_array_like(arr)?
                     };
-                    return Ok(Some(self.call_value(recv, this, &callargs)?));
+                    if elements_are_arrs {
+                        return Ok(Some(self.call_value(recv, this, &callargs)?));
+                    }
+                    // Rooted until the callee's frame owns the list (FN_APPLY).
+                    // An array-like list can be 2^24 entries, so the roots are
+                    // admitted against the heap ceiling like any other copy.
+                    self.reserve_host_roots(callargs.len())?;
+                    return Ok(Some(
+                        self.with_host_roots(&callargs, |vm| vm.call_value(recv, this, &callargs))?,
+                    ));
                 }
                 // Bind snapshots target length/name and may reject a sandbox-cap
                 // overflow while composing "bound ". Keep that fallible work in
@@ -1282,7 +1304,13 @@ impl<'p> Vm<'p> {
                 self.dataview_method(idx, name, args)
             }
             HeapObj::DataView { .. } => Ok(None),
-            HeapObj::ArrayBuffer { .. } => self.arraybuffer_method(idx, name, args),
+            // No receiver-kind shortcut for buffers: the method has to be the
+            // one a real Get finds. A plain ArrayBuffer has no `grow` (only
+            // SharedArrayBuffer does), a SharedArrayBuffer no `resize` or
+            // `transfer`, and a deleted or replaced prototype method must be
+            // seen. The caller's Get + call reaches the natives, which check
+            // the buffer brand before calling `arraybuffer_method`.
+            HeapObj::ArrayBuffer { .. } => Ok(None),
             _ => Ok(None),
         }
     }
@@ -1416,15 +1444,14 @@ impl<'p> Vm<'p> {
                 _ if self.str_proto != 0 && this.heap_index() == self.str_proto => "String",
                 _ if self.bool_proto != 0 && this.heap_index() == self.bool_proto => "Boolean",
                 _ if self.arr_proto != 0 && this.heap_index() == self.arr_proto => "Array",
-                // [[ErrorData]] ⇒ "Error". An error INSTANCE carries an own
-                // error-name; the Error/NativeError PROTOTYPES also have a `name`
-                // property but NO [[ErrorData]], so exclude them (they tag "Object").
-                _ if self.error_name(this.heap_index()).is_some()
-                    && !self.error_protos.contains(&this.heap_index()) =>
-                {
-                    "Error"
-                }
+                // Step 7 [[Call]] precedes step 8 [[ErrorData]]: a constructor
+                // such as `TypeError` tags "Function".
                 _ if callable => "Function",
+                // [[ErrorData]] ⇒ "Error": the internal slot the Error
+                // constructors (and `super()` from a subclass) set, the same one
+                // `Error.isError` reads. Not the `name` string — a renamed error
+                // is still an Error, and `{name: "TypeError"}` is not one.
+                _ if self.error_data.contains(&this.heap_index()) => "Error",
                 _ => "Object",
             }
         } else if this.is_number() {
@@ -1670,10 +1697,13 @@ impl<'p> Vm<'p> {
                 }))
             }
             "join" => {
+                // The separator is the EXACT string: the elements are numbers,
+                // but a separator's lone surrogate must survive as it does in
+                // `Array.prototype.join`.
                 let sep = if a0 == Value::UNDEFINED {
-                    ",".to_string()
+                    crate::heap::JsStr::new(",".to_string())
                 } else {
-                    self.to_js_string(a0)?
+                    self.to_js_str_owned(a0)?
                 };
                 self.preflight_native_iteration_work(len as u64)?;
                 // The element COUNT is fixed at entry; a detach (or resizable shrink)
@@ -1681,16 +1711,19 @@ impl<'p> Vm<'p> {
                 // as "" (Get → undefined → ""), so e.g. a detached length-3 array
                 // joins to ",,".
                 let eff = self.ta_effective_len(idx).unwrap_or(0);
-                let mut out = String::new();
+                let mut out: Vec<u8> = Vec::new();
                 for i in 0..len {
-                    let part = if i < eff {
-                        self.ta_elem_string(idx, i)
-                    } else {
-                        String::new()
-                    };
-                    self.append_guest_join_part(&mut out, &sep, &part, i)?;
+                    // Empty (detached) parts can put two separators side by
+                    // side; `wtf8_push` pairs a high half with a low one.
+                    if i != 0 {
+                        self.append_guest_wtf8(&mut out, sep.as_bytes())?;
+                    }
+                    if i < eff {
+                        let part = self.ta_elem_string(idx, i);
+                        self.append_guest_wtf8(&mut out, part.as_bytes())?;
+                    }
                 }
-                Ok(Some(self.alloc_str(out)))
+                Ok(Some(self.alloc_wtf8(out)))
             }
             "toString" => {
                 self.preflight_native_iteration_work(len as u64)?;
@@ -1708,32 +1741,33 @@ impl<'p> Vm<'p> {
                 // toLocaleString / toString / valueOf propagates as an abrupt
                 // completion (the elements are numbers/bigints, never nullish).
                 self.preflight_native_iteration_work(len as u64)?;
-                let mut out = String::new();
+                let mut out: Vec<u8> = Vec::new();
                 for i in 0..len {
                     let el = self.ta_element_get(idx, i);
+                    if i != 0 {
+                        self.append_guest_wtf8(&mut out, b",")?;
+                    }
                     // A user toLocaleString may shrink the buffer: later reads come
                     // back undefined, which joins as the empty string per spec.
                     if el == Value::UNDEFINED || el == Value::NULL {
-                        self.append_guest_join_part(&mut out, ",", "", i)?;
                         continue;
                     }
                     let f = self.get_prop(el, "toLocaleString")?;
-                    let s = if self.is_callable(f) {
-                        // ECMA-402 forwards (locales, options) to each element.
-                        let fwd = [
-                            args.first().copied().unwrap_or(Value::UNDEFINED),
-                            args.get(1).copied().unwrap_or(Value::UNDEFINED),
-                        ];
-                        let r = self.call_value(f, el, &fwd)?;
-                        self.to_js_string(r)?
-                    } else {
+                    if !self.is_callable(f) {
                         return Err(Thrown(
                             "TypeError: element toLocaleString is not callable".into(),
                         ));
-                    };
-                    self.append_guest_join_part(&mut out, ",", &s, i)?;
+                    }
+                    // ECMA-402 forwards (locales, options) to each element. The
+                    // result is ToString'd EXACTLY (a lone surrogate survives).
+                    let fwd = [
+                        args.first().copied().unwrap_or(Value::UNDEFINED),
+                        args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    ];
+                    let r = self.call_value(f, el, &fwd)?;
+                    self.append_guest_tostring(&mut out, r)?;
                 }
-                Ok(Some(self.alloc_str(out)))
+                Ok(Some(self.alloc_wtf8(out)))
             }
             "indexOf" | "lastIndexOf" | "includes" => {
                 // Length is fixed at method entry (ValidateTypedArray already ran).
@@ -2591,6 +2625,22 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The host-pin contract (`HostCtx::typed_array_region`): a pinned buffer
+    /// is never resized, grown, transferred or detached, because the host
+    /// holds a raw address into its bytes. Growing or detaching a local
+    /// buffer can reallocate or free that store. Every such path checks here
+    /// IMMEDIATELY BEFORE it mutates the buffer — after its argument
+    /// coercion, whose `valueOf` is guest code that can pin the buffer (an
+    /// earlier check alone is a time-of-check/time-of-use hole).
+    pub(crate) fn require_buffer_unpinned(&self, idx: u32, verb: &str) -> Result<(), Thrown> {
+        if self.pinned_buffers.contains(&idx) {
+            return Err(Thrown(format!(
+                "TypeError: Cannot {verb} an ArrayBuffer the host has pinned"
+            )));
+        }
+        Ok(())
+    }
+
     /// `ArrayBuffer.prototype.slice(begin?, end?)` → a new ArrayBuffer copy.
     pub(crate) fn arraybuffer_method(
         &mut self,
@@ -2599,16 +2649,34 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<Option<Value>, Thrown> {
         let len = self.array_buffer_len(idx);
+        // The natives brand-check the receiver before calling in; repeat the
+        // shared/non-shared split here so no caller can reach the local
+        // (reallocating) store through `grow`, or a shared store through
+        // `resize`/`transfer*`.
+        let shared = self.shared_buffers.contains(&idx);
+        match name {
+            "grow" if !shared => {
+                return Err(Thrown(
+                    "TypeError: SharedArrayBuffer.prototype.grow called on incompatible receiver"
+                        .into(),
+                ))
+            }
+            "resize" | "transfer" | "transferToFixedLength" | "transferToImmutable"
+            | "sliceToImmutable"
+                if shared =>
+            {
+                return Err(Thrown(format!(
+                    "TypeError: ArrayBuffer.prototype.{name} called on incompatible receiver"
+                )))
+            }
+            _ => {}
+        }
         match name {
             // `ArrayBuffer.prototype.resize(newLength)` — only for a resizable
             // buffer (created with maxByteLength); grows with zero-fill, shrinks
             // by truncation, within [0, maxByteLength].
             "resize" => {
-                if self.pinned_buffers.contains(&idx) {
-                    return Err(Thrown(
-                        "TypeError: Cannot resize an ArrayBuffer the host has pinned".into(),
-                    ));
-                }
+                self.require_buffer_unpinned(idx, "resize")?;
                 let max = match self.ab_max.get(&idx) {
                     Some(&m) => m,
                     None => return Err(Thrown("TypeError: ArrayBuffer is not resizable".into())),
@@ -2635,6 +2703,8 @@ impl<'p> Vm<'p> {
                         "RangeError: ArrayBuffer resize length out of range".into(),
                     ));
                 }
+                // The coercion above may have pinned it.
+                self.require_buffer_unpinned(idx, "resize")?;
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(idx) {
                     data.resize_bytes(n as usize);
                 }
@@ -2644,6 +2714,7 @@ impl<'p> Vm<'p> {
             // shrinks), within [currentLength, maxByteLength]. SABs are never
             // detached.
             "grow" => {
+                self.require_buffer_unpinned(idx, "grow")?;
                 let max = match self.ab_max.get(&idx) {
                     Some(&m) => m,
                     None => {
@@ -2795,6 +2866,7 @@ impl<'p> Vm<'p> {
             // ES2026: copy the buffer's bytes into a new IMMUTABLE ArrayBuffer and
             // detach the original (transfer semantics).
             "transferToImmutable" => {
+                self.require_buffer_unpinned(idx, "transfer")?;
                 // ArrayBufferCopyAndDetach order: the newLength ToIndex coercion
                 // (observable; may itself detach) runs BEFORE the detached and
                 // immutable receiver checks.
@@ -2821,6 +2893,8 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot transfer an immutable ArrayBuffer".into(),
                     ));
                 }
+                // The newLength coercion above may have pinned it.
+                self.require_buffer_unpinned(idx, "transfer")?;
                 let bytes: Vec<u8> = match self.heap.get(idx) {
                     HeapObj::ArrayBuffer { data, .. } => data.to_vec(),
                     _ => Vec::new(),
@@ -2896,11 +2970,7 @@ impl<'p> Vm<'p> {
             // bytes and detach the source. `transfer` preserves resizability (keeps
             // maxByteLength); `transferToFixedLength` produces a fixed buffer.
             "transfer" | "transferToFixedLength" => {
-                if self.pinned_buffers.contains(&idx) {
-                    return Err(Thrown(
-                        "TypeError: Cannot transfer an ArrayBuffer the host has pinned".into(),
-                    ));
-                }
+                self.require_buffer_unpinned(idx, "transfer")?;
                 // ArrayBufferCopyAndDetach order: coerce newLength (observable)
                 // BEFORE the detached and immutable receiver checks.
                 let new_len = match args.first() {
@@ -2926,6 +2996,8 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot transfer an immutable ArrayBuffer".into(),
                     ));
                 }
+                // The newLength coercion above may have pinned it.
+                self.require_buffer_unpinned(idx, "transfer")?;
                 let bytes: Vec<u8> = match self.heap.get(idx) {
                     HeapObj::ArrayBuffer { data, .. } => data.to_vec(),
                     _ => Vec::new(),

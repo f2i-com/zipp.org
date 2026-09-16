@@ -1,0 +1,19 @@
+repr-nonprintable '\u200b' 'a\xadb' '\u2028' '\ufeff' '\U000e0001' '\xa0' '\x85' '\u3000' '\x7f' '\x9f' 'é ü' '日本'
+repr-noncharacter ['\uffff'] '\ufffe' ['\x80'] '\u0378' '\U0010ffff' '\ue000'
+repr-quotes "it's" 'say "hi"' 'both \' and "' 'tab\there\n' 'back\\slash'
+printable False True False True True False
+ascii-astral '\U0001f600' 'a\U0010ffffb' ['\U0001d11e'] '\xe9\u200b' {'k': '\xf1'} '\xfc'
+oserror FileNotFoundError [Errno 2] nofile FileNotFoundError(2, 'nofile') 2 nofile None
+oserror PermissionError [Errno 13] denied PermissionError(13, 'denied') 13 denied None
+oserror FileExistsError [Errno 17] exists FileExistsError(17, 'exists') 17 exists None
+oserror OSError [Errno 99999] other OSError(99999, 'other') 99999 other None
+oserror-file FileNotFoundError [Errno 2] No such file: 'a.txt' (2, 'No such file') a.txt True
+oserror-plain just text None OSError('a', 'b', 'c', 'd', 'e', 'f')
+oserror-catch FileNotFoundError 2 [Errno 2] missing
+case-pred True True False True True True False True True False True True False
+zfill-astral 000😀 -00😀 4 00𝄞 00😀abc😀d +007 000
+splitlines-unicode ['é', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm'] ['a\r\n', 'b\r', 'c\n'] ['x\u2028']
+titlecase ǅemo ǅemo Ssx Ssx ʼN Hello World O'Neil 3Rd École Été
+replace-empty -a-b-c- -a-bc x .😀.a. bba ab
+find-bounds -1 3 3 0 4 1 5 2 3
+ValueError substring not found

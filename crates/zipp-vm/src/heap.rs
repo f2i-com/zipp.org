@@ -91,8 +91,37 @@ pub(crate) fn prop_tag_of(key: &str) -> u32 {
     prop_tag(key)
 }
 
+/// A per-process random key folded into the ordinary profile's table hashes
+/// (this property tag and the Map/Set index's string hash and tag). The
+/// FNV-1a/splitmix construction is public, so without a key one collision
+/// family computed offline (keys sharing the low tag bits) degrades every VM's
+/// object, Map and Set indexes to linear probing. Tags are process-local
+/// acceleration — never serialized, and every hit is confirmed against the
+/// real key — so a fresh key per process changes no observable behaviour.
+#[inline]
+pub(crate) fn hash_seed() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: AtomicU64 = AtomicU64::new(0);
+    #[cold]
+    fn init(seed: &AtomicU64) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(0x7a69_7070_5eed);
+        // Never 0, which marks "not yet drawn".
+        let v = h.finish() | 1;
+        match seed.compare_exchange(0, v, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => v,
+            Err(drawn) => drawn,
+        }
+    }
+    match SEED.load(Ordering::Relaxed) {
+        0 => init(&SEED),
+        s => s,
+    }
+}
+
 fn prop_tag(key: &str) -> u32 {
-    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325 ^ hash_seed();
     for &b in key.as_bytes() {
         h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3);
     }
@@ -1163,6 +1192,14 @@ pub struct ObjMap {
     /// rather than the compiler-proof-only unchecked push. Fits existing bool
     /// padding, preserving ObjMap's pinned size.
     planned_append_failed: bool,
+    /// This map is a class's materialized `C.prototype` (`Vm::prototype_of`).
+    /// Instances resolve declared members through the `ClassData` member
+    /// tables for as long as those tables still describe this object, so every
+    /// mutation of it must reach a slow path that can record the divergence
+    /// (`Vm::note_class_proto_mutation`): the in-place data-store fast paths
+    /// decline such a map, and `mark_class_proto` pins its shape to DICT so no
+    /// shape-keyed way can serve it. Fits existing bool padding.
+    pub class_proto: bool,
     /// This object's hidden class — see [`crate::shape`]. A redundant summary of
     /// `keys` + `attrs`, maintained by the same methods that mutate them, so an
     /// inline cache can ask "same layout?" with one integer compare instead of
@@ -2116,6 +2153,7 @@ impl ObjMap {
             numeric_index,
             has_element_key,
             planned_append_failed,
+            class_proto,
             shape: shape_slot,
         } = self;
         match keys {
@@ -2141,6 +2179,7 @@ impl ObjMap {
         *numeric_index = None;
         *has_element_key = plan.has_element_key();
         *planned_append_failed = false;
+        *class_proto = false;
         *shape_slot = shape;
         // The same cold tails `finalized_from_store` builds, on the same
         // conditions.
@@ -2269,8 +2308,17 @@ impl ObjMap {
             numeric_index: None,
             has_element_key: false,
             planned_append_failed: false,
+            class_proto: false,
             shape: crate::shape::EMPTY,
         }
+    }
+
+    /// Flag this map as a class's materialized prototype (see
+    /// [`ObjMap::class_proto`]) and drop it to dictionary mode for good, so no
+    /// shape-keyed cache way can ever write through it.
+    pub fn mark_class_proto(&mut self) {
+        self.class_proto = true;
+        self.shape_to_dict();
     }
 
     /// Can this side table shadow, hide, or constrain an ELEMENT (or `length`)
@@ -2687,41 +2735,6 @@ pub fn str_units(s: &str) -> usize {
     } else {
         s.chars().map(char_units).sum()
     }
-}
-
-/// Unit position of char-boundary byte offset `b` in `s` (clamped to the end).
-pub fn byte_to_units(s: &str, b: usize) -> usize {
-    str_units(&s[..b.min(s.len())])
-}
-
-/// Resolve unit position `u` in `s` to byte offsets, clamped to the end:
-/// `(floor, ceil)` are equal at a scalar boundary; a `u` that lands BETWEEN the
-/// halves of a surrogate pair gives the enclosing astral scalar's (start, end).
-pub fn unit_byte_bounds(s: &str, u: usize) -> (usize, usize) {
-    if u == 0 {
-        return (0, 0);
-    }
-    let mut units = 0usize;
-    for (b, c) in s.char_indices() {
-        if units == u {
-            return (b, b);
-        }
-        let n = char_units(c);
-        if units + n > u {
-            // `u` addresses this scalar's trail half (only possible when n == 2).
-            return (b, b + c.len_utf8());
-        }
-        units += n;
-    }
-    (s.len(), s.len())
-}
-
-/// Byte offset of unit position `u`, rounding a mid-pair position UP to the next
-/// scalar boundary — exact for SEARCH-START positions (a well-formed needle can
-/// never match starting at a trail unit). Anchored positions (`startsWith`/
-/// `endsWith`/`lastIndexOf` caps) use `unit_byte_bounds` to detect the split.
-pub fn unit_to_byte(s: &str, u: usize) -> usize {
-    unit_byte_bounds(s, u).1
 }
 
 // ── WTF-8 primitives ──
@@ -3414,6 +3427,25 @@ impl JsStr {
         JsStr::from_wtf8(out)
     }
 
+    /// Byte bounds of unit position `u` (clamped to the length): `(floor, ceil)`
+    /// are equal at a scalar boundary, and a `u` between the halves of an
+    /// astral pair gives that scalar's start and end. Resolved through the
+    /// position memo, so a scan that advances by small steps
+    /// (`indexOf(x, i + 1)`, a segment iterator) pays for the step, not a walk
+    /// from byte 0.
+    pub fn unit_byte_bounds(&self, u: usize) -> (usize, usize) {
+        if self.ascii {
+            let b = u.min(self.bytes.len());
+            return (b, b);
+        }
+        let (pos, bi) = self.seek(u);
+        if pos >= u.min(self.units as usize) {
+            (bi, bi)
+        } else {
+            (bi, bi + wtf8_decode(&self.bytes, bi).1)
+        }
+    }
+
     /// Iterate the code points (for-of/spread semantics — one item per code
     /// point; a lone surrogate yields its 0xD800–0xDFFF value).
     pub fn code_points(&self) -> impl Iterator<Item = u32> + '_ {
@@ -3680,6 +3712,19 @@ pub struct ClassData {
     /// `ClassDef` carries a decorator plan. `None` for every undecorated class
     /// (i.e. all of them today), so nothing on the hot class path pays for it.
     pub dec: Option<Box<DecState>>,
+    /// Sticky: `C.prototype` was mutated in a way `methods`/`getters`/
+    /// `setters` no longer describe (a declared member — this level's or an
+    /// ancestor's — was assigned, redefined or deleted on it, or the object was
+    /// frozen/sealed/re-prototyped). Member lookups that reach this level stop
+    /// trusting the tables and continue on the live prototype object instead.
+    /// Set only by `Vm::note_class_proto_mutation`, which also advances
+    /// `Vm::class_proto_epoch` so class-keyed caches filled from the tables miss.
+    pub proto_dirty: bool,
+    /// Sticky: some instance of this class carries an explicit `[[Prototype]]`
+    /// (`Object.setPrototypeOf(instance, …)`, or `Reflect.construct` with a
+    /// foreign newTarget). Lookups on this class's instances must then consult
+    /// the instance's `proto_of` entry before the member tables.
+    pub reproto_instances: bool,
 }
 
 /// The per-EVALUATION decoration state of a decorated class: what the decorator

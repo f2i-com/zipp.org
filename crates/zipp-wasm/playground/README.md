@@ -36,12 +36,17 @@ step is required. The independently maintained native research lab is at
 - A Python program sees the folder as its filesystem: `open()`, `os`,
   `os.path`, `pathlib` and `json.load` read the loaded files (packages by
   folder import as `legacy.fast_memory`), and files it writes appear in the
-  tree tagged *written*, openable like any other. Binary files show a
-  placeholder in the editor and cannot be edited; text files can. Nothing is
-  written back to disk: the browser holds the project, and the written
-  files live in its `localStorage` copy with the rest.
+  tree tagged *written* (by the latest run), openable like any other, and
+  sent to later runs with the rest of the project, so a program can keep
+  state in its own files. Binary files show a placeholder in the editor and
+  cannot be edited; text files can. Nothing is written back to disk: the
+  browser holds the project, and the written files live in its
+  `localStorage` copy with the rest.
 - Edit in place; `Tab` indents, `Ctrl+Enter` runs. The project is autosaved
-  in the browser's `localStorage` and restored on the next visit.
+  in the browser's `localStorage` and restored on the next visit, within the
+  browser's storage quota (about 5 MB of text; binaries share a 3 MiB
+  allowance). A project that does not fit is not autosaved, the console says
+  so, and no older snapshot is left to restore in its place.
 - **Run** compiles and runs the top level. If the program defines `draw` or
   `update`, the playground then runs a frame loop: each frame it sends the
   input snapshot, delivers queued `on_click`/`on_key` calls, calls `update()`
@@ -74,7 +79,7 @@ and `ui` is a global. Both languages see the same API:
 | `ui.canvas(w, h)` | resize the canvas |
 | `ui.clear(color)` | fill the canvas |
 | `ui.rect(x, y, w, h, color)` / `ui.circle(x, y, r, color)` / `ui.line(x1, y1, x2, y2, color)` | draw shapes |
-| `ui.text(x, y, text, color)` / `ui.font(size)` | draw text; set the text size |
+| `ui.text(x, y, text, color)` / `ui.font(size)` | draw text (the page paints at most 4096 characters of one text, 65,536 per frame); set the text size |
 | `ui.button(x, y, w, h, label)` | draw a button; returns `True` in the frame it was clicked |
 | `ui.mouse()` | `(x, y, down)` |
 | `ui.clicked()` | whether the mouse was clicked this frame |

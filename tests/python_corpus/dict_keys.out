@@ -1,0 +1,31 @@
+collide {1: 'bool'} 1 bool bool bool int
+collide-first-key-wins {True: 'float-third'} True
+zeros {0: 'false'} 1
+set-collide 3 [0, 1, 2] True True False
+big-keys [(-9223372036854775808, 'c'), (9007199254740992.0, 'e'), (18446744073709551616, 'b')] 3 b
+tuple-keys {(1, 2): 'float-tuple', (1, (2, 3)): 'nested', (): 'empty'} float-tuple nested empty True
+frozenset-keys fs empty-fs True
+mixed {'a': 1, b'a': 2, 1: 3, None: 4, (None,): 5, '1': 6, 1.5: 7} 4 6 7 2
+TypeError unhashable type: 'list'
+TypeError unhashable type: 'list'
+TypeError unhashable type: 'list'
+TypeError unhashable type: 'dict'
+order {'a': 99, 'c': 2, 'b': -1} ['a', 'c', 'b'] [99, 2, -1]
+order-update [('a', 99), ('c', 0), ('b', -1), ('z', 26)]
+order-readd ['c', 'b', 'z', 'a']
+counts {1: 3, 2: 2, '2': 1, (2,): 1, 0: 2}
+int-float-update {-3: 9, -2: 4, -1: 1, 0: 'f', 1: 'f', 2: 4, 3: 9}
+views {'y'} ['w', 'x', 'y', 'z'] ['x', 'z'] ['w', 'x', 'z'] True 3
+live-views ['x', 'y', 'z', 'new'] [1, 2, 3, 4] 4 True False
+items-setops [('x', 1)] ['new', 'y', 'z']
+view-eq True True ['new', 'z', 'y', 'x'] [4, 3, 2, 1]
+dict-eq True True True True
+dict-ops {'x': 1, 'y': 20, 'z': 3, 'new': 4, 'w': 0} {'x': 1, 'y': 20, 'z': 3, 'new': 4, 'w': 0} {'y': 2, 'w': 0, 'x': 1, 'z': 3, 'new': 4}
+dict-ior {'x': 1, 'y': 20, 'z': 3, 'new': 4, 'w': 0}
+fromkeys {1: None, 2: None} {'a': [], 'b': []}
+dict-constructor {1: 'b'} {True: 'y', 2: 'z'} {1: 2, 'k': 3}
+nested {0: {0: [0, 6], 1: [3, 9]}, 1: {1: [1, 7], 0: [4, 10]}, 2: {0: [2, 8], 1: [5, 11]}}
+invert {1: 'c', 2: 'b'}
+set-ints [0, 1, 4, 9, 16, 25] 6 True True False
+set-of-frozensets 1
+set-ops [2, 3] [1, 2, 3] True True True

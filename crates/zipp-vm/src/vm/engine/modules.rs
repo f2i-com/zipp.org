@@ -38,6 +38,12 @@ fn lexically_confined(root: &std::path::Path, raw_path: &std::path::Path) -> boo
     lexical_module_path(raw_path).is_some_and(|path| path.starts_with(root))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Loader canonicalize syscalls made on this thread (tests only).
+    static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn canonical_module_path(
     root: Option<&std::path::Path>,
     raw_path: &std::path::Path,
@@ -50,6 +56,8 @@ fn canonical_module_path(
             return Err(Thrown(MODULE_NOT_FOUND.into()));
         }
     }
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|c| c.set(c.get() + 1));
     let path = std::fs::canonicalize(raw_path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
     if root.is_some_and(|root| !path.starts_with(root)) {
         return Err(Thrown(MODULE_NOT_FOUND.into()));
@@ -179,17 +187,7 @@ impl<'p> Vm<'p> {
     /// Allocate a fresh live global slot from the eval pool (UNINITIALIZED),
     /// for module-loader bookkeeping (canonical namespace/source binding slots).
     pub(crate) fn alloc_module_shared_slot(&mut self) -> Result<u32, Thrown> {
-        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
-        if self.eval_global_next >= cap {
-            return Err(Thrown(
-                "EvalError: too many distinct globals introduced by eval".into(),
-            ));
-        }
-        let s = self.eval_global_next;
-        self.eval_global_next += 1;
-        self.globals[s as usize] = Value::UNINITIALIZED;
-        self.bump_global_gen(s);
-        Ok(s)
+        self.alloc_global_pool_slot(Value::UNINITIALIZED, "module bindings")
     }
 
     /// The CANONICAL live slot of `canon`'s namespace binding, created on
@@ -279,6 +277,42 @@ impl<'p> Vm<'p> {
         self.with_fresh_dfs_segment(|vm| {
             vm.with_confined_module_depth(|vm| vm.import_module_inner(raw_path, mtype))
         })
+    }
+
+    /// The directory a dynamic `import()` / `import.defer()` specifier resolves
+    /// against: the REFERRER's, as static imports already do (`dir.join`).
+    /// Code of a loader-installed module is found by its function-id range;
+    /// main-program code is the entry script (the VM-wide base directory).
+    /// Code compiled at run time (`eval`, `new Function`) has neither, so the
+    /// nearest activation below it that does decides — the code that is
+    /// running it, which is the code that created it in every ordinary shape.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
+    pub(crate) fn dynamic_import_base_dir(&self, func_id: u32) -> Option<std::path::PathBuf> {
+        let owner = |fid: u32| -> Option<Option<u32>> {
+            if let Some(&(_, _, ns)) = self
+                .module_func_ranges
+                .iter()
+                .find(|&&(s, e, _)| fid >= s && fid < e)
+            {
+                Some(Some(ns))
+            } else if (fid as usize) < self.main_func_count {
+                Some(None)
+            } else {
+                None
+            }
+        };
+        let module = owner(func_id)
+            .or_else(|| self.frames.iter().rev().find_map(|f| owner(f.func)))
+            .flatten();
+        if let Some(ns) = module {
+            let ns = Value::heap(ns);
+            if let Some((path, _)) = self.module_cache.iter().find(|(_, v)| **v == ns) {
+                if let Some(dir) = path.parent() {
+                    return Some(dir.to_path_buf());
+                }
+            }
+        }
+        self.module_base_dir.clone()
     }
 
     /// `import_module` for a static request edge taken by the link in
@@ -392,7 +426,7 @@ impl<'p> Vm<'p> {
             // Keep the globals backing allocation immovable. Native code pins
             // its base for an activation and JIT property ways may point at a
             // live module slot, so even a cold typed-module import must draw
-            // from the preallocated eval pool rather than `Vec::push`.
+            // from the eval pool reserved at boot, never a reallocating push.
             let slot = self.alloc_module_shared_slot()?;
             self.globals[slot as usize] = val;
             self.bump_global_gen(slot);
@@ -551,7 +585,6 @@ impl<'p> Vm<'p> {
             .collect();
         let decl_set: std::collections::HashSet<u32> =
             prog.module_decl_globals.iter().copied().collect();
-        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
         let mut prealloc: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut own_pre: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         if !early_prepare {
@@ -565,15 +598,9 @@ impl<'p> Vm<'p> {
                         own_pre.insert(exported.clone(), live);
                         continue;
                     }
-                    if self.eval_global_next >= cap {
-                        return Err(Thrown(
-                            "EvalError: too many distinct globals introduced by eval".into(),
-                        ));
-                    }
-                    let live = self.eval_global_next;
-                    self.eval_global_next += 1;
-                    self.globals[live as usize] = Value::UNINITIALIZED;
-                    self.bump_global_gen(live);
+                    let live = self.alloc_global_pool_slot(Value::UNINITIALIZED, "module bindings")?;
+                    self.pool_slot_names
+                        .insert(live, crate::vm::PoolSlotName::Module(local.as_str().into()));
                     prealloc.insert(c, live);
                     own_pre.insert(exported.clone(), live);
                 }
@@ -1436,6 +1463,10 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
                     *slot = m;
                 }
+                // The deferred namespace was created at link time and is
+                // usually old by now: barrier the young tag (and any young
+                // snapshot value) the replaced map carries.
+                self.heap.write_barrier(idx);
                 // Whole-map replacement: invalidate any JIT inline cache that
                 // captured the old vals pointer.
                 self.heap.bump_version(idx);
@@ -1447,6 +1478,11 @@ impl<'p> Vm<'p> {
     /// compiles to an activation containing Await ops). Used by import.defer:
     /// the proposal evaluates a deferred graph's ASYNC modules eagerly.
     pub(crate) fn module_has_tla(&mut self, path: &std::path::Path) -> bool {
+        // Canonical keys: probe before the canonicalize syscall (see
+        // `module_requests`).
+        if let Some(&tla) = self.module_tla_cache.get(path) {
+            return tla;
+        }
         let Ok(path) = self.resolve_module_path(path) else {
             return false;
         };
@@ -1554,6 +1590,12 @@ impl<'p> Vm<'p> {
         &mut self,
         path: &std::path::PathBuf,
     ) -> Result<std::sync::Arc<Vec<(std::path::PathBuf, ModuleRequestPhase)>>, Thrown> {
+        // The graph walks pass the canonical paths this cache is keyed by, so
+        // probe it before canonicalizing: a hit skips a filesystem syscall per
+        // visited node (the deferred-import walks revisit whole graphs).
+        if let Some(cached) = self.module_requests_cache.get(path) {
+            return Ok(cached.clone());
+        }
         let path = self.resolve_module_path(path)?;
         if let Some(cached) = self.module_requests_cache.get(&path) {
             return Ok(cached.clone());
@@ -2188,6 +2230,43 @@ mod confined_budget_tests {
             assert_eq!(
                 vm.module_load_depth, 0,
                 "error path must unwind the counter"
+            );
+        });
+    }
+
+    #[test]
+    fn deferred_import_walks_hit_the_canonical_caches_before_canonicalizing() {
+        // Every deferred import re-walks the shared unevaluated graph; those
+        // revisits pass canonical paths, so they must be cache probes rather
+        // than a canonicalize syscall per visited node (K x G syscalls).
+        const K: usize = 20;
+        const G: usize = 20;
+        with_confined_vm(|vm, root| {
+            vm.run().expect("initialize host realm");
+            let mut entry_src = String::new();
+            for k in 0..K {
+                entry_src.push_str(&format!("import defer * as n{k} from './a{k}.mjs';\n"));
+                std::fs::write(root.join(format!("a{k}.mjs")), "import './c0.mjs';")
+                    .expect("write deferred fixture");
+            }
+            for g in 0..G {
+                let source = if g + 1 == G {
+                    String::new()
+                } else {
+                    format!("import './c{}.mjs';", g + 1)
+                };
+                std::fs::write(root.join(format!("c{g}.mjs")), source)
+                    .expect("write chain fixture");
+            }
+            std::fs::write(root.join("entry.mjs"), entry_src).expect("write entry");
+            let entry = std::fs::canonicalize(root.join("entry.mjs")).expect("canonical entry");
+            let before = CANONICALIZE_CALLS.with(|c| c.get());
+            vm.import_module(&entry, None)
+                .expect("deferred graph links");
+            let calls = CANONICALIZE_CALLS.with(|c| c.get()) - before;
+            assert!(
+                calls > 0 && calls < 8 * (K + G),
+                "{calls} canonicalize calls for {K} deferred imports over a {G}-module graph"
             );
         });
     }

@@ -437,6 +437,7 @@ impl<'p> Vm<'p> {
                         };
                         if let Some(m) = msg.filter(|m| *m != Value::UNDEFINED) {
                             let message_value = self.to_str_value(m)?;
+                            self.heap.write_barrier_val(obj.heap_index(), message_value);
                             if let HeapObj::Object(map) = self.heap.get_mut(obj.heap_index()) {
                                 // `message` is a non-enumerable own data property.
                                 map.define(
@@ -451,6 +452,18 @@ impl<'p> Vm<'p> {
                                     },
                                 );
                             }
+                        }
+                        // The Error constructors' remaining steps apply to a
+                        // subclass instance too: InstallErrorCause, then (for
+                        // AggregateError) the `errors` list.
+                        let options = args
+                            .get(if k == 7 { 2 } else { 1 })
+                            .copied()
+                            .unwrap_or(Value::UNDEFINED);
+                        self.install_error_cause(obj, options)?;
+                        if k == 7 {
+                            let errors_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                            self.install_agg_errors(obj, errors_arg)?;
                         }
                     }
                     // `class X extends someProxy`: SuperCall is
@@ -496,18 +509,23 @@ impl<'p> Vm<'p> {
             // An explicit ctor produces `this`: its object-return (return-override)
             // becomes the effective instance; a non-object/undefined return keeps obj.
             if let Some(fid) = ctor {
-                let f = self.ctor_value(fid, &ctor_ups);
-                if let Some(brands) = self.method_brand.get(&cval.heap_index()).cloned() {
-                    if f.is_heap() {
-                        self.method_brand.insert(f.heap_index(), brands);
-                    }
-                }
                 // A BASE parent's InitializeInstanceElements runs at entry —
                 // brand, then fields, both before the parent ctor's parameter
                 // prologue.
                 if parent.is_none() && !extends_null {
                     self.brand_instance(obj, cval);
                     self.run_field_thunk(obj, cval)?;
+                }
+                // The ctor function value is materialized AFTER the field thunk
+                // (as construct_with_newtarget does for `new Base()`): the field
+                // initializers are guest code, and a function Value held only in
+                // a Rust local across them was swept, so super() called whatever
+                // object reused its slot ("Invalid Date is not a function").
+                let f = self.ctor_value(fid, &ctor_ups);
+                if let Some(brands) = self.method_brand.get(&cval.heap_index()).cloned() {
+                    if f.is_heap() {
+                        self.method_brand.insert(f.heap_index(), brands);
+                    }
                 }
                 // A derived parent ctor begins with `this` back in TDZ (until
                 // ITS OWN super() completes). No removal here: if the parent

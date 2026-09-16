@@ -125,6 +125,7 @@ mod parser;
 mod soft_keywords;
 mod string;
 mod token;
+mod unicode_names;
 
 pub use parser::{parse, parse_starts_at, parse_tokens, Parse, ParseError, ParseErrorType};
 pub use string::FStringErrorType;

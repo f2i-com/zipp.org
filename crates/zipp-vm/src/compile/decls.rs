@@ -7,6 +7,18 @@ use super::*;
 
 use crate::parse::ast;
 
+/// Whether a labelled statement's BODY is a further label chain ending in an
+/// iteration statement, so the outer label belongs to that loop's label set.
+fn labels_iteration(body: &ast::Stmt) -> bool {
+    match body {
+        ast::Stmt::Labeled { body, .. } => match &**body {
+            ast::Stmt::Labeled { .. } => labels_iteration(body),
+            inner => stmt_takes_label(inner) && !matches!(inner, ast::Stmt::Switch { .. }),
+        },
+        _ => false,
+    }
+}
+
 /// Recognise only `return x <int-literal> ? x : alt` (and `<=`). Keeping this
 /// deliberately narrower than a general conditional return leaves specialised
 /// expression lowering such as `Pad2Conditional` untouched. The consequent is
@@ -257,7 +269,8 @@ impl<'a> FnCompiler<'a> {
                     Some(lbl) => self
                         .loop_ctx
                         .iter()
-                        .rposition(|ctx| ctx.is_loop && ctx.label.as_deref() == Some(&**lbl)),
+                        .rposition(|ctx| ctx.is_loop && ctx.label.as_deref() == Some(&**lbl))
+                        .or_else(|| self.continue_through_label_set(lbl)),
                     None => self.loop_ctx.iter().rposition(|ctx| ctx.is_loop),
                 };
                 let idx = match idx {
@@ -294,18 +307,17 @@ impl<'a> FnCompiler<'a> {
                     // (the case this replaced a compile error) `L: try { return
                     // 42; } finally { break L; }`. The frame is NOT
                     // bare-breakable, so an unlabelled `break` inside still fails.
-                    self.loop_ctx
-                        .push(LoopCtx::label_frame(label.to_string(), self.handler_depth));
-                    if let S::Block(stmts) = &**body {
-                        // A labelled block keeps its own lexical scope.
-                        self.push_scope();
-                        for s in stmts {
-                            self.stmt(s)?;
-                        }
-                        self.pop_scope();
-                    } else {
-                        self.stmt(body)?;
-                    }
+                    let mut frame = LoopCtx::label_frame(label.to_string(), self.handler_depth);
+                    frame.labels_iteration = labels_iteration(body);
+                    self.loop_ctx.push(frame);
+                    // A labelled BLOCK is an ordinary block: it goes through the
+                    // `S::Block` arm for BlockDeclarationInstantiation (entry-time
+                    // function declarations, TDZ cells) and for `using` disposal.
+                    // Hand-rolling just its scope here skipped all three —
+                    // `L: { f(); function f(){} }` threw and a `using` in it was
+                    // never disposed. The label frame is pushed first, so a
+                    // `break L` unwinds through the block's disposal finally.
+                    self.stmt(body)?;
                     let ctx = self.loop_ctx.pop().unwrap();
                     let end = self.here();
                     for j in ctx.break_jumps {
@@ -671,6 +683,23 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// `continue lbl` where `lbl` is an OUTER label of a label set — `a: b:
+    /// for (…) { continue a; }`. Only the innermost label rides the loop frame;
+    /// each outer one pushed a label frame marked `labels_iteration`, and the
+    /// frames that directly follow it are the rest of the chain and then the
+    /// loop itself.
+    fn continue_through_label_set(&self, lbl: &str) -> Option<usize> {
+        let at = self
+            .loop_ctx
+            .iter()
+            .rposition(|c| c.labels_iteration && c.label.as_deref() == Some(lbl))?;
+        let mut i = at + 1;
+        while self.loop_ctx.get(i).is_some_and(|c| c.labels_iteration) {
+            i += 1;
+        }
+        self.loop_ctx.get(i).filter(|c| c.is_loop).map(|_| i)
+    }
+
     pub(crate) fn var_decl(&mut self, d: &ast::VarDecl) -> R<()> {
         // A `const` binding is immutable: record its slot/register so a later
         // assignment throws a TypeError (initialization below never goes through
@@ -993,9 +1022,24 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::CellSet { cell: reg, src: v });
                         self.dec_next_reg(1);
                     } else {
-                        let v = self.compile_named_init(reg, init, name)?;
+                        // A `var` binding already holds a value (hoisting, a
+                        // redeclaration, an earlier loop iteration), so an
+                        // initializer that fills its destination before reading
+                        // the name must build elsewhere — the plain-assignment
+                        // rule (`var a = [...a, 2]`, `var s = m.get(s) || s`).
+                        let into = if super::assign::builds_into_dst_incrementally(init, name)
+                            && crate::capture::references_name(init, name)
+                        {
+                            self.temp()
+                        } else {
+                            reg
+                        };
+                        let v = self.compile_named_init(into, init, name)?;
                         if v != reg {
                             self.emit(Instr::Move { dst: reg, src: v });
+                        }
+                        if into != reg {
+                            self.set_next_reg(save);
                         }
                         self.typeof_alias_record(name, init, reg);
                     }
@@ -1206,6 +1250,20 @@ impl<'a> FnCompiler<'a> {
                     {
                         self.entry_tdz_cells.remove(&r);
                     }
+                } else if let Some(r) = self
+                    .scopes
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .find(|(n, _)| n == &**id)
+                    .map(|(_, r)| *r)
+                    .filter(|r| self.block_tdz_cells.contains(r))
+                {
+                    // The block-entry TDZ cell of this leaf (captured, or
+                    // referenced before the declaration): reuse it, as the
+                    // simple-identifier declaration does, ending its TDZ for
+                    // the extraction's stores.
+                    self.block_tdz_cells.remove(&r);
                 } else {
                     self.declare_local(id);
                 }
@@ -1414,13 +1472,13 @@ impl<'a> FnCompiler<'a> {
                     // Lay the excluded (sibling) names out contiguously so the op
                     // can reference them by index range.
                     let exclude_start = self.string_constants.len() as u32;
-                    let mut exclude_count = 0u16;
+                    let exclude_count = super::assign::object_rest_exclude_count(props.len())?;
                     for prop in props {
                         let key = class_key_name(&prop.key).map_err(|_| {
                             "object-rest with a computed sibling key is not in the subset"
                         })?;
-                        self.string_name(&key);
-                        exclude_count += 1;
+                        // Compared against the source's internal keys.
+                        self.string_name(&crate::vm::helpers_numeric::escape_guest_key(key));
                     }
                     let save = self.next_reg;
                     let val = self.alloc_reg();
@@ -1450,6 +1508,17 @@ impl<'a> FnCompiler<'a> {
                         )) => (head, Some(&**inner)),
                         _ => (&elems[..], None),
                     };
+                // An element with a default or a nested pattern runs guest code
+                // BETWEEN iterator steps (IteratorBindingInitialization steps once
+                // per element), so draining up front is observable on a generator
+                // or a custom iterator: it ran ahead of the default, and a
+                // throwing default found later elements already pulled.
+                if fixed
+                    .iter()
+                    .any(|el| matches!(el, Some(e) if !matches!(e.pat, P::Ident(_))))
+                {
+                    return self.extract_array_pattern_stepwise(fixed, rest, src);
+                }
                 // JS array destructuring uses the iterator protocol; positional
                 // GetIndex matches it for arrays/strings/Map/Set, so we only need
                 // to drain a generator / custom iterable into an array first.
@@ -1510,6 +1579,203 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// A binding array pattern whose elements carry defaults or nested
+    /// patterns, driven one IteratorStep per element exactly as
+    /// `assign_array_target` drives an assignment pattern: each element's
+    /// default / nested pattern runs right after its own step, an abrupt
+    /// completion closes a non-exhausted iterator QUIETLY (the original throw
+    /// wins, and a `yield`-suspended pattern closes on `.return()`), and a
+    /// normal completion closes it STRICTLY. A built-in iterable whose
+    /// iteration is unobservable is still walked positionally by
+    /// GetIterator / IterNext. Patterns of plain identifiers and holes keep
+    /// the `IterToArray` path: nothing runs between their steps.
+    fn extract_array_pattern_stepwise(
+        &mut self,
+        fixed: &[Option<ast::PatternElem>],
+        rest: Option<&ast::Pattern>,
+        src: Reg,
+    ) -> R<()> {
+        let save_top = self.next_reg;
+        let iter_reg = self.alloc_reg();
+        self.emit(Instr::GetIterator {
+            dst: iter_reg,
+            src,
+        });
+        // The iterator record's [[NextMethod]], read once before any element.
+        let next_reg = self.alloc_reg();
+        self.emit(Instr::IterPrime {
+            dst: next_reg,
+            iter: iter_reg,
+        });
+        let idx_reg = self.alloc_reg();
+        self.emit(Instr::LoadInt {
+            dst: idx_reg,
+            val: 0,
+        });
+        let done = self.alloc_reg();
+        self.emit(Instr::LoadBool {
+            dst: done,
+            val: false,
+        });
+        let kind_reg = self.alloc_reg();
+        let val_reg = self.alloc_reg();
+        let push_at = self.here();
+        self.emit(Instr::PushFinally {
+            target: 0,
+            kind_reg,
+            val_reg,
+        });
+        self.handler_depth += 1;
+        for el in fixed {
+            let save = self.next_reg;
+            let val = self.alloc_reg();
+            let dflag = self.alloc_reg();
+            // Step (skipped once exhausted; exhausted elements read undefined).
+            // `done` is set BEFORE the step so an abrupt completion from the
+            // iterator itself skips IteratorClose; a value clears it.
+            let jdone = self.here();
+            self.emit(Instr::JumpIfTrue {
+                cond: done,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: true,
+            });
+            self.emit(Instr::IterNext {
+                value_dst: val,
+                done_dst: dflag,
+                iter: iter_reg,
+                idx: idx_reg,
+                next: next_reg,
+            });
+            let jexh = self.here();
+            self.emit(Instr::JumpIfTrue {
+                cond: dflag,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: false,
+            });
+            let jgot = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            let at_undef = self.here();
+            self.patch_jump(jdone, at_undef);
+            self.patch_jump(jexh, at_undef);
+            self.emit(Instr::LoadUndefined { dst: val });
+            let got = self.here();
+            self.patch_jump(jgot, got);
+            // A hole (`[, x]`) steps and binds nothing.
+            if let Some(p) = el {
+                self.extract_pattern(&p.pat, val)?;
+            }
+            self.set_next_reg(save);
+        }
+        if let Some(rest) = rest {
+            let save = self.next_reg;
+            let out = self.alloc_reg();
+            self.emit(Instr::ArrayCtor {
+                dst: out,
+                callee: None,
+                arg_base: 0,
+                argc: 0,
+                is_construct: false,
+            });
+            let v = self.alloc_reg();
+            let dflag = self.alloc_reg();
+            let loop_top = self.here();
+            let jrest_done = self.here();
+            self.emit(Instr::JumpIfTrue {
+                cond: done,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: true,
+            });
+            self.emit(Instr::IterNext {
+                value_dst: v,
+                done_dst: dflag,
+                iter: iter_reg,
+                idx: idx_reg,
+                next: next_reg,
+            });
+            let jout = self.here();
+            self.emit(Instr::JumpIfTrue {
+                cond: dflag,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: false,
+            });
+            self.emit(Instr::ArrayAppend {
+                arr: out,
+                val: v,
+                spread: false,
+            });
+            self.emit(Instr::Jump { target: loop_top });
+            let rest_done = self.here();
+            self.patch_jump(jrest_done, rest_done);
+            self.patch_jump(jout, rest_done);
+            self.extract_pattern(rest, out)?;
+            self.set_next_reg(save);
+        }
+        self.emit(Instr::PopFinally);
+        self.handler_depth -= 1;
+        // Normal completion: close iff not exhausted (strict result checks).
+        let jskip = self.here();
+        self.emit(Instr::JumpIfTrue {
+            cond: done,
+            target: 0,
+        });
+        self.emit(Instr::IterClose { iter: iter_reg });
+        let jend = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        // Abrupt exits: an exhausted iterator or one whose own step threw is
+        // not closed; a THROW closes QUIETLY, a RETURN (a `.return()` injected
+        // at a `yield` inside a default) closes STRICTLY, then EndFinally
+        // resumes the pending completion.
+        let fin_start = self.here();
+        if let Instr::PushFinally { target, .. } = &mut self.code[push_at as usize] {
+            *target = fin_start;
+        }
+        let jresume = self.here();
+        self.emit(Instr::JumpIfTrue {
+            cond: done,
+            target: 0,
+        });
+        let two = self.alloc_reg();
+        self.emit(Instr::LoadInt { dst: two, val: 2 });
+        let isthrow = self.alloc_reg();
+        self.emit(Instr::Eq {
+            dst: isthrow,
+            a: kind_reg,
+            b: two,
+        });
+        let jnotthrow = self.here();
+        self.emit(Instr::JumpIfFalse {
+            cond: isthrow,
+            target: 0,
+        });
+        self.emit(Instr::IterCloseQuiet { iter: iter_reg });
+        let jresume2 = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let at_ret = self.here();
+        self.patch_jump(jnotthrow, at_ret);
+        self.emit(Instr::IterClose { iter: iter_reg });
+        let resume = self.here();
+        self.patch_jump(jresume, resume);
+        self.patch_jump(jresume2, resume);
+        self.emit(Instr::EndFinally { kind_reg, val_reg });
+        let end = self.here();
+        self.patch_jump(jskip, end);
+        self.patch_jump(jend, end);
+        self.set_next_reg(save_top);
+        Ok(())
+    }
+
     /// Read `obj[key]` into `dst` for a destructuring property. A static key
     /// (identifier / string / number) uses GetProp; a computed `[expr]` key is
     /// evaluated and read with GetIndex.
@@ -1527,7 +1793,10 @@ impl<'a> FnCompiler<'a> {
         }
         let name = match key {
             ast::PropKey::Ident(id) => id.to_string(),
-            ast::PropKey::Str(s) => string_literal_key(s),
+            // A GetProp NAME is the internal key form (`escape_guest_key`).
+            ast::PropKey::Str(s) => {
+                crate::vm::helpers_numeric::escape_guest_key(string_literal_key(s))
+            }
             ast::PropKey::Num(n) => fmt_key_num(*n),
             // NOTE: the former `PropertyKey::BigIntLiteral` arm (`b.value
             // .to_string()`) has no counterpart — `ast::PropKey` has no BigInt

@@ -110,14 +110,54 @@ impl<'p> Vm<'p> {
         // MAX_FRAMES ever fires. Cap the nesting so it throws a catchable
         // RangeError (staging/sm/extensions/recursion.js) instead of crashing.
         if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
-            return Err(Thrown(
-                "RangeError: Maximum call stack size exceeded".into(),
-            ));
+            return Err(self.run_loop_depth_exceeded(stop_depth));
         }
         self.run_loop_depth += 1;
         let r = self.run_loop_body(stop_depth);
         self.run_loop_depth -= 1;
         r
+    }
+
+    /// The re-entry cap refused a nested `run_loop`. Every caller pushed the
+    /// frame(s) it wanted run BEFORE calling in, so leave the stack exactly as
+    /// an uncaught throw out of that loop would: a real RangeError in
+    /// `pending_throw`, and every frame above `stop_depth` popped with its
+    /// register window. Callers that swallow the error (the async driver
+    /// rejecting its promise, a Promise executor) otherwise kept running with
+    /// the refused frame still on top, so the caller's next `Return` popped
+    /// it instead of its own and re-dispatched its own frame from a stale ip
+    /// — the function body ran again, hit the cap again, forever. The refused
+    /// frames' own handlers are deliberately not consulted: nothing may run in
+    /// them at the cap (a resumed generator/async frame carries its handlers).
+    #[cold]
+    fn run_loop_depth_exceeded(&mut self, stop_depth: usize) -> Thrown {
+        const MSG: &str = "RangeError: Maximum call stack size exceeded";
+        while self.frames.len() > stop_depth {
+            let top = self.frames.len() - 1;
+            if self.frames[top].args_obj != u32::MAX {
+                let aidx = self.frames[top].args_obj;
+                self.args_sync_dense(aidx);
+            }
+            let f = self.frames.pop().unwrap();
+            self.regs.truncate(f.base);
+        }
+        // Created in the CALLER's context: the refused callee never ran.
+        let v = self.alloc_error_from_message(MSG);
+        self.realm_adopt_error(v);
+        self.pending_throw = Some(v);
+        Thrown(MSG.into())
+    }
+
+    /// CopyDataProperties (object rest) re-reads each snapshotted key's own
+    /// descriptor AT COPY TIME: a getter run for an earlier key may have
+    /// deleted a later one or made it non-enumerable, and such a key is
+    /// skipped. Only an ordinary object's ObjMap can change under the walk; a
+    /// string source's index keys are fixed.
+    pub(crate) fn rest_key_still_enumerable(&self, src: Value, key: &str) -> bool {
+        match self.heap.get(src.heap_index()) {
+            HeapObj::Object(map) => map.pos(key).is_some_and(|i| map.attr_at(i).enumerable),
+            _ => true,
+        }
     }
 
     fn run_loop_body(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
@@ -939,8 +979,14 @@ impl<'p> Vm<'p> {
                         // PutValue runs after the RHS, so an RHS exception must
                         // win (`seen = act()` where act() throws propagates the
                         // act() throw — staging/sm/Proxy/getPrototypeOf).
-                        if self.globals[idx as usize].is_uninitialized() {
-                            let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                        // An unnamed pool slot is a DECLARED module/realm
+                        // binding: the store itself raises its error.
+                        let name = if self.globals[idx as usize].is_uninitialized() {
+                            self.global_slot_name(idx)
+                        } else {
+                            None
+                        };
+                        if let Some(name) = name {
                             let own_backed = !self.global_name_is_lexical(&name)
                                 && self.global_this != 0
                                 && matches!(
@@ -977,7 +1023,9 @@ impl<'p> Vm<'p> {
                         // read-modify-write forms, whose Get already PROVED the
                         // reference resolvable, use StoreGlobalResolved instead.)
                         if self.globals[idx as usize].is_uninitialized() {
-                            let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                            let Some(name) = self.global_slot_name(idx) else {
+                                return Err(self.unnamed_global_slot_error(idx));
+                            };
                             // The reference IS resolvable when the name is a
                             // builtin global: undefined/NaN/Infinity are
                             // non-writable data props (strict write →
@@ -1076,7 +1124,9 @@ impl<'p> Vm<'p> {
                                 .rposition(|&i| i == idx)
                             {
                                 self.strict_unresolvable_globals.remove(p);
-                                let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                                let Some(name) = self.global_slot_name(idx) else {
+                                    return Err(self.unnamed_global_slot_error(idx));
+                                };
                                 return Err(Thrown(format!(
                                     "ReferenceError: {name} is not defined"
                                 )));
@@ -1090,7 +1140,9 @@ impl<'p> Vm<'p> {
                         // raises. Emitted only where the compiler put a
                         // load_binding of the SAME binding immediately before.
                         if self.globals[idx as usize].is_uninitialized() {
-                            let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                            let Some(name) = self.global_slot_name(idx) else {
+                                return Err(self.unnamed_global_slot_error(idx));
+                            };
                             // undefined/NaN/Infinity are non-writable data
                             // properties: a strict write is a TypeError.
                             if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
@@ -1311,9 +1363,15 @@ impl<'p> Vm<'p> {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
                         let r = if va.is_int() && vb.is_int() {
-                            match va.as_int().checked_mul(vb.as_int()) {
-                                Some(v) => Value::int(v),
-                                None => Value::num(va.as_int() as f64 * vb.as_int() as f64),
+                            // A ZERO product with a negative operand is -0 in JS
+                            // (`0 * -5`), which no Int encodes: like `Mod` below,
+                            // that case and overflow take the f64 product. One
+                            // operand is 0 whenever `v == 0`, so the sign of the
+                            // other is the sign of `ia | ib`.
+                            let (ia, ib) = (va.as_int(), vb.as_int());
+                            match ia.checked_mul(ib) {
+                                Some(v) if v != 0 || (ia | ib) >= 0 => Value::int(v),
+                                _ => Value::num(ia as f64 * ib as f64),
                             }
                         } else if va.is_number() && vb.is_number() {
                             Value::num(va.as_f64() * vb.as_f64())
@@ -1674,7 +1732,7 @@ impl<'p> Vm<'p> {
                                     Value::UNDEFINED,
                                     None,
                                 )? {
-                                    Some(s) => self.alloc_str(s),
+                                    Some(s) => self.json_stringify_result(s, &indent),
                                     None => Value::UNDEFINED,
                                 }
                             }
@@ -1739,16 +1797,25 @@ impl<'p> Vm<'p> {
                             if vv.is_heap() {
                                 self.args_sync_dense(vv.heap_index());
                             }
-                            // An array whose Array.prototype[Symbol.iterator] was
-                            // replaced spreads via the iterator protocol (the inline
-                            // fast path below assumes the default iterator).
-                            if vv.is_heap()
-                                && matches!(self.heap.get(vv.heap_index()), HeapObj::Array(_))
-                            {
+                            // Everything that is NOT one of the four inline fast
+                            // paths below (Array / Set / Str|Cons / Map) is drained
+                            // through the iterator protocol, which raises the
+                            // TypeError when the value has genuinely no
+                            // @@iterator. Naming the kinds explicitly instead left
+                            // `[...new Proxy([1,2],{})]`, `[...new String("ab")]`
+                            // and any object with a user-installed @@iterator
+                            // reporting "not iterable".
+                            // The inline paths stand in for the iterator only
+                            // while it is unobservable: the @@iterator read here
+                            // (GetIterator's one Get) is the kind's intrinsic and
+                            // its %XIteratorPrototype%.next is pristine. A
+                            // replaced @@iterator (own, subclass, patched
+                            // prototype) or a patched `next` spreads through the
+                            // protocol with the method already read.
+                            if vv.is_heap() && !self.builtin_iter_fast(vv, false) {
                                 let m = self.get_prop(vv, "@@iterator")?;
-                                if m.bits() != self.default_array_iter.bits() && self.is_callable(m)
-                                {
-                                    let elems = self.iterate_to_vec(vv)?;
+                                if !self.builtin_iter_pristine(vv, m, false) {
+                                    let elems = self.iterate_with_method(vv, m)?;
                                     if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                         dst_items.extend(elems);
                                     }
@@ -1756,25 +1823,26 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
-                            // Everything that is NOT one of the four inline fast
-                            // paths below (Array / Set / Str|Cons / Map) is drained
-                            // through the iterator protocol; iterate_to_vec →
-                            // get_iterator raises the TypeError when the value has
-                            // genuinely no @@iterator. Naming the kinds explicitly
-                            // instead left `[...new Proxy([1,2],{})]`,
-                            // `[...new String("ab")]` and any object with a
-                            // user-installed @@iterator reporting "not iterable".
+                            // A string spreads by CODE POINT, exactly: a lone
+                            // surrogate is its own one-unit string (the lossy
+                            // `char` view made it U+FFFD).
+                            if let Some(elems) = self.string_iter_values(vv, usize::MAX) {
+                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                                    dst_items.extend(elems);
+                                }
+                                ip += 1;
+                                continue;
+                            }
+                            // A TypedArray has no inline arm below: its element
+                            // count is the view's LIVE length (a length-tracking
+                            // view over a grown buffer yields the new elements)
+                            // and a detached or out-of-bounds view is the
+                            // iterator's TypeError, both of which the positional
+                            // walk behind `iterate_to_vec` already gets right.
                             if vv.is_heap()
-                                && !matches!(
-                                    self.heap.get(vv.heap_index()),
-                                    HeapObj::Array(_)
-                                        | HeapObj::Set(_)
-                                        | HeapObj::Str(_)
-                                        | HeapObj::Cons { .. }
-                                        | HeapObj::Map { .. }
-                                )
+                                && matches!(self.heap.get(vv.heap_index()), HeapObj::TypedArray { .. })
                             {
-                                let elems = self.iterate_to_vec(vv)?;
+                                let elems = self.positional_iteration_elements(vv)?;
                                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                     dst_items.extend(elems);
                                 }
@@ -1782,9 +1850,10 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                             // Materialize the spread source's elements (array/set â†’
-                            // elements; string â†’ chars; map â†’ [k,v] entries) WITHOUT
-                            // holding a heap borrow across the fresh allocations.
-                            let mut chars: Option<Vec<char>> = None;
+                            // elements; map â†’ [k,v] entries) WITHOUT holding a heap
+                            // borrow across the fresh allocations. A string never
+                            // reaches here: `string_iter_values` above already
+                            // spread it by EXACT code point.
                             let mut map_pairs: Option<Vec<(Value, Value)>> = None;
                             let mut array_src: Option<u32> = None;
                             if vv.is_heap() {
@@ -1804,15 +1873,6 @@ impl<'p> Vm<'p> {
                                         if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
                                             d.extend(elems);
                                         }
-                                    }
-                                    HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                                        chars = Some(
-                                            self.heap
-                                                .str_cow(vv.heap_index())
-                                                .unwrap()
-                                                .chars()
-                                                .collect(),
-                                        );
                                     }
                                     HeapObj::Map { keys, vals } => {
                                         // Skip tombstoned (deleted) entries.
@@ -1841,15 +1901,6 @@ impl<'p> Vm<'p> {
                                     dst_items.extend(elems);
                                 }
                             }
-                            if let Some(chars) = chars {
-                                let elems: Vec<Value> = chars
-                                    .into_iter()
-                                    .map(|c| self.alloc_str(c.to_string()))
-                                    .collect();
-                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                                    dst_items.extend(elems);
-                                }
-                            }
                             if let Some(pairs) = map_pairs {
                                 let elems: Vec<Value> = pairs
                                     .into_iter()
@@ -1868,7 +1919,10 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ArrayRest { dst, src, start } => {
                         let sv = self.get(base, src);
-                        let mut elems = self.iterate_to_vec(sv)?;
+                        // `src` is IterToArray's normalized value (the only
+                        // producer of this op's operand), whose GetIterator
+                        // already ran: walk it without a second one.
+                        let mut elems = self.destructure_rest(sv)?;
                         let start = (start as usize).min(elems.len());
                         let rest = elems.split_off(start);
                         let arr = Value::heap(self.heap.alloc(HeapObj::Array(rest)));
@@ -1936,11 +1990,7 @@ impl<'p> Vm<'p> {
                         } else {
                             Vec::new()
                         };
-                        let mut m = ObjMap::new();
-                        for k in keys {
-                            let v = self.get_prop(s, &k)?;
-                            m.set(&k, v);
-                        }
+                        let m = self.object_rest_plain(s, keys)?;
                         let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                         self.set(base, dst, v);
                         ip += 1;
@@ -1993,11 +2043,7 @@ impl<'p> Vm<'p> {
                         } else {
                             Vec::new()
                         };
-                        let mut m = ObjMap::new();
-                        for k in keys {
-                            let v = self.get_prop(s, &k)?;
-                            m.set(&k, v);
-                        }
+                        let m = self.object_rest_plain(s, keys)?;
                         let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                         self.set(base, dst, v);
                         ip += 1;
@@ -2273,6 +2319,8 @@ impl<'p> Vm<'p> {
                             private_brand,
                             class_id,
                             dec: None,
+                            proto_dirty: false,
+                            reproto_instances: false,
                         }))));
                         self.brand_owner.insert(private_brand, v.heap_index());
                         // Remember it so `super` in a derived class can reach it.
@@ -3668,8 +3716,7 @@ impl<'p> Vm<'p> {
                                 {
                                     // `String(symbol)` is allowed (unlike ToString,
                                     // which throws) and yields "Symbol(desc)".
-                                    let s = self.symbol_descriptive_string(a0)?;
-                                    self.alloc_str(s)
+                                    self.symbol_descriptive_value(a0)?
                                 } else {
                                     // Proper ToString: routes objects/functions
                                     // through their `toString` (so a function yields
@@ -4021,7 +4068,14 @@ impl<'p> Vm<'p> {
                                 self.promise_combine(crate::heap::CombKind::Any, a0, c)?
                             }
                             S::ObjectDefineProperty => {
-                                self.require_object_coercible(a0)?; // Type(O) must be Object
+                                // Type(O) must be Object — checked BEFORE
+                                // ToPropertyKey(P), whose toString may run.
+                                if !self.is_object_value(a0) {
+                                    return Err(Thrown(
+                                        "TypeError: Object.defineProperty called on non-object"
+                                            .into(),
+                                    ));
+                                }
                                 let key = self.to_property_key(
                                     args.get(1).copied().unwrap_or(Value::UNDEFINED),
                                 )?;
@@ -4078,7 +4132,11 @@ impl<'p> Vm<'p> {
                                 }
                                 if let Some(props) = args.get(1).copied() {
                                     if props != Value::UNDEFINED {
-                                        self.object_define_properties(o, props)?;
+                                        // `o` is a Rust local across the descriptor
+                                        // getters (as in the OBJ_CREATE native).
+                                        self.with_host_roots(&[o], |vm| {
+                                            vm.object_define_properties(o, props)
+                                        })?;
                                     }
                                 }
                                 o
@@ -4132,28 +4190,23 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let nums: Vec<f64> = elems
-                            .iter()
-                            .map(|&v| self.to_number_strict(v))
-                            .collect::<Result<_, _>>()?;
+                        // The variadic ops reduce exactly like a direct call
+                        // (`eval_math_args`: -0 < +0 ordering, a ±Infinity
+                        // hypot argument beating NaN); f64::max/min leave the
+                        // sign of a zero tie unspecified.
                         let r = match op {
-                            M::Max => nums.iter().fold(f64::NEG_INFINITY, |a, &b| {
-                                if a.is_nan() || b.is_nan() {
-                                    f64::NAN
-                                } else {
-                                    a.max(b)
-                                }
-                            }),
-                            M::Min => nums.iter().fold(f64::INFINITY, |a, &b| {
-                                if a.is_nan() || b.is_nan() {
-                                    f64::NAN
-                                } else {
-                                    a.min(b)
-                                }
-                            }),
-                            M::Hypot => nums.iter().map(|&v| v * v).sum::<f64>().sqrt(),
+                            // `eval_math_args` is the ONE reduction: Hypot goes
+                            // through `hypot_scaled` there, as every other tier
+                            // computes it.
+                            M::Max | M::Min | M::Hypot => self.eval_math_args(op, &elems)?,
                             // A non-variadic Math fn spread is unusual; apply to elem 0.
-                            _ => self.eval_math_one(op, nums.first().copied().unwrap_or(f64::NAN)),
+                            _ => {
+                                let nums: Vec<f64> = elems
+                                    .iter()
+                                    .map(|&v| self.to_number_strict(v))
+                                    .collect::<Result<_, _>>()?;
+                                self.eval_math_one(op, nums.first().copied().unwrap_or(f64::NAN))
+                            }
                         };
                         self.set(base, dst, Value::num(r));
                         ip += 1;
@@ -4571,6 +4624,13 @@ impl<'p> Vm<'p> {
                     Instr::JumpIfFalse { cond, target } => {
                         let v = self.get(base, cond);
                         if !self.truthy(v) {
+                            // A taken BACKWARD conditional closes a loop
+                            // (`do … while`): the same GC safe point as the
+                            // `Jump` back-edge, or an allocating loop with no
+                            // frame transition never collects.
+                            if (target as usize) < ip {
+                                self.maybe_gc();
+                            }
                             ip = target as usize;
                         } else {
                             ip += 1;
@@ -4579,6 +4639,11 @@ impl<'p> Vm<'p> {
                     Instr::JumpIfTrue { cond, target } => {
                         let v = self.get(base, cond);
                         if self.truthy(v) {
+                            // See `JumpIfFalse`: a backward taken branch is a
+                            // loop back-edge.
+                            if (target as usize) < ip {
+                                self.maybe_gc();
+                            }
                             ip = target as usize;
                         } else {
                             ip += 1;
@@ -4818,6 +4883,10 @@ impl<'p> Vm<'p> {
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
                             self.closure_eval_scope.insert(v.heap_index(), sc);
                         }
+                        // A function declared inside a class body keeps that
+                        // body private scope.
+                        let defining = self.frames[frame_idx].callee;
+                        self.inherit_private_brands(defining, v.heap_index());
                         self.realm_tag_new(v.heap_index());
                         self.set(base, dst, v);
                         ip += 1;
@@ -4877,6 +4946,8 @@ impl<'p> Vm<'p> {
                         if nt != Value::UNDEFINED {
                             self.record_closure_new_target(v.heap_index(), nt);
                         }
+                        // ... the enclosing class body private scope ...
+                        self.inherit_private_brands(callee, v.heap_index());
                         // ... and any dynamic EvalScope of the defining frame.
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
                             self.closure_eval_scope.insert(v.heap_index(), sc);
@@ -5191,28 +5262,11 @@ impl<'p> Vm<'p> {
                         // InstallErrorCause (ES2022): an options object with a `cause`
                         // gives the error a non-enumerable own `cause` property.
                         // HasProperty walks the proto chain AND fires a Proxy
-                        // `has` trap (observable; its throw propagates).
+                        // `has` trap (observable; its throw propagates). The
+                        // error is rooted across that guest code.
                         if let Some(or) = opts {
                             let options = self.get(base, or);
-                            let kc = self.alloc_str("cause".to_string());
-                            if self.is_object_value(options)
-                                && self.has_property_dyn(options, kc)?
-                            {
-                                let cause = self.get_prop(options, "cause")?;
-                                if let HeapObj::Object(m) = self.heap.get_mut(v.heap_index()) {
-                                    m.define(
-                                        "cause",
-                                        cause,
-                                        PropAttr {
-                                            writable: true,
-                                            enumerable: false,
-                                            configurable: true,
-                                            accessor: false,
-                                            setter: Value::UNDEFINED,
-                                        },
-                                    );
-                                }
-                            }
+                            self.install_error_cause(v, options)?;
                         }
                         // AggregateError installs `errors` LAST (after message + cause):
                         // a non-enumerable own array of IterableToList(firstArg). It runs
@@ -5222,7 +5276,7 @@ impl<'p> Vm<'p> {
                             let errors_arg = errors
                                 .map(|er| self.get(base, er))
                                 .unwrap_or(Value::UNDEFINED);
-                            self.install_agg_errors(v, errors_arg)?;
+                            self.with_host_roots(&[v], |vm| vm.install_agg_errors(v, errors_arg))?;
                         }
                         self.set(base, dst, v);
                         ip += 1;
@@ -5508,9 +5562,10 @@ impl<'p> Vm<'p> {
                         // Spec order: ToString(spec); then a non-undefined non-object
                         // `opts` â†’ TypeError; `import.source` â†’ SyntaxError (source
                         // phase unavailable for a text module); otherwise resolve the
-                        // specifier against the script's dir, load + evaluate the
-                        // module ONCE (cached by path so re-import yields the SAME
-                        // namespace), and resolve with its (snapshot) namespace. A
+                        // specifier against the referrer's dir, load + evaluate the
+                        // module ONCE in a later job (cached by path so re-import
+                        // yields the SAME namespace), and resolve with its
+                        // (snapshot) namespace. A
                         // missing file / no base dir â†’ TypeError; a throw during
                         // ToString or evaluation rejects with that value. import()
                         // never throws synchronously. Everything that may GC runs
@@ -5556,7 +5611,10 @@ impl<'p> Vm<'p> {
                                     // proposal evaluates a deferred graph's
                                     // async modules EAGERLY, with the returned
                                     // promise waiting on them.
-                                    match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
+                                    match self
+                                        .dynamic_import_base_dir(func_id)
+                                        .map(|d| d.join(&spec_str))
+                                    {
                                         None => Err(self.make_error(1, None)),
                                         // A fresh Evaluate() for the eager
                                         // async subgraph: its own DFS stack
@@ -5602,25 +5660,32 @@ impl<'p> Vm<'p> {
                                                 .unwrap_or_else(|| self.error_from_thrown(&msg))),
                                         },
                                     }
-                                } else if !self.module_loading.is_empty() {
-                                    // A dynamic import issued WHILE a static
-                                    // module link DFS is in flight (a
-                                    // dependency body evaluating inside an
-                                    // ancestor's import loop) must NOT preempt
-                                    // the spec's DFS evaluation order
-                                    // (verify-dfs): defer the whole load to a
-                                    // microtask — by the time it runs, the DFS
-                                    // has completed (the target then usually
-                                    // sits in the cache already).
-                                    match self.module_base_dir.as_ref() {
+                                } else {
+                                    // ContinueDynamicImport links and evaluates
+                                    // in a LATER job: the target's body never
+                                    // runs inside the import() call, before the
+                                    // rest of the calling code or jobs queued
+                                    // ahead of it. The same deferral keeps an
+                                    // import issued while a static link DFS is
+                                    // in flight (a dependency body evaluating
+                                    // inside an ancestor's import loop) from
+                                    // preempting the DFS evaluation order
+                                    // (verify-dfs). The specifier resolves
+                                    // against the REFERRER now; the job gets
+                                    // the joined path.
+                                    match self
+                                        .dynamic_import_base_dir(func_id)
+                                        .map(|d| d.join(&spec_str))
+                                    {
                                         None => Err(self.make_error(1, None)),
-                                        Some(_) => {
+                                        Some(path) => {
                                             let p = self.alloc_promise();
                                             // Root the promise in dst across the
                                             // allocations below.
                                             self.set(base, dst, Value::heap(p));
                                             let _gc = self.gc_lock_guard();
-                                            let sv = self.alloc_str(spec_str.clone());
+                                            let sv = self
+                                                .alloc_str(path.to_string_lossy().into_owned());
                                             let mut bargs = vec![sv];
                                             if let Some(t) = &mtype {
                                                 let tv = self.alloc_str(t.clone());
@@ -5650,24 +5715,6 @@ impl<'p> Vm<'p> {
                                             deferred = true;
                                             Ok(Value::heap(p))
                                         }
-                                    }
-                                } else {
-                                    match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
-                                        None => Err(self.make_error(1, None)),
-                                        // import_module canonicalizes, caches, runs, and
-                                        // recursively links re-exports; the returned value
-                                        // IS the fully-linked namespace.
-                                        Some(p) => match self.import_module(&p, mtype.as_deref()) {
-                                            Ok(ns) => Ok(ns),
-                                            // A loader Thrown carries its error type in
-                                            // the message prefix ("SyntaxError: …") —
-                                            // reject with the MATCHING error object, not
-                                            // an empty TypeError.
-                                            Err(Thrown(msg)) => Err(self
-                                                .pending_throw
-                                                .take()
-                                                .unwrap_or_else(|| self.error_from_thrown(&msg))),
-                                        },
                                     }
                                 }
                             }
@@ -5727,15 +5774,17 @@ impl<'p> Vm<'p> {
                         let vv = self.get(base, val);
                         // ToPropertyKey ONCE (the key expression was already evaluated).
                         let k = self.coerce_index_key(kv)?;
-                        if self.key_of(k) == "prototype" {
+                        let key = self.key_of(k);
+                        if key == "prototype" {
                             return Err(Thrown(
                                 "TypeError: Classes may not have a static property named 'prototype'"
                                     .into(),
                             ));
                         }
-                        // The resolved key is a string/symbol, so set_index's own
-                        // ToPropertyKey is idempotent (no user code runs twice).
-                        self.set_index(cv, k, vv, true)?;
+                        // DefineField (CreateDataPropertyOrThrow), not [[Set]]:
+                        // `static ['name'] = v` replaces the constructor's own
+                        // read-only `name`, and no inherited setter runs.
+                        self.define_field(cv, &key, vv)?;
                         ip += 1;
                     }
                     Instr::DefineAccessor {
@@ -7202,50 +7251,8 @@ impl<'p> Vm<'p> {
                         // leading-'#' test; textual fallback when no brand resolvable.
                         let mut private_callee: Option<Value> = None;
                         if is_private_key(key) {
-                            if let Some((b, kind, owner)) = self.resolve_private(key) {
-                                // Declaring-class-resolved, KIND-aware (FIX-3).
-                                if !self.private_receiver_ok(recv, b, kind, owner) {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                                    )));
-                                }
-                                let f = if kind & 1 != 0 {
-                                    self.private_member_from_owner(owner, key, (kind & 8) | 1)
-                                        .unwrap_or(Value::UNDEFINED)
-                                } else if kind & 2 != 0 {
-                                    let g = self
-                                        .private_member_from_owner(owner, key, (kind & 8) | 2)
-                                        .unwrap_or(Value::UNDEFINED);
-                                    self.call_value(g, recv, &[])?
-                                } else if kind & 4 != 0 {
-                                    return Err(Thrown(format!(
-                                        "TypeError: '{key}' was defined without a getter"
-                                    )));
-                                } else {
-                                    match self.private_field_get(recv, b, key) {
-                                        Some(v) => v,
-                                        None => {
-                                            return Err(Thrown(format!(
-                                                "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                                            )));
-                                        }
-                                    }
-                                };
-                                private_callee = Some(f);
-                            } else {
-                                let textual = self.has_property_str(recv, key)
-                                    || self.private_field_scan_has(recv, key);
-                                let present = match self.private_brand_ok(recv, key) {
-                                    Some(b) => textual && b,
-                                    None => textual,
-                                };
-                                if !present {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                                    )));
-                                }
-                                private_callee = self.private_field_scan(recv, key);
-                            }
+                            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+                            private_callee = self.private_method_callee(ctx, recv, key)?;
                         }
                         // ── interpreter method-call IC ── a monomorphic /
                         // low-polymorphic `obj.method()` resolves through the
@@ -7441,7 +7448,11 @@ impl<'p> Vm<'p> {
                         } else {
                             self.display(k)
                         };
-                        if !numeric_key {
+                        // Only a PRIMITIVE key's display is its property key. An
+                        // object key (a String wrapper, anything with its own
+                        // toString / @@toPrimitive) is named by ToPropertyKey,
+                        // which runs user code — `get_index` below performs it.
+                        if !numeric_key && !self.is_object_value(k) {
                             if let Some(result) =
                                 self.try_builtin_method(recv, &kstr, base, arg_base, argc)?
                             {
@@ -7602,9 +7613,15 @@ impl<'p> Vm<'p> {
                                 let jump_target =
                                     self.regs[base + val_reg as usize].as_int() as u32;
                                 let floor = (raw >> 2) as usize;
+                                let from = ip;
                                 match self.route_jump_through_finally(jump_target, floor) {
                                     Some(target) => ip = target as usize,
                                     None => ip = jump_target as usize,
+                                }
+                                // A `continue` resumed through a finally re-enters
+                                // its loop without the loop's `Jump` back-edge.
+                                if ip < from {
+                                    self.maybe_gc();
                                 }
                             }
                             _ => {
@@ -7613,13 +7630,12 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Instr::OpenUsingScope { dst } => {
-                        // Allocate a fresh `using` resource scope; its id (in a
-                        // register, so it rides the frame across suspensions) keys
-                        // the disposer list in `using_resources`.
-                        let id = self.using_next_id;
-                        self.using_next_id = self.using_next_id.wrapping_add(1);
-                        self.using_resources.insert(id, Vec::new());
-                        self.set(base, dst, Value::int(id as i32));
+                        // Allocate a fresh `using` resource scope (see
+                        // `using_scope_new`): it lives exactly as long as the
+                        // frame does, so a generator abandoned mid-block takes
+                        // its resources with it instead of rooting them forever.
+                        let list = self.using_scope_new();
+                        self.set(base, dst, list);
                         ip += 1;
                     }
                     Instr::RegisterDisposable { scope, val } => {
@@ -7650,10 +7666,8 @@ impl<'p> Vm<'p> {
                                 this: v,
                                 args: Vec::new(),
                             }));
-                            let id = self.get(base, scope).as_int() as u32;
-                            if let Some(d) = self.using_resources.get_mut(&id) {
-                                d.push(disposer);
-                            }
+                            let list = self.get(base, scope);
+                            self.using_scope_push(list, disposer, false);
                             ip += 1;
                         }
                     }
@@ -7666,8 +7680,8 @@ impl<'p> Vm<'p> {
                         // any throw with the incoming completion (kind&3==2 â‡’ the
                         // block already threw) into a SuppressedError chain; rewrite
                         // kind/val so the following EndFinally re-raises the merge.
-                        let id = self.get(base, scope).as_int() as u32;
-                        let disposers = self.using_resources.remove(&id).unwrap_or_default();
+                        let list = self.get(base, scope);
+                        let disposers = self.using_scope_take(list);
                         let raw = self.regs[base + kind_reg as usize].as_int();
                         let incoming = if raw & 3 == 2 {
                             Some(self.regs[base + val_reg as usize])
@@ -7687,11 +7701,10 @@ impl<'p> Vm<'p> {
                         // @@asyncDispose FIRST (once), fall back to @@dispose only when
                         // it is nullish; both absent/non-callable â†’ TypeError.
                         let v = self.get(base, val);
-                        let id = self.get(base, scope).as_int() as u32;
+                        let list = self.get(base, scope);
                         if v.is_nullish() {
-                            if let Some(d) = self.using_resources.get_mut(&id) {
-                                d.push(Value::UNDEFINED); // inert: awaited, not called
-                            }
+                            // Inert: sets needsAwait at disposal, calls nothing.
+                            self.using_scope_push(list, Value::UNDEFINED, true);
                             ip += 1;
                         } else {
                             if !self.is_object_value(v) {
@@ -7714,7 +7727,10 @@ impl<'p> Vm<'p> {
                                 ));
                             }
                             let disposer = if sync_fallback {
-                                let shim = self.sync_dispose_shim()?;
+                                // The first use compiles the shim with an eval;
+                                // `method` may be a getter's fresh function.
+                                let shim =
+                                    self.with_host_roots(&[method], Self::sync_dispose_shim)?;
                                 Value::heap(self.heap.alloc(HeapObj::Bound {
                                     target: shim,
                                     this: method,
@@ -7727,9 +7743,7 @@ impl<'p> Vm<'p> {
                                     args: Vec::new(),
                                 }))
                             };
-                            if let Some(d) = self.using_resources.get_mut(&id) {
-                                d.push(disposer);
-                            }
+                            self.using_scope_push(list, disposer, true);
                             ip += 1;
                         }
                     }
@@ -7739,25 +7753,48 @@ impl<'p> Vm<'p> {
                         // A real bound disposer is CALLED here (carrying its `this`);
                         // its result is left in `res` for the caller to Await. A sync
                         // throw propagates (caught by the loop's handler).
-                        let id = self.get(base, scope).as_int() as u32;
-                        let entry = self.using_resources.get_mut(&id).and_then(|d| d.pop());
-                        match entry {
-                            None => {
-                                self.set(base, done, Value::bool(true));
-                                self.set(base, res, Value::UNDEFINED);
-                                ip += 1;
+                        //
+                        // DisposeResources' await economy: an inert entry only
+                        // sets needsAwait, a sync-hint entry's result is not
+                        // awaited, and the one Await(undefined) a nullish entry
+                        // owes is paid before the next sync call or at the end,
+                        // and only when no async result was awaited. Each step
+                        // runs until it has a value to Await (done=false) or the
+                        // list is spent (done=true). Awaiting every entry cost a
+                        // microtask tick per null and per sync `using`.
+                        let list = self.get(base, scope);
+                        let r = loop {
+                            let (needs_await, has_awaited) = self.using_scope_flags(list);
+                            let owed = needs_await && !has_awaited;
+                            match self.using_scope_pop(list) {
+                                None if owed => {
+                                    self.set_using_scope_flags(list, false, has_awaited);
+                                    break Some(Value::UNDEFINED);
+                                }
+                                None => break None,
+                                Some((d, false)) if owed => {
+                                    // Await(undefined) BEFORE this sync disposer.
+                                    self.set_using_scope_flags(list, false, has_awaited);
+                                    self.using_scope_push(list, d, false);
+                                    break Some(Value::UNDEFINED);
+                                }
+                                Some((d, false)) => {
+                                    self.call_value(d, Value::UNDEFINED, &[])?;
+                                }
+                                Some((d, true)) if d.is_nullish() => {
+                                    self.set_using_scope_flags(list, true, has_awaited);
+                                }
+                                Some((d, true)) => {
+                                    let r = self.call_value(d, Value::UNDEFINED, &[])?;
+                                    let (needs_await, _) = self.using_scope_flags(list);
+                                    self.set_using_scope_flags(list, needs_await, true);
+                                    break Some(r);
+                                }
                             }
-                            Some(d) => {
-                                self.set(base, done, Value::bool(false));
-                                let r = if d.is_nullish() {
-                                    Value::UNDEFINED
-                                } else {
-                                    self.call_value(d, Value::UNDEFINED, &[])?
-                                };
-                                self.set(base, res, r);
-                                ip += 1;
-                            }
-                        }
+                        };
+                        self.set(base, done, Value::bool(r.is_none()));
+                        self.set(base, res, r.unwrap_or(Value::UNDEFINED));
+                        ip += 1;
                     }
                     Instr::MergeDispose {
                         kind_reg,
@@ -7784,9 +7821,15 @@ impl<'p> Vm<'p> {
                         // A `break`/`continue` exiting one or more `try` blocks:
                         // run each intervening `finally` first, popping any
                         // intervening `catch`, then land at `target`.
+                        let from = ip;
                         match self.route_jump_through_finally(target, floor as usize) {
                             Some(t) => ip = t as usize,
                             None => ip = target as usize,
+                        }
+                        // `continue` out of a try lands back in the loop without
+                        // executing its `Jump` back-edge: poll like one.
+                        if ip < from {
+                            self.maybe_gc();
                         }
                     }
                     Instr::SetRaw { arr, raw } => {
@@ -8044,10 +8087,12 @@ impl<'p> Vm<'p> {
                                         None => self.iter_result(Value::UNDEFINED, true),
                                     }
                                 } else {
-                                    let len = match self.heap.get(it.heap_index()) {
-                                        HeapObj::Array(items) => items.len(),
-                                        HeapObj::Set(items) => items.len(),
-                                        HeapObj::Map { keys, .. } => keys.len(),
+                                    // `coll`: a Map/Set step reads its entry positionally
+                                    // (`collection_entry_at`); an Array is an ordinary index.
+                                    let (len, coll) = match self.heap.get(it.heap_index()) {
+                                        HeapObj::Array(items) => (items.len(), false),
+                                        HeapObj::Set(items) => (items.len(), true),
+                                        HeapObj::Map { keys, .. } => (keys.len(), true),
                                         _ => {
                                             return Err(Thrown(format!(
                                                 "TypeError: {} is not iterable",
@@ -8056,7 +8101,11 @@ impl<'p> Vm<'p> {
                                         }
                                     };
                                     if cursor < len {
-                                        let val = self.get_index(it, Value::int(cursor as i32))?;
+                                        let val = if coll {
+                                            self.collection_entry_at(it, cursor)
+                                        } else {
+                                            self.get_index(it, Value::int(cursor as i32))?
+                                        };
                                         self.set(base, idx, Value::int((cursor + 1) as i32));
                                         self.iter_result(val, false)
                                     } else {
@@ -8572,18 +8621,22 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let len = match self.heap.get(it.heap_index()) {
-                            HeapObj::Array(items) => items.len(),
-                            HeapObj::Set(items) => items.len(),
-                            HeapObj::Str(s) => s.units(),
-                            HeapObj::Cons { len, .. } => *len,
-                            HeapObj::Map { keys, .. } => keys.len(),
+                        // `coll`: a Map/Set step reads its entry positionally
+                        // (`collection_entry_at`); everything else is an ordinary index.
+                        let (len, coll) = match self.heap.get(it.heap_index()) {
+                            // The JS length: past the dense store for a
+                            // virtual array (the fast path above declined it).
+                            HeapObj::Array(_) => (self.js_array_len(it.heap_index()), false),
+                            HeapObj::Set(items) => (items.len(), true),
+                            HeapObj::Str(s) => (s.units(), false),
+                            HeapObj::Cons { len, .. } => (*len, false),
+                            HeapObj::Map { keys, .. } => (keys.len(), true),
                             // The LIVE length each step: a tracking view follows its
                             // resizable buffer (shrink ends early, grow yields more);
                             // a detached/out-of-bounds view mid-iteration throws.
                             HeapObj::TypedArray { .. } => {
                                 match self.ta_effective_len(it.heap_index()) {
-                                    Some(n) => n,
+                                    Some(n) => (n, false),
                                     None => {
                                         return Err(Thrown(
                                             "TypeError: TypedArray iterator: the viewed buffer is detached or out of bounds".into(),
@@ -8599,10 +8652,14 @@ impl<'p> Vm<'p> {
                             }
                         };
                         if cursor < len {
-                            let val = self.get_index(it, Value::int(cursor as i32))?;
+                            let val = if coll {
+                                self.collection_entry_at(it, cursor)
+                            } else {
+                                self.get_index(it, Value::int(cursor as i32))?
+                            };
                             self.set(base, value_dst, val);
                             self.set(base, done_dst, Value::bool(false));
-                            self.set(base, idx, Value::int((cursor + 1) as i32));
+                            self.set(base, idx, len_value(cursor + 1));
                         } else {
                             self.set(base, done_dst, Value::bool(true));
                         }
@@ -8679,10 +8736,12 @@ impl<'p> Vm<'p> {
                                         None => self.iter_result(Value::UNDEFINED, true),
                                     }
                                 } else {
-                                    let len = match self.heap.get(it.heap_index()) {
-                                        HeapObj::Array(items) => items.len(),
-                                        HeapObj::Set(items) => items.len(),
-                                        HeapObj::Map { keys, .. } => keys.len(),
+                                    // `coll`: a Map/Set step reads its entry positionally
+                                    // (`collection_entry_at`); an Array is an ordinary index.
+                                    let (len, coll) = match self.heap.get(it.heap_index()) {
+                                        HeapObj::Array(items) => (items.len(), false),
+                                        HeapObj::Set(items) => (items.len(), true),
+                                        HeapObj::Map { keys, .. } => (keys.len(), true),
                                         _ => {
                                             return Err(Thrown(format!(
                                                 "TypeError: {} is not iterable",
@@ -8691,7 +8750,11 @@ impl<'p> Vm<'p> {
                                         }
                                     };
                                     if cursor < len {
-                                        let val = self.get_index(it, Value::int(cursor as i32))?;
+                                        let val = if coll {
+                                            self.collection_entry_at(it, cursor)
+                                        } else {
+                                            self.get_index(it, Value::int(cursor as i32))?
+                                        };
                                         self.set(base, idx, Value::int((cursor + 1) as i32));
                                         self.iter_result(val, false)
                                     } else {
@@ -9663,7 +9726,9 @@ impl<'p> Vm<'p> {
         let own_hit = o.is_heap()
             && kv.is_heap()
             && match self.heap.str_wtf8_cow(kv.heap_index()) {
-                Some(std::borrow::Cow::Borrowed(b)) => {
+                // ("@@…" is escaped as a key — `key_of` — so the generic path
+                // below decides it.)
+                Some(std::borrow::Cow::Borrowed(b)) if !b.starts_with(b"@@") => {
                     let oidx = o.heap_index();
                     match (std::str::from_utf8(b), self.heap.get(oidx)) {
                         (Ok(k), HeapObj::Object(m)) => m.pos(k).is_some(),
@@ -10118,25 +10183,35 @@ impl<'p> Vm<'p> {
     /// note below). Shared with the bare `MathOp` miss path, whose `Math`
     /// read must be exactly a `LoadGlobal`.
     #[inline(never)]
+    /// The ReferenceError for touching an uninitialized pool slot that has no
+    /// script-visible global name: a module declaration in its TDZ, a
+    /// ShadowRealm name never declared, or loader bookkeeping. None of these
+    /// may fall back to the incubating realm's global object — with no name
+    /// to probe, those lookups used to run for the literal property "?".
+    #[cold]
+    pub(crate) fn unnamed_global_slot_error(&self, idx: u32) -> Thrown {
+        Thrown(match self.pool_slot_names.get(&idx) {
+            Some(crate::vm::PoolSlotName::Module(name)) => {
+                format!("ReferenceError: Cannot access '{name}' before initialization")
+            }
+            Some(crate::vm::PoolSlotName::Realm(name)) => {
+                format!("ReferenceError: {name} is not defined")
+            }
+            None => "ReferenceError: binding accessed before initialization".into(),
+        })
+    }
+
     pub(crate) fn load_global_slow(&mut self, idx: u32, func_id: u32) -> Result<Value, Thrown> {
         let v = self.globals[idx as usize];
         if v.is_uninitialized() {
             // Referenced but never declared â†’ ReferenceError. The
             // name is in `program.global_names`, or â€” for a slot an
             // `eval` drew from the EVAL_POOL â€” in `eval_global_map`.
-            let name = self
-                .program
-                .global_names
-                .get(idx as usize)
-                .map(|s| s.as_str())
-                .or_else(|| {
-                    self.eval_global_map
-                        .iter()
-                        .find(|(_, &v)| v == idx)
-                        .map(|(k, _)| k.as_str())
-                })
-                .unwrap_or("?")
-                .to_string();
+            // A module / realm pool slot has neither and never resolves
+            // through the global object.
+            let Some(name) = self.global_slot_name(idx) else {
+                return Err(self.unnamed_global_slot_error(idx));
+            };
             // A binding created on the global OBJECT in sloppy code
             // (`this.x = v` / `globalThis.x = v`) lives as an own
             // property there, not in this slot. The global object's

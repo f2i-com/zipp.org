@@ -1,0 +1,16 @@
+basic Plain 1 2 3 new (5,) 5 6
+singleton True 2
+new-returns-foreign 42
+alt-constructors Point(0, 0) Point(3, 4) Point3(0, 0) 0
+bulk [Point(0, 0), Point(1, -1), Point(2, -2), Point(3, -3)] 12
+TypeError __init__() should return None, not 'int'
+list-sub [1, 2, 3, 4] 10 nums 4 [2, 3] list list True
+dict-sub 1 3 [('a', 1), ('b', 2), ('xyz', 3)] True dict
+tuple-sub (1, 'x') 1 ('x', 1) 2 True True Pair True
+tuple-sub-unpack 1 x [1, 'x'] (1, 'x', 2) tuple
+tree 37 10 3 [2, 2, 2]
+metaclass-call 3 True
+type-call 70 T WithInit
+object-new Plain True
+zero-arg-builtins ['Plain', 'list', 'dict', 'set', 'tuple', 'str', 'int', 'float', 'bool'] [[], {}, set(), (), '', 0, 0.0, False]
+conversions ['a', 'b'] {1: 2} {1} (1,) 12 7 1.5 False True

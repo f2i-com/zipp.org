@@ -46,6 +46,7 @@ pub(crate) fn compile_program_inner(
     module_mode: bool,
     main_goal: bool,
 ) -> R<Program> {
+    let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     let mut c = Compiler::new(source.to_string());
     c.module_mode = module_mode;
     c.main_goal = main_goal;
@@ -150,6 +151,7 @@ pub fn compile_eval(
     // self-name binding (see `Compiler::fn_ctor_no_self_name`).
     fn_ctor: bool,
 ) -> R<Program> {
+    let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     // MODULE early errors (ModuleDeclarationInstantiation): duplicate
     // LexicallyDeclaredNames (let/const/class AND top-level function — module
     // top-level functions are LEXICAL), or a lexical name colliding with any

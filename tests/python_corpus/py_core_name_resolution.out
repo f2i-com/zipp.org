@@ -1,0 +1,10 @@
+builtin-name print print
+builtin-name len len
+builtin-name abs abs
+builtin-name max max
+builtin-name sorted sorted
+builtin-name isinstance isinstance
+builtin-module builtins True
+injected 42
+later via-dict
+deleted False

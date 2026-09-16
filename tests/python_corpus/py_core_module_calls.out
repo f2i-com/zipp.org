@@ -1,0 +1,19 @@
+4.0 2 True
+True 6 5.0
+16
+P(x=1, y=2) P(x=3, y=4) [('a', 2)]
+OrderedDict({'a': 1}) deque([1, 2], maxlen=3)
+{"a": [1, 2], "b": 1}
+1 [2, 3]
+[5, 6, 7]
+True False
+[1, 'x', (2, 3)] [1, 'x', (2, 3)] [1, 'x', (2, 3)]
+{'k': 2} 3
+1
+5 1
+[1, 'x', (2, 3)] True
+patched 4
+2.0
+AttributeError: module 'math' has no attribute 'nope'
+TypeError: 'float' object is not callable
+TypeError raised

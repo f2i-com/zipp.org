@@ -8,6 +8,7 @@ function __zipp_py_call(name, args) { return __zipp_py.__rt.hostCall(name, args)
 function __zipp_py_take_ui() { const out = __zipp_py_ui; __zipp_py_ui = []; return out; }
 function __zipp_py_take_host() { return __zipp_py.__rt.takeHostRequests(); }
 function __zipp_py_vfs_changed() { return __zipp_py.__rt.vfsChangedText(); }
+function __zipp_py_exit_status() { return __zipp_py.__rt.exitStatus(); }
 function __zipp_py_set_input(json) {
     const i = JSON.parse(json);
     __zipp_py_input = {
@@ -20,26 +21,38 @@ function __zipp_py_set_input(json) {
 (function (R) {
     "use strict";
     const rt = R.__rt, T = rt.T, E = rt.E;
+    // What a SystemExit leaving the program asks of the process, for a host
+    // that owns one (the CLI reads it through `__zipp_py_exit_status`): an
+    // integer status, or, for any other code, the text CPython prints before
+    // exiting with status 1. `null` until a SystemExit leaves.
+    let exitStatus = null;
+    rt.exitStatus = function () { return exitStatus; };
     // A Python exception leaving the program: the VM reports `name: message`
     // from the exception object's own fields, formatted like a traceback tail.
     function hostError(e) {
         const exc = rt.normexc(e);
-        if (exc.cls === E.SystemExit) {
-            const code = exc.args.items.length ? exc.args.items[0] : 0n;
+        if (rt.isSubclass(exc.cls, E.SystemExit)) {
+            const items = exc.args.items;
+            const code = items.length === 0 ? null : items.length === 1 ? items[0] : exc.args;
             if (code === null || code === 0n || code === false) return null;
+            // CPython truncates a 64-bit code to a C int, and exits -1 when
+            // the code does not fit 64 bits.
+            exitStatus = typeof code === "bigint"
+                ? (BigInt.asIntN(64, code) === code ? Number(BigInt.asIntN(32, code)) : -1)
+                : code === true ? 1 : rt.str(code);
             const err = new Error(rt.str(code)); err.name = "SystemExit"; return err;
         }
         let message = rt.str(exc);
         let chain = "";
         let cause = exc.cause, ctx = exc.context;
-        if (cause !== null) chain = "The direct cause: " + rt.typeOf(cause).name + ": " + rt.str(cause) + (cause.traceback || "");
-        else if (ctx !== null && !exc.suppress) chain = "While handling: " + rt.typeOf(ctx).name + ": " + rt.str(ctx) + (ctx.traceback || "");
+        if (cause !== null) chain = "The direct cause: " + rt.typeOf(cause).name + ": " + rt.str(cause) + rt.excLocation(cause);
+        else if (ctx !== null && !exc.suppress) chain = "While handling: " + rt.typeOf(ctx).name + ": " + rt.str(ctx) + rt.excLocation(ctx);
         // `name: message` is what the host prints; the frames follow on
         // their own lines, outermost first, like CPython.
         const frames = rt.tracebackText(exc);
         const err = new Error(message);
         err.name = exc.cls.name;
-        err.message = (message ? message : "") + (exc.traceback || "") + (frames ? "\n" + frames.replace(/\n$/, "") : "") + (chain ? "\n" + chain : "");
+        err.message = (message ? message : "") + rt.excLocation(exc) + (frames ? "\n" + frames.replace(/\n$/, "") : "") + (chain ? "\n" + chain : "");
         err.pyexc = exc;
         return err;
     }
@@ -50,6 +63,9 @@ function __zipp_py_set_input(json) {
         if (typeof v === "boolean" || typeof v === "string") return v;
         if (typeof v === "number") return Number.isInteger(v) ? BigInt(v) : v;
         if (typeof v === "bigint") return v;
+        // Binary tensor transport: the VM built this array from the host's
+        // copy, so the storage can own it outright.
+        if (v instanceof Float32Array) return rt.float32Storage(v);
         if (Array.isArray(v)) { const items = []; for (let i = 0; i < v.length; i++) items.push(fromHost(v[i], depth + 1)); return rt.list(items); }
         if (typeof v === "object") { const d = rt.dict(); const keys = Object.keys(v); for (let i = 0; i < keys.length; i++) rt.dictSet(d, keys[i], fromHost(v[keys[i]], depth + 1)); return d; }
         rt.fail(E.TypeError, "unsupported host value");
@@ -58,6 +74,9 @@ function __zipp_py_set_input(json) {
         if (depth > 32) rt.fail(E.TypeError, "value nesting limit exceeded");
         if (v === null || typeof v === "boolean" || typeof v === "string" || typeof v === "number") return v;
         if (typeof v === "bigint") return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString();
+        // A float32 tensor storage leaves as its bytes (the VM copies them
+        // into the host value), not one number per element.
+        if (rt.isFloat32Storage(v)) return v.data;
         if (v.cls === T.list || v.cls === T.tuple) { const out = []; for (let i = 0; i < v.items.length; i++) out.push(toHost(v.items[i], depth + 1)); return out; }
         if (v.cls === T.dict) { const o = Object.create(null); const entries = rt.dictEntryList(v); for (let i = 0; i < entries.length; i++) o[rt.str(entries[i][0])] = toHost(entries[i][1], depth + 1); return o; }
         if (v.cls === T.set || v.cls === T.frozenset) { const items = rt.setList(v), out = []; for (let i = 0; i < items.length; i++) out.push(toHost(items[i], depth + 1)); return out; }
@@ -73,9 +92,16 @@ function __zipp_py_set_input(json) {
     // program-defined hook.
     rt.takeHostRequests = (function (take) {
         return function () {
-            const taken = take(), out = [];
-            for (let i = 0; i < taken.length; i++) out.push({ id: taken[i].id, kind: taken[i].kind, payload: toHost(taken[i].payload, 0) });
-            return out;
+            // Converting a payload can run guest __str__; its exception leaves as a host error.
+            try {
+                const taken = take(), out = [];
+                for (let i = 0; i < taken.length; i++) out.push({ id: taken[i].id, kind: taken[i].kind, payload: toHost(taken[i].payload, 0) });
+                return out;
+            } catch (e) {
+                const err = hostError(e);
+                if (err === null) return [];
+                throw err;
+            }
         };
     })(rt.takeHostRequests);
     const runtimeHooks = new Map([
@@ -91,10 +117,13 @@ function __zipp_py_set_input(json) {
         ["__zipp_py_vfs_list", function () { return rt.vfs.list(); }],
     ]);
     rt.vfsChangedText = function () {
+            // Handles the program left open are flushed, as at CPython's exit.
+            rt.flushOpenFiles();
             const changes = [];
             for (const path of rt.vfs.changed()) {
                 const bytes = rt.vfs.get(path);
-                changes.push(bytes === undefined ? { path: path, deleted: true } : { path: path, base64: base64(bytes) });
+                // Files are Uint8Arrays: encode natively, not byte by byte here.
+                changes.push(bytes === undefined ? { path: path, deleted: true } : { path: path, base64: bytes instanceof Uint8Array ? bytes.toBase64() : base64(bytes) });
             }
             return JSON.stringify({ version: 1, changes: changes });
     };
@@ -149,9 +178,11 @@ function __zipp_py_set_input(json) {
             const holder = { code: body, globals: new Map(), cells: [] };
             holder.code([]);
             rt.flushOut();
+            rt.flushOpenFiles();
             return null;
         } catch (e) {
             rt.flushOut();
+            rt.flushOpenFiles();
             const err = hostError(e);
             if (err === null) return null;
             throw err;

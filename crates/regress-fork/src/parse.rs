@@ -681,7 +681,7 @@ where
                         }
                         // Term :: Atom :: \ AtomEscape :: CharacterEscape :: c AsciiLetter
                         // Term :: ExtendedAtom :: \ [lookahead = c]
-                        'c' if !self.flags.unicode => {
+                        'c' if !self.flags.unicode_mode() => {
                             self.consume('c');
                             if self
                                 .peek()
@@ -725,14 +725,14 @@ where
                 '(' => {
                     if self.try_consume_str("(?=") {
                         // Positive lookahead.
-                        quantifier_allowed = !self.flags.unicode;
+                        quantifier_allowed = !self.flags.unicode_mode();
                         result.push(self.consume_lookaround_assertion(LookaroundParams {
                             negate: false,
                             backwards: false,
                         })?);
                     } else if self.try_consume_str("(?!") {
                         // Negative lookahead.
-                        quantifier_allowed = !self.flags.unicode;
+                        quantifier_allowed = !self.flags.unicode_mode();
                         result.push(self.consume_lookaround_assertion(LookaroundParams {
                             negate: true,
                             backwards: false,
@@ -802,7 +802,7 @@ where
                 }
 
                 // Term :: ExtendedAtom :: InvalidBracedQuantifier
-                '{' if !self.flags.unicode => {
+                '{' if !self.flags.unicode_mode() => {
                     if self.try_consume_braced_quantifier().is_some() {
                         return error("Invalid braced quantifier");
                     }
@@ -815,7 +815,7 @@ where
                 }
 
                 // Term :: Atom :: PatternCharacter :: SourceCharacter but not ^ $ \ . * + ? ( ) [ ] { } |
-                '*' | '+' | '?' | ']' | '{' | '}' if self.flags.unicode => {
+                '*' | '+' | '?' | ']' | '{' | '}' if self.flags.unicode_mode() => {
                     return error("Invalid atom character");
                 }
 
@@ -1425,9 +1425,10 @@ where
                             PropertyEscapeKind::StringSet(_) => error("Invalid character escape"),
                         }
                     }
-                    // ClassSetCharacter:: \b
+                    // ClassSetCharacter:: \b — U+0008 BACKSPACE, not `b`.
                     0x62 /* b */ => {
-                        Ok(ClassSetCharacter(self.consume(cp)))
+                        self.consume(cp);
+                        Ok(ClassSetCharacter(0x08))
                     }
                     // ClassSetCharacter:: \ ClassSetReservedPunctuator
                     _ if Self::is_class_set_reserved_punctuator(cp) => Ok(ClassSetCharacter(self.consume(cp))),
@@ -1452,9 +1453,10 @@ where
                     return error("Incomplete class set escape");
                 };
                 match cp {
-                    // \b
+                    // \b — U+0008 BACKSPACE, not `b`.
                     0x62 /* b */ => {
-                        Ok(self.consume(cp))
+                        self.consume(cp);
+                        Ok(0x08)
                     }
                     // \ ClassSetReservedPunctuator
                     _ if Self::is_class_set_reserved_punctuator(cp) => Ok(self.consume(cp)),
@@ -1539,7 +1541,7 @@ where
             Some('{') => {
                 if let Some(quantifier) = self.try_consume_braced_quantifier() {
                     Ok(Some(quantifier))
-                } else if self.flags.unicode {
+                } else if self.flags.unicode_mode() {
                     // if there was a brace '{' that doesn't parse into a valid quantifier,
                     // it's not valid with the unicode flag
                     error("Invalid quantifier")
@@ -1652,12 +1654,18 @@ where
             // CharacterEscape :: HexEscapeSequence :: x HexDigit HexDigit
             'x' => {
                 let hex_to_digit = |c: char| c.to_digit(16);
+                let after_x = self.input.clone();
                 let x1 = self.next().and_then(char::from_u32).and_then(hex_to_digit);
                 let x2 = self.next().and_then(char::from_u32).and_then(hex_to_digit);
                 match (x1, x2) {
                     (Some(x1), Some(x2)) => Ok(x1 * 16 + x2),
                     // CharacterEscape :: IdentityEscape :: SourceCharacterIdentityEscape
-                    _ if !self.flags.unicode => Ok(c),
+                    // — the escape is just `x`; whatever followed it is
+                    // re-read as pattern text (`/\x1/` matches "x1").
+                    _ if !self.flags.unicode_mode() => {
+                        self.input = after_x;
+                        Ok(c)
+                    }
                     _ => error("Invalid character escape"),
                 }
             }
@@ -1665,7 +1673,7 @@ where
             'u' => {
                 if let Some(c) = self.try_escape_unicode_sequence(self.flags.unicode_mode()) {
                     Ok(c)
-                } else if !self.flags.unicode {
+                } else if !self.flags.unicode_mode() {
                     // CharacterEscape :: IdentityEscape :: SourceCharacterIdentityEscape
                     Ok(c)
                 } else {
@@ -1673,7 +1681,7 @@ where
                 }
             }
             // CharacterEscape :: [~UnicodeMode] LegacyOctalEscapeSequence
-            '0'..='7' if !self.flags.unicode => {
+            '0'..='7' if !self.flags.unicode_mode() => {
                 let Some(c1) = self.peek() else {
                     return Ok(c - '0' as u32);
                 };
@@ -1710,7 +1718,7 @@ where
             '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
             | '/' => Ok(c),
             // CharacterEscape :: IdentityEscape :: SourceCharacterIdentityEscape
-            _ if !self.flags.unicode => Ok(c),
+            _ if !self.flags.unicode_mode() => Ok(c),
             _ => error("Invalid character escape"),
         }
     }
@@ -1798,7 +1806,7 @@ where
 
             // [+UnicodeMode] DecimalEscape
             // Note: This is a backreference.
-            '1'..='9' if self.flags.unicode => {
+            '1'..='9' if self.flags.unicode_mode() => {
                 let group = self.try_consume_decimal_integer_literal().unwrap();
                 if group <= self.group_count_max as usize {
                     Ok(ir::Node::BackRef {
@@ -1833,7 +1841,7 @@ where
             }
 
             // [+NamedCaptureGroups] k GroupName
-            'k' if self.flags.unicode || !self.named_group_indices.is_empty() => {
+            'k' if self.flags.unicode_mode() || !self.named_group_indices.is_empty() => {
                 // The sequence `\k` must be the start of a backreference to a named capture group.
                 // Note multiple capture groups may have the same name; we must map all of them to their indices.
                 self.consume('k');

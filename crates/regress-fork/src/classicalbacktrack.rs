@@ -1140,22 +1140,33 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     );
                     // If min is equal to max, there is no more backtracking to be done;
                     // otherwise move opposite the direction of the cursor.
-                    if *max == *min {
+                    //
+                    // PATCH (FORK.md B8): the cursors are compared by ORDER, and a
+                    // step that lands past `min` (or finds no position at all)
+                    // clamps to `min`. The step is surrogate-aware for UTF-16, so
+                    // when `min` sits inside a surrogate pair (a search started
+                    // on the trailing half) stepping left from just past the pair
+                    // jumps over `min`; the equality test never fired and the
+                    // next step reached `rs_unreachable!` — undefined behaviour
+                    // in the unchecked build.
+                    let exhausted = if Dir::FORWARD {
+                        *max <= *min
+                    } else {
+                        *max >= *min
+                    };
+                    if exhausted {
                         // We have backtracked this loop as far as possible.
                         self.pop_backtrack();
                         continue;
                     }
                     let newmax = if Dir::FORWARD {
-                        input.next_left_pos(*max)
+                        input.next_left_pos(*max).filter(|p| *p > *min)
                     } else {
-                        input.next_right_pos(*max)
-                    };
-                    if let Some(newmax) = newmax {
-                        *pos = newmax;
-                        *max = newmax;
-                    } else {
-                        rs_unreachable!("Should always be able to advance since min != max")
+                        input.next_right_pos(*max).filter(|p| *p < *min)
                     }
+                    .unwrap_or(*min);
+                    *pos = newmax;
+                    *max = newmax;
                     *ip = *continuation;
                     rxstat!(GREEDY1_RETRIES);
                     return true;
@@ -1171,23 +1182,27 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         if Dir::FORWARD { max >= min } else { max <= min },
                         "max should be >= min (or <= if tracking backwards)"
                     );
-                    if *max == *min {
+                    // PATCH (FORK.md B8): ordered comparison and a clamp to
+                    // `max`, mirroring the greedy arm above.
+                    let exhausted = if Dir::FORWARD {
+                        *max <= *min
+                    } else {
+                        *max >= *min
+                    };
+                    if exhausted {
                         // We have backtracked this loop as far as possible.
                         self.pop_backtrack();
                         continue;
                     }
                     // Move in the direction of the cursor.
                     let newmin = if Dir::FORWARD {
-                        input.next_right_pos(*min)
+                        input.next_right_pos(*min).filter(|p| *p < *max)
                     } else {
-                        input.next_left_pos(*min)
-                    };
-                    if let Some(newmin) = newmin {
-                        *pos = newmin;
-                        *min = newmin;
-                    } else {
-                        rs_unreachable!("Should always be able to advance since min != max")
+                        input.next_left_pos(*min).filter(|p| *p > *max)
                     }
+                    .unwrap_or(*max);
+                    *pos = newmin;
+                    *min = newmin;
                     *ip = *continuation;
                     return true;
                 }
@@ -1547,8 +1562,22 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     }
 
                     Insn::EnterLoop(fields) => {
-                        // Entering a loop, not re-entering it.
-                        self.s.loops.mat(fields.loop_id as usize).iters = 0;
+                        // Entering a loop, not re-entering it. Save the loop's
+                        // data BEFORE the reset: an enclosing loop enters this
+                        // one again on its next iteration, and backtracking
+                        // into that iteration must restore the count and entry
+                        // position this loop had. Resetting first made
+                        // `prepare_to_enter_loop` save the already-zeroed
+                        // count, so the empty-iteration check (ES2025
+                        // 22.2.2.4, Note 4) never fired and
+                        // `/(?:(?:a?)?)+n/.test("a")` ran until the process
+                        // ran out of memory.
+                        let id = fields.loop_id;
+                        let saved = *self.s.loops.mat(id as usize);
+                        if !self.push_backtrack(BacktrackInsn::SetLoopData { id, data: saved }) {
+                            break 'backtrack;
+                        }
+                        self.s.loops.mat(id as usize).iters = 0;
                         match self.run_loop(fields, pos, ip) {
                             Some(next_ip) => {
                                 ip = next_ip;
@@ -1885,6 +1914,17 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             }
             None
         }
+    }
+
+    /// PATCH (FORK.md B9): ONE attempt at code-unit/byte offset `offset` — the
+    /// ECMAScript sticky (`y`) match. No prefix search, no advance: a failure
+    /// costs the attempt alone, where `find_from(..).next()` filtered for a
+    /// start at `offset` ran an attempt at every later position first.
+    pub(crate) fn match_at(&mut self, offset: usize) -> Option<Match> {
+        let pos = self.input.try_move_right(self.input.left_end(), offset)?;
+        self.matcher.skip_hint = None;
+        let mut next_start = None;
+        self.next_match_anchored(pos, &mut next_start)
     }
 
     /// \return the next match, searching the remaining bytes using the given

@@ -121,9 +121,47 @@ pub fn compile_python_program(
     argv: &[String],
     hosted: bool,
 ) -> Result<CompiledSource, String> {
+    compile_python_entry(entry, None, modules, files, argv, hosted)
+}
+/// [`compile_python_program`] for a script run by its file: `entry_file`
+/// (root-relative, such as `tools/my-script.py` or an extensionless `tool`)
+/// is the entry module's `__file__`, `sys.argv[0]` and traceback file,
+/// whatever module name `entry` registers it under. Module sources are
+/// borrowed, so a host that also loads the `.py` files into `files` can
+/// point at those bytes instead of holding a second copy.
+pub fn compile_python_script(
+    entry: &str,
+    entry_file: &str,
+    modules: &[(String, &str)],
+    files: &[(String, Vec<u8>)],
+    argv: &[String],
+    hosted: bool,
+) -> Result<CompiledSource, String> {
+    compile_python_entry(entry, Some(entry_file), modules, files, argv, hosted)
+}
+/// Whether Python compiles keep the compiled runtime for the next program in
+/// the process. On by default: every program after the first clones it
+/// instead of compiling ~420 KB of runtime JavaScript again (test suites,
+/// the browser engine's re-runs, long-lived embedders). A process that
+/// compiles exactly one program, such as a command-line run, turns it off
+/// and so never copies a runtime it will not reuse.
+pub fn set_python_runtime_memo(enabled: bool) {
+    #[cfg(feature = "python")]
+    python::set_runtime_memo(enabled);
+    #[cfg(not(feature = "python"))]
+    let _ = enabled;
+}
+fn compile_python_entry<S: AsRef<str>>(
+    entry: &str,
+    entry_file: Option<&str>,
+    modules: &[(String, S)],
+    files: &[(String, Vec<u8>)],
+    argv: &[String],
+    hosted: bool,
+) -> Result<CompiledSource, String> {
     #[cfg(feature = "python")]
     {
-        let program = python::compile_project(entry, modules, files, argv, hosted)?;
+        let program = python::compile_project(entry, entry_file, modules, files, argv, hosted)?;
         let mut state = ScriptState::from_program(program);
         state.disable_vm_jit();
         Ok(CompiledSource {
@@ -133,7 +171,7 @@ pub fn compile_python_program(
     }
     #[cfg(not(feature = "python"))]
     {
-        let _ = (entry, modules, files, argv, hosted);
+        let _ = (entry, entry_file, modules, files, argv, hosted);
         Err("Python support is not built; enable the `python` Cargo feature".into())
     }
 }

@@ -168,27 +168,6 @@ fn regex_try_reserve_string_exact(
 }
 
 #[cfg(feature = "safe-sandbox")]
-fn regex_try_reserve_string_geometric(
-    vm: &mut Vm<'_>,
-    reservation: &mut super::instrument::RegexTransientReservation,
-    value: &mut String,
-    additional: usize,
-) -> Result<(), Thrown> {
-    let required = value
-        .len()
-        .checked_add(additional)
-        .filter(|required| *required <= MAX_STRING_BYTES)
-        .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
-    if required <= value.capacity() {
-        return Ok(());
-    }
-    let target = required
-        .max(value.capacity().saturating_mul(2).max(4))
-        .min(MAX_STRING_BYTES);
-    regex_try_reserve_string_exact(vm, reservation, value, target - value.len())
-}
-
-#[cfg(feature = "safe-sandbox")]
 fn regex_push_value(
     vm: &mut Vm<'_>,
     reservation: &mut super::instrument::RegexTransientReservation,
@@ -1075,6 +1054,10 @@ pub(crate) const ITFB_UNICODE: u8 = 1 << 1;
 pub(crate) const ITFB_FUSED: u8 = 1 << 2;
 pub(crate) const ITFB_STICKY: u8 = 1 << 3;
 pub(crate) const ITFB_INDICES: u8 = 1 << 4;
+/// Not an iterator bit: `regexp_split_impl`'s forward scan (see there). A
+/// match that begins at the end of the subject is a miss, because the
+/// @@split loop never attempts that position.
+pub(crate) const ITFB_SPLIT_SCAN: u8 = 1 << 5;
 
 /// One not-yet-observable matchAll result. Offsets are byte indices into the
 /// iterator record's immutable flat-ASCII subject; `u32::MAX` in both capture
@@ -1176,6 +1159,56 @@ pub(crate) struct MatchBatch {
     flat: Vec<u32>,
 }
 
+/// The value of `Vm::regex_subject_units`: the exact UTF-16 code units of the
+/// flat non-ASCII string that occupied heap slot `idx` at slot version
+/// `version` with `bytes` WTF-8 bytes. See `Vm::regex_subject_units_take` for
+/// why that triple identifies the content.
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) struct RegexSubjectUnits {
+    pub(crate) idx: u32,
+    version: u32,
+    bytes: usize,
+    units: Vec<u16>,
+}
+
+/// The first search of a RegExpBuiltinExec from `start`: a sticky regex makes
+/// ONE attempt anchored at `start` (a failure costs that attempt, not a scan
+/// of the rest of the subject); any other regex searches forward from it.
+#[inline(always)]
+fn regex_first_match_ascii(
+    regex: &regress::Regex,
+    subject: &str,
+    start: usize,
+    sticky: bool,
+) -> Option<regress::Match> {
+    if sticky {
+        regex.match_at_ascii(subject, start)
+    } else {
+        regex.find_from_ascii(subject, start).next()
+    }
+}
+
+/// RegExpBuiltinExec step 12.b for a `u`/`v` regex: a `lastIndex` on the
+/// trailing half of a surrogate pair names the code point that pair encodes,
+/// so matching starts at its leading half, as SpiderMonkey does (the code
+/// point model of tc39/ecma262#128). Passing the raw index let a sticky or
+/// global `/u` match see the lone trailing half, and a greedy loop starting
+/// there backtracked across the pair. V8 differs in one corner: its search
+/// loop revisits the mid-pair position for a zero-width assertion, so
+/// `"a\u{1F600}".split(/\B/u)` splits the pair there.
+#[inline]
+fn regex_code_point_start(units: &[u16], start: usize) -> usize {
+    if start > 0
+        && start < units.len()
+        && (0xDC00..=0xDFFF).contains(&units[start])
+        && (0xD800..=0xDBFF).contains(&units[start - 1])
+    {
+        start - 1
+    } else {
+        start
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Capture the final setup-time main-realm RegExp protocol functions. Called
     /// once after the species accessor is installed; the resulting indices are
@@ -1259,12 +1292,13 @@ impl<'p> Vm<'p> {
     /// Reconstruct a property KEY as a Value (a Symbol for an `@@`-encoded key,
     /// else a string) — so a Proxy trap / Reflect receives the real key.
     pub(crate) fn key_to_value(&mut self, key: &str) -> Value {
-        if key.starts_with("@@") {
+        if key.starts_with("@@") && is_hidden_key(key) {
             if let Some(&sym) = self.symbol_keys.get(key) {
                 return sym;
             }
         }
-        self.alloc_str(key.to_string())
+        // An escaped guest string key reads back as the string it was.
+        self.alloc_str(guest_key_text(key).to_string())
     }
 
     /// Look up a Proxy handler trap by name; `Ok(Some(fn))` if it's callable,
@@ -1387,6 +1421,39 @@ impl<'p> Vm<'p> {
                     && Self::FLAG_ACCESSORS
                         .iter()
                         .all(|(name, want)| accessor(name, *want))
+            }
+            _ => false,
+        }
+    }
+
+    /// UNOBSERVABLE for `"s".split(re)` to invoke the internal splitter instead
+    /// of `GetMethod(re, @@split)`: `re`'s [[Prototype]] is exactly
+    /// %RegExp.prototype%, it has no own `@@split`, and the prototype's
+    /// `@@split` is still the intrinsic data property.
+    ///
+    /// Nothing more is needed because `RegExp.prototype[@@split]` IS
+    /// `regexp_split_impl` — the whole observable protocol (SpeciesConstructor,
+    /// the sticky splitter, `exec`) lives inside it and runs either way. Without
+    /// this check the fast path swallowed a user `@@split` on the instance, on
+    /// `RegExp.prototype` or on a subclass, so the result depended on the call
+    /// shape: `"xay".split(re)` ignored the override that
+    /// `String.prototype.split.call("xay", re)` honoured.
+    pub(crate) fn regexp_split_fast_ok(&self, re: u32) -> bool {
+        match self.proto_of.get(&re) {
+            None => {}
+            Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
+            _ => return false,
+        }
+        if self
+            .arr_props
+            .get(&re)
+            .is_some_and(|m| m.pos("@@split").is_some())
+        {
+            return false;
+        }
+        match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => {
+                self.regexp_proto_slot_is_intrinsic(m, "@@split", false, native::REGEXP_SYM_SPLIT)
             }
             _ => false,
         }
@@ -1645,214 +1712,6 @@ impl<'p> Vm<'p> {
         Ok(self.build_regexp(p, Value::UNDEFINED)?.heap_index())
     }
 
-    /// Expand a `String.prototype.replace` string template against a match: `$&`
-    /// (whole), `` $` ``/`$'` (pre/post), `$N`/`$NN` (group), `$<name>` (named), `$$`.
-    pub(crate) fn expand_replacement(
-        &self,
-        tmpl: &str,
-        whole: &str,
-        groups: &[Option<String>],
-        named: &[(String, Option<String>)],
-        named_defined: bool,
-        pre: &str,
-        post: &str,
-        limit: usize,
-    ) -> Result<String, Thrown> {
-        // `limit` caps the output in BYTES: a `$1`-heavy template applied to a
-        // huge capture would otherwise build an unbounded string (hang / OOM —
-        // staging/sm/String/replace-math.js). Same 2^28 bound as "repeat".
-        let mut out = String::with_capacity(tmpl.len().min(limit));
-        macro_rules! push {
-            ($s:expr) => {{
-                let s: &str = $s;
-                if s.len() > limit - out.len() {
-                    return Err(Thrown("RangeError: Invalid string length".into()));
-                }
-                out.push_str(s);
-            }};
-        }
-        let bytes = tmpl.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'$' && i + 1 < bytes.len() {
-                let c = bytes[i + 1];
-                match c {
-                    b'$' => {
-                        push!("$");
-                        i += 2;
-                    }
-                    b'&' => {
-                        push!(whole);
-                        i += 2;
-                    }
-                    b'`' => {
-                        push!(pre);
-                        i += 2;
-                    }
-                    b'\'' => {
-                        push!(post);
-                        i += 2;
-                    }
-                    b'<' => {
-                        // `$<name>` substitutes the named capture (or "" if absent)
-                        // when named captures are present; otherwise (no groups
-                        // object / namedCaptures undefined) "$<" is a literal.
-                        if !named_defined {
-                            push!("$");
-                            i += 1;
-                        } else if let Some(end) = tmpl[i + 2..].find('>') {
-                            let name = &tmpl[i + 2..i + 2 + end];
-                            if let Some((_, Some(g))) = named.iter().find(|(n, _)| n == name) {
-                                push!(g);
-                            }
-                            i += 2 + end + 1;
-                        } else {
-                            push!("$");
-                            i += 1;
-                        }
-                    }
-                    b'0'..=b'9' => {
-                        // One or two digits; prefer the two-digit group if valid.
-                        let d1 = (c - b'0') as usize;
-                        let two = if i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit() {
-                            Some(d1 * 10 + (bytes[i + 2] - b'0') as usize)
-                        } else {
-                            None
-                        };
-                        if let Some(n) = two.filter(|&n| n >= 1 && n <= groups.len()) {
-                            if let Some(g) = &groups[n - 1] {
-                                push!(g);
-                            }
-                            i += 3;
-                        } else if d1 >= 1 && d1 <= groups.len() {
-                            if let Some(g) = &groups[d1 - 1] {
-                                push!(g);
-                            }
-                            i += 2;
-                        } else {
-                            push!("$");
-                            i += 1;
-                        }
-                    }
-                    _ => {
-                        push!("$");
-                        i += 1;
-                    }
-                }
-            } else {
-                // copy one UTF-8 char
-                let ch = tmpl[i..].chars().next().unwrap();
-                let mut b = [0u8; 4];
-                push!(ch.encode_utf8(&mut b));
-                i += ch.len_utf8();
-            }
-        }
-        Ok(out)
-    }
-
-    /// Safe-profile `GetSubstitution`: identical parsing to
-    /// `expand_replacement`, with every retained byte charged and every growth
-    /// fallible before the caller appends the result to its aggregate output.
-    #[cfg(feature = "safe-sandbox")]
-    #[allow(clippy::too_many_arguments)]
-    fn expand_replacement_safe(
-        &mut self,
-        reservation: &mut super::instrument::RegexTransientReservation,
-        tmpl: &str,
-        whole: &str,
-        groups: &[Option<String>],
-        named: &[(String, Option<String>)],
-        named_defined: bool,
-        pre: &str,
-        post: &str,
-        limit: usize,
-    ) -> Result<String, Thrown> {
-        let mut out = String::new();
-        regex_try_reserve_string_exact(self, reservation, &mut out, tmpl.len().min(limit))?;
-        macro_rules! push {
-            ($s:expr) => {{
-                let s: &str = $s;
-                if s.len() > limit.saturating_sub(out.len()) {
-                    return Err(Thrown("RangeError: Invalid string length".into()));
-                }
-                regex_try_reserve_string_geometric(self, reservation, &mut out, s.len())?;
-                out.push_str(s);
-            }};
-        }
-        let bytes = tmpl.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'$' && i + 1 < bytes.len() {
-                let c = bytes[i + 1];
-                match c {
-                    b'$' => {
-                        push!("$");
-                        i += 2;
-                    }
-                    b'&' => {
-                        push!(whole);
-                        i += 2;
-                    }
-                    b'`' => {
-                        push!(pre);
-                        i += 2;
-                    }
-                    b'\'' => {
-                        push!(post);
-                        i += 2;
-                    }
-                    b'<' => {
-                        if !named_defined {
-                            push!("$");
-                            i += 1;
-                        } else if let Some(end) = tmpl[i + 2..].find('>') {
-                            let name = &tmpl[i + 2..i + 2 + end];
-                            if let Some((_, Some(group))) = named.iter().find(|(n, _)| n == name) {
-                                push!(group);
-                            }
-                            i += 2 + end + 1;
-                        } else {
-                            push!("$");
-                            i += 1;
-                        }
-                    }
-                    b'0'..=b'9' => {
-                        let first = (c - b'0') as usize;
-                        let two = if i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit() {
-                            Some(first * 10 + (bytes[i + 2] - b'0') as usize)
-                        } else {
-                            None
-                        };
-                        if let Some(n) = two.filter(|&n| n >= 1 && n <= groups.len()) {
-                            if let Some(group) = &groups[n - 1] {
-                                push!(group);
-                            }
-                            i += 3;
-                        } else if first >= 1 && first <= groups.len() {
-                            if let Some(group) = &groups[first - 1] {
-                                push!(group);
-                            }
-                            i += 2;
-                        } else {
-                            push!("$");
-                            i += 1;
-                        }
-                    }
-                    _ => {
-                        push!("$");
-                        i += 1;
-                    }
-                }
-            } else {
-                let ch = tmpl[i..].chars().next().expect("template character exists");
-                let mut encoded = [0u8; 4];
-                push!(ch.encode_utf8(&mut encoded));
-                i += ch.len_utf8();
-            }
-        }
-        Ok(out)
-    }
-
     /// RegExp instance property reads: `lastIndex`, `source` (empty → "(?:)"),
     /// `flags`, and the per-flag booleans; methods delegate to RegExp.prototype.
     /// EscapeRegExpPattern: render `source` so it round-trips between two `/`
@@ -2090,17 +1949,20 @@ impl<'p> Vm<'p> {
         let mut replace_str_reservation = self
             .instrument_reserve_regex_transient(0)
             .map_err(|message| Thrown(message.into()))?;
+        // ToString(replaceValue) as EXACT bytes, so a template's own lone
+        // surrogates reach the output (the `$` selectors and `$<name>` are all
+        // ASCII, so the scan below is the same scan).
         #[cfg(feature = "safe-sandbox")]
-        let replace_str = if functional {
-            String::new()
+        let replace_tmpl = if functional {
+            Vec::new()
         } else {
-            regex_owned_capture_string(self, &mut replace_str_reservation, replace_value)?
+            regex_owned_wtf8_string(self, &mut replace_str_reservation, replace_value)?
         };
         #[cfg(not(feature = "safe-sandbox"))]
-        let replace_str = if functional {
-            String::new()
+        let replace_tmpl = if functional {
+            Vec::new()
         } else {
-            self.to_js_string(replace_value)?
+            self.to_wtf8_bytes(replace_value)?
         };
         // flags / global / fullUnicode are observable (Get, ToString).
         let flags_v = self.get_prop(rx, "flags")?;
@@ -2134,13 +1996,12 @@ impl<'p> Vm<'p> {
         let mut results_reservation = self
             .instrument_reserve_regex_transient(0)
             .map_err(|m| Thrown(m.into()))?;
-        let mut guard = 0u32;
+        // No iteration cap of its own: the spec loop ends when exec returns
+        // null, and a silent cap (formerly 5,000,000) returned a truncated
+        // result as if it were complete. The hardened profile's native work
+        // meter still bounds the loop.
         let mut native_work = 0u64;
         loop {
-            guard += 1;
-            if guard > 5_000_000 {
-                break;
-            }
             native_work = native_work.saturating_add(1);
             self.preflight_native_iteration_work(native_work)?;
             let result = self.regexp_exec_abstract(rx.heap_index(), s_val)?;
@@ -2218,7 +2079,8 @@ impl<'p> Vm<'p> {
             let pos_v = self.get_prop(result, "index")?;
             let position = self.to_integer_or_zero(pos_v)?.clamp(0, length_s as i64) as usize;
             // Replacement bytes (WTF-8): the functional path appends a returned
-            // string's EXACT bytes; the template path expands over lossy views.
+            // string's EXACT bytes; the template path expands over exact
+            // WTF-8 copies of the template, match, captures and context.
             #[cfg(feature = "safe-sandbox")]
             let mut replacement_reservation = self
                 .instrument_reserve_regex_transient(0)
@@ -2287,7 +2149,10 @@ impl<'p> Vm<'p> {
                 let mut captures_reservation = self
                     .instrument_reserve_regex_transient(0)
                     .map_err(|m| Thrown(m.into()))?;
-                let mut captures: Vec<Option<String>> = Vec::new();
+                // Every capture is the EXACT string the exec result holds:
+                // through a lossy `String` a captured lone surrogate reached
+                // `$N` as U+FFFD.
+                let mut captures: Vec<Option<Vec<u8>>> = Vec::new();
                 #[cfg(feature = "safe-sandbox")]
                 regex_try_reserve_exact(
                     self,
@@ -2312,7 +2177,7 @@ impl<'p> Vm<'p> {
                     } else {
                         #[cfg(feature = "safe-sandbox")]
                         {
-                            Some(regex_owned_capture_string(
+                            Some(regex_owned_wtf8_string(
                                 self,
                                 &mut captures_reservation,
                                 cap_v,
@@ -2320,7 +2185,7 @@ impl<'p> Vm<'p> {
                         }
                         #[cfg(not(feature = "safe-sandbox"))]
                         {
-                            Some(self.to_js_string(cap_v)?)
+                            Some(self.to_wtf8_bytes(cap_v)?)
                         }
                     });
                 }
@@ -2330,7 +2195,7 @@ impl<'p> Vm<'p> {
                 // Step l.i.1 — when `groups` is not undefined it is ToObject'd, so a
                 // primitive (e.g. a string `groups`) is boxed and its properties
                 // (`$<length>` etc.) become readable; ToObject(null) throws.
-                let named_list: Vec<(String, Option<String>)> = if named_defined {
+                let named_list: Vec<(String, Option<Vec<u8>>)> = if named_defined {
                     // ToObject(namedCaptures): null throws a TypeError (the public
                     // Object(null) would return {}, but this is the internal op).
                     self.require_object_coercible(named_v)?;
@@ -2338,96 +2203,107 @@ impl<'p> Vm<'p> {
                     // GetSubstitution reads EXACTLY the template's `$<name>`
                     // groups via Get — through the PROTOTYPE chain, so an
                     // inherited group property resolves (groups-object-subclass)
-                    // and a missing one substitutes the empty string.
-                    let mut v: Vec<(String, Option<String>)> = Vec::new();
-                    let mut rest = replace_str.as_str();
-                    while let Some(p) = rest.find("$<") {
-                        rest = &rest[p + 2..];
-                        let Some(e) = rest.find('>') else { break };
-                        let name_slice = &rest[..e];
-                        rest = &rest[e + 1..];
-                        if !v.iter().any(|(n, _)| n == name_slice) {
+                    // and a missing one substitutes the empty string. Each
+                    // OCCURRENCE is its own Get + ToString, in template order,
+                    // and `$$<name>` is a literal, not a reference — the
+                    // expansion below consumes this list positionally.
+                    let mut v: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+                    for name_slice in template_group_name_refs(&replace_tmpl) {
+                        // A property key is a Rust String engine-wide, so a
+                        // name that is not UTF-8 is read through its lossy
+                        // form — the Get still happens, as it did before.
+                        let name_slice = String::from_utf8_lossy(name_slice);
+                        #[cfg(feature = "safe-sandbox")]
+                        regex_try_reserve_geometric(
+                            self,
+                            &mut captures_reservation,
+                            &mut v,
+                            1,
+                            usize::MAX,
+                        )?;
+                        #[cfg(feature = "safe-sandbox")]
+                        let name = regex_owned_str(self, &mut captures_reservation, &name_slice)?;
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        let name = name_slice.into_owned();
+                        let val = self.get_prop(obj, &name)?;
+                        let sv = if val == Value::UNDEFINED {
+                            None
+                        } else {
                             #[cfg(feature = "safe-sandbox")]
-                            regex_try_reserve_geometric(
-                                self,
-                                &mut captures_reservation,
-                                &mut v,
-                                1,
-                                usize::MAX,
-                            )?;
-                            #[cfg(feature = "safe-sandbox")]
-                            let name =
-                                regex_owned_str(self, &mut captures_reservation, name_slice)?;
+                            {
+                                Some(regex_owned_wtf8_string(
+                                    self,
+                                    &mut captures_reservation,
+                                    val,
+                                )?)
+                            }
                             #[cfg(not(feature = "safe-sandbox"))]
-                            let name = name_slice.to_string();
-                            let val = self.get_prop(obj, &name)?;
-                            let sv = if val == Value::UNDEFINED {
-                                None
-                            } else {
-                                #[cfg(feature = "safe-sandbox")]
-                                {
-                                    Some(regex_owned_capture_string(
-                                        self,
-                                        &mut captures_reservation,
-                                        val,
-                                    )?)
-                                }
-                                #[cfg(not(feature = "safe-sandbox"))]
-                                {
-                                    Some(self.to_js_string(val)?)
-                                }
-                            };
-                            v.push((name, sv));
-                        }
+                            {
+                                Some(self.to_wtf8_bytes(val)?)
+                            }
+                        };
+                        v.push((name, sv));
                     }
                     v
                 } else {
                     Vec::new()
                 };
+                // The matched text, exactly as the exec result reported it.
                 #[cfg(feature = "safe-sandbox")]
-                let matched_lossy =
-                    regex_owned_capture_string(self, &mut captures_reservation, matched_val)?;
+                let matched_exact =
+                    regex_owned_wtf8_string(self, &mut captures_reservation, matched_val)?;
                 #[cfg(not(feature = "safe-sandbox"))]
-                let matched_lossy = self
+                let matched_exact = self
                     .heap
-                    .str_cow(matched_val.heap_index())
+                    .str_wtf8_cow(matched_val.heap_index())
                     .map(|c| c.into_owned())
                     .unwrap_or_default();
-                #[cfg(feature = "safe-sandbox")]
-                let pre =
-                    regex_owned_utf16_lossy(self, &mut captures_reservation, &u16s[..position])?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                let pre = String::from_utf16_lossy(&u16s[..position]);
                 let post_start = (position + match_len).min(length_s);
-                #[cfg(feature = "safe-sandbox")]
-                let post =
-                    regex_owned_utf16_lossy(self, &mut captures_reservation, &u16s[post_start..])?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                let post = String::from_utf16_lossy(&u16s[post_start..]);
-                #[cfg(feature = "safe-sandbox")]
-                let expanded = self.expand_replacement_safe(
-                    &mut replacement_reservation,
-                    &replace_str,
-                    &matched_lossy,
-                    &captures,
-                    &named_list,
+                // GetSubstitution over the EXACT pieces: `` $` `` and `$'` are
+                // ranges of the subject's own code units (no copy is made for a
+                // template that never names them), and the match and captures
+                // are the strings the protocol read. `named_in_order`: this
+                // path already performed one Get per `$<name>` OCCURRENCE, in
+                // template order, so the k-th token takes `named_list[k]`.
+                let src = SubSource::Owned(OwnedSub {
+                    whole: &matched_exact,
+                    pre: &u16s[..position],
+                    post: &u16s[post_start..],
+                    groups: &captures,
+                    named: &named_list,
                     named_defined,
-                    &pre,
-                    &post,
-                    MAX_STRING_BYTES.saturating_sub(accumulated.len()),
-                )?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                let expanded = self.expand_replacement(
-                    &replace_str,
-                    &matched_lossy,
-                    &captures,
-                    &named_list,
-                    named_defined,
-                    &pre,
-                    &post,
-                    MAX_STRING_BYTES.saturating_sub(accumulated.len()),
-                )?;
-                expanded.into_bytes()
+                    named_in_order: true,
+                });
+                let limit = MAX_STRING_BYTES.saturating_sub(accumulated.len());
+                let mut expanded: Vec<u8> = Vec::new();
+                expand_replacement_pieces(&replace_tmpl, &src, &mut |piece| {
+                    if piece.wtf8_len() > limit.saturating_sub(expanded.len()) {
+                        return Err(Thrown("RangeError: Invalid string length".into()));
+                    }
+                    #[cfg(feature = "safe-sandbox")]
+                    {
+                        match piece {
+                            SubPiece::Bytes(b) => regex_append_wtf8(
+                                self,
+                                &mut replacement_reservation,
+                                &mut expanded,
+                                b,
+                            ),
+                            SubPiece::Units(u) => regex_append_units(
+                                self,
+                                &mut replacement_reservation,
+                                &mut expanded,
+                                u,
+                            ),
+                        }
+                    }
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    {
+                        piece.append(&mut expanded);
+                        Ok(())
+                    }
+                })?;
+                expanded
             };
             if position >= next_pos {
                 #[cfg(feature = "safe-sandbox")]
@@ -2569,19 +2445,17 @@ impl<'p> Vm<'p> {
         let u16s: Vec<u16> = self.value_units(s_val);
         // `s_val`/`elems` live in Rust locals across exec re-entries.
         let _gc = self.gc_lock_guard();
-        self.set_prop(rx, "lastIndex", Value::int(0), false)?;
+        // Step 6.c: Set(rx, "lastIndex", +0, true) — a non-writable lastIndex
+        // on a generic receiver throws rather than being skipped.
+        self.set_prop(rx, "lastIndex", Value::int(0), true)?;
         let mut elems: Vec<Value> = Vec::new();
         #[cfg(feature = "safe-sandbox")]
         let mut elems_reservation = self
             .instrument_reserve_regex_transient(0)
             .map_err(|message| Thrown(message.into()))?;
-        let mut guard = 0u32;
+        // No iteration cap of its own (see `regexp_symbol_replace`).
         let mut native_work = 0u64;
         loop {
-            guard += 1;
-            if guard > 5_000_000 {
-                break;
-            }
             native_work = native_work.saturating_add(1);
             self.preflight_native_iteration_work(native_work)?;
             let result = self.regexp_exec_abstract(re, s_val)?;
@@ -2729,22 +2603,59 @@ impl<'p> Vm<'p> {
             #[cfg(not(feature = "safe-sandbox"))]
             return Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))));
         }
+        // A fresh intrinsic splitter (`c` is %RegExp%, so nothing else holds
+        // it) whose `exec` is still the intrinsic makes the loop's FAILED
+        // sticky attempts unobservable: each one only resets the splitter's
+        // `lastIndex`. Such a splitter scans forward from `q` to the first
+        // position whose sticky attempt succeeds — the same match, recorded in
+        // the same legacy statics — instead of making one exec per position.
+        // Decided HERE, after the last user code before the loop (`limit`'s
+        // ToUint32 may patch `RegExp.prototype.exec`; staging/sm split-limit).
+        let scan_bits = if c == default_ctor && self.regexp_exec_fast_ok(splitter.heap_index()) {
+            match self.heap.get(splitter.heap_index()) {
+                HeapObj::RegExp { flags, .. } if flags.contains('y') => Some(
+                    ITFB_GLOBAL
+                        | ITFB_SPLIT_SCAN
+                        | if flags.contains('u') || flags.contains('v') {
+                            ITFB_UNICODE
+                        } else {
+                            0
+                        },
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let mut p: usize = 0;
         let mut q: usize = 0;
-        let mut guard = 0u32;
+        // No iteration cap of its own (see `regexp_symbol_replace`): the
+        // per-position loop takes one step per subject position, so a cap
+        // truncated any split of a string longer than the cap.
         let mut native_work = 0u64;
         while q < size {
-            guard += 1;
-            if guard > 5_000_000 {
-                break;
-            }
             native_work = native_work.saturating_add(1);
             self.preflight_native_iteration_work(native_work)?;
             self.set_prop(splitter, "lastIndex", Value::num(q as f64), true)?;
-            let z = self.regexp_exec_abstract(splitter.heap_index(), s_val)?;
+            let z = match scan_bits {
+                Some(bits) => {
+                    self.regexp_exec_impl_prebits(splitter.heap_index(), s_val, true, Some(bits))?
+                }
+                None => self.regexp_exec_abstract(splitter.heap_index(), s_val)?,
+            };
             if z == Value::NULL {
+                if scan_bits.is_some() {
+                    // No sticky attempt at any position in q..size succeeds.
+                    break;
+                }
                 q = advance_string_index(&u16s, q, unicode_matching);
                 continue;
+            }
+            if scan_bits.is_some() {
+                // The scan's match begins at the first position from `q`
+                // whose sticky attempt succeeds; continue from there.
+                let index_v = self.get_prop(z, "index")?;
+                q = self.to_integer_or_zero(index_v)?.clamp(q as i64, size as i64) as usize;
             }
             // e = min(ToLength(Get(splitter,"lastIndex")), size).
             let li_v = self.get_prop(splitter, "lastIndex")?;
@@ -3024,11 +2935,13 @@ impl<'p> Vm<'p> {
         };
         let stateful = global || sticky;
         // Step 9: a non-global, non-sticky regex always searches from 0.
-        let start = if stateful { li } else { 0 };
+        let mut start = if stateful { li } else { 0 };
         // ASCII subjects match in place over the heap bytes (offsets == unit
-        // indices); anything else encodes the subject ONCE per exec.
+        // indices); anything else works over the subject's UTF-16 units
+        // (cached across execs outside the sandbox — `regex_subject_units_take`).
         // `lastIndex` is already a unit index engine-wide, so it is the
-        // search start with no conversion either way.
+        // search start with no conversion either way (bar the code-point
+        // snap below for a `u`/`v` regex).
         let s_idx = input_val.heap_index();
         // B124: ONE subject heap.get serves the flat-check, the ascii bit and
         // (for the ascii case, where units == bytes) the unit length, instead
@@ -3075,7 +2988,7 @@ impl<'p> Vm<'p> {
         let u16s: Vec<u16> = if is_ascii {
             Vec::new()
         } else {
-            self.value_units(input_val)
+            self.regex_subject_units_take(input_val)
         };
         let subj_units = if is_ascii {
             if slim_exec_enabled() {
@@ -3086,6 +2999,9 @@ impl<'p> Vm<'p> {
         } else {
             u16s.len()
         };
+        if unicode && !is_ascii {
+            start = regex_code_point_start(&u16s, start);
+        }
         let found = if start > subj_units {
             None
         } else if is_ascii {
@@ -3097,23 +3013,28 @@ impl<'p> Vm<'p> {
                 HeapObj::Str(js) => js.as_str_wf(),
                 _ => "",
             };
+            // Sticky: ONE attempt anchored at the start (`match_at_*`). The
+            // former unanchored search plus a start filter scanned the rest of
+            // the subject on every failed attempt, which made `split` (a sticky
+            // exec per position) and sticky lexers quadratic.
             #[cfg(feature = "safe-sandbox")]
             {
                 let limits = self.instrument_regex_limits();
-                let (found, usage) = match self.heap.get(re_idx) {
-                    HeapObj::RegExp {
-                        ascii_twin: Some(Some(twin)),
-                        ..
-                    } => {
-                        let mut matches = twin.find_from_ascii_with_limits(subj, start, limits);
-                        let found = matches.next();
-                        (found, matches.match_usage())
-                    }
-                    HeapObj::RegExp { regex, .. } => {
+                let search = |regex: &regress::Regex| {
+                    if sticky {
+                        regex.match_at_ascii_with_limits(subj, start, limits)
+                    } else {
                         let mut matches = regex.find_from_ascii_with_limits(subj, start, limits);
                         let found = matches.next();
                         (found, matches.match_usage())
                     }
+                };
+                let (found, usage) = match self.heap.get(re_idx) {
+                    HeapObj::RegExp {
+                        ascii_twin: Some(Some(twin)),
+                        ..
+                    } => search(twin),
+                    HeapObj::RegExp { regex, .. } => search(regex),
                     _ => (None, regress::MatchUsage::UNMETERED),
                 };
                 self.instrument_regex_usage(usage)
@@ -3126,8 +3047,10 @@ impl<'p> Vm<'p> {
                     HeapObj::RegExp {
                         ascii_twin: Some(Some(twin)),
                         ..
-                    } => twin.find_from_ascii(subj, start).next(),
-                    HeapObj::RegExp { regex, .. } => regex.find_from_ascii(subj, start).next(),
+                    } => regex_first_match_ascii(twin, subj, start, sticky),
+                    HeapObj::RegExp { regex, .. } => {
+                        regex_first_match_ascii(regex, subj, start, sticky)
+                    }
                     _ => None,
                 }
             }
@@ -3136,19 +3059,22 @@ impl<'p> Vm<'p> {
             {
                 let limits = self.instrument_regex_limits();
                 let (found, usage) = match self.heap.get(re_idx) {
-                    HeapObj::RegExp { regex, .. } => {
-                        if unicode {
+                    HeapObj::RegExp { regex, .. } => match (unicode, sticky) {
+                        (true, true) => regex.match_at_utf16_with_limits(&u16s, start, limits),
+                        (false, true) => regex.match_at_ucs2_with_limits(&u16s, start, limits),
+                        (true, false) => {
                             let mut matches =
                                 regex.find_from_utf16_with_limits(&u16s, start, limits);
                             let found = matches.next();
                             (found, matches.match_usage())
-                        } else {
+                        }
+                        (false, false) => {
                             let mut matches =
                                 regex.find_from_ucs2_with_limits(&u16s, start, limits);
                             let found = matches.next();
                             (found, matches.match_usage())
                         }
-                    }
+                    },
                     _ => (None, regress::MatchUsage::UNMETERED),
                 };
                 self.instrument_regex_usage(usage)
@@ -3158,22 +3084,31 @@ impl<'p> Vm<'p> {
             #[cfg(not(feature = "safe-sandbox"))]
             {
                 match self.heap.get(re_idx) {
-                    HeapObj::RegExp { regex, .. } => {
-                        if unicode {
-                            regex.find_from_utf16(&u16s, start).next()
-                        } else {
-                            regex.find_from_ucs2(&u16s, start).next()
-                        }
-                    }
+                    HeapObj::RegExp { regex, .. } => match (unicode, sticky) {
+                        (true, true) => regex.match_at_utf16(&u16s, start),
+                        (false, true) => regex.match_at_ucs2(&u16s, start),
+                        (true, false) => regex.find_from_utf16(&u16s, start).next(),
+                        (false, false) => regex.find_from_ucs2(&u16s, start).next(),
+                    },
                     _ => None,
                 }
             }
         };
-        // Sticky: the match must begin exactly at the search start.
-        let found = found.filter(|m| !(sticky && m.start() != start));
+        debug_assert!(
+            !sticky || found.as_ref().is_none_or(|m| m.start() == start),
+            "a sticky match begins exactly at the search start"
+        );
+        let found = match prebits {
+            Some(b) if b & ITFB_SPLIT_SCAN != 0 => found.filter(|m| m.start() < subj_units),
+            _ => found,
+        };
         let m = match found {
             Some(m) => m,
             None => {
+                #[cfg(not(feature = "safe-sandbox"))]
+                if !is_ascii {
+                    self.regex_subject_units_put(input_val, u16s);
+                }
                 if stateful {
                     // RegExpBuiltinExec Set(R,"lastIndex",0,true): a non-writable
                     // lastIndex makes a failed global/sticky exec throw.
@@ -3237,6 +3172,10 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "safe-sandbox")]
         drop(statics_reservation);
         if !build {
+            #[cfg(not(feature = "safe-sandbox"))]
+            if !is_ascii {
+                self.regex_subject_units_put(input_val, u16s);
+            }
             // `test`: nothing below is reachable, and with slot 1 deferred there is
             // no longer any string to build here at all.
             return Ok(Value::TRUE);
@@ -3262,6 +3201,10 @@ impl<'p> Vm<'p> {
         let result = self.regexp_build_result(&m, input_val, mstart, mend, has_indices, &mk);
         #[cfg(feature = "safe-sandbox")]
         drop(result_reservation);
+        #[cfg(not(feature = "safe-sandbox"))]
+        if !is_ascii {
+            self.regex_subject_units_put(input_val, u16s);
+        }
         Ok(result)
     }
 
@@ -3645,12 +3588,13 @@ impl<'p> Vm<'p> {
                 if !use_cached_units && start > subj.len() {
                     break None;
                 }
+                // Sticky (`/gy`): one anchored attempt, as in the shared impl.
                 match self.heap.get(re_idx) {
                     HeapObj::RegExp {
                         ascii_twin: Some(Some(twin)),
                         ..
                     } => {
-                        break twin.find_from_ascii(subj, start).next();
+                        break regex_first_match_ascii(twin, subj, start, sticky);
                     }
                     // Twin compile failed once: the base program is byte-safe too.
                     HeapObj::RegExp {
@@ -3658,13 +3602,13 @@ impl<'p> Vm<'p> {
                         regex,
                         ..
                     } => {
-                        break regex.find_from_ascii(subj, start).next();
+                        break regex_first_match_ascii(regex, subj, start, sticky);
                     }
                     HeapObj::RegExp {
                         ascii_twin: None, ..
                     } if !built_twin => {}
                     HeapObj::RegExp { regex, .. } => {
-                        break regex.find_from_ascii(subj, start).next();
+                        break regex_first_match_ascii(regex, subj, start, sticky);
                     }
                     _ => break None,
                 }
@@ -3679,8 +3623,10 @@ impl<'p> Vm<'p> {
                 self.ensure_regexp_ascii_twin(re_idx);
             }
         };
-        // Sticky: the match must begin exactly at the search start.
-        let found = found.filter(|m| !(sticky && m.start() != start));
+        debug_assert!(
+            !sticky || found.as_ref().is_none_or(|m| m.start() == start),
+            "a sticky match begins exactly at the search start"
+        );
         let m = match found {
             Some(m) => m,
             None => {
@@ -3956,6 +3902,7 @@ impl<'p> Vm<'p> {
             if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(re_idx) {
                 *last_index = v;
             }
+            self.heap.write_barrier_val(re_idx, v);
             Ok(())
         } else {
             self.set_prop(Value::heap(re_idx), "lastIndex", v, true)?;
@@ -4268,6 +4215,75 @@ impl<'p> Vm<'p> {
             HeapObj::Str(js) if js.is_ascii() => js.as_bytes().iter().map(|&b| b as u16).collect(),
             HeapObj::Str(js) => js.units_iter().collect(),
             _ => Vec::new(),
+        }
+    }
+
+    /// ToString(`v`) as its EXACT WTF-8 bytes: a lone surrogate stays itself,
+    /// where `to_js_string` reads it as U+FFFD.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn to_wtf8_bytes(&mut self, v: Value) -> Result<Vec<u8>, Thrown> {
+        let s = self.to_str_value(v)?;
+        Ok(self
+            .heap
+            .str_wtf8_cow(s.heap_index())
+            .map(|c| c.into_owned())
+            .unwrap_or_default())
+    }
+
+    /// `value_units` for a RegExp exec subject, served from the one-entry
+    /// [`RegexSubjectUnits`] cache when it still describes the string at that
+    /// slot. The caller hands the buffer back with
+    /// [`Self::regex_subject_units_put`] once its match ranges are consumed.
+    ///
+    /// Encoding per exec made every loop of execs over one non-ASCII string
+    /// O(length x execs): a global `match`, `matchAll`, a function-replacer
+    /// `replace`, and above all `split`, which execs once per position
+    /// (80 KB with one `é`: 13 s for `split(/\s+/)`, 8 ms for its ASCII twin).
+    ///
+    /// The key must prove the slot holds the same content. The slot version
+    /// changes whenever the slot is freed or reused. A proven-linear `+=`
+    /// appends to a flat string IN PLACE without a version bump, but always
+    /// grows its byte length, so the length completes the proof. A flatten
+    /// keeps both and the content.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn regex_subject_units_take(&mut self, subject: Value) -> Vec<u16> {
+        if subject.is_heap() {
+            let idx = subject.heap_index();
+            self.heap.flatten(idx);
+            if let HeapObj::Str(js) = self.heap.get(idx) {
+                let (version, bytes) = (self.heap.version_of(idx), js.as_bytes().len());
+                if let Some(cached) = self
+                    .regex_subject_units
+                    .take_if(|c| c.idx == idx && c.version == version && c.bytes == bytes)
+                {
+                    return cached.units;
+                }
+            }
+        }
+        self.value_units(subject)
+    }
+
+    /// Return a subject buffer taken by [`Self::regex_subject_units_take`].
+    /// Only a VM without a resource recorder keeps it: the buffer is native
+    /// memory outside the metered heap, and an instrumented VM's incremental
+    /// accounting must not undercount between calls.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn regex_subject_units_put(&mut self, subject: Value, units: Vec<u16>) {
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() {
+            return;
+        }
+        if units.is_empty() || !subject.is_heap() {
+            return;
+        }
+        let idx = subject.heap_index();
+        if let HeapObj::Str(js) = self.heap.get(idx) {
+            self.regex_subject_units = Some(RegexSubjectUnits {
+                idx,
+                version: self.heap.version_of(idx),
+                bytes: js.as_bytes().len(),
+                units,
+            });
         }
     }
 
@@ -5694,17 +5710,20 @@ impl<'p> Vm<'p> {
         let mut repl_str_reservation = self
             .instrument_reserve_regex_transient(0)
             .map_err(|message| Thrown(message.into()))?;
+        // ToString(replaceValue) as EXACT bytes: a template's own lone
+        // surrogate reached the output as U+FFFD when it came through a Rust
+        // `String` (`"abc".replace(/b/, "\uD800")`).
         #[cfg(feature = "safe-sandbox")]
-        let repl_str = if callable {
-            String::new()
+        let repl_tmpl = if callable {
+            Vec::new()
         } else {
-            regex_owned_capture_string(self, &mut repl_str_reservation, repl)?
+            regex_owned_wtf8_string(self, &mut repl_str_reservation, repl)?
         };
         #[cfg(not(feature = "safe-sandbox"))]
-        let repl_str = if callable {
-            String::new()
+        let repl_tmpl = if callable {
+            Vec::new()
         } else {
-            self.to_js_string(repl)?
+            self.to_wtf8_bytes(repl)?
         };
         // No match ⇒ the result is the subject unchanged (T0.4): return it as-is,
         // after the observable `ToString(replaceValue)` above, skipping the full
@@ -5876,118 +5895,50 @@ impl<'p> Vm<'p> {
                     crate::heap::wtf8_push(&mut out, &bytes);
                 }
             } else {
-                // GetSubstitution over LOSSY views (the template + captures come
-                // through ToString); positions stay unit-exact either way.
+                // GetSubstitution over the EXACT match: the template's bytes
+                // and ranges of the subject's own code units, never a
+                // `String::from_utf16_lossy` view that turned every lone
+                // surrogate in `$&`/`` $` ``/`$'`/`$N`/`$<name>` into U+FFFD.
                 #[cfg(feature = "safe-sandbox")]
                 let mut substitution_reservation = self
                     .instrument_reserve_regex_transient(0)
                     .map_err(|message| Thrown(message.into()))?;
-                #[cfg(feature = "safe-sandbox")]
-                let whole =
-                    regex_owned_utf16_lossy(self, &mut substitution_reservation, &u16s[m.range()])?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                let whole = String::from_utf16_lossy(&u16s[m.range()]);
-                let mut groups: Vec<Option<String>> = Vec::new();
-                #[cfg(feature = "safe-sandbox")]
-                regex_try_reserve_exact(
-                    self,
-                    &mut substitution_reservation,
-                    &mut groups,
-                    m.captures.len(),
-                )?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                groups.try_reserve_exact(m.captures.len()).map_err(|_| {
-                    Thrown("RangeError: RegExp capture-list allocation failed".into())
-                })?;
-                for capture in &m.captures {
-                    groups.push(match capture {
-                        Some(range) => {
-                            #[cfg(feature = "safe-sandbox")]
-                            {
-                                Some(regex_owned_utf16_lossy(
-                                    self,
-                                    &mut substitution_reservation,
-                                    &u16s[range.clone()],
-                                )?)
-                            }
-                            #[cfg(not(feature = "safe-sandbox"))]
-                            {
-                                Some(String::from_utf16_lossy(&u16s[range.clone()]))
-                            }
+                let limit = MAX_STRING_BYTES.saturating_sub(out.len());
+                let mut rep: Vec<u8> = Vec::new();
+                let src = SubSource::Match(SubSubject::Units(&u16s), m);
+                expand_replacement_pieces(&repl_tmpl, &src, &mut |piece| {
+                    // The template limit caps a `$1`-heavy expansion of a huge
+                    // capture (staging/sm/String/replace-math.js).
+                    if piece.wtf8_len() > limit.saturating_sub(rep.len()) {
+                        return Err(Thrown("RangeError: Invalid string length".into()));
+                    }
+                    #[cfg(feature = "safe-sandbox")]
+                    {
+                        match piece {
+                            SubPiece::Bytes(b) => regex_append_wtf8(
+                                self,
+                                &mut substitution_reservation,
+                                &mut rep,
+                                b,
+                            ),
+                            SubPiece::Units(u) => regex_append_units(
+                                self,
+                                &mut substitution_reservation,
+                                &mut rep,
+                                u,
+                            ),
                         }
-                        None => None,
-                    });
-                }
-                let mut named: Vec<(String, Option<String>)> = Vec::new();
-                for (name, range) in m.named_groups() {
-                    #[cfg(feature = "safe-sandbox")]
-                    regex_try_reserve_geometric(
-                        self,
-                        &mut substitution_reservation,
-                        &mut named,
-                        1,
-                        usize::MAX,
-                    )?;
-                    #[cfg(feature = "safe-sandbox")]
-                    let owned_name = regex_owned_str(self, &mut substitution_reservation, name)?;
+                    }
                     #[cfg(not(feature = "safe-sandbox"))]
-                    let owned_name = name.to_string();
-                    let value = match range {
-                        Some(range) => {
-                            #[cfg(feature = "safe-sandbox")]
-                            {
-                                Some(regex_owned_utf16_lossy(
-                                    self,
-                                    &mut substitution_reservation,
-                                    &u16s[range],
-                                )?)
-                            }
-                            #[cfg(not(feature = "safe-sandbox"))]
-                            {
-                                Some(String::from_utf16_lossy(&u16s[range]))
-                            }
-                        }
-                        None => None,
-                    };
-                    named.push((owned_name, value));
-                }
+                    {
+                        piece.append(&mut rep);
+                        Ok(())
+                    }
+                })?;
                 #[cfg(feature = "safe-sandbox")]
-                let pre =
-                    regex_owned_utf16_lossy(self, &mut substitution_reservation, &u16s[..st])?;
+                regex_append_wtf8(self, &mut out_reservation, &mut out, &rep)?;
                 #[cfg(not(feature = "safe-sandbox"))]
-                let pre = String::from_utf16_lossy(&u16s[..st]);
-                #[cfg(feature = "safe-sandbox")]
-                let post =
-                    regex_owned_utf16_lossy(self, &mut substitution_reservation, &u16s[en..])?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                let post = String::from_utf16_lossy(&u16s[en..]);
-                #[cfg(feature = "safe-sandbox")]
-                let rep = self.expand_replacement_safe(
-                    &mut substitution_reservation,
-                    &repl_str,
-                    &whole,
-                    &groups,
-                    &named,
-                    !named.is_empty(),
-                    &pre,
-                    &post,
-                    MAX_STRING_BYTES.saturating_sub(out.len()),
-                )?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                let rep = self.expand_replacement(
-                    &repl_str,
-                    &whole,
-                    &groups,
-                    &named,
-                    !named.is_empty(),
-                    &pre,
-                    &post,
-                    MAX_STRING_BYTES.saturating_sub(out.len()),
-                )?;
-                #[cfg(feature = "safe-sandbox")]
-                regex_append_wtf8(self, &mut out_reservation, &mut out, rep.as_bytes())?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                crate::heap::wtf8_push(&mut out, rep.as_bytes());
+                crate::heap::wtf8_push(&mut out, &rep);
             }
             last = en;
         }
@@ -6091,17 +6042,19 @@ impl<'p> Vm<'p> {
         let mut repl_str_reservation = self
             .instrument_reserve_regex_transient(0)
             .map_err(|message| Thrown(message.into()))?;
+        // The template is taken as EXACT bytes even here: the SUBJECT is
+        // ASCII, the replacement need not be.
         #[cfg(feature = "safe-sandbox")]
-        let repl_str = if callable {
-            String::new()
+        let repl_tmpl = if callable {
+            Vec::new()
         } else {
-            regex_owned_capture_string(self, &mut repl_str_reservation, repl)?
+            regex_owned_wtf8_string(self, &mut repl_str_reservation, repl)?
         };
         #[cfg(not(feature = "safe-sandbox"))]
-        let repl_str = if callable {
-            String::new()
+        let repl_tmpl = if callable {
+            Vec::new()
         } else {
-            self.to_js_string(repl)?
+            self.to_wtf8_bytes(repl)?
         };
         // No match ⇒ the result is the subject unchanged (T0.4): return it as-is,
         // after the observable `ToString(replaceValue)`, skipping the subject
@@ -6282,102 +6235,51 @@ impl<'p> Vm<'p> {
                     crate::heap::wtf8_push(&mut out, &bytes);
                 }
             } else {
-                // GetSubstitution directly over &str slices of the subject.
+                // GetSubstitution directly over the subject's bytes (ASCII, so
+                // a byte offset is a unit offset); only the template can carry
+                // a lone surrogate, and it reaches the output intact.
                 #[cfg(feature = "safe-sandbox")]
                 let mut substitution_reservation = self
                     .instrument_reserve_regex_transient(0)
                     .map_err(|message| Thrown(message.into()))?;
-                let mut groups: Vec<Option<String>> = Vec::new();
-                #[cfg(feature = "safe-sandbox")]
-                regex_try_reserve_exact(
-                    self,
-                    &mut substitution_reservation,
-                    &mut groups,
-                    m.captures.len(),
-                )?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                groups.try_reserve_exact(m.captures.len()).map_err(|_| {
-                    Thrown("RangeError: RegExp capture-list allocation failed".into())
-                })?;
-                for capture in &m.captures {
-                    groups.push(match capture {
-                        Some(range) => {
-                            #[cfg(feature = "safe-sandbox")]
-                            {
-                                Some(regex_owned_str(
+                let limit = MAX_STRING_BYTES.saturating_sub(out.len());
+                let mut rep: Vec<u8> = Vec::new();
+                let src = SubSource::Match(SubSubject::Ascii(&subject), m);
+                expand_replacement_pieces(
+                    &repl_tmpl,
+                    &src,
+                    &mut |piece| {
+                        if piece.wtf8_len() > limit.saturating_sub(rep.len()) {
+                            return Err(Thrown("RangeError: Invalid string length".into()));
+                        }
+                        #[cfg(feature = "safe-sandbox")]
+                        {
+                            match piece {
+                                SubPiece::Bytes(b) => regex_append_wtf8(
                                     self,
                                     &mut substitution_reservation,
-                                    &subject[range.clone()],
-                                )?)
-                            }
-                            #[cfg(not(feature = "safe-sandbox"))]
-                            {
-                                Some(subject[range.clone()].to_string())
-                            }
-                        }
-                        None => None,
-                    });
-                }
-                let mut named: Vec<(String, Option<String>)> = Vec::new();
-                for (name, range) in m.named_groups() {
-                    #[cfg(feature = "safe-sandbox")]
-                    regex_try_reserve_geometric(
-                        self,
-                        &mut substitution_reservation,
-                        &mut named,
-                        1,
-                        usize::MAX,
-                    )?;
-                    #[cfg(feature = "safe-sandbox")]
-                    let owned_name = regex_owned_str(self, &mut substitution_reservation, name)?;
-                    #[cfg(not(feature = "safe-sandbox"))]
-                    let owned_name = name.to_string();
-                    let value = match range {
-                        Some(range) => {
-                            #[cfg(feature = "safe-sandbox")]
-                            {
-                                Some(regex_owned_str(
+                                    &mut rep,
+                                    b,
+                                ),
+                                SubPiece::Units(u) => regex_append_units(
                                     self,
                                     &mut substitution_reservation,
-                                    &subject[range],
-                                )?)
-                            }
-                            #[cfg(not(feature = "safe-sandbox"))]
-                            {
-                                Some(subject[range].to_string())
+                                    &mut rep,
+                                    u,
+                                ),
                             }
                         }
-                        None => None,
-                    };
-                    named.push((owned_name, value));
-                }
-                #[cfg(feature = "safe-sandbox")]
-                let rep = self.expand_replacement_safe(
-                    &mut substitution_reservation,
-                    &repl_str,
-                    &subject[m.range()],
-                    &groups,
-                    &named,
-                    !named.is_empty(),
-                    &subject[..st],
-                    &subject[en..],
-                    MAX_STRING_BYTES.saturating_sub(out.len()),
-                )?;
-                #[cfg(not(feature = "safe-sandbox"))]
-                let rep = self.expand_replacement(
-                    &repl_str,
-                    &subject[m.range()],
-                    &groups,
-                    &named,
-                    !named.is_empty(),
-                    &subject[..st],
-                    &subject[en..],
-                    MAX_STRING_BYTES.saturating_sub(out.len()),
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        {
+                            piece.append(&mut rep);
+                            Ok(())
+                        }
+                    },
                 )?;
                 #[cfg(feature = "safe-sandbox")]
-                regex_append_wtf8(self, &mut out_reservation, &mut out, rep.as_bytes())?;
+                regex_append_wtf8(self, &mut out_reservation, &mut out, &rep)?;
                 #[cfg(not(feature = "safe-sandbox"))]
-                crate::heap::wtf8_push(&mut out, rep.as_bytes());
+                crate::heap::wtf8_push(&mut out, &rep);
             }
             last = en;
         }
@@ -6491,10 +6393,296 @@ pub(crate) fn nonunicode_pattern_chars(units: &[u16]) -> Vec<u32> {
 
 /// Append `units` onto WTF-8 buffer `out` — exact (`wtf8_push_cp`
 /// canonicalizes an adjacent (high, low) pair back into its astral scalar).
+/// One piece of a `GetSubstitution` expansion: literal template bytes (already
+/// WTF-8) or a range of the subject's UTF-16 code units.
+pub(crate) enum SubPiece<'a> {
+    Bytes(&'a [u8]),
+    Units(&'a [u16]),
+}
+
+impl SubPiece<'_> {
+    /// The number of bytes appending this piece adds — exact for `Bytes`, and
+    /// an upper bound for `Units` (a surrogate pair encodes in 4 bytes, not 6,
+    /// and a seam can pair two more halves).
+    pub(crate) fn wtf8_len(&self) -> usize {
+        match self {
+            SubPiece::Bytes(b) => b.len(),
+            SubPiece::Units(u) => u
+                .iter()
+                .map(|&u| match u {
+                    0..=0x7F => 1,
+                    0x80..=0x7FF => 2,
+                    _ => 3,
+                })
+                .sum(),
+        }
+    }
+
+    /// The hardened profile appends through the charging helpers instead.
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    pub(crate) fn append(&self, out: &mut Vec<u8>) {
+        match self {
+            SubPiece::Bytes(b) => crate::heap::wtf8_push(out, b),
+            SubPiece::Units(u) => push_units(out, u),
+        }
+    }
+}
+
+/// The subject a `GetSubstitution` expansion cuts its pieces from: the UTF-16
+/// units of the general path, or the bytes of an all-ASCII subject (where a
+/// byte offset IS a unit offset).
+#[derive(Clone, Copy)]
+pub(crate) enum SubSubject<'a> {
+    Units(&'a [u16]),
+    Ascii(&'a str),
+}
+
+impl<'a> SubSubject<'a> {
+    fn piece(&self, r: std::ops::Range<usize>) -> SubPiece<'a> {
+        match *self {
+            SubSubject::Units(u) => SubPiece::Units(&u[r]),
+            SubSubject::Ascii(s) => SubPiece::Bytes(&s.as_bytes()[r]),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match *self {
+            SubSubject::Units(u) => u.len(),
+            SubSubject::Ascii(s) => s.len(),
+        }
+    }
+}
+
+/// The already-materialized pieces of one match, for the fully observable
+/// `@@replace` protocol: its captures come back from a user-visible `exec`
+/// result (and its named groups from `Get(groups, name)`), not from a range
+/// of the subject. Each is the EXACT WTF-8 of the string it is.
+pub(crate) struct OwnedSub<'a> {
+    pub(crate) whole: &'a [u8],
+    pub(crate) pre: &'a [u16],
+    pub(crate) post: &'a [u16],
+    pub(crate) groups: &'a [Option<Vec<u8>>],
+    pub(crate) named: &'a [(String, Option<Vec<u8>>)],
+    pub(crate) named_defined: bool,
+    /// `named` was built by `template_group_name_refs`: one entry per `$<…>`
+    /// OCCURRENCE, in template order, because GetSubstitution performs its
+    /// `Get(namedCaptures, groupName)` per token — a repeated `$<a>` is two
+    /// Gets, and a getter may answer differently each time. The k-th token
+    /// therefore takes `named[k]` rather than the first entry with that name.
+    pub(crate) named_in_order: bool,
+}
+
+/// Where [`expand_replacement_pieces`] resolves each `$` selector.
+pub(crate) enum SubSource<'a> {
+    /// Ranges of the subject a regress `Match` indexes.
+    Match(SubSubject<'a>, &'a regress::Match),
+    /// Strings the observable protocol already read out.
+    Owned(OwnedSub<'a>),
+}
+
+impl<'a> SubSource<'a> {
+    fn whole(&self) -> SubPiece<'a> {
+        match self {
+            SubSource::Match(subject, m) => subject.piece(m.range()),
+            SubSource::Owned(o) => SubPiece::Bytes(o.whole),
+        }
+    }
+
+    fn pre(&self) -> SubPiece<'a> {
+        match self {
+            SubSource::Match(subject, m) => subject.piece(0..m.start()),
+            SubSource::Owned(o) => SubPiece::Units(o.pre),
+        }
+    }
+
+    fn post(&self) -> SubPiece<'a> {
+        match self {
+            SubSource::Match(subject, m) => subject.piece(m.end()..subject.len()),
+            SubSource::Owned(o) => SubPiece::Units(o.post),
+        }
+    }
+
+    fn group_count(&self) -> usize {
+        match self {
+            SubSource::Match(_, m) => m.captures.len(),
+            SubSource::Owned(o) => o.groups.len(),
+        }
+    }
+
+    /// Capture `n` (1-based, already range-checked): the empty string when the
+    /// group did not participate.
+    fn group(&self, n: usize) -> SubPiece<'a> {
+        match self {
+            SubSource::Match(subject, m) => match &m.captures[n - 1] {
+                Some(r) => subject.piece(r.clone()),
+                None => SubPiece::Bytes(b""),
+            },
+            SubSource::Owned(o) => match &o.groups[n - 1] {
+                Some(b) => SubPiece::Bytes(b),
+                None => SubPiece::Bytes(b""),
+            },
+        }
+    }
+
+    fn named_defined(&self) -> bool {
+        match self {
+            SubSource::Match(_, m) => m.named_groups().next().is_some(),
+            SubSource::Owned(o) => o.named_defined,
+        }
+    }
+
+    /// The named capture, or the empty string when absent or unmatched.
+    /// `nth` is the 0-based index of this `$<…>` token in the template, which
+    /// an `OwnedSub` built one-Get-per-occurrence consumes positionally.
+    fn named(&self, name: &[u8], nth: usize) -> SubPiece<'a> {
+        match self {
+            SubSource::Match(subject, m) => {
+                match m.named_groups().find(|(n, _)| n.as_bytes() == name) {
+                    Some((_, Some(r))) => subject.piece(r),
+                    _ => SubPiece::Bytes(b""),
+                }
+            }
+            SubSource::Owned(o) if o.named_in_order => match o.named.get(nth) {
+                Some((_, Some(b))) => SubPiece::Bytes(b),
+                _ => SubPiece::Bytes(b""),
+            },
+            // The names were read through the same lossy form their observable
+            // `Get` used, so a template name still finds them here.
+            SubSource::Owned(o) => match o
+                .named
+                .iter()
+                .find(|(n, _)| n.as_str() == String::from_utf8_lossy(name))
+                .map(|(_, v)| v)
+            {
+                Some(Some(b)) => SubPiece::Bytes(b),
+                _ => SubPiece::Bytes(b""),
+            },
+        }
+    }
+}
+
+/// `GetSubstitution` (ES 22.1.3.19.1) over the EXACT operands: `$$`, `$&`
+/// (whole), `` $` ``/`$'` (pre/post), `$N`/`$NN` (indexed group) and
+/// `$<name>` (named group, literal when the pattern has no named groups).
+/// Every substituted piece is handed to `push` — the caller appends and
+/// charges it — so nothing is ever rendered through a lossy `String`: the
+/// template keeps its own lone surrogates and a capture keeps the subject's.
+///
+/// Scanning the template as WTF-8 BYTES is exact: `$`, the four selectors and
+/// the digits are ASCII, and no byte of a multi-byte sequence is. An
+/// unrecognized `$` stays in the literal run, which is what pushing it and
+/// rescanning from the next byte did.
+pub(crate) fn expand_replacement_pieces(
+    tmpl: &[u8],
+    src: &SubSource<'_>,
+    push: &mut dyn FnMut(SubPiece<'_>) -> Result<(), Thrown>,
+) -> Result<(), Thrown> {
+    let named_defined = src.named_defined();
+    let group_count = src.group_count();
+    // Counts the `$<…>` TOKENS met, in template order — the key an `OwnedSub`
+    // whose `named` list is one entry per occurrence resolves against.
+    let mut next_named = 0usize;
+    let (mut i, mut literal) = (0usize, 0usize);
+    while i + 1 < tmpl.len() {
+        if tmpl[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let mut consumed = 2usize;
+        let piece: Option<SubPiece<'_>> = match tmpl[i + 1] {
+            b'$' => Some(SubPiece::Bytes(b"$")),
+            b'&' => Some(src.whole()),
+            b'`' => Some(src.pre()),
+            b'\'' => Some(src.post()),
+            // `$<name>` substitutes the named capture (the empty string when
+            // the group is absent or unmatched) only when the pattern HAS
+            // named groups; otherwise `$<` is literal.
+            b'<' if named_defined => match tmpl[i + 2..].iter().position(|&b| b == b'>') {
+                Some(end) => {
+                    consumed = 2 + end + 1;
+                    let nth = next_named;
+                    next_named += 1;
+                    Some(src.named(&tmpl[i + 2..i + 2 + end], nth))
+                }
+                None => {
+                    i += 1;
+                    continue;
+                }
+            },
+            // One or two digits; prefer the two-digit group if it exists.
+            b'0'..=b'9' => {
+                let d1 = (tmpl[i + 1] - b'0') as usize;
+                let two = if i + 2 < tmpl.len() && tmpl[i + 2].is_ascii_digit() {
+                    Some(d1 * 10 + (tmpl[i + 2] - b'0') as usize)
+                } else {
+                    None
+                };
+                let n = match two.filter(|&n| n >= 1 && n <= group_count) {
+                    Some(n) => {
+                        consumed = 3;
+                        n
+                    }
+                    None if d1 >= 1 && d1 <= group_count => d1,
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                Some(src.group(n))
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if let Some(piece) = piece {
+            if literal < i {
+                push(SubPiece::Bytes(&tmpl[literal..i]))?;
+            }
+            push(piece)?;
+            i += consumed;
+            literal = i;
+        }
+    }
+    if literal < tmpl.len() {
+        push(SubPiece::Bytes(&tmpl[literal..]))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn push_units(out: &mut Vec<u8>, units: &[u16]) {
     for &u in units {
         crate::heap::wtf8_push_cp(out, u as u32);
     }
+}
+
+/// The `$<name>` references GetSubstitution resolves in WTF-8 template
+/// `tmpl`, in template order and one per occurrence: exactly the tokens
+/// `expand_replacement_pieces` meets when named captures are defined. `$$` is
+/// consumed first, so `$$<a>` is a literal. A digit reference consumes digits
+/// only, so it can never hide a later `$` and the group count does not change
+/// what this returns.
+fn template_group_name_refs(tmpl: &[u8]) -> Vec<&[u8]> {
+    let mut refs = Vec::new();
+    let mut i = 0;
+    while i < tmpl.len() {
+        if tmpl[i] == b'$' && i + 1 < tmpl.len() {
+            match tmpl[i + 1] {
+                b'$' | b'&' | b'`' | b'\'' => i += 2,
+                b'<' => match tmpl[i + 2..].iter().position(|&b| b == b'>') {
+                    Some(end) => {
+                        refs.push(&tmpl[i + 2..i + 2 + end]);
+                        i += 2 + end + 1;
+                    }
+                    None => i += 1,
+                },
+                _ => i += 1,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    refs
 }
 
 /// AdvanceStringIndex (ES 22.2.7.3): +1 code UNIT, or +2 when `unicode`

@@ -22,6 +22,13 @@ Node was v22.16.0. Python was 3.13.5. Chromium was 144.0.7559.96.
 The included 3,521-byte WASM module was built with Clang 17.0.0 and wasm-ld from
 `wasm/kernels.c`, using `scripts/build_wasm.sh`. It has no WebAssembly imports.
 
+**Historical.** Every figure above, including the recorded response sizes in
+`http-validation.json`, describes the 13 September 2026 artifact. `955914f3`
+then changed `wasm/kernels.c` and rebuilt the module: the committed binary is
+now 4,217 bytes (SHA-256
+`79ceef0c974f0e62ecb676e88f22c68d14037251dedf5002ccd9096a64cefa57`). This
+archive is left as the record of that run and is not updated.
+
 The 57 Node tests include seven WebGPU **API/lifecycle mock** tests. Those verify
 host-side contracts such as bounds-guard generation, reduction scratch cleanup,
 readback mapping failure cleanup, compilation rejection cleanup and device-loss

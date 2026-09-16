@@ -1,0 +1,22 @@
+property 30 86.0 ['set', 'get', 'set', 'get']
+deleter None del
+ValueError below absolute zero
+AttributeError property 'fahrenheit' of 'Temperature' object has no setter
+data-descriptor-wins 1 in-dict
+class-access property celsius
+data v read from Host <v on class Host>
+data-set 42 v read from Host ['_v']
+nondata non-data non-data-class
+nondata-shadow instance wins non-data
+nondata-unshadow non-data
+inherited-descriptor v read from Sub 10 <v on class Sub>
+descriptor-replaced plain now plain now
+typed 13 4 x _y
+TypeError y must be int, got str
+typed-loop -30 [0, 1, 2, 3, 4]
+lazy [1, 2, 3] [1, 2, 3] 1 True
+property() 0 the balance
+property-super derived+base base
+function-descriptors plain plain static static Meth Meth
+function-shadow instance function plain
+dict-entries classmethod staticmethod True

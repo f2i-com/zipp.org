@@ -8,18 +8,6 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
-    /// If `idx` is an Error-like object — an object whose `name` is one of the
-    /// engine's error kinds — return that name, else `None`.
-    pub(crate) fn error_name(&self, idx: u32) -> Option<String> {
-        let map = match self.heap.get(idx) {
-            HeapObj::Object(m) => m,
-            _ => return None,
-        };
-        let nv = map.get("name")?;
-        let name = self.display(nv);
-        native::ERROR_NAMES.contains(&name.as_str()).then_some(name)
-    }
-
     /// Whether `idx`'s prototype chain reaches one of the error prototypes — i.e.
     /// it's a real error instance (created via `new TypeError` or an internal
     /// throw), as opposed to a plain object that merely has a `name` property.
@@ -239,15 +227,28 @@ impl<'p> Vm<'p> {
 
     /// Resolve `cb` to the native entry of a COMPILED, non-capturing JIT function
     /// for the array-builtin fast path (`map`/`filter`/`forEach`/`reduce`).
-    /// Returns `(entry, callee_reg_count, param_count)` or `None` if `cb` must go
-    /// through the interpreter `call_value` (not a plain function, a capturing
-    /// closure, JIT disabled, inside a deopted self-call continuation, or not
-    /// JIT-compilable). Compiles `cb` on first use if eligible — array builtins
-    /// call the same callback many times, so we don't wait for the call-count
-    /// threshold; an ineligible proto is blacklisted by `compile` and returns
-    /// `None` cheaply thereafter.
+    /// Returns `(entry, callee_reg_count, param_count, this)` or `None` if `cb`
+    /// must go through the interpreter `call_value` (not a plain function, a
+    /// capturing closure, JIT disabled, inside a deopted self-call continuation,
+    /// a `this` that must be bound per call, or not JIT-compilable). Compiles
+    /// `cb` on first use if eligible — array builtins call the same callback
+    /// many times, so we don't wait for the call-count threshold; an ineligible
+    /// proto is blacklisted by `compile` and returns `None` cheaply thereafter.
+    ///
+    /// `this` is what OrdinaryCallBindThis gives the callee for `this_arg`, the
+    /// same for every element: an arrow's lexical `this`, a strict callee's
+    /// `this_arg`, and for a sloppy one the global object when `this_arg` is
+    /// nullish. The native window used to hold the raw `this_arg`, so a sloppy
+    /// compiled callback saw `this === undefined`. A sloppy callee given a
+    /// primitive needs a FRESH wrapper per call, which `call_value` builds.
+    /// Resolved here once, not per element: a sort comparator runs n·log n
+    /// times, and a per-call binding measured ~2ns on each.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn native_cb_entry(&mut self, cb: Value) -> Option<(*const u8, usize, usize)> {
+    pub(crate) fn native_cb_entry(
+        &mut self,
+        cb: Value,
+        this_arg: Value,
+    ) -> Option<(*const u8, usize, usize, Value)> {
         // Mirror the interpreter's JIT-entry guard: respect ZIPP_NOJIT and never
         // enter native code from a deopted self-call continuation (livelock).
         if !self.jit_fused_ok() || self.jit_recurse_depth != 0 || !cb.is_heap() {
@@ -260,10 +261,25 @@ impl<'p> Vm<'p> {
         }
         // A callback that materialises `arguments` needs the interpreter's call
         // setup (the JIT window never builds the arguments object) — same guard
-        // as the fused-kernel paths.
-        if self.func(fid as usize).arguments_reg.is_some() {
+        // as the fused-kernel paths. An async or generator callback returns the
+        // Promise / generator object only that call setup creates; running its
+        // compiled body would hand back the raw completion value instead.
+        let is_strict = {
+            let proto = self.func(fid as usize);
+            if proto.arguments_reg.is_some() || proto.is_async || proto.is_generator {
+                return None;
+            }
+            proto.is_strict
+        };
+        let this = if let Some(lexical) = self.arrow_captured_this(cb) {
+            lexical
+        } else if is_strict || self.global_this == 0 || self.is_object_value(this_arg) {
+            this_arg
+        } else if this_arg.is_nullish() {
+            Value::heap(self.callee_this_global(cb))
+        } else {
             return None;
-        }
+        };
         if self.jit.get(fid).is_none() {
             let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
             // SAFETY: program functions are immutable during execution; the raw
@@ -332,21 +348,27 @@ impl<'p> Vm<'p> {
             entry,
             (proto.reg_count as usize).max(1),
             proto.param_count as usize,
+            this,
         ))
     }
 
     #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
-    pub(crate) fn native_cb_entry(&mut self, _cb: Value) -> Option<(*const u8, usize, usize)> {
+    pub(crate) fn native_cb_entry(
+        &mut self,
+        _cb: Value,
+        _this_arg: Value,
+    ) -> Option<(*const u8, usize, usize, Value)> {
         None
     }
 
     /// Invoke a compiled callback natively over the reused window at `win`
-    /// (`regs[win..win+callee_regs]`), writing `this`=undefined + the first
-    /// `param_count` args. On a native deopt (bail), re-runs the element through
-    /// the interpreter `call_value` — which nests its frame ABOVE this window
-    /// (base = `regs.len()`) and pops back, leaving the window intact for the
-    /// next element. This is the fast path that skips the per-element frame push
-    /// + `run_loop` re-entry + callee re-resolution that `call_value` incurs.
+    /// (`regs[win..win+callee_regs]`), writing the `this` `native_cb_entry`
+    /// bound + the first `param_count` args. On a native deopt (bail), re-runs
+    /// the element through the interpreter `call_value` — which nests its frame
+    /// ABOVE this window (base = `regs.len()`) and pops back, leaving the window
+    /// intact for the next element. This is the fast path that skips the
+    /// per-element frame push + `run_loop` re-entry + callee re-resolution that
+    /// `call_value` incurs.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn invoke_cb_windowed(
         &mut self,
@@ -357,9 +379,9 @@ impl<'p> Vm<'p> {
         args: &[Value],
         this_val: Value,
     ) -> Result<Value, Thrown> {
-        // An arrow callback ignores the supplied thisArg and uses its lexical `this`.
-        let this_val = self.arrow_captured_this(cb).unwrap_or(this_val);
-        self.regs[win] = this_val; // reg 0 = this (thisArg, or arrow's lexical this)
+        // `this_val` is the bound `this` from `native_cb_entry` (an arrow's
+        // lexical one included); `call_value` below rebinds it identically.
+        self.regs[win] = this_val; // reg 0 = this
         let n = args.len().min(param_count);
         for i in 0..n {
             self.regs[win + 1 + i] = args[i];
@@ -372,8 +394,19 @@ impl<'p> Vm<'p> {
         // through `jit_self_call` which is capacity-pinned (no regs realloc).
         let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
             unsafe { core::mem::transmute(entry) };
+        // The native entry is a Rust-stack re-entry exactly like a nested
+        // `run_loop`, but it never passes through one: a callback that recurses
+        // through the same array builtin (`function f(){ [1].forEach(f) }`, a
+        // `visit` over a cyclic graph) nested native frames with no budget until
+        // the OS stack overflowed and the process aborted. Charge it against the
+        // same re-entry cap so it throws the interpreter's catchable RangeError.
+        if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
         let mut bail: u32 = crate::codegen::NO_BAIL;
+        self.run_loop_depth += 1;
         let bits = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+        self.run_loop_depth -= 1;
         if bail == crate::codegen::NO_BAIL {
             return Ok(Value::from_bits(bits));
         }
@@ -406,19 +439,20 @@ impl<'p> Vm<'p> {
     }
 
     /// One per-element callback invocation: native fast path when `native` is
-    /// set, else the interpreter `call_value`.
+    /// set (with the `this` it bound), else the interpreter `call_value` with
+    /// the raw `this_val`.
     #[inline]
     pub(crate) fn run_cb_elem(
         &mut self,
-        native: Option<(*const u8, usize, usize)>,
+        native: Option<(*const u8, usize, usize, Value)>,
         win: usize,
         cb: Value,
         args: &[Value],
         this_val: Value,
     ) -> Result<Value, Thrown> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if let Some((entry, callee_regs, param_count)) = native {
-            let result = self.invoke_cb_windowed(entry, win, param_count, cb, args, this_val);
+        if let Some((entry, callee_regs, param_count, bound_this)) = native {
+            let result = self.invoke_cb_windowed(entry, win, param_count, cb, args, bound_this);
             // A resumed interpreter frame releases the window when it pops;
             // the next element expects it to be there again.
             if self.regs.len() < win + callee_regs {
@@ -453,14 +487,16 @@ fn fmt_exponential(n: f64, digits: Option<usize>) -> String {
     let sign = if n < 0.0 { "-" } else { "" };
     let a = n.abs();
     let (mant, exp) = match digits {
-        // Minimal mantissa: the shortest round-trip (Rust's default) is correct.
+        // Minimal mantissa: the shortest round-trip digits, an exact tie
+        // settled to the even candidate as in Number::toString.
         None => {
-            let raw = format!("{a:e}");
-            let epos = raw.find('e').unwrap();
-            (
-                raw[..epos].to_string(),
-                raw[epos + 1..].parse::<i32>().unwrap_or(0),
-            )
+            let (digits, exp) = crate::vm::helpers_num2::shortest_digits(a);
+            let mant = if digits.len() > 1 {
+                format!("{}.{}", &digits[..1], &digits[1..])
+            } else {
+                digits
+            };
+            (mant, exp)
         }
         Some(d) => round_exp_half_away(a, d),
     };
@@ -543,20 +579,27 @@ fn fmt_precision(n: f64, p: usize) -> String {
     }
     let neg = n < 0.0;
     let a = n.abs();
-    // Round to p significant figures via exponential form, then read the exponent.
-    let exp_str = format!("{a:.*e}", p - 1);
-    let epos = exp_str.find('e').unwrap();
-    let exp: i32 = exp_str[epos + 1..].parse().unwrap_or(0);
+    // Round to p significant figures ONCE, then lay the same digits out in
+    // either form. Step 10 picks the LARGER candidate on an exact tie
+    // ((2.5).toPrecision(1) is "3", (1.25).toPrecision(2) is "1.3"); Rust's
+    // `{:.*e}` / `{:.N}` formatters round such ties to even, so both forms
+    // come from `round_exp_half_away` (which also carries 9.99 → 1.00e+1).
+    // Reparsing the digits into an f64 and reformatting would re-introduce a
+    // rounding error (1.2345e27 → 1.2344999…e27).
+    let (mant, exp) = round_exp_half_away(a, p - 1);
     let body = if exp < -6 || exp >= p as i32 {
-        // The mantissa substring is ALREADY rounded to p significant figures by
-        // the `{:.*e}` formatter — use it directly. Reparsing it into an f64 and
-        // reformatting re-introduces a rounding error (1.2345e27 → 1.2344999…e27).
-        let m = &exp_str[..epos];
         let sign = if exp < 0 { "-" } else { "+" };
-        format!("{m}e{sign}{}", exp.abs())
+        format!("{mant}e{sign}{}", exp.abs())
     } else {
-        let frac = (p as i32 - 1 - exp).max(0) as usize;
-        format!("{a:.frac$}")
+        let digits: String = mant.chars().filter(|&c| c != '.').collect();
+        if exp < 0 {
+            format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
+        } else if exp as usize + 1 == p {
+            digits
+        } else {
+            let int_len = exp as usize + 1;
+            format!("{}.{}", &digits[..int_len], &digits[int_len..])
+        }
     };
     if neg {
         format!("-{body}")

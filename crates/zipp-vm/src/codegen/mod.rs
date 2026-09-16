@@ -1330,6 +1330,15 @@ pub struct MethodInlineShape {
     /// may materialize `captured_callee_bits`. Own/prototype methods use their
     /// explicit slot/hop guards instead.
     pub class_method: Option<(u32, u32)>,
+    /// `Vm::class_proto_epoch` baked when a CLASS member (method or accessor)
+    /// was resolved through the class's member tables. Those tables answer only
+    /// while they still describe the live prototype objects; the epoch moves
+    /// when any class's stop doing so (`C.prototype.m = f`, a redefined or
+    /// deleted declared member, `setPrototypeOf` on a prototype or instance),
+    /// and the arm misses from then on — the interpreter's `Class*` IC ways
+    /// bake the same epoch. `None` for own/prototype-chain arms, whose slot
+    /// and hop guards already cover mutation.
+    pub class_epoch: Option<u32>,
     /// Baked base pointer of this receiver's ObjMap `vals` (valid behind the
     /// version guard); shared by the outer body AND its inlined super bodies.
     pub vals_ptr: u64,

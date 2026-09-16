@@ -1,0 +1,47 @@
+(3, 2) (3, 1) (2, 3, 4) (2, 3, 4)
+bias [2, 3, 4] [-1.0, -1.0, -1.0, -1.0, 3.0, 3.0, 3.0, 3.0, 7.0, 7.0, 7.0, 7.0, 11.0, 11.0, 11.0, 11.0, 15.0, 15.0, 15.0, 15.0, 19.0, 19.0, 19.0, 19.0]
+flip [2] [0.10000000149011612, 0.05000000074505806]
+grid [3, 2] [0.0, 0.0, 10.0, 20.0, 20.0, 40.0]
+ratio [3, 2] [10.0, 20.0, 5.0, 10.0, 3.3333332538604736, 6.666666507720947]
+exp [8208, 36788, 164872, 2008554]
+tanh [-98661, -76159, 46212, 99505]
+sig [7586, 26894, 62246, 95257]
+gelu [-1552, -15866, 34573, 299595]
+gg [-3761, -8332, 86750, 101195]
+lg [198100, 69315, 22314, 230259]
+relu [0.0, 0.0, 0.5, 3.0] sqrt [2.5, 1.0, 0.5, 3.0] neg [2.5, 1.0, -0.5, -3.0]
+() (3,) (2, 1) (1, 1) (3, 2) (3, 2)
+total [] [21.0]
+cols [3] [5.0, 7.0, 9.0]
+rows [2] [2.0, 5.0]
+keep [2, 1] [6.0, 15.0]
+perm [3, 2] [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+flat [6] [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+softmax [9003, 24473, 66524, 9003, 24473, 66524] log_softmax [-240761, -140761, -40761, -240761, -140761, -40761]
+bb [2, 2, 2] [10.0, 13.0, 28.0, 40.0, 172.0, 193.0, 244.0, 274.0]
+bw [2, 2, 2] [2.0, 3.0, 8.0, 9.0, 14.0, 15.0, 20.0, 21.0]
+perm [2, 3] [6.0, 22.0, 38.0, 54.0, 70.0, 86.0]
+swapped [2, 3, 2] [0.0, 3.0, 1.0, 4.0, 2.0, 5.0, 6.0, 9.0, 7.0, 10.0, 8.0, 11.0]
+ce [120063] [11111, 11111, -22222, -30332, 8158, 22175, -3041, 555, 2487]
+p1 [0.9000000357627869, -2.0999999046325684, 0.5999999642372131]
+p2 [0.800000011920929, -2.1999998092651367, 0.699999988079071]
+m2 [0.0949999988079071, 0.04749999940395355, -0.1899999976158142]
+v2 [0.0004997500218451023, 0.00012493750546127558, 0.0019990000873804092]
+buf [1.3499999046325684, 1.125, 0.0]
+sgd [0.3250000476837158, -2.5625, 0.5]
+GraphError Shapes (2,) and (3,) cannot be broadcast
+GraphError Axis 2 is out of range for rank 2
+GraphError softmax supports the last axis of a tensor with at least one dimension
+GraphError dims must be a permutation of the tensor's axes
+GraphError reshape must keep the element count
+GraphError cross_entropy targets must be a tensor of integer class indices in [0, C)
+GraphError cross_entropy targets must be a tensor of integer class indices in [0, C)
+GraphError matmul batch dimensions must match or be 1
+GraphError Adam needs betas in [0, 1), eps >= 0 and an integer step >= 1
+GraphError sgd_update requires tensors of one shape
+GraphError Shapes have at most four dimensions
+GraphError Axis None is out of range for rank 2
+relu NUMBER
+tanh NUMBER
+sum NUMBER
+[0.0, 0.0]

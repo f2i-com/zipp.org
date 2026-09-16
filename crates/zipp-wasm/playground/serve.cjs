@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // A dependency-free playground server for Python and JavaScript on WASM. It serves the
 // REPOSITORY ROOT (so the page can reach ../dist/all/ for the engine and
-// ../../../examples/ for the sample projects) on loopback only.
+// ../../../examples/ for the sample projects) on loopback only. Any web page
+// can send requests to a loopback port, so it also answers only its own Host
+// (a DNS-rebinding page names another), never serves a dot-file or
+// dot-folder (`.git/`, `landing/.dev.vars`), and rejects paths with NUL bytes.
 //
 //   cd crates/zipp-wasm
 //   ./build-variants.sh all        # once: the Python-enabled engine
@@ -28,7 +31,16 @@ const TYPES = {
   ".png": "image/png",
 };
 
-const server = http.createServer(async (request, response) => {
+// The Host header a browser sends to this server, and only that.
+function ownHost(host) {
+  return host === `127.0.0.1:${PORT}` || host === `localhost:${PORT}`;
+}
+
+const server = http.createServer((request, response) => {
+  if (!ownHost(request.headers.host)) {
+    response.writeHead(421).end("misdirected request");
+    return;
+  }
   let pathname, url;
   try {
     url = new URL(request.url, 'http://localhost');
@@ -37,13 +49,25 @@ const server = http.createServer(async (request, response) => {
     response.writeHead(400).end("bad request");
     return;
   }
+  if (pathname.includes("\0")) {
+    response.writeHead(400).end("bad request");
+    return;
+  }
   if (pathname.endsWith("/")) pathname += "index.html";
+  if (pathname.split(/[\\/]/).some((segment) => segment.startsWith("."))) {
+    response.writeHead(403).end("forbidden");
+    return;
+  }
   const file = path.resolve(ROOT, "." + pathname);
   if (!file.startsWith(ROOT + path.sep) && file !== ROOT) {
     response.writeHead(403).end("forbidden");
     return;
   }
-  fs.readFile(file, (error, body) => {
+  readFile(file, response);
+});
+
+function readFile(file, response) {
+  const reply = (error, body) => {
     if (error) {
       response.writeHead(error.code === "ENOENT" ? 404 : 500).end(error.code === "ENOENT" ? "not found" : "error");
       return;
@@ -55,8 +79,14 @@ const server = http.createServer(async (request, response) => {
       "cross-origin-embedder-policy": "require-corp",
     });
     response.end(body);
-  });
-});
+  };
+  try {
+    fs.readFile(file, reply);
+  } catch (error) {
+    // Invalid paths throw synchronously; answer rather than crash the server.
+    reply(error);
+  }
+}
 
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { server.close(); process.exit(0); });
 

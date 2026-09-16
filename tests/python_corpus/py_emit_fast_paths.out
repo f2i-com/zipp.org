@@ -1,0 +1,189 @@
+int 0 1 -1 3 -100 0 2.5
+int 1 2 0 4 -99 3 3.5
+int -7 -6 -8 -4 -107 -21 -4.5
+int 3 4 2 6 -97 9 5.5
+int 100000000000000000000 100000000000000000001 99999999999999999999 100000000000000000003 99999999999999999900 300000000000000000000 1e+20
+int -100000000000000000000 -99999999999999999999 -100000000000000000001 -99999999999999999997 -100000000000000000100 -300000000000000000000 -1e+20
+int True 2 0 4 -99 3 3.5
+int False 1 -1 3 -100 0 2.5
+float 0.0 1.0 -1.0 0.5 0.0 0.0 -0.0
+float -0.0 1.0 -1.0 0.5 -0.0 0.0 0.0
+float 1.5 2.5 0.5 2.0 3.0 0.0 -1.5
+float -2.25 -1.25 -3.25 -1.75 -4.5 0.0 2.25
+float 2.0 3.0 1.0 2.5 4.0 0.0 -2.0
+float inf inf inf inf inf nan -inf
+float -inf -inf -inf -inf -inf nan inf
+float nan nan nan nan nan nan nan
+float 1e+308 1e+308 1e+308 1e+308 inf 0.0 -1e+308
+div 7 2 3 1 3.5 2 7 5 -8
+div 7 -2 -4 -1 -3.5 6 -1 -7 -8
+div 7 3 2 1 2.3333333333333335 3 7 4 -8
+div 7 -3 -3 -2 -2.3333333333333335 5 -1 -6 -8
+div -7 2 -4 1 -3.5 0 -5 -5 6
+div -7 -2 3 -1 3.5 -8 -1 7 6
+div -7 3 -3 2 -2.3333333333333335 1 -5 -6 6
+div -7 -3 2 -1 2.3333333333333335 -7 -3 4 6
+div 8 2 4 0 4.0 0 10 10 -9
+div 8 -2 -4 0 -4.0 8 -2 -10 -9
+div 8 3 2 2 2.6666666666666665 0 11 11 -9
+div 8 -3 -3 -1 -2.6666666666666665 8 -3 -11 -9
+div -8 2 -4 0 -4.0 0 -6 -6 7
+div -8 -2 4 0 4.0 -8 -2 6 7
+div -8 3 -3 1 -2.6666666666666665 0 -5 -5 7
+div -8 -3 2 -2 2.6666666666666665 -8 -3 5 7
+div 100000000000000000000 2 50000000000000000000 0 5e+19 0 100000000000000000002 100000000000000000002 -100000000000000000001
+div 100000000000000000000 -2 -50000000000000000000 0 -5e+19 100000000000000000000 -2 -100000000000000000002 -100000000000000000001
+div 100000000000000000000 3 33333333333333333333 1 3.333333333333333e+19 0 100000000000000000003 100000000000000000003 -100000000000000000001
+div 100000000000000000000 -3 -33333333333333333334 -2 -3.333333333333333e+19 100000000000000000000 -3 -100000000000000000003 -100000000000000000001
+fdiv 1.0 2.0 0.5 3.0 -1.0 2.0
+fdiv 1.0 -0.5 -2.0 0.5 1.5 -0.5
+fdiv 1.0 inf 0.0 inf -inf inf
+fdiv 1.0 -inf -0.0 -inf inf -inf
+fdiv 1.0 nan nan nan nan nan
+fdiv 1.0 3.0 0.3333333333333333 4.0 -2.0 3.0
+fdiv -1.0 2.0 -0.5 1.0 -3.0 -2.0
+fdiv -1.0 -0.5 2.0 -1.5 -0.5 0.5
+fdiv -1.0 inf -0.0 inf -inf -inf
+fdiv -1.0 -inf 0.0 -inf inf inf
+fdiv -1.0 nan nan nan nan nan
+fdiv -1.0 3.0 -0.3333333333333333 2.0 -4.0 -3.0
+fdiv 0.0 2.0 0.0 2.0 -2.0 0.0
+fdiv 0.0 -0.5 -0.0 -0.5 0.5 0.0
+fdiv 0.0 inf 0.0 inf -inf 0.0
+fdiv 0.0 -inf -0.0 -inf inf 0.0
+fdiv 0.0 nan nan nan nan 0.0
+fdiv 0.0 3.0 0.0 3.0 -3.0 0.0
+fdiv -0.0 2.0 -0.0 2.0 -2.0 0.0
+fdiv -0.0 -0.5 0.0 -0.5 0.5 0.0
+fdiv -0.0 inf -0.0 inf -inf 0.0
+fdiv -0.0 -inf 0.0 -inf inf 0.0
+fdiv -0.0 nan nan nan nan 0.0
+fdiv -0.0 3.0 -0.0 3.0 -3.0 0.0
+fdiv inf 2.0 inf inf inf inf
+fdiv inf -0.5 -inf inf inf -inf
+fdiv inf inf nan inf nan inf
+fdiv inf -inf nan nan inf -inf
+fdiv inf nan nan nan nan nan
+fdiv inf 3.0 inf inf inf inf
+fdiv nan 2.0 nan nan nan nan
+fdiv nan -0.5 nan nan nan nan
+fdiv nan inf nan nan nan nan
+fdiv nan -inf nan nan nan nan
+fdiv nan nan nan nan nan nan
+fdiv nan 3.0 nan nan nan nan
+fdiv 5.5 2.0 2.75 7.5 3.5 11.0
+fdiv 5.5 -0.5 -11.0 5.0 6.0 -2.75
+fdiv 5.5 inf 0.0 inf -inf inf
+fdiv 5.5 -inf -0.0 -inf inf -inf
+fdiv 5.5 nan nan nan nan nan
+fdiv 5.5 3.0 1.8333333333333333 8.5 2.5 16.5
+ZeroDivisionError float division by zero
+ZeroDivisionError float division by zero
+ZeroDivisionError float division by zero
+ZeroDivisionError float division by zero
+ZeroDivisionError float division by zero
+ZeroDivisionError float division by zero
+-0.0 0.0 -0.0 -0.0 0.0 0.0 -0.0
+-1.0 -1.0
+-0.0 0.0 -0.0 0.0 0.0 100000000000000000000 1 7
+-0.0 0.0 -0.0
+3.0 5.0 -0.5 9007199254740992.0 1e+20 3.5 -3.5 0.3333333333333333
+2 0 2 -1 -2 0 3
+abcd  xxx yyy [1, 2] (1, 2)
+ab0b1b2b3b4 5 -6 0 -100000000000000000000 -100000000000000000001 -18446744073709551616
+10 0.5 2 Num(3) Num(3) Num(4) Num(-3) Num(-4)
+TypeError can only concatenate str (not "int") to str
+TypeError unsupported operand type(s) for +: 'int' and 'str'
+TypeError unsupported operand type(s) for +: 'NoneType' and 'int'
+TypeError can only concatenate list (not "int") to list
+TypeError bad operand type for unary -: 'str'
+TypeError bad operand type for unary ~: 'float'
+inf -inf inf nan inf
+cmp 1 2 True True False False False True
+   branch lt le ne !ge
+cmp 2 1 False False True True False True
+   branch gt ge ne !lt
+cmp 2 2 False True False True True False
+   branch le ge eq !lt
+cmp 1.5 2.5 True True False False False True
+   branch lt le ne !ge
+cmp 2.5 1.5 False False True True False True
+   branch gt ge ne !lt
+cmp nan 1.0 False False False False False True
+   branch ne !lt !ge
+cmp 1.0 nan False False False False False True
+   branch ne !lt !ge
+cmp nan nan False False False False False True
+   branch ne !lt !ge
+cmp 0.0 -0.0 False True False True True False
+   branch le ge eq !lt
+cmp inf 100000000000000000000 False False True True False True
+   branch gt ge ne !lt
+cmp 1 1.0 False True False True True False
+   branch le ge eq !lt
+cmp 1 1.5 True True False False False True
+   branch lt le ne !ge
+cmp 100000000000000000000 100000000000000000001 True True False False False True
+   branch lt le ne !ge
+cmp 'a' 'b' True True False False False True
+   branch lt le ne !ge
+cmp 'b' 'a' False False True True False True
+   branch gt ge ne !lt
+cmp 'a' 'a' False True False True True False
+   branch le ge eq !lt
+cmp True 1 False True False True True False
+   branch le ge eq !lt
+cmp False 0.0 False True False True True False
+   branch le ge eq !lt
+str order True False True False
+   lt
+str order False True False True
+   not lt
+str order True False True False
+   lt
+Num(True) True True True
+Num lt truthy
+Num lt falsy
+is True False
+is True False
+is True False
+is False True
+is True False
+is True False
+True False False True True
+singleton None True False False False True
+   none branch
+singleton 0 False True False False True
+   not-true branch
+singleton '' False True False False True
+   not-true branch
+singleton [] False True False False True
+   not-true branch
+singleton False False True False True False
+   not-true branch
+singleton True False True True False True
+singleton 0.0 False True False False True
+   not-true branch
+singleton nan False True False False True
+   not-true branch
+bool 0 0 a a b a nand a b nor a c mixed a c d nested
+bool 0 1 a a b or-true a nand a b a c mixed a c d nested
+bool 1 0 a b a or-true a b nand a a b c a b nested
+bool 1 1 a b and-true a or-true a b a a b mixed a b c d nested
+bool 2 0 a b a or-true a b nand a a b c a b nested
+bool 2 1 a b and-true a or-true a b a a b mixed a b c
+while 3
+while-not 7
+while-float 2.5
+[3, 1.5, 'x', 0]
+[3, 1.5, nan]
+['hi', 'hi', 'hi', 'lo', 'lo', 'hi'] [2, 2, 2, 1, 2, 2]
+chain-branch 4
+long chain true
+walrus in branch 3
+walrus not 0
+all falsy
+Num truth
+membership
+non-membership
+1 0 0 1

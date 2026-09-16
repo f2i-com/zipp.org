@@ -343,8 +343,9 @@ pub enum TokenKind {
         /// is legal in a TAGGED template (the cooked value is `undefined`) and
         /// a SyntaxError otherwise — so the parser needs to know, not the lexer.
         cooked: Option<StrVal>,
-        /// The raw source between the delimiters, for `String.raw`.
-        raw: String,
+        /// The raw source between the delimiters, for `String.raw` — a
+        /// `StrVal` because eval'd source may carry a lone surrogate in it.
+        raw: StrVal,
         head: bool,
         tail: bool,
     },

@@ -247,7 +247,7 @@ mod tests {
                 tail,
             } => {
                 assert_eq!(cooked.as_ref().unwrap().to_lossy_string(), "abc");
-                assert_eq!(raw, "abc");
+                assert_eq!(raw.to_lossy_string(), "abc");
                 assert!(*head && *tail);
             }
             other => panic!("got {other:?}"),
@@ -282,7 +282,7 @@ mod tests {
         match &lex_all(r"`\u{}`")[0] {
             TokenKind::Template { cooked, raw, .. } => {
                 assert!(cooked.is_none(), "invalid escape => no cooked value");
-                assert_eq!(raw, r"\u{}");
+                assert_eq!(raw.to_lossy_string(), r"\u{}");
             }
             other => panic!("got {other:?}"),
         }
@@ -290,7 +290,7 @@ mod tests {
         match &lex_all("`a\r\nb`")[0] {
             TokenKind::Template { cooked, raw, .. } => {
                 assert_eq!(cooked.as_ref().unwrap().to_lossy_string(), "a\nb");
-                assert_eq!(raw, "a\nb");
+                assert_eq!(raw.to_lossy_string(), "a\nb");
             }
             other => panic!("got {other:?}"),
         }

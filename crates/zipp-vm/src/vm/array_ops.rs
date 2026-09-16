@@ -12,6 +12,26 @@ const MAX_ARRAY_STRINGIFY_DEPTH: usize = 4;
 #[cfg(not(feature = "safe-sandbox"))]
 const MAX_ARRAY_STRINGIFY_DEPTH: usize = 1_024;
 
+/// Compare two WTF-8 strings by UTF-16 code units (IsLessThan's order). The
+/// shared prefix is skipped bytewise; from the code point where they first
+/// differ, the units decide — so an astral character's lead surrogate orders
+/// below U+E000..U+FFFF, and a lone surrogate by its own unit value.
+fn wtf8_code_unit_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let Some(i) = a.iter().zip(b).position(|(x, y)| x != y) else {
+        return a.len().cmp(&b.len());
+    };
+    if a[i] < 0x80 && b[i] < 0x80 {
+        return a[i].cmp(&b[i]);
+    }
+    // Back up to the start of the code point holding the first difference;
+    // the prefix is shared, so it starts at the same offset in both.
+    let mut j = i;
+    while j > 0 && (a[j] & 0xC0) == 0x80 {
+        j -= 1;
+    }
+    crate::heap::wtf8_units_iter(&a[j..]).cmp(crate::heap::wtf8_units_iter(&b[j..]))
+}
+
 /// The three capture-free numeric arrow bodies used by the cross-engine WASM
 /// workload.  This deliberately is not a general bytecode mini-interpreter:
 /// recognition below admits only the exact compiler output, and every operand
@@ -379,6 +399,54 @@ impl<'p> Vm<'p> {
         result
     }
 
+    /// Admit `additional` more bytes onto a guest-visible join buffer: the
+    /// string byte cap, the host heap ceiling, a fallible reservation. The
+    /// WTF-8 twin of `append_guest_string`'s checks.
+    pub(crate) fn reserve_guest_wtf8(
+        &mut self,
+        out: &mut Vec<u8>,
+        additional: usize,
+    ) -> Result<(), Thrown> {
+        let total = out
+            .len()
+            .checked_add(additional)
+            .filter(|&n| n <= MAX_STRING_BYTES)
+            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(total)
+            .map_err(|message| Thrown(message.into()))?;
+        #[cfg(not(feature = "instrument"))]
+        let _ = total;
+        out.try_reserve(additional)
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))
+    }
+
+    /// ToString(v) as WTF-8 bytes, lone surrogates intact. A string is copied
+    /// as stored; an object goes through ToPrimitive first, so a `toString`
+    /// returning a lone surrogate keeps it. `to_js_string` decodes to a Rust
+    /// `String`, which turns each surrogate half into U+FFFD.
+    pub(crate) fn to_wtf8_string(&mut self, v: Value) -> Result<Vec<u8>, Thrown> {
+        let p = if self.is_object_value(v) {
+            self.to_primitive_string(v)?
+        } else {
+            v
+        };
+        if p.is_heap() && self.heap.is_str_like(p.heap_index()) {
+            return Ok(self
+                .heap
+                .str_wtf8_cow(p.heap_index())
+                .map(|c| c.into_owned())
+                .unwrap_or_default());
+        }
+        Ok(self.to_js_string(p)?.into_bytes())
+    }
+
+    /// Allocate a finished WTF-8 buffer (a join, or any builder that kept
+    /// lone surrogates) as a string value.
+    pub(crate) fn alloc_wtf8_str(&mut self, out: Vec<u8>) -> Value {
+        Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))
+    }
+
     /// Shared driver for `map`/`filter`/`forEach` (callback args = [element,
     /// index]). Uses the native callback fast path when the callback is a
     /// compiled non-capturing function: a single reused register window, a direct
@@ -592,12 +660,12 @@ impl<'p> Vm<'p> {
         // ran, or just the tail after a kernel bail (or nothing if it completed).
         let run_tail = start < snapshot_len;
         let mut native = if run_tail {
-            self.native_cb_entry(cb)
+            self.native_cb_entry(cb, this_arg)
         } else {
             None
         };
         let win = self.regs.len();
-        if let Some((_, callee_regs, _)) = native {
+        if let Some((_, callee_regs, _, _)) = native {
             if self.regs_would_overflow(win + callee_regs) {
                 native = None; // can't fit a window → interpreter path
             } else {
@@ -844,17 +912,9 @@ impl<'p> Vm<'p> {
     /// ordinary-array case takes the fast dense path unchanged; only a custom species
     /// constructs a target and receives each element via CreateDataPropertyOrThrow.
     /// GC is suspended for the scope so `out`'s values survive the species ctor call.
-    pub(crate) fn array_from_species(
-        &mut self,
-        original: Value,
-        out: Vec<Value>,
-        species_len: usize,
-    ) -> Result<Value, Thrown> {
-        self.array_from_species_len(original, out, species_len, false)
-    }
-
+    ///
     /// `set_length`: slice/splice end with Set(A,'length',n,true) per spec;
-    /// map/filter/flat/flatMap only define elements.
+    /// map/filter only define elements.
     pub(crate) fn array_from_species_len(
         &mut self,
         original: Value,
@@ -900,6 +960,75 @@ impl<'p> Vm<'p> {
         self.flatten_into_array_at(out, source, source_len, depth, mapper, 0, &mut work)
     }
 
+    /// `flat` / `flatMap`: FlattenIntoArray into `target` (the ArraySpeciesCreate
+    /// result, or `None` for a plain current-realm array).
+    ///
+    /// The receiver may be a Rust-owned apply argument and a species `target` a
+    /// fresh constructor result, so both stay on the host-root stack throughout.
+    ///
+    /// The walk itself collects into a Rust `Vec` — not a GC root — while
+    /// element getters, Proxy traps and the mapper run, so it holds the GC lock
+    /// instead of rooting each value: rooting them would hold every element
+    /// TWICE, and `[bigArray, bigArray, …].flat()` then needs twice the
+    /// memory, which trapped the WASM instance at its linear-memory wall
+    /// before the heap ceiling could refuse it (the accounting in
+    /// `reserve_array_result` sizes one copy). A species target receives the
+    /// elements only afterwards, through CreateDataPropertyOrThrow — a setter
+    /// or a defineProperty trap, which must be able to collect — so the
+    /// collected block becomes a real array first and is handed over from
+    /// there, reachable the whole time.
+    fn flatten_into_array_result(
+        &mut self,
+        source: Value,
+        source_len: usize,
+        depth: i64,
+        mapper: Option<(Value, Value)>,
+        target: Option<Value>,
+    ) -> Result<Value, Thrown> {
+        let target_root = target.unwrap_or(Value::UNDEFINED);
+        self.with_host_roots(&[source, target_root], |vm| {
+            // The lock spans the allocation too: until the block is inside a
+            // heap object, a collection there would see no reference to it.
+            let built = {
+                let _gc = vm.gc_lock_guard();
+                let mut out = Vec::new();
+                vm.flatten_into_array(&mut out, source, source_len, depth, mapper)?;
+                vm.alloc_array_current_realm(out)
+            };
+            let Some(a) = target else { return Ok(built) };
+            vm.with_host_roots(&[built], |vm| {
+                let n = match vm.heap.get(built.heap_index()) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
+                for i in 0..n {
+                    let v = match vm.heap.get(built.heap_index()) {
+                        HeapObj::Array(items) => items[i],
+                        _ => Value::UNDEFINED,
+                    };
+                    vm.create_data_property_or_throw(a, i, v)?;
+                }
+                Ok(a)
+            })
+        })
+    }
+
+    /// Is every `HasProperty`+`Get` the flatten walk does on `v` exactly "the
+    /// dense slot at that index, when it is not a hole"? True only for a real
+    /// Array (an arguments object records a `proto_of`) with no side table to
+    /// shadow an element or `length`, its default [[Prototype]], and no integer
+    /// key on the shared prototypes — the same proof `array_iter_get`'s two
+    /// fast paths make per call. Re-proved after anything that can run guest
+    /// code, since that code can add any of them.
+    fn flatten_dense(&self, v: Value) -> bool {
+        crate::codegen::hole_absent_fast_enabled()
+            && !self.array_proto_has_index
+            && v.is_heap()
+            && !self.arr_props.contains_key(&v.heap_index())
+            && !self.proto_of.contains_key(&v.heap_index())
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Array(_))
+    }
+
     fn flatten_into_array_at(
         &mut self,
         out: &mut Vec<Value>,
@@ -914,22 +1043,63 @@ impl<'p> Vm<'p> {
             .checked_add(source_len as u64)
             .ok_or_else(|| Thrown("RangeError: native builtin iteration limit exceeded".into()))?;
         self.preflight_native_iteration_work(*work)?;
+        // Hoisted out of the loop: `array_iter_get`'s per-element side-table
+        // probe is the whole cost of a plain `[1,2,3].flat()`.
+        let mut dense = self.flatten_dense(source);
+        let sidx = if source.is_heap() { source.heap_index() } else { 0 };
+        // A plain array flattened no further, with every index present: its
+        // elements go in as one block. (Every Get and HasProperty the walk
+        // below would do is unobservable here.)
+        if depth <= 0 && mapper.is_none() && dense {
+            let clean = matches!(self.heap.get(sidx), HeapObj::Array(items)
+                    if items.len() == source_len && !items.iter().any(|v| v.is_hole()));
+            if clean {
+                self.reserve_array_result(out, source_len, false)?;
+                if let HeapObj::Array(items) = self.heap.get(sidx) {
+                    out.extend_from_slice(items);
+                }
+                return Ok(());
+            }
+        }
         for k in 0..source_len {
-            let Some(got) = self.array_iter_get(source, k)? else {
+            let got = if dense {
+                match self.heap.get(sidx) {
+                    HeapObj::Array(items) => items.get(k).copied().filter(|v| !v.is_hole()),
+                    _ => None,
+                }
+            } else {
+                self.array_iter_get(source, k)?
+            };
+            let Some(got) = got else {
                 continue;
             };
             let v = match mapper {
-                Some((cb, ta)) => self.call_value(cb, ta, &[got, Value::num(k as f64), source])?,
+                Some((cb, ta)) => {
+                    let r = self.call_value(cb, ta, &[got, Value::num(k as f64), source])?;
+                    dense = self.flatten_dense(source);
+                    r
+                }
                 None => got,
             };
-            if depth > 0 && self.value_is_array_throwing(v)? {
-                let lv = self.get_prop(v, "length")?;
-                let lf = self.to_number_strict(lv)?;
-                let n = if lf.is_nan() || lf <= 0.0 {
-                    0usize
+            // `is_heap` first: IsArray is a chain walk, and the elements of a
+            // numeric array are never spreadable.
+            if depth > 0 && v.is_heap() && self.value_is_array_throwing(v)? {
+                // A mapper-made nested array is only a Rust local while its
+                // own length/element Gets run.
+                self.push_host_root(v);
+                // A plain Array's `length` is an own non-configurable data
+                // property no overlay redefines, so `js_array_len` IS its Get.
+                // (The walk's work budget bounds how much of it is read.)
+                let n = if self.flatten_dense(v) {
+                    self.js_array_len(v.heap_index())
                 } else {
-                    (lf.trunc().min(9_007_199_254_740_991.0) as usize)
-                        .min(crate::vm::MAX_DENSE_ARRAY_LEN)
+                    let lv = self.get_prop(v, "length")?;
+                    let lf = self.to_number_strict(lv)?;
+                    if lf.is_nan() || lf <= 0.0 {
+                        0usize
+                    } else {
+                        lf.trunc().min(9_007_199_254_740_991.0) as usize
+                    }
                 };
                 let next_depth = active_depth.checked_add(1).ok_or_else(|| {
                     Thrown("RangeError: array flattening nesting limit exceeded".into())
@@ -941,12 +1111,13 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 self.flatten_into_array_at(out, v, n, depth - 1, None, next_depth, work)?;
+                // The nested walk's Gets can be Proxy traps or accessors.
+                dense = self.flatten_dense(source);
             } else {
-                if out.len() >= crate::vm::MAX_DENSE_ARRAY_LEN {
-                    return Err(Thrown(
-                        "RangeError: array length exceeds the engine's dense-array limit".into(),
-                    ));
-                }
+                // Admit the result's growth before the store reallocates: its
+                // size is the sum of the elements visited, which for an array
+                // of N references to one big array is N times that array.
+                self.reserve_array_result(out, 1, false)?;
                 out.push(v);
             }
         }
@@ -1372,6 +1543,9 @@ impl<'p> Vm<'p> {
         } else {
             0
         };
+        if let Some(r) = self.virtual_array_search(this, name, search, len, has_from, from_raw)? {
+            return Ok(Some(r));
+        }
         match name {
             "lastIndexOf" => {
                 // Default search start is len-1; n>=0 → min(n, len-1); n<0 → len+n.
@@ -1434,6 +1608,124 @@ impl<'p> Vm<'p> {
                 }))
             }
         }
+    }
+
+    /// The indices in `[lo, hi)` a VIRTUAL array holds, ascending: its dense
+    /// store's non-hole slots and its overlay's index keys. A per-index walk
+    /// of a virtual array is O(length) — minutes at `length = 2**32 - 1` for
+    /// one element — while every index this leaves out is provably absent: no
+    /// indexed property on the prototype chain (the protector, no replaced
+    /// prototype), not an arguments object, and no accessor in the overlay, so
+    /// reading the present elements has no side effect that could add or
+    /// remove one. `None` when any of that does not hold.
+    fn virtual_array_present(&self, idx: u32, lo: usize, hi: usize) -> Option<Vec<usize>> {
+        if self.array_proto_has_index
+            || self.proto_of.contains_key(&idx)
+            || self.arguments_objs.contains_key(&idx)
+        {
+            return None;
+        }
+        let mut present: Vec<usize> = match self.heap.get(idx) {
+            HeapObj::Array(items) => (lo.min(items.len())..hi.min(items.len()))
+                .filter(|&i| !items[i].is_hole())
+                .collect(),
+            _ => return None,
+        };
+        if let Some(m) = self.arr_props.get(&idx) {
+            for (i, k) in m.keys.iter().enumerate() {
+                let Some(ki) = canonical_index_str(k) else {
+                    continue;
+                };
+                if ki >= 4_294_967_295 {
+                    continue;
+                }
+                if m.attr_at(i).accessor {
+                    return None;
+                }
+                if ki >= lo && ki < hi {
+                    present.push(ki);
+                }
+            }
+        }
+        present.sort_unstable();
+        present.dedup();
+        Some(present)
+    }
+
+    /// indexOf / lastIndexOf / includes over a VIRTUAL array, visiting only the
+    /// indices it holds (see `virtual_array_present`). An absent index is
+    /// skipped by indexOf/lastIndexOf and reads `undefined` for includes.
+    /// `None` hands the call to the per-index protocol.
+    fn virtual_array_search(
+        &mut self,
+        this: Value,
+        name: &str,
+        search: Value,
+        len: i64,
+        has_from: bool,
+        from_raw: i64,
+    ) -> Result<Option<Value>, Thrown> {
+        if !this.is_heap() || !self.array_is_virtual(this.heap_index()) {
+            return Ok(None);
+        }
+        let idx = this.heap_index();
+        let (lo, hi) = if name == "lastIndexOf" {
+            let k = if has_from {
+                if from_raw >= 0 {
+                    from_raw.min(len - 1)
+                } else {
+                    len + from_raw
+                }
+            } else {
+                len - 1
+            };
+            (0i64, k + 1)
+        } else {
+            let k = if from_raw >= 0 {
+                from_raw
+            } else {
+                (len + from_raw).max(0)
+            };
+            (k, len)
+        };
+        if lo >= hi {
+            return Ok(Some(if name == "includes" {
+                Value::bool(false)
+            } else {
+                Value::int(-1)
+            }));
+        }
+        let (lo, hi) = (lo as usize, hi as usize);
+        let Some(mut present) = self.virtual_array_present(idx, lo, hi) else {
+            return Ok(None);
+        };
+        let is_includes = name == "includes";
+        if is_includes && search == Value::UNDEFINED && present.len() < hi - lo {
+            return Ok(Some(Value::bool(true)));
+        }
+        if name == "lastIndexOf" {
+            present.reverse();
+        }
+        for k in present {
+            let v = self.get_index(this, Value::num(k as f64))?;
+            let hit = if is_includes {
+                self.same_value_zero(v, search)
+            } else {
+                self.values_strict_eq(v, search)
+            };
+            if hit {
+                return Ok(Some(if is_includes {
+                    Value::bool(true)
+                } else {
+                    Value::num(k as f64)
+                }));
+            }
+        }
+        Ok(Some(if is_includes {
+            Value::bool(false)
+        } else {
+            Value::int(-1)
+        }))
     }
 
     /// `Array.prototype.copyWithin` against an array-like *object* via the generic
@@ -1770,12 +2062,7 @@ impl<'p> Vm<'p> {
                         a
                     }
                     None => {
-                        if actual_delete.max(0) as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
-                            return Err(Thrown(
-                                "RangeError: array length exceeds the engine's dense-array limit"
-                                    .into(),
-                            ));
-                        }
+                        self.preflight_materialized_array(actual_delete.max(0) as usize)?;
                         let mut deleted: Vec<Value> =
                             Vec::with_capacity((actual_delete.max(0) as usize).min(4096));
                         let mut k = 0;
@@ -1840,6 +2127,95 @@ impl<'p> Vm<'p> {
         Ok(Some(r))
     }
 
+    /// `fill` on a VIRTUAL array, written into the dense store: grow it (with
+    /// holes) to the fill's end and store the value over `[start, end)`. When
+    /// the end is the JS length the array stops being virtual, so the idiom
+    /// `new Array(2e6).fill(0)` leaves an ordinary dense array behind — every
+    /// fast path, and the JIT, can use it again.
+    ///
+    /// `None` hands the call to the generic Set protocol, whenever this could
+    /// be observed differently: a start/end argument whose coercion runs code,
+    /// an element overlay or integrity flag on the array, a prototype that
+    /// could intercept a Set on a hole. An end past
+    /// `MAX_MATERIALIZED_ARRAY_LEN` also goes generic when the range beyond
+    /// the store is short, and is a RangeError when it is not.
+    fn fill_virtual_array_dense(
+        &mut self,
+        idx: u32,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        let plain = |v: Option<&Value>| v.map_or(true, |v| *v == Value::UNDEFINED || v.is_number());
+        if !plain(args.get(1))
+            || !plain(args.get(2))
+            || self.array_elements_overlaid(idx)
+            || self.array_proto_has_index
+            || self.proto_of.contains_key(&idx)
+            || self.arguments_objs.contains_key(&idx)
+        {
+            return Ok(None);
+        }
+        let js_len = self.js_array_len(idx);
+        let len = js_len as f64;
+        // ToIntegerOrInfinity of a Number, then the relative-index clamp.
+        let rel = |v: Option<&Value>, absent: f64| -> f64 {
+            match v {
+                Some(v) if v.is_number() => {
+                    let n = v.as_f64();
+                    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+                    if n < 0.0 {
+                        (len + n).max(0.0)
+                    } else {
+                        n.min(len)
+                    }
+                }
+                _ => absent,
+            }
+        };
+        let start = rel(args.get(1), 0.0) as usize;
+        let end = rel(args.get(2), len) as usize;
+        let dense = match self.heap.get(idx) {
+            HeapObj::Array(items) => items.len(),
+            _ => return Ok(None),
+        };
+        if end > crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
+            // The store cannot grow that far. The generic Sets grow it up to
+            // the dense cap, and every write past that becomes a string-keyed
+            // overlay property: a short tail is cheap that way, but
+            // `new Array(3e7).fill(0)` ran for seconds building gigabytes of
+            // them. Refuse a long one like every other materialization.
+            let overlaid = end.saturating_sub(start.max(dense).max(crate::vm::MAX_DENSE_ARRAY_LEN));
+            if overlaid > crate::vm::MAX_DENSE_ARRAY_LEN {
+                return Err(Thrown(
+                    "RangeError: array length exceeds the engine's dense-array limit".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        if start < end {
+            if end > dense {
+                self.preflight_materialized_array(end)?;
+            }
+            let val = args.first().copied().unwrap_or(Value::UNDEFINED);
+            self.heap.write_barrier_val(idx, val);
+            if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                if end > items.len() {
+                    items
+                        .try_reserve_exact(end - items.len())
+                        .map_err(|_| Thrown("RangeError: array allocation failed".into()))?;
+                    items.resize(end, Value::HOLE);
+                }
+                items[start..end].fill(val);
+                if end == js_len {
+                    self.array_js_len.remove(&idx);
+                }
+            }
+            // The key set (holes became elements) and possibly the length
+            // representation changed; see `array_apply_length`.
+            self.heap.bump_version(idx);
+        }
+        Ok(Some(Value::heap(idx)))
+    }
+
     pub(crate) fn array_method(
         &mut self,
         idx: u32,
@@ -1852,12 +2228,41 @@ impl<'p> Vm<'p> {
         // arms never reach a GC safe point, so the lock is free for them.
         let _gc = self.gc_lock_guard();
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        // `new Array(n).fill(x)` past the dense cap: the one idiom that turns a
+        // VIRTUAL array (see MAX_DENSE_ARRAY_LEN) into a fully populated one.
+        // Writing it through the generic Set protocol would put every element
+        // past the cap in the string-keyed sparse overlay; build the dense store
+        // instead, up to the fill's end, and let the dense arm below fill it.
+        // Only when nothing can observe the difference: no overlay element to
+        // collide with, no side table constraint on the writes, no prototype
+        // that could intercept a Set on a hole.
+        let virtual_len = self.array_is_virtual(idx);
+        if virtual_len && name == "fill" {
+            if let Some(r) = self.fill_virtual_array_dense(idx, args)? {
+                return Ok(Some(r));
+            }
+        }
         // Generic array methods accept an array-like `this`
         // (`Array.prototype.map.call({length:2, 0:'a', 1:'b'}, cb)`, or on a string).
         // For a non-array receiver, snapshot its `length` + indexed elements into a
         // temp array and run the (read-only) method against that. Mutating methods
         // still require a real array (they fall through to their HeapObj::Array arms).
-        if !matches!(self.heap.get(idx), HeapObj::Array(_)) {
+        //
+        // A VIRTUAL array takes the same generic protocol: every dense arm below
+        // sizes its work from the Vec, which holds only a prefix of it, so they
+        // silently answered for a truncated array. (`concat` and `sort` are not
+        // in the generic list; their arms read `js_array_len` themselves.)
+        //
+        // `toSpliced` with a start or deleteCount that is not a Number takes it
+        // too. Its spec order — length, then ToIntegerOrInfinity of both
+        // (valueOf runs, a BigInt throws), then reads bounded by the ENTRY
+        // length — is what the generic arm implements; the dense arm read
+        // non-Number arguments as 0 and copied the array as it stood after the
+        // coercions. A Number coerces without running code, so it stays dense.
+        if virtual_len
+            || (name == "toSpliced" && args.iter().take(2).any(|a| !a.is_number()))
+            || !matches!(self.heap.get(idx), HeapObj::Array(_))
+        {
             // Hole-skipping callback methods iterate the array-like object with
             // HasProperty per index (a dense snapshot would treat holes as
             // present-undefined and wrongly invoke the callback on them).
@@ -1956,7 +2361,7 @@ impl<'p> Vm<'p> {
                     if len as f64 > 4_294_967_295.0 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
-                    self.preflight_native_iteration_work(len as u64)?;
+                    self.preflight_materialized_array(len)?;
                     let mut out = Vec::with_capacity(len);
                     for k in 0..len {
                         let v =
@@ -1995,11 +2400,12 @@ impl<'p> Vm<'p> {
                 if matches!(name, "flat" | "flatMap") {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
                     let lf = self.to_number_strict(lv)?;
+                    // The full ToLength (the walk preflights its own work); a
+                    // clamp here silently skipped every index past 2^20.
                     let source_len = if lf.is_nan() || lf <= 0.0 {
                         0usize
                     } else {
-                        (lf.trunc().min(9_007_199_254_740_991.0) as usize)
-                            .min(crate::vm::MAX_DENSE_ARRAY_LEN)
+                        lf.trunc().min(9_007_199_254_740_991.0) as usize
                     };
                     let (depth, mapper) = if name == "flatMap" {
                         if !self.is_callable(arg0) {
@@ -2017,17 +2423,9 @@ impl<'p> Vm<'p> {
                         (self.to_integer_or_zero(arg0)?.max(0), None)
                     };
                     let target = self.array_species_create(Value::heap(idx), 0)?;
-                    let mut out = Vec::new();
-                    self.flatten_into_array(&mut out, Value::heap(idx), source_len, depth, mapper)?;
-                    return match target {
-                        Some(a) => {
-                            for (i, v) in out.into_iter().enumerate() {
-                                self.create_data_property_or_throw(a, i, v)?;
-                            }
-                            Ok(Some(a))
-                        }
-                        None => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out))))),
-                    };
+                    return self
+                        .flatten_into_array_result(Value::heap(idx), source_len, depth, mapper, target)
+                        .map(Some);
                 }
                 // join/toString/toLocaleString run LIVE against the receiver:
                 // len = ToLength(Get(O,'length')) FIRST, then (join) the
@@ -2038,22 +2436,37 @@ impl<'p> Vm<'p> {
                     return self.with_array_stringify_guard(idx, |vm| {
                         let lv = vm.get_prop(Value::heap(idx), "length")?;
                         let lenf = vm.to_number_strict(lv)?;
+                        // The full ToLength: a clamp here joined only the first
+                        // 2^20 elements of a longer array without a word.
                         let len = if lenf.is_nan() || lenf <= 0.0 {
                             0usize
                         } else {
-                            (lenf.trunc().min(9_007_199_254_740_991.0) as usize)
-                                .min(crate::vm::MAX_DENSE_ARRAY_LEN)
+                            lenf.trunc().min(9_007_199_254_740_991.0) as usize
                         };
+                        // Separator and parts as EXACT strings (see the dense
+                        // `join` below): a lone surrogate is itself, not U+FFFD.
                         let sep = if name == "join" && arg0 != Value::UNDEFINED {
-                            vm.to_js_string(arg0)?
+                            vm.to_js_str_owned(arg0)?
                         } else {
-                            ",".to_string()
+                            crate::heap::JsStr::new(",".to_string())
                         };
-                        let mut out = String::new();
+                        // The separators alone past the string cap: the result
+                        // cannot exist, so fail before walking the length.
+                        if len > 1
+                            && (len - 1).saturating_mul(sep.as_bytes().len())
+                                > crate::vm::MAX_STRING_BYTES
+                        {
+                            return Err(Thrown("RangeError: Invalid string length".into()));
+                        }
+                        vm.preflight_native_iteration_work(len as u64)?;
+                        let mut out: Vec<u8> = Vec::new();
                         for k in 0..len {
                             let v = vm.get_index(Value::heap(idx), Value::num(k as f64))?;
+                            if k != 0 {
+                                vm.append_guest_wtf8(&mut out, sep.as_bytes())?;
+                            }
                             if v.is_nullish() {
-                                vm.append_guest_join_part(&mut out, &sep, "", k)?;
+                                // An absent or nullish element contributes "".
                             } else if name == "toLocaleString" {
                                 let f = vm.get_prop(v, "toLocaleString")?;
                                 if !vm.is_callable(f) {
@@ -2069,14 +2482,12 @@ impl<'p> Vm<'p> {
                                     args.get(1).copied().unwrap_or(Value::UNDEFINED),
                                 ];
                                 let r = vm.call_value(f, v, &fwd)?;
-                                let s = vm.to_js_string(r)?;
-                                vm.append_guest_join_part(&mut out, &sep, &s, k)?;
+                                vm.append_guest_tostring(&mut out, r)?;
                             } else {
-                                let s = vm.to_js_string(v)?;
-                                vm.append_guest_join_part(&mut out, &sep, &s, k)?;
+                                vm.append_guest_tostring(&mut out, v)?;
                             }
                         }
-                        Ok(Some(vm.alloc_str(out)))
+                        Ok(Some(vm.alloc_wtf8(out)))
                     });
                 }
                 // toSpliced runs the spec copy loops directly: a DISCARDED element
@@ -2118,7 +2529,7 @@ impl<'p> Vm<'p> {
                     if new_len > 4_294_967_295 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
-                    self.preflight_native_iteration_work(new_len.max(0) as u64)?;
+                    self.preflight_materialized_array(new_len.max(0) as usize)?;
                     let mut out = Vec::with_capacity((new_len.max(0) as usize).min(4096));
                     for k in 0..start {
                         out.push(self.get_index(Value::heap(idx), Value::num(k as f64))?);
@@ -2199,12 +2610,7 @@ impl<'p> Vm<'p> {
                             Ok(Some(a))
                         }
                         None => {
-                            if count as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
-                                return Err(Thrown(
-                                    "RangeError: array length exceeds the engine's dense-array limit"
-                                        .into(),
-                                ));
-                            }
+                            self.preflight_materialized_array(count as usize)?;
                             let mut out = Vec::with_capacity((count as usize).min(4096));
                             let mut kf = k0;
                             while kf < fin {
@@ -2293,11 +2699,14 @@ impl<'p> Vm<'p> {
         // generic array-like helpers, which go through the observable
         // Get/Set/HasProperty path and throw where the spec says to. The dense
         // arms stay for the overwhelmingly common unconstrained array.
+        // (Likewise an element carrying a defineProperty'd override — a
+        // non-writable one must make the Set throw, which a raw store skips.)
         if matches!(name, "fill" | "copyWithin")
-            && self
+            && (self
                 .arr_props
                 .get(&idx)
                 .map_or(false, |m| m.is_frozen() || m.is_sealed() || !m.extensible)
+                || self.array_elements_overlaid(idx))
         {
             let this = Value::heap(idx);
             return if name == "fill" {
@@ -2306,13 +2715,30 @@ impl<'p> Vm<'p> {
                 self.array_like_copy_within(this, args)
             };
         }
-        if matches!(name, "push" | "pop" | "shift" | "unshift" | "splice")
-            && (self.arr_props.get(&idx).map_or(false, |m| m.is_frozen())
-                || self.array_length_nonwritable.contains(&idx))
-        {
-            return Err(Thrown(
-                "TypeError: Cannot assign to read only property 'length' of object '[object Array]'".into(),
-            ));
+        // The explicit `frozen` flag, not `is_frozen()`: that one is vacuously true
+        // for a merely non-extensible array (its side table holds no attributes),
+        // so `Object.preventExtensions(a); a.pop()` threw where node returns the
+        // element. A sealed or non-extensible array keeps a writable `length`, but
+        // its deletes (sealed) and new indices (both) can fail midway, so it takes
+        // the spec-step path, which throws exactly where the spec does.
+        if matches!(name, "push" | "pop" | "shift" | "unshift" | "splice") {
+            let (frozen, constrained) = self
+                .arr_props
+                .get(&idx)
+                .map_or((false, false), |m| (m.frozen, m.sealed || !m.extensible));
+            if frozen || self.array_length_nonwritable.contains(&idx) {
+                return Err(Thrown(
+                    "TypeError: Cannot assign to read only property 'length' of object '[object Array]'".into(),
+                ));
+            }
+            if constrained {
+                return self.array_like_mutate(Value::heap(idx), name, args);
+            }
+        }
+        // A push onto a sealed or non-extensible array Sets a NEW index, which
+        // must be rejected: the generic protocol performs (and fails) that Set.
+        if name == "push" && self.arr_props.get(&idx).is_some_and(|m| !m.extensible) {
+            return self.array_like_mutate(Value::heap(idx), name, args);
         }
         // pop/shift read an element via the spec Get. When that element is a HOLE in
         // the array's own storage, Get defers to the prototype chain — a prototype
@@ -2435,15 +2861,22 @@ impl<'p> Vm<'p> {
                         HeapObj::Array(items) => items.len(),
                         _ => 0,
                     };
+                    // The separator and every part are taken as EXACT strings:
+                    // `['\uD83D', '\uDE00'].join('')` is the astral character
+                    // they spell, and `s.split('').join('')` is `s` again. The
+                    // lossy `String` form turned every lone surrogate into
+                    // U+FFFD, which is the everyday corruption behind
+                    // `split('').reverse().join('')` on emoji text.
                     let sep = if name == "toString" || arg0 == Value::UNDEFINED {
-                        ",".to_string()
+                        crate::heap::JsStr::new(",".to_string())
                     } else {
-                        vm.to_js_string(arg0)?
+                        vm.to_js_str_owned(arg0)?
                     };
                     // Get(O,k) and ToString(element) interleave. The active-path
-                    // guard is shared across nested ToString calls.
+                    // guard is shared across nested ToString calls. Built as
+                    // WTF-8, so surrogate halves in separate elements pair up.
                     let side_table = vm.arr_props.contains_key(&idx);
-                    let mut out = String::new();
+                    let mut out: Vec<u8> = Vec::new();
                     for k in 0..len {
                         let v = if side_table {
                             vm.array_iter_get(Value::heap(idx), k)?
@@ -2451,37 +2884,36 @@ impl<'p> Vm<'p> {
                             vm.array_dense_or_proto_get(idx, k)?
                         };
                         let v = v.unwrap_or(Value::UNDEFINED);
-                        let part = if v.is_nullish() {
-                            String::new()
-                        } else {
-                            vm.to_js_string(v)?
-                        };
-                        vm.append_guest_join_part(&mut out, &sep, &part, k)?;
+                        if k != 0 {
+                            vm.append_guest_wtf8(&mut out, sep.as_bytes())?;
+                        }
+                        if !v.is_nullish() {
+                            vm.append_guest_tostring(&mut out, v)?;
+                        }
                     }
-                    Ok(Some(vm.alloc_str(out)))
+                    Ok(Some(vm.alloc_wtf8(out)))
                 })
             }
             "at" => {
                 // Negative index counts from the end; out of range → undefined.
-                let i = self.to_integer_or_zero(arg0)?;
+                // LengthOfArrayLike precedes ToIntegerOrInfinity(index).
                 let len = match self.heap.get(idx) {
                     HeapObj::Array(items) => items.len(),
                     _ => 0,
                 };
+                let i = self.to_integer_or_zero(arg0)?;
                 let abs = if i < 0 { i + len as i64 } else { i };
                 let v = if abs >= 0 && (abs as usize) < len {
-                    match self.heap.get(idx) {
-                        // A hole reads as undefined (never leak the sentinel).
-                        HeapObj::Array(items) => {
-                            let el = items[abs as usize];
-                            if el.is_hole() {
-                                Value::UNDEFINED
-                            } else {
-                                el
-                            }
-                        }
-                        _ => Value::UNDEFINED,
-                    }
+                    // Get(O, k): a hole resolves through the prototype chain
+                    // (`Array.prototype[k]`), as a plain `a[k]` does, and an
+                    // index accessor in the side table runs its getter.
+                    let k = abs as usize;
+                    let got = if self.arr_props.contains_key(&idx) {
+                        self.array_iter_get(Value::heap(idx), k)?
+                    } else {
+                        self.array_dense_or_proto_get(idx, k)?
+                    };
+                    got.unwrap_or(Value::UNDEFINED)
                 } else {
                     Value::UNDEFINED
                 };
@@ -2548,19 +2980,36 @@ impl<'p> Vm<'p> {
                     0
                 };
                 // SameValueZero (NaN matches NaN; +0/-0 equal) — not strict `===`.
-                let found = match self.heap.get(idx) {
+                let (found, live_len) = match self.heap.get(idx) {
                     HeapObj::Array(items) => {
-                        let from = (from.max(0) as usize).min(items.len());
-                        items[from..].iter().any(|&v| {
+                        let hi = items.len().min(len as usize);
+                        let from = (from.max(0) as usize).min(hi);
+                        let found = items[from..hi].iter().any(|&v| {
                             // includes Gets each index: a hole reads as undefined
                             // (so `[,].includes(undefined)` is true).
                             let v = if v.is_hole() { Value::UNDEFINED } else { v };
                             self.same_value_zero(v, arg0)
-                        })
+                        });
+                        (found, items.len())
                     }
-                    _ => false,
+                    _ => (false, 0),
                 };
-                Ok(Some(Value::bool(found)))
+                if found {
+                    return Ok(Some(Value::bool(true)));
+                }
+                // The scan is bounded by the length read at entry, not the live
+                // Vec: a fromIndex valueOf that shortened the array leaves
+                // indices it no longer holds, and includes still Gets each one
+                // (`undefined`, or an inherited element).
+                let mut k = from.max(live_len as i64);
+                while k < len {
+                    let v = self.get_index(Value::heap(idx), Value::num(k as f64))?;
+                    if self.same_value_zero(v, arg0) {
+                        return Ok(Some(Value::bool(true)));
+                    }
+                    k += 1;
+                }
+                Ok(Some(Value::bool(false)))
             }
             "lastIndexOf" => {
                 // In-place scan (no snapshot copy) — see "indexOf" for why this
@@ -2636,9 +3085,10 @@ impl<'p> Vm<'p> {
                         // One with a side table (accessors), an arguments object,
                         // or holes runs the spec HasProperty+Get per index —
                         // accessors fire and ABSENT indices stay absent (HOLE).
+                        // The JS length: a virtual array's store is only a prefix.
                         let arr_n = if e.is_heap() {
                             match self.heap.get(e.heap_index()) {
-                                HeapObj::Array(items) => Some(items.len()),
+                                HeapObj::Array(_) => Some(self.js_array_len(e.heap_index())),
                                 _ => None,
                             }
                         } else {
@@ -2647,14 +3097,29 @@ impl<'p> Vm<'p> {
                         if let Some(elen) = arr_n {
                             let eidx = e.heap_index();
                             if species_target.is_none()
+                                && !self.array_is_virtual(eidx)
                                 && !self.arr_props.contains_key(&eidx)
                                 && !self.arguments_objs.contains_key(&eidx)
                                 && !self.array_has_holes(eidx)
                             {
-                                let snap = self.array_snapshot(eidx);
-                                n += snap.len();
-                                out.extend(snap);
+                                // Admit the result's growth before copying into
+                                // it: N references to one large array are N
+                                // times its size in one native step. The copy
+                                // comes straight from the (hole-free) store.
+                                self.reserve_array_result(&mut out, elen, false)?;
+                                if let HeapObj::Array(items) = self.heap.get(eidx) {
+                                    out.extend_from_slice(items);
+                                }
+                                n = out.len();
                             } else {
+                                if species_target.is_some() {
+                                    self.preflight_native_iteration_work(elen as u64)?;
+                                } else {
+                                    // A virtual array is sized by a length, not by
+                                    // stored elements.
+                                    let virt = self.array_is_virtual(eidx);
+                                    self.reserve_array_result(&mut out, elen, virt)?;
+                                }
                                 for k in 0..elen {
                                     let v = self.array_iter_get(e, k)?.unwrap_or(Value::HOLE);
                                     self.concat_emit(species_target, &mut out, &mut n, v)?;
@@ -2671,9 +3136,26 @@ impl<'p> Vm<'p> {
                                     "TypeError: concat result length exceeds 2**53 - 1".into(),
                                 ));
                             }
-                            self.preflight_native_iteration_work(len as u64)?;
+                            // NOT admitted up front: a `length` of 2^53-1 says
+                            // nothing about how many indices EXIST, and the
+                            // first Get can throw (test262's poisoned index 0).
+                            // The walk is charged as it goes, so an element read
+                            // happens before any refusal and a length nothing
+                            // backs stops at the work bound rather than looping.
                             for k in 0..len {
-                                let el = self.get_prop(e, &k.to_string())?;
+                                self.preflight_native_iteration_work(k as u64 + 1)?;
+                                if species_target.is_none() {
+                                    self.reserve_array_result(&mut out, 1, true)?;
+                                }
+                                // Step 5.c.iv: only a PRESENT index is copied
+                                // (HasProperty, a Proxy `has` trap included); an
+                                // absent one stays a hole in the result.
+                                let key = k.to_string();
+                                let el = if self.has_property_str_dyn(e, &key)? {
+                                    self.get_prop(e, &key)?
+                                } else {
+                                    Value::HOLE
+                                };
                                 self.concat_emit(species_target, &mut out, &mut n, el)?;
                             }
                         }
@@ -2692,23 +3174,25 @@ impl<'p> Vm<'p> {
                 }
             }
             "flat" => {
+                // FlattenIntoArray over the live receiver, as flatMap and the
+                // array-like arm do: absent indices (holes, top-level or nested)
+                // are skipped rather than copied as `undefined`, a hole reads an
+                // inherited index, a nested Proxy over an array is flattened,
+                // and the result's growth is admitted as it is built. The
+                // snapshot-and-clone flattener did none of these.
+                let receiver = Value::heap(idx);
+                let source_len = self.js_array_len(idx);
                 // An absent OR explicitly-`undefined` depth defaults to 1
-                // (ToIntegerOrInfinity is only applied to a provided depth).
+                // (ToIntegerOrInfinity is only applied to a provided depth;
+                // Infinity saturates -> deep flatten).
                 let depth = if args.is_empty() || arg0 == Value::UNDEFINED {
                     1
                 } else {
-                    // ToInteger (Infinity saturates to i64::MAX -> deep flatten).
-                    let n = self.to_integer_or_zero(arg0)?;
-                    if n < 0 {
-                        0
-                    } else {
-                        n.min(i32::MAX as i64) as i32
-                    }
+                    self.to_integer_or_zero(arg0)?.max(0)
                 };
-                let snapshot = self.array_snapshot(idx);
-                let out = self.flatten_array(&snapshot, depth)?;
-                // flat builds the result via ArraySpeciesCreate(O, 0).
-                Ok(Some(self.array_from_species(Value::heap(idx), out, 0)?))
+                let target = self.array_species_create(receiver, 0)?;
+                self.flatten_into_array_result(receiver, source_len, depth, None, target)
+                    .map(Some)
             }
             "fill" => {
                 let val = arg0;
@@ -2740,6 +3224,11 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::heap(idx)))
             }
             "slice" => {
+                // LengthOfArrayLike precedes the start/end coercions.
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len() as i32,
+                    _ => 0,
+                };
                 let s0 = if args.is_empty() {
                     0
                 } else {
@@ -2751,16 +3240,21 @@ impl<'p> Vm<'p> {
                 } else {
                     Some(self.to_integer_or_zero(args[1])?)
                 };
-                let len = match self.heap.get(idx) {
-                    HeapObj::Array(items) => items.len() as i32,
-                    _ => 0,
-                };
                 let start = norm_index(s0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
                 let end = match e0 {
                     None => len,
                     Some(e) => norm_index(e.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len),
                 };
-                let clean = !self.arr_props.contains_key(&idx) && !self.array_has_holes(idx);
+                // A coercion that resized the array leaves the range to be read
+                // per index (HasProperty + Get): an index it removed becomes a
+                // hole in a result that is still `end - start` long.
+                let live_len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len() as i32,
+                    _ => 0,
+                };
+                let clean = live_len == len
+                    && !self.arr_props.contains_key(&idx)
+                    && !self.array_has_holes(idx);
                 let slice: Vec<Value> = if start < end {
                     if clean {
                         match self.heap.get(idx) {
@@ -2963,12 +3457,12 @@ impl<'p> Vm<'p> {
                 // remainder after a kernel bail (nothing if it completed).
                 let run_tail = start < snapshot_len;
                 let mut native = if run_tail {
-                    self.native_cb_entry(cb)
+                    self.native_cb_entry(cb, Value::UNDEFINED)
                 } else {
                     None
                 };
                 let win = self.regs.len();
-                if let Some((_, callee_regs, _)) = native {
+                if let Some((_, callee_regs, _, _)) = native {
                     if self.regs_would_overflow(win + callee_regs) {
                         native = None;
                     } else {
@@ -3034,7 +3528,9 @@ impl<'p> Vm<'p> {
                 // path at snapshot speed.
                 let fast = match self.heap.get(idx) {
                     HeapObj::Array(items) => {
-                        !self.arr_props.contains_key(&idx) && items.iter().all(|v| !v.is_hole())
+                        !self.arr_props.contains_key(&idx)
+                            && !self.array_is_virtual(idx)
+                            && items.iter().all(|v| !v.is_hole())
                     }
                     _ => false,
                 };
@@ -3043,18 +3539,27 @@ impl<'p> Vm<'p> {
                         HeapObj::Array(items) => items.clone(),
                         _ => Vec::new(),
                     };
+                    let n = snapshot.len();
                     self.sort_values(&mut snapshot, cmp)?;
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        *items = snapshot;
+                        if items.len() > n {
+                            // A comparator that appended to the array: the sort
+                            // writes indices 0..len only, so what it added past
+                            // them stays.
+                            items[..n].copy_from_slice(&snapshot);
+                        } else {
+                            *items = snapshot;
+                        }
                     }
                     return Ok(Some(receiver));
                 }
                 // SortIndexedProperties via the [[Get]]/[[Set]]/[[Delete]] protocol:
                 // own/inherited accessor INDICES fire their getters/setters, holes read
                 // their prototype value, and a getter that mutates the array mid-sort is
-                // observed. `len` is read ONCE up front (LengthOfArrayLike).
+                // observed. `len` is read ONCE up front (LengthOfArrayLike) — the JS
+                // length, which for a virtual array is past its dense store.
                 let len = match self.heap.get(idx) {
-                    HeapObj::Array(items) => items.len(),
+                    HeapObj::Array(_) => self.js_array_len(idx),
                     _ => {
                         let lv = self.get_prop(receiver, "length")?;
                         let n = self.to_number_strict(lv)?;
@@ -3065,11 +3570,29 @@ impl<'p> Vm<'p> {
                         }
                     }
                 };
+                // A VIRTUAL array with nothing that could observe an absent
+                // index visits only the indices it holds: the same values in
+                // the same order, without an O(length) walk over its holes.
+                let virtual_present = if self.array_is_virtual(idx) {
+                    self.virtual_array_present(idx, 0, len)
+                } else {
+                    None
+                };
+                let sparse = virtual_present.is_some();
                 let mut gathered = Vec::new();
-                for i in 0..len {
-                    // array_iter_get = ? HasProperty(O,i) ? ? Get(O,i) : skip.
-                    if let Some(v) = self.array_iter_get(receiver, i)? {
-                        gathered.push(v);
+                match virtual_present {
+                    Some(present) => {
+                        for i in present {
+                            gathered.push(self.get_index(receiver, Value::num(i as f64))?);
+                        }
+                    }
+                    None => {
+                        for i in 0..len {
+                            // array_iter_get = ? HasProperty(O,i) ? ? Get(O,i) : skip.
+                            if let Some(v) = self.array_iter_get(receiver, i)? {
+                                gathered.push(v);
+                            }
+                        }
                     }
                 }
                 let item_count = gathered.len();
@@ -3077,8 +3600,25 @@ impl<'p> Vm<'p> {
                 for (j, v) in gathered.into_iter().enumerate() {
                     self.set_index(receiver, Value::num(j as f64), v, true)?;
                 }
-                for j in item_count..len {
-                    self.delete_property(receiver, &j.to_string())?;
+                // Deleting an index the array does not hold is a no-op, so a
+                // sparse array deletes only the ones it holds NOW (a comparator
+                // may have added some), in the same ascending order.
+                let doomed = if sparse {
+                    self.virtual_array_present(idx, item_count, len)
+                } else {
+                    None
+                };
+                match doomed {
+                    Some(present) => {
+                        for j in present {
+                            self.delete_property(receiver, &j.to_string())?;
+                        }
+                    }
+                    None => {
+                        for j in item_count..len {
+                            self.delete_property(receiver, &j.to_string())?;
+                        }
+                    }
                 }
                 Ok(Some(receiver))
             }
@@ -3131,8 +3671,7 @@ impl<'p> Vm<'p> {
                 let source_len = if lf.is_nan() || lf <= 0.0 {
                     0usize
                 } else {
-                    (lf.trunc().min(9_007_199_254_740_991.0) as usize)
-                        .min(crate::vm::MAX_DENSE_ARRAY_LEN)
+                    lf.trunc().min(9_007_199_254_740_991.0) as usize
                 };
                 let cb = arg0;
                 if !self.is_callable(cb) {
@@ -3142,17 +3681,8 @@ impl<'p> Vm<'p> {
                 // ArraySpeciesCreate(O, 0) is step 4 — before the walk, and its
                 // `constructor` / @@species Gets are observable there.
                 let target = self.array_species_create(receiver, 0)?;
-                let mut out = Vec::new();
-                self.flatten_into_array(&mut out, receiver, source_len, 1, Some((cb, this_arg)))?;
-                match target {
-                    Some(a) => {
-                        for (i, v) in out.into_iter().enumerate() {
-                            self.create_data_property_or_throw(a, i, v)?;
-                        }
-                        Ok(Some(a))
-                    }
-                    None => Ok(Some(self.alloc_array_current_realm(out))),
-                }
+                self.flatten_into_array_result(receiver, source_len, 1, Some((cb, this_arg)), target)
+                    .map(Some)
             }
             "findLast" | "findLastIndex" => {
                 let cb = arg0;
@@ -3199,24 +3729,9 @@ impl<'p> Vm<'p> {
                 if self.is_callable(cmp) {
                     self.comparator_sort(&mut snapshot, cmp)?;
                 } else {
-                    // Default SortCompare: ToString each element (undefined last).
-                    let mut keyed: Vec<(Option<String>, Value)> =
-                        Vec::with_capacity(snapshot.len());
-                    for v in std::mem::take(&mut snapshot) {
-                        let key = if v == Value::UNDEFINED {
-                            None
-                        } else {
-                            Some(self.to_js_string(v)?)
-                        };
-                        keyed.push((key, v));
-                    }
-                    keyed.sort_by(|(ka, _), (kb, _)| match (ka, kb) {
-                        (Some(a), Some(b)) => a.cmp(b),
-                        (None, None) => std::cmp::Ordering::Equal,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                    });
-                    snapshot = keyed.into_iter().map(|(_, v)| v).collect();
+                    // Default SortCompare, shared with sort(): code-unit order,
+                    // undefined last.
+                    snapshot = self.default_sort(snapshot)?;
                 }
                 Ok(Some(self.alloc_array_current_realm(snapshot)))
             }
@@ -3319,23 +3834,23 @@ impl<'p> Vm<'p> {
                         args.first().copied().unwrap_or(Value::UNDEFINED),
                         args.get(1).copied().unwrap_or(Value::UNDEFINED),
                     ];
-                    let mut out = String::new();
+                    // Each result is ToString'd EXACTLY, as `join` does it.
+                    let mut out: Vec<u8> = Vec::new();
                     for (i, v) in snapshot.into_iter().enumerate() {
-                        if v.is_nullish() {
-                            vm.append_guest_join_part(&mut out, ",", "", i)?;
-                        } else {
-                            let f = vm.get_prop(v, "toLocaleString")?;
-                            if !vm.is_callable(f) {
-                                return Err(Thrown(
-                                    "TypeError: toLocaleString is not callable".into(),
-                                ));
-                            }
-                            let r = vm.call_value(f, v, &fwd)?;
-                            let s = vm.to_js_string(r)?;
-                            vm.append_guest_join_part(&mut out, ",", &s, i)?;
+                        if i != 0 {
+                            vm.append_guest_wtf8(&mut out, b",")?;
                         }
+                        if v.is_nullish() {
+                            continue;
+                        }
+                        let f = vm.get_prop(v, "toLocaleString")?;
+                        if !vm.is_callable(f) {
+                            return Err(Thrown("TypeError: toLocaleString is not callable".into()));
+                        }
+                        let r = vm.call_value(f, v, &fwd)?;
+                        vm.append_guest_tostring(&mut out, r)?;
                     }
-                    Ok(Some(vm.alloc_str(out)))
+                    Ok(Some(vm.alloc_wtf8(out)))
                 })
             }
             "with" => {
@@ -3369,6 +3884,9 @@ impl<'p> Vm<'p> {
             }
             "toSpliced" => {
                 // Like splice() but returns the modified COPY; receiver unchanged.
+                // Only Number arguments reach here (see the generic routing
+                // above); `as i64` is their ToIntegerOrInfinity (NaN -> 0,
+                // +/-Infinity saturate and then clamp).
                 let mut out = self.array_snapshot_get(idx)?;
                 let len = out.len();
                 let s = if arg0.is_number() {
@@ -3486,24 +4004,48 @@ impl<'p> Vm<'p> {
                 items.push(Value::UNDEFINED);
             }
         } else {
-            let mut keyed: Vec<(Option<String>, Value)> = Vec::with_capacity(items.len());
-            for v in std::mem::take(items) {
-                let key = if v == Value::UNDEFINED {
-                    None
-                } else {
-                    Some(self.to_js_string(v)?)
-                };
-                keyed.push((key, v));
-            }
-            keyed.sort_by(|(ka, _), (kb, _)| match (ka, kb) {
-                (Some(a), Some(b)) => a.cmp(b),
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (Some(_), None) => std::cmp::Ordering::Less,
-            });
-            *items = keyed.into_iter().map(|(_, v)| v).collect();
+            let values = std::mem::take(items);
+            *items = self.default_sort(values)?;
         }
         Ok(())
+    }
+
+    /// The default SortCompare over `values` (`sort()` / `toSorted()` with no
+    /// comparator): ToString each element once, order the strings by UTF-16
+    /// code units — the order `<` uses — and put `undefined` last, stably.
+    ///
+    /// The keys are WTF-8. A Rust `String` key compared in UTF-8 byte order,
+    /// which is code-point order: an astral character (a surrogate pair,
+    /// 0xD800..) sorted after U+E000..U+FFFF instead of before it, and every
+    /// lone surrogate became U+FFFD and compared equal to the others.
+    fn default_sort(&mut self, values: Vec<Value>) -> Result<Vec<Value>, Thrown> {
+        // `plain`: no byte >= 0xED, so no surrogate, no astral character and
+        // nothing at or above U+E000 — byte order IS code-unit order, and the
+        // comparison stays a memcmp.
+        let mut keyed: Vec<(Option<(Vec<u8>, bool)>, Value)> = Vec::with_capacity(values.len());
+        for v in values {
+            let key = if v == Value::UNDEFINED {
+                None
+            } else {
+                let bytes = self.to_wtf8_string(v)?;
+                let plain = !bytes.iter().any(|&b| b >= 0xED);
+                Some((bytes, plain))
+            };
+            keyed.push((key, v));
+        }
+        keyed.sort_by(|(ka, _), (kb, _)| match (ka, kb) {
+            (Some((a, pa)), Some((b, pb))) => {
+                if *pa && *pb {
+                    a.cmp(b)
+                } else {
+                    wtf8_code_unit_cmp(a, b)
+                }
+            }
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+        });
+        Ok(keyed.into_iter().map(|(_, v)| v).collect())
     }
 
     /// Stable bottom-up merge sort driven by a JS comparator (`cmp(a,b) < 0` ⇒
@@ -3617,9 +4159,9 @@ impl<'p> Vm<'p> {
         // Native-callback fast path: a compiled non-capturing comparator is called
         // directly over one reused register window (skipping a per-comparison frame
         // build + run_loop re-entry). `native = None` falls back to call_value.
-        let mut native = self.native_cb_entry(cmp);
+        let mut native = self.native_cb_entry(cmp, Value::UNDEFINED);
         let win = self.regs.len();
-        if let Some((_, callee_regs, _)) = native {
+        if let Some((_, callee_regs, _, _)) = native {
             if self.regs_would_overflow(win + callee_regs) {
                 native = None;
             } else {

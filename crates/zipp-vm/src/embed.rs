@@ -475,6 +475,16 @@ impl ScriptState {
         self.with_vm(|vm| vm.drain_microtasks());
     }
 
+    /// Deliver console lines to `sink` as they are produced, each tagged with
+    /// its stream, instead of buffering them for [`Self::take_output`] and
+    /// [`Self::take_console`]. A command-line host uses this to show a long
+    /// program's progress, and the two streams stay in production order by
+    /// construction. Lines already buffered stay buffered; the output ceiling
+    /// is charged exactly as before.
+    pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &str)>) {
+        self.with_vm(|vm| vm.console_sink = Some(sink));
+    }
+
     /// Take the `console.log`/`info`/`debug` lines produced so far, clearing the
     /// buffer. Un-drained output accumulates for the VM's lifetime, so a
     /// long-lived embedder should drain (or discard) periodically.
@@ -968,9 +978,11 @@ impl ScriptState {
         (left as i64 + vm.jit_steps.max(0)).max(0) as u64
     }
 
-    /// Instructions actually executed since [`Self::set_limits`] attached the
-    /// recorder — the consumed half of [`Self::steps_remaining`], and 0 before
-    /// limits are set.
+    /// Instructions actually executed under the current step ceiling — since
+    /// [`Self::set_limits`] attached the recorder or [`Self::renew_step_budget`]
+    /// last replaced the ceiling — the consumed half of
+    /// [`Self::steps_remaining`], and 0 before limits are set. Native and
+    /// WebAssembly builds report the same figure.
     ///
     /// This is the figure a host bills on (blockchain gas metering): what the
     /// script DID, in the same unit `max_steps` caps, counted identically

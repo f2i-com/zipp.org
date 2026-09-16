@@ -114,8 +114,48 @@ pub(crate) fn bigint_as_intn(bits: u32, x: i128) -> i128 {
 /// `@@sym:N`) — still reachable by getOwnPropertyDescriptor and surfaced by
 /// getOwnPropertySymbols. Real private FIELDS live in the side table (never
 /// own props), so a "#..." STRING key is an ordinary enumerable property.
+///
+/// Symbol keys are "@@" followed by anything but '@'; a guest STRING key
+/// that itself begins with "@@" is stored one '@' longer (see
+/// [`escape_guest_key`]), so it is never mistaken for one.
 pub(crate) fn is_hidden_key(k: &str) -> bool {
-    k.starts_with("@@")
+    let b = k.as_bytes();
+    b.len() >= 2 && b[0] == b'@' && b[1] == b'@' && b.get(2) != Some(&b'@')
+}
+
+/// Does guest string `s`, used as a property key, need the escape that keeps
+/// it out of the symbol-key space (it begins with "@@")?
+#[inline]
+pub(crate) fn guest_key_needs_escape(s: &str) -> bool {
+    s.as_bytes().starts_with(b"@@")
+}
+
+/// The internal property key for guest string `s` (ToPropertyKey of a
+/// String): `s` itself, except that one beginning with "@@" — the spelling
+/// of the engine's symbol keys (`@@iterator`, `@@sym:N`, `@@for:k`) — gains a
+/// leading '@'. Without it `o["@@iterator"]` WAS `o[Symbol.iterator]`, and
+/// such keys vanished from enumeration and JSON. [`guest_key_text`] undoes it.
+#[inline]
+pub(crate) fn escape_guest_key(s: String) -> String {
+    if guest_key_needs_escape(&s) {
+        let mut e = String::with_capacity(s.len() + 1);
+        e.push('@');
+        e.push_str(&s);
+        e
+    } else {
+        s
+    }
+}
+
+/// The guest-visible text of a (non-symbol) internal property key: the
+/// inverse of [`escape_guest_key`].
+#[inline]
+pub(crate) fn guest_key_text(k: &str) -> &str {
+    if k.as_bytes().starts_with(b"@@@") {
+        &k[1..]
+    } else {
+        k
+    }
 }
 
 pub(crate) fn len_value(n: usize) -> Value {
@@ -131,7 +171,13 @@ pub(crate) fn len_value(n: usize) -> Value {
 /// characters: it omits U+FEFF (ZWNBSP), leaving
 /// `parseInt("\u{FEFF}8675309")` at NaN, and it includes U+0085 (NEL), which
 /// is not JS whitespace at all (`parseInt("\u{85}8")` must be NaN).
-fn str_white_space(c: char) -> bool {
+///
+/// This is the ONE predicate for every trim in the engine: `String.prototype
+/// .trim`/`trimStart`/`trimEnd`, StringToNumber, StringToBigInt and the
+/// BigInt/string comparison. Each used to spell its own variant, so
+/// `"\u{85}a".trim()` dropped the NEL, `Number("\u{85}1")` was 1 instead of
+/// NaN, and `BigInt("\u{FEFF}1")` threw where the spec says 1n.
+pub(crate) fn str_white_space(c: char) -> bool {
     (c.is_whitespace() && c != '\u{85}') || c == '\u{FEFF}'
 }
 
@@ -179,10 +225,24 @@ pub(crate) fn parse_int(s: &str, radix: i32) -> f64 {
         i += 1;
     }
     if i == start {
-        f64::NAN
-    } else {
-        sign * val
+        return f64::NAN;
     }
+    // The spec leaves the value implementation-approximated ONLY for radixes
+    // other than 2, 4, 8, 10, 16 and 32 (and past a radix-10 literal's 20th
+    // digit); for those six the result is 𝔽(mathInt), correctly rounded.
+    // The f64 accumulation above is exact below 2^53 but rounds at every
+    // step past it, so a wider run is recomputed exactly.
+    let pow2 = (radix as u32).is_power_of_two();
+    if pow2 && (i - start) as u64 * (radix as u32).trailing_zeros() as u64 > 53 {
+        val = crate::parse::lexer::non_decimal_digits_to_f64(&b[start..i], radix as u32);
+    } else if radix == 10 && i - start > 15 {
+        // Every run of ASCII digits is a valid Rust float literal.
+        val = std::str::from_utf8(&b[start..i])
+            .ok()
+            .and_then(|d| d.parse::<f64>().ok())
+            .unwrap_or(val);
+    }
+    sign * val
 }
 
 /// JS `parseFloat(s)`: skip leading whitespace, then parse the longest leading

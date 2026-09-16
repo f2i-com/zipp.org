@@ -22,7 +22,7 @@ They all expect the generated glue at `tests/node/pkg/` (adjust the `require` at
 top of each file if you put it elsewhere).
 
 - **check-wasm-memory.cjs** — verifies the final wasm-bindgen artifact still has
-  exactly one unshared, non-memory64 linear memory capped at 256 MiB and only
+  exactly one unshared, non-memory64 linear memory capped at 1 GiB (16,384 pages) and only
   the audited host-import surface.
 - **host-contract.cjs** — every method a UI host depends on: the symbol map and
   what it hides, structured global reads/writes, batching and the function-slot
@@ -62,6 +62,12 @@ top of each file if you put it elsewhere).
   metadata reported in bytes. The audit's own three-case WASM probe ran
   red on `1477070` for ZA-04 (an uncaught argument-count `RangeError` that
   also left the instance unusable).
+- **audit-2026-09-15-ml-transport.cjs** — binary tensor transport: a guest
+  `Float32Array` reads as a host `Float32Array` bit for bit (views, nesting,
+  an unchanged echo keeping the guest's array), a host one arrives as a fresh
+  array or, in a Python state, as float32 tensor storage, other typed arrays
+  still read as `null`, and a detached or over-budget array is a controlled
+  error that leaves the engine usable.
 - **sdk-contract.mjs** — the reference host adapter's main-thread contract
   under a mocked Worker and deterministic timers (ZA-01/02/03): envelope-
   based categories, send-failure cleanup, monotonic death, no operation

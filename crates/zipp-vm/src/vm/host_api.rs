@@ -11,10 +11,13 @@
 //! Three deliberate limits, each because the alternative is worse:
 //!
 //! - **Only data crosses.** Functions, classes, `Map`/`Set`/`Date`/`RegExp`,
-//!   typed arrays and proxies marshal to [`HostValue::Opaque`], never to a live
-//!   reference — a `Value` is a heap INDEX whose meaning depends on this VM, so
-//!   handing one out would be handing out a dangling reference the moment the
-//!   collector moves. A host that wants a function's result should call it.
+//!   typed arrays other than `Float32Array`, and proxies marshal to
+//!   [`HostValue::Opaque`], never to a live reference — a `Value` is a heap
+//!   INDEX whose meaning depends on this VM, so handing one out would be
+//!   handing out a dangling reference the moment the collector moves. A host
+//!   that wants a function's result should call it. A `Float32Array` crosses
+//!   as a copy of its elements ([`HostValue::Float32Array`]): numeric tensors
+//!   are data, and one value per element made them unaffordable to move.
 //! - **Writes skip opaque slots.** Setting a global that currently holds a
 //!   function or class is a no-op rather than a clobber, so a host that reads
 //!   its whole state, edits one field and writes it all back cannot destroy the
@@ -30,6 +33,7 @@
 use crate::bytecode::Program;
 use crate::heap::{HeapObj, ObjMap, PropAttr};
 use crate::value::Value;
+use crate::vm::helpers_numeric::{escape_guest_key, guest_key_text, is_hidden_key};
 use crate::vm::Vm;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
@@ -116,6 +120,9 @@ pub(crate) const JIT_GLOBAL_ROUTE_EPOCH_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_MI_CLASS_EPOCH_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, mi_class_epoch);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CLASS_PROTO_EPOCH_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, class_proto_epoch);
 /// Exact `[[IsHTMLDDA]]` singleton mirror used by call-free loose-null
 /// comparisons. The companion byte preserves `ZIPP_NO_HTMLDDA_SCALAR`'s
 /// HashSet/counter ablation by routing heap operands back to the helper when
@@ -371,9 +378,17 @@ pub enum HostValue {
     /// A plain object, as its own enumerable data properties in insertion
     /// order. Accessors are not invoked and do not appear.
     Object(Vec<(String, HostValue)>),
+    /// A `Float32Array`'s elements, copied (bit patterns kept, NaN payloads
+    /// included). Binary transport for numeric tensors: a host moves one of
+    /// these for the price of its bytes, charged against the conversion's
+    /// string-byte ceiling, instead of one node per element. Writing one
+    /// creates a fresh `Float32Array` over its own buffer; a global slot that
+    /// already holds a typed array still refuses a whole-slot write (see
+    /// `host_set_slot`).
+    Float32Array(Vec<f32>),
     /// Something that cannot cross as data: a function, class, `Map`, `Set`,
-    /// `Date`, `RegExp`, typed array, proxy, … Reading one yields `Opaque`;
-    /// writing one is ignored.
+    /// `Date`, `RegExp`, a typed array of another kind, proxy, … Reading one
+    /// yields `Opaque`; writing one is ignored.
     Opaque,
 }
 
@@ -484,6 +499,17 @@ fn retained_class_bytes(c: &crate::bytecode::ClassDef) -> usize {
 /// for any UI state a host would sensibly hold, shallow enough that a pathological
 /// graph cannot exhaust the native stack (this walk is natively recursive).
 const MAX_DEPTH: usize = 64;
+
+/// A Symbol-keyed property lives under an engine-internal `"@@…"` key
+/// (`@@toStringTag`, `@@sym:N`), which is not data the object holds as far as
+/// a host is concerned — the guest's own `JSON.stringify` omits it. None of
+/// the boundary walks exports one, digests one or lets host data create one:
+/// a host string key of that form would otherwise alias a Symbol and install,
+/// say, an `@@iterator` or `@@toPrimitive` on a guest object, and a guest's
+/// Symbol-keyed capability would leave as a plain `"@@sym:1"` entry.
+fn host_invisible_key(key: &str) -> bool {
+    key.starts_with("@@")
+}
 
 /// Digest of a global that is absent or never initialised.
 const FP_ABSENT: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -1033,6 +1059,7 @@ impl<'p> Vm<'p> {
             Str { units: usize },
             Array { len: usize },
             Object { keys: usize, visible: usize },
+            Float32,
             Opaque,
         }
         // Every entry of an object is inspected twice below — once to count
@@ -1044,18 +1071,20 @@ impl<'p> Vm<'p> {
             }
         }
         let shape = match self.heap.get(idx) {
+            HeapObj::TypedArray { kind: 7, .. } => Shape::Float32,
             HeapObj::Str(s) => Shape::Str { units: s.units() },
             HeapObj::Cons { len, .. } => Shape::Str { units: *len },
             HeapObj::Array(items) => Shape::Array { len: items.len() },
             HeapObj::Object(m) => Shape::Object {
                 keys: m.keys.len(),
-                // The same exclusion host_out makes: an accessor is never
+                // The same exclusions host_out makes: an accessor is never
                 // invoked, so it contributes nothing to the marshalled value
-                // and must contribute nothing to the digest either.
+                // and must contribute nothing to the digest either; nor does a
+                // Symbol-keyed property.
                 visible: (0..m.keys.len())
                     .filter(|&i| {
                         let a = m.attr_at(i);
-                        a.enumerable && !a.accessor
+                        a.enumerable && !a.accessor && !is_hidden_key(&m.keys[i])
                     })
                     .count(),
             },
@@ -1065,6 +1094,24 @@ impl<'p> Vm<'p> {
         match shape {
             Shape::Opaque => {
                 fp_mix(h, 9);
+                true
+            }
+            Shape::Float32 => {
+                // Opaque, as `host_out` reads it, when detached or out of bounds.
+                let Some((buffer, offset, len)) = self.host_float32_view(idx) else {
+                    fp_mix(h, 9);
+                    return true;
+                };
+                // The same bytes `host_out` copies, charged the same way, so a
+                // digest never answers for an array the read could not marshal.
+                if !budget.charge_string_bytes(len.saturating_mul(4)) {
+                    return false;
+                }
+                fp_mix(h, 14);
+                fp_mix(h, len as u64);
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get(buffer) {
+                    fp_mix_bytes(h, &data[offset..offset + len * 4]);
+                }
                 true
             }
             Shape::Str { units } => {
@@ -1131,10 +1178,10 @@ impl<'p> Vm<'p> {
                     let val = match self.heap.get(idx) {
                         HeapObj::Object(m) if i < m.keys.len() => {
                             let a = m.attr_at(i);
-                            if !a.enumerable || a.accessor {
+                            if !a.enumerable || a.accessor || is_hidden_key(&m.keys[i]) {
                                 continue;
                             }
-                            let key = m.keys[i].as_bytes();
+                            let key = guest_key_text(&m.keys[i]).as_bytes();
                             if !budget.charge_string_bytes(key.len()) {
                                 ok = false;
                                 break;
@@ -1259,6 +1306,18 @@ impl<'p> Vm<'p> {
         debug_assert!(self.host_result_roots.len() >= base);
         self.host_result_roots.truncate(base);
         result
+    }
+
+    /// Root one more temporary in the innermost [`Vm::with_host_roots`]
+    /// scope. Native built-ins that collect guest-produced Values (getter and
+    /// trap results) into a Rust `Vec`/`ObjMap` while later getters or traps
+    /// run push each Value here as it is read; the enclosing scope releases
+    /// them on every exit. Only call it inside such a scope.
+    #[inline]
+    pub(crate) fn push_host_root(&mut self, value: Value) {
+        if value.is_heap() {
+            self.host_result_roots.push(value);
+        }
     }
 
     /// Host-created arguments are Rust locals until the target's frame is
@@ -1433,6 +1492,24 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The live bytes of a `Float32Array` at heap index `idx`, as (buffer
+    /// index, byte offset, element count) — `None` for anything else, and
+    /// for a view whose buffer is detached or that has fallen out of its
+    /// buffer's bounds (those stay opaque, as every typed array used to).
+    fn host_float32_view(&self, idx: u32) -> Option<(u32, usize, usize)> {
+        let (buffer, offset) = match self.heap.get(idx) {
+            HeapObj::TypedArray {
+                buffer,
+                kind: 7,
+                byte_offset,
+                ..
+            } => (*buffer, *byte_offset),
+            _ => return None,
+        };
+        let len = self.ta_effective_len(idx)?;
+        Some((buffer, offset, len))
+    }
+
     /// Does this value refuse to cross as data?
     fn host_is_opaque(&self, v: Value) -> bool {
         if !v.is_heap() {
@@ -1483,9 +1560,11 @@ impl<'p> Vm<'p> {
             Str { units: usize },
             Array(Vec<Value>),
             Object(Vec<(String, Value)>),
+            Float32,
             Opaque,
         }
         let shape = match self.heap.get(idx) {
+            HeapObj::TypedArray { kind: 7, .. } => Shape::Float32,
             HeapObj::Str(s) => Shape::Str { units: s.units() },
             HeapObj::Cons { len, .. } => Shape::Str { units: *len },
             HeapObj::Array(items) => {
@@ -1496,8 +1575,15 @@ impl<'p> Vm<'p> {
                 // Two scans of every entry, visible or not: inspected work,
                 // charged before either (ZA-07).
                 budget.charge_work(m.keys.len().saturating_mul(2))?;
+                // Symbol-keyed entries (`is_hidden_key`) are not string keys:
+                // the host's object model has no symbols, so they are not
+                // exported (they used to leak out as "@@…" names).
                 let count = (0..m.keys.len())
-                    .filter(|&i| m.attr_at(i).enumerable && !m.attr_at(i).accessor)
+                    .filter(|&i| {
+                        m.attr_at(i).enumerable
+                            && !m.attr_at(i).accessor
+                            && !is_hidden_key(&m.keys[i])
+                    })
                     .count();
                 budget.ensure_nodes(count)?;
                 let mut pairs = Vec::with_capacity(count);
@@ -1505,11 +1591,11 @@ impl<'p> Vm<'p> {
                     let a = &m.attr_at(i);
                     // Accessors are not invoked: running user code in the middle
                     // of a marshal would let a getter mutate the graph being walked.
-                    if !a.enumerable || a.accessor {
+                    if !a.enumerable || a.accessor || is_hidden_key(&m.keys[i]) {
                         continue;
                     }
                     budget.charge_string(&m.keys[i])?;
-                    pairs.push((m.keys[i].clone(), m.val_at(i)));
+                    pairs.push((guest_key_text(&m.keys[i]).to_string(), m.val_at(i)));
                 }
                 Shape::Object(pairs)
             }
@@ -1518,6 +1604,22 @@ impl<'p> Vm<'p> {
 
         match shape {
             Shape::Opaque => Ok(HostValue::Opaque),
+            Shape::Float32 => {
+                // A detached or out-of-bounds view has no elements to copy.
+                let Some((buffer, offset, len)) = self.host_float32_view(idx) else {
+                    return Ok(HostValue::Opaque);
+                };
+                // Refused before the copy is made, like an over-long string.
+                budget.charge_string_bytes(len.saturating_mul(4))?;
+                let values = match self.heap.get(buffer) {
+                    HeapObj::ArrayBuffer { data, .. } => data[offset..offset + len * 4]
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                Ok(HostValue::Float32Array(values))
+            }
             Shape::Str { units } => {
                 budget.ensure_string_units(units)?;
                 Ok(self.host_out_string(idx, budget)?)
@@ -1628,6 +1730,26 @@ impl<'p> Vm<'p> {
             }
             return self.host_in(hv, depth);
         }
+        // A Float32Array the host read and sent back unchanged keeps the
+        // guest's own array — its identity, and any other view sharing its
+        // buffer — rather than becoming a copy with the same elements. A
+        // changed one is an edit, and an explicit write wins.
+        if let HostValue::Float32Array(values) = hv {
+            if old.is_heap() {
+                if let Some((buffer, offset, len)) = self.host_float32_view(old.heap_index()) {
+                    let same = len == values.len()
+                        && matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { data, .. }
+                            if data[offset..offset + len * 4]
+                                .chunks_exact(4)
+                                .zip(values)
+                                .all(|(b, v)| b == v.to_le_bytes()));
+                    if same {
+                        return old;
+                    }
+                }
+            }
+            return self.host_in(hv, depth);
+        }
         let HostValue::Object(pairs) = hv else {
             return self.host_in(hv, depth);
         };
@@ -1680,6 +1802,9 @@ impl<'p> Vm<'p> {
 
         let mut m = ObjMap::with_capacity(pairs.len().max(old_props.len()));
         for (k, val) in pairs {
+            // A host name is a guest string key (`escape_guest_key`).
+            let k_key = escape_guest_key(k.clone());
+            let k = &k_key;
             let prev = find_old(k).map(|i| {
                 sent[i] = true;
                 (old_props[i].1, old_props[i].2)
@@ -1729,7 +1854,7 @@ impl<'p> Vm<'p> {
         //     a get-only property        ->  undefined
         for (i, (k, p, a)) in old_props.iter().enumerate() {
             let host_sent_it = sent[i];
-            let host_could_see_it = a.enumerable && !a.accessor;
+            let host_could_see_it = a.enumerable && !a.accessor && !host_invisible_key(k);
             if host_sent_it && host_could_see_it {
                 continue;
             }
@@ -1787,10 +1912,29 @@ impl<'p> Vm<'p> {
             HostValue::Object(pairs) => {
                 let mut m = ObjMap::with_capacity(pairs.len());
                 for (k, val) in pairs {
+                    // Host data never creates a Symbol-keyed property.
+                    if host_invisible_key(k) {
+                        continue;
+                    }
                     let v = self.host_in(val, depth + 1);
-                    m.set(k, v);
+                    // A host name is a guest string key (`escape_guest_key`).
+                    m.set(&escape_guest_key(k.clone()), v);
                 }
                 Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
+            }
+            HostValue::Float32Array(values) => {
+                // `alloc_array_buffer` refuses only when the recorder's heap
+                // ceiling would be crossed; a write cannot throw, so the
+                // value reads as null then, as an over-deep one does.
+                let Ok(buffer) = self.alloc_array_buffer(values.len().saturating_mul(4)) else {
+                    return Value::NULL;
+                };
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
+                    for (dst, v) in data.chunks_exact_mut(4).zip(values) {
+                        dst.copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                self.alloc_typed_array(buffer, 7, 0, values.len())
             }
         }
     }

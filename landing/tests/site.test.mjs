@@ -103,6 +103,27 @@ test('every journal entry and page is dated within the repository history', () =
   }
 })
 
+test('release install snippets run the binary from inside its archive folder', () => {
+  // release.yml packages each native binary as <bundle>/zipp, <bundle> being
+  // the archive name without its extension.
+  const workflow = readFileSync(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8')
+  assert.ok(workflow.includes('bundle="zipp-$RELEASE_VERSION-$RUST_TARGET"'))
+  assert.ok(workflow.includes('install -m 0755 "$binary" "dist/$bundle/zipp"'))
+  const snippets = []
+  const walk = value => {
+    if (typeof value === 'string') { if (/tar x\w*f zipp-/.test(value)) snippets.push(value) }
+    else if (value && typeof value === 'object') Object.values(value).forEach(walk)
+  }
+  walk(content)
+  assert.ok(snippets.length > 0)
+  for (const code of snippets) {
+    for (const [, bundle] of code.matchAll(/tar x\w*f (zipp-[\w.-]+?)\.tar\.gz/g)) {
+      assert.ok(code.includes(`./${bundle}/zipp `), `${bundle}: run the extracted ./${bundle}/zipp`)
+      assert.ok(!/(^|\n)\.\/zipp /.test(code), `${bundle}: no ./zipp exists after extraction`)
+    }
+  }
+})
+
 test('the home page keeps the site identity and links to the documentation without JavaScript', () => {
   const home = readFileSync(new URL('../index.html', import.meta.url), 'utf8')
   assert.ok(home.includes('<title>Zipp: Rust JavaScript &amp; Python Engine</title>'))

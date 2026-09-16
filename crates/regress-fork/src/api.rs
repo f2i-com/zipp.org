@@ -802,6 +802,36 @@ impl Regex {
         )
     }
 
+    /// PATCH (FORK.md B9): one match attempt anchored at byte offset `start`
+    /// of an ASCII-only `text` — the ECMAScript sticky (`y`) semantics. The
+    /// result, when present, starts exactly at `start`. A failed attempt costs
+    /// only that attempt; `find_from_ascii(text, start).next()` followed by a
+    /// start filter first tried every later position. Always the classical
+    /// executor (never the optional linear tier).
+    pub fn match_at_ascii(&self, text: &str, start: usize) -> Option<Match> {
+        <classicalbacktrack::BacktrackExecutor<'_, indexing::AsciiInput<'_>> as exec::Executor<
+            '_,
+            '_,
+        >>::new(&self.cr, text)
+        .match_at(start)
+    }
+
+    /// Metered form of [`Self::match_at_ascii`]; the usage report is the same
+    /// one the limited iterators expose.
+    #[cfg(feature = "bounded-backtracking")]
+    pub fn match_at_ascii_with_limits(
+        &self,
+        text: &str,
+        start: usize,
+        limits: MatchLimits,
+    ) -> (Option<Match>, MatchUsage) {
+        let mut ex = classicalbacktrack::BacktrackExecutor::<indexing::AsciiInput<'_>>::with_limits(
+            &self.cr, text, limits,
+        );
+        let found = ex.match_at(start);
+        (found, exec::MatchProducer::match_usage(&ex))
+    }
+
     /// Search an ASCII-only subject with an explicit executor plan.
     ///
     /// This bypasses `ZIPP_REGEX_TIER` and is intended for differential
@@ -953,6 +983,59 @@ impl Regex {
             super::classicalbacktrack::BacktrackExecutor::new_with_limits(input, &self.cr, limits),
             start,
         )
+    }
+
+    /// PATCH (FORK.md B9): one match attempt anchored at code-unit index
+    /// `start`, code-point elements — the sticky counterpart of
+    /// [`Self::find_from_utf16`]. `start` should be a code-point boundary: the
+    /// caller maps a `lastIndex` inside a surrogate pair to the pair's start.
+    #[cfg(feature = "utf16")]
+    pub fn match_at_utf16(&self, text: &[u16], start: usize) -> Option<Match> {
+        let input = Utf16Input::new(text, self.cr.flags.unicode_mode());
+        classicalbacktrack::BacktrackExecutor::new(
+            input,
+            MatchAttempter::new(&self.cr, input.left_end()),
+        )
+        .match_at(start)
+    }
+
+    #[cfg(all(feature = "utf16", feature = "bounded-backtracking"))]
+    pub fn match_at_utf16_with_limits(
+        &self,
+        text: &[u16],
+        start: usize,
+        limits: MatchLimits,
+    ) -> (Option<Match>, MatchUsage) {
+        let input = Utf16Input::new(text, self.cr.flags.unicode_mode());
+        let mut ex = classicalbacktrack::BacktrackExecutor::new_with_limits(input, &self.cr, limits);
+        let found = ex.match_at(start);
+        (found, exec::MatchProducer::match_usage(&ex))
+    }
+
+    /// PATCH (FORK.md B9): one match attempt anchored at code-unit index
+    /// `start`, code-unit elements — the sticky counterpart of
+    /// [`Self::find_from_ucs2`].
+    #[cfg(feature = "utf16")]
+    pub fn match_at_ucs2(&self, text: &[u16], start: usize) -> Option<Match> {
+        let input = Ucs2Input::new(text, self.cr.flags.unicode_mode());
+        classicalbacktrack::BacktrackExecutor::new(
+            input,
+            MatchAttempter::new(&self.cr, input.left_end()),
+        )
+        .match_at(start)
+    }
+
+    #[cfg(all(feature = "utf16", feature = "bounded-backtracking"))]
+    pub fn match_at_ucs2_with_limits(
+        &self,
+        text: &[u16],
+        start: usize,
+        limits: MatchLimits,
+    ) -> (Option<Match>, MatchUsage) {
+        let input = Ucs2Input::new(text, self.cr.flags.unicode_mode());
+        let mut ex = classicalbacktrack::BacktrackExecutor::new_with_limits(input, &self.cr, limits);
+        let found = ex.match_at(start);
+        (found, exec::MatchProducer::match_usage(&ex))
     }
 
     /// Replaces the first match of the regex in `text` with the replacement string.

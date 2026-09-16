@@ -26,7 +26,8 @@ is `https://www.zipp.org`; the apex domain should redirect to it at the edge.
 local folder/file loading, samples, source editor, entry selection, arguments,
 canvas, console, autosave, run/stop, and WebGL2/WebGPU selection for Python graphs.
 Files are read into a browser virtual filesystem, not sent to a server to execute.
-The page runs a Python-enabled Zipp WASM engine. The `torch` subset still uses CPU;
+The page runs a Python-enabled Zipp WASM engine. Eager `torch` runs on the CPU;
+experimental `torch.compile` runs GPU inference and dense-model SGD training, and
 browser GPU graphs use `zipp_gpu`. JavaScript guest GPU requests are not yet wired
 into the stock playground, as described in the main README.
 
@@ -39,6 +40,17 @@ To update that pair after rebuilding `crates/zipp-wasm/dist/all/`, run:
 ```sh
 node scripts/sync-playground.mjs --refresh-engine
 ```
+
+The pair must be a LABELLED build of the release the site announces. The sync
+script warns whenever `manifest.profile.version` differs from
+`landing/package.json`, or `profile.source.sha` is null (an unlabelled local
+build), and `--require-release` turns that warning into an error; `ci.yml`'s
+landing job runs it that way. An unlabelled pair once served the public
+`/playground` for a day with a class-method closure bug that the release it
+claimed had already fixed. The simplest correct refresh is to unpack the
+`zipp-wasm-<version>-web-python` release asset (verify its `SHA256SUMS`), copy
+its `zipp_wasm.js` and `zipp_wasm_bg.wasm` into `crates/zipp-wasm/dist/all/`,
+then run the command above.
 
 The landing's iframe and dedicated route load the same public files. The old
 JavaScript-only story scratchpad loads only when expanded. The native NCA research
@@ -133,8 +145,8 @@ v0.0.13; the page uses the artifact's recorded v0.0.12 identity. Benchmark
 headlines, confidence intervals, row counts, and the table refer to the same
 capture, rather than silently mixing new README headlines with old table rows.
 
-The optional JavaScript story scratchpad's browser engine is v0.0.15, 5,119,419 raw bytes, SHA-256
-`7c40f488d8b69209eea9e56dea2b0be13b3da0fd3810f3d8ec1d44c3d95972e4`.
+The optional JavaScript story scratchpad's browser engine is v0.0.18, 5,426,696 raw bytes, SHA-256
+`512fd864e2831fa2cb46047a7a044d32d4214b2b9caaf44200e8c153f994f1a8`.
 Its file pair is fingerprinted together in Vite configuration to avoid loading
 mismatched glue and WASM files. Each run uses a disposable Worker, a 6-second
 host deadline, and the module's instruction and heap limits.

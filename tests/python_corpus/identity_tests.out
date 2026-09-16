@@ -1,0 +1,34 @@
+classify None None False True True True False
+classify True True True False True False True
+classify False False True True False False True
+classify 0 other:int True True True False True
+classify 1 other:int True True True False True
+classify 0.0 other:float True True True False True
+classify 1.0 other:float True True True False True
+classify '' other:str True True True False True
+classify [] other:list True True True False True
+classify () other:tuple True True True False True
+classify Ellipsis Ellipsis True True True False True
+classify NotImplemented NotImplemented True True True False True
+classify True True True False True False True
+classify False False True True False False True
+classify True True True False True False True
+classify True True True False True False True
+classify None None False True True True False
+lists True False True True True False False
+tuples True True True
+dicts True False True True True
+strs True True
+bigint True True False
+float True False
+nan True True False
+sentinel 1 None raise None 0
+eq-override True False False True True True True
+bool-identity True True True True skip
+type-identity True True False True True True True
+method-identity True True True True
+side
+none-results True True True True True True
+none-count 3 3 [0, 3, 5] 3 3
+true-count 1 3 [False, False, False, True, False]
+linked 6

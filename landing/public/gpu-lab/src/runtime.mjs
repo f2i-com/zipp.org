@@ -1,16 +1,20 @@
-import {validateProgram, check, ComputeError} from './graph.mjs';
+import {validateProgram, check, ComputeError, DEFAULT_LIMITS} from './graph.mjs';
 import {CPUBackend} from './backends/cpu.mjs';
 import {WasmBackend} from './backends/wasm.mjs';
 import {WebGPUBackend} from './backends/webgpu.mjs';
 import {WebGL2Backend} from './backends/webgl2.mjs';
 const clock=()=>globalThis.performance?.now()??Date.now();
 
-export async function createRuntime({backend='auto', limits={}, wasmBytes, wasmUrl}={}) {
+/**
+ * `debug` re-enables the per-dispatch driver error and framebuffer checks the
+ * GPU backends otherwise make once per execution.
+ */
+export async function createRuntime({backend='auto', limits={}, wasmBytes, wasmUrl, debug=false}={}) {
   check(['auto','webgpu','webgl2','wasm','cpu-js'].includes(backend),'BACKEND','Unknown backend');
   const candidates=backend==='auto'?['webgpu','webgl2','wasm','cpu-js']:[backend],attempts=[];
   for(const name of candidates){
     try {
-      const implementation=name==='webgpu'?await WebGPUBackend.create():name==='webgl2'?await WebGL2Backend.create():
+      const implementation=name==='webgpu'?await WebGPUBackend.create({debug}):name==='webgl2'?await WebGL2Backend.create({debug}):
         name==='wasm'?await WasmBackend.create({wasmBytes,wasmUrl}):new CPUBackend();
       return new ComputeRuntime(implementation,limits,attempts);
     }catch(error){attempts.push({backend:name,error:String(error.message||error)});}
@@ -21,28 +25,46 @@ export async function createRuntime({backend='auto', limits={}, wasmBytes, wasmU
 export class ComputeRuntime {
   constructor(backend,limits={},attempts=[]){this.impl=backend;this.limits=limits;this.attempts=attempts;this.busy=false;this.disposed=false;}
   get backend(){return this.impl.name;}
-  info(){return {backend:this.backend,description:this.impl.description,adapter:this.impl.info??null,fallbackAttempts:this.attempts};}
-  async execute(program){
+  info(){return {backend:this.backend,description:this.impl.description,adapter:this.impl.info??null,fallbackAttempts:this.attempts,limits:this.effectiveLimits()};}
+  /**
+   * Policy defaults, then what this backend and device can sustain (a GPU may
+   * accept more work, a device buffer may cap tensor size), then the host's own
+   * limits, which always win.
+   */
+  effectiveLimits(){return {...DEFAULT_LIMITS,...(this.impl.limitHints?.()??{}),...this.limits};}
+  // `typedOutputs`: each output's `data` is a Float32Array of its own rather
+  // than a list of numbers (a ZIPP engine takes it as tensor storage).
+  async execute(program,{typedOutputs=false}={}){
     check(!this.disposed,'DISPOSED','Runtime has been disposed');
     check(!this.busy,'BUSY','Runtime supports one graph at a time; await the previous execution');
     // Validation and owned input copies happen before any asynchronous work or GPU allocation.
-    const plan=validateProgram(program,this.limits);this.busy=true;
-    const start=clock(),handles=new Map(),uses=[...plan.uses];
+    const plan=validateProgram(program,{...(this.impl.limitHints?.()??{}),...this.limits});this.busy=true;
+    const start=clock(),handles=new Map(),uses=[...plan.uses],root=plan.root;
     let value,error,began=false,finishError;
+    // Handles belong to storage roots; a reshape shares its source's handle.
     const free=id=>{const h=handles.get(id);if(h!==undefined){this.impl.free(h);handles.delete(id);}};
     try {
       await this.impl.begin(plan);began=true;
       for(const n of plan.nodes){
-        const h=await this.impl.run(n,n.refs.map(r=>handles.get(r)));handles.set(n.id,h);
-        for(const r of n.refs){uses[r]--;if(uses[r]===0)free(r);}
+        if(n.alias)continue;
+        const h=await this.impl.run(n,n.refs.map(r=>handles.get(root[r])));handles.set(n.id,h);
+        for(const r of n.refs){uses[root[r]]--;if(uses[root[r]]===0)free(root[r]);}
         if(uses[n.id]===0)free(n.id);
       }
-      const submitted=clock(),outputs=Object.create(null),cache=new Map();
+      const submitted=clock(),outputs=Object.create(null),ids=[...new Set(plan.outputs.map(o=>root[o.id]))];
+      // One batched readback when the backend offers it (one GPU round trip).
+      const read=this.impl.readAll?await this.impl.readAll(ids.map(id=>handles.get(id))):
+        await (async()=>{const all=[];for(const id of ids)all.push(await this.impl.read(handles.get(id)));return all;})();
+      const cache=new Map(ids.map((id,i)=>[id,read[i]]));
       for(const o of plan.outputs){
-        let data=cache.get(o.id);
-        if(!data){data=Array.from(await this.impl.read(handles.get(o.id)));cache.set(o.id,data);}
-        check(data.every(Number.isFinite),'NUMBER','Output contains non-finite values; graph v1 readback requires finite float32');
-        outputs[o.name]={shape:[...plan.nodes[o.id].shape],dtype:'float32',data:[...data]};
+        // A reshape shares its source storage, so the readback is keyed by the
+        // storage root; every output id is in the batch above.
+        const values=cache.get(root[o.id]);
+        for(let i=0;i<values.length;i++)if(!Number.isFinite(values[i]))throw new ComputeError('NUMBER','Output contains non-finite values; graph readback requires finite float32');
+        // A typed output hands the caller its own Float32Array; the plain form
+        // is a list of numbers.
+        const data=typedOutputs?(values instanceof Float32Array?values.slice():Float32Array.from(values)):Array.from(values);
+        outputs[o.name]={shape:[...plan.nodes[o.id].shape],dtype:'float32',data};
       }
       value={version:1,backend:this.backend,outputs,stats:{nodes:plan.nodes.length,estimatedWork:plan.work,
         logicalAllocationBytes:plan.logicalBytes,uploadElements:plan.inputElements,

@@ -107,7 +107,7 @@ on each call; persistent GPU models and GPU Conv2d training are not implemented.
 | `pythonCall(name, args)` | call it with an array of host values (integers, strings, booleans, null, arrays) and get host data back; a throw leaves the engine usable and classifies as `guest` |
 | `takeUi()` | drain the `ui` module's command buffer: `[["rect", x, y, w, h, color], ...]` |
 | `setPythonInput(json)` | replace the input snapshot `ui.mouse()`/`clicked()`/`key()`/`button()`/`width()`/`height()` read: `{"mx","my","down","clicked","keys":{...},"w","h"}` |
-| `takeHostRequests()` | drain the program's pending host requests: `[{id, kind, payload}, ...]`; today the one kind is `"gpu.execute"`, whose payload is a `zipp_gpu` compute graph (plain data, protocol version 1) |
+| `takeHostRequests()` | drain the program's pending host requests: `[{id, kind, payload}, ...]`; today the one kind is `"gpu.execute"`, whose payload is a `zipp_gpu` compute graph (plain data, protocol version 1 or 2 — 2 as soon as the graph uses an operation, rank or broadcast the first version did not define) |
 | `pythonCall("__zipp_py_deliver", [id, reply])` | answer a host request: `reply` is `{ok: true, value}` or `{ok: false, error: {code, message}}`; the program's callback runs inside this call, and the result is `true` when the id was pending |
 
 `playground/` is a complete host over this surface (and over the JavaScript ABI
@@ -125,7 +125,9 @@ Torch adapter and are also available directly.
 #### GPU compute for Python programs
 
 A Python program imports the bundled `zipp_gpu` library, records a float32
-graph with tensor arithmetic (`+`, `-`, `*`, `@`, `relu`, `sum`, `life`) and
+graph with tensor arithmetic (broadcasting `+ - * /`, `@` for matrices and
+batches, activations, axis reductions, softmax, cross-entropy with its
+gradient, SGD/momentum/Adam steps and `life`; see `gpu-lab/README.md`) and
 calls `Graph.submit(callback, on_error=None, **outputs)`. The graph leaves the
 engine as a `gpu.execute` host request; nothing inside the engine touches a
 GPU. `gpu-lab/` (the vendored GPU Lab: `src/runtime.mjs` and its WebGPU,
@@ -147,12 +149,18 @@ adapter.invalidate(); await adapter.idle(); compute.dispose();   // teardown, in
 ```
 
 The grant is explicit (`allowExecute`), requests are admitted one at a time
-with pending and lifetime quotas, an explicit backend choice is never
+with pending and lifetime quotas (an over-quota request is refused through its
+own `on_error`, after the current drain and the work ahead of it, so a callback
+that resubmits cannot recurse into the host), an explicit backend choice is never
 downgraded to a CPU implementation, a late result never reaches a disposed
 engine, and the host validates every graph itself (shapes, node count, work
-and allocation budgets) before a kernel runs. Natively (`zipp py`) and under
-CPython the same `submit` evaluates the graph with the library's float32
-reference implementation and reports `backend: "cpu-python"`.
+and allocation budgets) before a kernel runs. Tensor data moves as bytes: a
+graph built from `torch` tensors sends its inputs as `Float32Array`s, the
+adapter then asks the runtime for `Float32Array` outputs, and the engine takes
+those straight into tensor storage. Natively (`zipp py`) the same `submit`
+evaluates the graph on the engine's tensor kernels and under CPython with the
+library's pure-Python float32 reference, with the same float32 results, and
+reports `backend: "cpu-python"`.
 `tests/node/python-gpu.cjs` holds the channel and the adapter to this over the
 JavaScript reference and compiled-WASM backends; `playground/smoke.cjs` runs
 the graphs through a real browser, records which backend answered, and checks
@@ -443,9 +451,12 @@ Reads and writes cross as structured data — nested arrays and plain objects �
 JSON text and not `ToString`. Three rules, each because the alternative is worse:
 
 - **Only data crosses.** Functions, classes, `Map`/`Set`/`Date`/`RegExp`, typed
-  arrays and proxies read as `null`. A `Value` is a heap *index* whose meaning
-  depends on the live VM, so handing one out would hand out a dangling reference
-  the moment the collector moves.
+  arrays other than `Float32Array`, and proxies read as `null`. A `Value` is a
+  heap *index* whose meaning depends on the live VM, so handing one out would
+  hand out a dangling reference the moment the collector moves. A
+  `Float32Array` crosses as a copy of its elements, bit for bit: the host gets
+  its own `Float32Array`, and one the host sends arrives as a fresh array — a
+  numeric tensor costs its bytes, not one value per element.
 - **Writes skip those slots.** Setting a global that currently holds a function is
   a no-op, so a host that reads every global, edits one field and writes them all
   back cannot destroy the script's own functions on the round trip.
@@ -503,6 +514,7 @@ cover that way (string, regex, BigInt, array and nesting ceilings) come from
 | One `evalInContext` expression | 65,490 UTF-8 bytes (plus its fixed 46-byte host wrapper) |
 | Retained `evalInContext` wrapper source | 1,048,576 UTF-8 bytes total and 256 calls per engine |
 | All runtime compilation (`eval`, `Function`, `ShadowRealm`, and host eval) | 65,536 UTF-8 bytes per complete source, 16,777,216 retained source bytes and 16,384 attempts total; at most 16,384 retained function definitions and 1,024 retained class definitions |
+| Run-time global bindings | 1,024 slots per engine lifetime, shared by loaded ES modules' top-level declarations, global names first introduced by `eval`/`Function`, and ShadowRealm names; exhaustion throws a `RangeError` (native builds reserve 262,144) |
 | Source syntax/compile nesting | 48 active recursive parser entries, 16 links in one iterative operator/member grammar chain, and 32 structural AST levels before recursive compiler/capture walks |
 | VM execution | 50,000,000 bytecode instructions total by default, starting at guest top-level execution; a host may size the allowance through `setInstructionBudget`, before or after `initScript`, up to 2,000,000,000 |
 | Payload-aware VM heap high-water | 536,870,912 bytes |
@@ -512,7 +524,7 @@ cover that way (string, regex, BigInt, array and nesting ceilings) come from
 | One BigInt magnitude | 1,048,576 bits (approximately 128 KiB) |
 | One eager dense array/result | 131,072 elements; larger spec-visible lengths remain sparse where supported |
 | JavaScript call frames | 4,096 active frames |
-| Native VM re-entry | 3 simultaneous interpreter entries (the outer run plus at most 2 nested observable callbacks/traps), sized for the 1 MiB Worker stack |
+| Native VM re-entry | 32 simultaneous interpreter entries (`MAX_RUN_LOOP_DEPTH`: the outer run plus at most 31 nested callbacks, traps and builtin-resumed generators); a 33rd throws a catchable `RangeError`. The release gate runs `tests/node/native-depth.cjs` against both variants' stacks: 20 nested entries run and 200 are refused without a trap |
 | Proxy/prototype native meta-operation recursion | 32 guest-controlled transparent forwarding/prototype edges |
 | Guarded array-like/list-building native loops | 262,144 guest-directed iterations; recursive array flattening is capped at 64 active levels |
 | Array `join`/`toString`/`toLocaleString` recursion | 4 active nested arrays; cycles contribute an empty element and deeper acyclic graphs throw `RangeError` |
@@ -520,7 +532,7 @@ cover that way (string, regex, BigInt, array and nesting ceilings) come from
 | JSON replacer/object-key snapshots | 8,388,608 private allocation bytes per stringify, including key and container capacities |
 | Lifetime console output | 8,388,608 UTF-8 bytes total, including newlines, each line charged the cost of its own entry |
 | Synchronous host bridge | 64-byte kind, exact operation-specific arity (and never more than 16 arguments), 33,554,432 combined kind/argument bytes, and a 33,554,432-byte serialized reply |
-| Host value conversion | 2,000,000 nodes and 16,777,216 string bytes per boundary crossing (`getGlobalsBatch`, `setGlobalsBatch`, `callFunction`, `dispatchEvent`, `evalInContext`), plus 8 inspected property entries per node of that ceiling (16,000,000 in all: every entry of every object scanned, hidden and accessor entries included, charged before the scan); a fingerprint batch walks under the same 2,000,000-node, 16,777,216-byte, 16,000,000-entry budget — every element, hole, key and string byte charged, duplicate indices included — and answers `NaN` for what it cannot walk |
+| Host value conversion | 2,000,000 nodes and 16,777,216 string bytes per boundary crossing (`getGlobalsBatch`, `setGlobalsBatch`, `callFunction`, `dispatchEvent`, `evalInContext`; a `Float32Array` is one node and its elements are charged as string bytes, four each), plus 8 inspected property entries per node of that ceiling (16,000,000 in all: every entry of every object scanned, hidden and accessor entries included, charged before the scan); a fingerprint batch walks under the same 2,000,000-node, 16,777,216-byte, 16,000,000-entry budget — every element, hole, key and string byte charged, duplicate indices included — and answers `NaN` for what it cannot walk |
 | Asynchronous `host.call` | 4,096 requests queued between drains, 65,536 callbacks awaiting a reply, and 4,194,304 UTF-16 code units per request (kind plus arguments), all checked before anything registers; one drain delivers at most 4,096 requests and 33,554,432 string bytes, leaves the rest queued, and rejects (with explicit settlement) a single request that does not fit that allowance on its own; a drain also ATTEMPTS at most 64 peeks, retries and rejections and 8,000,000 nodes and 134,217,728 string bytes of walking across them, counted whether or not an attempt succeeded, and leaves the rest for the next drain |
 | `accel.make` binding spec | the public grammar only — `NAME=g:GLOBAL`, `NAME=c:GLOBAL`, `NAME=a:ID`, `NAME=n:NUMBER`, `NAME=t` — at most 8,192 bytes, 64 entries and 64-byte identifiers, names bound once (a set, not a scan), ids finite non-negative safe integers; the whole spec is validated before any region is resolved, regions are pinned as one transaction, and the engine's own `r:` region form is refused from guest text before the adapter sees the spec |
 

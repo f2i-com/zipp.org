@@ -1,0 +1,74 @@
+key-str ! KeyError: 'b'
+key-int ! KeyError: 3
+key-tuple ! KeyError: (1, 2)
+key-none ! KeyError: None
+key-pop ! KeyError: 'gone'
+key-popitem ! KeyError: 'popitem(): dictionary is empty'
+set-remove ! KeyError: 5
+index-list ! IndexError: list index out of range
+index-list-neg ! IndexError: list index out of range
+index-tuple ! IndexError: tuple index out of range
+index-str ! IndexError: string index out of range
+index-range ! IndexError: range object index out of range
+index-pop-empty ! IndexError: pop from empty list
+index-pop-range ! IndexError: pop index out of range
+index-assign ! IndexError: list assignment index out of range
+index-type ! TypeError: list indices must be integers or slices, not str
+index-float ! TypeError: tuple indices must be integers or slices, not float
+attr-instance ! AttributeError: 'Obj' object has no attribute 'missing'
+attr-class ! AttributeError: type object 'Obj' has no attribute 'missing'
+attr-int ! AttributeError: 'int' object has no attribute 'missing'
+attr-str ! AttributeError: 'str' object has no attribute 'missing'
+attr-list ! AttributeError: 'list' object has no attribute 'missing'
+attr-none ! AttributeError: 'NoneType' object has no attribute 'missing'
+attr-module ! AttributeError: module 'math' has no attribute 'missing'
+attr-set-slots ! AttributeError: 'Slots' object has no attribute 'b' and no __dict__ for setting new attributes
+attr-unset-slot ! AttributeError: 'Slots' object has no attribute 'a'
+type-add ! TypeError: unsupported operand type(s) for +: 'int' and 'str'
+type-radd ! TypeError: can only concatenate str (not "int") to str
+type-sub ! TypeError: unsupported operand type(s) for -: 'list' and 'list'
+type-mul ! TypeError: can't multiply sequence by non-int of type 'float'
+type-lt ! TypeError: '<' not supported between instances of 'int' and 'str'
+type-lt-none ! TypeError: '<' not supported between instances of 'NoneType' and 'NoneType'
+type-lt-list ! TypeError: '<' not supported between instances of 'list' and 'tuple'
+type-neg ! TypeError: bad operand type for unary -: 'str'
+type-invert ! TypeError: bad operand type for unary ~: 'float'
+type-call ! TypeError: 'int' object is not callable
+type-subscript ! TypeError: 'int' object is not subscriptable
+type-subscript-none ! TypeError: 'NoneType' object is not subscriptable
+type-item-assign ! AttributeError: 'tuple' object has no attribute '__setitem__'
+type-iter ! TypeError: 'int' object is not iterable
+type-len ! TypeError: object of type 'int' has no len()
+type-hash ! TypeError: unhashable type: 'list'
+type-str-in ! TypeError: 'in <string>' requires string as left operand, not int
+type-concat-tuple ! TypeError: can only concatenate tuple (not "list") to tuple
+type-int-arg ! TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'
+type-sorted-mixed ! TypeError: '<' not supported between instances of 'str' and 'int'
+value-int ! ValueError: invalid literal for int() with base 10: '12a'
+value-int-base ! ValueError: invalid literal for int() with base 10: 'z'
+value-float ! ValueError: could not convert string to float: 'abc'
+value-list-index ! ValueError: 3 is not in list
+value-list-remove ! ValueError: list.remove(x): x not in list
+value-str-index ! ValueError: substring not found
+value-unpack -> 1
+value-chr ! ValueError: chr() arg not in range(0x110000)
+value-range-step ! ValueError: range() arg 3 must not be zero
+zero-div ! ZeroDivisionError: integer division or modulo by zero
+zero-mod ! ZeroDivisionError: integer modulo by zero
+zero-float ! ZeroDivisionError: float division by zero
+name ! NameError: name 'undefined_variable' is not defined
+stop ! StopIteration: 
+recursion-free -> 45
+hasattr-true -> True
+hasattr-cls -> True
+hasattr-false -> False
+getattr-default -> 'd'
+getattr-no-default ! AttributeError: 'Obj' object has no attribute 'nothing'
+hasattr-property-valueerror ! ValueError: property failed
+hasattr-property-attributeerror -> False
+getattr-property-default -> 'fallback'
+getattr-property-valueerror ! ValueError: property failed
+loop-key present 1
+loop-key absent KeyError 'absent' ('absent',)
+loop-key present 1
+keyerror-multi ('a', 'b') ('a', 'b')

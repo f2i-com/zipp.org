@@ -617,7 +617,12 @@ fn dv_nested_reduce_plan(
                             let v = match *instr {
                                 Instr::Add { .. } => x.checked_add(y)?,
                                 Instr::Sub { .. } => x.checked_sub(y)?,
-                                _ => x.checked_mul(y)?,
+                                // A zero product with a negative operand is
+                                // the double -0, not an integer constant.
+                                _ => match x.checked_mul(y)? {
+                                    0 if (x | y) < 0 => return None,
+                                    v => v,
+                                },
                             };
                             constants.insert(dst, v);
                         }
@@ -2375,6 +2380,52 @@ fn emit_store_ip(ops: &mut dynasmrt::x64::Assembler, ip_slot: i32, v: i32) {
     dynasm!(ops ; mov rax, [rsp + ip_slot] ; mov DWORD [rax], v);
 }
 
+/// `Mul`'s -0 rule after the i64 product sits in rax: a ZERO product with a
+/// negative operand is -0 in JS (`0 * -5`), which no i64 home encodes, so the
+/// op bails at its own ip (dst unwritten) and the interpreter makes the
+/// double. A positive immediate multiplier can never produce it (no check);
+/// a negative one produces it exactly when the product is zero (jump straight
+/// to `bail`). Otherwise returns the label [`emit_mul_negzero_sign`] must
+/// define, reached only on a zero product — off the hot path.
+fn emit_mul_negzero_check(
+    ops: &mut dynasmrt::x64::Assembler,
+    b: Src,
+    bail: dynasmrt::DynamicLabel,
+) -> Option<dynasmrt::DynamicLabel> {
+    match b {
+        Src::I(bi) if bi > 0 => None,
+        Src::I(bi) if bi < 0 => {
+            dynasm!(ops ; test rax, rax ; jz => bail);
+            None
+        }
+        _ => {
+            let zchk = ops.new_dynamic_label();
+            dynasm!(ops ; test rax, rax ; jz => zchk);
+            Some(zchk)
+        }
+    }
+}
+
+/// The zero-product tail of [`emit_mul_negzero_check`]: one operand is 0, so
+/// the other's sign is the sign of `a | b`. Rejoins `store` when that is
+/// non-negative and falls through (to the caller's bail) otherwise. rcx is
+/// scratch; a register `b` was canonicalized in place before the multiply.
+fn emit_mul_negzero_sign(
+    ops: &mut dynasmrt::x64::Assembler,
+    a: Src,
+    b: Src,
+    lazy: &FxHashSet<u8>,
+    store: dynasmrt::DynamicLabel,
+) {
+    emit_src64_canon(ops, a, 1, lazy); // rcx
+    match b {
+        Src::R(bg) => dynasm!(ops ; or rcx, Rq(bg)),
+        Src::I(bi) => dynasm!(ops ; or rcx, bi),
+        Src::S(bd) => dynasm!(ops ; or rcx, [rsp + bd]),
+    }
+    dynasm!(ops ; jns => store);
+}
+
 /// The i53 range guard on a GPR home: same trick and same resume-at-ip+1
 /// contract as `emit_i53_guard` (r13 = 2^53, r14 = 2^54, prologue-loaded).
 /// With `inline` the two constants come as movabs immediates instead — used
@@ -2937,8 +2988,10 @@ pub(crate) fn compile_region_int_gpr(
         if plan.dv_flag_elide.contains(&ip) {
             continue;
         }
+        // A `split_recv_lg` load/GetProp writes the boxed reference an exit
+        // replays; it is never a dead value op (see the xmm emitter's twin).
         if let Some(d) = writes_reg(&proto.code[ip]) {
-            if plan.dead.contains(&d) {
+            if plan.dead.contains(&d) && !plan.split_recv_lg.contains(&ip) {
                 continue;
             }
         }
@@ -3246,6 +3299,11 @@ pub(crate) fn compile_region_int_gpr(
                         }
                     }
                 } else if plan.elide_guard.contains(&ip) {
+                    // A zero product with a negative operand (-0) bails at THIS
+                    // ip like the xmm arm; see `emit_mul_negzero_check`.
+                    let zbail = ops.new_dynamic_label();
+                    let store = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
                     emit_src64_canon(&mut ops, src(a), 0, &lazy); // rax
                     match src(b) {
                         Src::R(bg) => {
@@ -3255,13 +3313,29 @@ pub(crate) fn compile_region_int_gpr(
                         Src::I(bi) => dynasm!(ops ; imul rax, rax, bi),
                         Src::S(bd) => dynasm!(ops ; imul rax, [rsp + bd]),
                     }
+                    let zchk = emit_mul_negzero_check(&mut ops, src(b), zbail);
+                    let can_bail = !matches!(src(b), Src::I(bi) if bi > 0);
+                    dynasm!(ops ; => store);
                     match dl {
                         Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
                         Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
                     }
+                    if can_bail {
+                        dynasm!(ops ; jmp => done);
+                        if let Some(zchk) = zchk {
+                            dynasm!(ops ; => zchk);
+                            emit_mul_negzero_sign(&mut ops, src(a), src(b), &lazy, store);
+                        }
+                        dynasm!(ops ; => zbail);
+                        emit_store_ip(&mut ops, ip_slot, rip_at); // dst not written
+                        dynasm!(ops ; jmp => flush_exit);
+                    }
+                    dynasm!(ops ; => done);
                 } else {
-                    // Same i64-overflow / i53 split as the xmm arm.
+                    // Same i64-overflow / i53 split as the xmm arm, and the same
+                    // -0 bail (see `emit_mul_negzero_check`).
                     let ovf = ops.new_dynamic_label();
+                    let store = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
                     emit_src64_canon(&mut ops, src(a), 0, &lazy); // rax
                     match src(b) {
@@ -3273,14 +3347,18 @@ pub(crate) fn compile_region_int_gpr(
                         Src::S(bd) => dynasm!(ops ; imul rax, [rsp + bd]),
                     }
                     dynasm!(ops ; jo => ovf); // i64 overflow → redo in interp at THIS ip
+                    let zchk = emit_mul_negzero_check(&mut ops, src(b), ovf);
+                    dynasm!(ops ; => store);
                     match dl {
                         Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
                         Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
                     }
-                    dynasm!(ops
-                        ; jmp => done
-                        ; => ovf
-                    );
+                    dynasm!(ops ; jmp => done);
+                    if let Some(zchk) = zchk {
+                        dynasm!(ops ; => zchk);
+                        emit_mul_negzero_sign(&mut ops, src(a), src(b), &lazy, store);
+                    }
+                    dynasm!(ops ; => ovf);
                     emit_store_ip(&mut ops, ip_slot, rip_at); // dst not written
                     dynasm!(ops
                         ; jmp => flush_exit

@@ -1,0 +1,43 @@
+mod-zero-sign 0.0 0.0 0.0 0.0 0.0 0.0 0.0 -0.0 -0.0
+mod-signs 1.5 0.5 -0.5 -1.5 1e-300 1e+300
+floordiv-inf -1.0 -1.0 -1.0 -1.0 (-1.0, inf) -1.0 0.0 0.0
+inf-floordiv nan nan nan (nan, nan) nan 2.0 inf
+ZeroDivisionError float modulo by zero
+ZeroDivisionError float modulo by zero
+ZeroDivisionError float divmod()
+ZeroDivisionError float divmod()
+ZeroDivisionError float floor division by zero
+ZeroDivisionError float floor division by zero
+ZeroDivisionError float division by zero
+ZeroDivisionError division by zero
+ZeroDivisionError integer division or modulo by zero
+ZeroDivisionError integer modulo by zero
+floordiv-algo -11.0 (-11.0, 0.6999999999999995) 5499.0 6999.0 (5499.0, 0.0009999999999998855) 9.0 (9.0, 0.09999999999999995) 2.0 0.0
+floordiv-consistent 69.0 0.09999999999999962 True (-2.0, 0.0) (-2.0, -0.0) -0.0 -0.0
+pow-special 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0
+pow-inf inf 0.0 0.0 inf inf 0.0 -inf inf -0.0 1.0
+pow-negbase -512.0 0.25 -0.0 0.0 0.0
+OverflowError (34, 'Result too large')
+OverflowError (34, 'Result too large')
+OverflowError (34, 'Result too large')
+ZeroDivisionError 0.0 cannot be raised to a negative power
+ZeroDivisionError 0.0 cannot be raised to a negative power
+nan-operator False True False True False False False
+nan-distinct False False 2 2 missing 0
+inf-vs-bigint True True True False False True True
+exact-cmp False True False True True True True False
+exact-cmp-mixed True True True True True True True
+sorted-mixed [9007199254740991, 9007199254740992.0, 9007199254740992.0, 9007199254740993] 9007199254740993 1e+16
+mixed-set 2 True False {1.0: 'b'}
+OverflowError int too large to convert to float
+OverflowError integer division result too large for a float
+OverflowError int too large to convert to float
+OverflowError int too large to convert to float
+OverflowError int too large to convert to float
+OverflowError int too large to convert to float
+overflow 1e+20
+OverflowError int too large to convert to float
+OverflowError int too large to convert to float
+no-overflow 0.0 skip 8.98846567431158e+307 2000.0 400.0 True
+round 2 4 -2 0.12 0.38 1500000000000000078757140382806630373056702871662238732373781173267703686983362293679557062620671796065556665749325817265413784853040645863467188277180060474272580801389863705606745350692182135089053429852456199917621678558451461320111979114170213741868888183230085264257173504208294580298189100810240 10.0 12300 0
+float-int-ops 0.30000000000000004 0.30000000000000004 1e+16 9007199254740992.0 3.0 -4.0 -1.0 1.4142135623730951 2.5

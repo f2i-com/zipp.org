@@ -51,9 +51,24 @@ const JSON_STRING_LIMIT_ERROR: &str = "RangeError: Invalid string length";
 
 /// Pretty serialization retains one indentation string per recursive level;
 /// bounding depth in the hardened profile keeps that live set quadratic only
-/// in a small constant. The default profile retains its existing semantics.
+/// in a small constant.
 #[cfg(feature = "safe-sandbox")]
 const MAX_JSON_NESTING_DEPTH: usize = 64;
+
+/// The ordinary profile bounds the same walks for a different reason: every
+/// level of the parser, the serializer and the reviver walk is a native Rust
+/// frame. Unbounded, a deeply nested document (or a replacer/`toJSON` that
+/// returns a fresh object at every level) overflowed the native stack and
+/// aborted the process where node throws a catchable RangeError. The limits
+/// are sized for the CLI's 256 MiB interpreter stack; the heaviest frame,
+/// the serializer re-entering a replacer, measured under 3 KiB per level in a
+/// release build. The serializer stops at 10,000 levels, about where node's
+/// own stringify throws. Parsing, which node does iteratively, and the reviver
+/// walk over a parsed tree keep far more room.
+#[cfg(not(feature = "safe-sandbox"))]
+const MAX_JSON_STRINGIFY_DEPTH: usize = 10_000;
+#[cfg(not(feature = "safe-sandbox"))]
+const MAX_JSON_PARSE_DEPTH: usize = 100_000;
 
 /// `JSON.stringify` snapshots object keys before it invokes getters, `toJSON`,
 /// or a replacer. Those copies are deliberately outside the guest heap so a
@@ -86,9 +101,9 @@ struct JsonKeySnapshotBudget {
     used: std::cell::Cell<usize>,
 }
 
-/// Recursive JSON parsing is intentionally left compatible with the ordinary
-/// engine profile, but the hardened profile must fail before a valid, deeply
-/// nested document can exhaust the native (or WebAssembly) call stack.
+/// Recursive JSON parsing must fail before a valid, deeply nested document
+/// can exhaust the native (or WebAssembly) call stack: tightly in the
+/// hardened profile, and at [`MAX_JSON_PARSE_DEPTH`] in the ordinary one.
 #[inline]
 fn json_check_parse_depth(depth: usize) -> Result<(), Thrown> {
     #[cfg(feature = "safe-sandbox")]
@@ -98,7 +113,11 @@ fn json_check_parse_depth(depth: usize) -> Result<(), Thrown> {
         ));
     }
     #[cfg(not(feature = "safe-sandbox"))]
-    let _ = depth;
+    if depth >= MAX_JSON_PARSE_DEPTH {
+        return Err(Thrown(
+            "RangeError: JSON parse nesting depth exceeds the engine limit".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -450,12 +469,6 @@ impl<'p> Vm<'p> {
         self.json_commit_output(out, prior_capacity, appended)
     }
 
-    fn json_quote_output(&mut self, out: &mut String, text: &str) -> Result<(), Thrown> {
-        let prior_capacity = out.capacity();
-        let appended = json_quote_bounded(out, text);
-        self.json_commit_output(out, prior_capacity, appended)
-    }
-
     fn json_quote_heap_string_output(
         &mut self,
         out: &mut String,
@@ -512,7 +525,8 @@ impl<'p> Vm<'p> {
                 json_push_char_bounded(out, '\n')?;
                 json_push_str_bounded(out, pad)?;
             }
-            json_quote_bounded(out, key)?;
+            // (A key's guest text: an escaped "@@…" key loses its extra '@'.)
+            json_quote_bounded(out, guest_key_text(key))?;
             json_push_str_bounded(out, separator)
         })();
         self.json_commit_output(out, prior_capacity, appended)
@@ -540,7 +554,7 @@ impl<'p> Vm<'p> {
                         json_push_char_bounded(out, '\n')?;
                         json_push_str_bounded(out, pad)?;
                     }
-                    json_quote_bounded(out, &map.keys[slot])?;
+                    json_quote_bounded(out, guest_key_text(&map.keys[slot]))?;
                     json_push_str_bounded(out, separator)
                 })();
                 (map.val_at(slot), appended)
@@ -724,7 +738,7 @@ impl<'p> Vm<'p> {
                         active.pop();
                         return false;
                     }
-                    if json_quote_bounded(out, key).is_err()
+                    if json_quote_bounded(out, guest_key_text(key)).is_err()
                         || json_push_char_bounded(out, ':').is_err()
                     {
                         active.pop();
@@ -945,6 +959,7 @@ impl<'p> Vm<'p> {
         math_unary(op, x)
     }
 
+
     /// Evaluate a Math method over an argument SLICE (the value-form `Math.abs`
     /// invoked as a native), mirroring `eval_math`'s register-based variant.
     pub(crate) fn eval_math_args(
@@ -962,12 +977,13 @@ impl<'p> Vm<'p> {
                 for &v in args {
                     nums.push(self.to_number_strict(v)?);
                 }
+                if matches!(op, M::Hypot) {
+                    return Ok(crate::vm::helpers_num2::hypot_scaled(&nums));
+                }
                 let mut acc = match op {
                     M::Min => f64::INFINITY,
-                    M::Max => f64::NEG_INFINITY,
-                    _ => 0.0,
+                    _ => f64::NEG_INFINITY,
                 };
-                let mut hypot_inf = false;
                 for v in nums {
                     acc = match op {
                         // f64 min/max treat -0 and +0 as equal; spec orders -0 < +0,
@@ -985,7 +1001,8 @@ impl<'p> Vm<'p> {
                                 acc.min(v)
                             }
                         }
-                        M::Max => {
+                        // Max (Hypot returned above).
+                        _ => {
                             if v.is_nan() || acc.is_nan() {
                                 f64::NAN
                             } else if v == acc {
@@ -998,25 +1015,9 @@ impl<'p> Vm<'p> {
                                 acc.max(v)
                             }
                         }
-                        _ => {
-                            // Math.hypot: a ±Infinity argument forces +Infinity even
-                            // when another argument is NaN (spec step 3).
-                            if v.is_infinite() {
-                                hypot_inf = true;
-                            }
-                            acc + v * v
-                        }
                     };
                 }
-                if matches!(op, M::Hypot) {
-                    if hypot_inf {
-                        f64::INFINITY
-                    } else {
-                        acc.sqrt()
-                    }
-                } else {
-                    acc
-                }
+                acc
             }
             // The two-arg ops coerce arg0 then arg1 (ToNumber, left-to-right).
             M::Pow => {
@@ -1048,8 +1049,8 @@ impl<'p> Vm<'p> {
     }
 
     /// The per-level indent string for `JSON.stringify`'s `space` argument: a
-    /// number → that many spaces (clamped 0..10); a string → its first 10 chars;
-    /// anything else → empty (compact output).
+    /// number → that many spaces (clamped 0..10); a string → its first 10 code
+    /// units; anything else → empty (compact output).
     /// JSON.stringify `space` coercion (spec sec-json.stringify step 5): a Number
     /// wrapper object is read as ToNumber(space) and a String wrapper as
     /// ToString(space) — both honouring an overridden `valueOf`/`toString` (so
@@ -1082,14 +1083,20 @@ impl<'p> Vm<'p> {
                 };
                 Ok(Value::num(self.to_number_strict(prim)?))
             }
-            HeapObj::Boxed { kind: 0, .. } => {
-                let s = self.to_js_string(space)?;
-                Ok(self.alloc_str(s))
-            }
+            HeapObj::Boxed { kind: 0, .. } => self.to_str_value(space),
             _ => Ok(space),
         }
     }
 
+    /// The gap is the first 10 UTF-16 code UNITS of a string `space` (not 10
+    /// code points), so an astral character straddling the cut leaves its
+    /// lead surrogate behind. The serializer's buffer is a Rust `String`, so
+    /// a gap holding a lone surrogate is written with a marker instead:
+    /// U+0001 followed by four hex digits of the code unit, with a literal
+    /// U+0001 marked the same way. A raw U+0001 can come only from the gap,
+    /// because quoted string content escapes every control character, and
+    /// [`Self::json_stringify_result`] decodes the markers back to the exact
+    /// code units.
     pub(crate) fn json_indent(&self, space: Value) -> String {
         if space.is_number() {
             let n = space.as_f64();
@@ -1100,13 +1107,59 @@ impl<'p> Vm<'p> {
             };
             " ".repeat(n)
         } else if space.is_heap() {
-            match self.heap.str_cow(space.heap_index()) {
-                Some(s) => s.chars().take(10).collect(),
-                None => String::new(),
+            let Some(bytes) = self.heap.str_wtf8_cow(space.heap_index()) else {
+                return String::new();
+            };
+            fn push_marker(gap: &mut String, unit: u32) {
+                gap.push('\u{1}');
+                gap.push_str(&format!("{unit:04x}"));
             }
+            let mut gap = String::new();
+            let mut units = 0usize;
+            for cp in crate::heap::wtf8_code_points(&bytes) {
+                if units == 10 {
+                    break;
+                }
+                match char::from_u32(cp) {
+                    Some(c) if cp >= 0x10000 && units == 9 => {
+                        // The cut falls between the halves: keep the lead.
+                        let lead = 0xD800 + ((c as u32 - 0x10000) >> 10);
+                        push_marker(&mut gap, lead);
+                        units += 1;
+                    }
+                    Some('\u{1}') | None => {
+                        push_marker(&mut gap, cp);
+                        units += 1;
+                    }
+                    Some(c) => {
+                        gap.push(c);
+                        units += c.len_utf16();
+                    }
+                }
+            }
+            gap
         } else {
             String::new()
         }
+    }
+
+    /// Allocate a finished `JSON.stringify` result, decoding the lone-surrogate
+    /// markers [`Self::json_indent`] put into a gap. Without a marker in the
+    /// gap the output is already exact and is allocated as it stands.
+    pub(crate) fn json_stringify_result(&mut self, out: String, indent: &str) -> Value {
+        if !indent.contains('\u{1}') {
+            return self.alloc_str(out);
+        }
+        let mut exact: Vec<u8> = Vec::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(at) = rest.find('\u{1}') {
+            crate::heap::wtf8_push(&mut exact, rest[..at].as_bytes());
+            let unit = u32::from_str_radix(&rest[at + 1..at + 5], 16).unwrap_or(0xFFFD);
+            crate::heap::wtf8_push_cp(&mut exact, unit);
+            rest = &rest[at + 5..];
+        }
+        crate::heap::wtf8_push(&mut exact, rest.as_bytes());
+        Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(exact)))
     }
 
     /// Resolve `JSON.stringify`'s second argument into either a function
@@ -1179,6 +1232,8 @@ impl<'p> Vm<'p> {
                 } else {
                     None
                 };
+                // The list holds property KEYS (escaped like any "@@…" key).
+                let item = item.map(escape_guest_key);
                 if let Some(s) = item {
                     // Count every temporary conversion, including duplicates
                     // that are dropped. Otherwise `[huge, huge, ...]` can
@@ -1537,10 +1592,18 @@ impl<'p> Vm<'p> {
             let idx = v.heap_index();
             if self.json_plain_no_own_tojson(idx) && !self.json_default_protos_have_tojson() {
                 v
+            } else if matches!(
+                self.heap.get(idx),
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. }
+            ) {
+                // Step 2 reads `toJSON` only from an Object or a BigInt. A
+                // primitive string or symbol must not pick up a
+                // `String.prototype.toJSON` / `Symbol.prototype.toJSON`.
+                v
             } else {
                 let tj = self.get_prop(v, "toJSON")?;
                 if self.is_callable(tj) {
-                    let kv = self.alloc_str(key.to_string());
+                    let kv = self.alloc_key_str(key.to_string());
                     self.call_value(tj, v, &[kv])?
                 } else {
                     v
@@ -1552,7 +1615,7 @@ impl<'p> Vm<'p> {
         // A function `replacer` is applied after `toJSON`: replacer(key, value)
         // with `this` = the holder. Its result is what gets serialized.
         let v = if self.is_callable(replacer) {
-            let kv = self.alloc_str(key.to_string());
+            let kv = self.alloc_key_str(key.to_string());
             self.call_value(replacer, holder, &[kv, v])?
         } else {
             v
@@ -1600,9 +1663,11 @@ impl<'p> Vm<'p> {
             }
             // A boxed primitive serializes as ToString / ToNumber / its boolean —
             // observably invoking the wrapper's toString/valueOf (which may throw).
+            // The string is taken as a VALUE so its lone surrogates reach the
+            // quoter and print as `\udXXX`, not as U+FFFD.
             HeapObj::Boxed { kind: 0, .. } => {
-                let s = self.to_js_string(v)?;
-                self.json_quote_output(out, &s)?;
+                let s = self.to_str_value(v)?;
+                self.json_quote_heap_string_output(out, s.heap_index())?;
                 return Ok(true);
             }
             HeapObj::Boxed { kind: 1, .. } => {
@@ -1645,6 +1710,13 @@ impl<'p> Vm<'p> {
             }
             _ => {}
         }
+        // Step 11: a callable value is undefined (omitted, or `null` in an
+        // array). The function kinds are matched above; built-in constructors
+        // (`is_ctor` objects such as `Map`), class values and callable Proxies
+        // reach this point as objects and printed as `{}`.
+        if self.is_callable(v) {
+            return Ok(false);
+        }
         // SerializeJSONArray / SerializeJSONObject. Both read properties via REAL
         // [[Get]] (so getters / Proxy traps fire and abrupt completions propagate),
         // and detect cycles via `visited`. The PropertyList allowlist is GLOBAL — it
@@ -1658,6 +1730,12 @@ impl<'p> Vm<'p> {
         if depth >= MAX_JSON_NESTING_DEPTH {
             return Err(Thrown(
                 "RangeError: JSON nesting depth exceeds the sandbox limit".into(),
+            ));
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if depth >= MAX_JSON_STRINGIFY_DEPTH {
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
             ));
         }
         visited.push(idx);
@@ -1951,8 +2029,13 @@ impl<'p> Vm<'p> {
                                 return Err(e);
                             }
                         };
-                        owned_keys =
-                            self.json_clone_heap_key_values(kv, snapshot_budget, out.capacity())?;
+                        // Guest key TEXT back to the internal key form the
+                        // reads below (and the output's unescape) expect.
+                        owned_keys = self
+                            .json_clone_heap_key_values(kv, snapshot_budget, out.capacity())?
+                            .into_iter()
+                            .map(escape_guest_key)
+                            .collect();
                         &owned_keys
                     }
                 };
@@ -2160,6 +2243,9 @@ impl<'p> Vm<'p> {
                     Some(name) => name.to_string(),
                     None => json_parse_string(src, i)?.to_lossy_string(),
                 };
+                // A member name is a guest string key: "@@…" is escaped out of
+                // the symbol-key space (`escape_guest_key`).
+                let key = escape_guest_key(key);
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
                     return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));
@@ -2283,6 +2369,15 @@ impl<'p> Vm<'p> {
                 }
                 active.push(val.heap_index());
             }
+            // The ordinary profile has no active-path set, so a reviver that
+            // splices an ancestor back into the tree recursed until the native
+            // stack overflowed. The parse limit bounds any tree it produced.
+            #[cfg(not(feature = "safe-sandbox"))]
+            if depth >= MAX_JSON_PARSE_DEPTH {
+                return Err(Thrown(
+                    "RangeError: Maximum call stack size exceeded".into(),
+                ));
+            }
 
             // Keep this active-path entry across child getters, Proxy traps, and
             // child reviver calls. A prior child may replace a later child with
@@ -2327,8 +2422,10 @@ impl<'p> Vm<'p> {
                     // 2.c  keys = ? EnumerableOwnPropertyNames(val, key)  — proxy-aware
                     // (the ownKeys trap may throw), in integer-then-insertion order.
                     let keys_v = self.object_enum_own(val, crate::vm::EnumWhat::Keys)?;
+                    // Property KEYS (the walk's Get/Delete/CreateDataProperty and
+                    // the source map all use the internal form).
                     let keys: Vec<String> = match self.heap.get(keys_v.heap_index()) {
-                        HeapObj::Array(a) => a.iter().map(|&k| self.display(k)).collect(),
+                        HeapObj::Array(a) => a.iter().map(|&k| self.key_of(k)).collect(),
                         _ => Vec::new(),
                     };
                     for k in keys {
@@ -2353,7 +2450,7 @@ impl<'p> Vm<'p> {
             walk?;
         }
         let context = self.make_json_context(src);
-        let kv = self.alloc_str(key.to_string());
+        let kv = self.alloc_key_str(key.to_string());
         self.call_value(reviver, holder, &[kv, val, context])
     }
 
@@ -2489,6 +2586,9 @@ impl<'p> Vm<'p> {
                     Some(name) => name.to_string(),
                     None => json_parse_string(src, i)?.to_lossy_string(),
                 };
+                // A member name is a guest string key: "@@…" is escaped out of
+                // the symbol-key space (`escape_guest_key`).
+                let key = escape_guest_key(key);
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
                     return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));

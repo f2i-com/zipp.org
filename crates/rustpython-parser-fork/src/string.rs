@@ -19,6 +19,37 @@ use rustpython_parser_core::{
 // unicode_name2 does not expose `MAX_NAME_LENGTH`, so we replicate that constant here, fix #3798
 const MAX_UNICODE_NAME: usize = 88;
 
+/// The character a `\N{...}` escape names, from the bundled table of common
+/// names and aliases (see `gen_unicode_names.py`) or the algorithmic CJK
+/// ideograph names. Like CPython, names compare case-insensitively.
+fn character_named(name: &str) -> Option<char> {
+    if let Some(hex) = name
+        .get(..22)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("CJK UNIFIED IDEOGRAPH-"))
+        .and_then(|_| name.get(22..))
+    {
+        // The name's own spelling: four digits, or five without a leading zero.
+        if (hex.len() == 4 || (hex.len() == 5 && !hex.starts_with('0')))
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            let code = u32::from_str_radix(hex, 16).ok()?;
+            return crate::unicode_names::CJK_UNIFIED
+                .iter()
+                .any(|(lo, hi)| (*lo..=*hi).contains(&code))
+                .then(|| char::from_u32(code))
+                .flatten();
+        }
+        return None;
+    }
+    crate::unicode_names::NAMES.lines().find_map(|line| {
+        let (hex, entry) = line.split_once(' ')?;
+        entry
+            .eq_ignore_ascii_case(name)
+            .then(|| u32::from_str_radix(hex, 16).ok().and_then(char::from_u32))
+            .flatten()
+    })
+}
+
 struct StringParser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     kind: StringKind,
@@ -136,8 +167,15 @@ impl<'a> StringParser<'a> {
             ));
         }
 
-        unicode_names2::character(&name)
-            .ok_or_else(|| LexicalError::new(LexicalErrorType::UnicodeError, start_pos))
+        character_named(&name).ok_or_else(|| {
+            LexicalError::new(
+                LexicalErrorType::OtherError(format!(
+                    "(unicode error) \\N{{{name}}}: unknown Unicode character name \
+                     (this build knows common names only; spell the character or use \\u/\\U)"
+                )),
+                start_pos,
+            )
+        })
     }
 
     fn parse_escaped_char(&mut self) -> Result<String, LexicalError> {

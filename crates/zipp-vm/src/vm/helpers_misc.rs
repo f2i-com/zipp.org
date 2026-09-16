@@ -1095,7 +1095,12 @@ pub(crate) extern "win64" fn jit_get_index(
     // user code, and parity with the interpreter is what makes this sound.
     if key.is_heap() {
         let oidx = arr.heap_index();
-        if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(key.heap_index()) {
+        // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
+        if let Some(std::borrow::Cow::Borrowed(b)) = vm
+            .heap
+            .str_wtf8_cow(key.heap_index())
+            .filter(|b| !b.starts_with(b"@@"))
+        {
             if let Ok(k) = std::str::from_utf8(b) {
                 if !(oidx == vm.global_this && vm.global_this != 0)
                     && !(!vm.module_namespaces.is_empty()
@@ -1291,11 +1296,16 @@ pub(crate) extern "win64" fn jit_set_index(
             && !vm.arr_props.contains_key(&oidx)
         {
             let mut writable_slot = None;
-            if let Some(std::borrow::Cow::Borrowed(bytes)) = vm.heap.str_wtf8_cow(key.heap_index())
+            // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
+            if let Some(std::borrow::Cow::Borrowed(bytes)) = vm
+                .heap
+                .str_wtf8_cow(key.heap_index())
+                .filter(|b| !b.starts_with(b"@@"))
             {
                 if let Ok(k) = std::str::from_utf8(bytes) {
+                    // (A class prototype's writes must reach `set_prop`.)
                     if let HeapObj::Object(m) = vm.heap.get(oidx) {
-                        if let Some(i) = m.pos(k) {
+                        if let Some(i) = m.pos(k).filter(|_| !m.class_proto) {
                             let a = m.attr_at(i);
                             if !a.accessor && a.writable && !m.val_at(i).is_uninitialized() {
                                 writable_slot = Some(i);
@@ -4441,6 +4451,10 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     }
     // Pre-checks against a shared borrow (the write below re-borrows mutably).
     let own = match vm.heap.get(idx) {
+        // A class's prototype object: every write must reach `set_prop`, which
+        // records when it makes the class's member tables stale — never an
+        // own way whose hits would store with no call at all.
+        HeapObj::Object(map) if map.class_proto => return crate::codegen::PROP_VIA_IC,
         HeapObj::Object(map) => match map.pos(key) {
             // An accessor's SETTER must run (user code) — the interpreter-IC
             // slow helper frame-calls it. B114: fill an OWN accessor way first
@@ -4628,9 +4642,9 @@ pub(crate) extern "win64" fn jit_ic_base(vm: *mut core::ffi::c_void) -> *const c
 
 /// Win64 helper: the base pointer of `vm.globals`, fetched once by an OSR loop
 /// region's prologue and pinned in a callee-saved register for direct
-/// `LoadGlobal`/`StoreGlobal`. Sound because `globals` is allocated once at VM
-/// construction (`global_count + FIELD_POOL + EVAL_POOL` slots) and never
-/// reallocates at runtime.
+/// `LoadGlobal`/`StoreGlobal`. Sound because `globals` reserves its capacity
+/// once at VM construction (`global_count + FIELD_POOL + EVAL_POOL` slots) and
+/// never reallocates at runtime.
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm` that outlives the region run.
@@ -4734,17 +4748,11 @@ pub(crate) extern "win64" fn jit_math_two(code: u32, a_bits: u64, b_bits: u64) -
                 a.max(b)
             }
         }
-        // Hypot over exactly two args: a ±Inf operand forces +Inf even with a NaN
-        // partner (eval_math_args sets hypot_inf and returns +Inf). Otherwise the
-        // reduction is acc=0; acc += a*a; acc += b*b; then sqrt — i.e.
-        // sqrt(a*a + b*b), evaluated in that order.
-        M::Hypot => {
-            if a.is_infinite() || b.is_infinite() {
-                f64::INFINITY
-            } else {
-                (a * a + b * b).sqrt()
-            }
-        }
+        // Hypot over exactly two args, through the one scaled implementation
+        // the interpreter uses, so the tiers cannot disagree: a ±Inf operand
+        // forces +Inf even with a NaN partner, and a representable result is
+        // not lost to an intermediate overflow (`Math.hypot(1e300, 1e300)`).
+        M::Hypot => crate::vm::helpers_num2::hypot_scaled(&[a, b]),
         // Unary ops never reach here (codegen routes argc==1 to jit_math_unary).
         _ => f64::NAN,
     };
@@ -6845,7 +6853,10 @@ pub(crate) enum BigOp {
 /// fail for any other reason).
 pub(crate) fn parse_bigint_str(s: &str) -> Option<crate::vm::bigint::BigVal> {
     use crate::vm::bigint::BigVal;
-    let s = s.trim();
+    // StringToBigInt trims StrWhiteSpace, not Rust's: U+FEFF is whitespace
+    // (`BigInt("\u{FEFF}1")` is 1n, where `str::trim` left it a SyntaxError)
+    // and U+0085 is not.
+    let s = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
     let (neg, body, signed) = match s.strip_prefix('-') {
         Some(r) => (true, r, true),
         None => match s.strip_prefix('+') {

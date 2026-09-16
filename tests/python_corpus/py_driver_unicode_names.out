@@ -1,0 +1,68 @@
+1 0x41 b'A'
+1 0xe9 b'\xc3\xa9'
+1 0xdf b'\xc3\x9f'
+1 0x3a9 b'\xce\xa9'
+1 0x3c0 b'\xcf\x80'
+1 0x2014 b'\xe2\x80\x94'
+1 0x2013 b'\xe2\x80\x93'
+1 0x2026 b'\xe2\x80\xa6'
+1 0x201c b'\xe2\x80\x9c'
+1 0x201d b'\xe2\x80\x9d'
+1 0x2022 b'\xe2\x80\xa2'
+1 0x20ac b'\xe2\x82\xac'
+1 0xa3 b'\xc2\xa3'
+1 0xa5 b'\xc2\xa5'
+1 0xa9 b'\xc2\xa9'
+1 0xae b'\xc2\xae'
+1 0x2122 b'\xe2\x84\xa2'
+1 0xb0 b'\xc2\xb0'
+1 0xb5 b'\xc2\xb5'
+1 0xb1 b'\xc2\xb1'
+1 0xd7 b'\xc3\x97'
+1 0xf7 b'\xc3\xb7'
+1 0x2192 b'\xe2\x86\x92'
+1 0x21d0 b'\xe2\x87\x90'
+1 0x221e b'\xe2\x88\x9e'
+1 0x2260 b'\xe2\x89\xa0'
+1 0x2264 b'\xe2\x89\xa4'
+1 0x2211 b'\xe2\x88\x91'
+1 0x221a b'\xe2\x88\x9a'
+1 0x2500 b'\xe2\x94\x80'
+1 0x2588 b'\xe2\x96\x88'
+1 0x2605 b'\xe2\x98\x85'
+1 0x2603 b'\xe2\x98\x83'
+1 0x2713 b'\xe2\x9c\x93'
+1 0x2714 b'\xe2\x9c\x94'
+1 0x2717 b'\xe2\x9c\x97'
+1 0x1f40d b'\xf0\x9f\x90\x8d'
+1 0x1f600 b'\xf0\x9f\x98\x80'
+1 0x1f680 b'\xf0\x9f\x9a\x80'
+1 0xfffd b'\xef\xbf\xbd'
+1 0x3000 b'\xe3\x80\x80'
+1 0x4e2d b'\xe4\xb8\xad'
+1 0x6587 b'\xe6\x96\x87'
+NUL 0x0
+NULL 0x0
+TAB 0x9
+LINE FEED 0xa
+LF 0xa
+CR 0xd
+ESC 0x1b
+SP 0x20
+DEL 0x7f
+NBSP 0xa0
+SHY 0xad
+ZWJ 0x200d
+ZWSP 0x200b
+BOM 0xfeff
+VS16 0xfe0f
+BYTE ORDER MARK 0xfeff
+'caf\xe9' 4 True
+'21.5\xb0C \u2014 43 names'
+'\u2665 and\n\u263a'
+\N{EM DASH} 11
+b'\\N{EM DASH}' 11
+True
+'\u2022'
+'a \u2192 b'
+'1\xb72'

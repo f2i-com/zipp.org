@@ -51,6 +51,20 @@ const manifest = JSON.parse(await readFile(path.join(runtime, 'manifest.json'), 
 for (const name of names) {
   if (hash(await readFile(path.join(runtime, name))) !== manifest.files[name]) throw Error(`Playground engine pair mismatch: ${name}`)
 }
+// The pair must be a labelled build of the release the site announces: an
+// unlabelled (`source.sha: null`) or older pair can carry bugs that release
+// already fixed. A warning by default; `--require-release` (for release
+// checks) makes it an error. Refresh from the release's Python build with
+// --refresh-engine (see HANDOFF.md).
+const site = JSON.parse(await readFile(path.join(root, 'landing/package.json'), 'utf8'))
+const stale = []
+if (manifest.profile?.version !== site.version) stale.push(`engine ${manifest.profile?.version}, site ${site.version}`)
+if (!/^[0-9a-f]{40}$/.test(manifest.profile?.source?.sha ?? '')) stale.push('no source commit (an unlabelled local build)')
+if (stale.length) {
+  const message = `Playground engine pair is not a labelled ${site.version} release build: ${stale.join('; ')}.`
+  if (process.argv.includes('--require-release')) throw Error(message)
+  console.warn(`warning: ${message}`)
+}
 // Move glue and WASM URLs together when either half changes, including CDN caches.
 const build = hash(names.map(name => manifest.files[name]).join(':')).slice(0, 16)
 const workerPath = path.join(output, 'playground/engine.worker.js')

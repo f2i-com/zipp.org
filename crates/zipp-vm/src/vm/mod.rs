@@ -88,13 +88,41 @@ const MAX_TAIL_REUSE_STREAK: u32 = 1_000_000;
 /// native run, never concurrent), so this caps fields-per-region, not total.
 const FIELD_POOL: usize = 64;
 
-/// Extra global slots reserved past the JIT field pool for globals *created or
-/// first referenced inside `eval`* (sloppy `x = 1`, `var x`, hoisted function
-/// declarations, and reads of builtins the main program never named). Sized once
-/// at startup so the globals Vec never reallocates at runtime (the JIT pins its
-/// base pointer); `eval` draws from this pool by name and throws once it is
-/// exhausted rather than growing the Vec.
+/// Extra global slots reserved past the JIT field pool for every binding created
+/// after compile time: globals *created or first referenced inside `eval`* /
+/// `new Function` (sloppy `x = 1`, `var x`, hoisted function declarations, reads
+/// of builtins the main program never named), ShadowRealm names, and EVERY
+/// top-level binding of a loader-loaded ES module (exported or not) plus its
+/// namespace/source bookkeeping slots.
+///
+/// The CAPACITY is reserved once at startup so `globals` (and `global_gens`)
+/// never reallocate at runtime — the JIT pins both base pointers — while the
+/// LENGTH grows as slots are handed out (`Vm::alloc_global_pool_slot`), so GC
+/// root scans and resident-byte accounting see only slots in use. Exhaustion
+/// throws rather than growing the Vec. Native builds reserve address space
+/// generously (one bundled module can declare thousands of top-level
+/// functions; a 1024-slot pool failed real module graphs outright); the
+/// hardened and wasm profiles, whose reservation is real committed memory,
+/// keep the small pool.
+///
+/// NOT LARGER than this without fixing eval-global rooting first: past about
+/// 21,000 pool slots a function declared by one `eval` is collected while its
+/// slot still names it (it reads back as a swept object), which turns the
+/// clean "too many global bindings" error into silent wrong results. The
+/// defect is older than the pool size — reproduced by raising this constant
+/// alone on the base commit — but only a large pool makes it reachable.
+#[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+const EVAL_POOL: usize = 1 << 14;
+#[cfg(any(feature = "safe-sandbox", target_arch = "wasm32"))]
 const EVAL_POOL: usize = 1024;
+
+/// What an unnamed run-time pool slot binds (see `Vm::pool_slot_names`).
+pub(crate) enum PoolSlotName {
+    /// A module-scope declaration: uninitialized means its TDZ.
+    Module(Box<str>),
+    /// A ShadowRealm / createRealm name: uninitialized means never declared.
+    Realm(Box<str>),
+}
 
 /// Sentinel `closure` value for a frame whose callee is a plain (capture-free)
 /// function rather than a closure. Real heap indices are always `< u32::MAX`.
@@ -220,18 +248,35 @@ impl TiercActivationState {
     };
 }
 
-/// Largest length zipp will EAGERLY materialize for a dense array (`Vec<Value>`).
-/// The spec allows up to 2^32-1, but a dense Vec of that many `Value`s would be
-/// 32 GB; real engines store such arrays sparsely. Until zipp has sparse arrays,
-/// a `new Array(n)` / `arr.length = n` / defineProperty('length') / large-index
-/// assignment / array-like materialization beyond this cap throws a RangeError
-/// instead of OOMing the host. 2^22 elements ≈ 32 MB per array — far larger than
-/// any realistic program needs, while keeping a 12-way-parallel test262 run (each
-/// process possibly building several arrays) comfortably bounded.
+/// Largest length a HOLE-extending operation materializes in an array's dense
+/// store (`Vec<Value>`). The spec allows lengths up to 2^32-1, and a dense Vec
+/// that long would be 32 GB, so past this cap `new Array(n)`, `arr.length = n`
+/// and a large-index write do not grow the Vec: the array becomes VIRTUAL — its
+/// JS length lives in the `array_js_len` side table and any element past the
+/// dense prefix in the `arr_props` sparse overlay. Nothing throws there. Every
+/// builtin sizes its work from `js_array_len`, never from the Vec: a virtual
+/// array takes the generic per-index Get/HasProperty protocol, and an operation
+/// that has to build a dense result from one (spread, `slice`, `Array.from`,
+/// `with`, `fill` materializing the store) may do so up to
+/// [`MAX_MATERIALIZED_ARRAY_LEN`] and throws a RangeError beyond it — it never
+/// truncates. Arrays grown element by element (`push`) are not capped.
 #[cfg(feature = "safe-sandbox")]
 pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 22;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
+
+/// Largest dense array one native operation builds from a LENGTH rather than
+/// from elements that already exist: materializing a virtual array (see
+/// [`MAX_DENSE_ARRAY_LEN`]), draining an iterator eagerly, or copying an
+/// array-like by its `length`. Beyond it the operation throws a RangeError
+/// instead of attempting a multi-gigabyte allocation (`panic = "abort"` makes
+/// an allocation failure fatal). It is never below the dense cap, so any array
+/// the engine stores densely can still be copied.
+pub const MAX_MATERIALIZED_ARRAY_LEN: usize = if MAX_EAGER_ITER_RESULT > MAX_DENSE_ARRAY_LEN {
+    MAX_EAGER_ITER_RESULT
+} else {
+    MAX_DENSE_ARRAY_LEN
+};
 
 /// Maximum materialized string size. The hardened profile keeps a single
 /// allocation small enough that the periodic heap poll cannot overshoot a
@@ -246,12 +291,12 @@ pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
 /// by concatenating it. Chunking the encode does not help when the answer is
 /// the thing that will not fit.
 ///
-/// 2^24 units is 16.7M characters, and 2^25 bytes covers the worst-case WTF-8
-/// expansion of that. Both remain a fraction of the 128 MiB heap budget, which
-/// is what actually bounds total use — a program that builds these steadily
-/// still meets the budget, and one absurd request is still refused outright.
-/// The concern the old value names, a single allocation overshooting the
-/// host's budget by hundreds of megabytes, is untouched at this size.
+/// The hardened profile now allows 2^26 units (67M characters) and 2^27 bytes;
+/// the ordinary profile 2^28 of each. The byte cap is the one a builder of
+/// multi-byte text meets first, so every native builder admits its output in
+/// BYTES (`preflight_guest_string_size`) before it allocates, not only its
+/// length in units. A program that builds these steadily still meets the heap
+/// budget, and one absurd request is still refused outright.
 #[cfg(feature = "safe-sandbox")]
 pub const MAX_STRING_BYTES: usize = 1 << 27;
 #[cfg(not(feature = "safe-sandbox"))]
@@ -377,7 +422,38 @@ pub(crate) struct ArgsMap {
     mapped_count: usize,
     /// Bit i set = formal i SEVERED from the map (delete / accessor redefine /
     /// writable:false redefine) — permanently back to ordinary semantics.
+    /// Formals 0..64 live in `unmapped`; any past that (a sloppy function may
+    /// declare more) in `unmapped_hi`, which stays unallocated until needed.
     unmapped: u64,
+    unmapped_hi: Vec<u64>,
+}
+
+impl ArgsMap {
+    /// Has formal `i` been severed from the map?
+    #[inline]
+    fn is_unmapped(&self, i: usize) -> bool {
+        if i < 64 {
+            (self.unmapped >> i) & 1 == 1
+        } else {
+            let j = i - 64;
+            self.unmapped_hi
+                .get(j / 64)
+                .is_some_and(|w| (w >> (j % 64)) & 1 == 1)
+        }
+    }
+
+    /// Sever formal `i` from the map.
+    fn set_unmapped(&mut self, i: usize) {
+        if i < 64 {
+            self.unmapped |= 1 << i;
+        } else {
+            let j = i - 64;
+            if self.unmapped_hi.len() <= j / 64 {
+                self.unmapped_hi.resize(j / 64 + 1, 0);
+            }
+            self.unmapped_hi[j / 64] |= 1 << (j % 64);
+        }
+    }
 }
 
 /// One in-flight `AsyncDisposableStack.prototype.disposeAsync`: the spec's
@@ -1209,8 +1285,16 @@ pub struct Vm<'p> {
     /// compile-time `program.global_names`) to the EVAL_POOL slot it was assigned.
     /// Persists across `eval` calls so repeated evals see each other's globals.
     eval_global_map: std::collections::HashMap<String, u32>,
-    /// Next free EVAL_POOL slot. Starts at `global_count + FIELD_POOL`; bumped as
-    /// new eval globals are assigned, capped at `+ EVAL_POOL`.
+    /// Pool slots that deliberately have NO `eval_global_map` entry, by what
+    /// they bind: a loaded module's own declarations (per-module, so two
+    /// modules' same-named bindings never collide) and ShadowRealm names.
+    /// Consulted only when such a slot is read or written uninitialized, so
+    /// the error names the binding and no global-object fallback runs for a
+    /// name the incubating realm could shadow.
+    pool_slot_names: rustc_hash::FxHashMap<u32, PoolSlotName>,
+    /// Next free EVAL_POOL slot — always `globals.len()`. Starts at
+    /// `global_count + FIELD_POOL`; bumped as pool slots are handed out, capped
+    /// at `+ EVAL_POOL` (the reserved capacity).
     eval_global_next: u32,
     /// Every builtin global NAME → its heap value, recorded at setup regardless of
     /// whether the running program referenced it. Lets `eval`'d code resolve
@@ -1237,6 +1321,14 @@ pub struct Vm<'p> {
     /// the discriminator that makes the inline match the interpreter's live
     /// `class_values[id]` resolution (a mismatch falls to the helper).
     mi_class_epoch: u32,
+    /// Bumped whenever a class's member tables stop describing live objects:
+    /// the first divergence of its `C.prototype` (`ClassData::proto_dirty`) or
+    /// the first instance given an explicit `[[Prototype]]`
+    /// (`ClassData::reproto_instances`). Both flags are sticky, so this moves at
+    /// most twice per class. Every cache that resolved a member through the
+    /// tables — the interpreter's `Class*` IC ways and the JIT's class
+    /// method/accessor inline arms — bakes it and misses once it moves.
+    pub(crate) class_proto_epoch: u32,
     /// Q7 method/accessor-inline receiver recording: per `(func_id<<32)|ip`
     /// CallMethod/GetProp/SetProp site that resolved a Class method/getter/setter,
     /// the ≤8 distinct receiver Value-bits seen at IC-fill time (warmup). The JIT
@@ -1292,9 +1384,9 @@ pub struct Vm<'p> {
     heap: Heap,
     globals: Vec<Value>,
     /// Raw base of `globals`, loaded by Tier-C code through the live VM on
-    /// entry. The vector is allocated to its final FIELD_POOL + EVAL_POOL
-    /// extent at boot and never grows, so moving `Vm` does not invalidate the
-    /// allocation address. Kept explicit: emitted code must not depend on
+    /// entry. The vector's capacity is reserved to its final FIELD_POOL +
+    /// EVAL_POOL extent at boot and never exceeded, so neither growing its
+    /// length nor moving `Vm` invalidates the allocation address. Kept explicit: emitted code must not depend on
     /// Rust's private `Vec` field layout.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     globals_raw: u64,
@@ -1334,6 +1426,10 @@ pub struct Vm<'p> {
     /// two buffers can be merged back into one chronological log. One byte
     /// per line; the lines themselves are stored once, above.
     pub console_order: Vec<ConsoleStream>,
+    /// When set, console lines go to this sink as they are produced instead
+    /// of into the buffers above (a CLI that prints progress while a long
+    /// program runs). `None` everywhere else.
+    pub(crate) console_sink: Option<Box<dyn FnMut(ConsoleStream, &str)>>,
     /// Embedder host hook, backing the `HOST_CALL` native. `None` in every
     /// engine-internal path (`run`, `run_module_file`, the CLI, test262), so a
     /// stock build has no host surface at all; only `crate::embed` installs one.
@@ -1433,6 +1529,23 @@ pub struct Vm<'p> {
     /// small nesting stack in the VM root set instead of disabling GC across
     /// arbitrary JavaScript.
     promise_resolution_roots: Vec<u32>,
+    /// Test262 host reporting (`ZIPP_REPORT_UNHANDLED=1`, which
+    /// tools/run_test262.py sets): promises that a THROWING JOB rejected while
+    /// no handler was attached, in rejection order. GC ROOTS: a `.then`
+    /// dependent is unreachable once its reaction has run, and that is exactly
+    /// the rejection being reported. `report_unhandled_errors` names the ones
+    /// still unhandled at exit. Never pushed when reporting is off.
+    unhandled_rejections: Vec<u32>,
+    /// Set only while `reject_thrown_job` is settling a promise, so `settle`
+    /// can tell an exception that escaped a job from an ordinary
+    /// `reject(value)`. Test262 scores the first as a lost failure and the
+    /// second not at all.
+    rejecting_thrown_job: bool,
+    /// Marker lines for exceptions that escaped a `setTimeout` callback,
+    /// recorded only while reporting is on (the event loop otherwise drops
+    /// them, as it has no HostReportErrors hook).
+    uncaught_timer_errors: Vec<String>,
+    report_unhandled: bool,
     /// The `.raw` array of a tagged-template strings object, keyed by the cooked
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).
@@ -1487,6 +1600,12 @@ pub struct Vm<'p> {
     /// and integers — never traced, never pruned.
     matchall_caps_scratch: Vec<Option<std::ops::Range<usize>>>,
     matchall_flat_scratch: Vec<u32>,
+    /// The UTF-16 code units of the last non-ASCII RegExp exec subject, so a
+    /// global exec/match/split/replace loop over one string encodes it once
+    /// instead of once per exec (see [`proxy_regexp::RegexSubjectUnits`]).
+    /// Integers only: never traced; a major GC drops it with its subject.
+    #[cfg(not(feature = "safe-sandbox"))]
+    regex_subject_units: Option<proxy_regexp::RegexSubjectUnits>,
     /// Native bytes owned by completed RegExp matches that an outer operation
     /// retains while guest code can re-enter the VM (notably functional
     /// replacement callbacks). `heap_bytes()` cannot see those Rust-local
@@ -1612,6 +1731,16 @@ pub struct Vm<'p> {
     /// first access and cached here. For a class it carries the own methods +
     /// `constructor`; for a plain function just `constructor`.
     prototypes: std::collections::HashMap<u32, u32>,
+    /// Reverse of `prototypes` for CLASS values only: materialized prototype
+    /// object → its class. Consulted (behind `ObjMap::class_proto`) when such a
+    /// prototype is mutated; an entry is trusted only while `prototypes` still
+    /// pairs the two. Pruned with the other slot-keyed tables.
+    class_proto_owner: rustc_hash::FxHashMap<u32, u32>,
+    /// A built-in constructor object's `name` as created ([[InitialName]]),
+    /// captured just before the first redefinition or deletion of its own
+    /// `name` so `Function.prototype.toString` keeps rendering a well-formed
+    /// NativeFunction. Pruned with the other slot-keyed tables.
+    ctor_initial_name: rustc_hash::FxHashMap<u32, String>,
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
     proto_of: crate::slot_table::SlotTable<Value>,
@@ -1729,9 +1858,9 @@ pub struct Vm<'p> {
     /// (one 32-bit compare) instead of re-checking the callee bits+version per
     /// execution — sound only for slots NO bytecode store can ever hit (see
     /// `bytecode_stored_slots`), which makes the enumerated Rust writers
-    /// exhaustive. Sized with `globals` at boot and NEVER reallocated (the JIT
-    /// bakes element addresses); module bookkeeping draws from that same
-    /// preallocated pool.
+    /// exhaustive. Reserved with `globals` at boot, grown in lockstep with it
+    /// and NEVER reallocated (the JIT bakes element addresses); module
+    /// bookkeeping draws from that same preallocated pool.
     global_gens: Vec<u32>,
     /// Global slots ANY bytecode store op targets (StoreGlobal / -Strict /
     /// -Resolved / -Dyn / EvalScopeSet), collected over the main program at
@@ -2332,14 +2461,6 @@ pub struct Vm<'p> {
     disposablestack_ctor: u32,
     disposablestack_proto: u32,
     dispose_stacks: std::collections::HashMap<u32, (Vec<Value>, bool)>,
-    /// Per-block `using`-declaration resource scopes, keyed by a monotonic id
-    /// (`using_next_id`) that the `OpenUsingScope` op hands back in a register.
-    /// Each value is the scope's list of disposers (a @@dispose method bound to its
-    /// resource value), pushed by `RegisterDisposable` and drained LIFO by
-    /// `DisposeScope` on block exit. The disposers are GC roots (see gc.rs); the
-    /// entry is removed when its `DisposeScope` runs.
-    using_resources: std::collections::HashMap<u32, Vec<Value>>,
-    using_next_id: u32,
     /// `AsyncDisposableStack` ctor + prototype, and the set of dispose-stack
     /// instances that are ASYNC (their `use` prefers @@asyncDispose and their
     /// disposal goes through `disposeAsync`, which returns a Promise).
@@ -2515,6 +2636,30 @@ pub struct Vm<'p> {
     default_array_iter: Value,
     /// The pristine %ArrayIteratorPrototype%.next (see default_array_iter).
     default_array_iter_next: Value,
+    /// The pristine `@@iterator` of the other kinds IterNext and spread walk
+    /// positionally (String.prototype / Map.prototype.entries /
+    /// Set.prototype.values / %TypedArray%.prototype.values) and the pristine
+    /// `next` of the String/Map/Set iterator prototypes (a TypedArray's
+    /// iterator is an Array Iterator). See `Vm::builtin_iter_pristine`.
+    /// The default `@@iterator` of Set.prototype (`values`), Map.prototype
+    /// (`entries`), String.prototype and %TypedArray%.prototype (`values`): the
+    /// positional for-of / spread / destructuring shortcuts for those kinds are
+    /// taken only while the method GetIterator reads is still this one
+    /// (`builtin_iter_pristine`).
+    default_set_iter: Value,
+    default_map_iter: Value,
+    default_string_iter: Value,
+    default_ta_iter: Value,
+    /// Memo for the prototype half of `builtin_iter_pristine`, per built-in
+    /// iterator prototype (Array, Set, Map, String): the heap versions and the
+    /// `next` slot/bits of the last successful proof. Pure cache — a hit
+    /// re-checks every version and the live `next` bits (an in-place
+    /// overwrite bumps no version), so nothing has to invalidate it.
+    iter_proto_memo: [std::cell::Cell<construct::IterProtoProof>; 4],
+    /// The same kind of memo for `builtin_iter_fast`'s holder half: per
+    /// Array / Set / Map / String prototype, `(heap version + 1, slot)` of
+    /// the own `@@iterator` data property last proven to be the default.
+    iter_method_memo: [std::cell::Cell<(u32, u32)>; 4],
     /// The single canonical %ThrowTypeError% intrinsic — shared by
     /// Function.prototype.{caller,arguments} and a strict (unmapped) arguments
     /// object's `callee` poison-pill, so all references compare `===`.
@@ -2646,7 +2791,14 @@ pub struct Vm<'p> {
     /// drain after it is gone. The collector traces this stack while guest
     /// getters and queued jobs run (ZA-05 and the 12 September input-root
     /// regression). Nested entries preserve their caller's stack prefix.
+    /// Native built-ins also park their working sets here (getter and trap
+    /// results collected across later guest re-entry — spread, rest,
+    /// Object.values/entries, CreateListFromArrayLike; 15 September audit).
     host_result_roots: Vec<Value>,
+    /// The first exception a `setTimeout` callback let escape. It ends the
+    /// event loop and becomes the program's error when the main job itself
+    /// completed normally (Node's uncaught-exception exit). Rooted.
+    uncaught_timer_throw: Option<Value>,
 }
 
 /// B191 memo widths (hot names; anything else takes the full per-call proof).
@@ -2745,7 +2897,7 @@ mod helpers_datetime;
 mod helpers_json;
 mod helpers_misc;
 pub(crate) mod helpers_num2;
-mod helpers_numeric;
+pub(crate) mod helpers_numeric;
 mod intl;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod iter_jit;
@@ -2836,10 +2988,20 @@ pub(crate) use object_literal_jit::*;
 
 impl<'p> Vm<'p> {
     /// Append one console line to its stream, recording the order so
-    /// `ScriptState::take_console` can merge the streams chronologically.
+    /// `ScriptState::take_console` can merge the streams chronologically, or
+    /// hand it straight to the embedder's console sink when one is set.
     /// Every console emission goes through here.
     #[inline]
     pub(crate) fn push_console_line(&mut self, line: String, to_stderr: bool) {
+        if let Some(sink) = self.console_sink.as_mut() {
+            let stream = if to_stderr {
+                ConsoleStream::Stderr
+            } else {
+                ConsoleStream::Stdout
+            };
+            sink(stream, &line);
+            return;
+        }
         if to_stderr {
             self.console_order.push(ConsoleStream::Stderr);
             self.errput.push(line);

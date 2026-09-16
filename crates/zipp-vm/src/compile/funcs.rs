@@ -117,7 +117,7 @@ impl<'a> FnCompiler<'a> {
         let mut names = with_rest(&params, &rest);
         names.extend(param_pattern_leaves(&f.params));
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
-        let captured = capture::captured_locals(&names, body);
+        let captured = capture::captured_locals(&names, Some(&f.params), body);
         self.stash_child_with_shadows(&names, body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
@@ -690,7 +690,10 @@ impl<'a> FnCompiler<'a> {
                     // the field name (incl. the literal "#field" for privates).
                     if matches!(finit, Some(e) if is_anonymous_fn_def(e)) {
                         let kr = self.temp();
-                        let cidx = self.add_string_const(fname);
+                        // The key as a guest string VALUE (an escaped "@@…"
+                        // name reads back as its text).
+                        let cidx = self
+                            .add_string_const(crate::vm::helpers_numeric::guest_key_text(fname));
                         self.emit(Instr::LoadConst { dst: kr, idx: cidx });
                         self.emit(Instr::SetFnNameFromKey {
                             func: v,
@@ -716,12 +719,25 @@ impl<'a> FnCompiler<'a> {
                         None => v,
                     };
                     let name_idx = self.string_name(fname);
-                    self.emit(Instr::SetProp {
-                        obj: cls,
-                        name: name_idx,
-                        val: v,
-                        strict: false,
-                    });
+                    // DefineField (CreateDataPropertyOrThrow), exactly as for an
+                    // instance field: a [[Set]] was rejected by the constructor's
+                    // own non-writable `name`/`length` (a TypeError in modules),
+                    // ran an inherited static setter, and lost to an own static
+                    // getter. A private `#field` keeps the private store.
+                    if fname.starts_with('#') {
+                        self.emit(Instr::SetProp {
+                            obj: cls,
+                            name: name_idx,
+                            val: v,
+                            strict: false,
+                        });
+                    } else {
+                        self.emit(Instr::DefineField {
+                            obj: cls,
+                            name: name_idx,
+                            val: v,
+                        });
+                    }
                     // InitializeFieldOrAccessor: this element's OWN
                     // `addInitializer` callbacks run once it is defined and
                     // before the next static element, so `this[name]` is already
@@ -804,10 +820,12 @@ impl<'a> FnCompiler<'a> {
                     let fid = static_block_fns[idx];
                     let save = self.next_reg;
                     let f = self.temp();
-                    self.emit(Instr::MakeFunc {
-                        dst: f,
-                        func_id: fid,
-                    });
+                    // A block that uses a local of the enclosing function has
+                    // upvalues, and only `MakeClosure` gives it the captured
+                    // environment: a bare `MakeFunc` left its first `UpvalGet`
+                    // indexing a missing upvalue, which panicked the engine.
+                    let has_upvalues = !self.cx.functions[fid as usize].upvalues.is_empty();
+                    self.emit_make_callable(f, fid, has_upvalues);
                     let trash = self.temp();
                     // A static block executes the compiler-created function
                     // with the class as its this-value; it must not perform an
@@ -1083,7 +1101,9 @@ impl<'a> FnCompiler<'a> {
                 if $decs.is_empty() {
                     None
                 } else {
-                    let (nm, computed) = match class_key_name($key) {
+                    let (nm, computed) = match class_key_name($key)
+                        .map(crate::vm::helpers_numeric::escape_guest_key)
+                    {
                         Ok(n) if computed_key($key).is_none() => (n, false),
                         _ => (String::new(), true),
                     };
@@ -1113,7 +1133,9 @@ impl<'a> FnCompiler<'a> {
             ($de:expr, $key:expr, $went:expr) => {
                 if let Some(ix) = $de {
                     if !$went {
-                        let nm = class_key_name($key).unwrap_or_default();
+                        let nm = class_key_name($key)
+                            .map(crate::vm::helpers_numeric::escape_guest_key)
+                            .unwrap_or_default();
                         let e = &mut plan.elements[ix as usize];
                         e.is_private = nm.starts_with('#');
                         // Only `[Symbol.x]` — a computed MEMBER expression —
@@ -1160,7 +1182,7 @@ impl<'a> FnCompiler<'a> {
                     };
                     let de = dec_elem!(dkind, m.is_static, &m.key, m.decorators, String::new());
                     let computed_before = computed.len();
-                    match class_key_name(&m.key) {
+                    match class_key_name(&m.key).map(crate::vm::helpers_numeric::escape_guest_key) {
                         Ok(name) => {
                             // A public INSTANCE member takes (or keeps) its
                             // source position on the prototype; a later
@@ -1285,7 +1307,7 @@ impl<'a> FnCompiler<'a> {
                         dec_named.push(de);
                         instance_order.push((0, fields.len() - 1));
                     }
-                    match class_key_name(&p.key) {
+                    match class_key_name(&p.key).map(crate::vm::helpers_numeric::escape_guest_key) {
                         Ok(name) => {
                             if !p.is_static
                                 && !name.starts_with('#')
@@ -1352,7 +1374,7 @@ impl<'a> FnCompiler<'a> {
                         String::new()
                     );
                     let cf_before = computed_fields_ordered.len();
-                    match class_key_name(&p.key) {
+                    match class_key_name(&p.key).map(crate::vm::helpers_numeric::escape_guest_key) {
                         // A COMPUTED key whose literal folds to a "#..." STRING
                         // is a PUBLIC property that merely looks private — route it
                         // through the computed path (define_field → an ordinary,
@@ -1973,7 +1995,7 @@ impl<'a> FnCompiler<'a> {
             names.push(sn.clone());
         }
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
-        let captured = capture::captured_locals(&names, body);
+        let captured = capture::captured_locals(&names, Some(&f.params), body);
         self.stash_child_with_shadows(&names, body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
@@ -2010,7 +2032,7 @@ impl<'a> FnCompiler<'a> {
         if let ast::ArrowBody::Block(b) = &a.body {
             names.extend(hoisted_var_names(&b.stmts));
         }
-        let captured = capture::captured_locals_arrow(&names, &a.body);
+        let captured = capture::captured_locals_arrow(&names, &a.params, &a.body);
         self.stash_arrow_child_with_shadows(&names, &a.body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_arrow_body(

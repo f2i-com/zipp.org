@@ -1380,16 +1380,24 @@ pub(crate) fn hoistable_length(
             | Instr::StoreGlobalStrict { .. }
             | Instr::StoreGlobalResolved { .. } => {}
             // Arithmetic / bitwise / comparison on the region's values. The
-            // MEM tier reaches these with unknown operand types, so an
-            // `Add` CAN run ToPrimitive on an object — but only on a value
-            // the region itself produced, and a user hook there would have
-            // to reach the hoisted global through a closure it cannot get
-            // without one of the rejected ops. The pre-B217 blacklist
-            // already accepted every op in this group; keeping them is what
-            // preserves the hoist's whole reason to exist.
-            Instr::Add { .. }
-            | Instr::AddInt { .. }
-            | Instr::AddRightPair { .. }
+            // MEM tier reaches these with unknown operand types, and no arm
+            // here runs user code natively: the numeric ones BAIL on a
+            // non-number, `Eq`/`Ne` compare strictly, and `Not`/`TypeOf*`/
+            // `IsArray` only inspect the value.
+            //
+            // `Add` and the string-building ops (`AddRightPair`,
+            // `StrConcatChain`, `StrAppendInPlace`, `Pad2Concat`,
+            // `Pad2Conditional`) are deliberately absent: their helpers run
+            // ToPrimitive in place, calling an object's `valueOf`/`toString`
+            // without leaving the region. The object need not be something
+            // the region built — a `LoadGlobal` hands it any closure over
+            // the hoisted global, which could then push to the array or
+            // rebind the global while the loop kept comparing against the
+            // entry length (`s = s + o` with a pushing `valueOf` stopped
+            // after 99 of 5000 iterations). No real13/hostile row hoists a
+            // region that contains one of them, so this costs nothing
+            // measured; the per-iteration `.length` read stays correct.
+            Instr::AddInt { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
             | Instr::Div { .. }
@@ -1406,21 +1414,28 @@ pub(crate) fn hoistable_length(
             | Instr::TypeOf { .. }
             | Instr::TypeOfIs { .. }
             | Instr::TypeOfSame { .. }
-            | Instr::IsArray { .. }
-            | Instr::StrConcatChain { .. }
-            | Instr::StrAppendInPlace { .. }
-            | Instr::Pad2Concat { .. }
-            | Instr::Pad2Conditional { .. } => {}
+            | Instr::IsArray { .. } => {}
             // Control flow inside the region.
             Instr::Jump { .. }
             | Instr::JumpIfTrue { .. }
             | Instr::JumpIfFalse { .. }
             | Instr::JumpIfNotLt { .. }
             | Instr::JumpIfNotLe { .. } => {}
-            // Reads. `GetIndex` reads an element; `LenOf` reads a length;
-            // `GetProp` is the hoisted read itself (and any sibling read —
-            // the unique-`length` check below still applies).
-            Instr::GetIndex { .. } | Instr::GetProp { .. } | Instr::LenOf { .. } => {}
+            // Reads. `GetIndex` reads an element and `LenOf` a length; both
+            // deopt instead of running an accessor, a Proxy trap or a user
+            // `charCodeAt`. `GetProp` is admitted ONLY as a `length` read —
+            // the hoisted read itself, which the uniqueness check below pins
+            // to one. Any other named read may hit a getter (an object
+            // literal's, a class's, via the accessor-way or PROP_VIA_IC arm)
+            // that the MEM tier frame-calls in place, with the same effect
+            // as a `valueOf` above.
+            Instr::GetIndex { .. } | Instr::LenOf { .. } => {}
+            Instr::GetProp { name, .. }
+                if proto
+                    .string_constants
+                    .get(*name as usize)
+                    .map(|s| s.as_str())
+                    == Some("length") => {}
             // The ONE call form proven read-only and length-preserving.
             Instr::CallMethod { name, .. }
                 if proto
@@ -1457,6 +1472,22 @@ pub(crate) fn hoistable_length(
     // by a loop that never took the branch. Same requirement, and same argument,
     // as constant hoisting in `plan_region::runs_every_iteration`.
     if !runs_every_iteration(code, s, e, get_ip) {
+        return None;
+    }
+    // ...and the prologue's write must not be visible on a path where the
+    // interpreter never ran the read. A `while` loop whose `continue` jumps back
+    // to the header before the read enters the region without ever assigning
+    // `dst`, and can leave through the header's exit before reaching it:
+    // `while (i < n) { i++; if (k !== needle) continue; size = table.length; }`
+    // returned the table size for a needle that was never found. Only a reader
+    // outside `(get_ip, e]` — after the region, or ahead of the read inside it —
+    // can observe that write.
+    if !def_runs_before_region_entry(code, s, get_ip)
+        && code
+            .iter()
+            .enumerate()
+            .any(|(ip, ins)| !(ip > get_ip && ip <= e) && instr_uses(ins).contains(&dst))
+    {
         return None;
     }
     // `dst` must be written ONLY by this GetProp in the region.

@@ -545,9 +545,14 @@ impl<'p> Vm<'p> {
                 }
                 HeapObj::Array(items) => {
                     let dense_len = items.len();
+                    // An index defineProperty'd with non-default attributes (an
+                    // accessor, say) lives in arr_props over a HOLE placeholder in
+                    // the dense range; it is still an own key.
+                    let overlay = self.arr_props.get(&idx).filter(|m| m.has_element_key());
                     for i in 0..dense_len {
                         // A hole is an absent element — not a reflectable own key.
-                        if !items[i].is_hole() {
+                        if !items[i].is_hole() || overlay.is_some_and(|m| m.element_pos(i).is_some())
+                        {
                             keys.push(i.to_string());
                         }
                     }
@@ -567,7 +572,12 @@ impl<'p> Vm<'p> {
                         sparse.sort_unstable();
                         keys.extend(sparse.into_iter().map(|n| n.to_string()));
                     }
-                    keys.push("length".to_string());
+                    // An arguments object's `length` is an ordinary (deletable)
+                    // arr_props entry, emitted — only while it exists — by the
+                    // named tail below; pushing it here too listed it twice.
+                    if !self.arguments_objs.contains_key(&idx) {
+                        keys.push("length".to_string());
+                    }
                     if let Some(m) = self.arr_props.get(&idx) {
                         // Named own props only — index keys in arr_props were
                         // covered by the dense range / sparse run above.
@@ -673,6 +683,17 @@ impl<'p> Vm<'p> {
                             .map_or(false, |m| m.pos(k).is_some())
                     };
                     let has_proto_early = self.callable_has_prototype(obj);
+                    // OrdinaryOwnPropertyKeys: assigned integer keys come first,
+                    // ascending — ahead of even the intrinsic length/name.
+                    if let Some(m) = self.fn_props.get(&idx) {
+                        keys.extend(
+                            spec_key_order(&m.keys)
+                                .into_iter()
+                                .map(|i| &m.keys[i])
+                                .take_while(|k| canonical_u32_key(k).is_some())
+                                .cloned(),
+                        );
+                    }
                     if has_length || fp_has("length") {
                         keys.push("length".to_string());
                     }
@@ -694,7 +715,7 @@ impl<'p> Vm<'p> {
                             m.keys
                                 .iter()
                                 .filter(|k| {
-                                    if is_hidden_key(k) {
+                                    if is_hidden_key(k) || canonical_u32_key(k).is_some() {
                                         return false;
                                     }
                                     match k.as_str() {
@@ -749,17 +770,25 @@ impl<'p> Vm<'p> {
                         keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
                     }
                 }
-                // A RegExp's only own property is `lastIndex` (plus any assigned).
+                // A RegExp's only own property is `lastIndex` (plus any assigned);
+                // assigned integer keys still sort first, ascending.
                 HeapObj::RegExp { .. } => {
+                    let assigned: Vec<String> = match self.arr_props.get(&idx) {
+                        Some(m) => spec_key_order(&m.keys)
+                            .into_iter()
+                            .map(|i| &m.keys[i])
+                            .filter(|k| !is_hidden_key(k) && k.as_str() != "lastIndex")
+                            .cloned()
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    let ints = assigned
+                        .iter()
+                        .take_while(|k| canonical_u32_key(k).is_some())
+                        .count();
+                    keys.extend(assigned[..ints].iter().cloned());
                     keys.push("lastIndex".to_string());
-                    if let Some(m) = self.arr_props.get(&idx) {
-                        keys.extend(
-                            m.keys
-                                .iter()
-                                .filter(|k| !is_hidden_key(k) && k.as_str() != "lastIndex")
-                                .cloned(),
-                        );
-                    }
+                    keys.extend(assigned[ints..].iter().cloned());
                 }
                 // Every REMAINING heap kind — a boxed Number/Boolean/Symbol/BigInt
                 // wrapper (kind != 0; kind 0 = String is handled above), Map, Set,
@@ -785,7 +814,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let names: Vec<Value> = keys.into_iter().map(|k| self.alloc_str(k)).collect();
+        let names: Vec<Value> = keys.into_iter().map(|k| self.alloc_key_str(k)).collect();
         Ok(self.alloc_array_current_realm(names))
     }
 
@@ -1109,6 +1138,16 @@ impl<'p> Vm<'p> {
             }
             p = next;
         }
+        // Class member tables describe a fixed chain: re-prototyping a class's
+        // prototype object retires its tables, and re-prototyping an instance
+        // makes its class's instances consult `proto_of` first.
+        if let HeapObj::Object(m) = self.heap.get(o.heap_index()) {
+            if m.class_proto {
+                self.note_class_proto_mutation(o.heap_index(), None);
+            } else if m.class.is_some() {
+                self.note_class_instance_reproto(o.heap_index());
+            }
+        }
         self.proto_of.insert(o.heap_index(), proto);
         // Replacing a live object's [[Prototype]] changes what every chain
         // lookup THROUGH it resolves — bump its version so version-guarded
@@ -1287,7 +1326,30 @@ impl<'p> Vm<'p> {
 
     /// Read a property-descriptor object's fields (present-or-absent) for
     /// `Object.defineProperty`. Throws if `desc` is not an object.
+    ///
+    /// Every field read can run a getter or a Proxy trap. `desc` itself may be
+    /// a fresh getter result the caller holds only in Rust, and the `value` /
+    /// `get` read early are Rust locals while the later fields' getters run,
+    /// so all three stay on the host-root stack for the read. Callers that run
+    /// further guest code while holding the returned Values root them again.
     pub(crate) fn read_descriptor(
+        &mut self,
+        desc: Value,
+    ) -> Result<
+        (
+            Option<Value>,
+            Option<Value>,
+            Option<Value>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+        ),
+        Thrown,
+    > {
+        self.with_host_roots(&[desc], |vm| vm.read_descriptor_fields(desc))
+    }
+
+    fn read_descriptor_fields(
         &mut self,
         desc: Value,
     ) -> Result<
@@ -1338,7 +1400,9 @@ impl<'p> Vm<'p> {
             None
         };
         let value = if self.has_property_str_dyn(desc, "value")? {
-            Some(self.get_prop(desc, "value")?)
+            let v = self.get_prop(desc, "value")?;
+            self.push_host_root(v);
+            Some(v)
         } else {
             None
         };
@@ -1355,6 +1419,7 @@ impl<'p> Vm<'p> {
             if g != Value::UNDEFINED && !self.is_callable(g) {
                 return Err(Thrown("TypeError: Getter must be a function".into()));
             }
+            self.push_host_root(g);
             Some(g)
         } else {
             None

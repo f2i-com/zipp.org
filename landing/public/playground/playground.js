@@ -4,7 +4,14 @@
 // `update`, `on_click`, `on_key`).
 "use strict";
 
-const DEADLINE_MS = 5000;          // a reply later than this restarts the engine
+// A reply later than this restarts the engine. A `zipp_gpu` graph does not
+// delay the reply that produced it: the adapter chains execution on its queue,
+// so it runs after the worker has answered. It does occupy the worker before
+// the next frame, so the budget still has to be small against this deadline.
+// The graph validator bounds that work per backend, and the slowest of them
+// (the JavaScript reference, 100M estimated operations) measured ~27 ms for an
+// MNIST-scale MLP training step of 58M — so no extra frame-level GPU cap.
+const DEADLINE_MS = 5000;
 const INSTRUCTION_BUDGET = 2e9;    // the engine's maximum lifetime budget
 const STORAGE_KEY = "zipp-playground-project";
 const MAX_CONSOLE_LINES = 2000;
@@ -87,22 +94,39 @@ function pickEntry() {
   project.entry = top.find((n) => n === "main.py") || top.find((n) => n === "main.js")
     || top.find((n) => languageOf(n)) || names.find((n) => languageOf(n)) || names[0] || null;
 }
+// Autosave notes are logged once per loaded project.
+const autosave = { refused: false, skipped: false };
 function save() {
-  try {
-    // Text is stored as is; binaries as base64 while the total stays small.
-    let budget = 3 * 1024 * 1024;
-    const files = [];
-    for (const [name, value] of project.files) {
-      if (isBinary(value)) {
-        if (value.bytes.length > budget) continue;
-        budget -= value.bytes.length;
-        files.push([name, { base64: bytesToBase64(value.bytes) }]);
-      } else {
-        files.push([name, value]);
-      }
+  // Text is stored as is; binaries as base64 while the total stays small.
+  let budget = 3 * 1024 * 1024;
+  const files = [];
+  let skipped = 0;
+  for (const [name, value] of project.files) {
+    if (isBinary(value)) {
+      if (value.bytes.length > budget) { skipped++; continue; }
+      budget -= value.bytes.length;
+      files.push([name, { base64: bytesToBase64(value.bytes) }]);
+    } else {
+      files.push([name, value]);
     }
+  }
+  try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ name: project.name, entry: project.entry, current: project.current, files }));
-  } catch { /* storage unavailable: edits live for the session only */ }
+  } catch (error) {
+    // Usually the browser's storage quota (about 5 MB). The previous snapshot
+    // must not survive either: the next visit would restore that older
+    // project in place of this one.
+    try { localStorage.removeItem(STORAGE_KEY); } catch { /* storage unavailable */ }
+    if (!autosave.refused) {
+      autosave.refused = true;
+      log(`Autosave is off for ${project.name}: this browser would not store it (${error && error.name ? error.name : "storage unavailable"}). Edits last for this session only.`, "note");
+    }
+    return;
+  }
+  if (skipped && !autosave.skipped) {
+    autosave.skipped = true;
+    log(`Autosave leaves out ${skipped} binary file(s) over its 3 MiB budget; after a reload, open the folder again to use them.`, "note");
+  }
 }
 function restore() {
   try {
@@ -121,6 +145,7 @@ function setProject(name, entries, entry, current) {
   project.name = name;
   project.files = new Map(entries);
   project.written = new Set();
+  autosave.refused = autosave.skipped = false;
   project.entry = entry && project.files.has(entry) ? entry : null;
   pickEntry();
   project.current = current && project.files.has(current) ? current : project.entry;
@@ -422,8 +447,10 @@ document.addEventListener("drop", async (event) => {
       folderName = folderName || entry.name;
       await readEntryTree(entry, "", files);
     } else if (item.kind === "file") {
+      // A loose file sits at the project root, as with "Open files": a
+      // prefix folder would hide it from imports and relative open().
       const file = item.getAsFile();
-      if (file) files.push({ file, relative: (folderName || "files") + "/" + file.name });
+      if (file) files.push({ file, relative: file.name });
     }
   }
   await loadFileObjects(files.filter(Boolean), folderName || "files");
@@ -552,8 +579,9 @@ function projectSources(language) {
   if (language === "python") {
     // Every file goes along by path: `.py` files are modules (packages by
     // folder), the rest is the program's filesystem; binaries as base64.
+    // Files an earlier run wrote are sent like any other, so a program sees
+    // its own saved state (and the user's edits to it) on the next run.
     for (const [name, value] of [...project.files].sort((a, b) => a[0].localeCompare(b[0]))) {
-      if (project.written.has(name)) continue;
       files[name] = isBinary(value) ? { base64: bytesToBase64(value.bytes) } : value;
     }
     return { files, order, entry: project.entry };
@@ -601,6 +629,8 @@ async function run() {
   el.consoleOut.replaceChildren();
   clearCanvas();
   const { files, order, entry } = projectSources(language);
+  // The "written" tags describe the latest run only.
+  if (project.written.size) { project.written = new Set(); renderFiles(); }
   const argv = programArgs();
   log(`▶ ${project.name} (${language}, entry ${project.entry}${argv.length ? ", args " + argv.join(" ") : ""})`, "note");
   el.run.disabled = true;
@@ -712,6 +742,13 @@ async function tick(now) {
 
 // ---- canvas rendering + input ---------------------------------------------
 const paint = { font: 14 };
+// Guest drawing is painted here, on the page's main thread, where no engine
+// deadline applies. Each text or label is cut at the JavaScript `ui` shim's
+// 4096-character limit (Python's `ui` accepts much longer strings), and one
+// frame paints at most MAX_FRAME_TEXT characters, so a program cannot stall
+// the tab with text shaping.
+const MAX_UI_TEXT = 4096;
+const MAX_FRAME_TEXT = 65536;
 function clearCanvas() {
   ctx.fillStyle = "#10141c";
   ctx.fillRect(0, 0, el.canvas.width, el.canvas.height);
@@ -725,6 +762,12 @@ function render(commands) {
   if (!Array.isArray(commands) || commands.length === 0) return;
   el.canvasHint.hidden = true;
   applyFont();
+  let textBudget = MAX_FRAME_TEXT;
+  const text = (value) => {
+    const s = String(value).slice(0, Math.min(MAX_UI_TEXT, textBudget));
+    textBudget -= s.length;
+    return s;
+  };
   for (const c of commands) {
     switch (c[0]) {
       case "canvas": {
@@ -736,7 +779,7 @@ function render(commands) {
       case "rect": ctx.fillStyle = c[5]; ctx.fillRect(c[1], c[2], c[3], c[4]); break;
       case "circle": ctx.fillStyle = c[4]; ctx.beginPath(); ctx.arc(c[1], c[2], Math.max(0, c[3]), 0, Math.PI * 2); ctx.fill(); break;
       case "line": ctx.strokeStyle = c[5]; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(c[1], c[2]); ctx.lineTo(c[3], c[4]); ctx.stroke(); break;
-      case "text": ctx.fillStyle = c[4]; ctx.fillText(c[3], c[1], c[2]); break;
+      case "text": ctx.fillStyle = c[4]; ctx.fillText(text(c[3]), c[1], c[2]); break;
       case "font": paint.font = Math.max(4, Math.min(200, c[1])); applyFont(); break;
       case "button": {
         const [, x, y, w, h, label] = c;
@@ -751,7 +794,7 @@ function render(commands) {
         ctx.fillStyle = "#e6edf3";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillText(label, x + w / 2, y + h / 2);
+        ctx.fillText(text(label), x + w / 2, y + h / 2);
         ctx.textAlign = "start";
         ctx.textBaseline = "alphabetic";
         break;

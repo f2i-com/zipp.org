@@ -176,6 +176,20 @@ impl<'a> FnCompiler<'a> {
             Binding::ClassName(_) => true, // the inner class-name binding is immutable
         };
         if is_const {
+            // A const that may still be in its TDZ (a later switch clause's
+            // write to an earlier clause's `const`): SetMutableBinding throws
+            // the uninitialized ReferenceError before the immutability
+            // TypeError, and `CellGet` performs exactly that check.
+            if let Binding::LocalCell(cell) = b {
+                if self.block_tdz_cells.contains(cell) || self.entry_tdz_cells.contains(cell) {
+                    let t = self.alloc_reg();
+                    self.emit(Instr::CellGet {
+                        dst: t,
+                        cell: *cell,
+                    });
+                    self.dec_next_reg(1);
+                }
+            }
             let e = self.alloc_reg();
             self.emit(Instr::NewError {
                 dst: e,
@@ -642,12 +656,24 @@ impl<'a> FnCompiler<'a> {
                 // A destructuring pattern: apply its parameter-level default to the
                 // incoming argument register (when undefined) BEFORE extracting.
                 Pattern::Object { .. } | Pattern::Array(_) => {
+                    // A function whose parameters may direct-eval boxes every
+                    // parameter slot: default and destructure the argument in
+                    // the cell, not the cell itself (which is never undefined
+                    // and bound `undefined`s — now GetIterator's TypeError).
+                    let reg = (i + 1) as Reg;
+                    let src = if self.cell_regs.contains(&reg) {
+                        let t = self.alloc_reg();
+                        self.emit(Instr::CellGet { dst: t, cell: reg });
+                        t
+                    } else {
+                        reg
+                    };
                     if let Some(default) = default {
-                        self.apply_default_in_place((i + 1) as Reg, default)?;
+                        self.apply_default_in_place(src, default)?;
                     }
                     self.declare_pattern(pat, false)?;
                     let save = self.next_reg;
-                    self.extract_pattern(pat, (i + 1) as Reg)?;
+                    self.extract_pattern(pat, src)?;
                     self.set_next_reg(save);
                 }
                 _ => {}
@@ -661,7 +687,18 @@ impl<'a> FnCompiler<'a> {
                 if let Some(rr) = self.rest_reg {
                     self.declare_pattern(rest, false)?;
                     let save = self.next_reg;
-                    self.extract_pattern(rest, rr)?;
+                    // A function whose parameters may direct-eval boxes every
+                    // slot, the synthetic rest one included: destructure the
+                    // array in the cell, not the cell (which bound `undefined`s
+                    // and now fails GetIterator).
+                    let src = if self.cell_regs.contains(&rr) {
+                        let t = self.alloc_reg();
+                        self.emit(Instr::CellGet { dst: t, cell: rr });
+                        t
+                    } else {
+                        rr
+                    };
+                    self.extract_pattern(rest, src)?;
                     self.set_next_reg(save);
                 }
             }

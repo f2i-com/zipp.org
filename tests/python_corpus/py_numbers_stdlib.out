@@ -1,0 +1,51 @@
+namedtuple NT(a=1, b='d') x ('a', 'b') P(x=3, y=4)
+json-floats {"loss": 1.0, "big": 1e+16, "neg0": -0.0, "tiny": 1e-07, "n": 123456789.0, "i": 1180591620717411303424}
+json-roundtrip float [1, 1.0, -0.0] 3.0 false
+json-keys {"b": 1, "10": 2, "2": 3} {"__proto__": 1, "a": 2} {"1": "int", "1": "str"}
+json-markers {"__big": "1, \"admin\": true"} {"__special": "alert(1)"} {"profile": {"__big": "x"}}
+json-keytypes {"1.5": 1, "1.0": 5, "Infinity": 3, "null": 4, "-0.0": 6} {"a": 1}
+json-special [NaN, Infinity, -Infinity] ['NaN', '-Infinity']
+json-sorted {"a": [1, {"c": 3, "d": 2}], "b": 1} {"1": 2, "2": 1}
+json-indent True True
+json-ascii "\u00e9\u007f" "é" {"k":1}
+json-hooks ['a'] [('a', 1), ('b', 2)] [('F', '1.5'), ('I', '2')]
+json-default [1, {"a": [1, 2]}, [1, 3]] {"o": "obj"}
+json-error ValueError Out of range float values are not JSON compliant: nan
+json-error TypeError keys must be str, int, float, bool or None, not tuple
+json-error TypeError Object of type object is not JSON serializable
+json-error TypeError '<' not supported between instances of 'int' and 'str'
+json-error JSONDecodeError Expecting value: line 3 column 2 (char 9)
+json-error JSONDecodeError Expecting ':' delimiter: line 1 column 6 (char 5)
+json-error JSONDecodeError Expecting value: line 1 column 1 (char 0)
+json-error JSONDecodeError Extra data: line 1 column 5 (char 4)
+json-cycle Circular reference detected
+math exp OverflowError math range error
+math exp2 OverflowError math range error
+math cosh OverflowError math range error
+math pow-range OverflowError math range error
+math pow-domain ValueError math domain error
+math pow-neg ValueError math domain error
+math ldexp OverflowError math range error
+math gamma OverflowError math range error
+math gamma0 ValueError math domain error
+math log0 ValueError math domain error
+math log1p ValueError math domain error
+math atanh ValueError math domain error
+math fmod ValueError math domain error
+math tan ValueError math domain error
+math sqrt-big OverflowError int too large to convert to float
+math log-base1 ZeroDivisionError float division by zero
+math floor-inf OverflowError cannot convert float infinity to integer
+math trunc-nan ValueError cannot convert float NaN to integer
+math round-inf OverflowError cannot convert float infinity to integer
+math fsum OverflowError intermediate overflow in fsum
+math lgamma OverflowError math range error
+math-ok 1.0 1.0 inf 0.0 8.98846567431158e+307 1e-323 5e-324 -0.0 0.0 1.4142135623730951e+308 inf
+math-bigint 2000.0 400.0 921.0340371976182 1100.0 4754.8875021634685 True True
+bisect 4 3 3 2 5 6 2
+ValueError lo must be non-negative
+insort [1, 5, 5, 7, 9] [('a', 1), ('b', 2), ('c', 3)] 1
+accumulate [10, 10, 20, 60] [5] [1, 3, 6] [3, 3, 3]
+ordereddict False True True True True True
+struct-p b'\x02ab\x00\x00' b'\x02ab' (b'hey',) b'\x00'
+re-reentrant x B y C z a31b322 -a-b--d- -a-😀-b- ['', '', ''] ['', 'a', '', 'b', 'c', '']

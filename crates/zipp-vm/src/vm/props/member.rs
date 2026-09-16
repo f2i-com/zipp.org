@@ -53,6 +53,23 @@ enum RegExpAccessor {
     Absent,
 }
 
+/// Where a class INSTANCE's own-miss lookup of `key` lands on its class
+/// chain's member tables (`Vm::class_member_lookup`).
+#[derive(Clone, Copy)]
+pub(crate) enum ClassLookup {
+    /// A declared method (a writable data property of that level's prototype).
+    Method(Value),
+    /// A declared accessor: its getter, or UNDEFINED for a setter-only one.
+    Accessor { getter: Value, setter: Value },
+    /// The tables stop describing the chain here: resume the ordinary lookup
+    /// on this object (an instance's explicit `[[Prototype]]`, or a diverged
+    /// level's live prototype object). NULL ends the chain.
+    Live(Value),
+    /// No table level declares `key`: the ordinary prototype walk from the
+    /// instance's class prototype decides.
+    Miss,
+}
+
 impl<'p> Vm<'p> {
     /// Walk a RegExp instance's PROTOTYPE CHAIN for one of %RegExp.prototype%'s
     /// accessor names, reporting whether the intrinsic getter is still what a
@@ -726,6 +743,221 @@ impl<'p> Vm<'p> {
         self.proto_member_get(eff, key, obj)
     }
 
+    /// Resolve `key` for class instance `inst` (heap index; its own map has
+    /// already missed) on the member tables of `class` and the classes it
+    /// extends.
+    ///
+    /// The tables are a cache of the classes' prototype objects, valid only
+    /// while `note_class_proto_mutation` has not flagged a level
+    /// (`proto_dirty`) and the instance itself was never re-prototyped. A
+    /// level that no longer qualifies hands the lookup to the live object.
+    /// Private names never live on a prototype, so they always read the tables.
+    #[inline]
+    pub(crate) fn class_member_lookup(&self, inst: u32, class: u32, key: &str) -> ClassLookup {
+        let public = key.as_bytes().first() != Some(&b'#');
+        let mut cur = Some(class);
+        let mut first = true;
+        while let Some(cidx) = cur {
+            let HeapObj::Class(c) = self.heap.get(cidx) else {
+                break;
+            };
+            if public {
+                if first && c.reproto_instances {
+                    if let Some(&p) = self.proto_of.get(&inst) {
+                        return ClassLookup::Live(p);
+                    }
+                }
+                if c.proto_dirty {
+                    // Resume at the NEAREST level whose prototype exists, not
+                    // at this farther diverged one: a nearer prototype can
+                    // still carry keys no table declares (`C.prototype.x = f`
+                    // while only `B.prototype` diverged), and its
+                    // `[[Prototype]]` links every farther level anyway.
+                    let mut lvl = Some(class);
+                    while let Some(l) = lvl {
+                        if let Some(&p) = self.prototypes.get(&l) {
+                            return ClassLookup::Live(Value::heap(p));
+                        }
+                        if l == cidx {
+                            break;
+                        }
+                        lvl = match self.heap.get(l) {
+                            HeapObj::Class(lc) => lc.parent,
+                            _ => None,
+                        };
+                    }
+                }
+            }
+            first = false;
+            if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
+                return ClassLookup::Method(*v);
+            }
+            let getter = c.getters.iter().find(|(k, _)| k == key).map(|(_, v)| *v);
+            // A setter-only accessor is still an own property of this level's
+            // prototype: it shadows a farther getter (Get → undefined).
+            let setter = if public {
+                c.setters.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+            } else {
+                None
+            };
+            if getter.is_some() || setter.is_some() {
+                return ClassLookup::Accessor {
+                    getter: getter.unwrap_or(Value::UNDEFINED),
+                    setter: setter.unwrap_or(Value::UNDEFINED),
+                };
+            }
+            cur = c.parent;
+        }
+        ClassLookup::Miss
+    }
+
+    /// Where class instance `inst`'s ordinary prototype walk resumes once no
+    /// member table declares the key: its explicit `[[Prototype]]`, else the
+    /// nearest class level whose prototype object exists (an unmaterialized
+    /// level cannot have been mutated, so its tables are all of it — and a
+    /// materialized level's `[[Prototype]]` already links every farther one),
+    /// else where the class chain leaves the classes. `&self`: nothing is
+    /// materialized here.
+    pub(crate) fn class_instance_live_proto(&self, inst: u32, class: u32) -> Value {
+        if let Some(&p) = self.proto_of.get(&inst) {
+            return p;
+        }
+        let mut cur = class;
+        loop {
+            if let Some(&p) = self.prototypes.get(&cur) {
+                return Value::heap(p);
+            }
+            let HeapObj::Class(c) = self.heap.get(cur) else {
+                break;
+            };
+            if c.extends_null {
+                return Value::NULL;
+            }
+            match c.parent {
+                Some(par) if matches!(self.heap.get(par), HeapObj::Class(_)) => cur = par,
+                // A built-in or plain-function parent: its prototype object.
+                Some(par) => {
+                    if let Some(&v) = self.fn_proto_override.get(&par) {
+                        return if v.is_heap() { v } else { Value::NULL };
+                    }
+                    if let Some(&p) = self.prototypes.get(&par) {
+                        return Value::heap(p);
+                    }
+                    if let HeapObj::Object(m) = self.heap.get(par) {
+                        if let Some(p) = m.get("prototype").filter(|_| m.is_ctor) {
+                            return p;
+                        }
+                    }
+                    break;
+                }
+                None => break,
+            }
+        }
+        if self.obj_proto != 0 {
+            Value::heap(self.obj_proto)
+        } else {
+            Value::NULL
+        }
+    }
+
+    /// Does `key` name a declared member (method, getter or setter) of `class`
+    /// or of any class it extends?
+    pub(crate) fn class_chain_declares(&self, class: u32, key: &str) -> bool {
+        let mut cur = Some(class);
+        while let Some(cidx) = cur {
+            match self.heap.get(cidx) {
+                HeapObj::Class(c) => {
+                    if c.methods.iter().any(|(k, _)| k == key)
+                        || c.getters.iter().any(|(k, _)| k == key)
+                        || c.setters.iter().any(|(k, _)| k == key)
+                    {
+                        return true;
+                    }
+                    cur = c.parent;
+                }
+                _ => break,
+            }
+        }
+        false
+    }
+
+    /// A mutation is about to land on object `obj_idx`. When that object is a
+    /// class's materialized prototype and the change can alter what the
+    /// class's member tables answer — `key` is declared by the class or an
+    /// ancestor (an assignment, redefinition or delete of it), or `key` is
+    /// `None` (freeze/seal/preventExtensions, a `[[Prototype]]` change) —
+    /// retire the tables for that level (`ClassData::proto_dirty`, sticky) and
+    /// advance `class_proto_epoch` so every class-keyed cache misses. Keys no
+    /// table declares cannot disagree with a table: a table miss already falls
+    /// through to the live chain.
+    pub(crate) fn note_class_proto_mutation(&mut self, obj_idx: u32, key: Option<&str>) {
+        if self.class_proto_owner.is_empty() {
+            return;
+        }
+        let Some(&class) = self.class_proto_owner.get(&obj_idx) else {
+            return;
+        };
+        if self.prototypes.get(&class) != Some(&obj_idx) {
+            return;
+        }
+        match self.heap.get(class) {
+            HeapObj::Class(c) if !c.proto_dirty => {}
+            _ => return,
+        }
+        if let Some(k) = key {
+            if !self.class_chain_declares(class, k) {
+                return;
+            }
+        }
+        if let HeapObj::Class(c) = self.heap.get_mut(class) {
+            c.proto_dirty = true;
+        }
+        self.class_proto_epoch = self.class_proto_epoch.wrapping_add(1);
+    }
+
+    /// `key` of object `obj_idx` is about to be redefined or deleted. For a
+    /// built-in constructor's `name`, keep the name it was created with
+    /// (`Vm::ctor_initial_name`) — the text `Function.prototype.toString`
+    /// renders must stay a well-formed NativeFunction.
+    pub(crate) fn note_ctor_name_mutation(&mut self, obj_idx: u32, key: &str) {
+        if key != "name" || self.ctor_initial_name.contains_key(&obj_idx) {
+            return;
+        }
+        let name = match self.heap.get(obj_idx) {
+            HeapObj::Object(m) if m.is_ctor => m
+                .get("name")
+                .filter(|v| v.is_heap() && self.heap.is_str_like(v.heap_index()))
+                .map(|v| self.display(v)),
+            _ => None,
+        };
+        if let Some(n) = name {
+            self.ctor_initial_name.insert(obj_idx, n);
+        }
+    }
+
+    /// Object `obj_idx` is getting an explicit `[[Prototype]]`. For a class
+    /// instance, flag its class (`ClassData::reproto_instances`, sticky) so its
+    /// instances' lookups consult `proto_of` before the member tables.
+    pub(crate) fn note_class_instance_reproto(&mut self, obj_idx: u32) {
+        let class = match self.heap.get(obj_idx) {
+            HeapObj::Object(m) => m.class,
+            _ => None,
+        };
+        let Some(class) = class else {
+            return;
+        };
+        let flipped = match self.heap.get_mut(class) {
+            HeapObj::Class(c) if !c.reproto_instances => {
+                c.reproto_instances = true;
+                true
+            }
+            _ => false,
+        };
+        if flipped {
+            self.class_proto_epoch = self.class_proto_epoch.wrapping_add(1);
+        }
+    }
+
     /// Property GET with an explicit `receiver` — the original object a lookup
     /// started from. It equals `obj` at the top level; during prototype-chain
     /// delegation `obj` advances up the chain while `receiver` stays the original,
@@ -793,33 +1025,28 @@ impl<'p> Vm<'p> {
                         // getter on the class chain inline — identical to the
                         // Object arm's resolution in the slow path, which would
                         // otherwise charge the whole exotic preamble to every
-                        // hot `obj.method()` / class-getter read. A chain miss
-                        // (or a non-Class link) bails to the slow path.
-                        let (mut method, mut getter) = (None, None);
-                        let mut c2 = Some(class);
-                        while let Some(cidx) = c2 {
-                            match self.heap.get(cidx) {
-                                HeapObj::Class(c) => {
-                                    if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
-                                        method = Some(*v);
-                                        break;
-                                    }
-                                    if let Some((_, v)) = c.getters.iter().find(|(k, _)| k == key) {
-                                        getter = Some(*v);
-                                        break;
-                                    }
-                                    c2 = c.parent;
-                                }
-                                _ => break,
+                        // hot `obj.method()` / class-getter read. A table level
+                        // that no longer describes its prototype continues the
+                        // walk on the live object; a chain miss (or a non-Class
+                        // link) bails to the slow path.
+                        match self.class_member_lookup(ci, class, key) {
+                            ClassLookup::Method(mv) => return Ok(mv),
+                            ClassLookup::Accessor { getter, .. } => {
+                                return if getter == Value::UNDEFINED {
+                                    Ok(Value::UNDEFINED)
+                                } else {
+                                    self.call_value(getter, receiver, &[])
+                                };
                             }
+                            ClassLookup::Live(p) => {
+                                if !p.is_heap() {
+                                    return Ok(Value::UNDEFINED);
+                                }
+                                cur = p;
+                                continue;
+                            }
+                            ClassLookup::Miss => break,
                         }
-                        if let Some(mv) = method {
-                            return Ok(mv);
-                        }
-                        if let Some(g) = getter {
-                            return self.call_value(g, receiver, &[]);
-                        }
-                        break;
                     }
                     Err(None) => {}
                 }
@@ -1076,7 +1303,21 @@ impl<'p> Vm<'p> {
                             Ok(raw)
                         };
                     }
-                    // Intrinsic: fall through to the slot-backed answers below.
+                    // Intrinsic: the slot-backed answers below are what the
+                    // getter computes FOR THIS RegExp — valid only when it is
+                    // the receiver. A Proxy over it, an object inheriting from
+                    // it, or a foreign Reflect.get receiver has no
+                    // [[OriginalFlags]]/[[OriginalSource]]: run the intrinsic
+                    // getter against that receiver (it throws, or answers for
+                    // %RegExp.prototype% itself).
+                    RegExpAccessor::Intrinsic if receiver != obj => {
+                        let eff = self
+                            .proto_of
+                            .get(&obj.heap_index())
+                            .and_then(|p| p.is_heap().then(|| p.heap_index()))
+                            .unwrap_or(self.regexp_proto);
+                        return self.proto_member_get(eff, key, receiver);
+                    }
                     RegExpAccessor::Intrinsic => {}
                 }
             }
@@ -1362,8 +1603,23 @@ impl<'p> Vm<'p> {
             }
             return Ok(match key {
                 "byteLength" => Value::num(len as f64),
-                // An immutable buffer is fixed-size and never resizable.
-                "maxByteLength" => Value::num(max.unwrap_or(len) as f64),
+                // Step 4 of the getter: a DETACHED buffer reports +0, not the
+                // maximum it was created with. `len` is already 0 for a
+                // detached buffer, so only the resizable arm needed this.
+                // (An immutable buffer is fixed-size and never resizable.)
+                "maxByteLength" => Value::num(match max {
+                    Some(_)
+                        if !shared
+                            && matches!(
+                                self.heap.get(ai),
+                                HeapObj::ArrayBuffer { detached: true, .. }
+                            ) =>
+                    {
+                        0.0
+                    }
+                    Some(m) => m as f64,
+                    None => len as f64,
+                }),
                 "immutable" if !shared => Value::bool(immut),
                 "growable" if shared => Value::bool(max.is_some()),
                 "resizable" if !shared => Value::bool(max.is_some() && !immut),
@@ -1377,13 +1633,13 @@ impl<'p> Vm<'p> {
                     } else {
                         self.arraybuffer_proto
                     };
-                    let proto = self
-                        .proto_of
-                        .get(&ai)
-                        .copied()
-                        .filter(|p| p.is_heap())
-                        .map(|p| p.heap_index())
-                        .unwrap_or(default);
+                    // A NULL entry (`Object.setPrototypeOf(buf, null)`) means no
+                    // prototype: nothing is inherited, `buf.slice` included.
+                    let proto = match self.proto_of.get(&ai).copied() {
+                        Some(p) if p.is_heap() => p.heap_index(),
+                        Some(_) => return Ok(Value::UNDEFINED),
+                        None => default,
+                    };
                     // Accessor-aware (mirrors the TypedArray arm): an inherited
                     // getter like Object.prototype.__proto__ is INVOKED with the
                     // buffer as receiver, not returned as a raw function value.
@@ -1778,29 +2034,25 @@ impl<'p> Vm<'p> {
                 // (return its func) or getter (invoke it with this = obj).
                 let class = map.class;
                 let is_ctor = map.is_ctor;
-                let (mut method, mut getter) = (None, None);
-                let mut cur = class;
-                while let Some(cidx) = cur {
-                    match self.heap.get(cidx) {
-                        HeapObj::Class(c) => {
-                            if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
-                                method = Some(*v);
-                                break;
-                            }
-                            if let Some((_, v)) = c.getters.iter().find(|(k, _)| k == key) {
-                                getter = Some(*v);
-                                break;
-                            }
-                            cur = c.parent;
+                if let Some(cidx) = class {
+                    match self.class_member_lookup(obj.heap_index(), cidx, key) {
+                        ClassLookup::Method(m) => return Ok(m),
+                        ClassLookup::Accessor { getter, .. } => {
+                            return if getter == Value::UNDEFINED {
+                                Ok(Value::UNDEFINED)
+                            } else {
+                                self.call_value(getter, receiver, &[])
+                            };
                         }
-                        _ => break,
+                        ClassLookup::Live(p) => {
+                            if !p.is_heap() {
+                                return Ok(Value::UNDEFINED);
+                            }
+                            return self
+                                .with_native_recursion_guard(|vm| vm.get_member(p, key, receiver));
+                        }
+                        ClassLookup::Miss => {}
                     }
-                }
-                if let Some(m) = method {
-                    return Ok(m);
-                }
-                if let Some(g) = getter {
-                    return self.call_value(g, receiver, &[]);
                 }
                 // Own + class miss: delegate up the prototype chain — an explicit
                 // `Object.create` proto, else a class instance's `C.prototype`
@@ -1830,7 +2082,18 @@ impl<'p> Vm<'p> {
             // inherited, so walk the `extends` chain (`C.method`, `Sub.parentStatic`).
             // A `static get name()` is invoked with `this` = the class value.
             HeapObj::Class(c) => {
-                if let Some(v) = c.statics.get(key) {
+                if let Some(i) = c.statics.pos(key) {
+                    let (a, v) = (c.statics.attr_at(i), c.statics.val_at(i));
+                    // An `Object.defineProperty(C, key, {get, set})` accessor
+                    // lives here too (getter in the value slot): invoke it with
+                    // the receiver rather than returning the raw getter.
+                    if a.accessor {
+                        return if v == Value::UNDEFINED {
+                            Ok(Value::UNDEFINED)
+                        } else {
+                            self.call_value(v, receiver, &[])
+                        };
+                    }
                     return Ok(v);
                 }
                 if let Some((_, g)) = c.static_getters.iter().find(|(k, _)| k == key) {
@@ -1858,7 +2121,18 @@ impl<'p> Vm<'p> {
                 // than the original receiver. The same call also covers a non-Class
                 // parent (a built-in constructor or plain function, so
                 // `class X extends Temporal.Y {}` inherits `Y.from`).
-                if let Some(pidx) = c.parent {
+                //
+                // An explicit `Object.setPrototypeOf(C, proto)` replaced that
+                // link: the recorded prototype (or null, ending the chain) wins
+                // over both the parent and %Function.prototype%.
+                let parent = c.parent;
+                if let Some(&p) = self.proto_of.get(&obj.heap_index()) {
+                    if !p.is_heap() {
+                        return Ok(Value::UNDEFINED);
+                    }
+                    return self.with_native_recursion_guard(|vm| vm.get_member(p, key, receiver));
+                }
+                if let Some(pidx) = parent {
                     return self.with_native_recursion_guard(|vm| {
                         vm.get_member(Value::heap(pidx), key, receiver)
                     });
@@ -2006,12 +2280,15 @@ impl<'p> Vm<'p> {
                 // intrinsic prototype (so `gen.constructor` is
                 // %GeneratorFunction%), else %Function.prototype% (call/apply/bind),
                 // then up to Object.prototype (toString/valueOf/hasOwnProperty/…).
-                let start = self
-                    .proto_of
-                    .get(&obj.heap_index())
-                    .and_then(|p| p.is_heap().then(|| p.heap_index()))
-                    .or_else(|| self.callable_dynfn_proto(obj.heap_index()))
-                    .unwrap_or(self.fn_proto);
+                // A NULL override (`Object.setPrototypeOf(f, null)`) ends the
+                // chain: nothing is inherited, matching [[HasProperty]].
+                let start = match self.proto_of.get(&obj.heap_index()) {
+                    Some(p) if !p.is_heap() => return Ok(Value::UNDEFINED),
+                    Some(p) => p.heap_index(),
+                    None => self
+                        .callable_dynfn_proto(obj.heap_index())
+                        .unwrap_or(self.fn_proto),
+                };
                 // Accessor-aware so an inherited getter on Function.prototype (or a
                 // dynamic-function intrinsic) is invoked with this = receiver.
                 self.proto_member_get(start, key, receiver)

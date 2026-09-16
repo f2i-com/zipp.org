@@ -4,6 +4,7 @@ The host executes float32 forward, backward and update nodes. Parameters live
 on the CPU between submissions; this is not TorchInductor or a CUDA device.
 """
 import torch
+import _zipp_tensor as _k
 from zipp_gpu import Graph
 
 _active = None
@@ -11,6 +12,27 @@ _active = None
 
 def active_capture():
     return _active
+
+
+def _snapshot(tensor):
+    # What a result's staleness is judged against: the storage object and
+    # its version. Rebinding a tensor's storage (`.data =`, in-place
+    # arithmetic) replaces the object; writing into it bumps the version.
+    return None if tensor is None else (tensor, tensor._s, _k.version(tensor._s))
+
+
+def _changed(tensor, snapshot):
+    if snapshot is None:
+        return tensor is not None
+    return tensor is not snapshot[0] or tensor._s is not snapshot[1] or _k.version(tensor._s) != snapshot[2]
+
+
+def _any_requires_grad(parents):
+    # A loop, not any() over a generator: every recorded node asks this.
+    for parent in parents:
+        if parent.requires_grad:
+            return True
+    return False
 
 
 def _sgd_configuration(optimizer):
@@ -54,10 +76,14 @@ class _Capture:
             key = id(value)
             shape = (1, value.shape[0]) if row else tuple(value.shape)
             if key not in self.inputs:
-                data = value.detach().tolist()
-                symbolic = _Tensor(self, self.graph.tensor([data] if row else data), requires_grad=value.requires_grad)
-                self.inputs[key] = (value, symbolic, data)
-                self.previous_grads[key] = None if value.grad is None else value.grad.detach().tolist()
+                # The graph copies the storage (one pass, no Python floats);
+                # staleness is checked against storage identity and version.
+                symbolic = _Tensor(self, self.graph.tensor(value._s, shape), requires_grad=value.requires_grad)
+                self.inputs[key] = (value, symbolic, (value._s, _k.version(value._s)))
+                grad = value.grad
+                # The data too: a gradient that is not the optimizer's own
+                # is accumulated into on the host.
+                self.previous_grads[key] = None if grad is None else _snapshot(grad) + (_k.copy(grad._s),)
                 self.input_metadata[key] = (tuple(value.shape), value.requires_grad)
             original, symbolic, snapshot = self.inputs[key]
             if tuple(symbolic.shape) != shape:
@@ -133,7 +159,7 @@ class _Tensor:
         # operation recording, but must not change a cached leaf's intrinsic flag.
         self.requires_grad = capture.training and (
             requires_grad if requires_grad is not None
-            else torch.is_grad_enabled() and any(p.requires_grad for p in parents)
+            else torch.is_grad_enabled() and _any_requires_grad(parents)
         )
         if self.requires_grad:
             capture.tape.append(self)
@@ -220,21 +246,23 @@ class GPUResult:
             gradient = capture.grads[id(entry[1])]
             previous = capture.previous_grads[id(entry[0])]
             if id(entry[0]) not in optimizer_ids and previous is not None:
-                data = [previous] if len(entry[1].shape) != len(entry[0].shape) else previous
-                gradient = gradient + capture.graph.tensor(data)
+                gradient = gradient + capture.graph.tensor(previous[3], tuple(entry[1].shape))
             outputs["grad" + str(i)] = gradient
         for i, entry in enumerate(capture.updates):
             outputs["weight" + str(i)] = entry[1]
         # Validate output/node budgets before claiming the single-use submission.
-        capture.graph.program(**outputs)
+        program = capture.graph._program(outputs)
         self._submitted = True
         def arrived(result):
             def read(name, shape):
-                data = result["outputs"][name]
-                value = torch.tensor(data["data"], dtype=torch.float32).reshape(shape)
-                if capture.training and not torch.isfinite(value).all().item():
+                # Outputs arrive as float32 storage the result owns: the
+                # tensor wraps it, with no per-element conversion.
+                data = result["outputs"][name]["data"]
+                if _k.size(data) != torch._numel(shape):
+                    raise RuntimeError("GPU output %s has %d elements, expected shape %s" % (name, _k.size(data), shape))
+                if capture.training and not _k.all_finite(data):
                     raise RuntimeError("GPU training produced non-finite values; parameters were not updated")
-                return value
+                return torch.Tensor(data, shape, torch.float32)
             try:
                 if capture.training:
                     try:
@@ -248,10 +276,9 @@ class GPUResult:
                 updates = [(entry[0], read("weight" + str(i), tuple(entry[0].shape))) for i, entry in enumerate(capture.updates)]
                 if capture.training:
                     for original, symbolic, snapshot in capture.inputs.values():
-                        if original.dtype != torch.float32 or original.detach().tolist() != snapshot:
+                        if original.dtype != torch.float32 or original._s is not snapshot[0] or _k.version(original._s) != snapshot[1]:
                             raise RuntimeError("GPU training result is stale; a captured tensor changed before completion")
-                        current_grad = None if original.grad is None else original.grad.detach().tolist()
-                        if current_grad != capture.previous_grads[id(original)]:
+                        if _changed(original.grad, capture.previous_grads[id(original)]):
                             raise RuntimeError("GPU training result is stale; a captured gradient changed before completion")
                         if (tuple(original.shape), original.requires_grad) != capture.input_metadata[id(original)]:
                             raise RuntimeError("GPU training result is stale; a captured tensor changed before completion")
@@ -269,7 +296,7 @@ class GPUResult:
                 on_error(error)
                 return
             callback(value)
-        capture.graph.submit(arrived, on_error, **outputs)
+        capture.graph._submit(arrived, on_error, outputs, True, program)
 
     def backward(self, *args, **kwargs):
         raise NotImplementedError("Call loss.backward() inside a torch.compile(training=True) function")
@@ -288,6 +315,8 @@ def compile(model=None, *, backend="zipp_gpu", training=False):
             raise RuntimeError("Nested compiled training calls are unsupported")
         capture = _Capture(training)
         convert = lambda value: capture.tensor(value) if isinstance(value, torch.Tensor) else value
+        # Eager ops look for graph tensors only while a call records.
+        torch._recording(1)
         try:
             _active = capture if training else None
             with torch.enable_grad() if training else torch.no_grad():
@@ -299,4 +328,5 @@ def compile(model=None, *, backend="zipp_gpu", training=False):
             return GPUResult(output)
         finally:
             _active = None
+            torch._recording(-1)
     return invoke

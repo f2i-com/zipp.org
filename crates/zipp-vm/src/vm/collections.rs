@@ -95,10 +95,11 @@ fn mix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// FNV-1a over a byte string (the string-content repr).
+/// FNV-1a over a byte string (the string-content repr), from a basis keyed by
+/// the per-process [`crate::heap::hash_seed`].
 #[inline]
 fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325 ^ crate::heap::hash_seed();
     for &b in bytes {
         h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3);
     }
@@ -219,11 +220,13 @@ impl CollIndex {
     }
 
     /// The table hash in the ordinary profile: `mix64`'s high half — bucket =
-    /// `tag & mask`.
+    /// `tag & mask`. Keyed by the per-process seed (numbers and object
+    /// identities hash their raw bits), so the bucket of a key is not
+    /// computable offline.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     fn tag(repr: u64) -> u32 {
-        (mix64(repr) >> 32) as u32
+        (mix64(repr ^ crate::heap::hash_seed()) >> 32) as u32
     }
 
     /// Composite ordered key for the hostile-code tree. The high half hashes
@@ -769,6 +772,63 @@ mod safe_index_tests {
         }
         for (pos, &key) in keys.iter().enumerate().step_by(97) {
             assert_eq!(index.find(&heap, &keys, key), None, "slot {pos} survived");
+        }
+    }
+}
+
+#[cfg(all(test, not(feature = "safe-sandbox")))]
+mod seeded_index_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// The unkeyed FNV-1a/splitmix tag every VM used before the per-process
+    /// seed: what an attacker can precompute offline.
+    fn public_tag(key: &str) -> u32 {
+        let mut h = 0xCBF2_9CE4_8422_2325u64;
+        for &b in key.as_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((h ^ (h >> 31)) >> 32) as u32
+    }
+
+    #[test]
+    fn a_precomputed_bucket_collision_family_spreads_under_the_process_seed() {
+        // 256 keys that all share bucket 0 of a 1,024-bucket table under the
+        // public mapping — a probe chain 256 long in every VM, before.
+        let mut keys = Vec::new();
+        let mut candidate = 0u64;
+        while keys.len() < 256 {
+            let key = format!("h{candidate:09}");
+            if public_tag(&key) & 1_023 == 0 {
+                keys.push(key);
+            }
+            candidate += 1;
+        }
+        let mut heap = Heap::new();
+        let vals: Vec<Value> = keys
+            .iter()
+            .map(|k| Value::heap(heap.alloc_str(k.clone())))
+            .collect();
+        let mut index = CollIndex::with_capacity(700);
+        assert_eq!(index.mask, 1_023);
+        let buckets: HashSet<usize> = vals
+            .iter()
+            .map(|&v| index.key_tag(&heap, v) as usize & index.mask)
+            .collect();
+        assert!(buckets.len() > keys.len() / 2, "Map/Set buckets: {}", buckets.len());
+        let tags: HashSet<u32> = keys
+            .iter()
+            .map(|k| crate::heap::prop_tag_of(k) & 1_023)
+            .collect();
+        assert!(tags.len() > keys.len() / 2, "property buckets: {}", tags.len());
+        // Still an exact index: every key found at its slot.
+        for (pos, &v) in vals.iter().enumerate() {
+            index.insert(&heap, v, pos as u32);
+        }
+        for (pos, &v) in vals.iter().enumerate() {
+            assert_eq!(index.find(&heap, &vals, v), Some(pos));
         }
     }
 }

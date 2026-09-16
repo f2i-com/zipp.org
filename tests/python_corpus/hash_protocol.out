@@ -1,0 +1,19 @@
+equal-keys {P(1,2): 'b', P(2,1): 'c'} 2 c True False
+set 2 True [P(0,0), P(1,1)]
+TypeError unhashable type: 'EqOnly'
+TypeError unhashable type: 'EqOnly'
+TypeError unhashable type: 'EqOnly'
+identity-hash 1 2 False True True
+same-hash ['a', 'b', 'c'] 3 True False True
+inherit-hash child True True
+keep-hash 1
+mutated-key False False False 1 ['stored']
+restored-key True stored
+cross-type-eq True True n True
+notimplemented False True True True
+unhashable-explicit True 1 True
+TypeError unhashable type: 'Ordered'
+builtin-hash-eq True True True True
+grouping [(0, 0, 5), (0, 1, 5), (1, 0, 5), (1, 1, 5), (2, 0, 5), (2, 1, 5)]
+dedupe 4 [P(0,0), P(1,0), P(2,0), P(3,0), P(0,0), P(1,0)]
+memo 3 4 4 2

@@ -4,6 +4,8 @@ import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
 import {createRuntime} from '../src/runtime.mjs';
 import {createZippGPUAdapter,createZippGPUHandler} from '../src/zipp-adapter.mjs';
+import {createPythonGPUAdapter} from '../src/zipp-python-adapter.mjs';
+import {existsSync} from 'node:fs';
 const program={version:1,nodes:[{id:0,op:'input',shape:[2],data:[3,7]}],outputs:[{name:'result',id:0}]};
 const call=(id=1)=>({id,kind:'gpu.execute',args:[structuredClone(program)]});
 function engine(){return {disposed:false,replies:[],resolveHostCallback(id,r){this.replies.push([id,r]);return true;}};}
@@ -46,4 +48,63 @@ test('guest callback and promise shim round-trip against documented queue shape 
   const e={disposed:false,resolveHostCallback(id,result){pending.get(id)?.(result);pending.delete(id);return true;}};
   const a=createZippGPUAdapter(e,rt,{allowExecute:true});await a.dispatch(queue.shift());
   assert.deepEqual((await future).outputs.result.data,[3,7]);assert.equal(pending.size,0);a.invalidate();rt.dispose();
+});
+
+// R244: an over-quota rejection used to be delivered synchronously inside
+// drain(); a callback that resubmits then recursed drain -> deliver ->
+// onDelivered -> drain until the stack overflowed with the Engine borrowed.
+// This mock throws on re-entry the way wasm-bindgen's borrow flag does.
+function reentrantEngine(){
+  const e={disposed:false,queue:[],next:0,depth:0,maxDepth:0,results:0,rejections:0,retries:0,maxRetries:Infinity,
+    submit(){this.queue.push({id:++this.next,kind:'gpu.execute',payload:structuredClone(program)});},
+    takeHostRequests(){if(this.depth)throw Error('recursive use of an object');const q=this.queue;this.queue=[];return q;},
+    pythonCall(name,[id,reply]){
+      if(this.depth)throw Error('recursive use of an object');
+      this.depth++;this.maxDepth=Math.max(this.maxDepth,this.depth);
+      try{if(reply.ok)this.results++;else{this.rejections++;if(this.retries++<this.maxRetries)this.submit();}return true;}
+      finally{this.depth--;}
+    }};
+  return e;
+}
+test('Python adapter: a callback that resubmits after LIMIT does not recurse into drain',async()=>{
+  const rt=await createRuntime({backend:'cpu-js'}),e=reentrantEngine();let a,errors=0;
+  a=createPythonGPUAdapter(e,rt,{allowExecute:true,maxPending:16,onDelivered:({error})=>{if(error)errors++;a.drain();}});
+  for(let i=0;i<17;i++)e.submit();
+  a.drain();assert.equal(e.maxDepth,0,'no delivery happens inside drain()');
+  for(let i=0;i<50&&(e.results<17||a.pending);i++)await a.idle();
+  assert.equal(e.results,17);assert.equal(e.rejections,1);assert.equal(e.maxDepth,1);assert.equal(errors,0);
+  a.invalidate();rt.dispose();
+});
+test('Python adapter: an endless retry loop against the lifetime quota stays asynchronous',async()=>{
+  const rt=await createRuntime({backend:'cpu-js'}),e=reentrantEngine();let a;e.maxRetries=40;
+  a=createPythonGPUAdapter(e,rt,{allowExecute:true,maxRequests:2,onDelivered:()=>a.drain()});
+  for(let i=0;i<3;i++)e.submit();
+  a.drain();
+  for(let i=0;i<1000&&e.rejections<=e.maxRetries;i++)await a.idle();
+  assert.equal(e.results,2);assert.equal(e.rejections,41);assert.equal(e.maxDepth,1);
+  a.invalidate();rt.dispose();
+});
+const playgroundRuntime=new URL('../../../../landing/public/playground-runtime/',import.meta.url);
+test('Python adapter: the real Engine stays usable and disposable after 17 submits with a retrying on_error',
+  {skip:!existsSync(new URL('zipp_wasm_bg.wasm',playgroundRuntime))&&'checked-in playground runtime not present'},async()=>{
+  const wasm=await import(new URL('zipp_wasm.js',playgroundRuntime));
+  await wasm.default({module_or_path:await readFile(new URL('zipp_wasm_bg.wasm',playgroundRuntime))});
+  const rt=await createRuntime({backend:'cpu-js'}),engine=new wasm.Engine();engine.setInstructionBudget(2e9);
+  let adapter,errors=0;
+  adapter=createPythonGPUAdapter(engine,rt,{allowExecute:true,maxPending:16,maxRequests:100000,
+    onDelivered:({error})=>{if(error)errors++;adapter.drain();}});
+  engine.initPythonProject({'main.py':['from zipp_gpu import Graph','done = []','failures = []',
+    'def ok(r):','    done.append(r["outputs"]["result"]["data"])',
+    'def failed(e):','    failures.append(e.code)','    submit()',
+    'def submit():','    g = Graph()','    g.submit(ok, failed, result=g.tensor([1.0, 2.0]))',
+    'for i in range(17):','    submit()',
+    'def report():','    print(len(done), failures)',''].join('\n')},'main.py',[]);
+  adapter.drain();
+  for(let i=0;i<50&&adapter.pending;i++)await adapter.idle();
+  await adapter.idle();
+  assert.equal(errors,0);
+  engine.pythonCall('report',[]);
+  assert.deepEqual(engine.takeConsole().map(x=>x.text),['17 [\'LIMIT\']']);
+  assert.equal(engine.disposed,false);engine.dispose();assert.equal(engine.disposed,true);
+  adapter.invalidate();rt.dispose();
 });

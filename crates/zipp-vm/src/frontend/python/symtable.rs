@@ -32,6 +32,9 @@ pub(super) enum SymKind {
     Global,
     /// A class-body binding: lives in the class namespace.
     ClassLocal,
+    /// In a comprehension compiled inline: a plain local of the enclosing
+    /// code, read and written in that code's own register.
+    Outer,
 }
 
 #[derive(Debug)]
@@ -52,22 +55,37 @@ pub(super) struct Scope {
     /// The scope defines `super`/`__class__` uses (methods) — needs the
     /// implicit `__class__` cell from the enclosing class body.
     pub uses_class_cell: bool,
-    /// Byte offset of the defining node, the emitter's key into the table.
-    pub offset: u32,
+    /// Names a walrus in this scope's own code binds. A read of such a local
+    /// is copied out of its register, so an operand already evaluated keeps
+    /// its value when a later operand of the same expression rebinds it.
+    pub walrus_targets: BTreeSet<String>,
+    /// A list, set or dict comprehension the emitter compiles inline in
+    /// the enclosing function or module code (PEP 709) rather than as a
+    /// code object of its own: not a generator expression, not in a class
+    /// body, with no nested scopes and no `super`. The enclosing code's
+    /// locals it uses are [`SymKind::Outer`], not cells.
+    pub inline: bool,
+    /// Source range (start, end) of the defining node, the emitter's key
+    /// into the table.
+    pub offset: (u32, u32),
     pub parent: Option<usize>,
     pub children: Vec<usize>,
 }
 
 pub(super) struct SymTable {
     pub scopes: Vec<Scope>,
-    pub by_offset: BTreeMap<u32, usize>,
+    /// Scopes by the full source range of their defining node. A start
+    /// offset alone is ambiguous: an unparenthesized generator expression
+    /// starts where its element does, and the element may be a
+    /// comprehension or a lambda.
+    pub by_offset: BTreeMap<(u32, u32), usize>,
 }
 
 /// Raw facts gathered by the first pass, resolved by the second.
 struct Raw {
     kind: ScopeKind,
     name: String,
-    offset: u32,
+    offset: (u32, u32),
     parent: Option<usize>,
     bound: BTreeSet<String>,
     used: BTreeSet<String>,
@@ -78,6 +96,7 @@ struct Raw {
     is_comprehension: bool,
     deleted: BTreeSet<String>,
     uses_class_cell: bool,
+    walrus_targets: BTreeSet<String>,
     children: Vec<usize>,
 }
 
@@ -90,15 +109,20 @@ type R<T> = Result<T, String>;
 
 pub(super) fn analyse(module: &[ast::Stmt], name: &str) -> R<SymTable> {
     let mut b = Builder {
-        raws: vec![Raw::new(ScopeKind::Module, name, 0, None)],
+        raws: vec![Raw::new(ScopeKind::Module, name, (0, 0), None)],
         current: 0,
     };
     b.stmts(module)?;
     resolve(b.raws)
 }
 
+fn range_key(node: &impl Ranged) -> (u32, u32) {
+    let range = node.range();
+    (u32::from(range.start()), u32::from(range.end()))
+}
+
 impl Raw {
-    fn new(kind: ScopeKind, name: &str, offset: u32, parent: Option<usize>) -> Self {
+    fn new(kind: ScopeKind, name: &str, offset: (u32, u32), parent: Option<usize>) -> Self {
         Raw {
             kind,
             name: name.to_owned(),
@@ -113,6 +137,7 @@ impl Raw {
             is_comprehension: false,
             deleted: BTreeSet::new(),
             uses_class_cell: false,
+            walrus_targets: BTreeSet::new(),
             children: Vec::new(),
         }
     }
@@ -125,7 +150,7 @@ impl Builder {
     fn use_(&mut self, name: &str) {
         self.raws[self.current].used.insert(name.to_owned());
     }
-    fn enter(&mut self, kind: ScopeKind, name: &str, offset: u32) -> usize {
+    fn enter(&mut self, kind: ScopeKind, name: &str, offset: (u32, u32)) -> usize {
         let parent = self.current;
         let id = self.raws.len();
         self.raws.push(Raw::new(kind, name, offset, Some(parent)));
@@ -174,7 +199,7 @@ impl Builder {
                     f.name.as_str(),
                     &f.args,
                     &f.body,
-                    u32::from(f.range().start()),
+                    range_key(f),
                 )?;
             }
             ast::Stmt::AsyncFunctionDef(f) => {
@@ -194,7 +219,7 @@ impl Builder {
                 let id = self.enter(
                     ScopeKind::Class,
                     c.name.as_str(),
-                    u32::from(c.range().start()),
+                    range_key(c),
                 );
                 self.stmts(&c.body)?;
                 self.leave(id);
@@ -246,9 +271,20 @@ impl Builder {
                 self.stmts(&w.orelse)?;
             }
             ast::Stmt::If(i) => {
-                self.expr(&i.test)?;
-                self.stmts(&i.body)?;
-                self.stmts(&i.orelse)?;
+                // An `elif` is an If alone in the orelse: walk the chain
+                // iteratively so its length costs no native stack.
+                let mut arm = i;
+                loop {
+                    self.expr(&arm.test)?;
+                    self.stmts(&arm.body)?;
+                    match arm.orelse.as_slice() {
+                        [ast::Stmt::If(next)] => arm = next,
+                        orelse => {
+                            self.stmts(orelse)?;
+                            break;
+                        }
+                    }
+                }
             }
             ast::Stmt::With(w) => {
                 for item in &w.items {
@@ -400,7 +436,7 @@ impl Builder {
         name: &str,
         args: &ast::Arguments,
         body: &[ast::Stmt],
-        offset: u32,
+        offset: (u32, u32),
     ) -> R<()> {
         let id = self.enter(ScopeKind::Function, name, offset);
         let mut params = Vec::new();
@@ -452,7 +488,7 @@ impl Builder {
     fn comprehension(
         &mut self,
         kind: &str,
-        offset: u32,
+        offset: (u32, u32),
         generators: &[ast::Comprehension],
         elts: &[&ast::Expr],
     ) -> R<()> {
@@ -511,6 +547,9 @@ impl Builder {
                 while self.raws[owner].is_comprehension {
                     owner = self.raws[owner].parent.expect("comprehension has a parent");
                 }
+                // A read of the target in the owner is copied out of its
+                // register (an inline comprehension writes that register).
+                self.raws[owner].walrus_targets.insert(name.to_owned());
                 if owner == self.current {
                     self.bind(name);
                 } else {
@@ -529,8 +568,18 @@ impl Builder {
                 }
             }
             ast::Expr::BinOp(b) => {
-                self.expr(&b.left)?;
-                self.expr(&b.right)?;
+                // A left-deep operator chain (`a + b + c ...`) is walked
+                // iteratively, leftmost operand first.
+                let mut rights = vec![b.right.as_ref()];
+                let mut left = b.left.as_ref();
+                while let ast::Expr::BinOp(inner) = left {
+                    rights.push(inner.right.as_ref());
+                    left = inner.left.as_ref();
+                }
+                self.expr(left)?;
+                for right in rights.into_iter().rev() {
+                    self.expr(right)?;
+                }
             }
             ast::Expr::UnaryOp(u) => self.expr(&u.operand)?,
             ast::Expr::Lambda(l) => {
@@ -539,7 +588,7 @@ impl Builder {
                 let id = self.enter(
                     ScopeKind::Function,
                     "<lambda>",
-                    u32::from(l.range().start()),
+                    range_key(l),
                 );
                 let mut params = Vec::new();
                 for a in l
@@ -584,25 +633,25 @@ impl Builder {
             }
             ast::Expr::ListComp(c) => self.comprehension(
                 "<listcomp>",
-                u32::from(c.range().start()),
+                range_key(c),
                 &c.generators,
                 &[&c.elt],
             )?,
             ast::Expr::SetComp(c) => self.comprehension(
                 "<setcomp>",
-                u32::from(c.range().start()),
+                range_key(c),
                 &c.generators,
                 &[&c.elt],
             )?,
             ast::Expr::DictComp(c) => self.comprehension(
                 "<dictcomp>",
-                u32::from(c.range().start()),
+                range_key(c),
                 &c.generators,
                 &[&c.key, &c.value],
             )?,
             ast::Expr::GeneratorExp(c) => self.comprehension(
                 "<genexpr>",
-                u32::from(c.range().start()),
+                range_key(c),
                 &c.generators,
                 &[&c.elt],
             )?,
@@ -676,6 +725,11 @@ fn unsupported(node: &impl Ranged, what: &str) -> String {
     )
 }
 
+/// The prefix of a class scope's synthetic symbol for a free variable the
+/// class passes through to nested scopes while also binding (or declaring
+/// global) the same name itself.
+const PASS_THROUGH: &str = "\u{0}free:";
+
 /// Second pass: classify every name in every scope.
 fn resolve(raws: Vec<Raw>) -> R<SymTable> {
     let n = raws.len();
@@ -728,9 +782,21 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             }
         }
     }
+    let fast = super::emitter::py_fast_paths();
+    let inline: Vec<bool> = raws
+        .iter()
+        .map(|raw| {
+            fast && raw.is_comprehension
+                && raw.name != "<genexpr>"
+                && raw.children.is_empty()
+                && !raw.uses_class_cell
+                && raw.parent.is_some_and(|p| raws[p].kind != ScopeKind::Class)
+        })
+        .collect();
     // Pass 2: a free variable in a scope makes the binding scope's symbol a
     // cell, and every intervening function/class scope passes it through as
-    // free too (so cells chain down through nesting).
+    // free too (so cells chain down through nesting). A local of the code an
+    // inline comprehension runs in stays a local.
     let mut changed = true;
     while changed {
         changed = false;
@@ -740,14 +806,18 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
                 .filter(|(_, k)| **k == SymKind::Free)
                 .map(|(name, _)| name.clone())
                 .collect();
-            for name in frees {
+            for key in frees {
+                // A class's synthetic pass-through entry stands for the plain
+                // name in every scope above it.
+                let name = key.strip_prefix(PASS_THROUGH).unwrap_or(&key);
                 let mut cur = raws[id].parent;
                 while let Some(p) = cur {
-                    let entry = kinds[p].get(&name).copied();
+                    let entry = kinds[p].get(name).copied();
                     let is_class_cell = name == "__class__" && raws[p].kind == ScopeKind::Class;
                     match entry {
+                        Some(SymKind::Local) if inline[id] && Some(p) == raws[id].parent => break,
                         Some(SymKind::Local) => {
-                            kinds[p].insert(name.clone(), SymKind::Cell);
+                            kinds[p].insert(name.to_owned(), SymKind::Cell);
                             changed = true;
                             break;
                         }
@@ -756,7 +826,7 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
                         _ if is_class_cell => {
                             // The class body owns the `__class__` cell.
                             if entry != Some(SymKind::Cell) {
-                                kinds[p].insert(name.clone(), SymKind::Cell);
+                                kinds[p].insert(name.to_owned(), SymKind::Cell);
                                 changed = true;
                             }
                             break;
@@ -766,19 +836,16 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
                         {
                             // Pass-through: this scope does not bind it (a class
                             // local is NOT visible to nested scopes).
-                            if raws[p].kind == ScopeKind::Function
-                                || raws[p].kind == ScopeKind::Class
-                            {
-                                if entry != Some(SymKind::Free)
-                                    && entry != Some(SymKind::ClassLocal)
-                                {
-                                    kinds[p].insert(name.clone(), SymKind::Free);
-                                    changed = true;
-                                } else if entry == Some(SymKind::ClassLocal) {
-                                    // Both: the class binds its own copy AND passes
-                                    // the outer cell through. Mark pass-through via
-                                    // a synthetic entry.
-                                    kinds[p].insert(format!("\u{0}free:{name}"), SymKind::Free);
+                            if entry.is_none() {
+                                kinds[p].insert(name.to_owned(), SymKind::Free);
+                                changed = true;
+                            } else {
+                                // Both: the class resolves its own binding (or its
+                                // `global` declaration) AND passes the outer cell
+                                // through, marked by a synthetic entry. Only a new
+                                // entry is a change, or the fixpoint never settles.
+                                let synthetic = format!("{PASS_THROUGH}{name}");
+                                if kinds[p].insert(synthetic, SymKind::Free).is_none() {
                                     changed = true;
                                 }
                             }
@@ -791,6 +858,40 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             }
         }
     }
+    // A `del` that reaches its binding through `nonlocal` unbinds the OWNER's
+    // variable, so the owner cannot treat the name as definitely assigned
+    // either: `y = 1` in a function, a nested `nonlocal y; del y`, and then a
+    // read of `y` must raise NameError rather than hand back the unbound
+    // sentinel. Only the deleting scope recorded it.
+    let mut deleted: Vec<BTreeSet<String>> = raws.iter().map(|r| r.deleted.clone()).collect();
+    for id in 0..n {
+        for name in deleted[id].clone() {
+            if kinds[id].get(&name) != Some(&SymKind::Free) {
+                continue;
+            }
+            let mut cur = raws[id].parent;
+            while let Some(p) = cur {
+                match kinds[p].get(&name) {
+                    Some(SymKind::Cell) | Some(SymKind::Local) => {
+                        deleted[p].insert(name.clone());
+                        break;
+                    }
+                    _ => cur = raws[p].parent,
+                }
+            }
+        }
+    }
+    for id in (0..n).filter(|id| inline[*id]) {
+        let parent = raws[id].parent.expect("a comprehension has a parent");
+        let outer: Vec<String> = kinds[id]
+            .iter()
+            .filter(|(name, k)| **k == SymKind::Free && kinds[parent].get(*name) == Some(&SymKind::Local))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in outer {
+            kinds[id].insert(name, SymKind::Outer);
+        }
+    }
     let mut scopes = Vec::with_capacity(n);
     let mut by_offset = BTreeMap::new();
     for (id, raw) in raws.into_iter().enumerate() {
@@ -798,12 +899,15 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
         let mut free_order: Vec<String> = symbols
             .iter()
             .filter(|(_, k)| **k == SymKind::Free)
-            .map(|(name, _)| name.trim_start_matches("\u{0}free:").to_owned())
+            .map(|(name, _)| name.strip_prefix(PASS_THROUGH).unwrap_or(name).to_owned())
             .collect();
         free_order.sort();
         free_order.dedup();
-        if raw.kind != ScopeKind::Module {
-            by_offset.insert(raw.offset, id);
+        if raw.kind != ScopeKind::Module && by_offset.insert(raw.offset, id).is_some() {
+            return Err(format!(
+                "Python: internal: two scopes share the source range {:?}",
+                raw.offset
+            ));
         }
         scopes.push(Scope {
             kind: raw.kind,
@@ -812,8 +916,10 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             params: raw.params,
             free_order,
             is_generator: raw.is_generator,
-            deleted: raw.deleted,
+            deleted: std::mem::take(&mut deleted[id]),
             uses_class_cell: raw.uses_class_cell,
+            walrus_targets: raw.walrus_targets,
+            inline: inline[id],
             offset: raw.offset,
             parent: raw.parent,
             children: raw.children,

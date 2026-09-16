@@ -9,8 +9,8 @@ import json
 import re
 import posixpath
 ROOT=Path(__file__).resolve().parents[1]
-FILES=["src/graph.mjs","src/backends/cpu.mjs","src/backends/wasm.mjs",
-       "src/backends/webgpu.mjs","src/backends/webgl2.mjs","src/runtime.mjs","tests/browser-cases.mjs"]
+FILES=["src/graph.mjs","src/kernel-math.mjs","src/backends/cpu.mjs","src/backends/wasm.mjs",
+       "src/backends/webgpu.mjs","src/backends/webgl2.mjs","src/runtime.mjs","tests/ml-cases.mjs","tests/browser-cases.mjs"]
 
 def bundle():
     result=["(() => { const modules = Object.create(null);"]

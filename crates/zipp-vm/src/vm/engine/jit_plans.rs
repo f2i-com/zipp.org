@@ -3553,8 +3553,8 @@ impl<'p> Vm<'p> {
         // the OUTER window to undefined — which covers the inner's `this` (strict,
         // plain call ⇒ undefined) and any params the call leaves unfilled — so the
         // splice only has to SEED the params that are passed, with plain `Move`s
-        // inserted after the guard marker. Pure ops: a later bail re-runs the whole
-        // outer call with nothing committed, so deopt-idempotency is untouched.
+        // inserted after the guard marker. The seeds are pure ops; whether a later
+        // bail commits nothing depends on the inner body, which is checked below.
         // The B75/B76 surveys showed `inner-call-has-args` was EVERY remaining
         // nested reject on the call-heavy rows (13 sites in parse-large-js alone).
         // Resolve the wrapper's own call site from ITS live IC.
@@ -3590,6 +3590,42 @@ impl<'p> Vm<'p> {
             )
         }) {
             nested_reject("inner-branchy");
+            return None;
+        }
+        // The effect-ordering rule across the JOIN. `callee_leaf_ok` and
+        // `callee_leaf_ok_one_call` each check their own body — no deopt-capable
+        // op after a committed `StoreGlobal*` — but the flat body runs the
+        // wrapper's remaining ops AFTER the inner's ops. A bail there re-runs the
+        // whole wrapper call from the call ip, so an inner global write (an LCG
+        // seed, an id counter) would be applied twice: `pick(o){ return next() %
+        // o.size }` with an occasional non-numeric operand advanced the seed once
+        // per bail. Buffered `UpvalSet`s commit after the last op and stay legal.
+        let inner_commits = inner_body.iter().any(|i| {
+            matches!(
+                i,
+                Instr::StoreGlobal { .. }
+                    | Instr::StoreGlobalStrict { .. }
+                    | Instr::StoreGlobalResolved { .. }
+            )
+        });
+        if inner_commits
+            && !outer_body[call_at + 1..].iter().all(|i| {
+                matches!(
+                    i,
+                    Instr::LoadInt { .. }
+                        | Instr::LoadConst { .. }
+                        | Instr::LoadBool { .. }
+                        | Instr::Move { .. }
+                        | Instr::LoadGlobal { .. }
+                        | Instr::StoreGlobal { .. }
+                        | Instr::StoreGlobalStrict { .. }
+                        | Instr::StoreGlobalResolved { .. }
+                        | Instr::Return { .. }
+                        | Instr::ReturnUndefined
+                )
+            })
+        {
+            nested_reject("inner-effect-before-outer-deopt");
             return None;
         }
         // Shift every inner register above the outer window.
@@ -3971,6 +4007,7 @@ impl<'p> Vm<'p> {
                 recv_ver,
                 captured_callee_bits: Some(captured_callee_bits),
                 class_method,
+                class_epoch: class_method.map(|_| self.class_proto_epoch),
                 vals_ptr,
                 field_slots,
                 callee_reg_count: callee.reg_count,
@@ -4292,6 +4329,7 @@ impl<'p> Vm<'p> {
                 recv_ver,
                 captured_callee_bits: None,
                 class_method: None,
+                class_epoch: own_acc.is_none().then_some(self.class_proto_epoch),
                 vals_ptr,
                 field_slots,
                 callee_reg_count: callee.reg_count,

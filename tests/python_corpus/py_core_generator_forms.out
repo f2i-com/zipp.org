@@ -1,0 +1,8 @@
+drain [1]
+exhausted-value None ()
+first-stop result
+second-stop None
+  got GeneratorExit
+  cleanup
+closed []
+RuntimeError generator ignored GeneratorExit

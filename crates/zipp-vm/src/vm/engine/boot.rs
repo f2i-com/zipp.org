@@ -95,10 +95,12 @@ impl<'p> Vm<'p> {
         // as scratch "field globals" for object scalar-replacement (SROA): a
         // field-promoted region's GetProp/SetProp are rewritten to Load/StoreGlobal
         // on pool slots, and the interpreter syncs object.field ↔ pool slot around
-        // the native run. Sized once here so the globals Vec never reallocates at
-        // runtime (the JIT pins its base pointer).
-        let mut globals =
-            vec![Value::UNDEFINED; program.global_count as usize + FIELD_POOL + EVAL_POOL];
+        // the native run. The whole pool is RESERVED here so the globals Vec never
+        // reallocates at runtime (the JIT pins its base pointer); the eval pool's
+        // slots join the live length only as they are handed out.
+        let pool_reserve = program.global_count as usize + FIELD_POOL + EVAL_POOL;
+        let mut globals = Vec::with_capacity(pool_reserve);
+        globals.resize(program.global_count as usize + FIELD_POOL, Value::UNDEFINED);
         // Real global slots start as the never-declared sentinel: a LoadGlobal of
         // one throws ReferenceError unless a builtin (setup_globals), a hoisted
         // function, a top-level `var` (hoisted to undefined just below), or a
@@ -116,7 +118,8 @@ impl<'p> Vm<'p> {
         // and the fail-closed set of slots bytecode stores can reach — the
         // complement is what `slot_guard` keying may bake a generation for.
         // Eval/Function registration extends the set at runtime (`eval_prog`).
-        let global_gens = vec![0u32; globals.len()];
+        let mut global_gens = Vec::with_capacity(pool_reserve);
+        global_gens.resize(globals.len(), 0u32);
         let mut bytecode_stored_slots = rustc_hash::FxHashSet::default();
         for f in &program.functions {
             for ins in &f.code {
@@ -147,12 +150,14 @@ impl<'p> Vm<'p> {
             eval_classes: Vec::new(),
             main_class_count: program.classes.len(),
             eval_global_map: std::collections::HashMap::new(),
+            pool_slot_names: rustc_hash::FxHashMap::default(),
             eval_global_next: program.global_count + FIELD_POOL as u32,
             builtin_globals: std::collections::HashMap::new(),
             builtin_ns_slots: [u32::MAX; crate::vm::helpers_misc::BUILTIN_NS_COUNT],
             math_bare_memo: [(u32::MAX, u32::MAX); crate::bytecode::MATH_FN_COUNT],
             class_values: vec![None; program.classes.len()],
             mi_class_epoch: 0,
+            class_proto_epoch: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
@@ -180,6 +185,7 @@ impl<'p> Vm<'p> {
             output: Vec::new(),
             errput: Vec::new(),
             console_order: Vec::new(),
+            console_sink: None,
             host: None,
             host_ctx: None,
             start_mono_ms: crate::vm::clock::now_mono_ms(),
@@ -197,6 +203,10 @@ impl<'p> Vm<'p> {
             microtasks: std::collections::VecDeque::new(),
             current_microtask: None,
             promise_resolution_roots: Vec::new(),
+            unhandled_rejections: Vec::new(),
+            rejecting_thrown_job: false,
+            uncaught_timer_errors: Vec::new(),
+            report_unhandled: std::env::var("ZIPP_REPORT_UNHANDLED").is_ok_and(|v| v == "1"),
             coll_proof_cache: [(u32::MAX, 0, 0, 0); crate::vm::COLL_PROOF_SLOTS],
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),
@@ -207,6 +217,8 @@ impl<'p> Vm<'p> {
             matchall_batches: rustc_hash::FxHashMap::default(),
             matchall_caps_scratch: Vec::new(),
             matchall_flat_scratch: Vec::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            regex_subject_units: None,
             #[cfg(feature = "safe-sandbox")]
             regex_transient_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -235,6 +247,8 @@ impl<'p> Vm<'p> {
             brand_private_names: std::collections::HashMap::new(),
             brand_owner: std::collections::HashMap::new(),
             prototypes: std::collections::HashMap::new(),
+            class_proto_owner: rustc_hash::FxHashMap::default(),
+            ctor_initial_name: rustc_hash::FxHashMap::default(),
             proto_of: crate::slot_table::SlotTable::default(),
             ctor_field_hint: Vec::new(),
             fn_props: crate::slot_table::SlotTable::default(),
@@ -391,8 +405,6 @@ impl<'p> Vm<'p> {
             from_async_fn: None,
             async_dispose_fn: None,
             sync_dispose_shim_fn: None,
-            using_resources: std::collections::HashMap::new(),
-            using_next_id: 0,
             weakref_ctor: 0,
             finreg_ctor: 0,
             weakmap_ctor: 0,
@@ -458,6 +470,12 @@ impl<'p> Vm<'p> {
             asyncgen_proto: 0,
             default_array_iter: Value::UNDEFINED,
             default_array_iter_next: Value::UNDEFINED,
+            default_set_iter: Value::UNDEFINED,
+            default_map_iter: Value::UNDEFINED,
+            default_string_iter: Value::UNDEFINED,
+            default_ta_iter: Value::UNDEFINED,
+            iter_proto_memo: Default::default(),
+            iter_method_memo: Default::default(),
             throw_type_error: Value::UNDEFINED,
             iterator_ctor: 0,
             dollar262: 0,
@@ -505,6 +523,7 @@ impl<'p> Vm<'p> {
             weak_containers: std::collections::HashSet::new(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
+            uncaught_timer_throw: None,
         }
     }
 
@@ -528,6 +547,21 @@ impl<'p> Vm<'p> {
         self.jit_enabled
     }
 
+    /// Slots of `globals` / `global_gens` to charge as resident. The native
+    /// profile reserves a large eval pool as untouched address space and only
+    /// the live length is ever written; the small-pool profiles (hardened,
+    /// wasm linear memory) keep charging the whole reservation.
+    fn global_pool_resident_slots(&self) -> usize {
+        #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+        {
+            self.globals.len()
+        }
+        #[cfg(any(feature = "safe-sandbox", target_arch = "wasm32"))]
+        {
+            self.globals.capacity()
+        }
+    }
+
     fn vm_core_resident_bytes(&self) -> usize {
         self.regs
             .capacity()
@@ -538,8 +572,7 @@ impl<'p> Vm<'p> {
                     .saturating_mul(std::mem::size_of::<Frame>()),
             )
             .saturating_add(
-                self.globals
-                    .capacity()
+                self.global_pool_resident_slots()
                     .saturating_mul(std::mem::size_of::<Value>()),
             )
             .saturating_add(
@@ -580,8 +613,7 @@ impl<'p> Vm<'p> {
                     .saturating_mul(std::mem::size_of::<u32>()),
             )
             .saturating_add(
-                self.global_gens
-                    .capacity()
+                self.global_pool_resident_slots()
                     .saturating_mul(std::mem::size_of::<u32>()),
             )
             .saturating_add(
@@ -767,6 +799,14 @@ impl<'p> Vm<'p> {
         n = self.eval_global_map.keys().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.eval_global_map)),
             |n, key| n.saturating_add(key.capacity()),
+        );
+        n = self.pool_slot_names.values().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.pool_slot_names)),
+            |n, name| match name {
+                crate::vm::PoolSlotName::Module(s) | crate::vm::PoolSlotName::Realm(s) => {
+                    n.saturating_add(s.len())
+                }
+            },
         );
         n = self.deleted_globals.iter().fold(
             n.saturating_add(Self::hash_set_resident_bytes(&self.deleted_globals)),

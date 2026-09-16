@@ -130,8 +130,11 @@ impl<'p> Vm<'p> {
                 && !(!self.deferred_ns_state.is_empty()
                     && self.deferred_ns_state.contains_key(&oidx))
             {
-                if let Some(std::borrow::Cow::Borrowed(b)) =
-                    self.heap.str_wtf8_cow(key.heap_index())
+                // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
+                if let Some(std::borrow::Cow::Borrowed(b)) = self
+                    .heap
+                    .str_wtf8_cow(key.heap_index())
+                    .filter(|b| !b.starts_with(b"@@"))
                 {
                     if let (Ok(k), HeapObj::Object(m)) =
                         (std::str::from_utf8(b), self.heap.get(oidx))
@@ -351,31 +354,33 @@ impl<'p> Vm<'p> {
                 }
                 self.get_prop(obj, &k)
             }
-            // Positional access drives for-of / spread over a Map (the i-th
-            // [key, value] entry) and a Set (the i-th value). Insertion order.
-            HeapObj::Map { keys, vals } => {
-                if let Some(i) = array_index(key) {
-                    if i < keys.len() {
-                        let (k, v) = (keys[i], vals[i]);
-                        return Ok(Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))));
-                    }
-                    return Ok(Value::UNDEFINED);
-                }
-                // Non-numeric key (`map[Symbol.iterator]`, `map["set"]`): via prototype.
-                let k = self.key_of(key);
-                self.get_prop(obj, &k)
-            }
-            HeapObj::Set(items) => {
-                if let Some(i) = array_index(key) {
-                    if i < items.len() {
-                        return Ok(items[i]);
-                    }
-                    return Ok(Value::UNDEFINED);
-                }
+            // Map and Set are ordinary objects: `map[0]` is an ordinary [[Get]]
+            // of the key "0" (own, then prototype), never the 0th entry. The
+            // positional read the for-of opcodes need is `collection_entry_at`.
+            HeapObj::Map { .. } | HeapObj::Set(_) => {
                 let k = self.key_of(key);
                 self.get_prop(obj, &k)
             }
             _ => Ok(Value::UNDEFINED),
+        }
+    }
+
+    /// The for-of / spread / destructuring positional step over a Map or Set:
+    /// the `i`-th [key, value] entry of a Map (a fresh pair) or the `i`-th value
+    /// of a Set, in insertion order. Internal only — guest `coll[i]` is
+    /// `get_index`, an ordinary [[Get]]. The callers have already skipped
+    /// tombstones and bounds-checked `i`; anything else reads `undefined`.
+    pub(crate) fn collection_entry_at(&mut self, it: Value, i: usize) -> Value {
+        if !it.is_heap() {
+            return Value::UNDEFINED;
+        }
+        match self.heap.get(it.heap_index()) {
+            HeapObj::Map { keys, vals } => match (keys.get(i), vals.get(i)) {
+                (Some(&k), Some(&v)) => Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))),
+                _ => Value::UNDEFINED,
+            },
+            HeapObj::Set(items) => items.get(i).copied().unwrap_or(Value::UNDEFINED),
+            _ => Value::UNDEFINED,
         }
     }
 
@@ -464,33 +469,39 @@ impl<'p> Vm<'p> {
         // class-less object whose prototype chain provably can't intercept the
         // write (no same-named accessor / non-writable data / exotic level —
         // see plain_add_chain_clear) appends the new data property directly,
-        // skipping set_prop's special-case gauntlet. Object.prototype is
-        // excluded so its index-key bookkeeping (note_array_proto_index)
+        // skipping set_prop's special-case gauntlet. Object.prototype and
+        // Array.prototype (both plain objects, both in every array's chain) are
+        // excluded so their index-key bookkeeping (note_array_proto_index)
         // always runs; everything else stays generic.
         if key.is_heap()
             && !(idx == self.global_this && self.global_this != 0)
-            && idx != self.obj_proto
+            && !self.is_indexed_proto_anchor(idx)
             && self.realm_global_objs.is_empty()
             && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
             && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
         {
             // hit: own writable data slot; add: proven-clean new key.
             let (hit, add) = match self.heap.str_wtf8_cow(key.heap_index()) {
-                Some(std::borrow::Cow::Borrowed(b)) => {
+                // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
+                Some(std::borrow::Cow::Borrowed(b)) if !b.starts_with(b"@@") => {
                     match (std::str::from_utf8(b), self.heap.get(idx)) {
-                        (Ok(k), HeapObj::Object(m)) if k != "__proto__" => match m.pos(k) {
-                            Some(i) if !m.attr_at(i).accessor && m.attr_at(i).writable => {
-                                (Some(i), false)
+                        // (A class prototype's writes must reach `set_prop`,
+                        // which records when they retire its member tables.)
+                        (Ok(k), HeapObj::Object(m)) if k != "__proto__" && !m.class_proto => {
+                            match m.pos(k) {
+                                Some(i) if !m.attr_at(i).accessor && m.attr_at(i).writable => {
+                                    (Some(i), false)
+                                }
+                                Some(_) => (None, false),
+                                None => (
+                                    None,
+                                    m.extensible
+                                        && m.class.is_none()
+                                        && !m.is_ctor
+                                        && self.plain_add_chain_clear(idx, k),
+                                ),
                             }
-                            Some(_) => (None, false),
-                            None => (
-                                None,
-                                m.extensible
-                                    && m.class.is_none()
-                                    && !m.is_ctor
-                                    && self.plain_add_chain_clear(idx, k),
-                            ),
-                        },
+                        }
                         _ => (None, false),
                     }
                 }
@@ -612,33 +623,15 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // A FROZEN array has non-writable elements: ANY index write (even to an
-        // existing element) is rejected (sloppy no-op / strict TypeError). A sealed
-        // (not frozen) array keeps writable elements — only NEW indices are blocked
-        // by the non-extensible check below.
-        if array_index(key).is_some()
-            && matches!(self.heap.get(idx), HeapObj::Array(_))
-            && self.arr_props.get(&idx).map_or(false, |m| m.frozen)
-        {
-            self.reject_write(&self.key_of(key), strict)?;
-            return Ok(());
-        }
-        // A NEW index (past the current length) on a non-extensible array adds an own
-        // property → rejected (sloppy no-op / strict TypeError). An in-range index is
-        // already present and stays writable. Likewise, extending past the current
-        // length grows `length`, so a non-writable `length` (defineProperty / freeze)
-        // rejects it — Array [[DefineOwnProperty]]: index >= oldLen && length
-        // non-writable → false. (Checked before the &mut borrow below.)
+        // A FROZEN array's elements are non-writable, and a NEW index (past the
+        // current length, or a HOLE below it) on a non-extensible array — or past
+        // a non-writable `length` — adds an own property Array
+        // [[DefineOwnProperty]] refuses: sloppy no-op / strict TypeError.
+        // `array_index_write_rejected` is the shared predicate `OrdinarySet`'s
+        // boolean uses too. (Checked before the &mut borrow below; an arr_props
+        // override was routed to set_prop above.)
         if let Some(i) = array_index(key) {
-            let present = matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len());
-            if !present
-                && matches!(self.heap.get(idx), HeapObj::Array(_))
-                && (self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
-                    // Growing the JS length needs a writable `length`; an index
-                    // below a sparse array's VIRTUAL length doesn't grow it.
-                    || (self.array_length_nonwritable.contains(&idx)
-                        && i >= self.js_array_len(idx)))
-            {
+            if self.array_index_write_rejected(idx, i) {
                 self.reject_write(&self.key_of(key), strict)?;
                 return Ok(());
             }
@@ -785,8 +778,10 @@ impl<'p> Vm<'p> {
             return ConcatSetFast::Slow;
         }
         let idx = obj.heap_index();
+        // Both indexed-prototype anchors take the slow path so an index key
+        // written to them runs note_array_proto_index.
         if (idx == self.global_this && self.global_this != 0)
-            || idx == self.obj_proto
+            || self.is_indexed_proto_anchor(idx)
             || !self.realm_global_objs.is_empty()
             || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
             || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
@@ -800,7 +795,7 @@ impl<'p> Vm<'p> {
         let once = crate::heap::hash_once_enabled();
         let tag = crate::heap::prop_tag_of(key);
         let (hit, add) = match self.heap.get(idx) {
-            HeapObj::Object(m) if key != "__proto__" => match if once {
+            HeapObj::Object(m) if key != "__proto__" && !m.class_proto => match if once {
                 m.pos_tagged(key, tag)
             } else {
                 m.pos(key)
@@ -1186,23 +1181,37 @@ impl<'p> Vm<'p> {
             HeapObj::Date(m) => *m,
             _ => f64::NAN,
         };
-        let mut comp = [p.0, p.1, p.2, p.3, p.4, p.5, p.6];
         // Every component setter (setFullYear, setMonth, … setMilliseconds) has at
         // least one REQUIRED argument — the field at `start`. Calling it with no
         // args reads ToNumber(undefined) = NaN for that field, so the result is
         // NaN (Invalid Date). (Trailing optional args still default to the current
         // component value, handled by `comp` starting from the present parts.)
+        let mut comp = [p.0, p.1, p.2, p.3, p.4, p.5, p.6];
         let mut any_nan = args.is_empty();
-        // Coerce ALL args (ToNumber, invoking valueOf in order) before deciding.
+        // Each setter reads only its own parameters — setFullYear(year, month,
+        // date), setMonth(month, date), setDate(date), and setHours(hour, min,
+        // sec, ms) down to setMilliseconds(ms). Anything past that is never
+        // coerced and never lands in a later component: `[5].forEach(d.setUTCDate,
+        // d)` passes an index and the array, which must not become the time.
+        let arity = if start < 3 { 3 - start } else { 7 - start };
+        let args = &args[..args.len().min(arity)];
+        // The time value of an argument too large for the i64 path (below).
+        let mut wide: Option<f64> = None;
+        // Coerce the setter's args (ToNumber, invoking valueOf in order) before deciding.
         for (i, &v) in args.iter().enumerate() {
-            if start + i >= 7 {
+            let n = self.to_number_strict(v)?;
+            let k = start + i;
+            if !n.is_finite() {
+                // MakeDay/MakeTime: any non-finite field — ±Infinity as well as
+                // NaN — makes the time value NaN.
+                any_nan = true;
+            } else if n.abs() <= DATE_SET_SMALL[k] {
+                // ToIntegerOrInfinity: a truncating cast, exact at this size.
+                comp[k] = n as i64;
+            } else {
+                wide = Some(self.date_set_wide(comp, k, n, &args[i + 1..], any_nan)?);
                 break;
             }
-            let n = self.to_number_strict(v)?;
-            if n.is_nan() {
-                any_nan = true;
-            }
-            comp[start + i] = if n.is_finite() { n as i64 } else { 0 };
         }
         // A component setter (setMonth..setMilliseconds, start>=1) on an Invalid
         // Date returns NaN — but per spec [[DateValue]] is read BEFORE ToNumber
@@ -1212,16 +1221,57 @@ impl<'p> Vm<'p> {
         if orig_ms.is_nan() && start != 0 {
             return Ok(Value::num(f64::NAN));
         }
-        let ms = if any_nan {
-            f64::NAN
-        } else {
-            time_clip(ms_from_utc(
-                comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6],
-            ))
+        let ms = match wide {
+            Some(t) => time_clip(t),
+            None if any_nan => f64::NAN,
+            None => {
+                let [y, mo, d, h, mi, sec, ms] = comp;
+                time_clip(ms_from_utc(y, mo, d, h, mi, sec, ms))
+            }
         };
         if let HeapObj::Date(m) = self.heap.get_mut(idx) {
             *m = ms;
         }
         Ok(Value::num(ms))
     }
+
+    /// `date_set` from the first argument that does not fit its i64 path: the
+    /// remaining arguments are still coerced in order, and MakeDay / MakeTime /
+    /// MakeDate run over Numbers (an i64 round trip would saturate such an
+    /// argument and then wrap in the civil-day math: `setUTCFullYear(
+    /// 50505469855533208)` came back as a valid year-98 date). Returns the
+    /// unclipped time value, NaN for a non-finite field.
+    #[cold]
+    #[inline(never)]
+    fn date_set_wide(
+        &mut self,
+        comp: [i64; 7],
+        k: usize,
+        n: f64,
+        rest: &[Value],
+        mut any_nan: bool,
+    ) -> Result<f64, Thrown> {
+        let mut w = comp.map(|c| c as f64);
+        w[k] = n.trunc();
+        for (j, &v) in rest.iter().enumerate() {
+            let n = self.to_number_strict(v)?;
+            if n.is_finite() {
+                w[k + 1 + j] = n.trunc();
+            } else {
+                any_nan = true;
+            }
+        }
+        Ok(if any_nan {
+            f64::NAN
+        } else {
+            ms_from_utc_f64(w[0], w[1], w[2], w[3], w[4], w[5], w[6])
+        })
+    }
 }
+
+/// Per-component bounds (year, month, date, hours, minutes, seconds, ms) under
+/// which a Date setter's MakeDay / MakeTime / MakeDate partial sums are exact
+/// integers below 2^53 — every valid date year (±275760, with a month carry)
+/// and any ordinary argument — so the i64 civil-day computation yields the very
+/// same Number as the spec's f64 arithmetic.
+const DATE_SET_SMALL: [f64; 7] = [276_000.0, 12_000.0, 1.0e6, 1.0e6, 1.0e7, 1.0e9, 1.0e12];

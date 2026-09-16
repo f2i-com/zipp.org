@@ -838,12 +838,12 @@ function Playground() {
           <pre tabIndex={0} aria-live="polite" aria-label="Zipp console output"><code>{output}</code></pre>
           <div className="playground-boundary">
             <span><i />50m instruction lifetime cap</span>
-            <span><i />128 MiB VM heap ceiling</span>
+            <span><i />512 MiB VM heap ceiling</span>
             <span><i />6 s host deadline</span>
           </div>
         </div>
       </div>
-      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.15`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.15</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
+      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.18`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.18</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
     </section>
   )
 }

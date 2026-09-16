@@ -15,9 +15,29 @@ use crate::bytecode::{FuncProto, Instr, Program, Reg, NO_NAME};
 use ast::Ranged;
 use rustpython_parser::ast;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub(super) type R<T> = Result<T, String>;
+
+/// Whether the emitter lowers operations to guarded inline fast paths (int
+/// and float arithmetic, comparisons, identity tests, unpacking, counted and
+/// indexed loops) ahead of the runtime helper each one falls back to.
+/// `ZIPP_PY_NOFAST=1` (like `ZIPP_NOJIT`, any value) compiles every such
+/// operation to its helper only, so the differential corpus can check both
+/// lowerings. Read once per process.
+pub(super) fn py_fast_paths() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_PY_NOFAST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 pub(super) const MAX_DEPTH: usize = 96;
 pub(super) const MAX_FUNCTIONS: usize = 8192;
 pub(super) const MAX_INSTRUCTIONS: usize = 1 << 20;
@@ -38,6 +58,22 @@ pub(super) struct Unit<'a> {
     pub file: &'a str,
     pub source: &'a str,
     pub module_index: u32,
+    /// Byte offset of each line's start ([`line_starts`]), so a statement's
+    /// line is a binary search rather than a count from the top of the file.
+    pub lines: &'a [u32],
+}
+
+/// The byte offset where each line of `source` starts; the first is 0.
+pub(super) fn line_starts(source: &str) -> Vec<u32> {
+    let mut starts = vec![0];
+    starts.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter(|(_, b)| *b == b'\n')
+            .map(|(i, _)| i as u32 + 1),
+    );
+    starts
 }
 
 pub(super) struct Emitter<'a> {
@@ -52,11 +88,13 @@ pub(super) struct Emitter<'a> {
     pub program: &'a RefCell<Program>,
     pub next: usize,
     high: usize,
-    // Persistent registers set up by the prologue.
+    // Persistent registers set up by the prologue. `UNBOUND` and the
+    // globals are loaded there only when the scope's symbols show a use;
+    // otherwise [`Emitter::unbound`] and [`Emitter::globals`] read them where
+    // needed. The STOP sentinel is loaded ahead of each loop that tests it.
     pub r_rt: Reg,
-    pub r_stop: Reg,
-    pub r_unb: Reg,
-    pub r_globals: Reg,
+    r_unb: Option<Reg>,
+    r_globals: Option<Reg>,
     pub r_ns: Option<Reg>,
     pub r_line: Reg,
     /// Local (value) registers by name.
@@ -78,6 +116,13 @@ pub(super) struct Emitter<'a> {
     pub handler_depth: usize,
     pub qualname: String,
     last_line: i32,
+    /// [`py_fast_paths`], read once per code object.
+    pub fast: bool,
+    /// Constant-pool indices already handed out, so every use of the same
+    /// string or float shares one entry (and one string constant).
+    string_ids: HashMap<String, u32>,
+    string_consts: HashMap<u32, u32>,
+    float_consts: HashMap<u64, u32>,
 }
 
 impl<'a> Emitter<'a> {
@@ -113,9 +158,8 @@ impl<'a> Emitter<'a> {
             next: 2,
             high: 2,
             r_rt: 0,
-            r_stop: 0,
-            r_unb: 0,
-            r_globals: 0,
+            r_unb: None,
+            r_globals: None,
             r_ns: None,
             r_line: 0,
             locals: BTreeMap::new(),
@@ -128,6 +172,10 @@ impl<'a> Emitter<'a> {
             handler_depth: 0,
             qualname,
             last_line: -1,
+            fast: py_fast_paths(),
+            string_ids: HashMap::new(),
+            string_consts: HashMap::new(),
+            float_consts: HashMap::new(),
         };
         e.prologue()?;
         Ok(e)
@@ -142,6 +190,16 @@ impl<'a> Emitter<'a> {
     pub fn in_function(&self) -> bool {
         self.kind() == ScopeKind::Function
     }
+    /// The `__module__` of what this module defines: `__main__` for the
+    /// module run as the program, as its `__name__` is.
+    pub fn module_name(&self) -> &'a str {
+        let name = self.project.module_names[self.unit.module_index as usize];
+        if name == self.project.entry {
+            "__main__"
+        } else {
+            name
+        }
+    }
 
     fn prologue(&mut self) -> R<()> {
         self.r_rt = self.alloc()?;
@@ -149,9 +207,28 @@ impl<'a> Emitter<'a> {
             dst: self.r_rt,
             idx: self.rt_slot,
         })?;
-        self.r_stop = self.prop(self.r_rt, "STOP")?;
-        self.r_unb = self.prop(self.r_rt, "UNBOUND")?;
-        self.r_globals = self.prop(REG_FUNC, "globals")?;
+        let scope = self.scope();
+        // Unbound-initialised locals and cells need UNBOUND right here, and
+        // reads of captured cells test against it; global names, class
+        // namespaces and nested code objects (which capture the globals)
+        // need the module's dictionary.
+        let unbound_use = |(name, kind): (&String, &SymKind)| match kind {
+            SymKind::Local | SymKind::Cell => !scope.params.contains(name),
+            SymKind::Free => true,
+            _ => false,
+        };
+        if scope.symbols.iter().any(unbound_use) {
+            self.r_unb = Some(self.prop(self.r_rt, "UNBOUND")?);
+        }
+        if self.kind() != ScopeKind::Function
+            || !scope.children.is_empty()
+            || scope
+                .symbols
+                .values()
+                .any(|k| matches!(k, SymKind::Global | SymKind::ClassLocal))
+        {
+            self.r_globals = Some(self.prop(REG_FUNC, "globals")?);
+        }
         self.r_line = self.alloc()?;
         if self.kind() == ScopeKind::Class {
             let zero = self.small_int(0)?;
@@ -191,15 +268,17 @@ impl<'a> Emitter<'a> {
             }
             match kind {
                 SymKind::Local => {
+                    let unbound = self.unbound()?;
                     let reg = self.alloc()?;
                     self.emit(Instr::Move {
                         dst: reg,
-                        src: self.r_unb,
+                        src: unbound,
                     })?;
                     self.locals.insert(name.clone(), reg);
                 }
                 SymKind::Cell => {
-                    let cell = self.helper("cell", &[self.r_unb])?;
+                    let unbound = self.unbound()?;
+                    let cell = self.helper("cell", &[unbound])?;
                     self.cells.insert(name.clone(), cell);
                 }
                 _ => {}
@@ -225,6 +304,25 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// The UNBOUND sentinel: the prologue's register, or a read here.
+    pub fn unbound(&mut self) -> R<Reg> {
+        match self.r_unb {
+            Some(reg) => Ok(reg),
+            None => self.prop(self.r_rt, "UNBOUND"),
+        }
+    }
+    /// The module's global dictionary: the prologue's register, or a read here.
+    pub fn globals(&mut self) -> R<Reg> {
+        match self.r_globals {
+            Some(reg) => Ok(reg),
+            None => self.prop(REG_FUNC, "globals"),
+        }
+    }
+    /// The runtime's end-of-iteration sentinel, read ahead of a loop.
+    pub fn stop(&mut self) -> R<Reg> {
+        self.prop(self.r_rt, "STOP")
+    }
+
     pub fn finish(mut self) -> FuncProto {
         self.proto.reg_count = (self.high.max(self.next)) as u16;
         self.proto
@@ -236,9 +334,9 @@ impl<'a> Emitter<'a> {
         format!("Python: {at}: {message}")
     }
     pub fn line_of(&self, node: &impl Ranged) -> i32 {
-        let offset = u32::from(node.range().start()) as usize;
-        let prefix = self.unit.source.get(..offset).unwrap_or("");
-        (prefix.bytes().filter(|c| *c == b'\n').count() + 1) as i32
+        let offset = u32::from(node.range().start());
+        // Lines starting at or before the offset; the table always holds 0.
+        self.unit.lines.partition_point(|&start| start <= offset).max(1) as i32
     }
     /// Stamp the current line into the runtime's line global (one `LoadInt`
     /// and one `StoreGlobal`; skipped when the line has not changed).
@@ -311,6 +409,8 @@ impl<'a> Emitter<'a> {
             Some(Instr::Jump { target: dst })
             | Some(Instr::JumpIfFalse { target: dst, .. })
             | Some(Instr::JumpIfTrue { target: dst, .. })
+            | Some(Instr::JumpIfNotLt { target: dst, .. })
+            | Some(Instr::JumpIfNotLe { target: dst, .. })
             | Some(Instr::JumpFinally { target: dst, .. })
             | Some(Instr::PushHandler {
                 catch_target: dst, ..
@@ -334,16 +434,38 @@ impl<'a> Emitter<'a> {
 
     // ---- constants --------------------------------------------------------------
     pub fn string_index(&mut self, value: &str) -> u32 {
-        if let Some(index) = self.proto.string_constants.iter().position(|s| s == value) {
-            return index as u32;
+        if let Some(&index) = self.string_ids.get(value) {
+            return index;
         }
         let index = self.proto.string_constants.len() as u32;
         self.proto.string_constants.push(value.to_owned());
+        self.string_ids.insert(value.to_owned(), index);
         index
     }
     pub fn string(&mut self, value: &str) -> R<Reg> {
         let dst = self.alloc()?;
         let si = self.string_index(value);
+        let idx = match self.string_consts.get(&si) {
+            Some(&idx) => idx,
+            None => {
+                let idx = self.proto.constants.len() as u32;
+                self.proto
+                    .constants
+                    .push(crate::value::Value::heap(crate::vm::STRING_CONST_BIT | si));
+                self.string_consts.insert(si, idx);
+                idx
+            }
+        };
+        self.emit(Instr::LoadConst { dst, idx })?;
+        Ok(dst)
+    }
+    /// [`Self::string`] for a value known to be distinct from every other
+    /// constant (the virtual filesystem's paths and contents): it is appended
+    /// without searching the pool, which would be quadratic in the file count.
+    pub fn unique_string(&mut self, value: String) -> R<Reg> {
+        let dst = self.alloc()?;
+        let si = self.proto.string_constants.len() as u32;
+        self.proto.string_constants.push(value);
         let idx = self.proto.constants.len() as u32;
         self.proto
             .constants
@@ -376,8 +498,16 @@ impl<'a> Emitter<'a> {
     }
     pub fn float(&mut self, value: f64) -> R<Reg> {
         let dst = self.alloc()?;
-        let idx = self.proto.constants.len() as u32;
-        self.proto.constants.push(crate::value::Value::num(value));
+        // Keyed by bits: 0.0 and -0.0 (and each NaN payload) stay distinct.
+        let idx = match self.float_consts.get(&value.to_bits()) {
+            Some(&idx) => idx,
+            None => {
+                let idx = self.proto.constants.len() as u32;
+                self.proto.constants.push(crate::value::Value::num(value));
+                self.float_consts.insert(value.to_bits(), idx);
+                idx
+            }
+        };
         self.emit(Instr::LoadConst { dst, idx })?;
         Ok(dst)
     }
@@ -426,16 +556,22 @@ impl<'a> Emitter<'a> {
         Ok((base, argc))
     }
     pub fn array(&mut self, values: &[Reg]) -> R<Reg> {
-        let (arg_base, argc) = self.arguments(values)?;
         let dst = self.alloc()?;
+        self.array_into(dst, values)?;
+        Ok(dst)
+    }
+    pub fn array_into(&mut self, dst: Reg, values: &[Reg]) -> R<()> {
+        let (arg_base, argc) = self.arguments(values)?;
         self.emit(Instr::NewArray {
             dst,
             arg_base,
             argc,
         })?;
-        Ok(dst)
+        Ok(())
     }
-    /// `runtime.method(args...)`.
+    /// `runtime.method(args...)`. A plain Get and Call: the interpreter's
+    /// fused `CallMethod` measured slower on the runtime object than the pair
+    /// (its receiver-kind probes run before the method cache).
     pub fn helper(&mut self, method: &str, args: &[Reg]) -> R<Reg> {
         let callee = self.prop(self.r_rt, method)?;
         let (arg_base, argc) = self.arguments(args)?;
@@ -601,15 +737,6 @@ impl<'a> Emitter<'a> {
         self.patch(end, here)?;
         Ok(dst)
     }
-    /// Both operands are BigInts (Python ints): jump to the returned label
-    /// otherwise. The caller patches it to the slow path.
-    pub fn both_ints(&mut self, a: Reg, b: Reg) -> R<Vec<usize>> {
-        let ta = self.typeof_is(a, "bigint")?;
-        let j1 = self.jump_if_false(ta)?;
-        let tb = self.typeof_is(b, "bigint")?;
-        let j2 = self.jump_if_false(tb)?;
-        Ok(vec![j1, j2])
-    }
     pub fn cell_get(&mut self, cell: Reg) -> R<Reg> {
         self.prop(cell, "v")
     }
@@ -628,11 +755,12 @@ impl<'a> Emitter<'a> {
         }
     }
     fn check_bound(&mut self, value: Reg, name: &str) -> R<()> {
+        let unbound = self.unbound()?;
         let cond = self.alloc()?;
         self.emit(Instr::Eq {
             dst: cond,
             a: value,
-            b: self.r_unb,
+            b: unbound,
         })?;
         let skip = self.jump_if_false(cond)?;
         let key = self.string(name)?;
@@ -646,15 +774,31 @@ impl<'a> Emitter<'a> {
     fn is_definite(&self, name: &str) -> bool {
         self.definite.contains(name) && !self.scope().deleted.contains(name)
     }
+    /// Whether a walrus anywhere in the code this one runs in can rebind
+    /// the local `name` (an inline comprehension runs in its parent's code).
+    fn walrus_rebinds(&self, name: &str) -> bool {
+        let scope = self.scope();
+        scope.walrus_targets.contains(name)
+            || scope.inline
+                && scope
+                    .parent
+                    .is_some_and(|p| self.table.scopes[p].walrus_targets.contains(name))
+    }
     pub fn load_name(&mut self, name: &str) -> R<Reg> {
         match self.sym_kind(name) {
-            SymKind::Local => {
+            SymKind::Local | SymKind::Outer => {
                 let reg = *self
                     .locals
                     .get(name)
                     .ok_or_else(|| format!("Python emitter: unreserved local {name}"))?;
                 if !self.is_definite(name) {
                     self.check_bound(reg, name)?;
+                }
+                if self.walrus_rebinds(name) {
+                    // A later operand's `name := ...` must not change this one.
+                    let copy = self.alloc()?;
+                    self.emit(Instr::Move { dst: copy, src: reg })?;
+                    return Ok(copy);
                 }
                 Ok(reg)
             }
@@ -670,12 +814,14 @@ impl<'a> Emitter<'a> {
                 let ns = self
                     .r_ns
                     .ok_or("Python emitter: class local outside a class")?;
+                let globals = self.globals()?;
                 let key = self.string(name)?;
-                self.helper("nsload", &[ns, self.r_globals, key])
+                self.helper("nsload", &[ns, globals, key])
             }
             SymKind::Global => {
+                let globals = self.globals()?;
                 let key = self.string(name)?;
-                self.helper("gload", &[self.r_globals, key])
+                self.helper("gload", &[globals, key])
             }
         }
     }
@@ -687,7 +833,7 @@ impl<'a> Emitter<'a> {
     }
     pub fn store_name(&mut self, name: &str, value: Reg) -> R<()> {
         match self.sym_kind(name) {
-            SymKind::Local => {
+            SymKind::Local | SymKind::Outer => {
                 let dst = *self
                     .locals
                     .get(name)
@@ -712,28 +858,28 @@ impl<'a> Emitter<'a> {
                 self.helper("nsstore", &[ns, key, value])?;
             }
             SymKind::Global => {
+                let globals = self.globals()?;
                 let key = self.string(name)?;
-                self.helper("gstore", &[self.r_globals, key, value])?;
+                self.helper("gstore", &[globals, key, value])?;
             }
         }
         Ok(())
     }
     pub fn delete_name(&mut self, name: &str) -> R<()> {
         match self.sym_kind(name) {
-            SymKind::Local => {
+            SymKind::Local | SymKind::Outer => {
                 let dst = *self
                     .locals
                     .get(name)
                     .ok_or_else(|| format!("Python emitter: unreserved local {name}"))?;
-                self.emit(Instr::Move {
-                    dst,
-                    src: self.r_unb,
-                })?;
+                let unbound = self.unbound()?;
+                self.emit(Instr::Move { dst, src: unbound })?;
                 self.definite.remove(name);
             }
             SymKind::Cell | SymKind::Free => {
                 let cell = self.cell_reg(name)?;
-                self.cell_set(cell, self.r_unb)?;
+                let unbound = self.unbound()?;
+                self.cell_set(cell, unbound)?;
                 self.definite.remove(name);
             }
             SymKind::ClassLocal => {
@@ -744,8 +890,9 @@ impl<'a> Emitter<'a> {
                 self.helper("nsdel", &[ns, key])?;
             }
             SymKind::Global => {
+                let globals = self.globals()?;
                 let key = self.string(name)?;
-                self.helper("gdel", &[self.r_globals, key])?;
+                self.helper("gdel", &[globals, key])?;
             }
         }
         Ok(())
@@ -760,12 +907,18 @@ impl<'a> Emitter<'a> {
         qualname: String,
         body: impl FnOnce(&mut Emitter<'a>) -> R<()>,
     ) -> R<(u32, &'a Scope)> {
-        let offset = u32::from(node.range().start());
+        let range = node.range();
+        let key = (u32::from(range.start()), u32::from(range.end()));
         let scope_id = *self
             .table
             .by_offset
-            .get(&offset)
+            .get(&key)
             .ok_or_else(|| self.error(node, "internal: scope not analysed"))?;
+        // A code object compiled against another node's scope would, for
+        // instance, lower a generator body into a plain function.
+        if self.table.scopes[scope_id].name != name {
+            return Err(self.error(node, "internal: scope does not match its node"));
+        }
         if self.program.borrow().functions.len() >= MAX_FUNCTIONS {
             return Err(self.error(node, "function count limit exceeded"));
         }
@@ -845,7 +998,8 @@ impl<'a> Emitter<'a> {
         let varkw_r = self.boolean(varkw)?;
         let cells = self.cells_for(child)?;
         let isgen = self.boolean(child.is_generator)?;
-        let module = self.string(self.project.module_names[self.unit.module_index as usize])?;
+        let module = self.string(self.module_name())?;
+        let globals = self.globals()?;
         self.helper(
             "func",
             &[
@@ -861,7 +1015,7 @@ impl<'a> Emitter<'a> {
                 kwdefault_names,
                 kwdefault_values,
                 cells,
-                self.r_globals,
+                globals,
                 isgen,
                 doc,
                 module,

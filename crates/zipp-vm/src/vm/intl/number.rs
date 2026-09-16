@@ -142,6 +142,10 @@ impl<'p> Vm<'p> {
             out.min_significant = Some(1);
             out.max_significant = Some(2);
             out.rounding_increment = 1;
+            // Step 26.f: [[ComputedRoundingPriority]] is "morePrecision" here,
+            // and that is what resolvedOptions reports (the rounding already
+            // behaves that way with both pairs present).
+            out.rounding_priority = "morePrecision".into();
         } else if rounding_increment != 1 {
             // Steps 26-27: a rounding increment is only meaningful against
             // [[RoundingType]] "fractionDigits" — that is, the DEFAULT priority
@@ -223,10 +227,11 @@ impl<'p> Vm<'p> {
         resolved: u32,
         value: Value,
     ) -> Result<Value, Thrown> {
-        // Number Format Functions step 4 is ? ToNumber(value) — the FULL one, so
-        // an object argument's @@toPrimitive/valueOf runs exactly once and its
-        // exception propagates (`format({[Symbol.toPrimitive](){…}})`).
-        let n = self.to_number_coerce(value)?;
+        // Number Format Functions step 4 is ? ToIntlMathematicalValue(value) —
+        // ToPrimitive first, so an object argument's @@toPrimitive/valueOf runs
+        // exactly once and its exception propagates
+        // (`format({[Symbol.toPrimitive](){…}})`).
+        let n = self.to_intl_mv(value)?;
         // FormatNumeric is FormatNumericToParts concatenated, so derive it from
         // the SAME PartitionNumberPattern: `format` used to re-derive the string
         // on its own and dropped the `unit` style's affix that `formatToParts`
@@ -236,9 +241,109 @@ impl<'p> Vm<'p> {
         // `format`, so the two disagreeing is directly observable.
         // (nf_parts applies the numbering system to the digit runs — and only
         // to them; the separators around them are locale data this engine lacks.)
-        let parts = self.nf_parts(resolved, n)?;
+        let parts = self.nf_parts(resolved, &n)?;
         let s: String = parts.into_iter().map(|(_, v)| v).collect();
         Ok(self.alloc_str(s))
+    }
+
+    /// ToIntlMathematicalValue (ECMA-402 §15.5.16): ToPrimitive(value, number),
+    /// then a BigInt or a decimal numeric string keeps its EXACT decimal digits
+    /// and everything else is ToNumber. (`to_number_coerce` accepts BigInt the
+    /// same way, but through f64.)
+    pub(crate) fn to_intl_mv(&mut self, value: Value) -> Result<IntlMv, Thrown> {
+        let prim = if value.is_heap()
+            && !matches!(
+                self.heap.get(value.heap_index()),
+                HeapObj::Symbol { .. }
+                    | HeapObj::BigInt(_)
+                    | HeapObj::BigIntBig(_)
+                    | HeapObj::Str(_)
+                    | HeapObj::Cons { .. }
+            ) {
+            self.to_primitive_number(value)?
+        } else {
+            value
+        };
+        if prim.is_heap() {
+            match self.heap.get(prim.heap_index()) {
+                HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
+                    let s = self.to_js_string(prim)?;
+                    return Ok(IntlMv::from_bigint_string(&s));
+                }
+                HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                    let n = self.to_number(prim)?;
+                    let s = self.to_js_string(prim)?;
+                    return Ok(IntlMv::from_numeric_string(&s, n));
+                }
+                _ => {}
+            }
+        }
+        Ok(IntlMv::Num(self.to_number(prim)?))
+    }
+
+    /// ResolvePlural for a resolved `Intl.PluralRules`, with `en`'s CLDR rules.
+    /// The operands come from the number FORMATTED with the rules' digit
+    /// options (so `{minimumFractionDigits: 1}` makes 1 "1.0", which is
+    /// "other"), and from its absolute value (-1 is "one").
+    ///
+    /// * cardinal — `one: i = 1 and v = 0`
+    /// * ordinal — `one: n % 10 = 1 and n % 100 != 11`, `two: … 2 … 12`,
+    ///   `few: … 3 … 13` (1st, 2nd, 3rd, 11th, 21st)
+    pub(crate) fn intl_plural_category(&mut self, resolved: u32, n: f64) -> &'static str {
+        if !n.is_finite() {
+            return "other";
+        }
+        let ordinal = self.display(self.intl_slot(resolved, "type")) == "ordinal";
+        let slot_int = |vm: &Self, k: &str| -> Option<i64> {
+            let v = vm.intl_slot(resolved, k);
+            v.is_number().then(|| v.as_f64() as i64)
+        };
+        let rounding_priority = self.display(self.intl_slot(resolved, "roundingPriority"));
+        let rounding_mode = self.display(self.intl_slot(resolved, "roundingMode"));
+        let trailing_zero_display = self.display(self.intl_slot(resolved, "trailingZeroDisplay"));
+        // FormatNumericToString applies the digit options only: a compact or
+        // scientific `notation` never scales the operands (1000 is "other",
+        // not the "one" of its "1K" mantissa, and 1002 is still "2nd").
+        let params = NumFmtParams {
+            style: "decimal",
+            notation: "standard",
+            compact_display: "short",
+            min_int: slot_int(self, "minimumIntegerDigits").unwrap_or(1),
+            min_frac: slot_int(self, "minimumFractionDigits"),
+            max_frac: slot_int(self, "maximumFractionDigits"),
+            min_sig: slot_int(self, "minimumSignificantDigits"),
+            max_sig: slot_int(self, "maximumSignificantDigits"),
+            rounding_priority: &rounding_priority,
+            rounding_mode: &rounding_mode,
+            rounding_increment: slot_int(self, "roundingIncrement").unwrap_or(1),
+            trailing_zero_display: &trailing_zero_display,
+            sign_display: "never",
+            grouping: false,
+            group_min2: false,
+        };
+        let body = format_number_intl(n, &params);
+        let (int, frac) = body.split_once('.').unwrap_or((&body, ""));
+        let int = int.trim_start_matches('0');
+        if !ordinal {
+            return if int == "1" && frac.is_empty() {
+                "one"
+            } else {
+                "other"
+            };
+        }
+        if frac.bytes().any(|b| b != b'0') {
+            return "other";
+        }
+        let last = |k: usize| -> u32 {
+            let tail = &int[int.len().saturating_sub(k)..];
+            tail.parse().unwrap_or(0)
+        };
+        match (last(1), last(2)) {
+            (1, m) if m != 11 => "one",
+            (2, m) if m != 12 => "two",
+            (3, m) if m != 13 => "few",
+            _ => "other",
+        }
     }
 
     /// The string half of format(), split out so formatToParts/formatRange can
@@ -246,7 +351,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn intl_number_format_str(
         &mut self,
         resolved: u32,
-        n: f64,
+        n: &IntlMv,
     ) -> Result<String, Thrown> {
         let style = self.display(self.intl_slot(resolved, "style"));
         // A digit slot is ABSENT when SetNumberFormatDigitOptions did not resolve
@@ -278,10 +383,21 @@ impl<'p> Vm<'p> {
             grouping,
             group_min2,
         };
-        let s = format_number_intl(n, &params);
+        let s = format_intl_mv(n, &params);
         Ok(if style == "currency" {
             let cur = self.display(self.intl_slot(resolved, "currency"));
-            let sym = currency_symbol(&cur);
+            let display = self.display(self.intl_slot(resolved, "currencyDisplay"));
+            if display == "name" {
+                // CLDR `currencyPatterns` unitPattern "{0} {1}": the plural-
+                // selected display name FOLLOWS the number, and there is no
+                // accounting form of it ("-3.00 US dollars").
+                return Ok(format!(
+                    "{s} {}",
+                    currency_name(&cur, currency_plural_one(&s))
+                ));
+            }
+            let digit_body = s.trim_start_matches(['-', '+']).starts_with(|c: char| c.is_ascii_digit());
+            let sym = currency_affix(&cur, &display, digit_body);
             // `currencySign: "accounting"` swaps CLDR's *negative subpattern* in
             // for the minus sign — for `en` that is `(¤#,##0.00)`, so -987 USD
             // reads "($987.00)". Which values take it is decided upstream: the
@@ -311,8 +427,8 @@ impl<'p> Vm<'p> {
     pub(crate) fn nf_range_parts(
         &mut self,
         resolved: u32,
-        x: f64,
-        y: f64,
+        x: &IntlMv,
+        y: &IntlMv,
     ) -> Result<Vec<(String, String, &'static str)>, Thrown> {
         let a = self.nf_parts(resolved, x)?;
         let b = self.nf_parts(resolved, y)?;
@@ -346,18 +462,37 @@ impl<'p> Vm<'p> {
     pub(crate) fn nf_parts(
         &mut self,
         resolved: u32,
-        n: f64,
+        n: &IntlMv,
     ) -> Result<Vec<(String, String)>, Thrown> {
         let formatted = self.intl_number_format_str(resolved, n)?;
         let style = self.display(self.intl_slot(resolved, "style"));
-        let currency_prefix = if style == "currency" {
+        let currency_display = self.display(self.intl_slot(resolved, "currencyDisplay"));
+        let (currency_prefix, currency_suffix) = if style == "currency" {
             let cur = self.display(self.intl_slot(resolved, "currency"));
-            currency_symbol(&cur)
+            if currency_display == "name" {
+                let name = currency_name(&cur, false);
+                // The name's plural form is whichever one the string ends with.
+                let one = currency_name(&cur, true);
+                let chosen = if formatted.ends_with(&format!(" {name}")) {
+                    name
+                } else {
+                    one
+                };
+                (String::new(), chosen.to_string())
+            } else {
+                (currency_affix(&cur, &currency_display, true), String::new())
+            }
         } else {
-            String::new()
+            (String::new(), String::new())
         };
         let mut parts: Vec<(String, String)> = vec![];
         let mut rest = formatted.as_str();
+        if !currency_suffix.is_empty() {
+            rest = rest
+                .strip_suffix(currency_suffix.as_str())
+                .and_then(|r| r.strip_suffix(' '))
+                .unwrap_or(rest);
+        }
         // The accounting subpattern's affixes are `literal` parts and REPLACE the
         // minusSign part, so they are peeled before the sign check below
         // (`formatToParts/signDisplay-currency-en-US.js` expects
@@ -381,8 +516,25 @@ impl<'p> Vm<'p> {
             rest = r;
         }
         if !currency_prefix.is_empty() {
-            rest = rest.strip_prefix(currency_prefix.as_str()).unwrap_or(rest);
-            parts.push(("currency".into(), currency_prefix.clone()));
+            // An alphabetic affix ("USD", an unknown code) is separated from the
+            // digits by CLDR currencySpacing's U+00A0, a `literal` part of its own
+            // (absent before "NaN" / "∞", which are not digits).
+            match currency_prefix.strip_suffix('\u{a0}') {
+                Some(code) => {
+                    parts.push(("currency".into(), code.to_string()));
+                    match rest.strip_prefix(currency_prefix.as_str()) {
+                        Some(r) => {
+                            parts.push(("literal".into(), "\u{a0}".into()));
+                            rest = r;
+                        }
+                        None => rest = rest.strip_prefix(code).unwrap_or(rest),
+                    }
+                }
+                None => {
+                    rest = rest.strip_prefix(currency_prefix.as_str()).unwrap_or(rest);
+                    parts.push(("currency".into(), currency_prefix.clone()));
+                }
+            }
         }
         let suffix = if style == "percent" && rest.ends_with('%') {
             rest = &rest[..rest.len() - 1];
@@ -449,6 +601,10 @@ impl<'p> Vm<'p> {
         }
         if let Some(s) = suffix {
             parts.push(s);
+        }
+        if !currency_suffix.is_empty() {
+            parts.push(("literal".into(), " ".into()));
+            parts.push(("currency".into(), currency_suffix));
         }
         if !acct_close.is_empty() {
             parts.push(("literal".into(), acct_close.to_string()));
@@ -723,6 +879,64 @@ fn compact_affix_of(s: &str, display: &str) -> Option<&'static str> {
         .map(|(.., pat)| pat.trim_start_matches('0'))
         .filter(|aff| !aff.is_empty() && s.ends_with(aff))
         .max_by_key(|aff| aff.len())
+}
+
+/// The currency affix for `currencyDisplay` "symbol"/"narrowSymbol" (the
+/// locale symbol) or "code" (the ISO code, then CLDR currencySpacing's U+00A0
+/// when a digit follows: "USD 1.00", but "USDNaN" and "USD∞" as in ICU).
+fn currency_affix(code: &str, display: &str, digit_body: bool) -> String {
+    if display == "code" {
+        if digit_body {
+            format!("{code}\u{a0}")
+        } else {
+            code.to_string()
+        }
+    } else {
+        currency_symbol(code)
+    }
+}
+
+/// `en`'s cardinal `one` (i = 1 and v = 0) on an already-formatted number.
+fn currency_plural_one(formatted: &str) -> bool {
+    formatted.trim_start_matches(['-', '+']) == "1"
+}
+
+/// CLDR 47 `en` currency display names (`displayName-count-one` /
+/// `-count-other`), as ICU 77.1 (node 24) formats them. A code without a row
+/// falls back to the code itself, which ECMA-402 allows and ICU also does
+/// ("1.00 XYZ").
+const CURRENCY_NAMES_EN: &[(&str, &str, &str)] = &[
+    ("AUD", "Australian dollar", "Australian dollars"),
+    ("BRL", "Brazilian real", "Brazilian reals"),
+    ("CAD", "Canadian dollar", "Canadian dollars"),
+    ("CHF", "Swiss franc", "Swiss francs"),
+    ("CNY", "Chinese yuan", "Chinese yuan"),
+    ("DKK", "Danish krone", "Danish kroner"),
+    ("EUR", "euro", "euros"),
+    ("GBP", "British pound", "British pounds"),
+    ("HKD", "Hong Kong dollar", "Hong Kong dollars"),
+    ("ILS", "Israeli new shekel", "Israeli new shekels"),
+    ("INR", "Indian rupee", "Indian rupees"),
+    ("JPY", "Japanese yen", "Japanese yen"),
+    ("KRW", "South Korean won", "South Korean won"),
+    ("MXN", "Mexican peso", "Mexican pesos"),
+    ("NOK", "Norwegian krone", "Norwegian kroner"),
+    ("NZD", "New Zealand dollar", "New Zealand dollars"),
+    ("PLN", "Polish zloty", "Polish zlotys"),
+    ("RUB", "Russian ruble", "Russian rubles"),
+    ("SEK", "Swedish krona", "Swedish kronor"),
+    ("SGD", "Singapore dollar", "Singapore dollars"),
+    ("TRY", "Turkish lira", "Turkish Lira"),
+    ("USD", "US dollar", "US dollars"),
+    ("ZAR", "South African rand", "South African rand"),
+];
+
+/// The display name `currencyDisplay: "name"` prints for `code`.
+fn currency_name(code: &str, one: bool) -> String {
+    match CURRENCY_NAMES_EN.iter().find(|(c, ..)| *c == code) {
+        Some((_, singular, plural)) => if one { singular } else { plural }.to_string(),
+        None => code.to_string(),
+    }
 }
 
 /// The prefix and suffix of the NEGATIVE subpattern of CLDR's accounting

@@ -706,7 +706,9 @@ impl<'p> Vm<'p> {
             'a' | 'b' | 'B' => (hour12 && has(Self::F_HOUR)) || has(Self::F_DAYPERIOD),
             'h' | 'H' | 'K' | 'k' => has(Self::F_HOUR),
             'm' => has(Self::F_MINUTE),
-            's' => has(Self::F_SECOND),
+            // A fraction beside a minute brings its second along (the pattern
+            // matcher adds it, as ICU does), so "07:13:09.045", not "07:13:045".
+            's' => has(Self::F_SECOND) || (has(Self::F_FRAC) && has(Self::F_MINUTE)),
             'S' => has(Self::F_FRAC),
             'z' | 'Z' | 'O' | 'v' | 'V' | 'X' | 'x' => has(Self::F_ZONE),
             _ => true,
@@ -868,12 +870,12 @@ impl<'p> Vm<'p> {
         // clock to an epoch through the formatter's zone and straight back, so
         // the offset cancels and its own fields print unchanged
         // (`temporal-objects-resolved-time-zone.js`).
-        let tz_minutes = slot("timeZone")
+        let tz_seconds = slot("timeZone")
             .as_deref()
-            .and_then(|tz| time_zone_offset_minutes_at(tz, ms as i128))
+            .and_then(|tz| time_zone_offset_seconds_at(tz, ms as i128))
             .unwrap_or(0);
         let offset_ms = if absolute {
-            tz_minutes as i128 * 60_000
+            tz_seconds as i128 * 1_000
         } else {
             0
         };
@@ -1118,7 +1120,7 @@ impl<'p> Vm<'p> {
                         'z' | 'Z' | 'O' | 'v' | 'V' | 'X' | 'x' => {
                             out.push((
                                 "timeZoneName",
-                                self.dtf_zone_name(resolved, *c, n, tz_minutes),
+                                self.dtf_zone_name(resolved, *c, n, tz_seconds),
                             ));
                         }
                         // A field this engine does not implement (quarter, week
@@ -1202,14 +1204,13 @@ impl<'p> Vm<'p> {
     /// asserts the GMT spelling, `…/default-includes-time-and-time-zone-name.js`
     /// the UTC one). The *Offset and *Generic styles stay on the GMT format for
     /// UTC too.
-    fn dtf_zone_name(&self, resolved: u32, c: char, n: usize, tz_minutes: i64) -> String {
+    fn dtf_zone_name(&self, resolved: u32, c: char, n: usize, tz_seconds: i64) -> String {
         let slot = |k: &str| -> Option<String> {
             match self.heap.get(resolved) {
                 HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.val_at(i))),
                 _ => None,
             }
         };
-        let m = tz_minutes;
         let utc_named = slot("timeZone").as_deref() == Some("UTC") && c == 'z';
         if utc_named {
             return if n >= 4 {
@@ -1219,13 +1220,25 @@ impl<'p> Vm<'p> {
             }
             .to_string();
         }
-        if m == 0 {
+        if tz_seconds == 0 {
             return "GMT".to_string();
         }
-        let sign = if m < 0 { '-' } else { '+' };
-        let (h, mi) = (m.abs() / 60, m.abs() % 60);
-        if mi != 0 {
-            format!("GMT{sign}{h}:{mi:02}")
+        let sign = if tz_seconds < 0 { '-' } else { '+' };
+        let a = tz_seconds.abs();
+        let (h, mi, s) = (a / 3600, a / 60 % 60, a % 60);
+        // A sub-minute offset keeps its seconds in both forms (CLDR hourFormat
+        // with seconds): "GMT-0:44:30" / "GMT-00:44:30".
+        let secs = if s != 0 {
+            format!(":{s:02}")
+        } else {
+            String::new()
+        };
+        if c == 'O' && n >= 4 {
+            // UTS #35 `OOOO`, the LONG localized GMT format: `hourFormat` is
+            // +HH:mm, so the hour is two digits and the minutes always print.
+            format!("GMT{sign}{h:02}:{mi:02}{secs}")
+        } else if mi != 0 || s != 0 {
+            format!("GMT{sign}{h}:{mi:02}{secs}")
         } else {
             format!("GMT{sign}{h}")
         }

@@ -247,6 +247,88 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Make room for `additional` more elements in a dense result a native
+    /// builtin is filling (concat, flat). `out` is not on the heap yet, so the
+    /// heap estimate cannot see it: a result committed first and noticed at
+    /// the next bytecode poll overshot a 16 MB ceiling by gigabytes. Growth
+    /// doubles the store, and each doubling admits the WHOLE new store first —
+    /// the work bound on the element count, the heap ceiling on the bytes — so
+    /// a result built from many parts is checked O(log n) times, not once per
+    /// part. `materialized` adds the `MAX_MATERIALIZED_ARRAY_LEN` RangeError
+    /// for results sized by a length rather than by stored elements.
+    pub(crate) fn reserve_array_result(
+        &mut self,
+        out: &mut Vec<Value>,
+        additional: usize,
+        materialized: bool,
+    ) -> Result<(), Thrown> {
+        let need = out.len().saturating_add(additional);
+        if materialized && need > MAX_MATERIALIZED_ARRAY_LEN {
+            return Err(Thrown(
+                "RangeError: array length exceeds the engine's dense-array limit".into(),
+            ));
+        }
+        if need <= out.capacity() {
+            return Ok(());
+        }
+        self.preflight_native_iteration_work(need as u64)?;
+        let grown = need.max(out.capacity().saturating_mul(2)).max(16);
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(grown.saturating_mul(std::mem::size_of::<Value>()))
+            .map_err(|message| Thrown(message.into()))?;
+        out.try_reserve_exact(grown - out.len())
+            .map_err(|_| Thrown("RangeError: array allocation failed".into()))
+    }
+
+    /// Admit `additional` more entries on the host-root stack, the same way
+    /// `reserve_array_result` admits the result they shadow. A built-in that
+    /// roots its working set holds every value TWICE — once in the Rust Vec,
+    /// once as a root — and a 2^22-element block copy is 32 MB of each, so a
+    /// result admitted without its roots overshot a 256 MB ceiling and trapped
+    /// the instance instead of raising the RangeError. Charged on the root
+    /// stack's own doublings, so a per-element caller pays O(log n) checks.
+    pub(crate) fn reserve_host_roots(&mut self, additional: usize) -> Result<(), Thrown> {
+        let need = self.host_result_roots.len().saturating_add(additional);
+        if need <= self.host_result_roots.capacity() {
+            return Ok(());
+        }
+        let grown = need
+            .max(self.host_result_roots.capacity().saturating_mul(2))
+            .max(16);
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(grown.saturating_mul(std::mem::size_of::<Value>()))
+            .map_err(|message| Thrown(message.into()))?;
+        let more = grown - self.host_result_roots.len();
+        self.host_result_roots
+            .try_reserve_exact(more)
+            .map_err(|_| Thrown("RangeError: array allocation failed".into()))
+    }
+
+    /// Admit a dense result of `len` elements sized by a LENGTH rather than by
+    /// elements that exist — a virtual array, an array-like `length`: past
+    /// `MAX_MATERIALIZED_ARRAY_LEN` a RangeError (never a truncation), then
+    /// the safe-profile work bound and the host heap ceiling for the store.
+    pub(crate) fn preflight_materialized_array(&mut self, len: usize) -> Result<(), Thrown> {
+        if len > MAX_MATERIALIZED_ARRAY_LEN {
+            return Err(Thrown(
+                "RangeError: array length exceeds the engine's dense-array limit".into(),
+            ));
+        }
+        self.preflight_native_iteration_work(len as u64)?;
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(len.saturating_mul(std::mem::size_of::<Value>()))
+            .map_err(|message| Thrown(message.into()))?;
+        Ok(())
+    }
+
+    /// True when the array at `idx` is VIRTUAL: its JS length is larger than
+    /// its dense store (see `MAX_DENSE_ARRAY_LEN`). The `is_empty` probe first
+    /// keeps the common no-sparse-array program at one load.
+    #[inline]
+    pub(crate) fn array_is_virtual(&self, idx: u32) -> bool {
+        !self.array_js_len.is_empty() && self.array_js_len.contains_key(&idx)
+    }
+
     /// Sandboxed VMs retain the historical exact-capacity builder. The public
     /// heap ceiling intentionally counts HeapObj slots, not payload buffers;
     /// applying this reserve there would therefore add up to 31 uncharged
@@ -412,14 +494,16 @@ impl<'p> Vm<'p> {
 /// allocating the capture string. `Vm::to_number` delegates its ordinary
 /// string arm here, so the two paths cannot drift.
 pub(crate) fn string_to_number(s: &str) -> f64 {
-    // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
-    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+    // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not, and
+    // excludes U+0085 (NEL), which it does: `Number("\u{85}1")` is NaN —
+    // `str_white_space` is the set.
+    let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
     if t.is_empty() {
         return 0.0;
     }
     // Non-decimal integer literals `0x…`/`0o…`/`0b…`
-    // (StringNumericLiteral; no sign allowed). Fold digits into an f64 so
-    // arbitrarily long literals don't overflow.
+    // (StringNumericLiteral; no sign allowed), correctly rounded exactly as
+    // the same literal in source is — see `non_decimal_digits_to_f64`.
     let radix = match t.as_bytes() {
         [b'0', b'x' | b'X', ..] => Some((16u32, &t[2..])),
         [b'0', b'o' | b'O', ..] => Some((8, &t[2..])),
@@ -427,14 +511,10 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
         _ => None,
     };
     if let Some((base, digits)) = radix {
-        let mut acc = 0.0f64;
-        for c in digits.chars() {
-            match c.to_digit(base) {
-                Some(d) => acc = acc * base as f64 + d as f64,
-                None => return f64::NAN,
-            }
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(base)) {
+            return f64::NAN;
         }
-        return if digits.is_empty() { f64::NAN } else { acc };
+        return crate::parse::lexer::non_decimal_digits_to_f64(digits.as_bytes(), base);
     }
     // The only Infinity spellings a StringNumericLiteral accepts are these
     // exact capital-I forms.
@@ -803,8 +883,12 @@ impl<'p> Vm<'p> {
     /// methods invoked via `.call(arrayLike, …)` on a non-array (object or string).
     pub(crate) fn array_like_read(&mut self, idx: u32) -> Result<Vec<Value>, Thrown> {
         let this = Value::heap(idx);
-        if let HeapObj::Array(items) = self.heap.get(idx) {
-            return Ok(items.clone());
+        // A dense array's store IS its elements; a VIRTUAL one's store is only
+        // the prefix, so it reads by length like any array-like.
+        if !self.array_is_virtual(idx) {
+            if let HeapObj::Array(items) = self.heap.get(idx) {
+                return Ok(items.clone());
+            }
         }
         // len = ToLength(Get(this, "length")): a throwing `length` getter, or a
         // Symbol / throwing-valueOf length, propagates (ReturnIfAbrupt) instead of
@@ -813,19 +897,16 @@ impl<'p> Vm<'p> {
         // also honours an array-like whose `length` is an object with valueOf.
         let lv = self.get_prop(this, "length")?;
         let len = self.to_number_strict(lv)?;
-        // ToLength: a positive `len` (including +Infinity / "Infinity" / a huge
-        // finite) clamps to MAX_DENSE_ARRAY_LEN; NaN and ≤0 (incl. -Infinity) → 0.
-        // `len as usize` saturates for +Infinity, so the `.min` bounds it.
-        let len = if len > 0.0 {
-            (len as usize).min(crate::vm::MAX_DENSE_ARRAY_LEN)
-        } else {
-            0
-        };
+        // ToLength; NaN and ≤0 (incl. -Infinity) → 0. `as usize` saturates for
+        // +Infinity. A length past the materialization cap is a RangeError:
+        // reading only a prefix made `toSorted`/`with` silently drop the tail.
+        let len = if len > 0.0 { len as usize } else { 0 };
+        self.preflight_materialized_array(len)?;
         let mut out = Vec::with_capacity(len.min(4096));
         for i in 0..len {
             // An index getter that throws must propagate (ReturnIfAbrupt) — absent
             // properties already come back Ok(undefined) from get_index.
-            out.push(self.get_index(this, Value::int(i as i32))?);
+            out.push(self.get_index(this, Value::num(i as f64))?);
         }
         Ok(out)
     }
@@ -950,20 +1031,37 @@ impl<'p> Vm<'p> {
                 return Ok(out); // dense fast path
             }
         }
-        let len_v = self.get_prop(obj, "length")?;
-        let len_u64 = self.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1) as u64;
-        // Do not narrow ToLength before applying the safe-profile work cap:
-        // on wasm32 an attacker-controlled 2^32 used to wrap to an empty list.
-        self.preflight_native_iteration_work(len_u64)?;
-        let len = usize::try_from(len_u64)
-            .map_err(|_| Thrown("RangeError: argument list is too large".into()))?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(len)
-            .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
-        for i in 0..len {
-            out.push(self.get_index(obj, Value::num(i as f64))?);
-        }
-        Ok(out)
+        // The generic path reads `length` and every index with [[Get]], so a
+        // getter or Proxy trap runs between elements. `obj` can be a fresh
+        // trap result (a Proxy ownKeys list) and the elements read so far live
+        // only in `out` until the caller hands them to a frame: park both.
+        self.with_host_roots(&[obj], |vm| {
+            let len_v = vm.get_prop(obj, "length")?;
+            let len_u64 = vm.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+            // Do not narrow ToLength before applying the safe-profile work cap:
+            // on wasm32 an attacker-controlled 2^32 used to wrap to an empty list.
+            vm.preflight_native_iteration_work(len_u64)?;
+            // A profile-independent ceiling: the work cap above is unbounded in
+            // the default profile, where `f.apply(null, {length: 2**32 - 1})`
+            // used to commit ~32 GB for the list and then spin through four
+            // billion element reads. No list this long can become a call.
+            const MAX_ARRAY_LIKE_LIST: u64 = 1 << 24;
+            if len_u64 > MAX_ARRAY_LIKE_LIST {
+                return Err(Thrown("RangeError: Invalid array length".into()));
+            }
+            let len = usize::try_from(len_u64)
+                .map_err(|_| Thrown("RangeError: argument list is too large".into()))?;
+            let mut out = Vec::new();
+            // Reserve a bounded prefix and let the list grow as it is read.
+            out.try_reserve_exact(len.min(1 << 16))
+                .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
+            for i in 0..len {
+                let v = vm.get_index(obj, Value::num(i as f64))?;
+                vm.push_host_root(v);
+                out.push(v);
+            }
+            Ok(out)
+        })
     }
 
     /// IsConcatSpreadable(O) (ES 23.1.3.1.1): a `Symbol.isConcatSpreadable`
@@ -984,68 +1082,6 @@ impl<'p> Vm<'p> {
         // Step 4 is the REAL IsArray: it pierces Proxy targets (a proxy over an
         // array IS spreadable) and throws on a revoked proxy.
         self.value_is_array_throwing(v)
-    }
-
-    /// Recursively flatten nested arrays up to `depth` levels (for `Array.flat`).
-    /// Each nested array is cloned out before recursing (releases the heap borrow).
-    pub(crate) fn flatten_array(&self, items: &[Value], depth: i32) -> Result<Vec<Value>, Thrown> {
-        let mut work = 0u64;
-        self.flatten_array_at(items, depth, 0, &mut work)
-    }
-
-    fn flatten_array_at(
-        &self,
-        items: &[Value],
-        depth: i32,
-        active_depth: u32,
-        work: &mut u64,
-    ) -> Result<Vec<Value>, Thrown> {
-        *work = work
-            .checked_add(items.len() as u64)
-            .ok_or_else(|| Thrown("RangeError: native builtin iteration limit exceeded".into()))?;
-        self.preflight_native_iteration_work(*work)?;
-        let mut out = Vec::new();
-        for v in items {
-            let nested: Option<Vec<Value>> = if depth > 0 && v.is_heap() {
-                match self.heap.get(v.heap_index()) {
-                    HeapObj::Array(a) => Some(a.clone()),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            match nested {
-                Some(a) => {
-                    let next_depth = active_depth.checked_add(1).ok_or_else(|| {
-                        Thrown("RangeError: array flattening nesting limit exceeded".into())
-                    })?;
-                    #[cfg(feature = "safe-sandbox")]
-                    if next_depth > 64 {
-                        return Err(Thrown(
-                            "RangeError: array flattening nesting limit exceeded".into(),
-                        ));
-                    }
-                    let flattened = self.flatten_array_at(&a, depth - 1, next_depth, work)?;
-                    if (out.len() as u64).saturating_add(flattened.len() as u64)
-                        > MAX_NATIVE_ITERATION_WORK
-                    {
-                        return Err(Thrown(
-                            "RangeError: native builtin iteration limit exceeded".into(),
-                        ));
-                    }
-                    out.extend(flattened);
-                }
-                None => {
-                    if out.len() as u64 >= MAX_NATIVE_ITERATION_WORK {
-                        return Err(Thrown(
-                            "RangeError: native builtin iteration limit exceeded".into(),
-                        ));
-                    }
-                    out.push(*v);
-                }
-            }
-        }
-        Ok(out)
     }
 
     /// Strict equality between two raw values (no register indirection). Mirrors
@@ -1128,6 +1164,18 @@ impl<'p> Vm<'p> {
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
             return Ok(v);
         }
+        // An object's ToPrimitive result is kept as the string VALUE it is:
+        // `String(['\uD800'])` is the array's join result, surrogate intact.
+        // (Same protocol and order as `to_js_string`'s object path.)
+        let v = if self.is_object_value(v) {
+            let p = self.to_primitive_string(v)?;
+            if p.is_heap() && self.heap.is_str_like(p.heap_index()) {
+                return Ok(p);
+            }
+            p
+        } else {
+            v
+        };
         let s = self.to_js_string(v)?;
         Ok(self.alloc_str(s))
     }
@@ -1388,8 +1436,8 @@ impl<'p> Vm<'p> {
         }
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
-                let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+                // StrWhiteSpace: U+FEFF in, U+0085 out (unlike Rust's trim).
+                let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
                 if t.is_empty() {
                     return *x == BigVal::Small(0);
                 }
@@ -2381,7 +2429,11 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<std::cmp::Ordering>, Thrown> {
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                let y = if s.trim().is_empty() {
+                // StringToBigInt: an all-StrWhiteSpace string is 0n.
+                let y = if s
+                    .trim_matches(crate::vm::helpers_numeric::str_white_space)
+                    .is_empty()
+                {
                     Some(BigVal::Small(0))
                 } else {
                     parse_bigint_str(&s)
@@ -2838,24 +2890,24 @@ impl<'p> Vm<'p> {
     /// The special `String(symbol)` / Symbol.prototype.toString form. Ordinary
     /// ToString(Symbol) must throw, so this cannot use `to_js_string`; compose
     /// the already-string description with the same output and heap checks as
-    /// every other guest-derived string builder.
-    pub(crate) fn symbol_descriptive_string(&mut self, symbol: Value) -> Result<String, Thrown> {
+    /// every other guest-derived string builder. Built as WTF-8, so a
+    /// description holding a lone surrogate keeps it.
+    pub(crate) fn symbol_descriptive_value(&mut self, symbol: Value) -> Result<Value, Thrown> {
         let desc = match symbol.is_heap().then(|| self.heap.get(symbol.heap_index())) {
             Some(HeapObj::Symbol { desc, .. }) => *desc,
             _ => Value::UNDEFINED,
         };
         let description = if desc == Value::UNDEFINED {
-            None
+            Vec::new()
         } else {
-            Some(self.display_checked(desc)?)
+            self.to_wtf8_string(desc)?
         };
-        let mut out = String::new();
-        self.append_guest_string(&mut out, "Symbol(")?;
-        if let Some(description) = description {
-            self.append_guest_string(&mut out, &description)?;
-        }
-        self.append_guest_string(&mut out, ")")?;
-        Ok(out)
+        let mut out = Vec::new();
+        self.reserve_guest_wtf8(&mut out, description.len() + 8)?;
+        out.extend_from_slice(b"Symbol(");
+        out.extend_from_slice(&description);
+        out.push(b')');
+        Ok(self.alloc_wtf8_str(out))
     }
 
     fn display_string_into(&self, out: &mut DisplayBuffer, idx: u32) {
@@ -3381,7 +3433,7 @@ impl<'p> Vm<'p> {
                     if i != 0 {
                         out.push_str(", ");
                     }
-                    out.push_str(key);
+                    out.push_str(guest_key_text(key));
                     out.push_str(": ");
                     self.inspect_value_into(out, *value, true, depth + 1);
                     if out.truncated {

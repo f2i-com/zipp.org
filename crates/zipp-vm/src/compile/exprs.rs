@@ -194,6 +194,22 @@ pub(crate) enum PropVal<'a> {
     Func(&'a ast::Function),
 }
 
+/// Elements one fixed-block `NewArray` may carry; a longer literal is built
+/// incrementally (see `array_literal`).
+const NEWARRAY_MAX_ELEMS: usize = 1024;
+
+/// Whether an array literal takes `array_literal`'s incremental path whatever
+/// the register pressure: a spread element or more than `NEWARRAY_MAX_ELEMS`
+/// elements. (A short literal is also built incrementally when its block would
+/// not fit below `Reg::MAX`, i.e. only in a frame within 1024 registers of
+/// exhausting the register file; that case is not modelled here.)
+pub(crate) fn array_literal_is_incremental(elems: &[Option<ast::ArrayElem>]) -> bool {
+    elems.len() > NEWARRAY_MAX_ELEMS
+        || elems
+            .iter()
+            .any(|e| matches!(e, Some(ast::ArrayElem::Spread(_))))
+}
+
 impl<'a> FnCompiler<'a> {
     // ── expressions ──
     /// Compile `e`, returning the register holding its value.
@@ -207,6 +223,36 @@ impl<'a> FnCompiler<'a> {
             self.alloc_num_reg()
         };
         self.expr_into(e, dst)
+    }
+
+    /// Pin an operand register that the caller consumes only AFTER compiling
+    /// the `later` sub-expressions.
+    ///
+    /// A register local's read compiles to no instruction at all — `expr`
+    /// hands back the local's own register — so an instruction that consumes
+    /// it after a later operand ran sees whatever that operand stored:
+    /// `i + i++` added 2 + 1, and `a[i] = i++` wrote `a[1]`, where
+    /// left-to-right GetValue fixes the earlier operand first. Only an
+    /// assignment in the same expression can write a register local (a
+    /// closure or direct eval would have boxed it), so the copy is emitted
+    /// exactly when a later sub-expression may assign the name; every other
+    /// operand keeps the zero-copy read and its bytecode.
+    pub(crate) fn pin_operand(&mut self, e: &ast::Expr, r: Reg, later: &[&ast::Expr]) -> Reg {
+        let ast::Expr::Ident(name) = e else {
+            return r;
+        };
+        if !later
+            .iter()
+            .any(|x| super::calls::expr_may_assign_name(x, name))
+        {
+            return r;
+        }
+        if !matches!(self.resolve(name), Binding::Local(lr) if lr == r) {
+            return r;
+        }
+        let t = self.temp();
+        self.emit(Instr::Move { dst: t, src: r });
+        t
     }
 
     /// Compile `e` for its EFFECTS only — the caller will not read the result.
@@ -789,6 +835,7 @@ impl<'a> FnCompiler<'a> {
             return Ok(dst);
         }
         let obj = self.recv_expr(&m.object)?;
+        let obj = self.pin_operand(&m.object, obj, &[key_expr]);
         if m.optional {
             self.emit_optional_check(obj);
         }
@@ -1113,8 +1160,8 @@ impl<'a> FnCompiler<'a> {
             match q.cooked.as_ref() {
                 Some(s) => {
                     // A cooked value holding a lone surrogate goes to the
-                    // WTF-8-decoding constant slot. (Raw parts below are source
-                    // text — never markers.)
+                    // WTF-8-decoding constant slot — as does a raw part below,
+                    // when eval'd source carried one verbatim.
                     let idx = self.str_const(s);
                     self.emit(Instr::LoadConst { dst: r, idx });
                 }
@@ -1132,7 +1179,7 @@ impl<'a> FnCompiler<'a> {
         let raw_base = self.next_reg;
         for q in &quasi.quasis {
             let r = self.alloc_reg();
-            let idx = self.add_string_const(&q.raw);
+            let idx = self.str_const(&q.raw);
             self.emit(Instr::LoadConst { dst: r, idx });
         }
         self.emit(Instr::NewArray {
@@ -1149,6 +1196,8 @@ impl<'a> FnCompiler<'a> {
     }
 
     pub(crate) fn array_literal(&mut self, elems: &[Option<ast::ArrayElem>], dst: Reg) -> R<Reg> {
+        // (`array_literal_is_incremental` mirrors the size/spread half of the
+        // decision below for `builds_into_dst_incrementally`.)
         // The fixed-block `NewArray` form needs one CONTIGUOUS register per
         // element and passes the count as a `u16` argc, so it is only usable
         // for literals that actually fit the frame. A big literal (machine-
@@ -1161,14 +1210,9 @@ impl<'a> FnCompiler<'a> {
         // and pushes each value (including an explicit `LoadHole`) onto the
         // dense store, so it is semantically identical to `NewArray` — the
         // spread case below has always relied on that.
-        const NEWARRAY_MAX_ELEMS: usize = 1024;
         let n_elems = elems.len();
         let block_fits = self.next_reg as usize + n_elems <= Reg::MAX as usize;
-        let incremental = n_elems > NEWARRAY_MAX_ELEMS
-            || !block_fits
-            || elems
-                .iter()
-                .any(|e| matches!(e, Some(ast::ArrayElem::Spread(_))));
+        let incremental = array_literal_is_incremental(elems) || !block_fits;
         // With a `...spread` element the final length is dynamic, so build the
         // array incrementally via ArrayAppend instead of the fixed-block NewArray.
         if incremental {
@@ -1512,7 +1556,9 @@ impl<'a> FnCompiler<'a> {
         is_method: bool,
     ) -> R<u32> {
         let key = static_key_text(key).ok_or("unsupported object key in the zipp-vm subset")?;
-        let name = self.string_name(&key);
+        // The property NAME is the internal key form; `key` stays the guest
+        // text (NamedEvaluation below).
+        let name = self.string_name(&crate::vm::helpers_numeric::escape_guest_key(key.clone()));
         // A concise method gets a [[HomeObject]] (for `super`); the flag scopes
         // exactly the value compilation, as in `object_data_prop`.
         if is_method {
@@ -1741,7 +1787,9 @@ impl<'a> FnCompiler<'a> {
         }
         // Static identifier / string / number literal key.
         let key = static_key_text(key).ok_or("unsupported object key in the zipp-vm subset")?;
-        let name = self.string_name(&key);
+        // The property NAME is the internal key form; `key` stays the guest
+        // text (NamedEvaluation below).
+        let name = self.string_name(&crate::vm::helpers_numeric::escape_guest_key(key.clone()));
         // `{ fn: function(){}, m(){}, C: class{} }` — an anonymous
         // value function/class takes the property key as its name,
         // EXCEPT `{ __proto__: fn }` (a proto-setter, not a data
@@ -1875,6 +1923,7 @@ impl<'a> FnCompiler<'a> {
             if let ast::Expr::Binary { op, left, right } = test {
                 if matches!(op, ast::BinaryOp::Lt | ast::BinaryOp::LtEq) {
                     let a = self.expr(left)?;
+                    let a = self.pin_operand(left, a, &[right]);
                     let b = self.expr(right)?;
                     let j = self.here();
                     match op {
@@ -1939,6 +1988,7 @@ impl<'a> FnCompiler<'a> {
         let acc = self.temp();
         let save = self.next_reg; // == acc + 1: leaf temps roll back to here
         let a = self.expr(leaves[0])?;
+        let a = self.pin_operand(leaves[0], a, &leaves[1..2]);
         let b = self.expr(leaves[1])?;
         self.emit(Instr::Add { dst: acc, a, b });
         self.set_next_reg(save);
@@ -2070,6 +2120,7 @@ impl<'a> FnCompiler<'a> {
         // proxy and @@hasInstance-bearing constructors.
         if matches!(op, Op::Instanceof) {
             let val = self.expr(left)?;
+            let val = self.pin_operand(left, val, &[right]);
             let ctor = self.expr(right)?;
             self.emit(Instr::InstanceOfDyn { dst, val, ctor });
             return Ok(dst);
@@ -2077,6 +2128,7 @@ impl<'a> FnCompiler<'a> {
         // `key in obj`.
         if matches!(op, Op::In) {
             let key = self.expr(left)?;
+            let key = self.pin_operand(left, key, &[right]);
             let obj = self.expr(right)?;
             self.emit(Instr::HasProp {
                 dst,
@@ -2162,6 +2214,7 @@ impl<'a> FnCompiler<'a> {
         // `set_next_reg` ignores as a boundary: the scratch below stays put.
         let left_floor = self.next_reg;
         let a = self.expr(left)?;
+        let a = self.pin_operand(left, a, &[right]);
         self.set_next_reg(left_floor.max(a.saturating_add(1)));
         let r = self.expr(right)?;
         let instr = match op {
@@ -2380,6 +2433,7 @@ impl<'a> FnCompiler<'a> {
                         return Ok(dst);
                     }
                     let obj = self.recv_expr(&m.object)?;
+                    let obj = self.pin_operand(&m.object, obj, &[ke]);
                     let strict = self.cx.in_strict;
                     // Fuse `delete obj[<plain string literal> + e]` → DeleteIndexConcat
                     // (no throwaway concat-key allocation; see GetIndexConcat).
@@ -2696,6 +2750,7 @@ impl<'a> FnCompiler<'a> {
                 }
                 (_, ast::MemberProp::Computed(ke)) => {
                     let obj = self.recv_expr(&m.object)?;
+                    let obj = self.pin_operand(&m.object, obj, &[ke]);
                     let key = self.expr(ke)?;
                     // `o[k]++` reads then writes `o[k]` — coerce the key ToPropertyKey
                     // ONCE and reuse it (its toString/valueOf must not run twice).
@@ -2856,6 +2911,26 @@ impl<'a> FnCompiler<'a> {
                     if r != dst {
                         self.emit(Instr::Move { dst, src: r });
                     }
+                } else if dst == r {
+                    // `x = x++`: the result register IS the variable, so the
+                    // coerced old value is parked in a temp across the store of
+                    // the new one and then written back as the expression's
+                    // value (in place, the increment overwrote it: 5 became 6).
+                    let old = self.temp();
+                    self.emit(Instr::AddInt {
+                        dst: old,
+                        a: r,
+                        imm: 0,
+                        upd: true,
+                    });
+                    self.emit(Instr::AddInt {
+                        dst: r,
+                        a: old,
+                        imm: delta,
+                        upd: true,
+                    });
+                    self.emit(Instr::Move { dst, src: old });
+                    self.dec_next_reg(1); // reclaim `old`
                 } else {
                     // Yield ToNumeric(old) (one coercion), then increment from it.
                     self.emit(Instr::AddInt {

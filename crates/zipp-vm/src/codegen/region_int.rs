@@ -1673,8 +1673,19 @@ pub(crate) fn compile_region_int_maybe_cold(
         // (heap/calls decline the region), so this is sound. The label was already
         // emitted above so any jump still resolves. NOTE: jumps/stores/returns
         // aren't reg-defs, so `writes_reg` returns None for them — never skipped.
+        // A split receiver's object load and a captured callee's GetProp
+        // (`split_recv_lg`) are not value ops either: they materialise the boxed
+        // reference in the FRAME SLOT that a guard exit inside `[GetProp, call]`
+        // hands to the interpreter. Their register is `dead` whenever the only
+        // numeric def is a recycled completion temp, and skipping them left the
+        // slot holding that number — `TypeError: 1 is not a function` for
+        // `Math.imul(-t[i], 7)` on a `Neg` bail, or `charCodeAt` on the loop
+        // counter.
         if let Some(d) = writes_reg(&proto.code[ip]) {
-            if plan.dead.contains(&d) && captured_arr_push(proto, ip, ta_plan).is_none() {
+            if plan.dead.contains(&d)
+                && captured_arr_push(proto, ip, ta_plan).is_none()
+                && !plan.split_recv_lg.contains(&ip)
+            {
                 continue;
             }
         }
@@ -1784,6 +1795,10 @@ pub(crate) fn compile_region_int_maybe_cold(
                 if let Some(&(val_reg, shift)) = plan.mul_shift.get(&ip) {
                     // Guard-elided multiply by a constant power of two: a left
                     // shift (logical == arithmetic for the proven-in-range i64).
+                    // `mul_shift` requires that constant to be a POSITIVE power
+                    // of two (`k >= 2`), so a zero product means a zero value
+                    // operand and JS's answer is +0 — the -0 case below cannot
+                    // arise here and this arm stays branch-free.
                     let vx = xh(&plan, val_reg);
                     if d != vx {
                         dynasm!(ops ; movdqa Rx(d), Rx(vx));
@@ -1791,13 +1806,31 @@ pub(crate) fn compile_region_int_maybe_cold(
                     dynasm!(ops ; psllq Rx(d), shift as i8);
                 } else if plan.elide_guard.contains(&ip) {
                     // Result proven within ±2^53 ⇒ no i64 overflow possible and
-                    // no 2^53 guard needed; bare imul through the gprs.
+                    // no 2^53 guard needed; bare imul through the gprs. A ZERO
+                    // product with a negative operand is -0 in JS (`0 * -5`),
+                    // which has no i64 home: bail at THIS ip (dst unwritten) so
+                    // the interpreter makes the double. One operand is 0, so the
+                    // other's sign is the sign of `a | b` (rcx still holds b).
                     let (ax, bx) = (xh(&plan, a), xh(&plan, b));
+                    let zchk = ops.new_dynamic_label();
+                    let store = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
                     dynasm!(ops
                         ; movq rax, Rx(ax)
                         ; movq rcx, Rx(bx)
                         ; imul rax, rcx
+                        ; test rax, rax
+                        ; jz => zchk
+                        ; => store
                         ; movq Rx(d), rax
+                        ; jmp => done
+                        ; => zchk
+                        ; movq rdx, Rx(ax)
+                        ; or rdx, rcx
+                        ; jns => store
+                        ; mov DWORD [rsi], rip_at // resume at THIS op (dst unwritten)
+                        ; jmp => flush_exit
+                        ; => done
                     );
                 } else {
                     // i64 multiply via imul (gpr). On i64 OVERFLOW (product ≥ 2^63)
@@ -1805,16 +1838,27 @@ pub(crate) fn compile_region_int_maybe_cold(
                     // interpreter redoes it in f64 (reading the flushed operands). On a
                     // representable-but-large product the 2^53 guard handles it (like
                     // add): flush via cvtsi2sd (== JS's rounded product) + resume ip+1.
+                    // A zero product with a negative operand (-0) bails the same
+                    // way as overflow — see the guard-elided arm above.
                     let (ax, bx) = (xh(&plan, a), xh(&plan, b));
                     let ovf = ops.new_dynamic_label();
+                    let zchk = ops.new_dynamic_label();
+                    let store = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
                     dynasm!(ops
                         ; movq rax, Rx(ax)
                         ; movq rcx, Rx(bx)
                         ; imul rax, rcx
                         ; jo => ovf            // i64 overflow → can't represent; redo in interp
+                        ; test rax, rax
+                        ; jz => zchk
+                        ; => store
                         ; movq Rx(d), rax
                         ; jmp => done
+                        ; => zchk
+                        ; movq rdx, Rx(ax)
+                        ; or rdx, rcx
+                        ; jns => store
                         ; => ovf
                         ; mov DWORD [rsi], rip_at // resume at THIS op (dst not written)
                         ; jmp => flush_exit

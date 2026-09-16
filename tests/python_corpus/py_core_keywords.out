@@ -1,0 +1,20 @@
+0 (1, 5, 3)
+1 (1, 2, 3)
+2 (1, 8, 9)
+3 (2, 1, 3)
+4 TypeError f() got multiple values for argument 'a'
+5 TypeError f() got an unexpected keyword argument 'zzz'
+6 TypeError f() takes from 1 to 2 positional arguments but 3 were given
+7 TypeError f() missing 1 required positional argument: 'a'
+8 (1, 2, {'a': 3, 'z': 4})
+9 (1, 2, {'y': 1, 'x': 2})
+10 TypeError g() missing 1 required positional argument: 'a'
+11 ((1, 2), 3, {'q': 4, 'p': 5})
+12 ((), 1, {})
+13 TypeError h() missing 1 required keyword-only argument: 'x'
+14 (1, 2, 3, (4, 5), 6, 8, {'z': 7})
+15 (1, 2, 0, (), 0, 5, {})
+16 (1, 2, 3, (), 0, 5, {'w': 1})
+17 TypeError k() got multiple values for argument 'b'
+18 (1, 2, 3)
+19 (1, 2, 4)

@@ -14,3 +14,5 @@ mod descriptors;
 mod enumerate;
 mod member;
 mod proxy_ops;
+
+pub(crate) use member::ClassLookup;

@@ -65,8 +65,11 @@ the test262 harness.
 
 The ordinary CLI is for trusted programs. `zipp sandbox` and `zipp js
 --sandbox` remain compatibility aliases with resource supervision, but their
-executable still contains the native JIT machinery. Use the separately built
-`zipp-sandbox` when compile-time JIT/unsafe exclusion matters.
+executable still contains the native JIT machinery, and the hardened build's
+regular-expression execution and backtrack-memory budgets are not compiled in,
+so a catastrophic pattern runs until the wall-clock timeout instead of raising
+a catchable `RangeError`. Use the separately built `zipp-sandbox` when
+compile-time JIT/unsafe exclusion, or the full resource policy, matters.
 
 ## Conformance and language coverage
 
@@ -85,6 +88,15 @@ DateTimeFormat uses generated CLDR 48 data for `en`/`en-US`, `de`/`de-DE`,
 `ja`/`ja-JP`, `zh`/`zh-CN` and `ar-EG`. Its original pinned ECMA-402 shard passes
 488/488 executions without skips. Other Intl services currently ship English
 locale data only; this is not a claim of complete ECMA-402 conformance.
+
+One limitation there is about missing Unicode data rather than missing locales,
+so it shows up even in English: `Intl.Segmenter` does not ship the UAX #29
+`Grapheme_Cluster_Break` / `Word_Break` / `Sentence_Break` tables. Its
+`grapheme` granularity therefore splits Hangul jamo sequences, regional-
+indicator (flag) pairs and ZWJ/skin-tone emoji sequences into several segments,
+and `sentence` returns the whole string as one segment.
+`crates/zipp-vm/src/vm/segmenter.rs` states exactly which UAX #29 rules are and
+are not implemented.
 
 Errored module cycles, repeat dynamic import of those cycles, deferred-module
 top-level-await ordering, module-source path handling, and cross-realm
@@ -352,18 +364,18 @@ complete, provenance-stamped capture.
 
 ## Performance evidence
 
-The canonical engine table lives in the root README. Its current clean PGO
-inputs are `bench/real13_21288c1_pgo_2026-08-30.json` and
-`bench/hostile/head_clean_21288c1_pgo_2026-08-30.json`; both are complete
-four-engine captures with `publishable:true` and exact output throughout.
+The canonical engine table lives in the root README, which quotes its
+geomeans and intervals. Its clean PGO inputs are
+`bench/real13_8229b3fc_pgo_2026-09-02.json` and
+`bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`; both are complete
+four-engine captures with `publishable:true` and exact output throughout. The
+README also names the later `14770703` capture, for which no headline is claimed.
 
-At engine commit `21288c1`, Zipp's paired cold geomean is **0.642× Node** across
-the normal 13 and **0.881× Node** across the hostile 17. The explicitly derived
-equal-row all-30 view is **0.768× Node** [0.764, 0.771]. That aggregate does not
-erase suite ownership: its point is
+The optional all-30 view is an explicitly derived equal-row aggregate. It does
+not erase suite ownership: its point is
 `exp((13 × ln(G13) + 17 × ln(G17)) / 30)`, and its descriptive bootstrap treats
-the two separately captured suites as independent strata. Thirteen Node point
-gaps remain, so it is not an every-row superiority claim.
+the two separately captured suites as independent strata. Node point gaps
+remain, so it is not an every-row superiority claim.
 
 Current optimization evidence and next work live in `PERF_ROADMAP.md`. Detailed
 B001–B252 measurements and refutations live in the archive.

@@ -240,8 +240,9 @@ Zipp does not include its PyTorch runner, models, checkpoints or native endpoint
 
 ### Run the JavaScript engine
 
-The `0.0.18` release configuration provides x86-64 JavaScript CLI binaries and
-two browser WebAssembly packages:
+The `0.0.18` release provides x86-64 CLI binaries for Windows and Linux
+(JavaScript, plus the experimental Python frontend as `zipp py`) and two browser
+WebAssembly packages:
 
 | Download | Use it for |
 | --- | --- |
@@ -250,9 +251,9 @@ two browser WebAssembly packages:
 
 See [GitHub Releases](https://github.com/f2i-com/zipp.org/releases) for published
 assets and [0.0.18 release notes](docs/releases/0.0.18.md) for scope and limits.
-This checkout is a release candidate; the download commands below still use
-published **0.0.17** until 0.0.18 passes every release gate. Both WASM archives carry the
-exact source revision, language profile and checksums.
+`0.0.18` is the latest published release; the download commands below use it.
+Both WASM archives carry the exact source revision, language profile and
+checksums.
 
 Save this as `app.js`, then choose your platform below:
 
@@ -273,7 +274,7 @@ the [browser example](#embed-zipp-webassembly-in-a-web-app), or the
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.17'
+$version = '0.0.18'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -293,7 +294,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.17
+version=0.0.18
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -302,7 +303,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.17-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.18-x86_64-unknown-linux-gnu/zipp`.
 
 </details>
 
@@ -360,7 +361,8 @@ print(fib(30))
 ```sh
 zipp py fib.py                 # 832040
 zipp run fib.py                # frontend chosen by extension, shebang or directive
-zipp run --lang=python -       # from standard input
+zipp run tool                  # an extensionless `#!/usr/bin/env python3` script
+zipp run --lang=python -       # from standard input (no project folder)
 ```
 
 Classes (including metaclasses, descriptors and `__slots__`), exceptions
@@ -380,7 +382,10 @@ filesystem, so `open()`, `os`, `os.path`, `pathlib` and `json.load` see the
 project's data; `.py` files are modules and packages by folder
 (`legacy/fast_memory.py` is `legacy.fast_memory`, with or without an
 `__init__.py`); `sys.argv` carries the arguments; and files the program
-writes are copied back under the folder when it finishes. A `test_*.py`
+writes are copied back under the folder when it finishes (never over a file
+it could not see, such as one in `dist/`, a dot-folder or over the limits).
+Any script name runs, extensionless shebang scripts included, and output
+appears as the program prints it. A `test_*.py`
 entry runs its tests through the bundled `pytest` subset. The bundled
 library also includes a `torch` subset (tensors over typed arrays with
 reverse-mode autograd, `nn`, `nn.functional`, `optim`, `save`/`load` in
@@ -420,7 +425,7 @@ cd crates/zipp-wasm && ./build-variants.sh all && node playground/serve.cjs
 **Yes: JavaScript can use WebGL directly.** [WebGL is a browser JavaScript API](https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API),
 and this project's [WebGL2 graph backend](crates/zipp-wasm/gpu-lab/src/backends/webgl2.mjs),
 [WebGPU graph backend](crates/zipp-wasm/gpu-lab/src/backends/webgpu.mjs), and
-[WebGL2 backend](crates/zipp-wasm/gpu-lab/src/backends/webgl2.mjs) are written in
+[CPU reference backend](crates/zipp-wasm/gpu-lab/src/backends/cpu.mjs) are written in
 JavaScript. Python is one way to author work for that runtime.
 
 ### Browser JavaScript: run a GPU graph
@@ -529,7 +534,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.17
+version=0.0.18
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"
@@ -705,8 +710,9 @@ Zipp, **30.4 ms** for Node, **43.3 ms** for Bun and **82.6 ms** for Deno.
 <details>
 <summary><strong>Full Node, Bun and Deno results, confidence intervals and methodology</strong></summary>
 
-The current public evidence is the clean PGO capture at engine commit
-`8229b3fc`: [`real13_8229b3fc_pgo_2026-09-02.json`](bench/real13_8229b3fc_pgo_2026-09-02.json)
+The canonical table is the clean PGO capture at engine commit `8229b3fc`, the
+last before B280 changed native call lowering (see the note after the table):
+[`real13_8229b3fc_pgo_2026-09-02.json`](bench/real13_8229b3fc_pgo_2026-09-02.json)
 and [`head_clean_8229b3fc_pgo_2026-09-02.json`](bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json).
 Both artifacts record `publishable:true`, `ALL_CORRECT=1`, 15 complete
 counterbalanced repetitions, 10,000 bootstrap samples, exact output, and no
@@ -780,9 +786,16 @@ captured cell gets the native cross lane, bodies with `for...of` or `try`
 receive a frame-backed cross entry instead of the interpreter trampoline, and
 small holders take the holder-grain write barrier so an overwritten young value
 no longer floats into old space. Each landed with a one-binary latch A/B; the
-capture-to-capture row moves sit inside the intervals. Main has since added
-B274-B278, which are interpreter-side (the wasm rows above) and leave this
-native capture as the current public score. See the
+capture-to-capture row moves sit inside the intervals. B274-B278 then changed
+only the interpreter (the wasm rows above), but B280 (v0.0.15) made
+specification-order method calls the default and changed native call lowering.
+The newer publishable capture at `14770703`
+([`real13_14770703_pgo_2026-09-11.json`](bench/real13_14770703_pgo_2026-09-11.json),
+[`head_clean_14770703_pgo_2026-09-11.json`](bench/hostile/head_clean_14770703_pgo_2026-09-11.json))
+is slower against Node: headline ten 1.0025x [0.995, 1.009], all 13 0.677x
+[0.671, 0.682] and hostile 17 cold 0.875x [0.869, 0.883]. HANDOFF B314 places
+the change between `8229b3fc` and `e6e0f65d`, with B280's strict default the
+unmeasured suspect. No headline is claimed for `14770703`. See the
 [`bench` guide](bench/README.md), [hostile suite](bench/hostile/README.md), and
 [`PERF_ROADMAP.md`](PERF_ROADMAP.md) for exact methodology and remaining work.
 
@@ -969,8 +982,9 @@ ES2015–ES2025 is essentially complete, including:
 - `BigInt`, `Proxy`/`Reflect`, modern regular expressions, and `Temporal` with
   fifteen calendars;
 - ES modules, dynamic/typed/deferred/source-phase imports, and top-level await;
-- `eval`, `Function`, `ShadowRealm`, structured cloning, and browser-oriented
-  embedding APIs.
+- `eval`, `Function`, `ShadowRealm`, and browser-oriented embedding APIs (the
+  WASM host SDK structured-clones data across its Worker boundary; guest code
+  has no `structuredClone` global).
 
 DateTimeFormat ships CLDR 48 data for `en`/`en-US`, `de`/`de-DE`, `ja`/`ja-JP`,
 `zh`/`zh-CN` and `ar-EG`. Other Intl services

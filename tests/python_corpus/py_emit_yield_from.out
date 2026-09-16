@@ -1,0 +1,23 @@
+prime None
+send 10.0 15.0 25.0
+finish after [(3, 75.0)]
+throw a inner caught boom b outer done
+unhandled 1 outer caught KeyError('k')
+close x-1
+  inner finally x
+  outer finally
+closed
+throw-return waiting delegation over
+  Echo.send s
+  Echo.throw ValueError
+echo 1 2 99 3 echo result echo-done
+  Echo.close
+list 1
+AttributeError 'list_iterator' object has no attribute 'send'
+IndexError i
+chain [0, 1, 2, 'a', 'b', 0, 1, 4]
+empty value None
+twice 1 1
+twice value ('r', 'r')
+  resumed with None True
+  again True

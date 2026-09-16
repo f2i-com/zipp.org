@@ -1,0 +1,7 @@
+classmethod.__get__ Meth
+function.__get__ plain
+staticmethod.__get__ static
+property.__get__ prop
+classmethod.__func__ cm
+bound.__func__ True
+bound.__self__ True

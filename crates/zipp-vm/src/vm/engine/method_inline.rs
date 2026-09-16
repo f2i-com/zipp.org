@@ -540,9 +540,12 @@ impl<'p> Vm<'p> {
             }
             BigOp::Mul => {
                 if va.is_int() && vb.is_int() {
-                    Some(match va.as_int().checked_mul(vb.as_int()) {
-                        Some(v) => Value::int(v),
-                        None => Value::num(va.as_int() as f64 * vb.as_int() as f64),
+                    // Same -0 rule as the interpreter's `Mul` arm: a zero
+                    // product with a negative operand is the double -0.
+                    let (ia, ib) = (va.as_int(), vb.as_int());
+                    Some(match ia.checked_mul(ib) {
+                        Some(v) if v != 0 || (ia | ib) >= 0 => Value::int(v),
+                        _ => Value::num(ia as f64 * ib as f64),
                     })
                 } else if va.is_number() && vb.is_number() {
                     Some(Value::num(va.as_f64() * vb.as_f64()))

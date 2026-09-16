@@ -1,0 +1,12 @@
+basic Item(name='pen', qty=1, tags=['x']) Item(name='pen', qty=1, tags=[]) Item(name='ink', qty=3, tags=['blue']) False True 7.5 True
+order [Version(major=0, minor=9, patch=9), Version(major=1, minor=2, patch=0), Version(major=1, minor=2, patch=1), Version(major=1, minor=10, patch=0)] True Version(major=1, minor=10, patch=0) True
+frozen FrozenInstanceError
+frozen-ok Coord(x=3, y=4) 25 True v Coord(x=3, y=0)
+post-init Rect(w=2, h=5, area=10) 9
+inherit Derived(id=7, label='base', extra=True) ['id', 'label', 'extra'] {'id': 7, 'label': 'base', 'extra': True} (7, 'base', True) True
+asdict-nested {'items': [{'name': 'a', 'qty': 1, 'tags': []}, {'name': 'b', 'qty': 2, 'tags': []}], 'meta': {'k': 1}, 'inner': {'name': 'c', 'qty': 1, 'tags': []}}
+astuple-flat ('z', 5, [1, [2]]) (1, 2, 3)
+eq-false False True
+field-options WithRepr(a=1, cmp_ignored=0) True False
+workload 60 [1, 2, 3, 4] ['i0', 'i4', 'i8']
+replace Item(name='ink', qty=10, tags=['blue']) 3 Version(major=1, minor=2, patch=7)

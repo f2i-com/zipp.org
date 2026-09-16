@@ -49,14 +49,16 @@ var __zipp_py = (function () {
         t.mro = computeMro(t);
         return t;
     }
-    // C3 linearisation, as CPython.
+    // C3 linearisation, as CPython. Every class in it but `t` records `t` as
+    // a subclass, so a change to one of them reaches `t`'s lookup cache (see
+    // `typeChanged`).
     function computeMro(t) {
         const seqs = t.bases.map((b) => b.mro.slice());
         seqs.push(t.bases.slice());
         const result = [t];
         for (;;) {
             const live = seqs.filter((s) => s.length > 0);
-            if (live.length === 0) return result;
+            if (live.length === 0) { noteSubclass(t, result); return result; }
             let head = null;
             for (const s of live) {
                 const cand = s[0];
@@ -67,11 +69,37 @@ var __zipp_py = (function () {
             for (const s of live) if (s[0] === head) s.shift();
         }
     }
+    // Each class keeps weak references to all its subclasses (direct or
+    // not), so it never keeps a dynamically created class alive. Dead
+    // entries are dropped when the list has doubled since the last sweep.
+    const weakRef = typeof WeakRef === "function" ? (v) => new WeakRef(v) : (v) => ({ deref: () => v });
+    function noteSubclass(t, mro) {
+        for (let i = 1; i < mro.length; i++) {
+            const c = mro[i];
+            let subs = c.subclasses;
+            if (subs === undefined) { subs = c.subclasses = []; c.subSweep = 16; }
+            if (subs.length >= c.subSweep) { liveSubclasses(c, null); c.subSweep = 2 * subs.length + 16; }
+            subs.push(weakRef(t));
+        }
+    }
+    // Calls `visit` on every live subclass of `c` and compacts the list.
+    function liveSubclasses(c, visit) {
+        const subs = c.subclasses;
+        if (subs === undefined) return;
+        let live = 0;
+        for (let i = 0; i < subs.length; i++) {
+            const s = subs[i].deref();
+            if (s === undefined) continue;
+            subs[live++] = subs[i];
+            if (visit !== null) visit(s);
+        }
+        subs.length = live;
+    }
     const TypeType = makeType("type", [], new Map());
     TypeType.cls = TypeType;
     const ObjectType = makeType("object", [], new Map());
     ObjectType.cls = TypeType;
-    TypeType.bases = [ObjectType]; TypeType.mro = [TypeType, ObjectType];
+    TypeType.bases = [ObjectType]; TypeType.mro = [TypeType, ObjectType]; noteSubclass(TypeType, TypeType.mro);
     function newType(name, bases, dict, module) {
         const t = makeType(name, bases.length ? bases : [ObjectType], dict, module);
         t.cls = TypeType;
@@ -87,7 +115,8 @@ var __zipp_py = (function () {
         "dict_items", "enumerate", "zip", "map", "filter", "reversed", "iterator", "code"]) {
         T[name] = newType(name, [], new Map());
     }
-    T.bool.bases = [T.int]; T.bool.mro = [T.bool, T.int, ObjectType];
+    T.bool.bases = [T.int]; T.bool.mro = [T.bool, T.int, ObjectType]; noteSubclass(T.bool, [T.bool, T.int]);
+    ELLIPSIS.cls = T.ellipsis; NOTIMPL.cls = T.NotImplementedType;
     function typeOf(v) {
         const t = typeof v;
         if (t === "object") return v === null ? T.NoneType : (v.cls || ObjectType);
@@ -113,9 +142,8 @@ var __zipp_py = (function () {
     rt.ident = ident;
 
     // ---- exceptions ---------------------------------------------------------------------------
-    // Exception instances are ordinary objects carrying `args` plus `name` and
-    // `message` data properties so an uncaught one prints as "Name: message"
-    // at the host boundary.
+    // Exception instances are ordinary objects carrying `args`; one leaving
+    // the program becomes a host Error in entry.js (`hostError`).
     const E = {};
     rt.E = E;
     function defExc(name, base) { E[name] = newType(name, [base || E.Exception], new Map()); return E[name]; }
@@ -135,30 +163,21 @@ var __zipp_py = (function () {
     defExc("StopAsyncIteration"); defExc("JSONDecodeError", E.ValueError);
     defExc("BaseExceptionGroup", E.BaseException); defExc("ExceptionGroup", E.BaseExceptionGroup);
     E.ExceptionGroup.bases = [E.BaseExceptionGroup, E.Exception]; E.ExceptionGroup.mro = computeMro(E.ExceptionGroup);
-    function excMessage(e) {
-        const a = e.args;
-        if (!a || a.items.length === 0) return "";
-        if (a.items.length === 1) return e.cls === E.KeyError ? repr(a.items[0]) : str(a.items[0]);
-        return repr(a);
-    }
-    function locationText() {
-        const enc = __zipp_py_line;
+    function locationText(enc) {
         if (!enc) return "";
         const file = files[Math.floor(enc / 1000000)] || "?";
         return " (" + file + ":" + (enc % 1000000) + ")";
     }
+    // Runtime-raised exceptions take the exception being handled as their
+    // __context__ (a `raise` statement sets it again at raise time). The
+    // location is kept as the encoded line; its text, like the message, is
+    // built only when the exception reaches the host (most are caught).
     function makeExc(cls, args) {
-        const e = { cls: cls, dict: new Map(), args: sequence(T.tuple, args), cause: null, context: null,
-            traceback: locationText(), suppress: false };
-        refreshExc(e);
-        return e;
+        return { cls: cls, dict: new Map(), args: sequence(T.tuple, args), cause: null,
+            context: excStack.length ? excStack[excStack.length - 1] : null, tbline: __zipp_py_line, suppress: false };
     }
-    function refreshExc(e) {
-        // Host-visible: the VM prints `name: message` for an uncaught throw.
-        e.name = e.cls.name;
-        e.message = excMessage(e) + (e.traceback || "");
-    }
-    rt.makeExc = makeExc; rt.refreshExc = refreshExc;
+    rt.makeExc = makeExc;
+    rt.excLocation = function (e) { return locationText(e.tbline); };
     // Loop forms of map/filter/findIndex/every for callbacks that may run
     // guest code: a native array builtin would run each callback in a nested
     // interpreter loop, and the hardened wasm profile caps that nesting.
@@ -259,8 +278,7 @@ var __zipp_py = (function () {
         }
         const cur = rt.currentExc();
         if (cur !== null && cur !== e) e.context = cur;
-        e.traceback = locationText();
-        refreshExc(e);
+        e.tbline = __zipp_py_line;
         throw e;
     };
     R.assertfail = function (msg) { throw makeExc(E.AssertionError, msg === null ? [] : [msg]); };
@@ -286,11 +304,26 @@ var __zipp_py = (function () {
     rt.checkedText = checkedText;
 
     // ---- attribute protocol -------------------------------------------------------------------
-    // MRO lookups are cached per type. Any class-dict mutation bumps the
-    // epoch, which drops every cache (a base-class change affects subclasses).
+    // MRO lookups are cached per type (`lcache`, which also holds the
+    // construction plan). Setting or deleting a class attribute drops that
+    // one name from the class's cache and its subclasses' (`typeChanged`),
+    // so a class-attribute counter leaves every other lookup cached. The
+    // global epoch drops every cache, for the runtime's own bulk edits of a
+    // class dict (`rt.bumpEpoch`).
     let typeEpoch = 1;
     const MISSING_ATTR = { missing: true };
+    const CTOR_PLAN = { ctorPlan: true };  // the `lcache` key of `ctorPlan`
     rt.bumpEpoch = function () { typeEpoch++; };
+    function forgetName(t, name) {
+        const cache = t.lcache;
+        if (cache === undefined) return;
+        cache.delete(name);
+        if (name === "__init__" || name === "__new__") cache.delete(CTOR_PLAN);
+    }
+    function typeChanged(t, name) {
+        forgetName(t, name);
+        liveSubclasses(t, (s) => forgetName(s, name));
+    }
     function lookupType(t, name) {
         let cache = t.lcache;
         if (cache === undefined || t.lepoch !== typeEpoch) { cache = t.lcache = new Map(); t.lepoch = typeEpoch; }
@@ -306,12 +339,18 @@ var __zipp_py = (function () {
     rt.isFunction = isFunction;
     function bound(func, self) { return { cls: T.method, func: func, self: self }; }
     rt.bound = bound;
+    // An instance of a subclass of int, float or str boxes the primitive:
+    // `{cls, pyval, dict}`. The builtin methods of those types (flagged
+    // `unboxSelf`) receive the primitive as self.
+    function unbox(v) { return v !== null && typeof v === "object" && v.pyval !== undefined ? v.pyval : v; }
+    rt.unbox = unbox;
     // Descriptor GET of a class attribute found for `obj` (an instance) or for
     // the class itself when `obj` is null.
     function descrGet(attr, obj, owner) {
         if (attr === null || typeof attr !== "object") return attr;
         const c = attr.cls;
-        if (c === T.function || c === T.builtin_function_or_method) return obj === null ? attr : bound(attr, obj);
+        if (c === T.function) return obj === null ? attr : bound(attr, obj);
+        if (c === T.builtin_function_or_method) return obj === null ? attr : bound(attr, attr.unboxSelf === true && typeof obj === "object" ? unbox(obj) : obj);
         if (c === T.classmethod) return bound(attr.func, owner);
         if (c === T.staticmethod) return attr.func;
         if (c === T.property) {
@@ -331,7 +370,7 @@ var __zipp_py = (function () {
         const c = attr.cls;
         return c !== undefined && c !== T.function && lookupType(c, "__set__") !== undefined;
     }
-    function typeAttr(t, name) {
+    function typeAttr(t, name, missing) {
         // Attributes of a class object: its own MRO, then the metaclass (type).
         if (name === "__name__") return t.name;
         if (name === "__qualname__") return t.qualname;
@@ -345,16 +384,21 @@ var __zipp_py = (function () {
         if (attr !== undefined) return descrGet(attr, null, t);
         const meta = lookupType(t.cls, name);
         if (meta !== undefined) return descrGet(meta, t, t.cls);
+        if (missing !== undefined) return missing;
         fail(E.AttributeError, "type object '" + t.name + "' has no attribute '" + name + "'");
     }
-    function getattr(obj, name) {
+    // `missing` (hasattr, getattr with a default, imports): returned instead
+    // of raising when the lookup itself finds nothing, so a miss allocates no
+    // exception. An AttributeError raised by a descriptor or __getattr__
+    // still propagates.
+    function getattr(obj, name, missing) {
         let t;
         if (obj !== null && typeof obj === "object") {
-            if (obj.isType) return typeAttr(obj, name);
+            if (obj.isType) return typeAttr(obj, name, missing);
             t = obj.cls || ObjectType;
-            if (t === T.module) return rt.moduleAttr(obj, name);
+            if (t === T.module) return rt.moduleAttr(obj, name, missing);
             if (t === T.super) return rt.superAttr(obj, name);
-            if (t === TypeType) return typeAttr(obj, name);
+            if (t === TypeType) return typeAttr(obj, name, missing);
         } else {
             t = typeOf(obj);
         }
@@ -364,27 +408,28 @@ var __zipp_py = (function () {
         if (obj !== null && typeof obj === "object" && obj.dict !== undefined) {
             const v = obj.dict.get(name);
             if (v !== undefined) return v;
-            if (name === "__dict__") return rt.instanceDict(obj);
+            if (name === "__dict__" && t.noDict !== true) return rt.instanceDict(obj);
         }
         if (attr !== undefined) return descrGet(attr, obj, t);
         const special = rt.specialAttr(obj, t, name);
         if (special !== undefined) return special;
         const ga = lookupType(t, "__getattr__");
         if (ga !== undefined) return rt.call(ga, [obj, name], null);
-        if (obj !== null && typeof obj === "object" && obj.dict !== undefined) {
-            fail(E.AttributeError, "'" + t.name + "' object has no attribute '" + name + "'");
-        }
+        if (missing !== undefined) return missing;
         fail(E.AttributeError, "'" + t.name + "' object has no attribute '" + name + "'");
     }
     function setattr(obj, name, value) {
         if (obj !== null && typeof obj === "object" && obj.isType) {
             if (name === "__name__") { obj.name = str(value); return null; }
-            obj.dict.set(name, value); typeEpoch++; return null;
+            // An enum class's members are fixed.
+            if (obj.members !== undefined && obj.members.includes(obj.dict.get(name))) fail(E.AttributeError, "cannot reassign member '" + name + "'");
+            obj.dict.set(name, value); typeChanged(obj, name); return null;
         }
         const t = typeOf(obj);
-        if (obj === null || typeof obj !== "object" || obj.dict === undefined) {
+        if (obj === null || typeof obj !== "object" || obj.dict === undefined || obj.dict === null) {
             if (obj !== null && typeof obj === "object" && obj.cls === T.module) { obj.globals.set(name, value); return null; }
-            fail(E.AttributeError, "'" + t.name + "' object has no attribute '" + name + "'");
+            if (lookupType(t, name) !== undefined) fail(E.AttributeError, "'" + t.name + "' object attribute '" + name + "' is read-only");
+            fail(E.AttributeError, "'" + t.name + "' object has no attribute '" + name + "' and no __dict__ for setting new attributes");
         }
         const attr = lookupType(t, name);
         if (attr !== undefined && attr !== null && typeof attr === "object") {
@@ -403,12 +448,16 @@ var __zipp_py = (function () {
     }
     function delattr(obj, name) {
         if (obj !== null && typeof obj === "object" && obj.isType) {
-            if (!obj.dict.delete(name)) fail(E.AttributeError, name);
-            typeEpoch++;
+            if (!obj.dict.delete(name)) fail(E.AttributeError, "type object '" + obj.name + "' has no attribute '" + name + "'");
+            typeChanged(obj, name);
             return null;
         }
         const t = typeOf(obj);
-        if (obj === null || typeof obj !== "object" || obj.dict === undefined) fail(E.AttributeError, "'" + t.name + "' object has no attribute '" + name + "'");
+        if (obj !== null && typeof obj === "object" && obj.cls === T.module) {
+            if (!obj.globals.delete(name)) fail(E.AttributeError, "module '" + obj.name + "' has no attribute '" + name + "'");
+            return null;
+        }
+        if (obj === null || typeof obj !== "object" || obj.dict === undefined || obj.dict === null) fail(E.AttributeError, "'" + t.name + "' object has no attribute '" + name + "'");
         const attr = lookupType(t, name);
         if (attr !== undefined && attr !== null && typeof attr === "object" && attr.cls === T.property) {
             if (attr.fdel === null) fail(E.AttributeError, "property has no deleter");
@@ -420,7 +469,7 @@ var __zipp_py = (function () {
         return null;
     }
     R.getattr = getattr; R.setattr = setattr; R.delattr = delattr;
-    rt.getattr = getattr; rt.setattr = setattr; rt.descrGet = descrGet;
+    rt.getattr = getattr; rt.setattr = setattr; rt.descrGet = descrGet; rt.MISSING_ATTR = MISSING_ATTR;
     // Attribute lookup that skips the instance dict: for dunder dispatch.
     function typeMethod(obj, name) {
         return lookupType(typeOf(obj), name);
@@ -451,15 +500,32 @@ var __zipp_py = (function () {
         } else if (f.simple) {
             // The body starts with its own argument-count guard.
             f.fast = code;
+        } else if (!varargs && !varkw && argnames.length === positional) {
+            // Positional parameters with defaults: the positional call path
+            // appends the missing defaults instead of going through bindArgs.
+            f.fast = defaultsFast;
         }
         return f;
     };
+    // `this` is the function; `args` is the fresh positional array of the call.
+    function defaultsFast(args) {
+        const n = args.length, npos = this.positional;
+        if (n !== npos) {
+            const defaults = this.defaults, first = npos - defaults.length;
+            if (n < first || n > npos) return this.code(bindArgs(this, args, null));
+            for (let i = n; i < npos; i++) args.push(defaults[i - first]);
+        }
+        return this.code(args);
+    }
     R.arity = function (f, args) { arityError(f, args.length); };
     R.fannotate = function (f, names, values) { const m = new Map(); for (let i = 0; i < names.length; i++) m.set(names[i], values[i]); f.annotations = m; return null; };
     // A builtin: `code(args)` with `this` unused; `arity` -1 for variadic.
+    // `unboxSelf` is an own field on every builtin (set true later for the
+    // int/float/str methods) so method calls read it without a shape miss.
     function builtin(name, arity, code, minArity) {
         return { cls: T.builtin_function_or_method, name: name, qualname: name, arity: arity,
-            minArity: minArity === undefined ? arity : minArity, code: code, module: "builtins", dict: null, fast: builtinFast };
+            minArity: minArity === undefined ? arity : minArity, code: code, module: "builtins", dict: undefined, fast: builtinFast,
+            unboxSelf: false };
     }
     rt.builtin = builtin;
     // Keyword records: a Map from name to value (null when absent).
@@ -484,58 +550,112 @@ var __zipp_py = (function () {
     };
     R.append = function (arr, v) { arr.push(v); return arr; };
     // Bind `args`/`kwargs` to a Python function's signature: the bound array.
+    // Keyword name -> parameter index, built on the first keyword call.
+    function argIndex(f) {
+        let m = f.argIndex;
+        if (m === undefined) { m = f.argIndex = new Map(); for (let i = 0; i < f.argnames.length; i++) m.set(f.argnames[i], i); }
+        return m;
+    }
+    // The error paths below follow CPython's order: keyword problems, then
+    // too many positionals, then missing arguments.
     function bindArgs(f, args, kwargs) {
-        if (f.simple && (kwargs === null || kwargs.size === 0)) {
+        const nkw = kwargs === null ? 0 : kwargs.size;
+        if (f.simple && nkw === 0) {
             if (args.length !== f.positional) arityError(f, args.length);
             return args;
         }
         const names = f.argnames, npos = f.positional, nall = names.length;
         const out = new Array(nall);
-        const n = Math.min(args.length, npos);
+        const n = args.length < npos ? args.length : npos;
         for (let i = 0; i < n; i++) out[i] = args[i];
+        let kwrest = null;
+        if (nkw !== 0) {
+            // The common case, looked up per parameter without iterating the
+            // Map: every keyword names a parameter not already filled.
+            let matched = 0;
+            for (let i = f.posonly; i < nall && matched !== nkw; i++) {
+                const v = kwargs.get(names[i]);
+                if (v === undefined) continue;
+                if (out[i] !== undefined) { matched = -1; break; }
+                out[i] = v; matched++;
+            }
+            if (matched !== nkw) kwrest = bindKeywordsInOrder(f, kwargs, out, n);
+        }
         let extra = null;
         if (args.length > npos) {
-            if (!f.varargs) fail(TypeError, f.name + "() takes " + npos + " positional argument" + (npos === 1 ? "" : "s") + " but " + args.length + (kwargs && kwargs.size ? " positional argument" + (args.length === 1 ? "" : "s") + " (and " + kwargs.size + " keyword-only argument" + (kwargs.size === 1 ? "" : "s") + ")" : "") + (args.length === 1 && !(kwargs && kwargs.size) ? " was" : " were") + " given");
+            if (!f.varargs) tooManyPositional(f, args.length, out);
             extra = args.slice(npos);
         }
-        let kwrest = null;
-        if (kwargs !== null && kwargs.size) {
-            for (const [k, v] of kwargs) {
-                const idx = names.indexOf(k);
-                if (idx >= 0 && idx >= f.posonly) {
-                    if (out[idx] !== undefined) fail(TypeError, f.name + "() got multiple values for argument '" + k + "'");
-                    out[idx] = v;
-                } else {
-                    if (!f.varkw) fail(TypeError, f.name + "() got an unexpected keyword argument '" + k + "'");
-                    if (kwrest === null) kwrest = rt.dict();
-                    rt.dictSet(kwrest, k, v);
-                }
-            }
-        }
         const firstDefault = npos - f.defaults.length;
-        const missing = [], missingKw = [];
+        let missing = false;
         for (let i = 0; i < nall; i++) {
             if (out[i] !== undefined) continue;
             if (i < npos) {
                 if (i >= firstDefault) out[i] = f.defaults[i - firstDefault];
-                else missing.push(names[i]);
+                else missing = true;
             } else {
                 const d = f.kwdefaults === null ? undefined : f.kwdefaults.get(names[i]);
-                if (d !== undefined) out[i] = d; else missingKw.push(names[i]);
+                if (d !== undefined) out[i] = d; else missing = true;
             }
         }
-        if (missing.length) fail(TypeError, f.name + "() missing " + missing.length + " required positional argument" + (missing.length === 1 ? "" : "s") + ": " + listNames(missing));
-        if (missingKw.length) fail(TypeError, f.name + "() missing " + missingKw.length + " required keyword-only argument" + (missingKw.length === 1 ? "" : "s") + ": " + listNames(missingKw));
+        if (missing) missingArguments(f, out);
         if (f.varargs) out.push(tuple(extra || []));
         if (f.varkw) out.push(kwrest || rt.dict());
         return out;
     }
+    // Keywords bound in call order (extras for **kwargs, or an error named
+    // for the first offending keyword, as CPython reports it); `out` holds
+    // the first `n` positionals.
+    function bindKeywordsInOrder(f, kwargs, out, n) {
+        for (let i = n; i < out.length; i++) out[i] = undefined;
+        const index = argIndex(f);
+        let kwrest = null;
+        for (const [k, v] of kwargs) {
+            const idx = index.get(k);
+            if (idx !== undefined && idx >= f.posonly) {
+                if (out[idx] !== undefined) fail(TypeError, f.qualname + "() got multiple values for argument '" + k + "'");
+                out[idx] = v;
+            } else {
+                if (!f.varkw) {
+                    if (idx !== undefined) posonlyAsKeyword(f, kwargs);
+                    fail(TypeError, f.qualname + "() got an unexpected keyword argument '" + k + "'");
+                }
+                if (kwrest === null) kwrest = rt.dict();
+                rt.dictSet(kwrest, k, v);
+            }
+        }
+        return kwrest;
+    }
+    function posonlyAsKeyword(f, kwargs) {
+        const bad = [];
+        for (const k of kwargs.keys()) { const i = argIndex(f).get(k); if (i !== undefined && i < f.posonly) bad.push(k); }
+        fail(TypeError, f.qualname + "() got some positional-only arguments passed as keyword arguments: '" + bad.join(", ") + "'");
+    }
+    function tooManyPositional(f, got, out) {
+        const npos = f.positional, ndef = f.defaults.length;
+        let kwonly = 0;
+        for (let i = npos; i < f.argnames.length; i++) if (out[i] !== undefined) kwonly++;
+        const takes = ndef ? "from " + (npos - ndef) + " to " + npos + " positional arguments" : npos + " positional argument" + (npos === 1 ? "" : "s");
+        const given = kwonly ? got + " positional argument" + (got === 1 ? "" : "s") + " (and " + kwonly + " keyword-only argument" + (kwonly === 1 ? "" : "s") + ") were" : got + (got === 1 ? " was" : " were");
+        fail(TypeError, f.qualname + "() takes " + takes + " but " + given + " given");
+    }
+    function missingArguments(f, out) {
+        const npos = f.positional, names = f.argnames, firstDefault = npos - f.defaults.length;
+        const missing = [], missingKw = [];
+        for (let i = 0; i < names.length; i++) {
+            if (out[i] !== undefined) continue;
+            if (i < npos) { if (i < firstDefault) missing.push(names[i]); }
+            else if (f.kwdefaults === null || f.kwdefaults.get(names[i]) === undefined) missingKw.push(names[i]);
+        }
+        if (missing.length) fail(TypeError, f.qualname + "() missing " + missing.length + " required positional argument" + (missing.length === 1 ? "" : "s") + ": " + listNames(missing));
+        fail(TypeError, f.qualname + "() missing " + missingKw.length + " required keyword-only argument" + (missingKw.length === 1 ? "" : "s") + ": " + listNames(missingKw));
+    }
     function arityError(f, got) {
         if (got < f.positional) {
             const missing = f.argnames.slice(got, f.positional);
-            fail(TypeError, f.name + "() missing " + missing.length + " required positional argument" + (missing.length === 1 ? "" : "s") + ": " + listNames(missing));
+            fail(TypeError, f.qualname + "() missing " + missing.length + " required positional argument" + (missing.length === 1 ? "" : "s") + ": " + listNames(missing));
         }
-        fail(TypeError, f.name + "() takes " + f.positional + " positional argument" + (f.positional === 1 ? "" : "s") + " but " + got + " " + (got === 1 ? "was" : "were") + " given");
+        fail(TypeError, f.qualname + "() takes " + f.positional + " positional argument" + (f.positional === 1 ? "" : "s") + " but " + got + " " + (got === 1 ? "was" : "were") + " given");
     }
     const listNames = (m) => m.length === 1 ? "'" + m[0] + "'" : m.length === 2 ? "'" + m[0] + "' and '" + m[1] + "'" : m.slice(0, -1).map((x) => "'" + x + "'").join(", ") + ", and '" + m[m.length - 1] + "'";
     function builtinArgs(f, args, kwargs) {
@@ -546,6 +666,12 @@ var __zipp_py = (function () {
             return args;
         }
         if (f.arity >= 0 && (args.length > f.arity || args.length < f.minArity)) {
+            // Builtins that unpack a tuple of arguments word it CPython's other way.
+            if (f.unpackArgs === true) {
+                const bound = f.minArity === f.arity ? "" : args.length < f.minArity ? "at least " : "at most ";
+                const k = args.length < f.minArity ? f.minArity : f.arity;
+                fail(TypeError, f.name + " expected " + bound + k + " argument" + (k === 1 ? "" : "s") + ", got " + args.length);
+            }
             fail(TypeError, f.name + "() takes " + (f.minArity === f.arity ? "exactly " + (f.arity === 1 ? "one" : f.arity) : "from " + f.minArity + " to " + f.arity) + " argument" + (f.arity === 1 ? "" : "s") + " (" + args.length + " given)");
         }
         return args;
@@ -581,7 +707,15 @@ var __zipp_py = (function () {
     R.callmethod = function (obj, name, args, kwargs) {
         let t;
         if (obj !== null && typeof obj === "object") {
-            if (obj.isType || obj.cls === T.module || obj.cls === T.super) return call(getattr(obj, name), args, kwargs);
+            if (obj.cls === T.module) {
+                // `math.sqrt(x)`, `F.relu(x)`: a module global, called through
+                // its positional entry (functions, builtins and classes).
+                let v = obj.globals.get(name);
+                if (v === undefined) v = rt.moduleAttr(obj, name);
+                if (kwargs === null && v !== null && typeof v === "object" && v.fast !== undefined) return v.fast(args);
+                return call(v, args, kwargs);
+            }
+            if (obj.isType || obj.cls === T.super) return call(getattr(obj, name), args, kwargs);
             t = obj.cls || ObjectType;
         } else {
             t = typeOf(obj);
@@ -597,6 +731,7 @@ var __zipp_py = (function () {
                         if (attr.fast !== undefined && kwargs === null) return attr.fast(withSelf);
                         return attr.code(bindArgs(attr, withSelf, kwargs));
                     }
+                    if (attr.unboxSelf === true && typeof obj === "object") withSelf[0] = unbox(obj);
                     return attr.code(builtinArgs(attr, withSelf, kwargs));
                 }
             }
@@ -626,6 +761,7 @@ var __zipp_py = (function () {
                         if (attr.fast !== undefined && kwargs === null) return prepared(attr.fast, attr, withSelf);
                         return prepared(attr.code, attr, bindArgs(attr, withSelf, kwargs));
                     }
+                    if (attr.unboxSelf === true && typeof obj === "object") withSelf[0] = unbox(obj);
                     return prepared(attr.code, attr, builtinArgs(attr, withSelf, kwargs));
                 }
             }
@@ -666,7 +802,7 @@ var __zipp_py = (function () {
                 if (f !== null && typeof f === "object" && f.isabstract) abstract.push(k);
             }
         }
-        return abstract.sort();
+        return abstract.sort(rt.compareStrings);
     }
     function constructDefault(cls, args, kwargs) {
         if (cls === TypeType) {
@@ -678,43 +814,71 @@ var __zipp_py = (function () {
             const names = abstractNames(cls);
             if (names.length) fail(TypeError, "Can't instantiate abstract class " + cls.name + " without an implementation for abstract method" + (names.length === 1 ? "" : "s") + " " + names.map((n) => "'" + n + "'").join(", "));
         }
-        const ctor = rt.constructors.get(cls);
-        if (ctor !== undefined) return ctor(args, kwargs, cls);
-        // A subclass of an immutable builtin container takes its items from
-        // the builtin's constructor (its __new__); a user __init__ then runs.
-        const userNew = lookupType(cls, "__new__");
-        if (userNew === undefined || userNew === ObjectType.dict.get("__new__")) {
-            for (const c of cls.mro) {
-                if (c === T.tuple || c === T.frozenset || c === T.bytes) {
-                    const obj = rt.constructors.get(c)(args, kwargs, cls);
-                    if (obj.cls !== cls) obj.cls = cls;
-                    if (obj.dict === undefined || obj.dict === null) obj.dict = new Map();
-                    const init = lookupType(cls, "__init__");
-                    if (init !== undefined && init !== ObjectType.dict.get("__init__") && !init.isBase) call(descrGet(init, obj, cls), args, kwargs);
-                    return obj;
-                }
-            }
+        const plan = ctorPlan(cls);
+        if (plan.ctor !== undefined) return plan.ctor(args, kwargs, cls);
+        const init = plan.init;
+        // A subclass of an immutable builtin (int, str, tuple, ...) takes its
+        // value from that builtin's __new__; a user __init__ then runs.
+        if (plan.builtinBase !== undefined) {
+            const obj = rt.builtinNew(cls, plan.builtinBase, args, kwargs);
+            if (init !== undefined && (init === null || !init.isBase)) call(descrGet(init, obj, cls), args, kwargs);
+            return obj;
         }
-        const newf = lookupType(cls, "__new__");
         let obj;
-        if (newf !== undefined && newf !== ObjectType.dict.get("__new__")) {
-            const withCls = [cls]; for (let i = 0; i < args.length; i++) withCls.push(args[i]);
+        if (plan.newf !== undefined) {
+            const newf = plan.newf, withCls = [cls]; for (let i = 0; i < args.length; i++) withCls.push(args[i]);
             obj = call(newf.cls === T.staticmethod ? newf.func : newf, withCls, kwargs);
             if (!isInstance(obj, cls)) return obj;
+        } else if (plan.alloc !== undefined) {
+            // A subclass of a builtin container inherits its storage.
+            obj = plan.alloc(cls);
+            if (obj.dict === undefined || obj.dict === null) obj.dict = new Map();
         } else {
-            obj = rt.allocInstance(cls);
+            obj = { cls: cls, dict: new Map() };
         }
-        const init = lookupType(cls, "__init__");
-        if (init !== undefined && init !== ObjectType.dict.get("__init__")) {
+        if (init !== undefined) {
             const withSelf = [obj]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
-            const r = call(init, withSelf, kwargs);
+            // A Python __init__ is entered as `callmethod` does.
+            const r = init === null || init.cls !== T.function ? call(init, withSelf, kwargs)
+                : kwargs === null && init.fast !== undefined ? init.fast(withSelf) : init.code(bindArgs(init, withSelf, kwargs));
             if (r !== null) fail(TypeError, "__init__() should return None, not '" + typeOf(r).name + "'");
         } else if (args.length || (kwargs !== null && kwargs.size)) {
-            if (newf === undefined || newf === ObjectType.dict.get("__new__")) fail(TypeError, cls.name + "() takes no arguments");
+            if (plan.newf === undefined) fail(TypeError, cls.name + "() takes no arguments");
         }
         return obj;
     }
+    // What `constructDefault` needs to know about a class, cached with its
+    // attribute lookups (`lcache`); a change to `__init__` or `__new__`
+    // anywhere in its MRO drops it (`forgetName`).
+    function ctorPlan(cls) {
+        let cache = cls.lcache;
+        if (cache === undefined || cls.lepoch !== typeEpoch) { cache = cls.lcache = new Map(); cls.lepoch = typeEpoch; }
+        let plan = cache.get(CTOR_PLAN);
+        if (plan !== undefined) return plan;
+        const newf = lookupType(cls, "__new__"), init = lookupType(cls, "__init__");
+        let alloc;
+        for (const c of cls.mro) { alloc = rt.allocators.get(c); if (alloc !== undefined) break; }
+        plan = { ctor: rt.constructors.get(cls),
+            builtinBase: newf !== undefined && newf !== null ? newf.builtinBase : undefined,
+            newf: newf !== undefined && newf !== ObjectType.dict.get("__new__") ? newf : undefined,
+            init: init !== undefined && init !== ObjectType.dict.get("__init__") ? init : undefined,
+            alloc: alloc };
+        cache.set(CTOR_PLAN, plan);
+        return plan;
+    }
     rt.construct = construct;
+    // `base.__new__(cls, *args)` for an immutable builtin base: the builtin's
+    // constructor, re-classed (containers) or boxed (int/float/str).
+    rt.builtinNew = function (cls, base, args, kwargs) {
+        if (!isType(cls)) fail(TypeError, base.name + ".__new__(X): X is not a type object (" + typeOf(cls).name + ")");
+        if (!isSubclass(cls, base)) fail(TypeError, base.name + ".__new__(" + cls.name + "): " + cls.name + " is not a subtype of " + base.name);
+        const v = rt.constructors.get(base)(args, kwargs, cls);
+        if (cls === base) return v;
+        if (v === null || typeof v !== "object") return { cls: cls, pyval: v, dict: new Map() };
+        if (v.cls !== cls) v.cls = cls;
+        if (v.dict === undefined || v.dict === null) v.dict = new Map();
+        return v;
+    };
     rt.constructors = new Map();          // builtin type -> (args, kwargs, cls) => value
     rt.allocInstance = function (cls) {
         // A subclass of a builtin container inherits its storage.
@@ -767,7 +931,6 @@ var __zipp_py = (function () {
         const cls = newType(name, bases.slice(), ns, ns.get("__module__") || "main");
         cls.cls = metaclass;
         cls.qualname = ns.get("__qualname__") || name;
-        typeEpoch++;
         // __slots__: instances of an all-slotted hierarchy accept only those names.
         const slots = ns.get("__slots__");
         if (slots !== undefined) {
@@ -851,7 +1014,11 @@ var __zipp_py = (function () {
     };
     R.withexit = function (exit, e) {
         const exc = normexc(e);
-        const r = call(exit, [typeOf(exc), exc, null], null);
+        // __exit__ runs while `exc` is being handled: it is the context of
+        // anything __exit__ raises.
+        excStack.push(exc);
+        let r;
+        try { r = call(exit, [typeOf(exc), exc, null], null); } finally { excStack.pop(); }
         if (!rt.truth(r)) throw e;
         return null;
     };
@@ -873,19 +1040,26 @@ var __zipp_py = (function () {
     };
 
     // ---- iteration ----------------------------------------------------------------------------------
-    // A class-level dunder (a classmethod such as Enum.__iter__), bound to the class.
+    // A class-level dunder (a classmethod such as Enum.__iter__), bound to the
+    // class: the nearest classmethod on the MRO. An instance method of the
+    // same name nearer the class (Flag.__iter__) serves the instances and
+    // does not hide it.
     function classDunder(t, name) {
-        const m = lookupType(t, name);
-        if (m !== undefined && m !== null && typeof m === "object" && m.cls === T.classmethod) return bound(m.func, t);
+        for (const c of t.mro) {
+            const m = c.dict.get(name);
+            if (m !== undefined && m !== null && typeof m === "object" && m.cls === T.classmethod) return bound(m.func, t);
+        }
         return undefined;
     }
     rt.classDunder = classDunder;
     // Structural iteration for the builtin containers and their subclasses.
     function baseIter(v) {
         if (typeof v === "string") return { cls: T.iterator, next: stringIter(v) };
-        if (v.items !== undefined && (isInstance(v, T.list) || isInstance(v, T.tuple))) { let i = 0; return { cls: T.list_iterator, next: () => i < v.items.length ? v.items[i++] : STOP }; }
+        // An exhausted list iterator stays exhausted when the list grows.
+        if (v.items !== undefined && (isInstance(v, T.list) || isInstance(v, T.tuple))) { let i = 0; return { cls: T.list_iterator, next: () => { if (i < v.items.length) return v.items[i++]; i = Infinity; return STOP; } }; }
         if (v.map !== undefined && isInstance(v, T.dict)) return rt.dictKeyIter(v);
         if (v.map !== undefined) return rt.setIter(v);
+        if (v.pyval !== undefined) return baseIter(v.pyval);
         if (isInstance(v, T.range)) return rangeIter(v);
         if (isInstance(v, T.bytes)) { let i = 0; return { cls: T.iterator, next: () => i < v.items.length ? BigInt(v.items[i++]) : STOP }; }
         fail(TypeError, "'" + typeOf(v).name + "' object is not iterable");
@@ -936,18 +1110,42 @@ var __zipp_py = (function () {
         } };
     }
     // One step: the next value or the STOP sentinel. Python-level
-    // StopIteration raised by a __next__ becomes STOP.
+    // StopIteration raised by a __next__ becomes STOP. A generator never
+    // lets one out (PEP 479, see makeGenerator), so only wrapped user
+    // iterators pay for the handler.
     function fornext(it) {
         if (it.next !== undefined) {
-            if (it.wrapped === undefined && it.cls !== T.generator) return it.next();
+            if (it.wrapped === undefined) return it.next();
             try { return it.next(); }
             catch (e) { if (e !== null && typeof e === "object" && e.cls === E.StopIteration) return STOP; throw e; }
         }
         fail(TypeError, "'" + typeOf(it).name + "' object is not an iterator");
     }
     R.iter = iter; R.fornext = fornext; rt.iter = iter; rt.fornext = fornext;
+    // Whether iter() failing on `v` means it is not iterable at all (rather
+    // than a TypeError raised by its own __iter__).
+    function isIterable(v) {
+        if (typeof v === "string") return true;
+        if (v === null || typeof v !== "object") return false;
+        if (v.next !== undefined || v.iter !== undefined) return true;
+        return typeMethod(v, "__iter__") !== undefined || typeMethod(v, "__getitem__") !== undefined || (v.isType === true && classDunder(v, "__iter__") !== undefined);
+    }
+    rt.isIterable = isIterable;
     R.unpack = function (v, count, star) {
-        const it = iter(v), items = [];
+        // An exact list or tuple of the right length needs no iterator (the
+        // emitter only reads the result). A list is copied: storing the first
+        // target can run user code that mutates it before the next is read.
+        if (star < 0 && v !== null && typeof v === "object" && v.items !== undefined && v.items.length === count) {
+            if (v.cls === T.tuple) return v.items;
+            if (v.cls === T.list) return v.items.slice();
+        }
+        let it;
+        try { it = iter(v); }
+        catch (e) {
+            if (isExcOf(e, TypeError) && !isIterable(v)) fail(TypeError, "cannot unpack non-iterable " + typeOf(v).name + " object");
+            throw e;
+        }
+        const items = [];
         if (star < 0) {
             for (let i = 0; i <= count; i++) {
                 const x = fornext(it);
@@ -1015,7 +1213,7 @@ var __zipp_py = (function () {
         return out;
     };
     R.mattr = function (subject, name) {
-        try { return getattr(subject, name); }
+        try { return getattr(subject, name, UNBOUND); }
         catch (e) { if (e !== null && typeof e === "object" && isInstance(e, E.AttributeError)) return UNBOUND; throw e; }
     };
     R.mcls = function (subject, cls, npos) {
@@ -1060,39 +1258,81 @@ var __zipp_py = (function () {
     R.genreturned = function (it) { return it.returned === undefined ? null : it.returned; };
 
     // ---- generators ----------------------------------------------------------------------------------
+    // The protocol lives in four shared functions called as members of the
+    // generator record (`g.next()`), so creating a generator allocates one
+    // object. `returned` holds the return value only for the step that
+    // finished the generator (a later next() has no value, as in CPython).
+    function isExcOf(e, cls) { return e !== null && typeof e === "object" && e.cls !== undefined && e.cls.mro !== undefined && e.cls.mro.indexOf(cls) >= 0; }
+    // PEP 479: a StopIteration escaping the body becomes a RuntimeError.
+    function genEscape(g, e) {
+        g.running = false; g.done = true; g.returned = null;
+        if (!isExcOf(e, E.StopIteration)) return e;
+        const err = makeExc(E.RuntimeError, ["generator raised StopIteration"]);
+        err.cause = e; err.context = e; err.suppress = true;
+        return err;
+    }
+    function genFinish(g, r) {
+        g.running = false; g.done = true;
+        g.returned = r.value === undefined ? null : r.value;
+    }
+    function genNext() {
+        const g = this;
+        if (g.done) { g.returned = null; return STOP; }
+        if (g.running) fail(ValueError, "generator already executing");
+        g.running = true; g.started = true;
+        let r;
+        try { r = g.js.next(undefined); } catch (e) { throw genEscape(g, e); }
+        if (r.done) { genFinish(g, r); return STOP; }
+        g.running = false;
+        return r.value;
+    }
+    function genSend(v) {
+        const g = this;
+        if (g.running) fail(ValueError, "generator already executing");
+        if (g.done) { g.returned = null; throw makeExc(E.StopIteration, []); }
+        if (!g.started && v !== null) fail(TypeError, "can't send non-None value to a just-started generator");
+        g.running = true; g.started = true;
+        let r;
+        try { r = g.js.next(v); } catch (e) { throw genEscape(g, e); }
+        if (r.done) { genFinish(g, r); throw makeExc(E.StopIteration, g.returned === null ? [] : [g.returned]); }
+        g.running = false;
+        return r.value;
+    }
+    function genThrow(exc) {
+        const g = this;
+        if (g.running) fail(ValueError, "generator already executing");
+        if (g.done) throw exc;
+        g.running = true; g.started = true;
+        let r;
+        try { r = g.js.throw(exc); } catch (e) { throw genEscape(g, e); }
+        if (r.done) { genFinish(g, r); throw makeExc(E.StopIteration, g.returned === null ? [] : [g.returned]); }
+        g.running = false;
+        return r.value;
+    }
+    // close(): GeneratorExit raised at the paused yield. Returning (or letting
+    // GeneratorExit out) closes it; yielding again is an error; any other
+    // exception propagates.
+    function genClose() {
+        const g = this;
+        if (g.done) return null;
+        if (g.running) fail(ValueError, "generator already executing");
+        if (!g.started) { g.done = true; g.js.return(undefined); return null; }
+        g.running = true;
+        let r;
+        try { r = g.js.throw(makeExc(E.GeneratorExit, [])); }
+        catch (e) {
+            const out = genEscape(g, e);
+            if (isExcOf(out, E.GeneratorExit)) return null;
+            throw out;
+        }
+        g.running = false;
+        if (!r.done) fail(E.RuntimeError, "generator ignored GeneratorExit");
+        g.done = true; g.returned = null;
+        return r.value === undefined ? null : r.value;
+    }
     rt.makeGenerator = function (jsgen, f) {
-        const g = { cls: T.generator, js: jsgen, done: false, returned: null, name: f.name, qualname: f.qualname, running: false };
-        g.next = function () {
-            if (g.done) return STOP;
-            if (g.running) fail(ValueError, "generator already executing");
-            g.running = true;
-            let r;
-            try { r = jsgen.next(undefined); } finally { g.running = false; }
-            if (r.done) { g.done = true; g.returned = r.value === undefined ? null : r.value; return STOP; }
-            return r.value;
-        };
-        g.send = function (v) {
-            if (g.done) throw makeExc(E.StopIteration, []);
-            g.running = true;
-            let r;
-            try { r = jsgen.next(v); } finally { g.running = false; }
-            if (r.done) { g.done = true; g.returned = r.value === undefined ? null : r.value; throw makeExc(E.StopIteration, r.value === undefined || r.value === null ? [] : [r.value]); }
-            return r.value;
-        };
-        g.throwIn = function (exc) {
-            if (g.done) throw exc;
-            g.running = true;
-            let r;
-            try { r = jsgen.throw(exc); } finally { g.running = false; }
-            if (r.done) { g.done = true; throw makeExc(E.StopIteration, []); }
-            return r.value;
-        };
-        g.close = function () {
-            if (g.done) return null;
-            try { jsgen.return(undefined); } catch (e) { /* a throw during close */ }
-            g.done = true; return null;
-        };
-        return g;
+        return { cls: T.generator, js: jsgen, done: false, started: false, running: false, returned: null,
+            name: f.name, qualname: f.qualname, next: genNext, send: genSend, throwIn: genThrow, close: genClose };
     };
 
     // ---- modules ----------------------------------------------------------------------------------------
@@ -1103,13 +1343,14 @@ var __zipp_py = (function () {
         return { cls: T.module, name: name, file: file || null, globals: new Map(), dict: null };
     }
     rt.newModule = newModule;
-    rt.moduleAttr = function (m, name) {
+    rt.moduleAttr = function (m, name, missing) {
         const v = m.globals.get(name);
         if (v !== undefined) return v;
         if (name === "__name__") return m.name;
         if (name === "__file__") return m.file;
         if (name === "__dict__") return rt.dictFromMap(m.globals);
         if (m.submodules !== undefined && m.submodules.has(name)) return m.submodules.get(name);
+        if (missing !== undefined) return missing;
         fail(E.AttributeError, "module '" + m.name + "' has no attribute '" + name + "'");
     };
     R.module = function (name, code, file) { inits.set(name, { code: code, file: file }); files.push(file); return null; };
@@ -1170,16 +1411,14 @@ var __zipp_py = (function () {
             const n = vfsNorm(p), prefix = n === "" ? "" : n + "/", out = new Set();
             for (const k of vfs.keys()) if (k.startsWith(prefix)) { const rest = k.slice(prefix.length); const i = rest.indexOf("/"); out.add(i < 0 ? rest : rest.slice(0, i)); }
             for (const d of dirs) if (d.startsWith(prefix) && d !== n) { const rest = d.slice(prefix.length); const i = rest.indexOf("/"); out.add(i < 0 ? rest : rest.slice(0, i)); }
-            return Array.from(out).sort();
+            return Array.from(out).sort(rt.compareStrings);
         },
         mkdir: (p) => { dirs.add(vfsNorm(p)); },
         changed: () => { const out = Array.from(vfsChanged); vfsChanged.clear(); return out; },
     };
     const dirs = new Set();
-    R.vfs = function (path, latin1) {
-        const bytes = new Uint8Array(latin1.length);
-        for (let i = 0; i < latin1.length; i++) bytes[i] = latin1.charCodeAt(i) & 255;
-        vfs.set(vfsNorm(path), bytes);
+    R.vfs = function (path, base64) {
+        vfs.set(vfsNorm(path), Uint8Array.fromBase64(base64));
         return null;
     };
     rt.argv = [];
@@ -1243,16 +1482,14 @@ var __zipp_py = (function () {
         return m;
     };
     R.importfrom = function (m, name) {
-        try { return getattr(m, name); }
-        catch (e) {
-            if (!(e && e.cls === E.AttributeError)) throw e;
-            // `from pkg import sub`: a submodule that is not an attribute yet.
-            if (m !== null && typeof m === "object" && m.globals !== undefined && typeof m.name === "string") {
-                const full = m.name + "." + name;
-                if (inits.has(full) || builtinModules.has(full) || hasSubmodules(full)) return R.import(full, null);
-            }
-            fail(E.ImportError, "cannot import name '" + name + "' from '" + m.name + "'");
+        const v = getattr(m, name, MISSING_ATTR);
+        if (v !== MISSING_ATTR) return v;
+        // `from pkg import sub`: a submodule that is not an attribute yet.
+        if (m !== null && typeof m === "object" && m.globals !== undefined && typeof m.name === "string") {
+            const full = m.name + "." + name;
+            if (inits.has(full) || builtinModules.has(full) || hasSubmodules(full)) return R.import(full, null);
         }
+        fail(E.ImportError, "cannot import name '" + name + "' from '" + m.name + "'");
     };
     R.importstar = function (m, g) {
         const all = m.globals.get("__all__");

@@ -84,7 +84,10 @@ pub(crate) fn module_export_name(n: &ModuleExportName) -> String {
         // IdentifierReference by which side of the `as` it sat on; both were
         // read identically here, and the AST does not carry that distinction.
         ModuleExportName::Ident(id) => id.to_string(),
-        ModuleExportName::Str(s) => string_literal_key(s),
+        // (A namespace key: escaped like any "@@…" guest key.)
+        ModuleExportName::Str(s) => {
+            crate::vm::helpers_numeric::escape_guest_key(string_literal_key(s))
+        }
     }
 }
 
@@ -611,6 +614,10 @@ pub(crate) fn well_known_symbol_key(name: &str) -> Option<&'static str> {
 /// (staging/sm/Function/function-name-method.js). Only keys this compiler
 /// itself minted are rewritten — a literal `"@@foo"` string key keeps its text.
 pub(crate) fn fn_name_for_key(key: &str) -> String {
+    // An escaped guest "@@…" string key (`escape_guest_key`) names its text.
+    if key.starts_with("@@@") {
+        return crate::vm::helpers_numeric::guest_key_text(key).to_string();
+    }
     match key.strip_prefix("@@") {
         Some(rest) if well_known_symbol_key(rest) == Some(key) => format!("[Symbol.{rest}]"),
         _ => key.to_string(),
@@ -662,8 +669,13 @@ pub(crate) fn concat_key_literal_prefix(key: &Expr) -> Option<(&str, &Expr)> {
         // `StrVal::Utf8` IS the not-`.lone_surrogates` case: a literal holding a
         // lone surrogate can only be `StrVal::Utf16`, and `StrVal::from_utf16`
         // collapses back to `Utf8` exactly when the text is well-formed.
+        // (A "@@" prefix spells the engine's symbol keys, so its keys are
+        // escaped — `escape_guest_key` — which the fused raw-text key would
+        // skip; it keeps the ordinary computed-key path.)
         if let Expr::Str(StrVal::Utf8(s)) = &**left {
-            return Some((s.as_str(), right));
+            if !s.starts_with("@@") {
+                return Some((s.as_str(), right));
+            }
         }
     }
     None

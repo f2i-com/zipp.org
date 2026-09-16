@@ -60,6 +60,10 @@ name = "anchored_optimization"
 path = "tests/anchored_optimization.rs"
 
 [[test]]
+name = "audit_20260915_regex"
+path = "tests/audit_20260915_regex.rs"
+
+[[test]]
 name = "escape_tests"
 path = "tests/escape_tests.rs"
 

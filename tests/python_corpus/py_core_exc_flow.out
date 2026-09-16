@@ -1,0 +1,4 @@
+op-in-except 'second' KeyError('first')
+op-in-except-2 ZeroDivisionError
+bare-reraise-context ZeroDivisionError
+builtin-in-except invalid literal for int() with base 10: 'x' ValueError('v')

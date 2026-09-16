@@ -2015,8 +2015,8 @@
             {
               "type": "callout",
               "tone": "note",
-              "title": "Two inconsistencies you will find in the repository",
-              "text": "`bench/README.md` still names the earlier `c28781cf` pair as canonical while the README, roadmap and this site use `8229b3fc`; the all-30 formula is the same and the two differ in the third decimal. The README quotes Deno's launch as 82.6 ms while the two artifacts record 81.8 and 83.3 ms. Neither changes a conclusion."
+              "title": "One inconsistency you will find in the repository",
+              "text": "The README quotes Deno's launch as 82.6 ms while the two artifacts record 81.8 and 83.3 ms. It does not change a conclusion."
             }
           ]
         }
@@ -2613,7 +2613,7 @@
               "type": "code",
               "caption": "From a release archive",
               "lang": "shell",
-              "code": "# Linux\ncurl -LO https://github.com/f2i-com/zipp.org/releases/download/v0.0.18/zipp-0.0.18-x86_64-unknown-linux-gnu.tar.gz\ntar xzf zipp-0.0.18-x86_64-unknown-linux-gnu.tar.gz\n./zipp js hello.js\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
+              "code": "# Linux\ncurl -LO https://github.com/f2i-com/zipp.org/releases/download/v0.0.18/zipp-0.0.18-x86_64-unknown-linux-gnu.tar.gz\ntar xzf zipp-0.0.18-x86_64-unknown-linux-gnu.tar.gz\necho 'console.log(\"hello\")' > hello.js\n./zipp-0.0.18-x86_64-unknown-linux-gnu/zipp js hello.js\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
             },
             {
               "type": "p",

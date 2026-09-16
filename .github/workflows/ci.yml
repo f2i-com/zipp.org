@@ -1,13 +1,21 @@
-# Manual verification gate while automatic CI is paused (2026-09-12).
-# Restore push/main and pull_request triggers when automatic checks resume.
-# The retained verification jobs are deliberately small, so
-# a change that breaks a default-semantics regression cannot merge quietly
-# while the runner stays cheap:
+# Manual verification gate while automatic CI is paused (2026-09-12). The only
+# triggers below are `workflow_dispatch` and `workflow_call`: nothing here runs
+# on a push or a pull request, so a change CAN land on `main` without it. This
+# gate fires when someone dispatches it and whenever release.yml calls it.
+# Restore the push/main and pull_request triggers — and this comment's merge
+# wording — when automatic checks resume.
 #
+# The retained verification jobs are deliberately small, so a dispatched run
+# catches a broken default-semantics regression while the runner stays cheap:
+#
+#   python   the Python-enabled VM and CLI, the browser artifact, and the
+#            portable GPU contracts;
 #   engine   the VM's unit tests plus the audit-day regression binaries, on
 #            the default profile, and the manifest-advertised feature builds;
 #   wasm     the isolated host workspace, the production wasm32 build, and the
-#            Node boundary suite against that exact artifact.
+#            Node boundary suite against that exact artifact;
+#   landing  the public site's tests, typecheck and production build, plus the
+#            playground copy it synchronises out of crates/zipp-wasm.
 #
 # Everything heavier is a LOCAL command (see HANDOFF.md "Local verification"):
 # the full 230-binary engine suite, the safe-profile and instrumented lanes,
@@ -18,8 +26,8 @@
 # revision, so publishing depends on this same gate at that revision rather
 # than on whatever `main` build last happened to be green (ZIPP-09).
 #
-# Pull requests from forks get a read-only token and no secrets; nothing here
-# needs more.
+# Every job runs with a read-only token and no secrets; when pull-request
+# triggers are restored, fork runs get exactly that and nothing here needs more.
 name: CI
 
 on:
@@ -36,8 +44,13 @@ permissions:
   contents: read
 
 concurrency:
+  # Only release.yml passes `ref` (this workflow's own dispatch takes no
+  # inputs), so a release's gate run keeps its per-revision group and is never
+  # cancelled by a newer dispatch. `github.event_name` CANNOT express that: in
+  # a called workflow the github context is the CALLER's, so it reads `push` or
+  # `workflow_dispatch` and never `workflow_call`.
   group: ci-${{ github.workflow }}-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: ${{ inputs.ref == '' }}
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -112,12 +125,16 @@ jobs:
             target
           key: ci-engine-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       # The quarantine manifest is validated even though this lane skips
-      # nothing by prefix: an expired or stale entry fails here so it cannot
-      # rot unnoticed until the weekly full run.
+      # nothing: an expired, stale or ambiguous entry fails every dispatched
+      # run and every release gate, so it cannot rot unnoticed.
       - name: Validate the test quarantine manifest
         run: python3 tools/ci_quarantine.py --check --print
-      - name: Test Test262 scoring and failure gate
-        run: python3 -B -m unittest tools.test_run_test262 tools.test_run_test262_dual
+      # The quarantine tool's own tests belong here too: the step above trusts
+      # `--check`, and `--emit-skips` decides what the broad suite skips.
+      - name: Test Test262 scoring, the failure gate and the quarantine tool
+        run: >-
+          python3 -B -m unittest
+          tools.test_run_test262 tools.test_run_test262_dual tools.test_ci_quarantine
       - name: Unit tests and the audit-day regressions (default profile)
         run: >-
           cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast
@@ -220,3 +237,51 @@ jobs:
             }
             console.log(`module source revision ${sha} matches the checkout`);
           '
+
+  landing:
+    name: Landing site and synced playground
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: landing/package-lock.json
+      - name: Install the locked landing dependencies
+        working-directory: landing
+        run: npm ci
+      # The stats Worker's cache and backoff, content.json validation and SEO,
+      # the adventure sample against the checked-in engine, and the claims the
+      # page makes about that engine's version, size and limits.
+      - name: Test the landing site
+        working-directory: landing
+        run: npm test
+      # `npm run build` runs scripts/sync-playground.mjs first, which copies
+      # crates/zipp-wasm/playground into landing/public and rederives the engine
+      # cache key, then typechecks and builds with Vite.
+      - name: Typecheck and build the production site
+        working-directory: landing
+        run: |
+          npm run typecheck
+          npm run build
+      # A difference here means the checked-in landing/public copy has drifted
+      # from crates/zipp-wasm/playground or from the engine manifest, which is
+      # exactly the drift that used to ship unnoticed.
+      - name: Require the synchronised playground copy to be up to date
+        run: git diff --exit-code -- landing/public
+      # The engine pair served at /playground must be a LABELLED build of the
+      # announced release. An unlabelled local build shipped a class-method
+      # closure bug for a day after 0.0.18 fixed it, because nothing compared
+      # the pair's own profile with the release.
+      - name: Require the playground engine to be a labelled release build
+        working-directory: landing
+        run: node scripts/sync-playground.mjs --require-release
+      # The playground development server's request boundary: own-Host only,
+      # no dot-files, and no crash on a NUL byte in the path.
+      - name: Test the playground development server
+        run: node --test crates/zipp-wasm/playground/serve.test.cjs

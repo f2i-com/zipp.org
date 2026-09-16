@@ -42,8 +42,8 @@ export class Engine {
      * per-drain request or byte allowance is used up), or, for a single
      * request too large to cross even on its own, rejected: it is removed and its
      * callback is invoked with a `RangeError`, so no callback is left
-     * pending for a request the host will never see. A host that wants an
-     * empty queue keeps draining until this returns an empty array.
+     * pending for a request the host will never see. Use the status-bearing
+     * form below when completion must be distinguished from a bounded pass.
      *
      * Until the 11 September 2026 audit's ZIPP-02 the guest helper emptied
      * the queue before its return value crossed the converter, so a
@@ -73,10 +73,16 @@ export class Engine {
      * [`MAX_HOST_CALL_DRAIN_WORK_BYTES`] string bytes attempted across them,
      * counted monotonically — a failed attempt's work is not rolled back
      * with its representation budget. Whatever remains waits for the next
-     * drain; a host that wants an empty queue keeps draining until this
-     * returns an empty array with nothing deferred.
+     * drain. This legacy array form cannot signal that distinction;
+     * `drainPendingHostCallsStatus` can.
      */
     drainPendingHostCalls(): any;
+    /**
+     * Status-bearing form of `drainPendingHostCalls`. `hasMore` is true
+     * when a ceiling or recoverable interruption stopped this pass; callers
+     * can schedule another pass even when no deliverable request crossed.
+     */
+    drainPendingHostCallsStatus(): any;
     /**
      * Evaluate `expr` in the script's global context and return its value
      * as a JSON PROJECTION: the result is passed through the guest's
@@ -159,6 +165,14 @@ export class Engine {
      * `_init`) commonly reads `localStorage` or queries `db`.
      */
     initScript(source: string): any;
+    /**
+     * [`Self::init_script`] with an explicit source language: `"javascript"`
+     * (identical to `initScript`) or `"python"` (the experimental subset
+     * frontend; requires the `python` Cargo feature). A Python state has no
+     * preamble, exposes no global slots, and rejects the JS-only
+     * global/call/eval methods.
+     */
+    initSource(source: string, language: string): any;
     /**
      * The engine's own classification of the last error a method of this
      * instance threw:
@@ -349,13 +363,22 @@ export class Engine {
      */
     setSyncHostCapabilities(operations: any): void;
     /**
-     * Drain every console line produced so far, in order, as
+     * Drain a bounded prefix of the console lines produced so far, in order, as
      * `[{ stream: "stdout" | "stderr", text }]`. Draining here empties the
      * same buffers `takeOutput` drains.
      */
     takeConsole(): any;
     /**
-     * Drain every console line produced so far — `log`/`info`/`debug` and
+     * The console entries a failed initialization produced before its
+     * error (a program's own output ahead of the raise, a test report
+     * ahead of its non-zero exit), in `takeConsole`'s tagged form. The one
+     * method that answers on a disposed engine; it drains, and an engine
+     * that initialized returns an empty array.
+     */
+    takeFailedConsole(): any;
+    /**
+     * Drain a bounded prefix of the console lines produced so far —
+     * `log`/`info`/`debug` and
      * `warn`/`error` alike — in the order they were written. (The two
      * streams used to be concatenated, stdout first, so interleaved
      * messages lost their order: the 11 September 2026 audit's ZIPP-14.)
@@ -444,6 +467,7 @@ export interface InitOutput {
     readonly engine_dispose: (a: number) => void;
     readonly engine_disposed: (a: number) => number;
     readonly engine_drainPendingHostCalls: (a: number) => [number, number, number];
+    readonly engine_drainPendingHostCallsStatus: (a: number) => [number, number, number];
     readonly engine_evalInContext: (a: number, b: number, c: number) => [number, number, number];
     readonly engine_evalInContextRich: (a: number, b: number, c: number) => [number, number, number];
     readonly engine_getEventListenerTypes: (a: number) => [number, number, number];
@@ -451,6 +475,7 @@ export interface InitOutput {
     readonly engine_getGlobalsBatch: (a: number, b: any) => [number, number, number];
     readonly engine_getGlobalsFingerprint: (a: number, b: any) => [number, number, number];
     readonly engine_initScript: (a: number, b: number, c: number) => [number, number, number];
+    readonly engine_initSource: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly engine_lastErrorKind: (a: number) => [number, number];
     readonly engine_new: () => number;
     readonly engine_preambleLines: (a: number) => number;
@@ -468,6 +493,7 @@ export interface InitOutput {
     readonly engine_setLocalStorageBridge: (a: number, b: any) => [number, number];
     readonly engine_setSyncHostCapabilities: (a: number, b: any) => [number, number];
     readonly engine_takeConsole: (a: number) => [number, number, number];
+    readonly engine_takeFailedConsole: (a: number) => [number, number, number];
     readonly engine_takeOutput: (a: number) => [number, number, number];
     readonly zippInstanceUsage: () => [number, number, number];
     readonly zippProfile: () => [number, number];

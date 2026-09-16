@@ -1,0 +1,40 @@
+len '' 0 [] []
+len 'ascii' 5 [97, 115, 99, 105, 105] ['a', 's', 'c', 'i']
+len 'héllo' 5 [104, 233, 108, 108, 111] ['h', 'é', 'l', 'l']
+len 'naïve café' 10 [110, 97, 239, 118, 101, 32] ['n', 'a', 'ï', 'v']
+len '日本語テキスト' 7 [26085, 26412, 35486, 12486, 12461, 12473] ['日', '本', '語', 'テ']
+len '😀' 1 [128512] ['😀']
+len 'a😀b' 3 [97, 128512, 98] ['a', '😀', 'b']
+len '😀😃😄' 3 [128512, 128515, 128516] ['😀', '😃', '😄']
+len 'x🎉y🎊z' 5 [120, 127881, 121, 127882, 122] ['x', '🎉', 'y', '🎊']
+len '𝄞 music' 7 [119070, 32, 109, 117, 115, 105] ['𝄞', ' ', 'm', 'u']
+len 'é' 2 [101, 769] ['e', '́']
+len '🇳🇴 flag' 7 [127475, 127476, 32, 102, 108, 97] ['🇳', '🇴', ' ', 'f']
+len 'mixé😀日' 6 [109, 105, 120, 233, 128512, 26085] ['m', 'i', 'x', 'é']
+index ['a', '😀', 'b', 'é', '日', '𝄞', 'c'] ['c', '𝄞', '日', 'é', 'b', '😀', 'a']
+slice 😀b bé日𝄞c a😀bé日 ab日c c𝄞日éb😀a 😀é𝄞 日𝄞c 𝄞c  ''
+find 2 4 5 6 1 1 True False
+split ['a', 'b', 'c'] ['日本', '語'] ('x', '🎉', 'y') 😀|😃
+methods HÉLLO école STRASSE 😀ABC **日本** é··| --😀
+strip 😀 x xé True True
+enumerate [(0, 'é'), (1, '😀')] [(1, '𝄞')]
+reversed b😀a ['本', '日']
+ord-chr 128512 😀 True 1 119070 0xe9
+encode b'\xc3\xa9\xf0\x9f\x98\x80' 6 True skip
+compare True False True ['z', 'é', '日', 'ﬁ', '𐀀', '😀'] 😀 é
+isX True False True True True True True
+long 103 end 😀 é é 50 😀😀😀nééé
+loop-index 50
+loop-iter 50
+chunks 8 [13, 13, 13, 13, 13, 13, 13, 12] 😀😀😀😀😀😀😀😀😀😀😀en
+concat 20 😀éé😀 7
+fstring-width [   😀] [日本   ] [  é  ] **a😀***
+join-len 3 3 a😀b
+mult 😀é😀é😀é 6 😀😀
+in-list True 1 decomposed-differs
+zfill-expand 000é a   😀 5
+words [('naïve', 5), ('😀', 1), ('café', 4), ('日本', 2), ('x', 1)] naïve ['😀', 'x', '日本', 'café', 'naïve']
+splitlines ['a😀', 'b', 'c'] ['é', 'f']
+title Héllo Wörld Émile 😀A B
+casefold True éè
+bytes-index 169 [195, 169, 240, 159, 152, 128] b'\xa9\xc3'

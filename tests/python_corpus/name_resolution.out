@@ -1,0 +1,29 @@
+  called print
+builtin 3 True 2
+shadowed shadowed:str shadowed:list
+restored 4 3
+sum-shadow fake-sum ['fake-sum', 'fake-sum']
+sum-restored 3
+loop-shadow 0 5
+loop-shadow 1 -5
+loop-shadow 2 -5
+abs-restored 5
+NameError name 'len' is not defined
+global 1 6 6 local 6
+NameError name 'created_later' is not defined
+created made
+NameError name 'created_later' is not defined
+rebind v1
+rebind v2
+rebind v3
+alias v3
+NameError name 'caller' is not defined
+NameError name 'value' is not defined
+late-global 10
+late-global changed
+class-scope class-x module-x
+builtins (['min', 'max', 'sorted', 'isinstance', 'type', 'str'], 1, 'b', [1, 2], True, 'int', '5')
+builtins-module 2 2 True
+param-shadow (4, None) (0, 'p')
+names True None True True False
+global-in-nested 1 global-y

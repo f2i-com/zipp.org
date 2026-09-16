@@ -27,7 +27,11 @@ tables; below `1.0×` is faster.
 
 ### Public canonical capture
 
-The public score is the clean four-engine PGO capture at `8229b3fc`:
+The public score is the clean four-engine PGO capture at `8229b3fc`, the last
+before B280 made specification-order method calls the default. The later
+publishable capture at `14770703` measures headline ten 1.0025× Node, all 13
+0.677× and hostile 17 cold 0.875× (HANDOFF B314); no headline is claimed for it.
+The `8229b3fc` rows:
 
 | Corpus | Node | Bun | Deno | Node point wins |
 |---|---:|---:|---:|---:|

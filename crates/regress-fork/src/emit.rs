@@ -296,7 +296,15 @@ impl Emitter {
                     Node::CaptureGroup { id, contents, name } => {
                         let group = *id;
                         self.result.groups += 1;
-                        self.group_names.push(name.as_deref().unwrap_or("").into());
+                        // PATCH (FORK.md B10): names are keyed by group ID, the
+                        // index `Match::captures` uses. Emission order is not
+                        // source order: a lookbehind body is emitted reversed,
+                        // and pushing here swapped the names of its groups.
+                        let slot = group as usize;
+                        if self.group_names.len() <= slot {
+                            self.group_names.resize(slot + 1, "".into());
+                        }
+                        self.group_names[slot] = name.as_deref().unwrap_or("").into();
                         self.emit_insn(Insn::BeginCaptureGroup(group));
                         stack.push(Emitter::EndCaptureGroup { group });
                         stack.push(Emitter::Node(contents));

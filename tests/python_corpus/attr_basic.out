@@ -1,0 +1,30 @@
+lookup base child a:base c:child 3 3 3
+shadow instance base base a:instance b:base True False
+unshadow base a:base False
+class-mutate mutated mutated child child
+delete-subclass-attr mutated c:mutated
+readd child-again mutated
+shared-mutable ['from-a', 'from-c'] True
+rebind-mutable ['own'] ['from-a', 'from-c']
+loop-mutate 13 40 13 13
+patch-class A! C! True
+patch-method patched a:mutated patched c:child-again
+restore-method a:mutated
+patch-instance instance-level a:mutated b:mutated
+unpatch-instance b:mutated
+augassign-attr 1 2 1 0 {'total': 2} {'total': 1}
+after-class-set 2 1 100 101
+attr-loop 280 [1, 1, -1, -5, -11, -19] [('x', 3), ('y', 4), ('z', -1)]
+setattr 5 missing True False
+delattr False
+AttributeError 'Point' object has no attribute 'nope'
+AttributeError 'Point' object has no attribute 'nope'
+AttributeError type object 'Point' has no attribute 'nope'
+evolving class attr added later via __dict__ ['direct']
+added-method ('via __dict__', 3)
+inherit parent
+inherit-patched patched-parent
+override-later kid-own patched-parent
+override-removed patched-parent
+class-attrs Base Base Base True False
+instance-class True Child child-again True

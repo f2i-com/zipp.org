@@ -519,7 +519,13 @@ impl<'p> Vm<'p> {
         }
         // |base| ≥ 2 from here: result bits ≈ bits(a) · e.
         let e: u64 = match &b {
-            BigVal::Small(y) => *y as u64,
+            // Checked, not `as`: a fast-tier exponent in [2^64, i128::MAX]
+            // truncated to its low 64 bits, so `2n ** (2n ** 64n)` returned 1n.
+            // With |base| ≥ 2 any exponent that large is over the size limit.
+            BigVal::Small(y) => match u64::try_from(*y) {
+                Ok(e) => e,
+                Err(_) => return Err(Thrown(BIGINT_SIZE_ERR.into())),
+            },
             // |base| ≥ 2 with an exponent beyond i128 is astronomically big.
             BigVal::Big(_) => return Err(Thrown(BIGINT_SIZE_ERR.into())),
         };

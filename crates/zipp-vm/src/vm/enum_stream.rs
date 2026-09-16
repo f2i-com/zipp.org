@@ -1717,7 +1717,7 @@ impl<'p> Vm<'p> {
             last_key = Some(key.clone());
         }
         // Drop immutable map borrows before allocating the final key string.
-        let final_key = last_key.map(|key| self.alloc_str(key));
+        let final_key = last_key.map(|key| self.alloc_key_str(key));
         let remaining = limit.as_int() as u32;
         let result = (sum.as_int() as u32).wrapping_add(cycle.wrapping_mul(remaining));
         if let Some(key) = final_key {

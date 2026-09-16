@@ -1,0 +1,5 @@
+bytearray-isinstance False False False
+ellipsis-type ellipsis ellipsis <class 'ellipsis'>
+ValueError __len__() should return >= 0
+ValueError __len__() should return >= 0
+ValueError __len__() should return >= 0

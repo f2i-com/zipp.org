@@ -1,0 +1,106 @@
+truth NoneType [False, True, False, None, 'dflt', 0]
+truth bool [True, False, True, 1, True, 1]
+truth bool [False, True, False, False, 'dflt', 0]
+truth int [False, True, False, 0, 'dflt', 0]
+truth int [True, False, True, 1, 1, 1]
+truth int [True, False, True, 1, -1, 1]
+truth int [True, False, True, 1, 18446744073709551616, 1]
+truth int [True, False, True, 1, -170141183460469231731687303715884105728, 1]
+truth float [False, True, False, 0.0, 'dflt', 0]
+truth float [False, True, False, -0.0, 'dflt', 0]
+truth float [True, False, True, 1, 1e-300, 1]
+truth float [True, False, True, 1, nan, 1]
+truth float [True, False, True, 1, inf, 1]
+truth str [False, True, False, '', 'dflt', 0]
+truth str [True, False, True, 1, ' ', 1]
+truth str [True, False, True, 1, '0', 1]
+truth str [True, False, True, 1, 'False', 1]
+truth bytes [False, True, False, b'', 'dflt', 0]
+truth bytes [True, False, True, 1, b'\x00', 1]
+truth list [False, True, False, [], 0]
+truth list [True, False, True, 1, 1]
+truth list [True, False, True, 1, 1]
+truth tuple [False, True, False, (), 0]
+truth tuple [True, False, True, 1, 1]
+truth dict [False, True, False, {}, 0]
+truth dict [True, False, True, 1, 1]
+truth set [False, True, False, set(), 0]
+truth set [True, False, True, 1, 1]
+truth frozenset [False, True, False, frozenset(), 0]
+truth frozenset [True, False, True, 1, 1]
+truth range [False, True, False, range(0, 0), 0]
+truth range [True, False, True, 1, 1]
+truth range [False, True, False, range(5, 5), 0]
+truth range [True, False, True, 1, 1]
+truth bytearray [False, True, False, bytearray(b''), 0]
+truth bytearray [True, False, True, 1, 1]
+truth deque [False, True, False, deque([]), 0]
+truth deque [True, False, True, 1, 1]
+truth OrderedDict [False, True, False, OrderedDict(), 0]
+truth Counter [False, True, False, Counter(), 0]
+truth Counter [True, False, True, 1, 1]
+truth defaultdict [False, True, False, defaultdict(<class 'int'>, {}), 0]
+truth Empty [True, False, True, 1, 1]
+truth builtin_function_or_method [True, False, True, 1, 1]
+truth builtin_function_or_method [True, False, True, 1, 1]
+truth type [True, False, True, 1, 1]
+truth type [True, False, True, 1, 1]
+truth object [True, False, True, 1, 1]
+truth list_iterator [True, False, True, 1, 1]
+truth slice [True, False, True, 1, 1]
+truth int [False, True, False, 0, 'dflt', 0]
+  __bool__ True
+  __bool__ True
+  __bool__ True
+user B True False yes
+  __bool__ True
+  branch taken
+  __bool__ True
+  __bool__ True
+  and/or and-right B
+  __bool__ False
+  __bool__ False
+  __bool__ False
+user B False True no
+  __bool__ False
+  __bool__ False
+  __bool__ False
+  and/or B or-right
+  __len__ 0
+  __len__ 0
+  __len__ 0
+user L False True no
+  __len__ 0
+  __len__ 0
+  __len__ 0
+  and/or L or-right
+  __len__ 3
+  __len__ 3
+  __len__ 3
+user L True False yes
+  __len__ 3
+  branch taken
+  __len__ 3
+  __len__ 3
+  and/or and-right L
+user Both False True no
+  and/or Both or-right
+  __bool__ False
+  __bool__ True
+  __len__ 1
+  __len__ 0
+any/all True False
+  __len__ 0
+  __len__ 2
+  __bool__ False
+  __bool__ True
+filter ['L', 'B']
+TypeError __bool__ should return bool, returned int
+ValueError no truth
+count 144
+short-circuit None (3,) end False
+chained-not False True True True [True, False, True, False]
+cond-expr ['f', 't', 'f', 'f', 't', 't', 't', 't', 'f', 'f', 't', 't', 't', 'f', 't', 't', 't', 'f', 't', 'f']
+while-int 0
+while-str ''
+while-list []

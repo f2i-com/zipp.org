@@ -261,12 +261,22 @@ fn main() -> ExitCode {
         }
     }
     match r {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => REQUESTED_EXIT
+            .get()
+            .map_or(ExitCode::SUCCESS, |&status| ExitCode::from(status)),
         Err(e) => {
             eprintln!("zipp: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// A process status the program chose itself (Python's `sys.exit(3)`),
+/// reported by `main` in place of the success/failure mapping.
+static REQUESTED_EXIT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+
+fn request_exit(status: u8) {
+    let _ = REQUESTED_EXIT.set(status);
 }
 
 /// Print an engine outcome the way `node` does — `console.log` to stdout,

@@ -1,4 +1,4 @@
-//! Hardened-profile validation for recursively-shaped syntax trees.
+//! Validation for recursively-shaped syntax trees, in every profile.
 //!
 //! The parser itself bounds recursive-descent calls, but several productions
 //! (left-associated binary/member chains) are parsed with loops and still form
@@ -7,9 +7,7 @@
 //! before any such consumer sees guest-controlled depth.
 
 use super::ast::*;
-use super::parser::PResult;
-#[cfg(feature = "safe-sandbox")]
-use super::parser::SyntaxError;
+use super::parser::{PResult, SyntaxError};
 
 /// The backstop for tree shapes the other two guards cannot see the whole of:
 /// nested functions, chains and operator spines each stay under their own tier
@@ -34,18 +32,32 @@ use super::parser::SyntaxError;
 #[cfg(feature = "safe-sandbox")]
 pub const MAX_SAFE_AST_NESTING: usize = 128;
 
-pub(crate) fn validate_program_nesting(program: &Program) -> PResult<()> {
-    #[cfg(not(feature = "safe-sandbox"))]
-    {
-        let _ = program;
-        return Ok(());
-    }
-
-    #[cfg(feature = "safe-sandbox")]
-    validate_program_nesting_safe(program)
-}
+/// The default (native) profile's tree-depth backstop, equal to
+/// `parser::MAX_NATIVE_SYNTAX_CHAIN` for the reason the safe pair is equal.
+/// Before it, a long enough operator or member spine (`1+1+…` a million
+/// terms deep) passed the iterative parser and then overflowed the native
+/// stack in capture analysis, the compiler or the tree's drop — an
+/// uncatchable abort from `eval`.
+///
+/// MEASURED 2026-09-15, release build on the CLI's 256 MiB thread: the
+/// cheapest spines cost 0.3-0.8 KB of consumer stack per level (a `+` string
+/// chain survived ~790,000 levels, a `&&` chain ~310,000), so 32,768 levels
+/// stay under 30 MiB. The expensive per-level shapes — nested functions,
+/// arrows, classes — cannot reach this depth at all: each level of them also
+/// costs parser recursion, which `MAX_NATIVE_SYNTAX_RECURSION` bounds first.
+#[cfg(not(feature = "safe-sandbox"))]
+pub const MAX_NATIVE_AST_NESTING: usize = 32_768;
 
 #[cfg(feature = "safe-sandbox")]
+const AST_NESTING_LIMIT: usize = MAX_SAFE_AST_NESTING;
+#[cfg(not(feature = "safe-sandbox"))]
+const AST_NESTING_LIMIT: usize = MAX_NATIVE_AST_NESTING;
+#[cfg(feature = "safe-sandbox")]
+const AST_NESTING_ERROR: &str = "SyntaxError: compiled syntax nesting exceeds the sandbox limit";
+#[cfg(not(feature = "safe-sandbox"))]
+const AST_NESTING_ERROR: &str =
+    "RangeError: Maximum call stack size exceeded (compiled syntax nesting is too deep)";
+
 #[derive(Clone, Copy)]
 enum Work<'a> {
     Stmt(&'a Stmt, usize),
@@ -57,8 +69,31 @@ enum Work<'a> {
     Class(&'a Class, usize),
 }
 
-#[cfg(feature = "safe-sandbox")]
-fn validate_program_nesting_safe(program: &Program) -> PResult<()> {
+/// Whether the parser's upper bound on the tree's height (see
+/// `Parser::tree_depth_bound`) already proves `validate_program_nesting` would
+/// pass, so the walk can be skipped. Debug builds check the bound against the
+/// real tree on every parse, so a construct that grows the tree without
+/// passing a counted production fails the test suite instead of a user.
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) fn nesting_bound_is_safe(program: &Program, bound: usize) -> bool {
+    debug_assert!(
+        nesting_within(program, bound),
+        "the parser's tree-depth bound ({bound}) is below the tree's real height"
+    );
+    bound <= AST_NESTING_LIMIT
+}
+
+pub(crate) fn validate_program_nesting(program: &Program) -> PResult<()> {
+    if nesting_within(program, AST_NESTING_LIMIT) {
+        Ok(())
+    } else {
+        Err(SyntaxError::new(AST_NESTING_ERROR, 0))
+    }
+}
+
+/// Is every node of `program` at most `limit` levels deep (a top-level
+/// statement is level 1)?
+fn nesting_within(program: &Program, limit: usize) -> bool {
     let mut work = Vec::with_capacity(program.body.len().min(256));
     for stmt in &program.body {
         work.push(Work::Stmt(stmt, 1));
@@ -74,11 +109,8 @@ fn validate_program_nesting_safe(program: &Program) -> PResult<()> {
             | Work::Function(_, d)
             | Work::Class(_, d) => d,
         };
-        if depth > MAX_SAFE_AST_NESTING {
-            return Err(SyntaxError::new(
-                "SyntaxError: compiled syntax nesting exceeds the sandbox limit",
-                0,
-            ));
+        if depth > limit {
+            return false;
         }
         let child = depth + 1;
 
@@ -366,31 +398,27 @@ fn validate_program_nesting_safe(program: &Program) -> PResult<()> {
             }
         }
     }
-    Ok(())
+    true
 }
 
-#[cfg(feature = "safe-sandbox")]
 fn push_stmts<'a>(work: &mut Vec<Work<'a>>, stmts: &'a [Stmt], depth: usize) {
     for stmt in stmts {
         work.push(Work::Stmt(stmt, depth));
     }
 }
 
-#[cfg(feature = "safe-sandbox")]
 fn push_exprs<'a>(work: &mut Vec<Work<'a>>, exprs: &'a [Expr], depth: usize) {
     for expr in exprs {
         work.push(Work::Expr(expr, depth));
     }
 }
 
-#[cfg(feature = "safe-sandbox")]
 fn push_patterns<'a>(work: &mut Vec<Work<'a>>, patterns: &'a [Pattern], depth: usize) {
     for pattern in patterns {
         work.push(Work::Pattern(pattern, depth));
     }
 }
 
-#[cfg(feature = "safe-sandbox")]
 fn push_var<'a>(work: &mut Vec<Work<'a>>, var: &'a VarDecl, depth: usize) {
     for decl in &var.decls {
         work.push(Work::Pattern(&decl.id, depth));
@@ -400,7 +428,6 @@ fn push_var<'a>(work: &mut Vec<Work<'a>>, var: &'a VarDecl, depth: usize) {
     }
 }
 
-#[cfg(feature = "safe-sandbox")]
 fn push_args<'a>(work: &mut Vec<Work<'a>>, args: &'a [Arg], depth: usize) {
     for arg in args {
         match arg {
@@ -409,13 +436,11 @@ fn push_args<'a>(work: &mut Vec<Work<'a>>, args: &'a [Arg], depth: usize) {
     }
 }
 
-#[cfg(feature = "safe-sandbox")]
 fn push_call<'a>(work: &mut Vec<Work<'a>>, call: &'a CallExpr, depth: usize) {
     work.push(Work::Expr(&call.callee, depth));
     push_args(work, &call.args, depth);
 }
 
-#[cfg(feature = "safe-sandbox")]
 fn push_member<'a>(work: &mut Vec<Work<'a>>, member: &'a Member, depth: usize) {
     work.push(Work::Expr(&member.object, depth));
     if let MemberProp::Computed(expr) = &member.prop {

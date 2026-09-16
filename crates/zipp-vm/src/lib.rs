@@ -131,6 +131,16 @@ pub mod safe_syntax_limits {
     pub use crate::parse::parser::{MAX_SAFE_SYNTAX_CHAIN, MAX_SAFE_SYNTAX_RECURSION};
 }
 
+/// The default profile's counterparts of [`safe_syntax_limits`], exported for
+/// the same reason.
+#[cfg(not(feature = "safe-sandbox"))]
+pub mod native_syntax_limits {
+    pub use crate::parse::limits::MAX_NATIVE_AST_NESTING;
+    pub use crate::parse::parser::{
+        MAX_NATIVE_SYNTAX_CHAIN, MAX_NATIVE_SYNTAX_RECURSION, MAX_NATIVE_TREE_DEPTH_BOUND,
+    };
+}
+
 /// The hardened profile's native-work and size ceilings, for the same reason
 /// as [`safe_syntax_limits`]: v0.0.10 raised every one of these and the tests
 /// that had copied the old numbers kept passing while exercising nothing.
@@ -610,7 +620,9 @@ fn run_with_policy(
     if disable_external_code {
         vm.disable_external_code();
     }
-    match vm.run() {
+    let result = vm.run();
+    vm.report_unhandled_errors();
+    match result {
         Ok(_) => Ok(Outcome {
             output: vm.output,
             errput: vm.errput,
@@ -654,7 +666,9 @@ pub fn run_with_harness(
     let program = compile::compile_main_program(&ast, src)?;
     let mut vm = vm::Vm::new(&program);
     vm.set_module_base_dir(base_dir);
-    match vm.run_with_prelude(Some(harness)) {
+    let result = vm.run_with_prelude(Some(harness));
+    vm.report_unhandled_errors();
+    match result {
         Ok(_) => Ok(Outcome {
             output: vm.output,
             errput: vm.errput,
@@ -672,9 +686,9 @@ pub fn run_with_harness(
 /// `await`), declarations are module-scoped, and the event loop drains to
 /// completion. `base_dir` resolves relative imports. Like [`run_with_base`] but
 /// for `flags:[module]` test262 tests and `.mjs` entry points.
-/// Run the module FILE at `path`: an entry with STATIC imports routes through
-/// the module loader (dependencies link before evaluation); one without keeps
-/// the async-capable direct path (top-level await works there).
+/// Run the module FILE at `path` through the module loader: dependencies link
+/// before evaluation, and top-level await (in the entry or a dependency)
+/// suspends and finishes through the event loop.
 #[cfg(not(feature = "wasm-no-fs-loader"))]
 pub fn run_module_file(
     path: &std::path::Path,
@@ -691,67 +705,33 @@ pub fn run_module_file(
     // The harness (if any) runs as a realm SCRIPT — its vars become realm
     // globals every module can reference — then the entry loads through the
     // module loader: imports link before evaluation and the module's own
-    // declarations stay MODULE-scoped (never globalThis properties). An entry
-    // using top-level await falls back to the direct async-capable path (the
-    // loader's eval pipeline can't suspend yet); nothing of the entry has run
-    // when that compile-time rejection surfaces.
-    let host_src = harness.clone().unwrap_or_default();
+    // declarations stay MODULE-scoped (never globalThis properties).
+    let host_src = harness.unwrap_or_default();
     // The harness runs as a realm SCRIPT (its declarations become realm
     // globals), so it parses script-first — which is also what it compiled as
     // before the front-end swap, oxc's module-flavoured default notwithstanding.
     let host_ast = front::parse_auto(&host_src)?;
     let host = compile::compile_main_program(&host_ast, &host_src)?;
     let mut vm = vm::Vm::new(&host);
-    vm.set_module_base_dir(base_dir.clone());
+    vm.set_module_base_dir(base_dir);
     if let Err(thrown) = vm.run() {
+        vm.report_unhandled_errors();
         return Ok(Outcome {
             output: std::mem::take(&mut vm.output),
             errput: std::mem::take(&mut vm.errput),
             error: Some(thrown.0),
         });
     }
-    match vm.run_module_entry(path) {
+    let entry_result = vm.run_module_entry(path);
+    if !matches!(&entry_result, Err(thrown) if thrown.0.contains("top-level await is not supported")) {
+        vm.report_unhandled_errors();
+    }
+    match entry_result {
         Ok(_) => Ok(Outcome {
             output: vm.output,
             errput: vm.errput,
             error: None,
         }),
-        Err(thrown) if thrown.0.contains("top-level await is not supported") => {
-            // ENTRY top-level await: rerun on a fresh Vm via the direct
-            // async-capable module path, with the harness prepended (the
-            // single-module concatenation).
-            let combined;
-            let text: &str = match &harness {
-                Some(h) => {
-                    // A hashbang is only valid at position 0 — strip it (it is
-                    // a comment) before prepending the harness.
-                    let body = if src.starts_with("#!") {
-                        src.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
-                    } else {
-                        src.as_str()
-                    };
-                    combined = format!("{h}\n{body}");
-                    combined.as_str()
-                }
-                None => src.as_str(),
-            };
-            let ast2 = front::parse_module(text)?;
-            let program2 = compile::compile_main_module(&ast2, text)?;
-            let mut vm = vm::Vm::new(&program2);
-            vm.set_module_base_dir(base_dir);
-            match vm.run_module() {
-                Ok(_) => Ok(Outcome {
-                    output: vm.output,
-                    errput: vm.errput,
-                    error: None,
-                }),
-                Err(thrown) => Ok(Outcome {
-                    output: std::mem::take(&mut vm.output),
-                    errput: std::mem::take(&mut vm.errput),
-                    error: Some(thrown.0),
-                }),
-            }
-        }
         Err(thrown) => Ok(Outcome {
             output: std::mem::take(&mut vm.output),
             errput: std::mem::take(&mut vm.errput),
@@ -796,7 +776,9 @@ pub fn run_module_with_base(
     }
     let mut vm = vm::Vm::new(&program);
     vm.set_module_base_dir(base_dir);
-    match vm.run_module() {
+    let result = vm.run_module();
+    vm.report_unhandled_errors();
+    match result {
         Ok(_) => Ok(Outcome {
             output: vm.output,
             errput: vm.errput,

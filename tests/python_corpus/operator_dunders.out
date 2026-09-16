@@ -1,0 +1,20 @@
+forward V(10) V(4) V(21) V(2.3333333333333335) V(2) V(1) V(343) matmul(7,V(3)) V(49)
+mixed V(8) V(8) V(6) V(3) V(14) V(17.5) V(3.0) V(8) V(8.5)
+unary V(-7) V(4) V(-8) 9
+bitwise V(8) V(15) V(9) V(16) V(32) V(2) V(9)
+compare True True False True True True True True True True False
+TypeError unsupported operand type(s) for +: 'V' and 'str'
+TypeError can only concatenate str (not "V") to str
+TypeError '<' not supported between instances of 'V' and 'str'
+TypeError unsupported operand type(s) for -: 'list' and 'V'
+inplace-fallback V(28)
+iadd True [1, 2] plain add
+reflected Base.__add__ Derived.__radd__ Base.__add__ Base.__radd__
+only-reflected rsub(5) skip rmul(2.5) rmul(s)
+sum-dunder V(6) V(11)
+hot-loop V(80) V(6) [V(9), V(8)]
+matmul Matrix([[7, 10], [15, 22]])
+imatmul Matrix([[2, 1], [4, 3]])
+index-dunder 20 c 0b101 [0, 1, 2] [2, 3] skip
+container-dunders 3 True False True [0, 10, 20] True
+bool-int-arith V(2) V(2) V(5)

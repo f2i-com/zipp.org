@@ -37,8 +37,14 @@ impl<'s> Parser<'s> {
         let mut items: Vec<Expr> = Vec::new();
         let mut rest: Option<(Expr, u32)> = None;
         let mut trailing_comma = false;
+        // A parameter written as a parenthesized name — `((a)) => 1`,
+        // `(...(a)) => 1`. A parenthesized expression is fine and so is a
+        // parenthesized assignment target, but no FormalParameter admits one,
+        // so it is an error only if this region becomes arrow parameters.
+        let mut paren_param: Option<u32> = None;
 
         while !self.at(Punct::RParen) {
+            let item_pos = self.cur().span.start;
             if self.at(Punct::DotDotDot) {
                 let pos = self.cur().span.start;
                 self.bump_before_operand()?;
@@ -47,7 +53,11 @@ impl<'s> Parser<'s> {
                     "SyntaxError: rest parameter is only valid in a parameter list",
                     pos,
                 ));
-                rest = Some((self.parse_assign()?, pos));
+                let r = self.parse_assign()?;
+                if matches!(r, Expr::Ident(_)) && self.parenthesized {
+                    paren_param.get_or_insert(item_pos);
+                }
+                rest = Some((r, pos));
                 if self.at(Punct::Comma) {
                     self.cover_pattern_only(SyntaxError::new(
                         "SyntaxError: rest parameter must be last",
@@ -56,7 +66,13 @@ impl<'s> Parser<'s> {
                 }
                 break;
             }
-            items.push(self.parse_assign()?);
+            let item = self.parse_assign()?;
+            // The flag describes the primary that produced a lone identifier —
+            // nothing after it has cleared it yet.
+            if matches!(item, Expr::Ident(_)) && self.parenthesized {
+                paren_param.get_or_insert(item_pos);
+            }
+            items.push(item);
             if !self.eat(Punct::Comma, true)? {
                 break;
             }
@@ -110,6 +126,12 @@ impl<'s> Parser<'s> {
                 }
             } else {
                 self.cover.await_ident.extend(inner.await_ident);
+            }
+            if let Some(pos) = paren_param {
+                return Err(SyntaxError::new(
+                    "SyntaxError: invalid parameter: a parameter name cannot be parenthesized",
+                    pos,
+                ));
             }
             let mut params = Vec::with_capacity(items.len() + 1);
             for it in items {
@@ -453,15 +475,27 @@ impl<'s> Parser<'s> {
                 target,
                 value,
                 covered: false,
-            } => Pattern::Assign {
-                left: Box::new(self.target_to_pattern(target)?),
-                right: value,
-            },
+            } => {
+                // `((a) = 1) => 1`: legal as an assignment, but a
+                // BindingIdentifier is never parenthesized. A DIRECT name
+                // target's `covered` bit is exact (it is taken the moment the
+                // LHS ends); names nested in a pattern target are converted
+                // after the whole literal, so theirs is not consulted.
+                if matches!(target, Target::Ident { covered: true, .. }) {
+                    return Err(self.err_here("SyntaxError: invalid parameter"));
+                }
+                Pattern::Assign {
+                    left: Box::new(self.target_to_pattern(target)?),
+                    right: value,
+                }
+            }
             // A BindingPattern is an ObjectLiteral/ArrayLiteral read directly;
             // `(({})) => 1` wraps one in parentheses, which no FormalParameter
             // production admits.
             Expr::Array(items, f) => {
-                if f.parenthesized {
+                // `f.paren_name`: `([(a)]) => 1` — a BindingElement is a
+                // BindingIdentifier or BindingPattern, never parenthesized.
+                if f.parenthesized || f.paren_name {
                     return Err(self.err_here("SyntaxError: invalid parameter"));
                 }
                 if f.rest_comma {
@@ -506,7 +540,7 @@ impl<'s> Parser<'s> {
                 Pattern::Array(out)
             }
             Expr::Object(members, f) => {
-                if f.parenthesized {
+                if f.parenthesized || f.paren_name {
                     return Err(self.err_here("SyntaxError: invalid parameter"));
                 }
                 if f.rest_comma {
@@ -533,6 +567,15 @@ impl<'s> Parser<'s> {
                             ) {
                                 return Err(self
                                     .err_here("SyntaxError: rest element may not have a default"));
+                            }
+                            // `BindingRestProperty : ... BindingIdentifier` —
+                            // unlike an array rest, never a nested pattern
+                            // (`({...{a}}) => 1`); the non-cover path in
+                            // `parse_object_binding` already insists on a name.
+                            if !matches!(inner, Expr::Ident(_)) {
+                                return Err(self.err_here(
+                                    "SyntaxError: a rest property must be followed by an identifier",
+                                ));
                             }
                             rest = Some(Box::new(self.expr_to_pattern(inner)?));
                         }

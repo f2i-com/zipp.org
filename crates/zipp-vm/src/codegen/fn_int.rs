@@ -95,6 +95,13 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
     if proto.code.is_empty() || proto.reg_count == 0 || proto.param_count >= proto.reg_count {
         return false;
     }
+    // An async or generator body's completion is a Promise / generator object
+    // built by the interpreter's call path. Ordinary calls never enter a compiled
+    // body for these, but `native_cb_entry` (array-builtin callbacks, sort
+    // comparators) does: `a.sort(async (x, y) => x - y)` sorted the array.
+    if proto.is_async || proto.is_generator {
+        return false;
+    }
     // Rest and `arguments` are materialized by the interpreter's call setup,
     // not by the native self-call window. Stay interpreted when either can be
     // observed by the body.
@@ -1005,7 +1012,23 @@ pub(crate) fn int_binop(
     match op {
         BinOp::Add => dynasm!(ops ; add eax, r9d ; jo => bail),
         BinOp::Sub => dynasm!(ops ; sub eax, r9d ; jo => bail),
-        BinOp::Mul => dynasm!(ops ; imul eax, r9d ; jo => bail),
+        // A zero product with a negative operand is -0 in JS (`0 * -5`),
+        // which is not an Int — bail and let the interpreter make the double.
+        // One operand is 0, so the other's sign is the sign of `a | b`; the
+        // test sits behind the (rare) zero result, off the hot path.
+        BinOp::Mul => {
+            let nonzero = ops.new_dynamic_label();
+            dynasm!(ops
+                ; imul eax, r9d
+                ; jo => bail
+                ; test eax, eax
+                ; jnz => nonzero
+                ; mov r10d, [rbx + dreg(a)]
+                ; or r10d, r9d
+                ; js => bail
+                ; => nonzero
+            )
+        }
         // Signed integer remainder (JS `%` on integers; truncated, sign of the
         // dividend = idiv's remainder). `% 0` is NaN (not an Int) → bail; bail on
         // divisor -1 too, which sidesteps the INT_MIN/-1 idiv #DE (and `% -1` is

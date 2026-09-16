@@ -90,6 +90,11 @@ test('client rejects malformed data and unsafe links while retaining legitimate 
   assert.equal(data.forks, undefined)
   assert.equal(data.releaseUrl, undefined)
   for (const url of ['https://github.com.evil.test/f2i-com/zipp.org/releases', 'https://github.com/other/repo/releases', 'https://user:secret@github.com/f2i-com/zipp.org/releases']) assert.equal(repositoryUrl(url), undefined)
+  // The source commit is interpolated into the README link path.
+  assert.equal(parseRepoStats({ ...snapshot, source: { ...snapshot.source, commit: sha } }).sourceCommit, sha)
+  for (const commit of ['../../../../attacker/phish/blob/main', 'main', 'A'.repeat(40), 'a'.repeat(39), 'a'.repeat(41), 7]) {
+    assert.equal(parseRepoStats({ ...snapshot, source: { ...snapshot.source, commit } }).sourceCommit, undefined, String(commit))
+  }
   assert.deepEqual(readReadmeFacts('**200% of test262**: 200 / 100'), {})
   assert.deepEqual(readReadmeFacts('A new README format'), {})
 })

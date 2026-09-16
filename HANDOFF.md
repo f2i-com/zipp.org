@@ -9,12 +9,13 @@ v0.0.18 tagging remain behind the final CI gates. The local validation below
 is retained as historical evidence; its earlier push hold has been superseded
 for this promotion branch and PR.
 
-PR #19 is open on `codex/promote-0.0.18`. At `1539eb4b`, canonical standard
-CI and the original/corrected Test262 gates all passed. The earlier broad
-native run failed only because its preinstalled Node lacked Float16Array;
+PR #19 MERGED at `fc474d15` on 13 September 2026, and `v0.0.18` is the latest
+published release (release run 34769882925: all 17 jobs green, including the
+full security workflow and Test262). At `1539eb4b`, canonical standard CI and
+the original/corrected Test262 gates all passed. The earlier broad native run
+failed only because its preinstalled Node lacked Float16Array;
 `typedarray_interp_index_fast` compared unequal row counts. The native lane now
-selects and verifies Node 24, matching standard CI. Its focused test passes
-locally. The updated head needs fresh hosted gates before merge or release.
+selects and verifies Node 24, matching standard CI.
 
 ### 14 September: local conformance follow-up; pushes held
 
@@ -89,9 +90,22 @@ advisories, not a report of six exploitable vulnerabilities. Keep all gates inta
 The separate Python CI toolchain mismatch is fixed by pinning build-variants.sh
 to `cargo +1.92.0`; Linux runners had installed wasm32 only for that toolchain.
 
-The checked-in browser demo engines remain the previously validated 0.0.17
-artifacts. Release CI builds new binaries from the exact tag and verifies version,
-commit and languages. NCA stays in its separate repository.
+The `/playground` engine pair is now the published `v0.0.18` Python build:
+`landing/public/playground-runtime/manifest.json` records version 0.0.18 and
+`source.sha fc474d15758827770f06d0dc2ebfe3055ebaa625`, taken from the
+`zipp-wasm-0.0.18-web-python` release asset (all 24 SHA256SUMS verified).
+
+It previously reported 0.0.17 with `source.sha: null` — an unlabelled local
+build, since 0.0.17 never shipped a Python WASM asset — last refreshed at
+`1d547404`, which falls between `035d0e92` and its fix `0a5c1e2e`. The live
+site therefore threw `ReferenceError` for a function declaration inside a class
+method body that read an enclosing binding, and disposed the instance. Release
+CI built and verified new binaries from the exact tag, but nothing compared the
+playground pair's own profile with the release. `sync-playground.mjs` now warns
+on every build when the pair is not a labelled build of the announced version,
+and `ci.yml`'s landing job runs it with `--require-release`, which fails.
+`landing/public/wasm` (the JavaScript story scratchpad) is a separate v0.0.16
+pair and is unaffected. NCA stays in its separate repository.
 
 
 This is the current continuation note. Historical snapshots through B252 are
@@ -116,8 +130,10 @@ Release publishing now consumes the complete reusable security workflow at the
 validated tag commit. Its gate includes the full native and safe-profile suites,
 both sandboxes, the production Node and three-browser Worker boundaries,
 dependency audit, and Test262 checkout `4249661388e5d3f92a85186213da140a6481490f`
-with the exact three-entry
-failure manifest and zero skips. The known dynamic-definition retention remains
+with the exact NINE-entry failure manifest
+(`tools/test262-expected-failures.txt`; `1539eb4b` cut it from eleven by
+dropping the two `staging/sm/String/internalUsage.js` entries) and zero skips.
+The known dynamic-definition retention remains
 bounded and reported by `resourceUsage()` / `zippInstanceUsage()`; the reference
 SDK's one-tenant-per-Worker lifecycle and the 200-engine soak test remain the
 reclamation boundary.
@@ -155,8 +171,9 @@ The audit records executable hashes, verification results and remaining
 German locale-data / runtime-code-lifetime work. No performance claim or
 release artifact update accompanies these changes.
 
-The latest published release is v0.0.17 (`127477bd`). The tracked landing-page
-WebAssembly module described below remains the v0.0.16 artifact:
+The latest published release is v0.0.18 (`fc474d15`, 13 September 2026). The
+tracked landing-page WebAssembly module described below remains the v0.0.16
+artifact:
 the two audits of 11 September, B290-B324,
 with the `14770703` canonical capture (all-13 0.6766× Node, hostile 0.8749×
 Node; B314). The tracked production WebAssembly module
@@ -555,11 +572,13 @@ audit's own vocabulary.
   prints the inventory, emits the `--skip` arguments, and fails CI on an
   expired, stale (test no longer exists) or malformed entry, so a new
   `msplit_mechanism_*`-shaped regression is never skipped by a prefix.
-  `security.yml` runs weekly, on pull requests touching the sandbox crates,
-  hardened VM paths, harness and lockfiles (the bounded subset; the full
-  native workspace stays weekly/manual), and on demand; its stable toolchain
-  is labelled a canary. The instrumented embedding contracts run in CI's
-  engine job and in the safe-profile job.
+  `security.yml` has no schedule and no pull-request trigger while automatic
+  CI is paused (since 12 September 2026): it runs on `workflow_dispatch` and
+  when `release.yml` calls it at the tagged commit. Its gating lanes run on the
+  `toolchain` input, which defaults to the pinned release toolchain; the stable
+  canary is the separate non-blocking `stable-canary` job, which a release gate
+  does not run. The instrumented embedding contracts run in CI's engine job and
+  in the safe-profile job.
 - **B304 (ZIPP-17, P1/P2) — partly implemented; browser tests still
   open.** `window.dispatchEvent` now dispatches to the listeners registered
   on `window` for `String(event.type)` and reports the event uncancelled,
@@ -1187,8 +1206,9 @@ both rows), i.e. PGO-profile and layout variation of the size the intervals show
 CI (`ci.yml`) is deliberately the minimum: the VM's unit tests plus the
 audit-day regression binaries, the advertised feature builds, the isolated
 host workspace and the Node boundary suite against the production wasm32
-artifact. Everything else runs LOCALLY before a push (and weekly in
-`security.yml`):
+artifact, plus the landing site and its synced playground copy. Everything else
+runs LOCALLY before a push (and on demand, or at release, in `security.yml` —
+there is no schedule while automatic CI is paused):
 
 ```sh
 # the full engine suite (about 30 minutes; the quarantine manifest is exact)

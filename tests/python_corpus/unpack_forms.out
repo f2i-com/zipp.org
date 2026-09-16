@@ -1,0 +1,39 @@
+swap 2 1
+rotate 3 1 2
+swap-subscript [30, 20, 10]
+target-left-to-right 2 [30, 20, 'set']
+swap-attr v u
+nested 1 2 3 4
+nested-list-target 5 6 7 8
+starred 0 [1, 2, 3, 4] ['h', 'e', 'l', 'l'] o 1 [] 2 9 [] list
+starred-mid a ['b', 'c', 'd'] e f
+starred-nested x ['y', 'z'] 1
+starred-for 1 [2, 3]
+starred-for 4 []
+starred-for 5 [6]
+iterables h i k1 k2 5 6 0 1
+generator g1 g2
+chained-assign [0, 1] [0, 1] [0, 1] True
+chained-int 5 6
+implicit-tuple (1, 2, 3) (1,) tuple
+dict-targets {'a': 3, 'b': 2}
+pairs 3 onetwo
+too-many ValueError too many values to unpack (expected 2)
+too-few ValueError not enough values to unpack (expected 3, got 2)
+starred-too-few ValueError not enough values to unpack (expected at least 2, got 1)
+string-too-many ValueError too many values to unpack (expected 2)
+empty ValueError not enough values to unpack (expected 1, got 0)
+dict-too-many ValueError too many values to unpack (expected 2)
+func-unpack 6
+func-unpack 15
+func-unpack abc
+func-unpack 3
+func-unpack-error ValueError not enough values to unpack (expected 3, got 2)
+func-unpack-error ValueError too many values to unpack (expected 3)
+func-unpack-error ValueError not enough values to unpack (expected 3, got 2)
+func-unpack-error ValueError too many values to unpack (expected 3)
+hot-swap 1225
+fib-unpack [196418, 317811, 514229] 832040
+diag 1 5 9 8
+star-expr [0, 1, 2, 'a', 'b'] (1, 2) True {'x': 1, 'y': 2} []
+print-star|1|2|3

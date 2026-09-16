@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+use super::props::ClassLookup;
 use super::*;
 use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
@@ -123,14 +124,17 @@ impl<'p> Vm<'p> {
     /// The key's text viewed IN PLACE: `Some` iff `key` is a flat string
     /// whose WTF-8 bytes are valid UTF-8 — byte-identical to what `key_of`
     /// would allocate. A rope / lone-surrogate / Symbol / non-string key is
-    /// `None`; the caller falls back to `key_of`.
+    /// `None`; the caller falls back to `key_of`. So is a string `key_of`
+    /// would escape ("@@…", see `escape_guest_key`).
     #[inline]
     pub(crate) fn flat_key_str(&self, key: Value) -> Option<&str> {
         if !key.is_heap() {
             return None;
         }
         match self.heap.str_wtf8_cow(key.heap_index()) {
-            Some(std::borrow::Cow::Borrowed(b)) => std::str::from_utf8(b).ok(),
+            Some(std::borrow::Cow::Borrowed(b)) if !b.starts_with(b"@@") => {
+                std::str::from_utf8(b).ok()
+            }
             _ => None,
         }
     }
@@ -210,28 +214,26 @@ impl<'p> Vm<'p> {
                     {
                         return true;
                     }
-                    // Inherited method/getter/setter through the class chain.
-                    let class = map.class;
-                    let mut cur = class;
-                    while let Some(cidx) = cur {
-                        match self.heap.get(cidx) {
-                            HeapObj::Class(c) => {
-                                if c.methods.iter().any(|(n, _)| *n == k)
-                                    || c.getters.iter().any(|(n, _)| *n == k)
-                                    || c.setters.iter().any(|(n, _)| *n == k)
-                                {
-                                    return true;
-                                }
-                                cur = c.parent;
-                            }
-                            _ => break,
+                    // A class instance: its class chain's member tables answer for
+                    // the levels that still match their prototype objects; past
+                    // them (or for a key no table declares) the live chain does —
+                    // `C.prototype.z = 1` / `delete C.prototype.m` are visible.
+                    if let Some(cidx) = map.class {
+                        let next = match self.class_member_lookup(idx, cidx, &k) {
+                            ClassLookup::Method(_) | ClassLookup::Accessor { .. } => return true,
+                            ClassLookup::Live(p) => p,
+                            ClassLookup::Miss => self.class_instance_live_proto(idx, cidx),
+                        };
+                        if !next.is_heap() {
+                            return false;
                         }
+                        obj = next;
+                        continue 'prototype_chain;
                     }
                     // [[HasProperty]] continues up the prototype chain: an explicit
                     // `Object.create` proto, then the base Object.prototype (which
                     // carries toString/hasOwnProperty/valueOf/…). Mirrors get_member's
-                    // proto resolution, minus class-instance C.prototype (its methods
-                    // are already covered by the class-chain walk above).
+                    // proto resolution.
                     let proto = if let Some(&p) = self.proto_of.get(&idx) {
                         p.is_heap().then_some(p)
                     } else if self.obj_proto != 0 && idx != self.obj_proto {
@@ -518,7 +520,31 @@ impl<'p> Vm<'p> {
     /// VALUE, or the class value for the ctor/field-init/static block; both recorded
     /// in `method_brand` at MakeClass). `None` outside a class body.
     pub(crate) fn current_private_brands(&self) -> Option<&Vec<u64>> {
-        let callee = self.frames.last()?.callee;
+        self.private_brands_of(self.frames.last()?.callee)
+    }
+
+    /// The lexical private-brand chain of the class body whose code `callee` (a
+    /// function VALUE recorded in `method_brand`) runs. `current_private_brands`
+    /// asks this for the running frame; a frame-free JIT activation asks it for
+    /// its own callee, because the top frame then belongs to a caller.
+    /// A function defined INSIDE a class body shares that body's private
+    /// scope: `method(){ const self = this; function inner(){ self.#m = 1; } }`
+    /// is legal, and so is an arrow doing the same, because a private name is
+    /// lexically scoped rather than tied to being a method. Copy the defining
+    /// code's chain onto the new function value, so `resolve_private` finds
+    /// the declaring class from inside it (the textual fall-back it used
+    /// instead could not see a private ACCESSOR at all, and would have
+    /// accepted another class's same-named private).
+    pub(crate) fn inherit_private_brands(&mut self, defining: Value, closure: u32) {
+        if self.method_brand.is_empty() || !defining.is_heap() {
+            return;
+        }
+        if let Some(chain) = self.method_brand.get(&defining.heap_index()).cloned() {
+            self.method_brand.insert(closure, chain);
+        }
+    }
+
+    pub(crate) fn private_brands_of(&self, callee: Value) -> Option<&Vec<u64>> {
         if !callee.is_heap() {
             return None;
         }
@@ -852,7 +878,13 @@ impl<'p> Vm<'p> {
     /// the declaring class value is unknown — the caller keeps its textual
     /// path. kind bits: 1 = method, 2 = getter, 4 = setter; 0 = field.
     pub(crate) fn resolve_private(&self, key: &str) -> Option<(u64, u8, u32)> {
-        let chain = self.current_private_brands()?;
+        self.resolve_private_in(self.frames.last()?.callee, key)
+    }
+
+    /// `resolve_private` against the brand chain of `ctx` (see
+    /// `private_brands_of`) rather than the running frame's.
+    pub(crate) fn resolve_private_in(&self, ctx: Value, key: &str) -> Option<(u64, u8, u32)> {
+        let chain = self.private_brands_of(ctx)?;
         for &b in chain.iter() {
             if let Some(names) = self.brand_private_names.get(&b) {
                 if let Some(kind) = names.iter().find(|(n, _)| n == key).map(|&(_, k)| k) {
@@ -935,7 +967,17 @@ impl<'p> Vm<'p> {
     /// fall back to the lenient any-brand check — never tighter than the chain, so
     /// this can only ADD precision, never reject a previously-accepted access.
     pub(crate) fn private_brand_ok(&self, receiver: Value, key: &str) -> Option<bool> {
-        let chain = self.current_private_brands()?;
+        self.private_brand_ok_in(self.frames.last()?.callee, receiver, key)
+    }
+
+    /// `private_brand_ok` against the brand chain of `ctx`.
+    pub(crate) fn private_brand_ok_in(
+        &self,
+        ctx: Value,
+        receiver: Value,
+        key: &str,
+    ) -> Option<bool> {
+        let chain = self.private_brands_of(ctx)?;
         for &b in chain.iter() {
             if self
                 .brand_private_names
@@ -963,6 +1005,68 @@ impl<'p> Vm<'p> {
             return None;
         }
         Some(chain.iter().any(|&b| self.instance_has_brand(receiver, b)))
+    }
+
+    /// PrivateMethodCall's reference half for `recv.#m(...)` (a private `key`),
+    /// accessed from the class body whose brand chain `ctx` names: the brand
+    /// check (TypeError when the receiver's class did not declare `key`), then
+    /// the callee — the declaring class's method, a getter's result, or a
+    /// private field's value. `Ok(None)` when no chain brand resolves `key` and
+    /// the receiver passes the textual presence check without a private field
+    /// value; the caller then takes its ordinary property lookup.
+    ///
+    /// The interpreter's `CallMethod` passes the running frame's callee. The JIT
+    /// region-call fallback passes the callee of the code that is actually
+    /// running: it used to look `#m` up as a plain property, so one class could
+    /// call another class's same-named `#m`.
+    pub(crate) fn private_method_callee(
+        &mut self,
+        ctx: Value,
+        recv: Value,
+        key: &str,
+    ) -> Result<Option<Value>, Thrown> {
+        if let Some((b, kind, owner)) = self.resolve_private_in(ctx, key) {
+            // Declaring-class-resolved, KIND-aware (FIX-3).
+            if !self.private_receiver_ok(recv, b, kind, owner) {
+                return Err(Thrown(format!(
+                    "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+                )));
+            }
+            let f = if kind & 1 != 0 {
+                self.private_member_from_owner(owner, key, (kind & 8) | 1)
+                    .unwrap_or(Value::UNDEFINED)
+            } else if kind & 2 != 0 {
+                let g = self
+                    .private_member_from_owner(owner, key, (kind & 8) | 2)
+                    .unwrap_or(Value::UNDEFINED);
+                self.call_value(g, recv, &[])?
+            } else if kind & 4 != 0 {
+                return Err(Thrown(format!(
+                    "TypeError: '{key}' was defined without a getter"
+                )));
+            } else {
+                match self.private_field_get(recv, b, key) {
+                    Some(v) => v,
+                    None => {
+                        return Err(Thrown(format!(
+                            "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+                        )));
+                    }
+                }
+            };
+            return Ok(Some(f));
+        }
+        let textual = self.has_property_str(recv, key) || self.private_field_scan_has(recv, key);
+        let present = match self.private_brand_ok_in(ctx, recv, key) {
+            Some(b) => textual && b,
+            None => textual,
+        };
+        if !present {
+            return Err(Thrown(format!(
+                "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+            )));
+        }
+        Ok(self.private_field_scan(recv, key))
     }
 
     /// Proxy-aware [[HasProperty]] (`in` / Reflect.has). Mirrors `has_property`
@@ -1032,33 +1136,28 @@ impl<'p> Vm<'p> {
             {
                 return Ok(true);
             }
-            let mut cur = match self.heap.get(idx) {
+            let class = match self.heap.get(idx) {
                 HeapObj::Object(m) => m.class,
                 _ => None,
             };
-            // PRIVATE members are not observable via the ordinary
-            // [[HasProperty]] (`in` / Reflect.has): skip the class-member
-            // extension for "#..." keys. (has_property_str keeps it — the
-            // legacy textual private brand checks rely on it.)
-            let skip_members = k.starts_with('#');
-            while let Some(cidx) = cur {
-                let step = match self.heap.get(cidx) {
-                    HeapObj::Class(c) => Some((
-                        !skip_members
-                            && (c.methods.iter().any(|(n, _)| *n == k)
-                                || c.getters.iter().any(|(n, _)| *n == k)
-                                || c.setters.iter().any(|(n, _)| *n == k)),
-                        c.parent,
-                    )),
-                    _ => None,
+            let proto = if let Some(cidx) = class {
+                // A class instance: the member tables answer while they still
+                // describe their prototype objects, the live chain otherwise
+                // (see `has_property`). PRIVATE members are not observable via
+                // the ordinary [[HasProperty]] (`in` / Reflect.has): a "#..."
+                // key skips the tables. (has_property_str keeps them — the
+                // legacy textual private brand checks rely on it.)
+                let next = if k.starts_with('#') {
+                    self.class_instance_live_proto(idx, cidx)
+                } else {
+                    match self.class_member_lookup(idx, cidx, &k) {
+                        ClassLookup::Method(_) | ClassLookup::Accessor { .. } => return Ok(true),
+                        ClassLookup::Live(p) => p,
+                        ClassLookup::Miss => self.class_instance_live_proto(idx, cidx),
+                    }
                 };
-                match step {
-                    Some((true, _)) => return Ok(true),
-                    Some((false, parent)) => cur = parent,
-                    None => break,
-                }
-            }
-            let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                next.is_heap().then_some(next)
+            } else if let Some(&p) = self.proto_of.get(&idx) {
                 p.is_heap().then_some(p)
             } else if self.obj_proto != 0 && idx != self.obj_proto {
                 Some(Value::heap(self.obj_proto))
@@ -1414,15 +1513,15 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn make_error(&mut self, kind: u8, msg: Option<Value>) -> Value {
         let k = (kind as usize).min(7);
-        let name_v = self.alloc_str(native::ERROR_NAMES[k].to_string());
         let msg_idx = match msg {
             Some(m) if m != Value::UNDEFINED => Some(self.to_str_idx(m)),
             _ => None,
         };
         // `message` is a non-enumerable own data property (ES: CreateNonEnumerable-
-        // DataPropertyOrThrow). `name` is normally inherited from the prototype, but
-        // zipp keeps it own for the structural error_name/instanceof path — also
-        // non-enumerable, so `Object.keys(err)` is `[]` as the spec requires.
+        // DataPropertyOrThrow). `name` is NOT own: it is inherited from the
+        // prototype, so `Error.prototype.name = …` and a newTarget prototype's
+        // `name` are what `e.name` / `String(e)` see. The kind lives in the
+        // prototype link and [[ErrorData]] (`error_data`).
         let attr = PropAttr {
             writable: true,
             enumerable: false,
@@ -1431,7 +1530,6 @@ impl<'p> Vm<'p> {
             setter: Value::UNDEFINED,
         };
         let mut map = ObjMap::new();
-        map.define("name", name_v, attr);
         if let Some(mi) = msg_idx {
             map.define("message", Value::heap(mi), attr);
         }
@@ -1448,16 +1546,52 @@ impl<'p> Vm<'p> {
     /// non-enumerable, writable, configurable own array built from
     /// IterableToList(errorsArg) (spec 20.5.7.1 steps 4-5). `iterate_to_vec` runs the
     /// argument's iterator (user code) under a GC lock, so `err` stays live across it.
+    /// InstallErrorCause (ES2022): an `options` object with a `cause` (HasProperty:
+    /// proto chain + a Proxy `has` trap, observable) gives the error a
+    /// non-enumerable own `cause` data property.
+    ///
+    /// The `has` trap and the `cause` getter are guest code, and a freshly made
+    /// error is still only a Rust local here, so it stays rooted across them.
+    pub(crate) fn install_error_cause(&mut self, err: Value, options: Value) -> Result<(), Thrown> {
+        if !self.is_object_value(options) {
+            return Ok(());
+        }
+        self.with_host_roots(&[err, options], |vm| {
+            let kc = vm.alloc_str("cause".to_string());
+            if vm.has_property_dyn(options, kc)? {
+                let cause = vm.get_prop(options, "cause")?;
+                // The trap/getter reached safe points: `err` may be old now.
+                vm.heap.write_barrier_val(err.heap_index(), cause);
+                if let HeapObj::Object(m) = vm.heap.get_mut(err.heap_index()) {
+                    m.define(
+                        "cause",
+                        cause,
+                        PropAttr {
+                            writable: true,
+                            enumerable: false,
+                            configurable: true,
+                            accessor: false,
+                            setter: Value::UNDEFINED,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn install_agg_errors(
         &mut self,
         err: Value,
         errors_arg: Value,
     ) -> Result<(), Thrown> {
-        let list = self.iterate_to_vec(errors_arg)?;
+        // The iteration runs guest code while `err` can still be a Rust local.
+        let list = self.with_host_roots(&[err], |vm| vm.iterate_to_vec(errors_arg))?;
         // CreateArrayFromList allocates in the CONSTRUCTOR's realm — the errors
         // array of `new otherRealm.AggregateError([e])` carries the other realm's
         // %Array.prototype% (staging/sm/Error/AggregateError.js line 85).
         let arr = self.alloc_array_current_realm(list);
+        self.heap.write_barrier_val(err.heap_index(), arr);
         if let HeapObj::Object(m) = self.heap.get_mut(err.heap_index()) {
             m.define(
                 "errors",
@@ -1471,6 +1605,9 @@ impl<'p> Vm<'p> {
                 },
             );
         }
+        // A `cause` getter that ran before this may have let a minor promote
+        // the error; the fresh array is then an old->young store.
+        self.heap.write_barrier_val(err.heap_index(), arr);
         Ok(())
     }
 
@@ -1534,6 +1671,7 @@ impl<'p> Vm<'p> {
             base,
             mapped_count: param_count.min(argc),
             unmapped: 0,
+            unmapped_hi: Vec::new(),
         });
         self.arguments_objs.insert(idx, map);
         if obj_proto != 0 {
@@ -1622,7 +1760,7 @@ impl<'p> Vm<'p> {
     /// severed / frame dead → ordinary (dense-store) semantics apply.
     pub(crate) fn args_mapped_get(&self, idx: u32, i: usize) -> Option<Value> {
         let m = self.arguments_objs.get(&idx)?.as_ref()?;
-        if i >= m.mapped_count || i >= 64 || (m.unmapped >> i) & 1 == 1 {
+        if i >= m.mapped_count || m.is_unmapped(i) {
             return None;
         }
         let f = self.frames.get(m.frame_idx)?;
@@ -1646,7 +1784,7 @@ impl<'p> Vm<'p> {
         let Some(Some(m)) = self.arguments_objs.get(&idx) else {
             return false;
         };
-        if i >= m.mapped_count || i >= 64 || (m.unmapped >> i) & 1 == 1 {
+        if i >= m.mapped_count || m.is_unmapped(i) {
             return false;
         }
         let (frame_idx, base) = (m.frame_idx, m.base);
@@ -1686,8 +1824,10 @@ impl<'p> Vm<'p> {
             None
         };
         if let Some(Some(m)) = self.arguments_objs.get_mut(&idx) {
-            if i < 64 {
-                m.unmapped |= 1 << i;
+            // (An index past the formals was never mapped: nothing to record,
+            // and no bitset sized by an arbitrary index.)
+            if i < m.mapped_count {
+                m.set_unmapped(i);
             }
         }
         if let Some(v) = cur {
@@ -1708,7 +1848,7 @@ impl<'p> Vm<'p> {
     /// [[Get]] hooks; a no-op for everything else.
     pub(crate) fn args_sync_dense(&mut self, idx: u32) {
         let count = match self.arguments_objs.get(&idx) {
-            Some(Some(m)) => m.mapped_count.min(64),
+            Some(Some(m)) => m.mapped_count,
             _ => return,
         };
         for i in 0..count {
@@ -1757,7 +1897,9 @@ impl<'p> Vm<'p> {
                 return prop_key.clone();
             }
         }
-        self.display(key)
+        // A string spelled like a symbol key ("@@…") is escaped out of that
+        // space (`escape_guest_key`).
+        escape_guest_key(self.display(key))
     }
 
     /// `ToPropertyKey(key)` (7.1.19): a Symbol maps to its registry key; anything
@@ -1777,7 +1919,7 @@ impl<'p> Vm<'p> {
                 return Ok(prop_key.clone());
             }
         }
-        self.to_js_string(prim)
+        self.to_js_string(prim).map(escape_guest_key)
     }
 
     /// Allocate a BigInt value.
@@ -1812,7 +1954,9 @@ impl<'p> Vm<'p> {
         }
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
             let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-            let t = s.trim();
+            // StringToBigInt trims StrWhiteSpace: U+FEFF counts, U+0085 does not
+            // (`BigInt("\u{85}1")` is a SyntaxError, `BigInt("\u{FEFF}1")` is 1n).
+            let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
             if t.is_empty() {
                 return Ok(BigVal::Small(0));
             }

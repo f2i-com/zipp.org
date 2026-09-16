@@ -1,0 +1,11 @@
+attr-set-int ! AttributeError: 'int' object has no attribute 'x' and no __dict__ for setting new attributes
+type-mul-list ! TypeError: can't multiply sequence by non-int of type 'list'
+type-in ! TypeError: argument of type 'int' is not iterable
+type-join ! TypeError: sequence item 0: expected str instance, int found
+value-max-empty ! ValueError: max() iterable argument is empty
+value-min-empty ! ValueError: min() iterable argument is empty
+type-in-float ! TypeError: argument of type 'float' is not iterable
+type-join-later ! TypeError: sequence item 2: expected str instance, int found
+value-max-empty-default-less ! ValueError: max() iterable argument is empty
+attr-set-none ! AttributeError: 'NoneType' object has no attribute 'x' and no __dict__ for setting new attributes
+attr-set-str ! AttributeError: 'str' object attribute 'upper' is read-only

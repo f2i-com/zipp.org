@@ -12,37 +12,126 @@ declare(strict_types=1);
  * built-in figures, because the frontend treats every field as optional.
  *
  * Requirements: PHP 8.1+, the curl extension (or allow_url_fopen), and a
- * writable cache location (`api/cache/` beside this file, else the system
- * temp directory). Set ZIPP_GITHUB_TOKEN in the server environment to lift
- * GitHub's anonymous rate limit (60 requests/hour per address; this script
- * makes six per cache miss).
+ * writable cache location: `api/cache/` beside this file, else a private
+ * 0700 directory this process creates under the system temp directory (never
+ * a predictable file shared with other local users; see cacheDirectory()).
+ * One refresh runs at a time, and a failed refresh backs off for
+ * FAILURE_BACKOFF seconds. Set ZIPP_GITHUB_TOKEN in the server environment to
+ * lift GitHub's anonymous rate limit (60 requests/hour per address; this
+ * script makes six per cache miss).
  */
 
 const REPO = 'f2i-com/zipp.org';
 const BRANCH = 'main';
 const CACHE_TTL = 900;          // fresh for 15 minutes
 const STALE_MAX_AGE = 86400;    // serve a failed refresh from cache up to a day
+const FAILURE_BACKOFF = 60;     // after a failed refresh, wait before the next
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
 header('X-Content-Type-Options: nosniff');
 
-$cacheDir = is_writable(__DIR__ . '/cache') ? __DIR__ . '/cache' : sys_get_temp_dir();
-$cacheFile = $cacheDir . '/zipp-landing-stats-v2.json';
+/**
+ * The cache directory: `api/cache/` when the deployment provides it, else a
+ * directory private to this process's user under the system temp directory.
+ * A fixed file name in the shared temp directory would let another local
+ * user pre-create it with forged data or plant a symlink the write follows.
+ * Returns null (no caching) when no private location can be established.
+ */
+function cacheDirectory(): ?string
+{
+    $local = __DIR__ . '/cache';
+    if (is_dir($local) && !is_link($local) && is_writable($local)) {
+        return $local;
+    }
+    $uid = function_exists('posix_geteuid') ? posix_geteuid() : null;
+    $dir = sys_get_temp_dir() . '/zipp-landing-stats-'
+        . substr(hash('sha256', __DIR__ . '|' . ($uid ?? get_current_user())), 0, 16);
+    if (!is_dir($dir) && !@mkdir($dir, 0700)) {
+        return null;
+    }
+    clearstatcache(true, $dir);
+    if (is_link($dir) || !is_dir($dir) || !is_writable($dir)) {
+        return null;
+    }
+    // Where ownership and modes are meaningful, the directory must be ours
+    // and closed to everyone else, whoever created it first.
+    if ($uid !== null && (fileowner($dir) !== $uid || (fileperms($dir) & 0077) !== 0)) {
+        return null;
+    }
+    return $dir;
+}
 
-$cached = null;
-if (is_file($cacheFile)) {
-    $raw = @file_get_contents($cacheFile);
+/** A cached snapshot, never read through a symlink. */
+function readSnapshot(?string $file): ?array
+{
+    if ($file === null || is_link($file) || !is_file($file)) {
+        return null;
+    }
+    $raw = @file_get_contents($file);
     $decoded = $raw === false ? null : json_decode($raw, true);
-    if (is_array($decoded) && isset($decoded['generated_at'])) {
-        $cached = $decoded;
-        $age = time() - strtotime((string) $decoded['generated_at']);
-        if ($age >= 0 && $age < CACHE_TTL && isset($decoded['releases'])) {
-            $decoded['cached'] = true;
-            echo json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+    return is_array($decoded) && isset($decoded['generated_at']) ? $decoded : null;
+}
+
+function snapshotAge(array $snapshot): int
+{
+    return time() - (int) strtotime((string) $snapshot['generated_at']);
+}
+
+function isFresh(?array $snapshot): bool
+{
+    if ($snapshot === null) {
+        return false;
+    }
+    $age = snapshotAge($snapshot);
+    return $age >= 0 && $age < CACHE_TTL && isset($snapshot['releases']);
+}
+
+/** Answer with a cached snapshot, or 503 when there is none recent enough. */
+function serveCached(?array $snapshot, bool $stale): never
+{
+    if ($snapshot !== null) {
+        $age = snapshotAge($snapshot);
+        if ($stale ? $age >= 0 && $age < STALE_MAX_AGE : isFresh($snapshot)) {
+            $snapshot['cached'] = true;
+            if ($stale) {
+                $snapshot['stale'] = true;
+            }
+            echo json_encode($snapshot, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
             exit;
         }
     }
+    http_response_code(503);
+    echo json_encode(['error' => 'Repository updates are temporarily unavailable.']);
+    exit;
+}
+
+$cacheDir = cacheDirectory();
+$cacheFile = $cacheDir === null ? null : $cacheDir . '/zipp-landing-stats-v2.json';
+$failureFile = $cacheDir === null ? null : $cacheDir . '/zipp-landing-stats-v2.failed';
+
+$cached = readSnapshot($cacheFile);
+if (isFresh($cached)) {
+    serveCached($cached, false);
+}
+
+// One refresh at a time: a concurrent request serves the previous snapshot
+// (or waits for the refresh in progress when there is none), and a refresh
+// that failed recently is not retried until FAILURE_BACKOFF has passed.
+$lock = $cacheDir === null ? false : @fopen($cacheDir . '/zipp-landing-stats-v2.lock', 'c');
+if ($lock !== false && !flock($lock, LOCK_EX | LOCK_NB)) {
+    if ($cached !== null) {
+        serveCached($cached, true);
+    }
+    flock($lock, LOCK_EX);
+    $cached = readSnapshot($cacheFile);
+    if (isFresh($cached)) {
+        serveCached($cached, false);
+    }
+}
+if ($failureFile !== null && !is_link($failureFile) && is_file($failureFile)
+    && time() - (int) filemtime($failureFile) < FAILURE_BACKOFF) {
+    serveCached($cached, true);
 }
 
 /**
@@ -299,20 +388,26 @@ $out['failures'] = $failures;
 // Publish coherent snapshots only. A partial refresh keeps the old timestamp;
 // failed requests must never turn yesterday's data into a fresh success.
 if (count($failures) > 0) {
-    if ($cached !== null) {
-        $age = time() - strtotime((string) $cached['generated_at']);
-        if ($age >= 0 && $age < STALE_MAX_AGE) {
-            $cached['cached'] = true;
-            $cached['stale'] = true;
-            echo json_encode($cached, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
-            exit;
-        }
+    if ($failureFile !== null && !is_link($failureFile)) {
+        @touch($failureFile);
     }
-    http_response_code(503);
-    echo json_encode(['error' => 'Repository updates are temporarily unavailable.']);
-    exit;
+    serveCached($cached, true);
 }
 
 $json = json_encode($out, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
-@file_put_contents($cacheFile, $json, LOCK_EX);
+if ($cacheDir !== null) {
+    // Write beside the target and rename over it: rename replaces a planted
+    // symlink rather than writing through it, and readers never see a
+    // partial file.
+    $temp = @tempnam($cacheDir, 'stats');
+    if ($temp !== false) {
+        if (@file_put_contents($temp, $json) === strlen($json) && @rename($temp, $cacheFile)) {
+            if (is_file($failureFile) && !is_link($failureFile)) {
+                @unlink($failureFile);
+            }
+        } else {
+            @unlink($temp);
+        }
+    }
+}
 echo $json;

@@ -19,38 +19,79 @@ impl<'p> Vm<'p> {
     /// OrdinaryCreateFromConstructor's prototype selection: when `new_target`
     /// differs from the base constructor `cval` (a `Reflect.construct(c, args,
     /// newTarget)` or a derived-class `super()`), the instance's [[Prototype]] is
-    /// `Get(new_target, "prototype")` when that is an object, else `default`. For
-    /// the common `new C()` case (`new_target == cval`) the default — `cval`'s own
-    /// prototype — is used unchanged (no extra Get on the hot path).
+    /// `Get(new_target, "prototype")` when that is an object, else the
+    /// `intrinsic` default proto from GetFunctionRealm(newTarget). For the common
+    /// `new C()` case (`new_target == cval`) `default` — `cval`'s own prototype —
+    /// is used unchanged (no extra Get on the hot path).
     pub(crate) fn newtarget_proto(
         &mut self,
         new_target: Value,
         cval: Value,
         default: Value,
+        intrinsic: u32,
     ) -> Result<Value, Thrown> {
         if new_target.is_heap() && new_target != cval {
             let p = self.get_prop(new_target, "prototype")?;
             if self.is_object_value(p) {
+                // Rooted in the enclosing `construct_with_newtarget` scope.
+                self.push_host_root(p);
                 return Ok(p);
             }
-            // GetFunctionRealm(newTarget) throws on a REVOKED proxy — the
-            // `prototype` Get's trap may have just revoked it.
-            self.check_function_realm_reachable(new_target)?;
-            // Non-object prototype: GetPrototypeFromConstructor falls back to
-            // GetFunctionRealm(newTarget)'s intrinsic prototype — the realm's
-            // image of `default` when it IS an intrinsic (Iterator), else the
-            // realm's %Object.prototype% (an ordinary function's `default` is
-            // its own `.prototype` object, which has no realm image).
-            if default.is_heap() {
-                if let Some(rp) = self.realm_proto_fallback(new_target, default.heap_index()) {
-                    return Ok(Value::heap(rp));
-                }
-            }
-            if let Some(rp) = self.realm_proto_fallback(new_target, self.obj_proto) {
-                return Ok(Value::heap(rp));
-            }
+            return self.newtarget_intrinsic_fallback(new_target, intrinsic);
         }
         Ok(default)
+    }
+
+    /// GetPrototypeFromConstructor step 3 for a `newTarget` whose `prototype`
+    /// is not an object: the `intrinsic` default proto of
+    /// GetFunctionRealm(newTarget) — the realm's image of it for a createRealm
+    /// newTarget, the main intrinsic itself otherwise. Never the constructor's
+    /// own `.prototype`: `Reflect.construct(F, [], Q)` with `Q.prototype = 3`
+    /// makes an ordinary object that inherits from %Object.prototype%.
+    pub(crate) fn newtarget_intrinsic_fallback(
+        &self,
+        new_target: Value,
+        intrinsic: u32,
+    ) -> Result<Value, Thrown> {
+        // GetFunctionRealm(newTarget) throws on a REVOKED proxy — the
+        // `prototype` Get's trap may have just revoked it.
+        self.check_function_realm_reachable(new_target)?;
+        Ok(Value::heap(
+            self.realm_proto_fallback(new_target, intrinsic)
+                .unwrap_or(intrinsic),
+        ))
+    }
+
+    /// The intrinsic default proto for a class constructor's instances: the
+    /// base of its `extends` chain allocates `this` (OrdinaryCreateFromConstructor
+    /// runs there), so a chain that ends in a built-in constructor
+    /// (`class A extends Array`) falls back to that built-in's prototype
+    /// (%Array.prototype%), and every other chain to %Object.prototype%.
+    fn class_intrinsic_proto(&self, class_idx: u32) -> u32 {
+        let mut cur = class_idx;
+        // Bounded: an `extends` chain is acyclic by construction.
+        for _ in 0..10_000 {
+            match self.heap.get(cur) {
+                HeapObj::Class(c) => match c.parent {
+                    Some(p) => cur = p,
+                    None => return self.obj_proto,
+                },
+                HeapObj::Object(m) if m.is_ctor => {
+                    // A createRealm facade maps to the main built-in, whose
+                    // prototype `realm_proto_fallback` knows how to re-home.
+                    let main = self.realm_ctor_main.get(&cur).copied().unwrap_or(cur);
+                    return match self.heap.get(main) {
+                        HeapObj::Object(m) => m
+                            .get("prototype")
+                            .filter(|p| p.is_heap())
+                            .map_or(self.obj_proto, |p| p.heap_index()),
+                        _ => self.obj_proto,
+                    };
+                }
+                _ => return self.obj_proto,
+            }
+        }
+        self.obj_proto
     }
 
     /// GetFunctionRealm (10.2.5) reduced to its only OBSERVABLE effect: a REVOKED
@@ -111,6 +152,9 @@ impl<'p> Vm<'p> {
         if new_target.is_heap() && new_target != cv {
             let p = self.get_prop(new_target, "prototype")?;
             if self.is_object_value(p) {
+                // Rooted in the enclosing `construct_with_newtarget` scope: most
+                // built-ins coerce arguments (guest code) before `set_ctor_proto`.
+                self.push_host_root(p);
                 return Ok(Some(p));
             }
             // GetPrototypeFromConstructor step 3.a: a non-object `prototype`
@@ -141,6 +185,20 @@ impl<'p> Vm<'p> {
     /// the target, and into the instance's [[Prototype]] via OrdinaryCreateFrom
     /// Constructor (see `newtarget_proto`) for the Func/Class paths.
     pub(crate) fn construct_with_newtarget(
+        &mut self,
+        cv: Value,
+        args: &[Value],
+        new_target: Value,
+    ) -> Result<Value, Thrown> {
+        // One host-root scope per [[Construct]]: GetPrototypeFromConstructor
+        // (`newtarget_proto*`) parks the prototype it read there, and built-in
+        // paths that allocate their result before that read park the result,
+        // because the `prototype` Get and the later argument coercions are guest
+        // code that runs while both are still Rust locals.
+        self.with_host_roots(&[], |vm| vm.construct_with_newtarget_rooted(cv, args, new_target))
+    }
+
+    fn construct_with_newtarget_rooted(
         &mut self,
         cv: Value,
         args: &[Value],
@@ -225,54 +283,48 @@ impl<'p> Vm<'p> {
         // `Reflect.construct(RangeError, [msg])`). Mirrors the compile-lowered
         // `new TypeError(msg)` path. AggregateError takes the message as arg[1].
         if let Some(k) = self.error_ctors.iter().position(|&c| c == cv.heap_index()) {
-            let over = self.newtarget_proto_override(new_target, cv, self.error_protos[k])?;
-            // AggregateError (k==7) takes its message as arg[1] and coerces it with a
-            // real ToString (observable / abrupt) before iterating arg[0] into `errors`.
-            let e = if k == 7 {
-                let msg = match args.get(1).copied() {
-                    Some(m) if m != Value::UNDEFINED => Some(self.to_str_value(m)?),
-                    _ => None,
-                };
-                let e = self.make_error(7, msg);
-                let errors_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
-                self.install_agg_errors(e, errors_arg)?;
-                e
-            } else {
-                // Coerce `message` with a real ToString FIRST (observable / abrupt):
-                // a Symbol message throws TypeError, and a throwing toString /
-                // @@toPrimitive propagates — before the error object is allocated.
-                let msg = match args.first().copied() {
-                    Some(m) if m != Value::UNDEFINED => Some(self.to_str_value(m)?),
-                    _ => None,
-                };
-                self.make_error(k as u8, msg)
-            };
-            // InstallErrorCause: options (arg 1; arg 2 for AggregateError) with
-            // a `cause` (HasProperty: proto chain + has trap, observable) adds
-            // a non-enumerable own `cause` data property.
-            let options = args
-                .get(if k == 7 { 2 } else { 1 })
-                .copied()
-                .unwrap_or(Value::UNDEFINED);
-            if self.is_object_value(options) {
-                let kc = self.alloc_str("cause".to_string());
-                if self.has_property_dyn(options, kc)? {
-                    let cause = self.get_prop(options, "cause")?;
-                    if let HeapObj::Object(m) = self.heap.get_mut(e.heap_index()) {
-                        m.define(
-                            "cause",
-                            cause,
-                            PropAttr {
-                                writable: true,
-                                enumerable: false,
-                                configurable: true,
-                                accessor: false,
-                                setter: Value::UNDEFINED,
-                            },
-                        );
+            // The arguments may be a Rust copy of a Reflect.construct list and
+            // `over` a prototype a newTarget getter just produced; the error
+            // itself is a Rust local until returned. The prototype getter, the
+            // message ToString, the errors iteration, and the `has` trap /
+            // `cause` getter all run guest code that can collect, so keep every
+            // one of them rooted.
+            let (e, over) = self.with_host_roots(args, |vm| {
+                let over = vm.newtarget_proto_override(new_target, cv, vm.error_protos[k])?;
+                let over_root = over.unwrap_or(Value::UNDEFINED);
+                let e = vm.with_host_roots(&[over_root], |vm| -> Result<Value, Thrown> {
+                    // AggregateError (k==7) takes its message as arg[1] and coerces it
+                    // with a real ToString (observable / abrupt) before iterating
+                    // arg[0] into `errors`.
+                    // Coerce `message` with a real ToString FIRST (observable /
+                    // abrupt): a Symbol message throws TypeError, and a throwing
+                    // toString / @@toPrimitive propagates — before the error
+                    // object is allocated. AggregateError (k==7) takes its
+                    // message as arg[1].
+                    let msg = match args.get(if k == 7 { 1 } else { 0 }).copied() {
+                        Some(m) if m != Value::UNDEFINED => Some(vm.to_str_value(m)?),
+                        _ => None,
+                    };
+                    let e = vm.make_error(k as u8, msg);
+                    // InstallErrorCause: options (arg 1; arg 2 for AggregateError)
+                    // with a `cause` (HasProperty: proto chain + has trap,
+                    // observable) adds a non-enumerable own `cause` data property.
+                    let options = args
+                        .get(if k == 7 { 2 } else { 1 })
+                        .copied()
+                        .unwrap_or(Value::UNDEFINED);
+                    vm.with_host_roots(&[e], |vm| vm.install_error_cause(e, options))?;
+                    // AggregateError then iterates arg[0] into `errors` — after
+                    // the cause, as the spec (and the compiled `NewError` path)
+                    // orders it.
+                    if k == 7 {
+                        let errors_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                        vm.with_host_roots(&[e], |vm| vm.install_agg_errors(e, errors_arg))?;
                     }
-                }
-            }
+                    Ok(e)
+                })?;
+                Ok::<_, Thrown>((e, over))
+            })?;
             return Ok(self.set_ctor_proto(e, over));
         }
         // ArrayBuffer / DataView / TypedArray constructors used as values.
@@ -283,6 +335,9 @@ impl<'p> Vm<'p> {
             // in the body must leave `newTarget.prototype` unread
             // (sm/*/create-function-parse-before-getprototype.js).
             let r = self.build_function(args)?;
+            // Here and below: a result built before the `prototype` Get stays
+            // rooted across it (this construct's host-root scope).
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.fn_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -293,16 +348,19 @@ impl<'p> Vm<'p> {
         // create_realm).
         if ci == self.gen_fn_ctor && ci != 0 {
             let r = self.build_function_kind(args, 1)?;
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.gen_fn_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.async_fn_ctor && ci != 0 {
             let r = self.build_function_kind(args, 2)?;
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.async_fn_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.asyncgen_fn_ctor && ci != 0 {
             let r = self.build_function_kind(args, 3)?;
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.asyncgen_fn_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -339,17 +397,20 @@ impl<'p> Vm<'p> {
         }
         if ci == self.disposablestack_ctor && ci != 0 {
             let r = Value::heap(self.alloc_disposable_stack(false));
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.disposablestack_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.asyncdisposablestack_ctor && ci != 0 {
             let r = Value::heap(self.alloc_disposable_stack(true));
+            self.push_host_root(r);
             let over =
                 self.newtarget_proto_override(new_target, cv, self.asyncdisposablestack_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.suppressederror_ctor && ci != 0 {
             let r = self.build_suppressed_error(args)?;
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.suppressederror_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -432,6 +493,7 @@ impl<'p> Vm<'p> {
         }
         if ci == self.dataview_ctor && ci != 0 {
             let r = self.build_data_view(args)?;
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.dataview_proto)?;
             // OrdinaryCreateFromConstructor read newTarget.prototype (a user
             // getter may have detached or shrunk the buffer): re-validate the
@@ -490,6 +552,7 @@ impl<'p> Vm<'p> {
                 None
             };
             let r = self.build_typed_array(k as u8, args)?;
+            self.push_host_root(r);
             // OrdinaryCreateFromConstructor: a foreign/derived newTarget sets the
             // instance's [[Prototype]] (cross-realm intrinsic fallback when its
             // .prototype is not an object).
@@ -517,8 +580,12 @@ impl<'p> Vm<'p> {
                     "TypeError: Abstract class Iterator not directly constructable".into(),
                 ));
             }
-            let proto =
-                self.newtarget_proto(new_target, cv, Value::heap(self.iterator_proto_root))?;
+            let proto = self.newtarget_proto(
+                new_target,
+                cv,
+                Value::heap(self.iterator_proto_root),
+                self.iterator_proto_root,
+            )?;
             let oidx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
             if proto.is_heap() {
                 self.proto_of.insert(oidx, proto);
@@ -533,6 +600,7 @@ impl<'p> Vm<'p> {
         }
         if ci == self.duration_ctor && ci != 0 {
             let r = self.build_duration(args)?;
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.duration_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -544,6 +612,7 @@ impl<'p> Vm<'p> {
                 .validate_calendar_identifier(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
             let r = self.make_plain_date(y, m, d)?;
             let r = self.tag_cal(r, cal);
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.plaindate_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -556,6 +625,7 @@ impl<'p> Vm<'p> {
                 }
             }
             let r = self.make_plain_time(f)?;
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.plaintime_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -573,6 +643,7 @@ impl<'p> Vm<'p> {
                 .validate_calendar_identifier(args.get(9).copied().unwrap_or(Value::UNDEFINED))?;
             let r = self.make_plain_date_time(f)?;
             let r = self.tag_cal(r, cal);
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.plaindatetime_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -583,6 +654,7 @@ impl<'p> Vm<'p> {
                 .to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?
                 .to_i128_sat();
             let r = self.make_instant(ns)?;
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.instant_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -598,6 +670,7 @@ impl<'p> Vm<'p> {
             };
             let r = self.make_plain_year_month(y, m, rd)?;
             let r = self.tag_cal(r, cal);
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.plainyearmonth_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -613,6 +686,7 @@ impl<'p> Vm<'p> {
             };
             let r = self.make_plain_month_day(m, d, ry)?;
             let r = self.tag_cal(r, cal);
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.plainmonthday_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -621,6 +695,7 @@ impl<'p> Vm<'p> {
                 .validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             let r = self.make_zoned_date_time(args)?;
             let r = self.tag_cal(r, cal);
+            self.push_host_root(r);
             let over = self.newtarget_proto_override(new_target, cv, self.zoneddatetime_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -884,7 +959,7 @@ impl<'p> Vm<'p> {
             // The instance's [[Prototype]] is newTarget.prototype (OrdinaryCreate
             // FromConstructor); for the common `new F()` case this is F.prototype.
             let default = self.prototype_of(cv).unwrap_or(Value::UNDEFINED);
-            let mut proto = self.newtarget_proto(new_target, cv, default)?;
+            let mut proto = self.newtarget_proto(new_target, cv, default, self.obj_proto)?;
             // GetPrototypeFromConstructor: a non-object prototype falls back
             // to %Object.prototype% — from the CONSTRUCTOR's realm when it is
             // realm-tagged (a real function made by new other.Function()).
@@ -982,26 +1057,44 @@ impl<'p> Vm<'p> {
                 ),
                 _ => return Err(Thrown("TypeError: value is not a constructor".into())),
             };
+        // OrdinaryCreateFromConstructor: a `Reflect.construct(Class, args, NT)` (or
+        // any newTarget other than the class) gives the instance NT.prototype as its
+        // [[Prototype]], overriding the class-derived default (proto_of is consulted
+        // first by object_get_prototype_of / instanceof). `new Class()` is unchanged.
+        // GetPrototypeFromConstructor runs BEFORE the allocation, as the spec
+        // orders it: the `prototype` Get can be a Proxy trap or getter (guest
+        // code), and an instance allocated first was only a Rust local across
+        // it — a collection there handed the constructor a reused slot as `this`.
+        let mut proto_override: Option<Value> = None;
+        if new_target.is_heap() && new_target != cv {
+            let p = self.get_prop(new_target, "prototype")?;
+            proto_override = Some(if self.is_object_value(p) {
+                p
+            } else {
+                // GetPrototypeFromConstructor: a non-object `prototype` falls
+                // back to newTarget's realm's intrinsic — %Object.prototype%,
+                // or the built-in's prototype at the base of an `extends`
+                // chain — never this class's own `.prototype`.
+                let intrinsic = self.class_intrinsic_proto(cv.heap_index());
+                self.newtarget_intrinsic_fallback(new_target, intrinsic)?
+            });
+        }
         // The instance links to its class for method lookup + instanceof; its own
         // keys hold only the fields (so enumeration / JSON stay method-free).
         let mut map = ObjMap::new();
         map.class = Some(cv.heap_index());
         let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
-        // OrdinaryCreateFromConstructor: a `Reflect.construct(Class, args, NT)` (or
-        // any newTarget other than the class) gives the instance NT.prototype as its
-        // [[Prototype]], overriding the class-derived default (proto_of is consulted
-        // first by object_get_prototype_of / instanceof). `new Class()` is unchanged.
-        if new_target.is_heap() && new_target != cv {
-            let p = self.get_prop(new_target, "prototype")?;
-            if self.is_object_value(p) {
-                self.proto_of.insert(obj.heap_index(), p);
-            } else if let Some(rp) = self.realm_proto_fallback(new_target, self.obj_proto) {
-                // GetPrototypeFromConstructor: a createRealm-child newTarget
-                // with a non-object `prototype` falls back to ITS realm's
-                // %Object.prototype% (None for a main-realm newTarget).
-                self.proto_of.insert(obj.heap_index(), Value::heap(rp));
-            }
+        if let Some(p) = proto_override {
+            // A class instance with its own proto entry no longer matches the
+            // class-shape inline caches.
+            self.note_class_instance_reproto(obj.heap_index());
+            self.proto_of.insert(obj.heap_index(), p);
         }
+        // The instance is a Rust local until a constructor frame holds it as
+        // `this` — and a ctor-less class never gives it one: the implicit
+        // super(...args) brands it for a built-in parent (a Promise executor,
+        // a Set/Map adder — guest code) and then runs the field initializers.
+        self.push_host_root(obj);
         if has_explicit {
             // The explicit constructor runs its own `super(...)`; a ctor that
             // returns an object/array replaces the instance.

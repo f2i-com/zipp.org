@@ -13,8 +13,12 @@
 //!      running program is enumerated here or reachable by tracing from it. A
 //!      missed root would free a live object; `ZIPP_GC_STRESS` (collect at every
 //!      safe point) turns any such miss into an immediate corpus/test262 failure.
-//!   3. Collection only happens at a dispatch-loop safe point with `gc_lock == 0`,
-//!      so no native built-in is holding an un-rooted `Vec<Value>` working set.
+//!   3. Collection only happens at a dispatch-loop safe point with `gc_lock == 0`.
+//!      A native built-in that re-enters guest code (a getter, a Proxy trap, a
+//!      callback) while it holds a Rust-side `Vec<Value>` working set must keep
+//!      that set traced across the re-entry: park each Value on the
+//!      `with_host_roots` stack (`push_host_root`), or take `gc_lock_guard`
+//!      when the re-entry is bounded.
 //!
 //! Two collection kinds since the nursery (NURSERY_DESIGN.md §§1-2;
 //! `ZIPP_NO_NURSERY=1` restores majors-only exactly):
@@ -376,6 +380,9 @@ impl Vm<'_> {
         if let Some(v) = self.pending_throw {
             root_val!(v);
         }
+        if let Some(v) = self.uncaught_timer_throw {
+            root_val!(v);
+        }
         for (v, _) in self.module_body_promise.values() {
             root_val!(*v);
         }
@@ -498,6 +505,9 @@ impl Vm<'_> {
         for &promise in &self.promise_resolution_roots {
             root_idx!(promise);
         }
+        for &promise in &self.unhandled_rejections {
+            root_idx!(promise);
+        }
         for f in &self.frames {
             root_idx!(f.closure);
             root_val!(f.new_target);
@@ -611,11 +621,6 @@ impl Vm<'_> {
             }
             if let Some(e) = st.error_chain {
                 root_val!(e);
-            }
-        }
-        for disposers in self.using_resources.values() {
-            for &v in disposers {
-                root_val!(v);
             }
         }
         for m in self.fn_props.values().chain(self.arr_props.values()) {
@@ -820,6 +825,8 @@ impl Vm<'_> {
         self.super_called.retain(|&k| marks[k as usize]);
         self.super_this.retain(|&k, _| marks[k as usize]);
         self.prototypes.retain(|&k, _| marks[k as usize]);
+        self.class_proto_owner.retain(|&k, _| marks[k as usize]);
+        self.ctor_initial_name.retain(|&k, _| marks[k as usize]);
         self.fn_props.retain(|&k, _| marks[k as usize]);
         self.arr_props.retain(|&k, _| marks[k as usize]);
         self.regexp_result_props.retain(|&k, _| marks[k as usize]);
@@ -840,6 +847,16 @@ impl Vm<'_> {
         self.dv_tracking.retain(|&k| marks[k as usize]);
         self.regexp_string_iters.retain(|&k, _| marks[k as usize]);
         self.matchall_batches.retain(|&k, _| marks[k as usize]);
+        // Correctness never depends on this (the cache is keyed by the slot
+        // version); it only stops a dead subject's units staying resident.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self
+            .regex_subject_units
+            .as_ref()
+            .is_some_and(|c| !marks[c.idx as usize])
+        {
+            self.regex_subject_units = None;
+        }
         self.method_brand.retain(|&k, _| marks[k as usize]);
         self.instance_brand.retain(|&k, _| marks[k as usize]);
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
@@ -931,8 +948,11 @@ impl Vm<'_> {
     /// young referents. Root-like VM side tables are re-scanned by the shared
     /// `mark_roots`; keyed directed edges such as `closure_home` are traced
     /// from their reachable holder instead. Cost is O(roots + young live +
-    /// dirty edge lists), independent of the old heap — the term the stage-1
-    /// full mark
+    /// dirty edge lists + entries of every registered weak container),
+    /// otherwise independent of the old heap — the ephemeron fixpoint and the
+    /// weak sweep still visit each live WeakMap/WeakSet/FinalizationRegistry
+    /// in full, so a large long-lived WeakMap is paid for at every minor. The
+    /// term the stage-1 full mark
     /// still paid on every minor (B120's refutation), and the whole
     /// economics flip of stage 3: regex-log-scan's ~128ms/run of 95.8%-old
     /// trace work simply stops happening at minors.
@@ -1148,6 +1168,8 @@ impl Vm<'_> {
         prune_set!(self.super_called);
         prune_map!(self.super_this);
         prune_map!(self.prototypes);
+        prune_map!(self.class_proto_owner);
+        prune_map!(self.ctor_initial_name);
         prune_slots!(self.fn_props);
         prune_slots!(self.arr_props);
         prune_slots!(self.regexp_result_props);
@@ -1505,7 +1527,6 @@ impl Vm<'_> {
             | HeapObj::Func(_)
             | HeapObj::Native(_)
             | HeapObj::Date(_)
-            | HeapObj::RegExp { .. }
             | HeapObj::ArrayBuffer { .. }
             | HeapObj::Temporal { .. }
             // A BigInt (either representation) holds no heap references.
@@ -1544,6 +1565,9 @@ impl Vm<'_> {
                 }
             }
             HeapObj::Wrapped { target, .. } => m_val!(*target),
+            // `lastIndex` keeps the assigned Value as-is until exec applies
+            // ToLength, so an object (a `valueOf` carrier) or string lives here.
+            HeapObj::RegExp { last_index, .. } => m_val!(*last_index),
             HeapObj::Array(items) => {
                 for &v in items {
                     m_val!(v);

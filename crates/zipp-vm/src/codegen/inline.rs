@@ -1739,6 +1739,15 @@ pub(crate) fn emit_inline_method_call(
                 ; jne => miss
             );
         }
+        // A class member resolved through the member tables: they must still
+        // describe the live prototype chain (see `MethodInlineShape::class_epoch`).
+        if let Some(epoch) = shape.class_epoch {
+            let off = crate::vm::host_api::JIT_CLASS_PROTO_EPOCH_OFFSET as i32;
+            dynasm!(ops
+                ; cmp DWORD [rdi + off], epoch as i32
+                ; jne => miss
+            );
+        }
         // ── plain-object receiver: the method is an own property, so its SLOT
         // VALUE must still be the callee we baked. An in-place overwrite does
         // not change the shape and so does not bump the version above.
@@ -1932,6 +1941,15 @@ pub(crate) fn emit_inline_accessor(
             ; cmp edx, DWORD shape.recv_ver as i32
             ; jne => miss
         );
+        // A CLASS accessor came from the member tables, which answer only while
+        // they still describe the live prototype chain (`class_epoch`).
+        if let Some(epoch) = shape.class_epoch {
+            let off = crate::vm::host_api::JIT_CLASS_PROTO_EPOCH_OFFSET as i32;
+            dynasm!(ops
+                ; cmp DWORD [rdi + off], epoch as i32
+                ; jne => miss
+            );
+        }
         // ── W20 (M2): OWN-ACCESSOR arm ── the accessor function lives in the
         // receiver's own slot (`vals[slot]` for a getter, `attrs[slot].setter`
         // for a setter), so the baked callee must still BE there. The version

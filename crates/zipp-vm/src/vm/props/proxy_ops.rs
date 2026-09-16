@@ -232,94 +232,10 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let items = self.create_list_from_array_like(r)?;
-                // CreateListFromArrayLike with «String, Symbol» element-type check
-                // and the no-duplicate-entries invariant (spec 10.5.11 steps 8-9).
-                let mut seen_set: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                seen_set.try_reserve(items.len()).map_err(|_| {
-                    Thrown("RangeError: proxy ownKeys validation allocation failed".into())
-                })?;
-                for k in &items {
-                    let is_str = k.is_heap() && self.heap.is_str_like(k.heap_index());
-                    let is_sym = k.is_heap()
-                        && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. });
-                    if !is_str && !is_sym {
-                        return Err(Thrown(
-                            "TypeError: ownKeys trap result must contain only Strings and Symbols"
-                                .into(),
-                        ));
-                    }
-                    let id = if is_str {
-                        format!("s:{}", self.display(*k))
-                    } else {
-                        format!("y:{}", k.heap_index())
-                    };
-                    if !seen_set.insert(id.clone()) {
-                        return Err(Thrown(
-                            "TypeError: ownKeys trap result must not contain duplicate entries"
-                                .into(),
-                        ));
-                    }
-                }
-                // Target-key invariants (10.5.11 steps 10-22). Partition the target's
-                // own keys into configurable / non-configurable, keyed by the same
-                // identity scheme as `seen_set` (string content / symbol heap index).
-                let extensible = self.with_native_recursion_guard(|vm| vm.is_extensible(target))?;
-                let tkeys_v = self.with_native_recursion_guard(|vm| vm.object_own_keys(target))?;
-                let tkeys = self.array_snapshot(tkeys_v.heap_index());
-                let (mut config, mut nonconfig): (Vec<String>, Vec<String>) =
-                    (Vec::new(), Vec::new());
-                for tk in &tkeys {
-                    let id = if tk.is_heap()
-                        && matches!(self.heap.get(tk.heap_index()), HeapObj::Symbol { .. })
-                    {
-                        format!("y:{}", tk.heap_index())
-                    } else {
-                        format!("s:{}", self.display(*tk))
-                    };
-                    let ks = self.key_of(*tk);
-                    let desc = self.object_get_own_property_descriptor(target, &ks);
-                    let cfg = if desc.is_undefined() {
-                        true
-                    } else {
-                        let c = self.get_prop(desc, "configurable")?;
-                        self.truthy(c)
-                    };
-                    if cfg {
-                        config.push(id);
-                    } else {
-                        nonconfig.push(id);
-                    }
-                }
-                // Fast path: an extensible target with no non-configurable keys
-                // imposes no further constraint on the trap result.
-                if !(extensible && nonconfig.is_empty()) {
-                    let mut unchecked = seen_set;
-                    // Every non-configurable own key MUST appear in the trap result.
-                    for key in &nonconfig {
-                        if !unchecked.remove(key) {
-                            return Err(Thrown(
-                                "TypeError: proxy [[OwnPropertyKeys]] must include all non-configurable keys of the target".into(),
-                            ));
-                        }
-                    }
-                    // A non-extensible target: the trap result must contain EXACTLY
-                    // the target's own keys (every configurable key present, none extra).
-                    if !extensible {
-                        for key in &config {
-                            if !unchecked.remove(key) {
-                                return Err(Thrown(
-                                    "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must contain all of its own keys".into(),
-                                ));
-                            }
-                        }
-                        if !unchecked.is_empty() {
-                            return Err(Thrown(
-                                "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must not contain extra keys".into(),
-                            ));
-                        }
-                    }
-                }
+                // The key strings live only in `items` while a Proxy target's
+                // isExtensible / ownKeys traps run below; the caller receives
+                // them after the scope closes, with no safe point in between.
+                self.with_host_roots(&items, |vm| vm.proxy_own_keys_validate(target, &items))?;
                 Ok(Some(items))
             }
             None => {
@@ -329,5 +245,100 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.array_snapshot(keys.heap_index())))
             }
         }
+    }
+
+    /// [[OwnPropertyKeys]] steps 8-22 for a trap result `items` (already a
+    /// rooted list): the element-type and duplicate checks, then the target
+    /// key invariants.
+    fn proxy_own_keys_validate(&mut self, target: Value, items: &[Value]) -> Result<(), Thrown> {
+        // CreateListFromArrayLike with «String, Symbol» element-type check
+        // and the no-duplicate-entries invariant (spec 10.5.11 steps 8-9).
+        let mut seen_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        seen_set.try_reserve(items.len()).map_err(|_| {
+            Thrown("RangeError: proxy ownKeys validation allocation failed".into())
+        })?;
+        for k in items {
+            let is_str = k.is_heap() && self.heap.is_str_like(k.heap_index());
+            let is_sym = k.is_heap()
+                && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. });
+            if !is_str && !is_sym {
+                return Err(Thrown(
+                    "TypeError: ownKeys trap result must contain only Strings and Symbols"
+                        .into(),
+                ));
+            }
+            let id = if is_str {
+                format!("s:{}", self.display(*k))
+            } else {
+                format!("y:{}", k.heap_index())
+            };
+            if !seen_set.insert(id.clone()) {
+                return Err(Thrown(
+                    "TypeError: ownKeys trap result must not contain duplicate entries"
+                        .into(),
+                ));
+            }
+        }
+        // Target-key invariants (10.5.11 steps 10-22). Partition the target's
+        // own keys into configurable / non-configurable, keyed by the same
+        // identity scheme as `seen_set` (string content / symbol heap index).
+        let extensible = self.with_native_recursion_guard(|vm| vm.is_extensible(target))?;
+        let tkeys_v = self.with_native_recursion_guard(|vm| vm.object_own_keys(target))?;
+        let tkeys = self.array_snapshot(tkeys_v.heap_index());
+        let (mut config, mut nonconfig): (Vec<String>, Vec<String>) =
+            (Vec::new(), Vec::new());
+        for tk in &tkeys {
+            let id = if tk.is_heap()
+                && matches!(self.heap.get(tk.heap_index()), HeapObj::Symbol { .. })
+            {
+                format!("y:{}", tk.heap_index())
+            } else {
+                format!("s:{}", self.display(*tk))
+            };
+            let ks = self.key_of(*tk);
+            let desc = self.object_get_own_property_descriptor(target, &ks);
+            let cfg = if desc.is_undefined() {
+                true
+            } else {
+                let c = self.get_prop(desc, "configurable")?;
+                self.truthy(c)
+            };
+            if cfg {
+                config.push(id);
+            } else {
+                nonconfig.push(id);
+            }
+        }
+        // Fast path: an extensible target with no non-configurable keys
+        // imposes no further constraint on the trap result.
+        if !(extensible && nonconfig.is_empty()) {
+            let mut unchecked = seen_set;
+            // Every non-configurable own key MUST appear in the trap result.
+            for key in &nonconfig {
+                if !unchecked.remove(key) {
+                    return Err(Thrown(
+                        "TypeError: proxy [[OwnPropertyKeys]] must include all non-configurable keys of the target".into(),
+                    ));
+                }
+            }
+            // A non-extensible target: the trap result must contain EXACTLY
+            // the target's own keys (every configurable key present, none extra).
+            if !extensible {
+                for key in &config {
+                    if !unchecked.remove(key) {
+                        return Err(Thrown(
+                            "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must contain all of its own keys".into(),
+                        ));
+                    }
+                }
+                if !unchecked.is_empty() {
+                    return Err(Thrown(
+                        "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must not contain extra keys".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }

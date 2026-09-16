@@ -1,0 +1,16 @@
+str-mode {'b': 1, 'a': 2, '\x00x': 3} ['b', 'a', '\x00x'] None False 3 3 True
+unhashable unhashable type: 'list'
+unhashable-in unhashable type: 'list'
+unhashable unhashable type: 'dict'
+unhashable-in unhashable type: 'dict'
+unhashable unhashable type: 'set'
+unhashable-in unhashable type: 'set'
+switched {'b': 1, 'a': 2, '\x00x': 3, 1: 'one', 'c': 4, 2.5: 'f'} ['b', 'a', '\x00x', 1, 'c', 2.5] [1, 2, 3, 'one', 4, 'f'] one 3 one
+reinsert [('a', 2), ('\x00x', 3), ('c', 4), (2.5, 'f'), ('b', 9), (True, 't')] (True, 't') 5
+cleared {'z': 0, 'y': 1} ['z', 'y'] True {'z': 0, 'y': 1, 'w': 2} {'z': 0, 'y': 1, 3: 'x'}
+str-deletes {'k3': 3, 'k0': 'back', 'k9': 9} [('k1', 1), ('k3', 3), ('k0', 'back')] 1 9 {'k3': 3, 'k0': 'back', 'k9': 9}
+RuntimeError dictionary changed size during iteration
+ordered ['c', 'b', 'a'] ('a', 1) ('c', 3) OrderedDict({'b': 2})
+counter [('a', 5), ('b', 2), ('r', 2)] [('a', 5), ('b', 2), ('c', 1), ('d', 1), ('r', 2)] 0 [('x', 3), (1, 2)]
+defaultdict [('x', [1]), (2, ['two'])] {'x': [1], 2: ['two']}
+update {'x': 1, 2: 'b', 'y': 3} {'x': 1, 'y': 3} {'p': 0, 'q': 0, 3: 0}

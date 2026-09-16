@@ -41,54 +41,111 @@ attempts are reported by `runtime.info().fallbackAttempts`. Explicit backend
 selection fails if unavailable. Hardware GPU paths reject recognized software
 renderers. Browser/OS policy selects one adapter; this does not pool GPUs.
 
-Supported operations are input/full tensors, scalar or shape-matched add/sub/mul,
-ReLU, positive masks, matrix transpose/multiplication, sum and toroidal Life. Only named outputs are read
-back. Inputs and outputs are finite float32. One graph runs at a time; await it
-before submitting another. Dispose the runtime after outstanding work finishes.
+Graph IR v2 (stage 1: MLP classification training and inference) covers, on
+every backend, float32 tensors of rank 0-4:
 
-Default validation limits include 512 nodes, 1,048,576 elements per tensor,
-32 MiB summed **logical** node storage, 100 million estimated operations and
-16 outputs. `maxWebGLTextureBytes` separately limits live WebGL textures to
-128 MiB, including RGBA32F padding and reduction scratch. One scalar occupies a
-16-byte RGBA texel, not four physical bytes. The result reports
+| Family | Operations |
+|---|---|
+| Sources | `input`, `full` |
+| Elementwise | `add`, `sub`, `mul`, `div` with NumPy broadcasting; `neg`, `exp`, `log`, `sqrt`, `tanh`, `sigmoid`, `relu`, `positive` (ReLU mask), `gelu` and `gelu_grad` |
+| Shape | `reshape` (shares storage), `permute`, `transpose` (matrices) |
+| Reductions | `sum`, `mean` over one `axis` (with `keepdim`) or the whole tensor |
+| Rows | `softmax`, `log_softmax` over the last axis (max-subtracted) |
+| Linear algebra | `matmul`: [M,K]@[K,N] and batched [B,M,K]@[B,K,N] (a batch of 1 or a matrix broadcasts) |
+| Losses | `cross_entropy` (mean over rows, integer class targets) and `cross_entropy_grad` = (softmax - onehot)/N |
+| Optimizers | `sgd_update`, `momentum_update`, `adam_m`, `adam_v`, `adam_update` (PyTorch's update order) |
+| Other | toroidal `life` |
+
+GELU is the exact-erf form 0.5*x*(1 + erf(x/sqrt(2))). No backend language has
+erf, so all of them evaluate one shared approximation (a Taylor series below 0.5
+and Numerical Recipes' erfc fit above it, fractional error below 1.2e-7); see
+`src/kernel-math.mjs`. MSE needs no fused op: `sub`, `mul` and `mean` express it
+and its gradient. Optimizer nodes return the next value of a tensor, so a whole
+training step (forward, loss, backward and update of every parameter and moment)
+runs on the device as one graph; the next step feeds those outputs back as inputs.
+
+Only named outputs are read back. Inputs and outputs are finite float32: NaN
+produced inside a graph (overflow, then `inf - inf`) propagates through ReLU and
+the reductions and fails readback with `NUMBER` on every backend, including the
+GPUs checked here. One graph runs at a time; await it before submitting another.
+Dispose the runtime after outstanding work finishes. Protocol versions 1 and 2
+are accepted and mean the same thing; every version-1 graph is a valid graph.
+`zipp_gpu.Graph.program()` labels a graph 2 only once it uses something version 1
+did not define (a new operation, rank above two, broadcasting beyond a scalar
+operand, an axis reduction or a batched matmul), so graphs a version-1 host
+understands still arrive labelled the way it expects.
+
+Default validation limits include 512 nodes, 4,194,304 elements per tensor,
+65,536 per dimension, 64 MiB summed **logical** node storage, 100 million
+estimated operations and 64 outputs. A backend may raise the work budget
+(SIMD WASM 400M, WebGL2 500M, WebGPU 1G) and lower size limits to what its
+device holds; host limits passed to `createRuntime({limits: ...})` always win,
+and `runtime.info().limits` reports the result. `maxWebGLTextureBytes`
+separately limits live WebGL textures to 128 MiB, including padding, reduction
+scratch and pooled textures. WebGL2 stores one scalar per R32F texel (4 bytes)
+where R32F is renderable and falls back to RGBA32F (16 bytes). The result reports
 `stats.webglTexturePeakBytes`. This is requested texture storage, not a bound on
 all driver VRAM, shader objects or CPU staging/readback memory.
 
-Limits are host policy and can be supplied through `createRuntime({limits: ...})`.
-The adapter also bounds pending requests and rejects work after tenant invalidation.
+The GPU backends record each execution as one WebGPU command buffer (one submit,
+one readback map) or one run of WebGL draws, reuse buffers and textures across
+executions, and key pipelines by kernel with shapes passed as uniforms. Driver
+errors are checked once per execution; `createRuntime({debug: true})` restores
+per-dispatch WebGL error/framebuffer checks and per-node WebGPU error scopes.
+
+Limits are host policy. The adapter also bounds pending requests, refuses work
+over quota through the program's own error callback (asynchronously, so a
+callback that resubmits cannot recurse), and rejects work after tenant invalidation.
 
 ## Source map
 
 - `src/graph.mjs`: protocol, shapes and work/size validation.
 - `src/runtime.mjs`, `src/backends/`: scheduling, shaders, fallback kernels and cleanup.
+- `src/kernel-math.mjs`: the scalar definitions (erf-based GELU, sigmoid, NaN-keeping ReLU) every backend implements.
 - `src/zipp-python-adapter.mjs`: actual Python host bridge.
 - `src/zipp-adapter.mjs`, `src/zipp-guest.js`: opt-in JavaScript guest integration.
 - `../../zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`: native Python graph authoring/export library.
-- `wasm/kernels.c`, `wasm/kernels.wasm`: freestanding C kernels and included binary.
-- `tests/`: numerical checks, allocation/lifecycle mocks and browser cases.
+- `wasm/kernels.c`, `wasm/kernels.wasm`: freestanding C kernels and the
+  COMMITTED binary. No workflow rebuilds it: `npm test`, the Node GPU suites
+  and the `javascript-python` release archive all load this exact blob, and
+  nothing compares it against `kernels.c`. Rebuild with `scripts/build_wasm.sh`
+  (Clang targeting wasm32 plus wasm-ld) and review the C change and the new
+  binary together.
+- `tests/`: numerical checks, allocation/lifecycle mocks and browser cases; `tests/ml-cases.mjs`
+  holds the per-operation fixtures and the MLP training-step generator shared with the browser.
 - `docs/INTEGRATION.md`, `docs/ARCHITECTURE.md`, `docs/VALIDATION.md`: contracts and evidence.
 
 ## Check and rebuild
 
 ```sh
 npm test
-python tests/test_python.py
+py -3.13 tests/test_python.py
 python examples/run_native.py
+python scripts/browser_smoke.py        # real WebGPU/WebGL2 in Chrome (Playwright); REQUIRE_GPU=1 to insist
 ```
 
 After building a Python-enabled Node package in `../tests/node/pkg`, run
 `node ../tests/node/python-frontend.cjs`, `node ../tests/node/python-gpu.cjs`
 and `node ../tests/node/python-training.cjs`.
 The dedicated Python CI lane builds this artifact explicitly and asserts Python
-is enabled. Real WebGL2/WebGPU execution requires browser hardware: use the demo's
-**Check all backends**, or `landing/scripts/smoke-browser.py` with `REQUIRE_GPU=1`.
-A missing GPU is not a successful GPU check.
+is enabled. Real WebGL2/WebGPU execution requires browser hardware: use
+`scripts/browser_smoke.py` (serves this directory on 127.0.0.1, runs every case on
+every backend against the JavaScript reference plus an MNIST-sized training step,
+and writes `docs/browser-validation.json`), the demo's **Check all backends**, or
+`landing/scripts/smoke-browser.py` with `REQUIRE_GPU=1`. On hybrid-GPU Windows
+machines Chrome ignores `powerPreference`; the script passes
+`--force_high_performance_gpu` (override with `GPU_FLAGS`). A missing GPU is not a
+successful GPU check.
 
-Rebuild the standalone kernel with `sh scripts/build_wasm.sh` using Clang/wasm-ld.
+Rebuild the standalone kernel with `sh scripts/build_wasm.sh` using Clang/wasm-ld
+(built with `-msimd128`; browsers without WebAssembly SIMD fall back to JavaScript).
 On Windows, use `./scripts/build_wasm.ps1` (LLVM defaults to
 `C:\Program Files\LLVM\bin`; override with `-LlvmDirectory`).
 The kernel module is separate from Zipp WASM; rebuilding it does not rebuild Python.
 
-This remains an experimental graph engine: no kernel fusion, tiled matrix multiply,
-persistent cross-request tensors or general shader compiler. Timings are not claims
-of GPU speedup. Source and kernels are Apache-2.0; see LICENSE and NOTICE.
+This remains an experimental graph engine: no kernel fusion, persistent
+cross-request tensors, float16, convolutions or general shader compiler. Matrix
+products are tiled only on WebGPU (16x16 workgroup tiles) and register-blocked
+in the SIMD WASM kernels. Measured timings are in `docs/VALIDATION.md`; at MNIST
+scale a step is dominated by host transfers, not GPU arithmetic. Source and
+kernels are Apache-2.0; see LICENSE and NOTICE.

@@ -35,6 +35,21 @@ impl<'p> Vm<'p> {
         // release-PGO execution mode.
         self.require_external_code_enabled()?;
         self.preflight_native_iteration_work(args.len() as u64)?;
+        // A piece that is a string holding a lone surrogate also contributes
+        // its EXACT WTF-8 bytes, so the assembled source parses exactly — the
+        // same side channel a direct `eval` passes (`do_eval`'s `exact_src`).
+        // `to_js_string` is lossy, but only at those code units: U+FFFD and a
+        // WTF-8 surrogate are both three bytes, so the two stay aligned.
+        // `None` (nothing allocated) for every well-formed piece.
+        let exact_of = |vm: &Self, v: Value| -> Option<Vec<u8>> {
+            if v.is_heap() {
+                vm.heap.str_exact_if_not_wellformed(v.heap_index())
+            } else {
+                None
+            }
+        };
+        let mut exact_params: Option<Vec<u8>> = None;
+        let mut exact_body: Option<Vec<u8>> = None;
         let (params, body) = if args.is_empty() {
             (String::new(), String::new())
         } else {
@@ -48,11 +63,26 @@ impl<'p> Vm<'p> {
             for (i, a) in args[..args.len() - 1].iter().enumerate() {
                 if i != 0 {
                     self.append_guest_string(&mut params, ",")?;
+                    if let Some(e) = exact_params.as_mut() {
+                        e.push(b',');
+                    }
                 }
                 let part = self.to_js_string(*a)?;
+                match (exact_of(self, *a), exact_params.as_mut()) {
+                    (Some(x), Some(e)) => e.extend_from_slice(&x),
+                    (Some(x), None) => {
+                        let mut e = params.as_bytes().to_vec();
+                        e.extend_from_slice(&x);
+                        exact_params = Some(e);
+                    }
+                    (None, Some(e)) => e.extend_from_slice(part.as_bytes()),
+                    (None, None) => {}
+                }
                 self.append_guest_string(&mut params, &part)?;
             }
-            let body = self.to_js_string(args[args.len() - 1])?;
+            let last = args[args.len() - 1];
+            let body = self.to_js_string(last)?;
+            exact_body = exact_of(self, last);
             (params, body)
         };
         let prefix = match kind {
@@ -93,13 +123,23 @@ impl<'p> Vm<'p> {
         // swallow the wrapper's own `) {` and slip past the combined parse
         // (invalid-parameter-list.js). Lexer-level messages carry no
         // "SyntaxError:" prefix — add it so the error classifies correctly.
-        crate::parse::stmt::parse_standalone_params(&params).map_err(|e| {
-            Thrown(if e.msg.starts_with("SyntaxError") {
+        // (A RangeError — the nesting budget — keeps its own kind.)
+        let as_syntax_error = |e: crate::parse::parser::SyntaxError| {
+            Thrown(if e.msg.starts_with("SyntaxError") || e.msg.starts_with("RangeError") {
                 e.msg
             } else {
                 format!("SyntaxError: {}", e.msg)
             })
-        })?;
+        };
+        crate::parse::stmt::parse_standalone_params(&params).map_err(as_syntax_error)?;
+        // …and the BODY on its own as a FunctionBody (step 18), under this
+        // constructor's [Yield]/[Await] parameters. A body that closes the
+        // wrapper early (`}); evil(); (function(){`) is a SyntaxError HERE, so
+        // nothing of it is ever compiled or run: assembling it would have made
+        // a three-statement Script that executes `evil()` during construction
+        // and returns a function of the body's choosing.
+        crate::parse::stmt::parse_standalone_body(&body, matches!(kind, 1 | 3), matches!(kind, 2 | 3))
+            .map_err(as_syntax_error)?;
         // The newline before `)` defends against a `//` comment in the last
         // parameter; the wrapper parens make the body a function EXPRESSION whose
         // value (the function) becomes the eval completion value.
@@ -112,6 +152,18 @@ impl<'p> Vm<'p> {
         source.push_str(&body);
         source.push_str(SOURCE_CLOSE);
         debug_assert_eq!(source.len(), source_len);
+        let exact_source = (exact_params.is_some() || exact_body.is_some()).then(|| {
+            let mut e = Vec::with_capacity(source_len);
+            e.extend_from_slice(SOURCE_OPEN.as_bytes());
+            e.extend_from_slice(prefix.as_bytes());
+            e.extend_from_slice(NAME_OPEN.as_bytes());
+            e.extend_from_slice(exact_params.as_deref().unwrap_or(params.as_bytes()));
+            e.extend_from_slice(PARAM_BODY_SEP.as_bytes());
+            e.extend_from_slice(exact_body.as_deref().unwrap_or(body.as_bytes()));
+            e.extend_from_slice(SOURCE_CLOSE.as_bytes());
+            debug_assert_eq!(e.len(), source.len());
+            e
+        });
         // CreateDynamicFunction builds the function from the separately-parsed
         // params/body, so the "anonymous" name is SetFunctionName only — NO
         // self-name binding (`typeof anonymous` inside is "undefined",
@@ -135,7 +187,7 @@ impl<'p> Vm<'p> {
             Vec::new(),
             None,
             None,
-            None,
+            exact_source.as_deref(),
         )
     }
 
@@ -401,9 +453,14 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         // The drained disposer list and the running `completion` are Rust locals
         // (not in a register / map), so a GC during a disposer call could sweep
-        // them — suspend GC for the loop (the established hold-Values-across-a-
-        // callback pattern).
-        let _gc = self.gc_lock_guard();
+        // them. Root them (B214's rule) rather than suspending collection for
+        // the whole loop: a disposer is guest code and may allocate freely.
+        let base = self.host_result_roots.len();
+        self.host_result_roots.extend(disposers.iter().copied());
+        let completion_slot = self.host_result_roots.len();
+        self.host_result_roots
+            .push(completion.unwrap_or(Value::UNDEFINED));
+        let mut out = Ok(());
         for d in disposers.into_iter().rev() {
             if self.call_value(d, Value::UNDEFINED, &[]).is_err() {
                 // Thrown carries only a message; recapture the REAL thrown Value.
@@ -412,12 +469,85 @@ impl<'p> Vm<'p> {
                     .take()
                     .unwrap_or_else(|| self.make_error(1, None));
                 completion = Some(match completion {
-                    Some(prior) => self.build_suppressed_error(&[ev, prior, Value::UNDEFINED])?,
+                    Some(prior) => {
+                        match self.build_suppressed_error(&[ev, prior, Value::UNDEFINED]) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                out = Err(e);
+                                break;
+                            }
+                        }
+                    }
                     None => ev,
                 });
+                self.host_result_roots[completion_slot] = completion.unwrap_or(Value::UNDEFINED);
             }
         }
-        Ok(completion)
+        self.host_result_roots.truncate(base);
+        out.map(|()| completion)
+    }
+
+    /// A fresh `using` resource scope: an internal Array held in a register,
+    /// so it rides the frame across suspensions and lives exactly as long as
+    /// the frame does. Slot 0 holds DisposeResources' needsAwait (bit 0) and
+    /// hasAwaited (bit 1) flags; then one (disposer, hint) pair per
+    /// declaration in registration order, the hint `true` for an async-dispose
+    /// entry. An `await using` of null/undefined is an async entry holding
+    /// `undefined` (awaited, nothing called).
+    pub(crate) fn using_scope_new(&mut self) -> Value {
+        Value::heap(self.heap.alloc(HeapObj::Array(vec![Value::int(0)])))
+    }
+
+    fn using_scope_list(&mut self, scope: Value) -> Option<&mut Vec<Value>> {
+        if !scope.is_heap() {
+            return None;
+        }
+        match self.heap.get_mut(scope.heap_index()) {
+            HeapObj::Array(list) if !list.is_empty() => Some(list),
+            _ => None,
+        }
+    }
+
+    /// Append a disposer (or an inert `undefined`) to a `using` scope. The
+    /// list is usually old by the time a later declaration registers.
+    pub(crate) fn using_scope_push(&mut self, scope: Value, disposer: Value, is_async: bool) {
+        if let Some(list) = self.using_scope_list(scope) {
+            list.push(disposer);
+            list.push(Value::bool(is_async));
+            self.heap.write_barrier_val(scope.heap_index(), disposer);
+        }
+    }
+
+    /// Remove and return the most recently registered (disposer, hint).
+    pub(crate) fn using_scope_pop(&mut self, scope: Value) -> Option<(Value, bool)> {
+        let list = self.using_scope_list(scope)?;
+        if list.len() < 3 {
+            return None;
+        }
+        let is_async = list.pop()?.as_bool();
+        Some((list.pop()?, is_async))
+    }
+
+    /// Every disposer in registration order, leaving the scope empty.
+    pub(crate) fn using_scope_take(&mut self, scope: Value) -> Vec<Value> {
+        match self.using_scope_list(scope) {
+            Some(list) => list.drain(1..).step_by(2).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// DisposeResources' (needsAwait, hasAwaited) flags of a scope.
+    pub(crate) fn using_scope_flags(&mut self, scope: Value) -> (bool, bool) {
+        let bits = self
+            .using_scope_list(scope)
+            .map_or(0, |list| list[0].as_int());
+        (bits & 1 != 0, bits & 2 != 0)
+    }
+
+    pub(crate) fn set_using_scope_flags(&mut self, scope: Value, needs_await: bool, has_awaited: bool) {
+        if let Some(list) = self.using_scope_list(scope) {
+            list[0] = Value::int(needs_await as i32 | (has_awaited as i32) << 1);
+        }
     }
 
     /// Allocate a promise rejected with a fresh TypeError — the async-method
@@ -731,6 +861,11 @@ impl<'p> Vm<'p> {
         if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
             *slot = Box::new(m);
         }
+        // The namespace was allocated before the module body ran, so a minor
+        // during the body may already have promoted it: the fresh tag string
+        // and any young snapshot value are old->young edges no store barrier
+        // saw. Dirty the holder so the next minor re-traces the new map.
+        self.heap.write_barrier(idx);
         // The whole map (and its vals Vec) was replaced: invalidate any JIT
         // inline cache that captured the old vals pointer.
         self.heap.bump_version(idx);
@@ -835,7 +970,9 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let disposer = if sync_fallback {
-                    let shim = self.sync_dispose_shim()?;
+                    // The first use compiles the shim by running an eval, and
+                    // `method` may be a getter's fresh function held only here.
+                    let shim = self.with_host_roots(&[method], Self::sync_dispose_shim)?;
                     Value::heap(self.heap.alloc(HeapObj::Bound {
                         target: shim,
                         this: method,

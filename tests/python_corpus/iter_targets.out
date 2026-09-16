@@ -1,0 +1,52 @@
+enumerate 0 ann
+enumerate 1 bob
+enumerate 2 cy
+enumerate-start 10 ann
+enumerate-start 11 bob
+enumerate-start 12 cy
+zip ann 31
+zip bob 25
+zip cy 40
+zip-short [('ann', 'oslo'), ('bob', 'rome')] [] [('ann',), ('bob',), ('cy',)]
+ValueError zip() argument 2 is shorter than argument 1
+ValueError zip() argument 2 is longer than argument 1
+enum-zip 0 ann 31
+enum-zip 1 bob 25
+enum-zip 2 cy 40
+zip-enum 0 ann 31
+zip-enum 1 bob 25
+zip-enum 2 cy 40
+nested-target 10
+nested-target 26
+dict-nested x 1 2 3
+dict-nested y 4 5 6
+attr-target 2
+subscript-target ['x', 'y', 'z']
+dict-subscript-target {'a': 1, 'b': 2}
+loop-var-after 2
+NameError name 'never' is not defined
+reversed cy
+reversed bob
+reversed ann
+sorted ann
+sorted bob
+sorted cy
+map-filter ['ANN', 'CY']
+map-multi [4, 10] [8, 9]
+map-lazy 0 1 [4, 9, 16] []
+enum-iter (0, 'a') [(1, 'b')] []
+zip-iter (1, 'a') [(2, 'b')]
+resume-iter [4, 5, 6, 7, 8, 9]
+pairwise-manual [(1, 2), (3, 4), (5, 6)]
+nested-enum 72
+nested-continue a 0
+nested-continue b 0
+for-else-primes [2, 3, 5, 7, 11]
+protocols [2, 1, 0] ['a', 'b', 'c', 'd'] [(0, 'a'), (1, 'b'), (2, 'c'), (3, 'd')] {'a': 3, 'b': 2, 'c': 1, 'd': 0}
+proto-mix 0 2 a
+proto-mix 1 1 b
+proto-mix 2 0 c
+iter-builtins 1225 (4, 'o') ('a', 1)
+dict-iter ['b', 'a'] [('x', 1)] [('p', 1), ('q', 2)]
+range-forms [-3, -1, 1] [10, 7, 4, 1] [] 15 8 [4, 2, 0]
+index-build {'one': [0, 4], 'two': [1, 3], 'three': [2]}

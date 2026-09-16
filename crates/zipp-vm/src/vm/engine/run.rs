@@ -245,7 +245,25 @@ impl<'p> Vm<'p> {
         // before the embedding caller has a chance to marshal it.
         let root = main.as_ref().copied().unwrap_or(Value::UNDEFINED);
         self.with_host_roots(&[root], Self::run_event_loop);
+        if main.is_ok() {
+            if let Some(t) = self.take_uncaught_timer_throw() {
+                return Err(t);
+            }
+        }
+        // The main script's throw is the program's error; a timer throw
+        // after it is dropped rather than kept rooted for the VM's life.
+        self.uncaught_timer_throw = None;
         main
+    }
+
+    /// The first exception a timer callback let escape (see
+    /// `uncaught_timer_throw`), rethrown as the program's completion: the
+    /// value goes back into `pending_throw` so a host sees the real error.
+    pub(crate) fn take_uncaught_timer_throw(&mut self) -> Option<Thrown> {
+        let v = self.uncaught_timer_throw.take()?;
+        let msg = self.throw_message(v);
+        self.pending_throw = Some(v);
+        Some(Thrown(msg))
     }
 
     /// Run a MODULE as the program entry. The top-level body (func 0) is an async
@@ -295,6 +313,12 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        if r.is_ok() {
+            if let Some(t) = self.take_uncaught_timer_throw() {
+                return Err(t);
+            }
+        }
+        self.uncaught_timer_throw = None;
         r.map(|_| Value::UNDEFINED)
     }
 
@@ -391,15 +415,22 @@ impl<'p> Vm<'p> {
             if let HeapObj::Promise {
                 state: PromiseState::Rejected,
                 result,
+                handled,
                 ..
-            } = self.heap.get(p.heap_index())
+            } = self.heap.get_mut(p.heap_index())
             {
+                // The rejection IS the program's error: consumed, not unhandled.
+                *handled = true;
                 let reason = *result;
                 // Render the rejection like an uncaught throw ("Name: message")
                 // rather than display() (which gives "[object Object]" for an Error).
                 let msg = self.throw_message(reason);
+                self.uncaught_timer_throw = None;
                 return Err(Thrown(msg));
             }
+        }
+        if let Some(t) = self.take_uncaught_timer_throw() {
+            return Err(t);
         }
         Ok(Value::UNDEFINED)
     }
@@ -1115,6 +1146,32 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Hand out the next slot of the run-time global pool (see `EVAL_POOL`),
+    /// seeded with `seed`. The pool's capacity was reserved at boot, so the
+    /// pushes below never reallocate `globals` / `global_gens` (the JIT pins
+    /// both). `what` names the consumer in the exhaustion error.
+    pub(crate) fn alloc_global_pool_slot(
+        &mut self,
+        seed: Value,
+        what: &str,
+    ) -> Result<u32, Thrown> {
+        let cap = self.program.global_count as usize + FIELD_POOL + EVAL_POOL;
+        let s = self.eval_global_next as usize;
+        if s >= cap {
+            return Err(Thrown(format!(
+                "RangeError: too many global bindings: the {EVAL_POOL}-slot pool for \
+                 {what} is exhausted"
+            )));
+        }
+        debug_assert_eq!(self.globals.len(), s);
+        debug_assert!(s < self.globals.capacity() && s < self.global_gens.capacity());
+        self.globals.push(seed);
+        self.global_gens.push(0);
+        self.eval_global_next += 1;
+        self.bump_global_gen(s as u32);
+        Ok(s as u32)
+    }
+
     /// Resolve a global NAME referenced inside an `eval` to a live global slot.
     /// Names already in the compile-time program reuse their slot; genuinely new
     /// names (sloppy `x = 1`, `var x`, hoisted fns, or builtins the program never
@@ -1132,12 +1189,6 @@ impl<'p> Vm<'p> {
         if let Some(&s) = self.realm_globals.get(&rid).and_then(|m| m.get(name)) {
             return Ok(s);
         }
-        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
-        if self.eval_global_next >= cap {
-            return Err(Thrown(
-                "EvalError: too many distinct globals introduced by eval".into(),
-            ));
-        }
         let seed = if self.realm_global_objs.contains_key(&rid) {
             let own = match self.heap.get(rid) {
                 HeapObj::Object(m) => m.get(name),
@@ -1153,10 +1204,9 @@ impl<'p> Vm<'p> {
         } else {
             Value::UNINITIALIZED
         };
-        let s = self.eval_global_next;
-        self.eval_global_next += 1;
-        self.globals[s as usize] = seed;
-        self.bump_global_gen(s);
+        let s = self.alloc_global_pool_slot(seed, "ShadowRealm global names")?;
+        self.pool_slot_names
+            .insert(s, crate::vm::PoolSlotName::Realm(name.into()));
         self.realm_globals
             .entry(rid)
             .or_default()
@@ -1187,24 +1237,16 @@ impl<'p> Vm<'p> {
         if let Some(&s) = self.eval_global_map.get(name) {
             return Ok(s);
         }
-        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
-        if self.eval_global_next >= cap {
-            return Err(Thrown(
-                "EvalError: too many distinct globals introduced by eval".into(),
-            ));
-        }
-        let s = self.eval_global_next;
-        self.eval_global_next += 1;
-        self.eval_global_map.insert(name.to_string(), s);
         // A builtin the main program never referenced still resolves in eval'd
         // code (`eval("new RangeError()")`, `eval("Object.keys(x)")`): seed the
         // fresh slot with the builtin value rather than the never-declared
         // sentinel. A genuinely-undeclared name stays UNINITIALIZED → ReferenceError.
-        self.globals[s as usize] = match self.builtin_globals.get(name) {
+        let seed = match self.builtin_globals.get(name) {
             Some(&v) => Value::heap(v),
             None => Value::UNINITIALIZED,
         };
-        self.bump_global_gen(s);
+        let s = self.alloc_global_pool_slot(seed, "global names introduced by eval")?;
+        self.eval_global_map.insert(name.to_string(), s);
         Ok(s)
     }
 
@@ -1536,6 +1578,25 @@ impl<'p> Vm<'p> {
             },
         )
         .map_err(Thrown)?;
+        // CreateDynamicFunction parses the body STRING on its own as a
+        // FunctionBody. The assembled `(function anonymous(..) {\n<body>\n})`
+        // is only that when the body did not close the wrapper early: a body
+        // like `}); evil(); (function(){` otherwise makes a three-statement
+        // Script that runs `evil()` during construction and returns a function
+        // of the caller's choosing. Any early close leaves more than the one
+        // bare function expression (extra statements, or a call / sequence /
+        // binary expression around it), so requiring exactly that shape before
+        // anything compiles or runs is equivalent to the standalone body parse.
+        if fn_ctor
+            && !matches!(
+                ast.body.as_slice(),
+                [crate::parse::ast::Stmt::Expr(crate::parse::ast::Expr::Function(_))]
+            )
+        {
+            return Err(Thrown(
+                "SyntaxError: function body is not a standalone FunctionBody".into(),
+            ));
+        }
         // A direct eval in a PARAMETER DEFAULT: its sloppy var/function names
         // may not collide with the param-scope bindings (params + implicit
         // `arguments`) — SyntaxError BEFORE anything runs or is declared.
@@ -1668,11 +1729,13 @@ impl<'p> Vm<'p> {
         // AsyncIteratorClose on exactly the abrupt completions the spec closes on
         // (k-limit, sync-value await, mapfn, define) — never on next() itself.
         //
-        // The iterator keys are the ENGINE-INTERNAL well-known-symbol strings
-        // ("@@asyncIterator"/"@@iterator" — see `well_known_symbol_key`), NOT
-        // `Symbol.asyncIterator`. The spec says %Symbol.asyncIterator%, an
-        // intrinsic; reading it off the global `Symbol` binding lets user code
-        // redirect it:
+        // The iterator keys arrive as SYMBOL VALUES built here from the
+        // engine-internal well-known keys ("@@asyncIterator"/"@@iterator" —
+        // see `well_known_symbol_key`), never as those strings written in the
+        // polyfill source (a guest string spelled "@@…" is escaped so it
+        // cannot alias a symbol) and never as `Symbol.asyncIterator`. The spec
+        // says %Symbol.asyncIterator%, an intrinsic; reading it off the global
+        // `Symbol` binding lets user code redirect it:
         //
         //     globalThis.Symbol = { asyncIterator: Symbol("asyncIterator"), … };
         //     Array.fromAsync(objWithThatFakeKey)   // must NOT call the fake
@@ -1683,11 +1746,18 @@ impl<'p> Vm<'p> {
         // property shadowing it on the global object; fixing `LoadGlobal` to route
         // through a real own descriptor made the shadow visible and the bug live.
         //
-        // Any other intrinsic a JS-implemented polyfill reads off a global name
-        // (`TypeError`, `Object`, `Array`) is shadowable the same way. Not fixed
-        // here — only the symbols are test262-visible today — but the pattern is
-        // the hazard, not these two lines.
-        const SRC: &str = r#"(async function fromAsync(items, mapfn, thisArg) {
+        // Every other intrinsic it needs arrives as a factory parameter
+        // (`compile_polyfill`) for the same reason: `method.call(items)`,
+        // `mapfn.call(..)`, `Object.defineProperty`, `Math.*` and the global
+        // `Object` / `Array` / `TypeError` names were all reachable by user
+        // code, so patching `Function.prototype.call` or instrumenting
+        // `Object.defineProperty` changed or broke the builtin. The iterator's
+        // `next` is read ONCE, as GetIteratorFromMethod does, and each result
+        // property is defined through a null-prototype descriptor so an
+        // inherited `get` / `set` cannot turn it into an accessor descriptor.
+        const SRC: &str = r#"(function (apply, defineProperty, Object, Array, TypeError, asyncIteratorSym, iteratorSym) {
+ 'use strict';
+ return async function fromAsync(items, mapfn, thisArg) {
   'use strict';
   var C = this;
   if (items === undefined || items === null)
@@ -1695,19 +1765,20 @@ impl<'p> Vm<'p> {
   var mapping = mapfn !== undefined;
   if (mapping && typeof mapfn !== 'function')
     throw new TypeError('Array.fromAsync mapper is not a function');
-  var method = items['@@asyncIterator'];
+  var method = items[asyncIteratorSym];
   if (method === undefined || method === null) method = undefined;
   else if (typeof method !== 'function') throw new TypeError('@@asyncIterator is not a function');
   var isSync = false;
   if (method === undefined) {
-    var syncMethod = items['@@iterator'];
+    var syncMethod = items[iteratorSym];
     if (syncMethod === undefined || syncMethod === null) syncMethod = undefined;
     else if (typeof syncMethod !== 'function') throw new TypeError('@@iterator is not a function');
     if (syncMethod !== undefined) { method = syncMethod; isSync = true; }
   }
   if (method !== undefined) {
-    var it = method.call(items);
+    var it = apply(method, items, []);
     if (Object(it) !== it) throw new TypeError('iterator is not an object');
+    var next = it.next;
     var A = (typeof C === 'function') ? new C() : [];
     var k = 0;
     var closing = false;
@@ -1718,21 +1789,21 @@ impl<'p> Vm<'p> {
           closing = true;
           throw new TypeError('Array.fromAsync result exceeds the maximum length');
         }
-        var res = await it.next();
+        var res = await apply(next, it, []);
         if (Object(res) !== res) throw new TypeError('iterator result is not an object');
         if (res.done) break;
         var v = res.value;
         closing = true;
         if (isSync) v = await v;
-        var mapped = mapping ? await mapfn.call(thisArg, v, k) : v;
-        Object.defineProperty(A, k, { value: mapped, writable: true, enumerable: true, configurable: true });
+        var mapped = mapping ? await apply(mapfn, thisArg, [v, k]) : v;
+        defineProperty(A, k, { __proto__: null, value: mapped, writable: true, enumerable: true, configurable: true });
         k = k + 1;
       }
     } catch (e) {
       if (closing) {
         try {
           var ret = it.return;
-          if (ret !== undefined && ret !== null) await ret.call(it);
+          if (ret !== undefined && ret !== null) await apply(ret, it, []);
         } catch (_ignored) {}
       }
       throw e;
@@ -1742,36 +1813,21 @@ impl<'p> Vm<'p> {
   } else {
     var arrayLike = Object(items);
     var ln = +arrayLike.length;
-    var len = ln !== ln ? 0 : Math.max(0, Math.min(Math.trunc(ln), 9007199254740991));
+    var len = ln !== ln || ln <= 0 ? 0 : ln >= 9007199254740991 ? 9007199254740991 : ln - ln % 1;
     var A = (typeof C === 'function') ? new C(len) : new Array(len);
     var k = 0;
     while (k < len) {
       var kValue = await arrayLike[k];
-      var mapped = mapping ? await mapfn.call(thisArg, kValue, k) : kValue;
-      Object.defineProperty(A, k, { value: mapped, writable: true, enumerable: true, configurable: true });
+      var mapped = mapping ? await apply(mapfn, thisArg, [kValue, k]) : kValue;
+      defineProperty(A, k, { __proto__: null, value: mapped, writable: true, enumerable: true, configurable: true });
       k = k + 1;
     }
     A.length = len;
     return A;
   }
+ };
 })"#;
-        let f = self.do_eval(
-            SRC,
-            false,
-            false,
-            None,
-            None,
-            false,
-            false,
-            Value::UNDEFINED,
-            None,
-            false,
-            None,
-            Vec::new(),
-            None,
-            None,
-            None,
-        )?;
+        let f = self.compile_polyfill(SRC)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -1786,32 +1842,19 @@ impl<'p> Vm<'p> {
         if let Some(f) = self.async_dispose_fn {
             return Ok(f);
         }
-        const SRC: &str = r#"(async function() {
+        // Intrinsics arrive as factory parameters: see `compile_polyfill`.
+        const SRC: &str = r#"(function (apply, defineProperty, Object, Array, TypeError) {
+ return async function() {
   var O = this;
   var ret = O.return;
   if (ret === undefined || ret === null) return undefined;
   if (typeof ret !== 'function')
     throw new TypeError('the iterator [Symbol.iterator] return method is not callable');
-  await ret.call(O);
+  await apply(ret, O, []);
   return undefined;
+ };
 })"#;
-        let f = self.do_eval(
-            SRC,
-            false,
-            false,
-            None,
-            None,
-            false,
-            false,
-            Value::UNDEFINED,
-            None,
-            false,
-            None,
-            Vec::new(),
-            None,
-            None,
-            None,
-        )?;
+        let f = self.compile_polyfill(SRC)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1833,9 +1876,28 @@ impl<'p> Vm<'p> {
         if let Some(f) = self.sync_dispose_shim_fn {
             return Ok(f);
         }
-        const SRC: &str = r#"(function(O) { "use strict"; this.call(O); })"#;
-        let f = self.do_eval(
-            SRC,
+        // `apply` is the pristine Reflect.apply (see `compile_polyfill`), not
+        // `this.call`: a patched Function.prototype.call must not observe it.
+        const SRC: &str = r#"(function (apply) {
+ return function(O) { "use strict"; apply(this, O, []); };
+})"#;
+        let f = self.compile_polyfill(SRC)?;
+        self.sync_dispose_shim_fn = Some(f);
+        Ok(f)
+    }
+
+    /// Compile one of the JS-implemented builtins above. `src` is a FACTORY
+    /// `(function (apply, defineProperty, Object, Array, TypeError) { … })`
+    /// returning the implementation, called here with the intrinsics
+    /// themselves: `Reflect.apply` and `Object.defineProperty` as FRESH native
+    /// function objects (nothing user code can have reached, let alone
+    /// patched) and the original `Object` / `Array` / `TypeError`
+    /// constructors setup recorded. The spec steps they stand in for — Call,
+    /// CreateDataPropertyOrThrow, ToObject, ArrayCreate, %TypeError% — are
+    /// ones user code can neither observe nor redirect.
+    fn compile_polyfill(&mut self, src: &str) -> Result<Value, Thrown> {
+        let factory = self.do_eval(
+            src,
             false,
             false,
             None,
@@ -1851,7 +1913,43 @@ impl<'p> Vm<'p> {
             None,
             None,
         )?;
-        self.sync_dispose_shim_fn = Some(f);
-        Ok(f)
+        // `factory` and the fresh natives live in Rust locals until the call
+        // captures them.
+        let _gc = self.gc_lock_guard();
+        let apply = Value::heap(
+            self.heap
+                .alloc(HeapObj::Native(crate::vm::native::REFLECT_APPLY)),
+        );
+        let define = Value::heap(
+            self.heap
+                .alloc(HeapObj::Native(crate::vm::native::OBJ_DEFINE_PROPERTY)),
+        );
+        let ctor = |vm: &Self, name: &str| {
+            vm.builtin_globals
+                .get(name)
+                .map_or(Value::UNDEFINED, |&i| Value::heap(i))
+        };
+        // The well-known iterator symbols as VALUES: a property read with one
+        // uses its `prop_key`, so the polyfill reaches the real symbol-keyed
+        // member whatever the guest did to `globalThis.Symbol` — and without
+        // writing an internal "@@…" key in guest source, which is escaped.
+        let sym = |vm: &mut Self, key: &str| {
+            Value::heap(vm.heap.alloc(HeapObj::Symbol {
+                desc: Value::UNDEFINED,
+                prop_key: key.to_string(),
+            }))
+        };
+        let async_iterator = sym(self, "@@asyncIterator");
+        let iterator = sym(self, "@@iterator");
+        let args = [
+            apply,
+            define,
+            ctor(self, "Object"),
+            ctor(self, "Array"),
+            ctor(self, "TypeError"),
+            async_iterator,
+            iterator,
+        ];
+        self.call_value(factory, Value::UNDEFINED, &args)
     }
 }

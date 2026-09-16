@@ -504,9 +504,19 @@ impl<'p> Vm<'p> {
         let d = mk(picked);
         let mut out = [d[0], d[1], d[2], d[3]];
         if si == 1 && largest == "year" {
-            let miy = cal_months_in_year(cal, d1.0);
-            out[0] += out[1] / miy;
-            out[1] %= miy;
+            // The months fold into a year only when the nudged endpoint reaches
+            // `start + (years + sign)` — measured in the calendar, since a year
+            // there is 12 or 13 months. Dividing by the months in the ISO start
+            // year's number reported 12 months of a 13-month Hebrew year as P1Y.
+            let nudged = self.date_add(cal, d1.0, d1.1, d1.2, &d, 1);
+            let mut end_dur = [0i64; 10];
+            end_dur[0] = out[0] + sign;
+            let end = self.date_add(cal, d1.0, d1.1, d1.2, &end_dur, 1);
+            let beyond = iso_to_epoch_days(nudged.0, nudged.1, nudged.2)
+                - iso_to_epoch_days(end.0, end.1, end.2);
+            if beyond.signum() != -sign {
+                out = [out[0] + sign, 0, 0, 0];
+            }
         }
         Ok(out)
     }

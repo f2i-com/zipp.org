@@ -60,6 +60,31 @@
 //! processes under each switch, and [`boolhome_mechanism_*`] reads the tier back
 //! out of a child's `ZIPP_JITLOG`, so an admission change that quietly drops
 //! these kernels to the MEM tier fails the suite instead of making it vacuous.
+//!
+//! ── 07b400dc (2026-09-02), "Give booleans and global receivers their own
+//! register classes" ── THE THREE SPLIT-SPILL PINS MOVED REGIME. That commit
+//! gave a boolean-valued expression a BOOL-class register and a plain global
+//! receiver a RECV-class register, both provisional and NEVER reclaimed. A
+//! pinned global receiver therefore has exactly one definition, so
+//! `plan_region` excludes it as an ordinary pin instead of planning a B94 live-
+//! range split — and the W10.3 one-slot bridge these three tests pin is gated,
+//! in `region_int_gpr.rs`, on `!plan.split_recvs.is_empty()` (`split_prefix_spill`),
+//! with `allow_spill` threaded only from `region_int`'s DV and split-fallback
+//! retries. No split, no bridge. It cannot be recovered by rewriting the JS:
+//! the recycling was the allocator's, not the program's.
+//!
+//! The bridge is not dead — it still serves shapes whose receiver register is
+//! genuinely recycled under the default (the DataView route; see
+//! `split_recv_writethrough`) — and the whole recycled-receiver regime is what
+//! the shipped latch `ZIPP_NO_REG_CLASSES=1` restores. So the three
+//! `*_split_spill*` / `*_spill*` pins below run under that latch, where every
+//! count they assert is exact, and they are now swept against node through the
+//! `ZIPP_NO_REG_CLASSES=1` mode row. What the DEFAULT does instead is pinned by
+//! [`boolhome_default_alloc_needs_no_split_spill_bridge`], with counts of its
+//! own — and it is strictly better on both fixtures: denseint-4 needs no spill
+//! slot at all and reaches INT-GPR even under `ZIPP_NO_GPR_SPILL_SLOTS=1`
+//! (where it used to fall to DOUBLE), and the two-spill fixture lands on the
+//! XMM INT tier rather than DOUBLE.
 
 // The whole suite drives the x86-64 JIT tiers through a spawned CLI; in a
 // no-JIT config (safe-sandbox) the kernels cannot reach the emitters under
@@ -454,12 +479,19 @@ console.log(kernel(120));
 #[test]
 fn boolhome_all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
-    let modes: [&[(&str, &str)]; 5] = [
+    let modes: [&[(&str, &str)]; 7] = [
         &[("ZIPP_NO_FUSED_CMPJUMP", "1")],
         &[("ZIPP_NO_GPR_HOMES", "1")],
         &[("ZIPP_NO_GPR_SPILL_SLOTS", "1")],
         &[("ZIPP_JIT_THRESHOLD", "1")],
         &[("ZIPP_NOJIT", "1")],
+        // 07b400dc's latch: the v0.0.5 reclaim, i.e. the regime in which these
+        // kernels still recycle a receiver register and the three spill-bridge
+        // pins below have a B94 split to measure. It also puts the bools back
+        // on ordinary scratch, which is the allocation the W16 defects lived
+        // in — so this row is the original clobber matrix, node-checked.
+        &[("ZIPP_NO_REG_CLASSES", "1")],
+        &[("ZIPP_NO_REG_CLASSES", "1"), ("ZIPP_NO_FUSED_CMPJUMP", "1")],
     ];
     for mode in modes {
         let mut cmd = Command::new(&exe);
@@ -571,16 +603,25 @@ fn boolhome_mechanism_int_matrix_reaches_the_int_tier() {
     }
 }
 
+/// The v0.0.5 register allocation, restored by the latch 07b400dc (2026-09-02)
+/// shipped — the only regime in which these kernels still recycle a receiver
+/// register, and therefore the only one in which the W10.3 bridge is on the
+/// path at all (`split_prefix_spill` is gated on a B94 split existing). See the
+/// module header; the default's own census is
+/// [`boolhome_default_alloc_needs_no_split_spill_bridge`].
+const LEGACY_ALLOC: &[(&str, &str)] = &[("ZIPP_NO_REG_CLASSES", "1")];
+
 /// The four-bool dense-Array row is just one home wider than the physical GPR
-/// pool after its shared-home B94 retry. Default settings must use the bounded
-/// one-slot bridge and install INT-GPR rather than silently falling to DOUBLE.
+/// pool after its shared-home B94 retry. Under [`LEGACY_ALLOC`], default spill
+/// settings must use the bounded one-slot bridge and install INT-GPR rather
+/// than silently falling to DOUBLE.
 #[test]
 fn boolhome_denseint_four_engages_one_bounded_split_spill() {
     let op = INT_OPS
         .iter()
         .find(|op| op.tag == "denseint")
         .expect("denseint row");
-    let log = jitlog_of(&int_case(op, 4));
+    let log = jitlog_of_mode(&int_case(op, 4), LEGACY_ALLOC);
     let engaged = log
         .lines()
         .filter(|line| line.contains("GPR homes engaged"))
@@ -609,15 +650,22 @@ fn boolhome_denseint_four_engages_one_bounded_split_spill() {
 }
 
 /// The shared spill kill switch must restore the pre-bridge fallback exactly:
-/// the same correct (mode-swept above) denseint-4 kernel declines the one-slot
-/// retry and installs DOUBLE, with no GPR home plan emitted.
+/// under [`LEGACY_ALLOC`] the same correct (mode-swept above) denseint-4 kernel
+/// declines the one-slot retry and installs DOUBLE, with no GPR home plan
+/// emitted.
 #[test]
 fn boolhome_denseint_four_no_spill_switch_refuses_split_spill() {
     let op = INT_OPS
         .iter()
         .find(|op| op.tag == "denseint")
         .expect("denseint row");
-    let log = jitlog_of_mode(&int_case(op, 4), &[("ZIPP_NO_GPR_SPILL_SLOTS", "1")]);
+    let log = jitlog_of_mode(
+        &int_case(op, 4),
+        &[
+            ("ZIPP_NO_GPR_SPILL_SLOTS", "1"),
+            ("ZIPP_NO_REG_CLASSES", "1"),
+        ],
+    );
     assert!(
         log.lines()
             .any(|line| line.contains("INT-GPR decline [") && line.contains("7 homes > 4 gprs")),
@@ -635,10 +683,11 @@ fn boolhome_denseint_four_no_spill_switch_refuses_split_spill() {
 
 /// A two-spill B94 retry must remain outside the default one-slot bridge. The
 /// explicit general-spill mode then proves non-vacuously that this exact source
-/// needs (and can consume) two slots.
+/// needs (and can consume) two slots. Both children run under
+/// [`LEGACY_ALLOC`], the regime that still produces the B94 retry.
 #[test]
 fn boolhome_split_spill_bridge_stays_capped_at_one() {
-    let capped = jitlog_of(TWO_SPILL_SPLIT);
+    let capped = jitlog_of_mode(TWO_SPILL_SPLIT, LEGACY_ALLOC);
     assert!(
         capped
             .lines()
@@ -650,7 +699,10 @@ fn boolhome_split_spill_bridge_stays_capped_at_one() {
         "the default one-slot bridge admitted the two-spill fixture:\n{capped}"
     );
 
-    let general = jitlog_of_mode(TWO_SPILL_SPLIT, &[("ZIPP_GPR_SPILL_SLOTS", "1")]);
+    let general = jitlog_of_mode(
+        TWO_SPILL_SPLIT,
+        &[("ZIPP_GPR_SPILL_SLOTS", "1"), ("ZIPP_NO_REG_CLASSES", "1")],
+    );
     let engaged = general
         .lines()
         .filter(|line| line.contains("GPR homes engaged"))
@@ -671,5 +723,98 @@ fn boolhome_split_spill_bridge_stays_capped_at_one() {
             && general.contains("INT region fn1 [")
             && !general.contains("DOUBLE region fn1 ["),
         "general spill mode did not install the two-spill B94 plan:\n{general}"
+    );
+}
+
+/// What the DEFAULT lowering does with the same two kernels since 07b400dc
+/// (2026-09-02) — the other half of the three pins above, and the reason they
+/// may legitimately run under [`LEGACY_ALLOC`].
+///
+/// Neither kernel plans a B94 split any more (its receiver takes a
+/// never-reclaimed RECV register), so neither reaches the W10.3 bridge, and
+/// both are BETTER off for it. The counts are exact so a regression in either
+/// direction is caught:
+///
+///   * denseint-4 still declines its first eight-home attempt, still takes the
+///     shared-home re-plan, and then fits in SIX homes with three lazy
+///     sign-extensions and ZERO spill slots — the `GPR homes engaged` line
+///     ending in `lazy-sx)` rather than `spilled)` is the whole claim. It
+///     therefore installs INT-GPR even under `ZIPP_NO_GPR_SPILL_SLOTS=1`, the
+///     mode that used to send it to DOUBLE: the spill bridge has stopped being
+///     a correctness-adjacent dependency for this shape.
+///   * the two-spill fixture still overflows (eight homes, then seven after the
+///     share) and still refuses a GPR home plan, but now lands on the XMM INT
+///     tier instead of DOUBLE.
+#[test]
+fn boolhome_default_alloc_needs_no_split_spill_bridge() {
+    let op = INT_OPS
+        .iter()
+        .find(|op| op.tag == "denseint")
+        .expect("denseint row");
+    let src = int_case(op, 4);
+    // The bridge is irrelevant to this shape now, so its kill switch must make
+    // no difference at all — that is the strongest form of "not a dependency".
+    let modes: [&[(&str, &str)]; 2] = [&[], &[("ZIPP_NO_GPR_SPILL_SLOTS", "1")]];
+    for mode in modes {
+        let log = jitlog_of_mode(&src, mode);
+        let engaged = log
+            .lines()
+            .filter(|line| line.contains("GPR homes engaged"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            engaged.len(),
+            1,
+            "denseint-4 must engage exactly one INT-GPR region under {mode:?}:\n{log}"
+        );
+        assert!(
+            engaged[0].ends_with("(6 homes, 3 lazy-sx)"),
+            "denseint-4's default home census moved (and a `spilled)` suffix \
+             here would mean the RECV register class has stopped keeping the \
+             receiver out of the home pool): {}\n{log}",
+            engaged[0]
+        );
+        assert!(
+            log.lines()
+                .any(|line| line.contains("INT-GPR decline [")
+                    && line.contains("8 homes > 4 gprs")),
+            "denseint-4 no longer overflows its first attempt, so the \
+             shared-home re-plan below is not what is being measured:\n{log}"
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("B94 split receiver"))
+                .count(),
+            0,
+            "denseint-4 planned a B94 split under the default allocation — its \
+             receiver register is being recycled again:\n{log}"
+        );
+        assert!(
+            log.contains("INT region fn1 [") && !log.contains("DOUBLE region fn1 ["),
+            "denseint-4 did not install the INT-GPR plan under {mode:?}:\n{log}"
+        );
+    }
+
+    let two = jitlog_of(TWO_SPILL_SPLIT);
+    for homes in ["8 homes > 4 gprs", "7 homes > 4 gprs"] {
+        assert!(
+            two.lines()
+                .any(|line| line.contains("INT-GPR decline [") && line.contains(homes)),
+            "the cap fixture no longer overflows with `{homes}` under the \
+             default allocation:\n{two}"
+        );
+    }
+    assert_eq!(
+        two.lines()
+            .filter(|line| line.contains("B94 split receiver"))
+            .count(),
+        0,
+        "the cap fixture planned a B94 split under the default allocation:\n{two}"
+    );
+    assert!(
+        !two.contains("GPR homes engaged")
+            && two.contains("INT region fn1 [")
+            && !two.contains("DOUBLE region fn1 ["),
+        "the cap fixture should refuse GPR homes and host on the XMM INT tier \
+         (it reached only DOUBLE before 07b400dc):\n{two}"
     );
 }

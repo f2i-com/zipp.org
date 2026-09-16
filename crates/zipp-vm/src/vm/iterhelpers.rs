@@ -620,6 +620,9 @@ impl<'p> Vm<'p> {
     /// real thrown VALUE rides on `self.pending_throw`, which each close overwrites —
     /// so snapshot the first close's value and restore it after every later throw.
     fn iz_close_except(&mut self, iters: &[Value], except: usize) -> Option<Thrown> {
+        // The first close's thrown value is a Rust local while later `return()`
+        // calls run guest code (and overwrite `pending_throw`): keep it rooted.
+        let base = self.host_result_roots.len();
         let mut err = None;
         let mut first_pt: Option<Value> = None;
         for j in (0..iters.len()).rev() {
@@ -629,48 +632,59 @@ impl<'p> Vm<'p> {
                     if err.is_none() {
                         err = Some(e);
                         first_pt = self.pending_throw;
+                        self.host_result_roots.extend(first_pt);
                     } else {
                         self.pending_throw = first_pt;
                     }
                 }
             }
         }
+        self.host_result_roots.truncate(base);
         err
+    }
+
+    /// Run `close` with the current `self.pending_throw` saved — and rooted,
+    /// since the closes run guest `return()` calls that overwrite it — then
+    /// restore it (the kept completion value).
+    fn iz_keep_pending_throw(&mut self, close: impl FnOnce(&mut Self)) {
+        let saved = self.pending_throw;
+        self.with_host_roots(&[saved.unwrap_or(Value::UNDEFINED)], close);
+        self.pending_throw = saved;
     }
 
     /// Close the other iterators after an ABRUPT completion at index `except`,
     /// keeping `self.pending_throw` (the original abrupt value) intact — every close
     /// throw is discarded so the original completion wins (value AND string).
     fn iz_close_others_abrupt(&mut self, iters: &[Value], except: usize) {
-        let saved = self.pending_throw;
-        let _ = self.iz_close_except(iters, except);
-        self.pending_throw = saved;
+        self.iz_keep_pending_throw(|vm| {
+            let _ = vm.iz_close_except(iters, except);
+        });
     }
 
     /// Close `iters[lo..hi]` in REVERSE, discarding their close throws but keeping
     /// the current `self.pending_throw` (an already-set completion value) intact.
     fn iz_close_range_keep(&mut self, iters: &[Value], lo: usize, hi: usize) {
-        let saved = self.pending_throw;
-        let hi = hi.min(iters.len());
-        for j in (lo..hi).rev() {
-            if iters[j] != Value::NULL {
-                let it = self.iz_rec_iter(iters[j]);
-                let _ = self.iterator_close(it);
+        self.iz_keep_pending_throw(|vm| {
+            let hi = hi.min(iters.len());
+            for j in (lo..hi).rev() {
+                if iters[j] != Value::NULL {
+                    let it = vm.iz_rec_iter(iters[j]);
+                    let _ = vm.iterator_close(it);
+                }
             }
-        }
-        self.pending_throw = saved;
+        });
     }
 
     /// Close every open iterator EXCEPT `except`, in reverse, keeping pending_throw.
     fn iz_close_all_except_keep(&mut self, iters: &[Value], except: usize) {
-        let saved = self.pending_throw;
-        for j in (0..iters.len()).rev() {
-            if j != except && iters[j] != Value::NULL {
-                let it = self.iz_rec_iter(iters[j]);
-                let _ = self.iterator_close(it);
+        self.iz_keep_pending_throw(|vm| {
+            for j in (0..iters.len()).rev() {
+                if j != except && iters[j] != Value::NULL {
+                    let it = vm.iz_rec_iter(iters[j]);
+                    let _ = vm.iterator_close(it);
+                }
             }
-        }
-        self.pending_throw = saved;
+        });
     }
 
     /// Build the strict-mode "iterators have different lengths" TypeError, recording
@@ -723,7 +737,18 @@ impl<'p> Vm<'p> {
     /// lockstep and assemble one tuple (an Array for zip, a keyed object for
     /// zipKeyed) per the mode.
     fn iter_zip_next_inner(&mut self, idx: u32) -> Result<Value, Thrown> {
-        let _gc = self.gc_lock_guard();
+        // The iterators, padding and keys stay reachable through the helper;
+        // the step values collected so far and a pending strict-mode TypeError
+        // are Rust locals across the other iterators' guest `next()`/`return()`
+        // calls. Root those (B214's rule) instead of suspending collection for
+        // the whole step; the segment is released on every exit.
+        let base = self.host_result_roots.len();
+        let r = self.iter_zip_step(idx);
+        self.host_result_roots.truncate(base);
+        r
+    }
+
+    fn iter_zip_step(&mut self, idx: u32) -> Result<Value, Thrown> {
         let (source, arg, inner, mode, done) = match self.heap.get(idx) {
             HeapObj::IterHelper {
                 source,
@@ -773,7 +798,10 @@ impl<'p> Vm<'p> {
                             }
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
-                        Ok(Some(v)) => results[i] = v,
+                        Ok(Some(v)) => {
+                            self.host_result_roots.push(v);
+                            results[i] = v;
+                        }
                         Err(e) => {
                             // Abrupt: close the others (their errors are swallowed —
                             // the original abrupt completion wins).
@@ -802,6 +830,7 @@ impl<'p> Vm<'p> {
                             results[i] = pad(i);
                         }
                         Ok(Some(v)) => {
+                            self.host_result_roots.push(v);
                             results[i] = v;
                             all_done = false;
                         }
@@ -853,7 +882,10 @@ impl<'p> Vm<'p> {
                             self.iz_close_all_except_keep(&iters, i);
                             return Err(thr);
                         }
-                        Ok(Some(v)) => results[i] = v,
+                        Ok(Some(v)) => {
+                            self.host_result_roots.push(v);
+                            results[i] = v;
+                        }
                         Err(e) => {
                             // Abrupt step: close the others, the original wins.
                             self.ih_set_done(idx);

@@ -120,6 +120,87 @@ pub const MAX_SAFE_SYNTAX_RECURSION: usize = 192;
 #[cfg(feature = "safe-sandbox")]
 pub const MAX_SAFE_SYNTAX_CHAIN: usize = 128;
 
+/// The default (native) profile's parser-stack budget, in the same units as
+/// [`MAX_SAFE_SYNTAX_RECURSION`]. The native CLI is not a hostile-code
+/// boundary, but `eval`/`Function` of generated or user-supplied text is
+/// ordinary trusted code, and without a bound recursive descent mapped its
+/// nesting one-for-one onto the Rust stack: `eval('('.repeat(40000) + '1' +
+/// ')'.repeat(40000))` aborted the whole process with an uncatchable stack
+/// overflow where node throws a RangeError.
+///
+/// Sized for the CLI's 256 MiB interpreter thread (and the test harnesses'
+/// 256 MiB threads), and to accept every nesting depth real code reaches
+/// (29,310 files of npm and application JavaScript compile unchanged; the
+/// deepest shape in them is far below this). MEASURED 2026-09-15 with a
+/// `Function(source)` bisection per shape, deepest accepted here / by node
+/// v24.19: parentheses 2,726 / 1,773; array literals 2,727 / 2,388; object
+/// literals 1,363 / 757; arrows 2,726 / 926; template substitutions 2,726 /
+/// 2,069; blocks 4,092 / 2,834; `else if` arms 7,812 / 4,153; `a=a=…` 8,179 /
+/// 3,267; nested functions 8,184 / 1,070. Node takes a few cheap-per-level
+/// shapes deeper than this bound: unary `!!…` 8,179 / 10,346, conditional
+/// alternates `a?0:a?0:…` 8,174 / ≥200,000, and (through
+/// [`MAX_NATIVE_SYNTAX_CHAIN`]) `||`/`&&`/`??` and string `+` spines at
+/// 32,768 links / ≥300,000. Nothing real writes eight thousand `!` or two
+/// hundred thousand ternaries in a row, and a deeper bound costs stack the
+/// expensive shapes need. The most expensive shape per unit is a nested
+/// function: the
+/// release build survived ~21,000 of them on 256 MiB before this guard,
+/// ~12.5 KB each through parser and compiler, so the budget spends at most
+/// ~100 MiB and leaves the rest for the native frames an `eval` may already
+/// sit under.
+#[cfg(not(feature = "safe-sandbox"))]
+pub const MAX_NATIVE_SYNTAX_RECURSION: usize = 8192;
+
+/// The default profile's per-tier chain limit, in the units of
+/// [`MAX_SAFE_SYNTAX_CHAIN`]. Equal to `limits::MAX_NATIVE_AST_NESTING` for
+/// the same reason the safe pair is equal. Chains are parsed iteratively, so
+/// this bounds the recursive walks after the parser rather than the parser
+/// itself: a million-term `a.x.x…` or `1+1+…` overflowed capture analysis,
+/// the compiler or the tree's drop, and a 100,000-term numeric spine already
+/// failed to compile ("function needs more than 32768 registers").
+#[cfg(not(feature = "safe-sandbox"))]
+pub const MAX_NATIVE_SYNTAX_CHAIN: usize = 32_768;
+
+#[cfg(feature = "safe-sandbox")]
+const SYNTAX_RECURSION_LIMIT: usize = MAX_SAFE_SYNTAX_RECURSION;
+#[cfg(not(feature = "safe-sandbox"))]
+const SYNTAX_RECURSION_LIMIT: usize = MAX_NATIVE_SYNTAX_RECURSION;
+#[cfg(feature = "safe-sandbox")]
+const SYNTAX_CHAIN_LIMIT: usize = MAX_SAFE_SYNTAX_CHAIN;
+#[cfg(not(feature = "safe-sandbox"))]
+const SYNTAX_CHAIN_LIMIT: usize = MAX_NATIVE_SYNTAX_CHAIN;
+
+/// What a guest sees when source nesting runs out of budget. The hardened
+/// profile keeps its long-standing SyntaxError; the default profile reports
+/// the resource limit the way node does, as a (catchable, from `eval` and
+/// `Function`) RangeError.
+#[cfg(feature = "safe-sandbox")]
+const SYNTAX_NESTING_ERROR: &str = "SyntaxError: source nesting exceeds the sandbox limit";
+#[cfg(not(feature = "safe-sandbox"))]
+const SYNTAX_NESTING_ERROR: &str =
+    "RangeError: Maximum call stack size exceeded (source nesting is too deep)";
+#[cfg(feature = "safe-sandbox")]
+const SYNTAX_CHAIN_ERROR: &str =
+    "SyntaxError: source expression nesting exceeds the sandbox limit";
+#[cfg(not(feature = "safe-sandbox"))]
+const SYNTAX_CHAIN_ERROR: &str =
+    "RangeError: Maximum call stack size exceeded (source expression chain is too long)";
+#[cfg(not(feature = "safe-sandbox"))]
+const SYNTAX_TREE_ERROR: &str =
+    "RangeError: Maximum call stack size exceeded (syntax tree is too deep)";
+
+/// The default profile's ceiling on the running tree-height bound (see the
+/// `tree_depth` field), checked at every chain link. Twice the most the bound
+/// can exceed `limits::MAX_NATIVE_AST_NESTING` by for a tree that is within
+/// it — `TREE_LEVELS_PER_ACTIVATION` for each of at most
+/// `MAX_NATIVE_SYNTAX_RECURSION` nested activations — so no program the
+/// validator accepts is refused here. Cheap to drop: a release build dropped
+/// a 3,000,000-level spine on its 256 MiB thread and overflowed at 6,000,000.
+#[cfg(not(feature = "safe-sandbox"))]
+pub const MAX_NATIVE_TREE_DEPTH_BOUND: usize = 2
+    * (MAX_NATIVE_SYNTAX_RECURSION * TREE_LEVELS_PER_ACTIVATION
+        + super::limits::MAX_NATIVE_AST_NESTING);
+
 /// Grammar parameters — the `[Yield]`, `[Await]`, `[In]`, `[Return]` subscripts
 /// the spec threads through its productions, plus strictness.
 ///
@@ -533,12 +614,27 @@ pub struct Parser<'s> {
     /// it (`export @dec class C {}`), waiting for the ClassDeclaration it
     /// belongs to: `(offset of the first `@`, the list)`.
     pub(crate) pending_class_decorators: Option<(u32, Vec<super::ast::Expr>)>,
-    /// Number of active recursive grammar entry points.  Present only in the
-    /// hardened profile so ordinary/conformance builds retain their historical
-    /// grammar acceptance.
-    #[cfg(feature = "safe-sandbox")]
+    /// Number of active recursive grammar entry points, bounded in every
+    /// profile — tightly in the hardened one, by the native thread's stack in
+    /// the default one (see [`MAX_NATIVE_SYNTAX_RECURSION`]).
     syntax_recursion: usize,
+    /// A running UPPER BOUND on the height of the tree built so far by the
+    /// current recursive activation, in `limits::validate_program_nesting`'s
+    /// units: each activation reports `TREE_LEVELS_PER_ACTIVATION` above its
+    /// tallest child, and every chain link one more. When the whole program's
+    /// bound is within the limit the exact walk cannot fail, which is what
+    /// lets the default profile skip that walk for ordinary code — it cost
+    /// 3-5% of parse+compile on a 6 MB source.
+    tree_depth: usize,
 }
+
+/// How many validator levels one recursive activation may add above the
+/// tallest subtree its children built: the node it constructs plus the
+/// wrappers with no activation of their own between it and them. The widest
+/// such stack is a class declaration's synthesized `accessor` getter —
+/// statement, class, function, return statement, member, `this` — six levels;
+/// eight leaves room for a wrapper added later.
+const TREE_LEVELS_PER_ACTIVATION: usize = 8;
 
 impl<'s> Parser<'s> {
     #[cfg(test)]
@@ -547,8 +643,8 @@ impl<'s> Parser<'s> {
     }
 
     /// Constructs a parser and supplies the EXACT WTF-8 bytes `src` is a lossy
-    /// view of — see [`Lexer::set_exact_src`]. Only `eval` of a code string
-    /// holding a lone surrogate has any.
+    /// view of — see [`Lexer::set_exact_src`]. Only `eval` or a `Function`
+    /// constructor given a code string holding a lone surrogate has any.
     pub fn new_exact(
         src: &'s str,
         exact: Option<&'s [u8]>,
@@ -586,53 +682,86 @@ impl<'s> Parser<'s> {
             pending_export_locals: Vec::new(),
             accessor_seq: 0,
             pending_class_decorators: None,
-            #[cfg(feature = "safe-sandbox")]
             syntax_recursion: 0,
+            tree_depth: 0,
         })
     }
 
-    /// Run one recursion-bearing grammar production under the hardened
-    /// parser-stack budget.  The closure form is important: decrementing after
-    /// it returns also covers every `?`/early-error path without an unsafe raw
-    /// pointer or a guard that keeps `self` borrowed.
+    /// The upper bound on the finished program's tree height — see the
+    /// `tree_depth` field.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn tree_depth_bound(&self) -> usize {
+        self.tree_depth
+    }
+
+    /// Run one recursion-bearing grammar production under the parser-stack
+    /// budget of the active profile.  The closure form is important:
+    /// decrementing after it returns also covers every `?`/early-error path
+    /// without an unsafe raw pointer or a guard that keeps `self` borrowed.
     pub(crate) fn with_syntax_recursion<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> PResult<T>,
     ) -> PResult<T> {
-        #[cfg(not(feature = "safe-sandbox"))]
-        {
-            return f(self);
+        if self.syntax_recursion >= SYNTAX_RECURSION_LIMIT {
+            return Err(SyntaxError::new(
+                SYNTAX_NESTING_ERROR,
+                self.cur().span.start,
+            ));
         }
-
-        #[cfg(feature = "safe-sandbox")]
-        {
-            if self.syntax_recursion >= MAX_SAFE_SYNTAX_RECURSION {
-                return Err(SyntaxError::new(
-                    "SyntaxError: source nesting exceeds the sandbox limit",
-                    self.cur().span.start,
-                ));
-            }
-            self.syntax_recursion += 1;
-            let result = f(self);
-            self.syntax_recursion -= 1;
-            result
-        }
+        self.syntax_recursion += 1;
+        let outer_depth = std::mem::replace(&mut self.tree_depth, 0);
+        let result = f(self);
+        self.tree_depth = outer_depth.max(self.tree_depth + TREE_LEVELS_PER_ACTIVATION);
+        self.syntax_recursion -= 1;
+        result
     }
 
     /// Reject an iterative grammar chain before it becomes a deeply recursive
     /// AST.  `links` is the number of suffix/operator links already accepted at
     /// the current grammar tier.
-    pub(crate) fn check_syntax_chain(&self, links: usize) -> PResult<()> {
-        #[cfg(feature = "safe-sandbox")]
-        if links >= MAX_SAFE_SYNTAX_CHAIN {
+    pub(crate) fn check_syntax_chain(&mut self, links: usize) -> PResult<()> {
+        if links >= SYNTAX_CHAIN_LIMIT {
             return Err(SyntaxError::new(
-                "SyntaxError: source expression nesting exceeds the sandbox limit",
+                SYNTAX_CHAIN_ERROR,
                 self.cur().span.start,
             ));
         }
+        // Each link raises the spine one level above everything the
+        // activation has built so far (see `tree_depth`).
+        self.tree_depth += 1;
+        // Chains stacked through parentheses — `((o.x…).x…)…` — keep every
+        // tier under its own limit while the spine grows by a whole tier per
+        // level, and the walk that rejects the finished tree runs only once it
+        // exists: a 12 MB `eval` built a six-million-level spine whose
+        // recursive DROP then overflowed the stack. The bound exceeds the real
+        // height by at most `TREE_LEVELS_PER_ACTIVATION` per enclosing
+        // activation, so past this ceiling the tree is certainly too deep for
+        // `limits::validate_program_nesting` — stopping here only moves that
+        // rejection earlier, and caps what the error path drops.
         #[cfg(not(feature = "safe-sandbox"))]
-        let _ = links;
+        if self.tree_depth > MAX_NATIVE_TREE_DEPTH_BOUND {
+            return Err(SyntaxError::new(
+                SYNTAX_TREE_ERROR,
+                self.cur().span.start,
+            ));
+        }
         Ok(())
+    }
+
+    /// Parse one operand of a chain link that has no recursive activation of
+    /// its own, measuring its height apart from the spine it hangs off. Its
+    /// links would otherwise stack on everything the enclosing activation had
+    /// already built — `a && b || c && d || …` counted every `&&` of every arm
+    /// on one spine, a decorator list every hop of every decorator — and turn
+    /// the bound's small constant slack into slack proportional to the source.
+    pub(crate) fn with_operand_height<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> PResult<T>,
+    ) -> PResult<T> {
+        let spine = std::mem::replace(&mut self.tree_depth, 0);
+        let result = f(self);
+        self.tree_depth = spine.max(self.tree_depth + 1);
+        result
     }
 
     // ---- token plumbing ----------------------------------------------------
@@ -769,6 +898,18 @@ impl<'s> Parser<'s> {
         let more = matches!(t.kind, TokenKind::Template { tail: false, .. });
         self.tok = self.lx.next_token(more)?;
         Ok(t)
+    }
+
+    /// Parse one `[+In]` sub-production: `[In]` is off only at the top level
+    /// of a `for` head, and every initializer, computed key and bracketed
+    /// member inside that head turns it back on — `for (var [x = 'a' in {}]
+    /// = [];;)` is legal.
+    pub(crate) fn with_in<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        let saved_in = self.ctx.in_;
+        self.ctx.in_ = true;
+        let result = f(self);
+        self.ctx.in_ = saved_in;
+        result
     }
 
     pub(crate) fn cover_pattern_only(&mut self, e: SyntaxError) {

@@ -82,7 +82,7 @@ impl<'p> Vm<'p> {
         // (ToTemporalTimeZoneIdentifier extracts the bracket there).
         if tzarg.is_heap() && self.heap.is_str_like(tzarg.heap_index()) {
             let s = self.heap.str_cow(tzarg.heap_index()).unwrap().into_owned();
-            let t = s.trim();
+            let t = s.as_str();
             if t.contains('[')
                 || (t.starts_with(['+', '-']) && !Self::offset_identifier_shape_ok(t))
             {
@@ -779,7 +779,7 @@ impl<'p> Vm<'p> {
         // A DATE-ONLY string is GetStartOfDay, not midnight: "1919-03-31
         // [America/Toronto]" is 00:30, the instant the skipped hour ended, while
         // "1919-03-31T00[America/Toronto]" disambiguates to 01:00.
-        let head = s.trim().split('[').next().unwrap_or("");
+        let head = s.split('[').next().unwrap_or("");
         if behaviour == 0 && !head.contains(['T', 't', ' ']) {
             let r = tz_start_of_day(&id, local)?;
             let v = self.alloc_zdt(r, tz_offset_ns_at(&id, r), id)?;
@@ -973,7 +973,7 @@ impl<'p> Vm<'p> {
         // Z-requires-tz-annotation rule, then field-parse the annotation-stripped main.
         if rel.is_heap() && self.heap.is_str_like(rel.heap_index()) {
             let s = self.heap.str_cow(rel.heap_index()).unwrap().into_owned();
-            let st = s.trim();
+            let st = s.as_str();
             let (main, ann) = match st.find('[') {
                 Some(i) => (&st[..i], &st[i..]),
                 None => (st, ""),

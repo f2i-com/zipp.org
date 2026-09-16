@@ -19,7 +19,7 @@ integration date every corpus program matched.
 | Area | Supported |
 | --- | --- |
 | Numbers | arbitrary-precision `int`, `float` (Python `repr`/formatting rules, half-to-even rounding), `bool`; `+ - * / // % ** << >> & \| ^ ~`, chained comparisons, `divmod`, `round`, `pow` with modulus |
-| Strings | full `str` method set, `%` formatting, `str.format`, f-strings with conversions and nested format specs, `bytes` (utf-8/ascii/latin-1 encode/decode), code-point indexing |
+| Strings | full `str` method set, `%` formatting, `str.format`, f-strings with conversions and nested format specs, `bytes` (utf-8/ascii/latin-1 encode/decode), code-point indexing, `\N{...}` escapes for the common character names (see below) |
 | Containers | `list`, `tuple`, `dict` (insertion-ordered, `__missing__`), `set`, `frozenset`, `range`, slices with steps and slice assignment/deletion, comprehensions (list/set/dict/generator), starred unpacking, `del` |
 | Functions | defaults, keyword and keyword-only arguments, positional-only, `*args`/`**kwargs`, `*`/`**` at call sites, closures with `nonlocal`/`global`, lambdas, decorators, `__name__`/`__doc__`/`__defaults__`, generators (`yield`, `yield from`, `send`, `throw`, `close`, return value via `StopIteration.value`) |
 | Classes | single and multiple inheritance (C3 MRO), `super()` (zero- and two-argument), `__init__`/`__new__`, instance and class attributes, `property` with setters/deleters, `classmethod`, `staticmethod`, descriptors, `__getattr__`/`__setattr__`/`__delattr__`, `__init_subclass__`, `__class_getitem__`, `__slots__` (accepted), subclassing `list`/`dict`/`tuple`/`set`/exceptions, every operator, comparison, container, iteration, call, context-manager and conversion dunder |
@@ -27,7 +27,7 @@ integration date every corpus program matched.
 | Statements | `if`/`elif`/`else`, `while`/`for` with `else`, `break`/`continue` through `try`/`finally`, `pass`, annotations (`__annotations__`), walrus `:=`, `global`/`nonlocal`, `import`/`from ... import` (including inside functions) |
 | Modules | one module per `.py` file, packages by folder (`pkg/__init__.py` or a namespace folder; `import a.b.c`, `from pkg import submodule`), `__name__ == "__main__"`, cycles resolved like CPython, `import x as y`, `from x import *`, `__all__`; only the modules reachable from the entry through imports are compiled |
 | Builtins | `print` (sep/end/file), `len`, `range`, `enumerate`, `zip` (strict), `map`, `filter`, `reversed`, `sorted`/`list.sort` (stable, key, reverse), `min`/`max` (key, default), `sum`, `any`/`all`, `abs`, `round`, `divmod`, `pow`, `isinstance`/`issubclass`, `hasattr`/`getattr`/`setattr`/`delattr`, `id`, `hash`, `callable`, `chr`/`ord`, `bin`/`oct`/`hex`, `format`, `repr`/`ascii`, `iter`/`next`, `type`, `object`, `dir`, `vars`, `globals`, `exit` |
-| Built-in modules | `math`, `random` (seedable, deterministic), `time`, `sys`, `os`/`os.path` (a virtual empty filesystem), `io` (`StringIO`), `json`, `string`, `textwrap`, `copy`, `operator`, `itertools`, `functools` (`reduce`, `partial`, `lru_cache`/`cache`, `wraps`, `total_ordering`, `cmp_to_key`), `collections` (`Counter`, `defaultdict`, `deque`, `namedtuple`, `OrderedDict`, `ChainMap`), `heapq`, `bisect`, `statistics`, `re` (a JavaScript-backed subset with groups, named groups, `sub` with callables), `dataclasses` (`dataclass`, `field`, `asdict`, `astuple`, `replace`, `fields`; `order`, `frozen`), `enum` (`Enum`, `IntEnum`, `Flag`, `IntFlag`, `auto`), `typing` (generic aliases, `NamedTuple`, `TypedDict`), `abc` (`ABC` with abstract-method enforcement), `contextlib` (`contextmanager`, `suppress`, `closing`, `nullcontext`, `ExitStack`), `struct` (`pack`/`unpack`/`calcsize`/`iter_unpack`/`Struct` for the standard codes and byte orders), `hashlib` (`md5`, `sha1`, `sha256`), `platform`, `importlib` (`import_module` over the project), `io` (`StringIO`, `BytesIO`), `__future__` (`annotations`: PEP 563 string annotations, plus `X | None` union types) |
+| Built-in modules | `math`, `random` (seedable, deterministic), `time`, `sys`, `os`/`os.path` (a virtual empty filesystem), `io` (`StringIO`), `json`, `string`, `textwrap`, `copy`, `operator`, `itertools`, `functools` (`reduce`, `partial`, `lru_cache`/`cache`, `wraps`, `total_ordering`, `cmp_to_key`), `collections` (`Counter`, `defaultdict`, `deque`, `namedtuple`, `OrderedDict`, `ChainMap`), `heapq`, `bisect`, `statistics`, `re` (JavaScript-backed: groups, named groups and backreferences, inline and scoped flags, Unicode classes, `pos`/`endpos`, `sub` with templates or callables, `split`), `dataclasses` (`dataclass`, `field`, `asdict`, `astuple`, `replace`, `fields`; `order`, `frozen`), `enum` (`Enum`, `IntEnum`, `Flag`, `IntFlag`, `auto`), `typing` (generic aliases, `NamedTuple`, `TypedDict`), `abc` (`ABC` with abstract-method enforcement), `contextlib` (`contextmanager`, `suppress`, `closing`, `nullcontext`, `ExitStack`), `struct` (`pack`/`unpack`/`calcsize`/`iter_unpack`/`Struct` for the standard codes and byte orders), `hashlib` (`md5`, `sha1`, `sha256`), `platform`, `importlib` (`import_module` over the project), `io` (`StringIO`, `BytesIO`), `__future__` (`annotations`: PEP 563 string annotations, plus `X | None` union types) |
 | Files | a virtual filesystem holding the project folder's files (the CLI and the playground load them; 8 MiB per file, 64 MiB in total): `open()` in text and binary modes with `read`/`readline`/`readlines`/`write`/`seek`/`tell`/`truncate`, iteration and context managers; `os.listdir`/`makedirs`/`remove`/`rename`/`rmdir`/`getcwd`, `os.path`, `pathlib.Path` (`read_text`, `write_bytes`, `glob`, `rglob`, `mkdir`, ...); `sys.argv` from the host. Written files are reported back to the host (`__zipp_py_vfs_changed`), which the CLI copies to disk and the playground shows in its tree |
 | Bundled Python-source modules | `zipp_gpu` (`crates/zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`): float32 compute graphs (`Graph`, `Tensor`, `submit`, `program`, `to_json`, `execute_locally`); `pickle` (protocol 2 with `persistent_load`/`find_class`), `zipfile` (stored entries, zip64 reads), `pathlib`, `argparse`, `inspect` (signatures), `pytest` (`raises`, `approx`, `mark.parametrize`/`skip`/`skipif`, `fixture`, `tmp_path`, `main`; a `test_*.py` entry runs its tests automatically and a failure exits non-zero); and a `torch` subset (below). Each is compiled into a program only when imported. `zipp_gpu.py` also runs under CPython, which is how the corpus checks it |
 | `torch` subset | `crates/zipp-vm/src/frontend/python/lib/torch*.py` over the runtime's `_zipp_tensor` kernels (contiguous tensors on typed-array storages): dtypes, creation (`tensor`, `zeros`, `ones`, `full`, `arange`, `eye`, `randn`, `rand`, `randint`, `multinomial`, `randperm`), indexing and slicing (basic, advanced, boolean), shape ops (`view`, `reshape`, `permute`, `transpose`, `cat`, `stack`, `roll`, `unsqueeze`, `expand`, ...), elementwise and reduction ops with broadcasting, `matmul`/`@`/`einsum`, `softmax`/`log_softmax`, comparisons, in-place ops, reverse-mode autograd (`backward`, `autograd.grad`, `no_grad`, `requires_grad`), `nn` (`Module`, `Parameter`, `Sequential`, `ModuleList`, `Linear`, `Embedding`, `Conv1d` with stride 1, `GRUCell`, `LSTMCell`, `LayerNorm`, `Dropout`, activations, the common losses), `nn.functional`, `nn.init`, `nn.utils.clip_grad_norm_`, `optim` (`SGD`, `Adam`, `AdamW`, `RMSprop`, `lr_scheduler.StepLR`), `manual_seed`/`Generator` (seeded and deterministic; sample streams are not guaranteed to match PyTorch's), `save`/`load` of state dicts and tensors in PyTorch's zip checkpoint format (checkpoints written by PyTorch load, and the ones written here load in PyTorch). Everything runs on CPU kernels inside the engine: eager execution is CPU-only; experimental `torch.compile` records supported GPU inference and dense-model SGD training with asynchronous completion (see [Torch compatibility](TORCH_COMPATIBILITY.md)) |
@@ -40,6 +40,12 @@ integration date every corpus program matched.
 ## What does not run yet
 
 - `async`/`await`, type-parameter syntax, `except*`, complex numbers.
+- `\N{...}` knows a bundled table of names rather than all of Unicode
+  (Latin-1, Greek letters, punctuation, currency, arrows, mathematical
+  operators, box drawing, symbols, dingbats, common emoji, the control and
+  format character aliases, and `CJK UNIFIED IDEOGRAPH-XXXX`), matched
+  case-insensitively as CPython does. Any other name is a SyntaxError that
+  says so; spell the character or use `\u`/`\U`.
 - Sockets, processes, threads, and any file outside the project folder:
   the filesystem a program sees is the virtual one its host loaded (the
   CLI copies written files back under the project folder when the run
@@ -49,10 +55,28 @@ integration date every corpus program matched.
   is missing, and float64 accumulations differ from PyTorch's float32
   kernels in the last bits.
 - `__getattribute__` overrides, weak references, `__del__`.
+- `int` values are limited by the engine's BigInt size cap (2^30 bits; 2^20
+  in the hardened profile). Any operation whose result would exceed it,
+  including `**` and `<<` (checked before computing), raises
+  `OverflowError: Maximum BigInt size exceeded`.
+- `time.sleep` blocks in a standalone run but is a no-op under an embedding
+  host (the wasm engine), so the host's worker is never held; `perf_counter`,
+  `monotonic` and `process_time` read the engine's monotonic clock.
+- `enum`: `IntEnum`/`IntFlag` members are not `int` instances, and data-type
+  mixins such as `class S(str, Enum)` do not build their members through
+  the mixin type (a user `__init__` does receive each member's value).
+- `re` runs on the engine's JavaScript regex with Python's syntax, flags and
+  `\w`/`\d`/`\s` sets translated; `\W`/`\S` inside a character class are
+  approximations, and `Pattern.match(s, pos)` that fails still scans to the
+  end of the string (the engine's sticky match is not anchored yet).
 - Iteration order of sets follows insertion order, except that a set of
   small non-negative ints iterates ascending as CPython's hash table does;
   a set of strings can print in a different order from CPython (whose
   string hashes are randomised per process).
+- A `float` is an unboxed number, so it has no identity of its own. CPython's
+  containers compare identity before equality, which lets a NaN find *itself*
+  (`x = float("nan"); x in [x]` is True there); here that is False. Distinct
+  NaNs behave as CPython does: never equal, and separate dict and set keys.
 - `str` formatting of `float` uses Python's rules for `repr`, `f`, `e`, `g`,
   `%`; a few exotic spec combinations (`=` alignment with `0` padding of
   strings, `n` locale forms) are approximations.
@@ -127,10 +151,38 @@ bytes, `sys.argv[1:]`) return a language-labelled handle owning an ordinary
 contents), `pythonCall`, `pythonHas`, `takeUi`, `setPythonInput`,
 `takeHostRequests`, and the written-file report through
 `pythonCall("__zipp_py_vfs_changed", [])`; the JavaScript global-slot,
-`callFunction` and `evalInContext` methods reject Python states. The CLI's
-`zipp py FILE|DIR [ARGS...]` loads the folder holding the script (the
-current directory when the script is inside it), skipping `.git`,
-`__pycache__`, `node_modules`, `target` and virtual environments.
+`callFunction` and `evalInContext` methods reject Python states.
+
+### The CLI's project runs
+
+`zipp py FILE|DIR [ARGS...]` (and `zipp run FILE` for a file detected as
+Python by its extension, shebang or directive) runs the script as the entry
+of a project:
+
+- **Root.** The current directory when the script is inside it (as
+  `python path/to/script.py` sees the tree from where it is run), otherwise
+  the script's own folder. A filesystem root or the home folder is where
+  scripts are run from rather than a project, so a script below one is
+  rooted at its own folder. `zipp py DIR` roots at `DIR` and runs its
+  `main.py`; `--bc` takes a file, never a folder.
+- **Entry.** Any file name runs, with `__name__ == "__main__"` and
+  `__file__`/`sys.argv[0]` its root-relative path: `my-script.py`,
+  `2024_report.py`, an extensionless shebang script, or a script under a
+  dot-folder or a skipped folder. A file name that is a module name is also
+  importable by it. Its folder comes first for bare module names, as
+  `sys.path[0]` does: `sub/util.py` shadows a root `util.py` for a script
+  in `sub/` (the shadowed file stays readable).
+- **Files loaded.** The script's folder first, then the tree breadth-first,
+  skipping links and reparse points, every folder whose name starts with a
+  dot, and `__pycache__`, `node_modules`, `target`, `venv` and `dist`. Up to
+  8 MiB per file and 64 MiB in total, source files first; a `.py` file is
+  a module up to 1 MiB, and up to 256 modules are importable. The walk stops
+  after 20,000 entries. Files and folders that are over the limits or
+  cannot be read are left out with a note on stderr, not an error.
+- **Output.** Console lines are written as the program produces them, with
+  stdout and stderr in the order written.
+- **Standard input.** `zipp --lang=python -` has no project folder; its
+  file writes are discarded with a warning.
 
 ### CPU Torch compatibility evidence
 
@@ -190,6 +242,21 @@ base64 string for a zero-byte file), or `{ "path": "file", "deleted": true }`.
 Rename reports deletion of the old path and a write to the new one. Reading the
 hook drains the change set. Hosts must update their parser with the engine;
 the old tab-separated protocol is no longer supported.
+
+The CLI checks every change before it writes anything, applies deletions
+first, and reports each change it refuses on stderr while the rest still
+apply; a refused change fails the run, and when the program itself failed
+too, its own error and traceback are still printed (after the refusals) and
+decide the exit status. A change is refused when its path
+is invalid on the host (Windows stream syntax `:`, for example) or when it
+would replace a file that exists on disk but was not loaded into the
+program: one in a skipped folder, over the size limits, or unreadable. The
+program saw such a file as missing, so writing it back would destroy
+contents the program never read; a new file in a skipped folder is written
+normally. The virtual filesystem is case-sensitive. On a case-insensitive
+disk (Windows, macOS) spellings that differ only in case are one file when
+written back: the last write wins, and a case-only rename keeps the file
+under its new spelling (the last one written, when there are several).
 
 The native CLI accepts `.py`/`.pyw` case-insensitively for project entry files and
 module discovery. It skips symlinks and Windows reparse points while collecting
