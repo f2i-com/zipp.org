@@ -227,15 +227,28 @@ impl<'p> Vm<'p> {
 
     /// Resolve `cb` to the native entry of a COMPILED, non-capturing JIT function
     /// for the array-builtin fast path (`map`/`filter`/`forEach`/`reduce`).
-    /// Returns `(entry, callee_reg_count, param_count)` or `None` if `cb` must go
-    /// through the interpreter `call_value` (not a plain function, a capturing
-    /// closure, JIT disabled, inside a deopted self-call continuation, or not
-    /// JIT-compilable). Compiles `cb` on first use if eligible — array builtins
-    /// call the same callback many times, so we don't wait for the call-count
-    /// threshold; an ineligible proto is blacklisted by `compile` and returns
-    /// `None` cheaply thereafter.
+    /// Returns `(entry, callee_reg_count, param_count, this)` or `None` if `cb`
+    /// must go through the interpreter `call_value` (not a plain function, a
+    /// capturing closure, JIT disabled, inside a deopted self-call continuation,
+    /// a `this` that must be bound per call, or not JIT-compilable). Compiles
+    /// `cb` on first use if eligible — array builtins call the same callback
+    /// many times, so we don't wait for the call-count threshold; an ineligible
+    /// proto is blacklisted by `compile` and returns `None` cheaply thereafter.
+    ///
+    /// `this` is what OrdinaryCallBindThis gives the callee for `this_arg`, the
+    /// same for every element: an arrow's lexical `this`, a strict callee's
+    /// `this_arg`, and for a sloppy one the global object when `this_arg` is
+    /// nullish. The native window used to hold the raw `this_arg`, so a sloppy
+    /// compiled callback saw `this === undefined`. A sloppy callee given a
+    /// primitive needs a FRESH wrapper per call, which `call_value` builds.
+    /// Resolved here once, not per element: a sort comparator runs n·log n
+    /// times, and a per-call binding measured ~2ns on each.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn native_cb_entry(&mut self, cb: Value) -> Option<(*const u8, usize, usize)> {
+    pub(crate) fn native_cb_entry(
+        &mut self,
+        cb: Value,
+        this_arg: Value,
+    ) -> Option<(*const u8, usize, usize, Value)> {
         // Mirror the interpreter's JIT-entry guard: respect ZIPP_NOJIT and never
         // enter native code from a deopted self-call continuation (livelock).
         if !self.jit_fused_ok() || self.jit_recurse_depth != 0 || !cb.is_heap() {
@@ -248,10 +261,25 @@ impl<'p> Vm<'p> {
         }
         // A callback that materialises `arguments` needs the interpreter's call
         // setup (the JIT window never builds the arguments object) — same guard
-        // as the fused-kernel paths.
-        if self.func(fid as usize).arguments_reg.is_some() {
+        // as the fused-kernel paths. An async or generator callback returns the
+        // Promise / generator object only that call setup creates; running its
+        // compiled body would hand back the raw completion value instead.
+        let is_strict = {
+            let proto = self.func(fid as usize);
+            if proto.arguments_reg.is_some() || proto.is_async || proto.is_generator {
+                return None;
+            }
+            proto.is_strict
+        };
+        let this = if let Some(lexical) = self.arrow_captured_this(cb) {
+            lexical
+        } else if is_strict || self.global_this == 0 || self.is_object_value(this_arg) {
+            this_arg
+        } else if this_arg.is_nullish() {
+            Value::heap(self.callee_this_global(cb))
+        } else {
             return None;
-        }
+        };
         if self.jit.get(fid).is_none() {
             let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
             // SAFETY: program functions are immutable during execution; the raw
@@ -320,21 +348,27 @@ impl<'p> Vm<'p> {
             entry,
             (proto.reg_count as usize).max(1),
             proto.param_count as usize,
+            this,
         ))
     }
 
     #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
-    pub(crate) fn native_cb_entry(&mut self, _cb: Value) -> Option<(*const u8, usize, usize)> {
+    pub(crate) fn native_cb_entry(
+        &mut self,
+        _cb: Value,
+        _this_arg: Value,
+    ) -> Option<(*const u8, usize, usize, Value)> {
         None
     }
 
     /// Invoke a compiled callback natively over the reused window at `win`
-    /// (`regs[win..win+callee_regs]`), writing `this`=undefined + the first
-    /// `param_count` args. On a native deopt (bail), re-runs the element through
-    /// the interpreter `call_value` — which nests its frame ABOVE this window
-    /// (base = `regs.len()`) and pops back, leaving the window intact for the
-    /// next element. This is the fast path that skips the per-element frame push
-    /// + `run_loop` re-entry + callee re-resolution that `call_value` incurs.
+    /// (`regs[win..win+callee_regs]`), writing the `this` `native_cb_entry`
+    /// bound + the first `param_count` args. On a native deopt (bail), re-runs
+    /// the element through the interpreter `call_value` — which nests its frame
+    /// ABOVE this window (base = `regs.len()`) and pops back, leaving the window
+    /// intact for the next element. This is the fast path that skips the
+    /// per-element frame push + `run_loop` re-entry + callee re-resolution that
+    /// `call_value` incurs.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn invoke_cb_windowed(
         &mut self,
@@ -345,9 +379,9 @@ impl<'p> Vm<'p> {
         args: &[Value],
         this_val: Value,
     ) -> Result<Value, Thrown> {
-        // An arrow callback ignores the supplied thisArg and uses its lexical `this`.
-        let this_val = self.arrow_captured_this(cb).unwrap_or(this_val);
-        self.regs[win] = this_val; // reg 0 = this (thisArg, or arrow's lexical this)
+        // `this_val` is the bound `this` from `native_cb_entry` (an arrow's
+        // lexical one included); `call_value` below rebinds it identically.
+        self.regs[win] = this_val; // reg 0 = this
         let n = args.len().min(param_count);
         for i in 0..n {
             self.regs[win + 1 + i] = args[i];
@@ -405,19 +439,20 @@ impl<'p> Vm<'p> {
     }
 
     /// One per-element callback invocation: native fast path when `native` is
-    /// set, else the interpreter `call_value`.
+    /// set (with the `this` it bound), else the interpreter `call_value` with
+    /// the raw `this_val`.
     #[inline]
     pub(crate) fn run_cb_elem(
         &mut self,
-        native: Option<(*const u8, usize, usize)>,
+        native: Option<(*const u8, usize, usize, Value)>,
         win: usize,
         cb: Value,
         args: &[Value],
         this_val: Value,
     ) -> Result<Value, Thrown> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if let Some((entry, callee_regs, param_count)) = native {
-            let result = self.invoke_cb_windowed(entry, win, param_count, cb, args, this_val);
+        if let Some((entry, callee_regs, param_count, bound_this)) = native {
+            let result = self.invoke_cb_windowed(entry, win, param_count, cb, args, bound_this);
             // A resumed interpreter frame releases the window when it pops;
             // the next element expects it to be there again.
             if self.regs.len() < win + callee_regs {

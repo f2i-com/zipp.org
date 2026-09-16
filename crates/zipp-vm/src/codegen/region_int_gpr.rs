@@ -2988,8 +2988,10 @@ pub(crate) fn compile_region_int_gpr(
         if plan.dv_flag_elide.contains(&ip) {
             continue;
         }
+        // A `split_recv_lg` load/GetProp writes the boxed reference an exit
+        // replays; it is never a dead value op (see the xmm emitter's twin).
         if let Some(d) = writes_reg(&proto.code[ip]) {
-            if plan.dead.contains(&d) {
+            if plan.dead.contains(&d) && !plan.split_recv_lg.contains(&ip) {
                 continue;
             }
         }

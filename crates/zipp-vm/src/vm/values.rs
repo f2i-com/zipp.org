@@ -520,7 +520,14 @@ impl<'p> Vm<'p> {
     /// VALUE, or the class value for the ctor/field-init/static block; both recorded
     /// in `method_brand` at MakeClass). `None` outside a class body.
     pub(crate) fn current_private_brands(&self) -> Option<&Vec<u64>> {
-        let callee = self.frames.last()?.callee;
+        self.private_brands_of(self.frames.last()?.callee)
+    }
+
+    /// The lexical private-brand chain of the class body whose code `callee` (a
+    /// function VALUE recorded in `method_brand`) runs. `current_private_brands`
+    /// asks this for the running frame; a frame-free JIT activation asks it for
+    /// its own callee, because the top frame then belongs to a caller.
+    pub(crate) fn private_brands_of(&self, callee: Value) -> Option<&Vec<u64>> {
         if !callee.is_heap() {
             return None;
         }
@@ -854,7 +861,13 @@ impl<'p> Vm<'p> {
     /// the declaring class value is unknown — the caller keeps its textual
     /// path. kind bits: 1 = method, 2 = getter, 4 = setter; 0 = field.
     pub(crate) fn resolve_private(&self, key: &str) -> Option<(u64, u8, u32)> {
-        let chain = self.current_private_brands()?;
+        self.resolve_private_in(self.frames.last()?.callee, key)
+    }
+
+    /// `resolve_private` against the brand chain of `ctx` (see
+    /// `private_brands_of`) rather than the running frame's.
+    pub(crate) fn resolve_private_in(&self, ctx: Value, key: &str) -> Option<(u64, u8, u32)> {
+        let chain = self.private_brands_of(ctx)?;
         for &b in chain.iter() {
             if let Some(names) = self.brand_private_names.get(&b) {
                 if let Some(kind) = names.iter().find(|(n, _)| n == key).map(|&(_, k)| k) {
@@ -937,7 +950,17 @@ impl<'p> Vm<'p> {
     /// fall back to the lenient any-brand check — never tighter than the chain, so
     /// this can only ADD precision, never reject a previously-accepted access.
     pub(crate) fn private_brand_ok(&self, receiver: Value, key: &str) -> Option<bool> {
-        let chain = self.current_private_brands()?;
+        self.private_brand_ok_in(self.frames.last()?.callee, receiver, key)
+    }
+
+    /// `private_brand_ok` against the brand chain of `ctx`.
+    pub(crate) fn private_brand_ok_in(
+        &self,
+        ctx: Value,
+        receiver: Value,
+        key: &str,
+    ) -> Option<bool> {
+        let chain = self.private_brands_of(ctx)?;
         for &b in chain.iter() {
             if self
                 .brand_private_names
@@ -965,6 +988,68 @@ impl<'p> Vm<'p> {
             return None;
         }
         Some(chain.iter().any(|&b| self.instance_has_brand(receiver, b)))
+    }
+
+    /// PrivateMethodCall's reference half for `recv.#m(...)` (a private `key`),
+    /// accessed from the class body whose brand chain `ctx` names: the brand
+    /// check (TypeError when the receiver's class did not declare `key`), then
+    /// the callee — the declaring class's method, a getter's result, or a
+    /// private field's value. `Ok(None)` when no chain brand resolves `key` and
+    /// the receiver passes the textual presence check without a private field
+    /// value; the caller then takes its ordinary property lookup.
+    ///
+    /// The interpreter's `CallMethod` passes the running frame's callee. The JIT
+    /// region-call fallback passes the callee of the code that is actually
+    /// running: it used to look `#m` up as a plain property, so one class could
+    /// call another class's same-named `#m`.
+    pub(crate) fn private_method_callee(
+        &mut self,
+        ctx: Value,
+        recv: Value,
+        key: &str,
+    ) -> Result<Option<Value>, Thrown> {
+        if let Some((b, kind, owner)) = self.resolve_private_in(ctx, key) {
+            // Declaring-class-resolved, KIND-aware (FIX-3).
+            if !self.private_receiver_ok(recv, b, kind, owner) {
+                return Err(Thrown(format!(
+                    "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+                )));
+            }
+            let f = if kind & 1 != 0 {
+                self.private_member_from_owner(owner, key, (kind & 8) | 1)
+                    .unwrap_or(Value::UNDEFINED)
+            } else if kind & 2 != 0 {
+                let g = self
+                    .private_member_from_owner(owner, key, (kind & 8) | 2)
+                    .unwrap_or(Value::UNDEFINED);
+                self.call_value(g, recv, &[])?
+            } else if kind & 4 != 0 {
+                return Err(Thrown(format!(
+                    "TypeError: '{key}' was defined without a getter"
+                )));
+            } else {
+                match self.private_field_get(recv, b, key) {
+                    Some(v) => v,
+                    None => {
+                        return Err(Thrown(format!(
+                            "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+                        )));
+                    }
+                }
+            };
+            return Ok(Some(f));
+        }
+        let textual = self.has_property_str(recv, key) || self.private_field_scan_has(recv, key);
+        let present = match self.private_brand_ok_in(ctx, recv, key) {
+            Some(b) => textual && b,
+            None => textual,
+        };
+        if !present {
+            return Err(Thrown(format!(
+                "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+            )));
+        }
+        Ok(self.private_field_scan(recv, key))
     }
 
     /// Proxy-aware [[HasProperty]] (`in` / Reflect.has). Mirrors `has_property`

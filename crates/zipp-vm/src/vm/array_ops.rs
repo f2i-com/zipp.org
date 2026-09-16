@@ -660,12 +660,12 @@ impl<'p> Vm<'p> {
         // ran, or just the tail after a kernel bail (or nothing if it completed).
         let run_tail = start < snapshot_len;
         let mut native = if run_tail {
-            self.native_cb_entry(cb)
+            self.native_cb_entry(cb, this_arg)
         } else {
             None
         };
         let win = self.regs.len();
-        if let Some((_, callee_regs, _)) = native {
+        if let Some((_, callee_regs, _, _)) = native {
             if self.regs_would_overflow(win + callee_regs) {
                 native = None; // can't fit a window → interpreter path
             } else {
@@ -3444,12 +3444,12 @@ impl<'p> Vm<'p> {
                 // remainder after a kernel bail (nothing if it completed).
                 let run_tail = start < snapshot_len;
                 let mut native = if run_tail {
-                    self.native_cb_entry(cb)
+                    self.native_cb_entry(cb, Value::UNDEFINED)
                 } else {
                     None
                 };
                 let win = self.regs.len();
-                if let Some((_, callee_regs, _)) = native {
+                if let Some((_, callee_regs, _, _)) = native {
                     if self.regs_would_overflow(win + callee_regs) {
                         native = None;
                     } else {
@@ -4146,9 +4146,9 @@ impl<'p> Vm<'p> {
         // Native-callback fast path: a compiled non-capturing comparator is called
         // directly over one reused register window (skipping a per-comparison frame
         // build + run_loop re-entry). `native = None` falls back to call_value.
-        let mut native = self.native_cb_entry(cmp);
+        let mut native = self.native_cb_entry(cmp, Value::UNDEFINED);
         let win = self.regs.len();
-        if let Some((_, callee_regs, _)) = native {
+        if let Some((_, callee_regs, _, _)) = native {
             if self.regs_would_overflow(win + callee_regs) {
                 native = None;
             } else {

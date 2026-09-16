@@ -887,9 +887,10 @@ pub(crate) fn compile_region_regalloc(
             continue;
         }
         // Dead-code elimination: skip a pure op whose result is never read (see
-        // plan_region `dead`). Sound — every regalloc-region op is side-effect-free.
+        // plan_region `dead`). A `split_recv_lg` load/GetProp is not such an op:
+        // it writes the boxed reference a guard exit replays (see region_int).
         if let Some(d) = writes_reg(&proto.code[ip]) {
-            if plan.dead.contains(&d) {
+            if plan.dead.contains(&d) && !plan.split_recv_lg.contains(&ip) {
                 continue;
             }
         }

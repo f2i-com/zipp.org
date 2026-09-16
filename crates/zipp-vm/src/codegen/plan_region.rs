@@ -2776,6 +2776,25 @@ fn plan_region_cold_inner(
             _ => None,
         })
         .collect();
+    // The same holds for a pinned dense-ARRAY element read. Its inline load
+    // answers only the in-range non-hole case; a hole or an out-of-range index
+    // is an ordinary [[Get]] up the prototype chain, which can run an accessor
+    // or a Proxy trap installed on `Array.prototype`/`Object.prototype`. As a
+    // statement (`a[i & 15];`) or into an unread local the dst was dead and the
+    // getter never ran. TypedArray reads are integer-indexed exotic and stay
+    // eliminable.
+    let arr_read_dsts: FxHashSet<u16> = (s..=e)
+        .filter_map(|ip| match code[ip] {
+            Instr::GetIndex { dst, .. }
+                if ta_plan.access.get(&ip).is_some_and(|&j| {
+                    crate::codegen::is_arr_pin(ta_plan.pins[j as usize].kind)
+                }) =>
+            {
+                Some(dst)
+            }
+            _ => None,
+        })
+        .collect();
     let dead: FxHashSet<u16> = reg_order
         .iter()
         .copied()
@@ -2784,6 +2803,7 @@ fn plan_region_cold_inner(
                 && first_seen.get(r) != Some(&false)
                 && !read_outside.contains(r)
                 && !getprop_dsts.contains(r)
+                && !arr_read_dsts.contains(r)
         })
         .collect();
     reg_order.retain(|r| !dead.contains(r));
@@ -3187,6 +3207,10 @@ fn plan_region_cold_inner(
                 && used.contains(&dst)
                 && !dead.contains(&dst)
                 && runs_every_iteration(code, s, e, ip)
+                // The exit flush publishes the length even on a path that never
+                // reached the read, which a post-region reader observes unless
+                // the entry iteration ran it (`def_runs_before_region_entry`).
+                && (!read_outside.contains(&dst) || def_runs_before_region_entry(code, s, ip))
             {
                 hoist_len_ips.push(ip);
                 hoisted.insert(dst);
@@ -4659,15 +4683,15 @@ where
 ///
 /// True when no branch in `[s, d)` can jump PAST `d` while staying inside the
 /// region. Branches that LEAVE the region are deliberately allowed, including
-/// the loop header's own exit test: OSR entry only happens after the interpreter
-/// has already executed the loop `OSR_THRESHOLD` times, so a def that runs every
-/// iteration has already written its value into the frame slot — the region
-/// materialising the same constant into a home and flushing it back is then a
-/// no-op. A def that can be SKIPPED has no such guarantee.
+/// the loop header's own exit test.
 ///
 /// This is the cheap sound approximation of "the def dominates every exit". It
-/// is what makes constant hoisting (and `hoistable_length`) safe without a full
-/// dominator tree.
+/// is what constant hoisting (and the length hoists) build on without a full
+/// dominator tree. It says nothing about the frame slot at region ENTRY: a def
+/// behind a mid-body back-edge to the header (a `while` loop's `continue`) can
+/// be skipped by every iteration before entry — see
+/// `def_runs_before_region_entry`, which a hoist that publishes its value to the
+/// frame slot on a path that never reached the def must also require.
 ///
 /// AUDITED W17 — "which ops name a control-flow target" is stated in FIVE
 /// places and they do not agree. The five branch ops below are also all that
@@ -4697,6 +4721,30 @@ pub(crate) fn runs_every_iteration(code: &[Instr], s: usize, e: usize, d: usize)
         }
     }
     true
+}
+
+/// Has the def at `d` executed on the iteration that ENTERS region `[s, e]`?
+///
+/// The region is entered only from an interpreter back-edge to its header `s`
+/// (`Instr::Jump` in dispatch). If every back-edge to `s` lies at or after `d`
+/// and `runs_every_iteration(d)` holds, the iteration ending in that back-edge
+/// executed `d`, so the frame slot already holds the value a hoist computes in
+/// the prologue — publishing it is a no-op even when the region leaves through
+/// the header's exit before reaching `d` again. A branch to `s` inside `[s, d)`
+/// (a `while` loop's `continue` before the def) breaks that: every pre-entry
+/// iteration may have skipped `d`, and a hoisted `t = arr.length` then
+/// overwrote `t` on a search loop that never assigned it.
+pub(crate) fn def_runs_before_region_entry(code: &[Instr], s: usize, d: usize) -> bool {
+    !code.iter().take(d).skip(s).any(|instr| {
+        matches!(
+            *instr,
+            Instr::Jump { target }
+                | Instr::JumpIfFalse { target, .. }
+                | Instr::JumpIfTrue { target, .. }
+                | Instr::JumpIfNotLt { target, .. }
+                | Instr::JumpIfNotLe { target, .. } if target as usize == s
+        )
+    })
 }
 
 /// W28 — candidate TYPE SPLITS for `[s, e]`: VM registers the bytecode

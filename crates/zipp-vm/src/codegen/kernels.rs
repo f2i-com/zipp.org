@@ -6,10 +6,23 @@
 use super::*;
 
 /// True if every op of `proto` is in the kernel's pure-arithmetic subset (no
-/// calls / globals / heap ops / branches / `%` / non-int `LoadConst`). Callers
+/// calls / globals / heap ops / branches / non-int `LoadConst`). Callers
 /// additionally check `param_count`. Stricter than `can_compile` (no self-call)
 /// because the kernel must be call-free (no `regs` realloc under the window).
 pub(crate) fn can_kernel_body(proto: &FuncProto) -> bool {
+    // An async or generator callback returns a Promise / generator object, never
+    // its body's value: `filter(async x => x < 2)` keeps every element. The op
+    // whitelist below cannot see that — `async x => x + 1` is two admitted ops.
+    if proto.is_async || proto.is_generator {
+        return false;
+    }
+    // The kernel writes `this = undefined` into window[0] once. That is the
+    // callee's `this` only for a strict non-arrow function (the gates require an
+    // undefined thisArg): a sloppy callee binds the global object and an arrow its
+    // lexical `this`. Such a body may still run here if it never reads reg 0.
+    if (!proto.is_strict || proto.lexical_this) && proto.code.iter().any(kernel_reads_this) {
+        return false;
+    }
     proto.code.iter().all(|instr| {
         matches!(
             instr,
@@ -31,6 +44,27 @@ pub(crate) fn can_kernel_body(proto: &FuncProto) -> bool {
                 | Instr::ReturnUndefined
         )
     })
+}
+
+/// Does a kernel-subset op read register 0 (`this`)? Ops outside the subset
+/// answer `false`; `can_kernel_body` rejects them on its own.
+fn kernel_reads_this(instr: &Instr) -> bool {
+    match *instr {
+        Instr::Move { src, .. } | Instr::Return { src } => src == 0,
+        Instr::AddInt { a, .. } => a == 0,
+        Instr::Add { a, b, .. }
+        | Instr::Sub { a, b, .. }
+        | Instr::Mul { a, b, .. }
+        | Instr::Div { a, b, .. }
+        | Instr::Mod { a, b, .. }
+        | Instr::Lt { a, b, .. }
+        | Instr::Le { a, b, .. }
+        | Instr::Gt { a, b, .. }
+        | Instr::Ge { a, b, .. }
+        | Instr::Eq { a, b, .. }
+        | Instr::Ne { a, b, .. } => a == 0 || b == 0,
+        _ => false,
+    }
 }
 
 /// f64 binop for a kernel body (`regs[dst] = regs[a] <op> regs[b]`). Reuses the
@@ -55,10 +89,23 @@ pub(crate) fn kmap_dbinop(
     store_xmm(ops, dst);
 }
 
-/// f64 remainder for a kernel body (JS `%`): `a - trunc(a/b)*b` (truncated
-/// quotient, sign of the dividend — JS semantics). `% 0` and `Infinity % b`
-/// yield NaN exactly as in JS (Inf/NaN propagate through trunc/mul/sub). Uses
-/// `roundsd` (SSE4.1, universal on x86-64). A non-number operand jumps to `bail`.
+/// Remainder for a kernel body (JS `%`), EXACT for every pair of Numbers. It
+/// used to compute `a - trunc(a/b)*b` in doubles, which is not fmod: the
+/// product loses bits once the quotient is large (`123456789012345680 % 3`
+/// gave 16), `x % Infinity` gave NaN instead of `x`, and a zero remainder of a
+/// negative dividend lost its sign (`-4 % 2` is -0).
+///
+/// Two Int-tagged operands, or two doubles that are exactly i32 values (the
+/// usual output of a kernel's own double arithmetic, e.g. `x * 2`), take a
+/// 32-bit `idiv`. Everything else — a fractional or out-of-range double, a ±0
+/// dividend, `% 0`, `% -1`, and a zero remainder of a negative dividend — runs
+/// x87 `fprem`, which IS IEEE fmod: each partial remainder is exact (precision
+/// control does not apply to it), the result keeps the dividend's sign (so -0
+/// stays -0), `x % ±Infinity` is `x`, and `% 0` / `Infinity % y` / NaN give
+/// NaN. It loops while C2 reports an incomplete reduction (a huge exponent
+/// gap). Only a non-number operand jumps to `bail`. Bailing on doubles instead
+/// would hand the whole rest of the array to the per-element tail at the first
+/// fractional element.
 pub(crate) fn kmap_dmod(
     ops: &mut dynasmrt::x64::Assembler,
     bail: dynasmrt::DynamicLabel,
@@ -66,16 +113,91 @@ pub(crate) fn kmap_dmod(
     a: u16,
     b: u16,
 ) {
+    let slow = ops.new_dynamic_label();
+    let divide = ops.new_dynamic_label();
+    let boxed = ops.new_dynamic_label();
+    let x87_load = ops.new_dynamic_label();
+    let x87 = ops.new_dynamic_label();
+    let partial = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    // rax/rcx/rdx/r8/r10 and xmm0-2 are scratch; rdi (filter's kept count) and
+    // the callee-saved pins are untouched. The x87 stack is empty on entry
+    // (win64) and left empty.
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(a)]
+        ; mov rcx, [rbx + dreg(b)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => slow
+        ; mov r10, rcx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => slow
+        ; => divide                      // eax = a, ecx = b (both i32)
+        ; test ecx, ecx
+        ; jz => x87_load                 // % 0 → NaN
+        ; cmp ecx, -1
+        ; je => x87_load                 // i32::MIN / -1 faults; the result is ±0
+        ; mov r8d, eax                   // the dividend, for the -0 check
+        ; cdq
+        ; idiv ecx                       // edx = a % b, dividend's sign
+        ; test edx, edx
+        ; jnz => boxed
+        ; test r8d, r8d
+        ; js => x87_load                 // negative dividend, zero remainder: -0
+        ; => boxed
+        ; mov eax, edx                   // zero-extend the i32 payload
+        ; mov r8, QWORD INT_TAG as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        ; => slow
+    );
     load_num_xmm(ops, a, 0, bail); // xmm0 = a
     load_num_xmm(ops, b, 1, bail); // xmm1 = b
     dynasm!(ops
-        ; movsd xmm2, xmm0
-        ; divsd xmm2, xmm1           // a / b
-        ; roundsd xmm2, xmm2, 0b11   // truncate toward zero
-        ; mulsd xmm2, xmm1           // trunc(a/b) * b
-        ; subsd xmm0, xmm2           // a - trunc(a/b)*b
+        // Exactly-i32 doubles rejoin the integer divide. A zero truncation is
+        // ±0 (whose sign `idiv` would drop) or a fraction: x87. Out of range
+        // truncates to i32::MIN, which round-trips unequal; NaN is unordered.
+        ; cvttsd2si eax, xmm0
+        ; test eax, eax
+        ; jz => x87
+        ; xorps xmm2, xmm2
+        ; cvtsi2sd xmm2, eax
+        ; ucomisd xmm2, xmm0
+        ; jne => x87
+        ; jp => x87
+        ; cvttsd2si ecx, xmm1
+        ; xorps xmm2, xmm2
+        ; cvtsi2sd xmm2, ecx
+        ; ucomisd xmm2, xmm1
+        ; jne => x87
+        ; jp => x87
+        ; jmp => divide
+        ; => x87_load
     );
-    store_xmm(ops, dst);
+    // Only reached with both operands already proven numbers, so these loads
+    // never take `bail`.
+    load_num_xmm(ops, a, 0, bail);
+    load_num_xmm(ops, b, 1, bail);
+    dynasm!(ops
+        ; => x87
+        // x87 loads from memory only: stage both through dst's slot, which is
+        // free to clobber now that the operands sit in xmm0/xmm1.
+        ; movsd QWORD [rbx + dreg(dst)], xmm1
+        ; fld QWORD [rbx + dreg(dst)]    // st0 = b
+        ; movsd QWORD [rbx + dreg(dst)], xmm0
+        ; fld QWORD [rbx + dreg(dst)]    // st0 = a, st1 = b
+        ; => partial
+        ; fprem                          // st0 = partial remainder of a / b
+        ; fnstsw ax
+        ; test ax, 0x400                 // C2: reduction incomplete
+        ; jnz => partial
+        ; fstp QWORD [rbx + dreg(dst)]   // exact, so representable as a double
+        ; fstp st0                       // pop b
+        ; => done
+    );
 }
 
 /// f64 ordered comparison → Bool for a kernel body. Mirrors the region `dcmp`

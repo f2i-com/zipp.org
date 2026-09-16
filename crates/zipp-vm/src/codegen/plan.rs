@@ -53,10 +53,13 @@ pub(crate) struct RegionPlan {
     /// live-in. Their body occurrences are skipped (the home already holds them).
     pub(crate) hoist_ips: Vec<usize>,
     pub(crate) hoisted: FxHashSet<u16>,
-    /// Registers DEFINED in the region but NEVER used as an operand (dead). All
-    /// int-region ops are pure value computations (no side effects — heap/call ops
-    /// decline the region), so a dead-dst op produces a value nothing reads and is
-    /// skipped during body emission. The common source is object SROA, which
+    /// Registers DEFINED in the region but NEVER used as an operand (dead). A
+    /// dead-dst op produces a value nothing reads and is skipped during body
+    /// emission — sound only for pure value ops, so the planner never marks the
+    /// dst of an op that can run user code (an admitted `GetProp`, a pinned
+    /// dense-Array `GetIndex` whose hole/out-of-range read walks the prototype
+    /// chain), and the emitters never skip a `split_recv_lg` ip, whose boxed
+    /// frame write a guard exit replays. The common source is object SROA, which
     /// neutralises the (now-unused) object-ref `LoadGlobal`s to `LoadInt 0`: that's
     /// ~7 dead ops/iteration in the object benchmark, and dropping them also frees
     /// their xmm homes (often taking the loop off the slower home-reuse path).

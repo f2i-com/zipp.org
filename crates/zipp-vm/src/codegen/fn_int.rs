@@ -95,6 +95,13 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
     if proto.code.is_empty() || proto.reg_count == 0 || proto.param_count >= proto.reg_count {
         return false;
     }
+    // An async or generator body's completion is a Promise / generator object
+    // built by the interpreter's call path. Ordinary calls never enter a compiled
+    // body for these, but `native_cb_entry` (array-builtin callbacks, sort
+    // comparators) does: `a.sort(async (x, y) => x - y)` sorted the array.
+    if proto.is_async || proto.is_generator {
+        return false;
+    }
     // Rest and `arguments` are materialized by the interpreter's call setup,
     // not by the native self-call window. Stay interpreted when either can be
     // observed by the body.

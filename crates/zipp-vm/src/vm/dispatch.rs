@@ -7245,50 +7245,8 @@ impl<'p> Vm<'p> {
                         // leading-'#' test; textual fallback when no brand resolvable.
                         let mut private_callee: Option<Value> = None;
                         if is_private_key(key) {
-                            if let Some((b, kind, owner)) = self.resolve_private(key) {
-                                // Declaring-class-resolved, KIND-aware (FIX-3).
-                                if !self.private_receiver_ok(recv, b, kind, owner) {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                                    )));
-                                }
-                                let f = if kind & 1 != 0 {
-                                    self.private_member_from_owner(owner, key, (kind & 8) | 1)
-                                        .unwrap_or(Value::UNDEFINED)
-                                } else if kind & 2 != 0 {
-                                    let g = self
-                                        .private_member_from_owner(owner, key, (kind & 8) | 2)
-                                        .unwrap_or(Value::UNDEFINED);
-                                    self.call_value(g, recv, &[])?
-                                } else if kind & 4 != 0 {
-                                    return Err(Thrown(format!(
-                                        "TypeError: '{key}' was defined without a getter"
-                                    )));
-                                } else {
-                                    match self.private_field_get(recv, b, key) {
-                                        Some(v) => v,
-                                        None => {
-                                            return Err(Thrown(format!(
-                                                "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                                            )));
-                                        }
-                                    }
-                                };
-                                private_callee = Some(f);
-                            } else {
-                                let textual = self.has_property_str(recv, key)
-                                    || self.private_field_scan_has(recv, key);
-                                let present = match self.private_brand_ok(recv, key) {
-                                    Some(b) => textual && b,
-                                    None => textual,
-                                };
-                                if !present {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                                    )));
-                                }
-                                private_callee = self.private_field_scan(recv, key);
-                            }
+                            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+                            private_callee = self.private_method_callee(ctx, recv, key)?;
                         }
                         // ── interpreter method-call IC ── a monomorphic /
                         // low-polymorphic `obj.method()` resolves through the

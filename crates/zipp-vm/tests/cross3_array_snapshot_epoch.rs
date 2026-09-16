@@ -134,7 +134,9 @@ fn aliases_multiple_pins_and_unrelated_array_mutation_stay_exact() {
 }
 
 /// Freeze/seal and tagged-template SetRaw install named-only sidecars; they do
-/// not change dense element values. Mapped arguments, by contrast, must never
+/// not change dense element values. (Freeze/seal/preventExtensions still dirty
+/// the epoch: an inline dense STORE must not outlive them — see
+/// `audit_20260915_jit.rs`.) Mapped arguments, by contrast, must never
 /// use a raw snapshot because writes to the formal remain observable.
 #[test]
 fn named_sidecars_and_mapped_arguments_keep_full_semantics() {

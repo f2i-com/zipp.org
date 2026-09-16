@@ -1068,9 +1068,10 @@ impl<'p> Vm<'p> {
         let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
 
         // Resolve through the interpreter's per-site IC — IDENTICAL resolution
-        // order to the interpreter (which consults the IC first; everything the
-        // IC won't claim, incl. '#private' names, builtins, natives, accessors,
-        // generators/async, exotic receivers, deopts to the interpreter).
+        // order to the interpreter (which consults the IC first). What the IC
+        // won't claim — '#private' names, builtins, natives, accessors,
+        // generators/async, exotic receivers — takes the miss arm below, which
+        // completes the call the way the interpreter's CallMethod slow arm does.
         let (fid, closure, this_v, callee_v) = if is_method {
             let obj = ((packed_args >> 16) & 0xFFFF) as u16;
             let name = (packed_args >> 32) as u32;
@@ -1107,6 +1108,27 @@ impl<'p> Vm<'p> {
                 None => {
                     if jit_call_log() {
                         eprintln!("[call] METHOD MISS fn{func_id}@{ip} key={key}");
+                    }
+                    // `recv.#m()`: PrivateMethodCall's brand check, before any
+                    // property lookup. The general-miss tail below used to find
+                    // `#m` textually on the prototype chain, so a hot site
+                    // called ANOTHER class's same-named private method (or one
+                    // inherited through `Object.create(instance)`) where the
+                    // interpreter throws. The brand chain is the running code's:
+                    // the top frame when this window is that frame, else the
+                    // frame-free Tier-C activation that owns it.
+                    if crate::vm::is_private_key(key) {
+                        let Some(ctx) = self.jit_running_callee(func_id, base) else {
+                            return SELF_CALL_DEOPT;
+                        };
+                        match self.private_method_callee(ctx, recv, key) {
+                            Ok(Some(prop)) => {
+                                return self
+                                    .jit_call_method_value(recv, key, prop, base, arg_base, argc);
+                            }
+                            Ok(None) => {}
+                            Err(t) => return self.jit_thrown_to_sentinel(t),
+                        }
                     }
                     // B82: a `f.call(…)`/`f.apply(…)` site whose receiver is a
                     // plain user function and whose `call`/`apply` resolves to
@@ -1296,6 +1318,23 @@ impl<'p> Vm<'p> {
                 return self.jit_thrown_to_sentinel(Thrown(format!("{msg} (in {name})")));
             }
         };
+        self.jit_call_method_value(recv, key, prop, base, arg_base, argc)
+    }
+
+    /// The last step of the interpreter's `CallMethod` slow arm for an already
+    /// resolved method VALUE `prop`: the ctor-object route (`this = undefined`),
+    /// the interpreter's TypeError for a non-callable, then `call_value` with
+    /// `this = recv`. Runs to completion (the B184 contract above).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_call_method_value(
+        &mut self,
+        recv: Value,
+        key: &str,
+        prop: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> u64 {
         let this_v = if prop.is_heap()
             && matches!(self.heap.get(prop.heap_index()), HeapObj::Object(m) if m.is_ctor)
         {
@@ -1316,6 +1355,35 @@ impl<'p> Vm<'p> {
             Ok(v) => v.bits(),
             Err(t) => self.jit_thrown_to_sentinel(t),
         }
+    }
+
+    /// The function VALUE whose compiled code owns the register window at
+    /// `base` while it runs `func_id` — what the interpreter reads from the
+    /// running frame (`Frame::callee`) for lexical lookups such as private
+    /// brands. An OSR region and a frame-backed Tier-C body run ON the top frame;
+    /// a frame-free Tier-C body carves its window above it and is named by the
+    /// active Tier-C activation instead (the same identification the frame-free
+    /// closure lane uses). `None` when neither provably matches.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_running_callee(&self, func_id: u32, base: usize) -> Option<Value> {
+        if let Some(frame) = self.frames.last() {
+            if frame.func == func_id && frame.base == base {
+                return Some(frame.callee);
+            }
+        }
+        let act = self.jit_tierc_activation;
+        if !act.active
+            || act.callee == crate::vm::NO_CLOSURE
+            || act.callee as usize >= self.heap.len()
+        {
+            return None;
+        }
+        let fid = match self.heap.get(act.callee) {
+            HeapObj::Func(fid) => *fid,
+            HeapObj::Closure { func, .. } => *func,
+            _ => return None,
+        };
+        (fid == func_id).then(|| Value::heap(act.callee))
     }
 
     /// B82: inline the TARGET of `f.call(…)` / `f.apply(…)` at a region
