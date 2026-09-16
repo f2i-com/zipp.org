@@ -199,14 +199,38 @@
         silu: (x) => x / (1 + Math.exp(-x)), relu: (x) => (x > 0 ? x : 0), sqrt: Math.sqrt, square: (x) => x * x,
         abs: Math.abs, sign: (x) => (x > 0 ? 1 : x < 0 ? -1 : 0), floor: Math.floor, ceil: Math.ceil, round: (x) => { const r = Math.round(x); return (Math.abs(x % 1) === 0.5 && r % 2 !== 0) ? r - Math.sign(x) : r; },
         isfinite: (x) => (Number.isFinite(x) ? 1 : 0), isnan: (x) => (x !== x ? 1 : 0), not: (x) => (x ? 0 : 1), reciprocal: (x) => 1 / x, log1p: Math.log1p, expm1: Math.expm1,
-        gelu: (x) => 0.5 * x * (1 + erf(x / Math.SQRT2)), softplus: (x) => (x > 20 ? x : Math.log1p(Math.exp(x))), sin: Math.sin, cos: Math.cos,
+        gelu: (x) => x * cdf(x), gelu_grad: geluGrad, softplus: (x) => (x > 20 ? x : Math.log1p(Math.exp(x))), sin: Math.sin, cos: Math.cos,
     };
-    function erf(x) { const t = 1 / (1 + 0.3275911 * Math.abs(x)); const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x); return x >= 0 ? y : -y; }
+    // The standard normal CDF behind GELU (the exact-erf form, F.gelu's
+    // default), with the one erf approximation every zipp_gpu backend
+    // shares (gpu-lab's kernel-math.mjs, the Python reference's `_cdf`): an
+    // odd series for |z| < 0.5, Numerical Recipes' erfc fit above it, the
+    // lower tail from erfc directly. Same expressions, same evaluation order.
+    function erfSeries(z) {
+        const t = z * z;
+        return z * (1.1283791670955126 + t * (-0.37612638903183754 + t * (0.11283791670955126 + t * (-0.026866170645131252 +
+            t * (0.005223977625442188 + t * (-0.0008548327023450852 + t * 0.00012055332981789664))))));
+    }
+    function erfcFit(a) {
+        const t = 1 / (1 + 0.5 * a);
+        return t * Math.exp(-a * a - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 +
+            t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+    }
+    function cdf(x) {
+        const z = x * 0.7071067811865476;
+        if (Math.abs(z) < 0.5) return 0.5 + 0.5 * erfSeries(z);
+        if (z >= 10) return 1;
+        if (z <= -10) return 0;
+        const c = 0.5 * erfcFit(Math.abs(z));
+        return z > 0 ? 1 - c : c;
+    }
+    // d/dx gelu(x) = cdf(x) + x * pdf(x).
+    function geluGrad(x) { return cdf(x) + x * 0.3989422804014327 * Math.exp(-0.5 * x * x); }
     function unary(op, a, p1, p2) {
         let f = UN[op];
         if (op === "clamp") { const lo = p1 === null ? -Infinity : jsNumber(p1), hi = p2 === null ? Infinity : jsNumber(p2); f = (x) => (x < lo ? lo : x > hi ? hi : x); }
         if (f === undefined) fail(E.ValueError, "unknown op " + op);
-        const dtype = op === "isfinite" || op === "isnan" || op === "not" ? "bool" : (["exp", "log", "tanh", "sigmoid", "silu", "sqrt", "reciprocal", "log1p", "expm1", "gelu", "softplus", "sin", "cos"].includes(op) && RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype);
+        const dtype = op === "isfinite" || op === "isnan" || op === "not" ? "bool" : (["exp", "log", "tanh", "sigmoid", "silu", "sqrt", "reciprocal", "log1p", "expm1", "gelu", "gelu_grad", "softplus", "sin", "cos"].includes(op) && RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype);
         const out = alloc(dtype, a.data.length), A = a.data, O = out.data, n = O.length;
         // The hot activations and their gradients inline; the expressions
         // are the table's own.
@@ -777,29 +801,140 @@
     }
     // ---- the zipp_gpu float32 reference ------------------------------------------------------------
     // Without a host, `zipp_gpu` evaluates a graph with these: bit for bit
-    // what its pure-Python reference and the host's cpu-js backend compute.
-    // matmul rounds every partial sum to float32, a sum reduces pairwise
-    // (an odd tail adds 0), life counts toroidal neighbours above 0.5.
-    function graphMatmul(a, b, m, k, n) {
-        const out = alloc("float32", m * n), O = out.data, A = a.data, B = b.data, f = Math.fround;
-        for (let r = 0; r < m; r++) for (let c = 0; c < n; c++) {
-            let s = 0;
-            for (let j = 0, ia = r * k, ib = c; j < k; j++, ib += n) s = f(s + f(A[ia + j] * B[ib]));
-            O[r * n + c] = s;
+    // what its pure-Python reference (`execute_locally`) computes, which is
+    // the contract every backend meets. Every intermediate the reference
+    // rounds to float32 is rounded here, in the same order: a Float32Array
+    // store rounds once, `f` rounds a value the reference rounds before
+    // using it again. matmul rounds every partial sum, a whole-tensor sum
+    // reduces pairwise (an odd tail adds 0), an axis sum is `reduce`'s
+    // index-order accumulation, softmax subtracts the row maximum,
+    // exponentiates and divides by the rounded row sum, and the optimizer
+    // steps compose as `_optimizer_step` does. Transcendentals are the same
+    // `Math` functions the Python `math` module calls.
+    const f32 = Math.fround;
+    // [batch, m, k] @ [batch, k, n]; a batch stride of 0 broadcasts that
+    // operand. i-k-j order: each output element still sums its k products
+    // in k order, rounding each product and each partial sum. The product
+    // rounds through a one-element Float32Array rather than a call: on the
+    // interpreter that is the cheapest rounding, and the same value.
+    function graphMatmul(a, b, m, k, n, batch, aStride, bStride) {
+        const out = alloc("float32", batch * m * n), O = out.data, A = a.data, B = b.data, P = new Float32Array(1);
+        for (let t = 0; t < batch; t++) {
+            const ao = t * aStride, bo = t * bStride, oo = t * m * n;
+            for (let r = 0; r < m; r++) {
+                const ro = oo + r * n, ia = ao + r * k;
+                for (let j = 0; j < k; j++) {
+                    const x = A[ia + j], base = bo + j * n;
+                    for (let c = 0; c < n; c++) { P[0] = x * B[base + c]; O[ro + c] += P[0]; }
+                }
+            }
         }
         return out;
     }
-    function pairSum(a) {
-        // In place over a copy: step i reads 2i and 2i+1, never below i.
-        const work = new Float32Array(a.data);
+    // Pairwise float32 sum of `work` (a Float32Array this may overwrite):
+    // step i reads 2i and 2i+1, never below i.
+    function pairwise(work) {
         let len = work.length;
-        if (len === 0) fail(E.ValueError, "sum of an empty graph tensor");
         while (len > 1) {
             const half = Math.ceil(len / 2);
             for (let i = 0; i < half; i++) work[i] = work[2 * i] + (2 * i + 1 < len ? work[2 * i + 1] : 0);
             len = half;
         }
-        return make("float32", work.slice(0, 1));
+        return work[0];
+    }
+    function pairSum(a, mean) {
+        const n = a.data.length;
+        if (n === 0) fail(E.ValueError, "sum of an empty graph tensor");
+        const out = alloc("float32", 1), total = pairwise(new Float32Array(a.data));
+        out.data[0] = mean ? total / n : total;
+        return out;
+    }
+    // The elementwise functions of the graph protocol. relu keeps NaN (so a
+    // diverged value reaches the finite check at readback), sigmoid takes
+    // the overflow-free branch by sign, log and sqrt of a negative are NaN
+    // and log 0 is -infinity, as the reference's guarded `math` calls give.
+    function graphUnary(op, a) {
+        const out = alloc("float32", a.data.length), A = a.data, O = out.data, n = O.length;
+        switch (op) {
+            case "relu": for (let i = 0; i < n; i++) { const x = A[i]; O[i] = (x > 0 || x !== x) ? x : 0; } break;
+            case "positive": for (let i = 0; i < n; i++) O[i] = A[i] > 0 ? 1 : 0; break;
+            case "neg": for (let i = 0; i < n; i++) O[i] = -A[i]; break;
+            case "exp": for (let i = 0; i < n; i++) O[i] = Math.exp(A[i]); break;
+            case "log": for (let i = 0; i < n; i++) O[i] = Math.log(A[i]); break;
+            case "sqrt": for (let i = 0; i < n; i++) O[i] = Math.sqrt(A[i]); break;
+            case "tanh": for (let i = 0; i < n; i++) O[i] = Math.tanh(A[i]); break;
+            case "sigmoid": for (let i = 0; i < n; i++) { const x = A[i]; if (x >= 0) O[i] = 1 / (1 + Math.exp(-x)); else { const e = Math.exp(x); O[i] = e / (1 + e); } } break;
+            case "gelu": for (let i = 0; i < n; i++) { const x = A[i]; O[i] = x * cdf(x); } break;
+            case "gelu_grad": for (let i = 0; i < n; i++) O[i] = geluGrad(A[i]); break;
+            default: fail(E.ValueError, "unknown graph op " + op);
+        }
+        return out;
+    }
+    // Row maximum, NaN winning, and the float32 sum of exp(x - max) in index order.
+    function rowMax(A, base, cols) {
+        let m = A[base];
+        for (let j = 1; j < cols; j++) { const v = A[base + j]; if (v > m || v !== v) m = v; }
+        return m;
+    }
+    function rowExpSum(A, base, cols, m) {
+        let s = 0;
+        for (let j = 0; j < cols; j++) s = f32(s + f32(Math.exp(f32(A[base + j] - m))));
+        return s;
+    }
+    function graphSoftmax(a, rows, cols, log) {
+        const out = alloc("float32", a.data.length), A = a.data, O = out.data;
+        for (let r = 0, base = 0; r < rows; r++, base += cols) {
+            const m = rowMax(A, base, cols), s = rowExpSum(A, base, cols, m);
+            if (log) { const ls = f32(Math.log(s)); for (let j = base, end = base + cols; j < end; j++) O[j] = f32(A[j] - m) - ls; }
+            else for (let j = base, end = base + cols; j < end; j++) O[j] = f32(Math.exp(f32(A[j] - m))) / s;
+        }
+        return out;
+    }
+    // Mean cross-entropy of logits [rows, cols] against class targets (a
+    // float32 storage of integers), or its gradient (softmax - onehot) / rows.
+    function graphCrossEntropy(a, t, rows, cols, grad) {
+        const A = a.data, T = t.data;
+        if (!grad) {
+            const losses = new Float32Array(rows);
+            for (let r = 0, base = 0; r < rows; r++, base += cols) {
+                const m = rowMax(A, base, cols), s = rowExpSum(A, base, cols, m);
+                losses[r] = f32(Math.log(s)) - f32(A[base + T[r]] - m);
+            }
+            const out = alloc("float32", 1);
+            out.data[0] = pairwise(losses) / rows;
+            return out;
+        }
+        const out = alloc("float32", A.length), O = out.data;
+        for (let r = 0, base = 0; r < rows; r++, base += cols) {
+            const m = rowMax(A, base, cols), s = rowExpSum(A, base, cols, m), target = base + T[r];
+            for (let j = base, end = base + cols; j < end; j++) O[j] = f32(f32(f32(Math.exp(f32(A[j] - m))) / s) - (j === target ? 1 : 0)) / rows;
+        }
+        return out;
+    }
+    // One optimizer step over equal-sized storages; `s` holds the step's
+    // float32 scalars, rounded by the caller as `_optimizer_step` rounds them.
+    function graphStep(op, a, b, c, s) {
+        const out = alloc("float32", a.data.length), A = a.data, B = b.data, O = out.data, n = O.length;
+        switch (op) {
+            case "sgd_update": { const lr = s[0]; for (let i = 0; i < n; i++) O[i] = A[i] - f32(lr * B[i]); break; }
+            case "momentum_update": { const mu = s[0], w = s[1]; for (let i = 0; i < n; i++) O[i] = f32(mu * A[i]) + f32(w * B[i]); break; }
+            case "adam_m": {
+                // torch.lerp(m, grad, 1 - beta1), in the branch PyTorch takes for that weight.
+                const w = s[0], v1 = s[1];
+                if (w < 0.5) for (let i = 0; i < n; i++) O[i] = A[i] + f32(w * f32(B[i] - A[i]));
+                else for (let i = 0; i < n; i++) O[i] = B[i] - f32(f32(B[i] - A[i]) * v1);
+                break;
+            }
+            case "adam_v": { const beta = s[0], w = s[1]; for (let i = 0; i < n; i++) O[i] = f32(A[i] * beta) + f32(f32(w * B[i]) * B[i]); break; }
+            case "adam_update": {
+                // p - size * m / (sqrt(v) / bc + eps)
+                const C = c.data, size = s[0], bc = s[1], eps = s[2];
+                for (let i = 0; i < n; i++) O[i] = A[i] - f32(size * f32(B[i] / f32(f32(f32(Math.sqrt(C[i])) / bc) + eps)));
+                break;
+            }
+            default: fail(E.ValueError, "unknown optimizer step " + op);
+        }
+        return out;
     }
     function life(a, h, w) {
         const out = alloc("float32", h * w), O = out.data, A = a.data;
@@ -846,8 +981,16 @@
         fn("size", 1, (a) => BigInt(needS(a[0]).data.length));
         fn("version", 1, (a) => BigInt(needS(a[0]).version));
         fn("all_finite", 1, (a) => allFinite(needS(a[0])));
-        fn("graph_matmul", 5, (a) => graphMatmul(needS(a[0]), needS(a[1]), num(a[2]), num(a[3]), num(a[4])));
-        fn("pair_sum", 1, (a) => pairSum(needS(a[0])));
+        // graph_matmul(a, b, m, k, n, batch=1, a_batch_stride=0, b_batch_stride=0)
+        fn("graph_matmul", 8, (a) => graphMatmul(needS(a[0]), needS(a[1]), num(a[2]), num(a[3]), num(a[4]),
+            a[5] === undefined ? 1 : num(a[5]), a[6] === undefined ? 0 : num(a[6]), a[7] === undefined ? 0 : num(a[7])), 5);
+        // pair_sum(a, mean=False): the pairwise total, divided by the count when `mean`.
+        fn("pair_sum", 2, (a) => pairSum(needS(a[0]), a[1] !== undefined && rt.truth(a[1])), 1);
+        fn("graph_unary", 2, (a) => graphUnary(rt.needStr(a[0]), needS(a[1])));
+        fn("graph_softmax", 4, (a) => graphSoftmax(needS(a[0]), num(a[1]), num(a[2]), rt.truth(a[3])));
+        fn("graph_cross_entropy", 5, (a) => graphCrossEntropy(needS(a[0]), needS(a[1]), num(a[2]), num(a[3]), rt.truth(a[4])));
+        // graph_step(op, a, b, c_or_None, scalars): one optimizer update.
+        fn("graph_step", 5, (a) => { const s = a[4].items, sc = new Array(s.length); for (let i = 0; i < s.length; i++) sc[i] = jsNumber(s[i]); return graphStep(rt.needStr(a[0]), needS(a[1]), needS(a[2]), a[3] === null ? null : needS(a[3]), sc); });
         fn("life", 3, (a) => life(needS(a[0]), num(a[1]), num(a[2])));
         fn("fill", 2, (a) => { const s = needS(a[0]); s.data.fill(castValue(s.dtype, num(a[1]))); written(s); return null; });
         fn("copy_into", 2, (a) => {

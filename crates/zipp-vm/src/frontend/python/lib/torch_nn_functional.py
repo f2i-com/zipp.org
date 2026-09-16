@@ -108,8 +108,11 @@ def relu(x, inplace=False):
 
 
 def gelu(x, approximate="none"):
-    if approximate == "none" and torch._graph_recording and getattr(x, "_zipp_graph", False):
-        return x.gelu()
+    if approximate == "none":
+        # PyTorch's default: the exact-erf form (eager kernel or graph op).
+        return torch._gelu(x)
+    if approximate != "tanh":
+        raise RuntimeError("approximate argument must be either none or tanh.")
     # The tanh form; a graph tensor composes it from recorded operations.
     return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x * x * x)))
 

@@ -1271,6 +1271,15 @@ def silu(a):
     return _unary("silu", a, "Silu", lambda g, x, o: mul(g, _silu_grad(x)))
 
 
+def _gelu(a):
+    """The exact-erf GELU, F.gelu's default: x * cdf(x), with the derivative
+    cdf(x) + x * pdf(x) for autograd. Under a compiled graph it records the
+    protocol's gelu, whose gradient is the same closed form."""
+    if _graph_recording and getattr(a, "_zipp_graph", False):
+        return a.gelu()
+    return _unary("gelu", a, "Gelu", lambda g, x, o: mul(g, _unary_nograd("gelu_grad", x)))
+
+
 def _silu_grad(x):
     s = sigmoid(x.detach())
     return mul(s, add(1, mul(x.detach(), sub(1, s))))
