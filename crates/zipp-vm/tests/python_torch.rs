@@ -471,3 +471,153 @@ print(adam.state[id(model.weight)]['step'], torch.equal(model.weight, before))
         ]
     );
 }
+
+#[test]
+fn graph_kernels_match_the_float32_reference_bit_for_bit() {
+    // Every operation family of graph protocol version 2, run through the
+    // tensor kernels (`_execute_kernels`, the native path without a host) and
+    // through the pure-Python float32 reference (`execute_locally`) in the same
+    // program: identical float32 storage bytes for every output, signed zeros
+    // included. This is the contract behind `tools/python_corpus.py`, whose
+    // programs print graph results under CPython and Zipp alike.
+    let out = run(r#"
+from zipp_gpu import Graph, execute_locally, _execute_kernels
+import _zipp_tensor as _k
+
+state = [11]
+def lcg(n, scale, offset=0.0):
+    out = []
+    for _ in range(n):
+        state[0] = (state[0] * 1103515245 + 12345) % 2147483648
+        out.append(round((state[0] / 2147483648 * 2 - 1) * scale + offset, 5))
+    return out
+
+def check(family, g, **outputs):
+    kern = _execute_kernels(g._program(outputs), True)
+    ref = execute_locally(g.program(**outputs))
+    seen = []
+    for name in outputs:
+        k, r = kern["outputs"][name], ref["outputs"][name]
+        assert k["shape"] == r["shape"], (family, name, k["shape"], r["shape"])
+        assert isinstance(k["data"], _k.Storage) and _k.size(k["data"]) == len(r["data"]), (family, name)
+        assert _k.tobytes(k["data"]) == _k.tobytes(_k.from_flat("float32", r["data"])), (family, name, _k.to_list(k["data"])[:6], r["data"][:6])
+        assert all(k["data"] is not other for other in seen), (family, name, "shared storage")
+        seen.append(k["data"])
+    assert kern["stats"] == ref["stats"] and kern["backend"] == ref["backend"], family
+    print(family, "identical", len(outputs))
+
+g = Graph()
+col, row = g.tensor(lcg(64, 3.0), (64, 1)), g.tensor(lcg(10, 2.0), (1, 10))
+mat, bias = g.tensor(lcg(640, 1.0), (64, 10)), g.tensor(lcg(10, 0.5))
+cube, plane = g.tensor(lcg(24, 2.0), (2, 3, 4)), g.tensor(lcg(3, 1.0, 1.5), (3, 1))
+check("broadcast", g, strided=col - row, tiled=mat + bias, mid=cube * plane, scalar=2.0 / (mat * mat + 1.0),
+      ratio=col / row, flipped=row - col, negzero=-(mat * 0.0), minus=mat * -1.0, same=mat - mat, div=(cube + 5.0) / (plane * 2.0))
+
+g = Graph()
+x = g.tensor(lcg(97, 6.0) + [0.0, -0.0, 1e-4, -1e-4, 5.9, -5.9])
+check("unary", g, exp=x.exp(), log=(x * x + 1.0).log(), sqrt=(x * x).sqrt(), tanh=x.tanh(), sigmoid=x.sigmoid(),
+      gelu=x.gelu(), gelu_grad=x.gelu_grad(), relu=x.relu(), positive=x.positive(), neg=-x)
+
+g = Graph()
+t = g.tensor(lcg(60, 4.0), (3, 4, 5))
+scalar = g.tensor(2.5)
+check("reduce", g, whole=t.sum(), whole_mean=t.mean(), keep=t.sum(keepdim=True), keep_mean=t.mean(keepdim=True),
+      s0=t.sum(0), s1=t.sum(1), s2=t.sum(2), s1k=t.sum(1, keepdim=True), m0=t.mean(0), m2k=t.mean(-1, keepdim=True),
+      rank0=scalar.sum(0), rank0k=scalar.mean(0, keepdim=True), vec=g.tensor(lcg(13, 9.0)).sum(0))
+
+g = Graph()
+logits, small, deep = g.tensor(lcg(60, 5.0), (6, 10)), g.tensor(lcg(7, 3.0)), g.tensor(lcg(24, 4.0), (2, 3, 4))
+check("softmax", g, sm=logits.softmax(), lsm=logits.log_softmax(), sm1=small.softmax(), lsm1=small.log_softmax(),
+      sm3=deep.softmax(), lsm3=deep.log_softmax(-1))
+
+g = Graph()
+a, b = g.tensor(lcg(192, 1.0), (8, 24)), g.tensor(lcg(144, 1.0), (24, 6))
+a3, b3, b2 = g.tensor(lcg(24, 1.5), (2, 3, 4)), g.tensor(lcg(40, 1.5), (2, 4, 5)), g.tensor(lcg(20, 1.5), (4, 5))
+a1, a2 = g.tensor(lcg(12, 1.5), (1, 3, 4)), g.tensor(lcg(12, 1.5), (3, 4))
+check("matmul", g, plain=a @ b, batched=a3 @ b3, right_matrix=a3 @ b2, left_matrix=a2 @ b3, left_one=a1 @ b3, chained=(a @ b).T @ a)
+
+g = Graph()
+logits = g.tensor(lcg(60, 5.0), (6, 10))
+targets = [3, 0, 9, 4, 4, 7]
+check("cross_entropy", g, loss=logits.cross_entropy(targets), grad=logits.cross_entropy_grad(targets),
+      loss1=(logits * 3.0).cross_entropy(targets), grad1=(logits * 3.0).cross_entropy_grad(targets))
+
+g = Graph()
+raw = g.tensor(lcg(24, 2.0), (2, 3, 4))
+storage_input = g.tensor(_k.from_flat("float32", lcg(6, 2.0)), (2, 3))
+check("shape", g, perm=raw.permute(2, 0, 1), swapped=raw.transpose(0, 2), flat=raw.reshape(4, 6), inferred=raw.reshape(-1),
+      matrix_t=storage_input.T, raw=raw, again=raw, view=raw.reshape(24), stored=storage_input, stored_view=storage_input.reshape(6))
+
+g = Graph()
+p, grad = g.tensor(lcg(40, 1.0), (5, 8)), g.tensor(lcg(40, 0.3), (5, 8))
+m, v = g.tensor(lcg(40, 0.1), (5, 8)), g.tensor([abs(x) for x in lcg(40, 0.01)], (5, 8))
+p1, m1, v1 = g.adam(p, grad, m, v, lr=0.01, step=1)
+p7, m7, v7 = g.adam(p1, grad, m1, v1, lr=0.001, betas=(0.9, 0.999), eps=1e-8, step=7)
+pb, mb, vb = g.adam(p, grad, m, v, lr=0.05, betas=(0.3, 0.5), eps=0.0, step=3)
+buf = g.momentum_update(m, grad, 0.9, dampening=0.1)
+check("optimizer", g, sgd=g.sgd_update(p, grad, 0.1), decayed=g.sgd_update(p, grad + p * 0.01, 0.05), buf=buf,
+      nesterov=g.sgd_update(p, grad + buf * 0.9, 0.05), p1=p1, m1=m1, v1=v1, p7=p7, m7=m7, v7=v7, pb=pb, mb=mb, vb=vb)
+
+# A whole training step: dense layers, GELU, fused cross-entropy, Adam.
+g = Graph()
+xs, ys = g.tensor(lcg(36, 1.0), (9, 4)), [i % 3 for i in range(9)]
+w1, b1, w2, b2 = g.tensor(lcg(24, 0.5), (4, 6)), g.tensor(lcg(6, 0.1)), g.tensor(lcg(18, 0.5), (6, 3)), g.tensor(lcg(3, 0.1))
+pre = xs @ w1 + b1
+hidden = pre.gelu()
+logits = hidden @ w2 + b2
+delta = logits.cross_entropy_grad(ys)
+back = (delta @ w2.T) * pre.gelu_grad()
+grads = [xs.T @ back, back.sum(0), hidden.T @ delta, delta.sum(0)]
+outputs = {"loss": logits.cross_entropy(ys), "probs": logits.softmax(), "lsm": logits.log_softmax().mean(1, keepdim=True)}
+for i, (param, gr) in enumerate(zip([w1, b1, w2, b2], grads)):
+    outputs["p%d" % i], outputs["m%d" % i], outputs["v%d" % i] = g.adam(param, gr, g.zeros(param.shape), g.zeros(param.shape), lr=0.05, step=1)
+check("training_step", g, **outputs)
+"#)
+    .unwrap();
+    assert_eq!(
+        out,
+        [
+            "broadcast identical 10",
+            "unary identical 10",
+            "reduce identical 13",
+            "softmax identical 6",
+            "matmul identical 6",
+            "cross_entropy identical 4",
+            "shape identical 10",
+            "optimizer identical 13",
+            "training_step identical 15"
+        ]
+    );
+}
+
+#[test]
+fn eager_gelu_default_is_the_exact_erf_form_and_tanh_matches_pytorch() {
+    // Golden values from CPU PyTorch 2.11 (`py -3.11`): F.gelu with the
+    // default approximate="none" (exact erf) and approximate="tanh", forward
+    // and backward, on the same points. The erf approximation the kernels
+    // share is good to about 1e-7, so 2e-6 separates the two forms (they
+    // differ by up to 4e-4 here) without demanding libm equality.
+    let out = run(r#"
+import torch
+import torch.nn.functional as F
+points = [-3.0, -1.5, -0.5, 0.0, 0.25, 0.75, 2.0, 4.0]
+expected = {
+    "none": ([-0.0040502, -0.1002109, -0.1542688, 0.0, 0.1496766, 0.5800295, 1.9544997, 3.9998736],
+             [-0.0119456, -0.1274692, 0.1325049, 0.5, 0.6953733, 0.9992258, 1.0852319, 1.0005037]),
+    "tanh": ([-0.0036374, -0.1004284, -0.154286, 0.0, 0.1496754, 0.5799606, 1.9545977, 3.9999299],
+             [-0.0115842, -0.1277108, 0.1326301, 0.5, 0.6953541, 0.9989383, 1.0860993, 1.000335]),
+}
+for form, (values, grads) in expected.items():
+    x = torch.tensor(points, requires_grad=True)
+    y = F.gelu(x) if form == "none" else F.gelu(x, approximate=form)
+    y.sum().backward()
+    worst = max(max(abs(a - b) for a, b in zip(y.tolist(), values)), max(abs(a - b) for a, b in zip(x.grad.tolist(), grads)))
+    print(form, worst < 2e-6, torch.allclose(torch.nn.GELU(approximate=form)(x), y))
+try:
+    F.gelu(torch.ones(2), approximate="foo")
+except RuntimeError as error:
+    print(error)
+"#)
+    .unwrap();
+    assert_eq!(out, ["none True True", "tanh True True", "approximate argument must be either none or tanh."]);
+}

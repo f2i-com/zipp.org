@@ -907,25 +907,41 @@ def _host_data(data, storage):
     return _k.from_flat("float32", data) if storage else [float(v) for v in data]
 
 
-# The operations the tensor kernels compute float32-identically to the
-# reference below. Everything the second protocol version added — broadcasting
-# past a scalar, axis reductions, softmax, cross-entropy, the optimizer steps,
-# batched matmul — takes the reference path instead, so a graph produces the
-# same numbers whichever path runs it.
+def _step_scalars(op, node):
+    """The float32 scalars of one optimizer step, rounded exactly as
+    `_optimizer_step` rounds them (the same expressions, so the same values)."""
+    if op == "sgd_update":
+        return (_f32(node["lr"]),)
+    if op == "momentum_update":
+        return (_f32(node["momentum"]), _f32(1 - node["dampening"]))
+    if op == "adam_m":
+        w = _f32(1 - node["beta1"])
+        return (w, _f32(1 - w))
+    if op == "adam_v":
+        return (_f32(node["beta2"]), _f32(1 - node["beta2"]))
+    step = node["step"]
+    return (_f32(node["lr"] / (1 - node["beta1"] ** step)), _f32(math.sqrt(1 - node["beta2"] ** step)), _f32(node["eps"]))
+
+
+# Every operation of both protocol versions runs on the tensor kernels, which
+# compute float32-identically to the reference above: the kernels round each
+# intermediate the reference rounds, in the same order (see tensor.js). An
+# operation outside this set takes the reference path, which rejects it.
+_KERNEL_UNARY = frozenset(("relu", "positive", "neg", "exp", "log", "sqrt", "tanh", "sigmoid", "gelu", "gelu_grad"))
+_KERNEL_STEPS = frozenset(("sgd_update", "momentum_update", "adam_m", "adam_v", "adam_update"))
 _KERNEL_OPS = frozenset((
-    "input", "full", "add", "sub", "mul", "relu", "positive", "transpose",
-    "sum", "matmul", "life",
-))
+    "input", "full", "add", "sub", "mul", "div", "transpose", "permute", "reshape", "sum", "mean",
+    "softmax", "log_softmax", "cross_entropy", "cross_entropy_grad", "matmul", "life",
+)) | _KERNEL_UNARY | _KERNEL_STEPS
 
 
 def _execute_kernels(program, storage, check_finite=True):
     """`execute_locally` on Zipp's tensor kernels: the same float32 numbers."""
-    if (program.get("version") != 1
+    if (program.get("version") not in (1, 2)
             or any(node.get("op") not in _KERNEL_OPS for node in program.get("nodes", ()))):
         return _execute_reference(program, storage, check_finite)
     values = []
     shapes = []
-    zero = None
     for node in program["nodes"]:
         op = node["op"]
         if op == "input":
@@ -935,29 +951,53 @@ def _execute_kernels(program, storage, check_finite=True):
         elif op == "full":
             shape = tuple(node["shape"])
             out = _k.full("float32", _size(shape), node["value"])
-        elif op in ("add", "sub", "mul"):
+        elif op in _BINARY:
             a, b = node["a"], node["b"]
-            shape = shapes[b] if not shapes[a] else shapes[a]
-            out = _k.binary(op, values[a], shapes[a], values[b], shapes[b])[0]
-        elif op == "relu":
+            out, shape = _k.binary(op, values[a], shapes[a], values[b], shapes[b])
+        elif op in _KERNEL_UNARY:
             shape = shapes[node["a"]]
-            out = _k.unary("relu", values[node["a"]])
-        elif op == "positive":
+            out = _k.graph_unary(op, values[node["a"]])
+        elif op in ("sum", "mean"):
+            a = node["a"]
+            sa = shapes[a]
+            if "axis" not in node or not sa:
+                # The whole tensor (pairwise), or the one element of a scalar.
+                shape = tuple(1 for _ in sa) if node.get("keepdim") else ()
+                out = _k.pair_sum(values[a], op == "mean")
+            else:
+                out, shape = _k.reduce(op, values[a], sa, (node["axis"],), bool(node.get("keepdim")))
+        elif op in ("softmax", "log_softmax"):
             shape = shapes[node["a"]]
-            if zero is None:
-                zero = _k.zeros("float32", 1)
-            out = _k.astype(_k.binary("gt", values[node["a"]], shape, zero, ())[0], "float32")
+            cols = shape[-1]
+            out = _k.graph_softmax(values[node["a"]], _size(shape) // cols, cols, op == "log_softmax")
+        elif op in ("cross_entropy", "cross_entropy_grad"):
+            sa = shapes[node["a"]]
+            shape = sa if op == "cross_entropy_grad" else ()
+            out = _k.graph_cross_entropy(values[node["a"]], values[node["b"]], sa[0], sa[1], op == "cross_entropy_grad")
         elif op == "transpose":
             h, w = shapes[node["a"]]
             shape = (w, h)
             out = _k.permute(values[node["a"]], (h, w), (1, 0))[0]
-        elif op == "sum":
-            shape = ()
-            out = _k.pair_sum(values[node["a"]])
+        elif op == "permute":
+            out, shape = _k.permute(values[node["a"]], shapes[node["a"]], tuple(node["dims"]))
+        elif op == "reshape":
+            shape = tuple(node["shape"])
+            out = values[node["a"]]
         elif op == "matmul":
-            (m, k), (_, n) = shapes[node["a"]], shapes[node["b"]]
-            shape = (m, n)
-            out = _k.graph_matmul(values[node["a"]], values[node["b"]], m, k, n)
+            sa, sb = shapes[node["a"]], shapes[node["b"]]
+            m, k, n = sa[-2], sa[-1], sb[-1]
+            if len(sa) == 2 and len(sb) == 2:
+                shape = (m, n)
+                out = _k.graph_matmul(values[node["a"]], values[node["b"]], m, k, n)
+            else:
+                ba, bb = (sa[0] if len(sa) == 3 else 1), (sb[0] if len(sb) == 3 else 1)
+                shape = (max(ba, bb), m, n)
+                out = _k.graph_matmul(values[node["a"]], values[node["b"]], m, k, n, shape[0],
+                                      m * k if ba > 1 else 0, k * n if bb > 1 else 0)
+        elif op in _KERNEL_STEPS:
+            shape = shapes[node["a"]]
+            out = _k.graph_step(op, values[node["a"]], values[node["b"]], values[node["c"]] if "c" in node else None,
+                                _step_scalars(op, node))
         elif op == "life":
             shape = shapes[node["a"]]
             out = _k.life(values[node["a"]], shape[0], shape[1])
@@ -966,7 +1006,9 @@ def _execute_kernels(program, storage, check_finite=True):
         values.append(out)
         shapes.append(shape)
     outputs = {}
-    delivered = set()
+    # Each output owns its storage, as a host's copies do: never another
+    # output's, nor the graph's recorded input (a reshape passes storage on).
+    owned = [node.get("data") for node in program["nodes"] if node["op"] == "input"]
     readback = 0
     for o in program["outputs"]:
         data = values[o["id"]]
@@ -975,11 +1017,10 @@ def _execute_kernels(program, storage, check_finite=True):
         readback += _k.size(data)
         if not storage:
             data = _k.to_list(data)
-        elif o["id"] in delivered or data is program["nodes"][o["id"]].get("data"):
-            # Each output owns its storage, as a host's copies do: never
-            # another output's, nor the graph's recorded input.
-            data = _k.copy(data)
-        delivered.add(o["id"])
+        else:
+            if any(data is other for other in owned):
+                data = _k.copy(data)
+            owned.append(data)
         outputs[o["name"]] = {"shape": list(shapes[o["id"]]), "dtype": "float32", "data": data}
     return {"version": 1, "backend": "cpu-python", "outputs": outputs,
             "stats": {"nodes": len(values), "readbackElements": readback}}
