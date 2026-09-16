@@ -1196,7 +1196,10 @@ impl Engine {
     /// Drain the program's pending host requests: an array of
     /// `{id, kind, payload}` records, each a piece of work the program asked
     /// its embedder to do (`kind` `"gpu.execute"` carries a compute graph as
-    /// `payload`). Answer one with
+    /// `payload`; `"gpu.session.create"`, `"gpu.session.run"`,
+    /// `"gpu.session.download"` and `"gpu.session.dispose"` drive a prepared
+    /// session whose tensors stay on the device; the runtime raises no other
+    /// kind). Answer one with
     /// `pythonCall("__zipp_py_deliver", [id, reply])`, where `reply` is
     /// `{ok: true, value}` or `{ok: false, error: {code, message}}`; the
     /// program's callback for that request then runs inside that call. A

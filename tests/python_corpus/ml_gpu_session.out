@@ -1,0 +1,20 @@
+session cpu-python ready 1 feeds ('x', 'y') resident 12 step 1
+fed inputs without data [0, 1] carried 12 nodes 44
+per-run outputs ['loss', 'predicted'] steps [1, 2, 3]
+batched steps [4, 5, 6, 7, 8] next step 9 9
+loss x1000 [1119, 993, 886, 840, 755, 624, 587, 447]
+session equals chained, bit for bit: True True
+downloaded ['m0', 'p0', 'p1', 'p2', 'p3', 'v3'] [[4, 6], [6], [6, 3], [3]]
+weights equal chained: True True True
+fell True correct 9 of 9
+restarted at 1 next 2
+unknown feed -> GraphError: 'z' is not a feed of this session
+wrong length -> GraphError: Input x length does not match shape in step 0
+class index out of range -> GraphError: y must hold integer class indices in [0, 3)
+missing feed -> ComputeError: REFERENCE
+download of a non-resident -> GraphError: loss is not a resident output
+carry into the targets -> GraphError: carry p0 does not match the input shape
+carry shape -> GraphError: carry p1 does not match the input shape
+resident that is not an output -> GraphError: A resident tensor must be one of the outputs
+a backend the reference is not -> ComputeError: BACKEND
+after dispose -> DISPOSED

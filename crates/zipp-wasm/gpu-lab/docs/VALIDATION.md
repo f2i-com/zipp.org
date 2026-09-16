@@ -9,8 +9,9 @@ Current checks are separated by what they establish:
 
 | Check | Coverage |
 |---|---|
-| `npm test` in gpu-lab | JS/WASM numerical behavior, validators, adapter contracts, WebGPU lifecycle mocks, WebGL texture-budget bookkeeping, IR v2 differentials and finite-difference gradients |
-| `py -3.13 tests/test_python.py` | Native Python graph construction/export and the `execute_locally` float32 reference |
+| `npm test` in gpu-lab | JS/WASM numerical behavior, validators, adapter contracts, WebGPU lifecycle mocks, WebGL texture-budget bookkeeping, IR v2 differentials and finite-difference gradients; prepared sessions (`tests/sessions.test.mjs`: five Adam steps through a session equal five chained `execute()` calls bit for bit on cpu-js and WASM, carry/feed/resident validation, budgets and lifetime; the WebGPU mock pins one submit per multi-step run, resident buffers out of the pool and flat bind-group creation; the adapters pin opaque session ids and per-tenant disposal) |
+| `py -3.13 tests/test_python.py` | Native Python graph construction/export, the `execute_locally` float32 reference, and `Graph.prepare` sessions on the reference path (equal to chained submits bit for bit, and to a Node cpu-js session within 2.5e-7 relative) |
+| `py -3.13 tools/python_corpus.py` (repository root, default and `ZIPP_PY_NOFAST=1`) | `tests/python_corpus/ml_gpu_session.py`: the same session program under CPython and native `zipp py`, byte-identical output |
 | `node ../tests/node/python-frontend.cjs` | Actual Python-enabled WASM ABI, projects, VFS mutations and dictionary conversion |
 | `node ../tests/node/python-gpu.cjs` | Actual Python-to-host graph requests and JS/WASM evaluation |
 | `python scripts/browser_smoke.py`, `REQUIRE_GPU=1` | Every IR v2 case on real WebGPU/WebGL2 hardware against the JavaScript reference, plus an MNIST-scale training step; writes `docs/browser-validation.json` |
@@ -44,6 +45,49 @@ Shader compilation, transfers, driver memory and thermal/load differences affect
 results. `maxLogicalBytes` and WebGL's explicit texture-byte ceiling are different
 budgets; neither measures the entire browser's memory usage.
 
+## Prepared sessions — 16 September 2026
+
+Same machine, browser and adapters as the acceptance below; raw evidence in
+`docs/browser-validation.json` (`training[*].executeTypedWarmMedianMs`,
+`sessionOneStepWarmMedianMs`, `sessionEightStepsPerStepMedianMs`,
+`sessionVsChainedMaxAbsError`). One 784-256-10, batch-64 Adam step, typed
+outputs throughout, warm medians of 10 runs (8-step runs: median of 5 runs,
+divided by 8):
+
+| backend | (a) `execute()`, every output back | (b) session, 1 step per run, loss back | (c) session, 8 steps per run, per step | 5 session steps vs 5 chained executes |
+|---|---|---|---|---|
+| WebGPU (RTX 5090) | 7.50 ms | 3.60 ms | 0.79 ms | max abs error 0 |
+| WebGL2 (ANGLE/D3D11) | 6.20 ms | 1.10 ms | 0.81 ms | 0 |
+| WASM (SIMD, in-worker) | 3.30 ms | 1.70 ms | 1.64 ms | 0 |
+| cpu-js | 27.1 ms | 35.6 ms | 23.4 ms | 0 |
+
+What each layer removed on WebGPU, against the 6.6 ms measured before this
+work (validate 1.3 ms, record 0.5 ms, Chrome's submit-to-completion wait
+~2.6-2.9 ms, GPU work ~0.4 ms, 2.4 MB readback ~1.5 ms):
+
+- **prepare once** removes `validateProgram` and the input copies from every
+  step (1.3 ms), and the pre-created pipelines/bind groups plus the dynamic
+  uniform offsets remove most of the recording (0.5 ms; warm runs create no
+  bind group at all);
+- **carried tensors** remove the 2.4 MB readback and the 1 MB re-upload of
+  weights and moments (1.5 ms plus upload); a step uploads 200 KB of `x` and
+  targets and reads back four bytes;
+- **one submit for eight steps** amortizes the one cost that cannot be
+  removed from JavaScript: any await that waits for GPU work to finish (a
+  `mapAsync`, or `onSubmittedWorkDone` after a real dispatch) returns after
+  ~2.6 ms in this Chrome, while `popErrorScope` and an empty submit cost
+  0.1 ms (probe: `submit + mapAsync` 2.60 ms, `submit + onSubmittedWorkDone`
+  0.10 ms). A one-step run is therefore floor-bound at 2.6 + ~0.4 GPU + ~0.6
+  host ms; eight steps per run land at 0.79 ms per step, 32 at 0.88 ms.
+
+The session numbers are bit-identical to chained `execute()` calls on every
+backend here because a session dispatches the same kernels in the same order;
+the tolerance the harness allows for GPUs (`compare`) was not needed.
+WebGL2's `readPixels` is synchronous, so it has no completion-latency floor
+(a two-node session run is 0.2 ms) and gains most from a session at one step
+per run. cpu-js sessions are not faster than `execute()`: it never had a
+transfer cost to remove, and the WASM arena gains only the validation.
+
 ## Graph IR v2 acceptance — 16 September 2026
 
 Windows 11 / Chrome 153.0.8010.47 headless (`--force_high_performance_gpu`) /
@@ -55,7 +99,7 @@ hardware. Raw evidence: `docs/browser-validation.json`.
 Reproduce with `REQUIRE_GPU=1 python scripts/browser_smoke.py` from this directory
 (add `--headed` to watch it).
 
-- **226 Node tests** (`npm test`) and **23 native Python tests**
+- **246 Node tests** (`npm test`) and **28 native Python tests**
   (`py -3.13 tests/test_python.py`) passed. These include a cpu-js-versus-WASM
   differential over every operation — each binary op across ten broadcasting
   shape pairs including rank-4, scalar and size-1 axes; each unary op at lengths

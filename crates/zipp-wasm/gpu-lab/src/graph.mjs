@@ -8,6 +8,9 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxOutputElements: 4194304, maxLogicalBytes: 64 * 1024 * 1024,
   maxWork: 100000000, maxDimension: 65536, maxOutputs: 64,
   maxWebGLTextureBytes: 128 * 1024 * 1024,
+  // Prepared sessions (`runtime.prepare`): how many one runtime keeps, and how
+  // many training steps one `session.run` may submit as one command buffer.
+  maxSessions: 16, maxStepsPerRun: 64,
 });
 /** Highest tensor rank. Kernels address every tensor as four padded dimensions. */
 export const MAX_RANK = 4;
@@ -54,7 +57,7 @@ function finiteF32(v) {
   return Math.fround(v);
 }
 /** An owned float32 copy of a flat number array, holes and non-finite values rejected. */
-function float32Data(data) {
+export function float32Data(data) {
   const out = new Float32Array(data.length);
   for (let i = 0; i < data.length; i++) {
     const v = data[i];
@@ -63,6 +66,13 @@ function float32Data(data) {
     if (!Number.isFinite(out[i])) finiteF32(v); // NaN, infinity, or float32 overflow
   }
   return out;
+}
+/** Cross-entropy targets are indices: every value an integer in [0, classes). */
+export function checkClassTargets(data, classes, op = 'cross_entropy') {
+  for (let i = 0; i < data.length; i++) {
+    const t = data[i];
+    check(Number.isInteger(t) && t >= 0 && t < classes, 'NUMBER', `${op} targets must be an input of integer class indices in [0, C)`);
+  }
 }
 function sameShape(a, b) { return a.length === b.length && a.every((v, i) => v === b[i]); }
 /** Contiguous row-major strides, padded on the left to four dimensions. */
@@ -96,9 +106,22 @@ function axisOf(raw, rank) {
   check(Number.isSafeInteger(raw) && raw >= -Math.max(rank, 1) && raw < Math.max(rank, 1), 'SHAPE', 'Axis is out of range');
   return raw < 0 ? raw + rank : raw;
 }
+/** Adam's bias-corrected scalars for `step`, from the program's own doubles. */
+export function adamStep({lr, beta1, beta2}, step) {
+  check(Number.isSafeInteger(step) && step >= 1 && step <= 2 ** 31, 'NUMBER', 'step must be a positive integer');
+  const bc1 = 1 - Math.pow(beta1, step), bc2 = 1 - Math.pow(beta2, step);
+  const stepSize = finiteF32(lr / bc1), bc2Sqrt = finiteF32(Math.sqrt(bc2));
+  check(bc2Sqrt > 0, 'NUMBER', 'beta2 bias correction underflows float32');
+  return {step, stepSize, bc2Sqrt};
+}
 const OPTIMIZER_FIELDS = {sgd_update: ['lr'], momentum_update: ['momentum', 'dampening'],
   adam_m: ['beta1'], adam_v: ['beta2'], adam_update: ['lr', 'beta1', 'beta2', 'eps', 'step']};
-export function validateProgram(program, overrides = {}) {
+/**
+ * `session` (a prepared plan): an `input` node may omit `data` (it is fed at
+ * each `session.run`) and may name a program output as `carry`, whose value
+ * becomes the input's for the next step. Plain `execute()` accepts neither.
+ */
+export function validateProgram(program, overrides = {}, {session = false} = {}) {
   keys(overrides, Object.keys(DEFAULT_LIMITS));
   for (const v of Object.values(overrides)) check(Number.isSafeInteger(v) && v > 0,
     'LIMIT', 'Limits must be positive safe integers');
@@ -117,7 +140,7 @@ export function validateProgram(program, overrides = {}) {
     const raw = program.nodes[id];
     // Validate op before looking up a kernel; identifiers never become code.
     keys(raw, ['id', 'op', 'shape', 'data', 'value', 'a', 'b', 'c', 'axis', 'keepdim', 'dims',
-      'lr', 'momentum', 'dampening', 'beta1', 'beta2', 'eps', 'step'], ['id', 'op']);
+      'lr', 'momentum', 'dampening', 'beta1', 'beta2', 'eps', 'step', 'carry'], ['id', 'op']);
     check(raw.id === id, 'PROTOCOL', 'Node IDs must be consecutive integers starting at zero');
     const n = {id, op: raw.op, refs: []};
     const ref = key => {
@@ -155,16 +178,23 @@ export function validateProgram(program, overrides = {}) {
       units = a.size * 2;
     } else switch (op) {
       case 'input':
-        keys(raw, ['id', 'op', 'shape', 'data'], ['shape', 'data']);
+        keys(raw, session ? ['id', 'op', 'shape', 'data', 'carry'] : ['id', 'op', 'shape', 'data'], session ? ['shape'] : ['shape', 'data']);
         n.shape = shapeOf(raw.shape, limits);
-        // A flat list of numbers, or a Float32Array (a ZIPP engine's binary
-        // tensor transport): owned by the plan either way, and checked in
-        // one pass for the typed form, whose elements are float32 already.
-        check((raw.data instanceof Float32Array || Array.isArray(raw.data)) && raw.data.length === sizeOf(n.shape),
-          'SHAPE', 'Flat input length does not match shape');
-        inputElements += raw.data.length;
-        check(inputElements <= limits.maxInputElements, 'LIMIT', 'Total input exceeds limit');
-        n.data = float32Data(raw.data); break;
+        if (session && Object.hasOwn(raw, 'carry')) {
+          check(typeof raw.carry === 'string', 'PROTOCOL', 'carry must name an output');
+          n.carry = raw.carry; // checked against the outputs below
+        }
+        if (Object.hasOwn(raw, 'data')) {
+          // A flat list of numbers, or a Float32Array (a ZIPP engine's binary
+          // tensor transport): owned by the plan either way, and checked in
+          // one pass for the typed form, whose elements are float32 already.
+          check((raw.data instanceof Float32Array || Array.isArray(raw.data)) && raw.data.length === sizeOf(n.shape),
+            'SHAPE', 'Flat input length does not match shape');
+          inputElements += raw.data.length;
+          check(inputElements <= limits.maxInputElements, 'LIMIT', 'Total input exceeds limit');
+          n.data = float32Data(raw.data);
+        } else n.fed = true; // no initial value: every session run supplies one
+        break;
       case 'full':
         keys(raw, ['id', 'op', 'shape', 'value'], ['shape', 'value']);
         n.shape = shapeOf(raw.shape, limits); n.value = finiteF32(raw.value); break;
@@ -216,8 +246,13 @@ export function validateProgram(program, overrides = {}) {
         check(a.shape.length === 2 && b.shape.length === 1 && b.shape[0] === a.shape[0],
           'SHAPE', `${op} requires logits [N,C] and class targets [N]`);
         // Targets are data, checked here: every kernel may then index with them.
-        check(b.op === 'input' && b.data.every(t => Number.isInteger(t) && t >= 0 && t < a.shape[1]),
-          'NUMBER', `${op} targets must be an input of integer class indices in [0, C)`);
+        // A fed target input is checked at each upload instead (`classes`).
+        check(b.op === 'input' && b.carry === undefined, 'NUMBER', `${op} targets must be an input of integer class indices in [0, C)`);
+        if (b.data) checkClassTargets(b.data, a.shape[1], op);
+        else {
+          check(b.classes === undefined || b.classes === a.shape[1], 'SHAPE', `${op} targets are shared by logits of different widths`);
+          b.classes = a.shape[1];
+        }
         n.rows = a.shape[0]; n.cols = a.shape[1];
         n.shape = op === 'cross_entropy' ? [] : [...a.shape]; units = a.size * 4; break;
       }
@@ -236,11 +271,11 @@ export function validateProgram(program, overrides = {}) {
         if (op === 'adam_update') {
           check(Number.isSafeInteger(raw.step) && raw.step >= 1 && raw.step <= 2 ** 31, 'NUMBER', 'step must be a positive integer');
           check(raw.eps >= 0, 'NUMBER', 'eps must be non-negative');
-          n.step = raw.step;
           // Bias corrections are host constants, so no backend evaluates pow.
-          const bc1 = 1 - Math.pow(raw.beta1, n.step), bc2 = 1 - Math.pow(raw.beta2, n.step);
-          n.stepSize = finiteF32(raw.lr / bc1); n.bc2Sqrt = finiteF32(Math.sqrt(bc2));
-          check(n.bc2Sqrt > 0, 'NUMBER', 'beta2 bias correction underflows float32');
+          // The program's own doubles stay on the node: a session advancing
+          // the step recomputes them exactly as a fresh program would.
+          n.raw = Object.freeze({lr: raw.lr, beta1: raw.beta1, beta2: raw.beta2});
+          Object.assign(n, adamStep(n.raw, raw.step));
         }
         n.shape = [...inputs[0].shape]; units = inputs[0].size * 8; break;
       }
@@ -251,7 +286,7 @@ export function validateProgram(program, overrides = {}) {
     logicalBytes += n.size * 4; work += units || n.size;
     check(logicalBytes <= limits.maxLogicalBytes && work <= limits.maxWork,
       'LIMIT', 'Graph exceeds allocation or work budget');
-    nodes.push(Object.freeze(n));
+    nodes.push(n);
   }
   const names = new Set(); let outputElements = 0;
   const outputs = Array.from({length: program.outputs.length}, (_, i) => {
@@ -266,10 +301,18 @@ export function validateProgram(program, overrides = {}) {
     check(outputElements <= limits.maxOutputElements, 'LIMIT', 'Requested readback exceeds limit');
     return Object.freeze({...o});
   });
+  // A carried input takes its next value from a program output of its shape.
+  const byName = new Map(outputs.map(o => [o.name, o]));
+  for (const n of nodes) if (n.carry !== undefined) {
+    const o = byName.get(n.carry);
+    check(o !== undefined, 'REFERENCE', `carry names no output: ${n.carry}`);
+    check(sameShape(nodes[o.id].shape, n.shape), 'SHAPE', `carry ${n.carry} does not match the input shape`);
+  }
+  for (const n of nodes) Object.freeze(n);
   // Uses are counted per storage root: an alias (reshape) keeps its source alive
   // through its own consumers and outputs, and never frees anything itself.
   const uses = Array(nodes.length).fill(0);
   for (const n of nodes) if (!n.alias) for (const r of n.refs) uses[root[r]]++;
   for (const o of outputs) uses[root[o.id]]++;
-  return {nodes, outputs, uses, root, limits, logicalBytes, work, inputElements, outputElements};
+  return {nodes, outputs, uses, root, limits, logicalBytes, work, inputElements, outputElements, session};
 }

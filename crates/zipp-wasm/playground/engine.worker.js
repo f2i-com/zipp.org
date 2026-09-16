@@ -93,9 +93,14 @@ async function computeRuntime() {
   }
   return gpu.creating;
 }
-// `createZippGPUHandler` only needs `execute`; creating the runtime lazily
-// keeps the adapter synchronous to create.
-const lazyRuntime = { async execute(program, options) { await gpu.retiring; return (await computeRuntime()).execute(program, options); } };
+// `createZippGPUHandler` only needs `execute` and `prepare`; creating the
+// runtime lazily keeps the adapter synchronous to create. A session belongs
+// to the runtime that prepared it (`selectGpuBackend` disposes that runtime,
+// and with it every session, once its work has settled).
+const lazyRuntime = {
+  async execute(program, options) { await gpu.retiring; return (await computeRuntime()).execute(program, options); },
+  async prepare(program, options) { await gpu.retiring; return (await computeRuntime()).prepare(program, options); },
+};
 
 function selectGpuBackend(backend) {
   const wanted = ["auto", "webgpu", "webgl2", "wasm", "cpu-js"].includes(backend) ? backend : "auto";
@@ -114,6 +119,7 @@ function attachGpu() {
     allowExecute: true,
     maxPending: 16,
     maxRequests: 100000,
+    maxSessions: 8,
     onDelivered: ({ error }) => {
       // The callback ran (or failed) outside any page request: report what
       // it printed and drew as an unsolicited event, then look for the

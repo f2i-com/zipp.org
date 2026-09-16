@@ -67,8 +67,13 @@ export class WasmBackend {
     }
     return o;
   }
-  async read(h) { return this.view(h).slice(); }
+  async read(h) { return h instanceof Float32Array ? h.slice() : this.view(h).slice(); }
   free() {} // Arena reclaimed between serial graph executions, not individual nodes.
+  // Sessions: the arena is reset per step, so a handle that outlives a step is
+  // a host copy, uploaded again where a step reads it.
+  persist(h) { return h instanceof Float32Array ? h : this.view(h).slice(); }
+  materialize(h) { if (!(h instanceof Float32Array)) return h; const o = this.alloc(h.length); this.view(o).set(h); return o; }
+  nextStep() { this.cursor = this.base; }
   async finish() {}
   dispose() { this.e = null; }
 }

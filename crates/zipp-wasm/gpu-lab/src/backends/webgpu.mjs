@@ -135,7 +135,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
 const BINARY = {add: 0, sub: 1, mul: 2, div: 3}, MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
 const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_update: 4};
-const SLOT = 256, CHUNK = 256 * SLOT, POOL_BYTES = 256 * 1024 * 1024;
+// One 256-byte uniform slot per dispatch in a single buffer (dynamic offsets),
+// so a bind group depends only on its kernel and storage buffers and is
+// reused across steps and runs. UNIFORM_SLOTS bounds the dispatches of one
+// submission (a 64-step session run of a 512-node graph fits).
+const SLOT = 256, UNIFORM_SLOTS = 16384, POOL_BYTES = 256 * 1024 * 1024, GROUP_CACHE = 8192;
+const COMPUTE = () => globalThis.GPUShaderStage?.COMPUTE ?? 4;
 
 export class WebGPUBackend {
   static async create({debug = false} = {}) {
@@ -158,7 +163,9 @@ export class WebGPUBackend {
     // Idle buffers are free across executions; recycled ones were freed during the
     // current one and may still be read by commands recorded before the free.
     this.idle = new Map(); this.recycled = []; this.idleBytes = 0;
-    this.chunks = []; this.chunk = 0; this.slot = 0; this.encoder = null; this.pass = null;
+    this.groups = new Map(); this.bufferIds = new WeakMap(); this.nextBufferId = 1;
+    this.uniformBuffer = null; this.uniformData = new ArrayBuffer(UNIFORM_SLOTS * SLOT); this.slot = 0;
+    this.staging = null; this.encoder = null; this.pass = null;
     this.peakBufferBytes = 0; this.liveBufferBytes = 0;
     device.lost.then(reason => {this.lost = reason.message || reason.reason || 'Device lost';});
   }
@@ -170,8 +177,10 @@ export class WebGPUBackend {
   allocationStats() { return {webgpuBufferPeakBytes: this.peakBufferBytes}; }
   async begin() {
     this.live(); this.device.pushErrorScope('out-of-memory'); this.device.pushErrorScope('validation');
-    this.scopeOpen = true; this.chunk = 0; this.slot = 0;
+    this.scopeOpen = true; this.slot = 0;
+    if (!this.uniformBuffer) this.uniformBuffer = this.device.createBuffer({size: UNIFORM_SLOTS * SLOT, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
   }
+  idOf(buffer) { let id = this.bufferIds.get(buffer); if (!id) { id = this.nextBufferId++; this.bufferIds.set(buffer, id); } return id; }
   bytesFor(size) { return Math.max(SLOT, Math.ceil(size * 4 / SLOT) * SLOT); }
   alloc(size, data) {
     this.live();
@@ -193,40 +202,59 @@ export class WebGPUBackend {
     }
     return {buffer, size, bytes, freed: false};
   }
+  /** One pipeline per kernel with an explicit layout: a dynamic-offset uniform, read-only inputs, one output. */
   async pipeline(name) {
-    let pipeline = this.pipelines.get(name);
-    if (!pipeline) {
+    let entry = this.pipelines.get(name);
+    if (!entry) {
       const [inputs, body] = KERNELS[name];
+      const layout = this.device.createBindGroupLayout({entries: [
+        {binding: 0, visibility: COMPUTE(), buffer: {type: 'uniform', hasDynamicOffset: true}},
+        ...inputs.map((_, i) => ({binding: i + 1, visibility: COMPUTE(), buffer: {type: 'read-only-storage'}})),
+        {binding: inputs.length + 1, visibility: COMPUTE(), buffer: {type: 'storage'}}]});
       const module = this.device.createShaderModule({code: `${PRELUDE}\n${io(inputs)}\n${body}`});
-      pipeline = await this.device.createComputePipelineAsync({layout: 'auto', compute: {module, entryPoint: 'main'}});
-      this.pipelines.set(name, pipeline);
+      const pipeline = await this.device.createComputePipelineAsync({layout: this.device.createPipelineLayout({bindGroupLayouts: [layout]}),
+        compute: {module, entryPoint: 'main'}});
+      entry = {pipeline, layout}; this.pipelines.set(name, entry);
     }
-    return pipeline;
+    return entry;
   }
-  /** A 256-byte uniform slot for one dispatch; chunks are uploaded once, at submit. */
+  /** Fills the next 256-byte uniform slot and returns its dynamic offset; slots upload once, at submit. */
   uniform(fill) {
-    if (this.slot === CHUNK / SLOT) { this.chunk++; this.slot = 0; }
-    let chunk = this.chunks[this.chunk];
-    if (!chunk) {
-      chunk = {buffer: this.device.createBuffer({size: CHUNK, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST}), data: new ArrayBuffer(CHUNK)};
-      this.chunks.push(chunk);
-    }
-    const offset = this.slot++ * SLOT, u = new Uint32Array(chunk.data, offset, 24), f = new Float32Array(chunk.data, offset, 24);
+    check(this.slot < UNIFORM_SLOTS, 'LIMIT', `One submission dispatches at most ${UNIFORM_SLOTS} kernels; run fewer steps at a time`);
+    const offset = this.slot++ * SLOT, u = new Uint32Array(this.uniformData, offset, 24), f = new Float32Array(this.uniformData, offset, 24);
     u.fill(0); fill(u, f);
-    return {buffer: chunk.buffer, offset, size: 96};
+    return offset;
+  }
+  /** Bind groups are cached by kernel and storage buffers: fixed buffers (a session's) never rebuild one. */
+  bindGroup(kernel, layout, handles) {
+    let key = kernel;
+    for (const h of handles) key += `|${this.idOf(h.buffer)}:${h.size}`;
+    let group = this.groups.get(key);
+    if (!group) {
+      if (this.groups.size >= GROUP_CACHE) this.groups.clear();
+      group = this.device.createBindGroup({layout, entries: [{binding: 0, resource: {buffer: this.uniformBuffer, offset: 0, size: 96}},
+        ...handles.map((h, i) => ({binding: i + 1, resource: {buffer: h.buffer, size: h.size * 4}}))]});
+      this.groups.set(key, group);
+    }
+    return group;
   }
   async dispatch(kernel, fill, inputs, out, count, groups = null) {
     this.live();
-    const pipeline = await this.pipeline(kernel), limit = this.device.limits.maxComputeWorkgroupsPerDimension;
+    const {pipeline, layout} = await this.pipeline(kernel), limit = this.device.limits.maxComputeWorkgroupsPerDimension;
     let [x, y, z] = groups ?? [Math.ceil(count / 256), 1, 1];
     if (!groups && x > limit) { y = Math.ceil(x / limit); x = limit; }
     check(x <= limit && y <= limit && z <= limit, 'LIMIT', 'Dispatch exceeds WebGPU workgroup limit');
-    const entries = [{binding: 0, resource: this.uniform(fill)},
-      ...[...inputs, out].map((h, i) => ({binding: i + 1, resource: {buffer: h.buffer, size: h.size * 4}}))];
-    const group = this.device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries});
+    const offset = this.uniform(fill), group = this.bindGroup(kernel, layout, [...inputs, out]);
     if (!this.encoder) this.encoder = this.device.createCommandEncoder();
     if (!this.pass) this.pass = this.encoder.beginComputePass();
-    this.pass.setPipeline(pipeline); this.pass.setBindGroup(0, group); this.pass.dispatchWorkgroups(x, y, z);
+    this.pass.setPipeline(pipeline); this.pass.setBindGroup(0, group, [offset]); this.pass.dispatchWorkgroups(x, y, z);
+  }
+  /** A session carry: the step's output is copied into the input's fixed buffer, in stream order. */
+  carry(src, dst) {
+    this.live();
+    if (this.pass) { this.pass.end(); this.pass = null; }
+    if (!this.encoder) this.encoder = this.device.createCommandEncoder();
+    this.encoder.copyBufferToBuffer(src.buffer, 0, dst.buffer, 0, src.size * 4);
   }
   async pairwise(input, out) {
     const scratch = [];
@@ -306,10 +334,43 @@ export class WebGPUBackend {
     if (this.pass) {this.pass.end(); this.pass = null;}
     if (!this.encoder) this.encoder = this.device.createCommandEncoder();
     extra(this.encoder);
-    for (let i = 0; i <= this.chunk && i < this.chunks.length; i++)
-      this.device.queue.writeBuffer(this.chunks[i].buffer, 0, this.chunks[i].data, 0, i < this.chunk ? CHUNK : Math.max(this.slot, 1) * SLOT);
+    if (this.slot > 0) this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData, 0, this.slot * SLOT);
     const commands = this.encoder.finish(); this.encoder = null;
     this.device.queue.submit([commands]);
+  }
+  /** A MAP_READ buffer kept across session runs (grown when a readback outgrows it). */
+  stagingFor(total) {
+    if (this.staging && this.staging.size >= total) return this.staging;
+    if (this.staging) this.staging.destroy();
+    this.staging = this.device.createBuffer({size: Math.max(total, 4096), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+    return this.staging;
+  }
+  /**
+   * A session run's end: submit, then await the readback map, both error
+   * scopes and the queue in ONE round trip to the GPU process (`readAll` then
+   * `finish` take two). Leaves nothing for `finish` to do.
+   */
+  async complete(handles) {
+    this.live();
+    const offsets = []; let total = 0;
+    for (const h of handles) {offsets.push(total); total += h.size * 4;}
+    const staging = total ? this.stagingFor(total) : null;
+    this.flush(encoder => handles.forEach((h, i) => encoder.copyBufferToBuffer(h.buffer, 0, staging, offsets[i], h.size * 4)));
+    const pops = [this.device.popErrorScope(), this.device.popErrorScope()]; this.scopeOpen = false;
+    try {
+      const [validation, memory] = await Promise.all([...pops, staging ? staging.mapAsync(GPUMapMode.READ, 0, total) : null]);
+      if (validation || memory) throw new ComputeError('GPU', (validation || memory).message);
+      this.live();
+      if (!staging) return [];
+      const all = new Float32Array(staging.getMappedRange(0, total));
+      return handles.map((h, i) => all.slice(offsets[i] / 4, offsets[i] / 4 + h.size));
+    } catch (error) {
+      if (this.staging) { try { this.staging.destroy(); } catch { /* lost */ } this.staging = null; }
+      throw error;
+    } finally {
+      if (this.staging?.mapState === 'mapped') this.staging.unmap();
+      this.reclaim();
+    }
   }
   /** Every requested output through one staging buffer: one submit, one map. */
   async readAll(handles) {
@@ -325,9 +386,22 @@ export class WebGPUBackend {
     } finally {if (staging.mapState === 'mapped') staging.unmap(); staging.destroy();}
   }
   async read(h) { return (await this.readAll([h]))[0]; }
-  free(h) { if (!h.freed) { h.freed = true; this.recycled.push(h); } }
+  // Freed during an execution: recycled until it settles. Freed between
+  // executions (a session releasing a resident buffer): idle at once.
+  free(h) { if (!h.freed) { h.freed = true; if (this.scopeOpen) this.recycled.push(h); else this.pool(h); } }
+  // Idle lists stay sorted by buffer id, so a session run that starts from
+  // the same pool allocates the same buffers every time (and its cached bind
+  // groups keep matching); `alloc` takes from the end.
+  pool(h) {
+    if (this.idleBytes + h.bytes > POOL_BYTES) {h.buffer.destroy(); this.liveBufferBytes -= h.bytes; return;}
+    if (!this.idle.has(h.bytes)) this.idle.set(h.bytes, []);
+    const list = this.idle.get(h.bytes), id = this.idOf(h.buffer);
+    let i = list.length; while (i > 0 && this.idOf(list[i - 1]) > id) i--;
+    list.splice(i, 0, h.buffer); this.idleBytes += h.bytes;
+  }
+  reclaim() { for (const h of this.recycled) this.pool(h); this.recycled = []; }
   async finish() {
-    if (!this.scopeOpen) return;
+    if (!this.scopeOpen) { this.reclaim(); return; }
     this.scopeOpen = false;
     // Unsubmitted commands (a failed execution) are dropped with their encoder.
     if (this.pass) {this.pass.end(); this.pass = null;}
@@ -338,19 +412,13 @@ export class WebGPUBackend {
         this.device.queue.onSubmittedWorkDone()]);
       if (validation || memory) throw new ComputeError('GPU', (validation || memory).message);
       this.live();
-    } finally {
-      for (const h of this.recycled) {
-        if (this.idleBytes + h.bytes > POOL_BYTES) {h.buffer.destroy(); this.liveBufferBytes -= h.bytes; continue;}
-        if (!this.idle.has(h.bytes)) this.idle.set(h.bytes, []);
-        this.idle.get(h.bytes).push(h.buffer); this.idleBytes += h.bytes;
-      }
-      this.recycled = [];
-    }
+    } finally { this.reclaim(); }
   }
   dispose() {
     for (const list of this.idle.values()) for (const b of list) b.destroy();
     for (const h of this.recycled) h.buffer.destroy();
-    for (const c of this.chunks) c.buffer.destroy();
-    this.idle.clear(); this.recycled = []; this.chunks = []; this.pipelines.clear(); this.device.destroy();
+    if (this.uniformBuffer) this.uniformBuffer.destroy();
+    if (this.staging) this.staging.destroy();
+    this.idle.clear(); this.recycled = []; this.groups.clear(); this.pipelines.clear(); this.uniformBuffer = null; this.staging = null; this.device.destroy();
   }
 }

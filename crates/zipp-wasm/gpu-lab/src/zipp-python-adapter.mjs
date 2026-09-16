@@ -1,5 +1,5 @@
 import {check, ComputeError} from './graph.mjs';
-import {createZippGPUHandler} from './zipp-adapter.mjs';
+import {createZippGPUHandler, GPU_KINDS} from './zipp-adapter.mjs';
 
 /**
  * The GPU adapter for a ZIPP **Python** state.
@@ -18,10 +18,10 @@ import {createZippGPUHandler} from './zipp-adapter.mjs';
  * because a callback may submit more work. `onDelivered` lets the host
  * collect the console output and `ui` commands the callback produced.
  */
-export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, maxRequests = 4096, maxPending = 16, onDelivered = null} = {}) {
+export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, maxRequests = 4096, maxPending = 16, maxSessions = 16, onDelivered = null} = {}) {
   check(Number.isSafeInteger(maxRequests) && maxRequests > 0 && Number.isSafeInteger(maxPending) && maxPending > 0,
     'LIMIT', 'Adapter request limits must be positive integers');
-  const handler = createZippGPUHandler(runtime, {allowExecute});
+  const handler = createZippGPUHandler(runtime, {allowExecute, maxSessions});
   let active = true, tail = Promise.resolve(), pending = 0, admitted = 0;
   const live = () => active && !engine.disposed;
   // A macrotask boundary: lets the host's event loop run between rejections.
@@ -41,7 +41,7 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
   }
   function admit(request) {
     if (!live()) return Promise.reject(new ComputeError('DISPOSED', 'Adapter generation has ended'));
-    if (!request || request.kind !== 'gpu.execute') return Promise.reject(new ComputeError('DENIED', 'Not a GPU request'));
+    if (!request || !GPU_KINDS.includes(request.kind)) return Promise.reject(new ComputeError('DENIED', 'Not a GPU request'));
     if (!Number.isSafeInteger(request.id) || request.id < 1) return Promise.reject(new ComputeError('PROTOCOL', 'Invalid request ID'));
     if (admitted >= maxRequests || pending >= maxPending) {
       // Over quota: the program learns why through its own callback, but only
@@ -63,14 +63,15 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
     catch { return Promise.reject(new ComputeError('PROTOCOL', 'Request payload is not cloneable data')); }
     // An engine that sends tensor inputs as Float32Arrays takes outputs the
     // same way (straight into tensor storage); one that sends lists gets
-    // lists, whatever its age.
-    const typedOutputs = Array.isArray(payload?.nodes) && payload.nodes.some((node) => node?.data instanceof Float32Array);
+    // lists, whatever its age. Sessions are typed: their engine is new enough.
+    const kind = request.kind;
+    const typedOutputs = kind !== 'gpu.execute' || (Array.isArray(payload?.nodes) && payload.nodes.some((node) => node?.data instanceof Float32Array));
     const id = request.id;
     admitted++; pending++;
     const run = tail.then(async () => {
       if (!live()) return {delivered: false, cancelled: true};
       let reply;
-      try { reply = {ok: true, value: await handler.handle('gpu.execute', [payload], {typedOutputs})}; }
+      try { reply = {ok: true, value: await handler.handle(kind, [payload], {typedOutputs})}; }
       catch (error) { reply = {ok: false, error: {code: error.code || 'GPU', message: String(error.message || error).slice(0, 512)}}; }
       if (!live()) return {delivered: false, cancelled: true};
       // After the asynchronous host work, outside any engine call.
@@ -80,7 +81,7 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
     return run;
   }
   return Object.freeze({
-    accepts(kind) { return kind === 'gpu.execute'; },
+    accepts(kind) { return GPU_KINDS.includes(kind); },
     /** Take the engine's pending host requests; GPU ones are admitted here, the rest returned. */
     drain() {
       if (!live()) return [];
@@ -88,7 +89,7 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
       try { requests = engine.takeHostRequests(); } catch { return []; }
       const others = [];
       for (const request of Array.isArray(requests) ? requests : []) {
-        if (request && request.kind === 'gpu.execute') admit(request).catch(() => {});
+        if (request && GPU_KINDS.includes(request.kind)) admit(request).catch(() => {});
         else others.push(request);
       }
       return others;
@@ -97,5 +98,6 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
     invalidate() { active = false; handler.invalidate(); },
     idle() { return tail; },
     get pending() { return pending; },
+    get sessions() { return handler.sessions; },
   });
 }

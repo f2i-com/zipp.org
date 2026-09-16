@@ -213,4 +213,179 @@ console.log(JSON.stringify(out));"""
                     else:
                         for a,b in zip(outs[name]["data"],value["data"]): self.assertLessEqual(abs(a-b),2.5e-7*max(1,abs(b)))
 
+
+# ---- sessions: Graph.prepare on the reference path -------------------------------------
+def lcg(seed):
+    state = [seed]
+    def uniform(lo, hi):
+        state[0] = (state[0] * 1103515245 + 12345) % 2147483648
+        return lo + (hi - lo) * state[0] / 2147483648
+    return uniform
+
+def mlp_data(seed=7, features=4, hidden=6, classes=3, batch=5, steps=6):
+    rnd = lcg(seed)
+    params = [[[round(rnd(-0.5, 0.5), 4) for _ in range(hidden)] for _ in range(features)], [0.0] * hidden,
+              [[round(rnd(-0.5, 0.5), 4) for _ in range(classes)] for _ in range(hidden)], [0.0] * classes]
+    batches = []
+    for _ in range(steps):
+        xs = [[round(rnd(-0.3, 0.3) + (1.0 if j % classes == i % classes else 0.0), 4) for j in range(features)] for i in range(batch)]
+        batches.append((xs, [i % classes for i in range(batch)]))
+    return params, batches
+
+def step_outputs(g, x, y, w1, b1, w2, b2, moments, step, lr=0.05):
+    """Forward, cross-entropy, backward and Adam for a relu MLP: the outputs a step names."""
+    pre = x @ w1 + b1
+    hidden = pre.relu()
+    logits = hidden @ w2 + b2
+    delta = logits.cross_entropy_grad(y)
+    back = (delta @ w2.T) * pre.positive()
+    grads = [x.T @ back, back.sum(0), hidden.T @ delta, delta.sum(0)]
+    outputs = {"loss": logits.cross_entropy(y)}
+    for i, (p, grad, (m, v)) in enumerate(zip([w1, b1, w2, b2], grads, moments)):
+        outputs["p%d" % i], outputs["m%d" % i], outputs["v%d" % i] = g.adam(p, grad, m, v, lr=lr, step=step)
+    return outputs
+
+def shapes(features=4, hidden=6, classes=3):
+    return [(features, hidden), (hidden,), (hidden, classes), (classes,)]
+
+def chained(params, batches):
+    """One fresh graph per step, fed by the previous step's outputs: the session's reference."""
+    flat = [sum(p, []) if isinstance(p[0], list) else list(p) for p in params]
+    moments = [([0.0] * len(f), [0.0] * len(f)) for f in flat]
+    losses, seen = [], []
+    for step, (xs, ys) in enumerate(batches, 1):
+        g = Graph()
+        x, y = g.tensor(xs), g.tensor(ys)
+        ps = [g.tensor(f, shape=s) for f, s in zip(flat, shapes())]
+        ms = [(g.tensor(m, shape=s), g.tensor(v, shape=s)) for (m, v), s in zip(moments, shapes())]
+        outputs = step_outputs(g, x, y, *ps, ms, step)
+        g.submit(seen.append, **outputs)
+        out = seen[-1]["outputs"]
+        losses.append(out["loss"]["data"][0])
+        flat = [out["p%d" % i]["data"] for i in range(4)]
+        moments = [(out["m%d" % i]["data"], out["v%d" % i]["data"]) for i in range(4)]
+    return losses, flat, moments
+
+def prepared(params, batch=5, features=4):
+    """The same step as a session: parameters and moments carried, x and y fed."""
+    g = Graph()
+    x, y = g.tensor([[0.0] * features] * batch), g.tensor([0] * batch)
+    flat = [sum(p, []) if isinstance(p[0], list) else list(p) for p in params]
+    ps = [g.tensor(f, shape=s) for f, s in zip(flat, shapes())]
+    ms = [(g.tensor([0.0] * len(f), shape=s), g.tensor([0.0] * len(f), shape=s)) for f, s in zip(flat, shapes())]
+    outputs = step_outputs(g, x, y, *ps, ms, 1)
+    carry = {}
+    for i in range(4):
+        carry[ps[i]] = outputs["p%d" % i]
+        carry[ms[i][0]] = "m%d" % i
+        carry[ms[i][1]] = outputs["v%d" % i]
+    resident = [outputs[k] for k in outputs if k != "loss"]
+    return g, g.prepare(feeds={"x": x, "y": y}, carry=carry, resident=resident, **outputs), x, y
+
+
+class SessionTests(unittest.TestCase):
+    def test_session_steps_equal_chained_submits_bit_for_bit(self):
+        params, batches = mlp_data()
+        losses, flat, moments = chained(params, batches)
+        _, session, _, _ = prepared(params)
+        self.assertEqual(session.backend, "cpu-python"); self.assertEqual(session.feeds, ("x", "y"))
+        got = []
+        for xs, ys in batches[:3]:
+            session.run(got.append, x=xs, y=ys)
+        session.run_steps(got.append, [{"x": xs, "y": ys} for xs, ys in batches[3:]])
+        self.assertEqual([r["outputs"]["loss"]["data"][0] for r in got[:3]] + [s["outputs"]["loss"]["data"][0] for s in got[3]["steps"]], losses)
+        self.assertEqual([s["step"] for s in got[3]["steps"]], [4, 5, 6]); self.assertEqual(session.step, 7); self.assertEqual(got[3]["step"], 7)
+        self.assertEqual(list(got[0]["outputs"]), ["loss"], "resident outputs are not read back by default")
+        seen = []
+        session.download(seen.append, "p0", "p1", "p2", "p3", "m0", "v3")
+        for i in range(4):
+            self.assertEqual(seen[0]["outputs"]["p%d" % i]["data"], flat[i])
+        self.assertEqual(seen[0]["outputs"]["m0"]["data"], moments[0][0]); self.assertEqual(seen[0]["outputs"]["v3"]["data"], moments[3][1])
+        self.assertEqual(seen[0]["outputs"]["p0"]["shape"], [4, 6])
+
+    def test_prepared_program_marks_fed_and_carried_inputs(self):
+        params, _ = mlp_data()
+        _, session, _, _ = prepared(params)
+        nodes = session._program["nodes"]
+        self.assertNotIn("data", nodes[0]); self.assertNotIn("data", nodes[1])
+        self.assertEqual(sorted(n["carry"] for n in nodes if "carry" in n), sorted("%s%d" % (k, i) for k in "mpv" for i in range(4)))
+        self.assertTrue(all("data" in n for n in nodes if "carry" in n), "carried inputs keep their initial value")
+        self.assertEqual(session._classes, {1: 3}); self.assertEqual(len(session.resident), 12)
+
+    def test_run_validation_and_lifetime(self):
+        params, batches = mlp_data()
+        _, session, x, y = prepared(params)
+        xs, ys = batches[0]
+        with self.assertRaises(GraphError): session.run(print, z=xs)
+        with self.assertRaises(GraphError): session.run(print, x=xs[1:], y=ys)
+        with self.assertRaises(GraphError): session.run(print, x=xs, y=[7] * 5)
+        with self.assertRaises(GraphError): session.run(print, x=xs, y=ys, step=0)
+        with self.assertRaises(GraphError): session.run(print, x=xs, y=ys, readback=["nope"])
+        with self.assertRaises(GraphError): session.download(print, "loss")
+        with self.assertRaises(ComputeError): session.download(print, "p0")  # nothing computed yet
+        with self.assertRaises(ComputeError): session.run(print, y=ys)  # x has no value
+        with self.assertRaises(TypeError): session.run(None, x=xs, y=ys)
+        seen = []
+        session.run(seen.append, x=xs, y=ys, readback=["loss", "p0"])
+        self.assertEqual(sorted(seen[0]["outputs"]), ["loss", "p0"])
+        restart = []
+        session.run(restart.append, x=xs, y=ys, step=1)
+        self.assertEqual(restart[0]["steps"][0]["step"], 1); self.assertEqual(session.step, 2)
+        session.dispose(); session.dispose()
+        with self.assertRaises(ComputeError): session.run(print, x=xs, y=ys)
+
+    def test_carried_input_fed_once_then_carried(self):
+        g = Graph(); a = g.tensor([0.0, 0.0, 0.0]); nxt = a + 1
+        s = g.prepare(feeds={"a": a}, carry={a: nxt}, next=nxt)
+        with self.assertRaises(ComputeError): s.run_steps(print, [{}, {}])
+        with self.assertRaises(ComputeError): s.run_steps(print, [{}, {"a": [1, 2, 3]}])
+        self.assertEqual(s.step, 1, "a refused run executed nothing")
+        got = []
+        s.run_steps(got.append, [{"a": [1, 2, 3]}, {}, {}])
+        self.assertEqual([r["outputs"]["next"]["data"] for r in got[0]["steps"]], [[2.0, 3.0, 4.0], [3.0, 4.0, 5.0], [4.0, 5.0, 6.0]])
+        # A cross-entropy target never carries, fed or not.
+        h = Graph(); logits = h.tensor([[1.0, 2.0], [3.0, 4.0]]); y = h.tensor([0, 1]); loss = logits.cross_entropy(y)
+        with self.assertRaises(GraphError): h.prepare(carry={y: "grad"}, loss=loss, grad=logits.cross_entropy_grad(y).sum(1))
+
+    def test_prepare_validation(self):
+        g = Graph(); a = g.tensor([1.0, 2.0]); b = g.tensor([3.0, 4.0]); c = a + b; d = c.sum()
+        with self.assertRaises(GraphError): g.prepare(feeds={"c": c}, r=c)
+        with self.assertRaises(GraphError): g.prepare(feeds={"bad name": a}, r=c)
+        with self.assertRaises(GraphError): g.prepare(carry={a: d}, r=c, s=d)
+        with self.assertRaises(GraphError): g.prepare(carry={a: "zz"}, r=c)
+        with self.assertRaises(GraphError): g.prepare(carry={c: c}, r=c)
+        with self.assertRaises(GraphError): g.prepare(carry={a: b}, r=c, q=b)
+        with self.assertRaises(GraphError): g.prepare(resident=[d], r=c)
+        with self.assertRaises(GraphError): g.prepare(backend="tpu", r=c)
+        with self.assertRaises(ComputeError): g.prepare(backend="webgpu", r=c)
+        s = g.prepare(feeds={"a": a}, carry={b: c}, resident=["r"], r=c, t=d)
+        got = []
+        s.run_steps(got.append, [{"a": [1, 1]}, {"a": [1, 1]}, {"a": [1, 1]}])
+        self.assertEqual([r["outputs"]["t"]["data"] for r in got[0]["steps"]], [[9.0], [11.0], [13.0]])
+        with self.assertRaises(ComputeError): s.run_steps(print, [{"a": [1, 1]}, {}])  # a fed input needs a value every step
+        s.run(lambda r: None, readback=[], a=[3e38, 3e38])  # carried into b; nothing read back
+        with self.assertRaises(ComputeError): s.run(print, readback=["r"], a=[3e38, 3e38])  # overflows to inf
+        ready = []
+        g.prepare(on_ready=ready.append, r=c)
+        self.assertEqual(len(ready), 1)
+
+    def test_session_matches_node_cpu_js_session(self):
+        if shutil.which("node") is None: self.skipTest("node not installed")
+        params, batches = mlp_data(steps=3)
+        _, session, _, _ = prepared(params)
+        got = []
+        session.run_steps(got.append, [{"x": xs, "y": ys} for xs, ys in batches], readback=["loss", "p0", "v2"])
+        program = json.dumps(session._program); steps = json.dumps([{"inputs": {"0": sum(xs, []), "1": ys}} for xs, ys in batches])
+        script = """import {createRuntime} from './src/runtime.mjs';
+const [program,steps]=JSON.parse(await new Promise(r=>{let s='';process.stdin.on('data',d=>s+=d).on('end',()=>r(s));}));
+const rt=await createRuntime({backend:'cpu-js'}),session=await rt.prepare(program,{resident:['p0','v2']});
+const out=await session.run(steps,{readback:['loss','p0','v2']});
+console.log(JSON.stringify(out.steps.map(s=>Object.fromEntries(Object.entries(s.outputs).map(([k,v])=>[k,Array.from(v.data)])))));rt.dispose();"""
+        result = subprocess.run(["node", "--input-type=module", "-e", script], input=json.dumps([json.loads(program), json.loads(steps)]), capture_output=True, text=True, cwd=str(LAB), timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for mine, theirs in zip(got[0]["steps"], json.loads(result.stdout)):
+            for name in ["loss", "p0", "v2"]:
+                for a, b in zip(mine["outputs"][name]["data"], theirs[name]):
+                    self.assertLessEqual(abs(a - b), 2.5e-7 * max(1, abs(b)), name)
+
 if __name__=="__main__":unittest.main(verbosity=2)

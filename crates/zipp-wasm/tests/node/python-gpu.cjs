@@ -149,6 +149,86 @@ evolve(cells, neighbor_matrix(5)).submit(lambda y: print(y.tolist()))
     adapter.invalidate(); runtime.dispose(); e.dispose();
   }
 
+  // ---- sessions: Graph.prepare through the real engine -------------------------------------
+  // The program prepares one Adam step of a tiny MLP, runs three steps one at
+  // a time and three in one request, downloads a weight, and disposes; the
+  // same steps as chained submits are its reference.
+  const SESSION = `from zipp_gpu import Graph, ComputeError, execute_locally
+xs = [[[0.1 * (i + j + s) for j in range(4)] for i in range(3)] for s in range(6)]
+ys = [[(i + s) % 2 for i in range(3)] for s in range(6)]
+w0 = [[0.05 * (i - j) for j in range(2)] for i in range(4)]
+def step_graph(w, m, v, step):
+    g = Graph()
+    x, y, wt = g.tensor(xs[0]), g.tensor(ys[0]), g.tensor(w, shape=(4, 2))
+    logits = x @ wt
+    grad = x.T @ logits.cross_entropy_grad(y)
+    p1, m1, v1 = g.adam(wt, grad, g.tensor(m, shape=(4, 2)), g.tensor(v, shape=(4, 2)), lr=0.1, step=step)
+    return g, x, y, wt, {"loss": logits.cross_entropy(y), "w": p1, "m": m1, "v": v1}
+chained, w, m, v = [], w0, [0.0] * 8, [0.0] * 8
+for step in range(1, 7):
+    g, x, y, wt, outs = step_graph(w, m, v, step)
+    g._nodes[x._id]["data"], g._nodes[y._id]["data"] = [c for row in xs[step - 1] for c in row], list(ys[step - 1])
+    # The in-guest float32 reference (a hosted submit would answer later).
+    out = execute_locally(g.program(**outs))["outputs"]
+    chained.append(out["loss"]["data"][0]); w, m, v = out["w"]["data"], out["m"]["data"], out["v"]["data"]
+def close(a, b):
+    return len(a) == len(b) and all(abs(p - q) <= 1e-6 * max(1.0, abs(q)) for p, q in zip(a, b))
+g, x, y, wt, outs = step_graph(w0, [0.0] * 8, [0.0] * 8, 1)
+events = []
+session = g.prepare(feeds={"x": x, "y": y}, carry={wt: "w", g._tensors[g._nodes[outs["m"]._id]["a"]]: "m", g._tensors[g._nodes[outs["v"]._id]["a"]]: "v"},
+                    resident=["w", "m", "v"], on_ready=lambda s: events.append("ready " + s.backend), on_error=lambda e: events.append("create failed " + e.code), **outs)
+losses = []
+def took(result):
+    losses.extend(s["outputs"]["loss"]["data"][0] for s in result["steps"])
+for s in range(3):
+    session.run(took, on_error=lambda e: events.append("run failed " + e.code), x=xs[s], y=ys[s])
+session.run_steps(took, [{"x": xs[s], "y": ys[s]} for s in range(3, 6)], on_error=lambda e: events.append("run failed " + e.code))
+def got(result):
+    events.append("downloaded w " + str(result["outputs"]["w"]["shape"]) + " close " + str(close(result["outputs"]["w"]["data"], w)))
+    events.append("losses close to the reference " + str(close(losses, chained)) + " " + str(len(losses)))
+    session.dispose()
+    try:
+        session.run(print, x=xs[0], y=ys[0])
+    except ComputeError as e:
+        events.append("after dispose " + e.code)
+session.download(got, "w", on_error=lambda e: events.append("download failed " + e.code))
+def report():
+    print(*events, sep="; ")
+print("prepared", session.backend)
+`;
+  for (const backend of ["cpu-js", "wasm"]) {
+    const e = new Engine();
+    const runtime = await createRuntime({ backend, wasmBytes });
+    const adapter = createPythonGPUAdapter(e, runtime, { allowExecute: true, maxSessions: 2 });
+    e.initPythonProject({ main: SESSION }, "main");
+    eq(`${backend}: the session is requested, not created, before the host drains`, e.takeOutput(), ["prepared None"]);
+    const kinds = [];
+    for (let i = 0; i < 12 && (adapter.pending || i === 0 || e.pythonCall("__zipp_py_pending_host", []) > 0); i++) {
+      for (const r of e.takeHostRequests()) { kinds.push(r.kind); adapter.admit(r).catch(() => {}); }
+      await adapter.idle();
+    }
+    eq(`${backend}: the guest raised create, four runs, a download and a dispose in order`, kinds,
+      ["gpu.session.create", "gpu.session.run", "gpu.session.run", "gpu.session.run", "gpu.session.run", "gpu.session.download", "gpu.session.dispose"]);
+    e.pythonCall("report", []);
+    eq(`${backend}: six session steps equal six chained submits, the weight came back, and the disposed session refuses`, e.takeOutput(),
+      [`ready ${backend}; downloaded w [4, 2] close True; losses close to the reference True 6; after dispose DISPOSED`]);
+    ok(`${backend}: the adapter holds no session after the guest disposed it`, adapter.sessions === 0 && runtime.sessions.size === 0);
+    adapter.invalidate(); await adapter.idle(); runtime.dispose(); e.dispose();
+  }
+  {
+    // A guest that never disposes: invalidating the adapter frees its sessions.
+    const e = new Engine();
+    const runtime = await createRuntime({ backend: "cpu-js" });
+    const adapter = createPythonGPUAdapter(e, runtime, { allowExecute: true });
+    e.initPythonProject({ main: "from zipp_gpu import Graph\ng = Graph()\na = g.tensor([1.0, 2.0])\nb = g.tensor([1.0, 1.0])\ns = g.prepare(carry={a: 'r'}, resident=['r'], r=a + b)\ns.run(lambda r: print('ran', r['step']), readback=['r'])\n" }, "main");
+    adapter.drain(); await adapter.idle(); adapter.drain(); await adapter.idle();
+    eq("a session with nothing to feed runs on the host", e.takeOutput(), ["ran 2"]);
+    ok("the session is alive until its generation ends", adapter.sessions === 1 && runtime.sessions.size === 1);
+    adapter.invalidate();
+    ok("invalidating the generation disposes the tenant's sessions", adapter.sessions === 0 && runtime.sessions.size === 0);
+    await adapter.idle(); runtime.dispose(); e.dispose();
+  }
+
   // ---- denial, disposal, and a callback that raises ---------------------------------
   {
     const e = new Engine();

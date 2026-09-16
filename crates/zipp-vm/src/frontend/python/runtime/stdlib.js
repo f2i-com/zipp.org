@@ -876,17 +876,30 @@
         fn(g, "pairwise", 1, (a) => { const items = drain(a[0]); let i = 0; return gen(() => i + 1 < items.length ? tuple([items[i], items[++i]]) : STOP); });
         fn(g, "batched", 2, (a) => { const items = drain(a[0]); const n = Number(needInt(a[1])); let i = 0; return gen(() => { if (i >= items.length) return STOP; const b = items.slice(i, i + n); i += n; return tuple(b); }); });
     });
-    // ---- _zipp_gpu: the transport behind zipp_gpu.Graph.submit ------------------------------
+    // ---- _zipp_gpu: the transport behind zipp_gpu.Graph.submit and Graph.prepare -------------
+    // The host-request kinds a program may raise. Anything else never leaves
+    // the engine: the embedder's adapters admit exactly this list.
+    const GPU_REQUEST_KINDS = ["gpu.execute", "gpu.session.create", "gpu.session.run", "gpu.session.download", "gpu.session.dispose"];
     mod("_zipp_gpu", (g) => {
+        const callable = (f) => f !== null && typeof f === "object" && (f.cls === T.function || f.cls === T.method || f.cls === T.builtin_function_or_method);
         fn(g, "hosted", 0, () => rt.hosted === true);
         fn(g, "post", 2, (a) => {
             const program = a[0];
             if (program === null || typeof program !== "object" || program.cls !== T.dict) fail(E.TypeError, "a program is a dict");
-            const callback = a[1];
-            if (!(callback !== null && typeof callback === "object" && (callback.cls === T.function || callback.cls === T.method || callback.cls === T.builtin_function_or_method))) fail(E.TypeError, "post() needs a callable");
-            return BigInt(rt.postHost("gpu.execute", program, callback));
+            if (!callable(a[1])) fail(E.TypeError, "post() needs a callable");
+            return BigInt(rt.postHost("gpu.execute", program, a[1]));
+        });
+        // request(kind, payload, callback): a session request (`gpu.session.*`).
+        fn(g, "request", 3, (a) => {
+            const kind = a[0];
+            if (typeof kind !== "string" || GPU_REQUEST_KINDS.indexOf(kind) < 0) fail(E.ValueError, "unknown host request kind");
+            const payload = a[1];
+            if (payload === null || typeof payload !== "object" || payload.cls !== T.dict) fail(E.TypeError, "a payload is a dict");
+            if (!callable(a[2])) fail(E.TypeError, "request() needs a callable");
+            return BigInt(rt.postHost(kind, payload, a[2]));
         });
         fn(g, "pending", 0, () => BigInt(rt.pendingHostRequests()));
+        g.set("KINDS", tuple(GPU_REQUEST_KINDS.slice()));
     });
     // ---- struct: pack/unpack of the standard codes through a DataView ---------------------
     mod("struct", (g) => {

@@ -82,6 +82,8 @@ def main():
             print("   784-256-10 batch-64 Adam step: cold %.1f ms, warm median %.2f ms (min %.2f), loss-only %.2f ms, batch-512 loss-only %s, max abs error vs cpu-js %.3g, losses %s"
                   % (bench["coldMs"], bench["warmMedianMs"], bench["warmMinMs"], bench["lossOnlyWarmMedianMs"], bench["batch512LossOnlyWarmMedianMs"], bench["maxAbsError"],
                      " ".join("%.4f" % v for v in bench["losses"])))
+            print("   typed outputs, per step: execute() %.2f ms, session 1 step/run %.2f ms, session 8 steps/run %.2f ms; five session steps vs chained executes max abs error %.3g"
+                  % (bench["executeTypedWarmMedianMs"], bench["sessionOneStepWarmMedianMs"], bench["sessionEightStepsPerStepMedianMs"], bench["sessionVsChainedMaxAbsError"]))
             # Non-finite intermediates are rejected at readback where the platform propagates NaN.
             nan.append(page.evaluate("""async backend => {
               const {createRuntime} = await import('/src/runtime.mjs');
