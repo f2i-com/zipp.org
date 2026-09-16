@@ -14,15 +14,20 @@
 use std::{fs, path::PathBuf, process::Command};
 
 struct Fixture(PathBuf);
+/// Windows' clock granularity is coarse enough that two tests starting in the
+/// same tick produced the SAME directory, and the second `create_dir` failed
+/// with "Cannot create a file when that file already exists" (os error 183).
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "zipp-infra-{}-{}",
+            "zipp-infra-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         Self(path)

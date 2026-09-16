@@ -226,12 +226,20 @@ fn native_name_and_regexp_wrappers_reject_prefix_overflow() {
         target.bind(null)
         "#,
     );
-    // "function " plus "() { [native code] }" is more than 26 bytes.
-    assert_catchable_range_error(
-        r#"
-        Object.defineProperty(Array, "name", {value:"x".repeat(@BYTES_MINUS_26@)});
-        Function.prototype.toString.call(Array)
-        "#,
+    // A native's wrapper renders its INTRINSIC name, so redefining `name`
+    // cannot inflate it — which is why this is a completion, not a ceiling.
+    // It used to render the redefined name (diverging from every other
+    // engine), and this case reached the cap through that bug; the cap for
+    // wrapper growth is asserted on `bind` above, which does read the name.
+    assert_eq!(
+        run_ok(&sized(
+            r#"
+            Object.defineProperty(Array, "name", {value:"x".repeat(@BYTES_MINUS_26@)});
+            console.log(Function.prototype.toString.call(Array).length + " " + Array.name.length);
+            "#
+        )),
+        [format!("34 {}", BYTES - 26)],
+        "a redefined name must not reach the native wrapper"
     );
 }
 
