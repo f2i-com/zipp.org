@@ -1,15 +1,123 @@
 import {check, ComputeError, DEFAULT_LIMITS} from '../graph.mjs';
 
-/** Fragment-shader compute using RGBA32F textures. One scalar occupies the red channel. */
+// Shared GLSL: texel addressing, the shared erf-based CDF and an overflow-free
+// tanh. Shapes and scalars arrive as uniforms, so one program serves every shape.
+const PRELUDE = `#version 300 es
+precision highp float; precision highp int; precision highp sampler2D;
+uniform int wO, nO, wA, wB, wC, wD, mode, op, len;
+uniform ivec4 d, sa, sb, g;
+uniform vec4 f;
+out vec4 resultColor;
+// A bit-pattern test: HLSL compilers behind ANGLE may fold isnan() or x != x away.
+bool isNaN(float x) { return (floatBitsToUint(x) & 0x7fffffffu) > 0x7f800000u; }
+int strided(int i, ivec4 s) {
+  int x3 = i % d.w; int r3 = i / d.w; int x2 = r3 % d.z; int r2 = r3 / d.z;
+  return (r2 / d.y) * s.x + (r2 % d.y) * s.y + x2 * s.z + x3 * s.w;
+}
+float erfSeries(float z) {
+  float t = z * z;
+  return z * (1.1283791670955126 + t * (-0.37612638903183754 + t * (0.11283791670955126 + t * (-0.026866170645131252 +
+    t * (0.005223977625442188 + t * (-0.0008548327023450852 + t * 0.00012055332981789664))))));
+}
+float erfcFit(float a) {
+  float t = 1.0 / (1.0 + 0.5 * a);
+  return t * exp(-a * a - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 +
+    t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+}
+float cdf(float x) {
+  float z = x * 0.7071067811865476;
+  if (abs(z) < 0.5) return 0.5 + 0.5 * erfSeries(z);
+  if (z >= 10.0) return 1.0;
+  if (z <= -10.0) return 0.0;
+  float c = 0.5 * erfcFit(abs(z));
+  return z > 0.0 ? 1.0 - c : c;
+}
+float tanhS(float x) {
+  if (isNaN(x)) return x;
+  float a = abs(x);
+  if (a < 0.25) { float z = x * x; return x * (1.0 + z * (-0.3333333333333333 + z * (0.13333333333333333 + z * (-0.05396825396825397 + z * 0.021869488536155203)))); }
+  float t = exp(-2.0 * min(a, 20.0));
+  float r = (1.0 - t) / (1.0 + t);
+  return x < 0.0 ? -r : r;
+}`;
+const SAMPLERS = ['A', 'B', 'C', 'D'];
+const io = inputs => inputs.map(name => `uniform highp sampler2D t${name};
+float ${name}(int j) { return texelFetch(t${name}, ivec2(j % w${name}, j / w${name}), 0).r; }`).join('\n');
+const each = body => `void main() {
+  int i = int(gl_FragCoord.y) * wO + int(gl_FragCoord.x);
+  if (i >= nO) { resultColor = vec4(0.0); return; }
+  float value = 0.0;
+  ${body}
+  resultColor = vec4(value, 0.0, 0.0, 0.0);
+}`;
+const KERNELS = {
+  fill: [[], each('value = f.x;')],
+  unary: [['A'], each(`float x = A(i);
+  switch (op) {
+    case 0: value = (x > 0.0 || isNaN(x)) ? x : 0.0; break;
+    case 1: value = x > 0.0 ? 1.0 : 0.0; break;
+    case 2: value = -x; break;
+    case 3: value = exp(x); break;
+    case 4: value = log(x); break;
+    case 5: value = sqrt(x); break;
+    case 6: value = tanhS(x); break;
+    case 7: { float e = exp(-abs(x)); value = x >= 0.0 ? 1.0 / (1.0 + e) : e / (1.0 + e); break; }
+    case 8: value = x * cdf(x); break;
+    default: value = cdf(x) + x * 0.3989422804014327 * exp(-0.5 * min(x * x, 200.0)); break;
+  }`)],
+  binary: [['A', 'B'], each(`int ia = i; int ib = i;
+  if (mode == 1) ia = 0; else if (mode == 2) ib = 0; else if (mode == 3) { ia = strided(i, sa); ib = strided(i, sb); }
+  float x = A(ia); float y = B(ib);
+  value = op == 0 ? x + y : op == 1 ? x - y : op == 2 ? x * y : x / y;`)],
+  gather: [['A'], each('value = A(strided(i, sa));')],
+  pair: [['A'], each('int j = i * 2; value = A(j); if (j + 1 < len) value += A(j + 1);')],
+  scale: [['A'], each('value = A(i) / f.x;')],
+  reduce: [['A'], each(`int inner = g.x; int base = (i / inner) * len * inner + i % inner;
+  for (int j = 0; j < len; j++) value += A(base + j * inner);
+  if (mode == 1) value = value / float(len);`)],
+  // Softmax-family rows in passes: the maximum per row, the float32 sum of
+  // exp(x - max) per row (B = maxima), then one output per element.
+  row_max: [['A'], each(`int base = i * len; value = A(base);
+  for (int j = 1; j < len; j++) { float v = A(base + j); value = (v > value || isNaN(v)) ? v : value; }`)],
+  row_sum: [['A', 'B'], each(`int base = i * len; float m = B(i);
+  for (int j = 0; j < len; j++) value += exp(A(base + j) - m);`)],
+  softmax: [['A', 'B', 'C'], each(`int row = i / len; float x = A(i) - B(row);
+  value = mode == 1 ? x - log(C(row)) : exp(x) / C(row);`)],
+  // Cross-entropy from the same row statistics (B = maxima, C = sums, D = class targets).
+  ce_rows: [['A', 'B', 'C', 'D'], each(`int t = clamp(int(max(D(i), 0.0)), 0, len - 1);
+  value = log(C(i)) - (A(i * len + t) - B(i));`)],
+  ce_grad: [['A', 'B', 'C', 'D'], each(`int row = i / len; int t = clamp(int(max(D(row), 0.0)), 0, len - 1);
+  value = (exp(A(i) - B(row)) / C(row) - (i - row * len == t ? 1.0 : 0.0)) / float(g.x);`)],
+  matmul: [['A', 'B'], each(`int M = g.x; int K = g.y; int N = g.z;
+  int batch = i / (M * N); int rc = i - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int ab = batch * sa.x + row * K; int bb = batch * sa.y + col;
+  for (int k = 0; k < K; k++) value += A(ab + k) * B(bb + k * N);`)],
+  optim: [['A', 'B', 'C'], each(`float a = A(i); float b = B(i);
+  if (op == 0) value = a - f.x * b;
+  else if (op == 1) value = f.x * a + f.y * b;
+  else if (op == 2) value = f.x < 0.5 ? a + f.x * (b - a) : b - (b - a) * (1.0 - f.x);
+  else if (op == 3) value = a * f.x + f.y * b * b;
+  else value = a - f.x * (b / (sqrt(C(i)) / f.y + f.z));`)],
+  life: [['A'], each(`int h = g.x; int w = g.y; int x = i % w; int y = i / w; int count = 0;
+  for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) if (dx != 0 || dy != 0) {
+    int xx = (x + dx + w) % w; int yy = (y + dy + h) % h; count += A(yy * w + xx) > 0.5 ? 1 : 0; }
+  value = count == 3 || (A(i) > 0.5 && count == 2) ? 1.0 : 0.0;`)],
+};
+const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
+const BINARY = {add: 0, sub: 1, mul: 2, div: 3}, MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
+const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_update: 4};
+const UNIFORMS = ['wO', 'nO', 'wA', 'wB', 'wC', 'wD', 'mode', 'op', 'len', 'd', 'sa', 'sb', 'g', 'f', 'tA', 'tB', 'tC', 'tD'];
+
+/** Fragment-shader compute on float textures: R32F where renderable, else RGBA32F. */
 export class WebGL2Backend {
-  static async create() {
+  static async create({debug = false} = {}) {
     const canvas=typeof OffscreenCanvas!=='undefined'?new OffscreenCanvas(1,1):globalThis.document?.createElement('canvas');
     check(canvas, 'UNAVAILABLE', 'No canvas implementation is available');
     const gl=canvas.getContext('webgl2',{powerPreference:'high-performance',failIfMajorPerformanceCaveat:true,
       antialias:false,depth:false,stencil:false,preserveDrawingBuffer:false});
     check(gl,'UNAVAILABLE','WebGL2 is unavailable');
-    const debug=gl.getExtension('WEBGL_debug_renderer_info');
-    const renderer=String(gl.getParameter(debug?debug.UNMASKED_RENDERER_WEBGL:gl.RENDERER));
+    const debugInfo=gl.getExtension('WEBGL_debug_renderer_info');
+    const renderer=String(gl.getParameter(debugInfo?debugInfo.UNMASKED_RENDERER_WEBGL:gl.RENDERER));
     if(/swiftshader|llvmpipe|softpipe|software|microsoft basic render/i.test(renderer)) {
       gl.getExtension('WEBGL_lose_context')?.loseContext();
       throw new ComputeError('UNAVAILABLE',`Hardware WebGL2 required; browser reported ${renderer}`);
@@ -18,44 +126,84 @@ export class WebGL2Backend {
       gl.getExtension('WEBGL_lose_context')?.loseContext();
       throw new ComputeError('UNAVAILABLE','WebGL2 floating-point render targets are unavailable');
     }
-    return new WebGL2Backend(gl,canvas);
+    return new WebGL2Backend(gl,canvas,{debug});
   }
-  constructor(gl,canvas) {
-    this.name='webgl2';this.description='WebGL2 fragment shaders on RGBA32F textures';
-    this.gl=gl;this.canvas=canvas;this.programs=new Map();this.lost=false;
-    this.textureBytes=0;this.peakTextureBytes=0;this.maxTextureBytes=DEFAULT_LIMITS.maxWebGLTextureBytes;
-    const debug=gl.getExtension('WEBGL_debug_renderer_info');
-    this.info={description:String(gl.getParameter(debug?debug.UNMASKED_RENDERER_WEBGL:gl.RENDERER)),
-      vendor:String(gl.getParameter(debug?debug.UNMASKED_VENDOR_WEBGL:gl.VENDOR)),powerPreference:gl.getContextAttributes()?.powerPreference};
+  constructor(gl,canvas,{debug=false}={}) {
+    this.name='webgl2';this.gl=gl;this.canvas=canvas;this.debug=debug;this.programs=new Map();this.lost=false;
+    this.textureBytes=0;this.peakTextureBytes=0;this.maxTextureBytes=DEFAULT_LIMITS.maxWebGLTextureBytes;this.pool=new Map();this.pooledBytes=0;
+    const debugInfo=gl.getExtension('WEBGL_debug_renderer_info');
+    this.info={description:String(gl.getParameter(debugInfo?debugInfo.UNMASKED_RENDERER_WEBGL:gl.RENDERER)),
+      vendor:String(gl.getParameter(debugInfo?debugInfo.UNMASKED_VENDOR_WEBGL:gl.VENDOR)),powerPreference:gl.getContextAttributes()?.powerPreference};
     this.maxTexture=gl.getParameter(gl.MAX_TEXTURE_SIZE);
     const viewport=gl.getParameter(gl.MAX_VIEWPORT_DIMS);
     this.maxWidth=Math.min(this.maxTexture,viewport[0]);this.maxHeight=Math.min(this.maxTexture,viewport[1]);
     this.framebuffer=gl.createFramebuffer();this.vao=gl.createVertexArray();
     canvas.addEventListener?.('webglcontextlost',()=>{this.lost=true;});
     gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);gl.disable(gl.DITHER);gl.bindVertexArray(this.vao);
+    // One scalar per texel. R32F stores it in 4 bytes; RGBA32F is the fallback where R32F is not renderable.
+    this.r32f=this.renderable(gl.R32F,gl.RED);this.texelBytes=this.r32f?4:16;
+    // RGBA/FLOAT readback is always allowed; RED/FLOAT (a quarter of the bytes) only where the driver reports it.
+    this.readRed=this.r32f&&this.renderable(gl.R32F,gl.RED,true);
+    this.description=`WebGL2 fragment shaders on ${this.r32f?'R32F':'RGBA32F'} textures`;
+  }
+  renderable(internal,format,readsRed=false) {
+    const gl=this.gl,t=gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D,t);gl.texImage2D(gl.TEXTURE_2D,0,internal,1,1,0,format,gl.FLOAT,null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,this.framebuffer);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+    let ok=gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE;
+    if(ok&&readsRed)ok=gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT)===gl.RED&&gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE)===gl.FLOAT;
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,null,0);gl.deleteTexture(t);gl.getError();
+    return ok;
   }
   live(){check(!this.lost&&!this.gl.isContextLost(),'DEVICE_LOST','WebGL context is lost');}
-  async begin(plan){this.live();this.maxTextureBytes=plan?.limits.maxWebGLTextureBytes??DEFAULT_LIMITS.maxWebGLTextureBytes;this.peakTextureBytes=this.textureBytes;}
-  allocationStats(){return {webglTexturePeakBytes:this.peakTextureBytes};}
+  limitHints(){return {maxElements:Math.min(DEFAULT_LIMITS.maxElements,1024*this.maxHeight),maxWork:500000000};}
+  async begin(plan){this.live();this.maxTextureBytes=plan?.limits.maxWebGLTextureBytes??DEFAULT_LIMITS.maxWebGLTextureBytes;this.peakTextureBytes=this.textureBytes-this.pooledBytes;}
+  allocationStats(){return {webglTexturePeakBytes:this.peakTextureBytes,webglTextureFormat:this.r32f?'R32F':'RGBA32F'};}
+  layout(size){const width=Math.min(size,1024,this.maxWidth);return {width,height:Math.ceil(size/width)};}
+  /** Deletes pooled textures (oldest first) until `bytes` more fit in the live budget. */
+  evict(bytes){
+    for(const [key,list] of this.pool){
+      while(list.length&&this.textureBytes+bytes>this.maxTextureBytes){const t=list.shift();this.gl.deleteTexture(t.texture);this.textureBytes-=t.bytes;this.pooledBytes-=t.bytes;}
+      if(!list.length)this.pool.delete(key);
+      if(this.textureBytes+bytes<=this.maxTextureBytes)return;
+    }
+  }
   alloc(size,data) {
-    this.live();const gl=this.gl;
-    const width=Math.min(size,1024,this.maxWidth),height=Math.ceil(size/width);
+    this.live();const gl=this.gl,{width,height}=this.layout(size),key=`${width}x${height}`;
     check(height<=this.maxHeight,'LIMIT','Tensor exceeds WebGL texture/viewport limits');
-    const bytes=width*height*16;
-    check(this.textureBytes+bytes<=this.maxTextureBytes,'LIMIT','WebGL texture allocation budget exceeded (RGBA32F, padding and scratch included)');
-    const texture=gl.createTexture();check(texture,'GPU','WebGL texture allocation failed');
-    gl.bindTexture(gl.TEXTURE_2D,texture);
-    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
-    let rgba=null;
-    if(data) {rgba=new Float32Array(width*height*4);for(let i=0;i<size;i++)rgba[4*i]=data[i];}
-    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,width,height,0,gl.RGBA,gl.FLOAT,rgba);
-    const error=gl.getError();
-    if(error!==gl.NO_ERROR){gl.deleteTexture(texture);throw new ComputeError('GPU',`Texture allocation error ${error}`);}
-    this.textureBytes+=bytes;this.peakTextureBytes=Math.max(this.peakTextureBytes,this.textureBytes);
-    return {texture,width,height,size,bytes,freed:false};
+    const bytes=width*height*(this.texelBytes??16);
+    let texture=this.pool.get(key)?.pop()?.texture;
+    if(texture)this.pooledBytes-=bytes;
+    else {
+      if(this.textureBytes+bytes>this.maxTextureBytes)this.evict(bytes);
+      check(this.textureBytes+bytes<=this.maxTextureBytes,'LIMIT',`WebGL texture allocation budget exceeded (${this.r32f?'R32F':'RGBA32F'}, padding and scratch included)`);
+      texture=gl.createTexture();check(texture,'GPU','WebGL texture allocation failed');
+      gl.bindTexture(gl.TEXTURE_2D,texture);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+      gl.texStorage2D(gl.TEXTURE_2D,1,this.r32f?gl.R32F:gl.RGBA32F,width,height);
+      // Only new textures are checked; pooled ones already passed.
+      const error=gl.getError();
+      if(error!==gl.NO_ERROR){gl.deleteTexture(texture);throw new ComputeError('GPU',`Texture allocation error ${error}`);}
+      this.textureBytes+=bytes;
+    }
+    this.peakTextureBytes=Math.max(this.peakTextureBytes,this.textureBytes-this.pooledBytes);
+    const handle={texture,width,height,size,bytes,key,freed:false};
+    if(data)this.upload(handle,data);
+    return handle;
+  }
+  upload(h,data) {
+    const gl=this.gl;gl.bindTexture(gl.TEXTURE_2D,h.texture);
+    if(this.r32f){
+      const rows=Math.floor(h.size/h.width),rest=h.size-rows*h.width;
+      if(rows)gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,h.width,rows,gl.RED,gl.FLOAT,data,0);
+      if(rest)gl.texSubImage2D(gl.TEXTURE_2D,0,0,rows,rest,1,gl.RED,gl.FLOAT,data,rows*h.width);
+    } else {
+      const rgba=new Float32Array(h.width*h.height*4);for(let i=0;i<h.size;i++)rgba[4*i]=data[i];
+      gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,h.width,h.height,gl.RGBA,gl.FLOAT,rgba);
+    }
   }
   shader(type,code) {
     const gl=this.gl,s=gl.createShader(type);check(s,'GPU','Shader allocation failed');
@@ -65,86 +213,123 @@ export class WebGL2Backend {
     }
     return s;
   }
-  program(fragment) {
-    if(this.programs.has(fragment))return this.programs.get(fragment);
-    const gl=this.gl;let vs,fs,p;
+  program(name) {
+    if(this.programs.has(name))return this.programs.get(name);
+    const gl=this.gl,[inputs,body]=KERNELS[name];let vs,fs,p;
     try {
       vs=this.shader(gl.VERTEX_SHADER,`#version 300 es
       const vec2 positions[3]=vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));
       void main(){gl_Position=vec4(positions[gl_VertexID],0.,1.);}`);
-      fs=this.shader(gl.FRAGMENT_SHADER,fragment);p=gl.createProgram();check(p,'GPU','Program allocation failed');
+      fs=this.shader(gl.FRAGMENT_SHADER,`${PRELUDE}\n${io(inputs)}\n${body}`);p=gl.createProgram();check(p,'GPU','Program allocation failed');
       gl.attachShader(p,vs);gl.attachShader(p,fs);gl.linkProgram(p);
       check(gl.getProgramParameter(p,gl.LINK_STATUS),'SHADER',gl.getProgramInfoLog(p)||'Shader link failed');
-      if(this.programs.size>=128){const key=this.programs.keys().next().value;gl.deleteProgram(this.programs.get(key));this.programs.delete(key);}
-      this.programs.set(fragment,p);return p;
+      const entry={program:p,inputs:inputs.length,loc:Object.fromEntries(UNIFORMS.map(u=>[u,gl.getUniformLocation(p,u)]))};
+      this.programs.set(name,entry);return entry;
     } catch(error) {if(p)gl.deleteProgram(p);throw error;}
     finally {if(vs)gl.deleteShader(vs);if(fs)gl.deleteShader(fs);}
   }
   attach(h) {
     const gl=this.gl;gl.bindFramebuffer(gl.FRAMEBUFFER,this.framebuffer);
     gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,h.texture,0);
-    check(gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE,'GPU','Float framebuffer is incomplete');
+    if(this.debug)check(gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE,'GPU','Float framebuffer is incomplete');
   }
-  dispatch(out,inputs,body) {
-    this.live();const gl=this.gl;
-    const declarations=inputs.map((h,i)=>`uniform highp sampler2D tex${i};
-      float ${i===0?'A':'B'}(int j){return texelFetch(tex${i},ivec2(j%${h.width},j/${h.width}),0).r;}`).join('\n');
-    const code=`#version 300 es
-      precision highp float; precision highp int;
-      ${declarations}
-      out vec4 resultColor;
-      void main(){int i=int(gl_FragCoord.y)*${out.width}+int(gl_FragCoord.x);
-        if(i>=${out.size}){resultColor=vec4(0.);return;}
-        float value=0.; ${body} resultColor=vec4(value,0.,0.,0.);}`;
-    const program=this.program(code);gl.useProgram(program);this.attach(out);gl.viewport(0,0,out.width,out.height);
-    inputs.forEach((h,i)=>{gl.activeTexture(gl.TEXTURE0+i);gl.bindTexture(gl.TEXTURE_2D,h.texture);gl.uniform1i(gl.getUniformLocation(program,`tex${i}`),i);});
-    gl.bindVertexArray(this.vao);gl.drawArrays(gl.TRIANGLES,0,3);
-    const error=gl.getError();check(error===gl.NO_ERROR,'GPU',`WebGL dispatch error ${error}`);
+  /** One draw over the output texture. Driver errors are checked at readback, or here in debug mode. */
+  dispatch(kernel,uniforms,inputs,out) {
+    this.live();const gl=this.gl,p=this.program(kernel),loc=p.loc;
+    gl.useProgram(p.program);this.attach(out);gl.viewport(0,0,out.width,out.height);
+    inputs.forEach((h,i)=>{const name=SAMPLERS[i];gl.activeTexture(gl.TEXTURE0+i);gl.bindTexture(gl.TEXTURE_2D,h.texture);
+      if(loc[`t${name}`])gl.uniform1i(loc[`t${name}`],i);if(loc[`w${name}`])gl.uniform1i(loc[`w${name}`],h.width);});
+    gl.uniform1i(loc.wO,out.width);gl.uniform1i(loc.nO,out.size);
+    for(const [name,value] of Object.entries(uniforms)){
+      const l=loc[name];if(!l)continue;
+      if(name==='f')gl.uniform4fv(l,value);else if(Array.isArray(value))gl.uniform4iv(l,value);else gl.uniform1i(l,value);
+    }
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    if(this.debug){const error=gl.getError();check(error===gl.NO_ERROR,'GPU',`WebGL dispatch error ${error} in ${kernel}`);}
+  }
+  pairwise(input,out) {
+    const scratch=[];
+    try {
+      if(input.size===1){this.dispatch('scale',{f:[1,0,0,0]},[input],out);return;}
+      while(input.size>1){const length=Math.ceil(input.size/2),next=length===1?out:this.alloc(length);
+        if(next!==out)scratch.push(next);
+        this.dispatch('pair',{len:input.size},[input],next);input=next;
+      }
+    } finally {for(const h of scratch)this.free(h);}
+  }
+  /** Row maxima, then row sums of exp(x - max), each an [rows] texture. */
+  rowStats(a,rows,cols) {
+    const max=this.alloc(rows);let sum=null;
+    try {
+      this.dispatch('row_max',{len:cols},[a],max);sum=this.alloc(rows);this.dispatch('row_sum',{len:cols},[a,max],sum);
+      return {max,sum};
+    } catch(error){this.free(max);if(sum)this.free(sum);throw error;}
   }
   async run(n,refs) {
     if(n.op==='input')return this.alloc(n.size,n.data);
-    const out=this.alloc(n.size);
+    const out=this.alloc(n.size),[a]=refs;
     try {
       switch(n.op) {
-        case 'full':this.dispatch(out,[],`value=${glFloat(n.value)};`);break;
-        case 'add':case 'sub':case 'mul':
-          this.dispatch(out,refs,`value=A(${n.aScalar?'0':'i'})${{add:'+',sub:'-',mul:'*'}[n.op]}B(${n.bScalar?'0':'i'});`);break;
-        case 'relu':this.dispatch(out,refs,'value=max(A(i),0.);');break;
-        case 'positive':this.dispatch(out,refs,'value=A(i)>0.?1.:0.;');break;
-        case 'transpose':this.dispatch(out,refs,`value=A((i%${n.shape[1]})*${n.shape[0]}+i/${n.shape[1]});`);break;
-        case 'matmul':this.dispatch(out,refs,`int row=i/${n.n};int col=i%${n.n};
-          for(int k=0;k<${n.k};k++){value+=A(row*${n.k}+k)*B(k*${n.n}+col);}`);break;
-        case 'sum': {
-          let input=refs[0];const scratch=[];
+        case 'full':this.dispatch('fill',{f:[n.value,0,0,0]},[],out);break;
+        case 'add':case 'sub':case 'mul':case 'div':
+          this.dispatch('binary',{mode:MODE[n.mode],op:BINARY[n.op],...(n.mode==='general'?{d:n.dims,sa:n.aStrides,sb:n.bStrides}:{})},refs,out);break;
+        case 'relu':case 'positive':case 'neg':case 'exp':case 'log':case 'sqrt':
+        case 'tanh':case 'sigmoid':case 'gelu':case 'gelu_grad':this.dispatch('unary',{op:UNARY[n.op]},refs,out);break;
+        case 'transpose':case 'permute':this.dispatch('gather',{d:n.dims,sa:n.srcStrides},refs,out);break;
+        case 'sum':case 'mean':
+          if(n.whole){
+            if(n.op==='sum'){this.pairwise(a,out);break;}
+            const total=this.alloc(1);
+            try{this.pairwise(a,total);this.dispatch('scale',{f:[n.inputSize,0,0,0]},[total],out);}finally{this.free(total);}
+          } else this.dispatch('reduce',{len:n.len,mode:+(n.op==='mean'),g:[n.inner,0,0,0]},refs,out);
+          break;
+        case 'softmax':case 'log_softmax':case 'cross_entropy':case 'cross_entropy_grad': {
+          const {max,sum}=this.rowStats(a,n.rows,n.cols);
           try {
-            while(input.size>1){const length=Math.ceil(input.size/2),next=length===1?out:this.alloc(length);
-              if(next!==out)scratch.push(next);
-              this.dispatch(next,[input],`int j=i*2;value=A(j);if(j+1<${input.size})value+=A(j+1);`);input=next;
+            if(n.op==='softmax'||n.op==='log_softmax')this.dispatch('softmax',{len:n.cols,mode:+(n.op==='log_softmax')},[a,max,sum],out);
+            else if(n.op==='cross_entropy_grad')this.dispatch('ce_grad',{len:n.cols,g:[n.rows,0,0,0]},[a,max,sum,refs[1]],out);
+            else {
+              const rows=this.alloc(n.rows),total=this.alloc(1);
+              try {
+                this.dispatch('ce_rows',{len:n.cols},[a,max,sum,refs[1]],rows);
+                this.pairwise(rows,total);this.dispatch('scale',{f:[n.rows,0,0,0]},[total],out);
+              } finally {this.free(rows);this.free(total);}
             }
-            if(refs[0].size===1)this.dispatch(out,refs,'value=A(0);');
-          } finally {for(const h of scratch)this.free(h);}break;
+          } finally {this.free(max);this.free(sum);}
+          break;
         }
-        case 'life': {
-          const [h,w]=n.shape;
-          this.dispatch(out,refs,`int x=i%${w};int y=i/${w};int count=0;
-            for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++)if(dx!=0||dy!=0){
-              int xx=(x+dx+${w})%${w};int yy=(y+dy+${h})%${h};count+=A(yy*${w}+xx)>0.5?1:0;}
-            value=count==3||(A(i)>0.5&&count==2)?1.:0.;`);break;
+        case 'matmul':this.dispatch('matmul',{g:[n.m,n.k,n.n,n.batch],sa:[n.aBatchStride,n.bBatchStride,0,0]},refs,out);break;
+        case 'sgd_update':case 'momentum_update':case 'adam_m':case 'adam_v':case 'adam_update': {
+          const scalars={sgd_update:[n.lr],momentum_update:[n.momentum,n.w],adam_m:[n.w],adam_v:[n.beta2,n.w],
+            adam_update:[n.stepSize,n.bc2Sqrt,n.eps]}[n.op];
+          this.dispatch('optim',{op:OPTIM[n.op],f:[...scalars,0,0,0].slice(0,4)},[refs[0],refs[1],refs[2]??refs[1]],out);break;
         }
+        case 'life':this.dispatch('life',{g:[n.shape[0],n.shape[1],0,0]},refs,out);break;
       }
       return out;
     }catch(error){this.free(out);throw error;}
   }
-  async read(h) {
-    this.live();const gl=this.gl;this.attach(h);
+  readInto(h) {
+    const gl=this.gl;this.attach(h);
+    // readPixels is synchronous. The API remains awaitable, not non-blocking.
+    if(this.readRed){const red=new Float32Array(h.width*h.height);gl.readPixels(0,0,h.width,h.height,gl.RED,gl.FLOAT,red);return red.length===h.size?red:red.slice(0,h.size);}
     const rgba=new Float32Array(h.width*h.height*4);
-    // readPixels is synchronous in this fallback. The API remains awaitable, not non-blocking.
     gl.readPixels(0,0,h.width,h.height,gl.RGBA,gl.FLOAT,rgba);
-    check(gl.getError()===gl.NO_ERROR,'GPU','WebGL float readback failed');
     const result=new Float32Array(h.size);for(let i=0;i<h.size;i++)result[i]=rgba[i*4];return result;
   }
-  free(h){if(!h.freed){this.gl.deleteTexture(h.texture);this.textureBytes-=h.bytes;h.freed=true;}}
+  async readAll(handles) {
+    this.live();const results=handles.map(h=>this.readInto(h));
+    // The execution's one driver-error check covers every allocation, draw and readback.
+    const error=this.gl.getError();check(error===this.gl.NO_ERROR,'GPU',`WebGL error ${error} during execution or readback`);
+    return results;
+  }
+  async read(h){return (await this.readAll([h]))[0];}
+  free(h){
+    if(h.freed)return;h.freed=true;
+    (this.pool.get(h.key)??this.pool.set(h.key,[]).get(h.key)).push({texture:h.texture,bytes:h.bytes});this.pooledBytes+=h.bytes;
+  }
   async finish(){this.live();}
-  dispose(){const gl=this.gl;for(const p of this.programs.values())gl.deleteProgram(p);this.programs.clear();gl.deleteFramebuffer(this.framebuffer);gl.deleteVertexArray(this.vao);gl.getExtension('WEBGL_lose_context')?.loseContext();}
+  dispose(){const gl=this.gl;for(const p of this.programs.values())gl.deleteProgram(p.program);this.programs.clear();
+    for(const list of this.pool.values())for(const t of list)gl.deleteTexture(t.texture);this.pool.clear();
+    gl.deleteFramebuffer(this.framebuffer);gl.deleteVertexArray(this.vao);gl.getExtension('WEBGL_lose_context')?.loseContext();}
 }
-function glFloat(value){const s=String(value);return s.includes('.')||s.includes('e')?s:`${s}.0`;}

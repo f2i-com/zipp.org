@@ -1,0 +1,18 @@
+step 1 nodes 44 outputs 14
+step 2 nodes 44 outputs 14
+step 3 nodes 44 outputs 14
+step 4 nodes 44 outputs 14
+step 5 nodes 44 outputs 14
+step 6 nodes 44 outputs 14
+step 7 nodes 44 outputs 14
+step 8 nodes 44 outputs 14
+relu loss x1000 [1015, 941, 862, 781, 700, 620, 547, 479] fell True correct 9 of 9
+step 1 nodes 44 outputs 14
+step 2 nodes 44 outputs 14
+step 3 nodes 44 outputs 14
+step 4 nodes 44 outputs 14
+step 5 nodes 44 outputs 14
+step 6 nodes 44 outputs 14
+step 7 nodes 44 outputs 14
+step 8 nodes 44 outputs 14
+gelu loss x1000 [1005, 933, 853, 763, 664, 559, 456, 359] fell True correct 9 of 9

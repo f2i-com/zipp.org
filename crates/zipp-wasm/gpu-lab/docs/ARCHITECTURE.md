@@ -64,14 +64,73 @@ finiteness pass for the typed form. `runtime.execute(program, {typedOutputs: tru
 returns each output's `data` as a `Float32Array` of its own instead of a list;
 `zipp-python-adapter.mjs` asks for that when a request's inputs are typed.
 
-An empty shape means one scalar, not an empty array. Shapes are restricted to rank
-zero through two. Empty tensors and general broadcasting are intentionally absent.
-This keeps initial semantics explicit and testable.
+An empty shape means one scalar, not an empty array. Version 1 restricted shapes to
+rank zero through two and matched shapes (or a scalar) elementwise. Empty tensors
+are still intentionally absent. This keeps initial semantics explicit and testable.
 
 There is no guest-provided shader string, dynamic property dispatch, URL, JavaScript
 function, or host memory address in the protocol. Only fixed operation names enter
 the kernel generators. Source specialization uses host-validated finite numbers and
 bounded positive dimensions, not concatenated guest code.
+
+## Graph IR v2
+
+`"version": 2` names the extended operation set. One validator serves both versions
+and every version-1 graph means exactly the same thing under version 2, so a host
+that only ever sees v1 programs keeps its behaviour. Stage 1 targets dense
+classification: a whole MLP training step — forward, loss, backward and the update
+of every parameter and optimizer moment — is expressible as one graph, so optimizer
+state stays on the device between steps instead of being read back and re-uploaded.
+
+| Family | Operations | Shape rule |
+|---|---|---|
+| Sources | `input`, `full` | declared shape, rank 0-4 |
+| Elementwise binary | `add`, `sub`, `mul`, `div` | NumPy broadcasting, right-aligned |
+| Elementwise unary | `neg`, `exp`, `log`, `sqrt`, `tanh`, `sigmoid`, `relu`, `positive`, `gelu`, `gelu_grad` | shape preserved |
+| Shape | `reshape`, `permute` (`dims`), `transpose` (matrices) | element count preserved |
+| Reductions | `sum`, `mean`, with an optional `axis` and `keepdim` | axis removed, kept as 1, or whole tensor |
+| Rows | `softmax`, `log_softmax` | last axis only, shape preserved |
+| Linear algebra | `matmul` | `[M,K]@[K,N]`, or batched `[B,M,K]@[B,K,N]` where a batch of 1 or a matrix broadcasts |
+| Losses | `cross_entropy`, `cross_entropy_grad` | logits `[N,C]` with integer class targets `[N]` |
+| Optimizers | `sgd_update`, `momentum_update`, `adam_m`, `adam_v`, `adam_update` | equal shapes |
+| Other | `life` | matrix, shape preserved |
+
+Every kernel addresses a tensor as four dimensions padded on the left, with a
+stride vector per operand; a stride of zero repeats a broadcast axis and a
+permutation is the same strided gather. Binary nodes also carry a `mode`
+(`same`, `aScalar`, `bScalar`, `general`) so the common cases skip stride
+arithmetic. The validator derives all of this, including the padded dims and
+strides, before any backend allocates: kernels never recompute shape logic from
+guest fields.
+
+Numerical rules that all four backends share:
+
+- **Rounding.** Every intermediate is float32. Matrix products and axis reductions
+  accumulate each output in index order, so the WASM kernels reproduce the
+  JavaScript reference bit for bit; transcendental functions are evaluated in
+  double (or by the shared polynomial approximations on the GPUs) and rounded once,
+  agreeing to about one float32 ulp.
+- **Whole-tensor reductions** use a pairwise tree, the same topology on all
+  backends, so `sum` does not depend on the device's reduction width.
+- **Softmax family** subtracts the row maximum before exponentiating.
+  `cross_entropy` is fused: it reuses those row statistics rather than composing
+  `log_softmax` with a gather, and its gradient is `(softmax - onehot)/N`.
+- **GELU** is the exact-erf form `0.5*x*(1 + erf(x/sqrt(2)))`, not the tanh
+  approximation. No backend language has `erf`, so all of them evaluate one shared
+  approximation: an odd Taylor series for `|z| < 0.5` and Numerical Recipes' erfc
+  Chebyshev fit above it (fractional error below 1.2e-7). `src/kernel-math.mjs`
+  is its normative statement; the WGSL, GLSL and C copies mirror it line for line.
+- **NaN.** `relu` keeps NaN rather than folding it to zero (`max(x, 0)` would
+  differ between platforms), row maxima propagate NaN, and the readback check
+  rejects any non-finite output with `NUMBER`. A graph that diverges therefore
+  fails the same way on every backend instead of returning plausible numbers on
+  one and an error on another.
+- **Adam and momentum** follow PyTorch's evaluation order, including its
+  `torch.lerp` branch for the first moment. Bias corrections are host constants
+  computed once during validation, so no backend evaluates `pow`.
+
+Integer class targets are validated as data (an `input` node holding integers in
+`[0, C)`) before any kernel indexes with them.
 
 ## Memory ownership
 
@@ -89,17 +148,43 @@ copied into a mapped upload allocation. A readback uses a separate MAP_READ stag
 buffer, awaits mapping, copies the data, unmaps, and destroys the staging buffer.
 It is not zero-copy CPU-to-GPU sharing.
 
-The WebGL2 backend stores one scalar in the red channel of each RGBA32F texel. This
-is deliberately simple and wasteful: texture storage uses four float channels.
-Texel indexing can cross texture rows; padding does not become logical output.
-`readPixels` is synchronous in this backend. Calling it from an async function does
-not make that native call non-blocking, which is one reason to run it in a Worker.
+One execution records **one** command encoder and one compute pass: every node's
+dispatch goes into it and the queue is submitted once, when the outputs are copied
+into a single staging buffer. Buffers are pooled by rounded byte size across
+executions, so a repeated training step stops calling `createBuffer`. A buffer
+freed *during* an execution is only reused for an output, never re-uploaded as an
+input, because a `writeBuffer` would land ahead of commands already recorded
+against it. Shapes and scalars travel in a 96-byte uniform block written into
+256-byte slots of a per-execution chunk buffer, uploaded once at submit; pipelines
+are therefore keyed by kernel name, not by shape, and no graph value ever enters
+shader text. Validation and out-of-memory error scopes are pushed once per
+execution (per node in `debug` mode) and awaited together with the queue drain.
+
+The WebGL2 backend stores one scalar per texel: R32F (4 bytes) where the driver
+reports it renderable, falling back to RGBA32F (16 bytes) where it does not, with
+readback through `RED/FLOAT` only where `IMPLEMENTATION_COLOR_READ_FORMAT` allows
+it. Texel indexing can cross texture rows; padding does not become logical output.
+Programs are uniform-parameterized, so one program per kernel serves every shape,
+and textures are pooled by layout. `gl.getError()` and `checkFramebufferStatus`
+are *not* called per dispatch: one `getError()` after the execution's readbacks
+covers every draw and read, and `createRuntime({debug: true})` restores the
+per-dispatch checks. The one remaining eager check is a `getError()` after a
+texture's *first* allocation, so an out-of-memory driver is attributed to the
+allocation rather than to a later draw; pooled reuses skip it. `readPixels` is
+synchronous in this backend.
+Calling it from an async function does not make that native call non-blocking,
+which is one reason to run it in a Worker.
 
 The WASM backend uses a bounded arena, rebinding views after memory growth. The arena
 is reset between serial graph executions. Individual `free()` calls do not shrink
 its arena; tests exercise large allocations and repeated executions. Its module has
 no imports. Memory committed by the WebAssembly instance may remain at its previous
-high-water mark until the instance is released.
+high-water mark until the instance is released. The kernels are compiled with
+`-msimd128 -ffp-contract=off`: matrix products use a 4x8 register block holding
+eight `v128` accumulators across `k`, which keeps each output's summation in `k`
+order, so the result still matches the JavaScript reference bit for bit. Browsers
+without WebAssembly SIMD cannot instantiate this module and fall back to the
+JavaScript reference, which is a backend-availability failure, not a wrong answer.
 
 ## Lifecycle and availability
 
@@ -120,22 +205,44 @@ stop host execution but cannot promise to cancel work already submitted to a GPU
 
 ## Resource guardrails, not a new security proof
 
-Defaults include 512 graph nodes, at most 1,048,576 elements per tensor, 4096 per
-dimension, at most 1,048,576 aggregate input elements and requested output elements,
-16 named outputs, a 32 MiB summed logical node-allocation budget, and 100 million
+Defaults include 512 graph nodes, at most 4,194,304 elements per tensor, 65,536 per
+dimension, at most 4,194,304 aggregate input elements and requested output elements,
+64 named outputs, a 64 MiB summed logical node-allocation budget, and 100 million
 estimated work units per graph. These defaults are development policy, not a
-universal hardware optimum. The trusted host can provide tighter limits.
+universal hardware optimum. They are sized so that an MNIST-scale MLP training step
+(784-256-10, batch 64, Adam: ~58M work units, 254k uploaded and 611k read-back
+elements) is accepted; they are not sized for a model that does not fit in a browser
+tab.
 
-The work estimate counts matrix multiply by its dimension product, elementwise
-operations by element count, reductions by roughly twice input length, and cellular
-updates by nine reads per cell. It is not a GPU-time predictor or a substitute for
-browser watchdogs. Logical bytes are not exact VRAM usage: texture packing, padding,
-reduction scratch, staging, drivers, and in-flight command retention add overhead.
+Limits are resolved in three layers: these policy defaults, then the backend's
+`limitHints()` — what the device and implementation can actually sustain — and then
+the host's own `createRuntime({limits: ...})`, which always wins. `runtime.info()`
+reports the result. The hints raise the work budget where the implementation is
+faster (SIMD WASM 400M, WebGL2 500M, WebGPU 1G) and *lower* the element ceiling
+where the device is smaller: WebGPU derives it from
+`min(maxStorageBufferBindingSize, maxBufferSize)/4` and WebGL2 from its maximum
+texture/viewport height. A hint never raises a size limit past the policy default.
+
+Element counts are checked factor by factor while a shape is parsed, so a product
+never leaves the safe-integer range before it is compared, and both the logical
+byte total and the work total are re-checked after every node. A hostile graph is
+bounded by node count, per-tensor elements, aggregate input and output elements,
+logical bytes and work — raising the ceilings above does not remove any of those
+checks.
+
+The work estimate counts matrix multiply by twice its dimension product (batched by
+its batch count), elementwise operations by element count (transcendental ones by
+four times that), reductions by roughly twice input length, softmax and
+cross-entropy by four passes, optimizer steps by eight units per element, and
+cellular updates by nine reads per cell. It is not a GPU-time predictor or a
+substitute for browser watchdogs. Logical bytes are not exact VRAM usage: texture
+packing, padding, reduction scratch, staging, drivers, and in-flight command
+retention add overhead.
 
 The guest VM's instruction budget does not meter shaders. Keep an independent
 compute permission, per-tenant request limits, queue bounds, and host deadlines.
 Do not call this prototype a hardened multi-tenant GPU sandbox before additional
-review and actual-device testing. Raw custom shaders are not exposed in v1.
+review and actual-device testing. Raw custom shaders are exposed in neither version.
 
 ## What to optimize next, in order
 
@@ -158,11 +265,14 @@ nodes and kernels. Cache by structural expression and relevant dtype/shape polic
 Compare kernel launch savings against shader compile cost and cache growth. Keep a
 reference interpreter and a way to disable fusion during differential tests.
 
-**Fourth: tiled matrix kernels and batching.** Replace naive per-output matrix
-loops with a tuned tiled WebGPU kernel, measuring workgroup memory, register
-pressure, non-square shapes, and edge tiles. Avoid placing workgroup barriers inside
-non-uniform bounds branches. Group graph commands into fewer submissions where
-resource/error semantics permit. Do not generalize WebGPU-only features to WebGL.
+**Fourth: tiled matrix kernels and batching.** Partly done. WebGPU multiplies
+through 16x16 workgroup tiles (bounds handled by zero padding, so every invocation
+reaches both barriers rather than branching around them) and the WASM kernels use a
+4x8 register block; a graph is now one submission with pooled buffers. Still naive:
+the WebGL2 matmul remains a per-output loop over `k`, because fragment shaders have
+no workgroup memory and the equivalent needs multiple render targets and scissor
+tiling. Still unmeasured: workgroup-memory and register-pressure tuning against
+non-square and edge-tile shapes. Do not generalize WebGPU-only features to WebGL.
 
 **Fifth: persistent device sessions.** Retain weights and simulation states across
 graph requests. Introduce opaque generation-scoped tensor handles, explicit close,
@@ -195,7 +305,11 @@ cleanup/finish. No speedup is claimed by the validation artifacts.
 ## WebGL physical texture budget
 
 `maxWebGLTextureBytes` (128 MiB by default) is checked before each texture allocation.
-It charges padded width × height × 16 bytes for RGBA32F, including intermediate
-reduction textures; frees return those bytes to the live budget. The result's
-`webglTexturePeakBytes` reports peak requested texture storage. Driver overhead,
-program objects and CPU-side staging/readback allocations are outside this counter.
+It charges padded width × height × 4 bytes on R32F devices and × 16 bytes on the
+RGBA32F fallback, including intermediate reduction and row-statistic textures.
+Freed textures stay charged while they sit in the pool and are evicted (oldest
+first) when a new allocation would otherwise exceed the ceiling; `stats.webglTextureFormat`
+reports which format is in use. The result's `webglTexturePeakBytes` reports peak
+*live* requested texture storage — pooled-but-unused textures are excluded. Driver
+overhead, program objects and CPU-side staging/readback allocations are outside
+this counter.

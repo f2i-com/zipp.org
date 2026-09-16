@@ -107,7 +107,7 @@ on each call; persistent GPU models and GPU Conv2d training are not implemented.
 | `pythonCall(name, args)` | call it with an array of host values (integers, strings, booleans, null, arrays) and get host data back; a throw leaves the engine usable and classifies as `guest` |
 | `takeUi()` | drain the `ui` module's command buffer: `[["rect", x, y, w, h, color], ...]` |
 | `setPythonInput(json)` | replace the input snapshot `ui.mouse()`/`clicked()`/`key()`/`button()`/`width()`/`height()` read: `{"mx","my","down","clicked","keys":{...},"w","h"}` |
-| `takeHostRequests()` | drain the program's pending host requests: `[{id, kind, payload}, ...]`; today the one kind is `"gpu.execute"`, whose payload is a `zipp_gpu` compute graph (plain data, protocol version 1) |
+| `takeHostRequests()` | drain the program's pending host requests: `[{id, kind, payload}, ...]`; today the one kind is `"gpu.execute"`, whose payload is a `zipp_gpu` compute graph (plain data, protocol version 1 or 2 — 2 as soon as the graph uses an operation, rank or broadcast the first version did not define) |
 | `pythonCall("__zipp_py_deliver", [id, reply])` | answer a host request: `reply` is `{ok: true, value}` or `{ok: false, error: {code, message}}`; the program's callback runs inside this call, and the result is `true` when the id was pending |
 
 `playground/` is a complete host over this surface (and over the JavaScript ABI
@@ -125,7 +125,9 @@ Torch adapter and are also available directly.
 #### GPU compute for Python programs
 
 A Python program imports the bundled `zipp_gpu` library, records a float32
-graph with tensor arithmetic (`+`, `-`, `*`, `@`, `relu`, `sum`, `life`) and
+graph with tensor arithmetic (broadcasting `+ - * /`, `@` for matrices and
+batches, activations, axis reductions, softmax, cross-entropy with its
+gradient, SGD/momentum/Adam steps and `life`; see `gpu-lab/README.md`) and
 calls `Graph.submit(callback, on_error=None, **outputs)`. The graph leaves the
 engine as a `gpu.execute` host request; nothing inside the engine touches a
 GPU. `gpu-lab/` (the vendored GPU Lab: `src/runtime.mjs` and its WebGPU,
@@ -147,7 +149,9 @@ adapter.invalidate(); await adapter.idle(); compute.dispose();   // teardown, in
 ```
 
 The grant is explicit (`allowExecute`), requests are admitted one at a time
-with pending and lifetime quotas, an explicit backend choice is never
+with pending and lifetime quotas (an over-quota request is refused through its
+own `on_error`, after the current drain and the work ahead of it, so a callback
+that resubmits cannot recurse into the host), an explicit backend choice is never
 downgraded to a CPU implementation, a late result never reaches a disposed
 engine, and the host validates every graph itself (shapes, node count, work
 and allocation budgets) before a kernel runs. Tensor data moves as bytes: a

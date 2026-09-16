@@ -35,12 +35,15 @@ async def main():
     gpu=Graph()
     a=gpu.tensor([1,2,3,4]);b=gpu.tensor([10,20,30,40])
     c=(a*b+4).relu()
-    result=await gpu.run(transport,result=c,total=c.sum())
+    result=await transport(gpu.program(result=c,total=c.sum(),mean=c.mean(),best=c.softmax()))
     print("Backend:",result["backend"])
     print("Result: ",result["outputs"]["result"]["data"])
     print("Total:  ",result["outputs"]["total"]["data"][0])
+    print("Mean:   ",result["outputs"]["mean"]["data"][0])
     assert result["outputs"]["result"]["data"]==[14,44,94,164]
     assert result["outputs"]["total"]["data"]==[316]
+    assert result["outputs"]["mean"]["data"]==[79]
+    assert abs(sum(result["outputs"]["best"]["data"])-1)<1e-5
 
 if __name__=="__main__":
     try:asyncio.run(main())

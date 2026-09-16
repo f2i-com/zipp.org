@@ -9,12 +9,13 @@ Current checks are separated by what they establish:
 
 | Check | Coverage |
 |---|---|
-| `npm test` in gpu-lab | JS/WASM numerical behavior, validators, adapter contracts, WebGPU lifecycle mocks, WebGL texture-budget bookkeeping |
-| `python tests/test_python.py` | Native Python graph construction/export |
+| `npm test` in gpu-lab | JS/WASM numerical behavior, validators, adapter contracts, WebGPU lifecycle mocks, WebGL texture-budget bookkeeping, IR v2 differentials and finite-difference gradients |
+| `py -3.13 tests/test_python.py` | Native Python graph construction/export and the `execute_locally` float32 reference |
 | `node ../tests/node/python-frontend.cjs` | Actual Python-enabled WASM ABI, projects, VFS mutations and dictionary conversion |
 | `node ../tests/node/python-gpu.cjs` | Actual Python-to-host graph requests and JS/WASM evaluation |
+| `python scripts/browser_smoke.py`, `REQUIRE_GPU=1` | Every IR v2 case on real WebGPU/WebGL2 hardware against the JavaScript reference, plus an MNIST-scale training step; writes `docs/browser-validation.json` |
 | `landing/scripts/smoke-browser.py`, `REQUIRE_GPU=1` | Served playground, folder loading, examples, real hardware WebGL2/WebGPU and animation |
-| `tests/browser-cases.mjs` in the diagnostic demo | 15 numerical cases per selected browser backend |
+| `tests/browser-cases.mjs` in the diagnostic demo | the same numerical cases per selected browser backend |
 
 The Python CI lane in `.github/workflows/ci.yml` builds the Python feature explicitly,
 checks the artifact profile before running its boundary tests, and runs the native
@@ -26,15 +27,136 @@ reports WebGL2 through ANGLE/D3D11 and WebGPU through the Blackwell adapter.
 Portable mocks do not compile shaders. Unavailable GPU checks must be reported
 as unavailable, never silently replaced by a CPU pass.
 
-For repeatable browser checks, build the landing page, start its preview, and run
+For repeatable numerical checks on real hardware, run
+`REQUIRE_GPU=1 python scripts/browser_smoke.py` from this directory: it serves the
+lab on 127.0.0.1 (a secure context, so WebGPU is exposed), runs every case and the
+training step on each backend, and rewrites `docs/browser-validation.json`. An
+unavailable GPU backend is recorded as unavailable and, under `REQUIRE_GPU=1`,
+fails the run — it is never replaced by a CPU pass. For the served playground,
+build the landing page, start its preview, and run
 `python landing/scripts/smoke-browser.py http://127.0.0.1:4173` from the repository
-root with `REQUIRE_GPU=1`. This requires Chrome and Python Playwright.
+root with `REQUIRE_GPU=1`. Both require Chrome and Python Playwright (installed for
+this machine's 3.11 `python`, not for `py -3.13`).
 The diagnostic demo provides **Check all backends** for the full numerical matrix.
 
 Timings and GIFs are functional demonstrations, not performance benchmarks.
 Shader compilation, transfers, driver memory and thermal/load differences affect
 results. `maxLogicalBytes` and WebGL's explicit texture-byte ceiling are different
 budgets; neither measures the entire browser's memory usage.
+
+## Graph IR v2 acceptance — 16 September 2026
+
+Windows 11 / Chrome 153.0.8010.47 headless (`--force_high_performance_gpu`) /
+NVIDIA GeForce RTX 5090. WebGPU reported a non-fallback `nvidia`/`blackwell`
+adapter; WebGL2 reported `ANGLE (NVIDIA, NVIDIA GeForce RTX 5090 (0x00002B85)
+Direct3D11 vs_5_0 ps_5_0, D3D11)` and took the R32F path (4 bytes per scalar),
+so the RGBA32F fallback is exercised only by the allocation tests, not by this
+hardware. Raw evidence: `docs/browser-validation.json`.
+Reproduce with `REQUIRE_GPU=1 python scripts/browser_smoke.py` from this directory
+(add `--headed` to watch it).
+
+- **226 Node tests** (`npm test`) and **23 native Python tests**
+  (`py -3.13 tests/test_python.py`) passed. These include a cpu-js-versus-WASM
+  differential over every operation — each binary op across ten broadcasting
+  shape pairs including rank-4, scalar and size-1 axes; each unary op at lengths
+  1, 7, 64, 65 and 1025; axis and whole-tensor reductions with and without
+  `keepdim`; permutations, reshape aliasing, rank-2 and batched rank-3 matmul;
+  softmax, log_softmax, cross-entropy and its gradient; and all five optimizer
+  ops — plus a seeded 600-graph walk over shape space per family, and
+  finite-difference gradient checks: a whole MLP backward graph against central
+  differences of its own loss for GELU, tanh and sigmoid networks (the
+  differentiable activations; ReLU's kink makes central differences unreliable,
+  so its mask is covered by the `positive` differential instead), and the
+  cross-entropy and GELU gradient ops against double-precision differences.
+- **155 numerical cases passed on each of the four backends** in the browser,
+  every one compared element by element against the cpu-js reference.
+- The R244 regression runs the **real** checked-in playground engine: a Python
+  program that submits 17 graphs with an `on_error` handler that resubmits now
+  leaves the `Engine` usable and disposable instead of overflowing the host
+  stack while the engine is still borrowed.
+- `py -3.13 tools/python_corpus.py --zipp target/release/zipp.exe --only gpu`
+  passed for `gpu_graph.py`, `ml_gpu_ops.py` and `ml_gpu_training.py`: the
+  native Zipp Python frontend and CPython 3.13 print byte-identical output for
+  graph construction, the version rule and the `execute_locally` float32
+  reference over the whole v2 operation set.
+
+Per-operation maximum absolute error versus the cpu-js reference, browser run:
+
+| Operation family | WebGPU | WebGL2 | WASM (SIMD) |
+|---|---:|---:|---:|
+| `add`, `sub`, `mul` (incl. broadcasting) | 0 | 0 | 0 |
+| `div` | 6.1e-05 | 6.1e-05 | 0 |
+| `neg`, `relu`, `positive` | 0 | 0 | 0 |
+| `exp` | 1.22e-04 | 1.22e-04 | 0 |
+| `log`, `sqrt` | 2.38e-07 | 2.38e-07 | 0 |
+| `tanh`, `sigmoid`, `gelu_grad` | 1.19e-07 | 1.19e-07 | 0 |
+| `gelu` | 4.77e-07 | 4.77e-07 | 0 |
+| exact zero and tiny arguments of the odd functions | 5.96e-08 | 5.96e-08 | 0 |
+| `transpose`, `permute`, `reshape` | 0 | 0 | 0 |
+| `sum` over an axis | 0 | 0 | 0 |
+| `mean` over an axis | 5.96e-08 | 5.96e-08 | 0 |
+| whole-tensor `sum`/`mean` (pairwise) | 1.49e-08 | 1.49e-08 | 0 |
+| `softmax`, `log_softmax` | 1.91e-06 | 1.91e-06 | 0 |
+| `matmul` (rank 2 and batched rank 3) | 0 | 3.81e-06 | 0 |
+| `cross_entropy`, `cross_entropy_grad` | 4.77e-07 | 4.77e-07 | 5.59e-09 |
+| optimizer updates (SGD, momentum, Adam) | 0 | 2.38e-07 | 0 |
+| `life` | 0 | 0 | 0 |
+
+These are absolute errors on unnormalized fixtures, so read them against the
+magnitudes involved. The two largest are both the platform's own arithmetic, not
+the graph: `div` reaches 6.1e-05 where the largest quotient in the fixture is
+582.6, which is **exactly one float32 ulp** (GPU division is not
+correctly-rounded), and `exp` reaches 1.22e-04 where the largest value is 397,
+which is **four ulp** of the GPU `exp` intrinsic against `Math.fround(Math.exp(x))`.
+The WASM kernels are bit-identical to the JavaScript reference on every exact
+operation; their only non-zero row, cross-entropy, is the double-precision `log`
+implemented in `kernels.c` differing from V8's by under one ulp. The acceptance
+tolerance is `2e-4 + 2e-4·|expected|`.
+
+One MNIST-scale training step — 784-256-10 MLP, batch 64, ReLU, mean
+cross-entropy over integer class targets, full backward pass and Adam updating
+four parameters with both moments, all in **one graph** (58.1M estimated work
+units, 254k uploaded and 611k read-back elements):
+
+| Backend | cold | warm median | warm min | forward+loss only | batch 512, loss only | max abs error vs cpu-js |
+|---|---:|---:|---:|---:|---:|---:|
+| WebGPU | 18.6 ms | 7.8 ms | 5.8 ms | 5.4 ms | 8.6 ms | 4.35e-06 |
+| WebGL2 | 30.4 ms | 5.6 ms | 4.9 ms | 2.6 ms | 5.5 ms | 9.96e-06 |
+| WASM (SIMD) | 6.5 ms | 3.9 ms | 3.5 ms | 2.6 ms | over budget | 2.82e-06 |
+| cpu-js | 27.9 ms | 27.0 ms | 23.5 ms | 25.3 ms | over budget | 0 (reference) |
+
+All four backends produced the same five-step loss sequence to four decimals
+(2.3450, 2.2566, 2.0440, 1.9046, 1.7521), so the updates agree, not just the
+first forward pass. "over budget" is the work limit refusing the graph
+(`maxWork` 400M on WASM and 100M on cpu-js), not a failure. The error column is
+the worst over the loss, all four updated parameters and all eight Adam moments.
+
+These are wall-clock times for `runtime.execute()`, including upload, all
+dispatches and readback; they are not GPU timestamp queries and no speedup is
+claimed. At this size the step is dominated by transfers and per-node host work,
+which is why the WASM kernels — no PCIe round trip — beat both GPUs. What the
+GPUs do show is scaling: eight times the batch (64 to 512, forward and loss only)
+costs WebGPU 5.4 to 8.6 ms and WebGL2 2.6 to 5.5 ms, while both CPU backends
+refuse a graph that large. Choosing a backend by these numbers alone would pick
+WASM for a small model; the GPUs matter as the model grows.
+
+Non-finite intermediates were checked on every backend: a graph that overflows to
+infinity and then computes `inf - inf` fails readback with `NUMBER` through
+`relu`, `sum`, `tanh`, `gelu`, `softmax` and `matmul` on all four, closing the
+divergence where `relu` used to fold NaN to zero on some backends and propagate
+it on others.
+
+Limits raised for this work, with the hostile-input checks unchanged: elements
+per tensor 1,048,576 → 4,194,304; per dimension 4,096 → 65,536; aggregate input
+and output elements 1,048,576 → 4,194,304; named outputs 16 → 64; logical byte
+budget 32 → 64 MiB. The playground no longer pins `maxWork` to 50M and takes the
+backend's own budget instead; the measured cpu-js fallback cost above (27 ms for
+58M work units, so roughly 50 ms at the 100M ceiling) stays far inside the page's
+5-second frame deadline.
+
+Not established here: resident cross-request tensors, kernel fusion, float16,
+convolutions, a tiled WebGL2 matmul, or any claim about non-NVIDIA hardware,
+other browsers or a shared multi-tenant device.
 
 ## Local acceptance — 13 September 2026
 

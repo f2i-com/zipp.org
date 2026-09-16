@@ -24,6 +24,8 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
   const handler = createZippGPUHandler(runtime, {allowExecute});
   let active = true, tail = Promise.resolve(), pending = 0, admitted = 0;
   const live = () => active && !engine.disposed;
+  // A macrotask boundary: lets the host's event loop run between rejections.
+  const yieldToHost = () => new Promise(resolve => setTimeout(resolve, 0));
   function deliver(id, reply) {
     if (!live()) return false;
     let delivered = false, error = null;
@@ -42,9 +44,19 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
     if (!request || request.kind !== 'gpu.execute') return Promise.reject(new ComputeError('DENIED', 'Not a GPU request'));
     if (!Number.isSafeInteger(request.id) || request.id < 1) return Promise.reject(new ComputeError('PROTOCOL', 'Invalid request ID'));
     if (admitted >= maxRequests || pending >= maxPending) {
-      // Over quota: the program learns why through its own callback.
-      deliver(request.id, {ok: false, error: {code: 'LIMIT', message: 'GPU request allowance exceeded'}});
-      return Promise.resolve({delivered: true, cancelled: false, rejected: true});
+      // Over quota: the program learns why through its own callback, but only
+      // after the current drain has returned and the work ahead of it has
+      // settled. Delivering here, inside `drain()`, let a callback that
+      // resubmits recurse drain -> deliver -> onDelivered -> drain until the
+      // host stack overflowed with the Engine still borrowed.
+      const id = request.id;
+      const rejection = tail.then(async () => {
+        await yieldToHost();
+        if (!live()) return {delivered: false, cancelled: true, rejected: true};
+        return {delivered: deliver(id, {ok: false, error: {code: 'LIMIT', message: 'GPU request allowance exceeded'}}), cancelled: false, rejected: true};
+      });
+      tail = rejection.catch(() => {});
+      return rejection;
     }
     let payload;
     try { payload = structuredClone(request.payload); }

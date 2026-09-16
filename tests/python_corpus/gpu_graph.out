@@ -17,14 +17,14 @@ result [2, 2] [4.375, 2.125, -1.125, 3.375]
 ........
 ........
 alive: 5.0
-GraphError Empty tensors are not supported in v1
+GraphError Empty tensors are not supported
 GraphError Ragged matrices are not supported
 GraphError Tensor belongs to another graph or is not a valid handle
-GraphError Only matching shapes or scalar broadcasting are supported
-GraphError matmul requires [M,K] @ [K,N]
-GraphError Request between 1 and 16 named outputs
+GraphError Shapes (2,) and (3,) cannot be broadcast
+GraphError matmul requires [M,K] @ [K,N] or batched [B,M,K] @ [B,K,N]
+GraphError Request between 1 and 64 named outputs
 GraphError Only finite float32 values are supported
 GraphError Tensor values must be numbers, not bools or objects
 TypeError A symbolic Tensor has no Python truth value; execute and read an output
-PROTOCOL: Only graph protocol version 1 is supported PROTOCOL
+PROTOCOL: A program needs node and output lists PROTOCOL
 3e-07 0.30000000000000004 10

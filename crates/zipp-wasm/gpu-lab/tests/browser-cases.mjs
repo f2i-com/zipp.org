@@ -1,4 +1,5 @@
 import {createRuntime} from '../src/runtime.mjs';
+import {opCases, mlpTrainingStep} from './ml-cases.mjs';
 const input=(id,data,shape=[data.length])=>({id,op:'input',shape,data});
 const program=nodes=>({version:1,nodes,outputs:[{name:'result',id:nodes.length-1}]});
 function cases(){
@@ -19,7 +20,20 @@ function cases(){
     for(let id=1;id<=8;id++)nodes.push({id,op:'life',a:id-1});
     result.push([`Life torus ${h}x${w}, eight steps`,program(nodes)]);
   }
-  return result;
+  return [...result,...opCases()];
+}
+/** Largest |actual - expected| over every named output; throws past a float32 GPU tolerance. */
+function compare(actual,expected,tolerance=2e-4){
+  let worst=0;
+  for(const name of Object.keys(expected.outputs)){
+    const a=actual.outputs[name]?.data,b=expected.outputs[name].data;
+    if(!a||a.length!==b.length)throw Error(`Wrong result length for ${name}`);
+    for(let i=0;i<a.length;i++){
+      const delta=Math.abs(a[i]-b[i]);worst=Math.max(worst,delta);
+      if(!Number.isFinite(a[i])||delta>tolerance+tolerance*Math.abs(b[i]))throw Error(`Mismatch in ${name} at ${i}: ${a[i]} versus ${b[i]}`);
+    }
+  }
+  return worst;
 }
 /** Explicit backend selection: unsupported is a skip; a numerical/shader failure is a failure. */
 export async function checkBackend(backend,options={}){
@@ -31,13 +45,44 @@ export async function checkBackend(backend,options={}){
     reference=await createRuntime({backend:'cpu-js'});
     for(const [name,p] of cases()) {
       try {
-        const actual=await runtime.execute(p),expected=await reference.execute(p),a=actual.outputs.result.data,b=expected.outputs.result.data;
-        if(a.length!==b.length)throw Error('Wrong result length');
-        for(let i=0;i<a.length;i++)if(!Number.isFinite(a[i])||Math.abs(a[i]-b[i])>2e-4+2e-4*Math.abs(b[i]))
-          throw Error(`Mismatch at ${i}: ${a[i]} versus ${b[i]}`);
-        report.checks.push({name,status:'passed',totalWallMs:actual.stats.totalWallMs});report.passed++;
+        const actual=await runtime.execute(p),expected=await reference.execute(p),maxAbsError=compare(actual,expected);
+        report.checks.push({name,status:'passed',maxAbsError,totalWallMs:actual.stats.totalWallMs});report.passed++;
       }catch(error){report.status='failed';report.checks.push({name,status:'failed',error:String(error.message)});}
     }
   }finally{reference?.dispose();runtime.dispose();}
   return report;
+}
+/**
+ * One MLP classification training step (forward, cross-entropy, backward and
+ * Adam in one graph) on `backend`: per-output max abs error against cpu-js,
+ * then cold and warm wall-clock times. `steps` chains real updates.
+ */
+export async function benchmarkTraining(backend,{sizes=[784,256,10],batch=64,warm=10,steps=5,...options}={}){
+  const runtime=await createRuntime({backend,...options}),reference=await createRuntime({backend:'cpu-js'});
+  try{
+    const {program,parameters}=mlpTrainingStep({sizes,batch});
+    const cold=performance.now(),first=await runtime.execute(program),coldMs=performance.now()-cold;
+    const expected=await reference.execute(program),errors={};
+    for(const name of Object.keys(expected.outputs)){let worst=0;expected.outputs[name].data.forEach((v,i)=>{worst=Math.max(worst,Math.abs(v-first.outputs[name].data[i]));});errors[name]=worst;}
+    const median=async p=>{const times=[];for(let i=0;i<warm;i++){const t=performance.now();await runtime.execute(p);times.push(performance.now()-t);}
+      times.sort((x,y)=>x-y);return times;};
+    const times=await median(program);
+    // The same step reading back only the loss (the device work plus a readback's
+    // latency), and at batch 512 where arithmetic, not transfer, dominates.
+    const lossOnly=await median({...program,outputs:[program.outputs[0]]});
+    let batch512;
+    try{const big=mlpTrainingStep({sizes,batch:512}).program;await runtime.execute({...big,outputs:[big.outputs[0]]});
+      batch512=(await median({...big,outputs:[big.outputs[0]]}))[Math.floor(warm/2)];}
+    catch(error){batch512=error.code||String(error.message);}
+    // A short training run fed by each step's outputs: losses must fall.
+    let params=null,state=null;const losses=[];
+    for(let step=1;step<=steps;step++){
+      const next=mlpTrainingStep({sizes,batch,params,state,step,lr:0.002}).program,out=(await runtime.execute(next)).outputs;
+      losses.push(out.loss.data[0]);params=Array.from({length:parameters},(_,i)=>out[`p${i}`].data);state=params.map((_,i)=>[out[`m${i}`].data,out[`v${i}`].data]);
+    }
+    return {backend,info:runtime.info(),sizes,batch,estimatedWork:first.stats.estimatedWork,uploadElements:first.stats.uploadElements,
+      readbackElements:first.stats.readbackElements,maxAbsErrorVsCpuJs:errors,maxAbsError:Math.max(...Object.values(errors)),
+      coldMs,warmMedianMs:times[Math.floor(times.length/2)],warmMinMs:times[0],lossOnlyWarmMedianMs:lossOnly[Math.floor(lossOnly.length/2)],
+      batch512LossOnlyWarmMedianMs:batch512,losses};
+  }finally{reference.dispose();runtime.dispose();}
 }

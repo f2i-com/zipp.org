@@ -8,8 +8,15 @@ implementation, and only the named outputs come back.
 This module is bundled with the Zipp Python frontend (import it as
 `zipp_gpu`) and also runs under CPython, where `submit` evaluates the graph
 with the float32 reference implementation below. It is a graph builder, not
-a NumPy replacement: shapes are rank 0..2, values are float32, and the
-operation set is fixed (see `Tensor`).
+a NumPy replacement: shapes are rank 0..4, values are float32, and the
+operation set is fixed (see `Tensor` and the optimizer steps on `Graph`).
+
+Elementwise arithmetic broadcasts like NumPy. Beyond it: exp, log, sqrt,
+tanh, sigmoid, relu and GELU (the exact-erf form, with one shared erf
+approximation on every backend); sum/mean over an axis or the whole tensor;
+softmax and log_softmax over the last axis; matmul for matrices and batches;
+reshape/permute; fused cross-entropy with its gradient; and SGD, momentum and
+Adam update steps, so a whole training step can run in one graph.
 """
 import math
 import struct
@@ -67,13 +74,13 @@ def _number(value):
 def _shape(shape):
     if isinstance(shape, int) and not isinstance(shape, bool):
         shape = (shape,)
-    if not isinstance(shape, (tuple, list)) or len(shape) > 2:
-        raise GraphError("Use a scalar (), vector (N,), or matrix (M, N)")
-    if any(type(d) is not int or not 0 < d <= 4096 for d in shape):
-        raise GraphError("Dimensions must be integers in 1..4096")
+    if not isinstance(shape, (tuple, list)) or len(shape) > 4:
+        raise GraphError("Shapes have at most four dimensions")
+    if any(type(d) is not int or not 0 < d <= 65536 for d in shape):
+        raise GraphError("Dimensions must be integers in 1..65536")
     result = tuple(shape)
-    if _size(result) > 1048576:
-        raise GraphError("Tensor exceeds 1,048,576 elements")
+    if _size(result) > 4194304:
+        raise GraphError("Tensor exceeds 4,194,304 elements")
     return result
 
 
@@ -84,11 +91,32 @@ def _size(shape):
     return result
 
 
+# The ten operations the first protocol version defined; see `Graph.program`.
+_VERSION_ONE_OPS = frozenset((
+    "input", "full", "add", "sub", "mul", "relu", "positive", "transpose", "matmul", "sum", "life"))
+
+
+def _axis(axis, rank):
+    if type(axis) is not int or not -max(rank, 1) <= axis < max(rank, 1):
+        raise GraphError("Axis %r is out of range for rank %d" % (axis, rank))
+    return axis + rank if axis < 0 else axis
+
+
+def _broadcast(a, b):
+    """NumPy broadcasting of two shapes, right-aligned."""
+    rank = max(len(a), len(b))
+    pa = (1,) * (rank - len(a)) + tuple(a)
+    pb = (1,) * (rank - len(b)) + tuple(b)
+    if any(x != y and x != 1 and y != 1 for x, y in zip(pa, pb)):
+        raise GraphError("Shapes %r and %r cannot be broadcast" % (tuple(a), tuple(b)))
+    return tuple(max(x, y) for x, y in zip(pa, pb))
+
+
 def _flatten(data):
     if not isinstance(data, (tuple, list)):
         return [_number(data)], ()
     if not data:
-        raise GraphError("Empty tensors are not supported in v1")
+        raise GraphError("Empty tensors are not supported")
     if isinstance(data[0], (tuple, list)):
         width = len(data[0])
         if not width or any(not isinstance(row, (tuple, list)) or len(row) != width for row in data):
@@ -124,20 +152,86 @@ class Tensor:
     def __rmul__(self, other):
         return self._graph._binary("mul", other, self)
 
+    def __truediv__(self, other):
+        return self._graph._binary("div", self, other)
+
+    def __rtruediv__(self, other):
+        return self._graph._binary("div", other, self)
+
+    def __neg__(self):
+        return self._graph._unary("neg", self, self.shape)
+
     def __matmul__(self, other):
         return self._graph.matmul(self, other)
 
     def relu(self):
         return self._graph._unary("relu", self, self.shape)
 
-    def sum(self):
-        """Reduce all elements to one float32 scalar."""
-        return self._graph._unary("sum", self, ())
+    def exp(self):
+        return self._graph._unary("exp", self, self.shape)
 
-    def transpose(self):
-        if len(self.shape) != 2:
-            raise GraphError("transpose requires a matrix")
-        return self._graph._unary("transpose", self, (self.shape[1], self.shape[0]))
+    def log(self):
+        return self._graph._unary("log", self, self.shape)
+
+    def sqrt(self):
+        return self._graph._unary("sqrt", self, self.shape)
+
+    def tanh(self):
+        return self._graph._unary("tanh", self, self.shape)
+
+    def sigmoid(self):
+        return self._graph._unary("sigmoid", self, self.shape)
+
+    def gelu(self):
+        """0.5 * x * (1 + erf(x / sqrt(2))), the exact-erf GELU."""
+        return self._graph._unary("gelu", self, self.shape)
+
+    def gelu_grad(self):
+        """The derivative of `gelu` at each element."""
+        return self._graph._unary("gelu_grad", self, self.shape)
+
+    def sum(self, axis=None, keepdim=False):
+        """Sum all elements (pairwise), or over one axis in index order."""
+        return self._graph._reduce("sum", self, axis, keepdim)
+
+    def mean(self, axis=None, keepdim=False):
+        return self._graph._reduce("mean", self, axis, keepdim)
+
+    def softmax(self, axis=-1):
+        return self._graph._softmax("softmax", self, axis)
+
+    def log_softmax(self, axis=-1):
+        return self._graph._softmax("log_softmax", self, axis)
+
+    def reshape(self, *shape):
+        return self._graph.reshape(self, shape[0] if len(shape) == 1 and isinstance(shape[0], (tuple, list)) else shape)
+
+    def permute(self, *dims):
+        return self._graph.permute(self, dims[0] if len(dims) == 1 and isinstance(dims[0], (tuple, list)) else dims)
+
+    def transpose(self, dim0=None, dim1=None):
+        """Swap two axes; with no arguments, the two axes of a matrix."""
+        if dim0 is None and dim1 is None:
+            if len(self.shape) != 2:
+                raise GraphError("transpose requires a matrix")
+            return self._graph._unary("transpose", self, (self.shape[1], self.shape[0]))
+        rank = len(self.shape)
+        dims = list(range(rank))
+        i, j = _axis(dim0, rank), _axis(dim1, rank)
+        dims[i], dims[j] = dims[j], dims[i]
+        return self._graph.permute(self, dims)
+
+    @property
+    def T(self):
+        return self.transpose()
+
+    def cross_entropy(self, targets):
+        """Mean cross-entropy of logits [N, C] against integer class targets [N]."""
+        return self._graph._cross_entropy("cross_entropy", self, targets)
+
+    def cross_entropy_grad(self, targets):
+        """d(mean cross-entropy)/d(logits): (softmax(logits) - onehot(targets)) / N."""
+        return self._graph._cross_entropy("cross_entropy_grad", self, targets)
 
     def positive(self):
         return self._graph._unary("positive", self, self.shape)
@@ -159,6 +253,23 @@ class Graph:
     def __init__(self):
         self._nodes = []
         self._tensors = []
+        # The lowest protocol version that still means this graph (see `program`).
+        self._version = 1
+
+    def _version_one(self, op, shape, fields):
+        """Whether one node also means exactly the same thing under version 1.
+
+        Version 1 has ten operations, rank 0..2, no broadcasting beyond a scalar
+        operand, whole-tensor `sum` and `matmul` on matrices only.
+        """
+        if op not in _VERSION_ONE_OPS or len(shape) > 2 or "axis" in fields or "keepdim" in fields:
+            return False
+        operands = [self._tensors[fields[key]].shape for key in ("a", "b") if key in fields]
+        if any(len(s) > 2 for s in operands):
+            return False
+        if op in ("add", "sub", "mul"):
+            return operands[0] == operands[1] or operands[0] == () or operands[1] == ()
+        return True
 
     def _append(self, op, tensor_shape, **fields):
         if len(self._nodes) >= 512:
@@ -174,6 +285,8 @@ class Graph:
         node_id = len(self._nodes)
         node = {"id": node_id, "op": op}
         node.update(fields)
+        if self._version == 1 and not self._version_one(op, shape, fields):
+            self._version = 2
         self._nodes.append(node)
         tensor = Tensor(self, node_id, shape)
         self._tensors.append(tensor)
@@ -185,6 +298,9 @@ class Graph:
                 or self._tensors[tensor._id] is not tensor):
             raise GraphError("Tensor belongs to another graph or is not a valid handle")
         return tensor
+
+    def _coerce(self, value):
+        return self._owned(value) if isinstance(value, Tensor) else self.tensor(value)
 
     def tensor(self, data, shape=None):
         if _k is not None and isinstance(data, _k.Storage):
@@ -219,25 +335,116 @@ class Graph:
             self._owned(left)
         if right_tensor:
             self._owned(right)
-        a = left if left_tensor else self.tensor(left)
-        b = right if right_tensor else self.tensor(right)
-        if a.shape and b.shape and a.shape != b.shape:
-            raise GraphError("Only matching shapes or scalar broadcasting are supported")
-        return self._record(op, a.shape or b.shape, {"a": a._id, "b": b._id})
+        a, b = self._coerce(left), self._coerce(right)
+        return self._append(op, _broadcast(a.shape, b.shape), a=a._id, b=b._id)
 
     def _unary(self, op, tensor, shape):
         # `shape` is the operand's own, reversed, or () (see `Tensor`).
         a = self._owned(tensor)
         return self._record(op, shape, {"a": a._id})
 
+    def _reduce(self, op, tensor, axis, keepdim):
+        a = self._owned(tensor)
+        if not isinstance(keepdim, bool):
+            raise GraphError("keepdim must be a bool")
+        fields = {"keepdim": True} if keepdim else {}
+        if axis is None:
+            return self._append(op, tuple(1 for _ in a.shape) if keepdim else (), a=a._id, **fields)
+        axis = _axis(axis, len(a.shape))
+        shape = tuple(1 if i == axis else d for i, d in enumerate(a.shape)) if keepdim else a.shape[:axis] + a.shape[axis + 1:]
+        return self._append(op, shape, a=a._id, axis=axis, **fields)
+
+    def _softmax(self, op, tensor, axis):
+        a = self._owned(tensor)
+        if not a.shape or _axis(axis, len(a.shape)) != len(a.shape) - 1:
+            raise GraphError("%s supports the last axis of a tensor with at least one dimension" % op)
+        return self._append(op, a.shape, a=a._id)
+
+    def _cross_entropy(self, op, logits, targets):
+        a = self._owned(logits)
+        t = self._coerce(targets)
+        node = self._nodes[t._id]
+        if len(a.shape) != 2 or t.shape != (a.shape[0],):
+            raise GraphError("%s requires logits [N, C] and targets [N]" % op)
+        if node["op"] != "input" or any(v != int(v) or not 0 <= v < a.shape[1] for v in node["data"]):
+            raise GraphError("%s targets must be a tensor of integer class indices in [0, C)" % op)
+        return self._append(op, () if op == "cross_entropy" else a.shape, a=a._id, b=t._id)
+
     def matmul(self, left, right):
+        """[M,K] @ [K,N], or batched [B,M,K] @ [B,K,N] (a batch of 1 or a matrix broadcasts)."""
         a, b = self._owned(left), self._owned(right)
-        if len(a.shape) != 2 or len(b.shape) != 2 or a.shape[1] != b.shape[0]:
-            raise GraphError("matmul requires [M,K] @ [K,N]")
-        return self._append("matmul", (a.shape[0], b.shape[1]), a=a._id, b=b._id)
+        ra, rb = len(a.shape), len(b.shape)
+        if ra not in (2, 3) or rb not in (2, 3) or a.shape[-1] != b.shape[-2]:
+            raise GraphError("matmul requires [M,K] @ [K,N] or batched [B,M,K] @ [B,K,N]")
+        ba, bb = (a.shape[0] if ra == 3 else 1), (b.shape[0] if rb == 3 else 1)
+        if ba != bb and ba != 1 and bb != 1:
+            raise GraphError("matmul batch dimensions must match or be 1")
+        shape = (a.shape[-2], b.shape[-1])
+        return self._append("matmul", (max(ba, bb),) + shape if 3 in (ra, rb) else shape, a=a._id, b=b._id)
+
+    def reshape(self, tensor, shape):
+        a = self._owned(tensor)
+        shape = list(shape)
+        if shape.count(-1) == 1:
+            known = _size([d for d in shape if d != -1])
+            if not known or _size(a.shape) % known:
+                raise GraphError("reshape cannot infer -1 for %r" % (tuple(shape),))
+            shape[shape.index(-1)] = _size(a.shape) // known
+        shape = _shape(shape)
+        if _size(shape) != _size(a.shape):
+            raise GraphError("reshape must keep the element count")
+        return self._append("reshape", shape, a=a._id, shape=list(shape))
+
+    def permute(self, tensor, dims):
+        a = self._owned(tensor)
+        dims = [_axis(d, len(a.shape)) for d in dims]
+        if sorted(dims) != list(range(len(a.shape))):
+            raise GraphError("dims must be a permutation of the tensor's axes")
+        return self._append("permute", tuple(a.shape[d] for d in dims), a=a._id, dims=dims)
+
+    # ---- optimizer steps: each returns the next value of a tensor ------------------------
+    # They follow torch.optim's single-tensor update order, so a training step
+    # (forward, backward and update) can run on the device as one graph.
+
+    def _step(self, op, tensors, **scalars):
+        first = self._owned(tensors[0])
+        for t in tensors[1:]:
+            if self._owned(t).shape != first.shape:
+                raise GraphError("%s requires tensors of one shape" % op)
+        for name, value in scalars.items():
+            if name != "step":
+                _number(value)
+        refs = dict(zip(["a", "b", "c"], [t._id for t in tensors]))
+        refs.update(scalars)
+        return self._append(op, first.shape, **refs)
+
+    def sgd_update(self, param, direction, lr):
+        """param - lr * direction."""
+        return self._step("sgd_update", (param, direction), lr=float(lr))
+
+    def momentum_update(self, buf, grad, momentum, dampening=0.0):
+        """momentum * buf + (1 - dampening) * grad (PyTorch's SGD momentum buffer)."""
+        return self._step("momentum_update", (buf, grad), momentum=float(momentum), dampening=float(dampening))
+
+    def adam(self, param, grad, m, v, lr=0.001, betas=(0.9, 0.999), eps=1e-8, step=1):
+        """One Adam step; returns (next param, next first moment, next second moment)."""
+        beta1, beta2 = float(betas[0]), float(betas[1])
+        if not (0.0 <= beta1 < 1.0 and 0.0 <= beta2 < 1.0) or not eps >= 0 or type(step) is not int or not 1 <= step <= 2 ** 31:
+            raise GraphError("Adam needs betas in [0, 1), eps >= 0 and an integer step >= 1")
+        m1 = self._step("adam_m", (m, grad), beta1=beta1)
+        v1 = self._step("adam_v", (v, grad), beta2=beta2)
+        p1 = self._step("adam_update", (param, m1, v1), lr=float(lr), beta1=beta1, beta2=beta2, eps=float(eps), step=step)
+        return p1, m1, v1
 
     def program(self, **outputs):
-        """The plain-data program: version, nodes, and the named outputs."""
+        """The plain-data program: version, nodes, and the named outputs.
+
+        `version` is 2 as soon as the graph uses anything the first protocol
+        version did not define (a new operation, rank above two, broadcasting
+        beyond a scalar operand, an axis reduction or a batched matmul), and
+        stays 1 otherwise, so a graph that a version-1 host understands is still
+        labelled the way that host expects.
+        """
         program = self._program(outputs)
         for node in program["nodes"]:
             if "data" in node and not isinstance(node["data"], list):
@@ -247,8 +454,8 @@ class Graph:
     def _program(self, outputs):
         # Input data recorded from tensor storage stays storage here: it
         # leaves for the host as a Float32Array. `program` lists it.
-        if not 1 <= len(outputs) <= 16:
-            raise GraphError("Request between 1 and 16 named outputs")
+        if not 1 <= len(outputs) <= 64:
+            raise GraphError("Request between 1 and 64 named outputs")
         names = []
         for name, value in outputs.items():
             if (not name or len(name) > 64 or not name[0].isascii() or not name[0].isalpha()
@@ -258,15 +465,10 @@ class Graph:
             names.append({"name": name, "id": self._owned(value)._id})
         nodes = []
         for n in self._nodes:
-            node = dict(n)
-            if "shape" in node:
-                # The only list fields: an input's or a full's shape, and a
-                # list input's data.
-                node["shape"] = list(node["shape"])
-                if type(node.get("data")) is list:
-                    node["data"] = list(node["data"])
-            nodes.append(node)
-        return {"version": 1, "nodes": nodes, "outputs": names}
+            # Copy every list field (a shape, a permutation, a list input's
+            # data); tensor storage is left as storage for the binary transport.
+            nodes.append({key: list(value) if isinstance(value, list) else value for key, value in n.items()})
+        return {"version": self._version, "nodes": nodes, "outputs": names}
 
     def submit(self, callback, on_error=None, **outputs):
         """Execute the program for `outputs` and pass the result to `callback`.
@@ -321,8 +523,9 @@ class Graph:
 
 # ---- float32 reference implementation -----------------------------------------------
 # The same semantics as the host's JavaScript reference backend: every
-# intermediate rounds to float32, sums reduce pairwise, and matmul
-# accumulates in float32.
+# intermediate rounds to float32, whole-tensor sums reduce pairwise, axis sums
+# and matmul accumulate in index order, and IEEE non-finite values propagate
+# (to be rejected at readback) instead of raising.
 
 def _pairwise_sum(values):
     work = list(values)
@@ -334,59 +537,244 @@ def _pairwise_sum(values):
     return work[0]
 
 
+def _exp(x):
+    if x != x:
+        return x
+    try:
+        return math.exp(x)
+    except OverflowError:
+        return math.inf
+
+
+def _tanh(x):
+    return x if x != x else math.tanh(x)
+
+
+def _log(x):
+    if x > 0:
+        return math.log(x)
+    return -math.inf if x == 0 else math.nan
+
+
+def _sqrt(x):
+    return math.sqrt(x) if x >= 0 else math.nan
+
+
+def _div(x, y):
+    if y == 0:
+        if x == 0 or x != x:
+            return math.nan
+        return math.copysign(math.inf, x) * math.copysign(1.0, y)
+    return x / y
+
+
+def _erf_series(z):
+    t = z * z
+    return z * (1.1283791670955126 + t * (-0.37612638903183754 + t * (0.11283791670955126 + t * (-0.026866170645131252 +
+        t * (0.005223977625442188 + t * (-0.0008548327023450852 + t * 0.00012055332981789664))))))
+
+
+def _erfc_fit(a):
+    t = 1.0 / (1.0 + 0.5 * a)
+    return t * _exp(-a * a - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 +
+        t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
+
+
+def _cdf(x):
+    # The shared erf definition (series below 0.5, Numerical Recipes' erfc fit above);
+    # the lower tail comes from erfc directly, without cancelling in 1 + erf.
+    z = x * 0.7071067811865476
+    if abs(z) < 0.5:
+        return 0.5 + 0.5 * _erf_series(z)
+    if z >= 10:
+        return 1.0
+    if z <= -10:
+        return 0.0
+    c = 0.5 * _erfc_fit(abs(z))
+    return 1.0 - c if z > 0 else c
+
+
+def _sigmoid(x):
+    if x >= 0:
+        return 1.0 / (1.0 + _exp(-x))
+    e = _exp(x)
+    return e / (1.0 + e)
+
+
+_UNARY = {
+    "relu": lambda x: x if x > 0 or x != x else 0.0,
+    "positive": lambda x: 1.0 if x > 0 else 0.0,
+    "neg": lambda x: -x,
+    "exp": _exp, "log": _log, "sqrt": _sqrt, "tanh": _tanh, "sigmoid": _sigmoid,
+    "gelu": lambda x: x * _cdf(x),
+    "gelu_grad": lambda x: _cdf(x) + x * 0.3989422804014327 * _exp(-0.5 * min(x * x, 1e300)),
+}
+_BINARY = {"add": lambda x, y: x + y, "sub": lambda x, y: x - y, "mul": lambda x, y: x * y, "div": _div}
+
+
+def _strides(shape):
+    out, step = [], 1
+    for d in reversed(shape):
+        out.append(step)
+        step *= d
+    return out[::-1]
+
+
+def _indices(shape):
+    """Every multi-index of `shape` in row-major order."""
+    result = [()]
+    for d in shape:
+        result = [index + (i,) for index in result for i in range(d)]
+    return result
+
+
+def _row_stats(row):
+    m = row[0]
+    for v in row[1:]:
+        if v > m or v != v:
+            m = v
+    s = 0.0
+    for v in row:
+        s = _f32(s + _f32(_exp(_f32(v - m))))
+    return m, s
+
+
+def _optimizer_step(op, node, a, b, c):
+    if op == "sgd_update":
+        lr = _f32(node["lr"])
+        return [_f32(p - _f32(lr * d)) for p, d in zip(a, b)]
+    if op == "momentum_update":
+        mu, w = _f32(node["momentum"]), _f32(1 - node["dampening"])
+        return [_f32(_f32(mu * x) + _f32(w * g)) for x, g in zip(a, b)]
+    if op == "adam_m":
+        # torch.lerp(m, grad, 1 - beta1), in the branch PyTorch takes for that weight.
+        w = _f32(1 - node["beta1"])
+        if w < 0.5:
+            return [_f32(x + _f32(w * _f32(g - x))) for x, g in zip(a, b)]
+        v1 = _f32(1 - w)
+        return [_f32(g - _f32(_f32(g - x) * v1)) for x, g in zip(a, b)]
+    if op == "adam_v":
+        beta, w = _f32(node["beta2"]), _f32(1 - node["beta2"])
+        return [_f32(_f32(x * beta) + _f32(_f32(w * g) * g)) for x, g in zip(a, b)]
+    # adam_update: p - lr / (1 - beta1^t) * m / (sqrt(v) / sqrt(1 - beta2^t) + eps)
+    step = node["step"]
+    size = _f32(node["lr"] / (1 - node["beta1"] ** step))
+    bc = _f32(math.sqrt(1 - node["beta2"] ** step))
+    eps = _f32(node["eps"])
+    return [_f32(p - _f32(size * _f32(_div(m1, _f32(_f32(_div(_f32(_sqrt(v1)), bc)) + eps)))))
+            for p, m1, v1 in zip(a, b, c)]
+
+
 def execute_locally(program):
     """Run a program with the float32 reference implementation in Python."""
-    if not isinstance(program, dict) or program.get("version") != 1:
-        raise ComputeError("PROTOCOL", "Only graph protocol version 1 is supported")
+    if not isinstance(program, dict) or program.get("version") not in (1, 2):
+        raise ComputeError("PROTOCOL", "Only graph protocol versions 1 and 2 are supported")
+    if not isinstance(program.get("nodes"), list) or not isinstance(program.get("outputs"), list):
+        raise ComputeError("PROTOCOL", "A program needs node and output lists")
     values = []
     shapes = []
     for node in program["nodes"]:
         op = node["op"]
+        a = values[node["a"]] if "a" in node else None
+        sa = shapes[node["a"]] if "a" in node else None
         if op == "input":
             shape = tuple(node["shape"])
             out = [_f32(v) for v in node["data"]]
         elif op == "full":
             shape = tuple(node["shape"])
             out = [_f32(node["value"])] * _size(shape)
-        elif op in ("add", "sub", "mul"):
-            a, b = values[node["a"]], values[node["b"]]
-            sa, sb = shapes[node["a"]], shapes[node["b"]]
-            shape = sb if not sa else sa
-            n = _size(shape)
+        elif op in _BINARY:
+            b, sb = values[node["b"]], shapes[node["b"]]
+            shape = _broadcast(sa, sb)
+            fn = _BINARY[op]
+            rank = len(shape)
+            pa, pb = (1,) * (rank - len(sa)) + sa, (1,) * (rank - len(sb)) + sb
+            ta = [0 if pa[i] == 1 else s for i, s in enumerate(_strides(pa))]
+            tb = [0 if pb[i] == 1 else s for i, s in enumerate(_strides(pb))]
             out = []
-            for i in range(n):
-                x = a[0] if not sa else a[i]
-                y = b[0] if not sb else b[i]
-                out.append(_f32(x + y if op == "add" else x - y if op == "sub" else x * y))
-        elif op == "relu":
-            shape = shapes[node["a"]]
-            out = [v if v > 0 else 0.0 for v in values[node["a"]]]
-        elif op == "positive":
-            shape = shapes[node["a"]]
-            out = [1.0 if v > 0 else 0.0 for v in values[node["a"]]]
-        elif op == "transpose":
-            h, w = shapes[node["a"]]
-            shape = (w, h)
-            a = values[node["a"]]
-            out = [a[r * w + c] for c in range(w) for r in range(h)]
-        elif op == "sum":
-            shape = ()
-            out = [_pairwise_sum(values[node["a"]])]
+            for index in _indices(shape):
+                ia = sum(i * s for i, s in zip(index, ta))
+                ib = sum(i * s for i, s in zip(index, tb))
+                out.append(_f32(fn(a[ia], b[ib])))
+        elif op in _UNARY:
+            shape = sa
+            fn = _UNARY[op]
+            out = [_f32(fn(v)) for v in a]
+        elif op in ("sum", "mean"):
+            if "axis" not in node:
+                shape = tuple(1 for _ in sa) if node.get("keepdim") else ()
+                total = _pairwise_sum(a)
+                out = [_f32(total / len(a)) if op == "mean" else total]
+            else:
+                axis = node["axis"]
+                dims = sa or (1,)
+                outer, length, inner = _size(dims[:axis]), dims[axis], _size(dims[axis + 1:])
+                shape = tuple(1 if i == axis else d for i, d in enumerate(sa)) if node.get("keepdim") else sa[:axis] + sa[axis + 1:]
+                out = []
+                for o in range(outer):
+                    for i in range(inner):
+                        s = 0.0
+                        for j in range(length):
+                            s = _f32(s + a[(o * length + j) * inner + i])
+                        out.append(_f32(s / length) if op == "mean" else s)
+        elif op in ("softmax", "log_softmax"):
+            shape = sa
+            cols = sa[-1]
+            out = []
+            for r in range(0, len(a), cols):
+                row = a[r:r + cols]
+                m, s = _row_stats(row)
+                ls = _f32(_log(s))
+                for v in row:
+                    d = _f32(v - m)
+                    out.append(_f32(_div(_f32(_exp(d)), s)) if op == "softmax" else _f32(d - ls))
+        elif op in ("cross_entropy", "cross_entropy_grad"):
+            targets = values[node["b"]]
+            rows, cols = sa
+            losses, out = [], []
+            for r in range(rows):
+                row = a[r * cols:(r + 1) * cols]
+                m, s = _row_stats(row)
+                t = int(targets[r])
+                if op == "cross_entropy":
+                    losses.append(_f32(_f32(_log(s)) - _f32(row[t] - m)))
+                else:
+                    for j, v in enumerate(row):
+                        p = _f32(_div(_f32(_exp(_f32(v - m))), s))
+                        out.append(_f32(_f32(p - (1.0 if j == t else 0.0)) / rows))
+            shape = () if op == "cross_entropy" else sa
+            if op == "cross_entropy":
+                out = [_f32(_pairwise_sum(losses) / rows)]
+        elif op in ("transpose", "permute"):
+            dims = node["dims"] if op == "permute" else [1, 0]
+            shape = tuple(sa[d] for d in dims)
+            st = _strides(sa)
+            src = [st[d] for d in dims]
+            out = [a[sum(i * s for i, s in zip(index, src))] for index in _indices(shape)]
+        elif op == "reshape":
+            shape = tuple(node["shape"])
+            out = a
         elif op == "matmul":
-            a, b = values[node["a"]], values[node["b"]]
-            (m, k), (_, n) = shapes[node["a"]], shapes[node["b"]]
-            shape = (m, n)
+            b, sb = values[node["b"]], shapes[node["b"]]
+            m, k, n = sa[-2], sa[-1], sb[-1]
+            ba, bb = (sa[0] if len(sa) == 3 else 1), (sb[0] if len(sb) == 3 else 1)
+            batch = max(ba, bb)
+            shape = (batch, m, n) if 3 in (len(sa), len(sb)) else (m, n)
             out = []
-            for r in range(m):
-                for c in range(n):
-                    s = 0.0
-                    for j in range(k):
-                        s = _f32(s + _f32(a[r * k + j] * b[j * n + c]))
-                    out.append(s)
+            for t in range(batch):
+                ao, bo = (t * m * k if ba > 1 else 0), (t * k * n if bb > 1 else 0)
+                for r in range(m):
+                    for c in range(n):
+                        s = 0.0
+                        for j in range(k):
+                            s = _f32(s + _f32(a[ao + r * k + j] * b[bo + j * n + c]))
+                        out.append(s)
+        elif op in ("sgd_update", "momentum_update", "adam_m", "adam_v", "adam_update"):
+            shape = sa
+            out = _optimizer_step(op, node, a, values[node["b"]], values[node["c"]] if "c" in node else None)
         elif op == "life":
-            shape = shapes[node["a"]]
+            shape = sa
             h, w = shape
-            a = values[node["a"]]
             out = []
             for y in range(h):
                 for x in range(w):
@@ -400,7 +788,7 @@ def execute_locally(program):
         else:
             raise ComputeError("OP", "Unsupported operation: %s" % op)
         values.append(out)
-        shapes.append(shape)
+        shapes.append(tuple(shape))
     outputs = {}
     for o in program["outputs"]:
         data = values[o["id"]]
@@ -411,6 +799,21 @@ def execute_locally(program):
             "stats": {"nodes": len(values), "readbackElements": sum(len(v["data"]) for v in outputs.values())}}
 
 
+def _execute_reference(program, storage):
+    """The reference implementation over the binary transport: input storage
+    becomes lists for the run, and each output goes back to storage when the
+    caller asked for it (`_k` is present, or this would not be reachable)."""
+    nodes = []
+    for node in program.get("nodes", ()):
+        data = node.get("data")
+        nodes.append(dict(node, data=_k.to_list(data)) if isinstance(data, _k.Storage) else node)
+    result = execute_locally(dict(program, nodes=nodes))
+    if storage:
+        for out in result["outputs"].values():
+            out["data"] = _k.from_flat("float32", out["data"])
+    return result
+
+
 def _host_data(data, storage):
     # A host answers with a Float32Array (tensor storage here) or, from an
     # older host, a list of numbers that arrive as ints when integral.
@@ -419,8 +822,22 @@ def _host_data(data, storage):
     return _k.from_flat("float32", data) if storage else [float(v) for v in data]
 
 
+# The operations the tensor kernels compute float32-identically to the
+# reference below. Everything the second protocol version added — broadcasting
+# past a scalar, axis reductions, softmax, cross-entropy, the optimizer steps,
+# batched matmul — takes the reference path instead, so a graph produces the
+# same numbers whichever path runs it.
+_KERNEL_OPS = frozenset((
+    "input", "full", "add", "sub", "mul", "relu", "positive", "transpose",
+    "sum", "matmul", "life",
+))
+
+
 def _execute_kernels(program, storage):
     """`execute_locally` on Zipp's tensor kernels: the same float32 numbers."""
+    if (program.get("version") != 1
+            or any(node.get("op") not in _KERNEL_OPS for node in program.get("nodes", ()))):
+        return _execute_reference(program, storage)
     values = []
     shapes = []
     zero = None
