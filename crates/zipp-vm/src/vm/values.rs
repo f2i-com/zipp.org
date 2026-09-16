@@ -1852,7 +1852,9 @@ impl<'p> Vm<'p> {
         }
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
             let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-            let t = s.trim_matches(str_white_space);
+            // StringToBigInt trims StrWhiteSpace: U+FEFF counts, U+0085 does not
+            // (`BigInt("\u{85}1")` is a SyntaxError, `BigInt("\u{FEFF}1")` is 1n).
+            let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
             if t.is_empty() {
                 return Ok(BigVal::Small(0));
             }

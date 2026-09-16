@@ -400,6 +400,70 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc_js(exact))
     }
 
+    /// Append ToString(`v`) to a WTF-8 buffer EXACTLY: a string value's own
+    /// bytes are copied straight out of the heap (a lone surrogate survives,
+    /// and no intermediate `String` is allocated per element), an object's
+    /// ToString result goes the same way, and every other primitive renders as
+    /// UTF-8, which is already WTF-8. A Symbol still throws, in ToString.
+    ///
+    /// This is the join/concat counterpart of `append_guest_string`: it is what
+    /// makes `['\uD83D', '\uDE00'].join('')` the astral character it spells
+    /// rather than two U+FFFDs.
+    pub(crate) fn append_guest_tostring(
+        &mut self,
+        out: &mut Vec<u8>,
+        v: Value,
+    ) -> Result<(), Thrown> {
+        if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
+            return self.append_guest_heap_str(out, v.heap_index());
+        }
+        if self.is_object_value(v) {
+            let sv = self.to_str_value(v)?;
+            return self.append_guest_heap_str(out, sv.heap_index());
+        }
+        let s = self.to_js_string(v)?;
+        self.append_guest_wtf8(out, s.as_bytes())
+    }
+
+    /// Append a heap string's exact bytes to a WTF-8 buffer, admitted and
+    /// reserved as [`Self::append_guest_wtf8`] does, but copied without an
+    /// owned intermediate.
+    pub(crate) fn append_guest_heap_str(
+        &mut self,
+        out: &mut Vec<u8>,
+        idx: u32,
+    ) -> Result<(), Thrown> {
+        self.heap.flatten(idx);
+        let len = match self.heap.get(idx) {
+            HeapObj::Str(js) => js.as_bytes().len(),
+            _ => 0,
+        };
+        if len == 0 {
+            return Ok(());
+        }
+        let total = out
+            .len()
+            .checked_add(len)
+            .filter(|&n| n <= MAX_STRING_BYTES)
+            .ok_or_else(invalid_string_length)?;
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(total)
+            .map_err(|message| Thrown(message.into()))?;
+        #[cfg(not(feature = "instrument"))]
+        let _ = total;
+        out.try_reserve(len)
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        if let HeapObj::Str(js) = self.heap.get(idx) {
+            crate::heap::wtf8_push(out, js.as_bytes());
+        }
+        Ok(())
+    }
+
+    /// Allocate a WTF-8 buffer built by the appenders above as a guest string.
+    pub(crate) fn alloc_wtf8(&mut self, out: Vec<u8>) -> Value {
+        Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))
+    }
+
     /// Append guest-derived text without allowing a native helper to build an
     /// unbounded Rust `String` between VM meter polls. `total` is charged as an
     /// external in-flight allocation because `out` is not in the VM heap until
@@ -618,6 +682,15 @@ impl<'p> Vm<'p> {
                 };
                 return Ok(Some(Value::heap(self.heap.alloc_js(out))));
             }
+            // The rest of the search family (a position argument, a non-ASCII
+            // or non-string operand) also allocates nothing, so it reads both
+            // operands in place instead of taking the receiver copy below.
+            "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => {
+                if !matches!(self.heap.get(idx), HeapObj::Str(_)) {
+                    return Ok(None);
+                }
+                return self.string_search(idx, name, args).map(Some);
+            }
             _ => {}
         }
         // Other methods need owned content (slice/replace/split/…): the exact
@@ -640,7 +713,7 @@ impl<'p> Vm<'p> {
         let s_cow = js_recv.as_str_lossy();
         let s: &str = &s_cow;
         // JS positions/lengths are UTF-16 code units; `ascii` short-circuits the
-        // walks (unit == byte). All three closures take the RECEIVER `s` only.
+        // walks (unit == byte). The closure takes the RECEIVER `s` only.
         let unit_len = |s: &str| -> usize {
             if ascii {
                 s.len()
@@ -648,60 +721,10 @@ impl<'p> Vm<'p> {
                 crate::heap::str_units(s)
             }
         };
-        // Byte offset of a SEARCH-START unit position (mid-pair rounds up — exact
-        // for searches; anchored uses go through `unit_byte_bounds`).
-        let u2b = |s: &str, u: usize| -> usize {
-            if ascii {
-                u.min(s.len())
-            } else {
-                crate::heap::unit_to_byte(s, u)
-            }
-        };
-        // Unit position of a result byte offset (always a scalar boundary).
-        let b2u = |s: &str, b: usize| -> usize {
-            if ascii {
-                b
-            } else {
-                crate::heap::byte_to_units(s, b)
-            }
-        };
         // Substring by unit positions [a, b) — EXACT (slices the WTF-8 bytes;
         // a bound splitting a surrogate pair keeps the REAL covered half).
         let subu = |a: usize, b: usize| -> crate::heap::JsStr { js_recv.slice_units(a, b) };
         match name {
-            "indexOf" => {
-                // ToString(searchString) (honours @@toPrimitive/toString/valueOf,
-                // throws on a Symbol) BEFORE ToInteger(position) — spec arg order.
-                let needle = self.to_js_string(arg0)?;
-                // Optional fromIndex (ToInteger, a unit position) to start at.
-                let from = if args.len() >= 2 {
-                    self.to_integer_strict(args[1])?.max(0) as usize
-                } else {
-                    0
-                };
-                let byte_from = u2b(&s, from);
-                let pos = s[byte_from..]
-                    .find(&needle)
-                    .map(|b| b2u(&s, byte_from + b) as i32)
-                    .unwrap_or(-1);
-                Ok(Some(Value::int(pos)))
-            }
-            "includes" => {
-                if self.is_regexp(arg0)? {
-                    return Err(Thrown(
-                        "TypeError: String.prototype.includes argument must not be a RegExp".into(),
-                    ));
-                }
-                let needle = self.to_js_string(arg0)?;
-                let len = unit_len(&s) as i64;
-                let pos = if args.len() >= 2 {
-                    self.to_integer_strict(args[1])?.clamp(0, len)
-                } else {
-                    0
-                } as usize;
-                let byte = u2b(&s, pos);
-                Ok(Some(Value::bool(s[byte..].contains(&needle))))
-            }
             "toUpperCase" => {
                 let mapped_len = case_map_exact_len(js_recv.as_bytes(), true)?;
                 self.preflight_guest_string_size(mapped_len)?;
@@ -841,11 +864,16 @@ impl<'p> Vm<'p> {
                 let matcher = self.get_prop(rx, "@@matchAll")?;
                 Ok(Some(self.call_value(matcher, rx, &[s_val])?))
             }
-            // A RegExp separator takes the generic `"split"` arm below: its
-            // GetMethod(@@split) is observable, and a shortcut straight to
-            // `regexp_split_impl` ignored an own, subclass or patched
-            // `RegExp.prototype[Symbol.split]`. The intrinsic @@split lands in
-            // the same `regexp_split_impl`, whose loop dwarfs the dispatch.
+            // The internal splitter IS `RegExp.prototype[@@split]`, so taking it
+            // directly is unobservable only while that is the method a
+            // `GetMethod(re, @@split)` would find (`regexp_split_fast_ok`). A
+            // user `@@split` — own, on the prototype, or on a subclass — takes
+            // the generic `"split"` arm below, which performs the lookup.
+            "split" if self.as_regexp(arg0).is_some_and(|re| self.regexp_split_fast_ok(re)) => {
+                let re = self.as_regexp(arg0).unwrap();
+                let limit = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                Ok(Some(self.regexp_split_impl(re, Value::heap(idx), limit)?))
+            }
             "replace" if self.as_regexp(arg0).is_some() => {
                 let re = self.as_regexp(arg0).unwrap();
                 let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -874,14 +902,7 @@ impl<'p> Vm<'p> {
                     );
                     Ok(Some(self.regex_replace(idx, re, repl, global)?))
                 } else {
-                    let sl = self
-                        .heap
-                        .str_cow(idx)
-                        .map(|c| c.into_owned())
-                        .unwrap_or_default();
-                    Ok(Some(
-                        self.string_replace_plain(&sl, idx, arg0, repl, false)?,
-                    ))
+                    Ok(Some(self.string_replace_plain(idx, &js_recv, arg0, repl, false)?))
                 }
             }
             // `replaceAll` (regexp or otherwise) funnels into `string_replace_plain`,
@@ -930,12 +951,38 @@ impl<'p> Vm<'p> {
                 // throw) and rejects a Symbol; after ToUint32(limit) and before
                 // the lim==0 early-out, matching the spec ordering. Hoisted
                 // ABOVE the pretenure scope below so no user code (and no `?`)
-                // runs inside it.
+                // runs inside it. Taken as a string VALUE, so a lone-surrogate
+                // separator is itself and not U+FFFD.
                 let sep_or = if args.is_empty() || arg0 == Value::UNDEFINED {
                     None
                 } else {
-                    Some(self.to_js_string(arg0)?)
+                    Some(self.to_js_str_owned(arg0)?)
                 };
+                // Every part is located and admitted before anything is
+                // allocated. A single split could otherwise build millions of
+                // parts inside one instruction, past the heap meter, and a
+                // failed infallible allocation traps a WebAssembly host.
+                let ranges = match &sep_or {
+                    Some(sep) if lim != 0 && sep.units() != 0 => {
+                        Some(self.split_ranges(&js_recv, &s, sep, lim)?)
+                    }
+                    Some(_) if lim != 0 => {
+                        let count = js_recv.units().min(lim);
+                        let bytes = if ascii { 0 } else { js_recv.as_bytes().len() };
+                        self.split_admit(count, bytes)?;
+                        None
+                    }
+                    _ => None,
+                };
+                let count = match (&sep_or, &ranges) {
+                    (_, Some((r, _))) => r.len(),
+                    (Some(_), None) if lim != 0 => js_recv.units().min(lim),
+                    _ => 1,
+                };
+                let mut parts: Vec<Value> = Vec::new();
+                parts
+                    .try_reserve_exact(count)
+                    .map_err(|_| Thrown("RangeError: Invalid array length".into()))?;
                 // W9 static pretenure (NURSERY_DESIGN.md §4): split's parts and
                 // result array are the markdown/regex rows' retained "builder"
                 // output — measured to survive minors wholesale, so they
@@ -946,41 +993,42 @@ impl<'p> Vm<'p> {
                     // No separator → the whole string as a single element (lim 0
                     // → []). The receiver itself — exact, strings are immutable.
                     None => {
-                        if lim == 0 {
-                            Vec::new()
-                        } else {
-                            vec![Value::heap(idx)]
+                        if lim != 0 {
+                            parts.push(Value::heap(idx));
                         }
+                        parts
                     }
-                    Some(sep) => {
-                        if lim == 0 {
-                            Vec::new()
-                        } else if sep.is_empty() {
-                            // Split into 1-UNIT pieces (spec: code units). An astral
-                            // scalar's halves are REAL lone-surrogate strings.
-                            let units: Vec<u16> = js_recv.units_iter().take(lim).collect();
-                            units.into_iter().map(|u| self.str_from_unit(u)).collect()
-                        } else {
-                            // Byte offsets in the lossy view match the exact bytes, so
-                            // each part slices `js_recv`'s WTF-8 exactly.
-                            let ranges: Vec<(usize, usize)> = s
-                                .split(sep.as_str())
-                                .take(lim)
-                                .map(|p| {
-                                    let off = p.as_ptr() as usize - s.as_ptr() as usize;
-                                    (off, off + p.len())
-                                })
-                                .collect();
-                            ranges
-                                .into_iter()
-                                .map(|(a, b)| {
+                    Some(_) => {
+                        match &ranges {
+                            // Split into 1-UNIT pieces (spec: code units). An
+                            // astral scalar's halves are REAL lone-surrogate
+                            // strings.
+                            None => {
+                                if lim != 0 {
+                                    for u in js_recv.units_iter().take(lim) {
+                                        parts.push(self.str_from_unit(u));
+                                    }
+                                }
+                            }
+                            // Byte ranges of the exact bytes.
+                            Some((ranges, false)) => {
+                                for &(a, b) in ranges {
                                     let js = crate::heap::JsStr::from_wtf8(
                                         js_recv.as_bytes()[a..b].to_vec(),
                                     );
-                                    Value::heap(self.heap.alloc_js(js))
-                                })
-                                .collect()
+                                    parts.push(Value::heap(self.heap.alloc_js(js)));
+                                }
+                            }
+                            // Unit ranges: a bound between the halves of a pair
+                            // keeps the real half.
+                            Some((ranges, true)) => {
+                                for &(a, b) in ranges {
+                                    let js = js_recv.slice_units(a, b);
+                                    parts.push(Value::heap(self.heap.alloc_js(js)));
+                                }
+                            }
                         }
+                        parts
                     }
                 };
                 let arr = Value::heap(self.heap.alloc(HeapObj::Array(parts)));
@@ -993,82 +1041,23 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(arr))
             }
-            // ECMAScript TrimString whitespace = WhiteSpace + LineTerminator:
-            // U+FEFF (ZWNBSP/BOM) yes and U+0085 (NEL) no, the two places
-            // Rust's char::is_whitespace differs (`str_white_space`). The trim
-            // is computed on the lossy view (U+FFFD is not whitespace, neither
-            // are surrogates) and the result sliced from the EXACT bytes at the
-            // same offsets.
+            // ECMAScript TrimString whitespace is `str_white_space`: Unicode
+            // White_Space plus U+FEFF (ZWNBSP/BOM) and MINUS U+0085 (NEL),
+            // which is not ECMAScript whitespace at all — `char::is_whitespace`
+            // alone trimmed a NEL the spec keeps. The trim is computed on the
+            // lossy view (U+FFFD is not whitespace, neither are surrogates) and
+            // the result sliced from the EXACT bytes at the same offsets.
             "trim" => {
-                let w = crate::vm::helpers_numeric::str_white_space;
-                let t = s.trim_matches(w);
+                let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
                 Ok(Some(self.alloc_recv_slice(&js_recv, &s, t)))
             }
             "trimStart" => {
-                let w = crate::vm::helpers_numeric::str_white_space;
-                let t = s.trim_start_matches(w);
+                let t = s.trim_start_matches(crate::vm::helpers_numeric::str_white_space);
                 Ok(Some(self.alloc_recv_slice(&js_recv, &s, t)))
             }
             "trimEnd" => {
-                let w = crate::vm::helpers_numeric::str_white_space;
-                let t = s.trim_end_matches(w);
+                let t = s.trim_end_matches(crate::vm::helpers_numeric::str_white_space);
                 Ok(Some(self.alloc_recv_slice(&js_recv, &s, t)))
-            }
-            "startsWith" => {
-                if self.is_regexp(arg0)? {
-                    return Err(Thrown(
-                        "TypeError: String.prototype.startsWith argument must not be a RegExp"
-                            .into(),
-                    ));
-                }
-                let needle = self.to_js_string(arg0)?;
-                let len = unit_len(&s) as i64;
-                let pos = if args.len() >= 2 {
-                    self.to_integer_strict(args[1])?.clamp(0, len)
-                } else {
-                    0
-                } as usize;
-                // An ANCHORED position: a start in the middle of a surrogate pair
-                // makes the spec substring begin with a trail surrogate, which a
-                // well-formed needle can never match (only the empty one).
-                let r = if ascii {
-                    s[pos.min(s.len())..].starts_with(&needle)
-                } else {
-                    let (lo, hi) = crate::heap::unit_byte_bounds(&s, pos);
-                    if lo != hi {
-                        needle.is_empty()
-                    } else {
-                        s[lo..].starts_with(&needle)
-                    }
-                };
-                Ok(Some(Value::bool(r)))
-            }
-            "endsWith" => {
-                if self.is_regexp(arg0)? {
-                    return Err(Thrown(
-                        "TypeError: String.prototype.endsWith argument must not be a RegExp".into(),
-                    ));
-                }
-                let needle = self.to_js_string(arg0)?;
-                let len = unit_len(&s) as i64;
-                let end = if args.len() >= 2 && args[1] != Value::UNDEFINED {
-                    self.to_integer_strict(args[1])?.clamp(0, len)
-                } else {
-                    len
-                } as usize;
-                // ANCHORED end position: an end mid-pair leaves the spec substring
-                // ending in a lead surrogate — only an empty needle can match.
-                let r = if ascii {
-                    s[..end.min(s.len())].ends_with(&needle)
-                } else {
-                    let (lo, hi) = crate::heap::unit_byte_bounds(&s, end);
-                    if lo != hi {
-                        needle.is_empty()
-                    } else {
-                        s[..lo].ends_with(&needle)
-                    }
-                };
-                Ok(Some(Value::bool(r)))
             }
             "concat" => {
                 // Each argument is ToString-coerced (honours @@toPrimitive/toString/
@@ -1083,6 +1072,15 @@ impl<'p> Vm<'p> {
                         let part = self
                             .heap
                             .str_wtf8_cow(av.heap_index())
+                            .map(|c| c.into_owned());
+                        crate::heap::wtf8_push(&mut out, &part.unwrap_or_default());
+                    } else if self.is_object_value(av) {
+                        // An object's ToString result is kept as the string
+                        // VALUE it is (a `toString` returning a lone surrogate).
+                        let sv = self.to_str_value(av)?;
+                        let part = self
+                            .heap
+                            .str_wtf8_cow(sv.heap_index())
                             .map(|c| c.into_owned());
                         crate::heap::wtf8_push(&mut out, &part.unwrap_or_default());
                     } else {
@@ -1129,12 +1127,16 @@ impl<'p> Vm<'p> {
                 // the ordering cannot drift from `Intl.Collator.prototype.compare`
                 // (`localeCompare/{throws-same-exceptions-as,returns-same-results-as}
                 // -Collator.js`).
-                let other = self.to_js_string(arg0)?;
+                //
+                // `that` is ToString'd to a string VALUE and copied out before
+                // the Collator's options can run user code.
+                let that = self.to_js_str_owned(arg0)?;
                 let locales = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let options = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 let coll = self.make_intl(crate::vm::native::INTL_COLLATOR, locales, options)?;
                 let resolved = self.intl_this(coll, crate::vm::native::INTL_COLLATOR, "compare")?;
-                let ord = self.collator_compare(resolved, &s, &other)?;
+                let (a, b) = (collation_view(&js_recv), collation_view(&that));
+                let ord = self.collator_compare(resolved, &a, &b)?;
                 Ok(Some(Value::int(ord as i32)))
             }
             "normalize" => {
@@ -1154,6 +1156,39 @@ impl<'p> Vm<'p> {
                         "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD."
                             .into(),
                     ));
+                }
+                if !js_recv.is_wellformed() {
+                    // The lossy view shows each lone surrogate as U+FFFD, and
+                    // the result kept it. Normalize each well-formed run of the
+                    // exact bytes and copy the surrogates through: a surrogate
+                    // is a starter with no decomposition, so it blocks
+                    // reordering and composition exactly as a run boundary.
+                    let bytes = js_recv.as_bytes();
+                    let mut out_len = 0usize;
+                    for run in wtf8_runs(bytes) {
+                        match run {
+                            Ok(r) => for_each_normalized(&form, r, &mut |c| out_len += c.len_utf8()),
+                            Err(b) => out_len += b.len(),
+                        }
+                        if out_len > MAX_STRING_BYTES {
+                            return Err(invalid_string_length());
+                        }
+                    }
+                    self.preflight_guest_string_size(out_len)?;
+                    let mut out: Vec<u8> = Vec::new();
+                    out.try_reserve_exact(out_len)
+                        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+                    for run in wtf8_runs(bytes) {
+                        match run {
+                            Ok(r) => for_each_normalized(&form, r, &mut |c| {
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                            }),
+                            Err(b) => out.extend_from_slice(b),
+                        }
+                    }
+                    let js = crate::heap::JsStr::from_wtf8(out);
+                    return Ok(Some(Value::heap(self.heap.alloc_js(js))));
                 }
                 use unicode_normalization::UnicodeNormalization;
                 let out_len = match form.as_str() {
@@ -1198,20 +1233,11 @@ impl<'p> Vm<'p> {
                 }
                 // ToString(fillString) — a Symbol/abrupt fill throws (after the
                 // length early-return above, matching the spec's StringPad order).
-                // The filler goes through the EXACT string path when it is a
-                // string value (its own lone surrogates survive).
+                // The filler is taken as a string VALUE (its own lone
+                // surrogates, or those of a `toString` result, survive).
                 let fill_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let pad: crate::heap::JsStr = if fill_arg != Value::UNDEFINED {
-                    if fill_arg.is_heap() && self.heap.is_str_like(fill_arg.heap_index()) {
-                        let fi = fill_arg.heap_index();
-                        self.heap.flatten(fi);
-                        match self.heap.get(fi) {
-                            HeapObj::Str(js) => js.clone(),
-                            _ => crate::heap::JsStr::new(String::new()),
-                        }
-                    } else {
-                        crate::heap::JsStr::new(self.to_js_string(fill_arg)?)
-                    }
+                    self.to_js_str_owned(fill_arg)?
                 } else {
                     crate::heap::JsStr::new(" ".to_string())
                 };
@@ -1221,36 +1247,41 @@ impl<'p> Vm<'p> {
                 // StringPad truncates the repeated filler to (target - cur)
                 // UNITS; a truncation that splits an astral filler char keeps
                 // the REAL lead half (a 1-unit lone high surrogate).
-                let mut padding: Vec<u8> = Vec::new();
-                let mut need = target - cur;
-                while need > 0 {
-                    if need >= pad.units() {
-                        crate::heap::wtf8_push(&mut padding, pad.as_bytes());
-                        need -= pad.units();
-                    } else {
-                        let part = pad.slice_units(0, need);
-                        crate::heap::wtf8_push(&mut padding, part.as_bytes());
-                        need = 0;
-                    }
-                }
-                // Join padding and receiver as WTF-8 (the seam may canonicalize:
-                // e.g. a filler ending in a high surrogate against a receiver
-                // starting with a low one).
-                let mut out: Vec<u8> = Vec::with_capacity(padding.len() + js_recv.as_bytes().len());
-                if name == "padStart" {
-                    out.extend_from_slice(&padding);
-                    crate::heap::wtf8_push(&mut out, js_recv.as_bytes());
-                } else {
+                let need = target - cur;
+                let (whole, tail) = (need / pad.units(), pad.slice_units(0, need % pad.units()));
+                // The unit cap above bounds units, not bytes: a 3-byte filler
+                // character made one call build up to 3x MAX_STRING_BYTES in an
+                // unmetered buffer. Admit the exact size first (an upper bound:
+                // a seam that pairs two surrogate halves saves two bytes), and
+                // build into that one reservation.
+                let total = whole
+                    .checked_mul(pad.as_bytes().len())
+                    .and_then(|n| n.checked_add(tail.as_bytes().len()))
+                    .and_then(|n| n.checked_add(js_recv.as_bytes().len()))
+                    .ok_or_else(invalid_string_length)?;
+                self.preflight_guest_string_size(total)?;
+                let mut out: Vec<u8> = Vec::new();
+                out.try_reserve_exact(total)
+                    .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+                // Joined as WTF-8: a seam may canonicalize (a filler ending in a
+                // high surrogate against a receiver starting with a low one).
+                if name == "padEnd" {
                     out.extend_from_slice(js_recv.as_bytes());
-                    crate::heap::wtf8_push(&mut out, &padding);
+                }
+                for _ in 0..whole {
+                    crate::heap::wtf8_push(&mut out, pad.as_bytes());
+                }
+                crate::heap::wtf8_push(&mut out, tail.as_bytes());
+                if name == "padStart" {
+                    crate::heap::wtf8_push(&mut out, js_recv.as_bytes());
                 }
                 let js = crate::heap::JsStr::from_wtf8(out);
                 Ok(Some(Value::heap(self.heap.alloc_js(js))))
             }
             "replace" => {
                 let r = self.string_replace_plain(
-                    &s,
                     idx,
+                    &js_recv,
                     arg0,
                     args.get(1).copied().unwrap_or(Value::UNDEFINED),
                     false,
@@ -1259,8 +1290,8 @@ impl<'p> Vm<'p> {
             }
             "replaceAll" => {
                 let r = self.string_replace_plain(
-                    &s,
                     idx,
+                    &js_recv,
                     arg0,
                     args.get(1).copied().unwrap_or(Value::UNDEFINED),
                     true,
@@ -1278,52 +1309,28 @@ impl<'p> Vm<'p> {
                 let lang = locales
                     .first()
                     .and_then(|t| crate::vm::special_casing::special_casing_language(t));
-                let out = match lang
-                    .and_then(|l| crate::vm::special_casing::transform_case(&s, l, upper))
-                {
-                    Some(mapped) => mapped,
-                    None if upper => s.to_uppercase(),
-                    None => s.to_lowercase(),
-                };
-                Ok(Some(self.alloc_str(out)))
-            }
-            "lastIndexOf" => {
-                // ToString(searchString) before the position coercion (spec order).
-                let needle = self.to_js_string(arg0)?;
-                let len = unit_len(&s);
-                // position: ToNumber, then NaN -> search the whole string (per
-                // lastIndexOf), else ToInteger clamped to [0, len]. A unit cap.
-                let cap = if args.len() >= 2 && args[1] != Value::UNDEFINED {
-                    let np = self.to_number_strict(args[1])?;
-                    if np.is_nan() {
-                        len
-                    } else {
-                        (np.trunc().max(0.0) as usize).min(len)
+                // Both mappings size the result exactly and admit it before
+                // building, over the EXACT bytes. A case mapping can triple a
+                // string (U+0390 uppercases to three code points); building it
+                // straight into an unchecked `String` went past
+                // MAX_STRING_BYTES and trapped a WebAssembly host, where
+                // toUpperCase threw RangeError. Lone surrogates have no mapping
+                // and copy through, as in toUpperCase/toLowerCase.
+                let bytes = js_recv.as_bytes();
+                let out = match lang {
+                    // "und": the locale-independent mapping.
+                    None => {
+                        let mapped_len = case_map_exact_len(bytes, upper)?;
+                        self.preflight_guest_string_size(mapped_len)?;
+                        case_map_exact(bytes, upper, mapped_len)?
                     }
-                } else {
-                    len
-                };
-                let result: i64 = if needle.is_empty() {
-                    cap as i64
-                } else {
-                    // Last OVERLAPPING byte match whose start is ≤ the cap. A cap
-                    // that lands mid-pair floors to the pair's start (a match can
-                    // begin at the pair's lead unit, never at its trail).
-                    let cap_byte = crate::heap::unit_byte_bounds(&s, cap).0;
-                    let mut best: Option<usize> = None;
-                    let mut from = 0usize;
-                    while let Some(p) = s[from..].find(&needle) {
-                        let b = from + p;
-                        if b > cap_byte {
-                            break;
-                        }
-                        best = Some(b);
-                        // Restart one scalar later so overlapping matches are seen.
-                        from = b + s[b..].chars().next().map_or(1, |c| c.len_utf8());
+                    Some(lang) => {
+                        let mapped_len = special_case_exact_len(bytes, lang, upper);
+                        self.preflight_guest_string_size(mapped_len)?;
+                        special_case_exact(bytes, lang, upper, mapped_len)?
                     }
-                    best.map_or(-1, |b| b2u(&s, b) as i64)
                 };
-                Ok(Some(Value::num(result as f64)))
+                Ok(Some(Value::heap(self.heap.alloc_js(out))))
             }
             // Annex B HTML wrapper methods (B.2.3): wrap the string in a tag, with
             // the attribute value's `"` escaped to `&quot;`.
@@ -1397,6 +1404,296 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `indexOf` / `lastIndexOf` / `includes` / `startsWith` / `endsWith` over
+    /// the EXACT operands, borrowed in place.
+    ///
+    /// The needle is coerced to a string VALUE, never the lossy `String` of
+    /// `to_js_string`, whose U+FFFD made a lone-surrogate needle match a real
+    /// U+FFFD. Two strategies then cover every operand pair:
+    ///
+    /// * The `&str` search over the receiver's lossy view is exact whenever the
+    ///   needle is well-formed and either the receiver is too (the view then IS
+    ///   the content, borrowed) or the needle holds no U+FFFD (the only thing a
+    ///   substituted surrogate could falsely match). Positions go through the
+    ///   receiver's memoized unit/byte bounds, so a scanning loop like
+    ///   `while ((i = s.indexOf(",", i + 1)) !== -1)` is linear, not the
+    ///   quadratic receiver copy the generic path paid per call.
+    /// * Otherwise both sides are mapped to one `char` per UTF-16 code unit
+    ///   ([`unit_chars_into`]) and searched there, which is the spec's
+    ///   code-unit comparison: a lone-surrogate needle can match half of a pair.
+    fn string_search(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Value, Thrown> {
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        if name != "indexOf" && name != "lastIndexOf" && self.is_regexp(arg0)? {
+            return Err(Thrown(format!(
+                "TypeError: String.prototype.{name} argument must not be a RegExp"
+            )));
+        }
+        // ToString(searchString) before the position coercion (spec order).
+        let needle = self.to_str_value(arg0)?;
+        let len = self.heap_str_units(idx);
+        // The position coercion can run a user `valueOf`, so a needle
+        // allocated by the ToString above is rooted across it.
+        let roots = self.host_result_roots.len();
+        self.host_result_roots.push(needle);
+        let pos = self.string_search_position(name, args.get(1).copied(), len);
+        self.host_result_roots.truncate(roots);
+        let pos = pos?;
+        let nidx = needle.heap_index();
+        self.heap.flatten(nidx);
+
+        let (hay, ned) = match (self.heap.get(idx), self.heap.get(nidx)) {
+            (HeapObj::Str(hay), HeapObj::Str(ned)) => (hay, ned),
+            _ => return Ok(Value::UNDEFINED),
+        };
+        if ned.units() == 0 {
+            return Ok(match name {
+                "indexOf" | "lastIndexOf" => Value::int(pos as i32),
+                _ => Value::bool(true),
+            });
+        }
+        let lossy_exact = ned.is_wellformed()
+            && (hay.is_wellformed() || !bytes_contain_replacement_char(ned.as_bytes()));
+        if lossy_exact {
+            let s = hay.as_str_lossy();
+            let n = ned.as_str_wf();
+            let (lo, hi) = hay.unit_byte_bounds(pos);
+            return Ok(match name {
+                "indexOf" => match s[hi..].find(n) {
+                    Some(b) if hay.is_ascii() => Value::int((hi + b) as i32),
+                    Some(b) => {
+                        // `hi` is unit `pos`, or `pos + 1` when `pos` split a pair.
+                        let from = pos + usize::from(lo != hi);
+                        let at = from + crate::heap::wtf8_units(&hay.as_bytes()[hi..hi + b]);
+                        Value::int(at as i32)
+                    }
+                    None => Value::int(-1),
+                },
+                "includes" => Value::bool(s[hi..].contains(n)),
+                // Anchored positions: a start or end between the halves of a
+                // pair leaves a lone surrogate at the edge of the spec's
+                // substring, which a well-formed needle cannot match.
+                "startsWith" => Value::bool(lo == hi && s[lo..].starts_with(n)),
+                "endsWith" => Value::bool(lo == hi && s[..lo].ends_with(n)),
+                _ => {
+                    // lastIndexOf: the last match starting at or before `lo`.
+                    let mut end = (lo + n.len()).min(s.len());
+                    while !s.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    let found = loop {
+                        match s[..end].rfind(n) {
+                            Some(b) if b <= lo => break Some(b),
+                            Some(b) => {
+                                end = b + n.len() - 1;
+                                while !s.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                            }
+                            None => break None,
+                        }
+                    };
+                    match found {
+                        None => Value::int(-1),
+                        Some(b) if hay.is_ascii() => Value::int(b as i32),
+                        Some(b) => {
+                            // `lo` is unit `pos`, or `pos - 1` inside a pair.
+                            let lo_unit = pos - usize::from(lo != hi);
+                            let at = lo_unit - crate::heap::wtf8_units(&hay.as_bytes()[b..lo]);
+                            Value::int(at as i32)
+                        }
+                    }
+                }
+            });
+        }
+
+        let (hay_len, ned_len, ned_units) = (
+            unit_chars_len(hay.as_bytes()),
+            unit_chars_len(ned.as_bytes()),
+            ned.units(),
+        );
+        let mut hm = self.string_scratch(hay_len)?;
+        let mut nm = self.string_scratch(ned_len)?;
+        if let (HeapObj::Str(hay), HeapObj::Str(ned)) = (self.heap.get(idx), self.heap.get(nidx)) {
+            unit_chars_into(hay.as_bytes(), &mut hm);
+            unit_chars_into(ned.as_bytes(), &mut nm);
+        }
+        // One char per unit: a unit position is a char index.
+        let byte_of = |u: usize| hm.char_indices().nth(u).map_or(hm.len(), |(b, _)| b);
+        Ok(match name {
+            "indexOf" => {
+                let from = byte_of(pos);
+                match hm[from..].find(nm.as_str()) {
+                    Some(b) => Value::int((pos + hm[from..from + b].chars().count()) as i32),
+                    None => Value::int(-1),
+                }
+            }
+            "includes" => Value::bool(hm[byte_of(pos)..].contains(nm.as_str())),
+            "startsWith" => Value::bool(hm[byte_of(pos)..].starts_with(nm.as_str())),
+            "endsWith" => Value::bool(hm[..byte_of(pos)].ends_with(nm.as_str())),
+            _ => {
+                let end = byte_of((pos + ned_units).min(len));
+                match hm[..end].rfind(nm.as_str()) {
+                    Some(b) => Value::int(hm[..b].chars().count() as i32),
+                    None => Value::int(-1),
+                }
+            }
+        })
+    }
+
+    /// The clamped unit position argument of a [`Self::string_search`]
+    /// method: ToIntegerOrInfinity for `indexOf`/`includes`/`startsWith`
+    /// (absent is 0), the same for `endsWith` with absent or undefined meaning
+    /// the length, and `lastIndexOf`'s ToNumber, where NaN means the length.
+    fn string_search_position(
+        &mut self,
+        name: &str,
+        arg: Option<Value>,
+        len: usize,
+    ) -> Result<usize, Thrown> {
+        let len_i = len as i64;
+        Ok(match (name, arg) {
+            ("endsWith" | "lastIndexOf", None) => len,
+            ("endsWith" | "lastIndexOf", Some(v)) if v == Value::UNDEFINED => len,
+            ("lastIndexOf", Some(v)) => {
+                let n = self.to_number_strict(v)?;
+                if n.is_nan() {
+                    len
+                } else {
+                    (n.trunc().max(0.0) as usize).min(len)
+                }
+            }
+            (_, None) => 0,
+            (_, Some(v)) => self.to_integer_strict(v)?.clamp(0, len_i) as usize,
+        })
+    }
+
+    /// An empty scratch `String` with exactly `bytes` reserved: charged to the
+    /// instrumented heap budget first and fallibly allocated, so a native
+    /// helper's temporary copy of guest text cannot trap the host.
+    fn string_scratch(&mut self, bytes: usize) -> Result<String, Thrown> {
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(bytes)
+            .map_err(|message| Thrown(message.into()))?;
+        let mut out = String::new();
+        out.try_reserve_exact(bytes)
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        Ok(out)
+    }
+
+    /// The part ranges of `recv.split(sep)` for a non-empty separator, at most
+    /// `lim` of them: byte ranges of `recv`'s exact bytes (`false`), or unit
+    /// ranges (`true`) when the separator can only be matched per code unit
+    /// (see [`Self::string_search`] for the two strategies). `s` is `recv`'s
+    /// lossy view. Under a size cap or heap ceiling
+    /// ([`Self::split_counts_first`]), a receiver past [`SPLIT_ADMIT_BYTES`]
+    /// has its parts counted and admitted before the range vector is
+    /// allocated.
+    fn split_ranges(
+        &mut self,
+        recv: &crate::heap::JsStr,
+        s: &str,
+        sep: &crate::heap::JsStr,
+        lim: usize,
+    ) -> Result<(Vec<(usize, usize)>, bool), Thrown> {
+        let alloc_error = || Thrown("RangeError: Invalid array length".into());
+        if sep.is_wellformed()
+            && (recv.is_wellformed() || !bytes_contain_replacement_char(sep.as_bytes()))
+        {
+            let n = sep.as_str_wf();
+            // A one-character separator (the common `split(",")`) searches
+            // as a `char`, which is memchr-based.
+            let mut chars = n.chars();
+            let single = match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            };
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let counted = s.len() > SPLIT_ADMIT_BYTES && self.split_counts_first();
+            if counted {
+                let count = match single {
+                    Some(c) => s.split(c).take(lim).count(),
+                    None => s.split(n).take(lim).count(),
+                };
+                self.split_admit(count, s.len())?;
+                ranges.try_reserve_exact(count).map_err(|_| alloc_error())?;
+            }
+            let base = s.as_ptr() as usize;
+            let mut push = |p: &str| -> Result<(), Thrown> {
+                if ranges.len() == ranges.capacity() {
+                    ranges
+                        .try_reserve(ranges.len().max(16))
+                        .map_err(|_| alloc_error())?;
+                }
+                let off = p.as_ptr() as usize - base;
+                ranges.push((off, off + p.len()));
+                Ok(())
+            };
+            match single {
+                Some(c) => s.split(c).take(lim).try_for_each(&mut push)?,
+                None => s.split(n).take(lim).try_for_each(&mut push)?,
+            }
+            if !counted {
+                self.split_admit(ranges.len(), s.len())?;
+            }
+            return Ok((ranges, false));
+        }
+        let mut hm = self.string_scratch(unit_chars_len(recv.as_bytes()))?;
+        let mut nm = self.string_scratch(unit_chars_len(sep.as_bytes()))?;
+        unit_chars_into(recv.as_bytes(), &mut hm);
+        unit_chars_into(sep.as_bytes(), &mut nm);
+        let count = hm.split(nm.as_str()).take(lim).count();
+        self.split_admit(count, recv.as_bytes().len())?;
+        let mut ranges = Vec::new();
+        ranges.try_reserve_exact(count).map_err(|_| alloc_error())?;
+        let mut at = 0usize;
+        for piece in hm.split(nm.as_str()).take(lim) {
+            let end = at + piece.chars().count();
+            ranges.push((at, end));
+            at = end + sep.units();
+        }
+        Ok((ranges, true))
+    }
+
+    /// Whether a large `split` counts its parts before it collects their
+    /// ranges: the hardened profile's dense-array cap and an attached heap
+    /// ceiling must refuse a result before even its range vector exists. The
+    /// ordinary run collects the ranges in one pass, growing fallibly, and
+    /// admits them afterwards.
+    fn split_counts_first(&self) -> bool {
+        #[cfg(feature = "safe-sandbox")]
+        return true;
+        #[cfg(all(not(feature = "safe-sandbox"), feature = "instrument"))]
+        return self
+            .instr_rec
+            .as_ref()
+            .is_some_and(|rec| rec.heap_limit != usize::MAX);
+        #[cfg(all(not(feature = "safe-sandbox"), not(feature = "instrument")))]
+        return false;
+    }
+
+    /// Admit a split result of `parts` strings holding at most `bytes` of
+    /// text: the hardened profile's dense-array cap, the native iteration
+    /// bound, and the heap budget for the parts, their slots and the result
+    /// array.
+    fn split_admit(&mut self, parts: usize, bytes: usize) -> Result<(), Thrown> {
+        #[cfg(feature = "safe-sandbox")]
+        if parts > MAX_DENSE_ARRAY_LEN {
+            return Err(Thrown("RangeError: Invalid array length".into()));
+        }
+        self.preflight_native_iteration_work(parts as u64)?;
+        #[cfg(feature = "instrument")]
+        {
+            let per_part = std::mem::size_of::<HeapObj>()
+                + std::mem::size_of::<Value>()
+                + std::mem::size_of::<(usize, usize)>();
+            self.instrument_preflight_heap_growth(parts.saturating_mul(per_part).saturating_add(bytes))
+                .map_err(|message| Thrown(message.into()))?;
+        }
+        #[cfg(not(feature = "instrument"))]
+        let _ = bytes;
+        Ok(())
+    }
+
     /// `String.fromCharCode(...codes)`: each arg is ToUint16(ToNumber) — strict
     /// ToNumber (ToPrimitive-aware, BigInt/Symbol → TypeError, a throwing valueOf
     /// propagates), coerced in argument order. The result is built as WTF-8:
@@ -1428,14 +1725,15 @@ impl<'p> Vm<'p> {
     }
 
     /// String.prototype.replace / replaceAll with a NON-regexp searchValue.
-    /// `s_idx` is the receiver string's heap index, `all` selects replaceAll.
+    /// `s_idx` is the receiver string's heap index and `recv` the caller's copy
+    /// of its content; `all` selects replaceAll.
     /// Delegates to a custom `searchValue[Symbol.replace]` if present, else does a
     /// plain substring replacement with full GetSubstitution ($-pattern) support
     /// and functional replacers.
     pub(crate) fn string_replace_plain(
         &mut self,
-        s: &str,
         s_idx: u32,
+        recv: &crate::heap::JsStr,
         search_v: Value,
         repl_v: Value,
         all: bool,
@@ -1483,105 +1781,333 @@ impl<'p> Vm<'p> {
                 return self.call_value(m, search_v, &[sval, repl_v]);
             }
         }
-        let search = self.to_js_string(search_v)?;
+        // ToString(searchValue), then ToString(replaceValue) unless it is
+        // callable, each as the exact string VALUE. The lossy `String` form
+        // made a lone-surrogate needle match a real U+FFFD and dropped the
+        // surrogates of a replacement. Both are copied out of the heap, as the
+        // receiver is, so a functional replacer cannot disturb them.
+        let search = self.to_js_str_owned(search_v)?;
         let functional = self.is_callable(repl_v);
-        let repl_str = if functional {
-            String::new()
+        let tmpl = if functional {
+            crate::heap::JsStr::new(String::new())
         } else {
-            self.to_js_string(repl_v)?
+            self.to_js_str_owned(repl_v)?
         };
-        // Match byte offsets (non-overlapping). An empty searchValue matches at
-        // every char boundary including the end (replaceAll), or just position 0.
-        // (Spec: every UNIT boundary — the position between a surrogate pair's
-        // halves is skipped here since the splice can't represent the halves;
-        // exact once strings are WTF-8.)
-        let positions = if search.is_empty() {
-            if all {
-                PlainReplacePositions::EmptyAll {
-                    indices: s.char_indices(),
-                    end: s.len(),
-                    emitted_end: false,
-                }
-            } else {
-                PlainReplacePositions::One(Some(0))
-            }
-        } else if all {
-            PlainReplacePositions::All(s.match_indices(&search))
-        } else {
-            PlainReplacePositions::One(s.find(&search))
-        };
-        let mut out = String::new();
-        let mut last = 0usize;
-        for pos in positions {
-            self.append_guest_string(&mut out, &s[last..pos])?;
-            if functional {
-                let m = self.alloc_str(search.clone());
-                // The replacer's position argument is a UNIT position.
-                let off = Value::num(crate::heap::byte_to_units(s, pos) as f64);
-                // The third callback argument is the original receiver string.
-                // Reuse its immutable heap value: cloning a near-limit source
-                // once per match made replaceAll's native loop an unchecked
-                // O(matches * source_len) allocator despite an O(1) alias being
-                // semantically identical.
-                let sv = Value::heap(s_idx);
-                let r = self.call_value(repl_v, Value::UNDEFINED, &[m, off, sv])?;
-                let rs = self.to_js_string(r)?;
-                self.append_guest_string(&mut out, &rs)?;
-            } else {
-                let rep = self.expand_replacement(
-                    &repl_str,
-                    &search,
-                    &[],
-                    &[],
-                    false, // a string search has no named captures: `$<…>` is literal
-                    &s[..pos],
-                    &s[pos + search.len()..],
-                    MAX_STRING_BYTES.saturating_sub(out.len()),
-                )?;
-                self.append_guest_string(&mut out, &rep)?;
-            }
-            last = pos + search.len();
-        }
-        self.append_guest_string(&mut out, &s[last..])?;
-        Ok(self.alloc_str(out))
-    }
-}
-
-enum PlainReplacePositions<'subject, 'needle> {
-    EmptyAll {
-        indices: std::str::CharIndices<'subject>,
-        end: usize,
-        emitted_end: bool,
-    },
-    All(std::str::MatchIndices<'subject, &'needle str>),
-    One(Option<usize>),
-}
-
-impl Iterator for PlainReplacePositions<'_, '_> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::EmptyAll {
-                indices,
-                end,
-                emitted_end,
-            } => indices.next().map(|(index, _)| index).or_else(|| {
-                if *emitted_end {
-                    None
+        let bytes = recv.as_bytes();
+        let tmpl = tmpl.as_bytes();
+        let len = recv.units();
+        // `` $` `` and `$'` copy the text around a match; it is sliced only
+        // when the template names one of them.
+        let context = !functional && tmpl.windows(2).any(|w| w == b"$`" || w == b"$'");
+        let empty = crate::heap::JsStr::new(String::new());
+        let mut out: Vec<u8> = Vec::new();
+        let mut any = false;
+        if search.units() == 0 {
+            // An empty searchValue matches at position 0 (replace), or at every
+            // UNIT boundary including the end (replaceAll), so also between the
+            // halves of a surrogate pair, which stay apart unless the
+            // replacement between them is empty.
+            let ends = if all { len } else { 0 };
+            let mut units = recv.units_iter();
+            for p in 0..=ends {
+                let (pre, post) = if context {
+                    (recv.slice_units(0, p), recv.slice_units(p, len))
                 } else {
-                    *emitted_end = true;
-                    Some(*end)
+                    (empty.clone(), empty.clone())
+                };
+                self.append_plain_replacement(
+                    &mut out,
+                    s_idx,
+                    repl_v,
+                    functional,
+                    tmpl,
+                    &[],
+                    p,
+                    pre.as_bytes(),
+                    post.as_bytes(),
+                )?;
+                if p < ends {
+                    if let Some(u) = units.next() {
+                        self.append_guest_unit(&mut out, u)?;
+                    }
                 }
-            }),
-            Self::All(indices) => indices.next().map(|(index, _)| index),
-            Self::One(position) => position.take(),
+            }
+            if !all {
+                self.append_guest_wtf8(&mut out, bytes)?;
+            }
+            any = true;
+        } else if search.is_wellformed()
+            && (recv.is_wellformed() || !bytes_contain_replacement_char(search.as_bytes()))
+        {
+            // The receiver's lossy view differs from its content only where a
+            // lone surrogate reads as U+FFFD, which this needle cannot match,
+            // and it is byte-for-byte aligned with the content, so its match
+            // offsets slice the exact bytes. Matches are non-overlapping.
+            let s = recv.as_str_lossy();
+            let needle = search.as_str_wf();
+            let ascii = recv.is_ascii();
+            // The replacer's position argument is a UNIT position, counted
+            // forward from the previous match rather than from byte 0.
+            let (mut last, mut counted, mut units) = (0usize, 0usize, 0usize);
+            while let Some(off) = s[last..].find(needle) {
+                let pos = last + off;
+                any = true;
+                self.append_guest_wtf8(&mut out, &bytes[last..pos])?;
+                let position = if ascii {
+                    pos
+                } else {
+                    units += crate::heap::wtf8_units(&bytes[counted..pos]);
+                    counted = pos;
+                    units
+                };
+                let end = pos + needle.len();
+                let (pre, post): (&[u8], &[u8]) = if context {
+                    (&bytes[..pos], &bytes[end..])
+                } else {
+                    (&[], &[])
+                };
+                self.append_plain_replacement(
+                    &mut out,
+                    s_idx,
+                    repl_v,
+                    functional,
+                    tmpl,
+                    search.as_bytes(),
+                    position,
+                    pre,
+                    post,
+                )?;
+                last = end;
+                if !all {
+                    break;
+                }
+            }
+            if any {
+                self.append_guest_wtf8(&mut out, &bytes[last..])?;
+            }
+        } else {
+            // A lone-surrogate needle (or a U+FFFD one against a receiver
+            // whose lossy view has substitutes) is matched per UTF-16 code
+            // unit, where it can also match half of a pair: both sides map to
+            // one `char` per unit (see `string_search`), so a char index is a
+            // unit position.
+            let mut hm = self.string_scratch(unit_chars_len(bytes))?;
+            let mut nm = self.string_scratch(unit_chars_len(search.as_bytes()))?;
+            unit_chars_into(bytes, &mut hm);
+            unit_chars_into(search.as_bytes(), &mut nm);
+            let n_units = search.units();
+            let (mut last, mut at_byte, mut at_unit) = (0usize, 0usize, 0usize);
+            for (b, _) in hm.match_indices(nm.as_str()) {
+                at_unit += hm[at_byte..b].chars().count();
+                at_byte = b;
+                let pos = at_unit;
+                any = true;
+                let gap = recv.slice_units(last, pos);
+                self.append_guest_wtf8(&mut out, gap.as_bytes())?;
+                let (pre, post) = if context {
+                    (recv.slice_units(0, pos), recv.slice_units(pos + n_units, len))
+                } else {
+                    (empty.clone(), empty.clone())
+                };
+                self.append_plain_replacement(
+                    &mut out,
+                    s_idx,
+                    repl_v,
+                    functional,
+                    tmpl,
+                    search.as_bytes(),
+                    pos,
+                    pre.as_bytes(),
+                    post.as_bytes(),
+                )?;
+                last = pos + n_units;
+                if !all {
+                    break;
+                }
+            }
+            if any {
+                let tail = recv.slice_units(last, len);
+                self.append_guest_wtf8(&mut out, tail.as_bytes())?;
+            }
         }
+        if !any {
+            // No match: the receiver itself (strings are immutable, so the
+            // same value is indistinguishable from a copy).
+            return Ok(Value::heap(s_idx));
+        }
+        Ok(Value::heap(
+            self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)),
+        ))
+    }
+
+    /// Append the replacement for one match of a plain `replace`/`replaceAll`:
+    /// the functional replacer's result, ToString'd exactly, or
+    /// GetSubstitution of the template. A string search has no captures and
+    /// no groups object, so only `$$`, `$&`, `` $` `` and `$'` are special and
+    /// `$n`/`$<` stay literal. The template is scanned as WTF-8 bytes, which is
+    /// exact: `$` and the four selectors are ASCII, and no byte of a
+    /// multi-byte sequence is.
+    #[allow(clippy::too_many_arguments)]
+    fn append_plain_replacement(
+        &mut self,
+        out: &mut Vec<u8>,
+        s_idx: u32,
+        repl_v: Value,
+        functional: bool,
+        tmpl: &[u8],
+        matched: &[u8],
+        position: usize,
+        pre: &[u8],
+        post: &[u8],
+    ) -> Result<(), Thrown> {
+        if functional {
+            let m = self
+                .heap
+                .alloc_js(crate::heap::JsStr::from_wtf8(matched.to_vec()));
+            // The third callback argument is the original receiver string.
+            // Reuse its immutable heap value: cloning a near-limit source
+            // once per match made replaceAll's native loop an unchecked
+            // O(matches * source_len) allocator despite an O(1) alias being
+            // semantically identical.
+            let argv = [Value::heap(m), Value::num(position as f64), Value::heap(s_idx)];
+            let r = self.call_value(repl_v, Value::UNDEFINED, &argv)?;
+            let r = self.to_str_value(r)?;
+            let exact = self
+                .heap
+                .str_wtf8_cow(r.heap_index())
+                .map(|c| c.into_owned())
+                .unwrap_or_default();
+            return self.append_guest_wtf8(out, &exact);
+        }
+        let (mut literal, mut i) = (0usize, 0usize);
+        while i + 1 < tmpl.len() {
+            let piece: Option<&[u8]> = if tmpl[i] == b'$' {
+                match tmpl[i + 1] {
+                    b'$' => Some(b"$"),
+                    b'&' => Some(matched),
+                    b'`' => Some(pre),
+                    b'\'' => Some(post),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match piece {
+                Some(piece) => {
+                    self.append_guest_wtf8(out, &tmpl[literal..i])?;
+                    self.append_guest_wtf8(out, piece)?;
+                    i += 2;
+                    literal = i;
+                }
+                None => i += 1,
+            }
+        }
+        self.append_guest_wtf8(out, &tmpl[literal..])
+    }
+
+    /// `append_guest_string` for a WTF-8 buffer: the total is admitted against
+    /// MAX_STRING_BYTES and the heap budget, the buffer grows fallibly, and the
+    /// segment joins with `wtf8_push`, so surrogate halves meeting at the seam
+    /// pair up as they do in the UTF-16 string they spell.
+    pub(crate) fn append_guest_wtf8(&mut self, out: &mut Vec<u8>, seg: &[u8]) -> Result<(), Thrown> {
+        if seg.is_empty() {
+            return Ok(());
+        }
+        let total = out
+            .len()
+            .checked_add(seg.len())
+            .filter(|&n| n <= MAX_STRING_BYTES)
+            .ok_or_else(invalid_string_length)?;
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(total)
+            .map_err(|message| Thrown(message.into()))?;
+        #[cfg(not(feature = "instrument"))]
+        let _ = total;
+        out.try_reserve(seg.len())
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        crate::heap::wtf8_push(out, seg);
+        Ok(())
+    }
+
+    /// Append one UTF-16 code unit to a WTF-8 buffer, as [`Self::append_guest_wtf8`].
+    fn append_guest_unit(&mut self, out: &mut Vec<u8>, unit: u16) -> Result<(), Thrown> {
+        // Generalized UTF-8 of one BMP code point (a surrogate included).
+        let u = unit as u32;
+        let (buf, n) = match u {
+            0..=0x7F => ([u as u8, 0, 0], 1),
+            0x80..=0x7FF => ([0xC0 | (u >> 6) as u8, 0x80 | (u & 0x3F) as u8, 0], 2),
+            _ => (
+                [
+                    0xE0 | (u >> 12) as u8,
+                    0x80 | ((u >> 6) & 0x3F) as u8,
+                    0x80 | (u & 0x3F) as u8,
+                ],
+                3,
+            ),
+        };
+        self.append_guest_wtf8(out, &buf[..n])
+    }
+
+    /// ToString(`v`) as an owned copy of the exact string (lone surrogates
+    /// kept), safe to hold across user code.
+    pub(crate) fn to_js_str_owned(&mut self, v: Value) -> Result<crate::heap::JsStr, Thrown> {
+        let sv = self.to_str_value(v)?;
+        self.heap.flatten(sv.heap_index());
+        Ok(match self.heap.get(sv.heap_index()) {
+            HeapObj::Str(js) => js.clone(),
+            _ => crate::heap::JsStr::new(String::new()),
+        })
     }
 }
 
 fn invalid_string_length() -> Thrown {
     Thrown("RangeError: Invalid string length".into())
+}
+
+/// A `split` receiver at most this long never takes the counting pass: its
+/// result is bounded by its length and admitted after the ranges are found.
+const SPLIT_ADMIT_BYTES: usize = 4096;
+
+/// Whether WTF-8 `bytes` hold a U+FFFD. A needle without one can be searched
+/// for in a receiver's LOSSY view exactly: the view differs from the content
+/// only where a lone surrogate reads as U+FFFD.
+fn bytes_contain_replacement_char(bytes: &[u8]) -> bool {
+    bytes.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD])
+}
+
+/// UTF-8 length of [`unit_chars_into`]'s output for `bytes`.
+fn unit_chars_len(bytes: &[u8]) -> usize {
+    if bytes.is_ascii() {
+        return bytes.len();
+    }
+    crate::heap::wtf8_units_iter(bytes)
+        .map(|u| match u {
+            0..=0x7F => 1,
+            0x80..=0x7FF => 2,
+            0xD800..=0xDFFF => 4,
+            _ => 3,
+        })
+        .sum()
+}
+
+/// Append one `char` per UTF-16 code unit of WTF-8 `bytes`: each non-surrogate
+/// unit as itself, and each surrogate (lone, or a half of an astral pair) as
+/// U+F0000 plus its offset from U+D800. No other unit produces that
+/// supplementary private-use range, so `str` search over two mapped strings is
+/// exactly the spec's code-unit search, and a char index is a unit position.
+fn unit_chars_into(bytes: &[u8], out: &mut String) {
+    if bytes.is_ascii() {
+        // ASCII is valid UTF-8 and maps to itself.
+        out.push_str(std::str::from_utf8(bytes).unwrap_or_default());
+        return;
+    }
+    for u in crate::heap::wtf8_units_iter(bytes) {
+        let cp = match u {
+            0xD800..=0xDFFF => 0xF0000 + (u as u32 - 0xD800),
+            _ => u as u32,
+        };
+        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+    }
 }
 
 fn checked_string_output_add(current: usize, additional: usize) -> Result<usize, Thrown> {
@@ -1615,6 +2141,10 @@ fn extend_chars(out: &mut String, iter: impl Iterator<Item = char>) {
 /// verbatim. A surrogate is neither cased nor case-ignorable, so it breaks the
 /// UCD context exactly where the segments break.
 fn case_map_exact_len(bytes: &[u8], upper: bool) -> Result<usize, Thrown> {
+    // ASCII maps within ASCII, one byte for one.
+    if bytes.is_ascii() {
+        return Ok(bytes.len());
+    }
     let mut total = 0usize;
     let mut rest = bytes;
     while !rest.is_empty() {
@@ -1660,6 +2190,16 @@ fn case_map_exact(
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(mapped_len)
         .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+    if bytes.is_ascii() && bytes.len() == mapped_len {
+        out.extend(bytes.iter().map(|b| {
+            if upper {
+                b.to_ascii_uppercase()
+            } else {
+                b.to_ascii_lowercase()
+            }
+        }));
+        return Ok(crate::heap::JsStr::from_wtf8(out));
+    }
     let mut rest = bytes;
     while !rest.is_empty() {
         match std::str::from_utf8(rest) {
@@ -1717,4 +2257,116 @@ fn case_map_exact(
         return Err(invalid_string_length());
     }
     Ok(crate::heap::JsStr::from_wtf8(out))
+}
+
+/// WTF-8 `bytes` as its maximal well-formed runs (`Ok`) and the lone-surrogate
+/// bytes between them (`Err`), in order. A lone surrogate is neither cased nor
+/// case-ignorable, has combining class 0 and no decomposition, so a
+/// per-character context (final sigma, `After_I`, `More_Above`, normalization
+/// blocking) ends at it exactly as it ends at a run boundary.
+fn wtf8_runs(bytes: &[u8]) -> impl Iterator<Item = Result<&str, &[u8]>> {
+    let mut rest = bytes;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (run, tail) = match std::str::from_utf8(rest) {
+            Ok(s) => (Ok(s), &rest[rest.len()..]),
+            Err(e) if e.valid_up_to() > 0 => {
+                let (head, tail) = rest.split_at(e.valid_up_to());
+                // The valid prefix is UTF-8 by construction.
+                (Ok(std::str::from_utf8(head).unwrap_or_default()), tail)
+            }
+            Err(e) => {
+                let (bad, tail) = rest.split_at(e.error_len().unwrap_or(rest.len()));
+                (Err(bad), tail)
+            }
+        };
+        rest = tail;
+        Some(run)
+    })
+}
+
+/// UTF-8 length of the language-sensitive (`az`/`lt`/`tr`) case mapping of
+/// WTF-8 `bytes`: every well-formed run mapped, lone surrogates copied. At
+/// most three output bytes per input byte, so it cannot overflow `usize` for
+/// an admitted receiver.
+fn special_case_exact_len(bytes: &[u8], lang: &str, upper: bool) -> usize {
+    let mut total = 0usize;
+    for run in wtf8_runs(bytes) {
+        match run {
+            Ok(s) => {
+                crate::vm::special_casing::transform_case_each(s, lang, upper, &mut |c| {
+                    total += c.len_utf8()
+                });
+            }
+            Err(b) => total += b.len(),
+        }
+    }
+    total
+}
+
+/// Build the mapping [`special_case_exact_len`] sized into exactly
+/// `mapped_len` fallibly reserved bytes.
+fn special_case_exact(
+    bytes: &[u8],
+    lang: &str,
+    upper: bool,
+    mapped_len: usize,
+) -> Result<crate::heap::JsStr, Thrown> {
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(mapped_len)
+        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+    for run in wtf8_runs(bytes) {
+        match run {
+            Ok(s) => {
+                crate::vm::special_casing::transform_case_each(s, lang, upper, &mut |c| {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                });
+            }
+            Err(b) => out.extend_from_slice(b),
+        }
+    }
+    if out.len() != mapped_len {
+        return Err(invalid_string_length());
+    }
+    Ok(crate::heap::JsStr::from_wtf8(out))
+}
+
+/// Emit the `form` normalization of the well-formed run `s` (`form` is one of
+/// the four validated names; anything else is NFKD).
+fn for_each_normalized(form: &str, s: &str, emit: &mut impl FnMut(char)) {
+    use unicode_normalization::UnicodeNormalization;
+    match form {
+        "NFC" => s.nfc().for_each(emit),
+        "NFD" => s.nfd().for_each(emit),
+        "NFKC" => s.nfkc().for_each(emit),
+        _ => s.nfkd().for_each(emit),
+    }
+}
+
+/// The text `localeCompare` and `Intl.Collator.prototype.compare` collate for
+/// `js`. A well-formed string is itself (borrowed). The lossy view shows every
+/// lone surrogate as U+FFFD, so two different surrogates, or one and a real
+/// U+FFFD, collated equal. Each is shown instead as U+D0000 plus the
+/// surrogate, a code point of unassigned plane 13: equal to no assigned or
+/// private-use character, ordered by code unit, and after every letter, digit
+/// and symbol (emoji included), where ICU's implicit weights put a lone
+/// surrogate. (ICU also puts it before U+FFFD and the private-use characters,
+/// which no one code point can stand for as well.) Changes here reach
+/// `Intl.Collator.prototype.compare` too, which views its operands through
+/// this so the two keep agreeing.
+pub(crate) fn collation_view(js: &crate::heap::JsStr) -> std::borrow::Cow<'_, str> {
+    if js.is_wellformed() {
+        return std::borrow::Cow::Borrowed(js.as_str_wf());
+    }
+    std::borrow::Cow::Owned(
+        crate::heap::wtf8_code_points(js.as_bytes())
+            .map(|cp| match cp {
+                0xD800..=0xDFFF => char::from_u32(0xD_0000 + cp).unwrap_or('\u{FFFD}'),
+                _ => char::from_u32(cp).unwrap_or('\u{FFFD}'),
+            })
+            .collect(),
+    )
 }

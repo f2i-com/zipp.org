@@ -1079,6 +1079,9 @@ impl<'p> Vm<'p> {
                         return Ok(Some(self.call_value(recv, this, &callargs)?));
                     }
                     // Rooted until the callee's frame owns the list (FN_APPLY).
+                    // An array-like list can be 2^24 entries, so the roots are
+                    // admitted against the heap ceiling like any other copy.
+                    self.reserve_host_roots(callargs.len())?;
                     return Ok(Some(
                         self.with_host_roots(&callargs, |vm| vm.call_value(recv, this, &callargs))?,
                     ));
@@ -1694,11 +1697,13 @@ impl<'p> Vm<'p> {
                 }))
             }
             "join" => {
-                // The separator as WTF-8: a lone surrogate in it is kept.
+                // The separator is the EXACT string: the elements are numbers,
+                // but a separator's lone surrogate must survive as it does in
+                // `Array.prototype.join`.
                 let sep = if a0 == Value::UNDEFINED {
-                    b",".to_vec()
+                    crate::heap::JsStr::new(",".to_string())
                 } else {
-                    self.to_wtf8_string(a0)?
+                    self.to_js_str_owned(a0)?
                 };
                 self.preflight_native_iteration_work(len as u64)?;
                 // The element COUNT is fixed at entry; a detach (or resizable shrink)
@@ -1708,19 +1713,17 @@ impl<'p> Vm<'p> {
                 let eff = self.ta_effective_len(idx).unwrap_or(0);
                 let mut out: Vec<u8> = Vec::new();
                 for i in 0..len {
-                    let part = if i < eff {
-                        self.ta_elem_string(idx, i)
-                    } else {
-                        String::new()
-                    };
-                    let sep: &[u8] = if i == 0 { b"" } else { &sep };
-                    self.reserve_guest_wtf8(&mut out, sep.len() + part.len())?;
                     // Empty (detached) parts can put two separators side by
                     // side; `wtf8_push` pairs a high half with a low one.
-                    crate::heap::wtf8_push(&mut out, sep);
-                    out.extend_from_slice(part.as_bytes());
+                    if i != 0 {
+                        self.append_guest_wtf8(&mut out, sep.as_bytes())?;
+                    }
+                    if i < eff {
+                        let part = self.ta_elem_string(idx, i);
+                        self.append_guest_wtf8(&mut out, part.as_bytes())?;
+                    }
                 }
-                Ok(Some(self.alloc_wtf8_str(out)))
+                Ok(Some(self.alloc_wtf8(out)))
             }
             "toString" => {
                 self.preflight_native_iteration_work(len as u64)?;
@@ -1738,32 +1741,33 @@ impl<'p> Vm<'p> {
                 // toLocaleString / toString / valueOf propagates as an abrupt
                 // completion (the elements are numbers/bigints, never nullish).
                 self.preflight_native_iteration_work(len as u64)?;
-                let mut out = String::new();
+                let mut out: Vec<u8> = Vec::new();
                 for i in 0..len {
                     let el = self.ta_element_get(idx, i);
+                    if i != 0 {
+                        self.append_guest_wtf8(&mut out, b",")?;
+                    }
                     // A user toLocaleString may shrink the buffer: later reads come
                     // back undefined, which joins as the empty string per spec.
                     if el == Value::UNDEFINED || el == Value::NULL {
-                        self.append_guest_join_part(&mut out, ",", "", i)?;
                         continue;
                     }
                     let f = self.get_prop(el, "toLocaleString")?;
-                    let s = if self.is_callable(f) {
-                        // ECMA-402 forwards (locales, options) to each element.
-                        let fwd = [
-                            args.first().copied().unwrap_or(Value::UNDEFINED),
-                            args.get(1).copied().unwrap_or(Value::UNDEFINED),
-                        ];
-                        let r = self.call_value(f, el, &fwd)?;
-                        self.to_js_string(r)?
-                    } else {
+                    if !self.is_callable(f) {
                         return Err(Thrown(
                             "TypeError: element toLocaleString is not callable".into(),
                         ));
-                    };
-                    self.append_guest_join_part(&mut out, ",", &s, i)?;
+                    }
+                    // ECMA-402 forwards (locales, options) to each element. The
+                    // result is ToString'd EXACTLY (a lone surrogate survives).
+                    let fwd = [
+                        args.first().copied().unwrap_or(Value::UNDEFINED),
+                        args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    ];
+                    let r = self.call_value(f, el, &fwd)?;
+                    self.append_guest_tostring(&mut out, r)?;
                 }
-                Ok(Some(self.alloc_str(out)))
+                Ok(Some(self.alloc_wtf8(out)))
             }
             "indexOf" | "lastIndexOf" | "includes" => {
                 // Length is fixed at method entry (ValidateTypedArray already ran).

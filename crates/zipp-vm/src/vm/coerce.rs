@@ -280,6 +280,30 @@ impl<'p> Vm<'p> {
             .map_err(|_| Thrown("RangeError: array allocation failed".into()))
     }
 
+    /// Admit `additional` more entries on the host-root stack, the same way
+    /// `reserve_array_result` admits the result they shadow. A built-in that
+    /// roots its working set holds every value TWICE — once in the Rust Vec,
+    /// once as a root — and a 2^22-element block copy is 32 MB of each, so a
+    /// result admitted without its roots overshot a 256 MB ceiling and trapped
+    /// the instance instead of raising the RangeError. Charged on the root
+    /// stack's own doublings, so a per-element caller pays O(log n) checks.
+    pub(crate) fn reserve_host_roots(&mut self, additional: usize) -> Result<(), Thrown> {
+        let need = self.host_result_roots.len().saturating_add(additional);
+        if need <= self.host_result_roots.capacity() {
+            return Ok(());
+        }
+        let grown = need
+            .max(self.host_result_roots.capacity().saturating_mul(2))
+            .max(16);
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(grown.saturating_mul(std::mem::size_of::<Value>()))
+            .map_err(|message| Thrown(message.into()))?;
+        let more = grown - self.host_result_roots.len();
+        self.host_result_roots
+            .try_reserve_exact(more)
+            .map_err(|_| Thrown("RangeError: array allocation failed".into()))
+    }
+
     /// Admit a dense result of `len` elements sized by a LENGTH rather than by
     /// elements that exist — a virtual array, an array-like `length`: past
     /// `MAX_MATERIALIZED_ARRAY_LEN` a RangeError (never a truncation), then
@@ -471,8 +495,9 @@ impl<'p> Vm<'p> {
 /// string arm here, so the two paths cannot drift.
 pub(crate) fn string_to_number(s: &str) -> f64 {
     // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not, and
-    // excludes U+0085 (NEL), which Rust's does — `str_white_space` is the set.
-    let t = s.trim_matches(str_white_space);
+    // excludes U+0085 (NEL), which it does: `Number("\u{85}1")` is NaN —
+    // `str_white_space` is the set.
+    let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
     if t.is_empty() {
         return 0.0;
     }
@@ -1412,7 +1437,7 @@ impl<'p> Vm<'p> {
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
                 // StrWhiteSpace: U+FEFF in, U+0085 out (unlike Rust's trim).
-                let t = s.trim_matches(str_white_space);
+                let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
                 if t.is_empty() {
                     return *x == BigVal::Small(0);
                 }
@@ -2404,7 +2429,11 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<std::cmp::Ordering>, Thrown> {
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                let y = if s.trim_matches(str_white_space).is_empty() {
+                // StringToBigInt: an all-StrWhiteSpace string is 0n.
+                let y = if s
+                    .trim_matches(crate::vm::helpers_numeric::str_white_space)
+                    .is_empty()
+                {
                     Some(BigVal::Small(0))
                 } else {
                     parse_bigint_str(&s)

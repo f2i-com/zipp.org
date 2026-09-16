@@ -171,6 +171,12 @@ pub(crate) fn len_value(n: usize) -> Value {
 /// characters: it omits U+FEFF (ZWNBSP), leaving
 /// `parseInt("\u{FEFF}8675309")` at NaN, and it includes U+0085 (NEL), which
 /// is not JS whitespace at all (`parseInt("\u{85}8")` must be NaN).
+///
+/// This is the ONE predicate for every trim in the engine: `String.prototype
+/// .trim`/`trimStart`/`trimEnd`, StringToNumber, StringToBigInt and the
+/// BigInt/string comparison. Each used to spell its own variant, so
+/// `"\u{85}a".trim()` dropped the NEL, `Number("\u{85}1")` was 1 instead of
+/// NaN, and `BigInt("\u{FEFF}1")` threw where the spec says 1n.
 pub(crate) fn str_white_space(c: char) -> bool {
     (c.is_whitespace() && c != '\u{85}') || c == '\u{FEFF}'
 }

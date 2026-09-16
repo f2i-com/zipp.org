@@ -1732,7 +1732,7 @@ impl<'p> Vm<'p> {
                                     Value::UNDEFINED,
                                     None,
                                 )? {
-                                    Some(s) => self.alloc_str(s),
+                                    Some(s) => self.json_stringify_result(s, &indent),
                                     None => Value::UNDEFINED,
                                 }
                             }
@@ -1851,7 +1851,9 @@ impl<'p> Vm<'p> {
                             }
                             // Materialize the spread source's elements (array/set â†’
                             // elements; map â†’ [k,v] entries) WITHOUT holding a heap
-                            // borrow across the fresh allocations.
+                            // borrow across the fresh allocations. A string never
+                            // reaches here: `string_iter_values` above already
+                            // spread it by EXACT code point.
                             let mut map_pairs: Option<Vec<(Value, Value)>> = None;
                             let mut array_src: Option<u32> = None;
                             if vv.is_heap() {
@@ -4193,6 +4195,9 @@ impl<'p> Vm<'p> {
                         // hypot argument beating NaN); f64::max/min leave the
                         // sign of a zero tie unspecified.
                         let r = match op {
+                            // `eval_math_args` is the ONE reduction: Hypot goes
+                            // through `hypot_scaled` there, as every other tier
+                            // computes it.
                             M::Max | M::Min | M::Hypot => self.eval_math_args(op, &elems)?,
                             // A non-variadic Math fn spread is unusual; apply to elem 0.
                             _ => {

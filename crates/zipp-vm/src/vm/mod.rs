@@ -291,12 +291,12 @@ pub const MAX_MATERIALIZED_ARRAY_LEN: usize = if MAX_EAGER_ITER_RESULT > MAX_DEN
 /// by concatenating it. Chunking the encode does not help when the answer is
 /// the thing that will not fit.
 ///
-/// 2^24 units is 16.7M characters, and 2^25 bytes covers the worst-case WTF-8
-/// expansion of that. Both remain a fraction of the 128 MiB heap budget, which
-/// is what actually bounds total use — a program that builds these steadily
-/// still meets the budget, and one absurd request is still refused outright.
-/// The concern the old value names, a single allocation overshooting the
-/// host's budget by hundreds of megabytes, is untouched at this size.
+/// The hardened profile now allows 2^26 units (67M characters) and 2^27 bytes;
+/// the ordinary profile 2^28 of each. The byte cap is the one a builder of
+/// multi-byte text meets first, so every native builder admits its output in
+/// BYTES (`preflight_guest_string_size`) before it allocates, not only its
+/// length in units. A program that builds these steadily still meets the heap
+/// budget, and one absurd request is still refused outright.
 #[cfg(feature = "safe-sandbox")]
 pub const MAX_STRING_BYTES: usize = 1 << 27;
 #[cfg(not(feature = "safe-sandbox"))]

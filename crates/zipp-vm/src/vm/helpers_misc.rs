@@ -4748,9 +4748,11 @@ pub(crate) extern "win64" fn jit_math_two(code: u32, a_bits: u64, b_bits: u64) -
                 a.max(b)
             }
         }
-        // Hypot over exactly two args: the same normalised reduction as
-        // eval_math_args (a ±Inf operand forces +Inf even with a NaN partner).
-        M::Hypot => crate::vm::helpers_num2::math_hypot(&[a, b]),
+        // Hypot over exactly two args, through the one scaled implementation
+        // the interpreter uses, so the tiers cannot disagree: a ±Inf operand
+        // forces +Inf even with a NaN partner, and a representable result is
+        // not lost to an intermediate overflow (`Math.hypot(1e300, 1e300)`).
+        M::Hypot => crate::vm::helpers_num2::hypot_scaled(&[a, b]),
         // Unary ops never reach here (codegen routes argc==1 to jit_math_unary).
         _ => f64::NAN,
     };
@@ -6851,8 +6853,10 @@ pub(crate) enum BigOp {
 /// fail for any other reason).
 pub(crate) fn parse_bigint_str(s: &str) -> Option<crate::vm::bigint::BigVal> {
     use crate::vm::bigint::BigVal;
-    // StringToBigInt trims StrWhiteSpace (U+FEFF in, U+0085 out).
-    let s = s.trim_matches(crate::vm::str_white_space);
+    // StringToBigInt trims StrWhiteSpace, not Rust's: U+FEFF is whitespace
+    // (`BigInt("\u{FEFF}1")` is 1n, where `str::trim` left it a SyntaxError)
+    // and U+0085 is not.
+    let s = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
     let (neg, body, signed) = match s.strip_prefix('-') {
         Some(r) => (true, r, true),
         None => match s.strip_prefix('+') {

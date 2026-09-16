@@ -4651,7 +4651,7 @@ impl<'p> Vm<'p> {
                     replacer_fn,
                     allowlist.as_deref(),
                 )? {
-                    Some(s) => self.alloc_str(s),
+                    Some(s) => self.json_stringify_result(s, &indent),
                     None => Value::UNDEFINED,
                 }
             }
@@ -5749,25 +5749,24 @@ impl<'p> Vm<'p> {
                 };
                 self.preflight_native_iteration_work(raw_len as u64)?;
                 let subs = args.get(1..).unwrap_or(&[]);
-                // WTF-8 parts joined as `+` joins them: lone surrogates kept,
-                // and a high half ending one part pairs with a low half
+                // Every segment and substitution is appended EXACTLY: the lossy
+                // `String` form turned a lone surrogate in a raw segment or a
+                // substitution into U+FFFD, so `String.raw` could not round-trip
+                // text the template literal itself holds. The parts join as `+`
+                // joins them: a high half ending one part pairs with a low half
                 // starting the next.
                 let mut out: Vec<u8> = Vec::new();
                 for i in 0..raw_len {
                     let seg = self.get_index(raw, Value::num(i as f64))?;
-                    let seg = self.to_wtf8_string(seg)?;
-                    self.reserve_guest_wtf8(&mut out, seg.len())?;
-                    crate::heap::wtf8_push(&mut out, &seg);
+                    self.append_guest_tostring(&mut out, seg)?;
                     if i + 1 == raw_len {
                         break;
                     }
                     if let Some(sub) = subs.get(i) {
-                        let sub = self.to_wtf8_string(*sub)?;
-                        self.reserve_guest_wtf8(&mut out, sub.len())?;
-                        crate::heap::wtf8_push(&mut out, &sub);
+                        self.append_guest_tostring(&mut out, *sub)?;
                     }
                 }
-                self.alloc_wtf8_str(out)
+                self.alloc_wtf8(out)
             }
             // Object.prototype.toLocaleString() → this.toString().
             PROTO_TO_LOCALE_STRING => {
@@ -6715,8 +6714,13 @@ impl<'p> Vm<'p> {
             }
             INTL_COLLATOR_COMPARE => {
                 let resolved = self.intl_this(this, INTL_COLLATOR, "compare")?;
-                let a = self.to_js_string(a0)?;
-                let b = self.to_js_string(a1)?;
+                // The exact strings, seen as `localeCompare` sees them, so the
+                // two still agree when a lone surrogate is involved.
+                let (a, b) = (self.to_js_str_owned(a0)?, self.to_js_str_owned(a1)?);
+                let (a, b) = (
+                    super::string_ops::collation_view(&a),
+                    super::string_ops::collation_view(&b),
+                );
                 Value::num(self.collator_compare(resolved, &a, &b)?)
             }
             INTL_PLURAL_SELECT => {
@@ -7005,16 +7009,28 @@ impl<'p> Vm<'p> {
                 let it = self.intl_this(this, native::INTL_SEGMENT_ITERATOR, "next")?;
                 let g = self.display(self.intl_slot(it, "granularity"));
                 let input = self.intl_slot(it, "input");
-                let text = self.display(input);
-                self.preflight_native_iteration_work(crate::vm::segmenter::segment_work_bound(
-                    text.len(),
-                ))?;
                 let start = self.intl_slot(it, "index").as_f64() as usize;
-                let len = crate::heap::str_units(&text);
-                let (value, done) = if start >= len {
-                    (Value::UNDEFINED, true)
-                } else {
-                    let end = crate::vm::segmenter::segment_end(&text, &g, start);
+                // One step is O(segment): the boundary search streams forward
+                // from `start`'s byte offset, which the string's position memo
+                // finds from the previous step. Copying the whole input and
+                // re-segmenting it from 0 on every step made a `for…of` over
+                // the segments quadratic.
+                let step = match self.heap.get(input.heap_index()) {
+                    HeapObj::Str(js) if start < js.units() => {
+                        Some((js.unit_byte_bounds(start).0, js.as_bytes().len(), js.units()))
+                    }
+                    _ => None,
+                };
+                let (value, done) = if let Some((at, bytes, len)) = step {
+                    self.preflight_native_iteration_work(
+                        crate::vm::segmenter::segment_work_bound(bytes - at),
+                    )?;
+                    let end = match self.heap.get(input.heap_index()) {
+                        HeapObj::Str(js) => {
+                            crate::vm::segmenter::next_boundary(js.as_bytes(), &g, start, at, len)
+                        }
+                        _ => len,
+                    };
                     let v = self.segment_data_object(input, &g, start, end);
                     // [[IteratedStringNextSegmentCodeUnitIndex]] advances only
                     // after the data object is built.
@@ -7022,6 +7038,8 @@ impl<'p> Vm<'p> {
                         m.set("index", Value::num(end as f64));
                     }
                     (v, false)
+                } else {
+                    (Value::UNDEFINED, true)
                 };
                 self.iter_result(value, done)
             }

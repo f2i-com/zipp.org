@@ -7,6 +7,49 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// `Math.hypot` over ALREADY-COERCED arguments, in spec order: any ±Infinity
+/// gives +Infinity (even beside a NaN), then any NaN gives NaN, then all zeros
+/// give +0.
+///
+/// The sum is taken over the arguments SCALED by the largest magnitude, as V8
+/// does, with the same Kahan compensation, so the digits match node's.
+/// `sqrt(Σ v²)` unscaled is not an approximation of the result but a different
+/// value: the square overflows above ~1.3e154 and underflows below ~1e-162, so
+/// `Math.hypot(1e300, 1e300)` returned Infinity and `Math.hypot(3e-200,
+/// 4e-200)` returned 0, where both results are ordinary finite doubles. Every
+/// tier funnels here (interpreter, the `MathSpread` fallback and the JIT's
+/// two-argument helper) so they cannot answer differently.
+pub(crate) fn hypot_scaled(nums: &[f64]) -> f64 {
+    let mut max = 0.0f64;
+    let mut has_nan = false;
+    for &v in nums {
+        if v.is_infinite() {
+            return f64::INFINITY;
+        }
+        if v.is_nan() {
+            has_nan = true;
+        } else {
+            max = max.max(v.abs());
+        }
+    }
+    if has_nan {
+        return f64::NAN;
+    }
+    if max == 0.0 {
+        // Every argument is ±0, or there are none: +0.
+        return 0.0;
+    }
+    let (mut sum, mut compensation) = (0.0f64, 0.0f64);
+    for &v in nums {
+        let x = v / max;
+        let summand = x * x - compensation;
+        let preliminary = sum + summand;
+        compensation = (preliminary - sum) - summand;
+        sum = preliminary;
+    }
+    max * sum.sqrt()
+}
+
 /// A single-argument `Math.<op>` computation, matching JS where it diverges
 /// from Rust (`round` half-up; `sign` preserves ±0 and maps NaN→NaN). The
 /// variadic/binary ops never reach here with the real call paths; they fall
@@ -77,42 +120,6 @@ pub(crate) fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
         M::Hypot => x.abs(),
         M::Pow | M::Atan2 | M::Imul => f64::NAN,
     }
-}
-
-/// `Math.hypot` over already-numeric arguments. A ±Infinity argument forces
-/// +Infinity even beside a NaN (spec step 3); otherwise a NaN is NaN, and all
-/// zeros are +0. The sum of squares is taken over the magnitudes NORMALISED to
-/// the largest one, with Kahan compensation — the squares of 1e200 (or 1e-200)
-/// would overflow to Infinity (or underflow to 0) — which is V8's algorithm
-/// step for step, so results agree with it bit for bit.
-pub(crate) fn math_hypot(nums: &[f64]) -> f64 {
-    let mut max = 0.0f64;
-    let mut any_nan = false;
-    for &v in nums {
-        if v.is_nan() {
-            any_nan = true;
-        } else if v.abs() > max {
-            max = v.abs();
-        }
-    }
-    if max == f64::INFINITY {
-        return f64::INFINITY;
-    }
-    if any_nan {
-        return f64::NAN;
-    }
-    if max == 0.0 {
-        return 0.0;
-    }
-    let (mut sum, mut compensation) = (0.0f64, 0.0f64);
-    for &v in nums {
-        let n = v.abs() / max;
-        let summand = n * n - compensation;
-        let preliminary = sum + summand;
-        compensation = (preliminary - sum) - summand;
-        sum = preliminary;
-    }
-    sum.sqrt() * max
 }
 
 /// `Math.acosh(x)`.
@@ -452,10 +459,6 @@ pub(crate) fn num_is_safe_integer(v: Value) -> bool {
     }
 }
 
-/// `Number.prototype.toString(radix)` for `radix` in 2..=36. Renders the integer
-/// part in the given base (matching JS for whole numbers; a fractional part is
-/// truncated — full fractional-radix rendering is out of the subset). NaN and
-/// ±Infinity render via the canonical path (handled by the caller for radix 10).
 // ── Date helpers (proleptic Gregorian, UTC; Howard Hinnant's algorithms) ──
 
 /// Days since 1970-01-01 for (year, month 1..=12, day) — `day` may be out of
@@ -938,19 +941,26 @@ fn parse_legacy_date(s: &str) -> f64 {
                     Some(v) => v,
                     None => return f64::NAN,
                 };
-                if b.get(i) == Some(&b':') {
+                // Checked arithmetic: `read_uint` accepts any digit run that
+                // fits an i64, and a wrapped `oh * 60` landed absurd offsets
+                // back in range (`+307445734561825861:00` read as +44 minutes).
+                let minutes = if b.get(i) == Some(&b':') {
                     i += 1;
                     let om = match read_uint(b, &mut i) {
                         Some(v) => v,
                         None => return f64::NAN,
                     };
-                    offset_min = Some(sign * (oh * 60 + om));
+                    oh.checked_mul(60).and_then(|m| m.checked_add(om))
                 } else if oh >= 100 {
                     // `-0700` — hours and minutes written without the colon.
-                    offset_min = Some(sign * ((oh / 100) * 60 + oh % 100));
+                    (oh / 100).checked_mul(60).and_then(|m| m.checked_add(oh % 100))
                 } else {
                     // `-07` — hours only.
-                    offset_min = Some(sign * oh * 60);
+                    oh.checked_mul(60)
+                };
+                match minutes {
+                    Some(m) => offset_min = Some(sign * m),
+                    None => return f64::NAN,
                 }
                 continue;
             }
@@ -1040,7 +1050,10 @@ fn parse_legacy_date(s: &str) -> f64 {
         50..=99 => year + 1900,
         _ => year,
     };
-    if !(1..=12).contains(&month) || !is_day_num(day) {
+    // Every year past ±275,760 is outside the time value range anyway. Beyond
+    // a few million, `days_from_civil`'s `era * 146097` wraps in release
+    // builds, and a 17-digit year came back as year 91.
+    if !(1..=12).contains(&month) || !is_day_num(day) || year.unsigned_abs() > 1_000_000 {
         return f64::NAN;
     }
     let (mut h, mi, sec, ms) = time.unwrap_or((0, 0, 0, 0));
@@ -1143,6 +1156,18 @@ pub(crate) fn to_fixed(n: f64, f: usize) -> String {
     out
 }
 
+/// `Number.prototype.toString(radix)` for `radix` in 2..=36 other than 10.
+///
+/// The algorithm is implementation-defined, so this follows V8's
+/// `DoubleToRadixCString` digit for digit, which keeps the output identical
+/// to node's. The integer part is produced by repeated floating-point
+/// division, never a `u64` cast: the cast saturated at 2^64, so
+/// `(1e21).toString(16)` printed `ffffffffffffffff`. Digits below the value's
+/// precision print as `0`. The fraction is produced by repeated
+/// multiplication and stops once the remainder is within half a ULP (`delta`)
+/// of the input, rounding the last digit, so `(0.5).toString(2)` is `0.1` and
+/// `Math.random().toString(36)` has digits after the point. The sign is kept
+/// for every negative value, including those in (-1, 0).
 pub(crate) fn num_to_radix(n: f64, radix: u32) -> String {
     if n.is_nan() {
         return "NaN".into();
@@ -1154,22 +1179,120 @@ pub(crate) fn num_to_radix(n: f64, radix: u32) -> String {
             "-Infinity".into()
         };
     }
-    let neg = n < 0.0;
-    let mut int = n.abs().trunc() as u64;
-    if int == 0 {
+    if n == 0.0 {
         return "0".into();
     }
-    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut buf = Vec::new();
-    while int > 0 {
-        buf.push(DIGITS[(int % radix as u64) as usize]);
-        int /= radix as u64;
+    let radix_f = radix as f64;
+    let negative = n < 0.0;
+    let value = n.abs();
+    // Whole values below 2^53 (the common `i.toString(16)`) skip the
+    // fraction machinery; their digits come from `radix_int_digits` below.
+    if value.fract() == 0.0 && value < 9_007_199_254_740_992.0 {
+        let mut out = String::with_capacity(56);
+        if negative {
+            out.push('-');
+        }
+        radix_int_digits(&mut out, value, radix);
+        return out;
     }
-    if neg {
-        buf.push(b'-');
+    let mut integer = value.floor();
+    let mut fraction = value - integer;
+    // Fraction digits are only meaningful down to the input's own precision.
+    // `next_up` of the largest finite double is Infinity, which leaves no
+    // fraction to print, as it should.
+    let mut delta = (0.5 * (value.next_up() - value)).max(0.0f64.next_up());
+    // At most 1074 + 52 digits (radix 2, the smallest subnormal), which the
+    // bound only restates: V8's buffer holds 1100.
+    let mut frac: Vec<u8> = Vec::new();
+    if fraction >= delta {
+        while frac.len() < 1100 {
+            fraction *= radix_f;
+            delta *= radix_f;
+            let digit = fraction as usize;
+            frac.push(digit as u8);
+            fraction -= digit as f64;
+            // Round half to even on the last digit.
+            if fraction > 0.5 || (fraction == 0.5 && (digit & 1) == 1) {
+                if fraction + delta > 1.0 {
+                    // Carry into the digits already written, and possibly into
+                    // the integer part.
+                    loop {
+                        match frac.pop() {
+                            None => {
+                                integer += 1.0;
+                                break;
+                            }
+                            Some(d) if (d as u32) + 1 < radix => {
+                                frac.push(d + 1);
+                                break;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    break;
+                }
+            }
+            if fraction < delta {
+                break;
+            }
+        }
     }
-    buf.reverse();
-    String::from_utf8(buf).unwrap()
+    let mut out = String::with_capacity(frac.len() + 56);
+    if negative {
+        out.push('-');
+    }
+    radix_int_digits(&mut out, integer, radix);
+    if !frac.is_empty() {
+        out.push('.');
+        out.extend(frac.iter().map(|&d| RADIX_DIGITS[d as usize] as char));
+    }
+    out
+}
+
+const RADIX_DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// Append the digits of the whole, non-negative `integer` in `radix`, as V8's
+/// `DoubleToRadixCString` computes them: exactly below 2^53, and above it by
+/// repeated floating-point division, where a digit below the double's
+/// precision (`integer / radix` still at least 2^53, V8's
+/// `Double(integer / radix).Exponent() > 0`) prints as 0.
+fn radix_int_digits(out: &mut String, integer: f64, radix: u32) {
+    if integer < 9_007_199_254_740_992.0 {
+        // Exact below 2^53, where both computations agree digit for digit.
+        let (mut int, r) = (integer as u64, radix as u64);
+        let mut buf = [0u8; 64];
+        let mut at = buf.len();
+        loop {
+            at -= 1;
+            buf[at] = RADIX_DIGITS[(int % r) as usize];
+            int /= r;
+            if int == 0 {
+                break;
+            }
+        }
+        out.push_str(std::str::from_utf8(&buf[at..]).unwrap_or_default());
+        return;
+    }
+    // At most 1024 digits (radix 2, near f64::MAX), written right to left.
+    let radix_f = radix as f64;
+    let mut integer = integer;
+    let mut buf = [0u8; 1100];
+    let mut at = buf.len();
+    while integer / radix_f >= 9_007_199_254_740_992.0 && at > 1 {
+        integer /= radix_f;
+        at -= 1;
+        buf[at] = b'0';
+    }
+    while at > 0 {
+        let remainder = integer % radix_f;
+        at -= 1;
+        buf[at] = RADIX_DIGITS[remainder as usize];
+        integer = (integer - remainder) / radix_f;
+        if integer <= 0.0 {
+            break;
+        }
+    }
+    out.push_str(std::str::from_utf8(&buf[at..]).unwrap_or_default());
 }
 
 /// Normalize a Map key / Set element: `-0` becomes `+0` (SameValueZero treats
@@ -1202,6 +1325,79 @@ pub(crate) fn fmt_f64(n: f64) -> String {
     let mut out = String::new();
     fmt_f64_into(&mut out, n);
     out
+}
+
+/// The shortest round-trip significant digits of a positive finite `abs`, and
+/// the decimal exponent of the first one (the `{:e}` convention: `"6.25e-1"`
+/// is `("625", -1)`), chosen as ECMAScript Number::toString step 5 chooses.
+///
+/// Rust's `{:e}` supplies the digits. When two equally short strings are
+/// equally close to the value it keeps the upper one, where the spec keeps the
+/// even one: 600479950316068.25 printed …068.3 for node's …068.2.
+pub(crate) fn shortest_digits(abs: f64) -> (String, i32) {
+    let sci = format!("{abs:e}"); // e.g. "1.2345e2", "1e21", "5e-1"
+    let (mant, exp) = sci.split_once('e').expect("{:e} always has an exponent");
+    let e: i32 = exp.parse().expect("valid exponent");
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    match shortest_tie_neighbour(abs, &digits, e) {
+        Some(even) => (even, e),
+        None => (digits, e),
+    }
+}
+
+/// When the odd shortest digits `digits` (first digit at 10^e) are one of two
+/// equally close candidates for `abs`, the other, even one.
+///
+/// With the last digit at 10^p, the midpoint toward a neighbour is
+/// `N × 10^(p-1)`, `N = 10·d ± 5`, which is odd. Writing `abs = m × 2^q` with
+/// `m` odd, equality needs the powers of two to agree, `q == p - 1`, and then
+/// `m × 5^(1-p) == N` in integers, so the test costs a few integer operations
+/// on the odd half of all non-integral conversions. `p - 1 < 0` always: a
+/// midpoint `5 × 10^(p-1)` from both candidates fits within half an ulp of
+/// `abs` only below the units digit.
+fn shortest_tie_neighbour(abs: f64, digits: &str, e: i32) -> Option<String> {
+    let last = *digits.as_bytes().last()?;
+    if (last - b'0') % 2 == 0 {
+        return None;
+    }
+    let k = digits.len() as i32;
+    let s = e - k; // p - 1, with p = e - k + 1 the last digit's exponent
+    let bits = abs.to_bits();
+    let biased = ((bits >> 52) & 0x7FF) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (mut m, mut q) = if biased == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), biased - 1075)
+    };
+    if m == 0 {
+        return None;
+    }
+    let tz = m.trailing_zeros();
+    m >>= tz;
+    q += tz as i32;
+    // N < 2^60, so 5^(-s) must be too: -s ≤ 25.
+    if q != s || s >= 0 || s < -25 {
+        return None;
+    }
+    let lhs = (m as u128).checked_mul(5u128.checked_pow((-s) as u32)?)?;
+    let d: u64 = digits.parse().ok()?;
+    let ten_d = d as u128 * 10;
+    let neighbour = if lhs + 5 == ten_d {
+        d - 1
+    } else if lhs == ten_d + 5 {
+        d + 1
+    } else {
+        return None;
+    };
+    // Equally short (no borrow out of, or carry into, a digit), and it must
+    // still read back as `abs`.
+    let text = neighbour.to_string();
+    if text.len() != digits.len() {
+        return None;
+    }
+    let back: f64 = format!("{text}e{}", s + 1).parse().ok()?;
+    (back == abs).then_some(text)
 }
 
 /// `fmt_f64` appending into an existing buffer — the JSON.stringify fast path,
@@ -1264,11 +1460,9 @@ pub(crate) fn fmt_f64_into(out: &mut String, n: f64) {
     // General case: ECMAScript Number::toString (7.1.12.1). Extract the shortest
     // round-trip significant digits `s` (k of them) and the decimal point position
     // `n` such that the value is `s × 10^(n-k)`, via Rust's `{:e}` (also shortest
-    // round-trip), then format with JS's exponential cutoffs (n > 21 or n ≤ -6).
-    let sci = format!("{abs:e}"); // e.g. "1.2345e2", "1e21", "5e-1"
-    let (mant, exp) = sci.split_once('e').expect("{:e} always has an exponent");
-    let e: i32 = exp.parse().expect("valid exponent");
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    // round-trip, ties settled as the spec says in `shortest_digits`), then format
+    // with JS's exponential cutoffs (n > 21 or n ≤ -6).
+    let (digits, e) = shortest_digits(abs);
     let s = digits.as_str();
     let k = s.len() as i32;
     let np = e + 1; // decimal-point position (value ≈ 0.s × 10^np)

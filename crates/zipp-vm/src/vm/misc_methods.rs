@@ -452,14 +452,16 @@ fn fmt_exponential(n: f64, digits: Option<usize>) -> String {
     let sign = if n < 0.0 { "-" } else { "" };
     let a = n.abs();
     let (mant, exp) = match digits {
-        // Minimal mantissa: the shortest round-trip (Rust's default) is correct.
+        // Minimal mantissa: the shortest round-trip digits, an exact tie
+        // settled to the even candidate as in Number::toString.
         None => {
-            let raw = format!("{a:e}");
-            let epos = raw.find('e').unwrap();
-            (
-                raw[..epos].to_string(),
-                raw[epos + 1..].parse::<i32>().unwrap_or(0),
-            )
+            let (digits, exp) = crate::vm::helpers_num2::shortest_digits(a);
+            let mant = if digits.len() > 1 {
+                format!("{}.{}", &digits[..1], &digits[1..])
+            } else {
+                digits
+            };
+            (mant, exp)
         }
         Some(d) => round_exp_half_away(a, d),
     };

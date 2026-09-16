@@ -2737,41 +2737,6 @@ pub fn str_units(s: &str) -> usize {
     }
 }
 
-/// Unit position of char-boundary byte offset `b` in `s` (clamped to the end).
-pub fn byte_to_units(s: &str, b: usize) -> usize {
-    str_units(&s[..b.min(s.len())])
-}
-
-/// Resolve unit position `u` in `s` to byte offsets, clamped to the end:
-/// `(floor, ceil)` are equal at a scalar boundary; a `u` that lands BETWEEN the
-/// halves of a surrogate pair gives the enclosing astral scalar's (start, end).
-pub fn unit_byte_bounds(s: &str, u: usize) -> (usize, usize) {
-    if u == 0 {
-        return (0, 0);
-    }
-    let mut units = 0usize;
-    for (b, c) in s.char_indices() {
-        if units == u {
-            return (b, b);
-        }
-        let n = char_units(c);
-        if units + n > u {
-            // `u` addresses this scalar's trail half (only possible when n == 2).
-            return (b, b + c.len_utf8());
-        }
-        units += n;
-    }
-    (s.len(), s.len())
-}
-
-/// Byte offset of unit position `u`, rounding a mid-pair position UP to the next
-/// scalar boundary — exact for SEARCH-START positions (a well-formed needle can
-/// never match starting at a trail unit). Anchored positions (`startsWith`/
-/// `endsWith`/`lastIndexOf` caps) use `unit_byte_bounds` to detect the split.
-pub fn unit_to_byte(s: &str, u: usize) -> usize {
-    unit_byte_bounds(s, u).1
-}
-
 // ── WTF-8 primitives ──
 // The byte-level helpers every accessor builds on. All of them treat the
 // surrogate range exactly like any other 3-byte sequence; none of them ever
@@ -3460,6 +3425,25 @@ impl JsStr {
             push_cp_raw(&mut out, unit_of_cp(cp, 0) as u32);
         }
         JsStr::from_wtf8(out)
+    }
+
+    /// Byte bounds of unit position `u` (clamped to the length): `(floor, ceil)`
+    /// are equal at a scalar boundary, and a `u` between the halves of an
+    /// astral pair gives that scalar's start and end. Resolved through the
+    /// position memo, so a scan that advances by small steps
+    /// (`indexOf(x, i + 1)`, a segment iterator) pays for the step, not a walk
+    /// from byte 0.
+    pub fn unit_byte_bounds(&self, u: usize) -> (usize, usize) {
+        if self.ascii {
+            let b = u.min(self.bytes.len());
+            return (b, b);
+        }
+        let (pos, bi) = self.seek(u);
+        if pos >= u.min(self.units as usize) {
+            (bi, bi)
+        } else {
+            (bi, bi + wtf8_decode(&self.bytes, bi).1)
+        }
     }
 
     /// Iterate the code points (for-of/spread semantics — one item per code

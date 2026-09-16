@@ -441,71 +441,6 @@ impl<'p> Vm<'p> {
         Ok(self.to_js_string(p)?.into_bytes())
     }
 
-    /// Append one join element: the separator (for every index but the
-    /// first), then ToString(element), `undefined`/`null` contributing
-    /// nothing. Built with `wtf8_push`, so a high surrogate ending one part and
-    /// a low surrogate starting the next merge into the astral character, as
-    /// they do for `+` — `s.split('').join('')` returns `s`.
-    fn append_join_element(
-        &mut self,
-        out: &mut Vec<u8>,
-        sep: &[u8],
-        v: Value,
-        index: usize,
-    ) -> Result<(), Thrown> {
-        let sep = if index == 0 { &[][..] } else { sep };
-        if v.is_nullish() {
-            self.reserve_guest_wtf8(out, sep.len())?;
-            crate::heap::wtf8_push(out, sep);
-            return Ok(());
-        }
-        if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
-            // Push the stored bytes without copying them out first.
-            let si = v.heap_index();
-            self.heap.flatten(si);
-            let n = match self.heap.get(si) {
-                HeapObj::Str(s) => s.as_bytes().len(),
-                _ => 0,
-            };
-            self.reserve_guest_wtf8(out, sep.len() + n)?;
-            crate::heap::wtf8_push(out, sep);
-            if let HeapObj::Str(s) = self.heap.get(si) {
-                crate::heap::wtf8_push(out, s.as_bytes());
-            }
-            return Ok(());
-        }
-        let part = if self.is_object_value(v) {
-            self.to_wtf8_string(v)?
-        } else {
-            // Numbers, booleans, BigInts: ASCII. A Symbol throws here.
-            self.to_js_string(v)?.into_bytes()
-        };
-        self.reserve_guest_wtf8(out, sep.len() + part.len())?;
-        crate::heap::wtf8_push(out, sep);
-        crate::heap::wtf8_push(out, &part);
-        Ok(())
-    }
-
-    /// `toLocaleString`'s element: ToString of what the element's own
-    /// `toLocaleString` returned (an `undefined` result is "undefined" there,
-    /// not the empty part a nullish element gives), after a "," separator.
-    fn append_locale_join_element(
-        &mut self,
-        out: &mut Vec<u8>,
-        r: Value,
-        index: usize,
-    ) -> Result<(), Thrown> {
-        if r.is_nullish() {
-            let s = self.to_js_string(r)?;
-            let sep: &[u8] = if index == 0 { b"" } else { b"," };
-            self.reserve_guest_wtf8(out, sep.len() + s.len())?;
-            crate::heap::wtf8_push(out, sep);
-            crate::heap::wtf8_push(out, s.as_bytes());
-            return Ok(());
-        }
-        self.append_join_element(out, b",", r, index)
-    }
-
     /// Allocate a finished WTF-8 buffer (a join, or any builder that kept
     /// lone surrogates) as a string value.
     pub(crate) fn alloc_wtf8_str(&mut self, out: Vec<u8>) -> Value {
@@ -1028,12 +963,20 @@ impl<'p> Vm<'p> {
     /// `flat` / `flatMap`: FlattenIntoArray into `target` (the ArraySpeciesCreate
     /// result, or `None` for a plain current-realm array).
     ///
-    /// The walk collects into a Rust `Vec` while element getters, Proxy traps
-    /// and the mapper run, and a species `target` receives the elements only
-    /// afterwards through CreateDataPropertyOrThrow (a setter or a
-    /// defineProperty trap). The receiver may be a Rust-owned apply argument
-    /// and the target a fresh constructor result, so every collected value,
-    /// the receiver and the target stay on the host-root stack throughout.
+    /// The receiver may be a Rust-owned apply argument and a species `target` a
+    /// fresh constructor result, so both stay on the host-root stack throughout.
+    ///
+    /// The walk itself collects into a Rust `Vec` — not a GC root — while
+    /// element getters, Proxy traps and the mapper run, so it holds the GC lock
+    /// instead of rooting each value: rooting them would hold every element
+    /// TWICE, and `[bigArray, bigArray, …].flat()` then needs twice the
+    /// memory, which trapped the WASM instance at its linear-memory wall
+    /// before the heap ceiling could refuse it (the accounting in
+    /// `reserve_array_result` sizes one copy). A species target receives the
+    /// elements only afterwards, through CreateDataPropertyOrThrow — a setter
+    /// or a defineProperty trap, which must be able to collect — so the
+    /// collected block becomes a real array first and is handed over from
+    /// there, reachable the whole time.
     fn flatten_into_array_result(
         &mut self,
         source: Value,
@@ -1044,17 +987,29 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         let target_root = target.unwrap_or(Value::UNDEFINED);
         self.with_host_roots(&[source, target_root], |vm| {
-            let mut out = Vec::new();
-            vm.flatten_into_array(&mut out, source, source_len, depth, mapper)?;
-            match target {
-                Some(a) => {
-                    for (i, v) in out.into_iter().enumerate() {
-                        vm.create_data_property_or_throw(a, i, v)?;
-                    }
-                    Ok(a)
+            // The lock spans the allocation too: until the block is inside a
+            // heap object, a collection there would see no reference to it.
+            let built = {
+                let _gc = vm.gc_lock_guard();
+                let mut out = Vec::new();
+                vm.flatten_into_array(&mut out, source, source_len, depth, mapper)?;
+                vm.alloc_array_current_realm(out)
+            };
+            let Some(a) = target else { return Ok(built) };
+            vm.with_host_roots(&[built], |vm| {
+                let n = match vm.heap.get(built.heap_index()) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
+                for i in 0..n {
+                    let v = match vm.heap.get(built.heap_index()) {
+                        HeapObj::Array(items) => items[i],
+                        _ => Value::UNDEFINED,
+                    };
+                    vm.create_data_property_or_throw(a, i, v)?;
                 }
-                None => Ok(vm.alloc_array_current_realm(out)),
-            }
+                Ok(a)
+            })
         })
     }
 
@@ -1100,15 +1055,9 @@ impl<'p> Vm<'p> {
                     if items.len() == source_len && !items.iter().any(|v| v.is_hole()));
             if clean {
                 self.reserve_array_result(out, source_len, false)?;
-                let from = out.len();
                 if let HeapObj::Array(items) = self.heap.get(sidx) {
                     out.extend_from_slice(items);
                 }
-                // `out` is a Rust Vec, and a later element's guest code can
-                // detach these from the source (`src.length = 0`) before the
-                // result is allocated: root the block in the caller's scope
-                // (`flatten_into_array_result` truncates it).
-                self.host_result_roots.extend(out[from..].iter().copied());
                 return Ok(());
             }
         }
@@ -1169,10 +1118,6 @@ impl<'p> Vm<'p> {
                 // size is the sum of the elements visited, which for an array
                 // of N references to one big array is N times that array.
                 self.reserve_array_result(out, 1, false)?;
-                // Inside `flatten_into_array_result`'s host-root scope: `out`
-                // is a Rust Vec, so a later element's guest code could
-                // otherwise see this one collected.
-                self.push_host_root(v);
                 out.push(v);
             }
         }
@@ -2498,15 +2443,18 @@ impl<'p> Vm<'p> {
                         } else {
                             lenf.trunc().min(9_007_199_254_740_991.0) as usize
                         };
+                        // Separator and parts as EXACT strings (see the dense
+                        // `join` below): a lone surrogate is itself, not U+FFFD.
                         let sep = if name == "join" && arg0 != Value::UNDEFINED {
-                            vm.to_wtf8_string(arg0)?
+                            vm.to_js_str_owned(arg0)?
                         } else {
-                            b",".to_vec()
+                            crate::heap::JsStr::new(",".to_string())
                         };
                         // The separators alone past the string cap: the result
                         // cannot exist, so fail before walking the length.
                         if len > 1
-                            && (len - 1).saturating_mul(sep.len()) > crate::vm::MAX_STRING_BYTES
+                            && (len - 1).saturating_mul(sep.as_bytes().len())
+                                > crate::vm::MAX_STRING_BYTES
                         {
                             return Err(Thrown("RangeError: Invalid string length".into()));
                         }
@@ -2514,8 +2462,11 @@ impl<'p> Vm<'p> {
                         let mut out: Vec<u8> = Vec::new();
                         for k in 0..len {
                             let v = vm.get_index(Value::heap(idx), Value::num(k as f64))?;
+                            if k != 0 {
+                                vm.append_guest_wtf8(&mut out, sep.as_bytes())?;
+                            }
                             if v.is_nullish() {
-                                vm.append_join_element(&mut out, &sep, Value::UNDEFINED, k)?;
+                                // An absent or nullish element contributes "".
                             } else if name == "toLocaleString" {
                                 let f = vm.get_prop(v, "toLocaleString")?;
                                 if !vm.is_callable(f) {
@@ -2531,12 +2482,12 @@ impl<'p> Vm<'p> {
                                     args.get(1).copied().unwrap_or(Value::UNDEFINED),
                                 ];
                                 let r = vm.call_value(f, v, &fwd)?;
-                                vm.append_locale_join_element(&mut out, r, k)?;
+                                vm.append_guest_tostring(&mut out, r)?;
                             } else {
-                                vm.append_join_element(&mut out, &sep, v, k)?;
+                                vm.append_guest_tostring(&mut out, v)?;
                             }
                         }
-                        Ok(Some(vm.alloc_wtf8_str(out)))
+                        Ok(Some(vm.alloc_wtf8(out)))
                     });
                 }
                 // toSpliced runs the spec copy loops directly: a DISCARDED element
@@ -2901,10 +2852,16 @@ impl<'p> Vm<'p> {
                         HeapObj::Array(items) => items.len(),
                         _ => 0,
                     };
+                    // The separator and every part are taken as EXACT strings:
+                    // `['\uD83D', '\uDE00'].join('')` is the astral character
+                    // they spell, and `s.split('').join('')` is `s` again. The
+                    // lossy `String` form turned every lone surrogate into
+                    // U+FFFD, which is the everyday corruption behind
+                    // `split('').reverse().join('')` on emoji text.
                     let sep = if name == "toString" || arg0 == Value::UNDEFINED {
-                        b",".to_vec()
+                        crate::heap::JsStr::new(",".to_string())
                     } else {
-                        vm.to_wtf8_string(arg0)?
+                        vm.to_js_str_owned(arg0)?
                     };
                     // Get(O,k) and ToString(element) interleave. The active-path
                     // guard is shared across nested ToString calls. Built as
@@ -2918,9 +2875,14 @@ impl<'p> Vm<'p> {
                             vm.array_dense_or_proto_get(idx, k)?
                         };
                         let v = v.unwrap_or(Value::UNDEFINED);
-                        vm.append_join_element(&mut out, &sep, v, k)?;
+                        if k != 0 {
+                            vm.append_guest_wtf8(&mut out, sep.as_bytes())?;
+                        }
+                        if !v.is_nullish() {
+                            vm.append_guest_tostring(&mut out, v)?;
+                        }
                     }
-                    Ok(Some(vm.alloc_wtf8_str(out)))
+                    Ok(Some(vm.alloc_wtf8(out)))
                 })
             }
             "at" => {
@@ -3859,22 +3821,23 @@ impl<'p> Vm<'p> {
                         args.first().copied().unwrap_or(Value::UNDEFINED),
                         args.get(1).copied().unwrap_or(Value::UNDEFINED),
                     ];
+                    // Each result is ToString'd EXACTLY, as `join` does it.
                     let mut out: Vec<u8> = Vec::new();
                     for (i, v) in snapshot.into_iter().enumerate() {
-                        if v.is_nullish() {
-                            vm.append_join_element(&mut out, b",", Value::UNDEFINED, i)?;
-                        } else {
-                            let f = vm.get_prop(v, "toLocaleString")?;
-                            if !vm.is_callable(f) {
-                                return Err(Thrown(
-                                    "TypeError: toLocaleString is not callable".into(),
-                                ));
-                            }
-                            let r = vm.call_value(f, v, &fwd)?;
-                            vm.append_locale_join_element(&mut out, r, i)?;
+                        if i != 0 {
+                            vm.append_guest_wtf8(&mut out, b",")?;
                         }
+                        if v.is_nullish() {
+                            continue;
+                        }
+                        let f = vm.get_prop(v, "toLocaleString")?;
+                        if !vm.is_callable(f) {
+                            return Err(Thrown("TypeError: toLocaleString is not callable".into()));
+                        }
+                        let r = vm.call_value(f, v, &fwd)?;
+                        vm.append_guest_tostring(&mut out, r)?;
                     }
-                    Ok(Some(vm.alloc_wtf8_str(out)))
+                    Ok(Some(vm.alloc_wtf8(out)))
                 })
             }
             "with" => {

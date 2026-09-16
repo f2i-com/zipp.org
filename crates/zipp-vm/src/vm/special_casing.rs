@@ -100,9 +100,10 @@ pub(crate) fn special_casing_language(tag: &str) -> Option<&'static str> {
 }
 
 /// `After_Soft_Dotted`/`After_I`: is there a `pred`-matching character before
-/// position `i`, with no intervening character of combining class 0 or 230?
-fn after(chars: &[char], i: usize, pred: impl Fn(char) -> bool) -> bool {
-    for &c in chars[..i].iter().rev() {
+/// byte offset `i` of `s`, with no intervening character of combining class 0
+/// or 230?
+fn after(s: &str, i: usize, pred: impl Fn(char) -> bool) -> bool {
+    for c in s[..i].chars().rev() {
         if pred(c) {
             return true;
         }
@@ -114,10 +115,11 @@ fn after(chars: &[char], i: usize, pred: impl Fn(char) -> bool) -> bool {
     false
 }
 
-/// `More_Above`: is `chars[i]` followed by a combining class 230 character with
-/// no intervening character of combining class 0 or 230?
-fn more_above(chars: &[char], i: usize) -> bool {
-    for &c in &chars[i + 1..] {
+/// `More_Above`: is the character ending at byte offset `next` of `s`
+/// followed by a combining class 230 character with no intervening character
+/// of combining class 0 or 230?
+fn more_above(s: &str, next: usize) -> bool {
+    for c in s[next..].chars() {
         let k = ccc(c);
         if k == 230 {
             return true;
@@ -129,10 +131,11 @@ fn more_above(chars: &[char], i: usize) -> bool {
     false
 }
 
-/// `Before_Dot`: is `chars[i]` followed by U+0307, with only characters of
-/// combining class other than 0 and 230 in between?
-fn before_dot(chars: &[char], i: usize) -> bool {
-    for &c in &chars[i + 1..] {
+/// `Before_Dot`: is the character ending at byte offset `next` of `s`
+/// followed by U+0307, with only characters of combining class other than 0
+/// and 230 in between?
+fn before_dot(s: &str, next: usize) -> bool {
+    for c in s[next..].chars() {
         if c == '\u{307}' {
             return true;
         }
@@ -149,24 +152,40 @@ fn before_dot(chars: &[char], i: usize) -> bool {
 ///
 /// Every character the conditional table does NOT name falls through to the
 /// default mapping, so this is the full result, not a patch on top of one.
+#[cfg(test)]
 pub(crate) fn transform_case(s: &str, lang: &str, upper: bool) -> Option<String> {
-    if !matches!(lang, "tr" | "az" | "lt") {
-        return None;
-    }
-    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
+    transform_case_each(s, lang, upper, &mut |c| out.push(c)).then_some(out)
+}
+
+/// [`transform_case`] one output character at a time, so a caller can size
+/// the result in a first pass and build it into an admitted buffer in a
+/// second (a case mapping can triple a string). Returns `false`, emitting
+/// nothing, when `lang` has no language-sensitive mappings. The context
+/// conditions read their neighbours from `s` itself, so no per-character copy
+/// of the input is made.
+pub(crate) fn transform_case_each(
+    s: &str,
+    lang: &str,
+    upper: bool,
+    emit: &mut impl FnMut(char),
+) -> bool {
+    if !matches!(lang, "tr" | "az" | "lt") {
+        return false;
+    }
     let turkic = lang == "tr" || lang == "az";
-    for (i, &c) in chars.iter().enumerate() {
+    for (i, c) in s.char_indices() {
+        let next = i + c.len_utf8();
         let handled = if upper {
             match c {
                 // tr/az: i uppercases to İ rather than I.
                 'i' if turkic => {
-                    out.push('\u{130}');
+                    emit('\u{130}');
                     true
                 }
                 // lt: the explicit dot a lowercase i carries is dropped again
                 // when the letter it sits on becomes a capital.
-                '\u{307}' if lang == "lt" && after(&chars, i, is_soft_dotted) => true,
+                '\u{307}' if lang == "lt" && after(s, i, is_soft_dotted) => true,
                 _ => false,
             }
         } else {
@@ -174,32 +193,32 @@ pub(crate) fn transform_case(s: &str, lang: &str, upper: bool) -> Option<String>
                 // tr/az: İ lowercases to plain i (its dot is inherent), and a
                 // bare I loses its dot entirely unless one follows explicitly.
                 '\u{130}' if turkic => {
-                    out.push('i');
+                    emit('i');
                     true
                 }
-                '\u{307}' if turkic && after(&chars, i, |p| p == 'I') => true,
-                'I' if turkic && !before_dot(&chars, i) => {
-                    out.push('\u{131}');
+                '\u{307}' if turkic && after(s, i, |p| p == 'I') => true,
+                'I' if turkic && !before_dot(s, next) => {
+                    emit('\u{131}');
                     true
                 }
                 // lt: a capital I/J/Į that carries further accents above keeps
                 // an explicit dot when it becomes lowercase, so the accents do
                 // not sit where the dot belongs.
-                'I' | 'J' | '\u{12E}' if lang == "lt" && more_above(&chars, i) => {
-                    out.push(match c {
+                'I' | 'J' | '\u{12E}' if lang == "lt" && more_above(s, next) => {
+                    emit(match c {
                         'I' => 'i',
                         'J' => 'j',
                         _ => '\u{12F}',
                     });
-                    out.push('\u{307}');
+                    emit('\u{307}');
                     true
                 }
                 // The three precomposed Lithuanian capitals decompose the same
                 // way unconditionally.
                 '\u{CC}' | '\u{CD}' | '\u{128}' if lang == "lt" => {
-                    out.push('i');
-                    out.push('\u{307}');
-                    out.push(match c {
+                    emit('i');
+                    emit('\u{307}');
+                    emit(match c {
                         '\u{CC}' => '\u{300}',
                         '\u{CD}' => '\u{301}',
                         _ => '\u{303}',
@@ -212,13 +231,13 @@ pub(crate) fn transform_case(s: &str, lang: &str, upper: bool) -> Option<String>
         if !handled {
             // Not named by the conditional table: the default full mapping.
             if upper {
-                out.extend(c.to_uppercase());
+                c.to_uppercase().for_each(&mut *emit);
             } else {
-                out.extend(c.to_lowercase());
+                c.to_lowercase().for_each(&mut *emit);
             }
         }
     }
-    Some(out)
+    true
 }
 
 #[cfg(test)]
