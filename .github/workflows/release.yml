@@ -238,8 +238,12 @@ jobs:
             exit 1
           fi
           # Prove a tier really compiled rather than trusting the loop count.
-          ZIPP_JIT_THRESHOLD=1 ZIPP_JITLOG=1 "$binary" js target/zipp-release-smoke.js 2>&1 \
-            | grep -q 'compiled'
+          # Captured, not piped: `| grep -q` closes the pipe at its first
+          # match, and the engine next log write then hits EPIPE, where the
+          # print macros panic — this step aborted (signal 6) rather than
+          # reporting a result.
+          jitlog="$(ZIPP_JIT_THRESHOLD=1 ZIPP_JITLOG=1 "$binary" js target/zipp-release-smoke.js 2>&1)"
+          grep -q 'compiled' <<<"$jitlog"
 
       - name: Package Linux CLI
         if: runner.os == 'Linux'

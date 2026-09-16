@@ -278,6 +278,12 @@ fn r241_an_unreadable_folder_is_noted_and_skipped() {
         .args(["/deny", &format!("{user}:(RX)")])
         .output()
         .is_ok_and(|o| o.status.success());
+    // Applying the rule is not the same as losing access: an ADMINISTRATOR
+    // reads through a deny entry (SeBackupPrivilege), exactly as root ignores
+    // mode 0, and CI runs elevated. Probe the folder rather than trust the
+    // command exit status, so the notice is required only when the read
+    // really fails.
+    let unreadable = fs::read_dir(&locked).is_err() || fs::read(locked.join("f.txt")).is_err();
     let output = f.zipp(&["py", "app/main.py"]);
     #[cfg(unix)]
     {
@@ -293,8 +299,9 @@ fn r241_an_unreadable_folder_is_noted_and_skipped() {
     }
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "app ran\n");
-    #[cfg(windows)]
-    if denied {
+    // Required exactly when the probe proved the folder unreadable, on
+    // either platform — not when a command merely reported success.
+    if unreadable {
         assert!(
             stderr(&output).contains("left out of the project: locked"),
             "{}",

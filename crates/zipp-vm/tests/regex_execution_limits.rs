@@ -32,6 +32,21 @@ fn assert_regex_memory_failure(source: &str, function: &str, headroom: usize) {
     assert_eq!(state.resource_limit_error(), Some(message.as_str()));
 }
 
+/// The mirror of `assert_regex_memory_failure`: the same headroom, and the
+/// call must COMPLETE. Pins work the ceiling is meant to allow.
+fn assert_regex_completes(source: &str, function: &str, headroom: usize) {
+    let mut state = embed::compile_script(source).expect("script compiles");
+    state.run_init().expect("script initializes");
+    state.set_limits(10_000_000, None);
+    let baseline = state.heap_bytes();
+    state.set_heap_limit(baseline + headroom);
+
+    state
+        .call_slot(slot(&state, function), &[])
+        .unwrap_or_else(|message| panic!("{function} must fit the headroom: {message}"));
+    assert_eq!(state.resource_limit_error(), None);
+}
+
 #[test]
 fn catastrophic_backtracking_is_a_sticky_host_failure() {
     let mut state = embed::compile_script(
@@ -459,7 +474,11 @@ fn aliased_capture_materialization_is_bounded_in_a_subprocess() {
 #[test]
 fn exec_result_and_intrinsic_replacement_capture_copies_are_bounded() {
     // Every lookahead capture aliases the same long subject range. The match
-    // engine's compact ranges are cheap; materializing each range is not.
+    // engine's compact ranges are cheap; materializing each range is not —
+    // and materializing is now what a consumer ASKS for. GetSubstitution
+    // resolves `$N` from the subject's own units, so a template that names no
+    // capture copies nothing; `exec` must still hand every capture to the
+    // guest, and a replacement FUNCTION receives them as arguments.
     let ascii_pattern = "(?=(x*))".repeat(64);
     let ascii_source = format!(
         r#"
@@ -469,10 +488,13 @@ fn exec_result_and_intrinsic_replacement_capture_copies_are_bounded() {
             return capturePattern.exec(captureSubject);
         }}
         function materializeAsciiReplacement() {{
-            return captureSubject.replace(capturePattern, "");
+            return captureSubject.replace(capturePattern, "$1$2$3$4$5$6$7$8$9");
         }}
         function materializeFunctionalReplacement() {{
             return captureSubject.replace(capturePattern, function () {{ return ""; }});
+        }}
+        function lazyReplacementCopiesNoCapture() {{
+            return captureSubject.replace(capturePattern, "").length;
         }}
         "#,
     );
@@ -483,6 +505,11 @@ fn exec_result_and_intrinsic_replacement_capture_copies_are_bounded() {
     ] {
         assert_regex_memory_failure(&ascii_source, function, 160 * 1024);
     }
+    // The other side of the same rule: within the SAME headroom that the three
+    // above exhaust, a template naming no capture completes, because nothing
+    // is copied. If this ever fails, the substitution has gone back to
+    // materializing captures the replacement never asked for.
+    assert_regex_completes(&ascii_source, "lazyReplacementCopiesNoCapture", 160 * 1024);
 
     let utf16_pattern = "(?=(é*))".repeat(48);
     let utf16_source = format!(
@@ -490,7 +517,7 @@ fn exec_result_and_intrinsic_replacement_capture_copies_are_bounded() {
         const captureSubject = "é".repeat(4096);
         const capturePattern = new RegExp("{utf16_pattern}");
         function materializeUtf16Replacement() {{
-            return captureSubject.replace(capturePattern, "");
+            return captureSubject.replace(capturePattern, "$1$2$3$4$5$6$7$8$9");
         }}
         "#,
     );
