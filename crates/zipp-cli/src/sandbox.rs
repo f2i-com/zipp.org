@@ -267,7 +267,12 @@ fn print_help(frontend: Frontend) {
     println!();
     match frontend {
         Frontend::Integrated => {
-            println!("Applies defense-in-depth limits to a classic script in a supervised child.")
+            println!(
+                "Applies the supervisor's time, step, heap, source-size and output limits to a"
+            );
+            println!("classic script in a supervised child. This JIT build does not compile the");
+            println!("hardened profile's regex execution budget: see `zipp-sandbox` and");
+            println!("SECURITY.md for the limits only that artifact enforces.")
         }
         Frontend::Hardened => {
             println!("Runs a classic script in a supervised, interpreter-only safe-sandbox child.")

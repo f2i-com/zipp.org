@@ -505,6 +505,9 @@ impl Vm<'_> {
         for &promise in &self.promise_resolution_roots {
             root_idx!(promise);
         }
+        for &promise in &self.unhandled_rejections {
+            root_idx!(promise);
+        }
         for f in &self.frames {
             root_idx!(f.closure);
             root_val!(f.new_target);

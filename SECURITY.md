@@ -92,9 +92,15 @@ controls, or run it in an appropriately hardened OS sandbox, container, or
 microVM with explicit filesystem, network, process, memory, and CPU policy.
 
 The fast JIT-enabled CLI retains `zipp sandbox` and `zipp js --sandbox` as
-compatibility aliases. They share the same supervisor and resource policy, but
-the containing executable also includes the ordinary CLI's unsafe/JIT code and
-defaults to the throughput allocator profile. A JIT CLI can opt in to mimalloc's
+compatibility aliases. They share the supervisor's wall-clock, instruction,
+heap, source-size and output limits, but not every limit the hardened build
+compiles in: the regular-expression execution and backtrack-memory budgets are
+`safe-sandbox`-only (`crates/zipp-vm/src/vm/instrument.rs`), so a catastrophic
+backtracking pattern runs inside a single instruction until the supervisor's
+wall-clock timeout kills the worker, where `zipp-sandbox` raises a catchable
+`RangeError` in a fraction of a second. The containing executable also includes
+the ordinary CLI's unsafe/JIT code and defaults to the throughput allocator
+profile. A JIT CLI can opt in to mimalloc's
 secure mode with `--features secure-allocator`, but that does not remove its JIT
 or unsafe-code trust boundary.
 Treat those aliases as defense in depth, not as substitutes for the separately
@@ -132,6 +138,29 @@ but it does not make ambient browser authority safe. The Worker, message
 handler, imported functions, origin policy, browser, and host bridge remain part
 of the trusted computing base. Use an OS sandbox or microVM as an additional
 layer when the risk warrants it.
+
+### Release publishing
+
+`.github/workflows/release.yml` builds only from an existing `v*` tag and proves
+the checkout, the manifests and the built artifacts all name that tag's commit.
+The SOURCE is therefore bound to the tag — but a `workflow_dispatch` run takes
+the workflow FILE, and resolves the `uses:` references to `ci.yml` and
+`security.yml`, at the ref it was dispatched on. `validate` refuses a dispatch
+from any ref but `main` or the requested tag, which closes the accidental case
+(retrying an old tag against a rewritten `main`).
+
+The deliberate case needs repository settings the workflow cannot express, since
+anyone who can push a branch can already add a workflow that requests
+`contents: write`:
+
+- an `environment` named `release` — the `publish` job declares it — with
+  required reviewers and a deployment-branch-and-tag policy limited to `v*`;
+- a tag ruleset that forbids creating, deleting or moving `v*` tags outside that
+  process;
+- organization-level restrictions on `GITHUB_TOKEN` write permissions.
+
+Without the environment protection rules, the `environment:` key is only a label
+and publishing is protected by branch push permissions alone.
 
 ## Deployment checklist
 

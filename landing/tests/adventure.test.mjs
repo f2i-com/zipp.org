@@ -4,9 +4,11 @@ import { readFileSync } from 'node:fs'
 import { runInNewContext } from 'node:vm'
 import { randomInt } from 'node:crypto'
 import { injectStorySeed } from '../src/storySeed.ts'
-import init, { Engine } from '../public/wasm/zipp_wasm.js'
+import { createHash } from 'node:crypto'
+import init, { Engine, zippProfile } from '../public/wasm/zipp_wasm.js'
 
-await init({ module_or_path: readFileSync(new URL('../public/wasm/zipp_wasm_bg.wasm', import.meta.url)) })
+const wasmBytes = readFileSync(new URL('../public/wasm/zipp_wasm_bg.wasm', import.meta.url))
+await init({ module_or_path: wasmBytes })
 // Extract the authored template literal so tests execute precisely the editor sample.
 const sourceFile = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
 const template = sourceFile.match(/id: 'adventure'[\s\S]*?source: (`[\s\S]*?`) \}/)[1]
@@ -47,4 +49,19 @@ test('encounters exercise both outcomes and exhaustion ends longer journeys', ()
   assert.match(output, /A keepsake joins the collection/)
   assert.match(output, /Spirit remaining/)
   assert.match(output, /The quest can wait/)
+})
+
+test('the scratchpad copy and landing README describe the bundled engine', () => {
+  // The limits, version and provenance the page states are the artifact's own,
+  // so replacing landing/public/wasm without updating the copy fails here.
+  const profile = JSON.parse(zippProfile())
+  const mib = profile.limits.approxHeapBytes / (1024 * 1024)
+  assert.ok(sourceFile.includes(`${profile.limits.lifetimeSteps / 1e6}m instruction lifetime cap`))
+  assert.ok(sourceFile.includes(`${mib} MiB VM heap ceiling`), `App.tsx states the ${mib} MiB heap`)
+  assert.ok(sourceFile.includes(`releases/tag/v${profile.version}\``) && sourceFile.includes(`ZIPP WASM v${profile.version}<`),
+    `App.tsx names engine v${profile.version}`)
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
+  const sha = createHash('sha256').update(wasmBytes).digest('hex')
+  assert.ok(readme.includes(`engine is v${profile.version}, ${wasmBytes.length.toLocaleString('en-US')} raw bytes, SHA-256\n\`${sha}\``),
+    'landing/README.md records the engine version, size and SHA-256')
 })

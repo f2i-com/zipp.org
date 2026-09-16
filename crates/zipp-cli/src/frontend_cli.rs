@@ -195,7 +195,36 @@ fn execute(mut compiled: zipp_vm::frontend::CompiledSource) -> Result<(), String
             }
         }
     }
+    // A Python traceback and its exit status come from the frontend, not from
+    // the generic error path.
+    if python {
+        return python_exit(state, outcome.map(|_| ()));
+    }
     outcome.map(|_| ())
+}
+
+/// A Python program that ended by `SystemExit` sets the process status the way
+/// CPython does: an integer code becomes the status and nothing is printed; any
+/// other code is printed to stderr and the status is 1. Every other failure
+/// keeps the CLI's `zipp: <error>` report.
+///
+/// The status is the code's LOW 8 BITS, which is what `std::process::ExitCode`
+/// can express and what a POSIX wait status carries. CPython on Windows passes
+/// the full 32-bit value instead, so `sys.exit(258)` is 258 there and 2 here.
+fn python_exit(
+    state: &mut zipp_vm::embed::ScriptState,
+    outcome: Result<(), String>,
+) -> Result<(), String> {
+    let status = match state.call_global("__zipp_py_exit_status", &[]) {
+        Ok(zipp_vm::embed::JsValue::Number(code)) => (code as i64 & 0xff) as u8,
+        Ok(zipp_vm::embed::JsValue::String(text)) => {
+            eprintln!("{text}");
+            1
+        }
+        _ => return outcome,
+    };
+    super::request_exit(status);
+    Ok(())
 }
 
 /// Print console lines as the program produces them, so a long run shows
@@ -744,9 +773,15 @@ fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<()
         "{} of the program's file change(s) were not written back",
         refused.len()
     );
+    // A SystemExit is the program choosing a process status, not a failure:
+    // `python_exit` turns it into that status and prints nothing, and leaves a
+    // real traceback to be reported as the run's error.
     match outcome {
-        Err(error) if refused.is_empty() => Err(error),
-        Err(error) => Err(format!("{error}\n{}\nzipp: {summary}", lines.join("\n"))),
+        Err(error) if refused.is_empty() => python_exit(state, Err(error)),
+        Err(error) => python_exit(
+            state,
+            Err(format!("{error}\n{}\nzipp: {summary}", lines.join("\n"))),
+        ),
         Ok(_) if refused.is_empty() => Ok(()),
         Ok(_) => {
             for line in lines {

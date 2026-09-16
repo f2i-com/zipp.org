@@ -56,13 +56,16 @@ let jsSlots = null;
 // answers go back through `pythonCall("__zipp_py_deliver", ...)` between
 // engine calls. The runtime is created on the first request so a program
 // that never computes never touches the GPU; it is kept across runs and
-// replaced when the page picks another backend.
-const gpu = { backend: "auto", runtime: null, creating: null, adapter: null };
+// replaced when the page picks another backend. The runtime runs one graph at
+// a time, so a new run's graphs wait for `retiring`: the previous engine's
+// in-flight graph, which invalidating its adapter does not cancel (the
+// documented teardown is invalidate, await idle, dispose).
+const gpu = { backend: "auto", runtime: null, creating: null, adapter: null, retiring: Promise.resolve() };
 
 async function computeRuntime() {
   if (gpu.runtime) return gpu.runtime;
   if (!gpu.creating) {
-    gpu.creating = createRuntime({
+    const creation = createRuntime({
       backend: gpu.backend,
       wasmUrl: new URL("../gpu-lab/wasm/kernels.wasm", import.meta.url),
       // The work budget comes from the backend (100M estimated operations on
@@ -71,25 +74,39 @@ async function computeRuntime() {
       // CPU graph still finishes well inside the page's frame deadline.
       limits: { maxNodes: 512 },
     }).then((runtime) => {
+      if (gpu.creating !== creation) {
+        // The page picked another backend while this one was being created.
+        try { runtime.dispose(); } catch { /* keep going */ }
+        return computeRuntime();
+      }
+      gpu.creating = null;
       gpu.runtime = runtime;
       const info = runtime.info();
       const attempts = (info.fallbackAttempts || []).map((a) => `${a.backend}: ${a.error}`);
       self.postMessage({ type: "event", gpu: { backend: info.backend, description: info.description, adapter: info.adapter, attempts } });
       return runtime;
-    }).finally(() => { gpu.creating = null; });
+    }, (error) => {
+      if (gpu.creating === creation) gpu.creating = null;
+      throw error;
+    });
+    gpu.creating = creation;
   }
   return gpu.creating;
 }
 // `createZippGPUHandler` only needs `execute`; creating the runtime lazily
 // keeps the adapter synchronous to create.
-const lazyRuntime = { async execute(program, options) { return (await computeRuntime()).execute(program, options); } };
+const lazyRuntime = { async execute(program, options) { await gpu.retiring; return (await computeRuntime()).execute(program, options); } };
 
 function selectGpuBackend(backend) {
   const wanted = ["auto", "webgpu", "webgl2", "wasm", "cpu-js"].includes(backend) ? backend : "auto";
   if (wanted === gpu.backend) return;
   gpu.backend = wanted;
-  if (gpu.runtime && !gpu.runtime.busy) { try { gpu.runtime.dispose(); } catch { /* keep going */ } }
+  gpu.creating = null;
+  const old = gpu.runtime;
   gpu.runtime = null;
+  // Never dispose a runtime out from under the retiring engine's graph (that
+  // throws BUSY and leaked the device); dispose it once that graph settles.
+  if (old) gpu.retiring.then(() => { try { old.dispose(); } catch { /* keep going */ } });
 }
 
 function attachGpu() {
@@ -128,6 +145,8 @@ function drainHost() {
 function disposeEngine() {
   if (gpu.adapter) {
     gpu.adapter.invalidate();
+    // `idle()` settles (never rejects) once the generation's graphs are done.
+    gpu.retiring = Promise.all([gpu.retiring, gpu.adapter.idle()]).then(() => {});
     gpu.adapter = null;
   }
   if (engine) {

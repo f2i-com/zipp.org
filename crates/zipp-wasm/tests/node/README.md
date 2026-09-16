@@ -22,7 +22,7 @@ They all expect the generated glue at `tests/node/pkg/` (adjust the `require` at
 top of each file if you put it elsewhere).
 
 - **check-wasm-memory.cjs** — verifies the final wasm-bindgen artifact still has
-  exactly one unshared, non-memory64 linear memory capped at 256 MiB and only
+  exactly one unshared, non-memory64 linear memory capped at 1 GiB (16,384 pages) and only
   the audited host-import surface.
 - **host-contract.cjs** — every method a UI host depends on: the symbol map and
   what it hides, structured global reads/writes, batching and the function-slot

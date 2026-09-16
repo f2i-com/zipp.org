@@ -8,6 +8,7 @@ function __zipp_py_call(name, args) { return __zipp_py.__rt.hostCall(name, args)
 function __zipp_py_take_ui() { const out = __zipp_py_ui; __zipp_py_ui = []; return out; }
 function __zipp_py_take_host() { return __zipp_py.__rt.takeHostRequests(); }
 function __zipp_py_vfs_changed() { return __zipp_py.__rt.vfsChangedText(); }
+function __zipp_py_exit_status() { return __zipp_py.__rt.exitStatus(); }
 function __zipp_py_set_input(json) {
     const i = JSON.parse(json);
     __zipp_py_input = {
@@ -20,13 +21,25 @@ function __zipp_py_set_input(json) {
 (function (R) {
     "use strict";
     const rt = R.__rt, T = rt.T, E = rt.E;
+    // What a SystemExit leaving the program asks of the process, for a host
+    // that owns one (the CLI reads it through `__zipp_py_exit_status`): an
+    // integer status, or, for any other code, the text CPython prints before
+    // exiting with status 1. `null` until a SystemExit leaves.
+    let exitStatus = null;
+    rt.exitStatus = function () { return exitStatus; };
     // A Python exception leaving the program: the VM reports `name: message`
     // from the exception object's own fields, formatted like a traceback tail.
     function hostError(e) {
         const exc = rt.normexc(e);
-        if (exc.cls === E.SystemExit) {
-            const code = exc.args.items.length ? exc.args.items[0] : 0n;
+        if (rt.isSubclass(exc.cls, E.SystemExit)) {
+            const items = exc.args.items;
+            const code = items.length === 0 ? null : items.length === 1 ? items[0] : exc.args;
             if (code === null || code === 0n || code === false) return null;
+            // CPython truncates a 64-bit code to a C int, and exits -1 when
+            // the code does not fit 64 bits.
+            exitStatus = typeof code === "bigint"
+                ? (BigInt.asIntN(64, code) === code ? Number(BigInt.asIntN(32, code)) : -1)
+                : code === true ? 1 : rt.str(code);
             const err = new Error(rt.str(code)); err.name = "SystemExit"; return err;
         }
         let message = rt.str(exc);

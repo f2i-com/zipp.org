@@ -13,6 +13,11 @@ name: Security
 # verification") and here on demand. Release publishing calls this workflow
 # at the validated tag commit and consumes every result.
 #
+# Every gating lane runs on the `toolchain` input, which defaults to the pinned
+# release toolchain, so the suite that gates publishing is compiled by the same
+# compiler as the artifacts it gates. `stable-canary` is the separate,
+# non-blocking drift check; it does not run for a release gate.
+#
 # No job here publishes anything.
 on:
   workflow_dispatch:
@@ -21,23 +26,54 @@ on:
         description: Git revision to test (defaults to the dispatched revision)
         required: false
         type: string
+      toolchain:
+        description: Rust toolchain for every gating cargo lane
+        required: false
+        type: string
+        default: "1.92.0"
+      canary:
+        description: Also run the non-blocking stable-toolchain canary
+        required: false
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       ref:
         description: Exact validated release commit
         required: true
         type: string
+      toolchain:
+        description: Rust toolchain for every gating cargo lane (the release toolchain)
+        required: false
+        type: string
+        default: "1.92.0"
+      canary:
+        description: Run the stable-toolchain canary too (off for a release gate)
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: security-${{ github.workflow }}-${{ github.ref }}
+  # Key on the revision under test, not on the ref the run was started from.
+  # Two release dispatches for different tags both resolve `github.ref` to
+  # `refs/heads/main`, so a shared group let the second cancel the first and
+  # silently skipped the first release's publish.
+  group: security-${{ github.workflow }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # Every GATING cargo lane runs on this toolchain, which defaults to the
+  # pinned release toolchain: release.yml builds the shipped native and WASM
+  # artifacts with 1.92.0, so the suite that gates publishing must exercise the
+  # compiler and LLVM that produced them. `stable` is a separate, non-blocking
+  # canary job below. (dependency-audit stays on stable: cargo-audit is a tool,
+  # and its findings do not depend on the compiler that builds the engine.)
+  TOOLCHAIN: ${{ inputs.toolchain || '1.92.0' }}
 
 jobs:
   benchmark-integrity:
@@ -61,7 +97,8 @@ jobs:
 
   native-workspace:
     name: Native workspace tests
-    # The full native workspace is the expensive lane: weekly and on demand.
+    # The full native workspace is the expensive lane: on demand and at
+    # release (there is no schedule while automatic CI is paused).
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     # Hundreds of debug test executables otherwise duplicate full VM/parser
@@ -77,11 +114,8 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      # A deliberately labelled stable-toolchain canary: the pinned 1.92.0
-      # toolchain is what CI and release use, so a failure here that CI does
-      # not show is a toolchain drift signal, not a release blocker.
-      - name: Select stable Rust (canary)
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Select the gating Rust toolchain
+        run: rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --no-self-update
       # Differential tests use Node 24 as their reference, including Float16Array.
       # The runner's preinstalled Node may omit it and produce fewer output rows.
       - name: Select the Node.js reference runtime
@@ -97,12 +131,57 @@ jobs:
           set -euo pipefail
           skips="$(python3 tools/ci_quarantine.py --emit-skips)"
           # shellcheck disable=SC2086
-          cargo +stable test --locked --workspace --no-fail-fast -- $skips
+          cargo +${{ env.TOOLCHAIN }} test --locked --workspace --no-fail-fast -- $skips
       - name: Test bounded backtracking executor limits
         run: >-
-          cargo +stable test --locked -p zipp-regress
+          cargo +${{ env.TOOLCHAIN }} test --locked -p zipp-regress
           --features bounded-backtracking
           --test limited_backtracking
+
+  native-windows:
+    name: Native CLI and JIT VM (Windows x86-64)
+    # release.yml ships an x86_64-pc-windows-msvc CLI with the JIT on, but
+    # every other native lane runs on ubuntu and the other Windows lane builds
+    # zipp-sandbox, which excludes the JIT. Nothing therefore exercised the
+    # Win64 calling convention, VirtualProtect code publication, or the
+    # 256 MiB main-thread stack on the platform the binary runs on. This job
+    # does, and release publishing depends on this workflow.
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Select the gating Rust toolchain
+        run: rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --no-self-update
+      - name: Select the Node.js reference runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      # crates/zipp-cli/tests/windows_main_stack.rs is `#![cfg(windows)]`, so
+      # this is the only lane that runs it; sandbox.rs also has cfg(windows)
+      # cases, and audit_20260915_infra.rs pins the CLI's exit statuses.
+      - name: Test the CLI, its Windows main-thread stack and the sandbox aliases
+        run: cargo +${{ env.TOOLCHAIN }} test --locked -p zipp-cli
+      - name: Test the JIT VM on the shipped Windows target
+        run: >-
+          cargo +${{ env.TOOLCHAIN }} test --locked -p zipp-vm --no-fail-fast
+          --lib
+          --test jit_tier_parity
+          --test jit_tier_fuzz
+          --test jit_global_own_prop
+          --test jit_sparse_array_paths
+          --test call_order_default
+          --test class_body_bindings
+          --test captured_intrinsic_lane
 
   safe-vm:
     name: Safe interpreter profile
@@ -114,17 +193,17 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - name: Select stable Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Select the gating Rust toolchain
+        run: rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --no-self-update
       - name: Test the safe-profile VM library
-        run: cargo +stable test --locked -p zipp-vm --no-default-features --features safe-sandbox --lib
+        run: cargo +${{ env.TOOLCHAIN }} test --locked -p zipp-vm --no-default-features --features safe-sandbox --lib
       # The hostile-input and resource-limit regressions, plus the embedding
       # contracts the 11 September 2026 audit pinned (compile-free name calls
       # under a one-compile allowance; bounded fingerprint work), which the
       # safe profile's recorder can observe.
       - name: Test hostile-input, resource-limit and embedding-contract regressions
         run: |
-          cargo +stable test --locked -p zipp-vm \
+          cargo +${{ env.TOOLCHAIN }} test --locked -p zipp-vm \
             --no-default-features --features safe-sandbox \
             --test clock_installed \
             --test instrument \
@@ -167,11 +246,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - name: Select stable Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Select the gating Rust toolchain
+        run: rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --no-self-update
       - name: Prove the hardened feature boundary
         run: |
-          cargo +stable tree --locked --manifest-path crates/zipp-sandbox/Cargo.toml \
+          cargo +${{ env.TOOLCHAIN }} tree --locked --manifest-path crates/zipp-sandbox/Cargo.toml \
             -e features > sandbox-features.txt
           grep -q 'zipp-vm feature "safe-sandbox"' sandbox-features.txt
           grep -q 'mimalloc feature "secure"' sandbox-features.txt
@@ -181,7 +260,7 @@ jobs:
             exit 1
           fi
       - name: Test the separately resolved native sandbox
-        run: cargo +stable test --locked --manifest-path crates/zipp-sandbox/Cargo.toml
+        run: cargo +${{ env.TOOLCHAIN }} test --locked --manifest-path crates/zipp-sandbox/Cargo.toml
 
   native-sandbox-windows:
     name: Isolated native sandbox (Windows)
@@ -193,10 +272,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - name: Select stable Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Select the gating Rust toolchain
+        run: rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --no-self-update
       - name: Test Windows supervision and path boundaries
-        run: cargo +stable test --locked --manifest-path crates/zipp-sandbox/Cargo.toml
+        run: cargo +${{ env.TOOLCHAIN }} test --locked --manifest-path crates/zipp-sandbox/Cargo.toml
 
   wasm-sandbox:
     name: Isolated WebAssembly sandbox
@@ -211,24 +290,24 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - name: Select stable Rust and wasm32 target
+      - name: Select the gating Rust toolchain and wasm32 target
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup +stable target add wasm32-unknown-unknown
+          rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --no-self-update
+          rustup +${{ env.TOOLCHAIN }} target add wasm32-unknown-unknown
       - name: Select the Node.js runtime
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
       - name: Test the isolated host build
-        run: cargo +stable test --locked
+        run: cargo +${{ env.TOOLCHAIN }} test --locked
       - name: Test artifact-only VM specializations
         run: >-
-          cargo +stable test --locked --manifest-path ../zipp-vm/Cargo.toml
+          cargo +${{ env.TOOLCHAIN }} test --locked --manifest-path ../zipp-vm/Cargo.toml
           --no-default-features
           --features safe-sandbox,meter-only,wasm-no-fs-loader,wasm-single-agent
           --test no_fs_loader --test wasm_single_agent
       - name: Install matching wasm-bindgen CLI
-        run: cargo +stable install wasm-bindgen-cli --locked --version 0.2.126
+        run: cargo +${{ env.TOOLCHAIN }} install wasm-bindgen-cli --locked --version 0.2.126
       - name: Build the production wasm32 artifact
         env:
           RUSTFLAGS: >-
@@ -236,7 +315,7 @@ jobs:
             -C link-arg=--max-memory=1073741824
             -C link-arg=-zstack-size=1048576
           ZIPP_SOURCE_SHA: ${{ inputs.ref || github.sha }}
-        run: cargo +stable build --locked --release --target wasm32-unknown-unknown
+        run: cargo +${{ env.TOOLCHAIN }} build --locked --release --target wasm32-unknown-unknown
       # The same list CI and release run; see tests/node/run-boundary-suite.cjs.
       - name: Test the production host boundary under Node
         run: |
@@ -244,7 +323,8 @@ jobs:
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/run-boundary-suite.cjs
       # The exact stripped web package inside real Workers, through the
-      # reference host adapter (ZIPP-17): weekly here, locally before a push.
+      # reference host adapter (ZIPP-17): here on demand and at release,
+      # locally before a push.
       - name: Run the Worker smoke test in Chromium, Firefox and WebKit
         run: |
           set -euo pipefail
@@ -341,3 +421,39 @@ jobs:
       - name: Audit landing-page dependencies
         working-directory: landing
         run: npm audit --audit-level=low
+
+  stable-canary:
+    name: Stable-toolchain canary (non-blocking)
+    # Toolchain drift only. The gating lanes above run on the toolchain that
+    # builds the shipped binaries; this one re-runs the full native workspace
+    # on whatever `stable` is today, so a future-incompat error, lint or
+    # behaviour change shows up before the pin moves. It must never hold a
+    # release: `workflow_call` defaults `canary` to false so a release gate
+    # does not run it at all, and `continue-on-error` keeps a failure here out
+    # of the workflow's result even when it is dispatched by hand.
+    if: ${{ inputs.canary }}
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Select stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Select the Node.js reference runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Test the root native workspace on stable
+        run: |
+          set -euo pipefail
+          skips="$(python3 tools/ci_quarantine.py --emit-skips)"
+          # shellcheck disable=SC2086
+          cargo +stable test --locked --workspace --no-fail-fast -- $skips

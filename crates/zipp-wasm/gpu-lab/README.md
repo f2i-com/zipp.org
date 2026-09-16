@@ -105,7 +105,12 @@ callback that resubmits cannot recurse), and rejects work after tenant invalidat
 - `src/zipp-python-adapter.mjs`: actual Python host bridge.
 - `src/zipp-adapter.mjs`, `src/zipp-guest.js`: opt-in JavaScript guest integration.
 - `../../zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`: native Python graph authoring/export library.
-- `wasm/kernels.c`, `wasm/kernels.wasm`: freestanding C kernels and included binary.
+- `wasm/kernels.c`, `wasm/kernels.wasm`: freestanding C kernels and the
+  COMMITTED binary. No workflow rebuilds it: `npm test`, the Node GPU suites
+  and the `javascript-python` release archive all load this exact blob, and
+  nothing compares it against `kernels.c`. Rebuild with `scripts/build_wasm.sh`
+  (Clang targeting wasm32 plus wasm-ld) and review the C change and the new
+  binary together.
 - `tests/`: numerical checks, allocation/lifecycle mocks and browser cases; `tests/ml-cases.mjs`
   holds the per-operation fixtures and the MLP training-step generator shared with the browser.
 - `docs/INTEGRATION.md`, `docs/ARCHITECTURE.md`, `docs/VALIDATION.md`: contracts and evidence.

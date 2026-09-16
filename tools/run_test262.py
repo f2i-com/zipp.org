@@ -16,7 +16,11 @@ A test is a .js file with a `/*--- … ---*/` YAML frontmatter:
   negative: { phase: parse|resolution|runtime, type: <ErrorName> } — must fail
 Positive tests pass on clean exit; async tests pass when the harness prints
 `Test262:AsyncTestComplete`; negative tests require a normal language-error exit
-and the expected error type in the CLI diagnostic.
+and the expected error type in the CLI diagnostic. A positive NON-ASYNC test
+also fails when the engine reports an assertion lost after its synchronous part
+finished: a Test262Error thrown out of an unhandled promise job, or an exception
+thrown by a timer callback (see `lost_failure`). An async test's verdict stays
+$DONE's, as INTERPRETING.md specifies.
 
 The process exits nonzero on failures or skips. --expected-failures accepts an
 exact failure manifest for the selected run: both unexpected failures and stale
@@ -162,11 +166,53 @@ LEGACY_SYNTAX_ERRORS = {
 }
 
 
+# `run_one` sets ZIPP_REPORT_UNHANDLED=1, which makes the CLI print one stderr
+# line per exception that escaped a promise job whose promise nothing handled,
+# and one per exception a timer callback threw. Without it an assertion that
+# fails inside a promise reaction or a timer leaves no trace: the rejection is
+# simply dropped, the process exits 0, and the test scored PASS.
+#
+# The engine reports only jobs that THREW, never an ordinary `reject(value)`:
+# an unhandled rejection is not a Test262 failure, and about sixteen
+# built-ins/Promise/{all,allSettled,race} tests reject with a `Test262Error` on
+# purpose and never handle it.
+PROMISE_JOB_EXCEPTION = "zipp: unhandled exception in promise job: "
+TIMER_EXCEPTION = "zipp: uncaught exception in timer callback: "
+REPORT_ENV = {"ZIPP_REPORT_UNHANDLED": "1"}
+
+
 def reported_error(err):
     """The CLI's final error diagnostic, excluding messages printed by tests."""
     lines = [line[len("zipp: "):] for line in err.splitlines()
              if line.startswith("zipp: ")]
     return lines[-1] if lines else ""
+
+
+def lost_failure(err):
+    """The first failure a positive NON-ASYNC test lost after its synchronous
+    part: a Test262Error (a harness assertion) thrown out of a promise job
+    nothing handled, or any exception a timer callback threw (an uncaught
+    exception by definition). Such a test signals its verdict by completing
+    without throwing, so a lost assertion leaves the runner with no evidence at
+    all; `flags: [async]` tests report through $DONE and are scored by that
+    (see `classify`).
+
+    A job that threw something OTHER than a Test262Error is left alone: the
+    engine reports it for diagnosis, but Test262 scores only the harness's own
+    assertions, and a positive test may legitimately provoke a `TypeError`
+    inside an unobserved reaction.
+
+    Known residual: a reaction that RETURNS a rejected promise (including an
+    `async` callback whose body throws) is adoption, not a throw — the adopted
+    promise is marked handled and the dependent is rejected by pass-through, so
+    the engine reports nothing and such a failure is still lost. Narrowing to
+    thrown jobs is what keeps the sixteen `built-ins/Promise/*` tests that
+    reject with a `Test262Error` on purpose from failing the gate."""
+    for line in err.splitlines():
+        if line.startswith(TIMER_EXCEPTION) or (
+                line.startswith(PROMISE_JOB_EXCEPTION) and TEST262ERROR in line):
+            return line
+    return None
 
 
 def classify(meta, code, out, err):
@@ -210,14 +256,25 @@ def classify(meta, code, out, err):
             return ("FAIL", err.strip().splitlines()[0] if err.strip() else "async-no-complete")
         if code != 0:
             return ("FAIL", f"async-completed-then-exit={code}")
+        # NOT scored here: an assertion lost in a job after $DONE() already
+        # reported success. INTERPRETING.md makes the printed string the verdict
+        # for `flags: [async]` ("In the event of a passing test run, this
+        # function will be invoked with the string 'Test262:AsyncTestComplete'"),
+        # so a runner that overrules $DONE is reading a contract that is not
+        # there. The engine still PRINTS the report, so the evidence is in the
+        # log: `staging/explicit-resource-management/await-using-in-async-
+        # generator-body.js` asserts inside an unawaited `.then` that the second
+        # `next()` of a completed `async function*` yields 1 rather than
+        # undefined, and Node 24 loses the same assertion identically. That is
+        # an upstream test bug, not an engine failure, and scoring it here would
+        # fail the corrected-tree gate (which has no patch for that file).
         return ("PASS", None)
     if code == 0:
-        # A positive test that reported a Test262Error but still exited 0 did not
-        # pass: an assertion inside a promise reaction throws, the rejection goes
-        # unhandled, and the process exits cleanly.
-        if TEST262ERROR in blob:
-            line = next((l for l in blob.splitlines() if TEST262ERROR in l), TEST262ERROR)
-            return ("FAIL", f"swallowed: {line.strip()[:64]}")
+        # A positive test whose assertion failed inside a promise job or a
+        # timer still exits 0; the engine's report is the only evidence.
+        lost = lost_failure(err)
+        if lost:
+            return ("FAIL", f"lost: {lost[len('zipp: '):][:74]}")
         return ("PASS", None)
     sig = err.strip().splitlines()[-1] if err.strip() else f"exit={code}"
     return ("FAIL", sig[:80])
@@ -307,6 +364,7 @@ def run_one(args, get_harness, job):
             subcmd = "mjs" if is_module else "js"
             env = dict(os.environ)
             env["RUST_BACKTRACE"] = "0"
+            env.update(REPORT_ENV)
             if cannot_block:
                 env["ZIPP_CAN_BLOCK"] = "0"
             # Module tests run the ORIGINAL file (self-imports resolve to the

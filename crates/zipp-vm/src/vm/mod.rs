@@ -1529,6 +1529,23 @@ pub struct Vm<'p> {
     /// small nesting stack in the VM root set instead of disabling GC across
     /// arbitrary JavaScript.
     promise_resolution_roots: Vec<u32>,
+    /// Test262 host reporting (`ZIPP_REPORT_UNHANDLED=1`, which
+    /// tools/run_test262.py sets): promises that a THROWING JOB rejected while
+    /// no handler was attached, in rejection order. GC ROOTS: a `.then`
+    /// dependent is unreachable once its reaction has run, and that is exactly
+    /// the rejection being reported. `report_unhandled_errors` names the ones
+    /// still unhandled at exit. Never pushed when reporting is off.
+    unhandled_rejections: Vec<u32>,
+    /// Set only while `reject_thrown_job` is settling a promise, so `settle`
+    /// can tell an exception that escaped a job from an ordinary
+    /// `reject(value)`. Test262 scores the first as a lost failure and the
+    /// second not at all.
+    rejecting_thrown_job: bool,
+    /// Marker lines for exceptions that escaped a `setTimeout` callback,
+    /// recorded only while reporting is on (the event loop otherwise drops
+    /// them, as it has no HostReportErrors hook).
+    uncaught_timer_errors: Vec<String>,
+    report_unhandled: bool,
     /// The `.raw` array of a tagged-template strings object, keyed by the cooked
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).

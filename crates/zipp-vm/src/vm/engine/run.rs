@@ -415,9 +415,12 @@ impl<'p> Vm<'p> {
             if let HeapObj::Promise {
                 state: PromiseState::Rejected,
                 result,
+                handled,
                 ..
-            } = self.heap.get(p.heap_index())
+            } = self.heap.get_mut(p.heap_index())
             {
+                // The rejection IS the program's error: consumed, not unhandled.
+                *handled = true;
                 let reason = *result;
                 // Render the rejection like an uncaught throw ("Name: message")
                 // rather than display() (which gives "[object Object]" for an Error).

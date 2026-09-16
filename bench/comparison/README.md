@@ -342,9 +342,11 @@ That makes it a module-payload comparison, not total application download size.
 | QuickJS-NG WASI reactor | official v0.16.2 `qjs-wasi-reactor.wasm` | 1,528,293 | 527,761 | 417,087 | `fc638ef0bad35edb860ca93fe5c0ea288a6ad137888b34afa8ca2c2513727cf0` |
 | Boa Wasm | official `@boa-dev/boa_wasm` 0.22.0 | 21,296,176 | 7,737,026 | 5,484,164 | `03a3e4c1c0e71514cb28d2158ea52566dbbfbefe16fee795480a751e9b6b5f31` |
 
-The current Zipp row uses Rust 1.92.0, wasm-bindgen 0.2.126, the locked graph,
-`opt-level=3`, four codegen units, a 256 MiB linked memory maximum, and a 1 MiB
-linked stack. It selects the isolated `safe-sandbox`, `meter-only`,
+The Zipp v0.0.6 row above uses Rust 1.92.0, wasm-bindgen 0.2.126, the locked
+graph, `opt-level=3`, four codegen units, a 256 MiB linked memory maximum, and a
+1 MiB linked stack. That memory figure is the v0.0.6 build's; the linked maximum
+is now 1 GiB (`crates/zipp-wasm/.cargo/config.toml`, enforced by
+`tests/node/check-wasm-memory.cjs`), so do not read this row as a current limit. It selects the isolated `safe-sandbox`, `meter-only`,
 `wasm-no-fs-loader`, and `wasm-single-agent` zipp-vm features. After
 `wasm-bindgen --target web` removes the name and producers sections, the
 validated `strip-target-features.cjs` pass removes only the optional

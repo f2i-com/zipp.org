@@ -848,12 +848,12 @@ impl<'p> Vm<'p> {
         // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 —
         // resolving an old promise with a young value.
         self.store_barrier(crate::heap::gcoracle::PROMISE_SETTLE, p, val);
-        let reactions = match self.heap.get_mut(p) {
+        let (reactions, unhandled) = match self.heap.get_mut(p) {
             HeapObj::Promise {
                 state: s,
                 result,
                 reactions,
-                ..
+                handled,
             } => {
                 if *s != PromiseState::Pending {
                     return;
@@ -868,10 +868,19 @@ impl<'p> Vm<'p> {
                 // promise kept its opposite-kind reactions -- and the GC kept
                 // tracing their callbacks and dependents -- for the rest of its
                 // life. One list cannot express that, so it also goes away.
-                std::mem::take(reactions)
+                (
+                    std::mem::take(reactions),
+                    state == PromiseState::Rejected && !*handled,
+                )
             }
             _ => return,
         };
+        // HostPromiseRejectionTracker(promise, "reject"), narrowed to the
+        // rejections a running job THREW and kept only for the Test262 host
+        // report (see `reject_thrown_job` and `report_unhandled_errors`).
+        if unhandled && self.report_unhandled && self.rejecting_thrown_job {
+            self.unhandled_rejections.push(p);
+        }
         let kind = if state == PromiseState::Fulfilled {
             ReactionKind::Fulfill
         } else {
@@ -1384,6 +1393,22 @@ impl<'p> Vm<'p> {
         self.settle(p, PromiseState::Rejected, reason);
     }
 
+    /// Reject `p` because the JOB that was running threw: a reaction or
+    /// `finally` callback, a `then` called by PromiseResolveThenableJob, or an
+    /// async function/generator body reaching an uncaught exception.
+    ///
+    /// Only these rejections can be a guest assertion escaping into a later
+    /// job, so only these are recorded for the Test262 host report (see
+    /// `report_unhandled_errors`). A promise rejected by an explicit
+    /// `reject(value)` call is ordinary data flow that Test262 does not score:
+    /// built-ins/Promise/all/invoke-then-error-close.js and about fifteen
+    /// siblings reject with a `Test262Error` ON PURPOSE and never handle it.
+    fn reject_thrown_job(&mut self, p: u32, reason: Value) {
+        let previous = std::mem::replace(&mut self.rejecting_thrown_job, true);
+        self.reject(p, reason);
+        self.rejecting_thrown_job = previous;
+    }
+
     /// Keep heap Values owned only by a Promise abstract operation's Rust locals
     /// alive across re-entrant JavaScript. This is deliberately narrower than
     /// `gc_lock_guard`: user code may run and the collector may reclaim everything
@@ -1467,9 +1492,11 @@ impl<'p> Vm<'p> {
                         is_async: false,
                         is_combinator_all: false,
                     });
-                    if !on_r.is_undefined() {
-                        *handled = true;
-                    }
+                    // PerformPromiseThen marks the promise handled with or
+                    // without an onRejected: a rejection then flows to the
+                    // dependent, and that is the promise that goes unhandled
+                    // (internal adoption passes no handlers at all).
+                    *handled = true;
                 }
             }
             PromiseState::Fulfilled => {
@@ -2136,7 +2163,7 @@ impl<'p> Vm<'p> {
             };
             if let Some(p) = front {
                 self.async_gen_pop_front(idx);
-                self.reject(p, e);
+                self.reject_thrown_job(p, e);
             }
             self.async_gen_service_queue(idx);
             return;
@@ -2316,7 +2343,7 @@ impl<'p> Vm<'p> {
                     _ => None,
                 };
                 if let Some(req) = front {
-                    self.reject(req.promise, reason);
+                    self.reject_thrown_job(req.promise, reason);
                 }
                 self.async_gen_service_queue(idx);
             }
@@ -3285,7 +3312,7 @@ impl<'p> Vm<'p> {
                 a.handlers.clear();
             }
             let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
-            self.reject(result, e);
+            self.reject_thrown_job(result, e);
             return;
         }
         self.regs.extend_from_slice(&saved);
@@ -3435,7 +3462,7 @@ impl<'p> Vm<'p> {
                     a.regs.clear();
                     a.handlers.clear();
                 }
-                self.reject(result, e);
+                self.reject_thrown_job(result, e);
             }
         }
     }
@@ -3459,7 +3486,7 @@ impl<'p> Vm<'p> {
                     if !callback.is_undefined() {
                         if let Err(_) = self.call_value(callback, Value::UNDEFINED, &[]) {
                             let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
-                            self.reject(dependent, r);
+                            self.reject_thrown_job(dependent, r);
                             return;
                         }
                     }
@@ -3510,7 +3537,7 @@ impl<'p> Vm<'p> {
                     Ok(ret) => self.resolve(dependent, ret),
                     Err(_) => {
                         let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
-                        self.reject(dependent, r);
+                        self.reject_thrown_job(dependent, r);
                     }
                 }
             }
@@ -3579,7 +3606,7 @@ impl<'p> Vm<'p> {
                     // Spec: the job's catch calls resolvingFunctions.[[Reject]] —
                     // a no-op when the pair already fired inside `then`.
                     if self.resolver_pair_fire(pair) {
-                        self.reject(promise, e);
+                        self.reject_thrown_job(promise, e);
                     }
                 }
             }
@@ -3686,6 +3713,42 @@ impl<'p> Vm<'p> {
             let v = self.alloc_str("ok".to_string());
             self.resolve(p, v);
         }
+    }
+
+    /// The Test262 host report (`ZIPP_REPORT_UNHANDLED=1`, set by
+    /// tools/run_test262.py). Once the program and its event loop have
+    /// finished, append an `errput` line for every exception that escaped a
+    /// promise job (see `reject_thrown_job`) and whose promise never gained a
+    /// handler, then one per exception a timer callback threw. Neither shows
+    /// up anywhere else — the process still exits 0 — so without these lines a
+    /// positive test whose assertion fails inside a promise job or a timer
+    /// scores PASS. A no-op when reporting is off.
+    pub(crate) fn report_unhandled_errors(&mut self) {
+        if !self.report_unhandled {
+            return;
+        }
+        for p in std::mem::take(&mut self.unhandled_rejections) {
+            let reason = match self.heap.get(p) {
+                HeapObj::Promise {
+                    state: PromiseState::Rejected,
+                    result,
+                    handled: false,
+                    ..
+                } => *result,
+                _ => continue,
+            };
+            let msg = if reason.is_heap()
+                && matches!(self.heap.get(reason.heap_index()), HeapObj::Object(_))
+            {
+                self.throw_message(reason)
+            } else {
+                self.display(reason)
+            };
+            self.errput
+                .push(format!("zipp: unhandled exception in promise job: {msg}"));
+        }
+        let timers = std::mem::take(&mut self.uncaught_timer_errors);
+        self.errput.extend(timers);
     }
 
     /// The full event loop: deliver cross-thread waitAsync wakes, drain

@@ -524,7 +524,7 @@ cover that way (string, regex, BigInt, array and nesting ceilings) come from
 | One BigInt magnitude | 1,048,576 bits (approximately 128 KiB) |
 | One eager dense array/result | 131,072 elements; larger spec-visible lengths remain sparse where supported |
 | JavaScript call frames | 4,096 active frames |
-| Native VM re-entry | 3 simultaneous interpreter entries (the outer run plus at most 2 nested observable callbacks/traps), sized for the 1 MiB Worker stack |
+| Native VM re-entry | 32 simultaneous interpreter entries (`MAX_RUN_LOOP_DEPTH`: the outer run plus at most 31 nested callbacks, traps and builtin-resumed generators); a 33rd throws a catchable `RangeError`. The release gate runs `tests/node/native-depth.cjs` against both variants' stacks: 20 nested entries run and 200 are refused without a trap |
 | Proxy/prototype native meta-operation recursion | 32 guest-controlled transparent forwarding/prototype edges |
 | Guarded array-like/list-building native loops | 262,144 guest-directed iterations; recursive array flattening is capped at 64 active levels |
 | Array `join`/`toString`/`toLocaleString` recursion | 4 active nested arrays; cycles contribute an empty element and deeper acyclic graphs throw `RangeError` |

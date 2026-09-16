@@ -124,15 +124,17 @@ The benchmark runners stage reviewed inputs into private read-only trees and
 fail closed on drift. A diagnostic override can permit measurement; it can
 never turn a noncanonical run into publishable evidence.
 
-The current canonical public artifacts are:
+The current canonical public artifacts, the pair the root README tabulates, are:
 
-- [`real13_c28781cf_pgo_2026-09-02.json`](real13_c28781cf_pgo_2026-09-02.json)
-- [`hostile/head_clean_c28781cf_pgo_2026-09-02.json`](hostile/head_clean_c28781cf_pgo_2026-09-02.json)
+- [`real13_8229b3fc_pgo_2026-09-02.json`](real13_8229b3fc_pgo_2026-09-02.json)
+- [`hostile/head_clean_8229b3fc_pgo_2026-09-02.json`](hostile/head_clean_8229b3fc_pgo_2026-09-02.json)
 
 Both report `publishable:true`, `ALL_CORRECT=1`, the complete four-engine order,
 15 repetitions, 10,000 bootstrap samples, and empty failure and drift lists.
-The previous canonical pairs (`b65aa353`, 2026-09-02; `21288c1`, 2026-08-30)
-stay in this directory as prior series points.
+The previous canonical pairs (`c28781cf`, `b65aa353`, both 2026-09-02;
+`21288c1`, 2026-08-30) stay in this directory as prior series points. The later
+publishable `14770703` pair (2026-09-11) is recorded without a headline claim;
+the root README explains why.
 
 ### Explicit all-30 view
 
@@ -143,9 +145,10 @@ When one project-wide number is useful, the documented equal-row point is:
 G30 = exp((13 × ln(G13) + 17 × ln(G17)) / 30)
 ```
 
-For the `c28781cf` artifacts it is **0.728776× Node**, **0.602213× Bun**, and
-**0.469238× Deno**. The descriptive 95% intervals are respectively
-[0.716285, 0.735861], [0.597170, 0.607266], and [0.463940, 0.473858].
+For the `8229b3fc` artifacts it is **0.728× Node** [0.723, 0.730], **0.594×
+Bun** [0.591, 0.598], and **0.460× Deno** [0.458, 0.464], the descriptive 95%
+intervals the root README quotes. The earlier `c28781cf` pair gave 0.728776×
+Node, 0.602213× Bun and 0.469238× Deno.
 
 Each bootstrap replicate draws one shared repetition-index multiset for all 13
 normal rows and an independent shared multiset for all 17 hostile rows, then

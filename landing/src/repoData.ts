@@ -30,6 +30,9 @@ const obj = (v: unknown): Record<string, unknown> => typeof v === 'object' && v 
 const str = (v: unknown): string | undefined => typeof v === 'string' && v.length > 0 ? v.slice(0, 500) : undefined
 const count = (v: unknown): number | undefined => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined
 const date = (v: unknown): string | undefined => str(v) && Number.isFinite(Date.parse(v as string)) ? v as string : undefined
+// The source commit becomes part of a README link path, so only a full commit
+// SHA is accepted; anything else could redirect the link to another repository.
+const commitSha = (v: unknown): string | undefined => typeof v === 'string' && /^[a-f0-9]{40}$/.test(v) ? v : undefined
 
 export function repositoryUrl(value: unknown): string | undefined {
   try {
@@ -53,7 +56,7 @@ export function parseRepoStats(raw: unknown): RepoStats | null {
   const correctedValid = correctedPass !== undefined && correctedTotal !== undefined && correctedTotal > 0 && correctedPass <= correctedTotal
   return {
     generatedAt, stale: root.stale === true, cached: root.cached === true,
-    branch: str(source.branch) ?? 'main', sourceCommit: str(source.commit),
+    branch: str(source.branch) ?? 'main', sourceCommit: commitSha(source.commit),
     stars: count(repo.stars), forks: count(repo.forks), openIssues: count(repo.open_issues), license: str(repo.license),
     pushedAt: date(repo.pushed_at), version: str(root.version),
     releaseTag: str(release.tag), releaseUrl: repositoryUrl(release.url), releasePublishedAt: date(release.published_at), releases,
