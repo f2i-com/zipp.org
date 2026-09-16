@@ -27,7 +27,7 @@ members = [
 exclude = ["crates/zipp-sandbox", "crates/zipp-wasm", "crates/rustpython-parser-fork"]
 
 [workspace.package]
-version = "0.0.18"
+version = "0.0.19"
 edition = "2021"
 license = "Apache-2.0"
 

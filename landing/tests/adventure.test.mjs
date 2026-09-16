@@ -54,11 +54,14 @@ test('encounters exercise both outcomes and exhaustion ends longer journeys', ()
 test('the bundled engine is a labelled build of the release the site announces', () => {
   // The playground pair has `sync-playground.mjs --require-release` watching
   // it; this pair had nothing, and sat at v0.0.16 for two releases while the
-  // site said 0.0.18. A version bump without refreshing this engine now fails.
+  // site said 0.0.18. Both now answer to `zippEngineRelease`, the release the
+  // served engines are built from — not the version the site announces, which
+  // during a release window names assets that do not exist yet.
   const profile = JSON.parse(zippProfile())
   const site = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-  assert.equal(profile.version, site.version,
-    `public/wasm is engine v${profile.version} but the site is v${site.version}: refresh it from the release asset`)
+  const pinned = site.zippEngineRelease ?? site.version
+  assert.equal(profile.version, pinned,
+    `public/wasm is engine v${profile.version} but the pin is v${pinned}: refresh it from that release asset`)
   assert.match(profile.source?.sha ?? '', /^[0-9a-f]{40}$/,
     'public/wasm must be a LABELLED release build, not an unlabelled local one')
 })

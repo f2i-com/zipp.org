@@ -51,17 +51,22 @@ const manifest = JSON.parse(await readFile(path.join(runtime, 'manifest.json'), 
 for (const name of names) {
   if (hash(await readFile(path.join(runtime, name))) !== manifest.files[name]) throw Error(`Playground engine pair mismatch: ${name}`)
 }
-// The pair must be a labelled build of the release the site announces: an
-// unlabelled (`source.sha: null`) or older pair can carry bugs that release
-// already fixed. A warning by default; `--require-release` (for release
-// checks) makes it an error. Refresh from the release's Python build with
-// --refresh-engine (see HANDOFF.md).
+// The pair must be a labelled build of a PUBLISHED release: an unlabelled
+// (`source.sha: null`) or older pair can carry bugs that release already
+// fixed. `zippEngineRelease` names the release it is built from, which is NOT
+// the version the site announces — during a release window the site names a
+// version whose assets do not exist yet, and comparing against it deadlocked
+// the release on its own gate. Publishing a release therefore ends with one
+// commit that moves the pin and refreshes both pairs from the new assets
+// (`--refresh-engine`, see docs/releases/). A warning by default;
+// `--require-release` (the landing CI job) makes it an error.
 const site = JSON.parse(await readFile(path.join(root, 'landing/package.json'), 'utf8'))
+const pinned = site.zippEngineRelease ?? site.version
 const stale = []
-if (manifest.profile?.version !== site.version) stale.push(`engine ${manifest.profile?.version}, site ${site.version}`)
+if (manifest.profile?.version !== pinned) stale.push(`engine ${manifest.profile?.version}, pinned ${pinned}`)
 if (!/^[0-9a-f]{40}$/.test(manifest.profile?.source?.sha ?? '')) stale.push('no source commit (an unlabelled local build)')
 if (stale.length) {
-  const message = `Playground engine pair is not a labelled ${site.version} release build: ${stale.join('; ')}.`
+  const message = `Playground engine pair is not a labelled ${pinned} release build: ${stale.join('; ')}.`
   if (process.argv.includes('--require-release')) throw Error(message)
   console.warn(`warning: ${message}`)
 }
