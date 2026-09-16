@@ -4642,9 +4642,9 @@ pub(crate) extern "win64" fn jit_ic_base(vm: *mut core::ffi::c_void) -> *const c
 
 /// Win64 helper: the base pointer of `vm.globals`, fetched once by an OSR loop
 /// region's prologue and pinned in a callee-saved register for direct
-/// `LoadGlobal`/`StoreGlobal`. Sound because `globals` is allocated once at VM
-/// construction (`global_count + FIELD_POOL + EVAL_POOL` slots) and never
-/// reallocates at runtime.
+/// `LoadGlobal`/`StoreGlobal`. Sound because `globals` reserves its capacity
+/// once at VM construction (`global_count + FIELD_POOL + EVAL_POOL` slots) and
+/// never reallocates at runtime.
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm` that outlives the region run.
@@ -4748,17 +4748,9 @@ pub(crate) extern "win64" fn jit_math_two(code: u32, a_bits: u64, b_bits: u64) -
                 a.max(b)
             }
         }
-        // Hypot over exactly two args: a ±Inf operand forces +Inf even with a NaN
-        // partner (eval_math_args sets hypot_inf and returns +Inf). Otherwise the
-        // reduction is acc=0; acc += a*a; acc += b*b; then sqrt — i.e.
-        // sqrt(a*a + b*b), evaluated in that order.
-        M::Hypot => {
-            if a.is_infinite() || b.is_infinite() {
-                f64::INFINITY
-            } else {
-                (a * a + b * b).sqrt()
-            }
-        }
+        // Hypot over exactly two args: the same normalised reduction as
+        // eval_math_args (a ±Inf operand forces +Inf even with a NaN partner).
+        M::Hypot => crate::vm::helpers_num2::math_hypot(&[a, b]),
         // Unary ops never reach here (codegen routes argc==1 to jit_math_unary).
         _ => f64::NAN,
     };

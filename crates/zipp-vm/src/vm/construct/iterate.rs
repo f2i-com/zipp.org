@@ -732,6 +732,105 @@ impl<'p> Vm<'p> {
         Ok(it)
     }
 
+    /// Is %ArrayIteratorPrototype%.next still the pristine builtin? Every
+    /// positional walk of an array standing in for its default iterator
+    /// (for-of, spread, destructuring) is exact only while it is: a patched
+    /// `next` must be honoured through the real iterator protocol. (The
+    /// caller checks the `@@iterator` it read separately.)
+    pub(crate) fn array_iter_next_intact(&self) -> bool {
+        match self.heap.get(self.array_iter_proto) {
+            HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
+            _ => false,
+        }
+    }
+
+    /// May IterNext / spread walk the built-in iterable `v` (a string, Map,
+    /// Set or TypedArray) positionally in place of its iterator? Only while
+    /// `m` — the `@@iterator` GetIterator already read off `v`, own or
+    /// inherited — is its kind's pristine method and that kind's iterator
+    /// prototype still has its pristine `next`. A subclass or instance
+    /// override, a patched prototype, or a patched `next` must run through
+    /// the real protocol, as it does for arrays.
+    pub(crate) fn builtin_iter_pristine(&self, v: Value, m: Value) -> bool {
+        let (default, proto, next) = match self.heap.get(v.heap_index()) {
+            HeapObj::Str(_) | HeapObj::Cons { .. } => (
+                self.default_string_iter,
+                self.string_iter_proto,
+                self.default_string_iter_next,
+            ),
+            HeapObj::Map { .. } => (
+                self.default_map_iter,
+                self.map_iter_proto,
+                self.default_map_iter_next,
+            ),
+            HeapObj::Set(_) => (
+                self.default_set_iter,
+                self.set_iter_proto,
+                self.default_set_iter_next,
+            ),
+            HeapObj::TypedArray { .. } => (
+                self.default_ta_iter,
+                self.array_iter_proto,
+                self.default_array_iter_next,
+            ),
+            _ => return false,
+        };
+        m.bits() == default.bits()
+            && matches!(self.heap.get(proto), HeapObj::Object(p) if p.get("next") == Some(next))
+    }
+
+    /// Side-effect-free proof that an array, string, Map or Set whose
+    /// `@@iterator` has not been read may be walked positionally: when that
+    /// read can only land on its kind's prototype (a primitive string, or an
+    /// array/Map/Set with no own named properties and no recorded prototype —
+    /// the proof `jit_get_iterator` uses for arrays) and finds the pristine
+    /// method there as a DATA property, next to the pristine iterator `next`,
+    /// the read is unobservable and can be skipped: the full
+    /// `get_member_slow` walk would otherwise tax every for-of / spread /
+    /// destructuring start. `false` means "prove it through the real read",
+    /// not "patched".
+    #[inline]
+    pub(crate) fn builtin_iter_pristine_fast(&self, v: Value) -> bool {
+        let idx = v.heap_index();
+        let (proto, default, iter_proto, next) = match self.heap.get(idx) {
+            HeapObj::Str(_) | HeapObj::Cons { .. } => (
+                self.active_realm_proto(self.str_proto),
+                self.default_string_iter,
+                self.string_iter_proto,
+                self.default_string_iter_next,
+            ),
+            HeapObj::Array(_) | HeapObj::Map { .. } | HeapObj::Set(_)
+                if self.proto_of.contains_key(&idx) || self.arr_props.contains_key(&idx) =>
+            {
+                return false;
+            }
+            HeapObj::Array(_) => (
+                self.arr_proto,
+                self.default_array_iter,
+                self.array_iter_proto,
+                self.default_array_iter_next,
+            ),
+            HeapObj::Map { .. } => (
+                self.map_proto,
+                self.default_map_iter,
+                self.map_iter_proto,
+                self.default_map_iter_next,
+            ),
+            HeapObj::Set(_) => (
+                self.set_proto,
+                self.default_set_iter,
+                self.set_iter_proto,
+                self.default_set_iter_next,
+            ),
+            _ => return false,
+        };
+        matches!(self.heap.get(proto), HeapObj::Object(p)
+            if p.pos_tagged("@@iterator", self.iterator_key_tag).is_some_and(|i| {
+                !p.attr_at(i).accessor && p.val_at(i).bits() == default.bits()
+            }))
+            && matches!(self.heap.get(iter_proto), HeapObj::Object(p) if p.get("next") == Some(next))
+    }
+
     /// GetIterator(obj, sync): `method = GetMethod(obj, @@iterator)`, then
     /// `Call(method, obj)`. A missing / non-callable `@@iterator` is a TypeError
     /// HERE, not later — the callers used to precede this with a separate
@@ -766,15 +865,14 @@ impl<'p> Vm<'p> {
                 // array directly), but honour a replaced Array.prototype[@@iterator]
                 // by invoking it (so for-of uses the overridden iterator).
                 HeapObj::Array(_) => {
+                    if self.builtin_iter_pristine_fast(v) {
+                        return Ok(v);
+                    }
                     let m = self.get_prop(v, "@@iterator")?;
                     // The fast path also requires the PRISTINE
                     // %ArrayIteratorPrototype%.next — a patched next must be
                     // honoured by going through the real iterator protocol.
-                    let next_intact = match self.heap.get(self.array_iter_proto) {
-                        HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
-                        _ => false,
-                    };
-                    if m.bits() != self.default_array_iter.bits() || !next_intact {
+                    if m.bits() != self.default_array_iter.bits() || !self.array_iter_next_intact() {
                         if self.is_callable(m) {
                             return self.call_value(m, v, &[]);
                         }
@@ -788,15 +886,37 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(v);
                 }
-                // Kinds whose default iteration is driven positionally by IterNext,
-                // with no observable @@iterator get. (A replaced @@iterator on these
-                // is not honoured — unchanged, pre-existing behaviour.)
+                // Built-in iterables IterNext drives positionally — but only
+                // under their pristine @@iterator / iterator-prototype `next`
+                // (`builtin_iter_pristine`); a subclass, instance or prototype
+                // override runs through the real protocol, as for arrays.
                 HeapObj::Str(_)
                 | HeapObj::Cons { .. }
                 | HeapObj::TypedArray { .. }
                 | HeapObj::Map { .. }
-                | HeapObj::Set(_)
-                | HeapObj::Generator { .. }
+                | HeapObj::Set(_) => {
+                    if self.builtin_iter_pristine_fast(v) {
+                        return Ok(v);
+                    }
+                    let m = self.get_prop(v, "@@iterator")?;
+                    if self.builtin_iter_pristine(v, m) {
+                        return Ok(v);
+                    }
+                    if !self.is_callable(m) {
+                        return Err(Thrown(format!(
+                            "TypeError: {} is not iterable",
+                            self.display(v)
+                        )));
+                    }
+                    let it = self.call_value(m, v, &[])?;
+                    // GetIterator step 5: a non-object iterator is a TypeError.
+                    if !self.is_object_value(it) {
+                        return Err(Thrown("TypeError: iterator is not an object".into()));
+                    }
+                    return Ok(it);
+                }
+                // Iterators that are their own iterator: IterNext steps them.
+                HeapObj::Generator { .. }
                 | HeapObj::AsyncGenerator(_)
                 | HeapObj::Iterator { .. }
                 | HeapObj::IterHelper { .. } => return Ok(v),
@@ -943,30 +1063,66 @@ impl<'p> Vm<'p> {
             // shrunk resizable buffer). The positional fast path below must
             // surface the same TypeError instead of reading undefineds.
             HeapObj::TypedArray { .. } => {
-                if self.ta_effective_len(v.heap_index()).is_none() {
+                let it = self.get_prop(v, "@@iterator")?;
+                if !self.builtin_iter_pristine(v, it) {
+                    // A replaced @@iterator (subclass, instance, patched
+                    // prototype or `next`) runs through the protocol.
+                    if !self.is_callable(it) {
+                        return Err(Thrown(format!(
+                            "TypeError: {} is not iterable",
+                            self.display(v)
+                        )));
+                    }
+                    DestructureIter::Method(it)
+                } else if self.ta_effective_len(v.heap_index()).is_none() {
                     return Err(Thrown(
                         "TypeError: TypedArray is detached or out of bounds".into(),
                     ));
+                } else {
+                    DestructureIter::Positional
                 }
-                DestructureIter::Positional
+            }
+            // Strings, Maps and Sets: positional only under the pristine
+            // protocol (`builtin_iter_pristine`), as for arrays below.
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Map { .. } | HeapObj::Set(_) => {
+                if self.builtin_iter_pristine_fast(v) {
+                    DestructureIter::Positional
+                } else {
+                    let it = self.get_prop(v, "@@iterator")?;
+                    if self.builtin_iter_pristine(v, it) {
+                        DestructureIter::Positional
+                    } else if self.is_callable(it) {
+                        DestructureIter::Method(it)
+                    } else {
+                        return Err(Thrown(format!(
+                            "TypeError: {} is not iterable",
+                            self.display(v)
+                        )));
+                    }
+                }
             }
             // A plain array: fast-path the default iterator (direct indexing), but
             // honour a replaced Array.prototype[Symbol.iterator] by draining via
             // the iterator protocol (array destructuring uses it per spec).
             HeapObj::Array(_) => {
-                let it = self.get_prop(v, "@@iterator")?;
-                if it.bits() == self.default_array_iter.bits() {
-                    DestructureIter::Positional // the default iterator → direct indexing
-                } else if self.is_callable(it) {
-                    DestructureIter::Method(it) // call the already-observed replacement
+                if self.builtin_iter_pristine_fast(v) {
+                    DestructureIter::Positional
                 } else {
-                    // @@iterator was deleted or poisoned (undefined / non-callable):
-                    // GetIterator throws a TypeError rather than silently falling
-                    // back to positional indexing.
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not iterable",
-                        self.display(v)
-                    )));
+                    let it = self.get_prop(v, "@@iterator")?;
+                    if it.bits() == self.default_array_iter.bits() && self.array_iter_next_intact()
+                    {
+                        DestructureIter::Positional // the default iterator → direct indexing
+                    } else if self.is_callable(it) {
+                        DestructureIter::Method(it) // call the already-observed replacement
+                    } else {
+                        // @@iterator was deleted or poisoned (undefined / non-callable):
+                        // GetIterator throws a TypeError rather than silently falling
+                        // back to positional indexing.
+                        return Err(Thrown(format!(
+                            "TypeError: {} is not iterable",
+                            self.display(v)
+                        )));
+                    }
                 }
             }
             // An ITERATOR OBJECT is iterable through the protocol and nothing
@@ -1358,12 +1514,15 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
-        // The positional plans below hold values in Rust Vecs that are not GC
-        // roots — suspend GC for them. The two `next()` drains release the
-        // lock and root their working set instead (`drain_iterator_rooted`).
-        let gc = self.gc_lock_guard();
+        // The positional TypedArray plan below holds values in a Rust Vec that
+        // is not a GC root — suspend GC for it.
+        let _gc = self.gc_lock_guard();
         // A TypedArray iterates positionally over its elements.
         if let Some(ta) = self.as_typed_array(v) {
+            let m = self.get_prop(v, "@@iterator")?;
+            if !self.builtin_iter_pristine(v, m) {
+                return self.iterate_to_vec_via(v, m);
+            }
             let n = match self.heap.get(ta) {
                 HeapObj::TypedArray { length, .. } => *length,
                 _ => 0,
@@ -1372,6 +1531,35 @@ impl<'p> Vm<'p> {
             return Ok((0..n).map(|i| self.ta_element_get(ta, i)).collect());
         }
         let v = self.get_iterator(v)?;
+        self.drain_iterator_to_vec(v)
+    }
+
+    /// `iterate_to_vec` for a value whose `@@iterator` the caller has already
+    /// read as `m`: GetIterator's remaining steps (call it, require an object
+    /// back), then the drain — without a second, observable `@@iterator` read.
+    pub(crate) fn iterate_to_vec_via(&mut self, v: Value, m: Value) -> Result<Vec<Value>, Thrown> {
+        let _gc = self.gc_lock_guard();
+        if !self.is_callable(m) {
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
+        }
+        let it = self.call_value(m, v, &[])?;
+        if !self.is_object_value(it) {
+            return Err(Thrown("TypeError: iterator is not an object".into()));
+        }
+        self.drain_iterator_to_vec(it)
+    }
+
+    /// Drain what `get_iterator` produced for `iterate_to_vec` / `_via`: step
+    /// a generator or iterator object to completion, or walk a built-in
+    /// iterable `get_iterator` returned as its own (pristine) iterator.
+    fn drain_iterator_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        // The positional plans below hold values in Rust Vecs that are not GC
+        // roots — suspend GC for them. The two `next()` drains release the
+        // lock and root their working set instead (`drain_iterator_rooted`).
+        let gc = self.gc_lock_guard();
         // A generator is drained eagerly via repeated next() (spread / Array.from
         // produce a buffer; an infinite generator hangs here, matching V8).
         if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. }) {
@@ -1402,11 +1590,16 @@ impl<'p> Vm<'p> {
         }
         enum Plan {
             Vals(Vec<Value>),
-            Chars(Vec<char>),
+            /// A string's code points, as for-of steps them.
+            Chars(Vec<u32>),
             Pairs(Vec<(Value, Value)>),
             /// Deferred: materializing an array's elements can run a prototype
             /// getter for a hole, so it must happen outside the heap borrow.
             ArrayAt(u32),
+        }
+        if v.is_heap() {
+            // A rope's code points are read off its flattened WTF-8 bytes.
+            self.heap.flatten(v.heap_index());
         }
         let plan = if v.is_heap() {
             match self.heap.get(v.heap_index()) {
@@ -1415,9 +1608,9 @@ impl<'p> Vm<'p> {
                 HeapObj::Set(items) => {
                     Plan::Vals(items.iter().copied().filter(|v| !v.is_hole()).collect())
                 }
-                HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                    Plan::Chars(self.heap.str_cow(v.heap_index()).unwrap().chars().collect())
-                }
+                // A lone surrogate stays a 1-unit surrogate string (the lossy
+                // UTF-8 view made it U+FFFD).
+                HeapObj::Str(s) => Plan::Chars(s.code_points().collect()),
                 HeapObj::Map { keys, vals } => Plan::Pairs(
                     keys.iter()
                         .copied()
@@ -1441,10 +1634,7 @@ impl<'p> Vm<'p> {
         Ok(match plan {
             Plan::Vals(v) => v,
             Plan::ArrayAt(idx) => self.spread_array_elements(idx)?,
-            Plan::Chars(cs) => cs
-                .into_iter()
-                .map(|c| self.alloc_str(c.to_string()))
-                .collect(),
+            Plan::Chars(cs) => cs.into_iter().map(|cp| self.str_from_cp(cp)).collect(),
             Plan::Pairs(ps) => ps
                 .into_iter()
                 .map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))))

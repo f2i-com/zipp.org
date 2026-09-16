@@ -110,14 +110,54 @@ impl<'p> Vm<'p> {
         // MAX_FRAMES ever fires. Cap the nesting so it throws a catchable
         // RangeError (staging/sm/extensions/recursion.js) instead of crashing.
         if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
-            return Err(Thrown(
-                "RangeError: Maximum call stack size exceeded".into(),
-            ));
+            return Err(self.run_loop_depth_exceeded(stop_depth));
         }
         self.run_loop_depth += 1;
         let r = self.run_loop_body(stop_depth);
         self.run_loop_depth -= 1;
         r
+    }
+
+    /// The re-entry cap refused a nested `run_loop`. Every caller pushed the
+    /// frame(s) it wanted run BEFORE calling in, so leave the stack exactly as
+    /// an uncaught throw out of that loop would: a real RangeError in
+    /// `pending_throw`, and every frame above `stop_depth` popped with its
+    /// register window. Callers that swallow the error (the async driver
+    /// rejecting its promise, a Promise executor) otherwise kept running with
+    /// the refused frame still on top, so the caller's next `Return` popped
+    /// it instead of its own and re-dispatched its own frame from a stale ip
+    /// — the function body ran again, hit the cap again, forever. The refused
+    /// frames' own handlers are deliberately not consulted: nothing may run in
+    /// them at the cap (a resumed generator/async frame carries its handlers).
+    #[cold]
+    fn run_loop_depth_exceeded(&mut self, stop_depth: usize) -> Thrown {
+        const MSG: &str = "RangeError: Maximum call stack size exceeded";
+        while self.frames.len() > stop_depth {
+            let top = self.frames.len() - 1;
+            if self.frames[top].args_obj != u32::MAX {
+                let aidx = self.frames[top].args_obj;
+                self.args_sync_dense(aidx);
+            }
+            let f = self.frames.pop().unwrap();
+            self.regs.truncate(f.base);
+        }
+        // Created in the CALLER's context: the refused callee never ran.
+        let v = self.alloc_error_from_message(MSG);
+        self.realm_adopt_error(v);
+        self.pending_throw = Some(v);
+        Thrown(MSG.into())
+    }
+
+    /// CopyDataProperties (object rest) re-reads each snapshotted key's own
+    /// descriptor AT COPY TIME: a getter run for an earlier key may have
+    /// deleted a later one or made it non-enumerable, and such a key is
+    /// skipped. Only an ordinary object's ObjMap can change under the walk; a
+    /// string source's index keys are fixed.
+    fn rest_key_still_enumerable(&self, src: Value, key: &str) -> bool {
+        match self.heap.get(src.heap_index()) {
+            HeapObj::Object(map) => map.pos(key).is_some_and(|i| map.attr_at(i).enumerable),
+            _ => true,
+        }
     }
 
     fn run_loop_body(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
@@ -939,8 +979,14 @@ impl<'p> Vm<'p> {
                         // PutValue runs after the RHS, so an RHS exception must
                         // win (`seen = act()` where act() throws propagates the
                         // act() throw — staging/sm/Proxy/getPrototypeOf).
-                        if self.globals[idx as usize].is_uninitialized() {
-                            let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                        // An unnamed pool slot is a DECLARED module/realm
+                        // binding: the store itself raises its error.
+                        let name = if self.globals[idx as usize].is_uninitialized() {
+                            self.global_slot_name(idx)
+                        } else {
+                            None
+                        };
+                        if let Some(name) = name {
                             let own_backed = !self.global_name_is_lexical(&name)
                                 && self.global_this != 0
                                 && matches!(
@@ -977,7 +1023,9 @@ impl<'p> Vm<'p> {
                         // read-modify-write forms, whose Get already PROVED the
                         // reference resolvable, use StoreGlobalResolved instead.)
                         if self.globals[idx as usize].is_uninitialized() {
-                            let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                            let Some(name) = self.global_slot_name(idx) else {
+                                return Err(self.unnamed_global_slot_error(idx));
+                            };
                             // The reference IS resolvable when the name is a
                             // builtin global: undefined/NaN/Infinity are
                             // non-writable data props (strict write →
@@ -1076,7 +1124,9 @@ impl<'p> Vm<'p> {
                                 .rposition(|&i| i == idx)
                             {
                                 self.strict_unresolvable_globals.remove(p);
-                                let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                                let Some(name) = self.global_slot_name(idx) else {
+                                    return Err(self.unnamed_global_slot_error(idx));
+                                };
                                 return Err(Thrown(format!(
                                     "ReferenceError: {name} is not defined"
                                 )));
@@ -1090,7 +1140,9 @@ impl<'p> Vm<'p> {
                         // raises. Emitted only where the compiler put a
                         // load_binding of the SAME binding immediately before.
                         if self.globals[idx as usize].is_uninitialized() {
-                            let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                            let Some(name) = self.global_slot_name(idx) else {
+                                return Err(self.unnamed_global_slot_error(idx));
+                            };
                             // undefined/NaN/Infinity are non-writable data
                             // properties: a strict write is a TypeError.
                             if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
@@ -1311,9 +1363,15 @@ impl<'p> Vm<'p> {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
                         let r = if va.is_int() && vb.is_int() {
-                            match va.as_int().checked_mul(vb.as_int()) {
-                                Some(v) => Value::int(v),
-                                None => Value::num(va.as_int() as f64 * vb.as_int() as f64),
+                            // A ZERO product with a negative operand is -0 in JS
+                            // (`0 * -5`), which no Int encodes: like `Mod` below,
+                            // that case and overflow take the f64 product. One
+                            // operand is 0 whenever `v == 0`, so the sign of the
+                            // other is the sign of `ia | ib`.
+                            let (ia, ib) = (va.as_int(), vb.as_int());
+                            match ia.checked_mul(ib) {
+                                Some(v) if v != 0 || (ia | ib) >= 0 => Value::int(v),
+                                _ => Value::num(ia as f64 * ib as f64),
                             }
                         } else if va.is_number() && vb.is_number() {
                             Value::num(va.as_f64() * vb.as_f64())
@@ -1739,16 +1797,23 @@ impl<'p> Vm<'p> {
                             if vv.is_heap() {
                                 self.args_sync_dense(vv.heap_index());
                             }
-                            // An array whose Array.prototype[Symbol.iterator] was
-                            // replaced spreads via the iterator protocol (the inline
-                            // fast path below assumes the default iterator).
+                            // An array whose Array.prototype[Symbol.iterator] or
+                            // %ArrayIteratorPrototype%.next was replaced spreads via
+                            // the iterator protocol (the inline fast path below
+                            // assumes the default iterator), as for-of does.
                             if vv.is_heap()
                                 && matches!(self.heap.get(vv.heap_index()), HeapObj::Array(_))
+                                && !self.builtin_iter_pristine_fast(vv)
                             {
                                 let m = self.get_prop(vv, "@@iterator")?;
-                                if m.bits() != self.default_array_iter.bits() && self.is_callable(m)
+                                if m.bits() != self.default_array_iter.bits()
+                                    || !self.array_iter_next_intact()
                                 {
-                                    let elems = self.iterate_to_vec(vv)?;
+                                    // Call the method already read: a second
+                                    // @@iterator Get would be observable (and a
+                                    // deleted / non-callable one is GetIterator's
+                                    // TypeError, not a positional walk).
+                                    let elems = self.iterate_to_vec_via(vv, m)?;
                                     if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                         dst_items.extend(elems);
                                     }
@@ -1764,17 +1829,37 @@ impl<'p> Vm<'p> {
                             // instead left `[...new Proxy([1,2],{})]`,
                             // `[...new String("ab")]` and any object with a
                             // user-installed @@iterator reporting "not iterable".
-                            if vv.is_heap()
-                                && !matches!(
-                                    self.heap.get(vv.heap_index()),
-                                    HeapObj::Array(_)
-                                        | HeapObj::Set(_)
-                                        | HeapObj::Str(_)
-                                        | HeapObj::Cons { .. }
-                                        | HeapObj::Map { .. }
-                                )
-                            {
-                                let elems = self.iterate_to_vec(vv)?;
+                            // A Set / string / Map takes its inline path only under
+                            // its pristine protocol: a subclass, instance or
+                            // prototype @@iterator (or iterator `next`) override
+                            // is honoured, as for-of honours it.
+                            // `Some(Some(m))`: an overridden @@iterator `m`,
+                            // already read (called without a second Get);
+                            // `Some(None)`: the full protocol.
+                            let drain = if vv.is_heap() {
+                                match self.heap.get(vv.heap_index()) {
+                                    HeapObj::Array(_) => None,
+                                    HeapObj::Set(_)
+                                    | HeapObj::Str(_)
+                                    | HeapObj::Cons { .. }
+                                    | HeapObj::Map { .. } => {
+                                        if self.builtin_iter_pristine_fast(vv) {
+                                            None
+                                        } else {
+                                            let m = self.get_prop(vv, "@@iterator")?;
+                                            (!self.builtin_iter_pristine(vv, m)).then_some(Some(m))
+                                        }
+                                    }
+                                    _ => Some(None),
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(m) = drain {
+                                let elems = match m {
+                                    Some(m) => self.iterate_to_vec_via(vv, m)?,
+                                    None => self.iterate_to_vec(vv)?,
+                                };
                                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                     dst_items.extend(elems);
                                 }
@@ -1782,9 +1867,14 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                             // Materialize the spread source's elements (array/set â†’
-                            // elements; string â†’ chars; map â†’ [k,v] entries) WITHOUT
-                            // holding a heap borrow across the fresh allocations.
-                            let mut chars: Option<Vec<char>> = None;
+                            // elements; string â†’ code points; map â†’ [k,v] entries)
+                            // WITHOUT holding a heap borrow across the fresh
+                            // allocations. A rope is flattened first so its code
+                            // points can be read off the exact WTF-8 bytes.
+                            if vv.is_heap() {
+                                self.heap.flatten(vv.heap_index());
+                            }
+                            let mut chars: Option<Vec<u32>> = None;
                             let mut map_pairs: Option<Vec<(Value, Value)>> = None;
                             let mut array_src: Option<u32> = None;
                             if vv.is_heap() {
@@ -1805,14 +1895,12 @@ impl<'p> Vm<'p> {
                                             d.extend(elems);
                                         }
                                     }
-                                    HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                                        chars = Some(
-                                            self.heap
-                                                .str_cow(vv.heap_index())
-                                                .unwrap()
-                                                .chars()
-                                                .collect(),
-                                        );
+                                    // Code points as for-of steps them: a lone
+                                    // surrogate stays a 1-unit surrogate string
+                                    // (the lossy UTF-8 view made it U+FFFD).
+                                    HeapObj::Str(s) => chars = Some(s.code_points().collect()),
+                                    HeapObj::Cons { .. } => {
+                                        unreachable!("spread source flattened above")
                                     }
                                     HeapObj::Map { keys, vals } => {
                                         // Skip tombstoned (deleted) entries.
@@ -1842,10 +1930,8 @@ impl<'p> Vm<'p> {
                                 }
                             }
                             if let Some(chars) = chars {
-                                let elems: Vec<Value> = chars
-                                    .into_iter()
-                                    .map(|c| self.alloc_str(c.to_string()))
-                                    .collect();
+                                let elems: Vec<Value> =
+                                    chars.into_iter().map(|cp| self.str_from_cp(cp)).collect();
                                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                     dst_items.extend(elems);
                                 }
@@ -1868,7 +1954,20 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ArrayRest { dst, src, start } => {
                         let sv = self.get(base, src);
-                        let mut elems = self.iterate_to_vec(sv)?;
+                        // `src` is IterToArray's result: the destructured value
+                        // itself when positional reads match its iterator (an
+                        // array only under the pristine protocol), or a fresh
+                        // array of the values the protocol already produced.
+                        // Either way an ARRAY is sliced positionally: iterating a
+                        // drained array again ran a patched @@iterator / next a
+                        // second time over values it had already produced.
+                        let mut elems = if sv.is_heap()
+                            && matches!(self.heap.get(sv.heap_index()), HeapObj::Array(_))
+                        {
+                            self.spread_array_elements(sv.heap_index())?
+                        } else {
+                            self.iterate_to_vec(sv)?
+                        };
                         let start = (start as usize).min(elems.len());
                         let rest = elems.split_off(start);
                         let arr = Value::heap(self.heap.alloc(HeapObj::Array(rest)));
@@ -1938,6 +2037,9 @@ impl<'p> Vm<'p> {
                         };
                         let mut m = ObjMap::new();
                         for k in keys {
+                            if !self.rest_key_still_enumerable(s, &k) {
+                                continue;
+                            }
                             let v = self.get_prop(s, &k)?;
                             m.set(&k, v);
                         }
@@ -1995,6 +2097,9 @@ impl<'p> Vm<'p> {
                         };
                         let mut m = ObjMap::new();
                         for k in keys {
+                            if !self.rest_key_still_enumerable(s, &k) {
+                                continue;
+                            }
                             let v = self.get_prop(s, &k)?;
                             m.set(&k, v);
                         }
@@ -4144,28 +4249,20 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let nums: Vec<f64> = elems
-                            .iter()
-                            .map(|&v| self.to_number_strict(v))
-                            .collect::<Result<_, _>>()?;
+                        // The variadic ops reduce exactly like a direct call
+                        // (`eval_math_args`: -0 < +0 ordering, a ±Infinity
+                        // hypot argument beating NaN); f64::max/min leave the
+                        // sign of a zero tie unspecified.
                         let r = match op {
-                            M::Max => nums.iter().fold(f64::NEG_INFINITY, |a, &b| {
-                                if a.is_nan() || b.is_nan() {
-                                    f64::NAN
-                                } else {
-                                    a.max(b)
-                                }
-                            }),
-                            M::Min => nums.iter().fold(f64::INFINITY, |a, &b| {
-                                if a.is_nan() || b.is_nan() {
-                                    f64::NAN
-                                } else {
-                                    a.min(b)
-                                }
-                            }),
-                            M::Hypot => nums.iter().map(|&v| v * v).sum::<f64>().sqrt(),
+                            M::Max | M::Min | M::Hypot => self.eval_math_args(op, &elems)?,
                             // A non-variadic Math fn spread is unusual; apply to elem 0.
-                            _ => self.eval_math_one(op, nums.first().copied().unwrap_or(f64::NAN)),
+                            _ => {
+                                let nums: Vec<f64> = elems
+                                    .iter()
+                                    .map(|&v| self.to_number_strict(v))
+                                    .collect::<Result<_, _>>()?;
+                                self.eval_math_one(op, nums.first().copied().unwrap_or(f64::NAN))
+                            }
                         };
                         self.set(base, dst, Value::num(r));
                         ip += 1;
@@ -5526,9 +5623,10 @@ impl<'p> Vm<'p> {
                         // Spec order: ToString(spec); then a non-undefined non-object
                         // `opts` â†’ TypeError; `import.source` â†’ SyntaxError (source
                         // phase unavailable for a text module); otherwise resolve the
-                        // specifier against the script's dir, load + evaluate the
-                        // module ONCE (cached by path so re-import yields the SAME
-                        // namespace), and resolve with its (snapshot) namespace. A
+                        // specifier against the referrer's dir, load + evaluate the
+                        // module ONCE in a later job (cached by path so re-import
+                        // yields the SAME namespace), and resolve with its
+                        // (snapshot) namespace. A
                         // missing file / no base dir â†’ TypeError; a throw during
                         // ToString or evaluation rejects with that value. import()
                         // never throws synchronously. Everything that may GC runs
@@ -5574,7 +5672,10 @@ impl<'p> Vm<'p> {
                                     // proposal evaluates a deferred graph's
                                     // async modules EAGERLY, with the returned
                                     // promise waiting on them.
-                                    match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
+                                    match self
+                                        .dynamic_import_base_dir(func_id)
+                                        .map(|d| d.join(&spec_str))
+                                    {
                                         None => Err(self.make_error(1, None)),
                                         // A fresh Evaluate() for the eager
                                         // async subgraph: its own DFS stack
@@ -5620,25 +5721,32 @@ impl<'p> Vm<'p> {
                                                 .unwrap_or_else(|| self.error_from_thrown(&msg))),
                                         },
                                     }
-                                } else if !self.module_loading.is_empty() {
-                                    // A dynamic import issued WHILE a static
-                                    // module link DFS is in flight (a
-                                    // dependency body evaluating inside an
-                                    // ancestor's import loop) must NOT preempt
-                                    // the spec's DFS evaluation order
-                                    // (verify-dfs): defer the whole load to a
-                                    // microtask — by the time it runs, the DFS
-                                    // has completed (the target then usually
-                                    // sits in the cache already).
-                                    match self.module_base_dir.as_ref() {
+                                } else {
+                                    // ContinueDynamicImport links and evaluates
+                                    // in a LATER job: the target's body never
+                                    // runs inside the import() call, before the
+                                    // rest of the calling code or jobs queued
+                                    // ahead of it. The same deferral keeps an
+                                    // import issued while a static link DFS is
+                                    // in flight (a dependency body evaluating
+                                    // inside an ancestor's import loop) from
+                                    // preempting the DFS evaluation order
+                                    // (verify-dfs). The specifier resolves
+                                    // against the REFERRER now; the job gets
+                                    // the joined path.
+                                    match self
+                                        .dynamic_import_base_dir(func_id)
+                                        .map(|d| d.join(&spec_str))
+                                    {
                                         None => Err(self.make_error(1, None)),
-                                        Some(_) => {
+                                        Some(path) => {
                                             let p = self.alloc_promise();
                                             // Root the promise in dst across the
                                             // allocations below.
                                             self.set(base, dst, Value::heap(p));
                                             let _gc = self.gc_lock_guard();
-                                            let sv = self.alloc_str(spec_str.clone());
+                                            let sv = self
+                                                .alloc_str(path.to_string_lossy().into_owned());
                                             let mut bargs = vec![sv];
                                             if let Some(t) = &mtype {
                                                 let tv = self.alloc_str(t.clone());
@@ -5668,24 +5776,6 @@ impl<'p> Vm<'p> {
                                             deferred = true;
                                             Ok(Value::heap(p))
                                         }
-                                    }
-                                } else {
-                                    match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
-                                        None => Err(self.make_error(1, None)),
-                                        // import_module canonicalizes, caches, runs, and
-                                        // recursively links re-exports; the returned value
-                                        // IS the fully-linked namespace.
-                                        Some(p) => match self.import_module(&p, mtype.as_deref()) {
-                                            Ok(ns) => Ok(ns),
-                                            // A loader Thrown carries its error type in
-                                            // the message prefix ("SyntaxError: …") —
-                                            // reject with the MATCHING error object, not
-                                            // an empty TypeError.
-                                            Err(Thrown(msg)) => Err(self
-                                                .pending_throw
-                                                .take()
-                                                .unwrap_or_else(|| self.error_from_thrown(&msg))),
-                                        },
                                     }
                                 }
                             }
@@ -7461,7 +7551,11 @@ impl<'p> Vm<'p> {
                         } else {
                             self.display(k)
                         };
-                        if !numeric_key {
+                        // Only a PRIMITIVE key's display is its property key. An
+                        // object key (a String wrapper, anything with its own
+                        // toString / @@toPrimitive) is named by ToPropertyKey,
+                        // which runs user code — `get_index` below performs it.
+                        if !numeric_key && !self.is_object_value(k) {
                             if let Some(result) =
                                 self.try_builtin_method(recv, &kstr, base, arg_base, argc)?
                             {
@@ -10176,25 +10270,35 @@ impl<'p> Vm<'p> {
     /// note below). Shared with the bare `MathOp` miss path, whose `Math`
     /// read must be exactly a `LoadGlobal`.
     #[inline(never)]
+    /// The ReferenceError for touching an uninitialized pool slot that has no
+    /// script-visible global name: a module declaration in its TDZ, a
+    /// ShadowRealm name never declared, or loader bookkeeping. None of these
+    /// may fall back to the incubating realm's global object — with no name
+    /// to probe, those lookups used to run for the literal property "?".
+    #[cold]
+    pub(crate) fn unnamed_global_slot_error(&self, idx: u32) -> Thrown {
+        Thrown(match self.pool_slot_names.get(&idx) {
+            Some(crate::vm::PoolSlotName::Module(name)) => {
+                format!("ReferenceError: Cannot access '{name}' before initialization")
+            }
+            Some(crate::vm::PoolSlotName::Realm(name)) => {
+                format!("ReferenceError: {name} is not defined")
+            }
+            None => "ReferenceError: binding accessed before initialization".into(),
+        })
+    }
+
     pub(crate) fn load_global_slow(&mut self, idx: u32, func_id: u32) -> Result<Value, Thrown> {
         let v = self.globals[idx as usize];
         if v.is_uninitialized() {
             // Referenced but never declared â†’ ReferenceError. The
             // name is in `program.global_names`, or â€” for a slot an
             // `eval` drew from the EVAL_POOL â€” in `eval_global_map`.
-            let name = self
-                .program
-                .global_names
-                .get(idx as usize)
-                .map(|s| s.as_str())
-                .or_else(|| {
-                    self.eval_global_map
-                        .iter()
-                        .find(|(_, &v)| v == idx)
-                        .map(|(k, _)| k.as_str())
-                })
-                .unwrap_or("?")
-                .to_string();
+            // A module / realm pool slot has neither and never resolves
+            // through the global object.
+            let Some(name) = self.global_slot_name(idx) else {
+                return Err(self.unnamed_global_slot_error(idx));
+            };
             // A binding created on the global OBJECT in sloppy code
             // (`this.x = v` / `globalThis.x = v`) lives as an own
             // property there, not in this slot. The global object's

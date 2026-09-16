@@ -360,8 +360,19 @@ impl<'p> Vm<'p> {
         // through `jit_self_call` which is capacity-pinned (no regs realloc).
         let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
             unsafe { core::mem::transmute(entry) };
+        // The native entry is a Rust-stack re-entry exactly like a nested
+        // `run_loop`, but it never passes through one: a callback that recurses
+        // through the same array builtin (`function f(){ [1].forEach(f) }`, a
+        // `visit` over a cyclic graph) nested native frames with no budget until
+        // the OS stack overflowed and the process aborted. Charge it against the
+        // same re-entry cap so it throws the interpreter's catchable RangeError.
+        if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
         let mut bail: u32 = crate::codegen::NO_BAIL;
+        self.run_loop_depth += 1;
         let bits = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+        self.run_loop_depth -= 1;
         if bail == crate::codegen::NO_BAIL {
             return Ok(Value::from_bits(bits));
         }
@@ -531,20 +542,27 @@ fn fmt_precision(n: f64, p: usize) -> String {
     }
     let neg = n < 0.0;
     let a = n.abs();
-    // Round to p significant figures via exponential form, then read the exponent.
-    let exp_str = format!("{a:.*e}", p - 1);
-    let epos = exp_str.find('e').unwrap();
-    let exp: i32 = exp_str[epos + 1..].parse().unwrap_or(0);
+    // Round to p significant figures ONCE, then lay the same digits out in
+    // either form. Step 10 picks the LARGER candidate on an exact tie
+    // ((2.5).toPrecision(1) is "3", (1.25).toPrecision(2) is "1.3"); Rust's
+    // `{:.*e}` / `{:.N}` formatters round such ties to even, so both forms
+    // come from `round_exp_half_away` (which also carries 9.99 → 1.00e+1).
+    // Reparsing the digits into an f64 and reformatting would re-introduce a
+    // rounding error (1.2345e27 → 1.2344999…e27).
+    let (mant, exp) = round_exp_half_away(a, p - 1);
     let body = if exp < -6 || exp >= p as i32 {
-        // The mantissa substring is ALREADY rounded to p significant figures by
-        // the `{:.*e}` formatter — use it directly. Reparsing it into an f64 and
-        // reformatting re-introduces a rounding error (1.2345e27 → 1.2344999…e27).
-        let m = &exp_str[..epos];
         let sign = if exp < 0 { "-" } else { "+" };
-        format!("{m}e{sign}{}", exp.abs())
+        format!("{mant}e{sign}{}", exp.abs())
     } else {
-        let frac = (p as i32 - 1 - exp).max(0) as usize;
-        format!("{a:.frac$}")
+        let digits: String = mant.chars().filter(|&c| c != '.').collect();
+        if exp < 0 {
+            format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
+        } else if exp as usize + 1 == p {
+            digits
+        } else {
+            let int_len = exp as usize + 1;
+            format!("{}.{}", &digits[..int_len], &digits[int_len..])
+        }
     };
     if neg {
         format!("-{body}")

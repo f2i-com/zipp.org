@@ -123,13 +123,23 @@ impl<'p> Vm<'p> {
         // swallow the wrapper's own `) {` and slip past the combined parse
         // (invalid-parameter-list.js). Lexer-level messages carry no
         // "SyntaxError:" prefix — add it so the error classifies correctly.
-        crate::parse::stmt::parse_standalone_params(&params).map_err(|e| {
+        // (A RangeError — the nesting budget — keeps its own kind.)
+        let as_syntax_error = |e: crate::parse::parser::SyntaxError| {
             Thrown(if e.msg.starts_with("SyntaxError") || e.msg.starts_with("RangeError") {
                 e.msg
             } else {
                 format!("SyntaxError: {}", e.msg)
             })
-        })?;
+        };
+        crate::parse::stmt::parse_standalone_params(&params).map_err(as_syntax_error)?;
+        // …and the BODY on its own as a FunctionBody (step 18), under this
+        // constructor's [Yield]/[Await] parameters. A body that closes the
+        // wrapper early (`}); evil(); (function(){`) is a SyntaxError HERE, so
+        // nothing of it is ever compiled or run: assembling it would have made
+        // a three-statement Script that executes `evil()` during construction
+        // and returns a function of the body's choosing.
+        crate::parse::stmt::parse_standalone_body(&body, matches!(kind, 1 | 3), matches!(kind, 2 | 3))
+            .map_err(as_syntax_error)?;
         // The newline before `)` defends against a `//` comment in the last
         // parameter; the wrapper parens make the body a function EXPRESSION whose
         // value (the function) becomes the eval completion value.

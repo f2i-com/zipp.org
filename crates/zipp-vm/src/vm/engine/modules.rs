@@ -187,17 +187,7 @@ impl<'p> Vm<'p> {
     /// Allocate a fresh live global slot from the eval pool (UNINITIALIZED),
     /// for module-loader bookkeeping (canonical namespace/source binding slots).
     pub(crate) fn alloc_module_shared_slot(&mut self) -> Result<u32, Thrown> {
-        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
-        if self.eval_global_next >= cap {
-            return Err(Thrown(
-                "EvalError: too many distinct globals introduced by eval".into(),
-            ));
-        }
-        let s = self.eval_global_next;
-        self.eval_global_next += 1;
-        self.globals[s as usize] = Value::UNINITIALIZED;
-        self.bump_global_gen(s);
-        Ok(s)
+        self.alloc_global_pool_slot(Value::UNINITIALIZED, "module bindings")
     }
 
     /// The CANONICAL live slot of `canon`'s namespace binding, created on
@@ -287,6 +277,42 @@ impl<'p> Vm<'p> {
         self.with_fresh_dfs_segment(|vm| {
             vm.with_confined_module_depth(|vm| vm.import_module_inner(raw_path, mtype))
         })
+    }
+
+    /// The directory a dynamic `import()` / `import.defer()` specifier resolves
+    /// against: the REFERRER's, as static imports already do (`dir.join`).
+    /// Code of a loader-installed module is found by its function-id range;
+    /// main-program code is the entry script (the VM-wide base directory).
+    /// Code compiled at run time (`eval`, `new Function`) has neither, so the
+    /// nearest activation below it that does decides — the code that is
+    /// running it, which is the code that created it in every ordinary shape.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
+    pub(crate) fn dynamic_import_base_dir(&self, func_id: u32) -> Option<std::path::PathBuf> {
+        let owner = |fid: u32| -> Option<Option<u32>> {
+            if let Some(&(_, _, ns)) = self
+                .module_func_ranges
+                .iter()
+                .find(|&&(s, e, _)| fid >= s && fid < e)
+            {
+                Some(Some(ns))
+            } else if (fid as usize) < self.main_func_count {
+                Some(None)
+            } else {
+                None
+            }
+        };
+        let module = owner(func_id)
+            .or_else(|| self.frames.iter().rev().find_map(|f| owner(f.func)))
+            .flatten();
+        if let Some(ns) = module {
+            let ns = Value::heap(ns);
+            if let Some((path, _)) = self.module_cache.iter().find(|(_, v)| **v == ns) {
+                if let Some(dir) = path.parent() {
+                    return Some(dir.to_path_buf());
+                }
+            }
+        }
+        self.module_base_dir.clone()
     }
 
     /// `import_module` for a static request edge taken by the link in
@@ -400,7 +426,7 @@ impl<'p> Vm<'p> {
             // Keep the globals backing allocation immovable. Native code pins
             // its base for an activation and JIT property ways may point at a
             // live module slot, so even a cold typed-module import must draw
-            // from the preallocated eval pool rather than `Vec::push`.
+            // from the eval pool reserved at boot, never a reallocating push.
             let slot = self.alloc_module_shared_slot()?;
             self.globals[slot as usize] = val;
             self.bump_global_gen(slot);
@@ -559,7 +585,6 @@ impl<'p> Vm<'p> {
             .collect();
         let decl_set: std::collections::HashSet<u32> =
             prog.module_decl_globals.iter().copied().collect();
-        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
         let mut prealloc: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut own_pre: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         if !early_prepare {
@@ -573,15 +598,9 @@ impl<'p> Vm<'p> {
                         own_pre.insert(exported.clone(), live);
                         continue;
                     }
-                    if self.eval_global_next >= cap {
-                        return Err(Thrown(
-                            "EvalError: too many distinct globals introduced by eval".into(),
-                        ));
-                    }
-                    let live = self.eval_global_next;
-                    self.eval_global_next += 1;
-                    self.globals[live as usize] = Value::UNINITIALIZED;
-                    self.bump_global_gen(live);
+                    let live = self.alloc_global_pool_slot(Value::UNINITIALIZED, "module bindings")?;
+                    self.pool_slot_names
+                        .insert(live, crate::vm::PoolSlotName::Module(local.as_str().into()));
                     prealloc.insert(c, live);
                     own_pre.insert(exported.clone(), live);
                 }

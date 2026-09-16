@@ -94,7 +94,6 @@ impl<'p> Vm<'p> {
         } else {
             std::collections::HashSet::new()
         };
-        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
         let mut gmap: Vec<u32> = Vec::with_capacity(eval_prog.global_names.len());
         for (i, name) in eval_prog.global_names.iter().enumerate() {
             // A static-import LOCAL aliases the dependency's resolved live
@@ -110,15 +109,9 @@ impl<'p> Vm<'p> {
                     gmap.push(pre);
                     continue;
                 }
-                if self.eval_global_next >= cap {
-                    return Err(Thrown(
-                        "EvalError: too many distinct globals introduced by eval".into(),
-                    ));
-                }
-                let s = self.eval_global_next;
-                self.eval_global_next += 1;
-                self.globals[s as usize] = Value::UNINITIALIZED;
-                self.bump_global_gen(s);
+                let s = self.alloc_global_pool_slot(Value::UNINITIALIZED, "module bindings")?;
+                self.pool_slot_names
+                    .insert(s, crate::vm::PoolSlotName::Module(name.as_str().into()));
                 gmap.push(s);
             } else {
                 gmap.push(self.eval_global_slot(name)?);

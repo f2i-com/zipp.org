@@ -409,6 +409,13 @@ pub(crate) struct Recorder {
     /// `ticks` makes a separate off-loop counter unnecessary, and reusing this
     /// field avoids adding another hot-path load or another recorder field.
     pub(crate) used: u64,
+    /// `used + ticks` when the step ceiling was last set or renewed:
+    /// `steps_used` counts from here, so the host's figure means "under the
+    /// current budget" in this profile as it does in the release wasm meter
+    /// (which resets its counters on renewal), and
+    /// `steps_used() + steps_remaining() == max_steps` survives a renewal.
+    #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
+    steps_base: u64,
     /// Set by another thread to stop a running script.
     pub(crate) abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Approximate heap ceiling in bytes; `usize::MAX` means unlimited.
@@ -468,6 +475,12 @@ pub(crate) struct Recorder {
     /// Starts at the stride so the first poll reconciles, which is also what
     /// switches payload accounting on.
     ticks_since_heap_walk: u32,
+    /// `used` as of the last native entry's heap poll, rounded down to whole
+    /// polls. Compiled code never reaches the dispatch loop's tick stride, so
+    /// `Vm::meter_lend` advances the walk stride by the work done since —
+    /// one poll per `HEAP_AUDIT_MASK + 1` steps, the interpreter's cadence.
+    #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
+    used_at_heap_poll: u64,
     /// Retained growth in a VM-owned side table that is deliberately absent
     /// from `Heap::resident_bytes` (private fields/brands are the motivating
     /// case). The next interpreter poll or host-boundary postflight must run
@@ -487,6 +500,8 @@ impl Recorder {
             stop: i64::MAX - (HEAP_AUDIT_MASK as i64 + 1),
             finite: false,
             used: 0,
+            #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
+            steps_base: 0,
             abort: None,
             heap_limit: usize::MAX,
             output_limit: usize::MAX,
@@ -496,6 +511,8 @@ impl Recorder {
             postflight_since_audit: 0,
             preflight_bytes_since_audit: PREFLIGHT_AUDIT_BYTES,
             ticks_since_heap_walk: HEAP_WALK_STRIDE,
+            #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
+            used_at_heap_poll: 0,
             external_heap_dirty: false,
             heap_audit_non_heap: std::cell::Cell::new(0),
             dynamic_limits: DynamicCodeLimits::UNLIMITED,
@@ -548,6 +565,12 @@ impl Recorder {
             self.used = 0;
             self.stop = next_stop(self.remaining);
         }
+        // The lifetime counters keep running (the heap-poll cadence rides
+        // them); only the host-visible figure restarts with the new ceiling.
+        #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
+        {
+            self.steps_base = self.used.wrapping_add(self.ticks);
+        }
     }
 
     /// Total metered work. Ordinary and unlimited profiles combine disjoint
@@ -570,7 +593,7 @@ impl Recorder {
             return self.used.wrapping_add((i64::MAX - self.remaining).max(0) as u64);
         }
         #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
-        self.used.wrapping_add(self.ticks)
+        self.used.wrapping_add(self.ticks).saturating_sub(self.steps_base)
     }
 
     #[inline]
@@ -1265,13 +1288,28 @@ impl super::Vm<'_> {
         }
         // The heap ceiling needs checking here for the same reason: compiled
         // code never reaches `instrument_step`, so a native loop that allocates
-        // would run to the end of its lent chunk unexamined.
+        // would run to the end of its lent chunk unexamined. Escalate, then
+        // confirm, like the interpreter's poll: the O(heap slots) walk used to
+        // run on EVERY native entry, a tax proportional to the live heap on
+        // each interpreter-to-compiled call or loop entry. The O(1) estimate
+        // convicts fresh allocations at every entry; the walk that reconciles
+        // in-place growth rides the poll's stride, advanced by the native work
+        // done since the last entry (`used_at_heap_poll`) so compiled code is
+        // reconciled on the interpreter's per-step cadence. A heap whose
+        // payload accounting is still off takes one walk first (the cheap
+        // figure cannot see payloads until then).
         let ceiling = rec.heap_limit;
         if ceiling != usize::MAX {
-            if self.audit_heap_bytes() > ceiling {
-                if let Some(rec) = self.instr_rec.as_mut() {
-                    rec.exhaust(ResourceExhaustion::Heap);
-                }
+            // `used` falls back when an outer native run's unspent chunk is
+            // refunded; never count that as negative work.
+            rec.used_at_heap_poll = rec.used_at_heap_poll.min(rec.used);
+            let polls = (rec.used - rec.used_at_heap_poll) / (HEAP_AUDIT_MASK + 1);
+            rec.used_at_heap_poll += polls * (HEAP_AUDIT_MASK + 1);
+            let polls = u32::try_from(polls).unwrap_or(u32::MAX);
+            if !self.heap.payload_accounting_enabled() {
+                rec.external_heap_dirty = true;
+            }
+            if self.instrument_heap_poll_inner(polls).is_err() {
                 self.jit_steps = 0;
                 return 0;
             }
@@ -1597,13 +1635,13 @@ impl super::Vm<'_> {
     #[cold]
     #[inline(never)]
     pub(crate) fn instrument_heap_poll(&mut self) -> Tick {
-        self.instrument_heap_poll_inner(true)
+        self.instrument_heap_poll_inner(1)
     }
 
     /// The same reconciliation, driven by a collection rather than by the
     /// instruction stride.
     ///
-    /// `advance_walk_stride: false` is the whole difference, and it is what
+    /// Not advancing the walk stride is the whole difference, and it is what
     /// keeps this caller free. `ticks_since_heap_walk` schedules the O(heap
     /// slots) walk once per `heap_walk_stride_for` polls; it counts POLLS, and its
     /// budget was sized for polls that arrive every 65,536 instructions.
@@ -1621,12 +1659,12 @@ impl super::Vm<'_> {
     #[inline(never)]
     pub(crate) fn instrument_heap_poll_after_gc(&mut self) -> Tick {
         let force = !self.heap.payload_accounting_enabled();
-        self.instrument_heap_poll_inner(force)
+        self.instrument_heap_poll_inner(u32::from(force))
     }
 
     #[cold]
     #[inline(never)]
-    fn instrument_heap_poll_inner(&mut self, advance_walk_stride: bool) -> Tick {
+    fn instrument_heap_poll_inner(&mut self, advance_walk_stride: u32) -> Tick {
         let ceiling = match self.instr_rec.as_ref() {
             Some(rec) => rec.heap_limit,
             None => return Ok(()),
@@ -1668,8 +1706,9 @@ impl super::Vm<'_> {
         let walk_stride = heap_walk_stride_for(self.heap.len());
         let reconcile = match self.instr_rec.as_mut() {
             Some(rec) => {
-                let stride = if advance_walk_stride {
-                    rec.ticks_since_heap_walk = rec.ticks_since_heap_walk.saturating_add(1);
+                let stride = if advance_walk_stride != 0 {
+                    rec.ticks_since_heap_walk =
+                        rec.ticks_since_heap_walk.saturating_add(advance_walk_stride);
                     let due = rec.ticks_since_heap_walk >= walk_stride;
                     if due {
                         rec.ticks_since_heap_walk = 0;
@@ -1707,7 +1746,7 @@ impl super::Vm<'_> {
         if steps & 1023 != 0 {
             return Ok(());
         }
-        self.instrument_heap_poll_inner(false)
+        self.instrument_heap_poll_inner(0)
             .map_err(|message| super::Thrown(message.into()))
     }
 

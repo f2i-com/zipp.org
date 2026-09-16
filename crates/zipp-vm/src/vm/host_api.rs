@@ -500,6 +500,17 @@ fn retained_class_bytes(c: &crate::bytecode::ClassDef) -> usize {
 /// graph cannot exhaust the native stack (this walk is natively recursive).
 const MAX_DEPTH: usize = 64;
 
+/// A Symbol-keyed property lives under an engine-internal `"@@…"` key
+/// (`@@toStringTag`, `@@sym:N`), which is not data the object holds as far as
+/// a host is concerned — the guest's own `JSON.stringify` omits it. None of
+/// the boundary walks exports one, digests one or lets host data create one:
+/// a host string key of that form would otherwise alias a Symbol and install,
+/// say, an `@@iterator` or `@@toPrimitive` on a guest object, and a guest's
+/// Symbol-keyed capability would leave as a plain `"@@sym:1"` entry.
+fn host_invisible_key(key: &str) -> bool {
+    key.starts_with("@@")
+}
+
 /// Digest of a global that is absent or never initialised.
 const FP_ABSENT: u64 = 0x9e37_79b9_7f4a_7c15;
 /// FNV-1a's offset basis, XORed with a per-engine key before the walk.
@@ -1066,9 +1077,10 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) => Shape::Array { len: items.len() },
             HeapObj::Object(m) => Shape::Object {
                 keys: m.keys.len(),
-                // The same exclusion host_out makes: an accessor is never
+                // The same exclusions host_out makes: an accessor is never
                 // invoked, so it contributes nothing to the marshalled value
-                // and must contribute nothing to the digest either.
+                // and must contribute nothing to the digest either; nor does a
+                // Symbol-keyed property.
                 visible: (0..m.keys.len())
                     .filter(|&i| {
                         let a = m.attr_at(i);
@@ -1830,7 +1842,7 @@ impl<'p> Vm<'p> {
         //     a get-only property        ->  undefined
         for (i, (k, p, a)) in old_props.iter().enumerate() {
             let host_sent_it = sent[i];
-            let host_could_see_it = a.enumerable && !a.accessor;
+            let host_could_see_it = a.enumerable && !a.accessor && !host_invisible_key(k);
             if host_sent_it && host_could_see_it {
                 continue;
             }
@@ -1888,6 +1900,10 @@ impl<'p> Vm<'p> {
             HostValue::Object(pairs) => {
                 let mut m = ObjMap::with_capacity(pairs.len());
                 for (k, val) in pairs {
+                    // Host data never creates a Symbol-keyed property.
+                    if host_invisible_key(k) {
+                        continue;
+                    }
                     let v = self.host_in(val, depth + 1);
                     // A host name is a guest string key (`escape_guest_key`).
                     m.set(&escape_guest_key(k.clone()), v);

@@ -842,7 +842,16 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get_mut(str_proto) {
                 m.define("@@iterator", it, method_attr);
             }
+            self.default_string_iter = it;
         }
+        // The pristine iterator-prototype `next`s, as for arrays above.
+        let proto_next = |vm: &Self, proto: u32| match vm.heap.get(proto) {
+            HeapObj::Object(m) => m.get("next").unwrap_or(Value::UNDEFINED),
+            _ => Value::UNDEFINED,
+        };
+        self.default_map_iter_next = proto_next(self, self.map_iter_proto);
+        self.default_set_iter_next = proto_next(self, self.set_iter_proto);
+        self.default_string_iter_next = proto_next(self, self.string_iter_proto);
         // ── ES2025 Iterator Helpers ──
         // %Iterator.prototype% (the shared root holding the helper methods).
         let iter_root = build(
@@ -1070,11 +1079,13 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get_mut(map_proto) {
                 m.define("@@iterator", v, iter_attr);
             }
+            self.default_map_iter = v;
         }
         if let Some(v) = set_values {
             if let HeapObj::Object(m) = self.heap.get_mut(set_proto) {
                 m.define("@@iterator", v, iter_attr);
             }
+            self.default_set_iter = v;
         }
         // `Array.prototype[Symbol.iterator]` IS `Array.prototype.values` (same fn).
         let values_fn = match self.heap.get(self.arr_proto) {
@@ -1541,6 +1552,7 @@ impl<'p> Vm<'p> {
                         p.set_val_at(i, vf);
                     }
                 }
+                self.default_ta_iter = vf;
             }
             let arr_tostring = match self.heap.get(self.arr_proto) {
                 HeapObj::Object(p) => p.get("toString"),

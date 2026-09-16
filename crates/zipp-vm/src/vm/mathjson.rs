@@ -963,12 +963,13 @@ impl<'p> Vm<'p> {
                 for &v in args {
                     nums.push(self.to_number_strict(v)?);
                 }
+                if matches!(op, M::Hypot) {
+                    return Ok(crate::vm::helpers_num2::math_hypot(&nums));
+                }
                 let mut acc = match op {
                     M::Min => f64::INFINITY,
-                    M::Max => f64::NEG_INFINITY,
-                    _ => 0.0,
+                    _ => f64::NEG_INFINITY,
                 };
-                let mut hypot_inf = false;
                 for v in nums {
                     acc = match op {
                         // f64 min/max treat -0 and +0 as equal; spec orders -0 < +0,
@@ -986,7 +987,8 @@ impl<'p> Vm<'p> {
                                 acc.min(v)
                             }
                         }
-                        M::Max => {
+                        // Max (Hypot returned above).
+                        _ => {
                             if v.is_nan() || acc.is_nan() {
                                 f64::NAN
                             } else if v == acc {
@@ -999,25 +1001,9 @@ impl<'p> Vm<'p> {
                                 acc.max(v)
                             }
                         }
-                        _ => {
-                            // Math.hypot: a ±Infinity argument forces +Infinity even
-                            // when another argument is NaN (spec step 3).
-                            if v.is_infinite() {
-                                hypot_inf = true;
-                            }
-                            acc + v * v
-                        }
                     };
                 }
-                if matches!(op, M::Hypot) {
-                    if hypot_inf {
-                        f64::INFINITY
-                    } else {
-                        acc.sqrt()
-                    }
-                } else {
-                    acc
-                }
+                acc
             }
             // The two-arg ops coerce arg0 then arg1 (ToNumber, left-to-right).
             M::Pow => {

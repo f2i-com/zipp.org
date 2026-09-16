@@ -79,6 +79,42 @@ pub(crate) fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
     }
 }
 
+/// `Math.hypot` over already-numeric arguments. A ±Infinity argument forces
+/// +Infinity even beside a NaN (spec step 3); otherwise a NaN is NaN, and all
+/// zeros are +0. The sum of squares is taken over the magnitudes NORMALISED to
+/// the largest one, with Kahan compensation — the squares of 1e200 (or 1e-200)
+/// would overflow to Infinity (or underflow to 0) — which is V8's algorithm
+/// step for step, so results agree with it bit for bit.
+pub(crate) fn math_hypot(nums: &[f64]) -> f64 {
+    let mut max = 0.0f64;
+    let mut any_nan = false;
+    for &v in nums {
+        if v.is_nan() {
+            any_nan = true;
+        } else if v.abs() > max {
+            max = v.abs();
+        }
+    }
+    if max == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    if any_nan {
+        return f64::NAN;
+    }
+    if max == 0.0 {
+        return 0.0;
+    }
+    let (mut sum, mut compensation) = (0.0f64, 0.0f64);
+    for &v in nums {
+        let n = v.abs() / max;
+        let summand = n * n - compensation;
+        let preliminary = sum + summand;
+        compensation = (preliminary - sum) - summand;
+        sum = preliminary;
+    }
+    sum.sqrt() * max
+}
+
 /// `Math.acosh(x)`.
 ///
 /// Rust's `f64::acosh` is `ln(x + sqrt(x-1)*sqrt(x+1))`, whose argument is

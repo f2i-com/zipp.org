@@ -510,6 +510,7 @@ cover that way (string, regex, BigInt, array and nesting ceilings) come from
 | One `evalInContext` expression | 65,490 UTF-8 bytes (plus its fixed 46-byte host wrapper) |
 | Retained `evalInContext` wrapper source | 1,048,576 UTF-8 bytes total and 256 calls per engine |
 | All runtime compilation (`eval`, `Function`, `ShadowRealm`, and host eval) | 65,536 UTF-8 bytes per complete source, 16,777,216 retained source bytes and 16,384 attempts total; at most 16,384 retained function definitions and 1,024 retained class definitions |
+| Run-time global bindings | 1,024 slots per engine lifetime, shared by loaded ES modules' top-level declarations, global names first introduced by `eval`/`Function`, and ShadowRealm names; exhaustion throws a `RangeError` (native builds reserve 262,144) |
 | Source syntax/compile nesting | 48 active recursive parser entries, 16 links in one iterative operator/member grammar chain, and 32 structural AST levels before recursive compiler/capture walks |
 | VM execution | 50,000,000 bytecode instructions total by default, starting at guest top-level execution; a host may size the allowance through `setInstructionBudget`, before or after `initScript`, up to 2,000,000,000 |
 | Payload-aware VM heap high-water | 536,870,912 bytes |

@@ -1791,13 +1791,31 @@ pub(crate) fn compile_region_int_maybe_cold(
                     dynasm!(ops ; psllq Rx(d), shift as i8);
                 } else if plan.elide_guard.contains(&ip) {
                     // Result proven within ±2^53 ⇒ no i64 overflow possible and
-                    // no 2^53 guard needed; bare imul through the gprs.
+                    // no 2^53 guard needed; bare imul through the gprs. A ZERO
+                    // product with a negative operand is -0 in JS (`0 * -5`),
+                    // which has no i64 home: bail at THIS ip (dst unwritten) so
+                    // the interpreter makes the double. One operand is 0, so the
+                    // other's sign is the sign of `a | b` (rcx still holds b).
                     let (ax, bx) = (xh(&plan, a), xh(&plan, b));
+                    let zchk = ops.new_dynamic_label();
+                    let store = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
                     dynasm!(ops
                         ; movq rax, Rx(ax)
                         ; movq rcx, Rx(bx)
                         ; imul rax, rcx
+                        ; test rax, rax
+                        ; jz => zchk
+                        ; => store
                         ; movq Rx(d), rax
+                        ; jmp => done
+                        ; => zchk
+                        ; movq rdx, Rx(ax)
+                        ; or rdx, rcx
+                        ; jns => store
+                        ; mov DWORD [rsi], rip_at // resume at THIS op (dst unwritten)
+                        ; jmp => flush_exit
+                        ; => done
                     );
                 } else {
                     // i64 multiply via imul (gpr). On i64 OVERFLOW (product ≥ 2^63)
@@ -1805,16 +1823,27 @@ pub(crate) fn compile_region_int_maybe_cold(
                     // interpreter redoes it in f64 (reading the flushed operands). On a
                     // representable-but-large product the 2^53 guard handles it (like
                     // add): flush via cvtsi2sd (== JS's rounded product) + resume ip+1.
+                    // A zero product with a negative operand (-0) bails the same
+                    // way as overflow — see the guard-elided arm above.
                     let (ax, bx) = (xh(&plan, a), xh(&plan, b));
                     let ovf = ops.new_dynamic_label();
+                    let zchk = ops.new_dynamic_label();
+                    let store = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
                     dynasm!(ops
                         ; movq rax, Rx(ax)
                         ; movq rcx, Rx(bx)
                         ; imul rax, rcx
                         ; jo => ovf            // i64 overflow → can't represent; redo in interp
+                        ; test rax, rax
+                        ; jz => zchk
+                        ; => store
                         ; movq Rx(d), rax
                         ; jmp => done
+                        ; => zchk
+                        ; movq rdx, Rx(ax)
+                        ; or rdx, rcx
+                        ; jns => store
                         ; => ovf
                         ; mov DWORD [rsi], rip_at // resume at THIS op (dst not written)
                         ; jmp => flush_exit

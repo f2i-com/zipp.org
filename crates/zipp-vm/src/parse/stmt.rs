@@ -80,6 +80,36 @@ pub fn parse_standalone_params(src: &str) -> PResult<()> {
     Ok(())
 }
 
+/// Parse `src` as a STANDALONE FunctionBody, requiring the whole string to be
+/// consumed. CreateDynamicFunction step 18 parses the body STRING on its own
+/// (`Let body be ParseText(bodyString, bodyParseGoal)`) BEFORE assembling
+/// `(function anonymous(<params>\n) {\n<body>\n})`. Without it a body that
+/// closes the wrapper early — `}); evil(); (function(){` — turns the assembled
+/// source into a three-statement Script: `evil()` runs while the function is
+/// still being built, and the constructor hands back whichever function the
+/// body chose. The `try { new Function(src) } catch {}` syntax-check idiom must
+/// never execute anything.
+///
+/// `generator` / `is_async` are the [Yield] / [Await] grammar parameters of the
+/// four constructors (Function, GeneratorFunction, AsyncFunction,
+/// AsyncGeneratorFunction). [`Goal::FunctionBody`] additionally makes top-level
+/// `return` legal, and `new.target` — an ordinary function's, not a method's,
+/// so `super` stays a SyntaxError.
+pub fn parse_standalone_body(src: &str, generator: bool, is_async: bool) -> PResult<()> {
+    parse_exact(
+        src,
+        None,
+        ParseOptions {
+            goal: Goal::FunctionBody,
+            allow_yield_expr: generator,
+            allow_await_expr: is_async,
+            allow_new_target: true,
+            ..ParseOptions::default()
+        },
+    )
+    .map(|_| ())
+}
+
 impl<'s> Parser<'s> {
     pub(crate) fn parse_program(&mut self, goal: Goal) -> PResult<Program> {
         let (directives, strict) = self.directive_prologue()?;

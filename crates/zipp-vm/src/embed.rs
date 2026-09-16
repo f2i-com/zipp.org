@@ -978,9 +978,11 @@ impl ScriptState {
         (left as i64 + vm.jit_steps.max(0)).max(0) as u64
     }
 
-    /// Instructions actually executed since [`Self::set_limits`] attached the
-    /// recorder — the consumed half of [`Self::steps_remaining`], and 0 before
-    /// limits are set.
+    /// Instructions actually executed under the current step ceiling — since
+    /// [`Self::set_limits`] attached the recorder or [`Self::renew_step_budget`]
+    /// last replaced the ceiling — the consumed half of
+    /// [`Self::steps_remaining`], and 0 before limits are set. Native and
+    /// WebAssembly builds report the same figure.
     ///
     /// This is the figure a host bills on (blockchain gas metering): what the
     /// script DID, in the same unit `max_steps` caps, counted identically

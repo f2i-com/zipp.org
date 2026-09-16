@@ -700,6 +700,7 @@ impl Engine {
         // entering the parser. Source size is a compile-time resource, so the
         // VM's execution/heap recorder cannot protect this path for us.
         if source_len > MAX_INITIAL_SOURCE_BYTES {
+            self.note_error_kind("usage");
             self.terminate();
             return Err(JsValue::from_str(&format!(
                 "RangeError: initial script source exceeds the {MAX_INITIAL_SOURCE_BYTES}-byte limit"
@@ -1763,6 +1764,7 @@ impl Engine {
     fn ensure_host_configuration_open(&self) -> Result<(), JsValue> {
         self.ensure_live()?;
         if self.host_configuration_frozen {
+            self.note_error_kind("usage");
             Err(JsValue::from_str(
                 "zipp: host bridge configuration is immutable after initialization starts",
             ))
@@ -2030,16 +2032,23 @@ impl Engine {
         suffix: &str,
     ) -> Result<String, JsValue> {
         self.ensure_live()?;
+        // Every refusal below is host misuse or a host-side lifetime allowance
+        // ("usage"), classified where it is raised: `lastErrorKind()` must not
+        // report whatever the previous call left behind for a now-disposed
+        // engine.
         if self.state.is_none() {
+            self.note_error_kind("usage");
             return Err(JsValue::from_str("zipp: not initialized"));
         }
         if expr.len() > MAX_EVAL_SOURCE_BYTES {
+            self.note_error_kind("usage");
             self.terminate();
             return Err(JsValue::from_str(&format!(
                 "RangeError: {api} source exceeds the {MAX_EVAL_SOURCE_BYTES}-byte per-call limit"
             )));
         }
         if self.eval_calls >= MAX_EVAL_CALLS {
+            self.note_error_kind("usage");
             self.terminate();
             return Err(JsValue::from_str(&format!(
                 "RangeError: {api} exceeded its {MAX_EVAL_CALLS}-call lifetime limit"
@@ -2049,14 +2058,19 @@ impl Engine {
             .len()
             .checked_add(expr.len())
             .and_then(|n| n.checked_add(suffix.len()))
-            .ok_or_else(|| JsValue::from_str(&format!("RangeError: {api} source size overflow")))?;
+            .ok_or_else(|| {
+                self.note_error_kind("usage");
+                JsValue::from_str(&format!("RangeError: {api} source size overflow"))
+            })?;
         let retained = self
             .eval_retained_source_bytes
             .checked_add(wrapped_len)
             .ok_or_else(|| {
+                self.note_error_kind("usage");
                 JsValue::from_str(&format!("RangeError: {api} retained source size overflow"))
             })?;
         if retained > MAX_EVAL_RETAINED_SOURCE_BYTES {
+            self.note_error_kind("usage");
             self.terminate();
             return Err(JsValue::from_str(&format!(
                 "RangeError: {api} exceeded its {MAX_EVAL_RETAINED_SOURCE_BYTES}-byte retained-source lifetime limit"

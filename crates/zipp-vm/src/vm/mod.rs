@@ -88,13 +88,41 @@ const MAX_TAIL_REUSE_STREAK: u32 = 1_000_000;
 /// native run, never concurrent), so this caps fields-per-region, not total.
 const FIELD_POOL: usize = 64;
 
-/// Extra global slots reserved past the JIT field pool for globals *created or
-/// first referenced inside `eval`* (sloppy `x = 1`, `var x`, hoisted function
-/// declarations, and reads of builtins the main program never named). Sized once
-/// at startup so the globals Vec never reallocates at runtime (the JIT pins its
-/// base pointer); `eval` draws from this pool by name and throws once it is
-/// exhausted rather than growing the Vec.
+/// Extra global slots reserved past the JIT field pool for every binding created
+/// after compile time: globals *created or first referenced inside `eval`* /
+/// `new Function` (sloppy `x = 1`, `var x`, hoisted function declarations, reads
+/// of builtins the main program never named), ShadowRealm names, and EVERY
+/// top-level binding of a loader-loaded ES module (exported or not) plus its
+/// namespace/source bookkeeping slots.
+///
+/// The CAPACITY is reserved once at startup so `globals` (and `global_gens`)
+/// never reallocate at runtime — the JIT pins both base pointers — while the
+/// LENGTH grows as slots are handed out (`Vm::alloc_global_pool_slot`), so GC
+/// root scans and resident-byte accounting see only slots in use. Exhaustion
+/// throws rather than growing the Vec. Native builds reserve address space
+/// generously (one bundled module can declare thousands of top-level
+/// functions; a 1024-slot pool failed real module graphs outright); the
+/// hardened and wasm profiles, whose reservation is real committed memory,
+/// keep the small pool.
+///
+/// NOT LARGER than this without fixing eval-global rooting first: past about
+/// 21,000 pool slots a function declared by one `eval` is collected while its
+/// slot still names it (it reads back as a swept object), which turns the
+/// clean "too many global bindings" error into silent wrong results. The
+/// defect is older than the pool size — reproduced by raising this constant
+/// alone on the base commit — but only a large pool makes it reachable.
+#[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+const EVAL_POOL: usize = 1 << 14;
+#[cfg(any(feature = "safe-sandbox", target_arch = "wasm32"))]
 const EVAL_POOL: usize = 1024;
+
+/// What an unnamed run-time pool slot binds (see `Vm::pool_slot_names`).
+pub(crate) enum PoolSlotName {
+    /// A module-scope declaration: uninitialized means its TDZ.
+    Module(Box<str>),
+    /// A ShadowRealm / createRealm name: uninitialized means never declared.
+    Realm(Box<str>),
+}
 
 /// Sentinel `closure` value for a frame whose callee is a plain (capture-free)
 /// function rather than a closure. Real heap indices are always `< u32::MAX`.
@@ -1257,8 +1285,16 @@ pub struct Vm<'p> {
     /// compile-time `program.global_names`) to the EVAL_POOL slot it was assigned.
     /// Persists across `eval` calls so repeated evals see each other's globals.
     eval_global_map: std::collections::HashMap<String, u32>,
-    /// Next free EVAL_POOL slot. Starts at `global_count + FIELD_POOL`; bumped as
-    /// new eval globals are assigned, capped at `+ EVAL_POOL`.
+    /// Pool slots that deliberately have NO `eval_global_map` entry, by what
+    /// they bind: a loaded module's own declarations (per-module, so two
+    /// modules' same-named bindings never collide) and ShadowRealm names.
+    /// Consulted only when such a slot is read or written uninitialized, so
+    /// the error names the binding and no global-object fallback runs for a
+    /// name the incubating realm could shadow.
+    pool_slot_names: rustc_hash::FxHashMap<u32, PoolSlotName>,
+    /// Next free EVAL_POOL slot — always `globals.len()`. Starts at
+    /// `global_count + FIELD_POOL`; bumped as pool slots are handed out, capped
+    /// at `+ EVAL_POOL` (the reserved capacity).
     eval_global_next: u32,
     /// Every builtin global NAME → its heap value, recorded at setup regardless of
     /// whether the running program referenced it. Lets `eval`'d code resolve
@@ -1348,9 +1384,9 @@ pub struct Vm<'p> {
     heap: Heap,
     globals: Vec<Value>,
     /// Raw base of `globals`, loaded by Tier-C code through the live VM on
-    /// entry. The vector is allocated to its final FIELD_POOL + EVAL_POOL
-    /// extent at boot and never grows, so moving `Vm` does not invalidate the
-    /// allocation address. Kept explicit: emitted code must not depend on
+    /// entry. The vector's capacity is reserved to its final FIELD_POOL +
+    /// EVAL_POOL extent at boot and never exceeded, so neither growing its
+    /// length nor moving `Vm` invalidates the allocation address. Kept explicit: emitted code must not depend on
     /// Rust's private `Vec` field layout.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     globals_raw: u64,
@@ -1805,9 +1841,9 @@ pub struct Vm<'p> {
     /// (one 32-bit compare) instead of re-checking the callee bits+version per
     /// execution — sound only for slots NO bytecode store can ever hit (see
     /// `bytecode_stored_slots`), which makes the enumerated Rust writers
-    /// exhaustive. Sized with `globals` at boot and NEVER reallocated (the JIT
-    /// bakes element addresses); module bookkeeping draws from that same
-    /// preallocated pool.
+    /// exhaustive. Reserved with `globals` at boot, grown in lockstep with it
+    /// and NEVER reallocated (the JIT bakes element addresses); module
+    /// bookkeeping draws from that same preallocated pool.
     global_gens: Vec<u32>,
     /// Global slots ANY bytecode store op targets (StoreGlobal / -Strict /
     /// -Resolved / -Dyn / EvalScopeSet), collected over the main program at
@@ -2583,6 +2619,21 @@ pub struct Vm<'p> {
     default_array_iter: Value,
     /// The pristine %ArrayIteratorPrototype%.next (see default_array_iter).
     default_array_iter_next: Value,
+    /// The pristine `@@iterator` of the other kinds IterNext and spread walk
+    /// positionally (String.prototype / Map.prototype.entries /
+    /// Set.prototype.values / %TypedArray%.prototype.values) and the pristine
+    /// `next` of the String/Map/Set iterator prototypes (a TypedArray's
+    /// iterator is an Array Iterator). See `Vm::builtin_iter_pristine`.
+    default_string_iter: Value,
+    default_map_iter: Value,
+    default_set_iter: Value,
+    default_ta_iter: Value,
+    default_string_iter_next: Value,
+    default_map_iter_next: Value,
+    default_set_iter_next: Value,
+    /// The key-index tag of `"@@iterator"`, so `builtin_iter_pristine_fast`
+    /// probes a prototype without re-hashing the key at every iteration start.
+    iterator_key_tag: u32,
     /// The single canonical %ThrowTypeError% intrinsic — shared by
     /// Function.prototype.{caller,arguments} and a strict (unmapped) arguments
     /// object's `callee` poison-pill, so all references compare `===`.

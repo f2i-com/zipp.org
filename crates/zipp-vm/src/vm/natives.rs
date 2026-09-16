@@ -3646,11 +3646,10 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
-            // A dynamic import DEFERRED off a static module-link DFS (the
-            // ImportCall op queued this microtask): `this` is the import()
-            // promise, args = [specifier, type?]. Performs the load now and
-            // settles the promise exactly like the inline path (including
-            // chaining on a still-pending TLA body promise).
+            // The later job of a dynamic `import()` (the ImportCall op queued
+            // this microtask): `this` is the import() promise, args =
+            // [resolved path, type?]. Performs the load now and settles the
+            // promise (including chaining on a still-pending TLA body promise).
             #[cfg(not(feature = "wasm-no-fs-loader"))]
             MODULE_DYN_IMPORT => {
                 let p = this.heap_index();
@@ -3663,17 +3662,17 @@ impl<'p> Vm<'p> {
                     .copied()
                     .filter(|t| !t.is_undefined())
                     .map(|t| self.display(t));
-                let res: Result<Value, Value> =
-                    match self.module_base_dir.as_ref().map(|d| d.join(&spec)) {
-                        None => Err(self.make_error(1, None)),
-                        Some(path) => match self.import_module(&path, mtype.as_deref()) {
-                            Ok(ns) => Ok(ns),
-                            Err(Thrown(msg)) => Err(self
-                                .pending_throw
-                                .take()
-                                .unwrap_or_else(|| self.error_from_thrown(&msg))),
-                        },
-                    };
+                // The ImportCall op already resolved the specifier against
+                // its referrer (`dynamic_import_base_dir`): `spec` is the
+                // joined path, never re-resolved against the VM-wide base.
+                let path = std::path::PathBuf::from(spec);
+                let res: Result<Value, Value> = match self.import_module(&path, mtype.as_deref()) {
+                    Ok(ns) => Ok(ns),
+                    Err(Thrown(msg)) => Err(self
+                        .pending_throw
+                        .take()
+                        .unwrap_or_else(|| self.error_from_thrown(&msg))),
+                };
                 match res {
                     Ok(ns) => {
                         let body = self.pending_module_body.take();
