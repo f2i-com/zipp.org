@@ -52,7 +52,10 @@ frontends use the same engine, with native and WebAssembly builds.
   one graph. The `zipp_gpu` graph protocol (version 2) underneath also carries
   rank-4 broadcasting and batched matmul, so an MNIST-scale step written as a
   graph runs in one submission (7.8 ms on WebGPU, 3.9 ms on the WebAssembly
-  kernels, for 784-256-10 at batch 64).
+  kernels, for 784-256-10 at batch 64) - and as a prepared session, with the
+  weights and optimizer state resident on the device and eight steps per
+  submission, 0.79 ms per step (1.8 ms per step when driven from Python
+  through `compiled.prepare`).
 - **Keep the host in control.** Execution budgets and explicit host capabilities
   let embedders decide which resources a program can use.
 - **Explore one engine across languages.** An optional trusted-code build adds
@@ -402,7 +405,7 @@ statements, f-strings, the builtin types and a set of standard-library
 modules (`math`, `json`, `re`, `collections`, `itertools`, `functools`,
 `dataclasses`, `enum`, `contextlib`, `typing`, `struct`, `hashlib`, ...)
 all work; `async` does not yet. Semantics are checked
-differentially against CPython: the 93 programs of `tests/python_corpus/*.py`
+differentially against CPython: the 99 programs of `tests/python_corpus/*.py`
 must print exactly what CPython 3.13 prints, in the default, no-fast-path and
 no-JIT modes.
 
@@ -423,7 +426,12 @@ library also includes a `torch` subset (tensors over typed arrays with
 reverse-mode autograd, `nn`, `nn.functional`, `optim`, `save`/`load` in
 supported PyTorch checkpoint layouts) that runs on the engine's CPU kernels, so
 supported ML code can train and evaluate inside Zipp. Eager execution is CPU;
-`torch.compile` adds supported asynchronous GPU inference and dense-model training (SGD, momentum or Adam). The scope
+`torch.compile` records supported inference and training steps for the GPU
+(dense layers with relu, gelu, sigmoid or tanh, softmax, MSE or fused
+cross-entropy, SGD with momentum, Adam or AdamW), and `compiled.prepare()`
+keeps the weights and optimizer state on the device between steps (see
+[Train a small model on the browser GPU](#train-a-small-model-on-the-browser-gpu)).
+Natively, the same recorded graphs run on the engine's tensor kernels. The scope
 matrix, limits and the bytecode design are in
 [docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The
 feature is on by default in the CLI (`--no-default-features` builds the
@@ -432,10 +440,18 @@ WebAssembly package, which offers it as a
 [separate build variant](crates/zipp-wasm/README.md#build-variants-javascript-only-or-javascript-and-python).
 
 Python programs can also compute on the GPU in the browser: the bundled
-`zipp_gpu` library records a float32 graph (`+`, `*`, `@`, `relu`, `sum`,
-a Conway-life step) and `submit`s it, and the host runs it through WebGPU,
-WebGL2, compiled WebAssembly kernels or a JavaScript reference, calling the
-program back with the outputs; natively the same code evaluates on the CPU.
+`zipp_gpu` library records a float32 graph (broadcasting arithmetic, `@`,
+relu/gelu/sigmoid/tanh, softmax, reductions, fused cross-entropy, SGD and
+Adam update steps, a Conway-life step) and `submit`s it, and the host runs it
+through WebGPU, WebGL2, compiled WebAssembly kernels or a JavaScript
+reference, calling the program back with the outputs. `Graph.prepare` turns
+a graph into a session: inputs are fed per step, carried tensors such as
+weights and optimizer state stay on the device, and several steps go in one
+submission (0.79 ms per step on an RTX 5090 at eight steps per run, against
+3.6 ms for one step per submission). A run that fails after device work
+began poisons its session - only `dispose()` remains - rather than letting a
+retry run on state of no particular step. Natively the same code evaluates
+on the CPU, bit for bit the same as the reference.
 See [crates/zipp-wasm/README.md](crates/zipp-wasm/README.md#gpu-compute-for-python-programs).
 
 There is also a local [playground](crates/zipp-wasm/playground/README.md)
