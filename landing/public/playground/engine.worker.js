@@ -68,7 +68,11 @@ async function computeRuntime() {
     const creation = createRuntime({
       backend: gpu.backend,
       wasmUrl: new URL("../gpu-lab/wasm/kernels.wasm", import.meta.url),
-      limits: { maxNodes: 512, maxWork: 50_000_000 },
+      // The work budget comes from the backend (100M estimated operations on
+      // the JavaScript reference, more on SIMD WASM and the GPUs): enough for
+      // an MNIST-sized MLP training step (784-256-10, batch 64, ~58M) while a
+      // CPU graph still finishes well inside the page's frame deadline.
+      limits: { maxNodes: 512 },
     }).then((runtime) => {
       if (gpu.creating !== creation) {
         // The page picked another backend while this one was being created.
@@ -91,7 +95,7 @@ async function computeRuntime() {
 }
 // `createZippGPUHandler` only needs `execute`; creating the runtime lazily
 // keeps the adapter synchronous to create.
-const lazyRuntime = { async execute(program) { await gpu.retiring; return (await computeRuntime()).execute(program); } };
+const lazyRuntime = { async execute(program, options) { await gpu.retiring; return (await computeRuntime()).execute(program, options); } };
 
 function selectGpuBackend(backend) {
   const wanted = ["auto", "webgpu", "webgl2", "wasm", "cpu-js"].includes(backend) ? backend : "auto";
@@ -155,7 +159,9 @@ function disposeEngine() {
 }
 
 function live() {
-  return engine !== null && !engine.disposed;
+  // An engine whose own state is unusable (its getter throws) counts as
+  // disposed, so the error reply below is still posted.
+  try { return engine !== null && !engine.disposed; } catch { return false; }
 }
 
 // Every console line the program has produced since the last drain, in

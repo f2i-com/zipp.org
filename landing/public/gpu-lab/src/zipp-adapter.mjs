@@ -4,12 +4,13 @@ import {check, ComputeError} from './graph.mjs';
 export function createZippGPUHandler(runtime, {allowExecute=false}={}) {
   let active=true;
   return Object.freeze({
-    async handle(kind,args) {
+    // `options` reaches `runtime.execute` (`typedOutputs`).
+    async handle(kind,args,options={}) {
       check(active,'DISPOSED','GPU handler has been invalidated');
       check(allowExecute===true,'DENIED','GPU compute is not granted to this tenant');
       check(kind==='gpu.execute','DENIED','Unknown GPU operation');
       check(Array.isArray(args)&&args.length===1,'PROTOCOL','gpu.execute expects exactly one graph');
-      const result=await runtime.execute(args[0]);
+      const result=await runtime.execute(args[0],options);
       check(active,'CANCELLED','Tenant was invalidated while compute was in flight');
       return result;
     },

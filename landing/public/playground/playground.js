@@ -4,7 +4,14 @@
 // `update`, `on_click`, `on_key`).
 "use strict";
 
-const DEADLINE_MS = 5000;          // a reply later than this restarts the engine
+// A reply later than this restarts the engine. A `zipp_gpu` graph does not
+// delay the reply that produced it: the adapter chains execution on its queue,
+// so it runs after the worker has answered. It does occupy the worker before
+// the next frame, so the budget still has to be small against this deadline.
+// The graph validator bounds that work per backend, and the slowest of them
+// (the JavaScript reference, 100M estimated operations) measured ~27 ms for an
+// MNIST-scale MLP training step of 58M — so no extra frame-level GPU cap.
+const DEADLINE_MS = 5000;
 const INSTRUCTION_BUDGET = 2e9;    // the engine's maximum lifetime budget
 const STORAGE_KEY = "zipp-playground-project";
 const MAX_CONSOLE_LINES = 2000;
