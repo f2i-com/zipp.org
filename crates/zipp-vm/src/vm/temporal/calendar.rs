@@ -171,7 +171,6 @@ impl Cal {
 /// Unsupported-but-real ids (`islamic`, `islamic-rgsa`, …) return `None` and
 /// the caller reports them as unsupported, not as malformed.
 pub(crate) fn calendar_by_id(s: &str) -> Option<Cal> {
-    let s = s.trim();
     let lower = s.to_ascii_lowercase();
     Some(match lower.as_str() {
         "iso8601" => Cal::Iso,

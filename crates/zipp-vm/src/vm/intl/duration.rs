@@ -147,12 +147,12 @@ impl<'p> Vm<'p> {
             let n = match exact {
                 Some(s) => {
                     let sv = self.alloc_str(s);
-                    self.to_number_coerce(sv)?
+                    self.to_intl_mv(sv)?
                 }
-                None => value,
+                None => IntlMv::Num(value),
             };
             let mut run: Vec<(String, String, &'static str)> = self
-                .nf_parts(nf_resolved, n)?
+                .nf_parts(nf_resolved, &n)?
                 .into_iter()
                 .map(|(t, v)| (t, v, nf_unit))
                 .collect();

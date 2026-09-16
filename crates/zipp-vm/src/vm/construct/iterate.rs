@@ -1216,6 +1216,10 @@ impl<'p> Vm<'p> {
         }
         enum DestructureIter {
             Positional,
+            /// A Map's or Set's entries, read off the backing store: `map[0]`
+            /// is the property "0", not the first entry, so the positional
+            /// walk cannot stand in for the iterator here.
+            Collection,
             Existing,
             Method(Value),
         }
@@ -1267,7 +1271,14 @@ impl<'p> Vm<'p> {
                             "TypeError: TypedArray is detached or out of bounds".into(),
                         ));
                     }
-                    DestructureIter::Positional
+                    if matches!(
+                        self.heap.get(v.heap_index()),
+                        HeapObj::Map { .. } | HeapObj::Set(_)
+                    ) {
+                        DestructureIter::Collection
+                    } else {
+                        DestructureIter::Positional
+                    }
                 } else if self.is_callable(it) {
                     DestructureIter::Method(it) // call the already-observed method
                 } else {
@@ -1303,6 +1314,32 @@ impl<'p> Vm<'p> {
         let _gc = self.gc_lock_guard();
         let iter = match drain {
             DestructureIter::Positional => return Ok(v),
+            // The [key, value] pairs of a Map or the values of a Set, in
+            // insertion order with deleted slots skipped, at most `max` of them.
+            DestructureIter::Collection => {
+                // One pass over the backing store; a Map's fresh [key, value]
+                // pairs are allocated after it, outside the heap borrow.
+                let lim = max as usize;
+                let (mut out, pairs): (Vec<Value>, Vec<(Value, Value)>) =
+                    match self.heap.get(v.heap_index()) {
+                        HeapObj::Set(items) => {
+                            let live = items.iter().copied().filter(|x| !x.is_hole());
+                            (live.take(lim).collect(), Vec::new())
+                        }
+                        HeapObj::Map { keys, vals } => {
+                            let live = keys.iter().copied().zip(vals.iter().copied());
+                            let live = live.filter(|(k, _)| !k.is_hole());
+                            (Vec::new(), live.take(lim).collect())
+                        }
+                        _ => (Vec::new(), Vec::new()),
+                    };
+                self.instrument_drain_heap_check(out.len())?;
+                for (k, val) in pairs {
+                    out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![k, val]))));
+                    self.instrument_drain_heap_check(out.len())?;
+                }
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+            }
             DestructureIter::Existing => v,
             // GetIterator reads @@iterator once and calls that captured method.
             // Re-reading it here is observable when it is an accessor and can

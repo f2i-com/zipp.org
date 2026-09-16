@@ -355,7 +355,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn validate_calendar_identifier(&mut self, cv: Value) -> Result<Cal, Thrown> {
         if cv.is_heap() && self.heap.is_str_like(cv.heap_index()) {
             let s = self.heap.str_cow(cv.heap_index()).unwrap().into_owned();
-            return calendar_by_id(s.trim()).ok_or_else(|| {
+            return calendar_by_id(&s).ok_or_else(|| {
                 Thrown(format!(
                     "RangeError: \"{s}\" is not a valid calendar identifier"
                 ))

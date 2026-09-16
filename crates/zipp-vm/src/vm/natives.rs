@@ -95,56 +95,6 @@ impl GroupByWalk {
 }
 
 impl<'p> Vm<'p> {
-    /// ResolvePlural for the English plural rules (the locale data this engine
-    /// ships): the CLDR operands come from `n` as FORMATTED with the rules'
-    /// digit options — so `maximumFractionDigits: 0` makes 1.2 "one" and
-    /// `minimumFractionDigits: 1` makes 1 "other" — of its absolute value.
-    /// Cardinal: `one` iff i = 1 and v = 0. Ordinal: n % 10 = 1/2/3 (and
-    /// n % 100 not 11/12/13) → one/two/few. Compact and scientific notation
-    /// take the operands from the unrounded value, as ICU reports the full
-    /// magnitude there (1000 → "1K" is `other`).
-    fn plural_category_en(&mut self, resolved: u32, n: f64) -> Result<&'static str, Thrown> {
-        if !n.is_finite() {
-            return Ok("other");
-        }
-        let ordinal = self.display(self.intl_slot(resolved, "type")) == "ordinal";
-        let standard = self.display(self.intl_slot(resolved, "notation")) == "standard";
-        let text = if standard {
-            self.intl_number_format_str(resolved, n.abs())?
-        } else {
-            // Shortest round-trip form; Rust never uses exponent notation here.
-            format!("{}", n.abs())
-        };
-        let digits: String = text
-            .chars()
-            .filter(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        let (int_part, frac_part) = digits.split_once('.').unwrap_or((&digits, ""));
-        let int_part = int_part.trim_start_matches('0');
-        let v = frac_part.len();
-        if !ordinal {
-            return Ok(if int_part == "1" && v == 0 {
-                "one"
-            } else {
-                "other"
-            });
-        }
-        if frac_part.bytes().any(|b| b != b'0') {
-            return Ok("other"); // n % 10 of a non-integer is never 1, 2 or 3
-        }
-        let b = int_part.as_bytes();
-        let m100 = match b.len() {
-            0 => 0,
-            1 => (b[0] - b'0') as u32,
-            k => ((b[k - 2] - b'0') * 10 + (b[k - 1] - b'0')) as u32,
-        };
-        Ok(match (m100 % 10, m100) {
-            (1, m) if m != 11 => "one",
-            (2, m) if m != 12 => "two",
-            (3, m) if m != 13 => "few",
-            _ => "other",
-        })
-    }
 
     /// IteratorToList with a PRE-FETCHED @@iterator method (the observable
     /// trace: no second @@iterator get; `next` fetched once and cached; per
@@ -332,8 +282,7 @@ impl<'p> Vm<'p> {
                 final_len = ki + 1;
             }
             self.array_apply_length(aidx, final_len);
-            // A blocked shrink applies the partial truncation and reports
-            // FALSE (ArraySetLength step 17.b.iii).
+            // ArraySetLength step 17.b.iii: a blocked shrink is partial AND false.
             return Ok(blocked.is_none());
         }
         // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
@@ -501,23 +450,15 @@ impl<'p> Vm<'p> {
                     }) {
                         Some((true, _, setter)) => setter != Value::UNDEFINED,
                         Some((_, w, _)) => w,
-                        None => match (canonical_index_str(&key), self.heap.get(h)) {
-                            // An Array element: a present one is writable unless
-                            // the array is frozen; an absent one (a hole or past
-                            // the end) is a NEW property, which a non-extensible
-                            // array — or a non-writable `length` it would grow —
-                            // rejects.
-                            (Some(i), HeapObj::Array(items)) => {
-                                if items.get(i).is_some_and(|v| !v.is_hole()) {
-                                    !side.is_some_and(|m| m.frozen)
-                                } else {
-                                    side.map_or(true, |m| m.extensible)
-                                        && !(self.array_length_nonwritable.contains(&h)
-                                            && i >= self.js_array_len(h))
-                                }
-                            }
-                            (Some(_), _) => true,
-                            (None, _) => side.map_or(true, |m| m.extensible),
+                        // A dense array element has no attributes of its own, so
+                        // its writability is the array's integrity level — the
+                        // same predicate the assignment path uses. Reporting a
+                        // flat `true` made `Reflect.set` on a frozen element, a
+                        // sealed hole or a non-extensible new index answer `true`
+                        // for a write it then dropped.
+                        None => match canonical_index_str(&key) {
+                            Some(i) => !self.array_index_write_rejected(h, i),
+                            None => side.map_or(true, |m| m.extensible),
                         },
                     }
                 }
@@ -6599,10 +6540,10 @@ impl<'p> Vm<'p> {
             }
             INTL_NF_FORMAT_TO_PARTS => {
                 let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "formatToParts")?;
-                // ToIntlMathematicalValue-like coercion observes an object's
-                // valueOf/@@toPrimitive and intentionally accepts BigInt.
-                let n = self.to_number_coerce(a0)?;
-                let parts = self.nf_parts(resolved, n)?;
+                // ToIntlMathematicalValue observes an object's
+                // valueOf/@@toPrimitive and keeps a BigInt/string exact.
+                let n = self.to_intl_mv(a0)?;
+                let parts = self.nf_parts(resolved, &n)?;
                 let parts: Vec<(String, String, &str)> =
                     parts.into_iter().map(|(t, v)| (t, v, "")).collect();
                 self.intl_parts_array(&parts)
@@ -6619,12 +6560,12 @@ impl<'p> Vm<'p> {
                 if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
                     return Err(Thrown(format!("TypeError: {name} requires two values")));
                 }
-                let x = self.to_number_coerce(a0)?;
-                let y = self.to_number_coerce(a1)?;
+                let x = self.to_intl_mv(a0)?;
+                let y = self.to_intl_mv(a1)?;
                 if x.is_nan() || y.is_nan() {
                     return Err(Thrown(format!("RangeError: {name} values must not be NaN")));
                 }
-                let parts = self.nf_range_parts(resolved, x, y)?;
+                let parts = self.nf_range_parts(resolved, &x, &y)?;
                 if id == INTL_NF_FORMAT_RANGE {
                     let s: String = parts.iter().map(|(_, v, _)| v.as_str()).collect();
                     self.alloc_str(s)
@@ -6726,7 +6667,7 @@ impl<'p> Vm<'p> {
             INTL_PLURAL_SELECT => {
                 let resolved = self.intl_this(this, INTL_PLURALRULES, "select")?;
                 let n = self.to_number_strict(a0)?;
-                let cat = self.plural_category_en(resolved, n)?;
+                let cat = self.intl_plural_category(resolved, n);
                 self.alloc_str(cat.to_string())
             }
             INTL_PLURAL_SELECT_RANGE => {

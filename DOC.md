@@ -86,6 +86,15 @@ DateTimeFormat uses generated CLDR 48 data for `en`/`en-US`, `de`/`de-DE`,
 488/488 executions without skips. Other Intl services currently ship English
 locale data only; this is not a claim of complete ECMA-402 conformance.
 
+One limitation there is about missing Unicode data rather than missing locales,
+so it shows up even in English: `Intl.Segmenter` does not ship the UAX #29
+`Grapheme_Cluster_Break` / `Word_Break` / `Sentence_Break` tables. Its
+`grapheme` granularity therefore splits Hangul jamo sequences, regional-
+indicator (flag) pairs and ZWJ/skin-tone emoji sequences into several segments,
+and `sentence` returns the whole string as one segment.
+`crates/zipp-vm/src/vm/segmenter.rs` states exactly which UAX #29 rules are and
+are not implemented.
+
 Errored module cycles, repeat dynamic import of those cycles, deferred-module
 top-level-await ordering, module-source path handling, and cross-realm
 `Array.from` / `TypedArray.from` behavior are fixed; older descriptions of those

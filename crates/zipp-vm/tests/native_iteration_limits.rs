@@ -191,16 +191,20 @@ fn proxy_own_keys_set_validation_preserves_semantics() {
 }
 
 #[test]
-fn temporal_calendar_totals_obey_the_native_work_budget() {
-    // `total` brackets a calendar unit by stepping from the anchor; the walk
-    // is bounded by MAX_TEMPORAL_CALENDAR_ITERATIONS. Months keep the far end
-    // of a walk that long inside Temporal's representable range, so the loop
-    // bound is what fires rather than a date-range error.
-    assert_catchable_range_error(
-        r#"new Temporal.Duration(0, @OVER_CALENDAR_STEPS@).total({
-            unit: "month",
-            relativeTo: new Temporal.PlainDate(-100000, 1, 1)
-        })"#,
+fn temporal_calendar_totals_do_not_walk_unit_by_unit() {
+    // `total` brackets a calendar unit from the anchor. It used to step there
+    // one unit at a time, bounded by MAX_TEMPORAL_CALENDAR_ITERATIONS, so this
+    // spec-valid total (the far end stays inside the representable range)
+    // threw. The walk now starts from the closed-form calendar difference and
+    // corrects by a step or two, so it answers without approaching the bound.
+    assert_eq!(
+        run_ok(&sized(
+            r#"console.log(new Temporal.Duration(0, @OVER_CALENDAR_STEPS@).total({
+                unit: "month",
+                relativeTo: new Temporal.PlainDate(-100000, 1, 1)
+            }) === @OVER_CALENDAR_STEPS@);"#,
+        )),
+        ["true"]
     );
 }
 

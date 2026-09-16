@@ -8081,10 +8081,12 @@ impl<'p> Vm<'p> {
                                         None => self.iter_result(Value::UNDEFINED, true),
                                     }
                                 } else {
-                                    let len = match self.heap.get(it.heap_index()) {
-                                        HeapObj::Array(items) => items.len(),
-                                        HeapObj::Set(items) => items.len(),
-                                        HeapObj::Map { keys, .. } => keys.len(),
+                                    // `coll`: a Map/Set step reads its entry positionally
+                                    // (`collection_entry_at`); an Array is an ordinary index.
+                                    let (len, coll) = match self.heap.get(it.heap_index()) {
+                                        HeapObj::Array(items) => (items.len(), false),
+                                        HeapObj::Set(items) => (items.len(), true),
+                                        HeapObj::Map { keys, .. } => (keys.len(), true),
                                         _ => {
                                             return Err(Thrown(format!(
                                                 "TypeError: {} is not iterable",
@@ -8093,7 +8095,11 @@ impl<'p> Vm<'p> {
                                         }
                                     };
                                     if cursor < len {
-                                        let val = self.get_index(it, Value::int(cursor as i32))?;
+                                        let val = if coll {
+                                            self.collection_entry_at(it, cursor)
+                                        } else {
+                                            self.get_index(it, Value::int(cursor as i32))?
+                                        };
                                         self.set(base, idx, Value::int((cursor + 1) as i32));
                                         self.iter_result(val, false)
                                     } else {
@@ -8609,20 +8615,22 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let len = match self.heap.get(it.heap_index()) {
+                        // `coll`: a Map/Set step reads its entry positionally
+                        // (`collection_entry_at`); everything else is an ordinary index.
+                        let (len, coll) = match self.heap.get(it.heap_index()) {
                             // The JS length: past the dense store for a
                             // virtual array (the fast path above declined it).
-                            HeapObj::Array(_) => self.js_array_len(it.heap_index()),
-                            HeapObj::Set(items) => items.len(),
-                            HeapObj::Str(s) => s.units(),
-                            HeapObj::Cons { len, .. } => *len,
-                            HeapObj::Map { keys, .. } => keys.len(),
+                            HeapObj::Array(_) => (self.js_array_len(it.heap_index()), false),
+                            HeapObj::Set(items) => (items.len(), true),
+                            HeapObj::Str(s) => (s.units(), false),
+                            HeapObj::Cons { len, .. } => (*len, false),
+                            HeapObj::Map { keys, .. } => (keys.len(), true),
                             // The LIVE length each step: a tracking view follows its
                             // resizable buffer (shrink ends early, grow yields more);
                             // a detached/out-of-bounds view mid-iteration throws.
                             HeapObj::TypedArray { .. } => {
                                 match self.ta_effective_len(it.heap_index()) {
-                                    Some(n) => n,
+                                    Some(n) => (n, false),
                                     None => {
                                         return Err(Thrown(
                                             "TypeError: TypedArray iterator: the viewed buffer is detached or out of bounds".into(),
@@ -8638,9 +8646,11 @@ impl<'p> Vm<'p> {
                             }
                         };
                         if cursor < len {
-                            // `len_value`, not `Value::int`: a virtual array's
-                            // cursor can pass 2^31.
-                            let val = self.get_index(it, len_value(cursor))?;
+                            let val = if coll {
+                                self.collection_entry_at(it, cursor)
+                            } else {
+                                self.get_index(it, Value::int(cursor as i32))?
+                            };
                             self.set(base, value_dst, val);
                             self.set(base, done_dst, Value::bool(false));
                             self.set(base, idx, len_value(cursor + 1));
@@ -8720,10 +8730,12 @@ impl<'p> Vm<'p> {
                                         None => self.iter_result(Value::UNDEFINED, true),
                                     }
                                 } else {
-                                    let len = match self.heap.get(it.heap_index()) {
-                                        HeapObj::Array(items) => items.len(),
-                                        HeapObj::Set(items) => items.len(),
-                                        HeapObj::Map { keys, .. } => keys.len(),
+                                    // `coll`: a Map/Set step reads its entry positionally
+                                    // (`collection_entry_at`); an Array is an ordinary index.
+                                    let (len, coll) = match self.heap.get(it.heap_index()) {
+                                        HeapObj::Array(items) => (items.len(), false),
+                                        HeapObj::Set(items) => (items.len(), true),
+                                        HeapObj::Map { keys, .. } => (keys.len(), true),
                                         _ => {
                                             return Err(Thrown(format!(
                                                 "TypeError: {} is not iterable",
@@ -8732,7 +8744,11 @@ impl<'p> Vm<'p> {
                                         }
                                     };
                                     if cursor < len {
-                                        let val = self.get_index(it, Value::int(cursor as i32))?;
+                                        let val = if coll {
+                                            self.collection_entry_at(it, cursor)
+                                        } else {
+                                            self.get_index(it, Value::int(cursor as i32))?
+                                        };
                                         self.set(base, idx, Value::int((cursor + 1) as i32));
                                         self.iter_result(val, false)
                                     } else {

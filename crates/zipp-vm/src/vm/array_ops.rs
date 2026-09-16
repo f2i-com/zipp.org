@@ -2715,16 +2715,25 @@ impl<'p> Vm<'p> {
                 self.array_like_copy_within(this, args)
             };
         }
-        // (The explicit `frozen` flag, not the vacuous `is_frozen()`: a merely
-        // non-extensible array's empty side table has no attrs to disprove it,
-        // yet its `length` stays writable and its elements deletable.)
-        if matches!(name, "push" | "pop" | "shift" | "unshift" | "splice")
-            && (self.arr_props.get(&idx).map_or(false, |m| m.frozen)
-                || self.array_length_nonwritable.contains(&idx))
-        {
-            return Err(Thrown(
-                "TypeError: Cannot assign to read only property 'length' of object '[object Array]'".into(),
-            ));
+        // The explicit `frozen` flag, not `is_frozen()`: that one is vacuously true
+        // for a merely non-extensible array (its side table holds no attributes),
+        // so `Object.preventExtensions(a); a.pop()` threw where node returns the
+        // element. A sealed or non-extensible array keeps a writable `length`, but
+        // its deletes (sealed) and new indices (both) can fail midway, so it takes
+        // the spec-step path, which throws exactly where the spec does.
+        if matches!(name, "push" | "pop" | "shift" | "unshift" | "splice") {
+            let (frozen, constrained) = self
+                .arr_props
+                .get(&idx)
+                .map_or((false, false), |m| (m.frozen, m.sealed || !m.extensible));
+            if frozen || self.array_length_nonwritable.contains(&idx) {
+                return Err(Thrown(
+                    "TypeError: Cannot assign to read only property 'length' of object '[object Array]'".into(),
+                ));
+            }
+            if constrained {
+                return self.array_like_mutate(Value::heap(idx), name, args);
+            }
         }
         // A push onto a sealed or non-extensible array Sets a NEW index, which
         // must be rejected: the generic protocol performs (and fails) that Set.

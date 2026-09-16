@@ -637,10 +637,14 @@ impl<'p> Vm<'p> {
             if let Some(i) = canonical_u32_key(key) {
                 let i = i as usize;
                 // A sealed/frozen array's existing elements are non-configurable,
-                // so a present element can't be deleted (an out-of-range index or
-                // a hole is not an own property and deletes vacuously).
-                let in_bounds = matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len() && !items[i].is_hole());
-                if in_bounds
+                // so a present index can't be deleted (an out-of-range index or a
+                // HOLE is not an own property and deletes vacuously; an override
+                // on a hole placeholder is judged by its own attributes below).
+                let present = matches!(
+                    self.heap.get(idx),
+                    HeapObj::Array(items) if i < items.len() && !items[i].is_hole()
+                );
+                if present
                     && self
                         .arr_props
                         .get(&idx)
@@ -1831,20 +1835,20 @@ impl<'p> Vm<'p> {
                         self.heap.bump_version(idx);
                         return Ok(true);
                     }
-                    // A NEW index (past the current length, or a hole) on a
-                    // non-extensible array adds an own property → rejected (sloppy
-                    // no-op / strict TypeError). A present element stays writable.
-                    let present = matches!(self.heap.get(idx), HeapObj::Array(items) if n < items.len() && !items[n].is_hole());
-                    // Extending past the current length grows `length`; a non-writable
-                    // `length` (defineProperty / freeze) rejects that — Array
-                    // [[DefineOwnProperty]]: index >= oldLen && length non-writable →
-                    // false. (An index below a sparse array's VIRTUAL length doesn't
-                    // grow it.)
-                    if !present
-                        && (self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
-                            || (self.array_length_nonwritable.contains(&idx)
-                                && n >= self.js_array_len(idx)))
-                    {
+                    // The integrity level, through the SAME predicate the
+                    // numeric-key `set_index` path uses: a frozen element is
+                    // non-writable, and a new index (past the length, or a HOLE)
+                    // on a non-extensible array — or past a non-writable
+                    // `length` — adds an own property [[DefineOwnProperty]]
+                    // refuses. This branch used to omit the FROZEN case, which
+                    // only a STRING-keyed write reaches, so
+                    // `Object.assign(Object.freeze([1,2]), {0:5})` and
+                    // `new Proxy(frozen, {})["0"] = 5` overwrote the element.
+                    let present = matches!(
+                        self.heap.get(idx),
+                        HeapObj::Array(items) if n < items.len() && !items[n].is_hole()
+                    );
+                    if self.array_index_write_rejected(idx, n) {
                         return self.reject_write(key, strict);
                     }
                     // Past the eager-materialization cap AND the dense prefix:
@@ -2180,6 +2184,9 @@ impl<'p> Vm<'p> {
         val: Value,
         receiver: Value,
     ) -> Result<ProtoSet, Thrown> {
+        // Parsed ONCE: the walk below consults it at every chain node, and
+        // `canonical_index_str` allocates on a key that does parse.
+        let key_index = canonical_index_str(key);
         for _ in 0..1000 {
             if !cur.is_heap() {
                 return Ok(ProtoSet::DataWrite);
@@ -2215,6 +2222,26 @@ impl<'p> Vm<'p> {
                 } else {
                     ProtoSet::Absorbed
                 });
+            }
+            // An ARRAY chain node's dense element is an own data property too,
+            // but it lives in the backing Vec rather than an ObjMap, so the
+            // probe below never saw it. Its writability is the array's integrity
+            // level: a FROZEN element rejects the write instead of being
+            // shadowed (`Object.create(Object.freeze([1,2]))[0] = 9`). An index
+            // carrying a `defineProperty` override keeps the pre-existing
+            // fall-through — its attributes are not consulted here.
+            if let Some(i) = key_index {
+                let present = matches!(
+                    self.heap.get(cidx),
+                    HeapObj::Array(items) if i < items.len() && !items[i].is_hole()
+                );
+                if present && self.array_index_override(cidx, i).is_none() {
+                    return Ok(if self.array_index_write_rejected(cidx, i) {
+                        ProtoSet::NonWritable
+                    } else {
+                        ProtoSet::DataWrite
+                    });
+                }
             }
             let own = match self.heap.get(cidx) {
                 HeapObj::Object(m) => m.pos(key).map(|i| m.attr_at(i)),

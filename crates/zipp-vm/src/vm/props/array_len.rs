@@ -86,6 +86,35 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Whether Array `[[DefineOwnProperty]]` rejects a plain data write of index
+    /// `i` on the array at `arr_idx` — the integrity-level half of `set_index`,
+    /// shared so `OrdinarySet`'s boolean and the assignment path cannot drift
+    /// (`Reflect.set` used to answer `true` for a write it correctly dropped).
+    ///
+    /// * FROZEN — every element is non-writable, so any index is rejected.
+    /// * Non-extensible (sealed, frozen or `preventExtensions`) — an ABSENT
+    ///   index (past the length, or a hole below it) would add an own property.
+    /// * Non-writable `length` — an index at or past it would grow `length`.
+    ///
+    /// `false` for anything that is not a real array, and for an index carrying
+    /// a `defineProperty` override (its own attributes govern, upstream).
+    pub(crate) fn array_index_write_rejected(&self, arr_idx: u32, i: usize) -> bool {
+        let HeapObj::Array(items) = self.heap.get(arr_idx) else {
+            return false;
+        };
+        let present = i < items.len() && !items[i].is_hole();
+        let m = self.arr_props.get(&arr_idx);
+        if m.is_some_and(|m| m.frozen) {
+            return true;
+        }
+        !present
+            && (m.is_some_and(|m| !m.extensible)
+                // Growing the JS length needs a writable `length`; an index below
+                // a sparse array's VIRTUAL length doesn't grow it.
+                || (self.array_length_nonwritable.contains(&arr_idx)
+                    && i >= self.js_array_len(arr_idx)))
+    }
+
     /// ArraySetLength truncation blocker: the highest NON-configurable own array
     /// index `>= new_len` (it survives the shrink and the final length becomes
     /// blocker + 1). A defineProperty'd override in `arr_props` can be

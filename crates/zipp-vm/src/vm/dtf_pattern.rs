@@ -232,12 +232,23 @@ fn glue_index(date_pattern: &str) -> usize {
 /// A count change WITHIN a class is free (`M` → `MMMM`), and so is a letter
 /// change within the zone class. The one thing that is not rewritten is a field
 /// the request does not name — those stay as the locale wrote them.
-fn adjust_widths(pattern: &str, req: &Request) -> String {
+///
+/// `skeleton` is the `availableFormats`/`intervalFormats` key `pattern` was
+/// matched under ("" when the pattern was built from the request itself).
+fn adjust_widths(pattern: &str, skeleton: &str, req: &Request) -> String {
     let want: Vec<(u8, char, usize)> = req
         .fields
         .iter()
         .filter_map(|(c, n)| class_of(*c).map(|k| (k, *c, *n)))
         .collect();
+    // Whether the skeleton names a TEXT month. ICU's `adjustFieldTypes` leaves a
+    // month alone when the pattern's kind differs from its skeleton's: that is
+    // the locale choosing a numeric month for a text request. `ja` writes
+    // `yMMMM` as `y年M月`, and widening its `M` would print "2024年3月月".
+    let skel_month_text = pattern_fields(skeleton)
+        .iter()
+        .find(|(k, ..)| *k == 3)
+        .map(|(_, _, n)| *n >= 3);
     let mut out = String::new();
     for item in parse_pattern(pattern) {
         match item {
@@ -270,9 +281,14 @@ fn adjust_widths(pattern: &str, req: &Request) -> String {
                             3 => n <= 2 && *wn <= 2, // month has both forms
                             _ => true,
                         };
+                        let locale_month_kind =
+                            k == 3 && skel_month_text.is_some_and(|text| text != (n >= 3));
                         // Preserve calendar year kinds and standalone months;
                         // other letters follow the requested hour cycle or zone style.
-                        let count = if matches!(c, 'r' | 'U') || (k == 3 && n >= 3 && *wn <= 2) {
+                        let count = if matches!(c, 'r' | 'U')
+                            || (k == 3 && n >= 3 && *wn <= 2)
+                            || locale_month_kind
+                        {
                             n
                         } else if numeric {
                             (*wn).max(n)
@@ -336,18 +352,18 @@ fn distance(cand: &str, want: &[(u8, char, usize)]) -> Option<u32> {
 }
 
 /// The best CLDR pattern for one half of a request (all date fields, or all
-/// time fields).
+/// time fields), with the skeleton it was matched under ("" when none was).
 fn best_half(
     data: &DateTimeLocale,
     patterns: &CalendarPatterns,
     want: &[(u8, char, usize)],
     hour12: bool,
-) -> Option<String> {
+) -> Option<(String, &'static str)> {
     if want.is_empty() {
         return None;
     }
-    let mut best: Option<(u32, &str)> = None;
-    for (sk, pat) in patterns.available_formats {
+    let mut best: Option<(u32, &'static str, &'static str)> = None;
+    for &(sk, pat) in patterns.available_formats {
         // `availableFormats` carries an `h…`/`H…` twin of every time pattern;
         // only the one matching the resolved hour cycle is a candidate.
         let f = pattern_fields(sk);
@@ -361,19 +377,19 @@ fn best_half(
             continue;
         }
         if let Some(dist) = distance(sk, want) {
-            if best.is_none_or(|(b, _)| dist < b) {
-                best = Some((dist, pat));
+            if best.is_none_or(|(b, ..)| dist < b) {
+                best = Some((dist, sk, pat));
             }
         }
     }
     // No candidate at all (a `dayPeriod`- or `timeZoneName`-only request: CLDR
     // has no skeleton that small). The request IS then the pattern — the fields
     // in canonical order, which is what `appendItems` would build up to anyway.
-    let Some((dist, pat)) = best else {
+    let Some((dist, sk, pat)) = best else {
         let mut w = want.to_vec();
         w.sort_by_key(|(k, ..)| *k);
         let s: Vec<String> = w.iter().map(|(_, c, n)| c.to_string().repeat(*n)).collect();
-        return Some(s.join(" "));
+        return Some((s.join(" "), ""));
     };
     let mut out = pat.to_string();
     // Fields the winner lacks are attached with CLDR's `appendItems` glue, in
@@ -401,7 +417,7 @@ fn best_half(
                 .replace("{2}", &format!("'{}'", name.replace('\'', "''")));
         }
     }
-    Some(out)
+    Some((out, sk))
 }
 
 /// `best_pattern` without the join: the date pattern, the time pattern, and the
@@ -422,17 +438,25 @@ pub(crate) fn best_pattern_halves(
         .copied()
         .filter(|(k, ..)| is_date_class(*k))
         .collect();
-    let time: Vec<_> = all
+    let mut time: Vec<_> = all
         .iter()
         .copied()
         .filter(|(k, ..)| !is_date_class(*k) && *k != 11)
         .collect();
     let frac = all.iter().find(|(k, ..)| *k == 11).copied();
+    // ICU's `DateTimeMatcher::set` (ICU-20739): a minute plus a fraction with no
+    // second gets a second, or the fraction would hang off the minute or the
+    // day period ("07:13 AM045" for "07:13:09.045 AM").
+    if frac.is_some() && time.iter().any(|(k, ..)| *k == 9) && !time.iter().any(|(k, ..)| *k == 10)
+    {
+        time.push((10, 's', 1));
+    }
     let dp = best_half(data, patterns, &date, hour12)
-        .map(|p| adjust_widths(&p, req))
+        .map(|(p, sk)| adjust_widths(&p, sk, req))
         .unwrap_or_default();
     let tp = best_half(data, patterns, &time, hour12)
-        .map(|p| adjust_widths(&p, req))
+        .map(|(p, sk)| adjust_widths(&p, sk, req))
+        .or_else(|| frac.map(|_| String::new()))
         .map(|p| match frac {
             Some((_, c, n)) => splice_fraction(data, &p, c, n),
             None => p,
@@ -558,7 +582,7 @@ pub(crate) fn interval_pattern(
     };
     let req = &req;
     let gk = class_of(greatest)?;
-    let mut best: Option<(u32, &str)> = None;
+    let mut best: Option<(u32, &str, &str)> = None;
     for (sk, gd, pat) in patterns.interval_formats {
         if class_of(gd.chars().next()?) != Some(gk) {
             continue;
@@ -570,23 +594,22 @@ pub(crate) fn interval_pattern(
             continue;
         }
         if let Some(dist) = distance(sk, &want) {
-            if best.is_none_or(|(b, _)| dist < b) {
-                best = Some((dist, pat));
+            if best.is_none_or(|(b, ..)| dist < b) {
+                best = Some((dist, sk, pat));
             }
         }
     }
     // An EXACT field match collapses the fields the endpoints share, which is
     // the whole point of the table ("MMM d – d, y").
-    if let Some((dist, pat)) = best.filter(|(dist, _)| *dist < 10_000) {
-        let _ = dist;
-        return Some(adjust_widths(pat, req));
+    if let Some((_, sk, pat)) = best.filter(|(dist, ..)| *dist < 10_000) {
+        return Some(adjust_widths(pat, sk, req));
     }
     // No row carries every requested field — `en` has `hm` but no `hms`, so a
     // seconds-bearing time range has nothing to collapse against. Take the
     // locale's SEPARATOR and put the requested pattern on both sides; dropping
     // a field instead would silently change what the range means.
     let sep = best
-        .and_then(|(_, pat)| {
+        .and_then(|(_, _, pat)| {
             let items = parse_pattern(pat);
             interval_layout(&items).map(|(s, ..)| match &items[s] {
                 Item::Lit(l) => l.clone(),

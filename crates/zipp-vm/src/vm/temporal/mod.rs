@@ -46,11 +46,17 @@ pub(crate) struct PdtBag {
 /// (anything but `u-ca`) is rejected, at most one time-zone annotation is
 /// allowed, and 2+ calendar (`u-ca`) annotations are rejected if any is
 /// critical. `ann` starts at the first `[`.
+///
+/// The grammar is `DateTime TimeZoneAnnotation? Annotations?`, so the one
+/// time-zone annotation must come FIRST ("[u-ca=iso8601][UTC]" is a syntax
+/// error) and must be a syntactically valid identifier (not "[]" or "[é]"), and
+/// an annotation value is `[A-Za-z0-9]+` components joined by single `-`s.
 fn annotations_valid(ann: &str) -> bool {
     let mut s = ann;
     let mut cal_count = 0u32;
     let mut cal_critical = false;
     let mut tz_count = 0u32;
+    let mut saw_key = false;
     while !s.is_empty() {
         if !s.starts_with('[') {
             return false;
@@ -77,9 +83,13 @@ fn annotations_valid(ann: &str) -> bool {
                 .next()
                 .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
                 && key.bytes().all(key_char);
-            if !valid_key {
+            let valid_value = body[eq + 1..]
+                .split('-')
+                .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_alphanumeric()));
+            if !valid_key || !valid_value {
                 return false;
             }
+            saw_key = true;
             if key == "u-ca" {
                 cal_count += 1;
                 cal_critical |= critical;
@@ -90,20 +100,34 @@ fn annotations_valid(ann: &str) -> bool {
             // [Area/Location] or [±HH:MM] offset time-zone annotation. An offset-form
             // annotation must be minute precision (±HH, ±HH:MM, ±HHMM) — a sub-minute
             // one ([-07:00:01] / [-070001] / [-07:00:00.1]) is invalid.
-            if let Some(off) = body.strip_prefix(['+', '-']) {
-                let sub_minute = off.contains('.')
-                    || off.contains(',')
-                    || off.matches(':').count() >= 2
-                    || (!off.contains(':')
-                        && off.bytes().filter(|c| c.is_ascii_digit()).count() > 4);
-                if sub_minute {
-                    return false;
-                }
+            let ok = if body.starts_with(['+', '-']) {
+                crate::vm::intl::offset_time_zone_minutes(body).is_some()
+            } else {
+                tz_iana_name_syntax_ok(body)
+            };
+            if !ok || saw_key || tz_count > 0 {
+                return false;
             }
             tz_count += 1;
         }
     }
-    tz_count <= 1 && !(cal_count > 1 && cal_critical)
+    !(cal_count > 1 && cal_critical)
+}
+
+/// `TimeZoneIANAName`: `/`-separated components, each a `TZLeadingChar`
+/// (ASCII letter, `.` or `_`) followed by letters, digits, `.`, `_`, `-`, `+`,
+/// and never `.` or `..`. Syntax only — whether the zone exists is the caller's
+/// question (a PlainDate ignores its zone annotation).
+fn tz_iana_name_syntax_ok(s: &str) -> bool {
+    s.split('/').all(|c| {
+        let b = c.as_bytes();
+        c != "."
+            && c != ".."
+            && b.first()
+                .is_some_and(|&x| x.is_ascii_alphabetic() || x == b'.' || x == b'_')
+            && b.iter()
+                .all(|&x| x.is_ascii_alphanumeric() || matches!(x, b'.' | b'_' | b'-' | b'+'))
+    })
 }
 
 /// Validate a Temporal ISO string for a given parser context: the annotation
@@ -115,7 +139,9 @@ fn annotations_valid(ann: &str) -> bool {
 /// engine implements (so "…[u-ca=notacal]" / a date-like calendar name is a
 /// RangeError). The calendar-LESS types (Instant, PlainTime) ignore it entirely.
 fn temporal_string_ok(s: &str, reject_utc_designator: bool, require_known_calendar: bool) -> bool {
-    let s = s.trim();
+    // No trimming here or in the field parsers: the ISO 8601 / RFC 9557 grammar
+    // has no whitespace production, so " 2020-01-01" and "…[UTC] " are
+    // RangeErrors (a space is only ever the date-time separator).
     let (main, ann) = match s.find('[') {
         Some(i) => (&s[..i], &s[i..]),
         None => (s, ""),
@@ -157,24 +183,27 @@ fn temporal_string_ok(s: &str, reject_utc_designator: bool, require_known_calend
 /// a bare identifier in any ASCII case, a `[u-ca=…]` annotation embedded in an
 /// ISO string, or a bare ISO date / year-month / month-day string (→ iso8601).
 fn calendar_id_from_string(s: &str) -> Option<String> {
-    let s = s.trim();
     if calendar_by_id(s).is_some() {
         return Some(s.to_string());
+    }
+    // ParseTemporalCalendarString: only a string that IS a Temporal ISO string
+    // yields its annotation's calendar. Searching any string for "u-ca=" took
+    // "é2020-01-01[u-ca=hebrew]" (not an ISO string, not a calendar id) as hebrew.
+    let iso = temporal_string_ok(s, false, false)
+        && (parse_iso_datetime(s).is_some()
+            || parse_iso_date(s).is_some()
+            || parse_iso_year_month(s).is_some()
+            || parse_iso_month_day(s).is_some()
+            || parse_temporal_time(s).is_some());
+    if !iso {
+        return None;
     }
     if let Some(p) = s.find("u-ca=") {
         let val = &s[p + 5..];
         let end = val.find(']')?;
         return Some(val[..end].to_string());
     }
-    if parse_iso_datetime(s).is_some()
-        || parse_iso_date(s).is_some()
-        || parse_iso_year_month(s).is_some()
-        || parse_iso_month_day(s).is_some()
-        || parse_temporal_time(s).is_some()
-    {
-        return Some("iso8601".to_string());
-    }
-    None
+    Some("iso8601".to_string())
 }
 
 /// The rounding mode for the negated frame, used to implement `since` as
@@ -253,10 +282,12 @@ pub(crate) fn valid_offset_string(s: &str) -> bool {
 }
 
 /// Parse a Temporal time-zone argument into a (normalized id, offset-ns) pair.
-/// Stage 1: "UTC" and numeric offsets (±HH:MM[:SS]) carry a real offset; a named
+/// Stage 1: "UTC" and numeric offsets (±HH, ±HHMM, ±HH:MM) carry a real offset; a named
 /// IANA-style id ("Area/Location") is accepted with offset 0 (no tz database yet).
 fn parse_time_zone(s: &str) -> Option<(String, i64)> {
-    let t = s.trim();
+    // No trimming: neither a time zone identifier nor an ISO string has a
+    // whitespace production, so " UTC" and "UTC\n" are RangeErrors.
+    let t = s;
     if t.is_empty() {
         return None;
     }
@@ -264,6 +295,11 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
     // content (e.g. "2016-12-31T23:59:60+00:00[UTC]" -> "UTC", "…[+01:46]" -> the
     // offset zone). A leading `!` critical flag is stripped.
     if let Some(lb) = t.find('[') {
+        // Everything from the first `[` is the annotation suffix, and all of it
+        // must be well-formed — "…[-0200]é" is not a time zone string.
+        if !annotations_valid(&t[lb..]) {
+            return None;
+        }
         let rb = t[lb..].find(']').map(|r| lb + r)?;
         let inner = &t[lb + 1..rb];
         let inner = inner.strip_prefix('!').unwrap_or(inner);
@@ -274,7 +310,7 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
         // not just the bracket content. A pure UTC offset (only digits/`:`/`.`/`,`
         // after the sign) is checked directly; anything else must parse as a full
         // zoned-datetime string (which validates the date via the hardened parser).
-        let prefix = t[..lb].trim();
+        let prefix = &t[..lb];
         if !prefix.is_empty() {
             let pure_offset = prefix.strip_prefix(['+', '-']).is_some_and(|r| {
                 !r.is_empty()
@@ -296,42 +332,15 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
     }
     let b = t.as_bytes();
     if b[0] == b'+' || b[0] == b'-' {
-        let sign: i64 = if b[0] == b'-' { -1 } else { 1 };
-        let body = &t[1..];
-        // Both colon-separated (±HH, ±HH:MM, ±HH:MM:SS) and colon-less (±HH,
-        // ±HHMM, ±HHMMSS) offset forms are valid time-zone identifiers. A
-        // sub-minute/fractional offset is NOT a valid identifier (rejected).
-        let (hh, mm, ss) = if body.contains(':') {
-            let parts: Vec<&str> = body.split(':').collect();
-            if parts.len() > 3 {
-                return None;
-            }
-            let hh: i64 = parts.first()?.parse().ok()?;
-            let mm: i64 = parts.get(1).map_or(Some(0), |p| p.parse().ok())?;
-            let ss: i64 = parts.get(2).map_or(Some(0), |p| p.parse().ok())?;
-            (hh, mm, ss)
-        } else {
-            if !body.bytes().all(|c| c.is_ascii_digit()) || !matches!(body.len(), 2 | 4 | 6) {
-                return None;
-            }
-            let hh: i64 = body[0..2].parse().ok()?;
-            let mm: i64 = if body.len() >= 4 {
-                body[2..4].parse().ok()?
-            } else {
-                0
-            };
-            let ss: i64 = if body.len() >= 6 {
-                body[4..6].parse().ok()?
-            } else {
-                0
-            };
-            (hh, mm, ss)
-        };
-        if hh > 23 || mm > 59 || ss > 59 {
-            return None;
-        }
-        let off = sign * (hh * 3600 + mm * 60 + ss) * 1_000_000_000;
-        return Some((t.to_string(), off));
+        // An offset time zone identifier is UTCOffset[~SubMinutePrecision]:
+        // exactly ±HH, ±HHMM or ±HH:MM in ASCII digits — the same grammar
+        // Intl.DateTimeFormat checks. `str::parse` took "+1:5", "+001:00" and
+        // "+-01:00", which `tz_offset_ns_at` then read at fixed digit positions
+        // as a DIFFERENT offset. The id is FormatOffsetTimeZoneIdentifier's
+        // "±HH:MM" ("+0100" → "+01:00", "-00:00" → "+00:00").
+        let minutes = crate::vm::intl::offset_time_zone_minutes(t)?;
+        let off = minutes * 60 * 1_000_000_000;
+        return Some((format_offset(off), off));
     }
     // A bracket-less full ISO datetime string carries its own zone: "...Z" → UTC,
     // "...±HH:MM"/"...±HHMM" (minute precision) → that offset zone, normalized via
@@ -342,6 +351,10 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
         if parse_iso_date(&t[..sep]).is_some() {
             let tp = &t[sep + 1..];
             if let Some(z) = tp.find(['Z', 'z']) {
+                // The designator ends the string ("…T00:00ZéUTC]" is junk).
+                if z + 1 != tp.len() {
+                    return None;
+                }
                 return parse_iso_time(&tp[..z]).map(|_| ("UTC".to_string(), 0));
             }
             if let Some(o) = tp.find(['+', '-']) {
@@ -1296,9 +1309,16 @@ fn round_relative_datetime_diff(
     // (Re-differencing the endpoint would re-introduce the end-of-month under-count.)
     let mut f = mk(picked);
     if si == 1 && largest == "year" {
-        let miy = cal_months_in_year(cal, dt1[0]);
-        f[0] += f[1] / miy;
-        f[1] %= miy;
+        // The months fold into a year only when the nudged endpoint reaches
+        // `start + (years + sign)` in the calendar (12 or 13 months), not by a
+        // fixed months-in-year of the ISO start year's number.
+        let nudged = dt_epoch_ns(dt_add_dur(cal, dt1, f));
+        let mut end_dur = [0i64; 10];
+        end_dur[0] = f[0] + sign;
+        let end = dt_epoch_ns(dt_add_dur(cal, dt1, end_dur));
+        if (nudged - end).signum() as i64 != -sign {
+            f = end_dur;
+        }
     }
     Ok(f)
 }
@@ -1327,8 +1347,19 @@ fn duration_total_relative(
                 d
             };
             // Whole signed units, ALWAYS re-added from the anchor (chaining would let
-            // day-of-month clamping accumulate and corrupt the unit length).
-            let mut whole = 0i64;
+            // day-of-month clamping accumulate and corrupt the unit length): the
+            // largest `whole` whose `start + whole` does not pass the end.
+            let passes = |k: i64| -> bool {
+                let cand = dt_epoch_ns(dt_add_dur(cal, start, units(k)));
+                (sign > 0 && cand > end_ns) || (sign < 0 && cand < end_ns)
+            };
+            // Start from the closed-form calendar difference (the routine behind
+            // until/round), which is exact or one unit short at a month's end
+            // (2023-05-31 → 2024-04-30), so the walk below takes a step or two.
+            // Walking up from zero one unit at a time made a 90M-day month total
+            // hit the iteration cap, and a chinese one spend seconds on it.
+            let est = difference_datetime_cal(cal, start, dt_add_dur(cal, start, f), unit);
+            let mut whole = if unit == "year" { est[0] } else { est[1] };
             let mut bracketed = false;
             let mut work = 0u64;
             for _ in 0..MAX_TEMPORAL_CALENDAR_ITERATIONS {
@@ -1338,12 +1369,14 @@ fn duration_total_relative(
                         "RangeError: native builtin iteration limit exceeded".into(),
                     ));
                 }
-                let cand = dt_epoch_ns(dt_add_dur(cal, start, units(whole + sign)));
-                if (sign > 0 && cand > end_ns) || (sign < 0 && cand < end_ns) {
+                if passes(whole) {
+                    whole -= sign;
+                } else if !passes(whole + sign) {
+                    whole += sign;
+                } else {
                     bracketed = true;
                     break;
                 }
-                whole += sign;
             }
             if !bracketed {
                 return Err(Thrown(
@@ -1424,6 +1457,10 @@ fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String, i64, i8)> {
         None => ("", tz_offset, 0i8),
         Some(t) => {
             if let Some(zpos) = t.find(['Z', 'z']) {
+                // The designator ends the date-time ("…T00:00Zé[UTC]" is junk).
+                if zpos + 1 != t.len() {
+                    return None;
+                }
                 (&t[..zpos], 0i64, 1i8)
             } else if let Some(opos) = t.find(['+', '-']) {
                 // The offset must satisfy the strict UTC-offset grammar (2-digit
@@ -1453,7 +1490,9 @@ fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String, i64, i8)> {
             }
         }
     };
-    let time = if time_str.is_empty() {
+    // A separator must be followed by a time: "2020-01-01 [UTC]" and
+    // "2020-01-01TZ[UTC]" are not date-only strings.
+    let time = if time_part.is_none() {
         [0i64; 6]
     } else {
         parse_iso_time(time_str)?
@@ -1513,7 +1552,7 @@ fn temporal_string_has_date(s: &str) -> bool {
 /// The full (year, month, day) of a Temporal ISO string, or `None` for the
 /// dateless `YYYY-MM` / `MM-DD` shorthands.
 fn temporal_string_date(s: &str) -> Option<(i64, i64, i64)> {
-    let main = s.trim().split('[').next().unwrap_or("");
+    let main = s.split('[').next().unwrap_or("");
     let date_part = main.split(['T', 't', ' ']).next().unwrap_or("");
     parse_iso_date(date_part)
 }

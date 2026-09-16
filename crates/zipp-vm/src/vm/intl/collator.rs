@@ -54,8 +54,13 @@ impl<'p> Vm<'p> {
         let ignore_punct = self.intl_slot(resolved, "ignorePunctuation") == Value::bool(true);
         let sens = self.display(self.intl_slot(resolved, "sensitivity"));
         let upper_first = self.display(self.intl_slot(resolved, "caseFirst")) == "upper";
-        let a_lengths = collation_key_lengths(a, ignore_punct)?;
-        let b_lengths = collation_key_lengths(b, ignore_punct)?;
+        let numeric = self.intl_slot(resolved, "numeric") == Value::bool(true);
+        let opts = KeyOptions {
+            ignore_punct,
+            numeric,
+        };
+        let a_lengths = collation_key_lengths(a, opts)?;
+        let b_lengths = collation_key_lengths(b, opts)?;
         let key_bytes = a_lengths
             .0
             .checked_add(a_lengths.1)
@@ -67,8 +72,8 @@ impl<'p> Vm<'p> {
             .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
         self.preflight_guest_string_size(key_bytes)?;
         let (ka, kb) = (
-            collation_key(a, ignore_punct, a_lengths)?,
-            collation_key(b, ignore_punct, b_lengths)?,
+            collation_key(a, opts, a_lengths)?,
+            collation_key(b, opts, b_lengths)?,
         );
         let ord = match ka.0.cmp(&kb.0) {
             std::cmp::Ordering::Equal => {
@@ -113,6 +118,60 @@ pub(crate) fn is_variable_collation_char(c: char) -> bool {
     !c.is_alphanumeric() && !unicode_normalization::char::is_combining_mark(c)
 }
 
+/// The resolved options that shape a sort key.
+#[derive(Clone, Copy)]
+struct KeyOptions {
+    ignore_punct: bool,
+    /// `numeric: true` / `-u-kn`: a run of decimal digits is ONE primary
+    /// element ordered by its numeric value (CLDR/UTS #10 numeric collation).
+    numeric: bool,
+}
+
+/// The value of a decimal digit (Unicode `Nd`) — ASCII, or any digit of the
+/// ECMA-402 Table 10 numbering systems, whose ten digits are consecutive.
+fn numeric_digit(c: char) -> Option<u8> {
+    if c.is_ascii_digit() {
+        return Some(c as u8 - b'0');
+    }
+    if (c as u32) < 0x660 {
+        return None;
+    }
+    // `hanidec`'s digits are not consecutive (its "zero" U+3007 is followed by
+    // CJK brackets), so it is not a range.
+    NUMBERING_SYSTEM_ZERO
+        .iter()
+        .find(|(name, zero)| *name != "hanidec" && (*zero..zero + 10).contains(&(c as u32)))
+        .map(|(_, zero)| (c as u32 - zero) as u8)
+}
+
+/// The primary-key encoding of one digit run under numeric collation: a `'0'`
+/// marker (so the run sorts where a digit would against any other character),
+/// the significant-digit count as eight fixed-width `A`..`P` nibbles, then the
+/// significant digits. Two runs therefore compare by length and then by digits,
+/// i.e. by value, and leading zeros are ignored at every level ("a01" equals
+/// "a1", as in ICU). `digits` holds the run's digit values.
+fn push_numeric_run(primary: &mut String, digits: &[u8]) {
+    let sig = match digits.iter().position(|d| *d != 0) {
+        Some(i) => &digits[i..],
+        None => &[0][..],
+    };
+    primary.push('0');
+    let n = sig.len() as u32;
+    for shift in (0..8).rev() {
+        primary.push((b'A' + ((n >> (shift * 4)) & 0xF) as u8) as char);
+    }
+    primary.extend(sig.iter().map(|d| (b'0' + d) as char));
+}
+
+/// The encoded byte length of a digit run (see `push_numeric_run`).
+fn numeric_run_len(digits: &[u8]) -> usize {
+    let sig = digits
+        .iter()
+        .position(|d| *d != 0)
+        .map_or(1, |i| digits.len() - i);
+    9 + sig
+}
+
 /// The (primary, secondary, tertiary) sort key `collator_compare` documents:
 /// NFD, then split each scalar into its base-letter, accent and case
 /// contributions. `ignore_punct` drops the variable characters first, so they
@@ -121,13 +180,27 @@ pub(crate) fn is_variable_collation_char(c: char) -> bool {
 /// The case level records one flag per BASE character rather than per scalar of
 /// the lowercased primary, because a full case mapping can change length
 /// (U+0130 lowercases to two scalars) and the two levels must stay independent.
-fn collation_key_lengths(s: &str, ignore_punct: bool) -> Result<(usize, usize, usize), Thrown> {
+/// Under `numeric` a digit run is one primary element with no case flag.
+fn collation_key_lengths(s: &str, opts: KeyOptions) -> Result<(usize, usize, usize), Thrown> {
     use unicode_normalization::UnicodeNormalization;
     let mut primary = 0usize;
     let mut secondary = 0usize;
     let mut case = 0usize;
+    let mut run: Vec<u8> = Vec::new();
     for c in s.nfd() {
-        if ignore_punct && is_variable_collation_char(c) {
+        if opts.numeric {
+            if let Some(d) = numeric_digit(c) {
+                run.push(d);
+                continue;
+            }
+            if !run.is_empty() {
+                primary = primary
+                    .checked_add(numeric_run_len(&run))
+                    .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                run.clear();
+            }
+        }
+        if opts.ignore_punct && is_variable_collation_char(c) {
             continue;
         }
         if unicode_normalization::char::is_combining_mark(c) {
@@ -145,6 +218,11 @@ fn collation_key_lengths(s: &str, ignore_punct: bool) -> Result<(usize, usize, u
             .checked_add(1)
             .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
     }
+    if !run.is_empty() {
+        primary = primary
+            .checked_add(numeric_run_len(&run))
+            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+    }
     primary
         .checked_add(secondary)
         .and_then(|n| n.checked_add(case))
@@ -155,7 +233,7 @@ fn collation_key_lengths(s: &str, ignore_punct: bool) -> Result<(usize, usize, u
 
 fn collation_key(
     s: &str,
-    ignore_punct: bool,
+    opts: KeyOptions,
     lengths: (usize, usize, usize),
 ) -> Result<(String, String, Vec<u8>), Thrown> {
     use unicode_normalization::UnicodeNormalization;
@@ -170,8 +248,19 @@ fn collation_key(
     let mut case = Vec::new();
     case.try_reserve_exact(lengths.2)
         .map_err(|_| Thrown("RangeError: collation allocation failed".into()))?;
+    let mut run: Vec<u8> = Vec::new();
     for c in s.nfd() {
-        if ignore_punct && is_variable_collation_char(c) {
+        if opts.numeric {
+            if let Some(d) = numeric_digit(c) {
+                run.push(d);
+                continue;
+            }
+            if !run.is_empty() {
+                push_numeric_run(&mut primary, &run);
+                run.clear();
+            }
+        }
+        if opts.ignore_punct && is_variable_collation_char(c) {
             continue;
         }
         if unicode_normalization::char::is_combining_mark(c) {
@@ -180,6 +269,9 @@ fn collation_key(
         }
         primary.extend(c.to_lowercase());
         case.push(u8::from(c.is_uppercase()));
+    }
+    if !run.is_empty() {
+        push_numeric_run(&mut primary, &run);
     }
     debug_assert_eq!(primary.len(), lengths.0);
     debug_assert_eq!(secondary.len(), lengths.1);

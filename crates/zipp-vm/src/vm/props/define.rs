@@ -229,6 +229,9 @@ impl<'p> Vm<'p> {
                         accessor: false,
                         setter: Value::UNDEFINED,
                     };
+                    // A HOLE is an absent index, not a default data property: the
+                    // define is a NEW property (rejected on a non-extensible array,
+                    // and its unspecified attributes default to false).
                     let existing = self
                         .array_index_override(idx, i)
                         .or_else(|| dense_val.filter(|v| !v.is_hole()).map(|v| (plain, v)));

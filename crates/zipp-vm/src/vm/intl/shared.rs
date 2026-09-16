@@ -1362,6 +1362,11 @@ pub(crate) fn offset_time_zone_minutes(s: &str) -> Option<i64> {
     }
     let sign: i64 = if b[0] == b'-' { -1 } else { 1 };
     let body = &s[1..];
+    // ASCII first: the slices below are byte offsets, and "+0é1" is four bytes
+    // with byte 2 inside the 'é' (slicing there aborted the process).
+    if !body.is_ascii() {
+        return None;
+    }
     let (hh, mm) = match body.len() {
         2 => (body, "00"),
         4 => (&body[..2], &body[2..]),
@@ -1386,16 +1391,18 @@ fn format_offset_time_zone(minutes: i64) -> String {
     format!("{sign}{:02}:{:02}", a / 60, a % 60)
 }
 
-/// The UTC offset a time zone identifier has AT an instant, in minutes: fixed
+/// The UTC offset a time zone identifier has AT an instant, in seconds: fixed
 /// for an offset identifier, and the tz database's answer for a named zone.
 /// `ms` is the epoch milliseconds being formatted, which is what makes
 /// `{timeZone:"America/New_York"}` print EDT in July and EST in January.
-pub(crate) fn time_zone_offset_minutes_at(tz: &str, ms: i128) -> Option<i64> {
+/// Seconds, not minutes: every LMT period and Africa/Monrovia until 1972
+/// (-00:44:30) has a sub-minute offset, and dropping it moves the wall clock.
+pub(crate) fn time_zone_offset_seconds_at(tz: &str, ms: i128) -> Option<i64> {
     if let Some(m) = offset_time_zone_minutes(tz) {
-        return Some(m);
+        return Some(m * 60);
     }
     let z = crate::vm::temporal::tzdb::lookup(tz)?;
-    Some(crate::vm::temporal::tzdb::offset_seconds(z.zone, ms.div_euclid(1000) as i64) as i64 / 60)
+    Some(crate::vm::temporal::tzdb::offset_seconds(z.zone, ms.div_euclid(1000) as i64) as i64)
 }
 
 /// AvailableCanonicalTimeZones: the primary identifiers of the bundled IANA

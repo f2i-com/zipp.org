@@ -58,6 +58,20 @@ pub(crate) const REF_YEAR_LO: i64 = 1900;
 pub(crate) const REF_YEAR_HI_CHINESE: i64 = 2100;
 pub(crate) const REF_YEAR_HI_DANGI: i64 = 2050;
 
+/// The calendar years the astronomy is evaluated for: past Temporal's ISO
+/// limits (±275760) with room to spare, and inside the ±4e6-lunation window
+/// `new_moon_index_before` clamps to (lunation 0 is about 1 CE). Beyond it the
+/// series saturates and the `i32` month starts truncate, which used to fold
+/// every year above ~5.6e10 onto one valid date in year 6 and let `add({months:
+/// 2**32-1})` land in year -4 — so no RangeError ever fired. Such years get a
+/// plain synthetic structure instead ([`synthetic_year`]) whose every day is
+/// itself outside the ISO range, and the ordinary range check rejects them.
+const ASTRO_YEAR_LIMIT: i64 = 300_000;
+/// A lunation index safely inside `ASTRO_YEAR_LIMIT` (12.37 lunations a year).
+const ASTRO_LUNATION_LIMIT: i64 = 3_700_000;
+/// Where synthetic years stop growing, so their epoch days fit the `i32` starts.
+const SYNTHETIC_YEAR_CLAMP: i64 = 5_000_000;
+
 /// Offset of the calendar's reference meridian from UT, in days.
 ///
 /// Not a modern civil time zone: it is the meridian the calendar was *computed*
@@ -234,8 +248,53 @@ fn sui(dangi: bool, g: i64) -> Sui {
     })
 }
 
+/// A year outside `ASTRO_YEAR_LIMIT`: twelve 30-day months opening on ISO
+/// February 1 of (the clamped) `y`, numbered past every real month index
+/// ([`synthetic_month_from_index`] is its inverse). Nothing about it is
+/// meaningful except that it is monotone, finite, and lies entirely outside
+/// the representable ISO range.
+fn synthetic_year(y: i64) -> CnYear {
+    let yc = y.clamp(-SYNTHETIC_YEAR_CLAMP, SYNTHETIC_YEAR_CLAMP);
+    let start = iso_to_epoch_days(yc, 2, 1);
+    let mut starts = [0i32; 15];
+    for (i, s) in starts.iter_mut().enumerate().take(13) {
+        *s = (start + 30 * i as i64) as i32;
+    }
+    let j = yc.abs() - ASTRO_YEAR_LIMIT - 1;
+    let first_nm = if yc > 0 {
+        ASTRO_LUNATION_LIMIT + 1 + 12 * j
+    } else {
+        -ASTRO_LUNATION_LIMIT - 12 * (j + 1)
+    };
+    CnYear {
+        n_months: 12,
+        leap_ord: 0,
+        first_nm,
+        starts,
+    }
+}
+
+/// The (year, month) of a month index beyond `ASTRO_LUNATION_LIMIT`.
+fn synthetic_month_from_index(idx: i64) -> (i64, i64) {
+    let clamp = |j: i64| {
+        (ASTRO_YEAR_LIMIT + 1)
+            .saturating_add(j)
+            .min(SYNTHETIC_YEAR_CLAMP)
+    };
+    if idx > 0 {
+        let b = idx - ASTRO_LUNATION_LIMIT - 1;
+        (clamp(b / 12), b % 12 + 1)
+    } else {
+        let b = (-ASTRO_LUNATION_LIMIT - 1).saturating_sub(idx);
+        (-clamp(b / 12), 12 - b % 12)
+    }
+}
+
 /// The structure of calendar year `y`.
 pub(crate) fn year(dangi: bool, y: i64) -> CnYear {
+    if y.unsigned_abs() > ASTRO_YEAR_LIMIT as u64 {
+        return synthetic_year(y);
+    }
     cached(&YEAR_CACHE, (dangi, y), || {
         let a = sui(dangi, y - 1);
         let b = sui(dangi, y);
@@ -316,6 +375,11 @@ pub(crate) fn normalize(dangi: bool, y: i64, m: i64) -> (i64, i64, CnYear) {
 
 /// Inverse of the global month index.
 pub(crate) fn month_from_index(dangi: bool, idx: i64) -> (i64, i64) {
+    if idx.unsigned_abs() > ASTRO_LUNATION_LIMIT as u64 {
+        // Past the astronomy: a synthetic year, so the month (and anything
+        // built from it) is out of range.
+        return synthetic_month_from_index(idx);
+    }
     let (y, _, _) = from_epoch_days(dangi, new_moon_day(dangi, idx));
     let cy = year(dangi, y);
     (y, idx - cy.first_nm + 1)
@@ -468,6 +532,40 @@ mod tests {
     /// leans on (a well-formed 12- or 13-month year of positive months that
     /// round-trips), NOT that months are 29 or 30 days, which the monotonicity
     /// clamp in `nth_new_moon` cannot promise once the series has saturated it.
+    #[test]
+    fn years_past_the_astronomy_stay_out_of_range() {
+        for &dangi in &[false, true] {
+            for y in [
+                300_001,
+                1_000_000_000_000,
+                1 << 53,
+                -300_001,
+                -1_000_000_000_000,
+            ] {
+                let cy = year(dangi, y);
+                for m in 1..=cy.n_months as i64 {
+                    let (iy, ..) = epoch_days_to_iso(cy.month_start(m));
+                    assert!(iy.abs() > 275_760, "{y}-{m} landed in ISO year {iy}");
+                }
+                let (ny, nm) = month_from_index(dangi, cy.first_nm + 4);
+                assert!(
+                    ny.unsigned_abs() > ASTRO_YEAR_LIMIT as u64 && nm == 5,
+                    "{y}"
+                );
+            }
+            for idx in [
+                ASTRO_LUNATION_LIMIT + 1,
+                1 << 40,
+                -(1 << 40),
+                i64::MAX / 2,
+                i64::MIN / 2,
+            ] {
+                let (y, m) = month_from_index(dangi, idx);
+                assert!(y.unsigned_abs() > ASTRO_YEAR_LIMIT as u64 && (1..=12).contains(&m));
+            }
+        }
+    }
+
     #[test]
     fn extreme_years_terminate() {
         for &dangi in &[false, true] {
