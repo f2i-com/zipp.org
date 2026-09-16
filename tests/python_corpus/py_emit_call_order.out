@@ -1,0 +1,34 @@
+((1,), [])
+receiver-arg obj arg
+6
+callee-args callee a b c
+((1, 2), [('k', 3), ('z', 4)])
+positional-star-keywords obj p star kw kwargs
+((((3,), []),), [])
+nested outer inner leaf
+a-b
+builtin-method s parts
+old
+callee-before-rebind 
+first
+method-before-rebind 
+NameError name 'undefined_function' is not defined
+name-error-first 
+AttributeError
+attribute-error-first 
+('arg',)
+getattr-before-arg getattr dynamic arg
+instance 5 class 6
+instance-shadow v
+Meta1 Meta2 static3 static4
+class-and-static c c2 s s2
+2 ABC 1
+module-and-builtin f i
+6 5
+[1, 3, 3]
+False 0
+(1, 2, 2)
+9
+14
+cell-rebound 2
+cell-deleted NameError

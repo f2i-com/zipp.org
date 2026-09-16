@@ -146,7 +146,12 @@ fn per_engine_global_isolation() {
 #[test]
 fn source_complexity_is_bounded() {
     assert!(execute(&format!("x = {}", "(".repeat(300) + "1" + &")".repeat(300))).is_err());
-    assert!(execute(&format!("x = {}", "1 + ".repeat(300) + "1")).is_err());
+    assert!(execute(&format!("x = {}", "-".repeat(300) + "1")).is_err());
+    // A flat operator chain is not nesting.
+    assert_eq!(
+        execute(&format!("print({})", "1 + ".repeat(300) + "1")).unwrap(),
+        ["301"]
+    );
     assert!(execute(&"x = 1\n".repeat(20_000)).is_ok());
 }
 

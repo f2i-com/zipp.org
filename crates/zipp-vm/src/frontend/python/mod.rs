@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod emitter;
 mod exprs;
+mod nesting;
 mod stmts;
 mod symtable;
 
@@ -128,6 +129,9 @@ fn module_head(name: &str) -> &str {
 pub(super) struct Project<'a> {
     pub modules: BTreeSet<&'a str>,
     pub module_names: Vec<&'a str>,
+    /// The module run as the program: its `__name__` (and so the
+    /// `__module__` of what it defines) is `__main__`.
+    pub entry: &'a str,
 }
 
 /// A multi-module program. `modules` pairs each module name (the `.py` file's
@@ -151,8 +155,18 @@ fn imported_modules(suite: &[ast::Stmt], out: &mut BTreeSet<String>) {
                 }
             }
             ast::Stmt::If(s) => {
-                imported_modules(&s.body, out);
-                imported_modules(&s.orelse, out);
+                // An `elif` ladder is walked iteratively.
+                let mut arm = s;
+                loop {
+                    imported_modules(&arm.body, out);
+                    match arm.orelse.as_slice() {
+                        [ast::Stmt::If(next)] => arm = next,
+                        orelse => {
+                            imported_modules(orelse, out);
+                            break;
+                        }
+                    }
+                }
             }
             ast::Stmt::For(s) => {
                 imported_modules(&s.body, out);
@@ -275,6 +289,9 @@ pub(super) fn compile_project<S: AsRef<str>>(
             _ => format!("{}.py", name.replace('.', "/")),
         };
         let suite = parse_module(&file, source)?;
+        // Bound the tree's nesting before the recursive walks below.
+        let text: &str = source.strip_prefix('\u{feff}').unwrap_or(source);
+        let suite = nesting::check(suite, &file, text)?;
         let table = symtable::analyse(&suite, &name).map_err(|e| format!("{file}: {e}"))?;
         let mut wanted = BTreeSet::new();
         imported_modules(&suite, &mut wanted);
@@ -316,7 +333,8 @@ pub(super) fn compile_project<S: AsRef<str>>(
         .map(|(index, file, suite, table)| {
             let (name, source) = &sources[index];
             let source: &str = source.strip_prefix('\u{feff}').unwrap_or(*source);
-            (name.as_str(), file, source, suite, table)
+            let lines = emitter::line_starts(source);
+            (name.as_str(), file, source, suite, table, lines)
         })
         .collect();
     // A fixed seed program. Its root initializes the private runtime and then
@@ -332,13 +350,14 @@ pub(super) fn compile_project<S: AsRef<str>>(
     let project = Project {
         modules: names,
         module_names,
+        entry,
     };
     let program = RefCell::new(program);
     // Each module's top level becomes a code object the runtime runs on first
     // import; the entry body registers them all, names the entry module, then
     // imports it.
     let mut inits = Vec::with_capacity(parsed.len());
-    for (index, (name, file, source, suite, table)) in parsed.iter().enumerate() {
+    for (index, (name, file, source, suite, table, lines)) in parsed.iter().enumerate() {
         if program.borrow().functions.len() >= MAX_FUNCTIONS {
             return Err("Python project: function count limit exceeded".into());
         }
@@ -346,6 +365,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
             file,
             source,
             module_index: index as u32,
+            lines,
         };
         let mut out = Emitter::new(
             &format!("<module {name}>"),
@@ -384,6 +404,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
         file: "<entry>",
         source: "",
         module_index: 0,
+        lines: &[0],
     };
     let mut out = Emitter::new(
         "__zipp_py_entry",
@@ -396,8 +417,8 @@ pub(super) fn compile_project<S: AsRef<str>>(
         &program,
         "<entry>".to_owned(),
     )?;
-    // Each registration's temporaries are reclaimed, so the number of
-    // modules and files is not bounded by one function's register space.
+    // Registers are reclaimed after every call: the entry's register count
+    // must not grow with the number of modules or files.
     for (name, file, func_id) in inits {
         let mark = out.mark();
         let code = out.alloc()?;

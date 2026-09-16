@@ -1,9 +1,40 @@
 //! Statement lowering for the Python emitter.
 use super::emitter::{Emitter, LoopCtx, R};
+use super::exprs::{known, small_int_literal, Known};
 use super::symtable::{ScopeKind, SymKind};
 use crate::bytecode::{Instr, Reg};
 use ast::Ranged;
 use rustpython_parser::ast;
+
+/// How a loop steps through its iterable (see [`Emitter::loop_header`]):
+/// a fast mode chosen once, at loop entry, when the iterable allows it,
+/// and otherwise the runtime iterator `iter`, ended by `stop`.
+pub(super) struct Stepper {
+    pub counted: Option<Counted>,
+    pub indexed: Option<Indexed>,
+    pub iter: Reg,
+    pub stop: Reg,
+}
+/// Counting `cursor` towards `end` by `step` while `fast` holds.
+pub(super) struct Counted {
+    pub fast: Reg,
+    pub cursor: Reg,
+    pub end: Reg,
+    pub step: Step,
+}
+/// Indexing the list or tuple `seq` while `fast` holds.
+pub(super) struct Indexed {
+    pub fast: Reg,
+    pub seq: Reg,
+    pub index: Reg,
+}
+#[derive(Clone, Copy)]
+pub(super) enum Step {
+    /// A literal step: its sign fixes the loop's direction.
+    Imm(i32),
+    /// A step known only at run time, with `positive` = step > 0.
+    Dynamic { step: Reg, positive: Reg },
+}
 
 impl<'a> Emitter<'a> {
     pub fn suite(&mut self, suite: &[ast::Stmt], depth: usize) -> R<()> {
@@ -34,10 +65,21 @@ impl<'a> Emitter<'a> {
         self.stamp_line(stmt)?;
         match stmt {
             ast::Stmt::Pass(_) | ast::Stmt::Global(_) | ast::Stmt::Nonlocal(_) => {}
-            ast::Stmt::Expr(s) => {
-                self.expr(&s.value, depth + 1)?;
-            }
+            ast::Stmt::Expr(s) => match s.value.as_ref() {
+                ast::Expr::Yield(y) => {
+                    self.depth(s.value.as_ref(), depth + 1)?;
+                    self.yield_value(&s.value, y, depth + 1, false)?;
+                }
+                value => {
+                    self.expr(value, depth + 1)?;
+                }
+            },
             ast::Stmt::Assign(s) => {
+                if let [target] = s.targets.as_slice() {
+                    if self.literal_unpack(target, &s.value, depth + 1)? {
+                        return Ok(());
+                    }
+                }
                 let value = self.expr(&s.value, depth + 1)?;
                 for target in &s.targets {
                     self.assign(target, value, depth + 1)?;
@@ -53,7 +95,7 @@ impl<'a> Emitter<'a> {
                     let annotation = self.annotation_value(&s.annotation, depth + 1)?;
                     let container = match self.r_ns {
                         Some(ns) => ns,
-                        None => self.r_globals,
+                        None => self.globals()?,
                     };
                     let name = self.string(n.id.as_str())?;
                     self.helper("annotate", &[container, name, annotation])?;
@@ -71,24 +113,11 @@ impl<'a> Emitter<'a> {
                 self.emit(Instr::Return { src: value })?;
             }
             ast::Stmt::Match(s) => self.match_stmt(s, depth)?,
-            ast::Stmt::If(s) => {
-                let value = self.expr(&s.test, depth + 1)?;
-                let cond = self.truth(value)?;
-                let jump = self.jump_if_false(cond)?;
-                self.block_suite(&s.body, depth + 1)?;
-                let end = self.jump()?;
-                let here = self.here();
-                self.patch(jump, here)?;
-                self.block_suite(&s.orelse, depth + 1)?;
-                let here = self.here();
-                self.patch(end, here)?;
-            }
+            ast::Stmt::If(s) => self.if_chain(s, depth)?,
             ast::Stmt::While(s) => {
                 let head = self.here();
                 self.forget_line();
-                let value = self.expr(&s.test, depth + 1)?;
-                let cond = self.truth(value)?;
-                let exhausted = self.jump_if_false(cond)?;
+                let exhausted = self.branch(&s.test, false, depth + 1)?;
                 self.loops.push(LoopCtx {
                     head,
                     breaks: Vec::new(),
@@ -97,121 +126,9 @@ impl<'a> Emitter<'a> {
                 });
                 self.block_suite(&s.body, depth + 1)?;
                 self.emit(Instr::Jump { target: head })?;
-                self.finish_loop(vec![exhausted], &s.orelse, depth + 1)?;
-            }
-            ast::Stmt::For(s) => {
-                // `for x in range(...)` with the builtin `range` runs as a
-                // counted loop on BigInt registers: no iterator object and no
-                // helper call per step. `range` is checked at runtime (it may
-                // be shadowed), and any other iterable takes the generic path
-                // through the same loop body.
-                let counted = self.range_call(&s.iter, depth + 1)?;
-                let (iter, cursor, stop, step, positive, use_counter) = match counted {
-                    Some((f, args)) => {
-                        let is_range = self.helper("rangecheck", &[f])?;
-                        let use_counter = self.alloc()?;
-                        self.emit(Instr::Move {
-                            dst: use_counter,
-                            src: is_range,
-                        })?;
-                        let iter = self.alloc()?;
-                        let cursor = self.alloc()?;
-                        let stop = self.alloc()?;
-                        let step = self.alloc()?;
-                        let positive = self.alloc()?;
-                        let generic = self.jump_if_false(is_range)?;
-                        // Counted: start/stop/step as ints, `positive` = step > 0.
-                        let spec = self.helper("rangeargs", &[args])?;
-                        let zero = self.small_int(0)?;
-                        self.emit(Instr::GetIndex { dst: cursor, obj: spec, key: zero })?;
-                        let one = self.small_int(1)?;
-                        self.emit(Instr::GetIndex { dst: stop, obj: spec, key: one })?;
-                        let two = self.small_int(2)?;
-                        self.emit(Instr::GetIndex { dst: step, obj: spec, key: two })?;
-                        let three = self.small_int(3)?;
-                        self.emit(Instr::GetIndex { dst: positive, obj: spec, key: three })?;
-                        let skip = self.jump()?;
-                        let here = self.here();
-                        self.patch(generic, here)?;
-                        let null = self.none()?;
-                        let value = self.call_value(f, args, null)?;
-                        let it = self.helper("iter", &[value])?;
-                        self.emit(Instr::Move { dst: iter, src: it })?;
-                        let here = self.here();
-                        self.patch(skip, here)?;
-                        (iter, cursor, stop, step, positive, Some(use_counter))
-                    }
-                    None => {
-                        let value = self.expr(&s.iter, depth + 1)?;
-                        let iter = self.helper("iter", &[value])?;
-                        (iter, 0, 0, 0, 0, None)
-                    }
-                };
-                let head = self.here();
-                self.forget_line();
-                let item = self.alloc()?;
-                let mut exits = Vec::new();
-                match use_counter {
-                    Some(use_counter) => {
-                        let generic = self.jump_if_false(use_counter)?;
-                        // Counted step: exhausted when cursor >= stop (or <= stop
-                        // for a negative step); else item = cursor, cursor += step.
-                        let neg = self.jump_if_false(positive)?;
-                        let more = self.alloc()?;
-                        self.emit(Instr::Lt { dst: more, a: cursor, b: stop })?;
-                        exits.push(self.jump_if_false(more)?);
-                        let advance = self.jump()?;
-                        let here = self.here();
-                        self.patch(neg, here)?;
-                        self.emit(Instr::Gt { dst: more, a: cursor, b: stop })?;
-                        exits.push(self.jump_if_false(more)?);
-                        let here = self.here();
-                        self.patch(advance, here)?;
-                        self.emit(Instr::Move { dst: item, src: cursor })?;
-                        self.emit(Instr::Add { dst: cursor, a: cursor, b: step })?;
-                        let bound = self.jump()?;
-                        let here = self.here();
-                        self.patch(generic, here)?;
-                        let next = self.helper("fornext", &[iter])?;
-                        self.emit(Instr::Move { dst: item, src: next })?;
-                        let done = self.alloc()?;
-                        self.emit(Instr::Eq {
-                            dst: done,
-                            a: item,
-                            b: self.r_stop,
-                        })?;
-                        exits.push(self.jump_if_true(done)?);
-                        let here = self.here();
-                        self.patch(bound, here)?;
-                    }
-                    None => {
-                        let next = self.helper("fornext", &[iter])?;
-                        self.emit(Instr::Move { dst: item, src: next })?;
-                        let done = self.alloc()?;
-                        self.emit(Instr::Eq {
-                            dst: done,
-                            a: item,
-                            b: self.r_stop,
-                        })?;
-                        exits.push(self.jump_if_true(done)?);
-                    }
-                }
-                let exhausted = exits;
-                // The target is bound before every iteration of the body, but
-                // not necessarily after the loop (the iterable may be empty).
-                let saved = self.definite.clone();
-                self.assign(&s.target, item, depth + 1)?;
-                self.loops.push(LoopCtx {
-                    head,
-                    breaks: Vec::new(),
-                    continues: Vec::new(),
-                    handler_depth: self.handler_depth,
-                });
-                self.block_suite(&s.body, depth + 1)?;
-                self.emit(Instr::Jump { target: head })?;
-                self.definite = saved;
                 self.finish_loop(exhausted, &s.orelse, depth + 1)?;
             }
+            ast::Stmt::For(s) => self.for_stmt(s, depth)?,
             ast::Stmt::Break(_) => {
                 let Some(ctx) = self.loops.last() else {
                     return Err(self.error(stmt, "'break' outside loop"));
@@ -286,7 +203,8 @@ impl<'a> Emitter<'a> {
                                 module
                             } else {
                                 let key = self.string(head)?;
-                                self.helper("import", &[key, self.r_globals])?
+                                let globals = self.globals()?;
+                                self.helper("import", &[key, globals])?
                             };
                             self.store_name(head, value)?;
                         }
@@ -306,7 +224,8 @@ impl<'a> Emitter<'a> {
                         if self.kind() != ScopeKind::Module {
                             return Err(self.error(stmt, "import * only allowed at module level"));
                         }
-                        self.helper("importstar", &[module, self.r_globals])?;
+                        let globals = self.globals()?;
+                        self.helper("importstar", &[module, globals])?;
                         continue;
                     }
                     let attr = self.string(alias.name.as_str())?;
@@ -317,6 +236,59 @@ impl<'a> Emitter<'a> {
             }
             _ => return Err(self.error(stmt, "statement is not supported yet")),
         }
+        Ok(())
+    }
+
+    /// `if` with its `elif` ladder (each `elif` is an If alone in the
+    /// previous orelse), lowered iteratively: every arm compiles at the
+    /// statement's own depth. As in the nested form, a binding made by the
+    /// first test is definite afterwards; a later arm's test runs only when
+    /// the earlier tests failed, so its bindings are definite for the rest of
+    /// the ladder but not after it.
+    fn if_chain(&mut self, first: &ast::StmtIf, depth: usize) -> R<()> {
+        let mut ends = Vec::new();
+        let mut after = None;
+        let mut arm = first;
+        loop {
+            let mark = self.mark();
+            let skips = self.branch(&arm.test, false, depth + 1)?;
+            self.release(mark);
+            if after.is_none() {
+                after = Some(self.definite.clone());
+            }
+            self.block_suite(&arm.body, depth + 1)?;
+            let next = match arm.orelse.as_slice() {
+                [ast::Stmt::If(next)] => Some(next),
+                _ => None,
+            };
+            if !arm.orelse.is_empty() {
+                ends.push(self.jump()?);
+            }
+            let here = self.here();
+            for skip in skips {
+                self.patch(skip, here)?;
+            }
+            match next {
+                Some(next) => {
+                    self.forget_line();
+                    self.stamp_line(next)?;
+                    arm = next;
+                }
+                None => {
+                    self.forget_line();
+                    self.block_suite(&arm.orelse, depth + 1)?;
+                    break;
+                }
+            }
+        }
+        let here = self.here();
+        for end in ends {
+            self.patch(end, here)?;
+        }
+        if let Some(after) = after {
+            self.definite = after;
+        }
+        self.forget_line();
         Ok(())
     }
 
@@ -456,11 +428,12 @@ impl<'a> Emitter<'a> {
                 for (name, sub) in c.kwd_attrs.iter().zip(&c.kwd_patterns) {
                     let key = self.string(name.as_str())?;
                     let value = self.helper("mattr", &[subject, key])?;
+                    let unbound = self.unbound()?;
                     let missing = self.alloc()?;
                     self.emit(Instr::Eq {
                         dst: missing,
                         a: value,
-                        b: self.r_unb,
+                        b: unbound,
                     })?;
                     fails.push(self.jump_if_true(missing)?);
                     self.pattern(sub, value, fails, depth + 1)?;
@@ -517,24 +490,312 @@ impl<'a> Emitter<'a> {
     /// `range(a[, b[, c]])` by name, with plain positional arguments: the
     /// callee value and the evaluated argument array, for the counted-loop
     /// fast path. `None` for any other iterable expression.
-    fn range_call(&mut self, iter: &ast::Expr, depth: usize) -> R<Option<(Reg, Reg)>> {
+    pub fn range_call<'e>(&self, iter: &'e ast::Expr) -> Option<&'e [ast::Expr]> {
         let ast::Expr::Call(c) = iter else {
-            return Ok(None);
+            return None;
         };
         let ast::Expr::Name(n) = c.func.as_ref() else {
-            return Ok(None);
+            return None;
         };
-        if n.id.as_str() != "range"
+        if !self.fast
+            || n.id.as_str() != "range"
             || c.args.is_empty()
             || c.args.len() > 3
             || !c.keywords.is_empty()
             || c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_)))
         {
-            return Ok(None);
+            return None;
         }
+        Some(&c.args)
+    }
+
+    /// `for target in iter: body [else: orelse]`.
+    fn for_stmt(&mut self, s: &ast::StmtFor, depth: usize) -> R<()> {
+        let stepper = match self.range_call(&s.iter) {
+            Some(args) => self.range_stepper(args, depth + 1)?,
+            None => {
+                let value = self.expr(&s.iter, depth + 1)?;
+                self.seq_stepper(value, true)?
+            }
+        };
+        let head = self.here();
+        self.forget_line();
+        // The target is bound before every iteration of the body, but not
+        // necessarily after the loop (the iterable may be empty).
+        let saved = self.definite.clone();
+        let exhausted = self.loop_header(&stepper, &s.target, depth + 1)?;
+        self.loops.push(LoopCtx {
+            head,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            handler_depth: self.handler_depth,
+        });
+        self.block_suite(&s.body, depth + 1)?;
+        self.emit(Instr::Jump { target: head })?;
+        self.definite = saved;
+        self.finish_loop(exhausted, &s.orelse, depth + 1)
+    }
+
+    /// `for x in range(...)` with plain positional arguments. When `range`
+    /// is the builtin (checked at run time: it may be shadowed) and every
+    /// argument is an int, the loop counts on BigInt registers taken straight
+    /// from the arguments: no range object, no iterator, no helper call per
+    /// step. Anything else (a shadowed `range`, a float, a bool or an
+    /// `__index__` object, a zero step) calls `range` and iterates what it
+    /// returns, which also raises what it raises.
+    pub fn range_stepper(&mut self, args: &[ast::Expr], depth: usize) -> R<Stepper> {
         let f = self.load_name("range")?;
-        let args = self.sequence_array(&c.args, depth)?;
-        Ok(Some((f, args)))
+        let mut regs = Vec::with_capacity(args.len());
+        for a in args {
+            regs.push(self.expr(a, depth)?);
+        }
+        let fast = self.boolean(false)?;
+        let (cursor, end) = (self.alloc()?, self.alloc()?);
+        let iter = self.alloc()?;
+        let step_literal = match args.get(2) {
+            None => Some(1),
+            Some(e) => small_int_literal(e).filter(|k| *k != 0),
+        };
+        let step = match step_literal {
+            Some(k) => Step::Imm(k),
+            None => Step::Dynamic {
+                step: self.alloc()?,
+                positive: self.alloc()?,
+            },
+        };
+        let range = self.prop(self.r_rt, "TRANGE")?;
+        let is_range = self.alloc()?;
+        self.emit(Instr::Eq { dst: is_range, a: f, b: range })?;
+        let mut generic = vec![self.jump_if_false(is_range)?];
+        for (a, reg) in args.iter().zip(&regs) {
+            if known(a) != Known::Int {
+                let ok = self.typeof_is(*reg, "bigint")?;
+                generic.push(self.jump_if_false(ok)?);
+            }
+        }
+        match regs.as_slice() {
+            [stop] => {
+                self.emit(Instr::LoadBigInt { dst: cursor, value: 0 })?;
+                self.emit(Instr::Move { dst: end, src: *stop })?;
+            }
+            [start, stop, ..] => {
+                self.emit(Instr::Move { dst: cursor, src: *start })?;
+                self.emit(Instr::Move { dst: end, src: *stop })?;
+            }
+            [] => return Err("Python emitter: range() without arguments".into()),
+        }
+        if let Step::Dynamic { step, positive } = step {
+            let zero = self.alloc()?;
+            self.emit(Instr::LoadBigInt { dst: zero, value: 0 })?;
+            let is_zero = self.alloc()?;
+            self.emit(Instr::Eq { dst: is_zero, a: regs[2], b: zero })?;
+            generic.push(self.jump_if_true(is_zero)?);
+            self.emit(Instr::Move { dst: step, src: regs[2] })?;
+            self.emit(Instr::Lt { dst: positive, a: zero, b: step })?;
+        }
+        self.emit(Instr::LoadBool { dst: fast, val: true })?;
+        let done = self.jump()?;
+        let here = self.here();
+        for j in generic {
+            self.patch(j, here)?;
+        }
+        let arr = self.array(&regs)?;
+        let null = self.none()?;
+        let value = self.call_value(f, arr, null)?;
+        let it = self.helper("iter", &[value])?;
+        self.emit(Instr::Move { dst: iter, src: it })?;
+        let here = self.here();
+        self.patch(done, here)?;
+        let stop = self.stop()?;
+        Ok(Stepper {
+            counted: Some(Counted { fast, cursor, end, step }),
+            indexed: None,
+            iter,
+            stop,
+        })
+    }
+
+    /// Iteration over an evaluated `value`. With fast paths on, an exact
+    /// list or tuple is indexed in place (its current `items` and length
+    /// re-read every step, so appends during the loop are seen as CPython's
+    /// list iterator sees them) and a range object counts on its own
+    /// fields; anything else steps through its iterator. `wrap` is false for
+    /// a comprehension's outermost iterable, which arrives already passed
+    /// through `seqiter` (an exact list, tuple or range stays itself).
+    pub fn seq_stepper(&mut self, value: Reg, wrap: bool) -> R<Stepper> {
+        if !self.fast {
+            let iter = if wrap { self.helper("iter", &[value])? } else { value };
+            let stop = self.stop()?;
+            return Ok(Stepper {
+                counted: None,
+                indexed: None,
+                iter,
+                stop,
+            });
+        }
+        let iter = if wrap { self.helper("seqiter", &[value])? } else { value };
+        // `seqiter` returns an object: a list, tuple or range as itself, or
+        // a runtime iterator record.
+        let cls = self.prop(iter, "cls")?;
+        let list = self.prop(self.r_rt, "TLIST")?;
+        let is_seq = self.alloc()?;
+        self.emit(Instr::Eq { dst: is_seq, a: cls, b: list })?;
+        let tuple_check = self.jump_if_true(is_seq)?;
+        let tuple = self.prop(self.r_rt, "TTUPLE")?;
+        self.emit(Instr::Eq { dst: is_seq, a: cls, b: tuple })?;
+        let here = self.here();
+        self.patch(tuple_check, here)?;
+        let index = self.small_int(0)?;
+        let range = self.prop(self.r_rt, "TRANGE")?;
+        let is_range = self.alloc()?;
+        self.emit(Instr::Eq { dst: is_range, a: cls, b: range })?;
+        // A range object counts from its own start, stop and step (never 0).
+        let (cursor, end) = (self.alloc()?, self.alloc()?);
+        let (step, positive) = (self.alloc()?, self.alloc()?);
+        let not_range = self.jump_if_false(is_range)?;
+        let start = self.prop(iter, "start")?;
+        self.emit(Instr::Move { dst: cursor, src: start })?;
+        let stop_v = self.prop(iter, "stop")?;
+        self.emit(Instr::Move { dst: end, src: stop_v })?;
+        let step_v = self.prop(iter, "step")?;
+        self.emit(Instr::Move { dst: step, src: step_v })?;
+        let zero = self.alloc()?;
+        self.emit(Instr::LoadBigInt { dst: zero, value: 0 })?;
+        self.emit(Instr::Lt { dst: positive, a: zero, b: step })?;
+        let here = self.here();
+        self.patch(not_range, here)?;
+        let stop = self.stop()?;
+        Ok(Stepper {
+            counted: Some(Counted {
+                fast: is_range,
+                cursor,
+                end,
+                step: Step::Dynamic { step, positive },
+            }),
+            indexed: Some(Indexed { fast: is_seq, seq: iter, index }),
+            iter,
+            stop,
+        })
+    }
+
+    /// The loop head: one step of whichever mode the stepper chose, binding
+    /// `target` and falling through into the body, or jumping to the
+    /// returned exits once the iterable is exhausted. The generic step comes
+    /// first so the fast mode that closes the head falls straight into the
+    /// body; a plain name target is bound in each mode directly.
+    pub fn loop_header(&mut self, s: &Stepper, target: &ast::Expr, depth: usize) -> R<Vec<usize>> {
+        let mut exits = Vec::new();
+        let direct = matches!(target, ast::Expr::Name(_));
+        let item = self.alloc()?;
+        // Lists and tuples are the commoner fast mode: test them first.
+        let mut to_mode = Vec::new();
+        if let Some(ix) = &s.indexed {
+            to_mode.push(self.jump_if_true(ix.fast)?);
+        }
+        if let Some(c) = &s.counted {
+            to_mode.push(self.jump_if_true(c.fast)?);
+        }
+        let next = self.helper("fornext", &[s.iter])?;
+        self.emit(Instr::Move { dst: item, src: next })?;
+        let done = self.alloc()?;
+        self.emit(Instr::Eq {
+            dst: done,
+            a: item,
+            b: s.stop,
+        })?;
+        exits.push(self.jump_if_true(done)?);
+        let modes = to_mode.len();
+        let mut to_body = Vec::new();
+        if direct {
+            self.assign(target, item, depth)?;
+        }
+        if modes > 0 {
+            to_body.push(self.jump()?);
+        }
+        let mut modes_left = modes;
+        let mut to_mode = to_mode.into_iter();
+        if let Some(ix) = &s.indexed {
+            let here = self.here();
+            self.patch(to_mode.next().expect("indexed mode jump"), here)?;
+            modes_left -= 1;
+            let items = self.prop(ix.seq, "items")?;
+            let len = self.prop(items, "length")?;
+            exits.push(self.emit(Instr::JumpIfNotLt { a: ix.index, b: len, target: 0 })?);
+            let value = if direct { self.alloc()? } else { item };
+            self.emit(Instr::GetIndex {
+                dst: value,
+                obj: items,
+                key: ix.index,
+            })?;
+            self.emit(Instr::AddInt {
+                dst: ix.index,
+                a: ix.index,
+                imm: 1,
+                upd: false,
+            })?;
+            if direct {
+                self.assign(target, value, depth)?;
+            }
+            if modes_left > 0 {
+                to_body.push(self.jump()?);
+            }
+        }
+        if let Some(c) = &s.counted {
+            let here = self.here();
+            self.patch(to_mode.next().expect("counted mode jump"), here)?;
+            modes_left -= 1;
+            match c.step {
+                Step::Imm(k) if k > 0 => {
+                    exits.push(self.emit(Instr::JumpIfNotLt { a: c.cursor, b: c.end, target: 0 })?);
+                }
+                Step::Imm(_) => {
+                    exits.push(self.emit(Instr::JumpIfNotLt { a: c.end, b: c.cursor, target: 0 })?);
+                }
+                Step::Dynamic { positive, .. } => {
+                    let down = self.jump_if_false(positive)?;
+                    exits.push(self.emit(Instr::JumpIfNotLt { a: c.cursor, b: c.end, target: 0 })?);
+                    let advance = self.jump()?;
+                    let here = self.here();
+                    self.patch(down, here)?;
+                    exits.push(self.emit(Instr::JumpIfNotLt { a: c.end, b: c.cursor, target: 0 })?);
+                    let here = self.here();
+                    self.patch(advance, here)?;
+                }
+            }
+            if direct {
+                self.assign(target, c.cursor, depth)?;
+            } else {
+                self.emit(Instr::Move { dst: item, src: c.cursor })?;
+            }
+            match c.step {
+                Step::Imm(imm) => {
+                    self.emit(Instr::AddInt {
+                        dst: c.cursor,
+                        a: c.cursor,
+                        imm,
+                        upd: true,
+                    })?;
+                }
+                Step::Dynamic { step, .. } => {
+                    self.emit(Instr::Add {
+                        dst: c.cursor,
+                        a: c.cursor,
+                        b: step,
+                    })?;
+                }
+            }
+            if modes_left > 0 {
+                to_body.push(self.jump()?);
+            }
+        }
+        let here = self.here();
+        for j in to_body {
+            self.patch(j, here)?;
+        }
+        if !direct {
+            self.assign(target, item, depth)?;
+        }
+        Ok(exits)
     }
 
     fn finish_loop(&mut self, exhausted: Vec<usize>, otherwise: &[ast::Stmt], depth: usize) -> R<()> {
@@ -595,10 +856,51 @@ impl<'a> Emitter<'a> {
             return Err(self.error(&targets[0], "multiple starred expressions in assignment"));
         }
         let count = self.small_int(targets.len() as i32)?;
+        let items = self.alloc()?;
+        // An exact tuple or list of the right length is read in place.
+        let mut join = None;
+        if self.fast && star.is_none() {
+            let mut slow = Vec::new();
+            let is_obj = self.typeof_is(value, "object")?;
+            slow.push(self.jump_if_false(is_obj)?);
+            let null = self.none()?;
+            let is_null = self.alloc()?;
+            self.emit(Instr::Eq { dst: is_null, a: value, b: null })?;
+            slow.push(self.jump_if_true(is_null)?);
+            let cls = self.prop(value, "cls")?;
+            let tuple = self.prop(self.r_rt, "TTUPLE")?;
+            let exact = self.alloc()?;
+            self.emit(Instr::Eq { dst: exact, a: cls, b: tuple })?;
+            let is_tuple = self.jump_if_true(exact)?;
+            let list = self.prop(self.r_rt, "TLIST")?;
+            self.emit(Instr::Eq { dst: exact, a: cls, b: list })?;
+            slow.push(self.jump_if_false(exact)?);
+            let here = self.here();
+            self.patch(is_tuple, here)?;
+            let array = self.prop(value, "items")?;
+            let len = self.prop(array, "length")?;
+            let fits = self.alloc()?;
+            self.emit(Instr::Eq { dst: fits, a: len, b: count })?;
+            slow.push(self.jump_if_false(fits)?);
+            self.emit(Instr::Move { dst: items, src: array })?;
+            join = Some(self.jump()?);
+            let here = self.here();
+            for j in slow {
+                self.patch(j, here)?;
+            }
+        }
         let star_index = self.small_int(star.map(|i| i as i32).unwrap_or(-1))?;
         // The whole unpack is validated before any target is written.
-        let items = self.helper("unpack", &[value, count, star_index])?;
-        for (i, target) in targets.iter().enumerate() {
+        let unpacked = self.helper("unpack", &[value, count, star_index])?;
+        self.emit(Instr::Move { dst: items, src: unpacked })?;
+        if let Some(join) = join {
+            let here = self.here();
+            self.patch(join, here)?;
+        }
+        // Every item is read before any target is written: a target may be
+        // an element of the sequence being unpacked.
+        let mut values = Vec::with_capacity(targets.len());
+        for i in 0..targets.len() {
             let index = self.small_int(i as i32)?;
             let item = self.alloc()?;
             self.emit(Instr::GetIndex {
@@ -606,12 +908,53 @@ impl<'a> Emitter<'a> {
                 obj: items,
                 key: index,
             })?;
+            values.push(item);
+        }
+        for (target, item) in targets.iter().zip(values) {
             match target {
                 ast::Expr::Starred(s) => self.assign(&s.value, item, depth + 1)?,
                 other => self.assign(other, item, depth + 1)?,
             }
         }
         Ok(())
+    }
+
+    /// `a, b = x, y`: a literal right-hand side of the target's length,
+    /// with no starred item on either side, needs no tuple and no unpack.
+    /// Each item is copied into its own register before any target is
+    /// written, so `a, b = b, a` swaps.
+    fn literal_unpack(&mut self, target: &ast::Expr, value: &ast::Expr, depth: usize) -> R<bool> {
+        let (ast::Expr::Tuple(ast::ExprTuple { elts: targets, .. })
+        | ast::Expr::List(ast::ExprList { elts: targets, .. })) = target
+        else {
+            return Ok(false);
+        };
+        let (ast::Expr::Tuple(ast::ExprTuple { elts: items, .. })
+        | ast::Expr::List(ast::ExprList { elts: items, .. })) = value
+        else {
+            return Ok(false);
+        };
+        let starred = |e: &ast::Expr| matches!(e, ast::Expr::Starred(_));
+        if !self.fast
+            || targets.len() != items.len()
+            || targets.iter().any(starred)
+            || items.iter().any(starred)
+        {
+            return Ok(false);
+        }
+        self.depth(value, depth)?;
+        let mut regs = Vec::with_capacity(items.len());
+        for item in items {
+            let reg = self.expr(item, depth + 1)?;
+            let copy = self.alloc()?;
+            self.emit(Instr::Move { dst: copy, src: reg })?;
+            regs.push(copy);
+        }
+        self.depth(target, depth)?;
+        for (t, reg) in targets.iter().zip(regs) {
+            self.assign(t, reg, depth + 1)?;
+        }
+        Ok(true)
     }
     fn delete_target(&mut self, target: &ast::Expr, depth: usize) -> R<()> {
         match target {
@@ -647,16 +990,14 @@ impl<'a> Emitter<'a> {
         match s.target.as_ref() {
             ast::Expr::Name(n) => {
                 let left = self.load_name(n.id.as_str())?;
-                let right = self.expr(&s.value, depth)?;
-                let value = self.arith(&s.op, left, right, true)?;
+                let value = self.arith_operand(&s.op, left, Known::Unknown, &s.value, depth, true)?;
                 self.store_name(n.id.as_str(), value)
             }
             ast::Expr::Subscript(t) => {
                 let obj = self.expr(&t.value, depth)?;
                 let index = self.expr(&t.slice, depth)?;
                 let left = self.helper("getitem", &[obj, index])?;
-                let right = self.expr(&s.value, depth)?;
-                let value = self.arith(&s.op, left, right, true)?;
+                let value = self.arith_operand(&s.op, left, Known::Unknown, &s.value, depth, true)?;
                 self.helper("setitem", &[obj, index, value])?;
                 Ok(())
             }
@@ -664,8 +1005,7 @@ impl<'a> Emitter<'a> {
                 let obj = self.expr(&a.value, depth)?;
                 let name = self.string(a.attr.as_str())?;
                 let left = self.helper("getattr", &[obj, name])?;
-                let right = self.expr(&s.value, depth)?;
-                let value = self.arith(&s.op, left, right, true)?;
+                let value = self.arith_operand(&s.op, left, Known::Unknown, &s.value, depth, true)?;
                 self.helper("setattr", &[obj, name, value])?;
                 Ok(())
             }
@@ -765,7 +1105,7 @@ impl<'a> Emitter<'a> {
                 self.patch(*j, fin)?;
             }
             self.forget_line();
-            self.block_suite(&s.finalbody, depth)?;
+            self.finally_body(&s.finalbody, kind_reg, val_reg, depth)?;
             self.emit(Instr::EndFinally { kind_reg, val_reg })?;
         } else {
             let end = self.here();
@@ -776,6 +1116,53 @@ impl<'a> Emitter<'a> {
         self.forget_line();
         Ok(())
     }
+    /// A `finally` body. Entered with an exception propagating (completion
+    /// kind 2), that exception is the one being handled while the body runs,
+    /// so an exception raised there gets it as `__context__`; the
+    /// current-exception stack is popped again on every exit from the body.
+    fn finally_body(&mut self, body: &[ast::Stmt], kind_reg: Reg, val_reg: Reg, depth: usize) -> R<()> {
+        let pushed = self.boolean(false)?;
+        let two = self.small_int(2)?;
+        let throwing = self.alloc()?;
+        self.emit(Instr::Eq {
+            dst: throwing,
+            a: kind_reg,
+            b: two,
+        })?;
+        let skip = self.jump_if_false(throwing)?;
+        let exc = self.helper("normexc", &[val_reg])?;
+        self.helper("pushexc", &[exc])?;
+        self.emit(Instr::LoadBool {
+            dst: pushed,
+            val: true,
+        })?;
+        let here = self.here();
+        self.patch(skip, here)?;
+        let (k2, v2) = (self.alloc()?, self.alloc()?);
+        let body_fin = self.emit(Instr::PushFinally {
+            target: 0,
+            kind_reg: k2,
+            val_reg: v2,
+        })?;
+        self.handler_depth += 1;
+        self.block_suite(body, depth)?;
+        self.emit(Instr::LoadInt { dst: k2, val: 0 })?;
+        self.emit(Instr::PopFinally)?;
+        self.handler_depth -= 1;
+        let here = self.here();
+        self.patch(body_fin, here)?;
+        self.forget_line();
+        let not_pushed = self.jump_if_false(pushed)?;
+        self.helper("popexc", &[])?;
+        let here = self.here();
+        self.patch(not_pushed, here)?;
+        self.emit(Instr::EndFinally {
+            kind_reg: k2,
+            val_reg: v2,
+        })?;
+        Ok(())
+    }
+
     /// Normal completion of a protected region: record kind 0 and leave the
     /// finally handler (when there is one), then jump to the join point.
     fn leave_normally(&mut self, has_finally: bool, kind_reg: Reg) -> R<usize> {
@@ -809,11 +1196,6 @@ impl<'a> Emitter<'a> {
             obj: pair,
             key: one,
         })?;
-        if let Some(target) = &first.optional_vars {
-            self.control_depth += 1;
-            self.assign(target, entered, depth)?;
-            self.control_depth -= 1;
-        }
         let done = self.boolean(false)?;
         let (kind_reg, val_reg) = (self.alloc()?, self.alloc()?);
         let fin_push = self.emit(Instr::PushFinally {
@@ -828,13 +1210,19 @@ impl<'a> Emitter<'a> {
             catch_reg: ereg,
         })?;
         self.handler_depth += 1;
+        // The `as` target is bound inside the protected region: when binding
+        // it fails, `__exit__` still sees the exception (and may suppress it,
+        // leaving the target unbound afterwards).
+        let saved = self.definite.clone();
+        if let Some(target) = &first.optional_vars {
+            self.assign(target, entered, depth)?;
+        }
         if rest.is_empty() {
             self.block_suite(body, depth)?;
         } else {
-            let saved = self.definite.clone();
             self.with_stmt(rest, body, depth)?;
-            self.definite = saved;
         }
+        self.definite = saved;
         self.emit(Instr::PopHandler)?;
         self.handler_depth -= 1;
         let j1 = self.leave_normally(true, kind_reg)?;
@@ -981,7 +1369,7 @@ impl<'a> Emitter<'a> {
         let ns = self.helper("newns", &[])?;
         let name_r = self.string(s.name.as_str())?;
         let qual_r = self.string(&qualname)?;
-        let module_r = self.string(self.project.module_names[self.unit.module_index as usize])?;
+        let module_r = self.string(self.module_name())?;
         self.helper("nsinit", &[ns, name_r, qual_r, module_r])?;
         let (func_id, child) =
             self.compile_child(node, s.name.as_str(), qualname.clone(), |e| {
@@ -1036,7 +1424,8 @@ impl<'a> Emitter<'a> {
             ));
         }
         let key = self.string(name)?;
-        self.helper("import", &[key, self.r_globals])
+        let globals = self.globals()?;
+        self.helper("import", &[key, globals])
     }
 
     /// The keyword arguments of a call or class statement as a runtime

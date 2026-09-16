@@ -1,0 +1,13 @@
+[2, 1, 2, 1, 3, 5, 3, 7, 0]
+TypeError object of type 'int' has no len()
+TypeError object of type 'NoneType' has no len()
+TypeError object of type 'float' has no len()
+TypeError object of type 'Base' has no len()
+[True, True, True, False, True, True, False, True, True, False, True, False, True, True]
+TypeError isinstance() arg 2 must be a type, a tuple of types, or a union
+('local len', 'local isinstance')
+(3, True)
+('global len 3', 'global isinstance')
+(3, True)
+class len 2
+4000

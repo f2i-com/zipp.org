@@ -1,0 +1,25 @@
+enter unpack
+exit unpack TypeError
+TypeError reached the caller
+enter suppressed
+exit suppressed TypeError
+after suppressed
+enter attr
+exit attr ValueError
+ValueError no slot
+enter outer
+enter inner
+both 1 2
+exit inner None
+exit outer None
+enter inner-suppress
+exit inner-suppress TypeError
+target unbound after suppression
+context in finally KeyError(1)
+KeyError continues
+direct ValueError('second') KeyError('first')
+no pending None
+finally wins
+break None
+exit raised KeyError('from exit') ValueError('body')
+exit raised cleanly None

@@ -1,0 +1,43 @@
+r1 [0, 1, 2, 3, 4]
+r2 [2, 5, 8, 10, 7, 4, 1]
+r3 [7, 5, 3, 1, -1, -3, 0, 4, 8]
+r4 [1, 2, 3, 3, 2, 1]
+r5 [0, 1, 2]
+zero step range() arg 3 must not be zero
+float arg TypeError
+index arg [0, 1, 2, 1, 2, 3]
+shadowed ['shadow', 'shadow']
+range object [3, 7, 11, 9, 5, 1]
+after 11
+break (12, 7)
+else ran 2
+targets (2, {'k': 5})
+unpacked (3, 4)
+append during ([1, 2, 3, 10, 20], [1, 2, 3, 10, 20])
+sort during [3, 2, 3]
+del slice during ([0, 1, 5], [1, 3, 5])
+pop during [1, 2]
+slice assign during [1, 2, 9]
+tuples [4, 5, 6, 7, 8]
+subclasses ([3, 2, 1], [4, 5])
+list break [1, 3, 4]
+list else 2
+str ['h', 'é', 'l', 'l', 'o', '😀', 'a']
+dict ['a', 'b', 3]
+set [1, 2, 3]
+gen [0, 2, 4, 6]
+nested [(1, 0), (2, 1)]
+nested lists [1, 2, 3]
+cond [0, 6, 12, 18]
+dictcomp {0: [], 1: [0], 2: [0, 1], 3: [0, 1, 2]}
+setcomp [0, 1, 2]
+lazy genexpr [1, 2, 3, 4]
+genexpr range (0, [1, 2])
+tuple comp [6, 7]
+empty comps ([], [], [])
+mutating comp [1, 2, 3]
+user iterable [10, 20, 10, 20]
+not iterable 'int' object is not iterable
+comp not iterable 'NoneType' object is not iterable
+triple [0, 0, 10, 11, 20, 22, 111, 111, 121, 122, 222, 222]
+sum range 328350

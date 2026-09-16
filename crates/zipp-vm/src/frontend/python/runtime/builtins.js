@@ -1036,3 +1036,135 @@
     rt.constructors.set(ObjectType, (args, kw, cls) => { if (cls === ObjectType) { if (args.length || (kw && kw.size)) fail(E.TypeError, "object() takes no arguments"); return { cls: ObjectType, dict: new Map() }; } return null; });
     rt.constructors.delete(ObjectType);
 })(__zipp_py);
+
+/* ---- Emitter lowering helpers ---------------------------------------------------------------------
+ * Entry points the Rust emitter's lowerings call directly (bytes literals,
+ * spec-order method calls, `yield from` delegation, guarded builtin calls),
+ * kept as one block apart from the object model above. */
+(function (R) {
+    "use strict";
+    const rt = R.__rt, T = rt.T, E = rt.E, STOP = rt.STOP;
+    const isInstance = rt.isInstance, getattr = rt.getattr, call = rt.call;
+    // A bytes literal: its bytes as a Latin-1 string constant, built the
+    // way the emitter's `bytes` helper builds one from its byte values.
+    R.bytesconst = function (latin1) {
+        const items = new Array(latin1.length);
+        for (let i = 0; i < latin1.length; i++) items[i] = latin1.charCodeAt(i) & 255;
+        return R.bytes(items);
+    };
+
+    // `obj.name(args)` in Python's order: the attribute is resolved before
+    // the arguments are evaluated. A plain or builtin function found on the
+    // type, not shadowed by an instance attribute, comes back unbound with
+    // `R.mself` true, and the emitter calls it with the receiver prepended
+    // (no bound method is allocated); anything else is the attribute's value,
+    // with `R.mself` false. The emitter reads `mself` straight after the call.
+    R.mself = false;
+    R.mlookup = function (obj, name) {
+        let t;
+        if (obj !== null && typeof obj === "object") {
+            if (obj.isType || obj.cls === T.module || obj.cls === T.super) { const v = getattr(obj, name); R.mself = false; return v; }
+            t = obj.cls || rt.ObjectType;
+        } else {
+            t = rt.typeOf(obj);
+        }
+        const attr = rt.lookupType(t, name);
+        if (attr !== undefined && attr !== null && typeof attr === "object" && (attr.cls === T.function || attr.cls === T.builtin_function_or_method)) {
+            const own = obj !== null && typeof obj === "object" && obj.dict !== undefined && obj.dict !== null ? obj.dict.get(name) : undefined;
+            if (own === undefined) { R.mself = true; return attr; }
+        }
+        // `getattr` may run guest code (which may look methods up itself).
+        const v = getattr(obj, name);
+        R.mself = false;
+        return v;
+    };
+
+    // One step of `yield from` (PEP 380). Mode 0 sends `v` into the
+    // subiterator (`next()` when `v` is None), mode 1 throws `v` into it.
+    // Returns the next value to yield, or STOP once the subiterator has
+    // finished, with its return value in `R.yfret` (read straight after).
+    R.yfret = null;
+    const isStop = (e) => e !== null && typeof e === "object" && e.cls !== undefined && isInstance(e, E.StopIteration);
+    const stopValue = (e) => e.args && e.args.items.length ? e.args.items[0] : null;
+    // The Python object behind an iterator record `iter()` made.
+    const target = (it) => it.wrapped !== undefined ? it.wrapped : it;
+    function finished(value) { R.yfret = value; return STOP; }
+    R.yfstep = function (it, mode, v) {
+        const gen = it.cls === T.generator;
+        if (mode === 0) {
+            if (v === null || v === undefined) {
+                if (gen) {
+                    if (it.done) return finished(null);
+                    const r = it.next();
+                    return r === STOP ? finished(it.returned) : r;
+                }
+                try {
+                    const r = it.next();
+                    return r === STOP ? finished(null) : r;
+                } catch (e) {
+                    if (isStop(e)) return finished(stopValue(e));
+                    throw e;
+                }
+            }
+            const send = gen ? null : getattr(target(it), "send");
+            try {
+                return gen ? it.send(v) : call(send, [v], null);
+            } catch (e) {
+                if (isStop(e)) return finished(stopValue(e));
+                throw e;
+            }
+        }
+        const exc = rt.normexc(v);
+        if (isInstance(exc, E.GeneratorExit)) {
+            closeSub(it);
+            throw v;
+        }
+        let thrower = null;
+        if (!gen) {
+            try { thrower = getattr(target(it), "throw"); }
+            catch (e) { if (e !== null && typeof e === "object" && e.cls !== undefined && isInstance(e, E.AttributeError)) throw v; throw e; }
+        }
+        try {
+            return gen ? it.throwIn(exc) : call(thrower, [exc], null);
+        } catch (e) {
+            // The exception itself coming back is not the subiterator finishing.
+            if (isStop(e) && e !== exc) return finished(e.args.items.length ? stopValue(e) : gen ? it.returned : null);
+            throw e;
+        }
+    };
+    function closeSub(it) {
+        if (it.cls === T.generator) { it.close(); return; }
+        let close;
+        try { close = getattr(target(it), "close"); }
+        catch (e) { if (e !== null && typeof e === "object" && e.cls !== undefined && isInstance(e, E.AttributeError)) return; throw e; }
+        call(close, [], null);
+    }
+    // The delegating generator was closed while suspended in `yield from`.
+    R.yfclose = function (it) { closeSub(it); return null; };
+})(__zipp_py);
+
+/* ---- Emitter fast-path support ---------------------------------------------------------------------
+ * The class objects the emitter's inline loops test for, and the one step
+ * that decides how a loop iterates. */
+(function (R) {
+    "use strict";
+    const rt = R.__rt, T = rt.T;
+    R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range;
+    // The text limit an inline str concatenation is checked against.
+    R.MAX_TEXT = rt.MAX_TEXT;
+    // A loop's iterable: an exact list, tuple or range as itself (the loop
+    // indexes or counts it in place), anything else its iterator.
+    R.seqiter = function (v) {
+        if (v !== null && typeof v === "object") {
+            const c = v.cls;
+            if (c === T.list || c === T.tuple || c === T.range) return v;
+        }
+        return rt.iter(v);
+    };
+    // Guarded builtin intrinsics: once a call site's callee is found to be
+    // the builtin itself (`R.B*`), the emitter calls these directly.
+    R.BLEN = rt.builtins.get("len"); R.len1 = rt.len;
+    R.BISINSTANCE = rt.builtins.get("isinstance");
+    const isinstanceCode = R.BISINSTANCE.code;
+    R.isinst = function (v, t) { return rt.isType(t) ? rt.isinstanceCheck(v, t) : isinstanceCode([v, t]); };
+})(__zipp_py);

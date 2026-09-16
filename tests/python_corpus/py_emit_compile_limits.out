@@ -1,0 +1,10 @@
+['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight 16', 'many']
+7260
+-93
+98 FGHIJ
+(True, True) (True, False)
+[20, 'last']
+3000 5998 300 89401
+64 b'012345' b'def' [0, 127, 128, 255]
+[[1, 2], [3, 4], [5, 6], [7, 8], (9, 10)] [0, 1, 2, 'a', 'b', 0]
+True

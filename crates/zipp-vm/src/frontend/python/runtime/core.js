@@ -851,7 +851,11 @@ var __zipp_py = (function () {
     };
     R.withexit = function (exit, e) {
         const exc = normexc(e);
-        const r = call(exit, [typeOf(exc), exc, null], null);
+        // __exit__ runs while `exc` is being handled: it is the context of
+        // anything __exit__ raises.
+        excStack.push(exc);
+        let r;
+        try { r = call(exit, [typeOf(exc), exc, null], null); } finally { excStack.pop(); }
         if (!rt.truth(r)) throw e;
         return null;
     };
