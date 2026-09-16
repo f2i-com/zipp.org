@@ -53,10 +53,11 @@ class SGD(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        from torch._gpu import active_capture
+        from torch._gpu import active_capture, eager_step
         capture = active_capture()
         if capture is not None:
             return capture.sgd(self, closure)
+        eager_step(self)
         loss = closure() if closure is not None else None
         for g, p in self._params():
             grad = p.grad
@@ -82,10 +83,11 @@ class Adam(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        from torch._gpu import active_capture
+        from torch._gpu import active_capture, eager_step
         capture = active_capture()
         if capture is not None:
             return capture.adam(self, closure)
+        eager_step(self)
         loss = closure() if closure is not None else None
         for g, p in self._params():
             grad = p.grad
@@ -129,10 +131,11 @@ class RMSprop(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        from torch._gpu import active_capture
+        from torch._gpu import active_capture, eager_step
         capture = active_capture()
         if capture is not None:
             raise NotImplementedError("Compiled GPU training supports SGD, Adam and AdamW; RMSprop is not captured")
+        eager_step(self)
         loss = closure() if closure is not None else None
         for g, p in self._params():
             grad = p.grad

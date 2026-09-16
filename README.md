@@ -151,9 +151,27 @@ buffers and Adam moments are read from `optimizer.state`, updated in the graph
 and written back with the weights, so the next step continues where this one
 left off.
 **Each call captures a new graph, uploads inputs and weights, and reads back the
-loss, gradients and updated weights.** There is no `compiled.prepare()` API,
-resident model/optimizer state, graph cache or multi-GPU training yet. Small
-examples demonstrate correctness, not a GPU speedup. See the
+loss, gradients and updated weights.** To keep them on the device, prepare the
+step once from an example call and then feed only each step's batch:
+
+```python
+prepared = compiled_step.prepare(x, target)          # records once; weights and
+prepared.step(lambda loss: print(loss.item()), x, target)   # optimizer state stay resident
+prepared.steps(lambda losses: print(len(losses)), [(x, target)] * 8)  # 8 steps, one submission
+prepared.sync(lambda p: print("model and optimizer.state are current"))
+prepared.dispose()
+```
+
+`prepare`, `step`, `steps`, `sync` and `dispose` are Zipp extensions too. While a
+prepared session is live its parameters are refused to compiled calls and eager
+`optimizer.step()`; `sync()` leaves the model and `optimizer.state` exactly
+where the same number of eager steps would (checked against PyTorch 2.11 to
+about 1e-7). On an RTX 5090 in Chrome, a 784-256-10 batch-64 Adam step driven
+from Python costs (warm medians) 74 ms per `compiled()` call on WebGPU, 5.1 ms
+per `prepared.step`, and 1.8 ms per step with `prepared.steps` at eight steps
+per run (WebGL2: 89 / 3.3 / 2.2 ms; WebAssembly: 74 / 4.9 / 3.6 ms). Small
+examples demonstrate correctness, not a GPU speedup over native PyTorch. There is
+no graph cache or multi-GPU training. See the
 [Torch compatibility guide](docs/TORCH_COMPATIBILITY.md) for supported operations,
 limits and failure behavior. NCA experiments remain in their separate repository.
 

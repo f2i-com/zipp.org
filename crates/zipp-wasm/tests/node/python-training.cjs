@@ -174,5 +174,114 @@ print(all(p.grad is None for p in model.parameters()))
   assert.deepEqual(e.takeOutput(), [...Array(5).fill('accepted'), 'rejected', 'True']);
   assert.deepEqual(e.takeHostRequests(), []); e.dispose();
   console.log('momentum, dampening, Nesterov, Adam and AdamW are captured, RMSprop is rejected before submission; CPU gradients preserved');
+
+
+  // ---- prepared sessions: compiled.prepare() through the real engine and the session protocol ----
+  // Six distinct batches (fixtures/torch_prepared.py): first as chained
+  // compiled calls, then, from the same initial weights, as one prepared
+  // session (two single steps, the rest in one run), synced and disposed.
+  // Both must track PyTorch 2.11's eager steps, and each other.
+  const preparedSource = await fs.readFile(path.join(root, 'crates/zipp-vm/tests/fixtures/torch_prepared.py'), 'utf8');
+  const preparedExpected = JSON.parse(await fs.readFile(path.join(root, 'crates/zipp-vm/tests/fixtures/torch_prepared_expected.json')));
+  for (const backend of ['cpu-js', 'wasm']) {
+    for (const kase of ['gelu_ce_adam', 'relu_mse_nesterov']) {
+      const expected = preparedExpected[kase];
+      const e = new Engine();
+      e.initPythonProject({main: `case = ${JSON.stringify(kase)}\n` + preparedSource + `
+import json
+compiled = torch.compile(train_step, training=True)
+initial = [p.detach().clone() for p in model.parameters()]
+prepared = None
+def chained(index):
+    compiled(*batches[index]).submit(lambda loss: print(json.dumps(state(loss))), lambda error: print('FAILED', str(error)))
+def reset():
+    for p, value in zip(model.parameters(), initial):
+        p.data = value.clone()
+        p.grad = None
+    optimizer.state.clear()
+def prepare():
+    global prepared
+    prepared = compiled.prepare(*batches[0], on_ready=lambda p: print('ready', p.backend), on_error=lambda error: print('FAILED', str(error)))
+    print('prepared', prepared.backend, len(prepared.session.outputs), len(prepared.session.resident))
+def step(index):
+    prepared.step(lambda loss: print('loss', json.dumps(loss.item())), *batches[index], on_error=lambda error: print('FAILED', str(error)))
+def steps(start, stop):
+    prepared.steps(lambda losses: print('losses', json.dumps([l.item() for l in losses])), batches[start:stop], on_error=lambda error: print('FAILED', str(error)))
+def refused():
+    for call in (lambda: compiled(*batches[0]), lambda: train_step(*batches[0])):
+        try:
+            call()
+            print('NOT REFUSED')
+        except RuntimeError as error:
+            print('refused', str(error))
+def sync():
+    prepared.sync(lambda p: print('synced', json.dumps(state(torch.tensor(0.0)))), on_error=lambda error: print('FAILED', str(error)))
+def dispose():
+    prepared.dispose()
+    print('disposed', prepared.executed, prepared.backend)
+def eager(index):
+    print('eager', json.dumps(state(train_step(*batches[index]))))
+`}, 'main');
+      const runtime = await createRuntime({backend, wasmBytes});
+      const seen = [];
+      const adapter = createPythonGPUAdapter(e, runtime, {allowExecute: true, onDelivered: ev => seen.push(ev.reply.ok ? 'ok' : ev.reply.error.code)});
+      // A delivery can raise the next request (a run queued behind the
+      // session's creation is sent when the create reply arrives), so the
+      // host drains until the guest has nothing pending.
+      const settle = async () => {
+        for (let i = 0; i < 16; i++) {
+          adapter.drain(); await adapter.idle();
+          if (adapter.pending === 0 && e.pythonCall('__zipp_py_pending_host', []) === 0) return;
+        }
+        throw new Error('host requests did not settle');
+      };
+      const near = (actual, wanted, what, tolerance = 2e-6) => {
+        assert.equal(actual.length, wanted.length, what);
+        let worst = 0;
+        actual.forEach((value, i) => { worst = Math.max(worst, Math.abs(value - wanted[i])); });
+        assert.ok(worst < tolerance, `${backend} ${kase} ${what}: deviates by ${worst}`);
+        return worst;
+      };
+      const chainedStates = [];
+      for (let index = 0; index < expected.length; index++) {
+        e.pythonCall('chained', [index]); await settle();
+        const [line] = e.takeOutput();
+        chainedStates.push(JSON.parse(line));
+        near(chainedStates[index], expected[index], `chained step ${index}`);
+      }
+      seen.length = 0;
+      e.pythonCall('reset', []);
+      e.pythonCall('prepare', []);
+      e.pythonCall('step', [0]);   // queued behind the session's creation
+      e.pythonCall('refused', []);
+      assert.deepEqual(e.takeOutput(), [`prepared None ${kase.endsWith('adam') ? '17 16' : '13 12'}`, 'refused Parameter is resident in a prepared GPU session; sync() and dispose() it before recording another step', 'refused Parameter is resident in a prepared GPU session; sync() and dispose() it before an eager optimizer step'],
+        'the session is requested, not created, before the host drains; its parameters are refused meanwhile');
+      await settle();
+      assert.equal(adapter.sessions, 1);
+      const lines = e.takeOutput();
+      assert.equal(lines[0], `ready ${backend}`);
+      const losses = [JSON.parse(lines[1].slice(5))];
+      e.pythonCall('step', [1]); await settle();
+      losses.push(JSON.parse(e.takeOutput()[0].slice(5)));
+      e.pythonCall('steps', [2, expected.length]); await settle();
+      losses.push(...JSON.parse(e.takeOutput()[0].slice(7)));
+      near(losses, expected.map(s => s[0]), 'resident losses vs PyTorch');
+      near(losses, chainedStates.map(s => s[0]), 'resident losses vs chained compiled calls', 1e-6);
+      e.pythonCall('sync', []); await settle();
+      const synced = JSON.parse(e.takeOutput()[0].slice(7));
+      const worstPyTorch = near(synced.slice(1), expected[expected.length - 1].slice(1), 'synced weights, gradients and optimizer state vs PyTorch');
+      const worstChained = near(synced.slice(1), chainedStates[chainedStates.length - 1].slice(1), 'synced state vs chained compiled calls', 1e-6);
+      e.pythonCall('dispose', []);
+      await settle();
+      assert.deepEqual(e.takeOutput(), [`disposed ${expected.length} ${backend}`]);
+      assert.equal(adapter.sessions, 0, 'the adapter holds no session after the guest disposed it');
+      assert.deepEqual(seen, ['ok', 'ok', 'ok', 'ok', 'ok', 'ok'], 'create, three runs, one download and the dispose were delivered');
+      // After dispose the eager optimizer continues from the synced state.
+      e.pythonCall('eager', [0]);
+      assert.equal(e.takeOutput()[0].slice(0, 5), 'eager');
+      adapter.invalidate(); runtime.dispose(); e.dispose();
+      console.log(`${backend} ${kase}: prepared session over ${expected.length} batches tracks PyTorch (max abs error ${worstPyTorch.toExponential(2)}) and chained compiled calls (${worstChained.toExponential(2)}); refusals, sync and dispose checked`);
+    }
+  }
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

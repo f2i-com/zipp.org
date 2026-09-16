@@ -1,0 +1,18 @@
+== adam
+prepared cpu-python feeds ('x', 'y') outputs 17 resident 16
+resident steps [1, 2, 3, 4, 5] read back ['loss'] next step 6
+downloaded 16 tensors [[4, 5], [5], [5, 3], [3]] grad shapes [[4, 5], [5], [5, 3], [3]]
+loss x1000 [1145, 982, 938, 891, 744]
+resident equals chained, bit for bit: True True True True
+eager continuation x1000 [751, 653, 551]
+session continuation equals eager continuation: True True True True True
+weights p3 x1000 [307, 88, -302] fell True
+== momentum
+prepared cpu-python feeds ('x', 'y') outputs 13 resident 12
+resident steps [1, 2, 3, 4, 5] read back ['loss'] next step 6
+downloaded 12 tensors [[4, 5], [5], [5, 3], [3]] grad shapes [[4, 5], [5], [5, 3], [3]]
+loss x1000 [1145, 1051, 1081, 1062, 929]
+resident equals chained, bit for bit: True True True True
+eager continuation x1000 [922, 858, 760]
+session continuation equals eager continuation: True True True True True
+weights p3 x1000 [187, 29, -216] fell True

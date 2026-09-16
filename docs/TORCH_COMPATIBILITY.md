@@ -12,6 +12,7 @@ optimizers directly; their eager operations run on the CPU inside Zipp.
 | `model(x)` | Eager CPU tensor kernels in Zipp | Supported tensor operations, autograd, modules and optimizers. |
 | `torch.compile(model)(x)` | Records a float32 compute graph | Returns a pending result; call `.submit(callback, on_error=None)`. |
 | `torch.compile(step, training=True)(x, target)` | Records forward, backward and SGD update nodes | One zero_grad/backward/step; gradients and weights commit after successful readback. |
+| `torch.compile(step, training=True).prepare(x, target)` | Records the step once; a device-resident session | `step`/`steps` feed only the batch; weights and optimizer state carry on the device until `sync()`; `dispose()` frees them. |
 | Pending result in the playground | Host-selected WebGPU, WebGL2, WASM or JavaScript | Console and `result.backend` identify actual execution. |
 | Pending result in native Zipp | CPU graph evaluator | Does not acquire CUDA or a native GPU. |
 
@@ -106,22 +107,105 @@ Wait for completion before preparing the next step: overlapping captures general
 become stale after the first update. These guarantees cover recorded tensor/optimizer
 updates, not arbitrary Python side effects inside a user function.
 
-**This is capture per call, with uploads and readbacks per call.** There is no
-persistent compiled model, `prepare()` method, graph cache, resident parameter or
-optimizer state, or automatic multi-GPU distribution. Uploads and readbacks move
-tensor bytes (`Float32Array`s at the host boundary, straight into tensor storage
-on the way back), not a number per element. Native Zipp evaluates the graph on
-its CPU tensor kernels, with the same float32 results as `zipp_gpu`'s pure-Python
-reference; a browser GPU requires the host GPU grant and an available
-WebGL2/WebGPU backend. Auto selection can fall back to CPU; inspect `.backend`.
+**A compiled call is capture per call, with uploads and readbacks per call.**
+Uploads and readbacks move tensor bytes (`Float32Array`s at the host boundary,
+straight into tensor storage on the way back), not a number per element. Native
+Zipp evaluates the graph on its CPU tensor kernels, with the same float32 results
+as `zipp_gpu`'s pure-Python reference; a browser GPU requires the host GPU grant
+and an available WebGL2/WebGPU backend. Auto selection can fall back to CPU;
+inspect `.backend`. There is no graph cache or automatic multi-GPU distribution.
 
 Each step returns the requested result plus leaf gradients and updated parameters.
 The runtime's default 16-output limit means a model with four parameter tensors
 uses nine outputs (more if differentiating inputs). All intermediate forward and
 backward nodes count toward the same 512-node, storage and work budgets. This
 bounded implementation is intended for small experiments, not large ML workloads.
-GPU convolution and persistent compiled models are follow-on work; NCA remains
-outside this repository.
+GPU convolution is follow-on work; NCA remains outside this repository.
+
+### Prepared steps: weights and optimizer state resident on the device
+
+`compiled.prepare(*args, backend=None, on_ready=None, on_error=None, **kwargs)`
+records the step once from an example call and returns a `Prepared` session
+built on `zipp_gpu.Graph.prepare`:
+
+```python
+compiled = torch.compile(train_step, training=True)
+prepared = compiled.prepare(x, target)                  # records once, uploads weights
+prepared.step(callback, x, target, on_error=None)       # one step; callback(loss tensor)
+prepared.steps(callback, [(x1, t1), (x2, t2)], on_error=None)   # one submission; callback([loss, ...])
+prepared.sync(callback, on_error=None)                  # download into the model; callback(prepared)
+prepared.dispose()
+```
+
+- **Feeds.** The float tensor arguments and the integer class-target arguments
+  the recorded step reads are the feeds; every step passes them again with the
+  recorded shapes and dtypes (a `ValueError` otherwise). Any other tensor the
+  step reads (parameters, constants, buffers) is uploaded at `prepare()`.
+  Non-tensor arguments are recorded constants and must be passed unchanged.
+- **Resident state.** Each parameter's weight, its gradient and its optimizer
+  buffers (momentum buffer, or Adam's two moments) are outputs kept on the
+  device and carried into the next step; only the returned tensor is read back
+  per step. Buffers that do not exist yet start as zeros on the device (the
+  update PyTorch's first step performs on them, exactly, for Adam and for SGD
+  momentum without dampening; SGD momentum *with* dampening needs one eager or
+  compiled step first, because PyTorch's first step clones the gradient into
+  the buffer and one program for every step cannot express that from zeros).
+  The `adam_update` step count advances by one per executed step.
+- **Outputs bound.** One result plus, per parameter tensor, a weight, a
+  gradient and its buffers must fit the protocol's 64 outputs: at most 15
+  parameter tensors with Adam or AdamW (4 each), 21 with SGD momentum, 31 with
+  plain SGD. Beyond that `prepare()` raises `NotImplementedError` naming the
+  limit; it does not fall back to per-call capture. A tensor outside the
+  optimizer that requires grad is rejected too (its gradient would have to
+  accumulate across steps).
+- **`sync()`** downloads every resident tensor and, after checking each is
+  finite, replaces the parameters' data, writes `optimizer.state` (the eager
+  keys: `momentum_buffer`, `exp_avg`, `exp_avg_sq`, and `step` as the count
+  after the executed steps) and sets `.grad` to the last step's gradients: the
+  model is what the same number of eager `optimizer.step()` calls would have
+  left. The session stays live and keeps training from the same values; a
+  sync with nothing new executed calls back at once. Checked against PyTorch
+  2.11 (`crates/zipp-vm/tests/fixtures/torch_prepared.py`, six distinct
+  batches, relu/gelu/sigmoid/tanh, MSE and `F.cross_entropy`, SGD with weight
+  decay, momentum, Nesterov, Adam and AdamW): losses within 2.4e-7, weights,
+  gradients and optimizer state within 1.2e-7 after six steps, and eager steps
+  after `sync()`/`dispose()` continue the same trajectory. Without a host the
+  session's steps equal the same steps as separate compiled calls bit for bit.
+- **Exclusivity.** While a session is live its parameters are *refused* (a
+  `RuntimeError`) to compiled calls, to a second `prepare()` and to eager
+  `optimizer.step()`; `sync()` and `dispose()` first. Optimizer options are
+  snapshotted at `prepare()`; changing them makes the next step raise. Eager
+  edits to the parameters themselves are not detected: `sync()` overwrites them.
+- **Failure.** A step the device refuses (`ComputeError`, delivered to
+  `on_error` or raised) poisons the session, since carried state may have
+  advanced before the readback check; only `dispose()` remains. What was not
+  synced is lost on `dispose()`.
+- **Asynchrony.** In the playground the host creates the session after the
+  current call returns (`on_ready(prepared)`, `prepared.backend`); steps
+  requested meanwhile queue behind it. Without a host (`zipp py`, CPython for
+  `zipp_gpu` itself) the session runs on the tensor kernels and every callback
+  runs before the call returns. A `steps()` run submits at most 64 steps.
+- **Inference.** `torch.compile(model).prepare(x)` also works: the weights are
+  uploaded once and each `step` feeds only `x`; `sync()` has nothing to do.
+
+Measured on an RTX 5090 in headless Chrome, driving the engine from Python
+through the gpu-lab adapter (784-256-10, batch 64, Adam, cross-entropy; warm
+medians over 15 calls, 7 runs for the eight-step row):
+
+| Backend | `compiled()` per call | `prepared.step` per call | `prepared.steps`, 8 per run, per step |
+|---|---|---|---|
+| WebGPU | 74.4 ms | 5.1 ms | 1.84 ms |
+| WebGL2 | 88.8 ms | 3.3 ms | 2.24 ms |
+| WebAssembly | 73.7 ms | 4.9 ms | 3.63 ms |
+
+Of a `compiled()` call about 34 ms is the guest recording and validating the
+step (every input storage is scanned for finiteness in the interpreter), the
+host's own execution with the 2.4 MB readback is 4-19 ms, and the rest is
+transport and the commit of 16 tensors. A prepared step feeds one 64x784 batch
+(about 1 ms of guest time), the host runs it in 1.4-3.7 ms, and a `sync()` of
+the 2.4 MB of weights, gradients and moments takes 26-29 ms (download, delivery
+into tensor storage, the finiteness check of every value, and the commit). These
+are one machine's numbers for one small model, not a benchmark of the backends.
 
 ## Compatibility boundaries
 
@@ -131,8 +215,8 @@ calls `.item()`, `.tolist()` or `.backward()` on a compiled result needs adaptin
 The returned object exposes `.shape`, `.submit`, `.backend` and `.stats`; its
 backend and stats become available before the success callback runs.
 
-General GPU autograd (outside the training subset below), GPU convolution, GPU recurrent modules, arbitrary broadcasting,
-axis reductions, data-dependent tensor branches, persistent device tensors,
+General GPU autograd (outside the training subset above), GPU convolution, GPU recurrent modules,
+data-dependent tensor branches, device tensors outside a prepared session,
 kernel fusion, ONNX import and live model proxies are not implemented.
 Unsupported graph operations fail rather than claim GPU acceleration. `device="cuda"`
 and `.to("cuda")` are rejected; the CPU layer does not silently relabel storage.
@@ -179,8 +263,9 @@ code may expect. Reshape/view and detach can share contiguous storage; this is
 not a blanket promise that every view copies. Programs that depend on aliasing,
 offsets, noncontiguous strides or overlapping writes need adapting.
 
-GPU convolution and resident device tensors remain future work. Dense GPU
-training does not imply GPU Conv2d support.
+GPU convolution remains future work; device tensors are resident only within a
+prepared session (`compiled.prepare`). Dense GPU training does not imply GPU
+Conv2d support.
 
 See the [runnable visual example](../examples/python/torch_gpu/main.py),
 [CPU training regression](../crates/zipp-vm/tests/python_torch.rs) and
