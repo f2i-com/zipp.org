@@ -1,0 +1,4 @@
+int-subclass False True 1 6 BoolSub True 3 True
+int-subclass-new 5 USD 6 USD 5 True
+float-subclass 3.0 F 3.25
+str-subclass HI! abc 3 True

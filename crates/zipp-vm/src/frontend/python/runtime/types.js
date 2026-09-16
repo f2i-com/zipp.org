@@ -219,14 +219,20 @@
         const m = typeMethod(a, names[0]);
         if (m !== undefined) { const r = m.isBase ? baseBinop(op, a, b, false) : call(descrGet(m, a, ca), [b], null); if (r !== NOTIMPL) return r; }
         if (rm !== undefined) { const r = call(descrGet(rm, b, cb), [a], null); if (r !== NOTIMPL) return r; }
+        // A boxed int/float/str subclass instance without its own operator.
+        if ((ta === "object" && a !== null && a.pyval !== undefined) || (tb === "object" && b !== null && b.pyval !== undefined)) return binop(op, rt.unbox(a), rt.unbox(b), inplace);
         if (op === "add" && ta === "string") fail(E.TypeError, 'can only concatenate str (not "' + typeOf(b).name + '") to str');
         if (op === "add" && a !== null && ta === "object" && (a.cls === T.list || a.cls === T.tuple)) fail(E.TypeError, 'can only concatenate ' + a.cls.name + ' (not "' + typeOf(b).name + '") to ' + a.cls.name);
-        if (op === "mul" && ((ta === "string" && tb === "number") || (tb === "string" && ta === "number"))) fail(E.TypeError, "can't multiply sequence by non-int of type 'float'");
+        if (op === "mul") {
+            const isSeq = (v) => typeof v === "string" || (v !== null && typeof v === "object" && v.items !== undefined && (isInstance(v, T.list) || isInstance(v, T.tuple) || isInstance(v, T.bytes)));
+            const other = isSeq(a) ? b : isSeq(b) ? a : undefined;
+            if (other !== undefined && !isInt(other)) fail(E.TypeError, "can't multiply sequence by non-int of type '" + typeOf(other).name + "'");
+        }
         fail(E.TypeError, "unsupported operand type(s) for " + opSymbol(op) + (inplace ? "=" : "") + ": '" + typeOf(a).name + "' and '" + typeOf(b).name + "'");
     }
     // The builtin containers' arithmetic, structural (works for subclasses).
     function baseBinop(op, a, b, inplace) {
-        if (a === null || typeof a !== "object") return NOTIMPL;
+        if (a === null || typeof a !== "object" || a.pyval !== undefined) return NOTIMPL;
         if (a.items !== undefined && (isInstance(a, T.list) || isInstance(a, T.tuple))) {
             const isList = isInstance(a, T.list);
             const base = isList ? T.list : T.tuple;
@@ -351,7 +357,12 @@
             return r;
         }
         const l = typeMethod(v, "__len__");
-        if (l !== undefined) return asInt(call(descrGet(l, v, c), [], null)) !== 0n;
+        if (l !== undefined) {
+            const n = call(descrGet(l, v, c), [], null);
+            if (!isInt(n)) fail(E.TypeError, "'" + typeOf(n).name + "' object cannot be interpreted as an integer");
+            if (asInt(n) < 0n) fail(E.ValueError, "__len__() should return >= 0");
+            return asInt(n) !== 0n;
+        }
         return true;
     }
     R.truth = truth; rt.truth = truth;
@@ -387,6 +398,9 @@
             if (c === T.set || c === T.frozenset) return rt.setEq(a, b);
             if (c === T.range) { const n = rangeLength(a); return n === rangeLength(b) && (n === 0n || (a.start === b.start && (n === 1n || a.step === b.step))); }
             if (c === T.slice) return eq(a.start, b.start) && eq(a.stop, b.stop) && eq(a.step, b.step);
+            // Bound methods are fresh per access: equal when they bind the
+            // same function to the same (identical) object.
+            if (c === T.method) return a.func === b.func && a.self === b.self;
         }
         if (ta === "object" && a !== null) {
             const m = typeMethod(a, "__eq__");
@@ -461,6 +475,7 @@
             if (m !== undefined) { const r = call(descrGet(m, a, a.cls), [b], null); if (r !== NOTIMPL) return truth(r); }
         }
         if (rm !== undefined) { const r = call(descrGet(rm, b, b.cls), [a], null); if (r !== NOTIMPL) return truth(r); }
+        if ((ta === "object" && a !== null && a.pyval !== undefined) || (tb === "object" && b !== null && b.pyval !== undefined)) return cmp(op, rt.unbox(a), rt.unbox(b));
         const sym = { lt: "<", le: "<=", gt: ">", ge: ">=" }[op];
         fail(E.TypeError, "'" + sym + "' not supported between instances of '" + typeOf(a).name + "' and '" + typeOf(b).name + "'");
     }
@@ -556,6 +571,7 @@
         if (container.items !== undefined && (isInstance(container, T.list) || isInstance(container, T.tuple))) { for (const x of container.items) if (eq(x, needle)) return true; return false; }
         if (container.map !== undefined && isInstance(container, T.dict)) return rt.dictHas(container, needle);
         if (container.map !== undefined) return rt.setHas(container, needle);
+        if (container.pyval !== undefined) return baseContains(container.pyval, needle);
         if (isInstance(container, T.range)) {
             if (typeof needle === "number" && Number.isInteger(needle)) needle = BigInt(needle);
             if (!isInt(needle)) return false;
@@ -582,6 +598,7 @@
             const m = typeMethod(container, "__contains__");
             if (m !== undefined) { if (m.isBase) return baseContains(container, needle); return truth(call(descrGet(m, container, c), [needle], null)); }
         }
+        if (!rt.isIterable(container)) fail(E.TypeError, "argument of type '" + typeOf(container).name + "' is not iterable");
         const it = rt.iter(container);
         for (;;) { const v = rt.fornext(it); if (v === STOP) return false; if (eq(v, needle)) return true; }
     }
@@ -617,6 +634,7 @@
         if (c === T.tuple || c === T.frozenset || c === T.bytes || c === T.range) return "\0" + baseKey(v);
         if (c === T.list || c === T.dict || c === T.set) fail(E.TypeError, "unhashable type: '" + c.name + "'");
         if (c === T.slice) fail(E.TypeError, "unhashable type: 'slice'");
+        if (c === T.method) { const s = v.self; return "\0m" + rt.ident(v.func) + ":" + (s !== null && typeof s === "object" ? "o" + rt.ident(s) : keyStr(s)); }
         const h = typeMethod(v, "__hash__");
         if (h === null) fail(E.TypeError, "unhashable type: '" + c.name + "'");
         if (h === undefined || h === rt.ObjectType.dict.get("__hash__")) {
@@ -626,7 +644,7 @@
             if (eqm !== undefined && eqm !== rt.ObjectType.dict.get("__eq__")) fail(E.TypeError, "unhashable type: '" + c.name + "'");
             return v;
         }
-        if (h.isBase) return "\0" + baseKey(v);
+        if (h.isBase) return v.pyval !== undefined ? keyOf(v.pyval) : "\0" + baseKey(v);
         // A user hash shares the bucket of the int with that hash, so an
         // instance equal to an int key (through either side's __eq__) finds it.
         return intKey(hashBigInt(userHash(h, v, c)));
@@ -815,8 +833,18 @@
     function dictCopy(d) { const out = dict(); for (const [k, v] of dictEntries(d)) dictSet(out, k, v); return out; }
     function dictFromMap(m) { const d = dict(); for (const [k, v] of m) dictSet(d, k, v); return d; }
     function mapFromDict(d) { const m = new Map(); for (const [k, v] of dictEntries(d)) m.set(typeof k === "string" ? k : rt.str(k), v); return m; }
+    // A dict subclass that keeps dict's own __iter__ is read from its
+    // storage (CPython's dict_merge fast path ignores __getitem__/keys()).
+    function isPlainDictStorage(v) {
+        if (v === null || typeof v !== "object" || v.map === undefined) return false;
+        if (v.cls === T.dict) return true;
+        if (!isInstance(v, T.dict)) return false;
+        const it = typeMethod(v, "__iter__");
+        return it !== undefined && it !== null && it.isBase === true;
+    }
+    rt.isPlainDictStorage = isPlainDictStorage;
     function asDict(v, message) {
-        if (v !== null && typeof v === "object" && v.cls === T.dict) return v;
+        if (isPlainDictStorage(v)) return v;
         if (v !== null && typeof v === "object" && typeMethod(v, "keys") !== undefined) {
             const out = dict();
             const keys = callMethod(v, "keys", []);
@@ -881,7 +909,13 @@
         let out;
         switch (op) {
             case "or": out = inplace ? a : setFrom(a, type); for (const x of setValues(b)) setAdd(out, x); return out;
-            case "and": out = set(type); for (const x of setValues(a)) if (setHas(b, x)) setAdd(out, x); if (inplace) { a.map = out.map; a.size = out.size; return a; } return out;
+            case "and": {
+                // As CPython: walk the right operand unless it is the larger,
+                // so equal elements of different types come from that side.
+                const walk = b.size > a.size ? a : b, probe = walk === a ? b : a;
+                out = set(type); for (const x of setValues(walk)) if (setHas(probe, x)) setAdd(out, x);
+                if (inplace) { a.map = out.map; a.size = out.size; return a; } return out;
+            }
             case "sub": out = set(type); for (const x of setValues(a)) if (!setHas(b, x)) setAdd(out, x); if (inplace) { a.map = out.map; a.size = out.size; return a; } return out;
             case "xor": out = set(type); for (const x of setValues(a)) if (!setHas(b, x)) setAdd(out, x); for (const x of setValues(b)) if (!setHas(a, x)) setAdd(out, x); if (inplace) { a.map = out.map; a.size = out.size; return a; } return out;
         }
@@ -986,6 +1020,7 @@
             if (miss !== undefined) return call(descrGet(miss, o, o.cls), [k], null);
             throw rt.makeExc(E.KeyError, [k]);
         }
+        if (o.pyval !== undefined) return baseGetitem(o.pyval, k);
         if (isInstance(o, T.range)) {
             if (isSlice(k)) {
                 const [start, , step, count] = sliceIndices(k, Number(rangeLength(o)));
@@ -1090,6 +1125,8 @@
         if (typeof v === "string") return BigInt(strLen(v));
         if (v.items !== undefined) return BigInt(v.items.length);
         if (v.map !== undefined) return BigInt(v.size);
+        // A boxed str subclass instance.
+        if (v.pyval !== undefined) return baseLen(v.pyval);
         if (isInstance(v, T.range)) return rangeLength(v);
         fail(E.TypeError, "object of type '" + typeOf(v).name + "' has no len()");
     }

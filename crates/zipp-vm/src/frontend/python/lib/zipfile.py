@@ -2,6 +2,7 @@
 PyTorch checkpoints use); DEFLATE entries can be listed but not read, as the
 runtime has no zlib."""
 import struct
+import _zipp_tensor as _k
 
 ZIP_STORED = 0
 ZIP_DEFLATED = 8
@@ -33,12 +34,9 @@ class ZipInfo:
 
 
 def _crc32(data):
-    crc = 0xFFFFFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            crc = (crc >> 1) ^ (0xEDB88320 if crc & 1 else 0)
-    return crc ^ 0xFFFFFFFF
+    # A table-driven CRC-32 in the runtime: a per-bit Python loop took
+    # seconds per megabyte of checkpoint.
+    return _k.crc32(bytes(data))
 
 
 class ZipFile:

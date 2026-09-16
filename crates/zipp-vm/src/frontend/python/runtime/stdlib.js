@@ -18,6 +18,19 @@
             group: m[8], precision: m[9] === undefined ? null : parseInt(m[9], 10), type: m[10] };
     }
     function group(digits, sep) { return digits.replace(/\B(?=(\d{3})+(?!\d))/g, sep); }
+    // `digits` grouped by `size` with `sep`, left-padded with zeros that are
+    // grouped too until at least `minWidth` characters, never starting with
+    // a separator (CPython's zero padding with a grouping option).
+    function groupPadded(digits, sep, size, minWidth) {
+        let res = "", i = digits.length, count = 0;
+        while (i > 0 || res.length < minWidth) {
+            if (count === size) { res = sep + res; count = 0; }
+            res = (i > 0 ? digits[--i] : "0") + res; count++;
+        }
+        return res;
+    }
+    // The '0' flag, or an explicit '0' fill with '=' alignment.
+    const zeroPadded = (s) => (s.zero && s.align === undefined) || (s.fill === "0" && s.align === "=");
     function applyAlign(body, s, defaultAlign, signChar) {
         let fill = s.fill, align = s.align;
         if (align === undefined) { if (s.zero && s.type !== "s") { fill = "0"; align = "="; } else align = defaultAlign; }
@@ -57,7 +70,8 @@
                 // switch to exponent form comes one digit earlier than 'g'.
                 if (e2 < -4 || e2 >= (type === undefined ? p - 1 : p)) {
                     body = expForm(ax, p - 1);
-                    if (!s.alt) body = body.replace(/\.?0+e/, "e");
+                    // Without a type, "#" only keeps the point (repr digits, not %g's).
+                    if (!s.alt || (type === undefined && s.precision === null)) body = body.replace(/\.?0+e/, "e");
                 } else {
                     body = ax.toFixed(Math.max(0, p - 1 - e2));
                     if (!s.alt && body.includes(".")) body = body.replace(/\.?0+$/, "");
@@ -68,7 +82,14 @@
             }
         }
         if (type === "E" || type === "G" || type === "F") body = body.toUpperCase();
-        if (s.group && Number.isFinite(ax)) { const i = body.indexOf("."); body = i < 0 ? group(body, s.group) : group(body.slice(0, i), s.group) + body.slice(i); }
+        if (!Number.isFinite(ax)) { if (type === "%") body += "%"; return applyAlign(body, s, ">", signOf(neg, s)); }
+        // '#' keeps the decimal point even with no digits after it.
+        if (s.alt && !body.includes(".")) { const k = body.search(/[eE%]/); body = k < 0 ? body + "." : body.slice(0, k) + "." + body.slice(k); }
+        if (s.group) {
+            const intLen = /^\d*/.exec(body)[0].length, rest = body.slice(intLen);
+            if (zeroPadded(s) && s.width) { const sign = signOf(neg, s); return sign + groupPadded(body.slice(0, intLen), s.group, 3, s.width - sign.length - rest.length) + rest; }
+            body = group(body.slice(0, intLen), s.group) + rest;
+        }
         return applyAlign(body, s, ">", signOf(neg, s));
     }
     function expForm(ax, p) {
@@ -90,18 +111,16 @@
             default: fail(E.ValueError, "Unknown format code '" + s.type + "' for object of type 'int'");
         }
         const prefix = /^0[boxBOX]/.test(body) ? body.slice(0, 2) : "";
-        let digits = body.slice(prefix.length);
-        if (s.group) {
-            if (s.type && "boxX".includes(s.type)) { if (s.group === ",") fail(E.ValueError, "Cannot specify ',' with '" + s.type + "'."); digits = digits.replace(/\B(?=(\w{4})+(?!\w))/g, "_"); }
-            else digits = group(digits, s.group);
+        const raw = body.slice(prefix.length);
+        const size = s.type && "boxX".includes(s.type) ? 4 : 3;
+        if (s.group && size === 4 && s.group === ",") fail(E.ValueError, "Cannot specify ',' with '" + s.type + "'.");
+        // Zero padding goes between the prefix/sign and the digits, and is
+        // grouped along with them.
+        if (zeroPadded(s) && s.width) {
+            const sign = signOf(neg, s), minWidth = s.width - sign.length - prefix.length;
+            return sign + prefix + (s.group ? groupPadded(raw, s.group, size, minWidth) : raw.padStart(minWidth, "0"));
         }
-        // Zero padding goes between the prefix/sign and the digits.
-        if (s.zero && s.align === undefined && s.width !== undefined) {
-            const sign = signOf(neg, s);
-            const pad = Math.max(0, s.width - sign.length - prefix.length - digits.length);
-            return sign + prefix + "0".repeat(pad) + digits;
-        }
-        return applyAlign(prefix + digits, s, ">", signOf(neg, s));
+        return applyAlign(prefix + (s.group ? groupPadded(raw, s.group, size, 0) : raw), s, ">", signOf(neg, s));
     }
     function formatValue(v, spec) {
         if (typeof v === "string") {
@@ -116,6 +135,8 @@
         if (typeof v === "number") { const s = parseSpec(spec); if (s.type && "bcdoxXn".includes(s.type)) fail(E.ValueError, "Unknown format code '" + s.type + "' for object of type 'float'"); return formatFloat(v, s, s.type); }
         if (v === null && spec === "") return "None";
         const m = typeMethod(v, "__format__");
+        // An int/float/str subclass instance formats its value unless it defines __format__.
+        if (spec !== "" && v !== null && typeof v === "object" && v.pyval !== undefined && m === rt.ObjectType.dict.get("__format__")) return formatValue(v.pyval, spec);
         if (m !== undefined) { const r = call(descrGet(m, v, typeOf(v)), [spec], null); if (typeof r !== "string") fail(E.TypeError, "__format__ must return a str"); return r; }
         if (spec === "") return str(v);
         fail(E.TypeError, "unsupported format string passed to " + typeOf(v).name + ".__format__");
@@ -523,7 +544,7 @@
         fn(g, "rename", 2, (a) => { const f = rt.vfs.get(needStr(a[0])); if (f === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + a[0] + "'"); rt.vfs.set(needStr(a[1]), f); rt.vfs.remove(needStr(a[0])); return null; });
         fn(g, "rmdir", 1, () => null);
         for (const n of ["chdir", "system"]) fn(g, n, -1, () => fail(E.OSError, "os." + n + " is not available in the Python sandbox"));
-        fn(g, "urandom", 1, (a) => rt.bytes(Array.from({ length: Number(needInt(a[0])) }, () => Math.floor(Math.random() * 256))));
+        fn(g, "urandom", 1, (a) => { const n = Number(needInt(a[0])); if (n < 0) fail(E.ValueError, "negative argument not allowed"); const out = rt.zeroBytes(n); for (let i = 0; i < n; i++) out[i] = Math.floor(Math.random() * 256); return rt.bytes(out); });
     });
     mod("io", (g) => {
         const StringIO = pyClass("StringIO", "io", {
@@ -933,7 +954,7 @@
                 else if (size === 2) { if (c === "h") view.setInt16(it.offset, Number(n), s.little); else view.setUint16(it.offset, Number(n), s.little); }
                 else { if (c === "b") view.setInt8(it.offset, Number(n)); else view.setUint8(it.offset, Number(n)); }
             }
-            return rt.bytes(Array.from(bytes));
+            return rt.bytes(rt.bytesFromU8(bytes));
         }
         function halfBits(x) {
             // IEEE 754 binary16 with round-to-nearest-even.
@@ -966,8 +987,8 @@
             for (const it of s.items) {
                 const c = it.code;
                 if (c === "x") continue;
-                if (c === "s") { out.push(rt.bytes(Array.from(bytes.slice(it.offset, it.offset + it.count)))); continue; }
-                if (c === "p") { const n = Math.min(bytes[it.offset], it.count - 1); out.push(rt.bytes(Array.from(bytes.slice(it.offset + 1, it.offset + 1 + n)))); continue; }
+                if (c === "s") { out.push(rt.bytes(rt.bytesFromU8(bytes.slice(it.offset, it.offset + it.count)))); continue; }
+                if (c === "p") { const n = Math.min(bytes[it.offset], it.count - 1); out.push(rt.bytes(rt.bytesFromU8(bytes.slice(it.offset + 1, it.offset + 1 + n)))); continue; }
                 if (c === "c") { out.push(rt.bytes([bytes[it.offset]])); continue; }
                 if (c === "?") { out.push(bytes[it.offset] !== 0); continue; }
                 if (c === "f") { out.push(view.getFloat32(it.offset, s.little)); continue; }
@@ -1118,6 +1139,8 @@
             catch (e) {
                 if (stopped(e)) return e !== exc;
                 if (e === exc) return false;
+                // A StopIteration from the block comes back as PEP 479's RuntimeError.
+                if (stopped(exc) && e !== null && typeof e === "object" && e.cls === E.RuntimeError && e.cause === exc) return false;
                 throw e;
             }
         }));
@@ -1805,7 +1828,8 @@
         fnkw(g, "dataclass", (a) => { const kw = kwOf(a, ["init", "repr", "eq", "order", "frozen", "unsafe_hash", "slots", "kw_only"]); if (a.length === 1 && isType(a[0])) return process(a[0], kw); return builtin("dataclass", 1, (b) => process(b[0], kw)); });
         fn(g, "fields", 1, (a) => { const c = isType(a[0]) ? a[0] : typeOf(a[0]); return tuple(rt.dictEntryList(c.dict.get("__dataclass_fields__") || dict()).map((e) => e[1])); });
         fnkw(g, "asdict", (a) => { const conv = (v) => { if (v !== null && typeof v === "object" && v.dict && typeOf(v).dict.has("__dataclass_fields__")) { const d = dict(); for (const [n] of rt.dictEntryList(typeOf(v).dict.get("__dataclass_fields__"))) dictSet(d, n, conv(v.dict.get(n))); return d; } if (v !== null && typeof v === "object" && (v.cls === T.list || v.cls === T.tuple)) return rt.sequence(v.cls, v.items.map(conv)); if (v !== null && typeof v === "object" && v.cls === T.dict) { const d = dict(); for (const [k, x] of dictEntries(v)) dictSet(d, k, conv(x)); return d; } return v; }; return conv(a[0]); });
-        fn(g, "astuple", 1, (a) => tuple(rt.dictEntryList(typeOf(a[0]).dict.get("__dataclass_fields__")).map((e) => a[0].dict.get(e[0]))));
+        // astuple recurses like asdict: into dataclasses, lists, tuples and dicts.
+        fn(g, "astuple", 1, (a) => { const conv = (v) => { if (v !== null && typeof v === "object" && v.dict && typeOf(v).dict.has("__dataclass_fields__")) return tuple(rt.dictEntryList(typeOf(v).dict.get("__dataclass_fields__")).map((e) => conv(v.dict.get(e[0])))); if (v !== null && typeof v === "object" && (v.cls === T.list || v.cls === T.tuple)) return rt.sequence(v.cls, v.items.map(conv)); if (v !== null && typeof v === "object" && v.cls === T.dict) { const d = dict(); for (const [k, x] of dictEntries(v)) dictSet(d, conv(k), conv(x)); return d; } return v; }; return conv(a[0]); });
         fn(g, "is_dataclass", 1, (a) => { const c = isType(a[0]) ? a[0] : typeOf(a[0]); return c.dict.has("__dataclass_fields__") || c.mro.some((x) => x.dict.has("__dataclass_fields__")); });
         fnkw(g, "replace", (a) => { const kw = kwOf(a, null); const o = a[0]; const c = typeOf(o); const args = new Map(); for (const [n] of rt.dictEntryList(c.dict.get("__dataclass_fields__"))) args.set(n, kw && kw.has(n) ? kw.get(n) : o.dict.get(n)); return call(c, [], args); });
     });

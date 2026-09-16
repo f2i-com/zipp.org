@@ -1,0 +1,5 @@
+exhaust [1, 2]
+after-exhaust [] done
+RuntimeError dictionary changed size during iteration
+RuntimeError dictionary changed size during iteration
+RuntimeError dictionary changed size during iteration

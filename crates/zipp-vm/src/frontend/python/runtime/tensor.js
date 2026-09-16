@@ -751,7 +751,17 @@
         else if (a.dtype === "int64") { const b = new ArrayBuffer(n * 8), v = new DataView(b); for (let i = 0; i < n; i++) v.setBigInt64(i * 8, BigInt(Math.trunc(a.data[i])), true); bytes = new Uint8Array(b); }
         else if (a.dtype === "int32") { const b = new ArrayBuffer(n * 4), v = new DataView(b); for (let i = 0; i < n; i++) v.setInt32(i * 4, a.data[i], true); bytes = new Uint8Array(b); }
         else bytes = Uint8Array.from(a.data);
-        return rt.bytes(Array.from(bytes));
+        return rt.bytes(rt.bytesFromU8(bytes));
+    }
+    let CRC_TABLE = null;
+    function crc32(items, start) {
+        if (CRC_TABLE === null) {
+            CRC_TABLE = new Int32Array(256);
+            for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; CRC_TABLE[n] = c; }
+        }
+        let c = start ^ 0xFFFFFFFF;
+        for (let i = 0; i < items.length; i++) c = CRC_TABLE[(c ^ items[i]) & 0xFF] ^ (c >>> 8);
+        return (c ^ 0xFFFFFFFF) >>> 0;
     }
     function fromBytes(dtype, b, count) {
         const items = b.items, buf = new ArrayBuffer(items.length), u8 = new Uint8Array(buf);
@@ -885,6 +895,8 @@
         fn("randperm", 2, (a) => randperm(a[0], num(a[1])));
         fn("tobytes", 1, (a) => toBytes(needS(a[0])));
         fn("frombytes", 3, (a) => fromBytes(rt.needStr(a[0]), a[1], a[2] === undefined || a[2] === null ? null : num(a[2])), 2);
+        // zlib's CRC-32 of a bytes object, for zipfile (torch.save checkpoints).
+        fn("crc32", 2, (a) => BigInt(crc32(a[0].items, a[1] === undefined ? 0 : num(a[1]))), 1);
         fn("dot_sum", 2, (a) => { const x = needS(a[0]).data, y = needS(a[1]).data; let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; });
         fn("axpy", 3, (a) => { const alpha = num(a[0]), x = needS(a[1]).data, y = needS(a[2]).data; for (let i = 0; i < y.length; i++) y[i] = castValue(a[2].dtype, y[i] + alpha * x[i]); written(a[2]); return null; });
         g.set("Storage", Storage); g.set("Generator", Gen);

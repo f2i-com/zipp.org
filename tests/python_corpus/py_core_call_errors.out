@@ -1,0 +1,14 @@
+too-many-dflt TypeError: dflt() takes from 1 to 2 positional arguments but 3 were given
+posonly-as-kw TypeError: posonly() got some positional-only arguments passed as keyword arguments: 'b'
+method-missing TypeError: K.m() missing 1 required positional argument: 'x'
+method-too-many TypeError: K.m() takes 2 positional arguments but 3 were given
+unbound-method TypeError: K.m() missing 1 required positional argument: 'x'
+static-missing TypeError: K.s() missing 1 required positional argument: 'x'
+class-too-many TypeError: K.c() takes 2 positional arguments but 3 were given
+init-missing TypeError: K.__init__() missing 1 required positional argument: 'v'
+init-too-many TypeError: K.__init__() takes 2 positional arguments but 3 were given
+init-kw TypeError: K.__init__() got an unexpected keyword argument 'w'
+lambda-missing TypeError: <lambda>.<locals>.<lambda>() missing 1 required positional argument: 'y'
+lambda-too-many TypeError: <lambda>.<locals>.<lambda>() takes 0 positional arguments but 2 were given
+builtin-isinstance TypeError: isinstance expected 2 arguments, got 1
+nested-qualname TypeError: outer.<locals>.inner() missing 1 required positional argument: 'q'

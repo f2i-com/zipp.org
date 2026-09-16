@@ -1,0 +1,22 @@
+[1, 2, 3] 3 3
+base
+patched patched
+False False
+1
+11 3
+15
+-5 -5
+TypeError P() takes no arguments
+P
+R
+True
+m1
+m2
+0 1 2 
+99 99
+1
+bad 3 ('bad',)
+TypeError NoInit() takes no arguments
+3 6
+[1, 2] 1
+TypeError 'NoneType' object is not callable

@@ -32,14 +32,14 @@ function __zipp_py_set_input(json) {
         let message = rt.str(exc);
         let chain = "";
         let cause = exc.cause, ctx = exc.context;
-        if (cause !== null) chain = "The direct cause: " + rt.typeOf(cause).name + ": " + rt.str(cause) + (cause.traceback || "");
-        else if (ctx !== null && !exc.suppress) chain = "While handling: " + rt.typeOf(ctx).name + ": " + rt.str(ctx) + (ctx.traceback || "");
+        if (cause !== null) chain = "The direct cause: " + rt.typeOf(cause).name + ": " + rt.str(cause) + rt.excLocation(cause);
+        else if (ctx !== null && !exc.suppress) chain = "While handling: " + rt.typeOf(ctx).name + ": " + rt.str(ctx) + rt.excLocation(ctx);
         // `name: message` is what the host prints; the frames follow on
         // their own lines, outermost first, like CPython.
         const frames = rt.tracebackText(exc);
         const err = new Error(message);
         err.name = exc.cls.name;
-        err.message = (message ? message : "") + (exc.traceback || "") + (frames ? "\n" + frames.replace(/\n$/, "") : "") + (chain ? "\n" + chain : "");
+        err.message = (message ? message : "") + rt.excLocation(exc) + (frames ? "\n" + frames.replace(/\n$/, "") : "") + (chain ? "\n" + chain : "");
         err.pyexc = exc;
         return err;
     }
@@ -79,9 +79,16 @@ function __zipp_py_set_input(json) {
     // program-defined hook.
     rt.takeHostRequests = (function (take) {
         return function () {
-            const taken = take(), out = [];
-            for (let i = 0; i < taken.length; i++) out.push({ id: taken[i].id, kind: taken[i].kind, payload: toHost(taken[i].payload, 0) });
-            return out;
+            // Converting a payload can run guest __str__; its exception leaves as a host error.
+            try {
+                const taken = take(), out = [];
+                for (let i = 0; i < taken.length; i++) out.push({ id: taken[i].id, kind: taken[i].kind, payload: toHost(taken[i].payload, 0) });
+                return out;
+            } catch (e) {
+                const err = hostError(e);
+                if (err === null) return [];
+                throw err;
+            }
         };
     })(rt.takeHostRequests);
     const runtimeHooks = new Map([
@@ -97,6 +104,8 @@ function __zipp_py_set_input(json) {
         ["__zipp_py_vfs_list", function () { return rt.vfs.list(); }],
     ]);
     rt.vfsChangedText = function () {
+            // Handles the program left open are flushed, as at CPython's exit.
+            rt.flushOpenFiles();
             const changes = [];
             for (const path of rt.vfs.changed()) {
                 const bytes = rt.vfs.get(path);
@@ -156,9 +165,11 @@ function __zipp_py_set_input(json) {
             const holder = { code: body, globals: new Map(), cells: [] };
             holder.code([]);
             rt.flushOut();
+            rt.flushOpenFiles();
             return null;
         } catch (e) {
             rt.flushOut();
+            rt.flushOpenFiles();
             const err = hostError(e);
             if (err === null) return null;
             throw err;

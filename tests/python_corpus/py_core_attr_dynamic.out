@@ -1,0 +1,6 @@
+delattr-missing 'Recorder' object has no attribute 'zzz'
+slots-dict False ['anything'] False
+TypeError vars() argument must have __dict__ attribute
+TypeError attribute name must be string, not 'int'
+TypeError attribute name must be string, not 'int'
+TypeError attribute name must be string, not 'NoneType'

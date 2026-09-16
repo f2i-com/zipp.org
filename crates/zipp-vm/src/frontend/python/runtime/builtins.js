@@ -28,8 +28,8 @@
         return null;
     }
     function kwget(kw, name, dflt) { if (kw === null) return dflt; const v = kw.get(name); return v === undefined ? dflt : v; }
-    function needInt(v, what) { if (isInt(v)) return asInt(v); fail(E.TypeError, "'" + typeOf(v).name + "' object cannot be interpreted as an integer" + (what ? " (" + what + ")" : "")); }
-    function needStr(v, what) { if (typeof v === "string") return v; fail(E.TypeError, (what || "argument") + " must be str, not " + typeOf(v).name); }
+    function needInt(v, what) { if (isInt(v)) return asInt(v); if (v !== null && typeof v === "object" && typeof v.pyval === "bigint") return v.pyval; fail(E.TypeError, "'" + typeOf(v).name + "' object cannot be interpreted as an integer" + (what ? " (" + what + ")" : "")); }
+    function needStr(v, what) { if (typeof v === "string") return v; if (v !== null && typeof v === "object" && typeof v.pyval === "string") return v.pyval; fail(E.TypeError, (what || "argument") + " must be str, not " + typeOf(v).name); }
     function toIndex(v) { return Number(rt.indexOf(v)); }
     rt.needInt = needInt; rt.needStr = needStr; rt.kwOf = kwOf; rt.kwget = kwget;
 
@@ -44,14 +44,26 @@
     method(ObjectType, "__hash__", 1, function (args) { return BigInt(rt.ident(args[0])); });
     method(ObjectType, "__repr__", 1, function (args) { const v = args[0]; const c = typeOf(v); return "<" + (c.module === "builtins" ? "" : c.module + ".") + c.qualname + " object at 0x" + rt.ident(v).toString(16).padStart(8, "0") + ">"; });
     method(ObjectType, "__str__", 1, function (args) { return repr(args[0]); });
-    method(ObjectType, "__setattr__", 3, function (args) { const o = args[0]; if (o === null || typeof o !== "object" || o.dict === undefined) fail(E.AttributeError, "can't set attribute"); o.dict.set(args[1], args[2]); return null; });
+    // A class (a metaclass's `super().__setattr__`) goes through setattr so
+    // the lookup caches see the change.
+    method(ObjectType, "__setattr__", 3, function (args) { const o = args[0]; if (o !== null && typeof o === "object" && o.isType === true) return rt.setattr(o, args[1], args[2]); if (o === null || typeof o !== "object" || o.dict === undefined) fail(E.AttributeError, "can't set attribute"); o.dict.set(args[1], args[2]); return null; });
     method(ObjectType, "__getattribute__", 2, function (args) { return rt.getattr(args[0], args[1]); });
-    method(ObjectType, "__delattr__", 2, function (args) { const o = args[0]; if (!o.dict.delete(args[1])) fail(E.AttributeError, args[1]); return null; });
+    method(ObjectType, "__delattr__", 2, function (args) { const o = args[0]; if (o !== null && typeof o === "object" && o.isType === true) return R.delattr(o, args[1]); if (o === null || typeof o !== "object" || o.dict === undefined || o.dict === null || !o.dict.delete(args[1])) fail(E.AttributeError, "'" + typeOf(o).name + "' object has no attribute '" + args[1] + "'"); return null; });
     method(ObjectType, "__format__", 2, function (args) { if (args[1] !== "") fail(E.TypeError, "unsupported format string passed to " + typeOf(args[0]).name + ".__format__"); return str(args[0]); });
     method(ObjectType, "__init_subclass__", -1, function () { return null; });
     method(ObjectType, "__dir__", 1, function (args) { return list(dirOf(args[0])); });
     method(ObjectType, "__reduce__", 1, function () { fail(E.TypeError, "cannot pickle"); });
-    ObjectType.dict.set("__class__", { cls: T.property, fget: builtin("__class__", 1, (a) => typeOf(a[0])), fset: null, fdel: null, doc: null });
+    // `obj.__class__ = Other`: for instances whose storage layout matches.
+    const layoutOf = (cls) => { for (const c of cls.mro) if (rt.allocators.has(c)) return isSubclass(c, E.BaseException) ? E.BaseException : c; return ObjectType; };
+    const setClass = builtin("__class__", 2, (a) => {
+        const o = a[0], cls = a[1];
+        if (!isType(cls)) fail(E.TypeError, "__class__ must be set to a class, not '" + typeOf(cls).name + "' object");
+        if (o === null || typeof o !== "object" || o.isType || o.dict === undefined || o.dict === null || typeOf(o).mro.indexOf(ObjectType) < 0 || rt.constructors.has(o.cls)) fail(E.TypeError, "__class__ assignment only supported for mutable types or ModuleType subclasses");
+        if (layoutOf(o.cls) !== layoutOf(cls) || (o.cls.noDict === true) !== (cls.noDict === true)) fail(E.TypeError, "__class__ assignment: '" + cls.name + "' object layout differs from '" + o.cls.name + "'");
+        o.cls = cls;
+        return null;
+    });
+    ObjectType.dict.set("__class__", { cls: T.property, fget: builtin("__class__", 1, (a) => typeOf(a[0])), fset: setClass, fdel: null, doc: null });
     method(ObjectType, "__sizeof__", 1, function () { return 64n; });
     function dirOf(v) {
         const names = new Set();
@@ -64,7 +76,7 @@
     }
     // Exceptions: BaseException.__init__ stores args.
     method(E.BaseException, "__init__", -1, function (args) {
-        const self = args[0]; self.args = tuple(args.slice(1)); rt.refreshExc(self); return null;
+        const self = args[0]; self.args = tuple(args.slice(1)); return null;
     });
     method(E.BaseException, "__str__", 1, function (args) { const a = args[0].args.items; return a.length === 0 ? "" : a.length === 1 ? str(a[0]) : repr(args[0].args); });
     method(E.KeyError, "__str__", 1, function (args) { const a = args[0].args.items; return a.length === 1 ? repr(a[0]) : a.length === 0 ? "" : repr(args[0].args); });
@@ -84,8 +96,6 @@
             if (self.cls === E.OSError && isInt(a[0])) { const sub = ERRNO_CLASS.get(asInt(a[0])); if (sub !== undefined) self.cls = sub; }
             self.args = tuple(a.slice(0, 2));
         } else self.args = tuple(a);
-        rt.refreshExc(self);
-        if (a.length >= 2 && a.length <= 5) self.message = str(self) + (self.traceback || "");
         return null;
     });
     method(E.OSError, "__str__", 1, function (args) {
@@ -98,7 +108,8 @@
     method(E.BaseException, "with_traceback", 2, function (args) { return args[0]; });
     method(E.BaseException, "add_note", 2, function (args) { return null; });
     for (const [name, exc] of Object.entries(E)) {
-        rt.allocators.set(exc, (cls) => rt.makeExc(cls, []));
+        // A constructed exception has no context until it is raised.
+        rt.allocators.set(exc, (cls) => { const e = rt.makeExc(cls, []); e.context = null; return e; });
         B.set(name, exc);
     }
     B.set("EnvironmentError", E.OSError); B.set("IOError", E.OSError);
@@ -146,6 +157,17 @@
     method(T.property, "getter", 2, (a) => ({ cls: T.property, fget: a[1], fset: a[0].fset, fdel: a[0].fdel, doc: a[0].doc }));
     method(T.property, "setter", 2, (a) => ({ cls: T.property, fget: a[0].fget, fset: a[1], fdel: a[0].fdel, doc: a[0].doc }));
     method(T.property, "deleter", 2, (a) => ({ cls: T.property, fget: a[0].fget, fset: a[0].fset, fdel: a[1], doc: a[0].doc }));
+    // The descriptor protocol of the builtin descriptors, callable directly
+    // (`C.__dict__["m"].__get__(obj, C)`); attribute lookup itself goes
+    // through descrGet.
+    const descrGetMethod = (a) => {
+        const owner = a[2] === undefined || a[2] === null ? (a[1] === null ? null : typeOf(a[1])) : a[2];
+        if (a[1] === null && owner === null) fail(E.TypeError, "__get__(None, None) is invalid");
+        const d = a[0];
+        if (d.cls === T.classmethod) return rt.bound(d.func, owner);
+        return descrGet(d, a[1], owner);
+    };
+    for (const t of [T.function, T.classmethod, T.staticmethod, T.property]) method(t, "__get__", 3, descrGetMethod, 2);
     rt.constructors.set(T.staticmethod, (args) => ({ cls: T.staticmethod, func: args[0] }));
     rt.constructors.set(T.classmethod, (args) => ({ cls: T.classmethod, func: args[0] }));
     rt.constructors.set(T.super, (args) => {
@@ -195,7 +217,7 @@
         if (args.length === 0) return 0n;
         if (args.length === 2) base = Number(needInt(args[1]));
         if (base !== 0 && (base < 2 || base > 36)) fail(E.ValueError, "int() base must be >= 2 and <= 36, or 0");
-        const v = args[0];
+        const v = typeof args[0] === "object" && args[0] !== null && typeof args[0].pyval === "string" ? args[0].pyval : args[0];
         if (typeof v === "string") return parseIntLiteral(v, base);
         if (args.length === 2 || (k && k.has("base"))) fail(E.TypeError, "int() can't convert non-string with explicit base");
         if (isInt(v)) return asInt(v);
@@ -216,7 +238,7 @@
     }
     rt.constructors.set(T.float, (args) => {
         if (args.length === 0) return 0.0;
-        const v = args[0];
+        const v = typeof args[0] === "object" && args[0] !== null && typeof args[0].pyval === "string" ? args[0].pyval : args[0];
         if (typeof v === "number") return v;
         if (isInt(v)) return toFloat(v);
         if (typeof v === "string") return parseFloatLiteral(v);
@@ -234,18 +256,20 @@
     method(T.int, "__index__", 1, (a) => asInt(a[0]));
     method(T.int, "__int__", 1, (a) => asInt(a[0]));
     method(T.int, "__float__", 1, (a) => toFloat(a[0]));
+    // Called unbound (`int.__add__(x, y)`) self may still be boxed, and the
+    // other operand may be a boxed subclass instance.
+    const unbox = rt.unbox;
     for (const [t, base] of [[T.int, true], [T.float, false]]) {
         for (const [name, op] of [["add", "add"], ["sub", "sub"], ["mul", "mul"], ["truediv", "truediv"], ["floordiv", "floordiv"], ["mod", "mod"], ["pow", "pow"], ["and", "and"], ["or", "or"], ["xor", "xor"], ["lshift", "lshift"], ["rshift", "rshift"]]) {
             if (!base && ["and", "or", "xor", "lshift", "rshift"].includes(op)) continue;
-            method(t, "__" + name + "__", 2, (a) => isNum(a[1]) ? R.binop(op, a[0], a[1]) : NOTIMPL);
-            method(t, "__r" + name + "__", 2, (a) => isNum(a[1]) ? R.binop(op, a[1], a[0]) : NOTIMPL);
+            method(t, "__" + name + "__", 2, (a) => { const y = unbox(a[1]); return isNum(y) ? R.binop(op, unbox(a[0]), y) : NOTIMPL; });
+            method(t, "__r" + name + "__", 2, (a) => { const y = unbox(a[1]); return isNum(y) ? R.binop(op, y, unbox(a[0])) : NOTIMPL; });
         }
-        method(t, "__neg__", 1, (a) => R.unop("neg", a[0]));
-        method(t, "__pos__", 1, (a) => a[0]);
-        method(t, "__abs__", 1, (a) => { const v = a[0]; return isInt(v) ? (asInt(v) < 0n ? -asInt(v) : asInt(v)) : Math.abs(v); });
-        method(t, "__bool__", 1, (a) => rt.truth(a[0]));
-        for (const [name, op] of [["__eq__", "eq"], ["__ne__", "ne"], ["__lt__", "lt"], ["__le__", "le"], ["__gt__", "gt"], ["__ge__", "ge"]]) method(t, name, 2, (a) => isNum(a[1]) ? rt.cmp(op, a[0], a[1]) : NOTIMPL);
-        method(t, "__str__", 1, (a) => str(a[0]));
+        method(t, "__neg__", 1, (a) => R.unop("neg", unbox(a[0])));
+        method(t, "__pos__", 1, (a) => unbox(a[0]));
+        method(t, "__abs__", 1, (a) => { const v = unbox(a[0]); return isInt(v) ? (asInt(v) < 0n ? -asInt(v) : asInt(v)) : Math.abs(v); });
+        method(t, "__bool__", 1, (a) => rt.truth(unbox(a[0])));
+        for (const [name, op] of [["__eq__", "eq"], ["__ne__", "ne"], ["__lt__", "lt"], ["__le__", "le"], ["__gt__", "gt"], ["__ge__", "ge"]]) method(t, name, 2, (a) => { const y = unbox(a[1]); return isNum(y) ? rt.cmp(op, unbox(a[0]), y) : NOTIMPL; });
     }
     method(T.int, "__invert__", 1, (a) => R.unop("invert", a[0]));
     method(T.int, "bit_count", 1, (a) => { let n = asInt(a[0]); if (n < 0n) n = -n; let c = 0n; while (n) { c += n & 1n; n >>= 1n; } return c; });
@@ -358,11 +382,11 @@
     method(S, "__str__", 1, (a) => a[0]);
     method(S, "__getitem__", 2, (a) => rt.baseGetitem(a[0], a[1]));
     method(S, "__contains__", 2, (a) => rt.baseContains(a[0], a[1]));
-    method(S, "__add__", 2, (a) => typeof a[1] === "string" ? a[0] + a[1] : NOTIMPL);
+    method(S, "__add__", 2, (a) => { const y = rt.unbox(a[1]); return typeof y === "string" ? strSelf(a) + y : NOTIMPL; });
     method(S, "__mul__", 2, (a) => R.binop("mul", a[0], a[1]));
     method(S, "__mod__", 2, (a) => rt.percentFormat(a[0], a[1]));
-    method(S, "__eq__", 2, (a) => typeof a[1] === "string" ? a[0] === a[1] : NOTIMPL);
-    method(S, "__lt__", 2, (a) => typeof a[1] === "string" ? rt.compareStrings(a[0], a[1]) < 0 : NOTIMPL);
+    method(S, "__eq__", 2, (a) => { const y = rt.unbox(a[1]); return typeof y === "string" ? strSelf(a) === y : NOTIMPL; });
+    method(S, "__lt__", 2, (a) => { const y = rt.unbox(a[1]); return typeof y === "string" ? rt.compareStrings(strSelf(a), y) < 0 : NOTIMPL; });
     method(S, "__iter__", 1, (a) => rt.baseIter(a[0]));
     method(S, "upper", 1, (a) => strSelf(a).toUpperCase());
     method(S, "lower", 1, (a) => strSelf(a).toLowerCase());
@@ -437,7 +461,7 @@
     });
     // Every line boundary str.splitlines recognizes.
     method(S, "splitlines", 2, (a) => { const keep = a[1] !== undefined && truth(a[1]); const s = strSelf(a); const out = []; const re = /([^\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]*)(\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]|$)/g; let m; while ((m = re.exec(s)) !== null && (m[1].length || m[2].length)) { out.push(keep ? m[1] + m[2] : m[1]); if (m[2] === "") break; } return list(out); }, 1);
-    method(S, "join", 2, (a) => { const parts = drain(a[1]); for (const p of parts) if (typeof p !== "string") fail(E.TypeError, "sequence item: expected str instance, " + typeOf(p).name + " found"); return rt.checkedText(parts.join(strSelf(a))); });
+    method(S, "join", 2, (a) => { const parts = drain(a[1]); for (let i = 0; i < parts.length; i++) if (typeof parts[i] !== "string") { const u = rt.unbox(parts[i]); if (typeof u !== "string") fail(E.TypeError, "sequence item " + i + ": expected str instance, " + typeOf(parts[i]).name + " found"); parts[i] = u; } return rt.checkedText(parts.join(strSelf(a))); });
     method(S, "replace", 4, (a) => {
         const s = strSelf(a), from = needStr(a[1]), to = needStr(a[2]); const count = a[3] === undefined ? -1 : Number(needInt(a[3]));
         if (from === "") {
@@ -627,11 +651,26 @@
         }
         return out + "'";
     };
+    // Large byte buffers are built element by element: past the engine's
+    // dense-array limit (2^20 natively, more under safe-sandbox)
+    // `new Array(n).fill()` leaves a sparse array and `Array.from(typedArray)`
+    // throws, where a push loop stays dense.
+    const DENSE_NATIVE = 1 << 20;
+    rt.zeroBytes = function (n) {
+        if (n < 0) fail(E.ValueError, "negative count");
+        if (n > rt.MAX_ITEMS) fail(E.MemoryError, "sequence limit exceeded");
+        if (n <= DENSE_NATIVE) return new Array(n).fill(0);
+        const out = []; for (let i = 0; i < n; i++) out.push(0); return out;
+    };
+    rt.bytesFromU8 = function (u8) {
+        if (u8.length <= DENSE_NATIVE) return Array.from(u8);
+        const out = []; for (let i = 0; i < u8.length; i++) out.push(u8[i]); return out;
+    };
     rt.constructors.set(T.bytes, (args) => {
         if (args.length === 0) return rt.bytes([]);
         const v = args[0];
         if (typeof v === "string") return rt.encodeStr(v, args[1] === undefined ? "utf-8" : args[1]);
-        if (isInt(v)) return rt.bytes(new Array(Number(asInt(v))).fill(0));
+        if (isInt(v)) return rt.bytes(rt.zeroBytes(Number(asInt(v))));
         if (v !== null && typeof v === "object" && v.cls === T.bytes) return rt.bytes(v.items.slice());
         return rt.bytes(drain(v).map((x) => { const n = Number(needInt(x)); if (n < 0 || n > 255) fail(E.ValueError, "bytes must be in range(0, 256)"); return n; }));
     });
@@ -650,7 +689,7 @@
     method(T.bytes, "startswith", 4, (a) => { const s = b2s(a[0]).slice(bIdx(a[2]) || 0, bIdx(a[3])); const p = a[1]; if (p !== null && typeof p === "object" && p.cls === T.tuple) return p.items.some((x) => s.startsWith(bArg(x))); return s.startsWith(bArg(p)); }, 2);
     method(T.bytes, "endswith", 4, (a) => { const s = b2s(a[0]).slice(bIdx(a[2]) || 0, bIdx(a[3])); const p = a[1]; if (p !== null && typeof p === "object" && p.cls === T.tuple) return p.items.some((x) => s.endsWith(bArg(x))); return s.endsWith(bArg(p)); }, 2);
     method(T.bytes, "split", 3, (a) => { const s = b2s(a[0]); const max = a[2] === undefined ? -1 : Number(needInt(a[2])); let parts; if (a[1] === undefined || a[1] === null) { parts = s.split(/[ \t\n\r\x0b\x0c]+/).filter((x) => x !== ""); if (max >= 0 && parts.length > max + 1) { const head = parts.slice(0, max); const rest = s.replace(/^[ \t\n\r\x0b\x0c]+/, ""); let pos = 0; for (let i = 0; i < max; i++) { pos = rest.indexOf(head[i], pos) + head[i].length; } parts = head.concat([rest.slice(pos).replace(/^[ \t\n\r\x0b\x0c]+/, "")]); } } else { const sep = bArg(a[1]); if (sep === "") fail(E.ValueError, "empty separator"); parts = s.split(sep); if (max >= 0 && parts.length > max + 1) parts = parts.slice(0, max).concat([parts.slice(max).join(sep)]); } return list(parts.map(s2b)); }, 1);
-    method(T.bytes, "join", 2, (a) => { const sep = b2s(a[0]); const parts = drain(a[1]).map((x) => { if (x === null || typeof x !== "object" || x.cls !== T.bytes) fail(E.TypeError, "sequence item: expected a bytes-like object, " + typeOf(x).name + " found"); return b2s(x); }); return s2b(parts.join(sep)); });
+    method(T.bytes, "join", 2, (a) => { const sep = b2s(a[0]); const parts = drain(a[1]).map((x, i) => { if (x === null || typeof x !== "object" || x.items === undefined || !isInstance(x, T.bytes)) fail(E.TypeError, "sequence item " + i + ": expected a bytes-like object, " + typeOf(x).name + " found"); return b2s(x); }); return s2b(parts.join(sep)); });
     const bStrip = (name, fnc) => method(T.bytes, name, 2, (a) => { const s = b2s(a[0]); const chars = a[1] === undefined || a[1] === null ? " \t\n\r\x0b\x0c" : bArg(a[1]); return s2b(fnc(s, chars)); }, 1);
     const lstrip = (s, cs) => { let i = 0; while (i < s.length && cs.indexOf(s[i]) >= 0) i++; return s.slice(i); };
     const rstrip = (s, cs) => { let j = s.length; while (j > 0 && cs.indexOf(s[j - 1]) >= 0) j--; return s.slice(0, j); };
@@ -773,7 +812,23 @@
         return out;
     }
     rt.sortItems = sortItems;
-    methodkw(L, "sort", (a) => { const kw = kwOf(a, ["key", "reverse"]); const l = listSelf(a); if (a.length > 1) fail(E.TypeError, "sort() takes no positional arguments"); l.items = sortItems(l.items, kwget(kw, "key", null), truth(kwget(kw, "reverse", false))); return null; });
+    // As CPython, the list is empty while it sorts (keys and comparisons see
+    // `[]`); a failed sort puts the items back, and any change made during
+    // the sort is discarded with a ValueError.
+    methodkw(L, "sort", (a) => {
+        const kw = kwOf(a, ["key", "reverse"]); const l = listSelf(a);
+        if (a.length > 1) fail(E.TypeError, "sort() takes no positional arguments");
+        const key = kwget(kw, "key", null), reverse = truth(kwget(kw, "reverse", false));
+        const saved = l.items;
+        l.items = [];
+        let sorted;
+        try { sorted = sortItems(saved, key, reverse); }
+        catch (e) { l.items = saved; throw e; }
+        const modified = l.items.length !== 0;
+        l.items = sorted;
+        if (modified) fail(E.ValueError, "list modified during sort");
+        return null;
+    });
 
     // ---- tuple ------------------------------------------------------------------------------------------------------
     rt.constructors.set(T.tuple, (args, kw, cls) => { const out = cls === T.tuple ? tuple([]) : rt.allocInstance(cls); if (args.length) out.items = drain(args[0]); return out; });
@@ -796,7 +851,7 @@
     function dictSelf(a) { const v = a[0]; if (v !== null && typeof v === "object" && v.map !== undefined && isInstance(v, T.dict)) return v; fail(E.TypeError, "descriptor requires a 'dict' object but received '" + typeOf(v).name + "'"); }
     function fillDict(d, src, kw) {
         if (src !== undefined && src !== null) {
-            if (src !== null && typeof src === "object" && src.cls === T.dict) { for (const [k, v] of dictEntries(src)) dictSet(d, k, v); }
+            if (rt.isPlainDictStorage(src)) { for (const [k, v] of dictEntries(src)) dictSet(d, k, v); }
             else if (src !== null && typeof src === "object" && typeMethod(src, "keys") !== undefined) { for (const [k, v] of dictEntries(rt.asDict(src))) dictSet(d, k, v); }
             else { for (const pair of drain(src)) { const kv = drain(pair); if (kv.length !== 2) fail(E.ValueError, "dictionary update sequence element has length " + kv.length + "; 2 is required"); dictSet(d, kv[0], kv[1]); } }
         }
@@ -822,7 +877,13 @@
     method(D, "clear", 1, (a) => { rt.dictClear(dictSelf(a)); return null; });
     method(D, "copy", 1, (a) => rt.dictCopy(dictSelf(a)));
     function view(type, d, pick) {
-        return { cls: type, dict: d, iter: () => { const entries = dictEntryList(d); let i = 0; return { cls: T.iterator, next: () => i < entries.length ? pick(entries[i++]) : STOP }; } };
+        return { cls: type, dict: d, iter: () => {
+            const entries = dictEntryList(d); let i = 0; const size = d.size;
+            return { cls: T.iterator, next: () => {
+                if (d.size !== size) fail(E.RuntimeError, "dictionary changed size during iteration");
+                return i < entries.length ? pick(entries[i++]) : STOP;
+            } };
+        } };
     }
     method(D, "keys", 1, (a) => view(T.dict_keys, dictSelf(a), (e) => e[0]));
     method(D, "values", 1, (a) => view(T.dict_values, dictSelf(a), (e) => e[1]));
@@ -841,6 +902,14 @@
             method(v, "__r" + name.slice(2), 2, (a) => rt.setBinop(op, setFrom(a[1], T.set), setFrom(a[0], T.set), false));
         }
         method(v, "isdisjoint", 2, (a) => rt.setBinop("and", setFrom(a[0], T.set), setFrom(a[1], T.set), false).size === 0);
+        // Set-like equality with sets, frozensets and the other keys/items views.
+        method(v, "__eq__", 2, (a) => {
+            const self = a[0], o = a[1];
+            if (o === null || typeof o !== "object" || !(o.cls === T.dict_keys || o.cls === T.dict_items || isInstance(o, T.set) || isInstance(o, T.frozenset))) return NOTIMPL;
+            if (len(self) !== len(o)) return false;
+            const it = self.iter();
+            for (;;) { const x = it.next(); if (x === STOP) return true; if (!rt.contains(o, x)) return false; }
+        });
     }
     D.dict.set("fromkeys", { cls: T.classmethod, func: builtin("fromkeys", 3, (a) => { const d = rt.construct(a[0], [], null); const v = a[2] === undefined ? null : a[2]; for (const k of drain(a[1])) dictSet(d, k, v); return d; }, 2) });
 
@@ -852,8 +921,14 @@
         method(type, "__iter__", 1, (a) => rt.baseIter(a[0]));
         method(type, "__repr__", 1, (a) => rt.baseRepr(a[0]));
         method(type, "__eq__", 2, (a) => a[1] !== null && typeof a[1] === "object" && (a[1].cls === T.set || a[1].cls === T.frozenset) ? rt.setEq(a[0], a[1]) : NOTIMPL);
+        // intersection() with a non-set argument keeps the argument's elements.
+        const intersectIterable = (s, other) => {
+            if (other !== null && typeof other === "object" && other.map !== undefined && !isInstance(other, T.dict)) return rt.setBinop("and", s, other, false);
+            const out = set(s.cls); for (const x of drain(other)) if (setHas(s, x)) setAdd(out, x); return out;
+        };
         for (const [name, op] of [["union", "or"], ["intersection", "and"], ["difference", "sub"], ["symmetric_difference", "xor"]]) {
-            method(type, name, -1, (a) => { let out = setFrom(a[0], type); for (let i = 1; i < a.length; i++) out = rt.setBinop(op, out, setFrom(a[i], type), false); return out; });
+            const step = op === "and" ? intersectIterable : (out, other) => rt.setBinop(op, out, setFrom(other, type), false);
+            method(type, name, -1, (a) => { let out = setFrom(a[0], type); for (let i = 1; i < a.length; i++) out = step(out, a[i]); return out; });
             method(type, "__" + op + "__", 2, (a) => rt.baseBinop(op, a[0], a[1], false));
         }
         method(type, "issubset", 2, (a) => rt.setCompare("le", a[0], setFrom(a[1], type)));
@@ -869,7 +944,7 @@
         method(type, "pop", 1, (a) => { const items = setList(a[0]); if (!items.length) fail(E.KeyError, "pop from an empty set"); setDel(a[0], items[0]); return items[0]; });
         method(type, "clear", 1, (a) => { a[0].map.clear(); a[0].size = 0; return null; });
         method(type, "update", -1, (a) => { for (let i = 1; i < a.length; i++) for (const x of drain(a[i])) setAdd(a[0], x); return null; });
-        method(type, "intersection_update", -1, (a) => { for (let i = 1; i < a.length; i++) rt.setBinop("and", a[0], setFrom(a[i], type), true); return null; });
+        method(type, "intersection_update", -1, (a) => { for (let i = 1; i < a.length; i++) { const out = intersectIterable(a[0], a[i]); a[0].map = out.map; a[0].size = out.size; } return null; });
         method(type, "difference_update", -1, (a) => { for (let i = 1; i < a.length; i++) rt.setBinop("sub", a[0], setFrom(a[i], type), true); return null; });
         method(type, "symmetric_difference_update", 2, (a) => { rt.setBinop("xor", a[0], setFrom(a[1], type), true); return null; });
     }
@@ -938,6 +1013,19 @@
     for (const t of [T.list, T.tuple, T.dict, T.set, T.frozenset, T.str, T.range, T.bytes, T.int, T.float, T.bool, ObjectType]) {
         for (const v of t.dict.values()) if (v !== null && typeof v === "object" && v.cls === T.builtin_function_or_method) v.isBase = true;
     }
+    for (const t of [T.str, T.int, T.float, T.bool]) {
+        for (const v of t.dict.values()) if (v !== null && typeof v === "object" && v.cls === T.builtin_function_or_method) v.unboxSelf = true;
+    }
+    // `__new__` of the immutable builtins, for subclasses (`super().__new__(cls, v)`).
+    for (const base of [T.int, T.float, T.str, T.tuple, T.frozenset, T.bytes]) {
+        const f = builtin("__new__", -1, (a) => {
+            const kw = a.length && a[a.length - 1] instanceof Map ? a.pop() : null;
+            if (a.length === 0) fail(E.TypeError, base.name + ".__new__(): not enough arguments");
+            return rt.builtinNew(a[0], base, a.slice(1), kw);
+        });
+        f.kwnames = true;
+        base.dict.set("__new__", { cls: T.staticmethod, func: f, builtinBase: base });
+    }
 
     // ---- builtin functions ---------------------------------------------------------------------------------------------------
     defkw("print", (a) => {
@@ -952,7 +1040,8 @@
     rt.writeOut = function (text, file) {
         const toErr = file !== null && file !== undefined && file.isStderr === true;
         if (toErr) { errBuf += text; const i = errBuf.lastIndexOf("\n"); if (i >= 0) { console.error(errBuf.slice(0, i)); errBuf = errBuf.slice(i + 1); } return; }
-        if (file !== null && file !== undefined && file.write !== undefined && !file.isStdout) { call(rt.getattr(file, "write"), [text], null); return; }
+        // Any other file object (open(), io.StringIO, a user class) takes the text through its write().
+        if (file !== null && file !== undefined && file.isStdout !== true) { call(rt.getattr(file, "write"), [text], null); return; }
         outBuf += text;
         const i = outBuf.lastIndexOf("\n");
         if (i >= 0) { console.log(outBuf.slice(0, i)); outBuf = outBuf.slice(i + 1); }
@@ -970,7 +1059,7 @@
         const kw = kwOf(a, ["key", "default"]);
         const key = kwget(kw, "key", null);
         let items;
-        if (a.length === 1) { items = drain(a[0]); if (!items.length) { if (kw && kw.has("default")) return kw.get("default"); fail(E.ValueError, name + "() arg is an empty sequence"); } }
+        if (a.length === 1) { items = drain(a[0]); if (!items.length) { if (kw && kw.has("default")) return kw.get("default"); fail(E.ValueError, name + "() iterable argument is empty"); } }
         else { if (a.length === 0) fail(E.TypeError, name + " expected at least 1 argument, got 0"); items = a; }
         let best = items[0], bestKey = key === null ? best : call(key, [best], null);
         for (let i = 1; i < items.length; i++) { const k = key === null ? items[i] : call(key, [items[i]], null); if (cmp(op, k, bestKey)) { best = items[i]; bestKey = k; } }
@@ -1008,13 +1097,25 @@
     rt.isinstanceCheck = function (v, t) {
         if (!isType(t)) { const m = typeMethod(t, "__instancecheck__"); if (m !== undefined) return truth(call(descrGet(m, t, typeOf(t)), [v], null)); fail(E.TypeError, "isinstance() arg 2 must be a type, a tuple of types, or a union"); }
         if (t === T.int && typeof v === "boolean") return true;
-        return isInstance(v, t);
+        return isInstance(v, t) && (t !== T.bytes || !isInstance(v, T.bytearray));
     };
-    def("issubclass", 2, (a) => { if (!isType(a[0])) fail(E.TypeError, "issubclass() arg 1 must be a class"); const t = a[1]; if (t !== null && typeof t === "object" && t.cls === T.tuple) return t.items.some((x) => isSubclass(a[0], x)); if (!isType(t)) fail(E.TypeError, "issubclass() arg 2 must be a class, a tuple of classes, or a union"); return isSubclass(a[0], t); });
-    def("hasattr", 2, (a) => { try { rt.getattr(a[0], needStr(a[1])); return true; } catch (e) { if (e && e.cls && isSubclass(e.cls, E.AttributeError)) return false; throw e; } });
-    def("getattr", 3, (a) => { try { return rt.getattr(a[0], needStr(a[1])); } catch (e) { if (a.length === 3 && e && e.cls && isSubclass(e.cls, E.AttributeError)) return a[2]; throw e; } }, 2);
-    def("setattr", 3, (a) => rt.setattr(a[0], needStr(a[1]), a[2]));
-    def("delattr", 2, (a) => R.delattr(a[0], needStr(a[1])));
+    // bytearray reuses bytes' storage and methods by subclassing it here;
+    // Python-visible checks keep them unrelated, as in CPython.
+    const subclassCheck = (a, b) => isSubclass(a, b) && (b !== T.bytes || !isSubclass(a, T.bytearray));
+    def("issubclass", 2, (a) => { if (!isType(a[0])) fail(E.TypeError, "issubclass() arg 1 must be a class"); const t = a[1]; if (t !== null && typeof t === "object" && t.cls === T.tuple) return t.items.some((x) => subclassCheck(a[0], x)); if (!isType(t)) fail(E.TypeError, "issubclass() arg 2 must be a class, a tuple of classes, or a union"); return subclassCheck(a[0], t); });
+    const attrName = (v) => { if (typeof v === "string") return v; fail(E.TypeError, "attribute name must be string, not '" + typeOf(v).name + "'"); };
+    // A plain miss comes back as MISSING_ATTR (no exception is built); an
+    // AttributeError from a property or __getattr__ is still caught.
+    const MISSING_ATTR = rt.MISSING_ATTR;
+    def("hasattr", 2, (a) => { const name = attrName(a[1]); try { return rt.getattr(a[0], name, MISSING_ATTR) !== MISSING_ATTR; } catch (e) { if (e && e.cls && isSubclass(e.cls, E.AttributeError)) return false; throw e; } });
+    def("getattr", 3, (a) => {
+        const name = attrName(a[1]);
+        if (a.length < 3) return rt.getattr(a[0], name);
+        try { const v = rt.getattr(a[0], name, MISSING_ATTR); return v === MISSING_ATTR ? a[2] : v; }
+        catch (e) { if (e && e.cls && isSubclass(e.cls, E.AttributeError)) return a[2]; throw e; }
+    }, 2);
+    def("setattr", 3, (a) => rt.setattr(a[0], attrName(a[1]), a[2]));
+    def("delattr", 2, (a) => R.delattr(a[0], attrName(a[1])));
     def("id", 1, (a) => BigInt(rt.ident(a[0]) || (typeof a[0] === "string" ? rt.hashInt(a[0]) : 0n)));
     def("hash", 1, (a) => rt.hashInt(a[0]));
     def("callable", 1, (a) => { const v = a[0]; return v !== null && typeof v === "object" && (v.cls === T.function || v.cls === T.builtin_function_or_method || v.cls === T.method || v.isType === true || typeMethod(v, "__call__") !== undefined); });
@@ -1072,6 +1173,22 @@
     const BinType = rt.newType("BufferedReader", [rt.ObjectType], new Map(), "io");
     const fstate = (self) => { const s = self.dict.get("_f"); if (s.closed) fail(E.ValueError, "I/O operation on closed file."); return s; };
     const flush = (s) => { if (s.dirty) { rt.vfs.set(s.path, Uint8Array.from(s.buf)); s.dirty = false; } };
+    // Writable handles still open. CPython flushes a file when its last
+    // reference goes and at interpreter exit; here every open handle is
+    // flushed before its path is read and before the host collects the
+    // program's changes (`rt.flushOpenFiles()` from the entry and
+    // `vfsChangedText`).
+    const openStates = new Set();
+    rt.flushOpenFiles = function (path) {
+        for (const s of openStates) if (s.dirty && (path === undefined || s.path === path)) flush(s);
+    };
+    {
+        const vfsGet = rt.vfs.get;
+        rt.vfs.get = (p) => { if (openStates.size !== 0) rt.flushOpenFiles(rt.vfs.norm(p)); return vfsGet(p); };
+    }
+    // The hosts refuse to load a VFS file over 8 MiB; refuse to write one.
+    const MAX_FILE = 8 * 1024 * 1024;
+    const fileTooLarge = () => fail(E.OSError, "[Errno 27] File too large");
     function openFile(args) {
         const kw = kwOf(args, ["mode", "buffering", "encoding", "errors", "newline"]);
         let path = args[0];
@@ -1086,9 +1203,10 @@
         let existing = rt.vfs.get(norm);
         if (kind === "r" && existing === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + path + "'");
         if (kind === "x" && existing !== undefined) fail(E.FileExistsError, "[Errno 17] File exists: '" + path + "'");
-        const buf = kind === "w" || kind === "x" ? [] : existing === undefined ? [] : Array.from(existing);
+        const buf = kind === "w" || kind === "x" || existing === undefined ? [] : rt.bytesFromU8(existing);
         const s = { path: norm, buf: buf, pos: kind === "a" ? buf.length : 0, binary: binary, readable: kind === "r" || plus, writable: kind !== "r" || plus, closed: false, dirty: kind === "w" || kind === "x" || kind === "a" && existing === undefined, mode: mode };
         if (s.dirty) flush(s);
+        if (s.writable) openStates.add(s);
         const enc = kwget(kw, "encoding", null);
         s.encoding = enc === null ? "utf-8" : needStr(enc);
         return { cls: binary ? BinType : FileType, dict: new Map([["_f", s], ["name", path], ["mode", mode]]) };
@@ -1109,16 +1227,19 @@
             let bytes;
             if (binary) { if (a[1] === null || typeof a[1] !== "object" || a[1].cls !== T.bytes) fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(a[1]).name + "'"); bytes = a[1].items; }
             else bytes = bytesOfText(s, needStr(a[1]));
-            for (let i = 0; i < bytes.length; i++) s.buf[s.pos + i] = bytes[i];
+            if (s.pos + bytes.length > MAX_FILE) fileTooLarge();
+            // Past the end a gap (after a seek) fills with zeros, then appends.
+            while (s.buf.length < s.pos) s.buf.push(0);
+            for (let i = 0; i < bytes.length; i++) { if (s.pos + i < s.buf.length) s.buf[s.pos + i] = bytes[i]; else s.buf.push(bytes[i]); }
             s.pos += bytes.length; s.dirty = true;
             return BigInt(binary ? bytes.length : a[1].length);
         }));
         type.dict.set("writelines", builtin("writelines", 2, (a) => { for (const line of drain(a[1])) rt.callMethod(a[0], "write", [line]); return null; }));
         type.dict.set("flush", builtin("flush", 1, (a) => { flush(fstate(a[0])); return null; }));
-        type.dict.set("close", builtin("close", 1, (a) => { const s = a[0].dict.get("_f"); if (!s.closed) { flush(s); s.closed = true; } return null; }));
+        type.dict.set("close", builtin("close", 1, (a) => { const s = a[0].dict.get("_f"); if (!s.closed) { flush(s); s.closed = true; openStates.delete(s); } return null; }));
         type.dict.set("seek", builtin("seek", 3, (a) => { const s = fstate(a[0]); const off = Number(needInt(a[1])); const whence = a[2] === undefined ? 0 : Number(needInt(a[2])); s.pos = Math.max(0, whence === 0 ? off : whence === 1 ? s.pos + off : s.buf.length + off); return BigInt(s.pos); }, 2));
         type.dict.set("tell", builtin("tell", 1, (a) => BigInt(fstate(a[0]).pos)));
-        type.dict.set("truncate", builtin("truncate", 2, (a) => { const s = fstate(a[0]); const n = a[1] === undefined ? s.pos : Number(needInt(a[1])); s.buf.length = n; s.dirty = true; return BigInt(n); }, 1));
+        type.dict.set("truncate", builtin("truncate", 2, (a) => { const s = fstate(a[0]); const n = a[1] === undefined || a[1] === null ? s.pos : Number(needInt(a[1])); if (n < 0) fail(E.OSError, "[Errno 22] Invalid argument"); if (n > MAX_FILE) fileTooLarge(); if (n < s.buf.length) s.buf.length = n; else while (s.buf.length < n) s.buf.push(0); s.dirty = true; return BigInt(n); }, 1));
         type.dict.set("readable", builtin("readable", 1, (a) => fstate(a[0]).readable));
         type.dict.set("writable", builtin("writable", 1, (a) => fstate(a[0]).writable));
         type.dict.set("__enter__", builtin("__enter__", 1, (a) => a[0]));
@@ -1130,36 +1251,41 @@
     defkw("open", (a) => openFile(a));
     def("exit", 1, (a) => { throw rt.makeExc(E.SystemExit, a.length ? [a[0]] : []); }, 0);
     B.set("quit", B.get("exit"));
-    def("vars", 1, (a) => { if (a.length === 0) fail(E.TypeError, "vars() without arguments is not supported"); const v = a[0]; if (v !== null && typeof v === "object" && v.dict) return rt.instanceDict(v); if (v !== null && typeof v === "object" && v.cls === T.module) return rt.dictFromMap(v.globals); fail(E.TypeError, "vars() argument must have __dict__ attribute"); }, 0);
+    def("vars", 1, (a) => { if (a.length === 0) fail(E.TypeError, "vars() without arguments is not supported"); const v = a[0]; if (v !== null && typeof v === "object" && v.dict && !(v.cls !== undefined && v.cls.noDict === true)) return rt.instanceDict(v); if (v !== null && typeof v === "object" && v.cls === T.module) return rt.dictFromMap(v.globals); fail(E.TypeError, "vars() argument must have __dict__ attribute"); }, 0);
     {
         // Writes through obj.__dict__ land on the instance itself.
         const ID = rt.newType("dict", [], new Map(), "builtins");
         const m = (name, arity, code, min) => ID.dict.set(name, builtin(name, arity, code, min));
         const target = (a) => a[0].target.dict;
+        // Slot values share the instance Map; the view of a slotted class hides them.
+        const shown = (a) => { const v = a[0], m = v.target.dict; if (v.hide === undefined) return m; const out = new Map(); for (const [k, x] of m) if (!v.hide.has(k)) out.set(k, x); return out; };
         const keyStr = (k) => { if (typeof k !== "string") throw rt.makeExc(E.KeyError, [k]); return k; };
-        m("__getitem__", 2, (a) => { const v = target(a).get(keyStr(a[1])); if (v === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return v; });
+        m("__getitem__", 2, (a) => { const v = shown(a).get(keyStr(a[1])); if (v === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return v; });
         m("__setitem__", 3, (a) => { if (typeof a[1] !== "string") fail(E.TypeError, "attribute name must be string"); target(a).set(a[1], a[2]); return null; });
         m("__delitem__", 2, (a) => { if (!target(a).delete(keyStr(a[1]))) throw rt.makeExc(E.KeyError, [a[1]]); return null; });
-        m("__contains__", 2, (a) => typeof a[1] === "string" && target(a).has(a[1]));
-        m("__len__", 1, (a) => BigInt(target(a).size));
-        m("__iter__", 1, (a) => iter(list(Array.from(target(a).keys()))));
-        m("keys", 1, (a) => list(Array.from(target(a).keys())));
-        m("values", 1, (a) => list(Array.from(target(a).values())));
-        m("items", 1, (a) => list(Array.from(target(a), ([k, v]) => tuple([k, v]))));
-        m("get", 3, (a) => { const v = typeof a[1] === "string" ? target(a).get(a[1]) : undefined; return v === undefined ? (a[2] === undefined ? null : a[2]) : v; }, 2);
+        m("__contains__", 2, (a) => typeof a[1] === "string" && shown(a).has(a[1]));
+        m("__len__", 1, (a) => BigInt(shown(a).size));
+        m("__iter__", 1, (a) => iter(list(Array.from(shown(a).keys()))));
+        m("keys", 1, (a) => list(Array.from(shown(a).keys())));
+        m("values", 1, (a) => list(Array.from(shown(a).values())));
+        m("items", 1, (a) => list(Array.from(shown(a), ([k, v]) => tuple([k, v]))));
+        m("get", 3, (a) => { const v = typeof a[1] === "string" ? shown(a).get(a[1]) : undefined; return v === undefined ? (a[2] === undefined ? null : a[2]) : v; }, 2);
         m("pop", 3, (a) => { const v = typeof a[1] === "string" ? target(a).get(a[1]) : undefined; if (v === undefined) { if (a[2] === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return a[2]; } target(a).delete(a[1]); return v; }, 2);
         m("setdefault", 3, (a) => { const v = target(a).get(keyStr(a[1])); if (v !== undefined) return v; const d = a[2] === undefined ? null : a[2]; target(a).set(a[1], d); return d; }, 2);
         m("update", 2, (a) => { for (const [k, v] of rt.dictEntries(rt.asDict(a[1]))) target(a).set(needStr(k), v); return null; });
         m("clear", 1, (a) => { target(a).clear(); return null; });
-        m("copy", 1, (a) => rt.dictFromMap(target(a)));
-        m("__repr__", 1, (a) => repr(rt.dictFromMap(target(a))));
-        m("__eq__", 2, (a) => rt.eq(rt.dictFromMap(target(a)), a[1]));
-        m("__or__", 2, (a) => R.binop("or", rt.dictFromMap(target(a)), a[1]));
-        rt.instanceDict = (obj) => ({ cls: ID, target: obj });
+        m("copy", 1, (a) => rt.dictFromMap(shown(a)));
+        m("__repr__", 1, (a) => repr(rt.dictFromMap(shown(a))));
+        m("__eq__", 2, (a) => rt.eq(rt.dictFromMap(shown(a)), a[1]));
+        m("__or__", 2, (a) => R.binop("or", rt.dictFromMap(shown(a)), a[1]));
+        rt.instanceDict = (obj) => ({ cls: ID, target: obj, hide: obj.cls !== undefined && obj.cls !== null ? obj.cls.slots : undefined });
+        // globals(): the same live view over a module's namespace Map.
+        rt.namespaceView = (map) => ({ cls: ID, target: { dict: map }, hide: undefined });
         rt.T.instancedict = ID;
     }
+    for (const name of ["isinstance", "issubclass", "hasattr", "getattr", "setattr", "delattr", "divmod", "iter", "next", "format"]) B.get(name).unpackArgs = true;
     def("dir", 1, (a) => list(a.length ? dirOf(a[0]) : []), 0);
-    def("globals", 0, () => { const m = rt.entryModule(); return m ? rt.dictFromMap(m.globals) : dict(); });
+    def("globals", 0, () => { const m = rt.entryModule(); return m ? rt.namespaceView(m.globals) : dict(); });
     def("locals", 0, () => dict());
     def("type", 3, (a) => a.length === 1 ? typeOf(a[0]) : rt.buildclass(null, rt.mapFromDict(rt.asDict(a[2])), needStr(a[0]), drain(a[1]), null), 1);
     B.set("type", TypeType);
@@ -1193,6 +1319,12 @@
         BA.dict.set("__delitem__", builtin("__delitem__", 2, (a) => { const arr = a[0].items; if (a[1] !== null && typeof a[1] === "object" && a[1].cls === T.slice) { const [start, stop, step, count] = rt.sliceIndices(a[1], arr.length); if (step === 1) { arr.splice(start, Math.max(0, stop - start)); return null; } const drop = new Set(); for (let i = 0, j = start; i < count; i++, j += step) drop.add(j); a[0].items = arr.filter((_, i) => !drop.has(i)); return null; } let i = Number(needInt(a[1])); if (i < 0) i += arr.length; if (i < 0 || i >= arr.length) fail(E.IndexError, "bytearray index out of range"); arr.splice(i, 1); return null; }));
         BA.dict.set("__iadd__", builtin("__iadd__", 2, (a) => { for (const x of items(a[1])) a[0].items.push(x); return a[0]; }));
         BA.dict.set("__add__", builtin("__add__", 2, (a) => ({ cls: BA, items: a[0].items.concat(items(a[1])), dict: new Map() })));
+        // Repetition keeps the bytearray type, from either side.
+        const repeated = (ba, n) => rt.baseBinop("mul", { cls: T.bytes, items: ba.items }, n, false).items;
+        const times = (a) => isInt(a[1]) ? { cls: BA, items: repeated(a[0], a[1]), dict: new Map() } : NOTIMPL;
+        BA.dict.set("__mul__", builtin("__mul__", 2, times));
+        BA.dict.set("__rmul__", builtin("__rmul__", 2, times));
+        BA.dict.set("__imul__", builtin("__imul__", 2, (a) => { if (!isInt(a[1])) return NOTIMPL; a[0].items = repeated(a[0], a[1]); return a[0]; }));
         BA.dict.set("__repr__", builtin("__repr__", 1, (a) => "bytearray(" + rt.bytesRepr(a[0]) + ")"));
         BA.dict.set("__hash__", null);
         BA.dict.set("__iter__", builtin("__iter__", 1, (a) => iter({ cls: T.bytes, items: a[0].items })));
@@ -1209,7 +1341,7 @@
         const self = a[0]; const excs = drain(a[2]);
         if (typeof a[1] !== "string") fail(E.TypeError, "argument 1 must be str, not " + typeOf(a[1]).name);
         if (!excs.length) fail(E.ValueError, "second argument (exceptions) must be a non-empty sequence");
-        self.args = tuple([a[1], list(excs)]); self.dict.set("message", a[1]); self.dict.set("exceptions", tuple(excs)); rt.refreshExc(self); return null;
+        self.args = tuple([a[1], list(excs)]); self.dict.set("message", a[1]); self.dict.set("exceptions", tuple(excs)); return null;
     }));
     E.BaseExceptionGroup.dict.set("__str__", builtin("__str__", 1, (a) => { const n = a[0].dict.get("exceptions").items.length; return a[0].dict.get("message") + " (" + n + " sub-exception" + (n === 1 ? "" : "s") + ")"; }));
     E.BaseExceptionGroup.dict.set("__repr__", builtin("__repr__", 1, (a) => typeOf(a[0]).name + "(" + repr(a[0].dict.get("message")) + ", " + repr(list(a[0].dict.get("exceptions").items.slice())) + ")"));

@@ -27,17 +27,17 @@ life cpu-python {'nodes': 4, 'readbackElements': 50}
   next [5, 5] float32 list [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 reference agrees True
 overflow NUMBER NUMBER: Output contains non-finite values
-empty GraphError Empty tensors are not supported in v1
+empty GraphError Empty tensors are not supported
 ragged GraphError Ragged matrices are not supported
 bool GraphError Tensor values must be numbers, not bools or objects
 nan GraphError Only finite float32 values are supported
 inf GraphError Only finite float32 values are supported
 rank GraphError Tensor values must be numbers, not bools or objects
 shape GraphError Input length does not match shape
-mismatch GraphError Only matching shapes or scalar broadcasting are supported
-matmul GraphError matmul requires [M,K] @ [K,N]
+mismatch GraphError Shapes (2,) and (3,) cannot be broadcast
+matmul GraphError matmul requires [M,K] @ [K,N] or batched [B,M,K] @ [B,K,N]
 transpose GraphError transpose requires a matrix
 foreign GraphError Tensor belongs to another graph or is not a valid handle
 name GraphError Invalid output name
-none GraphError Request between 1 and 16 named outputs
-many GraphError Request between 1 and 16 named outputs
+none GraphError Request between 1 and 64 named outputs
+many accepted

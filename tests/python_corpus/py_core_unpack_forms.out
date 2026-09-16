@@ -1,0 +1,12 @@
+unpack TypeError cannot unpack non-iterable int object
+for-unpack TypeError cannot unpack non-iterable int object
+star-unpack TypeError cannot unpack non-iterable int object
+unpack TypeError cannot unpack non-iterable NoneType object
+for-unpack TypeError cannot unpack non-iterable NoneType object
+star-unpack TypeError cannot unpack non-iterable NoneType object
+unpack TypeError cannot unpack non-iterable float object
+for-unpack TypeError cannot unpack non-iterable float object
+star-unpack TypeError cannot unpack non-iterable float object
+unpack TypeError cannot unpack non-iterable builtin_function_or_method object
+for-unpack TypeError cannot unpack non-iterable builtin_function_or_method object
+star-unpack TypeError cannot unpack non-iterable builtin_function_or_method object

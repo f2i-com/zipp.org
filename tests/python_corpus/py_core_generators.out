@@ -1,0 +1,25 @@
+cleanup on close
+close -> None
+close-return rv-on-close
+ValueError propagated: error during cleanup
+StopIteration value: rv
+RuntimeError: generator raised StopIteration StopIteration True
+RuntimeError2: generator raised StopIteration
+RuntimeError3: generator raised StopIteration
+TypeError: can't send non-None value to a just-started generator
+send None ok 1
+RuntimeError: generator ignored GeneratorExit
+ValueError generator already executing
+unstarted close None []
+unstarted throw KeyError('kk') []
+throw-stopiteration generator raised StopIteration StopIteration('into')
+cm passes StopIteration StopIteration('block')
+cm2 handled
+after cm2
+drain [1]
+exhausted-value None ()
+stop result
+stop None
+send-stop result
+send-stop2 None
+close-running generator already executing

@@ -1,0 +1,17 @@
+0 bytearray bytearray(b'xxx')
+1 bytearray bytearray(b'ababab')
+2 bytearray bytearray(b'')
+3 bytearray bytearray(b'')
+4 bytearray bytearray(b'ab')
+5 bytes b'xxx'
+6 TypeError can't multiply sequence by non-int of type 'list'
+7 TypeError can't multiply sequence by non-int of type 'float'
+8 TypeError can't multiply sequence by non-int of type 'str'
+9 TypeError can't multiply sequence by non-int of type 'bytes'
+10 TypeError can't multiply sequence by non-int of type 'float'
+11 TypeError can't multiply sequence by non-int of type 'float'
+12 list [1]
+13 str abab
+14 TypeError can't multiply sequence by non-int of type 'NoneType'
+bytearray(b'ababab') True 6
+TypeError can't multiply sequence by non-int of type 'str'

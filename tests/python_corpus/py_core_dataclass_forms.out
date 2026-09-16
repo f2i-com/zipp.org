@@ -1,0 +1,2 @@
+astuple-nested ([('a', 1), ('b', 2)], {'k': ('m', 1)}, ('c', 1))
+asdict-nested {'items': [{'name': 'a', 'qty': 1}, {'name': 'b', 'qty': 2}], 'meta': {'k': {'name': 'm', 'qty': 1}}, 'inner': {'name': 'c', 'qty': 1}}

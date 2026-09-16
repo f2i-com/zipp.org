@@ -186,12 +186,21 @@ def set_grad_enabled(mode):
 
 
 class _Node:
-    __slots__ = ("backward", "parents", "name")
+    __slots__ = ("backward", "parents", "name", "pstate")
 
     def __init__(self, backward, parents, name):
         self.backward = backward
         self.parents = parents
         self.name = name
+        # Each parent's node, storage and requires_grad as this node consumed
+        # them. An in-place op rebinds the tensor object afterwards; like
+        # PyTorch's edges, backward still reaches the history it had here.
+        self.pstate = [None if p is None else (p._node, p._s, p.requires_grad) for p in parents]
+
+
+def _frozen(t, s):
+    """`t` with the storage `s` a node saw: an in-place op may have rebound it since."""
+    return t if t._s is s else Tensor(s, t.shape, _DTYPES[_k.dtype(s)])
 
 
 def _needs_grad(*tensors):
@@ -459,17 +468,20 @@ class Tensor:
         return self._inplace(div(self, other))
 
     def _inplace(self, result):
-        # In-place arithmetic on a tensor that is part of a graph rebinds like
-        # PyTorch's version counter would allow for non-leaf tensors; a leaf
-        # that requires grad is refused, as in PyTorch.
+        # In-place arithmetic rebinds this tensor to the result's storage and
+        # history. `result` was computed from this tensor, and every node
+        # recorded its parents' history (`_Node.pstate`), so the graph keeps
+        # the version before the change. A leaf that requires grad is
+        # refused, as in PyTorch; under no_grad only the values change.
         if self.requires_grad and self._node is None and _grad_enabled:
             raise RuntimeError("a leaf Variable that requires grad is being used in an in-place operation.")
         if _tuple(result.shape) != _tuple(self.shape):
             raise RuntimeError("output with shape %s doesn't match the broadcast shape %s" % (_tuple(self.shape), _tuple(result.shape)))
         self._s = result._s
         self.dtype = result.dtype
-        self._node = result._node
-        self.requires_grad = result.requires_grad
+        if _grad_enabled:
+            self._node = result._node
+            self.requires_grad = result.requires_grad
         return self
 
     def add_(self, other, alpha=1):
@@ -500,8 +512,7 @@ class Tensor:
         return self
 
     def clamp_(self, min=None, max=None):
-        self._s = clamp(self, min, max)._s
-        return self
+        return self._inplace(clamp(self, min, max))
 
     def uniform_(self, a=0.0, b=1.0, generator=None):
         _k.copy_into(self._s, (rand(*self.shape, generator=generator) * (b - a) + a)._s)
@@ -625,7 +636,10 @@ class Tensor:
         return mean(self, dim, keepdim, dtype)
 
     def prod(self, dim=None, keepdim=False):
-        return _reduce_nograd("prod", self, dim, keepdim)
+        return prod(self, dim, keepdim)
+
+    def count_nonzero(self, dim=None):
+        return count_nonzero(self, dim)
 
     def max(self, dim=None, keepdim=False):
         return max(self, dim, keepdim)
@@ -829,6 +843,17 @@ class _NdArray:
 def _repr(t):
     flat = _k.to_list(t._s)
     floating = t.dtype.is_floating_point
+    # PyTorch picks one layout for the whole tensor: "1." only when every
+    # finite element is a whole number, otherwise "%.4f" everywhere. Deciding
+    # per element would print tensor([0., 0.5000, 0.5000]).
+    int_mode = True
+    if floating:
+        for v in flat:
+            if v != v or v in (_float("inf"), _float("-inf")):
+                continue
+            if v != _int(v) or _b.abs(v) >= 1e15:
+                int_mode = False
+                break
 
     def fmt(v):
         if floating:
@@ -836,7 +861,7 @@ def _repr(t):
                 return "nan"
             if v in (_float("inf"), _float("-inf")):
                 return "inf" if v > 0 else "-inf"
-            if v == _int(v) and _b.abs(v) < 1e15:
+            if int_mode:
                 return "%d." % _int(v)
             return "%.4f" % v
         if t.dtype is _bool_dtype:
@@ -1020,7 +1045,12 @@ def linspace(start, end, steps, dtype=None):
 def eye(n, m=None, dtype=None):
     m = n if m is None else m
     dt = _dtype_of(dtype) or float32
-    return one_hot_(arange(_b.min(n, m)), m).to(dt) if n == m else zeros(n, m, dtype=dt)
+    k = _b.min(n, m)
+    if k == 0:
+        return zeros(n, m, dtype=dt)
+    # The first min(n, m) rows are one-hot; a taller matrix ends in zero rows.
+    out = one_hot_(arange(k), m).to(dt)
+    return out if k == n else cat([out, zeros(n - k, m, dtype=dt)], 0)
 
 
 def one_hot_(idx, n):
@@ -1141,7 +1171,8 @@ def _binary(op, a, b, name, backward):
     out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
     if _grad_enabled and (ta.requires_grad or tb.requires_grad):
         out.requires_grad = True
-        out._node = _Node(lambda g: backward(g, ta, tb, out), (ta, tb), name)
+        sa, sb = ta._s, tb._s
+        out._node = _Node(lambda g: backward(g, _frozen(ta, sa), _frozen(tb, sb), _frozen(out, storage)), (ta, tb), name)
     return out
 
 
@@ -1201,7 +1232,8 @@ def _unary(op, a, name, backward, p1=None, p2=None):
     out = Tensor(storage, a.shape, _DTYPES[_k.dtype(storage)])
     if _grad_enabled and a.requires_grad:
         out.requires_grad = True
-        out._node = _Node(lambda g: (backward(g, a, out),), (a,), name)
+        sa = a._s
+        out._node = _Node(lambda g: (backward(g, _frozen(a, sa), _frozen(out, storage)),), (a,), name)
     return out
 
 
@@ -1346,6 +1378,9 @@ def sum(a, dim=None, keepdim=False, dtype=None):
         return a.sum(dim, keepdim, dtype)
     if dtype is not None:
         a = a.to(dtype)
+    else:
+        # `(pred == target).sum()` counts; a uint8 sum does not wrap.
+        a = _int64_acc(a)
     dims = _dims_arg(dim, _len(a.shape))
     storage, shape = _k.reduce("sum", a._s, a.shape, dims, keepdim)
     out = Tensor(storage, shape, a.dtype)
@@ -1389,7 +1424,7 @@ def max(a, dim=None, keepdim=False):
         out = _reduce_nograd("max", a, None, False)
         if _needs_grad(a):
             out.requires_grad = True
-            out._node = _Node(lambda g: (mul((a == out).to(g.dtype), g),), (a,), "Max")
+            out._node = _Node(_ties_backward(a, out), (a,), "Max")
         return out
     values = _reduce_nograd("max", a, dim, keepdim)
     indices = _reduce_nograd("argmax", a, dim, keepdim)
@@ -1407,7 +1442,7 @@ def min(a, dim=None, keepdim=False):
         out = _reduce_nograd("min", a, None, False)
         if _needs_grad(a):
             out.requires_grad = True
-            out._node = _Node(lambda g: (mul((a == out).to(g.dtype), g),), (a,), "Min")
+            out._node = _Node(_ties_backward(a, out), (a,), "Min")
         return out
     values = _reduce_nograd("min", a, dim, keepdim)
     indices = _reduce_nograd("argmin", a, dim, keepdim)
@@ -1416,6 +1451,16 @@ def min(a, dim=None, keepdim=False):
         d = _norm_dim(dim, _len(a.shape))
         values._node = _Node(lambda g: (_scatter_grad(a, d, indices, g, keepdim),), (a,), "Min")
     return _ReturnTypes((values, indices))
+
+
+def _ties_backward(a, out):
+    # A full max/min splits the gradient evenly between tied extremes, as PyTorch does.
+    sa, so = a._s, out._s
+
+    def backward(g):
+        mask = (_frozen(a, sa) == _frozen(out, so)).to(g.dtype)
+        return (mul(div(mask, sum(mask)), g),)
+    return backward
 
 
 def _scatter_grad(a, d, indices, g, keepdim):
@@ -1441,8 +1486,17 @@ def any(a, dim=None, keepdim=False):
     return _reduce_nograd("any", a, dim, keepdim)
 
 
+def _int64_acc(a):
+    # bool and integer reductions accumulate in int64, as in PyTorch.
+    return a if a.dtype.is_floating_point or a.dtype is int64 else a.to(int64)
+
+
 def prod(a, dim=None, keepdim=False):
-    return _reduce_nograd("prod", a, dim, keepdim)
+    return _reduce_nograd("prod", _int64_acc(a), dim, keepdim)
+
+
+def count_nonzero(a, dim=None):
+    return sum(_binary_nograd("ne", a, 0), dim)
 
 
 def var(a, dim=None, keepdim=False, unbiased=True):
@@ -1469,6 +1523,7 @@ def norm(a, p=2, dim=None, keepdim=False):
 
 
 def cumsum(a, dim):
+    a = _int64_acc(a)
     d = _norm_dim(dim, _len(a.shape))
     parts, acc = [], None
     for i in _range(a.shape[d]):
@@ -1855,8 +1910,7 @@ def _scatter_add(base, indices, ishape, values):
 
 def _scatter_dim(base, dim, index, values):
     """Scatter `values` into `base` along `dim` at `index` (same shape as values)."""
-    idx = [_dim_index(base.shape, i, index.shape) for i in _range(_len(base.shape))]
-    idx[dim] = index
+    idx = [index if i == dim else _dim_index(base.shape, i, index.shape) for i in _range(_len(base.shape))]
     idx, ishape = _broadcast_indices(idx)
     _k.scatter(base._s, base.shape, [t._s for t in idx], ishape, values._s, values.shape)
     return base
@@ -1869,10 +1923,33 @@ def _dim_index(shape, i, target):
 
 
 def _setitem(a, key, value):
-    items = _basic_spec(a, key)
     value = _as_tensor(value, a)
     if value.dtype != a.dtype:
         value = value.to(a.dtype)
+    if not _needs_grad(a, value):
+        _setitem_into(a._s, a, key, value)
+        return
+    # Under autograd the assignment is an index_put: the overwritten
+    # positions pass no gradient back to `a`, and `value` receives the
+    # gradient of the positions it filled.
+    if a.requires_grad and a._node is None:
+        raise RuntimeError("a leaf Variable that requires grad is being used in an in-place operation.")
+    storage = _k.copy(a._s)
+    _setitem_into(storage, a, key, value)
+    shape, dt = a.shape, a.dtype
+
+    def backward(g):
+        keep = ones(*shape, dtype=g.dtype)
+        _setitem_into(keep._s, keep, key, tensor(0, dtype=g.dtype))
+        return (mul(g, keep), _getitem(g, key))
+    out = Tensor(storage, shape, dt, True, None)
+    out._node = _Node(backward, (a, value), "IndexPut")
+    a._inplace(out)
+
+
+def _setitem_into(dst, a, key, value):
+    """Assign `value` into the storage `dst` laid out like `a` at `key`."""
+    items = _basic_spec(a, key)
     spec, advanced = [], []
     d = 0
     for k in items:
@@ -1891,7 +1968,7 @@ def _setitem(a, key, value):
     while _len(spec) < _len(a.shape):
         spec.append((None, None, None))
     if not advanced:
-        _k.setslice(a._s, a.shape, spec, value._s, value.shape)
+        _k.setslice(dst, a.shape, spec, value._s, value.shape)
         return
     if _b.any(_isinstance(s, _int) or s != (None, None, None) for s in spec):
         raise IndexError("mixed basic and advanced assignment is not supported")
@@ -1899,7 +1976,7 @@ def _setitem(a, key, value):
     if dims != _list(_range(_len(dims))):
         raise IndexError("advanced assignment indices must be the leading dimensions")
     indices, ishape = _broadcast_indices([t for _, t in advanced])
-    _k.scatter(a._s, a.shape, [t._s for t in indices], ishape, value._s, value.shape)
+    _k.scatter(dst, a.shape, [t._s for t in indices], ishape, value._s, value.shape)
 
 
 def index_select(a, dim, index):
@@ -1950,8 +2027,10 @@ def matmul(a, b):
     storage, shape = _k.matmul(ta._s, ta.shape, tb._s, tb.shape)
     out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
     if _needs_grad(ta, tb):
+        sa, sb, ra, rb = ta._s, tb._s, ta.requires_grad, tb.requires_grad
+
         def backward(g):
-            x, y = ta, tb
+            x, y = _frozen(ta, sa), _frozen(tb, sb)
             gx = gy = None
             xs, ys = x, y
             if _len(x.shape) == 1:
@@ -1963,11 +2042,11 @@ def matmul(a, b):
                 gg = unsqueeze(gg, -2)
             if _len(y.shape) == 1:
                 gg = unsqueeze(gg, -1)
-            if x.requires_grad:
+            if ra:
                 gx = _unbroadcast(matmul(gg, transpose(ys, -1, -2)), xs.shape)
                 if _len(x.shape) == 1:
                     gx = gx.reshape(*x.shape)
-            if y.requires_grad:
+            if rb:
                 gy = _unbroadcast(matmul(transpose(xs, -1, -2), gg), ys.shape)
                 if _len(y.shape) == 1:
                     gy = gy.reshape(*y.shape)
@@ -2067,7 +2146,12 @@ def softmax(a, dim=-1, dtype=None):
     out = Tensor(_k.softmax(a._s, a.shape, d, False), a.shape, float32 if not a.dtype.is_floating_point else a.dtype)
     if _needs_grad(a):
         out.requires_grad = True
-        out._node = _Node(lambda g: (mul(out, sub(g, sum(mul(g, out), d, True))),), (a,), "Softmax")
+        so = out._s
+
+        def backward(g):
+            o = _frozen(out, so)
+            return (mul(o, sub(g, sum(mul(g, o), d, True))),)
+        out._node = _Node(backward, (a,), "Softmax")
     return out
 
 
@@ -2078,7 +2162,8 @@ def log_softmax(a, dim=-1, dtype=None):
     out = Tensor(_k.softmax(a._s, a.shape, d, True), a.shape, float32 if not a.dtype.is_floating_point else a.dtype)
     if _needs_grad(a):
         out.requires_grad = True
-        out._node = _Node(lambda g: (sub(g, mul(exp(out), sum(g, d, True))),), (a,), "LogSoftmax")
+        so = out._s
+        out._node = _Node(lambda g: (sub(g, mul(exp(_frozen(out, so)), sum(g, d, True))),), (a,), "LogSoftmax")
     return out
 
 
@@ -2112,13 +2197,30 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2.0):
 # ---- autograd engine ---------------------------------------------------------------------
 def _backward(root, grad, accumulate=True, inputs=None, retain=False):
     order, seen = [], set()
+    parents_of, aliases = {}, {}
+
+    def resolve(node):
+        # A parent rebound by an in-place op since this node consumed it
+        # stands in as an alias carrying the history it had then (one alias
+        # per earlier version, shared by every node that consumed it).
+        out = []
+        for p, st in zip(node.parents, node.pstate):
+            if p is not None and p._node is not st[0]:
+                key = (id(p), id(st[1]))
+                a = aliases.get(key)
+                if a is None:
+                    a = aliases[key] = Tensor(st[1], p.shape, p.dtype, st[2], st[0])
+                p = a
+            out.append(p)
+        return out
 
     def visit(t):
         if id(t) in seen:
             return
         seen.add(id(t))
         if t._node is not None:
-            for p in t._node.parents:
+            ps = parents_of[id(t)] = resolve(t._node)
+            for p in ps:
                 if p is not None and p.requires_grad:
                     visit(p)
         order.append(t)
@@ -2140,7 +2242,7 @@ def _backward(root, grad, accumulate=True, inputs=None, retain=False):
             if t._retain and accumulate and wanted is None:
                 t.grad = g.detach() if t.grad is None else add(t.grad, g).detach()
             parent_grads = t._node.backward(g)
-            for p, pg in zip(t._node.parents, parent_grads):
+            for p, pg in zip(parents_of[id(t)], parent_grads):
                 if p is None or pg is None or not p.requires_grad:
                     continue
                 if _tuple(pg.shape) != _tuple(p.shape):

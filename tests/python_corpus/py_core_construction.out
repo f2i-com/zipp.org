@@ -1,0 +1,3 @@
+tuple-sub Pair 2 (1, 'x') True True
+tuple-sub-index 1 1
+tuple-new-transform (1, 2, 3) 2 ()
