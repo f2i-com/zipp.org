@@ -7254,6 +7254,27 @@ impl<'p> Vm<'p> {
                             let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
                             private_callee = self.private_method_callee(ctx, recv, key)?;
                         }
+                        // `map.get(k)` / `map.set(k, v)` / `map.has(k)` on a
+                        // Map receiver: the receiver-kind dispatcher's Map
+                        // arm, reached directly. The method IC never holds a
+                        // Map receiver (its methods are natives), so every
+                        // such call otherwise pays a miss probe, the argument
+                        // stack buffer and the generic receiver walk before
+                        // the same `map_method` arm. The leaf runs the SAME
+                        // intrinsic proof that arm runs (`collection_method_is_
+                        // intrinsic`: pristine %Map.prototype% slot, no own
+                        // shadow) and declines to the unchanged path otherwise.
+                        // The Python frontend's runtime keeps globals,
+                        // attribute caches and instance dicts in Maps.
+                        if private_callee.is_none() && (argc == 1 || argc == 2) {
+                            if let Some(result) =
+                                self.interp_map_method_fast(recv, key, base, arg_base, argc)?
+                            {
+                                self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // ── interpreter method-call IC ── a monomorphic /
                         // low-polymorphic `obj.method()` resolves through the
                         // per-site cache (validated; see vm/ic.rs), skipping

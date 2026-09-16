@@ -712,7 +712,7 @@
 
     // ---- list ---------------------------------------------------------------------------------------------------
     const L = T.list;
-    function listSelf(a) { const v = a[0]; if (v !== null && typeof v === "object" && v.items !== undefined && isInstance(v, T.list)) return v; fail(E.TypeError, "descriptor requires a 'list' object but received '" + typeOf(v).name + "'"); }
+    function listSelf(a) { const v = a[0]; if (v !== null && typeof v === "object" && v.items !== undefined && (v.cls === T.list || isInstance(v, T.list))) return v; fail(E.TypeError, "descriptor requires a 'list' object but received '" + typeOf(v).name + "'"); }
     rt.constructors.set(T.list, (args, kw, cls) => { const out = cls === T.list ? list([]) : rt.allocInstance(cls); if (args.length) out.items = drain(args[0]); return out; });
     rt.allocators.set(T.list, (cls) => ({ cls: cls, items: [] }));
     rt.allocators.set(T.tuple, (cls) => ({ cls: cls, items: [] }));
@@ -1479,6 +1479,9 @@
     };
     // Guarded builtin intrinsics: once a call site's callee is found to be
     // the builtin itself (`R.B*`), the emitter calls these directly.
+    // The builtins dictionary itself: the emitter's inline global read
+    // probes it after the module's own dictionary, ahead of `gload`.
+    R.BUILTINS = rt.builtins;
     R.BLEN = rt.builtins.get("len"); R.len1 = rt.len;
     R.BISINSTANCE = rt.builtins.get("isinstance");
     const isinstanceCode = R.BISINSTANCE.code;

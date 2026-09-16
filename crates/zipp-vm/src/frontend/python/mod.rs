@@ -387,6 +387,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
             }
             _ => false,
         });
+        out.hoist_ints(&suite)?;
         out.frame_guard(1, |out| {
             out.suite(suite, 0)?;
             let value = out.none()?;

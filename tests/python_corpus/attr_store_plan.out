@@ -1,0 +1,27 @@
+1 10 0 set None instance method
+['count', 'method', 'nothing', 'x']
+desc-get 42 shadowed desc-class nondata
+105 105
+AttributeError: property 'ro' of 'Prop' object has no setter
+('default', 7) ('star', ()) <Kinds> <Kinds>
+20 30
+4
+20
+AttributeError: 'Slotted' object has no attribute 'z' and no __dict__ for setting new attributes
+1
+2
+101
+AttributeError: 'Counter' object has no attribute 'bump'
+False
+there
+own there
+there
+TypeError
+TypeError
+TypeError
+TypeError
+TypeError
+['a', 'b', 'c'] ['a', 'b,c'] 2 [1, 2, 3]
+instance go
+1 ('boom',)
+6 five

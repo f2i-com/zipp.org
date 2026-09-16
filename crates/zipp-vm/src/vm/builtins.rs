@@ -506,6 +506,59 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The interpreter's direct lane for `map.get(k)`, `map.set(k, v)` and
+    /// `map.has(k)` on a `HeapObj::Map` receiver in the root realm. It
+    /// answers exactly when `dispatch_builtin_method` would reach
+    /// `map_method` for these names: the receiver is a Map (so none of the
+    /// number, string, Temporal, callable or Boxed arms apply), the name is
+    /// none of the deferred `toString`/`valueOf` family, the receiver carries
+    /// no own property of that name (`arr_props`), and the collection
+    /// intrinsic proof holds. A realm other than the root keeps the generic
+    /// path, which sets the native callee realm around the call. Anything
+    /// short of that returns `None` without observable work.
+    pub(crate) fn interp_map_method_fast(
+        &mut self,
+        recv: Value,
+        name: &str,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Option<Value>, Thrown> {
+        if !recv.is_heap() || !self.realm_global_objs.is_empty() {
+            return Ok(None);
+        }
+        let idx = recv.heap_index();
+        if !matches!(self.heap.get(idx), HeapObj::Map { .. }) {
+            return Ok(None);
+        }
+        let expected_argc = match name {
+            "get" | "has" => 1,
+            "set" => 2,
+            _ => return Ok(None),
+        };
+        if argc != expected_argc {
+            return Ok(None);
+        }
+        if !self.arr_props.is_empty()
+            && self
+                .arr_props
+                .get(&idx)
+                .is_some_and(|m| m.pos(name).is_some())
+        {
+            return Ok(None);
+        }
+        if !self.collection_method_is_intrinsic(idx, name, 4) {
+            return Ok(None);
+        }
+        builtin_stats_count(self, recv, name);
+        let n = arg_base as usize;
+        let args = [
+            self.regs[base + n],
+            if argc == 2 { self.regs[base + n + 1] } else { Value::UNDEFINED },
+        ];
+        self.map_method(idx, name, &args[..argc as usize])
+    }
+
     /// B289: the spec-order lowering of `recv.name(args)` — `GetProp` of the
     /// callee before the arguments, `CallWithThis` after them — reaches the
     /// same builtin lanes as the fused `CallMethod` when the captured callee
