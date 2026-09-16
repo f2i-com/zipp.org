@@ -31,6 +31,30 @@
 //! region. The string case separately pins the `pin_obj` extension: its
 //! recycled string receiver splits while its clean element receiver remains an
 //! ordinary pin.
+//!
+//! ── 07b400dc (2026-09-02), "Give booleans and global receivers their own
+//! register classes" ── THE SHAPE B94 SPLITS MOVED. `Scopes::recv_expr` now
+//! routes every receiver that is a plain global identifier into a RECV-class
+//! register (`alloc_recv_reg`): provisional, above the ordinary stack, NEVER
+//! reclaimed. A pinned global receiver therefore has exactly one definition,
+//! `plan_region`'s `clean_global` rule admits it as an ordinary pin, and the
+//! recycled-receiver shape these fixtures were written around cannot be
+//! produced at all — not by rewriting the JS, because the recycling was the
+//! allocator's, not the program's. That commit measured parse-large-js −38.9%
+//! and typedarray-math −5.4%; parse-large-js is the very mix loop
+//! `MULTI_SPLIT_BUDGET` was sized for, so the budget's motivating workload is
+//! now served by not needing a split rather than by splitting four receivers.
+//!
+//! The mechanism is NOT dead: B94 still splits under the default lowering
+//! wherever the receiver register is still recycled (the DataView route —
+//! `split_recv_writethrough`'s `splitwt_mechanism_dv_oob_int_gpr` pins two live
+//! splits), and the whole element/string arm remains the fallback the shipped
+//! latch `ZIPP_NO_REG_CLASSES=1` restores. So the `msplit_mechanism_*` children
+//! below run under that latch, where the shape exists and every count these
+//! tests pin is exact; `msplit_mechanism_default_alloc_pins_receivers_without_splitting`
+//! pins what the DEFAULT does instead, with counts of its own. Both halves are
+//! falsifiable: the suite goes red if the split stops engaging under the latch,
+//! and equally if the default stops pinning these receivers cleanly.
 
 //! Pins x86-64 JIT mechanisms from the engine's logs and counters, which the interpreter-only profiles never emit; compiled only where that tier exists, like the other tier-pinning suites.
 #![cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -80,6 +104,12 @@ fn prog(body: &str) -> String {
 /// TWO recycled dense-Array receivers in one region — the shape the old budget
 /// of one declined outright ("pinned receiver reg not cleanly excludable"),
 /// dropping a 10-home fnv1a-over-two-arrays loop from the INT-GPR tier to MEM.
+///
+/// "Recycled" describes the allocation under `ZIPP_NO_REG_CLASSES=1`; since
+/// 07b400dc (2026-09-02) the default gives each receiver its own never-reclaimed
+/// RECV register and pins both cleanly. See the module header — this fixture is
+/// checked against node in BOTH regimes by
+/// `msplit_all_modes_answer_identically`.
 #[test]
 fn msplit_parity_two_element_receivers() {
     assert_matches_node(&prog(
@@ -167,6 +197,12 @@ console.log("four h=" + h);
 /// FIVE recycled receivers — one past `MULTI_SPLIT_BUDGET`. The budget must
 /// DECLINE the region to the memory tier, not silently plan a receiver it will
 /// not write through (the whole-region veto is the same one B94 shipped with).
+///
+/// That decline is the `ZIPP_NO_REG_CLASSES=1` behaviour. Under the default
+/// since 07b400dc (2026-09-02) none of the five is recycled, so no budget is
+/// spent and the region reaches INT-GPR with five hoisted pins —
+/// `msplit_mechanism_default_alloc_pins_receivers_without_splitting` pins that
+/// and `msplit_mechanism_budget_declines_past_four` pins this. See the header.
 #[test]
 fn msplit_parity_five_receivers_exceed_the_budget() {
     assert_matches_node(&prog(
@@ -290,13 +326,19 @@ console.log("arrswap " + out.join(","));
 #[test]
 fn msplit_all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
-    let modes: [&[(&str, &str)]; 6] = [
+    let modes: [&[(&str, &str)]; 8] = [
         &[("ZIPP_NO_MULTI_SPLIT", "1")],
         &[("ZIPP_INT_SPLIT", "1")],
         &[("ZIPP_NO_GPR_SPLIT", "1")],
         &[("ZIPP_JIT_THRESHOLD", "1")],
         &[("ZIPP_GC_STRESS", "1")],
         &[("ZIPP_NOJIT", "1")],
+        // 07b400dc's latch: the regime in which these fixtures still recycle a
+        // global receiver's register, i.e. the one the `msplit_mechanism_*`
+        // pins below measure. Without this row the B94 split plan would be
+        // asserted about but never checked against node.
+        &[("ZIPP_NO_REG_CLASSES", "1")],
+        &[("ZIPP_NO_REG_CLASSES", "1"), ("ZIPP_INT_SPLIT", "1")],
     ];
     for mode in modes {
         let mut cmd = std::process::Command::new(&exe);
@@ -324,7 +366,15 @@ fn msplit_all_modes_answer_identically() {
 /// fuses. The logged child therefore opts into the relaxed lowering; the
 /// parity tests above still run under the default, so both lowerings stay
 /// checked against node.
-fn jitlog_of(test_name: &str, env: &[(&str, &str)]) -> String {
+///
+/// `legacy_alloc` selects the register-allocation regime, which is the axis
+/// 07b400dc (2026-09-02) moved — see the module header. `true` sets the shipped
+/// `ZIPP_NO_REG_CLASSES=1` latch, under which a global receiver's register is
+/// still recycled and the B94 split is the plan; `false` is today's default,
+/// where the receiver takes a never-reclaimed RECV register and is pinned
+/// outright. `msplit_all_modes_answer_identically` runs the parity fixtures
+/// under the latch too, so the split path stays checked against node.
+fn jitlog_env(test_name: &str, env: &[(&str, &str)], legacy_alloc: bool) -> String {
     let exe = std::env::current_exe().expect("test exe path");
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg(test_name)
@@ -334,6 +384,11 @@ fn jitlog_of(test_name: &str, env: &[(&str, &str)]) -> String {
         .env("ZIPP_JITDECLINE", "1")
         .env("ZIPP_RELAXED_CALL_ORDER", "1")
         .env_remove("ZIPP_STRICT_CALL_ORDER");
+    if legacy_alloc {
+        cmd.env("ZIPP_NO_REG_CLASSES", "1");
+    } else {
+        cmd.env_remove("ZIPP_NO_REG_CLASSES");
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -347,10 +402,62 @@ fn jitlog_of(test_name: &str, env: &[(&str, &str)]) -> String {
     stderr
 }
 
+/// The regime in which the recycled-receiver shape exists (see `jitlog_env`).
+fn jitlog_of(test_name: &str, env: &[(&str, &str)]) -> String {
+    jitlog_env(test_name, env, true)
+}
+
+/// Today's shipped lowering.
+fn jitlog_default_alloc(test_name: &str, env: &[(&str, &str)]) -> String {
+    jitlog_env(test_name, env, false)
+}
+
 fn splits(log: &str) -> usize {
     log.lines()
         .filter(|l| l.contains("B94 split receiver"))
         .count()
+}
+
+/// The span fn1's kernel compiled at, e.g. `"1,30"` from
+/// `[jit] INT region fn1 [1,30] compiled`. Every count below is filtered to
+/// fn1's own region: these fixtures also compile their script-scope build
+/// loops, whose receivers would otherwise pad or mask the kernel's census.
+fn fn1_span(log: &str) -> String {
+    // Only the `... compiled` line, never `[jit] region fn1 [1] deopt at ip N`,
+    // which also starts with `region fn1 [` but carries a start, not a span.
+    let spans: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("] compiled"))
+        .filter_map(|l| l.split("region fn1 [").nth(1)?.split(']').next())
+        .collect();
+    assert!(
+        !spans.is_empty(),
+        "no fn1 region compiled:\n{log}"
+    );
+    assert!(
+        spans.windows(2).all(|w| w[0] == w[1]),
+        "fn1 compiled more than one distinct region {spans:?}, so a single \
+         span cannot filter its census:\n{log}"
+    );
+    spans[0].to_string()
+}
+
+/// One entry per `pinned receiver rN lg=[..]` line in fn1's region, holding
+/// that pin's LoadGlobal count. A CLEAN pin has exactly ONE: the receiver
+/// register is written once and never recycled, which is precisely what lets
+/// `plan_region` exclude it without a B94 split.
+fn fn1_pin_lg_counts(log: &str) -> Vec<usize> {
+    let tag = format!("region [{}] pinned receiver r", fn1_span(log));
+    log.lines()
+        .filter_map(|l| l.split(&tag).nth(1))
+        .map(|rest| {
+            rest.split("lg=[")
+                .nth(1)
+                .and_then(|t| t.split(']').next())
+                .map(|t| t.split(',').filter(|x| !x.trim().is_empty()).count())
+                .unwrap_or(0)
+        })
+        .collect()
 }
 
 fn has_pinned_receiver_decline(log: &str) -> bool {
@@ -358,10 +465,108 @@ fn has_pinned_receiver_decline(log: &str) -> bool {
         .any(|line| line.contains("pinned receiver r") && line.contains("not cleanly excludable"))
 }
 
+/// What the DEFAULT lowering does with these same fixtures since 07b400dc
+/// (2026-09-02) — the other half of the pin, and the reason the tests below
+/// may legitimately run under `ZIPP_NO_REG_CLASSES=1`.
+///
+/// Every receiver is now a CLEAN pin (one LoadGlobal, never recycled), so the
+/// region needs no split at all, and the counts here are exact: the pin count
+/// per fixture, one LoadGlobal each, all of them hoisted, ZERO splits, and no
+/// `not cleanly excludable` decline anywhere. Two of the rows are outright
+/// tier gains over the split era, which is why this is not a loosening:
+///
+///   * the FIVE-receiver fixture used to exceed `MULTI_SPLIT_BUDGET` and hit
+///     the whole-region decline to MEM (`msplit_mechanism_budget_declines_past_four`
+///     still pins that under the latch). It now compiles on INT-GPR with five
+///     hoisted pins and SEVEN homes — the budget's ceiling is gone because the
+///     thing it rationed is no longer spent.
+///   * the two-receiver kernel plans 9 GPR homes here against 10 under the
+///     latch: a split receiver costs a numeric home plus a boxed write-through
+///     at every def, and a clean pin costs neither.
+#[test]
+fn msplit_mechanism_default_alloc_pins_receivers_without_splitting() {
+    let cases: [(&str, &[(&str, &str)], usize); 4] = [
+        ("msplit_parity_two_element_receivers", &[], 2),
+        ("msplit_parity_string_and_element_receivers", &[], 2),
+        ("msplit_parity_five_receivers_exceed_the_budget", &[], 5),
+        // `starts` is the receiver of two distinct accesses here, and each
+        // receiver SITE takes its own RECV register, so five pins cover the
+        // four pinned objects (`guard-hoist pins=4/4` below).
+        (
+            "msplit_parity_four_receivers_with_a_string",
+            &[("ZIPP_INT_SPLIT", "1"), ("ZIPP_NO_GPR_HOMES", "1")],
+            5,
+        ),
+    ];
+    for (name, env, pins) in cases {
+        let log = jitlog_default_alloc(name, env);
+        assert_eq!(
+            splits(&log),
+            0,
+            "{name}: the default lowering should need no B94 split — a split \
+             here means a global receiver's register is being recycled \
+             again:\n{log}"
+        );
+        assert!(
+            !has_pinned_receiver_decline(&log),
+            "{name}: the default lowering should never reach the \
+             not-cleanly-excludable decline:\n{log}"
+        );
+        let lg = fn1_pin_lg_counts(&log);
+        assert_eq!(
+            lg.len(),
+            pins,
+            "{name}: expected {pins} pinned receivers in fn1's region, got \
+             {lg:?}\n{log}"
+        );
+        assert!(
+            lg.iter().all(|&n| n == 1),
+            "{name}: every pin must have exactly one LoadGlobal (that is what \
+             makes it excludable without a split), got {lg:?}\n{log}"
+        );
+        assert!(
+            log.contains("INT region fn1 ["),
+            "{name}: the kernel is not on the integer tier:\n{log}"
+        );
+        assert!(
+            !log.contains("MEM region fn1 ["),
+            "{name}: the kernel dropped to the memory tier:\n{log}"
+        );
+    }
+
+    // The two rows above that are tier/home gains, pinned as numbers so a
+    // regression back to the split era cannot pass quietly.
+    let five = jitlog_default_alloc("msplit_parity_five_receivers_exceed_the_budget", &[]);
+    assert!(
+        five.contains(&format!(
+            "region [{}] guard-hoist pins=5/5",
+            fn1_span(&five)
+        )),
+        "the five-receiver kernel must carry all five pins hoisted — it used \
+         to exceed MULTI_SPLIT_BUDGET and decline to MEM:\n{five}"
+    );
+    assert!(
+        five.contains("GPR homes engaged (7 homes, 0 lazy-sx)"),
+        "the five-receiver kernel's home census moved:\n{five}"
+    );
+    let two = jitlog_default_alloc("msplit_parity_two_element_receivers", &[]);
+    assert!(
+        two.contains("GPR homes engaged (9 homes, 1 lazy-sx)"),
+        "the two-receiver kernel plans 9 homes with clean pins and 10 with \
+         split ones; this census moved:\n{two}"
+    );
+}
+
 /// The mechanism itself: two receivers split in one region, the kernel on the
 /// integer tier. With the switch off the SAME program must decline the plan
 /// entirely (`plan_region=None`) and land on MEM — which is what makes this an
 /// off-switch and not a no-op.
+///
+/// Runs under `ZIPP_NO_REG_CLASSES=1` (see `jitlog_env`): since 07b400dc
+/// (2026-09-02) a global receiver takes a never-reclaimed RECV register, so the
+/// recycled shape a split needs exists only under that latch. The default's own
+/// census is pinned by
+/// `msplit_mechanism_default_alloc_pins_receivers_without_splitting` above.
 #[test]
 fn msplit_mechanism_two_receivers_split_and_reach_the_int_tier() {
     let name = "msplit_parity_two_element_receivers";
@@ -400,6 +605,10 @@ fn msplit_mechanism_two_receivers_split_and_reach_the_int_tier() {
 /// xmm refutation keeps `int_split_enabled` off), declines, and only then does
 /// the W8 GPR-split retry plan the splits. The off-switch is pinned by the
 /// tier, not by that message.
+///
+/// Under `ZIPP_NO_REG_CLASSES=1` (07b400dc, 2026-09-02 — see `jitlog_env`);
+/// r10/r12 are that regime's numbering, and under the default this fixture's
+/// two receivers are both clean RECV-register pins instead.
 #[test]
 fn msplit_mechanism_string_receiver_gate() {
     let name = "msplit_parity_string_and_element_receivers";
@@ -435,6 +644,12 @@ fn msplit_mechanism_string_receiver_gate() {
 
 /// The budget is a real ceiling: five recycled receivers must reach the
 /// whole-region decline, not a partial plan.
+///
+/// Under `ZIPP_NO_REG_CLASSES=1` (07b400dc, 2026-09-02 — see `jitlog_env`),
+/// which is the only regime that still produces five RECYCLED receivers. Under
+/// the default the same five are clean pins and the region reaches INT-GPR
+/// instead, which
+/// `msplit_mechanism_default_alloc_pins_receivers_without_splitting` pins.
 #[test]
 fn msplit_mechanism_budget_declines_past_four() {
     let log = jitlog_of("msplit_parity_five_receivers_exceed_the_budget", &[]);
@@ -453,6 +668,10 @@ fn msplit_mechanism_budget_declines_past_four() {
 /// `ZIPP_NO_GPR_HOMES=1` is load-bearing: otherwise the preferred GPR retry
 /// wins before the XMM body is emitted. The current fn1 bytecode has three
 /// recycled receivers and one clean pin.
+///
+/// Under `ZIPP_NO_REG_CLASSES=1` (07b400dc, 2026-09-02 — see `jitlog_env`);
+/// r16 and the `[1,48]` span are that regime's layout. Under the default the
+/// same span carries five clean pins and no split, pinned above.
 #[test]
 fn msplit_mechanism_xmm_emitter_carries_three_splits_and_a_clean_pin() {
     let log = jitlog_of(

@@ -234,6 +234,9 @@ fn logged_child(test: &str, extra: &[(&str, &str)]) -> String {
         .env_remove("ZIPP_NO_DV_DOUBLE")
         .env_remove("ZIPP_NO_WT_SHARE")
         .env_remove("ZIPP_NO_GUARD_HOIST")
+        // The register-allocation regime decides whether this shape exists at
+        // all (07b400dc, 2026-09-02): cleared here, re-set by `extra`.
+        .env_remove("ZIPP_NO_REG_CLASSES")
         .env_remove("ZIPP_JIT_THRESHOLD")
         .env_remove("ZIPP_GC_STRESS")
         .env_remove("ZIPP_NOJIT");
@@ -303,14 +306,105 @@ fn assert_split_recv_mechanism(test: &str, extra: &[(&str, &str)]) {
     );
 }
 
+/// ── 07b400dc (2026-09-02), "Give booleans and global receivers their own
+/// register classes" ── the two DOUBLE-tier cases run under that commit's own
+/// latch, which is the only regime that still produces the shape.
+///
+/// The header explains that `pre` and the constant-folding nests are
+/// load-bearing because they make the bytecode compiler RECYCLE the receiver's
+/// register number. 07b400dc took that lever away at the source:
+/// `Scopes::recv_expr` routes a plain global receiver into a never-reclaimed
+/// RECV-class register, so the register has exactly one definition, cannot be
+/// in `read_outside`, and is pinned outright rather than split. The B94 ∩ B97
+/// overlap this suite was written for therefore cannot be constructed in JS any
+/// more — the recycling was the allocator's decision, not the program's.
+///
+/// `ZIPP_NO_REG_CLASSES=1` restores the v0.0.5 reclaim and with it the exact
+/// shape, so the fix stays pinned where the defect lived; it is also in the
+/// mode sweep below, so that route stays checked against node.
+/// `splitwt_mechanism_dv_oob_int_gpr` stays on DEFAULT settings, because the
+/// DataView route still recycles its receiver and still carries two live B94
+/// splits — this mechanism is superseded for plain global receivers, not dead.
+const LEGACY_ALLOC: &[(&str, &str)] = &[("ZIPP_NO_REG_CLASSES", "1")];
+
 #[test]
 fn splitwt_mechanism_array_elem_deopt() {
-    assert_split_recv_mechanism("splitwt_parity_array_elem_deopt", &[]);
+    assert_split_recv_mechanism("splitwt_parity_array_elem_deopt", LEGACY_ALLOC);
 }
 
 #[test]
 fn splitwt_mechanism_ta_oob_store_strict() {
-    assert_split_recv_mechanism("splitwt_parity_ta_oob_store_strict", &[]);
+    assert_split_recv_mechanism("splitwt_parity_ta_oob_store_strict", LEGACY_ALLOC);
+}
+
+/// What the DEFAULT lowering does with the same two sources since 07b400dc —
+/// the other half of the pin, so this file fails if either regime moves.
+///
+/// The receiver is a CLEAN pin (one LoadGlobal, no split), which is why the
+/// overlap cannot arise; and the fixtures still compile on the DOUBLE tier and
+/// still take a native exit STRICTLY AFTER that LoadGlobal, so the
+/// `splitwt_parity_*` node comparisons above remain non-vacuous under default
+/// settings rather than merely passing.
+#[test]
+fn splitwt_mechanism_default_alloc_pins_the_receiver_instead() {
+    for test in [
+        "splitwt_parity_array_elem_deopt",
+        "splitwt_parity_ta_oob_store_strict",
+    ] {
+        let log = logged_child(test, &[]);
+        assert!(
+            split_recvs(&log).is_empty() && !log.contains("B94 split receiver"),
+            "{test} planned a B94 split under the default allocation — a \
+             global receiver's register is being recycled again, and the \
+             B94 ∩ B97 overlap is back in reach:\n{log}"
+        );
+        let span = log
+            .lines()
+            .find_map(|l| l.split("DOUBLE region fn0 [").nth(1)?.split(']').next())
+            .unwrap_or_else(|| panic!("{test} no longer hosts on the DOUBLE tier:\n{log}"))
+            .to_string();
+        let pins: Vec<usize> = log
+            .lines()
+            .filter_map(|l| {
+                l.split(&format!("DOUBLE region [{span}] pinned receiver r"))
+                    .nth(1)?
+                    .split("lg=[")
+                    .nth(1)?
+                    .split(']')
+                    .next()
+            })
+            .map(|t| t.split(',').filter(|x| !x.trim().is_empty()).count())
+            .collect();
+        assert_eq!(
+            pins,
+            vec![1],
+            "{test} should carry exactly one pinned receiver with exactly one \
+             LoadGlobal in its DOUBLE region:\n{log}"
+        );
+        let lg = log
+            .lines()
+            .find_map(|l| {
+                l.split(&format!("DOUBLE region [{span}] pinned receiver r"))
+                    .nth(1)?
+                    .split("lg=[")
+                    .nth(1)?
+                    .split(']')
+                    .next()?
+                    .split(',')
+                    .next()?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .expect("the pin's LoadGlobal ip");
+        let ips = deopt_ips(&log, &span);
+        assert!(
+            ips.iter().any(|&ip| ip > lg),
+            "{test} took no native exit after the receiver's LoadGlobal ip \
+             {lg} (exits {ips:?}), so the default route no longer reaches the \
+             window the parity cases check:\n{log}"
+        );
+    }
 }
 
 /// Capture-first member calls add a guarded `GetProp` before each DataView
@@ -362,7 +456,7 @@ fn splitwt_mechanism_dv_oob_int_gpr() {
 #[test]
 fn all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
-    let modes: [&[(&str, &str)]; 9] = [
+    let modes: [&[(&str, &str)]; 11] = [
         &[("ZIPP_NO_GLOB_RANGE", "1")],
         &[("ZIPP_NO_GPR_HOMES", "1")],
         &[("ZIPP_NO_DV_GPR", "1")],
@@ -372,6 +466,12 @@ fn all_modes_answer_identically() {
         &[("ZIPP_JIT_THRESHOLD", "1")],
         &[("ZIPP_GC_STRESS", "1")],
         &[("ZIPP_NOJIT", "1")],
+        // 07b400dc's latch: the v0.0.5 reclaim, i.e. the exact allocation the
+        // B94 ∩ B97 defect lived in and the one the two DOUBLE-tier mechanism
+        // pins now measure. Swept with `ZIPP_NO_WT_SHARE=1` too, since that is
+        // the mode that isolates the vector.
+        &[("ZIPP_NO_REG_CLASSES", "1")],
+        &[("ZIPP_NO_REG_CLASSES", "1"), ("ZIPP_NO_WT_SHARE", "1")],
     ];
     for mode in modes {
         let mut cmd = std::process::Command::new(&exe);
