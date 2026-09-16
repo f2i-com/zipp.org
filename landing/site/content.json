@@ -7,7 +7,7 @@
     "image": "/zipp-og-card.png",
     "imageAlt": "A luminous purple-to-cyan lightning mark moving across a dark field",
     "repo": "https://github.com/f2i-com/zipp.org",
-    "homeDateModified": "2026-09-17",
+    "homeDateModified": "2026-09-16",
     "organization": {
       "name": "f2i",
       "url": "https://f2i.com"
@@ -415,7 +415,7 @@
         "generational garbage collector Rust"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-17",
+      "dateModified": "2026-09-16",
       "sections": [
         {
           "heading": "The pipeline",
@@ -649,7 +649,7 @@
         "Rust Python runtime"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-17",
+      "dateModified": "2026-09-16",
       "sections": [
         {
           "heading": "How Python reaches the VM",
@@ -1029,7 +1029,7 @@
         "WebAssembly GPU compute"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-17",
+      "dateModified": "2026-09-16",
       "sections": [
         {
           "heading": "What the GPU Lab is",
@@ -2063,7 +2063,7 @@
         "sandboxed scripting"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-17",
+      "dateModified": "2026-09-16",
       "sections": [
         {
           "heading": "The embedding model",
@@ -2554,7 +2554,7 @@
         "Zipp changelog"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-17",
+      "dateModified": "2026-09-16",
       "sections": [
         {
           "heading": "Latest: v0.0.19, 16 September 2026",
@@ -2776,11 +2776,11 @@
     },
     {
       "slug": "journey",
-      "title": "The Zipp Story: A JavaScript Engine in Rust in 111 Days",
+      "title": "The Zipp Story: A JavaScript Engine in Rust in 110 Days",
       "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 14 September 2026, mistakes included.",
       "h1": "The Zipp story",
       "breadcrumb": "The story",
-      "lede": "Zipp's repository has 1,978 commits over 111 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in five acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
+      "lede": "Zipp's repository has 1,978 commits over 110 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in five acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
       "keywords": [
         "building a JavaScript engine",
         "JavaScript engine in Rust history",
@@ -2789,7 +2789,7 @@
         "solo compiler project"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-17",
+      "dateModified": "2026-09-16",
       "schemaType": "Article",
       "sections": [
         {
@@ -2800,7 +2800,7 @@
               "items": [
                 {
                   "value": "1,978",
-                  "label": "Commits from 29 May to 17 September 2026",
+                  "label": "Commits from 29 May to 16 September 2026",
                   "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 209 in September"
                 },
                 {
@@ -2887,7 +2887,7 @@
             },
             {
               "type": "p",
-              "text": "September then turned to correctness. External audits on 11 and 12 September produced 38 tickets, closed in v0.0.15 through v0.0.17; making specification-order method calls the default cost the headline benchmark its lead, and the ledger says so. On 13 September, in one day, the repository gained a Python 3 frontend compiling to the same VM, WebAssembly build variants, a folder-based playground, GPU compute from Python through WebGPU and WebGL2, and a Torch subset with GPU training. On 14 September the pinned Test262 corpus passed 95,671 of 95,680 unmodified and 95,680 with five documented corrections, and v0.0.18 was published. Between 15 and 17 September a review of the whole project found 324 defects, all fixed; `torch.compile` learned the graph protocol it sits on, GPU sessions kept weights and optimizer state on the device, version-2 graphs got native kernels, and v0.0.19 was published with the two longest gate jobs run locally on the tagged tree."
+              "text": "September then turned to correctness. External audits on 11 and 12 September produced 38 tickets, closed in v0.0.15 through v0.0.17; making specification-order method calls the default cost the headline benchmark its lead, and the ledger says so. On 13 September, in one day, the repository gained a Python 3 frontend compiling to the same VM, WebAssembly build variants, a folder-based playground, GPU compute from Python through WebGPU and WebGL2, and a Torch subset with GPU training. On 14 September the pinned Test262 corpus passed 95,671 of 95,680 unmodified and 95,680 with five documented corrections, and v0.0.18 was published. Between 15 and 16 September a review of the whole project found 324 defects, all fixed; `torch.compile` learned the graph protocol it sits on, GPU sessions kept weights and optimizer state on the device, version-2 graphs got native kernels, and v0.0.19 was published with the two longest gate jobs run locally on the tagged tree."
             }
           ]
         },
@@ -3600,7 +3600,7 @@
     "entries": [
       {
         "slug": "resident-gpu-sessions-and-v0-0-19",
-        "date": "2026-09-17",
+        "date": "2026-09-16",
         "title": "The GPU was losing to WebAssembly; sessions, kernels and v0.0.19",
         "summary": "v0.0.19 was held because the README promised more of torch.compile than it did; four tracks made it true - protocol-v2 capture, resident GPU sessions, native kernels, a second pass over the Python hot paths - and the release shipped with the two longest gate jobs run locally.",
         "tags": [
