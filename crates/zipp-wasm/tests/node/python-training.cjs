@@ -113,7 +113,7 @@ try:
 except NotImplementedError as error:
     print(str(error))
 `}, 'main');
-    assert.deepEqual(e.takeOutput(), ['GPU SGD options must be numeric or boolean scalars']);
+    assert.deepEqual(e.takeOutput(), ['GPU optimizer options must be numeric or boolean scalars']);
     assert.deepEqual(e.pythonCall('values', []), [2, 3, 11, 7]);
     assert.deepEqual(e.takeHostRequests(), []); e.dispose();
   }
@@ -157,7 +157,7 @@ for option in ['momentum', 'dampening', 'nesterov']:
     optimizer.param_groups[0][option] = 1
     try:
         compiled(inputs, targets)
-        print('NOT REJECTED')
+        print('accepted')
     except NotImplementedError:
         print('rejected')
     optimizer.param_groups[0][option] = 0
@@ -165,14 +165,14 @@ for kind in [torch.optim.Adam, torch.optim.AdamW, torch.optim.RMSprop]:
     optimizer = kind(model.parameters())
     try:
         compiled(inputs, targets)
-        print('NOT REJECTED')
+        print('accepted')
     except NotImplementedError:
         print('rejected')
 print(all(p.grad is None for p in model.parameters()))
 `;
   const e = new Engine();e.initPythonProject({main:rejectionSource},'main');
-  assert.deepEqual(e.takeOutput(), [...Array(6).fill('rejected'), 'True']);
+  assert.deepEqual(e.takeOutput(), [...Array(5).fill('accepted'), 'rejected', 'True']);
   assert.deepEqual(e.takeHostRequests(), []); e.dispose();
-  console.log('Unsupported training optimizers/options rejected before submission; CPU gradients preserved');
+  console.log('momentum, dampening, Nesterov, Adam and AdamW are captured, RMSprop is rejected before submission; CPU gradients preserved');
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});
