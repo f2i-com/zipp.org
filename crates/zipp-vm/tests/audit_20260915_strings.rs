@@ -592,6 +592,40 @@ mod hardened {
     }
 
     #[test]
+    fn concat_is_admitted_before_each_append() {
+        // The doubling shape: repeated self-concat asked the allocator for
+        // 137 GB and ABORTED the process, where node raises RangeError.
+        assert_catchable_range_error(
+            "(() => { let s = 'x'.repeat(1 << 16); for (let i = 0; i < 40; i++) s = s.concat(s); return s.length; })()",
+        );
+        // One argument past the cap, and many small ones that sum past it.
+        assert_catchable_range_error(&format!(
+            "'a'.repeat({}).concat('a'.repeat({}))",
+            BYTES / 2,
+            BYTES / 2 + 1
+        ));
+        assert_catchable_range_error(&format!(
+            "'a'.repeat({}).concat(...Array(64).fill('a'.repeat({})))",
+            BYTES / 2,
+            BYTES / 64
+        ));
+        // A `toString` returning the oversized part is charged the same way.
+        assert_catchable_range_error(&format!(
+            "'a'.repeat({}).concat({{ toString() {{ return 'a'.repeat({}); }} }})",
+            BYTES / 2,
+            BYTES / 2 + 1
+        ));
+        // Just under the cap still concatenates.
+        assert_eq!(
+            run_ok(&format!(
+                "console.log('a'.repeat({}).concat('b').length)",
+                BYTES - 2
+            )),
+            [(BYTES - 1).to_string()]
+        );
+    }
+
+    #[test]
     fn locale_case_mapping_obeys_the_byte_cap() {
         // U+0390 uppercases to three code points: six bytes from two.
         assert_catchable_range_error(&format!(

@@ -1065,6 +1065,10 @@ impl<'p> Vm<'p> {
                 // as WTF-8 with seam canonicalization: a string argument joins
                 // EXACTLY (its lone surrogates survive, and a trailing high +
                 // leading low across arguments merges into the astral scalar).
+                // Every append is charged against the guest string cap BEFORE
+                // it happens: `s = s.concat(s)` doubles each round, and an
+                // unbounded build asked the allocator for 137 GB and ABORTED
+                // the process where the spec (and node) raise RangeError.
                 let mut out: Vec<u8> = js_recv.as_bytes().to_vec();
                 for a in args {
                     let av = *a;
@@ -1072,8 +1076,10 @@ impl<'p> Vm<'p> {
                         let part = self
                             .heap
                             .str_wtf8_cow(av.heap_index())
-                            .map(|c| c.into_owned());
-                        crate::heap::wtf8_push(&mut out, &part.unwrap_or_default());
+                            .map(|c| c.into_owned())
+                            .unwrap_or_default();
+                        self.preflight_guest_string_size(out.len().saturating_add(part.len()))?;
+                        crate::heap::wtf8_push(&mut out, &part);
                     } else if self.is_object_value(av) {
                         // An object's ToString result is kept as the string
                         // VALUE it is (a `toString` returning a lone surrogate).
@@ -1081,10 +1087,13 @@ impl<'p> Vm<'p> {
                         let part = self
                             .heap
                             .str_wtf8_cow(sv.heap_index())
-                            .map(|c| c.into_owned());
-                        crate::heap::wtf8_push(&mut out, &part.unwrap_or_default());
+                            .map(|c| c.into_owned())
+                            .unwrap_or_default();
+                        self.preflight_guest_string_size(out.len().saturating_add(part.len()))?;
+                        crate::heap::wtf8_push(&mut out, &part);
                     } else {
                         let part = self.to_js_string(av)?;
+                        self.preflight_guest_string_size(out.len().saturating_add(part.len()))?;
                         crate::heap::wtf8_push(&mut out, part.as_bytes());
                     }
                 }
