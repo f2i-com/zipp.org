@@ -51,6 +51,18 @@ test('encounters exercise both outcomes and exhaustion ends longer journeys', ()
   assert.match(output, /The quest can wait/)
 })
 
+test('the bundled engine is a labelled build of the release the site announces', () => {
+  // The playground pair has `sync-playground.mjs --require-release` watching
+  // it; this pair had nothing, and sat at v0.0.16 for two releases while the
+  // site said 0.0.18. A version bump without refreshing this engine now fails.
+  const profile = JSON.parse(zippProfile())
+  const site = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(profile.version, site.version,
+    `public/wasm is engine v${profile.version} but the site is v${site.version}: refresh it from the release asset`)
+  assert.match(profile.source?.sha ?? '', /^[0-9a-f]{40}$/,
+    'public/wasm must be a LABELLED release build, not an unlabelled local one')
+})
+
 test('the scratchpad copy and landing README describe the bundled engine', () => {
   // The limits, version and provenance the page states are the artifact's own,
   // so replacing landing/public/wasm without updating the copy fails here.
