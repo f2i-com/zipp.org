@@ -851,11 +851,25 @@ function __wbg_get_imports() {
             const ret = arg0.has(arg1);
             return ret;
         },
-        __wbg_isArray_ed0a78fabccbf569: function() { return handleError(function (arg0) {
+        __wbg_instanceof_Float32Array_0734a24e43081e98: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Float32Array;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
+        __wbg_isArray_d3dc2f32b2472604: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
-        __wbg_keys_90b2ed4cf34a1b20: function() { return handleError(function (arg0) {
+        __wbg_isView_efae9308a44fc593: function(arg0) {
+            const ret = ArrayBuffer.isView(arg0);
+            return ret;
+        },
+        __wbg_keys_9bb653c27cd4a1fd: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -863,6 +877,14 @@ function __wbg_get_imports() {
             const ret = arg0.length;
             return ret;
         },
+        __wbg_length_98f10d1e2f4ea968: function(arg0) {
+            const ret = arg0.length;
+            return ret;
+        },
+        __wbg_new_1157acf78536ded6: function() { return handleError(function (arg0) {
+            const ret = new Float32Array(arg0);
+            return ret;
+        }, arguments); },
         __wbg_new_227d7c05414eb861: function() {
             const ret = new Error();
             return ret;
@@ -873,6 +895,10 @@ function __wbg_get_imports() {
         },
         __wbg_new_da52cf8fe3429cb2: function() {
             const ret = new Object();
+            return ret;
+        },
+        __wbg_new_from_slice_ddf8b82c4d6af38e: function(arg0, arg1) {
+            const ret = new Float32Array(getArrayF32FromWasm0(arg0, arg1));
             return ret;
         },
         __wbg_new_typed_a518d1b29b7e8a7b: function() {
@@ -891,6 +917,9 @@ function __wbg_get_imports() {
             const ret = JSON.parse(getStringFromWasm0(arg0, arg1));
             return ret;
         }, arguments); },
+        __wbg_prototypesetcall_ba9c9a7197c11933: function(arg0, arg1, arg2) {
+            Float32Array.prototype.set.call(getArrayF32FromWasm0(arg0, arg1), arg2);
+        },
         __wbg_push_d2ae3af0c1217ae6: function(arg0, arg1) {
             const ret = arg0.push(arg1);
             return ret;
@@ -965,6 +994,11 @@ function addToExternrefTable0(obj) {
     return idx;
 }
 
+function getArrayF32FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getFloat32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
+}
+
 function getArrayU16FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint16ArrayMemory0().subarray(ptr / 2, ptr / 2 + len);
@@ -976,6 +1010,14 @@ function getDataViewMemory0() {
         cachedDataViewMemory0 = new DataView(wasm.memory.buffer);
     }
     return cachedDataViewMemory0;
+}
+
+let cachedFloat32ArrayMemory0 = null;
+function getFloat32ArrayMemory0() {
+    if (cachedFloat32ArrayMemory0 === null || cachedFloat32ArrayMemory0.byteLength === 0) {
+        cachedFloat32ArrayMemory0 = new Float32Array(wasm.memory.buffer);
+    }
+    return cachedFloat32ArrayMemory0;
 }
 
 let cachedFloat64ArrayMemory0 = null;
@@ -1104,6 +1146,7 @@ function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     wasmModule = module;
     cachedDataViewMemory0 = null;
+    cachedFloat32ArrayMemory0 = null;
     cachedFloat64ArrayMemory0 = null;
     cachedUint16ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
