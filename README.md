@@ -46,7 +46,12 @@ frontends use the same engine, with native and WebAssembly builds.
   and data, with an editor, virtual files, console and graphics in one place.
 - **Start with familiar ML code.** The bundled Torch subset supports eager CPU
   tensors, autograd and training. Experimental `torch.compile(model)` records
-  supported inference and dense-model SGD training for WebGPU, WebGL2 or an explicit CPU fallback.
+  supported inference and training for WebGPU, WebGL2, WebAssembly SIMD kernels
+  or an explicit CPU fallback. The graph protocol carries rank-4 broadcasting,
+  batched matmul, stable softmax, a fused cross-entropy with its gradient, and
+  SGD, momentum or Adam updates that keep optimizer state on the device, so an
+  MNIST-scale step runs in one submission (7.8 ms on WebGPU, 3.9 ms on the
+  WebAssembly kernels, for 784-256-10 at batch 64).
 - **Keep the host in control.** Execution budgets and explicit host capabilities
   let embedders decide which resources a program can use.
 - **Explore one engine across languages.** An optional trusted-code build adds
@@ -136,7 +141,9 @@ provides asynchronous scheduling and graphics.
 
 [![Torch training on WebGL2: Python source, learned curve and falling loss](landing/public/demos/torch-training.png)](examples/python/torch_training/model.py)
 
-This first path supports float32 dense layers, ReLU, MSE and SGD without momentum.
+This path supports float32 dense layers with relu, gelu, sigmoid and tanh, MSE
+or a fused cross-entropy against integer class targets, and SGD, momentum or
+Adam updates whose optimizer state stays on the device for the step.
 **Each call captures a new graph, uploads inputs and weights, and reads back the
 loss, gradients and updated weights.** There is no `compiled.prepare()` API,
 resident model/optimizer state, graph cache or multi-GPU training yet. Small
@@ -240,18 +247,18 @@ Zipp does not include its PyTorch runner, models, checkpoints or native endpoint
 
 ### Run the JavaScript engine
 
-The `0.0.18` release provides x86-64 CLI binaries for Windows and Linux
+The `0.0.19` release provides x86-64 CLI binaries for Windows and Linux
 (JavaScript, plus the experimental Python frontend as `zipp py`) and two browser
 WebAssembly packages:
 
 | Download | Use it for |
 | --- | --- |
-| `zipp-wasm-0.0.18-web.zip` | JavaScript applications and embedding |
-| `zipp-wasm-0.0.18-web-python.zip` | JavaScript plus experimental Python projects, Torch and browser GPU adapters |
+| `zipp-wasm-0.0.19-web.zip` | JavaScript applications and embedding |
+| `zipp-wasm-0.0.19-web-python.zip` | JavaScript plus experimental Python projects, Torch and browser GPU adapters |
 
 See [GitHub Releases](https://github.com/f2i-com/zipp.org/releases) for published
-assets and [0.0.18 release notes](docs/releases/0.0.18.md) for scope and limits.
-`0.0.18` is the latest published release; the download commands below use it.
+assets and [0.0.19 release notes](docs/releases/0.0.19.md) for scope and limits.
+`0.0.19` is the latest published release; the download commands below use it.
 Both WASM archives carry the exact source revision, language profile and
 checksums.
 
@@ -274,7 +281,7 @@ the [browser example](#embed-zipp-webassembly-in-a-web-app), or the
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.18'
+$version = '0.0.19'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -294,7 +301,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.18
+version=0.0.19
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -303,7 +310,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.18-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.19-x86_64-unknown-linux-gnu/zipp`.
 
 </details>
 
@@ -371,8 +378,9 @@ statements, f-strings, the builtin types and a set of standard-library
 modules (`math`, `json`, `re`, `collections`, `itertools`, `functools`,
 `dataclasses`, `enum`, `contextlib`, `typing`, `struct`, `hashlib`, ...)
 all work; `async` does not yet. Semantics are checked
-differentially against CPython: `tests/python_corpus/*.py` must print
-exactly what CPython prints.
+differentially against CPython: the 93 programs of `tests/python_corpus/*.py`
+must print exactly what CPython 3.13 prints, in the default, no-fast-path and
+no-JIT modes.
 
 A folder runs as a project: `zipp py examples/python/project` runs its
 `main.py`, and `zipp py lab/train.py --steps 20` runs one script of a
@@ -534,7 +542,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.18
+version=0.0.19
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"
