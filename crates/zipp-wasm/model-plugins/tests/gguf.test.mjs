@@ -1,7 +1,7 @@
 // Reading a GGUF checkpoint, including a quantized one.
 //
-// The reader and the block dequantizers are the `gguf` and `ggml-quants` crates
-// compiled to WebAssembly (see interop/GGUF.md). This checks the host side: that
+// The reader and the block dequantizers come from gguf-wasm, consumed as a
+// pinned release (see interop/GGUF.md). This checks the host side: that
 // the byte ranges land on the tensors they claim, that shapes arrive in this
 // package's order rather than GGUF's, and that a row of a quantized table can
 // be read without decoding the table.

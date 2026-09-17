@@ -5,8 +5,9 @@ import {requireGgufModule} from './gguf-module.mjs';
 /**
  * GGUF as a weight source, alongside Safetensors.
  *
- * The reader and the block dequantizers are the `gguf` and `ggml-quants` crates
- * compiled to WebAssembly; this is the host side of that boundary. What matters
+ * The reader and the block dequantizers come from gguf-wasm, which is its own
+ * project (https://github.com/f2i-com/gguf-wasm) consumed here as a pinned
+ * release; this is the host side of that boundary. What matters
  * about the arrangement is that neither side ever holds the file: the header is
  * parsed from the first few megabytes, and every tensor after that is a byte
  * range this module reads through the same bounded `source` interface a

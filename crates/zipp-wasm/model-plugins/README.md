@@ -1,18 +1,29 @@
 # ZIPP local-model Python plugins — experimental source overlay
 
-**Status: host/Python foundation, not a verified ZIPP release.** This is an additive
+**Status: host/Python foundation, not a verified ZIPP release.** This is an
 implementation designed against `f2i-com/zipp.org` commit
-`62da28d9bdcd66fccbf5627d887d574016501f9d`. It adds a directory; it does not replace
-Rust/VM files, modify the current landing-page build, or change SoftN.
+`62da28d9bdcd66fccbf5627d887d574016501f9d`, and it is mostly additive: it adds this
+directory, and it also extends `gpu-lab`'s backends with quantized matmul and
+points `rust/` at the external `f2i-gguf-quants` crate so a kernel decodes blocks
+the way the reader does. It does not modify the landing-page build or change SoftN.
 
-49 standalone Node tests, 30 CPython/NumPy tests and four full-checkout gates pass
-in this repository: the plugin's graphs run through the current ZIPP Graph v2
-validator and CPU backend, and the plugin's Python compiles and generates inside a
-locally built Python-enabled ZIPP WASM engine, matching the stored PyTorch
-reference in both cases. See [validation](docs/VALIDATION.md) for versions and
-error bounds. **Browser, GPU and SoftN acceptance have still not run**: no backend
-other than the CPU reference has executed this model, the demo UI has never driven
-real inference, and nothing here establishes performance or language quality.
+348 standalone Node tests (89 here, 259 in `gpu-lab`), 30 CPython/NumPy tests and
+the full-checkout gates pass in this repository: the plugin's graphs run through
+the current ZIPP Graph v2 validator and CPU backend, and the plugin's Python
+compiles and generates inside a locally built Python-enabled ZIPP WASM engine,
+matching the stored PyTorch reference in both cases. Three suites need a checkpoint
+on disk and skip without one, since none is redistributed here; that is 71 tests
+rather than 89.
+
+Browser and GPU acceptance **have** since run for the fixture and GPT-Neo models:
+complete logit tensors on all four backends within 5e-5 of stored PyTorch, and the
+demo generating the reference continuations in Chrome. See
+[validation](docs/VALIDATION.md) for versions and error bounds.
+
+Still not established: **SoftN acceptance**, the Gate B robustness checks
+(cancellation, lost GPU device, budget exhaustion, other browsers), language
+quality for any model, and a recorded comparison of quantized Qwen3 logits
+against llama.cpp. See the GGUF section below for what is and is not measured.
 
 ## What is included
 
@@ -161,11 +172,11 @@ files across a Worker, send a Map of explicit relative paths to File objects as
 | --- | --- |
 | Versioned, source-hashed Python architecture plugins | Live mutation of an existing compiled VM; a general pip/plugin marketplace |
 | Local Blob/File/typed-array sources and a scoped bundle-entry adapter | SoftN extraction, permissions/UI integration, production package migration |
-| Safetensors F32/F16/BF16 with bounds checks and F32 conversion | Pickle checkpoints, GGUF, integer quantization, zero-copy device import |
-| Custom tiny transformer, single-file bigram, and GPT-Neo/TinyStories plugins, each declaring the one checkpoint family it implements | Any other family — Qwen, Llama, GPT-2 proper, SentencePiece tokenizers; loading one is refused, not attempted |
-| Hugging Face folders read as published: own config, own tensor names, own tokenizer files, safetensors shard index | Pickled `pytorch_model.bin` (never unpickled), GGUF, integer quantization |
-| Eager full-context planning as the oracle, plus cached decoding with carried KV caches and resident weights | Batched prefill, fused decode kernels, quantized formats, throughput claims |
-| Existing Graph v2 runtime integration code | ZIPP WASM/CLI, GPU inference and cross-backend parity verified here |
+| Safetensors F32/F16/BF16 with bounds checks and F32 conversion; GGUF through a pinned `gguf-wasm` release, with Q4_K and Q6_K weights kept resident as blocks | Pickle checkpoints, zero-copy device import, block formats other than Q4_K/Q6_K staying resident (the rest decode) |
+| Custom tiny transformer, single-file bigram, GPT-Neo/TinyStories and Qwen3 plugins, each declaring the one checkpoint family it implements | Any other family — Llama, GPT-2 proper, SentencePiece tokenizers; loading one is refused, not attempted |
+| Hugging Face folders read as published: own config, own tensor names, own tokenizer files, safetensors shard index | Pickled `pytorch_model.bin` (never unpickled) |
+| Eager full-context planning as the oracle, plus cached decoding with carried KV caches and resident weights, quantized or not | Batched prefill, fused decode kernels, throughput claims |
+| Existing Graph v2 runtime integration code; cross-backend parity verified on all four backends | ZIPP WASM/CLI integration, SoftN, Gate B robustness |
 
 There is no new native `zipp py` model command or built-in `zipp_llm` Python
 module in this overlay. The browser/embedding host owns model sessions.
@@ -255,23 +266,37 @@ GPU. See [architecture §4c](docs/ARCHITECTURE.md) and [interop/](interop/README
 ## GGUF and quantized checkpoints
 
 `src/gguf.mjs` reads GGUF files — including Q4_K, Q6_K and the rest of the ggml
-block formats — through a 132 KB WebAssembly build of the `gguf` and
-`ggml-quants` crates. Neither side holds the file: a 6.8 GB Q4_K_M checkpoint
-opens in 35 ms from a 16 MiB header read, and five rows of its 788 MiB quantized
-embedding table come back in 3 ms.
+block formats — through a WebAssembly build of [gguf-wasm](https://github.com/f2i-com/gguf-wasm),
+which is its own project rather than part of this one: reading the container, the
+block formats and the tokenizer is generic and useful without ZIPP. A pinned
+release is fetched by `scripts/fetch_gguf_wasm.sh` and committed, the way
+`gpu-lab/wasm/kernels.wasm` is; `wasm/gguf-wasm.lock.json` records the tag, the
+revision and the digest of every file, and the tests check the tree against it.
+The module is optional — `ggufSupport()` reports whether it is present, and a
+checkout without it loads Safetensors models as before.
 
-Quantization buys a smaller file, a smaller read, and a vocabulary-sized table
-you can touch a row at a time. It does not buy a smaller tensor on the device:
-the compute protocol is float32, so anything bound into a graph arrives
-dequantized. Running a quantized model *as* quantized needs blocks kept on the
-device and dequantized inside each backend's matmul — see [interop/GGUF.md](interop/GGUF.md).
+Neither side holds the file: a 6.8 GB Q4_K_M checkpoint opens in 35 ms from a
+16 MiB header read, and five rows of its 788 MiB quantized embedding table come
+back in 3 ms.
+
+Quantization buys a smaller file, a smaller read, a vocabulary-sized table you can
+touch a row at a time — and, since Graph v2 learned a quantized input, a smaller
+tensor on the device. A weight whose format a backend can decode is bound as
+blocks and decoded inside the matmul. Every backend implements that, and the two
+Node can reach -- `cpu-js` and `wasm` -- are held to bit-for-bit agreement with
+the same matmul over decoded values in the test suite; WebGL2 and WebGPU need a
+browser, which is `gpu-lab/scripts/check-gpu-matmul.cjs` rather than a recorded
+gate. For Qwen3-0.6B that is 373 MB
+resident rather than 2,274 MB. Anything else still arrives dequantized. See
+[interop/GGUF.md](interop/GGUF.md) for the protocol and the measurements.
 
 ## Next model milestone
 
-The next model milestone is a **separate** plugin for each further checkpoint
-family, carrying that family's own tokenizer and an explicit state-dict mapping
-verified against the reference implementation. It is not a configuration of the
-plugins here, and not a flag on them.
+Each further checkpoint family gets a **separate** plugin, carrying that family's
+own tokenizer and an explicit state-dict mapping verified against the reference
+implementation. It is not a configuration of the plugins here, and not a flag on
+them. `plugins/qwen3/` is the most recent one and reads its configuration,
+tokenizer and weights from the GGUF file itself.
 
 A plugin is **not** advertised as compatible with a checkpoint family merely
 because it uses transformer operations. Attention, LayerNorm and GELU say
@@ -293,9 +318,14 @@ Adding general library-only plugins or image/audio task drivers is a separate
 extension, not something this patch silently claims to provide.
 
 F16/BF16 checkpoints are expanded to Float32Array; this is not half-precision GPU
-execution. CPU-host caches avoid re-reading files, but each inference call binds
-and submits a full graph. The existing runtime copies/uploads inputs. There is no
-claim of zero-copy weights or persistent GPU residence.
+execution. Q4_K and Q6_K are the exception and are held as the file's own blocks,
+decoded inside the matmul — which is a smaller upload and a smaller residency, not
+a different arithmetic: the result is bit-for-bit what decoding first would give.
+
+Weights stay on the device across decode steps and the graph carries its KV cache,
+so a step uploads a token rather than a context. Everything else about a step is
+still a full graph bound and submitted, and there is no claim of zero-copy weights:
+the bytes are read, uploaded once, and kept.
 
 See [architecture and ABI](docs/ARCHITECTURE.md), [SoftN integration handoff](docs/SOFTN.md),
 [release gates](docs/HANDOFF.md), and [validation](docs/VALIDATION.md).

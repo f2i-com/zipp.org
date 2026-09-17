@@ -107,7 +107,7 @@ callback that resubmits cannot recurse), and rejects work after tenant invalidat
 - `src/zipp-adapter.mjs`, `src/zipp-guest.js`: opt-in JavaScript guest integration.
 - `../../zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`: native Python graph authoring/export library.
 - `src/quant.mjs`: Q4_K block decoding, a port of ggml's own, checked against
-  the `ggml-quants` crate rather than only against itself. An `input` node may
+  the `f2i-gguf-quants` crate rather than only against itself. An `input` node may
   declare `dtype: 'q4_k'` and carry blocks instead of values; a `matmul` with
   `transposed: true` reads them as it goes. The weight stays 144 bytes per 256
   values on the device — 7.1 times smaller — and the result is bit for bit what

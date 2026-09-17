@@ -70,10 +70,17 @@ It buys a smaller file, a smaller read, a vocabulary-sized table that can be
 touched a row at a time, and -- since Graph v2 learned a quantized input -- a
 smaller tensor on the device.
 
-What it does not buy is any of that automatically. This reader still decodes
-every tensor to float32 on the way in, because `dequantize` is what it calls.
-Keeping blocks is a second path, described below, and the two ends exist without
-being joined yet.
+What it does not buy is any of that automatically, and which path a tensor
+takes is a decision somebody has to make. `residentDtype(name)` answers whether
+a backend can hold this one as blocks; `readBlocks(name)` hands over the file's
+own bytes if so, and `readTensor(name)` decodes to float32 if not. The two are
+budgeted separately -- blocks against the model budget, because blocks cost what
+the file costs, and decoded tensors against the decoded-weight budget -- so a
+model that keeps most of itself quantized is charged for what it actually holds.
+
+The qwen3 plugin makes that decision the ordinary one: `matrix` binds a weight
+as blocks where the format allows it and expands it where it does not, which is
+what takes the 0.6B from 2,274 MB resident to 373 MB.
 
 ## Blocks on the device
 

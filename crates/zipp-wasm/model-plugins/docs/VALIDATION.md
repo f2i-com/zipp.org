@@ -3,13 +3,14 @@
 Two records, kept apart on purpose. The first is what this overlay's original
 download claimed; the second is what actually ran in a full ZIPP checkout at
 commit `62da28d9` with the improvements in this tree. Neither is a published
-upstream ZIPP result, and neither covers browser, GPU or SoftN acceptance.
+upstream ZIPP result. Browser and GPU checks appear below where they ran; SoftN
+acceptance and the remaining Gate B robustness checks did not run at all.
 
 ## Run in this checkout — 17 September 2026
 
 | Check | Result | Scope |
 | --- | --- | --- |
-| Node host and session tests | 49 passed, 0 failed | Loader, manifests, checkpoint/tokenizer refusal, binary bindings, bounds, hashing, lifecycle; session lifecycle uses explicit doubles |
+| Node host and session tests | 89 passed, 0 failed | Loader, manifests, checkpoint/tokenizer refusal, binary bindings, bounds, hashing, lifecycle; session lifecycle uses explicit doubles. The whole suite, of which the GGUF and Qwen3 rows below are a part. Without `ZIPP_GGUF_MODEL` and `ZIPP_QWEN3_MODEL` on disk it is 71 tests with 3 suites skipped, since no checkpoint is redistributed here |
 | Gate A1: upstream Graph v2 validator + CPU backend | passed, max absolute logit error 0.0000083446502685546875 | Five complete logit tensors from the plugin's own graphs, executed by `gpu-lab/src/runtime.mjs` on `cpu-js`, compared with stored PyTorch CPU outputs |
 | Gate A2: Python-enabled ZIPP WASM engine | passed | Real `Engine`, real `initPythonProject`/`pythonCall` bootstrap, five prompts: logits within tolerance and greedy token sequences identical to the reference |
 | Gate C1: a Hugging Face checkpoint folder, unconverted | passed | TinyStories-1M read as published through `openNative`: its own config.json, `model.safetensors` (including 8 BOOL mask buffers nothing binds), and its own vocab.json/merges.txt; logits within 2e-4 of transformers and greedy tokens identical |
@@ -28,6 +29,15 @@ upstream ZIPP result, and neither covers browser, GPU or SoftN acceptance.
 | Browser checkpoint refusal | passed | A local folder whose `model.json` claims `hf.gpt-neo-v1` with a `gpt2-byte-bpe-v1` tokenizer is refused in the UI with the `CHECKPOINT` message, no engine constructed |
 | Remaining Gate B checks | NOT RUN | Cancel during compile/read/compute, lost GPU device, malformed source, budget and context exhaustion, repeated load/teardown, peak memory, other browsers and devices |
 | SoftN app packaging/runtime | NOT RUN | Boundary adapter only, no SoftN source changes |
+| Quantized matmul on the backends Node can reach (`gpu-lab/tests/quantized.test.mjs`) | 7 passed | `cpu-js` and `wasm` hold a Q4_K/Q6_K matmul bit-for-bit equal to the same matmul over decoded values, and hold the decoder against `f2i-gguf-quants` rather than against a second copy of itself |
+| Quantized matmul on WebGL2 and WebGPU | NOT RUN in this record | Needs a GPU and a browser: `gpu-lab/scripts/check-gpu-matmul.cjs`. The shader decoders are therefore verified by construction and by the browser demo generating sensible text, not by a recorded bit-for-bit result |
+| GGUF reader (`tests/gguf.test.mjs`) | 9 passed | Header parsing, metadata, tensor ranges in this package's shape order, row gathering without decoding the table, budget refusals, malformed-shape refusal |
+| GGUF module detection and provenance (`tests/gguf-module.test.mjs`) | 7 passed | Absent module reported rather than thrown, wrong module refused by shape, and the committed tree checked against every digest `scripts/fetch_gguf_wasm.sh` recorded for `gguf-wasm` v0.0.1 — including that `rust/Cargo.toml` pins the revision the lock names |
+| GGUF tokenizer (`tests/tokenizer.test.mjs`) | 6 passed | Built inside the module from the file's own vocabulary and `tokenizer.ggml.pre`; qwen2 digit-splitting checked against the vocabulary's own rule, and an unimplemented pre-tokenizer name refused rather than guessed |
+| Qwen3-0.6B Q4_K_M end to end (`tests/qwen3.test.mjs`) | 6 passed | Configuration read from the file; prompt tokenized to the ids the vocabulary defines; **373 MB resident, 372 MB of it still blocks**; a prefill of "The capital of France is" predicting ` Paris`; and a cached decode agreeing with the prefill before generating |
+| Qwen3 architecture vs transformers (`tests/transformers-shim.test.mjs`) | passed, max absolute error 7.450580596923828e-8 | Hugging Face's own `modeling_qwen3.py` compiled unmodified inside ZIPP and compared with what transformers produced for the same weights. This validates the architecture, **not** the quantized path: it runs staged F32 weights, not GGUF blocks |
+| Qwen3 quantized logits vs an external reference | NOT RUN | No stored llama.cpp logits for this checkpoint. The quantized path is verified against ZIPP's own decoded path (bit-for-bit) and the architecture against transformers, but the two have not been joined into one number |
+| Qwen3-0.6B in the browser | RAN, NOT GATED | Loaded from a local GGUF file and generated text in Chrome on WebGL2. Observed interactively during development; nothing here establishes language quality |
 
 The browser rows were driven through Playwright against the system Chrome on
 Windows 11, over the playground's own loopback server. They are a real browser on

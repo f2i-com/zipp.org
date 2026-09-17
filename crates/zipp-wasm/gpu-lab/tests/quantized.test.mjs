@@ -7,7 +7,7 @@
 // decoder is wrong, not imprecise.
 //
 // Ground truth for the decoder itself comes from a second implementation --
-// the `ggml-quants` crate, through its WebAssembly build -- because a decoder
+// the `f2i-gguf-quants` crate, through its WebAssembly build -- because a decoder
 // checked only against itself would agree with its own mistakes. That part
 // skips unless ZIPP_GGUF_WASM points at the module.
 import test from 'node:test';
