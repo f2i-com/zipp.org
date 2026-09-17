@@ -8,8 +8,10 @@
 # The retained verification jobs are deliberately small, so a dispatched run
 # catches a broken default-semantics regression while the runner stays cheap:
 #
-#   python   the Python-enabled VM and CLI, the browser artifact, and the
-#            portable GPU contracts;
+#   python   the Python-enabled VM and CLI, the browser artifact, the portable
+#            GPU contracts, and the local-model plugins against that artifact
+#            (their full-checkout gates required rather than skipped, plus the
+#            GGUF module's lock file and the Rust pin that must match it);
 #   engine   the VM's unit tests plus the audit-day regression binaries, on
 #            the default profile, and the manifest-advertised feature builds;
 #   wasm     the isolated host workspace, the production wasm32 build, and the
@@ -100,6 +102,32 @@ jobs:
         run: |
           npm test
           python3 tests/test_python.py
+      # The local-model plugins, against the `dist/all` artifact the step above
+      # built. ZIPP_REQUIRE_INTEGRATION=1 turns the full-checkout gates from
+      # skips into failures: without it a missing engine reads as a pass, which
+      # is exactly the shape of "it was green and nothing ran".
+      #
+      # What this makes mandatory before a release: the plugin ABI and its
+      # source-digest manifests, the Graph v2 graphs each plugin emits, the
+      # engine integration, and the GGUF module's lock file -- the tree is
+      # rehashed against the digests scripts/fetch_gguf_wasm.sh recorded, and
+      # rust/Cargo.toml is checked to pin the revision that lock names.
+      #
+      # The suites that need a checkpoint on disk still skip: no weights are
+      # redistributed here, and downloading a model per run buys little.
+      - name: Test the local-model plugins against that engine
+        working-directory: crates/zipp-wasm/model-plugins
+        run: ZIPP_REQUIRE_INTEGRATION=1 npm test
+      # numpy to evaluate a plugin's graphs independently of ZIPP, safetensors
+      # to read a checkpoint the way a published one is stored. transformers is
+      # deliberately absent: the tests that compare against it guard the import
+      # and skip, so a reference comparison is a local exercise rather than a
+      # dependency on a large download here.
+      - name: Install what the plugin's Python tests evaluate graphs with
+        run: python3 -m pip install --break-system-packages numpy safetensors
+      - name: Test the plugin architectures against NumPy
+        working-directory: crates/zipp-wasm/model-plugins
+        run: npm run test:python
 
   engine:
     name: Engine (unit tests + audit regressions)
