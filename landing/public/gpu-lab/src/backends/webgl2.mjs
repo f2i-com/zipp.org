@@ -3,7 +3,7 @@ import {check, ComputeError, DEFAULT_LIMITS} from '../graph.mjs';
 // Shared GLSL: texel addressing, the shared erf-based CDF and an overflow-free
 // tanh. Shapes and scalars arrive as uniforms, so one program serves every shape.
 const PRELUDE = `#version 300 es
-precision highp float; precision highp int; precision highp sampler2D;
+precision highp float; precision highp int; precision highp sampler2D; precision highp usampler2D;
 uniform int wO, nO, wA, wB, wC, wD, mode, op, len;
 uniform ivec4 d, sa, sb, g;
 uniform vec4 f;
@@ -41,8 +41,17 @@ float tanhS(float x) {
   return x < 0.0 ? -r : r;
 }`;
 const SAMPLERS = ['A', 'B', 'C', 'D'];
-const io = inputs => inputs.map(name => `uniform highp sampler2D t${name};
-float ${name}(int j) { return texelFetch(t${name}, ivec2(j % w${name}, j / w${name}), 0).r; }`).join('\n');
+// A samples a float texture; B:u32 samples an R32UI one, which is how a
+// quantized weight arrives -- blocks, not values. Only ever read, never a
+// render target, so it needs no renderable format.
+const io = inputs => inputs.map(entry => {
+  const [name, type] = entry.split(':');
+  return type === 'u32'
+    ? `uniform highp usampler2D t${name};
+uint ${name}(int j) { return texelFetch(t${name}, ivec2(j % w${name}, j / w${name}), 0).r; }`
+    : `uniform highp sampler2D t${name};
+float ${name}(int j) { return texelFetch(t${name}, ivec2(j % w${name}, j / w${name}), 0).r; }`;
+}).join('\n');
 const each = body => `void main() {
   int i = int(gl_FragCoord.y) * wO + int(gl_FragCoord.x);
   if (i >= nO) { resultColor = vec4(0.0); return; }
@@ -50,6 +59,107 @@ const each = body => `void main() {
   ${body}
   resultColor = vec4(value, 0.0, 0.0, 0.0);
 }`;
+// Q4_K: 256 values per 144-byte block -- an f16 scale and minimum, eight 6-bit
+// sub-block scales and minimums packed into 12 bytes, then 256 nibbles. A port
+// of dequantize_row_q4_K; src/quant.mjs is the same thing in JavaScript and
+// the gguf-quants crate is it in Rust.
+const QUANT_GLSL = `uint qbyte(int off) { return (B(off >> 2) >> uint((off & 3) * 8)) & 0xffu; }
+uint qhalfBits(int off) { return qbyte(off) | (qbyte(off + 1) << 8); }
+int qbase(int block0, int col, int K, int e, int bytes) {
+  return (block0 + col * (K / 256) + e / 256) * bytes;
+}
+vec2 q4kScaleMin(int base, int j) {
+  if (j < 4) return vec2(float(qbyte(base + 4 + j) & 63u), float(qbyte(base + 8 + j) & 63u));
+  uint hi = qbyte(base + j + 8);
+  uint lo = qbyte(base + j);
+  uint me = qbyte(base + j + 4);
+  return vec2(float((hi & 15u) | ((lo >> 6) << 4)), float((hi >> 4) | ((me >> 6) << 4)));
+}
+float q4k(int block0, int col, int K, int e) {
+  int base = qbase(block0, col, K, e, 144);
+  int within = e % 256; int pair = within / 64; int rem = within % 64;
+  uint byte = qbyte(base + 16 + pair * 32 + rem % 32);
+  uint nibble = rem < 32 ? (byte & 15u) : (byte >> 4);
+  int j = pair * 2 + (rem < 32 ? 0 : 1);
+  vec2 sm = q4kScaleMin(base, j);
+  float d = unpackHalf2x16(qhalfBits(base)).x;
+  float dmin = unpackHalf2x16(qhalfBits(base + 2)).x;
+  return (d * sm.x) * float(nibble) - dmin * sm.y;
+}
+float q6k(int block0, int col, int K, int e) {
+  int base = qbase(block0, col, K, e, 210);
+  // half is a reserved word in GLSL ES, so the two 128-value halves are hf.
+  int within = e % 256; int hf = within / 128; int rem = within % 128;
+  int sub = rem / 32; int l = rem % 32;
+  uint ql = qbyte(base + 64 * hf + l + 32 * (sub & 1));
+  uint low = sub < 2 ? (ql & 15u) : (ql >> 4);
+  uint high = (qbyte(base + 128 + 32 * hf + l) >> uint(2 * sub)) & 3u;
+  float scale = float(int(qbyte(base + 192 + 8 * hf + l / 16 + 2 * sub) << 24) >> 24);
+  float d = unpackHalf2x16(qhalfBits(base + 208)).x;
+  return (d * scale) * float(int(low | (high << 4)) - 32);
+}
+
+// One dot product against a quantized row, reading each block's constants once.
+//
+// A fragment walks the reduced axis in order, so 256 consecutive weights share
+// a block and 32 or 16 share a sub-block scale. Reading those per weight cost
+// about eight texture fetches each and made a quantized product two and a half
+// times a float32 one; reading them when they change costs closer to one.
+//
+// The arithmetic is untouched: the scale is still folded into d before it
+// meets a quant, in that order, so this still equals the same product over
+// decoded values exactly.
+float q4kDot(int ab, int block0, int col, int K, int k0, int k1) {
+  int per = K / 256;
+  int heldBlock = -1; int heldSub = -1; int base = 0;
+  float d = 0.0; float dmin = 0.0; float scale = 0.0; float minimum = 0.0;
+  float total = 0.0;
+  for (int k = k0; k < k1; k++) {
+    int index = block0 + col * per + k / 256;
+    if (index != heldBlock) {
+      base = index * 144; heldBlock = index; heldSub = -1;
+      d = unpackHalf2x16(qhalfBits(base)).x;
+      dmin = unpackHalf2x16(qhalfBits(base + 2)).x;
+    }
+    int within = k % 256; int pair = within / 64; int rem = within % 64;
+    int j = pair * 2 + (rem < 32 ? 0 : 1);
+    if (j != heldSub) {
+      heldSub = j;
+      vec2 sm = q4kScaleMin(base, j);
+      scale = d * sm.x; minimum = dmin * sm.y;
+    }
+    uint byte = qbyte(base + 16 + pair * 32 + rem % 32);
+    uint nibble = rem < 32 ? (byte & 15u) : (byte >> 4);
+    total += A(ab + k) * (scale * float(nibble) - minimum);
+  }
+  return total;
+}
+float q6kDot(int ab, int block0, int col, int K, int k0, int k1) {
+  int per = K / 256;
+  int heldBlock = -1; int heldScale = -1; int base = 0;
+  float d = 0.0; float scale = 0.0;
+  float total = 0.0;
+  for (int k = k0; k < k1; k++) {
+    int index = block0 + col * per + k / 256;
+    if (index != heldBlock) {
+      base = index * 210; heldBlock = index; heldScale = -1;
+      d = unpackHalf2x16(qhalfBits(base + 208)).x;
+    }
+    int within = k % 256; int hf = within / 128; int rem = within % 128;
+    int sub = rem / 32; int l = rem % 32;
+    int at = 192 + 8 * hf + l / 16 + 2 * sub;
+    if (at != heldScale) {
+      heldScale = at;
+      scale = d * float(int(qbyte(base + at) << 24) >> 24);
+    }
+    uint ql = qbyte(base + 64 * hf + l + 32 * (sub & 1));
+    uint low = sub < 2 ? (ql & 15u) : (ql >> 4);
+    uint high = (qbyte(base + 128 + 32 * hf + l) >> uint(2 * sub)) & 3u;
+    total += A(ab + k) * (scale * float(int(low | (high << 4)) - 32));
+  }
+  return total;
+}
+`;
 const KERNELS = {
   fill: [[], each('value = f.x;')],
   unary: [['A'], each(`float x = A(i);
@@ -92,6 +202,59 @@ const KERNELS = {
   int batch = i / (M * N); int rc = i - batch * M * N; int row = rc / N; int col = rc - row * N;
   int ab = batch * sa.x + row * K; int bb = batch * sa.y + col;
   for (int k = 0; k < K; k++) value += A(ab + k) * B(bb + k * N);`)],
+  // The same product over a weight stored [N, K]: one contiguous row per output
+  // column, which is how a checkpoint writes a linear layer.
+  matmul_t: [['A', 'B'], each(`int M = g.x; int K = g.y; int N = g.z;
+  int batch = i / (M * N); int rc = i - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int ab = batch * sa.x + row * K; int bb = batch * sa.y + col * K;
+  for (int k = 0; k < K; k++) value += A(ab + k) * B(bb + k);`)],
+  // And over a weight that is still Q4_K blocks, decoded a value at a time as
+  // the loop reaches it. The texture holds 144 bytes per 256 weights and never
+  // the 1024 they expand to.
+  matmul_q4k: [['A', 'B:u32'], QUANT_GLSL + each(`int M = g.x; int K = g.y; int N = g.z;
+  int batch = i / (M * N); int rc = i - batch * M * N; int row = rc / N; int col = rc - row * N;
+  value = q4kDot(batch * sa.x + row * K, (batch * sa.y) / 256, col, K, 0, K);`)],
+  matmul_q6k: [['A', 'B:u32'], QUANT_GLSL + each(`int M = g.x; int K = g.y; int N = g.z;
+  int batch = i / (M * N); int rc = i - batch * M * N; int row = rc / N; int col = rc - row * N;
+  value = q6kDot(batch * sa.x + row * K, (batch * sa.y) / 256, col, K, 0, K);`)],
+  // Split along the reduced axis, then sum the parts.
+  //
+  // A fragment shader runs one invocation per output element, and a decode step
+  // multiplies [1, 1024] by [2048, 1024]: two thousand invocations, each walking
+  // a thousand dependent texture reads. That leaves a GPU almost idle -- the
+  // model's own matmuls measured slower than one matmul with a hundred times
+  // more outputs. Splitting the reduced axis into parts gives the same product
+  // as many times more invocations, and `reduce` adds the parts back.
+  //
+  // Both operands are read exactly as the unsplit kernels read them, and within
+  // a part the order is unchanged, so a quantized product still equals the same
+  // product over decoded values on this backend.
+  matmul_split: [['A', 'B'], each(`int M = g.x; int K = g.y; int N = g.z; int chunk = sa.w;
+  int perPart = nO / max(sa.z, 1); int part = i / perPart; int rest = i - part * perPart;
+  int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int k0 = part * chunk; int k1 = min(K, k0 + chunk);
+  int ab = batch * sa.x + row * K;
+  int bb = batch * sa.y + col;
+  for (int k = k0; k < k1; k++) value += A(ab + k) * B(bb + k * N);`)],
+  matmul_t_split: [['A', 'B'], each(`int M = g.x; int K = g.y; int N = g.z; int chunk = sa.w;
+  int perPart = nO / max(sa.z, 1); int part = i / perPart; int rest = i - part * perPart;
+  int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int k0 = part * chunk; int k1 = min(K, k0 + chunk);
+  int ab = batch * sa.x + row * K;
+  int bb = batch * sa.y + col * K;
+  for (int k = k0; k < k1; k++) value += A(ab + k) * B(bb + k);`)],
+  matmul_q4k_split: [['A', 'B:u32'], QUANT_GLSL + each(`int M = g.x; int K = g.y; int N = g.z; int chunk = sa.w;
+  int perPart = nO / max(sa.z, 1); int part = i / perPart; int rest = i - part * perPart;
+  int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int k0 = part * chunk; int k1 = min(K, k0 + chunk);
+  int ab = batch * sa.x + row * K;
+  value = q4kDot(ab, (batch * sa.y) / 256, col, K, k0, k1);`)],
+  matmul_q6k_split: [['A', 'B:u32'], QUANT_GLSL + each(`int M = g.x; int K = g.y; int N = g.z; int chunk = sa.w;
+  int perPart = nO / max(sa.z, 1); int part = i / perPart; int rest = i - part * perPart;
+  int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int k0 = part * chunk; int k1 = min(K, k0 + chunk);
+  int ab = batch * sa.x + row * K;
+  value = q6kDot(ab, (batch * sa.y) / 256, col, K, k0, k1);`)],
   optim: [['A', 'B', 'C'], each(`float a = A(i); float b = B(i);
   if (op == 0) value = a - f.x * b;
   else if (op == 1) value = f.x * a + f.y * b;
@@ -106,6 +269,10 @@ const KERNELS = {
 const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
 const BINARY = {add: 0, sub: 1, mul: 2, div: 3}, MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
 const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_update: 4};
+// Enough invocations to fill a GPU, and the smallest chunk of the reduced axis
+// worth giving one. Both are round numbers, not tuned constants: the win is in
+// the order of magnitude, and past it the second pass costs more than it saves.
+const WIDE_ENOUGH = 65536, MIN_SPLIT_K = 512, MIN_SPLIT_CHUNK = 128, MAX_SPLIT = 32;
 const UNIFORMS = ['wO', 'nO', 'wA', 'wB', 'wC', 'wD', 'mode', 'op', 'len', 'd', 'sa', 'sb', 'g', 'f', 'tA', 'tB', 'tC', 'tD'];
 
 /** Fragment-shader compute on float textures: R32F where renderable, else RGBA32F. */
@@ -159,7 +326,29 @@ export class WebGL2Backend {
   limitHints(){return {maxElements:Math.min(DEFAULT_LIMITS.maxElements,1024*this.maxHeight),maxWork:500000000};}
   async begin(plan){this.live();this.maxTextureBytes=plan?.limits.maxWebGLTextureBytes??DEFAULT_LIMITS.maxWebGLTextureBytes;this.peakTextureBytes=this.textureBytes-this.pooledBytes;}
   allocationStats(){return {webglTexturePeakBytes:this.peakTextureBytes,webglTextureFormat:this.r32f?'R32F':'RGBA32F'};}
-  layout(size){const width=Math.min(size,1024,this.maxWidth);return {width,height:Math.ceil(size/width)};}
+  /** How many ways to split a product's reduced axis.
+   *
+   * One fragment per output element is enough parallelism when there are many
+   * outputs and not nearly enough when there are a few thousand, which is what
+   * every projection in a one-token decode step looks like. The target is
+   * simply "enough invocations to fill a GPU"; past that, splitting only adds
+   * a second pass. */
+  splitParts(n){
+    if(n.size>=WIDE_ENOUGH||n.k<MIN_SPLIT_K)return 1;
+    const parts=Math.min(Math.ceil(WIDE_ENOUGH/n.size),Math.floor(n.k/MIN_SPLIT_CHUNK),MAX_SPLIT);
+    return parts>1?parts:1;
+  }
+  layout(size){
+    // Rows of 1024 keep the addressing cheap and are what every tensor here
+    // used to need. A quantized embedding table does not fit that shape: at
+    // 151,936 by 1,024 it is 32 million words, which is 31,200 rows against a
+    // driver limit that is usually 16,384. So a tensor that would be too tall
+    // is widened instead, up to whatever the driver allows.
+    let width=Math.min(size,1024,this.maxWidth);
+    if(width>0&&Math.ceil(size/width)>this.maxHeight)width=Math.min(this.maxWidth,Math.ceil(size/this.maxHeight));
+    width=Math.max(width,1);
+    return {width,height:Math.ceil(size/width)};
+  }
   /** Deletes pooled textures (oldest first) until `bytes` more fit in the live budget. */
   evict(bytes){
     for(const [key,list] of this.pool){
@@ -168,10 +357,22 @@ export class WebGL2Backend {
       if(this.textureBytes+bytes<=this.maxTextureBytes)return;
     }
   }
-  alloc(size,data) {
-    this.live();const gl=this.gl,{width,height}=this.layout(size),key=`${width}x${height}`;
+  /** Blocks of a quantized weight, as an R32UI texture of raw four-byte words.
+   * It is only ever sampled, never rendered to, so it needs no renderable
+   * format and none of the RGBA32F fallback that floats may need. */
+  allocWords(data) {
+    // A Q6_K block is 210 bytes, so a buffer of blocks need not be a multiple
+    // of four; the tail is padded rather than read short.
+    const total=Math.ceil(data.byteLength/4)*4;
+    const bytes=total===data.byteLength?data:(()=>{const b=new Uint8Array(total);b.set(data);return b;})();
+    return this.alloc(total/4,new Uint32Array(bytes.buffer,bytes.byteOffset,total/4),true);
+  }
+  alloc(size,data,words=false) {
+    this.live();const gl=this.gl,{width,height}=this.layout(size);
+    // Pooled by format as well as shape: the storage is immutable once set.
+    const key=`${width}x${height}${words?'u':''}`;
     check(height<=this.maxHeight,'LIMIT','Tensor exceeds WebGL texture/viewport limits');
-    const bytes=width*height*(this.texelBytes??16);
+    const bytes=width*height*(words?4:(this.texelBytes??16));
     let texture=this.pool.get(key)?.pop()?.texture;
     if(texture)this.pooledBytes-=bytes;
     else {
@@ -183,20 +384,24 @@ export class WebGL2Backend {
       gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
-      gl.texStorage2D(gl.TEXTURE_2D,1,this.r32f?gl.R32F:gl.RGBA32F,width,height);
+      gl.texStorage2D(gl.TEXTURE_2D,1,words?gl.R32UI:(this.r32f?gl.R32F:gl.RGBA32F),width,height);
       // Only new textures are checked; pooled ones already passed.
       const error=gl.getError();
       if(error!==gl.NO_ERROR){gl.deleteTexture(texture);throw new ComputeError('GPU',`Texture allocation error ${error}`);}
       this.textureBytes+=bytes;
     }
     this.peakTextureBytes=Math.max(this.peakTextureBytes,this.textureBytes-this.pooledBytes);
-    const handle={texture,width,height,size,bytes,key,freed:false};
+    const handle={texture,width,height,size,bytes,key,words,freed:false};
     if(data)this.upload(handle,data);
     return handle;
   }
   upload(h,data) {
     const gl=this.gl;gl.bindTexture(gl.TEXTURE_2D,h.texture);
-    if(this.r32f){
+    if(h.words){
+      const rows=Math.floor(h.size/h.width),rest=h.size-rows*h.width;
+      if(rows)gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,h.width,rows,gl.RED_INTEGER,gl.UNSIGNED_INT,data,0);
+      if(rest)gl.texSubImage2D(gl.TEXTURE_2D,0,0,rows,rest,1,gl.RED_INTEGER,gl.UNSIGNED_INT,data,rows*h.width);
+    } else if(this.r32f){
       const rows=Math.floor(h.size/h.width),rest=h.size-rows*h.width;
       if(rows)gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,h.width,rows,gl.RED,gl.FLOAT,data,0);
       if(rest)gl.texSubImage2D(gl.TEXTURE_2D,0,0,rows,rest,1,gl.RED,gl.FLOAT,data,rows*h.width);
@@ -266,7 +471,7 @@ export class WebGL2Backend {
     } catch(error){this.free(max);if(sum)this.free(sum);throw error;}
   }
   async run(n,refs) {
-    if(n.op==='input')return this.alloc(n.size,n.data);
+    if(n.op==='input')return n.quant?this.allocWords(n.data):this.alloc(n.size,n.data);
     const out=this.alloc(n.size),[a]=refs;
     try {
       switch(n.op) {
@@ -298,7 +503,19 @@ export class WebGL2Backend {
           } finally {this.free(max);this.free(sum);}
           break;
         }
-        case 'matmul':this.dispatch('matmul',{g:[n.m,n.k,n.n,n.batch],sa:[n.aBatchStride,n.bBatchStride,0,0]},refs,out);break;
+        case 'matmul':{
+          const kernel=n.bQuant?`matmul_${n.bQuant.dtype.replace('_','')}`:n.transposed?'matmul_t':'matmul';
+          const parts=this.splitParts(n);
+          if(parts===1){this.dispatch(kernel,{g:[n.m,n.k,n.n,n.batch],sa:[n.aBatchStride,n.bBatchStride,0,0]},refs,out);break;}
+          const partials=this.alloc(n.size*parts);
+          try{
+            this.dispatch(kernel+'_split',
+              {g:[n.m,n.k,n.n,n.batch],sa:[n.aBatchStride,n.bBatchStride,parts,Math.ceil(n.k/parts)]},refs,partials);
+            // `reduce` sums a [parts, outputs] layout straight down the parts.
+            this.dispatch('reduce',{len:parts,mode:0,g:[n.size,0,0,0]},[partials],out);
+          }finally{this.free(partials);}
+          break;
+        }
         case 'sgd_update':case 'momentum_update':case 'adam_m':case 'adam_v':case 'adam_update': {
           const scalars={sgd_update:[n.lr],momentum_update:[n.momentum,n.w],adam_m:[n.w],adam_v:[n.beta2,n.w],
             adam_update:[n.stepSize,n.bc2Sqrt,n.eps]}[n.op];

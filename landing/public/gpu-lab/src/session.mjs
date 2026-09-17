@@ -32,7 +32,9 @@ export class Session {
     // while stepNumber did not advance, so nothing but dispose() may touch them again.
     this.poisoned=false;
     const bytes=new Map();
-    for(const n of this.inputs)if(!n.fed||n.carry!==undefined)bytes.set(`in${n.id}`,n.size*4);
+    // A quantized input is resident as its blocks, which is the whole reason it
+    // is admitted: counting it as values would report seven times what it holds.
+    for(const n of this.inputs)if(!n.fed||n.carry!==undefined)bytes.set(`in${n.id}`,n.quant?n.quant.blocks*n.quant.bytes:n.size*4);
     for(const name of resident)bytes.set(`out${name}`,plan.nodes[this.byName.get(name).id].size*4);
     this.residentBytes=[...bytes.values()].reduce((a,b)=>a+b,0);
   }
