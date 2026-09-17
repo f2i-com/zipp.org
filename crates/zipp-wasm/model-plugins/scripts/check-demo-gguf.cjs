@@ -40,6 +40,9 @@ const MODEL = process.env.MODEL || 'E:/models/qwen3-0.6b-q4_k_m.gguf';
   const details = (await page.textContent('#details')).trim();
   console.log(`  status : ${status}  (${((Date.now() - started) / 1000).toFixed(1)} s)`);
   console.log(`  output : ${JSON.stringify(output)}`);
+  const speed = /"msPerToken":\s*([0-9.]+)/.exec(details);
+  const rate = /"tokensPerSecond":\s*([0-9.]+)/.exec(details);
+  if (speed) console.log(`  speed  : ${speed[1]} ms per token (${rate ? rate[1] : '?'} tokens a second)`);
   const info = details.split('\n\n')[0];
   try {
     const parsed = JSON.parse(info);

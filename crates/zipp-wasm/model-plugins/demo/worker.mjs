@@ -105,14 +105,17 @@ async function runGguf(data){
       tokenizer:{pre:tokenizer.pre,vocab:tokenizer.vocab_size},
       backend:runtime.info().backend,compute:runtime.info()}});
 
+    const timings=[];
     const prompt=[...tokenizer.encode(data.prompt)];
     if(!prompt.length)throw Error('The prompt is empty once tokenized.');
     if(prompt.length>=context)throw Error(`The prompt is ${prompt.length} tokens and this cache holds ${context}.`);
     const generated=[];
     let token=prompt[0];
     for(let position=0;position<context-1;position++){
+      const began=performance.now();
       const step=await stepInputs(plan,store,{token,position});
       const out=await session.run([step],{readback:['logits']});
+      timings.push(performance.now()-began);
       const logits=out.outputs.logits.data;
       if(position+1<prompt.length){token=prompt[position+1];continue;}
       // Greedy decoding on a 0.6B model repeats a phrase forever; a little
@@ -128,8 +131,14 @@ async function runGguf(data){
     }
     const text=tokenizer.decode(Uint32Array.from(generated));
     session.dispose();session=null;runtime.dispose();runtime=null;
+    // Prompt steps prime the cache and are not what a reader means by speed;
+    // the median of the generated ones is.
+    const warm=timings.slice(prompt.length).sort((a,b)=>a-b);
+    const median=warm.length?warm[warm.length>>1]:timings[timings.length-1];
     self.postMessage({type:'done',result:{text,tokens:generated,
       finishReason:generated.length>=data.maxNewTokens?'length':'stop',
+      msPerToken:Number(median.toFixed(1)),
+      tokensPerSecond:Number((1000/median).toFixed(1)),
       backend:'prepared decode'}});
   }finally{
     try{session?.dispose();}catch{}

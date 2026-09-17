@@ -159,19 +159,26 @@ def build_decode_graph(config, context=None):
                              keep, write, g.op("reshape", a=k, shape=[1, kv_width]))
         values = g.write_cache("v" + str(layer), g.cache("v" + str(layer), [context, kv_width]),
                                keep, write, g.op("reshape", a=v, shape=[1, kv_width]))
-        keys = g.repeat_heads(g.op("reshape", a=keys, shape=[context, kv_heads, dim]),
-                              context, kv_heads, repeats, dim)
-        values = g.repeat_heads(g.op("reshape", a=values, shape=[context, kv_heads, dim]),
-                                context, kv_heads, repeats, dim)
-
-        qh = g.op("permute", a=q, dims=[1, 0, 2])              # [heads, 1, dim]
-        kh = g.op("permute", a=keys, dims=[1, 2, 0])           # [heads, dim, context]
-        vh = g.op("permute", a=values, dims=[1, 0, 2])         # [heads, context, dim]
-        scores = g.op("mul", a=g.op("matmul", a=qh, b=kh), b=scale)
-        scores = g.op("add", a=scores, b=mask)
+        # Grouped-query attention without repeating anything.
+        #
+        # The prefill path copies each key head out to the query heads it
+        # serves, because its mask is [tokens, tokens] and cannot broadcast
+        # across a grouped batch. One token needs no such thing: viewing the
+        # queries as [kv_heads, repeats, dim] makes the batch dimension the
+        # key head itself, so the cache is read where it lies. That removes a
+        # [context, heads, dim] copy of both caches every step -- 29 million
+        # elements written per token on this model -- and halves what the
+        # permutes move.
+        qg = g.op("reshape", a=q, shape=[kv_heads, repeats, dim])
+        kh = g.op("permute", a=g.op("reshape", a=keys, shape=[context, kv_heads, dim]),
+                  dims=[1, 2, 0])                              # [kv_heads, dim, context]
+        vh = g.op("permute", a=g.op("reshape", a=values, shape=[context, kv_heads, dim]),
+                  dims=[1, 0, 2])                              # [kv_heads, context, dim]
+        scores = g.op("mul", a=g.op("matmul", a=qg, b=kh), b=scale)
+        scores = g.op("add", a=scores, b=mask)                 # [1, context] broadcasts
         attended = g.op("matmul", a=g.op("softmax", a=scores, axis=-1), b=vh)
-        attended = g.op("reshape", a=g.op("permute", a=attended, dims=[1, 0, 2]),
-                        shape=[1, q_width])
+        # [kv_heads, repeats, dim] is already head order, so this is a view.
+        attended = g.op("reshape", a=attended, shape=[1, q_width])
         x = g.op("add", a=x, b=g.linear(attended, block + "attn_output.weight", q_width, hidden))
 
         n = g.rms_norm(x, block + "ffn_norm.weight", hidden, epsilon)
