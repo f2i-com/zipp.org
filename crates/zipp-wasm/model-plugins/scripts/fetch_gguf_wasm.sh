@@ -60,7 +60,10 @@ if [ "$(gh api "repos/$REPO/git/ref/tags/$VERSION" --jq '.object.type' 2>/dev/nu
   commit=$(gh api "repos/$REPO/git/tags/$commit" --jq '.object.sha')
 fi
 
-python - "$VERSION" "$REPO" "$commit" "$work" <<'PY' > wasm/gguf-wasm.lock.json
+# Written by Python rather than redirected into, because a shell redirect on
+# Windows gets CRLF from Python's stdout, git stores LF, and the next run
+# reports a change that is not one.
+python - "$VERSION" "$REPO" "$commit" "$work" <<'PY'
 import hashlib, json, pathlib, sys
 
 version, repo, commit, work = sys.argv[1:5]
@@ -73,14 +76,14 @@ for directory in ('wasm/gguf', 'wasm/gguf-node'):
         if p.is_file():
             files[p.as_posix().removeprefix('wasm/')] = digest(p)
 
-print(json.dumps({
+pathlib.Path('wasm/gguf-wasm.lock.json').write_text(json.dumps({
     "comment": "Written by scripts/fetch_gguf_wasm.sh. Checked by tests/gguf-module.test.mjs.",
     "repository": f"https://github.com/{repo}",
     "tag": version,
     "commit": commit,
     "assets": assets,
     "files": files,
-}, indent=2))
+}, indent=2) + "\n", encoding="utf-8", newline="\n")
 PY
 
 echo "wasm/gguf-wasm.lock.json: $VERSION at ${commit}"
