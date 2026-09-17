@@ -18,6 +18,8 @@
  * the tests hold it to, and the reason a quantized weight changes what a device
  * must hold without changing what it computes.
  */
+const f = Math.fround;
+
 export const Q4_K_BLOCK = 256;
 export const Q4_K_BYTES = 144;
 
@@ -49,17 +51,24 @@ function scaleMin(scales, at, j, out) {
  * out first.
  */
 export function decodeQ4KBlock(bytes, at, out, outAt) {
+  // Every intermediate rounds to float32, because ggml's does: the sub-block
+  // scale, the minimum, and the product before the minimum is taken off. Doing
+  // the arithmetic in double and rounding once at the end agrees most of the
+  // time and differs in the last bit the rest of it, which over a table with
+  // millions of values is not "most of the time" at all.
   const d = readHalf(bytes, at), dmin = readHalf(bytes, at + 2);
   const scales = at + 4, qs = at + 16;
   const pair = [0, 0];
   let y = outAt, q = qs;
   for (let is = 0; is < 8; is += 2) {
     scaleMin(bytes, scales, is, pair);
-    const d1 = d * pair[0], m1 = dmin * pair[1];
+    const d1 = f(d * pair[0]), m1 = f(dmin * pair[1]);
     scaleMin(bytes, scales, is + 1, pair);
-    const d2 = d * pair[0], m2 = dmin * pair[1];
-    for (let l = 0; l < 32; l++) out[y + l] = d1 * (bytes[q + l] & 0x0f) - m1;
-    for (let l = 0; l < 32; l++) out[y + 32 + l] = d2 * ((bytes[q + l] >>> 4) & 0x0f) - m2;
+    const d2 = f(d * pair[0]), m2 = f(dmin * pair[1]);
+    // The store into a Float32Array rounds the subtraction, which is the
+    // second and last rounding.
+    for (let l = 0; l < 32; l++) out[y + l] = f(d1 * (bytes[q + l] & 0x0f)) - m1;
+    for (let l = 0; l < 32; l++) out[y + 32 + l] = f(d2 * ((bytes[q + l] >>> 4) & 0x0f)) - m2;
     y += 64;
     q += 32;
   }

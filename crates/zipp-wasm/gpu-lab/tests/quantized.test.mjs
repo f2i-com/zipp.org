@@ -125,8 +125,10 @@ test('the block decoder agrees with ggml-quants',
   {skip: !haveWasm && 'Set ZIPP_GGUF_WASM to the gguf-wasm module'}, async () => {
   const require = createRequire(import.meta.url);
   const gguf = require(wasmPath);
-  for (const seed of [1, 7, 4242]) {
-    const bytes = blocks(3, seed);
+  // Many seeds, not a few: a rounding difference in the decoder shows up in the
+  // last bit of a minority of values, so a handful of blocks can agree by luck.
+  for (let seed = 1; seed <= 60; seed++) {
+    const bytes = blocks(3, seed * 2654435761 % 2 ** 31);
     const theirs = gguf.dequantize('Q4_K', bytes, 3 * Q4_K_BLOCK);
     const ours = decoded(bytes);
     assert.equal(ours.length, theirs.length);

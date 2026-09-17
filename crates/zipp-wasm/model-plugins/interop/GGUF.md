@@ -47,33 +47,49 @@ everywhere here. They are reversed once, on the way in, so a plugin sees
 
 ## What quantization buys, and what it does not
 
-It buys a smaller file, a smaller read, and a vocabulary-sized table that can be
-touched a row at a time. It does **not** buy a smaller tensor on the device.
+It buys a smaller file, a smaller read, a vocabulary-sized table that can be
+touched a row at a time, and -- since Graph v2 learned a quantized input -- a
+smaller tensor on the device.
 
-The compute protocol is float32. Anything bound into a graph is dequantized on
-the way in, so a Q4_K_M checkpoint that is 0.5 GB on disk is still four bytes
-per parameter once it reaches a backend. For a 0.8B model that is about 3.2 GB
-of float32 — the same wall described in `../docs/HANDOFF.md`, unmoved. The
-decoded-weight budget is charged as tensors are actually decoded rather than at
-open time, precisely because opening a file you will only read rows of should
-not cost what decoding all of it would.
+What it does not buy is any of that automatically. This reader still decodes
+every tensor to float32 on the way in, because `dequantize` is what it calls.
+Keeping blocks is a second path, described below, and the two ends exist without
+being joined yet.
 
-So this makes a quantized checkpoint **readable**, not runnable at a size that
-was previously out of reach.
+## Blocks on the device
 
-## What running one quantized would need
+Graph v2 takes `dtype: 'q4_k'` on an `input` node, whose `data` is the blocks
+themselves: 144 bytes per 256 values. A backend decodes as it multiplies, so
+what the device holds is the file's own bytes and what it computes is unchanged
+-- the tests hold a quantized matmul to bit-for-bit equality with the same
+matmul over decoded values, and hold the decoder to equality with
+`ggml-quants` rather than with itself.
 
-Quantized tensors in Graph v2: a dtype on an input node, blocks kept as bytes on
-the device, and dequantization inside each backend's matmul rather than before
-it. That is four backends — the JavaScript reference, the C kernels, WebGL2 and
-WebGPU — and this repository holds them to bit-for-bit agreement, which is the
-real cost. On WebGL2 it means blocks in a texture and dequantization in the
-fragment shader; the `llm` repository's CUDA backend already does the equivalent
-with per-quant cooperative-warp GEMV kernels, so the shape of the work is known
-rather than speculative.
+Because blocks run along a row, a quantized weight can only be read `[N, K]`,
+which is the layout every checkpoint stores it in anyway. `matmul` therefore
+takes `transposed: true`, and a quantized `b` without it is refused rather than
+quietly transposed.
 
-Until then, the honest description is: ZIPP can read any GGUF and run what fits
-in float32.
+Measured on `blk.0.attn_q.weight` of a 6.8 GB Q4_K_M Gemma 3 12B:
+
+| | |
+| --- | --- |
+| Shape | `[4096, 3840]`, Q4_K |
+| Resident, quantized | 8.4 MiB |
+| Resident, float32 | 60.0 MiB |
+| Ratio | **7.11x** |
+| Output | bit-for-bit identical |
+
+7.11x is the number that decides whether a model fits. A 0.8B model whose
+matrices are Q4_K is roughly 450 MB of weights instead of 3.2 GB, which is the
+difference between a browser tab and a wall.
+
+Two things are not done. Only the JavaScript reference backend reads blocks; the
+C kernels, WebGPU and WebGL2 still want float32, and porting the decode into
+each is three ports of one settled design rather than three designs. And this
+reader does not yet bind a tensor as blocks -- `readTensor` dequantizes, so
+reaching the 7.11x through a plugin needs a binding that passes blocks straight
+through. Both are mechanical now that the protocol and the reference exist.
 
 ## A reader is not a model
 
