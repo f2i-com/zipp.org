@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ZIPP — Local model plugin lab</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚡</text></svg>">
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
@@ -32,7 +33,7 @@
       </div>
       <label for="model">Model folder (model.json + Safetensors weights)</label>
       <input id="model" type="file" webkitdirectory directory multiple>
-      <p class="hint">Choose each folder itself, not its parent. The model must pin the selected plugin's exact manifest hash.</p>
+      <p class="hint">Choose each folder itself, not its parent. The model must pin the selected plugin's exact manifest hash and name the checkpoint family that plugin implements. A checkpoint from another project (GPT-Neo or TinyStories, for example) needs a plugin written for it, and is refused here rather than loaded.</p>
     </div>
   </section>
   <section aria-labelledby="generate-title">
@@ -52,7 +53,10 @@
     <pre id="output" aria-label="Generated continuation"></pre>
     <details><summary>Details</summary><pre id="details"></pre></details>
   </section>
-  <footer>Architecture source is compiled by ZIPP inside a dedicated Worker. Weights stay outside the Python filesystem. Stopping terminates that Worker. No JavaScript-interop build, remote model resolver, or arbitrary Python package installer is used.</footer>
+  <footer>
+  <p>Architecture source is compiled by ZIPP inside a dedicated Worker. Weights stay outside the Python filesystem. Stopping terminates that Worker. No JavaScript-interop build, remote model resolver, or arbitrary Python package installer is used.</p>
+  <p><a href="./parity.html">Compare every backend's logits →</a> · <a href="../../playground/">ZIPP playground</a></p>
+</footer>
 </main>
 <script type="module" src="./app.mjs"></script>
 </body></html>

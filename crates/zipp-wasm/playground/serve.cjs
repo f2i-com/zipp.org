@@ -25,6 +25,7 @@ const TYPES = {
   ".json": "application/json; charset=utf-8",
   ".wasm": "application/wasm",
   ".py": "text/plain; charset=utf-8",
+  ".safetensors": "application/octet-stream",
   ".md": "text/plain; charset=utf-8",
   ".txt": "text/plain; charset=utf-8",
   ".svg": "image/svg+xml",
@@ -106,5 +107,11 @@ server.on('listening', () => {
     console.log("note: no Python-enabled engine at crates/zipp-wasm/dist/all/ yet; run ./build-variants.sh all first");
   }
   console.log(`zipp playground: http://127.0.0.1:${PORT}/crates/zipp-wasm/playground/`);
+  // The experimental local-model lab is served from the same root when present.
+  const lab = path.join(ROOT, "crates", "zipp-wasm", "model-plugins", "demo", "index.html");
+  if (fs.existsSync(lab)) {
+    console.log(`model lab:      http://127.0.0.1:${PORT}/crates/zipp-wasm/model-plugins/demo/`);
+    console.log(`backend parity: http://127.0.0.1:${PORT}/crates/zipp-wasm/model-plugins/demo/parity.html`);
+  }
 });
 server.listen(PORT, '127.0.0.1');
