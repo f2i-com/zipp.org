@@ -252,6 +252,20 @@ The trade is real: that path holds tensors in the guest and runs on the engine's
 CPU kernels, where the plugin path keeps weights outside Python and reaches the
 GPU. See [architecture §4c](docs/ARCHITECTURE.md) and [interop/](interop/README.md).
 
+## GGUF and quantized checkpoints
+
+`src/gguf.mjs` reads GGUF files — including Q4_K, Q6_K and the rest of the ggml
+block formats — through a 132 KB WebAssembly build of the `gguf` and
+`ggml-quants` crates. Neither side holds the file: a 6.8 GB Q4_K_M checkpoint
+opens in 35 ms from a 16 MiB header read, and five rows of its 788 MiB quantized
+embedding table come back in 3 ms.
+
+Quantization buys a smaller file, a smaller read, and a vocabulary-sized table
+you can touch a row at a time. It does not buy a smaller tensor on the device:
+the compute protocol is float32, so anything bound into a graph arrives
+dequantized. Running a quantized model *as* quantized needs blocks kept on the
+device and dequantized inside each backend's matmul — see [interop/GGUF.md](interop/GGUF.md).
+
 ## Next model milestone
 
 The next model milestone is a **separate** plugin for each further checkpoint

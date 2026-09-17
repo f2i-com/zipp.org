@@ -98,6 +98,14 @@ export class WeightStore {
     check(info.readable, 'DTYPE', `Cannot bind ${name}: dtype ${info.dtype} is unsupported; this host reads F32, F16 and BF16`);
     return info;
   }
+  /** Gather rows without decoding the whole tensor, where the index can.
+   * A Safetensors index decodes and slices; a GGUF one reads only those rows. */
+  async rows(name, indices) {
+    const {index} = this.#byName.get(name) ?? {};
+    this.info(name);
+    if (typeof index?.readRows !== 'function') return null;
+    return index.readRows(name, indices);
+  }
   async tensor(name) {
     this.info(name);
     if (!this.#pending.has(name)) {

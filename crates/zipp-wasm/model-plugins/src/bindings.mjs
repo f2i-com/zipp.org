@@ -81,9 +81,17 @@ export async function bindGraph(template, weights, limits) {
       }
     }
     else if (b.kind === 'rows') {
-      const info = weights.info(b.tensor), data = await weights.tensor(b.tensor), width = info.shape[1];
-      const rows = new Float32Array(b.indices.length * width);
-      b.indices.forEach((index, i) => rows.set(data.subarray(index * width, (index + 1) * width), i * width)); nodes[id].data = rows;
+      const info = weights.info(b.tensor), width = info.shape[1];
+      // A store that can read rows does; otherwise the whole tensor is decoded
+      // once and sliced, which is what a Safetensors file wants anyway.
+      const gathered = typeof weights.rows === 'function' ? await weights.rows(b.tensor, b.indices) : null;
+      if (gathered) { nodes[id].data = gathered; }
+      else {
+        const data = await weights.tensor(b.tensor);
+        const rows = new Float32Array(b.indices.length * width);
+        b.indices.forEach((index, i) => rows.set(data.subarray(index * width, (index + 1) * width), i * width));
+        nodes[id].data = rows;
+      }
     } else {
       const data = new Float32Array(b.length * b.length);
       for (let row = 0; row < b.length; row++) for (let col = 0; col < b.length; col++) {
