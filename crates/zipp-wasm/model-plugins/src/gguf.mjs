@@ -153,6 +153,17 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
     get decodedBytes() { return decoded; },
     get residentBlockBytes() { return resident; },
     fullyDecodedBytes,
+    /**
+     * The tokenizer this checkpoint was trained with, built inside the module.
+     *
+     * The vocabulary and merge table stay there: 151,936 strings and 151,387
+     * merges are expensive to move and pointless to move, since the only thing
+     * that reads them is the encoder. A checkpoint whose `tokenizer.ggml.pre`
+     * names a pattern the module does not scan is refused rather than guessed
+     * — the wrong pre-tokenizer gives ids that are individually valid and
+     * collectively wrong.
+     */
+    tokenizer() { return header.tokenizer(); },
     /** The file's own metadata, for a plugin that reads its configuration. */
     metadata() { return parseJSON(header.metadata(), {maxChars: limits.maxHeaderBytes}); },
     /** One metadata string array — a tokenizer vocabulary or its merges. */
