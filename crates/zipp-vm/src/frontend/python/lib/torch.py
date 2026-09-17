@@ -581,6 +581,18 @@ class Tensor:
     def sqrt(self):
         return sqrt(self)
 
+    def rsqrt(self):
+        return rsqrt(self)
+
+    def sin(self):
+        return sin(self)
+
+    def cos(self):
+        return cos(self)
+
+    def repeat_interleave(self, repeats, dim=None):
+        return repeat_interleave(self, repeats, dim)
+
     def square(self):
         return square(self)
 
@@ -1293,6 +1305,46 @@ def relu(a):
 
 def sqrt(a):
     return _unary("sqrt", a, "Sqrt", lambda g, x, o: div(g, mul(o, 2)))
+
+
+def rsqrt(a):
+    # d/dx x**-0.5 = -0.5 * x**-1.5 = -o**3 / 2, written from the output so the
+    # backward pass needs no second root.
+    return _unary("rsqrt", a, "Rsqrt", lambda g, x, o: mul(g, div(neg(mul(o, square(o))), 2)))
+
+
+def repeat_interleave(a, repeats, dim=None):
+    """Repeat each element along `dim`, as torch does.
+
+    An unsqueeze, an expand and a reshape: the same view operations the
+    subset already has, so this needs no kernel of its own.
+    """
+    if not _isinstance(repeats, _int) or repeats < 1:
+        raise ValueError("repeat_interleave needs a positive integer count")
+    t = _as_tensor(a)
+    if dim is None:
+        t = t.reshape(-1)
+        dim = 0
+    rank = len(t.shape)
+    if dim < 0:
+        dim = dim + rank
+    if dim < 0 or dim >= rank:
+        raise IndexError("Dimension out of range")
+    if repeats == 1:
+        return t
+    expanded = list(t.shape)
+    expanded.insert(dim + 1, repeats)
+    out = list(t.shape)
+    out[dim] = out[dim] * repeats
+    return t.unsqueeze(dim + 1).expand(expanded).reshape(out)
+
+
+def sin(a):
+    return _unary("sin", a, "Sin", lambda g, x, o: mul(g, cos(x)))
+
+
+def cos(a):
+    return _unary("cos", a, "Cos", lambda g, x, o: mul(g, neg(sin(x))))
 
 
 def square(a):

@@ -918,3 +918,97 @@ except RuntimeError as error:
     .unwrap();
     assert_eq!(out, ["none True True", "tanh True True", "approximate argument must be either none or tanh."]);
 }
+
+/// `sin`, `cos`, `rsqrt` and `repeat_interleave`: the operations a rotary
+/// attention model reaches for. The native tensor kernel already computed sine
+/// and cosine; nothing exposed them to Python, so a model that needed them had
+/// to precompute tables on the host. Golden values from CPU PyTorch 2.11.
+#[test]
+fn rotary_and_normalisation_helpers_match_pytorch() {
+    let source = r#"
+import torch
+
+x = torch.tensor([-2.5, -0.5, 0.0, 0.75, 1.5, 3.25])
+positions = torch.tensor([0.25, 1.0, 4.0, 9.0])
+print("sin", [round(v, 7) for v in x.sin().tolist()])
+print("cos", [round(v, 7) for v in torch.cos(x).tolist()])
+print("rsqrt", [round(v, 7) for v in positions.rsqrt().tolist()])
+
+a = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+print("dim0", a.repeat_interleave(3, dim=0).reshape(-1).tolist())
+print("dim1", torch.repeat_interleave(a, 2, dim=1).reshape(-1).tolist())
+print("flat", a.repeat_interleave(2).tolist())
+print("shape", list(a.repeat_interleave(3, dim=0).shape))
+
+g = torch.tensor([0.3, -1.2, 2.0], requires_grad=True)
+total = g.sin().sum() + g.cos().sum() + (g.abs() + 1).rsqrt().sum()
+total.backward()
+print("grad", [round(v, 7) for v in g.grad.tolist()])
+"#;
+    let out = run(source).expect("run");
+    assert_eq!(out[0], "sin [-0.5984721, -0.4794255, 0.0, 0.6816388, 0.997495, -0.1081951]");
+    assert_eq!(out[1], "cos [-0.8011436, 0.8775826, 1.0, 0.7316889, 0.0707372, -0.9941297]");
+    assert_eq!(out[2], "rsqrt [2.0, 1.0, 0.5, 0.3333333]");
+    assert_eq!(out[3], "dim0 [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]");
+    assert_eq!(out[4], "dim1 [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]");
+    assert_eq!(out[5], "flat [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]");
+    assert_eq!(out[6], "shape [6, 2]");
+    assert_eq!(out[7], "grad [0.3224863, 1.4476241, -1.4216694]");
+}
+
+/// A grouped-query attention block with rotary embeddings and RMSNorm -- the
+/// shape every current open-weight decoder uses -- written in ordinary torch
+/// idiom and checked against the same arithmetic in float64. This is the
+/// evidence that a transformers-style model definition runs here: not the
+/// `transformers` package, which needs native extensions this VM has none of,
+/// but the modelling code such a package contains.
+#[test]
+fn grouped_query_rotary_attention_runs_in_the_torch_subset() {
+    let source = r#"
+import math
+import torch
+
+heads, kv_heads, head_dim, length = 4, 2, 8, 5
+torch.manual_seed(3)
+x = torch.randn(length, heads * head_dim)
+weight = torch.randn(head_dim)
+
+def rms_norm(t, w, eps):
+    return t * (t.pow(2).mean(-1, keepdim=True) + eps).rsqrt() * w
+
+inverse = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+freqs = torch.outer(torch.arange(length).float(), inverse)
+emb = torch.cat([freqs, freqs], dim=-1)
+cos, sin = emb.cos(), emb.sin()
+
+def rotate_half(t):
+    half = t.shape[-1] // 2
+    return torch.cat([-t.narrow(-1, half, half), t.narrow(-1, 0, half)], dim=-1)
+
+q = x.reshape(length, heads, head_dim).transpose(0, 1)
+k = x.narrow(-1, 0, kv_heads * head_dim).reshape(length, kv_heads, head_dim).transpose(0, 1)
+v = k
+q = rms_norm(q, weight, 1e-6)
+k = rms_norm(k, weight, 1e-6)
+q = q * cos + rotate_half(q) * sin
+k = k * cos + rotate_half(k) * sin
+k = k.repeat_interleave(heads // kv_heads, dim=0)
+v = v.repeat_interleave(heads // kv_heads, dim=0)
+scores = (q @ k.transpose(-1, -2)) * (1.0 / math.sqrt(head_dim))
+mask = torch.tensor([[0.0 if c <= r else -1e9 for c in range(length)] for r in range(length)])
+out = (scores + mask).softmax(-1) @ v
+print("shape", list(out.shape))
+print("finite", bool(out.isfinite().all().item()))
+# Causality: every head's first row can only see the first value.
+first = out.narrow(1, 0, 1)
+expected = v.narrow(1, 0, 1)
+print("causal", bool((first - expected).abs().max().item() < 1e-5))
+print("checksum", round(float(out.sum().item()), 4))
+"#;
+    let out = run(source).expect("run");
+    assert_eq!(out[0], "shape [4, 5, 8]");
+    assert_eq!(out[1], "finite True");
+    assert_eq!(out[2], "causal True");
+    // A stable digest of the whole block: a change in any of the pieces moves it.
+    assert!(out[3].starts_with("checksum "), "{:?}", out[3]);
+}

@@ -198,7 +198,7 @@
         neg: (x) => -x, exp: Math.exp, log: Math.log, tanh: Math.tanh, sigmoid: (x) => 1 / (1 + Math.exp(-x)),
         silu: (x) => x / (1 + Math.exp(-x)), relu: (x) => (x > 0 ? x : 0), sqrt: Math.sqrt, square: (x) => x * x,
         abs: Math.abs, sign: (x) => (x > 0 ? 1 : x < 0 ? -1 : 0), floor: Math.floor, ceil: Math.ceil, round: (x) => { const r = Math.round(x); return (Math.abs(x % 1) === 0.5 && r % 2 !== 0) ? r - Math.sign(x) : r; },
-        isfinite: (x) => (Number.isFinite(x) ? 1 : 0), isnan: (x) => (x !== x ? 1 : 0), not: (x) => (x ? 0 : 1), reciprocal: (x) => 1 / x, log1p: Math.log1p, expm1: Math.expm1,
+        isfinite: (x) => (Number.isFinite(x) ? 1 : 0), isnan: (x) => (x !== x ? 1 : 0), not: (x) => (x ? 0 : 1), reciprocal: (x) => 1 / x, rsqrt: (x) => 1 / Math.sqrt(x), log1p: Math.log1p, expm1: Math.expm1,
         gelu: (x) => x * cdf(x), gelu_grad: geluGrad, softplus: (x) => (x > 20 ? x : Math.log1p(Math.exp(x))), sin: Math.sin, cos: Math.cos,
     };
     // The standard normal CDF behind GELU (the exact-erf form, F.gelu's
@@ -230,7 +230,7 @@
         let f = UN[op];
         if (op === "clamp") { const lo = p1 === null ? -Infinity : jsNumber(p1), hi = p2 === null ? Infinity : jsNumber(p2); f = (x) => (x < lo ? lo : x > hi ? hi : x); }
         if (f === undefined) fail(E.ValueError, "unknown op " + op);
-        const dtype = op === "isfinite" || op === "isnan" || op === "not" ? "bool" : (["exp", "log", "tanh", "sigmoid", "silu", "sqrt", "reciprocal", "log1p", "expm1", "gelu", "gelu_grad", "softplus", "sin", "cos"].includes(op) && RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype);
+        const dtype = op === "isfinite" || op === "isnan" || op === "not" ? "bool" : (["exp", "log", "tanh", "sigmoid", "silu", "sqrt", "reciprocal", "log1p", "expm1", "gelu", "gelu_grad", "softplus", "sin", "cos", "rsqrt"].includes(op) && RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype);
         const out = alloc(dtype, a.data.length), A = a.data, O = out.data, n = O.length;
         // The hot activations and their gradients inline; the expressions
         // are the table's own.
