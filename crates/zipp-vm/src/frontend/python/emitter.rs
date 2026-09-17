@@ -1132,6 +1132,32 @@ impl<'a> Emitter<'a> {
     }
     /// A project module, a namespace package (a folder holding project
     /// modules but no `__init__.py`), or a built-in module.
+    /// The module's own name, without the `__main__` alias the entry gets:
+    /// relative imports resolve against where a module actually sits.
+    pub fn raw_module_name(&self) -> &'a str {
+        self.project.module_names[self.unit.module_index as usize]
+    }
+
+    /// The package a relative import counts from, following CPython: a module
+    /// that has submodules is a package and counts from itself; anything else
+    /// counts from its parent. `None` means there is nothing above it.
+    pub fn package_of(&self, name: &str) -> Option<&'a str> {
+        let prefix = format!("{name}.");
+        if self.project.modules.iter().any(|m| m.starts_with(&prefix)) {
+            return self.project.modules.iter().copied().find(|m| *m == name).or_else(|| {
+                // A namespace package has submodules but no module of its own;
+                // the name is still what a relative import counts from.
+                self.project.modules.iter().copied().find(|m| m.starts_with(&prefix)).map(|m| &m[..name.len()])
+            });
+        }
+        match name.rfind('.') {
+            Some(cut) => self.project.modules.iter().copied().find(|m| *m == &name[..cut]).or_else(|| {
+                self.project.modules.iter().copied().find(|m| m.starts_with(&name[..cut + 1])).map(|m| &m[..cut])
+            }),
+            None => None,
+        }
+    }
+
     pub fn module_exists(&self, name: &str) -> bool {
         if self.project.modules.contains(name) || Self::is_builtin_module(name) {
             return true;

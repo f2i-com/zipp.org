@@ -145,6 +145,34 @@ def _norm_dim(dim, rank):
 _grad_enabled = True
 
 
+class autocast:
+    """Mixed precision, as a no-op: every tensor here is float32 already.
+
+    Model code wraps the parts that must stay in full precision -- rotary
+    tables, normalisation -- in `torch.autocast(..., enabled=False)`. That is
+    exactly what this engine does everywhere, so honouring the request means
+    doing nothing, and refusing it would fail code that is asking for the
+    behaviour it already has.
+    """
+
+    def __init__(self, device_type=None, dtype=None, enabled=True, cache_enabled=None):
+        self.device_type = device_type
+        self.dtype = dtype
+        self.enabled = enabled
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __call__(self, function):
+        def wrapper(*args, **kwargs):
+            with self:
+                return function(*args, **kwargs)
+        return wrapper
+
+
 class no_grad:
     """Context manager and decorator: operations inside record no gradient."""
 

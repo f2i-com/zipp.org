@@ -405,3 +405,98 @@ fn a_test_module_entry_runs_its_tests() {
         .unwrap();
     assert!(err.contains("SystemExit"), "{err}");
 }
+
+/// Relative imports, which a ported package is written with. A module that has
+/// submodules counts from itself; anything else counts from its parent, and
+/// each extra dot climbs one more level -- CPython's rule.
+#[test]
+fn relative_imports_resolve_against_the_current_package() {
+    let out = run_project(
+        "main",
+        &[
+            ("main", "import pkg.sub.leaf
+print(pkg.sub.leaf.report())
+"),
+            ("pkg", "VALUE = 'package'
+"),
+            ("pkg.shared", "NAME = 'shared'
+"),
+            ("pkg.sub", "DEPTH = 'sub'
+"),
+            (
+                "pkg.sub.leaf",
+                concat!(
+                    // one dot: this module's package, pkg.sub
+                    "from .  import sibling
+",
+                    "from . import DEPTH
+",
+                    // two dots: pkg
+                    "from ..shared import NAME
+",
+                    "from .. import VALUE
+",
+                    "def report():
+",
+                    "    return ' '.join([sibling.WHO, DEPTH, NAME, VALUE])
+",
+                ),
+            ),
+            ("pkg.sub.sibling", "WHO = 'sibling'
+"),
+        ],
+    )
+    .expect("run");
+    assert_eq!(out, vec!["sibling sub shared package"]);
+}
+
+/// A package's own `__init__` counts from itself, not from its parent.
+#[test]
+fn a_package_module_counts_relative_imports_from_itself() {
+    let out = run_project(
+        "main",
+        &["main", "import pkg
+print(pkg.HELLO)
+"]
+            .chunks(2)
+            .map(|c| (c[0], c[1]))
+            .collect::<Vec<_>>()
+            .as_slice()
+            .iter()
+            .copied()
+            .chain([("pkg", "from .inner import HELLO
+"), ("pkg.inner", "HELLO = 'from inner'
+")])
+            .collect::<Vec<_>>()
+            .as_slice(),
+    )
+    .expect("run");
+    assert_eq!(out, vec!["from inner"]);
+}
+
+/// Climbing past the top of the project is an error, not a silent miss.
+#[test]
+fn a_relative_import_beyond_the_top_level_is_refused() {
+    let error = run_project(
+        "main",
+        &[
+            ("main", "import pkg.leaf
+"),
+            ("pkg", "
+"),
+            ("pkg.leaf", "from ... import nothing
+"),
+        ],
+    )
+    .expect_err("should refuse");
+    assert!(error.contains("beyond top-level package"), "{error}");
+}
+
+/// A module with no package above it cannot climb at all.
+#[test]
+fn a_relative_import_with_no_parent_package_is_refused() {
+    let error = run_project("main", &[("main", "from . import anything
+")])
+        .expect_err("should refuse");
+    assert!(error.contains("no known parent package"), "{error}");
+}

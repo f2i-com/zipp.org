@@ -212,12 +212,64 @@ impl<'a> Emitter<'a> {
                 }
             }
             ast::Stmt::ImportFrom(s) => {
-                if s.level.is_some_and(|level| level.to_u32() > 0) {
-                    return Err(self.error(stmt, "relative imports are not supported"));
-                }
-                let Some(name) = s.module.as_ref() else {
-                    return Err(self.error(stmt, "relative imports are not supported"));
+                let level = s.level.map_or(0, |level| level.to_u32());
+                // `from .x import y` counts from the current module's package,
+                // one level per leading dot, exactly as CPython does. Ported
+                // packages are written this way, so refusing it made every one
+                // of them a rewrite rather than a copy.
+                let resolved = if level == 0 {
+                    let Some(name) = s.module.as_ref() else {
+                        return Err(self.error(stmt, "import from requires a module name"));
+                    };
+                    name.to_string()
+                } else {
+                    let here = self.raw_module_name();
+                    let mut base = match self.package_of(here) {
+                        Some(package) => package.to_string(),
+                        None => {
+                            return Err(self.error(
+                                stmt,
+                                "attempted relative import with no known parent package",
+                            ))
+                        }
+                    };
+                    for _ in 1..level {
+                        match base.rfind('.') {
+                            Some(cut) => base.truncate(cut),
+                            None => {
+                                return Err(self.error(
+                                    stmt,
+                                    "attempted relative import beyond top-level package",
+                                ))
+                            }
+                        }
+                    }
+                    match s.module.as_ref() {
+                        Some(name) => format!("{base}.{name}"),
+                        None => base,
+                    }
                 };
+                // `from . import name` binds a submodule when one exists, and
+                // otherwise reads the attribute off the package.
+                if level > 0 && s.module.is_none() {
+                    for alias in &s.names {
+                        if alias.name.as_str() == "*" {
+                            return Err(self.error(stmt, "import * needs an explicit module"));
+                        }
+                        let submodule = format!("{resolved}.{}", alias.name.as_str());
+                        let value = if self.module_exists(&submodule) {
+                            self.import_module(stmt, &submodule)?
+                        } else {
+                            let package = self.import_module(stmt, &resolved)?;
+                            let attr = self.string(alias.name.as_str())?;
+                            self.helper("importfrom", &[package, attr])?
+                        };
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                        self.store_name(bound.as_str(), value)?;
+                    }
+                    return Ok(());
+                }
+                let name = resolved;
                 let module = self.import_module(stmt, name.as_str())?;
                 for alias in &s.names {
                     if alias.name.as_str() == "*" {

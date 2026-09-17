@@ -136,8 +136,33 @@ pub(super) struct Project<'a> {
 
 /// A multi-module program. `modules` pairs each module name (the `.py` file's
 /// stem) with its source; `entry` names the module whose top level runs.
+/// Where a relative import could count from, given the module it appears in.
+/// A module that is itself a package counts from itself and a plain module
+/// counts from its parent. Discovery does not yet know which, so it offers both
+/// and lets the module set decide; only names that exist are ever queued.
+fn relative_bases(here: &str, level: u32) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for strip in [level.saturating_sub(1), level] {
+        let mut base = here.to_owned();
+        let mut ok = true;
+        for _ in 0..strip {
+            match base.rfind('.') {
+                Some(cut) => base.truncate(cut),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && !base.is_empty() && !out.contains(&base) {
+            out.push(base);
+        }
+    }
+    out
+}
+
 /// The module names a suite imports anywhere in its statements.
-fn imported_modules(suite: &[ast::Stmt], out: &mut BTreeSet<String>) {
+fn imported_modules(suite: &[ast::Stmt], here: &str, out: &mut BTreeSet<String>) {
     for stmt in suite {
         match stmt {
             ast::Stmt::Import(i) => {
@@ -146,11 +171,23 @@ fn imported_modules(suite: &[ast::Stmt], out: &mut BTreeSet<String>) {
                 }
             }
             ast::Stmt::ImportFrom(i) => {
-                if let Some(module) = &i.module {
-                    out.insert(module.as_str().to_owned());
+                let level = i.level.map_or(0, |level| level.to_u32());
+                let bases = if level == 0 {
+                    vec![String::new()]
+                } else {
+                    relative_bases(here, level)
+                };
+                for base in bases {
+                    let full = match (&i.module, base.is_empty()) {
+                        (Some(module), true) => module.as_str().to_owned(),
+                        (Some(module), false) => format!("{base}.{}", module.as_str()),
+                        (None, true) => continue,
+                        (None, false) => base.clone(),
+                    };
+                    out.insert(full.clone());
                     // `from pkg import sub` may name a submodule.
                     for alias in &i.names {
-                        out.insert(format!("{}.{}", module.as_str(), alias.name.as_str()));
+                        out.insert(format!("{full}.{}", alias.name.as_str()));
                     }
                 }
             }
@@ -158,39 +195,39 @@ fn imported_modules(suite: &[ast::Stmt], out: &mut BTreeSet<String>) {
                 // An `elif` ladder is walked iteratively.
                 let mut arm = s;
                 loop {
-                    imported_modules(&arm.body, out);
+                    imported_modules(&arm.body, here, out);
                     match arm.orelse.as_slice() {
                         [ast::Stmt::If(next)] => arm = next,
                         orelse => {
-                            imported_modules(orelse, out);
+                            imported_modules(orelse, here, out);
                             break;
                         }
                     }
                 }
             }
             ast::Stmt::For(s) => {
-                imported_modules(&s.body, out);
-                imported_modules(&s.orelse, out);
+                imported_modules(&s.body, here, out);
+                imported_modules(&s.orelse, here, out);
             }
             ast::Stmt::While(s) => {
-                imported_modules(&s.body, out);
-                imported_modules(&s.orelse, out);
+                imported_modules(&s.body, here, out);
+                imported_modules(&s.orelse, here, out);
             }
-            ast::Stmt::With(s) => imported_modules(&s.body, out),
+            ast::Stmt::With(s) => imported_modules(&s.body, here, out),
             ast::Stmt::Try(s) => {
-                imported_modules(&s.body, out);
+                imported_modules(&s.body, here, out);
                 for handler in &s.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    imported_modules(&h.body, out);
+                    imported_modules(&h.body, here, out);
                 }
-                imported_modules(&s.orelse, out);
-                imported_modules(&s.finalbody, out);
+                imported_modules(&s.orelse, here, out);
+                imported_modules(&s.finalbody, here, out);
             }
-            ast::Stmt::FunctionDef(s) => imported_modules(&s.body, out),
-            ast::Stmt::ClassDef(s) => imported_modules(&s.body, out),
+            ast::Stmt::FunctionDef(s) => imported_modules(&s.body, here, out),
+            ast::Stmt::ClassDef(s) => imported_modules(&s.body, here, out),
             ast::Stmt::Match(s) => {
                 for case in &s.cases {
-                    imported_modules(&case.body, out);
+                    imported_modules(&case.body, here, out);
                 }
             }
             _ => {}
@@ -294,7 +331,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
         let suite = nesting::check(suite, &file, text)?;
         let table = symtable::analyse(&suite, &name).map_err(|e| format!("{file}: {e}"))?;
         let mut wanted = BTreeSet::new();
-        imported_modules(&suite, &mut wanted);
+        imported_modules(&suite, &name, &mut wanted);
         let index = sources.len();
         names.insert(name.clone());
         sources.push((name.clone(), source));
