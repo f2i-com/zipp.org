@@ -50,3 +50,7 @@ crates/zipp-wasm/pkg/
 # playground/smoke.cjs and gpu-lab/scripts/check-gpu-matmul.cjs. Left untracked
 # it blocks the clean-checkout rule above, the same way dist/ did.
 crates/zipp-wasm/node_modules/
+
+# A bound decode plan with its weights replaced by sizes, for
+# gpu-lab/scripts/profile-decode.cjs. Generated, and specific to one model.
+crates/zipp-wasm/gpu-lab/skeleton.json

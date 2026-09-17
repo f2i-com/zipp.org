@@ -158,6 +158,46 @@ const KERNELS = {
   int batch = i / (M * N); int rc = i - batch * M * N; int row = rc / N; int col = rc - row * N;
   int ab = batch * sa.x + row * K; int block0 = (batch * sa.y) / 256;
   for (int k = 0; k < K; k++) value += A(ab + k) * q6k(block0, col, K, k);`)],
+  // Split along the reduced axis, then sum the parts.
+  //
+  // A fragment shader runs one invocation per output element, and a decode step
+  // multiplies [1, 1024] by [2048, 1024]: two thousand invocations, each walking
+  // a thousand dependent texture reads. That leaves a GPU almost idle -- the
+  // model's own matmuls measured slower than one matmul with a hundred times
+  // more outputs. Splitting the reduced axis into parts gives the same product
+  // as many times more invocations, and `reduce` adds the parts back.
+  //
+  // Both operands are read exactly as the unsplit kernels read them, and within
+  // a part the order is unchanged, so a quantized product still equals the same
+  // product over decoded values on this backend.
+  matmul_split: [['A', 'B'], each(`int M = g.x; int K = g.y; int N = g.z; int chunk = sa.w;
+  int perPart = nO / max(sa.z, 1); int part = i / perPart; int rest = i - part * perPart;
+  int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int k0 = part * chunk; int k1 = min(K, k0 + chunk);
+  int ab = batch * sa.x + row * K;
+  int bb = batch * sa.y + col;
+  for (int k = k0; k < k1; k++) value += A(ab + k) * B(bb + k * N);`)],
+  matmul_t_split: [['A', 'B'], each(`int M = g.x; int K = g.y; int N = g.z; int chunk = sa.w;
+  int perPart = nO / max(sa.z, 1); int part = i / perPart; int rest = i - part * perPart;
+  int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int k0 = part * chunk; int k1 = min(K, k0 + chunk);
+  int ab = batch * sa.x + row * K;
+  int bb = batch * sa.y + col * K;
+  for (int k = k0; k < k1; k++) value += A(ab + k) * B(bb + k);`)],
+  matmul_q4k_split: [['A', 'B:u32'], QUANT_GLSL + each(`int M = g.x; int K = g.y; int N = g.z; int chunk = sa.w;
+  int perPart = nO / max(sa.z, 1); int part = i / perPart; int rest = i - part * perPart;
+  int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int k0 = part * chunk; int k1 = min(K, k0 + chunk);
+  int ab = batch * sa.x + row * K;
+  int block0 = (batch * sa.y) / 256;
+  for (int k = k0; k < k1; k++) value += A(ab + k) * q4k(block0, col, K, k);`)],
+  matmul_q6k_split: [['A', 'B:u32'], QUANT_GLSL + each(`int M = g.x; int K = g.y; int N = g.z; int chunk = sa.w;
+  int perPart = nO / max(sa.z, 1); int part = i / perPart; int rest = i - part * perPart;
+  int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
+  int k0 = part * chunk; int k1 = min(K, k0 + chunk);
+  int ab = batch * sa.x + row * K;
+  int block0 = (batch * sa.y) / 256;
+  for (int k = k0; k < k1; k++) value += A(ab + k) * q6k(block0, col, K, k);`)],
   optim: [['A', 'B', 'C'], each(`float a = A(i); float b = B(i);
   if (op == 0) value = a - f.x * b;
   else if (op == 1) value = f.x * a + f.y * b;
@@ -172,6 +212,10 @@ const KERNELS = {
 const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
 const BINARY = {add: 0, sub: 1, mul: 2, div: 3}, MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
 const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_update: 4};
+// Enough invocations to fill a GPU, and the smallest chunk of the reduced axis
+// worth giving one. Both are round numbers, not tuned constants: the win is in
+// the order of magnitude, and past it the second pass costs more than it saves.
+const WIDE_ENOUGH = 65536, MIN_SPLIT_K = 512, MIN_SPLIT_CHUNK = 128, MAX_SPLIT = 32;
 const UNIFORMS = ['wO', 'nO', 'wA', 'wB', 'wC', 'wD', 'mode', 'op', 'len', 'd', 'sa', 'sb', 'g', 'f', 'tA', 'tB', 'tC', 'tD'];
 
 /** Fragment-shader compute on float textures: R32F where renderable, else RGBA32F. */
@@ -225,6 +269,18 @@ export class WebGL2Backend {
   limitHints(){return {maxElements:Math.min(DEFAULT_LIMITS.maxElements,1024*this.maxHeight),maxWork:500000000};}
   async begin(plan){this.live();this.maxTextureBytes=plan?.limits.maxWebGLTextureBytes??DEFAULT_LIMITS.maxWebGLTextureBytes;this.peakTextureBytes=this.textureBytes-this.pooledBytes;}
   allocationStats(){return {webglTexturePeakBytes:this.peakTextureBytes,webglTextureFormat:this.r32f?'R32F':'RGBA32F'};}
+  /** How many ways to split a product's reduced axis.
+   *
+   * One fragment per output element is enough parallelism when there are many
+   * outputs and not nearly enough when there are a few thousand, which is what
+   * every projection in a one-token decode step looks like. The target is
+   * simply "enough invocations to fill a GPU"; past that, splitting only adds
+   * a second pass. */
+  splitParts(n){
+    if(n.size>=WIDE_ENOUGH||n.k<MIN_SPLIT_K)return 1;
+    const parts=Math.min(Math.ceil(WIDE_ENOUGH/n.size),Math.floor(n.k/MIN_SPLIT_CHUNK),MAX_SPLIT);
+    return parts>1?parts:1;
+  }
   layout(size){
     // Rows of 1024 keep the addressing cheap and are what every tensor here
     // used to need. A quantized embedding table does not fit that shape: at
@@ -390,8 +446,19 @@ export class WebGL2Backend {
           } finally {this.free(max);this.free(sum);}
           break;
         }
-        case 'matmul':this.dispatch(n.bQuant?`matmul_${n.bQuant.dtype.replace('_','')}`:n.transposed?'matmul_t':'matmul',
-          {g:[n.m,n.k,n.n,n.batch],sa:[n.aBatchStride,n.bBatchStride,0,0]},refs,out);break;
+        case 'matmul':{
+          const kernel=n.bQuant?`matmul_${n.bQuant.dtype.replace('_','')}`:n.transposed?'matmul_t':'matmul';
+          const parts=this.splitParts(n);
+          if(parts===1){this.dispatch(kernel,{g:[n.m,n.k,n.n,n.batch],sa:[n.aBatchStride,n.bBatchStride,0,0]},refs,out);break;}
+          const partials=this.alloc(n.size*parts);
+          try{
+            this.dispatch(kernel+'_split',
+              {g:[n.m,n.k,n.n,n.batch],sa:[n.aBatchStride,n.bBatchStride,parts,Math.ceil(n.k/parts)]},refs,partials);
+            // `reduce` sums a [parts, outputs] layout straight down the parts.
+            this.dispatch('reduce',{len:parts,mode:0,g:[n.size,0,0,0]},[partials],out);
+          }finally{this.free(partials);}
+          break;
+        }
         case 'sgd_update':case 'momentum_update':case 'adam_m':case 'adam_v':case 'adam_update': {
           const scalars={sgd_update:[n.lr],momentum_update:[n.momentum,n.w],adam_m:[n.w],adam_v:[n.beta2,n.w],
             adam_update:[n.stepSize,n.bc2Sqrt,n.eps]}[n.op];

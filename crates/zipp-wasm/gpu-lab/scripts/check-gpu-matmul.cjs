@@ -106,7 +106,20 @@ const BASE = `${ORIGIN}/crates/zipp-wasm/gpu-lab/`;
       } catch (e) { report[name] = {status: 'error', why: String(e.message || e)}; runtime.dispose(); continue; }
       runtime.dispose();
 
-      const worst = (x, y) => { let w = 0; for (let i = 0; i < x.length; i++) for (let j = 0; j < x[i].length; j++) w = Math.max(w, Math.abs(x[i][j] - y[i][j])); return w; };
+      // Absolute error, and how much of the suite's acceptance band it uses:
+      // 2e-4 + 2e-4*|expected|, the same rule browser-cases applies. A GPU
+      // summing float32 in its own order is allowed to differ; a wrong kernel
+      // is not, and the ratio is what tells them apart.
+      const worst = (x, y) => {
+        let w = 0, band = 0, scale = 0;
+        for (let i = 0; i < x.length; i++) for (let j = 0; j < x[i].length; j++) {
+          const error = Math.abs(x[i][j] - y[i][j]);
+          w = Math.max(w, error);
+          scale = Math.max(scale, Math.abs(y[i][j]));
+          band = Math.max(band, error / (2e-4 + 2e-4 * Math.abs(y[i][j])));
+        }
+        return {error: w, band, scale};
+      };
       if (!reference) reference = got;
       report[name] = {
         status: 'ran',
@@ -132,12 +145,17 @@ const BASE = `${ORIGIN}/crates/zipp-wasm/gpu-lab/`;
     // Exactness for the decoder and the layout; the suite's GPU tolerance for
     // the product itself.
     const fails = [];
-    if (r.quantVsDecodedSameBackend !== 0) fails.push(`decoder off by ${r.quantVsDecodedSameBackend}`);
-    if (r.transposedVsPlainSameBackend !== 0) fails.push(`transpose off by ${r.transposedVsPlainSameBackend}`);
-    if (r.quantVsCpuJs > 2e-4) fails.push(`quantized ${r.quantVsCpuJs} from cpu-js`);
-    if (r.transposedVsCpuJs > 2e-4) fails.push(`transposed ${r.transposedVsCpuJs} from cpu-js`);
+    if (r.quantVsDecodedSameBackend.error !== 0) fails.push(`decoder off by ${r.quantVsDecodedSameBackend.error}`);
+    if (r.transposedVsPlainSameBackend.error !== 0) fails.push(`transpose off by ${r.transposedVsPlainSameBackend.error}`);
+    if (r.quantVsCpuJs.band > 1) fails.push(`quantized ${r.quantVsCpuJs.error} from cpu-js (${r.quantVsCpuJs.band.toFixed(2)}x the band)`);
+    if (r.transposedVsCpuJs.band > 1) fails.push(`transposed ${r.transposedVsCpuJs.error} from cpu-js (${r.transposedVsCpuJs.band.toFixed(2)}x the band)`);
     if (fails.length) { bad++; console.log(`  FAIL ${name}: ${fails.join('; ')}`); }
-    else console.log(`  ok   ${name}: decoder exact, product within ${Math.max(r.quantVsCpuJs, r.transposedVsCpuJs).toExponential(1)} of cpu-js`);
+    else {
+      const e = Math.max(r.quantVsCpuJs.error, r.transposedVsCpuJs.error);
+      const band = Math.max(r.quantVsCpuJs.band, r.transposedVsCpuJs.band);
+      console.log(`  ok   ${name}: decoder exact, product within ${e.toExponential(1)} of cpu-js ` +
+                  `(${(100 * band).toFixed(0)}% of the accepted band, values up to ${r.quantVsCpuJs.scale.toFixed(0)})`);
+    }
   }
   process.exit(bad ? 1 : 0);
 })();

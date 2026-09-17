@@ -301,6 +301,209 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   }
   if (row < M && col < N) { O[wg.z * M * N + row * N + col] = acc; }
 }`],
+  // Split along the reduced axis, then sum the parts.
+  //
+  // A decode step multiplies [1, 1024] by [2048, 1024]. The tile above is
+  // 16 by 16, so fifteen of every sixteen rows in it do nothing and the whole
+  // product is 128 workgroups -- far too few to fill a GPU, and measurably
+  // slower per weight than one matmul with a hundred times more outputs.
+  // Slicing the reduced axis multiplies the workgroups by the slice count,
+  // and `reduce` adds the slices back. Within a slice nothing about the
+  // arithmetic changes, so quantized still equals decoded here exactly.
+  matmul_split: [['A', 'B'], `var<workgroup> As: array<array<f32, 16>, 16>;
+var<workgroup> Bs: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  let batches = max(P.g.w, 1u);
+  let part = wg.z / batches; let b = wg.z % batches;
+  let row = wg.y * 16u + lid.y; let col = wg.x * 16u + lid.x;
+  let aBase = b * P.sa.x; let bBase = b * P.sa.y;
+  let k0 = part * P.sa.z; let k1 = min(K, k0 + P.sa.z);
+  var acc = 0.0;
+  for (var t = k0; t < k1; t = t + 16u) {
+    let ka = t + lid.x; let kb = t + lid.y;
+    var av = 0.0; var bv = 0.0;
+    if (row < M && ka < k1) { av = A[aBase + row * K + ka]; }
+    if (kb < k1 && col < N) { bv = B[bBase + kb * N + col]; }
+    As[lid.y][lid.x] = av; Bs[lid.y][lid.x] = bv;
+    workgroupBarrier();
+    let span = min(16u, k1 - t);
+    for (var k = 0u; k < span; k = k + 1u) { acc = acc + As[lid.y][k] * Bs[k][lid.x]; }
+    workgroupBarrier();
+  }
+  if (row < M && col < N) { O[(part * batches + b) * M * N + row * N + col] = acc; }
+}`],
+  matmul_t_split: [['A', 'B'], `var<workgroup> As: array<array<f32, 16>, 16>;
+var<workgroup> Bs: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  let batches = max(P.g.w, 1u);
+  let part = wg.z / batches; let b = wg.z % batches;
+  let row = wg.y * 16u + lid.y; let col = wg.x * 16u + lid.x;
+  let aBase = b * P.sa.x; let bBase = b * P.sa.y;
+  let k0 = part * P.sa.z; let k1 = min(K, k0 + P.sa.z);
+  var acc = 0.0;
+  for (var t = k0; t < k1; t = t + 16u) {
+    let ka = t + lid.x; let kb = t + lid.y;
+    var av = 0.0; var bv = 0.0;
+    if (row < M && ka < k1) { av = A[aBase + row * K + ka]; }
+    if (kb < k1 && col < N) { bv = B[bBase + col * K + kb]; }
+    As[lid.y][lid.x] = av; Bs[lid.y][lid.x] = bv;
+    workgroupBarrier();
+    let span = min(16u, k1 - t);
+    for (var k = 0u; k < span; k = k + 1u) { acc = acc + As[lid.y][k] * Bs[k][lid.x]; }
+    workgroupBarrier();
+  }
+  if (row < M && col < N) { O[(part * batches + b) * M * N + row * N + col] = acc; }
+}`],
+  matmul_q4k_split: [['A', 'B:u32'], `// Block-quantized weights, decoded where they are used.
+//
+// Ports of dequantize_row_q4_K and dequantize_row_q6_K; src/quant.mjs is the
+// same thing in JavaScript and rust/zipp-quants is it in Rust. Addressing is by
+// absolute byte, not by word: a Q6_K block is 210 bytes, so blocks after the
+// first are not word-aligned and a word-relative accessor would be wrong.
+fn qbyte(off: u32) -> u32 { return (B[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu; }
+// One f16 from two bytes that may straddle a word.
+fn qhalf(off: u32) -> f32 { return unpack2x16float(qbyte(off) | (qbyte(off + 1u) << 8u)).x; }
+// Where element e of row col begins, for a format of bytes per 256 values.
+fn qbase(block0: u32, col: u32, K: u32, e: u32, bytes: u32) -> u32 {
+  return (block0 + col * (K / 256u) + e / 256u) * bytes;
+}
+// Q4_K: f16 scale and minimum, eight 6-bit sub-block scales and minimums packed
+// into 12 bytes, then 256 nibbles. Sub-blocks 0..3 are a plain six bits; 4..7
+// borrow their high two bits from the bytes of the first four.
+fn q4k_scale_min(base: u32, j: u32) -> vec2<f32> {
+  if (j < 4u) { return vec2<f32>(f32(qbyte(base + 4u + j) & 63u), f32(qbyte(base + 8u + j) & 63u)); }
+  let hi = qbyte(base + j + 8u);
+  let lo = qbyte(base + j);
+  let me = qbyte(base + j + 4u);
+  return vec2<f32>(f32((hi & 15u) | ((lo >> 6u) << 4u)), f32((hi >> 4u) | ((me >> 6u) << 4u)));
+}
+fn q4k(block0: u32, col: u32, K: u32, e: u32) -> f32 {
+  let base = qbase(block0, col, K, e, 144u);
+  let within = e % 256u;
+  let pair = within / 64u;
+  let rem = within % 64u;
+  let byte = qbyte(base + 16u + pair * 32u + rem % 32u);
+  let nibble = select(byte >> 4u, byte & 15u, rem < 32u);
+  let j = pair * 2u + select(1u, 0u, rem < 32u);
+  let sm = q4k_scale_min(base, j);
+  return (qhalf(base) * sm.x) * f32(nibble) - qhalf(base + 2u) * sm.y;
+}
+// Q6_K: 128 low nibbles, 64 bytes of high pairs, sixteen signed group scales,
+// then the f16 super-block scale. Each value is (low4 | high2 << 4) - 32.
+fn q6k(block0: u32, col: u32, K: u32, e: u32) -> f32 {
+  let base = qbase(block0, col, K, e, 210u);
+  let within = e % 256u;
+  let half = within / 128u;
+  let rem = within % 128u;
+  let sub = rem / 32u;
+  let l = rem % 32u;
+  let ql = qbyte(base + 64u * half + l + 32u * (sub & 1u));
+  let low = select(ql >> 4u, ql & 15u, sub < 2u);
+  let high = (qbyte(base + 128u + 32u * half + l) >> (2u * sub)) & 3u;
+  let scale = f32(bitcast<i32>(qbyte(base + 192u + 8u * half + l / 16u + 2u * sub) << 24u) >> 24u);
+  return (qhalf(base + 208u) * scale) * f32(bitcast<i32>(low | (high << 4u)) - 32);
+}
+var<workgroup> As: array<array<f32, 16>, 16>;
+var<workgroup> Bs: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  let batches = max(P.g.w, 1u);
+  let part = wg.z / batches; let b = wg.z % batches;
+  let row = wg.y * 16u + lid.y; let col = wg.x * 16u + lid.x;
+  let aBase = b * P.sa.x; let bBase = b * P.sa.y;
+  let k0 = part * P.sa.z; let k1 = min(K, k0 + P.sa.z);
+  var acc = 0.0;
+  for (var t = k0; t < k1; t = t + 16u) {
+    let ka = t + lid.x; let kb = t + lid.y;
+    var av = 0.0; var bv = 0.0;
+    if (row < M && ka < k1) { av = A[aBase + row * K + ka]; }
+    if (kb < k1 && col < N) { bv = q4k(bBase / 256u, col, K, kb); }
+    As[lid.y][lid.x] = av; Bs[lid.y][lid.x] = bv;
+    workgroupBarrier();
+    let span = min(16u, k1 - t);
+    for (var k = 0u; k < span; k = k + 1u) { acc = acc + As[lid.y][k] * Bs[k][lid.x]; }
+    workgroupBarrier();
+  }
+  if (row < M && col < N) { O[(part * batches + b) * M * N + row * N + col] = acc; }
+}`],
+  matmul_q6k_split: [['A', 'B:u32'], `// Block-quantized weights, decoded where they are used.
+//
+// Ports of dequantize_row_q4_K and dequantize_row_q6_K; src/quant.mjs is the
+// same thing in JavaScript and rust/zipp-quants is it in Rust. Addressing is by
+// absolute byte, not by word: a Q6_K block is 210 bytes, so blocks after the
+// first are not word-aligned and a word-relative accessor would be wrong.
+fn qbyte(off: u32) -> u32 { return (B[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu; }
+// One f16 from two bytes that may straddle a word.
+fn qhalf(off: u32) -> f32 { return unpack2x16float(qbyte(off) | (qbyte(off + 1u) << 8u)).x; }
+// Where element e of row col begins, for a format of bytes per 256 values.
+fn qbase(block0: u32, col: u32, K: u32, e: u32, bytes: u32) -> u32 {
+  return (block0 + col * (K / 256u) + e / 256u) * bytes;
+}
+// Q4_K: f16 scale and minimum, eight 6-bit sub-block scales and minimums packed
+// into 12 bytes, then 256 nibbles. Sub-blocks 0..3 are a plain six bits; 4..7
+// borrow their high two bits from the bytes of the first four.
+fn q4k_scale_min(base: u32, j: u32) -> vec2<f32> {
+  if (j < 4u) { return vec2<f32>(f32(qbyte(base + 4u + j) & 63u), f32(qbyte(base + 8u + j) & 63u)); }
+  let hi = qbyte(base + j + 8u);
+  let lo = qbyte(base + j);
+  let me = qbyte(base + j + 4u);
+  return vec2<f32>(f32((hi & 15u) | ((lo >> 6u) << 4u)), f32((hi >> 4u) | ((me >> 6u) << 4u)));
+}
+fn q4k(block0: u32, col: u32, K: u32, e: u32) -> f32 {
+  let base = qbase(block0, col, K, e, 144u);
+  let within = e % 256u;
+  let pair = within / 64u;
+  let rem = within % 64u;
+  let byte = qbyte(base + 16u + pair * 32u + rem % 32u);
+  let nibble = select(byte >> 4u, byte & 15u, rem < 32u);
+  let j = pair * 2u + select(1u, 0u, rem < 32u);
+  let sm = q4k_scale_min(base, j);
+  return (qhalf(base) * sm.x) * f32(nibble) - qhalf(base + 2u) * sm.y;
+}
+// Q6_K: 128 low nibbles, 64 bytes of high pairs, sixteen signed group scales,
+// then the f16 super-block scale. Each value is (low4 | high2 << 4) - 32.
+fn q6k(block0: u32, col: u32, K: u32, e: u32) -> f32 {
+  let base = qbase(block0, col, K, e, 210u);
+  let within = e % 256u;
+  let half = within / 128u;
+  let rem = within % 128u;
+  let sub = rem / 32u;
+  let l = rem % 32u;
+  let ql = qbyte(base + 64u * half + l + 32u * (sub & 1u));
+  let low = select(ql >> 4u, ql & 15u, sub < 2u);
+  let high = (qbyte(base + 128u + 32u * half + l) >> (2u * sub)) & 3u;
+  let scale = f32(bitcast<i32>(qbyte(base + 192u + 8u * half + l / 16u + 2u * sub) << 24u) >> 24u);
+  return (qhalf(base + 208u) * scale) * f32(bitcast<i32>(low | (high << 4u)) - 32);
+}
+var<workgroup> As: array<array<f32, 16>, 16>;
+var<workgroup> Bs: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  let batches = max(P.g.w, 1u);
+  let part = wg.z / batches; let b = wg.z % batches;
+  let row = wg.y * 16u + lid.y; let col = wg.x * 16u + lid.x;
+  let aBase = b * P.sa.x; let bBase = b * P.sa.y;
+  let k0 = part * P.sa.z; let k1 = min(K, k0 + P.sa.z);
+  var acc = 0.0;
+  for (var t = k0; t < k1; t = t + 16u) {
+    let ka = t + lid.x; let kb = t + lid.y;
+    var av = 0.0; var bv = 0.0;
+    if (row < M && ka < k1) { av = A[aBase + row * K + ka]; }
+    if (kb < k1 && col < N) { bv = q6k(bBase / 256u, col, K, kb); }
+    As[lid.y][lid.x] = av; Bs[lid.y][lid.x] = bv;
+    workgroupBarrier();
+    let span = min(16u, k1 - t);
+    for (var k = 0u; k < span; k = k + 1u) { acc = acc + As[lid.y][k] * Bs[k][lid.x]; }
+    workgroupBarrier();
+  }
+  if (row < M && col < N) { O[(part * batches + b) * M * N + row * N + col] = acc; }
+}`],
 };
 const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
 const BINARY = {add: 0, sub: 1, mul: 2, div: 3}, MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
@@ -309,6 +512,9 @@ const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_upd
 // so a bind group depends only on its kernel and storage buffers and is
 // reused across steps and runs. UNIFORM_SLOTS bounds the dispatches of one
 // submission (a 64-step session run of a 512-node graph fits).
+// Enough outputs to fill a GPU, and the smallest slice of the reduced axis
+// worth a pass of its own. Round numbers: the win is the order of magnitude.
+const WIDE_ENOUGH = 65536, MIN_SPLIT_K = 512, MIN_SPLIT_CHUNK = 128, MAX_SPLIT = 32;
 const SLOT = 256, UNIFORM_SLOTS = 16384, POOL_BYTES = 256 * 1024 * 1024, GROUP_CACHE = 8192;
 const COMPUTE = () => globalThis.GPUShaderStage?.COMPUTE ?? 4;
 /** Blocks as whole four-byte words. A Q6_K block is 210 bytes, so a buffer of
@@ -400,6 +606,18 @@ export class WebGPUBackend {
       entry = {pipeline, layout}; this.pipelines.set(name, entry);
     }
     return entry;
+  }
+  /** How many ways to slice a product's reduced axis, or null to leave it whole.
+   *
+   * The tile is 16 by 16, so a product with one row uses a sixteenth of each
+   * workgroup and a few thousand outputs make only a hundred groups. The slice
+   * is a multiple of 16 so every slice starts where a tile does. */
+  splitParts(n) {
+    if (n.size >= WIDE_ENOUGH || n.k < MIN_SPLIT_K) return null;
+    const want = Math.min(Math.ceil(WIDE_ENOUGH / n.size), MAX_SPLIT);
+    const chunk = Math.max(MIN_SPLIT_CHUNK, Math.ceil(Math.ceil(n.k / want) / 16) * 16);
+    const parts = Math.ceil(n.k / chunk);
+    return parts > 1 ? {parts, chunk} : null;
   }
   /** Fills the next 256-byte uniform slot and returns its dynamic offset; slots upload once, at submit. */
   uniform(fill) {
@@ -496,8 +714,23 @@ export class WebGPUBackend {
         case 'cross_entropy_grad': await this.dispatch('ce_grad', u => {u[0] = n.rows; u[3] = n.cols;}, refs, out, n.rows); break;
         case 'matmul': {
           const kernel = n.bQuant ? `matmul_${n.bQuant.dtype.replace('_', '')}` : n.transposed ? 'matmul_t' : 'matmul';
-          await this.dispatch(kernel, u => {u.set([n.m, n.k, n.n, n.batch], 16); u[8] = n.aBatchStride; u[9] = n.bBatchStride;},
-            refs, out, n.size, [Math.ceil(n.n / 16), Math.ceil(n.m / 16), n.batch]); break;
+          const split = this.splitParts(n);
+          if (!split) {
+            await this.dispatch(kernel, u => {u.set([n.m, n.k, n.n, n.batch], 16); u[8] = n.aBatchStride; u[9] = n.bBatchStride;},
+              refs, out, n.size, [Math.ceil(n.n / 16), Math.ceil(n.m / 16), n.batch]);
+            break;
+          }
+          const {parts, chunk} = split, partials = this.alloc(n.size * parts);
+          try {
+            await this.dispatch(`${kernel}_split`, u => {
+              u.set([n.m, n.k, n.n, n.batch], 16);
+              u[8] = n.aBatchStride; u[9] = n.bBatchStride; u[10] = chunk;
+            }, refs, partials, n.size * parts, [Math.ceil(n.n / 16), Math.ceil(n.m / 16), n.batch * parts]);
+            // `reduce` sums a [parts, outputs] layout straight down the parts.
+            await this.dispatch('reduce', u => {u[0] = n.size; u[1] = 0; u[3] = parts; u[16] = n.size;},
+              [partials], out, n.size);
+          } finally { this.free(partials); }
+          break;
         }
         case 'sgd_update': case 'momentum_update': case 'adam_m': case 'adam_v': case 'adam_update': {
           const scalars = {sgd_update: [n.lr], momentum_update: [n.momentum, n.w], adam_m: [n.w], adam_v: [n.beta2, n.w],
