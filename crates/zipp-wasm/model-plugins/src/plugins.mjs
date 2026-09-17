@@ -1,0 +1,79 @@
+import {check, fields, integer, safePath, sha256, checkHash, resolveLimits} from './common.mjs';
+import {decodeUTF8, parseJSON} from './json.mjs';
+import {readAll, FileMapSource, fetchPinned} from './sources.mjs';
+
+export function validatePluginManifest(manifest, limits = resolveLimits()) {
+  fields(manifest, ['format', 'version', 'id', 'plugin_version', 'entry', 'capabilities', 'sources'],
+    ['format', 'version', 'id', 'plugin_version', 'entry', 'capabilities', 'sources']);
+  check(manifest.format === 'zipp.python-model-plugin' && manifest.version === 1, 'VERSION', 'Unsupported plugin manifest');
+  check(typeof manifest.id === 'string' && /^[a-z][a-z0-9.-]{2,95}$/.test(manifest.id), 'FORMAT', 'Invalid plugin id');
+  check(typeof manifest.plugin_version === 'string' && /^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(manifest.plugin_version), 'VERSION', 'Use an exact x.y.z plugin version');
+  check(typeof manifest.entry === 'string' && /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(manifest.entry), 'FORMAT', 'Entry must be a Python module name');
+  check(Array.isArray(manifest.capabilities) && manifest.capabilities.length === 1 && manifest.capabilities[0] === 'graph-v2',
+    'CAPABILITY', 'This host admits only the graph-v2 model-plugin capability');
+  check(manifest.sources && !Array.isArray(manifest.sources) && typeof manifest.sources === 'object', 'FORMAT', 'Expected source hash map');
+  const paths = Object.keys(manifest.sources); integer(paths.length, 1, limits.maxSourceFiles, 'Plugin source files');
+  for (const path of paths) {
+    safePath(path); check(path.endsWith('.py'), 'FORMAT', 'Plugins contain Python source only');
+    check(path.split('/').every((p, i, all) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(i === all.length - 1 ? p.slice(0, -3) : p)), 'PATH', 'Python source paths must be importable module names');
+    checkHash(manifest.sources[path]);
+  }
+  const entry = manifest.entry.replaceAll('.', '/');
+  check(Object.hasOwn(manifest.sources, `${entry}.py`) || Object.hasOwn(manifest.sources, `${entry}/__init__.py`), 'FORMAT', 'Plugin entry source is missing');
+  return manifest;
+}
+export const BOOTSTRAP_ENTRY = '__zipp_model_bootstrap.py';
+export function bootstrap(entry) {
+  // entry was validated as an identifier path, never arbitrary source text.
+  check(/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(entry), 'FORMAT', 'Invalid entry');
+  return `import json\nimport zipp_plugin.${entry} as _plugin\n\ndef zipp_model_describe(config):\n    return json.dumps(_plugin.describe(json.loads(config)))\n\ndef zipp_model_encode(text, tokenizer):\n    return json.dumps(_plugin.encode(text, json.loads(tokenizer)))\n\ndef zipp_model_decode(tokens, tokenizer):\n    return _plugin.decode(json.loads(tokens), json.loads(tokenizer))\n\ndef zipp_model_graph(config, tokens):\n    return json.dumps(_plugin.build_graph(json.loads(config), json.loads(tokens)))\n`;
+}
+export class PluginRegistry {
+  #installed = new Map();
+  constructor(overrides = {}) { this.limits = resolveLimits(overrides); }
+  async install(source, {approve, expectedHash} = {}) {
+    // Deliberately mandatory: no auto-install from a model's architecture field.
+    check(typeof approve === 'function', 'APPROVAL', 'The host must explicitly approve plugin installation');
+    const bytes = await readAll(source, 'plugin.json', this.limits.maxManifestBytes);
+    const digest = await sha256(bytes);
+    if (expectedHash !== undefined) { checkHash(expectedHash); check(digest === expectedHash, 'HASH', 'Plugin manifest digest mismatch'); }
+    const manifest = validatePluginManifest(parseJSON(decodeUTF8(bytes)), this.limits);
+    const identity = Object.freeze({id: manifest.id, version: manifest.plugin_version, sha256: digest});
+    const key = `${identity.id}@${identity.version}`;
+    if (this.#installed.has(key)) {
+      const installed = this.#installed.get(key);
+      check(installed.identity.sha256 === digest, 'CONFLICT', 'An installed id/version cannot be silently replaced'); return installed;
+    }
+    check(await approve(identity) === true, 'APPROVAL', 'Plugin installation was not approved');
+    const files = Object.create(null); files['zipp_plugin/__init__.py'] = '';
+    let sourceBytes = 0;
+    for (const [path, expected] of Object.entries(manifest.sources)) {
+      sourceBytes += source.size(path); integer(sourceBytes, 0, this.limits.maxSourceBytes, 'Total plugin source bytes');
+      const data = await readAll(source, path, this.limits.maxSourceFileBytes);
+      check(await sha256(data) === expected, 'HASH', `Python source digest mismatch: ${path}`);
+      files[`zipp_plugin/${path}`] = decodeUTF8(data);
+    }
+    files[BOOTSTRAP_ENTRY] = bootstrap(manifest.entry);
+    const installed = Object.freeze({identity, files: Object.freeze(files), entry: BOOTSTRAP_ENTRY});
+    // Recheck after awaits: another installation may have won the same key.
+    const current = this.#installed.get(key);
+    if (current) { check(current.identity.sha256 === digest, 'CONFLICT', 'Concurrent plugin version conflict'); return current; }
+    this.#installed.set(key, installed); return installed;
+  }
+  get(id, version) { const plugin = this.#installed.get(`${id}@${version}`); check(plugin, 'PLUGIN', 'Required plugin is not installed'); return plugin; }
+  remove(id, version) { return this.#installed.delete(`${id}@${version}`); }
+}
+/** A website catalogue is host UI, not a package resolver inside Python.
+ * The catalogue owner supplies the pinned manifest hash from a trusted page/catalogue.
+ */
+export async function downloadPluginSource(manifestUrl, manifestHash, {limits = resolveLimits(), signal, origin} = {}) {
+  const options = {signal, origin, maxBytes: limits.maxManifestBytes};
+  const raw = await fetchPinned(manifestUrl, manifestHash, options);
+  const manifest = validatePluginManifest(parseJSON(decodeUTF8(raw)), limits);
+  const base = new URL('.', manifestUrl), entries = new Map([['plugin.json', raw]]); let total = 0;
+  for (const [path, digest] of Object.entries(manifest.sources)) {
+    const bytes = await fetchPinned(new URL(safePath(path), base), digest, {...options, maxBytes: Math.max(1, Math.min(limits.maxSourceFileBytes, limits.maxSourceBytes - total))});
+    total += bytes.length; check(total <= limits.maxSourceBytes, 'LIMIT', 'Plugin exceeds source budget'); entries.set(path, bytes);
+  }
+  return new FileMapSource(entries);
+}

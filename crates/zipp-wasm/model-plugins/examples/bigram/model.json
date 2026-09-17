@@ -1,0 +1,35 @@
+{
+  "format": "zipp.local-model",
+  "version": 1,
+  "architecture": {
+    "id": "org.zipp.bigram",
+    "version": "0.1.0",
+    "sha256": "67c1c04a7db784b2caa2c54f1ce50c643e5c3952fe3d264f491564092284d1c2"
+  },
+  "config": {
+    "vocab_size": 7,
+    "context_length": 32
+  },
+  "tokenizer": {
+    "type": "character-v1",
+    "vocab": [
+      "<bos>",
+      "<eos>",
+      "<unk>",
+      "a",
+      "b",
+      "c",
+      "."
+    ],
+    "bos_token_id": 0,
+    "eos_token_id": 1,
+    "unk_token_id": 2
+  },
+  "weights": [
+    {
+      "path": "weights.safetensors",
+      "sha256": "8246a8ec8d906ed3523a1467105f7d2df1c89b6fe09f2fd0de9d0f30fcafb380"
+    }
+  ],
+  "license": "CC0-1.0; hand-authored deterministic integration fixture, not a trained LLM"
+}

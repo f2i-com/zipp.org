@@ -1,0 +1,3716 @@
+{
+  "cases": [
+    {
+      "prompt": "",
+      "tokens": [
+        0
+      ],
+      "template": {
+        "version": 1,
+        "graph": {
+          "version": 2,
+          "nodes": [
+            {
+              "id": 0,
+              "op": "input",
+              "shape": [
+                1,
+                32
+              ]
+            },
+            {
+              "id": 1,
+              "op": "input",
+              "shape": [
+                1,
+                32
+              ]
+            },
+            {
+              "id": 2,
+              "op": "add",
+              "a": 0,
+              "b": 1
+            },
+            {
+              "id": 3,
+              "op": "input",
+              "shape": [
+                1,
+                1
+              ]
+            },
+            {
+              "id": 4,
+              "op": "mean",
+              "a": 2,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 5,
+              "op": "sub",
+              "a": 2,
+              "b": 4
+            },
+            {
+              "id": 6,
+              "op": "mul",
+              "a": 5,
+              "b": 5
+            },
+            {
+              "id": 7,
+              "op": "mean",
+              "a": 6,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 8,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 9,
+              "op": "add",
+              "a": 7,
+              "b": 8
+            },
+            {
+              "id": 10,
+              "op": "sqrt",
+              "a": 9
+            },
+            {
+              "id": 11,
+              "op": "div",
+              "a": 5,
+              "b": 10
+            },
+            {
+              "id": 12,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 13,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 14,
+              "op": "mul",
+              "a": 11,
+              "b": 12
+            },
+            {
+              "id": 15,
+              "op": "add",
+              "a": 14,
+              "b": 13
+            },
+            {
+              "id": 16,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 17,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 18,
+              "op": "matmul",
+              "a": 15,
+              "b": 16
+            },
+            {
+              "id": 19,
+              "op": "add",
+              "a": 18,
+              "b": 17
+            },
+            {
+              "id": 20,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 21,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 22,
+              "op": "matmul",
+              "a": 15,
+              "b": 20
+            },
+            {
+              "id": 23,
+              "op": "add",
+              "a": 22,
+              "b": 21
+            },
+            {
+              "id": 24,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 25,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 26,
+              "op": "matmul",
+              "a": 15,
+              "b": 24
+            },
+            {
+              "id": 27,
+              "op": "add",
+              "a": 26,
+              "b": 25
+            },
+            {
+              "id": 28,
+              "op": "reshape",
+              "a": 19,
+              "shape": [
+                1,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 29,
+              "op": "permute",
+              "a": 28,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 30,
+              "op": "reshape",
+              "a": 23,
+              "shape": [
+                1,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 31,
+              "op": "permute",
+              "a": 30,
+              "dims": [
+                1,
+                2,
+                0
+              ]
+            },
+            {
+              "id": 32,
+              "op": "reshape",
+              "a": 27,
+              "shape": [
+                1,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 33,
+              "op": "permute",
+              "a": 32,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 34,
+              "op": "matmul",
+              "a": 29,
+              "b": 31
+            },
+            {
+              "id": 35,
+              "op": "full",
+              "shape": [],
+              "value": 0.35355339059327373
+            },
+            {
+              "id": 36,
+              "op": "mul",
+              "a": 34,
+              "b": 35
+            },
+            {
+              "id": 37,
+              "op": "add",
+              "a": 36,
+              "b": 3
+            },
+            {
+              "id": 38,
+              "op": "softmax",
+              "a": 37,
+              "axis": -1
+            },
+            {
+              "id": 39,
+              "op": "matmul",
+              "a": 38,
+              "b": 33
+            },
+            {
+              "id": 40,
+              "op": "permute",
+              "a": 39,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 41,
+              "op": "reshape",
+              "a": 40,
+              "shape": [
+                1,
+                32
+              ]
+            },
+            {
+              "id": 42,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 43,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 44,
+              "op": "matmul",
+              "a": 41,
+              "b": 42
+            },
+            {
+              "id": 45,
+              "op": "add",
+              "a": 44,
+              "b": 43
+            },
+            {
+              "id": 46,
+              "op": "add",
+              "a": 2,
+              "b": 45
+            },
+            {
+              "id": 47,
+              "op": "mean",
+              "a": 46,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 48,
+              "op": "sub",
+              "a": 46,
+              "b": 47
+            },
+            {
+              "id": 49,
+              "op": "mul",
+              "a": 48,
+              "b": 48
+            },
+            {
+              "id": 50,
+              "op": "mean",
+              "a": 49,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 51,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 52,
+              "op": "add",
+              "a": 50,
+              "b": 51
+            },
+            {
+              "id": 53,
+              "op": "sqrt",
+              "a": 52
+            },
+            {
+              "id": 54,
+              "op": "div",
+              "a": 48,
+              "b": 53
+            },
+            {
+              "id": 55,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 56,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 57,
+              "op": "mul",
+              "a": 54,
+              "b": 55
+            },
+            {
+              "id": 58,
+              "op": "add",
+              "a": 57,
+              "b": 56
+            },
+            {
+              "id": 59,
+              "op": "input",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            {
+              "id": 60,
+              "op": "input",
+              "shape": [
+                64
+              ]
+            },
+            {
+              "id": 61,
+              "op": "matmul",
+              "a": 58,
+              "b": 59
+            },
+            {
+              "id": 62,
+              "op": "add",
+              "a": 61,
+              "b": 60
+            },
+            {
+              "id": 63,
+              "op": "gelu",
+              "a": 62
+            },
+            {
+              "id": 64,
+              "op": "input",
+              "shape": [
+                64,
+                32
+              ]
+            },
+            {
+              "id": 65,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 66,
+              "op": "matmul",
+              "a": 63,
+              "b": 64
+            },
+            {
+              "id": 67,
+              "op": "add",
+              "a": 66,
+              "b": 65
+            },
+            {
+              "id": 68,
+              "op": "add",
+              "a": 46,
+              "b": 67
+            },
+            {
+              "id": 69,
+              "op": "mean",
+              "a": 68,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 70,
+              "op": "sub",
+              "a": 68,
+              "b": 69
+            },
+            {
+              "id": 71,
+              "op": "mul",
+              "a": 70,
+              "b": 70
+            },
+            {
+              "id": 72,
+              "op": "mean",
+              "a": 71,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 73,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 74,
+              "op": "add",
+              "a": 72,
+              "b": 73
+            },
+            {
+              "id": 75,
+              "op": "sqrt",
+              "a": 74
+            },
+            {
+              "id": 76,
+              "op": "div",
+              "a": 70,
+              "b": 75
+            },
+            {
+              "id": 77,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 78,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 79,
+              "op": "mul",
+              "a": 76,
+              "b": 77
+            },
+            {
+              "id": 80,
+              "op": "add",
+              "a": 79,
+              "b": 78
+            },
+            {
+              "id": 81,
+              "op": "input",
+              "shape": [
+                32,
+                30
+              ]
+            },
+            {
+              "id": 82,
+              "op": "input",
+              "shape": [
+                30
+              ]
+            },
+            {
+              "id": 83,
+              "op": "matmul",
+              "a": 80,
+              "b": 81
+            },
+            {
+              "id": 84,
+              "op": "add",
+              "a": 83,
+              "b": 82
+            }
+          ],
+          "outputs": [
+            {
+              "name": "logits",
+              "id": 84
+            }
+          ]
+        },
+        "bindings": [
+          {
+            "node": 0,
+            "kind": "rows",
+            "tensor": "token_embedding",
+            "indices": [
+              0
+            ]
+          },
+          {
+            "node": 1,
+            "kind": "rows",
+            "tensor": "position_embedding",
+            "indices": [
+              0
+            ]
+          },
+          {
+            "node": 3,
+            "kind": "causal",
+            "length": 1
+          },
+          {
+            "node": 12,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.weight"
+          },
+          {
+            "node": 13,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.bias"
+          },
+          {
+            "node": 16,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.weight"
+          },
+          {
+            "node": 17,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.bias"
+          },
+          {
+            "node": 20,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.weight"
+          },
+          {
+            "node": 21,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.bias"
+          },
+          {
+            "node": 24,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.weight"
+          },
+          {
+            "node": 25,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.bias"
+          },
+          {
+            "node": 42,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.weight"
+          },
+          {
+            "node": 43,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.bias"
+          },
+          {
+            "node": 55,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.weight"
+          },
+          {
+            "node": 56,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.bias"
+          },
+          {
+            "node": 59,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.weight"
+          },
+          {
+            "node": 60,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.bias"
+          },
+          {
+            "node": 64,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.weight"
+          },
+          {
+            "node": 65,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.bias"
+          },
+          {
+            "node": 77,
+            "kind": "tensor",
+            "tensor": "final_norm.weight"
+          },
+          {
+            "node": 78,
+            "kind": "tensor",
+            "tensor": "final_norm.bias"
+          },
+          {
+            "node": 81,
+            "kind": "tensor",
+            "tensor": "lm_head.weight"
+          },
+          {
+            "node": 82,
+            "kind": "tensor",
+            "tensor": "lm_head.bias"
+          }
+        ]
+      }
+    },
+    {
+      "prompt": "hello ",
+      "tokens": [
+        0,
+        14,
+        11,
+        17,
+        17,
+        20,
+        3
+      ],
+      "template": {
+        "version": 1,
+        "graph": {
+          "version": 2,
+          "nodes": [
+            {
+              "id": 0,
+              "op": "input",
+              "shape": [
+                7,
+                32
+              ]
+            },
+            {
+              "id": 1,
+              "op": "input",
+              "shape": [
+                7,
+                32
+              ]
+            },
+            {
+              "id": 2,
+              "op": "add",
+              "a": 0,
+              "b": 1
+            },
+            {
+              "id": 3,
+              "op": "input",
+              "shape": [
+                7,
+                7
+              ]
+            },
+            {
+              "id": 4,
+              "op": "mean",
+              "a": 2,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 5,
+              "op": "sub",
+              "a": 2,
+              "b": 4
+            },
+            {
+              "id": 6,
+              "op": "mul",
+              "a": 5,
+              "b": 5
+            },
+            {
+              "id": 7,
+              "op": "mean",
+              "a": 6,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 8,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 9,
+              "op": "add",
+              "a": 7,
+              "b": 8
+            },
+            {
+              "id": 10,
+              "op": "sqrt",
+              "a": 9
+            },
+            {
+              "id": 11,
+              "op": "div",
+              "a": 5,
+              "b": 10
+            },
+            {
+              "id": 12,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 13,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 14,
+              "op": "mul",
+              "a": 11,
+              "b": 12
+            },
+            {
+              "id": 15,
+              "op": "add",
+              "a": 14,
+              "b": 13
+            },
+            {
+              "id": 16,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 17,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 18,
+              "op": "matmul",
+              "a": 15,
+              "b": 16
+            },
+            {
+              "id": 19,
+              "op": "add",
+              "a": 18,
+              "b": 17
+            },
+            {
+              "id": 20,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 21,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 22,
+              "op": "matmul",
+              "a": 15,
+              "b": 20
+            },
+            {
+              "id": 23,
+              "op": "add",
+              "a": 22,
+              "b": 21
+            },
+            {
+              "id": 24,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 25,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 26,
+              "op": "matmul",
+              "a": 15,
+              "b": 24
+            },
+            {
+              "id": 27,
+              "op": "add",
+              "a": 26,
+              "b": 25
+            },
+            {
+              "id": 28,
+              "op": "reshape",
+              "a": 19,
+              "shape": [
+                7,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 29,
+              "op": "permute",
+              "a": 28,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 30,
+              "op": "reshape",
+              "a": 23,
+              "shape": [
+                7,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 31,
+              "op": "permute",
+              "a": 30,
+              "dims": [
+                1,
+                2,
+                0
+              ]
+            },
+            {
+              "id": 32,
+              "op": "reshape",
+              "a": 27,
+              "shape": [
+                7,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 33,
+              "op": "permute",
+              "a": 32,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 34,
+              "op": "matmul",
+              "a": 29,
+              "b": 31
+            },
+            {
+              "id": 35,
+              "op": "full",
+              "shape": [],
+              "value": 0.35355339059327373
+            },
+            {
+              "id": 36,
+              "op": "mul",
+              "a": 34,
+              "b": 35
+            },
+            {
+              "id": 37,
+              "op": "add",
+              "a": 36,
+              "b": 3
+            },
+            {
+              "id": 38,
+              "op": "softmax",
+              "a": 37,
+              "axis": -1
+            },
+            {
+              "id": 39,
+              "op": "matmul",
+              "a": 38,
+              "b": 33
+            },
+            {
+              "id": 40,
+              "op": "permute",
+              "a": 39,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 41,
+              "op": "reshape",
+              "a": 40,
+              "shape": [
+                7,
+                32
+              ]
+            },
+            {
+              "id": 42,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 43,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 44,
+              "op": "matmul",
+              "a": 41,
+              "b": 42
+            },
+            {
+              "id": 45,
+              "op": "add",
+              "a": 44,
+              "b": 43
+            },
+            {
+              "id": 46,
+              "op": "add",
+              "a": 2,
+              "b": 45
+            },
+            {
+              "id": 47,
+              "op": "mean",
+              "a": 46,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 48,
+              "op": "sub",
+              "a": 46,
+              "b": 47
+            },
+            {
+              "id": 49,
+              "op": "mul",
+              "a": 48,
+              "b": 48
+            },
+            {
+              "id": 50,
+              "op": "mean",
+              "a": 49,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 51,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 52,
+              "op": "add",
+              "a": 50,
+              "b": 51
+            },
+            {
+              "id": 53,
+              "op": "sqrt",
+              "a": 52
+            },
+            {
+              "id": 54,
+              "op": "div",
+              "a": 48,
+              "b": 53
+            },
+            {
+              "id": 55,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 56,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 57,
+              "op": "mul",
+              "a": 54,
+              "b": 55
+            },
+            {
+              "id": 58,
+              "op": "add",
+              "a": 57,
+              "b": 56
+            },
+            {
+              "id": 59,
+              "op": "input",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            {
+              "id": 60,
+              "op": "input",
+              "shape": [
+                64
+              ]
+            },
+            {
+              "id": 61,
+              "op": "matmul",
+              "a": 58,
+              "b": 59
+            },
+            {
+              "id": 62,
+              "op": "add",
+              "a": 61,
+              "b": 60
+            },
+            {
+              "id": 63,
+              "op": "gelu",
+              "a": 62
+            },
+            {
+              "id": 64,
+              "op": "input",
+              "shape": [
+                64,
+                32
+              ]
+            },
+            {
+              "id": 65,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 66,
+              "op": "matmul",
+              "a": 63,
+              "b": 64
+            },
+            {
+              "id": 67,
+              "op": "add",
+              "a": 66,
+              "b": 65
+            },
+            {
+              "id": 68,
+              "op": "add",
+              "a": 46,
+              "b": 67
+            },
+            {
+              "id": 69,
+              "op": "mean",
+              "a": 68,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 70,
+              "op": "sub",
+              "a": 68,
+              "b": 69
+            },
+            {
+              "id": 71,
+              "op": "mul",
+              "a": 70,
+              "b": 70
+            },
+            {
+              "id": 72,
+              "op": "mean",
+              "a": 71,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 73,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 74,
+              "op": "add",
+              "a": 72,
+              "b": 73
+            },
+            {
+              "id": 75,
+              "op": "sqrt",
+              "a": 74
+            },
+            {
+              "id": 76,
+              "op": "div",
+              "a": 70,
+              "b": 75
+            },
+            {
+              "id": 77,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 78,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 79,
+              "op": "mul",
+              "a": 76,
+              "b": 77
+            },
+            {
+              "id": 80,
+              "op": "add",
+              "a": 79,
+              "b": 78
+            },
+            {
+              "id": 81,
+              "op": "input",
+              "shape": [
+                32,
+                30
+              ]
+            },
+            {
+              "id": 82,
+              "op": "input",
+              "shape": [
+                30
+              ]
+            },
+            {
+              "id": 83,
+              "op": "matmul",
+              "a": 80,
+              "b": 81
+            },
+            {
+              "id": 84,
+              "op": "add",
+              "a": 83,
+              "b": 82
+            }
+          ],
+          "outputs": [
+            {
+              "name": "logits",
+              "id": 84
+            }
+          ]
+        },
+        "bindings": [
+          {
+            "node": 0,
+            "kind": "rows",
+            "tensor": "token_embedding",
+            "indices": [
+              0,
+              14,
+              11,
+              17,
+              17,
+              20,
+              3
+            ]
+          },
+          {
+            "node": 1,
+            "kind": "rows",
+            "tensor": "position_embedding",
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ]
+          },
+          {
+            "node": 3,
+            "kind": "causal",
+            "length": 7
+          },
+          {
+            "node": 12,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.weight"
+          },
+          {
+            "node": 13,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.bias"
+          },
+          {
+            "node": 16,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.weight"
+          },
+          {
+            "node": 17,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.bias"
+          },
+          {
+            "node": 20,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.weight"
+          },
+          {
+            "node": 21,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.bias"
+          },
+          {
+            "node": 24,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.weight"
+          },
+          {
+            "node": 25,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.bias"
+          },
+          {
+            "node": 42,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.weight"
+          },
+          {
+            "node": 43,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.bias"
+          },
+          {
+            "node": 55,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.weight"
+          },
+          {
+            "node": 56,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.bias"
+          },
+          {
+            "node": 59,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.weight"
+          },
+          {
+            "node": 60,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.bias"
+          },
+          {
+            "node": 64,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.weight"
+          },
+          {
+            "node": 65,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.bias"
+          },
+          {
+            "node": 77,
+            "kind": "tensor",
+            "tensor": "final_norm.weight"
+          },
+          {
+            "node": 78,
+            "kind": "tensor",
+            "tensor": "final_norm.bias"
+          },
+          {
+            "node": 81,
+            "kind": "tensor",
+            "tensor": "lm_head.weight"
+          },
+          {
+            "node": 82,
+            "kind": "tensor",
+            "tensor": "lm_head.bias"
+          }
+        ]
+      }
+    },
+    {
+      "prompt": "the little ",
+      "tokens": [
+        0,
+        24,
+        14,
+        11,
+        3,
+        17,
+        15,
+        24,
+        24,
+        17,
+        11,
+        3
+      ],
+      "template": {
+        "version": 1,
+        "graph": {
+          "version": 2,
+          "nodes": [
+            {
+              "id": 0,
+              "op": "input",
+              "shape": [
+                12,
+                32
+              ]
+            },
+            {
+              "id": 1,
+              "op": "input",
+              "shape": [
+                12,
+                32
+              ]
+            },
+            {
+              "id": 2,
+              "op": "add",
+              "a": 0,
+              "b": 1
+            },
+            {
+              "id": 3,
+              "op": "input",
+              "shape": [
+                12,
+                12
+              ]
+            },
+            {
+              "id": 4,
+              "op": "mean",
+              "a": 2,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 5,
+              "op": "sub",
+              "a": 2,
+              "b": 4
+            },
+            {
+              "id": 6,
+              "op": "mul",
+              "a": 5,
+              "b": 5
+            },
+            {
+              "id": 7,
+              "op": "mean",
+              "a": 6,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 8,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 9,
+              "op": "add",
+              "a": 7,
+              "b": 8
+            },
+            {
+              "id": 10,
+              "op": "sqrt",
+              "a": 9
+            },
+            {
+              "id": 11,
+              "op": "div",
+              "a": 5,
+              "b": 10
+            },
+            {
+              "id": 12,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 13,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 14,
+              "op": "mul",
+              "a": 11,
+              "b": 12
+            },
+            {
+              "id": 15,
+              "op": "add",
+              "a": 14,
+              "b": 13
+            },
+            {
+              "id": 16,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 17,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 18,
+              "op": "matmul",
+              "a": 15,
+              "b": 16
+            },
+            {
+              "id": 19,
+              "op": "add",
+              "a": 18,
+              "b": 17
+            },
+            {
+              "id": 20,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 21,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 22,
+              "op": "matmul",
+              "a": 15,
+              "b": 20
+            },
+            {
+              "id": 23,
+              "op": "add",
+              "a": 22,
+              "b": 21
+            },
+            {
+              "id": 24,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 25,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 26,
+              "op": "matmul",
+              "a": 15,
+              "b": 24
+            },
+            {
+              "id": 27,
+              "op": "add",
+              "a": 26,
+              "b": 25
+            },
+            {
+              "id": 28,
+              "op": "reshape",
+              "a": 19,
+              "shape": [
+                12,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 29,
+              "op": "permute",
+              "a": 28,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 30,
+              "op": "reshape",
+              "a": 23,
+              "shape": [
+                12,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 31,
+              "op": "permute",
+              "a": 30,
+              "dims": [
+                1,
+                2,
+                0
+              ]
+            },
+            {
+              "id": 32,
+              "op": "reshape",
+              "a": 27,
+              "shape": [
+                12,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 33,
+              "op": "permute",
+              "a": 32,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 34,
+              "op": "matmul",
+              "a": 29,
+              "b": 31
+            },
+            {
+              "id": 35,
+              "op": "full",
+              "shape": [],
+              "value": 0.35355339059327373
+            },
+            {
+              "id": 36,
+              "op": "mul",
+              "a": 34,
+              "b": 35
+            },
+            {
+              "id": 37,
+              "op": "add",
+              "a": 36,
+              "b": 3
+            },
+            {
+              "id": 38,
+              "op": "softmax",
+              "a": 37,
+              "axis": -1
+            },
+            {
+              "id": 39,
+              "op": "matmul",
+              "a": 38,
+              "b": 33
+            },
+            {
+              "id": 40,
+              "op": "permute",
+              "a": 39,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 41,
+              "op": "reshape",
+              "a": 40,
+              "shape": [
+                12,
+                32
+              ]
+            },
+            {
+              "id": 42,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 43,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 44,
+              "op": "matmul",
+              "a": 41,
+              "b": 42
+            },
+            {
+              "id": 45,
+              "op": "add",
+              "a": 44,
+              "b": 43
+            },
+            {
+              "id": 46,
+              "op": "add",
+              "a": 2,
+              "b": 45
+            },
+            {
+              "id": 47,
+              "op": "mean",
+              "a": 46,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 48,
+              "op": "sub",
+              "a": 46,
+              "b": 47
+            },
+            {
+              "id": 49,
+              "op": "mul",
+              "a": 48,
+              "b": 48
+            },
+            {
+              "id": 50,
+              "op": "mean",
+              "a": 49,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 51,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 52,
+              "op": "add",
+              "a": 50,
+              "b": 51
+            },
+            {
+              "id": 53,
+              "op": "sqrt",
+              "a": 52
+            },
+            {
+              "id": 54,
+              "op": "div",
+              "a": 48,
+              "b": 53
+            },
+            {
+              "id": 55,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 56,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 57,
+              "op": "mul",
+              "a": 54,
+              "b": 55
+            },
+            {
+              "id": 58,
+              "op": "add",
+              "a": 57,
+              "b": 56
+            },
+            {
+              "id": 59,
+              "op": "input",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            {
+              "id": 60,
+              "op": "input",
+              "shape": [
+                64
+              ]
+            },
+            {
+              "id": 61,
+              "op": "matmul",
+              "a": 58,
+              "b": 59
+            },
+            {
+              "id": 62,
+              "op": "add",
+              "a": 61,
+              "b": 60
+            },
+            {
+              "id": 63,
+              "op": "gelu",
+              "a": 62
+            },
+            {
+              "id": 64,
+              "op": "input",
+              "shape": [
+                64,
+                32
+              ]
+            },
+            {
+              "id": 65,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 66,
+              "op": "matmul",
+              "a": 63,
+              "b": 64
+            },
+            {
+              "id": 67,
+              "op": "add",
+              "a": 66,
+              "b": 65
+            },
+            {
+              "id": 68,
+              "op": "add",
+              "a": 46,
+              "b": 67
+            },
+            {
+              "id": 69,
+              "op": "mean",
+              "a": 68,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 70,
+              "op": "sub",
+              "a": 68,
+              "b": 69
+            },
+            {
+              "id": 71,
+              "op": "mul",
+              "a": 70,
+              "b": 70
+            },
+            {
+              "id": 72,
+              "op": "mean",
+              "a": 71,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 73,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 74,
+              "op": "add",
+              "a": 72,
+              "b": 73
+            },
+            {
+              "id": 75,
+              "op": "sqrt",
+              "a": 74
+            },
+            {
+              "id": 76,
+              "op": "div",
+              "a": 70,
+              "b": 75
+            },
+            {
+              "id": 77,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 78,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 79,
+              "op": "mul",
+              "a": 76,
+              "b": 77
+            },
+            {
+              "id": 80,
+              "op": "add",
+              "a": 79,
+              "b": 78
+            },
+            {
+              "id": 81,
+              "op": "input",
+              "shape": [
+                32,
+                30
+              ]
+            },
+            {
+              "id": 82,
+              "op": "input",
+              "shape": [
+                30
+              ]
+            },
+            {
+              "id": 83,
+              "op": "matmul",
+              "a": 80,
+              "b": 81
+            },
+            {
+              "id": 84,
+              "op": "add",
+              "a": 83,
+              "b": 82
+            }
+          ],
+          "outputs": [
+            {
+              "name": "logits",
+              "id": 84
+            }
+          ]
+        },
+        "bindings": [
+          {
+            "node": 0,
+            "kind": "rows",
+            "tensor": "token_embedding",
+            "indices": [
+              0,
+              24,
+              14,
+              11,
+              3,
+              17,
+              15,
+              24,
+              24,
+              17,
+              11,
+              3
+            ]
+          },
+          {
+            "node": 1,
+            "kind": "rows",
+            "tensor": "position_embedding",
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11
+            ]
+          },
+          {
+            "node": 3,
+            "kind": "causal",
+            "length": 12
+          },
+          {
+            "node": 12,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.weight"
+          },
+          {
+            "node": 13,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.bias"
+          },
+          {
+            "node": 16,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.weight"
+          },
+          {
+            "node": 17,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.bias"
+          },
+          {
+            "node": 20,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.weight"
+          },
+          {
+            "node": 21,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.bias"
+          },
+          {
+            "node": 24,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.weight"
+          },
+          {
+            "node": 25,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.bias"
+          },
+          {
+            "node": 42,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.weight"
+          },
+          {
+            "node": 43,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.bias"
+          },
+          {
+            "node": 55,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.weight"
+          },
+          {
+            "node": 56,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.bias"
+          },
+          {
+            "node": 59,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.weight"
+          },
+          {
+            "node": 60,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.bias"
+          },
+          {
+            "node": 64,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.weight"
+          },
+          {
+            "node": 65,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.bias"
+          },
+          {
+            "node": 77,
+            "kind": "tensor",
+            "tensor": "final_norm.weight"
+          },
+          {
+            "node": 78,
+            "kind": "tensor",
+            "tensor": "final_norm.bias"
+          },
+          {
+            "node": 81,
+            "kind": "tensor",
+            "tensor": "lm_head.weight"
+          },
+          {
+            "node": 82,
+            "kind": "tensor",
+            "tensor": "lm_head.bias"
+          }
+        ]
+      }
+    },
+    {
+      "prompt": "zipp runs ",
+      "tokens": [
+        0,
+        29,
+        15,
+        21,
+        21,
+        3,
+        22,
+        25,
+        19,
+        23,
+        3
+      ],
+      "template": {
+        "version": 1,
+        "graph": {
+          "version": 2,
+          "nodes": [
+            {
+              "id": 0,
+              "op": "input",
+              "shape": [
+                11,
+                32
+              ]
+            },
+            {
+              "id": 1,
+              "op": "input",
+              "shape": [
+                11,
+                32
+              ]
+            },
+            {
+              "id": 2,
+              "op": "add",
+              "a": 0,
+              "b": 1
+            },
+            {
+              "id": 3,
+              "op": "input",
+              "shape": [
+                11,
+                11
+              ]
+            },
+            {
+              "id": 4,
+              "op": "mean",
+              "a": 2,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 5,
+              "op": "sub",
+              "a": 2,
+              "b": 4
+            },
+            {
+              "id": 6,
+              "op": "mul",
+              "a": 5,
+              "b": 5
+            },
+            {
+              "id": 7,
+              "op": "mean",
+              "a": 6,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 8,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 9,
+              "op": "add",
+              "a": 7,
+              "b": 8
+            },
+            {
+              "id": 10,
+              "op": "sqrt",
+              "a": 9
+            },
+            {
+              "id": 11,
+              "op": "div",
+              "a": 5,
+              "b": 10
+            },
+            {
+              "id": 12,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 13,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 14,
+              "op": "mul",
+              "a": 11,
+              "b": 12
+            },
+            {
+              "id": 15,
+              "op": "add",
+              "a": 14,
+              "b": 13
+            },
+            {
+              "id": 16,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 17,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 18,
+              "op": "matmul",
+              "a": 15,
+              "b": 16
+            },
+            {
+              "id": 19,
+              "op": "add",
+              "a": 18,
+              "b": 17
+            },
+            {
+              "id": 20,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 21,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 22,
+              "op": "matmul",
+              "a": 15,
+              "b": 20
+            },
+            {
+              "id": 23,
+              "op": "add",
+              "a": 22,
+              "b": 21
+            },
+            {
+              "id": 24,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 25,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 26,
+              "op": "matmul",
+              "a": 15,
+              "b": 24
+            },
+            {
+              "id": 27,
+              "op": "add",
+              "a": 26,
+              "b": 25
+            },
+            {
+              "id": 28,
+              "op": "reshape",
+              "a": 19,
+              "shape": [
+                11,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 29,
+              "op": "permute",
+              "a": 28,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 30,
+              "op": "reshape",
+              "a": 23,
+              "shape": [
+                11,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 31,
+              "op": "permute",
+              "a": 30,
+              "dims": [
+                1,
+                2,
+                0
+              ]
+            },
+            {
+              "id": 32,
+              "op": "reshape",
+              "a": 27,
+              "shape": [
+                11,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 33,
+              "op": "permute",
+              "a": 32,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 34,
+              "op": "matmul",
+              "a": 29,
+              "b": 31
+            },
+            {
+              "id": 35,
+              "op": "full",
+              "shape": [],
+              "value": 0.35355339059327373
+            },
+            {
+              "id": 36,
+              "op": "mul",
+              "a": 34,
+              "b": 35
+            },
+            {
+              "id": 37,
+              "op": "add",
+              "a": 36,
+              "b": 3
+            },
+            {
+              "id": 38,
+              "op": "softmax",
+              "a": 37,
+              "axis": -1
+            },
+            {
+              "id": 39,
+              "op": "matmul",
+              "a": 38,
+              "b": 33
+            },
+            {
+              "id": 40,
+              "op": "permute",
+              "a": 39,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 41,
+              "op": "reshape",
+              "a": 40,
+              "shape": [
+                11,
+                32
+              ]
+            },
+            {
+              "id": 42,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 43,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 44,
+              "op": "matmul",
+              "a": 41,
+              "b": 42
+            },
+            {
+              "id": 45,
+              "op": "add",
+              "a": 44,
+              "b": 43
+            },
+            {
+              "id": 46,
+              "op": "add",
+              "a": 2,
+              "b": 45
+            },
+            {
+              "id": 47,
+              "op": "mean",
+              "a": 46,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 48,
+              "op": "sub",
+              "a": 46,
+              "b": 47
+            },
+            {
+              "id": 49,
+              "op": "mul",
+              "a": 48,
+              "b": 48
+            },
+            {
+              "id": 50,
+              "op": "mean",
+              "a": 49,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 51,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 52,
+              "op": "add",
+              "a": 50,
+              "b": 51
+            },
+            {
+              "id": 53,
+              "op": "sqrt",
+              "a": 52
+            },
+            {
+              "id": 54,
+              "op": "div",
+              "a": 48,
+              "b": 53
+            },
+            {
+              "id": 55,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 56,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 57,
+              "op": "mul",
+              "a": 54,
+              "b": 55
+            },
+            {
+              "id": 58,
+              "op": "add",
+              "a": 57,
+              "b": 56
+            },
+            {
+              "id": 59,
+              "op": "input",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            {
+              "id": 60,
+              "op": "input",
+              "shape": [
+                64
+              ]
+            },
+            {
+              "id": 61,
+              "op": "matmul",
+              "a": 58,
+              "b": 59
+            },
+            {
+              "id": 62,
+              "op": "add",
+              "a": 61,
+              "b": 60
+            },
+            {
+              "id": 63,
+              "op": "gelu",
+              "a": 62
+            },
+            {
+              "id": 64,
+              "op": "input",
+              "shape": [
+                64,
+                32
+              ]
+            },
+            {
+              "id": 65,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 66,
+              "op": "matmul",
+              "a": 63,
+              "b": 64
+            },
+            {
+              "id": 67,
+              "op": "add",
+              "a": 66,
+              "b": 65
+            },
+            {
+              "id": 68,
+              "op": "add",
+              "a": 46,
+              "b": 67
+            },
+            {
+              "id": 69,
+              "op": "mean",
+              "a": 68,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 70,
+              "op": "sub",
+              "a": 68,
+              "b": 69
+            },
+            {
+              "id": 71,
+              "op": "mul",
+              "a": 70,
+              "b": 70
+            },
+            {
+              "id": 72,
+              "op": "mean",
+              "a": 71,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 73,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 74,
+              "op": "add",
+              "a": 72,
+              "b": 73
+            },
+            {
+              "id": 75,
+              "op": "sqrt",
+              "a": 74
+            },
+            {
+              "id": 76,
+              "op": "div",
+              "a": 70,
+              "b": 75
+            },
+            {
+              "id": 77,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 78,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 79,
+              "op": "mul",
+              "a": 76,
+              "b": 77
+            },
+            {
+              "id": 80,
+              "op": "add",
+              "a": 79,
+              "b": 78
+            },
+            {
+              "id": 81,
+              "op": "input",
+              "shape": [
+                32,
+                30
+              ]
+            },
+            {
+              "id": 82,
+              "op": "input",
+              "shape": [
+                30
+              ]
+            },
+            {
+              "id": 83,
+              "op": "matmul",
+              "a": 80,
+              "b": 81
+            },
+            {
+              "id": 84,
+              "op": "add",
+              "a": 83,
+              "b": 82
+            }
+          ],
+          "outputs": [
+            {
+              "name": "logits",
+              "id": 84
+            }
+          ]
+        },
+        "bindings": [
+          {
+            "node": 0,
+            "kind": "rows",
+            "tensor": "token_embedding",
+            "indices": [
+              0,
+              29,
+              15,
+              21,
+              21,
+              3,
+              22,
+              25,
+              19,
+              23,
+              3
+            ]
+          },
+          {
+            "node": 1,
+            "kind": "rows",
+            "tensor": "position_embedding",
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10
+            ]
+          },
+          {
+            "node": 3,
+            "kind": "causal",
+            "length": 11
+          },
+          {
+            "node": 12,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.weight"
+          },
+          {
+            "node": 13,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.bias"
+          },
+          {
+            "node": 16,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.weight"
+          },
+          {
+            "node": 17,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.bias"
+          },
+          {
+            "node": 20,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.weight"
+          },
+          {
+            "node": 21,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.bias"
+          },
+          {
+            "node": 24,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.weight"
+          },
+          {
+            "node": 25,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.bias"
+          },
+          {
+            "node": 42,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.weight"
+          },
+          {
+            "node": 43,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.bias"
+          },
+          {
+            "node": 55,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.weight"
+          },
+          {
+            "node": 56,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.bias"
+          },
+          {
+            "node": 59,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.weight"
+          },
+          {
+            "node": 60,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.bias"
+          },
+          {
+            "node": 64,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.weight"
+          },
+          {
+            "node": 65,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.bias"
+          },
+          {
+            "node": 77,
+            "kind": "tensor",
+            "tensor": "final_norm.weight"
+          },
+          {
+            "node": 78,
+            "kind": "tensor",
+            "tensor": "final_norm.bias"
+          },
+          {
+            "node": 81,
+            "kind": "tensor",
+            "tensor": "lm_head.weight"
+          },
+          {
+            "node": 82,
+            "kind": "tensor",
+            "tensor": "lm_head.bias"
+          }
+        ]
+      }
+    },
+    {
+      "prompt": "alice likes ",
+      "tokens": [
+        0,
+        7,
+        17,
+        15,
+        9,
+        11,
+        3,
+        17,
+        15,
+        16,
+        11,
+        23,
+        3
+      ],
+      "template": {
+        "version": 1,
+        "graph": {
+          "version": 2,
+          "nodes": [
+            {
+              "id": 0,
+              "op": "input",
+              "shape": [
+                13,
+                32
+              ]
+            },
+            {
+              "id": 1,
+              "op": "input",
+              "shape": [
+                13,
+                32
+              ]
+            },
+            {
+              "id": 2,
+              "op": "add",
+              "a": 0,
+              "b": 1
+            },
+            {
+              "id": 3,
+              "op": "input",
+              "shape": [
+                13,
+                13
+              ]
+            },
+            {
+              "id": 4,
+              "op": "mean",
+              "a": 2,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 5,
+              "op": "sub",
+              "a": 2,
+              "b": 4
+            },
+            {
+              "id": 6,
+              "op": "mul",
+              "a": 5,
+              "b": 5
+            },
+            {
+              "id": 7,
+              "op": "mean",
+              "a": 6,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 8,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 9,
+              "op": "add",
+              "a": 7,
+              "b": 8
+            },
+            {
+              "id": 10,
+              "op": "sqrt",
+              "a": 9
+            },
+            {
+              "id": 11,
+              "op": "div",
+              "a": 5,
+              "b": 10
+            },
+            {
+              "id": 12,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 13,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 14,
+              "op": "mul",
+              "a": 11,
+              "b": 12
+            },
+            {
+              "id": 15,
+              "op": "add",
+              "a": 14,
+              "b": 13
+            },
+            {
+              "id": 16,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 17,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 18,
+              "op": "matmul",
+              "a": 15,
+              "b": 16
+            },
+            {
+              "id": 19,
+              "op": "add",
+              "a": 18,
+              "b": 17
+            },
+            {
+              "id": 20,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 21,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 22,
+              "op": "matmul",
+              "a": 15,
+              "b": 20
+            },
+            {
+              "id": 23,
+              "op": "add",
+              "a": 22,
+              "b": 21
+            },
+            {
+              "id": 24,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 25,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 26,
+              "op": "matmul",
+              "a": 15,
+              "b": 24
+            },
+            {
+              "id": 27,
+              "op": "add",
+              "a": 26,
+              "b": 25
+            },
+            {
+              "id": 28,
+              "op": "reshape",
+              "a": 19,
+              "shape": [
+                13,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 29,
+              "op": "permute",
+              "a": 28,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 30,
+              "op": "reshape",
+              "a": 23,
+              "shape": [
+                13,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 31,
+              "op": "permute",
+              "a": 30,
+              "dims": [
+                1,
+                2,
+                0
+              ]
+            },
+            {
+              "id": 32,
+              "op": "reshape",
+              "a": 27,
+              "shape": [
+                13,
+                4,
+                8
+              ]
+            },
+            {
+              "id": 33,
+              "op": "permute",
+              "a": 32,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 34,
+              "op": "matmul",
+              "a": 29,
+              "b": 31
+            },
+            {
+              "id": 35,
+              "op": "full",
+              "shape": [],
+              "value": 0.35355339059327373
+            },
+            {
+              "id": 36,
+              "op": "mul",
+              "a": 34,
+              "b": 35
+            },
+            {
+              "id": 37,
+              "op": "add",
+              "a": 36,
+              "b": 3
+            },
+            {
+              "id": 38,
+              "op": "softmax",
+              "a": 37,
+              "axis": -1
+            },
+            {
+              "id": 39,
+              "op": "matmul",
+              "a": 38,
+              "b": 33
+            },
+            {
+              "id": 40,
+              "op": "permute",
+              "a": 39,
+              "dims": [
+                1,
+                0,
+                2
+              ]
+            },
+            {
+              "id": 41,
+              "op": "reshape",
+              "a": 40,
+              "shape": [
+                13,
+                32
+              ]
+            },
+            {
+              "id": 42,
+              "op": "input",
+              "shape": [
+                32,
+                32
+              ]
+            },
+            {
+              "id": 43,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 44,
+              "op": "matmul",
+              "a": 41,
+              "b": 42
+            },
+            {
+              "id": 45,
+              "op": "add",
+              "a": 44,
+              "b": 43
+            },
+            {
+              "id": 46,
+              "op": "add",
+              "a": 2,
+              "b": 45
+            },
+            {
+              "id": 47,
+              "op": "mean",
+              "a": 46,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 48,
+              "op": "sub",
+              "a": 46,
+              "b": 47
+            },
+            {
+              "id": 49,
+              "op": "mul",
+              "a": 48,
+              "b": 48
+            },
+            {
+              "id": 50,
+              "op": "mean",
+              "a": 49,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 51,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 52,
+              "op": "add",
+              "a": 50,
+              "b": 51
+            },
+            {
+              "id": 53,
+              "op": "sqrt",
+              "a": 52
+            },
+            {
+              "id": 54,
+              "op": "div",
+              "a": 48,
+              "b": 53
+            },
+            {
+              "id": 55,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 56,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 57,
+              "op": "mul",
+              "a": 54,
+              "b": 55
+            },
+            {
+              "id": 58,
+              "op": "add",
+              "a": 57,
+              "b": 56
+            },
+            {
+              "id": 59,
+              "op": "input",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            {
+              "id": 60,
+              "op": "input",
+              "shape": [
+                64
+              ]
+            },
+            {
+              "id": 61,
+              "op": "matmul",
+              "a": 58,
+              "b": 59
+            },
+            {
+              "id": 62,
+              "op": "add",
+              "a": 61,
+              "b": 60
+            },
+            {
+              "id": 63,
+              "op": "gelu",
+              "a": 62
+            },
+            {
+              "id": 64,
+              "op": "input",
+              "shape": [
+                64,
+                32
+              ]
+            },
+            {
+              "id": 65,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 66,
+              "op": "matmul",
+              "a": 63,
+              "b": 64
+            },
+            {
+              "id": 67,
+              "op": "add",
+              "a": 66,
+              "b": 65
+            },
+            {
+              "id": 68,
+              "op": "add",
+              "a": 46,
+              "b": 67
+            },
+            {
+              "id": 69,
+              "op": "mean",
+              "a": 68,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 70,
+              "op": "sub",
+              "a": 68,
+              "b": 69
+            },
+            {
+              "id": 71,
+              "op": "mul",
+              "a": 70,
+              "b": 70
+            },
+            {
+              "id": 72,
+              "op": "mean",
+              "a": 71,
+              "axis": -1,
+              "keepdim": true
+            },
+            {
+              "id": 73,
+              "op": "full",
+              "shape": [],
+              "value": 1e-05
+            },
+            {
+              "id": 74,
+              "op": "add",
+              "a": 72,
+              "b": 73
+            },
+            {
+              "id": 75,
+              "op": "sqrt",
+              "a": 74
+            },
+            {
+              "id": 76,
+              "op": "div",
+              "a": 70,
+              "b": 75
+            },
+            {
+              "id": 77,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 78,
+              "op": "input",
+              "shape": [
+                32
+              ]
+            },
+            {
+              "id": 79,
+              "op": "mul",
+              "a": 76,
+              "b": 77
+            },
+            {
+              "id": 80,
+              "op": "add",
+              "a": 79,
+              "b": 78
+            },
+            {
+              "id": 81,
+              "op": "input",
+              "shape": [
+                32,
+                30
+              ]
+            },
+            {
+              "id": 82,
+              "op": "input",
+              "shape": [
+                30
+              ]
+            },
+            {
+              "id": 83,
+              "op": "matmul",
+              "a": 80,
+              "b": 81
+            },
+            {
+              "id": 84,
+              "op": "add",
+              "a": 83,
+              "b": 82
+            }
+          ],
+          "outputs": [
+            {
+              "name": "logits",
+              "id": 84
+            }
+          ]
+        },
+        "bindings": [
+          {
+            "node": 0,
+            "kind": "rows",
+            "tensor": "token_embedding",
+            "indices": [
+              0,
+              7,
+              17,
+              15,
+              9,
+              11,
+              3,
+              17,
+              15,
+              16,
+              11,
+              23,
+              3
+            ]
+          },
+          {
+            "node": 1,
+            "kind": "rows",
+            "tensor": "position_embedding",
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12
+            ]
+          },
+          {
+            "node": 3,
+            "kind": "causal",
+            "length": 13
+          },
+          {
+            "node": 12,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.weight"
+          },
+          {
+            "node": 13,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln1.bias"
+          },
+          {
+            "node": 16,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.weight"
+          },
+          {
+            "node": 17,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.q.bias"
+          },
+          {
+            "node": 20,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.weight"
+          },
+          {
+            "node": 21,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.k.bias"
+          },
+          {
+            "node": 24,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.weight"
+          },
+          {
+            "node": 25,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.v.bias"
+          },
+          {
+            "node": 42,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.weight"
+          },
+          {
+            "node": 43,
+            "kind": "tensor",
+            "tensor": "blocks.0.attn.out.bias"
+          },
+          {
+            "node": 55,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.weight"
+          },
+          {
+            "node": 56,
+            "kind": "tensor",
+            "tensor": "blocks.0.ln2.bias"
+          },
+          {
+            "node": 59,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.weight"
+          },
+          {
+            "node": 60,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.up.bias"
+          },
+          {
+            "node": 64,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.weight"
+          },
+          {
+            "node": 65,
+            "kind": "tensor",
+            "tensor": "blocks.0.ff.down.bias"
+          },
+          {
+            "node": 77,
+            "kind": "tensor",
+            "tensor": "final_norm.weight"
+          },
+          {
+            "node": 78,
+            "kind": "tensor",
+            "tensor": "final_norm.bias"
+          },
+          {
+            "node": 81,
+            "kind": "tensor",
+            "tensor": "lm_head.weight"
+          },
+          {
+            "node": 82,
+            "kind": "tensor",
+            "tensor": "lm_head.bias"
+          }
+        ]
+      }
+    }
+  ]
+}

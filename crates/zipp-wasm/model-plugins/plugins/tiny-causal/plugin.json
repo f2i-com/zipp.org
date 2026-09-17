@@ -1,0 +1,15 @@
+{
+  "format": "zipp.python-model-plugin",
+  "version": 1,
+  "id": "org.zipp.tiny-causal",
+  "plugin_version": "0.1.0",
+  "entry": "architecture",
+  "capabilities": [
+    "graph-v2"
+  ],
+  "sources": {
+    "architecture.py": "87c7c90cb8fda4dd462c4e00fa063a8cabb99d673ddeb1e646673da500442e8a",
+    "graph.py": "101befd7652e6417eb1614192b92d551b0e8080fe0878f3e6e531d3298119290",
+    "tokenizer.py": "d2a1a88fcf7447459a8afa50e8e73e1fd9ba5e21400a49de58162ba29a54bd28"
+  }
+}

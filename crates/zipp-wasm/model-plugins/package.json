@@ -1,0 +1,11 @@
+{
+  "name": "@zipp/experimental-model-plugins",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "test:python": "python -m unittest discover -s tests -p test_*.py -v"
+  },
+  "license": "Apache-2.0"
+}

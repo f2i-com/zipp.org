@@ -1,0 +1,63 @@
+{
+  "format": "zipp.local-model",
+  "version": 1,
+  "architecture": {
+    "id": "org.zipp.tiny-causal",
+    "version": "0.1.0",
+    "sha256": "b86548d0cf541afa64828debce45204313dc04eee779749a41d0d7e1691e160a"
+  },
+  "config": {
+    "vocab_size": 30,
+    "context_length": 48,
+    "hidden_size": 32,
+    "num_heads": 4,
+    "num_layers": 1,
+    "intermediate_size": 64,
+    "layer_norm_epsilon": 1e-05
+  },
+  "tokenizer": {
+    "type": "character-v1",
+    "vocab": [
+      "<bos>",
+      "<eos>",
+      "<unk>",
+      " ",
+      "!",
+      ",",
+      ".",
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "f",
+      "g",
+      "h",
+      "i",
+      "k",
+      "l",
+      "m",
+      "n",
+      "o",
+      "p",
+      "r",
+      "s",
+      "t",
+      "u",
+      "v",
+      "w",
+      "y",
+      "z"
+    ],
+    "bos_token_id": 0,
+    "eos_token_id": 1,
+    "unk_token_id": 2
+  },
+  "weights": [
+    {
+      "path": "weights.safetensors",
+      "sha256": "6cdfc5c6a711c9a6c4ee5b249ace42c3e4b39ce880400e4bd89c5864f7510d6d"
+    }
+  ],
+  "license": "CC0-1.0; original toy training corpus included in tools/train_demo.py"
+}

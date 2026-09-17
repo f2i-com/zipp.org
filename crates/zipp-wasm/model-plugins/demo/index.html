@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZIPP — Local model plugin lab</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main>
+  <p class="eyebrow">ZIPP · EXPERIMENTAL MODEL PLUGINS</p>
+  <h1>Bring the model.<br>Choose the architecture.</h1>
+  <p class="lead">Python defines the model. Your browser holds the weights. No inference server.</p>
+  <aside>This is an additive prototype, not part of the published ZIPP release. Build the Python-enabled WASM package first. The tiny fixture is an integration example, not a general-purpose language model.</aside>
+  <section aria-labelledby="source-title">
+    <h2 id="source-title">1. Choose a source</h2>
+    <label for="source">Model and architecture</label>
+    <select id="source">
+      <option value="tiny-char">Bundled tiny transformer · 12,094 parameters</option>
+      <option value="bigram">Bundled one-file Python bigram plugin</option>
+      <option value="catalogue-local">Website plugin + my local model folder</option>
+      <option value="local">My local plugin + model folders</option>
+    </select>
+    <p class="hint">Bundled examples download from this website only after approval. Local files are never uploaded by this lab.</p>
+    <div id="catalogue-fields" hidden>
+      <label for="catalogue-plugin">Architecture support to download (code only)</label>
+      <select id="catalogue-plugin"><option value="tiny-causal">Tiny causal transformer</option><option value="bigram">Bigram</option></select>
+    </div>
+    <div id="local-fields" hidden>
+      <div id="plugin-fields">
+      <label for="plugin">Plugin folder (plugin.json + Python source)</label>
+      <input id="plugin" type="file" webkitdirectory directory multiple>
+      </div>
+      <label for="model">Model folder (model.json + Safetensors weights)</label>
+      <input id="model" type="file" webkitdirectory directory multiple>
+      <p class="hint">Choose each folder itself, not its parent. The model must pin the selected plugin's exact manifest hash.</p>
+    </div>
+  </section>
+  <section aria-labelledby="generate-title">
+    <h2 id="generate-title">2. Run on this device</h2>
+    <div class="columns">
+      <div><label for="backend">Compute backend</label><select id="backend">
+        <option value="auto">Auto — report actual backend</option>
+        <option value="cpu-js">CPU JavaScript reference</option>
+        <option value="wasm">WASM SIMD kernels</option>
+        <option value="webgpu">WebGPU</option><option value="webgl2">WebGL2</option>
+      </select></div>
+      <div><label for="count">Maximum new tokens</label><input id="count" type="number" min="0" max="128" value="32"></div>
+    </div>
+    <label for="prompt">Prompt</label><textarea id="prompt" rows="3" maxlength="16384">hello </textarea>
+    <div class="buttons"><button id="run">Approve plugin & run locally</button><button id="cancel" disabled>Stop</button></div>
+    <p id="status" role="status" aria-live="polite">Ready. Nothing downloaded or executed.</p>
+    <pre id="output" aria-label="Generated continuation"></pre>
+    <details><summary>Details</summary><pre id="details"></pre></details>
+  </section>
+  <footer>Architecture source is compiled by ZIPP inside a dedicated Worker. Weights stay outside the Python filesystem. Stopping terminates that Worker. No JavaScript-interop build, remote model resolver, or arbitrary Python package installer is used.</footer>
+</main>
+<script type="module" src="./app.mjs"></script>
+</body></html>

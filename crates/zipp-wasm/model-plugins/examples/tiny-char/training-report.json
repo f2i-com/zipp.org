@@ -1,0 +1,33 @@
+{
+  "seed": 20260917,
+  "steps": 1000,
+  "torch_version": "2.10.0+cpu",
+  "training_seconds": 4.136667966842651,
+  "final_training_loss": 0.11971975862979889,
+  "parameters": 12094,
+  "checkpoint_bytes": 50240,
+  "corpus_sentences": 16,
+  "note": "Training-set examples only. No held-out language-quality benchmark.",
+  "samples": [
+    {
+      "prompt": "",
+      "greedy_text": "the little cat likes naps."
+    },
+    {
+      "prompt": "hello ",
+      "greedy_text": "alice!"
+    },
+    {
+      "prompt": "the little ",
+      "greedy_text": "cat likes naps."
+    },
+    {
+      "prompt": "zipp runs ",
+      "greedy_text": "a tiny model."
+    },
+    {
+      "prompt": "alice likes ",
+      "greedy_text": "green tea."
+    }
+  ]
+}

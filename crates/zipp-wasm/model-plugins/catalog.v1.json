@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "id": "org.zipp.tiny-causal",
+      "version": "0.1.0",
+      "manifest": "plugins/tiny-causal/plugin.json",
+      "sha256": "b86548d0cf541afa64828debce45204313dc04eee779749a41d0d7e1691e160a"
+    },
+    {
+      "id": "org.zipp.bigram",
+      "version": "0.1.0",
+      "manifest": "plugins/bigram/plugin.json",
+      "sha256": "67c1c04a7db784b2caa2c54f1ce50c643e5c3952fe3d264f491564092284d1c2"
+    }
+  ]
+}
