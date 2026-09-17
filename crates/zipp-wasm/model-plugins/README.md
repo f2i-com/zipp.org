@@ -20,6 +20,10 @@ complete logit tensors on all four backends within 5e-5 of stored PyTorch, and t
 demo generating the reference continuations in Chrome. See
 [validation](docs/VALIDATION.md) for versions and error bounds.
 
+These run in CI rather than only locally: the `python` job builds the
+Python-enabled artifact and then runs this suite against it with
+`ZIPP_REQUIRE_INTEGRATION=1`, so a missing engine fails instead of skipping.
+
 Still not established: **SoftN acceptance**, the Gate B robustness checks
 (cancellation, lost GPU device, budget exhaustion, other browsers), language
 quality for any model, and a recorded comparison of quantized Qwen3 logits
