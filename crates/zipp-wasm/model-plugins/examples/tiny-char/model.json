@@ -3,9 +3,10 @@
   "version": 1,
   "architecture": {
     "id": "org.zipp.tiny-causal",
-    "version": "0.1.0",
-    "sha256": "b86548d0cf541afa64828debce45204313dc04eee779749a41d0d7e1691e160a"
+    "version": "0.2.0",
+    "sha256": "c64da73b40c0c3de05c39e6c02ba0934edf4fdf64ae604faf6a9848b0c148f16"
   },
+  "checkpoint_format": "zipp.tiny-causal-v1",
   "config": {
     "vocab_size": 30,
     "context_length": 48,

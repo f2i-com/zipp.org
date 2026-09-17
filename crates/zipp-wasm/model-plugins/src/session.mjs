@@ -1,12 +1,12 @@
-import {check, fields, integer, checkHash, sha256, resolveLimits, abortCheck} from './common.mjs';
+import {check, fields, integer, checkHash, sha256, resolveLimits, abortCheck, formatId} from './common.mjs';
 import {parseJSON} from './json.mjs';
 import {readJSON, readAll} from './sources.mjs';
 import {openSafetensors, WeightStore} from './safetensors.mjs';
 import {bindGraph} from './bindings.mjs';
 
 function validateModel(manifest, plugin, limits) {
-  fields(manifest, ['format', 'version', 'architecture', 'config', 'tokenizer', 'weights', 'license'],
-    ['format', 'version', 'architecture', 'config', 'tokenizer', 'weights']);
+  fields(manifest, ['format', 'version', 'architecture', 'checkpoint_format', 'config', 'tokenizer', 'weights', 'license'],
+    ['format', 'version', 'architecture', 'checkpoint_format', 'config', 'tokenizer', 'weights']);
   check(manifest.format === 'zipp.local-model' && manifest.version === 1, 'VERSION', 'Unsupported local model manifest');
   fields(manifest.architecture, ['id', 'version', 'sha256'], ['id', 'version', 'sha256']);
   checkHash(manifest.architecture.sha256);
@@ -14,6 +14,18 @@ function validateModel(manifest, plugin, limits) {
   check(a.id === p.id && a.version === p.version && a.sha256 === p.sha256, 'PLUGIN', 'Model requires a different exact plugin identity; no automatic download');
   check(manifest.config && typeof manifest.config === 'object' && !Array.isArray(manifest.config), 'FORMAT', 'Expected model configuration');
   check(manifest.tokenizer && typeof manifest.tokenizer === 'object' && !Array.isArray(manifest.tokenizer), 'FORMAT', 'Expected tokenizer configuration');
+  // Checkpoint and tokenizer families, refused here: before an engine exists,
+  // before any Python compiles, and without consulting the checkpoint's own
+  // metadata. A plugin implements one named checkpoint family. Emitting the
+  // same transformer operations is not evidence that another project's tensor
+  // names, orientations, attention scaling or tokenization match; that needs a
+  // plugin written and verified against those checkpoints.
+  formatId(manifest.checkpoint_format, 'Model checkpoint format');
+  formatId(manifest.tokenizer.type, 'Model tokenizer format');
+  check(manifest.checkpoint_format === plugin.support.checkpoint_format, 'CHECKPOINT',
+    `This model is ${manifest.checkpoint_format}; plugin ${p.id}@${p.version} implements ${plugin.support.checkpoint_format} checkpoints only. Install a plugin built for that checkpoint family; shared transformer operations are not checkpoint compatibility.`);
+  check(plugin.support.tokenizer_formats.includes(manifest.tokenizer.type), 'TOKENIZER',
+    `This model tokenizes with ${manifest.tokenizer.type}; plugin ${p.id}@${p.version} implements ${plugin.support.tokenizer_formats.join(', ')}. A plugin must ship the tokenizer its checkpoints were trained with.`);
   check(Array.isArray(manifest.weights), 'FORMAT', 'Expected weight shard list');
   integer(manifest.weights.length, 1, limits.maxWeightFiles, 'Weight file count');
   const paths = new Set();
@@ -58,7 +70,7 @@ export class ModelSession {
   #engine; #runtime; #weights; #model; #plugin; #limits; #description; #busy = false; #closed = false;
   static async open({source, plugin, engineFactory, runtime, limits: overrides = {}}) {
     const limits = resolveLimits(overrides);
-    check(plugin?.identity && typeof engineFactory === 'function' && typeof runtime?.execute === 'function', 'HOST', 'Supply installed plugin, engine factory and ZIPP compute runtime');
+    check(plugin?.identity && plugin?.support && typeof engineFactory === 'function' && typeof runtime?.execute === 'function', 'HOST', 'Supply an installed plugin (identity and declared support), engine factory and ZIPP compute runtime');
     const model = validateModel(await readJSON(source, 'model.json', limits.maxManifestBytes), plugin, limits);
     let total = 0;
     for (const item of model.weights) { const bytes = source.size(item.path); integer(bytes, 8, limits.maxModelFileBytes, 'Weight file bytes'); total += bytes; integer(total, 8, limits.maxModelBytes, 'Aggregate weight bytes'); }
@@ -75,8 +87,17 @@ export class ModelSession {
       engine.initPythonProject({...plugin.files}, plugin.entry, []);
       const session = new ModelSession(engine, runtime, weights, model, plugin, limits);
       const d = session.#jsonCall('zipp_model_describe', [JSON.stringify(model.config)]);
-      fields(d, ['task', 'vocab_size', 'max_context'], ['task', 'vocab_size', 'max_context']);
+      const described = ['task', 'checkpoint_format', 'tokenizer_formats', 'vocab_size', 'max_context'];
+      fields(d, described, described);
       check(d.task === 'causal-lm', 'TASK', 'This initial session driver supports causal language model plugins');
+      // The manifest was trusted to refuse early; the source is what decides.
+      // A plugin.json advertising a checkpoint family its Python does not
+      // implement fails here rather than running against the wrong weights.
+      check(d.checkpoint_format === plugin.support.checkpoint_format, 'PLUGIN',
+        'Installed plugin source and plugin.json disagree about the supported checkpoint format');
+      check(Array.isArray(d.tokenizer_formats) && d.tokenizer_formats.length === plugin.support.tokenizer_formats.length &&
+        d.tokenizer_formats.every((f, i) => f === plugin.support.tokenizer_formats[i]), 'PLUGIN',
+        'Installed plugin source and plugin.json disagree about the supported tokenizers');
       integer(d.vocab_size, 2, limits.maxDimension, 'Vocabulary size'); integer(d.max_context, 1, limits.maxContext, 'Context size');
       integer(model.tokenizer.eos_token_id, 0, d.vocab_size - 1, 'EOS token');
       session.#description = Object.freeze(d); return session;
@@ -85,7 +106,10 @@ export class ModelSession {
   constructor(engine, runtime, weights, model, plugin, limits) {
     this.#engine = engine; this.#runtime = runtime; this.#weights = weights; this.#model = model; this.#plugin = plugin; this.#limits = limits;
   }
-  get info() { return {plugin: {...this.#plugin.identity}, ...this.#description, decodedWeightBytes: this.#weights.decodedBytes, backend: this.#runtime.info?.().backend ?? 'host-supplied'}; }
+  get info() {
+    return {plugin: {...this.#plugin.identity}, ...this.#description, tokenizer: this.#model.tokenizer.type,
+      decodedWeightBytes: this.#weights.decodedBytes, backend: this.#runtime.info?.().backend ?? 'host-supplied'};
+  }
   #live() { check(!this.#closed && !this.#engine.disposed, 'DISPOSED', 'Model session is closed'); }
   #call(name, args) { this.#live(); this.#engine.renewInstructionBudget(); return this.#engine.pythonCall(name, args); }
   #jsonCall(name, args) { return parseReply(this.#call(name, args), this.#limits.maxGraphBytes); }

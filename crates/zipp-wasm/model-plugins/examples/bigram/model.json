@@ -3,9 +3,10 @@
   "version": 1,
   "architecture": {
     "id": "org.zipp.bigram",
-    "version": "0.1.0",
-    "sha256": "67c1c04a7db784b2caa2c54f1ce50c643e5c3952fe3d264f491564092284d1c2"
+    "version": "0.2.0",
+    "sha256": "131f321bcbd7eab9a1d55bc9f33c0b6529b479c30d5e42c672d40d814d9c4ef6"
   },
+  "checkpoint_format": "zipp.bigram-v1",
   "config": {
     "vocab_size": 7,
     "context_length": 32

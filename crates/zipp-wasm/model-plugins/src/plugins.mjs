@@ -1,16 +1,25 @@
-import {check, fields, integer, safePath, sha256, checkHash, resolveLimits} from './common.mjs';
+import {check, fields, integer, safePath, sha256, checkHash, resolveLimits, formatId} from './common.mjs';
 import {decodeUTF8, parseJSON} from './json.mjs';
 import {readAll, FileMapSource, fetchPinned} from './sources.mjs';
 
 export function validatePluginManifest(manifest, limits = resolveLimits()) {
-  fields(manifest, ['format', 'version', 'id', 'plugin_version', 'entry', 'capabilities', 'sources'],
-    ['format', 'version', 'id', 'plugin_version', 'entry', 'capabilities', 'sources']);
+  const required = ['format', 'version', 'id', 'plugin_version', 'entry', 'capabilities',
+    'checkpoint_format', 'tokenizer_formats', 'sources'];
+  fields(manifest, required, required);
   check(manifest.format === 'zipp.python-model-plugin' && manifest.version === 1, 'VERSION', 'Unsupported plugin manifest');
   check(typeof manifest.id === 'string' && /^[a-z][a-z0-9.-]{2,95}$/.test(manifest.id), 'FORMAT', 'Invalid plugin id');
   check(typeof manifest.plugin_version === 'string' && /^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(manifest.plugin_version), 'VERSION', 'Use an exact x.y.z plugin version');
   check(typeof manifest.entry === 'string' && /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(manifest.entry), 'FORMAT', 'Entry must be a Python module name');
   check(Array.isArray(manifest.capabilities) && manifest.capabilities.length === 1 && manifest.capabilities[0] === 'graph-v2',
     'CAPABILITY', 'This host admits only the graph-v2 model-plugin capability');
+  // Declared support, pinned by the same hash chain as the source: it lets a
+  // host refuse an incompatible checkpoint before compiling any Python. The
+  // installed source must still agree (ModelSession checks `describe`).
+  formatId(manifest.checkpoint_format, 'Plugin checkpoint format');
+  check(Array.isArray(manifest.tokenizer_formats), 'FORMAT', 'Expected a tokenizer format list');
+  integer(manifest.tokenizer_formats.length, 1, 8, 'Declared tokenizer formats');
+  for (const format of manifest.tokenizer_formats) formatId(format, 'Plugin tokenizer format');
+  check(new Set(manifest.tokenizer_formats).size === manifest.tokenizer_formats.length, 'FORMAT', 'Duplicate tokenizer format');
   check(manifest.sources && !Array.isArray(manifest.sources) && typeof manifest.sources === 'object', 'FORMAT', 'Expected source hash map');
   const paths = Object.keys(manifest.sources); integer(paths.length, 1, limits.maxSourceFiles, 'Plugin source files');
   for (const path of paths) {
@@ -39,6 +48,10 @@ export class PluginRegistry {
     if (expectedHash !== undefined) { checkHash(expectedHash); check(digest === expectedHash, 'HASH', 'Plugin manifest digest mismatch'); }
     const manifest = validatePluginManifest(parseJSON(decodeUTF8(bytes)), this.limits);
     const identity = Object.freeze({id: manifest.id, version: manifest.plugin_version, sha256: digest});
+    const support = Object.freeze({
+      checkpoint_format: manifest.checkpoint_format,
+      tokenizer_formats: Object.freeze([...manifest.tokenizer_formats]),
+    });
     const key = `${identity.id}@${identity.version}`;
     if (this.#installed.has(key)) {
       const installed = this.#installed.get(key);
@@ -54,7 +67,7 @@ export class PluginRegistry {
       files[`zipp_plugin/${path}`] = decodeUTF8(data);
     }
     files[BOOTSTRAP_ENTRY] = bootstrap(manifest.entry);
-    const installed = Object.freeze({identity, files: Object.freeze(files), entry: BOOTSTRAP_ENTRY});
+    const installed = Object.freeze({identity, support, files: Object.freeze(files), entry: BOOTSTRAP_ENTRY});
     // Recheck after awaits: another installation may have won the same key.
     const current = this.#installed.get(key);
     if (current) { check(current.identity.sha256 === digest, 'CONFLICT', 'Concurrent plugin version conflict'); return current; }

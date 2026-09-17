@@ -1,7 +1,6 @@
 """Plugin math parity under CPython/NumPy, independently compared with PyTorch.
 These are NOT ZIPP VM or GPU tests; test-integration.mjs covers the checkout gates.
 """
-import importlib.util
 import json
 import math
 from pathlib import Path
@@ -10,12 +9,12 @@ import unittest
 import numpy as np
 from safetensors.numpy import load_file
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT/'tools'))
+from cpython_host import load_plugin as _load_plugin, plugin_support
 
 def load_plugin(name):
-    folder = ROOT/'plugins'/name
-    spec = importlib.util.spec_from_file_location('test_'+name.replace('-','_'), folder/'architecture.py', submodule_search_locations=[str(folder)])
-    module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = module; spec.loader.exec_module(module)
-    return module
+    """Import the plugin as the registry installs it, not as a loose file."""
+    return _load_plugin(ROOT/'plugins'/name)
 
 def evaluate(template, weights):
     bindings = {b['node']:b for b in template['bindings']}; values = []
@@ -108,5 +107,29 @@ class PluginTests(unittest.TestCase):
     def test_tokenizer_wrong_schema_rejected(self):
         t=dict(self.model['tokenizer']);t['type']='gpt2'
         with self.assertRaises(ValueError):self.plugin.encode('hello',t)
+    def test_declared_support_matches_the_manifest_and_describe(self):
+        for name in ['tiny-causal','bigram']:
+            with self.subTest(plugin=name):
+                module=load_plugin(name);support=plugin_support(module)
+                manifest=json.loads((ROOT/'plugins'/name/'plugin.json').read_text())
+                self.assertEqual(manifest['checkpoint_format'],support['checkpoint_format'])
+                self.assertEqual(manifest['tokenizer_formats'],support['tokenizer_formats'])
+                config=self.model['config'] if name=='tiny-causal' else {'vocab_size':7,'context_length':32}
+                described=module.describe(config)
+                self.assertEqual(described['checkpoint_format'],support['checkpoint_format'])
+                self.assertEqual(described['tokenizer_formats'],support['tokenizer_formats'])
+    def test_fixture_claims_only_its_own_checkpoint_family(self):
+        # The next model milestone is a separate GPT-Neo/TinyStories plugin with
+        # that family's tokenizer and state-dict mapping. Emitting the same
+        # transformer operations is not compatibility with those checkpoints, so
+        # this fixture must never advertise them, in the manifest or the source.
+        for name in ['tiny-causal','bigram']:
+            with self.subTest(plugin=name):
+                support=plugin_support(load_plugin(name))
+                self.assertEqual(support['checkpoint_format'],'zipp.'+('tiny-causal' if name=='tiny-causal' else 'bigram')+'-v1')
+                declared=' '.join([support['checkpoint_format']]+support['tokenizer_formats'])
+                for foreign in ['gpt-neo','gptneo','tinystories','gpt2','llama','sentencepiece','byte-bpe']:
+                    self.assertNotIn(foreign,declared)
+                self.assertEqual(support['tokenizer_formats'],['character-v1'])
 
 if __name__=='__main__':unittest.main()

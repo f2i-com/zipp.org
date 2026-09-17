@@ -5,11 +5,14 @@ implementation designed against `f2i-com/zipp.org` commit
 `62da28d9bdcd66fccbf5627d887d574016501f9d`. It adds a directory; it does not replace
 Rust/VM files, modify the current landing-page build, or change SoftN.
 
-40 standalone Node tests and 10 CPython/NumPy tests pass in the supplied evidence.
-Two full-checkout integration gates were **not run**: the current upstream GPU
-runtime and built Python-enabled ZIPP WASM package were not available locally.
-The demo UI was checked in an offline HTML harness, not through model inference.
-Do not merge or advertise working ZIPP/GPU inference until those gates pass.
+45 standalone Node tests, 12 CPython/NumPy tests and both full-checkout gates pass
+in this repository: the plugin's graphs run through the current ZIPP Graph v2
+validator and CPU backend, and the plugin's Python compiles and generates inside a
+locally built Python-enabled ZIPP WASM engine, matching the stored PyTorch
+reference in both cases. See [validation](docs/VALIDATION.md) for versions and
+error bounds. **Browser, GPU and SoftN acceptance have still not run**: no backend
+other than the CPU reference has executed this model, the demo UI has never driven
+real inference, and nothing here establishes performance or language quality.
 
 ## What is included
 
@@ -43,7 +46,13 @@ No package name, model config field, or Python string becomes browser JavaScript
 tokenizer plugin. `plugins/tiny-causal/` demonstrates a multi-file package with a
 configurable pre-norm causal transformer. Both use exactly the same host APIs.
 `plugin.json` is required even for one file: it carries identity, version, entry
-module, required capability and source hashes.
+module, required capability, the checkpoint and tokenizer families the source
+implements, and one hash per Python file.
+
+A multi-file plugin imports its own modules by absolute name under the fixed
+`zipp_plugin` package the host installs into (`from zipp_plugin.graph import
+Graph`). ZIPP's Python frontend has no relative imports, and that namespace is
+also what stops a plugin file shadowing the `json` module the bootstrap uses.
 
 ## Activate without rebuilding the engine
 
@@ -60,31 +69,41 @@ opcodes and new GPU kernels cannot be installed this way.
 
 ## Try it in a full ZIPP checkout
 
-Apply the overlay/patch described in the bundle's `START_HERE.md`, then build the
-regular Python WASM variant using the repository's documented toolchain:
+Build the regular Python WASM variant with the repository's documented toolchain,
+then run everything from this directory:
 
 ```sh
 bash crates/zipp-wasm/build-variants.sh all
 cd crates/zipp-wasm/model-plugins
-node --test
-ZIPP_REQUIRE_INTEGRATION=1 node --test tests/integration.test.mjs
+ZIPP_REQUIRE_INTEGRATION=1 node --test
 ```
 
-On PowerShell, set `$env:ZIPP_REQUIRE_INTEGRATION='1'` before the Node integration
-command. The required mode makes missing artifacts a failure rather than a skip.
+Expect 47 passing tests and no skips: 45 standalone plus the two checkout gates.
+Without `dist/all` the second gate skips instead, which is why required mode is
+the one to run before believing anything. On PowerShell, set
+`$env:ZIPP_REQUIRE_INTEGRATION='1'` first.
 The Python differential tests additionally need NumPy and Safetensors:
 
 ```sh
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-From the ZIPP repository root, serve the WASM tree (HTTPS in deployment; localhost
-is suitable for development):
+The lab runs on the playground's own loopback server, which already serves the
+repository root and prints the lab's URL once `demo/` is present:
 
 ```sh
-python -m http.server 8000 --bind 127.0.0.1 --directory crates/zipp-wasm
-# Open http://127.0.0.1:8000/model-plugins/demo/
+node crates/zipp-wasm/playground/serve.cjs
+# zipp playground: http://127.0.0.1:8765/crates/zipp-wasm/playground/
+# model lab:      http://127.0.0.1:8765/crates/zipp-wasm/model-plugins/demo/
+# backend parity: http://127.0.0.1:8765/crates/zipp-wasm/model-plugins/demo/parity.html
 ```
+
+That server is loopback-only, answers its own Host header, and serves no dot-files;
+deployment is HTTPS and a separate decision. `demo/parity.html` runs the plugin's
+recorded graphs on every backend the browser offers and compares complete logit
+tensors with the stored PyTorch reference, so a backend that produces believable
+text with wrong numbers is still caught. It never asks an explicit backend request
+to settle for another one.
 
 Choose the tiny fixture, download only a website plugin with your own local model,
 or select both a plugin folder and a matching model folder.
@@ -142,12 +161,33 @@ files across a Worker, send a Map of explicit relative paths to File objects as
 | Versioned, source-hashed Python architecture plugins | Live mutation of an existing compiled VM; a general pip/plugin marketplace |
 | Local Blob/File/typed-array sources and a scoped bundle-entry adapter | SoftN extraction, permissions/UI integration, production package migration |
 | Safetensors F32/F16/BF16 with bounds checks and F32 conversion | Pickle checkpoints, GGUF, integer quantization, zero-copy device import |
-| Custom tiny transformer and single-file bigram plugins | TinyStories/GPT-Neo, GPT-2 BPE, SentencePiece, arbitrary HF checkpoints |
+| Custom tiny transformer and single-file bigram plugins, each declaring the one checkpoint family it implements | TinyStories/GPT-Neo, GPT-2 BPE, SentencePiece, arbitrary HF checkpoints; loading one is refused, not attempted |
 | Eager full-context graph planning, greedy and temperature/top-k sampling | KV cache, resident model weights, fused decode kernels, throughput claims |
 | Existing Graph v2 runtime integration code | ZIPP WASM/CLI, GPU inference and cross-backend parity verified here |
 
 There is no new native `zipp py` model command or built-in `zipp_llm` Python
 module in this overlay. The browser/embedding host owns model sessions.
+
+## Next model milestone: a separate GPT-Neo/TinyStories plugin
+
+The next model milestone is a **separate** plugin for GPT-Neo/TinyStories
+checkpoints, carrying that family's own GPT-2 byte-BPE tokenizer and an explicit
+state-dict mapping verified against the reference implementation. It is not a
+configuration of the plugins here, and not a flag on them.
+
+The custom fixture is **not** advertised as compatible with those checkpoints
+merely because it uses transformer operations. Attention, LayerNorm and GELU say
+nothing about tensor names, weight orientation, tied embeddings, attention
+scaling, local/global attention patterns, normalization epsilon, activation
+variant or tokenization — the things a checkpoint actually depends on. So the
+claim is made in data rather than prose: `plugins/tiny-causal/plugin.json`
+declares `"checkpoint_format": "zipp.tiny-causal-v1"` and `"tokenizer_formats":
+["character-v1"]`, every `model.json` names the family it belongs to, and
+`ModelSession.open` refuses a mismatch with a `CHECKPOINT` or `TOKENIZER` error
+before it constructs an engine. Renaming a checkpoint's `checkpoint_format` does
+not convert it; it only moves the failure to a plugin that will read the wrong
+bytes. `docs/HANDOFF.md` Gate C lists what such a plugin must prove before the
+name `GPT-Neo` appears anywhere in a release.
 
 The generic session driver currently serves causal language models only. A plugin
 can replace architecture and tokenizer logic but must return that driver ABI.

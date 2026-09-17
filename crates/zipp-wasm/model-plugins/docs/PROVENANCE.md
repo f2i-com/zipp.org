@@ -15,6 +15,23 @@ Repository/API contracts inspected at ZIPP commit
   float32 arithmetic and erf-form GELU.
 - `crates/zipp-wasm/build-variants.sh`: standard Python `all` vs trusted `interop` build.
 
+Read again while integrating this overlay into a full checkout, because the host
+depends on what they decide:
+
+- `crates/zipp-vm/src/frontend/python/stmts.rs`: `ImportFrom` with a level above
+  zero is refused (`relative imports are not supported`), which is why a plugin's
+  sibling modules are imported absolutely under the installed `zipp_plugin`
+  package. Confirmed against a locally built engine, not inferred from the source.
+- `crates/zipp-wasm/src/lib.rs` (`module_name_of_path`, `initPythonProject`):
+  `zipp_plugin/graph.py` becomes the module `zipp_plugin.graph` and
+  `zipp_plugin/__init__.py` the package itself, so the registry's install layout
+  is what the frontend compiles.
+- `crates/zipp-wasm/gpu-lab/src/graph.mjs` node fields: `permute.dims`,
+  `reshape.shape`, `softmax.axis` (last axis only), `mean.axis`/`keepdim`,
+  `full.value` and matmul's rank two/three rule match what the plugin emits.
+- `docs/PYTHON_FRONTEND_EXPERIMENT.md`: `json` and `math` are built-in modules, so
+  the generated bootstrap and the transformer plugin need nothing installed.
+
 The above source files were read, not copied over or modified by this overlay.
 The original user's attached proposal is the basis for the host asset boundary,
 Safetensors-first approach, eager reference path and later KV-cache rollout.

@@ -11,7 +11,7 @@ import {bindGraph} from '../src/bindings.mjs';
 import {ModelSession, sampleLogits, seededRandom} from '../src/session.mjs';
 
 const encoder = new TextEncoder(), limits = resolveLimits();
-import {sourceDirectory} from './helpers.mjs';
+import {directoryEntries, sourceDirectory} from './helpers.mjs';
 
 function packed(header, data = new Uint8Array(), raw = false) {
   const json=encoder.encode(raw?header:JSON.stringify(header)),out=new Uint8Array(8+json.length+data.length);
@@ -129,6 +129,54 @@ test('model manifest cannot silently switch architecture plugins',async()=>{
   const plugin=await new PluginRegistry().install(await sourceDirectory('../plugins/bigram/'),{approve:()=>true});let made=0;
   await assert.rejects(ModelSession.open({source:await sourceDirectory('../examples/tiny-char/'),plugin,engineFactory:()=>{made++;},runtime:{execute(){}}}),/different exact plugin/);assert.equal(made,0);
 });
+// The next model milestone is a SEPARATE GPT-Neo/TinyStories plugin carrying
+// that family's tokenizer and state-dict mapping. Until such a plugin exists and
+// has been verified against those checkpoints, the custom fixture must refuse
+// them: emitting the same transformer operations is not checkpoint
+// compatibility, and these two tests are what keeps that from being advertised.
+async function modelEntriesWith(changes){
+  const entries=await directoryEntries('../examples/tiny-char/');
+  const model=JSON.parse(new TextDecoder().decode(entries.get('model.json')));
+  entries.set('model.json',encoder.encode(JSON.stringify(changes(model))));
+  return entries;
+}
+test('a GPT-Neo/TinyStories checkpoint is refused before any engine is created',async()=>{
+  const plugin=await new PluginRegistry().install(await sourceDirectory('../plugins/tiny-causal/'),{approve:()=>true});
+  const entries=await modelEntriesWith(model=>({...model,
+    architecture:{...model.architecture,sha256:plugin.identity.sha256},
+    checkpoint_format:'hf.gpt-neo-v1',
+    tokenizer:{...model.tokenizer,type:'gpt2-byte-bpe-v1'}}));
+  let made=0;
+  await assert.rejects(ModelSession.open({source:new FileMapSource(entries),plugin,
+    engineFactory:()=>{made++;},runtime:{execute(){}}}),
+    error=>error.code==='CHECKPOINT'&&/not checkpoint compatibility/.test(error.message));
+  assert.equal(made,0);
+});
+test('a foreign tokenizer is refused even for the right checkpoint family',async()=>{
+  const plugin=await new PluginRegistry().install(await sourceDirectory('../plugins/tiny-causal/'),{approve:()=>true});
+  const entries=await modelEntriesWith(model=>({...model,tokenizer:{...model.tokenizer,type:'gpt2-byte-bpe-v1'}}));
+  await assert.rejects(ModelSession.open({source:new FileMapSource(entries),plugin,
+    engineFactory:()=>{throw Error('must not construct an engine');},runtime:{execute(){}}}),
+    error=>error.code==='TOKENIZER'&&/tokenizer its checkpoints were trained with/.test(error.message));
+});
+test('the bundled plugins advertise only their own checkpoint family',async()=>{
+  for(const name of ['tiny-causal','bigram']){
+    const plugin=await new PluginRegistry().install(await sourceDirectory(`../plugins/${name}/`),{approve:()=>true});
+    assert.equal(plugin.support.checkpoint_format,name==='tiny-causal'?'zipp.tiny-causal-v1':'zipp.bigram-v1');
+    assert.deepEqual([...plugin.support.tokenizer_formats],['character-v1']);
+    assert.ok(Object.isFrozen(plugin.support));
+  }
+});
+test('a plugin manifest missing its declared support is rejected',async()=>{
+  const entries=await directoryEntries('../plugins/bigram/');
+  const manifest=JSON.parse(new TextDecoder().decode(entries.get('plugin.json')));
+  delete manifest.checkpoint_format;
+  entries.set('plugin.json',encoder.encode(JSON.stringify(manifest)));
+  await assert.rejects(new PluginRegistry().install(new FileMapSource(entries),{approve:()=>true}),/Missing field: checkpoint_format/);
+  const bad={...manifest,checkpoint_format:'GPT-Neo v1',tokenizer_formats:['character-v1']};
+  entries.set('plugin.json',encoder.encode(JSON.stringify(bad)));
+  await assert.rejects(new PluginRegistry().install(new FileMapSource(entries),{approve:()=>true}),/format identifier/);
+});
 test('greedy selection, stable seeded sampling, extreme temperature',()=>{
   assert.equal(sampleLogits(new Float32Array([2,3,3])),1);assert.equal(sampleLogits([1000,999],{temperature:Number.MIN_VALUE}),0);
   assert.equal(sampleLogits([1,4,2],{temperature:1,topK:1}),1);
@@ -144,6 +192,7 @@ test('Python packages may begin with an empty __init__.py', async () => {
     format: 'zipp.python-model-plugin', version: 1,
     id: 'org.example.empty-init', plugin_version: '0.1.0',
     entry: 'architecture', capabilities: ['graph-v2'],
+    checkpoint_format: 'org.example.empty-v1', tokenizer_formats: ['character-v1'],
     sources: {'__init__.py': await sha256(empty), 'architecture.py': await sha256(code)}
   };
   const entries = new Map([

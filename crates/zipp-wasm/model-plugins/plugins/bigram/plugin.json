@@ -2,12 +2,16 @@
   "format": "zipp.python-model-plugin",
   "version": 1,
   "id": "org.zipp.bigram",
-  "plugin_version": "0.1.0",
+  "plugin_version": "0.2.0",
   "entry": "architecture",
   "capabilities": [
     "graph-v2"
   ],
+  "checkpoint_format": "zipp.bigram-v1",
+  "tokenizer_formats": [
+    "character-v1"
+  ],
   "sources": {
-    "architecture.py": "6a4da7a40530ba57762dc9ed0f74dea2e848b5583eac2933cb9bc4041d2c849a"
+    "architecture.py": "8be85713052265cd0884015aa329ad33f741d8d71b3c43e53a213a47929a2c16"
   }
 }

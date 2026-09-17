@@ -7,6 +7,15 @@ checkpoint. Installing a plugin never means downloading weights. A model's
 `architecture` pins an already approved plugin identity. A mismatch is an error,
 not an instruction to resolve a remote repository or run remote code.
 
+A plugin also declares **which checkpoint family it implements** and which
+tokenizers it can read. A model names the same two things. The host compares them
+for exact equality before it constructs an engine, so an incompatible checkpoint
+is refused rather than partly loaded. This is deliberately not inference from the
+operations a graph uses: two plugins can emit identical attention and still
+disagree about tensor names, weight orientation, tied embeddings, attention
+scaling, epsilon placement or tokenization, which is precisely what a checkpoint
+depends on.
+
 The installed snapshot contains only Python source, namespaced under
 `zipp_plugin/`, plus a fixed generated bootstrap. It is supplied to
 `Engine.initPythonProject(files, entry, [])`. Architecture and tokenizer hooks run
@@ -26,24 +35,43 @@ The checked-in `plugins/*/plugin.json` files are complete, valid examples:
   "format": "zipp.python-model-plugin",
   "version": 1,
   "id": "org.example.my-architecture",
-  "plugin_version": "0.1.0",
+  "plugin_version": "0.2.0",
   "entry": "architecture",
   "capabilities": ["graph-v2"],
+  "checkpoint_format": "org.example.my-architecture-v1",
+  "tokenizer_formats": ["character-v1"],
   "sources": {"architecture.py": "<64 lowercase SHA-256 hex characters>"}
 }
 ```
+
+`checkpoint_format` and each `tokenizer_formats` entry are lowercase identifiers
+(`[a-z]` then `[a-z0-9]`, `.` and `-`), compared only for equality: the host never
+parses a family name for meaning. They are pinned by the manifest hash like the
+source is, which is what lets a host refuse a model before compiling any Python.
+The installed source must agree — `describe` reports the same two values, and a
+session that finds them different fails with `PLUGIN` rather than continuing.
 
 The placeholder above is documentation, not a valid digest. `tools/build_manifests.py`
 generates the included examples. An unchanged id/version cannot be overwritten
 with different source content in the same registry. Side-by-side versions are
 allowed. Removing a registry entry does not mutate an already running session.
 
+A multi-file plugin imports its own modules by absolute name under `zipp_plugin`:
+`from zipp_plugin.graph import Graph`, never `from .graph import Graph`. ZIPP's
+Python frontend rejects relative imports outright (`relative imports are not
+supported`), and the fixed namespace also stops a plugin's own `json.py` or
+`math.py` shadowing what the bootstrap imports. `tools/cpython_host.py` mirrors
+the same layout so the CPython tests and fixture tools import what ZIPP compiles.
+
 The entry module implements:
 
 ```python
 def describe(config):
     # Validate the supported configuration; currently only causal-lm task drivers.
-    return {"task": "causal-lm", "vocab_size": 30, "max_context": 48}
+    # The two format fields are the plugin's compatibility claim, and must match
+    # plugin.json: one plugin implements one checkpoint family.
+    return {"task": "causal-lm", "checkpoint_format": "org.example.my-architecture-v1",
+            "tokenizer_formats": ["character-v1"], "vocab_size": 30, "max_context": 48}
 
 def encode(text, tokenizer_config):
     # Return nonempty, bounded integer IDs, including any required BOS.
@@ -69,7 +97,14 @@ adjustment; arbitrary tokenizer downloads are not supported.
 
 `examples/tiny-char/model.json` and `examples/bigram/model.json` are complete
 examples. Required fields are `format: zipp.local-model`, `version: 1`,
-`architecture: {id, version, sha256}`, `config`, `tokenizer`, and `weights`.
+`architecture: {id, version, sha256}`, `checkpoint_format`, `config`,
+`tokenizer` (including its `type`), and `weights`.
+
+`checkpoint_format` must equal the plugin's, and `tokenizer.type` must be one the
+plugin lists; otherwise `ModelSession.open` throws `CHECKPOINT` or `TOKENIZER`
+before an engine exists. Editing that field to satisfy the check does not convert
+a checkpoint — it only replaces a clear refusal with a plugin reading the wrong
+bytes. A checkpoint from another project needs a plugin written for it.
 
 The `sha256` in `architecture` hashes the exact UTF-8 bytes of `plugin.json`, which
 in turn pins every Python source file. Each weights entry has a canonical relative
@@ -114,9 +149,9 @@ assume arbitrary rank-four matmul. LayerNorm is reduced to mean/sub/mul/add/sqrt
 and GELU uses the erf form matching the inspected backend, not the tanh variant.
 
 The transformer example uses `[input_width, output_width]` linear weight layout.
-Its Safetensors keys are its own explicit format. A PyTorch or Hugging Face file
-with different layouts must be converted or handled by a matching plugin; renaming
-its architecture field is not a conversion.
+Its Safetensors keys are its own explicit format, `zipp.tiny-causal-v1`. A PyTorch
+or Hugging Face file with different layouts must be converted or handled by a
+matching plugin; renaming its architecture or checkpoint field is not a conversion.
 
 ## 5. Limits and ownership
 

@@ -14,3 +14,9 @@ crates/rustpython-parser-fork/src/python.rs whitespace=-blank-at-eol
 # The WASM engine pairs are hash-checked against their manifests; never convert line endings.
 landing/public/playground-runtime/** -text
 landing/public/wasm/** -text
+
+# Model-plugin Python sources are hashed byte for byte by their plugin.json, and
+# each model.json pins that manifest again, so a CRLF checkout would make every
+# bundled fixture refuse to load. Keep this tree LF, and the checkpoints exact.
+crates/zipp-wasm/model-plugins/** text eol=lf
+crates/zipp-wasm/model-plugins/**/*.safetensors -text

@@ -19,6 +19,15 @@ export function integer(value, min, max, what) {
   check(Number.isSafeInteger(value) && value >= min && value <= max, 'LIMIT', `${what} must be an integer in [${min}, ${max}]`);
   return value;
 }
+/** A checkpoint or tokenizer family name: data a host compares, never a label
+ * it interprets. Two plugins agreeing on the word "transformer" is not a
+ * compatible checkpoint, so these are compared for exact equality only.
+ */
+export function formatId(value, what) {
+  check(typeof value === 'string' && value.length <= 64 && /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/.test(value),
+    'FORMAT', `${what} must be a lowercase dotted/hyphenated format identifier`);
+  return value;
+}
 export function safePath(path) {
   check(typeof path === 'string' && path.length > 0 && path.length <= 512, 'PATH', 'Invalid asset path');
   const parts = path.split('/');

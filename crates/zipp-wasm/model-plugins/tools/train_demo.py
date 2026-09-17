@@ -5,15 +5,18 @@ The result demonstrates loading/inference, not useful general language ability.
 """
 import argparse
 import hashlib
-import importlib.util
 import json
 import math
 from pathlib import Path
+import sys
 import time
 import torch
 from torch import nn
 from torch.nn import functional as F
 from safetensors.torch import save_file
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cpython_host import write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS = [
@@ -78,13 +81,17 @@ def main():
         loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optim.step()
     model.eval(); folder = ROOT/'examples/tiny-char'; folder.mkdir(parents=True,exist_ok=True)
     save_file(model.export(), str(folder/'weights.safetensors'), metadata={'purpose':'toy integration fixture; original 16-sentence corpus'})
+    # The manifest decides the identity, checkpoint family and tokenizer this
+    # checkpoint claims: a model trained by this script is a zipp.tiny-causal-v1
+    # checkpoint because this script emits that layout, not because it is small.
     identity = json.loads((ROOT/'plugins/tiny-causal/plugin.json').read_text())
     plugin_hash = hashlib.sha256((ROOT/'plugins/tiny-causal/plugin.json').read_bytes()).hexdigest()
-    tokenizer = dict(type='character-v1', vocab=vocab, bos_token_id=0,eos_token_id=1,unk_token_id=2)
+    tokenizer = dict(type=identity['tokenizer_formats'][0], vocab=vocab, bos_token_id=0,eos_token_id=1,unk_token_id=2)
     manifest = dict(format='zipp.local-model', version=1, architecture=dict(id=identity['id'],version=identity['plugin_version'],sha256=plugin_hash),
+                    checkpoint_format=identity['checkpoint_format'],
                     config=c,tokenizer=tokenizer,weights=[dict(path='weights.safetensors',sha256=hashlib.sha256((folder/'weights.safetensors').read_bytes()).hexdigest())],
                     license='CC0-1.0; original toy training corpus included in tools/train_demo.py')
-    (folder/'model.json').write_text(json.dumps(manifest,indent=2)+'\n')
+    write_json(folder/'model.json', manifest)
     cases = []
     with torch.no_grad():
         for prompt in ['', 'hello ', 'the little ', 'zipp runs ', 'alice likes ']:
@@ -98,11 +105,11 @@ def main():
                 generated.append(token);current.append(token)
             text = ''.join(vocab[t] if t>=3 else '\ufffd' if t==2 else '' for t in generated)
             cases.append(dict(prompt=prompt,tokens=ids,logits=expected,greedy_tokens=generated,greedy_text=text))
-    (folder/'oracle.json').write_text(json.dumps(dict(source='CPython/PyTorch CPU reference; not a ZIPP execution result',cases=cases),indent=2)+'\n')
+    write_json(folder/'oracle.json', dict(source='CPython/PyTorch CPU reference; not a ZIPP execution result',cases=cases))
     report = dict(seed=20260917,steps=args.steps,torch_version=torch.__version__,training_seconds=time.time()-start,
                   final_training_loss=float(loss.detach()),parameters=sum(p.numel() for p in model.parameters()),
                   checkpoint_bytes=(folder/'weights.safetensors').stat().st_size,corpus_sentences=len(CORPUS),
                   note='Training-set examples only. No held-out language-quality benchmark.',samples=[{k:v for k,v in case.items() if k in ['prompt','greedy_text']} for case in cases])
-    (folder/'training-report.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2))
+    write_json(folder/'training-report.json', report);print(json.dumps(report,indent=2))
 
 if __name__ == '__main__': main()

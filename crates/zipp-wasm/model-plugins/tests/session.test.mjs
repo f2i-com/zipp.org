@@ -10,7 +10,7 @@ class EngineDouble {
   initPythonProject(files,entry,args){assert.ok(files[entry].includes('zipp_model_graph'));assert.deepEqual(args,[]);}
   renewInstructionBudget(){this.renewals++;}
   pythonCall(name,args){this.calls.push(name);
-    if(name==='zipp_model_describe')return JSON.stringify({task:'causal-lm',vocab_size:7,max_context:32});
+    if(name==='zipp_model_describe')return JSON.stringify({task:'causal-lm',checkpoint_format:'zipp.bigram-v1',tokenizer_formats:['character-v1'],vocab_size:7,max_context:32});
     if(name==='zipp_model_encode')return JSON.stringify(tokensFor(args[0]));
     if(name==='zipp_model_decode')return JSON.parse(args[0]).map(t=>t===3?'a':'b').join('');
     if(name==='zipp_model_graph')return JSON.stringify({version:1,graph:{version:2,nodes:[{id:0,op:'input',shape:[1,7]}],outputs:[{name:'logits',id:0}]},bindings:[{node:0,kind:'rows',tensor:'transition_logits',indices:[JSON.parse(args[1]).at(-1)]}]});
@@ -42,4 +42,18 @@ test('bad output shape fails closed',async()=>{const {session}=await fixture({ex
 test('non-finite model output fails closed',async()=>{const {session}=await fixture({execute:async()=>({outputs:{logits:{shape:[1,7],data:Float32Array.from([NaN,0,0,0,0,0,0])}}})});await assert.rejects(session.infer([0]),/Non-finite/);session.dispose();});
 test('out-of-range token IDs and context are rejected',async()=>{const {session}=await fixture();for(const ids of [[],[7],[-1],Array(33).fill(0)])await assert.rejects(session.infer(ids));session.dispose();});
 test('dispose is idempotent; future inference refused',async()=>{const {session}=await fixture();session.dispose();session.dispose();await assert.rejects(session.infer([0]),/closed/);});
+// plugin.json is trusted to refuse a model early; the installed source is what
+// decides. A manifest advertising a checkpoint family its Python does not
+// implement must fail at open, not run against weights it cannot read.
+test('installed source that contradicts its manifest cannot open a session',async()=>{
+  class Contradicting extends EngineDouble {
+    pythonCall(name,args){
+      if(name==='zipp_model_describe')return JSON.stringify({task:'causal-lm',checkpoint_format:'hf.gpt-neo-v1',tokenizer_formats:['gpt2-byte-bpe-v1'],vocab_size:7,max_context:32});
+      return super.pythonCall(name,args);
+    }
+  }
+  const engine=new Contradicting();
+  await assert.rejects(fixture({engine}),/disagree about the supported checkpoint format/);
+  assert.ok(engine.disposed,'a refused session must not leave an engine behind');
+});
 test('weight hash mismatch is caught before constructing an engine',async()=>{const entries=await directoryEntries('../examples/bigram/');const bytes=entries.get('weights.safetensors');bytes[bytes.length-1]^=1;let created=false;const plugin=await new PluginRegistry().install(await sourceDirectory('../plugins/bigram/'),{approve:()=>true});await assert.rejects(ModelSession.open({source:new FileMapSource(entries),plugin,engineFactory:()=>{created=true;return new EngineDouble();},runtime:{execute(){}}}),/digest mismatch/);assert.equal(created,false);});

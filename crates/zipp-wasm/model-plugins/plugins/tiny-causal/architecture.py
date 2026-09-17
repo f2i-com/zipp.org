@@ -3,8 +3,18 @@ This custom checkpoint schema is intentionally NOT advertised as GPT-Neo/Llama.
 Graph execution, weight reading and resource policy belong to the host.
 """
 import math
-from .graph import Graph
-from .tokenizer import encode, decode
+# ZIPP's Python frontend has no relative imports: a sibling module is imported
+# by its absolute name under the fixed `zipp_plugin` package the host installs
+# this source into. `tools/cpython_host.py` mirrors that layout for CPython.
+from zipp_plugin.graph import Graph
+from zipp_plugin.tokenizer import encode, decode
+
+# The checkpoint family this source implements, and the tokenizers it can read.
+# `plugin.json` repeats both so a host can refuse a mismatched model before it
+# compiles any Python; `describe` is what proves the source agrees. Neither is a
+# label: another checkpoint family needs its own plugin, not a renamed config.
+CHECKPOINT_FORMAT = "zipp.tiny-causal-v1"
+TOKENIZER_FORMATS = ["character-v1"]
 
 def describe(config):
     required = {"vocab_size", "context_length", "hidden_size", "num_heads", "num_layers", "intermediate_size", "layer_norm_epsilon"}
@@ -19,7 +29,9 @@ def describe(config):
     epsilon = config["layer_norm_epsilon"]
     if not isinstance(epsilon, (int, float)) or not math.isfinite(epsilon) or not 0 < epsilon <= 1:
         raise ValueError("Invalid LayerNorm epsilon")
-    return {"task": "causal-lm", "vocab_size": config["vocab_size"], "max_context": config["context_length"]}
+    return {"task": "causal-lm", "checkpoint_format": CHECKPOINT_FORMAT,
+            "tokenizer_formats": list(TOKENIZER_FORMATS),
+            "vocab_size": config["vocab_size"], "max_context": config["context_length"]}
 
 def build_graph(config, tokens):
     description = describe(config)

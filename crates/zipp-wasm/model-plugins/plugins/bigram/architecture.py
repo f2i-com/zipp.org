@@ -1,8 +1,17 @@
-"""A table-based next-character model: proof the host is not transformer-specific."""
-"""Explicit character tokenizer used only by the bundled demonstration model.
-A different architecture package can supply another implementation of these hooks.
-This is NOT GPT-2 BPE, SentencePiece, or a generic tokenizer.json reader.
+"""A table-based next-character model: proof the host is not transformer-specific.
+
+One file carries the architecture and its tokenizer, so it needs no sibling
+imports. The tokenizer below is the explicit character scheme the bundled
+fixtures use: NOT GPT-2 BPE, SentencePiece, or a generic tokenizer.json reader.
+Another architecture package supplies its own implementation of these hooks.
 """
+# The checkpoint family this source implements, and the tokenizers it can read;
+# `plugin.json` repeats both so a host can refuse a mismatched model before it
+# compiles any Python. A transition table is not a transformer checkpoint, and
+# neither format name is a claim about anyone else's checkpoints.
+CHECKPOINT_FORMAT = "zipp.bigram-v1"
+TOKENIZER_FORMATS = ["character-v1"]
+
 def _validate(config):
     if set(config) != {"type", "vocab", "bos_token_id", "eos_token_id", "unk_token_id"}:
         raise ValueError("Unexpected character tokenizer fields")
@@ -44,7 +53,9 @@ def describe(config):
     for key in ["vocab_size", "context_length"]:
         if type(config[key]) is not int or not 1 <= config[key] <= 512:
             raise ValueError("Invalid bigram configuration")
-    return {"task": "causal-lm", "vocab_size": config["vocab_size"], "max_context": config["context_length"]}
+    return {"task": "causal-lm", "checkpoint_format": CHECKPOINT_FORMAT,
+            "tokenizer_formats": list(TOKENIZER_FORMATS),
+            "vocab_size": config["vocab_size"], "max_context": config["context_length"]}
 
 def build_graph(config, tokens):
     describe(config)

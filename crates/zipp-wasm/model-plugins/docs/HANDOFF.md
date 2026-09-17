@@ -6,6 +6,11 @@ missing engine/backend gates have run against a full checkout.
 
 ## Gate A — actual engine integration, before any feature announcement
 
+**Status: passing in this repository** (see `VALIDATION.md` for versions and error
+bounds). Both gates ran in required mode against the checked-out ZIPP runtime and
+a locally built `dist/all`. Rerun them on every engine or plugin change; a green
+Gate A is engine integration only, and says nothing about Gates B through E.
+
 Build the normal `all` WASM variant. Run:
 
 ```sh
@@ -27,10 +32,19 @@ ZIPP. Neither substitutes for these gates.
 
 ## Gate B — browser and backend acceptance
 
+**Status: partly done.** One Chrome on one Windows machine has run the lab end to
+end on all four backends, and `demo/parity.html` compared complete logit tensors
+against the PyTorch reference on each (`VALIDATION.md` has the numbers). The
+failure, cancellation, memory and device-matrix work below has not run, and no
+browser check is automated: treat the page as evidence a person reproduces, not a
+gate that guards a merge.
+
 Run the demo with the trained fixture on CPU JavaScript, WASM SIMD, WebGL2 and
 WebGPU where available. Capture real backend names, engine/source hashes, browser/
 OS/device, warm/cold timings, peak memory and numerical tolerance. Compare all
-logits, not just plausible generated text. Explicit backend requests must fail
+logits, not just plausible generated text — `demo/parity.html` does exactly that
+for the bundled fixture, on every backend the browser offers, and reports each
+backend's worst absolute error rather than a verdict alone. Explicit backend requests must fail
 visibly when unavailable. The bundled fixture is intentionally tiny and does not
 establish large-model performance or language quality.
 
@@ -43,7 +57,8 @@ catalogue cannot silently replace an installed pinned identity.
 
 ## Gate C — first externally sourced checkpoint
 
-Port GPT-Neo/TinyStories as a **new plugin**, not special cases in ModelSession.
+**This is the next model milestone.** Port GPT-Neo/TinyStories as a **new plugin**,
+not special cases in ModelSession and not a configuration of `tiny-causal`.
 Check real configuration, all state-dict names, tensor orientation, tied versus
 untied embeddings, position embeddings, attention scaling, global/local attention,
 normalization epsilon and activation variant. Implement a GPT-2 byte-BPE tokenizer
@@ -55,6 +70,17 @@ and greedy continuation against the reference implementation. Test direct local
 supply; no runtime internet fetch should be necessary. Do not call the custom toy
 transformer checkpoint-compatible with GPT-Neo merely because both use attention.
 Address larger tokenizer assets and vocabulary/output/memory limits explicitly.
+
+The host already refuses that claim rather than relying on reviewers to catch it:
+`tiny-causal` declares `checkpoint_format: zipp.tiny-causal-v1` with
+`tokenizer_formats: [character-v1]`, and a model naming anything else is rejected
+with `CHECKPOINT` or `TOKENIZER` before an engine is constructed
+(`tests/host.test.mjs`, `tests/test_plugins.py`). The new plugin therefore
+declares its own family — `hf.gpt-neo-v1` with a `gpt2-byte-bpe-v1` tokenizer, or
+whatever names its conversion actually implements — and every converted checkpoint
+names the same family. Widening `tiny-causal`'s declaration to make a foreign
+checkpoint load, rather than shipping the plugin, is the failure this gate exists
+to prevent: the refusal is the honest state until the mapping is verified.
 
 ## Gate D — scale without hiding costs
 
