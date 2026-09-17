@@ -98,6 +98,67 @@ float q6k(int block0, int col, int K, int e) {
   float d = unpackHalf2x16(qhalfBits(base + 208)).x;
   return (d * scale) * float(int(low | (high << 4)) - 32);
 }
+
+// One dot product against a quantized row, reading each block's constants once.
+//
+// A fragment walks the reduced axis in order, so 256 consecutive weights share
+// a block and 32 or 16 share a sub-block scale. Reading those per weight cost
+// about eight texture fetches each and made a quantized product two and a half
+// times a float32 one; reading them when they change costs closer to one.
+//
+// The arithmetic is untouched: the scale is still folded into d before it
+// meets a quant, in that order, so this still equals the same product over
+// decoded values exactly.
+float q4kDot(int ab, int block0, int col, int K, int k0, int k1) {
+  int per = K / 256;
+  int heldBlock = -1; int heldSub = -1; int base = 0;
+  float d = 0.0; float dmin = 0.0; float scale = 0.0; float minimum = 0.0;
+  float total = 0.0;
+  for (int k = k0; k < k1; k++) {
+    int index = block0 + col * per + k / 256;
+    if (index != heldBlock) {
+      base = index * 144; heldBlock = index; heldSub = -1;
+      d = unpackHalf2x16(qhalfBits(base)).x;
+      dmin = unpackHalf2x16(qhalfBits(base + 2)).x;
+    }
+    int within = k % 256; int pair = within / 64; int rem = within % 64;
+    int j = pair * 2 + (rem < 32 ? 0 : 1);
+    if (j != heldSub) {
+      heldSub = j;
+      vec2 sm = q4kScaleMin(base, j);
+      scale = d * sm.x; minimum = dmin * sm.y;
+    }
+    uint byte = qbyte(base + 16 + pair * 32 + rem % 32);
+    uint nibble = rem < 32 ? (byte & 15u) : (byte >> 4);
+    total += A(ab + k) * (scale * float(nibble) - minimum);
+  }
+  return total;
+}
+float q6kDot(int ab, int block0, int col, int K, int k0, int k1) {
+  int per = K / 256;
+  int heldBlock = -1; int heldScale = -1; int base = 0;
+  float d = 0.0; float scale = 0.0;
+  float total = 0.0;
+  for (int k = k0; k < k1; k++) {
+    int index = block0 + col * per + k / 256;
+    if (index != heldBlock) {
+      base = index * 210; heldBlock = index; heldScale = -1;
+      d = unpackHalf2x16(qhalfBits(base + 208)).x;
+    }
+    int within = k % 256; int hf = within / 128; int rem = within % 128;
+    int sub = rem / 32; int l = rem % 32;
+    int at = 192 + 8 * hf + l / 16 + 2 * sub;
+    if (at != heldScale) {
+      heldScale = at;
+      scale = d * float(int(qbyte(base + at) << 24) >> 24);
+    }
+    uint ql = qbyte(base + 64 * hf + l + 32 * (sub & 1));
+    uint low = sub < 2 ? (ql & 15u) : (ql >> 4);
+    uint high = (qbyte(base + 128 + 32 * hf + l) >> uint(2 * sub)) & 3u;
+    total += A(ab + k) * (scale * float(int(low | (high << 4)) - 32));
+  }
+  return total;
+}
 `;
 const KERNELS = {
   fill: [[], each('value = f.x;')],
@@ -152,12 +213,10 @@ const KERNELS = {
   // the 1024 they expand to.
   matmul_q4k: [['A', 'B:u32'], QUANT_GLSL + each(`int M = g.x; int K = g.y; int N = g.z;
   int batch = i / (M * N); int rc = i - batch * M * N; int row = rc / N; int col = rc - row * N;
-  int ab = batch * sa.x + row * K; int block0 = (batch * sa.y) / 256;
-  for (int k = 0; k < K; k++) value += A(ab + k) * q4k(block0, col, K, k);`)],
+  value = q4kDot(batch * sa.x + row * K, (batch * sa.y) / 256, col, K, 0, K);`)],
   matmul_q6k: [['A', 'B:u32'], QUANT_GLSL + each(`int M = g.x; int K = g.y; int N = g.z;
   int batch = i / (M * N); int rc = i - batch * M * N; int row = rc / N; int col = rc - row * N;
-  int ab = batch * sa.x + row * K; int block0 = (batch * sa.y) / 256;
-  for (int k = 0; k < K; k++) value += A(ab + k) * q6k(block0, col, K, k);`)],
+  value = q6kDot(batch * sa.x + row * K, (batch * sa.y) / 256, col, K, 0, K);`)],
   // Split along the reduced axis, then sum the parts.
   //
   // A fragment shader runs one invocation per output element, and a decode step
@@ -189,15 +248,13 @@ const KERNELS = {
   int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
   int k0 = part * chunk; int k1 = min(K, k0 + chunk);
   int ab = batch * sa.x + row * K;
-  int block0 = (batch * sa.y) / 256;
-  for (int k = k0; k < k1; k++) value += A(ab + k) * q4k(block0, col, K, k);`)],
+  value = q4kDot(ab, (batch * sa.y) / 256, col, K, k0, k1);`)],
   matmul_q6k_split: [['A', 'B:u32'], QUANT_GLSL + each(`int M = g.x; int K = g.y; int N = g.z; int chunk = sa.w;
   int perPart = nO / max(sa.z, 1); int part = i / perPart; int rest = i - part * perPart;
   int batch = rest / (M * N); int rc = rest - batch * M * N; int row = rc / N; int col = rc - row * N;
   int k0 = part * chunk; int k1 = min(K, k0 + chunk);
   int ab = batch * sa.x + row * K;
-  int block0 = (batch * sa.y) / 256;
-  for (int k = k0; k < k1; k++) value += A(ab + k) * q6k(block0, col, K, k);`)],
+  value = q6kDot(ab, (batch * sa.y) / 256, col, K, k0, k1);`)],
   optim: [['A', 'B', 'C'], each(`float a = A(i); float b = B(i);
   if (op == 0) value = a - f.x * b;
   else if (op == 1) value = f.x * a + f.y * b;

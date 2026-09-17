@@ -57,6 +57,58 @@ const BASE = `${ORIGIN}/crates/zipp-wasm/gpu-lab/`;
         r.logitsMatmulMs = (performance.now() - t1) / 3;
         session.dispose();
 
+        // 1b. The same product with the weight already float32, to separate
+        //     decoding from multiplying, and a decode-sized one to see whether
+        //     the answer changes when there are few outputs.
+        // 4096 rows is the largest float32 the protocol admits (a quantized one is
+        // bounded by its bytes instead), so that is the wide case here.
+        for (const [label, rows, cols] of [['big', 4096, 1024], ['layer', 2048, 1024]]) {
+          const q = blocks((rows * cols) / 256, 'q4_k');
+          const f = new Float32Array(rows * cols);
+          for (let i = 0; i < f.length; i++) f[i] = ((i % 97) / 97) - 0.5;
+          const x = new Float32Array(cols).fill(0.01);
+          const build = (b, dtype) => ({version: 2, nodes: [
+            {id: 0, op: 'input', shape: [1, cols], data: x},
+            dtype ? {id: 1, op: 'input', shape: [rows, cols], dtype, data: b}
+                  : {id: 1, op: 'input', shape: [rows, cols], data: b},
+            {id: 2, op: 'matmul', a: 0, b: 1, transposed: true},
+          ], outputs: [{name: 'out', id: 2}]});
+          for (const [suffix, program] of [['Q4K', build(q, 'q4_k')], ['f32', build(f)]]) {
+            const s2 = await runtime.prepare(program);
+            await s2.run([{inputs: {0: x}}], {readback: ['out']});
+            const t = performance.now();
+            for (let i = 0; i < 5; i++) await s2.run([{inputs: {0: x}}], {readback: ['out']});
+            r[`${label}${suffix}Ms`] = (performance.now() - t) / 5;
+            s2.dispose();
+          }
+        }
+
+        // 1c. Enough work in one dispatch to escape the round trip: 64 rows
+        //     against a 4096 by 1024 weight is 268 million multiply-adds, the
+        //     same order as a whole decode step, in one operation. This is the
+        //     only place the decode's real cost shows.
+        {
+          const [rows, cols, m] = [4096, 1024, 64];
+          const q = blocks((rows * cols) / 256, 'q4_k');
+          const f = new Float32Array(rows * cols);
+          for (let i = 0; i < f.length; i++) f[i] = ((i % 97) / 97) - 0.5;
+          const x = new Float32Array(m * cols).fill(0.01);
+          const build = (b, dtype) => ({version: 2, nodes: [
+            {id: 0, op: 'input', shape: [m, cols], data: x},
+            dtype ? {id: 1, op: 'input', shape: [rows, cols], dtype, data: b}
+                  : {id: 1, op: 'input', shape: [rows, cols], data: b},
+            {id: 2, op: 'matmul', a: 0, b: 1, transposed: true},
+          ], outputs: [{name: 'out', id: 2}]});
+          for (const [suffix, program] of [['Q4K', build(q, 'q4_k')], ['f32', build(f)]]) {
+            const s3 = await runtime.prepare(program);
+            await s3.run([{inputs: {0: x}}], {readback: ['out']});
+            const t = performance.now();
+            for (let i = 0; i < 5; i++) await s3.run([{inputs: {0: x}}], {readback: ['out']});
+            r[`bulk${suffix}Ms`] = (performance.now() - t) / 5;
+            s3.dispose();
+          }
+        }
+
         // 2. Dispatch cost: 2,800 tiny nodes that compute almost nothing.
         const nodes = [{id: 0, op: 'input', shape: [64], data: new Float32Array(64).fill(1)}];
         for (let i = 1; i < 2800; i++) nodes.push({id: i, op: 'add', a: i - 1, b: 0});
@@ -76,8 +128,15 @@ const BASE = `${ORIGIN}/crates/zipp-wasm/gpu-lab/`;
 
   for (const [name, r] of Object.entries(out)) {
     if (r.status !== 'ran') { console.log(`  ${name.padEnd(8)} ${r.status}: ${r.why}`); continue; }
-    console.log(`  ${name.padEnd(8)} one 155M-weight Q6_K matmul: ${r.logitsMatmulMs.toFixed(1).padStart(7)} ms` +
-                `   2,800 trivial nodes: ${r.dispatch2800Ms.toFixed(1).padStart(7)} ms`);
+    console.log(`  ${name}`);
+    console.log(`     155M Q6_K matmul ${r.logitsMatmulMs.toFixed(2).padStart(7)} ms` +
+                `   2,800 trivial nodes ${r.dispatch2800Ms.toFixed(2).padStart(7)} ms`);
+    console.log(`     [1,1024]@[4096,1024]  Q4_K ${r.bigQ4KMs.toFixed(2).padStart(7)} ms   f32 ${r.bigf32Ms.toFixed(2).padStart(7)} ms` +
+                `   decode costs ${((r.bigQ4KMs / r.bigf32Ms - 1) * 100).toFixed(0)}%`);
+    console.log(`     [1,1024]@[2048,1024]  Q4_K ${r.layerQ4KMs.toFixed(2).padStart(7)} ms   f32 ${r.layerf32Ms.toFixed(2).padStart(7)} ms` +
+                `   decode costs ${((r.layerQ4KMs / r.layerf32Ms - 1) * 100).toFixed(0)}%`);
+    console.log(`     [64,1024]@[4096,1024]  Q4_K ${r.bulkQ4KMs.toFixed(2).padStart(7)} ms   f32 ${r.bulkf32Ms.toFixed(2).padStart(7)} ms` +
+                `   decode costs ${((r.bulkQ4KMs / r.bulkf32Ms - 1) * 100).toFixed(0)}%   <- 268M MACs, past the round trip`);
   }
   await browser.close();
 })();

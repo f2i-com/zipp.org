@@ -100,17 +100,33 @@ const BASE = `${ORIGIN}/crates/zipp-wasm/gpu-lab/`;
     };
 
     await session.run([{inputs}], {readback: ['logits']});  // warm
+    // Three numbers that apportion a step: the whole thing, the same without
+    // reading 151,936 logits back, and how many dispatches it actually issues
+    // -- a reshape is an alias and issues none.
+    const time = async options => {
+      const started = performance.now();
+      for (let i = 0; i < 3; i++) await session.run([{inputs}], options);
+      return (performance.now() - started) / 3;
+    };
+    const withReadback = await time({readback: ['logits']});
+    const withoutReadback = await time({readback: []});
     spent.clear(); counts.clear(); bytes.clear();
     const t0 = performance.now();
     await session.run([{inputs}], {readback: ['logits']});
     const total = performance.now() - t0;
     session.dispose(); runtime.dispose();
-    return {total, rows: [...spent.entries()].sort((a, b) => b[1] - a[1])
-      .map(([op, ms]) => ({op, ms, calls: counts.get(op), elements: bytes.get(op)}))};
+    return {total, withReadback, withoutReadback,
+      dispatches: [...counts.values()].reduce((a, b) => a + b, 0),
+      rows: [...spent.entries()].sort((a, b) => b[1] - a[1])
+        .map(([op, ms]) => ({op, ms, calls: counts.get(op), elements: bytes.get(op)}))};
   }, {base: BASE, backend});
 
   if (out.error) { console.log('  ' + out.error); await browser.close(); return; }
-  console.log(`  ${backend}: one token in ${out.total.toFixed(1)} ms\n`);
+  console.log(`  ${backend}: ${out.withReadback.toFixed(1)} ms a token, ` +
+    `${out.withoutReadback.toFixed(1)} ms without reading the logits back, ` +
+    `${out.dispatches} dispatches`);
+  console.log(`  (the attribution below carries the cost of measuring it: ` +
+    `${out.total.toFixed(1)} ms instrumented)\n`);
   let acc = 0;
   for (const r of out.rows) {
     acc += r.ms;
