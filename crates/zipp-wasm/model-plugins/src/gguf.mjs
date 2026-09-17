@@ -59,8 +59,13 @@ async function readHeader(source, path, wasm, limits) {
 export async function openGGUF(source, path, wasm, overrides = {}) {
   const limits = resolveLimits(overrides);
   safePath(path);
-  check(wasm && typeof wasm.GgufHeader === 'function' && typeof wasm.dequantize === 'function',
-    'HOST', 'Supply the GGUF WebAssembly module (GgufHeader and dequantize)');
+  // The module comes from another repository and is coupled to this one by the
+  // shape of what it returns, not by a version. Every field it reports is
+  // checked below, so a changed shape fails by name rather than by producing
+  // tensors that are quietly wrong.
+  check(wasm && typeof wasm.GgufHeader === 'function' && typeof wasm.dequantize === 'function'
+    && typeof wasm.supported_dtypes === 'function',
+    'HOST', 'Supply the GGUF WebAssembly module (GgufHeader, dequantize, supported_dtypes)');
   const size = source.size(path);
   const {header, read} = await readHeader(source, path, wasm, limits);
   const listed = parseJSON(header.tensors(), {maxChars: limits.maxHeaderBytes});
