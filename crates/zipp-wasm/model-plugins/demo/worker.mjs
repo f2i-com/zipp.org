@@ -44,6 +44,9 @@ const GGUF_COMPUTE={maxNodes:8192,maxElements:4194304,maxInputElements:200_000_0
 // Which architecture this lab has a plugin for. A checkpoint naming anything
 // else is refused by name rather than run with the wrong arithmetic.
 const GGUF_PLUGINS={qwen3:{id:'org.zipp.qwen3',manifest:'plugins/qwen3/plugin.json'}};
+// How far back a repetition penalty looks. llama.cpp's default, and long
+// enough to catch a repeating phrase without penalising ordinary grammar.
+const REPETITION_WINDOW=64;
 
 async function runGguf(data){
   // The GGUF reader is a separate WebAssembly module and an optional one.
@@ -118,10 +121,14 @@ async function runGguf(data){
       timings.push(performance.now()-began);
       const logits=out.outputs.logits.data;
       if(position+1<prompt.length){token=prompt[position+1];continue;}
-      // Greedy decoding on a 0.6B model repeats a phrase forever; a little
-      // temperature with top-k is what stops that, and it is the model's
-      // quality being sampled rather than anything about the backend.
-      const next=sampleLogits(logits,{temperature:data.temperature??0,topK:data.topK??0});
+      // Greedy decoding on a 0.6B model repeats a phrase forever; the tail cut
+      // off and a penalty on what has just been said is what stops that, and
+      // it is the model's quality being sampled rather than anything about the
+      // backend. The window is the last 64 tokens, as llama.cpp defaults to.
+      const next=sampleLogits(logits,{
+        temperature:data.temperature??0,topK:data.topK??0,topP:data.topP??1,
+        repetitionPenalty:data.repetitionPenalty??1,
+        recent:[...prompt,...generated].slice(-REPETITION_WINDOW)});
       if(next===tokenizer.eos)break;
       generated.push(next);
       token=next;

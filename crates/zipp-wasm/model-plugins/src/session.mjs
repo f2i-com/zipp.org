@@ -133,20 +133,74 @@ export function seededRandom(seed = 1) {
   integer(seed, 0, 0xffffffff, 'Sampling seed'); let state = seed >>> 0;
   return () => { state = (Math.imul(state, 1664525) + 1013904223) >>> 0; return state / 4294967296; };
 }
-export function sampleLogits(logits, {temperature = 0, topK = 0, random = Math.random} = {}) {
+/**
+ * One token from a row of logits.
+ *
+ * Four controls, applied in the order llama.cpp applies them, because the order
+ * changes the answer: a repetition penalty, then top-k, then top-p, then
+ * temperature. Every default is inert -- no penalty, no truncation, greedy --
+ * so a caller that asks for nothing gets the most likely token, which is what
+ * an oracle comparison wants.
+ *
+ * `recent` is the token ids to penalise, usually the tail of what has been
+ * produced so far. The penalty is the CTRL form: divide a positive logit,
+ * multiply a negative one, so a token already used has to be *more* likely
+ * than before to be chosen again. It applies to greedy decoding too, which is
+ * the case that needs it most -- taking the most likely token every time is
+ * exactly how a small model ends up saying "yes, again, again, again".
+ */
+export function sampleLogits(logits, {temperature = 0, topK = 0, topP = 1,
+    repetitionPenalty = 1, recent = null, random = Math.random} = {}) {
   check(logits.length > 0, 'SHAPE', 'Empty logits');
   check(Number.isFinite(temperature) && temperature >= 0 && temperature <= 100, 'SAMPLING', 'Invalid temperature');
+  check(Number.isFinite(topP) && topP > 0 && topP <= 1, 'SAMPLING', 'top-p is above zero and at most one');
+  check(Number.isFinite(repetitionPenalty) && repetitionPenalty >= 1 && repetitionPenalty <= 4,
+    'SAMPLING', 'A repetition penalty is between one and four');
   integer(topK, 0, logits.length, 'topK');
+  for (let i = 0; i < logits.length; i++) check(Number.isFinite(logits[i]), 'NUMBER', 'Non-finite logits');
+
+  // Penalise what has already been said. The caller's array is never touched.
+  let scores = logits;
+  if (repetitionPenalty !== 1 && recent && recent.length) {
+    scores = Float32Array.from(logits);
+    const seen = new Set();
+    for (const id of recent) {
+      integer(id, 0, logits.length - 1, 'Recent token id');
+      if (seen.has(id)) continue;
+      seen.add(id);
+      scores[id] = scores[id] > 0 ? scores[id] / repetitionPenalty : scores[id] * repetitionPenalty;
+    }
+  }
+
   let best = 0;
-  for (let i = 0; i < logits.length; i++) { check(Number.isFinite(logits[i]), 'NUMBER', 'Non-finite logits'); if (logits[i] > logits[best]) best = i; }
+  for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
   if (temperature === 0) return best;
-  let indices = Array.from({length: logits.length}, (_, i) => i);
-  if (topK > 0 && topK < logits.length) indices = indices.sort((a, b) => logits[b] - logits[a] || a - b).slice(0, topK);
+
+  let indices = Array.from({length: scores.length}, (_, i) => i);
+  if (topK > 0 && topK < scores.length) indices = indices.sort((a, b) => scores[b] - scores[a] || a - b).slice(0, topK);
   // Subtract before dividing: even a tiny positive temperature cannot overflow
   // the maximum logit to +Infinity. Negative differences may underflow to -Inf.
-  const probs = indices.map(i => Math.exp((logits[i] - logits[best]) / temperature));
+  let probs = indices.map(i => Math.exp((scores[i] - scores[best]) / temperature));
+
+  if (topP < 1) {
+    // The smallest set of most likely tokens whose probability reaches topP.
+    // Sorted here even when top-k did not, because a prefix of an unsorted
+    // list is not a nucleus.
+    const order = indices.map((id, at) => at).sort((a, b) => probs[b] - probs[a] || indices[a] - indices[b]);
+    const total = probs.reduce((a, b) => a + b, 0);
+    const keptIndices = [], keptProbs = [];
+    let cumulative = 0;
+    for (const at of order) {
+      keptIndices.push(indices[at]); keptProbs.push(probs[at]);
+      cumulative += probs[at] / total;
+      if (cumulative >= topP) break;
+    }
+    indices = keptIndices; probs = keptProbs;
+  }
+
   const sum = probs.reduce((a, b) => a + b, 0), r = random();
-  check(Number.isFinite(r) && r >= 0 && r < 1, 'SAMPLING', 'Random source must return [0,1)'); let pick = r * sum;
+  check(Number.isFinite(r) && r >= 0 && r < 1, 'SAMPLING', 'Random source must return [0,1)');
+  let pick = r * sum;
   for (let i = 0; i < indices.length; i++) { pick -= probs[i]; if (pick < 0) return indices[i]; }
   return indices[indices.length - 1];
 }

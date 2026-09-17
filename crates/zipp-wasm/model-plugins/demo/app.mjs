@@ -51,8 +51,12 @@ $('run').addEventListener('click',()=>{
       payload.ggufFile=file;
       payload.temperature=Number($('temperature').value);
       payload.topK=Number($('topk').value);
+      payload.topP=Number($('topp').value);
+      payload.repetitionPenalty=Number($('penalty').value);
       if(!Number.isFinite(payload.temperature)||payload.temperature<0||payload.temperature>2)throw Error('Use a temperature between 0 and 2.');
       if(!Number.isInteger(payload.topK)||payload.topK<0||payload.topK>200)throw Error('Use a top-k between 0 and 200.');
+      if(!Number.isFinite(payload.topP)||payload.topP<=0||payload.topP>1)throw Error('Use a top-p above 0 and at most 1.');
+      if(!Number.isFinite(payload.repetitionPenalty)||payload.repetitionPenalty<1||payload.repetitionPenalty>2)throw Error('Use a repetition penalty between 1 and 2.');
     }
     if(selection==='local')payload.pluginEntries=entries($('plugin'));
     if(['local','catalogue-local','hf-checkpoint'].includes(selection))payload.modelEntries=entries($('model'));

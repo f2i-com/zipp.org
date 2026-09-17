@@ -38,8 +38,16 @@
         <div><label for="topk">Top-k</label>
           <input id="topk" type="number" min="0" max="200" value="40"></div>
       </div>
-      <p class="hint">Temperature 0 is greedy: it always takes the most likely token, which on a small
-      model falls into repeating a phrase. A little temperature with top-k is what stops that.</p>
+      <div class="columns">
+        <div><label for="topp">Top-p</label>
+          <input id="topp" type="number" min="0.05" max="1" step="0.05" value="0.95"></div>
+        <div><label for="penalty">Repetition penalty</label>
+          <input id="penalty" type="number" min="1" max="2" step="0.05" value="1.1"></div>
+      </div>
+      <p class="hint">Temperature 0 is greedy: it takes the most likely token every time, which is how a
+      small model ends up saying &ldquo;yes, again, again, again&rdquo;. Top-k and top-p cut the tail off the
+      distribution; the repetition penalty makes a token that has already been used need to be
+      <em>more</em> likely than before to be chosen again. 1 turns it off.</p>
       <p class="hint">A GGUF file describes itself, so no conversion and no <code>config.json</code>: the architecture,
       the hyperparameters and the tokenizer all come out of the file. Quantized weights stay in the file's own block
       format on the device &mdash; a 0.6B Qwen3 holds at about 373 MB where float32 would need 2,274 MB. The file is
