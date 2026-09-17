@@ -1,0 +1,17 @@
+[package]
+name = "zipp-model-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGUF reading and block dequantization for the browser, through wasm-bindgen."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zipp-gguf.workspace = true
+zipp-quants.workspace = true
+zipp-tokenizer.workspace = true
+# Pinned exactly, and to the same version crates/zipp-wasm pins: the generated
+# bindings must match the wasm-bindgen CLI that post-processes them.
+wasm-bindgen = "=0.2.126"

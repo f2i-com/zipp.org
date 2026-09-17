@@ -1,0 +1,26 @@
+# Rust that compiles to WebAssembly for the browser side of ZIPP.
+#
+# Vendored from the `llm` repository (a private Rust reimplementation of
+# llama.cpp) at commit e1b9d48, refactored to build without `std` so the same
+# code serves both a `wasm-bindgen` module and a freestanding SIMD kernel
+# module with no allocator. See README.md for what was changed and why.
+[workspace]
+resolver = "2"
+members = ["zipp-quants", "zipp-gguf", "zipp-tokenizer", "zipp-kernels", "zipp-model-wasm"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+zipp-quants = { path = "zipp-quants" }
+zipp-gguf   = { path = "zipp-gguf" }
+zipp-tokenizer = { path = "zipp-tokenizer" }
+half        = { version = "2.4", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

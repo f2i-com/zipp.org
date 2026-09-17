@@ -1,6 +1,11 @@
 /target
 crates/zipp-wasm/target/
 crates/zipp-sandbox/target/
+# crates/zipp-wasm/rust is its own workspace (no_std crates with their own
+# profile), so it has its own target directory. Its two build *outputs* --
+# gpu-lab/wasm/kernels.wasm and model-plugins/wasm/ -- are committed; the
+# intermediates are not.
+crates/zipp-wasm/rust/target/
 **/*.rs.bk
 # Cargo.lock is committed — Zipp ships the `zipp` CLI, so a
 # locked dependency set keeps builds reproducible.
@@ -40,3 +45,8 @@ target-soft/
 
 # Browser package built by `wasm-bindgen --target web` (see crates/zipp-wasm/README.md).
 crates/zipp-wasm/pkg/
+
+# Playwright, installed on demand (`npm install --no-save playwright`) for
+# playground/smoke.cjs and gpu-lab/scripts/check-gpu-matmul.cjs. Left untracked
+# it blocks the clean-checkout rule above, the same way dist/ did.
+crates/zipp-wasm/node_modules/

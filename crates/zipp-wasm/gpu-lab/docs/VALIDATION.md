@@ -154,7 +154,7 @@ correctly-rounded), and `exp` reaches 1.22e-04 where the largest value is 397,
 which is **four ulp** of the GPU `exp` intrinsic against `Math.fround(Math.exp(x))`.
 The WASM kernels are bit-identical to the JavaScript reference on every exact
 operation; their only non-zero row, cross-entropy, is the double-precision `log`
-implemented in `kernels.c` differing from V8's by under one ulp. The acceptance
+implemented in `../rust/zipp-kernels` differing from V8's by under one ulp. The acceptance
 tolerance is `2e-4 + 2e-4·|expected|`.
 
 One MNIST-scale training step — 784-256-10 MLP, batch 64, ReLU, mean

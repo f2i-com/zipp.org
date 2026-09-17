@@ -111,15 +111,18 @@ callback that resubmits cannot recurse), and rejects work after tenant invalidat
   declare `dtype: 'q4_k'` and carry blocks instead of values; a `matmul` with
   `transposed: true` reads them as it goes. The weight stays 144 bytes per 256
   values on the device — 7.1 times smaller — and the result is bit for bit what
-  the same matmul over decoded values gives, because decoding is exact. Only the
-  JavaScript reference backend reads them so far; the other three expand as
-  before.
-- `wasm/kernels.c`, `wasm/kernels.wasm`: freestanding C kernels and the
-  COMMITTED binary. No workflow rebuilds it: `npm test`, the Node GPU suites
-  and the `javascript-python` release archive all load this exact blob, and
-  nothing compares it against `kernels.c`. Rebuild with `scripts/build_wasm.sh`
-  (Clang targeting wasm32 plus wasm-ld) and review the C change and the new
-  binary together.
+  the same matmul over decoded values gives, because decoding is exact. All four
+  backends do this; each has its own decoder, and each is held to that equality.
+  `scripts/check-gpu-matmul.cjs` measures the two GPU ones in a real browser.
+- `wasm/kernels.wasm`: the COMMITTED binary of the freestanding kernels, built
+  from `../rust/zipp-kernels` (`no_std` Rust, SIMD, no allocator, no imports).
+  No workflow rebuilds it: `npm test`, the Node GPU suites and the
+  `javascript-python` release archive all load this exact blob, and nothing
+  compares it against its source. Rebuild with `scripts/build_wasm.sh` — cargo
+  alone, no separate link step — and review the source change and the new binary
+  together. `backend-bits.test.mjs` is what makes that reviewable: it holds the
+  compiled module to bit-for-bit equality with the JavaScript reference over
+  whole training steps.
 - `tests/`: numerical checks, allocation/lifecycle mocks and browser cases; `tests/ml-cases.mjs`
   holds the per-operation fixtures and the MLP training-step generator shared with the browser.
 - `docs/INTEGRATION.md`, `docs/ARCHITECTURE.md`, `docs/VALIDATION.md`: contracts and evidence.

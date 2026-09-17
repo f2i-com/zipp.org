@@ -1,0 +1,12 @@
+[package]
+name = "zipp-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freestanding float32 Graph v2 kernels for WebAssembly (SIMD), without std."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zipp-quants.workspace = true

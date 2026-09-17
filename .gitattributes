@@ -20,3 +20,10 @@ landing/public/wasm/** -text
 # bundled fixture refuse to load. Keep this tree LF, and the checkpoints exact.
 crates/zipp-wasm/model-plugins/** text eol=lf
 crates/zipp-wasm/model-plugins/**/*.safetensors -text
+
+# Compiled WebAssembly: build output of crates/zipp-wasm/rust, committed the way
+# gpu-lab/wasm/kernels.wasm always has been. A line-ending conversion silently
+# corrupts the module, and the rule above would otherwise claim the ones under
+# model-plugins. The wasm-bindgen .js and .d.ts beside them are text and stay
+# text, so they still diff.
+crates/zipp-wasm/**/*.wasm -text

@@ -1,0 +1,8 @@
+[package]
+name = "zipp-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Byte-level BPE for GGUF vocabularies, without std."
+
+[dependencies]

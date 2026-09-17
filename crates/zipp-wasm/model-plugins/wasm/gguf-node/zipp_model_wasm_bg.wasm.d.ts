@@ -1,0 +1,31 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_ggufheader_free: (a: number, b: number) => void;
+export const __wbg_tokenizer_free: (a: number, b: number) => void;
+export const dequantize: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+export const ggufheader_data_start: (a: number) => number;
+export const ggufheader_metadata: (a: number) => [number, number];
+export const ggufheader_new: (a: number, b: number) => [number, number, number];
+export const ggufheader_numbers: (a: number, b: number, c: number) => [number, number, number, number];
+export const ggufheader_row_range: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+export const ggufheader_strings: (a: number, b: number, c: number) => [number, number, number, number];
+export const ggufheader_tensors: (a: number) => [number, number];
+export const ggufheader_tokenizer: (a: number) => [number, number, number];
+export const ggufheader_version: (a: number) => number;
+export const supported_dtypes: () => [number, number];
+export const tokenizer_bos: (a: number) => number;
+export const tokenizer_decode: (a: number, b: number, c: number) => [number, number];
+export const tokenizer_encode: (a: number, b: number, c: number) => [number, number, number, number];
+export const tokenizer_eos: (a: number) => number;
+export const tokenizer_id_of: (a: number, b: number, c: number) => number;
+export const tokenizer_pre: (a: number) => [number, number];
+export const tokenizer_token: (a: number, b: number) => [number, number];
+export const tokenizer_vocab_size: (a: number) => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __externref_table_dealloc: (a: number) => void;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
+export const __externref_drop_slice: (a: number, b: number) => void;
+export const __wbindgen_start: () => void;

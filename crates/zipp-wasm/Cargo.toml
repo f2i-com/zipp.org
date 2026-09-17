@@ -7,8 +7,14 @@ description = "WebAssembly embedding of the zipp JavaScript engine: a persistent
 
 # Keep this package in a separate feature-resolution domain from the native
 # workspace. See the root workspace's `exclude` rationale.
+#
+# `rust/` is excluded for the same reason once more. Those crates are `no_std`
+# with `panic = "abort"` and their own profile; unifying features between a
+# freestanding SIMD kernel module and the engine embedding would mean neither
+# gets the settings it was measured with.
 [workspace]
 resolver = "2"
+exclude = ["rust"]
 
 [profile.release]
 # Integer-wrap bugs in VM bookkeeping should terminate the disposable Worker,
