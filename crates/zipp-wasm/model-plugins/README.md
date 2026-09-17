@@ -236,6 +236,22 @@ prepare a plan, and falls back to recomputing otherwise. The eager path is
 unchanged, is what `infer` uses, and the checkout gate requires both to produce
 the same tokens: a cache that is subtly wrong still reads like English.
 
+## Two ways to define a model
+
+A plugin emits Graph v2 nodes the host validates, binds and submits; weights
+never enter Python and the compute runs on any backend, including the GPU. That
+is what everything above does.
+
+A model can also just be *ordinary torch code*. `interop/` holds a
+`transformers`-shaped shim — the names a modelling file imports, 21 small
+modules — and with it `modeling_qwen3.py`, `modeling_qwen2.py`,
+`modeling_llama.py` and `modeling_mistral.py` run **exactly as published**,
+within 2e-07 of transformers. A new architecture becomes a file you copy.
+
+The trade is real: that path holds tensors in the guest and runs on the engine's
+CPU kernels, where the plugin path keeps weights outside Python and reaches the
+GPU. See [architecture §4c](docs/ARCHITECTURE.md) and [interop/](interop/README.md).
+
 ## Next model milestone
 
 The next model milestone is a **separate** plugin for each further checkpoint

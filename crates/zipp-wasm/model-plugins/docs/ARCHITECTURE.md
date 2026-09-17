@@ -261,6 +261,14 @@ in ordinary torch idiom instead. `tests/torch-subset.test.mjs` runs a real
 attention and SwiGLU, in the form a modelling file would contain — and it
 matches PyTorch to 2.4e-07 inside the engine.
 
+It goes further than idiom. `../interop/` holds a small `transformers`-shaped
+shim — the names a modelling file imports, not the package — and with it,
+`modeling_qwen3.py`, `modeling_qwen2.py`, `modeling_llama.py` and
+`modeling_mistral.py` run **byte for byte as published**, within 2e-07 of
+transformers (`tests/transformers-shim.test.mjs`, which hashes each file so
+"unmodified" is checked). A published model definition can be copied rather
+than ported.
+
 To be exact about what that does and does not mean: the `transformers`
 **package** does not run here. It needs numpy, PyTorch and Rust extensions for
 tokenizers and safetensors, plus an installer to fetch them, and this VM has no
