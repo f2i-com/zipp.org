@@ -41,8 +41,18 @@ export async function bindGraph(template, weights, limits) {
   for (const [id, b] of byNode) {
     const node = nodes[id]; check(node.op === 'input', 'FORMAT', 'Binding target must be an input');
     if (b.kind === 'tensor') {
-      fields(b, ['node', 'kind', 'tensor'], ['node', 'kind', 'tensor']);
-      check(sameShape(weights.info(b.tensor).shape, node.shape), 'SHAPE', `Weight shape mismatch: ${b.tensor}`);
+      fields(b, ['node', 'kind', 'tensor', 'transpose'], ['node', 'kind', 'tensor']);
+      const shape = weights.info(b.tensor).shape;
+      // A checkpoint stores a linear layer as [out, in]; this graph protocol
+      // multiplies [tokens, in] by [in, out]. Transposing on the way in lets a
+      // plugin read the checkpoint's own tensors instead of requiring a
+      // rewritten copy on disk. It is a relabelling of a matrix, not a licence
+      // to reinterpret a tensor: rank two only, and the shape must still match.
+      if (Object.hasOwn(b, 'transpose')) {
+        check(b.transpose === true, 'FORMAT', 'transpose is true when present');
+        check(shape.length === 2, 'SHAPE', `Only a matrix can be transposed: ${b.tensor}`);
+      }
+      check(sameShape(b.transpose ? [shape[1], shape[0]] : shape, node.shape), 'SHAPE', `Weight shape mismatch: ${b.tensor}`);
     } else if (b.kind === 'rows') {
       fields(b, ['node', 'kind', 'tensor', 'indices'], ['node', 'kind', 'tensor', 'indices']);
       const info = weights.info(b.tensor);
@@ -58,7 +68,18 @@ export async function bindGraph(template, weights, limits) {
     } else check(false, 'FORMAT', 'Unknown model asset binding');
   }
   for (const [id, b] of byNode) {
-    if (b.kind === 'tensor') nodes[id].data = await weights.tensor(b.tensor);
+    if (b.kind === 'tensor') {
+      const data = await weights.tensor(b.tensor);
+      if (!b.transpose) nodes[id].data = data;
+      else {
+        // A fresh array: the store's copy is shared with every other binding.
+        const [rows, columns] = weights.info(b.tensor).shape, out = new Float32Array(data.length);
+        for (let row = 0; row < rows; row++) {
+          for (let column = 0; column < columns; column++) out[column * rows + row] = data[row * columns + column];
+        }
+        nodes[id].data = out;
+      }
+    }
     else if (b.kind === 'rows') {
       const info = weights.info(b.tensor), data = await weights.tensor(b.tensor), width = info.shape[1];
       const rows = new Float32Array(b.indices.length * width);

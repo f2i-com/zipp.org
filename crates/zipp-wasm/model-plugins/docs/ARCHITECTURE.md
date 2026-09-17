@@ -100,6 +100,25 @@ examples. Required fields are `format: zipp.local-model`, `version: 1`,
 `architecture: {id, version, sha256}`, `checkpoint_format`, `config`,
 `tokenizer` (including its `type`), and `weights`.
 
+A tokenizer whose tables do not fit a manifest declares assets instead:
+
+```json
+"tokenizer": {"type": "gpt2-byte-bpe-v1", "eos_token_id": 50256, "bos_token_id": 50256,
+  "assets": {"vocab": {"path": "vocab.json", "form": "json-pairs", "sha256": "…"},
+             "merges": {"path": "merges.txt", "form": "lines", "sha256": "…"}}}
+```
+
+The host reads each asset from the model's own source, bounded and hash-checked,
+and hands it to the plugin through `load_asset(name, form, values)` already
+decomposed: one string for `text`, the lines for `lines`, or the alternating keys
+and values of a flat object for `json-pairs`. These are transports, not formats —
+nothing here reads what a line or a key says. They exist because ZIPP's string
+operations are regular-expression backed, which makes a plugin scanning a
+megabyte quadratic: a GPT-2 vocabulary CPython reads in 0.06s took over 200
+seconds inside the guest, while the same data as host values arrives in 0.07s.
+Weights never travel this way; a tokenizer's tables are what the hooks read, and
+a checkpoint's tensors are not.
+
 `checkpoint_format` must equal the plugin's, and `tokenizer.type` must be one the
 plugin lists; otherwise `ModelSession.open` throws `CHECKPOINT` or `TOKENIZER`
 before an engine exists. Editing that field to satisfy the check does not convert
@@ -113,6 +132,13 @@ weights as well. Configuration can describe different sizes of the same compatib
 architecture. It cannot create support for different tensor naming/layout,
 attention semantics or tokenization on its own.
 
+A tensor whose dtype this host cannot decode is indexed but not readable: real
+checkpoints carry buffers nothing here binds — GPT-Neo ships a BOOL causal mask
+per layer — and refusing the whole file over one of them would make a loadable
+checkpoint unloadable. Binding or reading such a tensor fails with `DTYPE`, in
+binding preflight rather than after a large read, and it is charged nothing
+against the decode budget.
+
 Safetensors support is deliberately a subset: little-endian F32, F16 and BF16,
 rank zero through four, bounded shapes, exact byte ranges, and no unindexed gaps,
 overlaps or trailing data. Duplicate JSON keys, unsupported dtypes and malformed
@@ -120,6 +146,31 @@ metadata fail. Scalar/empty tensor containers are accepted; the existing compute
 graph's positive-dimension rules still apply when used as model inputs.
 Safetensors itself permits non-finite numbers; this loader rejects them for ZIPP's
 finite-F32 graph protocol. This is not a claim that such files violate Safetensors.
+
+## 3b. A checkpoint folder with no manifest
+
+A plugin may also declare that it reads a checkpoint folder as the project that
+published it laid it out:
+
+```json
+"native": {"config": "config.json",
+           "assets": {"vocab": {"path": "vocab.json", "form": "json-pairs"},
+                      "merges": {"path": "merges.txt", "form": "lines"}}}
+```
+
+`ModelSession.openNative` then reads that config, finds the weights
+(`model.safetensors`, or every shard a `model.safetensors.index.json` names),
+reads the declared assets, and hashes all of it. Because such a folder carries no
+pin for this host, the host must approve those digests — plugin identity,
+checkpoint family, and the path, size and SHA-256 of every file — before any of
+it reaches guest code. The plugin's `native_manifest(config, assets, limits)`
+turns the checkpoint's own configuration into what the driver needs; returning
+one is the plugin asserting it implements this checkpoint, and a field it does
+not understand is an error rather than something ignored.
+
+This is a weaker claim than a pinned model, which is why it is a separate entry
+point that `open` never falls back to. `tools/pin_checkpoint.py` writes a pinned
+`model.json` beside a folder without touching anything else in it.
 
 ## 4. Binary bindings
 
@@ -131,7 +182,10 @@ A graph input has a normal id/op/shape but omits `data`. One binding resolves it
 {"node": 2, "kind": "causal", "length": 2}
 ```
 
-`tensor` requires exact shape equality. `rows` gathers indexed matrix rows on the
+`tensor` requires exact shape equality, or, with `"transpose": true`, equality
+with the matrix the other way round — which is how a PyTorch `[out, in]` linear
+is read without rewriting the file, and how a tied output projection reuses the
+embedding. Only rank two transposes, and the store's cached copy is never mutated. `rows` gathers indexed matrix rows on the
 host CPU for embeddings or a bigram table. `causal` supplies a finite additive
 mask and optionally a local `window`. The finite sentinel assumes ordinary
 attention-score magnitudes, as tested by the bundled fixture; it is not a proof
@@ -152,6 +206,84 @@ The transformer example uses `[input_width, output_width]` linear weight layout.
 Its Safetensors keys are its own explicit format, `zipp.tiny-causal-v1`. A PyTorch
 or Hugging Face file with different layouts must be converted or handled by a
 matching plugin; renaming its architecture or checkpoint field is not a conversion.
+
+## 4b. Cached decoding
+
+A plugin may build a second graph for decoding one token at a time:
+
+```python
+def build_decode_graph(config):
+    # Same arithmetic as build_graph at the last position; the keys and values
+    # come from a carried cache instead of from a recomputed context.
+    return {"version": 1, "kind": "decode", "context": 512, "graph": ..., "bindings": ...}
+```
+
+`describe` reports `"decode": true` when it does, and `ModelSession.generate`
+then prepares that graph once through `runtime.prepare` instead of rebuilding
+and resubmitting the model for every token. Three things follow:
+
+* weights are static graph inputs, so they are uploaded **once** rather than per
+  token — for a real vocabulary that is the dominant cost;
+* key and value caches are inputs marked `carry`, so the device keeps them
+  between runs and the host never sees them;
+* a token costs one position rather than the whole context.
+
+A decode graph binds three kinds of per-step input, none of which require the
+host to know what the model is:
+
+```json
+{"node": 0, "kind": "step", "slot": "rows", "tensor": "transformer.wte.weight", "index": "token"}
+{"node": 2, "kind": "step", "slot": "mask", "window": 256}
+{"node": 3, "kind": "step", "slot": "write"}
+{"node": 4, "kind": "zeros"}
+```
+
+`rows` is one gathered embedding row, indexed by `token` or `position`; `mask`
+is the additive mask for the positions written so far, optionally windowed;
+`write` is a one-hot column marking where this token writes. `zeros` is a
+carried cache's starting value, which the host allocates so a megabyte of zeroes
+never travels as JSON. The protocol has no scatter, so a cache is written as
+`cache * (1 - write) + write @ new` — ordinary arithmetic on tensors the backend
+already multiplies.
+
+Caches are not cleared between generations and do not need to be: every position
+is written before the mask unmasks it, so nothing stale is ever read. The eager
+path remains, is still what `infer` uses, and the checkout gate requires the two
+to produce identical tokens — a cache that is subtly wrong still reads like
+English, so agreement with the oracle is the only evidence worth having.
+
+## 4c. The other way to write a model
+
+Everything above expresses a model as Graph v2 nodes a plugin emits and the
+host binds. ZIPP also ships a `torch` subset, and a model can simply be written
+in ordinary torch idiom instead. `tests/torch-subset.test.mjs` runs a real
+`Qwen3DecoderLayer` that way — RMSNorm, rotary embeddings, grouped-query
+attention and SwiGLU, in the form a modelling file would contain — and it
+matches PyTorch to 2.4e-07 inside the engine.
+
+To be exact about what that does and does not mean: the `transformers`
+**package** does not run here. It needs numpy, PyTorch and Rust extensions for
+tokenizers and safetensors, plus an installer to fetch them, and this VM has no
+native extension loading and no pip. What runs is the modelling code such a
+package contains, which is the part that describes a model.
+
+The two approaches trade off against each other, and this package deliberately
+uses the first:
+
+| | Graph plugin (this package) | torch subset |
+| --- | --- | --- |
+| Weights | never enter Python; the host reads, binds and submits them | become tensors the guest holds |
+| Validation | the host checks every node, shape and binding before submitting | the guest computes; the host sees a result |
+| Resources | per-model budgets on nodes, elements, uploads and residency | the instruction budget and heap limit |
+| Writing a model | emit nodes; every op must exist in the protocol | ordinary torch code; every op must exist in the subset |
+| Porting a published model | a deliberate mapping, tensor by tensor | closer to copying the modelling file |
+
+A plugin that wants the second shape is a different capability than `graph-v2`,
+with a different security story, and is not something this registry admits
+today. It is recorded here because it is the cheaper path to a new architecture,
+and because the subset turned out to cover a current decoder once `sin`, `cos`,
+`rsqrt` and `repeat_interleave` were exposed to Python — the first two were
+already in the engine's tensor kernel and simply had no binding.
 
 ## 5. Limits and ownership
 

@@ -9,10 +9,18 @@ upstream ZIPP result, and neither covers browser, GPU or SoftN acceptance.
 
 | Check | Result | Scope |
 | --- | --- | --- |
-| Node host and session tests | 45 passed, 0 failed | Loader, manifests, checkpoint/tokenizer refusal, binary bindings, bounds, hashing, lifecycle; session lifecycle uses explicit doubles |
+| Node host and session tests | 49 passed, 0 failed | Loader, manifests, checkpoint/tokenizer refusal, binary bindings, bounds, hashing, lifecycle; session lifecycle uses explicit doubles |
 | Gate A1: upstream Graph v2 validator + CPU backend | passed, max absolute logit error 0.0000083446502685546875 | Five complete logit tensors from the plugin's own graphs, executed by `gpu-lab/src/runtime.mjs` on `cpu-js`, compared with stored PyTorch CPU outputs |
 | Gate A2: Python-enabled ZIPP WASM engine | passed | Real `Engine`, real `initPythonProject`/`pythonCall` bootstrap, five prompts: logits within tolerance and greedy token sequences identical to the reference |
-| CPython/NumPy plugin tests | 12 passed | Plugin math, tokenizer, causal masking, configuration, declared checkpoint family, alternative architecture |
+| Gate C1: a Hugging Face checkpoint folder, unconverted | passed | TinyStories-1M read as published through `openNative`: its own config.json, `model.safetensors` (including 8 BOOL mask buffers nothing binds), and its own vocab.json/merges.txt; logits within 2e-4 of transformers and greedy tokens identical |
+| Gate C2: the same folder from a written pin | passed | `tools/pin_checkpoint.py` manifest, loaded through the ordinary pinned path |
+| Cached decoding vs the full-context path | identical tokens, logits within 2e-4 of transformers | Carried key/value caches across steps, checked against both the eager graph and transformers, in NumPy and on the engine |
+| Cached decoding, measured | 104 ms/token to 48 ms/token on CPU JavaScript; 2.6 ms/token on WASM SIMD and 3.5 ms/token on WebGPU in a browser | Uploads per step fall from 3,619,160 elements to 1,664; 18.6 MB stays resident |
+| Recurrent primitives on the runtime | 2 passed | A causal depthwise convolution over a carried window and a gated delta-rule state update, each built from existing operations and checked against an independent implementation |
+| CPython/NumPy plugin tests | 30 passed | 12 for the bundled fixtures, 15 for GPT-Neo: config reading, logit parity, greedy parity, checkpoint-order tensors, local-attention windows, tanh GELU, unscaled attention, family refusals, and 27 differential tokenizer cases against transformers |
+| GPT-Neo logit parity | max absolute error 0.0000562667 | Complete final-position logits for five prompts, NumPy evaluation of the plugin's graphs vs transformers on the same checkpoint |
+| GPT-Neo tokenizer | 27/27 exact | Emoji, CJK, Cyrillic, contractions, whitespace runs, NBSP, zero-width, URLs, backslashes; encode equality and decode round-trip against the reference tokenizer |
+| GPT-Neo in the browser | passed on WebGPU, WASM SIMD and CPU JavaScript | The lab loaded the checkpoint folder, showed the digest of every file for approval, and generated the same text on each backend | Plugin math, tokenizer, causal masking, configuration, declared checkpoint family, alternative architecture |
 | Logit parity (independent evaluator) | max absolute error 0.0000069141387939453125 | NumPy evaluation of the plugin's graphs vs stored PyTorch CPU outputs |
 | Windows checkout integrity | passed | `.gitattributes` keeps this tree LF and the checkpoint exact, so the hashed fixtures survive a `core.autocrlf=true` checkout |
 | Browser demo, end to end | passed | Chrome 153.0.8010.47 over `playground/serve.cjs`: bundled fixture, bundled bigram, and a local model folder each downloaded/approved, compiled Python in a Worker and generated the reference continuations (`hello ` → `alice!`, `zipp runs ` → `a tiny model.`, bigram → `abc.`) |
@@ -63,6 +71,26 @@ That environment was Node 22.16.0, Python 3.13.5, PyTorch 2.10.0+cpu, Chromium
 localhost navigation was blocked by policy, so the UI checks used an offline HTML
 harness with source modules inlined. That is not equivalent to validating
 deployment, Worker imports or GPU execution, and it has not been repeated here.
+
+## About the GPT-Neo checkpoint
+
+TinyStories-1M: GPT-Neo, 8 layers alternating global and 256-wide local
+attention, 16 heads, hidden size 64, vocabulary 50,257, tied embeddings, about
+3M parameters. It is the largest real pretrained checkpoint that fits the graph
+protocol's default limits — its embedding is 3,216,448 elements against a
+4,194,304 element ceiling — and it is **not** in this repository. It was
+downloaded from Hugging Face, repacked out of pickle into safetensors with names,
+shapes and dtypes unchanged, and read from there.
+
+Reading it required raising two policy limits, both documented where they are
+set: the graph node budget (eight GPT-Neo layers emit 529 nodes against a default
+of 512) and the per-call instruction budget (a 50,000-entry tokenizer costs far
+more than the engine default). The compute runtime keeps its own budgets and the
+host passes matching ones; neither limit is a protocol ceiling.
+
+What this does not establish: one checkpoint, one family, one machine. Speed was
+not measured beyond noting that every generated token re-runs the whole model
+over the whole context, because there is no KV cache and no resident weights.
 
 ## About the fixture
 

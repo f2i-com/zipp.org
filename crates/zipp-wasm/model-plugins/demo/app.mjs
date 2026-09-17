@@ -21,9 +21,11 @@ function entries(input){
 }
 $('source').addEventListener('change',()=>{
   const source=$('source').value;
-  $('local-fields').hidden=!['local','catalogue-local'].includes(source);
+  $('local-fields').hidden=!['local','catalogue-local','hf-checkpoint'].includes(source);
   $('plugin-fields').hidden=source!=='local';
-  $('catalogue-fields').hidden=source!=='catalogue-local';
+  $('catalogue-fields').hidden=!['catalogue-local','hf-checkpoint'].includes(source);
+  $('hf-hint').hidden=source!=='hf-checkpoint';
+  if(source==='hf-checkpoint')$('catalogue-plugin').value='gpt-neo';
   if($('source').value==='bigram')$('prompt').value='';
 });
 $('cancel').addEventListener('click',()=>stop('Stopped. Model engine and Worker discarded.'));
@@ -33,9 +35,9 @@ $('run').addEventListener('click',()=>{
     if(!Number.isInteger(maxNewTokens)||maxNewTokens<0||maxNewTokens>128)throw Error('Use 0–128 new tokens.');
     const payload={type:'run',selection,backend:$('backend').value,prompt:$('prompt').value,maxNewTokens};
     if(selection==='local')payload.pluginEntries=entries($('plugin'));
-    if(['local','catalogue-local'].includes(selection))payload.modelEntries=entries($('model'));
-    if(selection==='catalogue-local')payload.cataloguePlugin=$('catalogue-plugin').value;
-    const warning=selection==='catalogue-local'?'Download the selected Python architecture support from this website, then run your local model? Model weights will not be downloaded or uploaded.':selection==='local'?'Run Python from the selected plugin folder inside ZIPP? Only approve code whose origin you trust. No local file will be uploaded.':'Download the selected tiny example and Python plugin from this website, then run it locally inside ZIPP?';
+    if(['local','catalogue-local','hf-checkpoint'].includes(selection))payload.modelEntries=entries($('model'));
+    if(['catalogue-local','hf-checkpoint'].includes(selection))payload.cataloguePlugin=$('catalogue-plugin').value;
+    const warning=selection==='hf-checkpoint'?'Download the selected Python architecture support from this website, then read your checkpoint folder as it is? You will be shown the digest of every file before it runs. Nothing is uploaded.':selection==='catalogue-local'?'Download the selected Python architecture support from this website, then run your local model? Model weights will not be downloaded or uploaded.':selection==='local'?'Run Python from the selected plugin folder inside ZIPP? Only approve code whose origin you trust. No local file will be uploaded.':'Download the selected tiny example and Python plugin from this website, then run it locally inside ZIPP?';
     if(!window.confirm(warning))return;
     stop();const gen=++generation;busy(true);$('output').textContent='';$('details').textContent='';$('status').textContent='Starting isolated model Worker…';
     worker=new Worker(new URL('./worker.mjs',import.meta.url),{type:'module'});arm();
@@ -46,6 +48,17 @@ $('run').addEventListener('click',()=>{
       if(data.type==='info'){$('details').textContent=JSON.stringify(data.info,null,2);$('status').textContent=`Running on ${data.info.backend}`;}
       if(data.type==='token'){$('output').textContent=data.text;$('status').textContent=`${data.count} tokens · ${data.backend}`;}
       if(data.type==='done'){$('output').textContent=data.result.text;$('details').textContent+='\n\n'+JSON.stringify(data.result,null,2);stop(`Finished · ${data.result.finishReason} · ${data.result.backend}`);}
+      if(data.type==='approve'){
+        // An unpinned checkpoint: the digests are only known once the Worker has
+        // read the folder, so the decision belongs here, with them in hand.
+        const files=[`config ${data.identity.config.path} ${data.identity.config.sha256.slice(0,16)}…`,
+          ...data.identity.weights.map(w=>`weights ${w.path} ${(w.bytes/1048576).toFixed(1)} MiB ${w.sha256.slice(0,16)}…`),
+          ...data.identity.assets.map(a=>`${a.name} ${a.path} ${(a.bytes/1024).toFixed(0)} KiB ${a.sha256.slice(0,16)}…`)];
+        $('details').textContent=JSON.stringify(data.identity,null,2);
+        const ok=window.confirm(`Load this unpinned checkpoint with ${data.identity.plugin.id}@${data.identity.plugin.version}?\n\nIt declares no pin for this lab, so these are the files that will be read:\n\n${files.join('\n')}`);
+        worker?.postMessage({type:'approved',ok});
+        if(!ok)$('status').textContent='Waiting…';
+      }
       if(data.type==='error')stop(`${data.code||'ERROR'}: ${data.message}`);
     };
     worker.onerror=event=>{if(gen===generation)stop(`Worker could not start: ${event.message}. Check that dist/all/zipp_wasm.js and its WASM binary have been built.`);};

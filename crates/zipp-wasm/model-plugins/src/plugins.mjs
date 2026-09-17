@@ -1,11 +1,11 @@
-import {check, fields, integer, safePath, sha256, checkHash, resolveLimits, formatId} from './common.mjs';
+import {check, fields, integer, safePath, sha256, checkHash, resolveLimits, formatId, ASSET_FORMS} from './common.mjs';
 import {decodeUTF8, parseJSON} from './json.mjs';
 import {readAll, FileMapSource, fetchPinned} from './sources.mjs';
 
 export function validatePluginManifest(manifest, limits = resolveLimits()) {
   const required = ['format', 'version', 'id', 'plugin_version', 'entry', 'capabilities',
     'checkpoint_format', 'tokenizer_formats', 'sources'];
-  fields(manifest, required, required);
+  fields(manifest, [...required, 'native'], required);
   check(manifest.format === 'zipp.python-model-plugin' && manifest.version === 1, 'VERSION', 'Unsupported plugin manifest');
   check(typeof manifest.id === 'string' && /^[a-z][a-z0-9.-]{2,95}$/.test(manifest.id), 'FORMAT', 'Invalid plugin id');
   check(typeof manifest.plugin_version === 'string' && /^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(manifest.plugin_version), 'VERSION', 'Use an exact x.y.z plugin version');
@@ -20,6 +20,26 @@ export function validatePluginManifest(manifest, limits = resolveLimits()) {
   integer(manifest.tokenizer_formats.length, 1, 8, 'Declared tokenizer formats');
   for (const format of manifest.tokenizer_formats) formatId(format, 'Plugin tokenizer format');
   check(new Set(manifest.tokenizer_formats).size === manifest.tokenizer_formats.length, 'FORMAT', 'Duplicate tokenizer format');
+  // Optional: the plugin can read a checkpoint folder as the project that
+  // published it laid it out, with no manifest written for this host. It names
+  // the config file it understands and the tokenizer files it needs; it still
+  // decides what any of them mean.
+  if (Object.hasOwn(manifest, 'native')) {
+    fields(manifest.native, ['config', 'assets'], ['config', 'assets']);
+    safePath(manifest.native.config);
+    check(manifest.native.assets && typeof manifest.native.assets === 'object' && !Array.isArray(manifest.native.assets),
+      'FORMAT', 'Expected a native tokenizer asset map');
+    const names = Object.keys(manifest.native.assets);
+    integer(names.length, 0, 8, 'Native tokenizer assets');
+    for (const name of names) {
+      check(/^[a-z][a-z0-9_]{0,31}$/.test(name), 'FORMAT', `Invalid native asset name: ${name}`);
+      const asset = manifest.native.assets[name];
+      fields(asset, ['path', 'form'], ['path', 'form']);
+      safePath(asset.path);
+      check(!asset.path.endsWith('.py'), 'FORMAT', 'A tokenizer asset is data, not plugin source');
+      check(ASSET_FORMS.includes(asset.form), 'FORMAT', `Unknown tokenizer asset form: ${asset.form}`);
+    }
+  }
   check(manifest.sources && !Array.isArray(manifest.sources) && typeof manifest.sources === 'object', 'FORMAT', 'Expected source hash map');
   const paths = Object.keys(manifest.sources); integer(paths.length, 1, limits.maxSourceFiles, 'Plugin source files');
   for (const path of paths) {
@@ -34,8 +54,10 @@ export function validatePluginManifest(manifest, limits = resolveLimits()) {
 export const BOOTSTRAP_ENTRY = '__zipp_model_bootstrap.py';
 export function bootstrap(entry) {
   // entry was validated as an identifier path, never arbitrary source text.
+  // zipp_model_native is defined for every plugin but resolves only for one
+  // that implements it; a plugin without native support never has it called.
   check(/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(entry), 'FORMAT', 'Invalid entry');
-  return `import json\nimport zipp_plugin.${entry} as _plugin\n\ndef zipp_model_describe(config):\n    return json.dumps(_plugin.describe(json.loads(config)))\n\ndef zipp_model_encode(text, tokenizer):\n    return json.dumps(_plugin.encode(text, json.loads(tokenizer)))\n\ndef zipp_model_decode(tokens, tokenizer):\n    return _plugin.decode(json.loads(tokens), json.loads(tokenizer))\n\ndef zipp_model_graph(config, tokens):\n    return json.dumps(_plugin.build_graph(json.loads(config), json.loads(tokens)))\n`;
+  return `import json\nimport zipp_plugin.${entry} as _plugin\n\ndef zipp_model_describe(config):\n    return json.dumps(_plugin.describe(json.loads(config)))\n\ndef zipp_model_encode(text, tokenizer):\n    return json.dumps(_plugin.encode(text, json.loads(tokenizer)))\n\ndef zipp_model_decode(tokens, tokenizer):\n    return _plugin.decode(json.loads(tokens), json.loads(tokenizer))\n\ndef zipp_model_graph(config, tokens):\n    return json.dumps(_plugin.build_graph(json.loads(config), json.loads(tokens)))\n\ndef zipp_model_decode_graph(config):\n    return json.dumps(_plugin.build_decode_graph(json.loads(config)))\n\ndef zipp_model_asset(name, form, values):\n    _plugin.load_asset(name, form, values)\n\ndef zipp_model_native(config, assets, limits):\n    return json.dumps(_plugin.native_manifest(json.loads(config), json.loads(assets), json.loads(limits)))\n`;
 }
 export class PluginRegistry {
   #installed = new Map();
@@ -51,6 +73,11 @@ export class PluginRegistry {
     const support = Object.freeze({
       checkpoint_format: manifest.checkpoint_format,
       tokenizer_formats: Object.freeze([...manifest.tokenizer_formats]),
+      native: Object.hasOwn(manifest, 'native')
+        ? Object.freeze({config: manifest.native.config,
+            assets: Object.freeze(Object.fromEntries(Object.entries(manifest.native.assets)
+              .map(([name, asset]) => [name, Object.freeze({...asset})])))})
+        : null,
     });
     const key = `${identity.id}@${identity.version}`;
     if (this.#installed.has(key)) {

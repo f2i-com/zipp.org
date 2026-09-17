@@ -1,0 +1,3 @@
+# Checkpoints converted or downloaded locally. Third-party weights are never
+# redistributed with ZIPP, and a 46 MiB checkpoint does not belong in git.
+models/

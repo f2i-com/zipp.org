@@ -5,7 +5,7 @@ implementation designed against `f2i-com/zipp.org` commit
 `62da28d9bdcd66fccbf5627d887d574016501f9d`. It adds a directory; it does not replace
 Rust/VM files, modify the current landing-page build, or change SoftN.
 
-45 standalone Node tests, 12 CPython/NumPy tests and both full-checkout gates pass
+49 standalone Node tests, 30 CPython/NumPy tests and four full-checkout gates pass
 in this repository: the plugin's graphs run through the current ZIPP Graph v2
 validator and CPU backend, and the plugin's Python compiles and generates inside a
 locally built Python-enabled ZIPP WASM engine, matching the stored PyTorch
@@ -78,7 +78,8 @@ cd crates/zipp-wasm/model-plugins
 ZIPP_REQUIRE_INTEGRATION=1 node --test
 ```
 
-Expect 47 passing tests and no skips: 45 standalone plus the two checkout gates.
+Expect 53 passing tests: 49 standalone plus four checkout gates, two of which
+need a GPT-Neo checkpoint folder and skip without one.
 Without `dist/all` the second gate skips instead, which is why required mode is
 the one to run before believing anything. On PowerShell, set
 `$env:ZIPP_REQUIRE_INTEGRATION='1'` first.
@@ -161,22 +162,89 @@ files across a Worker, send a Map of explicit relative paths to File objects as
 | Versioned, source-hashed Python architecture plugins | Live mutation of an existing compiled VM; a general pip/plugin marketplace |
 | Local Blob/File/typed-array sources and a scoped bundle-entry adapter | SoftN extraction, permissions/UI integration, production package migration |
 | Safetensors F32/F16/BF16 with bounds checks and F32 conversion | Pickle checkpoints, GGUF, integer quantization, zero-copy device import |
-| Custom tiny transformer and single-file bigram plugins, each declaring the one checkpoint family it implements | TinyStories/GPT-Neo, GPT-2 BPE, SentencePiece, arbitrary HF checkpoints; loading one is refused, not attempted |
-| Eager full-context graph planning, greedy and temperature/top-k sampling | KV cache, resident model weights, fused decode kernels, throughput claims |
+| Custom tiny transformer, single-file bigram, and GPT-Neo/TinyStories plugins, each declaring the one checkpoint family it implements | Any other family — Qwen, Llama, GPT-2 proper, SentencePiece tokenizers; loading one is refused, not attempted |
+| Hugging Face folders read as published: own config, own tensor names, own tokenizer files, safetensors shard index | Pickled `pytorch_model.bin` (never unpickled), GGUF, integer quantization |
+| Eager full-context planning as the oracle, plus cached decoding with carried KV caches and resident weights | Batched prefill, fused decode kernels, quantized formats, throughput claims |
 | Existing Graph v2 runtime integration code | ZIPP WASM/CLI, GPU inference and cross-backend parity verified here |
 
 There is no new native `zipp py` model command or built-in `zipp_llm` Python
 module in this overlay. The browser/embedding host owns model sessions.
 
-## Next model milestone: a separate GPT-Neo/TinyStories plugin
+## GPT-Neo: a real checkpoint, read where it lives
 
-The next model milestone is a **separate** plugin for GPT-Neo/TinyStories
-checkpoints, carrying that family's own GPT-2 byte-BPE tokenizer and an explicit
-state-dict mapping verified against the reference implementation. It is not a
-configuration of the plugins here, and not a flag on them.
+`plugins/gpt-neo/` reads GPT-Neo checkpoints — TinyStories among them — with the
+GPT-2 byte-level BPE tokenizer those checkpoints were trained with. It is a
+**separate** plugin, not a configuration of the fixtures above, and it is
+verified against Hugging Face transformers rather than against a plausible
+reading of its own output:
 
-The custom fixture is **not** advertised as compatible with those checkpoints
-merely because it uses transformer operations. Attention, LayerNorm and GELU say
+| Check | Result |
+| --- | --- |
+| Complete final-position logits, five prompts | max absolute error 5.6e-05 vs transformers, every argmax equal |
+| Greedy continuations | identical token sequences |
+| Tokenizer, 27 differential cases | encodes exactly as the reference, including emoji, CJK, Cyrillic, contractions, whitespace runs, NBSP and zero-width |
+| In the browser | WebGPU, WASM SIMD and CPU JavaScript all produce the same text |
+
+**It needs no conversion.** The plugin reads the checkpoint folder as the project
+that published it laid it out: its own `config.json`, its own tensor names, and
+its own `vocab.json`/`merges.txt`. A PyTorch `[out, in]` projection is read
+through a transposing binding, the tied output projection is the embedding read
+the other way round, and the BOOL causal-mask buffers GPT-Neo ships are indexed
+and ignored rather than making the file unreadable.
+
+```sh
+# Only if the repo ships pickle rather than safetensors: ZIPP will not unpickle.
+python tools/repack_safetensors.py --source ~/models/TinyStories-1M
+```
+
+Then choose **Website plugin + my Hugging Face checkpoint folder** in the lab, or:
+
+```javascript
+const session = await ModelSession.openNative({
+  source, plugin, engineFactory, runtime,
+  approve: identity => confirmWith(identity),   // digests of every file, before anything runs
+});
+```
+
+A folder from someone else carries no pin for this host, so `openNative` hashes
+the config, every shard and every tokenizer asset and hands them to the host to
+approve — a deliberately weaker claim than a pinned model, behind a deliberately
+separate entry point. `tools/pin_checkpoint.py` writes a `model.json` beside the
+checkpoint when you want the stronger one; it changes nothing else in the folder.
+
+What this cost, and what it did not: the fixture still declares
+`zipp.tiny-causal-v1` and still refuses everything else. GPT-Neo is loadable
+because a plugin was written and checked against it, not because the host learned
+to be flexible.
+
+## Cached decoding
+
+A plugin can build a second graph for one token at a time. The host prepares it
+once, so weights are uploaded once and key/value caches live on the device as
+`carry` inputs; each token then costs one position instead of the whole context.
+Generating 16 tokens from TinyStories-1M:
+
+| | per token | uploaded per step |
+| --- | --- | --- |
+| Recomputing the context | 104 ms (CPU JavaScript) | 3,619,160 elements |
+| Cached | 48 ms (CPU JavaScript) | 1,664 elements |
+| Cached, WASM SIMD in a browser | 2.6 ms | 1,664 elements |
+| Cached, WebGPU in a browser | 3.5 ms | 1,664 elements |
+
+`generate` takes this path whenever the plugin offers one and the runtime can
+prepare a plan, and falls back to recomputing otherwise. The eager path is
+unchanged, is what `infer` uses, and the checkout gate requires both to produce
+the same tokens: a cache that is subtly wrong still reads like English.
+
+## Next model milestone
+
+The next model milestone is a **separate** plugin for each further checkpoint
+family, carrying that family's own tokenizer and an explicit state-dict mapping
+verified against the reference implementation. It is not a configuration of the
+plugins here, and not a flag on them.
+
+A plugin is **not** advertised as compatible with a checkpoint family merely
+because it uses transformer operations. Attention, LayerNorm and GELU say
 nothing about tensor names, weight orientation, tied embeddings, attention
 scaling, local/global attention patterns, normalization epsilon, activation
 variant or tokenization — the things a checkpoint actually depends on. So the

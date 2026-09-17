@@ -28,6 +28,13 @@ export function formatId(value, what) {
     'FORMAT', `${what} must be a lowercase dotted/hyphenated format identifier`);
   return value;
 }
+/** How a tokenizer asset reaches the plugin: as one string, as its lines, or
+ * as the pairs of a flat JSON object. These are transports, not formats -- the
+ * host never reads what a line or a key says. ZIPP's string operations are
+ * regular-expression backed, so a plugin scanning a megabyte itself is
+ * quadratic; decomposing here is what keeps a real vocabulary loadable.
+ */
+export const ASSET_FORMS = Object.freeze(['text', 'lines', 'json-pairs']);
 export function safePath(path) {
   check(typeof path === 'string' && path.length > 0 && path.length <= 512, 'PATH', 'Invalid asset path');
   const parts = path.split('/');
@@ -49,12 +56,27 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxManifestBytes: 256 * 1024, maxHeaderBytes: 4 * 1024 * 1024,
   maxSourceFileBytes: 1024 * 1024, maxSourceBytes: 4 * 1024 * 1024,
   maxSourceFiles: 64, maxWeightFiles: 16, maxTensors: 4096,
+  // Tokenizer assets are mounted into the plugin's virtual filesystem. A GPT-2
+  // vocabulary is ~800 KB and its merge table ~450 KB, so they cannot live in a
+  // manifest; they are still bounded, hashed and counted like everything else.
+  maxTokenizerAssets: 8, maxTokenizerFileBytes: 8 * 1024 * 1024, maxTokenizerBytes: 16 * 1024 * 1024,
+  maxTokenizerItems: 1048576,
   maxModelFileBytes: 128 * 1024 * 1024, maxModelBytes: 256 * 1024 * 1024,
   maxDecodedBytes: 64 * 1024 * 1024, maxBoundInputBytes: 64 * 1024 * 1024,
   maxTensorElements: 4194304, maxDimension: 65536,
-  maxGraphBytes: 4 * 1024 * 1024, maxNodes: 512,
+  // A real checkpoint is deeper than a fixture: eight GPT-Neo layers emit 529
+  // nodes, and the count grows with depth, not context. The compute runtime has
+  // its own node budget and both must admit a graph, so raising this alone
+  // changes nothing -- the host passes matching limits to createRuntime.
+  maxGraphBytes: 4 * 1024 * 1024, maxNodes: 4096,
   maxContext: 512, maxNewTokens: 128, maxPromptChars: 16384,
-  instructionBudget: 50000000,
+  // Renewed per plugin call. A real tokenizer is the expensive one: reading a
+  // 50,000-entry vocabulary and its merge table costs far more than the engine
+  // default, and the engine derives a regular expression's step ceiling from
+  // what is left of this, so an exhausted budget surfaces as a regex failure
+  // rather than an obvious one. The engine's own ceiling is 2e9; the outer
+  // Worker deadline, not this, is what bounds wall-clock time.
+  instructionBudget: 500000000,
 });
 export function resolveLimits(overrides = {}) {
   fields(overrides, Object.keys(DEFAULT_LIMITS));

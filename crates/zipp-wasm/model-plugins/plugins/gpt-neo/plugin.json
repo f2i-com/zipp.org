@@ -1,0 +1,32 @@
+{
+  "format": "zipp.python-model-plugin",
+  "version": 1,
+  "id": "org.zipp.gpt-neo",
+  "plugin_version": "0.1.0",
+  "entry": "architecture",
+  "capabilities": [
+    "graph-v2"
+  ],
+  "checkpoint_format": "hf.gpt-neo-v1",
+  "tokenizer_formats": [
+    "gpt2-byte-bpe-v1"
+  ],
+  "native": {
+    "config": "config.json",
+    "assets": {
+      "vocab": {
+        "path": "vocab.json",
+        "form": "json-pairs"
+      },
+      "merges": {
+        "path": "merges.txt",
+        "form": "lines"
+      }
+    }
+  },
+  "sources": {
+    "architecture.py": "4adcc518adee017caa0c4180f9568b73ddc4490ad9c5bddadfc556330ebf84af",
+    "graph.py": "ad0035d455e59cf794e502785bc5c318966b160eebf41cdb734351afa4d35cff",
+    "tokenizer.py": "ab2659434f3c35e7e60b6b95515b9d897f1cfe624194096d4a1785f61b8d1a98"
+  }
+}

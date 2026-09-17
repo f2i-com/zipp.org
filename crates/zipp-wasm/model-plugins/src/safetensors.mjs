@@ -24,14 +24,22 @@ export async function openSafetensors(source, path, overrides = {}) {
     }
     check(name.length > 0 && name.length <= 256, 'FORMAT', 'Invalid tensor name');
     fields(meta, ['dtype', 'shape', 'data_offsets'], ['dtype', 'shape', 'data_offsets']);
-    check(Object.hasOwn(WIDTH, meta.dtype), 'DTYPE', `Unsupported dtype ${meta.dtype}; this prototype supports F32, F16, BF16`);
+    // An unreadable dtype is only fatal for a tensor something actually binds.
+    // Real checkpoints carry buffers this host never reads -- GPT-Neo ships a
+    // BOOL causal mask per layer -- and rejecting the file for a tensor nobody
+    // touches would make an otherwise loadable checkpoint unloadable.
+    check(typeof meta.dtype === 'string' && /^[A-Z][A-Z0-9_]{0,15}$/.test(meta.dtype), 'DTYPE', 'Invalid dtype name');
+    const readable = Object.hasOwn(WIDTH, meta.dtype);
     const elements = shapeSize(meta.shape, limits, true);
     check(Array.isArray(meta.data_offsets) && meta.data_offsets.length === 2, 'FORMAT', 'Invalid tensor offsets');
     const [begin, end] = meta.data_offsets;
     integer(begin, 0, size - 8 - n, 'Tensor start'); integer(end, begin, size - 8 - n, 'Tensor end');
-    check(end - begin === elements * WIDTH[meta.dtype], 'FORMAT', 'Tensor shape, dtype and byte length disagree');
-    decodedBytes += elements * 4; integer(decodedBytes, 0, limits.maxDecodedBytes, 'Decoded model bytes');
-    const info = Object.freeze({name, dtype: meta.dtype, shape: Object.freeze([...meta.shape]), elements, begin, end});
+    if (readable) {
+      check(end - begin === elements * WIDTH[meta.dtype], 'FORMAT', 'Tensor shape, dtype and byte length disagree');
+      // Only what can be decoded is charged to the decode budget.
+      decodedBytes += elements * 4; integer(decodedBytes, 0, limits.maxDecodedBytes, 'Decoded model bytes');
+    }
+    const info = Object.freeze({name, dtype: meta.dtype, shape: Object.freeze([...meta.shape]), elements, begin, end, readable});
     tensors.set(name, info); regions.push(info);
     integer(tensors.size, 1, limits.maxTensors, 'Tensor count');
   }
@@ -42,7 +50,9 @@ export async function openSafetensors(source, path, overrides = {}) {
   check(cursor === size - 8 - n, 'FORMAT', 'Unindexed trailing tensor bytes');
   return {path, size, decodedBytes, tensors, async readTensor(name) {
     check(tensors.has(name), 'TENSOR', `Missing tensor: ${name}`);
-    const info = tensors.get(name), bytes = await exactRead(source, path, 8 + n + info.begin, info.end - info.begin);
+    const info = tensors.get(name);
+    check(info.readable, 'DTYPE', `Cannot read ${name}: dtype ${info.dtype} is unsupported; this host reads F32, F16 and BF16`);
+    const bytes = await exactRead(source, path, 8 + n + info.begin, info.end - info.begin);
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength), data = new Float32Array(info.elements);
     const scratch = new DataView(new ArrayBuffer(4));
     for (let i = 0; i < data.length; i++) {
@@ -80,7 +90,14 @@ export class WeightStore {
     }
     this.decodedBytes = decoded;
   }
-  info(name) { check(!this.#disposed, 'DISPOSED', 'Weights have been disposed'); check(this.#byName.has(name), 'TENSOR', `Missing tensor: ${name}`); return this.#byName.get(name).info; }
+  info(name) {
+    check(!this.#disposed, 'DISPOSED', 'Weights have been disposed');
+    check(this.#byName.has(name), 'TENSOR', `Missing tensor: ${name}`);
+    const info = this.#byName.get(name).info;
+    // Refuse here, in binding preflight, rather than after a large read.
+    check(info.readable, 'DTYPE', `Cannot bind ${name}: dtype ${info.dtype} is unsupported; this host reads F32, F16 and BF16`);
+    return info;
+  }
   async tensor(name) {
     this.info(name);
     if (!this.#pending.has(name)) {

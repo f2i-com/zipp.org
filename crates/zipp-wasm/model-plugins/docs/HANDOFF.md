@@ -57,8 +57,22 @@ catalogue cannot silently replace an installed pinned identity.
 
 ## Gate C — first externally sourced checkpoint
 
-**This is the next model milestone.** Port GPT-Neo/TinyStories as a **new plugin**,
-not special cases in ModelSession and not a configuration of `tiny-causal`.
+**Status: done for GPT-Neo, on one checkpoint.** `plugins/gpt-neo/` reads
+GPT-Neo/TinyStories checkpoints with the GPT-2 byte-level BPE tokenizer they were
+trained with, matching transformers to 5.6e-05 on complete logits with identical
+greedy continuations and exact tokenizer agreement over a differential corpus
+(`tests/test_gpt_neo.py`, and two checkout gates that skip without a checkpoint
+because third-party weights are not in this repository). It reads a Hugging Face
+folder as published — no conversion, no rewritten tensors.
+
+What that does **not** establish: it is one checkpoint of one family at 3M
+parameters. Another GPT-Neo size, another vocabulary, or a checkpoint with
+different config fields has not been run. Every further family needs its own
+plugin and its own verification; the paragraphs below are the checklist that was
+followed and is the checklist for the next one.
+
+Port each further family as a **new plugin**, not special cases in ModelSession
+and not a configuration of an existing one.
 Check real configuration, all state-dict names, tensor orientation, tied versus
 untied embeddings, position embeddings, attention scaling, global/local attention,
 normalization epsilon and activation variant. Implement a GPT-2 byte-BPE tokenizer
@@ -71,7 +85,15 @@ supply; no runtime internet fetch should be necessary. Do not call the custom to
 transformer checkpoint-compatible with GPT-Neo merely because both use attention.
 Address larger tokenizer assets and vocabulary/output/memory limits explicitly.
 
-The host already refuses that claim rather than relying on reviewers to catch it:
+A checkpoint folder is read where it lives. The plugin declares the config file
+it understands and the tokenizer files it needs; `ModelSession.openNative` reads
+them, hashes everything including each shard, and requires the host to approve
+those digests before any of it reaches guest code. There is no pin, because a
+folder published by someone else carries none, and that is why it is a separate
+entry point rather than a fallback `open` slides into.
+`tools/pin_checkpoint.py` writes the stronger, pinned manifest when one is wanted.
+
+The host already refuses a compatibility claim rather than relying on reviewers:
 `tiny-causal` declares `checkpoint_format: zipp.tiny-causal-v1` with
 `tokenizer_formats: [character-v1]`, and a model naming anything else is rejected
 with `CHECKPOINT` or `TOKENIZER` before an engine is constructed
@@ -82,17 +104,113 @@ names the same family. Widening `tiny-causal`'s declaration to make a foreign
 checkpoint load, rather than shipping the plugin, is the failure this gate exists
 to prevent: the refusal is the honest state until the mapping is verified.
 
+### What a checkpoint still costs here
+
+Measured on TinyStories-1M (3M parameters, 50,257 vocabulary) with the CPU
+JavaScript backend: a session opens in about two seconds, of which most is
+hashing 46 MiB for approval, and each generated token re-uploads and re-runs the
+whole model over the whole context. There is no KV cache and no resident weight,
+so the embedding matrix crosses the boundary once per token. That is Gate D's
+subject, not a GPT-Neo problem.
+
+Two engine costs shaped the plugin and are worth fixing at the source rather than
+working around again:
+
+* `json.loads` is superlinear in the number of **integers** it decodes: 40,000 of
+  them take 6.5s where 40,000 strings take 0.12s, and a 50,000-entry vocabulary
+  never finished. String values and Python-level `d[k] = v` are both linear, so
+  the cost is in decoding numbers, not in objects or dictionaries.
+* `str.find` and `str.split` are regular-expression backed, so scanning a
+  megabyte from guest Python is quadratic — a vocabulary CPython reads in 0.06s
+  took over 200 seconds. The engine also derives a regular expression's step
+  ceiling from the remaining instruction budget, so exhausting that budget
+  surfaces as "regular expression exceeded its execution budget" rather than as
+  the instruction-budget error it actually is.
+
+The host therefore hands a plugin its tokenizer assets already decomposed, by a
+declared transport (`text`, `lines`, `json-pairs`), and the plugin builds its
+tables from host values. That crosses the boundary in 0.07s. If the two costs
+above are fixed, the transports stay useful but a plugin could also just read the
+files.
+
 ## Gate D — scale without hiding costs
 
-Keep the eager full-context path as a correctness oracle. Next add prepared,
-resident model weights, GPU embedding/gather as appropriate, a fixed-capacity
-per-layer KV cache and explicit cache writes/valid lengths; prefill and decode
-need separate accounting. Use per-layer rank-three/four cache tensors according to the backend ABI;
+**Status: the KV cache and resident weights are done.** A plugin may build a
+second graph, `build_decode_graph(config)`, which the host prepares once through
+`runtime.prepare`. Weights become static inputs, uploaded once; key and value
+caches are inputs marked `carry`, so they live on the device and never cross the
+boundary; each token attends over the cache instead of recomputing the context.
+The eager full-context path is unchanged and is still the oracle: the checkout
+gate runs both and requires identical tokens.
+
+Measured on TinyStories-1M, generating 16 tokens:
+
+| | per token | uploaded per step |
+| --- | --- | --- |
+| Recomputing the context (eager) | 104 ms, CPU JavaScript | 3,619,160 elements |
+| Cached decode | 48 ms, CPU JavaScript | 1,664 elements |
+| Cached decode, WASM SIMD in a browser | 2.6 ms | 1,664 elements |
+| Cached decode, WebGPU in a browser | 3.5 ms | 1,664 elements |
+
+The protocol has no scatter, so a cache is written arithmetically:
+`cache * (1 - write) + write @ new`, where `write` is a one-hot column the host
+feeds for the current position. Caches need no clearing between generations,
+because every position is written before the mask ever unmasks it.
+
+What is still missing here: prefill runs one step per prompt token rather than
+one batched graph, so a long prompt costs what it would have cost anyway;
+`run` accepts up to 64 steps per submission and the driver does not yet use
+that. Quantized formats and kernels remain unstarted, and F32 parity must come
+first.
+
+Keep the eager full-context path as a correctness oracle. Remaining: GPU
+embedding/gather as appropriate, batched prefill, and explicit valid-length
+accounting; prefill and decode need separate accounting. Use per-layer rank-three/four cache tensors according to the backend ABI;
 combining layers and an additional batch axis can exceed the supported tensor
 rank. Measure upload/readback and CPU planning separately from kernel time.
 
 The current snapshot has graph tensors up to rank four but matmul only ranks two
 and three. Do not infer support for one operation from a global rank ceiling.
+
+### Recurrent layers need no new kernels
+
+An earlier assessment in this work said that a Gated-DeltaNet linear-attention
+layer — 18 of Qwen3.5-0.8B's 24 layers — needs scan and convolution primitives
+Graph v2 lacks, and that unrolling one would exhaust the node budget. That was
+wrong, and `tests/recurrence.test.mjs` is the correction: both pieces run on the
+real runtime today, out of operations that already exist.
+
+* A causal depthwise convolution over a window of four is a carried window
+  matrix multiplied by a fixed shift matrix, with the new sample placed by a
+  one-hot column — then weighted and summed.
+* A gated delta rule, `S' = S * decay + k v`, is a batched outer product added
+  to a decayed carried state, read back as `q S'`.
+
+A scan operation is only needed to process a whole sequence inside one graph. A
+prepared session already carries state between runs, so the recurrence is one
+step per run and **the graph does not grow with the sequence** — a recurrent
+step is thirteen nodes whether it runs once or a thousand times. The cost is
+that prefill is sequential, which is the same cost the KV cache path already
+pays.
+
+### What Qwen3.5-0.8B would still need
+
+Not operations. Memory and precision:
+
+| | measured | ceiling here |
+| --- | --- | --- |
+| Tied embedding, as the output projection | 248,320 x 1024 = 254,279,680 elements | `maxElements` 4,194,304 — 60x over |
+| The same tensor as F32 | 1,017 MiB | — |
+| Whole checkpoint, bf16 as published | 1.63 GiB | — |
+| Whole checkpoint, expanded to F32 by this loader | 3.26 GiB | WASM linear memory maximum is 1 GiB |
+| Resident allocation | 1.63 GiB at best | `maxLogicalBytes` 64 MiB — 26x over |
+
+So the work is: storing and computing in the checkpoint's own dtype instead of
+expanding to F32, a chunked or much higher element ceiling for the vocabulary
+projection, and a resident budget that a device can actually hold. Quantization
+would cut the first by two to four times again. Until those land, a plugin for
+that family would be a plugin that cannot load its own checkpoint — which is the
+thing this repository refuses to ship.
 Keep cache ownership, sessions, work bounds and aggregate resident memory under
 host control. Add quantized formats/kernels only after F32 reference parity.
 F16/BF16 file conversion alone does not supply quantized compute.

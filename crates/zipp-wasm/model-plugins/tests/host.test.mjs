@@ -59,10 +59,38 @@ test('scalar and empty tensors are valid containers',async()=>{
   const scalar=await open(packed(tensorHeader([],'F32',[0,4]),f32([3])));assert.equal((await scalar.readTensor('w'))[0],3);
   const empty=await open(packed(tensorHeader([0],'F32',[0,0])));assert.equal((await empty.readTensor('w')).length,0);
 });
-test('unsupported dtype and malformed shapes fail before decoding',async()=>{
-  await assert.rejects(open(packed(tensorHeader([1],'I64',[0,8]),new Uint8Array(8))),/Unsupported dtype/);
+test('malformed shapes fail before decoding',async()=>{
   await assert.rejects(open(packed(tensorHeader([-1]),f32([1,2]))));
   await assert.rejects(open(packed(tensorHeader([1,1,1,1,2]),f32([1,2]))));
+  await assert.rejects(open(packed({w:{dtype:'not a dtype',shape:[1],data_offsets:[0,8]}},new Uint8Array(8))),/dtype/);
+});
+// A real checkpoint carries buffers this host never decodes: GPT-Neo ships a
+// BOOL causal mask for every layer. Indexing such a file has to succeed, or a
+// loadable checkpoint is refused over a tensor nothing binds.
+test('an unreadable dtype is indexed and only refused when something reads it',async()=>{
+  const index=await open(packed({keep:{dtype:'F32',shape:[2],data_offsets:[0,8]},mask:{dtype:'BOOL',shape:[4],data_offsets:[8,12]}},
+    new Uint8Array([...f32([1,-2]),1,0,1,0])));
+  assert.deepEqual([...await index.readTensor('keep')],[1,-2]);
+  assert.equal(index.tensors.get('mask').readable,false);
+  assert.equal(index.decodedBytes,8,'an undecodable tensor is not charged to the decode budget');
+  await assert.rejects(index.readTensor('mask'),/dtype BOOL is unsupported/);
+  const store=new WeightStore([index],limits);
+  assert.throws(()=>store.info('mask'),/dtype BOOL is unsupported/);
+  assert.deepEqual([...store.info('keep').shape],[2]);
+  store.dispose();
+});
+test('a transposing binding reads a checkpoint-order matrix',async()=>{
+  const index=await open(packed(tensorHeader([2,3],'F32',[0,24]),f32([1,2,3,4,5,6]))),store=new WeightStore([index],limits);
+  const template=(shape,transpose)=>({version:1,graph:{version:2,
+    nodes:[{id:0,op:'input',shape}],outputs:[{name:'logits',id:0}]},
+    bindings:[transpose===undefined?{node:0,kind:'tensor',tensor:'w'}:{node:0,kind:'tensor',tensor:'w',transpose}]});
+  assert.deepEqual([...(await bindGraph(template([2,3]),store,limits)).nodes[0].data],[1,2,3,4,5,6]);
+  assert.deepEqual([...(await bindGraph(template([3,2],true),store,limits)).nodes[0].data],[1,4,2,5,3,6]);
+  await assert.rejects(bindGraph(template([2,3],true),store,limits),/Weight shape mismatch/);
+  await assert.rejects(bindGraph(template([3,2],false),store,limits),/transpose is true when present/);
+  // The store's cached copy must survive a transposed binding unchanged.
+  assert.deepEqual([...(await bindGraph(template([2,3]),store,limits)).nodes[0].data],[1,2,3,4,5,6]);
+  store.dispose();
 });
 test('duplicate Safetensors keys rejected',async()=>{
   const h='{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}';

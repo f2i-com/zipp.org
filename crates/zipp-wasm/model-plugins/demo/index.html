@@ -19,21 +19,23 @@
       <option value="tiny-char">Bundled tiny transformer · 12,094 parameters</option>
       <option value="bigram">Bundled one-file Python bigram plugin</option>
       <option value="catalogue-local">Website plugin + my local model folder</option>
+      <option value="hf-checkpoint">Website plugin + my Hugging Face checkpoint folder</option>
       <option value="local">My local plugin + model folders</option>
     </select>
     <p class="hint">Bundled examples download from this website only after approval. Local files are never uploaded by this lab.</p>
     <div id="catalogue-fields" hidden>
       <label for="catalogue-plugin">Architecture support to download (code only)</label>
-      <select id="catalogue-plugin"><option value="tiny-causal">Tiny causal transformer</option><option value="bigram">Bigram</option></select>
+      <select id="catalogue-plugin"><option value="tiny-causal">Tiny causal transformer</option><option value="bigram">Bigram</option><option value="gpt-neo">GPT-Neo (reads a checkpoint folder as published)</option></select>
     </div>
     <div id="local-fields" hidden>
       <div id="plugin-fields">
       <label for="plugin">Plugin folder (plugin.json + Python source)</label>
       <input id="plugin" type="file" webkitdirectory directory multiple>
       </div>
-      <label for="model">Model folder (model.json + Safetensors weights)</label>
+      <label for="model">Model folder (model.json + Safetensors weights, or a checkpoint folder as published)</label>
       <input id="model" type="file" webkitdirectory directory multiple>
-      <p class="hint">Choose each folder itself, not its parent. The model must pin the selected plugin's exact manifest hash and name the checkpoint family that plugin implements. A checkpoint from another project (GPT-Neo or TinyStories, for example) needs a plugin written for it, and is refused here rather than loaded.</p>
+      <p class="hint" id="hf-hint" hidden>A Hugging Face folder is read as it is: its own config.json, its safetensors and the tokenizer files it was trained with. It carries no pin for this lab, so you will be shown the SHA-256 of every file before anything runs. A <code>pytorch_model.bin</code> is a pickle and is never executed; repack it with <code>tools/repack_safetensors.py</code> first.</p>
+    <p class="hint">Choose each folder itself, not its parent. The model must pin the selected plugin's exact manifest hash and name the checkpoint family that plugin implements. A checkpoint from another project (GPT-Neo or TinyStories, for example) needs a plugin written for it, and is refused here rather than loaded.</p>
     </div>
   </section>
   <section aria-labelledby="generate-title">

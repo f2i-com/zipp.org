@@ -2,7 +2,6 @@
 These are NOT ZIPP VM or GPU tests; test-integration.mjs covers the checkout gates.
 """
 import json
-import math
 from pathlib import Path
 import sys
 import unittest
@@ -11,44 +10,12 @@ from safetensors.numpy import load_file
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'tools'))
 from cpython_host import load_plugin as _load_plugin, plugin_support
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from evaluator import run as evaluate
 
 def load_plugin(name):
     """Import the plugin as the registry installs it, not as a loose file."""
     return _load_plugin(ROOT/'plugins'/name)
-
-def evaluate(template, weights):
-    bindings = {b['node']:b for b in template['bindings']}; values = []
-    for n in template['graph']['nodes']:
-        op = n['op']; a = values[n['a']] if 'a' in n else None; b = values[n['b']] if 'b' in n else None
-        if op == 'input':
-            binding = bindings.get(n['id'])
-            if binding is None: out = np.array(n['data'],dtype=np.float32).reshape(n['shape'])
-            elif binding['kind'] == 'tensor': out = weights[binding['tensor']]
-            elif binding['kind'] == 'rows': out = weights[binding['tensor']][binding['indices']]
-            else:
-                t = binding['length']; out = np.zeros((t,t),dtype=np.float32)
-                for row in range(t):
-                    for col in range(t):
-                        if col>row or ('window' in binding and col<=row-binding['window']): out[row,col] = -1e9
-        elif op == 'full': out = np.full(n['shape'],n['value'],dtype=np.float32)
-        elif op == 'add': out = a+b
-        elif op == 'sub': out = a-b
-        elif op == 'mul': out = a*b
-        elif op == 'div': out = a/b
-        elif op == 'matmul': out = a@b
-        elif op == 'mean': out = a.mean(axis=n.get('axis'),keepdims=n.get('keepdim',False),dtype=np.float32)
-        elif op == 'sqrt': out = np.sqrt(a)
-        elif op == 'reshape': out = a.reshape(n['shape'])
-        elif op == 'permute': out = a.transpose(n['dims'])
-        elif op == 'transpose': out = a.T
-        elif op == 'gelu':
-            erf = np.vectorize(math.erf,otypes=[float])(a.astype(np.float64)/math.sqrt(2))
-            out = 0.5*a.astype(np.float64)*(1+erf)
-        elif op == 'softmax':
-            exps = np.exp(a-a.max(axis=-1,keepdims=True)); out = exps/exps.sum(axis=-1,keepdims=True)
-        else: raise AssertionError('Unsupported test op '+op)
-        values.append(np.asarray(out,dtype=np.float32))
-    return values[template['graph']['outputs'][0]['id']]
 
 class PluginTests(unittest.TestCase):
     @classmethod

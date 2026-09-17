@@ -26,19 +26,29 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGINS = [
     ('tiny-causal', 'org.zipp.tiny-causal', '0.2.0', 'tiny-char'),
     ('bigram', 'org.zipp.bigram', '0.2.0', 'bigram'),
+    # No bundled example: a GPT-Neo checkpoint is converted locally by
+    # tools/convert_gpt_neo.py and never redistributed with ZIPP.
+    ('gpt-neo', 'org.zipp.gpt-neo', '0.1.0', None),
 ]
 
 def main():
     catalogue = []
     for directory, identifier, version, example in PLUGINS:
         path = ROOT/'plugins'/directory
-        support = plugin_support(load_plugin(path))
+        module = load_plugin(path)
+        support = plugin_support(module)
         sources = {p.relative_to(path).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                    for p in sorted(path.rglob('*.py'))}
         manifest = dict(format='zipp.python-model-plugin', version=1, id=identifier,
                         plugin_version=version, entry='architecture', capabilities=['graph-v2'],
                         checkpoint_format=support['checkpoint_format'],
-                        tokenizer_formats=support['tokenizer_formats'], sources=sources)
+                        tokenizer_formats=support['tokenizer_formats'])
+        # A plugin that can read a checkpoint folder as its own project laid it
+        # out declares the config file it understands and the tokenizer files it
+        # needs. Read from the source, so the manifest cannot claim more.
+        if hasattr(module, 'NATIVE_LAYOUT'):
+            manifest['native'] = module.NATIVE_LAYOUT
+        manifest['sources'] = sources
         raw = (json.dumps(manifest, indent=2) + '\n').encode()
         (path/'plugin.json').write_bytes(raw)
         digest = hashlib.sha256(raw).hexdigest()
@@ -46,6 +56,10 @@ def main():
                               manifest=f'plugins/{directory}/plugin.json', sha256=digest,
                               checkpoint_format=support['checkpoint_format'],
                               tokenizer_formats=support['tokenizer_formats']))
+        if example is None:
+            print(f'{identifier}@{version}: {len(sources)} source file(s), '
+                  f'{support["checkpoint_format"]} checkpoints, no bundled example model')
+            continue
         model_path = ROOT/'examples'/example/'model.json'
         model = json.loads(model_path.read_text())
         model['architecture'] = dict(id=identifier, version=version, sha256=digest)
