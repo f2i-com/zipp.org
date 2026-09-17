@@ -20,7 +20,21 @@ cd "$(dirname "$0")/.."
 CRATE="../rust"
 OUT="wasm/kernels.wasm"
 
+# Where this was built must not be part of what was built. `gguf-quants` comes
+# from a git dependency, so rustc records a panic location inside the cargo
+# checkout -- an absolute path naming whoever ran this. That is 40-odd bytes
+# nobody else can reproduce, in a binary that is committed and meant to be
+# checkable by rebuilding it. Remapped to a fixed stand-in instead.
+#
+# The prefix has to match the form rustc records, which on Windows is
+# `C:\Users\...` and not the `/c/Users/...` this shell uses, hence cygpath.
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+if command -v cygpath >/dev/null 2>&1; then
+  cargo_home=$(cygpath -w "$cargo_home")
+fi
+
 RUSTFLAGS="-C target-feature=+simd128 \
+ --remap-path-prefix=$cargo_home=/cargo \
  -C link-arg=--export-memory \
  -C link-arg=--export=__heap_base \
  -C link-arg=--initial-memory=2097152 \
