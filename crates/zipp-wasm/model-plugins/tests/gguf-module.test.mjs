@@ -7,6 +7,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import {access, readFile} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+
 import {ggufSupport, loadGgufModule, requireGgufModule} from '../src/index.mjs';
 
 test('a host can supply the module itself', async () => {
@@ -44,4 +47,44 @@ test('the fetched module is found where the fetch script puts it', async () => {
   assert.equal(support.source, 'node module');
   assert.equal(typeof support.module.GgufHeader, 'function');
   assert.equal(typeof support.module.dequantize, 'function');
+});
+
+// ---- what is in the tree, and where it came from ----------------------------
+
+test('the GGUF module in the tree is the one the lock file records', async () => {
+  // A version number is a name and a name can come to mean different bytes, so
+  // scripts/fetch_gguf_wasm.sh writes down the digest of everything it put
+  // here. A file that changed without that script running should be a failing
+  // test rather than a mystery.
+  const lockPath = new URL('../wasm/gguf-wasm.lock.json', import.meta.url);
+  if (!await access(lockPath).then(() => true, () => false)) return;  // not fetched
+  const lock = JSON.parse(await readFile(lockPath, 'utf8'));
+
+  assert.match(lock.tag, /^v\d+\.\d+\.\d+$/, 'the lock names a release');
+  assert.match(lock.commit, /^[0-9a-f]{40}$/, 'and the revision that release was built from');
+  assert.ok(Object.keys(lock.files).length > 0, 'and what it put in the tree');
+
+  for (const [name, expected] of Object.entries(lock.files)) {
+    const bytes = await readFile(new URL(`../wasm/${name}`, import.meta.url));
+    const actual = createHash('sha256').update(bytes).digest('hex');
+    assert.equal(actual, expected, `wasm/${name} is not what the lock records`);
+  }
+});
+
+test('the Rust pin and the WebAssembly pin are the same revision', async () => {
+  // A matmul that reads a quantized weight has to decode it exactly as the
+  // reader does. They use the same code, which only means anything if they use
+  // the same *version* of it -- so the two pins are checked against each other
+  // rather than trusted to be moved together.
+  const lockPath = new URL('../wasm/gguf-wasm.lock.json', import.meta.url);
+  const manifestPath = new URL('../../rust/Cargo.toml', import.meta.url);
+  for (const path of [lockPath, manifestPath]) {
+    if (!await access(path).then(() => true, () => false)) return;
+  }
+  const lock = JSON.parse(await readFile(lockPath, 'utf8'));
+  const manifest = await readFile(manifestPath, 'utf8');
+  const pinned = /rev = "([0-9a-f]{40})"/.exec(manifest);
+  assert.ok(pinned, 'rust/Cargo.toml pins gguf-quants by revision');
+  assert.equal(pinned[1], lock.commit,
+    'rust/Cargo.toml and wasm/gguf-wasm.lock.json name different revisions of gguf-wasm');
 });

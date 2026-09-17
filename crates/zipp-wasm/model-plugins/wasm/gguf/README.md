@@ -48,21 +48,56 @@ inside the matmul, which is the difference between a 0.6B model holding at
 
 ## The crates
 
-| | |
-| --- | --- |
-| `gguf` | the container: magic, version, metadata, tensor shapes, the byte range of every tensor. With `std`, opening a file and reading tensors and rows out of it. |
-| `gguf-quants` | the block formats, decoded exactly: F32, F16, BF16, Q4_0/1, Q5_0/1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS. |
-| `gguf-tokenizer` | byte-level BPE over the file's own vocabulary, with the pre-tokenizer that vocabulary was trained with. |
-| `gguf-wasm` | the `wasm-bindgen` surface: the three above, in a browser. |
+| package | library | |
+| --- | --- | --- |
+| `f2i-gguf` | `gguf` | the container: magic, version, metadata, tensor shapes, the byte range of every tensor. With `std`, opening a file and reading tensors and rows out of it. |
+| `f2i-gguf-quants` | `gguf_quants` | the block formats, decoded exactly: F32, F16, BF16, Q4_0/1, Q5_0/1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS. |
+| `f2i-gguf-tokenizer` | `gguf_tokenizer` | byte-level BPE over the file's own vocabulary, with the pre-tokenizer that vocabulary was trained with. |
+| `f2i-gguf-wasm` | `gguf_wasm` | the `wasm-bindgen` surface: the three above, in a browser. |
 
-Everything except `gguf-wasm` builds without `std`, which is what lets the same
-code serve a browser, a server and a freestanding module with no allocator.
+The published names carry an `f2i-` prefix because `gguf` on crates.io is an
+unrelated crate. The *library* names do not, so a consumer aliases the package
+once and `use gguf::...` reads the way you would expect:
+
+```toml
+gguf = { package = "f2i-gguf", version = "0.0.1", features = ["std"] }
+```
+
+Everything except the wasm surface builds without `std`, which is what lets the
+same code serve a browser, a server and a `wasm32` target. That is `no_std`,
+not allocation-free: `gguf` and `gguf-tokenizer` use `alloc` — `Vec`, `String`,
+`BTreeMap` — because parsing metadata means building collections. Only
+`gguf-quants` allocates nothing at all: every routine decodes into a slice its
+caller already owns, which is what lets a freestanding module with no allocator
+use it.
+
+## Reading something you did not write
+
+A parser takes numbers out of a file and then allocates according to them,
+which is the whole attack surface of a format like this. So:
+
+* lengths are `u64` in the format and `usize` on the machine, and on `wasm32`
+  that is a narrowing — checked, never cast;
+* a count is refused when the remaining bytes could not hold that many elements
+  even at their minimum size, which bounds every allocation by the file's own
+  length before a single byte is reserved;
+* additions and products that could overflow are checked;
+* duplicate metadata keys and duplicate tensor names are refused, because a
+  file that makes a reader choose which one wins is malformed;
+* `ParseLimits` bounds the rest, and a caller that knows its inputs can raise
+  or lower it.
+
+None of this is about Rust memory safety, which is not in question. It is about
+a malformed or hostile file producing an error rather than a panic, a silently
+truncated length, or an allocation that takes the process down. `crates/gguf/
+tests/hostile.rs` is where that is checked, including every prefix of a
+plausible header and a couple of thousand rounds of arbitrary bytes.
 
 ## Rust
 
 ```toml
 [dependencies]
-gguf = { version = "0.1", features = ["std"] }
+gguf = { package = "f2i-gguf", version = "0.0.1", features = ["std"] }
 ```
 
 ```rust
@@ -81,9 +116,18 @@ let values = model.tensor_f32("blk.0.attn_q.weight")?;
 let embedding = model.rows_f32("token_embd.weight", &[12095])?;
 ```
 
-Without the `std` feature there is no file and no filesystem: you hand
-`GgufFile::from_bytes` a header you read yourself, which is what a browser and
-an embedded target need.
+Without the `std` feature there is no file and no filesystem. You hand
+`GgufHeader::from_bytes` a header you read yourself, and it tells you where a
+tensor is:
+
+```rust
+let header = gguf::GgufHeader::from_bytes(&first_megabyte)?;
+let range = header.range_of("blk.0.attn_q.weight")?;   // offset and length
+```
+
+A header holds no file bytes and cannot hand you a tensor body — reading that
+range is the caller's job, because only the caller knows whether the file is a
+`File`, a `Blob`, an HTTP resource or a peer.
 
 ## JavaScript
 
@@ -108,9 +152,29 @@ tokenizer.decode(ids);
 parses, turning a tensor name into a byte range, and fetching that range. The
 module underneath is smaller and you can use it directly.
 
-Sources it can read through: `fromBlob(file)`, `fromURL(url)` (HTTP Range — a
-server that ignores it is caught rather than silently read whole), and
-`fromFileHandle(handle, size)` for Node.
+Three sources: `fromBlob(file)`, `fromFileHandle(handle, size)`, and
+`fromURL(url)`.
+
+### Reading one object, not several
+
+`fromURL` reads a model over many requests, and the failure that matters is not
+a request that fails — it is a *successful* one against a different object. A
+header parsed from version A and a weight fetched from version B are both 206,
+both the right length, and the model is quietly wrong. So identity is pinned
+when the model is opened and carried afterwards:
+
+* the open is a one-byte range request, not a HEAD. A server that honours Range
+  answers with a `Content-Range` stating the total, which is proof rather than a
+  promise — and some perfectly good servers and CDNs do not expose
+  `Accept-Ranges` or `Content-Length` to a cross-origin HEAD at all;
+* whatever validator comes back (`ETag`, else `Last-Modified`) is sent as
+  `If-Range` on every read after that, so a changed object answers 200 with the
+  whole entity and is refused;
+* every response's `Content-Range` must be the range that was asked for, out of
+  a total that has not changed.
+
+That does not make an HTTP source trustworthy. It makes it *consistent*: what
+is read is all from one object, or it is an error.
 
 ## The tokenizer is not an afterthought
 
@@ -169,12 +233,16 @@ from that tag's `Cargo.lock`.
 ## Tests
 
 ```sh
-cargo test                                            # the format itself
-GGUF_MODEL=model.gguf cargo test -p gguf --features std   # against a real file
+cargo test --workspace                                # the format itself
+cargo test -p f2i-gguf --features std                 # and the file reader
+node --test js/index.test.mjs                         # the source adapters
+sh scripts/build-wasm.sh && node scripts/smoke.mjs    # the built module
+GGUF_MODEL=model.gguf cargo test -p f2i-gguf --features std   # against a real file
 ```
 
 A checkpoint is not redistributed here, so the tests that need one skip without
-`GGUF_MODEL`.
+`GGUF_MODEL`. Everything else runs anywhere, including the hostile-file suite
+and a smoke test that writes its own GGUF.
 
 ## Provenance and licence
 

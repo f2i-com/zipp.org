@@ -1,0 +1,28 @@
+{
+  "comment": "Written by scripts/fetch_gguf_wasm.sh. Checked by tests/gguf-module.test.mjs.",
+  "repository": "https://github.com/f2i-com/gguf-wasm",
+  "tag": "v0.0.1",
+  "commit": "91b198f4eb062c2129f03ba6231ff00ff1271236",
+  "assets": {
+    "gguf-wasm-node-v0.0.1.tar.gz": "5a0bd0eee8adfa87a420ac9939114386772e50274453b4a9a7d244971e0f8f50",
+    "gguf-wasm-web-v0.0.1.tar.gz": "297d8bfa662ac95f94beee53d16cdddb321feefecbf2c71251364c2a54c1d3f3"
+  },
+  "files": {
+    "gguf/gguf_wasm.d.ts": "efbff34bb3b08ddb5b9bcb471a86b4ba26e013c6280235bb7dd2d41df3a122aa",
+    "gguf/gguf_wasm.js": "40907e403df3f6f380924c7ec9915aae4d05021a6096867d356de42edc2e9786",
+    "gguf/gguf_wasm_bg.wasm": "f569c5cf6b0244bbb81ad7e2395ab216ca31c8d1a2844779c7eef521c0321449",
+    "gguf/gguf_wasm_bg.wasm.d.ts": "f05938d5f4d1cca6c1f4ed62fd54efa7e3c5f48164456d7a19da7cb6dc12d185",
+    "gguf/index.mjs": "93a14c7fa5592a47f3a0c562a6ecd9b6d7889ed36e8101d07224b318371715df",
+    "gguf/LICENSE-APACHE": "00bf49683632f765eb2c943fecb32d58c1e62a7102b3fa2f08b3875e56d7eb39",
+    "gguf/LICENSE-MIT": "7f98ad5f09a08c69affb7b26109ecad8004cba078de9b77c7ed42fafc8dd7776",
+    "gguf/README.md": "667c78478aff5c5d21be175f46ab3b419c68bbf7b226c2b234f65e9744981734",
+    "gguf-node/gguf_wasm.d.ts": "cb2412ab1f3af42427ad6e209fc9afaf1c719da888928d05a76b21fa05754609",
+    "gguf-node/gguf_wasm.js": "289e5c33e25a71b1a14986c0a26ae9383be827366a20735445ea951c9f325557",
+    "gguf-node/gguf_wasm_bg.wasm": "f569c5cf6b0244bbb81ad7e2395ab216ca31c8d1a2844779c7eef521c0321449",
+    "gguf-node/gguf_wasm_bg.wasm.d.ts": "f05938d5f4d1cca6c1f4ed62fd54efa7e3c5f48164456d7a19da7cb6dc12d185",
+    "gguf-node/LICENSE-APACHE": "00bf49683632f765eb2c943fecb32d58c1e62a7102b3fa2f08b3875e56d7eb39",
+    "gguf-node/LICENSE-MIT": "7f98ad5f09a08c69affb7b26109ecad8004cba078de9b77c7ed42fafc8dd7776",
+    "gguf-node/package.json": "dbf8353f77358bc12169b7bb7301e1978d5b503e002ee927229a8993672818fc",
+    "gguf-node/README.md": "667c78478aff5c5d21be175f46ab3b419c68bbf7b226c2b234f65e9744981734"
+  }
+}

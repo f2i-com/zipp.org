@@ -26,10 +26,14 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # The block decoders, from the GGUF project. A matmul that reads a quantized
-# weight has to decode it the same way the reader does, so it uses the same
-# code rather than a copy of it -- and the pin is a tag, so the decoder ZIPP
-# compiles against is the one a given release was built from.
-gguf-quants = { git = "https://github.com/f2i-com/gguf-wasm", tag = "v0.1.0" }
+# weight has to decode it exactly as the reader does, so it uses that code
+# rather than a copy of it.
+#
+# Pinned by revision, not by tag: a tag is a name and a name can be moved, a
+# revision is the code. This one is gguf-wasm v0.0.1, and it is the same
+# revision ../model-plugins/wasm/gguf-wasm.lock.json records for the
+# WebAssembly build in the tree. Move both together.
+gguf-quants = { package = "f2i-gguf-quants", git = "https://github.com/f2i-com/gguf-wasm", rev = "91b198f4eb062c2129f03ba6231ff00ff1271236" }
 
 [profile.release]
 opt-level = 3

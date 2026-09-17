@@ -30,7 +30,10 @@ const FIRST = 1 << 20;
 const LARGEST = 64 << 20;
 
 /** A `File` or `Blob` the person chose. Nothing is uploaded and nothing is
- * loaded: `slice` is a view, and only the slice is read. */
+ * loaded: `slice` is a view, and only the slice is read.
+ *
+ * A `Blob` is immutable, so unlike a URL there is no question of the bytes
+ * changing between the header read and a tensor read. */
 export function fromBlob(blob) {
   return {
     size: () => blob.size,
@@ -40,28 +43,90 @@ export function fromBlob(blob) {
   };
 }
 
-/** A URL, over HTTP Range. The server has to honour it; one that ignores
- * Range and sends the whole file is caught here rather than silently read. */
-export function fromURL(url, {fetch: fetcher = globalThis.fetch} = {}) {
-  let size = null;
+/** `Content-Range: bytes 12-34/5678`, as numbers. Null if it is not that. */
+function parseContentRange(header) {
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(header ?? '').trim());
+  if (!match) return null;
+  const [, start, end, total] = match;
+  return {start: Number(start), end: Number(end), total: Number(total)};
+}
+
+/**
+ * A URL, over HTTP Range.
+ *
+ * Reading a model over the network means many requests against one object, and
+ * the thing that goes wrong is not a failed request -- it is a *successful* one
+ * against a different object. A header parsed from version A and a weight
+ * fetched from version B both succeed, and the result is a model that is
+ * quietly wrong. So the object's identity is pinned when it is opened and
+ * carried on every read afterwards:
+ *
+ *   * the open is a one-byte range request, not a HEAD. A server that honours
+ *     Range answers 206 with a `Content-Range` that states the total length,
+ *     which is the same information a HEAD would give and is proof rather than
+ *     a promise. Some perfectly good servers and CDNs do not expose
+ *     `Accept-Ranges` or `Content-Length` to a cross-origin HEAD at all.
+ *   * whatever validator comes back -- `ETag`, else `Last-Modified` -- is sent
+ *     as `If-Range` on every subsequent read. A server whose object has changed
+ *     answers 200 with the whole entity instead of 206, and that is refused.
+ *   * every response's `Content-Range` must be the range that was asked for,
+ *     out of a total that has not changed.
+ *
+ * None of this makes an HTTP source trustworthy. It makes it *consistent*: what
+ * is read is all from one object, or it is an error.
+ */
+export function fromURL(url, {fetch: fetcher = globalThis.fetch, headers = {}, signal} = {}) {
+  let size = null, validator = null;
+
+  const request = extra => ({headers: {...headers, ...extra}, signal});
+
+  const checkRange = (response, offset, length) => {
+    if (response.status === 200) {
+      throw new Error(`${url} returned the whole entity: the object changed since it was opened`);
+    }
+    if (response.status !== 206) {
+      throw new Error(`${url} did not honour a range request (${response.status})`);
+    }
+    const range = parseContentRange(response.headers.get('content-range'));
+    if (!range) throw new Error(`${url} returned no usable Content-Range`);
+    if (range.start !== offset || range.end !== offset + length - 1) {
+      throw new Error(`${url} returned bytes ${range.start}-${range.end}, not ${offset}-${offset + length - 1}`);
+    }
+    if (size !== null && range.total !== size) {
+      throw new Error(`${url} is now ${range.total} bytes, was ${size}: the object changed`);
+    }
+    const now = response.headers.get('etag') ?? response.headers.get('last-modified');
+    if (validator && now && now !== validator) {
+      throw new Error(`${url} changed identity (${validator} -> ${now})`);
+    }
+    return range;
+  };
+
   return {
     async prepare() {
-      const head = await fetcher(url, {method: 'HEAD'});
-      if (!head.ok) throw new Error(`HEAD ${url}: ${head.status}`);
-      size = Number(head.headers.get('content-length'));
+      const response = await fetcher(url, request({Range: 'bytes=0-0'}));
+      const range = checkRange(response, 0, 1);
+      await response.arrayBuffer();
+      size = range.total;
       if (!Number.isFinite(size) || size <= 0) throw new Error(`${url} reports no length`);
-      if ((head.headers.get('accept-ranges') ?? '') !== 'bytes') {
-        throw new Error(`${url} does not accept range requests`);
-      }
+      // Pinned here, and required to still hold on every read after this.
+      validator = response.headers.get('etag') ?? response.headers.get('last-modified') ?? null;
     },
     size: () => size,
     async read(offset, length) {
-      const response = await fetcher(url, {headers: {Range: `bytes=${offset}-${offset + length - 1}`}});
-      if (response.status !== 206) throw new Error(`${url} ignored a range request (${response.status})`);
+      if (length === 0) return new Uint8Array(0);
+      const response = await fetcher(url, request({
+        Range: `bytes=${offset}-${offset + length - 1}`,
+        ...(validator ? {'If-Range': validator} : {}),
+      }));
+      checkRange(response, offset, length);
       const bytes = new Uint8Array(await response.arrayBuffer());
       if (bytes.length !== length) throw new Error(`${url} returned ${bytes.length} of ${length} bytes`);
       return bytes;
     },
+    /** What identity this source pinned, if the server offered one. A caller
+     * that stores a model reference alongside a digest wants this. */
+    identity: () => validator,
   };
 }
 
