@@ -123,7 +123,11 @@ class Graph:
         `cos` and `sin` are [length, 1, dim] inputs the host computed, so no
         trigonometry happens here. `rotate_half` -- negate the second half and
         put it first -- is a permutation with a sign, which becomes a 2x2
-        matrix multiply once the head dimension is viewed as [2, dim/2]."""
+        matrix multiply once the head dimension is viewed as [2, dim/2].
+
+        Six operations, which is the right shape for a prompt: the alternative
+        below costs a matrix per position, and a prompt has many. One token has
+        one position, and `rope_once` is that case."""
         half = dim // 2
         # [L, H, dim] -> [L, H, 2, half] -> [L, H, half, 2] -> [L*H*half, 2]
         pairs = self.op("reshape", a=x, shape=[length, heads, 2, half])
@@ -137,6 +141,24 @@ class Graph:
         turned = self.op("reshape", a=turned, shape=[length, heads, dim])
         return self.op("add", a=self.op("mul", a=x, b=cos),
                        b=self.op("mul", a=turned, b=sin))
+
+    def rope_once(self, x, heads, dim, rotation):
+        """The same rotation for one token, as a single multiply.
+
+        `x*cos + rotate_half(x)*sin` is a linear map of the head, and every
+        term in it depends only on the position and the index -- so the host
+        can hand over the map itself, a [dim, dim] matrix with two non-zeros a
+        column, and this becomes one operation instead of six.
+
+        The arithmetic is larger and the wall clock is smaller. A decode step
+        is twenty-eight layers deep and spends more time telling a GPU what to
+        do than doing it, so six dispatches saved fifty-six times a step is
+        worth a matrix multiply that a GPU finishes in nanoseconds. The same
+        trade is a bad one for a prompt, where the matrix would be per
+        position and the JSON carrying it would dwarf the graph."""
+        flat = self.op("reshape", a=x, shape=[heads, dim])
+        turned = self.op("matmul", a=flat, b=rotation)
+        return self.op("reshape", a=turned, shape=[1, heads, dim])
 
     def repeat_heads(self, x, length, heads, times, dim):
         """Grouped-query attention: each key/value head serves `times` query
@@ -179,7 +201,9 @@ class Graph:
         constants; a decode graph is built once and run at every position, so
         the host computes them per step. They are trigonometry over a position
         and an index, never over the data."""
-        node = self.op("input", shape=[1, 1, dim])
+        # A matrix is the whole rotation; a table is one of its two halves.
+        shape = [dim, dim] if part == "matrix" else [1, 1, dim]
+        node = self.op("input", shape=shape)
         self.bindings.append({"node": node, "kind": "step", "slot": "rope",
                               "part": part, "dim": dim, "base": float(base)})
         return node

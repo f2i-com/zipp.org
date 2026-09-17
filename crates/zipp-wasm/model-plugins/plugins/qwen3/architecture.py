@@ -136,8 +136,7 @@ def build_decode_graph(config, context=None):
     mask = g.step_mask(context)
     write = g.step_write(context)
     keep = g.op("sub", a=g.scalar(1.0), b=write)
-    cos = g.step_rope("cos", dim, config["rope_base"])
-    sin = g.step_rope("sin", dim, config["rope_base"])
+    rotation = g.step_rope("matrix", dim, config["rope_base"])
     scale = g.scalar(1.0 / (dim ** 0.5))
 
     for layer in range(config["num_layers"]):
@@ -151,8 +150,8 @@ def build_decode_graph(config, context=None):
                  shape=[1, kv_heads, dim])
         q = g.rms_norm(q, block + "attn_q_norm.weight", dim, epsilon)
         k = g.rms_norm(k, block + "attn_k_norm.weight", dim, epsilon)
-        q = g.rope(q, 1, heads, dim, cos, sin)
-        k = g.rope(k, 1, kv_heads, dim, cos, sin)
+        q = g.rope_once(q, heads, dim, rotation)
+        k = g.rope_once(k, kv_heads, dim, rotation)
 
         # Into the caches, which are [context, kv_width] and carried.
         keys = g.write_cache("k" + str(layer), g.cache("k" + str(layer), [context, kv_width]),

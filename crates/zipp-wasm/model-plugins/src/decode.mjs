@@ -32,7 +32,7 @@ const residentDtype = (weights, name) =>
  * belong on this side of the boundary rather than in a kernel.
  */
 const STEP_SLOTS = new Set(['rows', 'mask', 'write', 'rope']);
-const ROPE_PARTS = new Set(['cos', 'sin']);
+const ROPE_PARTS = new Set(['cos', 'sin', 'matrix']);
 const INDEXES = new Set(['token', 'position']);
 /** Graph v2 wants finite float32; this is the mask sentinel, not -Infinity. */
 const MASKED = -1e9;
@@ -150,7 +150,8 @@ export async function prepareDecode(template, weights, limits) {
         check(binding.dim % 2 === 0, 'SHAPE', 'Rotary embeddings need an even dimension');
         check(typeof binding.base === 'number' && Number.isFinite(binding.base) && binding.base > 1,
           'FORMAT', 'A rotary base is a finite number above one');
-        check(sameShape(node.shape, [1, 1, binding.dim]), 'SHAPE', 'A rotary table is [1, 1, dim]');
+        check(sameShape(node.shape, binding.part === 'matrix' ? [binding.dim, binding.dim] : [1, 1, binding.dim]),
+          'SHAPE', binding.part === 'matrix' ? 'A rotary matrix is [dim, dim]' : 'A rotary table is [1, 1, dim]');
       } else if (binding.slot === 'rows') {
         check(INDEXES.has(binding.index), 'FORMAT', 'A gathered row is indexed by token or position');
         const shape = weights.info(binding.tensor).shape;
@@ -219,12 +220,27 @@ export async function stepInputs(plan, weights, {token, position}) {
     } else if (step.slot === 'rope') {
       // The angles depend on the position and the index, never on the data,
       // so they are computed here rather than being an operation.
-      const half = step.dim / 2, table = new Float32Array(step.dim);
-      for (let i = 0; i < step.dim; i++) {
-        const angle = position / step.base ** ((2 * (i % half)) / step.dim);
-        table[i] = step.part === 'cos' ? Math.cos(angle) : Math.sin(angle);
+      const half = step.dim / 2;
+      const angle = i => position / step.base ** ((2 * (i % half)) / step.dim);
+      if (step.part === 'matrix') {
+        // The whole rotation as one matrix, so a graph applies it with one
+        // multiply rather than a rotate-half built out of six operations. Two
+        // non-zeros a column: x[j] keeps cos, and the other half of its pair
+        // arrives with sin, negated for the first half -- which is what
+        // rotate-half means, written as the linear map it is.
+        const rotation = new Float32Array(step.dim * step.dim);
+        for (let j = 0; j < step.dim; j++) {
+          const a = angle(j);
+          rotation[j * step.dim + j] = Math.cos(a);
+          const partner = j < half ? j + half : j - half;
+          rotation[partner * step.dim + j] = j < half ? -Math.sin(a) : Math.sin(a);
+        }
+        inputs[step.node] = rotation;
+      } else {
+        const table = new Float32Array(step.dim);
+        for (let i = 0; i < step.dim; i++) table[i] = step.part === 'cos' ? Math.cos(angle(i)) : Math.sin(angle(i));
+        inputs[step.node] = table;
       }
-      inputs[step.node] = table;
     } else if (step.slot === 'mask') {
       const mask = new Float32Array(plan.context);
       for (let column = 0; column < plan.context; column++) {
