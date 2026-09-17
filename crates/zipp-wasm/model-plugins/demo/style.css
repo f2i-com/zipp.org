@@ -12,3 +12,4 @@ button#cancel{background:transparent;color:#dce4f4}button:disabled{opacity:.45;c
 pre{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,monospace}#output{min-height:105px;background:#0f1521;border-radius:8px;padding:18px;font-size:1.1rem}#details{font-size:.78rem;color:#bfcce4}
 #status{font-size:.9rem;color:#b8c9f3}details{margin-top:16px}footer{padding:8px 0 20px} [hidden]{display:none!important}
 @media(max-width:550px){main{padding:30px 16px}section{padding:18px}.columns{grid-template-columns:1fr;gap:0}.buttons{flex-wrap:wrap}}
+.warn{color:#b45309}

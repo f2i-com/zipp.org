@@ -84,12 +84,102 @@ Measured on `blk.0.attn_q.weight` of a 6.8 GB Q4_K_M Gemma 3 12B:
 matrices are Q4_K is roughly 450 MB of weights instead of 3.2 GB, which is the
 difference between a browser tab and a wall.
 
-Two things are not done. Only the JavaScript reference backend reads blocks; the
-C kernels, WebGPU and WebGL2 still want float32, and porting the decode into
-each is three ports of one settled design rather than three designs. And this
-reader does not yet bind a tensor as blocks -- `readTensor` dequantizes, so
-reaching the 7.11x through a plugin needs a binding that passes blocks straight
-through. Both are mechanical now that the protocol and the reference exist.
+All four backends read blocks: the JavaScript reference, the compiled SIMD
+kernels, WebGPU and WebGL2. Each decodes inside its own matmul rather than
+before it, and each is checked two ways -- the quantized product against that
+same backend's product over decoded values, and the whole thing against the
+reference. The first of those is **exact on every backend**, because decoding
+is integer arithmetic and two half-precision scales and there is nothing to
+round differently; `gpu-lab/scripts/check-gpu-matmul.cjs` is what measures it in
+a real browser.
+
+| Backend | decoder | product vs cpu-js |
+| --- | --- | --- |
+| cpu-js | exact | reference |
+| wasm (SIMD) | exact | **exact** |
+| WebGPU | exact | **exact** |
+| WebGL2 | exact | 6.1e-5 |
+
+WebGL2's difference is a float32 GPU summing in its own order, not a decoder:
+its transposed f32 matmul differs from cpu-js by exactly the same amount.
+
+Both Q4_K and Q6_K, which between them are what a `Q4_K_M` checkpoint is made
+of. Q6_K blocks are 210 bytes, so they are not word-aligned and the shaders
+address the buffer by byte rather than by word.
+
+## A model, end to end
+
+`plugins/qwen3/` is the first architecture that runs this way. Measured on a
+Qwen3-0.6B Q4_K_M, through the real engine running the plugin's Python:
+
+| | |
+| --- | --- |
+| Opened | 37 ms, from a 16 MiB header read |
+| Bound | 0.4 s, 310 tensors |
+| Resident | **373 MB** -- 372 MB of blocks, 1 MB of float32 norms |
+| The same weights as float32 | 2,274 MB |
+| Forward pass | 0.9 s (5 tokens, compiled SIMD kernels) |
+| "The capital of France is" | predicts " Paris" |
+
+Nothing was decoded: every matrix in that family is Q4_K or Q6_K, so 99.7% of
+what the device holds is the file's own bytes. That last row is the point --
+a model that loads and produces finite logits can still be wrong in ways that
+look like plausible nonsense, so the test asks a question with one answer.
+
+Two bindings make this work, and a plugin picks between them by intent rather
+than by dtype:
+
+* `matrix` -- a weight matrix in the checkpoint's own `[out, in]` layout. The
+  host keeps it as blocks where a backend can decode them and expands it where
+  one cannot; the graph multiplies it `transposed` either way, so the plugin
+  does not change when the answer does.
+* `blocks` -- the same, but it refuses rather than expanding, for a caller that
+  means it.
+
+A GGUF file describes itself, so there is no `config.json` to read: the plugin's
+`config_from_gguf` maps the metadata under its own architecture prefix and
+refuses a file that is not its family.
+
+## The tokenizer comes out of the file too
+
+A GGUF checkpoint carries its own vocabulary, merge table and -- importantly --
+the name of the pre-tokenizer it was trained with. `index.tokenizer()` builds
+one inside the module and keeps it there: 151,936 token strings and 151,387
+merges are expensive to move across the boundary and pointless to move, since
+the encoder is the only thing that reads them. Building it takes about 180 ms,
+against the minutes the same tables took in guest Python.
+
+The pattern matters more than it looks. Qwen2 splits digits **one at a time**
+where Llama-3 takes them three at a time and GPT-2 takes a run with its leading
+space. Using the wrong one produces ids that are individually valid and
+collectively wrong, so `tokenizer.ggml.pre` is read and a name this build does
+not recognise is refused rather than guessed.
+
+    "The capital of France is"  ->  785, 6722, 315, 9625, 374
+    "12345"                     ->  220, 16, 17, 18, 19, 20   (qwen2: one per digit)
+
+## Cached decoding
+
+`build_graph` recomputes the whole prompt for every token and is the oracle.
+`build_decode_graph` is the shape that makes a checkpoint usable: the weights
+are uploaded once as blocks, the keys and values stay on the device as carried
+inputs, and a token costs one position rather than the whole context.
+
+Rotary models need one thing the eager path does not. A prefill knows every
+position when it is built and carries its cosines and sines as constants; a
+decode graph is built once and run at every position, so the host feeds them per
+step through a `rope` slot. They are trigonometry over a position and an index,
+never over the data, which is why they belong on the host side rather than in a
+kernel.
+
+Measured on the 0.6B, cache included, compiled SIMD kernels:
+
+| | |
+| --- | --- |
+| Prepared | 0.4 s, 56 caches (two per layer) |
+| Resident | 401 MB at context 128 -- 372 MB of blocks, 28 MB of cache |
+| Throughput | ~3.9 tokens a second |
+| "The capital of France is" | " Paris. The capital of France is also the capital of the Republic" |
 
 ## A reader is not a model
 

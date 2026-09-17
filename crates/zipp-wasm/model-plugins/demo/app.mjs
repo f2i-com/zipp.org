@@ -19,8 +19,19 @@ function entries(input){
   // structured cloning across the Worker boundary.
   return map;
 }
+// Whether the optional GGUF WebAssembly module was built, answered once at
+// startup so the page can say so instead of failing at run time.
+import('../src/index.mjs').then(async ({ggufSupport})=>{
+  const support=await ggufSupport();
+  $('gguf-support').textContent=support.available
+    ?'GGUF support is built and ready.'
+    :`GGUF support is not built. ${support.remedy}`;
+  $('gguf-support').classList.toggle('warn',!support.available);
+}).catch(error=>{$('gguf-support').textContent=`GGUF support could not be checked: ${error.message}`;});
+
 $('source').addEventListener('change',()=>{
   const source=$('source').value;
+  $('gguf-fields').hidden=source!=='gguf';
   $('local-fields').hidden=!['local','catalogue-local','hf-checkpoint'].includes(source);
   $('plugin-fields').hidden=source!=='local';
   $('catalogue-fields').hidden=!['catalogue-local','hf-checkpoint'].includes(source);
@@ -34,10 +45,19 @@ $('run').addEventListener('click',()=>{
     const selection=$('source').value,maxNewTokens=Number($('count').value);
     if(!Number.isInteger(maxNewTokens)||maxNewTokens<0||maxNewTokens>128)throw Error('Use 0–128 new tokens.');
     const payload={type:'run',selection,backend:$('backend').value,prompt:$('prompt').value,maxNewTokens};
+    if(selection==='gguf'){
+      const file=$('gguf').files[0];
+      if(!file)throw Error('Choose a .gguf file first.');
+      payload.ggufFile=file;
+      payload.temperature=Number($('temperature').value);
+      payload.topK=Number($('topk').value);
+      if(!Number.isFinite(payload.temperature)||payload.temperature<0||payload.temperature>2)throw Error('Use a temperature between 0 and 2.');
+      if(!Number.isInteger(payload.topK)||payload.topK<0||payload.topK>200)throw Error('Use a top-k between 0 and 200.');
+    }
     if(selection==='local')payload.pluginEntries=entries($('plugin'));
     if(['local','catalogue-local','hf-checkpoint'].includes(selection))payload.modelEntries=entries($('model'));
     if(['catalogue-local','hf-checkpoint'].includes(selection))payload.cataloguePlugin=$('catalogue-plugin').value;
-    const warning=selection==='hf-checkpoint'?'Download the selected Python architecture support from this website, then read your checkpoint folder as it is? You will be shown the digest of every file before it runs. Nothing is uploaded.':selection==='catalogue-local'?'Download the selected Python architecture support from this website, then run your local model? Model weights will not be downloaded or uploaded.':selection==='local'?'Run Python from the selected plugin folder inside ZIPP? Only approve code whose origin you trust. No local file will be uploaded.':'Download the selected tiny example and Python plugin from this website, then run it locally inside ZIPP?';
+    const warning=selection==='gguf'?'Download the architecture support this checkpoint names from this website, then read your GGUF file as it is? Nothing is uploaded, and the file is read by range rather than loaded.':selection==='hf-checkpoint'?'Download the selected Python architecture support from this website, then read your checkpoint folder as it is? You will be shown the digest of every file before it runs. Nothing is uploaded.':selection==='catalogue-local'?'Download the selected Python architecture support from this website, then run your local model? Model weights will not be downloaded or uploaded.':selection==='local'?'Run Python from the selected plugin folder inside ZIPP? Only approve code whose origin you trust. No local file will be uploaded.':'Download the selected tiny example and Python plugin from this website, then run it locally inside ZIPP?';
     if(!window.confirm(warning))return;
     stop();const gen=++generation;busy(true);$('output').textContent='';$('details').textContent='';$('status').textContent='Starting isolated model Worker…';
     worker=new Worker(new URL('./worker.mjs',import.meta.url),{type:'module'});arm();

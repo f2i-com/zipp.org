@@ -21,11 +21,29 @@
       <option value="catalogue-local">Website plugin + my local model folder</option>
       <option value="hf-checkpoint">Website plugin + my Hugging Face checkpoint folder</option>
       <option value="local">My local plugin + model folders</option>
+      <option value="gguf">Website plugin + my GGUF checkpoint (quantized)</option>
     </select>
     <p class="hint">Bundled examples download from this website only after approval. Local files are never uploaded by this lab.</p>
     <div id="catalogue-fields" hidden>
       <label for="catalogue-plugin">Architecture support to download (code only)</label>
       <select id="catalogue-plugin"><option value="tiny-causal">Tiny causal transformer</option><option value="bigram">Bigram</option><option value="gpt-neo">GPT-Neo (reads a checkpoint folder as published)</option></select>
+    </div>
+    <div id="gguf-fields" hidden>
+      <label for="gguf">GGUF file</label>
+      <input id="gguf" type="file" accept=".gguf">
+      <p class="hint" id="gguf-support">Checking whether GGUF support is built&hellip;</p>
+      <div class="columns">
+        <div><label for="temperature">Temperature</label>
+          <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8"></div>
+        <div><label for="topk">Top-k</label>
+          <input id="topk" type="number" min="0" max="200" value="40"></div>
+      </div>
+      <p class="hint">Temperature 0 is greedy: it always takes the most likely token, which on a small
+      model falls into repeating a phrase. A little temperature with top-k is what stops that.</p>
+      <p class="hint">A GGUF file describes itself, so no conversion and no <code>config.json</code>: the architecture,
+      the hyperparameters and the tokenizer all come out of the file. Quantized weights stay in the file's own block
+      format on the device &mdash; a 0.6B Qwen3 holds at about 373 MB where float32 would need 2,274 MB. The file is
+      read by range and never uploaded.</p>
     </div>
     <div id="local-fields" hidden>
       <div id="plugin-fields">
