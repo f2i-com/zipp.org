@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFile, readdir} from 'node:fs/promises';
+import {readFile, readdir, access} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {parseJSON} from '../src/json.mjs';
 import {safePath, resolveLimits, sha256} from '../src/common.mjs';
@@ -229,4 +229,51 @@ test('Python packages may begin with an empty __init__.py', async () => {
   ]);
   const plugin = await new PluginRegistry().install(new FileMapSource(entries), {approve: () => true});
   assert.equal(plugin.files['zipp_plugin/__init__.py'], '');
+});
+
+test('a matrix binding decodes where a source has no block form', async () => {
+  // `matrix` asks for the checkpoint's own [out, in] weight and lets the host
+  // keep it quantized where it can. A Safetensors file has no block form at
+  // all, so this is the fallback path -- decoded to float32, still in the
+  // stored layout, because the graph multiplies it transposed either way.
+  // Every tensor in the Qwen3 checkpoint is Q4_K or Q6_K, so nothing there
+  // reaches this branch; a Q5_K checkpoint would hit it first.
+  const [outs, ins] = [3, 4];
+  const values = Array.from({length: outs * ins}, (_, i) => (i % 7) / 3 - 1);
+  const bytes = packed({w: {dtype: 'F32', shape: [outs, ins], data_offsets: [0, outs * ins * 4]}}, f32(values));
+  const store = new WeightStore([await open(bytes)], limits);
+  try {
+    assert.equal(store.residentDtype('w'), null, 'Safetensors has no block form');
+    await assert.rejects(store.blocks('w'), /no block form/);
+
+    const a = [0.5, -1.0, 0.25, 2.0];
+    const graph = await bindGraph({
+      version: 1,
+      graph: {version: 2, nodes: [
+        {id: 0, op: 'input', shape: [1, ins], data: a},
+        {id: 1, op: 'input', shape: [outs, ins]},
+        {id: 2, op: 'matmul', a: 0, b: 1, transposed: true},
+      ], outputs: [{name: 'logits', id: 2}]},
+      bindings: [{node: 1, kind: 'matrix', tensor: 'w'}],
+    }, store, limits);
+
+    // Decoded floats in the stored layout, no dtype, no transposed copy.
+    assert.ok(graph.nodes[1].data instanceof Float32Array);
+    assert.equal(graph.nodes[1].dtype, undefined);
+    assert.deepEqual([...graph.nodes[1].data], values.map(Math.fround));
+
+    const runtimeURL = new URL('../../gpu-lab/src/runtime.mjs', import.meta.url);
+    try { await access(runtimeURL); } catch { return; } // sibling package, not a dependency
+    const {createRuntime} = await import(runtimeURL);
+    const runtime = await createRuntime({backend: 'cpu-js'});
+    try {
+      const got = await runtime.execute(graph, {typedOutputs: true});
+      const want = Array.from({length: outs}, (_, o) => {
+        let sum = 0;
+        for (let i = 0; i < ins; i++) sum = Math.fround(sum + Math.fround(a[i] * values[o * ins + i]));
+        return sum;
+      });
+      assert.deepEqual([...got.outputs.logits.data], want);
+    } finally { runtime.dispose(); }
+  } finally { store.dispose(); }
 });

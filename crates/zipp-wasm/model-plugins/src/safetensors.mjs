@@ -111,6 +111,21 @@ export class WeightStore {
     if (typeof index?.readRows !== 'function') return null;
     return index.readRows(name, indices);
   }
+  /** The Graph v2 dtype this tensor can stay as on a device, or null if it
+   * must be decoded to float32. A Safetensors index has no blocks at all. */
+  residentDtype(name) {
+    this.info(name);
+    const {index} = this.#byName.get(name);
+    return typeof index.residentDtype === 'function' ? index.residentDtype(name) : null;
+  }
+  /** The tensor's own undecoded bytes, for a backend that decodes as it reads. */
+  async blocks(name) {
+    this.info(name);
+    const {index} = this.#byName.get(name);
+    check(typeof index.readBlocks === 'function', 'DTYPE',
+      `${name} comes from a source with no block form; bind it as a tensor`);
+    return index.readBlocks(name);
+  }
   async tensor(name) {
     this.info(name);
     if (!this.#pending.has(name)) {

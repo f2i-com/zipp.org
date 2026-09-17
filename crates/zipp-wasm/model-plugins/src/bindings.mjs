@@ -1,4 +1,11 @@
 import {check, fields, integer, shapeSize, sameShape} from './common.mjs';
+import {RESIDENT as RESIDENT_NAMES} from './gguf.mjs';
+
+/** The block format this tensor can stay in on a device, or null. */
+function residentFormat(weights, name) {
+  const dtype = typeof weights.residentDtype === 'function' ? weights.residentDtype(name) : null;
+  return dtype === null ? null : Object.values(RESIDENT_NAMES).find(f => f.dtype === dtype) ?? null;
+}
 const OPS = new Set(['input', 'full', 'add', 'sub', 'mul', 'div', 'relu', 'positive', 'gelu', 'exp', 'log',
   'neg', 'tanh', 'sigmoid', 'sqrt', 'matmul', 'transpose', 'reshape', 'permute', 'mean', 'sum', 'softmax', 'log_softmax']);
 
@@ -29,9 +36,14 @@ export async function bindGraph(template, weights, limits) {
     const node = {...raw};
     if (Object.hasOwn(node, 'shape')) shapeSize(node.shape, limits);
     if (node.op === 'input') {
-      fields(node, ['id', 'op', 'shape', 'data'], ['id', 'op', 'shape']);
-      inputBytes += shapeSize(node.shape, limits) * 4;
-      check(inputBytes <= limits.maxBoundInputBytes, 'LIMIT', 'Bound graph inputs exceed budget');
+      fields(node, ['id', 'op', 'shape', 'data', 'dtype'], ['id', 'op', 'shape']);
+      check(!Object.hasOwn(node, 'dtype'), 'FORMAT', 'A dtype comes from a blocks binding, not from the template');
+      // A blocks binding charges what its blocks cost, below; everything else
+      // is four bytes a value.
+      if (byNode.get(id)?.kind !== 'blocks') {
+        inputBytes += shapeSize(node.shape, limits) * 4;
+        check(inputBytes <= limits.maxBoundInputBytes, 'LIMIT', 'Bound graph inputs exceed budget');
+      }
       check(byNode.has(id) !== Object.hasOwn(node, 'data'), 'FORMAT', 'Input must have exactly one data source');
       if (Object.hasOwn(node, 'data')) check(Array.isArray(node.data) && node.data.length === shapeSize(node.shape, limits), 'SHAPE', 'Literal input size mismatch');
     } else check(!byNode.has(id), 'FORMAT', 'Only input nodes may bind assets');
@@ -53,6 +65,37 @@ export async function bindGraph(template, weights, limits) {
         check(shape.length === 2, 'SHAPE', `Only a matrix can be transposed: ${b.tensor}`);
       }
       check(sameShape(b.transpose ? [shape[1], shape[0]] : shape, node.shape), 'SHAPE', `Weight shape mismatch: ${b.tensor}`);
+    } else if (b.kind === 'matrix') {
+      // A weight matrix in the checkpoint's own [out, in] layout, kept as
+      // blocks where a backend can decode them and expanded where one cannot.
+      // The graph multiplies it transposed either way, so which happened does
+      // not change the graph -- only what the device holds.
+      fields(b, ['node', 'kind', 'tensor'], ['node', 'kind', 'tensor']);
+      const info = weights.info(b.tensor);
+      check(info.shape.length === 2, 'SHAPE', `A weight matrix is rank two: ${b.tensor}`);
+      check(sameShape(info.shape, node.shape), 'SHAPE',
+        `${b.tensor} is ${JSON.stringify(info.shape)}, not ${JSON.stringify(node.shape)}`);
+      const format = residentFormat(weights, b.tensor);
+      inputBytes += format
+        ? (shapeSize(node.shape, limits) / format.block) * format.bytes
+        : shapeSize(node.shape, limits) * 4;
+      check(inputBytes <= limits.maxBoundInputBytes, 'LIMIT', 'Bound graph inputs exceed budget');
+    } else if (b.kind === 'blocks') {
+      // The weight stays in the file's own format and the backend decodes it
+      // inside the matmul. That is only possible in the layout the blocks are
+      // written in -- they run along the last axis -- so there is no transpose
+      // here and the graph's matmul must carry `transposed: true`.
+      fields(b, ['node', 'kind', 'tensor'], ['node', 'kind', 'tensor']);
+      const info = weights.info(b.tensor);
+      const format = residentFormat(weights, b.tensor);
+      check(format !== undefined && format !== null, 'DTYPE',
+        `${b.tensor} is ${info.dtype}; this build keeps ${Object.values(RESIDENT_NAMES).map(f => f.dtype).join(', ')} resident and decodes the rest, so bind it as a tensor`);
+      check(info.shape.length === 2, 'SHAPE', `A quantized weight is a matrix: ${b.tensor}`);
+      check(sameShape(info.shape, node.shape), 'SHAPE',
+        `Blocks bind in the layout they are stored in; ${b.tensor} is ${JSON.stringify(info.shape)}`);
+      // What the device actually holds, which is the point of binding this way.
+      inputBytes += (shapeSize(node.shape, limits) / format.block) * format.bytes;
+      check(inputBytes <= limits.maxBoundInputBytes, 'LIMIT', 'Bound graph inputs exceed budget');
     } else if (b.kind === 'rows') {
       fields(b, ['node', 'kind', 'tensor', 'indices'], ['node', 'kind', 'tensor', 'indices']);
       const info = weights.info(b.tensor);
@@ -78,6 +121,21 @@ export async function bindGraph(template, weights, limits) {
           for (let column = 0; column < columns; column++) out[column * rows + row] = data[row * columns + column];
         }
         nodes[id].data = out;
+      }
+    }
+    else if (b.kind === 'blocks') {
+      const {dtype, bytes} = await weights.blocks(b.tensor);
+      nodes[id].dtype = dtype;
+      nodes[id].data = bytes;
+    }
+    else if (b.kind === 'matrix') {
+      if (residentFormat(weights, b.tensor)) {
+        const {dtype, bytes} = await weights.blocks(b.tensor);
+        nodes[id].dtype = dtype;
+        nodes[id].data = bytes;
+      } else {
+        // Decoded, but still in the stored layout: the matmul transposes.
+        nodes[id].data = await weights.tensor(b.tensor);
       }
     }
     else if (b.kind === 'rows') {

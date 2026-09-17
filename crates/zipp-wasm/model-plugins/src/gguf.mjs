@@ -1,5 +1,6 @@
 import {check, fields, integer, safePath, shapeSize, resolveLimits} from './common.mjs';
 import {decodeUTF8, parseJSON} from './json.mjs';
+import {requireGgufModule} from './gguf-module.mjs';
 
 /**
  * GGUF as a weight source, alongside Safetensors.
@@ -24,13 +25,22 @@ import {decodeUTF8, parseJSON} from './json.mjs';
  *     difference between a few kilobytes and a gigabyte, and it is why a
  *     vocabulary-sized tensor is usable at all.
  *
- * What this does not do is keep anything quantized. Every tensor becomes
- * float32 as it crosses into the graph, because the compute protocol is
- * float32. Quantization here buys a smaller file and a smaller read, not a
- * smaller tensor on the device.
+ * A tensor crosses into a graph one of two ways. `readTensor` decodes it to
+ * float32, which is what a format the backends cannot read must do. `readBlocks`
+ * hands over the file's own bytes and lets the backend decode inside its
+ * matmul, which is what a format they can read should do: 144 bytes per 256
+ * values instead of 1024, and the same result. `RESIDENT` says which is which.
  */
 const HEADER_FIRST = 1 << 20;
 const HEADER_MAX = 64 * 1024 * 1024;
+
+/** GGUF dtype names to the Graph v2 input dtypes that stay blocks on a device.
+ * This mirrors `QUANT` in gpu-lab's graph.mjs, which is the authority: a name
+ * that drifts out of it is refused there by name rather than silently decoded. */
+export const RESIDENT = Object.freeze({
+  Q4_K: Object.freeze({dtype: 'q4_k', block: 256, bytes: 144}),
+  Q6_K: Object.freeze({dtype: 'q6_k', block: 256, bytes: 210}),
+});
 
 /** Read the header by doubling until it parses: its size depends on how large
  * the tokenizer vocabulary embedded in the metadata is, which is not known
@@ -59,13 +69,18 @@ async function readHeader(source, path, wasm, limits) {
 export async function openGGUF(source, path, wasm, overrides = {}) {
   const limits = resolveLimits(overrides);
   safePath(path);
-  // The module comes from another repository and is coupled to this one by the
-  // shape of what it returns, not by a version. Every field it reports is
-  // checked below, so a changed shape fails by name rather than by producing
-  // tensors that are quietly wrong.
+  // A host may hand over the module; otherwise it is found, and a host that
+  // never built it gets a refusal saying so rather than a crash. See
+  // gguf-module.mjs -- GGUF reading is a separate WebAssembly module and an
+  // optional capability.
+  if (!wasm) wasm = await requireGgufModule();
+  // It comes from another crate and is coupled to this one by the shape of what
+  // it returns, not by a version. Every field it reports is checked below, so a
+  // changed shape fails by name rather than producing tensors that are quietly
+  // wrong.
   check(wasm && typeof wasm.GgufHeader === 'function' && typeof wasm.dequantize === 'function'
     && typeof wasm.supported_dtypes === 'function',
-    'HOST', 'Supply the GGUF WebAssembly module (GgufHeader, dequantize, supported_dtypes)');
+    'HOST', 'That module is not the GGUF one (GgufHeader, dequantize, supported_dtypes)');
   const size = source.size(path);
   const {header, read} = await readHeader(source, path, wasm, limits);
   const listed = parseJSON(header.tensors(), {maxChars: limits.maxHeaderBytes});
@@ -99,8 +114,9 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
   }
 
   // Charged as tensors are decoded, so the budget bounds real memory rather
-  // than a hypothetical.
-  let decoded = 0;
+  // than a hypothetical. `resident` is the same idea for blocks handed over
+  // undecoded, which cost what the file costs.
+  let decoded = 0, resident = 0;
   function charge(elements, name) {
     decoded += elements * 4;
     check(decoded <= limits.maxDecodedBytes, 'LIMIT',
@@ -135,6 +151,7 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
     // Zero at first: a weight store sums what its indexes have decoded, and
     // nothing has been decoded yet.
     get decodedBytes() { return decoded; },
+    get residentBlockBytes() { return resident; },
     fullyDecodedBytes,
     /** The file's own metadata, for a plugin that reads its configuration. */
     metadata() { return parseJSON(header.metadata(), {maxChars: limits.maxHeaderBytes}); },
@@ -142,6 +159,23 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
     strings(key) {
       check(typeof key === 'string', 'FORMAT', 'Expected a metadata key');
       return header.strings(key);
+    },
+    /** Which Graph v2 dtype this tensor can stay as, or null if it must decode. */
+    residentDtype(name) { return RESIDENT[info(name).dtype]?.dtype ?? null; },
+    /**
+     * The tensor's own bytes, undecoded. Charged against the model-byte budget
+     * rather than the decoded-weight one, because that is what it costs.
+     */
+    async readBlocks(name) {
+      const entry = info(name);
+      const dtype = RESIDENT[entry.dtype]?.dtype;
+      check(dtype !== undefined, 'DTYPE',
+        `${name} is ${entry.dtype}; no backend keeps that format resident, so it must be decoded`);
+      resident += entry.bytes;
+      check(resident <= limits.maxModelBytes, 'LIMIT',
+        `Holding ${name} as blocks would pass the model budget of ${limits.maxModelBytes} bytes`);
+      const bytes = await bytesOf(entry.offset, entry.bytes);
+      return {dtype, bytes, shape: entry.shape, elements: entry.elements};
     },
     async readTensor(name) {
       const entry = info(name);
@@ -166,13 +200,4 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
       return out;
     },
   };
-}
-
-/** Load the GGUF module, whose bytes the host supplies: this package downloads
- * nothing and knows no URLs. */
-export async function loadGgufModule(factory) {
-  check(typeof factory === 'function', 'HOST', 'Supply a factory that returns the GGUF WebAssembly module');
-  const wasm = await factory();
-  check(wasm && typeof wasm.GgufHeader === 'function', 'HOST', 'That module exposes no GgufHeader');
-  return wasm;
 }
