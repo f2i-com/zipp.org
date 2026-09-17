@@ -24,8 +24,8 @@ function entries(input){
 import('../src/index.mjs').then(async ({ggufSupport})=>{
   const support=await ggufSupport();
   $('gguf-support').textContent=support.available
-    ?'GGUF support is built and ready.'
-    :`GGUF support is not built. ${support.remedy}`;
+    ?'GGUF support is available.'
+    :`GGUF support is not present. ${support.remedy}`;
   $('gguf-support').classList.toggle('warn',!support.available);
 }).catch(error=>{$('gguf-support').textContent=`GGUF support could not be checked: ${error.message}`;});
 

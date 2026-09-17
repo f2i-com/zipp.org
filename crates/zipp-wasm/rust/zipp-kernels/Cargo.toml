@@ -9,4 +9,4 @@ description = "Freestanding float32 Graph v2 kernels for WebAssembly (SIMD), wit
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-zipp-quants.workspace = true
+gguf-quants.workspace = true

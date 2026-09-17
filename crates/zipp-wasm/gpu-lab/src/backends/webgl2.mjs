@@ -62,7 +62,7 @@ const each = body => `void main() {
 // Q4_K: 256 values per 144-byte block -- an f16 scale and minimum, eight 6-bit
 // sub-block scales and minimums packed into 12 bytes, then 256 nibbles. A port
 // of dequantize_row_q4_K; src/quant.mjs is the same thing in JavaScript and
-// rust/zipp-quants is it in Rust.
+// the gguf-quants crate is it in Rust.
 const QUANT_GLSL = `uint qbyte(int off) { return (B(off >> 2) >> uint((off & 3) * 8)) & 0xffu; }
 uint qhalfBits(int off) { return qbyte(off) | (qbyte(off + 1) << 8); }
 int qbase(int block0, int col, int K, int e, int bytes) {

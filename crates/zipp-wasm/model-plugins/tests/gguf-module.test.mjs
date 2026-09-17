@@ -28,20 +28,20 @@ test('a missing module is an answer, not an exception', async () => {
   // The reason names what was tried, on one line: this string goes in a UI.
   assert.match(support.reason, /^url: /);
   assert.equal(support.reason.includes('\n'), false);
-  assert.match(support.remedy, /build_gguf_wasm\.sh/);
+  assert.match(support.remedy, /fetch_gguf_wasm\.sh/);
 });
 
 test('a caller that needs it gets a refusal saying how to get one', async () => {
   await assert.rejects(
     requireGgufModule({url: new URL('./nowhere/absent.mjs', import.meta.url).href}),
-    /GGUF reading is unavailable .*build_gguf_wasm\.sh/s);
+    /GGUF reading is unavailable .*fetch_gguf_wasm\.sh/s);
 });
 
-test('the built module is found where the build script puts it', async () => {
-  // Skips rather than fails when it has not been built -- which is the point.
+test('the fetched module is found where the fetch script puts it', async () => {
+  // Skips rather than fails when it is not there -- which is the point.
   const support = await ggufSupport();
-  if (!support.available) { assert.match(support.remedy, /build_gguf_wasm/); return; }
-  assert.equal(support.source, 'node build');
+  if (!support.available) { assert.match(support.remedy, /fetch_gguf_wasm/); return; }
+  assert.equal(support.source, 'node module');
   assert.equal(typeof support.module.GgufHeader, 'function');
   assert.equal(typeof support.module.dequantize, 'function');
 });

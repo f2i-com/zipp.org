@@ -129,15 +129,15 @@ test('the protocol refuses what it cannot decode', async () => {
   } finally { runtime.dispose(); }
 });
 
-// The in-repo build by default (scripts/build_gguf_wasm.sh in model-plugins),
-// so this runs rather than skips; the variable overrides it for a build
-// elsewhere.
+// The fetched module by default (model-plugins/scripts/fetch_gguf_wasm.sh),
+// so this runs rather than skips; the variable overrides it for a module
+// somewhere else.
 const wasmPath = process.env.ZIPP_GGUF_WASM ??
-  fileURLToPath(new URL('../../model-plugins/wasm/gguf-node/zipp_model_wasm.js', import.meta.url));
+  fileURLToPath(new URL('../../model-plugins/wasm/gguf-node/gguf_wasm.js', import.meta.url));
 const haveWasm = await access(wasmPath).then(() => true, () => false);
 
 test('the block decoder agrees with ggml-quants',
-  {skip: !haveWasm && 'Build it: model-plugins/scripts/build_gguf_wasm.sh'}, async () => {
+  {skip: !haveWasm && 'Fetch it: model-plugins/scripts/fetch_gguf_wasm.sh'}, async () => {
   const require = createRequire(import.meta.url);
   const gguf = require(wasmPath);
   // Many seeds, not a few: a rounding difference in the decoder shows up in the

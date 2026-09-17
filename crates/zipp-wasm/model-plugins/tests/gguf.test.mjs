@@ -19,9 +19,9 @@ import {fileURLToPath} from 'node:url';
 import {openGGUF, WeightStore, resolveLimits, bindGraph} from '../src/index.mjs';
 
 const modelPath = process.env.ZIPP_GGUF_MODEL;
-// Built in-repo by scripts/build_gguf_wasm.sh; the variable overrides it.
+// Fetched by scripts/fetch_gguf_wasm.sh; the variable overrides it.
 const wasmPath = process.env.ZIPP_GGUF_WASM ??
-  fileURLToPath(new URL('../wasm/gguf-node/zipp_model_wasm.js', import.meta.url));
+  fileURLToPath(new URL('../wasm/gguf-node/gguf_wasm.js', import.meta.url));
 const exists = async path => { try { await access(path); return true; } catch { return false; } };
 const ready = Boolean(modelPath) && await exists(modelPath) && await exists(wasmPath);
 const reason = 'Set ZIPP_GGUF_MODEL to a .gguf file (see the file header)';

@@ -4,27 +4,29 @@ import {check} from './common.mjs';
  * Finding the GGUF WebAssembly module, or finding out that it is not here.
  *
  * GGUF reading is an *optional* capability. It is a second WebAssembly module,
- * separate from the ZIPP engine's and separate from the compute kernels', built
- * from `../rust/zipp-model-wasm` by `scripts/build_gguf_wasm.sh`. A host that
- * only ever loads Safetensors should not have to ship it, and this package must
- * import and work without it -- so nothing here is imported statically, and a
- * missing module is an answer rather than an error.
+ * separate from the ZIPP engine's and separate from the compute kernels', and
+ * it is not built here: the container, the block formats and the tokenizer are
+ * generic, so they live in their own project and this consumes a tagged
+ * release of it (see `scripts/fetch_gguf_wasm.sh`). A host that only ever
+ * loads Safetensors should not have to ship it, and this package must import
+ * and work without it -- so nothing here is imported statically, and a missing
+ * module is an answer rather than an error.
  *
  * Three ways a host gets one, in order of precedence:
  *
  *   1. It supplies a factory. A bundler, an offline build or a test harness
  *      knows better than we do where the module is.
  *   2. It supplies a URL to the wasm-bindgen glue.
- *   3. Neither, and we probe the build output next to this package. In Node
- *      that is the CommonJS build; in a browser the ES-module one, whose
- *      default export fetches the `.wasm` beside it.
+ *   3. Neither, and we probe what `scripts/fetch_gguf_wasm.sh` put next to
+ *      this package. In Node that is the CommonJS build; in a browser the
+ *      ES-module one, whose default export fetches the `.wasm` beside it.
  *
  * `ggufSupport()` answers the question a UI actually asks -- is it there? --
- * without throwing, so a page can say "GGUF: not built" instead of failing.
+ * without throwing, so a page can say "GGUF: not fetched" instead of failing.
  */
 const NODE = typeof process !== 'undefined' && Boolean(process.versions?.node);
-const NODE_GLUE = '../wasm/gguf-node/zipp_model_wasm.js';
-const WEB_GLUE = '../wasm/gguf/zipp_model_wasm.js';
+const NODE_GLUE = '../wasm/gguf-node/gguf_wasm.js';
+const WEB_GLUE = '../wasm/gguf/gguf_wasm.js';
 
 /** Check the shape of what a factory returned. The module comes from another
  * crate and is coupled to this one by that shape, not by a version. */
@@ -35,7 +37,7 @@ export async function loadGgufModule(factory) {
   return wasm;
 }
 
-/** The default probe: whatever `scripts/build_gguf_wasm.sh` last wrote. */
+/** The default probe: whatever `scripts/fetch_gguf_wasm.sh` last put there. */
 async function probe() {
   if (NODE) {
     const {createRequire} = await import('node:module');
@@ -68,7 +70,7 @@ export function ggufSupport({factory, url, reload = false} = {}) {
       if (typeof module.default === 'function') await module.default();
       return loadGgufModule(() => module);
     }]);
-    if (!factory && !url) attempts.push([NODE ? 'node build' : 'web build', () => loadGgufModule(probe)]);
+    if (!factory && !url) attempts.push([NODE ? 'node module' : 'web module', () => loadGgufModule(probe)]);
     let reason = 'no source was tried';
     for (const [source, load] of attempts) {
       try { return {available: true, module: await load(), source}; }
@@ -80,7 +82,7 @@ export function ggufSupport({factory, url, reload = false} = {}) {
       available: false,
       reason,
       // The one thing a person reading this actually needs to do about it.
-      remedy: 'Build it: model-plugins/scripts/build_gguf_wasm.sh',
+      remedy: 'Fetch it: model-plugins/scripts/fetch_gguf_wasm.sh',
     };
   })();
   cache.set(key, answer);

@@ -305,7 +305,7 @@ mod kernels {
     /// only the block's byte size and its decoder differ. Four output columns
     /// are decoded into `scratch` (4*k floats, supplied by the host arena) and
     /// every row of A reuses that decode, so the weight is read once per column
-    /// block and never expanded anywhere. The decoder is `zipp_quants`, the
+    /// block and never expanded anywhere. The decoder is `gguf_quants`, the
     /// same one the GGUF reader uses -- a second copy here would be a second
     /// thing to be wrong.
     #[no_mangle]
@@ -313,8 +313,8 @@ mod kernels {
     pub unsafe extern "C" fn bmm_quant(a: *const f32, w: *const u8, o: *mut f32, scratch: *mut f32,
         batch: i32, m: i32, k: i32, n: i32, sa: i32, sb: i32, dtype: i32) {
         const BLOCK_SIZE: usize = 256; // Q4_K and Q6_K alike
-        let bytes_per_block = if dtype == 0 { zipp_quants::q4_k::BYTES_PER_BLOCK }
-                              else { zipp_quants::q6_k::BYTES_PER_BLOCK };
+        let bytes_per_block = if dtype == 0 { gguf_quants::q4_k::BYTES_PER_BLOCK }
+                              else { gguf_quants::q6_k::BYTES_PER_BLOCK };
         let (mi, ki, ni) = (m as isize, k as isize, n as isize);
         let per = ki / BLOCK_SIZE as isize; // whole blocks per row, always exact
         let row_bytes = per * bytes_per_block as isize;
@@ -328,8 +328,8 @@ mod kernels {
                 for i in 0..span {
                     let src = core::slice::from_raw_parts(w.offset((col + i) * row_bytes), row_bytes as usize);
                     let dst = core::slice::from_raw_parts_mut(scratch.offset(i * ki), ki as usize);
-                    if dtype == 0 { zipp_quants::q4_k::dequantize(src, dst) }
-                    else { zipp_quants::q6_k::dequantize(src, dst) }
+                    if dtype == 0 { gguf_quants::q4_k::dequantize(src, dst) }
+                    else { gguf_quants::q6_k::dequantize(src, dst) }
                 }
                 // The decoded rows are exactly a [span, k] f32 weight, so the
                 // transposed panel computes the rest.

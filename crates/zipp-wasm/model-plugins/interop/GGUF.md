@@ -1,23 +1,42 @@
 # Reading GGUF, including quantized checkpoints
 
-`src/gguf.mjs` opens a GGUF file as a weight source beside Safetensors. The
-reader and the block dequantizers are not reimplemented here: they are the
-`gguf` and `ggml-quants` crates from the `llm` repository, compiled to
-WebAssembly by its `gguf-wasm` crate. Both were already pure computation and
-needed no change to target `wasm32`; the module is 132 KB and understands
-F32, F16, BF16, Q4_0/1, Q5_0/1, Q8_0, Q2_K, Q3_K, **Q4_K**, Q5_K, Q6_K,
-IQ4_NL and IQ4_XS.
+`src/gguf.mjs` opens a GGUF file as a weight source beside Safetensors. Nothing
+about the format is implemented here. The container, the block dequantizers and
+the tokenizer are their own project --
+[**gguf-wasm**](https://github.com/f2i-com/gguf-wasm) -- and this consumes a
+tagged release of it. The module understands F32, F16, BF16, Q4_0/1, Q5_0/1,
+Q8_0, Q2_K, Q3_K, **Q4_K**, Q5_K, **Q6_K**, IQ4_NL and IQ4_XS.
 
 ```sh
-# in the llm repository
-cargo build --release --target wasm32-unknown-unknown -p gguf-wasm
-wasm-bindgen --target web --out-dir crates/gguf-wasm/pkg \
-  target/wasm32-unknown-unknown/release/gguf_wasm.wasm
+sh scripts/fetch_gguf_wasm.sh        # the pinned tag, checksum-verified
+cat wasm/VERSION                     # which one is in the tree
 
-# here
-ZIPP_GGUF_WASM=<…/gguf-wasm/pkg-node/gguf_wasm.js> \
 ZIPP_GGUF_MODEL=<…/model.gguf> node --test tests/gguf.test.mjs
 ```
+
+## Where the boundary runs
+
+That project knows about the file format and nothing about how a model is
+executed. This one knows how ZIPP executes a model and nothing about GGUF
+beyond what it is handed. Concretely:
+
+> **gguf-wasm says** -- here is `blk.12.attn_q.weight`, shape `[2048, 1024]`,
+> format Q4_K, and here are its original packed bytes.
+>
+> **ZIPP says** -- keep those bytes resident; graph node 273 will consume them
+> through a quantized transposed matmul.
+
+The rule that a packed weight may appear only as the right-hand side of a
+transposed matmul is a *ZIPP compute-protocol* rule, and belongs on this side.
+So does the Qwen3 plugin, the decode plan, the carried KV cache, the prepared
+session and the four backends.
+
+ZIPP pins that project twice and the two move together: `../rust/Cargo.toml`
+takes `gguf-quants` from the tag, because a matmul that reads a quantized
+weight must decode it exactly as the reader does, and `scripts/fetch_gguf_wasm.sh`
+takes the same tag's WebAssembly build. `gpu-lab`'s suite then checks its own
+JavaScript decoder against that module and the compiled kernels against the
+JavaScript one, so all three agree or it names which does not.
 
 ## Neither side holds the file
 

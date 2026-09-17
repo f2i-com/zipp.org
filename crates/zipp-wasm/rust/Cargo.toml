@@ -1,12 +1,23 @@
-# Rust that compiles to WebAssembly for the browser side of ZIPP.
+# The Graph v2 compute kernels, as WebAssembly.
 #
-# Vendored from the `llm` repository (a private Rust reimplementation of
-# llama.cpp) at commit e1b9d48, refactored to build without `std` so the same
-# code serves both a `wasm-bindgen` module and a freestanding SIMD kernel
-# module with no allocator. See README.md for what was changed and why.
+# One crate, in its own feature-resolution domain for the reason the root
+# workspace excludes this tree: `zipp-kernels` is `no_std` with
+# `panic = "abort"` and its own profile, and unifying features between a
+# freestanding SIMD kernel module and the engine embedding would mean neither
+# gets the settings it was measured with.
+#
+# Reading GGUF used to live here too. It does not any more: the container, the
+# block formats and the tokenizer are generic, useful without ZIPP, and now
+# live in their own repository -- https://github.com/f2i-com/gguf-wasm. ZIPP
+# consumes that project rather than owning it. See ../model-plugins/interop/
+# GGUF.md for where the boundary is and why it is there.
+#
+# What remains here is the part that is only meaningful inside ZIPP: kernels
+# held to bit-for-bit agreement with a JavaScript reference, over a compute
+# protocol this repository defines.
 [workspace]
 resolver = "2"
-members = ["zipp-quants", "zipp-gguf", "zipp-tokenizer", "zipp-kernels", "zipp-model-wasm"]
+members = ["zipp-kernels"]
 
 [workspace.package]
 version = "0.0.1"
@@ -14,10 +25,11 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-zipp-quants = { path = "zipp-quants" }
-zipp-gguf   = { path = "zipp-gguf" }
-zipp-tokenizer = { path = "zipp-tokenizer" }
-half        = { version = "2.4", default-features = false }
+# The block decoders, from the GGUF project. A matmul that reads a quantized
+# weight has to decode it the same way the reader does, so it uses the same
+# code rather than a copy of it -- and the pin is a tag, so the decoder ZIPP
+# compiles against is the one a given release was built from.
+gguf-quants = { git = "https://github.com/f2i-com/gguf-wasm", tag = "v0.1.0" }
 
 [profile.release]
 opt-level = 3

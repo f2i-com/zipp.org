@@ -164,7 +164,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   matmul_q4k: [['A', 'B:u32'], `// Block-quantized weights, decoded where they are used.
 //
 // Ports of dequantize_row_q4_K and dequantize_row_q6_K; src/quant.mjs is the
-// same thing in JavaScript and rust/zipp-quants is it in Rust. Addressing is by
+// same thing in JavaScript and the gguf-quants crate is it in Rust. Addressing is by
 // absolute byte, not by word: a Q6_K block is 210 bytes, so blocks after the
 // first are not word-aligned and a word-relative accessor would be wrong.
 fn qbyte(off: u32) -> u32 { return (B[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu; }
@@ -234,7 +234,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   matmul_q6k: [['A', 'B:u32'], `// Block-quantized weights, decoded where they are used.
 //
 // Ports of dequantize_row_q4_K and dequantize_row_q6_K; src/quant.mjs is the
-// same thing in JavaScript and rust/zipp-quants is it in Rust. Addressing is by
+// same thing in JavaScript and the gguf-quants crate is it in Rust. Addressing is by
 // absolute byte, not by word: a Q6_K block is 210 bytes, so blocks after the
 // first are not word-aligned and a word-relative accessor would be wrong.
 fn qbyte(off: u32) -> u32 { return (B[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu; }
@@ -361,7 +361,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   matmul_q4k_split: [['A', 'B:u32'], `// Block-quantized weights, decoded where they are used.
 //
 // Ports of dequantize_row_q4_K and dequantize_row_q6_K; src/quant.mjs is the
-// same thing in JavaScript and rust/zipp-quants is it in Rust. Addressing is by
+// same thing in JavaScript and the gguf-quants crate is it in Rust. Addressing is by
 // absolute byte, not by word: a Q6_K block is 210 bytes, so blocks after the
 // first are not word-aligned and a word-relative accessor would be wrong.
 fn qbyte(off: u32) -> u32 { return (B[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu; }
@@ -434,7 +434,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   matmul_q6k_split: [['A', 'B:u32'], `// Block-quantized weights, decoded where they are used.
 //
 // Ports of dequantize_row_q4_K and dequantize_row_q6_K; src/quant.mjs is the
-// same thing in JavaScript and rust/zipp-quants is it in Rust. Addressing is by
+// same thing in JavaScript and the gguf-quants crate is it in Rust. Addressing is by
 // absolute byte, not by word: a Q6_K block is 210 bytes, so blocks after the
 // first are not word-aligned and a word-relative accessor would be wrong.
 fn qbyte(off: u32) -> u32 { return (B[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu; }

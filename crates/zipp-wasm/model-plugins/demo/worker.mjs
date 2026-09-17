@@ -51,7 +51,7 @@ const REPETITION_WINDOW=64;
 async function runGguf(data){
   // The GGUF reader is a separate WebAssembly module and an optional one.
   const support=await ggufSupport();
-  if(!support.available)throw Error(`GGUF support is not built (${support.reason}). ${support.remedy}`);
+  if(!support.available)throw Error(`GGUF support is not present (${support.reason}). ${support.remedy}`);
   progress('Reading the checkpoint header…');
   const limits=resolveLimits(GGUF_LIMITS);
   // A File is read by range. Nothing loads the whole checkpoint, here or anywhere.

@@ -1,4 +1,4 @@
-/* @ts-self-types="./zipp_model_wasm.d.ts" */
+/* @ts-self-types="./gguf_wasm.d.ts" */
 
 /**
  * A GGUF file's header: its metadata and where every tensor lives.
@@ -340,7 +340,7 @@ function __wbg_get_imports() {
     };
     return {
         __proto__: null,
-        "./zipp_model_wasm_bg.js": import0,
+        "./gguf_wasm_bg.js": import0,
     };
 }
 
@@ -499,7 +499,7 @@ if (!('encodeInto' in cachedTextEncoder)) {
 
 let WASM_VECTOR_LEN = 0;
 
-const wasmPath = `${__dirname}/zipp_model_wasm_bg.wasm`;
+const wasmPath = `${__dirname}/gguf_wasm_bg.wasm`;
 const wasmBytes = require('fs').readFileSync(wasmPath);
 const wasmModule = new WebAssembly.Module(wasmBytes);
 let wasmInstance = new WebAssembly.Instance(wasmModule, __wbg_get_imports());
