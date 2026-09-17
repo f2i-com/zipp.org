@@ -7,7 +7,7 @@ import {gelu, geluGrad, sigmoid, relu} from '../kernel-math.mjs';
  * reproduce them bit for bit; transcendental functions are evaluated in double
  * and rounded, so they agree with WASM to about one float32 ulp.
  */
-import {decodeQ4KBlock, Q4_K_BLOCK, Q4_K_BYTES} from '../quant.mjs';
+import {blockDecoder, FORMATS} from '../quant.mjs';
 const f = Math.fround;
 const UNARY = {relu, positive: x => x > 0 ? 1 : 0, neg: x => -x, exp: Math.exp, log: Math.log, sqrt: Math.sqrt,
   tanh: Math.tanh, sigmoid, gelu, gelu_grad: geluGrad};
@@ -107,12 +107,14 @@ export class CPUBackend {
         if (n.bQuant) {
           // b holds [N, K] blocks. Each output row of b is decoded once, into
           // scratch, and reused by every row of a: the weight is never expanded.
-          const perRow = k / Q4_K_BLOCK, scratch = new Float32Array(k);
+          const {block: BLOCK, bytes: BYTES} = FORMATS[n.bQuant.dtype];
+          const decode = blockDecoder(n.bQuant.dtype);
+          const perRow = k / BLOCK, scratch = new Float32Array(k);
           for (let batch = 0; batch < n.batch; batch++) {
-            const ao = batch * n.aBatchStride, bo = (batch * n.bBatchStride) / Q4_K_BLOCK, oo = batch * m * cols;
+            const ao = batch * n.aBatchStride, bo = (batch * n.bBatchStride) / BLOCK, oo = batch * m * cols;
             for (let c = 0; c < cols; c++) {
               for (let t = 0; t < perRow; t++) {
-                decodeQ4KBlock(b, (bo + c * perRow + t) * Q4_K_BYTES, scratch, t * Q4_K_BLOCK);
+                decode(b, (bo + c * perRow + t) * BYTES, scratch, t * BLOCK);
               }
               for (let r = 0; r < m; r++) {
                 const at = oo + r * cols + c, base = ao + r * k;

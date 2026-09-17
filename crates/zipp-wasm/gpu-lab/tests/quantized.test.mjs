@@ -12,32 +12,43 @@
 // skips unless ZIPP_GGUF_WASM points at the module.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {access} from 'node:fs/promises';
+import {access, readFile} from 'node:fs/promises';
 import {createRequire} from 'node:module';
+import {fileURLToPath} from 'node:url';
 
 import {createRuntime} from '../src/runtime.mjs';
-import {decodeQ4K, Q4_K_BLOCK, Q4_K_BYTES, readHalf} from '../src/quant.mjs';
+import {decodeQ4K, decodeQ6K, FORMATS, Q4_K_BLOCK, Q4_K_BYTES, readHalf} from '../src/quant.mjs';
 
-/** Plausible Q4_K blocks: real scales, every nibble exercised. */
-function blocks(count, seed = 1) {
+/** Plausible blocks of either format: real scales, every nibble exercised.
+ * The f16 scales get modest exponents so the products stay in range; every
+ * other byte is arbitrary, which is what makes this a decoder test. */
+function blocks(count, seed = 1, dtype = 'q4_k') {
   let state = seed >>> 0;
   const next = () => (state = (Math.imul(state, 1664525) + 1013904223) >>> 0);
-  const bytes = new Uint8Array(count * Q4_K_BYTES);
+  const {bytes: SIZE} = FORMATS[dtype];
+  const bytes = new Uint8Array(count * SIZE);
   for (let i = 0; i < count; i++) {
-    const at = i * Q4_K_BYTES;
-    // d and dmin as halves with modest exponents, so products stay in range.
-    bytes[at] = next() & 0xff; bytes[at + 1] = 0x20 | (next() & 0x07);
-    bytes[at + 2] = next() & 0xff; bytes[at + 3] = 0x18 | (next() & 0x07);
-    for (let j = 4; j < Q4_K_BYTES; j++) bytes[at + j] = next() & 0xff;
+    const at = i * SIZE;
+    for (let j = 0; j < SIZE; j++) bytes[at + j] = next() & 0xff;
+    if (dtype === 'q4_k') {
+      bytes[at + 1] = 0x20 | (next() & 0x07);     // d
+      bytes[at + 3] = 0x18 | (next() & 0x07);     // dmin
+    } else {
+      bytes[at + 209] = 0x20 | (next() & 0x07);   // d, at the block's end
+    }
   }
   return bytes;
 }
 
-const decoded = bytes => {
-  const out = new Float32Array((bytes.length / Q4_K_BYTES) * Q4_K_BLOCK);
-  decodeQ4K(bytes, 0, out.length, out);
+const decoded = (bytes, dtype = 'q4_k') => {
+  const {block, bytes: SIZE} = FORMATS[dtype];
+  const out = new Float32Array((bytes.length / SIZE) * block);
+  (dtype === 'q4_k' ? decodeQ4K : decodeQ6K)(bytes, 0, out.length, out);
   return out;
 };
+
+/** Both formats a backend can read without expanding. */
+const RESIDENT = ['q4_k', 'q6_k'];
 
 test('a half is read exactly', () => {
   const cases = [[0x00, 0x3c, 1], [0x00, 0xbc, -1], [0x00, 0x00, 0], [0x00, 0x80, -0],
@@ -50,9 +61,9 @@ test('a half is read exactly', () => {
 test('a quantized matmul equals the same matmul over decoded values', async () => {
   const runtime = await createRuntime({backend: 'cpu-js'});
   try {
-    for (const [m, k, n] of [[1, 256, 4], [3, 512, 2], [2, 256, 7]]) {
-      const weight = blocks((k / Q4_K_BLOCK) * n, m * 31 + k);
-      const values = decoded(weight);
+    for (const dtype of RESIDENT) for (const [m, k, n] of [[1, 256, 4], [3, 512, 2], [2, 256, 7]]) {
+      const weight = blocks((k / 256) * n, m * 31 + k, dtype);
+      const values = decoded(weight, dtype);
       assert.equal(values.length, k * n);
       const activations = Float32Array.from({length: m * k}, (_, i) => ((i * 37) % 19) / 16 - 0.5);
 
@@ -63,12 +74,12 @@ test('a quantized matmul equals the same matmul over decoded values', async () =
         {id: 2, op: 'matmul', a: 0, b: 1, transposed: true},
       ], outputs: [{name: 'out', id: 2}]});
 
-      const quantized = await runtime.execute(program(weight, 'q4_k'), {typedOutputs: true});
+      const quantized = await runtime.execute(program(weight, dtype), {typedOutputs: true});
       const plain = await runtime.execute(program(values), {typedOutputs: true});
       assert.deepEqual(quantized.outputs.out.shape, [m, n]);
       // Bit for bit, not close: same products, same order, same rounding.
       assert.deepEqual([...quantized.outputs.out.data], [...plain.outputs.out.data],
-        `${m}x${k}x${n} quantized and decoded results differ`);
+        `${dtype} ${m}x${k}x${n} quantized and decoded results differ`);
     }
   } finally { runtime.dispose(); }
 });
@@ -118,23 +129,91 @@ test('the protocol refuses what it cannot decode', async () => {
   } finally { runtime.dispose(); }
 });
 
-const wasmPath = process.env.ZIPP_GGUF_WASM;
-const haveWasm = Boolean(wasmPath) && await access(wasmPath).then(() => true, () => false);
+// The in-repo build by default (scripts/build_gguf_wasm.sh in model-plugins),
+// so this runs rather than skips; the variable overrides it for a build
+// elsewhere.
+const wasmPath = process.env.ZIPP_GGUF_WASM ??
+  fileURLToPath(new URL('../../model-plugins/wasm/gguf-node/zipp_model_wasm.js', import.meta.url));
+const haveWasm = await access(wasmPath).then(() => true, () => false);
 
 test('the block decoder agrees with ggml-quants',
-  {skip: !haveWasm && 'Set ZIPP_GGUF_WASM to the gguf-wasm module'}, async () => {
+  {skip: !haveWasm && 'Build it: model-plugins/scripts/build_gguf_wasm.sh'}, async () => {
   const require = createRequire(import.meta.url);
   const gguf = require(wasmPath);
   // Many seeds, not a few: a rounding difference in the decoder shows up in the
   // last bit of a minority of values, so a handful of blocks can agree by luck.
   for (let seed = 1; seed <= 60; seed++) {
-    const bytes = blocks(3, seed * 2654435761 % 2 ** 31);
-    const theirs = gguf.dequantize('Q4_K', bytes, 3 * Q4_K_BLOCK);
-    const ours = decoded(bytes);
-    assert.equal(ours.length, theirs.length);
-    // Two implementations of the same exact arithmetic: equal, not close.
-    assert.deepEqual([...ours], [...theirs], `seed ${seed} decodes differently`);
+    for (const dtype of RESIDENT) {
+      const blocked = blocks(3, seed * 2654435761 % 2 ** 31, dtype);
+      const theirs = gguf.dequantize(dtype.toUpperCase(), blocked, 3 * 256);
+      const ours = decoded(blocked, dtype);
+      assert.equal(ours.length, theirs.length);
+      // Two implementations of the same exact arithmetic: equal, not close.
+      assert.deepEqual([...ours], [...theirs], `${dtype} seed ${seed} decodes differently`);
+    }
   }
+});
+
+test('the compiled kernels agree with the reference, bit for bit', async () => {
+  // The contract the whole backend is held to (see backend-bits.test.mjs)
+  // extended to the two matmul shapes a checkpoint needs: a transposed f32
+  // weight, and a weight that stays quantized. SIMD across four columns keeps
+  // each output's k products in index order, which is what makes this exact
+  // rather than close.
+  const wasmBytes = await readFile(new URL('../wasm/kernels.wasm', import.meta.url));
+  const cpu = await createRuntime({backend: 'cpu-js'});
+  const wasm = await createRuntime({backend: 'wasm', wasmBytes});
+  try {
+    // Sizes either side of the four-column block and the 256-value block, so
+    // the vector path, the scalar remainder and multi-block rows all run.
+    for (const dtype of RESIDENT)
+    for (const [m, k, n] of [[1, 256, 4], [1, 256, 7], [3, 512, 8], [2, 768, 5], [5, 256, 1], [4, 512, 13]]) {
+      const weight = blocks((k / 256) * n, m * 131 + k + n, dtype);
+      const values = decoded(weight, dtype);
+      const activations = Float32Array.from({length: m * k}, (_, i) => ((i * 37) % 19) / 16 - 0.5);
+      const program = (b, dtype) => ({version: 2, nodes: [
+        {id: 0, op: 'input', shape: [m, k], data: activations},
+        dtype ? {id: 1, op: 'input', shape: [n, k], dtype, data: b}
+              : {id: 1, op: 'input', shape: [n, k], data: b},
+        {id: 2, op: 'matmul', a: 0, b: 1, transposed: true},
+      ], outputs: [{name: 'out', id: 2}]});
+      const run = (r, ...args) => r.execute(program(...args), {typedOutputs: true});
+
+      // One at a time: a runtime executes serially and says so.
+      const cq = await run(cpu, weight, dtype), cf = await run(cpu, values);
+      const wq = await run(wasm, weight, dtype), wf = await run(wasm, values);
+      const bits = x => [...x.outputs.out.data];
+      const what = `${dtype} ${m}x${k}x${n}`;
+      assert.deepEqual(bits(wf), bits(cf), `${what}: transposed f32 wasm differs from cpu-js`);
+      assert.deepEqual(bits(wq), bits(cq), `${what}: quantized wasm differs from cpu-js`);
+      // And on each backend, quantized equals the same matmul over decoded values.
+      assert.deepEqual(bits(cq), bits(cf), `${what}: cpu-js quantized differs from decoded`);
+      assert.deepEqual(bits(wq), bits(wf), `${what}: wasm quantized differs from decoded`);
+    }
+
+    // Batched, where the block offset of batch t is bBatchStride/256 rather
+    // than zero. Every backend computes that offset for itself, and nothing
+    // above reaches the arithmetic that does it.
+    for (const dtype of RESIDENT) for (const [batch, m, k, n] of [[2, 1, 256, 4], [3, 2, 512, 5]]) {
+      const weight = blocks(batch * (k / 256) * n, batch * 17 + k, dtype);
+      const values = decoded(weight, dtype);
+      const activations = Float32Array.from({length: batch * m * k}, (_, i) => ((i * 23) % 13) / 8 - 0.5);
+      const program = (b, dtype) => ({version: 2, nodes: [
+        {id: 0, op: 'input', shape: [batch, m, k], data: activations},
+        dtype ? {id: 1, op: 'input', shape: [batch, n, k], dtype, data: b}
+              : {id: 1, op: 'input', shape: [batch, n, k], data: b},
+        {id: 2, op: 'matmul', a: 0, b: 1, transposed: true},
+      ], outputs: [{name: 'out', id: 2}]});
+      const run = (r, ...args) => r.execute(program(...args), {typedOutputs: true});
+      const cq = await run(cpu, weight, dtype), cf = await run(cpu, values);
+      const wq = await run(wasm, weight, dtype), wf = await run(wasm, values);
+      const bits = x => [...x.outputs.out.data];
+      assert.deepEqual(cq.outputs.out.shape, [batch, m, n]);
+      assert.deepEqual(bits(cq), bits(cf), `${dtype} batch ${batch}: cpu-js quantized differs from decoded`);
+      assert.deepEqual(bits(wq), bits(cq), `${dtype} batch ${batch}: wasm quantized differs from cpu-js`);
+      assert.deepEqual(bits(wf), bits(cf), `${dtype} batch ${batch}: wasm transposed differs from cpu-js`);
+    }
+  } finally { cpu.dispose(); wasm.dispose(); }
 });
 
 test('a prepared session holds a quantized weight as blocks', async () => {

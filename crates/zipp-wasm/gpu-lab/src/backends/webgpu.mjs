@@ -36,8 +36,12 @@ fn tanh_s(x: f32) -> f32 {
   let r = (1.0 - t) / (1.0 + t);
   return select(r, -r, x < 0.0);
 }`;
-const io = inputs => inputs.map((name, i) => `@group(0) @binding(${i + 1}) var<storage, read> ${name}: array<f32>;`).join('\n') +
-  `\n@group(0) @binding(${inputs.length + 1}) var<storage, read_write> O: array<f32>;`;
+// A binds as array<f32>; B:u32 binds the same buffer as raw words, which is
+// how a quantized weight arrives -- blocks, not values.
+const io = inputs => inputs.map((name, i) => {
+  const [id, type = 'f32'] = name.split(':');
+  return `@group(0) @binding(${i + 1}) var<storage, read> ${id}: array<${type}>;`;
+}).join('\n') + `\n@group(0) @binding(${inputs.length + 1}) var<storage, read_write> O: array<f32>;`;
 const each = body => `@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
   let i = flat(gid, nwg);
@@ -131,6 +135,172 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   }
   if (row < M && col < N) { O[wg.z * M * N + row * N + col] = acc; }
 }`],
+  // The same tile, over a weight stored [N, K]: one contiguous row per
+  // output column, which is how a checkpoint writes a linear layer.
+  matmul_t: [['A', 'B'], `var<workgroup> As: array<array<f32, 16>, 16>;
+var<workgroup> Bs: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  let row = wg.y * 16u + lid.y; let col = wg.x * 16u + lid.x;
+  let aBase = wg.z * P.sa.x; let bBase = wg.z * P.sa.y;
+  var acc = 0.0;
+  for (var t = 0u; t < K; t = t + 16u) {
+    let ka = t + lid.x; let kb = t + lid.y;
+    var av = 0.0; var bv = 0.0;
+    if (row < M && ka < K) { av = A[aBase + row * K + ka]; }
+    if (kb < K && col < N) { bv = B[bBase + col * K + kb]; }
+    As[lid.y][lid.x] = av; Bs[lid.y][lid.x] = bv;
+    workgroupBarrier();
+    let span = min(16u, K - t);
+    for (var k = 0u; k < span; k = k + 1u) { acc = acc + As[lid.y][k] * Bs[k][lid.x]; }
+    workgroupBarrier();
+  }
+  if (row < M && col < N) { O[wg.z * M * N + row * N + col] = acc; }
+}`],
+  // And over a weight that is still Q4_K blocks: q4k decodes the one value
+  // the tile is about to load, so the device holds 144 bytes per 256 weights
+  // and never the 1024 they expand to.
+  matmul_q4k: [['A', 'B:u32'], `// Block-quantized weights, decoded where they are used.
+//
+// Ports of dequantize_row_q4_K and dequantize_row_q6_K; src/quant.mjs is the
+// same thing in JavaScript and rust/zipp-quants is it in Rust. Addressing is by
+// absolute byte, not by word: a Q6_K block is 210 bytes, so blocks after the
+// first are not word-aligned and a word-relative accessor would be wrong.
+fn qbyte(off: u32) -> u32 { return (B[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu; }
+// One f16 from two bytes that may straddle a word.
+fn qhalf(off: u32) -> f32 { return unpack2x16float(qbyte(off) | (qbyte(off + 1u) << 8u)).x; }
+// Where element e of row col begins, for a format of bytes per 256 values.
+fn qbase(block0: u32, col: u32, K: u32, e: u32, bytes: u32) -> u32 {
+  return (block0 + col * (K / 256u) + e / 256u) * bytes;
+}
+// Q4_K: f16 scale and minimum, eight 6-bit sub-block scales and minimums packed
+// into 12 bytes, then 256 nibbles. Sub-blocks 0..3 are a plain six bits; 4..7
+// borrow their high two bits from the bytes of the first four.
+fn q4k_scale_min(base: u32, j: u32) -> vec2<f32> {
+  if (j < 4u) { return vec2<f32>(f32(qbyte(base + 4u + j) & 63u), f32(qbyte(base + 8u + j) & 63u)); }
+  let hi = qbyte(base + j + 8u);
+  let lo = qbyte(base + j);
+  let me = qbyte(base + j + 4u);
+  return vec2<f32>(f32((hi & 15u) | ((lo >> 6u) << 4u)), f32((hi >> 4u) | ((me >> 6u) << 4u)));
+}
+fn q4k(block0: u32, col: u32, K: u32, e: u32) -> f32 {
+  let base = qbase(block0, col, K, e, 144u);
+  let within = e % 256u;
+  let pair = within / 64u;
+  let rem = within % 64u;
+  let byte = qbyte(base + 16u + pair * 32u + rem % 32u);
+  let nibble = select(byte >> 4u, byte & 15u, rem < 32u);
+  let j = pair * 2u + select(1u, 0u, rem < 32u);
+  let sm = q4k_scale_min(base, j);
+  return (qhalf(base) * sm.x) * f32(nibble) - qhalf(base + 2u) * sm.y;
+}
+// Q6_K: 128 low nibbles, 64 bytes of high pairs, sixteen signed group scales,
+// then the f16 super-block scale. Each value is (low4 | high2 << 4) - 32.
+fn q6k(block0: u32, col: u32, K: u32, e: u32) -> f32 {
+  let base = qbase(block0, col, K, e, 210u);
+  let within = e % 256u;
+  let half = within / 128u;
+  let rem = within % 128u;
+  let sub = rem / 32u;
+  let l = rem % 32u;
+  let ql = qbyte(base + 64u * half + l + 32u * (sub & 1u));
+  let low = select(ql >> 4u, ql & 15u, sub < 2u);
+  let high = (qbyte(base + 128u + 32u * half + l) >> (2u * sub)) & 3u;
+  let scale = f32(bitcast<i32>(qbyte(base + 192u + 8u * half + l / 16u + 2u * sub) << 24u) >> 24u);
+  return (qhalf(base + 208u) * scale) * f32(bitcast<i32>(low | (high << 4u)) - 32);
+}
+var<workgroup> As: array<array<f32, 16>, 16>;
+var<workgroup> Bs: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  let row = wg.y * 16u + lid.y; let col = wg.x * 16u + lid.x;
+  let aBase = wg.z * P.sa.x; let bBase = wg.z * P.sa.y;
+  var acc = 0.0;
+  for (var t = 0u; t < K; t = t + 16u) {
+    let ka = t + lid.x; let kb = t + lid.y;
+    var av = 0.0; var bv = 0.0;
+    if (row < M && ka < K) { av = A[aBase + row * K + ka]; }
+    if (kb < K && col < N) { bv = q4k(bBase / 256u, col, K, kb); }
+    As[lid.y][lid.x] = av; Bs[lid.y][lid.x] = bv;
+    workgroupBarrier();
+    let span = min(16u, K - t);
+    for (var k = 0u; k < span; k = k + 1u) { acc = acc + As[lid.y][k] * Bs[k][lid.x]; }
+    workgroupBarrier();
+  }
+  if (row < M && col < N) { O[wg.z * M * N + row * N + col] = acc; }
+}`],
+  matmul_q6k: [['A', 'B:u32'], `// Block-quantized weights, decoded where they are used.
+//
+// Ports of dequantize_row_q4_K and dequantize_row_q6_K; src/quant.mjs is the
+// same thing in JavaScript and rust/zipp-quants is it in Rust. Addressing is by
+// absolute byte, not by word: a Q6_K block is 210 bytes, so blocks after the
+// first are not word-aligned and a word-relative accessor would be wrong.
+fn qbyte(off: u32) -> u32 { return (B[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu; }
+// One f16 from two bytes that may straddle a word.
+fn qhalf(off: u32) -> f32 { return unpack2x16float(qbyte(off) | (qbyte(off + 1u) << 8u)).x; }
+// Where element e of row col begins, for a format of bytes per 256 values.
+fn qbase(block0: u32, col: u32, K: u32, e: u32, bytes: u32) -> u32 {
+  return (block0 + col * (K / 256u) + e / 256u) * bytes;
+}
+// Q4_K: f16 scale and minimum, eight 6-bit sub-block scales and minimums packed
+// into 12 bytes, then 256 nibbles. Sub-blocks 0..3 are a plain six bits; 4..7
+// borrow their high two bits from the bytes of the first four.
+fn q4k_scale_min(base: u32, j: u32) -> vec2<f32> {
+  if (j < 4u) { return vec2<f32>(f32(qbyte(base + 4u + j) & 63u), f32(qbyte(base + 8u + j) & 63u)); }
+  let hi = qbyte(base + j + 8u);
+  let lo = qbyte(base + j);
+  let me = qbyte(base + j + 4u);
+  return vec2<f32>(f32((hi & 15u) | ((lo >> 6u) << 4u)), f32((hi >> 4u) | ((me >> 6u) << 4u)));
+}
+fn q4k(block0: u32, col: u32, K: u32, e: u32) -> f32 {
+  let base = qbase(block0, col, K, e, 144u);
+  let within = e % 256u;
+  let pair = within / 64u;
+  let rem = within % 64u;
+  let byte = qbyte(base + 16u + pair * 32u + rem % 32u);
+  let nibble = select(byte >> 4u, byte & 15u, rem < 32u);
+  let j = pair * 2u + select(1u, 0u, rem < 32u);
+  let sm = q4k_scale_min(base, j);
+  return (qhalf(base) * sm.x) * f32(nibble) - qhalf(base + 2u) * sm.y;
+}
+// Q6_K: 128 low nibbles, 64 bytes of high pairs, sixteen signed group scales,
+// then the f16 super-block scale. Each value is (low4 | high2 << 4) - 32.
+fn q6k(block0: u32, col: u32, K: u32, e: u32) -> f32 {
+  let base = qbase(block0, col, K, e, 210u);
+  let within = e % 256u;
+  let half = within / 128u;
+  let rem = within % 128u;
+  let sub = rem / 32u;
+  let l = rem % 32u;
+  let ql = qbyte(base + 64u * half + l + 32u * (sub & 1u));
+  let low = select(ql >> 4u, ql & 15u, sub < 2u);
+  let high = (qbyte(base + 128u + 32u * half + l) >> (2u * sub)) & 3u;
+  let scale = f32(bitcast<i32>(qbyte(base + 192u + 8u * half + l / 16u + 2u * sub) << 24u) >> 24u);
+  return (qhalf(base + 208u) * scale) * f32(bitcast<i32>(low | (high << 4u)) - 32);
+}
+var<workgroup> As: array<array<f32, 16>, 16>;
+var<workgroup> Bs: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  let row = wg.y * 16u + lid.y; let col = wg.x * 16u + lid.x;
+  let aBase = wg.z * P.sa.x; let bBase = wg.z * P.sa.y;
+  var acc = 0.0;
+  for (var t = 0u; t < K; t = t + 16u) {
+    let ka = t + lid.x; let kb = t + lid.y;
+    var av = 0.0; var bv = 0.0;
+    if (row < M && ka < K) { av = A[aBase + row * K + ka]; }
+    if (kb < K && col < N) { bv = q6k(bBase / 256u, col, K, kb); }
+    As[lid.y][lid.x] = av; Bs[lid.y][lid.x] = bv;
+    workgroupBarrier();
+    let span = min(16u, K - t);
+    for (var k = 0u; k < span; k = k + 1u) { acc = acc + As[lid.y][k] * Bs[k][lid.x]; }
+    workgroupBarrier();
+  }
+  if (row < M && col < N) { O[wg.z * M * N + row * N + col] = acc; }
+}`],
 };
 const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
 const BINARY = {add: 0, sub: 1, mul: 2, div: 3}, MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
@@ -141,6 +311,14 @@ const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_upd
 // submission (a 64-step session run of a 512-node graph fits).
 const SLOT = 256, UNIFORM_SLOTS = 16384, POOL_BYTES = 256 * 1024 * 1024, GROUP_CACHE = 8192;
 const COMPUTE = () => globalThis.GPUShaderStage?.COMPUTE ?? 4;
+/** Blocks as whole four-byte words. A Q6_K block is 210 bytes, so a buffer of
+ * them need not be a multiple of four and the tail is padded rather than
+ * read short. */
+const words = bytes => {
+  const total = Math.ceil(bytes.byteLength / 4) * 4;
+  const padded = total === bytes.byteLength ? bytes : (() => { const b = new Uint8Array(total); b.set(bytes); return b; })();
+  return new Uint32Array(padded.buffer, padded.byteOffset, total / 4);
+};
 
 export class WebGPUBackend {
   static async create({debug = false} = {}) {
@@ -197,7 +375,12 @@ export class WebGPUBackend {
     } else {
       buffer = this.device.createBuffer({size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
         mappedAtCreation: !!data});
-      if (data) {new Float32Array(buffer.getMappedRange(), 0, size).set(data); buffer.unmap();}
+      if (data) {
+        const view = data instanceof Uint32Array
+          ? new Uint32Array(buffer.getMappedRange(), 0, size)
+          : new Float32Array(buffer.getMappedRange(), 0, size);
+        view.set(data); buffer.unmap();
+      }
       this.liveBufferBytes += bytes; this.peakBufferBytes = Math.max(this.peakBufferBytes, this.liveBufferBytes);
     }
     return {buffer, size, bytes, freed: false};
@@ -269,7 +452,11 @@ export class WebGPUBackend {
     } finally {for (const h of scratch) this.free(h);}
   }
   async run(n, refs) {
-    if (n.op === 'input') return this.alloc(n.size, n.data);
+    // A quantized input's buffer is its blocks: size counts four-byte words,
+    // so binding, pooling and accounting are unchanged, and nothing expands it.
+    if (n.op === 'input') {
+      return n.quant ? this.alloc(words(n.data).length, words(n.data)) : this.alloc(n.size, n.data);
+    }
     const out = this.alloc(n.size), [a] = refs;
     // Debug mode attributes validation errors to the node that caused them.
     let scoped = this.debug;
@@ -307,9 +494,11 @@ export class WebGPUBackend {
           break;
         }
         case 'cross_entropy_grad': await this.dispatch('ce_grad', u => {u[0] = n.rows; u[3] = n.cols;}, refs, out, n.rows); break;
-        case 'matmul':
-          await this.dispatch('matmul', u => {u.set([n.m, n.k, n.n, n.batch], 16); u[8] = n.aBatchStride; u[9] = n.bBatchStride;},
+        case 'matmul': {
+          const kernel = n.bQuant ? `matmul_${n.bQuant.dtype.replace('_', '')}` : n.transposed ? 'matmul_t' : 'matmul';
+          await this.dispatch(kernel, u => {u.set([n.m, n.k, n.n, n.batch], 16); u[8] = n.aBatchStride; u[9] = n.bBatchStride;},
             refs, out, n.size, [Math.ceil(n.n / 16), Math.ceil(n.m / 16), n.batch]); break;
+        }
         case 'sgd_update': case 'momentum_update': case 'adam_m': case 'adam_v': case 'adam_update': {
           const scalars = {sgd_update: [n.lr], momentum_update: [n.momentum, n.w], adam_m: [n.w], adam_v: [n.beta2, n.w],
             adam_update: [n.stepSize, n.bc2Sqrt, n.eps]}[n.op];
@@ -347,8 +536,8 @@ export class WebGPUBackend {
   }
   /**
    * A session run's end: submit, then await the readback map, both error
-   * scopes and the queue in ONE round trip to the GPU process (`readAll` then
-   * `finish` take two). Leaves nothing for `finish` to do.
+   * scopes and the queue in ONE round trip to the GPU process (readAll then
+   * finish take two). Leaves nothing for finish to do.
    */
   async complete(handles) {
     this.live();
@@ -391,7 +580,7 @@ export class WebGPUBackend {
   free(h) { if (!h.freed) { h.freed = true; if (this.scopeOpen) this.recycled.push(h); else this.pool(h); } }
   // Idle lists stay sorted by buffer id, so a session run that starts from
   // the same pool allocates the same buffers every time (and its cached bind
-  // groups keep matching); `alloc` takes from the end.
+  // groups keep matching); alloc takes from the end.
   pool(h) {
     if (this.idleBytes + h.bytes > POOL_BYTES) {h.buffer.destroy(); this.liveBufferBytes -= h.bytes; return;}
     if (!this.idle.has(h.bytes)) this.idle.set(h.bytes, []);

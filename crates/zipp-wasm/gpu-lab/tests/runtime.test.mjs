@@ -140,3 +140,13 @@ test('validator rejects non-finite, mis-sized and non-float32 typed input',()=>{
   for(const data of [new Float32Array([1,NaN]),new Float32Array([Infinity,1]),new Float32Array([1]),new Float64Array([1,2]),new Uint8Array([1,2])])
     assert.throws(()=>validateProgram(graph([input(0,data,[2])])),e=>['NUMBER','SHAPE'].includes(e.code),String(data.constructor.name));
 });
+
+test('every backend module parses', async () => {
+  // Shader source lives in template literals, so a backtick in a WGSL or GLSL
+  // comment is a JavaScript syntax error, not a shader one -- and only the two
+  // backends this machine can actually create would otherwise be loaded.
+  for (const name of ['cpu', 'wasm', 'webgl2', 'webgpu']) {
+    const module = await import(`../src/backends/${name}.mjs`);
+    assert.equal(typeof Object.values(module)[0], 'function', `${name} exports no backend`);
+  }
+});

@@ -1,5 +1,6 @@
 import {createRuntime} from '../src/runtime.mjs';
 import {opCases, mlpTrainingStep, mlpSessionProgram, seeded} from './ml-cases.mjs';
+import {decodeQ4K, Q4_K_BLOCK, Q4_K_BYTES} from '../src/quant.mjs';
 const input=(id,data,shape=[data.length])=>({id,op:'input',shape,data});
 const program=nodes=>({version:1,nodes,outputs:[{name:'result',id:nodes.length-1}]});
 function cases(){
@@ -19,6 +20,22 @@ function cases(){
     const data=Array.from({length:h*w},(_,i)=>(i*17%23)<7?1:0),nodes=[input(0,data,[h,w])];
     for(let id=1;id<=8;id++)nodes.push({id,op:'life',a:id-1});
     result.push([`Life torus ${h}x${w}, eight steps`,program(nodes)]);
+  }
+  // The two matmul shapes a checkpoint needs: a weight stored [N, K], and one
+  // that is still Q4_K blocks on the device. Every backend decodes inside its
+  // own matmul, so these exercise four separate decoders against the reference.
+  for(const [m,k,n] of [[1,256,4],[2,512,7],[3,256,16]]){
+    let state=(m*131+k+n)>>>0;const next=()=>(state=(Math.imul(state,1664525)+1013904223)>>>0);
+    const w=new Uint8Array((k/Q4_K_BLOCK)*n*Q4_K_BYTES);
+    for(let i=0;i<w.length/Q4_K_BYTES;i++){const at=i*Q4_K_BYTES;
+      w[at]=next()&0xff;w[at+1]=0x20|(next()&7);w[at+2]=next()&0xff;w[at+3]=0x18|(next()&7);
+      for(let j=4;j<Q4_K_BYTES;j++)w[at+j]=next()&0xff;}
+    const values=new Float32Array(k*n);decodeQ4K(w,0,values.length,values);
+    const a=Array.from({length:m*k},(_,i)=>((i*37)%19)/16-0.5);
+    const v2=b=>({version:2,nodes:[{id:0,op:'input',shape:[m,k],data:a},b,{id:2,op:'matmul',a:0,b:1,transposed:true}],
+      outputs:[{name:'result',id:2}]});
+    result.push([`transposed matmul ${m}x${k}x${n}`,v2({id:1,op:'input',shape:[n,k],data:values})]);
+    result.push([`Q4_K matmul ${m}x${k}x${n}`,v2({id:1,op:'input',shape:[n,k],dtype:'q4_k',data:w})]);
   }
   return [...result,...opCases()];
 }

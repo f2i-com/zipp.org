@@ -1,7 +1,12 @@
 import {check} from '../graph.mjs';
 const BINARY={add:0,sub:1,mul:2,div:3},MODE={same:0,aScalar:1,bScalar:2};
 const UNARY={relu:0,positive:1,neg:2,exp:3,log:4,sqrt:5,tanh:6,sigmoid:7,gelu:8,gelu_grad:9};
-const ARENA=128*1024*1024;
+// The kernel takes the format as a number; both pack 256 values to a block.
+const QUANT_DTYPE={q4_k:0,q6_k:1};
+// A ceiling, not a reservation: the module's memory grows only as the arena is
+// used. It has to admit a real checkpoint -- a 0.6B Qwen3 is 373 MB of blocks,
+// and this allocator bumps rather than reclaiming within one execution.
+const ARENA=2*1024*1024*1024;
 export class WasmBackend {
   static async create({wasmBytes, wasmUrl = new URL('../../wasm/kernels.wasm', import.meta.url)} = {}) {
     if (!wasmBytes) {
@@ -18,14 +23,19 @@ export class WasmBackend {
   /** SIMD kernels sustain more work than the JavaScript reference within a frame deadline. */
   limitHints() { return {maxWork: 400000000}; }
   async begin() { this.cursor = this.base; }
-  alloc(size) {
-    const ptr = this.cursor; this.cursor += Math.ceil(size*4/16)*16;
+  alloc(size) { return this.reserve(size*4, {size}); }
+  /** Blocks are bytes: a quantized weight is never counted in elements here,
+   * which is the whole reason it costs seven times less to keep. */
+  allocBytes(bytes) { return this.reserve(bytes, {bytes, quant: true}); }
+  reserve(bytes, fields) {
+    const ptr = this.cursor; this.cursor += Math.ceil(bytes/16)*16;
     check(this.cursor <= ARENA, 'LIMIT', 'WASM arena limit exceeded');
     const deficit = this.cursor - this.e.memory.buffer.byteLength;
     if (deficit > 0) this.e.memory.grow(Math.ceil(deficit/65536));
-    return {ptr, size};
+    return {ptr, ...fields};
   }
   view(h) { return new Float32Array(this.e.memory.buffer, h.ptr, h.size); }
+  bytesView(h) { return new Uint8Array(this.e.memory.buffer, h.ptr, h.bytes); }
   /** Pairwise tree over scratch that is released afterwards; returns the float32 total. */
   pairwise(input) {
     const mark=this.cursor;
@@ -33,7 +43,15 @@ export class WasmBackend {
     const total=this.view(input)[0];this.cursor=mark;return total;
   }
   async run(n, refs) {
-    const o = this.alloc(n.size), [a, b, c] = refs.map(r => r?.ptr), e = this.e;
+    const e = this.e;
+    // A quantized input is copied in as the blocks it is. Nothing expands it:
+    // only a transposed matmul reads it, and that decodes as it multiplies.
+    if (n.op === 'input' && n.quant) {
+      const h = this.allocBytes(n.data.length);
+      this.bytesView(h).set(n.data);
+      return h;
+    }
+    const o = this.alloc(n.size), [a, b, c] = refs.map(r => r?.ptr);
     switch(n.op) {
       case 'input': this.view(o).set(n.data); break;
       case 'full': e.fill(o.ptr,n.size,n.value); break;
@@ -44,7 +62,15 @@ export class WasmBackend {
       case 'relu': case 'positive': case 'neg': case 'exp': case 'log': case 'sqrt':
       case 'tanh': case 'sigmoid': case 'gelu': case 'gelu_grad': e.unary(a,o.ptr,n.size,UNARY[n.op]); break;
       case 'transpose': case 'permute': e.gather4(a,o.ptr,...n.dims,...n.srcStrides); break;
-      case 'matmul': e.bmm(a,b,o.ptr,n.batch,n.m,n.k,n.n,n.aBatchStride,n.bBatchStride); break;
+      case 'matmul':
+        if (n.bQuant) {
+          // Four decoded columns at a time; the scratch is released with the mark.
+          const mark=this.cursor,scratch=this.alloc(4*n.k);
+          e.bmm_quant(a,b,o.ptr,scratch.ptr,n.batch,n.m,n.k,n.n,n.aBatchStride,n.bBatchStride,QUANT_DTYPE[n.bQuant.dtype]);
+          this.cursor=mark;
+        } else if (n.transposed) e.bmm_t(a,b,o.ptr,n.batch,n.m,n.k,n.n,n.aBatchStride,n.bBatchStride);
+        else e.bmm(a,b,o.ptr,n.batch,n.m,n.k,n.n,n.aBatchStride,n.bBatchStride);
+        break;
       case 'life': e.life(a,o.ptr,n.shape[0],n.shape[1]); break;
       case 'sum': case 'mean':
         if (n.whole) {
@@ -71,8 +97,15 @@ export class WasmBackend {
   free() {} // Arena reclaimed between serial graph executions, not individual nodes.
   // Sessions: the arena is reset per step, so a handle that outlives a step is
   // a host copy, uploaded again where a step reads it.
-  persist(h) { return h instanceof Float32Array ? h : this.view(h).slice(); }
-  materialize(h) { if (!(h instanceof Float32Array)) return h; const o = this.alloc(h.length); this.view(o).set(h); return o; }
+  persist(h) {
+    if (h instanceof Float32Array || h instanceof Uint8Array) return h;
+    return h.quant ? this.bytesView(h).slice() : this.view(h).slice();
+  }
+  materialize(h) {
+    if (h instanceof Uint8Array) { const o = this.allocBytes(h.length); this.bytesView(o).set(h); return o; }
+    if (!(h instanceof Float32Array)) return h;
+    const o = this.alloc(h.length); this.view(o).set(h); return o;
+  }
   nextStep() { this.cursor = this.base; }
   async finish() {}
   dispose() { this.e = null; }

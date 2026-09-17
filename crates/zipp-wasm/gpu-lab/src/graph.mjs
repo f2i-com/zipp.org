@@ -22,12 +22,16 @@ export const MAX_RANK = 4;
  * one it cannot. The blocks stay as bytes and a matmul decodes them as it
  * reads them.
  *
- * Only Q4_K, deliberately. Every format here is another kernel in every
- * backend, and Q4_K is what a Q4_K_M checkpoint is mostly made of; the rest of
- * such a file is Q6_K and F32, which a loader can expand as it does today.
+ * Q4_K and Q6_K, which between them are what a Q4_K_M checkpoint is made of --
+ * a Qwen3-0.6B is 373 MB this way and 2,274 MB as float32, with nothing
+ * decoded at all. Every further format is another decoder in every backend
+ * held to bit-for-bit agreement, so they are added when a checkpoint needs
+ * them rather than for completeness. Anything else -- Q5_K, Q8_0, the IQ
+ * formats -- a loader expands to float32 on the way in, as it always has.
  */
 export const QUANT = Object.freeze({
   q4_k: Object.freeze({block: 256, bytes: 144}),
+  q6_k: Object.freeze({block: 256, bytes: 210}),
 });
 export function sizeOf(shape) { return shape.reduce((a, b) => a * b, 1); }
 // Operation families. Every name here is a fixed kernel; none becomes code.
@@ -56,13 +60,26 @@ function intArray(value, maxLength, what) {
   }
   return out;
 }
-function shapeOf(shape, limits) {
+/**
+ * `blocks` relaxes the element ceiling, and only that ceiling.
+ *
+ * `maxElements` exists because a float32 tensor of that many values must be
+ * allocated as four bytes each. A quantized input is never allocated at that
+ * size -- it is held as its blocks, and what it costs is charged against
+ * `maxLogicalBytes` below. Applying the float32 ceiling to it would refuse a
+ * 127 MB embedding table for being 155 million values, which is precisely the
+ * arithmetic quantization exists to avoid. Every dimension is still bounded and
+ * the product still stays a safe integer.
+ */
+function shapeOf(shape, limits, blocks = false) {
   const dims = intArray(shape, MAX_RANK, 'Shape');
   let size = 1;
   for (const d of dims) {
     check(d > 0 && d <= limits.maxDimension, 'SHAPE', 'Shape dimensions must be positive bounded integers');
+    size *= d;
+    check(Number.isSafeInteger(size), 'LIMIT', 'Tensor exceeds element limit');
     // Checked after every factor, so the product never leaves the safe-integer range.
-    size *= d; check(size <= limits.maxElements, 'LIMIT', 'Tensor exceeds element limit');
+    if (!blocks) check(size <= limits.maxElements, 'LIMIT', 'Tensor exceeds element limit');
   }
   return dims;
 }
@@ -159,9 +176,17 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
       'dtype', 'transposed'], ['id', 'op']);
     check(raw.id === id, 'PROTOCOL', 'Node IDs must be consecutive integers starting at zero');
     const n = {id, op: raw.op, refs: []};
-    const ref = key => {
+    // `blocks` marks the one position that can read a quantized node: the
+    // right-hand side of a transposed matmul, which decodes as it multiplies.
+    // Everywhere else a quantized handle is a byte array standing where floats
+    // are expected, so refusing it here is the difference between an error and
+    // a tensor of plausible nonsense.
+    const ref = (key, blocks = false) => {
       const r = raw[key];
       check(Number.isSafeInteger(r) && r >= 0 && r < id, 'REFERENCE', 'References must point to earlier nodes');
+      const target = nodes[root[r]];
+      check(blocks || !target?.quant, 'PROTOCOL',
+        `Node ${r} is quantized; only the right-hand side of a matmul can read it`);
       n[key] = r; n.refs.push(r); return nodes[r];
     };
     let units = 0;
@@ -196,8 +221,9 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
       case 'input': {
         const fields = session ? ['id', 'op', 'shape', 'data', 'carry', 'dtype'] : ['id', 'op', 'shape', 'data', 'dtype'];
         keys(raw, fields, session ? ['shape'] : ['shape', 'data']);
-        n.shape = shapeOf(raw.shape, limits);
-        if (Object.hasOwn(raw, 'dtype') && raw.dtype !== 'f32') {
+        const quantized = Object.hasOwn(raw, 'dtype') && raw.dtype !== 'f32';
+        n.shape = shapeOf(raw.shape, limits, quantized);
+        if (quantized) {
           // A quantized input: its bytes are blocks, not values, and only a
           // matmul reading it as the right-hand side knows how to decode them.
           check(typeof raw.dtype === 'string' && Object.hasOwn(QUANT, raw.dtype), 'PROTOCOL',
@@ -213,7 +239,9 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
           const blocks = size / block;
           check(raw.data instanceof Uint8Array && raw.data.length === blocks * bytes, 'SHAPE',
             `${raw.dtype} needs ${blocks * bytes} bytes for ${size} values; got ${raw.data?.length}`);
-          inputElements += size;
+          // Charged as what crosses the boundary -- blocks -- in the float32
+          // units this budget is expressed in, not as the values they stand for.
+          inputElements += Math.ceil(blocks * bytes / 4);
           check(inputElements <= limits.maxInputElements, 'LIMIT', 'Total input exceeds limit');
           n.quant = {dtype: raw.dtype, block, bytes, blocks};
           // Owned, like every other input's data.
@@ -278,7 +306,7 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
       }
       case 'matmul': {
         keys(raw, ['id', 'op', 'a', 'b', 'transposed'], ['a', 'b']);
-        const a = ref('a'), b = ref('b');
+        const a = ref('a'), b = ref('b', true);
         // `transposed`: b holds [N, K] rather than [K, N], which is how a
         // checkpoint stores a linear layer and the only way a quantized weight
         // can be read at all -- its blocks run along K, and blocks cannot be
@@ -359,6 +387,9 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
       !['__proto__', 'prototype', 'constructor'].includes(o.name), 'PROTOCOL', 'Invalid output name');
     check(!names.has(o.name), 'PROTOCOL', 'Duplicate output name'); names.add(o.name);
     check(Number.isSafeInteger(o.id) && o.id >= 0 && o.id < nodes.length, 'REFERENCE', 'Invalid output reference');
+    // Blocks are not a readable tensor: reading one back would hand out bytes
+    // where the caller is promised float32.
+    check(!nodes[root[o.id]]?.quant, 'PROTOCOL', `Output ${o.name} is a quantized tensor, which has no float32 readback`);
     outputElements += nodes[o.id].size;
     check(outputElements <= limits.maxOutputElements, 'LIMIT', 'Requested readback exceeds limit');
     return Object.freeze({...o});

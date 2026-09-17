@@ -22,6 +22,14 @@ const f = Math.fround;
 
 export const Q4_K_BLOCK = 256;
 export const Q4_K_BYTES = 144;
+export const Q6_K_BLOCK = 256;
+export const Q6_K_BYTES = 210;
+
+/** Every format a backend can read without expanding it, by Graph v2 name. */
+export const FORMATS = Object.freeze({
+  q4_k: Object.freeze({block: Q4_K_BLOCK, bytes: Q4_K_BYTES}),
+  q6_k: Object.freeze({block: Q6_K_BLOCK, bytes: Q6_K_BYTES}),
+});
 
 /** One IEEE half, as the float32 it names exactly. */
 export function readHalf(bytes, at) {
@@ -80,4 +88,51 @@ export function decodeQ4K(bytes, block, count, out) {
   for (let i = 0; i < blocks; i++) {
     decodeQ4KBlock(bytes, (block + i) * Q4_K_BYTES, out, i * Q4_K_BLOCK);
   }
+}
+
+/** Q6_K block decoding.
+ *
+ * A port of `dequantize_row_q6_K`, and the same discipline as Q4_K above: the
+ * scale product rounds to float32 before it meets the quant, because ggml's
+ * does. One 210-byte block, holding 256 values:
+ *
+ *   [0..128]    u8  ql      low four bits of each value
+ *   [128..192]  u8  qh      high two bits, four values to a byte
+ *   [192..208]  i8  scales  one signed scale per group of sixteen
+ *   [208..210]  f16 d       super-block scale
+ *
+ * Each value is `(low4 | high2 << 4) - 32`, times `d * scales[group]`.
+ */
+export function decodeQ6KBlock(bytes, at, out, outAt) {
+  const d = readHalf(bytes, at + 208);
+  for (let half = 0; half < 2; half++) {
+    const ql = at + 64 * half, qh = at + 128 + 32 * half, sc = at + 192 + 8 * half;
+    for (let sub = 0; sub < 4; sub++) {
+      const lowNibble = sub < 2, shift = 2 * sub, sub32 = (sub & 1) * 32;
+      for (let l = 0; l < 32; l++) {
+        const byte = bytes[ql + l + sub32];
+        const low = lowNibble ? byte & 0x0f : byte >>> 4;
+        const high = (bytes[qh + l] >>> shift) & 0x03;
+        // The scale runs per group of sixteen within the 32.
+        const scale = (bytes[sc + (l >>> 4) + 2 * sub] << 24) >> 24; // signed
+        out[outAt + 128 * half + 32 * sub + l] = f(d * scale) * ((low | (high << 4)) - 32);
+      }
+    }
+  }
+}
+
+/** Decode `count` values starting at block `block`, into `out`. */
+export function decodeQ6K(bytes, block, count, out) {
+  const blocks = count / Q6_K_BLOCK;
+  for (let i = 0; i < blocks; i++) {
+    decodeQ6KBlock(bytes, (block + i) * Q6_K_BYTES, out, i * Q6_K_BLOCK);
+  }
+}
+
+/** One block of whichever format, so a backend dispatches once per row rather
+ * than once per value. */
+export function blockDecoder(dtype) {
+  if (dtype === 'q4_k') return decodeQ4KBlock;
+  if (dtype === 'q6_k') return decodeQ6KBlock;
+  throw new Error(`No block decoder for ${dtype}`);
 }
