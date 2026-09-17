@@ -106,6 +106,14 @@ callback that resubmits cannot recurse), and rejects work after tenant invalidat
 - `src/zipp-python-adapter.mjs`: actual Python host bridge.
 - `src/zipp-adapter.mjs`, `src/zipp-guest.js`: opt-in JavaScript guest integration.
 - `../../zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`: native Python graph authoring/export library.
+- `src/quant.mjs`: Q4_K block decoding, a port of ggml's own, checked against
+  the `ggml-quants` crate rather than only against itself. An `input` node may
+  declare `dtype: 'q4_k'` and carry blocks instead of values; a `matmul` with
+  `transposed: true` reads them as it goes. The weight stays 144 bytes per 256
+  values on the device — 7.1 times smaller — and the result is bit for bit what
+  the same matmul over decoded values gives, because decoding is exact. Only the
+  JavaScript reference backend reads them so far; the other three expand as
+  before.
 - `wasm/kernels.c`, `wasm/kernels.wasm`: freestanding C kernels and the
   COMMITTED binary. No workflow rebuilds it: `npm test`, the Node GPU suites
   and the `javascript-python` release archive all load this exact blob, and

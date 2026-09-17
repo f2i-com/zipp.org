@@ -7,6 +7,7 @@ import {gelu, geluGrad, sigmoid, relu} from '../kernel-math.mjs';
  * reproduce them bit for bit; transcendental functions are evaluated in double
  * and rounded, so they agree with WASM to about one float32 ulp.
  */
+import {decodeQ4KBlock, Q4_K_BLOCK, Q4_K_BYTES} from '../quant.mjs';
 const f = Math.fround;
 const UNARY = {relu, positive: x => x > 0 ? 1 : 0, neg: x => -x, exp: Math.exp, log: Math.log, sqrt: Math.sqrt,
   tanh: Math.tanh, sigmoid, gelu, gelu_grad: geluGrad};
@@ -44,6 +45,9 @@ export class CPUBackend {
   constructor() { this.name = 'cpu-js'; this.description = 'Host JavaScript float32 reference'; }
   async begin() {}
   async run(n, refs) {
+    // A quantized input's handle is its blocks. Nothing expands it: that is the
+    // point, and only a transposed matmul knows how to read it.
+    if (n.op === 'input' && n.quant) return n.data;
     const out = new Float32Array(n.size), a = refs[0], b = refs[1];
     switch (n.op) {
       case 'input': out.set(n.data); break;
@@ -96,15 +100,47 @@ export class CPUBackend {
         break;
       }
       case 'matmul': {
-        // ikj order: each output still sums its products in k order, rounding each step.
+        // Every output sums its k products in k order, rounding each step, in
+        // all three shapes below. The loops differ in what they walk first, not
+        // in what any one output accumulates, so the results are identical.
         const {m, k, n: cols} = n;
-        for (let batch = 0; batch < n.batch; batch++) {
-          const ao = batch * n.aBatchStride, bo = batch * n.bBatchStride, oo = batch * m * cols;
-          for (let r = 0; r < m; r++) {
-            const row = out.subarray(oo + r*cols, oo + (r+1)*cols);
-            for (let j = 0; j < k; j++) {
-              const x = a[ao + r*k + j], base = bo + j*cols;
-              for (let c = 0; c < cols; c++) row[c] += f(x * b[base + c]);
+        if (n.bQuant) {
+          // b holds [N, K] blocks. Each output row of b is decoded once, into
+          // scratch, and reused by every row of a: the weight is never expanded.
+          const perRow = k / Q4_K_BLOCK, scratch = new Float32Array(k);
+          for (let batch = 0; batch < n.batch; batch++) {
+            const ao = batch * n.aBatchStride, bo = (batch * n.bBatchStride) / Q4_K_BLOCK, oo = batch * m * cols;
+            for (let c = 0; c < cols; c++) {
+              for (let t = 0; t < perRow; t++) {
+                decodeQ4KBlock(b, (bo + c * perRow + t) * Q4_K_BYTES, scratch, t * Q4_K_BLOCK);
+              }
+              for (let r = 0; r < m; r++) {
+                const at = oo + r * cols + c, base = ao + r * k;
+                for (let j = 0; j < k; j++) out[at] += f(a[base + j] * scratch[j]);
+              }
+            }
+          }
+        } else if (n.transposed) {
+          // b holds [N, K]: one contiguous row per output column.
+          for (let batch = 0; batch < n.batch; batch++) {
+            const ao = batch * n.aBatchStride, bo = batch * n.bBatchStride, oo = batch * m * cols;
+            for (let r = 0; r < m; r++) {
+              for (let c = 0; c < cols; c++) {
+                const at = oo + r * cols + c, base = ao + r * k, brow = bo + c * k;
+                for (let j = 0; j < k; j++) out[at] += f(a[base + j] * b[brow + j]);
+              }
+            }
+          }
+        } else {
+          // ikj order over [K, N].
+          for (let batch = 0; batch < n.batch; batch++) {
+            const ao = batch * n.aBatchStride, bo = batch * n.bBatchStride, oo = batch * m * cols;
+            for (let r = 0; r < m; r++) {
+              const row = out.subarray(oo + r*cols, oo + (r+1)*cols);
+              for (let j = 0; j < k; j++) {
+                const x = a[ao + r*k + j], base = bo + j*cols;
+                for (let c = 0; c < cols; c++) row[c] += f(x * b[base + c]);
+              }
             }
           }
         }

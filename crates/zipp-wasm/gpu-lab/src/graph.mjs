@@ -14,6 +14,21 @@ export const DEFAULT_LIMITS = Object.freeze({
 });
 /** Highest tensor rank. Kernels address every tensor as four padded dimensions. */
 export const MAX_RANK = 4;
+/** Block formats an input may hold without being expanded to float32.
+ *
+ * A quantized weight is the only thing in this protocol that is not float32,
+ * and it exists for one reason: a checkpoint that is 500 MB of Q4_K is 3.2 GB
+ * once expanded, which is the difference between a model a device can hold and
+ * one it cannot. The blocks stay as bytes and a matmul decodes them as it
+ * reads them.
+ *
+ * Only Q4_K, deliberately. Every format here is another kernel in every
+ * backend, and Q4_K is what a Q4_K_M checkpoint is mostly made of; the rest of
+ * such a file is Q6_K and F32, which a loader can expand as it does today.
+ */
+export const QUANT = Object.freeze({
+  q4_k: Object.freeze({block: 256, bytes: 144}),
+});
 export function sizeOf(shape) { return shape.reduce((a, b) => a * b, 1); }
 // Operation families. Every name here is a fixed kernel; none becomes code.
 export const BINARY_OPS = Object.freeze(['add', 'sub', 'mul', 'div']);
@@ -140,7 +155,8 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
     const raw = program.nodes[id];
     // Validate op before looking up a kernel; identifiers never become code.
     keys(raw, ['id', 'op', 'shape', 'data', 'value', 'a', 'b', 'c', 'axis', 'keepdim', 'dims',
-      'lr', 'momentum', 'dampening', 'beta1', 'beta2', 'eps', 'step', 'carry'], ['id', 'op']);
+      'lr', 'momentum', 'dampening', 'beta1', 'beta2', 'eps', 'step', 'carry',
+      'dtype', 'transposed'], ['id', 'op']);
     check(raw.id === id, 'PROTOCOL', 'Node IDs must be consecutive integers starting at zero');
     const n = {id, op: raw.op, refs: []};
     const ref = key => {
@@ -177,9 +193,41 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
       }
       units = a.size * 2;
     } else switch (op) {
-      case 'input':
-        keys(raw, session ? ['id', 'op', 'shape', 'data', 'carry'] : ['id', 'op', 'shape', 'data'], session ? ['shape'] : ['shape', 'data']);
+      case 'input': {
+        const fields = session ? ['id', 'op', 'shape', 'data', 'carry', 'dtype'] : ['id', 'op', 'shape', 'data', 'dtype'];
+        keys(raw, fields, session ? ['shape'] : ['shape', 'data']);
         n.shape = shapeOf(raw.shape, limits);
+        if (Object.hasOwn(raw, 'dtype') && raw.dtype !== 'f32') {
+          // A quantized input: its bytes are blocks, not values, and only a
+          // matmul reading it as the right-hand side knows how to decode them.
+          check(typeof raw.dtype === 'string' && Object.hasOwn(QUANT, raw.dtype), 'PROTOCOL',
+            `Unsupported input dtype ${String(raw.dtype)}; this protocol holds f32 and ${Object.keys(QUANT).join(', ')}`);
+          check(!session || !Object.hasOwn(raw, 'carry'), 'PROTOCOL', 'A quantized input is a constant, not a carried value');
+          const {block, bytes} = QUANT[raw.dtype];
+          const size = sizeOf(n.shape);
+          check(size % block === 0, 'SHAPE',
+            `A ${raw.dtype} tensor holds whole blocks of ${block}; ${size} is not a multiple of ${block}`);
+          check(n.shape[n.shape.length - 1] % block === 0, 'SHAPE',
+            `A ${raw.dtype} row must be whole blocks of ${block}; this one is ${n.shape[n.shape.length - 1]} wide`);
+          check(Object.hasOwn(raw, 'data'), 'PROTOCOL', 'A quantized input carries its blocks');
+          const blocks = size / block;
+          check(raw.data instanceof Uint8Array && raw.data.length === blocks * bytes, 'SHAPE',
+            `${raw.dtype} needs ${blocks * bytes} bytes for ${size} values; got ${raw.data?.length}`);
+          inputElements += size;
+          check(inputElements <= limits.maxInputElements, 'LIMIT', 'Total input exceeds limit');
+          n.quant = {dtype: raw.dtype, block, bytes, blocks};
+          // Owned, like every other input's data.
+          n.data = raw.data.slice();
+          n.size = size;
+          root.push(id);
+          // Charged as the bytes it is, not as the values it stands for: that
+          // saving is the whole point of admitting it.
+          logicalBytes += blocks * bytes; work += size;
+          check(logicalBytes <= limits.maxLogicalBytes && work <= limits.maxWork,
+            'LIMIT', 'Graph exceeds allocation or work budget');
+          nodes.push(n);
+          continue;
+        }
         if (session && Object.hasOwn(raw, 'carry')) {
           check(typeof raw.carry === 'string', 'PROTOCOL', 'carry must name an output');
           n.carry = raw.carry; // checked against the outputs below
@@ -195,6 +243,7 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
           n.data = float32Data(raw.data);
         } else n.fed = true; // no initial value: every session run supplies one
         break;
+      }
       case 'full':
         keys(raw, ['id', 'op', 'shape', 'value'], ['shape', 'value']);
         n.shape = shapeOf(raw.shape, limits); n.value = finiteF32(raw.value); break;
@@ -228,15 +277,28 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
         units = a.size * 4; break;
       }
       case 'matmul': {
-        keys(raw, ['id', 'op', 'a', 'b'], ['a', 'b']);
+        keys(raw, ['id', 'op', 'a', 'b', 'transposed'], ['a', 'b']);
         const a = ref('a'), b = ref('b');
+        // `transposed`: b holds [N, K] rather than [K, N], which is how a
+        // checkpoint stores a linear layer and the only way a quantized weight
+        // can be read at all -- its blocks run along K, and blocks cannot be
+        // transposed without decoding them.
+        const transposed = Object.hasOwn(raw, 'transposed');
+        if (transposed) check(raw.transposed === true, 'PROTOCOL', 'transposed is true when present');
+        n.transposed = transposed;
         const ra = a.shape.length, rb = b.shape.length;
-        check((ra === 2 || ra === 3) && (rb === 2 || rb === 3) && a.shape[ra - 1] === b.shape[rb - 2],
-          'SHAPE', 'matmul requires [M,K] @ [K,N] or batched [B,M,K] @ [B,K,N]');
+        const inner = transposed ? b.shape[rb - 1] : b.shape[rb - 2];
+        check((ra === 2 || ra === 3) && (rb === 2 || rb === 3) && a.shape[ra - 1] === inner,
+          'SHAPE', transposed ? 'transposed matmul requires [M,K] @ [N,K]' : 'matmul requires [M,K] @ [K,N] or batched [B,M,K] @ [B,K,N]');
+        const quant = nodes[root[raw.b]]?.quant;
+        check(!quant || transposed, 'PROTOCOL',
+          'A quantized weight is stored [N, K]; its matmul must be transposed');
         const ba = ra === 3 ? a.shape[0] : 1, bb = rb === 3 ? b.shape[0] : 1;
         check(ba === bb || ba === 1 || bb === 1, 'SHAPE', 'matmul batch dimensions must match or be 1');
-        n.batch = Math.max(ba, bb); n.m = a.shape[ra - 2]; n.k = a.shape[ra - 1]; n.n = b.shape[rb - 1];
+        n.batch = Math.max(ba, bb); n.m = a.shape[ra - 2]; n.k = a.shape[ra - 1];
+        n.n = transposed ? b.shape[rb - 2] : b.shape[rb - 1];
         n.aBatchStride = ba === 1 ? 0 : n.m * n.k; n.bBatchStride = bb === 1 ? 0 : n.k * n.n;
+        if (quant) n.bQuant = quant;
         n.shape = ra === 3 || rb === 3 ? [n.batch, n.m, n.n] : [n.m, n.n];
         shapeOf(n.shape, limits); units = 2 * n.batch * n.m * n.k * n.n; break;
       }
