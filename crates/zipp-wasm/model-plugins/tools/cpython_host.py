@@ -4,9 +4,9 @@
 `PluginRegistry.install` copies a plugin's Python files into a fixed
 `zipp_plugin` package and runs a generated bootstrap that imports the entry
 module from there, so a multi-file plugin imports its siblings by absolute name
-(`from zipp_plugin.graph import Graph`). ZIPP's Python frontend has no relative
-imports, and the fixed namespace is also what stops a plugin file shadowing the
-`json` the bootstrap itself imports. Mirroring that layout here keeps the
+(`from zipp_plugin.graph import Graph`). The fixed namespace is what stops a
+plugin file shadowing the `json` the bootstrap itself imports, and the absolute
+form names where the code actually ends up. Mirroring that layout here keeps the
 reference tests, the fixture tools and the engine running identical source.
 """
 import importlib

@@ -4,7 +4,7 @@
   "architecture": {
     "id": "org.zipp.tiny-causal",
     "version": "0.2.0",
-    "sha256": "c64da73b40c0c3de05c39e6c02ba0934edf4fdf64ae604faf6a9848b0c148f16"
+    "sha256": "845441475c74ef6dd20f9ec13f23b077ebaa69ec80fe41462de76d7f3624ec2f"
   },
   "checkpoint_format": "zipp.tiny-causal-v1",
   "config": {

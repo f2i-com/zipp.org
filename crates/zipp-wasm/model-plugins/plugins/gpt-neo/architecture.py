@@ -24,8 +24,9 @@ directly, so a Hugging Face folder needs no conversion to be loaded -- only a
 repack out of pickle, which this host refuses to execute.
 """
 import math
-# ZIPP's Python frontend has no relative imports; siblings are absolute under
-# the fixed package the host installs this source into.
+# Siblings are imported absolutely under the fixed package the host installs
+# this source into. Relative imports also work now, but the absolute form says
+# where the code will actually live, which is the useful thing here.
 from zipp_plugin.graph import Graph
 from zipp_plugin.tokenizer import encode, decode, load_asset
 

@@ -18,11 +18,24 @@ import {createHash} from 'node:crypto';
 const engineURL = new URL('../../dist/all/zipp_wasm.js', import.meta.url);
 const wasmURL = new URL('../../dist/all/zipp_wasm_bg.wasm', import.meta.url);
 const shimURL = new URL('../interop/', import.meta.url);
-const model = process.env.ZIPP_TRANSFORMERS_MODEL ?? 'qwen3';
-const stagedURL = new URL(`../models/transformers-${model}/`, import.meta.url);
+const modelsURL = new URL('../models/', import.meta.url);
 const exists = async url => { try { await access(url); return true; } catch { return false; } };
-const ready = await exists(engineURL) && await exists(new URL('case.json', stagedURL));
-const reason = `Needs dist/all and models/transformers-${model}/ (tools/stage_transformers_model.py)`;
+// Every model staged, not one: the claim is that the shim reads published files
+// generally, so whatever has been staged is what gets checked.
+const only = process.env.ZIPP_TRANSFORMERS_MODEL;
+const staged = await exists(modelsURL)
+  ? (await readdir(modelsURL, {withFileTypes: true}))
+      .filter(entry => entry.isDirectory() && entry.name.startsWith('transformers-'))
+      .map(entry => entry.name.slice('transformers-'.length))
+      .filter(name => !only || name === only)
+  : [];
+// Files that are known not to load, and exactly why. Asserted rather than
+// skipped: if one starts working, this list is what should change.
+const KNOWN_UNSUPPORTED = {
+  gpt_neo: /flex_attention/,
+};
+const haveEngine = await exists(engineURL);
+const reason = 'Needs dist/all and a staged model (tools/stage_transformers_model.py)';
 
 async function collect(dir, prefix = '') {
   const files = {};
@@ -57,8 +70,17 @@ def probe():
     return json.dumps(out.logits.reshape(-1).tolist())
 `;
 
-test('a published transformers modelling file runs unmodified on ZIPP',
-  {skip: !ready && reason}, async () => {
+test('published transformers modelling files run unmodified on ZIPP',
+  {skip: (!haveEngine || staged.length === 0) && reason}, async t => {
+  const zipp = await import(engineURL);
+  await zipp.default({module_or_path: await readFile(wasmURL)});
+  for (const model of staged) {
+    await t.test(model, () => runOne(zipp, model));
+  }
+});
+
+async function runOne(zipp, model) {
+  const stagedURL = new URL(`transformers-${model}/`, modelsURL);
   const caseText = await readFile(new URL('case.json', stagedURL), 'utf8');
   const recorded = JSON.parse(caseText);
   const files = await collect(shimURL);
@@ -73,13 +95,21 @@ test('a published transformers modelling file runs unmodified on ZIPP',
   files['main.py'] = driverFor(recorded);
   files['assets/case.json'] = caseText;
 
-  const zipp = await import(engineURL);
-  await zipp.default({module_or_path: await readFile(wasmURL)});
   const engine = new zipp.Engine();
   try {
     engine.setSyncHostCapabilities([]);
     engine.setInstructionBudget(2_000_000_000);
     const compiled = Date.now();
+    const expected = KNOWN_UNSUPPORTED[model];
+    if (expected) {
+      // This frontend resolves every import while compiling, so an optional
+      // backend guarded by an availability check is still looked up.
+      assert.throws(() => engine.initPythonProject(files, 'main.py', []), error =>
+        expected.test(String(error?.message ?? error)),
+        `${model} is listed as unsupported for a reason that no longer applies`);
+      console.log(`${model}: still unsupported, as recorded (${expected})`);
+      return;
+    }
     engine.initPythonProject(files, 'main.py', []);
     engine.renewInstructionBudget();
     const got = JSON.parse(engine.pythonCall('probe', []));
@@ -87,7 +117,7 @@ test('a published transformers modelling file runs unmodified on ZIPP',
     let worst = 0;
     for (let i = 0; i < got.length; i++) worst = Math.max(worst, Math.abs(got[i] - recorded.expected[i]));
     assert.ok(worst < 1e-5, `max difference ${worst} from transformers`);
-    console.log(`${shimModules}-module shim + ${Object.keys(recorded.sources).length} unmodified files ` +
-      `compiled in ${Date.now() - compiled} ms; max_abs_error = ${worst}`);
+    console.log(`${model}: ${shimModules}-module shim + ${Object.keys(recorded.sources).length} ` +
+      `unmodified files compiled in ${Date.now() - compiled} ms; max_abs_error = ${worst}`);
   } finally { try { engine.dispose(); } catch {} }
-});
+}

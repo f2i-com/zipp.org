@@ -25,7 +25,7 @@
     }
   },
   "sources": {
-    "architecture.py": "4adcc518adee017caa0c4180f9568b73ddc4490ad9c5bddadfc556330ebf84af",
+    "architecture.py": "af7314fde6471d66046ac3b8be9828f2365b75c8f8569c51ddeee4fa7963b265",
     "graph.py": "ad0035d455e59cf794e502785bc5c318966b160eebf41cdb734351afa4d35cff",
     "tokenizer.py": "ab2659434f3c35e7e60b6b95515b9d897f1cfe624194096d4a1785f61b8d1a98"
   }

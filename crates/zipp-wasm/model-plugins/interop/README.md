@@ -17,7 +17,8 @@ what transformers itself produced for the same weights:
 | `modeling_mistral.py` | 1.8e-07 |
 
 The test hashes each file against the digest recorded when the reference was
-made, so "unmodified" is checked rather than asserted.
+made, so "unmodified" is checked rather than asserted, and it runs every model
+staged under `models/transformers-*`, not one.
 
 ```sh
 python tools/stage_transformers_model.py --model qwen3   # copies the two files + a reference
@@ -43,7 +44,9 @@ model. What stood there was four tensor operations (`sin`, `cos`, `rsqrt`,
 
 ## Where it stops
 
-Older modelling files do not load yet. `modeling_gpt_neo.py` reaches for
+Older modelling files do not load yet, and the test records that rather than
+skipping it: `gpt_neo` is asserted to fail for the reason below, so if it ever
+starts working, the list is what changes. `modeling_gpt_neo.py` reaches for
 `torch.nn.attention.flex_attention` behind an availability check; CPython never
 runs that branch, but ZIPP resolves every import while compiling, so a guarded
 import of a module that does not exist fails before the guard can decide. That

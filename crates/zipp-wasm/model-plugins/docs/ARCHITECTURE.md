@@ -57,10 +57,9 @@ with different source content in the same registry. Side-by-side versions are
 allowed. Removing a registry entry does not mutate an already running session.
 
 A multi-file plugin imports its own modules by absolute name under `zipp_plugin`:
-`from zipp_plugin.graph import Graph`, never `from .graph import Graph`. ZIPP's
-Python frontend rejects relative imports outright (`relative imports are not
-supported`), and the fixed namespace also stops a plugin's own `json.py` or
-`math.py` shadowing what the bootstrap imports. `tools/cpython_host.py` mirrors
+`from zipp_plugin.graph import Graph`. Relative imports resolve too, but the
+absolute form names where the source will actually live, and the fixed namespace
+stops a plugin's own `json.py` or `math.py` shadowing what the bootstrap imports. `tools/cpython_host.py` mirrors
 the same layout so the CPython tests and fixture tools import what ZIPP compiles.
 
 The entry module implements:

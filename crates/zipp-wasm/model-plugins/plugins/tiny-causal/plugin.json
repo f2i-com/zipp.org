@@ -12,7 +12,7 @@
     "character-v1"
   ],
   "sources": {
-    "architecture.py": "94ecbfcb1856ed171d88793c6ddf5fe7c8e472c8e46e0ad731c449e1d80ce223",
+    "architecture.py": "f3965c7e23ef613a4c4639ea156458c10d3a0280eb2a16e11a2d5e797077c467",
     "graph.py": "101befd7652e6417eb1614192b92d551b0e8080fe0878f3e6e531d3298119290",
     "tokenizer.py": "d2a1a88fcf7447459a8afa50e8e73e1fd9ba5e21400a49de58162ba29a54bd28"
   }

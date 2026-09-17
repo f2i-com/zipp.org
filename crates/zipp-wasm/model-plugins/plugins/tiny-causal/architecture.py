@@ -3,9 +3,10 @@ This custom checkpoint schema is intentionally NOT advertised as GPT-Neo/Llama.
 Graph execution, weight reading and resource policy belong to the host.
 """
 import math
-# ZIPP's Python frontend has no relative imports: a sibling module is imported
-# by its absolute name under the fixed `zipp_plugin` package the host installs
-# this source into. `tools/cpython_host.py` mirrors that layout for CPython.
+# A sibling module is imported by its absolute name under the fixed
+# `zipp_plugin` package the host installs this source into. Relative imports
+# work too; the absolute form names where the code actually ends up.
+# `tools/cpython_host.py` mirrors that layout for CPython.
 from zipp_plugin.graph import Graph
 from zipp_plugin.tokenizer import encode, decode
 

@@ -5,7 +5,7 @@
       "id": "org.zipp.tiny-causal",
       "version": "0.2.0",
       "manifest": "plugins/tiny-causal/plugin.json",
-      "sha256": "c64da73b40c0c3de05c39e6c02ba0934edf4fdf64ae604faf6a9848b0c148f16",
+      "sha256": "845441475c74ef6dd20f9ec13f23b077ebaa69ec80fe41462de76d7f3624ec2f",
       "checkpoint_format": "zipp.tiny-causal-v1",
       "tokenizer_formats": [
         "character-v1"
@@ -25,7 +25,7 @@
       "id": "org.zipp.gpt-neo",
       "version": "0.1.0",
       "manifest": "plugins/gpt-neo/plugin.json",
-      "sha256": "b289571fb8cc5d7b587775cda035e0fdb45541ac25a972c61c33ffb903e1d67e",
+      "sha256": "6c76e3b6377d56d119defefeccc0964fa6aa9619fb55e800db38cc048b444b20",
       "checkpoint_format": "hf.gpt-neo-v1",
       "tokenizer_formats": [
         "gpt2-byte-bpe-v1"
