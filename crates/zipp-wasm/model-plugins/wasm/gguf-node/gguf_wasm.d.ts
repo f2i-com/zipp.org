@@ -85,6 +85,21 @@ export class Tokenizer {
 export function dequantize(dtype: string, bytes: Uint8Array, elements: number): Float32Array;
 
 /**
+ * Whether reading more of the file could make this header parse.
+ *
+ * A header read starts small and doubles, because how large a header is
+ * depends on the tokenizer vocabulary inside it. That loop needs to tell a
+ * short read from a file that will never be a header -- otherwise opening
+ * something that is not a GGUF file at all costs the whole doubling schedule
+ * before it is refused.
+ *
+ * This is a predicate rather than a property of the thrown error because an
+ * error crosses this boundary as a string, and a caller branching on a
+ * message is a caller that breaks when the message is reworded.
+ */
+export function header_needs_more_bytes(head: Uint8Array): boolean;
+
+/**
  * The dtypes this build decodes, so a host can say so before it starts.
  */
 export function supported_dtypes(): any[];

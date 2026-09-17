@@ -60,7 +60,7 @@ unrelated crate. The *library* names do not, so a consumer aliases the package
 once and `use gguf::...` reads the way you would expect:
 
 ```toml
-gguf = { package = "f2i-gguf", version = "0.0.1", features = ["std"] }
+gguf = { package = "f2i-gguf", version = "0.0.2", features = ["std"] }
 ```
 
 Everything except the wasm surface builds without `std`, which is what lets the
@@ -85,7 +85,20 @@ which is the whole attack surface of a format like this. So:
 * duplicate metadata keys and duplicate tensor names are refused, because a
   file that makes a reader choose which one wins is malformed;
 * `ParseLimits` bounds the rest, and a caller that knows its inputs can raise
-  or lower it.
+  or lower it;
+* a refusal says whether reading more could change it. `GgufError::
+  needs_more_bytes` is true only for truncation, so the header read can double
+  when a file is merely short and stop at once when it is not a GGUF file --
+  without that distinction, opening the wrong file costs the whole 64 MiB
+  schedule before it fails.
+
+The JavaScript wrapper checks the same things on its own side, because a range
+crosses that boundary as JSON. A GGUF length is a `u64` and a JSON number is a
+double, so past 2^53 a value arrives *near* what the file said rather than equal
+to it; and an offset past the end of a file is not an error in any source here,
+since `Blob.slice` clamps and the read simply comes back short. Both are refused
+when the model is opened, naming the tensor, rather than surfacing later as a
+tensor that decoded into nonsense.
 
 None of this is about Rust memory safety, which is not in question. It is about
 a malformed or hostile file producing an error rather than a panic, a silently
@@ -97,7 +110,7 @@ plausible header and a couple of thousand rounds of arbitrary bytes.
 
 ```toml
 [dependencies]
-gguf = { package = "f2i-gguf", version = "0.0.1", features = ["std"] }
+gguf = { package = "f2i-gguf", version = "0.0.2", features = ["std"] }
 ```
 
 ```rust
@@ -173,8 +186,14 @@ when the model is opened and carried afterwards:
 * every response's `Content-Range` must be the range that was asked for, out of
   a total that has not changed.
 
-That does not make an HTTP source trustworthy. It makes it *consistent*: what
-is read is all from one object, or it is an error.
+That does not make an HTTP source trustworthy. It makes it *consistent*: given
+a validator, what is read is all from one object or it is an error.
+
+A server that offers neither `ETag` nor `Last-Modified` cannot support that,
+and `fromURL` refuses it rather than quietly falling back to the size check --
+an object replaced by a different one of the same length is exactly the failure
+the rest of this is for. `allowUnvalidated: true` reads it anyway, and
+`identity()` returns `null` so a caller can tell which it got.
 
 ## The tokenizer is not an afterthought
 

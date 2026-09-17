@@ -72,10 +72,20 @@ function parseContentRange(header) {
  *   * every response's `Content-Range` must be the range that was asked for,
  *     out of a total that has not changed.
  *
- * None of this makes an HTTP source trustworthy. It makes it *consistent*: what
- * is read is all from one object, or it is an error.
+ * None of this makes an HTTP source trustworthy. It makes it *consistent*:
+ * given a validator, what is read is all from one object or it is an error.
+ *
+ * A server that offers neither `ETag` nor `Last-Modified` cannot support that
+ * promise -- an object could be replaced by a different one of the same length
+ * between two reads and nothing here would see it. That is refused by default
+ * rather than quietly downgraded, because the failure it produces is a model
+ * that is subtly wrong rather than one that does not load. Pass
+ * `allowUnvalidated: true` to read anyway, and know that the size check is
+ * then the only thing standing between you and a mixed read.
  */
-export function fromURL(url, {fetch: fetcher = globalThis.fetch, headers = {}, signal} = {}) {
+export function fromURL(url, {
+  fetch: fetcher = globalThis.fetch, headers = {}, signal, allowUnvalidated = false,
+} = {}) {
   let size = null, validator = null;
 
   const request = extra => ({headers: {...headers, ...extra}, signal});
@@ -111,6 +121,11 @@ export function fromURL(url, {fetch: fetcher = globalThis.fetch, headers = {}, s
       if (!Number.isFinite(size) || size <= 0) throw new Error(`${url} reports no length`);
       // Pinned here, and required to still hold on every read after this.
       validator = response.headers.get('etag') ?? response.headers.get('last-modified') ?? null;
+      if (validator === null && !allowUnvalidated) {
+        throw new Error(
+          `${url} offers neither ETag nor Last-Modified, so reads cannot be pinned to one ` +
+          `version of it. Pass {allowUnvalidated: true} to read it anyway.`);
+      }
     },
     size: () => size,
     async read(offset, length) {
@@ -144,6 +159,35 @@ export function fromFileHandle(handle, size) {
 }
 
 /**
+ * A byte range out of the header, checked against the file it claims to be in.
+ *
+ * Everything here arrives as JSON from a header the caller did not write, and
+ * two things go wrong with that. A GGUF length is a `u64`, and JSON numbers
+ * are doubles: past 2^53 a value arrives *near* what the file said rather than
+ * equal to it, so a read silently covers the wrong bytes. And an offset past
+ * the end of the file is not an error in any source here -- `Blob.slice`
+ * clamps, so the read comes back short and a decoder sees a truncated tensor
+ * as a valid one full of whatever followed.
+ *
+ * So a range is refused before it is ever read, and the refusal names the
+ * tensor rather than surfacing as a decode failure somewhere downstream.
+ */
+function checkRange(range, name, size) {
+  for (const field of ['offset', 'bytes', 'elements']) {
+    const value = range[field];
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(
+        `${name}: ${field} is ${value}, which is not a byte count this can represent exactly`);
+    }
+  }
+  if (range.offset + range.bytes > size) {
+    throw new Error(
+      `${name}: bytes ${range.offset}-${range.offset + range.bytes - 1} are past the end of a ${size}-byte file`);
+  }
+  return range;
+}
+
+/**
  * Open a checkpoint. `module` is the wasm-bindgen module; supply it rather
  * than have this guess, because how it is loaded is the host's business.
  */
@@ -156,12 +200,19 @@ export async function openGGUF(source, {module}) {
 
   let header = null, read = 0, failure = null;
   for (let want = Math.min(FIRST, size); want <= Math.min(LARGEST, size);) {
+    const head = await source.read(0, want);
     try {
-      header = new module.GgufHeader(await source.read(0, want));
+      header = new module.GgufHeader(head);
       read = want;
       break;
     } catch (error) {
       failure = error;
+      // Only a short read is worth reading more for. A file that is not a
+      // GGUF file, or whose counts are past the parser's limits, says so on
+      // the first megabyte and says the same thing on the sixty-fourth --
+      // without this, opening the wrong file costs the whole doubling
+      // schedule before it fails.
+      if (module.header_needs_more_bytes && !module.header_needs_more_bytes(head)) break;
       if (want >= size) break;
       want = Math.min(want * 4, size, LARGEST);
     }
@@ -170,6 +221,7 @@ export async function openGGUF(source, {module}) {
 
   const metadata = JSON.parse(header.metadata());
   const listed = JSON.parse(header.tensors());
+  for (const entry of listed) checkRange(entry, entry.name, size);
   const tensors = new Map(listed.map(entry => [entry.name, Object.freeze({
     ...entry,
     // GGUF writes a shape fastest-varying first. Both orders are offered so a
@@ -214,7 +266,9 @@ export async function openGGUF(source, {module}) {
       const width = entry.shape[1];
       const out = new Float32Array(indices.length * width);
       for (let i = 0; i < indices.length; i++) {
-        const range = JSON.parse(header.row_range(name, indices[i], 1));
+        // Checked here too, not just at open: this one comes fresh out of the
+        // module for each call, computed from a row index the caller chose.
+        const range = checkRange(JSON.parse(header.row_range(name, indices[i], 1)), name, size);
         const bytes = await source.read(range.offset, range.bytes);
         out.set(module.dequantize(range.dtype, bytes, range.elements), i * width);
       }

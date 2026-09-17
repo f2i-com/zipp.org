@@ -1,28 +1,28 @@
 {
   "comment": "Written by scripts/fetch_gguf_wasm.sh. Checked by tests/gguf-module.test.mjs.",
   "repository": "https://github.com/f2i-com/gguf-wasm",
-  "tag": "v0.0.1",
-  "commit": "91b198f4eb062c2129f03ba6231ff00ff1271236",
+  "tag": "v0.0.2",
+  "commit": "f079ef03fc5794d58cd03b13cbbe9327cd0e413b",
   "assets": {
-    "gguf-wasm-node-v0.0.1.tar.gz": "5a0bd0eee8adfa87a420ac9939114386772e50274453b4a9a7d244971e0f8f50",
-    "gguf-wasm-web-v0.0.1.tar.gz": "297d8bfa662ac95f94beee53d16cdddb321feefecbf2c71251364c2a54c1d3f3"
+    "gguf-wasm-node-v0.0.2.tar.gz": "4d5894f96aa5764a0d014321b5bb6b92da3a39ef113bed9ae1f1b37d8c15be8a",
+    "gguf-wasm-web-v0.0.2.tar.gz": "19070fec57d1d577ed05b7a6bdb4fda74f93c72627c9a267f7e9a8833216d0a9"
   },
   "files": {
-    "gguf/gguf_wasm.d.ts": "efbff34bb3b08ddb5b9bcb471a86b4ba26e013c6280235bb7dd2d41df3a122aa",
-    "gguf/gguf_wasm.js": "40907e403df3f6f380924c7ec9915aae4d05021a6096867d356de42edc2e9786",
-    "gguf/gguf_wasm_bg.wasm": "f569c5cf6b0244bbb81ad7e2395ab216ca31c8d1a2844779c7eef521c0321449",
-    "gguf/gguf_wasm_bg.wasm.d.ts": "f05938d5f4d1cca6c1f4ed62fd54efa7e3c5f48164456d7a19da7cb6dc12d185",
-    "gguf/index.mjs": "93a14c7fa5592a47f3a0c562a6ecd9b6d7889ed36e8101d07224b318371715df",
+    "gguf/gguf_wasm.d.ts": "6b8f58719401ef437977723efd99d363acee7cbe77df3a134eda08a99ecd6801",
+    "gguf/gguf_wasm.js": "b32dd8e2f35b74f41f55b99e79f83f1b5cd4a3fef65d0ac53ff14125949cdd2e",
+    "gguf/gguf_wasm_bg.wasm": "2ae713ce84bdf0598f5da03144f8eef56cd8706d05f5778698981ebfaa0a0192",
+    "gguf/gguf_wasm_bg.wasm.d.ts": "e0e4b6d4d9e00f659f95ccb73f9cdcbfd400667860249adaa124c2f9eb6e2d97",
+    "gguf/index.mjs": "4ce6d73b5f99845b4388be17fa55e8451575fb2c1d2af15621addf4c3b5a7207",
     "gguf/LICENSE-APACHE": "00bf49683632f765eb2c943fecb32d58c1e62a7102b3fa2f08b3875e56d7eb39",
     "gguf/LICENSE-MIT": "7f98ad5f09a08c69affb7b26109ecad8004cba078de9b77c7ed42fafc8dd7776",
-    "gguf/README.md": "667c78478aff5c5d21be175f46ab3b419c68bbf7b226c2b234f65e9744981734",
-    "gguf-node/gguf_wasm.d.ts": "cb2412ab1f3af42427ad6e209fc9afaf1c719da888928d05a76b21fa05754609",
-    "gguf-node/gguf_wasm.js": "289e5c33e25a71b1a14986c0a26ae9383be827366a20735445ea951c9f325557",
-    "gguf-node/gguf_wasm_bg.wasm": "f569c5cf6b0244bbb81ad7e2395ab216ca31c8d1a2844779c7eef521c0321449",
-    "gguf-node/gguf_wasm_bg.wasm.d.ts": "f05938d5f4d1cca6c1f4ed62fd54efa7e3c5f48164456d7a19da7cb6dc12d185",
+    "gguf/README.md": "703e90f139df4610f96b9896327179bccbf0df249cd14668589c685103d504d1",
+    "gguf-node/gguf_wasm.d.ts": "76c3659c5fe8f3db750d8516b326a515e927dcfb9f3f45c0100df6648054d343",
+    "gguf-node/gguf_wasm.js": "d48e123b7aaf04a194062a27841956d2ccb81c523f0912c8506f642c40139948",
+    "gguf-node/gguf_wasm_bg.wasm": "2ae713ce84bdf0598f5da03144f8eef56cd8706d05f5778698981ebfaa0a0192",
+    "gguf-node/gguf_wasm_bg.wasm.d.ts": "e0e4b6d4d9e00f659f95ccb73f9cdcbfd400667860249adaa124c2f9eb6e2d97",
     "gguf-node/LICENSE-APACHE": "00bf49683632f765eb2c943fecb32d58c1e62a7102b3fa2f08b3875e56d7eb39",
     "gguf-node/LICENSE-MIT": "7f98ad5f09a08c69affb7b26109ecad8004cba078de9b77c7ed42fafc8dd7776",
     "gguf-node/package.json": "dbf8353f77358bc12169b7bb7301e1978d5b503e002ee927229a8993672818fc",
-    "gguf-node/README.md": "667c78478aff5c5d21be175f46ab3b419c68bbf7b226c2b234f65e9744981734"
+    "gguf-node/README.md": "703e90f139df4610f96b9896327179bccbf0df249cd14668589c685103d504d1"
   }
 }

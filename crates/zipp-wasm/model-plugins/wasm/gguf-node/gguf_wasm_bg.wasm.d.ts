@@ -13,6 +13,7 @@ export const ggufheader_strings: (a: number, b: number, c: number) => [number, n
 export const ggufheader_tensors: (a: number) => [number, number];
 export const ggufheader_tokenizer: (a: number) => [number, number, number];
 export const ggufheader_version: (a: number) => number;
+export const header_needs_more_bytes: (a: number, b: number) => number;
 export const supported_dtypes: () => [number, number];
 export const tokenizer_bos: (a: number) => number;
 export const tokenizer_decode: (a: number, b: number, c: number) => [number, number];
