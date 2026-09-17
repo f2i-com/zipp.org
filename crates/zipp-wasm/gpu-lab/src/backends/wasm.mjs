@@ -18,11 +18,17 @@ export class WasmBackend {
   }
   constructor(exports) {
     this.name = 'wasm'; this.description = 'Compiled standalone C float32 kernels in WebAssembly (SIMD)';
-    this.e = exports; this.base = Number(exports.__heap_base.value); this.cursor = this.base;
+    this.e = exports; this.base = Number(exports.__heap_base.value);
+    this.cursor = this.base; this.pinned = this.base;
   }
   /** SIMD kernels sustain more work than the JavaScript reference within a frame deadline. */
   limitHints() { return {maxWork: 400000000}; }
-  async begin() { this.cursor = this.base; }
+  // Everything below `pinned` survives a step. A prepared session uploads its
+  // weights once -- that is what preparing is for -- and this arena used to
+  // reset to the bottom every step, so those weights were copied back in per
+  // token: 372 MB of memcpy for a 0.6B model, against the one thing the
+  // interface promises not to do.
+  async begin() { this.cursor = this.pinned; }
   alloc(size) { return this.reserve(size*4, {size}); }
   /** Blocks are bytes: a quantized weight is never counted in elements here,
    * which is the whole reason it costs seven times less to keep. */
@@ -97,16 +103,28 @@ export class WasmBackend {
   free() {} // Arena reclaimed between serial graph executions, not individual nodes.
   // Sessions: the arena is reset per step, so a handle that outlives a step is
   // a host copy, uploaded again where a step reads it.
+  /**
+   * A handle that outlives a step.
+   *
+   * One allocated contiguously from the pinned frontier stays exactly where it
+   * is and is never copied again: a prepared session's static inputs are
+   * uploaded in one run of allocations before any step, so that is all of them.
+   * Anything else -- a carried cache, an output produced mid-step -- is above
+   * this step's working set and has to come back to the host, because the next
+   * step will allocate over it.
+   */
   persist(h) {
     if (h instanceof Float32Array || h instanceof Uint8Array) return h;
+    if (h.ptr === this.pinned) { this.pinned = this.cursor; h.resident = true; return h; }
     return h.quant ? this.bytesView(h).slice() : this.view(h).slice();
   }
   materialize(h) {
+    if (h?.resident) return h; // already on this side, and staying
     if (h instanceof Uint8Array) { const o = this.allocBytes(h.length); this.bytesView(o).set(h); return o; }
     if (!(h instanceof Float32Array)) return h;
     const o = this.alloc(h.length); this.view(o).set(h); return o;
   }
-  nextStep() { this.cursor = this.base; }
+  nextStep() { this.cursor = this.pinned; }
   async finish() {}
   dispose() { this.e = null; }
 }
