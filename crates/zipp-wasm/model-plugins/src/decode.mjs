@@ -1,5 +1,9 @@
 import {check, fields, integer, shapeSize, sameShape} from './common.mjs';
 
+/** The block format a tensor can stay in on a device, or null. */
+const residentDtype = (weights, name) =>
+  typeof weights.residentDtype === 'function' ? weights.residentDtype(name) : null;
+
 /**
  * Cached decoding: one prepared graph, run once per token.
  *
@@ -20,11 +24,15 @@ import {check, fields, integer, shapeSize, sameShape} from './common.mjs';
  * column the host feeds per step: `cache * (1 - write) + write @ new`. That is
  * ordinary arithmetic on tensors the backend already knows how to multiply.
  *
- * The host fills exactly three kinds of per-step input, none of which require
- * knowing what the model is: a gathered embedding row, an additive mask for the
- * positions written so far, and that one-hot write column.
+ * The host fills four kinds of per-step input, none of which require knowing
+ * what the model is: a gathered embedding row, an additive mask for the
+ * positions written so far, that one-hot write column, and -- for a rotary
+ * model -- the cosines and sines of the current position. Those last are
+ * trigonometry over a position and a dimension, never over the data, so they
+ * belong on this side of the boundary rather than in a kernel.
  */
-const STEP_SLOTS = new Set(['rows', 'mask', 'write']);
+const STEP_SLOTS = new Set(['rows', 'mask', 'write', 'rope']);
+const ROPE_PARTS = new Set(['cos', 'sin']);
 const INDEXES = new Set(['token', 'position']);
 /** Graph v2 wants finite float32; this is the mask sentinel, not -Infinity. */
 const MASKED = -1e9;
@@ -76,9 +84,18 @@ export async function prepareDecode(template, weights, limits) {
       check(!byNode.has(id), 'FORMAT', 'Only input nodes may bind assets or step data');
       return node;
     }
-    fields(node, ['id', 'op', 'shape', 'carry'], ['id', 'op', 'shape']);
+    fields(node, ['id', 'op', 'shape', 'carry', 'data'], ['id', 'op', 'shape']);
     const size = shapeSize(node.shape, limits);
     const binding = byNode.get(id);
+    // A literal is a constant the graph carries itself -- a rotation matrix, a
+    // selector -- and is the one input that needs no binding. Exactly one
+    // source, as in the eager path.
+    if (Object.hasOwn(node, 'data')) {
+      check(!binding, 'FORMAT', 'An input has one data source: a literal or a binding, not both');
+      check(Array.isArray(node.data) && node.data.length === size, 'SHAPE', 'Literal input size mismatch');
+      check(!Object.hasOwn(node, 'carry'), 'FORMAT', 'A literal is constant, not carried');
+      return node;
+    }
     check(binding, 'FORMAT', 'Every decode input needs a binding: a weight, a zeroed cache, or step data');
     if (Object.hasOwn(node, 'carry')) {
       check(typeof node.carry === 'string' && outputs.has(node.carry), 'FORMAT',
@@ -93,7 +110,21 @@ export async function prepareDecode(template, weights, limits) {
   for (const [id, binding] of byNode) {
     const node = nodes[id];
     check(node.op === 'input', 'FORMAT', 'Binding target must be an input');
-    if (binding.kind === 'tensor') {
+    if (binding.kind === 'matrix' || binding.kind === 'blocks') {
+      // The checkpoint's own [out, in] matrix, kept in its block format where a
+      // backend can read it. Without this a cached decode would hold the model
+      // expanded, which is the arithmetic the whole path exists to avoid.
+      fields(binding, ['node', 'kind', 'tensor'], ['node', 'kind', 'tensor']);
+      const info = weights.info(binding.tensor);
+      check(info.shape.length === 2, 'SHAPE', `A weight matrix is rank two: ${binding.tensor}`);
+      check(sameShape(info.shape, node.shape), 'SHAPE',
+        `${binding.tensor} is ${JSON.stringify(info.shape)}, not ${JSON.stringify(node.shape)}`);
+      check(!Object.hasOwn(node, 'carry'), 'FORMAT', 'A weight is static, not carried');
+      if (binding.kind === 'blocks') {
+        check(residentDtype(weights, binding.tensor) !== null, 'DTYPE',
+          `${binding.tensor} is ${info.dtype}; no backend holds that format, so bind it as a matrix`);
+      }
+    } else if (binding.kind === 'tensor') {
       fields(binding, ['node', 'kind', 'tensor', 'transpose'], ['node', 'kind', 'tensor']);
       const shape = weights.info(binding.tensor).shape;
       if (Object.hasOwn(binding, 'transpose')) {
@@ -107,10 +138,20 @@ export async function prepareDecode(template, weights, limits) {
       fields(binding, ['node', 'kind'], ['node', 'kind']);
       check(Object.hasOwn(node, 'carry'), 'FORMAT', 'A zeroed input is only useful as a carried cache');
     } else if (binding.kind === 'step') {
-      fields(binding, ['node', 'kind', 'slot', 'tensor', 'index', 'window'], ['node', 'kind', 'slot']);
+      fields(binding, ['node', 'kind', 'slot', 'tensor', 'index', 'window', 'part', 'dim', 'base'],
+        ['node', 'kind', 'slot']);
       check(STEP_SLOTS.has(binding.slot), 'FORMAT', `Unknown per-step slot: ${String(binding.slot)}`);
       check(!Object.hasOwn(node, 'carry'), 'FORMAT', 'Step data is fed, not carried');
-      if (binding.slot === 'rows') {
+      if (binding.slot === 'rope') {
+        fields(binding, ['node', 'kind', 'slot', 'part', 'dim', 'base'],
+          ['node', 'kind', 'slot', 'part', 'dim', 'base']);
+        check(ROPE_PARTS.has(binding.part), 'FORMAT', 'A rotary table is cos or sin');
+        integer(binding.dim, 2, 4096, 'Rotary dimension');
+        check(binding.dim % 2 === 0, 'SHAPE', 'Rotary embeddings need an even dimension');
+        check(typeof binding.base === 'number' && Number.isFinite(binding.base) && binding.base > 1,
+          'FORMAT', 'A rotary base is a finite number above one');
+        check(sameShape(node.shape, [1, 1, binding.dim]), 'SHAPE', 'A rotary table is [1, 1, dim]');
+      } else if (binding.slot === 'rows') {
         check(INDEXES.has(binding.index), 'FORMAT', 'A gathered row is indexed by token or position');
         const shape = weights.info(binding.tensor).shape;
         check(shape.length === 2 && sameShape(node.shape, [1, shape[1]]), 'SHAPE',
@@ -128,7 +169,15 @@ export async function prepareDecode(template, weights, limits) {
     'A cache that is carried must be written, and a write needs a cache');
   // Weights and zeroed caches become the plan's static data, uploaded once.
   for (const [id, binding] of byNode) {
-    if (binding.kind === 'tensor') {
+    if (binding.kind === 'matrix' || binding.kind === 'blocks') {
+      if (residentDtype(weights, binding.tensor) !== null) {
+        const {dtype, bytes} = await weights.blocks(binding.tensor);
+        nodes[id].dtype = dtype;
+        nodes[id].data = bytes;
+      } else {
+        nodes[id].data = await weights.tensor(binding.tensor);
+      }
+    } else if (binding.kind === 'tensor') {
       const data = await weights.tensor(binding.tensor);
       if (!binding.transpose) nodes[id].data = data;
       else {
@@ -158,8 +207,24 @@ export async function stepInputs(plan, weights, {token, position}) {
       const info = weights.info(step.tensor), width = info.shape[1];
       const index = step.index === 'token' ? token : position;
       integer(index, 0, info.shape[0] - 1, step.index === 'token' ? 'Token id' : 'Position');
-      const data = await weights.tensor(step.tensor);
-      inputs[step.node] = data.slice(index * width, (index + 1) * width);
+      // One row, read as one row. A quantized embedding table is 155 million
+      // values and decoding all of it to reach one of them would cost more per
+      // token than the rest of the model put together.
+      const gathered = typeof weights.rows === 'function' ? await weights.rows(step.tensor, [index]) : null;
+      if (gathered) inputs[step.node] = gathered;
+      else {
+        const data = await weights.tensor(step.tensor);
+        inputs[step.node] = data.slice(index * width, (index + 1) * width);
+      }
+    } else if (step.slot === 'rope') {
+      // The angles depend on the position and the index, never on the data,
+      // so they are computed here rather than being an operation.
+      const half = step.dim / 2, table = new Float32Array(step.dim);
+      for (let i = 0; i < step.dim; i++) {
+        const angle = position / step.base ** ((2 * (i % half)) / step.dim);
+        table[i] = step.part === 'cos' ? Math.cos(angle) : Math.sin(angle);
+      }
+      inputs[step.node] = table;
     } else if (step.slot === 'mask') {
       const mask = new Float32Array(plan.context);
       for (let column = 0; column < plan.context; column++) {

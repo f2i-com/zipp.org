@@ -146,7 +146,7 @@ def native_manifest(native, assets, limits):
                      if usable < context else []}
 
 
-def build_decode_graph(config):
+def build_decode_graph(config, context=None):
     """The same model as one cached step: read one token, attend over the cache.
 
     `build_graph` recomputes the whole context for every token and is the
@@ -160,7 +160,9 @@ def build_decode_graph(config):
     token's written into it first.
     """
     description = describe(config)
-    context = description["max_context"]
+    context = description["max_context"] if context is None else int(context)
+    if not 1 <= context <= description["max_context"]:
+        raise ValueError("Invalid decode context")
     hidden, heads = config["hidden_size"], config["num_heads"]
     dim, intermediate = hidden // heads, config["intermediate_size"]
     epsilon = config["layer_norm_epsilon"]

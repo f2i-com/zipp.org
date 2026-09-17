@@ -331,7 +331,8 @@ export class ModelSession {
     // Falling back to recomputing the context is correct but much slower, so
     // why it happened is reported rather than left as a mystery.
     try {
-      const template = this.#jsonCall('zipp_model_decode_graph', [JSON.stringify(this.#model.config)]);
+      const template = this.#jsonCall('zipp_model_decode_graph',
+        [JSON.stringify(this.#model.config), JSON.stringify(this.#description.max_context)]);
       const plan = await prepareDecode(template, this.#weights, this.#limits);
       this.#live();
       const session = await this.#runtime.prepare(plan.program, {resident: plan.resident, typedOutputs: true});

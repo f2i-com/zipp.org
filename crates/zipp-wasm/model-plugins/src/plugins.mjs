@@ -57,7 +57,10 @@ export function bootstrap(entry) {
   // zipp_model_native is defined for every plugin but resolves only for one
   // that implements it; a plugin without native support never has it called.
   check(/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(entry), 'FORMAT', 'Invalid entry');
-  return `import json\nimport zipp_plugin.${entry} as _plugin\n\ndef zipp_model_describe(config):\n    return json.dumps(_plugin.describe(json.loads(config)))\n\ndef zipp_model_encode(text, tokenizer):\n    return json.dumps(_plugin.encode(text, json.loads(tokenizer)))\n\ndef zipp_model_decode(tokens, tokenizer):\n    return _plugin.decode(json.loads(tokens), json.loads(tokenizer))\n\ndef zipp_model_graph(config, tokens):\n    return json.dumps(_plugin.build_graph(json.loads(config), json.loads(tokens)))\n\ndef zipp_model_decode_graph(config):\n    return json.dumps(_plugin.build_decode_graph(json.loads(config)))\n\ndef zipp_model_asset(name, form, values):\n    _plugin.load_asset(name, form, values)\n\ndef zipp_model_native(config, assets, limits):\n    return json.dumps(_plugin.native_manifest(json.loads(config), json.loads(assets), json.loads(limits)))\n`;
+  return `import json\nimport zipp_plugin.${entry} as _plugin\n\ndef zipp_model_describe(config):\n    return json.dumps(_plugin.describe(json.loads(config)))\n\ndef zipp_model_encode(text, tokenizer):\n    return json.dumps(_plugin.encode(text, json.loads(tokenizer)))\n\ndef zipp_model_decode(tokens, tokenizer):\n    return _plugin.decode(json.loads(tokens), json.loads(tokenizer))\n\ndef zipp_model_config(metadata, vocab_size):
+    return json.dumps(_plugin.config_from_gguf(json.loads(metadata), json.loads(vocab_size)))
+
+def zipp_model_graph(config, tokens):\n    return json.dumps(_plugin.build_graph(json.loads(config), json.loads(tokens)))\n\ndef zipp_model_decode_graph(config, context):\n    return json.dumps(_plugin.build_decode_graph(json.loads(config), json.loads(context)))\n\ndef zipp_model_asset(name, form, values):\n    _plugin.load_asset(name, form, values)\n\ndef zipp_model_native(config, assets, limits):\n    return json.dumps(_plugin.native_manifest(json.loads(config), json.loads(assets), json.loads(limits)))\n`;
 }
 export class PluginRegistry {
   #installed = new Map();

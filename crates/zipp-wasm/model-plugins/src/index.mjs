@@ -5,4 +5,5 @@ export {openSafetensors, WeightStore} from './safetensors.mjs';
 export {openGGUF, RESIDENT} from './gguf.mjs';
 export {ggufSupport, loadGgufModule, requireGgufModule} from './gguf-module.mjs';
 export {bindGraph} from './bindings.mjs';
+export {prepareDecode, stepInputs, validateDecodeTemplate} from './decode.mjs';
 export {ModelError, DEFAULT_LIMITS, resolveLimits, sha256, formatId, ASSET_FORMS} from './common.mjs';
