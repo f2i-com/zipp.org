@@ -56,6 +56,13 @@ frontends use the same engine, with native and WebAssembly builds.
   weights and optimizer state resident on the device and eight steps per
   submission, 0.79 ms per step (1.8 ms per step when driven from Python
   through `compiled.prepare`).
+- **Run a language model from its GGUF file.** Graph inputs can stay in a
+  checkpoint's own Q4_K and Q6_K blocks, decoded inside the matmul on every
+  backend, so Qwen3-0.6B holds at 373 MB instead of 2,274. The experimental,
+  source-only [local-model plugins](crates/zipp-wasm/model-plugins/README.md)
+  run it from the file, in the browser or split across several machines, and
+  Hugging Face's own Qwen3, Qwen2, Llama and Mistral modelling files run on the
+  Python frontend unmodified.
 - **Keep the host in control.** Execution budgets and explicit host capabilities
   let embedders decide which resources a program can use.
 - **Explore one engine across languages.** An optional trusted-code build adds
@@ -74,6 +81,7 @@ surface and remaining differences.
 | Run Python projects in Zipp | Experimental Python frontend on the same VM | CPU, including the bundled `torch` subset |
 | Compile a supported Torch model or submit a Python `zipp_gpu` graph from the playground | Python in the WASM Worker; JavaScript handles the graph | WebGPU compute shaders or WebGL2 fragment shaders; visible CPU fallback in `auto` mode |
 | Use GPU graphs from browser JavaScript | An ordinary browser ES module or Worker | The same GPU runtime, without requiring Python or the Zipp VM |
+| Run a local language model from a GGUF file (experimental, source only) | A model plugin's Python in the WASM engine; JavaScript reads and binds the checkpoint | The same GPU runtime, with the weights kept as the file's quantized blocks |
 | Draw a custom browser visualization | Browser JavaScript with a canvas | WebGL/WebGL2 through the browser-selected adapter |
 
 **GPU support does not automatically move all Python or JavaScript onto a GPU.**
@@ -274,18 +282,18 @@ Zipp does not include its PyTorch runner, models, checkpoints or native endpoint
 
 ### Run the JavaScript engine
 
-The `0.0.19` release provides x86-64 CLI binaries for Windows and Linux
+The `0.0.20` release provides x86-64 CLI binaries for Windows and Linux
 (JavaScript, plus the experimental Python frontend as `zipp py`) and two browser
 WebAssembly packages:
 
 | Download | Use it for |
 | --- | --- |
-| `zipp-wasm-0.0.19-web.zip` | JavaScript applications and embedding |
-| `zipp-wasm-0.0.19-web-python.zip` | JavaScript plus experimental Python projects, Torch and browser GPU adapters |
+| `zipp-wasm-0.0.20-web.zip` | JavaScript applications and embedding |
+| `zipp-wasm-0.0.20-web-python.zip` | JavaScript plus experimental Python projects, Torch and browser GPU adapters |
 
 See [GitHub Releases](https://github.com/f2i-com/zipp.org/releases) for published
-assets and [0.0.19 release notes](docs/releases/0.0.19.md) for scope and limits.
-`0.0.19` is the latest published release; the download commands below use it.
+assets and [0.0.20 release notes](docs/releases/0.0.20.md) for scope and limits.
+`0.0.20` is the latest published release; the download commands below use it.
 Both WASM archives carry the exact source revision, language profile and
 checksums.
 
@@ -308,7 +316,7 @@ the [browser example](#embed-zipp-webassembly-in-a-web-app), or the
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.19'
+$version = '0.0.20'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -328,7 +336,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.19
+version=0.0.20
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -337,7 +345,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.19-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.20-x86_64-unknown-linux-gnu/zipp`.
 
 </details>
 
@@ -416,7 +424,9 @@ folder with arguments. Every file of the folder (subfolders included, up to
 filesystem, so `open()`, `os`, `os.path`, `pathlib` and `json.load` see the
 project's data; `.py` files are modules and packages by folder
 (`legacy/fast_memory.py` is `legacy.fast_memory`, with or without an
-`__init__.py`); `sys.argv` carries the arguments; and files the program
+`__init__.py`), and a package's own modules import each other relatively
+(`from .graph import Graph`) as CPython resolves them; `sys.argv` carries the
+arguments; and files the program
 writes are copied back under the folder when it finishes (never over a file
 it could not see, such as one in `dist/`, a dot-folder or over the limits).
 Any script name runs, extensionless shebang scripts included, and output
@@ -431,7 +441,12 @@ supported ML code can train and evaluate inside Zipp. Eager execution is CPU;
 cross-entropy, SGD with momentum, Adam or AdamW), and `compiled.prepare()`
 keeps the weights and optimizer state on the device between steps (see
 [Train a small model on the browser GPU](#train-a-small-model-on-the-browser-gpu)).
-Natively, the same recorded graphs run on the engine's tensor kernels. The scope
+Natively, the same recorded graphs run on the engine's tensor kernels. The
+subset covers enough of what real model code reaches for -- `torch.autocast`
+among it, a no-op here since every tensor is float32 -- that Hugging Face's
+`modeling_qwen3.py`, `modeling_qwen2.py`, `modeling_llama.py` and
+`modeling_mistral.py` compile and run exactly as published, within 1.8e-7 of
+transformers ([interop](crates/zipp-wasm/model-plugins/interop/README.md)). The scope
 matrix, limits and the bytecode design are in
 [docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The
 feature is on by default in the CLI (`--no-default-features` builds the
@@ -452,6 +467,12 @@ submission (0.79 ms per step on an RTX 5090 at eight steps per run, against
 began poisons its session - only `dispose()` remains - rather than letting a
 retry run on state of no particular step. Natively the same code evaluates
 on the CPU, bit for bit the same as the reference.
+A weight input can also be a checkpoint's own Q4_K or Q6_K blocks, decoded
+inside the matmul on every backend, and `matmul_fixed` computes a product in
+integers, the same bits on every backend that runs it
+([FIXED-POINT.md](crates/zipp-wasm/gpu-lab/docs/FIXED-POINT.md)). The
+WebAssembly kernels are `no_std` Rust, and the committed binary is rebuilt and
+compared in CI.
 See [crates/zipp-wasm/README.md](crates/zipp-wasm/README.md#gpu-compute-for-python-programs).
 
 There is also a local [playground](crates/zipp-wasm/playground/README.md)
@@ -582,7 +603,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.19
+version=0.0.20
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"
