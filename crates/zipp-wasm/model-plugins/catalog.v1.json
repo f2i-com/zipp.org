@@ -35,7 +35,7 @@
       "id": "org.zipp.qwen3",
       "version": "0.1.0",
       "manifest": "plugins/qwen3/plugin.json",
-      "sha256": "944a392177e334012c41711c6f2fef2ec09e9cdcb56239a3c168afbf3667b61b",
+      "sha256": "b4b02b38dfb438323e3abc6df01fe91fd610e62b31555e61dc0157daa079e3bf",
       "checkpoint_format": "gguf.qwen3-v1",
       "tokenizer_formats": [
         "qwen2-byte-bpe-v1"

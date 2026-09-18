@@ -268,9 +268,18 @@ export async function prepareDecode(template, weights, limits, {quantize = null}
 export function validateStageManifest(manifest) {
   fields(manifest, ['plugin', 'plugin_version', 'family', 'checkpoint_format',
     'tokenizer_formats', 'config_digest', 'first_layer', 'last_layer', 'num_layers',
-    'role', 'hidden_size', 'hidden_dtype', 'context', 'graph_version', 'protocol_version'],
+    'role', 'hidden_size', 'hidden_dtype', 'context', 'graph_version', 'protocol_version',
+    'fixed'],
     ['plugin', 'config_digest', 'first_layer', 'last_layer', 'role', 'hidden_size',
      'hidden_dtype']);
+  // Which of this stage's weights are multiplied as integers. Optional, and
+  // absent means none, so a manifest written before this existed still reads.
+  // It matters between peers rather than across a seam: two peers running the
+  // same layers of the same checkpoint compute different numbers if one is on
+  // the fixed-point path, so a checker has to compare stages that answer the
+  // same question. The seam itself is f32 either way.
+  if (manifest.fixed !== undefined) check(['none', 'layers', 'all'].includes(manifest.fixed),
+    'FORMAT', `Unknown fixed-weight policy: ${String(manifest.fixed)}`);
   check(/^[0-9a-f]{64}$/.test(manifest.config_digest), 'FORMAT',
     'A configuration digest is a sha256');
   check(['head', 'middle', 'tail', 'whole'].includes(manifest.role), 'FORMAT',

@@ -249,19 +249,28 @@ GPU backend where the emulation is the whole of the work.
   rejects it — `ComputeError: OP: Unsupported operation: matmul_fixed` — which
   is the right failure, not a silent one. A Python implementation would be a
   third numeric path to keep exact, and there is no caller for it yet.
-- **The Qwen3 model plugin**, which still emits `matmul`. Deliberately: the
-  operation is proven on its own before a whole model moves onto it.
+- **Nothing else.** The Qwen3 plugin reaches it: `build_decode_stage` and
+  `build_prefill_stage` take a `fixed` policy of `none` (the default, and what
+  every stage did before), `layers` (the seven projections in each transformer
+  block) or `all` (those and the tied `token_embd.weight`). `model-plugins`
+  binds it with `fixed` and `fixed_scales`, in `bindGraph` and `prepareDecode`
+  alike; the quantizer is passed in as `{quantize}` rather than imported,
+  because that package does not depend on this one and a second copy of this
+  arithmetic is the one thing not to have.
 
-  The binding underneath it is in place. `model-plugins` has `fixed` and
-  `fixed_scales` bindings in both `bindGraph` and `prepareDecode`, which quantize
-  a tensor once and hand the graph its quants and its scales; the quantizer is
-  passed in as `{quantize}` rather than imported, because that package does not
-  depend on this one and a second copy of this arithmetic is the one thing not to
-  have. What is left is a plugin that emits `matmul_fixed` with those bindings,
-  and the decision of *which* weights get the `i16` treatment — which is a memory
-  budget rather than a correctness question, and differs between a hosted stage
-  and a browser peer. A stage can mix the two forms freely, because they give the
-  same answer.
+  What a whole model costs is measured rather than extrapolated, because
+  twenty-eight layers compound and a per-matmul figure says nothing about that.
+  Against Qwen3-0.6B-Q4_K_M, every projection on the integer path:
+
+  | | |
+  | --- | --- |
+  | worst logit difference | 1.19e-03 of the largest logit |
+  | argmax moved | at 0 of 5 positions |
+  | two runtimes on the fixed path | identical, bit for bit |
+
+  Which weights are worth 3.56x their block size is a memory budget rather than
+  a correctness question, and the answer differs between a hosted stage and a
+  browser peer — so the policy is asked for and never assumed.
 
 ## Where this goes
 

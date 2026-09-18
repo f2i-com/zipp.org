@@ -305,6 +305,17 @@ one thing not to have. It costs 3.56 times what the same weight costs as Q4_K
 blocks, and at one token a step it is faster than the float32 matmul it
 replaces. `gpu-lab/docs/FIXED-POINT.md` has the measurements.
 
+The Qwen3 plugin asks for it by policy: `build_decode_stage` and
+`build_prefill_stage` take `fixed` as `none` (the default, and what every stage
+did before this existed), `layers` (the seven projections in each transformer
+block) or `all` (those and the tied `token_embd.weight`). A stage's manifest
+records which, because two peers running the same layers of the same checkpoint
+compute different numbers if one of them is on the integer path, and a checker
+has to compare peers answering the same question. Against Qwen3-0.6B with every
+projection on that path, the worst logit lands 1.19e-03 of the largest logit
+from the float32 answer, the argmax does not move, and two runtimes running it
+agree bit for bit.
+
 ## Next model milestone
 
 Each further checkpoint family gets a **separate** plugin, carrying that family's

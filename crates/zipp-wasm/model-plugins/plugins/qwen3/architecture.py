@@ -257,6 +257,56 @@ def layer_range(config, first_layer=None, last_layer=None):
     return first, last
 
 
+FIXED_POLICIES = ("none", "layers", "all")
+
+
+def fixed_weights(config, first, last, policy=None):
+    """Which weight matrices to bind for `matmul_fixed`, and why it is a choice.
+
+    `matmul_fixed` quantizes both sides to int16 and sums the products as
+    integers. Integer addition is associative, so every backend that implements
+    it reaches the *same* answer rather than one within a tolerance of another
+    -- which is what lets a second peer check a stage's compute by equality, and
+    what a proof over a prime field would need. Bound this way the weight is
+    quantized once instead of on every step, and at one token a step that is
+    faster than the float32 product it replaces.
+
+    It costs 3.56 times what the same weight costs as Q4_K blocks, so this is a
+    memory decision and not a correctness one, and it is made here rather than
+    assumed. Three answers:
+
+      * `none` -- the default, and what every stage did before this existed.
+      * `layers` -- the projections inside the transformer blocks. For a
+        Qwen3-0.6B middle stage that is most of the arithmetic and none of the
+        embedding table, which is the single largest tensor in the file and is
+        read a row at a time anyway.
+      * `all` -- those and the tied `token_embd.weight`, which a stage that
+        ends the model also multiplies to reach logits. The biggest gain and
+        the biggest cost: for this model that one tensor is 155M values.
+
+    A stage may mix the two forms freely, because they give the same answer.
+    """
+    if policy is None:
+        policy = "none"
+    if policy not in FIXED_POLICIES:
+        raise ValueError("Unknown fixed-weight policy: " + repr(policy))
+    if policy == "none":
+        return frozenset()
+    names = []
+    for layer in range(first, last + 1):
+        block = "blk." + str(layer) + "."
+        names.extend([block + "attn_q.weight", block + "attn_k.weight",
+                      block + "attn_v.weight", block + "attn_output.weight",
+                      block + "ffn_gate.weight", block + "ffn_up.weight",
+                      block + "ffn_down.weight"])
+    # Only where it is a matmul. A stage that begins the model looks a token up
+    # in the same tensor, and a row gather reads the file's own blocks -- there
+    # is nothing for a quantized weight to be there.
+    if policy == "all" and last == config["num_layers"] - 1:
+        names.append("token_embd.weight")
+    return frozenset(names)
+
+
 def config_digest(config):
     """A stable fingerprint of a configuration, for comparing two peers.
 
@@ -269,7 +319,7 @@ def config_digest(config):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def describe_stage(config, first_layer=None, last_layer=None, context=None):
+def describe_stage(config, first_layer=None, last_layer=None, context=None, fixed=None):
     """What a stage is, in enough detail that a peer cannot be handed the wrong one.
 
     In one process a hidden state is obviously the right hidden state. Over a
@@ -310,10 +360,15 @@ def describe_stage(config, first_layer=None, last_layer=None, context=None):
         "context": description["max_context"] if context is None else int(context),
         "graph_version": 2,
         "protocol_version": 1,
+        # Which weights this stage multiplies as integers. Two peers running
+        # the same layers of the same checkpoint still compute different numbers
+        # if one of them is on the fixed-point path, so a stage says which it is
+        # and a checker compares peers that answer the same question.
+        "fixed": "none" if fixed is None else fixed,
     }
 
 
-def build_decode_stage(config, context=None, first_layer=None, last_layer=None):
+def build_decode_stage(config, context=None, first_layer=None, last_layer=None, fixed=None):
     """One cached decode step over layers [first_layer, last_layer].
 
     A whole model is the default and is what `build_decode_graph` asks for. A
@@ -353,7 +408,7 @@ def build_decode_stage(config, context=None, first_layer=None, last_layer=None):
     hidden = config["hidden_size"]
     epsilon = config["rms_norm_epsilon"]
 
-    g = Graph()
+    g = Graph(fixed_weights(config, first, last, fixed))
     # The head of the model, or a hidden state from whoever ran the layers
     # before this one.
     if first == 0:
@@ -370,9 +425,9 @@ def build_decode_stage(config, context=None, first_layer=None, last_layer=None):
         x = g.rms_norm(x, "output_norm.weight", hidden, epsilon)
         logits = g.linear(x, "token_embd.weight", hidden, config["vocab_size"])
         return g.finish_decode(logits, context, stage=(first, last),
-                               manifest=describe_stage(config, first, last, context))
+                               manifest=describe_stage(config, first, last, context, fixed))
     return g.finish_stage(x, context, hidden, stage=(first, last),
-                          manifest=describe_stage(config, first, last, context))
+                          manifest=describe_stage(config, first, last, context, fixed))
 
 
 def _prefill_layer(g, x, layer, config, ctx):
@@ -448,7 +503,7 @@ def _prefill_inputs(g, config, length):
     }
 
 
-def build_prefill_stage(config, prompt, first_layer=None, last_layer=None):
+def build_prefill_stage(config, prompt, first_layer=None, last_layer=None, fixed=None):
     """A prompt through layers [first_layer, last_layer].
 
     A peer holding part of a model has to prefill as well as decode -- the
@@ -512,7 +567,7 @@ def build_prefill_stage(config, prompt, first_layer=None, last_layer=None):
     hidden = config["hidden_size"]
     epsilon = config["rms_norm_epsilon"]
 
-    g = Graph()
+    g = Graph(fixed_weights(config, first, last, fixed))
     if first == 0:
         x = g.rows("token_embd.weight", tokens, hidden)
     else:
@@ -532,9 +587,9 @@ def build_prefill_stage(config, prompt, first_layer=None, last_layer=None):
         # round, so the checkpoint carries no second copy of it.
         logits = g.linear(last_row, "token_embd.weight", hidden, config["vocab_size"])
         return g.finish(logits, stage=(first, last),
-                        manifest=describe_stage(config, first, last, length))
+                        manifest=describe_stage(config, first, last, length, fixed))
     return g.finish_hidden(x, stage=(first, last),
-                           manifest=describe_stage(config, first, last, length))
+                           manifest=describe_stage(config, first, last, length, fixed))
 
 
 def build_graph(config, tokens):

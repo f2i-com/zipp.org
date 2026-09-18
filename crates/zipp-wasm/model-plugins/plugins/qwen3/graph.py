@@ -23,13 +23,19 @@ import math
 
 
 class Graph:
-    def __init__(self):
+    def __init__(self, fixed=()):
         self.nodes = []
         self.bindings = []
         self.weights = {}
         self.constants = {}
         self.literals = {}
         self.carried = []
+        # Tensor names to bind for `matmul_fixed` instead of `matmul`: quantized
+        # to int16 once when the graph is bound rather than on every step. See
+        # `fixed_weights` in architecture.py for which names those are and what
+        # the trade is. Empty is the default and is the float32 path.
+        self.fixed = frozenset(fixed or ())
+        self.scales = {}
 
     def op(self, name, **attrs):
         index = len(self.nodes)
@@ -70,11 +76,24 @@ class Graph:
 
         The host keeps it as blocks where a backend can decode them and expands
         it where one cannot; either way it is multiplied transposed, so this
-        graph does not change when the answer does."""
+        graph does not change when the answer does.
+
+        Unless this tensor is one of the fixed ones, in which case it binds as
+        int16 quants with their per-row scales beside them, and `linear` reaches
+        for `matmul_fixed`. Two nodes rather than one, because the quants and
+        the scales are two inputs; the host reads and quantizes the tensor once
+        for both.
+        """
         key = (name, (outs, ins), "matrix")
         if key not in self.weights:
             index = self.op("input", shape=[outs, ins])
-            self.bindings.append({"node": index, "kind": "matrix", "tensor": name})
+            if name in self.fixed:
+                self.bindings.append({"node": index, "kind": "fixed", "tensor": name})
+                scales = self.op("input", shape=[outs])
+                self.bindings.append({"node": scales, "kind": "fixed_scales", "tensor": name})
+                self.scales[index] = scales
+            else:
+                self.bindings.append({"node": index, "kind": "matrix", "tensor": name})
             self.weights[key] = index
         return self.weights[key]
 
@@ -108,8 +127,18 @@ class Graph:
         return self.literal(("one_hot", length, position), [1, length], data)
 
     def linear(self, x, name, ins, outs):
-        """[tokens, ins] @ [outs, ins]^T -- the checkpoint's own layout."""
-        return self.op("matmul", a=x, b=self.matrix(name, outs, ins), transposed=True)
+        """[tokens, ins] @ [outs, ins]^T -- the checkpoint's own layout.
+
+        `matmul_fixed` where the weight was bound fixed. It is a different
+        operation and not a flag on this one, because it answers a different
+        question: what the integers say rather than what float32 says. Every
+        backend that implements it reaches the same answer by construction,
+        which is the property that makes a stage's compute checkable.
+        """
+        b = self.matrix(name, outs, ins)
+        if b in self.scales:
+            return self.op("matmul_fixed", a=x, b=b, c=self.scales[b], transposed=True)
+        return self.op("matmul", a=x, b=b, transposed=True)
 
     def rms_norm(self, x, name, width, epsilon):
         """x * rsqrt(mean(x^2)) * weight, over the last axis.
