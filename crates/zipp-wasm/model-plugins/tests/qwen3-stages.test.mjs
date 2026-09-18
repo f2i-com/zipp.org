@@ -1,29 +1,37 @@
-// A Qwen3 split across two stages, and the seam between them.
+// A Qwen3 divided across stages, and the seams between them.
 //
-// This is the machinery LEASED needs, tested as the thing it has to be: layers
-// 0..13 on one runtime, 14..27 on another, a hidden state passed between them,
-// and logits identical to running all twenty-eight together.
+// This is the machinery LEASED needs, tested as the thing it has to be: a range
+// of layers on one runtime, the next range on another, a hidden state passed
+// between them, and logits identical to running the whole model in one graph.
 //
-//   stage A: token -> layers 0..13  -> hidden [1, 1024]
-//                                        |
-//                        4 KB across the seam, while 372 MB stays put
-//                                        v
-//   stage B: hidden -> layers 14..27 -> logits [1, 151936]
+//   prefill: prompt -> [0..6] -> [7..13] -> [14..20] -> [21..27] -> logits
+//   decode:  token  -> [0..6] -> [7..13] -> [14..20] -> [21..27] -> logits
+//                       14 caches each, its own layers only
 //
-// Identical, not close. Both paths run the same kernels over the same weights
-// in the same order; the only difference is that one reads a vector out and
-// writes it back in the middle. If float32 came back different from that, the
-// seam would be lossy, and a lossy seam is not a seam.
+// Four ways of dividing it are covered: in half, in four equal parts, in four
+// uneven ones, and for both prefill and decode. The uneven case is the one
+// LEASED is actually for -- a phone taking four layers where a workstation
+// takes twelve -- and equal divisions would never have shown a bug that
+// depended on a share boundary falling somewhere unexpected.
 //
-// So the assertion is bit-for-bit, and the hidden state is round-tripped
+// Identical, not close. Every path runs the same kernels over the same weights
+// in the same order; the only difference is that some read a vector out and
+// write it back partway. If float32 came back different from that, the seam
+// would be lossy, and a lossy seam is not a seam.
+//
+// So the assertions are bit-for-bit, and a hidden state is round-tripped
 // through a structured clone first -- the cheapest honest stand-in for the
 // worker, process or network hop it would really take. A test that passed a
 // live Float32Array between two runtimes in one heap would prove less than it
 // appeared to.
 //
+// Decode is checked over several positions rather than one, which matters more
+// than it looks: a cache written or read wrongly is right for the first token
+// and wrong from the second.
+//
 // What this does NOT do is route anything. There is no peer protocol, no
 // discovery, no multi-stage driver. This is the plugin ABI and the proof that
-// the arithmetic survives being cut in half.
+// the arithmetic survives being divided.
 //
 //   ZIPP_QWEN3_MODEL=.../qwen3-0.6b-q4_k_m.gguf node --test tests/qwen3-stages.test.mjs
 import test from 'node:test';
@@ -451,8 +459,13 @@ test('stages need not be the same size, because peers are not the same machine',
     const config = call('zipp_model_config',
       [JSON.stringify(index.metadata()), JSON.stringify(vocab.length)]);
     const layers = config.num_layers;
-    const shares = [3, 12, 4, 9];
+    // Lopsided on purpose and derived from the model, so a different Qwen3
+    // divides unevenly too rather than tripping an assertion written for this
+    // one. For 28 layers this is 3 + 12 + 4 + 9.
+    const shares = unevenShares(layers);
     assert.equal(shares.reduce((a, b) => a + b, 0), layers, 'the shares must be the model');
+    assert.ok(shares.every(share => share >= 1), 'every peer holds at least one layer');
+    assert.ok(new Set(shares).size > 1, 'these shares are not uneven');
     const tokens = [...index.tokenizer().encode('The capital of France is')];
     const kernels = await readFile(kernelsURL);
 
@@ -563,6 +576,17 @@ test('stages need not be the same size, because peers are not the same machine',
     await source.close();
   }
 });
+
+/** Four unequal shares of `layers`, summing to it exactly.
+ *
+ * Fractions chosen so no boundary lands where an even division would put one:
+ * for 28 layers, 3 + 12 + 4 + 9. */
+function unevenShares(layers) {
+  const first = Math.max(1, Math.round(layers * 0.107));
+  const second = Math.max(1, Math.round(layers * 0.43));
+  const third = Math.max(1, Math.round(layers * 0.143));
+  return [first, second, third, layers - first - second - third];
+}
 
 /** One runtime, kept in the list the test disposes. */
 async function runtime0(runtimes, createRuntime, kernels) {
