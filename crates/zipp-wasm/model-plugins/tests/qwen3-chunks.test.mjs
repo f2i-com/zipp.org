@@ -8,7 +8,8 @@
 // carry on from there.
 //
 // That is only worth having if it is the same computation. These are the
-// claims, each measured rather than assumed:
+// claims, each measured rather than assumed, and on this backend (WASM) each
+// is exact -- not close, equal:
 //
 //   * The logits at the prompt's last token agree with the step-by-step ones.
 //   * A decode session seeded with a chunked prompt's caches then generates
@@ -134,7 +135,7 @@ test('a Qwen3 prompt a chunk at a time', {skip: !ready && reason}, async t => {
     await t.test('the last token of a chunked prompt agrees with the step-by-step one', () => {
       const w = worst(last, reference[0]);
       t.diagnostic(`worst logit difference: ${w.toExponential(2)}`);
-      assert.ok(w <= 1e-4, `chunked logits differ by ${w}`);
+      assert.equal(w, 0, `chunked logits differ by ${w}`);
       assert.equal(argmax(last), argmax(reference[0]), 'a different next token');
     });
 
@@ -155,7 +156,7 @@ test('a Qwen3 prompt a chunk at a time', {skip: !ready && reason}, async t => {
         assert.equal(argmax(logits), argmax(reference[i + 1]), `a different token at step ${i}`);
       }
       t.diagnostic(`worst logit difference while generating: ${worstSeen.toExponential(2)}`);
-      assert.ok(worstSeen <= 1e-4, `seeded generation differs by ${worstSeen}`);
+      assert.equal(worstSeen, 0, `seeded generation differs by ${worstSeen}`);
       s.dispose();
     });
 
@@ -173,7 +174,7 @@ test('a Qwen3 prompt a chunk at a time', {skip: !ready && reason}, async t => {
       }
       const w = worst(logits, last);
       t.diagnostic(`worst difference, split against whole: ${w.toExponential(2)}`);
-      assert.ok(w <= 1e-4, `split chunks differ from the whole by ${w}`);
+      assert.equal(w, 0, `split chunks differ from the whole by ${w}`);
       for (const s of [hs, ms, ts]) s.dispose();
     });
 
@@ -190,27 +191,29 @@ test('a Qwen3 prompt a chunk at a time', {skip: !ready && reason}, async t => {
       }
       const w = worst(logits, last);
       t.diagnostic(`worst difference between paddings: ${w.toExponential(2)}`);
-      assert.ok(w <= 1e-4, `padding changed the answer by ${w}`);
+      assert.equal(w, 0, `padding changed the answer by ${w}`);
       s.dispose();
     });
 
     await t.test('on the fixed-point path too, chunks and steps agree', async () => {
       // matmul_fixed accumulates in integers, so a chunk -- many rows through
-      // the same quants -- has no rounding order to differ in.
+      // the same quants -- has no rounding order to differ in. Two layers,
+      // every row compared: the multiply is what is new here, and a whole
+      // real model in int16 quants outgrows the WASM arena at a chunk of 16.
       const {quantizeWeight} = await import(quantURL);
       const fixedPlan = tokens => prepareDecode(call('zipp_model_decode_stage',
-        [JSON.stringify(config), JSON.stringify(CONTEXT), JSON.stringify(0), JSON.stringify(layers - 1),
+        [JSON.stringify(config), JSON.stringify(CONTEXT), JSON.stringify(0), JSON.stringify(1),
          JSON.stringify('layers'), JSON.stringify(tokens)]), store, hostLimits, {quantize: quantizeWeight});
       const one = await fixedPlan(1), many = await fixedPlan(CHUNK);
       const so = await runtime.prepare(one.program);
-      let want;
-      for (const [position, token] of prompt.entries()) want = output(await so.run([await stepInputs(one, store, {position, token})], {readback: ['logits']})).data;
+      const want = new Float32Array(prompt.length * width);
+      for (const [position, token] of prompt.entries()) want.set(output(await so.run([await stepInputs(one, store, {position, token})], {readback: ['hidden']})).data, position * width);
       so.dispose();
       const sm = await runtime.prepare(many.program);
-      let got;
+      const got = new Float32Array(prompt.length * width);
       for (let position = 0; position < prompt.length; position += CHUNK) {
         const tokens = prompt.slice(position, position + CHUNK);
-        got = output(await sm.run([await stepInputs(many, store, {position, tokens, count: tokens.length})], {readback: ['logits']})).data;
+        got.set(output(await sm.run([await stepInputs(many, store, {position, tokens, count: tokens.length})], {readback: ['hidden']})).data.subarray(0, tokens.length * width), position * width);
       }
       sm.dispose();
       const w = worst(got, want);
