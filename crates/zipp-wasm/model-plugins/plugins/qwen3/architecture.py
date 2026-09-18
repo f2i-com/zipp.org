@@ -132,7 +132,15 @@ def _decode_layer(g, x, layer, config, step):
     `step` carries what depends on the position rather than the layer: the
     mask, the write column, its complement and the rotation. Those are the same
     for every block, so they are built once and passed in.
+
+    It also says how many tokens a step covers. One is the decode step it
+    always was, emitted operation for operation as before. More is a *chunk*
+    of a prompt: every projection multiplies [tokens, width] rather than one
+    row, so each weight is read once for the whole chunk instead of once a
+    token -- which is where a step's time goes -- while the attention and the
+    cache writes are the single-token arithmetic, row by row.
     """
+    tokens = step.get("tokens", 1)
     hidden = config["hidden_size"]
     heads, kv_heads = config["num_heads"], config["num_kv_heads"]
     dim = config["head_dim"]
@@ -145,23 +153,23 @@ def _decode_layer(g, x, layer, config, step):
     block = "blk." + str(layer) + "."
     n = g.rms_norm(x, block + "attn_norm.weight", hidden, epsilon)
     q = g.op("reshape", a=g.linear(n, block + "attn_q.weight", hidden, q_width),
-             shape=[1, heads, dim])
+             shape=[tokens, heads, dim])
     k = g.op("reshape", a=g.linear(n, block + "attn_k.weight", hidden, kv_width),
-             shape=[1, kv_heads, dim])
+             shape=[tokens, kv_heads, dim])
     v = g.op("reshape", a=g.linear(n, block + "attn_v.weight", hidden, kv_width),
-             shape=[1, kv_heads, dim])
+             shape=[tokens, kv_heads, dim])
     q = g.rms_norm(q, block + "attn_q_norm.weight", dim, epsilon)
     k = g.rms_norm(k, block + "attn_k_norm.weight", dim, epsilon)
-    q = g.rope_once(q, heads, dim, step["rotation"])
-    k = g.rope_once(k, kv_heads, dim, step["rotation"])
+    q = g.rope_once(q, heads, dim, step["rotation"], tokens)
+    k = g.rope_once(k, kv_heads, dim, step["rotation"], tokens)
 
     # Into the caches, which are [context, kv_width] and carried. The names
     # carry the absolute layer index, so the caches of a stage holding layers
     # 8..15 never collide with those of a stage holding 0..7.
     keys = g.write_cache("k" + str(layer), g.cache("k" + str(layer), [context, kv_width]),
-                         step["keep"], step["write"], g.op("reshape", a=k, shape=[1, kv_width]))
+                         step["keep"], step["write"], g.op("reshape", a=k, shape=[tokens, kv_width]))
     values = g.write_cache("v" + str(layer), g.cache("v" + str(layer), [context, kv_width]),
-                           step["keep"], step["write"], g.op("reshape", a=v, shape=[1, kv_width]))
+                           step["keep"], step["write"], g.op("reshape", a=v, shape=[tokens, kv_width]))
     # Grouped-query attention without repeating anything.
     #
     # The prefill path copies each key head out to the query heads it serves,
@@ -171,16 +179,34 @@ def _decode_layer(g, x, layer, config, step):
     # so the cache is read where it lies. That removes a [context, heads, dim]
     # copy of both caches every step -- 29 million elements written per token
     # on this model -- and halves what the permutes move.
-    qg = g.op("reshape", a=q, shape=[kv_heads, repeats, dim])
     kh = g.op("permute", a=g.op("reshape", a=keys, shape=[context, kv_heads, dim]),
               dims=[1, 2, 0])                              # [kv_heads, dim, context]
     vh = g.op("permute", a=g.op("reshape", a=values, shape=[context, kv_heads, dim]),
               dims=[1, 0, 2])                              # [kv_heads, context, dim]
-    scores = g.op("mul", a=g.op("matmul", a=qg, b=kh), b=step["scale"])
-    scores = g.op("add", a=scores, b=step["mask"])         # [1, context] broadcasts
-    attended = g.op("matmul", a=g.op("softmax", a=scores, axis=-1), b=vh)
-    # [kv_heads, repeats, dim] is already head order, so this is a view.
-    attended = g.op("reshape", a=attended, shape=[1, q_width])
+    if tokens == 1:
+        qg = g.op("reshape", a=q, shape=[kv_heads, repeats, dim])
+        scores = g.op("mul", a=g.op("matmul", a=qg, b=kh), b=step["scale"])
+        scores = g.op("add", a=scores, b=step["mask"])     # [1, context] broadcasts
+        attended = g.op("matmul", a=g.op("softmax", a=scores, axis=-1), b=vh)
+        # [kv_heads, repeats, dim] is already head order, so this is a view.
+        attended = g.op("reshape", a=attended, shape=[1, q_width])
+    else:
+        # The same grouping with the chunk's tokens inside it: each key head
+        # serves `repeats` query heads of every token, [tokens*repeats] rows
+        # against the one cache. Each token's mask row reaches only as far as
+        # its own position, broadcast across the heads that share it.
+        qg = g.op("reshape", a=q, shape=[tokens, kv_heads, repeats, dim])
+        qg = g.op("permute", a=qg, dims=[1, 0, 2, 3])      # [kv_heads, tokens, repeats, dim]
+        qg = g.op("reshape", a=qg, shape=[kv_heads, tokens*repeats, dim])
+        scores = g.op("mul", a=g.op("matmul", a=qg, b=kh), b=step["scale"])
+        scores = g.op("reshape", a=scores, shape=[kv_heads, tokens, repeats, context])
+        scores = g.op("add", a=scores, b=step["mask"])     # [tokens, 1, context] broadcasts
+        probs = g.op("reshape", a=g.op("softmax", a=scores, axis=-1),
+                       shape=[kv_heads, tokens*repeats, context])
+        attended = g.op("matmul", a=probs, b=vh)           # [kv_heads, tokens*repeats, dim]
+        attended = g.op("reshape", a=attended, shape=[kv_heads, tokens, repeats, dim])
+        attended = g.op("permute", a=attended, dims=[1, 0, 2, 3])
+        attended = g.op("reshape", a=attended, shape=[tokens, q_width])
     x = g.op("add", a=x, b=g.linear(attended, block + "attn_output.weight", q_width, hidden))
 
     n = g.rms_norm(x, block + "ffn_norm.weight", hidden, epsilon)
@@ -191,20 +217,30 @@ def _decode_layer(g, x, layer, config, step):
     return x
 
 
-def _decode_step_inputs(g, config, context):
+def _decode_step_inputs(g, config, context, tokens=1):
     """What every block of a decode step needs, and no block owns.
 
     The mask, the write column and the rotation depend on the position, not on
     which layers are being run -- so a stage holding layers 8..15 needs exactly
     the same ones as a stage holding 0..7.
+
+    A chunk's write has a column per token, and a cache row is kept unless one
+    of them writes it: (1 - write) summed across the columns, which a multiply
+    by a column of ones is.
     """
-    write = g.step_write(context)
+    write = g.step_write(context, tokens)
+    if tokens == 1:
+        keep = g.op("sub", a=g.scalar(1.0), b=write)
+    else:
+        written = g.op("matmul", a=write, b=g.op("full", shape=[tokens, 1], value=1.0))
+        keep = g.op("sub", a=g.scalar(1.0), b=written)
     return {
         "context": context,
-        "mask": g.step_mask(context),
+        "tokens": tokens,
+        "mask": g.step_mask(context, tokens),
         "write": write,
-        "keep": g.op("sub", a=g.scalar(1.0), b=write),
-        "rotation": g.step_rope("matrix", config["head_dim"], config["rope_base"]),
+        "keep": keep,
+        "rotation": g.step_rope("matrix", config["head_dim"], config["rope_base"], tokens),
         "scale": g.scalar(1.0 / (config["head_dim"] ** 0.5)),
     }
 
@@ -368,7 +404,8 @@ def describe_stage(config, first_layer=None, last_layer=None, context=None, fixe
     }
 
 
-def build_decode_stage(config, context=None, first_layer=None, last_layer=None, fixed=None):
+def build_decode_stage(config, context=None, first_layer=None, last_layer=None, fixed=None,
+                       tokens=None):
     """One cached decode step over layers [first_layer, last_layer].
 
     A whole model is the default and is what `build_decode_graph` asks for. A
@@ -398,12 +435,27 @@ def build_decode_stage(config, context=None, first_layer=None, last_layer=None, 
     A stage that is both, which is the default, does both -- and
     `token_embd.weight` is bound once for the lookup and once for the tied
     projection, as it always was.
+
+    ## Chunks
+
+    `tokens` above one builds the same stage over that many consecutive
+    positions at once: a chunk of a prompt. It attends over and writes into
+    the same caches, so a prompt can be run a chunk at a time and the decode
+    graph carry on from where the last chunk left off -- the caches are what
+    connect them, and they hold the same thing either way. The difference is
+    where the time goes: a decode step reads every weight to process one
+    token, and a chunk reads it once for all of its tokens. A chunk may be
+    padded; the host says which of its rows are real, and the last stage
+    projects only the last real one onto the vocabulary.
     """
     description = describe(config)
     context = description["max_context"] if context is None else int(context)
     if not 1 <= context <= description["max_context"]:
         raise ValueError("Invalid decode context")
     first, last = layer_range(config, first_layer, last_layer)
+    tokens = 1 if tokens is None else tokens
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or not 1 <= tokens <= context:
+        raise ValueError("A chunk is between one token and the context")
 
     hidden = config["hidden_size"]
     epsilon = config["rms_norm_epsilon"]
@@ -412,16 +464,20 @@ def build_decode_stage(config, context=None, first_layer=None, last_layer=None, 
     # The head of the model, or a hidden state from whoever ran the layers
     # before this one.
     if first == 0:
-        x = g.step_rows("token_embd.weight", "token", hidden)
+        x = g.step_rows("token_embd.weight", "token", hidden, tokens)
     else:
-        x = g.step_hidden(hidden)
+        x = g.step_hidden(hidden, tokens)
 
-    step = _decode_step_inputs(g, config, context)
+    step = _decode_step_inputs(g, config, context, tokens)
     for layer in range(first, last + 1):
         x = _decode_layer(g, x, layer, config, step)
 
     # The tail of the model, or the residual for whoever runs the rest.
     if last == config["num_layers"] - 1:
+        if tokens > 1:
+            # One row is sampled, so one row is projected: selecting before the
+            # norm is the same thing, since the norm is per row.
+            x = g.op("matmul", a=g.step_select(tokens), b=x)
         x = g.rms_norm(x, "output_norm.weight", hidden, epsilon)
         logits = g.linear(x, "token_embd.weight", hidden, config["vocab_size"])
         return g.finish_decode(logits, context, stage=(first, last),
@@ -521,17 +577,14 @@ def build_prefill_stage(config, prompt, first_layer=None, last_layer=None, fixed
     not produce the key and value caches a decode session carries, and those
     start at zero however much prefilling has happened.
 
-    So the flow that works today is: run the prompt through the *decode* graphs
-    one position at a time, which writes the caches as it goes, and then carry
-    on generating. That is correct and it costs a step per prompt token where a
-    batched prefill would cost one pass.
-
-    The flow that would be better is for a prefill to emit `k{n}` and `v{n}` as
-    [length, kv_width] outputs and for a decode session to start from them
-    instead of from zeros. That is a real feature with a real test -- a
-    prefill-seeded decode agreeing with a position-by-position one, bit for bit
-    -- and it is not built yet. Until it is, `build_prefill_stage` is the eager
-    path and the oracle, not the way a session should start.
+    The batched prefill that does warm them is the *decode* graph over a chunk
+    of positions -- `build_decode_stage(..., tokens=16)` -- which attends over
+    and writes the caches exactly as a step does, row by row, while reading
+    each weight once for the whole chunk. A host runs a prompt through that a
+    chunk at a time and hands the caches to the one-token graph to carry on;
+    tests/qwen3-chunks.test.mjs holds it to the step-by-step path, bit for
+    bit. So `build_prefill_stage` stays what it was: the eager path and the
+    oracle, not the way a session should start.
 
     ## What a stage is told
 

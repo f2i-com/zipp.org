@@ -181,7 +181,7 @@ class Graph:
         return self.op("add", a=self.op("mul", a=x, b=cos),
                        b=self.op("mul", a=turned, b=sin))
 
-    def rope_once(self, x, heads, dim, rotation):
+    def rope_once(self, x, heads, dim, rotation, tokens=1):
         """The same rotation for one token, as a single multiply.
 
         `x*cos + rotate_half(x)*sin` is a linear map of the head, and every
@@ -194,10 +194,18 @@ class Graph:
         do than doing it, so six dispatches saved fifty-six times a step is
         worth a matrix multiply that a GPU finishes in nanoseconds. The same
         trade is a bad one for a prompt, where the matrix would be per
-        position and the JSON carrying it would dwarf the graph."""
-        flat = self.op("reshape", a=x, shape=[heads, dim])
-        turned = self.op("matmul", a=flat, b=rotation)
-        return self.op("reshape", a=turned, shape=[1, heads, dim])
+        position and the JSON carrying it would dwarf the graph.
+
+        Several tokens at once -- a chunk of a prompt -- is the same multiply
+        batched over them: `x` is [tokens, heads, dim] and `rotation` is one
+        matrix per token, [tokens, dim, dim], fed rather than built in, so the
+        graph stays the size it is however many positions a chunk covers.
+        Each row meets exactly the products a single step would give it."""
+        if tokens == 1:
+            flat = self.op("reshape", a=x, shape=[heads, dim])
+            turned = self.op("matmul", a=flat, b=rotation)
+            return self.op("reshape", a=turned, shape=[1, heads, dim])
+        return self.op("matmul", a=x, b=rotation)
 
     def repeat_heads(self, x, length, heads, times, dim):
         """Grouped-query attention: each key/value head serves `times` query
@@ -211,29 +219,35 @@ class Graph:
 
     # ---- Cached decoding: one token at a time, the caches on the device ----
 
-    def step_rows(self, tensor, index, width):
-        """One gathered row the host supplies per token, by token id or position."""
-        node = self.op("input", shape=[1, width])
+    def step_rows(self, tensor, index, width, tokens=1):
+        """One gathered row the host supplies per token, by token id or position
+        -- or one per token of a chunk, [tokens, width]."""
+        node = self.op("input", shape=[tokens, width])
         self.bindings.append({"node": node, "kind": "step", "slot": "rows",
                               "tensor": tensor, "index": index})
         return node
 
-    def step_mask(self, context):
-        """The additive mask over the positions written so far."""
-        node = self.op("input", shape=[1, context])
+    def step_mask(self, context, tokens=1):
+        """The additive mask over the positions written so far.
+
+        For a chunk, one row per token -- [tokens, 1, context] -- since each
+        sees the positions up to its own and no further. The middle axis is
+        where the query heads sharing a key head broadcast."""
+        node = self.op("input", shape=[1, context] if tokens == 1 else [tokens, 1, context])
         self.bindings.append({"node": node, "kind": "step", "slot": "mask"})
         return node
 
-    def step_write(self, context):
+    def step_write(self, context, tokens=1):
         """A one-hot column marking where this token writes into the caches.
 
         The protocol has no scatter, so writing is arithmetic: the old cache
-        times (1 - write), plus write times the new row."""
-        node = self.op("input", shape=[context, 1])
+        times (1 - write), plus write times the new row. A chunk has a column
+        per token, [context, tokens], and writes all of its rows at once."""
+        node = self.op("input", shape=[context, tokens])
         self.bindings.append({"node": node, "kind": "step", "slot": "write"})
         return node
 
-    def step_rope(self, part, dim, base):
+    def step_rope(self, part, dim, base, tokens=1):
         """The cosines or sines of the current position.
 
         A prefill knows every position when it is built and can carry these as
@@ -241,22 +255,38 @@ class Graph:
         the host computes them per step. They are trigonometry over a position
         and an index, never over the data."""
         # A matrix is the whole rotation; a table is one of its two halves.
-        shape = [dim, dim] if part == "matrix" else [1, 1, dim]
+        # A chunk has one of either per token.
+        if tokens == 1:
+            shape = [dim, dim] if part == "matrix" else [1, 1, dim]
+        else:
+            shape = [tokens, dim, dim] if part == "matrix" else [tokens, 1, dim]
         node = self.op("input", shape=shape)
         self.bindings.append({"node": node, "kind": "step", "slot": "rope",
                               "part": part, "dim": dim, "base": float(base)})
         return node
 
-    def step_hidden(self, width):
+    def step_hidden(self, width, tokens=1):
         """The residual stream, from whoever ran the layers before this stage.
 
         This is the seam. It is one `[1, width]` vector -- 4 KB where the
         weights it is travelling between are hundreds of megabytes -- and it is
         the residual rather than anything normalised, because every block
         normalises its own input. A stage can therefore be handed this and
-        carry on as though it had computed it."""
-        node = self.op("input", shape=[1, width])
+        carry on as though it had computed it.
+
+        A chunk hands over one row per token, [tokens, width]."""
+        node = self.op("input", shape=[tokens, width])
         self.bindings.append({"node": node, "kind": "step", "slot": "hidden"})
+        return node
+
+    def step_select(self, tokens):
+        """A [1, tokens] one-hot picking the chunk's last real token.
+
+        A chunk may be padded, and only one row of it is ever sampled, so the
+        host says which -- and the output head, the widest multiply in the
+        model, runs over that one row rather than all of them."""
+        node = self.op("input", shape=[1, tokens])
+        self.bindings.append({"node": node, "kind": "step", "slot": "select"})
         return node
 
     def cache(self, name, shape):

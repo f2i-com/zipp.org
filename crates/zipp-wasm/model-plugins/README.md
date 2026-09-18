@@ -178,7 +178,7 @@ files across a Worker, send a Map of explicit relative paths to File objects as
 | Safetensors F32/F16/BF16 with bounds checks and F32 conversion; GGUF through a pinned `gguf-wasm` release, with Q4_K and Q6_K weights kept resident as blocks | Pickle checkpoints, zero-copy device import, block formats other than Q4_K/Q6_K staying resident (the rest decode) |
 | Custom tiny transformer, single-file bigram, GPT-Neo/TinyStories and Qwen3 plugins, each declaring the one checkpoint family it implements; Qwen3 also builds any inclusive range of its layers, so a model can be run in stages that hand each other a residual stream | Any other family — Llama, GPT-2 proper, SentencePiece tokenizers; loading one is refused, not attempted |
 | Hugging Face folders read as published: own config, own tensor names, own tokenizer files, safetensors shard index | Pickled `pytorch_model.bin` (never unpickled) |
-| Eager full-context planning as the oracle, plus cached decoding with carried KV caches and resident weights, quantized or not | Batched prefill, fused decode kernels, throughput claims |
+| Eager full-context planning as the oracle, plus cached decoding with carried KV caches and resident weights, quantized or not; a Qwen3 stage's decode graph over a chunk of positions, for prompts | Fused decode kernels, throughput claims beyond the measurements below |
 | Existing Graph v2 runtime integration code; cross-backend parity verified on all four backends | ZIPP WASM/CLI integration, SoftN, Gate B robustness |
 
 There is no new native `zipp py` model command or built-in `zipp_llm` Python
@@ -249,6 +249,34 @@ Generating 16 tokens from TinyStories-1M:
 prepare a plan, and falls back to recomputing otherwise. The eager path is
 unchanged, is what `infer` uses, and the checkout gate requires both to produce
 the same tokens: a cache that is subtly wrong still reads like English.
+
+### A prompt in chunks
+
+One token a step is right for generating and wasteful for a prompt: a step
+reads every weight to process one token. Qwen3's `build_decode_stage` takes
+`tokens`, and with more than one it builds the same stage over that many
+consecutive positions -- hidden rows `[tokens, width]` in and out, a rotation,
+a mask row and a cache-write column per token, and a `[1, tokens]` selector so
+the last stage projects only its last real token onto the vocabulary.
+`prepareDecode` reads the chunk size from the input shapes (`plan.tokens`), and
+`stepInputs` takes `{position, tokens | hidden, count}` for up to that many
+positions, padding the rest inertly: padded rows write nothing and no real row
+can see them.
+
+It writes the same caches, so a host prepares both graphs, runs the prompt in
+chunks, then downloads the chunk session's carried caches and feeds them to the
+one-token session on its first step. Layers 1..26 of Qwen3-0.6B on WASM:
+
+| | per token |
+| --- | --- |
+| One token a step | 182 ms |
+| Chunks of 8 | 72 ms |
+| Chunks of 16 | 65 ms |
+
+`tests/qwen3-chunks.test.mjs` compares it with the step-by-step path -- the
+prompt's last logits, the tokens generated afterwards from the seeded caches,
+head/middle/tail chunks against the whole, and different paddings -- and on the
+fixture and on the real 0.6B every one of them is identical, bit for bit.
 
 ## Two ways to define a model
 

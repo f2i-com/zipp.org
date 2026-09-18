@@ -33,7 +33,8 @@ const residentDtype = (weights, name) =>
  */
 // `hidden` is the seam between two stages of one model: a stage that does not
 // start at layer 0 is handed the residual stream instead of looking a token up.
-const STEP_SLOTS = new Set(['rows', 'mask', 'write', 'rope', 'hidden']);
+// `select` picks the one row of a chunk that is projected onto the vocabulary.
+const STEP_SLOTS = new Set(['rows', 'mask', 'write', 'rope', 'hidden', 'select']);
 const ROPE_PARTS = new Set(['cos', 'sin', 'matrix']);
 const INDEXES = new Set(['token', 'position']);
 /** Graph v2 wants finite float32; this is the mask sentinel, not -Infinity. */
@@ -95,6 +96,9 @@ export async function prepareDecode(template, weights, limits, {quantize = null}
   }
   const steps = [], carries = new Map();
   let residentElements = 0;
+  // How many tokens a step covers: one for a decode step, more for a chunk of
+  // a prompt. Every per-step input says, by its shape, and they must agree.
+  const sizes = new Set();
   const nodes = graph.nodes.map((raw, id) => {
     check(raw && typeof raw === 'object' && raw.id === id, 'GRAPH', 'Nonconsecutive graph id');
     const node = {...raw};
@@ -187,21 +191,40 @@ export async function prepareDecode(template, weights, limits, {quantize = null}
         check(binding.dim % 2 === 0, 'SHAPE', 'Rotary embeddings need an even dimension');
         check(typeof binding.base === 'number' && Number.isFinite(binding.base) && binding.base > 1,
           'FORMAT', 'A rotary base is a finite number above one');
-        check(sameShape(node.shape, binding.part === 'matrix' ? [binding.dim, binding.dim] : [1, 1, binding.dim]),
-          'SHAPE', binding.part === 'matrix' ? 'A rotary matrix is [dim, dim]' : 'A rotary table is [1, 1, dim]');
+        const d = binding.dim;
+        if (binding.part === 'matrix') {
+          check(sameShape(node.shape, [d, d]) || (node.shape.length === 3 && sameShape(node.shape.slice(1), [d, d])),
+            'SHAPE', 'A rotary matrix is [dim, dim], or [tokens, dim, dim] for a chunk');
+          sizes.add(node.shape.length === 3 ? node.shape[0] : 1);
+        } else {
+          check(node.shape.length === 3 && node.shape[1] === 1 && node.shape[2] === d,
+            'SHAPE', 'A rotary table is [1, 1, dim], or [tokens, 1, dim] for a chunk');
+          sizes.add(node.shape[0]);
+        }
       } else if (binding.slot === 'rows') {
         check(INDEXES.has(binding.index), 'FORMAT', 'A gathered row is indexed by token or position');
         const shape = weights.info(binding.tensor).shape;
-        check(shape.length === 2 && sameShape(node.shape, [1, shape[1]]), 'SHAPE',
+        check(shape.length === 2 && node.shape.length === 2 && node.shape[1] === shape[1], 'SHAPE',
           `Gathered row shape mismatch: ${binding.tensor}`);
+        sizes.add(node.shape[0]);
       } else if (binding.slot === 'mask') {
         if (binding.window !== undefined) integer(binding.window, 1, template.context, 'Local attention window');
-        check(sameShape(node.shape, [1, template.context]), 'SHAPE', 'A decode mask is [1, context]');
+        check(sameShape(node.shape, [1, template.context]) ||
+          (node.shape.length === 3 && node.shape[1] === 1 && node.shape[2] === template.context),
+          'SHAPE', 'A decode mask is [1, context], or [tokens, 1, context] for a chunk');
+        sizes.add(node.shape.length === 3 ? node.shape[0] : 1);
       } else if (binding.slot === 'hidden') {
+        check(node.shape.length === 2 && node.shape[0] >= 1 && node.shape[1] >= 1,
+          'SHAPE', 'A hidden state is [tokens, hidden_size]');
+        sizes.add(node.shape[0]);
+      } else if (binding.slot === 'select') {
         check(node.shape.length === 2 && node.shape[0] === 1 && node.shape[1] >= 1,
-          'SHAPE', 'A hidden state is [1, hidden_size]');
+          'SHAPE', 'A row selector is [1, tokens]');
+        sizes.add(node.shape[1]);
       } else {
-        check(sameShape(node.shape, [template.context, 1]), 'SHAPE', 'A write column is [context, 1]');
+        check(node.shape.length === 2 && node.shape[0] === template.context && node.shape[1] >= 1,
+          'SHAPE', 'A write is [context, 1], or [context, tokens] for a chunk');
+        sizes.add(node.shape[1]);
       }
       steps.push({node: id, ...binding,
         ...(binding.slot === 'hidden' ? {width: node.shape[1]} : {})});
@@ -209,6 +232,9 @@ export async function prepareDecode(template, weights, limits, {quantize = null}
   }
   check(steps.some(step => step.slot === 'write') === carries.size > 0, 'FORMAT',
     'A cache that is carried must be written, and a write needs a cache');
+  check(sizes.size <= 1, 'SHAPE', `A step's inputs disagree about how many tokens it covers: ${[...sizes].join(', ')}`);
+  const tokens = sizes.size ? [...sizes][0] : 1;
+  integer(tokens, 1, template.context, 'Tokens a step covers');
   // Weights and zeroed caches become the plan's static data, uploaded once.
   // A tensor bound as `fixed` is quantized once and kept, so that naming it for
   // both its quants and its scales reads and quantizes it a single time.
@@ -250,6 +276,8 @@ export async function prepareDecode(template, weights, limits, {quantize = null}
   return {
     program: {version: 2, nodes, outputs: graph.outputs.map(o => ({...o}))},
     steps, context: template.context,
+    // One for a decode step; more for a chunk of a prompt (see chunkInputs).
+    tokens,
     resident: [...carries.keys()],
     // Present when this graph is part of a model rather than all of it: which
     // layers it runs, and how wide the residual stream it passes on is. A host
@@ -305,7 +333,124 @@ export function validateStageManifest(manifest) {
  * check is against the configuration digest and the layer adjacency rather
  * than against the shape. It is optional because a single process does not
  * need it; anything across a boundary should pass it. */
-export async function stepInputs(plan, weights, {token, position, hidden, from}) {
+/** That `hidden` is the output of the stage before this one, of this model.
+ * Shared by a single step and a chunk. */
+function checkSeam(plan, from) {
+  if (from === undefined) return;
+  check(from && typeof from === 'object', 'FORMAT', 'A stage manifest is an object');
+  const mine = plan.manifest;
+  check(mine !== undefined, 'FORMAT',
+    'This plan has no manifest to check a hidden state against');
+  check(from.config_digest === mine.config_digest, 'CHECKPOINT',
+    `That hidden state is from a different model (${from.config_digest} not ` +
+    `${mine.config_digest}). A matching residual width is not a matching model.`);
+  check(from.hidden_dtype === mine.hidden_dtype, 'FORMAT',
+    `That stage sends ${from.hidden_dtype}, this one reads ${mine.hidden_dtype}`);
+  check(from.last_layer + 1 === mine.first_layer, 'SHAPE',
+    `That stage ends at layer ${from.last_layer}; this one begins at ` +
+    `${mine.first_layer}, so ${mine.first_layer - from.last_layer - 1} layers are missing`);
+}
+
+/** The rotation of one position as a [dim, dim] matrix, written into `out`. */
+function rotationAt(out, offset, position, dim, base) {
+  const half = dim / 2;
+  for (let j = 0; j < dim; j++) {
+    const a = position / base ** ((2 * (j % half)) / dim);
+    out[offset + j * dim + j] = Math.cos(a);
+    const partner = j < half ? j + half : j - half;
+    out[offset + partner * dim + j] = j < half ? -Math.sin(a) : Math.sin(a);
+  }
+}
+
+/**
+ * The inputs for a chunk: `count` consecutive tokens from `position`, in a
+ * plan built for `plan.tokens` of them.
+ *
+ * Everything a single step is fed, one per token -- a row, a rotation, a mask
+ * row reaching as far as that token's own position, a write column -- plus the
+ * selector naming the last real token. A chunk shorter than the plan is
+ * padded, and the padding is inert by construction: its rows are zero, they
+ * write nothing into the caches (their columns are empty), and the real rows
+ * cannot see them, since every one of them lies after every real position.
+ * Their outputs are computed and ignored.
+ *
+ * `tokens` are the ids, for a plan that looks them up; `hidden` is
+ * [count, width] from the stage before, for one that does not.
+ */
+async function chunkInputs(plan, weights, {position, tokens, hidden, from, count}) {
+  const size = plan.tokens;
+  integer(count, 1, size, 'Tokens in this chunk');
+  integer(position, 0, plan.context - count, 'Chunk position');
+  const inputs = {};
+  for (const step of plan.steps) {
+    if (step.slot === 'rows') {
+      const info = weights.info(step.tensor), width = info.shape[1];
+      let indices;
+      if (step.index === 'token') {
+        check(Array.isArray(tokens) && tokens.length === count, 'SHAPE',
+          `A chunk of ${count} needs ${count} token ids`);
+        indices = tokens;
+      } else indices = Array.from({length: count}, (_, t) => position + t);
+      for (const index of indices) integer(index, 0, info.shape[0] - 1, step.index === 'token' ? 'Token id' : 'Position');
+      const out = new Float32Array(size * width);
+      const gathered = typeof weights.rows === 'function' ? await weights.rows(step.tensor, indices) : null;
+      if (gathered) out.set(gathered.subarray(0, count * width));
+      else {
+        const data = await weights.tensor(step.tensor);
+        indices.forEach((index, t) => out.set(data.subarray(index * width, (index + 1) * width), t * width));
+      }
+      inputs[step.node] = out;
+    } else if (step.slot === 'rope') {
+      if (step.part === 'matrix') {
+        const out = new Float32Array(size * step.dim * step.dim);
+        for (let t = 0; t < size; t++) rotationAt(out, t * step.dim * step.dim, position + t, step.dim, step.base);
+        inputs[step.node] = out;
+      } else {
+        const half = step.dim / 2, out = new Float32Array(size * step.dim);
+        for (let t = 0; t < size; t++) {
+          for (let i = 0; i < step.dim; i++) {
+            const a = (position + t) / step.base ** ((2 * (i % half)) / step.dim);
+            out[t * step.dim + i] = step.part === 'cos' ? Math.cos(a) : Math.sin(a);
+          }
+        }
+        inputs[step.node] = out;
+      }
+    } else if (step.slot === 'hidden') {
+      check(hidden instanceof Float32Array, 'SHAPE',
+        'This stage begins mid-model and needs {hidden}: the output of the stage before it');
+      check(hidden.length === count * step.width, 'SHAPE',
+        `A chunk of ${count} for this stage is ${count * step.width} values, got ${hidden.length}`);
+      checkSeam(plan, from);
+      for (let i = 0; i < hidden.length; i++) check(Number.isFinite(hidden[i]), 'NUMBER', 'Non-finite value in a hidden state');
+      const out = new Float32Array(size * step.width);
+      out.set(hidden);
+      inputs[step.node] = out;
+    } else if (step.slot === 'mask') {
+      const out = new Float32Array(size * plan.context);
+      for (let t = 0; t < size; t++) {
+        const at = position + t;
+        for (let column = 0; column < plan.context; column++) {
+          if (column > at || (step.window !== undefined && column <= at - step.window)) out[t * plan.context + column] = MASKED;
+        }
+      }
+      inputs[step.node] = out;
+    } else if (step.slot === 'select') {
+      const out = new Float32Array(size);
+      out[count - 1] = 1;
+      inputs[step.node] = out;
+    } else {
+      // [context, tokens], row-major: a real token's column marks its row.
+      const out = new Float32Array(plan.context * size);
+      for (let t = 0; t < count; t++) out[(position + t) * size + t] = 1;
+      inputs[step.node] = out;
+    }
+  }
+  return {inputs};
+}
+
+export async function stepInputs(plan, weights, {token, position, hidden, from, tokens, count}) {
+  // A plan for a chunk takes a chunk: ids or hidden rows for `count` tokens.
+  if ((plan.tokens ?? 1) > 1) return chunkInputs(plan, weights, {position, tokens, hidden, from, count});
   integer(position, 0, plan.context - 1, 'Decode position');
   const inputs = {};
   for (const step of plan.steps) {
@@ -355,20 +500,7 @@ export async function stepInputs(plan, weights, {token, position, hidden, from})
         'This stage begins mid-model and needs {hidden}: the output of the stage before it');
       check(hidden.length === step.width, 'SHAPE',
         `A hidden state for this stage is ${step.width} values, got ${hidden.length}`);
-      if (from !== undefined) {
-        check(from && typeof from === 'object', 'FORMAT', 'A stage manifest is an object');
-        const mine = plan.manifest;
-        check(mine !== undefined, 'FORMAT',
-          'This plan has no manifest to check a hidden state against');
-        check(from.config_digest === mine.config_digest, 'CHECKPOINT',
-          `That hidden state is from a different model (${from.config_digest} not ` +
-          `${mine.config_digest}). A matching residual width is not a matching model.`);
-        check(from.hidden_dtype === mine.hidden_dtype, 'FORMAT',
-          `That stage sends ${from.hidden_dtype}, this one reads ${mine.hidden_dtype}`);
-        check(from.last_layer + 1 === mine.first_layer, 'SHAPE',
-          `That stage ends at layer ${from.last_layer}; this one begins at ` +
-          `${mine.first_layer}, so ${mine.first_layer - from.last_layer - 1} layers are missing`);
-      }
+      checkSeam(plan, from);
       for (let i = 0; i < hidden.length; i++) {
         check(Number.isFinite(hidden[i]), 'NUMBER', 'Non-finite value in a hidden state');
       }
