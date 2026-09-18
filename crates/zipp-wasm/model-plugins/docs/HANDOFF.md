@@ -109,9 +109,12 @@ to prevent: the refusal is the honest state until the mapping is verified.
 Measured on TinyStories-1M (3M parameters, 50,257 vocabulary) with the CPU
 JavaScript backend: a session opens in about two seconds, of which most is
 hashing 46 MiB for approval, and each generated token re-uploads and re-runs the
-whole model over the whole context. There is no KV cache and no resident weight,
-so the embedding matrix crosses the boundary once per token. That is Gate D's
-subject, not a GPT-Neo problem.
+whole model over the whole context. There is no KV cache and no resident weight
+on *this* path, so the embedding matrix crosses the boundary once per token.
+That was Gate D's subject and Gate D has since answered it -- the cached decode
+path keeps weights resident and uploads 1,664 elements a step. The measurement
+above is what the eager path costs, which is why it is kept as an oracle rather
+than as a way to serve a model.
 
 Two engine costs shaped the plugin and are worth fixing at the source rather than
 working around again:
@@ -157,15 +160,35 @@ The protocol has no scatter, so a cache is written arithmetically:
 feeds for the current position. Caches need no clearing between generations,
 because every position is written before the mask ever unmasks it.
 
-What is still missing here: prefill runs one step per prompt token rather than
-one batched graph, so a long prompt costs what it would have cost anyway;
-`run` accepts up to 64 steps per submission and the driver does not yet use
-that. Quantized formats and kernels remain unstarted, and F32 parity must come
-first.
+**Quantized formats and kernels are done too, and are how a real checkpoint
+fits.** Q4_K and Q6_K weights stay in the file's own block format on the device
+and are decoded inside the matmul, on all four backends. Qwen3-0.6B holds at
+373 MB where float32 would need 2,274 MB. The decoders are checked against
+gguf-py — an independent implementation — for all fifteen formats bit for bit,
+and the whole path is checked end to end against transformers reading the same
+GGUF: 455,808 logits, worst difference 7.391e-5. See `docs/VALIDATION.md`.
+
+**A model can also be divided across devices.** `build_decode_stage` and
+`build_prefill_stage` build a graph over any inclusive range of layers; a stage
+loads only its own tensors and carries only its own caches, and hands the next
+one a residual stream. Halves, quarters and uneven shares all reproduce the
+whole model's logits bit for bit, including across worker threads with the
+buffer transferred rather than copied. `describe_stage` gives a stage an
+identity so a peer cannot be fed activations from a different checkpoint that
+happens to share a residual width.
+
+What is still missing here: a **batched prefill that warms the decode caches**.
+`build_prefill_stage` is a batched forward and produces the residual stream, not
+the key and value tensors a decode session carries — those still start at zero,
+so a prompt is fed through the decode graphs one position at a time. That is
+correct and costs a step per prompt token where one pass would do. Making a
+prefill emit `k{n}`/`v{n}` for a decode session to begin from is the next real
+piece of work in this gate. `run` also accepts up to 64 steps per submission and
+the driver does not yet use that.
 
 Keep the eager full-context path as a correctness oracle. Remaining: GPU
-embedding/gather as appropriate, batched prefill, and explicit valid-length
-accounting; prefill and decode need separate accounting. Use per-layer rank-three/four cache tensors according to the backend ABI;
+embedding/gather as appropriate, cache-warming prefill, and explicit
+valid-length accounting; prefill and decode need separate accounting. Use per-layer rank-three/four cache tensors according to the backend ABI;
 combining layers and an additional batch axis can exceed the supported tensor
 rank. Measure upload/readback and CPU planning separately from kernel time.
 
@@ -212,8 +235,10 @@ would cut the first by two to four times again. Until those land, a plugin for
 that family would be a plugin that cannot load its own checkpoint — which is the
 thing this repository refuses to ship.
 Keep cache ownership, sessions, work bounds and aggregate resident memory under
-host control. Add quantized formats/kernels only after F32 reference parity.
-F16/BF16 file conversion alone does not supply quantized compute.
+host control. Quantized formats and kernels came after F32 reference parity, as
+this said they should, and are now in place: see Gate D above and
+`interop/GGUF.md`. F16/BF16 file conversion alone still does not supply
+quantized compute, and did not.
 
 ## Gate E — general runtime extensions and packaging
 
