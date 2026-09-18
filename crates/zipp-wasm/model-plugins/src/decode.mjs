@@ -1,4 +1,5 @@
 import {check, fields, integer, shapeSize, sameShape} from './common.mjs';
+import {residentFormat} from './gguf.mjs';
 
 /** The block format a tensor can stay in on a device, or null. */
 const residentDtype = (weights, name) =>
@@ -53,7 +54,14 @@ export function validateDecodeTemplate(template, limits) {
     integer(template.stage.last_layer, template.stage.first_layer, 4095, 'Stage last layer');
   }
   if (template.hidden_size !== undefined) integer(template.hidden_size, 1, 1 << 20, 'Hidden size');
-  if (template.manifest !== undefined) validateStageManifest(template.manifest);
+  if (template.manifest !== undefined) {
+    validateStageManifest(template.manifest);
+    // Which weights a stage runs is the host's to say. A plugin is handed a
+    // configuration and never the file, so a digest from it would be a claim
+    // about something it has not seen.
+    check(template.manifest.checkpoint_digest === undefined, 'FORMAT',
+      'A plugin cannot say which weights it will run; the host does, with prepareDecode({checkpoint})');
+  }
   const graph = template.graph;
   fields(graph, ['version', 'nodes', 'outputs'], ['version', 'nodes', 'outputs']);
   check(graph.version === 2, 'VERSION', 'Expected ZIPP Graph v2');
@@ -84,9 +92,21 @@ export function validateDecodeTemplate(template, limits) {
 /**
  * Resolve a decode template into a program `runtime.prepare` accepts, plus the
  * per-step plan the caller feeds it. Weight reads happen once, here.
+ *
+ * `checkpoint` is the sha256 of the weights this plan is prepared from, as the
+ * host that opened them knows it, and becomes the stage manifest's
+ * `checkpoint_digest`. A host whose stages hand hidden states to one another
+ * should pass it: the configuration digest a plugin can compute says which
+ * architecture a stage runs, and only this says which model.
  */
-export async function prepareDecode(template, weights, limits, {quantize = null} = {}) {
+export async function prepareDecode(template, weights, limits, {quantize = null, checkpoint} = {}) {
   const {graph, outputs} = validateDecodeTemplate(template, limits);
+  if (checkpoint !== undefined) {
+    check(typeof checkpoint === 'string' && /^[0-9a-f]{64}$/.test(checkpoint), 'FORMAT',
+      'A checkpoint digest is the sha256 of the weights, in lowercase hex');
+    check(template.manifest !== undefined, 'FORMAT',
+      'Only a stage has a manifest to carry a checkpoint digest');
+  }
   const byNode = new Map();
   for (const binding of template.bindings) {
     check(binding && typeof binding === 'object', 'FORMAT', 'Invalid binding');
@@ -235,6 +255,22 @@ export async function prepareDecode(template, weights, limits, {quantize = null}
   check(sizes.size <= 1, 'SHAPE', `A step's inputs disagree about how many tokens it covers: ${[...sizes].join(', ')}`);
   const tokens = sizes.size ? [...sizes][0] : 1;
   integer(tokens, 1, template.context, 'Tokens a step covers');
+  // What the plan will hold, charged before any of it is read or quantized,
+  // against the same budget and at the same rates as the eager path in
+  // bindings.mjs: blocks cost what the file does, int16 quants two bytes a
+  // value, and everything else -- decoded weights, scales, zeroed caches,
+  // literals, per-step inputs -- four. A plan too large to hold is refused
+  // here rather than after the reads that would have filled it.
+  let inputBytes = 0;
+  for (const node of nodes) {
+    if (node.op !== 'input') continue;
+    const binding = byNode.get(node.id), size = shapeSize(node.shape, limits);
+    const format = binding?.kind === 'matrix' || binding?.kind === 'blocks'
+      ? residentFormat(weights, binding.tensor) : null;
+    inputBytes += format ? (size / format.block) * format.bytes
+      : binding?.kind === 'fixed' ? size * 2 : size * 4;
+    check(inputBytes <= limits.maxBoundInputBytes, 'LIMIT', 'Bound graph inputs exceed budget');
+  }
   // Weights and zeroed caches become the plan's static data, uploaded once.
   // A tensor bound as `fixed` is quantized once and kept, so that naming it for
   // both its quants and its scales reads and quantizes it a single time.
@@ -285,7 +321,10 @@ export async function prepareDecode(template, weights, limits, {quantize = null}
     // re-deriving it from the tensor names.
     ...(template.stage !== undefined ? {stage: {...template.stage}} : {}),
     ...(template.hidden_size !== undefined ? {hidden_size: template.hidden_size} : {}),
-    ...(template.manifest !== undefined ? {manifest: template.manifest} : {}),
+    // With the host's checkpoint digest when it gave one. A copy: the
+    // template's own manifest is the plugin's statement and stays as it was.
+    ...(template.manifest !== undefined ? {manifest: checkpoint === undefined
+      ? template.manifest : {...template.manifest, checkpoint_digest: checkpoint}} : {}),
   };
 }
 
@@ -297,7 +336,7 @@ export function validateStageManifest(manifest) {
   fields(manifest, ['plugin', 'plugin_version', 'family', 'checkpoint_format',
     'tokenizer_formats', 'config_digest', 'first_layer', 'last_layer', 'num_layers',
     'role', 'hidden_size', 'hidden_dtype', 'context', 'graph_version', 'protocol_version',
-    'fixed'],
+    'fixed', 'checkpoint_digest'],
     ['plugin', 'config_digest', 'first_layer', 'last_layer', 'role', 'hidden_size',
      'hidden_dtype']);
   // Which of this stage's weights are multiplied as integers. Optional, and
@@ -308,8 +347,14 @@ export function validateStageManifest(manifest) {
   // same question. The seam itself is f32 either way.
   if (manifest.fixed !== undefined) check(['none', 'layers', 'all'].includes(manifest.fixed),
     'FORMAT', `Unknown fixed-weight policy: ${String(manifest.fixed)}`);
-  check(/^[0-9a-f]{64}$/.test(manifest.config_digest), 'FORMAT',
-    'A configuration digest is a sha256');
+  check(typeof manifest.config_digest === 'string' && /^[0-9a-f]{64}$/.test(manifest.config_digest),
+    'FORMAT', 'A configuration digest is a sha256');
+  // The weights' own sha256, attached by the host that opened them (see
+  // prepareDecode). Optional here because a plugin's manifest never has one.
+  if (manifest.checkpoint_digest !== undefined) {
+    check(typeof manifest.checkpoint_digest === 'string' && /^[0-9a-f]{64}$/.test(manifest.checkpoint_digest),
+      'FORMAT', 'A checkpoint digest is a sha256');
+  }
   check(['head', 'middle', 'tail', 'whole'].includes(manifest.role), 'FORMAT',
     `Unknown stage role: ${String(manifest.role)}`);
   check(manifest.hidden_dtype === 'f32', 'FORMAT',
@@ -320,19 +365,6 @@ export function validateStageManifest(manifest) {
   return manifest;
 }
 
-/** The inputs one token needs: gathered rows, the mask so far, and the write column.
- *
- * A stage that does not start at layer 0 takes `hidden` instead of a token:
- * the residual stream the previous stage produced, which is the only thing
- * that crosses between them.
- *
- * `from` is that stage's manifest, and passing it is what turns "this is a
- * float array of the right length" into "this is the output of the stage
- * before this one, of this model". Two checkpoints that share a residual width
- * produce hidden states that compose without error and mean nothing, so the
- * check is against the configuration digest and the layer adjacency rather
- * than against the shape. It is optional because a single process does not
- * need it; anything across a boundary should pass it. */
 /** That `hidden` is the output of the stage before this one, of this model.
  * Shared by a single step and a chunk. */
 function checkSeam(plan, from) {
@@ -341,9 +373,27 @@ function checkSeam(plan, from) {
   const mine = plan.manifest;
   check(mine !== undefined, 'FORMAT',
     'This plan has no manifest to check a hidden state against');
+  // It arrived with the hidden state, from wherever that did.
+  validateStageManifest(from);
   check(from.config_digest === mine.config_digest, 'CHECKPOINT',
-    `That hidden state is from a different model (${from.config_digest} not ` +
+    `That hidden state is from a different configuration (${from.config_digest} not ` +
     `${mine.config_digest}). A matching residual width is not a matching model.`);
+  // A configuration names an architecture, not a model: a fine-tune of the
+  // same base, or the same model quantized another way, has every field the
+  // same and other weights. Which weights is the host's to say, and it says so
+  // with the checkpoint digest prepareDecode attaches. Compared whenever
+  // either side has one, and a side without one is refused rather than waved
+  // through -- an identity that can be passed by leaving it out checks nothing.
+  if (mine.checkpoint_digest !== undefined || from.checkpoint_digest !== undefined) {
+    check(from.checkpoint_digest !== undefined, 'CHECKPOINT',
+      `That stage does not say which weights it ran; this one runs ${mine.checkpoint_digest}`);
+    check(mine.checkpoint_digest !== undefined, 'CHECKPOINT',
+      `That stage ran ${from.checkpoint_digest}, and this plan was prepared without a ` +
+      'checkpoint digest to compare it with: pass {checkpoint} to prepareDecode');
+    check(from.checkpoint_digest === mine.checkpoint_digest, 'CHECKPOINT',
+      `That hidden state is from a different checkpoint (${from.checkpoint_digest} not ` +
+      `${mine.checkpoint_digest}). A matching configuration is not matching weights.`);
+  }
   check(from.hidden_dtype === mine.hidden_dtype, 'FORMAT',
     `That stage sends ${from.hidden_dtype}, this one reads ${mine.hidden_dtype}`);
   check(from.last_layer + 1 === mine.first_layer, 'SHAPE',
@@ -448,6 +498,20 @@ async function chunkInputs(plan, weights, {position, tokens, hidden, from, count
   return {inputs};
 }
 
+/** The inputs one token needs: gathered rows, the mask so far, and the write column.
+ *
+ * A stage that does not start at layer 0 takes `hidden` instead of a token:
+ * the residual stream the previous stage produced, which is the only thing
+ * that crosses between them.
+ *
+ * `from` is that stage's manifest -- its plan's `manifest`, as prepareDecode
+ * returned it -- and passing it is what turns "this is a float array of the
+ * right length" into "this is the output of the stage before this one, of
+ * this model". Two checkpoints that share a residual width produce hidden
+ * states that compose without error and mean nothing, so the check is against
+ * the configuration digest, the checkpoint digest and the layer adjacency
+ * rather than against the shape. It is optional because a single process does
+ * not need it; anything across a boundary should pass it. */
 export async function stepInputs(plan, weights, {token, position, hidden, from, tokens, count}) {
   // A plan for a chunk takes a chunk: ids or hidden rows for `count` tokens.
   if ((plan.tokens ?? 1) > 1) return chunkInputs(plan, weights, {position, tokens, hidden, from, count});

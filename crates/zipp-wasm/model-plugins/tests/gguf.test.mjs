@@ -197,3 +197,47 @@ test('a GGUF checkpoint reads by range, and a quantized row costs a row',
     } finally { store.dispose(); }
   } finally { await source.close(); }
 });
+
+// This one needs no checkpoint of anyone's: the bundled tiny Qwen3 has a
+// quantized embedding table, which is all it asks for.
+const fixture = fileURLToPath(new URL('fixtures/tiny-qwen3.gguf', import.meta.url));
+
+test('a gathered row is an input, not a holding, and is never charged as one',
+  {skip: !await exists(fixture) && 'Needs tests/fixtures/tiny-qwen3.gguf'}, async () => {
+  const source = await fileSource(fixture);
+  try {
+    const probe = await openGGUF(source, 'model.gguf', null, {});
+    const table = probe.tensors.get('token_embd.weight');
+    const rowBytes = table.shape[1] * 4;
+    const norm = [...probe.tensors.values()].find(t => t.readable && t.shape.length === 1);
+    assert.ok(norm, 'the fixture has no vector to decode whole');
+    // A budget that holds three rows and the vector at once, and nothing more.
+    const limits = resolveLimits({maxDecodedBytes: 3 * rowBytes + norm.elements * 4});
+    const index = await openGGUF(source, 'model.gguf', null, limits);
+    const store = new WeightStore([index], limits);
+
+    // A decode step gathers its token's row, uses it and drops it. Charging
+    // each one to the budget would refuse the fourth token here, and a long
+    // conversation on a real budget, with nothing more held than at the first.
+    for (let i = 0; i < 100; i++) await store.rows(table.name, [i % table.shape[0]]);
+    assert.equal(index.decodedBytes, 0, 'no row is held, so none is charged');
+    assert.equal(index.bytesDecoded, 100 * rowBytes, 'every row was decoded, and that is counted');
+    const readForRows = index.bytesRead;
+    assert.ok(readForRows > 0);
+
+    // A single gather is still bounded: it is memory while it lasts.
+    const over = Math.floor(limits.maxDecodedBytes / rowBytes) + 1;
+    await assert.rejects(store.rows(table.name, Array.from({length: over}, (_, i) => i)),
+      new RegExp(`Gathering ${over} rows`));
+
+    // A whole tensor is handed out to be held, and is charged -- and the
+    // store's figure is the index's as it is now, not as it was at the start.
+    assert.equal(store.decodedBytes, 0);
+    await store.tensor(norm.name);
+    assert.equal(index.decodedBytes, norm.elements * 4);
+    assert.equal(store.decodedBytes, norm.elements * 4);
+    assert.equal(index.bytesDecoded, 100 * rowBytes + norm.elements * 4);
+    assert.equal(index.bytesRead, readForRows + norm.bytes);
+    store.dispose();
+  } finally { await source.close(); }
+});

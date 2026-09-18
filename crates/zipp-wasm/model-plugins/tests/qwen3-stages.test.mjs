@@ -37,6 +37,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile, open, stat, access} from 'node:fs/promises';
+import {createReadStream} from 'node:fs';
+import {createHash} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 
 import {PluginRegistry, openGGUF, WeightStore, bindGraph, prepareDecode, stepInputs,
@@ -74,7 +76,10 @@ const computeLimits = {
   maxWork: 200000000000, maxDimension: 1 << 21, maxSessions: 8, maxStepsPerRun: 64,
 };
 
-async function fileSource(path) {
+/** A file as a weight source. `flip`, when given, is a byte offset whose
+ * lowest bit reads inverted: the same file with one weight changed, without
+ * writing a second copy of a checkpoint to disk. */
+async function fileSource(path, flip) {
   const size = (await stat(path)).size;
   const handle = await open(path);
   return {
@@ -83,10 +88,24 @@ async function fileSource(path) {
       const out = new Uint8Array(length);
       const {bytesRead} = await handle.read(out, 0, length, offset);
       assert.equal(bytesRead, length, 'short read');
+      if (flip !== undefined && flip >= offset && flip < offset + length) out[flip - offset] ^= 1;
       return out;
     },
     close: () => handle.close(),
   };
+}
+
+/** The sha256 of what `fileSource(path, flip)` reads: what a host that opened
+ * that file would know it as. */
+async function digestOf(path, flip) {
+  const hash = createHash('sha256');
+  let at = 0;
+  for await (const chunk of createReadStream(path)) {
+    if (flip !== undefined && flip >= at && flip < at + chunk.length) chunk[flip - at] ^= 1;
+    hash.update(chunk);
+    at += chunk.length;
+  }
+  return hash.digest('hex');
 }
 
 /** Whether this is a real checkpoint or the tiny shape-only fixture.
@@ -768,7 +787,7 @@ test('a stage refuses a hidden state that is not its predecessor\u2019s',
       assert.ok(inputs.inputs, 'a matching stage should compose');
     });
 
-    await t.test('a different model with the same width is refused', async () => {
+    await t.test('a different configuration with the same width is refused', async () => {
       // Same hidden size, different epsilon: a checkpoint whose activations
       // are exactly as pluggable and exactly as wrong.
       const other = {...config, rms_norm_epsilon: config.rms_norm_epsilon * 2};
@@ -779,7 +798,88 @@ test('a stage refuses a hidden state that is not its predecessor\u2019s',
       assert.notEqual(impostor.config_digest, stage(0, cut).config_digest);
       await assert.rejects(
         stepInputs(tailPlan, store, {position: 0, hidden, from: impostor}),
-        /from a different model/);
+        /from a different configuration/);
+    });
+
+    await t.test('the same configuration with other weights is refused', async () => {
+      // The case a configuration digest cannot see: a fine-tune, or another
+      // quantization of one model, has every configuration field the same.
+      // Here that is this file with one bit of one head-stage weight changed.
+      // Only the host knows which file it opened, so the host attaches its
+      // sha256 when it prepares a stage, and a seam compares those.
+      const tensor = index.tensors.get('blk.0.attn_q.weight');
+      assert.ok(tensor, 'the fixture has no blk.0.attn_q.weight');
+      // Four-aligned, mid-tensor: the low bit of a quant or a mantissa, never
+      // an exponent, so the changed weight is still finite.
+      const flip = tensor.offset + 4 * Math.floor(tensor.bytes / 8);
+      const [ours, theirs] = [await digestOf(modelPath), await digestOf(modelPath, flip)];
+      assert.notEqual(ours, theirs);
+
+      const otherSource = await fileSource(modelPath, flip);
+      try {
+        const otherIndex = await openGGUF(otherSource, 'model.gguf', null, hostLimits);
+        const otherStore = new WeightStore([otherIndex], hostLimits);
+        const otherConfig = call('zipp_model_config',
+          [JSON.stringify(otherIndex.metadata()), JSON.stringify(vocab.length)]);
+        const headTemplate = c => call('zipp_model_decode_stage',
+          [JSON.stringify(c), JSON.stringify(CONTEXT), JSON.stringify(0), JSON.stringify(cut)]);
+        const tailTemplate = call('zipp_model_decode_stage',
+          [JSON.stringify(config), JSON.stringify(CONTEXT),
+           JSON.stringify(cut + 1), JSON.stringify(layers - 1)]);
+        const head = await prepareDecode(headTemplate(config), store, hostLimits, {checkpoint: ours});
+        const otherHead = await prepareDecode(headTemplate(otherConfig), otherStore, hostLimits,
+          {checkpoint: theirs});
+        const tail = await prepareDecode(tailTemplate, store, hostLimits, {checkpoint: ours});
+
+        // Two checkpoints, one configuration, genuinely different weights.
+        assert.equal(otherHead.manifest.config_digest, head.manifest.config_digest,
+          'the configurations are identical');
+        const weight = async s => s.residentDtype(tensor.name) === null
+          ? new Uint8Array((await s.tensor(tensor.name)).buffer) : (await s.blocks(tensor.name)).bytes;
+        assert.notDeepEqual(await weight(otherStore), await weight(store), 'the weights differ');
+        assert.equal(head.manifest.checkpoint_digest, ours);
+        assert.equal(headTemplate(config).manifest.checkpoint_digest, undefined,
+          'the plugin\u2019s own manifest is left as it was');
+
+        // Its own head composes; the other checkpoint's does not.
+        assert.ok((await stepInputs(tail, store, {position: 0, hidden, from: head.manifest})).inputs);
+        await assert.rejects(
+          stepInputs(tail, store, {position: 0, hidden, from: otherHead.manifest}),
+          /from a different checkpoint/);
+        // Nor does one that leaves the digest out, which would otherwise be
+        // the way past this check.
+        await assert.rejects(
+          stepInputs(tail, store, {position: 0, hidden, from: stage(0, cut)}),
+          /does not say which weights/);
+        // And a plan prepared without a digest cannot vouch for one it is sent.
+        await assert.rejects(
+          stepInputs(tailPlan, store, {position: 0, hidden, from: head.manifest}),
+          /prepared without a checkpoint digest/);
+        // The same checks hold for a chunk.
+        const tailChunk = await prepareDecode(call('zipp_model_decode_stage',
+          [JSON.stringify(config), JSON.stringify(CONTEXT),
+           JSON.stringify(cut + 1), JSON.stringify(layers - 1), JSON.stringify(null), JSON.stringify(4)]),
+          store, hostLimits, {checkpoint: ours});
+        const rows = new Float32Array(2 * config.hidden_size);
+        assert.ok((await stepInputs(tailChunk, store,
+          {position: 0, hidden: rows, count: 2, from: head.manifest})).inputs);
+        await assert.rejects(stepInputs(tailChunk, store,
+          {position: 0, hidden: rows, count: 2, from: otherHead.manifest}), /from a different checkpoint/);
+
+        // Which weights is the host's to say, never the plugin's.
+        const claimed = headTemplate(config);
+        claimed.manifest = {...claimed.manifest, checkpoint_digest: ours};
+        await assert.rejects(prepareDecode(claimed, store, hostLimits), /plugin cannot say which weights/);
+        await assert.rejects(prepareDecode(headTemplate(config), store, hostLimits, {checkpoint: 'abc'}),
+          /checkpoint digest is the sha256/);
+        const unstaged = headTemplate(config);
+        delete unstaged.manifest;
+        await assert.rejects(prepareDecode(unstaged, store, hostLimits, {checkpoint: ours}),
+          /Only a stage has a manifest/);
+        otherStore.dispose();
+        console.log(`      one configuration, checkpoints ${ours.slice(0, 12)} and ${theirs.slice(0, 12)}: ` +
+          'its own head composes, the other is refused');
+      } finally { await otherSource.close(); }
     });
 
     await t.test('and so is a stage that does not end where this one begins', async () => {

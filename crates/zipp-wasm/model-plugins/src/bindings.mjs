@@ -1,11 +1,5 @@
 import {check, fields, integer, shapeSize, sameShape} from './common.mjs';
-import {RESIDENT as RESIDENT_NAMES} from './gguf.mjs';
-
-/** The block format this tensor can stay in on a device, or null. */
-function residentFormat(weights, name) {
-  const dtype = typeof weights.residentDtype === 'function' ? weights.residentDtype(name) : null;
-  return dtype === null ? null : Object.values(RESIDENT_NAMES).find(f => f.dtype === dtype) ?? null;
-}
+import {RESIDENT as RESIDENT_NAMES, residentFormat} from './gguf.mjs';
 const OPS = new Set(['input', 'full', 'add', 'sub', 'mul', 'div', 'relu', 'positive', 'gelu', 'exp', 'log',
   'neg', 'tanh', 'sigmoid', 'sqrt', 'matmul', 'matmul_fixed', 'transpose', 'reshape', 'permute',
   'mean', 'sum', 'softmax', 'log_softmax']);
@@ -62,9 +56,9 @@ export async function bindGraph(template, weights, limits, {feed = {}, quantize 
     if (node.op === 'input') {
       fields(node, ['id', 'op', 'shape', 'data', 'dtype'], ['id', 'op', 'shape']);
       check(!Object.hasOwn(node, 'dtype'), 'FORMAT', 'A dtype comes from a blocks or fixed binding, not from the template');
-      // A blocks or fixed binding charges what it actually costs, below;
-      // everything else is four bytes a value.
-      if (!['blocks', 'fixed'].includes(byNode.get(id)?.kind)) {
+      // A matrix, blocks or fixed binding charges what it actually costs,
+      // below; everything else is four bytes a value.
+      if (!['matrix', 'blocks', 'fixed'].includes(byNode.get(id)?.kind)) {
         inputBytes += shapeSize(node.shape, limits) * 4;
         check(inputBytes <= limits.maxBoundInputBytes, 'LIMIT', 'Bound graph inputs exceed budget');
       }

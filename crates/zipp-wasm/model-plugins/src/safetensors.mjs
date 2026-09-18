@@ -76,15 +76,16 @@ export async function openSafetensors(source, path, overrides = {}) {
 }
 /** Per-session cache. Pending reads share one promise and cannot revive a disposed store. */
 export class WeightStore {
-  #byName = new Map(); #pending = new Map(); #disposed = false;
+  #byName = new Map(); #pending = new Map(); #disposed = false; #indexes;
   constructor(indexes, limits) {
+    this.#indexes = [...indexes];
     // `decodedBytes` is what an index has decoded so far. A Safetensors index
     // decodes everything it holds, so it reports its whole size here and this
     // sum is the real check. A GGUF index decodes on demand and starts at zero,
     // enforcing the same budget itself as it decodes -- opening a checkpoint you
     // will only read rows of should not cost what decoding all of it would.
     let decoded = 0, bytes = 0;
-    for (const index of indexes) {
+    for (const index of this.#indexes) {
       decoded += index.decodedBytes; bytes += index.size;
       check(decoded <= limits.maxDecodedBytes && bytes <= limits.maxModelBytes, 'LIMIT', 'Aggregate model budget exceeded');
       for (const [name, info] of index.tensors) {
@@ -93,7 +94,11 @@ export class WeightStore {
         check(this.#byName.size <= limits.maxTensors, 'LIMIT', 'Aggregate tensor count exceeded');
       }
     }
-    this.decodedBytes = decoded;
+  }
+  /** What the indexes have decoded so far, read now rather than at
+   * construction: a GGUF index starts at zero and grows as it decodes. */
+  get decodedBytes() {
+    return this.#indexes.reduce((sum, index) => sum + index.decodedBytes, 0);
   }
   info(name) {
     check(!this.#disposed, 'DISPOSED', 'Weights have been disposed');

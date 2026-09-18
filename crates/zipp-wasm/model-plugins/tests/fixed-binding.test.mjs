@@ -17,7 +17,8 @@ import assert from 'node:assert/strict';
 import {open, stat, access} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 
-import {openGGUF, WeightStore, resolveLimits, bindGraph} from '../src/index.mjs';
+import {openGGUF, WeightStore, resolveLimits, bindGraph, prepareDecode} from '../src/index.mjs';
+import {residentFormat} from '../src/gguf.mjs';
 
 const modelPath = process.env.ZIPP_QWEN3_MODEL
   ?? fileURLToPath(new URL('fixtures/tiny-qwen3.gguf', import.meta.url));
@@ -179,7 +180,7 @@ test('a weight bound for matmul_fixed gives the same bits either way',
     });
 
     await t.test('one tensor, two bindings, read and quantized once', async () => {
-      const tensor = quantized ?? plain;
+      const tensor = quantized;
       const shape = store.info(tensor.name).shape;
       // A store that counts what the binding asks it for. Quantising is the
       // expensive half of binding a large checkpoint; doing it twice because
@@ -195,7 +196,7 @@ test('a weight bound for matmul_fixed gives the same bits either way',
     });
 
     await t.test('refusals: the quantizer, the scale shape, and the byte budget', async () => {
-      const tensor = quantized ?? plain;
+      const tensor = quantized;
       const shape = store.info(tensor.name).shape, [n, k] = shape;
       // Without the injected quantizer the binding says so, rather than failing
       // somewhere inside on an undefined call.
@@ -217,6 +218,63 @@ test('a weight bound for matmul_fixed gives the same bits either way',
       if (store.residentDtype(tensor.name) !== null) {
         await bindGraph(runTimeTemplate(tensor.name, shape, 'blocks'), store, tight);
       }
+    });
+
+    await t.test('the byte budget is charged once a binding, and before anything is read', async () => {
+      const tensor = quantized, shape = store.info(tensor.name).shape, [n, k] = shape;
+      const format = residentFormat(store, tensor.name);
+      const blockBytes = (n * k / format.block) * format.bytes;
+      // A store that counts what it is asked for, so "refused before reading"
+      // is observed rather than inferred from the error.
+      let reads = 0;
+      const counting = Object.create(store);
+      counting.info = name => store.info(name);
+      counting.residentDtype = name => store.residentDtype(name);
+      counting.blocks = async name => { reads++; return store.blocks(name); };
+      counting.tensor = async name => { reads++; return store.tensor(name); };
+      const budget = bytes => ({...hostLimits, maxBoundInputBytes: bytes});
+
+      // A matrix kept as blocks costs its blocks. It was once charged four
+      // bytes a value as well, as if it were decoded and resident at once.
+      const literal = m * k * 4;
+      await bindGraph(runTimeTemplate(tensor.name, shape, 'matrix'), counting, budget(literal + blockBytes));
+      await assert.rejects(bindGraph(runTimeTemplate(tensor.name, shape, 'matrix'), counting,
+        budget(literal + blockBytes - 1)), /Bound graph inputs exceed budget/);
+
+      // The decode path is held to the same budget at the same rates, and it
+      // is where the budget matters most: a stage's weights are read and, for
+      // a fixed binding, quantized there, all before a single step runs.
+      const activation = Array.from({length: k}, (_, i) => ((i * 23) % 17) / 32 - 0.25);
+      const decode = (weight, kinds) => ({
+        version: 1, kind: 'decode', context: 8,
+        graph: {version: 2, nodes: [{id: 0, op: 'input', shape: [1, k], data: activation}, ...weight],
+          outputs: [{name: 'logits', id: weight[weight.length - 1].id}]},
+        bindings: kinds.map((kind, i) => ({node: i + 1, kind, tensor: tensor.name})),
+      });
+      const fixed = () => decode([
+        {id: 1, op: 'input', shape: [n, k]},
+        {id: 2, op: 'input', shape: [n]},
+        {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true}], ['fixed', 'fixed_scales']);
+      const blocks = () => decode([
+        {id: 1, op: 'input', shape: [n, k]},
+        {id: 2, op: 'matmul', a: 0, b: 1, transposed: true}], ['blocks']);
+      const fixedBytes = k * 4 + n * k * 2 + n * 4;
+
+      reads = 0;
+      await assert.rejects(prepareDecode(fixed(), counting, budget(fixedBytes - 1), {quantize: quantizeWeight}),
+        /Bound graph inputs exceed budget/);
+      assert.equal(reads, 0, 'a plan over budget was refused after reading its weight');
+      await assert.rejects(prepareDecode(blocks(), counting, budget(k * 4 + blockBytes - 1)),
+        /Bound graph inputs exceed budget/);
+      assert.equal(reads, 0, 'a plan over budget was refused after reading its weight');
+
+      // Exactly the budget is admitted, and then the weight is read, once.
+      await prepareDecode(fixed(), counting, budget(fixedBytes), {quantize: quantizeWeight});
+      assert.equal(reads, 1);
+      await prepareDecode(blocks(), counting, budget(k * 4 + blockBytes));
+      assert.equal(reads, 2);
+      // And the int16 quants are the dearer form, as in the eager path.
+      assert.ok(n * k * 2 > blockBytes);
     });
   } finally { store.dispose(); await source.close(); }
 });

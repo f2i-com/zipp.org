@@ -43,6 +43,13 @@ export const RESIDENT = Object.freeze({
   Q6_K: Object.freeze({dtype: 'q6_k', block: 256, bytes: 210}),
 });
 
+/** The block format `weights` keeps `name` in -- its dtype, values a block and
+ * bytes a block -- or null if the tensor has to be decoded to float32. */
+export function residentFormat(weights, name) {
+  const dtype = typeof weights.residentDtype === 'function' ? weights.residentDtype(name) : null;
+  return dtype === null ? null : Object.values(RESIDENT).find(f => f.dtype === dtype) ?? null;
+}
+
 /** Read the header by doubling until it parses: its size depends on how large
  * the tokenizer vocabulary embedded in the metadata is, which is not known
  * before reading it. */
@@ -114,10 +121,21 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
     }));
   }
 
-  // Charged as tensors are decoded, so the budget bounds real memory rather
-  // than a hypothetical. `resident` is the same idea for blocks handed over
-  // undecoded, which cost what the file costs.
-  let decoded = 0, resident = 0;
+  // Two kinds of count. `decoded` and `resident` are what the budgets are
+  // charged with: every whole tensor handed out, as float32 or as its own
+  // blocks, for a caller to hold -- a weight store caches it, a prepared plan
+  // uploads it. Each call returns a fresh copy, so each is charged; the index
+  // cannot see a caller let one go, so these are an upper bound on what is
+  // held rather than a live figure.
+  //
+  // A gathered row is not held. It is one token's embedding, copied into that
+  // step's inputs and dropped, and charging it here would grow the count by a
+  // row a token until a long-running host refused its next token with its
+  // memory exactly as it was. So a gather is bounded on its own and not
+  // accumulated. `bytesRead` and `bytesDecoded` are the other kind: everything
+  // this index has read from the file and produced as float32, rows included,
+  // for a host that wants to know what the work cost.
+  let decoded = 0, resident = 0, bytesRead = 0, bytesDecoded = 0;
   function charge(elements, name) {
     decoded += elements * 4;
     check(decoded <= limits.maxDecodedBytes, 'LIMIT',
@@ -127,12 +145,14 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
     integer(length, 0, limits.maxModelFileBytes, 'Tensor bytes');
     const data = await source.read(path, offset, length);
     check(data instanceof Uint8Array && data.byteLength === length, 'SOURCE', 'Short or invalid read');
+    bytesRead += length;
     return data;
   }
   function checked(values, expected, name) {
     check(values instanceof Float32Array || Array.isArray(values), 'SOURCE', 'Expected float data');
     const out = values instanceof Float32Array ? values : Float32Array.from(values);
     check(out.length === expected, 'SHAPE', `Dequantized ${name} has ${out.length} of ${expected} elements`);
+    bytesDecoded += out.length * 4;
     for (let i = 0; i < out.length; i++) {
       // The graph protocol admits finite float32 only, and a corrupt block
       // reads as a plausible tensor full of infinities rather than an error.
@@ -153,6 +173,9 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
     // nothing has been decoded yet.
     get decodedBytes() { return decoded; },
     get residentBlockBytes() { return resident; },
+    // Cumulative, and never charged: see above.
+    get bytesRead() { return bytesRead; },
+    get bytesDecoded() { return bytesDecoded; },
     fullyDecodedBytes,
     /**
      * The tokenizer this checkpoint was trained with, built inside the module.
@@ -200,7 +223,9 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
       const entry = info(name);
       check(entry.shape.length === 2, 'SHAPE', `Row gathering needs a matrix: ${name}`);
       const width = entry.shape[1];
-      charge(indices.length * width, name);
+      // Bounded, not accumulated: a gather is a step's input, not a holding.
+      check(indices.length * width * 4 <= limits.maxDecodedBytes, 'LIMIT',
+        `Gathering ${indices.length} rows of ${name} would pass the decoded-weight budget of ${limits.maxDecodedBytes} bytes`);
       const out = new Float32Array(indices.length * width);
       for (let i = 0; i < indices.length; i++) {
         integer(indices[i], 0, entry.shape[0] - 1, 'Row index');
