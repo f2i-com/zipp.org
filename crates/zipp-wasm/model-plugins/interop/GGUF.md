@@ -214,3 +214,41 @@ plugin for its architecture — `gemma3`, `qwen3`, whatever `general.architectur
 says — because the tensor names, the attention shape and the tokenizer are that
 family's, not the format's. `../plugins/gpt-neo/` is what one of those looks
 like, and `interop/` is the other way of writing one.
+
+## Running part of a model
+
+`build_decode_stage(config, context, first_layer, last_layer)` builds the same
+decode step over an inclusive range of layers rather than all of them, and
+`build_decode_graph` is that function over every layer -- so the whole model
+stays the definition of what the stages have to add up to.
+
+What crosses between two stages is the residual stream and nothing else:
+
+```
+stage A: token  -> layers 0..13  -> hidden [1, 1024]
+                                       |
+                       4 KB a token, while 372 MB stays put
+                                       v
+stage B: hidden -> layers 14..27 -> logits [1, 151936]
+```
+
+It is the residual rather than anything normalised because every block
+normalises its own input, so a stage can be handed one and carry on as though
+it had computed it. The caches do not cross: `k12` and `v12` belong to whichever
+stage runs layer 12 and are read by nothing else, which is why those names carry
+absolute layer indices.
+
+`tensor_names(config, first, last)` takes the same range, and that is the part
+that makes a peer's share real -- it is told to load eleven tensors a layer for
+its own layers and nothing else, so "this device holds part of the model"
+describes what it read rather than what it happens to use.
+
+`tests/qwen3-stages.test.mjs` holds two stages to the whole model's logits **bit
+for bit**, at every position, with the hidden state round-tripped through a
+structured clone on the way. Equality rather than a tolerance is the point:
+nothing in a seam should compute, so anything other than equality would mean it
+does.
+
+None of this is a peer protocol. There is no discovery, no routing and no
+multi-stage driver here -- only a model that can be divided, and the evidence
+that dividing it changes no arithmetic.
