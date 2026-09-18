@@ -7,13 +7,12 @@ directory, and it also extends `gpu-lab`'s backends with quantized matmul and
 points `rust/` at the external `f2i-gguf-quants` crate so a kernel decodes blocks
 the way the reader does. It does not modify the landing-page build or change SoftN.
 
-348 standalone Node tests (89 here, 259 in `gpu-lab`), 30 CPython/NumPy tests and
+415 standalone Node tests (136 here, 279 in `gpu-lab`), 30 CPython/NumPy tests and
 the full-checkout gates pass in this repository: the plugin's graphs run through
 the current ZIPP Graph v2 validator and CPU backend, and the plugin's Python
 compiles and generates inside a locally built Python-enabled ZIPP WASM engine,
-matching the stored PyTorch reference in both cases. Three suites need a checkpoint
-on disk and skip without one, since none is redistributed here; that is 71 tests
-rather than 89.
+matching the stored PyTorch reference in both cases. Some suites need a checkpoint
+on disk and skip without one, since none is redistributed here.
 
 Browser and GPU acceptance **have** since run for the fixture and GPT-Neo models:
 complete logit tensors on all four backends within 5e-5 of stored PyTorch, and the
@@ -293,6 +292,18 @@ browser, which is `gpu-lab/scripts/check-gpu-matmul.cjs` rather than a recorded
 gate. For Qwen3-0.6B that is 373 MB
 resident rather than 2,274 MB. Anything else still arrives dequantized. See
 [interop/GGUF.md](interop/GGUF.md) for the protocol and the measurements.
+
+A weight can also be bound for `matmul_fixed`, the integer-accumulation product
+that reaches the same answer on every backend by construction rather than by
+agreeing about float32 rounding order. The `fixed` and `fixed_scales` bindings
+quantize the tensor to int16 once, here, instead of on every decode step: two
+bindings over one tensor, which is read and quantized a single time. Both
+`bindGraph` and `prepareDecode` take them, and both need the quantizer passed in
+as `{quantize}` -- `quantizeWeight` from `gpu-lab` -- because this package does
+not depend on the compute runtime and a second copy of that arithmetic is the
+one thing not to have. It costs 3.56 times what the same weight costs as Q4_K
+blocks, and at one token a step it is faster than the float32 matmul it
+replaces. `gpu-lab/docs/FIXED-POINT.md` has the measurements.
 
 ## Next model milestone
 

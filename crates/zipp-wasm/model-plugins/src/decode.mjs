@@ -84,7 +84,7 @@ export function validateDecodeTemplate(template, limits) {
  * Resolve a decode template into a program `runtime.prepare` accepts, plus the
  * per-step plan the caller feeds it. Weight reads happen once, here.
  */
-export async function prepareDecode(template, weights, limits) {
+export async function prepareDecode(template, weights, limits, {quantize = null} = {}) {
   const {graph, outputs} = validateDecodeTemplate(template, limits);
   const byNode = new Map();
   for (const binding of template.bindings) {
@@ -152,6 +152,25 @@ export async function prepareDecode(template, weights, limits) {
       check(sameShape(binding.transpose ? [shape[1], shape[0]] : shape, node.shape), 'SHAPE',
         `Weight shape mismatch: ${binding.tensor}`);
       check(!Object.hasOwn(node, 'carry'), 'FORMAT', 'A weight is static, not carried');
+    } else if (binding.kind === 'fixed' || binding.kind === 'fixed_scales') {
+      // `matmul_fixed`'s bind-time form, in the path where it pays: a decode
+      // step is one token, so quantising the weight per step costs more than
+      // the product does. Quantized once here instead, and held like any other
+      // static weight. Two bindings over one tensor -- the quants as `b` and
+      // their per-row scales as `c` -- and the tensor is read once for both.
+      fields(binding, ['node', 'kind', 'tensor'], ['node', 'kind', 'tensor']);
+      check(typeof quantize === 'function', 'HOST',
+        'A fixed binding needs the quantizer: pass {quantize}, which is quantizeWeight from gpu-lab, to prepareDecode');
+      const info = weights.info(binding.tensor);
+      check(info.shape.length === 2, 'SHAPE', `A weight matrix is rank two: ${binding.tensor}`);
+      check(!Object.hasOwn(node, 'carry'), 'FORMAT', 'A weight is static, not carried');
+      if (binding.kind === 'fixed') {
+        check(sameShape(info.shape, node.shape), 'SHAPE',
+          `${binding.tensor} is ${JSON.stringify(info.shape)}, not ${JSON.stringify(node.shape)}`);
+      } else {
+        check(sameShape(node.shape, [info.shape[0]]), 'SHAPE',
+          `${binding.tensor} has ${info.shape[0]} rows, so its scales are [${info.shape[0]}], not ${JSON.stringify(node.shape)}`);
+      }
     } else if (binding.kind === 'zeros') {
       fields(binding, ['node', 'kind'], ['node', 'kind']);
       check(Object.hasOwn(node, 'carry'), 'FORMAT', 'A zeroed input is only useful as a carried cache');
@@ -191,8 +210,22 @@ export async function prepareDecode(template, weights, limits) {
   check(steps.some(step => step.slot === 'write') === carries.size > 0, 'FORMAT',
     'A cache that is carried must be written, and a write needs a cache');
   // Weights and zeroed caches become the plan's static data, uploaded once.
+  // A tensor bound as `fixed` is quantized once and kept, so that naming it for
+  // both its quants and its scales reads and quantizes it a single time.
+  const quantized = new Map();
   for (const [id, binding] of byNode) {
-    if (binding.kind === 'matrix' || binding.kind === 'blocks') {
+    if (binding.kind === 'fixed' || binding.kind === 'fixed_scales') {
+      const [n, k] = weights.info(binding.tensor).shape;
+      if (!quantized.has(binding.tensor)) {
+        const resident = residentDtype(weights, binding.tensor);
+        quantized.set(binding.tensor, resident
+          ? await weights.blocks(binding.tensor).then(({dtype, bytes}) => quantize(bytes, n, k, dtype))
+          : quantize(await weights.tensor(binding.tensor), n, k, 'f32'));
+      }
+      const {quants, scales} = quantized.get(binding.tensor);
+      if (binding.kind === 'fixed') { nodes[id].dtype = 'i16'; nodes[id].data = quants; }
+      else nodes[id].data = scales;
+    } else if (binding.kind === 'matrix' || binding.kind === 'blocks') {
       if (residentDtype(weights, binding.tensor) !== null) {
         const {dtype, bytes} = await weights.blocks(binding.tensor);
         nodes[id].dtype = dtype;

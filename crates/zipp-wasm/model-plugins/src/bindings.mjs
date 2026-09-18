@@ -7,12 +7,31 @@ function residentFormat(weights, name) {
   return dtype === null ? null : Object.values(RESIDENT_NAMES).find(f => f.dtype === dtype) ?? null;
 }
 const OPS = new Set(['input', 'full', 'add', 'sub', 'mul', 'div', 'relu', 'positive', 'gelu', 'exp', 'log',
-  'neg', 'tanh', 'sigmoid', 'sqrt', 'matmul', 'transpose', 'reshape', 'permute', 'mean', 'sum', 'softmax', 'log_softmax']);
+  'neg', 'tanh', 'sigmoid', 'sqrt', 'matmul', 'matmul_fixed', 'transpose', 'reshape', 'permute',
+  'mean', 'sum', 'softmax', 'log_softmax']);
 
 /** Resolve only data bindings. The returned object is still passed through
  * the existing ZIPP graph validator by runtime.execute(). No validation bypass.
  */
-export async function bindGraph(template, weights, limits, {feed = {}} = {}) {
+export async function bindGraph(template, weights, limits, {feed = {}, quantize = null} = {}) {
+  // `quantize` is gpu-lab's `quantizeWeight`, handed in rather than imported.
+  // This package does not depend on the compute runtime -- the caller supplies
+  // that too -- and the alternative is a second copy of a quantisation that has
+  // to stay bit-identical to the one four backends implement. One authority,
+  // passed in, is the same arrangement `runtime` already has.
+  const quantized = new Map();
+  const quantizeOnce = async (tensor, n, k) => {
+    if (quantized.has(tensor)) return quantized.get(tensor);
+    const format = residentFormat(weights, tensor);
+    // Quantized in the file or not, what is quantized is the values, so the
+    // blocks are read as blocks where that is possible and decoded where it is
+    // not. Either way the result is what those values quantize to.
+    const result = format
+      ? await weights.blocks(tensor).then(({dtype, bytes}) => quantize(bytes, n, k, dtype))
+      : quantize(await weights.tensor(tensor), n, k, 'f32');
+    quantized.set(tensor, result);
+    return result;
+  };
   // `stage` is optional and says which layers this graph covers, for a graph
   // that is part of a model rather than all of it.
   fields(template, ['version', 'graph', 'bindings', 'stage', 'manifest'],
@@ -42,10 +61,10 @@ export async function bindGraph(template, weights, limits, {feed = {}} = {}) {
     if (Object.hasOwn(node, 'shape')) shapeSize(node.shape, limits);
     if (node.op === 'input') {
       fields(node, ['id', 'op', 'shape', 'data', 'dtype'], ['id', 'op', 'shape']);
-      check(!Object.hasOwn(node, 'dtype'), 'FORMAT', 'A dtype comes from a blocks binding, not from the template');
-      // A blocks binding charges what its blocks cost, below; everything else
-      // is four bytes a value.
-      if (byNode.get(id)?.kind !== 'blocks') {
+      check(!Object.hasOwn(node, 'dtype'), 'FORMAT', 'A dtype comes from a blocks or fixed binding, not from the template');
+      // A blocks or fixed binding charges what it actually costs, below;
+      // everything else is four bytes a value.
+      if (!['blocks', 'fixed'].includes(byNode.get(id)?.kind)) {
         inputBytes += shapeSize(node.shape, limits) * 4;
         check(inputBytes <= limits.maxBoundInputBytes, 'LIMIT', 'Bound graph inputs exceed budget');
       }
@@ -101,6 +120,30 @@ export async function bindGraph(template, weights, limits, {feed = {}} = {}) {
       // What the device actually holds, which is the point of binding this way.
       inputBytes += (shapeSize(node.shape, limits) / format.block) * format.bytes;
       check(inputBytes <= limits.maxBoundInputBytes, 'LIMIT', 'Bound graph inputs exceed budget');
+    } else if (b.kind === 'fixed' || b.kind === 'fixed_scales') {
+      // `matmul_fixed`'s bind-time form: the weight quantized to int16 once,
+      // here, instead of on every step. Two bindings over one tensor, because
+      // the quants and their per-row scales are two graph inputs -- the weight
+      // as `b` and the scales as `c`. They are quantized together and cached,
+      // so naming the tensor twice reads and quantizes it once.
+      fields(b, ['node', 'kind', 'tensor'], ['node', 'kind', 'tensor']);
+      check(typeof quantize === 'function', 'HOST',
+        'A fixed binding needs the quantizer: pass {quantize}, which is quantizeWeight from gpu-lab, to bindGraph');
+      const info = weights.info(b.tensor);
+      check(info.shape.length === 2, 'SHAPE', `A weight matrix is rank two: ${b.tensor}`);
+      if (b.kind === 'fixed') {
+        // Stored layout, like `blocks`: the quants run along K in the order the
+        // file has them, and the graph's matmul_fixed carries `transposed`.
+        check(sameShape(info.shape, node.shape), 'SHAPE',
+          `${b.tensor} is ${JSON.stringify(info.shape)}, not ${JSON.stringify(node.shape)}`);
+        // Two bytes a value, which is the whole trade and is charged as such:
+        // 3.56 times what the same weight costs as Q4_K blocks.
+        inputBytes += shapeSize(node.shape, limits) * 2;
+        check(inputBytes <= limits.maxBoundInputBytes, 'LIMIT', 'Bound graph inputs exceed budget');
+      } else {
+        check(sameShape(node.shape, [info.shape[0]]), 'SHAPE',
+          `${b.tensor} has ${info.shape[0]} rows, so its scales are [${info.shape[0]}], not ${JSON.stringify(node.shape)}`);
+      }
     } else if (b.kind === 'rows') {
       fields(b, ['node', 'kind', 'tensor', 'indices'], ['node', 'kind', 'tensor', 'indices']);
       const info = weights.info(b.tensor);
@@ -160,6 +203,12 @@ export async function bindGraph(template, weights, limits, {feed = {}} = {}) {
         // Decoded, but still in the stored layout: the matmul transposes.
         nodes[id].data = await weights.tensor(b.tensor);
       }
+    }
+    else if (b.kind === 'fixed' || b.kind === 'fixed_scales') {
+      const [n, k] = weights.info(b.tensor).shape;
+      const {quants, scales} = await quantizeOnce(b.tensor, n, k);
+      if (b.kind === 'fixed') { nodes[id].dtype = 'i16'; nodes[id].data = quants; }
+      else nodes[id].data = scales;
     }
     else if (b.kind === 'feed') {
       nodes[id].data = feed[b.name];

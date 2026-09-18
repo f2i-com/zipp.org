@@ -250,11 +250,18 @@ GPU backend where the emulation is the whole of the work.
   is the right failure, not a silent one. A Python implementation would be a
   third numeric path to keep exact, and there is no caller for it yet.
 - **The Qwen3 model plugin**, which still emits `matmul`. Deliberately: the
-  operation is proven on its own before a whole model moves onto it. When it
-  does, `bindGraph` is where `quantizeWeight` belongs — it already walks every
-  weight once — and the decision of *which* weights get the `i16` treatment is a
-  memory budget, not a correctness question. A stage can mix the two forms
-  freely, because they give the same answer.
+  operation is proven on its own before a whole model moves onto it.
+
+  The binding underneath it is in place. `model-plugins` has `fixed` and
+  `fixed_scales` bindings in both `bindGraph` and `prepareDecode`, which quantize
+  a tensor once and hand the graph its quants and its scales; the quantizer is
+  passed in as `{quantize}` rather than imported, because that package does not
+  depend on this one and a second copy of this arithmetic is the one thing not to
+  have. What is left is a plugin that emits `matmul_fixed` with those bindings,
+  and the decision of *which* weights get the `i16` treatment — which is a memory
+  budget rather than a correctness question, and differs between a hosted stage
+  and a browser peer. A stage can mix the two forms freely, because they give the
+  same answer.
 
 ## Where this goes
 
