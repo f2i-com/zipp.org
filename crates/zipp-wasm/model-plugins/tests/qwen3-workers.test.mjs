@@ -57,6 +57,9 @@ const COMPUTE = {
 // A dead worker never answers, so every round-trip is bounded. Without this a
 // peer going away is a test that hangs rather than a test that fails.
 const REPLY_TIMEOUT = 120000;
+// Starting a stage reads the model and uploads its weights, so it is slower
+// than a step and still must not be unbounded.
+const START_TIMEOUT = 300000;
 
 async function fileSource(path) {
   const size = (await stat(path)).size;
@@ -99,11 +102,26 @@ class StagePeer {
     });
   }
   static async start(options) {
+    // Bounded, and closed on every way a worker can fail to arrive. A harness
+    // for testing failure that can itself hang is not testing failure -- and a
+    // worker that dies during startup emits `exit` without ever emitting
+    // `error`, so waiting on `message` and `error` alone waits forever.
     const worker = new Worker(workerURL, {workerData: options});
-    await new Promise((resolve, reject) => {
-      worker.once('message', resolve);
-      worker.once('error', reject);
-    });
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`stage ${options.first}..${options.last} never started`)),
+          START_TIMEOUT);
+        const settle = fn => value => { clearTimeout(timer); fn(value); };
+        worker.once('message', settle(resolve));
+        worker.once('error', settle(reject));
+        worker.once('exit', settle(code =>
+          reject(new Error(`stage ${options.first}..${options.last} exited during startup (code ${code})`))));
+      });
+    } catch (error) {
+      await worker.terminate().catch(() => {});
+      throw error;
+    }
     return new StagePeer(worker, options);
   }
   ask(message, transfer = []) {

@@ -595,3 +595,98 @@ async function runtime0(runtimes, createRuntime, kernels) {
   runtimes.push(runtime);
   return runtime;
 }
+
+test('a later stage is told a length, not the prompt', {skip: !ready && reason}, async t => {
+  // What crosses to a peer should be what it can use. A stage running layers
+  // 20..27 never looks a token up -- it needs the prompt's *shape*, and
+  // sending it the ids would be handing over the text to establish a
+  // dimension. So the seam is activations plus a length, and the plugin
+  // refuses the combinations that would make that untrue.
+  const zipp = await import(engineURL);
+  await zipp.default({module_or_path: await readFile(wasmURL)});
+  const {createRuntime} = await import(runtimeURL);
+
+  const plugin = await new PluginRegistry().install(
+    await sourceDirectory('../plugins/qwen3/'), {approve: () => true});
+  const source = await fileSource(modelPath);
+  const index = await openGGUF(source, 'model.gguf', null, hostLimits);
+  const store = new WeightStore([index], hostLimits);
+  const engine = new zipp.Engine();
+  const runtimes = [];
+  try {
+    engine.setSyncHostCapabilities([]);
+    engine.setInstructionBudget(hostLimits.instructionBudget);
+    engine.initPythonProject({...plugin.files}, plugin.entry, []);
+    const call = (name, args) => {
+      engine.renewInstructionBudget();
+      return JSON.parse(engine.pythonCall(name, args));
+    };
+    const vocab = index.strings('tokenizer.ggml.tokens');
+    const config = call('zipp_model_config',
+      [JSON.stringify(index.metadata()), JSON.stringify(vocab.length)]);
+    const layers = config.num_layers, cut = Math.floor(layers / 2) - 1;
+    const tokens = [...index.tokenizer().encode('The capital of France is')];
+    const kernels = await readFile(kernelsURL);
+    const runtime = await runtime0(runtimes, createRuntime, kernels);
+
+    await t.test('a length builds the same graph the token list did', async () => {
+      const byTokens = call('zipp_model_prefill_stage',
+        [JSON.stringify(config), JSON.stringify(tokens),
+         JSON.stringify(cut + 1), JSON.stringify(layers - 1)]);
+      const byLength = call('zipp_model_prefill_stage',
+        [JSON.stringify(config), JSON.stringify(tokens.length),
+         JSON.stringify(cut + 1), JSON.stringify(layers - 1)]);
+      assert.deepEqual(byLength, byTokens,
+        'the ids changed a graph that is not supposed to read them');
+    });
+
+    await t.test('the first stage still needs the ids, and says so', () => {
+      assert.throws(() => call('zipp_model_prefill_stage',
+        [JSON.stringify(config), JSON.stringify(tokens.length),
+         JSON.stringify(0), JSON.stringify(cut)]),
+        /looks tokens up and needs their ids/);
+    });
+
+    await t.test('and a length-only stage composes into the same logits', async () => {
+      const head = await bindGraph(call('zipp_model_prefill_stage',
+        [JSON.stringify(config), JSON.stringify(tokens),
+         JSON.stringify(0), JSON.stringify(cut)]), store, hostLimits);
+      const hidden = acrossTheSeam(
+        (await runtime.execute(head, {typedOutputs: true})).outputs.hidden.data);
+      // The tail is given a number, and nothing else about the prompt.
+      const tail = await bindGraph(call('zipp_model_prefill_stage',
+        [JSON.stringify(config), JSON.stringify(tokens.length),
+         JSON.stringify(cut + 1), JSON.stringify(layers - 1)]),
+        store, hostLimits, {feed: {hidden}});
+      const split = (await runtime.execute(tail, {typedOutputs: true})).outputs.logits.data;
+      const want = (await runtime.execute(await bindGraph(call('zipp_model_graph',
+        [JSON.stringify(config), JSON.stringify(tokens)]), store, hostLimits),
+        {typedOutputs: true})).outputs.logits.data;
+      for (let i = 0; i < want.length; i++) {
+        if (!Object.is(split[i], want[i])) assert.fail(`logit ${i}: ${split[i]} vs ${want[i]}`);
+      }
+      console.log('      a tail stage given only a length reproduces the model exactly');
+    });
+
+    await t.test('a layer index that is not an integer is refused, not rounded', () => {
+      // Coercion at a boundary between machines is how a peer ends up running
+      // a range nobody asked for and saying nothing about it.
+      // null is not in this list: it is how a caller says "unspecified", and
+      // means the default end of the model rather than a coerced index.
+      for (const bad of [3.7, '5', true]) {
+        assert.throws(() => call('zipp_model_decode_stage',
+          [JSON.stringify(config), JSON.stringify(CONTEXT),
+           JSON.stringify(bad), JSON.stringify(layers - 1)]),
+          /must be an integer|Invalid layer range/,
+          `first_layer ${JSON.stringify(bad)}`);
+      }
+      assert.throws(() => call('zipp_model_decode_stage',
+        [JSON.stringify(config), JSON.stringify(CONTEXT),
+         JSON.stringify(layers - 1), JSON.stringify(0)]), /Invalid layer range/);
+    });
+  } finally {
+    for (const r of runtimes) await r?.dispose?.();
+    engine.free?.();
+    await source.close();
+  }
+});

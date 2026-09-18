@@ -233,8 +233,18 @@ def layer_range(config, first_layer=None, last_layer=None):
     graph that binds tensors the checkpoint does not have.
     """
     total = config["num_layers"]
-    first = 0 if first_layer is None else int(first_layer)
-    last = total - 1 if last_layer is None else int(last_layer)
+
+    def exact(value, what):
+        # Strict rather than coercive, because this is a boundary between
+        # machines. `int(3.7)` is 3 and `int("5")` is 5, and a peer told to run
+        # layers 3.7..9 would run a range nobody asked for and say nothing. A
+        # bool is an int in Python and is refused here for the same reason.
+        if isinstance(value, bool) or type(value) is not int:
+            raise ValueError(what + " must be an integer, got " + repr(value))
+        return value
+
+    first = 0 if first_layer is None else exact(first_layer, "first_layer")
+    last = total - 1 if last_layer is None else exact(last_layer, "last_layer")
     if not 0 <= first <= last < total:
         raise ValueError("Invalid layer range: " + str(first) + ".." + str(last) +
                          " of " + str(total) + " layers")
@@ -374,7 +384,7 @@ def _prefill_inputs(g, config, length):
     }
 
 
-def build_prefill_stage(config, tokens, first_layer=None, last_layer=None):
+def build_prefill_stage(config, prompt, first_layer=None, last_layer=None):
     """A prompt through layers [first_layer, last_layer].
 
     A peer holding part of a model has to prefill as well as decode -- the
@@ -385,18 +395,37 @@ def build_prefill_stage(config, tokens, first_layer=None, last_layer=None):
     stream for the whole prompt is [length, hidden_size], 20 KB for five tokens
     on this model, against weights that do not move at all.
 
-    A stage that does not start at layer 0 still needs the token list, because
-    the prompt's length is the shape of everything inside it -- but it never
-    looks a token up, and is not bound the embedding table.
+    ## What a stage is told
+
+    Only the first stage is given the prompt, because only the first stage
+    looks a token up. Every later one takes a *length*: the shape of the
+    residual stream it will be handed, which is all it can use. Passing the
+    token ids to a peer that runs layers 20..27 would be sending it the
+    prompt's contents to establish a dimension -- the model would still be
+    right, and the seam would quietly be carrying more than it needs to.
+
+    So `prompt` is a list of ids for a stage beginning at layer 0, and an
+    integer length for one that does not. Giving a later stage a list is
+    accepted and its length taken, since a caller holding the prompt anyway
+    should not have to remember which stage it is talking to.
     """
     description = describe(config)
-    if not isinstance(tokens, list) or not 1 <= len(tokens) <= description["max_context"]:
-        raise ValueError("Invalid context length")
-    if any(type(token) is not int or not 0 <= token < config["vocab_size"] for token in tokens):
-        raise ValueError("Invalid token id")
     first, last = layer_range(config, first_layer, last_layer)
 
-    length = len(tokens)
+    if isinstance(prompt, bool) or not isinstance(prompt, (list, int)):
+        raise ValueError("A prompt is a list of token ids, or a length")
+    if isinstance(prompt, int):
+        if first == 0:
+            raise ValueError("The first stage looks tokens up and needs their ids")
+        length, tokens = prompt, None
+    else:
+        length, tokens = len(prompt), prompt
+    if not 1 <= length <= description["max_context"]:
+        raise ValueError("Invalid context length")
+    if tokens is not None and any(
+            type(token) is not int or not 0 <= token < config["vocab_size"]
+            for token in tokens):
+        raise ValueError("Invalid token id")
     hidden = config["hidden_size"]
     epsilon = config["rms_norm_epsilon"]
 
