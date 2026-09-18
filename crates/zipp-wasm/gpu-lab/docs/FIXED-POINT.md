@@ -281,12 +281,16 @@ dot products, which is the standard primitive for exactly this shape and is what
 
 Between here and there is a smaller and more immediately useful consequence. The
 LEASED kit currently cross-checks a hosted stage by having a second peer redo the
-work and comparing within `AGREEMENT = 1e-3`, a tolerance that exists only
-because two backends running float32 need one. For a stage built on
-`matmul_fixed`, the tolerance is zero: a checker either reproduces the bits or
-the peer did something else. That is a much sharper instrument, and it needs no
-proof system at all.
+work and comparing within `allowedDifference` -- 1e-3 plus twenty parts per
+million of each value -- a tolerance that exists only because two backends
+running float32 need one. For a stage built on `matmul_fixed`, the tolerance is
+zero: a checker either reproduces the bits or the peer did something else. That
+is a much sharper instrument, and it needs no proof system at all.
 
-Neither is built. The Qwen3 plugin still emits `matmul`, deliberately — the
-operation is proven here first, and switching the plugin is one line once
-somebody wants the whole model on this path.
+What exists is the operation and the path to it: the Qwen3 plugin emits
+`matmul_fixed` for whatever its `fixed` policy names, and `model-plugins` binds
+it (see above). Neither consequence is built. There is no sumcheck or GKR
+argument. And the LEASED kit's descriptors carry the `fixed` policy, so two
+peers are only compared when they ran the same arithmetic, but its hosts prepare
+stages with the default policy of `none`, and it has no zero-tolerance
+comparison for a stage that is not.

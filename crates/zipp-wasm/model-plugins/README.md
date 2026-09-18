@@ -7,8 +7,10 @@ directory, and it also extends `gpu-lab`'s backends with quantized matmul and
 points `rust/` at the external `f2i-gguf-quants` crate so a kernel decodes blocks
 the way the reader does. It does not modify the landing-page build or change SoftN.
 
-415 standalone Node tests (136 here, 279 in `gpu-lab`), 30 CPython/NumPy tests and
-the full-checkout gates pass in this repository: the plugin's graphs run through
+The standalone Node suites here and in `gpu-lab`, the CPython/NumPy tests and the
+full-checkout gates pass in this repository (`npm test` in each directory prints
+how many; the numbers change with every commit, so they are not copied here):
+the plugin's graphs run through
 the current ZIPP Graph v2 validator and CPU backend, and the plugin's Python
 compiles and generates inside a locally built Python-enabled ZIPP WASM engine,
 matching the stored PyTorch reference in both cases. Some suites need a checkpoint
@@ -22,6 +24,13 @@ demo generating the reference continuations in Chrome. See
 These run in CI rather than only locally: the `python` job builds the
 Python-enabled artifact and then runs this suite against it with
 `ZIPP_REQUIRE_INTEGRATION=1`, so a missing engine fails instead of skipping.
+
+**Source only: not in the release archive.** This package is `private`, and
+`release.yml` does not ship it: the `javascript-python` archive carries
+`gpu-lab`'s runtime and kernels, but not `model-plugins/`, its plugins or its
+GGUF module. Use it from a checkout. Shipping it would mean adding it to that
+archive and adding a test that loads a plugin from the unpacked archive rather
+than from the tree, and neither is done.
 
 Still not established: **SoftN acceptance**, the Gate B robustness checks
 (cancellation, lost GPU device, budget exhaustion, other browsers), language
@@ -65,8 +74,11 @@ implements, and one hash per Python file.
 
 A multi-file plugin imports its own modules by absolute name under the fixed
 `zipp_plugin` package the host installs into (`from zipp_plugin.graph import
-Graph`). ZIPP's Python frontend has no relative imports, and that namespace is
-also what stops a plugin file shadowing the `json` module the bootstrap uses.
+Graph`). The bundled plugins were written that way when ZIPP's Python frontend
+refused relative imports. It has resolved them since `90e0a9c7`, as CPython
+does, so `from .graph import Graph` inside the package reaches the same module;
+absolute names remain the convention here. The namespace is also what stops a
+plugin file shadowing the `json` module the bootstrap uses.
 
 ## Activate without rebuilding the engine
 

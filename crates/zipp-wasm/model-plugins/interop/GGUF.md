@@ -255,13 +255,23 @@ seam is wider and still small -- the residual for every position, 20 KB for a
 five-token prompt -- and it arrives through a `feed` binding rather than a step
 slot, since a prefill graph is built once for one prompt.
 
-**A staged prefill does not warm the decode caches.** It is a batched forward:
-it produces the residual stream, not the key and value tensors a decode session
-carries, and those begin at zero however much prefilling has happened. So the
-flow that works today runs the prompt through the *decode* graphs one position
-at a time, writing the caches as it goes -- correct, and a step per prompt token
-where a batched pass would do. Making a prefill emit `k{n}`/`v{n}` for a decode
-session to start from is the next real feature here, and it is not built yet.
+**A staged prefill does not warm the decode caches; a chunk does.**
+`build_prefill_stage` is a batched forward: it produces the residual stream, not
+the key and value tensors a decode session carries. What warms them is
+`build_decode_stage(..., tokens)`, the decode stage over that many consecutive
+positions, which writes the same carried `k{n}`/`v{n}` a one-token step reads. A
+host runs the prompt through it in chunks and seeds the one-token session from
+the chunk session's caches; see "A prompt in chunks" in the README for how, and
+what it saves.
+
+A stage also says what it is. `describe_stage` gives it a manifest -- the plugin,
+the configuration's digest, the layers it runs, the width and dtype of what it
+hands on -- and the host that prepares it adds the sha256 of the weights it
+opened, with `prepareDecode(template, weights, limits, {checkpoint})`. Passing the
+previous stage's manifest as `from` to `stepInputs` refuses a hidden state from a
+different configuration, from the same configuration with other weights, from a
+stage that does not say which weights it ran, or from anywhere but the layer
+before this one -- all before anything is computed.
 
 It divides further than in half. `tests/qwen3-stages.test.mjs` runs twenty-eight
 layers as four stages of seven, for both paths, and decodes several positions in

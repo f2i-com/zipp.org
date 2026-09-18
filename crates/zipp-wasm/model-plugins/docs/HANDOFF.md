@@ -174,21 +174,29 @@ loads only its own tensors and carries only its own caches, and hands the next
 one a residual stream. Halves, quarters and uneven shares all reproduce the
 whole model's logits bit for bit, including across worker threads with the
 buffer transferred rather than copied. `describe_stage` gives a stage an
-identity so a peer cannot be fed activations from a different checkpoint that
-happens to share a residual width.
+identity -- its configuration digest and layer range -- and the host adds the
+one a plugin cannot know: `prepareDecode({checkpoint})` attaches the sha256 of
+the weights it opened as `checkpoint_digest`. A seam checks all three, so a peer
+cannot be fed activations from a different configuration that happens to share
+a residual width, nor from the same configuration with other weights (a
+fine-tune, another quantization), nor from a predecessor that omits the digest.
 
-What is still missing here: a **batched prefill that warms the decode caches**.
-`build_prefill_stage` is a batched forward and produces the residual stream, not
-the key and value tensors a decode session carries — those still start at zero,
-so a prompt is fed through the decode graphs one position at a time. That is
-correct and costs a step per prompt token where one pass would do. Making a
-prefill emit `k{n}`/`v{n}` for a decode session to begin from is the next real
-piece of work in this gate. `run` also accepts up to 64 steps per submission and
-the driver does not yet use that.
+**A prompt warms the decode caches in chunks.** `build_decode_stage(..., tokens)`
+builds the same stage over that many consecutive positions, writing the same
+carried `k{n}`/`v{n}` caches the one-token graph reads, with a short chunk
+padded inertly. A host runs the prompt in chunks and seeds the one-token session
+from the chunk session's caches: layers 1..26 of Qwen3-0.6B on WASM fall from
+182 ms a prompt token to 65 in chunks of 16, and `tests/qwen3-chunks.test.mjs`
+holds the result bit-for-bit equal to the step-by-step path. That is for Qwen3
+stages; `ModelSession` (`src/session.mjs`) still feeds a prompt through its
+whole-model decode graph one position at a time, and does not use `run`'s up to
+64 steps per submission either. `build_prefill_stage` remains the eager batched
+forward, producing the residual stream and no caches.
 
 Keep the eager full-context path as a correctness oracle. Remaining: GPU
-embedding/gather as appropriate, cache-warming prefill, and explicit
-valid-length accounting; prefill and decode need separate accounting. Use per-layer rank-three/four cache tensors according to the backend ABI;
+embedding/gather as appropriate, chunked prefill in `ModelSession` and for the
+other plugins, and explicit valid-length accounting; prefill and decode need
+separate accounting. Use per-layer rank-three/four cache tensors according to the backend ABI;
 combining layers and an additional batch axis can exceed the supported tensor
 rank. Measure upload/readback and CPU planning separately from kernel time.
 

@@ -19,9 +19,12 @@ Read again while integrating this overlay into a full checkout, because the host
 depends on what they decide:
 
 - `crates/zipp-vm/src/frontend/python/stmts.rs`: `ImportFrom` with a level above
-  zero is refused (`relative imports are not supported`), which is why a plugin's
-  sibling modules are imported absolutely under the installed `zipp_plugin`
-  package. Confirmed against a locally built engine, not inferred from the source.
+  zero was refused (`relative imports are not supported`) when this overlay was
+  integrated, which is why a plugin's sibling modules are imported absolutely
+  under the installed `zipp_plugin` package. Since `90e0a9c7` the frontend
+  resolves them as CPython does -- a Qwen3 plugin with `from .graph import
+  Graph` loads and answers -- and climbing past the top package is an error.
+  The plugins here keep their absolute imports.
 - `crates/zipp-wasm/src/lib.rs` (`module_name_of_path`, `initPythonProject`):
   `zipp_plugin/graph.py` becomes the module `zipp_plugin.graph` and
   `zipp_plugin/__init__.py` the package itself, so the registry's install layout

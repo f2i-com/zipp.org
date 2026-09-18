@@ -631,6 +631,11 @@ jobs:
           mkdir -p "dist/$bundle/host-sdk"
           install -m 0644 host-sdk/zipp-host.mjs host-sdk/zipp-host.worker.mjs host-sdk/README.md \
             "dist/$bundle/host-sdk/"
+          # gpu-lab's runtime and kernels ship; model-plugins/ deliberately does
+          # not. It is an experimental, private, source-only package, tested in
+          # CI from the tree (ci.yml's python job) and used from a checkout.
+          # Shipping it needs it copied here and a test against the unpacked
+          # archive, the way the smoke test above loads the engine.
           if [[ "$WASM_VARIANT" == "javascript-python" ]]; then
             mkdir -p "dist/$bundle/gpu-lab/wasm" "dist/$bundle/docs"
             cp -R gpu-lab/src "dist/$bundle/gpu-lab/"
