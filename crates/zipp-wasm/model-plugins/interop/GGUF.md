@@ -249,6 +249,23 @@ structured clone on the way. Equality rather than a tolerance is the point:
 nothing in a seam should compute, so anything other than equality would mean it
 does.
 
+`build_prefill_stage(config, tokens, first, last)` is the same thing for a
+prompt, because a peer has to prefill before a cached step means anything. Its
+seam is wider and still small -- the residual for every position, 20 KB for a
+five-token prompt -- and it arrives through a `feed` binding rather than a step
+slot, since a prefill graph is built once for one prompt.
+
+It divides further than in half. `tests/qwen3-stages.test.mjs` runs twenty-eight
+layers as four stages of seven, for both paths, and decodes several positions in
+sequence -- which is the case that matters, because a cache written or read
+wrongly is right for the first token and wrong from the second.
+
+```
+      prefill: prompt -> [0..6] -> [7..13] -> [14..20] -> [21..27] -> logits
+      decode:  token  -> [0..6] -> [7..13] -> [14..20] -> [21..27] -> logits
+                          14 caches each, its own layers only
+```
+
 None of this is a peer protocol. There is no discovery, no routing and no
 multi-stage driver here -- only a model that can be divided, and the evidence
 that dividing it changes no arithmetic.
