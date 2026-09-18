@@ -6,7 +6,8 @@ name: Security
 # sandbox boundary.
 #
 # Automatic CI is paused as of 2026-09-12. Run on demand with
-# `gh workflow run security.yml`; the former Monday 03:17 UTC schedule can be
+# `gh workflow run security.yml`, which skips the two heavy lanes unless given
+# `-f skip_heavy=false`; the former Monday 03:17 UTC schedule can be
 # restored when automatic checks resume. CI (ci.yml) is the minimum gate, and the
 # broad lanes — the full engine suite, the safe profile, the sandboxes, the
 # browser Workers — are run locally before a push (HANDOFF.md, "Local
@@ -33,6 +34,16 @@ on:
         default: "1.92.0"
       canary:
         description: Also run the non-blocking stable-toolchain canary
+        required: false
+        type: boolean
+        default: true
+      # On by default for a dispatch: the native workspace suite links 290-odd
+      # test executables and takes about seventy minutes, Test262 about
+      # fifteen, and the rest of the matrix about seven. A release always runs
+      # both (release.yml passes this explicitly), and so does
+      # `-f skip_heavy=false`.
+      skip_heavy:
+        description: Skip the native workspace suite (~70 min) and Test262 (~15 min); false runs the full matrix
         required: false
         type: boolean
         default: true
