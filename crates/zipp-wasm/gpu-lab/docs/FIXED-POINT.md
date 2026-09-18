@@ -37,6 +37,32 @@ set by its largest weight and wastes the range of every other row. It is the
 smaller of the two decisions — see the measurements below, where the width of
 the quants dominates — but it is free, so it is taken.
 
+## Two forms, one answer
+
+Steps 1 and 2 depend only on the weight, so they need not happen on every step.
+
+- **Run time.** `matmul_fixed(a, W)` where `W` is float32, Q4_K or Q6_K. Each
+  output column is decoded and quantized as it is used. Nothing is stored.
+- **Bind time.** `quantizeWeight(W, n, k, dtype)` in `src/quant.mjs` does steps 1
+  and 2 once and returns `{quants, scales}`. The quants become an input of
+  dtype `i16` and the scales a plain float32 `[N]` input, passed as `c`:
+  `matmul_fixed(a, quants, scales)`. Nothing is decoded or quantized per step.
+
+These are the same arithmetic at different times, so they produce **identical
+float32 bits** — `tests/fixed-point.test.mjs` asserts `Object.is` between them
+on both backends for all three weight sources. A checker comparing two peers
+therefore does not need to know which form either of them ran.
+
+The trade is memory. `i16` is two bytes a value against Q4_K's 0.5625, so a
+resident weight is **3.56x larger**: for Qwen3-0.6B, 373 MB becomes 1.33 GB.
+That is a hosted stage's trade to make and not a browser peer's, which is why
+both forms exist and neither is the default. The graph's own accounting shows
+it — `logicalBytes` counts an `i16` weight as the bytes it is.
+
+`i16` is this protocol's own format and not a checkpoint one. A float32 `matmul`
+refuses it: its kernels are named after the dtype, so the alternative is a
+lookup that finds nothing and an output left at zero.
+
 `quantizeRow` in `src/kernel-math.mjs` is the statement of steps 1 and 2 that
 every backend mirrors. Three details in it carry the whole guarantee:
 
@@ -140,38 +166,44 @@ row of zeros does the same. Neither produces a NaN on either backend.
 
 ## Speed
 
-On the wasm backend, a Q4_K `[m, 1024] @ [1024, 1024]` projection:
+A Q4_K `[m, 1024] @ [1024, 1024]` projection on the wasm backend, measured the
+way a stage actually runs one: `prepare()` once so the weight is uploaded and
+held, then timed `run()` steps. (Timing `execute()` instead re-uploads the
+weight on every call and inflates every figure here, unevenly.)
 
-| m | `matmul` | `matmul_fixed` | ratio |
+| m | `matmul` | `matmul_fixed` run time | `matmul_fixed` bind time |
 | --- | --- | --- | --- |
-| 1 (one decode step) | 0.56 ms | 2.28 ms | 4.1x |
-| 8 | 1.34 ms | 3.69 ms | 2.8x |
-| 32 | 4.53 ms | 8.51 ms | 1.9x |
+| 1 (one decode step) | 0.30 ms | 2.13 ms | **0.21 ms** |
+| 8 | 1.20 ms | 3.50 ms | 1.61 ms |
+| 32 | 4.43 ms | 8.32 ms | 6.44 ms |
 
-The ratio falling with `m` says where the time goes, and it is not where it
-first looks. Fitting the two lines separates a per-output-column cost from a
-per-activation-row cost:
+Fitting each line between m = 8 and m = 32 separates a per-output-column cost
+from a per-activation-row cost, and that is where the shape of it is:
 
-| | per column (decode, and requantise) | per row of activations |
+| | per column | per row of activations |
 | --- | --- | --- |
-| `matmul` | 0.28 ms | 0.133 ms |
-| `matmul_fixed` | 2.08 ms | 0.201 ms |
+| `matmul` | 0.12 ms (decode) | 0.135 ms |
+| `matmul_fixed`, run time | 1.90 ms (decode, then requantise) | 0.201 ms |
+| `matmul_fixed`, bind time | 0.00 ms | 0.201 ms |
 
-So the scalar integer dot is only **1.5x** slower than the SIMD float one. The
-other 1.8 ms — four fifths of a decode step — is requantising the weight, which
-this does *on every step, for a weight that never changes*. That is the
-optimisation to make first, and it is not a kernel trick: derive each weight
-row's int16 quants and its scale once at bind time and keep them resident. It
-would also skip the Q4_K decode, which the float path cannot skip, so a
-bind-time `matmul_fixed` should end up **faster** than `matmul` at m = 1 rather
-than four times slower. It costs memory: int16 quants are 2 bytes a value
-against Q4_K's 0.5625, so a resident weight is 3.6x larger.
+Three things fall out.
 
-That was not built, because it is a Graph v2 binding change and the point of
-this rung was to prove the numerics without one. Only after that is the scalar
-accumulator worth attacking — wasm SIMD has no 64-bit multiply-accumulate, so
-the options are paired i32 lanes or splitting each int16 into two int8 halves to
-use `i32x4_dot_i16x8` with a carry pass.
+**The bind-time form has no per-column cost at all**, which is what it is for.
+At m = 1 it is 0.21 ms against the float32 matmul's 0.30 — *faster than the
+operation it replaces*, because it skips the Q4_K decode that the float path
+cannot skip.
+
+**The run-time form spends 1.90 ms per column requantising**, against 0.12 ms
+to decode. Nine tenths of a one-token decode step, repeated every step for a
+weight that never changes. That is the entire reason the bind-time form exists.
+
+**The scalar integer dot is 1.5x the SIMD float one** — 0.201 against 0.135 ms a
+row — and that is the whole remaining gap. It is why the bind-time form loses
+its lead as `m` grows: at m = 32 it is 1.5x slower. Decode is m = 1, which is
+the case a hosted stage lives in; prefill is not, and would want this closed.
+wasm SIMD has no 64-bit multiply-accumulate, so closing it means paired i32
+lanes, or splitting each int16 into two int8 halves to use `i32x4_dot_i16x8`
+with a carry pass. Neither is done.
 
 ## Why the GPU backends refuse it
 
@@ -218,7 +250,11 @@ GPU backend where the emulation is the whole of the work.
   is the right failure, not a silent one. A Python implementation would be a
   third numeric path to keep exact, and there is no caller for it yet.
 - **The Qwen3 model plugin**, which still emits `matmul`. Deliberately: the
-  operation is proven on its own before a whole model moves onto it.
+  operation is proven on its own before a whole model moves onto it. When it
+  does, `bindGraph` is where `quantizeWeight` belongs — it already walks every
+  weight once — and the decision of *which* weights get the `i16` treatment is a
+  memory budget, not a correctness question. A stage can mix the two forms
+  freely, because they give the same answer.
 
 ## Where this goes
 

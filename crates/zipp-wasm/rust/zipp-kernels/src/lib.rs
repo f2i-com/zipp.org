@@ -441,6 +441,38 @@ mod kernels {
         }
     }
 
+    /// `matmul_fixed` over a weight that is already quantized: the bind-time form.
+    ///
+    /// `qw` is `[n, k]` int16 quants and `sw` their `[n]` float32 scales, both
+    /// produced once by `quantizeWeight` and resident from then on. Nothing is
+    /// decoded and nothing is requantized here, which is the entire difference
+    /// from `bmm_fixed` -- the arithmetic is the same arithmetic, so the two
+    /// agree bit for bit and the tests check exactly that.
+    ///
+    /// The weight is not batched (its scales would have to be too, and the
+    /// graph validator refuses it), so only `a` carries a batch stride.
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn bmm_fixed_i16(a: *const f32, qw: *const i16, sw: *const f32, o: *mut f32,
+        qa: *mut i16, sa: *mut f32, batch: i32, m: i32, k: i32, n: i32, stride_a: i32) {
+        let (mi, ki, ni) = (m as isize, k as isize, n as isize);
+        for t in 0..batch as isize {
+            let a = a.offset(t * stride_a as isize);
+            let c = o.offset(t * mi * ni);
+            for r in 0..mi { *sa.offset(r) = quantize_row(a.offset(r * ki), ki, qa.offset(r * ki)); }
+            for col in 0..ni {
+                let wrow = qw.offset(col * ki);
+                let s = *sw.offset(col);
+                for r in 0..mi {
+                    let qrow = qa.offset(r * ki);
+                    let mut acc: i64 = 0;
+                    for j in 0..ki { acc += (*qrow.offset(j) as i64) * (*wrow.offset(j) as i64); }
+                    *c.offset(r * ni + col) = (acc as f32) * (*sa.offset(r) * s);
+                }
+            }
+        }
+    }
+
     /// int16 quants against the row's own maximum; returns the float32 scale.
     /// The JavaScript statement of this is `quantizeRow`, and the two agree
     /// operation for operation -- a double-rounded float32 divide is the same

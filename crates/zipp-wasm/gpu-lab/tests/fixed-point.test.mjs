@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {createRuntime, ComputeRuntime} from '../src/runtime.mjs';
 import {quantizeRow, FIXED_QMAX} from '../src/kernel-math.mjs';
-import {FORMATS, decodeQ4K, decodeQ6K} from '../src/quant.mjs';
+import {FORMATS, decodeQ4K, decodeQ6K, quantizeWeight, readFixedQuants} from '../src/quant.mjs';
 const wasmBytes = await readFile(new URL('../wasm/kernels.wasm', import.meta.url));
 
 const rng = (seed = 1) => {
@@ -185,6 +185,200 @@ test('batched, and with one side broadcast, still bit-identical', async () => {
       for (let i = 0; i < x.length; i++) assert.ok(Object.is(x[i], y[i]), `${bShape}[${i}]: ${x[i]} / ${y[i]}`);
     }
   } finally { cpu.dispose(); wasm.dispose(); }
+});
+
+/** The same product with the weight quantized once beforehand instead of on
+ * every step: `b` becomes an `i16` input and its row scales a float32 [N]. */
+const boundGraph = (a, quants, scales, [m, k], [n]) => ({
+  version: 2,
+  nodes: [
+    {id: 0, op: 'input', shape: [m, k], data: Array.from(a)},
+    {id: 1, op: 'input', shape: [n, k], dtype: 'i16', data: quants},
+    {id: 2, op: 'input', shape: [n], data: Array.from(scales)},
+    {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true},
+  ],
+  outputs: [{name: 'fixed', id: 3}],
+});
+
+test('the bind-time form is the run-time form moved in time, not a second answer', async () => {
+  // The claim that makes `i16` worth having at all. Quantising the weight when
+  // the graph is built, rather than on every step, has to reach the identical
+  // float32 bits -- otherwise it is a different operation wearing the same name,
+  // and a checker comparing two peers could not tell which form either ran.
+  const {cpu, wasm} = await runtimes();
+  try {
+    const [m, k, n] = [3, 512, 17];
+    const a = activations(m * k, 61, 4);
+    const weights = [
+      ['float32', activations(n * k, 62, 0), 'f32'],
+      ['q4_k', blocks((k / 256) * n, 63, 'q4_k'), 'q4_k'],
+      ['q6_k', blocks((k / 256) * n, 64, 'q6_k'), 'q6_k'],
+    ];
+    for (const [label, source, dtype] of weights) {
+      const {quants, scales} = quantizeWeight(source, n, k, dtype);
+      assert.equal(quants.length, n * k * 2, `${label}: two bytes a value`);
+      assert.equal(scales.length, n, `${label}: one scale an output column`);
+      const runTime = dtype === 'f32'
+        ? fixedGraph(a, source, [m, k], [n])
+        : {version: 2, nodes: [
+            {id: 0, op: 'input', shape: [m, k], data: Array.from(a)},
+            {id: 1, op: 'input', shape: [n, k], dtype, data: source},
+            {id: 2, op: 'matmul_fixed', a: 0, b: 1, transposed: true}],
+           outputs: [{name: 'fixed', id: 2}]};
+      const bindTime = boundGraph(a, quants, scales, [m, k], [n]);
+      for (const [name, rt] of [['cpu-js', cpu], ['wasm', wasm]]) {
+        const x = (await rt.execute(runTime, {typedOutputs: true})).outputs.fixed.data;
+        const y = (await rt.execute(bindTime, {typedOutputs: true})).outputs.fixed.data;
+        for (let i = 0; i < x.length; i++) assert.ok(Object.is(x[i], y[i]),
+          `${label} on ${name}[${i}]: run-time ${x[i]} against bind-time ${y[i]}`);
+      }
+    }
+  } finally { cpu.dispose(); wasm.dispose(); }
+});
+
+test('a batch of activations against one bind-time weight', async () => {
+  // The only path that exercises the activation batch stride against an i16
+  // weight, whose own batch is fixed at one because its scales are [N]. It is
+  // the shape a prefill takes, and it had no test until it had a bug to have.
+  const {cpu, wasm} = await runtimes();
+  try {
+    const [batch, m, k, n] = [2, 2, 256, 5];
+    const a = activations(batch * m * k, 91, 3), source = activations(n * k, 92, 0);
+    const {quants, scales} = quantizeWeight(source, n, k);
+    const graph = weight => ({version: 2, nodes: [
+      {id: 0, op: 'input', shape: [batch, m, k], data: Array.from(a)}, ...weight],
+      outputs: [{name: 'fixed', id: weight[weight.length - 1].id}]});
+    const runTime = graph([{id: 1, op: 'input', shape: [n, k], data: Array.from(source)},
+      {id: 2, op: 'matmul_fixed', a: 0, b: 1, transposed: true}]);
+    const bindTime = graph([{id: 1, op: 'input', shape: [n, k], dtype: 'i16', data: quants},
+      {id: 2, op: 'input', shape: [n], data: Array.from(scales)},
+      {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true}]);
+    const want = (await cpu.execute(runTime, {typedOutputs: true})).outputs.fixed.data;
+    assert.equal(want.length, batch * m * n);
+    for (const [name, rt] of [['cpu-js', cpu], ['wasm', wasm]]) {
+      for (const [form, program] of [['run-time', runTime], ['bind-time', bindTime]]) {
+        const got = (await rt.execute(program, {typedOutputs: true})).outputs.fixed.data;
+        for (let i = 0; i < want.length; i++) assert.ok(Object.is(got[i], want[i]),
+          `${name} ${form}[${i}]: ${got[i]} against ${want[i]}`);
+      }
+    }
+    // A batched i16 weight has no meaning without batched scales, and is refused
+    // rather than read as though the batch were not there.
+    await assert.rejects(() => cpu.execute(graph([
+      {id: 1, op: 'input', shape: [batch, n, k], dtype: 'i16', data: new Uint8Array(batch * n * k * 2)},
+      {id: 2, op: 'input', shape: [n], data: Array.from(scales)},
+      {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true}]), {typedOutputs: true}),
+      e => { assert.equal(e.code, 'SHAPE'); assert.match(e.message, /batched i16 weight/); return true; });
+  } finally { cpu.dispose(); wasm.dispose(); }
+});
+
+test('quantizeWeight refuses a weight that is not the shape it was told', () => {
+  // It reads by computed offset, so a mismatched length reads past the end and
+  // quantizes `undefined` to NaN -- a plausible weight of nothing. The graph
+  // validator would refuse the result's length later, naming the wrong thing.
+  const [n, k] = [4, 256];
+  assert.throws(() => quantizeWeight(new Float32Array(n * k - 1), n, k), /is 1024 values; got 1023/);
+  assert.throws(() => quantizeWeight(blocks(n, 1, 'q4_k').slice(0, 100), n, k, 'q4_k'), /is 576 bytes; got 100/);
+  assert.throws(() => quantizeWeight(new Float32Array(n * k), n, k, 'q8_0'), /unknown dtype q8_0/);
+  // And the shape it was told is the one it produces.
+  const {quants, scales} = quantizeWeight(new Float32Array(n * k).fill(0.5), n, k);
+  assert.equal(quants.length, n * k * 2);
+  assert.equal(scales.length, n);
+});
+
+test('i16 quants are little-endian, so both backends read the same weight', async () => {
+  // wasm memory is little-endian and reads these natively; the JavaScript
+  // reference decodes the bytes explicitly rather than laying an Int16Array
+  // over them, so a big-endian host would still agree. This checks the bytes
+  // are what that says they are, negatives included.
+  const w = Float32Array.from([1, -1, 0.5, -0.5]);
+  const {quants} = quantizeWeight(w, 1, 4);
+  assert.deepEqual([...readFixedQuants(quants, 4)], [32767, -32767, 16384, -16383]);
+  assert.deepEqual([...quants.slice(0, 4)], [0xff, 0x7f, 0x01, 0x80], 'low byte first');
+});
+
+test('a bind-time weight survives a prepared session across steps', async () => {
+  // The case the format exists for: the weight is uploaded once at prepare and
+  // held, and every step reads it without decoding or requantising anything.
+  const {cpu, wasm} = await runtimes();
+  try {
+    const [k, n] = [256, 6];
+    const source = activations(n * k, 71, 0);
+    const {quants, scales} = quantizeWeight(source, n, k);
+    const program = {
+      version: 2,
+      nodes: [
+        {id: 0, op: 'input', shape: [1, k]},
+        {id: 1, op: 'input', shape: [n, k], dtype: 'i16', data: quants},
+        {id: 2, op: 'input', shape: [n], data: Array.from(scales)},
+        {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true},
+      ],
+      outputs: [{name: 'fixed', id: 3}],
+    };
+    const steps = [activations(k, 72, 2), activations(k, 73, 3), activations(k, 72, 2)];
+    for (const [name, rt] of [['cpu-js', cpu], ['wasm', wasm]]) {
+      const session = await rt.prepare(program, {});
+      try {
+        const seen = [];
+        for (const input of steps) seen.push((await session.run({inputs: {0: input}})).steps[0].outputs.fixed.data);
+        // The third step feeds the first step's activations again: a held
+        // weight that had been consumed or overwritten would not repeat.
+        for (let i = 0; i < seen[0].length; i++) assert.ok(Object.is(seen[0][i], seen[2][i]),
+          `${name}: step 3 repeats step 1 at [${i}]: ${seen[0][i]} against ${seen[2][i]}`);
+        assert.notEqual(seen[1][0], seen[0][0], `${name}: the steps are not all the same`);
+      } finally { session.dispose(); }
+    }
+  } finally { cpu.dispose(); wasm.dispose(); }
+});
+
+test('i16 costs what it costs, and the plan says so', async () => {
+  // 3.56x Q4_K on the device, which is the whole trade and should be visible in
+  // the graph's own accounting rather than discovered when a device runs out.
+  const {validateProgram} = await import('../src/graph.mjs');
+  const [k, n] = [256, 64];
+  const bytesOf = nodes => validateProgram({version: 2, nodes,
+    outputs: [{name: 'o', id: nodes.length - 1}]}).logicalBytes;
+  const a = {id: 0, op: 'input', shape: [1, k], data: new Array(k).fill(0.5)};
+  const asBlocks = bytesOf([a, {id: 1, op: 'input', shape: [n, k], dtype: 'q4_k', data: blocks((k / 256) * n, 1)},
+    {id: 2, op: 'matmul_fixed', a: 0, b: 1, transposed: true}]);
+  const {quants, scales} = quantizeWeight(activations(n * k, 2, 0), n, k);
+  const asFixed = bytesOf([a, {id: 1, op: 'input', shape: [n, k], dtype: 'i16', data: quants},
+    {id: 2, op: 'input', shape: [n], data: Array.from(scales)},
+    {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true}]);
+  const weightBlocks = (k / 256) * n * 144, weightFixed = n * k * 2 + n * 4;
+  assert.equal(asFixed - asBlocks, weightFixed - weightBlocks, 'the difference is the weight, counted as what it is');
+  assert.ok(weightFixed / weightBlocks > 3.5 && weightFixed / weightBlocks < 3.6,
+    `i16 is ${(weightFixed / weightBlocks).toFixed(2)}x Q4_K`);
+});
+
+test('validation: i16 belongs to matmul_fixed, and only with its scales', async () => {
+  const rt = await createRuntime({backend: 'cpu-js'});
+  const [k, n] = [256, 4];
+  const {quants, scales} = quantizeWeight(activations(n * k, 81, 0), n, k);
+  const a = {id: 0, op: 'input', shape: [1, k], data: new Array(k).fill(0.25)};
+  const w = {id: 1, op: 'input', shape: [n, k], dtype: 'i16', data: quants};
+  const s = {id: 2, op: 'input', shape: [n], data: Array.from(scales)};
+  const fails = async (nodes, code, match) =>
+    assert.rejects(() => rt.execute({version: 2, nodes, outputs: [{name: 'o', id: nodes.length - 1}]}),
+      e => { assert.equal(e.code, code, `${match}: got ${e.code} ${e.message}`);
+             assert.match(e.message, match); return true; });
+  try {
+    // A float32 matmul would look up a kernel named after the dtype and find
+    // none, so it refuses rather than leaving an output at zero.
+    await fails([a, w, {id: 2, op: 'matmul', a: 0, b: 1, transposed: true}], 'PROTOCOL', /belongs to matmul_fixed/);
+    await fails([a, w, {id: 2, op: 'matmul_fixed', a: 0, b: 1, transposed: true}], 'PROTOCOL', /needs the row scales/);
+    await fails([a, {id: 1, op: 'input', shape: [n, k], data: new Array(n * k).fill(1)}, s,
+      {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true}], 'PROTOCOL', /only an i16 weight has/);
+    await fails([a, w, {id: 2, op: 'input', shape: [n + 1], data: new Array(n + 1).fill(1)},
+      {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true}], 'SHAPE', /scales must be \[N\]/);
+    // Its bytes are its values: half of them is not a shorter weight.
+    await fails([a, {id: 1, op: 'input', shape: [n, k], dtype: 'i16', data: quants.slice(0, n * k)}, s,
+      {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true}], 'SHAPE', /needs \d+ bytes/);
+    // And it is not a tensor anyone can read back.
+    await assert.rejects(() => rt.execute({version: 2, nodes: [a, w, s,
+      {id: 3, op: 'matmul_fixed', a: 0, b: 1, c: 2, transposed: true}], outputs: [{name: 'o', id: 1}]}),
+      e => { assert.equal(e.code, 'PROTOCOL'); assert.match(e.message, /no float32 readback/); return true; });
+  } finally { rt.dispose(); }
 });
 
 /** How far the integer answer lands from the float32 one, in scale-free terms. */

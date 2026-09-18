@@ -80,16 +80,22 @@ export class WasmBackend {
         else e.bmm(a,b,o.ptr,n.batch,n.m,n.k,n.n,n.aBatchStride,n.bBatchStride);
         break;
       case 'matmul_fixed': {
-        // Four scratch buffers, all released with the mark: a decoded weight
-        // row, the quantized activations and their per-row scales, and the
-        // quantized weight row. The kernel's answer is an integer, so it is
-        // identical to the JavaScript reference's rather than close to it.
+        // Scratch released with the mark either way: the quantized activations
+        // and their per-row scales, and -- in the run-time form only -- a
+        // decoded weight row and its quants. The kernel's answer is an integer,
+        // so it is identical to the JavaScript reference's, not close to it.
         const mark = this.cursor;
-        const row = this.alloc(n.k), qa = this.reserve(n.m * n.k * 2, {}),
-              sa = this.alloc(n.m), qw = this.reserve(n.k * 2, {});
-        e.bmm_fixed(a, b, o.ptr, row.ptr, qa.ptr, sa.ptr, qw.ptr,
-          n.batch, n.m, n.k, n.n, n.aBatchStride, n.bBatchStride,
-          n.bQuant ? QUANT_DTYPE[n.bQuant.dtype] : 2);
+        const qa = this.reserve(n.m * n.k * 2, {}), sa = this.alloc(n.m);
+        if (n.bFixed) {
+          // Already quantized and resident: `b` is the int16 weight and `c` its
+          // scales. Nothing is decoded and nothing is requantized.
+          e.bmm_fixed_i16(a, b, c, o.ptr, qa.ptr, sa.ptr, n.batch, n.m, n.k, n.n, n.aBatchStride);
+        } else {
+          const row = this.alloc(n.k), qw = this.reserve(n.k * 2, {});
+          e.bmm_fixed(a, b, o.ptr, row.ptr, qa.ptr, sa.ptr, qw.ptr,
+            n.batch, n.m, n.k, n.n, n.aBatchStride, n.bBatchStride,
+            n.bQuant ? QUANT_DTYPE[n.bQuant.dtype] : 2);
+        }
         this.cursor = mark;
         break;
       }
