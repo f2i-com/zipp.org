@@ -15,7 +15,8 @@ const OPS = new Set(['input', 'full', 'add', 'sub', 'mul', 'div', 'relu', 'posit
 export async function bindGraph(template, weights, limits, {feed = {}} = {}) {
   // `stage` is optional and says which layers this graph covers, for a graph
   // that is part of a model rather than all of it.
-  fields(template, ['version', 'graph', 'bindings', 'stage'], ['version', 'graph', 'bindings']);
+  fields(template, ['version', 'graph', 'bindings', 'stage', 'manifest'],
+    ['version', 'graph', 'bindings']);
   check(template.version === 1, 'VERSION', 'Unsupported model binding protocol');
   const graph = template.graph;
   fields(graph, ['version', 'nodes', 'outputs'], ['version', 'nodes', 'outputs']);

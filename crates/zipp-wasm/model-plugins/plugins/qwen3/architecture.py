@@ -27,6 +27,12 @@ regardless.
 """
 from zipp_plugin.graph import Graph, rope_tables
 
+# Who this is, for a stage that has to say so to a peer. The manifest declares
+# the same id and version; these are here because a stage describes itself
+# without the host reading the manifest back to it.
+PLUGIN_ID = "org.zipp.qwen3"
+PLUGIN_VERSION = "0.1.0"
+
 CHECKPOINT_FORMAT = "gguf.qwen3-v1"
 TOKENIZER_FORMATS = ["qwen2-byte-bpe-v1"]
 
@@ -251,6 +257,62 @@ def layer_range(config, first_layer=None, last_layer=None):
     return first, last
 
 
+def config_digest(config):
+    """A stable fingerprint of a configuration, for comparing two peers.
+
+    Canonical JSON -- sorted keys, no incidental spacing -- so the digest
+    depends on the values and not on how they were written down.
+    """
+    import hashlib
+    import json
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def describe_stage(config, first_layer=None, last_layer=None, context=None):
+    """What a stage is, in enough detail that a peer cannot be handed the wrong one.
+
+    In one process a hidden state is obviously the right hidden state. Over a
+    network it is a [1, 1024] array of floats, and so is one from a different
+    checkpoint that happens to share a residual width -- which would compose
+    without error into confident nonsense. So a stage says what it is, and a
+    receiver checks before it computes.
+
+    What the plugin can answer is here. What it cannot -- the checkpoint's own
+    sha256, a session identity -- belongs to the host, which is the thing that
+    opened the file and is running the session.
+    """
+    description = describe(config)
+    first, last = layer_range(config, first_layer, last_layer)
+    total = config["num_layers"]
+    if first == 0 and last == total - 1:
+        role = "whole"
+    elif first == 0:
+        role = "head"
+    elif last == total - 1:
+        role = "tail"
+    else:
+        role = "middle"
+    return {
+        "plugin": PLUGIN_ID,
+        "plugin_version": PLUGIN_VERSION,
+        "family": description["family"],
+        "checkpoint_format": description["checkpoint_format"],
+        "tokenizer_formats": description["tokenizer_formats"],
+        "config_digest": config_digest(config),
+        "first_layer": first,
+        "last_layer": last,
+        "num_layers": total,
+        "role": role,
+        # What crosses the seam, and what it would take to accept one.
+        "hidden_size": config["hidden_size"],
+        "hidden_dtype": "f32",
+        "context": description["max_context"] if context is None else int(context),
+        "graph_version": 2,
+        "protocol_version": 1,
+    }
+
+
 def build_decode_stage(config, context=None, first_layer=None, last_layer=None):
     """One cached decode step over layers [first_layer, last_layer].
 
@@ -307,8 +369,10 @@ def build_decode_stage(config, context=None, first_layer=None, last_layer=None):
     if last == config["num_layers"] - 1:
         x = g.rms_norm(x, "output_norm.weight", hidden, epsilon)
         logits = g.linear(x, "token_embd.weight", hidden, config["vocab_size"])
-        return g.finish_decode(logits, context, stage=(first, last))
-    return g.finish_stage(x, context, hidden, stage=(first, last))
+        return g.finish_decode(logits, context, stage=(first, last),
+                               manifest=describe_stage(config, first, last, context))
+    return g.finish_stage(x, context, hidden, stage=(first, last),
+                          manifest=describe_stage(config, first, last, context))
 
 
 def _prefill_layer(g, x, layer, config, ctx):
@@ -395,6 +459,25 @@ def build_prefill_stage(config, prompt, first_layer=None, last_layer=None):
     stream for the whole prompt is [length, hidden_size], 20 KB for five tokens
     on this model, against weights that do not move at all.
 
+    ## It does not warm the caches
+
+    Worth being plain about, because the name suggests otherwise. This is a
+    *batched forward* over a prompt. It produces the residual stream; it does
+    not produce the key and value caches a decode session carries, and those
+    start at zero however much prefilling has happened.
+
+    So the flow that works today is: run the prompt through the *decode* graphs
+    one position at a time, which writes the caches as it goes, and then carry
+    on generating. That is correct and it costs a step per prompt token where a
+    batched prefill would cost one pass.
+
+    The flow that would be better is for a prefill to emit `k{n}` and `v{n}` as
+    [length, kv_width] outputs and for a decode session to start from them
+    instead of from zeros. That is a real feature with a real test -- a
+    prefill-seeded decode agreeing with a position-by-position one, bit for bit
+    -- and it is not built yet. Until it is, `build_prefill_stage` is the eager
+    path and the oracle, not the way a session should start.
+
     ## What a stage is told
 
     Only the first stage is given the prompt, because only the first stage
@@ -448,8 +531,10 @@ def build_prefill_stage(config, prompt, first_layer=None, last_layer=None):
         # Tied: the output projection is the token embedding read the other way
         # round, so the checkpoint carries no second copy of it.
         logits = g.linear(last_row, "token_embd.weight", hidden, config["vocab_size"])
-        return g.finish(logits, stage=(first, last))
-    return g.finish_hidden(x, stage=(first, last))
+        return g.finish(logits, stage=(first, last),
+                        manifest=describe_stage(config, first, last, length))
+    return g.finish_hidden(x, stage=(first, last),
+                           manifest=describe_stage(config, first, last, length))
 
 
 def build_graph(config, tokens):

@@ -244,40 +244,42 @@ class Graph:
         self.carried.append({"name": name, "id": updated})
         return updated
 
-    def finish(self, logits, stage=None):
-        return self._template("logits", logits, stage)
+    def finish(self, logits, stage=None, manifest=None):
+        return self._template("logits", logits, stage, manifest)
 
-    def finish_hidden(self, hidden, stage=None):
+    def finish_hidden(self, hidden, stage=None, manifest=None):
         """A prefill stage that stops before the end of the model: its output
         is the residual stream for whoever runs the rest."""
-        return self._template("hidden", hidden, stage)
+        return self._template("hidden", hidden, stage, manifest)
 
-    def _template(self, name, node, stage):
+    def _template(self, name, node, stage, manifest=None):
         template = {"version": 1,
                     "graph": {"version": 2, "nodes": self.nodes,
                               "outputs": [{"name": name, "id": node}]},
                     "bindings": self.bindings}
         if stage is not None:
             template["stage"] = {"first_layer": stage[0], "last_layer": stage[1]}
+        if manifest is not None:
+            template["manifest"] = manifest
         return template
 
-    def finish_decode(self, logits, context, stage=None):
+    def finish_decode(self, logits, context, stage=None, manifest=None):
         outputs = [{"name": "logits", "id": logits}]
         outputs.extend({"name": entry["name"], "id": entry["id"]} for entry in self.carried)
-        return self._decode_template(outputs, context, stage)
+        return self._decode_template(outputs, context, stage, manifest)
 
-    def finish_stage(self, hidden, context, width, stage=None):
+    def finish_stage(self, hidden, context, width, stage=None, manifest=None):
         """A stage that stops before the end of the model.
 
         Its output is the residual stream rather than logits, under the name
         the next stage's `step_hidden` binding expects to be given."""
         outputs = [{"name": "hidden", "id": hidden}]
         outputs.extend({"name": entry["name"], "id": entry["id"]} for entry in self.carried)
-        template = self._decode_template(outputs, context, stage)
+        template = self._decode_template(outputs, context, stage, manifest)
         template["hidden_size"] = width
         return template
 
-    def _decode_template(self, outputs, context, stage):
+    def _decode_template(self, outputs, context, stage, manifest=None):
         template = {"version": 1, "kind": "decode", "context": context,
                     "graph": {"version": 2, "nodes": self.nodes, "outputs": outputs},
                     "bindings": self.bindings}
@@ -285,6 +287,8 @@ class Graph:
             # Which layers these are, so a host can say what it is holding
             # without re-deriving it from the tensor names.
             template["stage"] = {"first_layer": stage[0], "last_layer": stage[1]}
+        if manifest is not None:
+            template["manifest"] = manifest
         return template
 
 

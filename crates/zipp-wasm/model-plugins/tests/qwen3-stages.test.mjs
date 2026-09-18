@@ -709,3 +709,94 @@ test('a later stage is told a length, not the prompt', {skip: !ready && reason},
     await source.close();
   }
 });
+
+test('a stage refuses a hidden state that is not its predecessor\u2019s',
+  {skip: !ready && reason}, async t => {
+  // The failure a network makes possible. In one process a hidden state is
+  // obviously the right one; over a wire it is an array of floats, and so is
+  // one from a different checkpoint that happens to share a residual width.
+  // Composed, those produce no error and mean nothing -- which is worse than a
+  // crash, because it looks like an answer.
+  const zipp = await import(engineURL);
+  await zipp.default({module_or_path: await readFile(wasmURL)});
+
+  const plugin = await new PluginRegistry().install(
+    await sourceDirectory('../plugins/qwen3/'), {approve: () => true});
+  const source = await fileSource(modelPath);
+  const index = await openGGUF(source, 'model.gguf', null, hostLimits);
+  const store = new WeightStore([index], hostLimits);
+  const engine = new zipp.Engine();
+  try {
+    engine.setSyncHostCapabilities([]);
+    engine.setInstructionBudget(hostLimits.instructionBudget);
+    engine.initPythonProject({...plugin.files}, plugin.entry, []);
+    const call = (name, args) => {
+      engine.renewInstructionBudget();
+      return JSON.parse(engine.pythonCall(name, args));
+    };
+    const vocab = index.strings('tokenizer.ggml.tokens');
+    const config = call('zipp_model_config',
+      [JSON.stringify(index.metadata()), JSON.stringify(vocab.length)]);
+    const layers = config.num_layers, cut = Math.floor(layers / 2) - 1;
+    const stage = (first, last) => call('zipp_model_stage_manifest',
+      [JSON.stringify(config), JSON.stringify(first), JSON.stringify(last),
+       JSON.stringify(CONTEXT)]);
+
+    await t.test('a stage says what it is', () => {
+      const head = stage(0, cut), tail = stage(cut + 1, layers - 1);
+      assert.equal(head.role, 'head');
+      assert.equal(tail.role, 'tail');
+      assert.equal(stage(0, layers - 1).role, 'whole');
+      if (layers > 3) assert.equal(stage(1, layers - 2).role, 'middle');
+      assert.equal(head.config_digest, tail.config_digest, 'same model, same digest');
+      assert.match(head.config_digest, /^[0-9a-f]{64}$/);
+      assert.equal(head.hidden_dtype, 'f32');
+      assert.equal(head.hidden_size, config.hidden_size);
+      assert.equal(head.plugin, 'org.zipp.qwen3');
+      console.log(`      head ${head.first_layer}..${head.last_layer}, ` +
+        `tail ${tail.first_layer}..${tail.last_layer}, digest ${head.config_digest.slice(0, 16)}`);
+    });
+
+    const tailPlan = await prepareDecode(call('zipp_model_decode_stage',
+      [JSON.stringify(config), JSON.stringify(CONTEXT),
+       JSON.stringify(cut + 1), JSON.stringify(layers - 1)]), store, hostLimits);
+    const hidden = new Float32Array(config.hidden_size);
+
+    await t.test('the right predecessor is accepted', async () => {
+      const inputs = await stepInputs(tailPlan, store,
+        {position: 0, hidden, from: stage(0, cut)});
+      assert.ok(inputs.inputs, 'a matching stage should compose');
+    });
+
+    await t.test('a different model with the same width is refused', async () => {
+      // Same hidden size, different epsilon: a checkpoint whose activations
+      // are exactly as pluggable and exactly as wrong.
+      const other = {...config, rms_norm_epsilon: config.rms_norm_epsilon * 2};
+      const impostor = call('zipp_model_stage_manifest',
+        [JSON.stringify(other), JSON.stringify(0), JSON.stringify(cut),
+         JSON.stringify(CONTEXT)]);
+      assert.equal(impostor.hidden_size, config.hidden_size, 'the widths do match');
+      assert.notEqual(impostor.config_digest, stage(0, cut).config_digest);
+      await assert.rejects(
+        stepInputs(tailPlan, store, {position: 0, hidden, from: impostor}),
+        /from a different model/);
+    });
+
+    await t.test('and so is a stage that does not end where this one begins', async () => {
+      // A gap is layers nobody ran; an overlap is layers run twice. Both
+      // compose silently and neither is the model.
+      if (cut >= 1) {
+        await assert.rejects(
+          stepInputs(tailPlan, store, {position: 0, hidden, from: stage(0, cut - 1)}),
+          /layers are missing/);
+      }
+      await assert.rejects(
+        stepInputs(tailPlan, store, {position: 0, hidden, from: stage(cut + 1, layers - 1)}),
+        /so .* layers are missing|ends at layer/);
+      console.log('      a gap, an overlap and a foreign model are all refused by manifest');
+    });
+  } finally {
+    engine.free?.();
+    await source.close();
+  }
+});

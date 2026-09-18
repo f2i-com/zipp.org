@@ -43,8 +43,8 @@ export function validateDecodeTemplate(template, limits) {
   // `stage` and `hidden_size` are optional and describe a graph that covers
   // part of a model rather than all of it: which layers it runs, and how wide
   // the residual stream it hands on is.
-  fields(template, ['version', 'kind', 'context', 'graph', 'bindings', 'stage', 'hidden_size'],
-    ['version', 'kind', 'context', 'graph', 'bindings']);
+  fields(template, ['version', 'kind', 'context', 'graph', 'bindings', 'stage',
+    'hidden_size', 'manifest'], ['version', 'kind', 'context', 'graph', 'bindings']);
   check(template.version === 1 && template.kind === 'decode', 'VERSION', 'Unsupported decode template');
   if (template.stage !== undefined) {
     fields(template.stage, ['first_layer', 'last_layer'], ['first_layer', 'last_layer']);
@@ -52,6 +52,7 @@ export function validateDecodeTemplate(template, limits) {
     integer(template.stage.last_layer, template.stage.first_layer, 4095, 'Stage last layer');
   }
   if (template.hidden_size !== undefined) integer(template.hidden_size, 1, 1 << 20, 'Hidden size');
+  if (template.manifest !== undefined) validateStageManifest(template.manifest);
   const graph = template.graph;
   fields(graph, ['version', 'nodes', 'outputs'], ['version', 'nodes', 'outputs']);
   check(graph.version === 2, 'VERSION', 'Expected ZIPP Graph v2');
@@ -223,15 +224,46 @@ export async function prepareDecode(template, weights, limits) {
     // re-deriving it from the tensor names.
     ...(template.stage !== undefined ? {stage: {...template.stage}} : {}),
     ...(template.hidden_size !== undefined ? {hidden_size: template.hidden_size} : {}),
+    ...(template.manifest !== undefined ? {manifest: template.manifest} : {}),
   };
+}
+
+/** What a stage says it is, so a peer can refuse one it should not accept.
+ *
+ * Checked on the way in rather than trusted, because a manifest travels with a
+ * hidden state and arrives from wherever that did. */
+export function validateStageManifest(manifest) {
+  fields(manifest, ['plugin', 'plugin_version', 'family', 'checkpoint_format',
+    'tokenizer_formats', 'config_digest', 'first_layer', 'last_layer', 'num_layers',
+    'role', 'hidden_size', 'hidden_dtype', 'context', 'graph_version', 'protocol_version'],
+    ['plugin', 'config_digest', 'first_layer', 'last_layer', 'role', 'hidden_size',
+     'hidden_dtype']);
+  check(/^[0-9a-f]{64}$/.test(manifest.config_digest), 'FORMAT',
+    'A configuration digest is a sha256');
+  check(['head', 'middle', 'tail', 'whole'].includes(manifest.role), 'FORMAT',
+    `Unknown stage role: ${String(manifest.role)}`);
+  check(manifest.hidden_dtype === 'f32', 'FORMAT',
+    `A seam carries f32, not ${String(manifest.hidden_dtype)}`);
+  integer(manifest.first_layer, 0, 1 << 20, 'Stage first layer');
+  integer(manifest.last_layer, manifest.first_layer, 1 << 20, 'Stage last layer');
+  integer(manifest.hidden_size, 1, 1 << 20, 'Stage hidden size');
+  return manifest;
 }
 
 /** The inputs one token needs: gathered rows, the mask so far, and the write column.
  *
  * A stage that does not start at layer 0 takes `hidden` instead of a token:
  * the residual stream the previous stage produced, which is the only thing
- * that crosses between them. */
-export async function stepInputs(plan, weights, {token, position, hidden}) {
+ * that crosses between them.
+ *
+ * `from` is that stage's manifest, and passing it is what turns "this is a
+ * float array of the right length" into "this is the output of the stage
+ * before this one, of this model". Two checkpoints that share a residual width
+ * produce hidden states that compose without error and mean nothing, so the
+ * check is against the configuration digest and the layer adjacency rather
+ * than against the shape. It is optional because a single process does not
+ * need it; anything across a boundary should pass it. */
+export async function stepInputs(plan, weights, {token, position, hidden, from}) {
   integer(position, 0, plan.context - 1, 'Decode position');
   const inputs = {};
   for (const step of plan.steps) {
@@ -281,6 +313,20 @@ export async function stepInputs(plan, weights, {token, position, hidden}) {
         'This stage begins mid-model and needs {hidden}: the output of the stage before it');
       check(hidden.length === step.width, 'SHAPE',
         `A hidden state for this stage is ${step.width} values, got ${hidden.length}`);
+      if (from !== undefined) {
+        check(from && typeof from === 'object', 'FORMAT', 'A stage manifest is an object');
+        const mine = plan.manifest;
+        check(mine !== undefined, 'FORMAT',
+          'This plan has no manifest to check a hidden state against');
+        check(from.config_digest === mine.config_digest, 'CHECKPOINT',
+          `That hidden state is from a different model (${from.config_digest} not ` +
+          `${mine.config_digest}). A matching residual width is not a matching model.`);
+        check(from.hidden_dtype === mine.hidden_dtype, 'FORMAT',
+          `That stage sends ${from.hidden_dtype}, this one reads ${mine.hidden_dtype}`);
+        check(from.last_layer + 1 === mine.first_layer, 'SHAPE',
+          `That stage ends at layer ${from.last_layer}; this one begins at ` +
+          `${mine.first_layer}, so ${mine.first_layer - from.last_layer - 1} layers are missing`);
+      }
       for (let i = 0; i < hidden.length; i++) {
         check(Number.isFinite(hidden[i]), 'NUMBER', 'Non-finite value in a hidden state');
       }

@@ -255,6 +255,14 @@ seam is wider and still small -- the residual for every position, 20 KB for a
 five-token prompt -- and it arrives through a `feed` binding rather than a step
 slot, since a prefill graph is built once for one prompt.
 
+**A staged prefill does not warm the decode caches.** It is a batched forward:
+it produces the residual stream, not the key and value tensors a decode session
+carries, and those begin at zero however much prefilling has happened. So the
+flow that works today runs the prompt through the *decode* graphs one position
+at a time, writing the caches as it goes -- correct, and a step per prompt token
+where a batched pass would do. Making a prefill emit `k{n}`/`v{n}` for a decode
+session to start from is the next real feature here, and it is not built yet.
+
 It divides further than in half. `tests/qwen3-stages.test.mjs` runs twenty-eight
 layers as four stages of seven, for both paths, and decodes several positions in
 sequence -- which is the case that matters, because a cache written or read
