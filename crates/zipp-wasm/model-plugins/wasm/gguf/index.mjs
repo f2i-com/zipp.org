@@ -263,8 +263,26 @@ export async function openGGUF(source, {module}) {
     async rows(name, indices) {
       const entry = info(name);
       if (entry.shape.length !== 2) throw new Error(`row gathering needs a matrix: ${name}`);
-      const width = entry.shape[1];
-      const out = new Float32Array(indices.length * width);
+      const [count, width] = entry.shape;
+      // These come from the caller rather than the file, so this is about a
+      // public API being hard to misuse rather than about a hostile
+      // checkpoint. A row index crosses into the module as a `u32`, and
+      // JavaScript will hand 4294967297, -1 or 1.5 to that conversion without
+      // complaint -- each of which reads some *other* row and returns it as
+      // though it were the one asked for.
+      if (!Array.isArray(indices) && !ArrayBuffer.isView(indices)) {
+        throw new Error('rows() takes a list of row indices');
+      }
+      for (const row of indices) {
+        if (!Number.isSafeInteger(row) || row < 0 || row >= count) {
+          throw new Error(`${name}: row ${row} is not one of its ${count} rows`);
+        }
+      }
+      const total = indices.length * width;
+      if (!Number.isSafeInteger(total)) {
+        throw new Error(`${name}: ${indices.length} rows of ${width} is too large to gather`);
+      }
+      const out = new Float32Array(total);
       for (let i = 0; i < indices.length; i++) {
         // Checked here too, not just at open: this one comes fresh out of the
         // module for each call, computed from a row index the caller chose.

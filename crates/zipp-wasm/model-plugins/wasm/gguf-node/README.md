@@ -60,7 +60,7 @@ unrelated crate. The *library* names do not, so a consumer aliases the package
 once and `use gguf::...` reads the way you would expect:
 
 ```toml
-gguf = { package = "f2i-gguf", version = "0.0.2", features = ["std"] }
+gguf = { package = "f2i-gguf", version = "0.0.3", features = ["std"] }
 ```
 
 Everything except the wasm surface builds without `std`, which is what lets the
@@ -100,6 +100,12 @@ since `Blob.slice` clamps and the read simply comes back short. Both are refused
 when the model is opened, naming the tensor, rather than surfacing later as a
 tensor that decoded into nonsense.
 
+`rows()` checks its own arguments for a different reason: those come from the
+caller, not the file. A row index crosses into the module as a `u32`, and
+JavaScript hands `2**32 + 1`, `-1` or `1.5` to that conversion without
+complaint -- each of which reads some other row and returns it as though it
+were the one asked for. An index outside the tensor's own row count is refused.
+
 None of this is about Rust memory safety, which is not in question. It is about
 a malformed or hostile file producing an error rather than a panic, a silently
 truncated length, or an allocation that takes the process down. `crates/gguf/
@@ -110,7 +116,7 @@ plausible header and a couple of thousand rounds of arbitrary bytes.
 
 ```toml
 [dependencies]
-gguf = { package = "f2i-gguf", version = "0.0.2", features = ["std"] }
+gguf = { package = "f2i-gguf", version = "0.0.3", features = ["std"] }
 ```
 
 ```rust

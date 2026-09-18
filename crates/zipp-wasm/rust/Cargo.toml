@@ -30,10 +30,10 @@ license = "MIT OR Apache-2.0"
 # rather than a copy of it.
 #
 # Pinned by revision, not by tag: a tag is a name and a name can be moved, a
-# revision is the code. This one is gguf-wasm v0.0.2, and it is the same
+# revision is the code. This one is gguf-wasm v0.0.3, and it is the same
 # revision ../model-plugins/wasm/gguf-wasm.lock.json records for the
 # WebAssembly build in the tree. Move both together.
-gguf-quants = { package = "f2i-gguf-quants", git = "https://github.com/f2i-com/gguf-wasm", rev = "f079ef03fc5794d58cd03b13cbbe9327cd0e413b" }
+gguf-quants = { package = "f2i-gguf-quants", git = "https://github.com/f2i-com/gguf-wasm", rev = "fc74d6fb8cf3cf6c770a65384388db98db209e3d" }
 
 [profile.release]
 opt-level = 3
