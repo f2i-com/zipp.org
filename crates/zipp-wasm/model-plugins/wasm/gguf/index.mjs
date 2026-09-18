@@ -29,6 +29,25 @@
 const FIRST = 1 << 20;
 const LARGEST = 64 << 20;
 
+/** What the module's own parameters can hold.
+ *
+ * The Rust parser is `u64` throughout, and a tensor's `offset` and `bytes` stay
+ * that wide because reading a range never materialises anything inside the
+ * module. But `dequantize` and `row_range` take `u32`: they produce values *in*
+ * wasm32 memory, which tops out at four gigabytes anyway, so a wider parameter
+ * would only move the failure.
+ *
+ * The part worth refusing is the silent conversion. wasm-bindgen turns a
+ * JavaScript number into a `u32` by truncating, so a row index of 2^32 + 5
+ * arrives as 5 -- a different row, read successfully, returned as though it
+ * were the one asked for. Anything crossing that boundary is checked here
+ * instead, where the number still means what the caller wrote.
+ *
+ * `bytes()` has no such ceiling and is the way to reach a tensor this cannot
+ * decode in one go: the range is read outside the module and never passes
+ * through a `u32`. */
+const U32_MAX = 0xffffffff;
+
 /** A `File` or `Blob` the person chose. Nothing is uploaded and nothing is
  * loaded: `slice` is a view, and only the slice is read.
  *
@@ -43,12 +62,31 @@ export function fromBlob(blob) {
   };
 }
 
-/** `Content-Range: bytes 12-34/5678`, as numbers. Null if it is not that. */
+/** `Content-Range: bytes 12-34/5678`, as numbers. Null if it is not that.
+ *
+ * Null too if any of them is past 2^53. These are decimal digits from a header
+ * and `Number` will take as many as it is given, returning something close to
+ * but not equal to what was sent -- and the whole point of reading this header
+ * is comparing it with what was asked for. The same rule as a tensor range:
+ * nothing beyond what JavaScript can hold exactly. */
 function parseContentRange(header) {
   const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(header ?? '').trim());
   if (!match) return null;
-  const [, start, end, total] = match;
-  return {start: Number(start), end: Number(end), total: Number(total)};
+  const [start, end, total] = match.slice(1, 4).map(Number);
+  if (![start, end, total].every(Number.isSafeInteger)) return null;
+  return {start, end, total};
+}
+
+/** An `ETag` usable as an `If-Range` validator, or null.
+ *
+ * `If-Range` needs a *strong* validator: a weak one (`W/"..."`) promises only
+ * that the entity is semantically equivalent, which is exactly the guarantee
+ * that does not hold here -- two byte ranges from semantically equivalent but
+ * differently encoded entities do not join up. RFC 9110 says a server must
+ * ignore `If-Range` with a weak validator, so sending one would give a
+ * confident-looking request that means nothing. */
+function strongETag(value) {
+  return typeof value === 'string' && !/^\s*W\//.test(value) ? value : null;
 }
 
 /**
@@ -66,16 +104,19 @@ function parseContentRange(header) {
  *     which is the same information a HEAD would give and is proof rather than
  *     a promise. Some perfectly good servers and CDNs do not expose
  *     `Accept-Ranges` or `Content-Length` to a cross-origin HEAD at all.
- *   * whatever validator comes back -- `ETag`, else `Last-Modified` -- is sent
- *     as `If-Range` on every subsequent read. A server whose object has changed
- *     answers 200 with the whole entity instead of 206, and that is refused.
+ *   * whatever validator comes back -- a *strong* `ETag`, else `Last-Modified`
+ *     -- is sent as `If-Range` on every subsequent read. A server whose object
+ *     has changed answers 200 with the whole entity instead of 206, and that is
+ *     refused. A weak ETag is passed over: `If-Range` requires a strong
+ *     validator and a server must ignore a weak one, so sending it would look
+ *     like a guarantee while being none.
  *   * every response's `Content-Range` must be the range that was asked for,
  *     out of a total that has not changed.
  *
  * None of this makes an HTTP source trustworthy. It makes it *consistent*:
  * given a validator, what is read is all from one object or it is an error.
  *
- * A server that offers neither `ETag` nor `Last-Modified` cannot support that
+ * A server that offers neither a strong `ETag` nor `Last-Modified` cannot support that
  * promise -- an object could be replaced by a different one of the same length
  * between two reads and nothing here would see it. That is refused by default
  * rather than quietly downgraded, because the failure it produces is a model
@@ -105,7 +146,7 @@ export function fromURL(url, {
     if (size !== null && range.total !== size) {
       throw new Error(`${url} is now ${range.total} bytes, was ${size}: the object changed`);
     }
-    const now = response.headers.get('etag') ?? response.headers.get('last-modified');
+    const now = strongETag(response.headers.get('etag')) ?? response.headers.get('last-modified');
     if (validator && now && now !== validator) {
       throw new Error(`${url} changed identity (${validator} -> ${now})`);
     }
@@ -120,10 +161,14 @@ export function fromURL(url, {
       size = range.total;
       if (!Number.isFinite(size) || size <= 0) throw new Error(`${url} reports no length`);
       // Pinned here, and required to still hold on every read after this.
-      validator = response.headers.get('etag') ?? response.headers.get('last-modified') ?? null;
+      // A weak ETag is not usable here, so it is passed over for
+      // Last-Modified rather than sent as an If-Range a server must ignore.
+      validator = strongETag(response.headers.get('etag'))
+        ?? response.headers.get('last-modified') ?? null;
       if (validator === null && !allowUnvalidated) {
         throw new Error(
-          `${url} offers neither ETag nor Last-Modified, so reads cannot be pinned to one ` +
+          `${url} offers neither a strong ETag nor Last-Modified, so reads cannot be pinned ` +
+          `to one `+
           `version of it. Pass {allowUnvalidated: true} to read it anyway.`);
       }
     },
@@ -253,6 +298,11 @@ export async function openGGUF(source, {module}) {
     async floats(name) {
       const entry = info(name);
       if (!entry.readable) throw new Error(`${name} is ${entry.dtype}; this build does not decode it`);
+      if (entry.elements > U32_MAX) {
+        throw new Error(
+          `${name} has ${entry.elements} values, past the ${U32_MAX} this module can decode in ` +
+          `one call. Read it as blocks with bytes() and decode it in pieces.`);
+      }
       return module.dequantize(entry.dtype, await this.bytes(name), entry.elements);
     },
 
@@ -276,6 +326,11 @@ export async function openGGUF(source, {module}) {
       for (const row of indices) {
         if (!Number.isSafeInteger(row) || row < 0 || row >= count) {
           throw new Error(`${name}: row ${row} is not one of its ${count} rows`);
+        }
+        if (row > U32_MAX) {
+          throw new Error(
+            `${name}: row ${row} is past the ${U32_MAX} this module addresses. The tensor is ` +
+            `reachable with bytes(), which reads a range without going through the module.`);
         }
       }
       const total = indices.length * width;

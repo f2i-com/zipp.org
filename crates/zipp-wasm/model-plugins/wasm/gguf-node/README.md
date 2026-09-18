@@ -60,7 +60,7 @@ unrelated crate. The *library* names do not, so a consumer aliases the package
 once and `use gguf::...` reads the way you would expect:
 
 ```toml
-gguf = { package = "f2i-gguf", version = "0.0.3", features = ["std"] }
+gguf = { package = "f2i-gguf", version = "0.0.4", features = ["std"] }
 ```
 
 Everything except the wasm surface builds without `std`, which is what lets the
@@ -106,6 +106,21 @@ JavaScript hands `2**32 + 1`, `-1` or `1.5` to that conversion without
 complaint -- each of which reads some other row and returns it as though it
 were the one asked for. An index outside the tensor's own row count is refused.
 
+### One `u32` ceiling, made explicit
+
+The parser is `u64` throughout, and a tensor's offset and length stay that wide
+because reading a range never materialises anything inside the module. Two
+entry points are narrower: `dequantize` and `row_range` take a `u32`, since what
+they produce lands in wasm32 memory, which is four gigabytes in total. A wider
+parameter would move the failure rather than remove it.
+
+What is worth refusing is the silent conversion, and `js/index.mjs` does:
+`rows()` rejects an index past `0xffffffff` and `floats()` rejects a tensor with
+more values than that, each saying so rather than truncating. `bytes()` has no
+such ceiling and is the way past it -- the range is read outside the module and
+never crosses that boundary, which is what a caller holding a tensor too large
+to decode in one go should use.
+
 None of this is about Rust memory safety, which is not in question. It is about
 a malformed or hostile file producing an error rather than a panic, a silently
 truncated length, or an allocation that takes the process down. `crates/gguf/
@@ -116,7 +131,7 @@ plausible header and a couple of thousand rounds of arbitrary bytes.
 
 ```toml
 [dependencies]
-gguf = { package = "f2i-gguf", version = "0.0.3", features = ["std"] }
+gguf = { package = "f2i-gguf", version = "0.0.4", features = ["std"] }
 ```
 
 ```rust
@@ -190,7 +205,12 @@ when the model is opened and carried afterwards:
   `If-Range` on every read after that, so a changed object answers 200 with the
   whole entity and is refused;
 * every response's `Content-Range` must be the range that was asked for, out of
-  a total that has not changed.
+  a total that has not changed, and its numbers must be exact JavaScript
+  integers -- they are decimal digits from a header, and `Number` will take more
+  of them than it can hold and return something merely close;
+* a *weak* `ETag` is passed over for `Last-Modified`. `If-Range` requires a
+  strong validator and a server must ignore a weak one, so sending `W/"..."`
+  would look like a guarantee while being none.
 
 That does not make an HTTP source trustworthy. It makes it *consistent*: given
 a validator, what is read is all from one object or it is an error.
@@ -233,6 +253,26 @@ arithmetic in double and rounding once at the end agrees most of the time and
 differs in the last bit the rest of it, which over a table with millions of
 values is not "most of the time" at all.
 
+Which is a claim, so it is checked against someone else's decoder rather than
+only against `ggml-quants.c` by eye. `crates/gguf-quants/tests/golden/` holds
+vectors decoded by [gguf-py](https://github.com/ggml-org/llama.cpp/tree/master/gguf-py),
+the llama.cpp project's own GGUF library, written in numpy by other people from
+the same specification. The comparison is equality, not a tolerance: **all
+fifteen formats, bit for bit.**
+
+The blocks are synthetic, and no model weights are in this repository. A decoder
+does not need a quantizer: every bit pattern is a legal block, since the quants
+are fixed-width indices and the scales are f16, so pseudo-random bytes are a
+valid block of any format. The one correction is that the f16 scale fields are
+overwritten with finite values, because a random f16 is NaN or infinity about
+one time in 128 and a NaN's payload is not something two implementations owe
+each other.
+
+That is also how the K-quants get covered at all — gguf-py decodes them without
+being able to produce them — and it is better coverage than real weights, which
+cluster where an off-by-one in a shift does not show.
+`scripts/golden-vectors.py` regenerates them.
+
 ## Examples
 
 ```sh
@@ -258,7 +298,9 @@ from that tag's `Cargo.lock`.
 ## Tests
 
 ```sh
-cargo test --workspace                                # the format itself
+cargo test --workspace                                # the format itself,
+                                                      # including the golden
+                                                      # vectors from gguf-py
 cargo test -p f2i-gguf --features std                 # and the file reader
 node --test js/index.test.mjs                         # the source adapters
 sh scripts/build-wasm.sh && node scripts/smoke.mjs    # the built module
