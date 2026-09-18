@@ -23,6 +23,22 @@ export async function createRuntime({backend='auto', limits={}, wasmBytes, wasmU
   throw new ComputeError('UNAVAILABLE',`Requested backend unavailable: ${attempts.map(a=>`${a.backend}: ${a.error}`).join('; ')}`);
 }
 
+/**
+ * Refuses a graph a backend has no kernel for, before anything is uploaded.
+ *
+ * Without this an operation with no case in a backend's switch leaves its
+ * output buffer at zero and returns a plausible tensor of nothing. Every
+ * backend used to implement every operation, so the question never arose;
+ * `matmul_fixed` is the first that two of them cannot do, and a silent wrong
+ * answer is the one failure a protocol built to be checkable must not have.
+ */
+function refuseUnsupported(plan, impl) {
+  const unsupported = impl.unsupported?.();
+  if (!unsupported?.size) return;
+  for (const n of plan.nodes) check(!unsupported.has(n.op), 'UNSUPPORTED',
+    `The ${impl.name} backend has no ${n.op} kernel`);
+}
+
 export class ComputeRuntime {
   constructor(backend,limits={},attempts=[]){this.impl=backend;this.limits=limits;this.attempts=attempts;this.busy=false;this.disposed=false;this.sessions=new Set();}
   get backend(){return this.impl.name;}
@@ -39,7 +55,8 @@ export class ComputeRuntime {
     check(!this.disposed,'DISPOSED','Runtime has been disposed');
     check(!this.busy,'BUSY','Runtime supports one graph at a time; await the previous execution');
     // Validation and owned input copies happen before any asynchronous work or GPU allocation.
-    const plan=validateProgram(program,{...(this.impl.limitHints?.()??{}),...this.limits});this.busy=true;
+    const plan=validateProgram(program,{...(this.impl.limitHints?.()??{}),...this.limits});
+    refuseUnsupported(plan,this.impl);this.busy=true;
     const start=clock(),handles=new Map(),uses=[...plan.uses],root=plan.root;
     let value,error,began=false,finishError;
     // Handles belong to storage roots; a reshape shares its source's handle.
@@ -94,6 +111,7 @@ export class ComputeRuntime {
     check(!this.disposed,'DISPOSED','Runtime has been disposed');
     check(!this.busy,'BUSY','Runtime supports one graph at a time; await the previous execution');
     const plan=validateProgram(program,{...(this.impl.limitHints?.()??{}),...this.limits},{session:true}),limits=plan.limits;
+    refuseUnsupported(plan,this.impl);
     check(this.sessions.size<limits.maxSessions,'LIMIT',`At most ${limits.maxSessions} sessions per runtime; dispose one first`);
     check(Array.isArray(resident)&&resident.every(n=>typeof n==='string'),'PROTOCOL','resident must list output names');
     const names=new Set(plan.outputs.map(o=>o.name));

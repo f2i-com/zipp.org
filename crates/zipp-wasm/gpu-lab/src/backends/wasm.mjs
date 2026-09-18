@@ -2,6 +2,8 @@ import {check} from '../graph.mjs';
 const BINARY={add:0,sub:1,mul:2,div:3},MODE={same:0,aScalar:1,bScalar:2};
 const UNARY={relu:0,positive:1,neg:2,exp:3,log:4,sqrt:5,tanh:6,sigmoid:7,gelu:8,gelu_grad:9};
 // The kernel takes the format as a number; both pack 256 values to a block.
+// 2 is `matmul_fixed` reading a plain f32 weight; the float kernels have
+// no such case, because a float weight there is simply `bmm_t`.
 const QUANT_DTYPE={q4_k:0,q6_k:1};
 // A ceiling, not a reservation: the module's memory grows only as the arena is
 // used. It has to admit a real checkpoint -- a 0.6B Qwen3 is 373 MB of blocks,
@@ -77,6 +79,20 @@ export class WasmBackend {
         } else if (n.transposed) e.bmm_t(a,b,o.ptr,n.batch,n.m,n.k,n.n,n.aBatchStride,n.bBatchStride);
         else e.bmm(a,b,o.ptr,n.batch,n.m,n.k,n.n,n.aBatchStride,n.bBatchStride);
         break;
+      case 'matmul_fixed': {
+        // Four scratch buffers, all released with the mark: a decoded weight
+        // row, the quantized activations and their per-row scales, and the
+        // quantized weight row. The kernel's answer is an integer, so it is
+        // identical to the JavaScript reference's rather than close to it.
+        const mark = this.cursor;
+        const row = this.alloc(n.k), qa = this.reserve(n.m * n.k * 2, {}),
+              sa = this.alloc(n.m), qw = this.reserve(n.k * 2, {});
+        e.bmm_fixed(a, b, o.ptr, row.ptr, qa.ptr, sa.ptr, qw.ptr,
+          n.batch, n.m, n.k, n.n, n.aBatchStride, n.bBatchStride,
+          n.bQuant ? QUANT_DTYPE[n.bQuant.dtype] : 2);
+        this.cursor = mark;
+        break;
+      }
       case 'life': e.life(a,o.ptr,n.shape[0],n.shape[1]); break;
       case 'sum': case 'mean':
         if (n.whole) {

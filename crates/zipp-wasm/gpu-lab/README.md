@@ -53,6 +53,7 @@ every backend, float32 tensors of rank 0-4:
 | Reductions | `sum`, `mean` over one `axis` (with `keepdim`) or the whole tensor |
 | Rows | `softmax`, `log_softmax` over the last axis (max-subtracted) |
 | Linear algebra | `matmul`: [M,K]@[K,N] and batched [B,M,K]@[B,K,N] (a batch of 1 or a matrix broadcasts) |
+| Integer linear algebra | `matmul_fixed`: the same product over int16 quants and an exact integer sum, `transposed` only. cpu-js and wasm; the GPU backends refuse it. See [docs/FIXED-POINT.md](docs/FIXED-POINT.md) |
 | Losses | `cross_entropy` (mean over rows, integer class targets) and `cross_entropy_grad` = (softmax - onehot)/N |
 | Optimizers | `sgd_update`, `momentum_update`, `adam_m`, `adam_v`, `adam_update` (PyTorch's update order) |
 | Other | toroidal `life` |
@@ -114,6 +115,17 @@ callback that resubmits cannot recurse), and rejects work after tenant invalidat
   the same matmul over decoded values gives, because decoding is exact. All four
   backends do this; each has its own decoder, and each is held to that equality.
   `scripts/check-gpu-matmul.cjs` measures the two GPU ones in a real browser.
+- `docs/FIXED-POINT.md`: `matmul_fixed`, the one operation here that is *not*
+  float32. Both sides are quantized to int16 with a per-row scale and the
+  products are summed as integers, so cpu-js and wasm reach the same answer by
+  construction rather than by agreeing about rounding order — which is what a
+  proof system over a prime field needs, and what lets a redundant-execution
+  check compare for equality instead of within a tolerance. It costs 1.8e-04
+  median relative error against `matmul` and, today, runs 4.1 times slower on a
+  decode step -- almost all of it requantising a weight that never changes.
+  WebGPU and
+  WebGL2 have no 64-bit integer to accumulate in and refuse the graph rather
+  than returning zeros.
 - `wasm/kernels.wasm`: the COMMITTED binary of the freestanding kernels, built
   from `../rust/zipp-kernels` (`no_std` Rust, SIMD, no allocator, no imports).
   No workflow rebuilds it: `npm test`, the Node GPU suites and the

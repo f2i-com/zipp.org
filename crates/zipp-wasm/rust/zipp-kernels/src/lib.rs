@@ -37,6 +37,13 @@ mod kernels {
     #[inline]
     fn sqrtf(x: f32) -> f32 { f32x4_extract_lane::<0>(f32x4_sqrt(f32x4_splat(x))) }
 
+    /// `abs` and `floor` are `std` methods; freestanding, the sign bit is a
+    /// mask and the rounding is the same SIMD instruction taken in one lane.
+    #[inline]
+    fn absf(x: f32) -> f32 { f32::from_bits(x.to_bits() & 0x7fff_ffff) }
+    #[inline]
+    fn floorf(x: f32) -> f32 { f32x4_extract_lane::<0>(f32x4_floor(f32x4_splat(x))) }
+
     #[inline]
     unsafe fn s<'a>(p: *const f32, n: i32) -> &'a [f32] { core::slice::from_raw_parts(p, n as usize) }
     #[inline]
@@ -365,6 +372,100 @@ mod kernels {
                 }
             }
         }
+    }
+
+    /// `C[m,n] = A[m,k] @ W[n,k]^T` accumulated in integers, not in float32.
+    ///
+    /// This is `matmul_fixed`, and it makes a different promise from every
+    /// other kernel here. The rest are bit-for-bit with the JavaScript
+    /// reference because both sides round float32 in the same order, which is
+    /// an agreement that has to be maintained. This one is bit-for-bit because
+    /// integer addition is associative: once two implementations agree on the
+    /// quants, no ordering, no vectorisation and no scheduling can make their
+    /// sums differ. That is the property a proof system needs -- a prime field
+    /// can express an integer sum and cannot express IEEE-754 rounding.
+    ///
+    /// Both sides are quantized to int16 against a per-row maximum, exactly as
+    /// `quantizeRow` in `gpu-lab/src/kernel-math.mjs` states it; read that for
+    /// why `floor(x + 0.5)` rather than a rounding intrinsic. `dtype` is 0 for
+    /// Q4_K, 1 for Q6_K and 2 for a plain f32 weight; the quantized forms are
+    /// requantized from what they decode to, because their sub-block scales are
+    /// not something one per-row integer scale can stand in for.
+    ///
+    /// The host supplies four scratch buffers: `row` (k floats, one decoded
+    /// weight row), `qa` (m*k int16), `sa` (m floats) and `qw` (k int16).
+    ///
+    /// Deliberately scalar. The products are up to 2^30 and their sum up to
+    /// 2^40, which needs an i64 accumulator, and wasm SIMD has no 64-bit
+    /// multiply-accumulate to widen this with. Correctness first: this is the
+    /// reference the GPU backends will be held to.
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn bmm_fixed(a: *const f32, w: *const u8, o: *mut f32,
+        row: *mut f32, qa: *mut i16, sa: *mut f32, qw: *mut i16,
+        batch: i32, m: i32, k: i32, n: i32, stride_a: i32, stride_b: i32, dtype: i32) {
+        const BLOCK_SIZE: isize = 256; // Q4_K and Q6_K alike
+        let (mi, ki, ni) = (m as isize, k as isize, n as isize);
+        let quantized = dtype != 2;
+        let bytes_per_block = if dtype == 0 { gguf_quants::q4_k::BYTES_PER_BLOCK }
+                              else { gguf_quants::q6_k::BYTES_PER_BLOCK } as isize;
+        let per = ki / BLOCK_SIZE;            // whole blocks per row, always exact
+        let row_bytes = per * bytes_per_block;
+        for t in 0..batch as isize {
+            let a = a.offset(t * stride_a as isize);
+            let c = o.offset(t * mi * ni);
+            // A quantized weight's stride counts values; its bytes are blocks.
+            let w = if quantized { w.offset((t * stride_b as isize / BLOCK_SIZE) * bytes_per_block) }
+                    else { w.offset(t * stride_b as isize * 4) };
+            // Quantized once per batch and reused by every output column, the
+            // way the float path reuses a decoded weight row across every row.
+            for r in 0..mi { *sa.offset(r) = quantize_row(a.offset(r * ki), ki, qa.offset(r * ki)); }
+            for col in 0..ni {
+                if quantized {
+                    let src = core::slice::from_raw_parts(w.offset(col * row_bytes), row_bytes as usize);
+                    let dst = core::slice::from_raw_parts_mut(row, ki as usize);
+                    if dtype == 0 { gguf_quants::q4_k::dequantize(src, dst) }
+                    else { gguf_quants::q6_k::dequantize(src, dst) }
+                } else {
+                    let src = w as *const f32;
+                    for j in 0..ki { *row.offset(j) = *src.offset(col * ki + j); }
+                }
+                let sw = quantize_row(row, ki, qw);
+                for r in 0..mi {
+                    let qrow = qa.offset(r * ki);
+                    let mut acc: i64 = 0;
+                    for j in 0..ki { acc += (*qrow.offset(j) as i64) * (*qw.offset(j) as i64); }
+                    *c.offset(r * ni + col) = (acc as f32) * (*sa.offset(r) * sw);
+                }
+            }
+        }
+    }
+
+    /// int16 quants against the row's own maximum; returns the float32 scale.
+    /// The JavaScript statement of this is `quantizeRow`, and the two agree
+    /// operation for operation -- a double-rounded float32 divide is the same
+    /// value as a direct one, so the reference computing in double changes
+    /// nothing.
+    unsafe fn quantize_row(src: *const f32, k: isize, dst: *mut i16) -> f32 {
+        const QMAX: f32 = 32767.0;
+        let mut mx = 0.0f32;
+        // `>` and not a max intrinsic, so a NaN is skipped here exactly as the
+        // reference skips it rather than propagating.
+        for j in 0..k { let v = absf(*src.offset(j)); if v > mx { mx = v; } }
+        // Negated deliberately, and not `mx <= 0.0`: this has to be true for a
+        // NaN as well as for zero, so that a row of NaNs takes the zero-scale
+        // path rather than quantising to the clamp bound.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        if !(mx > 0.0) {
+            for j in 0..k { *dst.offset(j) = 0; }
+            return 0.0;
+        }
+        let s = mx / QMAX;
+        for j in 0..k {
+            let t = floorf(*src.offset(j) / s + 0.5);
+            *dst.offset(j) = if t >= -QMAX { if t <= QMAX { t as i16 } else { 32767 } } else { -32767 };
+        }
+        s
     }
 
     #[no_mangle]

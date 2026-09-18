@@ -1,4 +1,4 @@
-import {gelu, geluGrad, sigmoid, relu} from '../kernel-math.mjs';
+import {gelu, geluGrad, sigmoid, relu, quantizeRow} from '../kernel-math.mjs';
 
 /**
  * Reference float32 host-JavaScript implementation, not advertised as WASM.
@@ -143,6 +143,45 @@ export class CPUBackend {
                 const x = a[ao + r*k + j], base = bo + j*cols;
                 for (let c = 0; c < cols; c++) row[c] += f(x * b[base + c]);
               }
+            }
+          }
+        }
+        break;
+      }
+      case 'matmul_fixed': {
+        // Integer accumulation, and therefore the same answer on every backend
+        // rather than an answer within a tolerance of another one. See
+        // `quantizeRow` for the quantisation this depends on and
+        // docs/FIXED-POINT.md for what it costs against float32.
+        const {m, k, n: cols} = n;
+        const qa = new Int16Array(m * k), sa = new Float32Array(m);
+        const qw = new Int16Array(k), row = new Float32Array(k);
+        const decode = n.bQuant ? blockDecoder(n.bQuant.dtype) : null;
+        const BLOCK = n.bQuant ? FORMATS[n.bQuant.dtype].block : 0;
+        const BYTES = n.bQuant ? FORMATS[n.bQuant.dtype].bytes : 0;
+        const perRow = n.bQuant ? k / BLOCK : 0;
+        for (let batch = 0; batch < n.batch; batch++) {
+          const ao = batch * n.aBatchStride, oo = batch * m * cols;
+          const bo = n.bQuant ? (batch * n.bBatchStride) / BLOCK : batch * n.bBatchStride;
+          // The activations are quantized once per batch and reused by every
+          // output column, the same way the float path reuses a decoded weight
+          // row across every row of a.
+          for (let r = 0; r < m; r++) sa[r] = quantizeRow(a, ao + r * k, k, qa, r * k);
+          for (let c = 0; c < cols; c++) {
+            if (decode) for (let t = 0; t < perRow; t++) decode(b, (bo + c * perRow + t) * BYTES, row, t * BLOCK);
+            else for (let j = 0; j < k; j++) row[j] = b[bo + c * k + j];
+            // A quantized weight is requantized from what it decodes to, not
+            // from the block's own scales: Q4_K and Q6_K carry sub-block scales
+            // that no single per-row integer can stand in for, and the scale
+            // here has to be the one the accumulator is undone by.
+            const sw = quantizeRow(row, 0, k, qw, 0);
+            for (let r = 0; r < m; r++) {
+              // Exact: each product is under 2^30 and a double is exact to
+              // 2^53, which the graph validator checks k against.
+              let acc = 0;
+              const base = r * k;
+              for (let j = 0; j < k; j++) acc += qa[base + j] * qw[j];
+              out[oo + r * cols + c] = f(f(acc) * f(sa[r] * sw));
             }
           }
         }

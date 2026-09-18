@@ -330,6 +330,55 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
         n.shape = ra === 3 || rb === 3 ? [n.batch, n.m, n.n] : [n.m, n.n];
         shapeOf(n.shape, limits); units = 2 * n.batch * n.m * n.k * n.n; break;
       }
+      case 'matmul_fixed': {
+        // The same product as `matmul`, computed over integers.
+        //
+        // Both sides are quantized to int16 with a per-row scale derived from
+        // the data, the k products are summed exactly, and the total is scaled
+        // back once. Integer addition is associative, so every backend that
+        // implements this reaches the *same* integer -- not one within a
+        // tolerance of another. `matmul` is bit-for-bit by careful agreement
+        // about float32 rounding order; this is bit-for-bit by construction,
+        // which is what a proof system needs, since a prime field can express
+        // an integer sum and cannot express IEEE-754 rounding.
+        //
+        // It is a separate operation and not a mode of `matmul` because it
+        // makes a different promise. `matmul` answers "what does float32 say";
+        // this answers "what do the integers say", and on a real projection the
+        // two differ by about 2.3e-3 (worst absolute, cosine 1.000000). A graph
+        // asks for one or the other; neither silently becomes the other.
+        keys(raw, ['id', 'op', 'a', 'b', 'transposed'], ['a', 'b']);
+        // A weight is stored [N, K] -- one contiguous row per output column --
+        // and a per-row scale is only cheap in that layout. There is no second
+        // layout to get wrong, so the flag is required rather than defaulted.
+        // Checked here rather than listed as a required field, so that omitting
+        // it and passing it as false give the one answer that says why.
+        check(raw.transposed === true, 'PROTOCOL', 'matmul_fixed reads its weight as [N, K]: transposed is required and is true');
+        const a = ref('a'), b = ref('b', true);
+        n.transposed = true;
+        const ra = a.shape.length, rb = b.shape.length;
+        check((ra === 2 || ra === 3) && (rb === 2 || rb === 3) && a.shape[ra - 1] === b.shape[rb - 1],
+          'SHAPE', 'matmul_fixed requires [M,K] @ [N,K] or batched [B,M,K] @ [B,N,K]');
+        const ba = ra === 3 ? a.shape[0] : 1, bb = rb === 3 ? b.shape[0] : 1;
+        check(ba === bb || ba === 1 || bb === 1, 'SHAPE', 'matmul_fixed batch dimensions must match or be 1');
+        n.batch = Math.max(ba, bb); n.m = a.shape[ra - 2]; n.k = a.shape[ra - 1]; n.n = b.shape[rb - 2];
+        // Exactness is the whole claim, so the accumulator's ceiling is checked
+        // rather than assumed. Each product is under 2^30 and k of them are
+        // summed; the JavaScript reference holds that in a double, which is
+        // exact below 2^53, and the WASM kernel in an i64. The bound is reached
+        // at k = 2^23, far above any real projection, but a graph is untrusted
+        // input and this is the one place the guarantee could quietly lapse.
+        check(n.k * 32767 * 32767 <= Number.MAX_SAFE_INTEGER, 'LIMIT',
+          'matmul_fixed inner dimension is too large for an exact integer accumulator');
+        n.aBatchStride = ba === 1 ? 0 : n.m * n.k; n.bBatchStride = bb === 1 ? 0 : n.n * n.k;
+        const fixedQuant = nodes[root[raw.b]]?.quant;
+        if (fixedQuant) n.bQuant = fixedQuant;
+        n.shape = ra === 3 || rb === 3 ? [n.batch, n.m, n.n] : [n.m, n.n];
+        // Two quantisation passes on top of the product itself: one over the
+        // activations, one over each decoded weight row.
+        shapeOf(n.shape, limits);
+        units = 2 * n.batch * n.m * n.k * n.n + 2 * n.batch * (n.m + n.n) * n.k; break;
+      }
       case 'cross_entropy': case 'cross_entropy_grad': {
         keys(raw, ['id', 'op', 'a', 'b'], ['a', 'b']);
         const a = ref('a'), b = ref('b');
