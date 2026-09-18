@@ -1,0 +1,17 @@
+{
+  "generator": "tools/make_tiny_qwen3.py",
+  "purpose": "Shape, not meaning: a Qwen3-shaped GGUF with random weights, so the stage and seam tests run without a real checkpoint.",
+  "sha256": "fb06481e513f789433757d76d301f99ce81d991d2da2bd4d0cb529b0a1e53e0e",
+  "bytes": 2928192,
+  "config": {
+    "hidden_size": 256,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 64,
+    "num_layers": 8,
+    "intermediate_size": 512,
+    "vocab_size": 1024,
+    "context_length": 64
+  },
+  "quantized": "token_embd is Q6_K, every projection Q4_K, so the packed matmul is exercised rather than only the float path"
+}

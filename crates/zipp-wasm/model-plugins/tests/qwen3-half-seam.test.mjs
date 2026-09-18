@@ -25,12 +25,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile, open, stat, access} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
 
 import {PluginRegistry, openGGUF, WeightStore, prepareDecode, stepInputs,
         resolveLimits} from '../src/index.mjs';
 import {sourceDirectory} from './helpers.mjs';
 import {throughHalf} from './helpers/half.mjs';
 
+// The tiny fixture by default, so these run in CI; a real checkpoint when one
+// is named. The fixture has the shape of a Qwen3 and random weights, which is
+// everything these tests need and nothing they claim about language.
+// The real checkpoint, not the tiny fixture: this measures against the stored
+// transformers logits, and those are evidence about one file. On the fixture
+// there would be nothing external to compare with, and the number would be a
+// measurement of a seam against itself.
 const modelPath = process.env.ZIPP_QWEN3_MODEL;
 const runtimeURL = new URL('../../gpu-lab/src/runtime.mjs', import.meta.url);
 const engineURL = new URL('../../dist/all/zipp_wasm.js', import.meta.url);

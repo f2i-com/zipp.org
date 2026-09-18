@@ -33,3 +33,7 @@ crates/zipp-wasm/**/*.wasm -text
 # line-ending converted -- the digest would fail on the first Windows checkout
 # and it would look like the model had changed.
 *.f32 binary
+
+# A GGUF is a container of packed blocks and f16 scales. Bytes that happen to be
+# 0x0D 0x0A are data, and this repository sets `text` on everything by default.
+*.gguf binary

@@ -37,21 +37,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile, open, stat, access} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
 
 import {PluginRegistry, openGGUF, WeightStore, bindGraph, prepareDecode, stepInputs,
         resolveLimits} from '../src/index.mjs';
 import {sourceDirectory} from './helpers.mjs';
 
-const modelPath = process.env.ZIPP_QWEN3_MODEL;
+// The tiny fixture by default, so these run in CI; a real checkpoint when one
+// is named. The fixture has the shape of a Qwen3 and random weights, which is
+// everything these tests need and nothing they claim about language.
+// A path rather than a URL: this is opened with fs and also handed to a worker,
+// and a URL survives neither as well as a string does.
+const modelPath = process.env.ZIPP_QWEN3_MODEL
+  ?? fileURLToPath(new URL('fixtures/tiny-qwen3.gguf', import.meta.url));
 const runtimeURL = new URL('../../gpu-lab/src/runtime.mjs', import.meta.url);
 const engineURL = new URL('../../dist/all/zipp_wasm.js', import.meta.url);
 const wasmURL = new URL('../../dist/all/zipp_wasm_bg.wasm', import.meta.url);
 const kernelsURL = new URL('../../gpu-lab/wasm/kernels.wasm', import.meta.url);
 
 const exists = async url => { try { await access(url); return true; } catch { return false; } };
-const ready = Boolean(modelPath) && await exists(modelPath) &&
+const ready = await exists(modelPath) &&
   await exists(runtimeURL) && await exists(engineURL) && await exists(wasmURL);
-const reason = 'Set ZIPP_QWEN3_MODEL to a Qwen3 GGUF, with dist/all built';
+const reason = 'Needs dist/all built, and tests/fixtures/tiny-qwen3.gguf';
 
 const GB = 1024 * 1024 * 1024;
 const CONTEXT = 32;
@@ -81,6 +88,14 @@ async function fileSource(path) {
     close: () => handle.close(),
   };
 }
+
+/** Whether this is a real checkpoint or the tiny shape-only fixture.
+ *
+ * The fixture has random weights, so it computes nothing meaningful and no
+ * assertion about *what* it predicts can hold. Everything structural still
+ * does -- which is the point of it, and why the staged tests run in CI at all.
+ * Only the "and it says Paris" assertions are conditional. */
+const knowsThings = config => config.vocab_size > 100000;
 
 /** What a hidden state survives on its way to another device.
  *
@@ -223,9 +238,9 @@ test('Qwen3 split across two stages gives the logits of the whole model',
       const logits = b.outputs.logits.data;
       let best = 0;
       for (let i = 1; i < logits.length; i++) if (logits[i] > logits[best]) best = i;
-      assert.equal(vocab[best], 'ĠParis');
+      if (knowsThings(config)) assert.equal(vocab[best], 'ĠParis');
       console.log(`      ${tokens.length} positions, logits identical bit for bit; ` +
-        `the seam moved ${seamBytes} bytes a token while 372 MB stayed put`);
+        `the seam moved ${seamBytes} bytes a token while the weights stayed put`);
     });
 
     await t.test('a stage that begins mid-model refuses to run without one', async () => {
@@ -236,7 +251,7 @@ test('Qwen3 split across two stages gives the logits of the whole model',
         /needs \{hidden\}/);
       await assert.rejects(
         stepInputs(backPlan, store, {position: 0, hidden: new Float32Array(8)}),
-        /is 1024 values, got 8/);
+        new RegExp(`is ${config.hidden_size} values, got 8`));
       const wrong = new Float32Array(config.hidden_size);
       wrong[3] = Number.NaN;
       await assert.rejects(
@@ -417,7 +432,7 @@ test('a token decodes across four stages, each carrying only its own caches',
       token = best;
       if (position >= tokens.length - 1) generated.push(vocab[best]);
     }
-    assert.equal(generated[0], 'ĠParis');
+    if (knowsThings(config)) assert.equal(generated[0], 'ĠParis');
     console.log(`      ${parts} stages of ${per} layers, ${tokens.length + 2} positions, ` +
       `logits identical throughout; generated ${JSON.stringify(generated.join(''))}`);
   } finally {
@@ -518,8 +533,8 @@ test('stages need not be the same size, because peers are not the same machine',
       }
       let best = 0;
       for (let i = 1; i < prefilled.length; i++) if (prefilled[i] > prefilled[best]) best = i;
-      assert.equal(vocab[best], 'ĠParis');
-      console.log(`      uneven prefill: identical, still ${JSON.stringify(vocab[best])}`);
+      if (knowsThings(config)) assert.equal(vocab[best], 'ĠParis');
+      console.log(`      uneven prefill: identical, predicts ${JSON.stringify(vocab[best])}`);
     });
 
     // And decode, which is where the caches are and so where an uneven share
@@ -582,10 +597,14 @@ test('stages need not be the same size, because peers are not the same machine',
  * Fractions chosen so no boundary lands where an even division would put one:
  * for 28 layers, 3 + 12 + 4 + 9. */
 function unevenShares(layers) {
-  const first = Math.max(1, Math.round(layers * 0.107));
-  const second = Math.max(1, Math.round(layers * 0.43));
-  const third = Math.max(1, Math.round(layers * 0.143));
-  return [first, second, third, layers - first - second - third];
+  if (layers < 4) throw new Error(`${layers} layers cannot be four peers`);
+  // Proportions first, then repaired: rounding on a small model can leave the
+  // last share at zero or below, and a peer holding no layers is not a peer.
+  const shares = [Math.round(layers * 0.107), Math.round(layers * 0.43),
+                  Math.round(layers * 0.143)].map(n => Math.max(1, n));
+  shares.push(layers - shares[0] - shares[1] - shares[2]);
+  while (shares[3] < 1) { shares[3] += 1; shares[shares.indexOf(Math.max(...shares))] -= 1; }
+  return shares;
 }
 
 /** One runtime, kept in the list the test disposes. */

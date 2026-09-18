@@ -24,12 +24,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {Worker} from 'node:worker_threads';
 import {readFile, open, stat, access} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
 
 import {PluginRegistry, openGGUF, WeightStore, prepareDecode, stepInputs,
         resolveLimits} from '../src/index.mjs';
 import {sourceDirectory} from './helpers.mjs';
 
-const modelPath = process.env.ZIPP_QWEN3_MODEL;
+// The tiny fixture by default, so these run in CI; a real checkpoint when one
+// is named. The fixture has the shape of a Qwen3 and random weights, which is
+// everything these tests need and nothing they claim about language.
+// A path rather than a URL: this is opened with fs and also handed to a worker,
+// and a URL survives neither as well as a string does.
+const modelPath = process.env.ZIPP_QWEN3_MODEL
+  ?? fileURLToPath(new URL('fixtures/tiny-qwen3.gguf', import.meta.url));
 const runtimeURL = new URL('../../gpu-lab/src/runtime.mjs', import.meta.url);
 const engineURL = new URL('../../dist/all/zipp_wasm.js', import.meta.url);
 const wasmURL = new URL('../../dist/all/zipp_wasm_bg.wasm', import.meta.url);
@@ -37,9 +44,9 @@ const kernelsURL = new URL('../../gpu-lab/wasm/kernels.wasm', import.meta.url);
 const workerURL = new URL('helpers/stage-worker.mjs', import.meta.url);
 
 const exists = async url => { try { await access(url); return true; } catch { return false; } };
-const ready = Boolean(modelPath) && await exists(modelPath) &&
+const ready = await exists(modelPath) &&
   await exists(runtimeURL) && await exists(engineURL) && await exists(wasmURL);
-const reason = 'Set ZIPP_QWEN3_MODEL to a Qwen3 GGUF, with dist/all built';
+const reason = 'Needs dist/all built, and tests/fixtures/tiny-qwen3.gguf';
 
 const GB = 1024 * 1024 * 1024;
 const CONTEXT = 32;
@@ -180,7 +187,13 @@ test('a model divided across worker threads gives the same logits',
       runtimeURL: runtimeURL.href, kernelsURL: kernelsURL.href,
       limits: LIMITS, compute: COMPUTE,
     };
-    const bounds = [[0, 9], [10, 18], [19, layers - 1]];
+    // Three roughly equal ranges, derived rather than written for one model.
+    const bounds = [];
+    for (let part = 0, at = 0; part < parts; part++) {
+      const share = Math.floor((layers - at) / (parts - part));
+      bounds.push([at, at + share - 1]);
+      at += share;
+    }
     for (const [first, last] of bounds) {
       peers.push(await StagePeer.start({...options, first, last}));
     }
@@ -217,7 +230,7 @@ test('a model divided across worker threads gives the same logits',
       const logits = await acrossPeers(tokens.length - 1, tokens[tokens.length - 1]);
       let best = 0;
       for (let i = 1; i < logits.length; i++) if (logits[i] > logits[best]) best = i;
-      assert.equal(vocab[best], 'ĠParis');
+      if (config.vocab_size > 100000) assert.equal(vocab[best], 'ĠParis');
       console.log(`      ${layers} layers across ${parts} worker threads, ` +
         `logits identical, hidden states transferred not copied`);
     });
@@ -229,7 +242,8 @@ test('a model divided across worker threads gives the same logits',
       await assert.rejects(
         acrossPeers(tokens.length, 100),
         error => {
-          assert.match(error.message, /stage 10\.\.18/, 'the error names the stage that died');
+          assert.match(error.message, new RegExp(`stage ${bounds[1][0]}\.\.${bounds[1][1]}`),
+            'the error names the stage that died');
           return true;
         },
         'a dead stage should refuse, and say which one it was');
@@ -246,7 +260,7 @@ test('a model divided across worker threads gives the same logits',
         modelPath, pluginDir: '../plugins/qwen3/', context: CONTEXT,
         engineURL: engineURL.href, wasmURL: wasmURL.href,
         runtimeURL: runtimeURL.href, kernelsURL: kernelsURL.href,
-        limits: LIMITS, compute: COMPUTE, first: 10, last: 18,
+        limits: LIMITS, compute: COMPUTE, first: bounds[1][0], last: bounds[1][1],
       });
       const position = tokens.length - 1;
       const fresh = await acrossPeers(position, tokens[position]);
