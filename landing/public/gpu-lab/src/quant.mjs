@@ -1,3 +1,4 @@
+import {quantizeRow} from './kernel-math.mjs';
 /** Q4_K block decoding, for backends that read a quantized weight as they use it.
  *
  * A port of `dequantize_row_q4_K` as ggml defines it, kept deliberately literal
@@ -135,4 +136,56 @@ export function blockDecoder(dtype) {
   if (dtype === 'q4_k') return decodeQ4KBlock;
   if (dtype === 'q6_k') return decodeQ6KBlock;
   throw new Error(`No block decoder for ${dtype}`);
+}
+
+/**
+ * Quantizes a weight the way `matmul_fixed` would, once, for a graph to hold.
+ *
+ * `rows` is either a Float32Array of `n * k` values or the bytes of a Q4_K or
+ * Q6_K tensor of that shape; `dtype` says which. The result is what an `i16`
+ * input node and its scales input want: `quants` as little-endian bytes -- the
+ * byte order this protocol reads every multi-byte field in -- and `scales` as
+ * one float32 per output column.
+ *
+ * This is the whole of the bind-time form. `matmul_fixed` over the result is
+ * bit-for-bit what `matmul_fixed` over the original weight gives, because it is
+ * the same `quantizeRow` over the same values; all that moved is when it ran.
+ * What it costs is memory: two bytes a value against Q4_K's 0.5625, so 3.56
+ * times more on the device, in exchange for a decode and a requantise that no
+ * longer happen on every step.
+ */
+export function quantizeWeight(rows, n, k, dtype = 'f32') {
+  // Checked here rather than left to fail later. This reads `rows` by computed
+  // offset, so a length that does not match the shape reads past the end, and
+  // `undefined` quantizes to NaN -- a plausible weight of nothing, produced
+  // silently. The graph validator would eventually refuse the result's length,
+  // but it would name the wrong thing.
+  if (dtype !== 'f32' && !Object.hasOwn(FORMATS, dtype))
+    throw new Error(`quantizeWeight: unknown dtype ${String(dtype)}`);
+  const expected = dtype === 'f32' ? n * k : (n * k / FORMATS[dtype].block) * FORMATS[dtype].bytes;
+  if (rows?.length !== expected)
+    throw new Error(`quantizeWeight: a [${n}, ${k}] ${dtype} weight is ${expected} ` +
+      `${dtype === 'f32' ? 'values' : 'bytes'}; got ${rows?.length}`);
+  const quants = new Uint8Array(n * k * 2), scales = new Float32Array(n);
+  const row = new Float32Array(k), out = new Int16Array(k);
+  const decode = dtype === 'f32' ? null : blockDecoder(dtype);
+  const per = decode ? k / FORMATS[dtype].block : 0, size = decode ? FORMATS[dtype].bytes : 0;
+  for (let c = 0; c < n; c++) {
+    if (decode) for (let t = 0; t < per; t++) decode(rows, (c * per + t) * size, row, t * FORMATS[dtype].block);
+    else for (let j = 0; j < k; j++) row[j] = rows[c * k + j];
+    scales[c] = quantizeRow(row, 0, k, out, 0);
+    // Written a byte at a time rather than through an Int16Array view, so the
+    // bytes are little-endian wherever this runs and not whatever the host is.
+    for (let j = 0, at = c * k * 2; j < k; j++, at += 2) {
+      quants[at] = out[j] & 0xff; quants[at + 1] = (out[j] >> 8) & 0xff;
+    }
+  }
+  return {quants, scales};
+}
+
+/** The int16 quants of an `i16` input, read out of its little-endian bytes. */
+export function readFixedQuants(bytes, count) {
+  const out = new Int16Array(count);
+  for (let i = 0, at = 0; i < count; i++, at += 2) out[i] = (bytes[at] | (bytes[at + 1] << 8)) << 16 >> 16;
+  return out;
 }

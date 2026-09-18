@@ -42,3 +42,53 @@ export const geluGrad = x => cdf(x) + x * 0.3989422804014327 * Math.exp(-0.5 * x
 export const sigmoid = x => x >= 0 ? 1 / (1 + Math.exp(-x)) : Math.exp(x) / (1 + Math.exp(x));
 /** ReLU keeps NaN, so a diverged value reaches the finite-readback check on every backend. */
 export const relu = x => (x > 0 || x !== x) ? x : 0;
+
+/**
+ * The int16 quantisation `matmul_fixed` is defined by, stated once.
+ *
+ * Reads `k` floats from `src` at `at`, writes their int16 quants to `dst` at
+ * `to`, and returns the float32 scale that turns a quant back into a value.
+ * Every backend mirrors this line for line, because bit-identical results
+ * depend on the quantisation and not on the accumulation -- integer addition
+ * is associative, so once two backends agree on the quants they cannot
+ * disagree on the sum.
+ *
+ * Three details carry that agreement:
+ *
+ *  - `floor(x + 0.5)`, not a rounding intrinsic. JavaScript's `Math.round`
+ *    rounds a half away from zero and WGSL's `round` rounds it to even; those
+ *    disagree on exactly the values a quantiser lands on most often. `floor`
+ *    means the same thing in all four languages. The `+ 0.5` is exact here in
+ *    float32 -- the operand is under 2^15 and float32 is exact to 2^24 -- so
+ *    it makes no difference whether a backend adds in float32 or in double.
+ *  - one division by the scale, correctly rounded. (GLSL ES allows 2 ULP on a
+ *    divide, which is the one hazard in porting this to WebGL2; see
+ *    docs/FIXED-POINT.md.)
+ *  - a max taken with `>`, which skips a NaN in every language rather than
+ *    propagating it in some and not others.
+ *
+ * 32767 and not 32768: the range is symmetric, so negating a tensor negates
+ * its quants exactly, and no quant is the one value whose negation overflows.
+ */
+export const FIXED_QMAX = 32767;
+export function quantizeRow(src, at, k, dst, to) {
+  let mx = 0;
+  for (let j = 0; j < k; j++) {
+    const v = src[at + j] < 0 ? -src[at + j] : src[at + j];
+    if (v > mx) mx = v;
+  }
+  // An all-zero row has no scale to derive. Its quants are zero and so is its
+  // contribution, and returning zero here keeps that true without a branch at
+  // the point of use -- a zero scale multiplies a zero accumulator.
+  if (!(mx > 0)) { dst.fill(0, to, to + k); return 0; }
+  const s = Math.fround(mx / FIXED_QMAX);
+  for (let j = 0; j < k; j++) {
+    const t = Math.floor(Math.fround(Math.fround(src[at + j] / s) + 0.5));
+    // The clamp cannot trigger on finite data -- the largest magnitude in the
+    // row is what set the scale -- but it is what makes the accumulator an
+    // integer under every input, including the non-finite ones a divergent
+    // graph can produce. A NaN is past neither bound and lands on the low one.
+    dst[to + j] = t >= -FIXED_QMAX ? (t <= FIXED_QMAX ? t : FIXED_QMAX) : -FIXED_QMAX;
+  }
+  return s;
+}

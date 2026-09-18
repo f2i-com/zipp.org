@@ -1,4 +1,5 @@
 import {check, ComputeError, DEFAULT_LIMITS} from '../graph.mjs';
+const UNSUPPORTED=new Set(['matmul_fixed']);
 
 // Shared GLSL: texel addressing, the shared erf-based CDF and an overflow-free
 // tanh. Shapes and scalars arrive as uniforms, so one program serves every shape.
@@ -324,6 +325,11 @@ export class WebGL2Backend {
   }
   live(){check(!this.lost&&!this.gl.isContextLost(),'DEVICE_LOST','WebGL context is lost');}
   limitHints(){return {maxElements:Math.min(DEFAULT_LIMITS.maxElements,1024*this.maxHeight),maxWork:500000000};}
+  /** Integer accumulation needs 64 bits -- products reach 2^30 and their sums
+   * 2^40 -- and GLSL ES has no 64-bit integer type. Until that is emulated in
+   * paired u32s, this backend says so rather than returning zeros. See
+   * docs/FIXED-POINT.md. */
+  unsupported(){return UNSUPPORTED;}
   async begin(plan){this.live();this.maxTextureBytes=plan?.limits.maxWebGLTextureBytes??DEFAULT_LIMITS.maxWebGLTextureBytes;this.peakTextureBytes=this.textureBytes-this.pooledBytes;}
   allocationStats(){return {webglTexturePeakBytes:this.peakTextureBytes,webglTextureFormat:this.r32f?'R32F':'RGBA32F'};}
   /** How many ways to split a product's reduced axis.
@@ -503,6 +509,17 @@ export class WebGL2Backend {
           } finally {this.free(max);this.free(sum);}
           break;
         }
+        // Not yet on this backend, and refused rather than skipped. An
+        // operation with no case here would leave its output buffer at zero and
+        // return a plausible tensor of nothing, which for a result that is
+        // meant to be *checkable* is the worst available failure. Integer
+        // accumulation needs 64 bits -- products reach 2^30 and their sums 2^40
+        // -- and neither WGSL nor GLSL ES has a 64-bit integer, so this waits
+        // on paired-u32 arithmetic. See docs/FIXED-POINT.md.
+        // A throw and not a `check(false, ...)`, so that no reading of this
+        // can end in a fall-through to the float32 `matmul` below.
+        case 'matmul_fixed': throw new ComputeError('UNSUPPORTED',
+          'matmul_fixed needs a 64-bit integer accumulator, which WebGL2 has no native type for; run it on the wasm or cpu-js backend');
         case 'matmul':{
           const kernel=n.bQuant?`matmul_${n.bQuant.dtype.replace('_','')}`:n.transposed?'matmul_t':'matmul';
           const parts=this.splitParts(n);

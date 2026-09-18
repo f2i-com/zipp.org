@@ -32,6 +32,17 @@ export const MAX_RANK = 4;
 export const QUANT = Object.freeze({
   q4_k: Object.freeze({block: 256, bytes: 144}),
   q6_k: Object.freeze({block: 256, bytes: 210}),
+  // Not a checkpoint format: `i16` is this protocol's own, and it exists only
+  // for `matmul_fixed`. A weight in it is already quantized the way that
+  // operation quantizes, so the per-step decode-and-requantize is done once by
+  // whoever built the graph -- with the row scales alongside it as a plain
+  // float32 [N] input. It is 3.56 times larger than Q4_K on the device, which
+  // is the trade and is the caller's to make: time for memory, in that
+  // direction, which is the opposite of what every other entry here is for.
+  //
+  // One value to a block, two bytes, little-endian -- the byte order the half
+  // scales in `quant.mjs` are already read with.
+  i16: Object.freeze({block: 1, bytes: 2}),
 });
 export function sizeOf(shape) { return shape.reduce((a, b) => a * b, 1); }
 // Operation families. Every name here is a fixed kernel; none becomes code.
@@ -319,6 +330,14 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
         check((ra === 2 || ra === 3) && (rb === 2 || rb === 3) && a.shape[ra - 1] === inner,
           'SHAPE', transposed ? 'transposed matmul requires [M,K] @ [N,K]' : 'matmul requires [M,K] @ [K,N] or batched [B,M,K] @ [B,K,N]');
         const quant = nodes[root[raw.b]]?.quant;
+        // `i16` is not a checkpoint format a float32 matmul can decode -- it is
+        // already quantized, and to a scale this node knows nothing about.
+        // Refused here because every backend names its kernel after the dtype,
+        // so the alternative is a lookup that finds nothing and an output left
+        // at zero. Before the `transposed` check, so that the answer names the
+        // real problem rather than one that would remain after fixing it.
+        check(quant?.dtype !== 'i16', 'PROTOCOL',
+          'An i16 weight carries no values a float32 matmul can read; it belongs to matmul_fixed, with its scales');
         check(!quant || transposed, 'PROTOCOL',
           'A quantized weight is stored [N, K]; its matmul must be transposed');
         const ba = ra === 3 ? a.shape[0] : 1, bb = rb === 3 ? b.shape[0] : 1;
@@ -329,6 +348,73 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
         if (quant) n.bQuant = quant;
         n.shape = ra === 3 || rb === 3 ? [n.batch, n.m, n.n] : [n.m, n.n];
         shapeOf(n.shape, limits); units = 2 * n.batch * n.m * n.k * n.n; break;
+      }
+      case 'matmul_fixed': {
+        // The same product as `matmul`, computed over integers.
+        //
+        // Both sides are quantized to int16 with a per-row scale derived from
+        // the data, the k products are summed exactly, and the total is scaled
+        // back once. Integer addition is associative, so every backend that
+        // implements this reaches the *same* integer -- not one within a
+        // tolerance of another. `matmul` is bit-for-bit by careful agreement
+        // about float32 rounding order; this is bit-for-bit by construction,
+        // which is what a proof system needs, since a prime field can express
+        // an integer sum and cannot express IEEE-754 rounding.
+        //
+        // It is a separate operation and not a mode of `matmul` because it
+        // makes a different promise. `matmul` answers "what does float32 say";
+        // this answers "what do the integers say", and on a real projection the
+        // two differ by about 2.3e-3 (worst absolute, cosine 1.000000). A graph
+        // asks for one or the other; neither silently becomes the other.
+        keys(raw, ['id', 'op', 'a', 'b', 'c', 'transposed'], ['a', 'b']);
+        // A weight is stored [N, K] -- one contiguous row per output column --
+        // and a per-row scale is only cheap in that layout. There is no second
+        // layout to get wrong, so the flag is required rather than defaulted.
+        // Checked here rather than listed as a required field, so that omitting
+        // it and passing it as false give the one answer that says why.
+        check(raw.transposed === true, 'PROTOCOL', 'matmul_fixed reads its weight as [N, K]: transposed is required and is true');
+        const a = ref('a'), b = ref('b', true);
+        n.transposed = true;
+        const ra = a.shape.length, rb = b.shape.length;
+        check((ra === 2 || ra === 3) && (rb === 2 || rb === 3) && a.shape[ra - 1] === b.shape[rb - 1],
+          'SHAPE', 'matmul_fixed requires [M,K] @ [N,K] or batched [B,M,K] @ [B,N,K]');
+        const ba = ra === 3 ? a.shape[0] : 1, bb = rb === 3 ? b.shape[0] : 1;
+        check(ba === bb || ba === 1 || bb === 1, 'SHAPE', 'matmul_fixed batch dimensions must match or be 1');
+        n.batch = Math.max(ba, bb); n.m = a.shape[ra - 2]; n.k = a.shape[ra - 1]; n.n = b.shape[rb - 2];
+        // Exactness is the whole claim, so the accumulator's ceiling is checked
+        // rather than assumed. Each product is under 2^30 and k of them are
+        // summed; the JavaScript reference holds that in a double, which is
+        // exact below 2^53, and the WASM kernel in an i64. The bound is reached
+        // at k = 2^23, far above any real projection, but a graph is untrusted
+        // input and this is the one place the guarantee could quietly lapse.
+        check(n.k * 32767 * 32767 <= Number.MAX_SAFE_INTEGER, 'LIMIT',
+          'matmul_fixed inner dimension is too large for an exact integer accumulator');
+        n.aBatchStride = ba === 1 ? 0 : n.m * n.k; n.bBatchStride = bb === 1 ? 0 : n.n * n.k;
+        const fixedQuant = nodes[root[raw.b]]?.quant;
+        if (fixedQuant) n.bQuant = fixedQuant;
+        // The bind-time form. An `i16` weight is already quantized, so it
+        // arrives with the row scales it was quantized against -- a plain
+        // float32 [N] input -- and this node does no decoding and no
+        // requantising at all. It is the same answer as the run-time form,
+        // moved in time: `quantizeWeight` in quant.mjs produces both, and the
+        // tests hold the two to bit equality rather than to a tolerance.
+        n.bFixed = fixedQuant?.dtype === 'i16';
+        check(n.bFixed === Object.hasOwn(raw, 'c'), 'PROTOCOL', n.bFixed
+          ? 'An i16 weight needs the row scales it was quantized against: pass them as c, a float32 [N] input'
+          : 'c names row scales, which only an i16 weight has; a float32 or block weight is scaled from its own values');
+        if (n.bFixed) {
+          const scales = ref('c');
+          check(scales.shape.length === 1 && scales.shape[0] === n.n, 'SHAPE',
+            `matmul_fixed scales must be [N] for an [N, K] weight; got [${scales.shape}] against N = ${n.n}`);
+          // One scale per output column, so a batch of weights would need a
+          // batch of scale vectors. Refused rather than guessed at.
+          check(bb === 1, 'SHAPE', 'A batched i16 weight is not supported; its scales would have to be batched too');
+        }
+        n.shape = ra === 3 || rb === 3 ? [n.batch, n.m, n.n] : [n.m, n.n];
+        // Two quantisation passes on top of the product itself: one over the
+        // activations, one over each decoded weight row.
+        shapeOf(n.shape, limits);
+        units = 2 * n.batch * n.m * n.k * n.n + 2 * n.batch * (n.m + n.n) * n.k; break;
       }
       case 'cross_entropy': case 'cross_entropy_grad': {
         keys(raw, ['id', 'op', 'a', 'b'], ['a', 'b']);

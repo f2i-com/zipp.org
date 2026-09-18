@@ -97,6 +97,17 @@ jobs:
           ./build-variants.sh interop
           wasm-bindgen --target nodejs --out-dir tests/node/pkg target/variants/interop/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/python-javascript.cjs --enabled
+      # gpu-lab/wasm/kernels.wasm is committed, and everything below loads that
+      # blob rather than building one -- so it is rebuilt here from zipp-kernels
+      # and the Cargo.lock at this commit, and has to come out byte-identical.
+      # The build remaps every recorded path and strips symbol names, so where
+      # and on which OS it was built are not part of it; what is left is the
+      # source, the lock file and the toolchain.
+      - name: Rebuild the numeric kernels and check the committed binary is theirs
+        working-directory: crates/zipp-wasm
+        run: |
+          RUSTUP_TOOLCHAIN=1.92.0 sh gpu-lab/scripts/build_wasm.sh
+          git diff --exit-code --stat -- gpu-lab/wasm/kernels.wasm
       - name: Test portable GPU contracts and Python graph authoring
         working-directory: crates/zipp-wasm/gpu-lab
         run: |

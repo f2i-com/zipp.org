@@ -1,4 +1,4 @@
-import {gelu, geluGrad, sigmoid, relu} from '../kernel-math.mjs';
+import {gelu, geluGrad, sigmoid, relu, quantizeRow} from '../kernel-math.mjs';
 
 /**
  * Reference float32 host-JavaScript implementation, not advertised as WASM.
@@ -7,7 +7,7 @@ import {gelu, geluGrad, sigmoid, relu} from '../kernel-math.mjs';
  * reproduce them bit for bit; transcendental functions are evaluated in double
  * and rounded, so they agree with WASM to about one float32 ulp.
  */
-import {blockDecoder, FORMATS} from '../quant.mjs';
+import {blockDecoder, FORMATS, readFixedQuants} from '../quant.mjs';
 const f = Math.fround;
 const UNARY = {relu, positive: x => x > 0 ? 1 : 0, neg: x => -x, exp: Math.exp, log: Math.log, sqrt: Math.sqrt,
   tanh: Math.tanh, sigmoid, gelu, gelu_grad: geluGrad};
@@ -47,7 +47,12 @@ export class CPUBackend {
   async run(n, refs) {
     // A quantized input's handle is its blocks. Nothing expands it: that is the
     // point, and only a transposed matmul knows how to read it.
-    if (n.op === 'input' && n.quant) return n.data;
+    // An `i16` weight is read out of its little-endian bytes once, here, rather
+    // than a pair of bytes at a time inside the product's innermost loop. In a
+    // prepared session this runs at `init` and the handle is held, which is the
+    // whole point of the format.
+    if (n.op === 'input' && n.quant)
+      return n.quant.dtype === 'i16' ? readFixedQuants(n.data, n.size) : n.data;
     const out = new Float32Array(n.size), a = refs[0], b = refs[1];
     switch (n.op) {
       case 'input': out.set(n.data); break;
@@ -143,6 +148,57 @@ export class CPUBackend {
                 const x = a[ao + r*k + j], base = bo + j*cols;
                 for (let c = 0; c < cols; c++) row[c] += f(x * b[base + c]);
               }
+            }
+          }
+        }
+        break;
+      }
+      case 'matmul_fixed': {
+        // Integer accumulation, and therefore the same answer on every backend
+        // rather than an answer within a tolerance of another one. See
+        // `quantizeRow` for the quantisation this depends on and
+        // docs/FIXED-POINT.md for what it costs against float32.
+        //
+        // Two forms, one answer. Either the weight arrives as float32 or as
+        // Q4_K/Q6_K blocks and each output column is decoded and quantized here,
+        // on every step -- or it arrives already quantized as `i16` with its
+        // scales, and none of that happens at all. `quantizeWeight` produces the
+        // second from the first, so they agree bit for bit by being the same
+        // arithmetic at a different time.
+        const {m, k, n: cols} = n, fixed = n.bFixed;
+        const qa = new Int16Array(m * k), sa = new Float32Array(m);
+        const qw = fixed ? null : new Int16Array(k), row = fixed ? null : new Float32Array(k);
+        const scales = fixed ? refs[2] : null;
+        const decode = !fixed && n.bQuant ? blockDecoder(n.bQuant.dtype) : null;
+        const BLOCK = decode ? FORMATS[n.bQuant.dtype].block : 0;
+        const BYTES = decode ? FORMATS[n.bQuant.dtype].bytes : 0;
+        const perRow = decode ? k / BLOCK : 0;
+        for (let batch = 0; batch < n.batch; batch++) {
+          const ao = batch * n.aBatchStride, oo = batch * m * cols;
+          const bo = decode ? (batch * n.bBatchStride) / BLOCK : batch * n.bBatchStride;
+          // The activations are quantized once per batch and reused by every
+          // output column, the same way the float path reuses a decoded weight
+          // row across every row of a.
+          for (let r = 0; r < m; r++) sa[r] = quantizeRow(a, ao + r * k, k, qa, r * k);
+          for (let c = 0; c < cols; c++) {
+            let w, at, sw;
+            if (fixed) { w = b; at = c * k; sw = scales[c]; }
+            else {
+              if (decode) for (let t = 0; t < perRow; t++) decode(b, (bo + c * perRow + t) * BYTES, row, t * BLOCK);
+              else for (let j = 0; j < k; j++) row[j] = b[bo + c * k + j];
+              // A quantized weight is requantized from what it decodes to, not
+              // from the block's own scales: Q4_K and Q6_K carry sub-block
+              // scales that no single per-row integer can stand in for, and the
+              // scale here has to be the one the accumulator is undone by.
+              sw = quantizeRow(row, 0, k, qw, 0); w = qw; at = 0;
+            }
+            for (let r = 0; r < m; r++) {
+              // Exact: each product is under 2^30 and a double is exact to
+              // 2^53, which the graph validator checks k against.
+              let acc = 0;
+              const base = r * k;
+              for (let j = 0; j < k; j++) acc += qa[base + j] * w[at + j];
+              out[oo + r * cols + c] = f(f(acc) * f(sa[r] * sw));
             }
           }
         }

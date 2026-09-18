@@ -129,13 +129,15 @@ callback that resubmits cannot recurse), and rejects work after tenant invalidat
   than returning zeros.
 - `wasm/kernels.wasm`: the COMMITTED binary of the freestanding kernels, built
   from `../rust/zipp-kernels` (`no_std` Rust, SIMD, no allocator, no imports).
-  No workflow rebuilds it: `npm test`, the Node GPU suites and the
-  `javascript-python` release archive all load this exact blob, and nothing
-  compares it against its source. Rebuild with `scripts/build_wasm.sh` — cargo
-  alone, no separate link step — and review the source change and the new binary
-  together. `backend-bits.test.mjs` is what makes that reviewable: it holds the
-  compiled module to bit-for-bit equality with the JavaScript reference over
-  whole training steps.
+  `npm test`, the Node GPU suites and the `javascript-python` release archive
+  all load this exact blob. Rebuild it with `scripts/build_wasm.sh` — cargo
+  alone, no separate link step, `--locked`, Rust 1.92.0 — and commit the source
+  change and the new binary together. The build does not depend on where it ran
+  -- recorded paths are remapped and symbol names stripped, and a Linux and a
+  Windows build are byte-identical -- so CI rebuilds it and fails if the result
+  differs from what is committed.
+  `backend-bits.test.mjs` holds the compiled module to bit-for-bit equality with
+  the JavaScript reference over whole training steps.
 - `tests/`: numerical checks, allocation/lifecycle mocks and browser cases; `tests/ml-cases.mjs`
   holds the per-operation fixtures and the MLP training-step generator shared with the browser.
 - `docs/INTEGRATION.md`, `docs/ARCHITECTURE.md`, `docs/VALIDATION.md`: contracts and evidence.
@@ -162,10 +164,10 @@ machines Chrome ignores `powerPreference`; the script passes
 `--force_high_performance_gpu` (override with `GPU_FLAGS`). A missing GPU is not a
 successful GPU check.
 
-Rebuild the standalone kernel with `sh scripts/build_wasm.sh` using Clang/wasm-ld
-(built with `-msimd128`; browsers without WebAssembly SIMD fall back to JavaScript).
-On Windows, use `./scripts/build_wasm.ps1` (LLVM defaults to
-`C:\Program Files\LLVM\bin`; override with `-LlvmDirectory`).
+Rebuild the standalone kernel with `sh scripts/build_wasm.sh`: cargo with Rust
+1.92.0 and the `wasm32-unknown-unknown` target. A Linux build and a Windows one
+(Git Bash) produce the same bytes (built with `+simd128`; browsers without
+WebAssembly SIMD fall back to JavaScript).
 The kernel module is separate from Zipp WASM; rebuilding it does not rebuild Python.
 
 This remains an experimental graph engine: no kernel fusion, persistent

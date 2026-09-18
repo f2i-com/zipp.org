@@ -1,4 +1,5 @@
 import {check, ComputeError, DEFAULT_LIMITS} from '../graph.mjs';
+const UNSUPPORTED=new Set(['matmul_fixed']);
 
 // Every kernel reads its shape and scalars from this uniform block, so one
 // pipeline per kernel serves every shape. No graph value enters shader text.
@@ -559,6 +560,11 @@ export class WebGPUBackend {
     return {maxElements: Math.min(DEFAULT_LIMITS.maxElements, cap), maxWork: 1000000000};
   }
   allocationStats() { return {webgpuBufferPeakBytes: this.peakBufferBytes}; }
+  /** Integer accumulation needs 64 bits -- products reach 2^30 and their sums
+   * 2^40 -- and WGSL has no 64-bit integer type. Until that is emulated in
+   * paired u32s, this backend says so rather than returning zeros. See
+   * docs/FIXED-POINT.md. */
+  unsupported(){return UNSUPPORTED;}
   async begin() {
     this.live(); this.device.pushErrorScope('out-of-memory'); this.device.pushErrorScope('validation');
     this.scopeOpen = true; this.slot = 0;
@@ -712,6 +718,17 @@ export class WebGPUBackend {
           break;
         }
         case 'cross_entropy_grad': await this.dispatch('ce_grad', u => {u[0] = n.rows; u[3] = n.cols;}, refs, out, n.rows); break;
+        // Not yet on this backend, and refused rather than skipped. An
+        // operation with no case here would leave its output buffer at zero and
+        // return a plausible tensor of nothing, which for a result that is
+        // meant to be *checkable* is the worst available failure. Integer
+        // accumulation needs 64 bits -- products reach 2^30 and their sums 2^40
+        // -- and neither WGSL nor GLSL ES has a 64-bit integer, so this waits
+        // on paired-u32 arithmetic. See docs/FIXED-POINT.md.
+        // A throw and not a `check(false, ...)`, so that no reading of this
+        // can end in a fall-through to the float32 `matmul` below.
+        case 'matmul_fixed': throw new ComputeError('UNSUPPORTED',
+          'matmul_fixed needs a 64-bit integer accumulator, which WebGPU has no native type for; run it on the wasm or cpu-js backend');
         case 'matmul': {
           const kernel = n.bQuant ? `matmul_${n.bQuant.dtype.replace('_', '')}` : n.transposed ? 'matmul_t' : 'matmul';
           const split = this.splitParts(n);

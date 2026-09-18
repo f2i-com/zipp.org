@@ -19,7 +19,7 @@ export class WasmBackend {
     return new WasmBackend(instance.exports);
   }
   constructor(exports) {
-    this.name = 'wasm'; this.description = 'Compiled standalone C float32 kernels in WebAssembly (SIMD)';
+    this.name = 'wasm'; this.description = 'Compiled no_std Rust kernels in WebAssembly (SIMD)';
     this.e = exports; this.base = Number(exports.__heap_base.value);
     this.cursor = this.base; this.pinned = this.base;
   }
