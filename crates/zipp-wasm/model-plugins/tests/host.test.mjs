@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile, readdir, access} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
+import {createHash} from 'node:crypto';
 import {parseJSON} from '../src/json.mjs';
 import {safePath, resolveLimits, sha256} from '../src/common.mjs';
 import {FileMapSource, sourceFromBundle, sourceFromFiles} from '../src/sources.mjs';
@@ -276,4 +277,50 @@ test('a matrix binding decodes where a source has no block form', async () => {
       assert.deepEqual([...got.outputs.logits.data], want);
     } finally { runtime.dispose(); }
   } finally { store.dispose(); }
+});
+
+test('the catalogue pins every plugin, at the digest it actually has', async () => {
+  // How the demo broke: a plugin's source changed, `plugin.json` was rehashed,
+  // and `catalog.v1.json` still pinned the digest of the manifest before that
+  // -- so downloading it failed the hash check at the point of use, which is
+  // the right refusal arriving far too late to be useful.
+  //
+  // Nothing checked this. tools/build_manifests.py regenerates the catalogue
+  // and had a hardcoded plugin list that qwen3 was never added to, so running
+  // it *removed* the entry instead of refreshing it. Both failures are the
+  // same shape: a generated file nobody compares against its sources.
+  const root = new URL('../', import.meta.url);
+  const catalogue = JSON.parse(await readFile(new URL('catalog.v1.json', root), 'utf8'));
+  assert.equal(catalogue.version, 1);
+  assert.ok(catalogue.plugins.length > 0, 'a catalogue with no plugins offers nothing');
+
+  const plugins = (await readdir(new URL('plugins/', root), {withFileTypes: true}))
+    .filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
+  const listed = catalogue.plugins.map(p => p.manifest.split('/')[1]).sort();
+  assert.deepEqual(listed, plugins,
+    'every plugin directory must be in the catalogue and vice versa');
+
+  for (const entry of catalogue.plugins) {
+    const bytes = await readFile(new URL(entry.manifest, root));
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    assert.equal(digest, entry.sha256,
+      `${entry.id}: the catalogue pins ${entry.sha256.slice(0, 16)} but ` +
+      `${entry.manifest} is ${digest.slice(0, 16)}. Run tools/build_manifests.py.`);
+
+    // And the manifest's own claims must match what it pins, since the
+    // catalogue repeats them and a reader may believe either.
+    const manifest = JSON.parse(bytes.toString('utf8'));
+    assert.equal(manifest.id, entry.id);
+    assert.equal(manifest.plugin_version, entry.version);
+    assert.equal(manifest.checkpoint_format, entry.checkpoint_format);
+    assert.deepEqual(manifest.tokenizer_formats, entry.tokenizer_formats);
+
+    // The sources a manifest pins have to be the sources on disk, which is the
+    // check the registry makes at install time -- here so it fails in CI first.
+    for (const [name, sha] of Object.entries(manifest.sources)) {
+      const source = await readFile(new URL(`plugins/${entry.manifest.split('/')[1]}/${name}`, root));
+      assert.equal(createHash('sha256').update(source).digest('hex'), sha,
+        `${entry.id}: ${name} does not match the digest ${entry.manifest} pins`);
+    }
+  }
 });

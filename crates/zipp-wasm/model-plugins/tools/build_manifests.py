@@ -29,6 +29,8 @@ PLUGINS = [
     # No bundled example: a GPT-Neo checkpoint is converted locally by
     # tools/convert_gpt_neo.py and never redistributed with ZIPP.
     ('gpt-neo', 'org.zipp.gpt-neo', '0.1.0', None),
+    # Nor here: a Qwen3 GGUF is the person's own file, read where it lies.
+    ('qwen3', 'org.zipp.qwen3', '0.1.0', None),
 ]
 
 def main():
