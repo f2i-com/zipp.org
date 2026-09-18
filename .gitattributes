@@ -27,3 +27,9 @@ crates/zipp-wasm/model-plugins/**/*.safetensors -text
 # model-plugins. The wasm-bindgen .js and .d.ts beside them are text and stay
 # text, so they still diff.
 crates/zipp-wasm/**/*.wasm -text
+
+# Reference logit vectors: raw little-endian float32, checked against a stored
+# sha256. Bytes that happen to be 0x0D 0x0A are data, so these must never be
+# line-ending converted -- the digest would fail on the first Windows checkout
+# and it would look like the model had changed.
+*.f32 binary

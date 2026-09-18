@@ -1,0 +1,50 @@
+{
+  "model": "qwen3-0.6b-q4_k_m.gguf",
+  "model_sha256": "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a",
+  "reference": "transformers + gguf-py, both reading this GGUF directly",
+  "vocab_size": 151936,
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "ids": [
+        785,
+        6722,
+        315,
+        9625,
+        374
+      ],
+      "argmax": 12095,
+      "argmax_piece": "\u0120Paris",
+      "logits_sha256": "5bcc24c2f2debd0e04b9e36d05486d82b851fcbf1108e3588f73fa05417eb898"
+    },
+    {
+      "prompt": "1 2 3 4",
+      "ids": [
+        16,
+        220,
+        17,
+        220,
+        18,
+        220,
+        19
+      ],
+      "argmax": 220,
+      "argmax_piece": "\u0120",
+      "logits_sha256": "72b719c47c360dfc2a7afe7211eede1bb82c3cb6493321f6f667fdbd5ac40451"
+    },
+    {
+      "prompt": "def add(a, b):",
+      "ids": [
+        750,
+        912,
+        2877,
+        11,
+        293,
+        1648
+      ],
+      "argmax": 198,
+      "argmax_piece": "\u010a",
+      "logits_sha256": "9b9d911dcc5305e42aa75d8c11ae63c25cee9e97ee0b22ed534107e5529bec7a"
+    }
+  ]
+}
