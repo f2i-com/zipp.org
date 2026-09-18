@@ -843,7 +843,7 @@ function Playground() {
           </div>
         </div>
       </div>
-      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.19`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.19</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
+      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.20`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.20</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
     </section>
   )
 }
