@@ -29,7 +29,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-VERSION="${GGUF_WASM_VERSION:-v0.0.4}"
+VERSION="${GGUF_WASM_VERSION:-v0.0.5}"
 REPO=f2i-com/gguf-wasm
 
 command -v gh >/dev/null 2>&1 || { echo "needs the gh CLI to download a release" >&2; exit 1; }

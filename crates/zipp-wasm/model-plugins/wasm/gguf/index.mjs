@@ -86,7 +86,12 @@ function parseContentRange(header) {
  * ignore `If-Range` with a weak validator, so sending one would give a
  * confident-looking request that means nothing. */
 function strongETag(value) {
-  return typeof value === 'string' && !/^\s*W\//.test(value) ? value : null;
+  // `"..."` and nothing else. RFC 9110 spells an entity-tag as a quoted string,
+  // optionally preceded by `W/`; anything that is neither is a header this does
+  // not understand, and sending it back as `If-Range` would be asserting
+  // something about a syntax nobody agreed to.
+  return typeof value === 'string' && /^"[^"]*"$/.test(value.trim())
+    ? value.trim() : null;
 }
 
 /**
@@ -242,10 +247,29 @@ export async function openGGUF(source, {module}) {
   }
   await source.prepare?.();
   const size = source.size();
+  // `fromBlob`, `fromURL` and `fromFileHandle` all behave; a source is a public
+  // interface, though, and a caller may hand over its own. A size that is not
+  // an exact positive integer makes every bounds check downstream meaningless,
+  // so it is refused here rather than believed.
+  if (!Number.isSafeInteger(size) || size <= 0) {
+    throw new Error(`that source reports a size of ${size}, which is not a length`);
+  }
+  const readExactly = async (offset, length) => {
+    // A short read is the quiet failure: a decoder sees a truncated tensor as a
+    // valid one full of whatever followed. `Blob.slice` clamps rather than
+    // throwing, so this is the check that turns that into an error.
+    const bytes = await source.read(offset, length);
+    if (!(bytes instanceof Uint8Array) || bytes.length !== length) {
+      throw new Error(
+        `that source returned ${bytes?.length ?? typeof bytes} bytes for ` +
+        `${length} at ${offset}`);
+    }
+    return bytes;
+  };
 
   let header = null, read = 0, failure = null;
   for (let want = Math.min(FIRST, size); want <= Math.min(LARGEST, size);) {
-    const head = await source.read(0, want);
+    const head = await readExactly(0, want);
     try {
       header = new module.GgufHeader(head);
       read = want;
@@ -291,7 +315,7 @@ export async function openGGUF(source, {module}) {
      * 1,024 once expanded. */
     async bytes(name) {
       const entry = info(name);
-      return source.read(entry.offset, entry.bytes);
+      return readExactly(entry.offset, entry.bytes);
     },
 
     /** A tensor decoded to float32. */
@@ -342,7 +366,7 @@ export async function openGGUF(source, {module}) {
         // Checked here too, not just at open: this one comes fresh out of the
         // module for each call, computed from a row index the caller chose.
         const range = checkRange(JSON.parse(header.row_range(name, indices[i], 1)), name, size);
-        const bytes = await source.read(range.offset, range.bytes);
+        const bytes = await readExactly(range.offset, range.bytes);
         out.set(module.dequantize(range.dtype, bytes, range.elements), i * width);
       }
       return out;

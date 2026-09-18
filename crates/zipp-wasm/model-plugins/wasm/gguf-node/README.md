@@ -60,7 +60,7 @@ unrelated crate. The *library* names do not, so a consumer aliases the package
 once and `use gguf::...` reads the way you would expect:
 
 ```toml
-gguf = { package = "f2i-gguf", version = "0.0.4", features = ["std"] }
+gguf = { package = "f2i-gguf", version = "0.0.5", features = ["std"] }
 ```
 
 Everything except the wasm surface builds without `std`, which is what lets the
@@ -131,7 +131,7 @@ plausible header and a couple of thousand rounds of arbitrary bytes.
 
 ```toml
 [dependencies]
-gguf = { package = "f2i-gguf", version = "0.0.4", features = ["std"] }
+gguf = { package = "f2i-gguf", version = "0.0.5", features = ["std"] }
 ```
 
 ```rust
@@ -271,7 +271,10 @@ each other.
 That is also how the K-quants get covered at all — gguf-py decodes them without
 being able to produce them — and it is better coverage than real weights, which
 cluster where an off-by-one in a shift does not show.
-`scripts/golden-vectors.py` regenerates them.
+`scripts/golden-vectors.py` regenerates them, against the exact versions
+`requirements-golden.txt` pins — the vectors are evidence, and evidence
+regenerated against a moving reference stops being able to tell you which
+side changed.
 
 ## Examples
 
