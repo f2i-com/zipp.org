@@ -418,3 +418,156 @@ test('a token decodes across four stages, each carrying only its own caches',
     await source.close();
   }
 });
+
+test('stages need not be the same size, because peers are not the same machine',
+  {skip: !ready && reason}, async t => {
+  // A phone takes four layers where a workstation takes twelve. Nothing in the
+  // code assumes equal shares -- but "takes arbitrary ranges" and "was ever run
+  // with unequal ones" are different claims, and only one of them is evidence.
+  //
+  // 28 layers as 3 + 12 + 4 + 9, which is deliberately lopsided and prime-ish:
+  // no split point falls where an even division would put one.
+  const zipp = await import(engineURL);
+  await zipp.default({module_or_path: await readFile(wasmURL)});
+  const {createRuntime} = await import(runtimeURL);
+
+  const plugin = await new PluginRegistry().install(
+    await sourceDirectory('../plugins/qwen3/'), {approve: () => true});
+  const source = await fileSource(modelPath);
+  const index = await openGGUF(source, 'model.gguf', null, hostLimits);
+  const store = new WeightStore([index], hostLimits);
+  const engine = new zipp.Engine();
+  const runtimes = [];
+  try {
+    engine.setSyncHostCapabilities([]);
+    engine.setInstructionBudget(hostLimits.instructionBudget);
+    engine.initPythonProject({...plugin.files}, plugin.entry, []);
+    const call = (name, args) => {
+      engine.renewInstructionBudget();
+      return JSON.parse(engine.pythonCall(name, args));
+    };
+
+    const vocab = index.strings('tokenizer.ggml.tokens');
+    const config = call('zipp_model_config',
+      [JSON.stringify(index.metadata()), JSON.stringify(vocab.length)]);
+    const layers = config.num_layers;
+    const shares = [3, 12, 4, 9];
+    assert.equal(shares.reduce((a, b) => a + b, 0), layers, 'the shares must be the model');
+    const tokens = [...index.tokenizer().encode('The capital of France is')];
+    const kernels = await readFile(kernelsURL);
+
+    const ranges = [];
+    let at = 0;
+    for (const share of shares) { ranges.push([at, at + share - 1]); at += share; }
+
+    await t.test('an uneven share is still exactly its own tensors and caches', () => {
+      let tensors = 0;
+      for (const [first, last] of ranges) {
+        const names = call('zipp_model_tensors',
+          [JSON.stringify(config), JSON.stringify(first), JSON.stringify(last)]);
+        const own = names.filter(n => n.startsWith('blk.'));
+        assert.equal(own.length, 11 * (last - first + 1),
+          `layers ${first}..${last}: eleven tensors a layer`);
+        for (const name of own) {
+          const layer = Number(name.split('.')[1]);
+          assert.ok(layer >= first && layer <= last, `${name} is not in ${first}..${last}`);
+        }
+        tensors += own.length;
+      }
+      assert.equal(tensors, 11 * layers, 'the shares do not cover the model exactly once');
+      console.log(`      shares ${shares.join(' + ')} = ${layers} layers`);
+    });
+
+    // Prefill and decode both, through the same lopsided division.
+    const whole = await runtime0(runtimes, createRuntime, kernels);
+    const oneShot = await whole.execute(
+      await bindGraph(call('zipp_model_graph',
+        [JSON.stringify(config), JSON.stringify(tokens)]), store, hostLimits),
+      {typedOutputs: true});
+
+    let carried = null, prefilled = null;
+    for (const [first, last] of ranges) {
+      const graph = await bindGraph(call('zipp_model_prefill_stage',
+        [JSON.stringify(config), JSON.stringify(tokens),
+         JSON.stringify(first), JSON.stringify(last)]),
+        store, hostLimits, carried ? {feed: {hidden: carried}} : {});
+      const out = await whole.execute(graph, {typedOutputs: true});
+      if (last === layers - 1) prefilled = out.outputs.logits.data;
+      else carried = acrossTheSeam(out.outputs.hidden.data);
+    }
+
+    await t.test('an uneven prefill gives the whole model logits', () => {
+      const want = oneShot.outputs.logits.data;
+      for (let i = 0; i < want.length; i++) {
+        if (!Object.is(prefilled[i], want[i])) {
+          assert.fail(`logit ${i}: ${prefilled[i]} in ${shares.join('+')}, ${want[i]} in one`);
+        }
+      }
+      let best = 0;
+      for (let i = 1; i < prefilled.length; i++) if (prefilled[i] > prefilled[best]) best = i;
+      assert.equal(vocab[best], 'ĠParis');
+      console.log(`      uneven prefill: identical, still ${JSON.stringify(vocab[best])}`);
+    });
+
+    // And decode, which is where the caches are and so where an uneven share
+    // could go wrong in a way prefill would not show.
+    const wholePlan = await prepareDecode(
+      call('zipp_model_decode_graph', [JSON.stringify(config), JSON.stringify(CONTEXT)]),
+      store, hostLimits);
+    const wholeSession = await (await runtime0(runtimes, createRuntime, kernels))
+      .prepare(wholePlan.program);
+
+    const stages = [];
+    for (const [first, last] of ranges) {
+      const plan = await prepareDecode(call('zipp_model_decode_stage',
+        [JSON.stringify(config), JSON.stringify(CONTEXT),
+         JSON.stringify(first), JSON.stringify(last)]), store, hostLimits);
+      assert.equal(plan.resident.length, 2 * (last - first + 1),
+        `layers ${first}..${last} should carry two caches a layer`);
+      const runtime = await runtime0(runtimes, createRuntime, kernels);
+      stages.push({plan, session: await runtime.prepare(plan.program), first, last});
+    }
+
+    await t.test('an uneven decode agrees at every position', async () => {
+      let token = tokens[0];
+      for (let position = 0; position < tokens.length + 1; position++) {
+        const feeding = position < tokens.length ? tokens[position] : token;
+        const one = await wholeSession.run(
+          [await stepInputs(wholePlan, store, {token: feeding, position})],
+          {readback: ['logits']});
+        let hidden = null, split = null;
+        for (const stage of stages) {
+          const inputs = stage.first === 0
+            ? await stepInputs(stage.plan, store, {token: feeding, position})
+            : await stepInputs(stage.plan, store, {position, hidden});
+          const out = await stage.session.run([inputs],
+            {readback: [stage.last === layers - 1 ? 'logits' : 'hidden']});
+          if (stage.last === layers - 1) split = out.outputs.logits.data;
+          else hidden = acrossTheSeam(out.outputs.hidden.data);
+        }
+        const want = one.outputs.logits.data;
+        for (let i = 0; i < want.length; i++) {
+          if (!Object.is(split[i], want[i])) {
+            assert.fail(`position ${position}, logit ${i}: ${split[i]} vs ${want[i]}`);
+          }
+        }
+        let best = 0;
+        for (let i = 1; i < split.length; i++) if (split[i] > split[best]) best = i;
+        token = best;
+      }
+      console.log(`      uneven decode: ${tokens.length + 1} positions, identical throughout`);
+    });
+  } finally {
+    for (const runtime of runtimes) await runtime?.dispose?.();
+    engine.free?.();
+    await source.close();
+  }
+});
+
+/** One runtime, kept in the list the test disposes. */
+async function runtime0(runtimes, createRuntime, kernels) {
+  const runtime = await createRuntime(
+    {backend: 'wasm', wasmBytes: kernels, limits: computeLimits});
+  runtimes.push(runtime);
+  return runtime;
+}
