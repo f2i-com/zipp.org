@@ -12,17 +12,21 @@ const OPS = new Set(['input', 'full', 'add', 'sub', 'mul', 'div', 'relu', 'posit
 /** Resolve only data bindings. The returned object is still passed through
  * the existing ZIPP graph validator by runtime.execute(). No validation bypass.
  */
-export async function bindGraph(template, weights, limits) {
-  fields(template, ['version', 'graph', 'bindings'], ['version', 'graph', 'bindings']);
+export async function bindGraph(template, weights, limits, {feed = {}} = {}) {
+  // `stage` is optional and says which layers this graph covers, for a graph
+  // that is part of a model rather than all of it.
+  fields(template, ['version', 'graph', 'bindings', 'stage'], ['version', 'graph', 'bindings']);
   check(template.version === 1, 'VERSION', 'Unsupported model binding protocol');
   const graph = template.graph;
   fields(graph, ['version', 'nodes', 'outputs'], ['version', 'nodes', 'outputs']);
   check(graph.version === 2, 'VERSION', 'Expected ZIPP Graph v2');
   check(Array.isArray(graph.nodes) && graph.nodes.length > 0 && graph.nodes.length <= limits.maxNodes, 'LIMIT', 'Graph node budget exceeded');
   check(Array.isArray(template.bindings) && template.bindings.length <= graph.nodes.length, 'LIMIT', 'Invalid binding count');
-  check(Array.isArray(graph.outputs) && graph.outputs.length === 1, 'FORMAT', 'Model graph must expose exactly one logits output');
+  check(Array.isArray(graph.outputs) && graph.outputs.length === 1, 'FORMAT', 'Model graph must expose exactly one output');
   fields(graph.outputs[0], ['name', 'id'], ['name', 'id']);
-  check(graph.outputs[0].name === 'logits', 'FORMAT', 'Model output must be named logits');
+  // Logits, or the residual stream for whoever runs the rest of the model.
+  check(graph.outputs[0].name === 'logits' || graph.outputs[0].name === 'hidden', 'FORMAT',
+    'Model output must be named logits, or hidden if it stops before the last layer');
   integer(graph.outputs[0].id, 0, graph.nodes.length - 1, 'Output node id');
   const byNode = new Map();
   for (const binding of template.bindings) {
@@ -103,6 +107,24 @@ export async function bindGraph(template, weights, limits) {
         'SHAPE', 'Row gathering requires a bounded index list and matrix');
       for (const index of b.indices) integer(index, 0, info.shape[0] - 1, 'Embedding index');
       check(sameShape(node.shape, [b.indices.length, info.shape[1]]), 'SHAPE', 'Embedding shape mismatch');
+    } else if (b.kind === 'feed') {
+      // Data the caller supplies rather than the checkpoint: the residual
+      // stream a previous stage produced. Checked on arrival for shape and
+      // finiteness, because it comes from somewhere else and may have crossed
+      // a worker, a process or a network on the way here.
+      fields(b, ['node', 'kind', 'name'], ['node', 'kind', 'name']);
+      check(typeof b.name === 'string' && /^[a-z][a-z0-9_]{0,31}$/.test(b.name),
+        'FORMAT', 'Invalid fed input name');
+      const given = feed[b.name];
+      check(given instanceof Float32Array, 'SHAPE',
+        `This graph begins mid-model and needs {${b.name}}: the output of the stage before it`);
+      // The node's shape was already bounded above; this is just its product.
+      const wanted = node.shape.reduce((a, n) => a * n, 1);
+      check(given.length === wanted, 'SHAPE',
+        `${b.name} is ${wanted} values for this stage, got ${given.length}`);
+      for (let i = 0; i < given.length; i++) {
+        check(Number.isFinite(given[i]), 'NUMBER', `Non-finite value in ${b.name}`);
+      }
     } else if (b.kind === 'causal') {
       fields(b, ['node', 'kind', 'length', 'window'], ['node', 'kind', 'length']);
       integer(b.length, 1, limits.maxContext, 'Attention length');
@@ -137,6 +159,9 @@ export async function bindGraph(template, weights, limits) {
         // Decoded, but still in the stored layout: the matmul transposes.
         nodes[id].data = await weights.tensor(b.tensor);
       }
+    }
+    else if (b.kind === 'feed') {
+      nodes[id].data = feed[b.name];
     }
     else if (b.kind === 'rows') {
       const info = weights.info(b.tensor), width = info.shape[1];

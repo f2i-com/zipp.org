@@ -84,6 +84,16 @@ class Graph:
                               "indices": list(indices)})
         return index
 
+    def feed(self, name, shape):
+        """Data the caller supplies rather than the checkpoint.
+
+        The prefill seam: a stage that does not start at layer 0 is handed the
+        residual stream for the whole prompt, [length, hidden_size], instead of
+        looking the tokens up."""
+        node = self.op("input", shape=list(shape))
+        self.bindings.append({"node": node, "kind": "feed", "name": name})
+        return node
+
     def causal_mask(self, length):
         index = self.op("input", shape=[length, length])
         self.bindings.append({"node": index, "kind": "causal", "length": length})
@@ -234,11 +244,22 @@ class Graph:
         self.carried.append({"name": name, "id": updated})
         return updated
 
-    def finish(self, logits):
-        return {"version": 1,
-                "graph": {"version": 2, "nodes": self.nodes,
-                          "outputs": [{"name": "logits", "id": logits}]},
-                "bindings": self.bindings}
+    def finish(self, logits, stage=None):
+        return self._template("logits", logits, stage)
+
+    def finish_hidden(self, hidden, stage=None):
+        """A prefill stage that stops before the end of the model: its output
+        is the residual stream for whoever runs the rest."""
+        return self._template("hidden", hidden, stage)
+
+    def _template(self, name, node, stage):
+        template = {"version": 1,
+                    "graph": {"version": 2, "nodes": self.nodes,
+                              "outputs": [{"name": name, "id": node}]},
+                    "bindings": self.bindings}
+        if stage is not None:
+            template["stage"] = {"first_layer": stage[0], "last_layer": stage[1]}
+        return template
 
     def finish_decode(self, logits, context, stage=None):
         outputs = [{"name": "logits", "id": logits}]

@@ -30,7 +30,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile, open, stat, access} from 'node:fs/promises';
 
-import {PluginRegistry, openGGUF, WeightStore, prepareDecode, stepInputs,
+import {PluginRegistry, openGGUF, WeightStore, bindGraph, prepareDecode, stepInputs,
         resolveLimits} from '../src/index.mjs';
 import {sourceDirectory} from './helpers.mjs';
 
@@ -235,6 +235,183 @@ test('Qwen3 split across two stages gives the logits of the whole model',
         stepInputs(backPlan, store, {position: 0, hidden: wrong}),
         /Non-finite value in a hidden state/);
     });
+  } finally {
+    for (const runtime of runtimes) await runtime?.dispose?.();
+    engine.free?.();
+    await source.close();
+  }
+});
+
+test('a prompt prefills across stages the same way a token decodes across them',
+  {skip: !ready && reason}, async t => {
+  // A peer holding layers 8..15 has to prefill as well as decode: the prompt
+  // must reach its layers before a cached step means anything. The prefill
+  // seam is wider -- the residual for every position rather than one -- and
+  // still nothing beside the weights: 20 KB for five tokens against 372 MB.
+  const zipp = await import(engineURL);
+  await zipp.default({module_or_path: await readFile(wasmURL)});
+  const {createRuntime} = await import(runtimeURL);
+
+  const plugin = await new PluginRegistry().install(
+    await sourceDirectory('../plugins/qwen3/'), {approve: () => true});
+  const source = await fileSource(modelPath);
+  const index = await openGGUF(source, 'model.gguf', null, hostLimits);
+  const store = new WeightStore([index], hostLimits);
+  const engine = new zipp.Engine();
+  let runtime;
+  try {
+    engine.setSyncHostCapabilities([]);
+    engine.setInstructionBudget(hostLimits.instructionBudget);
+    engine.initPythonProject({...plugin.files}, plugin.entry, []);
+    const call = (name, args) => {
+      engine.renewInstructionBudget();
+      return JSON.parse(engine.pythonCall(name, args));
+    };
+
+    const vocab = index.strings('tokenizer.ggml.tokens');
+    const config = call('zipp_model_config',
+      [JSON.stringify(index.metadata()), JSON.stringify(vocab.length)]);
+    const layers = config.num_layers;
+    const tokens = [...index.tokenizer().encode('The capital of France is')];
+    runtime = await createRuntime(
+      {backend: 'wasm', wasmBytes: await readFile(kernelsURL), limits: computeLimits});
+
+    const whole = await runtime.execute(
+      await bindGraph(call('zipp_model_graph',
+        [JSON.stringify(config), JSON.stringify(tokens)]), store, hostLimits),
+      {typedOutputs: true});
+
+    // Four stages rather than two, because "it divides" and "it divides in
+    // half" are different claims. 28 layers into 7 + 7 + 7 + 7.
+    const parts = 4, per = layers / parts;
+    assert.equal(per % 1, 0, 'this model divides evenly into four');
+
+    let carried = null, seam = 0;
+    for (let part = 0; part < parts; part++) {
+      const first = part * per, last = first + per - 1;
+      const template = call('zipp_model_prefill_stage',
+        [JSON.stringify(config), JSON.stringify(tokens),
+         JSON.stringify(first), JSON.stringify(last)]);
+      assert.deepEqual(template.stage, {first_layer: first, last_layer: last});
+
+      const graph = await bindGraph(template, store, hostLimits,
+        carried ? {feed: {hidden: carried}} : {});
+      const out = await runtime.execute(graph, {typedOutputs: true});
+
+      if (last === layers - 1) {
+        // The last stage ends the model, so this is the comparison.
+        const got = out.outputs.logits.data, want = whole.outputs.logits.data;
+        assert.equal(got.length, want.length);
+        for (let i = 0; i < want.length; i++) {
+          if (!Object.is(got[i], want[i])) {
+            assert.fail(`logit ${i}: ${got[i]} in ${parts} stages, ${want[i]} in one`);
+          }
+        }
+      } else {
+        assert.deepEqual(out.outputs.hidden.shape, [tokens.length, config.hidden_size]);
+        carried = acrossTheSeam(out.outputs.hidden.data);
+        seam = carried.byteLength;
+      }
+    }
+    console.log(`      ${layers} layers in ${parts} stages of ${per}, logits identical; ` +
+      `the seam carried ${seam} bytes between them`);
+  } finally {
+    await runtime?.dispose?.();
+    engine.free?.();
+    await source.close();
+  }
+});
+
+test('a token decodes across four stages, each carrying only its own caches',
+  {skip: !ready && reason}, async t => {
+  // Decode is the serving path, and the one where the seam is paid per token
+  // rather than per prompt. Four stages of seven layers, each with its own
+  // caches, generating several tokens in sequence -- because a cache that is
+  // wrong is wrong only from the second token onwards.
+  const zipp = await import(engineURL);
+  await zipp.default({module_or_path: await readFile(wasmURL)});
+  const {createRuntime} = await import(runtimeURL);
+
+  const plugin = await new PluginRegistry().install(
+    await sourceDirectory('../plugins/qwen3/'), {approve: () => true});
+  const source = await fileSource(modelPath);
+  const index = await openGGUF(source, 'model.gguf', null, hostLimits);
+  const store = new WeightStore([index], hostLimits);
+  const engine = new zipp.Engine();
+  const runtimes = [];
+  try {
+    engine.setSyncHostCapabilities([]);
+    engine.setInstructionBudget(hostLimits.instructionBudget);
+    engine.initPythonProject({...plugin.files}, plugin.entry, []);
+    const call = (name, args) => {
+      engine.renewInstructionBudget();
+      return JSON.parse(engine.pythonCall(name, args));
+    };
+
+    const vocab = index.strings('tokenizer.ggml.tokens');
+    const config = call('zipp_model_config',
+      [JSON.stringify(index.metadata()), JSON.stringify(vocab.length)]);
+    const layers = config.num_layers, parts = 4, per = layers / parts;
+    const tokens = [...index.tokenizer().encode('The capital of France is')];
+    const kernels = await readFile(kernelsURL);
+
+    const whole = {plan: await prepareDecode(
+      call('zipp_model_decode_graph', [JSON.stringify(config), JSON.stringify(CONTEXT)]),
+      store, hostLimits)};
+    runtimes.push(await createRuntime({backend: 'wasm', wasmBytes: kernels, limits: computeLimits}));
+    whole.session = await runtimes[0].prepare(whole.plan.program);
+
+    const stages = [];
+    for (let part = 0; part < parts; part++) {
+      const first = part * per, last = first + per - 1;
+      const plan = await prepareDecode(call('zipp_model_decode_stage',
+        [JSON.stringify(config), JSON.stringify(CONTEXT),
+         JSON.stringify(first), JSON.stringify(last)]), store, hostLimits);
+      // Two caches a layer, and only for this stage's layers.
+      assert.equal(plan.resident.length, 2 * per,
+        `stage ${part} carries ${plan.resident.length} caches, not ${2 * per}`);
+      for (const name of plan.resident) {
+        const layer = Number(name.slice(1));
+        assert.ok(layer >= first && layer <= last,
+          `stage ${part} carries ${name}, which is not one of layers ${first}..${last}`);
+      }
+      const runtime = await createRuntime({backend: 'wasm', wasmBytes: kernels, limits: computeLimits});
+      runtimes.push(runtime);
+      stages.push({plan, session: await runtime.prepare(plan.program), first, last});
+    }
+
+    // Several tokens, so a cache that is written or read wrongly shows up.
+    let token = tokens[0], generated = [];
+    for (let position = 0; position < tokens.length + 2; position++) {
+      const feeding = position < tokens.length ? tokens[position] : token;
+      const one = await whole.session.run(
+        [await stepInputs(whole.plan, store, {token: feeding, position})], {readback: ['logits']});
+
+      let hidden = null, split = null;
+      for (const stage of stages) {
+        const inputs = stage.first === 0
+          ? await stepInputs(stage.plan, store, {token: feeding, position})
+          : await stepInputs(stage.plan, store, {position, hidden});
+        const out = await stage.session.run([inputs],
+          {readback: [stage.last === layers - 1 ? 'logits' : 'hidden']});
+        if (stage.last === layers - 1) split = out.outputs.logits.data;
+        else hidden = acrossTheSeam(out.outputs.hidden.data);
+      }
+
+      const want = one.outputs.logits.data;
+      for (let i = 0; i < want.length; i++) {
+        if (!Object.is(split[i], want[i])) {
+          assert.fail(`position ${position}, logit ${i}: ${split[i]} split, ${want[i]} whole`);
+        }
+      }
+      let best = 0;
+      for (let i = 1; i < split.length; i++) if (split[i] > split[best]) best = i;
+      token = best;
+      if (position >= tokens.length - 1) generated.push(vocab[best]);
+    }
+    assert.equal(generated[0], 'ĠParis');
+    console.log(`      ${parts} stages of ${per} layers, ${tokens.length + 2} positions, ` +
+      `logits identical throughout; generated ${JSON.stringify(generated.join(''))}`);
   } finally {
     for (const runtime of runtimes) await runtime?.dispose?.();
     engine.free?.();

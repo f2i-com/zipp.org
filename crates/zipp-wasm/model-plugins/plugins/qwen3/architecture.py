@@ -301,72 +301,129 @@ def build_decode_stage(config, context=None, first_layer=None, last_layer=None):
     return g.finish_stage(x, context, hidden, stage=(first, last))
 
 
-def build_graph(config, tokens):
-    description = describe(config)
-    if not isinstance(tokens, list) or not 1 <= len(tokens) <= description["max_context"]:
-        raise ValueError("Invalid context length")
-    if any(type(token) is not int or not 0 <= token < config["vocab_size"] for token in tokens):
-        raise ValueError("Invalid token id")
+def _prefill_layer(g, x, layer, config, ctx):
+    """One transformer block over a whole prompt.
 
-    length = len(tokens)
+    The same arithmetic as `_decode_layer` over many positions instead of one:
+    the mask is [length, length] rather than [1, context], there are no caches
+    to write, and the rotary tables are constants because a prefill knows every
+    position when it is built.
+
+    `x` in and `x` out is the residual stream, so a range of these composes the
+    same way a range of decode layers does.
+    """
+    length = ctx["length"]
     hidden = config["hidden_size"]
     heads, kv_heads = config["num_heads"], config["num_kv_heads"]
     dim = config["head_dim"]
     repeats = heads // kv_heads
     epsilon = config["rms_norm_epsilon"]
     intermediate = config["intermediate_size"]
-    # Qwen3 sizes its attention projections by head_dim * heads, which need not
-    # equal hidden_size -- for the 0.6B it is 2048 against a hidden of 1024.
     q_width, kv_width = heads*dim, kv_heads*dim
+    mask, cos, sin, scale = ctx["mask"], ctx["cos"], ctx["sin"], ctx["scale"]
+
+    block = "blk." + str(layer) + "."
+    n = g.rms_norm(x, block + "attn_norm.weight", hidden, epsilon)
+    q = g.op("reshape", a=g.linear(n, block + "attn_q.weight", hidden, q_width),
+             shape=[length, heads, dim])
+    k = g.op("reshape", a=g.linear(n, block + "attn_k.weight", hidden, kv_width),
+             shape=[length, kv_heads, dim])
+    v = g.op("reshape", a=g.linear(n, block + "attn_v.weight", hidden, kv_width),
+             shape=[length, kv_heads, dim])
+    # Per-head RMSNorm before rotation. This is Qwen3's addition, and the
+    # weights are head_dim wide rather than hidden wide.
+    q = g.rms_norm(q, block + "attn_q_norm.weight", dim, epsilon)
+    k = g.rms_norm(k, block + "attn_k_norm.weight", dim, epsilon)
+    q = g.rope(q, length, heads, dim, cos, sin)
+    k = g.rope(k, length, kv_heads, dim, cos, sin)
+    k = g.repeat_heads(k, length, kv_heads, repeats, dim)
+    v = g.repeat_heads(v, length, kv_heads, repeats, dim)
+
+    qh = g.op("permute", a=q, dims=[1, 0, 2])            # [heads, length, dim]
+    kh = g.op("permute", a=k, dims=[1, 2, 0])            # [heads, dim, length]
+    vh = g.op("permute", a=v, dims=[1, 0, 2])            # [heads, length, dim]
+    scores = g.op("mul", a=g.op("matmul", a=qh, b=kh), b=scale)
+    scores = g.op("add", a=scores, b=mask)
+    context = g.op("matmul", a=g.op("softmax", a=scores, axis=-1), b=vh)
+    context = g.op("reshape", a=g.op("permute", a=context, dims=[1, 0, 2]),
+                   shape=[length, q_width])
+    x = g.op("add", a=x, b=g.linear(context, block + "attn_output.weight", q_width, hidden))
+
+    n = g.rms_norm(x, block + "ffn_norm.weight", hidden, epsilon)
+    gate = g.silu(g.linear(n, block + "ffn_gate.weight", hidden, intermediate))
+    up = g.linear(n, block + "ffn_up.weight", hidden, intermediate)
+    x = g.op("add", a=x, b=g.linear(g.op("mul", a=gate, b=up),
+                                    block + "ffn_down.weight", intermediate, hidden))
+    return x
+
+
+def _prefill_inputs(g, config, length):
+    """What every block of a prefill needs: the causal mask and the rotations.
+
+    Constants rather than fed values, because a prefill graph is built for one
+    prompt and knows every position in it.
+    """
+    dim = config["head_dim"]
+    cos_data, sin_data = rope_tables(length, dim, float(config["rope_base"]))
+    return {
+        "length": length,
+        "mask": g.causal_mask(length),
+        "cos": g.literal("rope_cos", [length, 1, dim], cos_data),
+        "sin": g.literal("rope_sin", [length, 1, dim], sin_data),
+        "scale": g.scalar(1.0 / (dim ** 0.5)),
+    }
+
+
+def build_prefill_stage(config, tokens, first_layer=None, last_layer=None):
+    """A prompt through layers [first_layer, last_layer].
+
+    A peer holding part of a model has to prefill as well as decode -- the
+    prompt has to reach its layers before a cached step means anything. So this
+    is `build_graph` over a range, and `build_graph` is this over all of it.
+
+    The seam is wider here than in a decode step and still small: the residual
+    stream for the whole prompt is [length, hidden_size], 20 KB for five tokens
+    on this model, against weights that do not move at all.
+
+    A stage that does not start at layer 0 still needs the token list, because
+    the prompt's length is the shape of everything inside it -- but it never
+    looks a token up, and is not bound the embedding table.
+    """
+    description = describe(config)
+    if not isinstance(tokens, list) or not 1 <= len(tokens) <= description["max_context"]:
+        raise ValueError("Invalid context length")
+    if any(type(token) is not int or not 0 <= token < config["vocab_size"] for token in tokens):
+        raise ValueError("Invalid token id")
+    first, last = layer_range(config, first_layer, last_layer)
+
+    length = len(tokens)
+    hidden = config["hidden_size"]
+    epsilon = config["rms_norm_epsilon"]
 
     g = Graph()
-    x = g.rows("token_embd.weight", tokens, hidden)
-    mask = g.causal_mask(length)
-    cos_data, sin_data = rope_tables(length, dim, float(config["rope_base"]))
-    cos = g.literal("rope_cos", [length, 1, dim], cos_data)
-    sin = g.literal("rope_sin", [length, 1, dim], sin_data)
-    scale = g.scalar(1.0 / (dim ** 0.5))
+    if first == 0:
+        x = g.rows("token_embd.weight", tokens, hidden)
+    else:
+        x = g.feed("hidden", [length, hidden])
 
-    for layer in range(config["num_layers"]):
-        block = "blk." + str(layer) + "."
-        n = g.rms_norm(x, block + "attn_norm.weight", hidden, epsilon)
-        q = g.op("reshape", a=g.linear(n, block + "attn_q.weight", hidden, q_width),
-                 shape=[length, heads, dim])
-        k = g.op("reshape", a=g.linear(n, block + "attn_k.weight", hidden, kv_width),
-                 shape=[length, kv_heads, dim])
-        v = g.op("reshape", a=g.linear(n, block + "attn_v.weight", hidden, kv_width),
-                 shape=[length, kv_heads, dim])
-        # Per-head RMSNorm before rotation. This is Qwen3's addition, and the
-        # weights are head_dim wide rather than hidden wide.
-        q = g.rms_norm(q, block + "attn_q_norm.weight", dim, epsilon)
-        k = g.rms_norm(k, block + "attn_k_norm.weight", dim, epsilon)
-        q = g.rope(q, length, heads, dim, cos, sin)
-        k = g.rope(k, length, kv_heads, dim, cos, sin)
-        k = g.repeat_heads(k, length, kv_heads, repeats, dim)
-        v = g.repeat_heads(v, length, kv_heads, repeats, dim)
+    ctx = _prefill_inputs(g, config, length)
+    for layer in range(first, last + 1):
+        x = _prefill_layer(g, x, layer, config, ctx)
 
-        qh = g.op("permute", a=q, dims=[1, 0, 2])            # [heads, length, dim]
-        kh = g.op("permute", a=k, dims=[1, 2, 0])            # [heads, dim, length]
-        vh = g.op("permute", a=v, dims=[1, 0, 2])            # [heads, length, dim]
-        scores = g.op("mul", a=g.op("matmul", a=qh, b=kh), b=scale)
-        scores = g.op("add", a=scores, b=mask)
-        context = g.op("matmul", a=g.op("softmax", a=scores, axis=-1), b=vh)
-        context = g.op("reshape", a=g.op("permute", a=context, dims=[1, 0, 2]),
-                       shape=[length, q_width])
-        x = g.op("add", a=x, b=g.linear(context, block + "attn_output.weight", q_width, hidden))
+    if last == config["num_layers"] - 1:
+        x = g.rms_norm(x, "output_norm.weight", hidden, epsilon)
+        # Only the last row is sampled, and this vocabulary is 151,936 wide:
+        # taking the row before the projection is the difference between logits
+        # of [1, 151936] and [tokens, 151936].
+        last_row = g.op("matmul", a=g.one_hot_row(length, length - 1), b=x)
+        # Tied: the output projection is the token embedding read the other way
+        # round, so the checkpoint carries no second copy of it.
+        logits = g.linear(last_row, "token_embd.weight", hidden, config["vocab_size"])
+        return g.finish(logits, stage=(first, last))
+    return g.finish_hidden(x, stage=(first, last))
 
-        n = g.rms_norm(x, block + "ffn_norm.weight", hidden, epsilon)
-        gate = g.silu(g.linear(n, block + "ffn_gate.weight", hidden, intermediate))
-        up = g.linear(n, block + "ffn_up.weight", hidden, intermediate)
-        x = g.op("add", a=x, b=g.linear(g.op("mul", a=gate, b=up),
-                                        block + "ffn_down.weight", intermediate, hidden))
 
-    x = g.rms_norm(x, "output_norm.weight", hidden, epsilon)
-    # Only the last row is sampled, and this vocabulary is 151,936 wide: taking
-    # the row before the projection is the difference between logits of
-    # [1, 151936] and [tokens, 151936].
-    last = g.op("matmul", a=g.one_hot_row(length, length - 1), b=x)
-    # Tied: the output projection is the token embedding read the other way
-    # round, so the checkpoint carries no second copy of it.
-    logits = g.linear(last, "token_embd.weight", hidden, config["vocab_size"])
-    return g.finish(logits)
+def build_graph(config, tokens):
+    """The whole prompt through the whole model, which is the correctness
+    oracle every other path is checked against."""
+    return build_prefill_stage(config, tokens)
