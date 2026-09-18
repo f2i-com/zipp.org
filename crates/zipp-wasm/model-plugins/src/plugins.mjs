@@ -56,11 +56,14 @@ export function bootstrap(entry) {
   // entry was validated as an identifier path, never arbitrary source text.
   // zipp_model_native is defined for every plugin but resolves only for one
   // that implements it; a plugin without native support never has it called.
+  // zipp_model_decode_stage is the same arrangement: a plugin whose model can
+  // be split across devices implements build_decode_stage, and one that cannot
+  // simply never has it asked for.
   check(/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(entry), 'FORMAT', 'Invalid entry');
   return `import json\nimport zipp_plugin.${entry} as _plugin\n\ndef zipp_model_describe(config):\n    return json.dumps(_plugin.describe(json.loads(config)))\n\ndef zipp_model_encode(text, tokenizer):\n    return json.dumps(_plugin.encode(text, json.loads(tokenizer)))\n\ndef zipp_model_decode(tokens, tokenizer):\n    return _plugin.decode(json.loads(tokens), json.loads(tokenizer))\n\ndef zipp_model_config(metadata, vocab_size):
     return json.dumps(_plugin.config_from_gguf(json.loads(metadata), json.loads(vocab_size)))
 
-def zipp_model_graph(config, tokens):\n    return json.dumps(_plugin.build_graph(json.loads(config), json.loads(tokens)))\n\ndef zipp_model_decode_graph(config, context):\n    return json.dumps(_plugin.build_decode_graph(json.loads(config), json.loads(context)))\n\ndef zipp_model_asset(name, form, values):\n    _plugin.load_asset(name, form, values)\n\ndef zipp_model_native(config, assets, limits):\n    return json.dumps(_plugin.native_manifest(json.loads(config), json.loads(assets), json.loads(limits)))\n`;
+def zipp_model_graph(config, tokens):\n    return json.dumps(_plugin.build_graph(json.loads(config), json.loads(tokens)))\n\ndef zipp_model_decode_graph(config, context):\n    return json.dumps(_plugin.build_decode_graph(json.loads(config), json.loads(context)))\n\ndef zipp_model_asset(name, form, values):\n    _plugin.load_asset(name, form, values)\n\ndef zipp_model_native(config, assets, limits):\n    return json.dumps(_plugin.native_manifest(json.loads(config), json.loads(assets), json.loads(limits)))\n\ndef zipp_model_tensors(config, first_layer=None, last_layer=None):\n    return json.dumps(_plugin.tensor_names(json.loads(config), json.loads(first_layer) if first_layer else None, json.loads(last_layer) if last_layer else None))\n\ndef zipp_model_decode_stage(config, context, first_layer, last_layer):\n    return json.dumps(_plugin.build_decode_stage(json.loads(config), json.loads(context), json.loads(first_layer), json.loads(last_layer)))\n`;
 }
 export class PluginRegistry {
   #installed = new Map();

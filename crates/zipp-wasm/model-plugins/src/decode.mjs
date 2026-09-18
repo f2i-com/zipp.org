@@ -217,6 +217,12 @@ export async function prepareDecode(template, weights, limits) {
     program: {version: 2, nodes, outputs: graph.outputs.map(o => ({...o}))},
     steps, context: template.context,
     resident: [...carries.keys()],
+    // Present when this graph is part of a model rather than all of it: which
+    // layers it runs, and how wide the residual stream it passes on is. A host
+    // holding several stages uses these to say what it has without
+    // re-deriving it from the tensor names.
+    ...(template.stage !== undefined ? {stage: {...template.stage}} : {}),
+    ...(template.hidden_size !== undefined ? {hidden_size: template.hidden_size} : {}),
   };
 }
 
