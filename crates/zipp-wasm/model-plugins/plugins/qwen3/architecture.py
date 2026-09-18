@@ -87,11 +87,24 @@ def describe(config):
     }
 
 
-def tensor_names(config):
-    """Every tensor this graph binds, in the checkpoint's own naming. Listed so
-    a host can check a file before building anything."""
-    names = ["token_embd.weight", "output_norm.weight"]
-    for layer in range(config["num_layers"]):
+def tensor_names(config, first_layer=None, last_layer=None):
+    """Every tensor a graph binds, in the checkpoint's own naming. Listed so a
+    host can check a file before building anything.
+
+    With a layer range this is the point of the whole exercise: a peer holding
+    layers 8..15 is told to load eleven tensors a layer and nothing else, so
+    "this device holds part of the model" is a fact about what it read rather
+    than a promise about what it uses. `token_embd.weight` is listed only for a
+    stage that looks a token up or projects to logits, and `output_norm.weight`
+    only for the one that ends the model.
+    """
+    first, last = layer_range(config, first_layer, last_layer)
+    names = []
+    if first == 0 or last == config["num_layers"] - 1:
+        names.append("token_embd.weight")
+    if last == config["num_layers"] - 1:
+        names.append("output_norm.weight")
+    for layer in range(first, last + 1):
         block = "blk." + str(layer) + "."
         names.extend([block + "attn_norm.weight", block + "attn_q.weight",
                       block + "attn_k.weight", block + "attn_v.weight",
@@ -100,6 +113,94 @@ def tensor_names(config):
                       block + "ffn_gate.weight", block + "ffn_up.weight",
                       block + "ffn_down.weight"])
     return names
+
+
+def _decode_layer(g, x, layer, config, step):
+    """One transformer block of a cached decode step.
+
+    Split out of `build_decode_graph` so a graph can be built over any range of
+    layers rather than always over all of them. `x` in and `x` out is the
+    residual stream, which is the only thing a block hands to the next one --
+    every norm a block needs is inside it.
+
+    `step` carries what depends on the position rather than the layer: the
+    mask, the write column, its complement and the rotation. Those are the same
+    for every block, so they are built once and passed in.
+    """
+    hidden = config["hidden_size"]
+    heads, kv_heads = config["num_heads"], config["num_kv_heads"]
+    dim = config["head_dim"]
+    repeats = heads // kv_heads
+    epsilon = config["rms_norm_epsilon"]
+    intermediate = config["intermediate_size"]
+    q_width, kv_width = heads*dim, kv_heads*dim
+    context = step["context"]
+
+    block = "blk." + str(layer) + "."
+    n = g.rms_norm(x, block + "attn_norm.weight", hidden, epsilon)
+    q = g.op("reshape", a=g.linear(n, block + "attn_q.weight", hidden, q_width),
+             shape=[1, heads, dim])
+    k = g.op("reshape", a=g.linear(n, block + "attn_k.weight", hidden, kv_width),
+             shape=[1, kv_heads, dim])
+    v = g.op("reshape", a=g.linear(n, block + "attn_v.weight", hidden, kv_width),
+             shape=[1, kv_heads, dim])
+    q = g.rms_norm(q, block + "attn_q_norm.weight", dim, epsilon)
+    k = g.rms_norm(k, block + "attn_k_norm.weight", dim, epsilon)
+    q = g.rope_once(q, heads, dim, step["rotation"])
+    k = g.rope_once(k, kv_heads, dim, step["rotation"])
+
+    # Into the caches, which are [context, kv_width] and carried. The names
+    # carry the absolute layer index, so the caches of a stage holding layers
+    # 8..15 never collide with those of a stage holding 0..7.
+    keys = g.write_cache("k" + str(layer), g.cache("k" + str(layer), [context, kv_width]),
+                         step["keep"], step["write"], g.op("reshape", a=k, shape=[1, kv_width]))
+    values = g.write_cache("v" + str(layer), g.cache("v" + str(layer), [context, kv_width]),
+                           step["keep"], step["write"], g.op("reshape", a=v, shape=[1, kv_width]))
+    # Grouped-query attention without repeating anything.
+    #
+    # The prefill path copies each key head out to the query heads it serves,
+    # because its mask is [tokens, tokens] and cannot broadcast across a
+    # grouped batch. One token needs no such thing: viewing the queries as
+    # [kv_heads, repeats, dim] makes the batch dimension the key head itself,
+    # so the cache is read where it lies. That removes a [context, heads, dim]
+    # copy of both caches every step -- 29 million elements written per token
+    # on this model -- and halves what the permutes move.
+    qg = g.op("reshape", a=q, shape=[kv_heads, repeats, dim])
+    kh = g.op("permute", a=g.op("reshape", a=keys, shape=[context, kv_heads, dim]),
+              dims=[1, 2, 0])                              # [kv_heads, dim, context]
+    vh = g.op("permute", a=g.op("reshape", a=values, shape=[context, kv_heads, dim]),
+              dims=[1, 0, 2])                              # [kv_heads, context, dim]
+    scores = g.op("mul", a=g.op("matmul", a=qg, b=kh), b=step["scale"])
+    scores = g.op("add", a=scores, b=step["mask"])         # [1, context] broadcasts
+    attended = g.op("matmul", a=g.op("softmax", a=scores, axis=-1), b=vh)
+    # [kv_heads, repeats, dim] is already head order, so this is a view.
+    attended = g.op("reshape", a=attended, shape=[1, q_width])
+    x = g.op("add", a=x, b=g.linear(attended, block + "attn_output.weight", q_width, hidden))
+
+    n = g.rms_norm(x, block + "ffn_norm.weight", hidden, epsilon)
+    gate = g.silu(g.linear(n, block + "ffn_gate.weight", hidden, intermediate))
+    up = g.linear(n, block + "ffn_up.weight", hidden, intermediate)
+    x = g.op("add", a=x, b=g.linear(g.op("mul", a=gate, b=up),
+                                    block + "ffn_down.weight", intermediate, hidden))
+    return x
+
+
+def _decode_step_inputs(g, config, context):
+    """What every block of a decode step needs, and no block owns.
+
+    The mask, the write column and the rotation depend on the position, not on
+    which layers are being run -- so a stage holding layers 8..15 needs exactly
+    the same ones as a stage holding 0..7.
+    """
+    write = g.step_write(context)
+    return {
+        "context": context,
+        "mask": g.step_mask(context),
+        "write": write,
+        "keep": g.op("sub", a=g.scalar(1.0), b=write),
+        "rotation": g.step_rope("matrix", config["head_dim"], config["rope_base"]),
+        "scale": g.scalar(1.0 / (config["head_dim"] ** 0.5)),
+    }
 
 
 def build_decode_graph(config, context=None):
@@ -117,78 +218,87 @@ def build_decode_graph(config, context=None):
     written in first -- by arithmetic, because the protocol has no scatter. And
     the rotary tables are fed per step rather than built in, because this graph
     is built once and run at every position.
+
+    This is `build_decode_stage` over every layer, which is how it stays the
+    definition of what a stage must add up to.
+    """
+    return build_decode_stage(config, context=context)
+
+
+def layer_range(config, first_layer=None, last_layer=None):
+    """The inclusive layer range a stage covers, checked against the model.
+
+    Defaults to the whole model, so every existing caller means what it always
+    meant. A range outside the model is refused here rather than producing a
+    graph that binds tensors the checkpoint does not have.
+    """
+    total = config["num_layers"]
+    first = 0 if first_layer is None else int(first_layer)
+    last = total - 1 if last_layer is None else int(last_layer)
+    if not 0 <= first <= last < total:
+        raise ValueError("Invalid layer range: " + str(first) + ".." + str(last) +
+                         " of " + str(total) + " layers")
+    return first, last
+
+
+def build_decode_stage(config, context=None, first_layer=None, last_layer=None):
+    """One cached decode step over layers [first_layer, last_layer].
+
+    A whole model is the default and is what `build_decode_graph` asks for. A
+    range is what makes a model divisible: layers 0..7 on one device, 8..15 on
+    another, and a hidden state between them.
+
+    ## What crosses the seam
+
+    The residual stream, and nothing else. Every normalisation a block needs
+    happens inside that block, so a stage hands on `x` exactly as the next
+    block expects to receive it -- one `[1, hidden_size]` vector, 4 KB for this
+    model, against the 372 MB of weights that stay where they are. That ratio
+    is the whole argument for splitting a model this way rather than moving it.
+
+    ## What does not cross it
+
+    The caches. `k12` and `v12` belong to whichever stage runs layer 12, live
+    on that device, and are never read by anything else -- a stage that owns
+    layers 8..15 carries sixteen caches and knows nothing of the other twelve.
+    That is why the names carry absolute layer indices.
+
+    ## The two ends
+
+    A stage starting at layer 0 reads a token id and looks the embedding up; a
+    later one receives a hidden state. A stage ending at the last layer applies
+    the output norm and projects to logits; an earlier one emits the residual.
+    A stage that is both, which is the default, does both -- and
+    `token_embd.weight` is bound once for the lookup and once for the tied
+    projection, as it always was.
     """
     description = describe(config)
     context = description["max_context"] if context is None else int(context)
     if not 1 <= context <= description["max_context"]:
         raise ValueError("Invalid decode context")
+    first, last = layer_range(config, first_layer, last_layer)
 
     hidden = config["hidden_size"]
-    heads, kv_heads = config["num_heads"], config["num_kv_heads"]
-    dim = config["head_dim"]
-    repeats = heads // kv_heads
     epsilon = config["rms_norm_epsilon"]
-    intermediate = config["intermediate_size"]
-    q_width, kv_width = heads*dim, kv_heads*dim
 
     g = Graph()
-    x = g.step_rows("token_embd.weight", "token", hidden)
-    mask = g.step_mask(context)
-    write = g.step_write(context)
-    keep = g.op("sub", a=g.scalar(1.0), b=write)
-    rotation = g.step_rope("matrix", dim, config["rope_base"])
-    scale = g.scalar(1.0 / (dim ** 0.5))
+    # The head of the model, or a hidden state from whoever ran the layers
+    # before this one.
+    if first == 0:
+        x = g.step_rows("token_embd.weight", "token", hidden)
+    else:
+        x = g.step_hidden(hidden)
 
-    for layer in range(config["num_layers"]):
-        block = "blk." + str(layer) + "."
-        n = g.rms_norm(x, block + "attn_norm.weight", hidden, epsilon)
-        q = g.op("reshape", a=g.linear(n, block + "attn_q.weight", hidden, q_width),
-                 shape=[1, heads, dim])
-        k = g.op("reshape", a=g.linear(n, block + "attn_k.weight", hidden, kv_width),
-                 shape=[1, kv_heads, dim])
-        v = g.op("reshape", a=g.linear(n, block + "attn_v.weight", hidden, kv_width),
-                 shape=[1, kv_heads, dim])
-        q = g.rms_norm(q, block + "attn_q_norm.weight", dim, epsilon)
-        k = g.rms_norm(k, block + "attn_k_norm.weight", dim, epsilon)
-        q = g.rope_once(q, heads, dim, rotation)
-        k = g.rope_once(k, kv_heads, dim, rotation)
+    step = _decode_step_inputs(g, config, context)
+    for layer in range(first, last + 1):
+        x = _decode_layer(g, x, layer, config, step)
 
-        # Into the caches, which are [context, kv_width] and carried.
-        keys = g.write_cache("k" + str(layer), g.cache("k" + str(layer), [context, kv_width]),
-                             keep, write, g.op("reshape", a=k, shape=[1, kv_width]))
-        values = g.write_cache("v" + str(layer), g.cache("v" + str(layer), [context, kv_width]),
-                               keep, write, g.op("reshape", a=v, shape=[1, kv_width]))
-        # Grouped-query attention without repeating anything.
-        #
-        # The prefill path copies each key head out to the query heads it
-        # serves, because its mask is [tokens, tokens] and cannot broadcast
-        # across a grouped batch. One token needs no such thing: viewing the
-        # queries as [kv_heads, repeats, dim] makes the batch dimension the
-        # key head itself, so the cache is read where it lies. That removes a
-        # [context, heads, dim] copy of both caches every step -- 29 million
-        # elements written per token on this model -- and halves what the
-        # permutes move.
-        qg = g.op("reshape", a=q, shape=[kv_heads, repeats, dim])
-        kh = g.op("permute", a=g.op("reshape", a=keys, shape=[context, kv_heads, dim]),
-                  dims=[1, 2, 0])                              # [kv_heads, dim, context]
-        vh = g.op("permute", a=g.op("reshape", a=values, shape=[context, kv_heads, dim]),
-                  dims=[1, 0, 2])                              # [kv_heads, context, dim]
-        scores = g.op("mul", a=g.op("matmul", a=qg, b=kh), b=scale)
-        scores = g.op("add", a=scores, b=mask)                 # [1, context] broadcasts
-        attended = g.op("matmul", a=g.op("softmax", a=scores, axis=-1), b=vh)
-        # [kv_heads, repeats, dim] is already head order, so this is a view.
-        attended = g.op("reshape", a=attended, shape=[1, q_width])
-        x = g.op("add", a=x, b=g.linear(attended, block + "attn_output.weight", q_width, hidden))
-
-        n = g.rms_norm(x, block + "ffn_norm.weight", hidden, epsilon)
-        gate = g.silu(g.linear(n, block + "ffn_gate.weight", hidden, intermediate))
-        up = g.linear(n, block + "ffn_up.weight", hidden, intermediate)
-        x = g.op("add", a=x, b=g.linear(g.op("mul", a=gate, b=up),
-                                        block + "ffn_down.weight", intermediate, hidden))
-
-    x = g.rms_norm(x, "output_norm.weight", hidden, epsilon)
-    logits = g.linear(x, "token_embd.weight", hidden, config["vocab_size"])
-    return g.finish_decode(logits, context)
+    # The tail of the model, or the residual for whoever runs the rest.
+    if last == config["num_layers"] - 1:
+        x = g.rms_norm(x, "output_norm.weight", hidden, epsilon)
+        logits = g.linear(x, "token_embd.weight", hidden, config["vocab_size"])
+        return g.finish_decode(logits, context, stage=(first, last))
+    return g.finish_stage(x, context, hidden, stage=(first, last))
 
 
 def build_graph(config, tokens):

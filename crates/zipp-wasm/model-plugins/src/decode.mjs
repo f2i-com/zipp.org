@@ -31,16 +31,27 @@ const residentDtype = (weights, name) =>
  * trigonometry over a position and a dimension, never over the data, so they
  * belong on this side of the boundary rather than in a kernel.
  */
-const STEP_SLOTS = new Set(['rows', 'mask', 'write', 'rope']);
+// `hidden` is the seam between two stages of one model: a stage that does not
+// start at layer 0 is handed the residual stream instead of looking a token up.
+const STEP_SLOTS = new Set(['rows', 'mask', 'write', 'rope', 'hidden']);
 const ROPE_PARTS = new Set(['cos', 'sin', 'matrix']);
 const INDEXES = new Set(['token', 'position']);
 /** Graph v2 wants finite float32; this is the mask sentinel, not -Infinity. */
 const MASKED = -1e9;
 
 export function validateDecodeTemplate(template, limits) {
-  fields(template, ['version', 'kind', 'context', 'graph', 'bindings'],
+  // `stage` and `hidden_size` are optional and describe a graph that covers
+  // part of a model rather than all of it: which layers it runs, and how wide
+  // the residual stream it hands on is.
+  fields(template, ['version', 'kind', 'context', 'graph', 'bindings', 'stage', 'hidden_size'],
     ['version', 'kind', 'context', 'graph', 'bindings']);
   check(template.version === 1 && template.kind === 'decode', 'VERSION', 'Unsupported decode template');
+  if (template.stage !== undefined) {
+    fields(template.stage, ['first_layer', 'last_layer'], ['first_layer', 'last_layer']);
+    integer(template.stage.first_layer, 0, 4095, 'Stage first layer');
+    integer(template.stage.last_layer, template.stage.first_layer, 4095, 'Stage last layer');
+  }
+  if (template.hidden_size !== undefined) integer(template.hidden_size, 1, 1 << 20, 'Hidden size');
   const graph = template.graph;
   fields(graph, ['version', 'nodes', 'outputs'], ['version', 'nodes', 'outputs']);
   check(graph.version === 2, 'VERSION', 'Expected ZIPP Graph v2');
@@ -56,7 +67,13 @@ export function validateDecodeTemplate(template, limits) {
     integer(output.id, 0, graph.nodes.length - 1, 'Output node id');
     outputs.set(output.name, output.id);
   }
-  check(outputs.has('logits'), 'FORMAT', 'A decode graph must expose a logits output');
+  // Logits, or the residual stream for whoever runs the rest of the model. A
+  // stage that ends mid-model has no vocabulary to project onto, and demanding
+  // logits of it would mean every stage carrying the output head.
+  check(outputs.has('logits') || outputs.has('hidden'), 'FORMAT',
+    'A decode graph must expose logits, or hidden if it stops before the last layer');
+  check(!(outputs.has('logits') && outputs.has('hidden')), 'FORMAT',
+    'A decode graph ends the model or hands it on, not both');
   check(Array.isArray(template.bindings) && template.bindings.length <= graph.nodes.length,
     'LIMIT', 'Invalid decode binding count');
   return {graph, outputs};
@@ -160,10 +177,14 @@ export async function prepareDecode(template, weights, limits) {
       } else if (binding.slot === 'mask') {
         if (binding.window !== undefined) integer(binding.window, 1, template.context, 'Local attention window');
         check(sameShape(node.shape, [1, template.context]), 'SHAPE', 'A decode mask is [1, context]');
+      } else if (binding.slot === 'hidden') {
+        check(node.shape.length === 2 && node.shape[0] === 1 && node.shape[1] >= 1,
+          'SHAPE', 'A hidden state is [1, hidden_size]');
       } else {
         check(sameShape(node.shape, [template.context, 1]), 'SHAPE', 'A write column is [context, 1]');
       }
-      steps.push({node: id, ...binding});
+      steps.push({node: id, ...binding,
+        ...(binding.slot === 'hidden' ? {width: node.shape[1]} : {})});
     } else check(false, 'FORMAT', `Unknown decode binding: ${String(binding.kind)}`);
   }
   check(steps.some(step => step.slot === 'write') === carries.size > 0, 'FORMAT',
@@ -199,8 +220,12 @@ export async function prepareDecode(template, weights, limits) {
   };
 }
 
-/** The inputs one token needs: gathered rows, the mask so far, and the write column. */
-export async function stepInputs(plan, weights, {token, position}) {
+/** The inputs one token needs: gathered rows, the mask so far, and the write column.
+ *
+ * A stage that does not start at layer 0 takes `hidden` instead of a token:
+ * the residual stream the previous stage produced, which is the only thing
+ * that crosses between them. */
+export async function stepInputs(plan, weights, {token, position, hidden}) {
   integer(position, 0, plan.context - 1, 'Decode position');
   const inputs = {};
   for (const step of plan.steps) {
@@ -241,6 +266,19 @@ export async function stepInputs(plan, weights, {token, position}) {
         for (let i = 0; i < step.dim; i++) table[i] = step.part === 'cos' ? Math.cos(angle(i)) : Math.sin(angle(i));
         inputs[step.node] = table;
       }
+    } else if (step.slot === 'hidden') {
+      // Checked rather than trusted: this arrives from another stage, and on
+      // the way it may have crossed a worker, a process or a network. A short
+      // or non-finite vector here would otherwise become a plausible-looking
+      // continuation of somebody else's model.
+      check(hidden instanceof Float32Array, 'SHAPE',
+        'This stage begins mid-model and needs {hidden}: the output of the stage before it');
+      check(hidden.length === step.width, 'SHAPE',
+        `A hidden state for this stage is ${step.width} values, got ${hidden.length}`);
+      for (let i = 0; i < hidden.length; i++) {
+        check(Number.isFinite(hidden[i]), 'NUMBER', 'Non-finite value in a hidden state');
+      }
+      inputs[step.node] = hidden;
     } else if (step.slot === 'mask') {
       const mask = new Float32Array(plan.context);
       for (let column = 0; column < plan.context; column++) {

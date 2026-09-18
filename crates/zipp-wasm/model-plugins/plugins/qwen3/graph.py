@@ -208,6 +208,18 @@ class Graph:
                               "part": part, "dim": dim, "base": float(base)})
         return node
 
+    def step_hidden(self, width):
+        """The residual stream, from whoever ran the layers before this stage.
+
+        This is the seam. It is one `[1, width]` vector -- 4 KB where the
+        weights it is travelling between are hundreds of megabytes -- and it is
+        the residual rather than anything normalised, because every block
+        normalises its own input. A stage can therefore be handed this and
+        carry on as though it had computed it."""
+        node = self.op("input", shape=[1, width])
+        self.bindings.append({"node": node, "kind": "step", "slot": "hidden"})
+        return node
+
     def cache(self, name, shape):
         """A device-resident tensor carried from one token to the next. It never
         crosses the host boundary; the host only ever sees the logits."""
@@ -228,12 +240,31 @@ class Graph:
                           "outputs": [{"name": "logits", "id": logits}]},
                 "bindings": self.bindings}
 
-    def finish_decode(self, logits, context):
+    def finish_decode(self, logits, context, stage=None):
         outputs = [{"name": "logits", "id": logits}]
         outputs.extend({"name": entry["name"], "id": entry["id"]} for entry in self.carried)
-        return {"version": 1, "kind": "decode", "context": context,
-                "graph": {"version": 2, "nodes": self.nodes, "outputs": outputs},
-                "bindings": self.bindings}
+        return self._decode_template(outputs, context, stage)
+
+    def finish_stage(self, hidden, context, width, stage=None):
+        """A stage that stops before the end of the model.
+
+        Its output is the residual stream rather than logits, under the name
+        the next stage's `step_hidden` binding expects to be given."""
+        outputs = [{"name": "hidden", "id": hidden}]
+        outputs.extend({"name": entry["name"], "id": entry["id"]} for entry in self.carried)
+        template = self._decode_template(outputs, context, stage)
+        template["hidden_size"] = width
+        return template
+
+    def _decode_template(self, outputs, context, stage):
+        template = {"version": 1, "kind": "decode", "context": context,
+                    "graph": {"version": 2, "nodes": self.nodes, "outputs": outputs},
+                    "bindings": self.bindings}
+        if stage is not None:
+            # Which layers these are, so a host can say what it is holding
+            # without re-deriving it from the tensor names.
+            template["stage"] = {"first_layer": stage[0], "last_layer": stage[1]}
+        return template
 
 
 def rope_tables(length, dim, base, offset=0):
