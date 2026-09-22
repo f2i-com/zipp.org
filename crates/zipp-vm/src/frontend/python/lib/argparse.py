@@ -98,6 +98,10 @@ class ArgumentParser:
 
     def set_defaults(self, **kw):
         self._defaults.update(kw)
+        # As in CPython, a parser default also becomes the matching action's default.
+        for a in self._actions:
+            if a.dest in kw:
+                a.default = kw[a.dest]
 
     def add_subparsers(self, dest=None, **kw):
         self._subparsers = _SubParsers(self, dest)
@@ -171,16 +175,19 @@ class ArgumentParser:
         positionals = [a for a in self._actions if a.positional]
         seen = set()
         rest = []
+        only_positional = False
         i = 0
         while i < len(args):
             arg = args[i]
-            if arg == "--":
-                rest.extend(args[i + 1:])
-                break
-            if arg in ("-h", "--help") and self.add_help:
+            if arg == "--" and not only_positional:
+                # Everything after `--` is positional.
+                only_positional = True
+                i += 1
+                continue
+            if arg in ("-h", "--help") and self.add_help and not only_positional:
                 self.print_help()
                 sys.exit(0)
-            if arg.startswith("-") and arg != "-" and not _looks_numeric(arg):
+            if not only_positional and arg.startswith("-") and arg != "-" and not _looks_numeric(arg):
                 name, value = (arg.split("=", 1) + [None])[:2] if arg.startswith("--") and "=" in arg else (arg, None)
                 act = self._option(name)
                 if act is None:
@@ -190,12 +197,16 @@ class ArgumentParser:
                 seen.add(act.dest)
                 if act.kind == "store_true":
                     setattr(ns, act.dest, True)
+                    i += 1
                 elif act.kind == "store_false":
                     setattr(ns, act.dest, False)
+                    i += 1
                 elif act.kind == "store_const":
                     setattr(ns, act.dest, act.const)
+                    i += 1
                 elif act.kind == "count":
                     setattr(ns, act.dest, (getattr(ns, act.dest) or 0) + 1)
+                    i += 1
                 elif act.kind == "version":
                     sys.stdout.write(str(act.const) + "\n")
                     sys.exit(0)
@@ -214,7 +225,7 @@ class ArgumentParser:
                     else:
                         setattr(ns, act.dest, converted)
                 continue
-            if self._subparsers is not None and arg in self._subparsers.parsers and all(a.dest in seen for a in positionals):
+            if not only_positional and self._subparsers is not None and arg in self._subparsers.parsers and all(a.dest in seen for a in positionals):
                 setattr(ns, self._subparsers.dest or "command", arg)
                 sub = self._subparsers.parsers[arg]
                 sub.parse_known_args(args[i + 1:], ns)
@@ -228,9 +239,13 @@ class ArgumentParser:
                 rest.append(arg)
                 i += 1
                 continue
-            values, i = self._collect(args, i, target, positional=True)
+            values, i = self._collect(args, i, target, positional=True, raw=only_positional)
             seen.add(target.dest)
             setattr(ns, target.dest, self._convert(target, values))
+        # A string default that was not overridden goes through `type`, as in CPython.
+        for a in self._actions:
+            if a.kind != "version" and a.dest not in seen and isinstance(a.default, str) and a.type is not None and getattr(ns, a.dest, None) is a.default:
+                setattr(ns, a.dest, self._typed(a, a.default))
         for a in positionals:
             if a.dest not in seen and a.nargs not in ("?", "*"):
                 self.error("the following arguments are required: %s" % a.dest)
@@ -257,8 +272,17 @@ class ArgumentParser:
                     return a
         return None
 
-    def _collect(self, args, i, act, positional=False):
+    def _collect(self, args, i, act, positional=False, raw=False):
         n = act.nargs
+        if raw:
+            # After `--`: every remaining string is a value.
+            count = 1 if n is None or n == "?" else (n if isinstance(n, int) else len(args) - i)
+            values = args[i:i + count]
+            if n == "+" and not values:
+                self.error("argument %s: expected at least one argument" % "/".join(act.flags or [act.dest]))
+            if isinstance(n, int) and len(values) != n:
+                self.error("argument %s: expected %d argument(s)" % ("/".join(act.flags or [act.dest]), n))
+            return values, i + len(values)
         if n is None:
             if i >= len(args) or (args[i].startswith("-") and not _looks_numeric(args[i]) and args[i] != "-"):
                 if positional:
@@ -275,21 +299,29 @@ class ArgumentParser:
             i += 1
             if isinstance(n, int) and len(values) == n:
                 break
+        if positional and n in ("*", "+") and i < len(args) and args[i] == "--":
+            # A variadic positional reads on through `--` (which it drops), as in CPython.
+            values.extend(args[i + 1:])
+            i = len(args)
         if n == "+" and not values:
             self.error("argument %s: expected at least one argument" % "/".join(act.flags or [act.dest]))
         if isinstance(n, int) and len(values) != n:
             self.error("argument %s: expected %d argument(s)" % ("/".join(act.flags or [act.dest]), n))
         return values, i
 
+    def _typed(self, act, v):
+        if act.type is None:
+            return v
+        try:
+            return act.type(v)
+        except (ValueError, TypeError, ArgumentTypeError) as e:
+            name = getattr(act.type, "__name__", "value")
+            self.error("argument %s: invalid %s value: %r" % ("/".join(act.flags or [act.dest]), name, v))
+
     def _convert(self, act, values):
         out = []
         for v in values:
-            if act.type is not None:
-                try:
-                    v = act.type(v)
-                except (ValueError, TypeError, ArgumentTypeError) as e:
-                    name = getattr(act.type, "__name__", "value")
-                    self.error("argument %s: invalid %s value: %r" % ("/".join(act.flags or [act.dest]), name, v))
+            v = self._typed(act, v)
             if act.choices is not None and v not in act.choices:
                 self.error("argument %s: invalid choice: %r (choose from %s)" % ("/".join(act.flags or [act.dest]), v, ", ".join(repr(c) for c in act.choices)))
             out.append(v)
@@ -297,7 +329,11 @@ class ArgumentParser:
         if n is None:
             return out[0] if out else act.default
         if n == "?":
-            return out[0] if out else (act.const if act.const is not None else act.default)
+            if out:
+                return out[0]
+            # No value: an option takes `const`, a positional its default; a string goes through `type`.
+            value = act.const if act.flags else act.default
+            return self._typed(act, value) if isinstance(value, str) else value
         return out
 
 

@@ -341,7 +341,7 @@ class Embedding(Module):
                 self.weight[padding_idx] = 0
 
     def forward(self, idx):
-        return F.embedding(idx, self.weight)
+        return F.embedding(idx, self.weight, self.padding_idx)
 
     def extra_repr(self):
         return "%d, %d" % (self.num_embeddings, self.embedding_dim)

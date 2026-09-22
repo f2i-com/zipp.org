@@ -1,0 +1,19 @@
+True True True
+True False False
+False True False
+data/x.csv out ('x',) a/b/c . ()
+False True False a/b/../c
+['a', 'a/b', 'a-b']
+x  x a .
+['src/a.py', 'src/pkg/b.py', 'src/pkg/sub/c.py']
+['src/pkg/sub/c.py']
+['src/pkg/sub/c.py']
+['src/pkg/sub/d.txt']
+['.', 'src', 'src/pkg', 'src/pkg/sub']
+['src']
+['src/a.py']
+['src/a.py', 'src/pkg/b.py', 'src/pkg/sub/c.py', 'top.py']
+FileNotFoundError
+True
+FileExistsError
+False

@@ -954,6 +954,9 @@ def _flatten_data(data):
 def _infer_dtype(flat, hint):
     if hint is not None:
         return hint
+    if not flat:
+        # `torch.tensor([])` takes the default floating dtype.
+        return _default_dtype
     has_float = False
     all_bool = _len(flat) > 0
     for v in flat:
@@ -1259,12 +1262,18 @@ def pow(a, b):
     return _binary("pow", a, b, "Pow", lambda g, x, y, o: (_unbroadcast(mul(g, mul(y, pow(x, sub(y, 1)))), x.shape), _unbroadcast(mul(g, mul(o, log(x))), y.shape)))
 
 
+def _split_ties(g, win_x, win_y, x, y):
+    # Elementwise max/min: the winner takes the gradient and a tie splits it evenly, as in PyTorch.
+    half = mul((x == y).to(g.dtype), 0.5)
+    return (_unbroadcast(mul(g, add(win_x.to(g.dtype), half)), x.shape), _unbroadcast(mul(g, add(win_y.to(g.dtype), half)), y.shape))
+
+
 def maximum(a, b):
-    return _binary("max", a, b, "Maximum", lambda g, x, y, o: (_unbroadcast(mul(g, (x >= y).to(g.dtype)), x.shape), _unbroadcast(mul(g, (y > x).to(g.dtype)), y.shape)))
+    return _binary("max", a, b, "Maximum", lambda g, x, y, o: _split_ties(g, x > y, y > x, x, y))
 
 
 def minimum(a, b):
-    return _binary("min", a, b, "Minimum", lambda g, x, y, o: (_unbroadcast(mul(g, (x <= y).to(g.dtype)), x.shape), _unbroadcast(mul(g, (y < x).to(g.dtype)), y.shape)))
+    return _binary("min", a, b, "Minimum", lambda g, x, y, o: _split_ties(g, x < y, y < x, x, y))
 
 
 def _unary(op, a, name, backward, p1=None, p2=None):
@@ -1591,7 +1600,29 @@ def _int64_acc(a):
 
 
 def prod(a, dim=None, keepdim=False):
-    return _reduce_nograd("prod", _int64_acc(a), dim, keepdim)
+    out = _reduce_nograd("prod", _int64_acc(a), dim, keepdim)
+    if _needs_grad(a):
+        rank = _len(a.shape)
+        dims = _dims_arg(dim, rank)
+        sa = a._s
+
+        def backward(g):
+            if rank == 0:
+                return (g,)
+            # d(prod)/dx_i is the product of the other elements: prod / x_i
+            # without zeros; at a sole zero, the product of the rest; with
+            # two or more zeros, 0.
+            x = _frozen(a, sa)
+            zero = x == 0
+            safe = where(zero, ones_like(x), x)
+            kept = dims if dims is not None else _list(_range(rank))
+            p = _reduce_nograd("prod", safe, kept, True)
+            zeros_in = _reduce_nograd("sum", zero.to(x.dtype), kept, True)
+            others = where(zero, where(zeros_in == 1, p, zeros_like(p)), where(zeros_in == 0, div(p, safe), zeros_like(x)))
+            return (mul(_expand_back(g, a.shape, dims, keepdim), others),)
+        out.requires_grad = True
+        out._node = _Node(backward, (a,), "Prod")
+    return out
 
 
 def count_nonzero(a, dim=None):
@@ -1604,7 +1635,8 @@ def var(a, dim=None, keepdim=False, unbiased=True):
     sq = square(sub(a, m))
     n = _numel(a.shape) / _b.max(1, _numel(sum(sq, dims, True).shape))
     correction = 1 if unbiased is True else (0 if unbiased is False else unbiased)
-    return div(sum(sq, dims, keepdim), _b.max(n - correction, 1))
+    # No degrees of freedom left (n - correction <= 0) gives nan/inf, as in PyTorch.
+    return div(sum(sq, dims, keepdim), _float(_b.max(n - correction, 0)))
 
 
 def std(a, dim=None, keepdim=False, unbiased=True):
@@ -2289,7 +2321,15 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2.0):
     grads = [p.grad for p in parameters if p.grad is not None]
     if not grads:
         return tensor(0.0)
-    total = _math.sqrt(_b.sum(_float(_k.dot_sum(g._s, g._s)) for g in grads))
+    norm_type = _float(norm_type)
+    if norm_type == 2.0:
+        total = _math.sqrt(_b.sum(_float(_k.dot_sum(g._s, g._s)) for g in grads))
+    elif norm_type == _math.inf:
+        total = _b.max(abs(g).max().item() if g.numel() else 0.0 for g in grads)
+    elif norm_type > 0:
+        total = _b.sum(pow(abs(g), norm_type).sum().item() for g in grads) ** (1.0 / norm_type)
+    else:
+        raise NotImplementedError("clip_grad_norm_ on Zipp supports norm_type > 0 and inf, not %r" % norm_type)
     coef = _float(max_norm) / (total + 1e-6)
     if coef < 1.0:
         for g in grads:
@@ -2508,6 +2548,11 @@ def _rebuild_tensor_v2(storage, storage_offset, size, stride, requires_grad=Fals
     t = Tensor(st, shape, _DTYPES[_k.dtype(st)])
     t.requires_grad = _bool(requires_grad)
     return t
+
+
+# A checkpoint names the global by its module: PyTorch loads (and allows
+# under weights_only) `torch._utils._rebuild_tensor_v2`, not `torch.…`.
+_rebuild_tensor_v2.__module__ = "torch._utils"
 
 
 def save(obj, f, pickle_protocol=2):

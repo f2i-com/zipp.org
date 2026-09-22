@@ -1,0 +1,26 @@
+1
+caller sees: None
+context: None
+resumed, handling: ValueError('inside gen')
+2
+caller sees: None
+after handler: None
+[]
+caller sees: None
+resumed, handling: ValueError('inside gen')
+2
+caller handling: TypeError('outer')
+context: TypeError('outer')
+caller sees: None
+closing, handling: GeneratorExit
+after close: None
+context: None
+in finally
+caller sees: None
+after close: None
+caught KeyError('b') context ValueError('a')
+2
+caller sees: None
+after close: None
+caught KeyError() context ValueError('a')
+2

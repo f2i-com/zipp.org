@@ -1,6 +1,8 @@
 """inspect for Zipp: signatures from the runtime's function records."""
 from collections import OrderedDict
 
+_void = object()  # "not given" for the replace() methods
+
 
 class Parameter:
     POSITIONAL_ONLY = "POSITIONAL_ONLY"
@@ -25,9 +27,22 @@ class Parameter:
             text = "*" + text
         elif self.kind == "VAR_KEYWORD":
             text = "**" + text
+        if self.annotation is not Parameter.empty:
+            text += ": " + _format_annotation(self.annotation)
         if self.default is not Parameter.empty:
-            text += "=%r" % (self.default,)
+            text += (" = %r" if self.annotation is not Parameter.empty else "=%r") % (self.default,)
         return text
+
+    def replace(self, name=_void, kind=_void, default=_void, annotation=_void):
+        return Parameter(self.name if name is _void else name, self.kind if kind is _void else kind,
+                         self.default if default is _void else default, self.annotation if annotation is _void else annotation)
+
+
+def _format_annotation(annotation):
+    if isinstance(annotation, type):
+        module = getattr(annotation, "__module__", "builtins")
+        return annotation.__qualname__ if module == "builtins" else "%s.%s" % (module, annotation.__qualname__)
+    return repr(annotation)
 
 
 class Signature:
@@ -38,9 +53,27 @@ class Signature:
         self.return_annotation = return_annotation
 
     def __repr__(self):
-        return "<Signature (%s)>" % ", ".join(str(p) for p in self.parameters.values())
+        return "<Signature %s>" % self
 
-    __str__ = lambda self: "(%s)" % ", ".join(str(p) for p in self.parameters.values())
+    def __str__(self):
+        parts = []
+        star = False
+        for p in self.parameters.values():
+            if p.kind == Parameter.VAR_POSITIONAL:
+                star = True
+            elif p.kind == Parameter.KEYWORD_ONLY and not star:
+                # Keyword-only parameters after a bare `*`.
+                parts.append("*")
+                star = True
+            parts.append(str(p))
+        text = "(%s)" % ", ".join(parts)
+        if self.return_annotation is not Parameter.empty:
+            text += " -> " + _format_annotation(self.return_annotation)
+        return text
+
+    def replace(self, parameters=_void, return_annotation=_void):
+        return Signature(list(self.parameters.values()) if parameters is _void else parameters,
+                         self.return_annotation if return_annotation is _void else return_annotation)
 
     def bind(self, *args, **kwargs):
         return _BoundArguments(self, args, kwargs)
@@ -49,21 +82,29 @@ class Signature:
 class _BoundArguments:
     def __init__(self, sig, args, kwargs):
         self.signature = sig
-        self.arguments = OrderedDict()
+        self.arguments = {}
         names = list(sig.parameters)
         for name, value in zip(names, args):
             self.arguments[name] = value
         self.arguments.update(kwargs)
 
 
-def signature(obj):
+def signature(obj, follow_wrapped=True):
+    # The runtime's code records carry the named parameters (positional, then
+    # keyword-only) but not `*args`/`**kwargs` or the positional-only marker,
+    # so those are missing from the signature.
     fn = obj
     if isinstance(obj, type):
         fn = getattr(obj, "__init__", None)
     elif not callable(obj):
         raise TypeError("%r is not a callable object" % (obj,))
-    while hasattr(fn, "__wrapped__"):
-        fn = fn.__wrapped__
+    if type(obj).__name__ == "partial" and hasattr(obj, "func"):
+        return _partial_signature(obj)
+    if follow_wrapped:
+        while hasattr(fn, "__wrapped__"):
+            fn = fn.__wrapped__
+    # A bound method (or classmethod) describes its function without the bound first argument.
+    fn = getattr(fn, "__func__", fn)
     code = getattr(fn, "__code__", None)
     names = list(getattr(code, "co_varnames", ())) if code is not None else []
     argcount = getattr(code, "co_argcount", len(names)) if code is not None else len(names)
@@ -84,17 +125,48 @@ def signature(obj):
     return Signature(params, annotations.get("return", Parameter.empty))
 
 
+def _partial_signature(obj):
+    """functools.partial: the bound positionals are gone, a bound keyword
+    becomes that parameter's default (and makes it and the positional
+    parameters after it keyword-only), as in CPython."""
+    params = list(signature(obj.func).parameters.values())
+    keywords = obj.keywords or {}
+    out = []
+    consumed = 0
+    keyword_only = False
+    for p in params:
+        if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD) and consumed < len(obj.args):
+            consumed += 1
+            continue
+        kind, default = p.kind, p.default
+        if p.name in keywords:
+            default = keywords[p.name]
+            if kind == Parameter.POSITIONAL_OR_KEYWORD:
+                keyword_only = True
+        if keyword_only and kind == Parameter.POSITIONAL_OR_KEYWORD:
+            kind = Parameter.KEYWORD_ONLY
+        out.append(Parameter(p.name, kind, default, p.annotation))
+    return Signature(out)
+
+
 def getfullargspec(fn):
-    sig = signature(fn)
-    return _ArgSpec([p.name for p in sig.parameters.values()])
+    sig = signature(fn, follow_wrapped=False)
+    params = list(sig.parameters.values())
+    args = [p.name for p in params if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)]
+    defaults = tuple(p.default for p in params if p.name in args and p.default is not Parameter.empty)
+    kwonly = [p for p in params if p.kind == Parameter.KEYWORD_ONLY]
+    kwdefaults = {p.name: p.default for p in kwonly if p.default is not Parameter.empty}
+    return _ArgSpec(args, defaults or None, [p.name for p in kwonly], kwdefaults or None)
 
 
 class _ArgSpec:
-    def __init__(self, args):
+    def __init__(self, args, defaults=None, kwonlyargs=(), kwonlydefaults=None):
         self.args = args
         self.varargs = None
         self.varkw = None
-        self.defaults = None
+        self.defaults = defaults
+        self.kwonlyargs = list(kwonlyargs)
+        self.kwonlydefaults = kwonlydefaults
 
 
 def isfunction(obj):

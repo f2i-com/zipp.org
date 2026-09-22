@@ -62,7 +62,6 @@
             case "%": body = rt.fixedHalfEven(ax * 100, Math.min(p, 100)) + "%"; break;
             case "g": case "G": case undefined: {
                 if (p === 0) p = 1;
-                if (ax === 0) { body = type === undefined ? "0.0" : "0"; break; }
                 const exp = Math.floor(Math.log10(ax));
                 let e2 = exp;
                 let r = expForm(ax, p - 1); const em = /e([+-]\d+)$/.exec(r); if (em) e2 = parseInt(em[1], 10);
@@ -71,9 +70,9 @@
                 if (e2 < -4 || e2 >= (type === undefined ? p - 1 : p)) {
                     body = expForm(ax, p - 1);
                     // Without a type, "#" only keeps the point (repr digits, not %g's).
-                    if (!s.alt || (type === undefined && s.precision === null)) body = body.replace(/\.?0+e/, "e");
+                    if ((!s.alt || (type === undefined && s.precision === null)) && body.includes(".")) body = body.replace(/\.?0+e/, "e");
                 } else {
-                    body = ax.toFixed(Math.max(0, p - 1 - e2));
+                    body = rt.fixedHalfEven(ax, Math.max(0, p - 1 - e2));
                     if (!s.alt && body.includes(".")) body = body.replace(/\.?0+$/, "");
                     if (type === undefined && s.precision === null) body = rt.floatRepr(ax);
                     else if (type === undefined && !body.includes(".") && !body.includes("e")) body += ".0";
@@ -92,8 +91,26 @@
         }
         return applyAlign(body, s, ">", signOf(neg, s));
     }
+    // `ax` with p digits after the point in exponent form, rounded with ties
+    // to even on the EXACT binary value (toExponential breaks exact ties
+    // away from zero), as rt.fixedHalfEven does for fixed point.
     function expForm(ax, p) {
-        let e = ax.toExponential(Math.min(p, 100));
+        p = Math.min(p, 100);
+        let e = ax.toExponential(p);
+        const exact = /^(\d)\.?(\d*)e([+-]\d+)$/.exec(ax.toExponential(Math.min(p + 30, 100)));
+        const digits = exact[1] + exact[2];
+        if (/^50*$/.test(digits.slice(p + 1))) {
+            // An exact tie: keep the truncated digits, bumped only when odd.
+            let kept = digits.slice(0, p + 1), x = Number(exact[3]);
+            if (Number(kept[p]) % 2 !== 0) {
+                const arr = kept.split("").map(Number); let i = arr.length - 1;
+                while (i >= 0) { if (arr[i] === 9) { arr[i] = 0; i--; } else { arr[i]++; break; } }
+                // 9.5 -> 10: one more digit, so the exponent moves up.
+                if (i < 0) { arr.unshift(1); arr.pop(); x++; }
+                kept = arr.join("");
+            }
+            e = kept[0] + (p > 0 ? "." + kept.slice(1) : "") + "e" + (x < 0 ? "-" : "+") + Math.abs(x);
+        }
         const m = /^(.*)e([+-])(\d+)$/.exec(e);
         return m[1] + "e" + m[2] + m[3].padStart(2, "0");
     }
@@ -542,7 +559,13 @@
         fnkw(g, "makedirs", (a) => { const kw = kwOf(a, ["exist_ok"]); const p = needStr(a[0]); if (rt.vfs.has(p)) fail(E.FileExistsError, "[Errno 17] File exists: '" + p + "'"); if (rt.vfs.isDir(p) && rt.vfs.norm(p) !== "" && !truth(kwget(kw, "exist_ok", false)) && a[1] === undefined) fail(E.FileExistsError, "[Errno 17] File exists: '" + p + "'"); rt.vfs.mkdir(p); return null; });
         for (const n of ["remove", "unlink"]) fn(g, n, 1, (a) => { if (!rt.vfs.remove(needStr(a[0]))) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + a[0] + "'"); return null; });
         fn(g, "rename", 2, (a) => { const f = rt.vfs.get(needStr(a[0])); if (f === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + a[0] + "'"); rt.vfs.set(needStr(a[1]), f); rt.vfs.remove(needStr(a[0])); return null; });
-        fn(g, "rmdir", 1, () => null);
+        fn(g, "rmdir", 1, (a) => {
+            const p = needStr(a[0]), r = rt.vfs.rmdir(p);
+            if (r === "missing") fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + p + "'");
+            if (r === "file") fail(E.NotADirectoryError, "[Errno 20] Not a directory: '" + p + "'");
+            if (r === "full") fail(E.OSError, "[Errno 39] Directory not empty: '" + p + "'");
+            return null;
+        });
         for (const n of ["chdir", "system"]) fn(g, n, -1, () => fail(E.OSError, "os." + n + " is not available in the Python sandbox"));
         fn(g, "urandom", 1, (a) => { const n = Number(needInt(a[0])); if (n < 0) fail(E.ValueError, "negative argument not allowed"); const out = rt.zeroBytes(n); for (let i = 0; i < n; i++) out[i] = Math.floor(Math.random() * 256); return rt.bytes(out); });
     });

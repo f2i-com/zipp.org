@@ -670,7 +670,8 @@
         if (isInstance(v, T.tuple)) { let s = "t("; for (const x of v.items) s += keyStr(x) + ","; return s + ")"; }
         if (isInstance(v, T.frozenset)) { const ks = []; for (const x of rt.setValues(v)) ks.push(keyStr(x)); ks.sort(); return "F{" + ks.join(",") + "}"; }
         if (isInstance(v, T.bytes)) return "b" + v.items.join(",");
-        if (isInstance(v, T.range)) return "r" + v.start + ":" + v.stop + ":" + v.step;
+        // Equal ranges hash alike: by length, then start and step only where they matter.
+        if (isInstance(v, T.range)) { const n = rangeLength(v); return "r" + n + (n === 0n ? "" : ":" + v.start + (n === 1n ? "" : ":" + v.step)); }
         if (typeof v === "string" || isNum(v) || v === null) return keyStr(v);
         fail(E.TypeError, "unhashable type: '" + typeOf(v).name + "'");
     }
@@ -1023,9 +1024,8 @@
         if (o.pyval !== undefined) return baseGetitem(o.pyval, k);
         if (isInstance(o, T.range)) {
             if (isSlice(k)) {
-                const [start, , step, count] = sliceIndices(k, Number(rangeLength(o)));
-                const s = o.start + BigInt(start) * o.step; const st = o.step * BigInt(step);
-                return rt.range(s, s + st * BigInt(count), st);
+                const [start, stop, step] = sliceIndices(k, Number(rangeLength(o)));
+                return rt.range(o.start + BigInt(start) * o.step, o.start + BigInt(stop) * o.step, o.step * BigInt(step));
             }
             const n = rangeLength(o); let i = rt.indexOf(k, "range"); if (i < 0n) i += n;
             if (i < 0n || i >= n) fail(E.IndexError, "range object index out of range");

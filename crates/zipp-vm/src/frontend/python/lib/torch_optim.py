@@ -3,6 +3,69 @@ import math
 import torch
 
 
+class _ParamState:
+    """`optimizer.state`: per-parameter dicts keyed by the parameter tensor
+    itself (by identity, as PyTorch's tensors hash), created on first access
+    like PyTorch's `defaultdict(dict)`. A parameter's `id()` also works as a
+    key (the GPU capture records parameters by id)."""
+
+    def __init__(self):
+        self._entries = {}
+
+    @staticmethod
+    def _key(p):
+        return p if type(p) is int else id(p)
+
+    def __getitem__(self, p):
+        k = self._key(p)
+        if k not in self._entries:
+            if type(p) is int:
+                raise KeyError(p)
+            self._entries[k] = (p, {})
+        return self._entries[k][1]
+
+    def __setitem__(self, p, value):
+        k = self._key(p)
+        old = self._entries.get(k)
+        self._entries[k] = (old[0] if old is not None and type(p) is int else p, value)
+
+    def __delitem__(self, p):
+        del self._entries[self._key(p)]
+
+    def __contains__(self, p):
+        return self._key(p) in self._entries
+
+    def __len__(self):
+        return len(self._entries)
+
+    def __iter__(self):
+        return iter([p for p, _ in self._entries.values()])
+
+    def get(self, p, default=None):
+        entry = self._entries.get(self._key(p))
+        return default if entry is None else entry[1]
+
+    def setdefault(self, p, default=None):
+        if p not in self:
+            self[p] = default
+        return self[p]
+
+    def keys(self):
+        return [p for p, _ in self._entries.values()]
+
+    def values(self):
+        return [v for _, v in self._entries.values()]
+
+    def items(self):
+        return list(self._entries.values())
+
+    def clear(self):
+        self._entries.clear()
+
+    def __repr__(self):
+        return repr(dict((self._key(p), v) for p, v in self._entries.values()))
+
+
 class Optimizer:
     def __init__(self, params, defaults):
         params = list(params)
@@ -13,7 +76,7 @@ class Optimizer:
         else:
             self.param_groups = [dict(defaults, params=params)]
         self.defaults = defaults
-        self.state = {}
+        self.state = _ParamState()
 
     def zero_grad(self, set_to_none=True):
         from torch._gpu import active_capture
@@ -28,11 +91,37 @@ class Optimizer:
                     p.grad.zero_()
 
     def state_dict(self):
-        return {"state": self.state, "param_groups": [{k: v for k, v in g.items() if k != "params"} for g in self.param_groups]}
+        # PyTorch's layout: parameters are numbered in group order, "state"
+        # maps a number to that parameter's state, and each group lists its numbers.
+        state, groups, index = {}, [], 0
+        for g in self.param_groups:
+            numbers = []
+            for p in g["params"]:
+                if p in self.state:
+                    state[index] = self.state[p]
+                numbers.append(index)
+                index += 1
+            group = {k: v for k, v in g.items() if k != "params"}
+            group["params"] = numbers
+            groups.append(group)
+        return {"state": state, "param_groups": groups}
 
     def load_state_dict(self, sd):
-        for g, saved in zip(self.param_groups, sd.get("param_groups", [])):
-            g.update(saved)
+        saved_groups = sd.get("param_groups", [])
+        if len(saved_groups) != len(self.param_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        saved_state = sd.get("state", {})
+        index = 0
+        self.state.clear()
+        for g, saved in zip(self.param_groups, saved_groups):
+            numbers = saved.get("params", list(range(index, index + len(g["params"]))))
+            if len(numbers) != len(g["params"]):
+                raise ValueError("loaded state dict contains a parameter group that doesn't match the size of optimizer's group")
+            for number, p in zip(numbers, g["params"]):
+                if number in saved_state:
+                    self.state[p] = dict(saved_state[number])
+            index += len(g["params"])
+            g.update({k: v for k, v in saved.items() if k != "params"})
 
     def add_param_group(self, group):
         self.param_groups.append(dict(self.defaults, **group))
@@ -66,7 +155,7 @@ class SGD(Optimizer):
             if g["weight_decay"]:
                 grad = grad + p.detach() * g["weight_decay"]
             if g["momentum"]:
-                st = self.state.setdefault(id(p), {})
+                st = self.state[p]
                 buf = st.get("momentum_buffer")
                 buf = grad.clone() if buf is None else buf * g["momentum"] + grad * (1 - g["dampening"])
                 st["momentum_buffer"] = buf
@@ -93,7 +182,9 @@ class Adam(Optimizer):
             grad = p.grad
             if g["maximize"]:
                 grad = -grad
-            st = self.state.setdefault(id(p), {"step": 0, "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)})
+            st = self.state[p]
+            if not st:
+                st.update({"step": 0, "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)})
             st["step"] += 1
             b1, b2 = g["betas"]
             lr, wd = g["lr"], g["weight_decay"]
@@ -142,9 +233,19 @@ class RMSprop(Optimizer):
             value = p.detach()
             if g["weight_decay"]:
                 grad = grad + value * g["weight_decay"]
-            st = self.state.setdefault(id(p), {"square_avg": torch.zeros_like(p)})
+            st = self.state[p]
+            if not st:
+                st["square_avg"] = torch.zeros_like(p)
             st["square_avg"] = st["square_avg"] * g["alpha"] + grad * grad * (1 - g["alpha"])
-            p.data = value - grad / (torch.sqrt(st["square_avg"]) + g["eps"]) * g["lr"]
+            avg = torch.sqrt(st["square_avg"]) + g["eps"]
+            if g["momentum"] > 0:
+                # PyTorch: buf = momentum * buf + grad / avg; p -= lr * buf.
+                buf = st.get("momentum_buffer")
+                buf = grad / avg if buf is None else buf * g["momentum"] + grad / avg
+                st["momentum_buffer"] = buf
+                p.data = value - buf * g["lr"]
+            else:
+                p.data = value - grad / avg * g["lr"]
         return loss
 
 

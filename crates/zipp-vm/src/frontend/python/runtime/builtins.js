@@ -425,10 +425,11 @@
     method(S, "strip", 2, (a) => stripChars(strSelf(a), a[1], 0), 1);
     method(S, "lstrip", 2, (a) => stripChars(strSelf(a), a[1], -1), 1);
     method(S, "rstrip", 2, (a) => stripChars(strSelf(a), a[1], 1), 1);
-    method(S, "split", -1, (a) => {
+    // sep and maxsplit may also come as keywords.
+    methodkw(S, "split", (a) => {
         const kw = kwOf(a, ["sep", "maxsplit"]);
         const s = strSelf(a); const sep = a[1] !== undefined ? a[1] : kwget(kw, "sep", null);
-        let maxsplit = Number(a[2] !== undefined ? needInt(a[2]) : kwget(kw, "maxsplit", -1n));
+        let maxsplit = Number(needInt(a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", -1n)));
         if (sep === null) {
             const parts = s.split(/\s+/).filter((x) => x.length);
             if (maxsplit < 0 || parts.length <= maxsplit + 1) return list(parts);
@@ -443,10 +444,10 @@
         if (maxsplit >= 0 && parts.length > maxsplit + 1) { const head = parts.slice(0, maxsplit); head.push(parts.slice(maxsplit).join(sep)); return list(head); }
         return list(parts);
     });
-    method(S, "rsplit", -1, (a) => {
+    methodkw(S, "rsplit", (a) => {
         const kw = kwOf(a, ["sep", "maxsplit"]);
         const s = strSelf(a); const sep = a[1] !== undefined ? a[1] : kwget(kw, "sep", null);
-        const maxsplit = Number(a[2] !== undefined ? needInt(a[2]) : kwget(kw, "maxsplit", -1n));
+        const maxsplit = Number(needInt(a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", -1n)));
         if (sep === null) {
             const parts = s.split(/\s+/).filter((x) => x.length);
             if (maxsplit < 0 || parts.length <= maxsplit + 1) return list(parts);
@@ -500,16 +501,28 @@
     method(S, "rindex", 4, (a) => findImpl(a, true, true), 2);
     method(S, "count", 4, (a) => { const s = strSelf(a), sub = needStr(a[1]); const r = searchRange(a, s); if (r === null) return 0n; if (sub === "") return BigInt(rt.strLen(r.hay) + 1); return BigInt(r.hay.split(sub).length - 1); }, 2);
     function affix(a, end) {
-        const s = strSelf(a); const p = a[1];
-        const test = (x) => end ? s.endsWith(needStr(x)) : s.startsWith(needStr(x));
+        let s = strSelf(a); const p = a[1];
+        // start/end bound the text like a slice (code points); a window that
+        // ends before it starts matches nothing, not even "".
+        if ((a[2] !== undefined && a[2] !== null) || (a[3] !== undefined && a[3] !== null)) {
+            const cps = codepoints(s), n = cps.length;
+            let lo = a[2] === undefined || a[2] === null ? 0 : Number(rt.indexOf(a[2])), hi = a[3] === undefined || a[3] === null ? n : Number(rt.indexOf(a[3]));
+            if (lo < 0) lo = Math.max(0, lo + n); if (hi < 0) hi = Math.max(0, hi + n); hi = Math.min(hi, n);
+            s = hi < lo ? null : cps.slice(lo, hi).join("");
+        }
+        const test = (x) => { const q = needStr(x); return s !== null && (end ? s.endsWith(q) : s.startsWith(q)); };
         if (p !== null && typeof p === "object" && p.cls === T.tuple) return p.items.some(test);
         return test(p);
     }
     method(S, "startswith", 4, (a) => affix(a, false), 2);
     method(S, "endswith", 4, (a) => affix(a, true), 2);
-    method(S, "isdigit", 1, (a) => /^[0-9٠-٩۰-۹]+$/.test(strSelf(a)));
+    // CPython's digit classes follow Numeric_Type: isdecimal is Decimal (Nd),
+    // isdigit adds Digit (superscripts, circled and parenthesized digits,
+    // all in No), isnumeric adds Numeric (the rest of Nl/No plus the CJK
+    // numeral ideographs, which are Lo). Tables from Unicode 14 (CPython 3.11).
+    method(S, "isdigit", 1, (a) => /^[\p{Nd}²³¹፩-፱᧚⁰⁴-⁹₀-₉①-⑨⑴-⑼⒈-⒐⓪⓵-⓽⓿❶-❾➀-➈➊-➒\u{10a40}-\u{10a43}\u{10e60}-\u{10e68}\u{11052}-\u{1105a}\u{1f100}-\u{1f10a}]+$/u.test(strSelf(a)));
     method(S, "isdecimal", 1, (a) => /^\p{Nd}+$/u.test(strSelf(a)));
-    method(S, "isnumeric", 1, (a) => /^[\p{Nd}\p{Nl}\p{No}]+$/u.test(strSelf(a)));
+    method(S, "isnumeric", 1, (a) => /^[\p{Nd}\p{Nl}\p{No}㐅㒃㠪㭍一七万三九二五亖亿-什仟仨伍佰億兆兩八六十千-卅卌叁-叄四壱壹幺廾-廿弌-弎弐拾捌柒漆玖百肆萬貮貳贰阡陆陌陸零參拾兩零六陸什\u{20001}\u{20064}\u{200e2}\u{20121}\u{2092a}\u{20983}\u{2098c}\u{2099c}\u{20aea}\u{20afd}\u{20b19}\u{22390}\u{22998}\u{23b1b}\u{2626d}\u{2f890}]+$/u.test(strSelf(a)));
     method(S, "isalpha", 1, (a) => /^[\p{L}]+$/u.test(strSelf(a)));
     method(S, "isalnum", 1, (a) => /^[\p{L}\p{N}]+$/u.test(strSelf(a)));
     method(S, "isspace", 1, (a) => /^\s+$/.test(strSelf(a)));
@@ -643,13 +656,16 @@
         }
         return out;
     };
-    rt.bytesRepr = function (b) {
-        let out = "b'";
+    // Double quotes when the bytes hold ' but no ", like str's repr;
+    // bytearray's repr (`array`) still escapes ' inside them, as CPython's does.
+    rt.bytesRepr = function (b, array) {
+        const q = b.items.indexOf(39) >= 0 && b.items.indexOf(34) < 0 ? "\"" : "'";
+        let out = "b" + q;
         for (const c of b.items) {
-            if (c === 39) out += "\\'"; else if (c === 92) out += "\\\\"; else if (c === 10) out += "\\n"; else if (c === 13) out += "\\r"; else if (c === 9) out += "\\t";
+            if (c === 39 && (q === "'" || array)) out += "\\'"; else if (c === 92) out += "\\\\"; else if (c === 10) out += "\\n"; else if (c === 13) out += "\\r"; else if (c === 9) out += "\\t";
             else if (c < 32 || c >= 127) out += "\\x" + c.toString(16).padStart(2, "0"); else out += String.fromCharCode(c);
         }
-        return out + "'";
+        return out + q;
     };
     // Large byte buffers are built element by element: past the engine's
     // dense-array limit (2^20 natively, more under safe-sandbox)
@@ -1093,7 +1109,9 @@
     def("all", 1, (a) => { const it = iter(a[0]); for (;;) { const v = fornext(it); if (v === STOP) return true; if (!truth(v)) return false; } });
     def("iter", 2, (a) => { if (a.length === 2) { const f = a[0], sentinel = a[1]; return { cls: T.iterator, next: () => { const v = call(f, [], null); return eq(v, sentinel) ? STOP : v; } }; } return iter(a[0]); }, 1);
     def("next", 2, (a) => { const it = a[0]; if (it === null || typeof it !== "object" || (it.next === undefined && typeMethod(it, "__next__") === undefined)) fail(E.TypeError, "'" + typeOf(it).name + "' object is not an iterator"); const v = it.next !== undefined ? fornext(it) : (() => { try { return callMethod(it, "__next__", []); } catch (e) { if (e && e.cls === E.StopIteration) return STOP; throw e; } })(); if (v === STOP) { if (a.length === 2) return a[1]; throw rt.makeExc(E.StopIteration, it.cls === T.generator && it.returned !== null ? [it.returned] : []); } return v; }, 1);
-    def("isinstance", 2, (a) => { const t = a[1]; if (t !== null && typeof t === "object" && t.cls === T.tuple) return t.items.some((x) => rt.isinstanceCheck(a[0], x)); if (t !== null && typeof t === "object" && t.cls === rt.UnionType) return t.dict.get("__args__").items.some((x) => x === null ? a[0] === null : rt.isinstanceCheck(a[0], x)); return rt.isinstanceCheck(a[0], t); });
+    // A tuple of types may nest further tuples (and unions), as in CPython.
+    const instanceOfAny = (v, t) => { if (t !== null && typeof t === "object" && t.cls === T.tuple) return t.items.some((x) => instanceOfAny(v, x)); if (t !== null && typeof t === "object" && t.cls === rt.UnionType) return t.dict.get("__args__").items.some((x) => x === null ? v === null : rt.isinstanceCheck(v, x)); return rt.isinstanceCheck(v, t); };
+    def("isinstance", 2, (a) => instanceOfAny(a[0], a[1]));
     rt.isinstanceCheck = function (v, t) {
         if (!isType(t)) { const m = typeMethod(t, "__instancecheck__"); if (m !== undefined) return truth(call(descrGet(m, t, typeOf(t)), [v], null)); fail(E.TypeError, "isinstance() arg 2 must be a type, a tuple of types, or a union"); }
         if (t === T.int && typeof v === "boolean") return true;
@@ -1102,7 +1120,8 @@
     // bytearray reuses bytes' storage and methods by subclassing it here;
     // Python-visible checks keep them unrelated, as in CPython.
     const subclassCheck = (a, b) => isSubclass(a, b) && (b !== T.bytes || !isSubclass(a, T.bytearray));
-    def("issubclass", 2, (a) => { if (!isType(a[0])) fail(E.TypeError, "issubclass() arg 1 must be a class"); const t = a[1]; if (t !== null && typeof t === "object" && t.cls === T.tuple) return t.items.some((x) => subclassCheck(a[0], x)); if (!isType(t)) fail(E.TypeError, "issubclass() arg 2 must be a class, a tuple of classes, or a union"); return subclassCheck(a[0], t); });
+    const subclassOfAny = (c, t) => { if (t !== null && typeof t === "object" && t.cls === T.tuple) return t.items.some((x) => subclassOfAny(c, x)); if (!isType(t)) fail(E.TypeError, "issubclass() arg 2 must be a class, a tuple of classes, or a union"); return subclassCheck(c, t); };
+    def("issubclass", 2, (a) => { if (!isType(a[0])) fail(E.TypeError, "issubclass() arg 1 must be a class"); return subclassOfAny(a[0], a[1]); });
     const attrName = (v) => { if (typeof v === "string") return v; fail(E.TypeError, "attribute name must be string, not '" + typeOf(v).name + "'"); };
     // A plain miss comes back as MISSING_ATTR (no exception is built); an
     // AttributeError from a property or __getattr__ is still caught.
@@ -1325,10 +1344,11 @@
         BA.dict.set("__mul__", builtin("__mul__", 2, times));
         BA.dict.set("__rmul__", builtin("__rmul__", 2, times));
         BA.dict.set("__imul__", builtin("__imul__", 2, (a) => { if (!isInt(a[1])) return NOTIMPL; a[0].items = repeated(a[0], a[1]); return a[0]; }));
-        BA.dict.set("__repr__", builtin("__repr__", 1, (a) => "bytearray(" + rt.bytesRepr(a[0]) + ")"));
+        BA.dict.set("__repr__", builtin("__repr__", 1, (a) => "bytearray(" + rt.bytesRepr(a[0], true) + ")"));
         BA.dict.set("__hash__", null);
         BA.dict.set("__iter__", builtin("__iter__", 1, (a) => iter({ cls: T.bytes, items: a[0].items })));
-        BA.dict.set("__getitem__", builtin("__getitem__", 2, (a) => getitem({ cls: T.bytes, items: a[0].items }, a[1])));
+        // A slice of a bytearray is a bytearray.
+        BA.dict.set("__getitem__", builtin("__getitem__", 2, (a) => { const r = getitem({ cls: T.bytes, items: a[0].items }, a[1]); return r !== null && typeof r === "object" && r.cls === T.bytes ? { cls: BA, items: r.items, dict: new Map() } : r; }));
         BA.dict.set("__eq__", builtin("__eq__", 2, (a) => a[1] !== null && typeof a[1] === "object" && a[1].items !== undefined && isInstance(a[1], T.bytes) && a[0].items.length === a[1].items.length && a[0].items.every((x, i) => x === a[1].items[i])));
         B.set("bytearray", BA);
     }

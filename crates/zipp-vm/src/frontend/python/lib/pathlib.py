@@ -23,23 +23,26 @@ class PurePath:
         return type(self)(str(other), self._path)
 
     def __eq__(self, other):
-        return isinstance(other, PurePath) and _norm(other._path) == _norm(self._path)
+        # Paths are compared as written (after `_join`'s cleanup); `..` is not collapsed.
+        return isinstance(other, PurePath) and other._path == self._path
 
     def __hash__(self):
-        return hash(_norm(self._path))
+        return hash(self._path)
 
     def __lt__(self, other):
-        return str(self) < str(other)
+        if not isinstance(other, PurePath):
+            return NotImplemented
+        return self.parts < other.parts
 
     @property
     def parts(self):
         p = self._path
-        parts = [x for x in p.split("/") if x]
+        parts = [x for x in p.split("/") if x and x != "."]
         return tuple((["/"] if p.startswith("/") else []) + parts)
 
     @property
     def name(self):
-        return self._path.rstrip("/").rsplit("/", 1)[-1] if self._path not in ("", "/") else ""
+        return self._path.rstrip("/").rsplit("/", 1)[-1] if self._path not in ("", "/", ".") else ""
 
     @property
     def stem(self):
@@ -112,7 +115,21 @@ class PurePath:
         return self._path
 
     def match(self, pattern):
-        return _fnmatch(self.name, pattern) if "/" not in pattern else _fnmatch(_norm(self._path), pattern)
+        # Matched from the right, one component per pattern component; an
+        # absolute pattern must match the whole path.
+        pat = PurePath(pattern)
+        pattern_parts = pat.parts
+        if not pattern_parts:
+            raise ValueError("empty pattern")
+        parts = self.parts
+        if pat.is_absolute() and len(parts) != len(pattern_parts):
+            return False
+        if len(pattern_parts) > len(parts):
+            return False
+        for part, pat_part in zip(reversed(parts), reversed(pattern_parts)):
+            if not _fnmatch(part, pat_part):
+                return False
+        return True
 
 
 PurePosixPath = PurePath
@@ -165,12 +182,17 @@ class Path(PurePath):
             return f.write(data)
 
     def mkdir(self, mode=0o777, parents=False, exist_ok=False):
-        if self.exists() and not exist_ok:
+        if self.exists():
+            if exist_ok and self.is_dir():
+                return
             raise FileExistsError("[Errno 17] File exists: '%s'" % self._path)
-        if parents or exist_ok:
+        if parents:
             os.makedirs(self._path, exist_ok=True)
-        else:
-            os.mkdir(self._path)
+            return
+        parent = self.parent._path
+        if parent and not os.path.isdir(parent):
+            raise FileNotFoundError("[Errno 2] No such file or directory: '%s'" % self._path)
+        os.mkdir(self._path)
 
     def touch(self, exist_ok=True):
         if not self.exists():
@@ -197,10 +219,10 @@ class Path(PurePath):
             yield self / name
 
     def glob(self, pattern):
-        return _glob(self, pattern, recursive=False)
+        return _glob(self, pattern)
 
     def rglob(self, pattern):
-        return _glob(self, "**/" + pattern, recursive=True)
+        return _glob(self, "**/" + pattern)
 
     def stat(self):
         return _Stat(os.path.getsize(self._path))
@@ -231,7 +253,10 @@ def _join(*parts):
             out += p
         else:
             out += "/" + p
-    return out
+    # As pathlib does: drop empty and "." components and a trailing slash,
+    # but keep ".." (collapsing it could change what a symlinked path means).
+    rest = "/".join(s for s in out.split("/") if s not in ("", "."))
+    return "/" + rest if out.startswith("/") else (rest or ".")
 
 
 def _norm(p):
@@ -302,37 +327,46 @@ def _match(s, i, p, j):
     return i == len(s)
 
 
-def _walk(root):
-    """Every path under `root` (files and directories), root-relative."""
-    base = _norm(str(root))
-    out = []
+def _child(base, name):
+    return name if base == "." else (base + name if base == "/" else base + "/" + name)
+
+
+def _dirs(base):
+    """`base` and every directory below it."""
+    out = [base]
     for name in sorted(os.listdir(base)):
-        full = (base + "/" + name) if base else name
-        out.append(full)
+        full = _child(base, name)
         if os.path.isdir(full):
-            out.extend(_walk(full))
+            out.extend(_dirs(full))
     return out
 
 
-def _glob(root, pattern, recursive):
-    base = _norm(str(root))
-    results = []
-    if "**" in pattern:
-        tail = pattern.replace("**/", "")
-        for path in _walk(root):
-            rel = path[len(base) + 1:] if base else path
-            if _fnmatch(rel.rsplit("/", 1)[-1], tail) or _fnmatch(rel, tail):
-                results.append(Path(path))
-        return results
-    segments = pattern.split("/")
-    candidates = [base]
+def _glob(root, pattern):
+    segments = PurePath(pattern).parts
+    if not segments:
+        raise ValueError("Unacceptable pattern: %r" % pattern)
+    if pattern.startswith("/"):
+        raise NotImplementedError("Non-relative patterns are unsupported")
     for seg in segments:
-        nxt = []
+        if "**" in seg and seg != "**":
+            raise ValueError("Invalid pattern: '**' can only be an entire path component")
+    candidates = [root._path]
+    for seg in segments:
+        nxt, seen = [], set()
         for c in candidates:
-            if not os.path.isdir(c) and c != "":
+            if not os.path.isdir(c):
                 continue
-            for name in sorted(os.listdir(c)):
-                if _fnmatch(name, seg):
-                    nxt.append((c + "/" + name) if c else name)
+            if seg == "**":
+                # This directory and every directory below it.
+                matches = _dirs(c)
+            else:
+                matches = [_child(c, name) for name in sorted(os.listdir(c)) if _fnmatch(name, seg)]
+            for m in matches:
+                if m not in seen:
+                    seen.add(m)
+                    nxt.append(m)
         candidates = nxt
+    if pattern.endswith("/"):
+        # A trailing separator selects directories only.
+        candidates = [c for c in candidates if os.path.isdir(c)]
     return [Path(c) for c in candidates]

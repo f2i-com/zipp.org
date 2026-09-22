@@ -1012,3 +1012,191 @@ print("checksum", round(float(out.sum().item()), 4))
     // A stable digest of the whole block: a change in any of the pieces moves it.
     assert!(out[3].starts_with("checksum "), "{:?}", out[3]);
 }
+
+/// `round` breaks exact .5 ties to even on both sides of zero. Golden values
+/// from CPU PyTorch 2.11: -1.5 and -3.5 round down to -2 and -4.
+#[test]
+fn round_breaks_negative_ties_to_even() {
+    let out = run(r#"
+import torch
+x = torch.tensor([-0.5, -1.5, -2.5, -3.5, 0.5, 1.5, 2.5, 3.5, -0.4, 0.6, -2.7])
+print(x.round().tolist())
+print(torch.round(x).tolist())
+"#)
+    .unwrap();
+    let expected = "[-0.0, -2.0, -2.0, -4.0, 0.0, 2.0, 2.0, 4.0, -0.0, 1.0, -3.0]";
+    assert_eq!(out, [expected, expected]);
+}
+
+/// Eager ops that disagreed with PyTorch: tie-splitting max/min gradients,
+/// `prod` autograd, cross-entropy's `weight`/`label_smoothing`/class dim and
+/// `reduction='none'` shape, `pos_weight`, softplus/elu gradients at large
+/// inputs, Embedding's `padding_idx`, var with no degrees of freedom, the
+/// dtype of `torch.tensor([])` and `clip_grad_norm_`'s `norm_type`. Golden
+/// values from CPU PyTorch 2.11 (the same program prints all True there).
+#[test]
+fn eager_ops_match_pytorch_on_ties_weights_and_edge_cases() {
+    let out = run(r#"
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def close(got, want, tol=1e-4):
+    got = got.tolist() if isinstance(got, torch.Tensor) else got
+    if isinstance(want, list):
+        return isinstance(got, list) and len(got) == len(want) and all(close(g, w, tol) for g, w in zip(got, want))
+    if math.isnan(want):
+        return math.isnan(got)
+    return abs(got - want) <= tol
+
+def check(label, ok):
+    print(label, ok)
+
+def tie_grads(fn):
+    x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+    y = torch.tensor([1.0, 0.0, 3.0], requires_grad=True)
+    fn(x, y).sum().backward()
+    return x.grad.tolist(), y.grad.tolist()
+check("maximum", tie_grads(torch.maximum) == ([0.5, 1.0, 0.5], [0.5, 0.0, 0.5]))
+check("minimum", tie_grads(torch.minimum) == ([0.5, 0.0, 0.5], [0.5, 1.0, 0.5]))
+check("max", tie_grads(torch.max) == ([0.5, 1.0, 0.5], [0.5, 0.0, 0.5]))
+
+def prod_grad(fn, values):
+    x = torch.tensor(values, requires_grad=True)
+    fn(x).backward()
+    return x.grad.tolist()
+check("prod", prod_grad(lambda x: x.prod() + x.sum(), [2.0, 3.0]) == [4.0, 3.0])
+check("prod zero", prod_grad(lambda x: x.prod(), [2.0, 0.0, 3.0]) == [0.0, 6.0, 0.0])
+check("prod zeros", prod_grad(lambda x: x.prod(), [0.0, 0.0, 3.0]) == [0.0, 0.0, 0.0])
+check("prod dim", prod_grad(lambda x: (x.prod(dim=1) * torch.tensor([1.0, 2.0])).sum(), [[2.0, 0.0, 3.0], [1.0, 2.0, 4.0]]) == [[0.0, 6.0, 0.0], [16.0, 8.0, 4.0]])
+check("prod keepdim", prod_grad(lambda x: x.prod(0, keepdim=True).sum(), [[2.0, 0.0, 3.0], [1.0, 2.0, 4.0]]) == [[1.0, 2.0, 4.0], [2.0, 0.0, 3.0]])
+
+a = torch.tensor([[1.0, -2.0, 3.0], [-4.0, 5.0, -6.0]])
+t = torch.tensor([1, 2])
+w = torch.tensor([1.0, 2.0, 3.0])
+check("ce weight", close(F.cross_entropy(a, t, weight=w).item(), 8.653222))
+check("ce smoothing", close(F.cross_entropy(a, t, label_smoothing=0.2).item(), 7.366493))
+check("ce both", close(F.cross_entropy(a, t, weight=w, label_smoothing=0.2).item(), 7.653217))
+check("ce weight sum", close(F.cross_entropy(a, t, weight=w, reduction="sum").item(), 43.266109, 1e-3))
+check("ce none", close(F.cross_entropy(a, t, weight=w, reduction="none", label_smoothing=0.1), [9.66569, 31.100405]))
+x = a.clone().requires_grad_(True)
+F.cross_entropy(x, t, weight=w, label_smoothing=0.2).backward()
+check("ce grad", close(x.grad, [[0.034067, -0.344307, 0.31024], [-0.013264, 0.533255, -0.519991]]))
+x3 = torch.tensor([[[1.0, 2.0], [0.5, -1.0], [3.0, 0.0]], [[0.0, 1.0], [2.0, 2.0], [-1.0, 1.0]]])
+t3 = torch.tensor([[0, 2], [1, 1]])
+p3 = torch.softmax(torch.tensor([[[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]), dim=1)
+none = F.cross_entropy(x3, t3, reduction="none")
+check("ce nd none", tuple(none.shape) == (2, 2) and close(none, [[2.196734, 2.169846], [0.169846, 0.551445]]))
+check("ce nd", close(F.cross_entropy(x3, t3).item(), 1.271968) and close(F.cross_entropy(x3, t3, weight=w, label_smoothing=0.3).item(), 1.394615))
+prob_none = F.cross_entropy(x3, p3, reduction="none")
+check("ce prob nd", tuple(prob_none.shape) == (2, 2) and close(prob_none, [[1.557681, 1.960164], [2.28144, 1.129126]]) and close(F.cross_entropy(x3, p3).item(), 1.732103))
+check("ce prob weight", close(F.cross_entropy(x3, p3, weight=w, label_smoothing=0.2).item(), 3.676808))
+
+check("pos_weight", close(F.binary_cross_entropy_with_logits(torch.tensor([0.5, -1.0]), torch.tensor([1.0, 0.0]), pos_weight=torch.tensor(3.0)).item(), 0.867747))
+check("pos_weight none", close(F.binary_cross_entropy_with_logits(torch.tensor([[0.5, -1.0], [20.0, -30.0]]), torch.tensor([[1.0, 0.0], [0.0, 1.0]]), pos_weight=torch.tensor([3.0, 0.5]), reduction="none"), [[1.422231, 0.313262], [20.0, 15.0]]))
+
+def act_grad(fn):
+    x = torch.tensor([100.0, 1.0, -1.0, 0.0, -100.0], requires_grad=True)
+    fn(x).sum().backward()
+    return x.grad
+check("softplus grad", close(act_grad(F.softplus), [1.0, 0.731059, 0.268941, 0.5, 0.0]))
+check("elu grad", close(act_grad(F.elu), [1.0, 1.0, 0.367879, 1.0, 0.0]))
+
+e = nn.Embedding(3, 2, padding_idx=0)
+e(torch.tensor([0, 1, 0])).sum().backward()
+check("padding_idx", e.weight.grad.tolist() == [[0.0, 0.0], [1.0, 1.0], [0.0, 0.0]])
+
+check("var dof", close(torch.tensor([3.0]).var().item(), float("nan")) and close(torch.tensor([3.0]).std().item(), float("nan")))
+check("var", close(torch.tensor([[1.0, 2.0], [3.0, 5.0]]).var(dim=1), [0.5, 2.0]))
+check("empty dtype", torch.tensor([]).dtype == torch.float32 and torch.tensor([[], []]).dtype == torch.float32)
+
+def clip(norm_type, g):
+    p = torch.tensor([1.0, 1.0], requires_grad=True)
+    (p * torch.tensor(g)).sum().backward()
+    n = torch.nn.utils.clip_grad_norm_([p], 1.0, norm_type=norm_type)
+    return n.item(), p.grad
+n, g = clip(float("inf"), [9.0, -16.0])
+check("clip inf", close(n, 16.0) and close(g, [0.5625, -1.0]))
+n, g = clip(1, [3.0, -4.0])
+check("clip l1", close(n, 7.0) and close(g, [0.428571, -0.571429]))
+n, g = clip(3.0, [3.0, -4.0])
+check("clip l3", close(n, 4.497941) and close(g, [0.666972, -0.889296]))
+"#)
+    .unwrap();
+    let failed: Vec<&String> = out.iter().filter(|line| !line.ends_with(" True")).collect();
+    assert!(failed.is_empty(), "{out:#?}");
+    assert_eq!(out.len(), 29, "{out:#?}");
+}
+
+/// `optimizer.state` is keyed by the parameter tensor, `state_dict()` /
+/// `load_state_dict()` carry each parameter's state by position (so a
+/// reloaded Adam or SGD-momentum run continues exactly), RMSprop honours
+/// `momentum`, and `torch.save` names `torch._utils._rebuild_tensor_v2`, the
+/// global PyTorch's weights-only loader accepts. Golden values from CPU
+/// PyTorch 2.11 (the same program prints the same lines there).
+#[test]
+fn optimizer_state_round_trips_and_checkpoints_name_pytorch_globals() {
+    let out = run(r#"
+import zipfile
+import torch
+
+def run(factory, reload):
+    w = torch.tensor([1.0, -2.0, 0.5], requires_grad=True)
+    opt = factory([w])
+    def step():
+        opt.zero_grad()
+        ((w - 0.3) ** 2).sum().backward()
+        opt.step()
+    for _ in range(3):
+        step()
+    if reload:
+        sd = opt.state_dict()
+        opt = factory([w])
+        opt.load_state_dict(sd)
+    for _ in range(3):
+        step()
+    return [round(v, 5) for v in w.tolist()]
+adam = lambda p: torch.optim.Adam(p, lr=0.1)
+sgdm = lambda p: torch.optim.SGD(p, lr=0.1, momentum=0.9)
+print("adam", run(adam, False) == run(adam, True) == [0.42672, -1.40427, 0.19778])
+print("sgdm", run(sgdm, False) == run(sgdm, True) == [-0.19628, 1.93064, 0.15821])
+
+w = torch.tensor([1.0, -2.0], requires_grad=True)
+b = torch.tensor([0.5], requires_grad=True)
+opt = torch.optim.Adam([{"params": [w]}, {"params": [b], "lr": 0.5}], lr=0.1)
+opt.zero_grad()
+((w ** 2).sum() + (b ** 2).sum()).backward()
+opt.step()
+print("state[p]", sorted(opt.state[w].keys()), int(opt.state[b]["step"]), len(opt.state))
+sd = opt.state_dict()
+print("state_dict", sorted(sd["state"]), [g["params"] for g in sd["param_groups"]], [g["lr"] for g in sd["param_groups"]])
+
+w = torch.tensor([1.0, -2.0, 0.5], requires_grad=True)
+opt = torch.optim.RMSprop([w], lr=0.01, momentum=0.5)
+for _ in range(4):
+    opt.zero_grad()
+    (w ** 2).sum().backward()
+    opt.step()
+print("rmsprop momentum", [round(v, 5) for v in w.tolist()] == [0.57913, -1.56421, 0.11463])
+
+torch.save({"w": torch.tensor([1.0, 2.0])}, "ck.pt")
+with zipfile.ZipFile("ck.pt") as z:
+    data = z.read("ck/data.pkl")
+print("global", b"torch._utils\n_rebuild_tensor_v2\n" in data, b"ctorch\n_rebuild_tensor_v2\n" in data)
+print("load", torch.load("ck.pt")["w"].tolist())
+"#)
+    .unwrap();
+    assert_eq!(
+        out,
+        [
+            "adam True",
+            "sgdm True",
+            "state[p] ['exp_avg', 'exp_avg_sq', 'step'] 1 2",
+            "state_dict [0, 1] [[0], [1]] [0.1, 0.5]",
+            "rmsprop momentum True",
+            "global True False",
+            "load [1.0, 2.0]",
+        ]
+    );
+}

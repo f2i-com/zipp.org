@@ -1,0 +1,15 @@
+[('verbose', True)]
+[('x', False)]
+[('const', 42)]
+[('v', 3)]
+[('flag', True), ('pos', 'pos'), ('q', True)]
+[('d', 5), ('e', 2.5), ('n', None)]
+[('d', 7)]
+[('d', 9)]
+[('p', 3)]
+[('f', ['a', 'b'])]
+[('x', '-x')]
+[('o', None), ('rest', ['--o', '1'])]
+[('o', None), ('rest', ['a', '--o', '1'])]
+(Namespace(x='-x'), ['extra', '--', 'y'])
+Namespace(opt='C') Namespace(opt='D') Namespace(opt='v')

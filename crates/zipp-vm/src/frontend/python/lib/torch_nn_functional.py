@@ -17,6 +17,11 @@ def embedding(idx, weight, padding_idx=None):
         raise RuntimeError("Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got torch.FloatTensor instead")
     flat = idx.reshape(-1)
     rows = torch.index_select(weight, 0, flat)
+    if padding_idx is not None and torch.is_grad_enabled() and weight.requires_grad:
+        # The padding row is looked up but receives no gradient.
+        if padding_idx < 0:
+            padding_idx += weight.shape[0]
+        rows = torch.where((flat != padding_idx).unsqueeze(1), rows, rows.detach())
     return rows.reshape(*(tuple(idx.shape) + (weight.shape[1],)))
 
 
@@ -126,7 +131,8 @@ def tanh(x):
 
 
 def softplus(x, beta=1.0, threshold=20.0):
-    return torch.where(x * beta > threshold, x, torch.log(1 + torch.exp(x * beta)) / beta)
+    # The exp branch is clamped where it is unused, so its gradient stays finite (no 0 * inf).
+    return torch.where(x * beta > threshold, x, torch.log(1 + torch.exp((x * beta).clamp(max=threshold))) / beta)
 
 
 def leaky_relu(x, negative_slope=0.01):
@@ -134,7 +140,8 @@ def leaky_relu(x, negative_slope=0.01):
 
 
 def elu(x, alpha=1.0):
-    return torch.where(x > 0, x, alpha * (torch.exp(x) - 1))
+    # As in softplus: clamp the unused exp branch so a large input's gradient is not nan.
+    return torch.where(x > 0, x, alpha * (torch.exp(x.clamp(max=0)) - 1))
 
 
 def softmax(x, dim=None, dtype=None):
@@ -206,26 +213,61 @@ def cross_entropy(logits, target, weight=None, reduction="mean", label_smoothing
         # Integer class targets take the fused graph operation; probability
         # targets compose from log_softmax below.
         return logits.cross_entropy(target, weight, reduction, label_smoothing)
+    # Classes are dim 1 of [N, C, d1, ...] (the last dim of [C] or [N, C]).
+    class_dim = 1 if len(logits.shape) > 2 else -1
+    n_classes = logits.shape[class_dim]
+    if weight is not None:
+        shape = [1] * len(logits.shape)
+        shape[class_dim] = n_classes
+        class_weight = weight.reshape(*shape)
     if target.dtype.is_floating_point:
-        lp = log_softmax(logits, -1)
-        loss = -(target * lp).sum(-1)
+        # Probability targets; the mean is over the N * d1 * ... positions (not the weights).
+        if label_smoothing > 0:
+            target = target * (1 - label_smoothing) + label_smoothing / n_classes
+        terms = target * log_softmax(logits, class_dim)
+        if weight is not None:
+            terms = terms * class_weight
+        loss = -terms.sum(class_dim)
         return loss.mean() if reduction == "mean" else loss.sum() if reduction == "sum" else loss
+    target_shape = tuple(target.shape)
     if len(logits.shape) == 1:
         logits = logits.unsqueeze(0)
-        target = target.reshape(1)
-    if len(logits.shape) > 2:
+    elif len(logits.shape) > 2:
         # [N, C, d1, ...]: put classes last and flatten.
         moved = torch.movedim(logits, 1, -1)
         logits = moved.reshape(-1, moved.shape[-1])
-        target = target.reshape(-1)
-    return nll_loss(log_softmax(logits, -1), target, reduction)
+    target = target.reshape(-1)
+    lp = log_softmax(logits, -1)
+    if weight is None and label_smoothing == 0:
+        loss = nll_loss(lp, target, reduction)
+        return loss.reshape(*target_shape) if reduction == "none" else loss
+    # PyTorch's weighted / label-smoothed form: each position's loss is
+    # (1 - eps) * w[t] * -lp[t] + eps / C * sum_c w[c] * -lp[c], and the mean
+    # divides by the summed target weights (the count without a weight).
+    loss = -lp[torch.arange(lp.shape[0]), target]
+    if weight is not None:
+        target_weight = weight[target]
+        loss = loss * target_weight
+    if label_smoothing > 0:
+        smooth = -(lp * weight).sum(-1) if weight is not None else -lp.sum(-1)
+        loss = loss * (1 - label_smoothing) + smooth * (label_smoothing / n_classes)
+    if reduction == "none":
+        return loss.reshape(*target_shape)
+    if reduction == "sum":
+        return loss.sum()
+    return loss.sum() / (target_weight.sum() if weight is not None else target.shape[0])
 
 
 def binary_cross_entropy_with_logits(logits, target, weight=None, reduction="mean", pos_weight=None):
     if tuple(logits.shape) != tuple(target.shape):
         raise ValueError("Target size (%s) must be the same as input size (%s)" % (tuple(target.shape), tuple(logits.shape)))
-    # max(x, 0) - x * y + log(1 + exp(-|x|)), the numerically stable form.
-    loss = torch.clamp(logits, min=0) - logits * target + torch.log(1 + torch.exp(-torch.abs(logits)))
+    if pos_weight is not None:
+        # (1 - y) x + (1 + (pw - 1) y) softplus(-x), with softplus(-x) = max(-x, 0) + log(1 + exp(-|x|)).
+        softplus_neg = torch.clamp(-logits, min=0) + torch.log(1 + torch.exp(-torch.abs(logits)))
+        loss = (1 - target) * logits + (1 + (pos_weight - 1) * target) * softplus_neg
+    else:
+        # max(x, 0) - x * y + log(1 + exp(-|x|)), the numerically stable form.
+        loss = torch.clamp(logits, min=0) - logits * target + torch.log(1 + torch.exp(-torch.abs(logits)))
     if weight is not None:
         loss = loss * weight
     return loss.mean() if reduction == "mean" else loss.sum() if reduction == "sum" else loss

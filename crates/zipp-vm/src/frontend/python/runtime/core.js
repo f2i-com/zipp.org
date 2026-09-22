@@ -1343,13 +1343,29 @@ var __zipp_py = (function () {
         g.running = false; g.done = true;
         g.returned = r.value === undefined ? null : r.value;
     }
+    // One resumption. The exceptions a generator is handling are its own
+    // frame's state: they go back on the current-exception stack (above the
+    // caller's) while it runs, and whatever is still pushed when it yields
+    // is taken off again and kept for the next resumption, so the caller's
+    // sys.exc_info() and __context__ never see them. `throwing` raises `v`
+    // at the paused yield, where it chains to the generator's own exception.
+    function genStep(g, throwing, v) {
+        const depth = excStack.length, saved = g.excs;
+        if (saved !== null) { g.excs = null; for (let i = 0; i < saved.length; i++) excStack.push(saved[i]); }
+        if (throwing && v !== null && typeof v === "object") { const cur = rt.currentExc(); if (cur !== null && cur !== v) v.context = cur; }
+        let r;
+        try { r = throwing ? g.js.throw(v) : g.js.next(v); }
+        catch (e) { excStack.length = depth; throw genEscape(g, e); }
+        if (!r.done && excStack.length > depth) g.excs = excStack.splice(depth);
+        else excStack.length = depth;
+        return r;
+    }
     function genNext() {
         const g = this;
         if (g.done) { g.returned = null; return STOP; }
         if (g.running) fail(ValueError, "generator already executing");
         g.running = true; g.started = true;
-        let r;
-        try { r = g.js.next(undefined); } catch (e) { throw genEscape(g, e); }
+        const r = genStep(g, false, undefined);
         if (r.done) { genFinish(g, r); return STOP; }
         g.running = false;
         return r.value;
@@ -1360,8 +1376,7 @@ var __zipp_py = (function () {
         if (g.done) { g.returned = null; throw makeExc(E.StopIteration, []); }
         if (!g.started && v !== null) fail(TypeError, "can't send non-None value to a just-started generator");
         g.running = true; g.started = true;
-        let r;
-        try { r = g.js.next(v); } catch (e) { throw genEscape(g, e); }
+        const r = genStep(g, false, v);
         if (r.done) { genFinish(g, r); throw makeExc(E.StopIteration, g.returned === null ? [] : [g.returned]); }
         g.running = false;
         return r.value;
@@ -1371,8 +1386,7 @@ var __zipp_py = (function () {
         if (g.running) fail(ValueError, "generator already executing");
         if (g.done) throw exc;
         g.running = true; g.started = true;
-        let r;
-        try { r = g.js.throw(exc); } catch (e) { throw genEscape(g, e); }
+        const r = genStep(g, true, exc);
         if (r.done) { genFinish(g, r); throw makeExc(E.StopIteration, g.returned === null ? [] : [g.returned]); }
         g.running = false;
         return r.value;
@@ -1387,11 +1401,10 @@ var __zipp_py = (function () {
         if (!g.started) { g.done = true; g.js.return(undefined); return null; }
         g.running = true;
         let r;
-        try { r = g.js.throw(makeExc(E.GeneratorExit, [])); }
+        try { r = genStep(g, true, makeExc(E.GeneratorExit, [])); }
         catch (e) {
-            const out = genEscape(g, e);
-            if (isExcOf(out, E.GeneratorExit)) return null;
-            throw out;
+            if (isExcOf(e, E.GeneratorExit)) return null;
+            throw e;
         }
         g.running = false;
         if (!r.done) fail(E.RuntimeError, "generator ignored GeneratorExit");
@@ -1399,7 +1412,7 @@ var __zipp_py = (function () {
         return r.value === undefined ? null : r.value;
     }
     rt.makeGenerator = function (jsgen, f) {
-        return { cls: T.generator, js: jsgen, done: false, started: false, running: false, returned: null,
+        return { cls: T.generator, js: jsgen, done: false, started: false, running: false, returned: null, excs: null,
             name: f.name, qualname: f.qualname, next: genNext, send: genSend, throwIn: genThrow, close: genClose };
     };
 
@@ -1482,6 +1495,9 @@ var __zipp_py = (function () {
             return Array.from(out).sort(rt.compareStrings);
         },
         mkdir: (p) => { dirs.add(vfsNorm(p)); },
+        // Removes an empty directory; otherwise says why not: "missing",
+        // "file" or "full" (a directory implied by the files under it is never empty).
+        rmdir: (p) => { const n = vfsNorm(p); if (vfs.has(n)) return "file"; if (!rt.vfs.isDir(n)) return "missing"; if (n === "" || rt.vfs.listDir(n).length) return "full"; dirs.delete(n); return null; },
         changed: () => { const out = Array.from(vfsChanged); vfsChanged.clear(); return out; },
     };
     const dirs = new Set();

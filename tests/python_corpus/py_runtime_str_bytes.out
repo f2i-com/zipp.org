@@ -1,0 +1,14 @@
+True True False
+True True True
+True False False True
+True True False
+True True True
+[True, True, True, True, True, True, True, True, True, True, True, True, True, True, True]
+[True, False, False, True] [True, True, True, True, True, True, True, True, True]
+True False False False
+b"it's" b'say "hi"' b'both \' and "' b'plain' bytearray(b"it\'s")
+bytearray(b'el') bytearray 101 bytearray(b'')
+True True False
+True False
+['a', 'b c d'] ['a', 'b,c'] ['a', 'b,c']
+['a b c', 'd'] ['a', 'b', 'c'] ['a', 'b']

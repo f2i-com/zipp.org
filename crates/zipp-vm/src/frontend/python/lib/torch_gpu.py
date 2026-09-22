@@ -78,7 +78,7 @@ def _optimizer_configuration(optimizer, kind):
 
 
 def _step_count(optimizer, parameter):
-    state = optimizer.state.get(id(parameter))
+    state = optimizer.state.get(parameter)
     step = 0 if state is None else state.get("step", 0)
     if type(step) is not int or step < 0:
         raise NotImplementedError("GPU optimizers need an integer step count in their state")
@@ -223,7 +223,7 @@ class _Capture:
         The buffer takes the leaf's captured layout (a bias is a row), so the
         update ops see one shape; it is read back in the parameter's shape.
         """
-        state = optimizer.state.get(id(parameter))
+        state = optimizer.state.get(parameter)
         buffer = None if state is None else state.get(key)
         if buffer is not None and (not isinstance(buffer, torch.Tensor) or buffer.dtype != torch.float32
                                    or tuple(buffer.shape) != tuple(parameter.shape)):
@@ -255,7 +255,7 @@ class _Capture:
                 # Plain SGD stays within protocol version 1 (see zipp_gpu).
                 self.updates.append((parameter, leaf._value - gradient * group["lr"]))
                 continue
-            had_buffer = (optimizer.state.get(id(parameter)) or {}).get("momentum_buffer") is not None
+            had_buffer = (optimizer.state.get(parameter) or {}).get("momentum_buffer") is not None
             if self.prepared and not had_buffer and group["dampening"]:
                 # A zero buffer reproduces PyTorch's first step (buffer = grad)
                 # only without dampening: momentum * 0 + (1 - 0) * grad is grad.
@@ -547,13 +547,13 @@ class GPUResult:
                         if original.dtype is not dtype or original._s is not snapshot[0] or _k.version(original._s) != snapshot[1]:
                             raise RuntimeError("GPU training result is stale; captured class targets changed before completion")
                     for parameter, key, snapshot in capture.state_snapshots:
-                        state = capture.optimizer.state.get(id(parameter))
+                        state = capture.optimizer.state.get(parameter)
                         if _changed(None if state is None else state.get(key), snapshot):
                             raise RuntimeError("GPU training result is stale; optimizer state changed before completion")
                     for parameter, new_value in updates:
                         parameter.data = new_value
                     for parameter, key, new_value in states:
-                        capture.optimizer.state.setdefault(id(parameter), {})[key] = new_value
+                        capture.optimizer.state[parameter][key] = new_value
                     for parameter, step in capture.step_counts.items():
                         capture.optimizer.state[parameter]["step"] = step
                     for parameter in capture.optimizer_params:
@@ -860,7 +860,7 @@ class Prepared:
                 for i, (parameter, new_value) in enumerate(capture.updates):
                     parameter.data = read("weight" + str(i), parameter.shape)
                 for i, (parameter, key, new_value) in enumerate(capture.state_updates):
-                    capture.optimizer.state.setdefault(id(parameter), {})[key] = read("state" + str(i), parameter.shape)
+                    capture.optimizer.state[parameter][key] = read("state" + str(i), parameter.shape)
                 for parameter, step in capture.step_counts.items():
                     # Recorded as the count after one step; the device advanced it per executed step.
                     capture.optimizer.state[parameter]["step"] = step + self.executed - 1
