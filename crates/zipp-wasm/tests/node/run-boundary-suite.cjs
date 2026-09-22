@@ -39,6 +39,7 @@ const CHECKS = [
   ["audit-2026-09-11.cjs"],
   ["audit-2026-09-11-close.cjs"],
   ["audit-2026-09-13.cjs"],
+  ["audit-2026-09-23.cjs"],
   ["audit-2026-09-15-ml-transport.cjs"],
   ["audit-2026-09-15-arrays.cjs"],
   ["audit-2026-09-15-dispatch.cjs"],

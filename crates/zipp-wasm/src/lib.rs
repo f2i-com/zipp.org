@@ -506,14 +506,14 @@ impl Engine {
     pub fn set_sync_host_capabilities(&mut self, operations: JsValue) -> Result<(), JsValue> {
         self.ensure_host_configuration_open()?;
         if !checked_is_array(&operations, "synchronous host capabilities").map_err(|error| self.to_js_error(error))? {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "TypeError: synchronous host capabilities must be an array",
             ));
         }
         let len = checked_array_length(&operations, "synchronous host capabilities")
             .map_err(|error| self.to_js_error(error))?;
         if len > MAX_SYNC_CAPABILITY_ENTRIES {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "RangeError: too many synchronous host capability entries",
             ));
         }
@@ -522,12 +522,12 @@ impl Engine {
             let operation = checked_array_get(&operations, index, "synchronous host capabilities")
                 .map_err(|error| self.to_js_error(error))?;
             let Some(operation) = operation.as_string() else {
-                return Err(JsValue::from_str(
+                return Err(self.usage_error(
                     "TypeError: synchronous host capability names must be strings",
                 ));
             };
             if !is_allowed_sync_host_call(&operation) {
-                return Err(JsValue::from_str(&format!(
+                return Err(self.usage_error(&format!(
                     "TypeError: unknown synchronous host capability '{operation}'"
                 )));
             }
@@ -556,7 +556,7 @@ impl Engine {
     pub fn init_source(&mut self, source: &str, language: &str) -> Result<JsValue, JsValue> {
         let language: zipp_vm::frontend::LanguageId = language
             .parse()
-            .map_err(|error: String| JsValue::from_str(&error))?;
+            .map_err(|error: String| self.usage_error(&error))?;
         self.initialize(language, source.len(), || match language {
             zipp_vm::frontend::LanguageId::JavaScript => {
                 compile_script_with_preamble(PREAMBLE, source, &GUEST_COMPILE_OPTIONS)
@@ -683,7 +683,7 @@ impl Engine {
         self.ensure_live()?;
         if self.state.is_some() {
             self.terminate();
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "zipp: repeated initialization disposed this engine",
             ));
         }
@@ -748,14 +748,19 @@ impl Engine {
             }));
 
             let init = st.run_init();
+            // A failed init never becomes `self.state`, so `terminate` cannot
+            // see what its top level retained (code `eval`/`new Function`
+            // defined stays in the instance); it is accounted here instead.
             if let Some(error) = st.resource_limit_error() {
                 self.note_error_kind("resource");
                 self.failed_init_console = st.console_snapshot();
+                account_retained(&st);
                 return Err(JsValue::from_str(error));
             }
             if let Err(e) = init {
                 self.note_error_kind("source");
                 self.failed_init_console = st.console_snapshot();
+                account_retained(&st);
                 return Err(JsValue::from_str(&e));
             }
 
@@ -819,7 +824,13 @@ impl Engine {
                     None
                 };
             }
-            let out = to_js(&HostValue::Object(exposed)).map_err(|error| self.to_js_error(error))?;
+            let out = match to_js(&HostValue::Object(exposed)) {
+                Ok(out) => out,
+                Err(error) => {
+                    account_retained(&st);
+                    return Err(self.to_js_error(error));
+                }
+            };
             self.slots = slots;
             self.helpers = helpers;
             self.state = Some(st);
@@ -836,7 +847,7 @@ impl Engine {
     #[wasm_bindgen(js_name = getGlobalByIndex)]
     pub fn get_global_by_index(&mut self, index: u32) -> Result<JsValue, JsValue> {
         if self.source_language == zipp_vm::frontend::LanguageId::Python {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "get_global_by_index is unavailable for the experimental Python frontend",
             ));
         }
@@ -854,7 +865,7 @@ impl Engine {
     #[wasm_bindgen(js_name = setGlobalByIndex)]
     pub fn set_global_by_index(&mut self, index: u32, value: JsValue) -> Result<(), JsValue> {
         if self.source_language == zipp_vm::frontend::LanguageId::Python {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "set_global_by_index is unavailable for the experimental Python frontend",
             ));
         }
@@ -872,7 +883,7 @@ impl Engine {
     #[wasm_bindgen(js_name = getGlobalsBatch)]
     pub fn get_globals_batch(&mut self, indices: JsValue) -> Result<JsValue, JsValue> {
         if self.source_language == zipp_vm::frontend::LanguageId::Python {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "get_globals_batch is unavailable for the experimental Python frontend",
             ));
         }
@@ -1013,7 +1024,7 @@ impl Engine {
     #[wasm_bindgen(js_name = getGlobalsFingerprint)]
     pub fn get_globals_fingerprint(&mut self, indices: JsValue) -> Result<JsValue, JsValue> {
         if self.source_language == zipp_vm::frontend::LanguageId::Python {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "get_globals_fingerprint is unavailable for the experimental Python frontend",
             ));
         }
@@ -1047,7 +1058,7 @@ impl Engine {
     #[wasm_bindgen(js_name = setGlobalsBatch)]
     pub fn set_globals_batch(&mut self, indices: JsValue, values: JsValue) -> Result<(), JsValue> {
         if self.source_language == zipp_vm::frontend::LanguageId::Python {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "set_globals_batch is unavailable for the experimental Python frontend",
             ));
         }
@@ -1057,7 +1068,7 @@ impl Engine {
         require_array(&values, "values").map_err(|error| self.to_js_error(error))?;
         let values_len = checked_array_length(&values, "values").map_err(|error| self.to_js_error(error))?;
         if values_len as usize != idx.len() {
-            return Err(JsValue::from_str(&format!(
+            return Err(self.usage_error(&format!(
                 "TypeError: setGlobalsBatch: indices and values must have the same length ({} indices, {} values)",
                 idx.len(),
                 values_len
@@ -1066,7 +1077,7 @@ impl Engine {
         let mut distinct = HashSet::with_capacity(idx.len());
         for i in &idx {
             if !distinct.insert(*i) {
-                return Err(JsValue::from_str(&format!(
+                return Err(self.usage_error(&format!(
                     "TypeError: setGlobalsBatch: index {i} appears more than once"
                 )));
             }
@@ -1093,7 +1104,7 @@ impl Engine {
     #[wasm_bindgen(js_name = callFunction)]
     pub fn call_function(&mut self, name: &str, args: JsValue) -> Result<JsValue, JsValue> {
         if self.source_language == zipp_vm::frontend::LanguageId::Python {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "call_function is unavailable for the experimental Python frontend",
             ));
         }
@@ -1272,7 +1283,7 @@ impl Engine {
     #[wasm_bindgen(js_name = evalInContext)]
     pub fn eval_in_context(&mut self, expr: &str) -> Result<JsValue, JsValue> {
         if self.source_language == zipp_vm::frontend::LanguageId::Python {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "eval_in_context is unavailable for the experimental Python frontend",
             ));
         }
@@ -1323,7 +1334,7 @@ impl Engine {
     #[wasm_bindgen(js_name = evalInContextRich)]
     pub fn eval_in_context_rich(&mut self, expr: &str) -> Result<JsValue, JsValue> {
         if self.source_language == zipp_vm::frontend::LanguageId::Python {
-            return Err(JsValue::from_str(
+            return Err(self.usage_error(
                 "eval_in_context_rich is unavailable for the experimental Python frontend",
             ));
         }
@@ -1602,7 +1613,10 @@ impl Engine {
         result: JsValue,
     ) -> Result<bool, JsValue> {
         self.ensure_live()?;
-        let call_id = host_call_id(call_id)?;
+        let call_id = host_call_id(call_id).map_err(|error| {
+            self.note_error_kind("usage");
+            error
+        })?;
         let mut budget = HostValueBudget::default();
         budget.charge_node().map_err(|error| self.to_js_error(error))?;
         let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
@@ -1625,7 +1639,10 @@ impl Engine {
     #[wasm_bindgen(js_name = cancelHostCallback)]
     pub fn cancel_host_callback(&mut self, call_id: f64) -> Result<bool, JsValue> {
         self.ensure_live()?;
-        let call_id = host_call_id(call_id)?;
+        let call_id = host_call_id(call_id).map_err(|error| {
+            self.note_error_kind("usage");
+            error
+        })?;
         let (Some(slot), Some(st)) = (self.helpers.cancel_host_call, self.state.as_mut()) else {
             return Ok(false);
         };
@@ -1693,13 +1710,16 @@ impl Engine {
     /// error (a program's own output ahead of the raise, a test report
     /// ahead of its non-zero exit), in `takeConsole`'s tagged form. The one
     /// method that answers on a disposed engine; it drains, and an engine
-    /// that initialized returns an empty array.
+    /// that initialized returns an empty array. Like `takeConsole` it pages:
+    /// each call drains what fits one conversion, and calls continue until
+    /// the array comes back empty.
     #[wasm_bindgen(js_name = takeFailedConsole)]
     pub fn take_failed_console(&mut self) -> Result<JsValue, JsValue> {
-        let snapshot = std::mem::take(&mut self.failed_init_console);
-        let (value, _) =
-            console_output_prefix(&snapshot, true).map_err(|error| self.to_js_error(error))?;
-        to_js(&value).map_err(|error| self.to_js_error(error))
+        let (value, count) = console_output_prefix(&self.failed_init_console, true)
+            .map_err(|error| self.to_js_error(error))?;
+        let result = to_js(&value).map_err(|error| self.to_js_error(error))?;
+        self.failed_init_console.drain(..count);
+        Ok(result)
     }
 
     /// Tear the VM down. The engine is unusable afterwards.
@@ -1758,6 +1778,13 @@ impl Engine {
 
     fn note_error_kind(&self, kind: &'static str) {
         self.last_error_kind.set(kind);
+    }
+
+    /// A mistake in the host's own call, classified as one: without this the
+    /// error keeps whatever kind the previous error had (a guest throw, say).
+    fn usage_error(&self, message: &str) -> JsValue {
+        self.note_error_kind("usage");
+        JsValue::from_str(message)
     }
 
     fn to_js_error(&self, error: String) -> JsValue {
@@ -2094,20 +2121,17 @@ impl Engine {
             self.python_hooks = None;
         }
         // Account what this engine leaves behind in the instance before the
-        // state that knows the figures is dropped.
-        if let Some(st) = self.state.as_ref() {
-            let usage = st.resource_usage();
+        // state that knows the figures is dropped. Every engine is disposed
+        // once, whether or not it ever initialized.
+        if !self.disposed {
             INSTANCE_USAGE.with(|c| {
                 let mut u = c.get();
                 u.engines_disposed += 1;
-                u.retained_functions += usage.retained_functions as u64;
-                u.retained_classes += usage.retained_classes as u64;
-                u.retained_function_bytes += usage.retained_function_bytes as u64;
-                u.retained_class_bytes += usage.retained_class_bytes as u64;
-                u.dynamic_code_calls += usage.dynamic_code_calls as u64;
-                u.dynamic_code_source_bytes += usage.dynamic_code_source_bytes as u64;
                 c.set(u);
             });
+        }
+        if let Some(st) = self.state.as_ref() {
+            account_retained(st);
         }
         self.state = None;
         self.slots.clear();
@@ -2118,6 +2142,22 @@ impl Engine {
         *self.bridges.borrow_mut() = Bridges::default();
         self.disposed = true;
     }
+}
+
+/// Add what a state retained in the instance (dynamic code outlives it) to the
+/// instance totals `zippInstanceUsage` reports.
+fn account_retained(st: &ScriptState) {
+    let usage = st.resource_usage();
+    INSTANCE_USAGE.with(|c| {
+        let mut u = c.get();
+        u.retained_functions += usage.retained_functions as u64;
+        u.retained_classes += usage.retained_classes as u64;
+        u.retained_function_bytes += usage.retained_function_bytes as u64;
+        u.retained_class_bytes += usage.retained_class_bytes as u64;
+        u.dynamic_code_calls += usage.dynamic_code_calls as u64;
+        u.dynamic_code_source_bytes += usage.dynamic_code_source_bytes as u64;
+        c.set(u);
+    });
 }
 
 /// One peeked, converted prefix of the host-call queue: the JS array the
@@ -3226,6 +3266,12 @@ fn from_js_bounded(
                 let key: &js_sys::JsString = k.unchecked_ref();
                 budget.ensure_string_units(key.length() as usize)?;
                 let Some(name) = k.as_string() else { continue };
+                // Keys cross as Rust strings, which cannot hold a lone
+                // surrogate: decoding would turn `"\uD800"` and `"\uDC00"`
+                // into one U+FFFD key and silently drop a value. Refuse it.
+                if name.contains('\u{FFFD}') && String::from_utf16(&key.iter().collect::<Vec<u16>>()).is_err() {
+                    return Err("TypeError: a host object key with a lone surrogate cannot cross".into());
+                }
                 budget.charge_string(&name)?;
                 let val = js_sys::Reflect::get(&object, &k)
                     .map_err(|_| inspection_error("host object property"))?;
