@@ -130,16 +130,19 @@ fn run(args: &[String]) -> Result<(), String> {
     if detected.language == LanguageId::JavaScript && !stdin {
         // `.mjs` retains the existing module loader rather than being silently
         // parsed as a script. Explicit Python selection wins over the extension.
-        let command = if path
+        let module = path
             .and_then(Path::extension)
             .and_then(|s| s.to_str())
-            .is_some_and(|s| s.eq_ignore_ascii_case("mjs"))
-        {
-            "mjs"
-        } else {
-            "js"
-        };
-        return super::run(&[command.to_owned(), filename]);
+            .is_some_and(|s| s.eq_ignore_ascii_case("mjs"));
+        if !bytecode {
+            return super::run(&[if module { "mjs" } else { "js" }.to_owned(), filename]);
+        }
+        // `--bc` inspects and never runs: a script falls through to the
+        // bytecode printer below, and a module, which that printer would parse
+        // with the wrong grammar, is refused rather than executed.
+        if module {
+            return Err("--bc takes a script; a .mjs module cannot be inspected this way".into());
+        }
     }
     // Any other Python file run by name (a shebang script, `zipp py tool`)
     // is the entry of its project exactly like a `.py` file.
@@ -778,10 +781,18 @@ fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<()
     // real traceback to be reported as the run's error.
     match outcome {
         Err(error) if refused.is_empty() => python_exit(state, Err(error)),
-        Err(error) => python_exit(
-            state,
-            Err(format!("{error}\n{}\nzipp: {summary}", lines.join("\n"))),
-        ),
+        Err(error) => match python_exit(state, Err(error)) {
+            // The program chose its status and keeps it, but a result is never
+            // partial without saying so: the refusals are reported regardless.
+            Ok(()) => {
+                for line in lines {
+                    eprintln!("{line}");
+                }
+                eprintln!("zipp: {summary}");
+                Ok(())
+            }
+            Err(error) => Err(format!("{error}\n{}\nzipp: {summary}", lines.join("\n"))),
+        },
         Ok(_) if refused.is_empty() => Ok(()),
         Ok(_) => {
             for line in lines {

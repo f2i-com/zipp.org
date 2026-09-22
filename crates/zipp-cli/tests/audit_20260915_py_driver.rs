@@ -241,6 +241,31 @@ fn r240_refused_changes_do_not_stop_the_rest_or_hide_the_error() {
     assert_eq!(f.read("dist/report.txt"), "keep-me\n");
 }
 
+/// A program that ends by `sys.exit` chooses its status, but the refused
+/// changes are reported all the same: a result is never partial silently.
+#[test]
+fn r240_refused_changes_are_reported_when_the_program_exits() {
+    for (exit, status) in [("sys.exit(3)", 3), ("sys.exit('fatal: bad input')", 1)] {
+        let f = Fixture::new("r240x");
+        f.write("dist/report.txt", "keep-me
+");
+        f.write(
+            "main.py",
+            format!("import sys
+open('dist/report.txt', 'w').write('lost')
+{exit}
+"),
+        );
+        let output = f.zipp(&["py", "main.py"]);
+        let err = stderr(&output);
+        assert_eq!(output.status.code(), Some(status), "{exit}: {err}");
+        assert!(err.contains("not written back: dist/report.txt"), "{exit}: {err}");
+        assert!(err.contains("were not written back"), "{exit}: {err}");
+        assert_eq!(f.read("dist/report.txt"), "keep-me
+");
+    }
+}
+
 /// `:` is stream syntax on Windows: the path is refused when the changes are
 /// checked, and the files around it are still written.
 #[cfg(windows)]
@@ -344,6 +369,25 @@ fn r242_bytecode_inspection_of_a_folder_is_refused() {
     assert!(!stdout(&output).contains("EXECUTED"));
     assert!(stderr(&output).contains("--bc takes a file"), "{}", stderr(&output));
     assert!(!f.0.join("proj/side_effect.txt").exists());
+}
+
+/// `--bc` never runs the program, whichever language it is in.
+#[test]
+fn r242_bytecode_inspection_of_javascript_does_not_run_it() {
+    let f = Fixture::new("r242js");
+    f.write("a.js", "console.log('EXECUTED');
+");
+    f.write("m.mjs", "console.log('EXECUTED');
+export {};
+");
+    let output = f.zipp(&["run", "--bc", "a.js"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stdout(&output).lines().any(|l| l == "EXECUTED"), "{}", stdout(&output));
+    assert!(!stdout(&output).is_empty());
+    let output = f.zipp(&["run", "--bc", "m.mjs"]);
+    assert!(!output.status.success());
+    assert!(!stdout(&output).lines().any(|l| l == "EXECUTED"), "{}", stdout(&output));
+    assert!(stderr(&output).contains("--bc takes a script"), "{}", stderr(&output));
 }
 
 #[cfg(any(windows, target_os = "macos"))]
