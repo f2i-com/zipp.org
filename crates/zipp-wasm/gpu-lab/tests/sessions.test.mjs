@@ -222,3 +222,39 @@ test('a non-finite readback in a later step poisons the session too',async()=>{
     s.dispose();rt.dispose();
   }
 });
+
+// A target input that begins with data may still be fed per step, and a fed
+// value is checked the same way whether or not the input had one to start.
+for(const backend of ['cpu-js','wasm'])test(`${backend}: a fed cross-entropy target is checked even when the input had data`,async()=>{
+  const rt=await createRuntime({backend,wasmBytes});
+  const s=await rt.prepare({version:2,nodes:[{id:0,op:'input',shape:[2,3],data:[1,2,3,4,5,6]},
+    {id:1,op:'input',shape:[2],data:[0,1]},{id:2,op:'cross_entropy',a:0,b:1}],outputs:[{name:'loss',id:2}]});
+  try{
+    await assert.rejects(s.run({inputs:{1:[3,1]}}),code('NUMBER'));
+    assert.ok(Number.isFinite((await s.run({inputs:{1:[2,0]}})).outputs.loss.data[0]));
+  }finally{s.dispose();rt.dispose();}
+});
+
+// A quantized input is blocks: a float feed would be read as block bytes.
+for(const backend of ['cpu-js','wasm'])test(`${backend}: a quantized input cannot be fed`,async()=>{
+  const rt=await createRuntime({backend,wasmBytes}),K=256,N=2,blocks=new Uint8Array(N*144);
+  const s=await rt.prepare({version:2,nodes:[{id:0,op:'input',shape:[1,K],data:new Float32Array(K).fill(1)},
+    {id:1,op:'input',shape:[N,K],dtype:'q4_k',data:blocks},{id:2,op:'matmul',a:0,b:1,transposed:true}],outputs:[{name:'y',id:2}]});
+  try{await assert.rejects(s.run({inputs:{1:new Float32Array(N*K)}}),code('PROTOCOL'));}
+  finally{s.dispose();rt.dispose();}
+});
+
+// The WASM arena pins a session's uploads; it must give them back once no
+// session holds them, and must not pin a step's own outputs as it goes.
+test('wasm: pinned arena memory is released and does not creep per run',async()=>{
+  const rt=await createRuntime({backend:'wasm',wasmBytes}),be=rt.impl;
+  const program={version:2,nodes:[{id:0,op:'input',shape:[1,64],data:new Float32Array(64).fill(1)},
+    {id:1,op:'input',shape:[64,64],data:new Float32Array(64*64).fill(0.5)},{id:2,op:'matmul',a:0,b:1}],outputs:[{name:'y',id:2}]};
+  try{
+    for(let i=0;i<3;i++){const s=await rt.prepare(program);await s.run({});s.dispose();assert.equal(be.pinned,be.base,`cycle ${i}`);}
+    const s=await rt.prepare(program),pinned=be.pinned;
+    for(let i=0;i<20;i++)assert.equal((await s.run({})).outputs.y.data[0],32);
+    assert.equal(be.pinned,pinned,'running a session pins nothing more');
+    s.dispose();
+  }finally{rt.dispose();}
+});

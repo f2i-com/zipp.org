@@ -119,7 +119,9 @@ export class ComputeRuntime {
     const session=new Session(this,plan,{resident:new Set(resident),typedOutputs:typedOutputs!==false});
     check(this.residentBytes()+session.residentBytes+plan.logicalBytes<=limits.maxLogicalBytes,'LIMIT','Resident tensors exceed the allocation budget');
     this.busy=true;
-    try{await session.init();}finally{this.busy=false;}
+    try{await session.init();}
+    catch(e){if(this.sessions.size===0)this.impl.unpin?.();throw e;}
+    finally{this.busy=false;}
     this.sessions.add(session);
     return session;
   }

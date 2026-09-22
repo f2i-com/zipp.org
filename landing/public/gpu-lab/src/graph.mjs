@@ -147,7 +147,8 @@ function gather(n, inShape) {
 }
 function axisOf(raw, rank) {
   check(Number.isSafeInteger(raw) && raw >= -Math.max(rank, 1) && raw < Math.max(rank, 1), 'SHAPE', 'Axis is out of range');
-  return raw < 0 ? raw + rank : raw;
+  // A scalar reduces as if it were [1], so -1 names that one axis too.
+  return raw < 0 ? raw + Math.max(rank, 1) : raw;
 }
 /** Adam's bias-corrected scalars for `step`, from the program's own doubles. */
 export function adamStep({lr, beta1, beta2}, step) {
@@ -424,11 +425,11 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
         // Targets are data, checked here: every kernel may then index with them.
         // A fed target input is checked at each upload instead (`classes`).
         check(b.op === 'input' && b.carry === undefined, 'NUMBER', `${op} targets must be an input of integer class indices in [0, C)`);
+        // Static targets are checked here and also carry `classes`: a session
+        // may feed any input per step, including one that began with data.
         if (b.data) checkClassTargets(b.data, a.shape[1], op);
-        else {
-          check(b.classes === undefined || b.classes === a.shape[1], 'SHAPE', `${op} targets are shared by logits of different widths`);
-          b.classes = a.shape[1];
-        }
+        check(b.classes === undefined || b.classes === a.shape[1], 'SHAPE', `${op} targets are shared by logits of different widths`);
+        b.classes = a.shape[1];
         n.rows = a.shape[0]; n.cols = a.shape[1];
         n.shape = op === 'cross_entropy' ? [] : [...a.shape]; units = a.size * 4; break;
       }

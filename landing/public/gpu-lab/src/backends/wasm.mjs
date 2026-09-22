@@ -135,9 +135,11 @@ export class WasmBackend {
    * this step's working set and has to come back to the host, because the next
    * step will allocate over it.
    */
-  persist(h) {
+  persist(h, pin = false) {
     if (h instanceof Float32Array || h instanceof Uint8Array) return h;
-    if (h.ptr === this.pinned) { this.pinned = this.cursor; h.resident = true; return h; }
+    // Only a session's upload pins. A step's first computed node also starts
+    // at the frontier, and pinning it would keep every step's scratch forever.
+    if (pin && h.ptr === this.pinned) { this.pinned = this.cursor; h.resident = true; return h; }
     return h.quant ? this.bytesView(h).slice() : this.view(h).slice();
   }
   materialize(h) {
@@ -147,6 +149,8 @@ export class WasmBackend {
     const o = this.alloc(h.length); this.view(o).set(h); return o;
   }
   nextStep() { this.cursor = this.pinned; }
+  /** Called when no session is left: nothing pinned is referenced any more. */
+  unpin() { this.pinned = this.base; this.cursor = this.base; }
   async finish() {}
   dispose() { this.e = null; }
 }

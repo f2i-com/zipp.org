@@ -47,14 +47,14 @@ export class Session {
   }
   retain(h){this.retained.set(h,(this.retained.get(h)??0)+1);return h;}
   release(h){const n=this.retained.get(h);if(n===undefined)return;if(n>1)this.retained.set(h,n-1);else{this.retained.delete(h);this.impl.free(h);}}
-  persist(h){return this.impl.persist?this.impl.persist(h):h;}
+  persist(h,pin=false){return this.impl.persist?this.impl.persist(h,pin):h;}
   materialize(h){return this.impl.materialize?this.impl.materialize(h):h;}
   /** Uploads the inputs that have data (static and initial carried values) once. */
   async init(){
     let began=false;
     try{
       await this.impl.begin(this.plan);began=true;
-      for(const n of this.inputs)if(n.data)this.held.set(n.id,this.retain(this.persist(await this.impl.run(n,[]))));
+      for(const n of this.inputs)if(n.data)this.held.set(n.id,this.retain(this.persist(await this.impl.run(n,[]),true)));
     }catch(e){this.free();throw e;}
     finally{if(began)await this.impl.finish();}
   }
@@ -70,6 +70,8 @@ export class Session {
       for(const key of Object.keys(given)){
         const id=Number(key),n=nodes[id];
         check(Number.isSafeInteger(id)&&String(id)===key&&n!==undefined&&n.op==='input','REFERENCE',`Input ${key} is not an input node`);
+        // Blocks are bytes, not values: a float feed would be read as block data.
+        check(!n.quant,'PROTOCOL',`Input ${key} is a quantized constant and cannot be fed`);
         const data=given[key];
         check((data instanceof Float32Array||Array.isArray(data))&&data.length===n.size,'SHAPE',`Input ${key} length does not match shape`);
         elements+=data.length;check(elements<=limits.maxInputElements,'LIMIT','Total input exceeds limit');
@@ -210,5 +212,7 @@ export class Session {
     if(this.disposed)return;
     if(this.busy){this.disposeRequested=true;return;}
     this.disposed=true;this.free();this.runtime.sessions.delete(this);
+    // What sessions pinned is only given back once none is left to hold any of it.
+    if(this.runtime.sessions.size===0)this.impl.unpin?.();
   }
 }

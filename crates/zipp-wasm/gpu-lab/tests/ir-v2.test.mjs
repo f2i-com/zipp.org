@@ -301,3 +301,12 @@ test('a seeded walk over every operation family agrees between cpu-js and WASM',
   // Only the transcendental paths may differ at all, and then by about one ulp.
   assert.ok(worst<=1e-6,`worst divergence ${worst} at ${worstCase}`);
 });
+
+// -1 names the only axis a scalar has, as it does for any other rank.
+test('reducing a scalar over axis -1 is the scalar',async()=>{
+  const rt=await createRuntime({backend:'cpu-js'});
+  const out=(await rt.execute({version:2,nodes:[{id:0,op:'input',shape:[],data:[5]},
+    {id:1,op:'sum',a:0,axis:-1},{id:2,op:'mean',a:0,axis:-1}],outputs:[{name:'s',id:1},{name:'m',id:2}]})).outputs;
+  assert.deepEqual([out.s.data[0],out.m.data[0]],[5,5]);
+  rt.dispose();
+});
