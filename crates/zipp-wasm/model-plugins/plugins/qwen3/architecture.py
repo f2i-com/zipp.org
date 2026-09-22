@@ -64,6 +64,14 @@ def config_from_gguf(metadata, vocab_size):
             raise ValueError("Checkpoint metadata is missing " + key)
         value = metadata[key]
         config[name] = float(value) if name == "rms_norm_epsilon" else int(value)
+    # The rotations here are plain RoPE. A file that asks for scaled rotations
+    # (YaRN, for a long-context release) would run with the wrong positions
+    # rather than fail, so it is refused unless the scaling is a no-op (a
+    # factor of 0 is llama.cpp's "unset").
+    scaling = metadata.get("qwen3.rope.scaling.type", "none")
+    factor = metadata.get("qwen3.rope.scaling.factor", 1.0)
+    if scaling not in ("none", "linear") or (scaling == "linear" and float(factor) not in (0.0, 1.0)):
+        raise ValueError("Unsupported rotary scaling: " + str(scaling) + " x" + str(factor))
     return config
 
 

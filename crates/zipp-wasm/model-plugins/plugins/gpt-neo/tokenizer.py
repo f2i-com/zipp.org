@@ -84,12 +84,15 @@ def load_asset(name, form, values):
         if form != "lines":
             raise ValueError("The merge table must arrive as lines")
         ranks = {}
-        for line in values:
+        for number, line in enumerate(values):
             if not isinstance(line, str):
                 raise ValueError("Merge lines must be text")
             if line and line[-1] == "\r":
                 line = line[:-1]
-            if not line or line[0] == "#":
+            # Only the "#version" header is a comment. "# #" and "## ##" are
+            # real merges, and skipping them splits every Markdown heading
+            # into ids the model was never trained on.
+            if not line or (number == 0 and line.startswith("#version")):
                 continue
             # Each line is short, so scanning one is cheap; it is the whole-file
             # scan that is not.

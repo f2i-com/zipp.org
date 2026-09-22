@@ -196,6 +196,7 @@ class TokenizerDifferentialTests(unittest.TestCase):
         'a'*200, '', ' ', '\n', '\t\t', 'word nbsp',
         'https://example.com/path?q=1&x=2', 'snake_case camelCase kebab-case',
         '$100 50% #hash @at ^caret ~tilde `tick', 'ellipsis… endash– emdash—',
+        '##', '###', '#### heading', '##########', '# $5 (#1)',
         'ñ ü ö ß Ω π ∑ ∞', '​zero width',
         '1st 2nd 3rd 10th', 'quote "inside" and ' + chr(92) + 'backslash' + chr(92),
     ]

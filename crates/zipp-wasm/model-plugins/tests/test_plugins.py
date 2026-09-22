@@ -100,3 +100,49 @@ class PluginTests(unittest.TestCase):
                 self.assertEqual(support['tokenizer_formats'],['character-v1'])
 
 if __name__=='__main__':unittest.main()
+
+
+class ModelOutputShimTests(unittest.TestCase):
+    """The interop ModelOutput indexes like transformers' own."""
+
+    def test_a_none_field_is_not_a_position_or_a_key(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'shim_modeling_outputs', ROOT/'interop/transformers/modeling_outputs.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        logits, cache = object(), object()
+        out = module.CausalLMOutputWithPast(loss=None, logits=logits, past_key_values=cache,
+                                            hidden_states=None, attentions=None)
+        self.assertIs(out[0], logits)
+        self.assertIs(out[1], cache)
+        self.assertEqual(out.to_tuple(), (logits, cache))
+        self.assertEqual(out.keys(), ['logits', 'past_key_values'])
+        self.assertIs(out['logits'], logits)
+        self.assertIsNone(out.loss)
+        with self.assertRaises(KeyError):
+            out['loss']
+
+
+class Qwen3ConfigTests(unittest.TestCase):
+    """What config_from_gguf accepts out of a file's metadata."""
+
+    def setUp(self):
+        self.plugin = load_plugin('qwen3')
+        self.metadata = {'general.architecture': 'qwen3'}
+        for name, suffix in self.plugin.GGUF_KEYS.items():
+            self.metadata['qwen3.' + suffix] = 1e-6 if name == 'rms_norm_epsilon' else 8
+
+    def test_scaled_rotations_are_refused_not_ignored(self):
+        self.assertEqual(self.plugin.config_from_gguf(self.metadata, 64)['vocab_size'], 64)
+        for kind, factor in [('none', 1.0), ('linear', 1.0), ('linear', 0.0)]:
+            with self.subTest(kind=kind, factor=factor):
+                metadata = {**self.metadata, 'qwen3.rope.scaling.type': kind,
+                            'qwen3.rope.scaling.factor': factor}
+                self.plugin.config_from_gguf(metadata, 64)
+        for kind, factor in [('yarn', 4.0), ('linear', 2.0)]:
+            with self.subTest(kind=kind, factor=factor):
+                metadata = {**self.metadata, 'qwen3.rope.scaling.type': kind,
+                            'qwen3.rope.scaling.factor': factor}
+                with self.assertRaisesRegex(ValueError, 'rotary scaling'):
+                    self.plugin.config_from_gguf(metadata, 64)

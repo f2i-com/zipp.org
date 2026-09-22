@@ -61,6 +61,11 @@ async function runGguf(data){
   const architecture=metadata['general.architecture'];
   const known=GGUF_PLUGINS[architecture];
   if(!known)throw Error(`This checkpoint is ${architecture}; this lab has no plugin for that architecture yet.`);
+  // The Qwen3 plugin projects to logits through the tied token embedding. The
+  // larger Qwen3 models (8B and up) carry their own output.weight instead, and
+  // running one through the tied path gives plausible-looking wrong logits.
+  if(index.tensors.has('output.weight'))
+    throw Error('This checkpoint has a separate output.weight (untied embeddings); the Qwen3 plugin supports tied embeddings only.');
 
   progress(`Downloading ${known.id} architecture support…`);
   const catalogueSource=new FileMapSource(new Map([['catalog.v1.json',await fetchBytes(new URL('catalog.v1.json',root),{maxBytes:65536})]]));

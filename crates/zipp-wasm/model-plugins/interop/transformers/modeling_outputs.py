@@ -11,13 +11,21 @@ class ModelOutput:
             raise AttributeError(name)
         return None
 
+    def _present(self):
+        # As in transformers: a field left as None is not a key, so `out[0]` is
+        # the logits of an output built with `loss=None`, not the loss.
+        return {name: value for name, value in self._fields.items() if value is not None}
+
     def __getitem__(self, key):
         if isinstance(key, str):
-            return self._fields[key]
-        return list(self._fields.values())[key]
+            return self._present()[key]
+        return list(self._present().values())[key]
+
+    def keys(self):
+        return list(self._present().keys())
 
     def to_tuple(self):
-        return tuple(self._fields.values())
+        return tuple(self._present().values())
 
 
 class BaseModelOutputWithPast(ModelOutput):

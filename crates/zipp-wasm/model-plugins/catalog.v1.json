@@ -25,7 +25,7 @@
       "id": "org.zipp.gpt-neo",
       "version": "0.1.0",
       "manifest": "plugins/gpt-neo/plugin.json",
-      "sha256": "c6d32889688db2eebe520a750a9ee288df0aa917eb3fe1d29768c35616e8d244",
+      "sha256": "8b8b8e379dfce06cebc3a1fa189fa0c3b949d44d3b93cee6820e17bcd35679dc",
       "checkpoint_format": "hf.gpt-neo-v1",
       "tokenizer_formats": [
         "gpt2-byte-bpe-v1"
@@ -35,7 +35,7 @@
       "id": "org.zipp.qwen3",
       "version": "0.1.0",
       "manifest": "plugins/qwen3/plugin.json",
-      "sha256": "9010f0166f438e7fe045646a7950e9dfce12ab0ae5d0020dbf191d66ba4bcc39",
+      "sha256": "8fcb3381e7380e4951206506f8bee3d436e711905ee07983a10e33478bcd5d75",
       "checkpoint_format": "gguf.qwen3-v1",
       "tokenizer_formats": [
         "qwen2-byte-bpe-v1"

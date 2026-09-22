@@ -12,7 +12,7 @@
     "qwen2-byte-bpe-v1"
   ],
   "sources": {
-    "architecture.py": "46498a235e42d6c1c7b6e7f4813f8613ce58e7d60fe2e9706f9469761ae9f636",
+    "architecture.py": "99643cd955d72b74df6976abb93683ede488a9a8055dc4a8804471dde88aa721",
     "graph.py": "60a6f7452010194911e706f75f906575195e29e20cfe202ba7eb8f3757c277a0"
   }
 }
