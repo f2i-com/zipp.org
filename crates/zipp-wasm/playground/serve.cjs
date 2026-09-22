@@ -15,6 +15,11 @@ const http = require("node:http");
 const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..", "..", "..");
+// The same folder as the file system names it. A request is checked again
+// after the file system resolves it, because a name without a leading dot can
+// still reach a dot-folder: on Windows `GIT~1` is `.git` and `DEV~1.VAR` is
+// `landing/.dev.vars`.
+const REAL_ROOT = fs.realpathSync.native(ROOT);
 let PORT = Number(process.env.PORT) || 8765;
 const TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -50,7 +55,8 @@ const server = http.createServer((request, response) => {
     response.writeHead(400).end("bad request");
     return;
   }
-  if (pathname.includes("\0")) {
+  // `:` is stream syntax on Windows (`file::$DATA`); nothing served has one.
+  if (pathname.includes("\0") || (process.platform === "win32" && pathname.includes(":"))) {
     response.writeHead(400).end("bad request");
     return;
   }
@@ -64,13 +70,31 @@ const server = http.createServer((request, response) => {
     response.writeHead(403).end("forbidden");
     return;
   }
-  readFile(file, response);
+  fs.realpath.native(file, (error, real) => {
+    if (error) {
+      notFoundOrError(error, response);
+      return;
+    }
+    const relative = path.relative(REAL_ROOT, real);
+    if (relative.startsWith("..") || path.isAbsolute(relative) ||
+        relative.split(path.sep).some((segment) => segment.startsWith("."))) {
+      response.writeHead(403).end("forbidden");
+      return;
+    }
+    readFile(real, response);
+  });
 });
+
+// A folder named without its trailing slash is not a file either.
+function notFoundOrError(error, response) {
+  const missing = error.code === "ENOENT" || error.code === "EISDIR";
+  response.writeHead(missing ? 404 : 500).end(missing ? "not found" : "error");
+}
 
 function readFile(file, response) {
   const reply = (error, body) => {
     if (error) {
-      response.writeHead(error.code === "ENOENT" ? 404 : 500).end(error.code === "ENOENT" ? "not found" : "error");
+      notFoundOrError(error, response);
       return;
     }
     response.writeHead(200, {

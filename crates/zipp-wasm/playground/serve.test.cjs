@@ -64,3 +64,8 @@ test("a NUL byte or traversal is answered and the server keeps running", async (
   assert.equal((await get("/README.md")).status, 200);
   assert.equal(server.exitCode, null);
 });
+
+test("a folder without its slash is not found, and a stream name is refused", async () => {
+  assert.equal((await get("/crates")).status, 404);
+  if (process.platform === "win32") assert.equal((await get("/README.md::$DATA")).status, 400);
+});

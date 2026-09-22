@@ -385,7 +385,10 @@ async function loadFileObjects(files, folderName) {
     const file = item instanceof File ? item : item.file;
     const relative = (item instanceof File ? file.webkitRelativePath : item.relative) || file.name;
     let parts = relative.split("/").filter(Boolean);
-    if (parts.length > 1 && folderName !== "files") parts = parts.slice(1);
+    // Only a path inside a folder has a first segment to drop: a loose file
+    // is its bare name. (A folder that happens to be called "files" is still
+    // a folder.)
+    if (parts.length > 1) parts = parts.slice(1);
     if (parts.some((p) => SKIP_DIRS.has(p) || (p.startsWith(".") && p !== "."))) continue;
     const path = parts.join("/");
     if (!path) continue;
@@ -400,7 +403,7 @@ async function loadFileObjects(files, folderName) {
     return;
   }
   const name = folderName || (files[0] instanceof File ? (files[0].webkitRelativePath || "").split("/")[0] : "") || "files";
-  stopRun();
+  await stopRun();
   setProject(name, entries, null, null);
   const folders = new Set(entries.map(([p]) => p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "").values());
   log(`Opened ${entries.length} file(s) from ${name}` + (folders.size > 1 ? ` in ${folders.size} folders` : "") + "." + (skipped.length ? ` Skipped ${skipped.length} file(s) over the size limits.` : ""), "note");
@@ -412,7 +415,9 @@ async function readEntryTree(entry, prefix, out) {
     if (file) out.push({ file, relative: prefix + entry.name });
     return;
   }
-  if (!entry.isDirectory || SKIP_DIRS.has(entry.name)) return;
+  // The dropped folder itself is the project, whatever it is called; only
+  // tool folders inside it are skipped, as "Open folder" does.
+  if (!entry.isDirectory || (prefix !== "" && SKIP_DIRS.has(entry.name))) return;
   const reader = entry.createReader();
   for (;;) {
     const batch = await new Promise((resolve) => reader.readEntries(resolve, () => resolve([])));
@@ -474,7 +479,7 @@ async function loadSample(key) {
     log(`Could not fetch the sample (${error.message}). Serve the repository root with "node playground/serve.cjs".`, "error");
     return;
   }
-  stopRun();
+  await stopRun();
   setProject(sample.name, entries, sample.entry, sample.entry);
   log(`Loaded sample ${sample.name}. Press Run.`, "note");
 }
@@ -622,10 +627,15 @@ function applyWrittenFiles(list) {
   save();
 }
 async function run() {
+  // One run at a time: Ctrl+Enter reaches here while the button is disabled.
+  if (el.run.disabled) return;
   if (!project.entry) { log("Nothing to run: open a folder or a sample first.", "error"); return; }
   const language = projectLanguage();
   if (!language) { log(`The entry file ${project.entry} is not a .py or .js file.`, "error"); return; }
-  stopRun();
+  el.run.disabled = true;
+  // The stop must be answered (or the engine replaced) before this run is
+  // sent, or its two-second deadline restarts the engine under the new run.
+  try { await stopRun(); } finally { el.run.disabled = false; }
   el.consoleOut.replaceChildren();
   clearCanvas();
   const { files, order, entry } = projectSources(language);
@@ -679,6 +689,13 @@ function reportError(reply) {
   stopLoop();
 }
 function deadline(error) {
+  // Someone else already replaced the engine (a stop that went unanswered);
+  // this request was simply cut off, and restarting again would cut the next.
+  if (error.message === "engine restarted") {
+    log("Stopped: the engine was restarted.", "note");
+    stopLoop();
+    return;
+  }
   log(`Stopped: ${error.message}. The program did not respond (an infinite loop?), so its engine was discarded.`, "error");
   stopLoop();
   startWorker();
