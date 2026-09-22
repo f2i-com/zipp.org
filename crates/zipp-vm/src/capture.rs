@@ -277,9 +277,14 @@ pub fn stmts_refs_all(body: &[Stmt]) -> HashSet<String> {
 pub fn lexical_forward_refs(stmts: &[Stmt]) -> HashSet<String> {
     let mut found = HashSet::new();
     // The common shapes — no lexical declaration after the first statement,
-    // and no multi-declarator one — need no walk at all.
+    // and no multi-declarator or destructuring one — need no walk at all. A
+    // destructuring declarator can reach its own names: `let [a = b, b] = []`.
     let needs_walk = stmts.iter().enumerate().any(|(i, s)| match s {
-        Stmt::VarDecl(d) if d.kind.is_lexical() => i > 0 || d.decls.len() > 1,
+        Stmt::VarDecl(d) if d.kind.is_lexical() => {
+            i > 0
+                || d.decls.len() > 1
+                || d.decls.iter().any(|x| !matches!(x.id, Pattern::Ident(_)))
+        }
         Stmt::ClassDecl(_) => i > 0,
         _ => false,
     });
@@ -300,16 +305,20 @@ pub fn lexical_forward_refs(stmts: &[Stmt]) -> HashSet<String> {
                 for decl in &d.decls {
                     let mut names = Names::default();
                     pattern_names(&decl.id, &mut names);
+                    // The declarator's own initializer and pattern defaults
+                    // run before its names are bound, so they count too.
+                    let mut own = Names::default();
+                    if let Some(init) = &decl.init {
+                        expr_refs(init, &mut own);
+                    }
+                    pattern_init_refs(&decl.id, &mut own);
                     found.extend(
                         names
                             .iter()
-                            .filter(|n| seen.contains(*n))
+                            .filter(|n| seen.contains(*n) || own.contains(*n))
                             .map(|n| n.to_string()),
                     );
-                    if let Some(init) = &decl.init {
-                        expr_refs(init, &mut seen);
-                    }
-                    pattern_init_refs(&decl.id, &mut seen);
+                    seen.extend(own);
                 }
             }
             Stmt::ClassDecl(c) => {

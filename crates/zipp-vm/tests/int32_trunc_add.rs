@@ -52,6 +52,7 @@ for (var i = 0; i < 40000; i++) {
   var a = x, b = Math.imul(x, 0x85ebca6b);
   acc = (acc + or0(a, b) + sub0(a, b) + ushr0(a, b) + mask(a, b) + xorc(a, b, i)) | 0;
   acc = (acc + shl(a, b) + count(a, b) + chain(a, b, i) + addint(a) + subint(b)) | 0;
+  acc = (acc + chain(a, b, 0.5) + chainsub(a, b, 0.5)) | 0;
   acc = (acc + twice(a, b) + both(a, b) + poly(a, b, 0) + step(a, i & 1023)) | 0;
 }
 console.log("warm", acc);
@@ -74,6 +75,11 @@ console.log("dbl", or0(2147483647.5, 1), or0(2147483648, 2147483648), or0(1e21, 
   chain(2147483647, 0.5, 0.5), addint(2147483647.7), mask(4294967295.9, 0));
 console.log("str", or0("7", 1), or0("x", 1), or0(true, 1), or0(null, 5), or0(undefined, 5),
   or0([3], 4), or0({}, 1));
+// A wrapped sum read by an Add whose other operand is a fraction or a string:
+// ToInt32 truncates before it wraps, and concatenation sees the digits.
+function chainsub(a, b, c) { return (c - (a + b)) | 0; }
+console.log("mixed chain", chain(2147483647, 1, 0.5), chain(2147483647, 1, "5"),
+  chain(-2147483648, -1, -0.5), chainsub(2147483647, 3, 0.5), chain(2147483647, 1, 1));
 var mixed = "none";
 try { or0(1n, 2n); } catch (e) { mixed = e instanceof TypeError ? "TypeError" : "other"; }
 console.log("bigint", mixed, String(1n + 2n));

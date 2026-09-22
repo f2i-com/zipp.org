@@ -633,16 +633,21 @@ pub(crate) fn dbinop(
 /// Int-tagged, so the true result is an integer of magnitude < 2^32 that the
 /// generic path represents exactly (an Int, or an f64 after `jo`). Every
 /// `Bitwise` operand position is ToInt32 / ToUint32 — a reduction mod 2^32 —
-/// and the wrapped i32 IS that residue. A chain `(a + b + c) | 0` holds too:
+/// and the wrapped i32 IS that residue. A chain through `AddInt` holds too:
 /// the generic path stays exact along it (|value| <= depth * 2^31, far below
-/// 2^53) and the residue of a sum is the sum of the residues. `Mul` is never
-/// admitted: its exact product rounds in f64, and ToInt32 of the rounded value
-/// is not the wrapped product.
+/// 2^53) and the residue of an integer sum is the sum of the residues. Only
+/// an integer IMMEDIATE may join a chain: a register operand can hold a
+/// fraction or a string, and then the reader's f64 or concatenation path runs
+/// on the wrapped value -- `(a + b + 0.5) | 0` truncates after wrapping where
+/// ToInt32 truncates first, and `(a + b) + "5"` concatenates the wrong digits.
+/// So `(a + b + c) | 0` admits only its last Add. `Mul` is never admitted:
+/// its exact product rounds in f64, and ToInt32 of the rounded value is not
+/// the wrapped product.
 ///
 /// THE PROOF is a forward walk over the function's CFG from each producer:
 /// every read of the destination register before its next definition, on
-/// every path, must be a `Bitwise` operand or an operand of another PROVEN
-/// member. Reads come from `instr_uses`, the exhaustive operand table;
+/// every path, must be a `Bitwise` operand or the operand of an `AddInt` that
+/// is itself a PROVEN member. Reads come from `instr_uses`, the exhaustive operand table;
 /// definitions from `writes_reg`, which may under-approximate — that only
 /// extends a walk (a read of the redefined register then declines the
 /// producer). Control edges are those of `bytecode_control_target`, and every
@@ -681,12 +686,6 @@ pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
         });
     if by_name_scope {
         return out;
-    }
-    fn is_arith(i: &Instr) -> bool {
-        matches!(
-            i,
-            Instr::Add { .. } | Instr::Sub { .. } | Instr::AddInt { .. }
-        )
     }
     fn push(q: usize, n: usize, stack: &mut Vec<usize>, visited: &mut [bool]) {
         if q < n && !visited[q] {
@@ -731,7 +730,7 @@ pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
         while let Some(q) = stack.pop() {
             let i = &code[q];
             if uses[q].contains(&t) {
-                if is_arith(i) {
+                if matches!(i, Instr::AddInt { .. }) {
                     arith_readers.push(q);
                 } else if !matches!(i, Instr::Bitwise { .. }) {
                     ok = false;
@@ -1270,7 +1269,6 @@ mod int32_trunc_tests {
             function sub_ushr(a, b) { return (a - b) >>> 0; }
             function and_mask(a, b) { return (a + b) & 65535; }
             function shift_count(a, b) { return 1 << (a + b); }
-            function chain(a, b, c) { return (a + b + c) | 0; }
             function addint(a) { return ((a | 0) + 1013904223) | 0; }
             function local_then_or(a, b) { let s = a + b; return s | 0; }
             function redefined(a, b) { return ((a + b) & 65535) + (a + b); }
@@ -1280,7 +1278,6 @@ mod int32_trunc_tests {
             "sub_ushr",
             "and_mask",
             "shift_count",
-            "chain",
             "addint",
             "local_then_or",
         ] {
@@ -1299,6 +1296,13 @@ mod int32_trunc_tests {
         let adds = arith_ips(&p);
         assert_eq!(adds.len(), 3, "{:?}", p.code);
         assert_eq!(member_ips(&p), vec![adds[0]], "{:?}", p.code);
+        // `(a + b + c) | 0`: `c` may be a fraction or a string, so the inner
+        // Add is observed exactly by the outer one; only the outer wraps. (A
+        // literal operand is a `LoadInt` register too, and declines the same.)
+        let p = named_proto("function chain(a, b, c) { return (a + b + c) | 0; }", "chain");
+        let adds = arith_ips(&p);
+        assert_eq!(adds.len(), 2, "{:?}", p.code);
+        assert_eq!(member_ips(&p), vec![adds[1]], "{:?}", p.code);
     }
 
     /// A read that observes the exact value declines the producer: a second
