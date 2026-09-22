@@ -116,7 +116,9 @@ export async function downloadPluginSource(manifestUrl, manifestHash, {limits = 
   const options = {signal, origin, maxBytes: limits.maxManifestBytes};
   const raw = await fetchPinned(manifestUrl, manifestHash, options);
   const manifest = validatePluginManifest(parseJSON(decodeUTF8(raw)), limits);
-  const base = new URL('.', manifestUrl), entries = new Map([['plugin.json', raw]]); let total = 0;
+  // Resolved the way fetchBytes resolved the manifest, so a relative URL that
+  // fetched is also a base its sources can be found against.
+  const base = new URL('.', new URL(manifestUrl, globalThis.location?.href)), entries = new Map([['plugin.json', raw]]); let total = 0;
   for (const [path, digest] of Object.entries(manifest.sources)) {
     const bytes = await fetchPinned(new URL(safePath(path), base), digest, {...options, maxBytes: Math.max(1, Math.min(limits.maxSourceFileBytes, limits.maxSourceBytes - total))});
     total += bytes.length; check(total <= limits.maxSourceBytes, 'LIMIT', 'Plugin exceeds source budget'); entries.set(path, bytes);

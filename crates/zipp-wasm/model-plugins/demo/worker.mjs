@@ -113,6 +113,8 @@ async function runGguf(data){
     if(!prompt.length)throw Error('The prompt is empty once tokenized.');
     if(prompt.length>=context)throw Error(`The prompt is ${prompt.length} tokens and this cache holds ${context}.`);
     const generated=[];
+    // Until the model or the count says otherwise, it is the cache that ran out.
+    let finishReason='context';
     let token=prompt[0];
     for(let position=0;position<context-1;position++){
       const began=performance.now();
@@ -121,6 +123,7 @@ async function runGguf(data){
       timings.push(performance.now()-began);
       const logits=out.outputs.logits.data;
       if(position+1<prompt.length){token=prompt[position+1];continue;}
+      if(generated.length>=data.maxNewTokens){finishReason='length';break;}
       // Greedy decoding on a 0.6B model repeats a phrase forever; the tail cut
       // off and a penalty on what has just been said is what stops that, and
       // it is the model's quality being sampled rather than anything about the
@@ -129,12 +132,12 @@ async function runGguf(data){
         temperature:data.temperature??0,topK:data.topK??0,topP:data.topP??1,
         repetitionPenalty:data.repetitionPenalty??1,
         recent:[...prompt,...generated].slice(-REPETITION_WINDOW)});
-      if(next===tokenizer.eos)break;
+      if(next===tokenizer.eos){finishReason='stop';break;}
       generated.push(next);
       token=next;
       self.postMessage({type:'token',text:tokenizer.decode(Uint32Array.from(generated)),
         count:generated.length,backend:runtime.info().backend});
-      if(generated.length>=data.maxNewTokens)break;
+      if(generated.length>=data.maxNewTokens){finishReason='length';break;}
     }
     const text=tokenizer.decode(Uint32Array.from(generated));
     session.dispose();session=null;runtime.dispose();runtime=null;
@@ -143,7 +146,7 @@ async function runGguf(data){
     const warm=timings.slice(prompt.length).sort((a,b)=>a-b);
     const median=warm.length?warm[warm.length>>1]:timings[timings.length-1];
     self.postMessage({type:'done',result:{text,tokens:generated,
-      finishReason:generated.length>=data.maxNewTokens?'length':'stop',
+      finishReason,
       msPerToken:Number(median.toFixed(1)),
       tokensPerSecond:Number((1000/median).toFixed(1)),
       backend:'prepared decode'}});

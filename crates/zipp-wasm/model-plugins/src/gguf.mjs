@@ -136,10 +136,12 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
   // this index has read from the file and produced as float32, rows included,
   // for a host that wants to know what the work cost.
   let decoded = 0, resident = 0, bytesRead = 0, bytesDecoded = 0;
+  // Checked before it is added, and given back if the read fails: a refusal or
+  // a failed read holds nothing, and must not leave the budget smaller.
   function charge(elements, name) {
-    decoded += elements * 4;
-    check(decoded <= limits.maxDecodedBytes, 'LIMIT',
+    check(decoded + elements * 4 <= limits.maxDecodedBytes, 'LIMIT',
       `Decoding ${name} would pass the decoded-weight budget of ${limits.maxDecodedBytes} bytes`);
+    decoded += elements * 4;
   }
   async function bytesOf(offset, length) {
     integer(length, 0, limits.maxModelFileBytes, 'Tensor bytes');
@@ -206,17 +208,21 @@ export async function openGGUF(source, path, wasm, overrides = {}) {
       const dtype = RESIDENT[entry.dtype]?.dtype;
       check(dtype !== undefined, 'DTYPE',
         `${name} is ${entry.dtype}; no backend keeps that format resident, so it must be decoded`);
-      resident += entry.bytes;
-      check(resident <= limits.maxModelBytes, 'LIMIT',
+      check(resident + entry.bytes <= limits.maxModelBytes, 'LIMIT',
         `Holding ${name} as blocks would pass the model budget of ${limits.maxModelBytes} bytes`);
-      const bytes = await bytesOf(entry.offset, entry.bytes);
+      resident += entry.bytes;
+      let bytes;
+      try { bytes = await bytesOf(entry.offset, entry.bytes); }
+      catch (error) { resident -= entry.bytes; throw error; }
       return {dtype, bytes, shape: entry.shape, elements: entry.elements};
     },
     async readTensor(name) {
       const entry = info(name);
       charge(entry.elements, name);
-      return checked(wasm.dequantize(entry.dtype, await bytesOf(entry.offset, entry.bytes), entry.elements),
-        entry.elements, name);
+      try {
+        return checked(wasm.dequantize(entry.dtype, await bytesOf(entry.offset, entry.bytes), entry.elements),
+          entry.elements, name);
+      } catch (error) { decoded -= entry.elements * 4; throw error; }
     },
     /** Gather whole rows without decoding the rest of the tensor. */
     async readRows(name, indices) {

@@ -2,6 +2,16 @@ import {check, fields, integer, shapeSize, resolveLimits, safePath} from './comm
 import {decodeUTF8, parseJSON} from './json.mjs';
 
 const WIDTH = Object.freeze({F32: 4, F16: 2, BF16: 2});
+function wellFormedShapeSize(shape) {
+  check(Array.isArray(shape) && shape.length <= 32, 'SHAPE', 'Invalid tensor shape');
+  let size = 1;
+  for (const d of shape) {
+    integer(d, 0, Number.MAX_SAFE_INTEGER, 'Tensor dimension');
+    size *= d;
+    integer(size, 0, Number.MAX_SAFE_INTEGER, 'Tensor elements');
+  }
+  return size;
+}
 async function exactRead(source, path, offset, length) {
   const bytes = await source.read(path, offset, length);
   check(bytes instanceof Uint8Array && bytes.length === length, 'SOURCE', 'Truncated tensor read'); return bytes;
@@ -30,7 +40,9 @@ export async function openSafetensors(source, path, overrides = {}) {
     // touches would make an otherwise loadable checkpoint unloadable.
     check(typeof meta.dtype === 'string' && /^[A-Z][A-Z0-9_]{0,15}$/.test(meta.dtype), 'DTYPE', 'Invalid dtype name');
     const readable = Object.hasOwn(WIDTH, meta.dtype);
-    const elements = shapeSize(meta.shape, limits, true);
+    // The same goes for the shape limits, which bound what this host decodes:
+    // a tensor it never reads only needs a shape that is well formed.
+    const elements = readable ? shapeSize(meta.shape, limits, true) : wellFormedShapeSize(meta.shape);
     check(Array.isArray(meta.data_offsets) && meta.data_offsets.length === 2, 'FORMAT', 'Invalid tensor offsets');
     const [begin, end] = meta.data_offsets;
     integer(begin, 0, size - 8 - n, 'Tensor start'); integer(end, begin, size - 8 - n, 'Tensor end');

@@ -241,3 +241,27 @@ test('a gathered row is an input, not a holding, and is never charged as one',
     store.dispose();
   } finally { await source.close(); }
 });
+
+// A read that fails holds nothing, so it must not leave the budget smaller:
+// the retry the weight store makes is charged once, not twice.
+test('a failed read gives back what it was charged',
+  {skip: !await exists(fixture) && 'Needs tests/fixtures/tiny-qwen3.gguf'}, async () => {
+  const inner = await fileSource(fixture);
+  let fail = false;
+  const source = {size: inner.size,
+    async read(...args) { if (fail) { fail = false; throw new Error('transient read error'); } return inner.read(...args); }};
+  try {
+    const probe = await openGGUF(source, 'model.gguf', null, {});
+    const norm = [...probe.tensors.values()].find(t => t.readable && t.shape.length === 1);
+    const limits = resolveLimits({maxDecodedBytes: norm.elements * 4});
+    const index = await openGGUF(source, 'model.gguf', null, limits);
+    fail = true;
+    await assert.rejects(index.readTensor(norm.name), /transient read error/);
+    assert.equal(index.decodedBytes, 0);
+    assert.equal((await index.readTensor(norm.name)).length, norm.elements);
+    assert.equal(index.decodedBytes, norm.elements * 4);
+    // A refusal is not a charge either: the budget is exactly spent, and still is.
+    await assert.rejects(index.readTensor(norm.name), /decoded-weight budget/);
+    assert.equal(index.decodedBytes, norm.elements * 4);
+  } finally { await inner.close(); }
+});

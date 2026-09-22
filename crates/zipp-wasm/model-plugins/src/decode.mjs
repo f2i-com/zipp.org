@@ -577,6 +577,9 @@ export async function stepInputs(plan, weights, {token, position, hidden, from, 
         if (column > position || (step.window !== undefined && column <= position - step.window)) mask[column] = MASKED;
       }
       inputs[step.node] = mask;
+    } else if (step.slot === 'select') {
+      // A selector over a one-token step names that token.
+      inputs[step.node] = Float32Array.of(1);
     } else {
       const write = new Float32Array(plan.context);
       write[position] = 1;

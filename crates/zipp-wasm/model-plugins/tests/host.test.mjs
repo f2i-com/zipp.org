@@ -10,6 +10,7 @@ import {PluginRegistry} from '../src/plugins.mjs';
 import {openSafetensors, WeightStore} from '../src/safetensors.mjs';
 import {bindGraph} from '../src/bindings.mjs';
 import {ModelSession, sampleLogits, seededRandom} from '../src/session.mjs';
+import {stepInputs} from '../src/decode.mjs';
 
 const encoder = new TextEncoder(), limits = resolveLimits();
 import {directoryEntries, sourceDirectory} from './helpers.mjs';
@@ -79,6 +80,17 @@ test('an unreadable dtype is indexed and only refused when something reads it',a
   assert.throws(()=>store.info('mask'),/dtype BOOL is unsupported/);
   assert.deepEqual([...store.info('keep').shape],[2]);
   store.dispose();
+});
+// The shape limits bound what is decoded, so a tensor that never is -- a
+// 4096-square BOOL mask, a rank-5 index buffer -- does not refuse the file.
+test('a tensor that is never decoded is not held to the decode shape limits',async()=>{
+  const index=await open(packed({keep:{dtype:'F32',shape:[2],data_offsets:[0,8]},
+    mask:{dtype:'BOOL',shape:[1,1,4096,4096],data_offsets:[8,8+4096*4096]},
+    ids:{dtype:'I64',shape:[1,1,1,1,1],data_offsets:[8+4096*4096,16+4096*4096]}},
+    new Uint8Array(16+4096*4096)));
+  assert.equal(index.tensors.get('mask').elements,4096*4096);
+  await assert.rejects(index.readTensor('mask'),/dtype BOOL is unsupported/);
+  await assert.rejects(open(packed({w:{dtype:'BOOL',shape:[-1],data_offsets:[0,0]}})),/dimension/);
 });
 test('a transposing binding reads a checkpoint-order matrix',async()=>{
   const index=await open(packed(tensorHeader([2,3],'F32',[0,24]),f32([1,2,3,4,5,6]))),store=new WeightStore([index],limits);
@@ -212,6 +224,15 @@ test('greedy selection, stable seeded sampling, extreme temperature',()=>{
   const a=seededRandom(0),b=seededRandom(0);assert.deepEqual(Array.from({length:20},()=>a()),Array.from({length:20},()=>b()));
   assert.throws(()=>sampleLogits([NaN,1]));assert.throws(()=>sampleLogits([1,2],{topK:3}));
 });
+// Top-p is cut before temperature, as the documented order says: the nucleus
+// of softmax([2,1,0]) is {0,1} at any temperature, so a cold sampler still
+// picks token 1 sometimes rather than collapsing onto token 0.
+test('top-p takes its nucleus before temperature is applied',()=>{
+  const counts=[0,0,0];
+  for(let i=0;i<1000;i++)counts[sampleLogits([2,1,0],{temperature:0.5,topP:0.7,random:()=>(i+0.5)/1000})]++;
+  assert.equal(counts[2],0,'token 2 is outside the nucleus');
+  assert.ok(counts[1]>50,`token 1 is inside the nucleus and should be drawn, got ${counts}`);
+});
 
 
 test('Python packages may begin with an empty __init__.py', async () => {
@@ -323,4 +344,13 @@ test('the catalogue pins every plugin, at the digest it actually has', async () 
         `${entry.id}: ${name} does not match the digest ${entry.manifest} pins`);
     }
   }
+});
+
+// A selector over a one-token step names that one token; it is not a write
+// column, which is what the single-step path used to feed it.
+test('a one-token step feeds a select slot one value', async () => {
+  const plan = {tokens: 1, context: 8, steps: [{node: 's', slot: 'select'}, {node: 'w', slot: 'write'}]};
+  const {inputs} = await stepInputs(plan, null, {position: 3});
+  assert.deepEqual([...inputs.s], [1]);
+  assert.deepEqual([...inputs.w], [0, 0, 0, 1, 0, 0, 0, 0]);
 });

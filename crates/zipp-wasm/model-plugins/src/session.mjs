@@ -79,7 +79,10 @@ async function deliverTokenizerAssets(engine, source, layout, limits) {
       values = text.split('\n');
       if (values.length > 0 && values[values.length - 1] === '') values.pop();
     } else {
-      const parsed = parseJSON(text, {maxChars: limits.maxTokenizerFileBytes});
+      // One item for the object and one per value; the pair count is checked
+      // against maxTokenizerItems below, not against parseJSON's default.
+      const parsed = parseJSON(text, {maxChars: limits.maxTokenizerFileBytes,
+        maxItems: limits.maxTokenizerItems + 1});
       check(plain(parsed), 'FORMAT', `Tokenizer asset ${name} must be a flat JSON object`);
       values = [];
       for (const key of Object.keys(parsed)) {
@@ -178,25 +181,29 @@ export function sampleLogits(logits, {temperature = 0, topK = 0, topP = 1,
 
   let indices = Array.from({length: scores.length}, (_, i) => i);
   if (topK > 0 && topK < scores.length) indices = indices.sort((a, b) => scores[b] - scores[a] || a - b).slice(0, topK);
-  // Subtract before dividing: even a tiny positive temperature cannot overflow
-  // the maximum logit to +Infinity. Negative differences may underflow to -Inf.
-  let probs = indices.map(i => Math.exp((scores[i] - scores[best]) / temperature));
 
   if (topP < 1) {
     // The smallest set of most likely tokens whose probability reaches topP.
     // Sorted here even when top-k did not, because a prefix of an unsorted
-    // list is not a nucleus.
-    const order = indices.map((id, at) => at).sort((a, b) => probs[b] - probs[a] || indices[a] - indices[b]);
-    const total = probs.reduce((a, b) => a + b, 0);
-    const keptIndices = [], keptProbs = [];
+    // list is not a nucleus. Measured before temperature, which comes last:
+    // a nucleus taken from the tempered distribution would shrink as the
+    // temperature fell, and that is a different sampler.
+    const plain = indices.map(i => Math.exp(scores[i] - scores[best]));
+    const order = indices.map((id, at) => at).sort((a, b) => plain[b] - plain[a] || indices[a] - indices[b]);
+    const total = plain.reduce((a, b) => a + b, 0);
+    const kept = [];
     let cumulative = 0;
     for (const at of order) {
-      keptIndices.push(indices[at]); keptProbs.push(probs[at]);
-      cumulative += probs[at] / total;
+      kept.push(indices[at]);
+      cumulative += plain[at] / total;
       if (cumulative >= topP) break;
     }
-    indices = keptIndices; probs = keptProbs;
+    indices = kept;
   }
+
+  // Subtract before dividing: even a tiny positive temperature cannot overflow
+  // the maximum logit to +Infinity. Negative differences may underflow to -Inf.
+  const probs = indices.map(i => Math.exp((scores[i] - scores[best]) / temperature));
 
   const sum = probs.reduce((a, b) => a + b, 0), r = random();
   check(Number.isFinite(r) && r >= 0 && r < 1, 'SAMPLING', 'Random source must return [0,1)');
