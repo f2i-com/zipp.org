@@ -16,7 +16,10 @@ against CPython and against another Zipp build.
   - an OO bank simulation
   - JSON round trip
   - sorting and `heapq`
-  - two torch workloads, both zipp-only: an MLP train step and a 128x128 matmul
+  - torch workloads, all zipp-only: an MLP train step, a 128x128 matmul, a
+    256x256 matmul plus an [8, 64, 64] bmm, a small CNN train step, an
+    LSTM+GRU train step, a transformer block train step (AdamW), a loop of
+    tiny autograd ops, and a shuffled DataLoader epoch over a TensorDataset
 
 ## Running
 

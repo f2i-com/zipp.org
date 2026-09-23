@@ -130,6 +130,15 @@ class Size(_tuple):
         return "torch.Size(%s)" % _list(self).__repr__()
 
 
+# The kernels hand result shapes back as Size, so a Tensor takes them as they
+# are instead of copying each into a new Size.
+_k._set_size_type(Size)
+# The shape of every 0-d tensor (a Size is immutable, so one is shared).
+_SCALAR_SHAPE = Size(())
+# Tuple equality of two shapes, without a tuple subclass's comparison dispatch.
+_shape_eq = _k._shape_eq
+
+
 def _numel(shape):
     n = 1
     for d in shape:
@@ -315,7 +324,13 @@ def _autograd_version(s):
 
 
 class _Node:
-    __slots__ = ("backward", "parents", "name", "pstate", "saved", "diff", "fn")
+    # Whether backward is itself differentiable (create_graph=True); also
+    # granted by name through `_DIFFERENTIABLE`. `fn`: the cached grad_fn.
+    # Class defaults, and no __slots__: on this runtime a slot store costs
+    # more than an instance-dict store, and a node is made per operation.
+    diff = False
+    fn = None
+    saved = None
 
     def __init__(self, backward, parents, name, saved=None):
         self.backward = backward
@@ -329,11 +344,8 @@ class _Node:
         # The tensors whose values backward reads, each with its storage's
         # version now: writing one in place before backward is an error, as
         # in PyTorch (see `_check_saved`).
-        self.saved = None if not saved else [(t._s, _k.aversion(t._s), t) for t in saved]
-        # Whether backward is itself differentiable (create_graph=True);
-        # also granted by name through `_DIFFERENTIABLE`.
-        self.diff = False
-        self.fn = None
+        if saved:
+            self.saved = [(t._s, _k.aversion(t._s), t) for t in saved]
 
 
 def _check_saved(node):
@@ -500,9 +512,23 @@ def _operands(a, b):
             elif a.dtype is not dt and not a.shape:
                 a = Tensor(_k.astype(a._s, dt.name), (), dt)
             return a, b, dt
+        tb = type(b)
+        if (tb is _float or tb is _int) and not _graph_recording:
+            # `_scalar_result` and `_as_tensor` for a plain float or int
+            # (while torch.compile records, `_as_tensor` is watched: below).
+            dt = a.dtype
+            if not dt.is_floating_point:
+                dt = _default_dtype if tb is _float else (int64 if dt is _bool_dtype else dt)
+            return a, Tensor(_k.full(dt.name, 1, b), _SCALAR_SHAPE, dt), dt
         dt = _scalar_result(a.dtype, b)
         return a, _as_tensor(b, None, dt), dt
     if _isinstance(b, Tensor):
+        ta = type(a)
+        if (ta is _float or ta is _int) and not _graph_recording:
+            dt = b.dtype
+            if not dt.is_floating_point:
+                dt = _default_dtype if ta is _float else (int64 if dt is _bool_dtype else dt)
+            return Tensor(_k.full(dt.name, 1, a), _SCALAR_SHAPE, dt), b, dt
         dt = _scalar_result(b.dtype, a)
         return _as_tensor(a, None, dt), b, dt
     return tensor(a), tensor(b), None
@@ -531,7 +557,7 @@ def _needs_grad(*tensors):
 
 def _unbroadcast(grad, shape):
     """Sum `grad` down to `shape` (the reverse of broadcasting)."""
-    if _tuple(grad.shape) == _tuple(shape):
+    if _shape_eq(grad.shape, shape) or _tuple(grad.shape) == _tuple(shape):
         return grad
     extra = _len(grad.shape) - _len(shape)
     dims = _list(_range(extra))
@@ -553,6 +579,12 @@ class Tensor:
     _base = None
     _untracked = False
     _hooks = None
+    # Defaults every new tensor starts with, read from the class until set:
+    # a tensor is made per operation and each attribute store costs.
+    grad = None
+    _node = None
+    _retain = False
+    requires_grad = False
 
     def __init__(self, storage=None, shape=None, dt=None, requires_grad=False, node=None):
         if type(dt) is not dtype:
@@ -562,12 +594,12 @@ class Tensor:
         self._s = storage
         # A Size is immutable, so tensors of one shape share it: elementwise
         # kernels hand an operand's own Size back as the result's shape.
-        self.shape = shape if type(shape) is Size else Size(shape)
+        self.shape = shape if type(shape) is Size else (_k._size(shape) if type(shape) is _tuple else Size(shape))
         self.dtype = dt
-        self.requires_grad = requires_grad
-        self.grad = None
-        self._node = node
-        self._retain = False
+        if requires_grad is not False:
+            self.requires_grad = requires_grad
+        if node is not None:
+            self._node = node
 
     # -- construction helpers
     @staticmethod
@@ -1870,6 +1902,10 @@ class Tensor:
         return isclose(self, other, rtol, atol, equal_nan)
 
 
+# `narrow` takes the fast route only for tensors indexed by this method.
+_tensor_getitem = Tensor.__getitem__
+
+
 class _NdArray:
     """Enough of a numpy view for `.numpy().tobytes()` and `.tolist()`."""
 
@@ -2166,16 +2202,23 @@ def _as_tensor(v, like=None, dtype=None):
     if _isinstance(v, Tensor):
         return v
     if dtype is not None and _isinstance(v, (_int, _float, _b.bool)):
-        return Tensor(_k.full(dtype.name, 1, v), (), dtype)
+        return Tensor(_k.full(dtype.name, 1, v), _SCALAR_SHAPE, dtype)
     if like is not None and like.dtype.is_floating_point and _isinstance(v, (_int, _float, _b.bool)):
-        return Tensor(_k.full(like.dtype.name, 1, _float(v)), (), like.dtype)
+        return Tensor(_k.full(like.dtype.name, 1, _float(v)), _SCALAR_SHAPE, like.dtype)
     return tensor(v)
 
 
 def _shape_args(shape):
-    if _len(shape) == 1 and _isinstance(shape[0], (_list, _tuple, Size)):
-        return _tuple(_int(d) for d in shape[0])
-    return _tuple(_int(d) for d in shape)
+    if _len(shape) == 1:
+        s0 = shape[0]
+        if type(s0) is not _int and _isinstance(s0, (_list, _tuple, Size)):
+            shape = s0
+    # A tuple of plain ints is returned as it is; anything else (a bool, a
+    # 0-d tensor, an int subclass) goes through int().
+    for d in shape:
+        if type(d) is not _int:
+            return _tuple([_int(v) for v in shape])
+    return shape if type(shape) is _tuple else _tuple(shape)
 
 
 def _legacy_init(self, dt, args):
@@ -2281,6 +2324,11 @@ def arange(start=0, end=None, step=1, dtype=None, layout=None, device=None, requ
     if n < 0 or (step > 0 and start > end) or (step < 0 and start < end):
         raise RuntimeError("upper bound and larger bound inconsistent with step sign")
     n = _int(n)
+    if _isinstance(start, (_int, _float)) and _isinstance(step, (_int, _float)) and _b.max(_b.abs(start), _b.abs(n * step), _b.abs(start + n * step)) < 9007199254740992:
+        # Every element start + i * step is then exact in double precision
+        # for int operands, and computed as Python computes it for floats:
+        # the kernel's loop gives the list's values.
+        return Tensor(_k.arange(dt.name, start, step, n), (n,), dt, requires_grad)
     values = [start + i * step for i in _range(n)]
     return Tensor(_k.from_flat(dt.name, values), (n,), dt, requires_grad)
 
@@ -2605,7 +2653,12 @@ def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None):
                 saved.append(tb)
             if "o" in need:
                 saved.append(out)
-        out._node = _Node(lambda g: backward(g, _frozen(ta, sa), _frozen(tb, sb), _frozen(out, storage)), (ta, tb), name, saved)
+        if saves is _NOSAVE:
+            # add/sub: backward reads only the operands' shapes, which
+            # `_frozen` would take from the tensors themselves anyway.
+            out._node = _Node(lambda g: backward(g, ta, tb, None), (ta, tb), name, saved)
+        else:
+            out._node = _Node(lambda g: backward(g, _frozen(ta, sa), _frozen(tb, sb), _frozen(out, storage)), (ta, tb), name, saved)
     return out
 
 
@@ -2640,7 +2693,7 @@ def add(input, other, alpha=1):
             return a.__add__(b if alpha == 1 else b * alpha)
         if hasattr(b, "_zipp_graph"):
             return (b if alpha == 1 else b * alpha).__radd__(a)
-    return _binary("add", a, _scaled(b, alpha), "Add", _add_backward, _NOSAVE)
+    return _binary("add", a, b if alpha == 1 else _scaled(b, alpha), "Add", _add_backward, _NOSAVE)
 
 
 def sub(input, other, alpha=1):
@@ -2652,7 +2705,7 @@ def sub(input, other, alpha=1):
             return (b if alpha == 1 else b * alpha).__rsub__(a)
     if _isinstance(a, Tensor) and a.dtype is _bool_dtype and _isinstance(b, Tensor) and b.dtype is _bool_dtype:
         raise RuntimeError("Subtraction, the `-` operator, with two bool tensors is not supported. If you are trying to invert a mask, use the `~` or `logical_not()` operator instead.")
-    return _binary("sub", a, _scaled(b, alpha), "Sub", _sub_backward, _NOSAVE)
+    return _binary("sub", a, b if alpha == 1 else _scaled(b, alpha), "Sub", _sub_backward, _NOSAVE)
 
 
 subtract = sub
@@ -2676,6 +2729,14 @@ multiply = mul
 
 
 def _float_result(a, b):
+    if type(a) is Tensor:
+        # A floating tensor with a Python number or a tensor of its own
+        # dtype: `_result_type` gives that dtype.
+        dt = a.dtype
+        if dt.is_floating_point:
+            tb = type(b)
+            if tb is _float or tb is _int or (tb is Tensor and b.dtype is dt):
+                return dt
     dt = _result_type(a, b)
     return dt if dt.is_floating_point else _default_dtype
 
@@ -3352,7 +3413,7 @@ def sum(input, dim=None, keepdim=False, dtype=None):
     else:
         # `(pred == target).sum()` counts; a uint8 sum does not wrap.
         a = _int64_acc(a)
-    dims = _dims_arg(_all_if_empty(dim), _len(a.shape))
+    dims = None if dim is None else _dims_arg(_all_if_empty(dim), _len(a.shape))
     storage, shape = _k.reduce("sum", a._s, a.shape, dims, keepdim, True)
     out = Tensor(storage, shape, a.dtype)
     if _needs_grad(a):
@@ -3376,7 +3437,7 @@ def mean(input, dim=None, keepdim=False, dtype=None):
         a = a.to(dtype)
     if not a.dtype.is_floating_point:
         raise RuntimeError("mean(): could not infer output dtype. Input dtype must be either a floating point or complex dtype. Got: %s" % _CAST_NAME[a.dtype.name])
-    dims = _dims_arg(_all_if_empty(dim), _len(a.shape))
+    dims = None if dim is None else _dims_arg(_all_if_empty(dim), _len(a.shape))
     storage, shape = _k.reduce("mean", a._s, a.shape, dims, keepdim, True)
     out = Tensor(storage, shape, a.dtype)
     if _needs_grad(a):
@@ -4051,13 +4112,20 @@ def reshape(input, *shape):
         shape = _tuple(n // known if d == -1 else d for d in shape)
     if _numel(shape) != n:
         raise RuntimeError("shape '%s' is invalid for input of size %d" % (_list(shape), n))
+    return _view(a, shape)
+
+
+def _view(a, shape):
+    """`a` reshaped to `shape`, a tuple of ints already checked to hold
+    `a`'s element count."""
     out = Tensor(a._s, shape, a.dtype)
     # A view: it shares the storage (so writes show through both ways) and
     # remembers its base for in-place autograd (see Tensor._rebase).
-    out._base = a if a._base is None else a._base
+    base = a._base
+    out._base = a if base is None else base
     if a._untracked:
         out._untracked = True
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (g.reshape(*a.shape),), (a,), "View")
     return out
@@ -4099,7 +4167,9 @@ def unsqueeze(input, dim):
     if _graph_recording and getattr(a, "_zipp_graph", False):
         return a.unsqueeze(dim)
     d = _norm_dim(dim, _len(a.shape) + 1)
-    return reshape(a, *(_tuple(a.shape[:d]) + (1,) + _tuple(a.shape[d:])))
+    shape = _list(a.shape)
+    shape.insert(d, 1)
+    return _view(a, _tuple(shape))
 
 
 def squeeze(input, dim=None):
@@ -4196,19 +4266,22 @@ def expand(input, *sizes):
     if _len(sizes) < rank:
         raise RuntimeError("expand: the number of sizes provided (%d) must be greater or equal to the number of dimensions in the tensor (%d)" % (_len(sizes), rank))
     off = _len(sizes) - rank
-    target = []
-    for i, s in enumerate(sizes):
-        if s == -1:
-            if i < off:
-                raise RuntimeError("expand: -1 is not allowed in a leading, non-existing dimension")
-            target.append(a.shape[i - off])
-        else:
-            target.append(s)
-    target = _tuple(target)
-    if target == _tuple(a.shape):
+    if -1 in sizes:
+        target = []
+        for i, s in enumerate(sizes):
+            if s == -1:
+                if i < off:
+                    raise RuntimeError("expand: -1 is not allowed in a leading, non-existing dimension")
+                target.append(a.shape[i - off])
+            else:
+                target.append(s)
+        target = _tuple(target)
+    else:
+        target = sizes
+    if _shape_eq(target, a.shape):
         return a
-    out = Tensor(_k.expand(a._s, a.shape, _list(target)), target, a.dtype)
-    if _needs_grad(a):
+    out = Tensor(_k.expand(a._s, a.shape, target), target, a.dtype)
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (_unbroadcast(g, a.shape),), (a,), "Expand")
     return out
@@ -4263,6 +4336,11 @@ def narrow(input, dim, start, length):
         start += a.shape[d]
     if start < 0 or length < 0 or start + length > a.shape[d]:
         raise RuntimeError("start (%d) + length (%d) exceeds dimension size (%d)." % (start, length, a.shape[d]))
+    if type(a).__getitem__ is _tensor_getitem:
+        # What `a[:, ..., start:start + length]` builds: every other dim whole.
+        spec = [(None, None, None)] * _len(a.shape)
+        spec[d] = (start, start + length, None)
+        return _slice(a, spec)
     spec = [slice(None)] * d + [slice(start, start + length)]
     return a[_tuple(spec)]
 
@@ -4300,14 +4378,22 @@ concatenate = cat
 
 
 def stack(tensors, dim=0):
-    tensors = [_as_tensor(t) for t in tensors]
+    tensors = [t if type(t) is Tensor else _as_tensor(t) for t in tensors]
     if not tensors:
         raise RuntimeError("stack expects a non-empty TensorList")
     first = _tuple(tensors[0].shape)
     for i, t_ in enumerate(tensors):
-        if _tuple(t_.shape) != first:
+        if not _shape_eq(t_.shape, first):
             raise RuntimeError("stack expects each tensor to be equal size, but got %s at entry 0 and %s at entry %d" % (_list(first), _list(t_.shape), i))
     d = _norm_dim(dim, _len(first) + 1)
+    if not _graph_recording and not (_grad_enabled and _any_requires_grad(tensors)):
+        # No history to record: concatenate the unsqueezed shapes directly,
+        # the kernel call `cat` makes on the unsqueezed views.
+        shape = _list(first)
+        shape.insert(d, 1)
+        shape = _tuple(shape)
+        storage, out_shape = _k.cat([(t_._s, shape) for t_ in tensors], d)
+        return Tensor(storage, out_shape, _DTYPES[_k.dtype(storage)])
     return cat([unsqueeze(t_, d) for t_ in tensors], d)
 
 
@@ -4677,6 +4763,13 @@ _EMPTY = _EmptyMark()
 
 
 def _getitem(a, key):
+    if type(key) is _int and a.shape:
+        # `a[i]`: the spec the general path below builds for a plain int
+        # (the kernel range-checks it).
+        spec = [key]
+        for _ in _range(_len(a.shape) - 1):
+            spec.append((None, None, None))
+        return _slice(a, spec)
     items = _basic_spec(a, key)
     spec, advanced, new_axes = [], [], []
     empty_axis = None
@@ -4738,7 +4831,7 @@ def _slice(a, spec):
 def _slice_scatter(g, shape, spec):
     """Zeros of `shape` with `g` at the sliced positions: the slice's
     gradient, itself differentiable (for create_graph)."""
-    base = zeros(*shape, dtype=g.dtype)
+    base = Tensor(_k.zeros(g.dtype.name, _numel(shape)), _shape_args(shape), g.dtype)
     _k.setslice(base._s, base.shape, spec, g._s, g.shape)
     if _needs_grad(g):
         base.requires_grad = True
@@ -5144,10 +5237,11 @@ def matmul(input, other):
             return a @ b
         if getattr(b, "_zipp_graph", False):
             return b.__rmatmul__(a)
-    ta, tb = _as_tensor(a), _as_tensor(b)
+    ta = a if type(a) is Tensor else _as_tensor(a)
+    tb = b if type(b) is Tensor else _as_tensor(b)
     storage, shape = _k.matmul(ta._s, ta.shape, tb._s, tb.shape)
     out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
-    if _needs_grad(ta, tb):
+    if _grad_enabled and (ta.requires_grad or tb.requires_grad):
         sa, sb, ra, rb = ta._s, tb._s, ta.requires_grad, tb.requires_grad
 
         def backward(g):
@@ -5535,21 +5629,6 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
     order, seen = [], set()
     parents_of, aliases = {}, {}
 
-    def resolve(node):
-        # A parent given a new history by an in-place op since this node
-        # consumed it stands in as an alias carrying the history it had then
-        # (one alias per earlier version, shared by every node that consumed it).
-        out = []
-        for p, st in zip(node.parents, node.pstate):
-            if p is not None and p._node is not st[0]:
-                key = (id(p), id(st[0]))
-                a = aliases.get(key)
-                if a is None:
-                    a = aliases[key] = Tensor(p._s, st[2], p.dtype, st[1], st[0])
-                p = a
-            out.append(p)
-        return out
-
     # Depth-first post-order without recursion (long chains of ops, an RNN
     # over many steps, must not hit the interpreter's recursion limit).
     stack = [(r, False) for r in reversed(roots)]
@@ -5558,23 +5637,52 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
         if done:
             order.append(t_)
             continue
-        if id(t_) in seen:
+        key = id(t_)
+        if key in seen:
             continue
-        seen.add(id(t_))
+        seen.add(key)
         stack.append((t_, True))
-        if t_._node is not None:
-            ps = parents_of[id(t_)] = resolve(t_._node)
-            for p in reversed(ps):
+        node = t_._node
+        if node is not None:
+            # The parents as this node consumed them: one given a new history
+            # by an in-place op since stands in as an alias carrying the
+            # history it had then (one alias per earlier version, shared by
+            # every node that consumed it).
+            pstate = node.pstate
+            ps = []
+            i = 0
+            for p in node.parents:
+                if p is not None:
+                    st = pstate[i]
+                    if p._node is not st[0]:
+                        akey = (id(p), id(st[0]))
+                        alias = aliases.get(akey)
+                        if alias is None:
+                            alias = aliases[akey] = Tensor(p._s, st[2], p.dtype, st[1], st[0])
+                        p = alias
+                ps.append(p)
+                i += 1
+            parents_of[key] = ps
+            i = _len(ps) - 1
+            while i >= 0:
+                p = ps[i]
                 if p is not None and p.requires_grad and id(p) not in seen:
                     stack.append((p, False))
+                i -= 1
     pending = {}
     for r, g in zip(roots, grads):
         pending[id(r)] = g if id(r) not in pending else add(pending[id(r)], g)
     captured = {}
     wanted = None if inputs is None else set(id(t_) for t_ in inputs)
-    with (enable_grad() if create_graph else no_grad()):
+    # The grad mode for the backward functions: recording only for
+    # create_graph (as `with enable_grad()` / `with no_grad()`).
+    global _grad_enabled
+    prev_mode = _grad_enabled
+    _grad_enabled = create_graph is True or _bool(create_graph)
+    try:
         for t_ in reversed(order):
-            g = pending.pop(id(t_), None)
+            key = id(t_)
+            g = pending.pop(key, None)
             if g is None:
                 continue
             if t_._hooks:
@@ -5582,8 +5690,8 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
                     replaced = hook(g)
                     if replaced is not None:
                         g = replaced
-            if wanted is not None and id(t_) in wanted:
-                captured[id(t_)] = g if id(t_) not in captured else add(captured[id(t_)], g)
+            if wanted is not None and key in wanted:
+                captured[key] = g if key not in captured else add(captured[key], g)
                 if accumulate:
                     _accumulate_grad(t_, g, create_graph)
             node = t_._node
@@ -5598,14 +5706,24 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
             if create_graph and not (node.diff or node.name in _DIFFERENTIABLE):
                 raise NotImplementedError("backward with create_graph=True through %s is not supported on Zipp" % _grad_fn_name(node.name))
             parent_grads = node.backward(g)
-            for p, pg in zip(parents_of[id(t_)], parent_grads):
+            if type(parent_grads) is not _tuple and type(parent_grads) is not _list:
+                parent_grads = _tuple(parent_grads)
+            ps = parents_of[key]
+            count = _b.min(_len(ps), _len(parent_grads))
+            for i in _range(count):
+                p = ps[i]
+                pg = parent_grads[i]
                 if p is None or pg is None or not p.requires_grad:
                     continue
-                if _tuple(pg.shape) != _tuple(p.shape):
+                if not _shape_eq(pg.shape, p.shape) and _tuple(pg.shape) != _tuple(p.shape):
                     pg = _unbroadcast(pg, p.shape) if _numel(pg.shape) >= _numel(p.shape) else expand(pg, *p.shape)
-                if pg.dtype != p.dtype and p.dtype.is_floating_point:
+                if pg.dtype is not p.dtype and pg.dtype != p.dtype and p.dtype.is_floating_point:
                     pg = pg.to(p.dtype)
-                pending[id(p)] = pg if id(p) not in pending else add(pending[id(p)], pg)
+                pk = id(p)
+                prior = pending.get(pk)
+                pending[pk] = pg if prior is None else add(prior, pg)
+    finally:
+        _grad_enabled = prev_mode
     return captured
 
 

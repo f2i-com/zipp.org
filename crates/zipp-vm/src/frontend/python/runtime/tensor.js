@@ -22,6 +22,27 @@
     const rt = R.__rt, T = rt.T, E = rt.E, fail = rt.fail;
     const tuple = rt.tuple, list = rt.list;
     const Storage = rt.newType("_Storage", [rt.ObjectType], new Map(), "_zipp_tensor");
+    // The engine's native loops (`vm::py_tensor`), bound only in Python
+    // states. `NATIVE(op, ...)` runs one kernel's loop in Rust over the same
+    // typed arrays and returns true, or declines with false (an odd view, a
+    // budget that cannot cover it, a trace being recorded) and the
+    // JavaScript loop after it runs instead. The values are the same either
+    // way; `_native(False)` turns the native loops off to compare.
+    let NATIVE_FN = null;
+    try { NATIVE_FN = typeof __zipp_py_native === "function" ? __zipp_py_native : null; } catch (e) { NATIVE_FN = null; }
+    let NATIVE = NATIVE_FN;
+    // Below this many elements an elementwise kernel's own inline loop is
+    // as cheap as the native call.
+    const NATIVE_MIN = 64;
+    const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
+        N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12;
+    const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
+        and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
+    const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
+        gelu: 12, gelu_grad: 13, reciprocal: 14, rsqrt: 15, log1p: 16, expm1: 17, softplus: 18, sin: 19, cos: 20, floor: 21,
+        ceil: 22, trunc: 23, isfinite: 24, isnan: 25, not: 26, clamp: 27, frac: 28, tan: 29, atan: 30, log2: 31, log10: 32,
+        isinf: 33, exp2: 34, sinh: 35, cosh: 36, asin: 37, acos: 38, asinh: 39, acosh: 40, atanh: 41 };
+    const RED_CODE = { sum: 1, mean: 2, prod: 3, max: 4, min: 5, argmax: 6, argmin: 7, all: 8, any: 9 };
     const ARRAY = { float32: Float32Array, float64: Float64Array, int64: Float64Array, int32: Float64Array, bool: Uint8Array, uint8: Uint8Array };
     const RANK = { bool: 0, uint8: 1, int32: 2, int64: 3, float32: 4, float64: 5 };
     function make(dtype, data) { if (ARRAY[dtype] === undefined) fail(E.TypeError, "unknown dtype " + dtype); return { cls: Storage, dtype: dtype, data: data, version: 0, untracked: 0 }; }
@@ -39,7 +60,15 @@
     // iterator protocol is several interpreter calls per element.
     function shapeOf(v) { if (v === null || typeof v !== "object" || v.items === undefined) fail(E.TypeError, "shape must be a tuple"); const items = v.items, out = new Array(items.length); for (let i = 0; i < items.length; i++) out[i] = Number(rt.asInt(items[i])); return out; }
     function ints(v) { return shapeOf(v); }
-    function pyShape(shape) { const out = new Array(shape.length); for (let i = 0; i < shape.length; i++) out[i] = BigInt(shape[i]); return tuple(out); }
+    // Result shapes are torch.Size values once torch registers the type
+    // (`_set_size_type`): a Tensor keeps a Size as it is, where a tuple
+    // would be copied into a new Size. A Size is a tuple subclass instance,
+    // built as `rt.allocInstance` builds one.
+    let SIZE = null;
+    function pyShape(shape) {
+        const out = new Array(shape.length); for (let i = 0; i < shape.length; i++) out[i] = BigInt(shape[i]);
+        return SIZE === null ? tuple(out) : { cls: SIZE, items: out, dict: new Map() };
+    }
     function numel(shape) { let n = 1; for (let i = 0; i < shape.length; i++) n *= shape[i]; return n; }
     function strides(shape) { const s = new Array(shape.length); let acc = 1; for (let i = shape.length - 1; i >= 0; i--) { s[i] = acc; acc *= shape[i]; } return s; }
     function promote(a, b) { return RANK[a] >= RANK[b] ? a : b; }
@@ -200,6 +229,9 @@
         // Same rank and (nonzero) size as an operand means the same shape.
         const outShape = n !== 0 && na === n && ashape.length === shape.length && tupleShape(apy) ? apy
             : n !== 0 && nb === n && bshape.length === shape.length && tupleShape(bpy) ? bpy : null;
+        if (n >= NATIVE_MIN && NATIVE !== null && BIN_CODE[op] !== undefined
+            && NATIVE(N_BINARY, BIN_CODE[op], A, Bd, O, shape, bstrides(ashape, shape), bstrides(bshape, shape)))
+            return tuple([out, outShape === null ? pyShape(shape) : outShape]);
         if (na === n && ashape.length === shape.length) {
             if (nb === 1 ? binaryScalar(op, O, A, Bd[0], false) : (nb === n && bshape.length === shape.length ? binaryTile(op, O, A, Bd, n, false) : (suffixTile(bshape, shape) === nb && binaryTile(op, O, A, Bd, nb, false))))
                 return tuple([out, outShape === null ? pyShape(shape) : outShape]);
@@ -314,11 +346,12 @@
     const FLOAT_UNARY = new Set(["exp", "log", "tanh", "sigmoid", "silu", "sqrt", "reciprocal", "log1p", "expm1", "gelu", "gelu_grad", "softplus", "sin", "cos", "rsqrt",
         "tan", "asin", "acos", "atan", "sinh", "cosh", "asinh", "acosh", "atanh", "log2", "log10", "exp2", "erf", "erfc", "erfinv"]);
     function unary(op, a, p1, p2) {
-        let f = UN[op];
-        if (op === "clamp") { const lo = p1 === null ? -Infinity : jsNumber(p1), hi = p2 === null ? Infinity : jsNumber(p2); f = (x) => (x < lo ? lo : x > hi ? hi : x); }
+        let f = UN[op], lo = 0, hi = 0;
+        if (op === "clamp") { lo = p1 === null ? -Infinity : jsNumber(p1); hi = p2 === null ? Infinity : jsNumber(p2); f = (x) => (x < lo ? lo : x > hi ? hi : x); }
         if (f === undefined) fail(E.ValueError, "unknown op " + op);
         const dtype = BOOL_UNARY.has(op) ? "bool" : (FLOAT_UNARY.has(op) && RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype);
         const out = alloc(dtype, a.data.length), A = a.data, O = out.data, n = O.length;
+        if (n >= NATIVE_MIN && NATIVE !== null && UN_CODE[op] !== undefined && NATIVE(N_UNARY, UN_CODE[op], A, O, lo, hi)) return out;
         // The hot activations and their gradients inline; the expressions
         // are the table's own.
         switch (op) {
@@ -376,6 +409,10 @@
         // the first NaN wins both, as in PyTorch.
         if (contiguous && CONTIGUOUS_REDUCE.has(op)) {
             const outer = first < 0 ? nIn : numel(shape.slice(0, first)), block = first < 0 ? 1 : numel(shape.slice(first, last + 1)), inner = first < 0 ? 1 : numel(shape.slice(last + 1));
+            // The native loop accumulates as O does: rounding every update
+            // when O is the float32 result itself, once on store otherwise.
+            if (nIn >= NATIVE_MIN && NATIVE !== null && NATIVE(N_REDUCE, RED_CODE[op], A, out.data, outer, block, inner, count, O === out.data))
+                return tuple([out, pyShape(finalShape)]);
             let i = 0;
             switch (op) {
                 case "sum": case "mean":
@@ -446,6 +483,7 @@
     // dim as an inline loop and no callback.
     function gatherStrided(O, A, shape, sa, base) {
         const rank = shape.length, n = O.length;
+        if (n >= NATIVE_MIN && NATIVE !== null && NATIVE(N_GATHER, A, O, shape, sa, base)) return;
         if (rank === 0) { if (n) O[0] = A[base]; return; }
         const lastN = shape[rank - 1], lastS = sa[rank - 1], idx = new Array(rank).fill(0);
         let x = base, o = 0;
@@ -474,7 +512,9 @@
         const outShape = p.map((d) => shape[d]);
         const inS = strides(shape), sa = p.map((d) => inS[d]);
         const out = alloc(a.dtype, a.data.length), O = out.data, A = a.data;
-        if (rank === 2 && p[0] === 1 && p[1] === 0) {
+        if (O.length >= NATIVE_MIN && NATIVE !== null && NATIVE(N_GATHER, A, O, outShape, sa, 0)) {
+            // The strided walk, run natively.
+        } else if (rank === 2 && p[0] === 1 && p[1] === 0) {
             // A matrix transpose (every Linear's weight.T): column by column.
             const h = shape[0], w = shape[1];
             for (let j = 0, o = 0; j < w; j++) for (let i = 0, q = j; i < h; i++, q += w) O[o++] = A[q];
@@ -650,6 +690,7 @@
         const row = new Float64Array(n);
         forEachBroadcast(batch, sa, sb, (bi, oa, ob) => {
             const baseA = oa * m * k, baseB = ob * k * n, baseO = bi * m * n;
+            if (NATIVE !== null && NATIVE(N_MATMUL, Ad, Bd, O, baseA, baseB, baseO, m, k, n)) return;
             for (let i = 0; i < m; i++) {
                 row.fill(0);
                 for (let p = 0, ia = baseA + i * k, ib = baseB; p < k; p++, ib += n) {
@@ -671,6 +712,7 @@
         const Lo = L - K + 1; if (Lo < 1) fail(E.RuntimeError, "conv1d: kernel size can't be greater than actual input size");
         const dtype = promote(x.dtype, w.dtype), out = alloc(dtype, B * Oc * Lo), O = out.data, X = x.data, W = w.data;
         const Bi = bias === null ? null : bias.data;
+        if (NATIVE !== null && NATIVE(N_CONV1D, X, W, Bi, O, B, C, L, Oc, K, Lo)) return tuple([out, pyShape([B, Oc, Lo])]);
         for (let b = 0; b < B; b++) for (let o = 0; o < Oc; o++) {
             const bv = Bi === null ? 0 : Bi[o];
             for (let t = 0; t < Lo; t++) {
@@ -685,6 +727,7 @@
         const [B, C, L] = xs, [Oc, , K] = ws, Lo = L - K + 1;
         const gx = alloc(x.dtype, B * C * L), gw = alloc(w.dtype, Oc * C * K), gb = alloc(w.dtype, Oc);
         const GX = gx.data, GW = gw.data, GB = gb.data, X = x.data, W = w.data, G = g.data;
+        if (NATIVE !== null && NATIVE(N_CONV1D_BACKWARD, X, W, G, GX, GW, GB, B, C, L, Oc, K, Lo)) return tuple([gx, gw, gb]);
         for (let b = 0; b < B; b++) for (let o = 0; o < Oc; o++) for (let t = 0; t < Lo; t++) {
             const gv = G[(b * Oc + o) * Lo + t]; if (gv === 0) continue;
             GB[o] += gv;
@@ -712,6 +755,10 @@
         const gw = grad ? alloc(w.dtype, w.data.length) : null;
         const gb = grad ? alloc(w.dtype, O) : null;
         const perGroup = O / groups;
+        if (NATIVE !== null && (grad
+            ? NATIVE(N_CONV2D_BACKWARD, x.data, w.data, grad.data, gx.data, gw.data, gb.data, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, groups, Ho, Wo)
+            : NATIVE(N_CONV2D, x.data, w.data, bias ? bias.data : null, out.data, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, groups, Ho, Wo)))
+            return grad ? tuple([gx,gw,gb]) : tuple([out,pyShape([B,O,Ho,Wo])]);
         for (let b=0; b<B; b++) for (let o=0; o<O; o++) {
             const firstChannel = Math.floor(o/perGroup)*Cg;
             for (let h=0; h<Ho; h++) for (let v=0; v<Wo; v++) {
@@ -736,6 +783,7 @@
         const d = dim < 0 ? dim + shape.length : dim, n = shape[d];
         const outer = numel(shape.slice(0, d)), inner = numel(shape.slice(d + 1));
         const dtype = RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype, out = alloc(dtype, a.data.length), O = out.data, A = a.data;
+        if (NATIVE !== null && NATIVE(N_SOFTMAX, A, O, outer, n, inner, !!log)) return out;
         for (let x = 0; x < outer; x++) for (let r = 0; r < inner; r++) {
             const base = x * n * inner + r;
             let mx = -Infinity; for (let i = 0; i < n; i++) { const v = A[base + i * inner]; if (v > mx) mx = v; }
@@ -814,6 +862,7 @@
         const out = alloc(dtype, numel(shape)), O = out.data;
         const sc = bstrides(cs, shape), sa = bstrides(as_, shape), sb = bstrides(bs, shape);
         const Cd = c.data, Ad = a.data, Bd = b.data;
+        if (O.length >= NATIVE_MIN && NATIVE !== null && NATIVE(N_WHERE, Cd, Ad, Bd, O, shape, sc, sa, sb)) return tuple([out, pyShape(shape)]);
         const rank = shape.length, idx = new Array(rank).fill(0);
         let oc = 0, oa = 0, ob = 0;
         for (let flat = 0; flat < O.length; flat++) {
@@ -1122,6 +1171,7 @@
     function allFinite(s) {
         if (!isFloatDtype(s.dtype)) return true;
         const d = s.data, n = d.length;
+        if (n >= NATIVE_MIN && NATIVE !== null) { const r = NATIVE(N_ALL_FINITE, d); if (r !== null) return r; }
         for (let i = 0; i < n; i++) { const x = d[i]; if (x - x !== 0) return false; }
         return true;
     }
@@ -1131,6 +1181,31 @@
         const num = (v) => jsNumber(v);
         fn("zeros", 2, (a) => alloc(rt.needStr(a[0]), num(a[1])));
         fn("full", 3, (a) => { const s = alloc(rt.needStr(a[0]), num(a[1])); s.data.fill(castValue(s.dtype, num(a[2]))); return s; });
+        // arange(dtype, start, step, n): element i is castValue(start + i * step),
+        // what from_flat gives for the list torch builds (torch.arange checks
+        // that the double arithmetic is exact or is Python's float arithmetic).
+        fn("arange", 4, (a) => { const s = alloc(rt.needStr(a[0]), num(a[3])), O = s.data, d = s.dtype, st = num(a[1]), step = num(a[2]), n = O.length; for (let i = 0; i < n; i++) O[i] = castValue(d, st + i * step); return s; });
+        fn("_set_size_type", 1, (a) => { SIZE = a[0]; return null; });
+        // _shape_eq(a, b): tuple equality of two shapes (tuples or Sizes of
+        // ints), without the rich-comparison dispatch of a tuple subclass.
+        fn("_shape_eq", 2, (a) => {
+            const x = a[0], y = a[1];
+            if (x === y) return true;
+            if (x === null || y === null || typeof x !== "object" || typeof y !== "object"
+                || (x.cls !== T.tuple && (SIZE === null || x.cls !== SIZE)) || (y.cls !== T.tuple && (SIZE === null || y.cls !== SIZE))) return rt.eq(x, y);
+            const p = x.items, q = y.items;
+            if (p.length !== q.length) return false;
+            for (let i = 0; i < p.length; i++) {
+                const u = p[i], v = q[i];
+                if (u === v) continue;
+                if (typeof u === "bigint" && typeof v === "bigint") return false;
+                if (!rt.eq(u, v)) return false;
+            }
+            return true;
+        });
+        // _size(t): torch.Size(t) for a tuple t, as the tuple constructor
+        // builds a subclass instance (`rt.allocInstance`, then its items).
+        fn("_size", 1, (a) => { const v = a[0]; if (SIZE === null || v === null || typeof v !== "object" || v.cls !== T.tuple) fail(E.TypeError, "_size expects a tuple"); return { cls: SIZE, items: v.items.slice(), dict: new Map() }; });
         fn("from_flat", 2, (a) => { const items = a[1].items, s = alloc(rt.needStr(a[0]), items.length); for (let i = 0; i < items.length; i++) s.data[i] = castValue(s.dtype, jsNumber(items[i])); return s; });
         fn("to_list", 1, (a) => {
             const s = needS(a[0]), d = s.data, out = new Array(d.length);
@@ -1158,6 +1233,9 @@
         fn("aversion", 1, (a) => { const s = needS(a[0]); return BigInt(s.version - s.untracked); });
         fn("untrack", 1, (a) => { needS(a[0]).untracked++; return null; });
         fn("all_finite", 1, (a) => allFinite(needS(a[0])));
+        // _native(on): switch the native loops (`vm::py_tensor`) on or off,
+        // returning whether they were on; for comparing the two paths.
+        fn("_native", 1, (a) => { const was = NATIVE !== null; NATIVE = rt.truth(a[0]) ? NATIVE_FN : null; return was; });
         // graph_matmul(a, b, m, k, n, batch=1, a_batch_stride=0, b_batch_stride=0)
         fn("graph_matmul", 8, (a) => graphMatmul(needS(a[0]), needS(a[1]), num(a[2]), num(a[3]), num(a[4]),
             a[5] === undefined ? 1 : num(a[5]), a[6] === undefined ? 0 : num(a[6]), a[7] === undefined ? 0 : num(a[7])), 5);

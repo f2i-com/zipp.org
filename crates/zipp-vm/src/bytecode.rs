@@ -2709,6 +2709,12 @@ pub struct Program {
     /// two modules' same-named exports don't collide; free/builtin references stay
     /// realm-shared. Empty for ordinary scripts / eval.
     pub module_decl_globals: Vec<u32>,
+    /// Set only on the Python frontend's runtime program: the VM then binds
+    /// the reserved global `__zipp_py_native` (the native tensor loops behind
+    /// `_zipp_tensor`, see `vm::py_tensor`). A JavaScript program never has
+    /// it, whatever names it uses.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub python_natives: bool,
 }
 
 /// A compiled class: the constructor func id (runs field inits + user ctor body),

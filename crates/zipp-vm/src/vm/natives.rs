@@ -5269,6 +5269,10 @@ impl<'p> Vm<'p> {
             // a global) needs `&mut Vm`, which it cannot have while the closure is
             // still borrowed from it. Re-entrant `__zippHostCall` therefore sees
             // `host == None` and throws rather than aliasing — the honest failure.
+            // The Python runtime's native tensor loops; `true` when the
+            // kernel ran, `false` when the caller must run its own loop.
+            #[cfg(feature = "python")]
+            PY_TENSOR => self.py_tensor(args)?,
             HOST_CALL => {
                 let kind = self.to_js_string(a0)?;
                 self.preflight_native_iteration_work(args.len().saturating_sub(1) as u64)?;

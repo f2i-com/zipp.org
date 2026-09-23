@@ -2928,6 +2928,23 @@ impl<'p> Vm<'p> {
                 self.bump_global_gen(slot as u32);
             }
         }
+        // The Python runtime's native tensor loops (`vm::py_tensor`): bound
+        // by slot, only in the program the Python frontend built, and never
+        // entered in `builtin_globals`, so no other program (nor an eval)
+        // can resolve the name.
+        #[cfg(feature = "python")]
+        if self.program.python_natives {
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_TENSOR_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let kernel = self.heap.alloc(HeapObj::Native(native::PY_TENSOR));
+                self.globals[slot] = Value::heap(kernel);
+                self.bump_global_gen(slot as u32);
+            }
+        }
         // `get [Symbol.species]` (a shared getter returning `this`) on every
         // species-aware constructor — used by slice/map/etc. and required by the
         // Symbol.species descriptor tests. Globals are assigned above, so

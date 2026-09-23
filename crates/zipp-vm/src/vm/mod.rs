@@ -2963,6 +2963,8 @@ pub(crate) use proxy_regexp::rxstats::dump_scalar_matchall as regexp_scalar_matc
 pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_call_direct_stats;
 pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 pub(crate) mod prof;
+#[cfg(feature = "python")]
+mod py_tensor;
 pub(crate) use prof::dump as prof_stats;
 pub(crate) use temporal::tzdb_version;
 pub(crate) mod decorators;

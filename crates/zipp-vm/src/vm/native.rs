@@ -308,6 +308,14 @@ pub const ANNEXB_REF_ERROR_NAME: &str = "__zipp_annexb_ref_error__";
 /// natives added by ongoing engine work.
 pub const HOST_CALL: u16 = 950;
 pub const HOST_CALL_NAME: &str = "__zippHostCall";
+/// The Python runtime's native tensor loops (`vm::py_tensor`), bound to the
+/// reserved global below only in a program the Python frontend built
+/// (`Program::python_natives`): an ordinary JavaScript program never sees it.
+/// Numbered well clear of the allocated range, like `HOST_CALL`.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_TENSOR: u16 = 1950;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_TENSOR_NAME: &str = "__zipp_py_native";
 
 // ── decorator context closures (proposal-decorators) ────────────────────────
 // Each is a `HeapObj::NativeClosure`, not a bare `Native`: they close over the
@@ -1635,6 +1643,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_ESCAPE => ("escape", 1),
         GLOBAL_UNESCAPE => ("unescape", 1),
         HOST_CALL => (HOST_CALL_NAME, 1),
+        #[cfg(feature = "python")]
+        PY_TENSOR => ("", 0),
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),

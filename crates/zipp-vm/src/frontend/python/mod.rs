@@ -607,7 +607,10 @@ fn runtime_seed() -> R<RuntimeSeed> {
 
 fn compile_runtime_seed() -> R<RuntimeSeed> {
     let runtime = format!("{RUNTIME_BASE}\n{INTEROP_RUNTIME}\n{RUNTIME_ENTRY}");
-    let program = crate::compile_only(&runtime, false)?;
+    let mut program = crate::compile_only(&runtime, false)?;
+    // Only this program — the Python runtime every Python state is built
+    // from — gets the native tensor loops (`vm::py_tensor`).
+    program.python_natives = true;
     let entry_fn = program
         .functions
         .iter()

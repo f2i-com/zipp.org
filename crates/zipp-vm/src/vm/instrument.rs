@@ -1376,6 +1376,60 @@ impl super::Vm<'_> {
         }
     }
 
+    /// Whether a native tensor kernel (`vm::py_tensor`) that will charge
+    /// `cost` steps and hold `transient` bytes of working buffers may run
+    /// now. It declines — and the Python runtime runs its own JavaScript
+    /// loop, which the dispatch loop meters, polls and traces as it always
+    /// has — when a trace is being recorded (native work produces no rows),
+    /// when a terminal state or an abort request is pending, when a finite
+    /// budget cannot cover the whole kernel, or when a finite heap ceiling
+    /// has no room for its buffers (a decline, never a heap exhaustion: the
+    /// JavaScript loop needs no such buffers). So a kernel either fits the
+    /// budget and is charged for it in full, or the budget runs out exactly
+    /// where it would have without natives.
+    #[cfg(feature = "python")]
+    pub(crate) fn native_kernel_admits(&self, cost: u64, transient: usize) -> bool {
+        let Some(rec) = self.instr_rec.as_ref() else {
+            return true;
+        };
+        if rec.terminal_message().is_some() {
+            return false;
+        }
+        if rec.heap_limit != usize::MAX && transient > rec.heap_limit.saturating_sub(self.instrument_heap_estimate()) {
+            return false;
+        }
+        #[cfg(not(feature = "meter-only"))]
+        {
+            if rec.tracing {
+                return false;
+            }
+            if rec
+                .abort
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return false;
+            }
+        }
+        rec.finite_remaining().is_none_or(|left| left >= cost)
+    }
+
+    /// Polled between blocks of a long native kernel: a host abort request
+    /// makes the kernel stop and decline, discarding its unwritten result;
+    /// the runtime's JavaScript loop then observes the abort at its first
+    /// poll. Always false in the wasm meter, which has no abort flag.
+    #[cfg(feature = "python")]
+    pub(crate) fn native_kernel_interrupted(&self) -> bool {
+        #[cfg(not(feature = "meter-only"))]
+        if let Some(rec) = self.instr_rec.as_ref() {
+            return rec
+                .abort
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        false
+    }
+
     /// Charge `n` steps for work that ran neither in the dispatch loop nor in
     /// compiled code — the off-frame method inliner evaluates a callee body in
     /// Rust outside `run_loop`, and `FinalizeObject` charges its per-field

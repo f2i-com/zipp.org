@@ -516,6 +516,7 @@ impl<'p> Vm<'p> {
                                 || is_hidden_key(name)
                                 || name == crate::vm::native::ANNEXB_REF_ERROR_NAME
                                 || name == crate::vm::native::HOST_CALL_NAME
+                                || name == crate::vm::native::PY_TENSOR_NAME
                                 || self.program.lexical_globals.contains(&(i as u32))
                                 || self.deleted_globals.contains(name)
                             {
