@@ -153,6 +153,10 @@ export function float32Data(data) {
   }
   return out;
 }
+/** Readback's rule: every value of an output finite (a host may serve this natively). */
+export function checkFiniteOutput(values) {
+  for (let i = 0; i < values.length; i++) if (!Number.isFinite(values[i])) throw new ComputeError('NUMBER', 'Output contains non-finite values; graph readback requires finite float32');
+}
 /** Cross-entropy targets are indices: every value an integer in [0, classes). */
 export function checkClassTargets(data, classes, op = 'cross_entropy') {
   for (let i = 0; i < data.length; i++) {

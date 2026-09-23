@@ -5,6 +5,10 @@ playground. The JavaScript guest adapter remains an explicit embedder option.
 Added hardware adapter reporting, real Python/WASM acceptance, and a separate
 WebGL texture budget including RGBA32F padding and reduction scratch.
 The native NCA research app now lives in `f2i-com/neuralautomata.com`.
+`scatter_add`'s WGSL no longer writes a vector component through a runtime
+index, which Direct3D's FXC compiler refuses; results are unchanged.
+Readback's finiteness rule is now one exported function, `checkFiniteOutput`
+(graph.mjs), which a host may serve natively.
 
 ## `matmul_fixed`
 

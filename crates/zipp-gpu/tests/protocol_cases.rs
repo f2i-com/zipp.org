@@ -157,8 +157,8 @@ fn execute_time_breakdown() {
     });
 }
 
-/// The native `float32Data` a session's feeds go through returns what
-/// gpu-lab's does and raises what it raises.
+/// The native `float32Data` a program's inputs and a session's feeds go
+/// through returns what gpu-lab's does and raises what it raises.
 #[test]
 fn accelerated_float32_data_matches_gpu_labs() {
     on_big_stack(|| {
@@ -186,6 +186,52 @@ fn accelerated_float32_data_matches_gpu_labs() {
         assert_eq!(
             json,
             r#"{"same":true,"errors":["NUMBER: Values must be finite float32 numbers","NUMBER: Values must be finite float32 numbers","NUMBER: Values must be finite float32 numbers"],"small":[1,"-0",2],"list":"NUMBER"}"#
+        );
+    });
+}
+
+/// The native `checkFiniteOutput` every execution's and session run's
+/// readback goes through accepts what gpu-lab's does and raises what it
+/// raises; and graph.mjs's own calls (validateProgram's inputs) take the
+/// native `float32Data`, not only the modules importing it.
+#[test]
+fn accelerated_readback_check_matches_gpu_labs() {
+    on_big_stack(|| {
+        let Some(mut host) = open() else { return };
+        let json = run_json(
+            &mut host,
+            r#"(() => {
+  const graph = __zgpuModules['src/graph.mjs'];
+  const check = graph.checkFiniteOutput;
+  const data = new Float32Array(1000);
+  for (let i = 0; i < data.length; i++) data[i] = (i % 7 - 3) * 0.37;
+  data[5] = -0; data[6] = 3.4028234663852886e38;
+  const outcome = (values) => { try { check(values); return 'ok'; } catch (e) { return e.code + ': ' + e.message; } };
+  const results = [outcome(data), outcome(new Float32Array([1, 2])), outcome([1, 2, 3]), outcome([1, NaN])];
+  for (const bad of [NaN, Infinity, -Infinity]) { const d = data.slice(); d[999] = bad; results.push(outcome(d)); }
+  // validateProgram's own float32Data: one native scan per large input.
+  const host = globalThis.__zippHostCall;
+  let scans = 0;
+  globalThis.__zippHostCall = (kind, ...rest) => { if (kind === 'gpu.allFinite') scans++; return host(kind, ...rest); };
+  let plan, rejected;
+  try {
+    plan = graph.validateProgram({version: 1, nodes: [{id: 0, op: 'input', shape: [1000], data}], outputs: [{name: 'x', id: 0}]});
+    const bad = data.slice(); bad[500] = NaN;
+    try { graph.validateProgram({version: 1, nodes: [{id: 0, op: 'input', shape: [1000], data: bad}], outputs: [{name: 'x', id: 0}]}); rejected = 'accepted'; }
+    catch (e) { rejected = e.code + ': ' + e.message; }
+  } finally { globalThis.__zippHostCall = host; }
+  const copy = plan.nodes[0].data;
+  const same = copy !== data && copy instanceof Float32Array && copy.every((v, i) => Object.is(v, data[i]));
+  return {results, scans, same, rejected};
+})()"#,
+        );
+        let bad =
+            "NUMBER: Output contains non-finite values; graph readback requires finite float32";
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"results":["ok","ok","ok","{bad}","{bad}","{bad}","{bad}"],"scans":2,"same":true,"rejected":"NUMBER: Values must be finite float32 numbers"}}"#
+            )
         );
     });
 }

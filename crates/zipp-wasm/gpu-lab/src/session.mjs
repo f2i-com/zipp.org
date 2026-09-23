@@ -1,4 +1,4 @@
-import {check, ComputeError, float32Data, checkClassTargets, checkIndices, adamStep, sizeOf} from './graph.mjs';
+import {check, checkFiniteOutput, ComputeError, float32Data, checkClassTargets, checkIndices, adamStep, sizeOf} from './graph.mjs';
 const clock=()=>globalThis.performance?.now()??Date.now();
 
 /**
@@ -162,7 +162,7 @@ export class Session {
         this.impl.readAll?await this.impl.readAll(pending.map(p=>p.h)):await (async()=>{const all=[];for(const p of pending)all.push(await this.impl.read(p.h));return all;})();
       pending.forEach((p,i)=>{
         const v=values[i];
-        for(let j=0;j<v.length;j++)if(!Number.isFinite(v[j]))throw new ComputeError('NUMBER','Output contains non-finite values; graph readback requires finite float32');
+        checkFiniteOutput(v);
         result.steps[p.s].outputs[p.name]={shape:[...nodes[p.id].shape],dtype:'float32',data:this.typedOutputs?(v instanceof Float32Array?v:Float32Array.from(v)):Array.from(v)};
       });
     }catch(e){error=e;}

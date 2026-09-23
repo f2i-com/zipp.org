@@ -179,6 +179,32 @@ pub fn find_adapter(
     Ok(None)
 }
 
+/// [`find_adapter`] on a thread of its own: loading the drivers is most of
+/// the GPU's start-up (creating a Vulkan instance alone takes ~130 ms on an
+/// NVIDIA driver), and the runtime's script compiles meanwhile.
+pub struct Probe {
+    thread: std::thread::JoinHandle<Result<Option<(wgpu::Instance, wgpu::Adapter)>, String>>,
+}
+
+impl Probe {
+    pub fn start(order: Vec<wgpu::Backends>) -> Result<Probe, String> {
+        std::thread::Builder::new()
+            .name("zipp-gpu-probe".into())
+            .spawn(move || find_adapter(&order))
+            .map(|thread| Probe { thread })
+            .map_err(|e| format!("zipp-gpu: the adapter probe did not start: {e}"))
+    }
+
+    /// Wait for the probe. `Ok(None)`: no driver, or only a software one.
+    pub fn finish(self) -> Result<Option<WebGpu>, String> {
+        let found = self
+            .thread
+            .join()
+            .map_err(|_| "zipp-gpu: the adapter probe failed".to_string())??;
+        Ok(found.map(|(instance, adapter)| WebGpu::new(instance, adapter)))
+    }
+}
+
 struct BufferEntry {
     buffer: wgpu::Buffer,
     size: u64,
@@ -328,7 +354,7 @@ impl WebGpu {
             "gpu.requestDevice" => return self.request_device(args),
             "gpu.allFinite" => {
                 // Whether the first `n` float32 values in `__zgpuUp` are all
-                // finite (the driver's fast path for gpu-lab's float32Data).
+                // finite (js/accelerate.js: gpu-lab's float32Data and checkFiniteOutput).
                 let n = int(args, 0)? as usize;
                 let bytes = region(
                     ctx,

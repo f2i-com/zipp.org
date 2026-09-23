@@ -1,4 +1,4 @@
-import {validateProgram, check, ComputeError, DEFAULT_LIMITS} from './graph.mjs';
+import {validateProgram, check, checkFiniteOutput, ComputeError, DEFAULT_LIMITS} from './graph.mjs';
 import {Session} from './session.mjs';
 import {CPUBackend} from './backends/cpu.mjs';
 import {WasmBackend} from './backends/wasm.mjs';
@@ -78,7 +78,7 @@ export class ComputeRuntime {
         // A reshape shares its source storage, so the readback is keyed by the
         // storage root; every output id is in the batch above.
         const values=cache.get(root[o.id]);
-        for(let i=0;i<values.length;i++)if(!Number.isFinite(values[i]))throw new ComputeError('NUMBER','Output contains non-finite values; graph readback requires finite float32');
+        checkFiniteOutput(values);
         // A typed output hands the caller its own Float32Array; the plain form
         // is a list of numbers.
         const data=typedOutputs?(values instanceof Float32Array?values.slice():Float32Array.from(values)):Array.from(values);

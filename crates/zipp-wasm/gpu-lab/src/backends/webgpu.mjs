@@ -146,18 +146,21 @@ const KERNELS = {
   // scatter_add over the base's padded dims (d): the index's padded dims (sa)
   // and the padded axis (g.x); every index element along the axis at this
   // position off the axis that names it adds its source, in ascending order.
+  // The index element at k along the axis is j0 + k * its axis stride (no
+  // vector written through a runtime index: Direct3D's FXC refuses that).
   scatter_add: [['A', 'B', 'C'], each(`let x3 = i % P.d.w; let r3 = i / P.d.w; let x2 = r3 % P.d.z; let r2 = r3 / P.d.z;
   let x = vec4<u32>(r2 / P.d.y, r2 % P.d.y, x2, x3);
   let axis = P.g.x;
+  let onAxis = vec4<bool>(axis == 0u, axis == 1u, axis == 2u, axis == 3u);
   var v = A[i];
-  var within = true;
-  for (var k = 0u; k < 4u; k = k + 1u) { if (k != axis && x[k] >= P.sa[k]) { within = false; } }
-  if (within) {
-    var q = x;
-    for (var k = 0u; k < P.sa[axis]; k = k + 1u) {
-      q[axis] = k;
-      let j = ((q.x * P.sa.y + q.y) * P.sa.z + q.z) * P.sa.w + q.w;
-      if (i32(C[j]) == i32(x[axis])) { v = v + B[j]; }
+  if (!any(select(x >= P.sa, vec4<bool>(false), onAxis))) {
+    let q = select(x, vec4<u32>(0u), onAxis);
+    let j0 = ((q.x * P.sa.y + q.y) * P.sa.z + q.z) * P.sa.w + q.w;
+    let strides = vec4<u32>(P.sa.y * P.sa.z * P.sa.w, P.sa.z * P.sa.w, P.sa.w, 1u);
+    let skip = strides[axis]; let count = P.sa[axis]; let want = i32(x[axis]);
+    for (var k = 0u; k < count; k = k + 1u) {
+      let j = j0 + k * skip;
+      if (i32(C[j]) == want) { v = v + B[j]; }
     }
   }
   O[i] = v;`)],

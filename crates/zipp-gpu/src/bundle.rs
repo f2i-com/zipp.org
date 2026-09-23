@@ -65,8 +65,9 @@ fn identifier(text: &str) -> Option<&str> {
     (end > 0).then(|| &text[..end])
 }
 
-/// One module as `__zgpuModules["path"] = (() => { ...; return {exports}; })();`.
-fn module(path: &str, source: &str) -> Result<String, String> {
+/// One module as `__zgpuModules["path"] = (() => { ...; return {exports}; })();`,
+/// each of `inside` run in the module's scope after its body.
+fn module(path: &str, source: &str, inside: &[&str]) -> Result<String, String> {
     let mut body = String::with_capacity(source.len() + 256);
     let mut exports: Vec<String> = Vec::new();
     for line in source.lines() {
@@ -119,6 +120,10 @@ fn module(path: &str, source: &str) -> Result<String, String> {
         body.push_str(&line.replace("import.meta.url", "\"zipp-gpu:///gpu-lab/\""));
         body.push('\n');
     }
+    for script in inside {
+        body.push_str(script);
+        body.push('\n');
+    }
     Ok(format!(
         "__zgpuModules[{path:?}] = (() => {{\n{body}return {{{}}};\n}})();\n",
         exports.join(", ")
@@ -130,17 +135,21 @@ pub fn bundle(modules: &[&[Module]]) -> Result<String, String> {
     bundle_with(modules, &[])
 }
 
-/// [`bundle`], with each `after` script run right after the module it names
-/// (before any later module binds its imports from that one).
-pub fn bundle_with(modules: &[&[Module]], after: &[(&str, &str)]) -> Result<String, String> {
+/// [`bundle`], with each `inside` script run in the scope of the module it
+/// names, after that module's body and before it returns its exports. A
+/// script there may rebind the module's own top-level functions: the
+/// module's internal calls, its exports and every later importer then all
+/// see the new one.
+pub fn bundle_with(modules: &[&[Module]], inside: &[(&str, &str)]) -> Result<String, String> {
     let mut out = String::from("var __zgpuModules = Object.create(null);\n");
     for list in modules {
         for (path, source) in list.iter() {
-            out.push_str(&module(path, source)?);
-            for (_, script) in after.iter().filter(|(p, _)| p == path) {
-                out.push_str(script);
-                out.push('\n');
-            }
+            let scripts: Vec<&str> = inside
+                .iter()
+                .filter(|(p, _)| p == path)
+                .map(|(_, script)| *script)
+                .collect();
+            out.push_str(&module(path, source, &scripts)?);
         }
     }
     Ok(out)
@@ -154,10 +163,11 @@ mod tests {
         let text = module(
             "src/backends/x.mjs",
             "import {check, ComputeError} from '../graph.mjs';\nexport class A {}\nexport async function f() {}\nexport const K = 1;\nconst u = import.meta.url;\n",
+            &["f = g;"],
         )
         .unwrap();
         assert!(text.contains("const {check, ComputeError} = __zgpuModules[\"src/graph.mjs\"];"));
-        assert!(text.contains("return {A, f, K};"));
+        assert!(text.contains("f = g;\nreturn {A, f, K};"));
         assert!(!text.contains("export "));
         assert!(!text.contains("import.meta"));
     }
@@ -169,8 +179,8 @@ mod tests {
     }
     #[test]
     fn refuses_what_it_cannot_bundle() {
-        assert!(module("a.mjs", "import * as x from './b.mjs';\n").is_err());
-        assert!(module("a.mjs", "export default 1;\n").is_err());
-        assert!(module("a.mjs", "import {a as b} from './b.mjs';\n").is_err());
+        assert!(module("a.mjs", "import * as x from './b.mjs';\n", &[]).is_err());
+        assert!(module("a.mjs", "export default 1;\n", &[]).is_err());
+        assert!(module("a.mjs", "import {a as b} from './b.mjs';\n", &[]).is_err());
     }
 }

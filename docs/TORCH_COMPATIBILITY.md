@@ -299,7 +299,7 @@ medians over 15 calls, 7 runs for the eight-step row):
 | WebGPU | 74.4 ms | 5.1 ms | 1.84 ms |
 | WebGL2 | 88.8 ms | 3.3 ms | 2.24 ms |
 | WebAssembly | 73.7 ms | 4.9 ms | 3.63 ms |
-| Native Zipp, WebGPU over wgpu/Vulkan | ≈154 ms | ≈3.9 ms | ≈3.5 ms |
+| Native Zipp, WebGPU over wgpu/Vulkan | ≈26 ms | ≈2.7 ms | ≈2.2 ms |
 
 Of a `compiled()` call about 34 ms is the guest recording and validating the
 step (every input storage is scanned for finiteness in the interpreter), the
@@ -407,8 +407,10 @@ results within the tolerances below. The browser playground remains
 asynchronous.
 
 **Starting and choosing the GPU.** The GPU starts on a program's first graph
-(adapter discovery and runtime start-up, about 250 ms), so a program that never
-submits one pays nothing. Software rasterizers (WARP, lavapipe) are not used.
+(adapter discovery and runtime start-up, about 200 ms, mostly the driver
+loading; on Direct3D 12 the first graph also compiles its kernels with the
+system's FXC compiler, about a second for a training step), so a program that
+never submits one pays nothing. Software rasterizers (WARP, lavapipe) are not used.
 `--no-gpu` (`zipp py --no-gpu main.py`) or `ZIPP_GPU=0` keeps the CPU evaluator.
 `ZIPP_GPU_BACKEND=vulkan|dx12|metal` picks the backend; the default order is
 Vulkan, then Direct3D 12, then Metal. `ZIPP_GPU_LOG=1` names the adapter when it
@@ -421,8 +423,7 @@ is re-evaluated on the CPU. A prepared session that fails on the GPU before its
 first step has run moves to the CPU (`prepared.backend` becomes `cpu-python`),
 unless it was prepared with `backend="webgpu"`. A failure after steps have run on
 the device is raised as the CPU evaluator raises it, and poisons the session.
-More than 16 live sessions, and on Direct3D 12 without `dxcompiler.dll` on `PATH`
-the index_add/scatter_add kernels, run on the CPU. Runs longer than 64 steps are
+More than 16 live sessions run on the CPU. Runs longer than 64 steps are
 split transparently.
 
 **Limits.** The device bounds a graph: a tensor up to the largest storage binding
@@ -430,7 +431,8 @@ split transparently.
 protocol's 512 nodes and 64 outputs still apply.
 
 **Accuracy.** gpu-lab's browser protocol cases pass 276/276 on the native backend
-with the browser harness's tolerances. The 112 exact cases (masks, where,
+(Vulkan, and Direct3D 12 with its default FXC compiler) with the browser
+harness's tolerances. The 112 exact cases (masks, where,
 dropout's `uniform` draws, slices, index_select, gather, and index_add/scatter_add
 accumulation order) match the JavaScript reference bit for bit. The Python
 fixtures print the same lines on the GPU as on the CPU evaluator: losses and
@@ -441,13 +443,15 @@ the protocol v3/v4 families.
 
 | Model | `compiled()` per call | `prepared.step` | `prepared.steps`, 8 per run, per step | CPU evaluator, `compiled()` |
 |---|---|---|---|---|
-| 784-256-10, batch 64, Adam | ≈154 ms | ≈3.9 ms | ≈3.5 ms | ≈2.8-4.4 s |
-| 784-1024-1024-10, batch 256, Adam | 1,854 ms | 9.0 ms | 8.2 ms | 118 s |
-| 784-2048-2048-10, batch 1024, Adam | 4,886 ms | 23.6 ms | 20.6 ms | 1,487 s |
+| 784-256-10, batch 64, Adam | ≈26 ms | ≈2.7 ms | ≈2.2 ms | ≈2.8-4.4 s |
+| 784-1024-1024-10, batch 256, Adam | 106 ms | 5.0 ms | 4.8 ms | 118 s |
+| 784-2048-2048-10, batch 1024, Adam | 314 ms | 19.0 ms | 17.1 ms | 1,487 s |
 
 A per-call `compiled()` uploads and reads back every weight, gradient and moment.
-The runtime's per-element JavaScript checks on those tensors dominate it, so it
-is about twice the browser's. Prepared sessions are where the GPU pays off.
+gpu-lab's finiteness checks on those tensors run natively, so a call costs about
+a third of the browser's (74 ms); what remains is the Python recording (~12 ms),
+copying the tensors, and the GPU work. Prepared sessions are where the GPU pays
+off.
 Reproduce with `crates/zipp-cli/tests/native_gpu/bench.py`.
 
 ## Compatibility boundaries

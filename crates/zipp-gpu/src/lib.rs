@@ -6,10 +6,12 @@
 //! trusted ZIPP JavaScript state runs gpu-lab's runtime *unchanged* (its
 //! sources are compiled into the binary, see [`bundle`]), and the WebGPU API
 //! that runtime calls is a small shim (`js/webgpu-shim.js`) over wgpu
-//! ([`device`]), which drives Vulkan, Direct3D 12 or Metal. One helper,
-//! gpu-lab's `float32Data` as the session module imports it, is served by a
-//! native finiteness scan for Float32Array feeds (`js/accelerate.js`: same
-//! results, same errors, a fraction of this engine's per-element loop cost).
+//! ([`device`]), which drives Vulkan, Direct3D 12 or Metal. Two of gpu-lab's
+//! helpers, `float32Data` (taking ownership of an input) and
+//! `checkFiniteOutput` (readback's finiteness rule), are served by a native
+//! finiteness scan for Float32Arrays (`js/accelerate.js`, rebound in
+//! graph.mjs's own scope: same results, same errors, a fraction of this
+//! engine's per-element loop cost).
 //!
 //! [`GpuHost::open`] finds a hardware adapter and brings the runtime up on
 //! it; `Ok(None)` means there is none (no driver, a software rasterizer only),
@@ -107,14 +109,18 @@ impl GpuHost {
     /// report why).
     pub fn open(options: &GpuOptions) -> Result<Option<GpuHost>, String> {
         let order = device::backend_order(options.backend.as_deref())?;
-        let Some((instance, adapter)) = device::find_adapter(&order)? else {
+        // The drivers are most of the start-up: the adapter is found on
+        // another thread while this one compiles the runtime.
+        let probe = device::Probe::start(order)?;
+        let state = Self::compile(options);
+        let Some(gpu) = probe.finish()? else {
             return Ok(None);
         };
-        Self::start(device::WebGpu::new(instance, adapter), options).map(Some)
+        Self::start(gpu, state?, options).map(Some)
     }
 
-    fn start(gpu: device::WebGpu, options: &GpuOptions) -> Result<GpuHost, String> {
-        let summary = gpu.summary.clone();
+    /// gpu-lab's runtime, the shim and the driver as one compiled script.
+    fn compile(options: &GpuOptions) -> Result<ScriptState, String> {
         let mut modules: Vec<&[bundle::Module]> = vec![bundle::RUNTIME];
         if options.with_cases {
             modules.push(bundle::CASES);
@@ -123,8 +129,16 @@ impl GpuHost {
             "{SHIM}\n{}\n{DRIVER}\n",
             bundle::bundle_with(&modules, &[("src/graph.mjs", ACCELERATE)])?
         );
-        let mut state = zipp_vm::embed::compile_script(&source)
-            .map_err(|e| format!("zipp-gpu: the runtime does not compile: {e}"))?;
+        zipp_vm::embed::compile_script(&source)
+            .map_err(|e| format!("zipp-gpu: the runtime does not compile: {e}"))
+    }
+
+    fn start(
+        gpu: device::WebGpu,
+        mut state: ScriptState,
+        options: &GpuOptions,
+    ) -> Result<GpuHost, String> {
+        let summary = gpu.summary.clone();
         let gpu = Rc::new(RefCell::new(gpu));
         let served = gpu.clone();
         state.set_host_call_ctx(Box::new(move |ctx, kind, args| {
