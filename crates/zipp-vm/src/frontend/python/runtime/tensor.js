@@ -24,7 +24,7 @@
     const Storage = rt.newType("_Storage", [rt.ObjectType], new Map(), "_zipp_tensor");
     const ARRAY = { float32: Float32Array, float64: Float64Array, int64: Float64Array, int32: Float64Array, bool: Uint8Array, uint8: Uint8Array };
     const RANK = { bool: 0, uint8: 1, int32: 2, int64: 3, float32: 4, float64: 5 };
-    function make(dtype, data) { if (ARRAY[dtype] === undefined) fail(E.TypeError, "unknown dtype " + dtype); return { cls: Storage, dtype: dtype, data: data, version: 0 }; }
+    function make(dtype, data) { if (ARRAY[dtype] === undefined) fail(E.TypeError, "unknown dtype " + dtype); return { cls: Storage, dtype: dtype, data: data, version: 0, untracked: 0 }; }
     function alloc(dtype, n) { return make(dtype, new ARRAY[dtype](n)); }
     function isStorage(v) { return v !== null && typeof v === "object" && v.cls === Storage; }
     function needS(v, what) { if (!isStorage(v)) fail(E.TypeError, (what || "argument") + " must be a tensor storage"); return v; }
@@ -103,8 +103,24 @@
         pow: (x, y) => Math.pow(x, y), max: (x, y) => (x !== x || y !== y) ? NaN : Math.max(x, y), min: (x, y) => (x !== x || y !== y) ? NaN : Math.min(x, y),
         eq: (x, y) => (x === y ? 1 : 0), ne: (x, y) => (x !== y ? 1 : 0), lt: (x, y) => (x < y ? 1 : 0), le: (x, y) => (x <= y ? 1 : 0), gt: (x, y) => (x > y ? 1 : 0), ge: (x, y) => (x >= y ? 1 : 0),
         and: (x, y) => (x && y ? 1 : 0), or: (x, y) => (x || y ? 1 : 0), xor: (x, y) => ((x ? 1 : 0) ^ (y ? 1 : 0)),
-        floordiv: (x, y) => Math.floor(x / y), mod: (x, y) => x - Math.floor(x / y) * y,
+        floordiv: (x, y) => Math.floor(x / y), mod: (x, y) => x - Math.floor(x / y) * y, fmod: (x, y) => x % y,
+        bitand: (x, y) => bitwise(x, y, 0), bitor: (x, y) => bitwise(x, y, 1), bitxor: (x, y) => bitwise(x, y, 2),
+        lshift: (x, y) => x * Math.pow(2, y), rshift: (x, y) => Math.floor(x / Math.pow(2, y)),
+        atan2: Math.atan2, ipow: intPow,
     };
+    // Integer bitwise ops on the float64 storage of int64 values: 32-bit JS
+    // operators when both fit, BigInt otherwise (exact up to 2**53 either way).
+    function bitwise(x, y, kind) {
+        if ((x | 0) === x && (y | 0) === y) return kind === 0 ? x & y : kind === 1 ? x | y : x ^ y;
+        const a = BigInt(x), b = BigInt(y);
+        return Number(kind === 0 ? a & b : kind === 1 ? a | b : a ^ b);
+    }
+    // An integer power stays an integer: a negative exponent gives 1 for a
+    // base of 1, +-1 for -1 and 0 otherwise (truncated 1/x**n), as PyTorch's powi.
+    function intPow(x, y) {
+        if (y < 0) return x === 1 ? 1 : x === -1 ? (y % 2 === 0 ? 1 : -1) : 0;
+        return Math.pow(x, y);
+    }
     const COMPARE = new Set(["eq", "ne", "lt", "le", "gt", "ge", "and", "or", "xor"]);
     // How many trailing elements `part` tiles over `shape` with: its
     // numel when `part` (leading 1s dropped) is exactly a suffix of `shape`,
@@ -164,12 +180,18 @@
     // A shape tuple the caller passed in, when the result has exactly that
     // shape: the kernel hands it back instead of building an equal one.
     function tupleShape(v) { return v !== undefined && (v.cls === T.tuple || rt.isSubclass(v.cls, T.tuple)); }
-    function binary(op, a, ashape, b, bshape, apy, bpy) {
-        const f = BIN[op]; if (f === undefined) fail(E.ValueError, "unknown op " + op);
+    // `want`: the result dtype Python's type promotion chose (null: promote
+    // the operands' dtypes). The kernel computes in double precision and
+    // rounds on store.
+    function binary(op, a, ashape, b, bshape, apy, bpy, want) {
         const shape = broadcastShape(ashape, bshape);
-        let dtype = COMPARE.has(op) ? "bool" : promote(a.dtype, b.dtype);
-        if (op === "div" && RANK[dtype] < RANK.float32) dtype = "float32";
-        if (op === "pow" && RANK[dtype] < RANK.float32 && b.dtype !== "int64") dtype = "float32";
+        let dtype = COMPARE.has(op) ? "bool" : (want ? want : promote(a.dtype, b.dtype));
+        if ((op === "div" || op === "atan2") && RANK[dtype] < RANK.float32) dtype = "float32";
+        // An integer result: powers stay integral (the other arithmetic is
+        // exact on integers already).
+        if (op === "pow" && RANK[dtype] < RANK.float32) op = "ipow";
+        const f = BIN[op]; if (f === undefined) fail(E.ValueError, "unknown op " + op);
+        if (dtype === "bool" && !COMPARE.has(op)) return binaryBool(f, a, ashape, b, bshape, shape);
         const n = numel(shape), out = alloc(dtype, n), A = a.data, Bd = b.data, O = out.data;
         // Every layout below visits elements in the same order and applies
         // the same double-precision operation as the closure form, and the
@@ -194,13 +216,75 @@
         }
         return tuple([out, outShape === null ? pyShape(shape) : outShape]);
     }
+    // Arithmetic with a bool result: computed like the others, then any
+    // nonzero stores as 1 (True + True is True).
+    function binaryBool(f, a, ashape, b, bshape, shape) {
+        const out = alloc("bool", numel(shape)), O = out.data, A = a.data, Bd = b.data;
+        forEachBroadcast(shape, bstrides(ashape, shape), bstrides(bshape, shape), (o, x, y) => { O[o] = f(A[x], Bd[y]) ? 1 : 0; });
+        return tuple([out, pyShape(shape)]);
+    }
     const UN = {
         neg: (x) => -x, exp: Math.exp, log: Math.log, tanh: Math.tanh, sigmoid: (x) => 1 / (1 + Math.exp(-x)),
-        silu: (x) => x / (1 + Math.exp(-x)), relu: (x) => (x > 0 ? x : 0), sqrt: Math.sqrt, square: (x) => x * x,
+        silu: (x) => x / (1 + Math.exp(-x)), relu: (x) => (x > 0 || x !== x ? x : 0), sqrt: Math.sqrt, square: (x) => x * x,
         abs: Math.abs, sign: (x) => (x > 0 ? 1 : x < 0 ? -1 : 0), floor: Math.floor, ceil: Math.ceil, round: (x) => { const r = Math.round(x); return (Math.abs(x % 1) === 0.5 && r % 2 !== 0) ? r - 1 : r; }, // Math.round breaks ties upward; odd means one too high
         isfinite: (x) => (Number.isFinite(x) ? 1 : 0), isnan: (x) => (x !== x ? 1 : 0), not: (x) => (x ? 0 : 1), reciprocal: (x) => 1 / x, rsqrt: (x) => 1 / Math.sqrt(x), log1p: Math.log1p, expm1: Math.expm1,
         gelu: (x) => x * cdf(x), gelu_grad: geluGrad, softplus: (x) => (x > 20 ? x : Math.log1p(Math.exp(x))), sin: Math.sin, cos: Math.cos,
+        tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan, sinh: Math.sinh, cosh: Math.cosh, asinh: Math.asinh, acosh: Math.acosh, atanh: Math.atanh,
+        log2: Math.log2, log10: Math.log10, exp2: (x) => Math.pow(2, x), erf: erf, erfc: erfc, erfinv: erfinv, trunc: Math.trunc, frac: (x) => x - Math.trunc(x),
+        isinf: (x) => (x === Infinity || x === -Infinity ? 1 : 0), isposinf: (x) => (x === Infinity ? 1 : 0), isneginf: (x) => (x === -Infinity ? 1 : 0),
+        bitnot: (x) => -x - 1, signbit: (x) => (x < 0 || Object.is(x, -0) ? 1 : 0),
     };
+    // erf to double precision: below 3 the all-positive series
+    // 2/sqrt(pi) e^(-x^2) sum 2^n x^(2n+1) / (2n+1)!! (no cancellation),
+    // above it erfc's continued fraction.
+    function erfcFrac(x) {
+        // Lentz's method on erfc(x) = e^(-x^2)/sqrt(pi) / (x + 1/2 / (x + 1 / (x + 3/2 / (x + ...)))).
+        const tiny = 1e-300;
+        let f = x, C = x, D = 0;
+        for (let n = 1; n < 300; n++) {
+            const an = n / 2;
+            D = x + an * D; if (D === 0) D = tiny; D = 1 / D;
+            C = x + an / C; if (C === 0) C = tiny;
+            const delta = C * D; f *= delta;
+            if (Math.abs(delta - 1) < 1e-16) break;
+        }
+        return Math.exp(-x * x) / Math.sqrt(Math.PI) / f;
+    }
+    function erf(x) {
+        if (x !== x) return NaN;
+        const a = Math.abs(x);
+        if (a >= 6) return x > 0 ? 1 : -1;
+        if (a < 3) {
+            const t = x * x;
+            let term = x, sum = x;
+            for (let n = 1; n < 200; n++) { term *= 2 * t / (2 * n + 1); sum += term; if (Math.abs(term) < 1e-17 * Math.abs(sum)) break; }
+            return 2 / Math.sqrt(Math.PI) * Math.exp(-t) * sum;
+        }
+        const c = erfcFrac(a);
+        return x > 0 ? 1 - c : c - 1;
+    }
+    function erfc(x) {
+        if (x !== x) return NaN;
+        if (x >= 3) return x > 27 ? 0 : erfcFrac(x);
+        return 1 - erf(x);
+    }
+    // Giles' single-precision erfinv, then Newton steps on the double erf.
+    function erfinv(y) {
+        if (y !== y || y < -1 || y > 1) return NaN;
+        if (y === 1) return Infinity; if (y === -1) return -Infinity;
+        let w = -Math.log((1 - y) * (1 + y)), x;
+        if (w < 5) {
+            w -= 2.5;
+            let p = 2.81022636e-08; p = 3.43273939e-07 + p * w; p = -3.5233877e-06 + p * w; p = -4.39150654e-06 + p * w; p = 0.00021858087 + p * w;
+            p = -0.00125372503 + p * w; p = -0.00417768164 + p * w; p = 0.246640727 + p * w; p = 1.50140941 + p * w; x = p * y;
+        } else {
+            w = Math.sqrt(w) - 3;
+            let p = -0.000200214257; p = 0.000100950558 + p * w; p = 0.00134934322 + p * w; p = -0.00367342844 + p * w; p = 0.00573950773 + p * w;
+            p = -0.0076224613 + p * w; p = 0.00943887047 + p * w; p = 1.00167406 + p * w; p = 2.83297682 + p * w; x = p * y;
+        }
+        for (let i = 0; i < 3; i++) { const e = erf(x) - y, d = 2 / Math.sqrt(Math.PI) * Math.exp(-x * x); if (d === 0 || e === 0) break; x -= e / d; }
+        return x;
+    }
     // The standard normal CDF behind GELU (the exact-erf form, F.gelu's
     // default), with the one erf approximation every zipp_gpu backend
     // shares (gpu-lab's kernel-math.mjs, the Python reference's `_cdf`): an
@@ -226,17 +310,20 @@
     }
     // d/dx gelu(x) = cdf(x) + x * pdf(x).
     function geluGrad(x) { return cdf(x) + x * 0.3989422804014327 * Math.exp(-0.5 * x * x); }
+    const BOOL_UNARY = new Set(["isfinite", "isnan", "not", "isinf", "isposinf", "isneginf", "signbit"]);
+    const FLOAT_UNARY = new Set(["exp", "log", "tanh", "sigmoid", "silu", "sqrt", "reciprocal", "log1p", "expm1", "gelu", "gelu_grad", "softplus", "sin", "cos", "rsqrt",
+        "tan", "asin", "acos", "atan", "sinh", "cosh", "asinh", "acosh", "atanh", "log2", "log10", "exp2", "erf", "erfc", "erfinv"]);
     function unary(op, a, p1, p2) {
         let f = UN[op];
         if (op === "clamp") { const lo = p1 === null ? -Infinity : jsNumber(p1), hi = p2 === null ? Infinity : jsNumber(p2); f = (x) => (x < lo ? lo : x > hi ? hi : x); }
         if (f === undefined) fail(E.ValueError, "unknown op " + op);
-        const dtype = op === "isfinite" || op === "isnan" || op === "not" ? "bool" : (["exp", "log", "tanh", "sigmoid", "silu", "sqrt", "reciprocal", "log1p", "expm1", "gelu", "gelu_grad", "softplus", "sin", "cos", "rsqrt"].includes(op) && RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype);
+        const dtype = BOOL_UNARY.has(op) ? "bool" : (FLOAT_UNARY.has(op) && RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype);
         const out = alloc(dtype, a.data.length), A = a.data, O = out.data, n = O.length;
         // The hot activations and their gradients inline; the expressions
         // are the table's own.
         switch (op) {
             case "neg": for (let i = 0; i < n; i++) O[i] = -A[i]; break;
-            case "relu": for (let i = 0; i < n; i++) { const x = A[i]; O[i] = x > 0 ? x : 0; } break;
+            case "relu": for (let i = 0; i < n; i++) { const x = A[i]; O[i] = x > 0 || x !== x ? x : 0; } break;
             case "exp": for (let i = 0; i < n; i++) O[i] = Math.exp(A[i]); break;
             case "log": for (let i = 0; i < n; i++) O[i] = Math.log(A[i]); break;
             case "tanh": for (let i = 0; i < n; i++) O[i] = Math.tanh(A[i]); break;
@@ -251,7 +338,11 @@
     }
     // ---- reductions ------------------------------------------------------------------
     const CONTIGUOUS_REDUCE = new Set(["sum", "mean", "prod", "max", "min", "argmax", "argmin", "all", "any"]);
-    function reduce(op, a, shape, dims, keepdim) {
+    // `precise`: accumulate in double precision and round once on store
+    // (eager torch reductions). Without it a float32 reduction rounds every
+    // partial sum, the index-order float32 accumulation the zipp_gpu graph
+    // reference defines for an axis sum.
+    function reduce(op, a, shape, dims, keepdim, precise) {
         const rank = shape.length;
         const red = dims === null ? null : ints(dims);
         if (red !== null) for (let i = 0; i < red.length; i++) { const d = red[i] < 0 ? red[i] + rank : red[i]; if (d < 0 || d >= rank) fail(E.IndexError, "Dimension out of range"); red[i] = d; }
@@ -264,10 +355,15 @@
         const nOut = numel(keptShape), nIn = numel(shape);
         const argOp = op === "argmax" || op === "argmin";
         const dtype = argOp ? "int64" : (op === "all" || op === "any") ? "bool" : (op === "mean" && RANK[a.dtype] < RANK.float32) ? "float32" : a.dtype;
-        const out = alloc(dtype, nOut), O = out.data, A = a.data;
+        const out = alloc(dtype, nOut), A = a.data;
+        // Reductions accumulate in double precision (O) and round once when
+        // stored into the result's dtype: a precise float32 sum of a million
+        // elements keeps float32 accuracy, and a uint8/bool max/min can
+        // start from +-Infinity.
+        const O = dtype === "float64" || dtype === "int64" || (dtype === "float32" && !precise) ? out.data : new Float64Array(nOut);
         const init = op === "sum" || op === "mean" ? 0 : op === "prod" ? 1 : op === "max" || op === "argmax" ? -Infinity : op === "min" || op === "argmin" ? Infinity : op === "all" ? 1 : 0;
         const best = argOp ? new Float64Array(nOut).fill(init) : null;
-        O.fill(init);
+        O.fill(argOp ? 0 : init);
         const count = nIn / (nOut || 1);
         // Reduced dims that form one contiguous block (every dim, a leading
         // batch dim, a trailing feature dim): outer x block x inner loops,
@@ -276,7 +372,8 @@
         let first = -1, last = -1, contiguous = true;
         for (let d = 0; d < rank; d++) if (isRed[d]) { if (first < 0) first = d; else if (last !== d - 1) contiguous = false; last = d; }
         // An arg reduction's index is the input's position within the
-        // reduced block, which is `r`.
+        // reduced block, which is `r`. NaN is the maximum and the minimum:
+        // the first NaN wins both, as in PyTorch.
         if (contiguous && CONTIGUOUS_REDUCE.has(op)) {
             const outer = first < 0 ? nIn : numel(shape.slice(0, first)), block = first < 0 ? 1 : numel(shape.slice(first, last + 1)), inner = first < 0 ? 1 : numel(shape.slice(last + 1));
             let i = 0;
@@ -295,10 +392,10 @@
                     for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) { const v = A[i++]; if (v < O[o] || v !== v) O[o] = v; }
                     break;
                 case "argmax":
-                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) { const v = A[i++]; if (v > best[o]) { best[o] = v; O[o] = r; } }
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) { const v = A[i++], b = best[o]; if (v > b || (v !== v && b === b)) { best[o] = v; O[o] = r; } }
                     break;
                 case "argmin":
-                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) { const v = A[i++]; if (v < best[o]) { best[o] = v; O[o] = r; } }
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) { const v = A[i++], b = best[o]; if (v < b || (v !== v && b === b)) { best[o] = v; O[o] = r; } }
                     break;
                 case "all":
                     for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) if (!A[i++]) O[o] = 0;
@@ -307,6 +404,7 @@
                     for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) if (A[i++]) O[o] = 1;
                     break;
             }
+            if (O !== out.data) out.data.set(O);
             return tuple([out, pyShape(finalShape)]);
         }
         // Map every input index to its output offset.
@@ -319,8 +417,8 @@
                 case "prod": O[oo] *= x; break;
                 case "max": if (x > O[oo] || x !== x) O[oo] = x; break;
                 case "min": if (x < O[oo] || x !== x) O[oo] = x; break;
-                case "argmax": if (x > best[oo]) { best[oo] = x; O[oo] = redIndex(pos, isRed, shape); } break;
-                case "argmin": if (x < best[oo]) { best[oo] = x; O[oo] = redIndex(pos, isRed, shape); } break;
+                case "argmax": { const b = best[oo]; if (x > b || (x !== x && b === b)) { best[oo] = x; O[oo] = redIndex(pos, isRed, shape); } break; }
+                case "argmin": { const b = best[oo]; if (x < b || (x !== x && b === b)) { best[oo] = x; O[oo] = redIndex(pos, isRed, shape); } break; }
                 case "all": if (!x) O[oo] = 0; break;
                 case "any": if (x) O[oo] = 1; break;
                 default: fail(E.ValueError, "unknown reduction " + op);
@@ -333,6 +431,7 @@
             }
         }
         if (op === "mean") for (let i = 0; i < O.length; i++) O[i] /= count;
+        if (O !== out.data) out.data.set(O);
         return tuple([out, pyShape(finalShape)]);
     }
     // The flat index within the reduced dims (row-major over them).
@@ -356,6 +455,19 @@
             for (; d >= 0; d--) { idx[d]++; x += sa[d]; if (idx[d] < shape[d]) break; x -= sa[d] * shape[d]; idx[d] = 0; }
             if (d < 0) break;
         }
+    }
+    // A contiguous copy of the elements a (storage offset, strides) view
+    // reads: PyTorch checkpoints store non-contiguous tensors that way.
+    function strided(a, shape, st, offset) {
+        const n = numel(shape);
+        if (n > 0) {
+            let lo = offset, hi = offset;
+            for (let d = 0; d < shape.length; d++) { if (st[d] < 0) fail(E.RuntimeError, "negative strides are not supported"); hi += (shape[d] - 1) * st[d]; }
+            if (lo < 0 || hi >= a.data.length) fail(E.RuntimeError, "setStorage: sizes " + JSON.stringify(shape) + ", strides " + JSON.stringify(st) + " and storage offset " + offset + " are out of bounds for storage of size " + a.data.length);
+        }
+        const out = alloc(a.dtype, n);
+        if (n > 0) gatherStrided(out.data, a.data, shape, st, offset);
+        return out;
     }
     function permute(a, shape, perm) {
         const p = ints(perm), rank = shape.length;
@@ -633,6 +745,33 @@
         }
         return out;
     }
+    // A running reduction along `dim`, accumulated in double precision and
+    // rounded on store. cummax/cummin also return the index of each running
+    // extreme (the latest one on ties, and NaN propagating, as PyTorch).
+    function scan(op, a, shape, dim) {
+        const d = dim < 0 ? dim + shape.length : dim, n = shape.length === 0 ? 1 : shape[d];
+        const outer = shape.length === 0 ? 1 : numel(shape.slice(0, d)), inner = shape.length === 0 ? 1 : numel(shape.slice(d + 1));
+        const out = alloc(a.dtype, a.data.length), O = out.data, A = a.data;
+        const arg = op === "cummax" || op === "cummin", idx = arg ? alloc("int64", a.data.length) : null, I = arg ? idx.data : null;
+        for (let x = 0; x < outer; x++) for (let r = 0; r < inner; r++) {
+            const base = x * n * inner + r;
+            let acc = op === "cumprod" ? 1 : op === "logcumsumexp" ? -Infinity : 0, at = 0;
+            for (let i = 0; i < n; i++) {
+                const p = base + i * inner, v = A[p];
+                switch (op) {
+                    case "cumsum": acc += v; break;
+                    case "cumprod": acc *= v; break;
+                    case "cummax": if (i === 0 || acc !== acc) { if (i === 0) { acc = v; at = 0; } } else if (v >= acc || v !== v) { acc = v; at = i; } break;
+                    case "cummin": if (i === 0 || acc !== acc) { if (i === 0) { acc = v; at = 0; } } else if (v <= acc || v !== v) { acc = v; at = i; } break;
+                    case "logcumsumexp": { const m = Math.max(acc, v); acc = m === -Infinity ? -Infinity : m === Infinity ? Infinity : m + Math.log(Math.exp(acc - m) + Math.exp(v - m)); break; }
+                    default: fail(E.ValueError, "unknown scan " + op);
+                }
+                O[p] = acc;
+                if (arg) I[p] = at;
+            }
+        }
+        return arg ? tuple([out, idx]) : out;
+    }
     // Stable merge sort of indices along `dim`.
     function argsort(a, shape, dim, descending) {
         const d = dim < 0 ? dim + shape.length : dim, n = shape[d];
@@ -654,7 +793,9 @@
                 let i = lo, j = mid, k = lo;
                 while (i < mid && j < hi) {
                     const a = keys[idx[i]], b = keys[idx[j]];
-                    const takeLeft = desc ? !(b > a) : !(b < a);
+                    // NaN is the largest value (last ascending, first
+                    // descending), as PyTorch sorts; ties keep their order.
+                    const takeLeft = a !== a ? (desc || b !== b) : b !== b ? !desc : desc ? !(b > a) : !(b < a);
                     tmp[k++] = takeLeft ? idx[i++] : idx[j++];
                 }
                 while (i < mid) tmp[k++] = idx[i++];
@@ -668,8 +809,8 @@
         for (let i = 0; i < A.length; i++) { const j = A[i]; if (j < 0 || j >= n) fail(E.RuntimeError, "Class values must be smaller than num_classes."); O[i * n + j] = 1; }
         return out;
     }
-    function where(c, cs, a, as_, b, bs) {
-        const shape = broadcastShape(broadcastShape(cs, as_), bs), dtype = promote(a.dtype, b.dtype);
+    function where(c, cs, a, as_, b, bs, want) {
+        const shape = broadcastShape(broadcastShape(cs, as_), bs), dtype = want ? want : promote(a.dtype, b.dtype);
         const out = alloc(dtype, numel(shape)), O = out.data;
         const sc = bstrides(cs, shape), sa = bstrides(as_, shape), sb = bstrides(bs, shape);
         const Cd = c.data, Ad = a.data, Bd = b.data;
@@ -709,6 +850,25 @@
     function nextDouble(s) { const hi = next32(s), lo = next32(s); const v = (hi * 4294967296 + lo) % 9007199254740992; return v / 9007199254740992; }
     const Gen = rt.newType("Generator", [rt.ObjectType], new Map(), "_zipp_tensor");
     function genNew(seed) { return { cls: Gen, dict: new Map(), state: mt(Number(BigInt.asUintN(32, BigInt(seed)))), seed: BigInt(seed) }; }
+    // A generator's whole state as a uint8 storage: the 624 MT words, the
+    // position (little-endian uint32 each) and the 64-bit seed.
+    function genGetState(g) {
+        const s = needGen(g), out = alloc("uint8", 624 * 4 + 4 + 8), v = new DataView(out.data.buffer);
+        for (let i = 0; i < 624; i++) v.setUint32(i * 4, s.mt[i], true);
+        v.setUint32(624 * 4, s.i, true);
+        v.setBigUint64(624 * 4 + 4, BigInt.asUintN(64, g.seed), true);
+        return out;
+    }
+    function genSetState(g, st) {
+        needGen(g); needS(st);
+        if (st.data.length !== 624 * 4 + 4 + 8) fail(E.RuntimeError, "Expected a generator state of " + (624 * 4 + 4 + 8) + " bytes, got " + st.data.length);
+        const bytes = Uint8Array.from(st.data), v = new DataView(bytes.buffer), mtState = { mt: new Uint32Array(624), i: 0 };
+        for (let i = 0; i < 624; i++) mtState.mt[i] = v.getUint32(i * 4, true);
+        mtState.i = v.getUint32(624 * 4, true);
+        if (mtState.i > 624) fail(E.RuntimeError, "invalid generator state");
+        g.state = mtState; g.seed = v.getBigUint64(624 * 4 + 4, true);
+        return null;
+    }
     function needGen(g) { if (g === null || typeof g !== "object" || g.cls !== Gen) fail(E.TypeError, "a Generator is required"); return g.state; }
     function rand(g, n) {
         // float32 uniform from 24 random bits, as torch's uniform_ for float.
@@ -732,15 +892,25 @@
         }
         return out;
     }
+    // PyTorch's CPU randint: a range below 2**28 takes one 32-bit word per
+    // element; a larger one takes random64() (two words, the first high)
+    // modulo the range. One exception: a range of exactly 2**32 stays one
+    // raw word, which torch.utils.data composes into its random64 seed.
     function randint(g, low, high, n) {
         const s = needGen(g), out = alloc("int64", n), O = out.data;
         const range = high - low;
         if (range <= 0) fail(E.RuntimeError, "random_ expects 'from' to be less than 'to'");
         for (let i = 0; i < n; i++) {
-            const r = range <= 4294967296 ? next32(s) % range : ((next32(s) * 4294967296 + next32(s)) % range);
+            const r = range < 268435456 || range === 4294967296 ? next32(s) % range : Number(((BigInt(next32(s)) << 32n) | BigInt(next32(s))) % BigInt(range));
             O[i] = low + r;
         }
         return out;
+    }
+    // PyTorch's random64(): two words, the first high, as Python ints.
+    function random64(g, n) {
+        const s = needGen(g), out = new Array(n);
+        for (let i = 0; i < n; i++) out[i] = (BigInt(next32(s)) << 32n) | BigInt(next32(s));
+        return list(out);
     }
     function multinomial(g, probs, shape, samples, replacement) {
         const s = needGen(g), n = shape[shape.length - 1], rows = probs.data.length / n;
@@ -760,10 +930,12 @@
         }
         return out;
     }
+    // PyTorch's CPU randperm: a forward Fisher-Yates shuffle, position i
+    // swapped with i + random() % (n - i).
     function randperm(g, n) {
         const s = needGen(g), out = alloc("int64", n), O = out.data;
         for (let i = 0; i < n; i++) O[i] = i;
-        for (let i = n - 1; i > 0; i--) { const j = next32(s) % (i + 1); const t = O[i]; O[i] = O[j]; O[j] = t; }
+        for (let i = 0; i < n - 1; i++) { const j = i + next32(s) % (n - i); const t = O[i]; O[i] = O[j]; O[j] = t; }
         return out;
     }
     // ---- bytes ---------------------------------------------------------------------------------
@@ -980,6 +1152,11 @@
         fn("dtype", 1, (a) => needS(a[0]).dtype);
         fn("size", 1, (a) => BigInt(needS(a[0]).data.length));
         fn("version", 1, (a) => BigInt(needS(a[0]).version));
+        // Autograd's view of the version: writes made through `.data` (which
+        // PyTorch gives a version counter of its own) are not counted, the
+        // total `version` above still is.
+        fn("aversion", 1, (a) => { const s = needS(a[0]); return BigInt(s.version - s.untracked); });
+        fn("untrack", 1, (a) => { needS(a[0]).untracked++; return null; });
         fn("all_finite", 1, (a) => allFinite(needS(a[0])));
         // graph_matmul(a, b, m, k, n, batch=1, a_batch_stride=0, b_batch_stride=0)
         fn("graph_matmul", 8, (a) => graphMatmul(needS(a[0]), needS(a[1]), num(a[2]), num(a[3]), num(a[4]),
@@ -1002,9 +1179,10 @@
             written(d);
             return null;
         });
-        fn("binary", 5, (a) => binary(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), needS(a[3]), shapeOf(a[4]), a[2], a[4]));
+        // binary(op, a, ashape, b, bshape, dtype=None): `dtype` is the result type promotion chose.
+        fn("binary", 6, (a) => binary(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), needS(a[3]), shapeOf(a[4]), a[2], a[4], a[5] === undefined || a[5] === null ? null : rt.needStr(a[5])), 5);
         fn("unary", 4, (a) => unary(rt.needStr(a[0]), needS(a[1]), a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]), 2);
-        fn("reduce", 5, (a) => reduce(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), a[3], rt.truth(a[4])));
+        fn("reduce", 6, (a) => reduce(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])), 5);
         fn("permute", 3, (a) => permute(needS(a[0]), shapeOf(a[1]), a[2]));
         fn("expand", 3, (a) => expand(needS(a[0]), shapeOf(a[1]), a[2]));
         fn("slice", 3, (a) => slice(needS(a[0]), shapeOf(a[1]), a[2]));
@@ -1024,7 +1202,11 @@
         fn("softmax", 4, (a) => softmax(needS(a[0]), shapeOf(a[1]), num(a[2]), rt.truth(a[3])));
         fn("argsort", 4, (a) => argsort(needS(a[0]), shapeOf(a[1]), num(a[2]), rt.truth(a[3])));
         fn("one_hot", 2, (a) => oneHot(needS(a[0]), num(a[1])));
-        fn("where", 6, (a) => where(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), needS(a[4]), shapeOf(a[5])));
+        fn("where", 7, (a) => where(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), needS(a[4]), shapeOf(a[5]), a[6] === undefined || a[6] === null ? null : rt.needStr(a[6])), 6);
+        fn("scan", 4, (a) => scan(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), num(a[3])));
+        fn("strided", 4, (a) => strided(needS(a[0]), shapeOf(a[1]), shapeOf(a[2]), num(a[3])));
+        fn("gen_get_state", 1, (a) => genGetState(a[0]));
+        fn("gen_set_state", 2, (a) => genSetState(a[0], a[1]));
         fn("allclose", 4, (a) => { const x = needS(a[0]), y = needS(a[1]); const rtol = num(a[2]), atol = num(a[3]); if (x.data.length !== y.data.length) return false; for (let i = 0; i < x.data.length; i++) { const p = x.data[i], q = y.data[i]; if (p === q) continue; if (!Number.isFinite(p) || !Number.isFinite(q) || Math.abs(p - q) > atol + rtol * Math.abs(q)) return false; } return true; });
         fn("equal", 2, (a) => { const x = needS(a[0]), y = needS(a[1]); if (x.data.length !== y.data.length) return false; for (let i = 0; i < x.data.length; i++) if (x.data[i] !== y.data[i]) return false; return true; });
         fn("gen", 1, (a) => genNew(rt.asInt(rt.needInt(a[0]))));
@@ -1036,6 +1218,7 @@
         fn("randint", 4, (a) => randint(a[0], num(a[1]), num(a[2]), num(a[3])));
         fn("multinomial", 5, (a) => multinomial(a[0], needS(a[1]), shapeOf(a[2]), num(a[3]), rt.truth(a[4])));
         fn("randperm", 2, (a) => randperm(a[0], num(a[1])));
+        fn("random64", 2, (a) => random64(a[0], num(a[1])));
         fn("tobytes", 1, (a) => toBytes(needS(a[0])));
         fn("frombytes", 3, (a) => fromBytes(rt.needStr(a[0]), a[1], a[2] === undefined || a[2] === null ? null : num(a[2])), 2);
         // zlib's CRC-32 of a bytes object, for zipfile (torch.save checkpoints).
