@@ -15,7 +15,12 @@
     function defkw(name, code) { const f = builtin(name, -1, code); f.kwnames = true; B.set(name, f); }
     function method(type, name, arity, code, minArity) { type.dict.set(name, builtin(name, arity, code, minArity)); }
     function methodkw(type, name, code) { const f = builtin(name, -1, code); f.kwnames = true; type.dict.set(name, f); }
-    function drain(iterable) { const out = []; const it = iter(iterable); for (;;) { const v = fornext(it); if (v === STOP) break; out.push(v); } return out; }
+    function drain(iterable) {
+        // An exact list or tuple iterates its items in order and runs no
+        // code while doing it: a copy of the items is the same array.
+        if (iterable !== null && typeof iterable === "object" && (iterable.cls === T.list || iterable.cls === T.tuple)) return iterable.items.slice();
+        const out = []; const it = iter(iterable); for (;;) { const v = fornext(it); if (v === STOP) break; out.push(v); } return out;
+    }
     rt.drain = drain;
     function kwOf(args, allowed) {
         // Builtins accepting keywords receive them as a trailing Map.
@@ -375,7 +380,7 @@
 
     // ---- str ------------------------------------------------------------------------------------------------------
     const S = T.str;
-    function strSelf(a) { return needStr(a[0], "descriptor requires a 'str' object"); }
+    function strSelf(a) { const v = a[0]; return typeof v === "string" ? v : needStr(v, "descriptor requires a 'str' object"); }
     method(S, "__len__", 1, (a) => rt.baseLen(a[0]));
     method(S, "__hash__", 1, (a) => rt.hashInt(a[0]));
     method(S, "__repr__", 1, (a) => rt.quoteStr(a[0]));
@@ -516,6 +521,50 @@
     }
     method(S, "startswith", 4, (a) => affix(a, false), 2);
     method(S, "endswith", 4, (a) => affix(a, true), 2);
+    // Direct positional entries (`c<n>`, see `builtinFast`) for the str
+    // methods programs call most: a str receiver with str arguments gets
+    // exactly the method's result without its argument array and checks;
+    // anything else runs the method itself (`this` is the builtin).
+    {
+        const direct = (name, n, fn) => { S.dict.get(name)["c" + n] = fn; };
+        direct("lower", 1, function (s) { return typeof s === "string" ? s.toLowerCase() : this.code([s]); });
+        direct("upper", 1, function (s) { return typeof s === "string" ? s.toUpperCase() : this.code([s]); });
+        direct("strip", 1, function (s) { return typeof s === "string" ? s.trim() : this.code([s]); });
+        direct("startswith", 2, function (s, p) { return typeof s === "string" && typeof p === "string" ? s.startsWith(p) : this.code([s, p]); });
+        direct("endswith", 2, function (s, p) { return typeof s === "string" && typeof p === "string" ? s.endsWith(p) : this.code([s, p]); });
+        direct("find", 2, function (s, sub) {
+            if (typeof s !== "string" || typeof sub !== "string") return this.code([s, sub]);
+            const i = s.indexOf(sub);
+            if (i < 0) return -1n;
+            return BigInt(rt.hasSurrogate(s) ? rt.strLen(s.slice(0, i)) : i);
+        });
+        direct("replace", 3, function (s, from, to) {
+            return typeof s === "string" && typeof from === "string" && typeof to === "string" && from !== "" ? rt.checkedText(s.split(from).join(to)) : this.code([s, from, to]);
+        });
+        direct("split", 2, function (s, sep) {
+            return typeof s === "string" && typeof sep === "string" && sep !== "" ? list(s.split(sep)) : this.code([s, sep]);
+        });
+        direct("split", 1, function (s) {
+            if (typeof s !== "string") return this.code([s]);
+            // `split(/\s+/)` without its empty ends (a loop: `filter` would
+            // run its callback on a nested interpreter).
+            const raw = s.split(/\s+/), parts = [];
+            for (let i = 0; i < raw.length; i++) if (raw[i].length) parts.push(raw[i]);
+            return list(parts);
+        });
+        direct("join", 2, function (sep, it) {
+            if (typeof sep !== "string") return this.code([sep, it]);
+            const parts = drain(it);
+            for (let i = 0; i < parts.length; i++) {
+                if (typeof parts[i] !== "string") {
+                    const u = rt.unbox(parts[i]);
+                    if (typeof u !== "string") fail(E.TypeError, "sequence item " + i + ": expected str instance, " + typeOf(parts[i]).name + " found");
+                    parts[i] = u;
+                }
+            }
+            return rt.checkedText(parts.join(sep));
+        });
+    }
     // CPython's digit classes follow Numeric_Type: isdecimal is Decimal (Nd),
     // isdigit adds Digit (superscripts, circled and parenthesized digits,
     // all in No), isnumeric adds Numeric (the rest of Nl/No plus the CJK
@@ -834,7 +883,27 @@
         const keys = key === null ? items.slice() : rt.amap(items, (x) => call(key, [x], null));
         const values = key === null ? null : items.slice();
         if (reverse) { keys.reverse(); if (values !== null) values.reverse(); }
-        const lt = (a, b) => cmp("lt", a, b);
+        const lt = rt.fastLt;
+        // Keys that are all plain values (or tuples of them): the engine sorts
+        // them stably, which for such keys is exactly the order (and the tie
+        // order) any stable sort by `<` gives.
+        if (rt.PYORD !== null && keys.length > 1) {
+            let plain = true;
+            const nk = new Array(keys.length);
+            for (let i = 0; i < keys.length; i++) {
+                const f = ordForm(keys[i], 0);
+                if (f === undefined) { plain = false; break; }
+                nk[i] = f;
+            }
+            const perm = plain ? rt.PYORD(1, nk) : undefined;
+            if (perm !== undefined) {
+                const ks = keys.slice(), vs = values === null ? null : values.slice();
+                for (let i = 0; i < perm.length; i++) { const j = perm[i]; keys[i] = ks[j]; if (vs !== null) values[i] = vs[j]; }
+                const out = values === null ? keys : values;
+                if (reverse) out.reverse();
+                return out;
+            }
+        }
         if (keys.length < 64) smallSort(keys, values, lt);
         else {
             const keyed = rt.amap(keys, (k, i) => [k, values === null ? k : values[i]]);
@@ -843,6 +912,20 @@
         }
         const out = values === null ? keys : values;
         if (reverse) out.reverse();
+        return out;
+    }
+    // A sort key as the engine's ordering takes it: a plain value itself, a
+    // tuple (nested ones too) as an array of its items; `undefined` for
+    // anything else (a list, an instance), which only the protocol orders.
+    function ordForm(k, depth) {
+        if (k === null || typeof k !== "object") return k;
+        if (k.cls !== T.tuple || depth > 8) return undefined;
+        const items = k.items, out = new Array(items.length);
+        for (let i = 0; i < items.length; i++) {
+            const f = ordForm(items[i], depth + 1);
+            if (f === undefined) return undefined;
+            out[i] = f;
+        }
         return out;
     }
     // CPython 3.13's sort of a short list, comparison for comparison: the
@@ -1515,6 +1598,70 @@
         return v;
     };
 
+    // `obj.name` for a call with `argc` positional values, as `mlookup`
+    // resolves it (`R.mself` says whether the receiver goes first), and the
+    // inline method caches the emitter probes next time: `gm` for a plain
+    // Python function on a user class, `gb` for a builtin method of a
+    // dict-less builtin container or str. A builtin that unboxes its
+    // receiver is bound by `getattr` instead when the receiver is boxed.
+    const GB_TYPES = new Set([T.list, T.tuple, T.dict, T.set, T.frozenset, T.str]);
+    R.mfind = function (obj, name, argc) {
+        let t;
+        if (obj !== null && typeof obj === "object") {
+            if (obj.isType || obj.cls === T.module || obj.cls === T.super) { const v = getattr(obj, name); R.mself = false; return v; }
+            t = obj.cls || rt.ObjectType;
+        } else {
+            t = rt.typeOf(obj);
+        }
+        const attr = rt.lookupType(t, name);
+        if (attr !== undefined && attr !== null && typeof attr === "object") {
+            const ac = attr.cls;
+            if (ac === T.function || ac === T.builtin_function_or_method) {
+                const own = obj !== null && typeof obj === "object" && obj.dict !== undefined && obj.dict !== null ? obj.dict.get(name) : undefined;
+                if (own === undefined) {
+                    if (ac === T.function) {
+                        if (t.userClass === true) { t.gm[name] = attr; rt.noteFlagged(t); }
+                        R.mself = true;
+                        return attr;
+                    }
+                    if (!(attr.unboxSelf === true && obj !== null && typeof obj === "object" && obj.pyval !== undefined)) {
+                        const n = argc + 1, arity = attr.arity;
+                        if (GB_TYPES.has(t) && (arity < 0 ? n >= attr.minArity : n <= arity && n >= attr.minArity)) {
+                            t.gb[name + "#" + argc] = attr; rt.noteFlagged(t);
+                        }
+                        R.mself = true;
+                        return attr;
+                    }
+                }
+            }
+        }
+        const v = getattr(obj, name);
+        R.mself = false;
+        return v;
+    };
+    // `super().name` for a call, as `superof` then `superAttr` resolve it,
+    // without building the super object: a plain Python function comes
+    // back unbound with `R.mself` set (the call passes `self` first); any
+    // other attribute comes back bound, as `superAttr` gives it.
+    R.smfind = function (cls, self, name) {
+        const objtype = rt.isType(self) && rt.isSubclass(self, cls) ? self : rt.typeOf(self);
+        const mro = objtype.mro;
+        const start = mro.indexOf(cls) + 1;
+        const onClass = rt.isType(self) && self === objtype;
+        for (let i = start; i < mro.length; i++) {
+            const v = mro[i].dict.get(name);
+            if (v === undefined) continue;
+            if (!onClass && v !== null && typeof v === "object" && v.cls === T.function) { R.mself = true; return v; }
+            const r = rt.descrGet(v, onClass ? null : self, objtype);
+            R.mself = false;
+            return r;
+        }
+        rt.fail(E.AttributeError, "'super' object has no attribute '" + name + "'");
+    };
+    R.TSTR = T.str; R.TMODULE = T.module;
+    // The builtins the emitter's method intrinsics stand in for.
+    R.LAPPEND = T.list.dict.get("append"); R.DGET = T.dict.dict.get("get"); R.MAX_ITEMS = rt.MAX_ITEMS;
+
     // One step of `yield from` (PEP 380). Mode 0 sends `v` into the
     // subiterator (`next()` when `v` is None), mode 1 throws `v` into it.
     // Returns the next value to yield, or STOP once the subiterator has
@@ -1585,7 +1732,9 @@
 (function (R) {
     "use strict";
     const rt = R.__rt, T = rt.T;
-    R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range;
+    R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict;
+    // The `Number` intrinsic, for the emitter's guarded int-to-index conversions.
+    R.Number = Number;
     // The text limit an inline str concatenation is checked against.
     R.MAX_TEXT = rt.MAX_TEXT;
     // A loop's iterable: an exact list, tuple or range as itself (the loop
@@ -1604,6 +1753,19 @@
     R.BUILTINS = rt.builtins;
     R.BLEN = rt.builtins.get("len"); R.len1 = rt.len;
     R.BISINSTANCE = rt.builtins.get("isinstance");
+    R.BHASATTR = rt.builtins.get("hasattr");
     const isinstanceCode = R.BISINSTANCE.code;
-    R.isinst = function (v, t) { return rt.isType(t) ? rt.isinstanceCheck(v, t) : isinstanceCode([v, t]); };
+    R.isinst = function (v, t) {
+        if (t !== null && typeof t === "object" && t.isType === true) {
+            // `v`'s exact type is `t`: true without the MRO walk.
+            const tv = typeof v;
+            const c = tv === "object" ? (v === null ? T.NoneType : v.cls) : tv === "bigint" ? T.int : tv === "string" ? T.str : tv === "number" ? T.float : tv === "boolean" ? T.bool : undefined;
+            if (c === t) return true;
+            // A primitive's type is a builtin one (no bytes/bytearray case,
+            // bool's MRO holds int): its MRO answers.
+            if (c !== undefined && (tv !== "object" || v === null)) return c.mro.indexOf(t) >= 0;
+            return rt.isinstanceCheck(v, t);
+        }
+        return isinstanceCode([v, t]);
+    };
 })(__zipp_py);

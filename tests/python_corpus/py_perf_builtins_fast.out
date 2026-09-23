@@ -1,0 +1,46 @@
+[1, 1, None, 'dflt', 3, 3, 4, 4, None, 'dflt']
+['one', 'one', None, 0, 'minus five', 'minus five', 'big', 'big', None, 0, 'huge', 'huge', 'one', 'one', 'two', 'two', None, 0]
+['true replaces 1', 'true replaces 1', 'true replaces 1', 'true replaces 1', 'true replaces 1', 'true replaces 1', 'float', 'float', 'str', 'str', 'tuple', 'tuple', 'none', 'none', None, '-']
+['seven', 'seven', 'eight', 'eight', 'eight', 'eight', 'seven', 'seven', None, None]
+[1, 1, None, 'dflt', 3, 3, 4, 4, None, 'dflt']
+['one', 'one', None, 0, 'minus five', 'minus five', 'big', 'big', None, 0, 'huge', 'huge', 'one', 'one', 'two', 'two', None, 0]
+['true replaces 1', 'true replaces 1', 'true replaces 1', 'true replaces 1', 'true replaces 1', 'true replaces 1', 'float', 'float', 'str', 'str', 'tuple', 'tuple', 'none', 'none', None, '-']
+['seven', 'seven', 'eight', 'eight', 'eight', 'eight', 'seven', 'seven', None, None]
+[1, 1, None, 'dflt', 3, 3, 4, 4, None, 'dflt']
+['one', 'one', None, 0, 'minus five', 'minus five', 'big', 'big', None, 0, 'huge', 'huge', 'one', 'one', 'two', 'two', None, 0]
+['true replaces 1', 'true replaces 1', 'true replaces 1', 'true replaces 1', 'true replaces 1', 'true replaces 1', 'float', 'float', 'str', 'str', 'tuple', 'tuple', 'none', 'none', None, '-']
+['seven', 'seven', 'eight', 'eight', 'eight', 'eight', 'seven', 'seven', None, None]
+TypeError unhashable type: 'list'
+TypeError unhashable type: 'dict'
+override override override
+1 None 5
+None 2
+1 no
+[0, [0], 1, [1], 2, [2], 3, [3], 4, [4]]
+[0, 2, 4] AL
+bound 11
+[-50, -50, -50, -49, -49, -48, -48, -48, -47, -46] [49, 49, 49, 49, 48]
+True 1180591620717411303424
+['', '', '', '', '', '', '', '', '', '', 'Z', 'Z'] ['😀', '😀', '😀', '😀']
+[(0, '0', -140), (0, '0', -105), (0, '0', -70), (0, '0', -35), (0, '0', 0)] [(0, '0', 0), (0, '0', -35), (0, '0', -70), (0, '0', -105), (0, '0', -140)]
+[-3, 0.0, False, 1, True, 2.5, 100000000000000000000] [100000000000000000000, 2.5, 1, True, 0.0, False, -3]
+[(0, 'z'), (1, 'a'), (1, 'b')]
+[(0, 0), (0, 3), (0, 6), (0, 9), (0, 12), (0, 15), (0, 18), (0, 21), (0, 24), (0, 27), (1, 1), (1, 4)]
+[('the', 3), ('brown', 1), ('dog', 1), ('end', 1), ('fox', 1), ('jumps', 1), ('lazy', 1), ('over', 1), ('quick', 1)]
+TypeError '<' not supported between instances of 'str' and 'int'
+TypeError '<' not supported between instances of 'str' and 'int'
+3
+True True True False False
+[R3, R2, R1] [(1, R2), (1, R1)]
+True 1 True True
+int True False False False False False False True True
+bool True True False False False False False True True
+float False False True False False False False False True
+str False False False True False False False True True
+NoneType False False False False False False False False True
+list False False False False True False False False True
+tuple False False False False False False False False True
+dict False False False False False False False False True
+bytes False False False False False True False False True
+bytearray False False False False False False True False True
+AL False False False False True False False False True

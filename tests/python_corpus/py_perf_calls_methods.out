@@ -1,0 +1,60 @@
+total 8712
+(1, 2, 1) (2, 3, 2) (4, 5, 2)
+((), []) ((1, 2), []) ((1,), [('x', 2)]) 12
+10 6
+TypeError: add() missing 1 required positional argument: 'b'
+TypeError: add() takes 2 positional arguments but 3 were given
+TypeError: inc() missing 1 required positional argument: 'x'
+TypeError: inc() takes from 1 to 2 positional arguments but 3 were given
+TypeError: kwonly() missing 1 required keyword-only argument: 'b'
+TypeError: kwonly() takes 1 positional argument but 2 were given
+TypeError: many() missing 11 required positional arguments: 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', and 'l'
+TypeError: gen_default() missing 1 required positional argument: 'n'
+TypeError: <lambda>() missing 1 required positional argument: 'x'
+TypeError: <lambda>() takes from 1 to 2 positional arguments but 3 were given
+TypeError: add() got an unexpected keyword argument 'c'
+TypeError: keywords must be strings
+2 7 7 9
+TypeError: kw() got multiple values for argument 'a'
+-3 -3
+TypeError
+2584 500
+bump 15 (1, 2, 15)
+shadowed 1 shadowed 4
+16
+class replaced 1 class replaced 9
+sub class replaced 5
+(6, 'Tools4', 6, 12, 'Tools7', 7)
+Tools1 Tools2
+[0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5] {0: [0, 3], 1: [1, 4], 2: [2, 5]} [1, 4] None dflt ['a', 'b'] x AB
+[0, 10, 20] HELLO hello True ['He', '', 'o'] 5
+1
+1
+0
+dict_keys(['1'])
+AttributeError: 'NoneType' object has no attribute 'append'
+AttributeError: 'int' object has no attribute 'append'
+AttributeError: 'float' object has no attribute 'append'
+TypeError 0
+TypeError 2
+6.146264369941973 2 6
+[11, 22, 33] 33 2 22 1
+IndexError list index out of range
+IndexError list index out of range
+IndexError tuple index out of range
+TypeError list indices must be integers or slices, not float
+TypeError list indices must be integers or slices, not str
+KeyError 'k'
+KeyError 2
+IndexError list assignment index out of range
+[11, 22, 99]
+IndexError
+{'a': 5, 'b': 2} 5
+str one one one
+{1: 'one', '1': 'str one', 'x': 5}
+D:a L:0 1 2
+1 2 2 2
+2 1 5 1 5 2
+7
+shadowed
+3

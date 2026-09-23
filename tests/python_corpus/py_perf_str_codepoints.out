@@ -1,0 +1,29 @@
+0 []    -1 -1 0   [''] True True -1
+11 ['p', ' ', 'i'] lai cii panaci -1 6 2 PLAIN AS plain ['pl', 'in ', 'scii'] True True 3
+10 ['c', 'n', 'e'] afé ïve cf av -1 6 2 CAFÉ NAÏ café  ['c', 'fé n', 'ïve'] True True 9
+4 ['中', '字', '符'] 文字符 文字符 中文字符 -1 -1 0 中文字符 中文字符 ['中文字符'] True True 3
+14 ['e', ' ', '!'] moj  🚀! eoi😀ad 6 8 1 EMOJI 😀  moji  ['emoji 😀 ', 'nd 🚀!'] True True 13
+1 ['😀', '😀', '😀']  😀 😀 0 -1 0 😀 😀 ['😀'] True True 0
+6 ['m', 'é', '中'] ixé é😀中 mixé😀中 4 -1 0 MIXÉ😀中 mixé😀 ['mixé😀中'] True True 5
+3 ['\uffff', '\ue000', '\ud7ff'] ퟿ ￿퟿ ￿퟿ -1 -1 0 ￿퟿ ￿퟿ ['\uffff\ue000\ud7ff'] True True 2
+50000 ['a', 'a', 'j'] bcd hij aaaaa -1 49990 5000 ABCDEFGH bcdef 5001 True True 9
+6000 ['a', 'a', '😀'] b😀a ab😀 aaaaa 2 5997 2000 AB😀AB😀AB b😀ab😀 2001 True True 2
+104 ['x', 'z', '😀'] éyz zz😀 xzzzzz 103 -1 0 XÉYZZZZZ xéyzz 1 True True 103
+50001 ['a', 'a', '😀'] bcd ij😀 aaaaa😀 50000 49990 5000 ABCDEFGH bcdef 5001 True True 50000
+['', 'Z', 'a', 'ab', 'a\uffff', 'a😀', 'b', 'zz', 'é', '\uffff', '😀'] 😀 
+[False, False, True, True, True, True, True, False, True, True, True, True, False, False, False, True, True, False, False, False, False, False, False, False, False, False, False, True, False, False, False, False, True, True, True, False]
+True True False
+[] [] 
+[112, 108, 97, 105, 110, 32, 97, 115, 99, 105] ['i', 'i', 'c', 's'] iics
+[99, 97, 102, 233, 32, 110, 97, 239, 118, 101] ['e', 'v', 'ï', 'a'] evïa
+[20013, 25991, 23383, 31526] ['符', '字', '文', '中'] 符字文中
+[101, 109, 111, 106, 105, 32, 128512, 32, 97, 110] ['!', '🚀', ' ', 'd'] !🚀 d
+[128512] ['😀'] 😀
+[109, 105, 120, 233, 128512, 20013] ['中', '😀', 'é', 'x'] 中😀éx
+[65535, 57344, 55295] ['\ud7ff', '\ue000', '\uffff'] ퟿￿
+[97, 98, 99, 100, 101, 102, 103, 104, 105, 106] ['j', 'i', 'h', 'g'] jihg
+8 ['line', 'one'] ['l', 'e', 'n']
+10 ['line', 'two', 'é'] ['l', 'e', 'w', 'é']
+12 ['third', '😀', 'line'] ['t', 'r', '😀', 'i']
+0 [''] []
+100000 é é

@@ -316,6 +316,22 @@ pub const HOST_CALL_NAME: &str = "__zippHostCall";
 pub const PY_TENSOR: u16 = 1950;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_TENSOR_NAME: &str = "__zipp_py_native";
+/// The Python runtime's string query (`vm::py_ops`): whether a string holds
+/// any UTF-16 surrogate unit, answered from the heap string's ASCII flag
+/// when it can be. Bound like [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_STR: u16 = 1951;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_STR_NAME: &str = "__zipp_py_str";
+/// The Python runtime's ordering of plain values (`vm::py_ops`): compare two
+/// keys, or sort an array of keys stably, when every key is an int, float,
+/// str, bool or None (or a tuple's items of those); otherwise `undefined`,
+/// and the runtime compares through its general protocol. Bound like
+/// [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_ORD: u16 = 1952;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_ORD_NAME: &str = "__zipp_py_ord";
 
 // ── decorator context closures (proposal-decorators) ────────────────────────
 // Each is a `HeapObj::NativeClosure`, not a bare `Native`: they close over the
@@ -1645,6 +1661,10 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         HOST_CALL => (HOST_CALL_NAME, 1),
         #[cfg(feature = "python")]
         PY_TENSOR => ("", 0),
+        #[cfg(feature = "python")]
+        PY_STR => ("", 1),
+        #[cfg(feature = "python")]
+        PY_ORD => ("", 2),
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),

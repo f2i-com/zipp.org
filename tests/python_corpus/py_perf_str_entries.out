@@ -1,0 +1,24 @@
+'  alpha,beta,gamma  ' '  ALPHA,BETA,GAMMA  ' 'Alpha,beta,GAMMA' True False 7 -1 0 '  Alpha;beta;GAMMA  ' ['  Alpha', 'beta', 'GAMMA  '] ['Alpha,beta,GAMMA']   Alpha-beta-GAMMA   True True
+'' '' '' False False -1 -1 0 '' [''] []  False True
+'x' 'X' 'x' False False -1 -1 0 'x' ['x'] ['x'] x True True
+'aé😀b,c' 'AÉ😀B,C' 'aé😀b,c' False False 4 2 0 'aé😀b;c' ['aé😀b', 'c'] ['aé😀b,c'] aé😀b-c False True
+' sub,class ' ' SUB,CLASS ' 'sub,class' False False 4 -1 0 ' sub;class ' [' sub', 'class '] ['sub,class']  sub-class  False True
+'\t\n mixed \xa0 space \x0b' '\t\n MIXED \xa0 SPACE \x0b' 'mixed \xa0 space' False False -1 -1 0 '\t\n mixed \xa0 space \x0b' ['\t\n mixed \xa0 space \x0b'] ['mixed', 'space'] 	
+ mixed   space  False True
+'  alpha,beta,gamma  ' '  ALPHA,BETA,GAMMA  ' 'Alpha,beta,GAMMA' True False 7 -1 0 '  Alpha;beta;GAMMA  ' ['  Alpha', 'beta', 'GAMMA  '] ['Alpha,beta,GAMMA']   Alpha-beta-GAMMA   True True
+'' '' '' False False -1 -1 0 '' [''] []  False True
+'x' 'X' 'x' False False -1 -1 0 'x' ['x'] ['x'] x True True
+'aé😀b,c' 'AÉ😀B,C' 'aé😀b,c' False False 4 2 0 'aé😀b;c' ['aé😀b', 'c'] ['aé😀b,c'] aé😀b-c False True
+' sub,class ' ' SUB,CLASS ' 'sub,class' False False 4 -1 0 ' sub;class ' [' sub', 'class '] ['sub,class']  sub-class  False True
+'\t\n mixed \xa0 space \x0b' '\t\n MIXED \xa0 SPACE \x0b' 'mixed \xa0 space' False False -1 -1 0 '\t\n mixed \xa0 space \x0b' ['\t\n mixed \xa0 space \x0b'] ['mixed', 'space'] 	
+ mixed   space  False True
+ValueError
+TypeError
+TypeError
+TypeError
+TypeError
+TypeError
+TypeError
+abc ['a', 'b'] x,y a,b p,q
+['a', 'b'] ['a', 'b c'] acabc 2 True
+str str zy

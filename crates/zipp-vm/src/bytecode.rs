@@ -2056,6 +2056,162 @@ pub enum Instr {
         argc: u16,
         to_stderr: bool,
     },
+
+    // ---- Python frontend fast paths ---------------------------------------
+    // Emitted only by `frontend::python`. Each is the fused form of a guarded
+    // inline sequence the Python emitter used to spell out (`typeof` tests,
+    // the operation, a jump over the slow path): it performs the operation
+    // when its operands are of the types listed, and otherwise jumps to
+    // `slow` (the emitter's runtime-helper path) leaving `dst` untouched. It
+    // never calls out, and it throws only on allocation limits. JavaScript
+    // code never contains them, so no JIT tier accepts them.
+    /// `dst = a <op> b` with Python semantics for: two ints (BigInts), two
+    /// floats (Numbers), or an int and a float (the int converted exactly as
+    /// `float(int)`: only for magnitudes below 2^127, else `slow`). See
+    /// [`PyArithOp`] for which of those pairs each operator takes.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyArith {
+        op: PyArithOp,
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        slow: u32,
+    },
+    /// `dst = a + imm` for an int (BigInt) or a float (Number) `a`.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyAddImm {
+        dst: Reg,
+        a: Reg,
+        imm: i32,
+        slow: u32,
+    },
+    /// `dst = (a <op> b)` as a bool, for two ints, two floats, an int and a
+    /// float (compared exactly: only ints of magnitude at most 2^53, else
+    /// `slow`), and, for `Eq`/`Ne` only, two strs.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyCompare {
+        op: PyCmpOp,
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        slow: u32,
+    },
+    /// The branch form of [`Instr::PyCompare`]: jumps to `target` when the
+    /// comparison's result equals `when`, falls through when it does not,
+    /// and jumps to `slow` when the operands are of no listed type pair.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyJumpCompare {
+        op: PyCmpOp,
+        a: Reg,
+        b: Reg,
+        when: bool,
+        target: u32,
+        slow: u32,
+    },
+    /// `dst = obj.cls` for a runtime record (a plain object) whose `cls`
+    /// is an own data property holding an object: a Python instance's class
+    /// (the property read is this site's inline cache). Anything else
+    /// (a primitive, `null`, an exotic object, a getter, a non-object
+    /// `cls`) jumps to `slow`.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyClassOf {
+        dst: Reg,
+        obj: Reg,
+        slow: u32,
+    },
+    /// The instance-dict read of an attribute: `obj.dict` (a plain object's
+    /// own data property, through this site's inline cache) must be a `Map`;
+    /// `key` is a string constant (constant-pool index). With `absent`
+    /// false, a present non-`undefined` entry goes to `dst` and anything
+    /// else jumps to `slow`; with `absent` true, the instruction falls
+    /// through when the Map has no such entry and jumps to `slow` otherwise
+    /// (leaving `dst` untouched).
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyDictGet {
+        dst: Reg,
+        obj: Reg,
+        key: u32,
+        absent: bool,
+        slow: u32,
+    },
+    /// `obj.dict.set(key, val)` for the same `obj.dict` Map, else `slow`.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyDictSet {
+        obj: Reg,
+        key: u32,
+        val: Reg,
+        slow: u32,
+    },
+    /// `dst = f[name]` when `f` is a plain-object record whose own data
+    /// property `name` (a string-constant index, read through this site's
+    /// inline cache) is a function: a callable's positional entry for one
+    /// argument count (`c<n>`). Anything else jumps to `slow`.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyCallEntry {
+        dst: Reg,
+        f: Reg,
+        name: u32,
+        slow: u32,
+    },
+    /// `dst = o[k]` for a runtime sequence or dict record: `o` a plain
+    /// object whose own data `cls` is the value in `seq` (a list or tuple
+    /// type: `o.items` an Array, `k` an int within it) or in `dict` (the
+    /// dict type: `o.str` true, `o.map` a Map, `k` a str present in it).
+    /// Anything else (a negative or out-of-range index, a missing key, a
+    /// hole) jumps to `slow`.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyGetItem {
+        dst: Reg,
+        o: Reg,
+        k: Reg,
+        seq: Reg,
+        dict: Reg,
+        slow: u32,
+    },
+    /// `o[k] = v` for the same records: an in-range element of the `seq`
+    /// type's items, or a str key of a str-keyed `dict` record (whose own
+    /// data `size` then follows the Map). Anything else jumps to `slow`.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PySetItem {
+        o: Reg,
+        k: Reg,
+        v: Reg,
+        seq: Reg,
+        dict: Reg,
+        slow: u32,
+    },
+}
+
+/// The operators of [`Instr::PyArith`]. `Add`, `Sub` and `Mul` take every
+/// listed pair; `TrueDiv` takes them all but divides only by a nonzero
+/// divisor (two ints only below 2^53 in magnitude, as Python's exact
+/// quotient then rounds the same); `FloorDiv` and `Mod` take two ints (fast
+/// tier, nonzero divisor) with floor semantics; the bitwise operators take
+/// two ints.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PyArithOp {
+    Add,
+    Sub,
+    Mul,
+    TrueDiv,
+    FloorDiv,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+}
+
+/// The comparisons of [`Instr::PyCompare`] / [`Instr::PyJumpCompare`].
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PyCmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
 }
 
 /// A compiled function: its code, register-file size, parameter count, and the

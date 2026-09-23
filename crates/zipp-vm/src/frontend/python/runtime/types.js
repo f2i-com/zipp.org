@@ -416,7 +416,18 @@
     const ORDER = { lt: ["__lt__", "__gt__"], le: ["__le__", "__ge__"], gt: ["__gt__", "__lt__"], ge: ["__ge__", "__le__"] };
     function compareSeq(a, b) {
         const n = Math.min(a.length, b.length);
-        for (let i = 0; i < n; i++) if (!eq(a[i], b[i])) return order3(a[i], b[i]);
+        for (let i = 0; i < n; i++) {
+            const x = a[i], y = b[i];
+            if (x === y) continue;
+            // Two distinct ints, or two distinct strs, are unequal and
+            // ordered by value (what `eq` then `order3` would find).
+            const tx = typeof x;
+            if (tx === typeof y) {
+                if (tx === "bigint") return x < y ? -1 : 1;
+                if (tx === "string") return compareStrings(x, y);
+            }
+            if (!eq(x, y)) return order3(x, y);
+        }
         return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
     }
     function order3(a, b) {
@@ -425,8 +436,23 @@
         return 0;
     }
     rt.order3 = order3;
+    // The engine's ordering of plain values (`__zipp_py_ord`, bound only in
+    // Python programs): -1/0/1 for two keys, or the permutation that sorts
+    // an array of keys stably; `undefined` whenever a key is not a plain
+    // int/float/str/bool/None (an array stands for a tuple's items) or a
+    // pair is unordered, and the general protocol then decides.
+    let PYORD = null;
+    try { PYORD = typeof __zipp_py_ord === "function" ? __zipp_py_ord : null; } catch (e) { PYORD = null; }
+    rt.PYORD = PYORD;
     function cmp(op, a, b) {
         const ta = typeof a, tb = typeof b;
+        if (op === "lt" && ta === "object" && tb === "object" && a !== null && b !== null) {
+            const ca = a.cls;
+            if (ca === b.cls && (ca === T.tuple || ca === T.list)) {
+                if (PYORD !== null) { const r = PYORD(0, a.items, b.items); if (r !== undefined) return r < 0; }
+                return compareSeq(a.items, b.items) < 0;
+            }
+        }
         if ((ta === "number" || ta === "bigint" || ta === "boolean") && (tb === "number" || tb === "bigint" || tb === "boolean")) {
             // JS relational and loose-equality operators compare a BigInt with
             // a Number exactly (and NaN compares false), as CPython does.
@@ -553,6 +579,11 @@
     function compareStrings(a, b) {
         // Code-point order (JS compares UTF-16 units, which differs for astral characters).
         if (a === b) return 0;
+        // UTF-16 order is code-point order until a surrogate is involved:
+        // two surrogate-free strs compare natively.
+        const x0 = a.charCodeAt(0), y0 = b.charCodeAt(0);
+        if (x0 !== y0 && x0 < 0xd800 && y0 < 0xd800) return x0 < y0 ? -1 : 1;
+        if (!hasSurrogate(a) && !hasSurrogate(b)) return a < b ? -1 : 1;
         const n = Math.min(a.length, b.length);
         for (let i = 0; i < n; i++) {
             const x = a.codePointAt(i), y = b.codePointAt(i);
@@ -562,6 +593,16 @@
         return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
     }
     rt.compareStrings = compareStrings;
+    // `a < b` as sorting and heaps ask it: two ints or two strs directly,
+    // two tuples (or two lists) through the engine's ordering, anything
+    // else through `cmp`.
+    function fastLt(a, b) {
+        const ta = typeof a;
+        if (ta === "bigint" && typeof b === "bigint") return a < b;
+        if (ta === "string" && typeof b === "string") return a !== b && compareStrings(a, b) < 0;
+        return cmp("lt", a, b);
+    }
+    rt.fastLt = fastLt;
     // Structural membership for the builtin containers and their subclasses.
     function baseContains(container, needle) {
         if (typeof container === "string") {
@@ -631,7 +672,19 @@
         }
         if (v === null) return NONE_KEY;
         const c = v.cls;
-        if (c === T.tuple || c === T.frozenset || c === T.bytes || c === T.range) return "\0" + baseKey(v);
+        if (c === T.tuple) {
+            // A tuple of plain values keeps its bucket key: its items never
+            // change, and neither do their keys.
+            const known = v.hkey;
+            if (known !== undefined) return known;
+            const k = "\0" + baseKey(v);
+            const items = v.items;
+            let plain = true;
+            for (let i = 0; i < items.length; i++) { const x = items[i]; if (x !== null && typeof x === "object") { plain = false; break; } }
+            if (plain) v.hkey = k;
+            return k;
+        }
+        if (c === T.frozenset || c === T.bytes || c === T.range) return "\0" + baseKey(v);
         if (c === T.list || c === T.dict || c === T.set) fail(E.TypeError, "unhashable type: '" + c.name + "'");
         if (c === T.slice) fail(E.TypeError, "unhashable type: 'slice'");
         if (c === T.method) { const s = v.self; return "\0m" + rt.ident(v.func) + ":" + (s !== null && typeof s === "object" ? "o" + rt.ident(s) : keyStr(s)); }
@@ -680,7 +733,18 @@
     // hashes are randomized in CPython, so only stability matters), mixed
     // and combined into a non-negative 53-bit value. The per-character step
     // is plain int arithmetic, which the interpreter runs without calls.
+    // Recent str hashes (a str is immutable, so its hash never changes; the
+    // Map hashes the key natively instead of this loop running per call).
+    const strHashes = new Map();
     function strHash(k) {
+        const known = strHashes.get(k);
+        if (known !== undefined) return known;
+        const h = strHashOf(k);
+        if (strHashes.size >= 4096) strHashes.clear();
+        strHashes.set(k, h);
+        return h;
+    }
+    function strHashOf(k) {
         let h1 = 5381, h2 = 0x6a09e667 | 0;
         for (let i = 0; i < k.length; i++) {
             const c = k.charCodeAt(i);
@@ -826,12 +890,28 @@
             return i < keys.length ? keys[i++] : STOP;
         } };
     }
+    // `dictEntries`' own loops, without its generator (a resumption per
+    // entry): the same entries in the same order, live as it is.
     function dictEq(a, b) {
         if (a.size !== b.size) return false;
-        for (const [k, v] of dictEntries(a)) { const w = dictGet(b, k); if (w === undefined || !eq(v, w)) return false; }
+        if (a.str === true) {
+            for (const [k, v] of a.map) { const w = dictGet(b, k); if (w === undefined || !eq(v, w)) return false; }
+            return true;
+        }
+        if (a.coll === true) {
+            const entries = dictEntryList(a);
+            for (let i = 0; i < entries.length; i++) { const e = entries[i]; const w = dictGet(b, e[0]); if (w === undefined || !eq(e[1], w)) return false; }
+            return true;
+        }
+        for (const bucket of a.map.values()) for (const e of bucket) { const w = dictGet(b, e[0]); if (w === undefined || !eq(e[1], w)) return false; }
         return true;
     }
-    function dictCopy(d) { const out = dict(); for (const [k, v] of dictEntries(d)) dictSet(out, k, v); return out; }
+    function dictCopy(d) {
+        const out = dict();
+        if (d.str === true) { for (const [k, v] of d.map) dictSet(out, k, v); return out; }
+        for (const [k, v] of dictEntries(d)) dictSet(out, k, v);
+        return out;
+    }
     function dictFromMap(m) { const d = dict(); for (const [k, v] of m) dictSet(d, k, v); return d; }
     function mapFromDict(d) { const m = new Map(); for (const [k, v] of dictEntries(d)) m.set(typeof k === "string" ? k : rt.str(k), v); return m; }
     // A dict subclass that keeps dict's own __iter__ is read from its
@@ -974,13 +1054,14 @@
     rt.sliceArray = sliceArray;
     function codepoints(s) { return hasSurrogate(s) ? Array.from(s) : s.split(""); }
     rt.codepoints = codepoints;
+    // The engine answers from the string's ASCII flag (`__zipp_py_str`, a
+    // native bound only in Python programs); the regex scan, also native,
+    // is the fallback. Either beats an interpreted loop.
+    const SURROGATE = /[\ud800-\udfff]/;
+    let STR_QUERY = null;
+    try { STR_QUERY = typeof __zipp_py_str === "function" ? __zipp_py_str : null; } catch (e) { STR_QUERY = null; }
     function hasSurrogate(s) {
-        const n = s.length;
-        if (n < 48) {
-            for (let i = 0; i < n; i++) { const c = s.charCodeAt(i); if (c >= 0xd800 && c <= 0xdfff) return true; }
-            return false;
-        }
-        return /[\ud800-\udfff]/.test(s);
+        return STR_QUERY !== null ? STR_QUERY(s) : SURROGATE.test(s);
     }
     rt.hasSurrogate = hasSurrogate;
     // The length in code points.

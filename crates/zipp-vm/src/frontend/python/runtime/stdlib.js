@@ -947,9 +947,12 @@
         // floats stay distinct (1.0 is "1.0"), a dict is its entries in
         // insertion order (so any key text is just a key), and `default`
         // is the fallback for anything else.
+        // A test first: a replace with a callback costs several times the
+        // test even when nothing matches, and almost nothing does.
+        const NON_PRINTABLE = /[^\x20-\x7e]/;
         function quote(s, ensureAscii) {
             const q = JSON.stringify(s);
-            return ensureAscii ? q.replace(/[^\x20-\x7e]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")) : q;
+            return ensureAscii && NON_PRINTABLE.test(q) ? q.replace(/[^\x20-\x7e]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")) : q;
         }
         function floatText(x, o) {
             if (Number.isFinite(x)) return rt.floatRepr(x);
@@ -966,45 +969,64 @@
             if (o.skipKeys) return undefined;
             fail(E.TypeError, "keys must be str, int, float, bool or None, not " + typeOf(k).name);
         }
+        // No closure captures a parameter here (a captured one lives in a
+        // cell), and every loop indexes: this is the encoder's hot path.
         function encode(v, o, level) {
             if (v === null) return "null";
-            const t = typeof v;
-            if (t === "boolean") return v ? "true" : "false";
-            if (t === "string") return quote(v, o.ensureAscii);
-            if (t === "bigint") return v.toString();
-            if (t === "number") return floatText(v, o);
+            if (typeof v === "string") return quote(v, o.ensureAscii);
+            if (typeof v === "bigint") return v.toString();
+            if (typeof v === "boolean") return v ? "true" : "false";
+            if (typeof v === "number") return floatText(v, o);
             const c = v.cls;
-            if (c === T.list || c === T.tuple || (v.items !== undefined && (isInstance(v, T.list) || isInstance(v, T.tuple)))) {
-                if (!v.items.length) return "[]";
-                enter(v, o);
-                const parts = v.items.map((x) => encode(x, o, level + 1));
-                o.seen.delete(v);
-                return wrap("[", parts, "]", o, level);
-            }
-            if (c === T.dict || (v.map !== undefined && isInstance(v, T.dict))) {
-                let entries = rt.dictEntryList(v);
-                if (!entries.length) return "{}";
-                enter(v, o);
-                if (o.sortKeys) {
-                    // Python ordering of the keys. Str keys sort by code point,
-                    // which is the UTF-16 order of JS `<` unless a key has an
-                    // astral character.
-                    if (entries.every((e) => typeof e[0] === "string")) entries.sort(entries.some((e) => rt.hasSurrogate(e[0])) ? (x, y) => rt.compareStrings(x[0], y[0]) : (x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
-                    else entries = rt.sortItems(entries.map((e) => e[0]), null, false).map((k) => [k, dictGet(v, k)]);
-                }
-                const parts = [];
-                for (const [k, x] of entries) {
-                    const kt = keyText(k, o);
-                    if (kt !== undefined) parts.push(quote(kt, o.ensureAscii) + o.kv + encode(x, o, level + 1));
-                }
-                o.seen.delete(v);
-                return parts.length ? wrap("{", parts, "}", o, level) : "{}";
-            }
+            if (c === T.list || c === T.tuple || (v.items !== undefined && (isInstance(v, T.list) || isInstance(v, T.tuple)))) return encodeSeq(v, o, level);
+            if (c === T.dict || (v.map !== undefined && isInstance(v, T.dict))) return encodeDict(v, o, level);
             if (o.dflt === null) fail(E.TypeError, "Object of type " + typeOf(v).name + " is not JSON serializable");
             enter(v, o);
             const r = encode(call(o.dflt, [v], null), o, level);
             o.seen.delete(v);
             return r;
+        }
+        function encodeSeq(v, o, level) {
+            const items = v.items;
+            if (!items.length) return "[]";
+            enter(v, o);
+            const parts = new Array(items.length);
+            for (let i = 0; i < items.length; i++) parts[i] = encode(items[i], o, level + 1);
+            o.seen.delete(v);
+            return wrap("[", parts, "]", o, level);
+        }
+        const entryKey = (e) => e[0];
+        function sortedEntries(v, entries) {
+            // Python ordering of the keys. Str keys sort by code point,
+            // which is the UTF-16 order of JS `<` unless a key has an
+            // astral character.
+            let strKeys = true;
+            for (let i = 0; i < entries.length; i++) if (typeof entries[i][0] !== "string") { strKeys = false; break; }
+            // Distinct str keys: the engine's ordering (code-point order)
+            // sorts them without a callback per comparison.
+            const perm = strKeys && rt.PYORD !== null ? rt.PYORD(1, rt.amap(entries, entryKey)) : undefined;
+            if (perm !== undefined) {
+                const out = new Array(perm.length);
+                for (let i = 0; i < perm.length; i++) out[i] = entries[perm[i]];
+                return out;
+            }
+            if (strKeys) return entries.sort(entries.some((e) => rt.hasSurrogate(e[0])) ? (x, y) => rt.compareStrings(x[0], y[0]) : (x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+            return rt.sortItems(entries.map(entryKey), null, false).map((k) => [k, dictGet(v, k)]);
+        }
+        function encodeDict(v, o, level) {
+            let entries = rt.dictEntryList(v);
+            if (!entries.length) return "{}";
+            enter(v, o);
+            if (o.sortKeys) entries = sortedEntries(v, entries);
+            const parts = [];
+            const ascii = o.ensureAscii, kv = o.kv;
+            for (let i = 0; i < entries.length; i++) {
+                const e = entries[i];
+                const kt = keyText(e[0], o);
+                if (kt !== undefined) parts.push(quote(kt, ascii) + kv + encode(e[1], o, level + 1));
+            }
+            o.seen.delete(v);
+            return parts.length ? wrap("{", parts, "}", o, level) : "{}";
         }
         function enter(v, o) { if (o.seen.has(v)) fail(E.ValueError, "Circular reference detected"); o.seen.add(v); }
         function wrap(open, parts, close, o, level) {
@@ -1046,19 +1068,19 @@
                 const line = s.slice(0, pos).split("\n").length, col = pos === 0 ? 1 : pos - s.lastIndexOf("\n", pos - 1);
                 throw rt.makeExc(E.JSONDecodeError, [msg + ": line " + line + " column " + col + " (char " + pos + ")"]);
             };
-            const ws = () => { while (i < n && (s[i] === " " || s[i] === "\t" || s[i] === "\n" || s[i] === "\r")) i++; };
+            const ws = () => { let c; while (i < n && ((c = s.charCodeAt(i)) === 32 || c === 9 || c === 10 || c === 13)) i++; };
             const constant = (text, v) => { i += text.length; return pConst === null ? v : call(pConst, [text], null); };
             function object() {
                 // object_pairs_hook sees the (key, value) list; otherwise a dict.
                 const d = pairsHook === null ? dict() : null, pairs = d === null ? [] : null;
-                i++; ws();
+                i++; if (s.charCodeAt(i) <= 32) ws();
                 if (s[i] !== "}") {
                     for (;;) {
-                        ws(); if (s[i] !== '"') err("Expecting property name enclosed in double quotes");
-                        const k = string(); ws(); if (s[i] !== ":") err("Expecting ':' delimiter"); i++;
+                        if (s.charCodeAt(i) <= 32) ws(); if (s[i] !== '"') err("Expecting property name enclosed in double quotes");
+                        const k = string(); if (s.charCodeAt(i) <= 32) ws(); if (s[i] !== ":") err("Expecting ':' delimiter"); i++;
                         const v = value();
                         if (d !== null) dictSet(d, k, v); else pairs.push(tuple([k, v]));
-                        ws();
+                        if (s.charCodeAt(i) <= 32) ws();
                         if (s[i] === ",") { i++; continue; }
                         if (s[i] === "}") break;
                         err("Expecting ',' delimiter");
@@ -1069,11 +1091,21 @@
                 return objectHook === null ? d : call(objectHook, [d], null);
             }
             function value() {
-                ws();
+                if (s.charCodeAt(i) <= 32) ws();
                 if (i >= n) err("Expecting value");
                 const c = s[i];
+                const u = s.charCodeAt(i);
+                // A digit, or a minus not starting `-Infinity`: a number.
+                if ((u >= 48 && u <= 57) || (u === 45 && s.charCodeAt(i + 1) !== 73)) {
+                    NUMBER.lastIndex = i;
+                    const m = NUMBER.exec(s);
+                    if (!m) err("Expecting value");
+                    i += m[0].length;
+                    if (m[1] || m[2]) return pFloat === null ? Number(m[0]) : call(pFloat, [m[0]], null);
+                    return pInt === null ? BigInt(m[0]) : call(pInt, [m[0]], null);
+                }
                 if (c === "{") return object();
-                if (c === "[") { i++; const items = []; ws(); if (s[i] === "]") { i++; return list(items); } for (;;) { items.push(value()); ws(); if (s[i] === ",") { i++; continue; } if (s[i] === "]") { i++; return list(items); } err("Expecting ',' delimiter"); } }
+                if (c === "[") { i++; const items = []; if (s.charCodeAt(i) <= 32) ws(); if (s[i] === "]") { i++; return list(items); } for (;;) { items.push(value()); if (s.charCodeAt(i) <= 32) ws(); if (s[i] === ",") { i++; continue; } if (s[i] === "]") { i++; return list(items); } err("Expecting ',' delimiter"); } }
                 if (c === '"') return string();
                 if (s.startsWith("true", i)) { i += 4; return true; }
                 if (s.startsWith("false", i)) { i += 5; return false; }
@@ -1088,13 +1120,18 @@
                 if (m[1] || m[2]) return pFloat === null ? Number(m[0]) : call(pFloat, [m[0]], null);
                 return pInt === null ? BigInt(m[0]) : call(pInt, [m[0]], null);
             }
+            // The next backslash at or after `i`, found natively and kept
+            // (-2: not looked for yet; n: there is none).
+            let nextBackslash = -2;
             function string() {
                 const start = i;
                 i++; let out = "";
                 for (;;) {
                     // Copy the run up to the next quote or backslash at once.
-                    let j = i;
-                    while (j < n) { const u = s.charCodeAt(j); if (u === 34 || u === 92) break; j++; }
+                    if (nextBackslash !== n && nextBackslash < i) { nextBackslash = s.indexOf("\\", i); if (nextBackslash < 0) nextBackslash = n; }
+                    let j = s.indexOf('"', i);
+                    if (j < 0) j = n;
+                    if (nextBackslash < j) j = nextBackslash;
                     if (j > i) { out += s.slice(i, j); i = j; }
                     if (i >= n) err("Unterminated string starting at", start);
                     const c = s[i++];
@@ -1836,7 +1873,7 @@
         rt.modules.set("collections.abc", g.get("abc"));
     });
     mod("heapq", (g) => {
-        const lt = (a, b) => cmp("lt", a, b);
+        const lt = rt.fastLt;
         const up = (h, i) => { while (i > 0) { const p = (i - 1) >> 1; if (lt(h[i], h[p])) { [h[i], h[p]] = [h[p], h[i]]; i = p; } else break; } };
         const down = (h, i) => { const n = h.length; for (;;) { let m = i; const l = 2 * i + 1, r = l + 1; if (l < n && lt(h[l], h[m])) m = l; if (r < n && lt(h[r], h[m])) m = r; if (m === i) break; [h[i], h[m]] = [h[m], h[i]]; i = m; } };
         fn(g, "heappush", 2, (a) => { a[0].items.push(a[1]); up(a[0].items, a[0].items.length - 1); return null; });
@@ -1861,7 +1898,7 @@
                 const mid = Math.floor((lo + hi) / 2);
                 let v = items !== null ? items[mid] : getitem(seq, BigInt(mid));
                 if (key !== null) v = call(key, [v], null);
-                if (right ? cmp("lt", x, v) : !cmp("lt", v, x)) hi = mid; else lo = mid + 1;
+                if (right ? rt.fastLt(x, v) : !rt.fastLt(v, x)) hi = mid; else lo = mid + 1;
             }
             return lo;
         };

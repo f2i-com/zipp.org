@@ -5273,6 +5273,10 @@ impl<'p> Vm<'p> {
             // kernel ran, `false` when the caller must run its own loop.
             #[cfg(feature = "python")]
             PY_TENSOR => self.py_tensor(args)?,
+            #[cfg(feature = "python")]
+            PY_STR => self.py_str_has_surrogate(a0),
+            #[cfg(feature = "python")]
+            PY_ORD => self.py_ord(args)?,
             HOST_CALL => {
                 let kind = self.to_js_string(a0)?;
                 self.preflight_native_iteration_work(args.len().saturating_sub(1) as u64)?;

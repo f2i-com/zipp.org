@@ -5,6 +5,7 @@ use super::symtable::{ScopeKind, SymKind};
 use crate::bytecode::{Instr, Reg};
 use ast::Ranged;
 use rustpython_parser::ast;
+use std::collections::BTreeSet;
 
 /// How a loop steps through its iterable (see [`Emitter::loop_header`]):
 /// a fast mode chosen once, at loop entry, when the iterable allows it,
@@ -14,6 +15,10 @@ pub(super) struct Stepper {
     pub indexed: Option<Indexed>,
     pub iter: Reg,
     pub stop: Reg,
+    /// `(direct, next)`: while `direct` holds, a step is the iterator
+    /// record's own `next` (read once, at loop entry) called on it, which is
+    /// what `fornext` does for a record that wraps no user `__next__`.
+    pub direct_next: Option<(Reg, Reg)>,
 }
 /// Counting `cursor` towards `end` by `step` while `fast` holds.
 pub(super) struct Counted {
@@ -664,6 +669,7 @@ impl<'a> Emitter<'a> {
             indexed: None,
             iter,
             stop,
+            direct_next: None,
         })
     }
 
@@ -683,6 +689,7 @@ impl<'a> Emitter<'a> {
                 indexed: None,
                 iter,
                 stop,
+                direct_next: None,
             });
         }
         let iter = if wrap { self.helper("seqiter", &[value])? } else { value };
@@ -716,8 +723,18 @@ impl<'a> Emitter<'a> {
         self.emit(Instr::Lt { dst: positive, a: zero, b: step })?;
         let here = self.here();
         self.patch(not_range, here)?;
+        // Any other iterator record: its `next`, called directly unless it
+        // wraps a user iterator (whose StopIteration `fornext` translates).
+        let next = self.prop(iter, "next")?;
+        let direct = self.typeof_is(next, "function")?;
+        let no_next = self.jump_if_false(direct)?;
+        let wrapped = self.prop(iter, "wrapped")?;
+        self.emit(Instr::TypeOfIs { dst: direct, a: wrapped, code: 3, neg: false })?;
+        let here = self.here();
+        self.patch(no_next, here)?;
         let stop = self.stop()?;
         Ok(Stepper {
+            direct_next: Some((direct, next)),
             counted: Some(Counted {
                 fast: is_range,
                 cursor,
@@ -747,8 +764,21 @@ impl<'a> Emitter<'a> {
         if let Some(c) = &s.counted {
             to_mode.push(self.jump_if_true(c.fast)?);
         }
+        let mut stepped = None;
+        if let Some((direct, next)) = s.direct_next {
+            let generic = self.jump_if_false(direct)?;
+            let base = self.block(1)?;
+            self.emit(Instr::CallWithThis { dst: item, callee: next, this_v: s.iter, arg_base: base, argc: 0, name: crate::bytecode::NO_NAME })?;
+            stepped = Some(self.jump()?);
+            let here = self.here();
+            self.patch(generic, here)?;
+        }
         let next = self.helper("fornext", &[s.iter])?;
         self.emit(Instr::Move { dst: item, src: next })?;
+        if let Some(j) = stepped {
+            let here = self.here();
+            self.patch(j, here)?;
+        }
         let done = self.alloc()?;
         self.emit(Instr::Eq {
             dst: done,
@@ -879,14 +909,15 @@ impl<'a> Emitter<'a> {
             ast::Expr::Subscript(t) => {
                 let obj = self.expr(&t.value, depth + 1)?;
                 let index = self.expr(&t.slice, depth + 1)?;
-                self.helper("setitem", &[obj, index, value])?;
-                Ok(())
+                if matches!(t.slice.as_ref(), ast::Expr::Slice(_)) {
+                    self.helper("setitem", &[obj, index, value])?;
+                    return Ok(());
+                }
+                self.subscript_set(obj, index, value)
             }
             ast::Expr::Attribute(a) => {
                 let obj = self.expr(&a.value, depth + 1)?;
-                let name = self.string(a.attr.as_str())?;
-                self.helper("setattr", &[obj, name, value])?;
-                Ok(())
+                self.attr_set(obj, a.attr.as_str(), value)
             }
             ast::Expr::Starred(_) => Err(self.error(
                 target,
@@ -1048,18 +1079,21 @@ impl<'a> Emitter<'a> {
             ast::Expr::Subscript(t) => {
                 let obj = self.expr(&t.value, depth)?;
                 let index = self.expr(&t.slice, depth)?;
-                let left = self.helper("getitem", &[obj, index])?;
+                if matches!(t.slice.as_ref(), ast::Expr::Slice(_)) {
+                    let left = self.helper("getitem", &[obj, index])?;
+                    let value = self.arith_operand(&s.op, left, Known::Unknown, &s.value, depth, true)?;
+                    self.helper("setitem", &[obj, index, value])?;
+                    return Ok(());
+                }
+                let left = self.subscript_get(obj, index)?;
                 let value = self.arith_operand(&s.op, left, Known::Unknown, &s.value, depth, true)?;
-                self.helper("setitem", &[obj, index, value])?;
-                Ok(())
+                self.subscript_set(obj, index, value)
             }
             ast::Expr::Attribute(a) => {
                 let obj = self.expr(&a.value, depth)?;
-                let name = self.string(a.attr.as_str())?;
-                let left = self.helper("getattr", &[obj, name])?;
+                let left = self.attr_get(obj, a.attr.as_str())?;
                 let value = self.arith_operand(&s.op, left, Known::Unknown, &s.value, depth, true)?;
-                self.helper("setattr", &[obj, name, value])?;
-                Ok(())
+                self.attr_set(obj, a.attr.as_str(), value)
             }
             other => Err(self.error(other, "illegal augmented assignment target")),
         }
@@ -1098,14 +1132,14 @@ impl<'a> Emitter<'a> {
         let catch_start = self.here();
         self.patch(push, catch_start)?;
         self.forget_line();
-        let exc = self.helper("normexc", &[ereg])?;
+        let exc = self.helper("caught", &[ereg, self.r_line])?;
         for handler in &s.handlers {
             let ast::ExceptHandler::ExceptHandler(h) = handler;
             self.stamp_line(handler)?;
             let next = match &h.type_ {
                 Some(ty) => {
                     let spec = self.expr(ty, depth)?;
-                    let matched = self.helper("excmatch", &[exc, spec])?;
+                    let matched = self.exc_match(exc, spec)?;
                     Some(self.jump_if_false(matched)?)
                 }
                 None => None,
@@ -1115,7 +1149,7 @@ impl<'a> Emitter<'a> {
                 self.store_name(name.as_str(), exc)?;
                 self.control_depth -= 1;
             }
-            self.helper("pushexc", &[exc])?;
+            self.push_exc(exc)?;
             // The handler body runs under its own finally so the current-exception
             // stack is popped (and the `as` name unbound) on EVERY exit: normal
             // completion, `return`, `break`/`continue`, or a raise.
@@ -1133,7 +1167,7 @@ impl<'a> Emitter<'a> {
             let fin2 = self.here();
             self.patch(body_fin, fin2)?;
             self.forget_line();
-            self.helper("popexc", &[])?;
+            self.pop_exc()?;
             if let Some(name) = &h.name {
                 self.delete_name(name.as_str())?;
             }
@@ -1182,8 +1216,8 @@ impl<'a> Emitter<'a> {
             b: two,
         })?;
         let skip = self.jump_if_false(throwing)?;
-        let exc = self.helper("normexc", &[val_reg])?;
-        self.helper("pushexc", &[exc])?;
+        let exc = self.helper("caught", &[val_reg, self.r_line])?;
+        self.push_exc(exc)?;
         self.emit(Instr::LoadBool {
             dst: pushed,
             val: true,
@@ -1205,7 +1239,7 @@ impl<'a> Emitter<'a> {
         self.patch(body_fin, here)?;
         self.forget_line();
         let not_pushed = self.jump_if_false(pushed)?;
-        self.helper("popexc", &[])?;
+        self.pop_exc()?;
         let here = self.here();
         self.patch(not_pushed, here)?;
         self.emit(Instr::EndFinally {
@@ -1285,7 +1319,7 @@ impl<'a> Emitter<'a> {
             val: true,
         })?;
         // Calls __exit__(type, value, tb); rethrows `ereg` unless it returned true.
-        self.helper("withexit", &[exit, ereg])?;
+        self.helper("withexit", &[exit, ereg, self.r_line])?;
         let j2 = self.leave_normally(true, kind_reg)?;
         self.handler_depth -= 1;
         let fin = self.here();
@@ -1336,12 +1370,8 @@ impl<'a> Emitter<'a> {
             },
             _ => self.none()?,
         };
-        let simple = Emitter::simple_arity(args);
         let line = self.line_of(node);
-        let (func_id, child) = self.compile_child(node, name, qualname.clone(), |e| {
-            if let Some(count) = simple {
-                e.arity_guard(count)?;
-            }
+        let (func_id, child) = self.compile_child(node, name, qualname.clone(), Some(args), |e| {
             e.hoist_ints(body)?;
             e.frame_guard(line, |e| {
                 e.suite(body, depth)?;
@@ -1425,7 +1455,7 @@ impl<'a> Emitter<'a> {
         let module_r = self.string(self.module_name())?;
         self.helper("nsinit", &[ns, name_r, qual_r, module_r])?;
         let (func_id, child) =
-            self.compile_child(node, s.name.as_str(), qualname.clone(), |e| {
+            self.compile_child(node, s.name.as_str(), qualname.clone(), None, |e| {
                 if let Some(ast::Stmt::Expr(first)) = s.body.first() {
                     if let ast::Expr::Constant(c) = first.value.as_ref() {
                         if let ast::Constant::Str(doc) = &c.value {
@@ -1482,6 +1512,26 @@ impl<'a> Emitter<'a> {
     pub fn keywords(&mut self, keywords: &[ast::Keyword], depth: usize) -> R<Reg> {
         if keywords.is_empty() {
             return self.none();
+        }
+        // Distinct names and no `**mapping`: nothing can repeat, so the
+        // record is a Map filled in order by its own `set`.
+        let mut names = BTreeSet::new();
+        if self.fast && keywords.iter().all(|k| k.arg.as_ref().is_some_and(|n| names.insert(n.as_str()))) {
+            let record = self.alloc()?;
+            self.emit(Instr::NewMap { dst: record, src: None })?;
+            let set = self.string_index("set");
+            for k in keywords {
+                let mark = self.mark();
+                let value = self.expr(&k.value, depth)?;
+                let args = self.block(2)?;
+                let name = k.arg.as_ref().map(|n| n.as_str()).unwrap_or_default();
+                self.string_into(args, name)?;
+                self.emit(Instr::Move { dst: args + 1, src: value })?;
+                let ignored = self.alloc()?;
+                self.emit(Instr::CallMethod { dst: ignored, obj: record, name: set, arg_base: args, argc: 2 })?;
+                self.release(mark);
+            }
+            return Ok(record);
         }
         let mut record = self.helper("kwnew", &[])?;
         for k in keywords {

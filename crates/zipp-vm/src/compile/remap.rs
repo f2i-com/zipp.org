@@ -961,5 +961,53 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         Instr::Print { arg_base, .. } => {
             *arg_base = m(*arg_base);
         }
+        Instr::PyArith { dst, a, b, .. } => {
+            *dst = m(*dst);
+            *a = m(*a);
+            *b = m(*b);
+        }
+        Instr::PyAddImm { dst, a, .. } => {
+            *dst = m(*dst);
+            *a = m(*a);
+        }
+        Instr::PyCompare { dst, a, b, .. } => {
+            *dst = m(*dst);
+            *a = m(*a);
+            *b = m(*b);
+        }
+        Instr::PyJumpCompare { a, b, .. } => {
+            *a = m(*a);
+            *b = m(*b);
+        }
+        Instr::PyClassOf { dst, obj, .. } => {
+            *dst = m(*dst);
+            *obj = m(*obj);
+        }
+        Instr::PyDictGet { dst, obj, .. } => {
+            *dst = m(*dst);
+            *obj = m(*obj);
+        }
+        Instr::PyDictSet { obj, val, .. } => {
+            *obj = m(*obj);
+            *val = m(*val);
+        }
+        Instr::PyCallEntry { dst, f, .. } => {
+            *dst = m(*dst);
+            *f = m(*f);
+        }
+        Instr::PyGetItem { dst, o, k, seq, dict, .. } => {
+            *dst = m(*dst);
+            *o = m(*o);
+            *k = m(*k);
+            *seq = m(*seq);
+            *dict = m(*dict);
+        }
+        Instr::PySetItem { o, k, v, seq, dict, .. } => {
+            *o = m(*o);
+            *k = m(*k);
+            *v = m(*v);
+            *seq = m(*seq);
+            *dict = m(*dict);
+        }
     }
 }

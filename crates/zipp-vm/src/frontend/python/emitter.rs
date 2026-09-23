@@ -2,13 +2,24 @@
 //! and the prologues of module, function, class-body and comprehension code.
 //!
 //! Every Python code object is one [`FuncProto`] with a fixed ABI: register 0
-//! is the Python function OBJECT (`this`), register 1 is the array of bound
-//! positional values the runtime's `bind` produced (parameters in signature
-//! order, `*args` as a tuple and `**kwargs` as a dict at the end). A class body
-//! receives its namespace as `args[0]`; a comprehension receives the outermost
-//! iterator. Locals are registers, captured locals are cell objects (`{v}`)
-//! in registers, free variables are cells read off `this.cells`, and globals go
+//! is the Python function OBJECT (`this`), and the bound values follow as the
+//! code object's own parameters from register 1, in signature order
+//! (positionals and keyword-only names, then `*args` as a tuple and
+//! `**kwargs` as a dict); a code object with more than [`MAX_DIRECT`] of them
+//! takes one array in register 1 instead. A class body receives its namespace
+//! as its one parameter; a comprehension receives the outermost iterator. A
+//! function of positional parameters only also has one entry per count it
+//! accepts (`f.c<n>`, the code object itself, whose prologue loads the
+//! defaults a shorter call leaves `undefined`), which call sites probe with
+//! `PyCallEntry`; keyword call sites probe `f.k<n>:<names>` the same way.
+//! Locals are registers, captured locals are cell objects (`{v}`) in
+//! registers, free variables are cells read off `this.cells`, and globals go
 //! through the module's dictionary held on `this.globals`.
+//!
+//! Fast paths lower an operation to a guarded inline form (the fused
+//! `Instr::Py*` instructions, or short instruction sequences over the
+//! runtime's per-class cache tables `ga/sa/gm/gb/gp/sp/gx`, see core.js)
+//! and lay its runtime-helper fallback out of line ([`Emitter::defer_cold`]).
 use super::symtable::{Scope, ScopeKind, SymKind, SymTable};
 use super::{Project, BUILTIN_MODULES};
 use crate::bytecode::{FuncProto, Instr, Program, Reg, NO_NAME};
@@ -39,11 +50,28 @@ pub(super) fn py_fast_paths() -> bool {
     }
 }
 pub(super) const MAX_DEPTH: usize = 96;
+/// Code objects with at most this many bound values take them as their own
+/// parameters (registers 1..=n); larger ones take one array. The runtime's
+/// `MAX_DIRECT` (core.js) must agree.
+pub(super) const MAX_DIRECT: usize = 12;
 pub(super) const MAX_FUNCTIONS: usize = 8192;
 pub(super) const MAX_INSTRUCTIONS: usize = 1 << 20;
-/// Registers 0 (`this`) and 1 (the bound-args array) are fixed by the ABI.
+/// Register 0 is `this` (the function object). The bound values follow as
+/// parameters from register 1, or, for a code object with more than
+/// [`MAX_DIRECT`] of them, as one array in register 1.
 pub(super) const REG_FUNC: Reg = 0;
 pub(super) const REG_ARGS: Reg = 1;
+
+/// A slow path laid out after the code object's body (see
+/// [`Emitter::defer_cold`]): the jumps into it, the register mark at the
+/// site, the instruction to resume at, and the code that fills it.
+pub(super) struct ColdBlock<'a> {
+    jumps: Vec<usize>,
+    slow_edges: Vec<usize>,
+    mark: usize,
+    resume: u32,
+    body: Box<dyn FnOnce(&mut Emitter<'a>) -> R<()> + 'a>,
+}
 
 pub(super) struct LoopCtx {
     pub head: u32,
@@ -126,6 +154,12 @@ pub(super) struct Emitter<'a> {
     /// Int literals loaded once ahead of the body ([`Emitter::hoist_ints`]),
     /// by value: [`Emitter::integer`] answers with the register.
     hoisted: HashMap<i128, Reg>,
+    /// `(first, count)`: positional parameters `first..count` have defaults,
+    /// which the prologue loads for any the call left `undefined` (a
+    /// positional entry `f.c<n>` with `n < count`).
+    pub fill_defaults: Option<(usize, usize)>,
+    /// Slow paths still to lay out ([`Emitter::flush_cold`]).
+    cold: Vec<ColdBlock<'a>>,
 }
 
 impl<'a> Emitter<'a> {
@@ -142,6 +176,24 @@ impl<'a> Emitter<'a> {
         program: &'a RefCell<Program>,
         qualname: String,
     ) -> R<Self> {
+        let mut e = Self::new_raw(name, unit, rt_slot, line_slot, table, scope, project, program, qualname);
+        e.prologue()?;
+        Ok(e)
+    }
+    /// [`Emitter::new`] without the prologue, for a caller that configures
+    /// the code object (see [`Emitter::fill_defaults`]) first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_raw(
+        name: &str,
+        unit: Unit<'a>,
+        rt_slot: u32,
+        line_slot: u32,
+        table: &'a SymTable,
+        scope: usize,
+        project: &'a Project<'a>,
+        program: &'a RefCell<Program>,
+        qualname: String,
+    ) -> Self {
         let mut proto = crate::compile::placeholder(name);
         proto.is_strict = true;
         proto.non_constructable = true;
@@ -149,7 +201,7 @@ impl<'a> Emitter<'a> {
         proto.param_count = 1;
         proto.length = 1;
         proto.is_generator = table.scopes[scope].is_generator;
-        let mut e = Emitter {
+        Emitter {
             proto,
             unit,
             rt_slot,
@@ -180,9 +232,9 @@ impl<'a> Emitter<'a> {
             string_consts: HashMap::new(),
             float_consts: HashMap::new(),
             hoisted: HashMap::new(),
-        };
-        e.prologue()?;
-        Ok(e)
+            fill_defaults: None,
+            cold: Vec::new(),
+        }
     }
 
     pub fn scope(&self) -> &'a Scope {
@@ -205,7 +257,24 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn prologue(&mut self) -> R<()> {
+    /// Whether this code object takes its bound values as parameters (see
+    /// [`MAX_DIRECT`]); a class body takes its namespace as its one parameter.
+    pub fn param_count(&self) -> usize {
+        match self.kind() {
+            ScopeKind::Class => 1,
+            _ => self.scope().params.len(),
+        }
+    }
+    pub fn direct_abi(&self) -> bool {
+        self.param_count() <= MAX_DIRECT
+    }
+    pub fn prologue(&mut self) -> R<()> {
+        let direct = self.direct_abi();
+        let nparams = if direct { self.param_count() } else { 1 };
+        self.proto.param_count = nparams as u16;
+        self.proto.length = nparams as u16;
+        self.next = 1 + nparams;
+        self.high = self.next;
         self.r_rt = self.alloc()?;
         self.emit(Instr::LoadGlobal {
             dst: self.r_rt,
@@ -235,25 +304,46 @@ impl<'a> Emitter<'a> {
         }
         self.r_line = self.alloc()?;
         if self.kind() == ScopeKind::Class {
-            let zero = self.small_int(0)?;
-            let ns = self.alloc()?;
-            self.emit(Instr::GetIndex {
-                dst: ns,
-                obj: REG_ARGS,
-                key: zero,
-            })?;
-            self.r_ns = Some(ns);
+            self.r_ns = Some(REG_ARGS);
         }
         let scope = self.scope();
         // Parameters arrive bound, in signature order.
+        let mut defaults = None;
         for (i, name) in scope.params.iter().enumerate() {
-            let idx = self.small_int(i as i32)?;
-            let value = self.alloc()?;
-            self.emit(Instr::GetIndex {
-                dst: value,
-                obj: REG_ARGS,
-                key: idx,
-            })?;
+            let value = if direct {
+                REG_ARGS + i as Reg
+            } else {
+                let idx = self.small_int(i as i32)?;
+                let value = self.alloc()?;
+                self.emit(Instr::GetIndex {
+                    dst: value,
+                    obj: REG_ARGS,
+                    key: idx,
+                })?;
+                value
+            };
+            if let Some((first, count)) = self.fill_defaults.filter(|_| direct) {
+                if i >= first && i < count {
+                    // A positional entry called with fewer values leaves the
+                    // rest undefined: load their defaults.
+                    let given = self.typeof_is(value, "undefined")?;
+                    let skip = self.jump_if_false(given)?;
+                    let table = match defaults {
+                        Some(r) => r,
+                        None => {
+                            let r = self.alloc()?;
+                            defaults = Some(r);
+                            r
+                        }
+                    };
+                    let name = self.string_index("defaults");
+                    self.emit(Instr::GetProp { dst: table, obj: REG_FUNC, name })?;
+                    let idx = self.small_int((i - first) as i32)?;
+                    self.emit(Instr::GetIndex { dst: value, obj: table, key: idx })?;
+                    let here = self.here();
+                    self.patch(skip, here)?;
+                }
+            }
             match scope.symbols.get(name) {
                 Some(SymKind::Cell) => {
                     let cell = self.helper("cell", &[value])?;
@@ -328,8 +418,41 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn finish(mut self) -> FuncProto {
+        debug_assert!(self.cold.is_empty(), "Python emitter: unflushed slow paths");
         self.proto.reg_count = (self.high.max(self.next)) as u16;
         self.proto
+    }
+
+    /// Lay a slow path out of line: `jumps` (already emitted, to be patched)
+    /// enter it, `body` fills it, and it jumps back to the instruction after
+    /// the current one. The fast path falls through with no jump over it.
+    /// It runs at this point of the program, so it may use every register
+    /// at or above the current mark (all dead here), and none below it that
+    /// it does not name.
+    pub fn defer_cold(&mut self, jumps: Vec<usize>, slow_edges: Vec<usize>, body: impl FnOnce(&mut Emitter<'a>) -> R<()> + 'a) {
+        let resume = self.here();
+        self.cold.push(ColdBlock { jumps, slow_edges, mark: self.next, resume, body: Box::new(body) });
+    }
+    /// Emit the deferred slow paths (they may defer more).
+    pub fn flush_cold(&mut self) -> R<()> {
+        let saved = self.next;
+        while !self.cold.is_empty() {
+            let blocks = std::mem::take(&mut self.cold);
+            for block in blocks {
+                let start = self.here();
+                for j in block.jumps {
+                    self.patch(j, start)?;
+                }
+                for j in block.slow_edges {
+                    self.patch_slow(j, start)?;
+                }
+                self.next = block.mark;
+                (block.body)(self)?;
+                self.emit(Instr::Jump { target: block.resume })?;
+            }
+        }
+        self.next = saved;
+        Ok(())
     }
 
     // ---- diagnostics ----------------------------------------------------------
@@ -342,8 +465,10 @@ impl<'a> Emitter<'a> {
         // Lines starting at or before the offset; the table always holds 0.
         self.unit.lines.partition_point(|&start| start <= offset).max(1) as i32
     }
-    /// Stamp the current line into the runtime's line global (one `LoadInt`
-    /// and one `StoreGlobal`; skipped when the line has not changed).
+    /// Stamp the current line into this frame's line register (one
+    /// `LoadInt`; skipped when the line has not changed). The frame guard
+    /// and the frame's own handlers read it (`addframe`, `caught`), which
+    /// is where an exception learns the line it was raised on.
     pub fn stamp_line(&mut self, node: &impl Ranged) -> R<()> {
         let line = self.line_of(node);
         if line == self.last_line {
@@ -354,10 +479,6 @@ impl<'a> Emitter<'a> {
         self.emit(Instr::LoadInt {
             dst: self.r_line,
             val,
-        })?;
-        self.emit(Instr::StoreGlobal {
-            idx: self.line_slot,
-            src: self.r_line,
         })?;
         Ok(())
     }
@@ -419,11 +540,40 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PushHandler {
                 catch_target: dst, ..
             })
-            | Some(Instr::PushFinally { target: dst, .. }) => {
+            | Some(Instr::PushFinally { target: dst, .. })
+            | Some(Instr::PyJumpCompare { target: dst, .. })
+            | Some(Instr::PyArith { slow: dst, .. })
+            | Some(Instr::PyAddImm { slow: dst, .. })
+            | Some(Instr::PyCompare { slow: dst, .. })
+            | Some(Instr::PyClassOf { slow: dst, .. })
+            | Some(Instr::PyDictGet { slow: dst, .. })
+            | Some(Instr::PyDictSet { slow: dst, .. })
+            | Some(Instr::PyCallEntry { slow: dst, .. })
+            | Some(Instr::PyGetItem { slow: dst, .. })
+            | Some(Instr::PySetItem { slow: dst, .. }) => {
                 *dst = target;
                 Ok(())
             }
             _ => Err("Python emitter: invalid jump patch".into()),
+        }
+    }
+    /// Patch the slow-path target of a fused Python fast-path instruction.
+    pub fn patch_slow(&mut self, at: usize, target: u32) -> R<()> {
+        match self.proto.code.get_mut(at) {
+            Some(Instr::PyJumpCompare { slow: dst, .. })
+            | Some(Instr::PyArith { slow: dst, .. })
+            | Some(Instr::PyAddImm { slow: dst, .. })
+            | Some(Instr::PyCompare { slow: dst, .. })
+            | Some(Instr::PyClassOf { slow: dst, .. })
+            | Some(Instr::PyDictGet { slow: dst, .. })
+            | Some(Instr::PyDictSet { slow: dst, .. })
+            | Some(Instr::PyCallEntry { slow: dst, .. })
+            | Some(Instr::PyGetItem { slow: dst, .. })
+            | Some(Instr::PySetItem { slow: dst, .. }) => {
+                *dst = target;
+                Ok(())
+            }
+            _ => Err("Python emitter: invalid slow-path patch".into()),
         }
     }
     pub fn jump(&mut self) -> R<usize> {
@@ -448,8 +598,19 @@ impl<'a> Emitter<'a> {
     }
     pub fn string(&mut self, value: &str) -> R<Reg> {
         let dst = self.alloc()?;
+        self.string_into(dst, value)?;
+        Ok(dst)
+    }
+    /// A string constant loaded straight into `dst`.
+    pub fn string_into(&mut self, dst: Reg, value: &str) -> R<()> {
+        let idx = self.string_const(value);
+        self.emit(Instr::LoadConst { dst, idx })?;
+        Ok(())
+    }
+    /// The constant-pool index of a string constant (shared per value).
+    pub fn string_const(&mut self, value: &str) -> u32 {
         let si = self.string_index(value);
-        let idx = match self.string_consts.get(&si) {
+        match self.string_consts.get(&si) {
             Some(&idx) => idx,
             None => {
                 let idx = self.proto.constants.len() as u32;
@@ -459,9 +620,7 @@ impl<'a> Emitter<'a> {
                 self.string_consts.insert(si, idx);
                 idx
             }
-        };
-        self.emit(Instr::LoadConst { dst, idx })?;
-        Ok(dst)
+        }
     }
     /// [`Self::string`] for a value known to be distinct from every other
     /// constant (the virtual filesystem's paths and contents): it is appended
@@ -512,9 +671,14 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         const MAX_HOISTED: usize = 32;
+        // Interned values allocate nothing, but a register read is still
+        // one instruction fewer than a load inside the loop; the ones that
+        // allocate go first.
         let interned = crate::heap::INTERN_BIGINT_MIN..=crate::heap::INTERN_BIGINT_MAX;
-        for value in super::nesting::loop_int_literals(stmts) {
-            if interned.contains(&value) || self.hoisted.contains_key(&value) {
+        let mut values = super::nesting::loop_int_literals(stmts);
+        values.sort_by_key(|v| interned.contains(v));
+        for value in values {
+            if self.hoisted.contains_key(&value) {
                 continue;
             }
             if self.hoisted.len() >= MAX_HOISTED {
@@ -662,12 +826,45 @@ impl<'a> Emitter<'a> {
         self.forget_line();
         let exc = self.helper("addframe", &[ereg, REG_FUNC, self.r_line])?;
         self.emit(Instr::Throw { src: exc })?;
-        Ok(())
+        self.flush_cold()
     }
     /// `call(f, args, kwargs)` through the runtime (one helper frame around
     /// the callee's own).
     pub fn call_value(&mut self, f: Reg, args: Reg, kwargs: Reg) -> R<Reg> {
         self.helper("callv", &[f, args, kwargs])
+    }
+    /// `f(args...)` with positional arguments in registers. A Python
+    /// function that accepts that many positionals has an entry for the
+    /// count (`f.c<n>`, see `R.func`), called directly with the values as
+    /// its parameters; anything else (including a count the function does
+    /// not accept, which then raises) takes [`Emitter::call_positional`].
+    pub fn call_with(&mut self, f: Reg, regs: &[Reg]) -> R<Reg> {
+        if !self.fast || regs.len() > MAX_DIRECT {
+            let args = self.array(regs)?;
+            return self.call_positional(f, args);
+        }
+        let dst = self.alloc()?;
+        let entry = self.alloc()?;
+        let name = self.string_index(&format!("c{}", regs.len()));
+        let at = self.emit(Instr::PyCallEntry { dst: entry, f, name, slow: 0 })?;
+        let (arg_base, argc) = self.arguments(regs)?;
+        self.emit(Instr::CallWithThis {
+            dst,
+            callee: entry,
+            this_v: f,
+            arg_base,
+            argc,
+            name: NO_NAME,
+        })?;
+        // No entry for the count: the positional-array path, out of line.
+        let regs = regs.to_vec();
+        self.defer_cold(Vec::new(), vec![at], move |e| {
+            let args = e.array(&regs)?;
+            let r = e.call_positional(f, args)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
+        Ok(dst)
     }
     /// A call with positional arguments only. Callables that need no
     /// argument shuffling carry a `fast` entry point (plain functions with
@@ -706,41 +903,6 @@ impl<'a> Emitter<'a> {
         self.patch(end, here)?;
         Ok(dst)
     }
-    /// The callee side of the direct call path: a function whose parameters
-    /// are all plain positionals checks the argument count itself (the
-    /// `bind` path also checks, so both entry points agree). Generators keep
-    /// the checked entry only, so the error is raised at the call.
-    pub fn arity_guard(&mut self, count: usize) -> R<()> {
-        if self.proto.is_generator {
-            return Ok(());
-        }
-        let len = self.prop(REG_ARGS, "length")?;
-        let expected = self.small_int(count as i32)?;
-        let ok = self.alloc()?;
-        self.emit(Instr::Eq {
-            dst: ok,
-            a: len,
-            b: expected,
-        })?;
-        let skip = self.jump_if_true(ok)?;
-        self.helper("arity", &[REG_FUNC, REG_ARGS])?;
-        let here = self.here();
-        self.patch(skip, here)?;
-        Ok(())
-    }
-    /// Only plain positional parameters: no defaults, `*args`, `**kwargs`
-    /// or keyword-only names. Returns the parameter count.
-    pub fn simple_arity(args: &ast::Arguments) -> Option<usize> {
-        let plain = args.posonlyargs.iter().chain(&args.args);
-        if args.vararg.is_some()
-            || args.kwarg.is_some()
-            || !args.kwonlyargs.is_empty()
-            || plain.clone().any(|a| a.default.is_some())
-        {
-            return None;
-        }
-        Some(plain.count())
-    }
     /// `dst = typeof value === <name>` as one fused instruction.
     pub fn typeof_is(&mut self, value: Reg, name: &str) -> R<Reg> {
         let code = crate::bytecode::TYPEOF_NAMES
@@ -772,6 +934,211 @@ impl<'a> Emitter<'a> {
         let here = self.here();
         self.patch(end, here)?;
         Ok(dst)
+    }
+    /// Whether `obj.<name>` may take the inline instance-attribute paths.
+    /// `__dict__` and `__class__` are answered specially by the helpers,
+    /// and `__proto__` is a JS accessor name the cache tables must not use.
+    fn inline_attr_name(&self, name: &str) -> bool {
+        self.fast && !matches!(name, "__dict__" | "__class__" | "__proto__")
+    }
+    /// Jumps to the slow path unless `obj` is a non-null object whose `cls`
+    /// is an object; returns the class register. Everything the inline
+    /// attribute paths read afterwards is a property of those two.
+    fn instance_class(&mut self, obj: Reg, slow: &mut Vec<usize>) -> R<Reg> {
+        let cls = self.alloc()?;
+        slow.push(self.emit(Instr::PyClassOf { dst: cls, obj, slow: 0 })?);
+        Ok(cls)
+    }
+    /// `obj.name` (a read). With fast paths on, an instance of a user class
+    /// whose type has no data descriptor for the name (`cls.ga[name]`, set
+    /// by the `getattr` helper) answers from its own dict when the name is
+    /// there; everything else, and every miss, asks `getattr`.
+    pub fn attr_get(&mut self, obj: Reg, name: &str) -> R<Reg> {
+        if !self.inline_attr_name(name) {
+            let key = self.string(name)?;
+            return self.helper("getattr", &[obj, key]);
+        }
+        let dst = self.alloc()?;
+        let mut slow = Vec::new();
+        let cls = self.instance_class(obj, &mut slow)?;
+        let table = self.prop(cls, "ga")?;
+        let flag = self.prop(table, name)?;
+        let not_plain = self.jump_if_false(flag)?;
+        let key = self.string_const(name);
+        slow.push(self.emit(Instr::PyDictGet { dst, obj, key, absent: false, slow: 0 })?);
+        let name = name.to_owned();
+        let name_g = name.clone();
+        // A property with a one-parameter Python getter (`cls.gp`), out of
+        // line, else the helper.
+        self.defer_cold(vec![not_plain], Vec::new(), move |e| {
+            let table = e.prop(cls, "gp")?;
+            let getter = e.prop(table, &name_g)?;
+            let is_fn = e.typeof_is(getter, "object")?;
+            let none = e.jump_if_false(is_fn)?;
+            let entry = e.prop(getter, "c1")?;
+            let (arg_base, argc) = e.arguments(&[obj])?;
+            e.emit(Instr::CallWithThis { dst, callee: entry, this_v: getter, arg_base, argc, name: NO_NAME })?;
+            let done = e.jump()?;
+            let here = e.here();
+            e.patch(none, here)?;
+            let key = e.string(&name_g)?;
+            let r = e.helper("getattr", &[obj, key])?;
+            e.emit(Instr::Move { dst, src: r })?;
+            let here = e.here();
+            e.patch(done, here)?;
+            Ok(())
+        });
+        self.defer_cold(Vec::new(), slow, move |e| {
+            let key = e.string(&name)?;
+            let r = e.helper("getattr", &[obj, key])?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
+        Ok(dst)
+    }
+    /// `obj.name = value`. With fast paths on, a store the `setattr` helper
+    /// found to be exactly a dict store for this class (`cls.sa[name]`) is
+    /// that store.
+    pub fn attr_set(&mut self, obj: Reg, name: &str, value: Reg) -> R<()> {
+        if !self.inline_attr_name(name) {
+            let key = self.string(name)?;
+            self.helper("setattr", &[obj, key, value])?;
+            return Ok(());
+        }
+        let mut slow = Vec::new();
+        let cls = self.instance_class(obj, &mut slow)?;
+        let table = self.prop(cls, "sa")?;
+        let flag = self.prop(table, name)?;
+        let not_plain = self.jump_if_false(flag)?;
+        let key = self.string_const(name);
+        slow.push(self.emit(Instr::PyDictSet { obj, key, val: value, slow: 0 })?);
+        let name = name.to_owned();
+        let name_s = name.clone();
+        // A property with a two-parameter Python setter (`cls.sp`), out of
+        // line, else the helper.
+        self.defer_cold(vec![not_plain], Vec::new(), move |e| {
+            let table = e.prop(cls, "sp")?;
+            let setter = e.prop(table, &name_s)?;
+            let is_fn = e.typeof_is(setter, "object")?;
+            let none = e.jump_if_false(is_fn)?;
+            let entry = e.prop(setter, "c2")?;
+            let ignored = e.alloc()?;
+            let (arg_base, argc) = e.arguments(&[obj, value])?;
+            e.emit(Instr::CallWithThis { dst: ignored, callee: entry, this_v: setter, arg_base, argc, name: NO_NAME })?;
+            let done = e.jump()?;
+            let here = e.here();
+            e.patch(none, here)?;
+            let key = e.string(&name_s)?;
+            e.helper("setattr", &[obj, key, value])?;
+            let here = e.here();
+            e.patch(done, here)?;
+            Ok(())
+        });
+        self.defer_cold(Vec::new(), slow, move |e| {
+            let key = e.string(&name)?;
+            e.helper("setattr", &[obj, key, value])?;
+            Ok(())
+        });
+        Ok(())
+    }
+    /// Jumps to `slow` unless `obj` is a non-null object; returns its `cls`.
+    pub fn object_class(&mut self, obj: Reg, slow: &mut Vec<usize>) -> R<Reg> {
+        self.instance_class(obj, slow)
+    }
+    /// `dst = Number(big)` for a BigInt in `big`, through the VM's guarded
+    /// `Number` intrinsic (the callee is the runtime's own reference).
+    pub fn bigint_to_number(&mut self, big: Reg) -> R<Reg> {
+        let callee = self.prop(self.r_rt, "Number")?;
+        let (arg_base, argc) = self.arguments(&[big])?;
+        let dst = self.alloc()?;
+        self.emit(Instr::GlobalFn { dst, op: crate::bytecode::GlobalFn::Number, callee, arg_base, argc })?;
+        Ok(dst)
+    }
+    /// `o[k]` (not a slice). Inline: an exact list or tuple indexed by an
+    /// int reads its items array at `Number(k)`, and an exact dict still in
+    /// its all-str mode looked up by a str reads its Map; a Python value is
+    /// never `undefined`, so an `undefined` read (a negative or out-of-range
+    /// index, a missing key) is left to the `getitem` helper, which answers
+    /// or raises exactly as before.
+    pub fn subscript_get(&mut self, o: Reg, k: Reg) -> R<Reg> {
+        if !self.fast {
+            return self.helper("getitem", &[o, k]);
+        }
+        let dst = self.alloc()?;
+        let seq = self.prop(self.r_rt, "TLIST")?;
+        let dict = self.prop(self.r_rt, "TDICT")?;
+        let at = self.emit(Instr::PyGetItem { dst, o, k, seq, dict, slow: 0 })?;
+        // A tuple, else the helper (which also answers every miss).
+        self.defer_cold(Vec::new(), vec![at], move |e| {
+            let tuple = e.prop(e.r_rt, "TTUPLE")?;
+            let at = e.emit(Instr::PyGetItem { dst, o, k, seq: tuple, dict, slow: 0 })?;
+            let done = e.jump()?;
+            let here = e.here();
+            e.patch_slow(at, here)?;
+            let r = e.helper("getitem", &[o, k])?;
+            e.emit(Instr::Move { dst, src: r })?;
+            let here = e.here();
+            e.patch(done, here)?;
+            Ok(())
+        });
+        Ok(dst)
+    }
+    /// `o[k] = v` (not a slice). Inline: an exact list's in-range element,
+    /// or an exact dict's str key while every key is a str (its `size`
+    /// following, as `dictSet` does); anything else asks the `setitem`
+    /// helper.
+    pub fn subscript_set(&mut self, o: Reg, k: Reg, v: Reg) -> R<()> {
+        if !self.fast {
+            self.helper("setitem", &[o, k, v])?;
+            return Ok(());
+        }
+        let seq = self.prop(self.r_rt, "TLIST")?;
+        let dict = self.prop(self.r_rt, "TDICT")?;
+        let at = self.emit(Instr::PySetItem { o, k, v, seq, dict, slow: 0 })?;
+        self.defer_cold(Vec::new(), vec![at], move |e| {
+            e.helper("setitem", &[o, k, v])?;
+            Ok(())
+        });
+        Ok(())
+    }
+    /// `except spec:` test: an exception whose class is exactly `spec`
+    /// matches inline; anything else asks `excmatch`.
+    pub fn exc_match(&mut self, exc: Reg, spec: Reg) -> R<Reg> {
+        if !self.fast {
+            return self.helper("excmatch", &[exc, spec]);
+        }
+        let dst = self.alloc()?;
+        let cls = self.prop(exc, "cls")?;
+        self.emit(Instr::Eq { dst, a: cls, b: spec })?;
+        let done = self.jump_if_true(dst)?;
+        let r = self.helper("excmatch", &[exc, spec])?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let here = self.here();
+        self.patch(done, here)?;
+        Ok(dst)
+    }
+    /// The exception being handled goes on (and comes off) the runtime's
+    /// current-exception stack: that array's own push and pop.
+    pub fn push_exc(&mut self, exc: Reg) -> R<()> {
+        if !self.fast {
+            self.helper("pushexc", &[exc])?;
+            return Ok(());
+        }
+        let stack = self.prop(self.r_rt, "EXCSTACK")?;
+        self.emit(Instr::ArrayAppend { arr: stack, val: exc, spread: false })?;
+        Ok(())
+    }
+    pub fn pop_exc(&mut self) -> R<()> {
+        if !self.fast {
+            self.helper("popexc", &[])?;
+            return Ok(());
+        }
+        let stack = self.prop(self.r_rt, "EXCSTACK")?;
+        let pop = self.string_index("pop");
+        let base = self.block(1)?;
+        let ignored = self.alloc()?;
+        self.emit(Instr::CallMethod { dst: ignored, obj: stack, name: pop, arg_base: base, argc: 0 })?;
+        Ok(())
     }
     pub fn cell_get(&mut self, cell: Reg) -> R<Reg> {
         self.prop(cell, "v")
@@ -972,6 +1339,7 @@ impl<'a> Emitter<'a> {
         node: &impl Ranged,
         name: &str,
         qualname: String,
+        signature: Option<&ast::Arguments>,
         body: impl FnOnce(&mut Emitter<'a>) -> R<()>,
     ) -> R<(u32, &'a Scope)> {
         let range = node.range();
@@ -989,7 +1357,7 @@ impl<'a> Emitter<'a> {
         if self.program.borrow().functions.len() >= MAX_FUNCTIONS {
             return Err(self.error(node, "function count limit exceeded"));
         }
-        let mut child = Emitter::new(
+        let mut child = Emitter::new_raw(
             name,
             self.unit,
             self.rt_slot,
@@ -999,9 +1367,25 @@ impl<'a> Emitter<'a> {
             self.project,
             self.program,
             qualname,
-        )?;
+        );
+        if let Some(args) = signature {
+            // The positionals with defaults, which a positional entry
+            // (`f.c<n>`, see `R.func`) may leave undefined.
+            let positional = args.posonlyargs.len() + args.args.len();
+            let first = args
+                .posonlyargs
+                .iter()
+                .chain(&args.args)
+                .position(|a| a.default.is_some())
+                .unwrap_or(positional);
+            if first < positional {
+                child.fill_defaults = Some((first, positional));
+            }
+        }
+        child.prologue()?;
         child.future_annotations = self.future_annotations;
         body(&mut child)?;
+        child.flush_cold()?;
         let mut program = self.program.borrow_mut();
         let func_id = program.functions.len() as u32;
         program.functions.push(child.finish());

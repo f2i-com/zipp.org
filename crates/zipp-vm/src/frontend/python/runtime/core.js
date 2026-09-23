@@ -8,11 +8,15 @@
  * None = null. Everything else is a JS object with a `cls` field pointing at
  * its Python class object; instances keep attributes in `dict` (a Map).
  *
- * Code ABI: every Python code object is called as `code.call(fnobj, args)`
- * where `fnobj` is the Python function object (`this`) and `args` is the
- * array of bound positional values `bind` produced. The emitter calls
- * `bind`/`bindmethod` and then issues a direct VM call, so Python frames stay
- * on the VM's explicit frame stack.
+ * Code ABI: every Python code object is called as a member of its Python
+ * function object (`this`), with the bound values as its own parameters
+ * (`invoke`; one array instead past `MAX_DIRECT`). Positional call sites call
+ * a function's per-count entry (`f.c<n>`) directly and everything else binds
+ * (`bindArgs`) first; calls stay on the VM's explicit frame stack. The
+ * emitter's inline attribute, method and construction paths read per-class
+ * cache tables kept here (`ga`, `sa`, `gm`, `gb`, `gp`, `sp`, `gx`, and the
+ * classes' own `c<n>` construction entries), invalidated wherever the class
+ * lookup cache is.
  */
 var __zipp_py_line = 0;
 var __zipp_py_ui = [];
@@ -40,12 +44,34 @@ var __zipp_py = (function () {
     // Direct entry points for the emitter's positional-call path (`fast`):
     // called as `f.fast(args)` with `this` = the callable.
     function typeFast(args) { return this.code([this, args, null]); }
-    function builtinFast(args) { return this.code(builtinArgs(this, args, null)); }
+    // A builtin called with a count its arity admits gets a positional entry
+    // for that count (`c<n>`, the trampoline below), so the emitter's
+    // positional call sites reach it without this frame next time.
+    function builtinFast(args) {
+        const n = args.length, arity = this.arity;
+        if (arity < 0 ? n >= this.minArity : n <= arity && n >= this.minArity) {
+            if (n < BUILTIN_ENTRY.length && this["c" + n] === undefined) this["c" + n] = BUILTIN_ENTRY[n];
+            return this.code(args);
+        }
+        return this.code(builtinArgs(this, args, null));
+    }
+    const BUILTIN_ENTRY = [
+        function () { return this.code([]); },
+        function (a) { return this.code([a]); },
+        function (a, b) { return this.code([a, b]); },
+        function (a, b, c) { return this.code([a, b, c]); },
+        function (a, b, c, d) { return this.code([a, b, c, d]); },
+        function (a, b, c, d, e) { return this.code([a, b, c, d, e]); },
+        function (a, b, c, d, e, f) { return this.code([a, b, c, d, e, f]); },
+    ];
     function makeType(name, bases, dict, module) {
         // `code` makes a class callable through the same member-call path as
         // functions (`prepare` returns self = the class, code = constructCode).
         const t = { cls: null, name: name, qualname: name, module: module || "builtins",
-            bases: bases, mro: null, dict: dict || new Map(), id: nextId++, isType: true, code: constructCode, fast: typeFast };
+            bases: bases, mro: null, dict: dict || new Map(), id: nextId++, isType: true, code: constructCode, fast: typeFast,
+            ga: Object.create(null), sa: Object.create(null), gm: Object.create(null), gb: Object.create(null),
+            gp: Object.create(null), sp: Object.create(null), gx: Object.create(null),
+            userClass: false, flagged: false };
         t.mro = computeMro(t);
         return t;
     }
@@ -165,7 +191,7 @@ var __zipp_py = (function () {
     defExc("BaseExceptionGroup", E.BaseException); defExc("ExceptionGroup", E.BaseExceptionGroup);
     E.ExceptionGroup.bases = [E.BaseExceptionGroup, E.Exception]; E.ExceptionGroup.mro = computeMro(E.ExceptionGroup);
     function locationText(enc) {
-        if (!enc) return "";
+        if (!enc || enc < 0) return "";
         const file = files[Math.floor(enc / 1000000)] || "?";
         return " (" + file + ":" + (enc % 1000000) + ")";
     }
@@ -173,9 +199,14 @@ var __zipp_py = (function () {
     // __context__ (a `raise` statement sets it again at raise time). The
     // location is kept as the encoded line; its text, like the message, is
     // built only when the exception reaches the host (most are caught).
+    // Python code keeps its current line in a register of its frame, not in
+    // a global, so a new (or explicitly raised) exception's line is pending
+    // (-1) until the frame it was raised in handles it (`R.caught`,
+    // `R.withexit`) or lets it out (`R.addframe`): that frame's line register
+    // still holds the raising statement's line then.
     function makeExc(cls, args) {
         return { cls: cls, dict: new Map(), args: sequence(T.tuple, args), cause: null,
-            context: excStack.length ? excStack[excStack.length - 1] : null, tbline: __zipp_py_line, suppress: false };
+            context: excStack.length ? excStack[excStack.length - 1] : null, tbline: -1, suppress: false };
     }
     rt.makeExc = makeExc;
     // The innermost recorded frame holds the line its own frame was running;
@@ -212,6 +243,14 @@ var __zipp_py = (function () {
         return makeExc(E.RuntimeError, [String(e)]);
     }
     R.normexc = normexc; rt.normexc = normexc;
+    // An exception entering a handler of the frame it was raised in (see
+    // `makeExc`): its pending line is that frame's current line.
+    R.caught = function (e, line) {
+        // `normexc`'s own first test, inline: a Python exception is itself.
+        const exc = e !== null && typeof e === "object" && e.tbline !== undefined && e.cls !== undefined && e.cls.mro !== undefined && e.cls.mro.indexOf(E.BaseException) >= 0 ? e : normexc(e);
+        if (exc.tbline === -1) exc.tbline = line;
+        return exc;
+    };
     // Frame guards (one per function and module body) call this while an
     // exception propagates: it records the frame, innermost first.
     // Innermost first; a runaway recursion keeps the innermost frames and
@@ -222,6 +261,7 @@ var __zipp_py = (function () {
         let frames = exc.frames;
         if (frames === undefined) frames = exc.frames = [];
         const enc = typeof line === "number" ? line : 0;
+        if (exc.tbline === -1) exc.tbline = enc;
         const name = f !== null && typeof f === "object" && typeof f.name === "string" ? f.name : "<module>";
         const frame = { file: files[Math.floor(enc / 1000000)] || "?", line: enc % 1000000, name: name };
         if (frames.length < KEEP_INNER) frames.push(frame);
@@ -257,6 +297,8 @@ var __zipp_py = (function () {
     };
     const excStack = [];
     R.pushexc = function (e) { excStack.push(e); return null; };
+    // The emitter pushes and pops this array itself (never replaced).
+    R.EXCSTACK = excStack;
     R.popexc = function () { excStack.pop(); return null; };
     rt.currentExc = function () { return excStack.length ? excStack[excStack.length - 1] : null; };
     R.excmatch = function (e, spec) {
@@ -286,7 +328,7 @@ var __zipp_py = (function () {
         }
         const cur = rt.currentExc();
         if (cur !== null && cur !== e) e.context = cur;
-        e.tbline = __zipp_py_line;
+        e.tbline = -1;
         throw e;
     };
     R.assertfail = function (msg) { throw makeExc(E.AssertionError, msg === null ? [] : [msg]); };
@@ -325,8 +367,57 @@ var __zipp_py = (function () {
     // plain `obj.dict.set` is exactly what `setattr` ends up doing for this
     // class (no `__setattr__` override, an instance dict), false otherwise.
     const SET_PLAN = { setPlan: true };
-    rt.bumpEpoch = function () { typeEpoch++; };
+    // Inline-cache tables the emitter's fast paths read with plain property
+    // loads (`obj.cls.ga.x`), set by the slow helpers once they know a name's
+    // answer for a class and cleared wherever `lcache` entries are:
+    //   ga[name] === true  instances of this user class may answer `name`
+    //                      from their own dict (no data descriptor on the
+    //                      type), so a dict hit is `getattr`'s result;
+    //   sa[name] === true  storing `name` on an instance is exactly
+    //                      `obj.dict.set` (see the plain store in `setattr`);
+    //   gm[name] = f       `obj.name(...)` finds the plain Python function f
+    //                      on the type (the call still checks the instance
+    //                      dict first).
+    //   gp[name] = g       `name` is a property whose getter is the Python
+    //                      function g, which takes the instance as its one
+    //                      positional value (`g.c1`);
+    //   sp[name] = s       likewise a property whose setter s takes
+    //                      (instance, value) (`s.c2`);
+    //   gx[name] === true  nothing on the type answers `name` (no class
+    //                      attribute, no special attribute, no __getattr__):
+    //                      an instance's dict alone does.
+    // Only user classes (`makeClass`) get those: their instances always
+    // carry a Map dict. The dict-less builtin containers and str (see
+    // `R.mfind`) get one more:
+    //   gb[name#n] = b     `obj.name(n values)` calls the builtin method b
+    //                      with the receiver first; its arity admits n + 1.
+    // A false/undefined entry means "ask the helper".
+    const flagged = [];
+    function noteFlagged(t) {
+        if (t.flagged !== true) { t.flagged = true; flagged.push(weakRef(t)); }
+    }
+    function clearFlags(t) {
+        t.ga = Object.create(null); t.sa = Object.create(null); t.gm = Object.create(null); t.gb = Object.create(null);
+        t.gp = Object.create(null); t.sp = Object.create(null); t.gx = Object.create(null);
+        t.flagged = false;
+        if (t.ctorEntries !== undefined) clearCtorEntries(t);
+    }
+    rt.noteFlagged = noteFlagged;
+    rt.bumpEpoch = function () {
+        typeEpoch++;
+        for (let i = 0; i < flagged.length; i++) { const t = flagged[i].deref(); if (t !== undefined) clearFlags(t); }
+        flagged.length = 0;
+    };
     function forgetName(t, name) {
+        if (t.flagged === true) {
+            if (name === "__setattr__") clearFlags(t);
+            else {
+                t.ga[name] = undefined; t.sa[name] = undefined; t.gm[name] = undefined; t.gb = Object.create(null);
+                t.gp[name] = undefined; t.sp[name] = undefined; t.gx[name] = undefined;
+                if (name === "__getattr__") t.gx = Object.create(null);
+            }
+        }
+        if ((name === "__init__" || name === "__new__") && t.ctorEntries !== undefined) clearCtorEntries(t);
         const cache = t.lcache;
         if (cache === undefined) return;
         cache.delete(name);
@@ -399,7 +490,11 @@ var __zipp_py = (function () {
             if (fget === null) fail(E.AttributeError, "property has no getter");
             // The positional entry the emitter's own calls use; `rt.call`
             // binds the same single argument for anything without one.
-            if (fget !== undefined && typeof fget === "object" && fget.fast !== undefined) return fget.fast([obj]);
+            if (fget !== undefined && typeof fget === "object") {
+                const c1 = fget.c1;
+                if (c1 !== undefined) return fget.c1(obj);
+                if (fget.fast !== undefined) return fget.fast([obj]);
+            }
             return rt.call(fget, [obj], null);
         }
         // A user-defined descriptor: __get__ on its type (a class-valued
@@ -448,15 +543,31 @@ var __zipp_py = (function () {
             t = typeOf(obj);
         }
         if (name === "__class__") return t;
+        if (dict !== undefined && t.gx[name] === true) {
+            const v = dict.get(name);
+            if (v !== undefined) return v;
+            if (missing !== undefined) return missing;
+        }
         let attr = cachedType(t, name);
         if (attr === MISSING_ATTR) attr = lookupType(t, name);
         // `isDataDescriptor`, inline: a property, or a class-valued
         // attribute other than a function whose type defines `__set__`.
         if (attr !== undefined && attr !== null && typeof attr === "object") {
             const ac = attr.cls;
-            if (ac === T.property || (ac !== undefined && ac !== T.function && lookupType(ac, "__set__") !== undefined)) return descrGet(attr, obj, t);
+            if (ac === T.property || (ac !== undefined && ac !== T.function && lookupType(ac, "__set__") !== undefined)) {
+                if (ac === T.property && t.userClass === true && dict !== undefined) {
+                    const g = attr.fget;
+                    if (g !== null && typeof g === "object" && g.cls === T.function && typeof g.c1 === "function") { t.gp[name] = g; if (t.flagged !== true) noteFlagged(t); }
+                }
+                return descrGet(attr, obj, t);
+            }
         }
         if (dict !== undefined) {
+            // No data descriptor: a dict hit is the answer from now on, until
+            // the name changes on the class (`forgetName`).
+            if (t.userClass === true && (attr === undefined || attr === null || typeof attr !== "object" || attr.cls === T.function) && name !== "__dict__") {
+                t.ga[name] = true; if (t.flagged !== true) noteFlagged(t);
+            }
             const v = dict.get(name);
             if (v !== undefined) return v;
             if (name === "__dict__" && t.noDict !== true) return rt.instanceDict(obj);
@@ -466,6 +577,7 @@ var __zipp_py = (function () {
         if (special !== undefined) return special;
         const ga = lookupType(t, "__getattr__");
         if (ga !== undefined) return rt.call(ga, [obj, name], null);
+        if (t.userClass === true && dict !== undefined && name !== "__dict__") { t.gx[name] = true; if (t.flagged !== true) noteFlagged(t); }
         if (missing !== undefined) return missing;
         fail(E.AttributeError, "'" + t.name + "' object has no attribute '" + name + "'");
     }
@@ -489,6 +601,7 @@ var __zipp_py = (function () {
                 if (t !== T.module) {
                     const attr = cachedType(t, name);
                     if ((attr === undefined || attr === null || typeof attr !== "object" || attr.cls === T.function) && setPlan(t)) {
+                        if (t.userClass === true) { t.sa[name] = true; if (t.flagged !== true) noteFlagged(t); }
                         dict.set(name, value);
                         return null;
                     }
@@ -504,8 +617,10 @@ var __zipp_py = (function () {
         const attr = lookupType(t, name);
         if (attr !== undefined && attr !== null && typeof attr === "object") {
             if (attr.cls === T.property) {
-                if (attr.fset === null) fail(E.AttributeError, "property '" + name + "' of '" + t.name + "' object has no setter");
-                rt.call(attr.fset, [obj, value], null); return null;
+                const fs = attr.fset;
+                if (fs === null) fail(E.AttributeError, "property '" + name + "' of '" + t.name + "' object has no setter");
+                if (t.userClass === true && typeof fs === "object" && fs.cls === T.function && typeof fs.c2 === "function") { t.sp[name] = fs; if (t.flagged !== true) noteFlagged(t); }
+                rt.call(fs, [obj, value], null); return null;
             }
             const set = attr.isType ? undefined : lookupType(attr.cls, "__set__");
             if (set !== undefined && attr.cls !== T.function) { rt.call(set, [attr, obj, value], null); return null; }
@@ -553,40 +668,81 @@ var __zipp_py = (function () {
     rt.callMethod = callMethod;
 
     // ---- functions, binding and calls ----------------------------------------------------------
+    // The code ABI. A code object takes its bound values as its own JS
+    // parameters, in signature order (positionals and keyword-only names,
+    // then the `*args` tuple, then the `**kwargs` dict), and is called as a
+    // member of its function object (`this`). A code object with more than
+    // MAX_DIRECT bound values takes them as one array instead (`f.arr`).
+    // A function whose signature has only positional parameters also gets
+    // one entry per positional count it accepts, `f.c0`..`f.cN`: the code
+    // object itself, which loads the defaults of the parameters a shorter
+    // call leaves undefined (no Python value is `undefined`). The emitter's
+    // positional call sites probe `f.c<argc>` and call it directly, so the
+    // arity check is the probe; anything else binds and then `invoke`s.
+    const MAX_DIRECT = 12;
+    rt.MAX_DIRECT = MAX_DIRECT;
+    // `f.code(...bound)` without a spread call, which the VM would run on a
+    // nested native interpreter (a recursion limit the wasm build keeps low).
+    function invoke(f, a) {
+        if (f.arr === true) return f.code(a);
+        switch (a.length) {
+            case 0: return f.code();
+            case 1: return f.code(a[0]);
+            case 2: return f.code(a[0], a[1]);
+            case 3: return f.code(a[0], a[1], a[2]);
+            case 4: return f.code(a[0], a[1], a[2], a[3]);
+            case 5: return f.code(a[0], a[1], a[2], a[3], a[4]);
+            case 6: return f.code(a[0], a[1], a[2], a[3], a[4], a[5]);
+            case 7: return f.code(a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+            case 8: return f.code(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+            case 9: return f.code(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+            case 10: return f.code(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]);
+            case 11: return f.code(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10]);
+            case 12: return f.code(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]);
+        }
+        fail(E.RuntimeError, "internal: bad bound argument count");
+    }
+    rt.invoke = invoke;
+    // Generator functions: `code` creates the generator (the body runs up
+    // to its GenStart, binding the parameters, now) from `this.real`, the
+    // generator code object, forwarding the bound values as they came.
+    const GEN_ENTRY = [
+        function () { return rt.makeGenerator(this.real(), this); },
+        function (a) { return rt.makeGenerator(this.real(a), this); },
+        function (a, b) { return rt.makeGenerator(this.real(a, b), this); },
+        function (a, b, c) { return rt.makeGenerator(this.real(a, b, c), this); },
+        function (a, b, c, d) { return rt.makeGenerator(this.real(a, b, c, d), this); },
+        function (a, b, c, d, e) { return rt.makeGenerator(this.real(a, b, c, d, e), this); },
+        function (a, b, c, d, e, g) { return rt.makeGenerator(this.real(a, b, c, d, e, g), this); },
+        function (a, b, c, d, e, g, h) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h), this); },
+        function (a, b, c, d, e, g, h, i) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i), this); },
+        function (a, b, c, d, e, g, h, i, j) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i, j), this); },
+        function (a, b, c, d, e, g, h, i, j, k) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i, j, k), this); },
+        function (a, b, c, d, e, g, h, i, j, k, l) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i, j, k, l), this); },
+        function (a, b, c, d, e, g, h, i, j, k, l, m) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i, j, k, l, m), this); },
+    ];
+    function genEntryArr(a) { return rt.makeGenerator(this.real(a), this); }
+    // The positional-array entry every callable has (`f.fast(args)`).
+    function funcFast(args) { return invoke(this, bindArgs(this, args, null)); }
     R.func = function (code, name, qualname, argnames, posonly, positional, varargs, varkw,
                        defaults, kwdefNames, kwdefValues, cells, globals, isgen, doc, module) {
         const f = { cls: T.function, code: code, name: name, qualname: qualname, argnames: argnames,
             posonly: posonly, positional: positional, varargs: varargs, varkw: varkw,
             defaults: defaults, kwdefaults: null, cells: cells, globals: globals, isgen: isgen,
-            doc: doc, module: module, dict: new Map(), simple: false };
+            doc: doc, module: module, dict: new Map(), simple: false, arr: false, fast: funcFast };
         if (kwdefNames.length) { f.kwdefaults = new Map(); for (let i = 0; i < kwdefNames.length; i++) f.kwdefaults.set(kwdefNames[i], kwdefValues[i]); }
         f.simple = !varargs && !varkw && argnames.length === positional && defaults.length === 0;
+        const nbound = argnames.length + (varargs ? 1 : 0) + (varkw ? 1 : 0);
+        f.arr = nbound > MAX_DIRECT;
         if (isgen) {
-            // Called as `f.code(args)` (a member call, `this` = f): creating
-            // the generator goes through `this.real`, never `Function.call`,
-            // which would re-enter the interpreter natively.
             f.real = code;
-            f.code = function (args) { return rt.makeGenerator(this.real(args), f); };
-        } else if (f.simple) {
-            // The body starts with its own argument-count guard.
-            f.fast = code;
-        } else if (!varargs && !varkw && argnames.length === positional) {
-            // Positional parameters with defaults: the positional call path
-            // appends the missing defaults instead of going through bindArgs.
-            f.fast = defaultsFast;
+            f.code = f.arr ? genEntryArr : GEN_ENTRY[nbound];
+        }
+        if (!f.arr && !varargs && !varkw && argnames.length === positional) {
+            for (let n = positional - defaults.length; n <= positional; n++) f["c" + n] = f.code;
         }
         return f;
     };
-    // `this` is the function; `args` is the fresh positional array of the call.
-    function defaultsFast(args) {
-        const n = args.length, npos = this.positional;
-        if (n !== npos) {
-            const defaults = this.defaults, first = npos - defaults.length;
-            if (n < first || n > npos) return this.code(bindArgs(this, args, null));
-            for (let i = n; i < npos; i++) args.push(defaults[i - first]);
-        }
-        return this.code(args);
-    }
     R.arity = function (f, args) { arityError(f, args.length); };
     R.fannotate = function (f, names, values) { const m = new Map(); for (let i = 0; i < names.length; i++) m.set(names[i], values[i]); f.annotations = m; return null; };
     // A builtin: `code(args)` with `this` unused; `arity` -1 for variadic.
@@ -633,6 +789,36 @@ var __zipp_py = (function () {
         if (f.simple && nkw === 0) {
             if (args.length !== f.positional) arityError(f, args.length);
             return args;
+        }
+        // Only positional-or-keyword parameters, and keywords that all name
+        // parameters the positionals left (none positional-only): each fills
+        // its own slot and defaults fill the rest. Anything else (an unknown,
+        // repeated or positional-only keyword, a missing argument) binds
+        // below, which also raises.
+        if (nkw !== 0 && !f.varargs && !f.varkw && f.argnames.length === f.positional) {
+            const names = f.argnames, npos = f.positional, na = args.length;
+            if (na <= npos && na >= f.posonly) {
+                const defaults = f.defaults, first = npos - defaults.length, out = args.slice();
+                let used = 0, i = na;
+                for (; i < npos; i++) {
+                    const v = kwargs.get(names[i]);
+                    if (v !== undefined) { out.push(v); used++; }
+                    else if (i >= first) out.push(defaults[i - first]);
+                    else break;
+                }
+                if (i === npos && used === nkw) {
+                    // Keywords naming the next parameters in order: the call is
+                    // the positional one of all its values. Recorded for the
+                    // emitter's keyword call sites (`k<n>:<names>`).
+                    const entry = f.arr ? undefined : f["c" + (na + nkw)];
+                    if (entry !== undefined) {
+                        let j = na, inOrder = true;
+                        for (const k of kwargs.keys()) { if (k !== names[j]) { inOrder = false; break; } j++; }
+                        if (inOrder) f["k" + na + ":" + names.slice(na, na + nkw).join(",")] = entry;
+                    }
+                    return out;
+                }
+            }
         }
         const names = f.argnames, npos = f.positional, nall = names.length;
         const out = new Array(nall);
@@ -769,11 +955,13 @@ var __zipp_py = (function () {
         }
         fail(TypeError, "'" + typeOf(f).name + "' object is not callable");
     }
+    // `prepare`'s record, for the runtime's own callers (`call` below); a
+    // function's `code` takes the bound values as parameters (`invoke`).
     R.bind = prepare;
-    // `obj.name(args)` resolved and called in one step. The callee runs as
-    // a member call (`f.code(args)`), a VM frame below this one; the emitter
-    // keeps a `bindmethod` + direct-call form for callers that need the
-    // callee's frame to sit directly on their own.
+    // `obj.name(args)` resolved and called in one step, for the runtime's
+    // own callers. The callee runs as a member call, a VM frame below this
+    // one; the emitter resolves methods itself (`R.mfind` and the inline
+    // caches) and calls the callee's entry directly.
     R.callmethod = function (obj, name, args, kwargs) {
         let t;
         if (obj !== null && typeof obj === "object") {
@@ -797,11 +985,21 @@ var __zipp_py = (function () {
             if (ac === T.function || ac === T.builtin_function_or_method) {
                 const inst = obj !== null && typeof obj === "object" && obj.dict !== undefined ? obj.dict.get(name) : undefined;
                 if (inst === undefined) {
-                    const withSelf = [obj]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
                     if (ac === T.function) {
-                        if (attr.fast !== undefined && kwargs === null) return attr.fast(withSelf);
-                        return attr.code(bindArgs(attr, withSelf, kwargs));
+                        // The receiver and up to three values straight into
+                        // the parameters when they are exactly the signature.
+                        if (kwargs === null && attr.simple === true && attr.positional === args.length + 1) {
+                            switch (args.length) {
+                                case 0: return attr.code(obj);
+                                case 1: return attr.code(obj, args[0]);
+                                case 2: return attr.code(obj, args[0], args[1]);
+                                case 3: return attr.code(obj, args[0], args[1], args[2]);
+                            }
+                        }
+                        const withSelf = [obj]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
+                        return invoke(attr, bindArgs(attr, withSelf, kwargs));
                     }
+                    const withSelf = [obj]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
                     if (attr.unboxSelf === true && typeof obj === "object") withSelf[0] = unbox(obj);
                     // `builtinArgs` with no keywords and a count the arity
                     // admits returns the array itself.
@@ -816,42 +1014,15 @@ var __zipp_py = (function () {
         return call(getattr(obj, name), args, kwargs);
     };
     R.callv = function (f, args, kwargs) { return call(f, args, kwargs); };
-    R.bindmethod = function (obj, name, args, kwargs) {
-        // obj.name(args): resolve like getattr but avoid allocating a bound
-        // method when the attribute is a plain or builtin function on the type.
-        let t;
-        if (obj !== null && typeof obj === "object") {
-            if (obj.isType || obj.cls === T.module || obj.cls === T.super) return prepare(getattr(obj, name), args, kwargs);
-            t = obj.cls || ObjectType;
-        } else {
-            t = typeOf(obj);
-        }
-        const attr = lookupType(t, name);
-        if (attr !== undefined && attr !== null && typeof attr === "object") {
-            const ac = attr.cls;
-            if (ac === T.function || ac === T.builtin_function_or_method) {
-                const inst = obj !== null && typeof obj === "object" && obj.dict !== undefined ? obj.dict.get(name) : undefined;
-                if (inst === undefined) {
-                    const withSelf = [obj]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
-                    if (ac === T.function) {
-                        // A plain-positional function validates the count itself.
-                        if (attr.fast !== undefined && kwargs === null) return prepared(attr.fast, attr, withSelf);
-                        return prepared(attr.code, attr, bindArgs(attr, withSelf, kwargs));
-                    }
-                    if (attr.unboxSelf === true && typeof obj === "object") withSelf[0] = unbox(obj);
-                    return prepared(attr.code, attr, builtinArgs(attr, withSelf, kwargs));
-                }
-            }
-        }
-        return prepare(getattr(obj, name), args, kwargs);
-    };
     // Calling from JS (helpers, dunder dispatch). `prepare` guarantees that
     // `p.self.code === p.code`, so this is a member call the VM runs on its
     // own frame stack — never `Function.prototype.call`, which re-enters the
     // interpreter natively (and the wasm build allows only one such level).
     function call(f, args, kwargs) {
+        if (f !== null && typeof f === "object" && f.cls === T.function) return invoke(f, bindArgs(f, args, kwargs === undefined ? null : kwargs));
         const p = prepare(f, args, kwargs === undefined ? null : kwargs);
-        return p.self.code(p.args);
+        const self = p.self;
+        return self.cls === T.function ? invoke(self, p.args) : self.code(p.args);
     }
     rt.call = call;
     // `Class(args)`: __new__/__init__.
@@ -894,6 +1065,17 @@ var __zipp_py = (function () {
         const plan = ctorPlan(cls);
         if (plan.ctor !== undefined) return plan.ctor(args, kwargs, cls);
         const init = plan.init;
+        // The plain case (a user class of `type` whose instance is a fresh
+        // record handed to a Python __init__ taking exactly these values,
+        // or to no __init__ at all) gets a positional entry for the count.
+        if (cls.userClass === true && cls.cls === TypeType && !cls.isABC && (kwargs === null || kwargs.size === 0)
+            && plan.builtinBase === undefined && plan.newf === undefined && plan.alloc === undefined) {
+            const n = args.length;
+            if (n < CTOR_ENTRY.length) {
+                if (init === undefined && n === 0) setCtorEntry(cls, 0, null);
+                else if (init !== undefined && init !== null && init.cls === T.function && typeof init["c" + (n + 1)] === "function") setCtorEntry(cls, n, init);
+            }
+        }
         // A subclass of an immutable builtin (int, str, tuple, ...) takes its
         // value from that builtin's __new__; a user __init__ then runs.
         if (plan.builtinBase !== undefined) {
@@ -917,12 +1099,37 @@ var __zipp_py = (function () {
             const withSelf = [obj]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
             // A Python __init__ is entered as `callmethod` does.
             const r = init === null || init.cls !== T.function ? call(init, withSelf, kwargs)
-                : kwargs === null && init.fast !== undefined ? init.fast(withSelf) : init.code(bindArgs(init, withSelf, kwargs));
+                : invoke(init, bindArgs(init, withSelf, kwargs));
             if (r !== null) fail(TypeError, "__init__() should return None, not '" + typeOf(r).name + "'");
         } else if (args.length || (kwargs !== null && kwargs.size)) {
             if (plan.newf === undefined) fail(TypeError, cls.name + "() takes no arguments");
         }
         return obj;
+    }
+    // Positional entries of classes (`cls.c<n>`, see `constructDefault`):
+    // exactly the plain construction path, with the __init__ found then.
+    function initReturned(r) { fail(TypeError, "__init__() should return None, not '" + typeOf(r).name + "'"); }
+    const CTOR_ENTRY = [
+        function () { const obj = { cls: this, dict: new Map() }; const init = this.ctorInit; if (init !== null) { const r = init.c1(obj); if (r !== null) initReturned(r); } return obj; },
+        function (a) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c2(obj, a); if (r !== null) initReturned(r); return obj; },
+        function (a, b) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c3(obj, a, b); if (r !== null) initReturned(r); return obj; },
+        function (a, b, c) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c4(obj, a, b, c); if (r !== null) initReturned(r); return obj; },
+        function (a, b, c, d) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c5(obj, a, b, c, d); if (r !== null) initReturned(r); return obj; },
+        function (a, b, c, d, e) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c6(obj, a, b, c, d, e); if (r !== null) initReturned(r); return obj; },
+        function (a, b, c, d, e, f) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c7(obj, a, b, c, d, e, f); if (r !== null) initReturned(r); return obj; },
+    ];
+    function setCtorEntry(cls, n, init) {
+        if (cls.ctorInit !== init) { clearCtorEntries(cls); cls.ctorInit = init; }
+        if (cls.ctorEntries === undefined || cls.ctorEntries === null) cls.ctorEntries = [];
+        cls["c" + n] = CTOR_ENTRY[n];
+        cls.ctorEntries.push(n);
+        noteFlagged(cls);
+    }
+    function clearCtorEntries(cls) {
+        const set = cls.ctorEntries;
+        if (set === undefined || set === null) return;
+        for (let i = 0; i < set.length; i++) cls["c" + set[i]] = undefined;
+        cls.ctorEntries = null;
     }
     // What `constructDefault` needs to know about a class, cached with its
     // attribute lookups (`lcache`); a change to `__init__` or `__new__`
@@ -1007,6 +1214,9 @@ var __zipp_py = (function () {
         for (const b of bases) if (!isType(b)) fail(TypeError, "bases must be types");
         const cls = newType(name, bases.slice(), ns, ns.get("__module__") || "main");
         cls.cls = metaclass;
+        // Instances always carry a Map dict: the inline caches may serve them.
+        // A metaclass's instances are classes, which never take that path.
+        cls.userClass = !isSubclass(cls, TypeType);
         cls.qualname = ns.get("__qualname__") || name;
         // __slots__: instances of an all-slotted hierarchy accept only those names.
         const slots = ns.get("__slots__");
@@ -1054,7 +1264,7 @@ var __zipp_py = (function () {
         if (bodyFn !== null) {
             const p = prepare(bodyFn, [], null);
             // The class body runs with its namespace as the only argument.
-            cell = p.self.code([ns]);
+            cell = p.self.code(ns);
         }
         let metaclass = null, kw = null;
         if (kwargs !== null && kwargs.size) {
@@ -1089,8 +1299,9 @@ var __zipp_py = (function () {
         if (exit === undefined) fail(TypeError, "'" + t.name + "' object does not support the context manager protocol (missed __exit__ method)");
         return [descrGet(exit, mgr, t), call(descrGet(enter, mgr, t), [], null)];
     };
-    R.withexit = function (exit, e) {
+    R.withexit = function (exit, e, line) {
         const exc = normexc(e);
+        if (exc.tbline === -1) exc.tbline = line;
         // __exit__ runs while `exc` is being handled: it is the context of
         // anything __exit__ raises.
         excStack.push(exc);
@@ -1369,12 +1580,19 @@ var __zipp_py = (function () {
         else excStack.length = depth;
         return r;
     }
+    // `genStep(g, false, undefined)` written out: this is every `for` step.
     function genNext() {
         const g = this;
         if (g.done) { g.returned = null; return STOP; }
         if (g.running) fail(ValueError, "generator already executing");
         g.running = true; g.started = true;
-        const r = genStep(g, false, undefined);
+        const depth = excStack.length, saved = g.excs;
+        if (saved !== null) { g.excs = null; for (let i = 0; i < saved.length; i++) excStack.push(saved[i]); }
+        let r;
+        try { r = g.js.next(undefined); }
+        catch (e) { excStack.length = depth; throw genEscape(g, e); }
+        if (!r.done && excStack.length > depth) g.excs = excStack.splice(depth);
+        else if (excStack.length !== depth) excStack.length = depth;
         if (r.done) { genFinish(g, r); return STOP; }
         g.running = false;
         return r.value;
@@ -1525,7 +1743,7 @@ var __zipp_py = (function () {
         modules.set(name, m);
         const fn = R.func(init.code, "<module>", "<module>", [], 0, 0, false, false, [], [], [], [], m.globals, false, null, name);
         try {
-            fn.code([]);
+            fn.code();
         } catch (e) {
             modules.delete(name);
             throw e;

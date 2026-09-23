@@ -495,5 +495,8 @@ print(round(float(torch.linalg.inv(a).sum()), 9), round(float(torch.linalg.eigva
     let interpreted = run(&program(false), 4_000_000_000, false);
     assert_eq!(native.output.clone().unwrap(), interpreted.output.clone().unwrap());
     assert!(native.steps > 4 * 4 * 1000, "native run charged only {} steps", native.steps);
-    assert!(native.steps * 4 < interpreted.steps, "{} vs {}", native.steps, interpreted.steps);
+    // The native kernels charge far less than the interpreted loops they
+    // replace. (The margin was 4x until Python's own fused instructions made
+    // the interpreted fallback itself about 4x cheaper to meter.)
+    assert!(native.steps * 2 < interpreted.steps, "{} vs {}", native.steps, interpreted.steps);
 }

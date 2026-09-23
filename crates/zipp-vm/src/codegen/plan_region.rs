@@ -5469,6 +5469,14 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::DateNew { arg_base, argc, .. }
         | Instr::DateUTC { arg_base, argc, .. }
         | Instr::Print { arg_base, argc, .. } => win(&[], arg_base, argc),
+        // Python-only fast paths; no JIT tier admits them.
+        Instr::PyArith { a, b, .. } | Instr::PyCompare { a, b, .. } | Instr::PyJumpCompare { a, b, .. } => vec![a, b],
+        Instr::PyAddImm { a, .. } => vec![a],
+        Instr::PyClassOf { obj, .. } | Instr::PyDictGet { obj, .. } => vec![obj],
+        Instr::PyDictSet { obj, val, .. } => vec![obj, val],
+        Instr::PyCallEntry { f, .. } => vec![f],
+        Instr::PyGetItem { o, k, seq, dict, .. } => vec![o, k, seq, dict],
+        Instr::PySetItem { o, k, v, seq, dict, .. } => vec![o, k, v, seq, dict],
         Instr::Call { callee, arg_base, argc, .. }
         | Instr::TailCall { callee, arg_base, argc }
         | Instr::New { callee, arg_base, argc, .. } => win(&[callee], arg_base, argc),

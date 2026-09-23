@@ -2944,6 +2944,26 @@ impl<'p> Vm<'p> {
                 self.globals[slot] = Value::heap(kernel);
                 self.bump_global_gen(slot as u32);
             }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_STR_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let query = self.heap.alloc(HeapObj::Native(native::PY_STR));
+                self.globals[slot] = Value::heap(query);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_ORD_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let order = self.heap.alloc(HeapObj::Native(native::PY_ORD));
+                self.globals[slot] = Value::heap(order);
+                self.bump_global_gen(slot as u32);
+            }
         }
         // `get [Symbol.species]` (a shared getter returning `this`) on every
         // species-aware constructor — used by slice/map/etc. and required by the

@@ -1541,6 +1541,20 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
+                    // The Python frontend's fused fast paths: one out-of-line
+                    // step (see `py_ops`), so this loop's own code is unchanged.
+                    Instr::PyArith { .. }
+                    | Instr::PyAddImm { .. }
+                    | Instr::PyCompare { .. }
+                    | Instr::PyJumpCompare { .. }
+                    | Instr::PyClassOf { .. }
+                    | Instr::PyDictGet { .. }
+                    | Instr::PyDictSet { .. }
+                    | Instr::PyCallEntry { .. }
+                    | Instr::PyGetItem { .. }
+                    | Instr::PySetItem { .. } => {
+                        ip = self.py_step(func_id, base, ip, instr)?;
+                    }
                     Instr::AddInt { dst, a, imm, upd } => {
                         let va = self.get(base, a);
                         let r = if va.is_int() {

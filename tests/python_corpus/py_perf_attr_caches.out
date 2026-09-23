@@ -1,0 +1,58 @@
+plain 1
+stored 2 {'x': 2}
+property read prop
+setter 5
+dict after setter {'x': 2}
+property removed 2
+store again 7
+sub 10 15
+sub sees base property 100
+AttributeError property 'x' of 'B' object has no setter
+sub after delete 20
+desc read desc
+desc set 4
+dict {'x': 3}
+nondata no dict nondata
+nondata with dict 9
+setattr x 2
+after __setattr__ 20
+restored 3
+method read method
+shadow shadow
+unshadowed method
+class attr 1
+class attr changed 2
+instance over class 3
+back to class 2
+slots 4
+slots AttributeError 'T' object has no attribute 'x' and no __dict__ for setting new attributes
+before own
+after __class__ Q.x
+new dict 42
+dict write 43
+miss getattr x
+hit present
+inst
+on class
+AttributeError: 'int' object has no attribute 'x'
+AttributeError: 'str' object has no attribute 'x'
+AttributeError: 'NoneType' object has no attribute 'x'
+AttributeError: module 'math' has no attribute 'x'
+inst
+inst
+on class
+AttributeError: 'int' object has no attribute 'x'
+AttributeError: 'str' object has no attribute 'x'
+AttributeError: 'NoneType' object has no attribute 'x'
+AttributeError: module 'math' has no attribute 'x'
+inst
+inst
+on class
+AttributeError: 'int' object has no attribute 'x'
+AttributeError: 'str' object has no attribute 'x'
+AttributeError: 'NoneType' object has no attribute 'x'
+AttributeError: module 'math' has no attribute 'x'
+inst
+3 {'x': 3, 'y': 6}
+meta meta property
+meta instance instance of WithMeta

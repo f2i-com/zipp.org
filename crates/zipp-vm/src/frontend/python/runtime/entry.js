@@ -172,11 +172,11 @@ function __zipp_py_set_input(json) {
     rt.runEntry = function (body) {
         try {
             // The entry code object follows the Python ABI: `this` is a
-            // function-shaped record and the only argument is the args array.
+            // function-shaped record, and the entry takes no parameters.
             // A member call keeps it on the VM's frame stack (no native
             // re-entry, which the wasm build allows only one level of).
             const holder = { code: body, globals: new Map(), cells: [] };
-            holder.code([]);
+            holder.code();
             rt.flushOut();
             rt.flushOpenFiles();
             return null;

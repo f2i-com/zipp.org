@@ -1,0 +1,16 @@
+2525 Derived>Base.who Derived Derived>Base.who Again ('Derived', 30) ('Again', 40) (('static', 1), 'Base.prop', 10)
+AttributeError 'super' object has no attribute 'nothing'
+7 700
+Derived>replaced who
+15 18
+([False, False, False], 'default') ([True, True, True], 1)
+([True, True, True], 'now present')
+([False, False, False], 'default')
+([True, True, True], 'class attr')
+([False, False, False], 'default')
+([True, True, True], 'via __getattr__ absent')
+([False, False, False], 'default')
+([False, False, False], 'default')
+([True, True, True], 'prop zzz')
+([True, True, True], 5)
+([True, True, True], ('x',)) ([False, False, False], 'default') ([True, True, True], None)

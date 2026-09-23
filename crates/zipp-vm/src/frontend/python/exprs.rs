@@ -1,8 +1,8 @@
 //! Expression lowering for the Python emitter.
-use super::emitter::{Emitter, LoopCtx, R};
+use super::emitter::{Emitter, LoopCtx, MAX_DIRECT, R};
 use super::stmts::{binop_name, inplace_binop_name};
 use super::symtable::{ScopeKind, SymKind};
-use crate::bytecode::{Instr, Reg};
+use crate::bytecode::{Instr, PyArithOp, PyCmpOp, Reg};
 use rustpython_parser::ast;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -244,7 +244,10 @@ impl<'a> Emitter<'a> {
             ast::Expr::Subscript(s) => {
                 let value = self.expr(&s.value, depth + 1)?;
                 let index = self.expr(&s.slice, depth + 1)?;
-                self.helper("getitem", &[value, index])
+                if matches!(s.slice.as_ref(), ast::Expr::Slice(_)) {
+                    return self.helper("getitem", &[value, index]);
+                }
+                self.subscript_get(value, index)
             }
             ast::Expr::Slice(s) => {
                 let lo = match &s.lower {
@@ -263,8 +266,7 @@ impl<'a> Emitter<'a> {
             }
             ast::Expr::Attribute(a) => {
                 let value = self.expr(&a.value, depth + 1)?;
-                let name = self.string(a.attr.as_str())?;
-                self.helper("getattr", &[value, name])
+                self.attr_get(value, a.attr.as_str())
             }
             ast::Expr::IfExp(e) => {
                 let otherwise = self.branch(&e.test, false, depth + 1)?;
@@ -305,12 +307,8 @@ impl<'a> Emitter<'a> {
                     format!("{}.<locals>.<lambda>", self.qualname)
                 };
                 let body = l.body.as_ref();
-                let simple = Emitter::simple_arity(&l.args);
                 let (func_id, child) =
-                    self.compile_child(expr, "<lambda>", qualname.clone(), |e| {
-                        if let Some(count) = simple {
-                            e.arity_guard(count)?;
-                        }
+                    self.compile_child(expr, "<lambda>", qualname.clone(), Some(&l.args), |e| {
                         let value = e.expr(body, depth + 1)?;
                         e.emit(Instr::Return { src: value })?;
                         Ok(())
@@ -541,6 +539,21 @@ impl<'a> Emitter<'a> {
     /// to a float as a float, exactly Python's int and float `+`; anything
     /// else (a bool, an object) loads the literal and asks the runtime.
     fn arith_imm(&mut self, op: &ast::Operator, a: Reg, literal: &ast::Expr, imm: i32, inplace: bool) -> R<Reg> {
+        if let Some(k) = small_int_literal(literal) {
+            // One fused instruction; the helper out of line.
+            let dst = self.alloc()?;
+            let at = self.emit(Instr::PyAddImm { dst, a, imm, slow: 0 })?;
+            let name = binop_name(op);
+            let helper = if inplace { "iop" } else { "binop" };
+            self.defer_cold(Vec::new(), vec![at], move |e| {
+                let b = e.integer(&k.to_string())?;
+                let name = e.string(name)?;
+                let r = e.helper(helper, &[name, a, b])?;
+                e.emit(Instr::Move { dst, src: r })?;
+                Ok(())
+            });
+            return Ok(dst);
+        }
         let dst = self.alloc()?;
         let is_int = self.typeof_is(a, "bigint")?;
         let add = self.jump_if_true(is_int)?;
@@ -612,6 +625,54 @@ impl<'a> Emitter<'a> {
     /// concatenates below the runtime's text limit. Everything else, mixed
     /// int/float operands included, goes through the runtime's dispatch.
     pub fn arith_known(&mut self, op: &ast::Operator, a: Reg, ka: Known, b: Reg, kb: Known, b_positive: bool, inplace: bool) -> R<Reg> {
+        let fused = match op {
+            ast::Operator::Add => Some(PyArithOp::Add),
+            ast::Operator::Sub => Some(PyArithOp::Sub),
+            ast::Operator::Mult => Some(PyArithOp::Mul),
+            ast::Operator::Div => Some(PyArithOp::TrueDiv),
+            ast::Operator::FloorDiv => Some(PyArithOp::FloorDiv),
+            ast::Operator::Mod => Some(PyArithOp::Mod),
+            ast::Operator::BitAnd => Some(PyArithOp::BitAnd),
+            ast::Operator::BitOr => Some(PyArithOp::BitOr),
+            ast::Operator::BitXor => Some(PyArithOp::BitXor),
+            _ => None,
+        };
+        let numeric = |k: Known| matches!(k, Known::Int | Known::Float | Known::Unknown);
+        if let (true, Some(pyop)) = (self.fast && numeric(ka) && numeric(kb), fused) {
+            // One fused instruction for ints and floats; a str + str tier
+            // (for `+`) and the helper out of line.
+            let dst = self.alloc()?;
+            let at = self.emit(Instr::PyArith { op: pyop, dst, a, b, slow: 0 })?;
+            let helper = if inplace { inplace_binop_name(op) } else { binop_name(op) };
+            let is_add = matches!(op, ast::Operator::Add);
+            self.defer_cold(Vec::new(), vec![at], move |e| {
+                let mut done = Vec::new();
+                if is_add {
+                    let mut slow = e.type_guard(&[(a, "string"), (b, "string")])?;
+                    let sum = e.alloc()?;
+                    e.emit(Instr::Add { dst: sum, a, b })?;
+                    let len = e.prop(sum, "length")?;
+                    let limit = e.prop(e.r_rt, "MAX_TEXT")?;
+                    let ok = e.alloc()?;
+                    e.emit(Instr::Le { dst: ok, a: len, b: limit })?;
+                    slow.push(e.jump_if_false(ok)?);
+                    e.emit(Instr::Move { dst, src: sum })?;
+                    done.push(e.jump()?);
+                    let here = e.here();
+                    for j in slow {
+                        e.patch(j, here)?;
+                    }
+                }
+                let r = e.helper(helper, &[a, b])?;
+                e.emit(Instr::Move { dst, src: r })?;
+                let here = e.here();
+                for j in done {
+                    e.patch(j, here)?;
+                }
+                Ok(())
+            });
+            return Ok(dst);
+        }
         let dst = self.alloc()?;
         let mut slow_jumps = Vec::new();
         let mut end_jumps = Vec::new();
@@ -721,8 +782,7 @@ impl<'a> Emitter<'a> {
         slow_jumps: &mut Vec<usize>,
         end_jumps: &mut Vec<usize>,
     ) -> R<()> {
-        let zero = self.alloc()?;
-        self.emit(Instr::LoadBigInt { dst: zero, value: 0 })?;
+        let zero = self.integer("0")?;
         if !b_positive {
             let is_zero = self.alloc()?;
             self.emit(Instr::Eq { dst: is_zero, a: b, b: zero })?;
@@ -797,6 +857,30 @@ impl<'a> Emitter<'a> {
         Ok(dst)
     }
 
+    /// The fused comparison for `op`, unless a literal operand rules every
+    /// fast case out (an ordering of strs is code-point order, which only
+    /// the runtime implements).
+    fn fused_compare(&self, op: &ast::CmpOp, ka: Known, kb: Known) -> Option<PyCmpOp> {
+        if !self.fast {
+            return None;
+        }
+        let pyop = match op {
+            ast::CmpOp::Lt => PyCmpOp::Lt,
+            ast::CmpOp::LtE => PyCmpOp::Le,
+            ast::CmpOp::Gt => PyCmpOp::Gt,
+            ast::CmpOp::GtE => PyCmpOp::Ge,
+            ast::CmpOp::Eq => PyCmpOp::Eq,
+            ast::CmpOp::NotEq => PyCmpOp::Ne,
+            _ => return None,
+        };
+        let equality = matches!(pyop, PyCmpOp::Eq | PyCmpOp::Ne);
+        let fits = |k: Known| match k {
+            Known::Int | Known::Float | Known::Unknown => true,
+            Known::Str => equality,
+            Known::Singleton => false,
+        };
+        (fits(ka) && fits(kb)).then_some(pyop)
+    }
     /// The VM comparison for `op` on two operands of one primitive type.
     fn compare_instr(op: &ast::CmpOp, dst: Reg, a: Reg, b: Reg) -> Option<Instr> {
         Some(match op {
@@ -847,6 +931,17 @@ impl<'a> Emitter<'a> {
     /// One comparison: inline tiers for ints, floats, strs and identity,
     /// everything else (and every guard miss) through the runtime.
     fn compare_once(&mut self, op: &ast::CmpOp, left: Reg, lk: Known, right: Reg, rk: Known) -> R<Reg> {
+        if let Some(pyop) = self.fused_compare(op, lk, rk) {
+            let dst = self.alloc()?;
+            let at = self.emit(Instr::PyCompare { op: pyop, dst, a: left, b: right, slow: 0 })?;
+            let helper = cmpop_name(op);
+            self.defer_cold(Vec::new(), vec![at], move |e| {
+                let r = e.helper(helper, &[left, right])?;
+                e.emit(Instr::Move { dst, src: r })?;
+                Ok(())
+            });
+            return Ok(dst);
+        }
         let dst = self.alloc()?;
         let mut end = Vec::new();
         let mut slow_jumps = Vec::new();
@@ -961,6 +1056,25 @@ impl<'a> Emitter<'a> {
 
     /// A single comparison as a branch (see [`Emitter::branch`]).
     fn compare_branch(&mut self, op: &ast::CmpOp, a: Reg, ka: Known, b: Reg, kb: Known, when: bool) -> R<Vec<usize>> {
+        if let Some(pyop) = self.fused_compare(op, ka, kb) {
+            // One fused compare-and-branch; out of line, the helper's truth
+            // takes the same branch (to wherever `at` is patched by then).
+            let at = self.emit(Instr::PyJumpCompare { op: pyop, a, b, when, target: 0, slow: 0 })?;
+            let name = cmpop_name(op);
+            self.defer_cold(Vec::new(), vec![at], move |e| {
+                let name = e.string(name)?;
+                let value = e.helper("richcmp", &[name, a, b])?;
+                let target = match e.proto.code.get(at) {
+                    Some(Instr::PyJumpCompare { target, .. }) => *target,
+                    _ => return Err("Python emitter: lost a fused branch".into()),
+                };
+                for j in e.jump_on_truth(value, when)? {
+                    e.patch(j, target)?;
+                }
+                Ok(())
+            });
+            return Ok(vec![at]);
+        }
         let mut taken = Vec::new();
         let mut done = Vec::new();
         let jump = |e: &mut Self, cond: Reg| if when { e.jump_if_true(cond) } else { e.jump_if_false(cond) };
@@ -1200,16 +1314,87 @@ impl<'a> Emitter<'a> {
         // then the attribute lookup), then the positional arguments, then
         // the keyword arguments.
         if let ast::Expr::Attribute(a) = c.func.as_ref() {
+            if let Some(r) = self.super_method_call(a, c, depth)? {
+                return Ok(r);
+            }
             let obj = self.expr(&a.value, depth)?;
             return self.method_call(obj, a.attr.as_str(), c, depth);
         }
         let f = self.expr(&c.func, depth)?;
+        if c.keywords.is_empty() && c.args.len() <= MAX_DIRECT && !c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_))) {
+            let mut regs = Vec::with_capacity(c.args.len());
+            for a in &c.args {
+                regs.push(self.expr(a, depth)?);
+            }
+            return self.call_with(f, &regs);
+        }
+        if let Some(r) = self.keyword_call(f, c, depth)? {
+            return Ok(r);
+        }
         let args = self.sequence_array(&c.args, depth)?;
         if c.keywords.is_empty() {
             return self.call_positional(f, args);
         }
         let kwargs = self.keywords(&c.keywords, depth)?;
         self.call_value(f, args, kwargs)
+    }
+
+    /// `f(p1.., k1=v1, ..)` with plain positionals and distinct named
+    /// keywords. A function whose parameters after the positionals are
+    /// exactly the keywords, in that order (the rest having defaults), is
+    /// then the positional call of all the values: `bindArgs` records such a
+    /// match on the function as the entry `k<n>:<names>` (see `R.func`'s
+    /// `c<n>`), which this site probes; anything else binds the keyword
+    /// record as before, out of line.
+    fn keyword_call(&mut self, f: Reg, c: &ast::ExprCall, depth: usize) -> R<Option<Reg>> {
+        let mut names = Vec::with_capacity(c.keywords.len());
+        for k in &c.keywords {
+            match &k.arg {
+                Some(n) if !names.contains(&n.as_str()) => names.push(n.as_str()),
+                _ => return Ok(None),
+            }
+        }
+        if !self.fast
+            || names.is_empty()
+            || c.args.len() + names.len() > MAX_DIRECT
+            || c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_)))
+        {
+            return Ok(None);
+        }
+        let mut regs = Vec::with_capacity(c.args.len() + names.len());
+        for a in &c.args {
+            regs.push(self.expr(a, depth)?);
+        }
+        for k in &c.keywords {
+            regs.push(self.expr(&k.value, depth)?);
+        }
+        let dst = self.alloc()?;
+        let entry = self.alloc()?;
+        let key = self.string_index(&format!("k{}:{}", c.args.len(), names.join(",")));
+        let at = self.emit(Instr::PyCallEntry { dst: entry, f, name: key, slow: 0 })?;
+        let (arg_base, argc) = self.arguments(&regs)?;
+        self.emit(Instr::CallWithThis { dst, callee: entry, this_v: f, arg_base, argc, name: crate::bytecode::NO_NAME })?;
+        let npos = c.args.len();
+        let names: Vec<String> = names.into_iter().map(str::to_owned).collect();
+        self.defer_cold(Vec::new(), vec![at], move |e| {
+            let args = e.array(&regs[..npos])?;
+            let record = e.alloc()?;
+            e.emit(Instr::NewMap { dst: record, src: None })?;
+            let set = e.string_index("set");
+            for (name, &value) in names.iter().zip(&regs[npos..]) {
+                let mark = e.mark();
+                let pair = e.block(2)?;
+                e.string_into(pair, name)?;
+                e.emit(Instr::Move { dst: pair + 1, src: value })?;
+                let ignored = e.alloc()?;
+                e.emit(Instr::CallMethod { dst: ignored, obj: record, name: set, arg_base: pair, argc: 2 })?;
+                e.release(mark);
+            }
+            let r = e.call_value(f, args, record)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
+        Ok(Some(dst))
     }
 
     /// `len(x)` and `isinstance(x, t)` through a global name: the callee is
@@ -1222,6 +1407,11 @@ impl<'a> Emitter<'a> {
             return Ok(None);
         };
         let name = n.id.as_str();
+        if let ("hasattr", [_, ast::Expr::Constant(k)]) = (name, c.args.as_slice()) {
+            if let ast::Constant::Str(attr) = &k.value {
+                return self.hasattr_intrinsic(c, attr.as_str(), depth);
+            }
+        }
         let (builtin, direct) = match (name, c.args.len()) {
             ("len", 1) => ("BLEN", "len1"),
             ("isinstance", 2) => ("BISINSTANCE", "isinst"),
@@ -1244,16 +1434,143 @@ impl<'a> Emitter<'a> {
         let same = self.alloc()?;
         self.emit(Instr::Eq { dst: same, a: f, b: expected })?;
         let other = self.jump_if_false(same)?;
+        let mut done_early = Vec::new();
+        if direct == "len1" {
+            // An exact list or tuple: its items' count, as an int.
+            let v = regs[0];
+            let mut slow = Vec::new();
+            let cls = self.object_class(v, &mut slow)?;
+            let t = self.alloc()?;
+            let list = self.prop(self.r_rt, "TLIST")?;
+            self.emit(Instr::Eq { dst: t, a: cls, b: list })?;
+            let is_list = self.jump_if_true(t)?;
+            let tuple = self.prop(self.r_rt, "TTUPLE")?;
+            self.emit(Instr::Eq { dst: t, a: cls, b: tuple })?;
+            slow.push(self.jump_if_false(t)?);
+            let here = self.here();
+            self.patch(is_list, here)?;
+            let items = self.prop(v, "items")?;
+            let n = self.prop(items, "length")?;
+            self.emit(Instr::BigIntFrom { dst, arg: n })?;
+            done_early.push(self.jump()?);
+            let here = self.here();
+            for j in slow {
+                self.patch(j, here)?;
+            }
+        }
         let r = self.helper(direct, &regs)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        done_early.push(self.jump()?);
+        let here = self.here();
+        self.patch(other, here)?;
+        let r = self.call_with(f, &regs)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let here = self.here();
+        for j in done_early {
+            self.patch(j, here)?;
+        }
+        Ok(Some(dst))
+    }
+
+    /// `super().name(args...)` with positional arguments, inside a method:
+    /// `smfind` resolves the attribute on the MRO past the class (without
+    /// allocating the super object) before the arguments are evaluated; a
+    /// plain function is called with the method's first parameter first.
+    fn super_method_call(&mut self, a: &ast::ExprAttribute, c: &ast::ExprCall, depth: usize) -> R<Option<Reg>> {
+        let ast::Expr::Call(inner) = a.value.as_ref() else {
+            return Ok(None);
+        };
+        let ast::Expr::Name(n) = inner.func.as_ref() else {
+            return Ok(None);
+        };
+        if !self.fast
+            || n.id.as_str() != "super"
+            || !inner.args.is_empty()
+            || !inner.keywords.is_empty()
+            || !c.keywords.is_empty()
+            || c.args.len() >= MAX_DIRECT
+            || c.args.iter().any(|e| matches!(e, ast::Expr::Starred(_)))
+        {
+            return Ok(None);
+        }
+        let (Some(cell), Some(first)) = (self.cells.get("__class__").copied(), self.first_param_reg()) else {
+            return Ok(None);
+        };
+        let cls = self.cell_get(cell)?;
+        // `super()` reads the first parameter now, before the arguments.
+        let receiver = self.alloc()?;
+        self.emit(Instr::Move { dst: receiver, src: first })?;
+        let first = receiver;
+        let key = self.string(a.attr.as_str())?;
+        let f = self.helper("smfind", &[cls, first, key])?;
+        let flag = self.string_index("mself");
+        let prepend = self.alloc()?;
+        self.emit(Instr::GetProp { dst: prepend, obj: self.r_rt, name: flag })?;
+        let mut regs = Vec::with_capacity(c.args.len());
+        for e in &c.args {
+            regs.push(self.expr(e, depth)?);
+        }
+        let dst = self.alloc()?;
+        let unbound = self.jump_if_false(prepend)?;
+        let mut with_self = Vec::with_capacity(regs.len() + 1);
+        with_self.push(first);
+        with_self.extend_from_slice(&regs);
+        let r = self.call_with(f, &with_self)?;
         self.emit(Instr::Move { dst, src: r })?;
         let done = self.jump()?;
         let here = self.here();
-        self.patch(other, here)?;
-        let args = self.array(&regs)?;
-        let r = self.call_positional(f, args)?;
+        self.patch(unbound, here)?;
+        let r = self.call_with(f, &regs)?;
         self.emit(Instr::Move { dst, src: r })?;
         let here = self.here();
         self.patch(done, here)?;
+        Ok(Some(dst))
+    }
+
+    /// `hasattr(obj, "name")` with the builtin itself as `hasattr`: an
+    /// instance of a user class on which nothing but the instance dict can
+    /// answer `name` (`cls.gx`, set by `getattr`) has it exactly when its
+    /// dict does. Anything else calls the builtin.
+    fn hasattr_intrinsic(&mut self, c: &ast::ExprCall, attr: &str, depth: usize) -> R<Option<Reg>> {
+        if !self.fast
+            || !c.keywords.is_empty()
+            || self.sym_kind("hasattr") != SymKind::Global
+            || matches!(attr, "__dict__" | "__class__" | "__proto__")
+        {
+            return Ok(None);
+        }
+        let f = self.load_name("hasattr")?;
+        let obj = self.expr(&c.args[0], depth)?;
+        let key = self.expr(&c.args[1], depth)?;
+        let dst = self.alloc()?;
+        let expected = self.prop(self.r_rt, "BHASATTR")?;
+        let same = self.alloc()?;
+        self.emit(Instr::Eq { dst: same, a: f, b: expected })?;
+        let mut generic = vec![self.jump_if_false(same)?];
+        let cls = self.alloc()?;
+        let at_cls = self.emit(Instr::PyClassOf { dst: cls, obj, slow: 0 })?;
+        let table = self.prop(cls, "gx")?;
+        let flag = self.prop(table, attr)?;
+        generic.push(self.jump_if_false(flag)?);
+        let own = self.alloc()?;
+        let key_const = self.string_const(attr);
+        let at_own = self.emit(Instr::PyDictGet { dst: own, obj, key: key_const, absent: false, slow: 0 })?;
+        self.emit(Instr::LoadBool { dst, val: true })?;
+        let done = self.jump()?;
+        let here = self.here();
+        self.patch_slow(at_own, here)?;
+        self.emit(Instr::LoadBool { dst, val: false })?;
+        let done2 = self.jump()?;
+        let here = self.here();
+        self.patch_slow(at_cls, here)?;
+        for j in generic {
+            self.patch(j, here)?;
+        }
+        let r = self.call_with(f, &[obj, key])?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let here = self.here();
+        self.patch(done, here)?;
+        self.patch(done2, here)?;
         Ok(Some(dst))
     }
 
@@ -1264,6 +1581,14 @@ impl<'a> Emitter<'a> {
     /// the type comes back unbound (with `mself` set) and is called with the
     /// receiver prepended, so no bound method is allocated either way.
     fn method_call(&mut self, obj: Reg, name: &str, c: &ast::ExprCall, depth: usize) -> R<Reg> {
+        if self.fast
+            && c.keywords.is_empty()
+            && c.args.len() < MAX_DIRECT
+            && !c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_)))
+            && !matches!(name, "__proto__")
+        {
+            return self.method_call_positional(obj, name, &c.args, depth);
+        }
         let name = self.string(name)?;
         let transparent = c.args.iter().chain(c.keywords.iter().map(|k| &k.value)).all(|e| self.order_transparent(e));
         if transparent {
@@ -1320,6 +1645,342 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// `obj.name(args...)` with positional arguments only, resolved before
+    /// the arguments are evaluated (as CPython's LOAD_ATTR/LOAD_METHOD is).
+    /// Inline: a user-class instance without `name` in its own dict whose
+    /// type caches a plain Python function for it (`cls.gm`), or a dict-less
+    /// builtin container or str whose type caches a builtin method for this
+    /// count (`cls.gb["name#n"]`), yields that function to call with the
+    /// receiver first. Otherwise `mfind` resolves it (and fills those caches)
+    /// and says whether the receiver goes first. The call then takes the
+    /// callee's positional entry for the count when it has one.
+    fn method_call_positional(&mut self, obj: Reg, name: &str, args: &[ast::Expr], depth: usize) -> R<Reg> {
+        if args.iter().all(|e| self.order_transparent(e)) {
+            return self.method_call_transparent(obj, name, args, depth);
+        }
+        let n = args.len();
+        let f = self.alloc()?;
+        let prepend = self.alloc()?;
+        let mut slow = Vec::new();
+        let mut found = Vec::new();
+        let gb_key = format!("{name}#{n}");
+        // An object receiver: a user class's method, or a builtin's.
+        let cls = self.alloc()?;
+        let not_obj = self.emit(Instr::PyClassOf { dst: cls, obj, slow: 0 })?;
+        let gm = self.prop(cls, "gm")?;
+        let name_idx = self.string_index(name);
+        let gb_idx = self.string_index(&gb_key);
+        self.emit(Instr::GetProp { dst: f, obj: gm, name: name_idx })?;
+        let is_fn = self.typeof_is(f, "object")?;
+        let try_builtin = self.jump_if_false(is_fn)?;
+        // The instance's own dict must not shadow the method.
+        let own = self.alloc()?;
+        let key = self.string_const(name);
+        slow.push(self.emit(Instr::PyDictGet { dst: own, obj, key, absent: true, slow: 0 })?);
+        found.push(self.jump()?);
+        let get = self.string_index("get");
+        let here = self.here();
+        self.patch(try_builtin, here)?;
+        // A module: its global, called as it is (`math.sqrt(x)`).
+        let tmodule = self.prop(self.r_rt, "TMODULE")?;
+        let is_module = self.alloc()?;
+        self.emit(Instr::Eq { dst: is_module, a: cls, b: tmodule })?;
+        let not_module = self.jump_if_false(is_module)?;
+        let globals = self.prop(obj, "globals")?;
+        let key = self.block(1)?;
+        self.string_into(key, name)?;
+        self.emit(Instr::CallMethod { dst: f, obj: globals, name: get, arg_base: key, argc: 1 })?;
+        let missing = self.typeof_is(f, "undefined")?;
+        slow.push(self.jump_if_true(missing)?);
+        self.emit(Instr::LoadBool { dst: prepend, val: false })?;
+        let module_found = self.jump()?;
+        let here = self.here();
+        self.patch(not_module, here)?;
+        let gb = self.prop(cls, "gb")?;
+        self.emit(Instr::GetProp { dst: f, obj: gb, name: gb_idx })?;
+        let is_fn = self.typeof_is(f, "object")?;
+        slow.push(self.jump_if_false(is_fn)?);
+        found.push(self.jump()?);
+        // A str receiver: a builtin str method.
+        let here = self.here();
+        self.patch(not_obj, here)?;
+        let is_str = self.typeof_is(obj, "string")?;
+        slow.push(self.jump_if_false(is_str)?);
+        let tstr = self.prop(self.r_rt, "TSTR")?;
+        let gb = self.prop(tstr, "gb")?;
+        self.emit(Instr::GetProp { dst: f, obj: gb, name: gb_idx })?;
+        let is_fn = self.typeof_is(f, "object")?;
+        slow.push(self.jump_if_false(is_fn)?);
+        let here = self.here();
+        for j in found {
+            self.patch(j, here)?;
+        }
+        self.emit(Instr::LoadBool { dst: prepend, val: true })?;
+        let resolved = self.jump()?;
+        let here = self.here();
+        for j in slow {
+            self.patch(j, here)?;
+        }
+        let key = self.string(name)?;
+        let count = self.small_int(n as i32)?;
+        let r = self.helper("mfind", &[obj, key, count])?;
+        self.emit(Instr::Move { dst: f, src: r })?;
+        let flag = self.string_index("mself");
+        // Read before anything else can run.
+        self.emit(Instr::GetProp { dst: prepend, obj: self.r_rt, name: flag })?;
+        let here = self.here();
+        self.patch(resolved, here)?;
+        self.patch(module_found, here)?;
+        let mut regs = Vec::with_capacity(n);
+        for a in args {
+            regs.push(self.expr(a, depth)?);
+        }
+        let dst = self.alloc()?;
+        let unbound = self.jump_if_false(prepend)?;
+        let mut done = Vec::new();
+        match (name, n) {
+            ("append", 1) => self.list_append_intrinsic(obj, f, regs[0], dst, &mut done)?,
+            ("get", 1 | 2) => self.dict_get_intrinsic(obj, f, &regs, dst, &mut done)?,
+            _ => {}
+        }
+        let mut with_self = Vec::with_capacity(n + 1);
+        with_self.push(obj);
+        with_self.extend_from_slice(&regs);
+        let r = self.call_with(f, &with_self)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        done.push(self.jump()?);
+        let here = self.here();
+        self.patch(unbound, here)?;
+        let r = self.call_with(f, &regs)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let here = self.here();
+        for j in done {
+            self.patch(j, here)?;
+        }
+        Ok(dst)
+    }
+
+    /// [`Emitter::method_call_positional`] when no argument can observe
+    /// whether the method was resolved before it (constants and bound
+    /// locals): the arguments first, then a user-class method found inline
+    /// is called straight away with the receiver first. Every other case
+    /// (a module function, a builtin container's or str's method, and the
+    /// general `mfind` resolution) is laid out of line.
+    fn method_call_transparent(&mut self, obj: Reg, name: &str, args: &[ast::Expr], depth: usize) -> R<Reg> {
+        let n = args.len();
+        let mut regs = Vec::with_capacity(n);
+        for a in args {
+            regs.push(self.expr(a, depth)?);
+        }
+        let dst = self.alloc()?;
+        let cls = self.alloc()?;
+        let at_cls = self.emit(Instr::PyClassOf { dst: cls, obj, slow: 0 })?;
+        let gm = self.prop(cls, "gm")?;
+        let f = self.prop(gm, name)?;
+        let is_fn = self.typeof_is(f, "object")?;
+        let not_method = self.jump_if_false(is_fn)?;
+        // The instance's own dict must not shadow the method.
+        let own = self.alloc()?;
+        let key = self.string_const(name);
+        let at_own = self.emit(Instr::PyDictGet { dst: own, obj, key, absent: true, slow: 0 })?;
+        let mut with_self = Vec::with_capacity(n + 1);
+        with_self.push(obj);
+        with_self.extend_from_slice(&regs);
+        let r = self.call_with(f, &with_self)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let name = name.to_owned();
+        // Not a user-class method: a module's function, or a builtin method.
+        let (name_b, regs_b, with_self_b) = (name.clone(), regs.clone(), with_self.clone());
+        self.defer_cold(vec![not_method], Vec::new(), move |e| {
+            let mut done = Vec::new();
+            let tmodule = e.prop(e.r_rt, "TMODULE")?;
+            let t = e.alloc()?;
+            e.emit(Instr::Eq { dst: t, a: cls, b: tmodule })?;
+            let not_module = e.jump_if_false(t)?;
+            let globals = e.prop(obj, "globals")?;
+            let key = e.block(1)?;
+            e.string_into(key, &name_b)?;
+            let g = e.alloc()?;
+            let get = e.string_index("get");
+            e.emit(Instr::CallMethod { dst: g, obj: globals, name: get, arg_base: key, argc: 1 })?;
+            let missing = e.typeof_is(g, "undefined")?;
+            let generic_a = e.jump_if_true(missing)?;
+            let r = e.call_with(g, &regs_b)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            done.push(e.jump()?);
+            let here = e.here();
+            e.patch(not_module, here)?;
+            let gb = e.prop(cls, "gb")?;
+            let b = e.prop(gb, &format!("{name_b}#{n}"))?;
+            let is_b = e.typeof_is(b, "object")?;
+            let generic_b = e.jump_if_false(is_b)?;
+            match (name_b.as_str(), n) {
+                ("append", 1) => e.list_append_intrinsic(obj, b, regs_b[0], dst, &mut done)?,
+                ("get", 1 | 2) => e.dict_get_intrinsic(obj, b, &regs_b, dst, &mut done)?,
+                _ => {}
+            }
+            let r = e.call_with(b, &with_self_b)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            done.push(e.jump()?);
+            let here = e.here();
+            e.patch(generic_a, here)?;
+            e.patch(generic_b, here)?;
+            e.method_generic(obj, &name_b, &regs_b, dst)?;
+            let here = e.here();
+            for j in done {
+                e.patch(j, here)?;
+            }
+            Ok(())
+        });
+        // No class record (a str, another primitive), or an own attribute
+        // of that name: a str's builtin method, else the general resolution.
+        self.defer_cold(Vec::new(), vec![at_cls, at_own], move |e| {
+            let mut done = Vec::new();
+            let is_str = e.typeof_is(obj, "string")?;
+            let generic = e.jump_if_false(is_str)?;
+            let tstr = e.prop(e.r_rt, "TSTR")?;
+            let gb = e.prop(tstr, "gb")?;
+            let b = e.prop(gb, &format!("{name}#{n}"))?;
+            let is_b = e.typeof_is(b, "object")?;
+            let generic_b = e.jump_if_false(is_b)?;
+            let r = e.call_with(b, &with_self)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            done.push(e.jump()?);
+            let here = e.here();
+            e.patch(generic, here)?;
+            e.patch(generic_b, here)?;
+            e.method_generic(obj, &name, &regs, dst)?;
+            let here = e.here();
+            for j in done {
+                e.patch(j, here)?;
+            }
+            Ok(())
+        });
+        Ok(dst)
+    }
+
+    /// The general method call: `mfind` resolves `obj.name` (filling the
+    /// inline caches) and says whether the receiver goes first.
+    fn method_generic(&mut self, obj: Reg, name: &str, regs: &[Reg], dst: Reg) -> R<()> {
+        let key = self.string(name)?;
+        let count = self.small_int(regs.len() as i32)?;
+        let f = self.helper("mfind", &[obj, key, count])?;
+        let flag = self.string_index("mself");
+        let prepend = self.alloc()?;
+        self.emit(Instr::GetProp { dst: prepend, obj: self.r_rt, name: flag })?;
+        let unbound = self.jump_if_false(prepend)?;
+        let mut with_self = Vec::with_capacity(regs.len() + 1);
+        with_self.push(obj);
+        with_self.extend_from_slice(regs);
+        let r = self.call_with(f, &with_self)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let done = self.jump()?;
+        let here = self.here();
+        self.patch(unbound, here)?;
+        let r = self.call_with(f, regs)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let here = self.here();
+        self.patch(done, here)?;
+        Ok(())
+    }
+
+    /// `obj.append(v)` resolved (receiver first) to the builtin
+    /// `list.append`: the push onto the receiver's items, below the size
+    /// limit (the builtin itself raises past it). Falls through otherwise.
+    fn list_append_intrinsic(&mut self, obj: Reg, f: Reg, v: Reg, dst: Reg, done: &mut Vec<usize>) -> R<()> {
+        let expected = self.prop(self.r_rt, "LAPPEND")?;
+        let same = self.alloc()?;
+        self.emit(Instr::Eq { dst: same, a: f, b: expected })?;
+        let other = self.jump_if_false(same)?;
+        let items = self.prop(obj, "items")?;
+        let len = self.prop(items, "length")?;
+        let limit = self.prop(self.r_rt, "MAX_ITEMS")?;
+        let full = self.emit(Instr::JumpIfNotLt { a: len, b: limit, target: 0 })?;
+        self.emit(Instr::ArrayAppend { arr: items, val: v, spread: false })?;
+        self.emit(Instr::LoadNull { dst })?;
+        done.push(self.jump()?);
+        let here = self.here();
+        self.patch(other, here)?;
+        self.patch(full, here)?;
+        Ok(())
+    }
+
+    /// `d.get(k[, default])` resolved (receiver first) to the builtin
+    /// `dict.get` on an exact dict: a str key while every key is a str reads
+    /// the Map; an int key within 2^53 in the bucketed form reads its bucket
+    /// when that holds exactly this key (and no bucket means no equal key);
+    /// a missing key gives the default. Anything else falls through.
+    fn dict_get_intrinsic(&mut self, obj: Reg, f: Reg, regs: &[Reg], dst: Reg, done: &mut Vec<usize>) -> R<()> {
+        let k = regs[0];
+        let mut other = Vec::new();
+        let expected = self.prop(self.r_rt, "DGET")?;
+        let t = self.alloc()?;
+        self.emit(Instr::Eq { dst: t, a: f, b: expected })?;
+        other.push(self.jump_if_false(t)?);
+        let cls = self.prop(obj, "cls")?;
+        let tdict = self.prop(self.r_rt, "TDICT")?;
+        self.emit(Instr::Eq { dst: t, a: cls, b: tdict })?;
+        other.push(self.jump_if_false(t)?);
+        let map = self.prop(obj, "map")?;
+        let str_mode = self.prop(obj, "str")?;
+        let bucketed = self.jump_if_false(str_mode)?;
+        // All-str mode: a str key reads the Map.
+        let is_str = self.typeof_is(k, "string")?;
+        other.push(self.jump_if_false(is_str)?);
+        let (arg_base, argc) = self.arguments(&[k])?;
+        let get = self.string_index("get");
+        self.emit(Instr::CallMethod { dst, obj: map, name: get, arg_base, argc })?;
+        let missing = self.typeof_is(dst, "undefined")?;
+        let absent = self.jump_if_true(missing)?;
+        done.push(self.jump()?);
+        // Bucketed: an int key of at most 2^53 in magnitude.
+        let here = self.here();
+        self.patch(bucketed, here)?;
+        let is_int = self.typeof_is(k, "bigint")?;
+        other.push(self.jump_if_false(is_int)?);
+        let key = self.bigint_to_number(k)?;
+        let hi = self.float(9007199254740991.0)?;
+        other.push(self.emit(Instr::JumpIfNotLe { a: key, b: hi, target: 0 })?);
+        let lo = self.float(-9007199254740991.0)?;
+        other.push(self.emit(Instr::JumpIfNotLe { a: lo, b: key, target: 0 })?);
+        let (arg_base, argc) = self.arguments(&[key])?;
+        let bucket = self.alloc()?;
+        self.emit(Instr::CallMethod { dst: bucket, obj: map, name: get, arg_base, argc })?;
+        let no_bucket = self.typeof_is(bucket, "undefined")?;
+        let absent2 = self.jump_if_true(no_bucket)?;
+        let len = self.prop(bucket, "length")?;
+        let one = self.small_int(1)?;
+        self.emit(Instr::Eq { dst: t, a: len, b: one })?;
+        other.push(self.jump_if_false(t)?);
+        let zero = self.small_int(0)?;
+        let entry = self.alloc()?;
+        self.emit(Instr::GetIndex { dst: entry, obj: bucket, key: zero })?;
+        let stored = self.alloc()?;
+        self.emit(Instr::GetIndex { dst: stored, obj: entry, key: zero })?;
+        self.emit(Instr::Eq { dst: t, a: stored, b: k })?;
+        other.push(self.jump_if_false(t)?);
+        self.emit(Instr::GetIndex { dst, obj: entry, key: one })?;
+        done.push(self.jump()?);
+        // Absent: the default.
+        let here = self.here();
+        self.patch(absent, here)?;
+        self.patch(absent2, here)?;
+        match regs.get(1) {
+            Some(&default) => {
+                self.emit(Instr::Move { dst, src: default })?;
+            }
+            None => {
+                self.emit(Instr::LoadNull { dst })?;
+            }
+        }
+        done.push(self.jump()?);
+        let here = self.here();
+        for j in other {
+            self.patch(j, here)?;
+        }
+        Ok(())
+    }
+
     /// An argument whose evaluation can neither run code nor raise, and
     /// whose value the attribute lookup cannot change, so it cannot tell
     /// whether the callee was resolved before it. A cell is not: a
@@ -1359,7 +2020,7 @@ impl<'a> Emitter<'a> {
         } else {
             format!("{}.<locals>.{kind}", self.qualname)
         };
-        let (func_id, child) = self.compile_child(node, kind, qualname.clone(), |e| {
+        let (func_id, child) = self.compile_child(node, kind, qualname.clone(), None, |e| {
             let acc = match kind {
                 "<listcomp>" => Some(e.helper("list", &[])?),
                 "<setcomp>" => Some(e.helper("set", &[])?),

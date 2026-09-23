@@ -92,6 +92,8 @@ pub(super) fn loop_int_literals(stmts: &[ast::Stmt]) -> Vec<i128> {
     }
     let mut out = Vec::new();
     let mut stack: Vec<(Node<'_>, usize, usize)> = Vec::new();
+    // An int `%` or `//` in a loop compares its result with zero.
+    let mut floor_op = false;
     for body in loops {
         stack.extend(body.iter().map(|s| (Node::Stmt(s), 0, 0)));
     }
@@ -119,9 +121,14 @@ pub(super) fn loop_int_literals(stmts: &[ast::Stmt]) -> Vec<i128> {
                     }
                 }
             }
+            Node::Expr(ast::Expr::BinOp(b)) if matches!(b.op, ast::Operator::Mod | ast::Operator::FloorDiv) => floor_op = true,
+            Node::Stmt(ast::Stmt::AugAssign(a)) if matches!(a.op, ast::Operator::Mod | ast::Operator::FloorDiv) => floor_op = true,
             _ => {}
         }
         children(node, depth, raw, &mut stack);
+    }
+    if floor_op && !out.contains(&0) {
+        out.insert(0, 0);
     }
     out
 }
