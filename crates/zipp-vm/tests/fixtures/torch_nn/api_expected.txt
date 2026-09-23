@@ -1,0 +1,238 @@
+buffer reassigned [0.2, 0.3] [0.2, 0.3] False
+non-persistent keys ['running_mean'] ['running_mean', 'cache']
+load without non-persistent <All keys matched successfully>
+buffer None ['running_mean', 'cache'] None
+buffer bad type TypeError cannot assign 'int' as buffer 'running_mean' (torch.nn.Buffer, torch.Tensor or None expected)
+del buffer ['running_mean'] False
+attr then param ['p'] False Parameter
+attr then module ['sub'] False
+param None ['p'] None ['sub.weight', 'sub.bias']
+param bad type TypeError cannot assign 'torch.FloatTensor' as parameter 'p' (torch.nn.Parameter or None expected)
+module None ['sub'] []
+module bad type TypeError cannot assign 'int' as child module 'sub' (torch.nn.Module or None expected)
+param replaced by module TypeError True
+module replaced by param ['p', 'q', 'lin2'] ['sub']
+sequential None child ['0', '1'] 3
+buffer dotted KeyError buffer name can't contain "."
+buffer empty KeyError buffer name can't be empty string ""
+buffer existing attr KeyError attribute 'plain' already exists
+buffer non-string TypeError buffer name should be a string. Got int
+buffer non-tensor TypeError cannot assign 'list' object to buffer 'b' (torch Tensor or None required)
+param dotted KeyError parameter name can't contain "."
+param plain tensor TypeError cannot assign 'torch.FloatTensor' object to parameter 'c' (torch.nn.Parameter or None required)
+param existing attr KeyError attribute 'plain' already exists
+param non-leaf TypeError cannot assign 'torch.FloatTensor' object to parameter 'd' (torch.nn.Parameter or None required)
+module non-module TypeError int is not a Module subclass
+buffer registered None ['nb'] []
+named_modules ['', '0', '1', '1.0', '1.1']
+named_modules prefix ['net', 'net.0', 'net.1', 'net.1.0', 'net.1.1']
+named_parameters prefix ['net.0.weight', 'net.0.bias', 'net.1.1.weight', 'net.1.1.bias']
+named_buffers prefix ['b.0.running_mean', 'b.0.running_var', 'b.0.num_batches_tracked']
+shared modules ['', '0', '1'] 3 2 2
+shared no dedupe ['', '0', '1', '2'] ['0.weight', '0.bias', '2.weight', '2.bias']
+shared state_dict ['0.weight', '0.bias', '2.weight', '2.bias']
+non-recursive [] 2
+keep_vars nested True True False
+load missing RuntimeError Error(s) in loading state_dict for Linear:
+	Missing key(s) in state_dict: "bias". 
+load unexpected RuntimeError Error(s) in loading state_dict for Linear:
+	Unexpected key(s) in state_dict: "extra". 
+load size mismatch RuntimeError Error(s) in loading state_dict for Linear:
+	size mismatch for weight: copying a param with shape torch.Size([2, 2]) from checkpoint, the shape in current model is torch.Size([3, 2]).
+load non-strict ['bias'] ['extra'] 6.0
+incompatible keys tuple ['bias'] ['extra']
+bn old checkpoint <All keys matched successfully>
+assign Parameter True [[1.0, 1.0], [1.0, 1.0]]
+loss buffers ['weight'] ['pos_weight'] []
+double torch.float64 torch.int64 torch.float64 torch.float64 True
+float torch.float32 torch.float32 torch.float32
+to dtype torch.float64 torch.float64
+to device torch.float32
+to int TypeError nn.Module.to only accepts floating point or complex dtypes, but got desired dtype=torch.int64
+parameterlist ['Parameter', 'Parameter'] True 2 ['0', '1']
+parameterlist append 3 Parameter ParameterList 2
+parameterdict ['a', 'b', 'c'] ['Parameter', 'Parameter', 'Parameter'] True ['a', 'b', 'c']
+sequential slice Sequential 2 Tanh ['1', '2']
+sequential edit ['Linear', 'Identity', 'ReLU', 'Linear', 'Tanh', 'Sigmoid', 'ReLU'] ['0', '1', '2', '3', '4', '5', '6']
+sequential del ['0', '1', '2', '3', '4', '5'] Identity
+sequential pop Identity 5
+sequential setitem GELU
+sequential ordereddict ['fc', 'act'] Sequential ['fc']
+modulelist ['Linear', 'Tanh', 'ReLU', 'Sigmoid', 'GELU'] ModuleList 2
+modulelist edit ['Identity', 'ReLU', 'Sigmoid', 'GELU'] ['0', '1', '2', '3']
+modulelist iadd 5 ReLU 4
+modulelist index IndexError index 10 is out of range
+moduledict ['a', 'b', 'c', 'd'] True 4 ['a.weight', 'a.bias'] ReLU ['a', 'c', 'd']
+Linear(in_features=3, out_features=2, bias=True)
+Linear(in_features=3, out_features=2, bias=False)
+LayerNorm((4,), eps=1e-05, elementwise_affine=True)
+LayerNorm((2, 3), eps=1e-06, elementwise_affine=False)
+Dropout(p=0.2, inplace=False)
+Dropout(p=0.1, inplace=True)
+GELU(approximate='none')
+GELU(approximate='tanh')
+Softmax(dim=None)
+Softmax(dim=1)
+LogSoftmax(dim=1)
+Embedding(4, 2)
+Embedding(4, 2, padding_idx=3, max_norm=1.0)
+ReLU()
+ReLU(inplace=True)
+LeakyReLU(negative_slope=0.2)
+ELU(alpha=0.5, inplace=True)
+Hardtanh(min_val=-2.0, max_val=2.0)
+ReLU6()
+Softplus(beta=2, threshold=10)
+Threshold(threshold=0.1, value=0.0)
+PReLU(num_parameters=3)
+GLU(dim=-1)
+SiLU()
+Mish()
+Hardswish()
+Tanh()
+Sigmoid()
+Identity()
+GRUCell(2, 3)
+LSTMCell(2, 3, bias=False)
+RNNCell(2, 3, nonlinearity=relu)
+LSTM(2, 3, num_layers=2, batch_first=True, bidirectional=True)
+GRU(2, 3, num_layers=2, dropout=0.5)
+RNN(2, 3)
+LSTM(4, 3, proj_size=2)
+Conv1d(2, 3, kernel_size=(3,), stride=(1,))
+Conv2d(2, 4, kernel_size=(3, 2), stride=(2, 2), padding=(1, 1), groups=2, bias=False)
+Conv2d(1, 1, kernel_size=(3, 3), stride=(1, 1), padding=same)
+ConvTranspose2d(2, 3, kernel_size=(3, 3), stride=(2, 2), output_padding=(1, 1))
+BatchNorm2d(3, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+BatchNorm1d(3, eps=1e-05, momentum=None, affine=False, track_running_stats=True)
+InstanceNorm2d(3, eps=1e-05, momentum=0.1, affine=False, track_running_stats=False)
+GroupNorm(2, 4, eps=1e-05, affine=True)
+RMSNorm((4,), eps=None, elementwise_affine=True)
+LocalResponseNorm(2, alpha=0.0001, beta=0.75, k=1.0)
+MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+MaxPool1d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+AvgPool2d(kernel_size=2, stride=1, padding=0)
+AvgPool1d(kernel_size=(3,), stride=(3,), padding=(0,))
+AdaptiveAvgPool2d(output_size=(1, 1))
+AdaptiveMaxPool1d(output_size=2)
+Flatten(start_dim=1, end_dim=-1)
+Unflatten(dim=1, unflattened_size=(2, 3))
+Upsample(scale_factor=2.0, mode='nearest')
+Upsample(size=(3, 4), mode='bilinear')
+PixelShuffle(upscale_factor=2)
+Unfold(kernel_size=2, dilation=1, padding=0, stride=1)
+Fold(output_size=(4, 4), kernel_size=2, dilation=1, padding=0, stride=1)
+ZeroPad2d((1, 1, 1, 1))
+ConstantPad1d(padding=(2, 2), value=1.5)
+ReflectionPad2d((1, 0, 1, 0))
+CrossEntropyLoss()
+MSELoss()
+CosineSimilarity()
+MultiheadAttention(
+  (out_proj): NonDynamicallyQuantizableLinear(in_features=4, out_features=4, bias=True)
+)
+EmbeddingBag(5, 2, mode='sum')
+Bilinear(in1_features=2, in2_features=3, out_features=4, bias=True)
+Sequential(
+  (0): Linear(in_features=2, out_features=2, bias=True)
+  (1): Sequential(
+    (0): ReLU()
+    (1): Dropout(p=0.5, inplace=False)
+  )
+)
+ModuleList(
+  (0-2): 3 x Linear(in_features=2, out_features=2, bias=True)
+  (3): ReLU()
+)
+ModuleList()
+ParameterList(  (0): Parameter containing: [torch.float32 of size 2x3])
+TransformerEncoderLayer(
+  (self_attn): MultiheadAttention(
+    (out_proj): NonDynamicallyQuantizableLinear(in_features=4, out_features=4, bias=True)
+  )
+  (linear1): Linear(in_features=4, out_features=8, bias=True)
+  (dropout): Dropout(p=0.1, inplace=False)
+  (linear2): Linear(in_features=8, out_features=4, bias=True)
+  (norm1): LayerNorm((4,), eps=1e-05, elementwise_affine=True)
+  (norm2): LayerNorm((4,), eps=1e-05, elementwise_affine=True)
+  (dropout1): Dropout(p=0.1, inplace=False)
+  (dropout2): Dropout(p=0.1, inplace=False)
+)
+identity args [1.0, 1.0]
+linear zero in [2, 3] [0.0, 0.0, 0.0]
+gru cell unbatched [3] ['torch', 'float64']
+lstm cell unbatched [3] [3] torch.float64
+conv1d unbatched [3, 3]
+layernorm no bias ['weight']
+conv same strided ValueError padding='same' is not supported for strided convolutions
+conv bad padding string ValueError Invalid padding string 'full', should be one of {'valid', 'same'}
+calculate_gain [1, 1, 1, 1, 1, 1, 1.6667, 1.4142, 1.4141, 0.75] 1.3868
+calculate_gain bad ValueError Unsupported nonlinearity swish
+calculate_gain bad slope ValueError negative_slope x not a valid number
+fan in/out (30, 40)
+fan 1d ValueError Fan in and fan out can not be computed for tensor with fewer than 2 dimensions
+embedding padding 3 [0.0, 0.0]
+embedding negative index IndexError index out of range in self
+embedding index too large IndexError index out of range in self
+embedding bad padding AssertionError Padding_idx must be within num_embeddings
+from_pretrained False 3 2
+dropout p negative ValueError dropout probability has to be between 0 and 1, but got -0.5
+dropout p > 1 ValueError dropout probability has to be between 0 and 1, but got 1.5
+dropout p=1 [0.0, 0.0, 0.0] [0.0, 0.0, 0.0] True
+relu inplace [0.0, 2.0] True
+leaky inplace [-0.5, 2.0]
+relu inplace leaf RuntimeError a leaf Variable that requires grad is being used in an in-place operation.
+ce target out of range IndexError Target -1 is out of bounds.
+ce target too large IndexError Target 5 is out of bounds.
+nll float target RuntimeError expected scalar type Long but found Float
+ce batch mismatch ValueError Expected input batch_size (3) to match target batch_size (2).
+ce all ignored mean True
+bce out of range RuntimeError all elements of input should be between 0 and 1
+bce shape ValueError Target size (torch.Size([3])) must be the same as input size (torch.Size([2]))
+clip nonfinite RuntimeError The total norm of order 2.0 for gradients from `parameters` is non-finite, so it cannot be clipped. To disable this error and scale the gradients by the non-finite norm anyway, set `error_if_nonfinite=False`
+clip foreach 2.4495 0.5
+clip value [[0.1, 0.1], [0.1, 0.1]]
+clip with norm [[0.025, 0.025], [0.025, 0.025]]
+weight_norm ['bias', 'weight_g', 'weight_v'] ['bias', 'weight_g', 'weight_v']
+remove_weight_norm ['bias', 'weight'] Parameter
+softmax implicit dims [True, True, True, True] [[0.2689, 0.7311], [0.1192, 0.8808]] [0.2689, 0.7311]
+get_submodule Linear True
+get_submodule missing AttributeError Sequential has no attribute `5`
+get_submodule not module AttributeError `weight` is not an nn.Module
+get_parameter [1, 2]
+get_parameter not param AttributeError `buf` is not an nn.Parameter
+get_buffer [1.0]
+get_buffer not buffer AttributeError `weight` is not a buffer
+train flags True False False True False
+train non-bool ValueError training mode is expected to be boolean
+requires_grad_ [False, False, False, False]
+zero_grad keep [0.0, 0.0, 0.0, 0.0]
+zero_grad none [None, None, None, None]
+hooks 103.0 [[1, 2]]
+hooks removed 2.0 1
+kwargs hooks 18.0
+hook order ['prepended', 'first']
+backward hook [([[-1.0, 5.5, 6.0]], [[2.0, 3.0]])] [[-1.0, 5.5, 6.0]]
+backward hook replaces [[0.0, 0.0, 0.0]] [[3.0, 6.0, 9.0], [4.0, 8.0, 12.0]]
+backward hook no input grad [((None,), [[1.0]])]
+handle context RemovableHandle
+named_buffers empty [] True
+deepcopy independent True [0.0, 0.0] Parameter True True ['scratch']
+encoder clones 2 False 24
+orthogonal (4, 4) 0.0
+orthogonal (3, 5) 0.0
+orthogonal (5, 3) 0.0
+orthogonal (2, 3, 2) 0.0
+trunc_normal True True True
+dirac 2.0 4.0 [0.0, 1.0, 0.0]
+eye [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+eye 3d ValueError Only tensors with 2 dimensions are supported
+sparse zeros per column [3, 3, 3, 3]
+kaiming zero-size [0, 3]
+pad_sequence [3, 3, 2] [2.0, 0.0, 0.0] [3, 3, 2] [0.0, 0.0, 2.0]
+packed [3, 2, 1] [0, 2, 1] [0, 2, 1] [1.0, 3.0, 2.0, 1.0, 3.0, 1.0]
+unpacked [3, 4, 2] [3, 1, 2] [2.0, 0.0, 0.0, 0.0]
+pack unsorted enforce RuntimeError `lengths` array must be sorted in decreasing order when `enforce_sorted` is True. You can pass `enforce_sorted=False` to pack_padded_sequence and/or pack_sequence to sidestep this requirement if you do not need ONNX exportability.
+pack zero length RuntimeError Length of all samples has to be greater than 0, but found an element in 'lengths' that is <= 0
+pack_sequence [2, 2, 1] PackedSequence 4
+lstm packed PackedSequence 6 [1, 3, 3] [3, 2, 1]
