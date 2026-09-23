@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import torch.nn.init as init
 import torch.nn.utils as utils
 import torch.nn.parameter as parameter
-from torch.nn.parameter import Parameter, Buffer
+from torch.nn.parameter import Parameter, Buffer, UninitializedParameter, UninitializedBuffer
 from torch.nn.utils.rnn import PackedSequence
 import torch.nn.utils.rnn as _rnn_utils
 
@@ -72,6 +72,25 @@ def _add_hook(hooks, handle, hook, prepend):
         hooks[k] = v
 
 
+class _WrappedHook:
+    """A load_state_dict pre-hook, called with its module first when it was
+    registered through the public API."""
+
+    def __init__(self, hook, module=None):
+        self.hook = hook
+        self.with_module = module is not None
+        self.module = module
+
+    def __call__(self, *args, **kwargs):
+        if self.with_module:
+            return self.hook(self.module, *args, **kwargs)
+        return self.hook(*args, **kwargs)
+
+    def __deepcopy__(self, memo):
+        # A copied module's hooks (often its own bound methods) follow it.
+        return _WrappedHook(_deepcopy_value(self.hook, memo), _deepcopy_value(self.module, memo) if self.with_module else None)
+
+
 class _IncompatibleKeys(tuple):
     def __new__(cls, missing_keys, unexpected_keys):
         return tuple.__new__(cls, (missing_keys, unexpected_keys))
@@ -101,6 +120,8 @@ def _deepcopy_value(value, memo):
         out.requires_grad = value.requires_grad
         if value.grad is not None:
             out.grad = value.grad.clone()
+        if isinstance(value, Buffer):
+            out = Buffer(out)
         for name in ("persistent", "_is_buffer"):
             if name in value.__dict__:
                 setattr(out, name, value.__dict__[name])
@@ -128,6 +149,10 @@ def _deepcopy_value(value, memo):
         return tuple(_deepcopy_value(v, memo) for v in value)
     if type(value) is set:
         return set(_deepcopy_value(v, memo) for v in value)
+    if type(value).__name__ == "method" and hasattr(value, "__func__"):
+        # As CPython's deepcopy: a bound method (a hook such as a lazy
+        # module's own) is rebound to the copy of its object.
+        return value.__func__.__get__(_deepcopy_value(value.__self__, memo))
     return _copy.deepcopy(value, memo)
 
 
@@ -257,6 +282,10 @@ class Module:
         d["_forward_pre_hooks_with_kwargs"] = OrderedDict()
         d["_backward_hooks"] = OrderedDict()
         d["_backward_pre_hooks"] = OrderedDict()
+        d["_state_dict_hooks"] = OrderedDict()
+        d["_state_dict_pre_hooks"] = OrderedDict()
+        d["_load_state_dict_pre_hooks"] = OrderedDict()
+        d["_load_state_dict_post_hooks"] = OrderedDict()
 
     # -- attribute registries ---------------------------------------------------------------
     def __setattr__(self, name, value):
@@ -508,6 +537,37 @@ class Module:
         _add_hook(hooks, handle, hook, prepend)
         return handle
 
+    def _register_state_dict_hook(self, hook):
+        hooks = self._hooks("_state_dict_hooks")
+        handle = RemovableHandle(hooks)
+        hooks[handle.id] = hook
+        return handle
+
+    def register_state_dict_post_hook(self, hook):
+        hook._from_public_api = True
+        return self._register_state_dict_hook(hook)
+
+    def register_state_dict_pre_hook(self, hook):
+        hooks = self._hooks("_state_dict_pre_hooks")
+        handle = RemovableHandle(hooks)
+        hooks[handle.id] = hook
+        return handle
+
+    def _register_load_state_dict_pre_hook(self, hook, with_module=False):
+        hooks = self._hooks("_load_state_dict_pre_hooks")
+        handle = RemovableHandle(hooks)
+        hooks[handle.id] = _WrappedHook(hook, self if with_module else None)
+        return handle
+
+    def register_load_state_dict_pre_hook(self, hook):
+        return self._register_load_state_dict_pre_hook(hook, with_module=True)
+
+    def register_load_state_dict_post_hook(self, hook):
+        hooks = self._hooks("_load_state_dict_post_hooks")
+        handle = RemovableHandle(hooks)
+        hooks[handle.id] = hook
+        return handle
+
     # -- traversal --------------------------------------------------------------------------
     def _named_modules_list(self, memo, prefix, remove_duplicate, out):
         if id(self) in memo:
@@ -680,13 +740,32 @@ class Module:
             keep_vars = args[2] if len(args) > 2 else keep_vars
         if destination is None:
             destination = OrderedDict()
+        d = self.__dict__
+        pre = d.get("_state_dict_pre_hooks")
+        if pre:
+            for hook in list(pre.values()):
+                hook(self, prefix, keep_vars)
         self._save_to_state_dict(destination, prefix, keep_vars)
         for name, module in self._modules.items():
             if module is not None:
                 module.state_dict(destination=destination, prefix=prefix + name + ".", keep_vars=keep_vars)
+        post = d.get("_state_dict_hooks")
+        if post:
+            local_metadata = {"version": self._version}
+            for hook in list(post.values()):
+                result = hook(self, destination, prefix, local_metadata)
+                if not getattr(hook, "_from_public_api", False):
+                    if result is not None:
+                        destination = result
+                elif result is not None:
+                    raise RuntimeError("state_dict post-hook must return None")
         return destination
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        pre = self.__dict__.get("_load_state_dict_pre_hooks")
+        if pre:
+            for hook in list(pre.values()):
+                hook(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
         persistent = [(k, v) for k, v in self._buffers.items() if k not in self._non_persistent_buffers_set]
         local_state = OrderedDict((k, v) for k, v in list(self._parameters.items()) + persistent if v is not None)
         assign = local_metadata.get("assign_to_params_buffers", False)
@@ -749,6 +828,12 @@ class Module:
                     child_prefix = prefix + name + "."
                     child_state = OrderedDict((k, v) for k, v in local_state.items() if k.startswith(child_prefix))
                     load(child, child_state, child_prefix)
+            post = module.__dict__.get("_load_state_dict_post_hooks")
+            if post:
+                incompatible = _IncompatibleKeys(missing_keys, unexpected_keys)
+                for hook in list(post.values()):
+                    if hook(module, incompatible) is not None:
+                        raise AssertionError("Hooks registered with ``register_load_state_dict_post_hook`` are notexpected to return new values, if incompatible_keys need to be modified,it should be done inplace.")
         load(self, state)
         if strict:
             if unexpected_keys:
@@ -1471,7 +1556,8 @@ class Conv2d(_ConvNd):
     _nd = 2
 
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
-        if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in (in_channels, out_channels, groups)):
+        # Zero channels are allowed, as in PyTorch (lazy convolutions start there).
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (in_channels, out_channels)) or isinstance(groups, bool) or not isinstance(groups, int) or groups < 1:
             raise ValueError("channels and groups must be positive integers")
         super().__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, False, 0, groups, bias, padding_mode, device, dtype)
 
@@ -1526,6 +1612,29 @@ class ConvTranspose2d(_ConvTransposeNd):
         return F.conv_transpose2d(input, self.weight, self.bias, self.stride, self.padding, op, self.groups, self.dilation)
 
 
+class Conv3d(_ConvNd):
+    _nd = 3
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
+        super().__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, False, 0, groups, bias, padding_mode, device, dtype)
+
+    def forward(self, input):
+        return self._conv(input, F.conv3d)
+
+
+class ConvTranspose3d(_ConvTransposeNd):
+    _nd = 3
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, output_padding=0, groups=1, bias=True, dilation=1, padding_mode="zeros", device=None, dtype=None):
+        if padding_mode != "zeros":
+            raise ValueError('Only "zeros" padding mode is supported for ConvTranspose3d')
+        super().__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, True, output_padding, groups, bias, padding_mode, device, dtype)
+
+    def forward(self, input, output_size=None):
+        op = self._output_padding(input, output_size)
+        return F.conv_transpose3d(input, self.weight, self.bias, self.stride, self.padding, op, self.groups, self.dilation)
+
+
 class Unfold(Module):
     def __init__(self, kernel_size, dilation=1, padding=0, stride=1):
         super().__init__()
@@ -1575,6 +1684,39 @@ class MaxPool2d(_MaxPoolNd):
         return F.max_pool2d(input, self.kernel_size, self.stride, self.padding, self.dilation, ceil_mode=self.ceil_mode, return_indices=self.return_indices)
 
 
+class MaxPool3d(_MaxPoolNd):
+    def forward(self, input):
+        return F.max_pool3d(input, self.kernel_size, self.stride, self.padding, self.dilation, ceil_mode=self.ceil_mode, return_indices=self.return_indices)
+
+
+class _MaxUnpoolNd(Module):
+    _nd = 1
+
+    def __init__(self, kernel_size, stride=None, padding=0):
+        super().__init__()
+        self.kernel_size = F._ntuple(kernel_size, self._nd)
+        self.stride = F._ntuple(stride if stride is not None else kernel_size, self._nd)
+        self.padding = F._ntuple(padding, self._nd)
+
+    def forward(self, input, indices, output_size=None):
+        return F._max_unpool(input, indices, self._nd, self.kernel_size, self.stride, self.padding, output_size, "max_unpool%dd" % self._nd)
+
+    def extra_repr(self):
+        return "kernel_size=%s, stride=%s, padding=%s" % (self.kernel_size, self.stride, self.padding)
+
+
+class MaxUnpool1d(_MaxUnpoolNd):
+    _nd = 1
+
+
+class MaxUnpool2d(_MaxUnpoolNd):
+    _nd = 2
+
+
+class MaxUnpool3d(_MaxUnpoolNd):
+    _nd = 3
+
+
 class AvgPool1d(Module):
     def __init__(self, kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True):
         super().__init__()
@@ -1608,6 +1750,11 @@ class AvgPool2d(Module):
         return "kernel_size=%s, stride=%s, padding=%s" % (self.kernel_size, self.stride, self.padding)
 
 
+class AvgPool3d(AvgPool2d):
+    def forward(self, input):
+        return F.avg_pool3d(input, self.kernel_size, self.stride, self.padding, self.ceil_mode, self.count_include_pad, self.divisor_override)
+
+
 class LPPool1d(Module):
     def __init__(self, norm_type, kernel_size, stride=None, ceil_mode=False):
         super().__init__()
@@ -1623,6 +1770,11 @@ class LPPool1d(Module):
 class LPPool2d(LPPool1d):
     def forward(self, input):
         return F.lp_pool2d(input, float(self.norm_type), self.kernel_size, self.stride, self.ceil_mode)
+
+
+class LPPool3d(LPPool1d):
+    def forward(self, input):
+        return F.lp_pool3d(input, float(self.norm_type), self.kernel_size, self.stride, self.ceil_mode)
 
 
 class _AdaptivePool(Module):
@@ -1659,6 +1811,19 @@ class AdaptiveMaxPool1d(_AdaptivePool):
 class AdaptiveMaxPool2d(_AdaptivePool):
     def forward(self, input):
         return F.adaptive_max_pool2d(input, self.output_size, self.return_indices)
+
+
+class AdaptiveAvgPool3d(_AdaptivePool):
+    def __init__(self, output_size):
+        super().__init__(output_size)
+
+    def forward(self, input):
+        return F.adaptive_avg_pool3d(input, self.output_size)
+
+
+class AdaptiveMaxPool3d(_AdaptivePool):
+    def forward(self, input):
+        return F.adaptive_max_pool3d(input, self.output_size, self.return_indices)
 
 
 # ---- normalisation ---------------------------------------------------------------------------
@@ -2331,6 +2496,11 @@ class MultiMarginLoss(_WeightedLoss):
         return F.multi_margin_loss(input, target, p=self.p, margin=self.margin, weight=self.weight, reduction=self.reduction)
 
 
+class MultiLabelMarginLoss(_Loss):
+    def forward(self, input, target):
+        return F.multilabel_margin_loss(input, target, reduction=self.reduction)
+
+
 class TripletMarginLoss(_Loss):
     def __init__(self, margin=1.0, p=2.0, eps=1e-6, swap=False, size_average=None, reduce=None, reduction="mean"):
         super().__init__(size_average, reduce, reduction)
@@ -2431,7 +2601,7 @@ class _PadNd(Module):
         return F.pad(input, self.padding, self._mode)
 
     def extra_repr(self):
-        if self._mode == "constant" and not isinstance(self, (ZeroPad1d, ZeroPad2d)):
+        if self._mode == "constant" and not isinstance(self, (ZeroPad1d, ZeroPad2d, ZeroPad3d)):
             return "padding=%s, value=%s" % (self.padding, self.value)
         return "%s" % (self.padding,)
 
@@ -2480,6 +2650,29 @@ class CircularPad1d(_PadNd):
 
 class CircularPad2d(_PadNd):
     _mode, _n = "circular", 2
+
+
+class ConstantPad3d(_PadNd):
+    _n = 3
+
+
+class ZeroPad3d(_PadNd):
+    _n = 3
+
+    def __init__(self, padding):
+        super().__init__(padding, 0.0)
+
+
+class ReflectionPad3d(_PadNd):
+    _mode, _n = "reflect", 3
+
+
+class ReplicationPad3d(_PadNd):
+    _mode, _n = "replicate", 3
+
+
+class CircularPad3d(_PadNd):
+    _mode, _n = "circular", 3
 
 
 # ---- recurrent cells -------------------------------------------------------------------------
@@ -2942,6 +3135,12 @@ class TransformerEncoderLayer(Module):
         if isinstance(activation, str):
             activation = _get_activation_fn(activation)
         self.activation = activation
+        if activation is F.relu or isinstance(activation, ReLU):
+            self.activation_relu_or_gelu = 1
+        elif activation is F.gelu or isinstance(activation, GELU):
+            self.activation_relu_or_gelu = 2
+        else:
+            self.activation_relu_or_gelu = 0
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
         x = src
@@ -3013,11 +3212,49 @@ class TransformerEncoder(Module):
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
+        self.enable_nested_tensor = enable_nested_tensor
+        self.mask_check = mask_check
+        # PyTorch's conditions for its nested-tensor fast path.
+        layer = encoder_layer
+        attn = getattr(layer, "self_attn", None)
+        eligible = (isinstance(layer, TransformerEncoderLayer) and not layer.norm_first and attn.batch_first
+                    and attn._qkv_same_embed_dim and attn.in_proj_bias is not None and layer.activation_relu_or_gelu
+                    and layer.norm1.eps == layer.norm2.eps and attn.num_heads % 2 == 0)
+        self.use_nested_tensor = bool(enable_nested_tensor and eligible)
+
+    def _nested_padding(self, src, mask, key_padding_mask):
+        """The padding mask when PyTorch would run this call as nested
+        tensors (evaluation, batch_first, a left-aligned key padding mask, no
+        attention mask, no gradient needed): its padded outputs are then
+        zeros before the final norm. None otherwise."""
+        if not self.__dict__.get("use_nested_tensor", False) or key_padding_mask is None or mask is not None:
+            return None
+        first = self.layers[0]
+        if first.training or src.dim() != 3:
+            return None
+        pad = key_padding_mask if key_padding_mask.dtype == torch.bool else key_padding_mask != 0
+        if self.__dict__.get("mask_check", True):
+            for row in pad.tolist():
+                seen = False
+                for p in row:
+                    if p:
+                        seen = True
+                    elif seen:
+                        return None
+        if torch.is_grad_enabled():
+            attn = first.self_attn
+            args = (src, attn.in_proj_weight, attn.in_proj_bias, attn.out_proj.weight, attn.out_proj.bias, first.norm1.weight, first.norm1.bias, first.norm2.weight, first.norm2.bias, first.linear1.weight, first.linear1.bias, first.linear2.weight, first.linear2.bias)
+            if any(t is not None and t.requires_grad for t in args):
+                return None
+        return pad
 
     def forward(self, src, mask=None, src_key_padding_mask=None, is_causal=None):
         output = src
+        pad = self._nested_padding(src, mask, src_key_padding_mask)
         for mod in self.layers:
             output = mod(output, src_mask=mask, is_causal=bool(is_causal), src_key_padding_mask=src_key_padding_mask)
+        if pad is not None:
+            output = output.masked_fill(pad.unsqueeze(-1), 0.0)
         if self.norm is not None:
             output = self.norm(output)
         return output
@@ -3072,4 +3309,251 @@ class Transformer(Module):
                 init.xavier_uniform_(p)
 
 
+
+# ---- lazy modules ----------------------------------------------------------------------------
+_is_lazy = parameter.is_lazy
+
+
+class LazyModuleMixin:
+    """Parameters (and buffers) start as UninitializedParameter; the first
+    forward infers their shapes from the input, materializes them in place
+    (the same objects, so an optimizer built earlier keeps working), resets
+    them and turns the module into `cls_to_become`. Loading a state_dict
+    into an uninitialized module materializes from the checkpoint's shapes."""
+    cls_to_become = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._load_hook = self._register_load_state_dict_pre_hook(self._lazy_load_hook)
+        self._initialize_hook = self.register_forward_pre_hook(self._infer_parameters, with_kwargs=True)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        for name, param in self._parameters.items():
+            if param is not None:
+                if not (_is_lazy(param) or keep_vars):
+                    param = param.detach()
+                destination[prefix + name] = param
+        for name, buf in self._buffers.items():
+            if buf is not None and name not in self._non_persistent_buffers_set:
+                if not (_is_lazy(buf) or keep_vars):
+                    buf = buf.detach()
+                destination[prefix + name] = buf
+
+    def _lazy_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        for name, param in list(self._parameters.items()) + list(self._buffers.items()):
+            key = prefix + name
+            if key in state_dict and param is not None:
+                input_param = state_dict[key]
+                if _is_lazy(param) and not _is_lazy(input_param):
+                    with torch.no_grad():
+                        param.materialize(input_param.shape)
+
+    def initialize_parameters(self, *args, **kwargs):
+        raise NotImplementedError("initialize_parameters is not implemented for %s" % self.__class__.__name__)
+
+    def has_uninitialized_params(self):
+        for param in list(self._parameters.values()) + list(self._buffers.values()):
+            if _is_lazy(param):
+                return True
+        return False
+
+    def _infer_parameters(self, module, args, kwargs=None):
+        kwargs = kwargs if kwargs else {}
+        module.initialize_parameters(*args, **kwargs)
+        if module.has_uninitialized_params():
+            raise RuntimeError("module %s has not been fully initialized" % self._get_name())
+        module._initialize_hook.remove()
+        module._load_hook.remove()
+        delattr(module, "_initialize_hook")
+        delattr(module, "_load_hook")
+        if module.cls_to_become is not None:
+            module.__class__ = module.cls_to_become
+
+    def _replicate_for_data_parallel(self):
+        raise RuntimeError("Modules with uninitialized parameters can't be used with `DataParallel`. Run a dummy forward pass to correctly initialize the modules")
+
+
+class LazyLinear(LazyModuleMixin, Linear):
+    cls_to_become = Linear
+
+    def __init__(self, out_features, bias=True, device=None, dtype=None):
+        super().__init__(0, 0, False)
+        self.weight = UninitializedParameter(device=device, dtype=dtype)
+        self.out_features = out_features
+        if bias:
+            self.bias = UninitializedParameter(device=device, dtype=dtype)
+
+    def reset_parameters(self):
+        if not self.has_uninitialized_params() and self.in_features != 0:
+            super().reset_parameters()
+
+    def initialize_parameters(self, input):
+        if self.has_uninitialized_params():
+            with torch.no_grad():
+                self.in_features = input.shape[-1]
+                self.weight.materialize((self.out_features, self.in_features))
+                if self.bias is not None:
+                    self.bias.materialize((self.out_features,))
+                self.reset_parameters()
+        if self.in_features == 0:
+            if input.shape[-1] != self.weight.shape[-1]:
+                raise AssertionError("The in_features inferred from input: %d is not equal to in_features from self.weight: %d" % (input.shape[-1], self.weight.shape[-1]))
+            self.in_features = input.shape[-1]
+
+
+class _LazyConvXdMixin(LazyModuleMixin):
+    _spatial = 2
+
+    def _lazy_setup(self, out_channels, bias, device, dtype):
+        self.weight = UninitializedParameter(device=device, dtype=dtype)
+        self.out_channels = out_channels
+        if bias:
+            self.bias = UninitializedParameter(device=device, dtype=dtype)
+
+    def reset_parameters(self):
+        if not self.has_uninitialized_params() and self.in_channels != 0:
+            super().reset_parameters()
+
+    def initialize_parameters(self, input, *args, **kwargs):
+        if self.has_uninitialized_params():
+            self.in_channels = self._get_in_channels(input)
+            if self.in_channels % self.groups != 0:
+                raise ValueError("in_channels must be divisible by groups")
+            if self.transposed:
+                self.weight.materialize((self.in_channels, self.out_channels // self.groups) + tuple(self.kernel_size))
+            else:
+                self.weight.materialize((self.out_channels, self.in_channels // self.groups) + tuple(self.kernel_size))
+            if self.bias is not None:
+                self.bias.materialize((self.out_channels,))
+            self.reset_parameters()
+
+    def _get_in_channels(self, input):
+        no_batch = self._spatial + 1
+        if input.dim() not in (no_batch, no_batch + 1):
+            raise RuntimeError("Expected %dD (unbatched) or %dD (batched) input to %s, but got input of size: %s" % (no_batch, no_batch + 1, self.__class__.__name__, input.shape))
+        return input.shape[1] if input.dim() == no_batch + 1 else input.shape[0]
+
+    def _get_num_spatial_dims(self):
+        return self._spatial
+
+
+class LazyConv1d(_LazyConvXdMixin, Conv1d):
+    cls_to_become = Conv1d
+    _spatial = 1
+
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
+        super().__init__(0, 0, kernel_size, stride, padding, dilation, groups, False, padding_mode, device, dtype)
+        self._lazy_setup(out_channels, bias, device, dtype)
+
+
+class LazyConv2d(_LazyConvXdMixin, Conv2d):
+    cls_to_become = Conv2d
+    _spatial = 2
+
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
+        super().__init__(0, 0, kernel_size, stride, padding, dilation, groups, False, padding_mode, device, dtype)
+        self._lazy_setup(out_channels, bias, device, dtype)
+
+
+class LazyConv3d(_LazyConvXdMixin, Conv3d):
+    cls_to_become = Conv3d
+    _spatial = 3
+
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
+        super().__init__(0, 0, kernel_size, stride, padding, dilation, groups, False, padding_mode, device, dtype)
+        self._lazy_setup(out_channels, bias, device, dtype)
+
+
+class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):
+    cls_to_become = ConvTranspose1d
+    _spatial = 1
+
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0, output_padding=0, groups=1, bias=True, dilation=1, padding_mode="zeros", device=None, dtype=None):
+        super().__init__(0, 0, kernel_size, stride, padding, output_padding, groups, False, dilation, padding_mode, device, dtype)
+        self._lazy_setup(out_channels, bias, device, dtype)
+
+
+class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):
+    cls_to_become = ConvTranspose2d
+    _spatial = 2
+
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0, output_padding=0, groups=1, bias=True, dilation=1, padding_mode="zeros", device=None, dtype=None):
+        super().__init__(0, 0, kernel_size, stride, padding, output_padding, groups, False, dilation, padding_mode, device, dtype)
+        self._lazy_setup(out_channels, bias, device, dtype)
+
+
+class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):
+    cls_to_become = ConvTranspose3d
+    _spatial = 3
+
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0, output_padding=0, groups=1, bias=True, dilation=1, padding_mode="zeros", device=None, dtype=None):
+        super().__init__(0, 0, kernel_size, stride, padding, output_padding, groups, False, dilation, padding_mode, device, dtype)
+        self._lazy_setup(out_channels, bias, device, dtype)
+
+
+class _LazyNormBase(LazyModuleMixin, _NormBase):
+    def __init__(self, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True, device=None, dtype=None):
+        super().__init__(0, eps, momentum, False, False, device=device, dtype=dtype)
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+        if self.affine:
+            self.weight = UninitializedParameter(device=device, dtype=dtype)
+            self.bias = UninitializedParameter(device=device, dtype=dtype)
+        if self.track_running_stats:
+            self.running_mean = UninitializedBuffer(device=device, dtype=dtype)
+            self.running_var = UninitializedBuffer(device=device, dtype=dtype)
+            self.num_batches_tracked = torch.tensor(0, dtype=torch.int64)
+
+    def reset_parameters(self):
+        if not self.has_uninitialized_params() and self.num_features != 0:
+            super().reset_parameters()
+
+    def initialize_parameters(self, input):
+        if self.has_uninitialized_params():
+            self.num_features = input.shape[1]
+            if self.affine:
+                self.weight.materialize((self.num_features,))
+                self.bias.materialize((self.num_features,))
+            if self.track_running_stats:
+                self.running_mean.materialize((self.num_features,))
+                self.running_var.materialize((self.num_features,))
+            self.reset_parameters()
+
+
+class LazyBatchNorm1d(_LazyNormBase, _BatchNorm):
+    cls_to_become = BatchNorm1d
+    _check_input_dim = BatchNorm1d._check_input_dim
+
+
+class LazyBatchNorm2d(_LazyNormBase, _BatchNorm):
+    cls_to_become = BatchNorm2d
+    _check_input_dim = BatchNorm2d._check_input_dim
+
+
+class LazyBatchNorm3d(_LazyNormBase, _BatchNorm):
+    cls_to_become = BatchNorm3d
+    _check_input_dim = BatchNorm3d._check_input_dim
+
+
+class LazyInstanceNorm1d(_LazyNormBase, _InstanceNorm):
+    cls_to_become = InstanceNorm1d
+    _batched_rank = 3
+
+
+class LazyInstanceNorm2d(_LazyNormBase, _InstanceNorm):
+    cls_to_become = InstanceNorm2d
+    _batched_rank = 4
+
+
+class LazyInstanceNorm3d(_LazyNormBase, _InstanceNorm):
+    cls_to_become = InstanceNorm3d
+    _batched_rank = 5
+
+
 functional = F
+
+# torch.nn.utils.parametrize/parametrizations subclass ModuleList and Module,
+# so they load once those exist (PyTorch exposes them as attributes of
+# torch.nn.utils after `import torch`).
+import torch.nn.utils.parametrize
+import torch.nn.utils.parametrizations

@@ -142,8 +142,8 @@ def _strided(x, starts, count, step, first_dim):
 def linear(x, weight, bias=None):
     if torch._graph_recording and getattr(x, "_zipp_graph", False):
         return x.linear(weight, bias)
-    out = torch.matmul(x, weight.transpose(0, 1))
-    return out if bias is None else out + bias
+    # matmul(x, weight.T) + bias, without copying the weight's transpose.
+    return torch._linear(x, weight, bias)
 
 
 def bilinear(input1, input2, weight, bias=None):
@@ -466,8 +466,15 @@ def conv_transpose2d(input, weight, bias=None, stride=1, padding=0, output_paddi
     if ho <= 0 or wo <= 0:
         raise RuntimeError("Given input size per channel: (%d x %d). Calculated output size per channel: (%d x %d). Output size is too small" % (h, w, ho, wo))
     out_shape = (n, cout, ho, wo)
+    # The conv2d this is the adjoint of, run over an output-sized input, has
+    # one position more per dimension where output_padding >= stride (legal
+    # when the dilation is larger): x is extended by zeros there, and the
+    # input gradient cropped back.
+    hc = (ho + 2 * padding[0] - dilation[0] * (kh - 1) - 1) // stride[0] + 1
+    wc = (wo + 2 * padding[1] - dilation[1] * (kw - 1) - 1) // stride[1] + 1
+    xk = x.detach() if (hc, wc) == (h, w) else pad(x.detach(), (0, wc - w, 0, hc - h))
     zeros = torch.zeros(*out_shape, dtype=x.dtype)
-    gx, _, _ = _k.conv2d_backward(zeros._s, zeros.shape, weight._s, weight.shape, x._s, stride, padding, dilation, groups)
+    gx, _, _ = _k.conv2d_backward(zeros._s, zeros.shape, weight._s, weight.shape, xk._s, stride, padding, dilation, groups)
     out = Tensor(gx, out_shape, x.dtype)
     if bias is not None:
         with torch.no_grad():
@@ -475,7 +482,9 @@ def conv_transpose2d(input, weight, bias=None, stride=1, padding=0, output_paddi
     if torch._needs_grad(x, weight, bias):
         def backward(g):
             gin = conv2d(g, weight.detach(), None, stride, padding, dilation, groups)
-            _, gw, _ = _k.conv2d_backward(g._s, g.shape, weight._s, weight.shape, x._s, stride, padding, dilation, groups)
+            if (hc, wc) != (h, w):
+                gin = gin[:, :, :h, :w]
+            _, gw, _ = _k.conv2d_backward(g._s, g.shape, weight._s, weight.shape, xk._s, stride, padding, dilation, groups)
             gb = None if bias is None else g.sum((0, 2, 3))
             return (gin, Tensor(gw, weight.shape, weight.dtype), gb)
         out.requires_grad = True
@@ -490,6 +499,107 @@ def conv_transpose1d(input, weight, bias=None, stride=1, padding=0, output_paddi
     s, p, op, d = _single(stride), _single(padding), _single(output_padding), _single(dilation)
     out = conv_transpose2d(x.unsqueeze(2), weight.unsqueeze(2), bias, (1, s[0]), (0, p[0]), (0, op[0]), groups, (1, d[0]))
     return out.squeeze(2)
+
+
+def _groups_arg(groups):
+    if isinstance(groups, bool) or not isinstance(groups, int) or groups < 1:
+        raise ValueError("groups must be a positive integer")
+    return groups
+
+
+def _depth_taps(x, count, start, step, spacing, taps, groups):
+    """The `taps` depth slices x[:, :, start + k * spacing :: step] (each
+    `count` long) of an N, C, D, H, W tensor, stacked into the channels of
+    one N * count, groups * taps * C / groups, H, W batch (group-major, so a
+    grouped conv2d sees each group's taps together)."""
+    n, c, _, h, w = x.shape
+    views = [_strided(x, [start + k * spacing], [count], [step], 2) for k in range(taps)]
+    stacked = torch.stack(views, 1).reshape(n, taps, groups, c // groups, count, h, w)
+    return stacked.permute(0, 4, 2, 1, 3, 5, 6).reshape(n * count, groups * taps * (c // groups), h, w)
+
+
+def conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    """conv3d as one conv2d call: the kernel's depth taps of every output
+    plane are stacked into the input channels (and the weight's depth folded
+    into its input channels to match), so the native 2-D kernel computes the
+    whole sum, and autograd flows through the stacking."""
+    x = input
+    if len(x.shape) == 4:
+        return conv3d(x.unsqueeze(0), weight, bias, stride, padding, dilation, groups).squeeze(0)
+    if len(x.shape) != 5:
+        raise RuntimeError("Expected 4D (unbatched) or 5D (batched) input to conv3d, but got input of size: %s" % list(x.shape))
+    if len(weight.shape) != 5:
+        raise RuntimeError("conv3d expects a 5-D (out, in / groups, kD, kH, kW) weight, got %s" % list(weight.shape))
+    groups = _groups_arg(groups)
+    s = _ntuple(stride, 3, "stride")
+    d = _ntuple(dilation, 3, "dilation")
+    if isinstance(padding, str):
+        if padding == "valid":
+            p = (0, 0, 0)
+        elif padding == "same":
+            x, p = _same_padding(x, weight, d, s, 3)
+        else:
+            raise ValueError("Invalid padding string '%s'" % padding)
+    else:
+        p = _ntuple(padding, 3, "padding")
+    n, cin = x.shape[0], x.shape[1]
+    cout, cg, kd = weight.shape[0], weight.shape[1], weight.shape[2]
+    if cin != cg * groups:
+        raise RuntimeError("Given groups=%d, weight of size %s, expected input%s to have %d channels, but got %d channels instead" % (groups, list(weight.shape), list(input.shape), cg * groups, cin))
+    if bias is not None and tuple(bias.shape) != (cout,):
+        raise RuntimeError("conv3d bias must match the output channels")
+    depth = x.shape[2] + 2 * p[0]
+    do = (depth - d[0] * (kd - 1) - 1) // s[0] + 1
+    if do <= 0:
+        raise RuntimeError("Calculated padded input size per channel: (%d x %d x %d). Kernel size: (%d x %d x %d). Kernel size can't be greater than actual input size" % (depth, x.shape[3] + 2 * p[1], x.shape[4] + 2 * p[2], kd, weight.shape[3], weight.shape[4]))
+    if p[0]:
+        x = pad(x, (0, 0, 0, 0, p[0], p[0]))
+    planes = _depth_taps(x, do, 0, s[0], d[0], kd, groups)
+    w2 = weight.permute(0, 2, 1, 3, 4).reshape(cout, kd * cg, weight.shape[3], weight.shape[4])
+    out = conv2d(planes, w2, bias, s[1:], p[1:], d[1:], groups)
+    return out.reshape(n, do, cout, out.shape[2], out.shape[3]).permute(0, 2, 1, 3, 4)
+
+
+def conv_transpose3d(input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1):
+    """The adjoint of conv3d, composed from one conv_transpose2d call: along
+    depth it is an ordinary convolution of the stride-dilated (zero-inserted)
+    input with the depth-flipped kernel, whose taps are stacked into the
+    channels as in conv3d."""
+    x = input
+    if len(x.shape) == 4:
+        return conv_transpose3d(x.unsqueeze(0), weight, bias, stride, padding, output_padding, groups, dilation).squeeze(0)
+    if len(x.shape) != 5 or len(weight.shape) != 5:
+        raise RuntimeError("Expected 4D (unbatched) or 5D (batched) input to conv_transpose3d, but got input of size: %s" % list(x.shape))
+    groups = _groups_arg(groups)
+    s = _ntuple(stride, 3, "stride")
+    p = _ntuple(padding, 3, "padding")
+    op = _ntuple(output_padding, 3, "output_padding")
+    d = _ntuple(dilation, 3, "dilation")
+    for i in range(3):
+        if op[i] >= s[i] and op[i] >= d[i]:
+            raise RuntimeError("output padding must be smaller than either stride or dilation, but got output_padding_depth: %d output_padding_height: %d output_padding_width: %d stride_depth: %d stride_height: %d stride_width: %d dilation_depth: %d dilation_height: %d dilation_width: %d" % (op + s + d))
+    n, cin, depth = x.shape[0], x.shape[1], x.shape[2]
+    if weight.shape[0] != cin:
+        raise RuntimeError("Given transposed=1, weight of size %s, expected input%s to have %d channels, but got %d channels instead" % (list(weight.shape), list(x.shape), weight.shape[0], cin))
+    cog, kd = weight.shape[1], weight.shape[2]
+    cout = cog * groups
+    do = (depth - 1) * s[0] - 2 * p[0] + d[0] * (kd - 1) + op[0] + 1
+    if do <= 0:
+        raise RuntimeError("Given input size per channel: (%d x %d x %d). Calculated output size per channel is too small" % tuple(x.shape[2:]))
+    up = x
+    if s[0] > 1:
+        h, w = x.shape[3], x.shape[4]
+        zeros = torch.zeros(n, cin, depth, s[0] - 1, h, w, dtype=x.dtype)
+        up = torch.cat([x.unsqueeze(3), zeros], 3).reshape(n, cin, depth * s[0], h, w).narrow(2, 0, (depth - 1) * s[0] + 1)
+    edge = d[0] * (kd - 1)
+    if edge or op[0]:
+        up = pad(up, (0, 0, 0, 0, edge, edge + op[0]))
+    planes = _depth_taps(up, do, p[0], 1, d[0], kd, groups)
+    cig = cin // groups
+    kh, kw = weight.shape[3], weight.shape[4]
+    wf = weight.flip(2).reshape(groups, cig, cog, kd, kh, kw).permute(0, 3, 1, 2, 4, 5).reshape(groups * kd * cig, cog, kh, kw)
+    out = conv_transpose2d(planes, wf, bias, s[1:], p[1:], op[1:], groups, d[1:])
+    return out.reshape(n, do, cout, out.shape[2], out.shape[3]).permute(0, 2, 1, 3, 4)
 
 
 def _patches(x, kernel, dilation, padding, stride, fill, name):
@@ -599,23 +709,28 @@ def _max_pool(x, nd, kernel_size, stride, padding, dilation, ceil_mode, return_i
     outs = [_pool_out(spatial[i], k[i], s[i], p[i], d[i], ceil_mode) for i in range(nd)]
     if any(o <= 0 for o in outs):
         raise RuntimeError("Given input size: %s. Calculated output size: %s. Output size is too small" % (tuple(x.shape[1:]), tuple([x.shape[1]] + outs)))
-    spec = []
-    for i in reversed(range(nd)):
-        right = max(0, (outs[i] - 1) * s[i] + d[i] * (k[i] - 1) + 1 - spatial[i] - p[i])
-        spec += [p[i], right]
-    xp = pad(x, spec, value=-_inf) if any(spec) else x
-    views = []
-    for flat in range(_prod(k)):
-        offs, rem = [], flat
-        for kk in reversed(k):
-            offs.append(rem % kk)
-            rem //= kk
-        offs.reverse()
-        views.append(_strided(xp, [o * dd for o, dd in zip(offs, d)], outs, s, 2))
-    if len(views) == 1:
-        values, which = views[0], torch.zeros(*views[0].shape, dtype=torch.int64)
-    else:
-        values, which = torch.stack(views, -1).max(-1)
+    def stacked(x):
+        # The -inf padded input's kh * kw strided views, stacked: max(-1).
+        spec = []
+        for i in reversed(range(nd)):
+            right = max(0, (outs[i] - 1) * s[i] + d[i] * (k[i] - 1) + 1 - spatial[i] - p[i])
+            spec += [p[i], right]
+        xp = pad(x, spec, value=-_inf) if any(spec) else x
+        views = []
+        for flat in range(_prod(k)):
+            offs, rem = [], flat
+            for kk in reversed(k):
+                offs.append(rem % kk)
+                rem //= kk
+            offs.reverse()
+            views.append(_strided(xp, [o * dd for o, dd in zip(offs, d)], outs, s, 2))
+        if len(views) == 1:
+            return views[0], torch.zeros(*views[0].shape, dtype=torch.int64)
+        return torch.stack(views, -1).max(-1)
+    # 2-d windows that cannot overlap run as one kernel with the same values
+    # and gradients (see torch._max_pool2d).
+    native = torch._max_pool2d(x, k, s, p, d, outs, lambda xd: stacked(xd)[0]) if nd == 2 else None
+    values, which = native if native is not None else stacked(x)
     if unbatched:
         values = values.squeeze(0)
     if not return_indices:
@@ -644,6 +759,14 @@ def max_pool1d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode
 
 def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, return_indices=False):
     return _max_pool(input, 2, kernel_size, stride, padding, dilation, ceil_mode, return_indices, "max_pool2d")
+
+
+def max_pool3d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, return_indices=False):
+    return _max_pool(input, 3, kernel_size, stride, padding, dilation, ceil_mode, return_indices, "max_pool3d")
+
+
+def max_pool3d_with_indices(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, return_indices=True):
+    return _max_pool(input, 3, kernel_size, stride, padding, dilation, ceil_mode, True, "max_pool3d")
 
 
 def max_pool1d_with_indices(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, return_indices=True):
@@ -717,6 +840,10 @@ def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False, coun
     return _avg_pool(input, 2, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override, "avg_pool2d")
 
 
+def avg_pool3d(input, kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True, divisor_override=None):
+    return _avg_pool(input, 3, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override, "avg_pool3d")
+
+
 def lp_pool1d(input, norm_type, kernel_size, stride=None, ceil_mode=False):
     k = _single(kernel_size)[0]
     out = avg_pool1d(input ** norm_type, k, stride, 0, ceil_mode)
@@ -727,6 +854,12 @@ def lp_pool2d(input, norm_type, kernel_size, stride=None, ceil_mode=False):
     kh, kw = _pair(kernel_size)
     out = avg_pool2d(input ** norm_type, (kh, kw), stride, 0, ceil_mode)
     return (torch.sign(out) * relu(torch.abs(out))) ** (1.0 / norm_type) * ((kh * kw) ** (1.0 / norm_type))
+
+
+def lp_pool3d(input, norm_type, kernel_size, stride=None, ceil_mode=False):
+    kd, kh, kw = _ntuple(kernel_size, 3, "kernel_size")
+    out = avg_pool3d(input ** norm_type, (kd, kh, kw), stride, 0, ceil_mode)
+    return ((torch.sign(out) * relu(torch.abs(out))) * (kd * kh * kw)) ** (1.0 / norm_type)
 
 
 def _adaptive_sizes(x, nd, output_size):
@@ -793,6 +926,10 @@ def _adaptive_max(x, nd, output_size, return_indices, name):
     return res
 
 
+def adaptive_avg_pool3d(input, output_size):
+    return _adaptive_avg(input, 3, output_size, "adaptive_avg_pool3d")
+
+
 def adaptive_max_pool1d(input, output_size, return_indices=False):
     return _adaptive_max(input, 1, output_size, return_indices, "adaptive_max_pool1d")
 
@@ -807,6 +944,60 @@ def adaptive_max_pool1d_with_indices(input, output_size, return_indices=True):
 
 def adaptive_max_pool2d_with_indices(input, output_size, return_indices=True):
     return _adaptive_max(input, 2, output_size, True, "adaptive_max_pool2d")
+
+
+def adaptive_max_pool3d(input, output_size, return_indices=False):
+    return _adaptive_max(input, 3, output_size, return_indices, "adaptive_max_pool3d")
+
+
+def adaptive_max_pool3d_with_indices(input, output_size, return_indices=True):
+    return _adaptive_max(input, 3, output_size, True, "adaptive_max_pool3d")
+
+
+def _max_unpool(input, indices, nd, kernel_size, stride, padding, output_size, name):
+    """Scatters each value to its flat index in a zero output plane; the
+    gradient gathers from the same indices."""
+    k = _ntuple(kernel_size, nd, "kernel_size")
+    s = k if stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0) else _ntuple(stride, nd, "stride")
+    p = _ntuple(padding, nd, "padding")
+    unbatched = len(input.shape) == nd + 1
+    x = input.unsqueeze(0) if unbatched else input
+    idx = indices.unsqueeze(0) if unbatched else indices
+    spatial = x.shape[2:]
+    if output_size is None:
+        outs = [(spatial[i] - 1) * s[i] - 2 * p[i] + k[i] for i in range(nd)]
+    else:
+        outs = [int(v) for v in output_size][-nd:]
+        for i in range(nd):
+            low = (spatial[i] - 1) * s[i] - 2 * p[i] + k[i]
+            if not low - s[i] < outs[i] < low + s[i]:
+                raise ValueError("invalid output_size %s (dim %d must be between %d and %d)" % (list(output_size), i, low - s[i], low + s[i]))
+    n, c = x.shape[0], x.shape[1]
+    plane = _prod(outs)
+    flat_idx = idx.reshape(n, c, -1).long()
+    if flat_idx.numel() and (int(flat_idx.min().item()) < 0 or int(flat_idx.max().item()) >= plane):
+        raise RuntimeError("Found an invalid max index: %d (output volumes are of size %s" % (int(flat_idx.max().item()), "x".join(str(v) for v in outs)))
+    flat_x = x.reshape(n, c, -1)
+    out = torch.zeros(n, c, plane, dtype=x.dtype).scatter(2, flat_idx, flat_x.detach())
+    if torch._needs_grad(flat_x):
+        def backward(g):
+            return (torch.gather(g, 2, flat_idx),)
+        out.requires_grad = True
+        out._node = torch._Node(backward, (flat_x,), "MaxUnpool%dDBackward0" % nd)
+    out = out.reshape(n, c, *outs)
+    return out.squeeze(0) if unbatched else out
+
+
+def max_unpool1d(input, indices, kernel_size, stride=None, padding=0, output_size=None):
+    return _max_unpool(input, indices, 1, kernel_size, stride, padding, output_size, "max_unpool1d")
+
+
+def max_unpool2d(input, indices, kernel_size, stride=None, padding=0, output_size=None):
+    return _max_unpool(input, indices, 2, kernel_size, stride, padding, output_size, "max_unpool2d")
+
+
+def max_unpool3d(input, indices, kernel_size, stride=None, padding=0, output_size=None):
+    return _max_unpool(input, indices, 3, kernel_size, stride, padding, output_size, "max_unpool3d")
 
 
 # ---- resampling ----------------------------------------------------------------------------
@@ -852,8 +1043,6 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
             raise ValueError("align_corners option can only be set with the interpolating modes: linear | bilinear | bicubic | trilinear")
     elif align_corners is None:
         align_corners = False
-    if antialias:
-        raise NotImplementedError("interpolate(antialias=True) is not supported on Zipp")
     if size is not None and scale_factor is not None:
         raise ValueError("only one of size or scale_factor should be defined")
     if size is not None:
@@ -871,8 +1060,14 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
             scales = [None] * nd
     else:
         raise ValueError("either size or scale_factor should be defined")
+    if antialias and not (mode in ("bilinear", "bicubic") and nd == 2):
+        raise ValueError("Anti-alias option is restricted to bilinear and bicubic modes and requires a 4-D tensor as input")
     if mode == "area":
         return _adaptive_avg(x, nd, tuple(out_sizes), "adaptive_avg_pool%dd" % nd)
+    if mode == "bicubic" or antialias:
+        if nd != 2:
+            raise NotImplementedError("Got %dD input, but bicubic mode needs 4D input" % (nd + 2))
+        return _separable_resample(x, out_sizes, scales, align_corners, mode == "bicubic", antialias)
     linear_modes = {"linear": 1, "bilinear": 2, "trilinear": 3}
     if mode in linear_modes:
         if linear_modes[mode] != nd:
@@ -946,6 +1141,121 @@ def _linear_resample(x, dim, n_out, scale, align_corners):
     a = torch.index_select(x, dim, torch.tensor(i0, dtype=torch.int64))
     b = torch.index_select(x, dim, torch.tensor(i1, dtype=torch.int64))
     return a * w0 + b * w1
+
+
+def _cubic1(x, a):
+    return ((x * (a + 2) - (a + 3)) * x) * x + 1.0
+
+
+def _cubic2(x, a):
+    return ((x * a - 5 * a) * x + 8 * a) * x - 4 * a
+
+
+def _scale64(n_in, n_out, scale, align_corners):
+    if align_corners:
+        return (n_in - 1) / (n_out - 1) if n_out > 1 else 0.0
+    if scale is not None and scale > 0:
+        return 1.0 / scale
+    return n_in / n_out
+
+
+def _cubic_taps(n_in, n_out, s, align_corners, dtype):
+    """PyTorch's upsample_bicubic2d taps along one dimension: per output,
+    four source indices (clamped to the border) and cubic-convolution
+    weights (A=-0.75). Computed with `dtype` tensor arithmetic, which rounds
+    each step as the kernel's own float arithmetic does."""
+    o = torch.arange(n_out, dtype=dtype)
+    real = o * s if align_corners else (o + 0.5) * s - 0.5
+    base = torch.floor(real).clamp(max=n_in - 1)
+    t = (real - base).clamp(0.0, 1.0)
+    u = 1.0 - t
+    a = -0.75
+    w = torch.stack([_cubic2(t + 1.0, a), _cubic1(t, a), _cubic1(u, a), _cubic2(u + 1.0, a)], 1)
+    idx = (base.long().unsqueeze(1) + (torch.arange(4) - 1).unsqueeze(0)).clamp(0, n_in - 1)
+    return idx, w
+
+
+def _aa_taps(n_in, n_out, s, cubic, dtype, r):
+    """PyTorch's antialiased (PIL-style) taps along one dimension: a filter
+    (triangle, or Keys cubic with a=-0.5) stretched by the downscale factor
+    and normalised to sum to one within the input."""
+    size = 4 if cubic else 2
+    support = r(size * 0.5 * s) if s >= 1.0 else size * 0.5
+    invscale = r(1.0 / s) if s >= 1.0 else 1.0
+    o = torch.arange(n_out, dtype=dtype)
+    center = (o + 0.5) * s
+    xmin = ((center - support) + 0.5).trunc().clamp(min=0)
+    xsize = ((center + support) + 0.5).trunc().clamp(max=n_in) - xmin
+    taps = max(1, int(xsize.max().item()))
+    j = torch.arange(taps, dtype=dtype).unsqueeze(0)
+    pos = xmin.unsqueeze(1) + j
+    x = torch.abs(((pos - center.unsqueeze(1)) + 0.5) * invscale)
+    zero = torch.zeros_like(x)
+    if cubic:
+        w = torch.where(x < 1.0, _cubic1(x, -0.5), torch.where(x < 2.0, _cubic2(x, -0.5), zero))
+    else:
+        w = torch.where(x < 1.0, 1.0 - x, zero)
+    w = torch.where(j < xsize.unsqueeze(1), w, zero)
+    total = w.sum(1, keepdim=True)
+    w = w / torch.where(total != 0, total, torch.ones_like(total))
+    return pos.long().clamp(max=n_in - 1), w
+
+
+def _resample_matrix(n_in, n_out, scale, align_corners, cubic, antialias, dtype):
+    """The n_out x n_in interpolation matrix of one dimension."""
+    if dtype == torch.float64:
+        s, r = _scale64(n_in, n_out, scale, align_corners), _identity
+    else:
+        s, r = _scale(n_in, n_out, scale, align_corners), _f32
+    if antialias:
+        idx, w = _aa_taps(n_in, n_out, s, cubic, dtype, r)
+    else:
+        idx, w = _cubic_taps(n_in, n_out, s, align_corners, dtype)
+    return torch.zeros(n_out, n_in, dtype=dtype).scatter_add(1, idx, w)
+
+
+def _identity(v):
+    return v
+
+
+def _separable_resample(x, out_sizes, scales, align_corners, cubic, antialias):
+    """Bicubic and antialiased bilinear/bicubic resampling of N, C, H, W:
+    width first, then height, each a product with the dimension's
+    interpolation matrix (so the gradient is the exact adjoint, as PyTorch's
+    backward kernels compute it)."""
+    dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    h_in, w_in = x.shape[2], x.shape[3]
+    h_out, w_out = out_sizes
+    # With antialias, PyTorch's forward skips a dimension whose size is
+    # unchanged, but its backward still applies that dimension's weights
+    # (not the identity when an explicit scale factor was given): the value
+    # passes through and the gradient takes the weights.
+    out = x
+    if not antialias or w_out != w_in or (scales[1] is not None and torch._needs_grad(out)):
+        m = _resample_matrix(w_in, w_out, scales[1], align_corners, cubic, antialias, dtype).to(x.dtype)
+        cols = torch.matmul(out, m.t())
+        out = cols if not antialias or w_out != w_in else _value_with_grad_of(out, cols)
+    if not antialias or h_out != h_in or (scales[0] is not None and torch._needs_grad(out)):
+        m = _resample_matrix(h_in, h_out, scales[0], align_corners, cubic, antialias, dtype).to(x.dtype)
+        rows = torch.matmul(m, out)
+        if antialias and h_out == h_in:
+            rows = _value_with_grad_of(out, rows)
+        elif antialias and w_out == 1 and h_out > 1:
+            # PyTorch's antialiased kernel applies the first output row's
+            # vertical weights to every row when the output is one pixel
+            # wide; its backward is the true adjoint. Match both.
+            quirk = torch.matmul(m.narrow(0, 0, 1).expand(h_out, h_in), out)
+            rows = _value_with_grad_of(quirk, rows)
+        out = rows
+    return out
+
+
+def _value_with_grad_of(value, proxy):
+    """Exactly `value`, differentiating as `proxy` (of the same shape): the
+    added proxy - proxy.detach() is an exact zero."""
+    if not torch._needs_grad(proxy):
+        return value.detach()
+    return value.detach() + (proxy - proxy.detach())
 
 
 # ---- activations ---------------------------------------------------------------------------
@@ -1151,6 +1461,37 @@ def hardswish(input, inplace=False):
     return out
 
 
+_threshold_fn = threshold
+
+
+def threshold_(input, threshold, value):
+    return _threshold_fn(input, threshold, value, True)
+
+
+def hardtanh_(input, min_val=-1.0, max_val=1.0):
+    return hardtanh(input, min_val, max_val, True)
+
+
+def elu_(input, alpha=1.0):
+    return elu(input, alpha, True)
+
+
+def selu_(input):
+    return selu(input, True)
+
+
+def celu_(input, alpha=1.0):
+    return celu(input, alpha, True)
+
+
+def leaky_relu_(input, negative_slope=0.01):
+    return leaky_relu(input, negative_slope, True)
+
+
+def rrelu_(input, lower=1.0 / 8, upper=1.0 / 3, training=False):
+    return rrelu(input, lower, upper, training, True)
+
+
 def _implicit_dim(ndim):
     return 0 if ndim in (0, 1, 3) else 1
 
@@ -1208,7 +1549,13 @@ def _clamp_min_value(t, eps):
 
 def normalize(input, p=2.0, dim=1, eps=1e-12, out=None):
     n = _safe_norm(input, p, dim, keepdim=True).clamp(min=eps)
-    return input / n.expand_as(input)
+    result = input / n.expand_as(input)
+    if out is None:
+        return result
+    if torch._needs_grad(result):
+        raise RuntimeError("normalize(): functions with out=... arguments don't support automatic differentiation, but one of the arguments requires grad.")
+    out.copy_(result)
+    return out
 
 
 def cosine_similarity(x1, x2, dim=1, eps=1e-8):
@@ -1776,6 +2123,37 @@ def multi_margin_loss(input, target, p=1, margin=1.0, weight=None, size_average=
     loss = (z * others.to(x.dtype)).sum(1) / c
     if len(input.shape) == 1 and reduction == "none":
         loss = loss.reshape(())
+    return _reduce(loss, reduction)
+
+
+def multilabel_margin_loss(input, target, size_average=None, reduce=None, reduction="mean"):
+    """sum over target classes j (the leading entries of each target row,
+    up to the first -1) and non-target classes i of max(0, 1 - (x[j] - x[i])),
+    divided by the number of classes."""
+    reduction = _reduction(size_average, reduce, reduction)
+    unbatched = len(input.shape) <= 1
+    x = input.reshape(1, -1) if unbatched else input
+    t = target.reshape(1, -1) if unbatched else target
+    if len(x.shape) != 2 or tuple(t.shape) != tuple(x.shape):
+        raise RuntimeError("inconsistent target size: %s for input of size: %s" % (list(target.shape), list(input.shape)))
+    n, c = x.shape
+    counts = [[0.0] * c for _ in range(n)]
+    member = [[0.0] * c for _ in range(n)]
+    for row, labels in enumerate(t.tolist()):
+        for j in labels:
+            j = int(j)
+            if j < 0:
+                break
+            if j >= c:
+                raise RuntimeError("multilabel_margin_loss: target index %d is out of bounds" % j)
+            counts[row][j] += 1.0
+            member[row][j] = 1.0
+    cnt = torch.tensor(counts, dtype=x.dtype)
+    other = 1.0 - torch.tensor(member, dtype=x.dtype)
+    margins = relu(1.0 - x.unsqueeze(2) + x.unsqueeze(1))
+    loss = (margins * (cnt.unsqueeze(2) * other.unsqueeze(1))).sum((1, 2)) / c
+    if unbatched:
+        loss = loss.reshape(()) if len(input.shape) == 1 or input.numel() == 1 else loss
     return _reduce(loss, reduction)
 
 

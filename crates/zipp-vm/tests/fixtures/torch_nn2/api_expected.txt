@@ -1,0 +1,151 @@
+== lazy linear
+LazyLinear(in_features=0, out_features=3, bias=True)
+True UninitializedParameter <UninitializedParameter> True
+True True True
+['weight', 'bias'] ['UninitializedParameter', 'UninitializedParameter']
+RuntimeError
+ValueError
+Linear (3, 5) (3,) 5 Parameter (2, 3)
+Linear(in_features=5, out_features=3, bias=True)
+False False 0 0
+== lazy load
+<All keys matched successfully>
+LazyLinear (3, 5) 0 False
+True [-0.1, -0.25, -0.12, -0.35, -0.3, 0.03]
+Linear 5
+RuntimeError
+LazyBatchNorm1d [0.3, 0.4] [1.5667, 1.5667] 1 0
+== lazy training
+Sequential(
+  (0): LazyLinear(in_features=0, out_features=4, bias=True)
+  (1): Tanh()
+  (2): LazyLinear(in_features=0, out_features=1, bias=True)
+)
+['Linear', 'Tanh', 'Linear'] [(4, 5), (4,), (1, 4), (1,)]
+0.28085
+0.27599
+0.26804
+0.25886
+True
+== lazy conv and norm
+LazyConv2d(0, 4, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+Conv2d(2, 4, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)) (4, 2, 3, 3) 2
+ConvTranspose3d(4, 4, kernel_size=(2, 2, 2), stride=(1, 1, 1), groups=2) (4, 2, 2, 2, 2)
+RuntimeError
+ValueError
+LazyBatchNorm2d(0, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+['weight', 'bias', 'running_mean', 'running_var', 'num_batches_tracked'] ['UninitializedParameter', 'UninitializedParameter', 'UninitializedBuffer', 'UninitializedBuffer', 'Tensor']
+BatchNorm2d(3, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True) [0.75, 1.15, 1.55] [5.1571, 5.1571, 5.1571] 1
+LazyInstanceNorm1d(0, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True) True
+InstanceNorm1d InstanceNorm1d(3, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True) [0.75, 1.15, 1.55]
+== buffer
+True False True False
+['a'] ['a', 'b'] True
+True [0.0, 1.0, 2.0] True ['a']
+== parametrize
+ParametrizedLinear True True False
+Linear True
+True
+[-0.3, -0.2, -0.1, -0.2, 0.1, 0.2, -0.1, 0.2, -0.2]
+['bias', 'parametrizations.weight.original'] ['bias', 'parametrizations.weight.original']
+ParametrizedLinear(
+  in_features=3, out_features=3, bias=True
+  (parametrizations): ModuleDict(
+    (weight): ParametrizationList(
+      (0): Symmetric()
+    )
+  )
+)
+[2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0] [2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0]
+[4.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 4.0] 2
+2 True
+4
+[2.0, 4.0, 4.0, 0.0, 2.0, 4.0, 0.0, 0.0, 2.0] [1.0, 1.0, 1.0]
+['parametrizations.weight.original', 'parametrizations.bias.original']
+<All keys matched successfully> True
+Linear ['bias', 'weight'] [4.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 4.0] False True
+ValueError
+ValueError
+ValueError
+(6,)
+['weight', 'bias', 'running_var', 'num_batches_tracked', 'parametrizations.running_mean.original'] ParametrizedBatchNorm1d
+== parametrizations
+['bias', 'parametrizations.weight.original', 'parametrizations.weight.0._u', 'parametrizations.weight.0._v'] ['bias', 'parametrizations.weight.original']
+1 0 1e-12
+1.0
+1 (3,) (8,)
+[1.0]
+['bias', 'parametrizations.weight.original0', 'parametrizations.weight.original1'] [(2,), (2, 1), (2, 3)]
+<All keys matched successfully>
+True [-0.4118, -0.1679, -0.2106, -0.3122]
+['bias', 'parametrizations.weight.original', 'parametrizations.weight.0.base'] [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] [-0.7071, -0.6804, 0.1925, 0.0, 0.2722, 0.9623, 0.7071, -0.6804, 0.1925]
+[0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0]
+(4, 2) [1.0, 0.0, 0.0, 1.0] _OrthMaps.householder
+['bias', 'parametrizations.weight.original'] [0.0, 0.0, 0.0, 0.0]
+ValueError
+no error
+== legacy spectral norm
+['bias', 'weight_orig'] ['weight_u', 'weight_v'] ['bias', 'weight_orig', 'weight_u', 'weight_v']
+Tensor False
+RuntimeError
+ValueError
+[0.6, 0.8] [1.0, 0.0, 0.0] [2.2727, 1.3636, 0.4545, -0.4545, -1.3636, -2.2727]
+[0.3298, 0.944] [-0.5374, 0.1466, 0.8305] [-1.1641, -0.6985, -0.2328, 0.2328, 0.6985, 1.1641]
+['bias', 'weight'] 0 0 1 [-1.1641, -0.6985, -0.2328, 0.2328, 0.6985, 1.1641]
+(3,) (4,)
+== state dict hooks
+pre '' False
+['weight', 'bias', 'extra']
+pre '0.' True
+['0.weight', '0.bias', '0.extra']
+pre '' False
+load pre '' ['bias', 'weight']
+load post [] []
+<All keys matched successfully>
+pre '' False
+load pre '' ['bias', 'weight']
+load post [] []
+RuntimeError
+pre '' False
+load pre '' ['bias', 'weight']
+load post [] []
+<All keys matched successfully>
+== 3-D layers
+Conv3d(2, 4, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1), groups=2)
+Conv3d(2, 4, kernel_size=(1, 2, 3), stride=(1, 1, 1), padding=same, bias=False)
+ConvTranspose3d(2, 4, kernel_size=(1, 2, 3), stride=(1, 2, 1), output_padding=(0, 1, 0))
+MaxPool3d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+MaxPool3d(kernel_size=(1, 2, 3), stride=1, padding=(0, 1, 1), dilation=2, ceil_mode=True)
+AvgPool3d(kernel_size=3, stride=2, padding=1)
+AdaptiveAvgPool3d(output_size=(1, None, 3))
+AdaptiveMaxPool3d(output_size=2)
+MaxUnpool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2), padding=(0, 0, 0))
+LPPool3d(norm_type=2, kernel_size=3, stride=None, ceil_mode=False)
+ReflectionPad3d((1, 1, 1, 1, 1, 1)) ReplicationPad3d((1, 0, 1, 0, 1, 0)) CircularPad3d((2, 2, 2, 2, 2, 2)) ZeroPad3d((1, 1, 1, 1, 1, 1)) ConstantPad3d(padding=(1, 1, 1, 1, 1, 1), value=2.0)
+MultiLabelMarginLoss() Dropout3d(p=0.2, inplace=False) Upsample(scale_factor=2.0, mode='trilinear')
+RuntimeError
+RuntimeError
+ValueError
+RuntimeError
+RuntimeError
+RuntimeError
+ValueError
+NotImplementedError
+ValueError
+[21.0, 23.0, 29.0, 31.0, 53.0, 55.0, 61.0, 63.0] [21, 23, 29, 31, 53, 55, 61, 63]
+[0.0, 164.0, 0.0, 172.0]
+(1, 1, 2, 3) (1, 1, 7, 10)
+== nested tensor fast path
+True 1 [1.16, 1.19, 1.22, 1.25, 1.28, 1.31, 1.34, 1.16] [1.16, 1.19, 1.22, 1.25, 1.28, 1.31, 1.34, 1.16]
+True True False
+False True
+False False False
+== deepcopy
+LazyLinear Linear True
+LazyLinear True (3, 5) Parameter
+ParametrizedLinear ['bias', 'parametrizations.weight.original', 'parametrizations.weight.0._u', 'parametrizations.weight.0._v'] False
+False True
+== legacy spectral norm, pre-v1 checkpoint
+<All keys matched successfully>
+[2.1226, 0.9434] [0.6, 0.8, 0.0]
+[-0.22, -0.2, -0.2, 0.5, -0.32, 0.58]
