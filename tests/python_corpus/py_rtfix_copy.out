@@ -1,0 +1,25 @@
+copy OrderedDict [('b', [1]), ('a', [2])] True
+copy defaultdict True [('x', [1]), ('y', [5])] False True
+copy Counter [('a', 5), ('b', 2), ('r', 2)] True
+copy MyDict {'k': [1, 2]} t {'n': 1} True True
+copy MyList [[1], [2]] hi True
+copy MySet [1, 2, 3] False
+deepcopy OrderedDict [('b', [1]), ('a', [2])] False
+deepcopy defaultdict True [('x', [1]), ('y', [5])] False False
+deepcopy Counter [('a', 5), ('b', 2), ('r', 2)] True
+deepcopy MyDict {'k': [1, 2]} t {'n': 1} False False
+deepcopy MyList [[1], [2]] hi False
+deepcopy MySet [1, 2, 3] False
+True True True True
+['leaf'] True True ['leaf2'] True
+True True
+  deepcopy hook got memo dict: True
+  deepcopy hook got memo dict: True
+('copied', [1]) ('deep', [1]) ('deep', [1])
+[1] 5 reduce {'a': 2, 'b': 3, 'via': 'reduce'}
+1 rebuilt rebuilt
+P(x=[1], y=2) P(x=[1], y=2) P False True
+deque([[1], [2]], maxlen=3) 3 False
+True True
+ValueError ('bad', [1])
+True True 3.5 s

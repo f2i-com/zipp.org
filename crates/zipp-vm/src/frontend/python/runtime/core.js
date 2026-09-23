@@ -153,7 +153,8 @@ var __zipp_py = (function () {
     for (const n of ["ArithmeticError", "AssertionError", "AttributeError", "EOFError", "ImportError", "LookupError",
         "MemoryError", "NameError", "OSError", "RuntimeError", "StopIteration", "SyntaxError", "TypeError",
         "ValueError", "Warning", "BufferError", "ReferenceError"]) defExc(n);
-    defExc("ModuleNotFoundError", E.ImportError); defExc("IndexError", E.LookupError); defExc("KeyError", E.LookupError);
+    defExc("ModuleNotFoundError", E.ImportError); E.ImportError.dict.set("name", null); E.ImportError.dict.set("path", null);
+    defExc("IndexError", E.LookupError); defExc("KeyError", E.LookupError);
     defExc("UnboundLocalError", E.NameError); defExc("NotImplementedError", E.RuntimeError); defExc("RecursionError", E.RuntimeError);
     defExc("OverflowError", E.ArithmeticError); defExc("ZeroDivisionError", E.ArithmeticError); defExc("FloatingPointError", E.ArithmeticError);
     defExc("FileNotFoundError", E.OSError); defExc("PermissionError", E.OSError); defExc("TimeoutError", E.OSError);
@@ -177,7 +178,14 @@ var __zipp_py = (function () {
             context: excStack.length ? excStack[excStack.length - 1] : null, tbline: __zipp_py_line, suppress: false };
     }
     rt.makeExc = makeExc;
-    rt.excLocation = function (e) { return locationText(e.tbline); };
+    // The innermost recorded frame holds the line its own frame was running;
+    // the global line is only re-stamped when a line changes, so after a call
+    // returns it can still name the callee's last line (another module).
+    rt.excLocation = function (e) {
+        const fr = e.frames !== undefined && e.frames.length ? e.frames[0] : null;
+        if (fr !== null && fr.file !== "?" && fr.line > 0) return " (" + fr.file + ":" + fr.line + ")";
+        return locationText(e.tbline);
+    };
     // Loop forms of map/filter/findIndex/every for callbacks that may run
     // guest code: a native array builtin would run each callback in a nested
     // interpreter loop, and the hardened wasm profile caps that nesting.
@@ -469,6 +477,7 @@ var __zipp_py = (function () {
                 if (obj.members !== undefined && obj.members.includes(obj.dict.get(name))) fail(E.AttributeError, "cannot reassign member '" + name + "'");
                 obj.dict.set(name, value); typeChanged(obj, name); return null;
             }
+            if (name === "__dict__" && obj.dict !== undefined && obj.dict !== null && obj.cls !== T.module && (obj.cls || ObjectType).noDict !== true) { rt.setInstanceDict(obj, value); return null; }
             // The common store: an instance whose class has no attribute of
             // that name, or one that is no data descriptor (a primitive, None
             // or a plain function), and no `__setattr__` of its own. The
@@ -1429,7 +1438,7 @@ var __zipp_py = (function () {
         if (v !== undefined) return v;
         if (name === "__name__") return m.name;
         if (name === "__file__") return m.file;
-        if (name === "__dict__") return rt.dictFromMap(m.globals);
+        if (name === "__dict__") return rt.namespaceView(m.globals);
         if (m.submodules !== undefined && m.submodules.has(name)) return m.submodules.get(name);
         if (missing !== undefined) return missing;
         fail(E.AttributeError, "module '" + m.name + "' has no attribute '" + name + "'");
@@ -1464,7 +1473,7 @@ var __zipp_py = (function () {
             if (b !== undefined) { m = typeof b === "function" ? b() : b; modules.set(name, m); }
             else if (hasSubmodules(name)) { m = newModule(name, null); m.globals.set("__name__", name); m.globals.set("__path__", rt.list([name.replace(/\./g, "/")])); modules.set(name, m); }
             else if (parent !== null && parent.submodules !== undefined && parent.submodules.has(leaf)) { m = parent.submodules.get(leaf); modules.set(name, m); }
-            else fail(E.ModuleNotFoundError, "No module named '" + name + "'");
+            else { const e = makeExc(E.ModuleNotFoundError, ["No module named '" + name + "'"]); e.dict.set("name", name); throw e; }
         }
         if (parent !== null && parent.globals.get(leaf) === undefined) parent.globals.set(leaf, m);
         return m;
@@ -1573,7 +1582,9 @@ var __zipp_py = (function () {
             const full = m.name + "." + name;
             if (inits.has(full) || builtinModules.has(full) || hasSubmodules(full)) return R.import(full, null);
         }
-        fail(E.ImportError, "cannot import name '" + name + "' from '" + m.name + "'");
+        const e = makeExc(E.ImportError, ["cannot import name '" + name + "' from '" + m.name + "'"]);
+        e.dict.set("name", m.name);
+        throw e;
     };
     R.importstar = function (m, g) {
         const all = m.globals.get("__all__");

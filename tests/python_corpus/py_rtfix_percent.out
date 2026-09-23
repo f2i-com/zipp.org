@@ -1,0 +1,11 @@
+3.750 3 3   3.8| 3.750000e+00 3.75
+7 7 FF
+2.500000 7.00 7 9
+loss 0.1235 acc 97%
+1.50 2
+1.5 'x' 3 1 2.0
+%d TypeError %d format: a real number is required, not OnlyFloat
+%x TypeError %x format: an integer is required, not OnlyInt
+%f TypeError must be real number, not str
+%d TypeError %d format: a real number is required, not str
+%x TypeError %x format: an integer is required, not float

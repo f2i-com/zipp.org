@@ -204,6 +204,13 @@
         if (conv === "r") v = repr(v); else if (conv === "s") v = str(v); else if (conv === "a") v = call(rt.builtins.get("ascii"), [v], null);
         return formatValue(v, spec);
     }
+    // `%d`/`%x`/`%f` accept any object with `__int__`/`__index__`/`__float__`
+    // (a 0-d tensor, a numpy-like scalar), as CPython's PyNumber_* calls do.
+    const numberDunder = (v, name) => {
+        if (v === null || typeof v !== "object" || v.cls === undefined) return undefined;
+        const m = typeMethod(v, name);
+        return m ? call(descrGet(m, v, typeOf(v)), [], null) : undefined;
+    };
     // printf-style `%` formatting.
     rt.percentFormat = function (s, values) {
         const args = values !== null && typeof values === "object" && values.cls === T.tuple ? values.items.slice() : [values];
@@ -227,9 +234,9 @@
             if (t === "s") { spec.type = "s"; out += applyAlign(prec === undefined ? str(v) : codepoints(str(v)).slice(0, spec.precision).join(""), Object.assign(spec, { precision: null }), ">", ""); }
             else if (t === "r" || t === "a") { out += applyAlign(t === "a" ? rt.ascii(v) : repr(v), Object.assign(spec, { precision: null }), ">", ""); }
             else if (t === "c") { out += applyAlign(isInt(v) ? String.fromCodePoint(Number(asInt(v))) : str(v), spec, ">", ""); }
-            else if ("diu".includes(t)) { if (typeof v === "number") v = BigInt(Math.trunc(v)); if (!isInt(v)) fail(E.TypeError, "%d format: a real number is required, not " + typeOf(v).name); spec.type = "d"; out += formatInt(asInt(v), spec); }
-            else if ("oxX".includes(t)) { if (!isInt(v)) fail(E.TypeError, "%" + t + " format: an integer is required, not " + typeOf(v).name); spec.type = t; out += formatInt(asInt(v), spec); }
-            else { if (!isNum(v)) fail(E.TypeError, "must be real number, not " + typeOf(v).name); out += formatFloat(toFloat(v), spec, t); }
+            else if ("diu".includes(t)) { if (typeof v === "number") v = BigInt(Math.trunc(v)); else if (!isInt(v)) { let r = numberDunder(v, "__int__"); if (r === undefined) r = numberDunder(v, "__index__"); if (typeof r === "number") r = BigInt(Math.trunc(r)); if (r !== undefined && isInt(r)) v = r; } if (!isInt(v)) fail(E.TypeError, "%" + t + " format: a real number is required, not " + typeOf(v).name); spec.type = "d"; out += formatInt(asInt(v), spec); }
+            else if ("oxX".includes(t)) { if (!isInt(v)) { const r = numberDunder(v, "__index__"); if (r !== undefined && isInt(r)) v = r; } if (!isInt(v)) fail(E.TypeError, "%" + t + " format: an integer is required, not " + typeOf(v).name); spec.type = t; out += formatInt(asInt(v), spec); }
+            else { if (!isNum(v)) { let r = numberDunder(v, "__float__"); if (r === undefined) r = numberDunder(v, "__index__"); if (r !== undefined && isNum(r)) v = r; } if (!isNum(v)) fail(E.TypeError, "must be real number, not " + typeOf(v).name); out += formatFloat(toFloat(v), spec, t); }
         }
         out += s.slice(i);
         if (argi < args.length && mapping === null) fail(E.TypeError, "not all arguments converted during string formatting");
@@ -462,26 +469,361 @@
     });
 
     // ---- random (deterministic xorshift, seedable) ----------------------------------------------------------------------------------
-    mod("random", (g) => {
-        let s0 = 0x9E3779B9, s1 = 0x243F6A88;
-        function seed(v) { let h = 2166136261 ^ Number(BigInt.asUintN(32, BigInt(v))); h = Math.imul(h ^ (h >>> 16), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); s0 = (h ^ (h >>> 16)) >>> 0 || 1; s1 = (Math.imul(s0, 1597334677) ^ 0x5bd1e995) >>> 0 || 2; }
-        function next32() { let x = s0, y = s1; s0 = y; x ^= x << 23; x ^= x >>> 17; x ^= y ^ (y >>> 26); s1 = x >>> 0; return (s0 + s1) >>> 0; }
-        function random() { return (next32() * 2097152 + (next32() >>> 11)) / 9007199254740992; }
-        seed(Date.now());
-        fn(g, "seed", 1, (a) => { const v = a[0] === undefined || a[0] === null ? Date.now() : isInt(a[0]) ? asInt(a[0]) : typeof a[0] === "number" ? Math.trunc(a[0] * 1e6) : BigInt(rt.hashInt(a[0])); seed(v); return null; }, 0);
-        fn(g, "random", 0, () => random());
-        fn(g, "randint", 2, (a) => { const lo = needInt(a[0]), hi = needInt(a[1]); if (hi < lo) fail(E.ValueError, "empty range for randrange()"); return lo + BigInt(Math.floor(random() * Number(hi - lo + 1n))); });
-        fn(g, "randrange", 3, (a) => { let start = needInt(a[0]), stop = a[1] === undefined || a[1] === null ? null : needInt(a[1]); const step = a[2] === undefined ? 1n : needInt(a[2]); if (stop === null) { stop = start; start = 0n; } const n = (stop - start + step - (step > 0n ? 1n : -1n)) / step; if (n <= 0n) fail(E.ValueError, "empty range for randrange()"); return start + step * BigInt(Math.floor(random() * Number(n))); }, 1);
-        fn(g, "uniform", 2, (a) => { const x = toFloat(a[0]), y = toFloat(a[1]); return x + (y - x) * random(); });
-        fn(g, "choice", 1, (a) => { const items = drain(a[0]); if (!items.length) fail(E.IndexError, "Cannot choose from an empty sequence"); return items[Math.floor(random() * items.length)]; });
-        fnkw(g, "choices", (a) => { const kw = kwOf(a, ["weights", "k"]); const items = drain(a[0]); const k = Number(kwget(kw, "k", 1n)); const weights = kwget(kw, "weights", null); const out = []; if (weights === null) { for (let i = 0; i < k; i++) out.push(items[Math.floor(random() * items.length)]); return list(out); } const w = drain(weights).map(toFloat); const total = w.reduce((x, y) => x + y, 0); for (let i = 0; i < k; i++) { let r = random() * total, j = 0; while (j < w.length - 1 && r >= w[j]) { r -= w[j]; j++; } out.push(items[j]); } return list(out); });
-        fn(g, "shuffle", 1, (a) => { const l = a[0].items; for (let i = l.length - 1; i > 0; i--) { const j = Math.floor(random() * (i + 1)); [l[i], l[j]] = [l[j], l[i]]; } return null; });
-        fn(g, "sample", 2, (a) => { const items = drain(a[0]).slice(); const k = Number(needInt(a[1])); if (k > items.length) fail(E.ValueError, "Sample larger than population or is negative"); const out = []; for (let i = 0; i < k; i++) { const j = i + Math.floor(random() * (items.length - i)); [items[i], items[j]] = [items[j], items[i]]; out.push(items[i]); } return list(out); });
-        fn(g, "gauss", 2, (a) => { const mu = toFloat(a[0]), sigma = toFloat(a[1]); const u = 1 - random(), v = random(); return mu + sigma * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); });
-        g.set("normalvariate", g.get("gauss"));
-        fn(g, "getrandbits", 1, (a) => { const k = Number(needInt(a[0])); let v = 0n; for (let i = 0; i < k; i += 32) v = (v << 32n) | BigInt(next32()); return v & ((1n << BigInt(k)) - 1n); });
-    });
+    // SHA-512 over a byte array (random.seed of a str/bytes, hashlib.sha512).
+    rt.sha512 = function (bytes) {
+        const K = [
+        0x428a2f98d728ae22n, 0x7137449123ef65cdn, 0xb5c0fbcfec4d3b2fn, 0xe9b5dba58189dbbcn,
+        0x3956c25bf348b538n, 0x59f111f1b605d019n, 0x923f82a4af194f9bn, 0xab1c5ed5da6d8118n,
+        0xd807aa98a3030242n, 0x12835b0145706fben, 0x243185be4ee4b28cn, 0x550c7dc3d5ffb4e2n,
+        0x72be5d74f27b896fn, 0x80deb1fe3b1696b1n, 0x9bdc06a725c71235n, 0xc19bf174cf692694n,
+        0xe49b69c19ef14ad2n, 0xefbe4786384f25e3n, 0x0fc19dc68b8cd5b5n, 0x240ca1cc77ac9c65n,
+        0x2de92c6f592b0275n, 0x4a7484aa6ea6e483n, 0x5cb0a9dcbd41fbd4n, 0x76f988da831153b5n,
+        0x983e5152ee66dfabn, 0xa831c66d2db43210n, 0xb00327c898fb213fn, 0xbf597fc7beef0ee4n,
+        0xc6e00bf33da88fc2n, 0xd5a79147930aa725n, 0x06ca6351e003826fn, 0x142929670a0e6e70n,
+        0x27b70a8546d22ffcn, 0x2e1b21385c26c926n, 0x4d2c6dfc5ac42aedn, 0x53380d139d95b3dfn,
+        0x650a73548baf63den, 0x766a0abb3c77b2a8n, 0x81c2c92e47edaee6n, 0x92722c851482353bn,
+        0xa2bfe8a14cf10364n, 0xa81a664bbc423001n, 0xc24b8b70d0f89791n, 0xc76c51a30654be30n,
+        0xd192e819d6ef5218n, 0xd69906245565a910n, 0xf40e35855771202an, 0x106aa07032bbd1b8n,
+        0x19a4c116b8d2d0c8n, 0x1e376c085141ab53n, 0x2748774cdf8eeb99n, 0x34b0bcb5e19b48a8n,
+        0x391c0cb3c5c95a63n, 0x4ed8aa4ae3418acbn, 0x5b9cca4f7763e373n, 0x682e6ff3d6b2b8a3n,
+        0x748f82ee5defb2fcn, 0x78a5636f43172f60n, 0x84c87814a1f0ab72n, 0x8cc702081a6439ecn,
+        0x90befffa23631e28n, 0xa4506cebde82bde9n, 0xbef9a3f7b2c67915n, 0xc67178f2e372532bn,
+        0xca273eceea26619cn, 0xd186b8c721c0c207n, 0xeada7dd6cde0eb1en, 0xf57d4f7fee6ed178n,
+        0x06f067aa72176fban, 0x0a637dc5a2c898a6n, 0x113f9804bef90daen, 0x1b710b35131c471bn,
+        0x28db77f523047d84n, 0x32caab7b40c72493n, 0x3c9ebe0a15c9bebcn, 0x431d67c49c100d4cn,
+        0x4cc5d4becb3e42b6n, 0x597f299cfc657e2an, 0x5fcb6fab3ad6faecn, 0x6c44198c4a475817n
+        ];
+        const M64 = (1n << 64n) - 1n;
+        const rotr = (x, n) => ((x >> n) | (x << (64n - n))) & M64;
+        let H = [0x6a09e667f3bcc908n, 0xbb67ae8584caa73bn, 0x3c6ef372fe94f82bn, 0xa54ff53a5f1d36f1n, 0x510e527fade682d1n, 0x9b05688c2b3e6c1fn, 0x1f83d9abfb41bd6bn, 0x5be0cd19137e2179n];
+        const n = bytes.length, total = ((n + 17 + 127) >> 7) << 7, padded = new Uint8Array(total);
+        padded.set(bytes); padded[n] = 0x80;
+        let bits = BigInt(n) * 8n;
+        for (let i = total - 1; i >= total - 16 && bits > 0n; i--) { padded[i] = Number(bits & 255n); bits >>= 8n; }
+        const W = new Array(80);
+        for (let off = 0; off < total; off += 128) {
+            for (let i = 0; i < 16; i++) { let w = 0n; for (let b = 0; b < 8; b++) w = (w << 8n) | BigInt(padded[off + 8 * i + b]); W[i] = w; }
+            for (let i = 16; i < 80; i++) {
+                const s0 = rotr(W[i - 15], 1n) ^ rotr(W[i - 15], 8n) ^ (W[i - 15] >> 7n);
+                const s1 = rotr(W[i - 2], 19n) ^ rotr(W[i - 2], 61n) ^ (W[i - 2] >> 6n);
+                W[i] = (W[i - 16] + s0 + W[i - 7] + s1) & M64;
+            }
+            let [a, b, c, d, e, f, gg, h] = H;
+            for (let i = 0; i < 80; i++) {
+                const S1 = rotr(e, 14n) ^ rotr(e, 18n) ^ rotr(e, 41n), ch = (e & f) ^ (~e & M64 & gg), t1 = (h + S1 + ch + K[i] + W[i]) & M64;
+                const S0 = rotr(a, 28n) ^ rotr(a, 34n) ^ rotr(a, 39n), maj = (a & b) ^ (a & c) ^ (b & c), t2 = (S0 + maj) & M64;
+                h = gg; gg = f; f = e; e = (d + t1) & M64; d = c; c = b; b = a; a = (t1 + t2) & M64;
+            }
+            H = [(H[0] + a) & M64, (H[1] + b) & M64, (H[2] + c) & M64, (H[3] + d) & M64, (H[4] + e) & M64, (H[5] + f) & M64, (H[6] + gg) & M64, (H[7] + h) & M64];
+        }
+        const out = [];
+        for (const w of H) for (let s = 56n; s >= 0n; s -= 8n) out.push(Number((w >> s) & 255n));
+        return out;
+    };
 
+    // ---- random: CPython's Mersenne Twister and the derived distributions -------------------------------------------------
+    // The same MT19937 state, seeding (init_by_array over the seed's 32-bit
+    // words) and algorithms as CPython's `random`, so a seeded program draws
+    // the same values: random(), getrandbits, _randbelow, randrange,
+    // randint, choice, shuffle, sample, choices, uniform, gauss,
+    // normalvariate and the other variates.
+    mod("random", (g) => {
+        const N = 624;
+        function initGenrand(st, s) {
+            const m = st.mt; m[0] = s >>> 0;
+            for (let i = 1; i < N; i++) { const p = m[i - 1] ^ (m[i - 1] >>> 30); m[i] = (Math.imul(1812433253, p) + i) >>> 0; }
+            st.i = N;
+        }
+        function initByArray(st, key) {
+            initGenrand(st, 19650218);
+            const m = st.mt;
+            let i = 1, j = 0;
+            for (let k = Math.max(N, key.length); k > 0; k--) {
+                const p = m[i - 1] ^ (m[i - 1] >>> 30);
+                m[i] = ((m[i] ^ Math.imul(p, 1664525)) + key[j] + j) >>> 0;
+                i++; j++;
+                if (i >= N) { m[0] = m[N - 1]; i = 1; }
+                if (j >= key.length) j = 0;
+            }
+            for (let k = N - 1; k > 0; k--) {
+                const p = m[i - 1] ^ (m[i - 1] >>> 30);
+                m[i] = ((m[i] ^ Math.imul(p, 1566083941)) - i) >>> 0;
+                i++;
+                if (i >= N) { m[0] = m[N - 1]; i = 1; }
+            }
+            m[0] = 0x80000000;
+            st.i = N;
+        }
+        function genrand(st) {
+            const m = st.mt;
+            if (st.i >= N) {
+                let k = 0, y;
+                for (; k < N - 397; k++) { y = (m[k] & 0x80000000) | (m[k + 1] & 0x7fffffff); m[k] = m[k + 397] ^ (y >>> 1) ^ (y & 1 ? 0x9908b0df : 0); }
+                for (; k < N - 1; k++) { y = (m[k] & 0x80000000) | (m[k + 1] & 0x7fffffff); m[k] = m[k + 397 - N] ^ (y >>> 1) ^ (y & 1 ? 0x9908b0df : 0); }
+                y = (m[N - 1] & 0x80000000) | (m[0] & 0x7fffffff); m[N - 1] = m[396] ^ (y >>> 1) ^ (y & 1 ? 0x9908b0df : 0);
+                st.i = 0;
+            }
+            let y = m[st.i++];
+            y ^= y >>> 11; y ^= (y << 7) & 0x9d2c5680; y ^= (y << 15) & 0xefc60000; y ^= y >>> 18;
+            return y >>> 0;
+        }
+        const random = (st) => { const a = genrand(st) >>> 5, b = genrand(st) >>> 6; return (a * 67108864 + b) / 9007199254740992; };
+        function getrandbits(st, k) {
+            if (k < 0) fail(E.ValueError, "number of bits must be non-negative");
+            if (k === 0) return 0n;
+            if (k <= 32) return BigInt(genrand(st) >>> (32 - k));
+            let out = 0n, shift = 0n;
+            for (let left = k; left > 0; left -= 32, shift += 32n) {
+                let r = genrand(st);
+                if (left < 32) r >>>= 32 - left;
+                out |= BigInt(r) << shift;
+            }
+            return out;
+        }
+        const bitLength = (n) => n === 0n ? 0 : n.toString(2).length;
+        // Random._randbelow_with_getrandbits.
+        function randbelow(st, n) {
+            const k = bitLength(n);
+            if (k <= 32) {
+                const lim = Number(n);
+                if (k === 0) return 0n;
+                let r = genrand(st) >>> (32 - k);
+                while (r >= lim) r = genrand(st) >>> (32 - k);
+                return BigInt(r);
+            }
+            let r = getrandbits(st, k);
+            while (r >= n) r = getrandbits(st, k);
+            return r;
+        }
+        function seedFrom(st, a) {
+            let n;
+            if (a === null || a === undefined) {
+                const t = BigInt(Date.now()) * 1000000n + BigInt(Math.floor((performance.now() % 1000) * 1000));
+                n = t;
+            } else if (isInt(a)) {
+                n = asInt(a); if (n < 0n) n = -n;
+            } else if (typeof a === "string" || (a !== null && typeof a === "object" && (a.cls === T.bytes || isInstance(a, T.bytes)))) {
+                const bytes = typeof a === "string" ? rt.encodeStr(a, "utf-8").items : a.items;
+                const all = bytes.concat(rt.sha512(bytes));
+                n = 0n; for (const b of all) n = (n << 8n) | BigInt(b);
+            } else if (typeof a === "number" || isInstance(a, T.float)) {
+                n = BigInt.asUintN(64, BigInt(call(rt.builtins.get("hash"), [a], null)));
+            } else fail(E.TypeError, "The only supported seed types are: None,\nint, float, str, bytes, and bytearray.");
+            const key = [];
+            while (n > 0n) { key.push(Number(n & 0xffffffffn)); n >>= 32n; }
+            if (key.length === 0) key.push(0);
+            initByArray(st, key);
+            st.gauss = null;
+        }
+        const newState = () => ({ mt: new Uint32Array(N), i: N + 1, gauss: null });
+        const Random = rt.newType("Random", [rt.ObjectType], new Map(), "random");
+        rt.allocators.set(Random, (cls) => ({ cls: cls, rng: newState() }));
+        const S = (self) => { if (self === null || typeof self !== "object" || self.rng === undefined) fail(E.TypeError, "descriptor requires a 'random.Random' object"); return self.rng; };
+        const m = (name, arity, code, min) => Random.dict.set(name, builtin(name, arity, code, min));
+        const mkw = (name, code) => { const f = builtin(name, -1, code); f.kwnames = true; Random.dict.set(name, f); };
+        const num = (v, what) => { if (isNum(v)) return toFloat(v); fail(E.TypeError, "must be real number, not " + typeOf(v).name); };
+        const index = (v) => rt.indexOf(v);
+        mkw("__init__", (a) => { const kw = kwOf(a, ["x"]); const x = a[1] !== undefined ? a[1] : kwget(kw, "x", null); rt.callMethod(a[0], "seed", [x]); return null; });
+        mkw("seed", (a) => {
+            const kw = kwOf(a, ["a", "version"]);
+            const st = S(a[0]), x = a[1] !== undefined ? a[1] : kwget(kw, "a", null);
+            const version = a[2] !== undefined ? a[2] : kwget(kw, "version", 2n);
+            if (Number(needInt(version)) === 1 && (typeof x === "string" || (x !== null && typeof x === "object" && x.cls === T.bytes))) {
+                const s = typeof x === "string" ? codepointsOf(x) : x.items;
+                let v = s.length ? BigInt(s[0]) << 7n : 0n;
+                for (const c of s) v = ((1000003n * v) ^ BigInt(c)) & 0xFFFFFFFFFFFFFFFFn;
+                v ^= BigInt(s.length);
+                seedFrom(st, v === -1n ? -2n : v);
+                return null;
+            }
+            seedFrom(st, x);
+            return null;
+        });
+        const codepointsOf = (s) => codepoints(s).map((c) => c.codePointAt(0));
+        m("random", 1, (a) => random(S(a[0])));
+        m("getrandbits", 2, (a) => getrandbits(S(a[0]), Number(needInt(a[1]))));
+        m("randbytes", 2, (a) => { const n = Number(needInt(a[1])); if (n < 0) fail(E.ValueError, "negative argument not allowed"); let v = getrandbits(S(a[0]), n * 8); const out = []; for (let i = 0; i < n; i++) { out.push(Number(v & 255n)); v >>= 8n; } return rt.bytes(out); });
+        m("_randbelow", 2, (a) => randbelow(S(a[0]), needInt(a[1])));
+        const fdiv = (x, y) => { const q = x / y; return x % y !== 0n && (x < 0n) !== (y < 0n) ? q - 1n : q; };
+        function randrange(st, start, stop, step) {
+            const istart = index(start);
+            if (stop === undefined || stop === null) {
+                if (step !== undefined) fail(E.TypeError, "Missing a non-None stop argument");
+                if (istart > 0n) return randbelow(st, istart);
+                fail(E.ValueError, "empty range for randrange()");
+            }
+            const istop = index(stop), width = istop - istart;
+            const istep = step === undefined ? 1n : index(step);
+            if (istep === 1n) {
+                if (width > 0n) return istart + randbelow(st, width);
+                fail(E.ValueError, "empty range for randrange() (" + istart + ", " + istop + ", " + width + ")");
+            }
+            let n;
+            if (istep > 0n) n = fdiv(width + istep - 1n, istep);
+            else if (istep < 0n) n = fdiv(width + istep + 1n, istep);
+            else fail(E.ValueError, "zero step for randrange()");
+            if (n <= 0n) fail(E.ValueError, "empty range for randrange()");
+            return istart + istep * randbelow(st, n);
+        }
+        mkw("randrange", (a) => { const kw = kwOf(a, ["start", "stop", "step"]); return randrange(S(a[0]), a[1] !== undefined ? a[1] : kwget(kw, "start", undefined), a[2] !== undefined ? a[2] : kwget(kw, "stop", undefined), a[3] !== undefined ? a[3] : kwget(kw, "step", undefined)); });
+        m("randint", 3, (a) => randrange(S(a[0]), a[1], R.binop("add", a[2], 1n)));
+        m("choice", 2, (a) => { const st = S(a[0]), n = asInt(len(a[1])); if (n === 0n) fail(E.IndexError, "Cannot choose from an empty sequence"); return getitem(a[1], randbelow(st, n)); });
+        m("shuffle", 2, (a) => {
+            const st = S(a[0]), x = a[1];
+            if (x !== null && typeof x === "object" && x.cls === T.list) { const l = x.items; for (let i = l.length - 1; i > 0; i--) { const j = Number(randbelow(st, BigInt(i + 1))); const t = l[i]; l[i] = l[j]; l[j] = t; } return null; }
+            for (let i = asInt(len(x)) - 1n; i > 0n; i--) { const j = randbelow(st, i + 1n); const xi = getitem(x, i), xj = getitem(x, j); rt.setitem(x, i, xj); rt.setitem(x, j, xi); }
+            return null;
+        });
+        function sample(st, population, k) {
+            if (typeof population !== "string" && (population === null || typeof population !== "object" || isInstance(population, T.set) || isInstance(population, T.frozenset) || isInstance(population, T.dict))) fail(E.TypeError, "Population must be a sequence.  For dicts or sets, use sorted(d).");
+            const n = Number(asInt(len(population)));
+            if (!(0 <= k && k <= n)) fail(E.ValueError, "Sample larger than population or is negative");
+            const result = new Array(k);
+            let setsize = 21;
+            if (k > 5) setsize += Math.pow(4, Math.ceil(Math.log(k * 3) / Math.log(4)));
+            if (n <= setsize) {
+                const pool = population.cls === T.list || population.cls === T.tuple ? population.items.slice() : drain(population);
+                for (let i = 0; i < k; i++) { const j = Number(randbelow(st, BigInt(n - i))); result[i] = pool[j]; pool[j] = pool[n - i - 1]; }
+            } else {
+                const selected = new Set();
+                for (let i = 0; i < k; i++) {
+                    let j = Number(randbelow(st, BigInt(n)));
+                    while (selected.has(j)) j = Number(randbelow(st, BigInt(n)));
+                    selected.add(j);
+                    result[i] = getitem(population, BigInt(j));
+                }
+            }
+            return result;
+        }
+        mkw("sample", (a) => {
+            const kw = kwOf(a, ["population", "k", "counts"]);
+            const st = S(a[0]), population = a[1] !== undefined ? a[1] : kwget(kw, "population", undefined);
+            const kv = a[2] !== undefined ? a[2] : kwget(kw, "k", undefined);
+            if (population === undefined || kv === undefined) fail(E.TypeError, "Random.sample() missing required argument");
+            const k = Number(needInt(kv)), counts = kwget(kw, "counts", null);
+            if (counts !== null) {
+                const cum = []; let total = 0n;
+                for (const c of drain(counts)) { total = R.binop("add", total, c); cum.push(total); }
+                if (cum.length !== Number(asInt(len(population)))) fail(E.ValueError, "The number of counts does not match the population");
+                total = cum.pop();
+                if (!isInt(total)) fail(E.TypeError, "Counts must be integers");
+                if (asInt(total) <= 0n) fail(E.ValueError, "Total of counts must be greater than zero");
+                const picks = sample(st, rt.range(0n, asInt(total), 1n), k);
+                return list(picks.map((s) => { let lo = 0, hi = cum.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (s < asInt(cum[mid])) hi = mid; else lo = mid + 1; } return getitem(population, BigInt(lo)); }));
+            }
+            return list(sample(st, population, k));
+        });
+        mkw("choices", (a) => {
+            const kw = kwOf(a, ["population", "weights", "cum_weights", "k"]);
+            const st = S(a[0]), population = a[1] !== undefined ? a[1] : kwget(kw, "population", undefined);
+            let weights = a[2] !== undefined ? a[2] : kwget(kw, "weights", null);
+            let cumw = kwget(kw, "cum_weights", null);
+            const k = Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "k", 1n)));
+            const n = Number(asInt(len(population)));
+            const out = [];
+            if (cumw === null) {
+                if (weights === null) { for (let i = 0; i < k; i++) out.push(getitem(population, BigInt(Math.floor(random(st) * n)))); return list(out); }
+                const acc = []; let t = null;
+                for (const w of drain(weights)) { t = t === null ? w : R.binop("add", t, w); acc.push(t); }
+                cumw = acc;
+            } else if (weights !== null) fail(E.TypeError, "Cannot specify both weights and cumulative weights");
+            else cumw = drain(cumw);
+            if (cumw.length !== n) fail(E.ValueError, "The number of weights does not match the population");
+            const cum = cumw.map((x) => num(x));
+            const total = cum[n - 1] + 0.0;
+            if (total <= 0.0) fail(E.ValueError, "Total of weights must be greater than zero");
+            if (!Number.isFinite(total)) fail(E.ValueError, "Total of weights must be finite");
+            const hi = n - 1;
+            for (let i = 0; i < k; i++) {
+                const x = random(st) * total;
+                let lo = 0, h = hi;
+                while (lo < h) { const mid = (lo + h) >> 1; if (x < cum[mid]) h = mid; else lo = mid + 1; }
+                out.push(getitem(population, BigInt(lo)));
+            }
+            return list(out);
+        });
+        m("uniform", 3, (a) => { const x = num(a[1]), y = num(a[2]); return x + (y - x) * random(S(a[0])); });
+        mkw("triangular", (a) => {
+            const kw = kwOf(a, ["low", "high", "mode"]);
+            const st = S(a[0]);
+            let low = num(a[1] !== undefined ? a[1] : kwget(kw, "low", 0.0)), high = num(a[2] !== undefined ? a[2] : kwget(kw, "high", 1.0));
+            const mode = a[3] !== undefined ? a[3] : kwget(kw, "mode", null);
+            let u = random(st);
+            if (high === low) return low;
+            let c = mode === null ? 0.5 : (num(mode) - low) / (high - low);
+            if (u > c) { u = 1.0 - u; c = 1.0 - c; const t = low; low = high; high = t; }
+            return low + (high - low) * Math.sqrt(u * c);
+        });
+        const TWOPI = 2.0 * Math.PI, NV_MAGICCONST = 4 * Math.exp(-0.5) / Math.sqrt(2.0), LOG4 = Math.log(4.0), SG_MAGICCONST = 1.0 + Math.log(4.5);
+        function gauss(st, mu, sigma) {
+            let z = st.gauss; st.gauss = null;
+            if (z === null) {
+                const x2pi = random(st) * TWOPI, g2rad = Math.sqrt(-2.0 * Math.log(1.0 - random(st)));
+                z = Math.cos(x2pi) * g2rad; st.gauss = Math.sin(x2pi) * g2rad;
+            }
+            return mu + z * sigma;
+        }
+        function normalvariate(st, mu, sigma) {
+            let z;
+            for (;;) { const u1 = random(st), u2 = 1.0 - random(st); z = NV_MAGICCONST * (u1 - 0.5) / u2; const zz = z * z / 4.0; if (zz <= -Math.log(u2)) break; }
+            return mu + z * sigma;
+        }
+        function gammavariate(st, alpha, beta) {
+            if (alpha <= 0.0 || beta <= 0.0) fail(E.ValueError, "gammavariate: alpha and beta must be > 0.0");
+            if (alpha > 1.0) {
+                const ainv = Math.sqrt(2.0 * alpha - 1.0), bbb = alpha - LOG4, ccc = alpha + ainv;
+                for (;;) {
+                    const u1 = random(st);
+                    if (!(1e-7 < u1 && u1 < 0.9999999)) continue;
+                    const u2 = 1.0 - random(st), v = Math.log(u1 / (1.0 - u1)) / ainv, x = alpha * Math.exp(v), z = u1 * u1 * u2, r = bbb + ccc * v - x;
+                    if (r + SG_MAGICCONST - 4.5 * z >= 0.0 || r >= Math.log(z)) return x * beta;
+                }
+            }
+            if (alpha === 1.0) return -Math.log(1.0 - random(st)) * beta;
+            let x;
+            for (;;) {
+                const u = random(st), b = (Math.E + alpha) / Math.E, p = b * u;
+                x = p <= 1.0 ? Math.pow(p, 1.0 / alpha) : -Math.log((b - p) / alpha);
+                const u1 = random(st);
+                if (p > 1.0) { if (u1 <= Math.pow(x, alpha - 1.0)) break; } else if (u1 <= Math.exp(-x)) break;
+            }
+            return x * beta;
+        }
+        const twoDefaults = (name, fnc) => mkw(name, (a) => { const kw = kwOf(a, ["mu", "sigma"]); return fnc(S(a[0]), num(a[1] !== undefined ? a[1] : kwget(kw, "mu", 0.0)), num(a[2] !== undefined ? a[2] : kwget(kw, "sigma", 1.0))); });
+        twoDefaults("gauss", gauss);
+        twoDefaults("normalvariate", normalvariate);
+        m("lognormvariate", 3, (a) => Math.exp(normalvariate(S(a[0]), num(a[1]), num(a[2]))));
+        m("expovariate", 2, (a) => { const l = num(a[1]); if (l === 0) fail(E.ZeroDivisionError, "float division by zero"); return -Math.log(1.0 - random(S(a[0]))) / l; });
+        m("gammavariate", 3, (a) => gammavariate(S(a[0]), num(a[1]), num(a[2])));
+        m("betavariate", 3, (a) => { const st = S(a[0]); const y = gammavariate(st, num(a[1]), 1.0); return y ? y / (y + gammavariate(st, num(a[2]), 1.0)) : 0.0; });
+        m("paretovariate", 2, (a) => Math.pow(1.0 - random(S(a[0])), -1.0 / num(a[1])));
+        m("weibullvariate", 3, (a) => num(a[1]) * Math.pow(-Math.log(1.0 - random(S(a[0]))), 1.0 / num(a[2])));
+        m("getstate", 1, (a) => { const st = S(a[0]); const words = []; for (let i = 0; i < N; i++) words.push(BigInt(st.mt[i])); words.push(BigInt(st.i)); return tuple([3n, tuple(words), st.gauss]); });
+        m("setstate", 2, (a) => {
+            const st = S(a[0]), s = a[1];
+            if (s === null || typeof s !== "object" || s.cls !== T.tuple || s.items.length !== 3) fail(E.ValueError, "state with version 3 passed to Random.setstate() of version 3");
+            if (s.items[0] !== 3n) fail(E.ValueError, "state with version " + str(s.items[0]) + " passed to Random.setstate() of version 3");
+            const words = drain(s.items[1]);
+            if (words.length !== N + 1) fail(E.ValueError, "state vector is the wrong size");
+            for (let i = 0; i < N; i++) st.mt[i] = Number(BigInt.asUintN(32, needInt(words[i])));
+            const idx = Number(needInt(words[N]));
+            if (idx < 0 || idx > N) fail(E.ValueError, "invalid state");
+            st.i = idx;
+            st.gauss = s.items[2] === null ? null : num(s.items[2]);
+            return null;
+        });
+        // Copies and pickles rebuild from the state, as CPython's __reduce__.
+        m("__reduce__", 1, (a) => tuple([typeOf(a[0]), tuple([]), rt.callMethod(a[0], "getstate", [])]));
+        m("__getstate__", 1, (a) => rt.callMethod(a[0], "getstate", []));
+        m("__setstate__", 2, (a) => rt.callMethod(a[0], "setstate", [a[1]]));
+        g.set("Random", Random);
+        const SystemRandom = rt.newType("SystemRandom", [Random], new Map(), "random");
+        g.set("SystemRandom", SystemRandom);
+        const inst = rt.allocInstance(Random);
+        seedFrom(inst.rng, null);
+        g.set("_inst", inst);
+        for (const name of ["seed", "random", "uniform", "triangular", "randint", "choice", "randrange", "sample", "shuffle", "choices", "normalvariate", "lognormvariate", "expovariate", "gammavariate", "gauss", "betavariate", "paretovariate", "weibullvariate", "getstate", "setstate", "getrandbits", "randbytes"]) g.set(name, rt.getattr(inst, name));
+    });
     // ---- time / sys / os / io ---------------------------------------------------------------------------------------------------------
     mod("time", (g) => {
         fn(g, "time", 0, () => Date.now() / 1000);
@@ -797,10 +1139,136 @@
         fn(g, "shorten", 2, (a) => { const s = needStr(a[0]).split(/\s+/).join(" "); const w = Number(needInt(a[1])); return s.length <= w ? s : s.slice(0, Math.max(0, w - 6)).replace(/\s+\S*$/, "") + " [...]"; });
     });
     mod("copy", (g) => {
-        function shallow(v) { if (v === null || typeof v !== "object") return v; const c = v.cls; if (c === T.list) return list(v.items.slice()); if (c === T.tuple) return v; if (c === T.dict) return rt.dictCopy(v); if (c === T.set) return rt.setFrom(v, T.set); const m = typeMethod(v, "__copy__"); if (m) return call(descrGet(m, v, c), [], null); if (v.dict !== undefined && !v.isType) { const o = rt.allocInstance(c); for (const [k, x] of v.dict) o.dict.set(k, x); if (v.items) o.items = v.items.slice(); return o; } return v; }
-        function deep(v, memo) { if (v === null || typeof v !== "object") return v; if (memo.has(v)) return memo.get(v); const c = v.cls; let out; if (c === T.list) { out = list([]); memo.set(v, out); for (const x of v.items) out.items.push(deep(x, memo)); return out; } if (c === T.tuple) { out = tuple(v.items.map((x) => deep(x, memo))); return out; } if (c === T.dict) { out = dict(); memo.set(v, out); for (const [k, x] of dictEntries(v)) dictSet(out, deep(k, memo), deep(x, memo)); return out; } if (c === T.set) { out = rt.set(); memo.set(v, out); for (const x of rt.setValues(v)) rt.setAdd(out, deep(x, memo)); return out; } const m = typeMethod(v, "__deepcopy__"); if (m) return call(descrGet(m, v, c), [rt.dictFromMap(new Map())], null); if (v.dict !== undefined && !v.isType && c !== T.function && c !== T.module) { out = rt.allocInstance(c); memo.set(v, out); for (const [k, x] of v.dict) out.dict.set(k, deep(x, memo)); if (v.items) out.items = v.items.map((x) => deep(x, memo)); return out; } return v; }
+        // CPython's copy protocol: the builtin containers directly, then
+        // `__copy__`/`__deepcopy__`, then a user `__reduce_ex__`/`__reduce__`
+        // (rebuilt as `copy._reconstruct` does), and otherwise the default
+        // object reduction: a new instance of the same class (no `__init__`)
+        // with the attribute state (`__getstate__`/`__setstate__` when
+        // defined) and the builtin storage it inherits (dict, list, set,
+        // deque, tuple subclasses such as OrderedDict, defaultdict, Counter).
+        // Native fields (an exception's args, a deque's maxlen, a boxed
+        // value) carry over; typed-array buffers are duplicated by deepcopy.
+        const SKIP = new Set(["id", "dictView", "cls", "dict", "items", "map", "size", "str", "coll"]);
+        const ATOMIC = new Set([T.function, T.module, T.builtin_function_or_method, T.range, T.bytes, T.property, T.classmethod, T.staticmethod]);
+        const isAtomic = (v) => v === null || typeof v !== "object" || v.cls === undefined || isType(v) || ATOMIC.has(v.cls) || (v.cls === T.frozenset && v.dict === undefined);
+        const objectReduce = rt.ObjectType.dict.get("__reduce__");
+        const userMethod = (v, name) => { const m = typeMethod(v, name); return m === undefined || m === null || m.isBase === true || m === objectReduce ? null : m; };
+        const callOn = (v, m, args) => call(descrGet(m, v, typeOf(v)), args, null);
+        const isBuffer = (x) => x !== null && typeof x === "object" && ArrayBuffer.isView(x);
+        // The Python memo dict a user `__deepcopy__(memo)` receives carries the
+        // JavaScript Map keyed by object, so copy.deepcopy(x, memo) inside it
+        // shares the one memo.
+        const pyMemo = (memo) => { if (memo.py === undefined) { memo.py = dict(); memo.py.jsMemo = memo; } return memo.py; };
+        function cloneInstance(v, f, memo) {
+            const c = v.cls, o = rt.allocInstance(c);
+            for (const k of Object.keys(v)) {
+                if (SKIP.has(k)) continue;
+                const x = v[k];
+                o[k] = memo !== null && isBuffer(x) ? x.slice() : x;
+            }
+            if (v.dict === undefined) delete o.dict;
+            if (memo !== null) memo.set(v, o);
+            if (v.dict !== undefined && v.dict !== null) {
+                const getstate = userMethod(v, "__getstate__");
+                const setstate = userMethod(o, "__setstate__");
+                if (getstate !== null || setstate !== null) {
+                    let state = getstate !== null ? callOn(v, getstate, []) : rt.dictFromMap(v.dict);
+                    if (memo !== null) state = f(state);
+                    if (setstate !== null) callOn(o, setstate, [state]);
+                    else if (state !== null) for (const [k, x] of dictEntries(rt.asDict(state))) o.dict.set(needStr(k), x);
+                } else for (const [k, x] of v.dict) o.dict.set(k, f(x));
+            }
+            if (Array.isArray(v.items)) { const items = []; for (const x of v.items) items.push(f(x)); o.items = items; }
+            if (v.map !== undefined && isInstance(v, T.dict)) {
+                const setitem = typeMethod(v, "__setitem__");
+                const plain = setitem === undefined || setitem === null || setitem.isBase === true;
+                for (const [k, x] of rt.dictEntryList(v)) { const key = f(k), val = f(x); if (plain) dictSet(o, key, val); else rt.setitem(o, key, val); }
+            } else if (v.map !== undefined && (isInstance(v, T.set) || isInstance(v, T.frozenset))) {
+                for (const x of rt.setValues(v)) rt.setAdd(o, f(x));
+            }
+            return o;
+        }
+        // copy._reconstruct over a `__reduce_ex__`/`__reduce__` result.
+        function reconstruct(v, rv, f, memo) {
+            if (typeof rv === "string") return v;
+            if (rv === null || typeof rv !== "object" || rv.cls !== T.tuple || rv.items.length < 2) fail(E.TypeError, "__reduce__ must return a string or tuple");
+            const it = rv.items, deepMode = memo !== null;
+            const func = it[0], args = it[1], state = it[2], listiter = it[3], dictiter = it[4];
+            const y = call(func, drain(deepMode ? f(args) : args), null);
+            if (deepMode) memo.set(v, y);
+            if (state !== undefined && state !== null) {
+                const st = deepMode ? f(state) : state;
+                const setstate = y !== null && typeof y === "object" ? typeMethod(y, "__setstate__") : undefined;
+                if (setstate !== undefined && setstate !== null) callOn(y, setstate, [st]);
+                else {
+                    let d = st, slots = null;
+                    if (st !== null && typeof st === "object" && st.cls === T.tuple && st.items.length === 2) { d = st.items[0]; slots = st.items[1]; }
+                    if (d !== null) for (const [k, x] of dictEntries(rt.asDict(d))) y.dict.set(needStr(k), x);
+                    if (slots !== null) for (const [k, x] of dictEntries(rt.asDict(slots))) rt.setattr(y, k, x);
+                }
+            }
+            if (listiter !== undefined && listiter !== null) for (const x of drain(listiter)) rt.callMethod(y, "append", [deepMode ? f(x) : x]);
+            if (dictiter !== undefined && dictiter !== null) for (const kv of drain(dictiter)) { const k = getitem(kv, 0n), x = getitem(kv, 1n); rt.setitem(y, deepMode ? f(k) : k, deepMode ? f(x) : x); }
+            return y;
+        }
+        function reduced(v) {
+            const rex = userMethod(v, "__reduce_ex__");
+            if (rex !== null) return callOn(v, rex, [4n]);
+            const r = userMethod(v, "__reduce__");
+            return r !== null ? callOn(v, r, []) : undefined;
+        }
+        const same = (x) => x;
+        function shallow(v) {
+            if (isAtomic(v)) return v;
+            const c = v.cls;
+            if (c === T.list) return list(v.items.slice());
+            if (c === T.tuple) return v;
+            if (c === T.dict) return rt.dictCopy(v);
+            if (c === T.set) return rt.setFrom(v, T.set);
+            const m = typeMethod(v, "__copy__");
+            if (m) return callOn(v, m, []);
+            const rv = reduced(v);
+            if (rv !== undefined) return reconstruct(v, rv, same, null);
+            if (v.dict === undefined && v.map === undefined && v.items === undefined) return v;
+            return cloneInstance(v, same, null);
+        }
+        function deep(v, memo) {
+            if (isAtomic(v)) return v;
+            const known = memo.get(v);
+            if (known !== undefined) return known;
+            const c = v.cls, f = (x) => deep(x, memo);
+            let out;
+            if (c === T.list) { out = list([]); memo.set(v, out); for (const x of v.items) out.items.push(deep(x, memo)); return out; }
+            if (c === T.tuple) {
+                const items = []; let changed = false;
+                for (const x of v.items) { const y = deep(x, memo); if (y !== x) changed = true; items.push(y); }
+                // A tuple holding itself through a list was copied meanwhile.
+                const again = memo.get(v);
+                if (again !== undefined) return again;
+                out = changed ? tuple(items) : v; memo.set(v, out); return out;
+            }
+            if (c === T.dict) { out = dict(); memo.set(v, out); for (const [k, x] of rt.dictEntryList(v)) dictSet(out, deep(k, memo), deep(x, memo)); return out; }
+            if (c === T.set) { out = rt.set(); memo.set(v, out); for (const x of rt.setValues(v)) rt.setAdd(out, deep(x, memo)); return out; }
+            const m = typeMethod(v, "__deepcopy__");
+            if (m) { out = callOn(v, m, [pyMemo(memo)]); memo.set(v, out); return out; }
+            const rv = reduced(v);
+            if (rv !== undefined) return reconstruct(v, rv, f, memo);
+            // A native value holding a typed-array buffer (a tensor storage)
+            // is duplicated rather than shared; other native values are.
+            if (v.dict === undefined && v.map === undefined && v.items === undefined && !isBuffer(v.data)) return v;
+            return cloneInstance(v, f, memo);
+        }
         fn(g, "copy", 1, (a) => shallow(a[0]));
-        fn(g, "deepcopy", 2, (a) => deep(a[0], new Map()), 1);
+        fnkw(g, "deepcopy", (a) => {
+            const kw = kwOf(a, ["memo"]);
+            if (a.length < 1 || a.length > 2) fail(E.TypeError, "deepcopy() takes from 1 to 2 positional arguments but " + a.length + " were given");
+            const pm = a[1] !== undefined ? a[1] : kwget(kw, "memo", null);
+            let memo;
+            if (pm === null) memo = new Map();
+            else if (typeof pm === "object" && pm.jsMemo !== undefined) memo = pm.jsMemo;
+            else { memo = new Map(); if (typeof pm === "object") { memo.py = pm; pm.jsMemo = memo; } }
+            return deep(a[0], memo);
+        });
         rt.deepcopy = (v) => deep(v, new Map());
     });
     mod("operator", (g) => {
@@ -1128,7 +1596,7 @@
             for (const w of [a0, b0, c0, d0]) out.push(w & 255, (w >>> 8) & 255, (w >>> 16) & 255, (w >>> 24) & 255);
             return out;
         }
-        const ALGOS = { sha256: [sha256, 32], sha1: [sha1, 20], md5: [md5, 16] };
+        const ALGOS = { sha256: [sha256, 32], sha1: [sha1, 20], md5: [md5, 16], sha512: [rt.sha512, 64] };
         const Hash = rt.newType("HASH", [rt.ObjectType], new Map(), "hashlib");
         const state = (self) => self.dict.get("_data");
         Hash.dict.set("update", builtin("update", 2, (a) => { const d = state(a[0]); for (const b of toBytes(a[1])) d.push(b); return null; }));

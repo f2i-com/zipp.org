@@ -1,0 +1,28 @@
+b'abc' 0 9 3
+b'bc' 1 10 3
+b'Z' 8 8 1
+b'' 0 12 13
+b'zz' -1 -1 0
+97 0 9 -
+99 2 11 -
+0 None 0 9 0 12 3 13
+1 None 3 9 1 12 2 12
+-3 None 9 9 9 12 1 4
+-100 None 0 9 0 12 3 13
+2 7 3 3 2 7 1 6
+2 -2 3 3 2 10 2 9
+-5 -1 -1 -1 7 11 1 5
+12 None -1 -1 12 12 0 1
+13 None -1 -1 -1 -1 0 0
+5 2 -1 -1 -1 -1 0 0
+2 1 2 1
+6 9 3
+ValueError subsection not found
+ValueError subsection not found
+ValueError byte must be in range(0, 256)
+TypeError argument should be integer or bytes-like object, not 'str'
+4000 b'\x01\x02\x02\x03\x03\x03\x04\x04\x04\x04\x06\x07' b'\xce\xce\xcf\xcf\xcf\xcf' 1526
+b'a, b, c' b'' b'x' b'pq'
+200022 200000 200000 -1 49999
+TypeError sequence item 1: expected a bytes-like object, str found
+200030 b'heEA\x00\x01' b'tail' True

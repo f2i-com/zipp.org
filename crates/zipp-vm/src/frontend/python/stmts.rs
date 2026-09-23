@@ -1467,15 +1467,11 @@ impl<'a> Emitter<'a> {
         Ok(value)
     }
 
-    fn import_module(&mut self, stmt: &ast::Stmt, name: &str) -> R<Reg> {
-        if !self.module_exists(name) {
-            return Err(self.error(
-                stmt,
-                &format!(
-                    "No module named '{name}' (project .py files and the built-in modules only)"
-                ),
-            ));
-        }
+    /// An import of a module that is neither in the project nor built in
+    /// compiles too: the runtime import raises `ModuleNotFoundError` when the
+    /// statement runs, so `try: import numpy` / `except ImportError:` guards
+    /// work as they do under CPython.
+    fn import_module(&mut self, _stmt: &ast::Stmt, name: &str) -> R<Reg> {
         let key = self.string(name)?;
         let globals = self.globals()?;
         self.helper("import", &[key, globals])

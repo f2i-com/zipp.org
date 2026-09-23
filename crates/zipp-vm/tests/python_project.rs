@@ -106,10 +106,65 @@ fn a_module_runs_once_and_cycles_resolve_partially_like_cpython() {
 
 #[test]
 fn unknown_and_unsupported_imports_are_compile_errors() {
+    // An unknown module compiles and raises ModuleNotFoundError where the
+    // import runs, so an `except ImportError` guard can catch it.
     for (source, needle) in [
-        ("import nowhere\n", "No module named 'nowhere'"),
-        ("from nowhere import x\n", "No module named 'nowhere'"),
-        ("import a.b\n", "No module named 'a.b'"),
+        ("import nowhere\n", "ModuleNotFoundError: No module named 'nowhere'"),
+        ("from nowhere import x\n", "ModuleNotFoundError: No module named 'nowhere'"),
+        ("import a.b\n", "ModuleNotFoundError: No module named 'a'"),
+        ("import util.b\n", "ModuleNotFoundError: No module named 'util.b'"),
+        ("from util import nothing\n", "ImportError: cannot import name 'nothing' from 'util'"),
+    ] {
+        let err = run_project("main", &[("main", source), ("util", "x = 1\n")])
+            .err()
+            .unwrap();
+        assert!(err.contains(needle), "{source:?}: {err}");
+    }
+    assert_eq!(
+        run_project(
+            "main",
+            &[(
+                "main",
+                "try:\n    import nowhere\nexcept ImportError as e:\n    nowhere = None\n    print(type(e).__name__, e.name, e)\n\
+                 try:\n    from nowhere.sub import thing\nexcept ModuleNotFoundError:\n    thing = 0\n\
+                 print(nowhere, thing)\n",
+            )],
+        )
+        .unwrap(),
+        vec![
+            "ModuleNotFoundError nowhere No module named 'nowhere'",
+            "None 0"
+        ]
+    );
+    // An error raised on a line after a call into another module returned
+    // cites the line that raised it, not the callee's last line.
+    let err = run_project(
+        "main",
+        &[
+            (
+                "main",
+                "import util\n\ndef f():\n    return util.make().missing\n\nf()\n",
+            ),
+            ("util", "class T:\n    pass\n\ndef make():\n    x = 1\n    return T()\n"),
+        ],
+    )
+    .err()
+    .unwrap();
+    assert!(
+        err.contains("has no attribute 'missing' (main.py:4)"),
+        "{err}"
+    );
+    let err = run_project(
+        "main",
+        &[
+            ("main", "import util\n\nutil.boom()\n"),
+            ("util", "def boom():\n    x = 1\n    raise ValueError('inner')\n"),
+        ],
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("ValueError: inner (util.py:3)"), "{err}");
+    for (source, needle) in [
         (
             "def f():\n    from util import *\n",
             "import * only allowed at module level",

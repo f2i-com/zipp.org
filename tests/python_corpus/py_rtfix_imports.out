@@ -1,0 +1,11 @@
+guard 1: ModuleNotFoundError zz_no_such_module_anywhere No module named 'zz_no_such_module_anywhere'
+np is None
+tqdm fallback: [0, 1, 2]
+dotted: ModuleNotFoundError True zz_no_such_pkg
+missing name: ImportError False
+second name missing: ImportError
+fallback for a fallback for b
+HAVE False
+json ok {"k": 1}
+unreached import is fine
+dynamic: ModuleNotFoundError

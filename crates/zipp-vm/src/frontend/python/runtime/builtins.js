@@ -678,8 +678,9 @@
         if (n <= DENSE_NATIVE) return new Array(n).fill(0);
         const out = []; for (let i = 0; i < n; i++) out.push(0); return out;
     };
+    // A push loop is also the fast copy: the engine's Array.from over a
+    // typed array is several times slower.
     rt.bytesFromU8 = function (u8) {
-        if (u8.length <= DENSE_NATIVE) return Array.from(u8);
         const out = []; for (let i = 0; i < u8.length; i++) out.push(u8[i]); return out;
     };
     rt.constructors.set(T.bytes, (args) => {
@@ -698,14 +699,76 @@
     const s2b = (s) => { const out = []; for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 255); return rt.bytes(out); };
     const bArg = (v, what) => { if (v !== null && typeof v === "object" && v.cls === T.bytes) return b2s(v); if (isInt(v)) return String.fromCharCode(Number(asInt(v))); fail(E.TypeError, (what || "argument") + " should be integer or bytes-like object, not '" + typeOf(v).name + "'"); };
     const bIdx = (v) => v === undefined || v === null ? undefined : Number(needInt(v));
-    method(T.bytes, "find", 4, (a) => { const s = b2s(a[0]); const i = s.slice(0, bIdx(a[3])).indexOf(bArg(a[1]), bIdx(a[2])); return BigInt(i); }, 2);
-    method(T.bytes, "rfind", 4, (a) => { const s = b2s(a[0]); const i = s.slice(0, bIdx(a[3])).lastIndexOf(bArg(a[1])); return BigInt(i >= (bIdx(a[2]) || 0) ? i : -1); }, 2);
-    method(T.bytes, "index", 4, (a) => { const i = b2s(a[0]).slice(0, bIdx(a[3])).indexOf(bArg(a[1]), bIdx(a[2])); if (i < 0) fail(E.ValueError, "subsection not found"); return BigInt(i); }, 2);
-    method(T.bytes, "count", 4, (a) => { const s = b2s(a[0]).slice(bIdx(a[2]) || 0, bIdx(a[3])), sub = bArg(a[1]); if (sub === "") return BigInt(s.length + 1); return BigInt(s.split(sub).length - 1); }, 2);
+    // Searches run on the byte arrays themselves (the engine's native
+    // indexOf/lastIndexOf finds each candidate first byte), with start/end
+    // clamped like slice bounds.
+    const bNeedle = (v) => { if (v !== null && typeof v === "object" && v.items !== undefined && isInstance(v, T.bytes)) return v.items; if (isInt(v)) { const n = Number(asInt(v)); if (n < 0 || n > 255) fail(E.ValueError, "byte must be in range(0, 256)"); return [n]; } fail(E.TypeError, "argument should be integer or bytes-like object, not '" + typeOf(v).name + "'"); };
+    const bBounds = (len, s, e) => {
+        let start = s === undefined || s === null ? 0 : Number(rt.indexOf(s)), end = e === undefined || e === null ? len : Number(rt.indexOf(e));
+        if (start < 0) { start += len; if (start < 0) start = 0; }
+        if (end < 0) { end += len; if (end < 0) end = 0; } else if (end > len) end = len;
+        return [start, end];
+    };
+    const bMatchAt = (hay, needle, i) => { for (let k = 1; k < needle.length; k++) if (hay[i + k] !== needle[k]) return false; return true; };
+    function bFind(hay, needle, start, end) {
+        const n = needle.length;
+        if (start > hay.length || end - start < n) return -1;
+        if (n === 0) return start;
+        const first = needle[0], last = end - n;
+        for (let i = hay.indexOf(first, start); i >= 0 && i <= last; i = hay.indexOf(first, i + 1)) if (bMatchAt(hay, needle, i)) return i;
+        return -1;
+    }
+    function bRfind(hay, needle, start, end) {
+        const n = needle.length;
+        if (start > hay.length || end - start < n) return -1;
+        if (n === 0) return end;
+        const first = needle[0];
+        for (let i = hay.lastIndexOf(first, end - n); i >= start; i = i > 0 ? hay.lastIndexOf(first, i - 1) : -1) if (bMatchAt(hay, needle, i)) return i;
+        return -1;
+    }
+    rt.bytesFind = bFind; rt.bytesRfind = bRfind;
+    const bSearch = (a, fnc) => { const hay = a[0].items, [start, end] = bBounds(hay.length, a[2], a[3]); return fnc(hay, bNeedle(a[1]), start, end); };
+    method(T.bytes, "find", 4, (a) => BigInt(bSearch(a, bFind)), 2);
+    method(T.bytes, "rfind", 4, (a) => BigInt(bSearch(a, bRfind)), 2);
+    method(T.bytes, "index", 4, (a) => { const i = bSearch(a, bFind); if (i < 0) fail(E.ValueError, "subsection not found"); return BigInt(i); }, 2);
+    method(T.bytes, "rindex", 4, (a) => { const i = bSearch(a, bRfind); if (i < 0) fail(E.ValueError, "subsection not found"); return BigInt(i); }, 2);
+    method(T.bytes, "count", 4, (a) => {
+        const hay = a[0].items, needle = bNeedle(a[1]), [start, end] = bBounds(hay.length, a[2], a[3]);
+        if (start > hay.length || end < start) return 0n;
+        if (needle.length === 0) return BigInt(end - start + 1);
+        let n = 0;
+        for (let i = bFind(hay, needle, start, end); i >= 0; i = bFind(hay, needle, i + needle.length, end)) n++;
+        return BigInt(n);
+    }, 2);
     method(T.bytes, "startswith", 4, (a) => { const s = b2s(a[0]).slice(bIdx(a[2]) || 0, bIdx(a[3])); const p = a[1]; if (p !== null && typeof p === "object" && p.cls === T.tuple) return p.items.some((x) => s.startsWith(bArg(x))); return s.startsWith(bArg(p)); }, 2);
     method(T.bytes, "endswith", 4, (a) => { const s = b2s(a[0]).slice(bIdx(a[2]) || 0, bIdx(a[3])); const p = a[1]; if (p !== null && typeof p === "object" && p.cls === T.tuple) return p.items.some((x) => s.endsWith(bArg(x))); return s.endsWith(bArg(p)); }, 2);
     method(T.bytes, "split", 3, (a) => { const s = b2s(a[0]); const max = a[2] === undefined ? -1 : Number(needInt(a[2])); let parts; if (a[1] === undefined || a[1] === null) { parts = s.split(/[ \t\n\r\x0b\x0c]+/).filter((x) => x !== ""); if (max >= 0 && parts.length > max + 1) { const head = parts.slice(0, max); const rest = s.replace(/^[ \t\n\r\x0b\x0c]+/, ""); let pos = 0; for (let i = 0; i < max; i++) { pos = rest.indexOf(head[i], pos) + head[i].length; } parts = head.concat([rest.slice(pos).replace(/^[ \t\n\r\x0b\x0c]+/, "")]); } } else { const sep = bArg(a[1]); if (sep === "") fail(E.ValueError, "empty separator"); parts = s.split(sep); if (max >= 0 && parts.length > max + 1) parts = parts.slice(0, max).concat([parts.slice(max).join(sep)]); } return list(parts.map(s2b)); }, 1);
-    method(T.bytes, "join", 2, (a) => { const sep = b2s(a[0]); const parts = drain(a[1]).map((x, i) => { if (x === null || typeof x !== "object" || x.items === undefined || !isInstance(x, T.bytes)) fail(E.TypeError, "sequence item " + i + ": expected a bytes-like object, " + typeOf(x).name + " found"); return b2s(x); }); return s2b(parts.join(sep)); });
+    // Concatenates the parts' byte arrays with the engine's native concat,
+    // up to 1024 arrays per call, so a join of many parts stays linear.
+    const concatArrays = (arrs) => {
+        if (arrs.length < 2) return arrs.length ? arrs[0].slice() : [];
+        while (arrs.length > 1) {
+            const next = [];
+            for (let i = 0; i < arrs.length; i += 1024) next.push(Array.prototype.concat.apply([], arrs.slice(i, i + 1024)));
+            arrs = next;
+        }
+        return arrs[0];
+    };
+    rt.concatByteArrays = concatArrays;
+    method(T.bytes, "join", 2, (a) => {
+        const src = a[1], sep = a[0].items, arrs = [];
+        const parts = src !== null && typeof src === "object" && (src.cls === T.list || src.cls === T.tuple) ? src.items : drain(src);
+        const bytesType = T.bytes;
+        for (let i = 0; i < parts.length; i++) {
+            const x = parts[i];
+            if (x === null || typeof x !== "object" || (x.cls !== bytesType && (x.items === undefined || !isInstance(x, bytesType)))) fail(E.TypeError, "sequence item " + i + ": expected a bytes-like object, " + typeOf(x).name + " found");
+            if (i > 0 && sep.length) arrs.push(sep);
+            arrs.push(x.items);
+        }
+        const out = concatArrays(arrs);
+        if (out.length > rt.MAX_ITEMS) fail(E.MemoryError, "sequence limit exceeded");
+        return rt.bytes(out);
+    });
     const bStrip = (name, fnc) => method(T.bytes, name, 2, (a) => { const s = b2s(a[0]); const chars = a[1] === undefined || a[1] === null ? " \t\n\r\x0b\x0c" : bArg(a[1]); return s2b(fnc(s, chars)); }, 1);
     const lstrip = (s, cs) => { let i = 0; while (i < s.length && cs.indexOf(s[i]) >= 0) i++; return s.slice(i); };
     const rstrip = (s, cs) => { let j = s.length; while (j > 0 && cs.indexOf(s[j - 1]) >= 0) j--; return s.slice(0, j); };
@@ -1191,7 +1254,7 @@
     const FileType = rt.newType("TextIOWrapper", [rt.ObjectType], new Map(), "io");
     const BinType = rt.newType("BufferedReader", [rt.ObjectType], new Map(), "io");
     const fstate = (self) => { const s = self.dict.get("_f"); if (s.closed) fail(E.ValueError, "I/O operation on closed file."); return s; };
-    const flush = (s) => { if (s.dirty) { rt.vfs.set(s.path, Uint8Array.from(s.buf)); s.dirty = false; } };
+    const flush = (s) => { if (s.dirty) { rt.vfs.set(s.path, new Uint8Array(s.buf)); s.dirty = false; } };
     // Writable handles still open. CPython flushes a file when its last
     // reference goes and at interpreter exit; here every open handle is
     // flushed before its path is read and before the host collects the
@@ -1247,9 +1310,11 @@
             if (binary) { if (a[1] === null || typeof a[1] !== "object" || a[1].cls !== T.bytes) fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(a[1]).name + "'"); bytes = a[1].items; }
             else bytes = bytesOfText(s, needStr(a[1]));
             if (s.pos + bytes.length > MAX_FILE) fileTooLarge();
-            // Past the end a gap (after a seek) fills with zeros, then appends.
+            // Past the end a gap (after a seek) fills with zeros, then appends;
+            // a large append at the end is one native concat.
             while (s.buf.length < s.pos) s.buf.push(0);
-            for (let i = 0; i < bytes.length; i++) { if (s.pos + i < s.buf.length) s.buf[s.pos + i] = bytes[i]; else s.buf.push(bytes[i]); }
+            if (s.pos === s.buf.length && bytes.length >= 4096 && bytes.length * 4 >= s.buf.length) s.buf = s.buf.concat(bytes);
+            else for (let i = 0; i < bytes.length; i++) { if (s.pos + i < s.buf.length) s.buf[s.pos + i] = bytes[i]; else s.buf.push(bytes[i]); }
             s.pos += bytes.length; s.dirty = true;
             return BigInt(binary ? bytes.length : a[1].length);
         }));
@@ -1297,9 +1362,44 @@
         m("__repr__", 1, (a) => repr(rt.dictFromMap(shown(a))));
         m("__eq__", 2, (a) => rt.eq(rt.dictFromMap(shown(a)), a[1]));
         m("__or__", 2, (a) => R.binop("or", rt.dictFromMap(shown(a)), a[1]));
-        rt.instanceDict = (obj) => ({ cls: ID, target: obj, hide: obj.cls !== undefined && obj.cls !== null ? obj.cls.slots : undefined });
-        // globals(): the same live view over a module's namespace Map.
-        rt.namespaceView = (map) => ({ cls: ID, target: { dict: map }, hide: undefined });
+        // Without slots to hide, `obj.__dict__` is a real dict whose storage
+        // is the instance's own attribute Map (a str-keyed dict keeps exactly
+        // that shape), so isinstance, json, pickle, copy and every dict method
+        // see it as CPython's do, and writes land on the object. A non-str
+        // key would convert the storage to buckets; it is refused instead.
+        const refuseKey = () => fail(E.TypeError, "attribute name must be string");
+        const liveDict = (target) => ({
+            cls: T.dict, liveTarget: target,
+            get map() { return target.dict; }, set map(v) { refuseKey(); },
+            get size() { return target.dict.size; }, set size(v) { },
+            get str() { return true; }, set str(v) { if (v !== true) refuseKey(); },
+        });
+        rt.instanceDict = (obj) => {
+            const hide = obj.cls !== undefined && obj.cls !== null ? obj.cls.slots : undefined;
+            if (hide !== undefined && hide !== null && hide.size !== 0) return { cls: ID, target: obj, hide: hide };
+            // One view per object, as `obj.__dict__ is obj.__dict__` holds in CPython.
+            let view = obj.dictView;
+            if (view === undefined || view.liveTarget !== obj) { view = liveDict(obj); obj.dictView = view; }
+            return view;
+        };
+        // `obj.__dict__ = d`: a str-keyed dict becomes the object's attribute
+        // storage itself (so `self.__dict__ = self` in a dict subclass makes
+        // keys and attributes one namespace, as in CPython); its size then
+        // follows the shared Map and a non-str key is refused. A dict with
+        // other keys is copied.
+        rt.setInstanceDict = (obj, d) => {
+            if (d === null || typeof d !== "object" || d.map === undefined || !isInstance(d, T.dict)) fail(E.TypeError, "__dict__ must be set to a dictionary, not a '" + typeOf(d).name + "'");
+            if (d.liveTarget !== undefined) { obj.dict = d.liveTarget.dict; return; }
+            if (d.str !== true) { obj.dict = rt.mapFromDict(d); return; }
+            const shared = d.map;
+            Object.defineProperty(d, "map", { get: () => shared, set: (v) => { refuseKey(); }, configurable: true });
+            Object.defineProperty(d, "size", { get: () => shared.size, set: (v) => { }, configurable: true });
+            Object.defineProperty(d, "str", { get: () => true, set: (v) => { if (v !== true) refuseKey(); }, configurable: true });
+            obj.dict = shared;
+            if (d.cls === T.dict) obj.dictView = Object.defineProperty(d, "liveTarget", { value: obj, configurable: true, writable: true });
+        };
+        // globals() and module.__dict__: the same live dict over a module's namespace Map.
+        rt.namespaceView = (map) => liveDict({ dict: map });
         rt.T.instancedict = ID;
     }
     for (const name of ["isinstance", "issubclass", "hasattr", "getattr", "setattr", "delattr", "divmod", "iter", "next", "format"]) B.get(name).unpackArgs = true;
