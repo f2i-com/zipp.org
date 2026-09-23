@@ -79,6 +79,7 @@ surface and remaining differences.
 |---|---|---|
 | Run JavaScript scripts or embed Zipp | Native Rust VM/JIT, or Zipp's WebAssembly build | CPU; host APIs are supplied by the embedding application |
 | Run Python projects in Zipp | Experimental Python frontend on the same VM | CPU, including the bundled `torch` subset |
+| Compile a supported Torch model or submit a `zipp_gpu` graph with `zipp py` | Python in the native engine; gpu-lab's runtime in a second engine state | A hardware GPU through wgpu (Vulkan, Direct3D 12, Metal), synchronously; the CPU evaluator when there is none |
 | Compile a supported Torch model or submit a Python `zipp_gpu` graph from the playground | Python in the WASM Worker; JavaScript handles the graph | WebGPU compute shaders or WebGL2 fragment shaders; visible CPU fallback in `auto` mode |
 | Use GPU graphs from browser JavaScript | An ordinary browser ES module or Worker | The same GPU runtime, without requiring Python or the Zipp VM |
 | Run a local language model from a GGUF file (experimental, source only) | A model plugin's Python in the WASM engine; JavaScript reads and binds the checkpoint | The same GPU runtime, with the weights kept as the file's quantized blocks |
@@ -441,7 +442,7 @@ supported ML code can train and evaluate inside Zipp. Eager execution is CPU;
 cross-entropy, SGD with momentum, Adam or AdamW), and `compiled.prepare()`
 keeps the weights and optimizer state on the device between steps (see
 [Train a small model on the browser GPU](#train-a-small-model-on-the-browser-gpu)).
-Natively, the same recorded graphs run on the engine's tensor kernels. The
+Natively, `zipp py` runs the same recorded graphs on a hardware GPU through wgpu when one is present, synchronously and with the same results, and on the engine's tensor kernels otherwise ([Native GPU](docs/TORCH_COMPATIBILITY.md#native-gpu-zipp-py)). The
 subset covers enough of what real model code reaches for -- `torch.autocast`
 among it, a no-op here since every tensor is float32 -- that Hugging Face's
 `modeling_qwen3.py`, `modeling_qwen2.py`, `modeling_llama.py` and
@@ -465,8 +466,9 @@ weights and optimizer state stay on the device, and several steps go in one
 submission (0.79 ms per step on an RTX 5090 at eight steps per run, against
 3.6 ms for one step per submission). A run that fails after device work
 began poisons its session - only `dispose()` remains - rather than letting a
-retry run on state of no particular step. Natively the same code evaluates
-on the CPU, bit for bit the same as the reference.
+retry run on state of no particular step. Natively the same code runs on a
+GPU when one is present, and otherwise evaluates on the CPU, bit for bit the
+same as the reference.
 A weight input can also be a checkpoint's own Q4_K or Q6_K blocks, decoded
 inside the matmul on every backend, and `matmul_fixed` computes a product in
 integers, the same bits on every backend that runs it
@@ -573,8 +575,10 @@ reads the requested outputs, and delivers the callback between VM calls.
 Supported operations include elementwise arithmetic, ReLU, matrix multiplication,
 sum and a wrapped Conway-Life update. These are float32 operations, with the
 shape/work limits in the [GPU Lab documentation](crates/zipp-wasm/gpu-lab/README.md).
-Running this Python code through the native Zipp CLI instead uses its local CPU
-reference evaluator; it does not start PyTorch or CUDA.
+Running this Python code through the native Zipp CLI runs the same graphs on a
+hardware GPU through wgpu (Vulkan, Direct3D 12 or Metal) when one is present,
+synchronously, and otherwise on its local CPU reference evaluator (`--no-gpu` or
+`ZIPP_GPU=0` forces it). It does not start PyTorch or CUDA.
 
 ### Browser JavaScript versus JavaScript inside Zipp
 

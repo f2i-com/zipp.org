@@ -14,7 +14,7 @@ optimizers directly; their eager operations run on the CPU inside Zipp.
 | `torch.compile(step, training=True)(x, target)` | Records forward, backward and SGD update nodes | One zero_grad/backward/step; gradients and weights commit after successful readback. |
 | `torch.compile(step, training=True).prepare(x, target)` | Records the step once; a device-resident session | `step`/`steps` feed only the batch; weights and optimizer state carry on the device until `sync()`; `dispose()` frees them. |
 | Pending result in the playground | Host-selected WebGPU, WebGL2, WASM or JavaScript | Console and `result.backend` identify actual execution. |
-| Pending result in native Zipp | CPU graph evaluator | Does not acquire CUDA or a native GPU. |
+| Pending result in native Zipp (`zipp py`) | A hardware GPU through wgpu (Vulkan, Direct3D 12 or Metal) when one is present; the CPU graph evaluator otherwise | Synchronous either way; `result.backend` is `webgpu` or `cpu-python`. No CUDA. See *Native GPU*. |
 
 The default inference path accepts tensor positional/keyword inputs and records a callable's
 forward pass under `torch.no_grad()`. Supported operations are elementwise
@@ -24,17 +24,19 @@ exponents 2, 1, 0.5, -1 and -0.5, matrix multiplication (including 1-D inputs
 to `nn.Linear` and matrix-vector, vector-matrix and dot products), sum/mean over
 all elements or over any set of dimensions, `softmax`/`log_softmax` over any
 dimension, `reshape`/`view`/`flatten`/`squeeze`/`unsqueeze`/`permute`/`transpose`/`.t()`/`.T`,
-`.detach()` as a stop-gradient, indexing that only reshapes (`None`, full
-slices, `...`, index 0 of a size-1 dimension), and `nn.Linear`/`nn.ReLU`/`nn.Sequential`
+`.detach()` as a stop-gradient, indexing (see *Element selection*), and `nn.Linear`/`nn.ReLU`/`nn.Sequential`
 combinations. Comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`, `torch.gt`/`eq`/...,
 also with an eager tensor on the left), `torch.where`/`Tensor.where`,
 `masked_fill`, `clamp`/`clip`/`clamp_min`/`clamp_max` (scalar or tensor bounds),
 `maximum`/`minimum` (and two-tensor `torch.max`/`torch.min`),
 `F.hardtanh`/`F.relu6`/`F.leaky_relu` (and their `nn` modules), mask logic (`&`,
 `|`, `^`, `~`, `logical_and`/`or`/`xor`/`not`) and dropout record graph protocol
-version 3 operations (see *Masks, clamping and dropout*). Element-selecting
-slices cannot be expressed by the graph protocol and raise
-`NotImplementedError` naming the operation.
+version 3 operations (see *Masks, clamping and dropout*). Slicing,
+`split`/`chunk`/`unbind`/`narrow`/`select`/`flip`, `cat`/`stack`, `index_select`,
+`gather`, `take_along_dim`, `F.embedding` and one integer tensor index record
+graph protocol version 4 operations (see *Element selection*); boolean-mask
+indexing and indices computed on the device raise `NotImplementedError` naming
+the operation.
 Shapes must match except for scalars and a vector bias expanded across a matrix's
 rows. Each call snapshots and uploads its float32 inputs and weights.
 Each call must return one tensor. Results are read back into ordinary CPU tensors.
@@ -97,10 +99,12 @@ operations on that parameter, so its gradient reaches the parameter, and a
 prepared session recomputes it from the resident weights every step.
 Re-recording covers add/sub/mul/div, neg, the powers above, square,
 exp/log/tanh/sigmoid/relu/sqrt/rsqrt/gelu/abs/silu, view/reshape,
-permute/transpose, sum/mean, matmul, maximum/minimum, softmax/log_softmax, clone and a float32
-`to`; any other operation raises `NotImplementedError` naming it rather than
-becoming a separate leaf with no gradient. `p.detach()` and `p.data` read the
-parameter's input.
+permute/transpose, sum/mean, matmul, maximum/minimum, softmax/log_softmax, basic
+slicing (`pos[:T]`, `W[0]`, `W[:, ::2]`), `torch.cat` of parameters, clone and a
+float32 `to`; any other operation raises `NotImplementedError` naming it rather
+than becoming a separate leaf with no gradient (indexing a parameter by a tensor,
+`W[idx]`, names `torch.index_select`/`F.embedding`, which record on the device).
+`p.detach()` and `p.data` read the parameter's input.
 
 Optimizers follow `torch.optim`'s single-tensor update order. SGD supports
 learning rate, weight decay, maximize, parameter groups, momentum, dampening
@@ -116,9 +120,11 @@ gradients and retained graphs are rejected on the compiled path (eager
 `optimizer.step(closure)` is supported). Every trainable optimizer parameter
 must participate in the loss. Dense relu networks with MSE and plain SGD still
 record a protocol version 1 graph, which natively runs on the tensor kernels;
-anything newer records version 2, or version 3 once it uses a comparison,
-`where`, clamping, `maximum`/`minimum` or dropout, which natively runs on `zipp_gpu`'s
-pure-Python float32 reference (the same numbers, not fast).
+anything newer records version 2, version 3 once it uses a comparison,
+`where`, clamping, `maximum`/`minimum` or dropout, or version 4 once it slices,
+concatenates or indexes. Natively these run on a hardware GPU when one is present
+(see *Native GPU*) and otherwise on `zipp_gpu`'s float32 reference (the same
+numbers, not fast).
 
 Weights and gradients stay unchanged while a supported step is recorded or pending.
 After successful readback, finite results are checked before committing weights,
@@ -194,11 +200,13 @@ prepared.dispose()
   the device from the resident weights) and pass argument-derived values as
   arguments. Python values (`.item()`, Python's `random`, other Python state)
   are recorded constants, frozen like non-tensor arguments. A bool tensor
-  argument read as a mask is fed each step. A step that draws random numbers
-  on the CPU (`torch.rand`/`randn`/`randint`/`normal`) is refused for the same
-  reason; dropout and `torch.rand_like`/`torch.bernoulli` of graph tensors draw
-  on the device, afresh every step. Per-call `torch.compile` accepts all of
-  these.
+  argument read as a mask is fed each step, and an integer argument read as an
+  index (embedding tokens, `gather` positions, through a view such as
+  `idx.view(-1)`) is fed each step and checked against the dimension it
+  indexes. CPU random draws inside the step are feeds too (see *CPU random
+  draws in prepared steps*); dropout and `torch.rand_like`/`torch.bernoulli` of
+  graph tensors draw on the device, afresh every step. Per-call
+  `torch.compile` accepts all of these.
 - **Resident state.** Each parameter's weight, its gradient and its optimizer
   buffers (momentum buffer, or Adam's two moments) are outputs kept on the
   device and carried into the next step; only the returned tensor is read back
@@ -239,9 +247,9 @@ prepared.dispose()
   synced is lost on `dispose()`.
 - **Asynchrony.** In the playground the host creates the session after the
   current call returns (`on_ready(prepared)`, `prepared.backend`); steps
-  requested meanwhile queue behind it. Without a host (`zipp py`, CPython for
-  `zipp_gpu` itself) the session runs on the tensor kernels and every callback
-  runs before the call returns. A `steps()` run submits at most 64 steps. Fed
+  requested meanwhile queue behind it. Without a host (`zipp py`, with or
+  without a GPU, and CPython for `zipp_gpu` itself) every callback runs before
+  the call returns. A `steps()` run submits at most 64 steps. Fed
   batches are copied when a step is posted, so refilling one buffer in place
   between queued steps is safe.
 - **Inference.** `torch.compile(model).prepare(x)` also works: the weights are
@@ -268,16 +276,19 @@ mask is therefore the same bits on WebGPU, WebGL2, WASM, JavaScript and native
 Zipp (checked in a real browser on WebGPU and WebGL2), but it is not PyTorch's
 (or eager Zipp's) random stream: compare statistics, not values. Kept elements
 are multiplied by float32(1/float32(1 - p)), exactly as PyTorch's CPU dropout,
-and the gradient is masked and scaled identically. Eval mode and p = 0 are the
+and the gradient is masked and scaled identically (eager CPU `F.dropout`,
+`nn.Dropout` and `dropout1d/2d/3d` keep the same `x * float32(1/float32(1 - p))`,
+so kept values match PyTorch's CPU dropout bit for bit). Eval mode and p = 0 are the
 identity and draw nothing; p = 1 multiplies by 0; `dropout1d`/`2d` (and
 unbatched `3d`) drop whole channels. Each dropout call takes one 32-bit seed
 from torch's default generator, so `torch.manual_seed` makes compiled calls
 reproducible. Per-call compilation draws new seeds every call; a prepared
 session draws them at `prepare()` and advances the step every executed step,
 so every step has a fresh mask. `torch.rand_like`/`torch.bernoulli` of graph
-tensors use the same generator. In-place dropout of a graph tensor is refused,
-and `randn` has no device form, because a normal draw needs transcendental
-functions that backends round differently.
+tensors use the same generator. In-place dropout of a graph tensor is refused.
+`randn` has no device form, because a normal draw needs transcendental functions
+that backends round differently; inside a prepared step it is drawn on the host
+every step and fed (see *CPU random draws in prepared steps*).
 
 Measured on an RTX 5090 in headless Chrome, driving the engine from Python
 through the gpu-lab adapter (784-256-10, batch 64, Adam, cross-entropy; warm
@@ -288,6 +299,7 @@ medians over 15 calls, 7 runs for the eight-step row):
 | WebGPU | 74.4 ms | 5.1 ms | 1.84 ms |
 | WebGL2 | 88.8 ms | 3.3 ms | 2.24 ms |
 | WebAssembly | 73.7 ms | 4.9 ms | 3.63 ms |
+| Native Zipp, WebGPU over wgpu/Vulkan | ≈154 ms | ≈3.9 ms | ≈3.5 ms |
 
 Of a `compiled()` call about 34 ms is the guest recording and validating the
 step (every input storage is scanned for finiteness in the interpreter), the
@@ -297,6 +309,146 @@ transport and the commit of 16 tensors. A prepared step feeds one 64x784 batch
 the 2.4 MB of weights, gradients and moments takes 26-29 ms (download, delivery
 into tensor storage, the finiteness check of every value, and the commit). These
 are one machine's numbers for one small model, not a benchmark of the backends.
+
+### Element selection (graph protocol version 4)
+
+Basic indexing of a graph tensor (integers, slices with positive steps, `None`,
+`...`) records one `slice` node and a reshape; `x[:, -1]`, `x[1::2]`, `h[b]` and
+`qkv[..., :d]` are all one strided box. `narrow`, `select`,
+`split`/`split_with_sizes`/`chunk`/`unbind` (methods and `torch.` functions) and
+`flip`/`fliplr`/`flipud` (a box with negative strides) are slices too.
+`torch.cat`/`concat`/`concatenate`/`stack` (and `hstack`/`vstack`/`column_stack`)
+write each piece into zeros with `slice_scatter`; eager tensors among the pieces
+are uploaded like any operand. One integer tensor or list index (`x[idx]`,
+`x[:, [2, 0]]`, a 0-d index) records `index_select` and a reshape to the index's
+shape; `torch.index_select`, `torch.gather`, `torch.take_along_dim` and the
+tensor methods record `index_select`/`gather`; `x[torch.arange(n), idx]` of a
+matrix records `gather`. `F.embedding` and `nn.Embedding` record `index_select`
+on the table whenever the table trains or the tokens are a step argument, so a
+prepared session feeds the tokens every step.
+
+Gradients follow PyTorch 2.11: a slice's gradient is its box written into zeros
+(`slice_scatter`), `cat`'s is each piece's slice, `index_select`'s (and the
+embedding's) accumulates with `index_add` into zeros and `gather`'s with
+`scatter_add` into zeros. The protocol fixes the accumulation order -- each
+element's base value, then every contribution in ascending index position, one
+float32 addition at a time, which is PyTorch's CPU order -- so a repeated token's
+embedding gradient is the same bits on every backend. The pieces of one
+`split`/`chunk`/`unbind` are merged by writing each into the others' buffer
+(PyTorch's split backward is a `cat`), while separately taken slices of one
+tensor add their zero-padded gradients, as they do in PyTorch; the two differ
+only in the sign of a zero. Eager slices and `cat`s of a parameter inside a
+training step (`self.pos[:T]`, `torch.cat([Wa, Wb], 1)`) are re-recorded on the
+parameter's input.
+
+Indices are integer tensors on the CPU. The graph's only dtype is float32, so an
+index is converted exactly (every extent is below 65536) and checked to lie in
+`[0, size)` when the step records, and a fed index at every step. Negative index
+values, boolean-mask indexing (a data-dependent shape), indices computed on the
+device (an `argmax`, a comparison), slices that select nothing, several tensor
+indices in one indexing (other than `x[torch.arange(n), idx]`), an integer
+combined with a tensor index, and indexing a parameter by a tensor on the CPU
+(`W[idx]`; use `torch.index_select` or `F.embedding`) raise `NotImplementedError`
+naming the case; a negative step raises PyTorch's own `ValueError`. Checked
+against PyTorch 2.11 (`crates/zipp-vm/tests/python_torch_gpu3.rs`: a transformer
+head with an embedding lookup, a sliced positional table, a split qkv projection,
+causal attention and last-token logits; `gather` and `x[arange, idx]` NLL;
+`cat`/`stack`/`chunk`/`unbind`/`narrow`/`flip`; strided and integer slicing;
+eager slices and cats of parameters): losses, gradients, weights and optimizer
+state within 1.1e-7 over four steps as per-call calls, eager Zipp and a prepared
+session, which equals the per-call calls bit for bit.
+
+### CPU random draws in prepared steps
+
+Inside a step being prepared, `torch.randn`, `torch.rand`, `torch.randint`,
+`torch.randperm`, `torch.normal`, `torch.multinomial`, `torch.randn_like`,
+`torch.rand_like`/`torch.randint_like` of CPU tensors and `torch.bernoulli` of a
+CPU tensor record as per-step feeds. While `prepare()` records, each draws from a
+copy of the generator's state, so preparing does not move torch's stream; every
+executed step then makes the same call on the host, from the real generator (or
+the `generator=` given), in the order the step made them, and feeds the values.
+A `steps()` run draws step by step, in order, before it is submitted, and a
+hosted session receives each queued step's own copy. The session therefore
+consumes the stream exactly as the same eager steps do: under the same
+`torch.manual_seed` a prepared session draws the same values as eager Zipp's steps
+and leaves the generator at the same point, and its results equal per-call
+compilation bit for bit (VAE reparameterisation with `randn_like`, input noise,
+`torch.normal` of a graph mean, `randint` negative samples looked up in an
+embedding, a `bernoulli` mask and `randint` class targets). A float32 draw
+becomes a graph input, so arithmetic on it records on the device
+(`mu + eps * std`); an integer draw stays a CPU tensor and is fed wherever the
+step reads it as class targets, an index or a mask. (Zipp's `randn` is its own,
+not PyTorch's bit stream; `rand`/`randint` follow PyTorch's.)
+
+Refused, naming why: an in-place draw (`normal_`, `uniform_`, `random_`,
+`bernoulli_`, `exponential_`, ...), `torch.poisson` or `nn.init` inside the step;
+an integer draw the graph does not read as targets, an index or a mask; a tensor
+an eager operation computed from an integer draw; `torch.multinomial` of a graph
+tensor, or of probabilities computed from a parameter, an argument or another
+draw; and a draw with `requires_grad=True`. Device-drawn dropout seeds still come
+from torch's generator at `prepare()`, so a step mixing dropout with CPU draws
+does not reproduce eager Zipp's stream.
+
+## Native GPU (`zipp py`)
+
+The native CLI runs `torch.compile` and `zipp_gpu` graphs on a hardware GPU when
+one is present. It embeds gpu-lab's JavaScript runtime, runs it unchanged in a
+second, trusted Zipp state, and gives it a WebGPU API backed by
+[wgpu](https://wgpu.rs): Vulkan, Direct3D 12 or Metal, loaded at run time. No SDK
+is needed to build, and a machine without a driver simply has no adapter.
+
+**Semantics.** A graph runs on the GPU synchronously, exactly where the CPU
+evaluator would have run it: `submit(callback)` calls back before it returns,
+plain loops of compiled calls train, `sync()` works anywhere, and a program's
+output does not depend on whether a GPU is present. The differences are
+`result.backend` / `prepared.backend` (`webgpu`), an added `stats["adapter"]`
+(for example `"NVIDIA GeForce RTX 5090 (vulkan, NVIDIA 616.92)"`), and float
+results within the tolerances below. The browser playground remains
+asynchronous.
+
+**Starting and choosing the GPU.** The GPU starts on a program's first graph
+(adapter discovery and runtime start-up, about 250 ms), so a program that never
+submits one pays nothing. Software rasterizers (WARP, lavapipe) are not used.
+`--no-gpu` (`zipp py --no-gpu main.py`) or `ZIPP_GPU=0` keeps the CPU evaluator.
+`ZIPP_GPU_BACKEND=vulkan|dx12|metal` picks the backend; the default order is
+Vulkan, then Direct3D 12, then Metal. `ZIPP_GPU_LOG=1` names the adapter when it
+starts. If an adapter exists but the runtime cannot start on it, one line on
+stderr says so and the program runs on the CPU.
+
+**Fallback.** Whatever the GPU cannot do goes to the CPU evaluator, with the
+result or error the CPU evaluator gives. A compiled call the GPU refuses or fails
+is re-evaluated on the CPU. A prepared session that fails on the GPU before its
+first step has run moves to the CPU (`prepared.backend` becomes `cpu-python`),
+unless it was prepared with `backend="webgpu"`. A failure after steps have run on
+the device is raised as the CPU evaluator raises it, and poisons the session.
+More than 16 live sessions, and on Direct3D 12 without `dxcompiler.dll` on `PATH`
+the index_add/scatter_add kernels, run on the CPU. Runs longer than 64 steps are
+split transparently.
+
+**Limits.** The device bounds a graph: a tensor up to the largest storage binding
+(1 GiB here), 8 GiB of logical graph storage, no estimated-work budget. The
+protocol's 512 nodes and 64 outputs still apply.
+
+**Accuracy.** gpu-lab's browser protocol cases pass 276/276 on the native backend
+with the browser harness's tolerances. The 112 exact cases (masks, where,
+dropout's `uniform` draws, slices, index_select, gather, and index_add/scatter_add
+accumulation order) match the JavaScript reference bit for bit. The Python
+fixtures print the same lines on the GPU as on the CPU evaluator: losses and
+state within 1.2e-7 of PyTorch 2.11 for prepared sessions, 5.9e-7 relative for
+the protocol v3/v4 families.
+
+**Speed** (RTX 5090, Vulkan):
+
+| Model | `compiled()` per call | `prepared.step` | `prepared.steps`, 8 per run, per step | CPU evaluator, `compiled()` |
+|---|---|---|---|---|
+| 784-256-10, batch 64, Adam | ≈154 ms | ≈3.9 ms | ≈3.5 ms | ≈2.8-4.4 s |
+| 784-1024-1024-10, batch 256, Adam | 1,854 ms | 9.0 ms | 8.2 ms | 118 s |
+| 784-2048-2048-10, batch 1024, Adam | 4,886 ms | 23.6 ms | 20.6 ms | 1,487 s |
+
+A per-call `compiled()` uploads and reads back every weight, gradient and moment.
+The runtime's per-element JavaScript checks on those tensors dominate it, so it
+is about twice the browser's. Prepared sessions are where the GPU pays off.
+Reproduce with `crates/zipp-cli/tests/native_gpu/bench.py`.
 
 ## Compatibility boundaries
 
@@ -344,9 +496,12 @@ third-party ML packages is not supported; within the bundled `torch`:
   into the tensor's storage.
 - **Autograd.** First-order gradients through all of the above;
   `create_graph=True` for elementwise, reduction, shape, indexing, matmul and
-  softmax operations (operations whose gradient is a dedicated kernel, such as
-  convolution, `prod`, `cumprod` and the fused nn losses, raise
-  `NotImplementedError` under `create_graph`); `autograd.grad`,
+  softmax operations (convolutions -- conv1d/2d/3d and the transposed
+  convolutions -- run their backward as differentiable transposed convolutions
+  and unfolded matmuls under `create_graph`, and keep the native kernel
+  otherwise; other operations whose gradient is a dedicated kernel, such as
+  `prod`, `cumprod` and the fused nn losses, raise `NotImplementedError` under
+  `create_graph`); `autograd.grad`,
   `torch.autograd.Function` (several outputs, `needs_input_grad`),
   `torch.autograd.functional` (`vjp`, `jacobian`, `hessian`), `grad_fn`,
   `register_hook`, `set_grad_enabled` (function, context manager or decorator),
@@ -383,7 +538,10 @@ third-party ML packages is not supported; within the bundled `torch`:
   and householder maps); Lazy modules (LazyLinear, LazyConv1d/2d/3d,
   LazyConvTranspose1d/2d/3d, LazyBatchNorm1d/2d/3d, LazyInstanceNorm1d/2d/3d)
   with `UninitializedParameter`/`UninitializedBuffer`, materialized in place
-  by the first forward or by loading a state dict. Module attribute
+  by the first forward or by loading a state dict; the elementwise functions,
+  matmul/`F.linear`, `cat`, `sum`/`mean` and the tensor methods given one raise
+  PyTorch's `ValueError` (other torch.* functions that read the shape first
+  raise `RuntimeError`). Module attribute
   assignment, non-persistent buffers, `nn.Buffer`, `state_dict(keep_vars=)`,
   `load_state_dict(strict=, assign=)` and dotted names follow PyTorch, so
   PyTorch state dicts load directly, including the spectral-norm
@@ -395,8 +553,22 @@ third-party ML packages is not supported; within the bundled `torch`:
   parameters and buffers. `nn.Buffer(t)` returns a `Buffer`-typed tensor
   rather than a plain `Tensor` (the runtime does not consult metaclass
   `__instancecheck__`), so `isinstance(b, nn.Buffer)` holds as in PyTorch while
-  `type(b)` differs. `DataParallel`, `SyncBatchNorm`, `grid_sample`, `ctc_loss`
-  and fractional max pooling are not implemented.
+  `type(b)` differs. `F.grid_sample` (4-D bilinear/nearest/bicubic, 5-D
+  bilinear/nearest; zeros/border/reflection padding; `align_corners`; gradients
+  for input and grid, following PyTorch's CPU kernels) and `F.affine_grid` (2-D
+  and 3-D); `F.ctc_loss`/`nn.CTCLoss` (padded or concatenated targets, tuple or
+  tensor lengths, `blank`, `reduction` with PyTorch's mean over target lengths,
+  `zero_infinity`; PyTorch's gradient, which assumes `log_softmax` inputs);
+  fractional max pooling (`F.fractional_max_pool2d/3d`,
+  `nn.FractionalMaxPool2d/3d`, with `_random_samples` reproducing PyTorch's
+  windows exactly); `nn.SyncBatchNorm` (local batch statistics, as PyTorch
+  without a process group) and `convert_sync_batchnorm`; and
+  `nn.DataParallel`/`nn.parallel.DistributedDataParallel` as single-device
+  wrappers (`.module`, `module.`-prefixed state_dict keys, forward passes
+  through; DDP follows PyTorch's CPU-module path but needs no `torch.distributed`
+  process group, which Zipp does not provide, and `register_comm_hook` hooks are
+  recorded but never run). `torch.grid_sampler`, `torch.affine_grid_generator`
+  and `torch.ctc_loss` take PyTorch's integer mode and reduction codes.
 - **`torch.optim`.** SGD, Adam, AdamW, RMSprop (`centered`, `maximize`),
   Adagrad, Adamax, NAdam, RAdam, Adadelta, ASGD, Rprop and LBFGS (one group,
   closure required), with PyTorch's option validation, `step(closure)`,
@@ -419,60 +591,150 @@ third-party ML packages is not supported; within the bundled `torch`:
   2**32 draws one 32-bit word per element where PyTorch draws 64 bits).
   `get_state`/`set_state` and `torch.get_rng_state`/`set_rng_state` capture the
   full generator state in Zipp's own layout, not interchangeable with PyTorch's.
+  `torch.poisson` draws with `torch.distributions.Poisson`'s sampler (inversion
+  below rate 10, transformed rejection above), so any rate is cheap.
 - **`torch.linalg`.** `det`, `slogdet`, `inv`/`inv_ex`, `solve`/`solve_ex`
   (vector and broadcast right-hand sides, `left=False`), `solve_triangular`,
   `cholesky`/`cholesky_ex`, `qr` (`reduced`/`complete`/`r`), `eigh`/`eigvalsh`
-  (`UPLO`), `svd`/`svdvals` (`full_matrices`), `pinv` (`hermitian`,
-  `atol`/`rtol`), `matrix_rank`, `lstsq`, `norm`/`vector_norm`/`matrix_norm`
-  (every order), `cond`, `matrix_power` (negative powers), `matrix_exp`,
-  `cross`, `multi_dot`, `vecdot`, `diagonal`, `vander`, `householder_product`,
-  `tensorinv`/`tensorsolve` and `lu`/`lu_factor`/`lu_solve` (no gradient), with
-  the top-level `torch.det`/`logdet`/`slogdet`/`inverse`/`cholesky`/
-  `cholesky_solve`/`cholesky_inverse`/`qr`/`svd` (returning V)/`pinverse`/
-  `matrix_power`/`matrix_exp` and tensor methods, over batches `[..., m, n]`
-  of float32/float64. Factorizations run in double precision on the CPU
-  (partial-pivoting LU, Householder QR with LAPACK's signs, Jacobi `eigh` and
-  SVD, Francis QR for `eig`) and round once to the input dtype; gradients are
-  PyTorch's formulas as tensor operations, so they batch, broadcast and support
+  (`UPLO`), `eig`/`eigvals`, `svd`/`svdvals` (`full_matrices`), `pinv`
+  (`hermitian`, `atol`/`rtol`), `matrix_rank`, `lstsq`,
+  `norm`/`vector_norm`/`matrix_norm` (every order), `cond`, `matrix_power`
+  (negative powers), `matrix_exp`, `cross`, `multi_dot`, `vecdot`,
+  `diagonal`, `vander`, `householder_product`, `tensorinv`/`tensorsolve` and
+  `lu`/`lu_factor`/`lu_solve`, with the top-level `torch.det`/`logdet`/
+  `slogdet`/`inverse`/`cholesky`/`cholesky_solve`/`cholesky_inverse`/`qr`/
+  `svd` (returning V)/`pinverse`/`matrix_power`/`matrix_exp` and tensor
+  methods, over batches `[..., m, n]` of float32/float64 (`solve`/`inv` and
+  the vector and Frobenius/1/inf matrix norms also take complex64/complex128;
+  complex solves run as the real 2n x 2n system, so complex64 results are
+  more accurate than PyTorch's float32 LAPACK, which differs by ~1e-5).
+  Factorizations run as native loops (partial-pivoting LU with LAPACK's
+  pivot choice, Householder QR with LAPACK's signs, Cholesky, triangular
+  solves, tridiagonal QL for `eigh`, one-sided Jacobi SVD, Hessenberg +
+  Francis QR with back-substituted eigenvectors for `eig`), charged to the
+  instruction budget; when the engine declines one (a budget that cannot
+  cover it, a recorded trace) the same algorithms run in Python (cyclic
+  Jacobi for `eigh`). Both compute in double precision and round once to
+  the input dtype: a 64x64 `svd` takes about 2 ms and `eigh` under 1 ms,
+  a 256x256 `inv`/`solve`/`cholesky`/`qr` under 10 ms. Gradients are
+  PyTorch's formulas as tensor operations (including `linalg.lu`,
+  `lu_factor` and `lu_solve`), so they batch, broadcast and support
   `create_graph=True`. Values and gradients match PyTorch 2.11 to 1e-12 in
-  float64 (2e-6 in float32); eigenvector and singular-vector signs may differ.
-  Failures raise `torch.linalg.LinAlgError` with PyTorch's messages. With no
-  complex dtype, `eig`/`eigvals` return real tensors for real spectra and raise
-  `NotImplementedError` otherwise. These are small-matrix algorithms (a 64x64
-  `svd` takes about 4 s).
-- **`torch.distributions`.** Normal, LogNormal, Uniform, Bernoulli,
+  float64 (2e-6 in float32); eigenvector and singular-vector signs may
+  differ. `eig`/`eigvals` return complex tensors (complex64 for float32
+  input, complex128 for float64), as PyTorch does, eigenvalues in the Schur
+  form's diagonal order (a conjugate pair with its positive imaginary part
+  first: LAPACK's order for most matrices, not guaranteed) and unit
+  eigenvectors whose largest component is real and positive; their
+  gradients (PyTorch's `linalg_eig_backward`, including its phase-invariance
+  check) flow to the real input. Failures raise `torch.linalg.LinAlgError`
+  with PyTorch's messages. Other functions refuse complex input with
+  `NotImplementedError`.
+- **Complex tensors.** `torch.complex64`/`cfloat` and `complex128`/`cdouble`
+  (`complex32` is named but cannot hold data) are stored as interleaved
+  (real, imaginary) float32/float64 pairs, PyTorch's layout. Creation by
+  `torch.complex`, `polar`, `view_as_complex`, `zeros`/`ones`/`full`/`eye`/
+  `tensor(..., dtype=)`, `randn`/`rand` (each part N(0, 1/2) for `randn`) and
+  `to(complex dtype)`; `.real`/`.imag` (and their setters), `real`/`imag`,
+  `conj`/`conj_physical`/`resolve_conj`, `abs`, `angle`, `sgn`, `isreal`,
+  `view_as_real`/`view_as_complex`; arithmetic with PyTorch's complex type
+  promotion (real with complex is complex, float64 with complex64 is
+  complex128), `pow` (with PyTorch's shortcuts for the exponents 2, 3, 0.5,
+  -0.5, -1, -2), `exp`/`log`/`log2`/`log10`/`log1p`/`expm1`/`sqrt`/`rsqrt`/
+  `sin`/`cos`/`tan`/`sinh`/`cosh`/`tanh`/`sigmoid`/`reciprocal`/`square`,
+  `matmul`/`mm`/`bmm`/`mv`/`dot`/`vdot`/`einsum`, `sum`/`mean`/`prod`/
+  `cumsum`/`cumprod`, `eq`/`ne`/`isclose`/`allclose`, the shape, indexing,
+  indexed-assignment and in-place ops, `finfo`, `is_complex`, printing as
+  PyTorch prints (`tensor([1.+2.j, ...])`), and checkpoints
+  (`ComplexFloatStorage`/`ComplexDoubleStorage`, both directions). Each
+  elementwise op computes in double precision and rounds once, so
+  complex64 results can differ from PyTorch's float arithmetic in the last
+  bit. Autograd follows PyTorch's convention for a real loss (the gradient
+  of a complex input is dL/d(re) + i dL/d(im); a real input of a complex
+  result takes the real part). `.real`, `.imag` and `conj()` are copies
+  (strided views copy here), and `is_conj()` is always False;
+  `view_as_real`/`view_as_complex` share the storage and its version
+  counter, but an in-place write through one does not update the other's
+  autograd history. Casting complex to real drops the imaginary part with
+  PyTorch's warning (printed to stderr once). Python has no complex numbers
+  on Zipp yet (`1+2j` does not compile), so `item()` and `tolist()` of a
+  complex tensor raise `NotImplementedError` (`float()` a `TypeError`);
+  pass complex scalars as 0-d complex tensors. Ops without a complex kernel (comparisons other than eq/ne, max/min, softmax,
+  activations, convolutions, ...) raise instead of reading the pairs as
+  reals.
+- **`torch.fft`.** `fft`/`ifft`, `rfft`/`irfft`, `hfft`/`ihfft` and their
+  2-D and N-D forms (`n`/`s`, `dim`, `norm` "backward"/"ortho"/"forward"),
+  `fftfreq`/`rfftfreq`, `fftshift`/`ifftshift`, plus `torch.stft`/`istft`
+  and the `hann`/`hamming`/`blackman`/`bartlett` windows; `torch.fft` is an
+  attribute after `import torch`. Transforms run as a native mixed-radix
+  Cooley-Tukey (lengths whose prime factors are at most 31) or Bluestein
+  (any other length) in double precision, rounded once to complex64/
+  complex128 (a JavaScript loop with the same bytes when the engine declines);
+  a 64 x 4096 float64 `fft` takes about 12 ms. Values match PyTorch 2.11 to
+  1e-12 (float64) and 2e-6 (float32) of each result's scale; gradients are
+  PyTorch's (FftC2C/FftR2C/FftC2R backward, differentiable again).
+  float16/bfloat16 inputs raise PyTorch's "Unsupported dtype" (under CPU
+  autocast they compute in float32, as PyTorch's autocast lists them).
+- **`torch.distributions`.** Every distribution in PyTorch 2.11's
+  `torch.distributions.__all__`: Normal, LogNormal, Uniform, Bernoulli,
   Categorical, OneHotCategorical (and StraightThrough), Binomial, Multinomial,
-  Poisson, Geometric, Exponential, Laplace, Cauchy, Gamma, Chi2, Beta,
-  Dirichlet, StudentT, HalfNormal, HalfCauchy, MultivariateNormal (covariance,
-  precision or `scale_tril`), LowRankMultivariateNormal, Independent,
-  MixtureSameFamily, TransformedDistribution (Exp, Affine, Sigmoid, Tanh,
-  Softmax, Softplus, Power, Abs, StickBreaking, Reshape, Independent and
-  Compose transforms), RelaxedBernoulli and RelaxedOneHotCategorical, with
-  PyTorch's shapes, `expand`, constraints, argument and sample validation,
-  `biject_to`/`transform_to`, and `kl_divergence`/`register_kl` for the pairs
-  PyTorch registers among these. `log_prob`, `entropy`, `cdf`/`icdf`, moments
-  and KL values and gradients match PyTorch 2.11 to 1e-12 in float64. `rsample`
-  is reparameterised where PyTorch's is; Gamma, Chi2, StudentT, Beta and
-  Dirichlet use the implicit Gamma gradient, with Dirichlet and Beta
-  differentiated through normalised Gamma draws. Samples come from torch's
-  generator, so they follow `manual_seed` but not PyTorch's streams.
-  `constraints`, `transforms` and `kl` are attributes of `torch.distributions`,
-  not importable submodules. Gumbel, Pareto, Weibull, NegativeBinomial and
-  Wishart are not implemented.
+  NegativeBinomial, Poisson, Geometric, Exponential, Laplace, Cauchy, Gumbel,
+  Gamma, Chi2, InverseGamma, Beta, Kumaraswamy, ContinuousBernoulli, Dirichlet,
+  StudentT, FisherSnedecor, HalfNormal, HalfCauchy, Pareto, GeneralizedPareto,
+  Weibull, VonMises, LogisticNormal, MultivariateNormal (covariance, precision
+  or `scale_tril`), LowRankMultivariateNormal, Wishart, LKJCholesky,
+  Independent, MixtureSameFamily, TransformedDistribution (Exp, Affine,
+  Sigmoid, Tanh, Softmax, Softplus, Power, Abs, StickBreaking, Reshape,
+  Independent, Compose, CorrCholesky, LowerCholesky, PositiveDefinite, Cat,
+  Stack and CumulativeDistribution transforms), RelaxedBernoulli and
+  RelaxedOneHotCategorical, with PyTorch's shapes, `expand`, constraints,
+  argument and sample validation, `biject_to`/`transform_to`, and
+  `kl_divergence`/`register_kl` for all 87 pairs PyTorch registers, including
+  the exponential-family Bregman divergence. `log_prob`, `entropy`,
+  `cdf`/`icdf`, moments and KL values and gradients match PyTorch 2.11 to 1e-12
+  in float64. `rsample` is reparameterised where PyTorch's is; Gamma, Chi2,
+  StudentT, Beta, Dirichlet, InverseGamma, FisherSnedecor and Wishart use the
+  implicit Gamma gradient, with Dirichlet and Beta differentiated through
+  normalised Gamma draws. Samples come from torch's generator, so they follow
+  `manual_seed` but not PyTorch's streams. Poisson and NegativeBinomial sample
+  any rate; Wishart samples by the Bartlett decomposition and redraws singular
+  samples as PyTorch intends (its own check is inverted); VonMises samples in
+  float64 by Best-Fisher rejection. LKJCholesky samples by the onion method as
+  published; PyTorch 2.11's sampler draws rows below the second too spread out,
+  so its samples do not follow its own `log_prob`, which Zipp matches.
+  `torch.distributions.constraints`, `.transforms`, `.kl` and one module per
+  PyTorch file (`from torch.distributions.normal import Normal`, `.utils`,
+  `.distribution`, ...) are importable and hold the package's own objects.
 - **`torch.amp`.** `autocast` (context manager and decorator; `torch.autocast`
   is the same class), `is_autocast_available`, `custom_fwd`/`custom_bwd`,
   `GradScaler` and the deprecated `torch.cuda.amp` spellings. `GradScaler("cpu")`
   follows PyTorch exactly (float32 scale, per-optimizer inf/NaN checks, skipped
-  steps, backoff/growth/interval, `update(new_scale)`, `state_dict`). CPU
-  `autocast` keeps PyTorch's autocast state but does not re-type operations:
-  matmul, linear and convolution inside it compute in the tensors' own dtypes.
+  steps, backoff/growth/interval, `update(new_scale)`, `state_dict`). An enabled
+  CPU `autocast` region re-types operations with PyTorch 2.11's CPU policy:
+  matmul/`@`/`mm`/`bmm`/`addmm`/`addbmm`/`baddbmm`, `F.linear`, the 1-D to 3-D
+  convolutions and transposed convolutions, `F.prelu`,
+  `F.scaled_dot_product_attention` and `linalg.vecdot` cast floating inputs to
+  the autocast dtype (so do the composites PyTorch routes through them:
+  contracting `einsum`/`tensordot`, `multi_dot`, `matrix_power`, `linalg.pinv`,
+  and the Linear, convolution, attention, Transformer, LSTM and RNN modules); the
+  losses, `prod`, `trace`, `cdist`, `quantile`/`nanquantile`, 3-D and unpooling
+  pools, reflect/replicate padding, `inverse`/`pinverse`/`cholesky*`/`qr`/`svd`,
+  the factorizing `torch.linalg` functions and `torch.fft` cast to float32;
+  `cat`/`stack`/`index_copy` promote to the widest input (raising PyTorch's
+  `prioritize` error for the other reduced format); every other op, and every
+  float64 input, keeps its dtype. The casts are differentiable (float32
+  parameters receive float32 gradients), backward runs with autocast off, and
+  weight casts are cached for the region when `cache_enabled`; `nn.GRU` keeps
+  its tensors' dtypes.
 - **Checkpoints.** `torch.save` and `torch.load` implement PyTorch's ZIP
   checkpoint format: pickle reads protocols 0-5 and writes protocol 2, and
   loading uses the same allowlist as PyTorch's `weights_only=True`. Tensors,
   `nn.Parameter`, `torch.Size`, `torch.device`, dtypes, bytes, bytearray, set
   and OrderedDict round-trip with PyTorch in both directions; float16,
-  bfloat16, int8 and int16 tensors are written and read as PyTorch's
-  `HalfStorage`/`BFloat16Storage`/`CharStorage`/`ShortStorage` records. Strided checkpoint
+  bfloat16, int8, int16, complex64 and complex128 tensors are written and
+  read as PyTorch's `HalfStorage`/`BFloat16Storage`/`CharStorage`/
+  `ShortStorage`/`ComplexFloatStorage`/`ComplexDoubleStorage` records (the
+  elements are copied as they are). Strided checkpoint
   tensors (transposes, slices, expands, storage offsets) load as contiguous
   copies; tensors that shared a storage in the file no longer share it after
   loading. `torch.save(module)` is refused: save `module.state_dict()` instead.
@@ -489,6 +751,12 @@ layers, bicubic/antialias, spectral norm, parametrizations and Lazy modules),
 [python_torch_distributions.rs](../crates/zipp-vm/tests/python_torch_distributions.rs),
 [python_torch_amp.rs](../crates/zipp-vm/tests/python_torch_amp.rs),
 [python_torch_gpu2.rs](../crates/zipp-vm/tests/python_torch_gpu2.rs),
+[python_torch_gpu3.rs](../crates/zipp-vm/tests/python_torch_gpu3.rs),
+[python_torch_nn3.rs](../crates/zipp-vm/tests/python_torch_nn3.rs) (grid_sample,
+CTC, fractional pooling, conv padding modes, parallel wrappers, conv second
+derivatives; fixtures regenerated by `fixtures/torch_nn3/gen.py`),
+[python_torch_complex.rs](../crates/zipp-vm/tests/python_torch_complex.rs),
+[python_torch_fft.rs](../crates/zipp-vm/tests/python_torch_fft.rs),
 [python_torch_optim.rs](../crates/zipp-vm/tests/python_torch_optim.rs) and
 [python_torch_gpu.rs](../crates/zipp-vm/tests/python_torch_gpu.rs).
 
@@ -497,9 +765,14 @@ layers, bicubic/antialias, spectral norm, parametrizations and Lazy modules),
 `torch.float16` (`torch.half`) and `torch.bfloat16` have PyTorch's value
 semantics: every operation that produces one rounds each result to the format
 (round to nearest even; float16 keeps subnormals and overflows to infinity),
-and conversions from float64 go through float32 as `c10::Half` does. Storage
-stays a `Float32Array` (every value of either format is a float32), so memory
-use is not halved. Promotion follows PyTorch: float16 with float32 is float32,
+and conversions from float64 go through float32 as `c10::Half` does. Each takes two bytes per element: a float16 storage is a `Float16Array` and a
+bfloat16 one a `Uint16Array` of the upper 16 bits of the float32 value, so a
+tensor uses half of float32's memory; kernels compute in float as before and
+round each result to the format once. Checkpoints read and write the 2-byte
+elements directly. `view(dtype)` among float16, bfloat16 and int16 (and between
+uint8 and int8) shares the storage as PyTorch's does, though the view keeps its
+own version counter; other pairs of one element size copy the bytes, and a view
+to a different element size rescales the last dimension. Promotion follows PyTorch: float16 with float32 is float32,
 float16 with bfloat16 is float32, an integer tensor with float16 is float16,
 uint8 with int8 is int16. With a Python scalar, add/sub/pow/remainder/atan2
 first round the scalar to the format, mul/div keep it in float, `s / x` is
@@ -510,9 +783,12 @@ rounds every partial product to the format, as PyTorch does. matmul, softmax
 and log_softmax agree with PyTorch within one ulp of the format (PyTorch's
 kernels sum in float in a blocked order). `rand` draws 11 (float16) or 8
 (bfloat16) bits per element from the CPU stream and `random_()` spans
-[0, 2**11] / [0, 2**8], matching PyTorch. `torch.optim`'s update
-(`p - lr * grad`) can round once more than PyTorch's fused `add_`, so an
-optimizer step on half parameters may differ by an ulp. `torch.compile` graphs
+[0, 2**11] / [0, 2**8], matching PyTorch. `torch.optim` updates
+float16/bfloat16 parameters with PyTorch's single-tensor sequence of in-place
+`add_(alpha=)`, `lerp_`, `addcmul_` and `addcdiv_`, matching PyTorch bit for bit
+over the elements its vectorized CPU loop covers (PyTorch's scalar tail, the
+last `numel % 32` elements on AVX-512, can differ by an ulp); float32/float64
+updates are unchanged. `torch.compile` graphs
 remain float32 only. `torch.int8` and `torch.int16` (`torch.short`) wrap modulo
 2**8 / 2**16 as uint8 does, refuse out-of-range Python values when a tensor is
 created or filled (as PyTorch does), and cannot be used as index tensors.
@@ -526,8 +802,10 @@ symmetric zero padding, dilation and groups (including depthwise convolution).
 Input, weight and optional bias gradients participate in eager autograd and
 ordinary optimizers. Try the [ordinary Torch CPU training example](../examples/python/conv2d/main.py)
 with `zipp py examples/python/conv2d`. Numeric and string (`'same'`, `'valid'`)
-padding are supported; `padding_mode` must be `'zeros'` (`F.pad` itself supports
-reflect, replicate and circular). `nn.Conv1d`/`F.conv1d` support stride,
+padding are supported; `nn.Conv1d/2d/3d` accept `padding_mode` `'zeros'`,
+`'reflect'`, `'replicate'` and `'circular'` (as PyTorch, the non-zero modes pad
+with `F.pad` and convolve with padding 0); transposed convolutions accept
+`'zeros'` only, as in PyTorch. `nn.Conv1d`/`F.conv1d` support stride,
 dilation, groups, `'same'` and unbatched input; `nn.ConvTranspose1d/2d/3d` support
 stride, padding, output_padding, groups and dilation. GPU compilation does not
 support convolution yet.
