@@ -338,5 +338,91 @@ def dispose():
     adapter.invalidate(); runtime.dispose(); e.dispose();
     console.log('cpu-js: steps queued in one call over a buffer refilled in place train on their own batches');
   }
+
+  // ---- protocol version 3: masks, where, clamp and dropout through the host ----
+  // fixtures/torch_gpu2/masks.py against PyTorch 2.11 as chained compiled
+  // calls (the "edges" case starts on every clamp/hardtanh/relu6/tie
+  // boundary), then a prepared dropout session whose device masks must be
+  // fresh every step and equal the ones zipp_gpu's reference draws from the
+  // recorded seed, with the synced gradient masked like the last step.
+  const masksSource = await fs.readFile(path.join(root, 'crates/zipp-vm/tests/fixtures/torch_gpu2/masks.py'), 'utf8');
+  const masksExpected = JSON.parse(await fs.readFile(path.join(root, 'crates/zipp-vm/tests/fixtures/torch_gpu2/masks_expected.json')));
+  for (const backend of ['cpu-js', 'wasm']) {
+    for (const kase of ['edges', 'tensorclamp', 'where', 'logical', 'activations']) {
+      const expected = masksExpected[kase];
+      const e = new Engine();
+      e.initPythonProject({main: `case = ${JSON.stringify(kase)}\n` + masksSource + `
+import json
+compiled = torch.compile(train_step, training=True)
+def chained(index):
+    compiled(*batches[index]).submit(lambda loss: print(json.dumps(state(loss))), lambda error: print('FAILED', str(error)))
+`}, 'main');
+      const runtime = await createRuntime({backend, wasmBytes});
+      const adapter = createPythonGPUAdapter(e, runtime, {allowExecute: true});
+      let worst = 0;
+      for (let index = 0; index < expected.length; index++) {
+        e.pythonCall('chained', [index]); adapter.drain(); await adapter.idle();
+        const [line] = e.takeOutput();
+        const actual = JSON.parse(line);
+        assert.equal(actual.length, expected[index].length, `${backend} ${kase} step ${index}`);
+        actual.forEach((value, i) => { worst = Math.max(worst, Math.abs(value - expected[index][i]) / (1 + Math.abs(expected[index][i]))); });
+      }
+      assert.ok(worst < 1e-6, `${backend} ${kase}: deviates from PyTorch by ${worst}`);
+      adapter.invalidate(); runtime.dispose(); e.dispose();
+      console.log(`${backend} ${kase}: ${expected.length} compiled version-3 steps track PyTorch (max relative error ${worst.toExponential(2)})`);
+    }
+    const e = new Engine();
+    e.initPythonProject({main: `import torch
+import zipp_gpu
+from torch import nn
+import torch.nn.functional as F
+w = nn.Parameter(torch.ones(32))
+optimizer = torch.optim.SGD([w], lr=0.0)
+def step(x):
+    optimizer.zero_grad()
+    out = F.dropout(x * w, 0.5)
+    out.sum().backward()
+    optimizer.step()
+    return out
+compiled = torch.compile(step, training=True)
+x = torch.ones(16, 32)
+prepared = None
+last = []
+def prepare():
+    global prepared
+    prepared = compiled.prepare(x, on_ready=lambda p: print('ready', p.backend), on_error=lambda error: print('FAILED', str(error)))
+def report(outs):
+    node = [n for n in prepared.session._program["nodes"] if n["op"] == "uniform"][0]
+    same = []
+    for i, out in enumerate(outs):
+        g = zipp_gpu.Graph()
+        u = zipp_gpu.execute_locally(g.program(u=g.uniform(tuple(node["shape"]), node["seed"], node["step"] + i)))["outputs"]["u"]["data"]
+        same.append([1.0 if v >= 0.5 else 0.0 for v in u] == [1.0 if v != 0 else 0.0 for v in out.flatten().tolist()])
+    last[:] = [outs[-1]]
+    print('masks', all(same), len(set(tuple(o.flatten().tolist()) for o in outs)), sorted(set(outs[0].flatten().tolist())))
+def run():
+    prepared.steps(report, [(x,)] * 4, on_error=lambda error: print('FAILED', str(error)))
+def sync():
+    prepared.sync(lambda p: print('grad', torch.equal(w.grad, (last[0] != 0).float().sum(0) * 2.0)), on_error=lambda error: print('FAILED', str(error)))
+def dispose():
+    prepared.dispose()
+`}, 'main');
+    const runtime = await createRuntime({backend, wasmBytes});
+    const adapter = createPythonGPUAdapter(e, runtime, {allowExecute: true});
+    const settle = async () => {
+      for (let i = 0; i < 16; i++) {
+        adapter.drain(); await adapter.idle();
+        if (adapter.pending === 0 && e.pythonCall('__zipp_py_pending_host', []) === 0) return;
+      }
+      throw new Error('host requests did not settle');
+    };
+    e.pythonCall('prepare', []); await settle();
+    e.pythonCall('run', []); await settle();
+    e.pythonCall('sync', []); await settle();
+    e.pythonCall('dispose', []); await settle();
+    assert.deepEqual(e.takeOutput(), [`ready ${backend}`, 'masks True 4 [0.0, 2.0]', 'grad True']);
+    adapter.invalidate(); runtime.dispose(); e.dispose();
+    console.log(`${backend}: a prepared dropout session draws a fresh device mask per step, equal to zipp_gpu's reference, and its gradient carries it`);
+  }
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

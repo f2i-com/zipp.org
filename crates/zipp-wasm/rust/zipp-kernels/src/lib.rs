@@ -54,7 +54,9 @@ mod kernels {
         for x in sm(o, n) { *x = value; }
     }
 
-    /// `op`: 0 add, 1 sub, 2 mul, 3 div. `mode`: 0 equal shapes, 1 scalar a, 2 scalar b.
+    /// `op`: 0 add, 1 sub, 2 mul, 3 div, 4 maximum, 5 minimum, then the 0/1
+    /// comparisons 6 eq, 7 ne, 8 lt, 9 le, 10 gt, 11 ge.
+    /// `mode`: 0 equal shapes, 1 scalar a, 2 scalar b.
     #[no_mangle]
     pub unsafe extern "C" fn binary(a: *const f32, b: *const f32, o: *mut f32, n: i32, mode: i32, op: i32) {
         let o = sm(o, n);
@@ -68,9 +70,63 @@ mod kernels {
         }
     }
 
+    /// maximum/minimum propagate a NaN from either side and give a tie
+    /// (-0 against +0 included) to `x`, as PyTorch's kernels and the
+    /// JavaScript reference do. A comparison with a NaN holds only for `ne`.
     #[inline(always)]
     fn apply(op: i32, x: f32, y: f32) -> f32 {
-        match op { 0 => x + y, 1 => x - y, 2 => x * y, _ => x / y }
+        let unordered = x != x || y != y;
+        let mask = |b: bool| if b { 1.0 } else { 0.0 };
+        match op {
+            0 => x + y, 1 => x - y, 2 => x * y, 3 => x / y,
+            4 => if unordered { f32::NAN } else if x < y { y } else { x },
+            5 => if unordered { f32::NAN } else if y < x { y } else { x },
+            6 => mask(x == y), 7 => mask(x != y), 8 => mask(x < y),
+            9 => mask(x <= y), 10 => mask(x > y), _ => mask(x >= y),
+        }
+    }
+
+    /// `where(c, a, b)` over four padded dimensions: `a` where the condition
+    /// is nonzero (a NaN counts as nonzero), `b` where it is zero of either
+    /// sign -- a test of the bits, identical in every backend.
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn where_strided(c: *const f32, a: *const f32, b: *const f32, o: *mut f32,
+        d0: i32, d1: i32, d2: i32, d3: i32, c0: i32, c1: i32, c2: i32, c3: i32,
+        a0: i32, a1: i32, a2: i32, a3: i32, b0: i32, b1: i32, b2: i32, b3: i32) {
+        let mut i = 0isize;
+        for x0 in 0..d0 { for x1 in 0..d1 { for x2 in 0..d2 {
+            let pc = c.offset((x0*c0 + x1*c1 + x2*c2) as isize);
+            let pa = a.offset((x0*a0 + x1*a1 + x2*a2) as isize);
+            let pb = b.offset((x0*b0 + x1*b1 + x2*b2) as isize);
+            for x3 in 0..d3 {
+                let pick = (*pc.offset((x3*c3) as isize)).to_bits() & 0x7fff_ffff != 0;
+                *o.offset(i) = if pick { *pa.offset((x3*a3) as isize) } else { *pb.offset((x3*b3) as isize) };
+                i += 1;
+            }
+        }}}
+    }
+
+    /// Chris Wellons' lowbias32 finalizer, wrapping as u32 arithmetic does
+    /// in every backend.
+    #[inline(always)]
+    fn mix(mut x: u32) -> u32 {
+        x ^= x >> 16; x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15; x = x.wrapping_mul(0x846c_a68b);
+        x ^ (x >> 16)
+    }
+
+    /// Counter-based uniform numbers in [0, 1): element i of a (seed, step)
+    /// draw is mix(mix(i ^ k2) + k1) >> 8 times 2^-24, k1 = mix(seed ^
+    /// 0x9e3779b9) and k2 = mix(step ^ k1). Integer-exact, so every backend
+    /// draws the same float32 bits.
+    #[no_mangle]
+    pub unsafe extern "C" fn uniform(o: *mut f32, n: i32, seed: i32, step: i32) {
+        let k1 = mix(seed as u32 ^ 0x9e37_79b9);
+        let k2 = mix(step as u32 ^ k1);
+        for (i, x) in sm(o, n).iter_mut().enumerate() {
+            *x = (mix(mix(i as u32 ^ k2).wrapping_add(k1)) >> 8) as f32 * (1.0 / 16_777_216.0);
+        }
     }
 
     /// NumPy broadcasting over four padded dimensions; a stride of 0 repeats an operand.

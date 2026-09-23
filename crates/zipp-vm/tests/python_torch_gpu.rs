@@ -267,15 +267,15 @@ torch.compile(mse_step, training=True)(x0, torch.ones(4, 3, dtype=torch.int64)).
 }
 
 #[test]
-fn prepared_steps_refuse_random_draws_and_step_created_tensors() {
-    // A prepared session replays one recorded program: a dropout mask or
-    // torch.randn noise drawn while recording would be the same at every
-    // step. prepare() refuses such a step; per-call compilation draws afresh
-    // each call and still accepts it, as does dropout outside training mode.
-    // Other tensors the step creates and reads as graph inputs (a constant,
-    // a value computed from a parameter under no_grad, a one-hot of the
-    // targets) would be frozen the same way and are refused too; the scalars
-    // eager arithmetic wraps are literals and stay accepted.
+fn prepared_steps_refuse_cpu_random_draws_and_values_a_step_would_change() {
+    // A prepared session replays one recorded program: torch.randn noise
+    // drawn on the CPU while recording would be the same at every step, so
+    // prepare() refuses it (per-call compilation draws afresh each call and
+    // still accepts it). Dropout draws its mask on the device, afresh every
+    // step, and is accepted. A constant the step builds is uploaded once and
+    // accepted; a value computed from a parameter under no_grad or a one-hot
+    // of the targets would be frozen and is refused, naming why; the scalars
+    // eager arithmetic wraps stay accepted (python_torch_gpu2.rs has more).
     let out = run(r#"
 import torch
 from torch import nn
@@ -342,24 +342,27 @@ for kind in ("constant", "no_grad from a parameter", "one_hot of a read target",
         print(kind, "->", error)
 "#)
     .unwrap();
-    let refused = "prepare() cannot record a step that draws random numbers (F.dropout or nn.Dropout in training mode, \
-                   torch.rand/randn/randint...): the prepared session would replay the same draw at every step. \
-                   Use per-call torch.compile, or draw outside the step and pass the tensor as an argument";
-    let created = "prepare(): the step creates a tensor while it runs and reads it as a graph input (a constant built inside the step, \
-                   or a value computed from parameters under no_grad or from Python state); the session would keep its prepare() value \
-                   at every step. Create constants outside the step, pass per-step values as arguments, and compute values from \
-                   parameters with graph operations";
+    let refused = "prepare() cannot record a step that draws random numbers on the CPU (torch.rand/randn/randint/normal...): \
+                   the prepared session would replay the same draw at every step. F.dropout, nn.Dropout and torch.rand_like or \
+                   torch.bernoulli of graph tensors draw on the device, afresh every step. Use per-call torch.compile, \
+                   or draw outside the step and pass the tensor as an argument";
+    let parameter = "prepare(): the step reads a tensor computed from a parameter outside autograd (under no_grad, or from \
+                     .detach()/.data) as a graph input; the session would keep its prepare() value at every step. Compute it from \
+                     the parameter with gradients enabled (it is then recorded on the device from the resident weights) or outside the step";
+    let argument = "prepare(): the step reads a tensor that an eager operation derived from a step argument (a one-hot, a cast, \
+                    arithmetic on class targets) as a graph input; the session would keep its prepare() value at every step. \
+                    Pass the derived tensor as the argument instead";
     assert_eq!(
         out,
         [
-            format!("dropout True {refused}"),
-            format!("nn.Dropout True {refused}"),
+            "dropout True accepted".to_owned(),
+            "nn.Dropout True accepted".to_owned(),
             format!("randn True {refused}"),
             "eval dropout False accepted".to_owned(),
             "torch.Size([1])".to_owned(),
-            format!("constant -> {created}"),
-            format!("no_grad from a parameter -> {created}"),
-            format!("one_hot of a read target -> {created}"),
+            "constant accepted".to_owned(),
+            format!("no_grad from a parameter -> {parameter}"),
+            format!("one_hot of a read target -> {argument}"),
             "graph scalars accepted".to_owned(),
         ]
     );
@@ -403,12 +406,12 @@ attempt("reshape-only indexing", lambda x, y: F.cross_entropy(model(x)[None][0][
         [
             "torch.erf -> This torch function is not supported by torch.compile: it cannot record it on a compiled graph tensor \
              (the supported operations are listed in docs/TORCH_COMPATIBILITY.md)",
-            "clamp -> Tensor.clamp is not supported by torch.compile",
+            "clamp accepted",
             "slice -> torch.compile supports indexing that only reshapes (None, full slices, index 0 of a size-1 dimension); \
              slicing and gathering elements are not supported",
             "gather -> torch.compile supports indexing that only reshapes (None, full slices, index 0 of a size-1 dimension); \
              slicing and gathering elements are not supported",
-            "comparison -> Comparisons are not supported by torch.compile",
+            "comparison accepted",
             "cube -> GPU power supports the exponents 2, 1, 0.5, -1 and -0.5",
             "item -> Tensor.item is not supported by torch.compile",
             "hasattr accepted",

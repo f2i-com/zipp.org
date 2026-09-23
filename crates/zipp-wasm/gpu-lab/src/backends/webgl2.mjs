@@ -33,6 +33,32 @@ float cdf(float x) {
   float c = 0.5 * erfcFit(abs(z));
   return z > 0.0 ? 1.0 - c : c;
 }
+// Binary operations by code: arithmetic, then maximum/minimum (NaN from
+// either side, a tie to x) and 0/1 comparisons (NaN compares unequal). NaN is
+// tested by bits, never trusted to an ordered comparison the driver may fold.
+float binop(int o, float x, float y) {
+  if (o == 0) return x + y;
+  if (o == 1) return x - y;
+  if (o == 2) return x * y;
+  if (o == 3) return x / y;
+  bool unordered = isNaN(x) || isNaN(y);
+  // A tie is decided first: under ANGLE's Direct3D backend -0 < +0 came out
+  // true (or the select became max(), whose zero sign is the driver's), and
+  // -0 against +0 is exactly the tie that must go to x.
+  if (o == 4) return unordered ? x + y : x == y ? x : (x < y ? y : x);
+  if (o == 5) return unordered ? x + y : x == y ? x : (y < x ? y : x);
+  if (o == 7) return unordered || x != y ? 1.0 : 0.0;
+  if (unordered) return 0.0;
+  if (o == 6) return x == y ? 1.0 : 0.0;
+  if (o == 8) return x < y ? 1.0 : 0.0;
+  if (o == 9) return x <= y ? 1.0 : 0.0;
+  if (o == 10) return x > y ? 1.0 : 0.0;
+  return x >= y ? 1.0 : 0.0;
+}
+// The uniform generator's hash: lowbias32, in uint arithmetic modulo 2^32.
+uint mix32(uint x) {
+  x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; return x ^ (x >> 16u);
+}
 float tanhS(float x) {
   if (isNaN(x)) return x;
   float a = abs(x);
@@ -178,8 +204,17 @@ const KERNELS = {
   }`)],
   binary: [['A', 'B'], each(`int ia = i; int ib = i;
   if (mode == 1) ia = 0; else if (mode == 2) ib = 0; else if (mode == 3) { ia = strided(i, sa); ib = strided(i, sb); }
-  float x = A(ia); float y = B(ib);
-  value = op == 0 ? x + y : op == 1 ? x - y : op == 2 ? x * y : x / y;`)],
+  value = binop(op, A(ia), B(ib));`)],
+  // where(c, a, b) (A = condition, B = a, C = b): nonzero bits (NaN included) pick B.
+  // g carries b's strides, the fourth uniform vector the prelude declares.
+  where: [['A', 'B', 'C'], each(`int ic = i; int ia = i; int ib = i;
+  if (mode == 3) { ic = strided(i, sa); ia = strided(i, sb); ib = strided(i, g); }
+  value = (floatBitsToUint(A(ic)) & 0x7fffffffu) != 0u ? B(ia) : C(ib);`)],
+  // Seed and step arrive as 16-bit halves (d), so no uniform int is ever
+  // asked to hold a value past 2^31.
+  uniform: [[], each(`uint k1 = mix32((uint(d.x) | (uint(d.y) << 16u)) ^ 0x9e3779b9u);
+  uint k2 = mix32((uint(d.z) | (uint(d.w) << 16u)) ^ k1);
+  value = float(mix32(mix32(uint(i) ^ k2) + k1) >> 8u) * 5.9604644775390625e-8;`)],
   gather: [['A'], each('value = A(strided(i, sa));')],
   pair: [['A'], each('int j = i * 2; value = A(j); if (j + 1 < len) value += A(j + 1);')],
   scale: [['A'], each('value = A(i) / f.x;')],
@@ -268,7 +303,9 @@ const KERNELS = {
   value = count == 3 || (A(i) > 0.5 && count == 2) ? 1.0 : 0.0;`)],
 };
 const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
-const BINARY = {add: 0, sub: 1, mul: 2, div: 3}, MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
+const BINARY = {add: 0, sub: 1, mul: 2, div: 3, maximum: 4, minimum: 5, eq: 6, ne: 7, lt: 8, le: 9, gt: 10, ge: 11};
+const MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
+const halves = v => [v & 0xffff, v >>> 16];
 const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_update: 4};
 // Enough invocations to fill a GPU, and the smallest chunk of the reduced axis
 // worth giving one. Both are round numbers, not tuned constants: the win is in
@@ -482,11 +519,14 @@ export class WebGL2Backend {
     try {
       switch(n.op) {
         case 'full':this.dispatch('fill',{f:[n.value,0,0,0]},[],out);break;
-        case 'add':case 'sub':case 'mul':case 'div':
+        case 'add':case 'sub':case 'mul':case 'div':case 'maximum':case 'minimum':
+        case 'eq':case 'ne':case 'lt':case 'le':case 'gt':case 'ge':
           this.dispatch('binary',{mode:MODE[n.mode],op:BINARY[n.op],...(n.mode==='general'?{d:n.dims,sa:n.aStrides,sb:n.bStrides}:{})},refs,out);break;
         case 'relu':case 'positive':case 'neg':case 'exp':case 'log':case 'sqrt':
         case 'tanh':case 'sigmoid':case 'gelu':case 'gelu_grad':this.dispatch('unary',{op:UNARY[n.op]},refs,out);break;
         case 'transpose':case 'permute':this.dispatch('gather',{d:n.dims,sa:n.srcStrides},refs,out);break;
+        case 'where':this.dispatch('where',{mode:n.mode==='same'?0:3,d:n.dims,sa:n.cStrides,sb:n.aStrides,g:n.bStrides},refs,out);break;
+        case 'uniform':this.dispatch('uniform',{d:[...halves(n.seed),...halves(n.step)]},[],out);break;
         case 'sum':case 'mean':
           if(n.whole){
             if(n.op==='sum'){this.pairwise(a,out);break;}

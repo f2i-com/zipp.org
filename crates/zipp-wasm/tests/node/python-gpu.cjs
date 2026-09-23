@@ -128,6 +128,39 @@ print("recorded")
     adapter.invalidate(); runtime.dispose(); e.dispose();
   }
 
+  // Protocol version 3 (comparisons, maximum/minimum, where, uniform) through
+  // the host: the answer equals zipp_gpu's own reference bit for bit, and
+  // torch.compile records comparisons, where, clamp and hardtanh.
+  for (const backend of ["cpu-js", "wasm"]) {
+    const e = new Engine();
+    const runtime = await createRuntime({ backend, wasmBytes });
+    const adapter = createPythonGPUAdapter(e, runtime, { allowExecute: true });
+    e.initPythonProject({ main: `import zipp_gpu
+import torch
+import torch.nn.functional as F
+g = zipp_gpu.Graph()
+a = g.tensor([[0.5, -1.0, 2.0], [2.0, 0.0, -0.5]])
+b = g.tensor([2.0, 0.0, -1.0])
+outs = {op: getattr(a, op)(b) for op in ("eq", "ne", "lt", "le", "gt", "ge", "maximum", "minimum")}
+outs["pick"] = g.where(a > 0, b, a)
+outs["u"] = g.uniform((3, 257), 2 ** 31 + 5, 7)
+outs["drop"] = a * (g.uniform((2, 3), 99, 4) >= 0.25) * (1 / 0.75)
+program = g.program(**outs)
+reference = zipp_gpu.execute_locally(program)["outputs"]
+def show(result):
+    print("v3", result["backend"], program["version"], all(result["outputs"][k]["data"] == reference[k]["data"] for k in reference))
+g.submit(show, lambda error: print("failed", error), **outs)
+x = torch.tensor([[1.5, -2.0, 0.25], [0.0, 3.0, -0.75]])
+fn = lambda x: torch.where(x > 0, x, x * 0.1).clamp(-1, 1) + F.hardtanh(x * 2) + x.masked_fill(x == 0, 5.0)
+torch.compile(fn)(x).submit(lambda y: print("torch v3", torch.allclose(y, fn(x), atol=1e-6)))
+` }, "main");
+    adapter.drain();
+    await adapter.idle();
+    eq(`${backend}: version-3 graphs equal zipp_gpu's reference; compiled masks, where, clamp and hardtanh match eager`, e.takeOutput(),
+      [`v3 ${backend} 3 True`, "torch v3 True"]);
+    adapter.invalidate(); runtime.dispose(); e.dispose();
+  }
+
   // Run the actual portable Life module: a glider shifts diagonally after 4 steps.
   const lifeSource = await readFile(path.join(__dirname, "../../../../examples/python/gpu/life.py"), "utf8");
   for (const backend of ["cpu-js", "wasm"]) {

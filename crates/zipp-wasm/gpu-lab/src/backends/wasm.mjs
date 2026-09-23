@@ -1,5 +1,5 @@
 import {check} from '../graph.mjs';
-const BINARY={add:0,sub:1,mul:2,div:3},MODE={same:0,aScalar:1,bScalar:2};
+const BINARY={add:0,sub:1,mul:2,div:3,maximum:4,minimum:5,eq:6,ne:7,lt:8,le:9,gt:10,ge:11},MODE={same:0,aScalar:1,bScalar:2};
 const UNARY={relu:0,positive:1,neg:2,exp:3,log:4,sqrt:5,tanh:6,sigmoid:7,gelu:8,gelu_grad:9};
 // The kernel takes the format as a number; both pack 256 values to a block.
 // 2 is `matmul_fixed` reading a plain f32 weight; the float kernels have
@@ -63,13 +63,18 @@ export class WasmBackend {
     switch(n.op) {
       case 'input': this.view(o).set(n.data); break;
       case 'full': e.fill(o.ptr,n.size,n.value); break;
-      case 'add': case 'sub': case 'mul': case 'div':
+      case 'add': case 'sub': case 'mul': case 'div': case 'maximum': case 'minimum':
+      case 'eq': case 'ne': case 'lt': case 'le': case 'gt': case 'ge':
         if (n.mode !== 'general') e.binary(a,b,o.ptr,n.size,MODE[n.mode],BINARY[n.op]);
         else e.binary_strided(a,b,o.ptr,BINARY[n.op],...n.dims,...n.aStrides,...n.bStrides);
         break;
       case 'relu': case 'positive': case 'neg': case 'exp': case 'log': case 'sqrt':
       case 'tanh': case 'sigmoid': case 'gelu': case 'gelu_grad': e.unary(a,o.ptr,n.size,UNARY[n.op]); break;
       case 'transpose': case 'permute': e.gather4(a,o.ptr,...n.dims,...n.srcStrides); break;
+      // refs are [condition, a, b]; `c` below is the third pointer, b's.
+      case 'where': e.where_strided(a,b,c,o.ptr,...n.dims,...n.cStrides,...n.aStrides,...n.bStrides); break;
+      // Seed and step cross as i32 bit patterns; the kernel reads them as u32.
+      case 'uniform': e.uniform(o.ptr,n.size,n.seed|0,n.step|0); break;
       case 'matmul':
         if (n.bQuant) {
           // Four decoded columns at a time; the scratch is released with the mark.

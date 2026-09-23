@@ -29,6 +29,38 @@ fn cdf(x: f32) -> f32 {
   let c = 0.5 * erfc_fit(abs(z));
   return select(c, 1.0 - c, z > 0.0);
 }
+// NaN by bits: WGSL lets a compiler assume no NaN reaches a comparison.
+fn is_nan(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
+// Binary operations by code: arithmetic, then maximum/minimum (NaN from either
+// side, a tie to x) and 0/1 comparisons (NaN compares unequal).
+fn binop(o: u32, x: f32, y: f32) -> f32 {
+  switch o {
+    case 0u: { return x + y; }
+    case 1u: { return x - y; }
+    case 2u: { return x * y; }
+    case 3u: { return x / y; }
+    default: {}
+  }
+  let unordered = is_nan(x) || is_nan(y);
+  // A tie (-0 against +0 included) goes to x before any ordering is asked,
+  // so no compiler rewrite into max()/min() can pick the zero's sign.
+  if (o == 4u) { return select(select(select(x, y, x < y), x, x == y), x + y, unordered); }
+  if (o == 5u) { return select(select(select(x, y, y < x), x, x == y), x + y, unordered); }
+  if (o == 7u) { return select(0.0, 1.0, unordered || x != y); }
+  if (unordered) { return 0.0; }
+  switch o {
+    case 6u: { return select(0.0, 1.0, x == y); }
+    case 8u: { return select(0.0, 1.0, x < y); }
+    case 9u: { return select(0.0, 1.0, x <= y); }
+    case 10u: { return select(0.0, 1.0, x > y); }
+    default: { return select(0.0, 1.0, x >= y); }
+  }
+}
+// The uniform generator's hash: lowbias32 in u32 arithmetic, which wraps.
+fn mix32(v: u32) -> u32 {
+  var x = v;
+  x = x ^ (x >> 16u); x = x * 0x7feb352du; x = x ^ (x >> 15u); x = x * 0x846ca68bu; return x ^ (x >> 16u);
+}
 fn tanh_s(x: f32) -> f32 {
   if (x != x) { return x; }
   let a = abs(x);
@@ -73,10 +105,14 @@ const KERNELS = {
   O[i] = r;`)],
   binary: [['A', 'B'], each(`var ia = i; var ib = i;
   if (P.mode == 1u) { ia = 0u; } else if (P.mode == 2u) { ib = 0u; } else if (P.mode == 3u) { ia = strided(i, P.sa); ib = strided(i, P.sb); }
-  let x = A[ia]; let y = B[ib];
-  var r: f32;
-  switch P.op { case 0u: { r = x + y; } case 1u: { r = x - y; } case 2u: { r = x * y; } default: { r = x / y; } }
-  O[i] = r;`)],
+  O[i] = binop(P.op, A[ia], B[ib]);`)],
+  // where(c, a, b) (C = condition): nonzero bits (NaN included) pick A. g holds b's strides.
+  where: [['C', 'A', 'B'], each(`var ic = i; var ia = i; var ib = i;
+  if (P.mode == 3u) { ic = strided(i, P.sa); ia = strided(i, P.sb); ib = strided(i, P.g); }
+  O[i] = select(B[ib], A[ia], (bitcast<u32>(C[ic]) & 0x7fffffffu) != 0u);`)],
+  // Counter-based uniform numbers: g.x the seed, g.y the step.
+  uniform: [[], each(`let k1 = mix32(P.g.x ^ 0x9e3779b9u); let k2 = mix32(P.g.y ^ k1);
+  O[i] = f32(mix32(mix32(i ^ k2) + k1) >> 8u) * 5.9604644775390625e-8;`)],
   gather: [['A'], each('O[i] = A[strided(i, P.sa)];')],
   pair: [['A'], each('let j = i * 2u; var other = 0.0; if (j + 1u < P.len) { other = A[j + 1u]; } O[i] = A[j] + other;')],
   scale: [['A'], each('O[i] = A[i] / P.f.x;')],
@@ -507,7 +543,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 }`],
 };
 const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
-const BINARY = {add: 0, sub: 1, mul: 2, div: 3}, MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
+const BINARY = {add: 0, sub: 1, mul: 2, div: 3, maximum: 4, minimum: 5, eq: 6, ne: 7, lt: 8, le: 9, gt: 10, ge: 11};
+const MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
 const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_update: 4};
 // One 256-byte uniform slot per dispatch in a single buffer (dynamic offsets),
 // so a bind group depends only on its kernel and storage buffers and is
@@ -688,12 +725,18 @@ export class WebGPUBackend {
     try {
       switch (n.op) {
         case 'full': await this.dispatch('fill', (u, f) => {u[0] = n.size; f[20] = n.value;}, [], out, n.size); break;
-        case 'add': case 'sub': case 'mul': case 'div':
+        case 'add': case 'sub': case 'mul': case 'div': case 'maximum': case 'minimum':
+        case 'eq': case 'ne': case 'lt': case 'le': case 'gt': case 'ge':
           await this.dispatch('binary', u => {u[0] = n.size; u[1] = MODE[n.mode]; u[2] = BINARY[n.op];
             if (n.mode === 'general') {u.set(n.dims, 4); u.set(n.aStrides, 8); u.set(n.bStrides, 12);}}, refs, out, n.size); break;
         case 'relu': case 'positive': case 'neg': case 'exp': case 'log': case 'sqrt':
         case 'tanh': case 'sigmoid': case 'gelu': case 'gelu_grad':
           await this.dispatch('unary', u => {u[0] = n.size; u[2] = UNARY[n.op];}, refs, out, n.size); break;
+        case 'where':
+          await this.dispatch('where', u => {u[0] = n.size; u[1] = n.mode === 'same' ? 0 : 3;
+            u.set(n.dims, 4); u.set(n.cStrides, 8); u.set(n.aStrides, 12); u.set(n.bStrides, 16);}, refs, out, n.size); break;
+        case 'uniform':
+          await this.dispatch('uniform', u => {u[0] = n.size; u[16] = n.seed >>> 0; u[17] = n.step >>> 0;}, [], out, n.size); break;
         case 'transpose': case 'permute':
           await this.dispatch('gather', u => {u[0] = n.size; u.set(n.dims, 4); u.set(n.srcStrides, 8);}, refs, out, n.size); break;
         case 'sum': case 'mean':

@@ -17,10 +17,15 @@ export function builder() {
     full: (shape, value) => add('full', {shape, value}),
     op: (op, a, b, fields = {}) => add(op, b === undefined ? {a, ...fields} : {a, b, ...fields}),
     node: (op, fields) => add(op, fields),
-    program: outputs => ({version: 2, nodes, outputs: Object.entries(outputs).map(([name, id]) => ({name, id}))}),
+    // Labelled 3 once a version-3 operation is used, as zipp_gpu labels it.
+    program: outputs => ({version: nodes.some(n => V3.has(n.op)) ? 3 : 2, nodes,
+      outputs: Object.entries(outputs).map(([name, id]) => ({name, id}))}),
   };
 }
 const UNARY = ['relu', 'positive', 'neg', 'exp', 'log', 'sqrt', 'tanh', 'sigmoid', 'gelu', 'gelu_grad'];
+const V3 = new Set(['maximum', 'minimum', 'eq', 'ne', 'lt', 'le', 'gt', 'ge', 'where', 'uniform']);
+/** Values on a coarse grid, so comparisons and maximum/minimum meet real ties. */
+const grid = (rnd, n) => Array.from({length: n}, () => Math.round(rnd(-2, 2) * 2) / 2);
 /** [name, program] pairs; each program's outputs are compared element by element. */
 export function opCases() {
   const cases = [], rnd = seeded(97);
@@ -74,7 +79,70 @@ export function opCases() {
       m: m1, v: v1, adam: g.node('adam_update', {a: p, b: m1, c: v1, lr: 0.001, beta1: 0.9, beta2: 0.999, eps: 1e-8, step: 3}),
       lerpHigh: g.op('adam_m', m, grad, {beta1: 0.25})};
   });
+  // Version 3. Every case named `exact ...` is integer-exact or a selection,
+  // so the browser harness holds each backend to bit equality with cpu-js.
+  for (const op of ['maximum', 'minimum', 'eq', 'ne', 'lt', 'le', 'gt', 'ge']) for (const [sa, sb] of broadcasts)
+    one(`exact ${op} [${sa}] with [${sb}]`, g => {
+      const a = g.input(grid(rnd, sa.reduce((x, y) => x * y, 1)), sa), b = g.input(grid(rnd, sb.reduce((x, y) => x * y, 1)), sb);
+      return {result: g.op(op, a, b), reversed: g.op(op, b, a)};
+    });
+  for (const [sc, sa, sb] of [[[3], [3], [3]], [[4, 1], [1, 3], [3]], [[], [2, 3], []], [[2, 1, 3], [4, 1], [1]],
+    [[2, 3, 4, 5], [3, 1, 5], [1, 4, 1]], [[1025], [1025], [1]], [[3, 129], [129], [3, 1]]])
+    one(`exact where [${sc}] ? [${sa}] : [${sb}]`, g => {
+      const size = s => s.reduce((x, y) => x * y, 1);
+      const c = g.input(grid(rnd, size(sc)).map(v => v > 0 ? 1 : v < 0 ? 0 : -0), sc);
+      const a = g.random(sa, rnd), b = g.random(sb, rnd), mask = g.op('gt', g.random(sc, rnd), g.full([], 0));
+      return {result: g.node('where', {c, a, b}), masked: g.node('where', {c: mask, a: b, b: a})};
+    });
+  for (const [shape, seed, step] of [[[1], 0, 1], [[7], 1, 2], [[1025], 0xffffffff, 2 ** 31], [[3, 257], 2 ** 31 + 5, 7], [[2, 3, 4, 5], 12345, 3]])
+    one(`exact uniform [${shape}] seed ${seed} step ${step}`, g => ({result: g.node('uniform', {shape, seed, step})}));
+  one('exact NaN and signed-zero semantics', g => {
+    // 0/0 is NaN in-graph (inputs must be finite); only finite values are read back.
+    const nan = g.op('div', g.full([2], 0), g.full([2], 0)), one = g.input([1, -1]);
+    const pz = g.input([0, 0]), nz = g.input([-0, -0]), mask = x => g.op('eq', x, x);
+    return {maxNan: mask(g.op('maximum', nan, one)), maxNanRight: mask(g.op('maximum', one, nan)),
+      minNan: mask(g.op('minimum', one, nan)), eq: g.op('eq', nan, one), ne: g.op('ne', nan, nan), lt: g.op('lt', nan, one),
+      ge: g.op('ge', one, nan), pickNan: g.node('where', {c: nan, a: one, b: pz}), pickNegZero: g.node('where', {c: nz, a: one, b: pz}),
+      maxZeros: g.op('maximum', nz, pz), maxZerosRight: g.op('maximum', pz, nz), minZeros: g.op('minimum', pz, nz),
+      minZerosLeft: g.op('minimum', nz, pz), zeroLt: g.op('lt', nz, pz), zeroGt: g.op('gt', pz, nz), zeroEq: g.op('eq', nz, pz)};
+  });
+  one('uniform dropout mask and its scale', g => {
+    const u = g.node('uniform', {shape: [16, 33], seed: 99, step: 4}), keep = g.op('ge', u, g.full([], 0.25));
+    const x = g.random([16, 33], rnd), noise = g.op('mul', keep, g.full([], 1 / 0.75));
+    return {out: g.op('mul', x, noise), keep: g.op('mean', keep)};
+  });
   return cases;
+}
+
+/**
+ * A prepared dropout MLP: relu hidden layer, dropout(p) drawn on the device
+ * by `uniform` (its step advances every session step, so every step has a
+ * fresh mask), mean cross-entropy and SGD, the four parameters carried. x
+ * (node 0) and the class targets (node 1) are fed; `noise` is readable so a
+ * harness can see that masks change. Returns the program and output names.
+ */
+export function dropoutSessionProgram({sizes = [12, 24, 5], batch = 8, seed = 3, p = 0.25, lr = 0.1, dropSeed = 777} = {}) {
+  const g = builder(), rnd = seeded(seed), [f, h, c] = sizes;
+  const x = g.node('input', {shape: [batch, f]}), y = g.node('input', {shape: [batch]});
+  const W1 = g.random([f, h], rnd, -0.5, 0.5), b1 = g.random([h], rnd, -0.1, 0.1);
+  const W2 = g.random([h, c], rnd, -0.5, 0.5), b2 = g.random([c], rnd, -0.1, 0.1);
+  const pre = g.op('add', g.op('matmul', x, W1), b1), hid = g.op('relu', pre);
+  const keep = g.op('ge', g.node('uniform', {shape: [batch, h], seed: dropSeed, step: 1}), g.full([], p));
+  const noise = g.op('mul', keep, g.full([], Math.fround(1 / Math.fround(1 - p))));
+  const dropped = g.op('mul', hid, noise), logits = g.op('add', g.op('matmul', dropped, W2), b2);
+  const loss = g.op('cross_entropy', logits, y), delta = g.op('cross_entropy_grad', logits, y);
+  const dW2 = g.op('matmul', g.op('transpose', dropped), delta), db2 = g.op('sum', delta, undefined, {axis: 0});
+  const back = g.op('mul', g.op('mul', g.op('matmul', delta, g.op('transpose', W2)), noise), g.op('positive', pre));
+  const dW1 = g.op('matmul', g.op('transpose', x), back), db1 = g.op('sum', back, undefined, {axis: 0});
+  const outputs = {loss, noise};
+  [[W1, dW1], [b1, db1], [W2, dW2], [b2, db2]].forEach(([param, grad], i) => {
+    outputs[`p${i}`] = g.op('sgd_update', param, grad, {lr});
+    g.nodes[param].carry = `p${i}`;
+  });
+  const program = g.program(outputs);
+  return {program, resident: ['p0', 'p1', 'p2', 'p3'],
+    batches: (count, rnd2 = seeded(seed + 1)) => Array.from({length: count}, () => ({inputs: {
+      0: Array.from({length: batch * f}, () => rnd2(-1, 1)), 1: Array.from({length: batch}, () => Math.floor(rnd2(0, c)))}}))};
 }
 
 /**

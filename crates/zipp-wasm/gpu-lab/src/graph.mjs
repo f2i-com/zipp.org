@@ -46,7 +46,38 @@ export const QUANT = Object.freeze({
 });
 export function sizeOf(shape) { return shape.reduce((a, b) => a * b, 1); }
 // Operation families. Every name here is a fixed kernel; none becomes code.
-export const BINARY_OPS = Object.freeze(['add', 'sub', 'mul', 'div']);
+export const BINARY_OPS = Object.freeze(['add', 'sub', 'mul', 'div', 'maximum', 'minimum', 'eq', 'ne', 'lt', 'le', 'gt', 'ge']);
+/** Comparisons: float32 masks, 1 where the relation holds and 0 elsewhere (a NaN operand holds only `ne`). */
+export const COMPARE_OPS = Object.freeze(['eq', 'ne', 'lt', 'le', 'gt', 'ge']);
+/**
+ * Operations version 3 added: `maximum`/`minimum`, the comparisons, `where`
+ * and the counter-based `uniform`. Every version-1 and version-2 graph means
+ * the same thing under version 3; a writer labels a graph 3 only once it uses
+ * one of these, so an older host refuses what it cannot run instead of
+ * misreading it.
+ */
+export const VERSION_THREE_OPS = Object.freeze([...COMPARE_OPS, 'maximum', 'minimum', 'where', 'uniform']);
+/**
+ * The `uniform` bit generator: a keyed hash of (seed, step, element index),
+ * integer arithmetic modulo 2^32 only, so every backend produces the same bits
+ * and none depends on a transcendental function or a float rounding mode.
+ * `mix` is Chris Wellons' lowbias32 finalizer. The value is the top 24 bits
+ * times 2^-24: a float32 in [0, 1) that every backend forms exactly.
+ */
+export function uniformMix(x) {
+  x = (x ^ (x >>> 16)) >>> 0; x = Math.imul(x, 0x7feb352d) >>> 0;
+  x = (x ^ (x >>> 15)) >>> 0; x = Math.imul(x, 0x846ca68b) >>> 0;
+  return (x ^ (x >>> 16)) >>> 0;
+}
+/** The two per-node keys: `k1` from the seed alone, `k2` from the step and `k1`. */
+export function uniformKeys(seed, step) {
+  const k1 = uniformMix((seed ^ 0x9e3779b9) >>> 0), k2 = uniformMix((step ^ k1) >>> 0);
+  return [k1, k2];
+}
+/** Element `i`'s value: mix(mix(i ^ k2) + k1) >> 8, times 2^-24. */
+export function uniformValue(k1, k2, i) {
+  return (uniformMix((uniformMix((i ^ k2) >>> 0) + k1) >>> 0) >>> 8) * 5.9604644775390625e-8;
+}
 export const UNARY_OPS = Object.freeze(['relu', 'positive', 'neg', 'exp', 'log', 'sqrt', 'tanh', 'sigmoid', 'gelu', 'gelu_grad']);
 export const REDUCE_OPS = Object.freeze(['sum', 'mean']);
 function plain(obj) {
@@ -171,9 +202,10 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
     'LIMIT', 'Limits must be positive safe integers');
   const limits = {...DEFAULT_LIMITS, ...overrides};
   keys(program, ['version', 'nodes', 'outputs'], ['version', 'nodes', 'outputs']);
-  // Versions 1 and 2 share one validator: version 2 names the extended operation
-  // set, and every version-1 graph means the same thing under it.
-  check(program.version === 1 || program.version === 2, 'PROTOCOL', 'Only graph protocol versions 1 and 2 are supported');
+  // Versions 1, 2 and 3 share one validator: each names a larger operation
+  // set, and every older graph means the same thing under the newer version.
+  check(program.version === 1 || program.version === 2 || program.version === 3, 'PROTOCOL',
+    'Only graph protocol versions 1, 2 and 3 are supported');
   check(Array.isArray(program.nodes) && program.nodes.length > 0 && program.nodes.length <= limits.maxNodes,
     'LIMIT', 'Invalid graph node count');
   check(Array.isArray(program.outputs) && program.outputs.length > 0 && program.outputs.length <= limits.maxOutputs,
@@ -185,7 +217,7 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
     // Validate op before looking up a kernel; identifiers never become code.
     keys(raw, ['id', 'op', 'shape', 'data', 'value', 'a', 'b', 'c', 'axis', 'keepdim', 'dims',
       'lr', 'momentum', 'dampening', 'beta1', 'beta2', 'eps', 'step', 'carry',
-      'dtype', 'transposed'], ['id', 'op']);
+      'dtype', 'transposed', 'seed'], ['id', 'op']);
     check(raw.id === id, 'PROTOCOL', 'Node IDs must be consecutive integers starting at zero');
     const n = {id, op: raw.op, refs: []};
     // `blocks` marks the one position that can read a quantized node: the
@@ -287,6 +319,31 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
       case 'full':
         keys(raw, ['id', 'op', 'shape', 'value'], ['shape', 'value']);
         n.shape = shapeOf(raw.shape, limits); n.value = finiteF32(raw.value); break;
+      case 'uniform': {
+        // Counter-based random numbers: element i of a (seed, step) draw is a
+        // pure function of the three, so a draw is reproducible on every
+        // backend and a prepared session gets a fresh one per step by
+        // advancing `step` (as it advances adam_update's).
+        keys(raw, ['id', 'op', 'shape', 'seed', 'step'], ['shape', 'seed']);
+        n.shape = shapeOf(raw.shape, limits);
+        check(Number.isSafeInteger(raw.seed) && raw.seed >= 0 && raw.seed <= 0xffffffff, 'NUMBER', 'seed must be an integer in [0, 2^32)');
+        const step = Object.hasOwn(raw, 'step') ? raw.step : 1;
+        check(Number.isSafeInteger(step) && step >= 1 && step <= 2 ** 31, 'NUMBER', 'step must be a positive integer');
+        n.seed = raw.seed; n.step = step; units = sizeOf(n.shape) * 4; break;
+      }
+      case 'where': {
+        // where(c, a, b): a where c is nonzero (a NaN counts as nonzero), b
+        // where it is zero (either sign), all three broadcast together.
+        keys(raw, ['id', 'op', 'c', 'a', 'b'], ['c', 'a', 'b']);
+        const c = ref('c'), a = ref('a'), b = ref('b');
+        const all = broadcast(broadcast(c.shape, a.shape).shape, b.shape);
+        n.shape = all.shape; n.dims = all.dims;
+        // Each operand's padded strides against the output (0 = broadcast).
+        n.cStrides = broadcast(c.shape, n.shape).aStrides;
+        n.aStrides = broadcast(a.shape, n.shape).aStrides; n.bStrides = broadcast(b.shape, n.shape).aStrides;
+        n.mode = sameShape(c.shape, n.shape) && sameShape(a.shape, n.shape) && sameShape(b.shape, n.shape) ? 'same' : 'general';
+        break;
+      }
       case 'life': case 'transpose': {
         keys(raw, ['id', 'op', 'a'], ['a']); const a = ref('a');
         check(a.shape.length === 2, 'SHAPE', `${op} requires a matrix`);

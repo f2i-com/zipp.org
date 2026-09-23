@@ -7,9 +7,11 @@ and optimizer state on the CPU between submissions; a prepared step
 steps until `sync()` copies them back. This is not TorchInductor or a CUDA
 device.
 """
+import math
 import torch
+import torch.nn.functional as _F
 import _zipp_tensor as _k
-from zipp_gpu import Graph, ComputeError
+from zipp_gpu import Graph, ComputeError, _f32
 
 _active = None
 # Parameters held by a live prepared session, by id: while one holds a
@@ -118,14 +120,85 @@ class _Capture:
         # same storage (`p.detach()`, `.data`) reads the same input node, so a
         # prepared session carries it with the parameter.
         self.storages = {}
-        # Whether the step drew random numbers (see `_record`).
+        # Whether the step drew random numbers on the CPU (see `_record`).
         self.used_random = False
-        # Prepared only: the tensors created while the step recorded (see `_record`).
-        self.created = ((), set())
+        # torch's one random entry, as it was before `_record` watched it: the
+        # seeds of the device's own draws (dropout masks) come from it, so
+        # they follow torch.manual_seed and are not CPU draws to refuse.
+        self.draw = getattr(torch, "_gen", None)
+        # Eager bool tensors read as graph masks (see `mask_input`), by id.
+        self.masks = {}
+        # Prepared only: every tensor-kernel call made while the step recorded,
+        # as (storages read, storages written), in order (see `_record`).
+        self.trace = []
+        # Scalar constants the version-3 operations record, one node each.
+        self.constants = {}
 
     def derived_input(self, value):
         """Whether `value` is an eager result with a gradient path to a leaf."""
         return self.training and isinstance(value, torch.Tensor) and value.requires_grad and value._node is not None
+
+    def seed(self, generator=None):
+        """A 32-bit seed for a device `uniform` draw: one word of torch's
+        generator, so compiled calls are reproducible under manual_seed and
+        each call (or prepared session) draws its own masks."""
+        return int(_k.to_list(_k.randint(self.draw(generator), 0, 1 << 32, 1))[0])
+
+    def scalar(self, value):
+        """The graph node of a finite scalar constant, recorded once per capture
+        (keyed with the sign, so 0.0 and -0.0 stay distinct)."""
+        key = (value, math.copysign(1.0, value))
+        node = self.constants.get(key)
+        if node is None:
+            node = self.constants[key] = self.graph.tensor(value)
+        return node
+
+    def mask_input(self, value):
+        """An eager bool tensor as a graph mask (0.0/1.0, converted exactly).
+
+        Recorded once per storage and shape, checked for staleness like any
+        input, and fed each step when it is a prepared step's argument."""
+        if len(value.shape) > 4:
+            raise NotImplementedError("Compiled GPU masks have at most four dimensions")
+        entry = self.masks.get(id(value))
+        if entry is None:
+            for other in self.masks.values():
+                if other[2][0] is value._s and tuple(other[0].shape) == tuple(value.shape):
+                    return other[1]
+            node = self.graph.tensor(_k.astype(value._s, "float32"), tuple(value.shape))
+            entry = (value, _Tensor(self, node, requires_grad=False, mask=True), (value._s, _k.version(value._s)))
+            self.masks[id(value)] = entry
+        return entry[1]
+
+    def operand(self, value):
+        """A graph operand: a graph tensor, a float32 or bool eager tensor, or a finite number."""
+        if isinstance(value, _Tensor):
+            if value._capture is not self:
+                raise ValueError("Cannot mix separate compiled GPU calls")
+            return value
+        if isinstance(value, torch.Tensor):
+            return self.mask_input(value) if value.dtype is torch.bool else self.tensor(value)
+        if isinstance(value, bool):
+            value = float(value)
+        if isinstance(value, (int, float)):
+            if not math.isfinite(value):
+                raise NotImplementedError(
+                    "torch.compile records finite float32 constants only; %r cannot be a graph value "
+                    "(for a masked_fill before softmax use a large finite value such as -1e9)" % (value,))
+            return _Tensor(self, self.scalar(float(value)))
+        raise TypeError("Expected a tensor or a number, got %s" % type(value).__name__)
+
+    def condition(self, value, what):
+        """A bool condition: a comparison result or an eager bool tensor, as in PyTorch."""
+        if isinstance(value, _Tensor) and value.dtype is torch.bool:
+            return self.operand(value)
+        if isinstance(value, torch.Tensor) and value.dtype is torch.bool:
+            return self.mask_input(value)
+        if isinstance(value, (_Tensor, torch.Tensor)):
+            if what == "masked_fill":
+                raise RuntimeError("masked_fill_ only supports boolean masks, but got mask with dtype %s" % _dtype_name(value.dtype))
+            raise RuntimeError("where expected condition to be a boolean tensor, but got a tensor with dtype %s" % _dtype_name(value.dtype).capitalize())
+        raise TypeError("%s(): argument 'condition' must be Tensor, not %s" % (what, type(value).__name__))
 
     def tensor(self, value, row=False):
         if isinstance(value, _Tensor):
@@ -140,6 +213,8 @@ class _Capture:
                 return symbolic.reshape(1, value.shape[0]) if row else symbolic
             if len(value.shape) > 2:
                 raise NotImplementedError("Compiled GPU calls support scalar, vector and matrix tensors only")
+            if value.dtype is torch.bool:
+                return self.mask_input(value)
             if value.dtype != torch.float32:
                 raise TypeError("GPU compilation requires float32 tensors; integer tensors are accepted only as cross_entropy class targets")
             key = id(value)
@@ -220,6 +295,8 @@ class _Capture:
             result = operands[0].permute(self._replay_permutation(node, parents[0], shape))
         elif name == "Mm":
             result = operands[0] @ operands[1]
+        elif name in ("Maximum", "Minimum") and len(operands) == 2 and None not in operands:
+            result = _maximum(self, "maximum" if name == "Maximum" else "minimum", operands[0], operands[1])
         elif name in ("Softmax", "LogSoftmax"):
             method = "softmax" if name == "Softmax" else "log_softmax"
             with torch.no_grad():
@@ -495,12 +572,14 @@ def _shape_args(shape):
 
 
 class _Tensor:
-    def __init__(self, capture, value, parents=(), pullback=None, requires_grad=None):
+    def __init__(self, capture, value, parents=(), pullback=None, requires_grad=None, mask=False):
         self._capture = capture
         self._value = value
         self._zipp_graph = True
         self.shape = torch.Size(value.shape)
-        self.dtype = torch.float32
+        # A comparison's result is a bool mask, as in PyTorch; on the device
+        # it is float32 0.0/1.0, so arithmetic with it is exact.
+        self.dtype = torch.bool if mask else torch.float32
         self.parents = parents
         self.pullback = pullback
         # Explicit requires_grad describes a source leaf. no_grad suppresses
@@ -524,8 +603,8 @@ class _Tensor:
 
     def _binary(self, operation, other, reverse=False):
         capture = self._capture
-        if (isinstance(other, torch.Tensor) and len(self.shape) == 2 and tuple(other.shape) == (self.shape[1],)
-                and not capture.derived_input(other)):
+        if (isinstance(other, torch.Tensor) and other.dtype == torch.float32 and len(self.shape) == 2
+                and tuple(other.shape) == (self.shape[1],) and not capture.derived_input(other)):
             # A bias row broadcast by a ones-matmul keeps dense layers within
             # protocol version 1; other broadcasting uses the graph's own.
             other = capture.tensor(other, row=True)
@@ -534,16 +613,19 @@ class _Tensor:
         rhs = capture.tensor(other)
         a, b = (rhs, self) if reverse else (self, rhs)
         av, bv = a._value, b._value
+        # Only an operand that takes a gradient gets a pullback node: a
+        # constant or a mask operand would otherwise add nodes nothing reads.
         if operation == "div":
             result = av / bv
             def backward(g):
-                return (_unbroadcast(g / bv, a), _unbroadcast(-(g * (result / bv)), b))
+                return (_unbroadcast(g / bv, a) if a.requires_grad else None,
+                        _unbroadcast(-(g * (result / bv)), b) if b.requires_grad else None)
             return _Tensor(capture, result, (a, b), backward)
         result = av + bv if operation == "add" else av - bv if operation == "sub" else av * bv
         def backward(g):
-            ga = g * bv if operation == "mul" else g
-            gb = g * av if operation == "mul" else g * -1.0 if operation == "sub" else g
-            return (_unbroadcast(ga, a), _unbroadcast(gb, b))
+            ga = (g * bv if operation == "mul" else g) if a.requires_grad else None
+            gb = (g * av if operation == "mul" else g * -1.0 if operation == "sub" else g) if b.requires_grad else None
+            return (None if ga is None else _unbroadcast(ga, a), None if gb is None else _unbroadcast(gb, b))
         return _Tensor(capture, result, (a, b), backward)
 
     def _unary(self, value, pullback):
@@ -584,8 +666,53 @@ class _Tensor:
         raise NotImplementedError("GPU power supports the exponents 2, 1, 0.5, -1 and -0.5")
     def pow(self, exponent): return self ** exponent
     def square(self): return self * self
-    def __lt__(self, other): raise CompileUnsupportedError("Comparisons are not supported by torch.compile")
-    __le__ = __gt__ = __ge__ = __lt__
+    # ---- comparisons, masks and selection (protocol version 3) --------------------------
+    def __lt__(self, other): return _compare(self._capture, "lt", self, other)
+    def __le__(self, other): return _compare(self._capture, "le", self, other)
+    def __gt__(self, other): return _compare(self._capture, "gt", self, other)
+    def __ge__(self, other): return _compare(self._capture, "ge", self, other)
+    def __eq__(self, other):
+        return False if other is None else _compare(self._capture, "eq", self, other)
+    def __ne__(self, other):
+        return True if other is None else _compare(self._capture, "ne", self, other)
+    def __hash__(self):
+        return id(self)
+    def eq(self, other): return _compare(self._capture, "eq", self, other)
+    def ne(self, other): return _compare(self._capture, "ne", self, other)
+    def lt(self, other): return _compare(self._capture, "lt", self, other)
+    def le(self, other): return _compare(self._capture, "le", self, other)
+    def gt(self, other): return _compare(self._capture, "gt", self, other)
+    def ge(self, other): return _compare(self._capture, "ge", self, other)
+    greater, greater_equal, less, less_equal, not_equal = gt, ge, lt, le, ne
+    def where(self, condition, other): return _where(self._capture, condition, self, other, "where")
+    def masked_fill(self, mask, value): return _masked_fill(self._capture, self, mask, value)
+    def maximum(self, other): return _maximum(self._capture, "maximum", self, other)
+    def minimum(self, other): return _maximum(self._capture, "minimum", self, other)
+    def clamp(self, min=None, max=None): return _clamp(self._capture, self, min, max)
+    clip = clamp
+    def clamp_min(self, min): return _clamp(self._capture, self, min, None)
+    def clamp_max(self, max): return _clamp(self._capture, self, None, max)
+    def logical_not(self): return _logical(self._capture, "not", self, None)
+    def logical_and(self, other): return _logical(self._capture, "and", self, other)
+    def logical_or(self, other): return _logical(self._capture, "or", self, other)
+    def logical_xor(self, other): return _logical(self._capture, "xor", self, other)
+    def __invert__(self):
+        if self.dtype is not torch.bool:
+            raise TypeError("~ (bitwise not) of a float compiled graph tensor is not supported; it applies to comparison masks")
+        return _logical(self._capture, "not", self, None)
+    def _bitwise(self, op, other):
+        if self.dtype is not torch.bool or not (isinstance(other, bool) or getattr(other, "dtype", None) is torch.bool):
+            raise TypeError("&, | and ^ of compiled graph tensors apply to comparison masks (bool) only")
+        return _logical(self._capture, op, self, other)
+    def __and__(self, other): return self._bitwise("and", other)
+    def __rand__(self, other): return self._bitwise("and", other)
+    def __or__(self, other): return self._bitwise("or", other)
+    def __ror__(self, other): return self._bitwise("or", other)
+    def __xor__(self, other): return self._bitwise("xor", other)
+    def __rxor__(self, other): return self._bitwise("xor", other)
+    def bool(self):
+        # A mask already is one; anything else becomes `!= 0`, as in PyTorch.
+        return self if self.dtype is torch.bool else _compare(self._capture, "ne", self, 0.0)
 
     def __matmul__(self, other):
         b = self._capture.tensor(other)
@@ -623,14 +750,21 @@ class _Tensor:
     def detach(self):
         # A stop-gradient: the same value, no path back to its sources.
         return _Tensor(self._capture, self._value, requires_grad=False)
-    def float(self): return self
+    def float(self):
+        # A mask read as float32 is the same 0.0/1.0 values, without a copy.
+        return self if self.dtype is torch.float32 else _Tensor(self._capture, self._value, requires_grad=False)
     def contiguous(self): return self
     def clone(self): return self
     def to(self, *args, **kwargs):
+        target = None
         for value in list(args) + list(kwargs.values()):
-            if value not in (torch.float32, "cpu") and not (isinstance(value, bool) or value is None):
-                raise NotImplementedError("A compiled graph tensor is float32 on the host GPU; .to(%r) is not supported" % (value,))
-        return self
+            if value is torch.float32 or value is torch.bool:
+                target = value
+            elif value != "cpu" and not (isinstance(value, bool) or value is None):
+                raise NotImplementedError("A compiled graph tensor is float32 (bool for comparison masks) on the host GPU; .to(%r) is not supported" % (value,))
+        if target is torch.bool:
+            return self.bool()
+        return self.float() if target is torch.float32 else self
     def type_as(self, other):
         return self.to(other.dtype)
 
@@ -901,6 +1035,9 @@ class GPUResult:
                     for original, symbolic, snapshot, dtype in capture.targets.values():
                         if original.dtype is not dtype or original._s is not snapshot[0] or _k.version(original._s) != snapshot[1]:
                             raise RuntimeError("GPU training result is stale; captured class targets changed before completion")
+                    for original, symbolic, snapshot in capture.masks.values():
+                        if original.dtype is not torch.bool or original._s is not snapshot[0] or _k.version(original._s) != snapshot[1]:
+                            raise RuntimeError("GPU training result is stale; a captured mask changed before completion")
                     for parameter, key, snapshot in capture.state_snapshots:
                         state = capture.optimizer.state.get(parameter)
                         if _changed(None if state is None else state.get(key), snapshot):
@@ -929,6 +1066,423 @@ class GPUResult:
         raise NotImplementedError("Call loss.backward() inside a torch.compile(training=True) function")
 
 
+# ---- comparisons, selection, clamping and dropout on graph tensors (protocol version 3) ----
+# Each records graph operations and, where PyTorch defines one, the same
+# gradient: `where` routes it to the branch taken (zero to the other), clamp
+# passes it where lo <= x <= hi (hardtanh and relu6 strictly inside), maximum
+# and minimum split a tie evenly, comparisons have none, and dropout scales it
+# by the forward's own mask.
+
+def _dtype_name(dtype):
+    return "float" if dtype is torch.float32 else "bool" if dtype is torch.bool else str(dtype).replace("torch.", "")
+
+
+def _capture_of(*values):
+    for value in values:
+        if isinstance(value, _Tensor):
+            return value._capture
+    return None
+
+
+def _mask(capture, value):
+    return _Tensor(capture, value, requires_grad=False, mask=True)
+
+
+def _compare(capture, op, a, b):
+    ta, tb = capture.operand(a), capture.operand(b)
+    return _mask(capture, capture.graph._binary(op, ta._value, tb._value))
+
+
+def _truth(capture, value):
+    """`value != 0` as a 0/1 graph value (a mask is already one)."""
+    t = capture.operand(value)
+    return t._value if t.dtype is torch.bool else capture.graph._binary("ne", t._value, capture.scalar(0.0))
+
+
+def _logical(capture, op, a, b):
+    graph = capture.graph
+    x = _truth(capture, a)
+    if op == "not":
+        return _mask(capture, graph._binary("eq", x, capture.scalar(0.0)))
+    y = _truth(capture, b)
+    # On 0/1 values: and is a product, or a maximum, xor an inequality; all exact.
+    return _mask(capture, graph._binary("mul" if op == "and" else "maximum" if op == "or" else "ne", x, y))
+
+
+def _where(capture, condition, a, b, what):
+    c = capture.condition(condition, what)
+    ta, tb = capture.operand(a), capture.operand(b)
+    graph, cv, zero = capture.graph, c._value, capture.scalar(0.0)
+
+    def backward(grad):
+        # PyTorch: where(condition, grad, 0) and where(condition, 0, grad).
+        return (_unbroadcast(graph.where(cv, grad, zero), ta) if ta.requires_grad else None,
+                _unbroadcast(graph.where(cv, zero, grad), tb) if tb.requires_grad else None)
+    return _Tensor(capture, graph.where(cv, ta._value, tb._value), (ta, tb), backward,
+                   mask=ta.dtype is torch.bool and tb.dtype is torch.bool)
+
+
+def _masked_fill(capture, x, mask, value):
+    t = capture.operand(x)
+    if isinstance(value, (torch.Tensor, _Tensor)) and len(value.shape):
+        raise RuntimeError("masked_fill_ only supports a 0-dimensional value tensor, but got tensor with %d dimension(s)." % len(value.shape))
+    out = _where(capture, mask, value, t, "masked_fill")
+    if tuple(out.shape) != tuple(t.shape):
+        raise RuntimeError("output with shape %s doesn't match the broadcast shape %s" % (list(t.shape), list(out.shape)))
+    return out
+
+
+def _maximum(capture, op, a, b):
+    ta, tb = capture.operand(a), capture.operand(b)
+    graph, av, bv, zero = capture.graph, ta._value, tb._value, capture.scalar(0.0)
+
+    def backward(grad):
+        # PyTorch: where(a == b, grad / 2, grad), zero where the other side wins.
+        tie = graph.where(graph._binary("eq", av, bv), grad * capture.scalar(0.5), grad)
+        ga = gb = None
+        if ta.requires_grad:
+            ga = _unbroadcast(graph.where(graph._binary("lt" if op == "maximum" else "gt", av, bv), zero, tie), ta)
+        if tb.requires_grad:
+            gb = _unbroadcast(graph.where(graph._binary("gt" if op == "maximum" else "lt", av, bv), zero, tie), tb)
+        return ga, gb
+    return _Tensor(capture, graph._binary(op, av, bv), (ta, tb), backward,
+                   mask=ta.dtype is torch.bool and tb.dtype is torch.bool)
+
+
+def _clamp(capture, x, lo, hi, exclusive=False):
+    """min(max(x, lo), hi) with scalar or tensor bounds.
+
+    The gradient reaches x where lo <= x <= hi (clamp) or lo < x < hi
+    (`exclusive`: hardtanh, relu6); a tensor bound gets it where x lies beyond
+    it, the lower one only while lo < hi -- PyTorch's clamp_backward_min_max."""
+    if lo is None and hi is None:
+        raise RuntimeError("torch.clamp: At least one of 'min' or 'max' must not be None")
+    t = capture.operand(x)
+    graph, xv, zero = capture.graph, t._value, capture.scalar(0.0)
+    low = None if lo is None else capture.operand(lo)
+    high = None if hi is None else capture.operand(hi)
+    value = xv
+    if low is not None:
+        value = graph._binary("maximum", value, low._value)
+    if high is not None:
+        value = graph._binary("minimum", value, high._value)
+    parents = (t,) + tuple(bound for bound in (low, high) if bound is not None)
+
+    def backward(grad):
+        above_low = None if low is None else graph._binary("gt" if exclusive else "ge", xv, low._value)
+        below_high = None if high is None else graph._binary("lt" if exclusive else "le", xv, high._value)
+        inside = below_high if above_low is None else above_low if below_high is None else above_low * below_high
+        result = [_unbroadcast(graph.where(inside, grad, zero), t) if t.requires_grad else None]
+        if low is not None:
+            if low.requires_grad:
+                taken = graph._binary("lt", xv, low._value)
+                if high is not None:
+                    taken = taken * graph._binary("lt", low._value, high._value)
+                result.append(_unbroadcast(graph.where(taken, grad, zero), low))
+            else:
+                result.append(None)
+        if high is not None:
+            if high.requires_grad:
+                taken = graph._binary("gt", xv, high._value)
+                if low is not None:
+                    taken = graph._binary("maximum", taken, graph._binary("lt", high._value, low._value))
+                result.append(_unbroadcast(graph.where(taken, grad, zero), high))
+            else:
+                result.append(None)
+        return tuple(result)
+    return _Tensor(capture, value, parents, backward)
+
+
+def _hardtanh(capture, x, lo, hi):
+    if lo > hi:
+        raise ValueError("min_val cannot be greater than max_val")
+    return _clamp(capture, x, float(lo), float(hi), exclusive=True)
+
+
+def _leaky_relu(capture, x, slope):
+    t = capture.operand(x)
+    graph, xv = capture.graph, t._value
+    positive = graph._binary("gt", xv, capture.scalar(0.0))
+    # PyTorch: x > 0 ? x : x * slope, and grad > 0 ? grad : grad * slope by the same test.
+    return _Tensor(capture, graph.where(positive, xv, xv * slope), (t,),
+                   lambda grad: (graph.where(positive, grad, grad * slope),))
+
+
+def _dropout(capture, x, p, training, feature_rank=None, name="dropout"):
+    """Dropout with its mask drawn on the device: `uniform(shape, seed, step) >= p`.
+
+    The seed is one word of torch's generator; a prepared session advances the
+    step every step, so each step has a fresh mask. Kept elements scale by
+    float32(1 / float32(1 - p)) and the gradient by the same mask and scale,
+    as PyTorch's CPU dropout multiplies by bernoulli(1 - p) / (1 - p). The
+    mask is not PyTorch's random stream (nor eager Zipp's)."""
+    if p < 0.0 or p > 1.0:
+        raise ValueError("dropout probability has to be between 0 and 1, but got %s" % p)
+    if not training or p == 0:
+        return x
+    t = capture.operand(x)
+    if p == 1:
+        return t * 0.0
+    shape = tuple(t.shape)
+    if feature_rank is not None:
+        rank = len(shape)
+        if rank not in (feature_rank - 1, feature_rank):
+            raise RuntimeError("%s: Expected %dD or %dD input, but received a %dD input." % (name, feature_rank - 1, feature_rank, rank))
+        lead = 2 if rank == feature_rank else 1
+        shape = shape[:lead] + (1,) * (rank - lead)
+    graph = capture.graph
+    keep = graph.uniform(shape, capture.seed(), 1) >= capture.scalar(_f32(float(p)))
+    noise = keep * _f32(1.0 / _f32(1.0 - p))
+    return _Tensor(capture, t._value * noise, (t,), lambda grad: (grad * noise,))
+
+
+def _uniform_like(capture, x, generator=None, dtype=None):
+    if dtype is not None and dtype is not torch.float32:
+        raise NotImplementedError("A compiled rand_like draws float32 only")
+    return _Tensor(capture, capture.graph.uniform(tuple(x.shape), capture.seed(generator), 1), requires_grad=False)
+
+
+def _bernoulli(capture, x, p=None, generator=None):
+    t = capture.operand(x)
+    draw = capture.graph.uniform(tuple(t.shape), capture.seed(generator), 1)
+    # 1.0 with probability p (the input, or `p`), as float32: PyTorch keeps the input's dtype.
+    return _Tensor(capture, draw < (t._value if p is None else float(p)), requires_grad=False)
+
+
+def _argument(args, kwargs, index, name, default=None):
+    if len(args) > index:
+        return args[index]
+    return kwargs.get(name, default)
+
+
+def _no_inplace(kwargs, args, index, name):
+    if _argument(args, kwargs, index, "inplace", False):
+        raise NotImplementedError("torch.compile does not record in-place %s on a graph tensor; use inplace=False" % name)
+
+
+def _patch_functions(patched):
+    """Graph-aware versions of torch's comparison, selection, clamping and
+    dropout functions, installed while a call records. Each falls through to
+    the original unless a graph tensor is among its tensor arguments. Every
+    replaced attribute is appended to `patched` as it is installed."""
+
+    def patch(module, name, make):
+        original = getattr(module, name, None)
+        if original is not None:
+            setattr(module, name, make(original))
+            patched.append((module, name, original))
+
+    def where(original):
+        def call(condition, *args, **kwargs):
+            a, b = _argument(args, kwargs, 0, "input"), _argument(args, kwargs, 1, "other")
+            capture = None if a is None and b is None else _capture_of(condition, a, b)
+            return original(condition, *args, **kwargs) if capture is None else _where(capture, condition, a, b, "where")
+        return call
+
+    def clamp(original, lo_default=None, hi_default=None, one=None):
+        def call(input, *args, **kwargs):
+            if one == "min":
+                lo, hi = _argument(args, kwargs, 0, "min"), None
+            elif one == "max":
+                lo, hi = None, _argument(args, kwargs, 0, "max")
+            else:
+                lo, hi = _argument(args, kwargs, 0, "min"), _argument(args, kwargs, 1, "max")
+            capture = _capture_of(input, lo, hi)
+            return original(input, *args, **kwargs) if capture is None else _clamp(capture, input, lo, hi)
+        return call
+
+    def maximum(op):
+        def make(original):
+            def call(input, *args, **kwargs):
+                other = _argument(args, kwargs, 0, "other")
+                capture = _capture_of(input, other)
+                return original(input, *args, **kwargs) if capture is None else _maximum(capture, op, input, other)
+            return call
+        return make
+
+    def binary_max(op):
+        # torch.max(a, b) / torch.min(a, b): the elementwise form only.
+        def make(original):
+            def call(input, *args, **kwargs):
+                other = _argument(args, kwargs, 0, "dim", kwargs.get("other"))
+                capture = _capture_of(input, other) if isinstance(other, (torch.Tensor, _Tensor)) else None
+                return original(input, *args, **kwargs) if capture is None else _maximum(capture, op, input, other)
+            return call
+        return make
+
+    def masked_fill(original):
+        def call(input, mask, value):
+            capture = _capture_of(input, mask, value)
+            return original(input, mask, value) if capture is None else _masked_fill(capture, input, mask, value)
+        return call
+
+    def binary_nograd(original):
+        def call(op, a, b):
+            capture = _capture_of(a, b)
+            if capture is not None and op in ("eq", "ne", "lt", "le", "gt", "ge"):
+                return _compare(capture, op, a, b)
+            if capture is not None and op in ("and", "or", "xor"):
+                return _logical(capture, op, a, b)
+            return original(op, a, b)
+        return call
+
+    def logical_not(original):
+        def call(input):
+            capture = _capture_of(input)
+            return original(input) if capture is None else _logical(capture, "not", input, None)
+        return call
+
+    def rand_like(original):
+        def call(input, *args, **kwargs):
+            capture = _capture_of(input)
+            if capture is None:
+                return original(input, *args, **kwargs)
+            return _uniform_like(capture, input, _argument(args, kwargs, 0, "generator"), kwargs.get("dtype"))
+        return call
+
+    def bernoulli(original):
+        def call(input, *args, **kwargs):
+            capture = _capture_of(input)
+            if capture is None:
+                return original(input, *args, **kwargs)
+            return _bernoulli(capture, input, _argument(args, kwargs, 0, "p"), _argument(args, kwargs, 1, "generator"))
+        return call
+
+    def dropout(feature_rank=None, name="dropout"):
+        def make(original):
+            def call(input, *args, **kwargs):
+                capture = _capture_of(input)
+                if capture is None:
+                    return original(input, *args, **kwargs)
+                p, training = _argument(args, kwargs, 0, "p", 0.5), _argument(args, kwargs, 1, "training", True)
+                if training and p:
+                    _no_inplace(kwargs, args, 2, name)
+                return _dropout(capture, input, p, training, feature_rank, name)
+            return call
+        return make
+
+    def hardtanh(original):
+        def call(input, *args, **kwargs):
+            capture = _capture_of(input)
+            if capture is None:
+                return original(input, *args, **kwargs)
+            _no_inplace(kwargs, args, 2, "hardtanh")
+            return _hardtanh(capture, input, _argument(args, kwargs, 0, "min_val", -1.0), _argument(args, kwargs, 1, "max_val", 1.0))
+        return call
+
+    def relu6(original):
+        def call(input, *args, **kwargs):
+            capture = _capture_of(input)
+            if capture is None:
+                return original(input, *args, **kwargs)
+            _no_inplace(kwargs, args, 0, "relu6")
+            return _hardtanh(capture, input, 0.0, 6.0)
+        return call
+
+    def leaky_relu(original):
+        def call(input, *args, **kwargs):
+            capture = _capture_of(input)
+            if capture is None:
+                return original(input, *args, **kwargs)
+            _no_inplace(kwargs, args, 1, "leaky_relu")
+            return _leaky_relu(capture, input, _argument(args, kwargs, 0, "negative_slope", 0.01))
+        return call
+
+    patch(torch, "where", where)
+    for name in ("clamp", "clip"):
+        patch(torch, name, clamp)
+    patch(torch, "clamp_min", lambda original: clamp(original, one="min"))
+    patch(torch, "clamp_max", lambda original: clamp(original, one="max"))
+    patch(torch, "maximum", maximum("maximum"))
+    patch(torch, "minimum", maximum("minimum"))
+    patch(torch, "max", binary_max("maximum"))
+    patch(torch, "min", binary_max("minimum"))
+    patch(torch, "masked_fill", masked_fill)
+    # Every comparison and logical and/or/xor goes through it, including an
+    # eager tensor on the left of a graph tensor (`bound < x`).
+    patch(torch, "_binary_nograd", binary_nograd)
+    patch(torch, "logical_not", logical_not)
+    patch(torch, "rand_like", rand_like)
+    patch(torch, "bernoulli", bernoulli)
+    patch(_F, "dropout", dropout())
+    patch(_F, "dropout1d", dropout(3, "dropout1d"))
+    patch(_F, "dropout2d", dropout(4, "dropout2d"))
+    # Rank 4 at most on the device, so only unbatched (C, D, H, W) input.
+    patch(_F, "dropout3d", dropout(5, "dropout3d"))
+    patch(_F, "hardtanh", hardtanh)
+    patch(_F, "relu6", relu6)
+    patch(_F, "leaky_relu", leaky_relu)
+
+
+# ---- prepared constants: which tensors a step's history ties to a parameter or argument ------
+# Query functions read a storage without deriving one; they are left alone.
+_TRACE_SKIP = frozenset(("version", "aversion", "size", "dtype", "all_finite", "to_list", "item", "Storage", "Generator"))
+
+
+def _storages(value, into, depth=0):
+    if isinstance(value, _k.Storage):
+        into.append(value)
+    elif depth < 2 and isinstance(value, (tuple, list)):
+        for item in value:
+            _storages(item, into, depth + 1)
+
+
+def _trace_kernels(trace, traced):
+    """Wrap every tensor kernel so each call that reads storage appends
+    (storages read, storages it returned or wrote in place) to `trace`; what
+    was replaced is appended to `traced` as it is, for `_record` to restore."""
+    version = _k.version
+
+    def make(fn):
+        def call(*args, **kwargs):
+            read = []
+            for value in args:
+                _storages(value, read)
+            for value in kwargs.values():
+                _storages(value, read)
+            if not read:
+                return fn(*args, **kwargs)
+            before = [version(x) for x in read]
+            out = fn(*args, **kwargs)
+            written = []
+            _storages(out, written)
+            for x, v in zip(read, before):
+                if version(x) != v:
+                    written.append(x)
+            if written:
+                trace.append((read, written))
+            return out
+        return call
+
+    for name in dir(_k):
+        if name.startswith("_") or name in _TRACE_SKIP:
+            continue
+        fn = getattr(_k, name)
+        if isinstance(fn, type) or not callable(fn):
+            continue
+        setattr(_k, name, make(fn))
+        traced.append((name, fn))
+
+
+def _tainted(trace, sources):
+    """Storage id -> "parameter" or "argument" for every storage whose history
+    reaches one of `sources` through the traced kernel calls, in call order."""
+    tainted = dict(sources)
+    for read, written in trace:
+        reason = None
+        for x in read:
+            found = tainted.get(id(x))
+            if found == "argument":
+                reason = found
+                break
+            if found is not None:
+                reason = found
+        if reason is not None:
+            for x in written:
+                tainted.setdefault(id(x), reason)
+    return tainted
+
+
 def _record(model, training, args, kwargs, prepared=False):
     """Run `model` once with graph tensors in place of its float tensor arguments."""
     global _active
@@ -941,42 +1495,37 @@ def _record(model, training, args, kwargs, prepared=False):
     # Eager ops look for graph tensors only while a call records.
     torch._recording(1)
     # A prepared step is one recorded program run many times: a random draw
-    # inside it (a dropout mask, torch.randn noise) would become a constant
+    # on the CPU inside it (torch.randn noise) would become a constant
     # replayed at every step. Every draw goes through torch._gen, so watch it.
+    # Dropout, rand_like and bernoulli of graph tensors draw on the device
+    # instead (`uniform`, fresh every step) with seeds from `capture.draw`.
     draw = getattr(torch, "_gen", None) if prepared else None
     if draw is not None:
         def watched(generator):
             capture.used_random = True
             return draw(generator)
         torch._gen = watched
-    # And every tensor the step creates (a constant built inside it, a value
-    # computed from parameters under no_grad or from Python state): read as
-    # a graph input, it too would keep its prepare-time value. Scalars that
-    # eager arithmetic wraps (`W * 2.0`) are literals, not such tensors.
-    init = torch.Tensor.__init__ if prepared else None
-    wrap = getattr(torch, "_as_tensor", None) if prepared else None
-    created, literals = [], []
-    if prepared:
-        def made(self, *a, **k):
-            init(self, *a, **k)
-            created.append(self)
-        torch.Tensor.__init__ = made
-        if wrap is not None:
-            def literal(value, *a, **k):
-                result = wrap(value, *a, **k)
-                if not isinstance(value, torch.Tensor):
-                    literals.append(result)
-                return result
-            torch._as_tensor = literal
+    # Every tensor kernel call is traced while a prepared step records, so
+    # prepare() can tell a constant built inside the step (uploaded once)
+    # from a value computed from a parameter or an argument (which a session
+    # replaying one program would freeze): see `_tainted`.
+    traced, patched = [], []
     try:
+        if prepared:
+            _trace_kernels(capture.trace, traced)
+        # Comparisons, where, clamp, maximum/minimum, dropout and the
+        # activations built from them record graph operations while a call
+        # records; outside one (and for eager tensors) they are PyTorch's own.
+        _patch_functions(patched)
         _active = capture if training else None
         with torch.enable_grad() if training else torch.no_grad():
             output = model(*[convert(value) for value in args], **{key: convert(value) for key, value in kwargs.items()})
         if capture.used_random:
             raise NotImplementedError(
-                "prepare() cannot record a step that draws random numbers (F.dropout or nn.Dropout in training mode, "
-                "torch.rand/randn/randint...): the prepared session would replay the same draw at every step. "
-                "Use per-call torch.compile, or draw outside the step and pass the tensor as an argument")
+                "prepare() cannot record a step that draws random numbers on the CPU (torch.rand/randn/randint/normal...): "
+                "the prepared session would replay the same draw at every step. F.dropout, nn.Dropout and torch.rand_like or "
+                "torch.bernoulli of graph tensors draw on the device, afresh every step. Use per-call torch.compile, "
+                "or draw outside the step and pass the tensor as an argument")
         if not isinstance(output, _Tensor):
             raise TypeError("Compiled GPU calls must return one supported graph tensor")
         if training and not capture.did_step:
@@ -986,14 +1535,10 @@ def _record(model, training, args, kwargs, prepared=False):
         _active = None
         if draw is not None:
             torch._gen = draw
-        if init is not None:
-            torch.Tensor.__init__ = init
-        if wrap is not None:
-            torch._as_tensor = wrap
-        if prepared:
-            # The tensors stay referenced by `capture` until prepare() has
-            # checked its inputs, so their ids stay theirs.
-            capture.created = (created, set(id(t) for t in created) - set(id(t) for t in literals))
+        for module, name, original in reversed(patched):
+            setattr(module, name, original)
+        for name, original in traced:
+            setattr(_k, name, original)
         torch._recording(-1)
 
 
@@ -1077,6 +1622,8 @@ class Prepared:
                 # The class targets read from this argument's storage: the
                 # argument itself, or a view of it (`y.view(-1)`, `y.squeeze(1)`).
                 nodes = [("t", entry[1]) for entry in capture.targets.values() if entry[2][0] is value._s]
+                # A bool argument read as a mask (or through a view of it) is fed the same way.
+                nodes += [("m", entry[1]._value) for entry in capture.masks.values() if entry[2][0] is value._s]
             if not nodes:
                 # The step did not read this tensor as a graph input: it
                 # ignored it, or used a copy derived from it (a slice, a
@@ -1101,15 +1648,35 @@ class Prepared:
             if symbolic._value is not node and not (recorded["op"] == "reshape" and recorded["a"] == node._id):
                 raise NotImplementedError("prepare(): the step reads a parameter through another tensor over its storage in a different "
                                           "layout; that input would keep the prepare-time weights")
-        created = capture.created[1]
-        for original, symbolic, snapshot in capture.inputs.values():
-            if id(original) in created and id(original._s) not in parameter_nodes and id(original) not in argument_ids:
+        # Constants: a tensor the step reads as a graph input is uploaded once,
+        # which is right exactly when no step could give it another value --
+        # when nothing in its history is a parameter or a step argument.
+        # Parameters and arguments are read through their own (carried or
+        # fed) inputs; anything computed from them by eager kernels would be
+        # frozen at its prepare() value and is refused.
+        sources = {}
+        for parameter in capture.optimizer_params:
+            sources[id(parameter._s)] = "parameter"
+        for position, value in arguments:
+            if isinstance(value, torch.Tensor):
+                sources[id(value._s)] = "argument"
+        tainted = _tainted(capture.trace, sources)
+        read = [(entry[0], entry[1]) for entry in capture.inputs.values()] + [(entry[0], entry[1]) for entry in capture.masks.values()]
+        for original, symbolic in read:
+            if id(original) in argument_ids or id(original) in optimizer_ids or id(original._s) in parameter_nodes:
+                continue
+            reason = tainted.get(id(original._s))
+            if reason == "parameter":
                 raise NotImplementedError(
-                    "prepare(): the step creates a tensor while it runs and reads it as a graph input (a constant built inside the step, "
-                    "or a value computed from parameters under no_grad or from Python state); the session would keep its prepare() value "
-                    "at every step. Create constants outside the step, pass per-step values as arguments, and compute values from "
-                    "parameters with graph operations")
-        capture.created = ((), set())
+                    "prepare(): the step reads a tensor computed from a parameter outside autograd (under no_grad, or from "
+                    ".detach()/.data) as a graph input; the session would keep its prepare() value at every step. Compute it from "
+                    "the parameter with gradients enabled (it is then recorded on the device from the resident weights) or outside the step")
+            if reason == "argument":
+                raise NotImplementedError(
+                    "prepare(): the step reads a tensor that an eager operation derived from a step argument (a one-hot, a cast, "
+                    "arithmetic on class targets) as a graph input; the session would keep its prepare() value at every step. "
+                    "Pass the derived tensor as the argument instead")
+        capture.trace = []
         # Outputs: the result read back each step; per parameter its weight,
         # optimizer buffers and gradient resident, carried into their inputs.
         self._leaves = [entry for entry in capture.inputs.values() if id(entry[1]) in capture.grads]

@@ -159,7 +159,8 @@ class GraphV2Tests(unittest.TestCase):
         from zipp_gpu import execute_locally
         g=Graph(); a=g.tensor([1,2]); p=g.program(r=(a*3).relu())
         self.assertEqual(p["version"],1); self.assertEqual(execute_locally(dict(p,version=2))["outputs"]["r"]["data"],[3,6])
-        with self.assertRaises(ComputeError): execute_locally({"version":3,"nodes":[],"outputs":[]})
+        self.assertEqual(execute_locally(dict(p,version=3))["outputs"]["r"]["data"],[3,6])
+        with self.assertRaises(ComputeError): execute_locally({"version":4,"nodes":[],"outputs":[]})
 
     def test_the_program_version_follows_what_the_graph_actually_uses(self):
         """Version 1 while a version-1 host would read the graph the same way; 2 as soon as it would not."""
@@ -433,5 +434,110 @@ console.log(JSON.stringify(out.steps.map(s=>Object.fromEntries(Object.entries(s.
             for name in ["loss", "p0", "v2"]:
                 for a, b in zip(mine["outputs"][name]["data"], theirs[name]):
                     self.assertLessEqual(abs(a - b), 2.5e-7 * max(1, abs(b)), name)
+
+
+# ---- protocol version 3: comparisons, maximum/minimum, where, uniform --------------------
+NODE_BACKENDS = """import {readFile} from 'node:fs/promises';import {createRuntime} from './src/runtime.mjs';
+const program=JSON.parse(await new Promise(r=>{let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>r(s));}));
+const wasmBytes=await readFile('./wasm/kernels.wasm');const out={};
+for(const backend of ['cpu-js','wasm']){const rt=await createRuntime({backend,wasmBytes});out[backend]=(await rt.execute(program)).outputs;rt.dispose();}
+console.log(JSON.stringify(out));"""
+
+
+class GraphV3Tests(unittest.TestCase):
+    def test_version_three_labels_only_graphs_that_use_its_operations(self):
+        def version(build):
+            g = Graph(); return g.program(r=build(g))["version"]
+        for build in [lambda g: g.tensor([1.0, 2.0]) > 0, lambda g: g.tensor([1.0]).eq(g.tensor([2.0])),
+                      lambda g: g.tensor([1.0, 2.0]).maximum(1.5), lambda g: g.tensor([1.0]).minimum(g.tensor([0.0])),
+                      lambda g: g.where(g.tensor([1.0, 0.0]), 1.0, 2.0), lambda g: g.uniform((2, 3), 7)]:
+            self.assertEqual(version(build), 3, build)
+        self.assertEqual(version(lambda g: g.tensor([1.0, 2.0]).exp()), 2)
+        self.assertEqual(version(lambda g: g.tensor([1.0, 2.0]) * 2), 1)
+
+    def test_semantics_of_comparisons_ties_nan_and_where(self):
+        from zipp_gpu import execute_locally
+        g = Graph(); x = g.tensor([1.0, 2.0, 3.0, -0.0, 0.0, -1.0]); y = g.tensor([1.0, 3.0, 2.0, 0.0, -0.0, -2.0])
+        nan = g.full((6,), 0) / g.full((6,), 0)
+        out = execute_locally(g.program(gt=x > y, ge=x >= y, lt=x < y, le=x <= y, eq=x.eq(y), ne=x.ne(y), mx=x.maximum(y), mn=x.minimum(y),
+                                        nanne=nan.ne(nan), naneq=nan.eq(x), pick=g.where(nan, x, y),
+                                        zero=g.where(g.tensor([0.0, -0.0, 2, -3, 0, 1]), x, 9.0),
+                                        mxnan=x.maximum(nan).ne(x.maximum(nan))))["outputs"]
+        v = lambda k: out[k]["data"]
+        self.assertEqual(v("gt"), [0, 0, 1, 0, 0, 1]); self.assertEqual(v("ge"), [1, 0, 1, 1, 1, 1])
+        self.assertEqual(v("lt"), [0, 1, 0, 0, 0, 0]); self.assertEqual(v("le"), [1, 1, 0, 1, 1, 0])
+        self.assertEqual(v("eq"), [1, 0, 0, 1, 1, 0]); self.assertEqual(v("ne"), [0, 1, 1, 0, 0, 1])
+        # A tie goes to the first operand, so maximum(-0, +0) is -0, as PyTorch 2.11 gives.
+        self.assertEqual([math.copysign(1, a) for a in v("mx")], [1, 1, 1, -1, 1, -1]); self.assertEqual(v("mx"), [1, 3, 3, 0, 0, -1])
+        self.assertEqual([math.copysign(1, a) for a in v("mn")], [1, 1, 1, -1, 1, -1]); self.assertEqual(v("mn"), [1, 2, 2, 0, 0, -2])
+        self.assertEqual(v("nanne"), [1] * 6); self.assertEqual(v("naneq"), [0] * 6); self.assertEqual(v("mxnan"), [1] * 6)
+        self.assertEqual(v("pick"), [1, 2, 3, 0, 0, -1]); self.assertEqual(v("zero"), [9, 9, 3, 0, 9, -1])
+        with self.assertRaises(GraphError): g.uniform((2,), -1)
+        with self.assertRaises(GraphError): g.uniform((2,), 1, 0)
+        with self.assertRaises(GraphError): g.where(g.tensor([1.0, 0.0]), g.tensor([1.0, 2.0, 3.0]), 0.0)
+
+    def test_uniform_known_answers(self):
+        # The same values tests/ir-v3.test.mjs pins for the JavaScript backends.
+        from zipp_gpu import execute_locally
+        g = Graph(); u = g.uniform((2, 5), 12345, 3)
+        want = [0.7625014185905457, 0.13164889812469482, 0.7715473175048828, 0.8630410432815552, 0.5749761462211609]
+        self.assertEqual(execute_locally(g.program(u=u))["outputs"]["u"]["data"][:5], want)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_python_reference_matches_the_javascript_backends_bit_for_bit(self):
+        g = Graph()
+        x = g.tensor([[0.5, -1.0, 2.0], [2.0, 0.0, -0.5]]); y = g.tensor([2.0, 0.0, -1.0]); c = g.tensor([[1.0], [0.0]])
+        outs = {op: getattr(x, op)(y) for op in ("eq", "ne", "lt", "le", "gt", "ge", "maximum", "minimum")}
+        outs.update(rev=y.maximum(x), where=g.where(c, x, y), mask=g.where(x > 0, y, x), u=g.uniform((3, 257), 2 ** 31 + 5, 7),
+                    u1=g.uniform((7,), 0), drop=x * (g.uniform((2, 3), 99, 4) >= 0.25) * (1 / 0.75))
+        program = g.program(**outs)
+        from zipp_gpu import execute_locally
+        mine = execute_locally(program)["outputs"]
+        result = subprocess.run(["node", "--input-type=module", "-e", NODE_BACKENDS], input=json.dumps(program),
+                                capture_output=True, text=True, cwd=str(LAB), timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for backend, theirs in json.loads(result.stdout).items():
+            for name, value in mine.items():
+                with self.subTest(backend=backend, output=name):
+                    self.assertEqual(theirs[name]["data"], value["data"])
+
+    def test_a_prepared_session_draws_afresh_every_step(self):
+        from zipp_gpu import execute_locally
+        g = Graph(); x = g.tensor([[0.0] * 4] * 3); u = g.uniform((3, 4), 5, 2)
+        drop = x * (u >= 0.5)
+        session = g.prepare(feeds={"x": x}, u=u, drop=drop)
+        got = []
+        session.run_steps(got.append, [{"x": [[1.0] * 4] * 3}] * 3)
+        for i, step in enumerate(got[0]["steps"]):
+            h = Graph(); want = execute_locally(h.program(u=h.uniform((3, 4), 5, 2 + i)))["outputs"]["u"]["data"]
+            self.assertEqual(step["outputs"]["u"]["data"], want)
+            self.assertEqual(step["outputs"]["drop"]["data"], [1.0 if v >= 0.5 else 0.0 for v in want])
+        self.assertEqual(len(set(tuple(s["outputs"]["u"]["data"]) for s in got[0]["steps"])), 3)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_prepared_dropout_session_matches_node_cpu_js_session_bit_for_bit(self):
+        g = Graph()
+        x = g.tensor([[0.0] * 3] * 4); w = g.tensor([[0.5, -0.25], [0.125, 1.0], [-0.75, 0.5]])
+        h = (x @ w).relu()
+        noise = (g.uniform((4, 2), 31337, 1) >= 0.3) * (1 / 0.7)
+        loss = (h * noise).sum()
+        grad = x.T @ (noise * h.positive())
+        w1 = g.sgd_update(w, grad, 0.1)
+        session = g.prepare(feeds={"x": x}, carry={w: "w"}, resident=["w"], loss=loss, noise=noise, w=w1)
+        batches = [[[0.1 * (i + j + k) - 0.4 for j in range(3)] for i in range(4)] for k in range(5)]
+        got = []
+        session.run_steps(got.append, [{"x": b} for b in batches], readback=["loss", "noise"])
+        steps = [{"inputs": {"0": sum(b, [])}} for b in batches]
+        script = """import {createRuntime} from './src/runtime.mjs';
+const [program,steps]=JSON.parse(await new Promise(r=>{let s='';process.stdin.on('data',d=>s+=d).on('end',()=>r(s));}));
+const rt=await createRuntime({backend:'cpu-js'}),session=await rt.prepare(program,{resident:['w']});
+const run=await session.run(steps,{readback:['loss','noise']});
+console.log(JSON.stringify(run.steps.map(s=>Object.fromEntries(Object.entries(s.outputs).map(([k,v])=>[k,Array.from(v.data)])))));rt.dispose();"""
+        result = subprocess.run(["node", "--input-type=module", "-e", script], input=json.dumps([session._program, steps]),
+                                capture_output=True, text=True, cwd=str(LAB), timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for mine, other in zip(got[0]["steps"], json.loads(result.stdout)):
+            self.assertEqual(mine["outputs"]["loss"]["data"], other["loss"]); self.assertEqual(mine["outputs"]["noise"]["data"], other["noise"])
+        self.assertGreater(len(set(tuple(s["outputs"]["noise"]["data"]) for s in got[0]["steps"])), 1)
 
 if __name__=="__main__":unittest.main(verbosity=2)

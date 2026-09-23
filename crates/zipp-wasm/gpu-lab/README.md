@@ -17,7 +17,9 @@ Python compiles to Zipp bytecode and executes inside the WASM Worker. Its built-
 `takeHostRequests()` and calls `pythonCall("__zipp_py_deliver", ...)` with results.
 The bundled `torch` subset is eager CPU-only; experimental `torch.compile` records
 supported GPU inference and training steps (dense layers with relu, gelu, sigmoid
-or tanh, softmax, MSE or fused cross-entropy, SGD with momentum, Adam or AdamW).
+or tanh, softmax, MSE or fused cross-entropy, SGD with momentum, Adam or AdamW,
+comparisons and masks, where/masked_fill, clamp, hardtanh/relu6/leaky_relu,
+maximum/minimum and dropout drawn on the device).
 General Python is not compiled to shaders. See the [Torch compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).
 
 ## Use JavaScript directly
@@ -42,13 +44,16 @@ attempts are reported by `runtime.info().fallbackAttempts`. Explicit backend
 selection fails if unavailable. Hardware GPU paths reject recognized software
 renderers. Browser/OS policy selects one adapter; this does not pool GPUs.
 
-Graph IR v2 (stage 1: MLP classification training and inference) covers, on
-every backend, float32 tensors of rank 0-4:
+Graph IR v2 (stage 1: MLP classification training and inference) and v3
+(masks, selection and on-device random numbers) cover, on every backend,
+float32 tensors of rank 0-4:
 
 | Family | Operations |
 |---|---|
-| Sources | `input`, `full` |
+| Sources | `input`, `full`; v3: `uniform` (see below) |
 | Elementwise | `add`, `sub`, `mul`, `div` with NumPy broadcasting; `neg`, `exp`, `log`, `sqrt`, `tanh`, `sigmoid`, `relu`, `positive` (ReLU mask), `gelu` and `gelu_grad` |
+| v3 elementwise | `maximum`, `minimum` (NaN from either side; a tie, -0 against +0 included, returns `a`, as PyTorch does); comparisons `eq`, `ne`, `lt`, `le`, `gt`, `ge` returning float32 1/0 masks (a NaN operand satisfies only `ne`); all with NumPy broadcasting |
+| v3 selection | `where` with `c`, `a`, `b` (three-way broadcasting): `a` where `c` is nonzero (a NaN counts as nonzero), `b` where it is +0 or -0 |
 | Shape | `reshape` (shares storage), `permute`, `transpose` (matrices) |
 | Reductions | `sum`, `mean` over one `axis` (with `keepdim`) or the whole tensor |
 | Rows | `softmax`, `log_softmax` over the last axis (max-subtracted) |
@@ -57,6 +62,20 @@ every backend, float32 tensors of rank 0-4:
 | Losses | `cross_entropy` (mean over rows, integer class targets) and `cross_entropy_grad` = (softmax - onehot)/N |
 | Optimizers | `sgd_update`, `momentum_update`, `adam_m`, `adam_v`, `adam_update` (PyTorch's update order) |
 | Other | toroidal `life` |
+
+`uniform` (`shape`, `seed` an integer in [0, 2^32), `step` an integer in
+[1, 2^31], default 1) is a counter-based generator: element i is
+`mix(mix(i ^ k2) + k1) >> 8` times 2^-24, with k1 = `mix(seed ^ 0x9e3779b9)`,
+k2 = `mix(step ^ k1)` and `mix` Chris Wellons' lowbias32 hash, all in 32-bit
+unsigned arithmetic. It is integer-exact, so every backend (and `zipp_gpu`'s
+Python reference) draws the same float32 bits in [0, 1); it is not PyTorch's
+random stream. A prepared session evaluates it at the recorded `step` plus the
+session step minus one, as it advances `adam_update`, so one recorded dropout
+mask (`ge(uniform, p)`) is fresh at every step. Comparisons, `maximum`,
+`minimum`, `where` and `uniform` are exact on every backend; the browser harness
+holds WebGPU and WebGL2 to bit equality with cpu-js on them (under ANGLE's
+Direct3D backend `x < y ? y : x` lost a tied zero's sign, so the shaders decide
+ties before ordering).
 
 GELU is the exact-erf form 0.5*x*(1 + erf(x/sqrt(2))). No backend language has
 erf, so all of them evaluate one shared approximation (a Taylor series below 0.5
@@ -70,12 +89,14 @@ Only named outputs are read back. Inputs and outputs are finite float32: NaN
 produced inside a graph (overflow, then `inf - inf`) propagates through ReLU and
 the reductions and fails readback with `NUMBER` on every backend, including the
 GPUs checked here. One graph runs at a time; await it before submitting another.
-Dispose the runtime after outstanding work finishes. Protocol versions 1 and 2
-are accepted and mean the same thing; every version-1 graph is a valid graph.
-`zipp_gpu.Graph.program()` labels a graph 2 only once it uses something version 1
-did not define (a new operation, rank above two, broadcasting beyond a scalar
-operand, an axis reduction or a batched matmul), so graphs a version-1 host
-understands still arrive labelled the way it expects.
+Dispose the runtime after outstanding work finishes. Protocol versions 1, 2
+and 3 are accepted; each adds operations and every older graph means the same
+thing under a newer version. `zipp_gpu.Graph.program()` labels a graph 2 only
+once it uses something version 1 did not define (a new operation, rank above
+two, broadcasting beyond a scalar operand, an axis reduction or a batched
+matmul), and 3 only once it uses `maximum`, `minimum`, a comparison, `where` or
+`uniform`, so graphs an older host understands still arrive labelled the way
+it expects and a version-2 host refuses a version-3 graph instead of misreading it.
 
 Default validation limits include 512 nodes, 4,194,304 elements per tensor,
 65,536 per dimension, 64 MiB summed **logical** node storage, 100 million
@@ -139,7 +160,9 @@ callback that resubmits cannot recurse), and rejects work after tenant invalidat
   `backend-bits.test.mjs` holds the compiled module to bit-for-bit equality with
   the JavaScript reference over whole training steps.
 - `tests/`: numerical checks, allocation/lifecycle mocks and browser cases; `tests/ml-cases.mjs`
-  holds the per-operation fixtures and the MLP training-step generator shared with the browser.
+  holds the per-operation fixtures, the MLP training-step generator and the prepared
+  dropout MLP shared with the browser; `tests/ir-v3.test.mjs` covers version 3 (NaN,
+  ties and signed zeros, the generator's known answers and statistics, per-step draws).
 - `docs/INTEGRATION.md`, `docs/ARCHITECTURE.md`, `docs/VALIDATION.md`: contracts and evidence.
 
 ## Check and rebuild

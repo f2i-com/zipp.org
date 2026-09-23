@@ -1,4 +1,5 @@
 import {gelu, geluGrad, sigmoid, relu, quantizeRow} from '../kernel-math.mjs';
+import {uniformKeys, uniformValue} from '../graph.mjs';
 
 /**
  * Reference float32 host-JavaScript implementation, not advertised as WASM.
@@ -11,7 +12,14 @@ import {blockDecoder, FORMATS, readFixedQuants} from '../quant.mjs';
 const f = Math.fround;
 const UNARY = {relu, positive: x => x > 0 ? 1 : 0, neg: x => -x, exp: Math.exp, log: Math.log, sqrt: Math.sqrt,
   tanh: Math.tanh, sigmoid, gelu, gelu_grad: geluGrad};
-const BINARY = {add: (x, y) => x + y, sub: (x, y) => x - y, mul: (x, y) => x * y, div: (x, y) => x / y};
+// maximum/minimum: NaN if either operand is NaN, otherwise the larger (smaller)
+// with ties -- including -0 against +0 -- going to the first operand, as
+// PyTorch's kernels do. Comparisons are 0/1 masks; NaN compares unequal.
+const BINARY = {add: (x, y) => x + y, sub: (x, y) => x - y, mul: (x, y) => x * y, div: (x, y) => x / y,
+  maximum: (x, y) => (x !== x || y !== y) ? NaN : x < y ? y : x,
+  minimum: (x, y) => (x !== x || y !== y) ? NaN : y < x ? y : x,
+  eq: (x, y) => x === y ? 1 : 0, ne: (x, y) => x !== y ? 1 : 0, lt: (x, y) => x < y ? 1 : 0,
+  le: (x, y) => x <= y ? 1 : 0, gt: (x, y) => x > y ? 1 : 0, ge: (x, y) => x >= y ? 1 : 0};
 
 /** Pairwise float32 reduction: the tree topology the GPU kernels use. */
 export function pairwiseSum(a) {
@@ -57,7 +65,8 @@ export class CPUBackend {
     switch (n.op) {
       case 'input': out.set(n.data); break;
       case 'full': out.fill(n.value); break;
-      case 'add': case 'sub': case 'mul': case 'div': {
+      case 'add': case 'sub': case 'mul': case 'div': case 'maximum': case 'minimum':
+      case 'eq': case 'ne': case 'lt': case 'le': case 'gt': case 'ge': {
         const op = BINARY[n.op];
         if (n.mode === 'same') for (let i = 0; i < n.size; i++) out[i] = op(a[i], b[i]);
         else if (n.mode === 'aScalar') { const x = a[0]; for (let i = 0; i < n.size; i++) out[i] = op(x, b[i]); }
@@ -72,6 +81,22 @@ export class CPUBackend {
         break;
       }
       case 'transpose': case 'permute': strided(n, out, i => a[i]); break;
+      case 'where': {
+        // refs are [condition, a, b]: nonzero (NaN included) picks a.
+        const [c, x, y] = refs, [d0, d1, d2, d3] = n.dims, [c0, c1, c2, c3] = n.cStrides;
+        const [a0, a1, a2, a3] = n.aStrides, [b0, b1, b2, b3] = n.bStrides;
+        let i = 0;
+        for (let x0 = 0; x0 < d0; x0++) for (let x1 = 0; x1 < d1; x1++) for (let x2 = 0; x2 < d2; x2++) {
+          const cb = x0*c0 + x1*c1 + x2*c2, ab = x0*a0 + x1*a1 + x2*a2, bb = x0*b0 + x1*b1 + x2*b2;
+          for (let x3 = 0; x3 < d3; x3++) out[i++] = c[cb + x3*c3] !== 0 ? x[ab + x3*a3] : y[bb + x3*b3];
+        }
+        break;
+      }
+      case 'uniform': {
+        const [k1, k2] = uniformKeys(n.seed, n.step);
+        for (let i = 0; i < n.size; i++) out[i] = uniformValue(k1, k2, i);
+        break;
+      }
       case 'sum': case 'mean': {
         if (n.whole) {
           const total = pairwiseSum(a);

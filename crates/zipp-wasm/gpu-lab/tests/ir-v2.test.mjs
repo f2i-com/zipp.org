@@ -22,10 +22,11 @@ test('broadcasting follows NumPy right alignment and yields zero strides on expa
   const b=broadcast([4,1],[5]);assert.deepEqual(b.dims,[1,1,4,5]);assert.deepEqual(b.aStrides,[4,4,1,0]);assert.deepEqual(b.bStrides,[5,5,0,1]);
   for(const [x,y] of [[[3],[4]],[[2,3],[3,2]],[[4,1,3],[2,3,3]]])assert.throws(()=>broadcast(x,y),shapeErr);
 });
-test('version 2 is accepted, versions other than 1 and 2 are not',()=>{
+test('versions 2 and 3 are accepted, versions other than 1, 2 and 3 are not',()=>{
   const g=builder();g.input([1,2]);
   assert.equal(validateProgram(g.program({r:0})).nodes.length,1);
-  for(const version of [0,3,'2',2.5])assert.throws(()=>validateProgram({...g.program({r:0}),version}),protoErr);
+  assert.equal(validateProgram({...g.program({r:0}),version:3}).nodes.length,1);
+  for(const version of [0,4,'2','3',2.5])assert.throws(()=>validateProgram({...g.program({r:0}),version}),protoErr);
 });
 test('shapes: rank up to four, holes and overflow-sized products fail with the right code',()=>{
   const full=shape=>({version:2,nodes:[{id:0,op:'full',shape,value:1}],outputs:[{name:'r',id:0}]});

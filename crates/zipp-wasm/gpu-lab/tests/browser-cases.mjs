@@ -1,5 +1,5 @@
 import {createRuntime} from '../src/runtime.mjs';
-import {opCases, mlpTrainingStep, mlpSessionProgram, seeded} from './ml-cases.mjs';
+import {opCases, mlpTrainingStep, mlpSessionProgram, dropoutSessionProgram, seeded} from './ml-cases.mjs';
 import {decodeQ4K, Q4_K_BLOCK, Q4_K_BYTES} from '../src/quant.mjs';
 const input=(id,data,shape=[data.length])=>({id,op:'input',shape,data});
 const program=nodes=>({version:1,nodes,outputs:[{name:'result',id:nodes.length-1}]});
@@ -39,18 +39,43 @@ function cases(){
   }
   return [...result,...opCases()];
 }
-/** Largest |actual - expected| over every named output; throws past a float32 GPU tolerance. */
-function compare(actual,expected,tolerance=2e-4){
+/** Largest |actual - expected| over every named output; throws past a float32 GPU tolerance.
+ * `exact`: the same float32 bits, a zero's sign included (integer-exact and selecting operations). */
+function compare(actual,expected,tolerance=2e-4,exact=false){
   let worst=0;
   for(const name of Object.keys(expected.outputs)){
     const a=actual.outputs[name]?.data,b=expected.outputs[name].data;
     if(!a||a.length!==b.length)throw Error(`Wrong result length for ${name}`);
     for(let i=0;i<a.length;i++){
       const delta=Math.abs(a[i]-b[i]);worst=Math.max(worst,delta);
-      if(!Number.isFinite(a[i])||delta>tolerance+tolerance*Math.abs(b[i]))throw Error(`Mismatch in ${name} at ${i}: ${a[i]} versus ${b[i]}`);
+      if(exact?!Object.is(a[i],b[i]):(!Number.isFinite(a[i])||delta>tolerance+tolerance*Math.abs(b[i])))throw Error(`Mismatch in ${name} at ${i}: ${a[i]} versus ${b[i]}`);
     }
   }
   return worst;
+}
+/**
+ * A prepared dropout MLP (masks drawn on the device by `uniform`, a fresh one
+ * per step) run for six steps on `runtime` and on cpu-js: the masks must be
+ * the same bits, the losses and parameters within the float32 tolerance.
+ */
+async function dropoutSession(runtime,reference){
+  const spec=dropoutSessionProgram(),batches=spec.batches(6),out={};
+  for(const [key,rt] of [['actual',runtime],['expected',reference]]){
+    const session=await rt.prepare(spec.program,{resident:spec.resident});
+    try{
+      const run=await session.run(batches,{readback:['loss','noise']});
+      out[key]={steps:run.steps,params:(await session.download(spec.resident)).outputs};
+    }finally{session.dispose();}
+  }
+  let worst=0;const masks=new Set();
+  out.expected.steps.forEach((s,i)=>{
+    const a=out.actual.steps[i].outputs;
+    compare({outputs:{noise:a.noise}},{outputs:{noise:s.outputs.noise}},0,true);
+    worst=Math.max(worst,compare({outputs:{loss:a.loss}},{outputs:{loss:s.outputs.loss}}));
+    masks.add(Array.from(a.noise.data,v=>v>0?1:0).join(''));
+  });
+  if(masks.size!==batches.length)throw Error(`Dropout masks repeat across steps (${masks.size} distinct of ${batches.length})`);
+  return Math.max(worst,compare({outputs:out.actual.params},{outputs:out.expected.params}));
 }
 /** Explicit backend selection: unsupported is a skip; a numerical/shader failure is a failure. */
 export async function checkBackend(backend,options={}){
@@ -62,10 +87,13 @@ export async function checkBackend(backend,options={}){
     reference=await createRuntime({backend:'cpu-js'});
     for(const [name,p] of cases()) {
       try {
-        const actual=await runtime.execute(p),expected=await reference.execute(p),maxAbsError=compare(actual,expected);
+        const actual=await runtime.execute(p),expected=await reference.execute(p),maxAbsError=compare(actual,expected,2e-4,name.startsWith('exact '));
         report.checks.push({name,status:'passed',maxAbsError,totalWallMs:actual.stats.totalWallMs});report.passed++;
       }catch(error){report.status='failed';report.checks.push({name,status:'failed',error:String(error.message)});}
     }
+    const name='prepared dropout MLP: fresh device masks per step, bit-identical to cpu-js';
+    try{const maxAbsError=await dropoutSession(runtime,reference);report.checks.push({name,status:'passed',maxAbsError});report.passed++;}
+    catch(error){report.status='failed';report.checks.push({name,status:'failed',error:String(error.message)});}
   }finally{reference?.dispose();runtime.dispose();}
   return report;
 }

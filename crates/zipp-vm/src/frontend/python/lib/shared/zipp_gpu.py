@@ -17,6 +17,11 @@ approximation on every backend); sum/mean over an axis or the whole tensor;
 softmax and log_softmax over the last axis; matmul for matrices and batches;
 reshape/permute; fused cross-entropy with its gradient; and SGD, momentum and
 Adam update steps, so a whole training step can run in one graph.
+
+Protocol version 3 adds maximum/minimum, the comparisons (float32 0/1 masks),
+`Graph.where` and `Graph.uniform`, a counter-based random draw that is the
+same bits on every backend (see `_uniform_keys`). A graph is labelled 3 only
+once it uses one of them.
 """
 import math
 import struct
@@ -94,6 +99,10 @@ def _size(shape):
 # The ten operations the first protocol version defined; see `Graph.program`.
 _VERSION_ONE_OPS = frozenset((
     "input", "full", "add", "sub", "mul", "relu", "positive", "transpose", "matmul", "sum", "life"))
+# The comparisons: float32 masks, 1.0 where the relation holds, 0.0 elsewhere.
+_COMPARE_OPS = ("eq", "ne", "lt", "le", "gt", "ge")
+# What protocol version 3 added; a graph using any of them is labelled 3.
+_VERSION_THREE_OPS = frozenset(_COMPARE_OPS + ("maximum", "minimum", "where", "uniform"))
 
 
 def _axis(axis, rank):
@@ -163,6 +172,47 @@ class Tensor:
 
     def __matmul__(self, other):
         return self._graph.matmul(self, other)
+
+    # Comparisons record masks (1.0 where true, 0.0 elsewhere; a NaN operand
+    # holds only for `ne`). No `==`/`!=` operators: a handle stays hashable
+    # and comparable by identity, as dict keys (`prepare(carry=...)`) need.
+    def __lt__(self, other):
+        return self._graph._binary("lt", self, other)
+
+    def __le__(self, other):
+        return self._graph._binary("le", self, other)
+
+    def __gt__(self, other):
+        return self._graph._binary("gt", self, other)
+
+    def __ge__(self, other):
+        return self._graph._binary("ge", self, other)
+
+    def eq(self, other):
+        return self._graph._binary("eq", self, other)
+
+    def ne(self, other):
+        return self._graph._binary("ne", self, other)
+
+    def lt(self, other):
+        return self._graph._binary("lt", self, other)
+
+    def le(self, other):
+        return self._graph._binary("le", self, other)
+
+    def gt(self, other):
+        return self._graph._binary("gt", self, other)
+
+    def ge(self, other):
+        return self._graph._binary("ge", self, other)
+
+    def maximum(self, other):
+        """Elementwise maximum: NaN if either side is NaN, a tie (-0 against +0 too) to self."""
+        return self._graph._binary("maximum", self, other)
+
+    def minimum(self, other):
+        """Elementwise minimum: NaN if either side is NaN, a tie (-0 against +0 too) to self."""
+        return self._graph._binary("minimum", self, other)
 
     def relu(self):
         return self._graph._unary("relu", self, self.shape)
@@ -285,7 +335,9 @@ class Graph:
         node_id = len(self._nodes)
         node = {"id": node_id, "op": op}
         node.update(fields)
-        if self._version == 1 and not self._version_one(op, shape, fields):
+        if op in _VERSION_THREE_OPS:
+            self._version = 3
+        elif self._version == 1 and not self._version_one(op, shape, fields):
             self._version = 2
         self._nodes.append(node)
         tensor = Tensor(self, node_id, shape)
@@ -327,6 +379,29 @@ class Graph:
 
     def zeros(self, shape):
         return self.full(shape, 0)
+
+    def where(self, condition, a, b):
+        """`a` where `condition` is nonzero (a NaN counts as nonzero), `b` where
+        it is zero of either sign; the three broadcast together. Numbers are
+        recorded as scalar inputs."""
+        for value in (condition, a, b):
+            if isinstance(value, Tensor):
+                self._owned(value)
+        c, x, y = self._coerce(condition), self._coerce(a), self._coerce(b)
+        return self._append("where", _broadcast(_broadcast(c.shape, x.shape), y.shape), c=c._id, a=x._id, b=y._id)
+
+    def uniform(self, shape, seed, step=1):
+        """float32 numbers in [0, 1), multiples of 2**-24: element i is a hash
+        of (seed, step, i) in integer arithmetic, so every backend (and this
+        module) draws the same bits. A prepared session advances `step` by one
+        per executed step, so each step draws afresh. It is not PyTorch's
+        random stream."""
+        shape = _shape(shape)
+        if type(seed) is not int or not 0 <= seed <= 0xFFFFFFFF:
+            raise GraphError("uniform seed is an integer in [0, 2**32)")
+        if type(step) is not int or not 1 <= step <= 2 ** 31:
+            raise GraphError("uniform step is an integer in [1, 2**31]")
+        return self._record("uniform", shape, {"shape": list(shape), "seed": seed, "step": step})
 
     def _binary(self, op, left, right):
         # Check existing handles before recording a new scalar.
@@ -448,7 +523,9 @@ class Graph:
         version did not define (a new operation, rank above two, broadcasting
         beyond a scalar operand, an axis reduction or a batched matmul), and
         stays 1 otherwise, so a graph that a version-1 host understands is still
-        labelled the way that host expects.
+        labelled the way that host expects. It is 3 once the graph uses an
+        operation version 3 added (maximum, minimum, a comparison, where or
+        uniform), so a version-2 host refuses it instead of misreading it.
         """
         program = self._program(outputs)
         for node in program["nodes"]:
@@ -694,7 +771,35 @@ _UNARY = {
     "gelu": lambda x: x * _cdf(x),
     "gelu_grad": lambda x: _cdf(x) + x * 0.3989422804014327 * _exp(-0.5 * min(x * x, 1e300)),
 }
-_BINARY = {"add": lambda x, y: x + y, "sub": lambda x, y: x - y, "mul": lambda x, y: x * y, "div": _div}
+_BINARY = {"add": lambda x, y: x + y, "sub": lambda x, y: x - y, "mul": lambda x, y: x * y, "div": _div,
+           # NaN from either side; a tie (-0 against +0 included) goes to x, as in PyTorch.
+           "maximum": lambda x, y: x + y if x != x or y != y else (y if x < y else x),
+           "minimum": lambda x, y: x + y if x != x or y != y else (y if y < x else x),
+           "eq": lambda x, y: 1.0 if x == y else 0.0, "ne": lambda x, y: 1.0 if x != y else 0.0,
+           "lt": lambda x, y: 1.0 if x < y else 0.0, "le": lambda x, y: 1.0 if x <= y else 0.0,
+           "gt": lambda x, y: 1.0 if x > y else 0.0, "ge": lambda x, y: 1.0 if x >= y else 0.0}
+
+
+def _mix32(x):
+    """Chris Wellons' lowbias32 finalizer, in 32-bit unsigned arithmetic."""
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x ^= x >> 15
+    x = (x * 0x846CA68B) & 0xFFFFFFFF
+    return x ^ (x >> 16)
+
+
+def _uniform_keys(seed, step):
+    """The `uniform` operation's two keys: k1 from the seed, k2 from the step and k1.
+
+    Element i is then (mix(mix(i ^ k2) + k1) >> 8) * 2**-24, every step modulo
+    2**32: integer-exact, so each backend draws the same float32 bits."""
+    k1 = _mix32((seed ^ 0x9E3779B9) & 0xFFFFFFFF)
+    return k1, _mix32((step ^ k1) & 0xFFFFFFFF)
+
+
+def _uniform_value(k1, k2, i):
+    return (_mix32((_mix32((i ^ k2) & 0xFFFFFFFF) + k1) & 0xFFFFFFFF) >> 8) * 5.9604644775390625e-08
 
 
 def _strides(shape):
@@ -752,8 +857,8 @@ def _optimizer_step(op, node, a, b, c):
 
 def execute_locally(program, check_finite=True):
     """Run a program with the float32 reference implementation in Python."""
-    if not isinstance(program, dict) or program.get("version") not in (1, 2):
-        raise ComputeError("PROTOCOL", "Only graph protocol versions 1 and 2 are supported")
+    if not isinstance(program, dict) or program.get("version") not in (1, 2, 3):
+        raise ComputeError("PROTOCOL", "Only graph protocol versions 1, 2 and 3 are supported")
     if not isinstance(program.get("nodes"), list) or not isinstance(program.get("outputs"), list):
         raise ComputeError("PROTOCOL", "A program needs node and output lists")
     values = []
@@ -785,6 +890,24 @@ def execute_locally(program, check_finite=True):
             shape = sa
             fn = _UNARY[op]
             out = [_f32(fn(v)) for v in a]
+        elif op == "where":
+            c, sc = values[node["c"]], shapes[node["c"]]
+            b, sb = values[node["b"]], shapes[node["b"]]
+            shape = _broadcast(_broadcast(sc, sa), sb)
+            rank = len(shape)
+
+            def spread(s):
+                padded = (1,) * (rank - len(s)) + s
+                return [0 if padded[i] == 1 else t for i, t in enumerate(_strides(padded))]
+            tc, ta, tb = spread(sc), spread(sa), spread(sb)
+            out = []
+            for index in _indices(shape):
+                pick = c[sum(i * t for i, t in zip(index, tc))] != 0
+                out.append(a[sum(i * t for i, t in zip(index, ta))] if pick else b[sum(i * t for i, t in zip(index, tb))])
+        elif op == "uniform":
+            shape = tuple(node["shape"])
+            k1, k2 = _uniform_keys(node["seed"], node.get("step", 1))
+            out = [_uniform_value(k1, k2, i) for i in range(_size(shape))]
         elif op in ("sum", "mean"):
             if "axis" not in node:
                 shape = tuple(1 for _ in sa) if node.get("keepdim") else ()
@@ -932,12 +1055,13 @@ _KERNEL_STEPS = frozenset(("sgd_update", "momentum_update", "adam_m", "adam_v", 
 _KERNEL_OPS = frozenset((
     "input", "full", "add", "sub", "mul", "div", "transpose", "permute", "reshape", "sum", "mean",
     "softmax", "log_softmax", "cross_entropy", "cross_entropy_grad", "matmul", "life",
-)) | _KERNEL_UNARY | _KERNEL_STEPS
+    "maximum", "minimum", "where", "uniform",
+) + _COMPARE_OPS) | _KERNEL_UNARY | _KERNEL_STEPS
 
 
 def _execute_kernels(program, storage, check_finite=True):
     """`execute_locally` on Zipp's tensor kernels: the same float32 numbers."""
-    if (program.get("version") not in (1, 2)
+    if (program.get("version") not in (1, 2, 3)
             or any(node.get("op") not in _KERNEL_OPS for node in program.get("nodes", ()))):
         return _execute_reference(program, storage, check_finite)
     values = []
@@ -951,6 +1075,29 @@ def _execute_kernels(program, storage, check_finite=True):
         elif op == "full":
             shape = tuple(node["shape"])
             out = _k.full("float32", _size(shape), node["value"])
+        elif op in _COMPARE_OPS:
+            # The kernel's bool mask, converted exactly to float32 0/1.
+            a, b = node["a"], node["b"]
+            mask, shape = _k.binary(op, values[a], shapes[a], values[b], shapes[b])
+            out = _k.astype(mask, "float32")
+        elif op in ("maximum", "minimum"):
+            # b where it wins strictly, else a (so a tie goes to a), then b
+            # wherever b is NaN (a NaN in a is already what was taken).
+            a, b = node["a"], node["b"]
+            va, sa, vb, sb = values[a], shapes[a], values[b], shapes[b]
+            wins, shape = _k.binary("lt" if op == "maximum" else "gt", va, sa, vb, sb)
+            picked, shape = _k.where(wins, shape, vb, sb, va, sa, "float32")
+            nan, nan_shape = _k.binary("ne", vb, sb, vb, sb)
+            out, shape = _k.where(nan, nan_shape, vb, sb, picked, shape, "float32")
+        elif op == "where":
+            # Nonzero (NaN included) picks a; zero of either sign picks b.
+            c = node["c"]
+            chosen, c_shape = _k.binary("ne", values[c], shapes[c], _k.full("float32", 1, 0.0), ())
+            out, shape = _k.where(chosen, c_shape, values[node["a"]], shapes[node["a"]], values[node["b"]], shapes[node["b"]], "float32")
+        elif op == "uniform":
+            shape = tuple(node["shape"])
+            k1, k2 = _uniform_keys(node["seed"], node.get("step", 1))
+            out = _k.graph_uniform(_size(shape), k1, k2)
         elif op in _BINARY:
             a, b = node["a"], node["b"]
             out, shape = _k.binary(op, values[a], shapes[a], values[b], shapes[b])
@@ -1289,8 +1436,9 @@ class Session:
                         node["data"] = self._values[node["id"]]
                     else:
                         raise ComputeError("REFERENCE", "Input %d has no value: feed it in step %d" % (node["id"], index))
-                elif node["op"] == "adam_update" and step_no != 1:
-                    node["step"] = node["step"] + step_no - 1
+                elif node["op"] in ("adam_update", "uniform") and step_no != 1:
+                    # Adam's bias correction follows the step; a uniform draw is fresh each step.
+                    node["step"] = node.get("step", 1) + step_no - 1
                 nodes.append(node)
             program = dict(base, nodes=nodes)
             self._began = True

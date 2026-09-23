@@ -91,7 +91,8 @@ export class Session {
    * `readback`: output names read for every step (default: every output not
    * resident). `step`: the training-step number of the first step (default:
    * continues from the previous run); an `adam_update` node's bias correction
-   * follows it, so one prepared step trains a whole run.
+   * follows it, so one prepared step trains a whole run, and a `uniform`
+   * node draws with its recorded step plus this one minus 1, a new draw per step.
    */
   async run(steps,{readback,step}={}){
     check(!this.disposed,'DISPOSED','Session has been disposed');
@@ -128,7 +129,9 @@ export class Session {
         for(const n of this.inputs)if(uses[n.id]===0)freeLocal(n.id); // nothing reads it
         for(const n of nodes){
           if(n.alias||n.op==='input')continue;
-          const node=n.op==='adam_update'&&stepNo!==1?{...n,...adamStep(n.raw,n.step+stepNo-1)}:n;
+          // Step-dependent nodes follow the session's step: Adam's bias
+          // correction, and a `uniform` draw, which is fresh every step.
+          const node=stepNo===1?n:n.op==='adam_update'?{...n,...adamStep(n.raw,n.step+stepNo-1)}:n.op==='uniform'?{...n,step:n.step+stepNo-1}:n;
           handles.set(n.id,await this.impl.run(node,n.refs.map(r=>handles.get(root[r]))));
           for(const r of n.refs){uses[root[r]]--;if(uses[root[r]]===0)freeLocal(root[r]);}
           if(uses[n.id]===0)freeLocal(n.id);
