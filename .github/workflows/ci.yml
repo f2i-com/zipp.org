@@ -78,7 +78,7 @@ jobs:
           node-version: 24
       - name: Test the Python-enabled VM and CLI (including filesystem policy)
         run: |
-          cargo +1.92.0 test --locked -p zipp-vm --features python --test python_frontend --test python_project --test python_corpus --test python_torch --test python_javascript --test python_torch_core --test python_torch_nn --test python_torch_optim --test python_torch_gpu --test python_torch_native
+          cargo +1.92.0 test --locked -p zipp-vm --features python --test python_frontend --test python_project --test python_corpus --test python_torch --test python_javascript --test python_torch_core --test python_torch_nn --test python_torch_optim --test python_torch_gpu --test python_torch_native --test python_torch_gpu2 --test python_torch_nn2 --test python_torch_dtypes --test python_torch_linalg --test python_torch_distributions --test python_torch_amp
           cargo +1.92.0 test --locked -p zipp-vm --features python-js-interop --test python_javascript
           cargo +1.92.0 test --locked -p zipp-cli
       - name: Build the Python-enabled browser artifact
