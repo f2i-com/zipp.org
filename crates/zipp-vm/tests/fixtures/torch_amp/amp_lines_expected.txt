@@ -1,0 +1,26 @@
+step before scale: AssertionError Attempted step but _scale is None.  This may indicate your script did not use scaler.scale(loss or outputs) earlier in the iteration.
+update before scale: AssertionError Attempted update but _scale is None.  This may indicate your script did not use scaler.scale(loss or outputs) earlier in the iteration.
+unscale twice: RuntimeError unscale_() has already been called on this optimizer since the last update().
+step twice: RuntimeError step() has already been called since the last update().
+unscale after step: RuntimeError unscale_() is being called after step().
+closure: RuntimeError Closure use is not currently supported if GradScaler is enabled.
+growth factor: AssertionError The growth factor must be > 1.0.
+backoff factor: AssertionError The backoff factor must be < 1.0.
+load empty: RuntimeError The source state dict is empty, possibly because it was saved from a disabled instance of GradScaler.
+scale bad: ValueError outputs must be a Tensor or an iterable of Tensors
+no grads: AssertionError No inf checks were recorded for this optimizer.
+disabled: True 1.0 {} False None
+disabled step: None [0.0, 0.0]
+disabled grads: [2.0, 4.0]
+available: True True False
+autocast int device: ValueError Expected `device_type` of type `str`, got: `<class 'int'>`
+autocast unknown device: RuntimeError Expected one of cpu, cuda, ipu, xpu, mkldnn, opengl, opencl, ideep, hip, ve, fpga, maia, xla, lazy, vulkan, mps, meta, hpu, mtia, privateuseone device type at start of device string: xyz
+default: False True False
+inside: True True True True
+nested off: False
+restored: True
+after: False
+decorated: (True, 2) decorated False
+exception restores: False
+custom: [('fwd', True), ('cast fwd', False, True), ('cast bwd', False), ('bwd', True), ('fwd', False), ('bwd', False)] [12.75, 4.0]
+custom_fwd device: ValueError Expected `device_type` of type `str`, got: `<class 'int'>`

@@ -1,0 +1,27 @@
+inv singular: LinAlgError True linalg.inv: The diagonal element 2 is zero, the inversion could not be completed because the input matrix is singular.
+inv batch: LinAlgError True linalg.inv: (Batch element 1): The diagonal element 2 is zero, the inversion could not be completed because the input matrix is singular.
+cholesky: LinAlgError True linalg.cholesky: The factorization could not be completed because the input is not positive-definite (the leading minor of order 2 is not positive-definite).
+cholesky batch: LinAlgError True linalg.cholesky: (Batch element 1): The factorization could not be completed because the input is not positive-definite (the leading minor of order 2 is not positive-definite).
+cholesky_ex check: LinAlgError True linalg.cholesky_ex: The factorization could not be completed because the input is not positive-definite (the leading minor of order 2 is not positive-definite).
+solve singular: LinAlgError True torch.linalg.solve: The solver failed because the input matrix is singular.
+solve shapes: RuntimeError True linalg.solve: Incompatible shapes of A and B for the equation AX = B (2x2 and 3x1)
+inv rect: RuntimeError True linalg.inv: A must be batches of square matrices, but they are 2 by 3 matrices
+inv 1d: RuntimeError True linalg.inv: The input tensor A must have at least 2 dimensions.
+inv long: RuntimeError True linalg.inv: Expected a floating point or complex tensor as input. Got Long
+det rect: RuntimeError True linalg.det: A must be batches of square matrices, but they are 2 by 3 matrices
+eigh rect: RuntimeError True linalg.eigh: A must be batches of square matrices, but they are 2 by 3 matrices
+norm 3d ord: RuntimeError True linalg.norm: If dim is not specified but ord is, the input must be 1D or 2D. Got 3D.
+matrix_norm ord: RuntimeError True linalg.matrix_norm: Order 3 not supported.
+vector_norm str: TypeError False linalg_vector_norm(): argument 'ord' must be Number, not str
+cross: RuntimeError True linalg.cross: inputs dimension -1 must have length 3. Got 3 and 4
+multi_dot: RuntimeError True multi_dot(): expected at least 2 tensors but got 1
+lstsq driver: RuntimeError True torch.linalg.lstsq: parameter `driver` should be one of (gels, gelsy, gelsd, gelss)
+qr mode: RuntimeError True qr received unrecognized mode 'bad' but expected one of 'reduced' (default), 'r', or 'complete'
+matrix_power singular: LinAlgError True linalg.inv: The diagonal element 2 is zero, the inversion could not be completed because the input matrix is singular.
+cross ndim: RuntimeError True linalg.cross: inputs must have the same number of dimensions.
+inv output write: inplace error
+det input write: inplace error
+solve input write: inplace error
+cholesky output write: inplace error
+qr r backward: RuntimeError True The derivative of linalg.qr depends on Q, which is not computed when mode='r'. Please use linalg.qr(A, mode='reduced') if you are going to differentiate through linalg.qr.
+qr complete backward: RuntimeError True The QR decomposition is not differentiable when mode='complete' and nrows > ncols.

@@ -1,0 +1,138 @@
+Normal [3] [] True False [2, 3] torch.float32 Real()
+Normal0 [] [] True False [2] torch.float32 Real()
+LogNormal [3] [] True False [2, 3] torch.float32 GreaterThan(lower_bound=0.0)
+Uniform [2] [] True False [2, 2] torch.float32 Interval(lower_bound=tensor([0., 0.]), upper_bound=tensor([1., 2.]))
+Bernoulli [2] [] False True [2, 2] torch.float32 Boolean()
+Categorical [2] [] False True [2, 2] torch.int64 IntegerInterval(lower_bound=0, upper_bound=3)
+OneHot [2] [4] False True [2, 2, 4] torch.float32 OneHot()
+Binomial [2] [] False True [2, 2] torch.float32 IntegerInterval(lower_bound=0, upper_bound=tensor([5., 5.]))
+Multinomial [] [3] False False [2, 3] torch.float32 Multinomial()
+Poisson [2] [] False False [2, 2] torch.float32 IntegerGreaterThan(lower_bound=0)
+Geometric [1] [] False False [2, 1] torch.float32 IntegerGreaterThan(lower_bound=0)
+Exponential [1] [] True False [2, 1] torch.float32 GreaterThanEq(lower_bound=0.0)
+Laplace [] [] True False [2] torch.float32 Real()
+Cauchy [] [] True False [2] torch.float32 Real()
+Gamma [2] [] True False [2, 2] torch.float32 GreaterThanEq(lower_bound=0.0)
+Beta [2] [] True False [2, 2] torch.float32 Interval(lower_bound=0.0, upper_bound=1.0)
+Dirichlet [2] [3] True False [2, 2, 3] torch.float32 Simplex()
+Chi2 [1] [] True False [2, 1] torch.float32 GreaterThanEq(lower_bound=0.0)
+StudentT [2] [] True False [2, 2] torch.float32 Real()
+HalfNormal [1] [] True False [2, 1] torch.float32 GreaterThanEq(lower_bound=0.0)
+HalfCauchy [1] [] True False [2, 1] torch.float32 GreaterThanEq(lower_bound=0.0)
+MVN [2] [3] True False [2, 2, 3] torch.float32 IndependentConstraint(Real(), 1)
+LowRank [] [3] True False [2, 3] torch.float32 IndependentConstraint(Real(), 1)
+Independent [2] [3] True False [2, 2, 3] torch.float32 IndependentConstraint(Real(), 1)
+Mixture [] [] False False [2] torch.float32 MixtureSameFamilyConstraint(Real())
+RelaxedBernoulli [1] [] True False [2, 1] torch.float32 Interval(lower_bound=0.0, upper_bound=1.0)
+RelaxedOneHot [2] [3] True False [2, 2, 3] torch.float32 Simplex()
+Transformed [] [] True False [2] torch.float32 GreaterThan(lower_bound=0.0)
+Stick [] [4] True False [2, 4] torch.float32 Simplex()
+torch.float64 torch.int64 torch.float64 torch.float64
+Normal(loc: 0.0, scale: 1.0)
+Normal(loc: torch.Size([3]), scale: torch.Size([3]))
+Categorical(probs: torch.Size([3]))
+Independent(Normal(loc: torch.Size([3]), scale: torch.Size([3])), 1)
+Uniform(low: 0.0, high: 2.0)
+GreaterThan(lower_bound=0.0) Real() Simplex() Interval(lower_bound=0.0, upper_bound=1.0) IndependentConstraint(Real(), 1)
+Interval(lower_bound=0.0, upper_bound=2.0) IntegerInterval(lower_bound=0, upper_bound=3) GreaterThanEq(lower_bound=1.0) LessThan(upper_bound=3.0)
+IntegerGreaterThan(lower_bound=0) PositiveDefinite() LowerCholesky() IndependentConstraint(GreaterThan(lower_bound=0.0), 2)
+ExpTransform() _InverseTransform(ExpTransform()) ComposeTransform(
+    ExpTransform(),
+    SigmoidTransform()
+)
+ComposeTransform(
+    ExpTransform(),
+    AffineTransform()
+) SoftmaxTransform() StickBreakingTransform()
+real [True, True, True, True, True]
+positive [False, False, True, True, True]
+nonnegative [False, True, True, True, True]
+unit_interval [False, True, True, True, False]
+boolean [False, True, False, True, False]
+nonnegative_integer [False, True, False, True, True]
+positive_integer [False, False, False, True, True]
+interval [False, True, True, True, False]
+half_open [False, True, True, False, False]
+greater_than [False, False, False, True, True]
+simplex [True, False, False]
+one_hot [True, False]
+real_vector [False, True]
+lower_cholesky [True, False, False]
+positive_definite [True, False]
+symmetric [True, False]
+multinomial [True, False]
+True False 0 1 2 True
+[True, False] [True, False]
+[True, True, False] 1
+normal scale ValueError Expected parameter scale (Tensor of shape ()) of distribution Normal(loc: 0.0, scale: -1.0) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+normal scale tensor ValueError Expected parameter scale (Tensor of shape (2,)) of distribution Normal(loc: torch.Size([2]), scale: torch.Size([2])) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+bernoulli both ValueError Either `probs` or `logits` must be specified, but not both.
+bernoulli probs ValueError Expected parameter probs (Tensor of shape (1,)) of distribution Bernoulli(probs: tensor([1.5000])) to satisfy the constraint Interval(lower_bound=0.0, upper_bound=1.0), but found invalid values:
+categorical 0d ValueError `probs` parameter must be at least one-dimensional.
+categorical simplex ValueError Expected parameter probs (Tensor of shape (2,)) of distribution Categorical(probs: torch.Size([2])) to satisfy the constraint Simplex(), but found invalid values:
+uniform order ValueError Expected parameter low (Tensor of shape ()) of distribution Uniform(low: 1.0, high: 0.0) to satisfy the constraint LessThan(upper_bound=0.0), but found invalid values:
+dirichlet 0d ValueError `concentration` parameter must be at least one-dimensional.
+dirichlet positive ValueError Expected parameter concentration (Tensor of shape (2,)) of distribution Dirichlet(concentration: torch.Size([2])) to satisfy the constraint IndependentConstraint(GreaterThan(lower_bound=0.0), 1), but found invalid values:
+mvn none ValueError Exactly one of covariance_matrix or precision_matrix or scale_tril may be specified.
+mvn not pd ValueError Expected parameter covariance_matrix (Tensor of shape (2, 2)) of distribution MultivariateNormal(loc: torch.Size([2]), covariance_matrix: torch.Size([2, 2])) to satisfy the constraint PositiveDefinite(), but found invalid values:
+mvn tril ValueError Expected parameter scale_tril (Tensor of shape (2, 2)) of distribution MultivariateNormal(loc: torch.Size([2]), scale_tril: torch.Size([2, 2])) to satisfy the constraint LowerCholesky(), but found invalid values:
+multinomial count NotImplementedError inhomogeneous total_count is not supported
+independent ndims ValueError Expected reinterpreted_batch_ndims <= len(base_distribution.batch_shape), actual 2 vs 1
+mixture type ValueError  The Mixture distribution needs to be an  instance of torch.distributions.Categorical
+mixture count ValueError `mixture_distribution component` (3) does not equal `component_distribution.batch_shape[-1]` (2)
+geometric zero ValueError Expected parameter probs (Tensor of shape (2,)) of distribution Geometric(probs: torch.Size([2])) to be positive but found invalid values:
+gamma rate ValueError Expected parameter rate (Tensor of shape ()) of distribution Gamma(concentration: 1.0, rate: 0.0) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+poisson negative ValueError Expected parameter rate (Tensor of shape (1,)) of distribution Poisson(rate: tensor([-1.])) to satisfy the constraint GreaterThanEq(lower_bound=0.0), but found invalid values:
+transforms type ValueError transforms must be a Transform or a list of Transforms
+exp support ValueError Expected value argument (Tensor of shape ()) to be within the support (GreaterThanEq(lower_bound=0.0)) of the distribution Exponential(rate: 1.0), but found invalid values:
+beta support ValueError Expected value argument (Tensor of shape ()) to be within the support (Interval(lower_bound=0.0, upper_bound=1.0)) of the distribution Beta(), but found invalid values:
+value type ValueError The value argument to log_prob must be a Tensor
+event shape ValueError The right-most size of value must match event_shape: torch.Size([2]) vs torch.Size([3]).
+broadcast ValueError Value is not broadcastable with batch_shape+event_shape: torch.Size([2]) vs torch.Size([3]).
+categorical support ValueError Expected value argument (Tensor of shape ()) to be within the support (IntegerInterval(lower_bound=0, upper_bound=2)) of the distribution Categorical(probs: torch.Size([3])), but found invalid values:
+bernoulli support ValueError Expected value argument (Tensor of shape ()) to be within the support (Boolean()) of the distribution Bernoulli(probs: 0.5), but found invalid values:
+no validation no error
+no validation param no error
+default off no error
+default on ValueError Expected parameter scale (Tensor of shape ()) of distribution Normal(loc: 0.0, scale: -1.0) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+set default ValueError 
+mode NotImplementedError <class 'torch.distributions.distribution.Distribution'> does not implement mode
+entropy NotImplementedError 
+enumerate NotImplementedError Enumeration over cartesian product is not implemented
+inhomogeneous NotImplementedError Inhomogeneous total count not supported by `enumerate_support`.
+validate flag True False
+expand Normal Normal [4, 3] [] [4, 3] [4, 3] True
+expand Bernoulli Bernoulli [4, 3] [] [4, 3] [4, 3] True
+expand Categorical Categorical [4, 3] [] [4, 3] [4, 3] True
+expand Dirichlet Dirichlet [4, 3] [2] [4, 3, 2] [4, 3] True
+expand MVN MultivariateNormal [4, 3] [2] [4, 3, 2] [4, 3] True
+expand Gamma Gamma [4, 3] [] [4, 3] [4, 3] True
+expand LogNormal LogNormal [4, 3] [] [4, 3] [4, 3] True
+expand StudentT StudentT [4, 3] [] [4, 3] [4, 3] True
+expand Independent Independent [4, 3] [2] [4, 3, 2] [4, 3] True
+expand Beta Beta [4, 3] [] [4, 3] [4, 3] True
+expand Mixture MixtureSameFamily [4, 3] [] [4, 3] [4, 3] True
+expand keeps validate False
+bern support [[0.0, 0.0], [1.0, 1.0]]
+bern support noexpand [[0.0], [1.0]]
+cat support [[0], [1], [2]]
+binom support [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]
+stddev [1.0]
+param shape [2, 5]
+sample_n [5, 2]
+rsample grad True False
+rsample NotImplementedError 
+lazy probs False
+lazy probs after True
+kl subclass 0.4431471824645996
+kl registered 42.0 0.4431471824645996
+kl missing NotImplementedError No KL(p || q) is implemented for p type Normal and q type Categorical
+kl type no error
+kl binomial NotImplementedError KL between Binomials where q.total_count > p.total_count is not implemented
+kl uniform inf [0.6931471824645996, inf]
+kl bernoulli edge [0.6931470632553101, 0.6931470632553101, inf]
+transform 1 True 0 True True True True
+domains Real() GreaterThan(lower_bound=0.0) Interval(lower_bound=0.0, upper_bound=1.0) Simplex() GreaterThan(lower_bound=0.0)
+cache True True True
+shapes [2, 4] [4, 6]
+cache size ValueError cache_size must be 0 or 1
