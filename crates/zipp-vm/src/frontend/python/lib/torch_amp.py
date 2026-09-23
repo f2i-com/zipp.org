@@ -6,10 +6,17 @@ decorators, with PyTorch's semantics on a machine without CUDA.
   (`torch.is_autocast_enabled(device)`, `torch.get_autocast_dtype(device)`,
   nesting and restore-on-exit). Zipp has no CUDA, so `device_type="cuda"`
   warns and disables itself exactly as PyTorch does when CUDA is not
-  available. On the CPU the state is recorded but operations are not
-  re-typed: eager kernels keep computing in the tensors' own dtypes (float32
-  by default), so an autocast region gives full-precision results where
-  PyTorch would round matmul/linear/conv inputs to bfloat16.
+  available. An enabled CPU region re-types operations with PyTorch 2.11's
+  CPU policy: the "lower precision" ops (matmul/mm/bmm/addmm/baddbmm/addbmm,
+  linear, the convolutions, prelu, scaled_dot_product_attention,
+  linalg.vecdot) cast their floating inputs to the autocast dtype, the
+  "fp32" ops (the losses, prod, trace, cdist, quantile, 3-D and unpooling
+  pools, reflection/replication padding and the factorizing torch.linalg
+  functions) cast them to float32, cat/stack/index_copy promote to the
+  widest, and everything else runs in its inputs' dtypes. The casts are
+  differentiable `.to()`s; backward runs with autocast off. torch.py's own
+  ops test `torch._autocast_cpu` on entry; the torch.nn.functional and
+  torch.linalg ones are wrapped below.
 * `GradScaler(device="cuda", ...)` follows torch/amp/grad_scaler.py: with
   `device="cuda"` it warns and disables itself (CUDA is unavailable), after
   which `scale()` returns its argument, `step()` is `optimizer.step()` and
@@ -73,6 +80,7 @@ def set_autocast_enabled(device_type, enabled=None):
         # The legacy one-argument form sets CUDA's state.
         device_type, enabled = "cuda", device_type
     _enabled[_device_kind(device_type)] = bool(enabled)
+    _sync()
 
 
 def get_autocast_dtype(device_type):
@@ -83,6 +91,7 @@ def get_autocast_dtype(device_type):
 
 def set_autocast_dtype(device_type, dtype):
     _dtypes[_device_kind(device_type)] = dtype
+    _sync()
 
 
 def is_autocast_cache_enabled():
@@ -91,10 +100,23 @@ def is_autocast_cache_enabled():
 
 def set_autocast_cache_enabled(enabled):
     _cache_enabled[0] = bool(enabled)
+    _sync()
+
+
+# The weight casts an enabled CPU region caches (torch._autocast_cache).
+_cache = {}
 
 
 def clear_autocast_cache():
-    return None
+    _cache.clear()
+
+
+def _sync():
+    """Publish the CPU state to torch.py: the autocast dtype while CPU
+    autocast is enabled (else None), and the cast cache while it is on."""
+    on = bool(_enabled.get("cpu", False))
+    torch._autocast_cpu = get_autocast_dtype("cpu") if on else None
+    torch._autocast_cache = _cache if on and _cache_enabled[0] else None
 
 
 def autocast_increment_nesting():
@@ -546,6 +568,89 @@ class _CudaAmp:
         return custom_bwd(bwd, device_type="cuda")
 
 
+# ---- the autocast policy of torch.nn.functional and torch.linalg ops ---------------------
+# (module, names, policy) as derived from PyTorch 2.11 under
+# torch.autocast("cpu"): "lower" casts floating inputs to the autocast dtype,
+# "fp32" to float32, None runs the op with autocast off and its inputs as
+# they are (an op PyTorch runs as one kernel, which Zipp composes from
+# autocast ops such as matmul or cat), "lower_out" runs it so and casts its
+# floating results to the autocast dtype (a composite whose last step
+# PyTorch autocasts); a callable picks one of those (or "pass": no change)
+# from the arguments.
+def _pad_policy(args, kwargs):
+    mode = kwargs.get("mode", args[2] if len(args) > 2 else "constant")
+    return "fp32" if mode in ("reflect", "replicate") else None if mode == "circular" else "pass"
+
+
+_F_LOWER = ("conv1d", "conv2d", "conv3d", "conv_transpose1d", "conv_transpose2d", "conv_transpose3d", "prelu",
+            "scaled_dot_product_attention")
+_F_FP32 = ("avg_pool3d", "max_pool3d", "adaptive_avg_pool3d", "adaptive_max_pool3d", "max_unpool2d", "max_unpool3d",
+           "fractional_max_pool2d", "fractional_max_pool3d", "grid_sample", "binary_cross_entropy",
+           "binary_cross_entropy_with_logits", "mse_loss", "l1_loss", "smooth_l1_loss", "huber_loss", "cross_entropy",
+           "nll_loss", "kl_div", "soft_margin_loss", "margin_ranking_loss", "hinge_embedding_loss", "cosine_embedding_loss",
+           "poisson_nll_loss", "triplet_margin_loss", "multi_margin_loss", "multilabel_margin_loss", "ctc_loss")
+_F_NONE = ("bilinear", "unfold", "fold", "embedding_bag")
+_LINALG_FP32 = ("inv", "inv_ex", "cholesky", "cholesky_ex", "qr", "svd", "svdvals", "eig", "eigvals", "eigh", "eigvalsh",
+                "solve", "lstsq", "matrix_rank", "householder_product", "cond", "tensorinv", "tensorsolve")
+_LINALG_LOWER = ("vecdot",)
+_LINALG_NONE = ("cross",)
+_LINALG_LOWER_OUT = ("pinv",)
+# torch.* (and Tensor methods) that torch.linalg installs or PyTorch lists.
+_TORCH_FP32 = ("inverse", "cholesky", "cholesky_solve", "cholesky_inverse", "qr", "svd", "pinverse", "triangular_solve",
+               "lu_solve", "geqrf", "orgqr", "ormqr", "polar", "stft", "view_as_complex")
+
+
+def _autocast_wrapper(fn, policy):
+    run = torch._autocast_run
+
+    def autocast_op(*args, **kwargs):
+        fast = torch._autocast_cpu
+        if fast is None:
+            return fn(*args, **kwargs)
+        chosen = policy(args, kwargs) if callable(policy) else policy
+        if chosen == "pass":
+            return fn(*args, **kwargs)
+        if chosen == "lower_out":
+            return torch._autocast_cast(run(fn, None, args, kwargs), fast)
+        return run(fn, chosen, args, kwargs)
+    autocast_op = _wraps(fn, autocast_op)
+    autocast_op._zipp_autocast = fn
+    return autocast_op
+
+
+def _wrap_ops(owner, names, policy, done):
+    for name in names:
+        fn = getattr(owner, name, None) if isinstance(owner, type) else owner.__dict__.get(name)
+        if fn is None or not callable(fn) or getattr(fn, "_zipp_autocast", None) is not None:
+            continue
+        # One wrapper per function, shared by every name it is bound to.
+        wrapped = done.get(id(fn))
+        if wrapped is None:
+            wrapped = done[id(fn)] = _autocast_wrapper(fn, policy)
+        try:
+            setattr(owner, name, wrapped)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _install_policy():
+    import torch.nn.functional as F
+    import torch.linalg as linalg
+    done = {}
+    _wrap_ops(F, _F_LOWER, "lower", done)
+    _wrap_ops(F, _F_FP32, "fp32", done)
+    _wrap_ops(F, _F_NONE, None, done)
+    _wrap_ops(F, ("pad",), _pad_policy, done)
+    _wrap_ops(linalg, _LINALG_FP32, "fp32", done)
+    _wrap_ops(linalg, _LINALG_LOWER, "lower", done)
+    _wrap_ops(linalg, _LINALG_NONE, None, done)
+    _wrap_ops(linalg, _LINALG_LOWER_OUT, "lower_out", done)
+    for owner in (torch, torch.Tensor):
+        _wrap_ops(owner, _TORCH_FP32, "fp32", done)
+        _wrap_ops(owner, _F_LOWER, "lower", done)
+        _wrap_ops(owner, ("cross",), None, done)
+
+
 def _install():
     names = {
         "is_autocast_enabled": is_autocast_enabled, "set_autocast_enabled": set_autocast_enabled,
@@ -573,3 +678,5 @@ def _install():
 
 
 _install()
+_install_policy()
+_sync()

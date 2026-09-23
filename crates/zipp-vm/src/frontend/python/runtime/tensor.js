@@ -43,15 +43,27 @@
         ceil: 22, trunc: 23, isfinite: 24, isnan: 25, not: 26, clamp: 27, frac: 28, tan: 29, atan: 30, log2: 31, log10: 32,
         isinf: 33, exp2: 34, sinh: 35, cosh: 36, asin: 37, acos: 38, asinh: 39, acosh: 40, atanh: 41 };
     const RED_CODE = { sum: 1, mean: 2, prod: 3, max: 4, min: 5, argmax: 6, argmin: 7, all: 8, any: 9 };
-    // float16 and bfloat16 live in a Float32Array (every value of either is
-    // a float32 value) and every kernel that computes one rounds its result
-    // to the format (`finish`); int8/int16 wrap on store as uint8 does.
+    // Two bytes per element for the reduced-precision floats: float16 in a
+    // Float16Array (a read gives the value), bfloat16 in a Uint16Array of
+    // the upper 16 bits of the float32 (`bfValue` reads one, `bfBits`
+    // rounds a float32 to one; `wide` decodes a whole storage). A kernel
+    // that computes a float16/bfloat16 result writes float32 values into a
+    // Float32Array (`work`) and `finish` rounds them to the format once, as
+    // it always has: the Float16Array's own double -> half store would round
+    // once where PyTorch's float opmath rounds twice. Copies (permute,
+    // slice, gather, ...) move the 2-byte elements as they are. int8/int16
+    // wrap on store as uint8 does.
     const ARRAY = { float32: Float32Array, float64: Float64Array, int64: Float64Array, int32: Float64Array, bool: Uint8Array, uint8: Uint8Array,
-        float16: Float32Array, bfloat16: Float32Array, int8: Int8Array, int16: Int16Array };
+        float16: Float16Array, bfloat16: Uint16Array, int8: Int8Array, int16: Int16Array };
     const RANK = { bool: 0, uint8: 1, int8: 1, int16: 2, int32: 3, int64: 4, float16: 5, bfloat16: 5, float32: 6, float64: 7 };
     const FLOAT = { float16: 1, bfloat16: 1, float32: 1, float64: 1 };
     function make(dtype, data) { if (ARRAY[dtype] === undefined) fail(E.TypeError, "unknown dtype " + dtype); return { cls: Storage, dtype: dtype, data: data, version: 0, untracked: 0 }; }
     function alloc(dtype, n) { return make(dtype, new ARRAY[dtype](n)); }
+    // A result storage a kernel computes into: a float32 scratch for
+    // float16/bfloat16 (rounded and packed by `finish`), else `alloc`.
+    function work(dtype, n) { return make(dtype, dtype === "float16" || dtype === "bfloat16" ? new Float32Array(n) : new ARRAY[dtype](n)); }
+    // Dtypes whose storages can alias one another's memory (`view_dtype`).
+    const VIEW_GROUP = { float16: 2, bfloat16: 2, int16: 2, uint8: 1, int8: 1 };
     function isStorage(v) { return v !== null && typeof v === "object" && v.cls === Storage; }
     function needS(v, what) { if (!isStorage(v)) fail(E.TypeError, (what || "argument") + " must be a tensor storage"); return v; }
     function written(s) { s.version++; }
@@ -75,12 +87,42 @@
     }
     const f16 = Math.f16round;
     const HALF = { float16: 1, bfloat16: 1 };
-    // Round a new float16/bfloat16 result (a Float32Array holding float32
-    // values) to its format; any other storage is left as it is.
+    // The bfloat16 bits of float32 value x: round to nearest even on the
+    // upper half (bf16's rounding); NaN as 0x7fc0 (a JavaScript NaN is the
+    // one canonical NaN).
+    function bfBits(x) {
+        if (x !== x) return 0x7fc0;
+        BF_F[0] = x;
+        const u = BF_U[0];
+        return ((u + 0x7fff + ((u >>> 16) & 1)) >>> 16) & 0xffff;
+    }
+    function bfValue(bits) { BF_U[0] = bits << 16; return BF_F[0]; }
+    // A bfloat16 storage's values, as a Float32Array (exact).
+    function wide(s) {
+        const U = s.data, n = U.length, w = new Uint32Array(n);
+        for (let i = 0; i < n; i++) w[i] = U[i] << 16;
+        return new Float32Array(w.buffer);
+    }
+    // A storage's elements as numbers a kernel can read: the typed array
+    // itself, except that bfloat16 is decoded.
+    function vals(s) { return s.dtype === "bfloat16" ? wide(s) : s.data; }
+    // Finish a float16/bfloat16 result computed into a `work` scratch:
+    // round each float32 to the format (a Float16Array store of a float32
+    // value is Math.f16round of it) into the 2-byte storage. A NaN is the
+    // canonical one whichever loop (native or JavaScript) produced it. A
+    // storage that is already packed, or of another dtype, is left as it is.
     function finish(s) {
-        const d = s.dtype;
-        if (d === "float16") { const O = s.data, n = O.length; for (let i = 0; i < n; i++) O[i] = f16(O[i]); }
-        else if (d === "bfloat16") { const O = s.data, n = O.length; for (let i = 0; i < n; i++) O[i] = bf16(O[i]); }
+        const d = s.dtype, O = s.data;
+        if (d === "float16") {
+            if (O instanceof Float32Array) { const n = O.length, h = new Float16Array(n); for (let i = 0; i < n; i++) h[i] = O[i]; s.data = h; }
+        } else if (d === "bfloat16" && O instanceof Float32Array) {
+            const n = O.length, u = new Uint32Array(O.buffer, O.byteOffset, n), h = new Uint16Array(n);
+            for (let i = 0; i < n; i++) {
+                const w = u[i];
+                h[i] = (w & 0x7fffffff) > 0x7f800000 ? 0x7fc0 : ((w + 0x7fff + ((w >>> 16) & 1)) >>> 16) & 0xffff;
+            }
+            s.data = h;
+        }
         return s;
     }
     // Indexed loops, not for...of: these run on every kernel call, and the
@@ -127,6 +169,13 @@
         if (dtype === "int8" || dtype === "int16") return Math.trunc(v);
         return v;
     }
+    // What a storage of `dtype` holds for the number v: castValue's value,
+    // or for bfloat16 its bits.
+    function enc(dtype, v) { return dtype === "bfloat16" ? bfBits(Math.fround(v)) : castValue(dtype, v); }
+    // enc as a function of (dtype, v) for a per-element loop: castValue
+    // itself unless the storage is bfloat16, so other dtypes pay no extra call.
+    function encBf(dtype, v) { return bfBits(Math.fround(v)); }
+    function encoder(dtype) { return dtype === "bfloat16" ? encBf : castValue; }
     // Broadcast `shape` against `target`: the stride per target dim (0 where broadcast).
     function bstrides(shape, target) {
         const s = strides(shape), out = new Array(target.length).fill(0), off = target.length - shape.length;
@@ -258,8 +307,8 @@
         // exact on integers already).
         if (op === "pow" && !isFloatDtype(dtype)) op = "ipow";
         const f = BIN[op]; if (f === undefined) fail(E.ValueError, "unknown op " + op);
-        if (dtype === "bool" && !COMPARE.has(op)) return binaryBool(f, a, ashape, b, bshape, shape);
-        const n = numel(shape), out = alloc(dtype, n), A = a.data, Bd = b.data, O = out.data;
+        if (dtype === "bool" && !COMPARE.has(op)) return binaryBool(f, vals(a), ashape, vals(b), bshape, shape);
+        const n = numel(shape), out = work(dtype, n), A = a.dtype === "bfloat16" ? wide(a) : a.data, Bd = b.dtype === "bfloat16" ? wide(b) : b.data, O = out.data;
         // Every layout below visits elements in the same order and applies
         // the same double-precision operation as the closure form, and the
         // typed array rounds on store, so results are identical.
@@ -288,8 +337,8 @@
     }
     // Arithmetic with a bool result: computed like the others, then any
     // nonzero stores as 1 (True + True is True).
-    function binaryBool(f, a, ashape, b, bshape, shape) {
-        const out = alloc("bool", numel(shape)), O = out.data, A = a.data, Bd = b.data;
+    function binaryBool(f, A, ashape, Bd, bshape, shape) {
+        const out = alloc("bool", numel(shape)), O = out.data;
         forEachBroadcast(shape, bstrides(ashape, shape), bstrides(bshape, shape), (o, x, y) => { O[o] = f(A[x], Bd[y]) ? 1 : 0; });
         return tuple([out, pyShape(shape)]);
     }
@@ -670,7 +719,7 @@
             else { const e = r(jsNumber(p1)), top = r(1 - e); f = (x) => { const c = x < e ? e : x > top ? top : x; return Math.log(c / r(1 - c)); }; }
         }
         if (f === undefined) fail(E.ValueError, "unknown op " + op);
-        const out = alloc(dtype, a.data.length), A = a.data, O = out.data, n = O.length;
+        const out = work(dtype, a.data.length), A = a.dtype === "bfloat16" ? wide(a) : a.data, O = out.data, n = O.length;
         if (n >= NATIVE_MIN && NATIVE !== null && UN_CODE[op] !== undefined && NATIVE(N_UNARY, UN_CODE[op], A, O, lo, hi)) { if (HALF[out.dtype] === 1) finish(out); return out; }
         // The hot activations and their gradients inline; the expressions
         // are the table's own.
@@ -711,7 +760,7 @@
         // A float16/bfloat16 product rounds every partial product to the
         // format, as PyTorch's reduced-precision prod accumulates.
         if (op === "prod" && HALF[dtype] === 1) return halfProd(a, shape, rank, red, keepdim, dtype);
-        const out = alloc(dtype, nOut), A = a.data;
+        const out = work(dtype, nOut), A = a.dtype === "bfloat16" ? wide(a) : a.data;
         // Reductions accumulate in double precision (O) and round once when
         // stored into the result's dtype: a precise float32 sum of a million
         // elements keeps float32 accuracy, and a uint8/bool max/min can
@@ -800,7 +849,7 @@
         if (red !== null) for (let i = 0; i < red.length; i++) isRed[red[i]] = true;
         const outShape = [], keptShape = [];
         for (let d = 0; d < rank; d++) { if (isRed[d]) keptShape.push(1); else { outShape.push(shape[d]); keptShape.push(shape[d]); } }
-        const out = alloc(dtype, numel(keptShape)), O = out.data, A = a.data, outS = strides(keptShape), nIn = numel(shape);
+        const out = work(dtype, numel(keptShape)), O = out.data, A = vals(a), outS = strides(keptShape), nIn = numel(shape);
         O.fill(1);
         const pos = new Array(rank).fill(0);
         let oo = 0;
@@ -813,7 +862,7 @@
                 pos[d] = 0;
             }
         }
-        return tuple([out, pyShape(keepdim ? keptShape : outShape)]);
+        return tuple([finish(out), pyShape(keepdim ? keptShape : outShape)]);
     }
     // The flat index within the reduced dims (row-major over them).
     function redIndex(pos, isRed, shape) {
@@ -910,8 +959,9 @@
         const outShape = [], sa = [];
         let base = 0;
         for (let d = 0; d < shape.length; d++) { base += s.starts[d] * inS[d]; if (s.keep[d]) { outShape.push(s.counts[d]); sa.push(inS[d] * s.steps[d]); } }
-        const sv = bstrides(vshape, outShape), A = a.data, V = v.data, f32 = a.dtype === "float32";
-        forEachBroadcast(outShape, sa, sv, (o, x, y) => { A[base + x] = castValue(a.dtype, V[y]); });
+        const sv = bstrides(vshape, outShape), A = a.data, V = vals(v), dt = a.dtype;
+        const cv = encoder(dt);
+        forEachBroadcast(outShape, sa, sv, (o, x, y) => { A[base + x] = cv(dt, V[y]); });
         written(a);
         return null;
     }
@@ -932,7 +982,7 @@
     function scatter(a, shape, idx, ishape, v, vshape) {
         const k = idx.items.length, inS = strides(shape), ish = ints(ishape), rest = shape.slice(k);
         const restN = numel(rest), nIdx = numel(ish), target = ish.concat(rest);
-        const sv = bstrides(vshape, target), A = a.data, V = v.data;
+        const sv = bstrides(vshape, target), A = a.data, V = vals(v), dt = a.dtype, cv = encoder(dt);
         const I = idx.items.map((s) => s.data);
         // Value offset for [i, r]: walk with forEachBroadcast over the target shape.
         const restS = strides(rest);
@@ -942,7 +992,7 @@
             const i = Math.floor(o / restN), r = o - i * restN;
             let base = 0;
             for (let d = 0; d < k; d++) { let j = I[d][i]; if (j < 0) j += shape[d]; if (j < 0 || j >= shape[d]) fail(E.IndexError, "index out of bounds"); base += j * inS[d]; }
-            A[base + r] = castValue(a.dtype, V[y]);
+            A[base + r] = cv(dt, V[y]);
         });
         written(a);
         return null;
@@ -951,13 +1001,13 @@
     function scatterAdd(a, shape, idx, ishape, v, vshape) {
         const k = idx.items.length, inS = strides(shape), ish = ints(ishape), rest = shape.slice(k);
         const restN = numel(rest), target = ish.concat(rest);
-        const sv = bstrides(vshape, target), A = a.data, V = v.data;
+        const sv = bstrides(vshape, target), A = a.data, V = vals(v), dt = a.dtype, bf = dt === "bfloat16";
         const I = idx.items.map((s) => s.data);
         forEachBroadcast(target, new Array(target.length).fill(0), sv, (o, x, y) => {
             const i = Math.floor(o / restN), r = o - i * restN;
             let base = 0;
             for (let d = 0; d < k; d++) { let j = I[d][i]; if (j < 0) j += shape[d]; if (j < 0 || j >= shape[d]) fail(E.IndexError, "index out of bounds"); base += j * inS[d]; }
-            A[base + r] = castValue(a.dtype, A[base + r] + V[y]);
+            A[base + r] = bf ? bfBits(Math.fround(bfValue(A[base + r]) + V[y])) : castValue(dt, A[base + r] + V[y]);
         });
         written(a);
         return null;
@@ -986,11 +1036,16 @@
             total += s[d]; dtype = promote(dtype, items[i].items[0].dtype);
         }
         const outShape = first.slice(); outShape[d] = total;
-        const out = alloc(dtype, numel(outShape)), O = out.data;
+        // Parts of the result's dtype copy their elements as they are; a
+        // promoted part converts (its values into a scratch `finish` rounds).
+        let mixed = false;
+        for (let i = 0; i < items.length; i++) if (items[i].items[0].dtype !== dtype) mixed = true;
+        const out = mixed ? work(dtype, numel(outShape)) : alloc(dtype, numel(outShape)), O = out.data;
         const outer = numel(first.slice(0, d)), inner = numel(first.slice(d + 1));
+        const src = items.map((p) => mixed ? vals(p.items[0]) : p.items[0].data);
         let o = 0;
         for (let x = 0; x < outer; x++) for (let i = 0; i < items.length; i++) {
-            const A = items[i].items[0].data, n = shapes[i][d] * inner, base = x * n;
+            const A = src[i], n = shapes[i][d] * inner, base = x * n;
             for (let r = 0; r < n; r++) O[o++] = A[base + r];
         }
         { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(outShape)]); }
@@ -1009,7 +1064,7 @@
     function padLast(a, shape, left, right, value) {
         const last = shape[shape.length - 1], outer = a.data.length / (last || 1);
         const newLast = last + left + right, outShape = shape.slice(); outShape[shape.length - 1] = newLast;
-        const out = alloc(a.dtype, outer * newLast), O = out.data, A = a.data;
+        const out = work(a.dtype, outer * newLast), O = out.data, A = vals(a);
         if (value !== 0) O.fill(value);
         for (let x = 0; x < outer; x++) for (let i = 0; i < last; i++) O[x * newLast + left + i] = A[x * last + i];
         { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(outShape)]); }
@@ -1033,7 +1088,7 @@
         const batchA = A.slice(0, -2), batchB = Bs.slice(0, -2), batch = broadcastShape(batchA, batchB);
         const nb = numel(batch), sa = bstrides(batchA, batch), sb = bstrides(batchB, batch);
         const dtype = promote(a.dtype, b.dtype);
-        const out = alloc(dtype, nb * m * n), O = out.data, Ad = a.data, Bd = b.data;
+        const out = work(dtype, nb * m * n), O = out.data, Ad = a.dtype === "bfloat16" ? wide(a) : a.data, Bd = b.dtype === "bfloat16" ? wide(b) : b.data;
         // i-k-j order over one double-precision row: each output element
         // sums its k products in the same order as i-j-k, and rounds to the
         // dtype once, on store. float64 results are unchanged; float32 ones
@@ -1080,7 +1135,7 @@
     function maxPool2d(x, xs, d) {
         const NC = xs[0] * xs[1], H = xs[2], W = xs[3];
         const [kh, kw, sh, sw, ph, pw, dh, dw, Ho, Wo] = d;
-        const n = NC * Ho * Wo, out = alloc(x.dtype, n), idx = alloc("int64", n), X = x.data, O = out.data, I = idx.data;
+        const n = NC * Ho * Wo, out = work(x.dtype, n), idx = alloc("int64", n), X = vals(x), O = out.data, I = idx.data;
         if (NATIVE !== null && NATIVE(N_MAX_POOL2D, X, O, I, NC, H, W, kh, kw, sh, sw, ph, pw, dh, dw, Ho, Wo)) { if (HALF[out.dtype] === 1) finish(out); return tuple([out, idx]); }
         for (let p = 0, o = 0; p < NC; p++) {
             const base = p * H * W;
@@ -1108,7 +1163,7 @@
     function maxPool2dBackward(g, idx, xs, d) {
         const NC = xs[0] * xs[1], H = xs[2], W = xs[3];
         const [kh, kw, sh, sw, ph, pw, dh, dw, Ho, Wo] = d;
-        const out = alloc(g.dtype, NC * H * W), GX = out.data, G = g.data, I = idx.data;
+        const out = work(g.dtype, NC * H * W), GX = out.data, G = vals(g), I = idx.data;
         if (G.length !== NC * Ho * Wo || I.length !== G.length) fail(E.RuntimeError, "max_pool2d_backward: size mismatch");
         if (NATIVE !== null && NATIVE(N_MAX_POOL2D_BACKWARD, G, I, GX, NC, H, W, kh, kw, sh, sw, ph, pw, dh, dw, Ho, Wo)) { if (HALF[out.dtype] === 1) finish(out); return out; }
         for (let p = 0, o = 0; p < NC; p++) {
@@ -1127,8 +1182,8 @@
         const [B, C, L] = xs, [Oc, C2, K] = ws;
         if (C !== C2) fail(E.RuntimeError, "conv1d: expected input with " + C2 + " channels, got " + C);
         const Lo = L - K + 1; if (Lo < 1) fail(E.RuntimeError, "conv1d: kernel size can't be greater than actual input size");
-        const dtype = promote(x.dtype, w.dtype), out = alloc(dtype, B * Oc * Lo), O = out.data, X = x.data, W = w.data;
-        const Bi = bias === null ? null : bias.data;
+        const dtype = promote(x.dtype, w.dtype), out = work(dtype, B * Oc * Lo), O = out.data, X = vals(x), W = vals(w);
+        const Bi = bias === null ? null : vals(bias);
         if (NATIVE !== null && NATIVE(N_CONV1D, X, W, Bi, O, B, C, L, Oc, K, Lo)) { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape([B, Oc, Lo])]); }
         for (let b = 0; b < B; b++) for (let o = 0; o < Oc; o++) {
             const bv = Bi === null ? 0 : Bi[o];
@@ -1142,8 +1197,8 @@
     }
     function conv1dBackward(x, xs, w, ws, g) {
         const [B, C, L] = xs, [Oc, , K] = ws, Lo = L - K + 1;
-        const gx = alloc(x.dtype, B * C * L), gw = alloc(w.dtype, Oc * C * K), gb = alloc(w.dtype, Oc);
-        const GX = gx.data, GW = gw.data, GB = gb.data, X = x.data, W = w.data, G = g.data;
+        const gx = work(x.dtype, B * C * L), gw = work(w.dtype, Oc * C * K), gb = work(w.dtype, Oc);
+        const GX = gx.data, GW = gw.data, GB = gb.data, X = vals(x), W = vals(w), G = vals(g);
         if (NATIVE !== null && NATIVE(N_CONV1D_BACKWARD, X, W, G, GX, GW, GB, B, C, L, Oc, K, Lo)) return tuple([finish(gx), finish(gw), finish(gb)]);
         for (let b = 0; b < B; b++) for (let o = 0; o < Oc; o++) for (let t = 0; t < Lo; t++) {
             const gv = G[(b * Oc + o) * Lo + t]; if (gv === 0) continue;
@@ -1167,29 +1222,30 @@
         const Wo = Math.floor((W + 2*Pw - Dw*(Kw-1) - 1)/Sw) + 1;
         if (Ho < 1 || Wo < 1) fail(E.RuntimeError, "conv2d: kernel exceeds padded input");
         if (grad && (grad.data.length !== B*O*Ho*Wo || grad.dtype !== x.dtype)) fail(E.RuntimeError, "conv2d: invalid gradient");
-        const out = grad ? null : alloc(x.dtype, B*O*Ho*Wo);
-        const gx = grad ? alloc(x.dtype, x.data.length) : null;
-        const gw = grad ? alloc(w.dtype, w.data.length) : null;
-        const gb = grad ? alloc(w.dtype, O) : null;
+        const out = grad ? null : work(x.dtype, B*O*Ho*Wo);
+        const gx = grad ? work(x.dtype, x.data.length) : null;
+        const gw = grad ? work(w.dtype, w.data.length) : null;
+        const gb = grad ? work(w.dtype, O) : null;
         const perGroup = O / groups;
+        const Xd = vals(x), Wd = vals(w), Bd = bias ? vals(bias) : null, Gd = grad ? vals(grad) : null;
         if (NATIVE !== null && (grad
-            ? NATIVE(N_CONV2D_BACKWARD, x.data, w.data, grad.data, gx.data, gw.data, gb.data, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, groups, Ho, Wo)
-            : NATIVE(N_CONV2D, x.data, w.data, bias ? bias.data : null, out.data, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, groups, Ho, Wo)))
+            ? NATIVE(N_CONV2D_BACKWARD, Xd, Wd, Gd, gx.data, gw.data, gb.data, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, groups, Ho, Wo)
+            : NATIVE(N_CONV2D, Xd, Wd, Bd, out.data, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, groups, Ho, Wo)))
             return grad ? tuple([finish(gx),finish(gw),finish(gb)]) : tuple([finish(out),pyShape([B,O,Ho,Wo])]);
         for (let b=0; b<B; b++) for (let o=0; o<O; o++) {
             const firstChannel = Math.floor(o/perGroup)*Cg;
             for (let h=0; h<Ho; h++) for (let v=0; v<Wo; v++) {
                 const oi = ((b*O+o)*Ho+h)*Wo+v;
-                const gv = grad ? grad.data[oi] : 0;
-                let sum = bias ? bias.data[o] : 0;
+                const gv = grad ? Gd[oi] : 0;
+                let sum = bias ? Bd[o] : 0;
                 if (grad) gb.data[o] += gv;
                 for (let c=0; c<Cg; c++) for (let kh=0; kh<Kh; kh++) for (let kw=0; kw<Kw; kw++) {
                     const ih = h*Sh-Ph+kh*Dh, iw = v*Sw-Pw+kw*Dw;
                     if (ih<0 || ih>=H || iw<0 || iw>=W) continue;
                     const xi = ((b*C+firstChannel+c)*H+ih)*W+iw;
                     const wi = ((o*Cg+c)*Kh+kh)*Kw+kw;
-                    if (grad) { gx.data[xi] += gv*w.data[wi]; gw.data[wi] += gv*x.data[xi]; }
-                    else sum += x.data[xi]*w.data[wi];
+                    if (grad) { gx.data[xi] += gv*Wd[wi]; gw.data[wi] += gv*Xd[xi]; }
+                    else sum += Xd[xi]*Wd[wi];
                 }
                 if (!grad) out.data[oi] = sum;
             }
@@ -1199,7 +1255,7 @@
     function softmax(a, shape, dim, log) {
         const d = dim < 0 ? dim + shape.length : dim, n = shape[d];
         const outer = numel(shape.slice(0, d)), inner = numel(shape.slice(d + 1));
-        const dtype = !isFloatDtype(a.dtype) ? "float32" : a.dtype, out = alloc(dtype, a.data.length), O = out.data, A = a.data;
+        const dtype = !isFloatDtype(a.dtype) ? "float32" : a.dtype, out = work(dtype, a.data.length), O = out.data, A = vals(a);
         if (NATIVE !== null && NATIVE(N_SOFTMAX, A, O, outer, n, inner, !!log)) { if (HALF[out.dtype] === 1) finish(out); return out; }
         for (let x = 0; x < outer; x++) for (let r = 0; r < inner; r++) {
             const base = x * n * inner + r;
@@ -1216,7 +1272,7 @@
     function scan(op, a, shape, dim) {
         const d = dim < 0 ? dim + shape.length : dim, n = shape.length === 0 ? 1 : shape[d];
         const outer = shape.length === 0 ? 1 : numel(shape.slice(0, d)), inner = shape.length === 0 ? 1 : numel(shape.slice(d + 1));
-        const out = alloc(a.dtype, a.data.length), O = out.data, A = a.data;
+        const out = work(a.dtype, a.data.length), O = out.data, A = vals(a);
         const arg = op === "cummax" || op === "cummin", idx = arg ? alloc("int64", a.data.length) : null, I = arg ? idx.data : null;
         for (let x = 0; x < outer; x++) for (let r = 0; r < inner; r++) {
             const base = x * n * inner + r;
@@ -1241,7 +1297,7 @@
     function argsort(a, shape, dim, descending) {
         const d = dim < 0 ? dim + shape.length : dim, n = shape[d];
         const outer = numel(shape.slice(0, d)), inner = numel(shape.slice(d + 1));
-        const out = alloc("int64", a.data.length), O = out.data, A = a.data;
+        const out = alloc("int64", a.data.length), O = out.data, A = vals(a);
         const idx = new Float64Array(n), tmp = new Float64Array(n), keys = new Float64Array(n);
         for (let x = 0; x < outer; x++) for (let r = 0; r < inner; r++) {
             const base = x * n * inner + r;
@@ -1276,9 +1332,9 @@
     }
     function where(c, cs, a, as_, b, bs, want) {
         const shape = broadcastShape(broadcastShape(cs, as_), bs), dtype = want ? want : promote(a.dtype, b.dtype);
-        const out = alloc(dtype, numel(shape)), O = out.data;
+        const out = work(dtype, numel(shape)), O = out.data;
         const sc = bstrides(cs, shape), sa = bstrides(as_, shape), sb = bstrides(bs, shape);
-        const Cd = c.data, Ad = a.data, Bd = b.data;
+        const Cd = c.data, Ad = vals(a), Bd = vals(b);
         if (O.length >= NATIVE_MIN && NATIVE !== null && NATIVE(N_WHERE, Cd, Ad, Bd, O, shape, sc, sa, sb)) { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(shape)]); }
         const rank = shape.length, idx = new Array(rank).fill(0);
         let oc = 0, oa = 0, ob = 0;
@@ -1339,11 +1395,11 @@
     function rand(g, n, dtype) {
         // float32 uniform from 24 random bits, as torch's uniform_ for float;
         // float16 from 11 and bfloat16 from 8 (their mantissa digits).
-        const s = needGen(g), out = alloc(dtype, n), O = out.data;
+        const s = needGen(g), out = work(dtype, n), O = out.data;
         if (dtype === "float16") for (let i = 0; i < n; i++) O[i] = (next32(s) & 0x7ff) * 0.00048828125;
         else if (dtype === "bfloat16") for (let i = 0; i < n; i++) O[i] = (next32(s) & 0xff) * 0.00390625;
         else for (let i = 0; i < n; i++) O[i] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
-        return out;
+        return finish(out);
     }
     function randDouble(g, n) {
         const s = needGen(g), out = alloc("float64", n), O = out.data;
@@ -1352,7 +1408,7 @@
     }
     function randn(g, n, dtype) {
         // Box-Muller on doubles; pairs, as torch's normal_ (scalar path).
-        const s = needGen(g), out = alloc(dtype, n), O = out.data;
+        const s = needGen(g), out = work(dtype, n), O = out.data;
         for (let i = 0; i < n; i += 2) {
             const u1 = 1 - nextDouble(s), u2 = nextDouble(s);
             const r = Math.sqrt(-2 * Math.log(u1)), t = 2 * Math.PI * u2;
@@ -1383,7 +1439,7 @@
     }
     function multinomial(g, probs, shape, samples, replacement) {
         const s = needGen(g), n = shape[shape.length - 1], rows = probs.data.length / n;
-        const out = alloc("int64", rows * samples), O = out.data, P = probs.data;
+        const out = alloc("int64", rows * samples), O = out.data, P = vals(probs);
         const w = new Float64Array(n);
         for (let r = 0; r < rows; r++) {
             for (let i = 0; i < n; i++) { w[i] = P[r * n + i]; if (w[i] < 0 || w[i] !== w[i]) fail(E.RuntimeError, "probability tensor contains either `inf`, `nan` or element < 0"); }
@@ -1416,14 +1472,8 @@
         else if (a.dtype === "int64") { const b = new ArrayBuffer(n * 8), v = new DataView(b); for (let i = 0; i < n; i++) v.setBigInt64(i * 8, BigInt(Math.trunc(a.data[i])), true); bytes = new Uint8Array(b); }
         else if (a.dtype === "int32") { const b = new ArrayBuffer(n * 4), v = new DataView(b); for (let i = 0; i < n; i++) v.setInt32(i * 4, a.data[i], true); bytes = new Uint8Array(b); }
         else if (a.dtype === "int16") bytes = new Uint8Array(Int16Array.from(a.data).buffer);
-        else if (a.dtype === "float16") { const h = new Float16Array(n); for (let i = 0; i < n; i++) h[i] = a.data[i]; bytes = new Uint8Array(h.buffer); }
-        else if (a.dtype === "bfloat16") {
-            // The upper half of each float32 (the value is a bfloat16 already);
-            // NaN as PyTorch writes it, 0x7fc0 with its sign.
-            const u = new Uint32Array(Float32Array.from(a.data).buffer), h = new Uint16Array(n);
-            for (let i = 0; i < n; i++) { const w = u[i]; h[i] = (w & 0x7fffffff) > 0x7f800000 ? ((w >>> 16) & 0x8000) | 0x7fc0 : w >>> 16; }
-            bytes = new Uint8Array(h.buffer);
-        }
+        // float16 and bfloat16 storages hold PyTorch's 2-byte elements already.
+        else if (a.dtype === "float16" || a.dtype === "bfloat16") bytes = new Uint8Array(a.data.buffer, a.data.byteOffset, n * 2).slice();
         else bytes = Uint8Array.from(a.data);
         return rt.bytes(rt.bytesFromU8(bytes));
     }
@@ -1448,8 +1498,12 @@
         if (dtype === "int32") { const m = n === undefined ? items.length / 4 : n, out = alloc("int32", m); for (let i = 0; i < m; i++) out.data[i] = view.getInt32(i * 4, true); return out; }
         if (dtype === "int16") { const m = n === undefined ? items.length / 2 : n, out = alloc("int16", m); for (let i = 0; i < m; i++) out.data[i] = view.getInt16(i * 2, true); return out; }
         if (dtype === "int8") { const m = n === undefined ? items.length : n, out = alloc("int8", m); for (let i = 0; i < m; i++) out.data[i] = view.getInt8(i); return out; }
-        if (dtype === "float16") { const m = n === undefined ? items.length / 2 : n, out = alloc("float16", m), h = new Uint16Array(m); for (let i = 0; i < m; i++) h[i] = view.getUint16(i * 2, true); out.data.set(new Float16Array(h.buffer)); return out; }
-        if (dtype === "bfloat16") { const m = n === undefined ? items.length / 2 : n, out = alloc("bfloat16", m), u = new Uint32Array(m); for (let i = 0; i < m; i++) u[i] = view.getUint16(i * 2, true) * 65536; out.data.set(new Float32Array(u.buffer)); return out; }
+        if (dtype === "float16" || dtype === "bfloat16") {
+            // The 2-byte elements as they are (bits, NaN payloads included).
+            const m = n === undefined ? items.length / 2 : n, out = alloc(dtype, m), h = new Uint16Array(out.data.buffer);
+            for (let i = 0; i < m; i++) h[i] = view.getUint16(i * 2, true);
+            return out;
+        }
         if (dtype === "bool" || dtype === "uint8") { const m = n === undefined ? items.length : n, out = alloc(dtype, m); for (let i = 0; i < m; i++) out.data[i] = items[i]; return out; }
         fail(E.TypeError, "unknown dtype " + dtype);
     }
@@ -1603,6 +1657,68 @@
         for (let i = 0; i < n; i++) O[i] = (graphUniformMix((graphUniformMix((i ^ k2) >>> 0) + k1) >>> 0) >>> 8) * 5.9604644775390625e-8;
         return out;
     }
+    // Graph protocol version 4: selection and its gradients, in the order
+    // zipp_gpu's reference and every host backend use. `dims`/`strides` are
+    // four padded dimensions; a box's strides may be negative. The two
+    // accumulations add each contribution onto the base in ascending index
+    // position, one float32 rounding per addition (the Float32Array store).
+    function graphSlice(a, dims, st, offset) {
+        const out = alloc("float32", dims[0] * dims[1] * dims[2] * dims[3]), O = out.data, A = a.data;
+        let i = 0;
+        for (let x0 = 0; x0 < dims[0]; x0++) for (let x1 = 0; x1 < dims[1]; x1++) for (let x2 = 0; x2 < dims[2]; x2++) {
+            const base = offset + x0 * st[0] + x1 * st[1] + x2 * st[2];
+            for (let x3 = 0; x3 < dims[3]; x3++) O[i++] = A[base + x3 * st[3]];
+        }
+        return out;
+    }
+    function graphSliceScatter(b, src, dims, st, offset) {
+        const out = alloc("float32", b.data.length), O = out.data, S = src.data;
+        O.set(b.data);
+        let i = 0;
+        for (let x0 = 0; x0 < dims[0]; x0++) for (let x1 = 0; x1 < dims[1]; x1++) for (let x2 = 0; x2 < dims[2]; x2++) {
+            const base = offset + x0 * st[0] + x1 * st[1] + x2 * st[2];
+            for (let x3 = 0; x3 < dims[3]; x3++) O[base + x3 * st[3]] = S[i++];
+        }
+        return out;
+    }
+    function graphIndexSelect(a, index, outer, len, count, inner) {
+        const out = alloc("float32", outer * count * inner), O = out.data, A = a.data, I = index.data;
+        for (let o = 0, at = 0; o < outer; o++) for (let k = 0; k < count; k++) {
+            const from = (o * len + I[k]) * inner;
+            for (let r = 0; r < inner; r++) O[at++] = A[from + r];
+        }
+        return out;
+    }
+    function graphIndexAdd(b, src, index, outer, len, count, inner) {
+        const out = alloc("float32", b.data.length), O = out.data, S = src.data, I = index.data;
+        O.set(b.data);
+        for (let o = 0; o < outer; o++) for (let k = 0; k < count; k++) {
+            const to = (o * len + I[k]) * inner, from = (o * count + k) * inner;
+            for (let r = 0; r < inner; r++) O[to + r] += S[from + r];
+        }
+        return out;
+    }
+    function graphGather(a, index, dims, st, axisStride) {
+        const out = alloc("float32", index.data.length), O = out.data, A = a.data, I = index.data;
+        let i = 0;
+        for (let x0 = 0; x0 < dims[0]; x0++) for (let x1 = 0; x1 < dims[1]; x1++) for (let x2 = 0; x2 < dims[2]; x2++) {
+            const base = x0 * st[0] + x1 * st[1] + x2 * st[2];
+            for (let x3 = 0; x3 < dims[3]; x3++, i++) O[i] = A[base + x3 * st[3] + I[i] * axisStride];
+        }
+        return out;
+    }
+    // Row-major over the index: two elements landing on one output differ
+    // only along the axis, so they arrive in ascending position.
+    function graphScatterAdd(b, src, index, dims, st, axisStride) {
+        const out = alloc("float32", b.data.length), O = out.data, S = src.data, I = index.data;
+        O.set(b.data);
+        let i = 0;
+        for (let x0 = 0; x0 < dims[0]; x0++) for (let x1 = 0; x1 < dims[1]; x1++) for (let x2 = 0; x2 < dims[2]; x2++) {
+            const base = x0 * st[0] + x1 * st[1] + x2 * st[2];
+            for (let x3 = 0; x3 < dims[3]; x3++, i++) O[base + x3 * st[3] + I[i] * axisStride] += S[i];
+        }
+        return out;
+    }
     function life(a, h, w) {
         const out = alloc("float32", h * w), O = out.data, A = a.data;
         for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -1616,7 +1732,7 @@
     // No NaN or infinity: `x - x` is 0 exactly for finite x.
     function allFinite(s) {
         if (!isFloatDtype(s.dtype)) return true;
-        const d = s.data, n = d.length;
+        const d = vals(s), n = d.length;
         if (n >= NATIVE_MIN && NATIVE !== null) { const r = NATIVE(N_ALL_FINITE, d); if (r !== null) return r; }
         for (let i = 0; i < n; i++) { const x = d[i]; if (x - x !== 0) return false; }
         return true;
@@ -1626,11 +1742,11 @@
         const fn = (name, arity, code, min) => g.set(name, rt.builtin(name, arity, code, min));
         const num = (v) => jsNumber(v);
         fn("zeros", 2, (a) => alloc(rt.needStr(a[0]), num(a[1])));
-        fn("full", 3, (a) => { const s = alloc(rt.needStr(a[0]), num(a[1])); s.data.fill(castValue(s.dtype, num(a[2]))); return s; });
+        fn("full", 3, (a) => { const s = alloc(rt.needStr(a[0]), num(a[1])); s.data.fill(enc(s.dtype, num(a[2]))); return s; });
         // arange(dtype, start, step, n): element i is castValue(start + i * step),
         // what from_flat gives for the list torch builds (torch.arange checks
         // that the double arithmetic is exact or is Python's float arithmetic).
-        fn("arange", 4, (a) => { const s = alloc(rt.needStr(a[0]), num(a[3])), O = s.data, d = s.dtype, st = num(a[1]), step = num(a[2]), n = O.length; for (let i = 0; i < n; i++) O[i] = castValue(d, st + i * step); return s; });
+        fn("arange", 4, (a) => { const s = alloc(rt.needStr(a[0]), num(a[3])), O = s.data, d = s.dtype, st = num(a[1]), step = num(a[2]), n = O.length, cv = encoder(d); for (let i = 0; i < n; i++) O[i] = cv(d, st + i * step); return s; });
         fn("_set_size_type", 1, (a) => { SIZE = a[0]; return null; });
         // _shape_eq(a, b): tuple equality of two shapes (tuples or Sizes of
         // ints), without the rich-comparison dispatch of a tuple subclass.
@@ -1652,23 +1768,27 @@
         // _size(t): torch.Size(t) for a tuple t, as the tuple constructor
         // builds a subclass instance (`rt.allocInstance`, then its items).
         fn("_size", 1, (a) => { const v = a[0]; if (SIZE === null || v === null || typeof v !== "object" || v.cls !== T.tuple) fail(E.TypeError, "_size expects a tuple"); return { cls: SIZE, items: v.items.slice(), dict: new Map() }; });
-        fn("from_flat", 2, (a) => { const items = a[1].items, s = alloc(rt.needStr(a[0]), items.length); for (let i = 0; i < items.length; i++) s.data[i] = castValue(s.dtype, jsNumber(items[i])); return s; });
+        fn("from_flat", 2, (a) => { const items = a[1].items, s = alloc(rt.needStr(a[0]), items.length), cv = encoder(s.dtype); for (let i = 0; i < items.length; i++) s.data[i] = cv(s.dtype, jsNumber(items[i])); return s; });
         fn("to_list", 1, (a) => {
-            const s = needS(a[0]), d = s.data, out = new Array(d.length);
+            const s = needS(a[0]), d = vals(s), out = new Array(d.length);
             if (isFloatDtype(s.dtype)) { for (let i = 0; i < out.length; i++) out[i] = d[i]; }
             else { for (let i = 0; i < out.length; i++) out[i] = pyNumber(s.dtype, d[i]); }
             return list(out);
         });
-        fn("item", 2, (a) => { const s = needS(a[0]); return pyNumber(s.dtype, s.data[num(a[1])]); });
-        fn("setitem", 3, (a) => { const s = needS(a[0]); s.data[num(a[1])] = castValue(s.dtype, num(a[2])); written(s); return null; });
+        fn("item", 2, (a) => { const s = needS(a[0]), i = num(a[1]); return pyNumber(s.dtype, s.dtype === "bfloat16" && s.data[i] !== undefined ? bfValue(s.data[i]) : s.data[i]); });
+        fn("setitem", 3, (a) => { const s = needS(a[0]); s.data[num(a[1])] = enc(s.dtype, num(a[2])); written(s); return null; });
         fn("copy", 1, (a) => { const s = needS(a[0]); return make(s.dtype, s.data.slice()); });
         fn("astype", 2, (a) => {
             const s = needS(a[0]), d = rt.needStr(a[1]); const out = alloc(d, s.data.length);
             // A float target converts exactly as castValue does (the typed
-            // array rounds float32 on store); integer targets truncate.
-            if (d === "float32" || d === "float64" || (d === s.dtype && HALF[d] === 1)) out.data.set(s.data);
-            else if (HALF[d] === 1) { const O = out.data, S = s.data, round = d === "float16" ? f16 : bf16; for (let i = 0; i < O.length; i++) O[i] = round(Math.fround(S[i])); }
-            else for (let i = 0; i < out.data.length; i++) out.data[i] = castValue(d, s.data[i]);
+            // array rounds float32 on store; float16 and bfloat16 round that
+            // float32 to the format); integer targets truncate.
+            if (d === s.dtype && HALF[d] === 1) { out.data.set(s.data); return out; }
+            const S = vals(s), O = out.data, n = O.length;
+            if (d === "float32" || d === "float64") O.set(S);
+            else if (d === "float16") { if (S instanceof Float32Array) O.set(S); else for (let i = 0; i < n; i++) O[i] = Math.fround(S[i]); }
+            else if (d === "bfloat16") for (let i = 0; i < n; i++) O[i] = bfBits(Math.fround(S[i]));
+            else for (let i = 0; i < n; i++) O[i] = castValue(d, S[i]);
             return out;
         });
         fn("dtype", 1, (a) => needS(a[0]).dtype);
@@ -1695,14 +1815,22 @@
         fn("graph_step", 5, (a) => { const s = a[4].items, sc = new Array(s.length); for (let i = 0; i < s.length; i++) sc[i] = jsNumber(s[i]); return graphStep(rt.needStr(a[0]), needS(a[1]), needS(a[2]), a[3] === null ? null : needS(a[3]), sc); });
         // graph_uniform(n, k1, k2): the protocol's counter-based uniform draw.
         fn("graph_uniform", 3, (a) => graphUniform(num(a[0]), num(a[1]) >>> 0, num(a[2]) >>> 0));
+        // Version 4 (see graphSlice): four-integer lists are padded dims and strides.
+        const graphInts = (v) => { const it = v.items; return [num(it[0]), num(it[1]), num(it[2]), num(it[3])]; };
+        fn("graph_slice", 4, (a) => graphSlice(needS(a[0]), graphInts(a[1]), graphInts(a[2]), num(a[3])));
+        fn("graph_slice_scatter", 5, (a) => graphSliceScatter(needS(a[0]), needS(a[1]), graphInts(a[2]), graphInts(a[3]), num(a[4])));
+        fn("graph_index_select", 6, (a) => graphIndexSelect(needS(a[0]), needS(a[1]), num(a[2]), num(a[3]), num(a[4]), num(a[5])));
+        fn("graph_index_add", 7, (a) => graphIndexAdd(needS(a[0]), needS(a[1]), needS(a[2]), num(a[3]), num(a[4]), num(a[5]), num(a[6])));
+        fn("graph_gather", 5, (a) => graphGather(needS(a[0]), needS(a[1]), graphInts(a[2]), graphInts(a[3]), num(a[4])));
+        fn("graph_scatter_add", 6, (a) => graphScatterAdd(needS(a[0]), needS(a[1]), needS(a[2]), graphInts(a[3]), graphInts(a[4]), num(a[5])));
         fn("life", 3, (a) => life(needS(a[0]), num(a[1]), num(a[2])));
-        fn("fill", 2, (a) => { const s = needS(a[0]); s.data.fill(castValue(s.dtype, num(a[1]))); written(s); return null; });
+        fn("fill", 2, (a) => { const s = needS(a[0]); s.data.fill(enc(s.dtype, num(a[1]))); written(s); return null; });
         fn("copy_into", 2, (a) => {
             const d = needS(a[0]), s = needS(a[1]); if (d.data.length !== s.data.length) fail(E.RuntimeError, "size mismatch");
             // A float storage of its own dtype holds values castValue leaves
             // unchanged, so a block copy is the same store.
             if (d.dtype === s.dtype && isFloatDtype(d.dtype)) d.data.set(s.data);
-            else for (let i = 0; i < d.data.length; i++) d.data[i] = castValue(d.dtype, s.data[i]);
+            else { const S = vals(s), D = d.data, dt = d.dtype, cv = encoder(dt); for (let i = 0; i < D.length; i++) D[i] = cv(dt, S[i]); }
             written(d);
             return null;
         });
@@ -1713,7 +1841,7 @@
         // left operand), so no 0-d tensor has to be built for it.
         fn("binary_scalar", 7, (a) => {
             const s = alloc(rt.needStr(a[4]), 1);
-            s.data[0] = castValue(s.dtype, num(a[3]));
+            s.data[0] = enc(s.dtype, num(a[3]));
             const want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
             return rt.truth(a[6]) ? binary(rt.needStr(a[0]), s, [], needS(a[1]), shapeOf(a[2]), undefined, a[2], want)
                 : binary(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), s, [], a[2], undefined, want);
@@ -1747,8 +1875,8 @@
         fn("strided", 4, (a) => strided(needS(a[0]), shapeOf(a[1]), shapeOf(a[2]), num(a[3])));
         fn("gen_get_state", 1, (a) => genGetState(a[0]));
         fn("gen_set_state", 2, (a) => genSetState(a[0], a[1]));
-        fn("allclose", 4, (a) => { const x = needS(a[0]), y = needS(a[1]); const rtol = num(a[2]), atol = num(a[3]); if (x.data.length !== y.data.length) return false; for (let i = 0; i < x.data.length; i++) { const p = x.data[i], q = y.data[i]; if (p === q) continue; if (!Number.isFinite(p) || !Number.isFinite(q) || Math.abs(p - q) > atol + rtol * Math.abs(q)) return false; } return true; });
-        fn("equal", 2, (a) => { const x = needS(a[0]), y = needS(a[1]); if (x.data.length !== y.data.length) return false; for (let i = 0; i < x.data.length; i++) if (x.data[i] !== y.data[i]) return false; return true; });
+        fn("allclose", 4, (a) => { const x = needS(a[0]), y = needS(a[1]); const rtol = num(a[2]), atol = num(a[3]); if (x.data.length !== y.data.length) return false; const X = vals(x), Y = vals(y); for (let i = 0; i < X.length; i++) { const p = X[i], q = Y[i]; if (p === q) continue; if (!Number.isFinite(p) || !Number.isFinite(q) || Math.abs(p - q) > atol + rtol * Math.abs(q)) return false; } return true; });
+        fn("equal", 2, (a) => { const x = needS(a[0]), y = needS(a[1]); if (x.data.length !== y.data.length) return false; const X = vals(x), Y = vals(y); for (let i = 0; i < X.length; i++) if (X[i] !== Y[i]) return false; return true; });
         fn("gen", 1, (a) => genNew(rt.asInt(rt.needInt(a[0]))));
         fn("gen_seed", 2, (a) => { const g = a[0]; g.seed = rt.asInt(rt.needInt(a[1])); g.state = mt(Number(BigInt.asUintN(32, g.seed))); return null; });
         fn("gen_initial_seed", 1, (a) => a[0].seed);
@@ -1763,8 +1891,26 @@
         fn("frombytes", 3, (a) => fromBytes(rt.needStr(a[0]), a[1], a[2] === undefined || a[2] === null ? null : num(a[2])), 2);
         // zlib's CRC-32 of a bytes object, for zipfile (torch.save checkpoints).
         fn("crc32", 2, (a) => BigInt(crc32(a[0].items, a[1] === undefined ? 0 : num(a[1]))), 1);
-        fn("dot_sum", 2, (a) => { const x = needS(a[0]).data, y = needS(a[1]).data; let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; });
-        fn("axpy", 3, (a) => { const alpha = num(a[0]), x = needS(a[1]).data, y = needS(a[2]).data; for (let i = 0; i < y.length; i++) y[i] = castValue(a[2].dtype, y[i] + alpha * x[i]); written(a[2]); return null; });
+        fn("dot_sum", 2, (a) => { const x = vals(needS(a[0])), y = vals(needS(a[1])); let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; });
+        fn("axpy", 3, (a) => {
+            const alpha = num(a[0]), x = vals(needS(a[1])), ys = needS(a[2]), y = ys.data, dt = ys.dtype;
+            if (dt === "bfloat16") for (let i = 0; i < y.length; i++) y[i] = bfBits(Math.fround(bfValue(y[i]) + alpha * x[i]));
+            else for (let i = 0; i < y.length; i++) y[i] = castValue(dt, y[i] + alpha * x[i]);
+            written(ys);
+            return null;
+        });
+        // nbytes(s): the bytes a storage's elements occupy.
+        fn("nbytes", 1, (a) => BigInt(needS(a[0]).data.byteLength));
+        // view_dtype(s, dtype): a storage of `dtype` over the same memory,
+        // for two dtypes whose elements have the same typed-array layout
+        // (float16/bfloat16/int16, uint8/int8), else None.
+        fn("view_dtype", 2, (a) => {
+            const s = needS(a[0]), d = rt.needStr(a[1]), C = ARRAY[d];
+            if (C === undefined) fail(E.TypeError, "unknown dtype " + d);
+            const same = (VIEW_GROUP[d] !== undefined && VIEW_GROUP[d] === VIEW_GROUP[s.dtype]);
+            if (!same) return null;
+            return make(d, new C(s.data.buffer, s.data.byteOffset, s.data.length));
+        });
         g.set("Storage", Storage); g.set("Generator", Gen);
     });
 })(__zipp_py);

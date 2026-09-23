@@ -513,3 +513,58 @@ print("cases", CASES[0], "mismatches", len(BAD), BAD[:5])
     assert_eq!(out.len(), 1, "{out:#?}");
     assert!(out[0].contains("mismatches 0 []"), "{}", out[0]);
 }
+
+/// float16/bfloat16 as two-byte storages, against PyTorch 2.11:
+/// `fixtures/torch_dtypes/dtypes2_cases.py` runs unchanged under both
+/// (`dtypes2_expected.txt` is its CPython output): every optimizer's update
+/// of float16/bfloat16 parameters (PyTorch's fused `add_`/`lerp_`/
+/// `addcmul_`/`addcdiv_` sequence, bit for bit over eight steps of 64
+/// elements), `view(dtype)` sharing memory among float16/bfloat16/int16 and
+/// uint8/int8 and rescaling the last dimension across element sizes,
+/// `element_size`/`nbytes`, and gradients through a 0-d operand that loses
+/// the type promotion.
+#[test]
+fn half_storages_views_and_optimizers_match_pytorch() {
+    let source = format!(
+        "{}\nfor line in lines():\n    print(line)\n",
+        include_str!("fixtures/torch_dtypes/dtypes2_cases.py").replace("if __name__ == \"__main__\":", "if False:")
+    );
+    let out: Vec<String> = run_program(source).join("\n").lines().map(str::to_owned).collect();
+    let want: Vec<String> = include_str!("fixtures/torch_dtypes/dtypes2_expected.txt").lines().map(str::to_owned).collect();
+    for (got, want) in out.iter().zip(&want) {
+        assert_eq!(got, want);
+    }
+    assert_eq!(out.len(), want.len());
+}
+
+/// A float16 or bfloat16 storage holds two bytes per element (a
+/// Float16Array, or bfloat16 bits in a Uint16Array), a float32 one four,
+/// whatever produced it: creation, arithmetic, reductions, matmul, copies,
+/// conversion and a checkpoint round trip.
+#[test]
+fn reduced_precision_storages_hold_two_bytes_per_element() {
+    let source = r#"
+import torch
+import _zipp_tensor as _k
+
+def nb(t):
+    return _k.nbytes(t._s) // max(1, t.numel())
+
+for dt in (torch.float16, torch.bfloat16):
+    a = torch.linspace(-3, 3, 96).to(dt).reshape(8, 12)
+    b = torch.ones(12, 8, dtype=dt)
+    made = [torch.zeros(5, dtype=dt), torch.full((5,), 0.3, dtype=dt), torch.arange(0, 3, 0.5, dtype=dt), torch.rand(7, dtype=dt),
+            torch.randn(7, dtype=dt), a + a, a * 2.5, a.exp(), a.sum(1), a.prod(0), a @ b, a.t(), a[1:5, ::2], torch.cat([a, a]),
+            torch.where(a > 0, a, -a), a.softmax(-1), a.cumsum(1), torch.nn.functional.pad(a, (1, 1), value=0.25), a.clone(),
+            torch.tensor([1.0, 2.0]).to(dt)]
+    torch.save({"a": a}, "h.pt")
+    made.append(torch.load("h.pt")["a"])
+    c = torch.zeros(8, 12, dtype=dt)
+    c[2] = 1.5
+    c.copy_(a)
+    made.append(c)
+    print(str(dt), sorted(set(nb(t) for t in made)), _k.nbytes(torch.zeros(1000, dtype=dt)._s))
+print("float32", _k.nbytes(torch.zeros(1000)._s))
+"#;
+    assert_eq!(run_program(source.to_owned()), ["torch.float16 [2] 2000", "torch.bfloat16 [2] 2000", "float32 4000"]);
+}

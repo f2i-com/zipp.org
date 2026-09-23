@@ -378,6 +378,9 @@ class SGD(Optimizer):
         self._eager()
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_sgd(self, g, p)
+                continue
             grad = p.grad
             if g["maximize"]:
                 grad = -grad
@@ -423,6 +426,9 @@ class Adam(Optimizer):
         self._eager()
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_adam(self, g, p)
+                continue
             grad = p.grad
             if g["maximize"]:
                 grad = -grad
@@ -480,6 +486,9 @@ class RMSprop(Optimizer):
         self._eager("RMSprop")
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_rmsprop(self, g, p)
+                continue
             grad = p.grad
             if g["maximize"]:
                 grad = -grad
@@ -542,6 +551,9 @@ class Adagrad(Optimizer):
         self._eager("Adagrad")
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_adagrad(self, g, p)
+                continue
             grad = p.grad
             st = self.state[p]
             if not st:
@@ -575,6 +587,9 @@ class Adamax(Optimizer):
         self._eager("Adamax")
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_adamax(self, g, p)
+                continue
             grad = p.grad
             if g["maximize"]:
                 grad = -grad
@@ -616,6 +631,9 @@ class NAdam(Optimizer):
         self._eager("NAdam")
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_nadam(self, g, p)
+                continue
             grad = p.grad
             if g["maximize"]:
                 grad = -grad
@@ -661,6 +679,9 @@ class RAdam(Optimizer):
         self._eager("RAdam")
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_radam(self, g, p)
+                continue
             grad = p.grad
             if g["maximize"]:
                 grad = -grad
@@ -709,6 +730,9 @@ class Adadelta(Optimizer):
         self._eager("Adadelta")
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_adadelta(self, g, p)
+                continue
             grad = p.grad
             st = self.state[p]
             if not st:
@@ -748,6 +772,9 @@ class ASGD(Optimizer):
         self._eager("ASGD")
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_asgd(self, g, p)
+                continue
             grad = p.grad
             if g["maximize"]:
                 grad = -grad
@@ -785,6 +812,9 @@ class Rprop(Optimizer):
         self._eager("Rprop")
         loss = _closure_loss(closure)
         for g, p in self._params():
+            if p.dtype._reduced:
+                _half_rprop(self, g, p)
+                continue
             grad = p.grad
             if g["maximize"]:
                 grad = -grad
@@ -801,6 +831,257 @@ class Rprop(Optimizer):
             p.data = p.detach() - torch.sign(grad) * st["step_size"]
             st["prev"] = grad.clone()
         return loss
+
+
+# ---- float16/bfloat16 parameters -----------------------------------------------------------
+# A reduced-precision parameter follows PyTorch's single-tensor update op for
+# op: the in-place `add_(alpha=)`, `lerp_`, `addcmul_` and `addcdiv_` each
+# compute in float and round to the format once, where the float32/float64
+# expressions above would round every partial product. The optimizers'
+# float32 scalar tensors (NAdam's mu_product, ASGD's eta and mu) round to
+# float32 as PyTorch's do.
+def _reduced(p):
+    return p.dtype._reduced
+
+
+def _f32(x):
+    return torch.tensor(x, dtype=torch.float32).item()
+
+
+def _half_sgd(opt, g, p):
+    grad = p.grad if not g["maximize"] else -p.grad
+    if g["weight_decay"]:
+        grad = grad.add(p, alpha=g["weight_decay"])
+    if g["momentum"]:
+        st = opt.state[p]
+        buf = st.get("momentum_buffer")
+        if buf is None:
+            buf = grad.detach().clone()
+            st["momentum_buffer"] = buf
+        else:
+            buf.mul_(g["momentum"]).add_(grad, alpha=1 - g["dampening"])
+        grad = grad.add(buf, alpha=g["momentum"]) if g["nesterov"] else buf
+    p.add_(grad, alpha=-_value(g["lr"]))
+
+
+def _half_adam(opt, g, p):
+    grad = p.grad if not g["maximize"] else -p.grad
+    st = opt.state[p]
+    if not st:
+        st.update({"step": 0, "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)})
+        if g["amsgrad"]:
+            st["max_exp_avg_sq"] = torch.zeros_like(p)
+    st["step"] += 1
+    b1, b2 = g["betas"]
+    lr, wd = _value(g["lr"]), g["weight_decay"]
+    if wd:
+        if g.get("decoupled_weight_decay", opt._decoupled):
+            p.mul_(1 - lr * wd)
+        else:
+            grad = grad.add(p, alpha=wd)
+    exp_avg, exp_avg_sq = st["exp_avg"], st["exp_avg_sq"]
+    exp_avg.lerp_(grad, 1 - b1)
+    exp_avg_sq.mul_(b2).addcmul_(grad, grad, value=1 - b2)
+    step = float(st["step"])
+    step_size = lr / (1 - b1 ** step)
+    bias2_sqrt = (1 - b2 ** step) ** 0.5
+    if g["amsgrad"]:
+        mx = st.get("max_exp_avg_sq")
+        if mx is None:
+            mx = st["max_exp_avg_sq"] = torch.zeros_like(p)
+        mx.copy_(torch.maximum(mx, exp_avg_sq))
+        denom = (mx.sqrt() / bias2_sqrt).add_(g["eps"])
+    else:
+        denom = (exp_avg_sq.sqrt() / bias2_sqrt).add_(g["eps"])
+    p.addcdiv_(exp_avg, denom, value=-step_size)
+
+
+def _half_rmsprop(opt, g, p):
+    grad = p.grad if not g["maximize"] else -p.grad
+    st = opt.state[p]
+    if not st:
+        st["step"] = 0
+        st["square_avg"] = torch.zeros_like(p)
+        if g["momentum"] > 0:
+            st["momentum_buffer"] = torch.zeros_like(p)
+        if g["centered"]:
+            st["grad_avg"] = torch.zeros_like(p)
+    st["step"] = st.get("step", 0) + 1
+    if g["weight_decay"]:
+        grad = grad.add(p, alpha=g["weight_decay"])
+    alpha = g["alpha"]
+    square_avg = st["square_avg"]
+    square_avg.mul_(alpha).addcmul_(grad, grad, value=1 - alpha)
+    if g["centered"]:
+        grad_avg = st.get("grad_avg")
+        if grad_avg is None:
+            grad_avg = st["grad_avg"] = torch.zeros_like(p)
+        grad_avg.lerp_(grad, 1 - alpha)
+        avg = square_avg.addcmul(grad_avg, grad_avg, value=-1).sqrt_()
+    else:
+        avg = square_avg.sqrt()
+    avg = avg.add_(g["eps"])
+    lr = _value(g["lr"])
+    if g["momentum"] > 0:
+        buf = st.get("momentum_buffer")
+        if buf is None:
+            buf = st["momentum_buffer"] = torch.zeros_like(p)
+        buf.mul_(g["momentum"]).addcdiv_(grad, avg)
+        p.add_(buf, alpha=-lr)
+    else:
+        p.addcdiv_(grad, avg, value=-lr)
+
+
+def _half_adagrad(opt, g, p):
+    st = opt.state[p]
+    if not st:
+        st["step"] = 0
+        st["sum"] = torch.full_like(p, g["initial_accumulator_value"])
+    st["step"] += 1
+    grad = p.grad if not g["maximize"] else -p.grad
+    if g["weight_decay"]:
+        grad = grad.add(p, alpha=g["weight_decay"])
+    clr = _value(g["lr"]) / (1 + (float(st["step"]) - 1) * g["lr_decay"])
+    st["sum"].addcmul_(grad, grad, value=1)
+    std = st["sum"].sqrt().add_(g["eps"])
+    p.addcdiv_(grad, std, value=-clr)
+
+
+def _half_adamax(opt, g, p):
+    grad = p.grad if not g["maximize"] else -p.grad
+    st = opt.state[p]
+    if not st:
+        st.update({"step": 0, "exp_avg": torch.zeros_like(p), "exp_inf": torch.zeros_like(p)})
+    st["step"] += 1
+    b1, b2 = g["betas"]
+    if g["weight_decay"]:
+        grad = grad.add(p, alpha=g["weight_decay"])
+    exp_avg, exp_inf = st["exp_avg"], st["exp_inf"]
+    exp_avg.lerp_(grad, 1 - b1)
+    exp_inf.copy_(torch.maximum(exp_inf.mul_(b2), grad.abs().add_(g["eps"])))
+    clr = _value(g["lr"]) / (1 - b1 ** float(st["step"]))
+    p.addcdiv_(exp_avg, exp_inf, value=-clr)
+
+
+def _half_nadam(opt, g, p):
+    grad = p.grad if not g["maximize"] else -p.grad
+    st = opt.state[p]
+    if not st:
+        st.update({"step": 0, "mu_product": 1.0, "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)})
+    st["step"] += 1
+    step = float(st["step"])
+    lr, wd = _value(g["lr"]), g["weight_decay"]
+    b1, b2 = g["betas"]
+    bias2 = 1 - b2 ** step
+    if wd:
+        if g["decoupled_weight_decay"]:
+            p.mul_(1 - lr * wd)
+        else:
+            grad = grad.add(p, alpha=wd)
+    mu = b1 * (1.0 - 0.5 * (0.96 ** (step * g["momentum_decay"])))
+    mu_next = b1 * (1.0 - 0.5 * (0.96 ** ((step + 1) * g["momentum_decay"])))
+    # PyTorch keeps mu_product as a float32 tensor.
+    mu_product = _f32(_f32(st["mu_product"]) * mu)
+    st["mu_product"] = mu_product
+    exp_avg, exp_avg_sq = st["exp_avg"], st["exp_avg_sq"]
+    exp_avg.lerp_(grad, 1 - b1)
+    exp_avg_sq.mul_(b2).addcmul_(grad, grad, value=1 - b2)
+    denom = exp_avg_sq.div(bias2).sqrt()
+    mu_product_next = mu_product * mu_next
+    denom.add_(g["eps"])
+    p.addcdiv_(grad, denom, value=(-lr * (1.0 - mu) / (1.0 - mu_product)))
+    p.addcdiv_(exp_avg, denom, value=(-lr * mu_next) / (1.0 - mu_product_next))
+
+
+def _half_radam(opt, g, p):
+    grad = p.grad if not g["maximize"] else -p.grad
+    st = opt.state[p]
+    if not st:
+        st.update({"step": 0, "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)})
+    st["step"] += 1
+    step = float(st["step"])
+    lr, wd = _value(g["lr"]), g["weight_decay"]
+    b1, b2 = g["betas"]
+    if wd:
+        if g["decoupled_weight_decay"]:
+            p.mul_(1 - lr * wd)
+        else:
+            grad = grad.add(p, alpha=wd)
+    exp_avg, exp_avg_sq = st["exp_avg"], st["exp_avg_sq"]
+    exp_avg.lerp_(grad, 1 - b1)
+    exp_avg_sq.mul_(b2).addcmul_(grad, grad, value=1 - b2)
+    bias1 = 1 - b1 ** step
+    bias2 = 1 - b2 ** step
+    corrected = exp_avg / bias1
+    rho_inf = 2 / (1 - b2) - 1
+    rho_t = rho_inf - 2 * step * (b2 ** step) / bias2
+    if rho_t > 5.0:
+        rect = ((rho_t - 4) * (rho_t - 2) * rho_inf / ((rho_inf - 4) * (rho_inf - 2) * rho_t)) ** 0.5
+        adaptive = (bias2 ** 0.5) / exp_avg_sq.sqrt().add_(g["eps"])
+        p.add_(corrected * lr * adaptive * rect, alpha=-1.0)
+    else:
+        p.add_(corrected * lr, alpha=-1.0)
+
+
+def _half_adadelta(opt, g, p):
+    st = opt.state[p]
+    if not st:
+        st.update({"step": 0, "square_avg": torch.zeros_like(p), "acc_delta": torch.zeros_like(p)})
+    st["step"] += 1
+    grad = p.grad if not g["maximize"] else -p.grad
+    if g["weight_decay"]:
+        grad = grad.add(p, alpha=g["weight_decay"])
+    rho, eps = g["rho"], g["eps"]
+    square_avg, acc_delta = st["square_avg"], st["acc_delta"]
+    square_avg.mul_(rho).addcmul_(grad, grad, value=1 - rho)
+    std = square_avg.add(eps).sqrt_()
+    delta = acc_delta.add(eps).sqrt_()
+    delta.div_(std).mul_(grad)
+    acc_delta.mul_(rho).addcmul_(delta, delta, value=1 - rho)
+    p.add_(delta, alpha=-_value(g["lr"]))
+
+
+def _half_asgd(opt, g, p):
+    grad = p.grad if not g["maximize"] else -p.grad
+    st = opt.state[p]
+    lr = _value(g["lr"])
+    if not st:
+        st.update({"step": 0, "eta": _f32(lr), "mu": 1.0, "ax": torch.zeros_like(p)})
+    st["step"] += 1
+    if g["weight_decay"]:
+        grad = grad.add(p, alpha=g["weight_decay"])
+    # PyTorch keeps eta and mu as float32 tensors.
+    eta = _f32(st["eta"])
+    p.mul_(1 - g["lambd"] * eta)
+    p.add_(grad, alpha=-eta)
+    mu = _f32(st["mu"])
+    if mu != 1:
+        st["ax"].add_(p.sub(st["ax"]).mul_(torch.tensor(mu, dtype=torch.float32)))
+    else:
+        st["ax"].copy_(p)
+    step = float(st["step"])
+    st["eta"] = _f32(lr / ((1 + g["lambd"] * lr * step) ** g["alpha"]))
+    st["mu"] = _f32(1 / max(1, step - g["t0"]))
+
+
+def _half_rprop(opt, g, p):
+    grad = p.grad if not g["maximize"] else -p.grad
+    st = opt.state[p]
+    if not st:
+        st.update({"step": 0, "prev": torch.zeros_like(p), "step_size": torch.full_like(grad, _value(g["lr"]))})
+    st["step"] += 1
+    etaminus, etaplus = g["etas"]
+    step_size_min, step_size_max = g["step_sizes"]
+    prev, step_size = st["prev"], st["step_size"]
+    sign = grad.mul(prev).sign()
+    sign[sign.gt(0)] = etaplus
+    sign[sign.lt(0)] = etaminus
+    sign[sign.eq(0)] = 1
+    step_size.mul_(sign).clamp_(step_size_min, step_size_max)
+    grad = grad.clone()
+    grad[sign.eq(etaminus)] = 0
+    p.addcmul_(grad.sign(), step_size, value=-1)
+    prev.copy_(grad)
 
 
 def _dot(a, b):

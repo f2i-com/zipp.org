@@ -1,0 +1,87 @@
+matmul bfloat16 float16 bfloat16 float16 float64 float64
+matmul_1d bfloat16 float16 bfloat16 float16 float64 float64
+mm bfloat16 float16 bfloat16 float16 float64 float64
+bmm bfloat16 float16 bfloat16 float16 float64 float64
+baddbmm bfloat16 float16 bfloat16 float16 float64 float64
+addmm bfloat16 float16 bfloat16 float16 float64 float64
+addbmm bfloat16 float16 bfloat16 float16 float64 float64
+Tensor.mm bfloat16 float16 bfloat16 float16 float64 float64
+mv float32 float32 bfloat16 float16 float64 float64
+addmv float32 float32 bfloat16 float16 float64 float64
+dot float32 float32 bfloat16 float16 float64 float64
+outer float32 float32 bfloat16 float16 float64 float64
+einsum_contract bfloat16 float16 bfloat16 float16 float64 float64
+einsum_elementwise float32 float32 bfloat16 float16 float64 float64
+tensordot bfloat16 float16 bfloat16 float16 float64 float64
+tensordot_full float32 float32 bfloat16 float16 float64 float64
+multi_dot bfloat16 float16 bfloat16 float16 float64 float64
+matrix_power bfloat16 float16 bfloat16 float16 bfloat16 float16
+linalg.vecdot bfloat16 float16 bfloat16 float16 float64 float64
+F.linear bfloat16 float16 bfloat16 float16 float64 float64
+F.bilinear float32 float32 bfloat16 float16 float64 float64
+F.conv1d bfloat16 float16 bfloat16 float16 float64 float64
+F.conv2d bfloat16 float16 bfloat16 float16 float64 float64
+F.conv3d bfloat16 float16 bfloat16 float16 float64 float64
+F.conv_transpose2d bfloat16 float16 bfloat16 float16 float64 float64
+F.prelu bfloat16 float16 bfloat16 float16 float64 float64
+F.sdpa bfloat16 float16 bfloat16 float16 float64 float64
+F.relu float32 float32 bfloat16 float16 float64 float64
+F.softmax float32 float32 bfloat16 float16 float64 float64
+F.layer_norm float32 float32 bfloat16 float16 float64 float64
+F.max_pool2d float32 float32 bfloat16 float16 float64 float64
+F.max_pool3d float32 float32 float32 float32 float64 float64
+F.adaptive_avg_pool3d float32 float32 float32 float32 float64 float64
+F.pad_reflect float32 float32 float32 float32 float64 float64
+F.pad_replicate float32 float32 float32 float32 float64 float64
+F.pad_constant float32 float32 bfloat16 float16 float64 float64
+F.pad_circular float32 float32 bfloat16 float16 float64 float64
+F.mse_loss float32 float32 float32 float32 float64 float64
+F.l1_loss float32 float32 float32 float32 float64 float64
+F.smooth_l1_loss float32 float32 float32 float32 float64 float64
+F.cross_entropy float32 float32 float32 float32 float64 float64
+F.nll_loss float32 float32 float32 float32 float64 float64
+F.kl_div float32 float32 float32 float32 float64 float64
+F.bce_with_logits float32 float32 float32 float32 float64 float64
+F.gaussian_nll float32 float32 bfloat16 float16 float64 float64
+F.cosine_similarity float32 float32 bfloat16 float16 float64 float64
+cdist float32 float32 float32 float32 float64 float64
+trace float32 float32 float32 float32 float64 float64
+prod float32 float32 float32 float32 float64 float64
+Tensor.prod float32 float32 float32 float32 float64 float64
+quantile float32 float32 float32 float32 float64 float64
+sum float32 float32 bfloat16 float16 float64 float64
+cumsum float32 float32 bfloat16 float16 float64 float64
+cat_mixed float32 float32 float32 float32 float64 float64
+cat_same float32 float32 bfloat16 float16 float64 float64
+stack_f64 float64 float64 float64 float64 float64 float64
+inverse float32 float32 float32 float32 float64 float64
+linalg.inv float32 float32 float32 float32 float64 float64
+linalg.cholesky float32 float32 float32 float32 float64 float64
+linalg.svdvals float32 float32 float32 float32 float64 float64
+linalg.eigvalsh float32 float32 float32 float32 float64 float64
+linalg.solve float32 float32 float32 float32 float64 float64
+linalg.pinv bfloat16 float16 bfloat16 float16 bfloat16 float16
+pinverse float32 float32 float32 float32 float32 float32
+nn.Linear bfloat16 float16 bfloat16 float16 float64 float64
+nn.MHA bfloat16 float16 bfloat16 float16 bfloat16 float16
+nn.RNN bfloat16 float16 bfloat16 float16 bfloat16 float16
+nn.GRUCell float32 float32 float32 float32 float32 float32
+nn.LSTMCell float32 float32 float32 float32 float32 float32
+cat torch.float16 torch.float32 RuntimeError Unexpected floating ScalarType in at::autocast::prioritize
+cat torch.float32 torch.float16 torch.float32
+cat torch.bfloat16 torch.float32 RuntimeError Unexpected floating ScalarType in at::autocast::prioritize
+cat torch.float32 torch.bfloat16 torch.float32
+(False, 'torch.bfloat16')
+(True, 'torch.bfloat16', 'torch.bfloat16')
+(False, 'torch.float32')
+(True, 'torch.float16', 'torch.float16')
+('torch.bfloat16', 'torch.bfloat16')
+'torch.float64'
+'torch.bfloat16'
+'torch.float32'
+'torch.float32'
+(False, 'torch.float32')
+'torch.bfloat16'
+('torch.bfloat16', False)
+True
+(False, 'torch.float32')

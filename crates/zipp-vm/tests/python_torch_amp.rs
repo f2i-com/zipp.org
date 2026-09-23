@@ -108,8 +108,70 @@ with torch.autocast("cpu", dtype=torch.bfloat16):
             "False False False",
             "True False",
             "True True",
-            "True torch.float32",
+            "True torch.bfloat16",
         ],
         "{out}"
     );
+}
+
+/// Inside `torch.autocast("cpu")` every op takes PyTorch 2.11's CPU policy:
+/// the result dtype of ~70 ops (lower-precision, fp32, promote and
+/// untouched ops, composites such as einsum/tensordot/multi_dot/pinv and
+/// the nn modules built on them) for float32, bfloat16, float16 and float64
+/// inputs in bfloat16 and float16 regions, cat's `prioritize` errors, and
+/// the autocast state through nesting, `enabled=False`, the decorator,
+/// `cache_enabled` and an unsupported dtype.
+#[test]
+fn cpu_autocast_retypes_ops_as_pytorch() {
+    let source = format!(
+        "{}
+for line in policy_lines() + state_lines():
+    print(line)
+",
+        include_str!("fixtures/torch_amp/autocast_cases.py")
+    );
+    let out = lines(&run(&source).unwrap().join("
+"));
+    let want = lines(include_str!("fixtures/torch_amp/autocast_lines_expected.txt"));
+    for (got, want) in out.iter().zip(&want) {
+        assert_eq!(got, want);
+    }
+    assert_eq!(out.len(), want.len());
+}
+
+/// A training step inside `torch.autocast("cpu")` (bfloat16 and float16):
+/// the activations' dtypes, the loss values and the float32 gradients that
+/// flow back through the casts agree with PyTorch to the autocast format's
+/// precision (Zipp's reduced-precision matmul rounds once where PyTorch's
+/// blocked float kernels may round differently).
+#[test]
+fn cpu_autocast_training_step_matches_pytorch() {
+    let source = format!(
+        "{}
+import json
+expected = json.loads(r'''{}''')
+{}",
+        include_str!("fixtures/torch_amp/autocast_cases.py"),
+        include_str!("fixtures/torch_amp/autocast_expected.json"),
+        r#"
+got = train_values()
+bad = []
+for name in sorted(expected):
+    e, g = expected[name], got[name]
+    if name.endswith("dtypes") or len(e) != len(g):
+        if e != g:
+            bad.append("%s: %r, expected %r" % (name, g, e))
+        continue
+    if isinstance(e[0], str):
+        if e[0] != g[0]:
+            bad.append("%s: %s, expected %s" % (name, g[0], e[0]))
+        e, g = e[1:], g[1:]
+    tol = 0.02 if name.startswith("bfloat16") else 0.004
+    worst = max([abs(a - b) / max(1.0, abs(b)) for a, b in zip(g, e)] + [0.0])
+    if not worst <= tol:
+        bad.append("%s: off by %.3g" % (name, worst))
+print("compared", len(expected), bad)
+"#
+    );
+    assert_eq!(run(&source).unwrap(), ["compared 16 []"]);
 }

@@ -28,8 +28,9 @@ class dtype:
         self.itemsize = _ITEMSIZE.get(name, 1)
         self.is_signed = name not in ("uint8", "bool")
         self.is_complex = False
-        # float16/bfloat16: stored as float32 values, every result rounded
-        # to the format; arithmetic follows PyTorch's float `opmath`.
+        # float16/bfloat16: two bytes per element (a Float16Array, or the
+        # upper float32 halves in a Uint16Array), every result rounded to
+        # the format; arithmetic follows PyTorch's float `opmath`.
         self._reduced = name in ("float16", "bfloat16")
 
     def __repr__(self):
@@ -183,6 +184,75 @@ def _norm_dim(dim, rank):
 
 # ---- autograd ---------------------------------------------------------------------------
 _grad_enabled = True
+
+# ---- CPU autocast -------------------------------------------------------------------------
+# The lower-precision dtype while a CPU autocast region is enabled, else None
+# (torch.amp keeps it). An op on one of PyTorch's CPU autocast lists tests it
+# on entry -- one global load when autocast is off -- and runs through
+# `_autocast_run`, which casts the op's floating inputs by its policy and runs
+# it with autocast off, as PyTorch's autocast kernels call the op below the
+# Autocast dispatch key: "lower" casts to the autocast dtype, "fp32" to
+# float32, "promote" to the widest floating input, None casts nothing. float64
+# and non-floating tensors are never cast.
+_autocast_cpu = None
+# While the region's cache is enabled, the casts of float32 leaf tensors that
+# require grad (weights): id -> (tensor, cast), cleared as the outermost
+# region exits (torch.amp).
+_autocast_cache = None
+
+
+def _autocast_cast(v, dt):
+    if _isinstance(v, Tensor):
+        vd = v.dtype
+        if vd is dt or vd is float64 or not vd.is_floating_point:
+            return v
+        cache = _autocast_cache
+        if cache is not None and vd is float32 and dt is _autocast_cpu and v.requires_grad and v._node is None:
+            hit = cache.get(id(v))
+            if hit is not None and hit[0] is v:
+                return hit[1]
+            out = v.to(dt)
+            cache[id(v)] = (v, out)
+            return out
+        return v.to(dt)
+    if type(v) is _list:
+        return [_autocast_cast(x, dt) for x in v]
+    if type(v) is _tuple:
+        return _tuple([_autocast_cast(x, dt) for x in v])
+    return v
+
+
+def _autocast_widest(values, fast):
+    """at::autocast::prioritize over the floating tensors in `values`
+    (one list level deep), starting from the autocast dtype."""
+    cur = fast
+    for v in values:
+        for t_ in (v if type(v) is _list or type(v) is _tuple else (v,)):
+            if _isinstance(t_, Tensor) and t_.dtype.is_floating_point:
+                d = t_.dtype
+                if d is float64:
+                    continue
+                if cur is float32 or d is float32:
+                    cur = float32
+                elif not (cur is fast and d is fast):
+                    raise RuntimeError("Unexpected floating ScalarType in at::autocast::prioritize")
+    return cur
+
+
+def _autocast_run(fn, policy, args, kwargs=None):
+    """fn(*args, **kwargs) under the CPU autocast policy `policy`."""
+    global _autocast_cpu
+    fast = _autocast_cpu
+    if policy is not None:
+        dt = fast if policy == "lower" else float32 if policy == "fp32" else _autocast_widest(_list(args) + _list((kwargs or {}).values()), fast)
+        args = _autocast_cast(_tuple(args), dt)
+        if kwargs:
+            kwargs = {k: _autocast_cast(v, dt) for k, v in kwargs.items()}
+    _autocast_cpu = None
+    try:
+        return fn(*args, **(kwargs or {}))
+    finally:
+        _autocast_cpu = fast
 
 
 class autocast:
@@ -531,6 +601,14 @@ def can_cast(from_, to):
 _CATEGORY = {"bool": 0, "uint8": 1, "int8": 1, "int16": 1, "int32": 1, "int64": 1, "float16": 2, "bfloat16": 2, "float32": 2, "float64": 2}
 
 
+def _cast_0d(t_, dt):
+    """A 0-d operand converted to the result dtype: differentiably when it
+    requires grad (the gradient flows back through the cast)."""
+    if _grad_enabled and t_.requires_grad:
+        return t_.to(dt)
+    return Tensor(_k.astype(t_._s, dt.name), (), dt)
+
+
 def _operands(a, b, opmath=False):
     """Both operands as tensors plus the promoted result dtype (None when the
     kernel's own promotion of the two storages already gives it). A Python
@@ -543,13 +621,13 @@ def _operands(a, b, opmath=False):
                 return a, b, None
             dt = _result_type(a, b)
             if opmath and dt._reduced and not b.shape and a.dtype is dt:
-                return a, (b if b.dtype is float32 else Tensor(_k.astype(b._s, "float32"), (), float32)), dt
+                return a, (b if b.dtype is float32 else _cast_0d(b, float32)), dt
             # Only a 0-d operand can lose to the other's dtype; cast it, so
             # the kernel computes in the result dtype as PyTorch does.
             if b.dtype is not dt and not b.shape:
-                b = Tensor(_k.astype(b._s, dt.name), (), dt)
+                b = _cast_0d(b, dt)
             elif a.dtype is not dt and not a.shape:
-                a = Tensor(_k.astype(a._s, dt.name), (), dt)
+                a = _cast_0d(a, dt)
             return a, b, dt
         tb = type(b)
         if (tb is _float or tb is _int) and not _graph_recording:
@@ -734,6 +812,14 @@ class Tensor:
         return self
 
     def element_size(self):
+        return self.dtype.itemsize
+
+    @property
+    def nbytes(self):
+        return self.numel() * self.dtype.itemsize
+
+    @property
+    def itemsize(self):
         return self.dtype.itemsize
 
     def get_device(self):
@@ -1701,9 +1787,7 @@ class Tensor:
 
     def view(self, *shape):
         if _len(shape) == 1 and _isinstance(shape[0], dtype):
-            if shape[0].itemsize != self.dtype.itemsize:
-                raise RuntimeError("view(dtype): only dtypes of the same size are supported on Zipp")
-            return self if shape[0] is self.dtype else Tensor(_k.frombytes(shape[0].name, _k.tobytes(self._s)), self.shape, shape[0])
+            return _view_dtype(self, shape[0])
         return reshape(self, *shape)
 
     def reshape_as(self, other):
@@ -2348,6 +2432,29 @@ def _shape_args(shape):
 # other shape takes the class call).
 # A replaced `__init__` (a wrapper installed on the class) is still called.
 _onew = object.__new__
+
+
+def _view_dtype(t, dt):
+    """`t.view(dt)`: t's bytes read as `dt`. float16/bfloat16/int16 (and
+    uint8/int8) views share t's memory, so a write through either shows in
+    the other; other pairs copy the bytes (int32/int64 are not stored at
+    their width). A different element size rescales the last dimension."""
+    if dt is t.dtype:
+        return t
+    old, new = t.dtype.itemsize, dt.itemsize
+    if old == new:
+        st = _k.view_dtype(t._s, dt.name)
+        if st is None:
+            st = _k.frombytes(dt.name, _k.tobytes(t._s))
+        return Tensor(st, t.shape, dt)
+    what = "view %s as %s (different element sizes)" % (_CAST_NAME[t.dtype.name], _CAST_NAME[dt.name])
+    if not t.shape:
+        raise RuntimeError("self.dim() cannot be 0 to " + what)
+    last = t.shape[-1]
+    if old < new and (last * old) % new:
+        raise RuntimeError("self.size(-1) must be divisible by %d to %s, but got %d" % (new // old, what, last))
+    shape = _tuple(t.shape[:-1]) + (last * old // new,)
+    return Tensor(_k.frombytes(dt.name, _k.tobytes(t._s)), shape, dt)
 
 
 def _new3(storage, shape, dt):
@@ -3982,6 +4089,8 @@ def _int64_acc(a):
 
 
 def prod(input, dim=None, keepdim=False, dtype=None):
+    if _autocast_cpu is not None:
+        return _autocast_run(prod, "fp32", (input, dim, keepdim, dtype))
     a = input if dtype is None else input.to(dtype)
     out = _reduce_nograd("prod", _int64_acc(a), dim, keepdim)
     if _grad_enabled and a.requires_grad:
@@ -4219,6 +4328,8 @@ def mode(input, dim=-1, keepdim=False):
 
 
 def quantile(input, q, dim=None, keepdim=False, interpolation="linear"):
+    if _autocast_cpu is not None:
+        return _autocast_run(quantile, "fp32", (input, q, dim, keepdim, interpolation))
     a = input
     if dim is None:
         a, d = a.reshape(-1), 0
@@ -4256,6 +4367,8 @@ def quantile(input, q, dim=None, keepdim=False, interpolation="linear"):
 
 
 def nanquantile(input, q, dim=None, keepdim=False, interpolation="linear"):
+    if _autocast_cpu is not None:
+        return _autocast_run(nanquantile, "fp32", (input, q, dim, keepdim, interpolation))
     return quantile(input, q, dim, keepdim, interpolation)
 
 
@@ -4737,6 +4850,8 @@ def narrow(input, dim, start, length):
 
 
 def cat(tensors, dim=0):
+    if _autocast_cpu is not None:
+        return _autocast_run(cat, "promote", (tensors, dim))
     tensors = [_as_tensor(t) for t in tensors]
     if not tensors:
         raise RuntimeError("torch.cat(): expected a non-empty list of Tensors")
@@ -4769,6 +4884,8 @@ concatenate = cat
 
 
 def stack(tensors, dim=0):
+    if _autocast_cpu is not None:
+        return _autocast_run(stack, "promote", (tensors, dim))
     tensors = [t if type(t) is Tensor else _as_tensor(t) for t in tensors]
     if not tensors:
         raise RuntimeError("stack expects a non-empty TensorList")
@@ -5025,6 +5142,8 @@ def diagflat(input, offset=0):
 
 
 def trace(input):
+    if _autocast_cpu is not None:
+        return _autocast_run(trace, "fp32", (input,))
     return sum(diagonal(input))
 
 
@@ -5434,6 +5553,8 @@ def _moved_order(rank, d):
 
 
 def index_copy(input, dim, index, source):
+    if _autocast_cpu is not None:
+        return _autocast_run(index_copy, "promote", (input, dim, index, source))
     a = input
     d = _norm_dim(dim, _b.max(_len(a.shape), 1))
     src = source if source.dtype is a.dtype else source.to(a.dtype)
@@ -5630,6 +5751,8 @@ def bucketize(input, boundaries, out_int32=False, right=False):
 
 # ---- linear algebra ----------------------------------------------------------------------
 def matmul(input, other):
+    if _autocast_cpu is not None:
+        return _autocast_run(matmul, "lower", (input, other))
     a, b = input, other
     if _graph_recording:
         if getattr(a, "_zipp_graph", False):
@@ -5719,6 +5842,8 @@ def _linear(x, weight, bias=None):
     transposed in place (`matmul`'s transB) where `matmul(x, weight.T)`
     would copy it and record a Permute node; the values, gradients and their
     accumulation order are that path's exactly (see `_linear_mm`)."""
+    if _autocast_cpu is not None:
+        return _autocast_run(_linear, "lower", (x, weight, bias))
     if (not _graph_recording and _isinstance(x, Tensor) and _isinstance(weight, Tensor)
             and _len(weight.shape) == 2 and _len(x.shape) >= 2):
         out = _linear_mm(x, weight)
@@ -5773,12 +5898,16 @@ def _linear_mm(x, w):
 
 
 def mm(input, mat2):
+    if _autocast_cpu is not None:
+        return _autocast_run(mm, "lower", (input, mat2))
     if _len(input.shape) != 2 or _len(mat2.shape) != 2:
         raise RuntimeError("self must be a matrix" if _len(input.shape) != 2 else "mat2 must be a matrix")
     return matmul(input, mat2)
 
 
 def bmm(input, mat2):
+    if _autocast_cpu is not None:
+        return _autocast_run(bmm, "lower", (input, mat2))
     if _len(input.shape) != 3 or _len(mat2.shape) != 3:
         raise RuntimeError("batch1 must be a 3D tensor" if _len(input.shape) != 3 else "batch2 must be a 3D tensor")
     if input.shape[0] != mat2.shape[0]:
@@ -5787,12 +5916,16 @@ def bmm(input, mat2):
 
 
 def mv(input, vec):
+    if _autocast_cpu is not None:
+        return _autocast_run(mv, None, (input, vec))
     if _len(input.shape) != 2 or _len(vec.shape) != 1:
         raise RuntimeError("vector + matrix @ vector expected, got %d, %d" % (_len(input.shape), _len(vec.shape)))
     return matmul(input, vec)
 
 
 def dot(input, other):
+    if _autocast_cpu is not None:
+        return _autocast_run(dot, None, (input, other))
     if _len(input.shape) != 1 or _len(other.shape) != 1:
         raise RuntimeError("1D tensors expected, but got %dD and %dD tensors" % (_len(input.shape), _len(other.shape)))
     if input.shape[0] != other.shape[0]:
@@ -5821,18 +5954,26 @@ def _scaled_sum(input, product, beta, alpha):
 
 
 def addmm(input, mat1, mat2, beta=1, alpha=1):
+    if _autocast_cpu is not None:
+        return _autocast_run(addmm, "lower", (input, mat1, mat2, beta, alpha))
     return _scaled_sum(input, mm(mat1, mat2), beta, alpha)
 
 
 def addmv(input, mat, vec, beta=1, alpha=1):
+    if _autocast_cpu is not None:
+        return _autocast_run(addmv, None, (input, mat, vec, beta, alpha))
     return _scaled_sum(input, mv(mat, vec), beta, alpha)
 
 
 def addbmm(input, batch1, batch2, beta=1, alpha=1):
+    if _autocast_cpu is not None:
+        return _autocast_run(addbmm, "lower", (input, batch1, batch2, beta, alpha))
     return _scaled_sum(input, sum(bmm(batch1, batch2), 0), beta, alpha)
 
 
 def baddbmm(input, batch1, batch2, beta=1, alpha=1):
+    if _autocast_cpu is not None:
+        return _autocast_run(baddbmm, "lower", (input, batch1, batch2, beta, alpha))
     return _scaled_sum(input, bmm(batch1, batch2), beta, alpha)
 
 
@@ -5840,7 +5981,29 @@ def addr(input, vec1, vec2, beta=1, alpha=1):
     return _scaled_sum(input, outer(vec1, vec2), beta, alpha)
 
 
+def _tensordot_policy(a, b, dims):
+    # PyTorch contracts through mm (autocast) unless every dim is contracted.
+    n = dims if _isinstance(dims, _int) else _len(dims[0]) if _isinstance(dims[0], (_list, _tuple)) else 1
+    return None if _len(a.shape) + _len(b.shape) - 2 * n <= 0 else "lower"
+
+
+def _einsum_policy(equation, operands):
+    # PyTorch contracts pairs of operands with bmm (autocast) when a label
+    # is summed away; elementwise and single-operand equations do not.
+    if _len(operands) == 1 and type(operands[0]) in (_list, _tuple):
+        operands = operands[0]
+    if _len(operands) < 2 or not _isinstance(equation, str):
+        return None
+    lhs, _, rhs = equation.replace(" ", "").partition("->")
+    labels = [c for c in lhs if c.isalpha()]
+    if "->" not in equation:
+        return "lower" if _b.any(labels.count(c) > 1 for c in labels) else None
+    return "lower" if _b.any(c not in rhs for c in labels) else None
+
+
 def tensordot(a, b, dims=2):
+    if _autocast_cpu is not None:
+        return _autocast_run(tensordot, _tensordot_policy(a, b, dims), (a, b, dims))
     if _isinstance(dims, Tensor):
         dims = dims.tolist()
     if _isinstance(dims, _int):
@@ -5895,6 +6058,8 @@ def cross(input, other, dim=None):
 
 def cdist(x1, x2, p=2.0, compute_mode=None):
     """Pairwise p-norm distances between the rows of x1 [..., P, M] and x2 [..., R, M]."""
+    if _autocast_cpu is not None:
+        return _autocast_run(cdist, "fp32", (x1, x2, p, compute_mode))
     d = sub(unsqueeze(x1, -2), unsqueeze(x2, -3))
     return norm(d, p, -1)
 
@@ -5940,6 +6105,8 @@ def einsum(equation, *operands):
     sum the labels absent from the output. A label repeated within one
     operand takes its diagonal; '...' covers broadcast dims. Every step
     keeps autograd."""
+    if _autocast_cpu is not None:
+        return _autocast_run(einsum, _einsum_policy(equation, operands), (equation,) + _tuple(operands))
     if _len(operands) == 1 and _isinstance(operands[0], (_list, _tuple)):
         operands = _tuple(operands[0])
     terms, rhs = _einsum_split(equation, operands)
@@ -6145,7 +6312,15 @@ _bwd_active = False
 
 
 def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
-    global _bwd_active, _grad_enabled
+    global _bwd_active, _grad_enabled, _autocast_cpu
+    if _autocast_cpu is not None:
+        # Backward runs with autocast off: its ops take the dtypes the
+        # forward ops chose, as PyTorch's backward does.
+        fast, _autocast_cpu = _autocast_cpu, None
+        try:
+            return _backward(roots, grads, accumulate, inputs, create_graph)
+        finally:
+            _autocast_cpu = fast
     if _bwd_active:
         return _backward_dict(roots, grads, accumulate, inputs, create_graph)
     if _isinstance(roots, Tensor):
@@ -6603,6 +6778,12 @@ class _Storage:
 
     def __init__(self, storage=None):
         self._s = storage
+
+    def element_size(self):
+        return self.dtype.itemsize
+
+    def nbytes(self):
+        return _k.size(self._s) * self.dtype.itemsize
 
 
 class FloatStorage(_Storage):

@@ -24,7 +24,9 @@
 //! own). A kernel returns `true` when it wrote its outputs and `false` when it
 //! declined, leaving them untouched; the runtime then runs its own loop.
 //! It declines on anything it does not recognise — an argument that is not a
-//! Float32Array/Float64Array/Uint8Array view, a detached or out-of-range
+//! Float32Array/Float64Array/Float16Array/Uint8Array/Uint16Array view (a
+//! float16 storage is a Float16Array; a bfloat16 one is a Uint16Array of
+//! bits, which the runtime only hands over to copy), a detached or out-of-range
 //! view, an output sharing a buffer with an input, sizes that overflow — so
 //! the JavaScript loop stays the reference for every odd case, errors
 //! included.
@@ -38,7 +40,7 @@
 //! it declines and the interpreted loop spends the budget exactly as it did
 //! before these kernels existed. It also declines while a trace is recorded,
 //! and polls the host abort flag between blocks of work.
-use super::helpers_num2::math_unary;
+use super::helpers_num2::{f16_bits_to_f64, f64_to_f16_bits, math_unary};
 use super::helpers_numeric::to_uint_modular;
 use super::{native, Thrown, Vm};
 use crate::bytecode::MathFn as M;
@@ -72,8 +74,10 @@ const OP_MAX_POOL2D_BACKWARD: u32 = 15;
 
 // TypedArray kinds (`native::TA_KINDS`) a tensor storage can be.
 const KIND_U8: u8 = 1;
+const KIND_U16: u8 = 4;
 const KIND_F32: u8 = 7;
 const KIND_F64: u8 = 8;
+const KIND_F16: u8 = 11;
 
 /// A typed-array view: its buffer's heap index, element kind, byte offset
 /// and element count.
@@ -89,6 +93,7 @@ impl View {
     fn size(self) -> usize {
         match self.kind {
             KIND_U8 => 1,
+            KIND_U16 | KIND_F16 => 2,
             KIND_F32 => 4,
             _ => 8,
         }
@@ -102,6 +107,8 @@ fn stored(kind: u8, x: f64) -> f64 {
     match kind {
         KIND_F32 => x as f32 as f64,
         KIND_U8 => to_uint_modular(x, 8) as f64,
+        KIND_U16 => to_uint_modular(x, 16) as f64,
+        KIND_F16 => f16_bits_to_f64(f64_to_f16_bits(x)),
         _ => x,
     }
 }
@@ -429,8 +436,8 @@ impl Vm<'_> {
 
     // ---- argument access ------------------------------------------------------------
 
-    /// A storage view: a Float32Array, Float64Array or Uint8Array whose
-    /// buffer is live and covers it.
+    /// A storage view: a Float32Array, Float64Array, Float16Array,
+    /// Uint8Array or Uint16Array whose buffer is live and covers it.
     fn pt_view(&self, v: Value) -> Option<View> {
         if !v.is_heap() {
             return None;
@@ -445,7 +452,7 @@ impl Vm<'_> {
         else {
             return None;
         };
-        if !matches!(kind, KIND_U8 | KIND_F32 | KIND_F64) {
+        if !matches!(kind, KIND_U8 | KIND_U16 | KIND_F32 | KIND_F64 | KIND_F16) {
             return None;
         }
         let len = self.ta_effective_len(idx)?;
@@ -485,6 +492,8 @@ impl Vm<'_> {
                 b.copy_from_slice(c);
                 f64::from_le_bytes(b)
             })),
+            KIND_F16 => out.extend(bytes.chunks_exact(2).map(|c| f16_bits_to_f64(u16::from_le_bytes([c[0], c[1]])))),
+            KIND_U16 => out.extend(bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as f64)),
             _ => out.extend(bytes.iter().map(|&b| b as f64)),
         }
         Some(out)
@@ -520,6 +529,16 @@ impl Vm<'_> {
             KIND_F64 => {
                 for (c, &x) in bytes.chunks_exact_mut(8).zip(values) {
                     c.copy_from_slice(&x.to_le_bytes());
+                }
+            }
+            KIND_F16 => {
+                for (c, &x) in bytes.chunks_exact_mut(2).zip(values) {
+                    c.copy_from_slice(&f64_to_f16_bits(x).to_le_bytes());
+                }
+            }
+            KIND_U16 => {
+                for (c, &x) in bytes.chunks_exact_mut(2).zip(values) {
+                    c.copy_from_slice(&(to_uint_modular(x, 16) as u16).to_le_bytes());
                 }
             }
             _ => {

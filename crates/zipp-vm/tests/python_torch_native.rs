@@ -254,6 +254,80 @@ for op in ["add", "sub", "mul", "div", "pow", "max", "lt", "eq", "floordiv"]:
                 ref = _k.binary(op, S, (), A, (70,), want) if flip else _k.binary(op, A, (70,), S, (), want)
                 if image(_k.binary_scalar(op, A, (70,), v, sdt, want, flip)) != image(ref):
                     BAD.append("binary_scalar vs full %s %s %s %s" % (op, dt, flip, on))
+# float16 (a Float16Array the native loops read and copy) and bfloat16 (a
+# Uint16Array of bits, decoded before any arithmetic and only copied as it
+# is): every kernel, alone and mixed with float32/float64.
+for dt in ["float16", "bfloat16"]:
+    for op in ["add", "sub", "mul", "div", "pow", "max", "min", "lt", "eq", "and", "floordiv", "mod", "atan2"]:
+        for sa, sb in [((96,), (96,)), ((12, 8), (8,)), ((4, 1, 6), (1, 5, 6)), ((70,), ())]:
+            seed += 1
+            A = storage(dt, sa, seed)
+            B = storage(dt, sb, seed + 1)
+            F = storage("float32", sb, seed + 2)
+            both("half binary %s %s %s %s" % (op, dt, sa, sb), lambda: _k.binary(op, A, sa, B, sb))
+            both("half binary %s %s f32 %s" % (op, dt, sa), lambda: _k.binary(op, A, sa, F, sb))
+            both("half binary %s %s want %s" % (op, dt, sa), lambda: _k.binary(op, F, sb, A, sa, "float64"))
+    for op in ["neg", "relu", "exp", "log", "tanh", "sigmoid", "sqrt", "abs", "sign", "gelu", "reciprocal", "floor", "isnan", "isinf", "sin", "atanh"]:
+        seed += 1
+        A = storage(dt, (70,), seed)
+        both("half unary %s %s" % (op, dt), lambda: _k.unary(op, A))
+    seed += 1
+    A = storage(dt, (100,), seed)
+    both("half clamp %s" % dt, lambda: _k.unary("clamp", A, -0.5, 1.5))
+    for op in ["sum", "mean", "prod", "max", "min", "argmax", "argmin", "all", "any"]:
+        for shape, dims in [((256,), None), ((16, 12), (0,)), ((4, 6, 8), (1,)), ((4, 6, 8), (0, 2))]:
+            for precise in (False, True):
+                seed += 1
+                A = storage(dt, shape, seed)
+                both("half reduce %s %s %s %s %s" % (op, dt, shape, dims, precise), lambda: _k.reduce(op, A, shape, dims, True, precise))
+    for shape, dim in (((8, 10), 1), ((2, 3, 70), -1)):
+        for log in (False, True):
+            seed += 1
+            A = storage(dt, shape, seed)
+            both("half softmax %s %s %s" % (dt, shape, log), lambda: _k.softmax(A, shape, dim, log))
+    for dtb in [dt, "float32", "float64"]:
+        for sa, sb in [((5, 7), (7, 3)), ((16, 32), (32, 20)), ((64,), (64, 9)), ((3, 4, 5), (5, 6))]:
+            seed += 1
+            A = storage(dt, sa, seed)
+            B = storage(dtb, sb, seed + 3)
+            both("half matmul %s %s %s" % (dt, dtb, sa), lambda: _k.matmul(A, sa, B, sb))
+        seed += 1
+        A = storage(dt, (4, 10, 12), seed)
+        B = storage(dtb, (9, 12), seed + 1)
+        both("half matmul_t %s %s" % (dt, dtb), lambda: _k.matmul(A, (4, 10, 12), B, (9, 12), True))
+    for xs, ws, st, pd, dl, g in [((2, 3, 9, 9), (4, 3, 3, 3), (1, 1), (0, 0), (1, 1), 1), ((2, 4, 9, 8), (6, 2, 3, 2), (2, 1), (1, 2), (1, 2), 2)]:
+        seed += 1
+        X = storage(dt, xs, seed)
+        W = storage(dt, ws, seed + 1)
+        for Bi in (None, storage(dt, (ws[0],), seed + 2)):
+            both("half conv2d %s %s" % (dt, xs), lambda: _k.conv2d(X, xs, W, ws, Bi, st, pd, dl, g))
+        ho = (xs[2] + 2 * pd[0] - dl[0] * (ws[2] - 1) - 1) // st[0] + 1
+        wo = (xs[3] + 2 * pd[1] - dl[1] * (ws[3] - 1) - 1) // st[1] + 1
+        G = storage(dt, (xs[0], ws[0], ho, wo), seed + 5)
+        both("half conv2d_backward %s %s" % (dt, xs), lambda: _k.conv2d_backward(X, xs, W, ws, G, st, pd, dl, g))
+    seed += 1
+    X = storage(dt, (2, 3, 20), seed)
+    W = storage(dt, (4, 3, 5), seed + 1)
+    both("half conv1d %s" % dt, lambda: _k.conv1d(X, (2, 3, 20), W, (4, 3, 5), storage(dt, (4,), seed + 2)))
+    G = storage(dt, (2, 4, 16), seed + 3)
+    both("half conv1d_backward %s" % dt, lambda: _k.conv1d_backward(X, (2, 3, 20), W, (4, 3, 5), G))
+    seed += 1
+    A = storage(dt, (6, 5, 7), seed)
+    for perm in ((1, 0, 2), (2, 0, 1)):
+        both("half permute %s %s" % (dt, perm), lambda: _k.permute(A, (6, 5, 7), perm))
+    M = storage(dt, (20, 13), seed)
+    both("half transpose %s" % dt, lambda: _k.permute(M, (20, 13), (1, 0)))
+    V = storage(dt, (1, 13), seed)
+    both("half expand %s" % dt, lambda: _k.expand(V, (1, 13), (4, 9, 13)))
+    both("half slice %s" % dt, lambda: _k.slice(A, (6, 5, 7), [(1, None, 2), None, (0, 6, 1)]))
+    both("half strided %s" % dt, lambda: _k.strided(A, (5, 6), (1, 7), 3))
+    C = storage("bool", (6, 1, 7), seed + 1)
+    Bv = storage(dt, (5, 1), seed + 2)
+    Fv = storage("float32", (5, 1), seed + 3)
+    both("half where %s" % dt, lambda: _k.where(C, (6, 1, 7), A, (6, 5, 7), Bv, (5, 1)))
+    both("half where mixed %s" % dt, lambda: _k.where(C, (6, 1, 7), A, (6, 5, 7), Fv, (5, 1)))
+    both("half all_finite %s" % dt, lambda: _k.all_finite(A))
+    both("half all_finite finite %s" % dt, lambda: _k.all_finite(_k.from_flat(dt, [i / 8.0 for i in range(100)])))
 print("cases", CASES[0], "mismatches", len(BAD), BAD[:5])
 "#;
 
@@ -294,6 +368,33 @@ fn a_native_kernel_is_charged_for_its_work() {
     assert!(native.steps > 4 * macs, "native run charged only {} steps", native.steps);
     // ... and below what the interpreted loop spends on the same work.
     assert!(native.steps < interpreted.steps, "{} vs {}", native.steps, interpreted.steps);
+}
+
+/// float16 storages (Float16Array) take the native loops directly, and a
+/// bfloat16 storage (Uint16Array bits) is copied natively: both runs cost
+/// far fewer steps than the interpreted loops, with the same bytes.
+#[test]
+fn half_storages_take_the_native_loops() {
+    let program = |native: bool, body: &str| {
+        format!(
+            "import _zipp_tensor as _k
+a = _k.astype(_k.from_flat(\"float32\", [((i * 7) % 13) / 13.0 for i in range(4096)]), \"float16\")
+b = _k.astype(_k.from_flat(\"float32\", [((i * 5) % 11) / 11.0 for i in range(4096)]), \"bfloat16\")
+_k._native({})
+{body}
+",
+            if native { "True" } else { "False" }
+        )
+    };
+    let matmul = "out, shape = _k.matmul(a, (64, 64), a, (64, 64))\nprint(_k.dtype(out), _k.nbytes(out), _k.tobytes(out)[:64])";
+    let permute = "out, shape = _k.permute(b, (64, 64), (1, 0))\nprint(_k.dtype(out), _k.nbytes(out), _k.tobytes(out))";
+    for body in [matmul, permute] {
+        let native = run(&program(true, body), 2_000_000_000, false);
+        let interpreted = run(&program(false, body), 2_000_000_000, false);
+        assert_eq!(native.output.clone().unwrap(), interpreted.output.clone().unwrap());
+        assert!(native.output.unwrap()[0].contains(" 8192 "), "two bytes per element");
+        assert!(native.steps < interpreted.steps, "{body}: {} vs {}", native.steps, interpreted.steps);
+    }
 }
 
 #[test]
