@@ -1316,7 +1316,7 @@ impl Vm<'_> {
         let mode = u32::try_from(int_arg(a, 5)?).ok()?;
         let inverse = num_arg(a, 6)? != 0.0;
         let scale = num_arg(a, 7)?;
-        if mode > 3 || n == 0 || n > (1 << 40) {
+        if mode > 3 || n == 0 || n as u64 > (1u64 << 40) {
             return None;
         }
         let half = (n >> 1) + 1;
