@@ -1005,13 +1005,18 @@ class Tensor:
 
     def __float__(self):
         if self.dtype.is_complex:
-            raise TypeError("can't convert complex to float")
+            return _cx_real_scalar(self.item(), "double")
         return _float(self.item())
 
     def __int__(self):
         if self.dtype.is_complex:
-            raise TypeError("can't convert complex to int")
+            return _int(_cx_real_scalar(self.item(), "int64_t"))
         return _int(self.item())
+
+    def __complex__(self):
+        if _numel(self.shape) != 1:
+            raise ValueError("only one element tensors can be converted to Python scalars")
+        return _PyComplex(self.item())
 
     def __bool__(self):
         n = _numel(self.shape)
@@ -1038,7 +1043,7 @@ class Tensor:
     def __format__(self, spec):
         # As PyTorch: a 0-d tensor formats its value; any other tensor only
         # takes an empty format spec.
-        if not self.shape and not self.dtype.is_complex:
+        if not self.shape:
             return format(self.item(), spec)
         if spec:
             raise TypeError("unsupported format string passed to Tensor.__format__")
@@ -1275,6 +1280,12 @@ class Tensor:
         if _grad_enabled and (self.requires_grad or (_isinstance(value, Tensor) and value.requires_grad)):
             return self._inplace_op(_filled, value)
         value = value.item() if _isinstance(value, Tensor) else value
+        if _cx_parts(value) is not None:
+            if self.dtype.is_complex:
+                _k.copy_into(self._s, _cx_from_values(self.dtype, [value] * _numel(self.shape)))
+                self._wrote()
+                return self
+            value = _cx_real_scalar(value, _CPP_NAME.get(self.dtype.name, self.dtype.name))
         if self.dtype.name in _NARROW_INT:
             _check_narrow(self.dtype, [value], "_t")
         _k.fill(self._s, value)
@@ -2688,6 +2699,11 @@ def full(size, fill_value, dtype=None, layout=None, device=None, requires_grad=F
     shape = _shape_args((size,))
     if _isinstance(fill_value, Tensor):
         fill_value = fill_value.item()
+    if _cx_parts(fill_value) is not None:
+        dt = _dtype_of(dtype) or _default_complex()
+        if dt.is_complex:
+            return Tensor(_cx_from_values(dt, [fill_value] * _numel(shape)), shape, dt, requires_grad)
+        fill_value = _cx_real_scalar(fill_value, _CPP_NAME.get(dt.name, dt.name))
     dt = _dtype_of(dtype) or (_default_dtype if _isinstance(fill_value, _float) else (_bool_dtype if _isinstance(fill_value, _b.bool) else int64))
     if dt.name in _NARROW_INT:
         _check_narrow(dt, [fill_value], "_t")
@@ -6982,12 +6998,10 @@ def is_storage(obj):
 # dL/d(re) + i dL/d(im), so a holomorphic f passes grad * conj(f'(z)) back,
 # and a real input of a complex result takes the real part.
 #
-# Python has no complex numbers in this runtime yet (`1+2j` does not
-# compile), so a complex scalar travels as a 0-d complex tensor. The two
-# functions below are the only places a complex element meets a Python
-# value: `_cx_parts` reads one (None for anything that is not a Python
-# complex) and `_cx_scalar` makes one. With a runtime `complex` type they
-# read and build it; until then `_cx_scalar` raises.
+# A complex element meets a Python value in the functions below: `_cx_parts`
+# reads a Python complex (None for anything else), `_cx_scalar` makes one,
+# and `_cx_real_scalar` narrows one to a real dtype as PyTorch's checked
+# conversion does (a nonzero imaginary part is refused).
 _PyComplex = _b.complex if _isinstance(_b.complex, type) else None
 
 
@@ -7003,6 +7017,13 @@ def _cx_scalar(re, im):
     if _PyComplex is None:
         raise NotImplementedError("complex Python scalars are not supported yet")
     return _PyComplex(re, im)
+
+
+def _cx_real_scalar(v, cname):
+    """The real part of a complex scalar converted to a real type `cname`."""
+    if v.imag != 0:
+        raise RuntimeError("value cannot be converted to type %s without overflow" % cname)
+    return v.real
 
 
 def _cx_scalars(s):

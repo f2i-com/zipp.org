@@ -108,7 +108,7 @@ fn unsupported_syntax_is_a_compile_error() {
     for source in [
         "async def f():\n    pass\n",
         "type Point = tuple[int, int]\n",
-        "x = 1j\n",
+        "try:\n    pass\nexcept* ValueError:\n    pass\n",
         "def f(:\n",
         "x = = 1\n",
     ] {

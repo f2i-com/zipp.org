@@ -88,6 +88,11 @@ impl<'a> Emitter<'a> {
                     match &c.value {
                         ast::Constant::Int(i) => return self.integer(&format!("-{i}")),
                         ast::Constant::Float(f) => return self.float(-*f),
+                        ast::Constant::Complex { real, imag } => {
+                            let re = self.float(-*real)?;
+                            let im = self.float(-*imag)?;
+                            return self.helper("cxconst", &[re, im]);
+                        }
                         _ => {}
                     }
                 }
@@ -1152,8 +1157,11 @@ impl<'a> Emitter<'a> {
                 let arr = self.array(&regs)?;
                 self.helper("tuple", &[arr])
             }
-            ast::Constant::Complex { .. } => {
-                Err(self.error(node, "complex numbers are not supported"))
+            // An imaginary literal (`2j`, or a real part CPython folded in).
+            ast::Constant::Complex { real, imag } => {
+                let re = self.float(*real)?;
+                let im = self.float(*imag)?;
+                self.helper("cxconst", &[re, im])
             }
         }
     }

@@ -656,10 +656,14 @@ third-party ML packages is not supported; within the bundled `torch`:
   `view_as_real`/`view_as_complex` share the storage and its version
   counter, but an in-place write through one does not update the other's
   autograd history. Casting complex to real drops the imaginary part with
-  PyTorch's warning (printed to stderr once). Python has no complex numbers
-  on Zipp yet (`1+2j` does not compile), so `item()` and `tolist()` of a
-  complex tensor raise `NotImplementedError` (`float()` a `TypeError`);
-  pass complex scalars as 0-d complex tensors. Ops without a complex kernel (comparisons other than eq/ne, max/min, softmax,
+  PyTorch's warning (printed to stderr once). Python complex scalars work
+  as in PyTorch 2.11: `item()`, `tolist()` and iteration give Python `complex`
+  values (`torch.fft` results included), complex literals build complex
+  tensors (`torch.tensor([1+2j])` is complex64, and promotion with real
+  tensors follows PyTorch), a complex scalar mixes into tensor arithmetic
+  (`t * 2j`), `torch.full` and `fill_` take one, `complex(t)`, `float(t)` and
+  `int(t)` of a one-element tensor use PyTorch's checked conversion, and a
+  0-d complex tensor formats as its value. Ops without a complex kernel (comparisons other than eq/ne, max/min, softmax,
   activations, convolutions, ...) raise instead of reading the pairs as
   reals.
 - **`torch.fft`.** `fft`/`ifft`, `rfft`/`irfft`, `hfft`/`ihfft` and their

@@ -5,8 +5,9 @@
  * calls into the `__zipp_py` helper object defined here.
  *
  * Value model: int = BigInt, float = number, bool = boolean, str = string,
- * None = null. Everything else is a JS object with a `cls` field pointing at
- * its Python class object; instances keep attributes in `dict` (a Map).
+ * None = null, complex = `{cls, re, im}` (types.js). Everything else is a JS
+ * object with a `cls` field pointing at its Python class object; instances
+ * keep attributes in `dict` (a Map).
  *
  * Code ABI: every Python code object is called as a member of its Python
  * function object (`this`), with the bound values as its own parameters
@@ -134,7 +135,7 @@ var __zipp_py = (function () {
     rt.TypeType = TypeType; rt.ObjectType = ObjectType; rt.newType = newType; rt.computeMro = computeMro;
     const T = {};                        // builtin type objects by name
     rt.T = T;
-    for (const name of ["NoneType", "bool", "int", "float", "str", "list", "tuple", "dict", "set",
+    for (const name of ["NoneType", "bool", "int", "float", "complex", "str", "list", "tuple", "dict", "set",
         "frozenset", "range", "function", "builtin_function_or_method", "method", "module",
         "generator", "NotImplementedType", "ellipsis", "slice", "property", "staticmethod",
         "classmethod", "super", "cell", "bytes", "list_iterator", "dict_keys", "dict_values",

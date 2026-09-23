@@ -82,7 +82,8 @@
         }
         let negate = false;
         if (x < 0) {
-            if (!Number.isInteger(y)) return NaN; // CPython's result is complex
+            // float_pow hands a negative base with a non-integral exponent to complex.
+            if (!Number.isInteger(y)) return cxPow(x, 0, y, 0);
             x = -x; negate = isOddInteger(y);
         }
         if (x === 1) return negate ? -1 : 1;
@@ -161,6 +162,189 @@
         if (r === NOTIMPL) fail(E.TypeError, "unsupported operand type(s) for " + opSymbol(op) + ": '" + typeOf(a).name + "' and '" + typeOf(b).name + "'");
         return r;
     }
+    // ---- complex -------------------------------------------------------------------------------------
+    // A complex number is `{cls: T.complex, re, im}` (two JS numbers). An
+    // instance of a subclass is the same record re-classed, with a `dict`
+    // (`rt.builtinNew`), so everything below reads `re`/`im` structurally.
+    // The arithmetic is CPython 3.13's complexobject.c: an int or float
+    // operand becomes (x, 0.0) first (TO_COMPLEX), so signed zeros and
+    // NaNs come out as CPython's do. Only the generic dispatch paths look
+    // for complex; the int/float fast paths never see one.
+    function cx(re, im) { return { cls: T.complex, re: re, im: im }; }
+    function isCx(v) {
+        if (v === null || typeof v !== "object") return false;
+        const c = v.cls;
+        return c === T.complex || (v.im !== undefined && c !== undefined && c.mro !== undefined && c.mro.indexOf(T.complex) >= 0);
+    }
+    // TO_COMPLEX: whether `v` (an int, float, bool, or complex, or an
+    // int/float subclass instance) converts, leaving its parts in CR/CI. An
+    // int beyond the float range raises OverflowError, as PyLong_AsDouble.
+    let CR = 0, CI = 0;
+    function cxLoad(v) {
+        const tv = typeof v;
+        if (tv === "number") { CR = v; CI = 0; return true; }
+        if (tv === "bigint" || tv === "boolean") { CR = toFloat(v); CI = 0; return true; }
+        if (tv !== "object" || v === null) return false;
+        if (isCx(v)) { CR = v.re; CI = v.im; return true; }
+        const p = v.pyval;
+        if (typeof p === "number") { CR = p; CI = 0; return true; }
+        if (typeof p === "bigint") { CR = intToFloat(p); CI = 0; return true; }
+        return false;
+    }
+    // _Py_c_quot (Smith's algorithm); a zero divisor sets CX_EDOM.
+    let QR = 0, QI = 0, CX_EDOM = false;
+    function cxQuot(ar, ai, br, bi) {
+        const abr = br < 0 ? -br : br, abi = bi < 0 ? -bi : bi;
+        if (abr >= abi) {
+            if (abr === 0) { CX_EDOM = true; QR = QI = 0; }
+            else {
+                const ratio = bi / br, denom = br + bi * ratio;
+                QR = (ar + ai * ratio) / denom;
+                QI = (ai - ar * ratio) / denom;
+            }
+        } else if (abi >= abr) {
+            const ratio = br / bi, denom = br * ratio + bi;
+            QR = (ar * ratio + ai) / denom;
+            QI = (ai * ratio - ar) / denom;
+        } else QR = QI = NaN;
+    }
+    // hypot(x, y) correctly rounded (the engine's Math.hypot sums scaled
+    // squares, as V8 does, and is often an ulp off): the root of the rounded
+    // sum of squares, corrected by one Newton step whose residual
+    // h*h - x*x - y*y is computed exactly (Dekker products; the two
+    // subtractions are exact by Sterbenz's lemma, x >= y). Scaling by powers
+    // of two keeps the squares clear of overflow and underflow.
+    const SPLIT = 134217729;
+    function prodErr(a, b, p) {
+        let t = SPLIT * a; const ah = t - (t - a), al = a - ah;
+        t = SPLIT * b; const bh = t - (t - b), bl = b - bh;
+        return ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+    }
+    const H_BIG = Math.pow(2, 500), H_SMALL = Math.pow(2, -450), H_DOWN = Math.pow(2, -600), H_UP = Math.pow(2, 600);
+    function hypot(x, y) {
+        x = Math.abs(x); y = Math.abs(y);
+        if (x === Infinity || y === Infinity) return Infinity;
+        if (x !== x || y !== y) return NaN;
+        if (x < y) { const t = x; x = y; y = t; }
+        if (y === 0) return x;
+        let scale = 1;
+        if (x > H_BIG) { x *= H_DOWN; y *= H_DOWN; scale = H_UP; }
+        else if (x < H_SMALL) { x *= H_UP; y *= H_UP; scale = H_DOWN; }
+        const xx = x * x, yy = y * y;
+        let h = Math.sqrt(xx + yy);
+        const hh = h * h;
+        h -= (((hh - xx) - yy) + ((prodErr(h, h, hh) - prodErr(x, x, xx)) - prodErr(y, y, yy))) / (2 * h);
+        return h * scale;
+    }
+    rt.hypot = hypot;
+    // C's pow for the magnitude (never negative here): pow(1, y) and
+    // pow(x, 0) are 1 even for a NaN or infinite partner.
+    function cPow(x, y) { return x === 1 || y === 0 ? 1 : Math.pow(x, y); }
+    // complex_pow: exact small integer exponents by repeated squaring
+    // (c_powi), everything else in polar form (_Py_c_pow).
+    function cxPow(ar, ai, br, bi) {
+        CX_EDOM = false;
+        let pr, pi;
+        if (bi === 0 && br === Math.floor(br) && Math.abs(br) <= 100) {
+            let n = br < 0 ? -br : br;
+            let rr = 1, ri = 0, xr = ar, xi = ai, mask = 1;
+            while (n >= mask) {
+                if (n & mask) { const t = rr * xr - ri * xi; ri = rr * xi + ri * xr; rr = t; }
+                mask <<= 1;
+                const t = xr * xr - xi * xi; xi = xr * xi + xi * xr; xr = t;
+            }
+            if (br > 0) { pr = rr; pi = ri; } else { cxQuot(1, 0, rr, ri); pr = QR; pi = QI; }
+        } else if (br === 0 && bi === 0) { pr = 1; pi = 0; }
+        else if (ar === 0 && ai === 0) {
+            if (bi !== 0 || br < 0) CX_EDOM = true;
+            pr = 0; pi = 0;
+        } else {
+            const vabs = hypot(ar, ai);
+            let len = cPow(vabs, br);
+            const at = Math.atan2(ai, ar);
+            let phase = at * br;
+            if (bi !== 0) { len *= Math.exp(-at * bi); phase += bi * Math.log(vabs); }
+            // libm's cos and sin of an infinity set errno to EDOM.
+            if (phase === Infinity || phase === -Infinity) CX_EDOM = true;
+            pr = len * Math.cos(phase); pi = len * Math.sin(phase);
+        }
+        // _Py_ADJUST_ERANGE2: an infinite part is an overflow unless the
+        // result is already a domain error.
+        if (CX_EDOM) fail(E.ZeroDivisionError, "0.0 to a negative or complex power");
+        if (pr === Infinity || pr === -Infinity || pi === Infinity || pi === -Infinity) fail(E.OverflowError, "complex exponentiation");
+        return cx(pr, pi);
+    }
+    // `a op b` for two operands that TO_COMPLEX converts (NOTIMPL
+    // otherwise, and for the operators complex does not define).
+    function cxBinop(op, a, b) {
+        if (op !== "add" && op !== "sub" && op !== "mul" && op !== "truediv" && op !== "pow") return NOTIMPL;
+        if (!cxLoad(a)) return NOTIMPL;
+        const ar = CR, ai = CI;
+        if (!cxLoad(b)) return NOTIMPL;
+        const br = CR, bi = CI;
+        switch (op) {
+            case "add": return cx(ar + br, ai + bi);
+            case "sub": return cx(ar - br, ai - bi);
+            case "mul": return cx(ar * br - ai * bi, ar * bi + ai * br);
+            case "truediv":
+                CX_EDOM = false;
+                cxQuot(ar, ai, br, bi);
+                if (CX_EDOM) fail(E.ZeroDivisionError, "complex division by zero");
+                return cx(QR, QI);
+        }
+        return cxPow(ar, ai, br, bi);
+    }
+    // _Py_c_abs; `abs()` turns an infinite hypot of finite parts into
+    // OverflowError (the caller's choice: cmath reports it differently).
+    function cxAbs(re, im) {
+        if (!Number.isFinite(re) || !Number.isFinite(im)) {
+            if (re === Infinity || re === -Infinity) return Math.abs(re);
+            if (im === Infinity || im === -Infinity) return Math.abs(im);
+            return NaN;
+        }
+        return hypot(re, im);
+    }
+    // complex_richcompare's equality: an int compares exactly with the
+    // real part when the imaginary part is zero.
+    function cxEq(self, w) {
+        const re = self.re, im = self.im;
+        let o = w;
+        if (o !== null && typeof o === "object" && (typeof o.pyval === "bigint" || typeof o.pyval === "number")) o = o.pyval;
+        const t = typeof o;
+        if (t === "bigint") return im === 0 && re == o;
+        if (t === "boolean") return im === 0 && re === (o ? 1 : 0);
+        if (t === "number") return re === o && im === 0;
+        if (isCx(o)) return re === o.re && im === o.im;
+        return NOTIMPL;
+    }
+    // repr's parts: repr digits without the ".0" float's repr adds.
+    function cxPart(x) { const s = floatRepr(x); return s.endsWith(".0") ? s.slice(0, -2) : s; }
+    function cxRepr(re, im) {
+        const i = cxPart(im);
+        if (re === 0 && !Object.is(re, -0)) return i + "j";
+        return "(" + cxPart(re) + (i[0] === "-" ? "" : "+") + i + "j)";
+    }
+    // complex_hash: hash(re) + 1000003 * hash(im) in 64-bit unsigned
+    // arithmetic, -1 reserved; a zero imaginary part leaves hash(re).
+    function cxHash(re, im) {
+        let h = BigInt.asUintN(64, hashFloat(re) + 1000003n * hashFloat(im));
+        if (h === 0xFFFFFFFFFFFFFFFFn) h = 0xFFFFFFFFFFFFFFFEn;
+        return BigInt.asIntN(64, h);
+    }
+    // The dict bucket of a complex: a zero imaginary part shares its real
+    // part's (it equals that float and the ints equal to it).
+    function cxKey(v) { return v.im === 0 ? keyOf(v.re) : intKey(cxHash(v.re, v.im)); }
+    // complex.__hash__, once builtins.js defines it (a subclass that keeps
+    // it hashes and buckets as its value does).
+    let CX_HASH = null;
+    rt.setCxHash = function (h) { CX_HASH = h; };
+    // The emitter's imaginary literals.
+    R.cxconst = function (re, im) { return cx(re, im); };
+    rt.cx = cx; rt.isCx = isCx; rt.cxBinop = cxBinop; rt.cxAbs = cxAbs; rt.cxEq = cxEq; rt.cxRepr = cxRepr; rt.cxHash = cxHash;
+    // (re, im) of what TO_COMPLEX converts, or null.
+    rt.cxParts = function (v) { return cxLoad(v) ? [CR, CI] : null; };
+    // _Py_c_quot for the cmath module: [re, im], with `edom` set on a zero divisor.
+    rt.cxQuot = function (ar, ai, br, bi) { CX_EDOM = false; cxQuot(ar, ai, br, bi); return [QR, QI, CX_EDOM]; };
     rt.floatDivmod = function (x, y) {
         if (y === 0) fail(E.ZeroDivisionError, "float divmod()");
         return [floatFloorDiv(x, y), floatMod(x, y)];
@@ -197,7 +381,13 @@
             const c = a.cls;
             if (c === T.list || c === T.tuple || c === T.dict || c === T.set || c === T.frozenset || c === T.bytes) {
                 const r = baseBinop(op, a, b, inplace); if (r !== NOTIMPL) return r;
+            } else if (c === T.complex && (tb === "number" || tb === "bigint" || tb === "boolean" || (tb === "object" && b !== null && b.cls === T.complex))) {
+                // Exact complex with a number or exact complex: no subclass
+                // method could come first (a subclass operand dispatches below).
+                const r = cxBinop(op, a, b); if (r !== NOTIMPL) return r;
             }
+        } else if (tb === "object" && b !== null && b.cls === T.complex && (ta === "number" || ta === "bigint" || ta === "boolean")) {
+            const r = cxBinop(op, a, b); if (r !== NOTIMPL) return r;
         }
         if (tb === "string" && op === "mul" && isInt(a)) return repeat(b, a);
         if (b !== null && tb === "object" && (b.cls === T.list || b.cls === T.tuple) && op === "mul" && isInt(a)) return repeat(b, a);
@@ -330,6 +520,7 @@
     R.unop = function (op, v) {
         if (isInt(v)) { const i = asInt(v); return op === "neg" ? -i : op === "pos" ? i : ~i; }
         if (typeof v === "number") { if (op === "invert") fail(E.TypeError, "bad operand type for unary ~: 'float'"); return op === "neg" ? -v : v; }
+        if (v !== null && typeof v === "object" && v.cls === T.complex && op !== "invert") return op === "neg" ? cx(-v.re, -v.im) : v;
         const name = op === "neg" ? "__neg__" : op === "pos" ? "__pos__" : "__invert__";
         const r = callMethod(v, name, []);
         if (r !== undefined) return r;
@@ -350,6 +541,7 @@
         if (c === T.list || c === T.tuple || c === T.bytes) return v.items.length !== 0;
         if (c === T.dict || c === T.set || c === T.frozenset) return v.size !== 0;
         if (c === T.range) return rangeLength(v) !== 0n;
+        if (c === T.complex) return v.re !== 0 || v.im !== 0;
         const b = typeMethod(v, "__bool__");
         if (b !== undefined) {
             const r = call(descrGet(b, v, c), [], null);
@@ -401,6 +593,7 @@
             // Bound methods are fresh per access: equal when they bind the
             // same function to the same (identical) object.
             if (c === T.method) return a.func === b.func && a.self === b.self;
+            if (c === T.complex) return a.re === b.re && a.im === b.im;
         }
         if (ta === "object" && a !== null) {
             const m = typeMethod(a, "__eq__");
@@ -688,8 +881,10 @@
         if (c === T.list || c === T.dict || c === T.set) fail(E.TypeError, "unhashable type: '" + c.name + "'");
         if (c === T.slice) fail(E.TypeError, "unhashable type: 'slice'");
         if (c === T.method) { const s = v.self; return "\0m" + rt.ident(v.func) + ":" + (s !== null && typeof s === "object" ? "o" + rt.ident(s) : keyStr(s)); }
+        if (c === T.complex) return cxKey(v);
         const h = typeMethod(v, "__hash__");
         if (h === null) fail(E.TypeError, "unhashable type: '" + c.name + "'");
+        if (h === CX_HASH) return cxKey(v);
         if (h === undefined || h === rt.ObjectType.dict.get("__hash__")) {
             // Identity, unless the class redefines equality without a hash
             // (Python then sets __hash__ = None).
@@ -803,8 +998,10 @@
         if (v === null) return 4238894112n;
         const c = v.cls;
         if (c === T.tuple) return hashTuple(v.items);
+        if (c === T.complex) return cxHash(v.re, v.im);
         if (c !== undefined && c !== T.frozenset && c !== T.bytes && c !== T.range && c !== T.list && c !== T.dict && c !== T.set && c !== T.slice) {
             const h = typeMethod(v, "__hash__");
+            if (h === CX_HASH && h !== null) return cxHash(v.re, v.im);
             if (h !== undefined && h !== null && !h.isBase && h !== rt.ObjectType.dict.get("__hash__")) return hashBigInt(userHash(h, v, c));
         }
         const k = keyOf(v);
@@ -1299,6 +1496,7 @@
         const c = v.cls;
         if (c === undefined) return "<js object>";
         if (c === T.list || c === T.tuple || c === T.dict || c === T.set || c === T.frozenset) return baseRepr(v);
+        if (c === T.complex) return cxRepr(v.re, v.im);
         if (c === T.range) return "range(" + v.start + ", " + v.stop + (v.step === 1n ? "" : ", " + v.step) + ")";
         if (c === T.slice) return "slice(" + repr(v.start) + ", " + repr(v.stop) + ", " + repr(v.step) + ")";
         if (c === T.function) return "<function " + v.qualname + " at 0x" + rt.ident(v).toString(16).padStart(8, "0") + ">";

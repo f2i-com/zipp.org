@@ -523,6 +523,13 @@ class Pickler:
                 self._w(b"\x8a" + bytes([len(enc)]) + enc)
         elif isinstance(obj, float):
             self._w(b"G" + struct.pack(">d", obj))
+        elif type(obj) is complex:
+            # As CPython's copyreg reduces it: complex(real, imag).
+            self._global("builtins", "complex")
+            self._save(obj.real)
+            self._save(obj.imag)
+            self._w(b"\x86R")
+            self._memoize(obj)
         elif isinstance(obj, str):
             enc = obj.encode("utf-8")
             self._w(b"X" + struct.pack("<I", len(enc)) + enc)

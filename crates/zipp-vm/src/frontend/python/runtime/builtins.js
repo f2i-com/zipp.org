@@ -1178,8 +1178,186 @@
     for (const t of [T.str, T.int, T.float, T.bool]) {
         for (const v of t.dict.values()) if (v !== null && typeof v === "object" && v.cls === T.builtin_function_or_method) v.unboxSelf = true;
     }
+    // ---- complex ---------------------------------------------------------------------------------------------------
+    // The type's methods and constructor (CPython 3.13's complexobject.c);
+    // the value helpers are in types.js. Methods read `re`/`im` from self,
+    // which may be a subclass instance.
+    const CX = T.complex, cx = rt.cx, isCx = rt.isCx;
+    for (const op of ["add", "sub", "mul", "truediv"]) {
+        method(CX, "__" + op + "__", 2, (a) => rt.cxBinop(op, a[0], a[1]));
+        method(CX, "__r" + op + "__", 2, (a) => rt.cxBinop(op, a[1], a[0]));
+    }
+    // A third argument other than None is refused once both operands convert.
+    const cxPowMethod = (x, y, z) => {
+        if (z !== undefined && z !== null) { if (rt.cxParts(x) === null || rt.cxParts(y) === null) return NOTIMPL; fail(E.ValueError, "complex modulo"); }
+        return rt.cxBinop("pow", x, y);
+    };
+    method(CX, "__pow__", 3, (a) => cxPowMethod(a[0], a[1], a[2]), 2);
+    method(CX, "__rpow__", 3, (a) => cxPowMethod(a[1], a[0], a[2]), 2);
+    method(CX, "__neg__", 1, (a) => cx(-a[0].re, -a[0].im));
+    method(CX, "__pos__", 1, (a) => a[0].cls === CX ? a[0] : cx(a[0].re, a[0].im));
+    method(CX, "__abs__", 1, (a) => {
+        const r = rt.cxAbs(a[0].re, a[0].im);
+        if ((r === Infinity) && Number.isFinite(a[0].re) && Number.isFinite(a[0].im)) fail(E.OverflowError, "absolute value too large");
+        return r;
+    });
+    method(CX, "__bool__", 1, (a) => a[0].re !== 0 || a[0].im !== 0);
+    method(CX, "__eq__", 2, (a) => rt.cxEq(a[0], a[1]));
+    method(CX, "__ne__", 2, (a) => { const r = rt.cxEq(a[0], a[1]); return r === NOTIMPL ? r : !r; });
+    for (const name of ["__lt__", "__le__", "__gt__", "__ge__"]) method(CX, name, 2, () => NOTIMPL);
+    method(CX, "__hash__", 1, (a) => rt.cxHash(a[0].re, a[0].im));
+    rt.setCxHash(CX.dict.get("__hash__"));
+    method(CX, "__repr__", 1, (a) => rt.cxRepr(a[0].re, a[0].im));
+    method(CX, "__format__", 2, (a) => rt.formatComplex(a[0], needStr(a[1], "complex.__format__() argument")));
+    method(CX, "__complex__", 1, (a) => a[0].cls === CX ? a[0] : cx(a[0].re, a[0].im));
+    method(CX, "__getnewargs__", 1, (a) => tuple([a[0].re, a[0].im]));
+    method(CX, "conjugate", 1, (a) => cx(a[0].re, -a[0].im));
+    CX.dict.set("real", { cls: T.property, fget: builtin("real", 1, (a) => a[0].re), fset: null, fdel: null, doc: "the real part of a complex number" });
+    CX.dict.set("imag", { cls: T.property, fget: builtin("imag", 1, (a) => a[0].im), fset: null, fdel: null, doc: "the imaginary part of a complex number" });
+    const strValue = (v) => typeof v === "string" ? v : v !== null && typeof v === "object" && typeof v.pyval === "string" ? v.pyval : undefined;
+    const isIntLike = (v) => isInt(v) || (v !== null && typeof v === "object" && typeof v.pyval === "bigint");
+    // PyNumber_Float, for a value known to have __float__ or __index__.
+    function numberFloat(v) {
+        if (typeof v === "number") return v;
+        if (isInt(v)) return toFloat(v);
+        const m = typeMethod(v, "__float__");
+        if (m !== undefined) {
+            const r = call(descrGet(m, v, typeOf(v)), [], null);
+            if (typeof r === "number") return r;
+            if (r !== null && typeof r === "object" && typeof r.pyval === "number") return r.pyval;
+            fail(E.TypeError, typeOf(v).name + ".__float__ returned non-float (type " + typeOf(r).name + ")");
+        }
+        const r = call(descrGet(typeMethod(v, "__index__"), v, typeOf(v)), [], null);
+        if (!isIntLike(r)) fail(E.TypeError, "__index__ returned non-int (type " + typeOf(r).name + ")");
+        return toFloat(unbox(r));
+    }
+    // The `nb_float || nb_index || complex` test complex() makes of its arguments.
+    const numberLike = (v) => isNum(v) || isCx(v) || typeMethod(v, "__float__") !== undefined || typeMethod(v, "__index__") !== undefined;
+    rt.numberFloat = numberFloat;
+    // complex_from_string_inner over the ASCII form of the text.
+    const PY_SPACE = (c) => c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r";
+    const FLOAT_PREFIX = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/, INF_NAN_PREFIX = /^([+-]?)(inf(?:inity)?|nan)/i;
+    // PyOS_string_to_double's longest float prefix at `p`: [value, end].
+    function floatPrefix(s, p) {
+        const rest = s.slice(p);
+        let m = FLOAT_PREFIX.exec(rest);
+        if (m !== null) return [Number(m[0]), p + m[0].length];
+        m = INF_NAN_PREFIX.exec(rest);
+        if (m !== null) return [m[2][0] === "n" || m[2][0] === "N" ? NaN : m[1] === "-" ? -Infinity : Infinity, p + m[0].length];
+        return [-1, p];
+    }
+    function parseComplex(s) {
+        const n = s.length, isJ = (c) => c === "j" || c === "J";
+        let p = 0, x = 0, y = 0, bracket = false;
+        while (p < n && PY_SPACE(s[p])) p++;
+        if (s[p] === "(") { bracket = true; p++; while (p < n && PY_SPACE(s[p])) p++; }
+        const [z, end] = floatPrefix(s, p);
+        if (end !== p) {
+            p = end;
+            if (s[p] === "+" || s[p] === "-") {
+                x = z;
+                const [w, end2] = floatPrefix(s, p);
+                if (end2 !== p) { y = w; p = end2; } else { y = s[p] === "+" ? 1 : -1; p++; }
+                if (!isJ(s[p])) return null;
+                p++;
+            } else if (isJ(s[p])) { p++; y = z; }
+            else x = z;
+        } else {
+            if (s[p] === "+" || s[p] === "-") { y = s[p] === "+" ? 1 : -1; p++; }
+            else y = 1;
+            if (!isJ(s[p])) return null;
+            p++;
+        }
+        while (p < n && PY_SPACE(s[p])) p++;
+        if (bracket) {
+            if (s[p] !== ")") return null;
+            p++;
+            while (p < n && PY_SPACE(s[p])) p++;
+        }
+        return p === n ? [x, y] : null;
+    }
+    // A Unicode decimal digit's value: its offset in its run of digits
+    // (every run of category Nd is whole decades starting at a zero).
+    const ND = /^\p{Nd}$/u;
+    function digitValue(cp) {
+        let start = cp;
+        while (start > 0 && ND.test(String.fromCodePoint(start - 1))) start--;
+        return (cp - start) % 10;
+    }
+    const UNICODE_SPACE = /^[\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]$/;
+    function complexFromString(text, orig) {
+        // _PyUnicode_TransformDecimalAndSpaceToASCII: other whitespace is a
+        // space, other decimal digits their ASCII digit, anything else '?'.
+        let s = "";
+        for (const ch of text) {
+            const c = ch.codePointAt(0);
+            if (c < 128) s += ch;
+            else if (UNICODE_SPACE.test(ch)) s += " ";
+            else if (ND.test(ch)) s += String(digitValue(c));
+            else s += "?";
+        }
+        // _Py_string_to_number_with_underscores: single underscores only
+        // between digits.
+        if (s.includes("_")) {
+            const bad = () => fail(E.ValueError, "could not convert string to complex: " + repr(orig));
+            let out = "", prev = "";
+            for (const ch of s) {
+                if (ch === "\0") bad();
+                const digit = ch >= "0" && ch <= "9";
+                if (ch === "_") { if (!(prev >= "0" && prev <= "9")) bad(); }
+                else { out += ch; if (prev === "_" && !digit) bad(); }
+                prev = ch;
+            }
+            if (prev === "_") bad();
+            s = out;
+        }
+        const parts = parseComplex(s);
+        if (parts === null) fail(E.ValueError, "complex() arg is a malformed string");
+        return cx(parts[0], parts[1]);
+    }
+    rt.constructors.set(CX, (args, kw, cls) => {
+        const given = args.length + (kw !== null && kw !== undefined ? kw.size : 0);
+        if (given > 2) fail(E.TypeError, "complex() takes at most 2 arguments (" + given + " given)");
+        let r = args[0], i = args[1];
+        if (kw !== null && kw !== undefined) {
+            for (const [k, v] of kw) {
+                if (k === "real") { if (args.length >= 1) fail(E.TypeError, "argument for complex() given by name ('real') and position (1)"); r = v; }
+                else if (k === "imag") { if (args.length >= 2) fail(E.TypeError, "argument for complex() given by name ('imag') and position (2)"); i = v; }
+                else fail(E.TypeError, "complex() got an unexpected keyword argument '" + k + "'");
+            }
+        }
+        if (r === undefined) r = 0n;
+        if (i === undefined && cls === CX && r !== null && typeof r === "object" && r.cls === CX) return r;
+        const rs = strValue(r);
+        if (rs !== undefined) {
+            if (i !== undefined) fail(E.TypeError, "complex() can't take second arg if first is a string");
+            return complexFromString(rs, r);
+        }
+        if (i !== undefined && strValue(i) !== undefined) fail(E.TypeError, "complex() second arg can't be a string");
+        // try_complex_special_method (exact complex answers itself).
+        if (!(r !== null && typeof r === "object" && r.cls === CX)) {
+            const m = typeMethod(r, "__complex__");
+            if (m !== undefined) {
+                const res = call(descrGet(m, r, typeOf(r)), [], null);
+                if (!isCx(res)) fail(E.TypeError, "__complex__ returned non-complex (type " + typeOf(res).name + ")");
+                r = res;
+            }
+        }
+        if (!numberLike(r)) fail(E.TypeError, "complex() first argument must be a string or a number, not '" + typeOf(r).name + "'");
+        if (i !== undefined && !numberLike(i)) fail(E.TypeError, "complex() second argument must be a number, not '" + typeOf(i).name + "'");
+        let crr, cri = 0, rComplex = false;
+        if (isCx(r)) { crr = r.re; cri = r.im; rComplex = true; } else crr = numberFloat(r);
+        let cir;
+        if (i === undefined) cir = cri;
+        else if (isCx(i)) { cir = i.re; crr -= i.im; }
+        else cir = numberFloat(i);
+        if (rComplex && i !== undefined) cir += cri;
+        return cx(crr, cir);
+    });
+    B.set("complex", CX);
+
     // `__new__` of the immutable builtins, for subclasses (`super().__new__(cls, v)`).
-    for (const base of [T.int, T.float, T.str, T.tuple, T.frozenset, T.bytes]) {
+    for (const base of [T.int, T.float, T.complex, T.str, T.tuple, T.frozenset, T.bytes]) {
         const f = builtin("__new__", -1, (a) => {
             const kw = a.length && a[a.length - 1] instanceof Map ? a.pop() : null;
             if (a.length === 0) fail(E.TypeError, base.name + ".__new__(): not enough arguments");
@@ -1297,6 +1475,8 @@
         if (m !== undefined && !m.isBase) { const r = call(descrGet(m, x, typeOf(x)), [y], null); if (r !== NOTIMPL) return r; }
         const rm = typeMethod(y, "__rdivmod__");
         if (rm !== undefined && !rm.isBase) { const r = call(descrGet(rm, y, typeOf(y)), [x], null); if (r !== NOTIMPL) return r; }
+        // complex has neither // nor %, so no divmod.
+        if (isCx(x) || isCx(y)) fail(E.TypeError, "unsupported operand type(s) for divmod(): '" + typeOf(x).name + "' and '" + typeOf(y).name + "'");
         return tuple([R.binop("floordiv", x, y), R.binop("mod", x, y)]);
     });
     def("pow", 3, (a) => {
@@ -1305,6 +1485,8 @@
                 // pow(x, y, z) on an instance calls its __pow__ with the modulus.
                 const m = a[0] !== null && typeof a[0] === "object" ? typeMethod(a[0], "__pow__") : undefined;
                 if (m !== undefined && !m.isBase) { const r = call(descrGet(m, a[0], typeOf(a[0])), [a[1], a[2]], null); if (r !== NOTIMPL) return r; }
+                // complex_pow refuses a modulus once both operands convert.
+                if ((isCx(a[0]) || isCx(a[1]) || isCx(a[2])) && rt.cxParts(a[0]) !== null && rt.cxParts(a[1]) !== null) fail(E.ValueError, "complex modulo");
                 if (isNum(a[0]) && isNum(a[1]) && isNum(a[2])) fail(E.TypeError, "pow() 3rd argument not allowed unless all arguments are integers");
                 fail(E.TypeError, "unsupported operand type(s) for ** or pow(): '" + typeOf(a[0]).name + "', '" + typeOf(a[1]).name + "', '" + typeOf(a[2]).name + "'");
             }
@@ -1328,7 +1510,7 @@
     def("bin", 1, (a) => { const v = rt.indexOf(a[0]); return (v < 0n ? "-0b" : "0b") + (v < 0n ? -v : v).toString(2); });
     def("oct", 1, (a) => { const v = rt.indexOf(a[0]); return (v < 0n ? "-0o" : "0o") + (v < 0n ? -v : v).toString(8); });
     def("hex", 1, (a) => { const v = rt.indexOf(a[0]); return (v < 0n ? "-0x" : "0x") + (v < 0n ? -v : v).toString(16); });
-    def("format", 2, (a) => rt.formatValue(a[0], a[1] === undefined ? "" : needStr(a[1])), 1);
+    def("format", 2, (a) => rt.formatValue(a[0], a[1] === undefined ? "" : needStr(a[1], "format() argument 2")), 1);
     def("input", 1, (a) => { if (a.length) rt.writeOut(str(a[0]), null); fail(E.EOFError, "input() is not available: no interactive console in this environment"); }, 0);
     // ---- open(): files of the program's virtual filesystem -----------------------------------------
     // Text and binary modes, read/write/append/exclusive, with the usual
@@ -1535,7 +1717,6 @@
         BA.dict.set("__eq__", builtin("__eq__", 2, (a) => a[1] !== null && typeof a[1] === "object" && a[1].items !== undefined && isInstance(a[1], T.bytes) && a[0].items.length === a[1].items.length && a[0].items.every((x, i) => x === a[1].items[i])));
         B.set("bytearray", BA);
     }
-    def("complex", -1, () => fail(E.TypeError, "complex numbers are not supported"));
     B.set("__name__", "builtins");
     B.set("__debug__", true);
     // ExceptionGroup(message, exceptions): `.message`, `.exceptions`, and

@@ -11,10 +11,13 @@
     const kwOf = rt.kwOf, kwget = rt.kwget;
 
     // ---- format specs ---------------------------------------------------------------------------------------------------
+    const SPEC = /^(?:(.)?([<>=^]))?([+\- ])?(z)?(#)?(0)?(\d+)?([,_])?(?:\.(\d+))?([bcdeEfFgGnosxX%])?$/;
+    // The spec's longest valid prefix without a type, and what follows it.
+    const SPEC_TAIL = /^(?:(?:.)?[<>=^])?[+\- ]?z?#?0?\d*[,_]?(?:\.\d+)?([\s\S]*)$/;
     function parseSpec(spec) {
-        const m = /^(?:(.)?([<>=^]))?([+\- ])?(z)?(#)?(0)?(\d+)?([,_])?(?:\.(\d+))?([bcdeEfFgGnosxX%])?$/.exec(spec);
+        const m = SPEC.exec(spec);
         if (!m) fail(E.ValueError, "Invalid format specifier '" + spec + "'");
-        return { fill: m[1], align: m[2], sign: m[3] || "-", alt: !!m[5], zero: !!m[6], width: m[7] ? parseInt(m[7], 10) : 0,
+        return { fill: m[1], align: m[2], sign: m[3] || "-", noNeg0: !!m[4], alt: !!m[5], zero: !!m[6], width: m[7] ? parseInt(m[7], 10) : 0,
             group: m[8], precision: m[9] === undefined ? null : parseInt(m[9], 10), type: m[10] };
     }
     function group(digits, sep) { return digits.replace(/\B(?=(\d{3})+(?!\d))/g, sep); }
@@ -114,6 +117,111 @@
         const m = /^(.*)e([+-])(\d+)$/.exec(e);
         return m[1] + "e" + m[2] + m[3].padStart(2, "0");
     }
+    // _Py_dg_dtoa's digits of a finite x >= 0, trailing zeros removed ("0"
+    // for zero, "" when mode 3 rounds to zero), and the decimal point's
+    // position: mode 0 is the shortest round trip, mode 2 `nd` significant
+    // digits, mode 3 `nd` digits after the point (both ties to even).
+    const DIGITS = /^(\d)(?:\.(\d+))?e([+-]\d+)$/;
+    function dtoaDigits(x, mode, nd) {
+        if (x === 0) return ["0", 1];
+        let digits, decpt;
+        if (mode === 3) {
+            const f = rt.fixedHalfEven(x, Math.min(nd, 100));
+            const k = f.indexOf(".");
+            digits = k < 0 ? f : f.slice(0, k) + f.slice(k + 1);
+            decpt = k < 0 ? f.length : k;
+            let lead = 0;
+            while (lead < digits.length && digits[lead] === "0") lead++;
+            digits = digits.slice(lead); decpt -= lead;
+            if (digits === "" || /^0+$/.test(digits)) return ["", -nd];
+        } else {
+            const m = DIGITS.exec(mode === 0 ? x.toExponential() : expForm(x, Math.max(nd, 1) - 1));
+            digits = m[1] + (m[2] || ""); decpt = parseInt(m[3], 10) + 1;
+        }
+        return [digits.replace(/0+$/, ""), decpt];
+    }
+    // PyOS_double_to_string (format_float_short): `code` is e/f/g/r or
+    // E/F/G; `sign` always writes a sign, `alt` is '#', `noNeg0` is 'z'.
+    function doubleToString(d, code, precision, sign, alt, noNeg0) {
+        const upper = code === "E" || code === "F" || code === "G";
+        if (upper) code = code.toLowerCase();
+        let mode = 0;
+        if (code === "e") { mode = 2; precision++; }
+        else if (code === "f") mode = 3;
+        else if (code === "g") { mode = 2; if (precision === 0) precision = 1; }
+        let neg = d < 0 || Object.is(d, -0), out;
+        if (!Number.isFinite(d)) {
+            if (d !== d) neg = false;
+            out = (neg ? "-" : sign ? "+" : "") + (d !== d ? "nan" : "inf");
+            return upper ? out.toUpperCase() : out;
+        }
+        const dd = dtoaDigits(Math.abs(d), mode, precision), digits = dd[0], dl = digits.length;
+        let decpt = dd[1];
+        if (noNeg0 && neg && (dl === 0 || digits === "0")) neg = false;
+        let vend = dl, useExp = false, exp = 0;
+        if (code === "e") { useExp = true; vend = precision; }
+        else if (code === "f") vend = decpt + precision;
+        else if (code === "g") { if (decpt <= -4 || decpt > precision) useExp = true; if (alt) vend = precision; }
+        else if (decpt <= -4 || decpt > 16) useExp = true;
+        if (useExp) { exp = decpt - 1; decpt = 1; }
+        const vstart = decpt <= 0 ? decpt - 1 : 0;
+        if (vend < decpt) vend = decpt;
+        out = neg ? "-" : sign ? "+" : "";
+        if (decpt <= 0) out += "0".repeat(decpt - vstart) + "." + "0".repeat(-decpt);
+        if (0 < decpt && decpt <= dl) out += digits.slice(0, decpt) + "." + digits.slice(decpt);
+        else out += digits;
+        if (dl < decpt) out += "0".repeat(decpt - dl) + "." + "0".repeat(vend - decpt);
+        else out += "0".repeat(vend - dl);
+        if (out.endsWith(".") && !alt) out = out.slice(0, -1);
+        if (useExp) out += "e" + (exp < 0 ? "-" : "+") + String(Math.abs(exp)).padStart(2, "0");
+        return upper ? out.toUpperCase() : out;
+    }
+    // complex.__format__ (format_complex_internal): each part formatted as
+    // a float of the type, the imaginary one signed unless the real part
+    // is left out, then padded as a whole. No type is repr's digits, with
+    // the real part omitted when it is +0 and parentheses otherwise.
+    rt.formatComplex = function (v, spec) {
+        if (spec === "") return str(v);
+        let s;
+        const m = SPEC.exec(spec);
+        if (m === null) {
+            // CPython's parser errors: a '.' without digits, one unknown
+            // trailing character (the type), or anything longer left over.
+            const t = SPEC_TAIL.exec(spec);
+            if (t !== null && t[1][0] === ".") fail(E.ValueError, "Format specifier missing precision");
+            if (t !== null && t[1].length === 1) fail(E.ValueError, "Unknown format code '" + t[1] + "' for object of type 'complex'");
+            fail(E.ValueError, "Invalid format specifier '" + spec + "' for object of type 'complex'");
+        }
+        s = parseSpec(spec);
+        let type = s.type;
+        if (type !== undefined && !"eEfFgGn".includes(type)) fail(E.ValueError, "Unknown format code '" + type + "' for object of type 'complex'");
+        if (s.fill === "0" || (s.zero && s.fill === undefined)) fail(E.ValueError, "Zero padding is not allowed in complex format specifier");
+        if (s.align === "=") fail(E.ValueError, "'=' alignment flag is not allowed in complex format specifier");
+        const re = v.re, im = v.im;
+        let precision = s.precision === null ? -1 : s.precision, dflt = 6, skipRe = false, parens = false;
+        if (type === undefined) {
+            type = "r"; dflt = 0;
+            if (re === 0 && !Object.is(re, -0)) skipRe = true; else parens = true;
+        }
+        if (type === "n") type = "g";
+        if (precision < 0) precision = dflt; else if (type === "r") type = "g";
+        const part = (x, signSpec) => {
+            let body = doubleToString(x, type, precision, false, s.alt, s.noNeg0), signChar = "";
+            if (body[0] === "-") { signChar = "-"; body = body.slice(1); }
+            else if (signSpec === "+" || signSpec === " ") signChar = signSpec;
+            if (s.group) { const k = /^\d*/.exec(body)[0].length; body = group(body.slice(0, k), s.group) + body.slice(k); }
+            return signChar + body;
+        };
+        const body = (parens ? "(" : "") + (skipRe ? "" : part(re, s.sign)) + part(im, skipRe ? s.sign : "+") + "j" + (parens ? ")" : "");
+        const n = body.length;
+        if (n >= s.width) return body;
+        const fill = s.fill === undefined ? " " : s.fill, pad = s.width - n;
+        switch (s.align) {
+            case "<": return body + fill.repeat(pad);
+            case "^": { const l = Math.floor(pad / 2); return fill.repeat(l) + body + fill.repeat(pad - l); }
+        }
+        return fill.repeat(pad) + body;
+    };
     function formatInt(v, s) {
         const neg = v < 0n; const av = neg ? -v : v;
         let body;
@@ -233,7 +341,10 @@
             // %-formatting right-aligns unless the `-` flag is given.
             if (t === "s") { spec.type = "s"; out += applyAlign(prec === undefined ? str(v) : codepoints(str(v)).slice(0, spec.precision).join(""), Object.assign(spec, { precision: null }), ">", ""); }
             else if (t === "r" || t === "a") { out += applyAlign(t === "a" ? rt.ascii(v) : repr(v), Object.assign(spec, { precision: null }), ">", ""); }
-            else if (t === "c") { out += applyAlign(isInt(v) ? String.fromCodePoint(Number(asInt(v))) : str(v), spec, ">", ""); }
+            else if (t === "c") {
+                if (!isInt(v) && !(typeof v === "string" && codepoints(v).length === 1)) fail(E.TypeError, "%c requires int or char");
+                out += applyAlign(isInt(v) ? String.fromCodePoint(Number(asInt(v))) : v, spec, ">", "");
+            }
             else if ("diu".includes(t)) { if (typeof v === "number") v = BigInt(Math.trunc(v)); else if (!isInt(v)) { let r = numberDunder(v, "__int__"); if (r === undefined) r = numberDunder(v, "__index__"); if (typeof r === "number") r = BigInt(Math.trunc(r)); if (r !== undefined && isInt(r)) v = r; } if (!isInt(v)) fail(E.TypeError, "%" + t + " format: a real number is required, not " + typeOf(v).name); spec.type = "d"; out += formatInt(asInt(v), spec); }
             else if ("oxX".includes(t)) { if (!isInt(v)) { const r = numberDunder(v, "__index__"); if (r !== undefined && isInt(r)) v = r; } if (!isInt(v)) fail(E.TypeError, "%" + t + " format: an integer is required, not " + typeOf(v).name); spec.type = t; out += formatInt(asInt(v), spec); }
             else { if (!isNum(v)) { let r = numberDunder(v, "__float__"); if (r === undefined) r = numberDunder(v, "__index__"); if (r !== undefined && isNum(r)) v = r; } if (!isNum(v)) fail(E.TypeError, "must be real number, not " + typeOf(v).name); out += formatFloat(toFloat(v), spec, t); }
@@ -417,7 +528,7 @@
             while (x * x > n) x--; while ((x + 1n) * (x + 1n) <= n) x++; return x;
         });
         fn(g, "fsum", 1, (a) => { let s = 0, c = 0, finite = true; for (const v of drain(a[0])) { const x = f(v); if (!Number.isFinite(x)) finite = false; const y = x - c; const t = s + y; c = (t - s) - y; s = t; } if (finite && !Number.isFinite(s)) fail(E.OverflowError, "intermediate overflow in fsum"); return s; });
-        fn(g, "prod", -1, (a) => { let r = 1n; for (const v of drain(a[0])) r = R.binop("mul", r, v); return r; });
+        fnkw(g, "prod", (a) => { const kw = kwOf(a, ["start"]); let r = kwget(kw, "start", 1n); for (const v of drain(a[0])) r = R.binop("mul", r, v); return r; });
         fn(g, "dist", 2, (a) => { const p = drain(a[0]).map(f), q = drain(a[1]).map(f); return Math.hypot(...p.map((x, i) => x - q[i])); });
         // erf via its Maclaurin series near zero and a continued fraction of
         // erfc in the tails (both converge to double precision).
@@ -527,6 +638,416 @@
     // the same values: random(), getrandbits, _randbelow, randrange,
     // randint, choice, shuffle, sample, choices, uniform, gauss,
     // normalvariate and the other variates.
+    // ---- cmath: CPython 3.13's cmathmodule.c. Each function returns the C99
+    // Annex G value and sets `errno` as the C code does (EDOM becomes
+    // "math domain error", ERANGE "math range error"); a non-finite argument
+    // reads the special-value table of its (real, imag) classes.
+    mod("cmath", (g) => {
+        const cx = rt.cx, isCx = rt.isCx, hypot = rt.hypot;
+        const EDOM = 33, ERANGE = 34;
+        let errno = 0;
+        const P = Math.PI, P14 = 0.25 * Math.PI, P12 = 0.5 * Math.PI, P34 = 0.75 * Math.PI, INF = Infinity, N = NaN;
+        const U = -9.5426319407711027e33;   // never read: both parts finite
+        const DBL_MIN = 2.2250738585072014e-308, LARGE = 1.7976931348623157e308 / 4;
+        const SQRT_LARGE = Math.sqrt(LARGE), LOG_LARGE = Math.log(LARGE), SQRT_DBL_MIN = Math.sqrt(DBL_MIN);
+        const LN2 = 0.6931471805599453094, LN10 = 2.302585092994045684;
+        const isInf = (x) => x === Infinity || x === -Infinity;
+        const copysign = (x, y) => (y < 0 || Object.is(y, -0)) ? -Math.abs(x) : Math.abs(x);
+        const ldexp = (x, n) => x * Math.pow(2, n);
+        const log1p = (x) => x === 0 ? x : Math.log1p(x);
+        // special_type: -inf, negative, -0, +0, positive, +inf, nan.
+        const st = (d) => Number.isFinite(d) ? (d !== 0 ? (d > 0 ? 4 : 1) : (Object.is(d, -0) ? 2 : 3)) : d !== d ? 6 : d > 0 ? 5 : 0;
+        const special = (t, re, im) => { const k = (st(re) * 7 + st(im)) * 2; return [t[k], t[k + 1]]; };
+        const ACOS = [
+            P34, INF, P, INF, P, INF, P, -INF, P, -INF, P34, -INF, N, INF,
+            P12, INF, U, U, U, U, U, U, U, U, P12, -INF, N, N,
+            P12, INF, U, U, P12, 0, P12, -0, U, U, P12, -INF, P12, N,
+            P12, INF, U, U, P12, 0, P12, -0, U, U, P12, -INF, P12, N,
+            P12, INF, U, U, U, U, U, U, U, U, P12, -INF, N, N,
+            P14, INF, 0, INF, 0, INF, 0, -INF, 0, -INF, P14, -INF, N, INF,
+            N, INF, N, N, N, N, N, N, N, N, N, -INF, N, N];
+        const ACOSH = [
+            INF, -P34, INF, -P, INF, -P, INF, P, INF, P, INF, P34, INF, N,
+            INF, -P12, U, U, U, U, U, U, U, U, INF, P12, N, N,
+            INF, -P12, U, U, 0, -P12, 0, P12, U, U, INF, P12, N, N,
+            INF, -P12, U, U, 0, -P12, 0, P12, U, U, INF, P12, N, N,
+            INF, -P12, U, U, U, U, U, U, U, U, INF, P12, N, N,
+            INF, -P14, INF, -0, INF, -0, INF, 0, INF, 0, INF, P14, INF, N,
+            INF, N, N, N, N, N, N, N, N, N, INF, N, N, N];
+        const ASINH = [
+            -INF, -P14, -INF, -0, -INF, -0, -INF, 0, -INF, 0, -INF, P14, -INF, N,
+            -INF, -P12, U, U, U, U, U, U, U, U, -INF, P12, N, N,
+            -INF, -P12, U, U, -0, -0, -0, 0, U, U, -INF, P12, N, N,
+            INF, -P12, U, U, 0, -0, 0, 0, U, U, INF, P12, N, N,
+            INF, -P12, U, U, U, U, U, U, U, U, INF, P12, N, N,
+            INF, -P14, INF, -0, INF, -0, INF, 0, INF, 0, INF, P14, INF, N,
+            INF, N, N, N, N, -0, N, 0, N, N, INF, N, N, N];
+        const ATANH = [
+            -0, -P12, -0, -P12, -0, -P12, -0, P12, -0, P12, -0, P12, -0, N,
+            -0, -P12, U, U, U, U, U, U, U, U, -0, P12, N, N,
+            -0, -P12, U, U, -0, -0, -0, 0, U, U, -0, P12, -0, N,
+            0, -P12, U, U, 0, -0, 0, 0, U, U, 0, P12, 0, N,
+            0, -P12, U, U, U, U, U, U, U, U, 0, P12, N, N,
+            0, -P12, 0, -P12, 0, -P12, 0, P12, 0, P12, 0, P12, 0, N,
+            0, -P12, N, N, N, N, N, N, N, N, 0, P12, N, N];
+        const COSH = [
+            INF, N, U, U, INF, 0, INF, -0, U, U, INF, N, INF, N,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            N, 0, U, U, 1, 0, 1, -0, U, U, N, 0, N, 0,
+            N, 0, U, U, 1, -0, 1, 0, U, U, N, 0, N, 0,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            INF, N, U, U, INF, -0, INF, 0, U, U, INF, N, INF, N,
+            N, N, N, N, N, 0, N, 0, N, N, N, N, N, N];
+        const EXP = [
+            0, 0, U, U, 0, -0, 0, 0, U, U, 0, 0, 0, 0,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            N, N, U, U, 1, -0, 1, 0, U, U, N, N, N, N,
+            N, N, U, U, 1, -0, 1, 0, U, U, N, N, N, N,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            INF, N, U, U, INF, -0, INF, 0, U, U, INF, N, INF, N,
+            N, N, N, N, N, -0, N, 0, N, N, N, N, N, N];
+        const LOG = [
+            INF, -P34, INF, -P, INF, -P, INF, P, INF, P, INF, P34, INF, N,
+            INF, -P12, U, U, U, U, U, U, U, U, INF, P12, N, N,
+            INF, -P12, U, U, -INF, -P, -INF, P, U, U, INF, P12, N, N,
+            INF, -P12, U, U, -INF, -0, -INF, 0, U, U, INF, P12, N, N,
+            INF, -P12, U, U, U, U, U, U, U, U, INF, P12, N, N,
+            INF, -P14, INF, -0, INF, -0, INF, 0, INF, 0, INF, P14, INF, N,
+            INF, N, N, N, N, N, N, N, N, N, INF, N, N, N];
+        const SINH = [
+            INF, N, U, U, -INF, -0, -INF, 0, U, U, INF, N, INF, N,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            0, N, U, U, -0, -0, -0, 0, U, U, 0, N, 0, N,
+            0, N, U, U, 0, -0, 0, 0, U, U, 0, N, 0, N,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            INF, N, U, U, INF, -0, INF, 0, U, U, INF, N, INF, N,
+            N, N, N, N, N, -0, N, 0, N, N, N, N, N, N];
+        const SQRT = [
+            INF, -INF, 0, -INF, 0, -INF, 0, INF, 0, INF, INF, INF, N, INF,
+            INF, -INF, U, U, U, U, U, U, U, U, INF, INF, N, N,
+            INF, -INF, U, U, 0, -0, 0, 0, U, U, INF, INF, N, N,
+            INF, -INF, U, U, 0, -0, 0, 0, U, U, INF, INF, N, N,
+            INF, -INF, U, U, U, U, U, U, U, U, INF, INF, N, N,
+            INF, -INF, INF, -0, INF, -0, INF, 0, INF, 0, INF, INF, INF, N,
+            INF, -INF, N, N, N, N, N, N, N, N, INF, INF, N, N];
+        const TANH = [
+            -1, 0, U, U, -1, -0, -1, 0, U, U, -1, 0, -1, 0,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            N, N, U, U, -0, -0, -0, 0, U, U, N, N, N, N,
+            N, N, U, U, 0, -0, 0, 0, U, U, N, N, N, N,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            1, 0, U, U, 1, -0, 1, 0, U, U, 1, 0, 1, 0,
+            N, N, N, N, N, -0, N, 0, N, N, N, N, N, N];
+        const RECT = [
+            INF, N, U, U, -INF, 0, -INF, -0, U, U, INF, N, INF, N,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            0, 0, U, U, -0, 0, -0, -0, U, U, 0, 0, 0, 0,
+            0, 0, U, U, 0, -0, 0, 0, U, U, 0, 0, 0, 0,
+            N, N, U, U, U, U, U, U, U, U, N, N, N, N,
+            INF, N, U, U, INF, -0, INF, 0, U, U, INF, N, INF, N,
+            N, N, N, N, N, 0, N, 0, N, N, N, N, N, N];
+        function cSqrt(zr, zi) {
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) { errno = 0; return special(SQRT, zr, zi); }
+            if (zr === 0 && zi === 0) return [0, zi];
+            let ax = Math.abs(zr), s;
+            const ay = Math.abs(zi);
+            if (ax < DBL_MIN && ay < DBL_MIN) {
+                // hypot(ax, ay) could be subnormal: scale up first.
+                ax = ldexp(ax, 53);
+                s = ldexp(Math.sqrt(ax + hypot(ax, ldexp(ay, 53))), -27);
+            } else {
+                ax /= 8;
+                s = 2 * Math.sqrt(ax + hypot(ax, ay / 8));
+            }
+            const d = ay / (2 * s);
+            errno = 0;
+            return zr >= 0 ? [s, copysign(d, zi)] : [d, copysign(s, zi)];
+        }
+        function cAcos(zr, zi) {
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) { errno = 0; return special(ACOS, zr, zi); }
+            let rr, ri;
+            if (Math.abs(zr) > LARGE || Math.abs(zi) > LARGE) {
+                rr = Math.atan2(Math.abs(zi), zr);
+                if (zr < 0) ri = -copysign(Math.log(hypot(zr / 2, zi / 2)) + LN2 * 2, zi);
+                else ri = copysign(Math.log(hypot(zr / 2, zi / 2)) + LN2 * 2, -zi);
+            } else {
+                const s1 = cSqrt(1 - zr, -zi), s2 = cSqrt(1 + zr, zi);
+                rr = 2 * Math.atan2(s1[0], s2[0]);
+                ri = Math.asinh(s2[0] * s1[1] - s2[1] * s1[0]);
+            }
+            errno = 0;
+            return [rr, ri];
+        }
+        function cAcosh(zr, zi) {
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) { errno = 0; return special(ACOSH, zr, zi); }
+            let rr, ri;
+            if (Math.abs(zr) > LARGE || Math.abs(zi) > LARGE) {
+                rr = Math.log(hypot(zr / 2, zi / 2)) + LN2 * 2;
+                ri = Math.atan2(zi, zr);
+            } else {
+                const s1 = cSqrt(zr - 1, zi), s2 = cSqrt(zr + 1, zi);
+                rr = Math.asinh(s1[0] * s2[0] + s1[1] * s2[1]);
+                ri = 2 * Math.atan2(s1[1], s2[0]);
+            }
+            errno = 0;
+            return [rr, ri];
+        }
+        function cAsinh(zr, zi) {
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) { errno = 0; return special(ASINH, zr, zi); }
+            let rr, ri;
+            if (Math.abs(zr) > LARGE || Math.abs(zi) > LARGE) {
+                if (zi >= 0) rr = copysign(Math.log(hypot(zr / 2, zi / 2)) + LN2 * 2, zr);
+                else rr = -copysign(Math.log(hypot(zr / 2, zi / 2)) + LN2 * 2, -zr);
+                ri = Math.atan2(zi, Math.abs(zr));
+            } else {
+                const s1 = cSqrt(1 + zi, -zr), s2 = cSqrt(1 - zi, zr);
+                rr = Math.asinh(s1[0] * s2[1] - s2[0] * s1[1]);
+                ri = Math.atan2(zi, s1[0] * s2[0] - s1[1] * s2[1]);
+            }
+            errno = 0;
+            return [rr, ri];
+        }
+        function cAsin(zr, zi) { const s = cAsinh(-zi, zr); return [s[1], -s[0]]; }
+        function cAtanh(zr, zi) {
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) { errno = 0; return special(ATANH, zr, zi); }
+            // atanh(z) = -atanh(-z), to have z.real >= 0.
+            if (zr < 0) { const r = cAtanh(-zr, -zi); return [-r[0], -r[1]]; }
+            const ay = Math.abs(zi);
+            let rr, ri;
+            if (zr > SQRT_LARGE || ay > SQRT_LARGE) {
+                // atanh(z) ~ 1/z +/- i*pi/2 for a large z.
+                const h = hypot(zr / 2, zi / 2);
+                rr = zr / 4 / h / h;
+                ri = -copysign(Math.PI / 2, -zi);
+                errno = 0;
+            } else if (zr === 1 && ay < SQRT_DBL_MIN) {
+                if (ay === 0) { rr = INF; ri = zi; errno = EDOM; }
+                else {
+                    rr = -Math.log(Math.sqrt(ay) / Math.sqrt(hypot(ay, 2)));
+                    ri = copysign(Math.atan2(2, -ay) / 2, zi);
+                    errno = 0;
+                }
+            } else {
+                rr = log1p(4 * zr / ((1 - zr) * (1 - zr) + ay * ay)) / 4;
+                ri = -Math.atan2(-2 * zi, (1 - zr) * (1 + zr) - ay * ay) / 2;
+                errno = 0;
+            }
+            return [rr, ri];
+        }
+        function cAtan(zr, zi) { const s = cAtanh(-zi, zr); return [s[1], -s[0]]; }
+        function cCosh(zr, zi) {
+            let rr, ri;
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) {
+                if (isInf(zr) && Number.isFinite(zi) && zi !== 0) {
+                    rr = copysign(INF, Math.cos(zi));
+                    ri = zr > 0 ? copysign(INF, Math.sin(zi)) : -copysign(INF, Math.sin(zi));
+                } else [rr, ri] = special(COSH, zr, zi);
+                errno = isInf(zi) && zr === zr ? EDOM : 0;
+                return [rr, ri];
+            }
+            if (Math.abs(zr) > LOG_LARGE) {
+                // cosh(z.real) overflows before cosh(z) does.
+                const xm1 = zr - copysign(1, zr);
+                rr = Math.cos(zi) * Math.cosh(xm1) * Math.E;
+                ri = Math.sin(zi) * Math.sinh(xm1) * Math.E;
+            } else {
+                rr = Math.cos(zi) * Math.cosh(zr);
+                ri = Math.sin(zi) * Math.sinh(zr);
+            }
+            errno = isInf(rr) || isInf(ri) ? ERANGE : 0;
+            return [rr, ri];
+        }
+        function cCos(zr, zi) { return cCosh(-zi, zr); }
+        function cExp(zr, zi) {
+            let rr, ri;
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) {
+                if (isInf(zr) && Number.isFinite(zi) && zi !== 0) {
+                    if (zr > 0) { rr = copysign(INF, Math.cos(zi)); ri = copysign(INF, Math.sin(zi)); }
+                    else { rr = copysign(0, Math.cos(zi)); ri = copysign(0, Math.sin(zi)); }
+                } else [rr, ri] = special(EXP, zr, zi);
+                errno = isInf(zi) && (Number.isFinite(zr) || zr === Infinity) ? EDOM : 0;
+                return [rr, ri];
+            }
+            if (zr > LOG_LARGE) {
+                const l = Math.exp(zr - 1);
+                rr = l * Math.cos(zi) * Math.E;
+                ri = l * Math.sin(zi) * Math.E;
+            } else {
+                const l = Math.exp(zr);
+                rr = l * Math.cos(zi);
+                ri = l * Math.sin(zi);
+            }
+            errno = isInf(rr) || isInf(ri) ? ERANGE : 0;
+            return [rr, ri];
+        }
+        function cLog(zr, zi) {
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) { errno = 0; return special(LOG, zr, zi); }
+            const ax = Math.abs(zr), ay = Math.abs(zi);
+            let rr;
+            if (ax > LARGE || ay > LARGE) rr = Math.log(hypot(ax / 2, ay / 2)) + LN2;
+            else if (ax < DBL_MIN && ay < DBL_MIN) {
+                if (ax > 0 || ay > 0) rr = Math.log(hypot(ldexp(ax, 53), ldexp(ay, 53))) - 53 * LN2;
+                else { errno = EDOM; return [-INF, Math.atan2(zi, zr)]; }
+            } else {
+                const h = hypot(ax, ay);
+                if (0.71 <= h && h <= 1.73) {
+                    const am = ax > ay ? ax : ay, an = ax > ay ? ay : ax;
+                    rr = log1p((am - 1) * (am + 1) + an * an) / 2;
+                } else rr = Math.log(h);
+            }
+            errno = 0;
+            return [rr, Math.atan2(zi, zr)];
+        }
+        function cLog10(zr, zi) { const r = cLog(zr, zi); return [r[0] / LN10, r[1] / LN10]; }
+        function cSinh(zr, zi) {
+            let rr, ri;
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) {
+                if (isInf(zr) && Number.isFinite(zi) && zi !== 0) {
+                    rr = zr > 0 ? copysign(INF, Math.cos(zi)) : -copysign(INF, Math.cos(zi));
+                    ri = copysign(INF, Math.sin(zi));
+                } else [rr, ri] = special(SINH, zr, zi);
+                errno = isInf(zi) && zr === zr ? EDOM : 0;
+                return [rr, ri];
+            }
+            if (Math.abs(zr) > LOG_LARGE) {
+                const xm1 = zr - copysign(1, zr);
+                rr = Math.cos(zi) * Math.sinh(xm1) * Math.E;
+                ri = Math.sin(zi) * Math.cosh(xm1) * Math.E;
+            } else {
+                rr = Math.cos(zi) * Math.sinh(zr);
+                ri = Math.sin(zi) * Math.cosh(zr);
+            }
+            errno = isInf(rr) || isInf(ri) ? ERANGE : 0;
+            return [rr, ri];
+        }
+        function cSin(zr, zi) { const s = cSinh(-zi, zr); return [s[1], -s[0]]; }
+        function cTanh(zr, zi) {
+            let rr, ri;
+            if (!Number.isFinite(zr) || !Number.isFinite(zi)) {
+                if (isInf(zr) && Number.isFinite(zi) && zi !== 0) {
+                    rr = zr > 0 ? 1 : -1;
+                    ri = copysign(0, 2 * Math.sin(zi) * Math.cos(zi));
+                } else [rr, ri] = special(TANH, zr, zi);
+                errno = isInf(zi) && Number.isFinite(zr) ? EDOM : 0;
+                return [rr, ri];
+            }
+            if (Math.abs(zr) > LOG_LARGE) {
+                rr = copysign(1, zr);
+                ri = 4 * Math.sin(zi) * Math.cos(zi) * Math.exp(-2 * Math.abs(zr));
+            } else {
+                const tx = Math.tanh(zr), ty = Math.tan(zi), c = 1 / Math.cosh(zr), txty = tx * ty, denom = 1 + txty * txty;
+                rr = tx * (1 + ty * ty) / denom;
+                ri = ((ty / denom) * c) * c;
+            }
+            errno = 0;
+            return [rr, ri];
+        }
+        function cTan(zr, zi) { const s = cTanh(-zi, zr); return [s[1], -s[0]]; }
+        // c_atan2: C99's atan2 at the infinities and zeros.
+        function cAtan2(zr, zi) {
+            if (zr !== zr || zi !== zi) return NaN;
+            if (isInf(zi)) {
+                if (isInf(zr)) return copysign(zr > 0 ? 0.25 * Math.PI : 0.75 * Math.PI, zi);
+                return copysign(0.5 * Math.PI, zi);
+            }
+            if (isInf(zr) || zi === 0) return copysign(zr > 0 || Object.is(zr, 0) ? 0 : Math.PI, zi);
+            return Math.atan2(zi, zr);
+        }
+        // PyFloat_AsDouble.
+        function asDouble(v) {
+            if (typeof v === "number") return v;
+            if (isInt(v)) return toFloat(v);
+            if (v !== null && typeof v === "object" && typeof v.pyval === "number") return v.pyval;
+            const m = typeMethod(v, "__float__");
+            if (m !== undefined) {
+                const r = call(descrGet(m, v, typeOf(v)), [], null);
+                if (typeof r === "number") return r;
+                if (r !== null && typeof r === "object" && typeof r.pyval === "number") return r.pyval;
+                fail(E.TypeError, typeOf(v).name + ".__float__ returned non-float (type " + typeOf(r).name + ")");
+            }
+            if (typeMethod(v, "__index__") !== undefined) return toFloat(rt.indexOf(v));
+            fail(E.TypeError, "must be real number, not " + typeOf(v).name);
+        }
+        // PyComplex_AsCComplex: a complex, __complex__, else a real number.
+        function asComplex(v) {
+            if (isCx(v)) return [v.re, v.im];
+            const m = typeMethod(v, "__complex__");
+            if (m !== undefined) {
+                const r = call(descrGet(m, v, typeOf(v)), [], null);
+                if (!isCx(r)) fail(E.TypeError, "__complex__ returned non-complex (type " + typeOf(r).name + ")");
+                return [r.re, r.im];
+            }
+            return [asDouble(v), 0];
+        }
+        function mathError() {
+            if (errno === EDOM) fail(E.ValueError, "math domain error");
+            fail(E.OverflowError, "math range error");
+        }
+        for (const [name, impl] of [["acos", cAcos], ["acosh", cAcosh], ["asin", cAsin], ["asinh", cAsinh], ["atan", cAtan], ["atanh", cAtanh],
+            ["cos", cCos], ["cosh", cCosh], ["exp", cExp], ["log10", cLog10], ["sin", cSin], ["sinh", cSinh], ["sqrt", cSqrt], ["tan", cTan], ["tanh", cTanh]]) {
+            fn(g, name, 1, (a) => {
+                const z = asComplex(a[0]);
+                errno = 0;
+                const r = impl(z[0], z[1]);
+                if (errno !== 0) mathError();
+                return cx(r[0], r[1]);
+            });
+        }
+        // log(z[, base]): the quotient of the two logs; only the last log's
+        // errno (or a zero divisor) counts, as in CPython.
+        fn(g, "log", 2, (a) => {
+            const z = asComplex(a[0]);
+            errno = 0;
+            let r = cLog(z[0], z[1]);
+            if (a.length > 1) {
+                const b = asComplex(a[1]);
+                const lb = cLog(b[0], b[1]);
+                const q = rt.cxQuot(r[0], r[1], lb[0], lb[1]);
+                if (q[2]) errno = EDOM;
+                r = q;
+            }
+            if (errno !== 0) mathError();
+            return cx(r[0], r[1]);
+        }, 1);
+        fn(g, "phase", 1, (a) => { const z = asComplex(a[0]); return cAtan2(z[0], z[1]); });
+        fn(g, "polar", 1, (a) => {
+            const z = asComplex(a[0]);
+            const phi = cAtan2(z[0], z[1]), r = rt.cxAbs(z[0], z[1]);
+            if (r === Infinity && Number.isFinite(z[0]) && Number.isFinite(z[1])) { errno = ERANGE; mathError(); }
+            return tuple([r, phi]);
+        });
+        fn(g, "rect", 2, (a) => {
+            const r = asDouble(a[0]), phi = asDouble(a[1]);
+            let zr, zi;
+            errno = 0;
+            if (!Number.isFinite(r) || !Number.isFinite(phi)) {
+                if (isInf(r) && Number.isFinite(phi) && phi !== 0) {
+                    zr = r > 0 ? copysign(INF, Math.cos(phi)) : -copysign(INF, Math.cos(phi));
+                    zi = r > 0 ? copysign(INF, Math.sin(phi)) : -copysign(INF, Math.sin(phi));
+                } else [zr, zi] = special(RECT, r, phi);
+                if (r !== 0 && r === r && isInf(phi)) errno = EDOM;
+            } else if (phi === 0) { zr = r; zi = r * phi; }
+            else { zr = r * Math.cos(phi); zi = r * Math.sin(phi); }
+            if (errno !== 0) mathError();
+            return cx(zr, zi);
+        });
+        fn(g, "isfinite", 1, (a) => { const z = asComplex(a[0]); return Number.isFinite(z[0]) && Number.isFinite(z[1]); });
+        fn(g, "isnan", 1, (a) => { const z = asComplex(a[0]); return z[0] !== z[0] || z[1] !== z[1]; });
+        fn(g, "isinf", 1, (a) => { const z = asComplex(a[0]); return isInf(z[0]) || isInf(z[1]); });
+        fnkw(g, "isclose", (a) => {
+            const kw = kwOf(a, ["rel_tol", "abs_tol"]);
+            if (a.length !== 2) fail(E.TypeError, "isclose() takes exactly 2 positional arguments (" + a.length + " given)");
+            const x = asComplex(a[0]), y = asComplex(a[1]);
+            const rel = asDouble(kwget(kw, "rel_tol", 1e-9)), abs = asDouble(kwget(kw, "abs_tol", 0));
+            if (rel < 0 || abs < 0) fail(E.ValueError, "tolerances must be non-negative");
+            if (x[0] === y[0] && x[1] === y[1]) return true;
+            if (isInf(x[0]) || isInf(x[1]) || isInf(y[0]) || isInf(y[1])) return false;
+            const diff = rt.cxAbs(x[0] - y[0], x[1] - y[1]);
+            return diff <= rel * rt.cxAbs(y[0], y[1]) || diff <= rel * rt.cxAbs(x[0], x[1]) || diff <= abs;
+        });
+        g.set("pi", Math.PI); g.set("e", Math.E); g.set("tau", 2 * Math.PI); g.set("inf", Infinity);
+        g.set("infj", cx(0, Infinity)); g.set("nan", NaN); g.set("nanj", cx(0, NaN));
+    });
     mod("random", (g) => {
         const N = 624;
         function initGenrand(st, s) {
@@ -1186,7 +1707,7 @@
         // Native fields (an exception's args, a deque's maxlen, a boxed
         // value) carry over; typed-array buffers are duplicated by deepcopy.
         const SKIP = new Set(["id", "dictView", "cls", "dict", "items", "map", "size", "str", "coll"]);
-        const ATOMIC = new Set([T.function, T.module, T.builtin_function_or_method, T.range, T.bytes, T.property, T.classmethod, T.staticmethod]);
+        const ATOMIC = new Set([T.function, T.module, T.builtin_function_or_method, T.range, T.bytes, T.property, T.classmethod, T.staticmethod, T.complex]);
         const isAtomic = (v) => v === null || typeof v !== "object" || v.cls === undefined || isType(v) || ATOMIC.has(v.cls) || (v.cls === T.frozenset && v.dict === undefined);
         const objectReduce = rt.ObjectType.dict.get("__reduce__");
         const userMethod = (v, name) => { const m = typeMethod(v, name); return m === undefined || m === null || m.isBase === true || m === objectReduce ? null : m; };

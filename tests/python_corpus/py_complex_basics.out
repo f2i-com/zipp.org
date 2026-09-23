@@ -1,0 +1,161 @@
+-- literals and repr
+1j 1j complex
+2.5j 2.5j complex
+1000j 1000j complex
+0j 0j complex
+(-0-0j) (-0-0j) complex
+(-0-1j) (-0-1j) complex
+(1+2j) (1+2j) complex
+(1-2j) (1-2j) complex
+(-1-2j) (-1-2j) complex
+(1.5+0j) (1.5+0j) complex
+1j 1j complex
+0j 0j complex
+1e+16j 1e+16j complex
+1e-05j 1e-05j complex
+1.2345678901234568e+17j 1.2345678901234568e+17j complex
+infj infj complex
+3.14159j 3.14159j complex
+(0.1+0.2j) (0.1+0.2j) complex
+1e-310j 1e-310j complex
+0j -0j 1j -2.5j infj -infj nanj 1e+16j 1e-05j 
+(-0+0j) (-0-0j) (-0+1j) (-0-2.5j) (-0+infj) (-0-infj) (-0+nanj) (-0+1e+16j) (-0+1e-05j) 
+(1+0j) (1-0j) (1+1j) (1-2.5j) (1+infj) (1-infj) (1+nanj) (1+1e+16j) (1+1e-05j) 
+(-1+0j) (-1-0j) (-1+1j) (-1-2.5j) (-1+infj) (-1-infj) (-1+nanj) (-1+1e+16j) (-1+1e-05j) 
+(1e+16+0j) (1e+16-0j) (1e+16+1j) (1e+16-2.5j) (1e+16+infj) (1e+16-infj) (1e+16+nanj) (1e+16+1e+16j) (1e+16+1e-05j) 
+(1.5e-07+0j) (1.5e-07-0j) (1.5e-07+1j) (1.5e-07-2.5j) (1.5e-07+infj) (1.5e-07-infj) (1.5e-07+nanj) (1.5e-07+1e+16j) (1.5e-07+1e-05j) 
+(inf+0j) (inf-0j) (inf+1j) (inf-2.5j) (inf+infj) (inf-infj) (inf+nanj) (inf+1e+16j) (inf+1e-05j) 
+(-inf+0j) (-inf-0j) (-inf+1j) (-inf-2.5j) (-inf+infj) (-inf-infj) (-inf+nanj) (-inf+1e+16j) (-inf+1e-05j) 
+(nan+0j) (nan-0j) (nan+1j) (nan-2.5j) (nan+infj) (nan-infj) (nan+nanj) (nan+1e+16j) (nan+1e-05j) 
+(100+0j) (100-0j) (100+1j) (100-2.5j) (100+infj) (100-infj) (100+nanj) (100+1e+16j) (100+1e-05j) 
+(1e+22+0j) (1e+22-0j) (1e+22+1j) (1e+22-2.5j) (1e+22+infj) (1e+22-infj) (1e+22+nanj) (1e+22+1e+16j) (1e+22+1e-05j) 
+(2.5+0j) (2.5-0j) (2.5+1j) (2.5-2.5j) (2.5+infj) (2.5-infj) (2.5+nanj) (2.5+1e+16j) (2.5+1e-05j) 
+-- constructor
+0j 0j (3+0j) (3.5+0j) (1+0j) 0j (-0+0j)
+(1+2j) (1.5-2j) (2+0j) 3j (1-1j) (2+5j)
+1j (-1+1j) (-3+5j) (1+0j) 3j (-0-0j)
+True False
+(1e+20+0j) (9007199254740992+0j) (-1000000000000000+1000000000000000j)
+'1' -> (1+0j)
+'1j' -> 1j
+'-1j' -> -1j
+'+1.5J' -> 1.5j
+'1+2j' -> (1+2j)
+'1-2j' -> (1-2j)
+'  3.5  ' -> (3.5+0j)
+'(1+2j)' -> (1+2j)
+' ( 1+2j ) ' -> (1+2j)
+'\t-4.25e2+1e-2j\n' -> (-425+0.01j)
+'j' -> 1j
+'-j' -> -1j
+'+J' -> 1j
+'1+j' -> (1+1j)
+'2-J' -> (2-1j)
+'inf' -> (inf+0j)
+'-infj' -> -infj
+'infinity+nanj' -> (inf+nanj)
+'nan' -> (nan+0j)
+'NaN-InFj' -> (nan-infj)
+'1e5' -> (100000+0j)
+'1E5j' -> 100000j
+'.5' -> (0.5+0j)
+'5.' -> (5+0j)
+'.5j' -> 0.5j
+'1_000+2_0j' -> (1000+20j)
+'1_0.5_0e1_0j' -> 105000000000j
+'0x10' !! ValueError complex() arg is a malformed string
+'1e' !! ValueError complex() arg is a malformed string
+'1+' !! ValueError complex() arg is a malformed string
+'(1+2j' !! ValueError complex() arg is a malformed string
+'1+2j)' !! ValueError complex() arg is a malformed string
+'()' !! ValueError complex() arg is a malformed string
+'' !! ValueError complex() arg is a malformed string
+' ' !! ValueError complex() arg is a malformed string
+'1+2' !! ValueError complex() arg is a malformed string
+'1 + 2j' !! ValueError complex() arg is a malformed string
+'1+2jj' !! ValueError complex() arg is a malformed string
+'j1' !! ValueError complex() arg is a malformed string
+'1_' !! ValueError could not convert string to complex: '1_'
+'_1' !! ValueError could not convert string to complex: '_1'
+'1__0' !! ValueError could not convert string to complex: '1__0'
+'1._5' !! ValueError could not convert string to complex: '1._5'
+'(j)' -> 1j
+'--1' !! ValueError complex() arg is a malformed string
+'+-1j' !! ValueError complex() arg is a malformed string
+'1e+j' !! ValueError complex() arg is a malformed string
+'infj+1' !! ValueError complex() arg is a malformed string
+'١٢+٣j' -> (12+3j)
+'1\xa0' -> (1+0j)
+'\u20001j\u3000' -> 1j
+'1\u200b' !! ValueError complex() arg is a malformed string
+(1, 2, 3) {} !! TypeError complex() takes at most 2 arguments (3 given)
+() {'foo': 1} !! TypeError complex() got an unexpected keyword argument 'foo'
+(1,) {'real': 2} !! TypeError argument for complex() given by name ('real') and position (1)
+(1, 2) {'imag': 2} !! TypeError complex() takes at most 2 arguments (3 given)
+('1', 2) {} !! TypeError complex() can't take second arg if first is a string
+(1, '2') {} !! TypeError complex() second arg can't be a string
+([],) {} !! TypeError complex() first argument must be a string or a number, not 'list'
+(1, []) {} !! TypeError complex() second argument must be a number, not 'list'
+(b'1',) {} !! TypeError complex() first argument must be a string or a number, not 'bytes'
+(None,) {} !! TypeError complex() first argument must be a string or a number, not 'NoneType'
+(1, None) {} !! TypeError complex() second argument must be a number, not 'NoneType'
+('1',) {'imag': 1} !! TypeError complex() can't take second arg if first is a string
+(10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000,) {} !! OverflowError int too large to convert to float
+(1, 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000) {} !! OverflowError int too large to convert to float
+({},) {} !! TypeError complex() first argument must be a string or a number, not 'dict'
+(3+4j) (2.5+0j) (7+0j) (2.5+7j) (1+1j)
+(6+0j) (1+3j) (1+2.5j)
+TypeError __complex__ returned non-complex (type int)
+TypeError __complex__ returned non-complex (type str)
+TypeError BadFloat.__float__ returned non-float (type int)
+(1+9j)
+TypeError complex() second argument must be a number, not 'WithComplex'
+-- attributes
+3.0 -4.0 float (3+4j) -1j (-0+0j) (3-4j) (3.0, -4.0)
+5 0 0.0 5 2.5 0
+False False False False False
+NotImplemented NotImplemented NotImplemented (4-4j) (-2+4j) (0.12+0.16j) (-7.461496614688569-2.885492725513448j)
+True True False False False True complex (<class 'complex'>, <class 'object'>) <class 'type'>
+AttributeError on set x
+AttributeError on set real
+-- equality and hashing
+True True False True True False True True True True
+False True False False False False
+0 1000003 3458764513822540934 4611686018429387911 -2 -2000008 True True
+314159 314159942477 314159628318 7229033979992872944 0 -2305843009213693952
+int one float three j False True True True True
+{1: 'replaced', 2.5: 'float', 3j: 'three j'}
+3 ['(2+3j)', '1', '1j']
+[1, 2, 3] 1 2 True
+'<' not supported between instances of 'complex' and 'complex'
+'<=' not supported between instances of 'complex' and 'complex'
+'>' not supported between instances of 'complex' and 'complex'
+'>=' not supported between instances of 'complex' and 'complex'
+'<' not supported between instances of 'complex' and 'int'
+'>=' not supported between instances of 'float' and 'complex'
+'<' not supported between instances of 'complex' and 'complex'
+'>' not supported between instances of 'complex' and 'complex'
+'<' not supported between instances of 'complex' and 'int'
+False False True True True False
+-- subclasses
+(1+2j) (1+2j) C 1.0 2.0 (1-2j) complex True
+(2+2j) complex (2+2j) complex complex True 5.0 True True
+0j (3+4j) (5+0j) 1j C (1+2j) complex 1 1.0+2.0j
+attr {'extra': 'attr'} (<class '__main__.C'>, <class 'complex'>, <class 'object'>)
+Tagged((1+2j), t) t Tagged.add Tagged.radd Tagged.radd 2j Tagged((1+2j), t) Tagged((1+2j), t) Tagged((1+2j), t) 1.00+2.00j
+(1+2j) 2.23606797749979 True 1.0 complex
+-- copy, pickle, json
+True True [(1.5-2j), {(1.5-2j): (1.5-2j)}] (1+2j) C attr
+(1.5-2j) True
+0j True
+(-0+infj) True
+[1j, ((2+3j), {'k': (-0-1j)})] True
+{1j: 2j} True
+(nan+1j)
+(1+2j)
+(1+2j)
+(1+2j)
+Object of type complex is not JSON serializable
+Object of type complex is not JSON serializable
+keys must be str, int, float, bool or None, not complex
+{"z": [0.0, 1.0]}

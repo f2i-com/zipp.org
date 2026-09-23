@@ -1,0 +1,861 @@
+-- binary operators
+0 0j 0j 0j 0j ZeroDivisionError: complex division by zero
+0 (-0-0j) 0j 0j -0j ZeroDivisionError: complex division by zero
+0 (-0+0j) 0j 0j (-0+0j) ZeroDivisionError: complex division by zero
+0 1j 1j -1j 0j 0j
+0 (-0-2j) -2j 2j -0j (-0-0j)
+0 (1+1j) (1+1j) (-1-1j) 0j 0j
+0 (3-4j) (3-4j) (-3+4j) 0j (-0+0j)
+0 (inf+0j) (inf+0j) (-inf+0j) (nan+nanj) 0j
+0 infj infj -infj (nan+nanj) 0j
+0 (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+0 (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+0 (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) 0j 0j
+0 (1e-320+5e-324j) (1e-320+5e-324j) (-1e-320-5e-324j) 0j 0j
+1 0j (1+0j) (1+0j) 0j ZeroDivisionError: complex division by zero
+1 (-0-0j) (1+0j) (1+0j) -0j ZeroDivisionError: complex division by zero
+1 (-0+0j) (1+0j) (1+0j) (-0+0j) ZeroDivisionError: complex division by zero
+1 1j (1+1j) (1-1j) 1j -1j
+1 (-0-2j) (1-2j) (1+2j) -2j (-0+0.5j)
+1 (1+1j) (2+1j) -1j (1+1j) (0.5-0.5j)
+1 (3-4j) (4-4j) (-2+4j) (3-4j) (0.12+0.16j)
+1 (inf+0j) (inf+0j) (-inf+0j) (inf+nanj) 0j
+1 infj (1+infj) (1-infj) (nan+infj) -0j
+1 (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+1 (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+1 (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (1e+300+1e+300j) (5e-301-5e-301j)
+1 (1e-320+5e-324j) (1+5e-324j) (1-5e-324j) (1e-320+5e-324j) (inf-infj)
+-3 0j (-3+0j) (-3+0j) (-0+0j) ZeroDivisionError: complex division by zero
+-3 (-0-0j) (-3+0j) (-3+0j) 0j ZeroDivisionError: complex division by zero
+-3 (-0+0j) (-3+0j) (-3+0j) -0j ZeroDivisionError: complex division by zero
+-3 1j (-3+1j) (-3-1j) (-0-3j) 3j
+-3 (-0-2j) (-3-2j) (-3+2j) 6j (-0-1.5j)
+-3 (1+1j) (-2+1j) (-4-1j) (-3-3j) (-1.5+1.5j)
+-3 (3-4j) -4j (-6+4j) (-9+12j) (-0.36-0.48j)
+-3 (inf+0j) (inf+0j) (-inf+0j) (-inf+nanj) (-0+0j)
+-3 infj (-3+infj) (-3-infj) (nan-infj) 0j
+-3 (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+-3 (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+-3 (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (-3e+300-3e+300j) (-1.4999999999999998e-300+1.4999999999999998e-300j)
+-3 (1e-320+5e-324j) (-3+5e-324j) (-3-5e-324j) (-3e-320-1.5e-323j) (-inf+infj)
+True 0j (1+0j) (1+0j) 0j ZeroDivisionError: complex division by zero
+True (-0-0j) (1+0j) (1+0j) -0j ZeroDivisionError: complex division by zero
+True (-0+0j) (1+0j) (1+0j) (-0+0j) ZeroDivisionError: complex division by zero
+True 1j (1+1j) (1-1j) 1j -1j
+True (-0-2j) (1-2j) (1+2j) -2j (-0+0.5j)
+True (1+1j) (2+1j) -1j (1+1j) (0.5-0.5j)
+True (3-4j) (4-4j) (-2+4j) (3-4j) (0.12+0.16j)
+True (inf+0j) (inf+0j) (-inf+0j) (inf+nanj) 0j
+True infj (1+infj) (1-infj) (nan+infj) -0j
+True (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+True (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+True (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (1e+300+1e+300j) (5e-301-5e-301j)
+True (1e-320+5e-324j) (1+5e-324j) (1-5e-324j) (1e-320+5e-324j) (inf-infj)
+False 0j 0j 0j 0j ZeroDivisionError: complex division by zero
+False (-0-0j) 0j 0j -0j ZeroDivisionError: complex division by zero
+False (-0+0j) 0j 0j (-0+0j) ZeroDivisionError: complex division by zero
+False 1j 1j -1j 0j 0j
+False (-0-2j) -2j 2j -0j (-0-0j)
+False (1+1j) (1+1j) (-1-1j) 0j 0j
+False (3-4j) (3-4j) (-3+4j) 0j (-0+0j)
+False (inf+0j) (inf+0j) (-inf+0j) (nan+nanj) 0j
+False infj infj -infj (nan+nanj) 0j
+False (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+False (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+False (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) 0j 0j
+False (1e-320+5e-324j) (1e-320+5e-324j) (-1e-320-5e-324j) 0j 0j
+2.5 0j (2.5+0j) (2.5+0j) 0j ZeroDivisionError: complex division by zero
+2.5 (-0-0j) (2.5+0j) (2.5+0j) -0j ZeroDivisionError: complex division by zero
+2.5 (-0+0j) (2.5+0j) (2.5+0j) (-0+0j) ZeroDivisionError: complex division by zero
+2.5 1j (2.5+1j) (2.5-1j) 2.5j -2.5j
+2.5 (-0-2j) (2.5-2j) (2.5+2j) -5j (-0+1.25j)
+2.5 (1+1j) (3.5+1j) (1.5-1j) (2.5+2.5j) (1.25-1.25j)
+2.5 (3-4j) (5.5-4j) (-0.5+4j) (7.5-10j) (0.3+0.4j)
+2.5 (inf+0j) (inf+0j) (-inf+0j) (inf+nanj) 0j
+2.5 infj (2.5+infj) (2.5-infj) (nan+infj) -0j
+2.5 (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+2.5 (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+2.5 (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (2.5e+300+2.5e+300j) (1.25e-300-1.25e-300j)
+2.5 (1e-320+5e-324j) (2.5+5e-324j) (2.5-5e-324j) (2.5e-320+1e-323j) (inf-infj)
+-0.0 0j 0j (-0+0j) (-0+0j) ZeroDivisionError: complex division by zero
+-0.0 (-0-0j) (-0+0j) 0j 0j ZeroDivisionError: complex division by zero
+-0.0 (-0+0j) (-0+0j) 0j -0j ZeroDivisionError: complex division by zero
+-0.0 1j 1j (-0-1j) (-0+0j) 0j
+-0.0 (-0-2j) (-0-2j) 2j 0j (-0-0j)
+-0.0 (1+1j) (1+1j) (-1-1j) (-0+0j) 0j
+-0.0 (3-4j) (3-4j) (-3+4j) 0j (-0-0j)
+-0.0 (inf+0j) (inf+0j) (-inf+0j) (nan+nanj) 0j
+-0.0 infj infj (-0-infj) (nan+nanj) 0j
+-0.0 (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+-0.0 (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+-0.0 (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (-0+0j) 0j
+-0.0 (1e-320+5e-324j) (1e-320+5e-324j) (-1e-320-5e-324j) (-0+0j) 0j
+0.0 0j 0j 0j 0j ZeroDivisionError: complex division by zero
+0.0 (-0-0j) 0j 0j -0j ZeroDivisionError: complex division by zero
+0.0 (-0+0j) 0j 0j (-0+0j) ZeroDivisionError: complex division by zero
+0.0 1j 1j -1j 0j 0j
+0.0 (-0-2j) -2j 2j -0j (-0-0j)
+0.0 (1+1j) (1+1j) (-1-1j) 0j 0j
+0.0 (3-4j) (3-4j) (-3+4j) 0j (-0+0j)
+0.0 (inf+0j) (inf+0j) (-inf+0j) (nan+nanj) 0j
+0.0 infj infj -infj (nan+nanj) 0j
+0.0 (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+0.0 (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+0.0 (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) 0j 0j
+0.0 (1e-320+5e-324j) (1e-320+5e-324j) (-1e-320-5e-324j) 0j 0j
+1e+308 0j (1e+308+0j) (1e+308+0j) 0j ZeroDivisionError: complex division by zero
+1e+308 (-0-0j) (1e+308+0j) (1e+308+0j) -0j ZeroDivisionError: complex division by zero
+1e+308 (-0+0j) (1e+308+0j) (1e+308+0j) (-0+0j) ZeroDivisionError: complex division by zero
+1e+308 1j (1e+308+1j) (1e+308-1j) 1e+308j -1e+308j
+1e+308 (-0-2j) (1e+308-2j) (1e+308+2j) -infj (-0+5e+307j)
+1e+308 (1+1j) (1e+308+1j) (1e+308-1j) (1e+308+1e+308j) (5e+307-5e+307j)
+1e+308 (3-4j) (1e+308-4j) (1e+308+4j) (inf-infj) (1.2e+307+1.6e+307j)
+1e+308 (inf+0j) (inf+0j) (-inf+0j) (inf+nanj) 0j
+1e+308 infj (1e+308+infj) (1e+308-infj) (nan+infj) -0j
+1e+308 (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+1e+308 (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+1e+308 (1e+300+1e+300j) (1.00000001e+308+1e+300j) (9.9999999e+307-1e+300j) (inf+infj) (50000000-50000000j)
+1e+308 (1e-320+5e-324j) (1e+308+5e-324j) (1e+308-5e-324j) (9.99988867182683e-13+4.9406564584124655e-16j) (inf-infj)
+inf 0j (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+inf (-0-0j) (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+inf (-0+0j) (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+inf 1j (inf+1j) (inf-1j) (nan+infj) (nan-infj)
+inf (-0-2j) (inf-2j) (inf+2j) (nan-infj) (nan+infj)
+inf (1+1j) (inf+1j) (inf-1j) (inf+infj) (inf-infj)
+inf (3-4j) (inf-4j) (inf+4j) (inf-infj) (inf+infj)
+inf (inf+0j) (inf+0j) (nan+0j) (inf+nanj) (nan+nanj)
+inf infj (inf+infj) (inf-infj) (nan+infj) (nan+nanj)
+inf (inf+infj) (inf+infj) (nan-infj) (nan+nanj) (nan+nanj)
+inf (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+inf (1e+300+1e+300j) (inf+1e+300j) (inf-1e+300j) (inf+infj) (inf-infj)
+inf (1e-320+5e-324j) (inf+5e-324j) (inf-5e-324j) (inf+infj) (inf-infj)
+-inf 0j (-inf+0j) (-inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+-inf (-0-0j) (-inf+0j) (-inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+-inf (-0+0j) (-inf+0j) (-inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+-inf 1j (-inf+1j) (-inf-1j) (nan-infj) (nan+infj)
+-inf (-0-2j) (-inf-2j) (-inf+2j) (nan+infj) (nan-infj)
+-inf (1+1j) (-inf+1j) (-inf-1j) (-inf-infj) (-inf+infj)
+-inf (3-4j) (-inf-4j) (-inf+4j) (-inf+infj) (-inf-infj)
+-inf (inf+0j) (nan+0j) (-inf+0j) (-inf+nanj) (nan+nanj)
+-inf infj (-inf+infj) (-inf-infj) (nan-infj) (nan+nanj)
+-inf (inf+infj) (nan+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+-inf (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+-inf (1e+300+1e+300j) (-inf+1e+300j) (-inf-1e+300j) (-inf-infj) (-inf+infj)
+-inf (1e-320+5e-324j) (-inf+5e-324j) (-inf-5e-324j) (-inf-infj) (-inf+infj)
+nan 0j (nan+0j) (nan+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+nan (-0-0j) (nan+0j) (nan+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+nan (-0+0j) (nan+0j) (nan+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+nan 1j (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+nan (-0-2j) (nan-2j) (nan+2j) (nan+nanj) (nan+nanj)
+nan (1+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+nan (3-4j) (nan-4j) (nan+4j) (nan+nanj) (nan+nanj)
+nan (inf+0j) (nan+0j) (nan+0j) (nan+nanj) (nan+nanj)
+nan infj (nan+infj) (nan-infj) (nan+nanj) (nan+nanj)
+nan (inf+infj) (nan+infj) (nan-infj) (nan+nanj) (nan+nanj)
+nan (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+nan (1e+300+1e+300j) (nan+1e+300j) (nan-1e+300j) (nan+nanj) (nan+nanj)
+nan (1e-320+5e-324j) (nan+5e-324j) (nan-5e-324j) (nan+nanj) (nan+nanj)
+0j 0 0j 0j 0j ZeroDivisionError: complex division by zero
+0j 1 (1+0j) (-1+0j) 0j 0j
+0j -3 (-3+0j) (3+0j) (-0+0j) (-0-0j)
+0j True (1+0j) (-1+0j) 0j 0j
+0j False 0j 0j 0j ZeroDivisionError: complex division by zero
+0j 2.5 (2.5+0j) (-2.5+0j) 0j 0j
+0j -0.0 0j 0j (-0+0j) ZeroDivisionError: complex division by zero
+0j 0.0 0j 0j 0j ZeroDivisionError: complex division by zero
+0j 1e+308 (1e+308+0j) (-1e+308+0j) 0j 0j
+0j inf (inf+0j) (-inf+0j) (nan+nanj) 0j
+0j -inf (-inf+0j) (inf+0j) (nan+nanj) (-0-0j)
+0j nan (nan+0j) (nan+0j) (nan+nanj) (nan+nanj)
+0j 0j 0j 0j 0j ZeroDivisionError: complex division by zero
+0j (-0-0j) 0j 0j -0j ZeroDivisionError: complex division by zero
+0j (-0+0j) 0j 0j (-0+0j) ZeroDivisionError: complex division by zero
+0j 1j 1j -1j 0j 0j
+0j (-0-2j) -2j 2j -0j (-0-0j)
+0j (1+1j) (1+1j) (-1-1j) 0j 0j
+0j (3-4j) (3-4j) (-3+4j) 0j (-0+0j)
+0j (inf+0j) (inf+0j) (-inf+0j) (nan+nanj) 0j
+0j infj infj -infj (nan+nanj) 0j
+0j (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+0j (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+0j (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) 0j 0j
+0j (1e-320+5e-324j) (1e-320+5e-324j) (-1e-320-5e-324j) 0j 0j
+(-0-0j) 0 0j (-0-0j) -0j ZeroDivisionError: complex division by zero
+(-0-0j) 1 (1+0j) (-1-0j) -0j (-0+0j)
+(-0-0j) -3 (-3+0j) (3-0j) 0j (-0+0j)
+(-0-0j) True (1+0j) (-1-0j) -0j (-0+0j)
+(-0-0j) False 0j (-0-0j) -0j ZeroDivisionError: complex division by zero
+(-0-0j) 2.5 (2.5+0j) (-2.5-0j) -0j (-0+0j)
+(-0-0j) -0.0 (-0+0j) -0j 0j ZeroDivisionError: complex division by zero
+(-0-0j) 0.0 0j (-0-0j) -0j ZeroDivisionError: complex division by zero
+(-0-0j) 1e+308 (1e+308+0j) (-1e+308-0j) -0j (-0+0j)
+(-0-0j) inf (inf+0j) (-inf-0j) (nan+nanj) (-0+0j)
+(-0-0j) -inf (-inf+0j) (inf-0j) (nan+nanj) (-0+0j)
+(-0-0j) nan (nan+0j) (nan-0j) (nan+nanj) (nan+nanj)
+(-0-0j) 0j 0j (-0-0j) -0j ZeroDivisionError: complex division by zero
+(-0-0j) (-0-0j) (-0-0j) 0j 0j ZeroDivisionError: complex division by zero
+(-0-0j) (-0+0j) (-0+0j) -0j 0j ZeroDivisionError: complex division by zero
+(-0-0j) 1j 1j (-0-1j) -0j (-0+0j)
+(-0-0j) (-0-2j) (-0-2j) 2j 0j -0j
+(-0-0j) (1+1j) (1+1j) (-1-1j) -0j (-0+0j)
+(-0-0j) (3-4j) (3-4j) (-3+4j) (-0+0j) (-0-0j)
+(-0-0j) (inf+0j) (inf+0j) (-inf-0j) (nan+nanj) (-0+0j)
+(-0-0j) infj infj (-0-infj) (nan+nanj) (-0+0j)
+(-0-0j) (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+(-0-0j) (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+(-0-0j) (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) -0j (-0+0j)
+(-0-0j) (1e-320+5e-324j) (1e-320+5e-324j) (-1e-320-5e-324j) -0j (-0+0j)
+(-0+0j) 0 0j (-0+0j) (-0+0j) ZeroDivisionError: complex division by zero
+(-0+0j) 1 (1+0j) (-1+0j) (-0+0j) 0j
+(-0+0j) -3 (-3+0j) (3+0j) -0j -0j
+(-0+0j) True (1+0j) (-1+0j) (-0+0j) 0j
+(-0+0j) False 0j (-0+0j) (-0+0j) ZeroDivisionError: complex division by zero
+(-0+0j) 2.5 (2.5+0j) (-2.5+0j) (-0+0j) 0j
+(-0+0j) -0.0 (-0+0j) 0j -0j ZeroDivisionError: complex division by zero
+(-0+0j) 0.0 0j (-0+0j) (-0+0j) ZeroDivisionError: complex division by zero
+(-0+0j) 1e+308 (1e+308+0j) (-1e+308+0j) (-0+0j) 0j
+(-0+0j) inf (inf+0j) (-inf+0j) (nan+nanj) 0j
+(-0+0j) -inf (-inf+0j) (inf+0j) (nan+nanj) -0j
+(-0+0j) nan (nan+0j) (nan+0j) (nan+nanj) (nan+nanj)
+(-0+0j) 0j 0j (-0+0j) (-0+0j) ZeroDivisionError: complex division by zero
+(-0+0j) (-0-0j) (-0+0j) 0j 0j ZeroDivisionError: complex division by zero
+(-0+0j) (-0+0j) (-0+0j) 0j -0j ZeroDivisionError: complex division by zero
+(-0+0j) 1j 1j (-0-1j) (-0+0j) 0j
+(-0+0j) (-0-2j) (-0-2j) 2j 0j (-0-0j)
+(-0+0j) (1+1j) (1+1j) (-1-1j) (-0+0j) 0j
+(-0+0j) (3-4j) (3-4j) (-3+4j) 0j (-0-0j)
+(-0+0j) (inf+0j) (inf+0j) (-inf+0j) (nan+nanj) 0j
+(-0+0j) infj infj (-0-infj) (nan+nanj) 0j
+(-0+0j) (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+(-0+0j) (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+(-0+0j) (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (-0+0j) 0j
+(-0+0j) (1e-320+5e-324j) (1e-320+5e-324j) (-1e-320-5e-324j) (-0+0j) 0j
+1j 0 1j 1j 0j ZeroDivisionError: complex division by zero
+1j 1 (1+1j) (-1+1j) 1j 1j
+1j -3 (-3+1j) (3+1j) (-0-3j) (-0-0.3333333333333333j)
+1j True (1+1j) (-1+1j) 1j 1j
+1j False 1j 1j 0j ZeroDivisionError: complex division by zero
+1j 2.5 (2.5+1j) (-2.5+1j) 2.5j 0.4j
+1j -0.0 1j 1j (-0+0j) ZeroDivisionError: complex division by zero
+1j 0.0 1j 1j 0j ZeroDivisionError: complex division by zero
+1j 1e+308 (1e+308+1j) (-1e+308+1j) 1e+308j 1e-308j
+1j inf (inf+1j) (-inf+1j) (nan+infj) 0j
+1j -inf (-inf+1j) (inf+1j) (nan-infj) (-0-0j)
+1j nan (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+1j 0j 1j 1j 0j ZeroDivisionError: complex division by zero
+1j (-0-0j) 1j 1j -0j ZeroDivisionError: complex division by zero
+1j (-0+0j) 1j 1j (-0+0j) ZeroDivisionError: complex division by zero
+1j 1j 2j 0j (-1+0j) (1+0j)
+1j (-0-2j) -1j 3j (2-0j) (-0.5-0j)
+1j (1+1j) (1+2j) (-1+0j) (-1+1j) (0.5+0.5j)
+1j (3-4j) (3-3j) (-3+5j) (4+3j) (-0.16+0.12j)
+1j (inf+0j) (inf+1j) (-inf+1j) (nan+infj) 0j
+1j infj infj -infj (-inf+nanj) 0j
+1j (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+1j (nan+1j) (nan+2j) (nan+0j) (nan+nanj) (nan+nanj)
+1j (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (-1e+300+1e+300j) (5e-301+5e-301j)
+1j (1e-320+5e-324j) (1e-320+1j) (-1e-320+1j) (-5e-324+1e-320j) (inf+infj)
+(-0-2j) 0 -2j (-0-2j) -0j ZeroDivisionError: complex division by zero
+(-0-2j) 1 (1-2j) (-1-2j) -2j (-0-2j)
+(-0-2j) -3 (-3-2j) (3-2j) 6j (-0+0.6666666666666666j)
+(-0-2j) True (1-2j) (-1-2j) -2j (-0-2j)
+(-0-2j) False -2j (-0-2j) -0j ZeroDivisionError: complex division by zero
+(-0-2j) 2.5 (2.5-2j) (-2.5-2j) -5j (-0-0.8j)
+(-0-2j) -0.0 (-0-2j) -2j 0j ZeroDivisionError: complex division by zero
+(-0-2j) 0.0 -2j (-0-2j) -0j ZeroDivisionError: complex division by zero
+(-0-2j) 1e+308 (1e+308-2j) (-1e+308-2j) -infj (-0-2e-308j)
+(-0-2j) inf (inf-2j) (-inf-2j) (nan-infj) (-0-0j)
+(-0-2j) -inf (-inf-2j) (inf-2j) (nan+infj) (-0+0j)
+(-0-2j) nan (nan-2j) (nan-2j) (nan+nanj) (nan+nanj)
+(-0-2j) 0j -2j (-0-2j) -0j ZeroDivisionError: complex division by zero
+(-0-2j) (-0-0j) (-0-2j) -2j 0j ZeroDivisionError: complex division by zero
+(-0-2j) (-0+0j) (-0-2j) -2j 0j ZeroDivisionError: complex division by zero
+(-0-2j) 1j -1j (-0-3j) (2-0j) (-2+0j)
+(-0-2j) (-0-2j) (-0-4j) 0j (-4+0j) (1-0j)
+(-0-2j) (1+1j) (1-1j) (-1-3j) (2-2j) (-1-1j)
+(-0-2j) (3-4j) (3-6j) (-3+2j) (-8-6j) (0.32-0.24j)
+(-0-2j) (inf+0j) (inf-2j) (-inf-2j) (nan-infj) (-0-0j)
+(-0-2j) infj infj (-0-infj) (inf+nanj) (-0+0j)
+(-0-2j) (inf+infj) (inf+infj) (-inf-infj) (nan+nanj) (nan+nanj)
+(-0-2j) (nan+1j) (nan-1j) (nan-3j) (nan+nanj) (nan+nanj)
+(-0-2j) (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (2e+300-2e+300j) (-1e-300-1e-300j)
+(-0-2j) (1e-320+5e-324j) (1e-320-2j) (-1e-320-2j) (1e-323-2e-320j) (-inf-infj)
+(1+1j) 0 (1+1j) (1+1j) 0j ZeroDivisionError: complex division by zero
+(1+1j) 1 (2+1j) 1j (1+1j) (1+1j)
+(1+1j) -3 (-2+1j) (4+1j) (-3-3j) (-0.3333333333333333-0.3333333333333333j)
+(1+1j) True (2+1j) 1j (1+1j) (1+1j)
+(1+1j) False (1+1j) (1+1j) 0j ZeroDivisionError: complex division by zero
+(1+1j) 2.5 (3.5+1j) (-1.5+1j) (2.5+2.5j) (0.4+0.4j)
+(1+1j) -0.0 (1+1j) (1+1j) (-0+0j) ZeroDivisionError: complex division by zero
+(1+1j) 0.0 (1+1j) (1+1j) 0j ZeroDivisionError: complex division by zero
+(1+1j) 1e+308 (1e+308+1j) (-1e+308+1j) (1e+308+1e+308j) (1e-308+1e-308j)
+(1+1j) inf (inf+1j) (-inf+1j) (inf+infj) 0j
+(1+1j) -inf (-inf+1j) (inf+1j) (-inf-infj) (-0-0j)
+(1+1j) nan (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(1+1j) 0j (1+1j) (1+1j) 0j ZeroDivisionError: complex division by zero
+(1+1j) (-0-0j) (1+1j) (1+1j) -0j ZeroDivisionError: complex division by zero
+(1+1j) (-0+0j) (1+1j) (1+1j) (-0+0j) ZeroDivisionError: complex division by zero
+(1+1j) 1j (1+2j) (1+0j) (-1+1j) (1-1j)
+(1+1j) (-0-2j) (1-1j) (1+3j) (2-2j) (-0.5+0.5j)
+(1+1j) (1+1j) (2+2j) 0j 2j (1+0j)
+(1+1j) (3-4j) (4-3j) (-2+5j) (7-1j) (-0.04+0.28j)
+(1+1j) (inf+0j) (inf+1j) (-inf+1j) (inf+infj) 0j
+(1+1j) infj (1+infj) (1-infj) (-inf+infj) -0j
+(1+1j) (inf+infj) (inf+infj) (-inf-infj) (nan+infj) (nan+nanj)
+(1+1j) (nan+1j) (nan+2j) (nan+0j) (nan+nanj) (nan+nanj)
+(1+1j) (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) 2e+300j (1e-300+0j)
+(1+1j) (1e-320+5e-324j) (1+1j) (1+1j) (9.995e-321+1.0005e-320j) (inf+infj)
+(3-4j) 0 (3-4j) (3-4j) 0j ZeroDivisionError: complex division by zero
+(3-4j) 1 (4-4j) (2-4j) (3-4j) (3-4j)
+(3-4j) -3 -4j (6-4j) (-9+12j) (-1+1.3333333333333333j)
+(3-4j) True (4-4j) (2-4j) (3-4j) (3-4j)
+(3-4j) False (3-4j) (3-4j) 0j ZeroDivisionError: complex division by zero
+(3-4j) 2.5 (5.5-4j) (0.5-4j) (7.5-10j) (1.2-1.6j)
+(3-4j) -0.0 (3-4j) (3-4j) 0j ZeroDivisionError: complex division by zero
+(3-4j) 0.0 (3-4j) (3-4j) 0j ZeroDivisionError: complex division by zero
+(3-4j) 1e+308 (1e+308-4j) (-1e+308-4j) (inf-infj) (2.9999999999999997e-308-4e-308j)
+(3-4j) inf (inf-4j) (-inf-4j) (inf-infj) -0j
+(3-4j) -inf (-inf-4j) (inf-4j) (-inf+infj) (-0+0j)
+(3-4j) nan (nan-4j) (nan-4j) (nan+nanj) (nan+nanj)
+(3-4j) 0j (3-4j) (3-4j) 0j ZeroDivisionError: complex division by zero
+(3-4j) (-0-0j) (3-4j) (3-4j) (-0+0j) ZeroDivisionError: complex division by zero
+(3-4j) (-0+0j) (3-4j) (3-4j) 0j ZeroDivisionError: complex division by zero
+(3-4j) 1j (3-3j) (3-5j) (4+3j) (-4-3j)
+(3-4j) (-0-2j) (3-6j) (3-2j) (-8-6j) (2+1.5j)
+(3-4j) (1+1j) (4-3j) (2-5j) (7-1j) (-0.5-3.5j)
+(3-4j) (3-4j) (6-8j) 0j (-7-24j) (1-0j)
+(3-4j) (inf+0j) (inf-4j) (-inf-4j) (inf-infj) -0j
+(3-4j) infj (3+infj) (3-infj) (inf+infj) (-0-0j)
+(3-4j) (inf+infj) (inf+infj) (-inf-infj) (inf+nanj) (nan+nanj)
+(3-4j) (nan+1j) (nan-3j) (nan-5j) (nan+nanj) (nan+nanj)
+(3-4j) (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (7e+300-1e+300j) (-5e-301-3.4999999999999995e-300j)
+(3-4j) (1e-320+5e-324j) (3-4j) (3-4j) (3.002e-320-3.9985e-320j) (inf-infj)
+(inf+0j) 0 (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+0j) 1 (inf+0j) (inf+0j) (inf+nanj) (inf+nanj)
+(inf+0j) -3 (inf+0j) (inf+0j) (-inf+nanj) (-inf+nanj)
+(inf+0j) True (inf+0j) (inf+0j) (inf+nanj) (inf+nanj)
+(inf+0j) False (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+0j) 2.5 (inf+0j) (inf+0j) (inf+nanj) (inf+nanj)
+(inf+0j) -0.0 (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+0j) 0.0 (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+0j) 1e+308 (inf+0j) (inf+0j) (inf+nanj) (inf+nanj)
+(inf+0j) inf (inf+0j) (nan+0j) (inf+nanj) (nan+nanj)
+(inf+0j) -inf (nan+0j) (inf+0j) (-inf+nanj) (nan+nanj)
+(inf+0j) nan (nan+0j) (nan+0j) (nan+nanj) (nan+nanj)
+(inf+0j) 0j (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+0j) (-0-0j) (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+0j) (-0+0j) (inf+0j) (inf+0j) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+0j) 1j (inf+1j) (inf-1j) (nan+infj) (nan-infj)
+(inf+0j) (-0-2j) (inf-2j) (inf+2j) (nan-infj) (nan+infj)
+(inf+0j) (1+1j) (inf+1j) (inf-1j) (inf+infj) (inf-infj)
+(inf+0j) (3-4j) (inf-4j) (inf+4j) (inf-infj) (inf+infj)
+(inf+0j) (inf+0j) (inf+0j) (nan+0j) (inf+nanj) (nan+nanj)
+(inf+0j) infj (inf+infj) (inf-infj) (nan+infj) (nan+nanj)
+(inf+0j) (inf+infj) (inf+infj) (nan-infj) (nan+nanj) (nan+nanj)
+(inf+0j) (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+(inf+0j) (1e+300+1e+300j) (inf+1e+300j) (inf-1e+300j) (inf+infj) (inf-infj)
+(inf+0j) (1e-320+5e-324j) (inf+5e-324j) (inf-5e-324j) (inf+infj) (inf-infj)
+infj 0 infj infj (nan+nanj) ZeroDivisionError: complex division by zero
+infj 1 (1+infj) (-1+infj) (nan+infj) (nan+infj)
+infj -3 (-3+infj) (3+infj) (nan-infj) (nan-infj)
+infj True (1+infj) (-1+infj) (nan+infj) (nan+infj)
+infj False infj infj (nan+nanj) ZeroDivisionError: complex division by zero
+infj 2.5 (2.5+infj) (-2.5+infj) (nan+infj) (nan+infj)
+infj -0.0 infj infj (nan+nanj) ZeroDivisionError: complex division by zero
+infj 0.0 infj infj (nan+nanj) ZeroDivisionError: complex division by zero
+infj 1e+308 (1e+308+infj) (-1e+308+infj) (nan+infj) (nan+infj)
+infj inf (inf+infj) (-inf+infj) (nan+infj) (nan+nanj)
+infj -inf (-inf+infj) (inf+infj) (nan-infj) (nan+nanj)
+infj nan (nan+infj) (nan+infj) (nan+nanj) (nan+nanj)
+infj 0j infj infj (nan+nanj) ZeroDivisionError: complex division by zero
+infj (-0-0j) infj infj (nan+nanj) ZeroDivisionError: complex division by zero
+infj (-0+0j) infj infj (nan+nanj) ZeroDivisionError: complex division by zero
+infj 1j infj infj (-inf+nanj) (inf+nanj)
+infj (-0-2j) infj infj (inf+nanj) (-inf+nanj)
+infj (1+1j) (1+infj) (-1+infj) (-inf+infj) (inf+infj)
+infj (3-4j) (3+infj) (-3+infj) (inf+infj) (-inf+infj)
+infj (inf+0j) (inf+infj) (-inf+infj) (nan+infj) (nan+nanj)
+infj infj infj nanj (-inf+nanj) (nan+nanj)
+infj (inf+infj) (inf+infj) (-inf+nanj) (nan+nanj) (nan+nanj)
+infj (nan+1j) (nan+infj) (nan+infj) (nan+nanj) (nan+nanj)
+infj (1e+300+1e+300j) (1e+300+infj) (-1e+300+infj) (-inf+infj) (inf+infj)
+infj (1e-320+5e-324j) (1e-320+infj) (-1e-320+infj) (-inf+infj) (inf+infj)
+(inf+infj) 0 (inf+infj) (inf+infj) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+infj) 1 (inf+infj) (inf+infj) (nan+nanj) (nan+nanj)
+(inf+infj) -3 (inf+infj) (inf+infj) (nan+nanj) (nan+nanj)
+(inf+infj) True (inf+infj) (inf+infj) (nan+nanj) (nan+nanj)
+(inf+infj) False (inf+infj) (inf+infj) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+infj) 2.5 (inf+infj) (inf+infj) (nan+nanj) (nan+nanj)
+(inf+infj) -0.0 (inf+infj) (inf+infj) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+infj) 0.0 (inf+infj) (inf+infj) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+infj) 1e+308 (inf+infj) (inf+infj) (nan+nanj) (nan+nanj)
+(inf+infj) inf (inf+infj) (nan+infj) (nan+nanj) (nan+nanj)
+(inf+infj) -inf (nan+infj) (inf+infj) (nan+nanj) (nan+nanj)
+(inf+infj) nan (nan+infj) (nan+infj) (nan+nanj) (nan+nanj)
+(inf+infj) 0j (inf+infj) (inf+infj) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+infj) (-0-0j) (inf+infj) (inf+infj) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+infj) (-0+0j) (inf+infj) (inf+infj) (nan+nanj) ZeroDivisionError: complex division by zero
+(inf+infj) 1j (inf+infj) (inf+infj) (nan+nanj) (nan+nanj)
+(inf+infj) (-0-2j) (inf+infj) (inf+infj) (nan+nanj) (nan+nanj)
+(inf+infj) (1+1j) (inf+infj) (inf+infj) (nan+infj) (inf+nanj)
+(inf+infj) (3-4j) (inf+infj) (inf+infj) (inf+nanj) (nan+infj)
+(inf+infj) (inf+0j) (inf+infj) (nan+infj) (nan+nanj) (nan+nanj)
+(inf+infj) infj (inf+infj) (inf+nanj) (nan+nanj) (nan+nanj)
+(inf+infj) (inf+infj) (inf+infj) (nan+nanj) (nan+infj) (nan+nanj)
+(inf+infj) (nan+1j) (nan+infj) (nan+infj) (nan+nanj) (nan+nanj)
+(inf+infj) (1e+300+1e+300j) (inf+infj) (inf+infj) (nan+infj) (inf+nanj)
+(inf+infj) (1e-320+5e-324j) (inf+infj) (inf+infj) (nan+infj) (inf+nanj)
+(nan+1j) 0 (nan+1j) (nan+1j) (nan+nanj) ZeroDivisionError: complex division by zero
+(nan+1j) 1 (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(nan+1j) -3 (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(nan+1j) True (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(nan+1j) False (nan+1j) (nan+1j) (nan+nanj) ZeroDivisionError: complex division by zero
+(nan+1j) 2.5 (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(nan+1j) -0.0 (nan+1j) (nan+1j) (nan+nanj) ZeroDivisionError: complex division by zero
+(nan+1j) 0.0 (nan+1j) (nan+1j) (nan+nanj) ZeroDivisionError: complex division by zero
+(nan+1j) 1e+308 (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(nan+1j) inf (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(nan+1j) -inf (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(nan+1j) nan (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(nan+1j) 0j (nan+1j) (nan+1j) (nan+nanj) ZeroDivisionError: complex division by zero
+(nan+1j) (-0-0j) (nan+1j) (nan+1j) (nan+nanj) ZeroDivisionError: complex division by zero
+(nan+1j) (-0+0j) (nan+1j) (nan+1j) (nan+nanj) ZeroDivisionError: complex division by zero
+(nan+1j) 1j (nan+2j) (nan+0j) (nan+nanj) (nan+nanj)
+(nan+1j) (-0-2j) (nan-1j) (nan+3j) (nan+nanj) (nan+nanj)
+(nan+1j) (1+1j) (nan+2j) (nan+0j) (nan+nanj) (nan+nanj)
+(nan+1j) (3-4j) (nan-3j) (nan+5j) (nan+nanj) (nan+nanj)
+(nan+1j) (inf+0j) (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(nan+1j) infj (nan+infj) (nan-infj) (nan+nanj) (nan+nanj)
+(nan+1j) (inf+infj) (nan+infj) (nan-infj) (nan+nanj) (nan+nanj)
+(nan+1j) (nan+1j) (nan+2j) (nan+0j) (nan+nanj) (nan+nanj)
+(nan+1j) (1e+300+1e+300j) (nan+1e+300j) (nan-1e+300j) (nan+nanj) (nan+nanj)
+(nan+1j) (1e-320+5e-324j) (nan+1j) (nan+1j) (nan+nanj) (nan+nanj)
+(1e+300+1e+300j) 0 (1e+300+1e+300j) (1e+300+1e+300j) 0j ZeroDivisionError: complex division by zero
+(1e+300+1e+300j) 1 (1e+300+1e+300j) (1e+300+1e+300j) (1e+300+1e+300j) (1e+300+1e+300j)
+(1e+300+1e+300j) -3 (1e+300+1e+300j) (1e+300+1e+300j) (-3e+300-3e+300j) (-3.3333333333333335e+299-3.3333333333333335e+299j)
+(1e+300+1e+300j) True (1e+300+1e+300j) (1e+300+1e+300j) (1e+300+1e+300j) (1e+300+1e+300j)
+(1e+300+1e+300j) False (1e+300+1e+300j) (1e+300+1e+300j) 0j ZeroDivisionError: complex division by zero
+(1e+300+1e+300j) 2.5 (1e+300+1e+300j) (1e+300+1e+300j) (2.5e+300+2.5e+300j) (4e+299+4e+299j)
+(1e+300+1e+300j) -0.0 (1e+300+1e+300j) (1e+300+1e+300j) (-0+0j) ZeroDivisionError: complex division by zero
+(1e+300+1e+300j) 0.0 (1e+300+1e+300j) (1e+300+1e+300j) 0j ZeroDivisionError: complex division by zero
+(1e+300+1e+300j) 1e+308 (1.00000001e+308+1e+300j) (-9.9999999e+307+1e+300j) (inf+infj) (1e-08+1e-08j)
+(1e+300+1e+300j) inf (inf+1e+300j) (-inf+1e+300j) (inf+infj) 0j
+(1e+300+1e+300j) -inf (-inf+1e+300j) (inf+1e+300j) (-inf-infj) (-0-0j)
+(1e+300+1e+300j) nan (nan+1e+300j) (nan+1e+300j) (nan+nanj) (nan+nanj)
+(1e+300+1e+300j) 0j (1e+300+1e+300j) (1e+300+1e+300j) 0j ZeroDivisionError: complex division by zero
+(1e+300+1e+300j) (-0-0j) (1e+300+1e+300j) (1e+300+1e+300j) -0j ZeroDivisionError: complex division by zero
+(1e+300+1e+300j) (-0+0j) (1e+300+1e+300j) (1e+300+1e+300j) (-0+0j) ZeroDivisionError: complex division by zero
+(1e+300+1e+300j) 1j (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300+1e+300j) (1e+300-1e+300j)
+(1e+300+1e+300j) (-0-2j) (1e+300+1e+300j) (1e+300+1e+300j) (2e+300-2e+300j) (-5e+299+5e+299j)
+(1e+300+1e+300j) (1+1j) (1e+300+1e+300j) (1e+300+1e+300j) 2e+300j (1e+300+0j)
+(1e+300+1e+300j) (3-4j) (1e+300+1e+300j) (1e+300+1e+300j) (7e+300-1e+300j) (-4.0000000000000003e+298+2.8e+299j)
+(1e+300+1e+300j) (inf+0j) (inf+1e+300j) (-inf+1e+300j) (inf+infj) 0j
+(1e+300+1e+300j) infj (1e+300+infj) (1e+300-infj) (-inf+infj) -0j
+(1e+300+1e+300j) (inf+infj) (inf+infj) (-inf-infj) (nan+infj) (nan+nanj)
+(1e+300+1e+300j) (nan+1j) (nan+1e+300j) (nan+1e+300j) (nan+nanj) (nan+nanj)
+(1e+300+1e+300j) (1e+300+1e+300j) (2e+300+2e+300j) 0j (nan+infj) (1+0j)
+(1e+300+1e+300j) (1e-320+5e-324j) (1e+300+1e+300j) (1e+300+1e+300j) (9.994948015368417e-21+1.0004829328285243e-20j) (inf+infj)
+(1e-320+5e-324j) 0 (1e-320+5e-324j) (1e-320+5e-324j) 0j ZeroDivisionError: complex division by zero
+(1e-320+5e-324j) 1 (1+5e-324j) (-1+5e-324j) (1e-320+5e-324j) (1e-320+5e-324j)
+(1e-320+5e-324j) -3 (-3+5e-324j) (3+5e-324j) (-3e-320-1.5e-323j) (-3.335e-321-0j)
+(1e-320+5e-324j) True (1+5e-324j) (-1+5e-324j) (1e-320+5e-324j) (1e-320+5e-324j)
+(1e-320+5e-324j) False (1e-320+5e-324j) (1e-320+5e-324j) 0j ZeroDivisionError: complex division by zero
+(1e-320+5e-324j) 2.5 (2.5+5e-324j) (-2.5+5e-324j) (2.5e-320+1e-323j) (4e-321+0j)
+(1e-320+5e-324j) -0.0 (1e-320+5e-324j) (1e-320+5e-324j) (-0+0j) ZeroDivisionError: complex division by zero
+(1e-320+5e-324j) 0.0 (1e-320+5e-324j) (1e-320+5e-324j) 0j ZeroDivisionError: complex division by zero
+(1e-320+5e-324j) 1e+308 (1e+308+5e-324j) (-1e+308+5e-324j) (9.99988867182683e-13+4.9406564584124655e-16j) 0j
+(1e-320+5e-324j) inf (inf+5e-324j) (-inf+5e-324j) (inf+infj) 0j
+(1e-320+5e-324j) -inf (-inf+5e-324j) (inf+5e-324j) (-inf-infj) (-0-0j)
+(1e-320+5e-324j) nan (nan+5e-324j) (nan+5e-324j) (nan+nanj) (nan+nanj)
+(1e-320+5e-324j) 0j (1e-320+5e-324j) (1e-320+5e-324j) 0j ZeroDivisionError: complex division by zero
+(1e-320+5e-324j) (-0-0j) (1e-320+5e-324j) (1e-320+5e-324j) -0j ZeroDivisionError: complex division by zero
+(1e-320+5e-324j) (-0+0j) (1e-320+5e-324j) (1e-320+5e-324j) (-0+0j) ZeroDivisionError: complex division by zero
+(1e-320+5e-324j) 1j (1e-320+1j) (1e-320-1j) (-5e-324+1e-320j) (5e-324-1e-320j)
+(1e-320+5e-324j) (-0-2j) (1e-320-2j) (1e-320+2j) (1e-323-2e-320j) (-0+5e-321j)
+(1e-320+5e-324j) (1+1j) (1+1j) (-1-1j) (9.995e-321+1.0005e-320j) (5e-321-5e-321j)
+(1e-320+5e-324j) (3-4j) (3-4j) (-3+4j) (3.002e-320-3.9985e-320j) (1.2e-321+1.6e-321j)
+(1e-320+5e-324j) (inf+0j) (inf+5e-324j) (-inf+5e-324j) (inf+infj) 0j
+(1e-320+5e-324j) infj (1e-320+infj) (1e-320-infj) (-inf+infj) -0j
+(1e-320+5e-324j) (inf+infj) (inf+infj) (-inf-infj) (nan+infj) (nan+nanj)
+(1e-320+5e-324j) (nan+1j) (nan+1j) (nan-1j) (nan+nanj) (nan+nanj)
+(1e-320+5e-324j) (1e+300+1e+300j) (1e+300+1e+300j) (-1e+300-1e+300j) (9.994948015368417e-21+1.0004829328285243e-20j) -0j
+(1e-320+5e-324j) (1e-320+5e-324j) (2e-320+1e-323j) 0j 0j (1+0j)
+-- powers
+0j ** 0 (1+0j)
+0j ** 1 0j
+0j ** 2 0j
+0j ** 3 0j
+0j ** -1 ZeroDivisionError: 0.0 to a negative or complex power
+0j ** -2 ZeroDivisionError: 0.0 to a negative or complex power
+0j ** 10 0j
+0j ** 100 0j
+0j ** 101 0j
+0j ** -100 ZeroDivisionError: 0.0 to a negative or complex power
+0j ** 0.5 0j
+0j ** -0.5 ZeroDivisionError: 0.0 to a negative or complex power
+0j ** 1j ZeroDivisionError: 0.0 to a negative or complex power
+0j ** (-0-1j) ZeroDivisionError: 0.0 to a negative or complex power
+0j ** (2+1j) ZeroDivisionError: 0.0 to a negative or complex power
+0j ** 0j (1+0j)
+0j ** 1.0 0j
+0j ** 2.0 0j
+0j ** 100.0 0j
+0j ** 1e+20 0j
+0j ** (2+0j) 0j
+0j ** (2-0j) 0j
+0j ** (inf+0j) 0j
+0j ** (nan+0j) 0j
+(-0-0j) ** 0 (1+0j)
+(-0-0j) ** 1 -0j
+(-0-0j) ** 2 0j
+(-0-0j) ** 3 0j
+(-0-0j) ** -1 ZeroDivisionError: 0.0 to a negative or complex power
+(-0-0j) ** -2 ZeroDivisionError: 0.0 to a negative or complex power
+(-0-0j) ** 10 0j
+(-0-0j) ** 100 0j
+(-0-0j) ** 101 0j
+(-0-0j) ** -100 ZeroDivisionError: 0.0 to a negative or complex power
+(-0-0j) ** 0.5 0j
+(-0-0j) ** -0.5 ZeroDivisionError: 0.0 to a negative or complex power
+(-0-0j) ** 1j ZeroDivisionError: 0.0 to a negative or complex power
+(-0-0j) ** (-0-1j) ZeroDivisionError: 0.0 to a negative or complex power
+(-0-0j) ** (2+1j) ZeroDivisionError: 0.0 to a negative or complex power
+(-0-0j) ** 0j (1+0j)
+(-0-0j) ** 1.0 -0j
+(-0-0j) ** 2.0 0j
+(-0-0j) ** 100.0 0j
+(-0-0j) ** 1e+20 0j
+(-0-0j) ** (2+0j) 0j
+(-0-0j) ** (2-0j) 0j
+(-0-0j) ** (inf+0j) 0j
+(-0-0j) ** (nan+0j) 0j
+1j ** 0 (1+0j)
+1j ** 1 1j
+1j ** 2 (-1+0j)
+1j ** 3 (-0-1j)
+1j ** -1 -1j
+1j ** -2 (-1-0j)
+1j ** 10 (-1+0j)
+1j ** 100 (1+0j)
+1j ** 101 (4.408109496293883e-15+1j)
+1j ** -100 (1+0j)
+1j ** 0.5 (0.7071067811865476+0.7071067811865476j)
+1j ** -0.5 (0.7071067811865476-0.7071067811865476j)
+1j ** 1j (0.20787957635076193+0j)
+1j ** (-0-1j) (4.810477380965351-0j)
+1j ** (2+1j) (-0.20787957635076193+2.545790577860684e-17j)
+1j ** 0j (1+0j)
+1j ** 1.0 1j
+1j ** 2.0 (-1+0j)
+1j ** 100.0 (1+0j)
+1j ** 1e+20 (-0.9795611306275517+0.2011466911576539j)
+1j ** (2+0j) (-1+0j)
+1j ** (2-0j) (-1+0j)
+1j ** (inf+0j) ZeroDivisionError: 0.0 to a negative or complex power
+1j ** (nan+0j) (nan+nanj)
+(-0-1j) ** 0 (1+0j)
+(-0-1j) ** 1 -1j
+(-0-1j) ** 2 (-1+0j)
+(-0-1j) ** 3 1j
+(-0-1j) ** -1 (-0+1j)
+(-0-1j) ** -2 (-1-0j)
+(-0-1j) ** 10 (-1+0j)
+(-0-1j) ** 100 (1+0j)
+(-0-1j) ** 101 (4.408109496293883e-15-1j)
+(-0-1j) ** -100 (1+0j)
+(-0-1j) ** 0.5 (0.7071067811865476-0.7071067811865476j)
+(-0-1j) ** -0.5 (0.7071067811865476+0.7071067811865476j)
+(-0-1j) ** 1j (4.810477380965351+0j)
+(-0-1j) ** (-0-1j) (0.20787957635076193+0j)
+(-0-1j) ** (2+1j) (-4.810477380965351-5.89113572696996e-16j)
+(-0-1j) ** 0j (1+0j)
+(-0-1j) ** 1.0 -1j
+(-0-1j) ** 2.0 (-1+0j)
+(-0-1j) ** 100.0 (1+0j)
+(-0-1j) ** 1e+20 (-0.9795611306275517-0.2011466911576539j)
+(-0-1j) ** (2+0j) (-1+0j)
+(-0-1j) ** (2-0j) (-1+0j)
+(-0-1j) ** (inf+0j) ZeroDivisionError: 0.0 to a negative or complex power
+(-0-1j) ** (nan+0j) (nan+nanj)
+(1+1j) ** 0 (1+0j)
+(1+1j) ** 1 (1+1j)
+(1+1j) ** 2 2j
+(1+1j) ** 3 (-2+2j)
+(1+1j) ** -1 (0.5-0.5j)
+(1+1j) ** -2 -0.5j
+(1+1j) ** 10 32j
+(1+1j) ** 100 (-1125899906842624+0j)
+(1+1j) ** 101 (-1125899906842634.5-1125899906842629.5j)
+(1+1j) ** -100 (-8.881784197001252e-16-0j)
+(1+1j) ** 0.5 (1.0986841134678098+0.45508986056222733j)
+(1+1j) ** -0.5 (0.7768869870150186-0.3217971264527913j)
+(1+1j) ** 1j (0.4288290062943678+0.15487175246424678j)
+(1+1j) ** (-0-1j) (2.0628722350809046-0.745007062179724j)
+(1+1j) ** (2+1j) (-0.3097435049284936+0.8576580125887359j)
+(1+1j) ** 0j (1+0j)
+(1+1j) ** 1.0 (1+1j)
+(1+1j) ** 2.0 2j
+(1+1j) ** 100.0 (-1125899906842624+0j)
+(1+1j) ** 1e+20 OverflowError: complex exponentiation
+(1+1j) ** (2+0j) 2j
+(1+1j) ** (2-0j) 2j
+(1+1j) ** (inf+0j) ZeroDivisionError: 0.0 to a negative or complex power
+(1+1j) ** (nan+0j) (nan+nanj)
+(2-3j) ** 0 (1+0j)
+(2-3j) ** 1 (2-3j)
+(2-3j) ** 2 (-5-12j)
+(2-3j) ** 3 (-46-9j)
+(2-3j) ** -1 (0.15384615384615385+0.23076923076923078j)
+(2-3j) ** -2 (-0.029585798816568046+0.07100591715976332j)
+(2-3j) ** 10 (-341525+145668j)
+(2-3j) ** 100 (-3.1340261677532145e+55+3.8692675133024646e+55j)
+(2-3j) ** 101 (5.339750204400842e+55+1.7140613529864519e+56j)
+(2-3j) ** -100 (-1.264059123710859e-56-1.5606069127924218e-56j)
+(2-3j) ** 0.5 (1.6741492280355401-0.895977476129838j)
+(2-3j) ** -0.5 (0.46432545265081504+0.24849944091130338j)
+(2-3j) ** 1j (0.7597404963163099+2.5616204986595768j)
+(2-3j) ** (-0-1j) (0.10641956869062098-0.3588153454214566j)
+(2-3j) ** (2+1j) (26.940743502333373-21.9249884490936j)
+(2-3j) ** 0j (1+0j)
+(2-3j) ** 1.0 (2-3j)
+(2-3j) ** 2.0 (-5-12j)
+(2-3j) ** 100.0 (-3.1340261677532145e+55+3.8692675133024646e+55j)
+(2-3j) ** 1e+20 OverflowError: complex exponentiation
+(2-3j) ** (2+0j) (-5-12j)
+(2-3j) ** (2-0j) (-5-12j)
+(2-3j) ** (inf+0j) ZeroDivisionError: 0.0 to a negative or complex power
+(2-3j) ** (nan+0j) (nan+nanj)
+(0.5+0.5j) ** 0 (1+0j)
+(0.5+0.5j) ** 1 (0.5+0.5j)
+(0.5+0.5j) ** 2 0.5j
+(0.5+0.5j) ** 3 (-0.25+0.25j)
+(0.5+0.5j) ** -1 (1-1j)
+(0.5+0.5j) ** -2 -2j
+(0.5+0.5j) ** 10 0.03125j
+(0.5+0.5j) ** 100 (-8.881784197001252e-16+0j)
+(0.5+0.5j) ** 101 (-4.440892098500668e-16-4.440892098500648e-16j)
+(0.5+0.5j) ** -100 (-1125899906842624-0j)
+(0.5+0.5j) ** 0.5 (0.7768869870150187+0.32179712645279135j)
+(0.5+0.5j) ** -0.5 (1.0986841134678098-0.45508986056222733j)
+(0.5+0.5j) ** 1j (0.4288290062943678-0.15487175246424675j)
+(0.5+0.5j) ** (-0-1j) (2.0628722350809046+0.7450070621797239j)
+(0.5+0.5j) ** (2+1j) (0.07743587623212343+0.21441450314718397j)
+(0.5+0.5j) ** 0j (1+0j)
+(0.5+0.5j) ** 1.0 (0.5+0.5j)
+(0.5+0.5j) ** 2.0 0.5j
+(0.5+0.5j) ** 100.0 (-8.881784197001252e-16+0j)
+(0.5+0.5j) ** 1e+20 (-0-0j)
+(0.5+0.5j) ** (2+0j) 0.5j
+(0.5+0.5j) ** (2-0j) 0.5j
+(0.5+0.5j) ** (inf+0j) ZeroDivisionError: 0.0 to a negative or complex power
+(0.5+0.5j) ** (nan+0j) (nan+nanj)
+(-2+0j) ** 0 (1+0j)
+(-2+0j) ** 1 (-2+0j)
+(-2+0j) ** 2 (4+0j)
+(-2+0j) ** 3 (-8+0j)
+(-2+0j) ** -1 (-0.5-0j)
+(-2+0j) ** -2 (0.25+0j)
+(-2+0j) ** 10 (1024+0j)
+(-2+0j) ** 100 (1.2676506002282294e+30+0j)
+(-2+0j) ** 101 (-2.535301200456459e+30+2.2351770595394796e+16j)
+(-2+0j) ** -100 (7.888609052210118e-31+0j)
+(-2+0j) ** 0.5 (8.659560562354934e-17+1.4142135623730951j)
+(-2+0j) ** -0.5 (4.329780281177467e-17-0.7071067811865476j)
+(-2+0j) ** 1j (0.03324182700885666+0.027612020368333014j)
+(-2+0j) ** (-0-1j) (17.800720977640488-14.786006499422164j)
+(-2+0j) ** (2+1j) (0.13296730803542667+0.11044808147333203j)
+(-2+0j) ** 0j (1+0j)
+(-2+0j) ** 1.0 (-2+0j)
+(-2+0j) ** 2.0 (4+0j)
+(-2+0j) ** 100.0 (1.2676506002282294e+30+0j)
+(-2+0j) ** 1e+20 OverflowError: complex exponentiation
+(-2+0j) ** (2+0j) (4+0j)
+(-2+0j) ** (2-0j) (4+0j)
+(-2+0j) ** (inf+0j) ZeroDivisionError: 0.0 to a negative or complex power
+(-2+0j) ** (nan+0j) (nan+nanj)
+(1e+200+1e+200j) ** 0 (1+0j)
+(1e+200+1e+200j) ** 1 (1e+200+1e+200j)
+(1e+200+1e+200j) ** 2 (nan+nanj)
+(1e+200+1e+200j) ** 3 (nan+nanj)
+(1e+200+1e+200j) ** -1 (5e-201-5e-201j)
+(1e+200+1e+200j) ** -2 (nan+nanj)
+(1e+200+1e+200j) ** 10 (nan+nanj)
+(1e+200+1e+200j) ** 100 (nan+nanj)
+(1e+200+1e+200j) ** 101 OverflowError: complex exponentiation
+(1e+200+1e+200j) ** -100 (nan+nanj)
+(1e+200+1e+200j) ** 0.5 (1.09868411346781e+100+4.550898605622274e+99j)
+(1e+200+1e+200j) ** -0.5 (7.768869870150186e-101-3.217971264527913e-101j)
+(1e+200+1e+200j) ** 1j (-0.26501568527917657+0.37100709279846705j)
+(1e+200+1e+200j) ** (-0-1j) (-1.2748519596365109-1.7847212280847389j)
+(1e+200+1e+200j) ** (2+1j) OverflowError: complex exponentiation
+(1e+200+1e+200j) ** 0j (1+0j)
+(1e+200+1e+200j) ** 1.0 (1e+200+1e+200j)
+(1e+200+1e+200j) ** 2.0 (nan+nanj)
+(1e+200+1e+200j) ** 100.0 (nan+nanj)
+(1e+200+1e+200j) ** 1e+20 OverflowError: complex exponentiation
+(1e+200+1e+200j) ** (2+0j) (nan+nanj)
+(1e+200+1e+200j) ** (2-0j) (nan+nanj)
+(1e+200+1e+200j) ** (inf+0j) ZeroDivisionError: 0.0 to a negative or complex power
+(1e+200+1e+200j) ** (nan+0j) (nan+nanj)
+(inf+0j) ** 0 (1+0j)
+(inf+0j) ** 1 OverflowError: complex exponentiation
+(inf+0j) ** 2 (nan+nanj)
+(inf+0j) ** 3 (nan+nanj)
+(inf+0j) ** -1 (nan+nanj)
+(inf+0j) ** -2 (nan+nanj)
+(inf+0j) ** 10 (nan+nanj)
+(inf+0j) ** 100 (nan+nanj)
+(inf+0j) ** 101 OverflowError: complex exponentiation
+(inf+0j) ** -100 (nan+nanj)
+(inf+0j) ** 0.5 OverflowError: complex exponentiation
+(inf+0j) ** -0.5 -0j
+(inf+0j) ** 1j ZeroDivisionError: 0.0 to a negative or complex power
+(inf+0j) ** (-0-1j) ZeroDivisionError: 0.0 to a negative or complex power
+(inf+0j) ** (2+1j) ZeroDivisionError: 0.0 to a negative or complex power
+(inf+0j) ** 0j (1+0j)
+(inf+0j) ** 1.0 OverflowError: complex exponentiation
+(inf+0j) ** 2.0 (nan+nanj)
+(inf+0j) ** 100.0 (nan+nanj)
+(inf+0j) ** 1e+20 OverflowError: complex exponentiation
+(inf+0j) ** (2+0j) (nan+nanj)
+(inf+0j) ** (2-0j) (nan+nanj)
+(inf+0j) ** (inf+0j) (nan+nanj)
+(inf+0j) ** (nan+0j) (nan+nanj)
+(nan+0j) ** 0 (1+0j)
+(nan+0j) ** 1 (nan+nanj)
+(nan+0j) ** 2 (nan+nanj)
+(nan+0j) ** 3 (nan+nanj)
+(nan+0j) ** -1 (nan+nanj)
+(nan+0j) ** -2 (nan+nanj)
+(nan+0j) ** 10 (nan+nanj)
+(nan+0j) ** 100 (nan+nanj)
+(nan+0j) ** 101 (nan+nanj)
+(nan+0j) ** -100 (nan+nanj)
+(nan+0j) ** 0.5 (nan+nanj)
+(nan+0j) ** -0.5 (nan+nanj)
+(nan+0j) ** 1j (nan+nanj)
+(nan+0j) ** (-0-1j) (nan+nanj)
+(nan+0j) ** (2+1j) (nan+nanj)
+(nan+0j) ** 0j (1+0j)
+(nan+0j) ** 1.0 (nan+nanj)
+(nan+0j) ** 2.0 (nan+nanj)
+(nan+0j) ** 100.0 (nan+nanj)
+(nan+0j) ** 1e+20 (nan+nanj)
+(nan+0j) ** (2+0j) (nan+nanj)
+(nan+0j) ** (2-0j) (nan+nanj)
+(nan+0j) ** (inf+0j) (nan+nanj)
+(nan+0j) ** (nan+0j) (nan+nanj)
+2 ** 1j (0.7692389013639721+0.6389612763136348j)
+2 ** (-0-1j) (0.7692389013639721-0.6389612763136348j)
+2 ** (2+1j) (3.0769556054558884+2.555845105254539j)
+2 ** 0j (1+0j)
+2 ** (2+0j) (4+0j)
+2 ** (2-0j) (4+0j)
+2 ** (inf+0j) (nan+nanj)
+2 ** (nan+0j) (nan+nanj)
+-2 ** 1j (0.03324182700885666+0.027612020368333014j)
+-2 ** (-0-1j) (17.800720977640488-14.786006499422164j)
+-2 ** (2+1j) (0.13296730803542667+0.11044808147333203j)
+-2 ** 0j (1+0j)
+-2 ** (2+0j) (4+0j)
+-2 ** (2-0j) (4+0j)
+-2 ** (inf+0j) ZeroDivisionError: 0.0 to a negative or complex power
+-2 ** (nan+0j) (nan+nanj)
+0 ** 1j ZeroDivisionError: 0.0 to a negative or complex power
+0 ** (-0-1j) ZeroDivisionError: 0.0 to a negative or complex power
+0 ** (2+1j) ZeroDivisionError: 0.0 to a negative or complex power
+0 ** 0j (1+0j)
+0 ** (2+0j) 0j
+0 ** (2-0j) 0j
+0 ** (inf+0j) 0j
+0 ** (nan+0j) 0j
+2.5 ** 1j (0.6087670819712999+0.793349002588488j)
+2.5 ** (-0-1j) (0.6087670819712999-0.793349002588488j)
+2.5 ** (2+1j) (3.8047942623206246+4.958431266178049j)
+2.5 ** 0j (1+0j)
+2.5 ** (2+0j) (6.25+0j)
+2.5 ** (2-0j) (6.25+0j)
+2.5 ** (inf+0j) (nan+nanj)
+2.5 ** (nan+0j) (nan+nanj)
+0.0 ** 1j ZeroDivisionError: 0.0 to a negative or complex power
+0.0 ** (-0-1j) ZeroDivisionError: 0.0 to a negative or complex power
+0.0 ** (2+1j) ZeroDivisionError: 0.0 to a negative or complex power
+0.0 ** 0j (1+0j)
+0.0 ** (2+0j) 0j
+0.0 ** (2-0j) 0j
+0.0 ** (inf+0j) 0j
+0.0 ** (nan+0j) 0j
+(-1+0j) ValueError: complex modulo ValueError: complex modulo ValueError: complex modulo (-1+0j)
+33554432j -2.9802322387695312e-08j OverflowError: complex exponentiation OverflowError: complex exponentiation
+-- mixed and in-place
+(3+3j)
+(3+2j)
+(6+4j)
+(1.5+1j)
+(1.25+3j)
+(2.25+3j) complex
+(5+2j)
+1.5j
+(1+8j) (5+0j) (-4+0j) (6.123233995736766e-17+1j) (-1+0j) (0.5+0.5j) (5-5j) (inf+infj)
+(1+1j) 0j (-1+1j) (0.7692389013639721+0.6389612763136348j) 1j (0.38461945068198605-0.3194806381568174j) (1.0000000000000002+1.7320508075688772j)
+1e+20j 1.152921504606847e+18j (9007199254740992+0j) 9.999999999999999e-31j
+-- unary and abs
+0j (-0-0j) 0j 0.0 TypeError: bad operand type for unary ~: 'complex' True
+(-0-0j) 0j (-0-0j) 0.0 TypeError: bad operand type for unary ~: 'complex' True
+(1+2j) (-1-2j) (1+2j) 2.23606797749979 TypeError: bad operand type for unary ~: 'complex' True
+(-0+0j) -0j (-0+0j) 0.0 TypeError: bad operand type for unary ~: 'complex' True
+(inf+nanj) (-inf+nanj) (inf+nanj) inf TypeError: bad operand type for unary ~: 'complex' False
+(nan-infj) (nan+infj) (nan-infj) inf TypeError: bad operand type for unary ~: 'complex' False
+(nan+2j) (nan-2j) (nan+2j) nan TypeError: bad operand type for unary ~: 'complex' False
+(3-4j) (-3+4j) (3-4j) 5.0 TypeError: bad operand type for unary ~: 'complex' True
+(1e+308+1e+308j) (-1e+308-1e+308j) (1e+308+1e+308j) 1.4142135623730951e+308 TypeError: bad operand type for unary ~: 'complex' True
+(5e-324+5e-324j) (-5e-324-5e-324j) (5e-324+5e-324j) 5e-324 TypeError: bad operand type for unary ~: 'complex' True
+(-1.5+2.5j) (1.5-2.5j) (-1.5+2.5j) 2.9154759474226504 TypeError: bad operand type for unary ~: 'complex' True
+-- refused operations
+TypeError: unsupported operand type(s) for //: 'complex' and 'int'
+TypeError: unsupported operand type(s) for //: 'int' and 'complex'
+TypeError: unsupported operand type(s) for %: 'complex' and 'int'
+TypeError: unsupported operand type(s) for %: 'float' and 'complex'
+TypeError: unsupported operand type(s) for divmod(): 'complex' and 'int'
+TypeError: unsupported operand type(s) for divmod(): 'int' and 'complex'
+TypeError: unsupported operand type(s) for divmod(): 'complex' and 'complex'
+TypeError: unsupported operand type(s) for &: 'complex' and 'int'
+TypeError: unsupported operand type(s) for |: 'int' and 'complex'
+TypeError: unsupported operand type(s) for ^: 'complex' and 'complex'
+TypeError: unsupported operand type(s) for <<: 'complex' and 'int'
+TypeError: unsupported operand type(s) for >>: 'int' and 'complex'
+TypeError: type complex doesn't define __round__ method
+TypeError: type complex doesn't define __round__ method
+TypeError: int() argument must be a string, a bytes-like object or a real number, not 'complex'
+TypeError: float() argument must be a string or a real number, not 'complex'
+TypeError: must be real number, not complex
+TypeError: must be real number, not complex
+TypeError: must be real number, not complex
+TypeError: must be real number, not complex
+TypeError: must be real number, not complex
+TypeError: unsupported operand type(s) for +: 'complex' and 'str'
+TypeError: can only concatenate str (not "complex") to str
+TypeError: can't multiply sequence by non-int of type 'complex'
+TypeError: can't multiply sequence by non-int of type 'complex'
+TypeError: can't multiply sequence by non-int of type 'complex'
+TypeError: unsupported operand type(s) for +: 'complex' and 'NoneType'
+TypeError: unsupported operand type(s) for @: 'complex' and 'complex'
+TypeError: '<' not supported between instances of 'complex' and 'int'
+OverflowError: int too large to convert to float
+OverflowError: int too large to convert to float
+ZeroDivisionError: complex division by zero
+ZeroDivisionError: complex division by zero
+ZeroDivisionError: complex division by zero
+ZeroDivisionError: complex division by zero
+ZeroDivisionError: 0.0 to a negative or complex power
+ZeroDivisionError: 0.0 to a negative or complex power
+ZeroDivisionError: 0.0 to a negative or complex power
+ZeroDivisionError: 0.0 to a negative or complex power
+ZeroDivisionError: 0.0 to a negative or complex power
+unsupported operand type(s) for //=: 'complex' and 'int'
+unsupported operand type(s) for %=: 'complex' and 'int'
+-- sum, math.prod, sorted keys
+(5.5+1j) 0.9999999999999999j (1.5+2j) 0j 2j (-0+0j)
+1j (1+1j) (-2+0j) (-2+2j)
+[(1-1j), 2, (3+1j)] -3 1j
+(4950-4950j) [(-1+0j), 2j, (3-4j)] [(1+0j), (2.5+0j), 3j]
