@@ -179,6 +179,12 @@ of a project:
   a module up to 1 MiB, and up to 256 modules are importable. The walk stops
   after 20,000 entries. Files and folders that are over the limits or
   cannot be read are left out with a note on stderr, not an error.
+- **Execution.** `zipp py` runs with the native JIT on (unless `ZIPP_NOJIT`
+  is set), which mostly speeds up the runtime's tensor kernels: a 128x128
+  float32 matmul takes about a quarter of the interpreter's time. Embedders
+  get an interpreted Python state by default, since the JIT meters an
+  instruction budget differently; `ScriptState::enable_vm_jit` turns it on
+  for a state that runs without one.
 - **Output.** Console lines are written as the program produces them, with
   stdout and stderr in the order written.
 - **Standard input.** `zipp --lang=python -` has no project folder; its
