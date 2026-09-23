@@ -424,5 +424,130 @@ def dispose():
     adapter.invalidate(); runtime.dispose(); e.dispose();
     console.log(`${backend}: a prepared dropout session draws a fresh device mask per step, equal to zipp_gpu's reference, and its gradient carries it`);
   }
+
+  // ---- protocol version 4: selection, and CPU random draws fed per prepared step ----
+  // fixtures/torch_gpu3/selection.py against PyTorch 2.11 as chained compiled
+  // calls and as a hosted prepared session (the transformer case feeds its
+  // token argument to an embedding lookup every step), then a hosted prepared
+  // step with CPU randn/randint draws: each queued step is fed its own fresh
+  // draw from torch's generator, equal to the same eager steps' draws.
+  const selectionSource = await fs.readFile(path.join(root, 'crates/zipp-vm/tests/fixtures/torch_gpu3/selection.py'), 'utf8');
+  const selectionExpected = JSON.parse(await fs.readFile(path.join(root, 'crates/zipp-vm/tests/fixtures/torch_gpu3/selection_expected.json')));
+  for (const backend of ['cpu-js', 'wasm']) {
+    for (const kase of ['transformer', 'gather', 'cat', 'strided', 'params']) {
+      const expected = selectionExpected[kase];
+      const e = new Engine();
+      e.initPythonProject({main: `case = ${JSON.stringify(kase)}\n` + selectionSource + `
+import json
+compiled = torch.compile(train_step, training=True)
+initial = [p.detach().clone() for p in params]
+def chained(index):
+    compiled(*batches[index]).submit(lambda loss: print(json.dumps(state(loss))), lambda error: print('FAILED', str(error)))
+prepared = None
+losses = []
+def prepare():
+    global prepared
+    for p, value in zip(params, initial):
+        p.data = value.clone()
+        p.grad = None
+    optimizer.state.clear()
+    prepared = compiled.prepare(*batches[0], on_ready=lambda p: print('ready', p.backend), on_error=lambda error: print('FAILED', str(error)))
+def run():
+    prepared.step(lambda loss: losses.append(loss.item()), *batches[0])
+    prepared.steps(lambda results: losses.extend(r.item() for r in results), batches[1:])
+def sync():
+    # After the steps have come back: a sync with nothing executed yet calls back at once.
+    prepared.sync(lambda p: print(json.dumps(state(torch.tensor(losses[-1])))), on_error=lambda error: print('FAILED', str(error)))
+def dispose():
+    prepared.dispose()
+`}, 'main');
+      const runtime = await createRuntime({backend, wasmBytes});
+      const adapter = createPythonGPUAdapter(e, runtime, {allowExecute: true});
+      const settle = async () => {
+        for (let i = 0; i < 16; i++) {
+          adapter.drain(); await adapter.idle();
+          if (adapter.pending === 0 && e.pythonCall('__zipp_py_pending_host', []) === 0) return;
+        }
+        throw new Error('host requests did not settle');
+      };
+      let worst = 0;
+      const deviation = (actual, want) => { assert.equal(actual.length, want.length); actual.forEach((v, i) => { worst = Math.max(worst, Math.abs(v - want[i]) / (1 + Math.abs(want[i]))); }); };
+      const chainedStates = [];
+      for (let index = 0; index < expected.length; index++) {
+        e.pythonCall('chained', [index]); await settle();
+        const [line] = e.takeOutput();
+        chainedStates.push(JSON.parse(line));
+        deviation(chainedStates[index], expected[index]);
+      }
+      e.pythonCall('prepare', []); await settle();
+      assert.deepEqual(e.takeOutput(), [`ready ${backend}`]);
+      e.pythonCall('run', []); await settle();
+      e.pythonCall('sync', []); await settle();
+      const [final] = e.takeOutput().map(line => JSON.parse(line));
+      deviation(final, expected[expected.length - 1]);
+      assert.deepEqual(final, chainedStates[chainedStates.length - 1], `${backend} ${kase}: the hosted session equals chained calls bit for bit`);
+      e.pythonCall('dispose', []); await settle();
+      assert.ok(worst < 1e-6, `${backend} ${kase}: deviates from PyTorch by ${worst}`);
+      adapter.invalidate(); runtime.dispose(); e.dispose();
+      console.log(`${backend} ${kase}: ${expected.length} version-4 steps, chained and as a hosted prepared session, track PyTorch (max relative error ${worst.toExponential(2)})`);
+    }
+    const e = new Engine();
+    e.initPythonProject({main: `import torch
+from torch import nn
+import torch.nn.functional as F
+def build():
+    torch.manual_seed(4)
+    enc = nn.Linear(4, 5)
+    emb = nn.Embedding(9, 5)
+    optimizer = torch.optim.SGD(list(enc.parameters()) + list(emb.parameters()), lr=0.1)
+    def step(x, y):
+        optimizer.zero_grad()
+        noisy = x + 0.2 * torch.randn(3, 4)
+        neg = torch.randint(0, 9, (3,))
+        h = enc(noisy)
+        loss = F.cross_entropy(h, y) + (h * emb(neg)).sum() * 0.01
+        loss.backward()
+        optimizer.step()
+        return noisy + torch.arange(9.0).index_select(0, neg).sum() * 1000.0
+    return step
+torch.manual_seed(7)
+xs = [torch.randn(3, 4) for _ in range(4)]
+ys = [torch.tensor([0, 4, 2]), torch.tensor([1, 1, 3]), torch.tensor([4, 0, 0]), torch.tensor([2, 3, 1])]
+step = build()
+torch.manual_seed(50)
+eager = [step(xs[i], ys[i]) for i in range(4)]
+after_eager = torch.rand(1).item()
+prepared = None
+got = []
+def prepare():
+    global prepared
+    step = build()
+    torch.manual_seed(50)
+    prepared = torch.compile(step, training=True).prepare(xs[0], ys[0], on_ready=lambda p: print('ready', p.backend), on_error=lambda error: print('FAILED', str(error)))
+def run():
+    # One step, then three queued in one call: each is drawn when it is posted.
+    prepared.step(got.append, xs[0], ys[0])
+    prepared.steps(got.extend, [(xs[i], ys[i]) for i in range(1, 4)])
+    print('stream', torch.rand(1).item() == after_eager)
+def report():
+    print('draws', len(got), all(torch.equal(a, b) for a, b in zip(got, eager)), len(set(tuple(g.flatten().tolist()) for g in got)))
+    prepared.dispose()
+`}, 'main');
+    const runtime = await createRuntime({backend, wasmBytes});
+    const adapter = createPythonGPUAdapter(e, runtime, {allowExecute: true});
+    const settle = async () => {
+      for (let i = 0; i < 16; i++) {
+        adapter.drain(); await adapter.idle();
+        if (adapter.pending === 0 && e.pythonCall('__zipp_py_pending_host', []) === 0) return;
+      }
+      throw new Error('host requests did not settle');
+    };
+    e.pythonCall('prepare', []); await settle();
+    e.pythonCall('run', []); await settle();
+    e.pythonCall('report', []); await settle();
+    assert.deepEqual(e.takeOutput(), [`ready ${backend}`, 'stream True', 'draws 4 True 4']);
+    adapter.invalidate(); runtime.dispose(); e.dispose();
+    console.log(`${backend}: a hosted prepared step feeds every queued step its own CPU randn/randint draw, equal to the eager steps' draws`);
+  }
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

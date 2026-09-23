@@ -17,15 +17,19 @@ export function builder() {
     full: (shape, value) => add('full', {shape, value}),
     op: (op, a, b, fields = {}) => add(op, b === undefined ? {a, ...fields} : {a, b, ...fields}),
     node: (op, fields) => add(op, fields),
-    // Labelled 3 once a version-3 operation is used, as zipp_gpu labels it.
-    program: outputs => ({version: nodes.some(n => V3.has(n.op)) ? 3 : 2, nodes,
+    // Labelled 3 once a version-3 operation is used and 4 once a version-4
+    // one is, as zipp_gpu labels it.
+    program: outputs => ({version: nodes.some(n => V4.has(n.op)) ? 4 : nodes.some(n => V3.has(n.op)) ? 3 : 2, nodes,
       outputs: Object.entries(outputs).map(([name, id]) => ({name, id}))}),
   };
 }
 const UNARY = ['relu', 'positive', 'neg', 'exp', 'log', 'sqrt', 'tanh', 'sigmoid', 'gelu', 'gelu_grad'];
 const V3 = new Set(['maximum', 'minimum', 'eq', 'ne', 'lt', 'le', 'gt', 'ge', 'where', 'uniform']);
+const V4 = new Set(['slice', 'slice_scatter', 'index_select', 'index_add', 'gather', 'scatter_add']);
 /** Values on a coarse grid, so comparisons and maximum/minimum meet real ties. */
 const grid = (rnd, n) => Array.from({length: n}, () => Math.round(rnd(-2, 2) * 2) / 2);
+/** Arbitrary float32 values with some signed zeros, which a selection must keep. */
+const signedGrid = (rnd, n) => Array.from({length: n}, (_, i) => i % 11 === 3 ? -0 : i % 13 === 5 ? 0 : Math.fround(rnd(-3, 3)));
 /** [name, program] pairs; each program's outputs are compared element by element. */
 export function opCases() {
   const cases = [], rnd = seeded(97);
@@ -105,6 +109,45 @@ export function opCases() {
       ge: g.op('ge', one, nan), pickNan: g.node('where', {c: nan, a: one, b: pz}), pickNegZero: g.node('where', {c: nz, a: one, b: pz}),
       maxZeros: g.op('maximum', nz, pz), maxZerosRight: g.op('maximum', pz, nz), minZeros: g.op('minimum', pz, nz),
       minZerosLeft: g.op('minimum', nz, pz), zeroLt: g.op('lt', nz, pz), zeroGt: g.op('gt', pz, nz), zeroEq: g.op('eq', nz, pz)};
+  });
+  // Version 4: selection and its gradients. Every case is `exact ...`: values
+  // move without arithmetic, and the two accumulations add in the order the
+  // protocol fixes, so each backend must give cpu-js's bits, signed zeros too.
+  for (const [shape, begin, stride, box] of [[[9], [2], [3], [3]], [[9], [8], [-2], [5]], [[5, 7], [1, 6], [2, -1], [2, 7]],
+    [[4, 3, 6], [3, 0, 1], [-1, 1, 2], [4, 3, 3]], [[2, 3, 4, 5], [1, 2, 0, 4], [-1, -1, 3, -2], [2, 3, 2, 3]], [[3, 1025], [0, 1], [1, 4], [3, 256]]])
+    one(`exact slice [${shape}] from [${begin}] by [${stride}]`, g => {
+      const a = g.input(signedGrid(rnd, shape.reduce((x, y) => x * y, 1)), shape);
+      const s = g.node('slice', {a, begin, stride, shape: box});
+      const grad = g.input(signedGrid(rnd, box.reduce((x, y) => x * y, 1)), box);
+      return {slice: s, scatter: g.node('slice_scatter', {a: g.full(shape, 0), b: grad, begin, stride}),
+        over: g.node('slice_scatter', {a, b: grad, begin, stride})};
+    });
+  for (const [shape, axis, index] of [[[6], 0, [5, 0, 5, 2]], [[7, 5], 0, [3, 3, 0, 6, 1, 3]], [[4, 9], 1, [8, 0, 0, 4]],
+    [[2, 5, 3], 1, [4, 4, 4, 1, 0, 2, 4]], [[3, 2, 4, 5], 3, [0, 4, 2]], [[65, 33], 0, Array.from({length: 130}, (_, i) => (i * 7) % 65)]])
+    one(`exact index_select/index_add [${shape}] axis ${axis}`, g => {
+      const a = g.input(signedGrid(rnd, shape.reduce((x, y) => x * y, 1)), shape), idx = g.input(index);
+      const box = shape.map((d, i) => i === axis ? index.length : d);
+      const src = g.input(signedGrid(rnd, box.reduce((x, y) => x * y, 1)), box);
+      return {select: g.node('index_select', {a, b: idx, axis}), grad: g.node('index_add', {a: g.full(shape, 0), b: src, c: idx, axis}),
+        onto: g.node('index_add', {a, b: src, c: idx, axis})};
+    });
+  for (const [shape, axis, ishape] of [[[6], 0, [9]], [[4, 5], 1, [4, 7]], [[4, 5], 0, [6, 3]], [[3, 4, 5], 2, [2, 4, 8]],
+    [[2, 3, 4, 5], 1, [2, 5, 3, 5]], [[40, 30], 0, [70, 30]]])
+    one(`exact gather/scatter_add [${shape}] axis ${axis} index [${ishape}]`, g => {
+      const size = s => s.reduce((x, y) => x * y, 1), a = g.input(signedGrid(rnd, size(shape)), shape);
+      const idx = g.input(Array.from({length: size(ishape)}, () => Math.floor(rnd(0, shape[axis]))), ishape);
+      const src = g.input(signedGrid(rnd, size(ishape)), ishape);
+      return {gather: g.node('gather', {a, b: idx, axis}), grad: g.node('scatter_add', {a: g.full(shape, 0), b: src, c: idx, axis}),
+        onto: g.node('scatter_add', {a, b: src, c: idx, axis})};
+    });
+  one('exact accumulation order and signed zeros of index_add and scatter_add', g => {
+    // 1 + 2^-24 + 2^-24 is 1 added left to right and 1 + 2^-23 the other way:
+    // only the fixed order gives one answer. -0 onto a +0 base is +0.
+    const e = 5.9604644775390625e-8, base = g.input([1, -0, 0, 3]), src = g.input([e, -0, e, -0, 2 ** 24, -(2 ** 24)]);
+    const idx = g.input([0, 1, 0, 2, 3, 3]);
+    return {indexAdd: g.node('index_add', {a: base, b: src, c: idx, axis: 0}),
+      scatterAdd: g.node('scatter_add', {a: base, b: src, c: idx, axis: 0}),
+      zeros: g.node('index_add', {a: g.input([-0, -0, -0, -0]), b: g.input([-0, -0]), c: g.input([1, 1]), axis: 0})};
   });
   one('uniform dropout mask and its scale', g => {
     const u = g.node('uniform', {shape: [16, 33], seed: 99, step: 4}), keep = g.op('ge', u, g.full([], 0.25));
@@ -216,4 +259,33 @@ export function mlpSessionProgram({sizes = [784, 256, 10], batch = 64, seed = 5,
     nodes[nodes[byName.get(`${k}${i}`)].a].carry = `${k}${i}`; resident.push(`${k}${i}`);
   }
   return {program: {...program, nodes}, parameters, state, resident, sizes, batch, seed, lr};
+}
+
+/**
+ * A prepared version-4 step: an embedding table looked up by a fed index
+ * (index_select), the last position of each sequence sliced out, the first
+ * half of its features taken (a qkv-style column slice), a linear head and
+ * mean cross-entropy, and the gradient back through slice_scatter and
+ * index_add into the table; SGD on both weights, which carry. Node 0 is the
+ * [batch * steps] token index, node 1 the class targets; `rows` (the looked-up
+ * embeddings) is readable so a harness can compare exact lookups.
+ */
+export function embeddingSessionProgram({vocab = 11, dim = 8, batch = 3, steps = 4, classes = 5, seed = 17, lr = 0.5} = {}) {
+  const g = builder(), rnd = seeded(seed), half = dim / 2;
+  const idx = g.node('input', {shape: [batch * steps]}), y = g.node('input', {shape: [batch]});
+  const E = g.random([vocab, dim], rnd, -1, 1), W = g.random([half, classes], rnd, -0.5, 0.5);
+  const rows = g.node('index_select', {a: E, b: idx, axis: 0}), seq = g.node('reshape', {a: rows, shape: [batch, steps, dim]});
+  const last = g.node('slice', {a: seq, begin: [0, steps - 1, 0], stride: [1, 1, 1], shape: [batch, 1, dim]});
+  const q = g.node('slice', {a: g.node('reshape', {a: last, shape: [batch, dim]}), begin: [0, 0], stride: [1, 1], shape: [batch, half]});
+  const logits = g.op('matmul', q, W), loss = g.op('cross_entropy', logits, y), delta = g.op('cross_entropy_grad', logits, y);
+  const dW = g.op('matmul', g.op('transpose', q), delta), dq = g.op('matmul', delta, g.op('transpose', W));
+  const dLast = g.node('slice_scatter', {a: g.full([batch, dim], 0), b: dq, begin: [0, 0], stride: [1, 1]});
+  const dSeq = g.node('slice_scatter', {a: g.full([batch, steps, dim], 0), b: g.node('reshape', {a: dLast, shape: [batch, 1, dim]}),
+    begin: [0, steps - 1, 0], stride: [1, 1, 1]});
+  const dE = g.node('index_add', {a: g.full([vocab, dim], 0), b: g.node('reshape', {a: dSeq, shape: [batch * steps, dim]}), c: idx, axis: 0});
+  const outputs = {loss, rows, E: g.op('sgd_update', E, dE, {lr}), W: g.op('sgd_update', W, dW, {lr})};
+  g.nodes[E].carry = 'E'; g.nodes[W].carry = 'W';
+  return {program: g.program(outputs), resident: ['E', 'W'],
+    batches: (count, rnd2 = seeded(seed + 1)) => Array.from({length: count}, () => ({inputs: {
+      [idx]: Array.from({length: batch * steps}, () => Math.floor(rnd2(0, vocab))), [y]: Array.from({length: batch}, () => Math.floor(rnd2(0, classes)))}}))};
 }

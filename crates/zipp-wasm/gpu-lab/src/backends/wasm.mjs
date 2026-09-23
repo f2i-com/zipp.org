@@ -71,6 +71,14 @@ export class WasmBackend {
       case 'relu': case 'positive': case 'neg': case 'exp': case 'log': case 'sqrt':
       case 'tanh': case 'sigmoid': case 'gelu': case 'gelu_grad': e.unary(a,o.ptr,n.size,UNARY[n.op]); break;
       case 'transpose': case 'permute': e.gather4(a,o.ptr,...n.dims,...n.srcStrides); break;
+      // Version 4: a slice is the permutation's strided gather, started at the
+      // box's first element (its strides may be negative).
+      case 'slice': e.gather4(a+4*n.offset,o.ptr,...n.boxDims,...n.boxStrides); break;
+      case 'slice_scatter': e.slice_scatter(a,b,o.ptr,n.size,n.offset,...n.boxDims,...n.boxStrides); break;
+      case 'index_select': e.index_select(a,b,o.ptr,n.outer,n.len,n.count,n.inner); break;
+      case 'index_add': e.index_add(a,b,c,o.ptr,n.outer,n.len,n.count,n.inner); break;
+      case 'gather': e.gather_axis(a,b,o.ptr,n.axisStride,n.len,...n.dims,...n.srcStrides); break;
+      case 'scatter_add': e.scatter_add(a,b,c,o.ptr,n.size,n.axisStride,n.len,...n.indexDims,...n.dstStrides); break;
       // refs are [condition, a, b]; `c` below is the third pointer, b's.
       case 'where': e.where_strided(a,b,c,o.ptr,...n.dims,...n.cStrides,...n.aStrides,...n.bStrides); break;
       // Seed and step cross as i32 bit patterns; the kernel reads them as u32.

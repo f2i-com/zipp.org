@@ -1,5 +1,5 @@
 import {createRuntime} from '../src/runtime.mjs';
-import {opCases, mlpTrainingStep, mlpSessionProgram, dropoutSessionProgram, seeded} from './ml-cases.mjs';
+import {opCases, mlpTrainingStep, mlpSessionProgram, dropoutSessionProgram, embeddingSessionProgram, seeded} from './ml-cases.mjs';
 import {decodeQ4K, Q4_K_BLOCK, Q4_K_BYTES} from '../src/quant.mjs';
 const input=(id,data,shape=[data.length])=>({id,op:'input',shape,data});
 const program=nodes=>({version:1,nodes,outputs:[{name:'result',id:nodes.length-1}]});
@@ -77,6 +77,26 @@ async function dropoutSession(runtime,reference){
   if(masks.size!==batches.length)throw Error(`Dropout masks repeat across steps (${masks.size} distinct of ${batches.length})`);
   return Math.max(worst,compare({outputs:out.actual.params},{outputs:out.expected.params}));
 }
+/**
+ * A prepared version-4 session (embedding lookup by a fed index, a last-token
+ * slice, a column slice, and their gradients through slice_scatter and
+ * index_add) for six steps on `runtime` and on cpu-js: the first step's
+ * looked-up rows are the same bits, the losses and weights within tolerance.
+ */
+async function embeddingSession(runtime,reference){
+  const spec=embeddingSessionProgram(),batches=spec.batches(6),out={};
+  for(const [key,rt] of [['actual',runtime],['expected',reference]]){
+    const session=await rt.prepare(spec.program,{resident:spec.resident});
+    try{
+      const run=await session.run(batches,{readback:['loss','rows']});
+      out[key]={steps:run.steps,params:(await session.download(spec.resident)).outputs};
+    }finally{session.dispose();}
+  }
+  compare({outputs:{rows:out.actual.steps[0].outputs.rows}},{outputs:{rows:out.expected.steps[0].outputs.rows}},0,true);
+  let worst=0;
+  out.expected.steps.forEach((s,i)=>{worst=Math.max(worst,compare({outputs:out.actual.steps[i].outputs},{outputs:s.outputs}));});
+  return Math.max(worst,compare({outputs:out.actual.params},{outputs:out.expected.params}));
+}
 /** Explicit backend selection: unsupported is a skip; a numerical/shader failure is a failure. */
 export async function checkBackend(backend,options={}){
   let runtime,reference;
@@ -91,9 +111,11 @@ export async function checkBackend(backend,options={}){
         report.checks.push({name,status:'passed',maxAbsError,totalWallMs:actual.stats.totalWallMs});report.passed++;
       }catch(error){report.status='failed';report.checks.push({name,status:'failed',error:String(error.message)});}
     }
-    const name='prepared dropout MLP: fresh device masks per step, bit-identical to cpu-js';
-    try{const maxAbsError=await dropoutSession(runtime,reference);report.checks.push({name,status:'passed',maxAbsError});report.passed++;}
-    catch(error){report.status='failed';report.checks.push({name,status:'failed',error:String(error.message)});}
+    for(const [name,run] of [['prepared dropout MLP: fresh device masks per step, bit-identical to cpu-js',dropoutSession],
+      ['prepared embedding/slice step (version 4): fed index, exact lookups, trains like cpu-js',embeddingSession]]){
+      try{const maxAbsError=await run(runtime,reference);report.checks.push({name,status:'passed',maxAbsError});report.passed++;}
+      catch(error){report.status='failed';report.checks.push({name,status:'failed',error:String(error.message)});}
+    }
   }finally{reference?.dispose();runtime.dispose();}
   return report;
 }

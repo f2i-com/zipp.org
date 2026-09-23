@@ -95,8 +95,8 @@ print(case, resident == chained_losses, final == chained[-1])
 
 #[test]
 fn eager_operations_on_parameters_keep_their_gradient_path() {
-    // `W.T`, `W * 2`, `(p ** 2).sum()` and `torch.add(h, b)` inside a
-    // compiled step run eagerly on the parameter; the capture re-records
+    // `W.T`, `W * 2`, `(p ** 2).sum()`, `torch.add(h, b)` and a slice `W[0]`
+    // inside a compiled step run eagerly on the parameter; the capture re-records
     // them on the parameter's own input, so the gradient reaches it (these
     // used to become separate leaves: a silently partial gradient, or a
     // parameter "not participating"). What it cannot record raises.
@@ -133,12 +133,12 @@ def run(kind, compiled):
     else:
         torch.compile(step, training=True)(x).submit(lambda loss: None)
     return W.grad.tolist() + [b.grad.tolist()], W.tolist()
-for kind in ("tied", "scaled only", "add", "l2"):
+for kind in ("tied", "scaled only", "add", "l2", "slice"):
     eager, compiled = run(kind, False), run(kind, True)
     grads = max(abs(p - q) for a, c in zip(eager[0], compiled[0]) for p, q in zip(a, c))
     weights = max(abs(p - q) for a, c in zip(eager[1], compiled[1]) for p, q in zip(a, c))
     print(kind, grads < 1e-6, weights < 1e-6)
-for kind in ("clamp", "slice", "cube"):
+for kind in ("clamp", "cube"):
     try:
         run(kind, True)
         print(kind, "accepted")
@@ -159,8 +159,8 @@ for kind in ("clamp", "slice", "cube"):
             "scaled only True True".to_owned(),
             "add True True".to_owned(),
             "l2 True True".to_owned(),
+            "slice True True".to_owned(),
             format!("clamp -> {}", unsupported("Clamp")),
-            format!("slice -> {}", unsupported("Slice")),
             "cube -> GPU power supports the exponents 2, 1, 0.5, -1 and -0.5".to_owned(),
         ]
     );
@@ -269,10 +269,10 @@ torch.compile(mse_step, training=True)(x0, torch.ones(4, 3, dtype=torch.int64)).
 #[test]
 fn prepared_steps_refuse_cpu_random_draws_and_values_a_step_would_change() {
     // A prepared session replays one recorded program: torch.randn noise
-    // drawn on the CPU while recording would be the same at every step, so
-    // prepare() refuses it (per-call compilation draws afresh each call and
-    // still accepts it). Dropout draws its mask on the device, afresh every
-    // step, and is accepted. A constant the step builds is uploaded once and
+    // drawn on the CPU is drawn again on the host and fed every step (see
+    // python_torch_gpu3.rs), so prepare() accepts it, as per-call compilation
+    // does. Dropout draws its mask on the device, afresh every step, and is
+    // accepted. A constant the step builds is uploaded once and
     // accepted; a value computed from a parameter under no_grad or a one-hot
     // of the targets would be frozen and is refused, naming why; the scalars
     // eager arithmetic wraps stay accepted (python_torch_gpu2.rs has more).
@@ -342,10 +342,6 @@ for kind in ("constant", "no_grad from a parameter", "one_hot of a read target",
         print(kind, "->", error)
 "#)
     .unwrap();
-    let refused = "prepare() cannot record a step that draws random numbers on the CPU (torch.rand/randn/randint/normal...): \
-                   the prepared session would replay the same draw at every step. F.dropout, nn.Dropout and torch.rand_like or \
-                   torch.bernoulli of graph tensors draw on the device, afresh every step. Use per-call torch.compile, \
-                   or draw outside the step and pass the tensor as an argument";
     let parameter = "prepare(): the step reads a tensor computed from a parameter outside autograd (under no_grad, or from \
                      .detach()/.data) as a graph input; the session would keep its prepare() value at every step. Compute it from \
                      the parameter with gradients enabled (it is then recorded on the device from the resident weights) or outside the step";
@@ -357,7 +353,7 @@ for kind in ("constant", "no_grad from a parameter", "one_hot of a read target",
         [
             "dropout True accepted".to_owned(),
             "nn.Dropout True accepted".to_owned(),
-            format!("randn True {refused}"),
+            "randn True accepted".to_owned(),
             "eval dropout False accepted".to_owned(),
             "torch.Size([1])".to_owned(),
             "constant accepted".to_owned(),
@@ -393,7 +389,7 @@ def attempt(name, body):
 attempt("torch.erf", lambda x, y: F.cross_entropy(torch.erf(model(x)), y))
 attempt("clamp", lambda x, y: F.cross_entropy(model(x).clamp(0, 1), y))
 attempt("slice", lambda x, y: F.cross_entropy(model(x)[0:1], y[0:1]))
-attempt("gather", lambda x, y: F.cross_entropy(model(x)[:, 0:1], y))
+attempt("mask index", lambda x, y: F.cross_entropy(model(x)[model(x) > 0].reshape(1, -1), y[:1]))
 attempt("comparison", lambda x, y: F.cross_entropy(model(x) * (model(x) > 0), y))
 attempt("cube", lambda x, y: F.cross_entropy(model(x) ** 3, y))
 attempt("item", lambda x, y: F.cross_entropy(model(x), y) * model(x).sum().item())
@@ -407,10 +403,9 @@ attempt("reshape-only indexing", lambda x, y: F.cross_entropy(model(x)[None][0][
             "torch.erf -> This torch function is not supported by torch.compile: it cannot record it on a compiled graph tensor \
              (the supported operations are listed in docs/TORCH_COMPATIBILITY.md)",
             "clamp accepted",
-            "slice -> torch.compile supports indexing that only reshapes (None, full slices, index 0 of a size-1 dimension); \
-             slicing and gathering elements are not supported",
-            "gather -> torch.compile supports indexing that only reshapes (None, full slices, index 0 of a size-1 dimension); \
-             slicing and gathering elements are not supported",
+            "slice accepted",
+            "mask index -> torch.compile cannot index with a boolean mask: it selects a data-dependent number of elements, \
+             which a graph shape cannot hold",
             "comparison accepted",
             "cube -> GPU power supports the exponents 2, 1, 0.5, -1 and -0.5",
             "item -> Tensor.item is not supported by torch.compile",

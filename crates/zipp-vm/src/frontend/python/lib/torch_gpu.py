@@ -133,6 +133,18 @@ class _Capture:
         self.trace = []
         # Scalar constants the version-3 operations record, one node each.
         self.constants = {}
+        # Integer index tensors read as graph index inputs (see `index_input`), by id.
+        self.indices = {}
+        # Prepared only: the CPU random draws the step made while it recorded,
+        # in order (see `_draw`). Each is drawn again on the host for every
+        # step, from torch's generator, and fed.
+        self.draws = []
+        # While a recorded draw runs: {id(real generator): (real, stand-in)}.
+        # The draw consumes a copy of the generator's state, so recording
+        # leaves torch's stream where it was.
+        self.redirect = None
+        # Storages of the step's tensor arguments (set by `_record`).
+        self.argument_storages = set()
 
     def derived_input(self, value):
         """Whether `value` is an eager result with a gradient path to a leaf."""
@@ -297,6 +309,19 @@ class _Capture:
             result = operands[0] @ operands[1]
         elif name in ("Maximum", "Minimum") and len(operands) == 2 and None not in operands:
             result = _maximum(self, "maximum" if name == "Maximum" else "minimum", operands[0], operands[1])
+        elif name == "Slice":
+            result = self._replay_slice(node, parents[0], operands[0], shape)
+        elif name == "Cat" and None not in operands:
+            dims = [d for d in range(len(shape)) if all(len(p.shape) == len(shape) for p in parents)
+                    and shape[d] == sum(p.shape[d] for p in parents)
+                    and all(p.shape[i] == shape[i] for p in parents for i in range(len(shape)) if i != d)]
+            if len(dims) != 1:
+                raise NotImplementedError("torch.compile could not tell which dimension an eager cat of a parameter joined")
+            result = _cat(self, operands, dims[0])
+        elif name == "Index":
+            raise NotImplementedError(
+                "torch.compile cannot record indexing a parameter by a tensor on the CPU (W[idx]); use torch.index_select(W, 0, idx), "
+                "torch.gather or F.embedding, which record on the device with the parameter's gradient")
         elif name in ("Softmax", "LogSoftmax"):
             method = "softmax" if name == "Softmax" else "log_softmax"
             with torch.no_grad():
@@ -339,6 +364,34 @@ class _Capture:
         reduced = operand.sum(dims, True) if name == "Sum" else operand.mean(dims, True)
         return reduced.reshape(shape)
 
+    def _replay_slice(self, node, parent, operand, shape):
+        """An eager basic slice of a parameter (`pos[:T]`, `W[0]`, `W[:, ::2]`):
+        its backward writes a probe into zeros, which shows the parent position
+        of every element; those positions must form one strided box."""
+        probe, spread = self._probe(node, shape)
+        count = torch._numel(shape)
+        where = [None] * count
+        for position, v in enumerate(_k.to_list(spread._s)):
+            if v:
+                where[int(v) - 1] = position
+        pshape = tuple(parent.shape)
+        if None in where or not pshape:
+            raise NotImplementedError("torch.compile could not record an eager slice of a parameter")
+        coords = [_unravel(position, pshape) for position in where]
+        begin, stride, box = [], [], []
+        for d in range(len(pshape)):
+            seen = sorted(set(c[d] for c in coords))
+            step = seen[1] - seen[0] if len(seen) > 1 else 1
+            if any(b - a != step for a, b in zip(seen, seen[1:])):
+                raise NotImplementedError("torch.compile could not record an eager slice of a parameter")
+            begin.append(seen[0])
+            stride.append(step)
+            box.append(len(seen))
+        if torch._numel(box) != count or any(
+                tuple(b + i * t for b, i, t in zip(begin, _unravel(k, box), stride)) != tuple(c) for k, c in enumerate(coords)):
+            raise NotImplementedError("torch.compile could not record an eager slice of a parameter")
+        return (operand if _whole(pshape, begin, stride, box) else _slice(operand, begin, stride, box)).reshape(shape)
+
     def _replay_permutation(self, node, parent, shape):
         probe, moved = self._probe(node, shape)
         found = []
@@ -376,6 +429,39 @@ class _Capture:
             self.targets[key] = (value, symbolic, (value._s, _k.version(value._s)), value.dtype)
         return self.targets[key][1]
 
+    def index_input(self, value, bound, what):
+        """An integer index tensor as a graph index input, recorded once per
+        storage and shape. The graph's only dtype is float32, so the values are
+        converted exactly (indices stay below 65536) and checked here to lie in
+        [0, bound); like class targets, an index read from a step argument (or
+        a view of one) is fed again every prepared step."""
+        if isinstance(value, _Tensor):
+            raise NotImplementedError(
+                "torch.compile takes %s indices from integer tensors on the CPU; an index computed on the device "
+                "(an argmax, a comparison, arithmetic on graph tensors) is not supported" % what)
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value, dtype=torch.int64)
+        if value.dtype.is_floating_point or value.dtype is torch.bool:
+            raise IndexError("tensors used as indices must be long, int, byte or bool tensors")
+        shape = tuple(value.shape)
+        if len(shape) > 4 or not torch._numel(shape):
+            raise NotImplementedError("torch.compile records %s indices of at least one element and at most four dimensions" % what)
+        values = _k.to_list(value._s)
+        low, high = min(values), max(values)
+        if low < 0:
+            raise NotImplementedError("torch.compile records non-negative %s indices only (got %d); add the dimension size to a negative index" % (what, low))
+        if high >= bound:
+            raise IndexError("index %d is out of bounds for dimension with size %d" % (high, bound))
+        entry = self.indices.get(id(value))
+        if entry is not None and tuple(entry[0].shape) == shape:
+            return entry[1]
+        for original, node, snapshot, dtype in self.indices.values():
+            if snapshot[0] is value._s and tuple(original.shape) == shape:
+                return node
+        node = self.graph.tensor(_k.astype(value._s, "float32"), shape)
+        self.indices[id(value)] = (value, node, (value._s, _k.version(value._s)), value.dtype)
+        return node
+
     def zero_grad(self, optimizer, set_to_none):
         if not set_to_none:
             raise NotImplementedError("GPU training requires zero_grad(set_to_none=True)")
@@ -391,13 +477,25 @@ class _Capture:
         self.did_backward = True
         self.grads[id(loss)] = self.graph.full(tuple(loss.shape), 1.0)
         for node in reversed(self.tape):
-            grad = self.grads.get(id(node))
+            grad = _settle(self.grads.get(id(node)))
             if grad is None or node.pullback is None:
                 continue
             for parent, value in zip(node.parents, node.pullback(grad)):
-                if parent.requires_grad:
+                if parent.requires_grad and value is not None:
                     old = self.grads.get(id(parent))
+                    if isinstance(value, _Piece):
+                        # The members of one split are consecutive on the tape,
+                        # so their pieces arrive together and merge as a cat.
+                        if isinstance(old, _Group) and old.group is value.group:
+                            old.add(value)
+                        else:
+                            self.grads[id(parent)] = _Group(self.graph, value, _settle(old))
+                        continue
+                    old = _settle(old)
                     self.grads[id(parent)] = value if old is None else old + value
+        for key, value in list(self.grads.items()):
+            if isinstance(value, _Group):
+                self.grads[key] = value.value()
 
     # ---- optimizer steps ----------------------------------------------------------------
     # Each mirrors torch.optim's single-tensor loop, in its order: negate for
@@ -822,38 +920,57 @@ class _Tensor:
     @property
     def T(self): return self.permute(tuple(reversed(range(len(self.shape)))))
 
+    # ---- element selection (protocol version 4) ---------------------------------------
     def __getitem__(self, key):
-        # Indexing that only reshapes: `x[None]`, `x[:, 0]` on a size-1
-        # dimension, `x[...]`, full slices. The protocol has no gather or
-        # slice operation, so anything that selects elements is rejected.
-        key = key if isinstance(key, tuple) else (key,)
-        if sum(1 for k in key if k is Ellipsis) > 1:
-            raise IndexError("an index can only have a single ellipsis ('...')")
-        consumed = sum(1 for k in key if k is not None and k is not Ellipsis)
-        if consumed > len(self.shape):
-            raise IndexError("too many indices for tensor of dimension %d" % len(self.shape))
-        expanded = []
-        for k in key:
-            if k is Ellipsis:
-                expanded.extend([slice(None)] * (len(self.shape) - consumed))
-            else:
-                expanded.append(k)
-        expanded.extend([slice(None)] * (len(self.shape) - sum(1 for k in expanded if k is not None)))
-        shape, axis = [], 0
-        for k in expanded:
-            if k is None:
-                shape.append(1)
-                continue
-            size = self.shape[axis]
-            if isinstance(k, slice) and k.step in (None, 1) and k.start in (None, 0) and (k.stop is None or k.stop >= size):
-                shape.append(size)
-            elif isinstance(k, int) and not isinstance(k, bool) and size == 1 and k in (0, -1):
-                pass
-            else:
-                raise NotImplementedError("torch.compile supports indexing that only reshapes (None, full slices, index 0 of a size-1 "
-                                          "dimension); slicing and gathering elements are not supported")
-            axis += 1
-        return self.reshape(tuple(shape))
+        return _getitem(self, key)
+    def select(self, dim, index):
+        d = _dim(dim, len(self.shape))
+        return self[(slice(None),) * d + (_index_of(index),)]
+    def narrow(self, dim, start, length):
+        d = _dim(dim, len(self.shape))
+        size = self.shape[d]
+        start, length = _index_of(start), _index_of(length)
+        if start < 0:
+            start += size
+        if start < 0 or length < 0 or start + length > size:
+            raise RuntimeError("start (%d) + length (%d) exceeds dimension size (%d)." % (start, length, size))
+        return self[(slice(None),) * d + (slice(start, start + length),)]
+    def split(self, split_size_or_sections, dim=0):
+        d = _dim(dim, len(self.shape))
+        n = self.shape[d]
+        if isinstance(split_size_or_sections, int):
+            size = split_size_or_sections
+            if size <= 0:
+                raise RuntimeError("split_size can only be 0 if dimension size is 0, but got dimension size of %d" % n)
+            sizes = [size] * (n // size) + ([n % size] if n % size else [])
+        else:
+            sizes = [int(v) for v in split_size_or_sections]
+            if sum(sizes) != n:
+                raise RuntimeError("split_with_sizes expects split_sizes to sum exactly to %d (input tensor's size at dimension %d), but got split_sizes=%s" % (n, d, sizes))
+        return _split(self, sizes, d)
+    def split_with_sizes(self, split_sizes, dim=0):
+        return self.split(list(split_sizes), dim)
+    def chunk(self, chunks, dim=0):
+        if chunks <= 0:
+            raise RuntimeError("chunk expects `chunks` to be greater than 0, got: %d" % chunks)
+        d = _dim(dim, len(self.shape))
+        return self.split(-(-self.shape[d] // chunks), d)
+    def unbind(self, dim=0):
+        d = _dim(dim, len(self.shape))
+        kept = tuple(size for i, size in enumerate(self.shape) if i != d)
+        return tuple(piece.reshape(kept) for piece in _split(self, [1] * self.shape[d], d))
+    def index_select(self, dim, index):
+        return _index_select(self, dim, index)
+    def gather(self, dim, index, sparse_grad=False):
+        return _gather(self, dim, index)
+    def take_along_dim(self, indices, dim=None):
+        if dim is None:
+            return self.reshape(-1).gather(0, indices.reshape(-1))
+        return self.gather(dim, indices)
+    def flip(self, *dims):
+        return _flip(self, _shape_args(dims))
+    def fliplr(self): return _flip(self, (1,))
+    def flipud(self): return _flip(self, (0,))
 
     # ---- activations: each pullback is composed from graph operations -------------
     def relu(self):
@@ -1035,6 +1152,9 @@ class GPUResult:
                     for original, symbolic, snapshot, dtype in capture.targets.values():
                         if original.dtype is not dtype or original._s is not snapshot[0] or _k.version(original._s) != snapshot[1]:
                             raise RuntimeError("GPU training result is stale; captured class targets changed before completion")
+                    for original, symbolic, snapshot, dtype in capture.indices.values():
+                        if original.dtype is not dtype or original._s is not snapshot[0] or _k.version(original._s) != snapshot[1]:
+                            raise RuntimeError("GPU training result is stale; a captured index changed before completion")
                     for original, symbolic, snapshot in capture.masks.values():
                         if original.dtype is not torch.bool or original._s is not snapshot[0] or _k.version(original._s) != snapshot[1]:
                             raise RuntimeError("GPU training result is stale; a captured mask changed before completion")
@@ -1193,6 +1313,14 @@ def _clamp(capture, x, lo, hi, exclusive=False):
     return _Tensor(capture, value, parents, backward)
 
 
+def _broadcast_shapes(a, b):
+    rank = max(len(a), len(b))
+    a, b = (1,) * (rank - len(a)) + tuple(a), (1,) * (rank - len(b)) + tuple(b)
+    if any(x != y and x != 1 and y != 1 for x, y in zip(a, b)):
+        raise RuntimeError("The size of tensor a (%s) must match the size of tensor b (%s)" % (list(a), list(b)))
+    return tuple(max(x, y) for x, y in zip(a, b))
+
+
 def _hardtanh(capture, x, lo, hi):
     if lo > hi:
         raise ValueError("min_val cannot be greater than max_val")
@@ -1249,6 +1377,334 @@ def _bernoulli(capture, x, p=None, generator=None):
     return _Tensor(capture, draw < (t._value if p is None else float(p)), requires_grad=False)
 
 
+# ---- element selection on graph tensors (protocol version 4) ----------------------------------
+# Slicing records `slice` and its gradient writes the box into zeros
+# (`slice_scatter`); a tensor index records `index_select` or `gather` with the
+# index as a graph input, and their gradients accumulate with `index_add` or
+# `scatter_add` in ascending index position, PyTorch's CPU order. A split's
+# members' gradients are written into one another (PyTorch's split backward is
+# a cat) rather than added as zero-padded copies, so signed zeros survive as
+# they do in PyTorch; separately taken slices add, as they do there.
+
+class _Piece:
+    """One split member's gradient: `grad` belongs in the box (begin, stride)
+    of zeros shaped like the source."""
+    def __init__(self, group, grad, begin, stride, shape):
+        self.group = group
+        self.grad = grad
+        self.begin = begin
+        self.stride = stride
+        self.shape = shape
+
+
+class _Group:
+    """A split's pieces received so far, written into zeros, plus whatever
+    gradient the source had before them."""
+    def __init__(self, graph, piece, prior):
+        self.graph = graph
+        self.group = piece.group
+        self.prior = prior
+        self.merged = graph.slice_scatter(graph.zeros(piece.shape), piece.grad, piece.begin, piece.stride)
+
+    def add(self, piece):
+        self.merged = self.graph.slice_scatter(self.merged, piece.grad, piece.begin, piece.stride)
+
+    def value(self):
+        return self.merged if self.prior is None else self.prior + self.merged
+
+
+def _settle(value):
+    return value.value() if isinstance(value, _Group) else value
+
+
+def _unravel(position, shape):
+    out = []
+    for size in reversed(shape):
+        out.append(position % size)
+        position //= size
+    return tuple(reversed(out))
+
+
+def _index_of(value):
+    if isinstance(value, bool) or not (isinstance(value, int) or hasattr(value, "__index__")):
+        raise TypeError("expected an integer, got %s" % type(value).__name__)
+    return value if isinstance(value, int) else value.__index__()
+
+
+def _slice(t, begin, stride, box, group=None):
+    """The strided box of a graph tensor; its gradient is the box written into zeros."""
+    capture = t._capture
+    graph = capture.graph
+    shape = tuple(t.shape)
+    begin, stride, box = list(begin), list(stride), list(box)
+    if group is None:
+        pullback = lambda g: (graph.slice_scatter(graph.zeros(shape), g, begin, stride),)
+    else:
+        pullback = lambda g: (_Piece(group, g, begin, stride, shape),)
+    return _Tensor(capture, graph.slice(t._value, begin, stride, box), (t,), pullback, mask=t.dtype is torch.bool)
+
+
+def _whole(shape, begin, stride, box):
+    return all(b == 0 for b in begin) and all(t == 1 for t in stride) and tuple(box) == tuple(shape)
+
+
+def _split(t, sizes, d):
+    rank = len(t.shape)
+    if any(size <= 0 for size in sizes):
+        raise NotImplementedError("torch.compile cannot record an empty split piece (graph dimensions are positive)")
+    if len(sizes) == 1:
+        return (t,)
+    group, out, at = object(), [], 0
+    for size in sizes:
+        out.append(_slice(t, [at if i == d else 0 for i in range(rank)], [1] * rank,
+                          [size if i == d else n for i, n in enumerate(t.shape)], group))
+        at += size
+    return tuple(out)
+
+
+def _slice_bound(value):
+    return value if value is None else _index_of(value)
+
+
+def _getitem(t, key):
+    """Basic indexing (integers, slices with positive steps, None, ...) records
+    one `slice` and a reshape; one integer tensor (or list) index records
+    `index_select` along its dimension, and x[torch.arange(n), idx] of a
+    matrix records `gather`. Masks and device-computed indices are refused."""
+    key = key if isinstance(key, tuple) else (key,)
+    rank = len(t.shape)
+    if sum(1 for k in key if k is Ellipsis) > 1:
+        raise IndexError("an index can only have a single ellipsis ('...')")
+    consumed = sum(1 for k in key if k is not None and k is not Ellipsis and not isinstance(k, bool))
+    if consumed > rank:
+        raise IndexError("too many indices for tensor of dimension %d" % rank)
+    items = []
+    for k in key:
+        if k is Ellipsis:
+            items.extend([slice(None)] * (rank - consumed))
+        else:
+            items.append(k)
+    items.extend([slice(None)] * (rank - sum(1 for k in items if k is not None and not isinstance(k, bool))))
+    begin, stride, box, plan, advanced, integer, axis = [], [], [], [], [], False, 0
+    for k in items:
+        if k is None or k is True:
+            plan.append(None)
+            continue
+        if k is False:
+            raise NotImplementedError("torch.compile cannot index with False: it selects no elements, and graph dimensions are positive")
+        size = t.shape[axis]
+        if isinstance(k, slice):
+            start, stop, step = _slice_bound(k.start), _slice_bound(k.stop), _slice_bound(k.step)
+            if step is not None and step <= 0:
+                raise ValueError("step must be greater than zero")
+            start, stop, step = slice(start, stop, step).indices(size)
+            count = len(range(start, stop, step))
+            if not count:
+                raise NotImplementedError("torch.compile cannot record a slice that selects no elements (graph dimensions are positive)")
+            begin.append(start)
+            stride.append(step)
+            box.append(count)
+            plan.append(axis)
+        elif isinstance(k, _Tensor):
+            raise NotImplementedError(
+                "torch.compile cannot index with a boolean mask: it selects a data-dependent number of elements, which a graph shape cannot hold"
+                if k.dtype is torch.bool else
+                "torch.compile takes tensor indices from integer tensors on the CPU; an index computed on the device is not supported")
+        elif isinstance(k, (torch.Tensor, list, tuple)):
+            if (k.dtype is torch.bool) if isinstance(k, torch.Tensor) else (len(k) > 0 and all(isinstance(v, bool) for v in k)):
+                raise NotImplementedError("torch.compile cannot index with a boolean mask: it selects a data-dependent number of elements, which a graph shape cannot hold")
+            index = k if isinstance(k, torch.Tensor) else torch.tensor(k, dtype=torch.int64)
+            begin.append(0)
+            stride.append(1)
+            box.append(size)
+            plan.append(("index", axis, index))
+            advanced.append((axis, index))
+        else:
+            k = _index_of(k)
+            if not -size <= k < size:
+                raise IndexError("index %d is out of bounds for dimension %d with size %d" % (k, axis, size))
+            begin.append(k % size)
+            stride.append(1)
+            box.append(1)
+            integer = True
+        axis += 1
+    out = t if _whole(t.shape, begin, stride, box) else _slice(t, begin, stride, box)
+    if len(advanced) == 2 and rank == 2 and not integer and plan == [("index", 0, advanced[0][1]), ("index", 1, advanced[1][1])]:
+        # x[torch.arange(n), idx] on an [n, C] matrix: one element per row.
+        rows, cols = advanced[0][1], advanced[1][1]
+        n = t.shape[0]
+        if (tuple(rows.shape) == (n,) and tuple(cols.shape) == (n,) and not rows.dtype.is_floating_point
+                and id(rows._s) not in t._capture.argument_storages and _k.to_list(rows._s) == list(range(n))):
+            return _gather(out, 1, cols.reshape(n, 1)).reshape(n)
+    if len(advanced) > 1:
+        raise NotImplementedError("torch.compile records one tensor index per indexing (or x[torch.arange(n), idx] of a matrix); "
+                                  "index in separate steps, or use gather")
+    shape = []
+    if advanced:
+        if integer:
+            raise NotImplementedError("torch.compile does not combine integer and tensor indices in one indexing; index in two steps (x[i][idx])")
+        axis, index = advanced[0]
+        out = _index_select(out, axis, index)
+    for entry in plan:
+        if entry is None:
+            shape.append(1)
+        elif isinstance(entry, tuple):
+            shape.extend(entry[2].shape)
+        else:
+            shape.append(out.shape[entry])
+    return out if tuple(shape) == tuple(out.shape) else out.reshape(tuple(shape))
+
+
+def _index_select(t, dim, index):
+    capture = t._capture
+    graph = capture.graph
+    rank = len(t.shape)
+    if not rank:
+        raise NotImplementedError("torch.compile records index_select of a tensor with at least one dimension")
+    d = _dim(dim, rank)
+    node = capture.index_input(index, t.shape[d], "index_select")
+    flat = node if len(node.shape) == 1 else graph.reshape(node, (torch._numel(node.shape),))
+    shape = tuple(t.shape)
+    return _Tensor(capture, graph.index_select(t._value, d, flat), (t,),
+                   lambda g: (graph.index_add(graph.zeros(shape), d, flat, g),), mask=t.dtype is torch.bool)
+
+
+def _gather(t, dim, index):
+    capture = t._capture
+    graph = capture.graph
+    rank = len(t.shape)
+    if not rank:
+        raise NotImplementedError("torch.compile records gather of a tensor with at least one dimension")
+    d = _dim(dim, rank)
+    if isinstance(index, torch.Tensor) and index.dtype is not torch.int64:
+        raise RuntimeError("gather(): Expected dtype int64 for index")
+    if len(getattr(index, "shape", ())) != rank:
+        raise RuntimeError("Index tensor must have the same number of dimensions as input tensor")
+    for i in range(rank):
+        if i != d and index.shape[i] > t.shape[i]:
+            raise RuntimeError("Size does not match at dimension %d expected index %s to be smaller than self %s apart from dimension %d"
+                               % (i, list(index.shape), list(t.shape), d))
+    node = capture.index_input(index, t.shape[d], "gather")
+    shape = tuple(t.shape)
+    return _Tensor(capture, graph.gather(t._value, d, node), (t,),
+                   lambda g: (graph.scatter_add(graph.zeros(shape), d, node, g),), mask=t.dtype is torch.bool)
+
+
+def _flip(t, dims):
+    rank = len(t.shape)
+    flipped = [_dim(d, rank) for d in dims]
+    for d in flipped:
+        if flipped.count(d) > 1:
+            raise RuntimeError("dim %d appears multiple times in the list of dims" % d)
+    begin = [n - 1 if i in flipped else 0 for i, n in enumerate(t.shape)]
+    stride = [-1 if i in flipped else 1 for i in range(rank)]
+    if all(t.shape[i] == 1 for i in flipped):
+        return t
+    capture = t._capture
+    graph = capture.graph
+    box = list(t.shape)
+    return _Tensor(capture, graph.slice(t._value, begin, stride, box), (t,),
+                   lambda g: (graph.slice(g, begin, stride, box),), mask=t.dtype is torch.bool)
+
+
+def _cat(capture, tensors, dim):
+    """Concatenation: each piece written into zeros (`slice_scatter`); the
+    gradient of each piece is its slice of the result's."""
+    items = []
+    for i, value in enumerate(tensors):
+        if not isinstance(value, (_Tensor, torch.Tensor)):
+            raise TypeError("expected Tensor as element %d in argument 0, but got %s" % (i, type(value).__name__))
+        items.append(capture.operand(value))
+    if not items:
+        raise RuntimeError("torch.cat(): expected a non-empty list of Tensors")
+    rank = len(items[0].shape)
+    if not rank:
+        raise RuntimeError("zero-dimensional tensor (at position 0) cannot be concatenated")
+    d = _dim(dim, rank)
+    for i, item in enumerate(items):
+        if len(item.shape) != rank:
+            raise RuntimeError("Tensors must have same number of dimensions: got %d and %d" % (rank, len(item.shape)))
+        for j in range(rank):
+            if j != d and item.shape[j] != items[0].shape[j]:
+                raise RuntimeError("Sizes of tensors must match except in dimension %d. Expected size %d but got size %d for tensor number %d in the list."
+                                   % (d, items[0].shape[j], item.shape[j], i))
+    mask = all(item.dtype is torch.bool for item in items)
+    if len(items) == 1:
+        return items[0]
+    graph = capture.graph
+    shape = [sum(item.shape[d] for item in items) if j == d else n for j, n in enumerate(items[0].shape)]
+    out, starts, at = graph.zeros(tuple(shape)), [], 0
+    for item in items:
+        begin = [at if j == d else 0 for j in range(rank)]
+        out = graph.slice_scatter(out, item._value, begin, [1] * rank)
+        starts.append(begin)
+        at += item.shape[d]
+
+    def backward(g):
+        return tuple(graph.slice(g, begin, [1] * rank, list(item.shape)) if item.requires_grad else None
+                     for item, begin in zip(items, starts))
+    return _Tensor(capture, out, tuple(items), backward, mask=mask)
+
+
+def _stack(capture, tensors, dim):
+    items = [capture.operand(value) for value in tensors]
+    if not items:
+        raise RuntimeError("stack expects a non-empty TensorList")
+    for i, item in enumerate(items):
+        if tuple(item.shape) != tuple(items[0].shape):
+            raise RuntimeError("stack expects each tensor to be equal size, but got %s at entry 0 and %s at entry %d"
+                               % (list(items[0].shape), list(item.shape), i))
+    d = _dim(dim, len(items[0].shape) + 1)
+    return _cat(capture, [item.unsqueeze(d) for item in items], d)
+
+
+def _graph_select(capture, input, index):
+    """Whether an index_select/gather call records on the graph: a graph
+    tensor is involved, the source is a trainable tensor of a training step
+    (its gradient must reach it), or the index is read from a step argument or
+    a random draw (a prepared session feeds it every step)."""
+    if capture is None:
+        return False
+    if isinstance(input, _Tensor) or isinstance(index, _Tensor):
+        return True
+    if not isinstance(input, torch.Tensor) or input.dtype is not torch.float32:
+        return False
+    if capture.training and torch.is_grad_enabled() and input.requires_grad:
+        return True
+    return isinstance(index, torch.Tensor) and (id(index._s) in capture.argument_storages
+                                                or any(entry["storage"] is index._s for entry in capture.draws))
+
+
+# ---- CPU random draws inside a prepared step ------------------------------------------------------
+# A draw records as a feed: while the step records, it draws from a copy of
+# the generator's state (torch's stream does not move), and every executed
+# step draws again on the host -- the same call, in the same order, from the
+# real generator -- and feeds the values. A float32 draw becomes a graph input
+# (so arithmetic on it records on the device); an integer draw stays a CPU
+# tensor, fed wherever the step reads it as class targets or an index.
+
+def _draw(capture, redraw):
+    capture.redirect = {}
+    try:
+        return redraw()
+    finally:
+        capture.redirect = None
+
+
+def _host_draw(capture, redraw, what):
+    value = _draw(capture, redraw)
+    if not isinstance(value, torch.Tensor):
+        return value
+    if value.requires_grad:
+        raise NotImplementedError("prepare() cannot record a random draw that requires grad (%s)" % what)
+    if value.dtype is torch.float32 and len(value.shape) <= 4 and torch._numel(value.shape):
+        node = capture.graph.tensor(value._s, tuple(value.shape))
+        capture.draws.append({"what": what, "redraw": redraw, "node": node, "storage": None})
+        return _Tensor(capture, node, requires_grad=False)
+    capture.draws.append({"what": what, "redraw": redraw, "node": None, "storage": value._s, "value": value})
+    return value
+
+
 def _argument(args, kwargs, index, name, default=None):
     if len(args) > index:
         return args[index]
@@ -1260,11 +1716,15 @@ def _no_inplace(kwargs, args, index, name):
         raise NotImplementedError("torch.compile does not record in-place %s on a graph tensor; use inplace=False" % name)
 
 
-def _patch_functions(patched):
-    """Graph-aware versions of torch's comparison, selection, clamping and
-    dropout functions, installed while a call records. Each falls through to
-    the original unless a graph tensor is among its tensor arguments. Every
-    replaced attribute is appended to `patched` as it is installed."""
+def _patch_functions(patched, capture=None):
+    """Graph-aware versions of torch's comparison, selection, clamping,
+    dropout, concatenation and indexing functions, installed while a call
+    records. Each falls through to the original unless a graph tensor is among
+    its tensor arguments (index_select/gather also record for a trainable
+    source or an index a prepared session feeds). While a prepared step
+    records, torch's CPU random draws become per-step feeds (see `_draw`).
+    Every replaced attribute is appended to `patched` as it is installed."""
+    prepared = capture is not None and capture.prepared
 
     def patch(module, name, make):
         original = getattr(module, name, None)
@@ -1334,19 +1794,108 @@ def _patch_functions(patched):
 
     def rand_like(original):
         def call(input, *args, **kwargs):
-            capture = _capture_of(input)
-            if capture is None:
+            owner = _capture_of(input)
+            if owner is None:
+                if prepared and capture.redirect is None:
+                    return _host_draw(capture, lambda: original(input, *args, **kwargs), "torch.rand_like")
                 return original(input, *args, **kwargs)
-            return _uniform_like(capture, input, _argument(args, kwargs, 0, "generator"), kwargs.get("dtype"))
+            return _uniform_like(owner, input, _argument(args, kwargs, 0, "generator"), kwargs.get("dtype"))
         return call
 
-    def bernoulli(original):
+    def bernoulli(original, rand):
         def call(input, *args, **kwargs):
-            capture = _capture_of(input)
-            if capture is None:
-                return original(input, *args, **kwargs)
-            return _bernoulli(capture, input, _argument(args, kwargs, 0, "p"), _argument(args, kwargs, 1, "generator"))
+            owner = _capture_of(input)
+            p, generator = _argument(args, kwargs, 0, "p"), _argument(args, kwargs, 1, "generator")
+            if owner is None:
+                if not prepared or capture.redirect is not None:
+                    return original(input, *args, **kwargs)
+                if not isinstance(input, torch.Tensor) or input.dtype is not torch.float32:
+                    return _host_draw(capture, lambda: original(input, *args, **kwargs), "torch.bernoulli")
+                # PyTorch's (and eager Zipp's) bernoulli: rand(shape) < p, the
+                # draw fed and the comparison recorded against p on the device.
+                shape = tuple(input.shape)
+                u = _host_draw(capture, lambda: rand(*shape, generator=generator, dtype=torch.float32), "torch.bernoulli")
+                return _compare(capture, "lt", u, input if p is None else float(p)).float()
+            return _bernoulli(owner, input, p, generator)
         return call
+
+    def drawn(what):
+        # A CPU draw of a prepared step: the same call, drawn again every step.
+        def make(original):
+            def call(*args, **kwargs):
+                if capture.redirect is not None:
+                    return original(*args, **kwargs)
+                return _host_draw(capture, lambda: original(*args, **kwargs), what)
+            return call
+        return make
+
+    def multinomial(original):
+        def call(input, *args, **kwargs):
+            if isinstance(input, _Tensor):
+                raise NotImplementedError("torch.compile cannot record torch.multinomial of a graph tensor: it samples from values "
+                                          "the host does not have until the step has run")
+            if not prepared or capture.redirect is not None:
+                return original(input, *args, **kwargs)
+            value = _host_draw(capture, lambda: original(input, *args, **kwargs), "torch.multinomial")
+            capture.draws[-1]["probs"] = input
+            return value
+        return call
+
+    def normal(original, randn):
+        # normal(mean, std) with a tensor mean or std: randn of the broadcast
+        # shape, times std, plus mean (eager Zipp's order), without gradient.
+        # With a graph operand that arithmetic records on the device, and in a
+        # prepared step so does it for any tensor operand (a parameter's
+        # value lives on the device); the randn is the draw.
+        def call(mean=0.0, std=1.0, *args, **kwargs):
+            owner = _capture_of(mean, std)
+            tensors = isinstance(mean, (torch.Tensor, _Tensor)) or isinstance(std, (torch.Tensor, _Tensor))
+            if owner is None and not (prepared and capture.redirect is None):
+                return original(mean, std, *args, **kwargs)
+            owner = owner or capture
+            if not tensors:
+                return _host_draw(owner, lambda: original(mean, std, *args, **kwargs), "torch.normal")
+            if args or set(kwargs) - {"generator"}:
+                raise NotImplementedError("torch.compile records torch.normal(mean, std, generator=None) with a tensor mean or std")
+            generator = kwargs.get("generator")
+            like = mean if isinstance(mean, (torch.Tensor, _Tensor)) else std
+            shape = _broadcast_shapes(tuple(getattr(mean, "shape", ())), tuple(getattr(std, "shape", ())))
+            dtype = like.dtype
+            draw = lambda: randn(*shape, generator=generator, dtype=dtype)
+            z = _host_draw(owner, draw, "torch.normal") if prepared else draw()
+            out = owner.operand(z) * owner.operand(std) + owner.operand(mean)
+            return out.detach()
+        return call
+
+    def cat(original):
+        def call(tensors, dim=0):
+            owner = _capture_of(*tensors) if isinstance(tensors, (list, tuple)) else None
+            return original(tensors, dim) if owner is None else _cat(owner, tensors, dim)
+        return call
+
+    def stack(original):
+        def call(tensors, dim=0):
+            owner = _capture_of(*tensors) if isinstance(tensors, (list, tuple)) else None
+            return original(tensors, dim) if owner is None else _stack(owner, tensors, dim)
+        return call
+
+    def selecting(kind):
+        def make(original):
+            def call(input, dim, index, *args, **kwargs):
+                if not _graph_select(capture, input, index):
+                    return original(input, dim, index, *args, **kwargs)
+                t = input if isinstance(input, _Tensor) else capture.operand(input)
+                return _index_select(t, dim, index) if kind == "index_select" else _gather(t, dim, index)
+            return call
+        return make
+
+    def method(name):
+        # torch.split(t, ...) and friends of a graph tensor: its own method.
+        def make(original):
+            def call(input, *args, **kwargs):
+                return getattr(input, name)(*args, **kwargs) if isinstance(input, _Tensor) else original(input, *args, **kwargs)
+            return call
+        return make
 
     def dropout(feature_rank=None, name="dropout"):
         def make(original):
@@ -1403,7 +1952,32 @@ def _patch_functions(patched):
     patch(torch, "_binary_nograd", binary_nograd)
     patch(torch, "logical_not", logical_not)
     patch(torch, "rand_like", rand_like)
-    patch(torch, "bernoulli", bernoulli)
+    patch(torch, "bernoulli", lambda original: bernoulli(original, torch.rand))
+    patch(torch, "normal", lambda original: normal(original, torch.randn))
+    patch(torch, "multinomial", multinomial)
+    if prepared:
+        for name in ("randn", "rand", "randint", "randperm", "randn_like", "randint_like"):
+            patch(torch, name, drawn("torch." + name))
+
+        def in_place(name):
+            def make(original):
+                def call(self, *args, **kwargs):
+                    raise NotImplementedError(
+                        "prepare() cannot record Tensor.%s inside the step: an in-place draw would keep its prepare() values at "
+                        "every step. torch.rand/randn/randint/randperm/normal/multinomial, their *_like forms and torch.bernoulli "
+                        "are drawn afresh on the host every step; use one of those, per-call torch.compile, or draw outside the "
+                        "step and pass the tensor as an argument" % name)
+                return call
+            return make
+        for name in ("uniform_", "normal_", "bernoulli_", "exponential_", "geometric_", "log_normal_", "cauchy_", "random_"):
+            patch(torch.Tensor, name, in_place(name))
+    for name in ("cat", "concat", "concatenate"):
+        patch(torch, name, cat)
+    patch(torch, "stack", stack)
+    patch(torch, "index_select", selecting("index_select"))
+    patch(torch, "gather", selecting("gather"))
+    for name in ("split", "chunk", "unbind", "narrow", "select", "flip", "fliplr", "flipud", "take_along_dim"):
+        patch(torch, name, method(name))
     patch(_F, "dropout", dropout())
     patch(_F, "dropout1d", dropout(3, "dropout1d"))
     patch(_F, "dropout2d", dropout(4, "dropout2d"))
@@ -1489,21 +2063,34 @@ def _record(model, training, args, kwargs, prepared=False):
     if _active is not None:
         raise RuntimeError("Nested compiled training calls are unsupported")
     capture = _Capture(training, prepared)
+    for value in list(args) + list(kwargs.values()):
+        if isinstance(value, torch.Tensor):
+            capture.argument_storages.add(id(value._s))
     # Float tensors become graph leaves; integer tensors stay on the CPU
     # (cross_entropy records its class targets from there).
     convert = lambda value: capture.tensor(value) if isinstance(value, torch.Tensor) and value.dtype.is_floating_point else value
     # Eager ops look for graph tensors only while a call records.
     torch._recording(1)
     # A prepared step is one recorded program run many times: a random draw
-    # on the CPU inside it (torch.randn noise) would become a constant
-    # replayed at every step. Every draw goes through torch._gen, so watch it.
-    # Dropout, rand_like and bernoulli of graph tensors draw on the device
-    # instead (`uniform`, fresh every step) with seeds from `capture.draw`.
+    # on the CPU inside it (torch.randn noise) must be drawn again every step.
+    # The draws torch_gpu knows (`_patch_functions`) record as per-step feeds
+    # and, while they record, draw from a copy of the generator (`redirect`);
+    # every other draw still goes through torch._gen and is refused. Dropout,
+    # rand_like and bernoulli of graph tensors draw on the device instead
+    # (`uniform`, fresh every step) with seeds from `capture.draw`.
     draw = getattr(torch, "_gen", None) if prepared else None
     if draw is not None:
         def watched(generator):
-            capture.used_random = True
-            return draw(generator)
+            real = draw(generator)
+            if capture.redirect is None:
+                capture.used_random = True
+                return real
+            entry = capture.redirect.get(id(real))
+            if entry is None:
+                copy = _k.gen(0)
+                _k.gen_set_state(copy, _k.gen_get_state(real))
+                entry = capture.redirect[id(real)] = (real, copy)
+            return entry[1]
         torch._gen = watched
     # Every tensor kernel call is traced while a prepared step records, so
     # prepare() can tell a constant built inside the step (uploaded once)
@@ -1516,16 +2103,17 @@ def _record(model, training, args, kwargs, prepared=False):
         # Comparisons, where, clamp, maximum/minimum, dropout and the
         # activations built from them record graph operations while a call
         # records; outside one (and for eager tensors) they are PyTorch's own.
-        _patch_functions(patched)
+        _patch_functions(patched, capture)
         _active = capture if training else None
         with torch.enable_grad() if training else torch.no_grad():
             output = model(*[convert(value) for value in args], **{key: convert(value) for key, value in kwargs.items()})
         if capture.used_random:
             raise NotImplementedError(
-                "prepare() cannot record a step that draws random numbers on the CPU (torch.rand/randn/randint/normal...): "
-                "the prepared session would replay the same draw at every step. F.dropout, nn.Dropout and torch.rand_like or "
-                "torch.bernoulli of graph tensors draw on the device, afresh every step. Use per-call torch.compile, "
-                "or draw outside the step and pass the tensor as an argument")
+                "prepare() cannot record this CPU random draw: torch.rand/randn/randint/randperm/normal/multinomial, "
+                "torch.rand_like/randn_like/randint_like and torch.bernoulli are drawn afresh on the host every step, but an "
+                "in-place draw (normal_, uniform_, random_, bernoulli_, exponential_...), torch.poisson or nn.init inside the "
+                "step would replay its prepare() values. Use one of those functions, per-call torch.compile, or draw outside "
+                "the step and pass the tensor as an argument")
         if not isinstance(output, _Tensor):
             raise TypeError("Compiled GPU calls must return one supported graph tensor")
         if training and not capture.did_step:
@@ -1624,6 +2212,8 @@ class Prepared:
                 nodes = [("t", entry[1]) for entry in capture.targets.values() if entry[2][0] is value._s]
                 # A bool argument read as a mask (or through a view of it) is fed the same way.
                 nodes += [("m", entry[1]._value) for entry in capture.masks.values() if entry[2][0] is value._s]
+                # And an integer argument read as an index (embedding tokens, gather positions).
+                nodes += [("i", entry[1]) for entry in capture.indices.values() if entry[2][0] is value._s]
             if not nodes:
                 # The step did not read this tensor as a graph input: it
                 # ignored it, or used a copy derived from it (a slice, a
@@ -1660,12 +2250,23 @@ class Prepared:
         for position, value in arguments:
             if isinstance(value, torch.Tensor):
                 sources[id(value._s)] = "argument"
+        drawn = dict((id(entry["storage"]), entry) for entry in capture.draws if entry["storage"] is not None)
+        for key in drawn:
+            sources[key] = "random"
         tainted = _tainted(capture.trace, sources)
         read = [(entry[0], entry[1]) for entry in capture.inputs.values()] + [(entry[0], entry[1]) for entry in capture.masks.values()]
+        read += [(entry[0], entry[1]) for entry in capture.targets.values()] + [(entry[0], entry[1]) for entry in capture.indices.values()]
         for original, symbolic in read:
-            if id(original) in argument_ids or id(original) in optimizer_ids or id(original._s) in parameter_nodes:
+            if (id(original) in argument_ids or id(original) in optimizer_ids or id(original._s) in parameter_nodes
+                    or id(original._s) in capture.argument_storages or id(original._s) in drawn):
                 continue
             reason = tainted.get(id(original._s))
+            if reason == "random":
+                raise NotImplementedError(
+                    "prepare(): the step reads a tensor that an eager operation computed from a CPU random draw of integers (a cast, "
+                    "a one-hot, arithmetic) as a graph input; the session would keep its prepare() value at every step. Read the "
+                    "draw itself as class targets or an index, draw a float32 tensor (arithmetic on it records on the device), "
+                    "or draw outside the step and pass the tensor as an argument")
             if reason == "parameter":
                 raise NotImplementedError(
                     "prepare(): the step reads a tensor computed from a parameter outside autograd (under no_grad, or from "
@@ -1676,6 +2277,35 @@ class Prepared:
                     "prepare(): the step reads a tensor that an eager operation derived from a step argument (a one-hot, a cast, "
                     "arithmetic on class targets) as a graph input; the session would keep its prepare() value at every step. "
                     "Pass the derived tensor as the argument instead")
+        # Random draws: each drawn again on the host for every step, in recorded
+        # order, and fed -- a float32 draw into its own graph input, an integer
+        # one into every class-target, index or mask input read from it.
+        self._draws = []
+        for i, entry in enumerate(capture.draws):
+            names = []
+            if entry["node"] is not None:
+                names.append(("r%d" % i, True))
+                feeds["r%d" % i] = entry["node"]
+            else:
+                storage = entry["storage"]
+                nodes = [entry2[1] for entry2 in capture.targets.values() if entry2[2][0] is storage]
+                nodes += [entry2[1] for entry2 in capture.indices.values() if entry2[2][0] is storage]
+                nodes += [entry2[1]._value for entry2 in capture.masks.values() if entry2[2][0] is storage]
+                if not nodes:
+                    raise NotImplementedError(
+                        "prepare(): the step draws %s on the CPU and does not read the draw as class targets, an index or a "
+                        "mask of the graph (it uses it in Python or in eager arithmetic); the session would keep its prepare() "
+                        "value at every step. Use per-call torch.compile, or draw outside the step and pass it as an argument" % entry["what"])
+                for j, node in enumerate(nodes):
+                    names.append(("r%d_%d" % (i, j), False))
+                    feeds["r%d_%d" % (i, j)] = node
+            probs = entry.get("probs")
+            if probs is not None and (probs.requires_grad or id(probs._s) in capture.argument_storages or id(probs._s) in tainted):
+                raise NotImplementedError(
+                    "prepare(): torch.multinomial inside the step samples from probabilities computed from a parameter, an argument "
+                    "or another draw; the host would sample from their prepare() values. Pass the samples as an argument, or use "
+                    "per-call torch.compile")
+            self._draws.append((entry["redraw"], names))
         capture.trace = []
         # Outputs: the result read back each step; per parameter its weight,
         # optimizer buffers and gradient resident, carried into their inputs.
@@ -1771,6 +2401,15 @@ class Prepared:
             feeds[name] = value._s if dtype == torch.float32 else _k.astype(value._s, "float32")
         return feeds
 
+    def _redraw(self, feeds):
+        # The step's CPU draws, from torch's generator, in the order the step
+        # made them: what the same eager step would draw at this point.
+        for redraw, names in self._draws:
+            value = redraw()
+            for name, is_float in names:
+                feeds[name] = value._s if is_float else _k.astype(value._s, "float32")
+        return feeds
+
     def _fail(self, error, on_error):
         self._failed = error
         self._release()
@@ -1791,6 +2430,8 @@ class Prepared:
         if not 1 <= len(batches) <= 64:
             raise ValueError("steps() submits between 1 and 64 steps in one run")
         feeds = [self._step_feeds(args, kwargs, i) for i, (args, kwargs) in enumerate(batches)]
+        # Drawn only once every step's arguments are accepted, step by step.
+        feeds = [self._redraw(step) for step in feeds]
         count = len(batches)
 
         def arrived(result):

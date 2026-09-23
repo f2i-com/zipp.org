@@ -22,6 +22,15 @@ Protocol version 3 adds maximum/minimum, the comparisons (float32 0/1 masks),
 `Graph.where` and `Graph.uniform`, a counter-based random draw that is the
 same bits on every backend (see `_uniform_keys`). A graph is labelled 3 only
 once it uses one of them.
+
+Protocol version 4 adds element selection: strided slices (`Tensor[...]`,
+`Graph.slice`) and `Graph.slice_scatter`, and along one axis with an integer
+index input `Graph.index_select`/`Graph.gather` and their accumulating
+counterparts `Graph.index_add`/`Graph.scatter_add`, which add each
+contribution onto the base in ascending index position (one float32 rounding
+per addition, the same order on every backend). `Graph.cat` and
+`Graph.stack` are built from `slice_scatter`. A graph is labelled 4 only once
+it uses one of them.
 """
 import math
 import struct
@@ -103,6 +112,10 @@ _VERSION_ONE_OPS = frozenset((
 _COMPARE_OPS = ("eq", "ne", "lt", "le", "gt", "ge")
 # What protocol version 3 added; a graph using any of them is labelled 3.
 _VERSION_THREE_OPS = frozenset(_COMPARE_OPS + ("maximum", "minimum", "where", "uniform"))
+# What protocol version 4 added (element selection); a graph using any of them is labelled 4.
+_VERSION_FOUR_OPS = frozenset(("slice", "slice_scatter", "index_select", "index_add", "gather", "scatter_add"))
+# The operations that read an integer index, and the field naming it.
+_INDEX_FIELD = {"index_select": "b", "gather": "b", "index_add": "c", "scatter_add": "c"}
 
 
 def _axis(axis, rank):
@@ -286,6 +299,18 @@ class Tensor:
     def positive(self):
         return self._graph._unary("positive", self, self.shape)
 
+    def __getitem__(self, key):
+        """Integers, slices (any nonzero step, negative ones included), `None`
+        and `...`, as in NumPy: a `slice` node, then a reshape that drops the
+        integer-indexed axes and inserts the `None` ones."""
+        return self._graph._getitem(self, key)
+
+    def index_select(self, axis, index):
+        return self._graph.index_select(self, axis, index)
+
+    def gather(self, axis, index):
+        return self._graph.gather(self, axis, index)
+
     def life(self):
         """One toroidal Conway-style life step. Not a trained neural model."""
         if len(self.shape) != 2:
@@ -335,8 +360,10 @@ class Graph:
         node_id = len(self._nodes)
         node = {"id": node_id, "op": op}
         node.update(fields)
-        if op in _VERSION_THREE_OPS:
-            self._version = 3
+        if op in _VERSION_FOUR_OPS:
+            self._version = 4
+        elif op in _VERSION_THREE_OPS:
+            self._version = max(self._version, 3)
         elif self._version == 1 and not self._version_one(op, shape, fields):
             self._version = 2
         self._nodes.append(node)
@@ -481,6 +508,170 @@ class Graph:
         if sorted(dims) != list(range(len(a.shape))):
             raise GraphError("dims must be a permutation of the tensor's axes")
         return self._append("permute", tuple(a.shape[d] for d in dims), a=a._id, dims=dims)
+
+    # ---- selection (protocol version 4) ----------------------------------------------------
+
+    def _box(self, op, source, begin, stride, box):
+        rank = len(source.shape)
+        if not rank:
+            raise GraphError("%s requires at least one dimension" % op)
+        begin, stride, box = list(begin), list(stride), list(box)
+        if not len(begin) == len(stride) == len(box) == rank:
+            raise GraphError("%s needs one begin, stride and extent per axis of the source" % op)
+        for d in range(rank):
+            for v in (begin[d], stride[d], box[d]):
+                if type(v) is not int:
+                    raise GraphError("%s begins, strides and extents are integers" % op)
+            last = begin[d] + (box[d] - 1) * stride[d]
+            if stride[d] == 0 or abs(stride[d]) > 65536 or box[d] < 1:
+                raise GraphError("%s strides are nonzero integers and extents positive" % op)
+            if not (0 <= begin[d] < source.shape[d] and 0 <= last < source.shape[d]):
+                raise GraphError("%s reads axis %d of %r outside its range" % (op, d, source.shape))
+        return begin, stride, box
+
+    def slice(self, tensor, begin, stride, shape):
+        """The strided box out[i] = tensor[begin + i * stride] (per axis) of `shape`."""
+        a = self._owned(tensor)
+        begin, stride, box = self._box("slice", a, begin, stride, shape)
+        box = _shape(box)
+        return self._append("slice", box, a=a._id, begin=begin, stride=stride, shape=list(box))
+
+    def slice_scatter(self, base, src, begin, stride):
+        """A copy of `base` with the strided box at (begin, stride) replaced by `src`."""
+        a, b = self._owned(base), self._owned(src)
+        begin, stride, _ = self._box("slice_scatter", a, begin, stride, b.shape)
+        return self._append("slice_scatter", a.shape, a=a._id, b=b._id, begin=begin, stride=stride)
+
+    def _getitem(self, tensor, key):
+        a = self._owned(tensor)
+        key = key if isinstance(key, tuple) else (key,)
+        if sum(1 for k in key if k is Ellipsis) > 1:
+            raise GraphError("An index can hold one ellipsis")
+        consumed = sum(1 for k in key if k is not None and k is not Ellipsis)
+        if consumed > len(a.shape):
+            raise GraphError("Too many indices for a tensor of rank %d" % len(a.shape))
+        expanded = []
+        for k in key:
+            expanded.extend([slice(None)] * (len(a.shape) - consumed) if k is Ellipsis else [k])
+        expanded.extend([slice(None)] * (len(a.shape) - sum(1 for k in expanded if k is not None)))
+        begin, stride, box, shape, axis = [], [], [], [], 0
+        for k in expanded:
+            if k is None:
+                shape.append(1)
+                continue
+            size = a.shape[axis]
+            if isinstance(k, slice):
+                start, stop, step = k.indices(size)
+                count = len(range(start, stop, step))
+                if not count:
+                    raise GraphError("A slice selecting no elements has no graph form (dimensions are positive)")
+                begin.append(start)
+                stride.append(step)
+                box.append(count)
+                shape.append(count)
+            elif type(k) is int:
+                if not -size <= k < size:
+                    raise IndexError("Index %d is out of range for an axis of %d" % (k, size))
+                begin.append(k % size)
+                stride.append(1)
+                box.append(1)
+            else:
+                raise GraphError("Graph tensors index with integers, slices, None and ...; use index_select or gather for tensors")
+            axis += 1
+        out = a
+        if begin != [0] * len(begin) or stride != [1] * len(stride) or box != list(a.shape):
+            out = self.slice(a, begin, stride, box)
+        return out if tuple(shape) == tuple(out.shape) else self.reshape(out, shape)
+
+    def _index(self, index, bound, op):
+        """An index as a graph input of integers in [0, bound): an input node
+        (or a reshape of one), or data, recorded as an input."""
+        t = self._coerce(index)
+        root = t._id
+        while self._nodes[root]["op"] == "reshape":
+            root = self._nodes[root]["a"]
+        node = self._nodes[root]
+        if node["op"] != "input":
+            raise GraphError("%s takes its index from an input tensor of integers" % op)
+        data = node.get("data")
+        if _k is not None and isinstance(data, _k.Storage):
+            data = _k.to_list(data)
+        if any(v != int(v) or not 0 <= v < bound for v in data):
+            raise GraphError("%s index values must be integers in [0, %d)" % (op, bound))
+        return t
+
+    def index_select(self, tensor, axis, index):
+        """Along `axis`, position k of the result is position index[k] of `tensor` (index 1-D)."""
+        a = self._owned(tensor)
+        if not a.shape:
+            raise GraphError("index_select requires at least one dimension")
+        axis = _axis(axis, len(a.shape))
+        i = self._index(index, a.shape[axis], "index_select")
+        if len(i.shape) != 1:
+            raise GraphError("index_select takes a 1-D index")
+        shape = tuple(i.shape[0] if d == axis else s for d, s in enumerate(a.shape))
+        return self._append("index_select", shape, a=a._id, b=i._id, axis=axis)
+
+    def index_add(self, base, axis, index, src):
+        """`base` plus src[.., k, ..] added at position index[k] of `axis`, k ascending."""
+        a, b = self._owned(base), self._owned(src)
+        if not a.shape:
+            raise GraphError("index_add requires at least one dimension")
+        axis = _axis(axis, len(a.shape))
+        i = self._index(index, a.shape[axis], "index_add")
+        if len(i.shape) != 1 or b.shape != tuple(i.shape[0] if d == axis else s for d, s in enumerate(a.shape)):
+            raise GraphError("index_add takes a 1-D index and a source shaped like the base with that axis the index's length")
+        return self._append("index_add", a.shape, a=a._id, b=b._id, c=i._id, axis=axis)
+
+    def gather(self, tensor, axis, index):
+        """Each result element reads `tensor` at its own position, `axis` replaced by the index there."""
+        a = self._owned(tensor)
+        if not a.shape:
+            raise GraphError("gather requires at least one dimension")
+        axis = _axis(axis, len(a.shape))
+        i = self._index(index, a.shape[axis], "gather")
+        if len(i.shape) != len(a.shape) or any(d != axis and i.shape[d] > a.shape[d] for d in range(len(a.shape))):
+            raise GraphError("gather needs an index of the source's rank, no larger off the axis")
+        return self._append("gather", i.shape, a=a._id, b=i._id, axis=axis)
+
+    def scatter_add(self, base, axis, index, src):
+        """`base` plus each src element added where the index sends it along `axis`, in ascending position."""
+        a, b = self._owned(base), self._owned(src)
+        if not a.shape:
+            raise GraphError("scatter_add requires at least one dimension")
+        axis = _axis(axis, len(a.shape))
+        i = self._index(index, a.shape[axis], "scatter_add")
+        if (len(i.shape) != len(a.shape) or b.shape != i.shape
+                or any(d != axis and i.shape[d] > a.shape[d] for d in range(len(a.shape)))):
+            raise GraphError("scatter_add needs an index of the base's rank (no larger off the axis) and a source of its shape")
+        return self._append("scatter_add", a.shape, a=a._id, b=b._id, c=i._id, axis=axis)
+
+    def cat(self, tensors, axis=0):
+        """Concatenation along `axis`: each piece written into zeros by slice_scatter."""
+        pieces = [self._owned(t) for t in tensors]
+        if not pieces or not pieces[0].shape:
+            raise GraphError("cat needs tensors with at least one dimension")
+        rank = len(pieces[0].shape)
+        axis = _axis(axis, rank)
+        for p in pieces:
+            if len(p.shape) != rank or any(d != axis and p.shape[d] != pieces[0].shape[d] for d in range(rank)):
+                raise GraphError("cat needs equal shapes off the axis")
+        if len(pieces) == 1:
+            return pieces[0]
+        shape = tuple(sum(p.shape[axis] for p in pieces) if d == axis else s for d, s in enumerate(pieces[0].shape))
+        out, at = self.zeros(shape), 0
+        for p in pieces:
+            out = self.slice_scatter(out, p, [at if d == axis else 0 for d in range(rank)], [1] * rank)
+            at += p.shape[axis]
+        return out
+
+    def stack(self, tensors, axis=0):
+        """Stacking along a new `axis`: `cat` of the pieces with that axis inserted."""
+        pieces = [self._owned(t) for t in tensors]
+        if not pieces:
+            raise GraphError("stack needs at least one tensor")
+        axis = _axis(axis, len(pieces[0].shape) + 1)
+        return self.cat([self.reshape(p, p.shape[:axis] + (1,) + p.shape[axis:]) for p in pieces], axis)
 
     # ---- optimizer steps: each returns the next value of a tensor ------------------------
     # They follow torch.optim's single-tensor update order, so a training step
@@ -637,7 +828,7 @@ class Graph:
             feed_ids[name] = node["id"]
         for node_id in set(feed_ids.values()):
             nodes[node_id].pop("data", None)
-        classes, targets = {}, set()
+        classes, targets, bounds = {}, set(), {}
         for node in nodes:
             if node["op"] in ("cross_entropy", "cross_entropy_grad"):
                 targets.add(node["b"])
@@ -646,6 +837,16 @@ class Graph:
                     if classes.get(node["b"], width) != width:
                         raise GraphError("cross_entropy targets are shared by logits of different widths")
                     classes[node["b"]] = width
+            elif node["op"] in _INDEX_FIELD:
+                # A fed index is checked at every run against the smallest
+                # extent it indexes, as the host checks it.
+                root = node[_INDEX_FIELD[node["op"]]]
+                while nodes[root]["op"] == "reshape":
+                    root = nodes[root]["a"]
+                targets.add(root)
+                extent = self._tensors[node["a"]].shape[node["axis"]]
+                if "data" not in nodes[root]:
+                    bounds[root] = min(bounds.get(root, extent), extent)
 
         def output_name(value, what):
             if isinstance(value, Tensor):
@@ -671,7 +872,7 @@ class Graph:
             if self._tensors[out_id].shape != tensor.shape:
                 raise GraphError("carry %s does not match the input shape" % name)
             if node["id"] in targets:
-                raise GraphError("cross_entropy targets cannot carry a value")
+                raise GraphError("cross_entropy targets and index inputs cannot carry a value")
             node["carry"] = name
         resident_names = []
         for value in resident:
@@ -680,7 +881,7 @@ class Graph:
                 resident_names.append(name)
         if backend is not None and backend not in ("webgpu", "webgl2", "wasm", "cpu-js", "cpu-python"):
             raise GraphError("Unknown backend %r" % (backend,))
-        return Session(self, program, feed_ids, classes, resident_names, backend, on_ready, on_error)
+        return Session(self, program, feed_ids, classes, resident_names, backend, on_ready, on_error, bounds)
 
 
 # ---- float32 reference implementation -----------------------------------------------
@@ -857,8 +1058,8 @@ def _optimizer_step(op, node, a, b, c):
 
 def execute_locally(program, check_finite=True):
     """Run a program with the float32 reference implementation in Python."""
-    if not isinstance(program, dict) or program.get("version") not in (1, 2, 3):
-        raise ComputeError("PROTOCOL", "Only graph protocol versions 1, 2 and 3 are supported")
+    if not isinstance(program, dict) or program.get("version") not in (1, 2, 3, 4):
+        raise ComputeError("PROTOCOL", "Only graph protocol versions 1, 2, 3 and 4 are supported")
     if not isinstance(program.get("nodes"), list) or not isinstance(program.get("outputs"), list):
         raise ComputeError("PROTOCOL", "A program needs node and output lists")
     values = []
@@ -962,6 +1163,50 @@ def execute_locally(program, check_finite=True):
         elif op == "reshape":
             shape = tuple(node["shape"])
             out = a
+        elif op in ("slice", "slice_scatter"):
+            # Coordinates, not strides: position x of the box is source
+            # position begin + x * stride on every axis.
+            begin, stride = node["begin"], node["stride"]
+            st = _strides(sa)
+            box = tuple(node["shape"]) if op == "slice" else shapes[node["b"]]
+            at = [sum((begin[d] + x[d] * stride[d]) * st[d] for d in range(len(sa))) for x in _indices(box)]
+            if op == "slice":
+                shape = box
+                out = [a[j] for j in at]
+            else:
+                shape = sa
+                out = list(a)
+                for j, v in zip(at, values[node["b"]]):
+                    out[j] = v
+        elif op in ("index_select", "gather"):
+            axis, index = node["axis"], values[node["b"]]
+            st = _strides(sa)
+            if op == "index_select":
+                shape = tuple(len(index) if d == axis else s for d, s in enumerate(sa))
+                out = [a[sum((int(index[x[d]]) if d == axis else x[d]) * st[d] for d in range(len(sa)))] for x in _indices(shape)]
+            else:
+                shape = shapes[node["b"]]
+                out = [a[sum((int(index[i]) if d == axis else x[d]) * st[d] for d in range(len(sa)))]
+                       for i, x in enumerate(_indices(shape))]
+        elif op in ("index_add", "scatter_add"):
+            # For every output element: its base value, then each contribution
+            # landing on it in ascending index position, rounding each addition.
+            axis, src, sb, index = node["axis"], values[node["b"]], shapes[node["b"]], values[node["c"]]
+            shape = sa
+            tb = _strides(sb)
+            out = []
+            for x in _indices(sa):
+                v = a[len(out)]
+                if op == "index_add":
+                    for k, t in enumerate(index):
+                        if int(t) == x[axis]:
+                            v = _f32(v + src[sum((k if d == axis else x[d]) * tb[d] for d in range(len(sa)))])
+                elif all(d == axis or x[d] < sb[d] for d in range(len(sa))):
+                    for k in range(sb[axis]):
+                        j = sum((k if d == axis else x[d]) * tb[d] for d in range(len(sa)))
+                        if int(index[j]) == x[axis]:
+                            v = _f32(v + src[j])
+                out.append(v)
         elif op == "matmul":
             b, sb = values[node["b"]], shapes[node["b"]]
             m, k, n = sa[-2], sa[-1], sb[-1]
@@ -1056,12 +1301,30 @@ _KERNEL_OPS = frozenset((
     "input", "full", "add", "sub", "mul", "div", "transpose", "permute", "reshape", "sum", "mean",
     "softmax", "log_softmax", "cross_entropy", "cross_entropy_grad", "matmul", "life",
     "maximum", "minimum", "where", "uniform",
-) + _COMPARE_OPS) | _KERNEL_UNARY | _KERNEL_STEPS
+) + _COMPARE_OPS) | _KERNEL_UNARY | _KERNEL_STEPS | _VERSION_FOUR_OPS
+
+
+def _pad4(values, fill):
+    return [fill] * (4 - len(values)) + list(values)
+
+
+def _box_walk(node, source_shape, box):
+    """A box's start offset and signed per-axis strides through the source's
+    storage, padded to four dimensions (what graph_slice walks)."""
+    st = _strides(source_shape)
+    offset = sum(b * t for b, t in zip(node["begin"], st))
+    return _pad4(box, 1), _pad4([t * s for t, s in zip(st, node["stride"])], 0), offset
+
+
+def _axis_walk(source_shape, axis):
+    """The source's strides padded to four dimensions with the axis's zeroed, and the axis stride."""
+    st = _strides(source_shape)
+    return _pad4([0 if d == axis else t for d, t in enumerate(st)], 0), st[axis]
 
 
 def _execute_kernels(program, storage, check_finite=True):
     """`execute_locally` on Zipp's tensor kernels: the same float32 numbers."""
-    if (program.get("version") not in (1, 2, 3)
+    if (program.get("version") not in (1, 2, 3, 4)
             or any(node.get("op") not in _KERNEL_OPS for node in program.get("nodes", ()))):
         return _execute_reference(program, storage, check_finite)
     values = []
@@ -1130,6 +1393,33 @@ def _execute_kernels(program, storage, check_finite=True):
         elif op == "reshape":
             shape = tuple(node["shape"])
             out = values[node["a"]]
+        elif op == "slice":
+            shape = tuple(node["shape"])
+            dims, walk, offset = _box_walk(node, shapes[node["a"]], shape)
+            out = _k.graph_slice(values[node["a"]], dims, walk, offset)
+        elif op == "slice_scatter":
+            shape = shapes[node["a"]]
+            dims, walk, offset = _box_walk(node, shape, shapes[node["b"]])
+            out = _k.graph_slice_scatter(values[node["a"]], values[node["b"]], dims, walk, offset)
+        elif op in ("index_select", "index_add"):
+            sa, axis = shapes[node["a"]], node["axis"]
+            index = values[node["b" if op == "index_select" else "c"]]
+            count = _k.size(index)
+            outer, length, inner = _size(sa[:axis]), sa[axis], _size(sa[axis + 1:])
+            if op == "index_select":
+                shape = tuple(count if d == axis else s for d, s in enumerate(sa))
+                out = _k.graph_index_select(values[node["a"]], index, outer, length, count, inner)
+            else:
+                shape = sa
+                out = _k.graph_index_add(values[node["a"]], values[node["b"]], index, outer, length, count, inner)
+        elif op == "gather":
+            walk, stride = _axis_walk(shapes[node["a"]], node["axis"])
+            shape = shapes[node["b"]]
+            out = _k.graph_gather(values[node["a"]], values[node["b"]], _pad4(shape, 1), walk, stride)
+        elif op == "scatter_add":
+            shape = shapes[node["a"]]
+            walk, stride = _axis_walk(shape, node["axis"])
+            out = _k.graph_scatter_add(values[node["a"]], values[node["b"]], values[node["c"]], _pad4(shapes[node["c"]], 1), walk, stride)
         elif op == "matmul":
             sa, sb = shapes[node["a"]], shapes[node["b"]]
             m, k, n = sa[-2], sa[-1], sb[-1]
@@ -1203,11 +1493,12 @@ def _poisoned(cause):
 class Session:
     """A prepared program whose tensors stay on the device between runs (see `Graph.prepare`)."""
 
-    def __init__(self, graph, program, feeds, classes, resident, backend, on_ready, on_error):
+    def __init__(self, graph, program, feeds, classes, resident, backend, on_ready, on_error, bounds=None):
         self._graph = graph
         self._program = program
         self._feeds = dict(feeds)
         self._classes = classes
+        self._bounds = dict(bounds or {})
         self._resident = list(resident)
         self._outputs = [o["name"] for o in program["outputs"]]
         self._sizes = {node["id"]: _size(node["shape"]) for node in program["nodes"] if node["op"] == "input"}
@@ -1346,6 +1637,10 @@ class Session:
                 values = _k.to_list(flat) if _k is not None and isinstance(flat, _k.Storage) else flat
                 if any(v != int(v) or not 0 <= v < self._classes[node_id] for v in values):
                     raise GraphError("%s must hold integer class indices in [0, %d)" % (name, self._classes[node_id]))
+            if node_id in self._bounds:
+                values = _k.to_list(flat) if _k is not None and isinstance(flat, _k.Storage) else flat
+                if any(v != int(v) or not 0 <= v < self._bounds[node_id] for v in values):
+                    raise GraphError("%s must hold integer indices in [0, %d)" % (name, self._bounds[node_id]))
             given[str(node_id)] = flat
         return given
 

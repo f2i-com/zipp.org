@@ -216,6 +216,49 @@ const KERNELS = {
   uint k2 = mix32((uint(d.z) | (uint(d.w) << 16u)) ^ k1);
   value = float(mix32(mix32(uint(i) ^ k2) + k1) >> 8u) * 5.9604644775390625e-8;`)],
   gather: [['A'], each('value = A(strided(i, sa));')],
+  // Version 4. slice: the strided gather from the box's first element (g.x);
+  // its strides (sa) may be negative, which int arithmetic carries as is.
+  slice: [['A'], each('value = A(g.x + strided(i, sa));')],
+  // slice_scatter over the base's padded dims (d): an element inside the box
+  // (begin sa, signed stride sb, extent g) takes the source's value, the rest
+  // the base's. Distances are made non-negative before any division.
+  slice_scatter: [['A', 'B'], each(`int x3 = i % d.w; int r3 = i / d.w; int x2 = r3 % d.z; int r2 = r3 / d.z;
+  ivec4 x = ivec4(r2 / d.y, r2 % d.y, x2, x3);
+  ivec4 q = ivec4(0); bool inside = true;
+  for (int k = 0; k < 4; k++) {
+    int s = abs(sb[k]); int t = sb[k] > 0 ? x[k] - sa[k] : sa[k] - x[k];
+    if (t < 0 || t % s != 0 || t / s >= g[k]) { inside = false; break; }
+    q[k] = t / s;
+  }
+  value = inside ? B(((q.x * g.y + q.y) * g.z + q.z) * g.w + q.w) : A(i);`)],
+  // index_select over [outer, N = g.x, inner = g.y], len the index's length (B).
+  index_select: [['A', 'B'], each(`int inner = g.y; int r = i % inner; int k = (i / inner) % len; int o = i / (inner * len);
+  int p = clamp(int(B(k)), 0, g.x - 1);
+  value = A((o * g.x + p) * inner + r);`)],
+  // index_add: the base (A) plus every source row (B, [outer, len, inner]) whose
+  // index (C) names this position, in ascending k.
+  index_add: [['A', 'B', 'C'], each(`int inner = g.y; int r = i % inner; int p = (i / inner) % g.x; int o = i / (inner * g.x);
+  value = A(i);
+  for (int k = 0; k < len; k++) if (int(C(k)) == p) value += B((o * len + k) * inner + r);`)],
+  // gather over the index's padded dims (d): a's strides with the axis zeroed
+  // (sa), plus the index value (B, clamped below g.y) times the axis stride g.x.
+  gather_axis: [['A', 'B'], each('value = A(strided(i, sa) + clamp(int(B(i)), 0, g.y - 1) * g.x);')],
+  // scatter_add over the base's padded dims (d): the index's padded dims (sa),
+  // the padded axis (g.x); every index element along the axis that lies at this
+  // position off the axis and names it, in ascending order, adds its source.
+  scatter_add: [['A', 'B', 'C'], each(`int x3 = i % d.w; int r3 = i / d.w; int x2 = r3 % d.z; int r2 = r3 / d.z;
+  ivec4 x = ivec4(r2 / d.y, r2 % d.y, x2, x3);
+  value = A(i);
+  bool within = true;
+  for (int k = 0; k < 4; k++) if (k != g.x && x[k] >= sa[k]) within = false;
+  if (within) {
+    int want = x[g.x]; ivec4 q = x;
+    for (int k = 0; k < sa[g.x]; k++) {
+      q[g.x] = k;
+      int j = ((q.x * sa.y + q.y) * sa.z + q.z) * sa.w + q.w;
+      if (int(C(j)) == want) value += B(j);
+    }
+  }`)],
   pair: [['A'], each('int j = i * 2; value = A(j); if (j + 1 < len) value += A(j + 1);')],
   scale: [['A'], each('value = A(i) / f.x;')],
   reduce: [['A'], each(`int inner = g.x; int base = (i / inner) * len * inner + i % inner;
@@ -525,6 +568,12 @@ export class WebGL2Backend {
         case 'relu':case 'positive':case 'neg':case 'exp':case 'log':case 'sqrt':
         case 'tanh':case 'sigmoid':case 'gelu':case 'gelu_grad':this.dispatch('unary',{op:UNARY[n.op]},refs,out);break;
         case 'transpose':case 'permute':this.dispatch('gather',{d:n.dims,sa:n.srcStrides},refs,out);break;
+        case 'slice':this.dispatch('slice',{d:n.boxDims,sa:n.boxStrides,g:[n.offset,0,0,0]},refs,out);break;
+        case 'slice_scatter':this.dispatch('slice_scatter',{d:n.dims,sa:n.begin4,sb:n.stride4,g:n.boxDims},refs,out);break;
+        case 'index_select':this.dispatch('index_select',{len:n.count,g:[n.len,n.inner,0,0]},refs,out);break;
+        case 'index_add':this.dispatch('index_add',{len:n.count,g:[n.len,n.inner,0,0]},refs,out);break;
+        case 'gather':this.dispatch('gather_axis',{d:n.dims,sa:n.srcStrides,g:[n.axisStride,n.len,0,0]},refs,out);break;
+        case 'scatter_add':this.dispatch('scatter_add',{d:n.dims,sa:n.indexDims,g:[n.axis4,0,0,0]},refs,out);break;
         case 'where':this.dispatch('where',{mode:n.mode==='same'?0:3,d:n.dims,sa:n.cStrides,sb:n.aStrides,g:n.bStrides},refs,out);break;
         case 'uniform':this.dispatch('uniform',{d:[...halves(n.seed),...halves(n.step)]},[],out);break;
         case 'sum':case 'mean':

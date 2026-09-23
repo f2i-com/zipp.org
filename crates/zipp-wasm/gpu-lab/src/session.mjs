@@ -1,4 +1,4 @@
-import {check, ComputeError, float32Data, checkClassTargets, adamStep, sizeOf} from './graph.mjs';
+import {check, ComputeError, float32Data, checkClassTargets, checkIndices, adamStep, sizeOf} from './graph.mjs';
 const clock=()=>globalThis.performance?.now()??Date.now();
 
 /**
@@ -42,7 +42,7 @@ export class Session {
   /** What the plan expects and keeps: for a host relaying the session to a guest. */
   describe(){
     return {backend:this.backend,step:this.stepNumber,residentBytes:this.residentBytes,poisoned:this.poisoned,
-      inputs:this.inputs.map(n=>({id:n.id,shape:[...n.shape],fed:!!n.fed,...(n.carry!==undefined?{carry:n.carry}:{}),...(n.classes!==undefined?{classes:n.classes}:{})})),
+      inputs:this.inputs.map(n=>({id:n.id,shape:[...n.shape],fed:!!n.fed,...(n.carry!==undefined?{carry:n.carry}:{}),...(n.classes!==undefined?{classes:n.classes}:{}),...(n.indexBound!==undefined?{indexBound:n.indexBound}:{})})),
       outputs:this.plan.outputs.map(o=>({name:o.name,shape:[...this.plan.nodes[o.id].shape],resident:this.resident.has(o.name)}))};
   }
   retain(h){this.retained.set(h,(this.retained.get(h)??0)+1);return h;}
@@ -77,6 +77,7 @@ export class Session {
         elements+=data.length;check(elements<=limits.maxInputElements,'LIMIT','Total input exceeds limit');
         const owned=float32Data(data);
         if(n.classes!==undefined)checkClassTargets(owned,n.classes);
+        if(n.indexBound!==undefined)checkIndices(owned,n.indexBound);
         fed.set(id,owned);
       }
       // Every fed input needs a value until a carry has given it one.

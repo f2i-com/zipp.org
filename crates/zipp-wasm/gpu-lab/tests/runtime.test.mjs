@@ -89,7 +89,7 @@ test('WASM module has no imports and grows/rebinds its memory safely',async()=>{
 });
 
 const invalidCases=[
-  ['version',p=>{p.version=4;}], ['unknown op',p=>{p.nodes[1].op='__proto__';}],
+  ['version',p=>{p.version=5;}], ['unknown op',p=>{p.nodes[1].op='__proto__';}],
   ['extra field',p=>{p.nodes[1].source='arbitrary shader';}],['forward reference',p=>{p.nodes[1].a=2;}],
   ['negative reference',p=>{p.nodes[1].a=-1;}],['duplicate ID',p=>{p.nodes[1].id=0;}],
   ['wrong data size',p=>{p.nodes[0].data=[];}],['NaN',p=>{p.nodes[0].data[0]=NaN;}],

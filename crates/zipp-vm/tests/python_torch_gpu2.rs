@@ -226,8 +226,10 @@ fn prepared_steps_upload_constants_once_and_refuse_values_a_step_would_change() 
     // causal tril mask compared and used by masked_fill) are uploaded once
     // and the session equals per-call compilation bit for bit; a bool mask
     // argument is fed every step. A value computed from a parameter outside
-    // autograd, one derived from a step argument, or a CPU random draw would
-    // be frozen at its prepare() value and is refused with the reason.
+    // autograd or one derived from a step argument would be frozen at its
+    // prepare() value and is refused with the reason. A CPU random draw is
+    // drawn again on the host and fed every step (python_torch_gpu3.rs), so
+    // the session draws what per-call compilation draws.
     let out = run(r#"
 import torch
 from torch import nn
@@ -300,10 +302,6 @@ for kind in ("ones", "arange", "scalar tensor", "causal mask", "mask argument", 
     let argument = "prepare(): the step reads a tensor that an eager operation derived from a step argument (a one-hot, a cast, \
                     arithmetic on class targets) as a graph input; the session would keep its prepare() value at every step. \
                     Pass the derived tensor as the argument instead";
-    let random = "prepare() cannot record a step that draws random numbers on the CPU (torch.rand/randn/randint/normal...): \
-                  the prepared session would replay the same draw at every step. F.dropout, nn.Dropout and torch.rand_like or \
-                  torch.bernoulli of graph tensors draw on the device, afresh every step. Use per-call torch.compile, \
-                  or draw outside the step and pass the tensor as an argument";
     let fine = "prepared == per-call True eager within 1e-5 True";
     assert_eq!(
         out,
@@ -316,7 +314,7 @@ for kind in ("ones", "arange", "scalar tensor", "causal mask", "mask argument", 
             format!("no_grad from a parameter -> {parameter}"),
             format!("detach arithmetic -> {parameter}"),
             format!("one_hot of an argument -> {argument}"),
-            format!("randn -> {random}"),
+            format!("randn {fine}"),
         ]
     );
 }

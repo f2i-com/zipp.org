@@ -58,6 +58,18 @@ export const COMPARE_OPS = Object.freeze(['eq', 'ne', 'lt', 'le', 'gt', 'ge']);
  */
 export const VERSION_THREE_OPS = Object.freeze([...COMPARE_OPS, 'maximum', 'minimum', 'where', 'uniform']);
 /**
+ * Operations version 4 added: element selection and its gradients. `slice`
+ * reads a strided box, `slice_scatter` writes one into a copy of a base,
+ * `index_select`/`gather` read along one axis by an integer index input, and
+ * `index_add`/`scatter_add` accumulate along it. All of them move values
+ * without arithmetic except the two accumulations, whose order is part of the
+ * protocol: each output element is its base value plus the contributions in
+ * ascending index position, one float32 addition at a time, left to right
+ * (PyTorch's CPU order for index_add_ and scatter_add_). A writer labels a
+ * graph 4 only once it uses one of these.
+ */
+export const VERSION_FOUR_OPS = Object.freeze(['slice', 'slice_scatter', 'index_select', 'index_add', 'gather', 'scatter_add']);
+/**
  * The `uniform` bit generator: a keyed hash of (seed, step, element index),
  * integer arithmetic modulo 2^32 only, so every backend produces the same bits
  * and none depends on a transcendental function or a float rounding mode.
@@ -148,6 +160,13 @@ export function checkClassTargets(data, classes, op = 'cross_entropy') {
     check(Number.isInteger(t) && t >= 0 && t < classes, 'NUMBER', `${op} targets must be an input of integer class indices in [0, C)`);
   }
 }
+/** An index input of the version-4 selections: every value an integer in [0, bound). */
+export function checkIndices(data, bound) {
+  for (let i = 0; i < data.length; i++) {
+    const t = data[i];
+    check(Number.isInteger(t) && t >= 0 && t < bound, 'NUMBER', `Index values must be integers in [0, ${bound})`);
+  }
+}
 function sameShape(a, b) { return a.length === b.length && a.every((v, i) => v === b[i]); }
 /** Contiguous row-major strides, padded on the left to four dimensions. */
 function strides4(shape) {
@@ -202,10 +221,10 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
     'LIMIT', 'Limits must be positive safe integers');
   const limits = {...DEFAULT_LIMITS, ...overrides};
   keys(program, ['version', 'nodes', 'outputs'], ['version', 'nodes', 'outputs']);
-  // Versions 1, 2 and 3 share one validator: each names a larger operation
-  // set, and every older graph means the same thing under the newer version.
-  check(program.version === 1 || program.version === 2 || program.version === 3, 'PROTOCOL',
-    'Only graph protocol versions 1, 2 and 3 are supported');
+  // Versions 1 to 4 share one validator: each names a larger operation set,
+  // and every older graph means the same thing under the newer version.
+  check(program.version === 1 || program.version === 2 || program.version === 3 || program.version === 4, 'PROTOCOL',
+    'Only graph protocol versions 1, 2, 3 and 4 are supported');
   check(Array.isArray(program.nodes) && program.nodes.length > 0 && program.nodes.length <= limits.maxNodes,
     'LIMIT', 'Invalid graph node count');
   check(Array.isArray(program.outputs) && program.outputs.length > 0 && program.outputs.length <= limits.maxOutputs,
@@ -217,7 +236,7 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
     // Validate op before looking up a kernel; identifiers never become code.
     keys(raw, ['id', 'op', 'shape', 'data', 'value', 'a', 'b', 'c', 'axis', 'keepdim', 'dims',
       'lr', 'momentum', 'dampening', 'beta1', 'beta2', 'eps', 'step', 'carry',
-      'dtype', 'transposed', 'seed'], ['id', 'op']);
+      'dtype', 'transposed', 'seed', 'begin', 'stride'], ['id', 'op']);
     check(raw.id === id, 'PROTOCOL', 'Node IDs must be consecutive integers starting at zero');
     const n = {id, op: raw.op, refs: []};
     // `blocks` marks the one position that can read a quantized node: the
@@ -234,6 +253,15 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
       n[key] = r; n.refs.push(r); return nodes[r];
     };
     let units = 0;
+    // An index is data every kernel may address memory with, so it is an input
+    // (static or fed, read through reshapes) whose values are checked here or
+    // at each upload against the smallest extent any user indexes.
+    const indexInput = (r, bound, what) => {
+      const target = nodes[root[r]];
+      check(target.op === 'input' && target.carry === undefined, 'NUMBER', `${what} takes its index from an input of integers`);
+      if (target.data) checkIndices(target.data, bound);
+      target.indexBound = Math.min(target.indexBound ?? bound, bound);
+    };
     const op = typeof raw.op === 'string' ? raw.op : '';
     if (BINARY_OPS.includes(op)) {
       keys(raw, ['id', 'op', 'a', 'b'], ['a', 'b']);
@@ -512,6 +540,96 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
           Object.assign(n, adamStep(n.raw, raw.step));
         }
         n.shape = [...inputs[0].shape]; units = inputs[0].size * 8; break;
+      }
+      case 'slice': case 'slice_scatter': {
+        // slice: out[i] = a[begin + i * stride] per axis, a box of `shape`.
+        // slice_scatter: a copy of `a` with that box (b's shape) replaced by b.
+        // A stride is a nonzero integer; a negative one walks the axis backwards.
+        const scatter = op === 'slice_scatter';
+        keys(raw, scatter ? ['id', 'op', 'a', 'b', 'begin', 'stride'] : ['id', 'op', 'a', 'begin', 'stride', 'shape'],
+          scatter ? ['a', 'b', 'begin', 'stride'] : ['a', 'begin', 'stride', 'shape']);
+        const a = ref('a'), src = scatter ? ref('b') : null, rank = a.shape.length;
+        check(rank >= 1, 'SHAPE', `${op} requires at least one dimension`);
+        const box = scatter ? [...src.shape] : shapeOf(raw.shape, limits);
+        const begin = intArray(raw.begin, MAX_RANK, 'begin'), stride = intArray(raw.stride, MAX_RANK, 'stride');
+        check(box.length === rank && begin.length === rank && stride.length === rank, 'SHAPE',
+          `${op} needs one begin, stride and extent per axis of the source`);
+        for (let d = 0; d < rank; d++) {
+          const last = begin[d] + (box[d] - 1) * stride[d];
+          check(stride[d] !== 0 && Math.abs(stride[d]) <= limits.maxDimension, 'SHAPE', `${op} strides are nonzero integers`);
+          check(begin[d] >= 0 && begin[d] < a.shape[d] && last >= 0 && last < a.shape[d], 'SHAPE',
+            `${op} reads axis ${d} of [${a.shape}] outside its range`);
+        }
+        const aStrides = strides4(a.shape).slice(MAX_RANK - rank);
+        // The box's walk through a's storage: an offset and a signed stride per padded axis.
+        n.offset = begin.reduce((s, b, d) => s + b * aStrides[d], 0);
+        n.boxDims = pad4(box);
+        n.boxStrides = [...Array(MAX_RANK - rank).fill(0), ...aStrides.map((s, d) => s * stride[d])];
+        n.begin4 = [...Array(MAX_RANK - rank).fill(0), ...begin];
+        n.stride4 = [...Array(MAX_RANK - rank).fill(1), ...stride];
+        n.shape = scatter ? [...a.shape] : box;
+        n.dims = pad4(n.shape);
+        units = scatter ? a.size + src.size : sizeOf(box);
+        break;
+      }
+      case 'index_select': case 'gather': {
+        // index_select: along `axis`, output position k reads a's position index[k]
+        // (index is 1-D). gather: every output element reads a at its own
+        // position, `axis` replaced by the index's value there (index has a's rank;
+        // its other extents at most a's). Either index is an input of integers.
+        keys(raw, ['id', 'op', 'a', 'b', 'axis'], ['a', 'b', 'axis']);
+        const a = ref('a'), index = ref('b'), rank = a.shape.length;
+        check(rank >= 1, 'SHAPE', `${op} requires at least one dimension`);
+        const axis = axisOf(raw.axis, rank); n.axis = axis;
+        if (op === 'index_select') {
+          check(index.shape.length === 1, 'SHAPE', 'index_select takes a 1-D index');
+          n.outer = sizeOf(a.shape.slice(0, axis)); n.len = a.shape[axis]; n.inner = sizeOf(a.shape.slice(axis + 1));
+          n.count = index.shape[0];
+          n.shape = a.shape.map((d, i) => i === axis ? n.count : d);
+        } else {
+          check(index.shape.length === rank && index.shape.every((d, i) => i === axis || d <= a.shape[i]), 'SHAPE',
+            `gather needs an index of the source's rank, no larger than [${a.shape}] off axis ${axis}`);
+          const st = strides4(a.shape);
+          n.axisStride = st[MAX_RANK - rank + axis]; n.len = a.shape[axis];
+          n.srcStrides = st.map((s, d) => d === MAX_RANK - rank + axis || d < MAX_RANK - rank ? 0 : s);
+          n.shape = [...index.shape];
+        }
+        indexInput(raw.b, a.shape[axis], op);
+        n.dims = pad4(n.shape);
+        break;
+      }
+      case 'index_add': case 'scatter_add': {
+        // A copy of base `a` plus source `b` accumulated at index `c` along
+        // `axis`: each output element is its base value, then every
+        // contribution that lands on it in ascending index position, one
+        // float32 addition at a time. index_add: c is 1-D and b is a with that
+        // axis c long. scatter_add: c has a's rank (no larger than a off the
+        // axis) and b is c's shape.
+        keys(raw, ['id', 'op', 'a', 'b', 'c', 'axis'], ['a', 'b', 'c', 'axis']);
+        const a = ref('a'), src = ref('b'), index = ref('c'), rank = a.shape.length;
+        check(rank >= 1, 'SHAPE', `${op} requires at least one dimension`);
+        const axis = axisOf(raw.axis, rank); n.axis = axis;
+        if (op === 'index_add') {
+          check(index.shape.length === 1, 'SHAPE', 'index_add takes a 1-D index');
+          n.outer = sizeOf(a.shape.slice(0, axis)); n.len = a.shape[axis]; n.inner = sizeOf(a.shape.slice(axis + 1));
+          n.count = index.shape[0];
+          check(sameShape(src.shape, a.shape.map((d, i) => i === axis ? n.count : d)), 'SHAPE',
+            `index_add needs a source of shape [${a.shape.map((d, i) => i === axis ? n.count : d)}]`);
+          units = a.size * n.count;
+        } else {
+          check(index.shape.length === rank && index.shape.every((d, i) => i === axis || d <= a.shape[i]), 'SHAPE',
+            `scatter_add needs an index of the base's rank, no larger than [${a.shape}] off axis ${axis}`);
+          check(sameShape(src.shape, index.shape), 'SHAPE', 'scatter_add needs a source of the index\'s shape');
+          const st = strides4(a.shape);
+          n.axisStride = st[MAX_RANK - rank + axis]; n.len = a.shape[axis];
+          n.dstStrides = st.map((s, d) => d === MAX_RANK - rank + axis || d < MAX_RANK - rank ? 0 : s);
+          n.indexDims = pad4(index.shape);
+          n.axis4 = MAX_RANK - rank + axis;
+          units = a.size * index.shape[axis];
+        }
+        indexInput(raw.c, a.shape[axis], op);
+        n.shape = [...a.shape]; n.dims = pad4(n.shape);
+        break;
       }
       default: throw new ComputeError('OP', `Unsupported operation: ${String(raw.op)}`);
     }

@@ -114,6 +114,53 @@ const KERNELS = {
   uniform: [[], each(`let k1 = mix32(P.g.x ^ 0x9e3779b9u); let k2 = mix32(P.g.y ^ k1);
   O[i] = f32(mix32(mix32(i ^ k2) + k1) >> 8u) * 5.9604644775390625e-8;`)],
   gather: [['A'], each('O[i] = A[strided(i, P.sa)];')],
+  // Version 4. slice: the strided gather from the box's first element (g.x);
+  // negative strides arrive as two's-complement words and u32 arithmetic wraps
+  // modulo 2^32, so the sum is the signed one.
+  slice: [['A'], each('O[i] = A[P.g.x + strided(i, P.sa)];')],
+  // slice_scatter over the base's padded dims (d): inside the box (begin sa,
+  // signed stride sb, extent g) the source's value, elsewhere the base's.
+  slice_scatter: [['A', 'B'], each(`let x3 = i % P.d.w; let r3 = i / P.d.w; let x2 = r3 % P.d.z; let r2 = r3 / P.d.z;
+  let x = vec4<i32>(i32(r2 / P.d.y), i32(r2 % P.d.y), i32(x2), i32(x3));
+  let begin = bitcast<vec4<i32>>(P.sa); let stride = bitcast<vec4<i32>>(P.sb); let ext = vec4<i32>(P.g);
+  var q = vec4<i32>(0); var inside = true;
+  for (var k = 0; k < 4; k = k + 1) {
+    let s = abs(stride[k]); let t = select(begin[k] - x[k], x[k] - begin[k], stride[k] > 0);
+    if (t < 0 || t % s != 0 || t / s >= ext[k]) { inside = false; break; }
+    q[k] = t / s;
+  }
+  if (inside) { O[i] = B[u32(((q.x * ext.y + q.y) * ext.z + q.z) * ext.w + q.w)]; } else { O[i] = A[i]; }`)],
+  // index_select over [outer, N = g.x, inner = g.y]; len is the index's (B) length.
+  index_select: [['A', 'B'], each(`let inner = P.g.y; let r = i % inner; let k = (i / inner) % P.len; let o = i / (inner * P.len);
+  let p = u32(clamp(i32(B[k]), 0, i32(P.g.x) - 1));
+  O[i] = A[(o * P.g.x + p) * inner + r];`)],
+  // index_add: the base (A) plus every source row (B, [outer, len, inner]) whose
+  // index (C) names this position, in ascending k.
+  index_add: [['A', 'B', 'C'], each(`let inner = P.g.y; let r = i % inner; let p = (i / inner) % P.g.x; let o = i / (inner * P.g.x);
+  var v = A[i];
+  for (var k = 0u; k < P.len; k = k + 1u) { if (i32(C[k]) == i32(p)) { v = v + B[(o * P.len + k) * inner + r]; } }
+  O[i] = v;`)],
+  // gather over the index's padded dims (d): a's strides with the axis zeroed
+  // (sa), plus the index value (B, clamped below g.y) times the axis stride g.x.
+  gather_axis: [['A', 'B'], each('O[i] = A[strided(i, P.sa) + u32(clamp(i32(B[i]), 0, i32(P.g.y) - 1)) * P.g.x];')],
+  // scatter_add over the base's padded dims (d): the index's padded dims (sa)
+  // and the padded axis (g.x); every index element along the axis at this
+  // position off the axis that names it adds its source, in ascending order.
+  scatter_add: [['A', 'B', 'C'], each(`let x3 = i % P.d.w; let r3 = i / P.d.w; let x2 = r3 % P.d.z; let r2 = r3 / P.d.z;
+  let x = vec4<u32>(r2 / P.d.y, r2 % P.d.y, x2, x3);
+  let axis = P.g.x;
+  var v = A[i];
+  var within = true;
+  for (var k = 0u; k < 4u; k = k + 1u) { if (k != axis && x[k] >= P.sa[k]) { within = false; } }
+  if (within) {
+    var q = x;
+    for (var k = 0u; k < P.sa[axis]; k = k + 1u) {
+      q[axis] = k;
+      let j = ((q.x * P.sa.y + q.y) * P.sa.z + q.z) * P.sa.w + q.w;
+      if (i32(C[j]) == i32(x[axis])) { v = v + B[j]; }
+    }
+  }
+  O[i] = v;`)],
   pair: [['A'], each('let j = i * 2u; var other = 0.0; if (j + 1u < P.len) { other = A[j + 1u]; } O[i] = A[j] + other;')],
   scale: [['A'], each('O[i] = A[i] / P.f.x;')],
   reduce: [['A'], each(`let inner = P.g.x; let base = (i / inner) * P.len * inner + i % inner;
@@ -739,6 +786,18 @@ export class WebGPUBackend {
           await this.dispatch('uniform', u => {u[0] = n.size; u[16] = n.seed >>> 0; u[17] = n.step >>> 0;}, [], out, n.size); break;
         case 'transpose': case 'permute':
           await this.dispatch('gather', u => {u[0] = n.size; u.set(n.dims, 4); u.set(n.srcStrides, 8);}, refs, out, n.size); break;
+        // Signed strides and begins are stored as their 32-bit two's complement.
+        case 'slice':
+          await this.dispatch('slice', u => {u[0] = n.size; u.set(n.boxDims, 4); u.set(n.boxStrides.map(v => v >>> 0), 8); u[16] = n.offset;}, refs, out, n.size); break;
+        case 'slice_scatter':
+          await this.dispatch('slice_scatter', u => {u[0] = n.size; u.set(n.dims, 4); u.set(n.begin4, 8); u.set(n.stride4.map(v => v >>> 0), 12); u.set(n.boxDims, 16);},
+            refs, out, n.size); break;
+        case 'index_select': case 'index_add':
+          await this.dispatch(n.op, u => {u[0] = n.size; u[3] = n.count; u[16] = n.len; u[17] = n.inner;}, refs, out, n.size); break;
+        case 'gather':
+          await this.dispatch('gather_axis', u => {u[0] = n.size; u.set(n.dims, 4); u.set(n.srcStrides, 8); u[16] = n.axisStride; u[17] = n.len;}, refs, out, n.size); break;
+        case 'scatter_add':
+          await this.dispatch('scatter_add', u => {u[0] = n.size; u.set(n.dims, 4); u.set(n.indexDims, 8); u[16] = n.axis4;}, refs, out, n.size); break;
         case 'sum': case 'mean':
           if (n.whole) {
             if (n.op === 'sum') { await this.pairwise(a, out); break; }

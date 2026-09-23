@@ -19,7 +19,8 @@ The bundled `torch` subset is eager CPU-only; experimental `torch.compile` recor
 supported GPU inference and training steps (dense layers with relu, gelu, sigmoid
 or tanh, softmax, MSE or fused cross-entropy, SGD with momentum, Adam or AdamW,
 comparisons and masks, where/masked_fill, clamp, hardtanh/relu6/leaky_relu,
-maximum/minimum and dropout drawn on the device).
+maximum/minimum, dropout drawn on the device, and element selection: slices,
+split/chunk, cat/stack, index_select/embedding lookups and gather).
 General Python is not compiled to shaders. See the [Torch compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).
 
 ## Use JavaScript directly
@@ -44,9 +45,9 @@ attempts are reported by `runtime.info().fallbackAttempts`. Explicit backend
 selection fails if unavailable. Hardware GPU paths reject recognized software
 renderers. Browser/OS policy selects one adapter; this does not pool GPUs.
 
-Graph IR v2 (stage 1: MLP classification training and inference) and v3
-(masks, selection and on-device random numbers) cover, on every backend,
-float32 tensors of rank 0-4:
+Graph IR v2 (stage 1: MLP classification training and inference), v3
+(masks, selection and on-device random numbers) and v4 (element selection by
+position and by index) cover, on every backend, float32 tensors of rank 0-4:
 
 | Family | Operations |
 |---|---|
@@ -55,6 +56,8 @@ float32 tensors of rank 0-4:
 | v3 elementwise | `maximum`, `minimum` (NaN from either side; a tie, -0 against +0 included, returns `a`, as PyTorch does); comparisons `eq`, `ne`, `lt`, `le`, `gt`, `ge` returning float32 1/0 masks (a NaN operand satisfies only `ne`); all with NumPy broadcasting |
 | v3 selection | `where` with `c`, `a`, `b` (three-way broadcasting): `a` where `c` is nonzero (a NaN counts as nonzero), `b` where it is +0 or -0 |
 | Shape | `reshape` (shares storage), `permute`, `transpose` (matrices) |
+| v4 slices | `slice` (`a`, `begin`, `stride`, `shape`, one entry per axis of `a`): out[i] = a[begin + i * stride] per axis, a stride any nonzero integer (a negative one walks backwards); `slice_scatter` (`a`, `b`, `begin`, `stride`): a copy of `a` with that box (b's shape) replaced by `b`. Every position the box touches must lie inside `a` |
+| v4 indexing | `index_select` (`a`, index `b`, `axis`): along the axis, position k is a's position b[k] (b 1-D); `gather` (`a`, index `b`, `axis`): each output element reads a at its own position with the axis coordinate replaced by b's value there (b has a's rank and is no larger off the axis); `index_add` (`a`, `b`, index `c`, `axis`) and `scatter_add` (`a`, `b`, index `c`, `axis`): a copy of `a` plus every source element added where the index sends it |
 | Reductions | `sum`, `mean` over one `axis` (with `keepdim`) or the whole tensor |
 | Rows | `softmax`, `log_softmax` over the last axis (max-subtracted) |
 | Linear algebra | `matmul`: [M,K]@[K,N] and batched [B,M,K]@[B,K,N] (a batch of 1 or a matrix broadcasts) |
@@ -77,6 +80,25 @@ holds WebGPU and WebGL2 to bit equality with cpu-js on them (under ANGLE's
 Direct3D backend `x < y ? y : x` lost a tied zero's sign, so the shaders decide
 ties before ordering).
 
+The two v4 accumulations have a fixed order, which is part of the protocol:
+each output element is its base value, then every contribution that lands on
+it in ascending index position (for `scatter_add`, ascending position along the
+axis), one float32 addition at a time, left to right. That is PyTorch's CPU
+order for `index_add_`, `scatter_add_` and the embedding gradient, so the
+gradient of an `index_select` (an `index_add` into zeros) or a `gather` (a
+`scatter_add` into zeros) is the same float32 bits on every backend, added in
+the order PyTorch adds them; the GPU shaders walk each output's contributors
+in that order rather than using atomics. An index is data every kernel addresses memory
+with, so it must be an `input` (static or fed per session step, read through
+reshapes) of integers in [0, extent): static data is checked when the graph is
+validated and a fed index at every upload, against the smallest extent any
+node indexes with it (`describe()` reports it as `indexBound`); the kernels
+also clamp defensively. `slice`, `slice_scatter`, `index_select` and `gather`
+move values without arithmetic, so signed zeros survive, and the browser
+harness holds WebGPU and WebGL2 to bit equality with cpu-js on all six
+operations (including the accumulation-order case: 1 + 2^-24 + 2^-24 is 1 left
+to right and 1 + 2^-23 the other way).
+
 GELU is the exact-erf form 0.5*x*(1 + erf(x/sqrt(2))). No backend language has
 erf, so all of them evaluate one shared approximation (a Taylor series below 0.5
 and Numerical Recipes' erfc fit above it, fractional error below 1.2e-7); see
@@ -89,14 +111,16 @@ Only named outputs are read back. Inputs and outputs are finite float32: NaN
 produced inside a graph (overflow, then `inf - inf`) propagates through ReLU and
 the reductions and fails readback with `NUMBER` on every backend, including the
 GPUs checked here. One graph runs at a time; await it before submitting another.
-Dispose the runtime after outstanding work finishes. Protocol versions 1, 2
-and 3 are accepted; each adds operations and every older graph means the same
+Dispose the runtime after outstanding work finishes. Protocol versions 1 to 4
+are accepted; each adds operations and every older graph means the same
 thing under a newer version. `zipp_gpu.Graph.program()` labels a graph 2 only
 once it uses something version 1 did not define (a new operation, rank above
 two, broadcasting beyond a scalar operand, an axis reduction or a batched
-matmul), and 3 only once it uses `maximum`, `minimum`, a comparison, `where` or
-`uniform`, so graphs an older host understands still arrive labelled the way
-it expects and a version-2 host refuses a version-3 graph instead of misreading it.
+matmul), 3 only once it uses `maximum`, `minimum`, a comparison, `where` or
+`uniform`, and 4 only once it uses `slice`, `slice_scatter`, `index_select`,
+`index_add`, `gather` or `scatter_add`, so graphs an older host understands
+still arrive labelled the way it expects and an older host refuses a newer
+graph instead of misreading it.
 
 Default validation limits include 512 nodes, 4,194,304 elements per tensor,
 65,536 per dimension, 64 MiB summed **logical** node storage, 100 million
@@ -161,8 +185,11 @@ callback that resubmits cannot recurse), and rejects work after tenant invalidat
   the JavaScript reference over whole training steps.
 - `tests/`: numerical checks, allocation/lifecycle mocks and browser cases; `tests/ml-cases.mjs`
   holds the per-operation fixtures, the MLP training-step generator and the prepared
-  dropout MLP shared with the browser; `tests/ir-v3.test.mjs` covers version 3 (NaN,
-  ties and signed zeros, the generator's known answers and statistics, per-step draws).
+  dropout MLP and embedding/slice session shared with the browser; `tests/ir-v3.test.mjs`
+  covers version 3 (NaN, ties and signed zeros, the generator's known answers and
+  statistics, per-step draws) and `tests/ir-v4.test.mjs` version 4 (validation, each
+  operation against an independent coordinate-wise statement, the accumulation order,
+  fed and bounds-checked index inputs, cpu-js and wasm bit for bit).
 - `docs/INTEGRATION.md`, `docs/ARCHITECTURE.md`, `docs/VALIDATION.md`: contracts and evidence.
 
 ## Check and rebuild

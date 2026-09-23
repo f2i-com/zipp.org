@@ -81,6 +81,59 @@ export class CPUBackend {
         break;
       }
       case 'transpose': case 'permute': strided(n, out, i => a[i]); break;
+      // Version 4. Selections copy values; the two accumulations add each
+      // contribution to the base in ascending index position, rounding every
+      // addition (a Float32Array store rounds once).
+      case 'slice': {
+        const off = n.offset;
+        strided({dims: n.boxDims, srcStrides: n.boxStrides}, out, i => a[off + i]);
+        break;
+      }
+      case 'slice_scatter': {
+        out.set(a);
+        const [d0, d1, d2, d3] = n.boxDims, [s0, s1, s2, s3] = n.boxStrides, off = n.offset;
+        let i = 0;
+        for (let x0 = 0; x0 < d0; x0++) for (let x1 = 0; x1 < d1; x1++) for (let x2 = 0; x2 < d2; x2++) {
+          const base = off + x0*s0 + x1*s1 + x2*s2;
+          for (let x3 = 0; x3 < d3; x3++) out[base + x3*s3] = b[i++];
+        }
+        break;
+      }
+      case 'index_select': {
+        const {outer, len, inner, count} = n;
+        for (let o = 0, at = 0; o < outer; o++) for (let k = 0; k < count; k++) {
+          const from = (o*len + b[k])*inner;
+          for (let r = 0; r < inner; r++) out[at++] = a[from + r];
+        }
+        break;
+      }
+      case 'index_add': {
+        out.set(a);
+        const src = refs[1], index = refs[2], {outer, len, inner, count} = n;
+        for (let o = 0; o < outer; o++) for (let k = 0; k < count; k++) {
+          const to = (o*len + index[k])*inner, from = (o*count + k)*inner;
+          for (let r = 0; r < inner; r++) out[to + r] += src[from + r];
+        }
+        break;
+      }
+      case 'gather': {
+        const stride = n.axisStride;
+        let i = 0;
+        strided(n, out, j => a[j + b[i++]*stride]);
+        break;
+      }
+      case 'scatter_add': {
+        out.set(a);
+        // Every index element in row-major order: two that land on one output
+        // differ only along the axis, so they arrive in ascending position.
+        const src = refs[1], index = refs[2], [d0, d1, d2, d3] = n.indexDims, [s0, s1, s2, s3] = n.dstStrides, stride = n.axisStride;
+        let i = 0;
+        for (let x0 = 0; x0 < d0; x0++) for (let x1 = 0; x1 < d1; x1++) for (let x2 = 0; x2 < d2; x2++) {
+          const base = x0*s0 + x1*s1 + x2*s2;
+          for (let x3 = 0; x3 < d3; x3++, i++) { const at = base + x3*s3 + index[i]*stride; out[at] += src[i]; }
+        }
+        break;
+      }
       case 'where': {
         // refs are [condition, a, b]: nonzero (NaN included) picks a.
         const [c, x, y] = refs, [d0, d1, d2, d3] = n.dims, [c0, c1, c2, c3] = n.cStrides;

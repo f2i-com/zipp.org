@@ -159,6 +159,93 @@ mod kernels {
         }}}
     }
 
+    /// An index value as a position: validated by the host to be an integer
+    /// in [0, n), clamped anyway so no value can address outside the tensor.
+    #[inline(always)]
+    fn position(t: f32, n: i32) -> isize {
+        let c = t as i32;
+        (if c < 0 { 0 } else if c >= n { n - 1 } else { c }) as isize
+    }
+
+    /// `slice_scatter`: a copy of `base` (`n` values) with the strided box that
+    /// starts at `offset` replaced by `src`, visited in `src`'s own order.
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn slice_scatter(base: *const f32, src: *const f32, o: *mut f32, n: i32, offset: i32,
+        d0: i32, d1: i32, d2: i32, d3: i32, s0: i32, s1: i32, s2: i32, s3: i32) {
+        core::ptr::copy_nonoverlapping(base, o, n as usize);
+        let o = o.offset(offset as isize);
+        let mut i = 0isize;
+        for x0 in 0..d0 { for x1 in 0..d1 { for x2 in 0..d2 {
+            let p = o.offset((x0*s0 + x1*s1 + x2*s2) as isize);
+            for x3 in 0..d3 { *p.offset((x3*s3) as isize) = *src.offset(i); i += 1; }
+        }}}
+    }
+
+    /// `index_select` over `[outer, len, inner]`: position k of the output's
+    /// middle axis (`count` long) is position `index[k]` of the source's.
+    #[no_mangle]
+    pub unsafe extern "C" fn index_select(a: *const f32, index: *const f32, o: *mut f32,
+        outer: i32, len: i32, count: i32, inner: i32) {
+        let mut at = 0isize;
+        for p in 0..outer as isize { for k in 0..count as isize {
+            let from = a.offset((p * len as isize + position(*index.offset(k), len)) * inner as isize);
+            for r in 0..inner as isize { *o.offset(at) = *from.offset(r); at += 1; }
+        }}
+    }
+
+    /// `index_add`: `base` plus `src` (`[outer, count, inner]`) added at
+    /// `index[k]` of the middle axis, k ascending, each addition rounded.
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn index_add(base: *const f32, src: *const f32, index: *const f32, o: *mut f32,
+        outer: i32, len: i32, count: i32, inner: i32) {
+        core::ptr::copy_nonoverlapping(base, o, (outer * len * inner) as usize);
+        for p in 0..outer as isize { for k in 0..count as isize {
+            let to = o.offset((p * len as isize + position(*index.offset(k), len)) * inner as isize);
+            let from = src.offset((p * count as isize + k) * inner as isize);
+            for r in 0..inner as isize { *to.offset(r) += *from.offset(r); }
+        }}
+    }
+
+    /// `gather`: each output element (four padded dimensions) reads `a` at its
+    /// own position -- `s` are a's strides, the axis's zeroed -- plus its index
+    /// value times the axis stride.
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn gather_axis(a: *const f32, index: *const f32, o: *mut f32, axis_stride: i32, len: i32,
+        d0: i32, d1: i32, d2: i32, d3: i32, s0: i32, s1: i32, s2: i32, s3: i32) {
+        let mut i = 0isize;
+        for x0 in 0..d0 { for x1 in 0..d1 { for x2 in 0..d2 {
+            let p = a.offset((x0*s0 + x1*s1 + x2*s2) as isize);
+            for x3 in 0..d3 {
+                let at = (x3*s3) as isize + position(*index.offset(i), len) * axis_stride as isize;
+                *o.offset(i) = *p.offset(at);
+                i += 1;
+            }
+        }}}
+    }
+
+    /// `scatter_add`: `base` (`n` values) plus `src` added where the index
+    /// (four padded dimensions, `src`'s shape) sends it, visiting the index in
+    /// row-major order -- two elements landing on one output differ only
+    /// along the axis, so they arrive in ascending position.
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn scatter_add(base: *const f32, src: *const f32, index: *const f32, o: *mut f32,
+        n: i32, axis_stride: i32, len: i32, d0: i32, d1: i32, d2: i32, d3: i32, s0: i32, s1: i32, s2: i32, s3: i32) {
+        core::ptr::copy_nonoverlapping(base, o, n as usize);
+        let mut i = 0isize;
+        for x0 in 0..d0 { for x1 in 0..d1 { for x2 in 0..d2 {
+            let p = o.offset((x0*s0 + x1*s1 + x2*s2) as isize);
+            for x3 in 0..d3 {
+                let at = (x3*s3) as isize + position(*index.offset(i), len) * axis_stride as isize;
+                *p.offset(at) += *src.offset(i);
+                i += 1;
+            }
+        }}}
+    }
+
     /// `op`: 0 relu (NaN kept), 1 positive, 2 neg, 3 exp, 4 log, 5 sqrt,
     /// 6 tanh, 7 sigmoid, 8 gelu, 9 gelu_grad.
     #[no_mangle]

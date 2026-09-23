@@ -160,7 +160,7 @@ class GraphV2Tests(unittest.TestCase):
         g=Graph(); a=g.tensor([1,2]); p=g.program(r=(a*3).relu())
         self.assertEqual(p["version"],1); self.assertEqual(execute_locally(dict(p,version=2))["outputs"]["r"]["data"],[3,6])
         self.assertEqual(execute_locally(dict(p,version=3))["outputs"]["r"]["data"],[3,6])
-        with self.assertRaises(ComputeError): execute_locally({"version":4,"nodes":[],"outputs":[]})
+        with self.assertRaises(ComputeError): execute_locally({"version":5,"nodes":[],"outputs":[]})
 
     def test_the_program_version_follows_what_the_graph_actually_uses(self):
         """Version 1 while a version-1 host would read the graph the same way; 2 as soon as it would not."""
@@ -539,5 +539,128 @@ console.log(JSON.stringify(run.steps.map(s=>Object.fromEntries(Object.entries(s.
         for mine, other in zip(got[0]["steps"], json.loads(result.stdout)):
             self.assertEqual(mine["outputs"]["loss"]["data"], other["loss"]); self.assertEqual(mine["outputs"]["noise"]["data"], other["noise"])
         self.assertGreater(len(set(tuple(s["outputs"]["noise"]["data"]) for s in got[0]["steps"])), 1)
+
+
+# ---- protocol version 4: slices, index_select/index_add, gather/scatter_add ----------------
+NODE_BITS = """import {readFile} from 'node:fs/promises';import {createRuntime} from './src/runtime.mjs';
+const program=JSON.parse(await new Promise(r=>{let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>r(s));}));
+const wasmBytes=await readFile('./wasm/kernels.wasm');const out={};
+for(const backend of ['cpu-js','wasm']){const rt=await createRuntime({backend,wasmBytes});const r=(await rt.execute(program,{typedOutputs:true})).outputs;
+  out[backend]=Object.fromEntries(Object.entries(r).map(([k,v])=>[k,Array.from(new Uint32Array(v.data.buffer,v.data.byteOffset,v.data.length))]));rt.dispose();}
+console.log(JSON.stringify(out));"""
+
+
+def bits(values):
+    import struct
+    return [struct.unpack("<I", struct.pack("<f", v))[0] for v in values]
+
+
+class GraphV4Tests(unittest.TestCase):
+    def test_version_four_labels_only_graphs_that_use_its_operations(self):
+        def version(build):
+            g = Graph(); return g.program(r=build(g))["version"]
+        x = lambda g: g.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        for build in [lambda g: x(g)[:, 1:], lambda g: x(g)[0], lambda g: x(g)[::-1],
+                      lambda g: g.index_select(x(g), 1, g.tensor([2.0, 0.0])), lambda g: x(g).gather(0, g.tensor([[1.0, 0.0, 1.0]])),
+                      lambda g: g.cat([x(g), x(g)], 1), lambda g: g.stack([x(g), x(g)]),
+                      lambda g: (x(g)[:, :1] > 0).maximum(x(g)[:, 1:2]), lambda g: (x(g) > 0)[0]]:
+            self.assertEqual(version(build), 4, build)
+        # Indexing that selects nothing new records no slice at all.
+        self.assertEqual(version(lambda g: x(g)[:, :] * 2), 1)
+        self.assertEqual(version(lambda g: x(g)[None, ...].exp()), 2)
+        self.assertEqual(version(lambda g: x(g)[None] > 0), 3)
+
+    def test_getitem_follows_python_slicing(self):
+        from zipp_gpu import execute_locally
+        rows = [[float(10 * i + j) for j in range(5)] for i in range(4)]
+        g = Graph(); x = g.tensor(rows)
+        cases = {"a": (x[1], rows[1]), "b": (x[:, -1], [r[-1] for r in rows]), "c": (x[::2, ::-2], sum([r[::-2] for r in rows[::2]], [])),
+                 "d": (x[-1:0:-1, 1:4], sum([r[1:4] for r in rows[-1:0:-1]], [])), "e": (x[2, 3], [rows[2][3]]),
+                 "f": (x[None, 1:3, ..., 4], [r[4] for r in rows[1:3]]), "g": (x[..., 7:1:-3], sum([r[7:1:-3] for r in rows], []))}
+        out = execute_locally(g.program(**{k: v[0] for k, v in cases.items()}))["outputs"]
+        for k, (t, want) in cases.items():
+            self.assertEqual(out[k]["data"], want, k)
+        self.assertEqual(cases["f"][0].shape, (1, 2)); self.assertEqual(cases["e"][0].shape, ())
+        for bad in [lambda: x[4], lambda: x[:, -6]]:
+            with self.assertRaises(IndexError): bad()
+        for bad in [lambda: x[2:2], lambda: x[1, 2, 3], lambda: x[..., ...], lambda: x[[0, 1]]]:
+            with self.assertRaises(GraphError): bad()
+
+    def test_selections_accumulations_cat_and_stack(self):
+        from zipp_gpu import execute_locally
+        e = 2.0 ** -24
+        g = Graph(); w = g.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]); idx = g.tensor([2.0, 0.0, 2.0])
+        base = g.tensor([1.0, -0.0, 0.0, 3.0]); src = g.tensor([e, -0.0, e, -0.0, 2.0 ** 24, -(2.0 ** 24)]); pos = g.tensor([0.0, 1.0, 0.0, 2.0, 3.0, 3.0])
+        rows = w.index_select(0, idx)
+        out = execute_locally(g.program(
+            rows=rows, back=g.index_add(g.zeros((3, 2)), 0, idx, rows), cols=g.index_select(w, 1, g.tensor([1.0])),
+            gath=w.gather(1, g.tensor([[1.0], [0.0], [1.0]])), scat=g.scatter_add(g.zeros((3, 2)), 1, g.tensor([[1.0], [0.0], [1.0]]), g.tensor([[7.0], [8.0], [9.0]])),
+            order=g.index_add(base, 0, pos, src), order2=g.scatter_add(base, 0, pos, src),
+            cat=g.cat([w, w[:, :1]], 1), stack=g.stack([w[0], w[2]], 1),
+            put=g.slice_scatter(w, g.tensor([[-1.0], [-2.0]]), [2, 1], [-2, 1])))["outputs"]
+        v = lambda k: out[k]["data"]
+        self.assertEqual(v("rows"), [5, 6, 1, 2, 5, 6]); self.assertEqual(v("back"), [1, 2, 0, 0, 10, 12])
+        self.assertEqual(v("cols"), [2, 4, 6]); self.assertEqual(v("gath"), [2, 3, 6]); self.assertEqual(v("scat"), [0, 7, 8, 0, 0, 9])
+        # The base first, then ascending position, one rounding each: 1 + e + e is 1, and 3 + 2**24 rounds before - 2**24.
+        for k in ("order", "order2"):
+            self.assertEqual(v(k), [1, 0, 0, 4]); self.assertEqual([math.copysign(1, a) for a in v(k)], [1, -1, 1, 1])
+        self.assertEqual(v("cat"), [1, 2, 1, 3, 4, 3, 5, 6, 5]); self.assertEqual(out["stack"]["shape"], [2, 2]); self.assertEqual(v("stack"), [1, 5, 2, 6])
+        self.assertEqual(v("put"), [1, -2, 3, 4, 5, -1])
+        for bad in [lambda: w.index_select(0, g.tensor([3.0])), lambda: w.index_select(0, g.tensor([0.5])), lambda: w.index_select(0, w.sum(1)),
+                    lambda: w.gather(0, g.tensor([[0.0, 0.0, 0.0]])), lambda: g.index_add(w, 0, idx, w[:2]), lambda: g.cat([w, w.T], 0),
+                    lambda: g.slice(w, [0, 0], [0, 1], [1, 2]), lambda: g.slice(w, [0, 0], [2, 1], [3, 2])]:
+            with self.assertRaises(GraphError): bad()
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_python_reference_matches_the_javascript_backends_bit_for_bit(self):
+        from zipp_gpu import execute_locally
+        seed = lcg(21)
+        vals = lambda n: [(-0.0 if i % 7 == 3 else round(seed(-3, 3), 3)) for i in range(n)]
+        g = Graph()
+        a = g.tensor(vals(60), (3, 4, 5)); b = g.tensor(vals(24), (2, 3, 4))
+        i1 = g.tensor([4.0, 0.0, 4.0, 2.0]); i3 = g.tensor([float(int(seed(0, 5))) for _ in range(3 * 4 * 7)], (3, 4, 7))
+        s4 = g.tensor(vals(3 * 4 * 7), (3, 4, 7))
+        outs = dict(sl=a[::-1, 1:, ::2], neg=a[2, ::-3, -1], put=g.slice_scatter(a, b[:, :, :1], [0, 1, 4], [2, 1, -1]),
+                    isel=a.index_select(2, i1), iadd=g.index_add(a, 2, i1, g.tensor(vals(48), (3, 4, 4))),
+                    gat=a.gather(2, i3), sadd=g.scatter_add(a, 2, i3, s4), cat=g.cat([a[:, :, :2], a[:, :, 4:]], 2))
+        program = g.program(**outs)
+        mine = execute_locally(program)["outputs"]
+        result = subprocess.run(["node", "--input-type=module", "-e", NODE_BITS], input=json.dumps(program),
+                                capture_output=True, text=True, cwd=str(LAB), timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for backend, theirs in json.loads(result.stdout).items():
+            for name, value in mine.items():
+                with self.subTest(backend=backend, output=name):
+                    self.assertEqual(theirs[name], bits(value["data"]))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_prepared_embedding_session_feeds_its_index_and_matches_node_bit_for_bit(self):
+        g = Graph()
+        table = g.tensor([[0.25 * (i - j) for j in range(4)] for i in range(6)])
+        idx = g.tensor([0.0] * 6)
+        rows = table.index_select(0, idx)
+        last = rows.reshape(2, 3, 4)[:, -1]
+        grad = g.index_add(g.zeros((6, 4)), 0, idx, g.slice_scatter(g.zeros((2, 3, 4)), last.reshape(2, 1, 4), [0, 2, 0], [1, 1, 1]).reshape(6, 4))
+        new = g.sgd_update(table, grad, 0.5)
+        session = g.prepare(feeds={"idx": idx}, carry={table: new}, resident=[new], last=last, table=new)
+        with self.assertRaises(GraphError):
+            session.run(lambda r: None, idx=[0, 1, 2, 3, 4, 6])
+        steps = [[0, 5, 5, 1, 2, 5], [3, 3, 3, 3, 3, 3], [4, 0, 2, 2, 1, 0]]
+        got = []
+        session.run_steps(got.append, [{"idx": s} for s in steps], readback=["last"])
+        final = []
+        session.download(final.append, "table")
+        script = """import {createRuntime} from './src/runtime.mjs';
+const [program,steps]=JSON.parse(await new Promise(r=>{let s='';process.stdin.on('data',d=>s+=d).on('end',()=>r(s));}));
+const rt=await createRuntime({backend:'cpu-js'}),session=await rt.prepare(program,{resident:['table']});
+const run=await session.run(steps,{readback:['last']});const table=(await session.download(['table'])).outputs.table.data;
+console.log(JSON.stringify({last:run.steps.map(s=>Array.from(s.outputs.last.data)),table:Array.from(table)}));rt.dispose();"""
+        result = subprocess.run(["node", "--input-type=module", "-e", script],
+                                input=json.dumps([session._program, [{"inputs": {"1": s}} for s in steps]]),
+                                capture_output=True, text=True, cwd=str(LAB), timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        other = json.loads(result.stdout)
+        self.assertEqual([s["outputs"]["last"]["data"] for s in got[0]["steps"]], other["last"])
+        self.assertEqual(final[0]["outputs"]["table"]["data"], other["table"])
 
 if __name__=="__main__":unittest.main(verbosity=2)

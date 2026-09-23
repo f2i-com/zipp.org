@@ -161,6 +161,51 @@ torch.compile(fn)(x).submit(lambda y: print("torch v3", torch.allclose(y, fn(x),
     adapter.invalidate(); runtime.dispose(); e.dispose();
   }
 
+  // Protocol version 4 (slice, slice_scatter, index_select/index_add,
+  // gather/scatter_add) through the host: the answer equals zipp_gpu's own
+  // reference bit for bit, signs of zero included, and torch.compile records
+  // slicing, split, cat and an embedding lookup that match eager Zipp.
+  for (const backend of ["cpu-js", "wasm"]) {
+    const e = new Engine();
+    const runtime = await createRuntime({ backend, wasmBytes });
+    const adapter = createPythonGPUAdapter(e, runtime, { allowExecute: true });
+    e.initPythonProject({ main: `import math
+import zipp_gpu
+import torch
+from torch import nn
+g = zipp_gpu.Graph()
+# Tensor storage crosses to the host as a Float32Array, signed zeros intact
+# (a list of Python floats arrives with -0.0 as 0).
+vals = lambda n, k: torch.tensor([(-0.0 if i % 7 == 3 else ((i * k) % 13 - 6) * 0.37) for i in range(n)])._s
+a = g.tensor(vals(60, 5), (3, 4, 5)); b = g.tensor(vals(24, 3), (2, 3, 4))
+i1 = g.tensor([4.0, 0.0, 4.0, 2.0]); i3 = g.tensor([float((i * 3) % 5) for i in range(84)], (3, 4, 7))
+outs = dict(sl=a[::-1, 1:, ::2], put=g.slice_scatter(a, b[:, :, :1], [0, 1, 4], [2, 1, -1]), isel=a.index_select(2, i1),
+            iadd=g.index_add(a, 2, i1, g.tensor(vals(48, 7), (3, 4, 4))), gat=a.gather(2, i3),
+            sadd=g.scatter_add(a, 2, i3, g.tensor(vals(84, 11), (3, 4, 7))), cat=g.cat([a[:, :, :2], a[:, :, 4:]], 2))
+program = g.program(**outs)
+reference = zipp_gpu.execute_locally(program)["outputs"]
+signs = lambda v: [math.copysign(1.0, x) for x in v]
+def show(result):
+    print("v4", result["backend"], program["version"], all(result["outputs"][k]["data"] == reference[k]["data"]
+          and signs(result["outputs"][k]["data"]) == signs(reference[k]["data"]) for k in reference))
+g.submit(show, lambda error: print("failed", error), **outs)
+torch.manual_seed(2)
+emb = nn.Embedding(7, 6)
+x = torch.randn(3, 6)
+tokens = torch.tensor([[1, 6, 2], [0, 0, 5]])
+def fn(x, tokens):
+    q, k, v = x.split(2, dim=1)
+    rows = emb(tokens)[:, -1]
+    return torch.cat([q * k, v.flip(1), rows[:, ::2][:, :2]], 0) + x[1:2, 2:4]
+torch.compile(fn)(x, tokens).submit(lambda y: print("torch v4", torch.allclose(y, fn(x, tokens), atol=1e-6)))
+` }, "main");
+    adapter.drain();
+    await adapter.idle();
+    eq(`${backend}: version-4 graphs equal zipp_gpu's reference bit for bit; compiled slicing, split, cat and embedding match eager`, e.takeOutput(),
+      [`v4 ${backend} 4 True`, "torch v4 True"]);
+    adapter.invalidate(); runtime.dispose(); e.dispose();
+  }
+
   // Run the actual portable Life module: a glider shifts diagonally after 4 steps.
   const lifeSource = await readFile(path.join(__dirname, "../../../../examples/python/gpu/life.py"), "utf8");
   for (const backend of ["cpu-js", "wasm"]) {
