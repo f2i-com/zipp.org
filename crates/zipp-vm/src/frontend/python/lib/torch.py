@@ -245,7 +245,7 @@ class _GradMode:
         _grad_enabled = self._mode
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, exc_type=None, exc=None, tb=None):
         global _grad_enabled
         _grad_enabled = self._prev
         return False
@@ -354,13 +354,27 @@ class _Node:
         # Each parent's history, requires_grad and shape as this node
         # consumed it. An in-place op gives the tensor object a new history
         # afterwards; like PyTorch's edges, backward still reaches the
-        # history it had here.
-        self.pstate = [None if p is None else (p._node, p.requires_grad, p.shape) for p in parents]
+        # history it had here. (One and two parents are spelled out: on this
+        # runtime a comprehension costs more than the tuples it builds.)
+        n = _len(parents)
+        if n == 1:
+            p = parents[0]
+            self.pstate = [None if p is None else (p._node, p.requires_grad, p.shape)]
+        elif n == 2:
+            p, q = parents
+            self.pstate = [None if p is None else (p._node, p.requires_grad, p.shape), None if q is None else (q._node, q.requires_grad, q.shape)]
+        else:
+            self.pstate = [None if p is None else (p._node, p.requires_grad, p.shape) for p in parents]
         # The tensors whose values backward reads, each with its storage's
         # version now: writing one in place before backward is an error, as
         # in PyTorch (see `_check_saved`).
         if saved:
-            self.saved = [(t._s, _k.aversion(t._s), t) for t in saved]
+            if _len(saved) == 1:
+                t = saved[0]
+                s = t._s
+                self.saved = [(s, _k.aversion(s), t)]
+            else:
+                self.saved = [(t._s, _k.aversion(t._s), t) for t in saved]
 
 
 def _check_saved(node):
@@ -584,7 +598,8 @@ def _needs_grad(*tensors):
 
 def _unbroadcast(grad, shape):
     """Sum `grad` down to `shape` (the reverse of broadcasting)."""
-    if _shape_eq(grad.shape, shape) or _tuple(grad.shape) == _tuple(shape):
+    gshape = grad.shape
+    if gshape is shape or _shape_eq(gshape, shape) or _tuple(gshape) == _tuple(shape):
         return grad
     extra = _len(grad.shape) - _len(shape)
     dims = _list(_range(extra))
@@ -612,16 +627,21 @@ class Tensor:
     _node = None
     _retain = False
     requires_grad = False
+    # Backward's traversal marks (see `_backward`).
+    _bwe = None
+    _pg = None
+    _bps = None
 
     def __init__(self, storage=None, shape=None, dt=None, requires_grad=False, node=None):
-        if type(dt) is not dtype:
+        if dt.__class__ is not dtype:
             # The legacy constructor: torch.Tensor(data) or torch.Tensor(*sizes).
             _legacy_init(self, _default_dtype, (storage, shape, dt) if _isinstance(dt, _int) else ((storage, shape) if shape is not None else (() if storage is None else (storage,))))
             return
         self._s = storage
         # A Size is immutable, so tensors of one shape share it: elementwise
         # kernels hand an operand's own Size back as the result's shape.
-        self.shape = shape if type(shape) is Size else (_k._size(shape) if type(shape) is _tuple else Size(shape))
+        cls = shape.__class__
+        self.shape = shape if cls is Size else (_k._size(shape) if cls is _tuple else Size(shape))
         self.dtype = dt
         if requires_grad is not False:
             self.requires_grad = requires_grad
@@ -813,7 +833,7 @@ class Tensor:
 
     def clone(self, memory_format=None):
         out = Tensor(_k.copy(self._s), self.shape, self.dtype)
-        if _needs_grad(self):
+        if _grad_enabled and self.requires_grad:
             out.requires_grad = True
             out._node = _Node(lambda g: (g,), (self,), "Clone")
         return out
@@ -914,7 +934,7 @@ class Tensor:
             raise RuntimeError("a view of a leaf Variable that requires grad is being used in an in-place operation.")
 
     def _write(self, result):
-        if result.shape != self.shape:
+        if result.shape is not self.shape and result.shape != self.shape:
             raise RuntimeError("output with shape %s doesn't match the broadcast shape %s" % (_list(self.shape), _list(result.shape)))
         if result.dtype is not self.dtype and _CATEGORY[result.dtype.name] > _CATEGORY[self.dtype.name]:
             raise RuntimeError("result type %s can't be cast to the desired output type %s" % (_CAST_NAME[result.dtype.name], _CAST_NAME[self.dtype.name]))
@@ -1745,7 +1765,14 @@ class Tensor:
         return unbind(self, dim)
 
     def select(self, dim, index):
-        d = _norm_dim(dim, _len(self.shape))
+        rank = _len(self.shape)
+        d = _norm_dim(dim, rank)
+        if type(index) is _int and type(self).__getitem__ is _tensor_getitem:
+            # The spec `self[(:, ..., index)]` builds, the kernel checking
+            # the index: every other dim whole.
+            spec = [(None, None, None)] * rank
+            spec[d] = index
+            return _slice(self, spec)
         spec = [slice(None)] * d + [index]
         return self[_tuple(spec)]
 
@@ -1982,6 +2009,7 @@ class Tensor:
 
 # `narrow` takes the fast route only for tensors indexed by this method.
 _tensor_getitem = Tensor.__getitem__
+_tensor_init = Tensor.__init__
 
 
 class _NdArray:
@@ -2312,6 +2340,24 @@ def _shape_args(shape):
         if type(d) is not _int:
             return _tuple([_int(v) for v in shape])
     return shape if type(shape) is _tuple else _tuple(shape)
+
+
+# Tensors the kernels return are built without the class call: with
+# `Tensor.__init__` as defined here, `_new3(storage, shape, dt)` is exactly
+# `Tensor(storage, shape, dt)` for a Size `shape` (a kernel result's; any
+# other shape takes the class call).
+# A replaced `__init__` (a wrapper installed on the class) is still called.
+_onew = object.__new__
+
+
+def _new3(storage, shape, dt):
+    if shape.__class__ is Size and Tensor.__init__ is _tensor_init:
+        t = _onew(Tensor)
+        t._s = storage
+        t.shape = shape
+        t.dtype = dt
+        return t
+    return Tensor(storage, shape, dt)
 
 
 def _legacy_init(self, dt, args):
@@ -2729,9 +2775,19 @@ def _any_requires_grad(args):
 
 
 def _binary_nograd(op, a, b):
+    if a.__class__ is Tensor and not _graph_recording:
+        cb = b.__class__
+        if cb is _float or cb is _int:
+            # `_operands`' plain-number case, the number going to the kernel
+            # as it is (`binary_scalar` stores it as `full` would).
+            dt = a.dtype
+            if not dt.is_floating_point:
+                dt = _default_dtype if cb is _float else (int64 if dt is _bool_dtype else dt)
+            storage, shape = _k.binary_scalar(op, a._s, a.shape, b, dt.name, dt.name, False)
+            return _new3(storage, shape, _DTYPES[_k.dtype(storage)])
     ta, tb, dt = _operands(a, b)
     storage, shape = _k.binary(op, ta._s, ta.shape, tb._s, tb.shape, None if dt is None else dt.name)
-    return Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
+    return _new3(storage, shape, _DTYPES[_k.dtype(storage)])
 
 
 def _unary_nograd(op, a, p1=None, p2=None):
@@ -2745,31 +2801,78 @@ _NOSAVE = ("", "")
 def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=False):
     """An elementwise binary op. `saves` names the values backward reads
     when the first/second operand requires grad ("x", "y", "o" for the
-    output), so writing one of them in place before backward raises."""
-    ta, tb, dt = _operands(a, b, opmath)
-    if want is not None:
-        dt = want
-    storage, shape = _k.binary(op, ta._s, ta.shape, tb._s, tb.shape, None if dt is None else dt.name)
-    out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
-    ra, rb = ta.requires_grad, tb.requires_grad
+    output), so writing one of them in place before backward raises.
+
+    Never a comparison: the result dtype is the kernel's `want` (or the
+    operands' shared dtype) whenever that is floating, and only otherwise
+    asked of the kernel."""
+    ca = a.__class__
+    cb = b.__class__
+    if ca is Tensor and cb is Tensor and a.dtype is b.dtype:
+        ta, tb, dt = a, b, want
+    elif ca is Tensor and (cb is _float or cb is _int) and not _graph_recording:
+        # `_operands`' plain-number case: the number becomes a 0-d tensor of
+        # the result dtype (float32 for a float16/bfloat16 `opmath` op).
+        dt = a.dtype
+        if not dt.is_floating_point:
+            dt = _default_dtype if cb is _float else (int64 if dt is _bool_dtype else dt)
+        sdt = float32 if opmath and dt._reduced else dt
+        if want is not None:
+            dt = want
+        if not (_grad_enabled and a.requires_grad):
+            # Nothing records: the kernel takes the number itself.
+            storage, shape = _k.binary_scalar(op, a._s, a.shape, b, sdt.name, dt.name, False)
+            return _new3(storage, shape, dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)])
+        ta, tb = a, _scalar_operand(b, sdt)
+    elif cb is Tensor and (ca is _float or ca is _int) and not _graph_recording:
+        dt = b.dtype
+        if not dt.is_floating_point:
+            dt = _default_dtype if ca is _float else (int64 if dt is _bool_dtype else dt)
+        sdt = dt
+        if want is not None:
+            dt = want
+        if not (_grad_enabled and b.requires_grad):
+            storage, shape = _k.binary_scalar(op, b._s, b.shape, a, sdt.name, dt.name, True)
+            return _new3(storage, shape, dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)])
+        ta, tb = _scalar_operand(a, sdt), b
+    else:
+        ta, tb, dt = _operands(a, b, opmath)
+        if want is not None:
+            dt = want
+    if dt is None:
+        storage, shape = _k.binary(op, ta._s, ta.shape, tb._s, tb.shape, None)
+        rdt = ta.dtype
+        if not (rdt.is_floating_point and rdt is tb.dtype):
+            rdt = _DTYPES[_k.dtype(storage)]
+    else:
+        storage, shape = _k.binary(op, ta._s, ta.shape, tb._s, tb.shape, dt.name)
+        rdt = dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)]
+    out = _new3(storage, shape, rdt)
+    ra = ta.requires_grad
+    rb = tb.requires_grad
     if _grad_enabled and (ra or rb):
         out.requires_grad = True
-        sa, sb = ta._s, tb._s
         need = (saves[0] if ra else "") + (saves[1] if rb else "")
         saved = None
         if need:
-            saved = []
             if "x" in need:
-                saved.append(ta)
-            if "y" in need:
-                saved.append(tb)
+                saved = [ta]
+                if "y" in need:
+                    saved.append(tb)
+            elif "y" in need:
+                saved = [tb]
             if "o" in need:
-                saved.append(out)
+                if saved is None:
+                    saved = [out]
+                else:
+                    saved.append(out)
         if saves is _NOSAVE:
             # add/sub: backward reads only the operands' shapes, which
             # `_frozen` would take from the tensors themselves anyway.
             out._node = _Node(lambda g: backward(g, ta, tb, None), (ta, tb), name, saved)
         else:
+            sa = ta._s
+            sb = tb._s
             out._node = _Node(lambda g: backward(g, _frozen(ta, sa), _frozen(tb, sb), _frozen(out, storage)), (ta, tb), name, saved)
     return out
 
@@ -2974,10 +3077,40 @@ def fmin(input, other):
     return where(isnan(other), input, where(isnan(input), other, minimum(input, other)))
 
 
+# The 0-d tensors a Python number becomes as an operand of a recorded op,
+# per dtype name and number. Each is internal to the nodes that hold it
+# (never written, never requiring grad), so one serves every op with that
+# number as `_operands` would build it afresh. Keyed by the number alone:
+# an int and the float equal to it store the same value in the dtype. Zero
+# is not kept (0.0 == -0.0 as a key), NaN never matches itself, and a
+# dtype's table is emptied when it fills.
+_SCALARS = dict((name, {}) for name in _DTYPES)
+
+
+def _scalar_operand(v, dt):
+    if v != 0 and v == v:
+        table = _SCALARS[dt.name]
+        try:
+            return table[v]
+        except KeyError:
+            pass
+        if _len(table) >= 64:
+            table.clear()
+        t = table[v] = Tensor(_k.full(dt.name, 1, v), _SCALAR_SHAPE, dt)
+        return t
+    return Tensor(_k.full(dt.name, 1, v), _SCALAR_SHAPE, dt)
+
+
+# The unary kernels whose result is not the (floating) input's dtype
+# (tensor.js's BOOL_UNARY).
+_BOOL_UNARY = frozenset(["isfinite", "isnan", "not", "isinf", "isposinf", "isneginf", "signbit"])
+
+
 def _unary(op, a, name, backward, p1=None, p2=None, saves="x"):
     """An elementwise unary op; `saves` as in `_binary` ("x" input, "o" output)."""
     storage = _k.unary(op, a._s, p1, p2)
-    out = Tensor(storage, a.shape, _DTYPES[_k.dtype(storage)])
+    dt = a.dtype
+    out = _new3(storage, a.shape, dt if dt.is_floating_point and op not in _BOOL_UNARY else _DTYPES[_k.dtype(storage)])
     if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         sa = a._s
@@ -3546,7 +3679,7 @@ def where(condition, input=None, other=None):
         condition = condition.to(_bool_dtype)
     ta, tb, dt = _operands(input, other)
     storage, shape = _k.where(condition._s, condition.shape, ta._s, ta.shape, tb._s, tb.shape, None if dt is None else dt.name)
-    out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
+    out = _new3(storage, shape, _DTYPES[_k.dtype(storage)])
     if _needs_grad(ta, tb):
         out.requires_grad = True
         out._node = _Node(lambda g: (_unbroadcast(where(condition, g, 0.0), ta.shape) if ta.requires_grad else None, _unbroadcast(where(condition, 0.0, g), tb.shape) if tb.requires_grad else None), (ta, tb), "Where")
@@ -3555,7 +3688,7 @@ def where(condition, input=None, other=None):
 
 def _cast(a, dt):
     out = Tensor(_k.astype(a._s, dt.name), a.shape, dt)
-    if _needs_grad(a) and dt.is_floating_point and a.dtype.is_floating_point:
+    if _grad_enabled and a.requires_grad and dt.is_floating_point and a.dtype.is_floating_point:
         out.requires_grad = True
         out._node = _Node(lambda g: (g.to(a.dtype),), (a,), "ToCopy")
     return out
@@ -3565,7 +3698,7 @@ def _replaced(src, values):
     """`values` (no history) standing in for `src`: backward gives the old
     values a zero gradient, as PyTorch's fill/random in-place ops do."""
     out = Tensor(values._s, src.shape, src.dtype) if values.dtype is src.dtype else Tensor(_k.astype(values._s, src.dtype.name), src.shape, src.dtype)
-    if _needs_grad(src):
+    if _grad_enabled and src.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (zeros_like(g),), (src,), "Fill")
     return out
@@ -3583,7 +3716,7 @@ def _filled(src, value):
 
 def _zeroed(src):
     out = Tensor(_k.zeros(src.dtype.name, _numel(src.shape)), src.shape, src.dtype)
-    if _needs_grad(src):
+    if _grad_enabled and src.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (zeros_like(g),), (src,), "Zero")
     return out
@@ -3626,12 +3759,17 @@ def _all_if_empty(dim):
 def _reduce_nograd(op, a, dim, keepdim):
     dims = _dims_arg(dim, _len(a.shape))
     storage, shape = _k.reduce(op, a._s, a.shape, dims, keepdim, True)
-    return Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
+    return _new3(storage, shape, _DTYPES[_k.dtype(storage)])
 
 
 def _expand_back(g, a_shape, dims, keepdim):
     """Broadcast a reduced gradient back over the reduced dims."""
     if dims is None:
+        if not _grad_enabled and _numel(a_shape) != 1 and g.__class__ is Tensor:
+            # The one value, broadcast: the kernel call the reshape and
+            # expand below make, without the intermediate view. (A 1-element
+            # target keeps that path, whose result shares g's storage.)
+            return Tensor(_k.expand(g._s, g.shape, a_shape), a_shape, g.dtype)
         return expand(g.reshape(*([1] * _len(a_shape))), *a_shape)
     if not keepdim:
         for d in sorted(dims):
@@ -3655,13 +3793,13 @@ def sum(input, dim=None, keepdim=False, dtype=None):
         return a.sum(dim, keepdim, dtype)
     if dtype is not None:
         a = a.to(dtype)
-    else:
+    elif not a.dtype.is_floating_point and a.dtype is not int64:
         # `(pred == target).sum()` counts; a uint8 sum does not wrap.
-        a = _int64_acc(a)
+        a = a.to(int64)
     dims = None if dim is None else _dims_arg(_all_if_empty(dim), _len(a.shape))
     storage, shape = _k.reduce("sum", a._s, a.shape, dims, keepdim, True)
-    out = Tensor(storage, shape, a.dtype)
-    if _needs_grad(a):
+    out = _new3(storage, shape, a.dtype)
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (_expand_back(g, a.shape, dims, keepdim),), (a,), "Sum")
     return out
@@ -3684,8 +3822,8 @@ def mean(input, dim=None, keepdim=False, dtype=None):
         raise RuntimeError("mean(): could not infer output dtype. Input dtype must be either a floating point or complex dtype. Got: %s" % _CAST_NAME[a.dtype.name])
     dims = None if dim is None else _dims_arg(_all_if_empty(dim), _len(a.shape))
     storage, shape = _k.reduce("mean", a._s, a.shape, dims, keepdim, True)
-    out = Tensor(storage, shape, a.dtype)
-    if _needs_grad(a):
+    out = _new3(storage, shape, a.dtype)
+    if _grad_enabled and a.requires_grad:
         count = _numel(a.shape) / _b.max(1, _numel(shape))
         out.requires_grad = True
         out._node = _Node(lambda g: (div(_expand_back(g, a.shape, dims, keepdim), count),), (a,), "Mean")
@@ -3733,7 +3871,7 @@ def max(input, dim=None, keepdim=False, out=None):
     if dim is None:
         _check_nonempty(a, None, "max")
         out = _reduce_nograd("max", a, None, False)
-        if _needs_grad(a):
+        if _grad_enabled and a.requires_grad:
             out.requires_grad = True
             out._node = _Node(_ties_backward(a, out), (a,), "Max", (a, out))
         return out
@@ -3747,7 +3885,7 @@ def min(input, dim=None, keepdim=False, out=None):
     if dim is None:
         _check_nonempty(a, None, "min")
         out = _reduce_nograd("min", a, None, False)
-        if _needs_grad(a):
+        if _grad_enabled and a.requires_grad:
             out.requires_grad = True
             out._node = _Node(_ties_backward(a, out), (a,), "Min", (a, out))
         return out
@@ -3759,7 +3897,7 @@ def _arg_reduce(a, dim, keepdim, op, argop):
     _check_nonempty(a, dims, op)
     values = _reduce_nograd(op, a, dim, keepdim)
     indices = _reduce_nograd(argop, a, dim, keepdim)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         values.requires_grad = True
         if not dims:
             values._node = _Node(lambda g: (g,), (a,), op.capitalize())
@@ -3798,7 +3936,7 @@ def _amaxmin(a, dim, keepdim, op):
     dims = _dims_arg(_all_if_empty(dim), _len(a.shape))
     _check_nonempty(a, dims, "a" + op)
     out = _reduce_nograd(op, a, dims, keepdim)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         # Tied extremes share the gradient evenly, as PyTorch's amax/amin.
         def backward(g):
             o = _expand_back(out, a.shape, dims, keepdim)
@@ -3846,7 +3984,7 @@ def _int64_acc(a):
 def prod(input, dim=None, keepdim=False, dtype=None):
     a = input if dtype is None else input.to(dtype)
     out = _reduce_nograd("prod", _int64_acc(a), dim, keepdim)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         rank = _len(a.shape)
         dims = _dims_arg(dim, rank)
         sa = a._s
@@ -3923,7 +4061,7 @@ def _norm2(a, dims, keepdim):
     """The 2-norm with PyTorch's backward: g * x / norm, zero where the norm is zero."""
     with no_grad():
         out = sqrt(sum(square(a), dims, keepdim))
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         def backward(g):
             o = _expand_back(out, a.shape, dims, keepdim)
             return (where(o == 0, 0.0, div(mul(_expand_back(g, a.shape, dims, keepdim), a), o)),)
@@ -3936,7 +4074,7 @@ def _pnorm(a, p, dims, keepdim):
     """The general p-norm; backward g * x |x|^(p-2) / norm^(p-1), zero where the norm is zero."""
     with no_grad():
         out = pow(sum(pow(abs(a), p), dims, keepdim), 1.0 / p)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         def backward(g):
             o = _expand_back(out, a.shape, dims, keepdim)
             grad = div(mul(mul(_expand_back(g, a.shape, dims, keepdim), a), pow(abs(a), p - 2)), pow(o, p - 1))
@@ -3997,7 +4135,7 @@ def median(input, dim=None, keepdim=False):
         idx = _median_index(flat, 0, False)
         with no_grad():
             value = flat[idx.item()]
-        if _needs_grad(a):
+        if _grad_enabled and a.requires_grad:
             # The whole-tensor median shares the gradient among equal values.
             def backward(g):
                 mask = (a == value).to(g.dtype)
@@ -4134,7 +4272,7 @@ def cumsum(input, dim, dtype=None):
     a = input.to(dtype) if dtype is not None else _int64_acc(input)
     d = _norm_dim(dim, _b.max(_len(a.shape), 1))
     out = Tensor(_k.scan("cumsum", a._s, a.shape, d), a.shape, a.dtype)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (g if not a.shape else _rev_cumsum(g, d),), (a,), "Cumsum")
     return out
@@ -4144,7 +4282,7 @@ def cumprod(input, dim, dtype=None):
     a = input.to(dtype) if dtype is not None else _int64_acc(input)
     d = _norm_dim(dim, _b.max(_len(a.shape), 1))
     out = Tensor(_k.scan("cumprod", a._s, a.shape, d), a.shape, a.dtype)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         def backward(g):
             if not a.shape:
                 return (g,)
@@ -4178,7 +4316,7 @@ def _cum_extreme(a, dim, op):
     storage, idx = _k.scan(op, a._s, a.shape, d)
     values = Tensor(storage, a.shape, a.dtype)
     indices = Tensor(idx, a.shape, int64)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         values.requires_grad = True
         values._node = _Node(lambda g: (g if not a.shape else scatter_add(zeros_like(a, dtype=g.dtype), d, indices, g),), (a,), op.capitalize())
     return _returns(op, values, indices)
@@ -4196,7 +4334,7 @@ def logcumsumexp(input, dim):
     a = input
     d = _norm_dim(dim, _b.max(_len(a.shape), 1))
     out = Tensor(_k.scan("logcumsumexp", a._s, a.shape, d), a.shape, a.dtype)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         def backward(g):
             # grad_i = sum over j >= i of g_j * exp(x_i - out_j).
             return (mul(_rev_cumsum(mul(g, exp(neg(out))), d), exp(a)),)
@@ -4441,12 +4579,20 @@ def permute(input, *dims):
     dims = _tuple(_norm_dim(d, rank) for d in dims)
     if _b.sorted(dims) != _list(_range(rank)):
         raise RuntimeError("permute(): dims must be a permutation of the tensor's dimensions")
-    storage, shape = _k.permute(a._s, a.shape, _list(dims))
-    out = Tensor(storage, shape, a.dtype)
-    if _needs_grad(a):
+    return _permute(a, _list(dims), rank)
+
+
+def _permute(a, dims, rank):
+    """`permute(a, *dims)` for `dims`, a list, already a permutation of
+    range(rank)."""
+    storage, shape = _k.permute(a._s, a.shape, dims)
+    out = _new3(storage, shape, a.dtype)
+    if _grad_enabled and a.requires_grad:
         inverse = [0] * rank
-        for i, d in enumerate(dims):
+        i = 0
+        for d in dims:
             inverse[d] = i
+            i += 1
         out.requires_grad = True
         out._node = _Node(lambda g: (permute(g, *inverse),), (a,), "Permute")
     return out
@@ -4464,7 +4610,7 @@ def transpose(input, dim0, dim1):
     d0, d1 = _norm_dim(dim0, rank), _norm_dim(dim1, rank)
     dims = _list(_range(rank))
     dims[d0], dims[d1] = dims[d1], dims[d0]
-    return permute(a, *dims)
+    return _permute(a, dims, rank)
 
 
 swapaxes = transpose
@@ -4603,7 +4749,7 @@ def cat(tensors, dim=0):
         raise RuntimeError("zero-dimensional tensor (at position 0) cannot be concatenated")
     d = _norm_dim(dim, rank)
     storage, shape = _k.cat([(t._s, t.shape) for t in tensors], d)
-    out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
+    out = _new3(storage, shape, _DTYPES[_k.dtype(storage)])
     if _needs_grad(*tensors):
         sizes = [t.shape[d] for t in tensors]
 
@@ -4699,6 +4845,16 @@ def split(tensor, split_size_or_sections, dim=0):
         if _b.sum(sizes) != n:
             raise RuntimeError("split_with_sizes expects split_sizes to sum exactly to %d (input tensor's size at dimension %d), but got split_sizes=%s" % (n, d, sizes))
     out, start = [], 0
+    if _isinstance(size, _int) and type(a).__getitem__ is _tensor_getitem:
+        # `narrow(a, d, start, s)` for pieces that are in range by
+        # construction: the slice spec it builds, every other dim whole.
+        rank = _len(a.shape)
+        for s in sizes:
+            spec = [(None, None, None)] * rank
+            spec[d] = (start, start + s, None)
+            out.append(_slice(a, spec))
+            start += s
+        return _tuple(out)
     for s in sizes:
         out.append(narrow(a, d, start, s))
         start += s
@@ -4771,7 +4927,7 @@ def roll(input, shifts, dims=None):
     if a.shape[d] == 0:
         return a
     out = Tensor(_k.roll(a._s, a.shape, _int(shifts), d), a.shape, a.dtype)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (roll(g, -_int(shifts), d),), (a,), "Roll")
     return out
@@ -5011,9 +5167,7 @@ def _getitem(a, key):
     if type(key) is _int and a.shape:
         # `a[i]`: the spec the general path below builds for a plain int
         # (the kernel range-checks it).
-        spec = [key]
-        for _ in _range(_len(a.shape) - 1):
-            spec.append((None, None, None))
+        spec = [key] + [(None, None, None)] * (_len(a.shape) - 1)
         return _slice(a, spec)
     items = _basic_spec(a, key)
     spec, advanced, new_axes = [], [], []
@@ -5066,8 +5220,8 @@ def _getitem(a, key):
 
 def _slice(a, spec):
     storage, shape = _k.slice(a._s, a.shape, spec)
-    out = Tensor(storage, shape, a.dtype)
-    if _needs_grad(a):
+    out = _new3(storage, shape, a.dtype)
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (_slice_scatter(g, a.shape, spec),), (a,), "Slice")
     return out
@@ -5076,9 +5230,9 @@ def _slice(a, spec):
 def _slice_scatter(g, shape, spec):
     """Zeros of `shape` with `g` at the sliced positions: the slice's
     gradient, itself differentiable (for create_graph)."""
-    base = Tensor(_k.zeros(g.dtype.name, _numel(shape)), _shape_args(shape), g.dtype)
+    base = _new3(_k.zeros(g.dtype.name, _numel(shape)), shape, g.dtype) if shape.__class__ is Size else Tensor(_k.zeros(g.dtype.name, _numel(shape)), _shape_args(shape), g.dtype)
     _k.setslice(base._s, base.shape, spec, g._s, g.shape)
-    if _needs_grad(g):
+    if _grad_enabled and g.requires_grad:
         base.requires_grad = True
         base._node = _Node(lambda gg: (_slice(gg, spec),), (g,), "SliceBackward")
     return base
@@ -5121,8 +5275,8 @@ def _advanced_get(a, dims, indices):
     order = dims + [i for i in _range(rank) if i not in dims]
     x = permute(a, *order) if order != _list(_range(rank)) else a
     storage, shape = _k.gather(x._s, x.shape, [t_._s for t_ in indices], ishape)
-    out = Tensor(storage, shape, a.dtype)
-    if _needs_grad(x):
+    out = _new3(storage, shape, a.dtype)
+    if _grad_enabled and x.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (_index_put_add(x.shape, indices, ishape, g),), (x,), "Index")
     if adjacent and dims[0] > 0:
@@ -5139,7 +5293,7 @@ def _index_put_add(shape, indices, ishape, g):
     advanced index's gradient, itself differentiable."""
     base = zeros(*shape, dtype=g.dtype)
     _k.scatter_add(base._s, base.shape, [t_._s for t_ in indices], ishape, g._s, g.shape)
-    if _needs_grad(g):
+    if _grad_enabled and g.requires_grad:
         base.requires_grad = True
         k = _len(indices)
 
@@ -5247,8 +5401,8 @@ def index_select(input, dim, index):
         return a.clone()
     index = index.reshape(-1) if index.shape != (index.numel(),) else index
     storage, shape = _k.index_select(a._s, a.shape, d, index._s)
-    out = Tensor(storage, shape, a.dtype)
-    if _needs_grad(a):
+    out = _new3(storage, shape, a.dtype)
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (index_add(zeros(*a.shape, dtype=g.dtype), d, index, g),), (a,), "IndexSelect")
     return out
@@ -5485,7 +5639,7 @@ def matmul(input, other):
     ta = a if type(a) is Tensor else _as_tensor(a)
     tb = b if type(b) is Tensor else _as_tensor(b)
     storage, shape = _k.matmul(ta._s, ta.shape, tb._s, tb.shape)
-    out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
+    out = _new3(storage, shape, _DTYPES[_k.dtype(storage)])
     if _grad_enabled and (ta.requires_grad or tb.requires_grad):
         sa, sb, ra, rb = ta._s, tb._s, ta.requires_grad, tb.requires_grad
 
@@ -5515,6 +5669,106 @@ def matmul(input, other):
         saved = ([ta] if rb else []) + ([tb] if ra else [])
         out.requires_grad = True
         out._node = _Node(backward, (ta, tb), "Dot" if _len(ta.shape) == 1 and _len(tb.shape) == 1 else "Mm", saved)
+    return out
+
+
+def _max_pool2d(x, k, s, p, d, outs, replay):
+    """F.max_pool2d's values and window indices for a batched 4-d floating
+    `x` in one kernel, or None where the stacked-views path must run.
+
+    That path pads with -inf, stacks the kh * kw strided views and takes
+    `max(-1)`; its gradient reaches the input as the sum of every view's
+    slice gradient. The kernel's values and indices are that max's. Taken
+    only when windows cannot overlap (stride >= dilation * (k - 1) + 1 in
+    both dims) and hold two or more positions: each input position then
+    receives at most one nonzero term of that sum, so its value is the
+    output gradient there (`g + 0`, the adds turning -0 into +0) or +0, in
+    whichever order the terms were added. Under create_graph the gradient is
+    the stacked-views path's own, recorded: `replay` runs that path."""
+    if (_graph_recording or not _isinstance(x, Tensor) or not x.dtype.is_floating_point or _len(x.shape) != 4
+            or k[0] * k[1] < 2 or s[0] < d[0] * (k[0] - 1) + 1 or s[1] < d[1] * (k[1] - 1) + 1):
+        return None
+    dims = (k[0], k[1], s[0], s[1], p[0], p[1], d[0], d[1], outs[0], outs[1])
+    vs, ws = _k.max_pool2d(x._s, x.shape, dims)
+    shape = Size((x.shape[0], x.shape[1], outs[0], outs[1]))
+    values = Tensor(vs, shape, x.dtype)
+    which = Tensor(ws, shape, int64)
+    if _grad_enabled and x.requires_grad:
+        sx = x._s
+        xshape = x.shape
+        xdt = x.dtype
+
+        def backward(g):
+            if _grad_enabled:
+                # create_graph: the gradient as the stacked-views path
+                # computes and records it (it reads only `which` and the
+                # shapes, never x, so a detached input serves).
+                xd = Tensor(sx, xshape, xdt)
+                xd.requires_grad = True
+                with enable_grad():
+                    ref = replay(xd)
+                return _autograd_grad([ref], [xd], [g], create_graph=True)
+            return (Tensor(_k.max_pool2d_backward(g._s, ws, xshape, dims), xshape, g.dtype),)
+        values.requires_grad = True
+        values._node = _Node(backward, (x,), "Max")
+    return values, which
+
+
+def _linear(x, weight, bias=None):
+    """F.linear: x @ weight.T (+ bias). The product reads the weight
+    transposed in place (`matmul`'s transB) where `matmul(x, weight.T)`
+    would copy it and record a Permute node; the values, gradients and their
+    accumulation order are that path's exactly (see `_linear_mm`)."""
+    if (not _graph_recording and _isinstance(x, Tensor) and _isinstance(weight, Tensor)
+            and _len(weight.shape) == 2 and _len(x.shape) >= 2):
+        out = _linear_mm(x, weight)
+    else:
+        out = matmul(x, weight.transpose(0, 1))
+    return out if bias is None else out + bias
+
+
+def _linear_mm(x, w):
+    storage, shape = _k.matmul(x._s, x.shape, w._s, w.shape, True)
+    out = _new3(storage, shape, _DTYPES[_k.dtype(storage)])
+    rx = x.requires_grad
+    rw = w.requires_grad
+    if _grad_enabled and (rx or rw):
+        sx = x._s
+        wshape = w.shape
+        wdt = w.dtype
+        # The weight's values now, for x's gradient: `matmul(x, weight.T)`
+        # kept them in its transposed copy, so a later in-place update of
+        # the weight (an optimizer step before backward) is not seen.
+        wsnap = _k.copy(w._s) if rx else None
+
+        def backward(g):
+            xs = _frozen(x, sx)
+            gx = gw = None
+            if _grad_enabled:
+                # create_graph: the transposed path's own operations, so
+                # the recorded gradient graph is the one it would record.
+                wt = Tensor(_k.permute(wsnap, wshape, [1, 0])[0], (wshape[1], wshape[0]), wdt) if rx else None
+                if rx and rw:
+                    wt.requires_grad = True
+                    pnode = _Node(lambda gg: (permute(gg, 1, 0),), (w,), "Permute")
+                    # The weight's history as this product consumed it.
+                    pnode.pstate = [node.pstate[1]]
+                    wt._node = pnode
+                if rx:
+                    gx = _unbroadcast(matmul(g, transpose(wt, -1, -2)), xs.shape)
+                if rw:
+                    gw = permute(_unbroadcast(matmul(transpose(xs, -1, -2), g), (wshape[1], wshape[0])), 1, 0)
+                return (gx, gw)
+            if rx:
+                gx = _unbroadcast(matmul(g, Tensor(wsnap, wshape, wdt)), xs.shape)
+            if rw:
+                # g^T @ x sums, per element, the products x^T @ g sums, in
+                # the same order: the transposed path's value, transposed.
+                gw = _unbroadcast(matmul(transpose(g, -1, -2), xs), wshape)
+            return (gx, gw)
+        out.requires_grad = True
+        node = _Node(backward, (x, w), "Mm", [x] if rw else None)
+        out._node = node
     return out
 
 
@@ -5763,7 +6017,7 @@ def softmax(input, dim=-1, dtype=None):
         a = a.to(dtype)
     d = _norm_dim(dim, _b.max(_len(a.shape), 1))
     out = Tensor(_k.softmax(a._s, a.shape or (1,), d, False), a.shape, _default_dtype if not a.dtype.is_floating_point else a.dtype)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         so = out._s
 
@@ -5782,7 +6036,7 @@ def log_softmax(input, dim=-1, dtype=None):
         a = a.to(dtype)
     d = _norm_dim(dim, _b.max(_len(a.shape), 1))
     out = Tensor(_k.softmax(a._s, a.shape or (1,), d, True), a.shape, _default_dtype if not a.dtype.is_floating_point else a.dtype)
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         so = out._s
         out._node = _Node(lambda g: (sub(g, mul(exp(_frozen(out, so)), sum(g, d if a.shape else None, True))),), (a,), "LogSoftmax", (out,))
@@ -5838,7 +6092,8 @@ def _run_backward(tensors, grad_tensors, create_graph=False, inputs=None):
         if g is None:
             if _numel(t_.shape) != 1:
                 raise RuntimeError("grad can be implicitly created only for scalar outputs")
-            g = ones(*t_.shape, dtype=t_.dtype)
+            # ones(*t_.shape, dtype=t_.dtype), one element.
+            g = Tensor(_k.full(t_.dtype.name, 1, 1), t_.shape, t_.dtype)
         else:
             g = _as_tensor(g, t_)
             if _tuple(g.shape) != _tuple(t_.shape):
@@ -5867,10 +6122,185 @@ def _accumulate_grad(t_, g, create_graph):
     else:
         # Outside create_graph PyTorch accumulates into the existing .grad
         # in place, so a reference to it sees the sum.
-        t_.grad._write(add(t_.grad, g))
+        grad = t_.grad
+        total = add(grad, g)
+        if total.shape is grad.shape and total.dtype is grad.dtype and not grad._untracked:
+            # What `_write` does once its checks pass.
+            _k.copy_into(grad._s, total._s)
+        else:
+            grad._write(total)
+
+
+# The traversal marks the tensors it visits instead of keeping id-keyed
+# sets and dicts (on this runtime `id()` and a dict or set method call each
+# cost several attribute loads): `_bwe` is the traversal a tensor was last
+# visited by, `_pg` its pending gradient and `_bps` its node's parents when
+# one of them had to be replaced by an alias. A visit clears `_pg` and
+# `_bps`, so values an earlier traversal left behind (one that raised) are
+# never read. A backward started while another runs (a hook or a node's
+# backward calling backward) takes `_backward_dict`, which keeps its state
+# in local dicts and so cannot disturb the outer traversal's marks. Both
+# visit, order and accumulate exactly alike.
+_bwd_active = False
 
 
 def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
+    global _bwd_active, _grad_enabled
+    if _bwd_active:
+        return _backward_dict(roots, grads, accumulate, inputs, create_graph)
+    if _isinstance(roots, Tensor):
+        roots, grads = [roots], [grads]
+    _bwd_active = True
+    try:
+        cur = []
+        order = [None] * 32
+        cap = 32
+        n_order = 0
+        aliases = None
+        # Depth-first post-order without recursion, as `_backward_dict`: a
+        # stack of (tensor, done) pairs held in a list indexed by `sp`.
+        stack = [None] * 32
+        scap = 32
+        sp = 0
+        i = _len(roots) - 1
+        while i >= 0:
+            if sp == scap:
+                stack += [None] * scap
+                scap += scap
+            stack[sp] = (roots[i], False)
+            sp += 1
+            i -= 1
+        while sp:
+            sp -= 1
+            t_, done = stack[sp]
+            if done:
+                if n_order == cap:
+                    order += [None] * cap
+                    cap += cap
+                order[n_order] = t_
+                n_order += 1
+                continue
+            if t_._bwe is cur:
+                continue
+            t_._bwe = cur
+            if t_._pg is not None:
+                t_._pg = None
+            if t_._bps is not None:
+                t_._bps = None
+            # The done entry takes this slot: the pop above freed it.
+            stack[sp] = (t_, True)
+            sp += 1
+            node = t_._node
+            if node is not None:
+                # The parents as this node consumed them: one given a new
+                # history by an in-place op since stands in as an alias
+                # carrying the history it had then (one alias per earlier
+                # version, shared by every node that consumed it).
+                ps = node.parents
+                pstate = node.pstate
+                i = _len(ps) - 1
+                while i >= 0:
+                    p = ps[i]
+                    if p is not None:
+                        st = pstate[i]
+                        if p._node is not st[0]:
+                            if aliases is None:
+                                aliases = {}
+                            akey = (id(p), id(st[0]))
+                            alias = aliases.get(akey)
+                            if alias is None:
+                                alias = aliases[akey] = Tensor(p._s, st[2], p.dtype, st[1], st[0])
+                            if t_._bps is None:
+                                ps = t_._bps = _list(ps)
+                            ps[i] = alias
+                            p = alias
+                        if p.requires_grad and p._bwe is not cur:
+                            if sp == scap:
+                                stack += [None] * scap
+                                scap += scap
+                            stack[sp] = (p, False)
+                            sp += 1
+                    i -= 1
+        i = 0
+        for r in roots:
+            g = grads[i]
+            i += 1
+            prior = r._pg
+            r._pg = g if prior is None else add(prior, g)
+        captured = {}
+        wanted = None if inputs is None else set(id(t_) for t_ in inputs)
+        # The grad mode for the backward functions: recording only for
+        # create_graph (as `with enable_grad()` / `with no_grad()`).
+        prev_mode = _grad_enabled
+        _grad_enabled = create_graph is True or _bool(create_graph)
+        try:
+            k = n_order - 1
+            while k >= 0:
+                t_ = order[k]
+                k -= 1
+                g = t_._pg
+                if g is None:
+                    continue
+                t_._pg = None
+                if t_._hooks:
+                    for hook in _list(t_._hooks):
+                        replaced = hook(g)
+                        if replaced is not None:
+                            g = replaced
+                if wanted is not None:
+                    key = id(t_)
+                    if key in wanted:
+                        captured[key] = g if key not in captured else add(captured[key], g)
+                        if accumulate:
+                            _accumulate_grad(t_, g, create_graph)
+                node = t_._node
+                if node is None:
+                    if accumulate and wanted is None and t_.requires_grad:
+                        _accumulate_grad(t_, g, create_graph)
+                    continue
+                if t_._retain and accumulate and wanted is None:
+                    _accumulate_grad(t_, g, create_graph)
+                if node.saved is not None:
+                    _check_saved(node)
+                if create_graph and not (node.diff or node.name in _DIFFERENTIABLE):
+                    raise NotImplementedError("backward with create_graph=True through %s is not supported on Zipp" % _grad_fn_name(node.name))
+                parent_grads = node.backward(g)
+                tp = parent_grads.__class__
+                if tp is not _tuple and tp is not _list:
+                    parent_grads = _tuple(parent_grads)
+                ps = t_._bps
+                if ps is None:
+                    ps = node.parents
+                else:
+                    t_._bps = None
+                count = _len(ps)
+                m = _len(parent_grads)
+                if m < count:
+                    count = m
+                i = 0
+                while i < count:
+                    p = ps[i]
+                    pg = parent_grads[i]
+                    i += 1
+                    if p is None or pg is None or not p.requires_grad:
+                        continue
+                    pshape = p.shape
+                    gshape = pg.shape
+                    if gshape is not pshape and not _shape_eq(gshape, pshape) and _tuple(gshape) != _tuple(pshape):
+                        pg = _unbroadcast(pg, pshape) if _numel(gshape) >= _numel(pshape) else expand(pg, *pshape)
+                    pdt = p.dtype
+                    if pg.dtype is not pdt and pg.dtype != pdt and pdt.is_floating_point:
+                        pg = pg.to(pdt)
+                    prior = p._pg
+                    p._pg = pg if prior is None else add(prior, pg)
+        finally:
+            _grad_enabled = prev_mode
+        return captured
+    finally:
+        _bwd_active = False
+
+
+def _backward_dict(roots, grads, accumulate=True, inputs=None, create_graph=False):
     if _isinstance(roots, Tensor):
         roots, grads = [roots], [grads]
     order, seen = [], set()

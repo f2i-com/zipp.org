@@ -35,7 +35,7 @@
     // as cheap as the native call.
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
-        N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12;
+        N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -1015,9 +1015,17 @@
         { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(outShape)]); }
     }
     // ---- linear algebra ----------------------------------------------------------------
-    function matmul(a, ashape, b, bshape) {
+    // `transB`: b holds the transpose of the right operand, a 2-D [n, k]
+    // (F.linear's weight), read in place instead of transposed into a copy.
+    // Each output element sums the same k products in the same order, so
+    // the result is the plain product's, byte for byte.
+    function matmul(a, ashape, b, bshape, transB) {
         let A = ashape.slice(), Bs = bshape.slice();
         if (A.length === 0 || Bs.length === 0) fail(E.RuntimeError, "both arguments to matmul need to be at least 1D");
+        if (transB) {
+            if (Bs.length !== 2) fail(E.RuntimeError, "matmul: a transposed right operand must be 2-D");
+            Bs = [Bs[1], Bs[0]];
+        }
         const squeezeA = A.length === 1, squeezeB = Bs.length === 1;
         if (squeezeA) A = [1, A[0]]; if (squeezeB) Bs = [Bs[0], 1];
         const m = A[A.length - 2], k = A[A.length - 1], k2 = Bs[Bs.length - 2], n = Bs[Bs.length - 1];
@@ -1034,6 +1042,19 @@
         const row = new Float64Array(n);
         forEachBroadcast(batch, sa, sb, (bi, oa, ob) => {
             const baseA = oa * m * k, baseB = ob * k * n, baseO = bi * m * n;
+            if (transB) {
+                if (NATIVE !== null && NATIVE(N_MATMUL_NT, Ad, Bd, O, baseA, baseB, baseO, m, k, n)) return;
+                // Element (i, j) sums A[i, p] * B[j, p] over p in order in a
+                // double, as the row loop below sums it, and rounds on store.
+                for (let i = 0, ia = baseA, io = baseO; i < m; i++, ia += k) {
+                    for (let j = 0, jb = baseB; j < n; j++, jb += k, io++) {
+                        let s = 0;
+                        for (let p = 0; p < k; p++) s += Ad[ia + p] * Bd[jb + p];
+                        O[io] = s;
+                    }
+                }
+                return;
+            }
             if (NATIVE !== null && NATIVE(N_MATMUL, Ad, Bd, O, baseA, baseB, baseO, m, k, n)) return;
             for (let i = 0; i < m; i++) {
                 row.fill(0);
@@ -1048,6 +1069,58 @@
         if (squeezeA) outShape.splice(outShape.length - 2, 1);
         if (squeezeB) outShape.splice(outShape.length - 1, 1);
         { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(outShape)]); }
+    }
+    // max_pool2d over x [N, C, H, W] (dims `d`: [Kh, Kw, Sh, Sw, Ph, Pw, Dh,
+    // Dw, Ho, Wo]): per output, the window's values in row-major order, a
+    // padded position reading -Infinity (the -inf padding torch pads with).
+    // The value is what the `max` reduction of the stacked window keeps
+    // (NaN wins, the last one), the int64 index what `argmax` keeps (the
+    // first maximum, or the first NaN), so F.max_pool2d's values and window
+    // indices are the stacked-views path's exactly.
+    function maxPool2d(x, xs, d) {
+        const NC = xs[0] * xs[1], H = xs[2], W = xs[3];
+        const [kh, kw, sh, sw, ph, pw, dh, dw, Ho, Wo] = d;
+        const n = NC * Ho * Wo, out = alloc(x.dtype, n), idx = alloc("int64", n), X = x.data, O = out.data, I = idx.data;
+        if (NATIVE !== null && NATIVE(N_MAX_POOL2D, X, O, I, NC, H, W, kh, kw, sh, sw, ph, pw, dh, dw, Ho, Wo)) { if (HALF[out.dtype] === 1) finish(out); return tuple([out, idx]); }
+        for (let p = 0, o = 0; p < NC; p++) {
+            const base = p * H * W;
+            for (let i = 0; i < Ho; i++) for (let j = 0; j < Wo; j++, o++) {
+                let m = -Infinity, best = -Infinity, at = 0, r = 0;
+                for (let a = 0; a < kh; a++) {
+                    const y = i * sh - ph + a * dh;
+                    for (let b = 0; b < kw; b++, r++) {
+                        const xx = j * sw - pw + b * dw;
+                        const v = y >= 0 && y < H && xx >= 0 && xx < W ? X[base + y * W + xx] : -Infinity;
+                        if (v > m || v !== v) m = v;
+                        if (v > best || (v !== v && best === best)) { best = v; at = r; }
+                    }
+                }
+                O[o] = m; I[o] = at;
+            }
+        }
+        if (HALF[out.dtype] === 1) finish(out);
+        return tuple([out, idx]);
+    }
+    // The input-shaped gradient of `maxPool2d`: zeros with g + 0 at each
+    // output's window position (for windows that do not overlap, what the
+    // stacked views' slice gradients sum to; a position in the padding is
+    // dropped, as the padding's own gradient drops it).
+    function maxPool2dBackward(g, idx, xs, d) {
+        const NC = xs[0] * xs[1], H = xs[2], W = xs[3];
+        const [kh, kw, sh, sw, ph, pw, dh, dw, Ho, Wo] = d;
+        const out = alloc(g.dtype, NC * H * W), GX = out.data, G = g.data, I = idx.data;
+        if (G.length !== NC * Ho * Wo || I.length !== G.length) fail(E.RuntimeError, "max_pool2d_backward: size mismatch");
+        if (NATIVE !== null && NATIVE(N_MAX_POOL2D_BACKWARD, G, I, GX, NC, H, W, kh, kw, sh, sw, ph, pw, dh, dw, Ho, Wo)) { if (HALF[out.dtype] === 1) finish(out); return out; }
+        for (let p = 0, o = 0; p < NC; p++) {
+            const base = p * H * W;
+            for (let i = 0; i < Ho; i++) for (let j = 0; j < Wo; j++, o++) {
+                const r = I[o], a = Math.floor(r / kw), b = r - a * kw;
+                const y = i * sh - ph + a * dh, xx = j * sw - pw + b * dw;
+                if (y >= 0 && y < H && xx >= 0 && xx < W) GX[base + y * W + xx] = G[o] + 0;
+            }
+        }
+        if (HALF[out.dtype] === 1) finish(out);
+        return out;
     }
     // conv1d, stride 1, no padding, no dilation: x [B,C,L], w [O,C,K], bias [O]?
     function conv1d(x, xs, w, ws, bias) {
@@ -1634,6 +1707,17 @@
             return null;
         });
         // binary(op, a, ashape, b, bshape, dtype=None): `dtype` is the result type promotion chose.
+        // binary_scalar(op, a, ashape, value, sdtype, want, flip): `binary` with
+        // a Python number for one operand, held in a 1-element `sdtype`
+        // storage exactly as `full` stores it (`flip`: the number is the
+        // left operand), so no 0-d tensor has to be built for it.
+        fn("binary_scalar", 7, (a) => {
+            const s = alloc(rt.needStr(a[4]), 1);
+            s.data[0] = castValue(s.dtype, num(a[3]));
+            const want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
+            return rt.truth(a[6]) ? binary(rt.needStr(a[0]), s, [], needS(a[1]), shapeOf(a[2]), undefined, a[2], want)
+                : binary(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), s, [], a[2], undefined, want);
+        });
         fn("binary", 6, (a) => binary(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), needS(a[3]), shapeOf(a[4]), a[2], a[4], a[5] === undefined || a[5] === null ? null : rt.needStr(a[5])), 5);
         fn("unary", 4, (a) => unary(rt.needStr(a[0]), needS(a[1]), a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]), 2);
         fn("reduce", 6, (a) => reduce(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])), 5);
@@ -1648,7 +1732,9 @@
         fn("cat", 2, (a) => cat(a[0], num(a[1])));
         fn("roll", 4, (a) => roll(needS(a[0]), shapeOf(a[1]), num(a[2]), num(a[3])));
         fn("pad_last", 5, (a) => padLast(needS(a[0]), shapeOf(a[1]), num(a[2]), num(a[3]), num(a[4])));
-        fn("matmul", 4, (a) => matmul(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3])));
+        fn("matmul", 5, (a) => matmul(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), a[4] !== undefined && a[4] !== null && rt.truth(a[4])), 4);
+        fn("max_pool2d", 3, (a) => maxPool2d(needS(a[0]), shapeOf(a[1]), ints(a[2])));
+        fn("max_pool2d_backward", 4, (a) => maxPool2dBackward(needS(a[0]), needS(a[1]), shapeOf(a[2]), ints(a[3])));
         fn("conv1d", 5, (a) => conv1d(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), a[4] === null ? null : needS(a[4])));
         fn("conv1d_backward", 5, (a) => conv1dBackward(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), needS(a[4])));
         fn("conv2d", 9, (a) => conv2d(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), a[4] === null ? null : needS(a[4]), shapeOf(a[5]), shapeOf(a[6]), shapeOf(a[7]), num(a[8])));

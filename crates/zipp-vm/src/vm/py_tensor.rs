@@ -66,6 +66,9 @@ const OP_SOFTMAX: u32 = 9;
 const OP_GATHER: u32 = 10;
 const OP_ALL_FINITE: u32 = 11;
 const OP_WHERE: u32 = 12;
+const OP_MATMUL_NT: u32 = 13;
+const OP_MAX_POOL2D: u32 = 14;
+const OP_MAX_POOL2D_BACKWARD: u32 = 15;
 
 // TypedArray kinds (`native::TA_KINDS`) a tensor storage can be.
 const KIND_U8: u8 = 1;
@@ -402,7 +405,10 @@ impl Vm<'_> {
         let op = u32::try_from(op).unwrap_or(0);
         let a = &args[1..];
         Ok(match op {
-            OP_MATMUL => Value::bool(self.pt_matmul(a).is_some()),
+            OP_MATMUL => Value::bool(self.pt_matmul(a, false).is_some()),
+            OP_MATMUL_NT => Value::bool(self.pt_matmul(a, true).is_some()),
+            OP_MAX_POOL2D => Value::bool(self.pt_max_pool2d(a, false).is_some()),
+            OP_MAX_POOL2D_BACKWARD => Value::bool(self.pt_max_pool2d(a, true).is_some()),
             OP_CONV2D => Value::bool(self.pt_conv2d(a, false).is_some()),
             OP_CONV2D_BACKWARD => Value::bool(self.pt_conv2d(a, true).is_some()),
             OP_CONV1D => Value::bool(self.pt_conv1d(a).is_some()),
@@ -556,8 +562,10 @@ impl Vm<'_> {
 
     /// `(A, B, O, aOff, bOff, oOff, m, k, n)`: one [m,k] @ [k,n] product of a
     /// batch, tensor.js's `matmul` loop: i-k-j order over one f64 row, each
-    /// output rounded once on store.
-    fn pt_matmul(&mut self, a: &[Value]) -> Option<()> {
+    /// output rounded once on store. `trans_b`: B is stored as its [n,k]
+    /// transpose (the `transB` loop); element (i, j) still sums its k
+    /// products in p order from 0 in an f64, so it is the same value.
+    fn pt_matmul(&mut self, a: &[Value], trans_b: bool) -> Option<()> {
         let (va, vb, vo) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?);
         if vo.buffer == va.buffer || vo.buffer == vb.buffer {
             return None;
@@ -576,6 +584,17 @@ impl Vm<'_> {
             }
             let row = &mut out[i * n..(i + 1) * n];
             let arow = &av[i * k..(i + 1) * k];
+            if trans_b {
+                for (j, r) in row.iter_mut().enumerate() {
+                    let brow = &bv[j * k..(j + 1) * k];
+                    let mut s = 0.0f64;
+                    for (&x, &y) in arow.iter().zip(brow) {
+                        s += x * y;
+                    }
+                    *r = s;
+                }
+                continue;
+            }
             for (p, &x) in arow.iter().enumerate() {
                 let brow = &bv[p * n..(p + 1) * n];
                 for (r, &y) in row.iter_mut().zip(brow) {
@@ -1149,6 +1168,114 @@ impl Vm<'_> {
         let finite = av.iter().all(|&x| x - x == 0.0);
         self.pt_charge(cost);
         Some(finite)
+    }
+
+    /// Forward `(X, O, I, NC, H, W, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, Ho, Wo)`
+    /// or backward `(G, I, GX, ...the same dims)`: tensor.js's `maxPool2d`
+    /// and `maxPool2dBackward`. The forward takes each window's values in
+    /// row-major order (a padded position reads -Infinity) and keeps the
+    /// max as the `max` reduction does (NaN wins, the last one) and its
+    /// position as `argmax` does (the first maximum or the first NaN). The
+    /// backward stores `g + 0` at each output's recorded position of a
+    /// zeroed input-shaped gradient (positions outside the input dropped).
+    fn pt_max_pool2d(&mut self, a: &[Value], backward: bool) -> Option<()> {
+        let mut d = [0usize; 13];
+        for (i, slot) in d.iter_mut().enumerate() {
+            *slot = int_arg(a, 3 + i)?;
+        }
+        let [nc, h, w, kh, kw, sh, sw, ph, pw, dh, dw, ho, wo] = d;
+        let k = kh.checked_mul(kw)?;
+        let xn = nc.checked_mul(h)?.checked_mul(w)?;
+        let on = nc.checked_mul(ho)?.checked_mul(wo)?;
+        // Every coordinate the walk forms must fit an isize.
+        let lim = isize::MAX as usize / 4;
+        if xn > lim || ho.checked_mul(sh)?.checked_add(kh.checked_mul(dh)?)?.checked_add(ph)? > lim || wo.checked_mul(sw)?.checked_add(kw.checked_mul(dw)?)?.checked_add(pw)? > lim {
+            return None;
+        }
+        let (v0, v1, v2) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?);
+        if v0.buffer == v2.buffer || v1.buffer == v2.buffer || v0.buffer == v1.buffer {
+            return None;
+        }
+        let (hi, wi, phi, pwi) = (h as isize, w as isize, ph as isize, pw as isize);
+        if backward {
+            let (vg, vi, vgx) = (v0, v1, v2);
+            if vg.len != on || vi.len != on || vgx.len != xn {
+                return None;
+            }
+            let cost = self.pt_admit(on.saturating_add(xn), on.saturating_mul(2).saturating_add(xn))?;
+            let gv = self.pt_read_all(vg)?;
+            let iv = self.pt_read_all(vi)?;
+            let mut out = zeroed(xn)?;
+            let mut o = 0usize;
+            for p in 0..nc {
+                if p % 64 == 63 && self.native_kernel_interrupted() {
+                    return None;
+                }
+                let base = p * h * w;
+                for i in 0..ho {
+                    for j in 0..wo {
+                        let r = iv[o];
+                        if !(r >= 0.0 && r.fract() == 0.0 && r < k as f64) {
+                            return None;
+                        }
+                        let r = r as usize;
+                        let (ra, rb) = (r / kw, r % kw);
+                        let y = (i * sh + ra * dh) as isize - phi;
+                        let x = (j * sw + rb * dw) as isize - pwi;
+                        if y >= 0 && y < hi && x >= 0 && x < wi {
+                            out[base + y as usize * w + x as usize] = gv[o] + 0.0;
+                        }
+                        o += 1;
+                    }
+                }
+            }
+            self.pt_write(vgx, 0, &out)?;
+            self.pt_charge(cost);
+            return Some(());
+        }
+        let (vx, vo, vi) = (v0, v1, v2);
+        if vx.len != xn || vo.len != on || vi.len != on || vi.kind != KIND_F64 {
+            return None;
+        }
+        let cost = self.pt_admit(on.checked_mul(k)?.checked_add(on)?, xn.saturating_add(on.saturating_mul(2)))?;
+        let xv = self.pt_read_all(vx)?;
+        let mut vals = zeroed(on)?;
+        let mut idx = zeroed(on)?;
+        let mut o = 0usize;
+        for p in 0..nc {
+            if p % 64 == 63 && self.native_kernel_interrupted() {
+                return None;
+            }
+            let base = p * h * w;
+            for i in 0..ho {
+                for j in 0..wo {
+                    let (mut m, mut best, mut at) = (f64::NEG_INFINITY, f64::NEG_INFINITY, 0usize);
+                    let mut r = 0usize;
+                    for ra in 0..kh {
+                        let y = (i * sh + ra * dh) as isize - phi;
+                        for rb in 0..kw {
+                            let x = (j * sw + rb * dw) as isize - pwi;
+                            let v = if y >= 0 && y < hi && x >= 0 && x < wi { xv[base + y as usize * w + x as usize] } else { f64::NEG_INFINITY };
+                            if v > m || v.is_nan() {
+                                m = v;
+                            }
+                            if v > best || (v.is_nan() && !best.is_nan()) {
+                                best = v;
+                                at = r;
+                            }
+                            r += 1;
+                        }
+                    }
+                    vals[o] = m;
+                    idx[o] = at as f64;
+                    o += 1;
+                }
+            }
+        }
+        self.pt_write(vo, 0, &vals)?;
+        self.pt_write(vi, 0, &idx)?;
+        self.pt_charge(cost);
+        Some(())
     }
 
     /// `(C, A, B, O, shape, stridesC, stridesA, stridesB)`: tensor.js's

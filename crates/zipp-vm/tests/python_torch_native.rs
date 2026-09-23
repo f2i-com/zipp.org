@@ -200,6 +200,60 @@ for dt in ["float32", "float64", "int64", "bool"]:
     Bv = storage(dt, (5, 1), seed + 2)
     both("where %s" % dt, lambda: _k.where(C, (6, 1, 7), A, (6, 5, 7), Bv, (5, 1)))
     both("all_finite %s" % dt, lambda: _k.all_finite(A))
+# matmul with a transposed right operand (F.linear's weight): the bytes of
+# the plain product with that operand transposed into a copy.
+for dta in ["float32", "float64", "int64"]:
+    for dtb in ["float32", "float64"]:
+        for sa, sb in [((16, 32), (64, 32)), ((4, 10, 12), (48, 12)), ((12,), (7, 12)), ((3, 0), (5, 0)), ((5, 7), (3, 7)), ((2, 3, 70), (9, 70)), ((0, 4), (6, 4))]:
+            seed += 1
+            A = storage(dta, sa, seed)
+            B = storage(dtb, sb, seed + 3)
+            both("matmul_t %s %s %s %s" % (dta, dtb, sa, sb), lambda: _k.matmul(A, sa, B, sb, True))
+            for on in (False, True):
+                _k._native(on)
+                Bt, st = _k.permute(B, sb, [1, 0])
+                if image(_k.matmul(A, sa, B, sb, True)) != image(_k.matmul(A, sa, Bt, st)):
+                    BAD.append("matmul_t vs transposed copy %s %s %s %s %s" % (dta, dtb, sa, sb, on))
+A = storage("float32", (8, 8), 5)
+both("matmul_t self", lambda: _k.matmul(A, (8, 8), A, (8, 8), True))
+both("matmul_t mismatch", lambda: _k.matmul(A, (8, 8), A, (4, 16), True))
+both("matmul_t 3-d", lambda: _k.matmul(A, (8, 8), A, (2, 4, 8), True))
+# max_pool2d and its gradient: dims (Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw).
+for dt in ["float32", "float64", "float16", "bfloat16"]:
+    for kd in [(2, 2, 2, 2, 0, 0, 1, 1), (2, 2, 3, 3, 0, 0, 1, 1), (2, 2, 2, 3, 1, 1, 1, 1), (3, 3, 3, 3, 1, 1, 1, 1), (2, 2, 3, 3, 0, 0, 2, 2),
+               (1, 2, 1, 2, 0, 0, 1, 1), (3, 1, 3, 2, 1, 0, 1, 1), (3, 3, 1, 1, 1, 1, 1, 1), (2, 3, 1, 2, 0, 1, 2, 1)]:
+        kh, kw, sh, sw, ph, pw, dh, dw = kd
+        xs = (2, 3, 9, 8)
+        ho = (xs[2] + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+        wo = (xs[3] + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+        dims = kd + (ho, wo)
+        seed += 1
+        X = storage("float32", xs, seed) if dt in ("float16", "bfloat16") else storage(dt, xs, seed)
+        if dt in ("float16", "bfloat16"):
+            X = _k.astype(X, dt)
+        both("max_pool2d %s %s" % (dt, kd), lambda: _k.max_pool2d(X, xs, dims))
+        G = storage("float32", (2, 3, ho, wo), seed + 1)
+        if dt != "float32":
+            G = _k.astype(G, dt)
+        I = _k.max_pool2d(X, xs, dims)[1]
+        both("max_pool2d_backward %s %s" % (dt, kd), lambda: _k.max_pool2d_backward(G, I, xs, dims))
+        J = _k.from_flat("int64", [(i * 5) % 11 for i in range(2 * 3 * ho * wo)])
+        both("max_pool2d_backward index %s %s" % (dt, kd), lambda: _k.max_pool2d_backward(G, J, xs, dims))
+# binary with a Python number operand: `binary` against that number's 1-element storage.
+for op in ["add", "sub", "mul", "div", "pow", "max", "lt", "eq", "floordiv"]:
+    for dt, v, sdt, want in [("float32", 2.5, "float32", "float32"), ("float32", -0.0, "float32", "float32"), ("int64", 3, "int64", "int64"), ("float16", 0.1, "float32", "float16"), ("float64", 1e-3, "float64", "float64")]:
+        for flip in (False, True):
+            seed += 1
+            A = storage("float32", (70,), seed) if dt == "float16" else storage(dt, (70,), seed)
+            if dt == "float16":
+                A = _k.astype(A, dt)
+            both("binary_scalar %s %s %s" % (op, dt, flip), lambda: _k.binary_scalar(op, A, (70,), v, sdt, want, flip))
+            for on in (False, True):
+                _k._native(on)
+                S = _k.full(sdt, 1, v)
+                ref = _k.binary(op, S, (), A, (70,), want) if flip else _k.binary(op, A, (70,), S, (), want)
+                if image(_k.binary_scalar(op, A, (70,), v, sdt, want, flip)) != image(ref):
+                    BAD.append("binary_scalar vs full %s %s %s %s" % (op, dt, flip, on))
 print("cases", CASES[0], "mismatches", len(BAD), BAD[:5])
 "#;
 
