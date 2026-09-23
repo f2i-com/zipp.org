@@ -7,9 +7,9 @@ The classes follow PyTorch 2.11's `torch/distributions/*.py` (argument
 checking, broadcasting, shapes, `expand`, validation messages). Sampling
 draws from torch's generator (`torch.rand`/`torch.randn`/`torch.poisson`
 and the tensor `*_` samplers), so values follow the manual seed but are not
-PyTorch's streams. `constraints`, `transforms`, `kl` and `utils` are
-attributes of this module (`from torch.distributions import constraints`),
-not importable submodules.
+PyTorch's streams. `constraints`, `transforms` and `kl` are also the
+submodules torch.distributions.constraints/.transforms/.kl, which re-export
+the objects defined here; `utils` and `constraint_registry` are attributes.
 
 `lgamma`, `digamma` and the regularized incomplete gamma use `torch.lgamma`
 / `torch.digamma` when torch provides them and otherwise a per-element
@@ -266,53 +266,52 @@ _SGG_COEF = (
 )
 
 
-def _standard_gamma_grad_py(alpha, x):
-    """d x / d alpha for x ~ Gamma(alpha, 1) at a fixed quantile, as
-    PyTorch's standard_gamma_grad_one computes it: a Taylor series for small
-    x, Rice's saddle-point expansion for large alpha and a bivariate rational
-    approximation otherwise."""
-    if x < 0.8:
-        numer = 1.0
-        denom = alpha
-        series1 = numer / denom
-        series2 = numer / (denom * denom)
-        for i in range(1, 6):
-            numer *= -x / i
-            denom += 1
-            series1 += numer / denom
-            series2 += numer / (denom * denom)
-        pow_x_alpha = x ** alpha
-        gamma_pdf = x ** (alpha - 1) * math.exp(-x)
-        gamma_cdf = pow_x_alpha * series1
-        gamma_cdf_alpha = (math.log(x) - _py_digamma(alpha)) * gamma_cdf - pow_x_alpha * series2 if x > 0 else nan
-        result = -gamma_cdf_alpha / gamma_pdf if gamma_pdf != 0 else nan
-        return 0.0 if result != result else result
-    if alpha > 8.0:
-        if 0.9 * alpha <= x <= 1.1 * alpha:
-            numer_1 = 1 + 24 * alpha * (1 + 12 * alpha)
-            numer_2 = 1440 * (alpha * alpha) + 6 * x * (53 - 120 * x) - 65 * x * x / alpha + alpha * (107 + 3600 * x)
-            return numer_1 * numer_2 / (1244160 * (alpha * alpha) * (alpha * alpha))
-        denom = math.sqrt(8 * alpha)
-        term2 = denom / (alpha - x)
-        term3 = (x - alpha - alpha * math.log(x / alpha)) ** -1.5
-        term23 = term2 - term3 if x < alpha else term2 + term3
-        term1 = math.log(x / alpha) * term23 - math.sqrt(2 / alpha) * (alpha + x) / ((alpha - x) * (alpha - x))
-        stirling = 1 + 1 / (12 * alpha) * (1 + 1 / (24 * alpha))
-        return -stirling * x * term1 / denom
-    u = math.log(x / alpha)
-    v = math.log(alpha)
+def _standard_gamma_grad(concentration, x):
+    """d x / d alpha for x ~ Gamma(alpha, 1) at a fixed quantile, elementwise,
+    as PyTorch's standard_gamma_grad_one computes it (in float64): a Taylor
+    series for small x, Rice's saddle-point expansion for large alpha and a
+    bivariate rational approximation otherwise."""
+    a, x = torch.broadcast_tensors(concentration.detach(), x.detach())
+    dtype = x.dtype
+    a = a.to(torch.float64)
+    x = x.to(torch.float64)
+    nan_t = torch.full_like(x, nan)
+    # x < 0.8: a Taylor series of the incomplete gamma function.
+    numer = torch.ones_like(x)
+    denom = a
+    series1 = numer / denom
+    series2 = numer / (denom * denom)
+    for i in range(1, 6):
+        numer = numer * (-x / i)
+        denom = denom + 1
+        series1 = series1 + numer / denom
+        series2 = series2 + numer / (denom * denom)
+    pow_x_alpha = x ** a
+    gamma_pdf = x ** (a - 1) * torch.exp(-x)
+    gamma_cdf = pow_x_alpha * series1
+    gamma_cdf_alpha = torch.where(x > 0, (torch.log(x) - _digamma(a)) * gamma_cdf - pow_x_alpha * series2, nan_t)
+    series = torch.where(gamma_pdf != 0, -gamma_cdf_alpha / gamma_pdf, nan_t)
+    series = torch.where(series != series, torch.zeros_like(series), series)
+    # alpha > 8: Rice's saddle-point expansion (a polynomial near x = alpha).
+    numer_1 = 1 + 24 * a * (1 + 12 * a)
+    numer_2 = 1440 * (a * a) + 6 * x * (53 - 120 * x) - 65 * x * x / a + a * (107 + 3600 * x)
+    near = numer_1 * numer_2 / (1244160 * (a * a) * (a * a))
+    sq = torch.sqrt(8 * a)
+    term2 = sq / (a - x)
+    term3 = (x - a - a * torch.log(x / a)) ** -1.5
+    term23 = torch.where(x < a, term2 - term3, term2 + term3)
+    term1 = torch.log(x / a) * term23 - torch.sqrt(2 / a) * (a + x) / ((a - x) * (a - x))
+    stirling = 1 + 1 / (12 * a) * (1 + 1 / (24 * a))
+    rice = torch.where((0.9 * a <= x) & (x <= 1.1 * a), near, -stirling * x * term1 / sq)
+    # otherwise: a bivariate rational approximation in log(x / alpha), log(alpha).
+    u = torch.log(x / a)
+    v = torch.log(a)
     c = [_SGG_COEF[0][i] + u * (_SGG_COEF[1][i] + u * _SGG_COEF[2][i]) for i in range(8)]
     p = c[0] + v * (c[1] + v * (c[2] + v * c[3]))
     q = c[4] + v * (c[5] + v * (c[6] + v * c[7]))
-    return math.exp(p / q)
-
-
-def _standard_gamma_grad(concentration, x):
-    """Elementwise d sample / d concentration (torch._standard_gamma_grad)."""
-    a, x = torch.broadcast_tensors(concentration, x)
-    av = torch._k.to_list(a.detach()._s)
-    xv = torch._k.to_list(x.detach()._s)
-    return torch.Tensor(torch._k.from_flat(x.dtype.name, [_standard_gamma_grad_py(p, q) for p, q in zip(av, xv)]), x.shape, x.dtype)
+    rational = torch.exp(p / q)
+    out = torch.where(x < 0.8, series, torch.where(a > 8.0, rice, rational))
+    return out.to(dtype)
 
 
 def _uniforms(n):
@@ -323,46 +322,93 @@ def _normals(n):
     return torch._k.to_list(torch.randn(n, dtype=torch.float64)._s) if n else []
 
 
+def _gamma_scalar(a, buf_n, buf_u):
+    """One Marsaglia-Tsang Gamma(a, 1) draw for a >= 1 (lists of normals and
+    uniforms from torch's generator are consumed and refilled in blocks)."""
+    d = a - 1.0 / 3.0
+    c = 1.0 / math.sqrt(9.0 * d)
+    while True:
+        if not buf_n:
+            buf_n.extend(_normals(64))
+        z = buf_n.pop()
+        v = 1.0 + c * z
+        if v <= 0:
+            continue
+        v = v * v * v
+        if not buf_u:
+            buf_u.extend(_uniforms(64))
+        u = buf_u.pop()
+        if u < 1.0 - 0.0331 * z * z * z * z or (u > 0 and math.log(u) < 0.5 * z * z + d * (1.0 - v + math.log(v))):
+            return d * v
+
+
+def _patch(values, mask, fill):
+    """values with the lanes where `mask` holds replaced, in order, by the
+    floats fill() returns for their positions (a list of lane indices). The
+    lanes are found by list.index: masked_select and nonzero are costlier."""
+    count = int(mask.sum())
+    if not count:
+        return values
+    flags = torch._k.to_list(mask._s)
+    idx = []
+    i = -1
+    for _ in range(count):
+        i = flags.index(True, i + 1)
+        idx.append(i)
+    return values.index_copy(0, torch.tensor(idx, dtype=torch.int64), torch.tensor(fill(idx), dtype=torch.float64))
+
+
+def _gamma_draws(alphas):
+    """Marsaglia-Tsang draws of Gamma(alpha, 1) for a float64 vector of
+    alphas on torch's generator. The first proposal is made for every lane
+    at once (it is accepted over 95% of the time); rejected lanes then draw
+    one at a time. Alphas below 1 draw Gamma(alpha + 1) scaled by U^(1/alpha);
+    alpha 0 gives 0 and invalid alphas nan."""
+    n = alphas.numel()
+    if n == 0:
+        return torch.zeros(0, dtype=torch.float64)
+    finite = (alphas > 0) & (alphas < inf)
+    safe = torch.where(finite, alphas, torch.ones_like(alphas))
+    small = safe < 1
+    a = torch.where(small, safe + 1, safe)
+    d = a - 1.0 / 3.0
+    c = 1.0 / torch.sqrt(9.0 * d)
+    z = torch.randn(n, dtype=torch.float64)
+    u = torch.rand(n, dtype=torch.float64)
+    v = 1.0 + c * z
+    positive = v > 0
+    v = torch.where(positive, v, torch.ones_like(v))
+    v = v * v * v
+    z2 = z * z
+    accept = positive & ((u < 1.0 - 0.0331 * z2 * z2) | (torch.log(u) < 0.5 * z2 + d * (1.0 - v + torch.log(v))))
+
+    def redraw(idx):
+        a_list = torch._k.to_list(a._s)
+        buf_n, buf_u = [], []
+        return [_gamma_scalar(a_list[i], buf_n, buf_u) for i in idx]
+    out = _patch(d * v, finite & ~accept, redraw)
+    if bool(small.any()):
+        out = torch.where(small, out * torch.rand(n, dtype=torch.float64).pow(1.0 / safe), out)
+    out = torch.where(finite, out.clamp(min=2.2250738585072014e-308), torch.full_like(out, nan))
+    # Gamma(0) is a point mass at zero (the callers clamp to their dtype's tiny).
+    out = torch.where(alphas == 0, torch.zeros_like(out), out)
+    return torch.where(alphas == inf, torch.full_like(out, inf), out)
+
+
 def _sample_gamma_py(alphas):
-    """Marsaglia-Tsang draws of Gamma(alpha, 1) for each alpha, on torch's
-    generator (normals and uniforms drawn in blocks)."""
-    out = []
-    buf_n, buf_u = [], []
-    for alpha in alphas:
-        boost = 1.0
-        a = alpha
-        if a < 1.0:
-            if not buf_u:
-                buf_u = _uniforms(64)
-            u = buf_u.pop()
-            boost = u ** (1.0 / a) if u > 0 else 0.0
-            a += 1.0
-        d = a - 1.0 / 3.0
-        c = 1.0 / math.sqrt(9.0 * d)
-        while True:
-            if not buf_n:
-                buf_n = _normals(64)
-            z = buf_n.pop()
-            v = 1.0 + c * z
-            if v <= 0:
-                continue
-            v = v * v * v
-            if not buf_u:
-                buf_u = _uniforms(64)
-            u = buf_u.pop()
-            if u < 1.0 - 0.0331 * z * z * z * z or (u > 0 and math.log(u) < 0.5 * z * z + d * (1.0 - v + math.log(v))):
-                break
-        out.append(max(d * v * boost, 2.2250738585072014e-308))
-    return out
+    """Gamma(alpha, 1) draws for a list of alphas (a list of floats)."""
+    if not alphas:
+        return []
+    return torch._k.to_list(_gamma_draws(torch.tensor([float(x) for x in alphas], dtype=torch.float64))._s)
 
 
 def _standard_gamma(concentration):
     """Gamma(concentration, 1) samples with the implicit reparameterisation
     gradient (torch._standard_gamma)."""
     a = concentration
-    vals = _sample_gamma_py(torch._k.to_list(a.detach()._s))
-    tiny = torch.finfo(a.dtype).tiny
-    out = torch.Tensor(torch._k.from_flat(a.dtype.name, [max(v, tiny) for v in vals]), a.shape, a.dtype)
+    with torch.no_grad():
+        draws = _gamma_draws(a.detach().reshape(-1).to(torch.float64))
+        out = draws.to(a.dtype).clamp(min=torch.finfo(a.dtype).tiny).reshape(tuple(a.shape))
     if torch.is_grad_enabled() and a.requires_grad:
         sample = out.detach()
 
@@ -400,6 +446,110 @@ def _sample_binomial_py(counts, probs):
             k = sum(1 for u in _uniforms(n) if u < q)
         out.append(float(n - k if flip else k))
     return out
+
+
+def _poisson_inversion(lam, u):
+    """The smallest k with P(X <= k) >= u, X ~ Poisson(lam) (lam below 10)."""
+    k = 0
+    p = math.exp(-lam)
+    F = p
+    while u > F and p > 0:
+        k += 1
+        p *= lam / k
+        F += p
+    return float(k)
+
+
+def _poisson_ptrs(lam, buf):
+    """One draw by Hormann's transformed rejection with squeeze (lam >= 10)."""
+    slam = math.sqrt(lam)
+    loglam = math.log(lam)
+    b = 0.931 + 2.53 * slam
+    a = -0.059 + 0.02483 * b
+    log_invalpha = math.log(1.1239 + 1.1328 / (b - 3.4))
+    vr = 0.9277 - 3.6224 / (b - 2)
+    while True:
+        if len(buf) < 2:
+            buf.extend(_uniforms(64))
+        U = buf.pop() - 0.5
+        V = buf.pop()
+        us = 0.5 - abs(U)
+        if us <= 0:
+            continue
+        k = math.floor((2 * a / us + b) * U + lam + 0.43)
+        if us >= 0.07 and V <= vr:
+            return float(k)
+        if k < 0 or (us < 0.013 and V > us):
+            continue
+        if V <= 0 or math.log(V) + log_invalpha - math.log(a / (us * us) + b) <= -lam + k * loglam - math.lgamma(k + 1):
+            return float(k)
+
+
+def _poisson_draws(lam):
+    """Poisson draws for a float64 vector of rates on torch's generator:
+    inversion below rate 10, and from 10 up Hormann's transformed rejection
+    with squeeze (PTRS, as NumPy's random_poisson_ptrs), whose cost does not
+    grow with the rate (a product of uniforms underflows exp(-rate) near
+    rate 745). Both run on all their lanes at once; lanes PTRS rejects retry
+    one at a time."""
+    n = lam.numel()
+    out = torch.zeros(n, dtype=torch.float64)
+    if n == 0:
+        return out
+    small = (lam > 0) & (lam < 10)
+    if bool(small.any()):
+        r = torch.where(small, lam, torch.zeros_like(lam))
+        u = torch.rand(n, dtype=torch.float64)
+        k = torch.zeros(n, dtype=torch.float64)
+        p = torch.exp(-r)
+        F = p
+        active = small & (u > F)
+        while bool(active.any()):
+            k = k + active.to(torch.float64)
+            p = torch.where(active, p * r / k.clamp(min=1), p)
+            F = torch.where(active, F + p, F)
+            active = active & (u > F) & (p > 0)
+        out = torch.where(small, k, out)
+    big = (lam >= 10) & (lam < inf)
+    if bool(big.any()):
+        L = torch.where(big, lam, torch.full_like(lam, 10.0))
+        loglam = torch.log(L)
+        b = 0.931 + 2.53 * torch.sqrt(L)
+        a = -0.059 + 0.02483 * b
+        log_invalpha = torch.log(1.1239 + 1.1328 / (b - 3.4))
+        vr = 0.9277 - 3.6224 / (b - 2)
+        U = torch.rand(n, dtype=torch.float64) - 0.5
+        V = torch.rand(n, dtype=torch.float64)
+        us = 0.5 - U.abs()
+        inside = us > 0
+        safe_us = torch.where(inside, us, torch.ones_like(us))
+        k = torch.floor((2 * a / safe_us + b) * U + L + 0.43)
+        fast = (us >= 0.07) & (V <= vr)
+        reject = (k < 0) | ((us < 0.013) & (V > us))
+        kk = k.clamp(min=0)
+        squeeze = torch.log(V) + log_invalpha - torch.log(a / (safe_us * safe_us) + b) <= -L + kk * loglam - torch.lgamma(kk + 1)
+        accept = inside & (fast | (~reject & squeeze))
+
+        def redraw(idx):
+            rates = torch._k.to_list(L._s)
+            buf = []
+            return [_poisson_ptrs(rates[i], buf) for i in idx]
+        out = torch.where(big, _patch(k, big & ~accept, redraw), out)
+    out = torch.where(lam == inf, torch.full_like(out, inf), out)
+    return torch.where(lam != lam, torch.full_like(out, nan), out)
+
+
+def _sample_poisson_py(rates):
+    """Poisson draws for a list of rates (a list of floats)."""
+    if not rates:
+        return []
+    return torch._k.to_list(_poisson_draws(torch.tensor([float(x) for x in rates], dtype=torch.float64))._s)
+
+
+def _poisson_sample(rate):
+    """torch.poisson(rate) with _sample_poisson_py's draws (any rate)."""
+    with torch.no_grad():
+        return _poisson_draws(rate.detach().reshape(-1).to(torch.float64)).to(rate.dtype).reshape(tuple(rate.shape))
 
 
 # ---- utils ----------------------------------------------------------------------------------
@@ -920,6 +1070,8 @@ _one_hot = _OneHot()
 _nonnegative_integer = _IntegerGreaterThan(0)
 _lower_cholesky = _LowerCholesky()
 _positive_definite = _PositiveDefinite()
+_positive_semidefinite = _PositiveSemidefinite()
+_corr_cholesky = _CorrCholesky()
 _dependent = _Dependent()
 for _name, _value in (
         ("Constraint", Constraint), ("MixtureSameFamilyConstraint", MixtureSameFamilyConstraint),
@@ -931,8 +1083,8 @@ for _name, _value in (
         ("greater_than_eq", _GreaterThanEq), ("less_than", _LessThan), ("multinomial", _Multinomial),
         ("unit_interval", _unit_interval), ("interval", _Interval), ("half_open_interval", _HalfOpenInterval),
         ("simplex", _simplex), ("lower_triangular", _LowerTriangular()), ("lower_cholesky", _lower_cholesky),
-        ("corr_cholesky", _CorrCholesky()), ("square", _Square()), ("symmetric", _Symmetric()),
-        ("positive_semidefinite", _PositiveSemidefinite()), ("positive_definite", _positive_definite),
+        ("corr_cholesky", _corr_cholesky), ("square", _Square()), ("symmetric", _Symmetric()),
+        ("positive_semidefinite", _positive_semidefinite), ("positive_definite", _positive_definite),
         ("cat", _Cat), ("stack", _Stack)):
     setattr(constraints, _name, _value)
 
@@ -1962,7 +2114,7 @@ class Poisson(ExponentialFamily):
     def sample(self, sample_shape=()):
         shape = self._extended_shape(sample_shape)
         with torch.no_grad():
-            return torch.poisson(self.rate.expand(shape).contiguous() * 1)
+            return _poisson_sample(self.rate.expand(shape))
 
     def log_prob(self, value):
         if self._validate_args:
@@ -3419,10 +3571,286 @@ class StickBreakingTransform(Transform):
         return _size(shape[:-1], (shape[-1] - 1,))
 
 
+def _pad_left_one(x):
+    """F.pad(x, [1, 0], value=1): a column of ones before the last dim."""
+    return torch.cat([torch.ones_like(x[..., :1]), x], -1)
+
+
+class CorrCholeskyTransform(Transform):
+    __module__ = "torch.distributions.transforms"
+    """Maps a vector of D(D-1)/2 reals to the Cholesky factor of a D x D
+    correlation matrix: tanh to (-1, 1), then stick-breaking on the rows."""
+    domain = _real_vector
+    codomain = _corr_cholesky
+    bijective = True
+
+    def _call(self, x):
+        x = torch.tanh(x)
+        eps = torch.finfo(x.dtype).eps
+        x = x.clamp(min=-1 + eps, max=1 - eps)
+        r = vec_to_tril_matrix(x, diag=-1)
+        z = r ** 2
+        z1m_cumprod_sqrt = (1 - z).sqrt().cumprod(-1)
+        r = r + torch.eye(r.shape[-1], dtype=r.dtype)
+        return r * _pad_left_one(z1m_cumprod_sqrt[..., :-1])
+
+    def _inverse(self, y):
+        y_cumsum = 1 - torch.cumsum(y * y, dim=-1)
+        y_cumsum_shifted = _pad_left_one(y_cumsum[..., :-1])
+        y_vec = tril_matrix_to_vec(y, diag=-1)
+        y_cumsum_vec = tril_matrix_to_vec(y_cumsum_shifted, diag=-1)
+        t = y_vec / y_cumsum_vec.sqrt()
+        return (t.log1p() - t.neg().log1p()) / 2
+
+    def log_abs_det_jacobian(self, x, y, intermediates=None):
+        # Of x and the flattened strict lower triangle of y.
+        y1m_cumsum = 1 - (y * y).cumsum(dim=-1)
+        y1m_cumsum_tril = tril_matrix_to_vec(y1m_cumsum, diag=-2)
+        stick_breaking_logdet = 0.5 * y1m_cumsum_tril.log().sum(-1)
+        tanh_logdet = -2 * (x + _softplus(-2 * x) - math.log(2.0)).sum(dim=-1)
+        return stick_breaking_logdet + tanh_logdet
+
+    def forward_shape(self, shape):
+        if len(shape) < 1:
+            raise ValueError("Too few dimensions on input")
+        N = shape[-1]
+        D = round((0.25 + 2 * N) ** 0.5 + 0.5)
+        if D * (D - 1) // 2 != N:
+            raise ValueError("Input is not a flattened lower-diagonal number")
+        return _size(shape[:-1], (D, D))
+
+    def inverse_shape(self, shape):
+        if len(shape) < 2:
+            raise ValueError("Too few dimensions on input")
+        if shape[-2] != shape[-1]:
+            raise ValueError("Input is not square")
+        D = shape[-1]
+        return _size(shape[:-2], (D * (D - 1) // 2,))
+
+
+class LowerCholeskyTransform(Transform):
+    __module__ = "torch.distributions.transforms"
+    """Unconstrained square matrices to lower-triangular ones with a positive
+    diagonal (the strict lower triangle kept, the diagonal exponentiated)."""
+    domain = _IndependentConstraint(_real, 2)
+    codomain = _lower_cholesky
+
+    def __eq__(self, other):
+        return isinstance(other, LowerCholeskyTransform)
+
+    def __hash__(self):
+        return id(self)
+
+    def _call(self, x):
+        return x.tril(-1) + x.diagonal(dim1=-2, dim2=-1).exp().diag_embed()
+
+    def _inverse(self, y):
+        return y.tril(-1) + y.diagonal(dim1=-2, dim2=-1).log().diag_embed()
+
+
+class PositiveDefiniteTransform(Transform):
+    __module__ = "torch.distributions.transforms"
+    """Unconstrained square matrices to positive-definite ones (L L^T of
+    LowerCholeskyTransform's L)."""
+    domain = _IndependentConstraint(_real, 2)
+    codomain = _positive_definite
+
+    def __eq__(self, other):
+        return isinstance(other, PositiveDefiniteTransform)
+
+    def __hash__(self):
+        return id(self)
+
+    def _call(self, x):
+        x = LowerCholeskyTransform()(x)
+        return x @ x.mT
+
+    def _inverse(self, y):
+        return LowerCholeskyTransform().inv(_cholesky(y))
+
+
+class CatTransform(Transform):
+    __module__ = "torch.distributions.transforms"
+    """Applies each transform of `tseq` to its slice (of `lengths[i]`) along
+    `dim`, like torch.cat."""
+
+    def __init__(self, tseq, dim=0, lengths=None, cache_size=0):
+        if not all(isinstance(t, Transform) for t in tseq):
+            raise AssertionError("All elements of tseq must be Transform instances")
+        if cache_size:
+            tseq = [t.with_cache(cache_size) for t in tseq]
+        Transform.__init__(self, cache_size=cache_size)
+        self.transforms = list(tseq)
+        if lengths is None:
+            lengths = [1] * len(self.transforms)
+        self.lengths = list(lengths)
+        if len(self.lengths) != len(self.transforms):
+            raise AssertionError("lengths (%d) must match transforms (%d)" % (len(self.lengths), len(self.transforms)))
+        self.dim = dim
+
+    @property
+    def event_dim(self):
+        return max(t.event_dim for t in self.transforms)
+
+    @property
+    def length(self):
+        return sum(self.lengths)
+
+    def with_cache(self, cache_size=1):
+        if self._cache_size == cache_size:
+            return self
+        return CatTransform(self.transforms, self.dim, self.lengths, cache_size)
+
+    def _check(self, x, kind, name):
+        if not (-x.dim() <= self.dim < x.dim()):
+            raise AssertionError("dim %d out of range for %s with %d dimensions" % (self.dim, kind, x.dim()))
+        if x.size(self.dim) != self.length:
+            raise AssertionError("%s.size(%d) = %d must equal length %d" % (name, self.dim, x.size(self.dim), self.length))
+
+    def _call(self, x):
+        self._check(x, "tensor", "x")
+        yslices = []
+        start = 0
+        for trans, length in zip(self.transforms, self.lengths):
+            yslices.append(trans(x.narrow(self.dim, start, length)))
+            start = start + length
+        return torch.cat(yslices, dim=self.dim)
+
+    def _inverse(self, y):
+        self._check(y, "tensor", "y")
+        xslices = []
+        start = 0
+        for trans, length in zip(self.transforms, self.lengths):
+            xslices.append(trans.inv(y.narrow(self.dim, start, length)))
+            start = start + length
+        return torch.cat(xslices, dim=self.dim)
+
+    def log_abs_det_jacobian(self, x, y):
+        self._check(x, "x", "x")
+        self._check(y, "y", "y")
+        logdetjacs = []
+        start = 0
+        for trans, length in zip(self.transforms, self.lengths):
+            logdetjac = trans.log_abs_det_jacobian(x.narrow(self.dim, start, length), y.narrow(self.dim, start, length))
+            if trans.event_dim < self.event_dim:
+                logdetjac = _sum_rightmost(logdetjac, self.event_dim - trans.event_dim)
+            logdetjacs.append(logdetjac)
+            start = start + length
+        dim = self.dim
+        if dim >= 0:
+            dim = dim - x.dim()
+        dim = dim + self.event_dim
+        if dim < 0:
+            return torch.cat(logdetjacs, dim=dim)
+        total = logdetjacs[0]
+        for j in logdetjacs[1:]:
+            total = total + j
+        return total
+
+    @property
+    def bijective(self):
+        return all(t.bijective for t in self.transforms)
+
+    @_dependent_property
+    def domain(self):
+        return _Cat([t.domain for t in self.transforms], self.dim, self.lengths)
+
+    @_dependent_property
+    def codomain(self):
+        return _Cat([t.codomain for t in self.transforms], self.dim, self.lengths)
+
+
+class StackTransform(Transform):
+    __module__ = "torch.distributions.transforms"
+    """Applies each transform of `tseq` to its slice along `dim`, like
+    torch.stack."""
+
+    def __init__(self, tseq, dim=0, cache_size=0):
+        if not all(isinstance(t, Transform) for t in tseq):
+            raise AssertionError("All elements of tseq must be Transform instances")
+        if cache_size:
+            tseq = [t.with_cache(cache_size) for t in tseq]
+        Transform.__init__(self, cache_size=cache_size)
+        self.transforms = list(tseq)
+        self.dim = dim
+
+    def with_cache(self, cache_size=1):
+        if self._cache_size == cache_size:
+            return self
+        return StackTransform(self.transforms, self.dim, cache_size)
+
+    def _slice(self, z):
+        return [z.select(self.dim, i) for i in range(z.size(self.dim))]
+
+    def _check(self, x, kind, name):
+        if not (-x.dim() <= self.dim < x.dim()):
+            raise AssertionError("dim %d out of range for %s with %d dimensions" % (self.dim, kind, x.dim()))
+        if x.size(self.dim) != len(self.transforms):
+            raise AssertionError("%s.size(%d) = %d must equal len(transforms) %d" % (name, self.dim, x.size(self.dim), len(self.transforms)))
+
+    def _call(self, x):
+        self._check(x, "tensor", "x")
+        return torch.stack([trans(xs) for xs, trans in zip(self._slice(x), self.transforms)], dim=self.dim)
+
+    def _inverse(self, y):
+        self._check(y, "tensor", "y")
+        return torch.stack([trans.inv(ys) for ys, trans in zip(self._slice(y), self.transforms)], dim=self.dim)
+
+    def log_abs_det_jacobian(self, x, y):
+        self._check(x, "x", "x")
+        self._check(y, "y", "y")
+        return torch.stack([trans.log_abs_det_jacobian(xs, ys) for xs, ys, trans in zip(self._slice(x), self._slice(y), self.transforms)], dim=self.dim)
+
+    @property
+    def bijective(self):
+        return all(t.bijective for t in self.transforms)
+
+    @_dependent_property
+    def domain(self):
+        return _Stack([t.domain for t in self.transforms], self.dim)
+
+    @_dependent_property
+    def codomain(self):
+        return _Stack([t.codomain for t in self.transforms], self.dim)
+
+
+class CumulativeDistributionTransform(Transform):
+    __module__ = "torch.distributions.transforms"
+    """A univariate distribution's CDF: its support to the unit interval,
+    with log|dy/dx| = log_prob(x)."""
+    bijective = True
+    codomain = _unit_interval
+    sign = +1
+
+    def __init__(self, distribution, cache_size=0):
+        Transform.__init__(self, cache_size=cache_size)
+        self.distribution = distribution
+
+    @property
+    def domain(self):
+        return self.distribution.support
+
+    def _call(self, x):
+        return self.distribution.cdf(x)
+
+    def _inverse(self, y):
+        return self.distribution.icdf(y)
+
+    def log_abs_det_jacobian(self, x, y):
+        return self.distribution.log_prob(x)
+
+    def with_cache(self, cache_size=1):
+        if self._cache_size == cache_size:
+            return self
+        return CumulativeDistributionTransform(self.distribution, cache_size=cache_size)
+
+
 transforms = _Namespace("torch.distributions.transforms")
 for _cls in (Transform, ComposeTransform, IndependentTransform, ReshapeTransform, ExpTransform,
              PowerTransform, SigmoidTransform, SoftplusTransform, TanhTransform, AbsTransform,
-             AffineTransform, SoftmaxTransform, StickBreakingTransform):
+             AffineTransform, SoftmaxTransform, StickBreakingTransform, CorrCholeskyTransform,
+             LowerCholeskyTransform, PositiveDefiniteTransform, CatTransform, StackTransform,
+             CumulativeDistributionTransform):
     setattr(transforms, _cls.__name__, _cls)
 transforms.identity_transform = identity_transform
 transforms._InverseTransform = _InverseTransform
@@ -3839,6 +4267,1022 @@ class RelaxedOneHotCategorical(TransformedDistribution):
         return self.base_dist.probs
 
 
+# ---- more transformed distributions -----------------------------------------------------------
+class Gumbel(TransformedDistribution):
+    __module__ = "torch.distributions.gumbel"
+    """loc - scale * log(-log(U)), U ~ Uniform(tiny, 1 - eps)."""
+    arg_constraints = {"loc": _real, "scale": _positive}
+    support = _real
+
+    def __init__(self, loc, scale, validate_args=None):
+        self.loc, self.scale = broadcast_all(loc, scale)
+        finfo = torch.finfo(self.loc.dtype)
+        if isinstance(loc, _Number) and isinstance(scale, _Number):
+            base_dist = Uniform(finfo.tiny, 1 - finfo.eps, validate_args=validate_args)
+        else:
+            base_dist = Uniform(torch.full_like(self.loc, finfo.tiny), torch.full_like(self.loc, 1 - finfo.eps), validate_args=validate_args)
+        parts = [ExpTransform().inv, AffineTransform(loc=0, scale=-torch.ones_like(self.scale)),
+                 ExpTransform().inv, AffineTransform(loc=loc, scale=-self.scale)]
+        TransformedDistribution.__init__(self, base_dist, parts, validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(Gumbel, _instance)
+        batch_shape = torch.Size(tuple(batch_shape))
+        new.loc = self.loc.expand(batch_shape)
+        new.scale = self.scale.expand(batch_shape)
+        return TransformedDistribution.expand(self, batch_shape, _instance=new)
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        y = (self.loc - value) / self.scale
+        return (y - y.exp()) - self.scale.log()
+
+    @property
+    def mean(self):
+        return self.loc + self.scale * euler_constant
+
+    @property
+    def mode(self):
+        return self.loc
+
+    @property
+    def stddev(self):
+        return (math.pi / math.sqrt(6)) * self.scale
+
+    @property
+    def variance(self):
+        return self.stddev.pow(2)
+
+    def entropy(self):
+        return self.scale.log() + (1 + euler_constant)
+
+
+class Pareto(TransformedDistribution):
+    __module__ = "torch.distributions.pareto"
+    """Pareto type I: scale * exp(E), E ~ Exponential(alpha)."""
+    arg_constraints = {"alpha": _positive, "scale": _positive}
+
+    def __init__(self, scale, alpha, validate_args=None):
+        self.scale, self.alpha = broadcast_all(scale, alpha)
+        base_dist = Exponential(self.alpha, validate_args=validate_args)
+        TransformedDistribution.__init__(self, base_dist, [ExpTransform(), AffineTransform(loc=0, scale=self.scale)], validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(Pareto, _instance)
+        batch_shape = torch.Size(tuple(batch_shape))
+        new.scale = self.scale.expand(batch_shape)
+        new.alpha = self.alpha.expand(batch_shape)
+        return TransformedDistribution.expand(self, batch_shape, _instance=new)
+
+    @property
+    def mean(self):
+        a = self.alpha.clamp(min=1)
+        return a * self.scale / (a - 1)
+
+    @property
+    def mode(self):
+        return self.scale
+
+    @property
+    def variance(self):
+        a = self.alpha.clamp(min=2)
+        return self.scale.pow(2) * a / ((a - 1).pow(2) * (a - 2))
+
+    @_dependent_property(is_discrete=False, event_dim=0)
+    def support(self):
+        return _GreaterThanEq(self.scale)
+
+    def entropy(self):
+        return (self.scale / self.alpha).log() + (1 + self.alpha.reciprocal())
+
+
+class Weibull(TransformedDistribution):
+    __module__ = "torch.distributions.weibull"
+    """scale * E^(1 / concentration), E ~ Exponential(1)."""
+    arg_constraints = {"scale": _positive, "concentration": _positive}
+    support = _positive
+
+    def __init__(self, scale, concentration, validate_args=None):
+        self.scale, self.concentration = broadcast_all(scale, concentration)
+        self.concentration_reciprocal = self.concentration.reciprocal()
+        base_dist = Exponential(torch.ones_like(self.scale), validate_args=validate_args)
+        parts = [PowerTransform(exponent=self.concentration_reciprocal), AffineTransform(loc=0, scale=self.scale)]
+        TransformedDistribution.__init__(self, base_dist, parts, validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(Weibull, _instance)
+        batch_shape = torch.Size(tuple(batch_shape))
+        new.scale = self.scale.expand(batch_shape)
+        new.concentration = self.concentration.expand(batch_shape)
+        new.concentration_reciprocal = new.concentration.reciprocal()
+        base_dist = self.base_dist.expand(batch_shape)
+        parts = [PowerTransform(exponent=new.concentration_reciprocal), AffineTransform(loc=0, scale=new.scale)]
+        TransformedDistribution.__init__(new, base_dist, parts, validate_args=False)
+        new._validate_args = self._validate_args
+        return new
+
+    @property
+    def mean(self):
+        return self.scale * torch.exp(_lgamma(1 + self.concentration_reciprocal))
+
+    @property
+    def mode(self):
+        return self.scale * ((self.concentration - 1) / self.concentration) ** self.concentration.reciprocal()
+
+    @property
+    def variance(self):
+        return self.scale.pow(2) * (torch.exp(_lgamma(1 + 2 * self.concentration_reciprocal))
+                                    - torch.exp(2 * _lgamma(1 + self.concentration_reciprocal)))
+
+    def entropy(self):
+        return euler_constant * (1 - self.concentration_reciprocal) + torch.log(self.scale * self.concentration_reciprocal) + 1
+
+
+def _kumaraswamy_moments(a, b, n):
+    arg1 = 1 + n / a
+    log_value = _lgamma(arg1) + _lgamma(b) - _lgamma(arg1 + b)
+    return b * torch.exp(log_value)
+
+
+class Kumaraswamy(TransformedDistribution):
+    __module__ = "torch.distributions.kumaraswamy"
+    """(1 - (1 - U)^(1 / concentration0))^(1 / concentration1), U ~ Uniform(0, 1)."""
+    arg_constraints = {"concentration1": _positive, "concentration0": _positive}
+    support = _unit_interval
+    has_rsample = True
+
+    def __init__(self, concentration1, concentration0, validate_args=None):
+        self.concentration1, self.concentration0 = broadcast_all(concentration1, concentration0)
+        base_dist = Uniform(torch.full_like(self.concentration0, 0), torch.full_like(self.concentration0, 1), validate_args=validate_args)
+        parts = [PowerTransform(exponent=self.concentration0.reciprocal()), AffineTransform(loc=1.0, scale=-1.0),
+                 PowerTransform(exponent=self.concentration1.reciprocal())]
+        TransformedDistribution.__init__(self, base_dist, parts, validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(Kumaraswamy, _instance)
+        batch_shape = torch.Size(tuple(batch_shape))
+        new.concentration1 = self.concentration1.expand(batch_shape)
+        new.concentration0 = self.concentration0.expand(batch_shape)
+        return TransformedDistribution.expand(self, batch_shape, _instance=new)
+
+    @property
+    def mean(self):
+        return _kumaraswamy_moments(self.concentration1, self.concentration0, 1)
+
+    @property
+    def mode(self):
+        # PyTorch's log-space expression, nan where either concentration is below 1.
+        log_mode = self.concentration0.reciprocal() * (-self.concentration0).log1p() - (-self.concentration0 * self.concentration1).log1p()
+        bad = (self.concentration0 < 1) | (self.concentration1 < 1)
+        return torch.where(bad, torch.full_like(log_mode, nan), log_mode).exp()
+
+    @property
+    def variance(self):
+        return _kumaraswamy_moments(self.concentration1, self.concentration0, 2) - torch.pow(self.mean, 2)
+
+    def entropy(self):
+        t1 = 1 - self.concentration1.reciprocal()
+        t0 = 1 - self.concentration0.reciprocal()
+        H0 = _digamma(self.concentration0 + 1) + euler_constant
+        return t0 + t1 * H0 - torch.log(self.concentration1) - torch.log(self.concentration0)
+
+
+class InverseGamma(TransformedDistribution):
+    __module__ = "torch.distributions.inverse_gamma"
+    """1 / X for X ~ Gamma(concentration, rate)."""
+    arg_constraints = {"concentration": _positive, "rate": _positive}
+    support = _positive
+    has_rsample = True
+
+    def __init__(self, concentration, rate, validate_args=None):
+        base_dist = Gamma(concentration, rate, validate_args=validate_args)
+        neg_one = -torch.ones((), dtype=base_dist.rate.dtype)
+        TransformedDistribution.__init__(self, base_dist, PowerTransform(neg_one), validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(InverseGamma, _instance)
+        return TransformedDistribution.expand(self, batch_shape, _instance=new)
+
+    @property
+    def concentration(self):
+        return self.base_dist.concentration
+
+    @property
+    def rate(self):
+        return self.base_dist.rate
+
+    @property
+    def mean(self):
+        result = self.rate / (self.concentration - 1)
+        return torch.where(self.concentration > 1, result, torch.full_like(result, inf))
+
+    @property
+    def mode(self):
+        return self.rate / (self.concentration + 1)
+
+    @property
+    def variance(self):
+        result = self.rate.square() / ((self.concentration - 1).square() * (self.concentration - 2))
+        return torch.where(self.concentration > 2, result, torch.full_like(result, inf))
+
+    def entropy(self):
+        return self.concentration + self.rate.log() + _lgamma(self.concentration) - (1 + self.concentration) * _digamma(self.concentration)
+
+
+class LogisticNormal(TransformedDistribution):
+    __module__ = "torch.distributions.logistic_normal"
+    """StickBreakingTransform of Normal(loc, scale): a distribution on the
+    simplex one longer than loc."""
+    arg_constraints = {"loc": _real, "scale": _positive}
+    support = _simplex
+    has_rsample = True
+
+    def __init__(self, loc, scale, validate_args=None):
+        base_dist = Normal(loc, scale, validate_args=validate_args)
+        if not base_dist.batch_shape:
+            base_dist = base_dist.expand([1])
+        TransformedDistribution.__init__(self, base_dist, StickBreakingTransform(), validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(LogisticNormal, _instance)
+        return TransformedDistribution.expand(self, batch_shape, _instance=new)
+
+    @property
+    def loc(self):
+        return self.base_dist.base_dist.loc
+
+    @property
+    def scale(self):
+        return self.base_dist.base_dist.scale
+
+
+# ---- more distributions -----------------------------------------------------------------------
+class ContinuousBernoulli(ExponentialFamily):
+    __module__ = "torch.distributions.continuous_bernoulli"
+    """The continuous Bernoulli on [0, 1] (Loaiza-Ganem and Cunningham, 2019):
+    density proportional to probs^x (1 - probs)^(1 - x). Probabilities in
+    `lims` use Taylor expansions around 1/2."""
+    arg_constraints = {"probs": _unit_interval, "logits": _real}
+    support = _unit_interval
+    _mean_carrier_measure = 0
+    has_rsample = True
+
+    def __init__(self, probs=None, logits=None, lims=(0.499, 0.501), validate_args=None):
+        if (probs is None) == (logits is None):
+            raise ValueError("Either `probs` or `logits` must be specified, but not both.")
+        if probs is not None:
+            is_scalar = isinstance(probs, _Number)
+            (self.probs,) = broadcast_all(probs)
+            # Checked here when asked, as the clamped probs always pass.
+            if validate_args is not None:
+                if not _all_true(self.arg_constraints["probs"].check(self.probs)):
+                    raise ValueError("The parameter probs has invalid values")
+            self.probs = clamp_probs(self.probs)
+        else:
+            is_scalar = isinstance(logits, _Number)
+            (self.logits,) = broadcast_all(logits)
+        self._param = self.probs if probs is not None else self.logits
+        batch_shape = torch.Size() if is_scalar else self._param.size()
+        self._lims = lims
+        Distribution.__init__(self, batch_shape, validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(ContinuousBernoulli, _instance)
+        new._lims = self._lims
+        batch_shape = torch.Size(tuple(batch_shape))
+        if "probs" in self.__dict__:
+            new.probs = self.probs.expand(batch_shape)
+            new._param = new.probs
+        if "logits" in self.__dict__:
+            new.logits = self.logits.expand(batch_shape)
+            new._param = new.logits
+        Distribution.__init__(new, batch_shape, validate_args=False)
+        new._validate_args = self._validate_args
+        return new
+
+    def _outside_unstable_region(self):
+        return torch.le(self.probs, self._lims[0]) | torch.gt(self.probs, self._lims[1])
+
+    def _cut_probs(self):
+        return torch.where(self._outside_unstable_region(), self.probs, self._lims[0] * torch.ones_like(self.probs))
+
+    def _cont_bern_log_norm(self):
+        """The log normalizing constant as a function of probs."""
+        cut_probs = self._cut_probs()
+        cut_probs_below_half = torch.where(torch.le(cut_probs, 0.5), cut_probs, torch.zeros_like(cut_probs))
+        cut_probs_above_half = torch.where(torch.ge(cut_probs, 0.5), cut_probs, torch.ones_like(cut_probs))
+        log_norm = torch.log(torch.abs(torch.log1p(-cut_probs) - torch.log(cut_probs))) - torch.where(
+            torch.le(cut_probs, 0.5), torch.log1p(-2.0 * cut_probs_below_half), torch.log(2.0 * cut_probs_above_half - 1.0))
+        x = torch.pow(self.probs - 0.5, 2)
+        taylor = math.log(2.0) + (4.0 / 3.0 + 104.0 / 45.0 * x) * x
+        return torch.where(self._outside_unstable_region(), log_norm, taylor)
+
+    @property
+    def mean(self):
+        cut_probs = self._cut_probs()
+        mus = cut_probs / (2.0 * cut_probs - 1.0) + 1.0 / (torch.log1p(-cut_probs) - torch.log(cut_probs))
+        x = self.probs - 0.5
+        taylor = 0.5 + (1.0 / 3.0 + 16.0 / 45.0 * torch.pow(x, 2)) * x
+        return torch.where(self._outside_unstable_region(), mus, taylor)
+
+    @property
+    def stddev(self):
+        return torch.sqrt(self.variance)
+
+    @property
+    def variance(self):
+        cut_probs = self._cut_probs()
+        vars_ = cut_probs * (cut_probs - 1.0) / torch.pow(1.0 - 2.0 * cut_probs, 2) + 1.0 / torch.pow(torch.log1p(-cut_probs) - torch.log(cut_probs), 2)
+        x = torch.pow(self.probs - 0.5, 2)
+        taylor = 1.0 / 12.0 - (1.0 / 15.0 - 128.0 / 945.0 * x) * x
+        return torch.where(self._outside_unstable_region(), vars_, taylor)
+
+    @lazy_property
+    def logits(self):
+        return probs_to_logits(self.probs, is_binary=True)
+
+    @lazy_property
+    def probs(self):
+        return clamp_probs(logits_to_probs(self.logits, is_binary=True))
+
+    @property
+    def param_shape(self):
+        return self._param.size()
+
+    def sample(self, sample_shape=()):
+        shape = self._extended_shape(sample_shape)
+        u = torch.rand(tuple(shape), dtype=self.probs.dtype)
+        with torch.no_grad():
+            return self.icdf(u)
+
+    def rsample(self, sample_shape=()):
+        shape = self._extended_shape(sample_shape)
+        u = torch.rand(tuple(shape), dtype=self.probs.dtype)
+        return self.icdf(u)
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        logits, value = broadcast_all(self.logits, value)
+        return -torch.nn.functional.binary_cross_entropy_with_logits(logits, value, reduction="none") + self._cont_bern_log_norm()
+
+    def cdf(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        cut_probs = self._cut_probs()
+        cdfs = (torch.pow(cut_probs, value) * torch.pow(1.0 - cut_probs, 1.0 - value) + cut_probs - 1.0) / (2.0 * cut_probs - 1.0)
+        unbounded_cdfs = torch.where(self._outside_unstable_region(), cdfs, value)
+        return torch.where(torch.le(value, 0.0), torch.zeros_like(value),
+                           torch.where(torch.ge(value, 1.0), torch.ones_like(value), unbounded_cdfs))
+
+    def icdf(self, value):
+        cut_probs = self._cut_probs()
+        return torch.where(
+            self._outside_unstable_region(),
+            (torch.log1p(-cut_probs + value * (2.0 * cut_probs - 1.0)) - torch.log1p(-cut_probs)) / (torch.log(cut_probs) - torch.log1p(-cut_probs)),
+            value)
+
+    def entropy(self):
+        log_probs0 = torch.log1p(-self.probs)
+        log_probs1 = torch.log(self.probs)
+        return self.mean * (log_probs0 - log_probs1) - self._cont_bern_log_norm() - log_probs0
+
+    @property
+    def _natural_params(self):
+        return (self.logits,)
+
+    def _log_normalizer(self, x):
+        out_unst_reg = torch.le(x, self._lims[0] - 0.5) | torch.gt(x, self._lims[1] - 0.5)
+        cut_nat_params = torch.where(out_unst_reg, x, (self._lims[0] - 0.5) * torch.ones_like(x))
+        log_norm = torch.log(torch.abs(torch.expm1(cut_nat_params))) - torch.log(torch.abs(cut_nat_params))
+        taylor = 0.5 * x + torch.pow(x, 2) / 24.0 - torch.pow(x, 4) / 2880.0
+        return torch.where(out_unst_reg, log_norm, taylor)
+
+
+class FisherSnedecor(Distribution):
+    __module__ = "torch.distributions.fishersnedecor"
+    """F(df1, df2): the ratio of Gamma(df1 / 2, df1) and Gamma(df2 / 2, df2)
+    draws (so rsample is reparameterised through the implicit Gamma gradient)."""
+    arg_constraints = {"df1": _positive, "df2": _positive}
+    support = _positive
+    has_rsample = True
+
+    def __init__(self, df1, df2, validate_args=None):
+        self.df1, self.df2 = broadcast_all(df1, df2)
+        self._gamma1 = Gamma(self.df1 * 0.5, self.df1)
+        self._gamma2 = Gamma(self.df2 * 0.5, self.df2)
+        batch_shape = torch.Size() if _scalar_batch(df1, df2) else self.df1.size()
+        Distribution.__init__(self, batch_shape, validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(FisherSnedecor, _instance)
+        batch_shape = torch.Size(tuple(batch_shape))
+        new.df1 = self.df1.expand(batch_shape)
+        new.df2 = self.df2.expand(batch_shape)
+        new._gamma1 = self._gamma1.expand(batch_shape)
+        new._gamma2 = self._gamma2.expand(batch_shape)
+        Distribution.__init__(new, batch_shape, validate_args=False)
+        new._validate_args = self._validate_args
+        return new
+
+    @property
+    def mean(self):
+        df2 = torch.where(self.df2 <= 2, torch.full_like(self.df2, nan), self.df2)
+        return df2 / (df2 - 2)
+
+    @property
+    def mode(self):
+        mode = (self.df1 - 2) / self.df1 * self.df2 / (self.df2 + 2)
+        return torch.where(self.df1 <= 2, torch.full_like(mode, nan), mode)
+
+    @property
+    def variance(self):
+        df2 = torch.where(self.df2 <= 4, torch.full_like(self.df2, nan), self.df2)
+        return 2 * df2.pow(2) * (self.df1 + df2 - 2) / (self.df1 * (df2 - 2).pow(2) * (df2 - 4))
+
+    def rsample(self, sample_shape=()):
+        shape = tuple(self._extended_shape(sample_shape))
+        X1 = self._gamma1.rsample(sample_shape).view(shape)
+        X2 = self._gamma2.rsample(sample_shape).view(shape)
+        tiny = torch.finfo(X2.dtype).tiny
+        X2 = X2.clamp(min=tiny)
+        Y = X1 / X2
+        return Y.clamp(min=tiny)
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        ct1 = self.df1 * 0.5
+        ct2 = self.df2 * 0.5
+        ct3 = self.df1 / self.df2
+        t1 = _lgamma(ct1 + ct2) - _lgamma(ct1) - _lgamma(ct2)
+        t2 = ct1 * ct3.log() + (ct1 - 1) * torch.log(value)
+        t3 = (ct1 + ct2) * torch.log1p(ct3 * value)
+        return t1 + t2 - t3
+
+
+class GeneralizedPareto(Distribution):
+    __module__ = "torch.distributions.generalized_pareto"
+    """The generalized Pareto distribution (TensorFlow Probability's
+    parameterisation): Exponential at concentration 0, Pareto above, bounded
+    below."""
+    arg_constraints = {"loc": _real, "scale": _positive, "concentration": _real}
+    has_rsample = True
+
+    def __init__(self, loc, scale, concentration, validate_args=None):
+        self.loc, self.scale, self.concentration = broadcast_all(loc, scale, concentration)
+        batch_shape = torch.Size() if _scalar_batch(loc, scale, concentration) else self.loc.size()
+        Distribution.__init__(self, batch_shape, validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(GeneralizedPareto, _instance)
+        batch_shape = torch.Size(tuple(batch_shape))
+        new.loc = self.loc.expand(batch_shape)
+        new.scale = self.scale.expand(batch_shape)
+        new.concentration = self.concentration.expand(batch_shape)
+        Distribution.__init__(new, batch_shape, validate_args=False)
+        new._validate_args = self._validate_args
+        return new
+
+    def rsample(self, sample_shape=()):
+        shape = self._extended_shape(sample_shape)
+        u = torch.rand(tuple(shape), dtype=self.loc.dtype)
+        return self.icdf(u)
+
+    def _eq_zero(self):
+        # PyTorch compares with a default-dtype zero, which fails for float64
+        # parameters under a float32 default; the comparison itself is this.
+        return torch.isclose(self.concentration, torch.zeros_like(self.concentration))
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        z = self._z(value)
+        eq_zero = self._eq_zero()
+        safe_conc = torch.where(eq_zero, torch.ones_like(self.concentration), self.concentration)
+        y = 1 / safe_conc + torch.ones_like(z)
+        where_nonzero = torch.where(y == 0, y, y * torch.log1p(safe_conc * z))
+        return -self.scale.log() - torch.where(eq_zero, z, where_nonzero)
+
+    def log_survival_function(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        z = self._z(value)
+        eq_zero = self._eq_zero()
+        safe_conc = torch.where(eq_zero, torch.ones_like(self.concentration), self.concentration)
+        where_nonzero = -torch.log1p(safe_conc * z) / safe_conc
+        return torch.where(eq_zero, -z, where_nonzero)
+
+    def log_cdf(self, value):
+        return torch.log1p(-torch.exp(self.log_survival_function(value)))
+
+    def cdf(self, value):
+        return torch.exp(self.log_cdf(value))
+
+    def icdf(self, value):
+        loc = self.loc
+        scale = self.scale
+        concentration = self.concentration
+        eq_zero = torch.isclose(concentration, torch.zeros_like(concentration))
+        safe_conc = torch.where(eq_zero, torch.ones_like(concentration), concentration)
+        logu = torch.log1p(-value)
+        where_nonzero = loc + scale / safe_conc * torch.expm1(-safe_conc * logu)
+        where_zero = loc - scale * logu
+        return torch.where(eq_zero, where_zero, where_nonzero)
+
+    def _z(self, x):
+        return (x - self.loc) / self.scale
+
+    @property
+    def mean(self):
+        concentration = self.concentration
+        valid = concentration < 1
+        safe_conc = torch.where(valid, concentration, torch.full_like(concentration, 0.5))
+        result = self.loc + self.scale / (1 - safe_conc)
+        return torch.where(valid, result, torch.full_like(result, nan))
+
+    @property
+    def variance(self):
+        concentration = self.concentration
+        valid = concentration < 0.5
+        safe_conc = torch.where(valid, concentration, torch.full_like(concentration, 0.25))
+        result = self.scale ** 2 / ((1 - safe_conc) ** 2 * (1 - 2 * safe_conc))
+        return torch.where(valid, result, torch.full_like(result, nan))
+
+    def entropy(self):
+        ans = torch.log(self.scale) + self.concentration + 1
+        return ans.expand(tuple(self._batch_shape))
+
+    @property
+    def mode(self):
+        return self.loc
+
+    @_dependent_property(is_discrete=False, event_dim=0)
+    def support(self):
+        lower = self.loc
+        upper = torch.where(self.concentration < 0, lower - self.scale / self.concentration, torch.full_like(lower, inf))
+        return _Interval(lower, upper)
+
+
+def _eval_poly(y, coef):
+    coef = list(coef)
+    result = coef.pop()
+    while coef:
+        result = coef.pop() + y * result
+    return result
+
+
+_I0_COEF_SMALL = [1.0, 3.5156229, 3.0899424, 1.2067492, 0.2659732, 0.360768e-1, 0.45813e-2]
+_I0_COEF_LARGE = [0.39894228, 0.1328592e-1, 0.225319e-2, -0.157565e-2, 0.916281e-2, -0.2057706e-1, 0.2635537e-1, -0.1647633e-1, 0.392377e-2]
+_I1_COEF_SMALL = [0.5, 0.87890594, 0.51498869, 0.15084934, 0.2658733e-1, 0.301532e-2, 0.32411e-3]
+_I1_COEF_LARGE = [0.39894228, -0.3988024e-1, -0.362018e-2, 0.163801e-2, -0.1031555e-1, 0.2282967e-1, -0.2895312e-1, 0.1787654e-1, -0.420059e-2]
+_COEF_SMALL = [_I0_COEF_SMALL, _I1_COEF_SMALL]
+_COEF_LARGE = [_I0_COEF_LARGE, _I1_COEF_LARGE]
+
+
+def _log_modified_bessel_fn(x, order=0):
+    """log(I_order(x)) for x > 0 and order 0 or 1, with PyTorch's (Abramowitz
+    and Stegun's) polynomial approximations."""
+    if order != 0 and order != 1:
+        raise AssertionError("order must be 0 or 1, got %s" % (order,))
+    y = x / 3.75
+    y = y * y
+    small = _eval_poly(y, _COEF_SMALL[order])
+    if order == 1:
+        small = x.abs() * small
+    small = small.log()
+    y = 3.75 / x
+    large = x - 0.5 * x.log() + _eval_poly(y, _COEF_LARGE[order]).log()
+    return torch.where(x < 3.75, small, large)
+
+
+def _rejection_sample(loc, concentration, proposal_r, x):
+    """Best and Fisher's (1979) rejection sampler for the von Mises."""
+    done = torch.zeros(tuple(x.shape), dtype=torch.bool)
+    while not bool(done.all()):
+        u = torch.rand((3,) + tuple(x.shape), dtype=loc.dtype)
+        u1, u2, u3 = u.unbind()
+        z = torch.cos(math.pi * u1)
+        f = (1 + proposal_r * z) / (proposal_r + z)
+        c = concentration * (proposal_r - f)
+        accept = ((c * (2 - c) - u2) > 0) | ((c / u2).log() + 1 - c >= 0)
+        if bool(accept.any()):
+            x = torch.where(accept, (u3 - 0.5).sign() * f.acos(), x)
+            done = done | accept
+    return (x + math.pi + loc) % (2 * math.pi) - math.pi
+
+
+class VonMises(Distribution):
+    __module__ = "torch.distributions.von_mises"
+    """The circular von Mises distribution; `loc` and values are angles
+    (any real, read modulo 2 pi). Sampling is Best-Fisher rejection in
+    double precision."""
+    arg_constraints = {"loc": _real, "concentration": _positive}
+    support = _real
+    has_rsample = False
+
+    def __init__(self, loc, concentration, validate_args=None):
+        self.loc, self.concentration = broadcast_all(loc, concentration)
+        batch_shape = self.loc.shape
+        Distribution.__init__(self, batch_shape, torch.Size(), validate_args)
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        log_prob = self.concentration * torch.cos(value - self.loc)
+        return log_prob - math.log(2 * math.pi) - _log_modified_bessel_fn(self.concentration, order=0)
+
+    @lazy_property
+    def _loc(self):
+        return self.loc.to(torch.float64)
+
+    @lazy_property
+    def _concentration(self):
+        return self.concentration.to(torch.float64)
+
+    @lazy_property
+    def _proposal_r(self):
+        kappa = self._concentration
+        tau = 1 + (1 + 4 * kappa ** 2).sqrt()
+        rho = (tau - (2 * tau).sqrt()) / (2 * kappa)
+        _proposal_r = (1 + rho ** 2) / (2 * rho)
+        _proposal_r_taylor = 1 / kappa + kappa
+        return torch.where(kappa < 1e-5, _proposal_r_taylor, _proposal_r)
+
+    def sample(self, sample_shape=()):
+        with torch.no_grad():
+            shape = self._extended_shape(sample_shape)
+            x = torch.zeros(tuple(shape), dtype=torch.float64)
+            return _rejection_sample(self._loc, self._concentration, self._proposal_r, x).to(self.loc.dtype)
+
+    def expand(self, batch_shape, _instance=None):
+        try:
+            return Distribution.expand(self, batch_shape)
+        except NotImplementedError:
+            validate_args = self.__dict__.get("_validate_args")
+            batch_shape = torch.Size(tuple(batch_shape))
+            loc = self.loc.expand(batch_shape)
+            concentration = self.concentration.expand(batch_shape)
+            return type(self)(loc, concentration, validate_args=validate_args)
+
+    @property
+    def mean(self):
+        return self.loc
+
+    @property
+    def mode(self):
+        return self.loc
+
+    @lazy_property
+    def variance(self):
+        return 1 - (_log_modified_bessel_fn(self.concentration, order=1) - _log_modified_bessel_fn(self.concentration, order=0)).exp()
+
+
+class NegativeBinomial(Distribution):
+    __module__ = "torch.distributions.negative_binomial"
+    """The number of successes before `total_count` failures, each trial a
+    success with probability `probs`; sampled as a Gamma-Poisson mixture."""
+    arg_constraints = {"total_count": _GreaterThanEq(0), "probs": _HalfOpenInterval(0.0, 1.0), "logits": _real}
+    support = _nonnegative_integer
+
+    def __init__(self, total_count, probs=None, logits=None, validate_args=None):
+        if (probs is None) == (logits is None):
+            raise ValueError("Either `probs` or `logits` must be specified, but not both.")
+        if probs is not None:
+            self.total_count, self.probs = broadcast_all(total_count, probs)
+            self.total_count = self.total_count.type_as(self.probs)
+        else:
+            self.total_count, self.logits = broadcast_all(total_count, logits)
+            self.total_count = self.total_count.type_as(self.logits)
+        self._param = self.probs if probs is not None else self.logits
+        Distribution.__init__(self, self._param.size(), validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(NegativeBinomial, _instance)
+        batch_shape = torch.Size(tuple(batch_shape))
+        new.total_count = self.total_count.expand(batch_shape)
+        if "probs" in self.__dict__:
+            new.probs = self.probs.expand(batch_shape)
+            new._param = new.probs
+        if "logits" in self.__dict__:
+            new.logits = self.logits.expand(batch_shape)
+            new._param = new.logits
+        Distribution.__init__(new, batch_shape, validate_args=False)
+        new._validate_args = self._validate_args
+        return new
+
+    @property
+    def mean(self):
+        return self.total_count * torch.exp(self.logits)
+
+    @property
+    def mode(self):
+        return ((self.total_count - 1) * self.logits.exp()).floor().clamp(min=0.0)
+
+    @property
+    def variance(self):
+        return self.mean / torch.sigmoid(-self.logits)
+
+    @lazy_property
+    def logits(self):
+        return probs_to_logits(self.probs, is_binary=True)
+
+    @lazy_property
+    def probs(self):
+        return logits_to_probs(self.logits, is_binary=True)
+
+    @property
+    def param_shape(self):
+        return self._param.size()
+
+    @lazy_property
+    def _gamma(self):
+        # Not validated: total_count may be zero.
+        return Gamma(concentration=self.total_count, rate=torch.exp(-self.logits), validate_args=False)
+
+    def sample(self, sample_shape=()):
+        with torch.no_grad():
+            rate = self._gamma.sample(sample_shape=sample_shape)
+            return _poisson_sample(rate)
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        F = torch.nn.functional
+        log_unnormalized_prob = self.total_count * F.logsigmoid(-self.logits) + value * F.logsigmoid(self.logits)
+        log_normalization = -_lgamma(self.total_count + value) + _lgamma(1.0 + value) + _lgamma(self.total_count)
+        # total_count == 0 and value == 0 has probability 1 (lgamma(0) is infinite).
+        log_normalization = torch.where(self.total_count + value == 0.0, torch.zeros_like(log_normalization), log_normalization)
+        return log_unnormalized_prob - log_normalization
+
+
+_log_2 = math.log(2)
+
+
+def _mvdigamma(x, p):
+    if not bool(x.gt((p - 1) / 2).all()):
+        raise AssertionError("Wrong domain for multivariate digamma function.")
+    return _digamma(x.unsqueeze(-1) - torch.arange(p, dtype=x.dtype).div(2).expand(tuple(x.shape) + (-1,))).sum(-1)
+
+
+def _clamp_above_eps(x):
+    return x.clamp(min=torch.finfo(x.dtype).eps)
+
+
+def _torch_linalg():
+    import torch.linalg as LA
+    return LA
+
+
+class Wishart(ExponentialFamily):
+    __module__ = "torch.distributions.wishart"
+    """The Wishart distribution over positive-definite matrices, given df and
+    one of covariance_matrix, precision_matrix or scale_tril. rsample is the
+    Bartlett decomposition (chi-square diagonal, normal lower triangle),
+    reparameterised through the implicit Gamma gradient."""
+    support = _positive_definite
+    has_rsample = True
+    _mean_carrier_measure = 0
+
+    @property
+    def arg_constraints(self):
+        return {"covariance_matrix": _positive_definite, "precision_matrix": _positive_definite,
+                "scale_tril": _lower_cholesky, "df": _GreaterThan(self.event_shape[-1] - 1)}
+
+    def __init__(self, df, covariance_matrix=None, precision_matrix=None, scale_tril=None, validate_args=None):
+        if (covariance_matrix is not None) + (scale_tril is not None) + (precision_matrix is not None) != 1:
+            raise AssertionError("Exactly one of covariance_matrix or precision_matrix or scale_tril may be specified.")
+        param = next(p for p in (covariance_matrix, precision_matrix, scale_tril) if p is not None)
+        if param.dim() < 2:
+            raise ValueError("scale_tril must be at least two-dimensional, with optional leading batch dimensions")
+        if isinstance(df, _Number):
+            batch_shape = torch.Size(tuple(param.shape[:-2]))
+            self.df = torch.tensor(df, dtype=param.dtype)
+        else:
+            batch_shape = torch.Size(tuple(torch.broadcast_shapes(tuple(param.shape[:-2]), tuple(df.shape))))
+            self.df = df.expand(batch_shape)
+        event_shape = param.shape[-2:]
+        if bool(self.df.le(event_shape[-1] - 1).any()):
+            raise ValueError("Value of df=%s expected to be greater than ndim - 1 = %d." % (df, event_shape[-1] - 1))
+        if scale_tril is not None:
+            self.scale_tril = param.expand(tuple(batch_shape) + (-1, -1))
+        elif covariance_matrix is not None:
+            self.covariance_matrix = param.expand(tuple(batch_shape) + (-1, -1))
+        else:
+            self.precision_matrix = param.expand(tuple(batch_shape) + (-1, -1))
+        Distribution.__init__(self, batch_shape, event_shape, validate_args=validate_args)
+        self._batch_dims = [-(x + 1) for x in range(len(self._batch_shape))]
+        if scale_tril is not None:
+            self._unbroadcasted_scale_tril = scale_tril
+        elif covariance_matrix is not None:
+            self._unbroadcasted_scale_tril = _cholesky(covariance_matrix)
+        else:
+            self._unbroadcasted_scale_tril = _precision_to_scale_tril(precision_matrix)
+        self._dist_chi2 = self._make_chi2(batch_shape)
+
+    def _make_chi2(self, batch_shape):
+        # The Bartlett factor's squared diagonal: chi-square with df - i degrees.
+        p = self._event_shape[-1] if self._event_shape else self._unbroadcasted_scale_tril.shape[-1]
+        offsets = torch.arange(p, dtype=self._unbroadcasted_scale_tril.dtype).expand(tuple(batch_shape) + (-1,))
+        return Chi2(df=self.df.unsqueeze(-1) - offsets)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(Wishart, _instance)
+        batch_shape = torch.Size(tuple(batch_shape))
+        cov_shape = _size(batch_shape, self.event_shape)
+        new._unbroadcasted_scale_tril = self._unbroadcasted_scale_tril.expand(cov_shape)
+        new.df = self.df.expand(batch_shape)
+        new._batch_dims = [-(x + 1) for x in range(len(batch_shape))]
+        if "covariance_matrix" in self.__dict__:
+            new.covariance_matrix = self.covariance_matrix.expand(cov_shape)
+        if "scale_tril" in self.__dict__:
+            new.scale_tril = self.scale_tril.expand(cov_shape)
+        if "precision_matrix" in self.__dict__:
+            new.precision_matrix = self.precision_matrix.expand(cov_shape)
+        Distribution.__init__(new, batch_shape, self.event_shape, validate_args=False)
+        new._dist_chi2 = new._make_chi2(batch_shape)
+        new._validate_args = self._validate_args
+        return new
+
+    @lazy_property
+    def scale_tril(self):
+        return self._unbroadcasted_scale_tril.expand(_size(self._batch_shape, self._event_shape))
+
+    @lazy_property
+    def covariance_matrix(self):
+        L = self._unbroadcasted_scale_tril
+        return (L @ L.transpose(-2, -1)).expand(_size(self._batch_shape, self._event_shape))
+
+    @lazy_property
+    def precision_matrix(self):
+        _torch_linalg()
+        L = self._unbroadcasted_scale_tril
+        identity = torch.eye(self._event_shape[-1], dtype=L.dtype)
+        return torch.cholesky_solve(identity, L).expand(_size(self._batch_shape, self._event_shape))
+
+    def _batch_view(self, x):
+        return x.view(tuple(self._batch_shape) + (1, 1))
+
+    @property
+    def mean(self):
+        return self._batch_view(self.df) * self.covariance_matrix
+
+    @property
+    def mode(self):
+        factor = self.df - self.covariance_matrix.shape[-1] - 1
+        factor = torch.where(factor <= 0, torch.full_like(factor, nan), factor)
+        return self._batch_view(factor) * self.covariance_matrix
+
+    @property
+    def variance(self):
+        V = self.covariance_matrix
+        diag_V = V.diagonal(dim1=-2, dim2=-1)
+        return self._batch_view(self.df) * (V.pow(2) + diag_V.unsqueeze(-1) * diag_V.unsqueeze(-2))
+
+    def _bartlett_factor(self, sample_shape=()):
+        p = self._event_shape[-1]
+        noise = _clamp_above_eps(self._dist_chi2.rsample(sample_shape).sqrt()).diag_embed(dim1=-2, dim2=-1)
+        lower = torch.randn(tuple(sample_shape) + tuple(self._batch_shape) + (p, p), dtype=noise.dtype).tril(-1)
+        return self._unbroadcasted_scale_tril @ (noise + lower)
+
+    def _bartlett_sampling(self, sample_shape=()):
+        chol = self._bartlett_factor(sample_shape)
+        return chol @ chol.transpose(-2, -1)
+
+    def _maybe_singular(self, chol):
+        # chol is lower triangular with a nonzero diagonal, so chol chol^T is
+        # positive definite unless a pivot is lost to rounding; only then is
+        # the (costly) Cholesky check worth running.
+        c = chol.detach()
+        pivots = c.diagonal(dim1=-2, dim2=-1).pow(2).amin(-1)
+        size = (c * c).sum(-1).amax(-1)
+        return bool((pivots <= 1e3 * torch.finfo(c.dtype).eps * size).any())
+
+    def _singular(self, sample, sample_shape):
+        bad = ~self.support.check(sample)
+        if self._batch_shape:
+            bad = bad.reshape(tuple(sample_shape) + (-1,)).any(-1)
+        return bad
+
+    def rsample(self, sample_shape=(), max_try_correction=None):
+        """Bartlett draws; singular ones (possible for ndim - 1 < df < ndim)
+        are redrawn up to `max_try_correction` (10) times, as PyTorch
+        intends (its own check is inverted, so it redraws every sample)."""
+        if max_try_correction is None:
+            max_try_correction = 10
+        sample_shape = torch.Size(tuple(sample_shape))
+        chol = self._bartlett_factor(sample_shape)
+        sample = chol @ chol.transpose(-2, -1)
+        if not self._maybe_singular(chol):
+            return sample
+        is_singular = self._singular(sample.detach(), sample_shape)
+        for _ in range(max_try_correction):
+            if not bool(is_singular.any()):
+                break
+            sample_new = self._bartlett_sampling(sample_shape)
+            mask = is_singular.reshape(tuple(is_singular.shape) + (1,) * (len(self._batch_shape) + 2))
+            sample = torch.where(mask, sample_new, sample)
+            is_singular = self._singular(sample.detach(), sample_shape)
+        return sample
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        LA = _torch_linalg()
+        nu = self.df
+        p = self._event_shape[-1]
+        L = self._unbroadcasted_scale_tril
+        return (-nu * (p * _log_2 / 2 + L.diagonal(dim1=-2, dim2=-1).log().sum(-1))
+                - torch.mvlgamma(nu / 2, p=p)
+                + (nu - p - 1) / 2 * LA.slogdet(value).logabsdet
+                - torch.cholesky_solve(value, L).diagonal(dim1=-2, dim2=-1).sum(dim=-1) / 2)
+
+    def entropy(self):
+        nu = self.df
+        p = self._event_shape[-1]
+        L = self._unbroadcasted_scale_tril
+        return ((p + 1) * (p * _log_2 / 2 + L.diagonal(dim1=-2, dim2=-1).log().sum(-1))
+                + torch.mvlgamma(nu / 2, p=p)
+                - (nu - p - 1) / 2 * _mvdigamma(nu / 2, p=p)
+                + nu * p / 2)
+
+    @property
+    def _natural_params(self):
+        nu = self.df
+        p = self._event_shape[-1]
+        return -self.precision_matrix / 2, (nu - p - 1) / 2
+
+    def _log_normalizer(self, x, y):
+        LA = _torch_linalg()
+        p = self._event_shape[-1]
+        return (y + (p + 1) / 2) * (-LA.slogdet(-2 * x).logabsdet + _log_2 * p) + torch.mvlgamma(y + (p + 1) / 2, p=p)
+
+
+class LKJCholesky(Distribution):
+    __module__ = "torch.distributions.lkj_cholesky"
+    """The LKJ distribution over Cholesky factors of correlation matrices:
+    L L^T has density proportional to det^(concentration - 1). Sampling is
+    the onion method (Lewandowski, Kurowicka and Joe, 2009, section 3.2)."""
+    arg_constraints = {"concentration": _positive}
+    support = _corr_cholesky
+
+    def __init__(self, dim, concentration=1.0, validate_args=None):
+        if dim < 2:
+            raise ValueError("Expected dim to be an integer greater than or equal to 2. Found dim=%s." % (dim,))
+        self.dim = dim
+        (self.concentration,) = broadcast_all(concentration)
+        batch_shape = self.concentration.size()
+        event_shape = torch.Size((dim, dim))
+        # Row k's squared off-diagonal norm is Beta(k / 2, eta + (dim - 2) / 2 -
+        # (k - 1) / 2). (PyTorch 2.11 draws Beta(k - 1/2, ...), which is not the
+        # onion method: its rows below the second come out too spread.)
+        marginal_conc = self.concentration + 0.5 * (self.dim - 2)
+        offset = torch.arange(self.dim - 1, dtype=self.concentration.dtype)
+        offset = torch.cat([torch.zeros(1, dtype=offset.dtype), offset])
+        beta_conc1 = 0.5 * (offset + 1)
+        beta_conc0 = marginal_conc.unsqueeze(-1) - 0.5 * offset
+        self._beta = Beta(beta_conc1, beta_conc0)
+        Distribution.__init__(self, batch_shape, event_shape, validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(LKJCholesky, _instance)
+        batch_shape = torch.Size(tuple(batch_shape))
+        new.dim = self.dim
+        new.concentration = self.concentration.expand(batch_shape)
+        new._beta = self._beta.expand(_size(batch_shape, (self.dim,)))
+        Distribution.__init__(new, batch_shape, self.event_shape, validate_args=False)
+        new._validate_args = self._validate_args
+        return new
+
+    def sample(self, sample_shape=()):
+        with torch.no_grad():
+            y = self._beta.sample(sample_shape).unsqueeze(-1)
+            u_normal = torch.randn(tuple(self._extended_shape(sample_shape)), dtype=y.dtype).tril(-1)
+            # The first row is all zeros; clamping its norm leaves it zero.
+            norm = u_normal.norm(dim=-1, keepdim=True).clamp(min=torch.finfo(y.dtype).tiny)
+            w = torch.sqrt(y) * (u_normal / norm)
+            eps = torch.finfo(w.dtype).tiny
+            diag_elems = torch.clamp(1 - torch.sum(w ** 2, dim=-1), min=eps).sqrt()
+            return w + torch.diag_embed(diag_elems)
+
+    def log_prob(self, value):
+        # Stan's LKJ Cholesky density: prod L_ii^(2 (eta - 1) + dim - i).
+        if self._validate_args:
+            self._validate_sample(value)
+        diag_elems = value.diagonal(dim1=-1, dim2=-2)[..., 1:]
+        order = torch.arange(2, self.dim + 1, dtype=self.concentration.dtype)
+        order = 2 * (self.concentration - 1).unsqueeze(-1) + self.dim - order
+        unnormalized_log_pdf = torch.sum(order * diag_elems.log(), dim=-1)
+        dm1 = self.dim - 1
+        alpha = self.concentration + 0.5 * dm1
+        denominator = _lgamma(alpha) * dm1
+        numerator = torch.mvlgamma(alpha - 0.5, dm1)
+        pi_constant = 0.5 * dm1 * math.log(math.pi)
+        normalize_term = pi_constant + numerator - denominator
+        return unnormalized_log_pdf - normalize_term
+
+
 # ---- constraint registry (biject_to / transform_to) ------------------------------------------
 class ConstraintRegistry:
     __module__ = "torch.distributions.constraint_registry"
@@ -3910,6 +5354,15 @@ biject_to.register(_IndependentConstraint, _biject_to_independent)
 transform_to.register(_IndependentConstraint, _transform_to_independent)
 biject_to.register(_Simplex, lambda c: StickBreakingTransform())
 transform_to.register(_Simplex, lambda c: SoftmaxTransform())
+transform_to.register(_LowerCholesky, lambda c: LowerCholeskyTransform())
+transform_to.register(_PositiveDefinite, lambda c: PositiveDefiniteTransform())
+transform_to.register(_PositiveSemidefinite, lambda c: PositiveDefiniteTransform())
+biject_to.register(_CorrCholesky, lambda c: CorrCholeskyTransform())
+transform_to.register(_CorrCholesky, lambda c: CorrCholeskyTransform())
+biject_to.register(_Cat, lambda c: CatTransform([biject_to(part) for part in c.cseq], c.dim, c.lengths))
+transform_to.register(_Cat, lambda c: CatTransform([transform_to(part) for part in c.cseq], c.dim, c.lengths))
+biject_to.register(_Stack, lambda c: StackTransform([biject_to(part) for part in c.cseq], c.dim))
+transform_to.register(_Stack, lambda c: StackTransform([transform_to(part) for part in c.cseq], c.dim))
 
 
 # ---- KL divergence --------------------------------------------------------------------------
@@ -4167,13 +5620,412 @@ def _kl_independent_independent(p, q):
     return _sum_rightmost(result, p.reinterpreted_batch_ndims)
 
 
-kl = _Namespace("torch.distributions.kl")
-kl.kl_divergence = kl_divergence
-kl.register_kl = register_kl
-kl._KL_REGISTRY = _KL_REGISTRY
-kl._KL_MEMOIZE = _KL_MEMOIZE
+def _x_log_x(tensor):
+    fn = getattr(torch, "xlogy", None)
+    return fn(tensor, tensor) if fn is not None else _xlogy(tensor, tensor)
+
+
+def _set_inf(result, mask):
+    """PyTorch's `result[mask] = inf` (zero gradient where masked)."""
+    return torch.where(mask, torch.full_like(result, inf), result)
+
+
+@register_kl(ExponentialFamily, ExponentialFamily)
+def _kl_expfamily_expfamily(p, q):
+    # The Bregman divergence of the log normalizer (same family only).
+    if type(p) is not type(q):
+        raise NotImplementedError("The cross KL-divergence between different exponential families cannot                             be computed using Bregman divergences")
+    p_nparams = [np_.detach().requires_grad_() for np_ in p._natural_params]
+    q_nparams = q._natural_params
+    lg_normal = p._log_normalizer(*p_nparams)
+    gradients = torch._autograd_grad(lg_normal.sum(), p_nparams, create_graph=True)
+    result = q._log_normalizer(*q_nparams) - lg_normal
+    for pnp, qnp, g in zip(p_nparams, q_nparams, gradients):
+        term = (qnp - pnp) * g
+        result = result - _sum_rightmost(term, len(q.event_shape))
+    return result
+
+
+@register_kl(Gumbel, Gumbel)
+def _kl_gumbel_gumbel(p, q):
+    ct1 = p.scale / q.scale
+    ct2 = q.loc / q.scale
+    ct3 = p.loc / q.scale
+    t1 = -ct1.log() - ct2 + ct3
+    t2 = ct1 * euler_constant
+    t3 = torch.exp(ct2 + _lgamma(1 + ct1) - ct3)
+    return t1 + t2 + t3 - (1 + euler_constant)
+
+
+@register_kl(Pareto, Pareto)
+def _kl_pareto_pareto(p, q):
+    scale_ratio = p.scale / q.scale
+    alpha_ratio = q.alpha / p.alpha
+    t1 = q.alpha * scale_ratio.log()
+    t2 = -alpha_ratio.log()
+    result = t1 + t2 + alpha_ratio - 1
+    return _set_inf(result, p.support.lower_bound < q.support.lower_bound)
+
+
+@register_kl(ContinuousBernoulli, ContinuousBernoulli)
+def _kl_continuous_bernoulli_continuous_bernoulli(p, q):
+    t1 = p.mean * (p.logits - q.logits)
+    t2 = p._cont_bern_log_norm() + torch.log1p(-p.probs)
+    t3 = -q._cont_bern_log_norm() - torch.log1p(-q.probs)
+    return t1 + t2 + t3
+
+
+@register_kl(Bernoulli, Poisson)
+def _kl_bernoulli_poisson(p, q):
+    return -p.entropy() - (p.probs * q.rate.log() - q.rate)
+
+
+@register_kl(Beta, ContinuousBernoulli)
+def _kl_beta_continuous_bernoulli(p, q):
+    return -p.entropy() - p.mean * q.logits - torch.log1p(-q.probs) - q._cont_bern_log_norm()
+
+
+@register_kl(Beta, Pareto)
+def _kl_beta_infinity(p, q):
+    return _infinite_like(p.concentration1)
+
+
+@register_kl(Beta, Exponential)
+def _kl_beta_exponential(p, q):
+    return -p.entropy() - q.rate.log() + q.rate * (p.concentration1 / (p.concentration1 + p.concentration0))
+
+
+@register_kl(Beta, Gamma)
+def _kl_beta_gamma(p, q):
+    t1 = -p.entropy()
+    t2 = _lgamma(q.concentration) - q.concentration * q.rate.log()
+    t3 = (q.concentration - 1) * (_digamma(p.concentration1) - _digamma(p.concentration1 + p.concentration0))
+    t4 = q.rate * p.concentration1 / (p.concentration1 + p.concentration0)
+    return t1 + t2 - t3 + t4
+
+
+@register_kl(Beta, Normal)
+def _kl_beta_normal(p, q):
+    E_beta = p.concentration1 / (p.concentration1 + p.concentration0)
+    var_normal = q.scale.pow(2)
+    t1 = -p.entropy()
+    t2 = 0.5 * (var_normal * 2 * math.pi).log()
+    t3 = (E_beta * (1 - E_beta) / (p.concentration1 + p.concentration0 + 1) + E_beta.pow(2)) * 0.5
+    t4 = q.loc * E_beta
+    t5 = q.loc.pow(2) * 0.5
+    return t1 + t2 + (t3 - t4 + t5) / var_normal
+
+
+@register_kl(Beta, Uniform)
+def _kl_beta_uniform(p, q):
+    result = -p.entropy() + (q.high - q.low).log()
+    return _set_inf(result, (q.low > p.support.lower_bound) | (q.high < p.support.upper_bound))
+
+
+@register_kl(ContinuousBernoulli, Pareto)
+def _kl_continuous_bernoulli_infinity(p, q):
+    return _infinite_like(p.probs)
+
+
+@register_kl(ContinuousBernoulli, Exponential)
+def _kl_continuous_bernoulli_exponential(p, q):
+    return -p.entropy() - torch.log(q.rate) + q.rate * p.mean
+
+
+@register_kl(ContinuousBernoulli, Normal)
+def _kl_continuous_bernoulli_normal(p, q):
+    t1 = -p.entropy()
+    t2 = 0.5 * (math.log(2.0 * math.pi) + torch.square(q.loc / q.scale)) + torch.log(q.scale)
+    t3 = (p.variance + torch.square(p.mean) - 2.0 * q.loc * p.mean) / (2.0 * torch.square(q.scale))
+    return t1 + t2 + t3
+
+
+@register_kl(ContinuousBernoulli, Uniform)
+def _kl_continuous_bernoulli_uniform(p, q):
+    result = -p.entropy() + (q.high - q.low).log()
+    outside = torch.ge(q.low, p.support.lower_bound) | torch.le(q.high, p.support.upper_bound)
+    return torch.where(outside, torch.ones_like(result) * inf, result)
+
+
+@register_kl(Exponential, Beta)
+@register_kl(Exponential, ContinuousBernoulli)
+@register_kl(Exponential, Pareto)
+@register_kl(Exponential, Uniform)
+def _kl_exponential_infinity(p, q):
+    return _infinite_like(p.rate)
+
+
+@register_kl(Exponential, Gumbel)
+def _kl_exponential_gumbel(p, q):
+    scale_rate_prod = p.rate * q.scale
+    loc_scale_ratio = q.loc / q.scale
+    t1 = scale_rate_prod.log() - 1
+    t2 = torch.exp(loc_scale_ratio) * scale_rate_prod / (scale_rate_prod + 1)
+    t3 = scale_rate_prod.reciprocal()
+    return t1 - loc_scale_ratio + t2 + t3
+
+
+@register_kl(Exponential, Normal)
+def _kl_exponential_normal(p, q):
+    var_normal = q.scale.pow(2)
+    rate_sqr = p.rate.pow(2)
+    t1 = 0.5 * torch.log(rate_sqr * var_normal * 2 * math.pi)
+    t2 = rate_sqr.reciprocal()
+    t3 = q.loc / p.rate
+    t4 = q.loc.pow(2) * 0.5
+    return t1 - 1 + (t2 - t3 + t4) / var_normal
+
+
+@register_kl(Gamma, Beta)
+@register_kl(Gamma, ContinuousBernoulli)
+@register_kl(Gamma, Pareto)
+@register_kl(Gamma, Uniform)
+def _kl_gamma_infinity(p, q):
+    return _infinite_like(p.concentration)
+
+
+@register_kl(Gamma, Exponential)
+def _kl_gamma_exponential(p, q):
+    return -p.entropy() - q.rate.log() + q.rate * p.concentration / p.rate
+
+
+@register_kl(Gamma, Gumbel)
+def _kl_gamma_gumbel(p, q):
+    beta_scale_prod = p.rate * q.scale
+    loc_scale_ratio = q.loc / q.scale
+    t1 = (p.concentration - 1) * _digamma(p.concentration) - _lgamma(p.concentration) - p.concentration
+    t2 = beta_scale_prod.log() + p.concentration / beta_scale_prod
+    t3 = torch.exp(loc_scale_ratio) * (1 + beta_scale_prod.reciprocal()).pow(-p.concentration) - loc_scale_ratio
+    return t1 + t2 + t3
+
+
+@register_kl(Gamma, Normal)
+def _kl_gamma_normal(p, q):
+    var_normal = q.scale.pow(2)
+    beta_sqr = p.rate.pow(2)
+    t1 = 0.5 * torch.log(beta_sqr * var_normal * 2 * math.pi) - p.concentration - _lgamma(p.concentration)
+    t2 = 0.5 * (p.concentration.pow(2) + p.concentration) / beta_sqr
+    t3 = q.loc * p.concentration / p.rate
+    t4 = 0.5 * q.loc.pow(2)
+    return t1 + (p.concentration - 1) * _digamma(p.concentration) + (t2 - t3 + t4) / var_normal
+
+
+@register_kl(Gumbel, Beta)
+@register_kl(Gumbel, ContinuousBernoulli)
+@register_kl(Gumbel, Exponential)
+@register_kl(Gumbel, Gamma)
+@register_kl(Gumbel, Pareto)
+@register_kl(Gumbel, Uniform)
+def _kl_gumbel_infinity(p, q):
+    return _infinite_like(p.loc)
+
+
+@register_kl(Gumbel, Normal)
+def _kl_gumbel_normal(p, q):
+    param_ratio = p.scale / q.scale
+    t1 = (param_ratio / math.sqrt(2 * math.pi)).log()
+    t2 = (math.pi * param_ratio * 0.5).pow(2) / 3
+    t3 = ((p.loc + p.scale * euler_constant - q.loc) / q.scale).pow(2) * 0.5
+    return -t1 + t2 + t3 - (euler_constant + 1)
+
+
+@register_kl(Laplace, Beta)
+@register_kl(Laplace, ContinuousBernoulli)
+@register_kl(Laplace, Exponential)
+@register_kl(Laplace, Gamma)
+@register_kl(Laplace, Pareto)
+@register_kl(Laplace, Uniform)
+def _kl_laplace_infinity(p, q):
+    return _infinite_like(p.loc)
+
+
+@register_kl(Laplace, Normal)
+def _kl_laplace_normal(p, q):
+    var_normal = q.scale.pow(2)
+    scale_sqr_var_ratio = p.scale.pow(2) / var_normal
+    t1 = 0.5 * torch.log(2 * scale_sqr_var_ratio / math.pi)
+    t2 = 0.5 * p.loc.pow(2)
+    t3 = p.loc * q.loc
+    t4 = 0.5 * q.loc.pow(2)
+    return -t1 + scale_sqr_var_ratio + (t2 - t3 + t4) / var_normal - 1
+
+
+@register_kl(LowRankMultivariateNormal, MultivariateNormal)
+def _kl_lowrankmultivariatenormal_multivariatenormal(p, q):
+    if tuple(p.event_shape) != tuple(q.event_shape):
+        raise ValueError("KL-divergence between two (Low Rank) Multivariate Normals with                          different event shapes cannot be computed")
+    term1 = 2 * q._unbroadcasted_scale_tril.diagonal(dim1=-2, dim2=-1).log().sum(-1) - _batch_lowrank_logdet(
+        p._unbroadcasted_cov_factor, p._unbroadcasted_cov_diag, p._capacitance_tril)
+    term3 = _batch_mahalanobis(q._unbroadcasted_scale_tril, q.loc - p.loc)
+    combined_batch_shape = tuple(torch.broadcast_shapes(tuple(q._unbroadcasted_scale_tril.shape[:-2]), tuple(p._unbroadcasted_cov_factor.shape[:-2])))
+    n = p.event_shape[0]
+    q_scale_tril = q._unbroadcasted_scale_tril.expand(combined_batch_shape + (n, n))
+    p_cov_factor = p._unbroadcasted_cov_factor.expand(combined_batch_shape + (n, p.cov_factor.size(-1)))
+    p_cov_diag = torch.diag_embed(p._unbroadcasted_cov_diag.sqrt()).expand(combined_batch_shape + (n, n))
+    term21 = _batch_trace_XXT(_solve_triangular_lower(q_scale_tril, p_cov_factor))
+    term22 = _batch_trace_XXT(_solve_triangular_lower(q_scale_tril, p_cov_diag))
+    return 0.5 * (term1 + term21 + term22 + term3 - p.event_shape[0])
+
+
+@register_kl(MultivariateNormal, LowRankMultivariateNormal)
+def _kl_multivariatenormal_lowrankmultivariatenormal(p, q):
+    if tuple(p.event_shape) != tuple(q.event_shape):
+        raise ValueError("KL-divergence between two (Low Rank) Multivariate Normals with                          different event shapes cannot be computed")
+    term1 = _batch_lowrank_logdet(q._unbroadcasted_cov_factor, q._unbroadcasted_cov_diag, q._capacitance_tril) - 2 * p._unbroadcasted_scale_tril.diagonal(dim1=-2, dim2=-1).log().sum(-1)
+    term3 = _batch_lowrank_mahalanobis(q._unbroadcasted_cov_factor, q._unbroadcasted_cov_diag, q.loc - p.loc, q._capacitance_tril)
+    qWt_qDinv = q._unbroadcasted_cov_factor.mT / q._unbroadcasted_cov_diag.unsqueeze(-2)
+    A = _solve_triangular_lower(q._capacitance_tril, qWt_qDinv)
+    term21 = _batch_trace_XXT(p._unbroadcasted_scale_tril * q._unbroadcasted_cov_diag.rsqrt().unsqueeze(-1))
+    term22 = _batch_trace_XXT(A.matmul(p._unbroadcasted_scale_tril))
+    return 0.5 * (term1 + (term21 - term22) + term3 - p.event_shape[0])
+
+
+@register_kl(Normal, Beta)
+@register_kl(Normal, ContinuousBernoulli)
+@register_kl(Normal, Exponential)
+@register_kl(Normal, Gamma)
+@register_kl(Normal, Pareto)
+@register_kl(Normal, Uniform)
+def _kl_normal_infinity(p, q):
+    return _infinite_like(p.loc)
+
+
+@register_kl(Normal, Gumbel)
+def _kl_normal_gumbel(p, q):
+    mean_scale_ratio = p.loc / q.scale
+    var_scale_sqr_ratio = (p.scale / q.scale).pow(2)
+    loc_scale_ratio = q.loc / q.scale
+    t1 = var_scale_sqr_ratio.log() * 0.5
+    t2 = mean_scale_ratio - loc_scale_ratio
+    t3 = torch.exp(-mean_scale_ratio + 0.5 * var_scale_sqr_ratio + loc_scale_ratio)
+    return -t1 + t2 + t3 - (0.5 * (1 + math.log(2 * math.pi)))
+
+
+@register_kl(Pareto, Beta)
+@register_kl(Pareto, ContinuousBernoulli)
+@register_kl(Pareto, Uniform)
+def _kl_pareto_infinity(p, q):
+    return _infinite_like(p.scale)
+
+
+@register_kl(Pareto, Exponential)
+def _kl_pareto_exponential(p, q):
+    scale_rate_prod = p.scale * q.rate
+    t1 = (p.alpha / scale_rate_prod).log()
+    t2 = p.alpha.reciprocal()
+    t3 = p.alpha * scale_rate_prod / (p.alpha - 1)
+    result = t1 - t2 + t3 - 1
+    return _set_inf(result, p.alpha <= 1)
+
+
+@register_kl(Pareto, Gamma)
+def _kl_pareto_gamma(p, q):
+    common_term = p.scale.log() + p.alpha.reciprocal()
+    t1 = p.alpha.log() - common_term
+    t2 = _lgamma(q.concentration) - q.concentration * q.rate.log()
+    t3 = (1 - q.concentration) * common_term
+    t4 = q.rate * p.alpha * p.scale / (p.alpha - 1)
+    result = t1 + t2 + t3 + t4 - 1
+    return _set_inf(result, p.alpha <= 1)
+
+
+@register_kl(Pareto, Normal)
+def _kl_pareto_normal(p, q):
+    var_normal = 2 * q.scale.pow(2)
+    common_term = p.scale / (p.alpha - 1)
+    t1 = (math.sqrt(2 * math.pi) * q.scale * p.alpha / p.scale).log()
+    t2 = p.alpha.reciprocal()
+    t3 = p.alpha * common_term.pow(2) / (p.alpha - 2)
+    t4 = (p.alpha * common_term - q.loc).pow(2)
+    result = t1 - t2 + (t3 + t4) / var_normal - 1
+    return _set_inf(result, p.alpha <= 2)
+
+
+@register_kl(Poisson, Bernoulli)
+@register_kl(Poisson, Binomial)
+def _kl_poisson_infinity(p, q):
+    return _infinite_like(p.rate)
+
+
+@register_kl(Uniform, Beta)
+def _kl_uniform_beta(p, q):
+    common_term = p.high - p.low
+    t1 = torch.log(common_term)
+    t2 = (q.concentration1 - 1) * (_x_log_x(p.high) - _x_log_x(p.low) - common_term) / common_term
+    t3 = (q.concentration0 - 1) * (_x_log_x(1 - p.high) - _x_log_x(1 - p.low) + common_term) / common_term
+    t4 = _lgamma(q.concentration1) + _lgamma(q.concentration0) - _lgamma(q.concentration1 + q.concentration0)
+    result = t3 + t4 - t1 - t2
+    return _set_inf(result, (p.high > q.support.upper_bound) | (p.low < q.support.lower_bound))
+
+
+@register_kl(Uniform, ContinuousBernoulli)
+def _kl_uniform_continuous_bernoulli(p, q):
+    result = -p.entropy() - p.mean * q.logits - torch.log1p(-q.probs) - q._cont_bern_log_norm()
+    outside = torch.ge(p.high, q.support.upper_bound) | torch.le(p.low, q.support.lower_bound)
+    return torch.where(outside, torch.ones_like(result) * inf, result)
+
+
+@register_kl(Uniform, Exponential)
+def _kl_uniform_exponential(p, q):
+    result = q.rate * (p.high + p.low) / 2 - ((p.high - p.low) * q.rate).log()
+    return _set_inf(result, p.low < q.support.lower_bound)
+
+
+@register_kl(Uniform, Gamma)
+def _kl_uniform_gamma(p, q):
+    common_term = p.high - p.low
+    t1 = common_term.log()
+    t2 = _lgamma(q.concentration) - q.concentration * q.rate.log()
+    t3 = (1 - q.concentration) * (_x_log_x(p.high) - _x_log_x(p.low) - common_term) / common_term
+    t4 = q.rate * (p.high + p.low) / 2
+    result = -t1 + t2 + t3 + t4
+    return _set_inf(result, p.low < q.support.lower_bound)
+
+
+@register_kl(Uniform, Gumbel)
+def _kl_uniform_gumbel(p, q):
+    common_term = q.scale / (p.high - p.low)
+    high_loc_diff = (p.high - q.loc) / q.scale
+    low_loc_diff = (p.low - q.loc) / q.scale
+    t1 = common_term.log() + 0.5 * (high_loc_diff + low_loc_diff)
+    t2 = common_term * (torch.exp(-high_loc_diff) - torch.exp(-low_loc_diff))
+    return t1 - t2
+
+
+@register_kl(Uniform, Pareto)
+def _kl_uniform_pareto(p, q):
+    support_uniform = p.high - p.low
+    t1 = (q.alpha * q.scale.pow(q.alpha) * support_uniform).log()
+    t2 = (_x_log_x(p.high) - _x_log_x(p.low) - support_uniform) / support_uniform
+    result = t2 * (q.alpha + 1) - t1
+    return _set_inf(result, p.low < q.support.lower_bound)
+
 
 constraint_registry = _Namespace("torch.distributions.constraint_registry")
 constraint_registry.biject_to = biject_to
 constraint_registry.transform_to = transform_to
 constraint_registry.ConstraintRegistry = ConstraintRegistry
+
+__all__ = [
+    "AbsTransform", "AffineTransform", "Bernoulli", "Beta", "Binomial", "CatTransform", "Categorical",
+    "Cauchy", "Chi2", "ComposeTransform", "ContinuousBernoulli", "CorrCholeskyTransform",
+    "CumulativeDistributionTransform", "Dirichlet", "Distribution", "ExpTransform", "Exponential",
+    "ExponentialFamily", "FisherSnedecor", "Gamma", "GeneralizedPareto", "Geometric", "Gumbel",
+    "HalfCauchy", "HalfNormal", "Independent", "IndependentTransform", "InverseGamma", "Kumaraswamy",
+    "LKJCholesky", "Laplace", "LogNormal", "LogisticNormal", "LowRankMultivariateNormal",
+    "LowerCholeskyTransform", "MixtureSameFamily", "Multinomial", "MultivariateNormal",
+    "NegativeBinomial", "Normal", "OneHotCategorical", "OneHotCategoricalStraightThrough", "Pareto",
+    "Poisson", "PositiveDefiniteTransform", "PowerTransform", "RelaxedBernoulli",
+    "RelaxedOneHotCategorical", "ReshapeTransform", "SigmoidTransform", "SoftmaxTransform",
+    "SoftplusTransform", "StackTransform", "StickBreakingTransform", "StudentT", "TanhTransform",
+    "Transform", "TransformedDistribution", "Uniform", "VonMises", "Weibull", "Wishart", "biject_to",
+    "identity_transform", "kl_divergence", "register_kl", "transform_to",
+]
+
+# The constraints, transforms and kl submodules re-export what this module
+# defines; importing them here makes `torch.distributions.constraints` (and
+# the others) those modules, as in PyTorch, whichever way a program reaches
+# them.
+import torch.distributions.constraints as constraints
+import torch.distributions.transforms as transforms
+import torch.distributions.kl as kl

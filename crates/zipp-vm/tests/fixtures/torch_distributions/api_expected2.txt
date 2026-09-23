@@ -1,0 +1,170 @@
+all ['AbsTransform', 'AffineTransform', 'Bernoulli', 'Beta', 'Binomial', 'CatTransform', 'Categorical', 'Cauchy', 'Chi2', 'ComposeTransform', 'ContinuousBernoulli', 'CorrCholeskyTransform', 'CumulativeDistributionTransform', 'Dirichlet', 'Distribution', 'ExpTransform', 'Exponential', 'ExponentialFamily', 'FisherSnedecor', 'Gamma', 'GeneralizedPareto', 'Geometric', 'Gumbel', 'HalfCauchy', 'HalfNormal', 'Independent', 'IndependentTransform', 'InverseGamma', 'Kumaraswamy', 'LKJCholesky', 'Laplace', 'LogNormal', 'LogisticNormal', 'LowRankMultivariateNormal', 'LowerCholeskyTransform', 'MixtureSameFamily', 'Multinomial', 'MultivariateNormal', 'NegativeBinomial', 'Normal', 'OneHotCategorical', 'OneHotCategoricalStraightThrough', 'Pareto', 'Poisson', 'PositiveDefiniteTransform', 'PowerTransform', 'RelaxedBernoulli', 'RelaxedOneHotCategorical', 'ReshapeTransform', 'SigmoidTransform', 'SoftmaxTransform', 'SoftplusTransform', 'StackTransform', 'StickBreakingTransform', 'StudentT', 'TanhTransform', 'Transform', 'TransformedDistribution', 'Uniform', 'VonMises', 'Weibull', 'Wishart', 'biject_to', 'identity_transform', 'kl_divergence', 'register_kl', 'transform_to']
+missing []
+submodules True True True True True True True True True True True True True True
+submodule names torch.distributions.constraints torch.distributions.transforms torch.distributions.kl
+constraint names []
+transform names []
+Gumbel [2] [] True False [2, 2] torch.float32 Real()
+   Gumbel(loc: torch.Size([2]), scale: torch.Size([2]))
+   {'loc': 'Real()', 'scale': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2, 2]
+   rsample [3, 2]
+Gumbel0 [] [] True False [2] torch.float32 Real()
+   Gumbel(loc: 0.0, scale: 1.0)
+   {'loc': 'Real()', 'scale': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2]
+   rsample [3]
+Pareto [2] [] True False [2, 2] torch.float32 GreaterThanEq(lower_bound=tensor([1., 2.]))
+   Pareto(alpha: torch.Size([2]), scale: torch.Size([2]))
+   {'alpha': 'GreaterThan(lower_bound=0.0)', 'scale': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2, 2]
+   rsample [3, 2]
+Weibull [2] [] True False [2, 2] torch.float32 GreaterThan(lower_bound=0.0)
+   Weibull(scale: torch.Size([2]), concentration: torch.Size([2]))
+   {'scale': 'GreaterThan(lower_bound=0.0)', 'concentration': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2, 2]
+   rsample [3, 2]
+Kumaraswamy [2] [] True False [2, 2] torch.float32 Interval(lower_bound=0.0, upper_bound=1.0)
+   Kumaraswamy(concentration1: torch.Size([2]), concentration0: torch.Size([2]))
+   {'concentration1': 'GreaterThan(lower_bound=0.0)', 'concentration0': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2, 2]
+   rsample [3, 2]
+ContinuousBernoulli [2] [] True False [2, 2] torch.float32 Interval(lower_bound=0.0, upper_bound=1.0)
+   ContinuousBernoulli(probs: torch.Size([2]))
+   {'probs': 'Interval(lower_bound=0.0, upper_bound=1.0)', 'logits': 'Real()'}
+   support ok True [2, 2]
+   rsample [3, 2]
+ContinuousBernoulli0 [] [] True False [2] torch.float32 Interval(lower_bound=0.0, upper_bound=1.0)
+   ContinuousBernoulli(probs: 0.30000001192092896)
+   {'probs': 'Interval(lower_bound=0.0, upper_bound=1.0)', 'logits': 'Real()'}
+   support ok True [2]
+   rsample [3]
+FisherSnedecor [2] [] True False [2, 2] torch.float32 GreaterThan(lower_bound=0.0)
+   FisherSnedecor(df1: torch.Size([2]), df2: torch.Size([2]))
+   {'df1': 'GreaterThan(lower_bound=0.0)', 'df2': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2, 2]
+   rsample [3, 2]
+GeneralizedPareto [2] [] True False [2, 2] torch.float32 Interval(lower_bound=tensor([0., 1.]), upper_bound=tensor([   inf, 7.6667]))
+   GeneralizedPareto(loc: torch.Size([2]), scale: torch.Size([2]), concentration: torch.Size([2]))
+   {'loc': 'Real()', 'scale': 'GreaterThan(lower_bound=0.0)', 'concentration': 'Real()'}
+   support ok True [2, 2]
+   rsample [3, 2]
+InverseGamma [2] [] True False [2, 2] torch.float32 GreaterThan(lower_bound=0.0)
+   InverseGamma()
+   {'concentration': 'GreaterThan(lower_bound=0.0)', 'rate': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2, 2]
+   rsample [3, 2]
+LogisticNormal [2] [4] True False [2, 2, 4] torch.float32 Simplex()
+   LogisticNormal()
+   {'loc': 'Real()', 'scale': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2, 2]
+   rsample [3, 2, 4]
+VonMises [2] [] False False [2, 2] torch.float32 Real()
+   VonMises(loc: torch.Size([2]), concentration: torch.Size([2]))
+   {'loc': 'Real()', 'concentration': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2, 2]
+NegativeBinomial [2] [] False False [2, 2] torch.float32 IntegerGreaterThan(lower_bound=0)
+   NegativeBinomial(total_count: torch.Size([2]), probs: torch.Size([2]), logits: torch.Size([2]))
+   {'total_count': 'GreaterThanEq(lower_bound=0)', 'probs': 'HalfOpenInterval(lower_bound=0.0, upper_bound=1.0)', 'logits': 'Real()'}
+   support ok True [2, 2]
+Wishart [2] [2, 2] True False [2, 2, 2, 2] torch.float32 PositiveDefinite()
+   Wishart(covariance_matrix: torch.Size([2, 2, 2]), df: torch.Size([2]))
+   {'covariance_matrix': 'PositiveDefinite()', 'precision_matrix': 'PositiveDefinite()', 'scale_tril': 'LowerCholesky()', 'df': 'GreaterThan(lower_bound=1)'}
+   support ok True [2, 2]
+   rsample [3, 2, 2, 2]
+LKJCholesky [2] [3, 3] False False [2, 2, 3, 3] torch.float32 CorrCholesky()
+   LKJCholesky(concentration: torch.Size([2]))
+   {'concentration': 'GreaterThan(lower_bound=0.0)'}
+   support ok True [2, 2]
+negbin zero sample [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+gamma zero sample [[True, True], [True, True]]
+dtypes torch.float64 torch.float32 torch.float64 torch.float64
+gumbel scale ValueError Expected parameter scale (Tensor of shape ()) of distribution Gumbel(loc: 0.0, scale: -1.0) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+pareto alpha ValueError Expected parameter rate (Tensor of shape (1,)) of distribution Exponential(rate: tensor([0.])) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+weibull conc ValueError Expected parameter concentration (Tensor of shape (1,)) of distribution Weibull(scale: tensor([1.]), concentration: tensor([-1.])) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+kumaraswamy ValueError Expected parameter concentration0 (Tensor of shape (1,)) of distribution Kumaraswamy(concentration1: tensor([1.]), concentration0: tensor([-1.])) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+cb probs ValueError The parameter probs has invalid values
+cb probs default no error
+cb both ValueError Either `probs` or `logits` must be specified, but not both.
+fisher ValueError Expected parameter concentration (Tensor of shape (1,)) of distribution Gamma(concentration: tensor([0.]), rate: tensor([0.])) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+genpareto scale ValueError Expected parameter scale (Tensor of shape ()) of distribution GeneralizedPareto(loc: 0.0, scale: -1.0, concentration: 0.10000000149011612) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+invgamma ValueError Expected parameter concentration (Tensor of shape (1,)) of distribution Gamma(concentration: tensor([-1.]), rate: tensor([1.])) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+logisticnormal ValueError Expected parameter scale (Tensor of shape (2,)) of distribution Normal(loc: torch.Size([2]), scale: torch.Size([2])) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+vonmises ValueError Expected parameter concentration (Tensor of shape (1,)) of distribution VonMises(loc: tensor([0.]), concentration: tensor([0.])) to satisfy the constraint GreaterThan(lower_bound=0.0), but found invalid values:
+negbin probs ValueError Expected parameter probs (Tensor of shape (1,)) of distribution NegativeBinomial(total_count: tensor([3.]), probs: tensor([1.])) to satisfy the constraint HalfOpenInterval(lower_bound=0.0, upper_bound=1.0), but found invalid values:
+negbin count ValueError Expected parameter total_count (Tensor of shape (1,)) of distribution NegativeBinomial(total_count: tensor([-1.]), probs: tensor([0.5000])) to satisfy the constraint GreaterThanEq(lower_bound=0), but found invalid values:
+negbin both ValueError Either `probs` or `logits` must be specified, but not both.
+wishart none AssertionError Exactly one of covariance_matrix or precision_matrix or scale_tril may be specified.
+wishart two AssertionError Exactly one of covariance_matrix or precision_matrix or scale_tril may be specified.
+wishart dim ValueError scale_tril must be at least two-dimensional, with optional leading batch dimensions
+wishart df ValueError Value of df=tensor([0.5000]) expected to be greater than ndim - 1 = 1.
+wishart pd ValueError Expected parameter covariance_matrix (Tensor of shape (2, 2)) of distribution Wishart(covariance_matrix: torch.Size([2, 2]), df: 4.0) to satisfy the constraint PositiveDefinite(), but found invalid values:
+lkj dim ValueError Expected dim to be an integer greater than or equal to 2. Found dim=1.
+lkj conc ValueError Expected parameter concentration (Tensor of shape (1, 3, 2)) of distribution Dirichlet(concentration: torch.Size([1, 3, 2])) to satisfy the constraint IndependentConstraint(GreaterThan(lower_bound=0.0), 1), but found invalid values:
+gumbel value ValueError Expected value argument (Tensor of shape ()) to be within the support (Real()) of the distribution Gumbel(loc: 0.0, scale: 1.0), but found invalid values:
+pareto support ValueError Expected value argument (Tensor of shape (1,)) to be within the support (GreaterThanEq(lower_bound=tensor([2.]))) of the distribution Pareto(alpha: tensor([1.]), scale: tensor([2.])), but found invalid values:
+weibull support ValueError Expected value argument (Tensor of shape (1,)) to be within the support (GreaterThan(lower_bound=0.0)) of the distribution Weibull(scale: tensor([1.]), concentration: tensor([1.])), but found invalid values:
+kumaraswamy support ValueError Expected value argument (Tensor of shape (1,)) to be within the support (Interval(lower_bound=0.0, upper_bound=1.0)) of the distribution Kumaraswamy(concentration1: tensor([1.]), concentration0: tensor([1.])), but found invalid values:
+cb support ValueError Expected value argument (Tensor of shape (1,)) to be within the support (Interval(lower_bound=0.0, upper_bound=1.0)) of the distribution ContinuousBernoulli(probs: tensor([0.3000])), but found invalid values:
+genpareto support ValueError Expected value argument (Tensor of shape (1,)) to be within the support (Interval(lower_bound=tensor([0.]), upper_bound=tensor([2.]))) of the distribution GeneralizedPareto(loc: tensor([0.]), scale: tensor([1.]), concentration: tensor([-0.5000])), but found invalid values:
+invgamma support ValueError Expected value argument (Tensor of shape (1,)) to be within the support (GreaterThan(lower_bound=0.0)) of the distribution InverseGamma(), but found invalid values:
+logisticnormal support ValueError Expected value argument (Tensor of shape (3,)) to be within the support (Simplex()) of the distribution LogisticNormal(), but found invalid values:
+negbin support ValueError Expected value argument (Tensor of shape (1,)) to be within the support (IntegerGreaterThan(lower_bound=0)) of the distribution NegativeBinomial(total_count: tensor([3.]), probs: tensor([0.5000])), but found invalid values:
+wishart support ValueError Expected value argument (Tensor of shape (2, 2)) to be within the support (PositiveDefinite()) of the distribution Wishart(covariance_matrix: torch.Size([2, 2]), df: 4.0), but found invalid values:
+lkj support ValueError Expected value argument (Tensor of shape (2, 2)) to be within the support (CorrCholesky()) of the distribution LKJCholesky(concentration: 1.0), but found invalid values:
+fisher entropy NotImplementedError 
+vonmises entropy NotImplementedError 
+vonmises cdf NotImplementedError 
+vonmises rsample NotImplementedError 
+negbin entropy NotImplementedError 
+negbin rsample NotImplementedError 
+cb mode NotImplementedError <class 'torch.distributions.continuous_bernoulli.ContinuousBernoulli'> does not implement mode
+logisticnormal mean NotImplementedError 
+lkj mean NotImplementedError 
+lkj rsample NotImplementedError 
+pareto entropy ok no error
+vonmises variance lazy False
+vonmises variance after True
+expand Gumbel Gumbel [4, 3] [] [4, 3] [4, 3] True
+expand Pareto Pareto [4, 3] [] [4, 3] [4, 3] True
+expand Weibull Weibull [4, 3] [] [4, 3] [4, 3] True
+expand Kumaraswamy Kumaraswamy [4, 3] [] [4, 3] [4, 3] True
+expand ContinuousBernoulli ContinuousBernoulli [4, 3] [] [4, 3] [4, 3] True
+expand FisherSnedecor FisherSnedecor [4, 3] [] [4, 3] [4, 3] True
+expand GeneralizedPareto GeneralizedPareto [4, 3] [] [4, 3] [4, 3] True
+expand InverseGamma InverseGamma [4, 3] [] [4, 3] [4, 3] True
+expand LogisticNormal LogisticNormal [4, 3] [3] [4, 3, 3] [4, 3] True
+expand VonMises VonMises [4, 3] [] [4, 3] [4, 3] True
+expand NegativeBinomial NegativeBinomial [4, 3] [] [4, 3] [4, 3] True
+expand Wishart Wishart [4, 3] [2, 2] [4, 3, 2, 2] [4, 3] True
+expand LKJCholesky LKJCholesky [4, 3] [2, 2] [4, 3, 2, 2] [4, 3] True
+expand validate False False
+wishart lazy True False
+wishart lazy after True
+corrchol IndependentConstraint(Real(), 1) CorrCholesky() True 1 2
+lowerchol IndependentConstraint(Real(), 2) LowerCholesky() False True PositiveDefinite()
+lowerchol ladj NotImplementedError 
+cat Cat() Cat() True 0 3
+stack Stack() Stack() True
+cdt Real() Interval(lower_bound=0.0, upper_bound=1.0) True 1 True
+cat check [[True, True, True], [True, False, True]]
+registry LowerCholeskyTransform() PositiveDefiniteTransform() PositiveDefiniteTransform() CorrCholeskyTransform() CorrCholeskyTransform()
+registry cat [ComposeTransform(
+    ExpTransform(),
+    AffineTransform()
+), ComposeTransform(
+    
+)] [SigmoidTransform(), ComposeTransform(
+    
+)]
+biject lower_cholesky NotImplementedError Cannot transform _LowerCholesky constraints
+biject positive_definite NotImplementedError Cannot transform _PositiveDefinite constraints
+cat transform AssertionError lengths (2) must match transforms (1)
+cat length AssertionError x.size(0) = 3 must equal length 2
+kl expfamily cross NotImplementedError The cross KL-divergence between different exponential families cannot                             be computed using Bregman divergences
+kl wishart no error
+kl vonmises NotImplementedError No KL(p || q) is implemented for p type VonMises and q type VonMises
+kl pareto inf [True, False]
+kl normal gamma [inf]
+kl uniform gumbel []
+kl registry size 87
