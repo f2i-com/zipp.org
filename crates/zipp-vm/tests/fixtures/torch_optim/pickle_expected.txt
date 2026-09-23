@@ -1,0 +1,18 @@
+0 {'b': b'\x00\xff', 'ba': bytearray(b'ab'), 'big': 1180591620717411303424, 'f': 1.5, 'fs': frozenset([1, 2]), 'l': [None, True, False], 'neg': -7, 'nested': {'k': [1, {'x': b''}]}, 's': set([3]), 't': (1, 'two', 3.0), 'u': 'café ☃'}
+0 types [('b', 'bytes'), ('ba', 'bytearray'), ('big', 'int'), ('f', 'float'), ('fs', 'frozenset'), ('l', 'list'), ('neg', 'int'), ('nested', 'dict'), ('s', 'set'), ('t', 'tuple'), ('u', 'str')]
+1 {'b': b'\x00\xff', 'ba': bytearray(b'ab'), 'big': 1180591620717411303424, 'f': 1.5, 'fs': frozenset([1, 2]), 'l': [None, True, False], 'neg': -7, 'nested': {'k': [1, {'x': b''}]}, 's': set([3]), 't': (1, 'two', 3.0), 'u': 'café ☃'}
+1 types [('b', 'bytes'), ('ba', 'bytearray'), ('big', 'int'), ('f', 'float'), ('fs', 'frozenset'), ('l', 'list'), ('neg', 'int'), ('nested', 'dict'), ('s', 'set'), ('t', 'tuple'), ('u', 'str')]
+2 {'b': b'\x00\xff', 'ba': bytearray(b'ab'), 'big': 1180591620717411303424, 'f': 1.5, 'fs': frozenset([1, 2]), 'l': [None, True, False], 'neg': -7, 'nested': {'k': [1, {'x': b''}]}, 's': set([3]), 't': (1, 'two', 3.0), 'u': 'café ☃'}
+2 types [('b', 'bytes'), ('ba', 'bytearray'), ('big', 'int'), ('f', 'float'), ('fs', 'frozenset'), ('l', 'list'), ('neg', 'int'), ('nested', 'dict'), ('s', 'set'), ('t', 'tuple'), ('u', 'str')]
+3 {'b': b'\x00\xff', 'ba': bytearray(b'ab'), 'big': 1180591620717411303424, 'f': 1.5, 'fs': frozenset([1, 2]), 'l': [None, True, False], 'neg': -7, 'nested': {'k': [1, {'x': b''}]}, 's': set([3]), 't': (1, 'two', 3.0), 'u': 'café ☃'}
+3 types [('b', 'bytes'), ('ba', 'bytearray'), ('big', 'int'), ('f', 'float'), ('fs', 'frozenset'), ('l', 'list'), ('neg', 'int'), ('nested', 'dict'), ('s', 'set'), ('t', 'tuple'), ('u', 'str')]
+4 {'b': b'\x00\xff', 'ba': bytearray(b'ab'), 'big': 1180591620717411303424, 'f': 1.5, 'fs': frozenset([1, 2]), 'l': [None, True, False], 'neg': -7, 'nested': {'k': [1, {'x': b''}]}, 's': set([3]), 't': (1, 'two', 3.0), 'u': 'café ☃'}
+4 types [('b', 'bytes'), ('ba', 'bytearray'), ('big', 'int'), ('f', 'float'), ('fs', 'frozenset'), ('l', 'list'), ('neg', 'int'), ('nested', 'dict'), ('s', 'set'), ('t', 'tuple'), ('u', 'str')]
+5 {'b': b'\x00\xff', 'ba': bytearray(b'ab'), 'big': 1180591620717411303424, 'f': 1.5, 'fs': frozenset([1, 2]), 'l': [None, True, False], 'neg': -7, 'nested': {'k': [1, {'x': b''}]}, 's': set([3]), 't': (1, 'two', 3.0), 'u': 'café ☃'}
+5 types [('b', 'bytes'), ('ba', 'bytearray'), ('big', 'int'), ('f', 'float'), ('fs', 'frozenset'), ('l', 'list'), ('neg', 'int'), ('nested', 'dict'), ('s', 'set'), ('t', 'tuple'), ('u', 'str')]
+round trip 0 True True bytearray
+round trip 2 True True bytearray
+round trip highest True True bytearray
+bytearray bytearray(b'ab')
+bytes b'\x00\x01\xfe' b''
+dump [1, 'two']

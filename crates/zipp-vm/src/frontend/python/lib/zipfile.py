@@ -1,6 +1,9 @@
 """zipfile for Zipp: reading and writing archives with STORED entries (what
 PyTorch checkpoints use); DEFLATE entries can be listed but not read, as the
-runtime has no zlib."""
+runtime has no zlib. Mode "a" appends to an existing archive (its entries,
+compressed or not, are kept byte for byte) and mode "x" refuses to replace
+an existing file. The archive is assembled in memory and written on close."""
+import os
 import struct
 import _zipp_tensor as _k
 
@@ -36,19 +39,46 @@ class ZipInfo:
 def _crc32(data):
     # A table-driven CRC-32 in the runtime: a per-bit Python loop took
     # seconds per megabyte of checkpoint.
-    return _k.crc32(bytes(data))
+    return _k.crc32(data if isinstance(data, bytes) else bytes(data))
+
+
+def _concat(pieces):
+    # Pairwise concatenation: `+` copies natively, while one join over a few
+    # large pieces took most of a second per megabyte-sized checkpoint.
+    pieces = [p for p in pieces if p]
+    if not pieces:
+        return b""
+    while len(pieces) > 1:
+        merged = [pieces[i] + pieces[i + 1] for i in range(0, len(pieces) - 1, 2)]
+        if len(pieces) % 2:
+            merged.append(pieces[-1])
+        pieces = merged
+    return pieces[0]
+
+
+# The end-of-central-directory record is 22 bytes plus a comment of at most
+# 65535: only that tail needs searching, not a checkpoint's whole payload.
+_EOCD_SEARCH = 22 + 65535
 
 
 class ZipFile:
-    def __init__(self, file, mode="r", compression=ZIP_STORED, allowZip64=True):
+    def __init__(self, file, mode="r", compression=ZIP_STORED, allowZip64=True, compresslevel=None, *, strict_timestamps=True):
+        if mode not in ("r", "w", "x", "a"):
+            raise ValueError("ZipFile requires mode 'r', 'w', 'x', or 'a'")
         self.mode = mode
         self.filename = None
         self._entries = []
         self._data = b""
         self._closed = False
         self._file = None
+        # Bytes kept ahead of the new entries (mode "a"), and the central
+        # directory records of the entries already there.
+        self._prefix = b""
+        self._records = []
+        if hasattr(file, "__fspath__"):
+            file = file.__fspath__()
         if mode == "r":
-            if isinstance(file, bytes):
+            if isinstance(file, (bytes, bytearray)):
                 self._data = bytes(file)
             elif hasattr(file, "read"):
                 self._data = file.read()
@@ -57,29 +87,54 @@ class ZipFile:
                 with open(self.filename, "rb") as f:
                     self._data = f.read()
             self._read_directory()
-        elif mode in ("w", "a", "x"):
-            if hasattr(file, "write"):
-                self._file = file
-            else:
-                self.filename = str(file)
-            self._records = []
-        else:
-            raise ValueError("ZipFile requires mode 'r', 'w', 'x', or 'a'")
+            return
+        if hasattr(file, "write"):
+            self._file = file
+            if mode == "a" and hasattr(file, "read") and hasattr(file, "seek"):
+                file.seek(0)
+                self._append_to(file.read())
+                file.seek(0)
+                if hasattr(file, "truncate"):
+                    file.truncate()
+            return
+        self.filename = str(file)
+        exists = os.path.exists(self.filename)
+        if mode == "x" and exists:
+            raise FileExistsError("[Errno 17] File exists: %r" % (self.filename,))
+        if mode == "a" and exists:
+            with open(self.filename, "rb") as f:
+                self._append_to(f.read())
+
+    def _append_to(self, data):
+        # An existing archive keeps everything before its central directory
+        # and its entries' directory records; anything else (a non-zip file)
+        # is kept whole with a new archive after it, as CPython does.
+        if not data:
+            return
+        self._data = data
+        try:
+            start = self._read_directory()
+        except BadZipFile:
+            self._prefix = data
+            self._entries = []
+            self._data = b""
+            return
+        self._prefix = data[:start]
 
     def _read_directory(self):
         data = self._data
-        end = data.rfind(b"PK\x05\x06")
+        tail = max(0, len(data) - _EOCD_SEARCH)
+        end = data[tail:].rfind(b"PK\x05\x06")
         if end < 0:
             raise BadZipFile("File is not a zip file")
+        end += tail
         count = struct.unpack("<H", data[end + 10:end + 12])[0]
         size = struct.unpack("<I", data[end + 12:end + 16])[0]
         offset = struct.unpack("<I", data[end + 16:end + 20])[0]
-        if offset == 0xFFFFFFFF or count == 0xFFFF:
-            loc = data.rfind(b"PK\x06\x07")
-            if loc >= 0:
-                zip64 = struct.unpack("<Q", data[loc + 8:loc + 16])[0]
-                count = struct.unpack("<Q", data[zip64 + 32:zip64 + 40])[0]
-                offset = struct.unpack("<Q", data[zip64 + 48:zip64 + 56])[0]
+        if (offset == 0xFFFFFFFF or count == 0xFFFF) and end >= 20 and data[end - 20:end - 16] == b"PK\x06\x07":
+            zip64 = struct.unpack("<Q", data[end - 12:end - 4])[0]
+            count = struct.unpack("<Q", data[zip64 + 32:zip64 + 40])[0]
+            offset = struct.unpack("<Q", data[zip64 + 48:zip64 + 56])[0]
         pos = offset
         for _ in range(count):
             if data[pos:pos + 4] != b"PK\x01\x02":
@@ -103,8 +158,10 @@ class ZipFile:
             info.compress_size = csize
             info.file_size = usize
             info.header_offset = hoff
+            info._central = data[pos:pos + 46 + nlen + elen + clen]
             self._entries.append(info)
             pos += 46 + nlen + elen + clen
+        return offset
 
     def namelist(self):
         return [e.filename for e in self._entries]
@@ -138,12 +195,19 @@ class ZipFile:
     def extract(self, member, path=None):
         raise NotImplementedError("extract() is not available; use read()")
 
-    def writestr(self, name, data, compress_type=None):
+    def writestr(self, name, data, compress_type=None, compresslevel=None):
+        if self.mode == "r":
+            raise ValueError("write() requires mode 'w', 'x', or 'a'")
+        if self._closed:
+            raise ValueError("Attempt to write to ZIP archive that was already closed")
         if isinstance(name, ZipInfo):
             name = name.filename
         if isinstance(data, str):
             data = data.encode("utf-8")
-        self._records.append((name, bytes(data)))
+        self._records.append((name, data if isinstance(data, bytes) else bytes(data)))
+        info = ZipInfo(name)
+        info.file_size = info.compress_size = len(data)
+        self._entries.append(info)
 
     def write(self, filename, arcname=None):
         with open(filename, "rb") as f:
@@ -155,19 +219,22 @@ class ZipFile:
         self._closed = True
         if self.mode == "r":
             return
-        out = []
-        central = []
-        offset = 0
+        out = [self._prefix]
+        central = [info._central for info in self._entries if getattr(info, "_central", None) is not None]
+        offset = len(self._prefix)
         for name, data in self._records:
             enc = name.encode("utf-8")
             crc = _crc32(data)
             header = b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 20, 0, 0, 0, 0x21, crc, len(data), len(data), len(enc), 0) + enc
-            out.append(header + data)
+            out.append(header)
+            out.append(data)
             central.append(b"PK\x01\x02" + struct.pack("<HHHHHHIIIHHHHHII", 20, 20, 0, 0, 0, 0x21, crc, len(data), len(data), len(enc), 0, 0, 0, 0, 0, offset) + enc)
             offset += len(header) + len(data)
         cd = b"".join(central)
         end = b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, len(central), len(central), len(cd), offset, 0)
-        blob = b"".join(out) + cd + end
+        out.append(cd)
+        out.append(end)
+        blob = _concat(out)
         if self._file is not None:
             self._file.write(blob)
         else:

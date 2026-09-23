@@ -1,0 +1,82 @@
+AdamW post hook AdamW 1
+generator group 0.4 list 0
+bare tensor group [0.5, 0.5] list
+tensor params TypeError: params argument given to the optimizer should be an iterable of Tensors or dicts, but got torch.FloatTensor
+empty params ValueError: optimizer got an empty parameter list
+set params TypeError: optimizer parameters need to be organized in ordered collections, but the ordering of tensors in sets will change between runs. Please use a list instead.
+non-tensor TypeError: optimizer can only optimize Tensors, but one of the params is int
+non-leaf ValueError: can't optimize a non-leaf Tensor
+overlap ValueError: some parameters appear in more than one parameter group
+overlap add ValueError: some parameters appear in more than one parameter group 1
+group not dict TypeError: param_group must be a dict, but got <class 'list'>
+named ['a', 'b'] ValueError: all optimizer param groups should be with/without names. cannot add param group without names to the optimizer
+duplicate [-0.20000000298023224] 2
+SGD ['params', 'lr', 'momentum', 'dampening', 'weight_decay', 'nesterov', 'maximize', 'foreach', 'differentiable', 'fused'] True
+Adam ['params', 'lr', 'betas', 'eps', 'weight_decay', 'amsgrad', 'maximize', 'foreach', 'capturable', 'differentiable', 'fused', 'decoupled_weight_decay'] True
+AdamW ['params', 'lr', 'betas', 'eps', 'weight_decay', 'amsgrad', 'maximize', 'foreach', 'capturable', 'differentiable', 'fused', 'decoupled_weight_decay'] True
+RMSprop ['params', 'lr', 'momentum', 'alpha', 'eps', 'centered', 'weight_decay', 'capturable', 'foreach', 'maximize', 'differentiable'] True
+Adagrad ['params', 'lr', 'lr_decay', 'eps', 'weight_decay', 'initial_accumulator_value', 'foreach', 'maximize', 'differentiable', 'fused'] True
+Adamax ['params', 'lr', 'betas', 'eps', 'weight_decay', 'foreach', 'maximize', 'differentiable', 'capturable'] True
+NAdam ['params', 'lr', 'betas', 'eps', 'weight_decay', 'momentum_decay', 'decoupled_weight_decay', 'maximize', 'foreach', 'capturable', 'differentiable'] True
+RAdam ['params', 'lr', 'betas', 'eps', 'weight_decay', 'maximize', 'foreach', 'capturable', 'decoupled_weight_decay', 'differentiable'] True
+Adadelta ['params', 'lr', 'rho', 'eps', 'weight_decay', 'maximize', 'capturable', 'foreach', 'differentiable'] True
+ASGD ['params', 'lr', 'lambd', 'alpha', 't0', 'weight_decay', 'foreach', 'maximize', 'differentiable', 'capturable'] True
+Rprop ['params', 'lr', 'etas', 'step_sizes', 'foreach', 'maximize', 'differentiable', 'capturable'] True
+SGD (
+Parameter Group 0
+    dampening: 0
+    differentiable: False
+    foreach: None
+    fused: None
+    lr: 0.1
+    maximize: False
+    momentum: 0.9
+    nesterov: False
+    weight_decay: 0
+)
+SGD lr -> ValueError: Invalid learning rate: -0.1
+SGD momentum -> ValueError: Invalid momentum value: -0.5
+SGD weight_decay -> ValueError: Invalid weight_decay value: -1
+SGD nesterov no momentum -> ValueError: Nesterov momentum requires a momentum and zero dampening
+SGD nesterov dampening -> ValueError: Nesterov momentum requires a momentum and zero dampening
+SGD fused foreach -> RuntimeError: `fused` and `foreach` cannot be `True` together.
+Adam lr -> ValueError: Invalid learning rate: -0.001
+Adam eps -> ValueError: Invalid epsilon value: -1e-08
+Adam beta0 -> ValueError: Invalid beta parameter at index 0: 1.0
+Adam beta1 -> ValueError: Invalid beta parameter at index 1: -0.1
+Adam weight_decay -> ValueError: Invalid weight_decay value: -0.1
+Adam fused differentiable -> RuntimeError: `fused` does not support `differentiable`
+AdamW beta1 -> ValueError: Invalid beta parameter at index 1: 1.5
+RMSprop alpha -> ValueError: Invalid alpha value: -0.1
+RMSprop momentum -> ValueError: Invalid momentum value: -0.1
+RMSprop eps -> ValueError: Invalid epsilon value: -0.1
+Adagrad lr_decay -> ValueError: Invalid lr_decay value: -1
+Adagrad init -> ValueError: Invalid initial_accumulator_value value: -1
+Adamax beta -> ValueError: Invalid beta parameter at index 1: 1.0
+NAdam momentum_decay -> ValueError: Invalid momentum_decay value: -1
+RAdam eps -> ValueError: Invalid epsilon value: -1
+Adadelta rho -> ValueError: Invalid rho value: 1.5
+ASGD weight_decay -> ValueError: Invalid weight_decay value: -1
+Rprop etas -> ValueError: Invalid eta values: 1.5, 1.2
+kwargs accepted -> ok
+decoupled flag True True
+state SGD [] [] -1 True
+state Adam [] ['exp_avg', 'exp_avg_sq', 'step'] 6 True
+state AdamW [] ['exp_avg', 'exp_avg_sq', 'step'] 6 True
+state RMSprop [] ['square_avg', 'step'] 6 True
+state Adagrad [0] ['step', 'sum'] 6 True
+state Adamax [] ['exp_avg', 'exp_inf', 'step'] 6 True
+state NAdam [] ['exp_avg', 'exp_avg_sq', 'mu_product', 'step'] 6 True
+state RAdam [] ['exp_avg', 'exp_avg_sq', 'step'] 6 True
+state Adadelta [] ['acc_delta', 'square_avg', 'step'] 6 True
+state ASGD [] ['ax', 'eta', 'mu', 'step'] 6 True
+state Rprop [] ['prev', 'step', 'step_size'] 6 True
+mismatch size ValueError: loaded state dict contains a parameter group that doesn't match the size of optimizer's group 2
+mismatch groups ValueError: loaded state dict has a different number of parameter groups 2
+loaded lr 0.5 True
+closure 5.0 [True] [0.8, -1.6] True
+zero_grad keep [0.0, 0.0]
+zero_grad none None
+hooks [('pre', True, 1), ('post', True), ('post', True)]
+custom post hook
+custom [0.75, -1.75] {'lr': 0.25} True
