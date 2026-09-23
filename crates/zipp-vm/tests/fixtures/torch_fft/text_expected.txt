@@ -1,0 +1,33 @@
+RuntimeError: Invalid normalization mode: "bad"
+RuntimeError: Invalid number of data points (0) specified
+RuntimeError: Invalid number of data points (-1) specified
+RuntimeError: rfft expects a real input tensor, but got ComplexFloat
+RuntimeError: Unsupported dtype Half
+RuntimeError: Unsupported dtype BFloat16
+torch.complex64
+IndexError: Dimension out of range (expected to be in range of [-1, 0], but got 2)
+torch.Size([10])
+torch.float32
+RuntimeError: When given, dim and shape arguments must have the same length
+torch.Size([4, 5])
+RuntimeError: FFT dims must be unique
+IndexError: Dimension specified as -1 but tensor has no dimensions
+torch.complex128
+torch.float32
+torch.complex64
+RuntimeError: Invalid number of data points (0) specified
+RuntimeError: Invalid number of data points (0) specified
+IndexError: Dimension out of range (expected to be in range of [-1, 0], but got -2)
+torch.Size([2, 3])
+torch.Size([4, 2])
+torch.Size([4, 10])
+torch.Size([3, 5])
+torch.float32
+torch.float64
+[[5, 3, 4], [2, 0, 1]]
+[2, 3, 4, 0, 1]
+torch.Size([6])
+['FftR2CBackward0', 'FftR2CBackward0', 'FftC2CBackward0', 'FftC2RBackward0', 'FftC2RBackward0', 'ConjBackward0', 'FftC2CBackward0']
+[torch.complex64, torch.complex64, torch.complex64, torch.float32]
+tensor([10.+0.j, -2.+2.j, -2.+0.j, -2.-2.j])
+tensor([3.+0.0000j, 1.+3.4641j, 0.-1.7321j, 1.+0.0000j])

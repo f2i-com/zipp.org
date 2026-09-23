@@ -2892,9 +2892,16 @@ class RNNBase(Module):
         w_hr = get("weight_hr") if self.proj_size > 0 else None
         return get("weight_ih"), get("weight_hh"), b_ih, b_hh, w_hr
 
-    def _run(self, x, h0, c0, lengths):
+    def _run(self, x, h0, c0, lengths, wdt=None):
         """x: (T, B, input) time-major; h0/c0: (layers * dirs, B, H) or None.
-        With `lengths` (sorted, descending) rows stop updating past their end."""
+        With `lengths` (sorted, descending) rows stop updating past their end.
+        `wdt`: the dtype the weights are cast to (CPU autocast)."""
+        if wdt is None and torch._autocast_cpu is not None and self.mode != "GRU":
+            # PyTorch's CPU autocast runs lstm and rnn_tanh/rnn_relu in its
+            # lower precision (the input, states and weights cast to it, as
+            # the op's other floating inputs); gru keeps their own dtypes.
+            fast = torch._autocast_cpu
+            return torch._autocast_run(lambda a, b, c: self._run(a, b, c, lengths, fast), "lower", (x, h0, c0))
         T, B = x.shape[0], x.shape[1]
         dirs = 2 if self.bidirectional else 1
         is_lstm = self.mode == "LSTM"
@@ -2909,6 +2916,9 @@ class RNNBase(Module):
             for direction in range(dirs):
                 k = layer * dirs + direction
                 w_ih, w_hh, b_ih, b_hh, w_hr = self._weights(layer, direction)
+                if wdt is not None:
+                    w_ih, w_hh, b_ih, b_hh, w_hr = [w if w is None or w.dtype is wdt or w.dtype is torch.float64 or not w.dtype.is_floating_point else w.to(wdt)
+                                                    for w in (w_ih, w_hh, b_ih, b_hh, w_hr)]
                 gi_all = _unbind_time(F.linear(layer_in, w_ih, b_ih))
                 h = h0[k]
                 c = c0[k] if is_lstm else None

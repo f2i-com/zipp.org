@@ -40,6 +40,9 @@
 //! it declines and the interpreted loop spends the budget exactly as it did
 //! before these kernels existed. It also declines while a trace is recorded,
 //! and polls the host abort flag between blocks of work.
+mod fft;
+mod linalg;
+
 use super::helpers_num2::{f16_bits_to_f64, f64_to_f16_bits, math_unary};
 use super::helpers_numeric::to_uint_modular;
 use super::{native, Thrown, Vm};
@@ -71,6 +74,8 @@ const OP_WHERE: u32 = 12;
 const OP_MATMUL_NT: u32 = 13;
 const OP_MAX_POOL2D: u32 = 14;
 const OP_MAX_POOL2D_BACKWARD: u32 = 15;
+const OP_FFT: u32 = 16;
+const OP_LINALG: u32 = 17;
 
 // TypedArray kinds (`native::TA_KINDS`) a tensor storage can be.
 const KIND_U8: u8 = 1;
@@ -430,6 +435,8 @@ impl Vm<'_> {
                 None => Value::NULL,
             },
             OP_WHERE => Value::bool(self.pt_where(a).is_some()),
+            OP_FFT => Value::bool(self.pt_fft(a).is_some()),
+            OP_LINALG => Value::bool(self.pt_linalg(a).is_some()),
             _ => Value::bool(false),
         })
     }
@@ -1294,6 +1301,256 @@ impl Vm<'_> {
         self.pt_write(vo, 0, &vals)?;
         self.pt_write(vi, 0, &idx)?;
         self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(A, O, rows, nIn, n, mode, inverse, scale)`: tensor.js's `fft`
+    /// (see `fft`): each row's transform of length n, scaled, rounded to
+    /// O's element type on store.
+    fn pt_fft(&mut self, a: &[Value]) -> Option<()> {
+        let (va, vo) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?);
+        if va.buffer == vo.buffer || !matches!(va.kind, KIND_F32 | KIND_F64) || !matches!(vo.kind, KIND_F32 | KIND_F64) {
+            return None;
+        }
+        let (rows, n_in, n) = (int_arg(a, 2)?, int_arg(a, 3)?, int_arg(a, 4)?);
+        let mode = u32::try_from(int_arg(a, 5)?).ok()?;
+        let inverse = num_arg(a, 6)? != 0.0;
+        let scale = num_arg(a, 7)?;
+        if mode > 3 || n == 0 || n > (1 << 40) {
+            return None;
+        }
+        let half = (n >> 1) + 1;
+        let n_out = if mode == 1 { half } else { n };
+        let in_len = rows.checked_mul(n_in)?.checked_mul(if mode == 1 || mode == 3 { 1 } else { 2 })?;
+        let out_len = rows.checked_mul(n_out)?.checked_mul(if mode == 2 { 1 } else { 2 })?;
+        if va.len != in_len || vo.len != out_len {
+            return None;
+        }
+        // Bluestein's chirp index j*j mod 2n is exact in the JavaScript
+        // loop's doubles only while j*j stays below 2**53.
+        if !fft::smooth(n) && n > 94_906_265 {
+            return None;
+        }
+        let per_row = fft::estimate_units(n);
+        let units = (rows as u64).saturating_mul(per_row).saturating_add(fft::plan_units(n));
+        let cost = self.pt_admit(usize::try_from(units).ok()?, in_len.saturating_add(out_len).saturating_add(fft::plan_elems(n)))?;
+        let mut plan = fft::Plan::new(n, if inverse { 1.0 } else { -1.0 })?;
+        let av = self.pt_read_all(va)?;
+        let mut out = zeroed(out_len)?;
+        if !fft::transform(&mut plan, &av, &mut out, rows, n_in, mode, scale, || self.native_kernel_interrupted()) {
+            return None;
+        }
+        self.pt_write(vo, 0, &out)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(op, nIn, nOut, ...inputs, ...outputs, ...dims)`: tensor.js's
+    /// `linalg`, a batch of dense factorizations (`linalg`). Inputs are
+    /// float32/float64 matrices, outputs float64 storages the runtime
+    /// sized; the results agree with torch_linalg.py's Python algorithms
+    /// (the fallback when this declines) to its documented tolerances.
+    fn pt_linalg(&mut self, a: &[Value]) -> Option<()> {
+        let op = int_arg(a, 0)?;
+        let (n_in, n_out) = (int_arg(a, 1)?, int_arg(a, 2)?);
+        if n_in == 0 || n_in > 2 || n_out > 5 {
+            return None;
+        }
+        let mut ins: Vec<View> = Vec::new();
+        for i in 0..n_in {
+            let v = self.pt_view(arg(a, 3 + i))?;
+            if !matches!(v.kind, KIND_F32 | KIND_F64) {
+                return None;
+            }
+            ins.push(v);
+        }
+        let mut outs: Vec<View> = Vec::new();
+        for i in 0..n_out {
+            let v = self.pt_view(arg(a, 3 + n_in + i))?;
+            if v.kind != KIND_F64 || ins.iter().any(|x| x.buffer == v.buffer) || outs.iter().any(|x| x.buffer == v.buffer) {
+                return None;
+            }
+            outs.push(v);
+        }
+        let dims_at = 3 + n_in + n_out;
+        let mut dims = [0usize; 5];
+        for (i, d) in dims.iter_mut().enumerate() {
+            if arg(a, dims_at + i).is_number() {
+                *d = int_arg(a, dims_at + i)?;
+            }
+        }
+        let batch = dims[0];
+        use linalg::Op;
+        // Each matrix's work-bound op and dims, and the input and output sizes.
+        let (bop, bm, bn, in_sizes, out_sizes): (Op, usize, usize, [usize; 2], [usize; 5]) = match op {
+            1 => {
+                let (m, n) = (dims[1], dims[2]);
+                let mn = m.checked_mul(n)?;
+                (Op::Lu, m, n, [mn, 0], [mn, m, m.min(n), 1, 1])
+            }
+            2 | 3 => {
+                let (n, k) = (dims[1], dims[2]);
+                let nk = n.checked_mul(k)?;
+                (Op::Solve, n, k, [n.checked_mul(n)?, nk], [nk, if op == 2 { 1 } else { 0 }, 0, 0, 0])
+            }
+            4 => {
+                let n = dims[1];
+                (Op::Cholesky, n, n, [n.checked_mul(n)?, 0], [n.checked_mul(n)?, 1, 0, 0, 0])
+            }
+            5 => {
+                let (m, n, qcols, rrows) = (dims[1], dims[2], dims[3], dims[4]);
+                (Op::Qr, m, n, [m.checked_mul(n)?, 0], [m.checked_mul(qcols)?, rrows.checked_mul(n)?, 0, 0, 0])
+            }
+            6 => {
+                let n = dims[1];
+                (Op::Eigh, n, n, [n.checked_mul(n)?, 0], [n, n.checked_mul(n)?, 0, 0, 0])
+            }
+            7 => {
+                let (m, n, full) = (dims[1], dims[2], dims[3] != 0);
+                let k = m.min(n);
+                let (uc, vr) = if full { (m, n) } else { (k, k) };
+                (Op::Svd, m, n, [m.checked_mul(n)?, 0], [m.checked_mul(uc)?, k, vr.checked_mul(n)?, 0, 0])
+            }
+            8 => {
+                let n = dims[1];
+                let nn = n.checked_mul(n)?;
+                (Op::Eig, n, n, [nn, 0], [n, n, nn, nn, 1])
+            }
+            _ => return None,
+        };
+        if ins.iter().enumerate().any(|(i, v)| batch.checked_mul(in_sizes[i]) != Some(v.len))
+            || outs.iter().enumerate().any(|(i, v)| batch.checked_mul(out_sizes[i]) != Some(v.len))
+        {
+            return None;
+        }
+        // The price: each matrix's work bound. An SVD's is its sweeps plus a
+        // basis completion only when a non-square full basis is asked for;
+        // a rank-deficient input that needs more stops and declines below.
+        let per = if op == 7 && !(dims[3] != 0 && bm != bn) {
+            let k = bm.min(bn) as u64;
+            let big = bm.max(bn) as u64;
+            (k * k / 2 + 1)
+                .saturating_mul(80)
+                .saturating_mul(big.saturating_mul(4).saturating_add(k * 2))
+                .saturating_add(big.saturating_pow(3).saturating_mul(4))
+                .saturating_add(64)
+        } else if op == 2 {
+            // The factorization, then the solve.
+            linalg::bound(Op::Lu, bm, bm).saturating_add(linalg::bound(bop, bm, bn))
+        } else {
+            linalg::bound(bop, bm, bn)
+        };
+        let units = per.saturating_mul(batch as u64);
+        let elems = ins.iter().chain(outs.iter()).fold(0usize, |x, v| x.saturating_add(v.len)).saturating_mul(3);
+        let cost = self.pt_admit(usize::try_from(units).ok()?, elems)?;
+        let inputs: Vec<Vec<f64>> = ins.iter().map(|&v| self.pt_read_all(v)).collect::<Option<_>>()?;
+        let mut results: Vec<Vec<f64>> = out_sizes[..n_out].iter().map(|&n| zeroed(batch.checked_mul(n)?)).collect::<Option<_>>()?;
+        let spent = {
+            let mut interrupted = || self.native_kernel_interrupted();
+            let mut b = linalg::Budget::new(&mut interrupted);
+            for t in 0..batch {
+                let x = &inputs[0][t * in_sizes[0]..(t + 1) * in_sizes[0]];
+                match op {
+                    1 => {
+                        let (m, n) = (dims[1], dims[2]);
+                        let k = m.min(n);
+                        let f = linalg::lu(x, m, n, &mut b)?;
+                        results[0][t * m * n..(t + 1) * m * n].copy_from_slice(&f.lu);
+                        for (i, &p) in f.perm.iter().enumerate() {
+                            results[1][t * m + i] = p as f64;
+                        }
+                        for (i, &p) in f.pivots.iter().enumerate() {
+                            results[2][t * k + i] = p as f64;
+                        }
+                        results[3][t] = f.sign;
+                        results[4][t] = f.info as f64;
+                    }
+                    2 => {
+                        let (n, k) = (dims[1], dims[2]);
+                        let rhs = &inputs[1][t * n * k..(t + 1) * n * k];
+                        let f = linalg::lu(x, n, n, &mut b)?;
+                        let sol = linalg::lu_solve(&f.lu, &f.perm, n, rhs, k, &mut b)?;
+                        results[0][t * n * k..(t + 1) * n * k].copy_from_slice(&sol);
+                        results[1][t] = f.info as f64;
+                    }
+                    3 => {
+                        let (n, k) = (dims[1], dims[2]);
+                        let rhs = &inputs[1][t * n * k..(t + 1) * n * k];
+                        let sol = linalg::tri_solve(x, n, rhs, k, dims[3] != 0, dims[4] != 0, &mut b)?;
+                        results[0][t * n * k..(t + 1) * n * k].copy_from_slice(&sol);
+                    }
+                    4 => {
+                        let n = dims[1];
+                        let (l, info) = linalg::cholesky(x, n, &mut b)?;
+                        results[0][t * n * n..(t + 1) * n * n].copy_from_slice(&l);
+                        results[1][t] = info as f64;
+                    }
+                    5 => {
+                        let (m, n, qcols, rrows) = (dims[1], dims[2], dims[3], dims[4]);
+                        let (w, taus) = linalg::householder(x, m, n, &mut b)?;
+                        for i in 0..rrows.min(m) {
+                            for j in i..n {
+                                results[1][t * rrows * n + i * n + j] = w[i * n + j];
+                            }
+                        }
+                        if qcols > 0 {
+                            let q = linalg::form_q(&w, &taus, m, n, qcols, &mut b)?;
+                            results[0][t * m * qcols..(t + 1) * m * qcols].copy_from_slice(&q);
+                        }
+                    }
+                    6 => {
+                        let n = dims[1];
+                        let lower = dims[2] != 0;
+                        // The symmetric matrix of the named triangle.
+                        let mut sym = zeroed(n * n)?;
+                        for i in 0..n {
+                            for j in 0..n {
+                                let from_lower = j <= i;
+                                let (r, c) = if from_lower == lower { (i, j) } else { (j, i) };
+                                sym[i * n + j] = x[r * n + c];
+                            }
+                        }
+                        let (w, v) = linalg::eigh(&sym, n, &mut b)?;
+                        results[0][t * n..(t + 1) * n].copy_from_slice(&w);
+                        results[1][t * n * n..(t + 1) * n * n].copy_from_slice(&v);
+                    }
+                    7 => {
+                        let (m, n, full) = (dims[1], dims[2], dims[3] != 0);
+                        let (u, sv, vh) = linalg::svd(x, m, n, full, &mut b)?;
+                        let (su, ss, sh) = (out_sizes[0], out_sizes[1], out_sizes[2]);
+                        if u.len() != su || sv.len() != ss || vh.len() != sh {
+                            return None;
+                        }
+                        results[0][t * su..(t + 1) * su].copy_from_slice(&u);
+                        results[1][t * ss..(t + 1) * ss].copy_from_slice(&sv);
+                        results[2][t * sh..(t + 1) * sh].copy_from_slice(&vh);
+                    }
+                    _ => {
+                        let n = dims[1];
+                        match linalg::eig(x, n, &mut b)? {
+                            Ok(e) => {
+                                results[0][t * n..(t + 1) * n].copy_from_slice(&e.wr);
+                                results[1][t * n..(t + 1) * n].copy_from_slice(&e.wi);
+                                results[2][t * n * n..(t + 1) * n * n].copy_from_slice(&e.vr);
+                                results[3][t * n * n..(t + 1) * n * n].copy_from_slice(&e.vi);
+                                results[4][t] = 1.0;
+                            }
+                            Err(()) => results[4][t] = 0.0,
+                        }
+                    }
+                }
+                if b.spent() > units {
+                    return None;
+                }
+            }
+            b.spent()
+        };
+        for (v, r) in outs.iter().zip(&results) {
+            self.pt_write(*v, 0, r)?;
+        }
+        // Charged for the work done, within the admitted price.
+        let done = STEPS_BASE.saturating_add(spent.saturating_mul(STEPS_PER_UNIT));
+        self.pt_charge(done.min(cost));
         Some(())
     }
 

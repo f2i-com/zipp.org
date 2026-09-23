@@ -328,6 +328,24 @@ for dt in ["float16", "bfloat16"]:
     both("half where mixed %s" % dt, lambda: _k.where(C, (6, 1, 7), A, (6, 5, 7), Fv, (5, 1)))
     both("half all_finite %s" % dt, lambda: _k.all_finite(A))
     both("half all_finite finite %s" % dt, lambda: _k.all_finite(_k.from_flat(dt, [i / 8.0 for i in range(100)])))
+# torch.fft's transforms (`vm::py_tensor::fft`): mode 0 complex -> complex,
+# 1 real -> onesided, 2 onesided -> real, 3 real -> all bins; lengths of
+# 2, 3 and 5, odd primes to 31 and Bluestein, inputs shorter and longer
+# than the transform, both directions, three scales.
+for dt in FLOATS:
+    for n in (1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 16, 30, 31, 37, 60, 64, 77, 97, 100, 128, 243, 1000, 1009):
+        for mode in (0, 1, 2, 3):
+            for inverse in (False, True):
+                base = n // 2 + 1 if mode == 2 else n
+                for n_in in (base, max(1, base - 3), base + 2):
+                    seed += 1
+                    rows = 3
+                    width = 1 if mode in (1, 3) else 2
+                    A = storage(dt, (rows * n_in * width,), seed)
+                    if width == 2:
+                        A = _k.as_complex(A)
+                    scale = (1.0, 1.0 / n, 1.0 / (n ** 0.5))[seed % 3]
+                    both("fft %s n%d mode%d inv%s in%d" % (dt, n, mode, inverse, n_in), lambda: _k.fft(A, rows, n_in, n, mode, inverse, scale))
 print("cases", CASES[0], "mismatches", len(BAD), BAD[:5])
 "#;
 
@@ -451,4 +469,31 @@ fn javascript_cannot_see_the_native_loops() {
     st.run_init().expect("runs");
     let got = st.call_global("probe", &[]).expect("calls");
     assert!(matches!(&got, JsValue::String(s) if s == "undefined,false,false"), "{got:?}");
+}
+
+/// A torch.fft transform or torch.linalg factorization run natively gives
+/// the same result as with the native loops off (the FFT's JavaScript loop
+/// byte for byte; the Python factorizations to their tolerance), is charged
+/// to the budget, and costs far fewer steps than the interpreted work.
+#[test]
+fn fft_and_linalg_kernels_are_charged_and_agree() {
+    let program = |native: bool| {
+        format!(
+            "import torch
+import _zipp_tensor as _k
+_k._native({})
+x = torch.tensor([((i * 7) % 13) / 13.0 - 0.4 for i in range(4 * 1000)], dtype=torch.float64).reshape(4, 1000)
+y = torch.fft.fft(x)
+print(_k.tobytes(y._s) == _k.tobytes(torch.fft.fft(x)._s), round(float(torch.view_as_real(y).abs().sum()), 6))
+a = x[:, :40].T @ x[:, :40] + torch.eye(40, dtype=torch.float64)
+print(round(float(torch.linalg.inv(a).sum()), 9), round(float(torch.linalg.eigvalsh(a).sum()), 9))
+",
+            if native { "True" } else { "False" }
+        )
+    };
+    let native = run(&program(true), 4_000_000_000, false);
+    let interpreted = run(&program(false), 4_000_000_000, false);
+    assert_eq!(native.output.clone().unwrap(), interpreted.output.clone().unwrap());
+    assert!(native.steps > 4 * 4 * 1000, "native run charged only {} steps", native.steps);
+    assert!(native.steps * 4 < interpreted.steps, "{} vs {}", native.steps, interpreted.steps);
 }

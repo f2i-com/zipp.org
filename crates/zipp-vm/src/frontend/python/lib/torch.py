@@ -1,5 +1,5 @@
 """A PyTorch-compatible tensor library for Zipp: contiguous float16/bfloat16/
-float32/float64, int8/int16/int32/int64, uint8 and bool tensors with broadcasting, reverse-mode autograd, and the modules,
+float32/float64, complex64/complex128, int8/int16/int32/int64, uint8 and bool tensors with broadcasting, reverse-mode autograd, and the modules,
 functional ops, optimizers and checkpoint format the bundled `torch.nn`,
 `torch.nn.functional`, `torch.optim` and `torch.autograd` provide.
 
@@ -18,7 +18,8 @@ _int, _float, _bool, _isinstance, _len, _range, _tuple, _list = _b.int, _b.float
 _issubclass = _b.issubclass
 
 
-_ITEMSIZE = {"float64": 8, "int64": 8, "float32": 4, "int32": 4, "float16": 2, "bfloat16": 2, "int16": 2}
+_ITEMSIZE = {"float64": 8, "int64": 8, "float32": 4, "int32": 4, "float16": 2, "bfloat16": 2, "int16": 2,
+             "complex64": 8, "complex128": 16, "complex32": 4}
 
 
 class dtype:
@@ -27,11 +28,21 @@ class dtype:
         self.is_floating_point = is_floating
         self.itemsize = _ITEMSIZE.get(name, 1)
         self.is_signed = name not in ("uint8", "bool")
-        self.is_complex = False
+        # complex64/complex128: interleaved (real, imaginary) pairs of
+        # float32/float64 (`_zipp_tensor`'s pair storages). Not floating
+        # point, as in PyTorch; `_inexact` is "floating or complex".
+        self.is_complex = name.startswith("complex")
+        self._inexact = is_floating or self.is_complex
         # float16/bfloat16: two bytes per element (a Float16Array, or the
         # upper float32 halves in a Uint16Array), every result rounded to
         # the format; arithmetic follows PyTorch's float `opmath`.
         self._reduced = name in ("float16", "bfloat16")
+
+    def to_real(self):
+        return _TO_REAL.get(self.name, self)
+
+    def to_complex(self):
+        return _TO_COMPLEX.get(self.name, self)
 
     def __repr__(self):
         return "torch." + self.name
@@ -57,10 +68,23 @@ float16 = dtype("float16", True)
 bfloat16 = dtype("bfloat16", True)
 int8 = dtype("int8", False)
 int16 = dtype("int16", False)
+complex64 = dtype("complex64", False)
+complex128 = dtype("complex128", False)
+# complex32 (ComplexHalf) is named, but no tensor of it can be made here.
+complex32 = dtype("complex32", False)
 half = float16
 short = int16
+cfloat = complex64
+cdouble = complex128
+chalf = complex32
 _DTYPES = {"float32": float32, "float64": float64, "int64": int64, "int32": int32, "uint8": uint8, "bool": _bool_dtype,
-           "float16": float16, "bfloat16": bfloat16, "int8": int8, "int16": int16}
+           "float16": float16, "bfloat16": bfloat16, "int8": int8, "int16": int16, "complex64": complex64, "complex128": complex128,
+           "complex32": complex32}
+_CPP_NAME = {"complex64": "c10::complex<float>", "complex128": "c10::complex<double>", "float32": "float", "float64": "double",
+             "float16": "c10::Half", "bfloat16": "c10::BFloat16", "int64": "int64_t", "int32": "int", "int16": "int16_t", "int8": "int8_t",
+             "uint8": "uint8_t", "bool": "bool"}
+_TO_REAL = {"complex64": float32, "complex128": float64, "complex32": float16}
+_TO_COMPLEX = {"float32": complex64, "float64": complex128, "float16": complex32}
 _default_dtype = float32
 
 
@@ -536,9 +560,11 @@ def _frozen(t, s):
 # which outranks a Python scalar's (int -> int64, float -> the default dtype).
 # Not a total order: uint8 with int8 promotes to int16 and float16 with
 # bfloat16 to float32 (the pairs of equal rank).
-_RANK = {"bool": 0, "uint8": 1, "int8": 1, "int16": 2, "int32": 3, "int64": 4, "float16": 5, "bfloat16": 5, "float32": 6, "float64": 7}
+_RANK = {"bool": 0, "uint8": 1, "int8": 1, "int16": 2, "int32": 3, "int64": 4, "float16": 5, "bfloat16": 5, "float32": 6, "float64": 7,
+         "complex32": 8, "complex64": 9, "complex128": 10}
 _CAST_NAME = {"float32": "Float", "float64": "Double", "int64": "Long", "int32": "Int", "bool": "Bool", "uint8": "Byte",
-              "float16": "Half", "bfloat16": "BFloat16", "int8": "Char", "int16": "Short"}
+              "float16": "Half", "bfloat16": "BFloat16", "int8": "Char", "int16": "Short", "complex64": "ComplexFloat",
+              "complex128": "ComplexDouble", "complex32": "ComplexHalf"}
 
 
 def _promote_types(x, y):
@@ -547,6 +573,12 @@ def _promote_types(x, y):
     if y is None or x is y:
         return x
     rx, ry = _RANK[x.name], _RANK[y.name]
+    if rx >= 8 or ry >= 8:
+        # A complex dtype wins, wide enough for the other's real values
+        # (complex64 with float64 is complex128).
+        if x is complex128 or y is complex128 or x is float64 or y is float64:
+            return complex128
+        return complex64
     if rx == ry:
         return int16 if rx == 1 else float32
     return x if rx > ry else y
@@ -560,6 +592,12 @@ def _combine_categories(higher, lower):
         return lower
     if lower is None:
         return higher
+    if higher.is_complex:
+        return higher
+    if lower.is_complex:
+        # A higher-priority floating dtype keeps its precision, made complex
+        # (c10's combine_categories).
+        return _TO_COMPLEX.get(higher.name, complex64) if higher.is_floating_point else lower
     if higher.is_floating_point:
         return higher
     if higher is _bool_dtype or lower.is_floating_point:
@@ -574,6 +612,8 @@ def _scalar_dtype(v):
         return int64
     if _isinstance(v, _float):
         return _default_dtype
+    if _cx_parts(v) is not None:
+        return _default_complex()
     raise TypeError("unsupported operand type for a tensor operation: '%s'" % type(v).__name__)
 
 
@@ -598,7 +638,8 @@ def can_cast(from_, to):
     return _CATEGORY[from_.name] <= _CATEGORY[to.name]
 
 
-_CATEGORY = {"bool": 0, "uint8": 1, "int8": 1, "int16": 1, "int32": 1, "int64": 1, "float16": 2, "bfloat16": 2, "float32": 2, "float64": 2}
+_CATEGORY = {"bool": 0, "uint8": 1, "int8": 1, "int16": 1, "int32": 1, "int64": 1, "float16": 2, "bfloat16": 2, "float32": 2, "float64": 2,
+             "complex32": 3, "complex64": 3, "complex128": 3}
 
 
 def _cast_0d(t_, dt):
@@ -634,7 +675,7 @@ def _operands(a, b, opmath=False):
             # `_scalar_result` and `_as_tensor` for a plain float or int
             # (while torch.compile records, `_as_tensor` is watched: below).
             dt = a.dtype
-            if not dt.is_floating_point:
+            if not dt._inexact:
                 dt = _default_dtype if tb is _float else (int64 if dt is _bool_dtype else dt)
             if opmath and dt._reduced:
                 return a, Tensor(_k.full("float32", 1, b), _SCALAR_SHAPE, float32), dt
@@ -645,7 +686,7 @@ def _operands(a, b, opmath=False):
         ta = type(a)
         if (ta is _float or ta is _int) and not _graph_recording:
             dt = b.dtype
-            if not dt.is_floating_point:
+            if not dt._inexact:
                 dt = _default_dtype if ta is _float else (int64 if dt is _bool_dtype else dt)
             return Tensor(_k.full(dt.name, 1, a), _SCALAR_SHAPE, dt), b, dt
         dt = _scalar_result(b.dtype, a)
@@ -654,7 +695,7 @@ def _operands(a, b, opmath=False):
 
 
 def _scalar_result(dt, v):
-    if dt.is_floating_point or _isinstance(v, _b.bool):
+    if dt.is_complex or ((dt.is_floating_point or _isinstance(v, _b.bool)) and _cx_parts(v) is None):
         return dt
     if _isinstance(v, _int):
         return int64 if dt is _bool_dtype else dt
@@ -662,7 +703,35 @@ def _scalar_result(dt, v):
         return _default_dtype
     if _isinstance(v, (_list, _tuple)):
         return _result_type(Tensor(_k.zeros(dt.name, 1), (1,), dt), tensor(v))
+    if _cx_parts(v) is not None:
+        return _combine_categories(dt, _default_complex())
     return _scalar_dtype(v)
+
+
+def _lazy(v):
+    """Whether v is an uninitialized (Lazy) parameter or buffer; a plain
+    Tensor answers from its class alone."""
+    return v.__class__ is not Tensor and getattr(v, "_uninitialized", False)
+
+
+def _lazy_error(v, name):
+    # What PyTorch's __torch_function__ raises for one (its message names
+    # the builtin, here without the object's address).
+    raise ValueError("Attempted to use an uninitialized parameter in <built-in method %s of type object>. This error happens when you are using a `LazyModule` or explicitly manipulating `torch.nn.parameter.%s` objects. When using LazyModules Call `forward` with a dummy batch to initialize the parameters before calling torch functions" % (name, type(v).__name__))
+
+
+def _check_lazy(name, *values):
+    for v in values:
+        if _isinstance(v, Tensor) and _lazy(v):
+            _lazy_error(v, name)
+
+
+def _lazy_reraise(e, name, *values):
+    """A RuntimeError from reading an operand's shape: PyTorch's ValueError
+    when the operand is an uninitialized parameter (its `.shape` raised),
+    the error itself otherwise. The hot paths only pay for a `try`."""
+    _check_lazy(name, *values)
+    raise e
 
 
 def _needs_grad(*tensors):
@@ -805,6 +874,70 @@ class Tensor:
     def is_floating_point(self):
         return self.dtype.is_floating_point
 
+    # -- complex parts. `real`/`imag` are copies (writes go through their
+    # setters, `view_as_real` or indexing), not the views PyTorch returns.
+    @property
+    def real(self):
+        return real(self)
+
+    @real.setter
+    def real(self, value):
+        if not self.dtype.is_complex:
+            self.copy_(value)
+            return
+        view_as_real(self)[..., 0] = value
+
+    @property
+    def imag(self):
+        return imag(self)
+
+    @imag.setter
+    def imag(self, value):
+        if not self.dtype.is_complex:
+            raise RuntimeError("imag is not implemented for tensors with non-complex dtypes.")
+        view_as_real(self)[..., 1] = value
+
+    def conj(self):
+        return conj(self)
+
+    def conj_physical(self):
+        return conj_physical(self)
+
+    def conj_physical_(self):
+        return self._inplace_op(conj_physical)
+
+    def resolve_conj(self):
+        return self
+
+    def resolve_neg(self):
+        return self
+
+    def is_conj(self):
+        return False
+
+    def is_neg(self):
+        return False
+
+    def angle(self):
+        return angle(self)
+
+    def cfloat(self):
+        return self.to(complex64)
+
+    def cdouble(self):
+        return self.to(complex128)
+
+    def adjoint(self):
+        return adjoint(self)
+
+    @property
+    def H(self):
+        return adjoint(self) if _len(self.shape) == 2 else conj(self)
+
+    @property
+    def mH(self):
+        return adjoint(self)
+
     def is_contiguous(self):
         return True
 
@@ -853,10 +986,13 @@ class Tensor:
     def item(self):
         if _numel(self.shape) != 1:
             raise RuntimeError("a Tensor with %d elements cannot be converted to Scalar" % _numel(self.shape))
+        if self.dtype.is_complex:
+            re, im = _k.to_list(_k.as_real(self._s))
+            return _cx_scalar(re, im)
         return _k.item(self._s, 0)
 
     def tolist(self):
-        flat = _k.to_list(self._s)
+        flat = _cx_scalars(self._s) if self.dtype.is_complex else _k.to_list(self._s)
         if _len(self.shape) == 0:
             return flat[0]
 
@@ -868,19 +1004,26 @@ class Tensor:
         return build(0, _list(self.shape))
 
     def __float__(self):
+        if self.dtype.is_complex:
+            raise TypeError("can't convert complex to float")
         return _float(self.item())
 
     def __int__(self):
+        if self.dtype.is_complex:
+            raise TypeError("can't convert complex to int")
         return _int(self.item())
 
     def __bool__(self):
         n = _numel(self.shape)
         if n != 1:
             raise RuntimeError("Boolean value of Tensor with more than one value is ambiguous" if n > 1 else "Boolean value of Tensor with no values is ambiguous")
+        if self.dtype.is_complex:
+            re, im = _k.to_list(_k.as_real(self._s))
+            return re != 0 or im != 0
         return _bool(self.item())
 
     def __index__(self):
-        if self.dtype.is_floating_point or _numel(self.shape) != 1:
+        if self.dtype._inexact or _numel(self.shape) != 1:
             raise TypeError("only integer tensors of a single element can be converted to an index")
         return _int(self.item())
 
@@ -895,7 +1038,7 @@ class Tensor:
     def __format__(self, spec):
         # As PyTorch: a 0-d tensor formats its value; any other tensor only
         # takes an empty format spec.
-        if not self.shape:
+        if not self.shape and not self.dtype.is_complex:
             return format(self.item(), spec)
         if spec:
             raise TypeError("unsupported format string passed to Tensor.__format__")
@@ -1193,7 +1336,7 @@ class Tensor:
         return self._overwrite(rand(*self.shape, generator=generator, dtype=self.dtype if self.dtype.is_floating_point else None) * (b - a) + a)
 
     def normal_(self, mean=0.0, std=1.0, generator=None):
-        return self._overwrite(randn(*self.shape, generator=generator, dtype=self.dtype if self.dtype.is_floating_point else None) * std + mean)
+        return self._overwrite(randn(*self.shape, generator=generator, dtype=self.dtype if self.dtype._inexact else None) * std + mean)
 
     def bernoulli_(self, p=0.5, generator=None):
         probs = p if _isinstance(p, Tensor) else full(self.shape, _float(p), dtype=float64)
@@ -1505,7 +1648,7 @@ class Tensor:
         return sign(self)
 
     def sgn(self):
-        return sign(self)
+        return sgn(self)
 
     def signbit(self):
         return signbit(self)
@@ -1543,7 +1686,7 @@ class Tensor:
         return isneginf(self)
 
     def isreal(self):
-        return ones_like(self, dtype=_bool_dtype)
+        return isreal(self)
 
     def nan_to_num(self, nan=0.0, posinf=None, neginf=None):
         return nan_to_num(self, nan, posinf, neginf)
@@ -2076,7 +2219,7 @@ class Tensor:
         return _bool(self)
 
     def is_complex(self):
-        return False
+        return self.dtype.is_complex
 
     def is_signed(self):
         return self.dtype not in (uint8, _bool_dtype)
@@ -2209,6 +2352,23 @@ class _Formatter:
         return " " * (self.max_width - _len(out)) + out
 
 
+class _ComplexFormatter:
+    """PyTorch's complex layout: the real and imaginary parts each through
+    their own formatter, joined as `re+imj`."""
+
+    def __init__(self, re, im):
+        self.re = re
+        self.im = im
+        self.max_width = re.max_width + im.max_width + 1
+
+    def format(self, v):
+        real_str = self.re.format(v[0])
+        imag_str = (self.im.format(v[1]) + "j").lstrip()
+        if imag_str[0] == "+" or imag_str[0] == "-":
+            return real_str + imag_str
+        return real_str + "+" + imag_str
+
+
 def _nested(flat, shape, offset):
     """The nested lists of `shape` elements starting at `flat[offset]`."""
     if _len(shape) == 1:
@@ -2269,7 +2429,7 @@ def _repr(t):
     suffixes = []
     rank = _len(t.shape)
     n = _numel(t.shape)
-    default = t.dtype in (_default_dtype, int64, _bool_dtype)
+    default = t.dtype in (_default_dtype, int64, _bool_dtype) or t.dtype is _default_complex()
     if n == 0:
         if rank != 1:
             suffixes.append("size=" + str(_tuple(t.shape)))
@@ -2279,11 +2439,20 @@ def _repr(t):
     else:
         if not default:
             suffixes.append("dtype=" + repr(t.dtype))
-        flat = _k.to_list(t._s)
+        if t.dtype.is_complex:
+            parts = _k.to_list(_k.as_real(t._s))
+            flat = [(parts[i], parts[i + 1]) for i in _range(0, _len(parts), 2)]
+        else:
+            flat = _k.to_list(t._s)
         rows = flat[0] if rank == 0 else _nested(flat, _list(t.shape), 0)
         summarize = n > _PRINT.threshold
         shown = _summarized(rows, rank, _PRINT.edgeitems) if summarize else rows
-        fmt = _Formatter(_leaves(shown, rank, []), t.dtype)
+        if t.dtype.is_complex:
+            leaves = _leaves(shown, rank, [])
+            rdt = t.dtype.to_real()
+            fmt = _ComplexFormatter(_Formatter([v[0] for v in leaves], rdt), _Formatter([v[1] for v in leaves], rdt))
+        else:
+            fmt = _Formatter(_leaves(shown, rank, []), t.dtype)
         body = _tensor_body(rows, rank, indent, summarize, fmt)
     if t._node is not None:
         suffixes.append("grad_fn=<%s>" % _grad_fn_name(t._node.name))
@@ -2306,7 +2475,7 @@ def _repr(t):
 def _flatten_data(data):
     """Nested lists/tuples (or scalars) to a flat list and a shape."""
     if _isinstance(data, Tensor):
-        return _k.to_list(data._s), _tuple(data.shape), data.dtype
+        return (_cx_scalars(data._s) if data.dtype.is_complex else _k.to_list(data._s)), _tuple(data.shape), data.dtype
     if _isinstance(data, (_list, _tuple)):
         if _len(data) == 0:
             return [], (0,), None
@@ -2349,6 +2518,7 @@ def _infer_dtype(flat, hint):
         # `torch.tensor([])` takes the default floating dtype.
         return _default_dtype
     has_float = False
+    has_complex = False
     all_bool = _len(flat) > 0
     for v in flat:
         if _isinstance(v, _b.bool):
@@ -2356,15 +2526,23 @@ def _infer_dtype(flat, hint):
         all_bool = False
         if _isinstance(v, _float):
             has_float = True
+        elif _cx_parts(v) is not None:
+            has_complex = True
         elif not _isinstance(v, _int):
             raise TypeError("Could not infer dtype of %s" % type(v).__name__)
     if all_bool:
         return _bool_dtype
+    if has_complex:
+        return _default_complex()
     return _default_dtype if has_float else int64
 
 
 def tensor(data, dtype=None, device=None, requires_grad=False, pin_memory=False):
     _check_cpu_device(device)
+    if _isinstance(data, Tensor) and data.dtype.is_complex:
+        # A complex tensor's copy (its elements have no Python form yet).
+        dt = data.dtype if dtype is None else _dtype_of(dtype)
+        return Tensor(_k.astype(data._s, dt.name), data.shape, dt, requires_grad)
     flat, shape, hint = _flatten_data(data)
     if _isinstance(data, Tensor) and dtype is None:
         dt = data.dtype
@@ -2372,6 +2550,8 @@ def tensor(data, dtype=None, device=None, requires_grad=False, pin_memory=False)
         dt = _dtype_of(dtype) or _infer_dtype(flat, hint)
     if dt.name in _NARROW_INT and not _isinstance(data, Tensor):
         _check_narrow(dt, flat, "")
+    if dt.is_complex:
+        return Tensor(_cx_from_values(dt, flat), shape, dt, requires_grad)
     flat = [_float(v) if dt.is_floating_point else (_int(v) if dt is not _bool_dtype else (1 if v else 0)) for v in flat]
     return Tensor(_k.from_flat(dt.name, flat), shape, dt, requires_grad)
 
@@ -2408,7 +2588,7 @@ def _as_tensor(v, like=None, dtype=None):
         return v
     if dtype is not None and _isinstance(v, (_int, _float, _b.bool)):
         return Tensor(_k.full(dtype.name, 1, v), _SCALAR_SHAPE, dtype)
-    if like is not None and like.dtype.is_floating_point and _isinstance(v, (_int, _float, _b.bool)):
+    if like is not None and like.dtype._inexact and _isinstance(v, (_int, _float, _b.bool)):
         return Tensor(_k.full(like.dtype.name, 1, _float(v)), _SCALAR_SHAPE, like.dtype)
     return tensor(v)
 
@@ -2615,6 +2795,8 @@ def logspace(start, end, steps, base=10.0, dtype=None, layout=None, device=None,
 def eye(n, m=None, dtype=None, layout=None, device=None, requires_grad=False):
     m = n if m is None else m
     dt = _dtype_of(dtype) or _default_dtype
+    if dt.is_complex:
+        return eye(n, m, dtype=dt.to_real()).to(dt).requires_grad_(requires_grad)
     out = zeros(n, m, dtype=dt)
     for i in _range(_b.min(n, m)):
         _k.setitem(out._s, i * m + i, 1)
@@ -2641,6 +2823,9 @@ class finfo:
 
     def __init__(self, type=None):
         dt = _default_dtype if type is None else _dtype_of(type)
+        if dt.is_complex:
+            # A complex dtype's parts: finfo of its real dtype.
+            dt = dt.to_real()
         if not dt.is_floating_point:
             raise TypeError("torch.finfo() requires a floating point input type. Use torch.iinfo to handle 'torch.finfo'")
         self.bits, self.eps, self.max, self.tiny, self.smallest_subnormal, self.resolution, self.precision = self._INFO[dt.name]
@@ -2658,7 +2843,7 @@ class iinfo:
 
     def __init__(self, type):
         dt = _dtype_of(type)
-        if dt.is_floating_point:
+        if dt._inexact:
             raise TypeError("torch.iinfo() requires an integer input type. Use torch.finfo to handle 'torch.float'")
         self.bits, self.min, self.max = self._INFO[dt.name]
         self.dtype = dt.name
@@ -2759,6 +2944,9 @@ def rand(*size, generator=None, dtype=None, layout=None, device=None, requires_g
     _check_cpu_device(device)
     shape = _shape_args(size)
     dt = _dtype_of(dtype) or _default_dtype
+    if dt.is_complex:
+        # Uniform real and imaginary parts, drawn as 2n reals.
+        return Tensor(_k.as_complex(rand(_numel(shape) * 2, generator=generator, dtype=dt.to_real())._s), shape, dt, requires_grad)
     storage = _k.rand(_gen(generator), _numel(shape), dt.name) if dt is float32 or dt._reduced else _k.rand_double(_gen(generator), _numel(shape))
     return Tensor(storage, shape, dt, requires_grad)
 
@@ -2767,6 +2955,12 @@ def randn(*size, generator=None, dtype=None, layout=None, device=None, requires_
     _check_cpu_device(device)
     shape = _shape_args(size)
     dt = _dtype_of(dtype) or _default_dtype
+    if dt.is_complex:
+        # Real and imaginary parts each N(0, 1/2), as PyTorch's complex
+        # normal: 2n standard normals scaled by sqrt(1/2).
+        rdt = dt.to_real()
+        parts = _k.binary_scalar("mul", _k.randn(_gen(generator), _numel(shape) * 2, rdt.name), (_numel(shape) * 2,), 0.7071067811865476, rdt.name, rdt.name, False)[0]
+        return Tensor(_k.as_complex(parts), shape, dt, requires_grad)
     return Tensor(_k.randn(_gen(generator), _numel(shape), dt.name), shape, dt, requires_grad)
 
 
@@ -2832,18 +3026,22 @@ def normal(mean=0.0, std=1.0, size=None, generator=None, dtype=None, layout=None
 
 
 def poisson(input, generator=None):
-    # Knuth's method per element (small rates), on the generator's stream.
-    lam = _k.to_list(input._s)
-    out = []
-    for l in lam:
-        limit, k, p = _math.exp(-l), 0, 1.0
-        while True:
-            p *= _k.item(_k.rand_double(_gen(generator), 1), 0)
-            if p <= limit:
-                break
-            k += 1
-        out.append(k)
-    return Tensor(_k.from_flat(input.dtype.name, out), input.shape, input.dtype)
+    """Poisson draws with torch.distributions.Poisson's sampler (inversion
+    below rate 10, Hormann's PTRS above it, so any rate is cheap) on the
+    generator's stream; no gradient, as in PyTorch."""
+    import torch.distributions as dist
+    # Reading the generator through `_gen` first lets a prepared
+    # torch.compile step see (and refuse) a draw it would replay.
+    _gen(generator)
+    if generator is None or generator is default_generator:
+        return dist._poisson_sample(input)
+    # The sampler draws from the default generator: lend it this one's state.
+    saved = default_generator._g
+    default_generator._g = generator._g
+    try:
+        return dist._poisson_sample(input)
+    finally:
+        default_generator._g = saved
 
 
 class _RandomModule:
@@ -2888,18 +3086,26 @@ def _binary_nograd(op, a, b):
             # `_operands`' plain-number case, the number going to the kernel
             # as it is (`binary_scalar` stores it as `full` would).
             dt = a.dtype
-            if not dt.is_floating_point:
+            if not dt._inexact:
                 dt = _default_dtype if cb is _float else (int64 if dt is _bool_dtype else dt)
             storage, shape = _k.binary_scalar(op, a._s, a.shape, b, dt.name, dt.name, False)
             return _new3(storage, shape, _DTYPES[_k.dtype(storage)])
-    ta, tb, dt = _operands(a, b)
+    try:
+        ta, tb, dt = _operands(a, b)
+        ta.shape, tb.shape
+    except RuntimeError as e:
+        _lazy_reraise(e, op, a, b)
     storage, shape = _k.binary(op, ta._s, ta.shape, tb._s, tb.shape, None if dt is None else dt.name)
     return _new3(storage, shape, _DTYPES[_k.dtype(storage)])
 
 
 def _unary_nograd(op, a, p1=None, p2=None):
     storage = _k.unary(op, a._s, p1, p2)
-    return Tensor(storage, a.shape, _DTYPES[_k.dtype(storage)])
+    try:
+        shape = a.shape
+    except RuntimeError as e:
+        _lazy_reraise(e, op, a)
+    return Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
 
 
 _NOSAVE = ("", "")
@@ -2921,7 +3127,7 @@ def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=Fals
         # `_operands`' plain-number case: the number becomes a 0-d tensor of
         # the result dtype (float32 for a float16/bfloat16 `opmath` op).
         dt = a.dtype
-        if not dt.is_floating_point:
+        if not dt._inexact:
             dt = _default_dtype if cb is _float else (int64 if dt is _bool_dtype else dt)
         sdt = float32 if opmath and dt._reduced else dt
         if want is not None:
@@ -2933,7 +3139,7 @@ def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=Fals
         ta, tb = a, _scalar_operand(b, sdt)
     elif cb is Tensor and (ca is _float or ca is _int) and not _graph_recording:
         dt = b.dtype
-        if not dt.is_floating_point:
+        if not dt._inexact:
             dt = _default_dtype if ca is _float else (int64 if dt is _bool_dtype else dt)
         sdt = dt
         if want is not None:
@@ -2943,7 +3149,12 @@ def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=Fals
             return _new3(storage, shape, dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)])
         ta, tb = _scalar_operand(a, sdt), b
     else:
-        ta, tb, dt = _operands(a, b, opmath)
+        try:
+            ta, tb, dt = _operands(a, b, opmath)
+            # (an uninitialized parameter's shape raises here, not below)
+            ta.shape, tb.shape
+        except RuntimeError as e:
+            _lazy_reraise(e, name.lower(), a, b)
         if want is not None:
             dt = want
     if dt is None:
@@ -2958,6 +3169,8 @@ def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=Fals
     ra = ta.requires_grad
     rb = tb.requires_grad
     if _grad_enabled and (ra or rb):
+        if not rdt.is_floating_point and rdt.is_complex:
+            backward = _COMPLEX_BACKWARD.get(backward, backward)
         out.requires_grad = True
         need = (saves[0] if ra else "") + (saves[1] if rb else "")
         saved = None
@@ -2992,12 +3205,32 @@ def _sub_backward(g, x, y, o):
     return (_unbroadcast(g, x.shape), _unbroadcast(neg(g), y.shape))
 
 
+def _cj(t):
+    """conj(t) for a complex tensor, t itself otherwise: a complex op's
+    gradient is the upstream gradient times the conjugate derivative
+    (PyTorch's convention for a real loss)."""
+    return conj(t) if t.dtype.is_complex else t
+
+
 def _mul_backward(g, x, y, o):
     return (_unbroadcast(mul(g, y), x.shape) if x.requires_grad else None, _unbroadcast(mul(g, x), y.shape) if y.requires_grad else None)
 
 
 def _div_backward(g, x, y, o):
     return (_unbroadcast(div(g, y), x.shape) if x.requires_grad else None, _unbroadcast(neg(mul(g, div(o, y))), y.shape) if y.requires_grad else None)
+
+
+def _mul_backward_c(g, x, y, o):
+    return (_unbroadcast(mul(g, _cj(y)), x.shape) if x.requires_grad else None, _unbroadcast(mul(g, _cj(x)), y.shape) if y.requires_grad else None)
+
+
+def _div_backward_c(g, x, y, o):
+    return (_unbroadcast(div(g, _cj(y)), x.shape) if x.requires_grad else None, _unbroadcast(neg(mul(g, _cj(div(o, y)))), y.shape) if y.requires_grad else None)
+
+
+# The backward a binary op with a complex result takes instead (the
+# conjugate derivative); `_binary` swaps it in when it records one.
+_COMPLEX_BACKWARD = {_mul_backward: _mul_backward_c, _div_backward: _div_backward_c}
 
 
 def _scaled(b, alpha):
@@ -3066,12 +3299,12 @@ def _float_result(a, b):
         # A floating tensor with a Python number or a tensor of its own
         # dtype: `_result_type` gives that dtype.
         dt = a.dtype
-        if dt.is_floating_point:
+        if dt._inexact:
             tb = type(b)
             if tb is _float or tb is _int or (tb is Tensor and b.dtype is dt):
                 return dt
     dt = _result_type(a, b)
-    return dt if dt.is_floating_point else _default_dtype
+    return dt if dt._inexact else _default_dtype
 
 
 def div(input, other, rounding_mode=None):
@@ -3119,6 +3352,14 @@ def fmod(input, other):
 
 def _pow_backward(g, x, y, o):
     gx = gy = None
+    if x.dtype.is_complex or y.dtype.is_complex:
+        # d/dx x**y = y x**(y-1), d/dy = x**y log x (conjugated); x**0
+        # contributes nothing to x, 0**y (y != 0) nothing to y.
+        if x.requires_grad:
+            gx = _unbroadcast(mul(g, _cj(where(y == 0, zeros_like(o), mul(y, pow(x, sub(y, 1)))))), x.shape)
+        if y.requires_grad:
+            gy = _unbroadcast(mul(g, _cj(where(x == 0, zeros_like(o), mul(o, log(x))))), y.shape)
+        return (gx, gy)
     if x.requires_grad:
         gx = _unbroadcast(where(y == 0, 0.0, mul(g, mul(y, pow(x, sub(y, 1))))), x.shape)
     if y.requires_grad:
@@ -3131,14 +3372,14 @@ def pow(input, exponent):
     if _graph_recording and getattr(a, "_zipp_graph", False):
         return a ** b
     if _isinstance(a, Tensor) and not _isinstance(b, Tensor):
-        if not a.dtype.is_floating_point and _isinstance(b, _int) and not _isinstance(b, _b.bool) and b < 0:
+        if not a.dtype._inexact and _isinstance(b, _int) and not _isinstance(b, _b.bool) and b < 0:
             raise RuntimeError("Integers to negative integer powers are not allowed.")
         e = b
 
         def backward(g, x, y, o):
             if e == 0:
                 return (zeros_like(x, dtype=g.dtype), None)
-            return (mul(g, mul(pow(x, e - 1), e)), None)
+            return (mul(g, _cj(mul(pow(x, e - 1), e))), None)
         return _binary("pow", a, b, "Pow", backward, ("x", ""))
     return _binary("pow", a, b, "Pow", _pow_backward, ("xy", "xyo"))
 
@@ -3215,9 +3456,19 @@ _BOOL_UNARY = frozenset(["isfinite", "isnan", "not", "isinf", "isposinf", "isneg
 
 def _unary(op, a, name, backward, p1=None, p2=None, saves="x"):
     """An elementwise unary op; `saves` as in `_binary` ("x" input, "o" output)."""
-    storage = _k.unary(op, a._s, p1, p2)
     dt = a.dtype
-    out = _new3(storage, a.shape, dt if dt.is_floating_point and op not in _BOOL_UNARY else _DTYPES[_k.dtype(storage)])
+    if dt.is_floating_point:
+        storage = _k.unary(op, a._s, p1, p2)
+        try:
+            shape = a.shape
+        except RuntimeError as e:
+            _lazy_reraise(e, name.lower(), a)
+        out = _new3(storage, shape, dt if op not in _BOOL_UNARY else _DTYPES[_k.dtype(storage)])
+    elif dt.is_complex:
+        return _cx_unary(op, a, name)
+    else:
+        storage = _k.unary(op, a._s, p1, p2)
+        out = _new3(storage, a.shape, _DTYPES[_k.dtype(storage)])
     if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         sa = a._s
@@ -3543,6 +3794,8 @@ def square(input):
 def abs(input):
     if _graph_recording and getattr(input, "_zipp_graph", False):
         return input.abs()
+    if input.dtype.is_complex:
+        return _cx_abs(input)
     return _unary("abs", input, "Abs", lambda g, x, o: mul(g, _unary_nograd("sign", x)))
 
 
@@ -3552,7 +3805,7 @@ absolute = abs
 def _zero_grad_unary(op, name):
     def f(input):
         a = input
-        if not a.dtype.is_floating_point and op in ("floor", "ceil", "round", "trunc"):
+        if not a.dtype._inexact and op in ("floor", "ceil", "round", "trunc"):
             # Integer values round to themselves.
             return Tensor(_k.copy(a._s), a.shape, a.dtype)
         return _unary(op, a, name, lambda g, x, o: zeros_like(g), saves="")
@@ -3564,8 +3817,18 @@ floor = _zero_grad_unary("floor", "Floor")
 ceil = _zero_grad_unary("ceil", "Ceil")
 trunc = _zero_grad_unary("trunc", "Trunc")
 fix = trunc
-sign = _zero_grad_unary("sign", "Sign")
-sgn = sign
+_sign_real = _zero_grad_unary("sign", "Sign")
+
+
+def sign(input):
+    if input.dtype.is_complex:
+        raise NotImplementedError("Unlike NumPy, torch.sign is not intended to support complex numbers. Please use torch.sgn instead.")
+    return _sign_real(input)
+
+
+def sgn(input):
+    return _cx_sgn(input) if input.dtype.is_complex else _sign_real(input)
+
 _round_half_even = _zero_grad_unary("round", "Round")
 
 
@@ -3721,6 +3984,8 @@ def isneginf(input):
 
 
 def isreal(input):
+    if input.dtype.is_complex:
+        return eq(imag(input), 0)
     return ones_like(input, dtype=_bool_dtype)
 
 
@@ -3794,11 +4059,23 @@ def where(condition, input=None, other=None):
 
 
 def _cast(a, dt):
+    if a.dtype.is_complex and not dt.is_complex and dt is not _bool_dtype:
+        _warn_complex_cast()
     out = Tensor(_k.astype(a._s, dt.name), a.shape, dt)
-    if _grad_enabled and a.requires_grad and dt.is_floating_point and a.dtype.is_floating_point:
+    if _grad_enabled and a.requires_grad and dt._inexact and a.dtype._inexact:
         out.requires_grad = True
-        out._node = _Node(lambda g: (g.to(a.dtype),), (a,), "ToCopy")
+        out._node = _Node(lambda g: (_grad_as(g, a.dtype),), (a,), "ToCopy")
     return out
+
+
+def _grad_as(g, dt):
+    """A gradient converted to its input's dtype: a real input of a complex
+    result takes the real part (PyTorch's handle_r_to_c)."""
+    if g.dtype.is_complex and not dt.is_complex:
+        g = real(g)
+        if g.dtype is dt:
+            return g
+    return _cast(g, dt)
 
 
 def _replaced(src, values):
@@ -3900,11 +4177,14 @@ def sum(input, dim=None, keepdim=False, dtype=None):
         return a.sum(dim, keepdim, dtype)
     if dtype is not None:
         a = a.to(dtype)
-    elif not a.dtype.is_floating_point and a.dtype is not int64:
+    elif not a.dtype._inexact and a.dtype is not int64:
         # `(pred == target).sum()` counts; a uint8 sum does not wrap.
         a = a.to(int64)
-    dims = None if dim is None else _dims_arg(_all_if_empty(dim), _len(a.shape))
-    storage, shape = _k.reduce("sum", a._s, a.shape, dims, keepdim, True)
+    try:
+        dims = None if dim is None else _dims_arg(_all_if_empty(dim), _len(a.shape))
+        storage, shape = _k.reduce("sum", a._s, a.shape, dims, keepdim, True)
+    except RuntimeError as e:
+        _lazy_reraise(e, "sum", a)
     out = _new3(storage, shape, a.dtype)
     if _grad_enabled and a.requires_grad:
         out.requires_grad = True
@@ -3925,10 +4205,13 @@ def mean(input, dim=None, keepdim=False, dtype=None):
         return a.mean(dim, keepdim, dtype)
     if dtype is not None:
         a = a.to(dtype)
-    if not a.dtype.is_floating_point:
+    if not a.dtype._inexact:
         raise RuntimeError("mean(): could not infer output dtype. Input dtype must be either a floating point or complex dtype. Got: %s" % _CAST_NAME[a.dtype.name])
-    dims = None if dim is None else _dims_arg(_all_if_empty(dim), _len(a.shape))
-    storage, shape = _k.reduce("mean", a._s, a.shape, dims, keepdim, True)
+    try:
+        dims = None if dim is None else _dims_arg(_all_if_empty(dim), _len(a.shape))
+        storage, shape = _k.reduce("mean", a._s, a.shape, dims, keepdim, True)
+    except RuntimeError as e:
+        _lazy_reraise(e, "mean", a)
     out = _new3(storage, shape, a.dtype)
     if _grad_enabled and a.requires_grad:
         count = _numel(a.shape) / _b.max(1, _numel(shape))
@@ -4085,7 +4368,7 @@ def any(input, dim=None, keepdim=False):
 
 def _int64_acc(a):
     # bool and integer reductions accumulate in int64, as in PyTorch.
-    return a if a.dtype.is_floating_point or a.dtype is int64 else a.to(int64)
+    return a if a.dtype._inexact or a.dtype is int64 else a.to(int64)
 
 
 def prod(input, dim=None, keepdim=False, dtype=None):
@@ -4111,7 +4394,7 @@ def prod(input, dim=None, keepdim=False, dtype=None):
             p = _reduce_nograd("prod", safe, kept, True)
             zeros_in = _reduce_nograd("sum", zero.to(x.dtype), kept, True)
             others = where(zero, where(zeros_in == 1, p, zeros_like(p)), where(zeros_in == 0, div(p, safe), zeros_like(x)))
-            return (mul(_expand_back(g, a.shape, dims, keepdim), others),)
+            return (mul(_expand_back(g, a.shape, dims, keepdim), _cj(others)),)
         out.requires_grad = True
         out._node = _Node(backward, (a,), "Prod", (a,))
     return out
@@ -4195,6 +4478,9 @@ def _pnorm(a, p, dims, keepdim):
 
 def norm(input, p="fro", dim=None, keepdim=False, out=None, dtype=None):
     a = input if dtype is None else input.to(dtype)
+    if a.dtype.is_complex:
+        # A complex tensor's norms are its moduli's.
+        a = abs(a)
     if not a.dtype.is_floating_point:
         raise RuntimeError("linalg.vector_norm: Expected a floating point or complex tensor as input. Got %s" % _CAST_NAME[a.dtype.name])
     dims = _dims_arg(dim, _len(a.shape))
@@ -4400,7 +4686,9 @@ def cumprod(input, dim, dtype=None):
             if not a.shape:
                 return (g,)
             if not (a == 0).any().item():
-                return (div(_rev_cumsum(mul(g, out), d), a),)
+                return (div(_rev_cumsum(mul(g, _cj(out)), d), _cj(a)),)
+            if a.dtype.is_complex:
+                raise NotImplementedError("the derivative of cumprod over a complex tensor with zeros is not implemented on Zipp")
             # With zeros: grad_i = sum over j >= i of g_j * prod(x_k, k <= j, k != i).
             x, dd = _moved_last(a, d)
             gm, _ = _moved_last(g, d)
@@ -4740,7 +5028,7 @@ def t(input):
 
 
 def adjoint(input):
-    return transpose(input, -2, -1)
+    return _cj(transpose(input, -2, -1))
 
 
 def movedim(input, source, destination):
@@ -4856,7 +5144,10 @@ def cat(tensors, dim=0):
     if not tensors:
         raise RuntimeError("torch.cat(): expected a non-empty list of Tensors")
     # PyTorch skips legacy empty 1-d tensors when the others differ in rank.
-    ranks = set(_len(t.shape) for t in tensors)
+    try:
+        ranks = set(_len(t.shape) for t in tensors)
+    except RuntimeError as e:
+        _lazy_reraise(e, "cat", *tensors)
     if _len(ranks) > 1:
         tensors = [t for t in tensors if _tuple(t.shape) != (0,)] or tensors[:1]
     rank = _len(tensors[0].shape)
@@ -5761,7 +6052,13 @@ def matmul(input, other):
             return b.__rmatmul__(a)
     ta = a if type(a) is Tensor else _as_tensor(a)
     tb = b if type(b) is Tensor else _as_tensor(b)
-    storage, shape = _k.matmul(ta._s, ta.shape, tb._s, tb.shape)
+    if ta.dtype is not tb.dtype and ta.dtype.is_complex is not tb.dtype.is_complex:
+        # PyTorch does not promote a real operand of a complex product.
+        raise RuntimeError("expected m1 and m2 to have the same dtype, but got: %s != %s" % (_CPP_NAME.get(ta.dtype.name, ta.dtype.name), _CPP_NAME.get(tb.dtype.name, tb.dtype.name)))
+    try:
+        storage, shape = _k.matmul(ta._s, ta.shape, tb._s, tb.shape)
+    except RuntimeError as e:
+        _lazy_reraise(e, "matmul", ta, tb)
     out = _new3(storage, shape, _DTYPES[_k.dtype(storage)])
     if _grad_enabled and (ta.requires_grad or tb.requires_grad):
         sa, sb, ra, rb = ta._s, tb._s, ta.requires_grad, tb.requires_grad
@@ -5781,11 +6078,11 @@ def matmul(input, other):
             else:
                 gg = g
             if ra:
-                gx = _unbroadcast(matmul(gg, transpose(ys, -1, -2)), xs.shape)
+                gx = _unbroadcast(matmul(gg, _cj(transpose(ys, -1, -2))), xs.shape)
                 if _len(x.shape) == 1:
                     gx = gx.reshape(*x.shape)
             if rb:
-                gy = _unbroadcast(matmul(transpose(xs, -1, -2), gg), ys.shape)
+                gy = _unbroadcast(matmul(_cj(transpose(xs, -1, -2)), gg), ys.shape)
                 if _len(y.shape) == 1:
                     gy = gy.reshape(*y.shape)
             return (gx, gy)
@@ -5844,12 +6141,15 @@ def _linear(x, weight, bias=None):
     accumulation order are that path's exactly (see `_linear_mm`)."""
     if _autocast_cpu is not None:
         return _autocast_run(_linear, "lower", (x, weight, bias))
-    if (not _graph_recording and _isinstance(x, Tensor) and _isinstance(weight, Tensor)
-            and _len(weight.shape) == 2 and _len(x.shape) >= 2):
-        out = _linear_mm(x, weight)
-    else:
-        out = matmul(x, weight.transpose(0, 1))
-    return out if bias is None else out + bias
+    try:
+        if (not _graph_recording and _isinstance(x, Tensor) and _isinstance(weight, Tensor)
+                and _len(weight.shape) == 2 and _len(x.shape) >= 2 and weight.dtype.is_floating_point and x.dtype.is_floating_point):
+            out = _linear_mm(x, weight)
+        else:
+            out = matmul(x, weight.transpose(0, 1))
+        return out if bias is None else out + bias
+    except (RuntimeError, ValueError) as e:
+        _lazy_reraise(e, "linear", x, weight, bias)
 
 
 def _linear_mm(x, w):
@@ -5934,7 +6234,10 @@ def dot(input, other):
 
 
 inner = dot
-vdot = dot
+
+
+def vdot(input, other):
+    return dot(conj(input), other)
 
 
 def outer(input, vec2):
@@ -6160,7 +6463,7 @@ def equal(input, other):
 
 def allclose(input, other, rtol=1e-05, atol=1e-08, equal_nan=False):
     a, b = _as_tensor(input), _as_tensor(other)
-    if equal_nan:
+    if equal_nan or a.dtype.is_complex or b.dtype.is_complex:
         return _bool(isclose(a, b, rtol, atol, True).all().item())
     if _tuple(a.shape) != _tuple(b.shape):
         shape = _broadcast_shapes(a.shape, b.shape)
@@ -6248,6 +6551,7 @@ _DIFFERENTIABLE = frozenset([
     "Atan2", "Maximum", "Minimum", "Fill", "Zero", "Copy", "CopySlices", "Median",
     "Lgamma", "Digamma", "Polygamma", "I0", "SpecialI0E", "SpecialI1", "SpecialI1E", "Sinc", "Logit", "Xlogy", "Igamma", "Igammac",
     "SpecialErfcx", "SpecialNdtr", "SpecialNdtri", "SpecialLogNdtr", "SpecialEntr", "SpecialXlog1Py", "SpecialZeta",
+    "ViewAsReal", "ViewAsComplex", "Conj", "ConjPhysical", "Select", "Angle", "Sgn",
 ])
 
 
@@ -6259,6 +6563,8 @@ def _run_backward(tensors, grad_tensors, create_graph=False, inputs=None):
         if g is None:
             if _numel(t_.shape) != 1:
                 raise RuntimeError("grad can be implicitly created only for scalar outputs")
+            if t_.dtype.is_complex:
+                raise RuntimeError("grad can be implicitly created only for real scalar outputs but got %s" % repr(t_.dtype))
             # ones(*t_.shape, dtype=t_.dtype), one element.
             g = Tensor(_k.full(t_.dtype.name, 1, 1), t_.shape, t_.dtype)
         else:
@@ -6277,8 +6583,8 @@ def _run_backward(tensors, grad_tensors, create_graph=False, inputs=None):
 
 
 def _accumulate_grad(t_, g, create_graph):
-    if g.dtype is not t_.dtype and t_.dtype.is_floating_point:
-        g = g.to(t_.dtype)
+    if g.dtype is not t_.dtype and t_.dtype._inexact:
+        g = _grad_as(g, t_.dtype)
     if t_.grad is None:
         # A gradient of its own: a backward result can be shared (an add
         # hands one gradient to both operands, or the caller's `gradient`
@@ -6464,8 +6770,8 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
                     if gshape is not pshape and not _shape_eq(gshape, pshape) and _tuple(gshape) != _tuple(pshape):
                         pg = _unbroadcast(pg, pshape) if _numel(gshape) >= _numel(pshape) else expand(pg, *pshape)
                     pdt = p.dtype
-                    if pg.dtype is not pdt and pg.dtype != pdt and pdt.is_floating_point:
-                        pg = pg.to(pdt)
+                    if pg.dtype is not pdt and pg.dtype != pdt and pdt._inexact:
+                        pg = _grad_as(pg, pdt)
                     prior = p._pg
                     p._pg = pg if prior is None else add(prior, pg)
         finally:
@@ -6569,8 +6875,8 @@ def _backward_dict(roots, grads, accumulate=True, inputs=None, create_graph=Fals
                     continue
                 if not _shape_eq(pg.shape, p.shape) and _tuple(pg.shape) != _tuple(p.shape):
                     pg = _unbroadcast(pg, p.shape) if _numel(pg.shape) >= _numel(p.shape) else expand(pg, *p.shape)
-                if pg.dtype is not p.dtype and pg.dtype != p.dtype and p.dtype.is_floating_point:
-                    pg = pg.to(p.dtype)
+                if pg.dtype is not p.dtype and pg.dtype != p.dtype and p.dtype._inexact:
+                    pg = _grad_as(pg, p.dtype)
                 pk = id(p)
                 prior = pending.get(pk)
                 pending[pk] = pg if prior is None else add(prior, pg)
@@ -6667,12 +6973,451 @@ def is_storage(obj):
     return _isinstance(obj, _Storage)
 
 
+# ---- complex tensors ---------------------------------------------------------------------
+# A complex64/complex128 tensor's storage holds interleaved (real, imaginary)
+# float32/float64 pairs. `view_as_real`/`view_as_complex` share it (and its
+# version counter); `.real`, `.imag` and `conj()` are copies, since strided
+# views copy here. Every complex op is differentiable with PyTorch's
+# convention for a real loss L: a complex input's gradient is
+# dL/d(re) + i dL/d(im), so a holomorphic f passes grad * conj(f'(z)) back,
+# and a real input of a complex result takes the real part.
+#
+# Python has no complex numbers in this runtime yet (`1+2j` does not
+# compile), so a complex scalar travels as a 0-d complex tensor. The two
+# functions below are the only places a complex element meets a Python
+# value: `_cx_parts` reads one (None for anything that is not a Python
+# complex) and `_cx_scalar` makes one. With a runtime `complex` type they
+# read and build it; until then `_cx_scalar` raises.
+_PyComplex = _b.complex if _isinstance(_b.complex, type) else None
+
+
+def _cx_parts(v):
+    """(re, im) of a Python complex number, None for any other value."""
+    if _PyComplex is not None and _isinstance(v, _PyComplex):
+        return (_float(v.real), _float(v.imag))
+    return None
+
+
+def _cx_scalar(re, im):
+    """A complex element as a Python value (item, tolist, iteration)."""
+    if _PyComplex is None:
+        raise NotImplementedError("complex Python scalars are not supported yet")
+    return _PyComplex(re, im)
+
+
+def _cx_scalars(s):
+    """A complex storage's elements as Python values (`_cx_scalar`)."""
+    flat = _k.to_list(_k.as_real(s))
+    return [_cx_scalar(flat[i], flat[i + 1]) for i in _range(0, _len(flat), 2)]
+
+
+def _cx_from_values(dt, flat):
+    """A `dt` storage from Python numbers and complex numbers."""
+    pairs = []
+    for v in flat:
+        p = _cx_parts(v)
+        if p is None:
+            pairs.append(_float(v))
+            pairs.append(0.0)
+        else:
+            pairs.append(p[0])
+            pairs.append(p[1])
+    return _k.from_pairs(dt.name, pairs)
+
+
+def _default_complex():
+    return complex128 if _default_dtype is float64 else complex64
+
+
+_complex_cast_warned = False
+
+
+def _warn_complex_cast():
+    # PyTorch's (once-per-process) UserWarning; this runtime has no
+    # `warnings` module, so it goes to stderr as Python prints a warning.
+    global _complex_cast_warned
+    if not _complex_cast_warned:
+        _complex_cast_warned = True
+        import sys
+        sys.stderr.write("UserWarning: Casting complex values to real discards the imaginary part\n")
+
+
+def _as_cx(g, dt):
+    """A gradient headed for a complex input: complex of `dt`."""
+    return g if g.dtype is dt else _cast(g, dt)
+
+
+def view_as_real(input):
+    a = input
+    if not a.dtype.is_complex:
+        raise RuntimeError("view_as_real is only supported for complex tensors")
+    out = Tensor(_k.as_real(a._s), _tuple(a.shape) + (2,), a.dtype.to_real())
+    if _grad_enabled and a.requires_grad:
+        out.requires_grad = True
+        out._node = _Node(lambda g: (view_as_complex(g),), (a,), "ViewAsReal")
+    return out
+
+
+def view_as_complex(input):
+    a = input
+    if a.dtype is not float32 and a.dtype is not float64:
+        raise RuntimeError("view_as_complex is only supported for half, float and double tensors, but got a tensor of scalar type: %s" % _CAST_NAME[a.dtype.name])
+    if not a.shape:
+        raise RuntimeError("Input tensor must have one or more dimensions")
+    if a.shape[-1] != 2:
+        raise RuntimeError("Tensor must have a last dimension of size 2")
+    cdt = a.dtype.to_complex()
+    out = Tensor(_k.as_complex(a._s), _tuple(a.shape[:-1]), cdt)
+    if _grad_enabled and a.requires_grad:
+        out.requires_grad = True
+        out._node = _Node(lambda g: (view_as_real(_as_cx(g, cdt)),), (a,), "ViewAsComplex")
+    return out
+
+
+def complex(real, imag, *, out=None):
+    re_, im_ = real, imag
+    if not _isinstance(re_, Tensor) or not _isinstance(im_, Tensor):
+        raise TypeError("complex(): argument 'real' and 'imag' must be Tensor")
+    if re_.dtype is not im_.dtype:
+        raise RuntimeError("Expected object of scalar type %s but got scalar type %s for second argument" % (_CAST_NAME[re_.dtype.name], _CAST_NAME[im_.dtype.name]))
+    if re_.dtype is not float32 and re_.dtype is not float64:
+        raise RuntimeError("Expected both inputs to be Half, Float or Double tensors but got %s and %s" % (_CAST_NAME[re_.dtype.name], _CAST_NAME[im_.dtype.name]))
+    if _tuple(re_.shape) != _tuple(im_.shape):
+        re_, im_ = broadcast_tensors(re_, im_)
+    return view_as_complex(stack([re_, im_], -1))
+
+
+def polar(abs, angle, *, out=None):
+    r, th = abs, angle
+    if not _isinstance(r, Tensor) or not _isinstance(th, Tensor):
+        raise TypeError("polar(): argument 'abs' and 'angle' must be Tensor")
+    if r.dtype is not th.dtype:
+        raise RuntimeError("Expected object of scalar type %s but got scalar type %s for second argument" % (_CAST_NAME[r.dtype.name], _CAST_NAME[th.dtype.name]))
+    return complex(mul(r, cos(th)), mul(r, sin(th)))
+
+
+def _cx_part(a, which):
+    """z.real (which 0) or z.imag (1), a copy with PyTorch's gradient."""
+    out = Tensor(_k.unary("real" if which == 0 else "imag", a._s), a.shape, a.dtype.to_real())
+    if _grad_enabled and a.requires_grad:
+        out.requires_grad = True
+        cdt = a.dtype
+        if which == 0:
+            backward = lambda g: (complex(g, zeros_like(g)).to(cdt),)
+        else:
+            backward = lambda g: (complex(zeros_like(g), g).to(cdt),)
+        out._node = _Node(backward, (a,), "Select")
+    return out
+
+
+def real(input):
+    if not input.dtype.is_complex:
+        return input
+    return _cx_part(input, 0)
+
+
+def imag(input):
+    if not input.dtype.is_complex:
+        raise RuntimeError("imag is not implemented for tensors with non-complex dtypes.")
+    return _cx_part(input, 1)
+
+
+def conj_physical(input):
+    a = input
+    if not a.dtype.is_complex:
+        return a
+    return _cx_unary("conj", a, "ConjPhysical")
+
+
+def conj(input):
+    # PyTorch returns a lazy conjugate view (is_conj() True); here the
+    # conjugate is computed at once, so is_conj() is always False.
+    a = input
+    if not a.dtype.is_complex:
+        return a
+    return _cx_unary("conj", a, "Conj")
+
+
+def resolve_conj(input):
+    return input
+
+
+def resolve_neg(input):
+    return input
+
+
+def is_conj(input):
+    return False
+
+
+def is_neg(input):
+    return False
+
+
+# d/dz of the holomorphic unary ops, as functions of the input x and output o.
+_CX_DERIV = {
+    "exp": lambda x, o: o,
+    "exp2": lambda x, o: mul(o, _math.log(2.0)),
+    "expm1": lambda x, o: add(o, 1.0),
+    "log": lambda x, o: reciprocal(x),
+    "log2": lambda x, o: reciprocal(mul(x, _math.log(2.0))),
+    "log10": lambda x, o: reciprocal(mul(x, _math.log(10.0))),
+    "log1p": lambda x, o: reciprocal(add(x, 1.0)),
+    "sqrt": lambda x, o: reciprocal(mul(o, 2.0)),
+    "rsqrt": lambda x, o: mul(pow(o, 3), -0.5),
+    "reciprocal": lambda x, o: neg(mul(o, o)),
+    "square": lambda x, o: mul(x, 2.0),
+    "sin": lambda x, o: cos(x),
+    "cos": lambda x, o: neg(sin(x)),
+    "tan": lambda x, o: add(mul(o, o), 1.0),
+    "sinh": lambda x, o: cosh(x),
+    "cosh": lambda x, o: sinh(x),
+    "tanh": lambda x, o: sub(1.0, mul(o, o)),
+    "sigmoid": lambda x, o: mul(o, sub(1.0, o)),
+}
+
+
+def _cx_unary(op, a, name):
+    """A complex elementwise op (`_unary` hands complex inputs here)."""
+    storage = _k.unary(op, a._s)
+    out = Tensor(storage, a.shape, _DTYPES[_k.dtype(storage)])
+    if _grad_enabled and a.requires_grad and out.dtype.is_complex:
+        sa = a._s
+        if op == "conj":
+            backward = lambda g: (conj(_as_cx(g, a.dtype)),)
+        elif op == "neg":
+            backward = lambda g: (neg(g),)
+        else:
+            d = _CX_DERIV.get(op)
+            if d is None:
+                raise NotImplementedError("the derivative of %s is not implemented for complex tensors on Zipp" % op)
+            backward = lambda g: (mul(g, conj(d(_frozen(a, sa), _frozen(out, storage)))),)
+        out.requires_grad = True
+        out._node = _Node(backward, (a,), name, [a, out])
+    return out
+
+
+def _cx_real_op(op, a):
+    """A complex op with a real result (abs, angle), no history."""
+    return Tensor(_k.unary(op, a._s), a.shape, a.dtype.to_real())
+
+
+def _cx_abs(a):
+    out = _cx_real_op("abs", a)
+    if _grad_enabled and a.requires_grad:
+        sa = a._s
+        out.requires_grad = True
+        # g * sgn(z): zero at z = 0.
+        out._node = _Node(lambda g: (mul(g, _cx_sgn(_frozen(a, sa))),), (a,), "Abs", [a])
+    return out
+
+
+def angle(input):
+    a = input
+    if a.dtype.is_complex:
+        out = _cx_real_op("angle", a)
+        if _grad_enabled and a.requires_grad:
+            sa = a._s
+            out.requires_grad = True
+
+            def backward(g):
+                z = _frozen(a, sa)
+                r2 = real(mul(z, conj(z)))
+                # g * i z / |z|^2, zero at z = 0.
+                safe = where(r2 == 0, ones_like(r2), r2)
+                d = mul(z, div(g, safe))
+                return (where(r2 == 0, zeros_like(d), complex(neg(imag(d)), real(d))),)
+            out._node = _Node(backward, (a,), "Angle", [a])
+        return out
+    x = a if a.dtype.is_floating_point else a.to(_default_dtype)
+    # pi for a negative number, 0 otherwise (NaN stays NaN); zero gradient.
+    out = where(isnan(x), x, where(x < 0, _math.pi, 0.0)).detach()
+    if _grad_enabled and x.requires_grad:
+        out.requires_grad = True
+        out._node = _Node(lambda g: (zeros_like(g),), (x,), "Angle")
+    return out
+
+
+def _cx_sgn(a):
+    out = Tensor(_k.unary("sgn", a._s), a.shape, a.dtype)
+    if _grad_enabled and a.requires_grad:
+        sa = a._s
+        so = out._s
+        out.requires_grad = True
+
+        def backward(g):
+            z = _frozen(a, sa)
+            s_ = _frozen(out, so)
+            r = _cx_real_op("abs", z)
+            safe = where(r == 0, ones_like(r), r)
+            # -i sgn(z) Im(conj(g) sgn(z)) / |z|, zero at z = 0.
+            t = div(imag(mul(conj(g), s_)), safe)
+            d = mul(s_, t)
+            return (where(r == 0, zeros_like(d), complex(imag(d), neg(real(d)))),)
+        out._node = _Node(backward, (a,), "Sgn", [a, out])
+    return out
+
+
+# ---- windows and the short-time Fourier transform -------------------------------------------
+def _window(fn_name, window_length, periodic, dtype, requires_grad):
+    dt = _dtype_of(dtype) or _default_dtype
+    if not dt.is_floating_point:
+        raise RuntimeError("%s expects floating point dtypes, got: %s" % (fn_name, repr(dt)))
+    n = _int(window_length)
+    if n < 0:
+        raise RuntimeError("%s requires non-negative window_length, got window_length=%d" % (fn_name, n))
+    return dt, n, (n + 1 if periodic and n > 1 else n)
+
+
+def _windowed(out, n, requires_grad):
+    out = out[:n] if out.shape[0] != n else out
+    return out.detach().requires_grad_(requires_grad) if requires_grad else out.detach()
+
+
+def hamming_window(window_length, periodic=True, alpha=0.54, beta=0.46, *, dtype=None, layout=None, device=None, requires_grad=False):
+    """PyTorch's formula in the window's dtype: alpha - beta cos(2 pi n / (N - 1))
+    (a periodic window is the first N of N + 1)."""
+    dt, n, m = _window("hamming_window", window_length, periodic, dtype, requires_grad)
+    if n <= 1:
+        return ones(n, dtype=dt, requires_grad=requires_grad)
+    w = add(mul(cos(mul(arange(m, dtype=dt), _math.pi * 2.0 / (m - 1))), -beta), alpha)
+    return _windowed(w, n, requires_grad)
+
+
+def hann_window(window_length, periodic=True, *, dtype=None, layout=None, device=None, requires_grad=False):
+    return hamming_window(window_length, periodic, 0.5, 0.5, dtype=dtype, requires_grad=requires_grad)
+
+
+def blackman_window(window_length, periodic=True, *, dtype=None, layout=None, device=None, requires_grad=False):
+    dt, n, m = _window("blackman_window", window_length, periodic, dtype, requires_grad)
+    if n <= 1:
+        return ones(n, dtype=dt, requires_grad=requires_grad)
+    t = mul(arange(m, dtype=dt), _math.pi / (m - 1))
+    w = add(sub(mul(cos(mul(t, 4)), 0.08), mul(cos(mul(t, 2)), 0.5)), 0.42)
+    return _windowed(w, n, requires_grad)
+
+
+def bartlett_window(window_length, periodic=True, *, dtype=None, layout=None, device=None, requires_grad=False):
+    dt, n, m = _window("bartlett_window", window_length, periodic, dtype, requires_grad)
+    if n <= 1:
+        return ones(n, dtype=dt, requires_grad=requires_grad)
+    w = mul(arange(m, dtype=dt), 2.0 / (m - 1))
+    half = ((m - 1) >> 1) + 1
+    w = cat([w[:half], add(mul(w[half:], -1), 2)])
+    return _windowed(w, n, requires_grad)
+
+
+def _stft_window(window, n_fft, win_length, dt):
+    win_length = n_fft if win_length is None else _int(win_length)
+    if win_length <= 0 or win_length > n_fft:
+        raise RuntimeError("stft: expected 0 < win_length <= n_fft, but got win_length=%d" % win_length)
+    if window is None:
+        window = ones(win_length, dtype=dt)
+    elif window.ndim != 1 or window.shape[0] != win_length:
+        raise RuntimeError("stft: expected a 1D window tensor of size equal to win_length=%d, but got window with size %s" % (win_length, _list(window.shape)))
+    if win_length < n_fft:
+        left = (n_fft - win_length) // 2
+        window = cat([zeros(left, dtype=window.dtype), window, zeros(n_fft - win_length - left, dtype=window.dtype)])
+    return window
+
+
+def _frames_index(n_frames, n_fft, hop):
+    return tensor([[t * hop + j for j in _range(n_fft)] for t in _range(n_frames)], dtype=int64)
+
+
+def stft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, pad_mode="reflect", normalized=False, onesided=None, return_complex=None):
+    """torch.stft: windowed frames of a 1-D or batched 2-D signal and their
+    DFTs, (batch?, freq, frames), differentiable (the frames are gathered
+    by indexing, the transforms are torch.fft's)."""
+    import torch.fft as _fft
+    x = input
+    complex_io = x.dtype.is_complex or (window is not None and window.dtype.is_complex)
+    if return_complex is None:
+        if not complex_io:
+            raise RuntimeError("stft requires the return_complex parameter be given for real inputs, and will further require that return_complex=True in a future PyTorch release.")
+        return_complex = True
+    if x.ndim not in (1, 2):
+        raise RuntimeError("stft: expected a 1D or 2D tensor, but got %dD" % x.ndim)
+    batched = x.ndim == 2
+    if not batched:
+        x = unsqueeze(x, 0)
+    n_fft = _int(n_fft)
+    hop = n_fft // 4 if hop_length is None else _int(hop_length)
+    if hop <= 0:
+        raise RuntimeError("stft: expected hop_length > 0, but got hop_length=%d" % hop)
+    if center:
+        pad = n_fft // 2
+        x = _F.pad(x.unsqueeze(0), [pad, pad], mode=pad_mode).squeeze(0)
+    L = x.shape[-1]
+    if n_fft <= 0 or n_fft > L:
+        raise RuntimeError("stft: expected 0 < n_fft < %d, but got n_fft=%d" % (L, n_fft))
+    rdt = x.dtype.to_real() if x.dtype.is_complex else (x.dtype if x.dtype.is_floating_point else _default_dtype)
+    w = _stft_window(window, n_fft, win_length, rdt)
+    n_frames = 1 + (L - n_fft) // hop
+    frames = x[:, _frames_index(n_frames, n_fft, hop)] * w
+    norm = "ortho" if normalized else "backward"
+    one = (not complex_io) if onesided is None else _bool(onesided)
+    spec = _fft.rfft(frames, n_fft, -1, norm) if one else _fft.fft(frames, n_fft, -1, norm)
+    spec = spec.transpose(1, 2)
+    if not batched:
+        spec = spec.squeeze(0)
+    return spec if return_complex else view_as_real(spec)
+
+
+def istft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, normalized=False, onesided=None, length=None, return_complex=False):
+    """torch.istft: the overlap-add inverse of stft, divided by the summed
+    squared window (which must not vanish anywhere)."""
+    import torch.fft as _fft
+    if not input.dtype.is_complex:
+        raise RuntimeError("istft requires a complex-valued input tensor matching the output from stft with return_complex=True.")
+    spec = input
+    batched = spec.ndim == 3
+    if not batched:
+        spec = unsqueeze(spec, 0)
+    n_fft = _int(n_fft)
+    hop = n_fft // 4 if hop_length is None else _int(hop_length)
+    n_freq, n_frames = spec.shape[1], spec.shape[2]
+    one = (n_freq != n_fft) if onesided is None else _bool(onesided)
+    if one and n_freq != n_fft // 2 + 1:
+        raise RuntimeError("istft: expected the frequency dimension (3rd to the last) of the input tensor to match n_fft / 2 + 1 when onesided=True, but got %d" % n_freq)
+    rdt = spec.dtype.to_real()
+    w = _stft_window(window, n_fft, win_length, rdt)
+    norm = "ortho" if normalized else "backward"
+    st = spec.transpose(1, 2)
+    if one:
+        if return_complex:
+            raise RuntimeError("cannot have onesided output if window or input is complex")
+        frames = _fft.irfft(st, n_fft, -1, norm)
+    else:
+        frames = _fft.ifft(st, n_fft, -1, norm)
+        if not return_complex:
+            frames = real(frames)
+    frames = frames * w
+    B = frames.shape[0]
+    expected = n_fft + hop * (n_frames - 1)
+    idx = _frames_index(n_frames, n_fft, hop).reshape(-1)
+    y = zeros(B, expected, dtype=frames.dtype).index_add(1, idx, frames.reshape(B, -1))
+    env = zeros(expected, dtype=w.dtype).index_add(0, idx, (w * w).repeat(n_frames))
+    start = n_fft // 2 if center else 0
+    end = expected - (n_fft // 2 if center else 0)
+    if length is not None:
+        end = _b.min(start + _int(length), expected)
+    y = y[:, start:end]
+    env = env[start:end]
+    if env.numel() and _float(env.abs().min()) < 1e-11:
+        raise RuntimeError("istft: window overlap add min: 1")
+    y = y / env
+    if length is not None and y.shape[1] < _int(length):
+        y = cat([y, zeros(B, _int(length) - y.shape[1], dtype=y.dtype)], 1)
+    return y if batched else y.squeeze(0)
+
+
 def is_floating_point(input):
     return input.dtype.is_floating_point
 
 
 def is_complex(input):
-    return False
+    return input.dtype.is_complex
 
 
 def is_nonzero(input):
@@ -6697,16 +7442,36 @@ def select(input, dim, index):
     return input.select(dim, index)
 
 
-def conj(input):
-    return input
-
-
-def real(input):
-    return input
-
-
 def sigmoid_(input):
     return input.sigmoid_()
+
+
+# torch.grid_sampler / torch.affine_grid_generator / torch.ctc_loss: the
+# ATen ops behind F.grid_sample, F.affine_grid and F.ctc_loss, taking
+# PyTorch's integer codes for the modes and the reduction.
+_GRID_MODES = ("bilinear", "nearest", "bicubic")
+_GRID_PADDINGS = ("zeros", "border", "reflection")
+_REDUCTIONS = ("none", "mean", "sum")
+
+
+def _code(codes, v, what):
+    i = _int(v)
+    if i < 0 or i >= _len(codes):
+        raise RuntimeError("%s: invalid code %d (expected 0 to %d)" % (what, i, _len(codes) - 1))
+    return codes[i]
+
+
+def grid_sampler(input, grid, interpolation_mode, padding_mode, align_corners):
+    return _F.grid_sample(input, grid, _code(_GRID_MODES, interpolation_mode, "grid_sampler interpolation_mode"),
+                          _code(_GRID_PADDINGS, padding_mode, "grid_sampler padding_mode"), _bool(align_corners))
+
+
+def affine_grid_generator(theta, size, align_corners):
+    return _F.affine_grid(theta, _list(size), _bool(align_corners))
+
+
+def ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0, reduction=0, zero_infinity=False):
+    return _F.ctc_loss(log_probs, targets, input_lengths, target_lengths, blank, _code(_REDUCTIONS, reduction, "ctc_loss reduction"), zero_infinity)
 
 
 def typename(obj):
@@ -6826,8 +7591,17 @@ class ShortStorage(_Storage):
     dtype = int16
 
 
+class ComplexFloatStorage(_Storage):
+    dtype = complex64
+
+
+class ComplexDoubleStorage(_Storage):
+    dtype = complex128
+
+
 _STORAGE_TYPES = {"float32": FloatStorage, "float64": DoubleStorage, "int64": LongStorage, "int32": IntStorage, "bool": BoolStorage, "uint8": ByteStorage,
-                  "float16": HalfStorage, "bfloat16": BFloat16Storage, "int8": CharStorage, "int16": ShortStorage}
+                  "float16": HalfStorage, "bfloat16": BFloat16Storage, "int8": CharStorage, "int16": ShortStorage,
+                  "complex64": ComplexFloatStorage, "complex128": ComplexDoubleStorage}
 
 
 def _contiguous_strides(shape):
@@ -6950,6 +7724,8 @@ for _name, _fn in (("exp", exp), ("exp2", exp2), ("expm1", expm1), ("log", log),
         setattr(Tensor, _name + "_", _make_inplace(_fn))
 
 
+Tensor.stft = stft
+Tensor.istft = istft
 _STORAGE_NAMES = {c.__name__: c for c in _STORAGE_TYPES.values()}
 from collections import OrderedDict as _OrderedDict
 
@@ -7003,7 +7779,10 @@ class _LazySubmodule:
         self._lazy_name = name
 
     def _lazy_load(self):
-        import torch.distributions as module
+        if self._lazy_name == "fft":
+            import torch.fft as module
+        else:
+            import torch.distributions as module
         globals()[self._lazy_name] = module
         return module
 
@@ -7020,6 +7799,7 @@ class _LazySubmodule:
 
 
 distributions = _LazySubmodule("distributions")
+fft = _LazySubmodule("fft")
 
 
 class _Fx:

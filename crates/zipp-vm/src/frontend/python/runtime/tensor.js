@@ -35,7 +35,7 @@
     // as cheap as the native call.
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
-        N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15;
+        N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -53,10 +53,26 @@
     // once where PyTorch's float opmath rounds twice. Copies (permute,
     // slice, gather, ...) move the 2-byte elements as they are. int8/int16
     // wrap on store as uint8 does.
+    //
+    //
+    // complex64/complex128 storages hold interleaved (real, imaginary)
+    // pairs in a Float32Array/Float64Array of twice the element count
+    // (PyTorch's ComplexFloat/ComplexDouble layout), as objects of their
+    // own class (`CStorage`, made by `cmake`/`calloc`). `PAIR` names each
+    // one's real dtype. Only the kernels that know the layout accept them
+    // (`needSC`); every other kernel's `needS` refuses one, so a complex
+    // storage can never be read as twice as many reals by mistake, and a
+    // real kernel call pays nothing for them. The copying kernels
+    // (permute, slice, cat, gather, ...) run on the same array seen as a
+    // real storage with a trailing dimension of 2 (`realOf`), which is
+    // exactly the complex layout.
     const ARRAY = { float32: Float32Array, float64: Float64Array, int64: Float64Array, int32: Float64Array, bool: Uint8Array, uint8: Uint8Array,
         float16: Float16Array, bfloat16: Uint16Array, int8: Int8Array, int16: Int16Array };
-    const RANK = { bool: 0, uint8: 1, int8: 1, int16: 2, int32: 3, int64: 4, float16: 5, bfloat16: 5, float32: 6, float64: 7 };
+    const CARRAY = { complex64: Float32Array, complex128: Float64Array };
+    const RANK = { bool: 0, uint8: 1, int8: 1, int16: 2, int32: 3, int64: 4, float16: 5, bfloat16: 5, float32: 6, float64: 7, complex64: 8, complex128: 9 };
     const FLOAT = { float16: 1, bfloat16: 1, float32: 1, float64: 1 };
+    const PAIR = { complex64: "float32", complex128: "float64" };
+    const COMPLEX_OF = { float32: "complex64", float64: "complex128" };
     function make(dtype, data) { if (ARRAY[dtype] === undefined) fail(E.TypeError, "unknown dtype " + dtype); return { cls: Storage, dtype: dtype, data: data, version: 0, untracked: 0 }; }
     function alloc(dtype, n) { return make(dtype, new ARRAY[dtype](n)); }
     // A result storage a kernel computes into: a float32 scratch for
@@ -65,8 +81,53 @@
     // Dtypes whose storages can alias one another's memory (`view_dtype`).
     const VIEW_GROUP = { float16: 2, bfloat16: 2, int16: 2, uint8: 1, int8: 1 };
     function isStorage(v) { return v !== null && typeof v === "object" && v.cls === Storage; }
-    function needS(v, what) { if (!isStorage(v)) fail(E.TypeError, (what || "argument") + " must be a tensor storage"); return v; }
-    function written(s) { s.version++; }
+    const CStorage = rt.newType("_ComplexStorage", [rt.ObjectType], new Map(), "_zipp_tensor");
+    function isCStorage(v) { return v !== null && typeof v === "object" && v.cls === CStorage; }
+    function cmake(dtype, data) { if (CARRAY[dtype] === undefined) fail(E.TypeError, "unknown complex dtype " + dtype); return { cls: CStorage, dtype: dtype, data: data, version: 0, untracked: 0 }; }
+    function calloc(dtype, n) { return cmake(dtype, new CARRAY[dtype](2 * n)); }
+    // A storage of any dtype, complex included (the creation kernels): the
+    // complex dtype names are the only ones longer than 8 characters.
+    function anyAlloc(dtype, n) { return dtype.length > 8 ? calloc(dtype, n) : alloc(dtype, n); }
+    // A storage argument a kernel's complex path takes (a complex storage,
+    // or a real one mixed with a complex operand).
+    function needC(v) { if (!isCStorage(v)) needS(v); return v; }
+    function needS(v, what) {
+        if (!isStorage(v)) {
+            if (isCStorage(v)) fail(E.RuntimeError, "this operation does not support complex tensors on Zipp");
+            fail(E.TypeError, (what || "argument") + " must be a tensor storage");
+        }
+        return v;
+    }
+    // A storage argument of a kernel that handles complex storages too.
+    function needSC(v, what) { if (!isStorage(v) && !isCStorage(v)) fail(E.TypeError, (what || "argument") + " must be a tensor storage"); return v; }
+    // A view storage (`as_real`/`as_complex`) shares its base's memory and
+    // version counter: writes through either are one history.
+    function root(s) { return s.base === undefined ? s : s.base; }
+    function written(s) { if (s.base === undefined) s.version++; else s.base.version++; }
+    // The elements of a storage (complex pairs count once).
+    function count(s) { return s.cls === CStorage ? s.data.length >> 1 : s.data.length; }
+    // A complex storage's memory seen as its real dtype (trailing dim 2).
+    function realOf(s) { return make(PAIR[s.dtype], s.data); }
+    // A fresh real result of a kernel run on `realOf` storages, as `dtype`.
+    function asPair(r, dtype) { return cmake(dtype, r.data); }
+    // A (storage, Size) kernel result over shape + [2], as the complex
+    // storage and the shape without the trailing 2.
+    function lowered(res, dtype) {
+        const items = res.items, sh = shapeOf(items[1]);
+        sh.pop();
+        return tuple([asPair(items[0], dtype), pyShape(sh)]);
+    }
+    // `s` converted to the complex dtype `d` (a real storage gets zero
+    // imaginary parts); `s` itself when it already is one.
+    function toPair(s, d) {
+        if (s.dtype === d) return s;
+        const n = count(s), out = calloc(d, n), O = out.data;
+        if (s.cls === CStorage) { O.set(s.data); return out; }
+        const S = vals(s);
+        for (let i = 0; i < n; i++) O[2 * i] = S[i];
+        return out;
+    }
+    function pyInts(arr) { const out = new Array(arr.length); for (let i = 0; i < arr.length; i++) out[i] = BigInt(arr[i]); return tuple(out); }
     // The host transport (entry.js): a float32 storage leaves as its
     // Float32Array, and a Float32Array the host sends arrives as a storage
     // that owns it (the VM made it from the host's copy).
@@ -145,6 +206,9 @@
     function promote(a, b) {
         if (a === b) return a;
         const ra = RANK[a], rb = RANK[b];
+        // A complex dtype wins, at double precision when either side is
+        // (complex64 with float64 is complex128).
+        if (ra >= 8 || rb >= 8) return a === "complex128" || b === "complex128" || a === "float64" || b === "float64" ? "complex128" : "complex64";
         if (ra === rb) return ra === 1 ? "int16" : "float32";
         return ra > rb ? a : b;
     }
@@ -1344,6 +1408,480 @@
         }
         { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(shape)]); }
     }
+    // astype between real dtypes.
+    function astype(s, d) {
+        const out = alloc(d, s.data.length);
+        // A float target converts exactly as castValue does (the typed
+        // array rounds float32 on store; float16 and bfloat16 round that
+        // float32 to the format); integer targets truncate.
+        if (d === s.dtype && HALF[d] === 1) { out.data.set(s.data); return out; }
+        const S = vals(s), O = out.data, n = O.length;
+        if (d === "float32" || d === "float64") O.set(S);
+        else if (d === "float16") { if (S instanceof Float32Array) O.set(S); else for (let i = 0; i < n; i++) O[i] = Math.fround(S[i]); }
+        else if (d === "bfloat16") for (let i = 0; i < n; i++) O[i] = bfBits(Math.fround(S[i]));
+        else for (let i = 0; i < n; i++) O[i] = castValue(d, S[i]);
+        return out;
+    }
+    // Every element of complex storage s set to re + im j (rounded to its dtype).
+    function fillPair(s, re, im) { const D = s.data; for (let i = 0; i < D.length; i += 2) { D[i] = re; D[i + 1] = im; } }
+    // ---- complex kernels ----------------------------------------------------------------------
+    // Elementwise complex arithmetic in double precision, rounded once on
+    // store (complex64 into its Float32Array). Operands arrive as complex
+    // storages or real storages (read with a zero imaginary part). The
+    // formulas follow C++'s std::complex / NumPy: division scales by the
+    // larger of |c| and |d| (Smith), sqrt is the stable half-angle form,
+    // tanh Kahan's form.
+    const CZ = new Float64Array(2);
+    function cdiv(a, b, c, d) {
+        const ac = Math.abs(c), ad = Math.abs(d);
+        if (ac >= ad) {
+            if (ac === 0 && ad === 0) { CZ[0] = a / ac; CZ[1] = b / ad; return; }
+            const rat = d / c, scl = 1 / (c + d * rat);
+            CZ[0] = (a + b * rat) * scl; CZ[1] = (b - a * rat) * scl;
+        } else {
+            const rat = c / d, scl = 1 / (d + c * rat);
+            CZ[0] = (a * rat + b) * scl; CZ[1] = (b * rat - a) * scl;
+        }
+    }
+    function cexp(x, y) {
+        if (y === 0) { CZ[0] = Math.exp(x); CZ[1] = y; return; }
+        const e = Math.exp(x); CZ[0] = e * Math.cos(y); CZ[1] = e * Math.sin(y);
+    }
+    function clog(x, y) { CZ[0] = Math.log(Math.hypot(x, y)); CZ[1] = Math.atan2(y, x); }
+    function csqrt(x, y) {
+        if (x === 0 && y === 0) { CZ[0] = 0; CZ[1] = y; return; }
+        if (y === Infinity || y === -Infinity) { CZ[0] = Infinity; CZ[1] = y; return; }
+        const t = Math.sqrt((Math.abs(x) + Math.hypot(x, y)) / 2);
+        if (x >= 0) { CZ[0] = t; CZ[1] = y / (2 * t); }
+        else { CZ[0] = Math.abs(y) / (2 * t); CZ[1] = y < 0 || Object.is(y, -0) ? -t : t; }
+    }
+    function ctanh(x, y) {
+        if (Math.abs(x) > 22) { CZ[0] = x > 0 ? 1 : -1; CZ[1] = 4 * Math.sin(y) * Math.cos(y) * Math.exp(-2 * Math.abs(x)); return; }
+        const t = Math.tan(y), b = 1 + t * t, sh = Math.sinh(x), r = Math.sqrt(1 + sh * sh), den = 1 + b * sh * sh;
+        CZ[0] = b * r * sh / den; CZ[1] = t / den;
+    }
+    function cpow(a, b, c, d) {
+        // z ** w = exp(w log z); z ** 0 is 1, 0 ** w is 0 for a positive real w.
+        if (c === 0 && d === 0) { CZ[0] = 1; CZ[1] = 0; return; }
+        if (a === 0 && b === 0 && c > 0 && d === 0) { CZ[0] = 0; CZ[1] = 0; return; }
+        clog(a, b);
+        const lr = CZ[0], li = CZ[1];
+        cexp(c * lr - d * li, c * li + d * lr);
+    }
+    // One complex unary op into CZ; false for an op with no complex form.
+    function cunaryOne(op, x, y) {
+        switch (op) {
+            case "neg": CZ[0] = -x; CZ[1] = -y; return true;
+            case "conj": CZ[0] = x; CZ[1] = -y; return true;
+            case "exp": cexp(x, y); return true;
+            case "log": clog(x, y); return true;
+            case "log2": clog(x, y); CZ[0] /= Math.LN2; CZ[1] /= Math.LN2; return true;
+            case "log10": clog(x, y); CZ[0] /= Math.LN10; CZ[1] /= Math.LN10; return true;
+            case "sqrt": csqrt(x, y); return true;
+            case "rsqrt": { csqrt(x, y); const p = CZ[0], q = CZ[1]; cdiv(1, 0, p, q); return true; }
+            case "reciprocal": cdiv(1, 0, x, y); return true;
+            case "square": CZ[0] = x * x - y * y; CZ[1] = 2 * x * y; return true;
+            case "sin": CZ[0] = Math.sin(x) * Math.cosh(y); CZ[1] = Math.cos(x) * Math.sinh(y); return true;
+            case "cos": CZ[0] = Math.cos(x) * Math.cosh(y); CZ[1] = -Math.sin(x) * Math.sinh(y); return true;
+            case "sinh": CZ[0] = Math.sinh(x) * Math.cos(y); CZ[1] = Math.cosh(x) * Math.sin(y); return true;
+            case "cosh": CZ[0] = Math.cosh(x) * Math.cos(y); CZ[1] = Math.sinh(x) * Math.sin(y); return true;
+            case "tanh": ctanh(x, y); return true;
+            // tan z = -i tanh(i z)
+            case "tan": { ctanh(-y, x); const u = CZ[0]; CZ[0] = CZ[1]; CZ[1] = -u; return true; }
+            case "sigmoid": { cexp(-x, -y); const p = 1 + CZ[0], q = CZ[1]; cdiv(1, 0, p, q); return true; }
+            case "expm1": { const e = Math.exp(x), h = Math.sin(y / 2); CZ[0] = Math.expm1(x) * Math.cos(y) - 2 * h * h; CZ[1] = e * Math.sin(y); return true; }
+            case "log1p": CZ[0] = 0.5 * Math.log1p(x * (2 + x) + y * y); CZ[1] = Math.atan2(y, 1 + x); return true;
+            case "exp2": cexp(x * Math.LN2, y * Math.LN2); return true;
+            // z / |z| as a complex division (so -2.5-0j gives -1+0j, as PyTorch).
+            case "sgn": { const r = Math.hypot(x, y); if (r === 0) { CZ[0] = 0; CZ[1] = 0; } else cdiv(x, y, r, 0); return true; }
+        }
+        return false;
+    }
+    // Complex unary ops with a real (1) or bool (2) result.
+    const CREAL = { abs: 1, angle: 1, real: 1, imag: 1, isnan: 2, isinf: 2, isfinite: 2, not: 2 };
+    function cunary(op, a) {
+        const n = count(a), A = a.data, kind = CREAL[op];
+        if (kind !== undefined) {
+            const out = alloc(kind === 2 ? "bool" : PAIR[a.dtype], n), O = out.data;
+            for (let i = 0, j = 0; i < n; i++, j += 2) {
+                const x = A[j], y = A[j + 1];
+                switch (op) {
+                    case "abs": O[i] = Math.hypot(x, y); break;
+                    case "angle": O[i] = Math.atan2(y, x); break;
+                    case "real": O[i] = x; break;
+                    case "imag": O[i] = y; break;
+                    case "isnan": O[i] = x !== x || y !== y ? 1 : 0; break;
+                    case "isinf": O[i] = x === Infinity || x === -Infinity || y === Infinity || y === -Infinity ? 1 : 0; break;
+                    case "isfinite": O[i] = Number.isFinite(x) && Number.isFinite(y) ? 1 : 0; break;
+                    default: O[i] = x === 0 && y === 0 ? 1 : 0;
+                }
+            }
+            return out;
+        }
+        if (!cunaryOne(op, 0, 0)) fail(E.RuntimeError, "\"" + op + "\" is not implemented for complex tensors on Zipp");
+        const out = calloc(a.dtype, n), O = out.data;
+        for (let j = 0; j < 2 * n; j += 2) { cunaryOne(op, A[j], A[j + 1]); O[j] = CZ[0]; O[j + 1] = CZ[1]; }
+        return out;
+    }
+    // The scalar exponents PyTorch's complex pow takes a shortcut for.
+    function cpowScalar(e, x, y) {
+        if (e === 2) { CZ[0] = x * x - y * y; CZ[1] = 2 * x * y; return true; }
+        if (e === 3) { const p = x * x - y * y, q = 2 * x * y; CZ[0] = p * x - q * y; CZ[1] = p * y + q * x; return true; }
+        if (e === 0.5) { csqrt(x, y); return true; }
+        if (e === -0.5) { csqrt(x, y); const p = CZ[0], q = CZ[1]; cdiv(1, 0, p, q); return true; }
+        if (e === -1) { cdiv(1, 0, x, y); return true; }
+        if (e === -2) { const p = x * x - y * y, q = 2 * x * y; cdiv(1, 0, p, q); return true; }
+        return false;
+    }
+    const CBIN = { add: 1, sub: 1, mul: 1, div: 1, pow: 1, eq: 2, ne: 2 };
+    function cbinary(op, a, ashape, b, bshape, want) {
+        const kind = CBIN[op];
+        if (kind === undefined) fail(E.RuntimeError, "\"" + op + "\" is not implemented for complex tensors on Zipp");
+        const shape = broadcastShape(ashape, bshape), n = numel(shape);
+        const cdt = want !== null && PAIR[want] !== undefined ? want : promote(a.dtype, b.dtype);
+        const A = toPair(a, cdt).data, B = toPair(b, cdt).data;
+        const out = kind === 2 ? alloc("bool", n) : calloc(cdt, n), O = out.data;
+        const sa = bstrides(ashape, shape), sb = bstrides(bshape, shape);
+        // A scalar real exponent (a one-element operand with no imaginary part).
+        const scalarExp = op === "pow" && numel(bshape) === 1 && B[1] === 0 && cpowScalar(B[0], 1, 0) ? B[0] : null;
+        forEachBroadcast(shape, sa, sb, (o, xi, yi) => {
+            const x = A[2 * xi], y = A[2 * xi + 1], c = B[2 * yi], d = B[2 * yi + 1];
+            switch (op) {
+                case "add": O[2 * o] = x + c; O[2 * o + 1] = y + d; return;
+                case "sub": O[2 * o] = x - c; O[2 * o + 1] = y - d; return;
+                case "mul": O[2 * o] = x * c - y * d; O[2 * o + 1] = x * d + y * c; return;
+                case "div": cdiv(x, y, c, d); break;
+                case "pow": if (scalarExp !== null) cpowScalar(scalarExp, x, y); else cpow(x, y, c, d); break;
+                case "eq": O[o] = x === c && y === d ? 1 : 0; return;
+                default: O[o] = x !== c || y !== d ? 1 : 0; return;
+            }
+            O[2 * o] = CZ[0]; O[2 * o + 1] = CZ[1];
+        });
+        return tuple([out, pyShape(shape)]);
+    }
+    // The reduced dims of a `reduce` call, normalized, as a JS array (all
+    // of them for None).
+    function redDims(dims, rank) {
+        if (dims === null) { const all = []; for (let d = 0; d < rank; d++) all.push(d); return all; }
+        const red = ints(dims);
+        for (let i = 0; i < red.length; i++) { const d = red[i] < 0 ? red[i] + rank : red[i]; if (d < 0 || d >= rank) fail(E.IndexError, "Dimension out of range"); red[i] = d; }
+        return red;
+    }
+    // sum/mean run as the real reduction over shape + [2] (each part
+    // separately, which is complex addition); prod multiplies pairs in
+    // double precision, rounding once.
+    function creduce(op, a, shape, dims, keepdim, precise) {
+        const rank = shape.length, red = redDims(dims, rank);
+        if (op === "sum" || op === "mean") {
+            if (rank === 0) return tuple([cmake(a.dtype, a.data.slice()), pyShape([])]);
+            return lowered(reduce(op, realOf(a), shape.concat([2]), pyInts(red), keepdim, precise), a.dtype);
+        }
+        if (op !== "prod") fail(E.RuntimeError, "\"" + op + "\" is not implemented for complex tensors on Zipp");
+        const isRed = new Array(rank).fill(false);
+        for (let i = 0; i < red.length; i++) isRed[red[i]] = true;
+        const outShape = [], keptShape = [];
+        for (let d = 0; d < rank; d++) { if (isRed[d]) keptShape.push(1); else { outShape.push(shape[d]); keptShape.push(shape[d]); } }
+        const nOut = numel(keptShape), nIn = numel(shape), P = new Float64Array(2 * nOut), A = a.data, outS = strides(keptShape);
+        for (let i = 0; i < nOut; i++) P[2 * i] = 1;
+        const pos = new Array(rank).fill(0);
+        let oo = 0;
+        for (let flat = 0; flat < nIn; flat++) {
+            const x = P[2 * oo], y = P[2 * oo + 1], c = A[2 * flat], d = A[2 * flat + 1];
+            P[2 * oo] = x * c - y * d; P[2 * oo + 1] = x * d + y * c;
+            for (let q = rank - 1; q >= 0; q--) {
+                pos[q]++; if (!isRed[q]) oo += outS[q];
+                if (pos[q] < shape[q]) break;
+                if (!isRed[q]) oo -= outS[q] * shape[q];
+                pos[q] = 0;
+            }
+        }
+        const out = calloc(a.dtype, nOut);
+        out.data.set(P);
+        return tuple([out, pyShape(keepdim ? keptShape : outShape)]);
+    }
+    function cscan(op, a, shape, dim) {
+        const rank = shape.length, d = rank === 0 ? 0 : (dim < 0 ? dim + rank : dim);
+        if (op === "cumsum") {
+            if (rank === 0) return cmake(a.dtype, a.data.slice());
+            return cmake(a.dtype, scan("cumsum", realOf(a), shape.concat([2]), d).data);
+        }
+        if (op !== "cumprod") fail(E.RuntimeError, "\"" + op + "\" is not implemented for complex tensors on Zipp");
+        const n = rank === 0 ? 1 : shape[d], outer = rank === 0 ? 1 : numel(shape.slice(0, d)), inner = rank === 0 ? 1 : numel(shape.slice(d + 1));
+        const out = calloc(a.dtype, count(a)), O = out.data, A = a.data;
+        for (let x = 0; x < outer; x++) for (let r = 0; r < inner; r++) {
+            let pr = 1, pi = 0;
+            for (let i = 0; i < n; i++) {
+                const p = 2 * (x * n * inner + i * inner + r), c = A[p], q = A[p + 1];
+                const nr = pr * c - pi * q; pi = pr * q + pi * c; pr = nr;
+                O[p] = pr; O[p + 1] = pi;
+            }
+        }
+        return out;
+    }
+    // A complex matmul as four real double-precision products of the
+    // parts (each a `matmul` of float64 planes, which sums exactly as the
+    // real kernel does), combined and rounded once to the result dtype.
+    function cmatmul(a, ashape, b, bshape) {
+        const cdt = promote(a.dtype, b.dtype), A = toPair(a, cdt).data, B = toPair(b, cdt).data;
+        const plane = (D, off) => { const n = D.length >> 1, P = new Float64Array(n); for (let i = 0; i < n; i++) P[i] = D[2 * i + off]; return make("float64", P); };
+        const ar = plane(A, 0), ai = plane(A, 1), br = plane(B, 0), bi = plane(B, 1);
+        const rr = matmul(ar, ashape, br, bshape, false), ii = matmul(ai, ashape, bi, bshape, false);
+        const ri = matmul(ar, ashape, bi, bshape, false), ir = matmul(ai, ashape, br, bshape, false);
+        const RR = rr.items[0].data, II = ii.items[0].data, RI = ri.items[0].data, IR = ir.items[0].data, n = RR.length;
+        const out = calloc(cdt, n), O = out.data;
+        for (let i = 0; i < n; i++) { O[2 * i] = RR[i] - II[i]; O[2 * i + 1] = RI[i] + IR[i]; }
+        return tuple([out, rr.items[1]]);
+    }
+    // astype involving a complex dtype: into complex (a real source gets
+    // zero imaginary parts), or from complex into a real dtype (the real
+    // part; bool asks for a nonzero part).
+    function castPair(s, d) {
+        if (PAIR[d] !== undefined) return toPair(s, d);
+        const n = count(s), S = s.data;
+        if (d === "bool") { const out = alloc("bool", n); for (let i = 0; i < n; i++) out.data[i] = S[2 * i] !== 0 || S[2 * i + 1] !== 0 ? 1 : 0; return out; }
+        const re = alloc(PAIR[s.dtype], n), R = re.data;
+        for (let i = 0; i < n; i++) R[i] = S[2 * i];
+        return d === re.dtype ? re : astype(re, d);
+    }
+    // ---- FFT (torch.fft) ----------------------------------------------------------------------
+    // One-dimensional discrete Fourier transforms of contiguous rows, in
+    // double precision, rounded once to the output dtype. A length whose
+    // prime factors are all at most 31 runs a mixed-radix
+    // decimation-in-time Cooley-Tukey (radix 4 first, then 2, 3, 5 and the
+    // odd primes to 31); any other length runs Bluestein's chirp-z
+    // algorithm over a power-of-two convolution. Twiddles are cos/sin of
+    // 2*pi*k/N, computed directly (no recurrences).
+    // `vm::py_tensor::fft` is this code line for line (the same operations
+    // in the same order), so the native loop gives these bytes exactly.
+    // modes: 0 complex -> complex, 1 real -> onesided complex (n/2+1
+    // bins), 2 onesided complex -> real (Hermitian extension; the
+    // imaginary parts of bins 0 and n/2 are ignored), 3 real -> all n
+    // bins (the onesided ones, then their conjugates). A real input's
+    // bins 0 and n/2 are real exactly.
+    function fftFactors(n) {
+        const f = [];
+        let m = n;
+        while (m % 4 === 0) { f.push(4); m /= 4; }
+        while (m % 2 === 0) { f.push(2); m /= 2; }
+        while (m % 3 === 0) { f.push(3); m /= 3; }
+        while (m % 5 === 0) { f.push(5); m /= 5; }
+        // Other primes up to 31 run the generic odd-radix pass.
+        for (let q = 7; q <= 31; q += 2) while (m % q === 0) { f.push(q); m /= q; }
+        return m === 1 ? f : null;
+    }
+    // cos and sin of 2*pi*k/n into TW: the angle folded into the first
+    // octant by the circle's symmetries (in exact integers, eighths of k),
+    // so the table is exactly symmetric and exact at multiples of pi/2.
+    const TW = new Float64Array(2);
+    function twiddle(k, n) {
+        const T = 8 * n;
+        let a = 8 * k, sc = 1, ss = 1, swap = false;
+        if (2 * a > T) { a = T - a; ss = -1; }
+        if (4 * a > T) { a = T / 2 - a; sc = -1; }
+        if (8 * a > T) { a = T / 4 - a; swap = true; }
+        const t = 2 * Math.PI * a / T, c = Math.cos(t), s = Math.sin(t);
+        TW[0] = sc * (swap ? s : c); TW[1] = ss * (swap ? c : s);
+    }
+    // A plan for length n and direction sign (-1 forward, +1 inverse).
+    function fftPlan(n, sign) {
+        const factors = fftFactors(n);
+        if (factors !== null) {
+            const cr = new Float64Array(n), ci = new Float64Array(n);
+            for (let k = 0; k < n; k++) { twiddle(k, n); cr[k] = TW[0]; ci[k] = sign * TW[1]; }
+            return { n: n, sign: sign, factors: factors, cr: cr, ci: ci, blue: null };
+        }
+        let m = 1;
+        while (m < 2 * n - 1) m *= 2;
+        const sub = fftPlan(m, -1), inv = fftPlan(m, 1);
+        // The chirp c_j = exp(sign * i * pi * j^2 / n), j^2 taken mod 2n.
+        const wr = new Float64Array(n), wi = new Float64Array(n);
+        for (let j = 0; j < n; j++) { twiddle((j * j) % (2 * n), 2 * n); wr[j] = TW[0]; wi[j] = sign * TW[1]; }
+        // The transformed conjugate chirp, wrapped: b_j = b_(m-j) = conj(c_j).
+        const br = new Float64Array(m), bi = new Float64Array(m);
+        for (let j = 0; j < n; j++) { br[j] = wr[j]; bi[j] = -wi[j]; if (j > 0) { br[m - j] = wr[j]; bi[m - j] = -wi[j]; } }
+        const Br = new Float64Array(m), Bi = new Float64Array(m);
+        fftRun(sub, br, bi, Br, Bi);
+        return { n: n, sign: sign, factors: null, cr: null, ci: null, blue: { m: m, sub: sub, inv: inv, wr: wr, wi: wi, Br: Br, Bi: Bi,
+            ar: new Float64Array(m), ai: new Float64Array(m), tr: new Float64Array(m), ti: new Float64Array(m) } };
+    }
+    // out[oo + k] (k < len) = DFT of in[io + j * stride] over the plan's
+    // factors from index fi on; the twiddle of W_len^e is table entry
+    // e * (N / len).
+    function fftRec(p, len, xr, xi, io, stride, yr, yi, oo, fi) {
+        if (len === 1) { yr[oo] = xr[io]; yi[oo] = xi[io]; return; }
+        const r = p.factors[fi], m = len / r, N = p.n, step = N / len, cr = p.cr, ci = p.ci;
+        for (let q = 0; q < r; q++) fftRec(p, m, xr, xi, io + q * stride, stride * r, yr, yi, oo + q * m, fi + 1);
+        for (let k = 0; k < m; k++) {
+            if (r === 2) {
+                const a = oo + k, b = a + m;
+                let br = yr[b], bi = yi[b];
+                if (k !== 0) { const e = k * step, wr = cr[e], wi = ci[e], t = br * wr - bi * wi; bi = br * wi + bi * wr; br = t; }
+                const ar = yr[a], ai = yi[a];
+                yr[a] = ar + br; yi[a] = ai + bi; yr[b] = ar - br; yi[b] = ai - bi;
+            } else if (r === 4) {
+                const i0 = oo + k, i1 = i0 + m, i2 = i1 + m, i3 = i2 + m;
+                let x1r = yr[i1], x1i = yi[i1], x2r = yr[i2], x2i = yi[i2], x3r = yr[i3], x3i = yi[i3];
+                if (k !== 0) {
+                    let e = k * step, wr = cr[e], wi = ci[e], t = x1r * wr - x1i * wi; x1i = x1r * wi + x1i * wr; x1r = t;
+                    e = 2 * k * step; wr = cr[e]; wi = ci[e]; t = x2r * wr - x2i * wi; x2i = x2r * wi + x2i * wr; x2r = t;
+                    e = 3 * k * step; wr = cr[e]; wi = ci[e]; t = x3r * wr - x3i * wi; x3i = x3r * wi + x3i * wr; x3r = t;
+                }
+                const x0r = yr[i0], x0i = yi[i0];
+                const s0r = x0r + x2r, s0i = x0i + x2i, d0r = x0r - x2r, d0i = x0i - x2i;
+                const s1r = x1r + x3r, s1i = x1i + x3i, d1r = x1r - x3r, d1i = x1i - x3i;
+                // W_4 = sign * i: X1 = d0 + sign*i*d1, X3 = d0 - sign*i*d1.
+                const sg = p.sign;
+                const jr = sg > 0 ? -d1i : d1i, ji = sg > 0 ? d1r : -d1r;
+                yr[i0] = s0r + s1r; yi[i0] = s0i + s1i;
+                yr[i1] = d0r + jr; yi[i1] = d0i + ji;
+                yr[i2] = s0r - s1r; yi[i2] = s0i - s1i;
+                yr[i3] = d0r - jr; yi[i3] = d0i - ji;
+            } else {
+                // Radix 3 or 5: twiddled inputs, then the r-point DFT with
+                // its exact constants (cos 2pi/3 = -1/2, ...).
+                const tr = p.tmpr, ti = p.tmpi;
+                for (let q = 0; q < r; q++) {
+                    const at = oo + q * m + k;
+                    let xr0 = yr[at], xi0 = yi[at];
+                    if (q !== 0 && k !== 0) { const e = q * k * step, wr = cr[e], wi = ci[e], t = xr0 * wr - xi0 * wi; xi0 = xr0 * wi + xi0 * wr; xr0 = t; }
+                    tr[q] = xr0; ti[q] = xi0;
+                }
+                const sg = p.sign;
+                if (r > 5) {
+                    // Odd prime r: pairs q, r-q (sums and differences), then
+                    // X_s = A + i B and X_(r-s) = A - i B.
+                    const h = (r - 1) >> 1, pr = p.pr, pi = p.pi, mr = p.mr, mi = p.mi, big = N / r;
+                    let x0r = tr[0], x0i = ti[0];
+                    for (let q = 1; q <= h; q++) { pr[q] = tr[q] + tr[r - q]; pi[q] = ti[q] + ti[r - q]; mr[q] = tr[q] - tr[r - q]; mi[q] = ti[q] - ti[r - q]; x0r += pr[q]; x0i += pi[q]; }
+                    yr[oo + k] = x0r; yi[oo + k] = x0i;
+                    for (let s = 1; s <= h; s++) {
+                        let ar = tr[0], ai = ti[0], br = 0, bi = 0;
+                        for (let q = 1; q <= h; q++) {
+                            const e = ((q * s) % r) * big, wr = cr[e], wi = ci[e];
+                            ar += wr * pr[q]; ai += wr * pi[q]; br += wi * mr[q]; bi += wi * mi[q];
+                        }
+                        yr[oo + s * m + k] = ar - bi; yi[oo + s * m + k] = ai + br;
+                        yr[oo + (r - s) * m + k] = ar + bi; yi[oo + (r - s) * m + k] = ai - br;
+                    }
+                } else if (r === 3) {
+                    const t1r = tr[1] + tr[2], t1i = ti[1] + ti[2];
+                    const t2r = tr[0] - 0.5 * t1r, t2i = ti[0] - 0.5 * t1i;
+                    const t3r = 0.8660254037844386 * (tr[1] - tr[2]), t3i = 0.8660254037844386 * (ti[1] - ti[2]);
+                    // s * i * t3
+                    const ur = sg > 0 ? -t3i : t3i, ui = sg > 0 ? t3r : -t3r;
+                    const i0 = oo + k, i1 = i0 + m, i2 = i1 + m;
+                    yr[i0] = tr[0] + t1r; yi[i0] = ti[0] + t1i;
+                    yr[i1] = t2r + ur; yi[i1] = t2i + ui;
+                    yr[i2] = t2r - ur; yi[i2] = t2i - ui;
+                } else {
+                    const c1 = 0.30901699437494745, c2 = -0.8090169943749475, s1 = 0.9510565162951535, s2 = 0.5877852522924731;
+                    const t1r = tr[1] + tr[4], t1i = ti[1] + ti[4], t2r = tr[2] + tr[3], t2i = ti[2] + ti[3];
+                    const d1r = tr[1] - tr[4], d1i = ti[1] - ti[4], d2r = tr[2] - tr[3], d2i = ti[2] - ti[3];
+                    const a1r = tr[0] + c1 * t1r + c2 * t2r, a1i = ti[0] + c1 * t1i + c2 * t2i;
+                    const a2r = tr[0] + c2 * t1r + c1 * t2r, a2i = ti[0] + c2 * t1i + c1 * t2i;
+                    const b1r = s1 * d1r + s2 * d2r, b1i = s1 * d1i + s2 * d2i;
+                    const b2r = s2 * d1r - s1 * d2r, b2i = s2 * d1i - s1 * d2i;
+                    // s * i * b
+                    const u1r = sg > 0 ? -b1i : b1i, u1i = sg > 0 ? b1r : -b1r, u2r = sg > 0 ? -b2i : b2i, u2i = sg > 0 ? b2r : -b2r;
+                    const i0 = oo + k, i1 = i0 + m, i2 = i1 + m, i3 = i2 + m, i4 = i3 + m;
+                    yr[i0] = tr[0] + t1r + t2r; yi[i0] = ti[0] + t1i + t2i;
+                    yr[i1] = a1r + u1r; yi[i1] = a1i + u1i;
+                    yr[i4] = a1r - u1r; yi[i4] = a1i - u1i;
+                    yr[i2] = a2r + u2r; yi[i2] = a2i + u2i;
+                    yr[i3] = a2r - u2r; yi[i3] = a2i - u2i;
+                }
+            }
+        }
+    }
+    // The unnormalized transform of (xr, xi) into (yr, yi), all of the
+    // plan's length (x is not modified).
+    function fftRun(p, xr, xi, yr, yi) {
+        const n = p.n;
+        if (p.blue === null) {
+            if (p.tmpr === undefined) {
+                p.tmpr = new Float64Array(32); p.tmpi = new Float64Array(32);
+                p.pr = new Float64Array(16); p.pi = new Float64Array(16); p.mr = new Float64Array(16); p.mi = new Float64Array(16);
+            }
+            fftRec(p, n, xr, xi, 0, 1, yr, yi, 0, 0);
+            return;
+        }
+        const b = p.blue, m = b.m, ar = b.ar, ai = b.ai, tr = b.tr, ti = b.ti, wr = b.wr, wi = b.wi;
+        for (let j = 0; j < m; j++) { ar[j] = 0; ai[j] = 0; }
+        for (let j = 0; j < n; j++) { const a = xr[j], c = xi[j]; ar[j] = a * wr[j] - c * wi[j]; ai[j] = a * wi[j] + c * wr[j]; }
+        fftRun(b.sub, ar, ai, tr, ti);
+        for (let j = 0; j < m; j++) { const a = tr[j], c = ti[j], d = b.Br[j], e = b.Bi[j]; ar[j] = a * d - c * e; ai[j] = a * e + c * d; }
+        fftRun(b.inv, ar, ai, tr, ti);
+        for (let k = 0; k < n; k++) { const a = tr[k] / m, c = ti[k] / m; yr[k] = a * wr[k] - c * wi[k]; yi[k] = a * wi[k] + c * wr[k]; }
+    }
+    // fft(src, rows, nIn, n, mode, inverse, scale): `rows` rows of nIn
+    // input elements each (zero-padded or truncated to the transform
+    // length n; for mode 2, to n/2+1 bins), every output scaled by `scale`.
+    function fft(a, rows, nIn, n, mode, inverse, scale) {
+        const complexIn = a.cls === CStorage, rdt = complexIn ? PAIR[a.dtype] : a.dtype;
+        const realIn = mode === 1 || mode === 3;
+        if (realIn === complexIn || (rdt !== "float32" && rdt !== "float64")) fail(E.TypeError, "fft: bad input dtype " + a.dtype);
+        const half = (n >> 1) + 1, nOut = mode === 1 ? half : n;
+        const out = mode === 2 ? alloc(rdt, rows * nOut) : calloc(COMPLEX_OF[rdt], rows * nOut), O = out.data, A = a.data;
+        if (rows === 0 || n === 0) return out;
+        if (NATIVE !== null && NATIVE(N_FFT, A, O, rows, nIn, n, mode, inverse ? 1 : 0, scale)) return out;
+        const p = fftPlan(n, inverse ? 1 : -1);
+        const xr = new Float64Array(n), xi = new Float64Array(n), yr = new Float64Array(n), yi = new Float64Array(n);
+        for (let row = 0; row < rows; row++) {
+            for (let j = 0; j < n; j++) { xr[j] = 0; xi[j] = 0; }
+            if (mode === 0) {
+                const c = nIn < n ? nIn : n, base = 2 * row * nIn;
+                for (let j = 0; j < c; j++) { xr[j] = A[base + 2 * j]; xi[j] = A[base + 2 * j + 1]; }
+            } else if (realIn) {
+                const c = nIn < n ? nIn : n, base = row * nIn;
+                for (let j = 0; j < c; j++) xr[j] = A[base + j];
+            } else {
+                // The Hermitian extension of the first n/2+1 bins.
+                const c = nIn < half ? nIn : half, base = 2 * row * nIn;
+                for (let k = 0; k < c; k++) {
+                    const re = A[base + 2 * k], im = A[base + 2 * k + 1];
+                    if (k === 0 || 2 * k === n) { xr[k] = re; continue; }
+                    xr[k] = re; xi[k] = im; xr[n - k] = re; xi[n - k] = -im;
+                }
+            }
+            fftRun(p, xr, xi, yr, yi);
+            if (realIn) {
+                yi[0] = 0;
+                if ((n & 1) === 0) yi[n >> 1] = 0;
+                if (mode === 3) for (let k = half; k < n; k++) { yr[k] = yr[n - k]; yi[k] = -yi[n - k]; }
+            }
+            if (mode === 2) { const base = row * n; for (let j = 0; j < n; j++) O[base + j] = yr[j] * scale; }
+            else { const base = 2 * row * nOut; for (let k = 0; k < nOut; k++) { O[base + 2 * k] = yr[k] * scale; O[base + 2 * k + 1] = yi[k] * scale; } }
+        }
+        return out;
+    }
+    // ---- torch.linalg's factorizations ----------------------------------------------------------
+    // linalg(op, inputs, dims): a batch of dense factorizations run
+    // natively (`vm::py_tensor::linalg`) into float64 storages sized here,
+    // or null when the native kernel declines (or the native loops are
+    // off); torch_linalg.py then runs its own Python algorithms, which the
+    // native ones match to its documented tolerances. ops: 1 lu, 2 solve,
+    // 3 triangular solve, 4 cholesky, 5 qr, 6 eigh, 7 svd, 8 eig.
+    const LINALG_OUTS = {
+        1: (d) => [d[0] * d[1] * d[2], d[0] * d[1], d[0] * Math.min(d[1], d[2]), d[0], d[0]],
+        2: (d) => [d[0] * d[1] * d[2], d[0]],
+        3: (d) => [d[0] * d[1] * d[2]],
+        4: (d) => [d[0] * d[1] * d[1], d[0]],
+        5: (d) => [d[0] * d[1] * d[3], d[0] * d[4] * d[2]],
+        6: (d) => [d[0] * d[1], d[0] * d[1] * d[1]],
+        7: (d) => { const k = Math.min(d[1], d[2]); return [d[0] * d[1] * (d[3] ? d[1] : k), d[0] * k, d[0] * (d[3] ? d[2] : k) * d[2]]; },
+        8: (d) => [d[0] * d[1], d[0] * d[1], d[0] * d[1] * d[1], d[0] * d[1] * d[1], d[0]],
+    };
+    function linalg(op, ins, dims) {
+        const f = LINALG_OUTS[op];
+        if (f === undefined) fail(E.ValueError, "unknown linalg op " + op);
+        if (NATIVE === null) return null;
+        const outs = f(dims).map((n) => alloc("float64", n));
+        const args = [N_LINALG, op, ins.length, outs.length];
+        for (let i = 0; i < ins.length; i++) args.push(ins[i].data);
+        for (let i = 0; i < outs.length; i++) args.push(outs[i].data);
+        for (let i = 0; i < dims.length; i++) args.push(dims[i]);
+        return NATIVE(...args) ? list(outs) : null;
+    }
     // ---- random: MT19937, with PyTorch's CPU transforms ------------------------------------------
     function mt(seed) {
         const s = { mt: new Uint32Array(624), i: 625 };
@@ -1467,8 +2005,9 @@
     function toBytes(a) {
         const n = a.data.length;
         let bytes;
-        if (a.dtype === "float32") bytes = new Uint8Array(Float32Array.from(a.data).buffer);
-        else if (a.dtype === "float64") bytes = new Uint8Array(Float64Array.from(a.data).buffer);
+        // A complex storage's interleaved pairs are PyTorch's layout.
+        if (a.dtype === "float32" || a.dtype === "complex64") bytes = new Uint8Array(Float32Array.from(a.data).buffer);
+        else if (a.dtype === "float64" || a.dtype === "complex128") bytes = new Uint8Array(Float64Array.from(a.data).buffer);
         else if (a.dtype === "int64") { const b = new ArrayBuffer(n * 8), v = new DataView(b); for (let i = 0; i < n; i++) v.setBigInt64(i * 8, BigInt(Math.trunc(a.data[i])), true); bytes = new Uint8Array(b); }
         else if (a.dtype === "int32") { const b = new ArrayBuffer(n * 4), v = new DataView(b); for (let i = 0; i < n; i++) v.setInt32(i * 4, a.data[i], true); bytes = new Uint8Array(b); }
         else if (a.dtype === "int16") bytes = new Uint8Array(Int16Array.from(a.data).buffer);
@@ -1494,6 +2033,8 @@
         const n = count === null ? undefined : count;
         if (dtype === "float32") { const m = n === undefined ? items.length / 4 : n, out = alloc("float32", m); for (let i = 0; i < m; i++) out.data[i] = view.getFloat32(i * 4, true); return out; }
         if (dtype === "float64") { const m = n === undefined ? items.length / 8 : n, out = alloc("float64", m); for (let i = 0; i < m; i++) out.data[i] = view.getFloat64(i * 8, true); return out; }
+        if (dtype === "complex64") { const m = n === undefined ? items.length / 8 : n, out = calloc("complex64", m); for (let i = 0; i < 2 * m; i++) out.data[i] = view.getFloat32(i * 4, true); return out; }
+        if (dtype === "complex128") { const m = n === undefined ? items.length / 16 : n, out = calloc("complex128", m); for (let i = 0; i < 2 * m; i++) out.data[i] = view.getFloat64(i * 8, true); return out; }
         if (dtype === "int64") { const m = n === undefined ? items.length / 8 : n, out = alloc("int64", m); for (let i = 0; i < m; i++) out.data[i] = Number(view.getBigInt64(i * 8, true)); return out; }
         if (dtype === "int32") { const m = n === undefined ? items.length / 4 : n, out = alloc("int32", m); for (let i = 0; i < m; i++) out.data[i] = view.getInt32(i * 4, true); return out; }
         if (dtype === "int16") { const m = n === undefined ? items.length / 2 : n, out = alloc("int16", m); for (let i = 0; i < m; i++) out.data[i] = view.getInt16(i * 2, true); return out; }
@@ -1741,8 +2282,8 @@
     rt.defineModule("_zipp_tensor", (g) => {
         const fn = (name, arity, code, min) => g.set(name, rt.builtin(name, arity, code, min));
         const num = (v) => jsNumber(v);
-        fn("zeros", 2, (a) => alloc(rt.needStr(a[0]), num(a[1])));
-        fn("full", 3, (a) => { const s = alloc(rt.needStr(a[0]), num(a[1])); s.data.fill(enc(s.dtype, num(a[2]))); return s; });
+        fn("zeros", 2, (a) => { const d = rt.needStr(a[0]); return d.length > 8 ? calloc(d, num(a[1])) : alloc(d, num(a[1])); });
+        fn("full", 3, (a) => { const d = rt.needStr(a[0]); if (d.length > 8) { const c = calloc(d, num(a[1])); fillPair(c, num(a[2]), 0); return c; } const s = alloc(d, num(a[1])); s.data.fill(enc(s.dtype, num(a[2]))); return s; });
         // arange(dtype, start, step, n): element i is castValue(start + i * step),
         // what from_flat gives for the list torch builds (torch.arange checks
         // that the double arithmetic is exact or is Python's float arithmetic).
@@ -1768,7 +2309,28 @@
         // _size(t): torch.Size(t) for a tuple t, as the tuple constructor
         // builds a subclass instance (`rt.allocInstance`, then its items).
         fn("_size", 1, (a) => { const v = a[0]; if (SIZE === null || v === null || typeof v !== "object" || v.cls !== T.tuple) fail(E.TypeError, "_size expects a tuple"); return { cls: SIZE, items: v.items.slice(), dict: new Map() }; });
-        fn("from_flat", 2, (a) => { const items = a[1].items, s = alloc(rt.needStr(a[0]), items.length), cv = encoder(s.dtype); for (let i = 0; i < items.length; i++) s.data[i] = cv(s.dtype, jsNumber(items[i])); return s; });
+        fn("from_flat", 2, (a) => {
+            const items = a[1].items, s = anyAlloc(rt.needStr(a[0]), items.length), cv = encoder(s.dtype);
+            // A complex dtype takes real values (zero imaginary parts).
+            if (s.cls === CStorage) { for (let i = 0; i < items.length; i++) s.data[2 * i] = jsNumber(items[i]); return s; }
+            for (let i = 0; i < items.length; i++) s.data[i] = cv(s.dtype, jsNumber(items[i])); return s;
+        });
+        // from_pairs(dtype, flat): a complex storage from interleaved
+        // (real, imaginary) numbers.
+        fn("from_pairs", 2, (a) => {
+            const items = a[1].items, d = rt.needStr(a[0]);
+            if (PAIR[d] === undefined || (items.length & 1)) fail(E.TypeError, "from_pairs needs a complex dtype and an even count");
+            const s = calloc(d, items.length >> 1);
+            for (let i = 0; i < items.length; i++) s.data[i] = jsNumber(items[i]);
+            return s;
+        });
+        // as_real(s) / as_complex(s): the same memory as the real dtype
+        // with a trailing dimension of 2, or back (view_as_real /
+        // view_as_complex); both share `s`'s version counter.
+        fn("as_real", 1, (a) => { const s = needSC(a[0]); if (s.cls !== CStorage) fail(E.TypeError, "as_real needs a complex storage"); const v = make(PAIR[s.dtype], s.data); v.base = root(s); return v; });
+        fn("as_complex", 1, (a) => { const s = needSC(a[0]), d = COMPLEX_OF[s.dtype]; if (d === undefined || (s.data.length & 1)) fail(E.TypeError, "as_complex needs a float32/float64 storage of even size"); const v = cmake(d, s.data); v.base = root(s); return v; });
+        // fill_complex(s, re, im): every element set to re + im j.
+        fn("fill_complex", 3, (a) => { const s = needSC(a[0]); if (s.cls !== CStorage) fail(E.TypeError, "fill_complex needs a complex storage"); fillPair(s, num(a[1]), num(a[2])); written(s); return null; });
         fn("to_list", 1, (a) => {
             const s = needS(a[0]), d = vals(s), out = new Array(d.length);
             if (isFloatDtype(s.dtype)) { for (let i = 0; i < out.length; i++) out[i] = d[i]; }
@@ -1777,29 +2339,17 @@
         });
         fn("item", 2, (a) => { const s = needS(a[0]), i = num(a[1]); return pyNumber(s.dtype, s.dtype === "bfloat16" && s.data[i] !== undefined ? bfValue(s.data[i]) : s.data[i]); });
         fn("setitem", 3, (a) => { const s = needS(a[0]); s.data[num(a[1])] = enc(s.dtype, num(a[2])); written(s); return null; });
-        fn("copy", 1, (a) => { const s = needS(a[0]); return make(s.dtype, s.data.slice()); });
-        fn("astype", 2, (a) => {
-            const s = needS(a[0]), d = rt.needStr(a[1]); const out = alloc(d, s.data.length);
-            // A float target converts exactly as castValue does (the typed
-            // array rounds float32 on store; float16 and bfloat16 round that
-            // float32 to the format); integer targets truncate.
-            if (d === s.dtype && HALF[d] === 1) { out.data.set(s.data); return out; }
-            const S = vals(s), O = out.data, n = O.length;
-            if (d === "float32" || d === "float64") O.set(S);
-            else if (d === "float16") { if (S instanceof Float32Array) O.set(S); else for (let i = 0; i < n; i++) O[i] = Math.fround(S[i]); }
-            else if (d === "bfloat16") for (let i = 0; i < n; i++) O[i] = bfBits(Math.fround(S[i]));
-            else for (let i = 0; i < n; i++) O[i] = castValue(d, S[i]);
-            return out;
-        });
-        fn("dtype", 1, (a) => needS(a[0]).dtype);
-        fn("size", 1, (a) => BigInt(needS(a[0]).data.length));
-        fn("version", 1, (a) => BigInt(needS(a[0]).version));
+        fn("copy", 1, (a) => { const s = a[0]; if (isStorage(s)) return make(s.dtype, s.data.slice()); needC(s); return cmake(s.dtype, s.data.slice()); });
+        fn("astype", 2, (a) => { const s = a[0], d = rt.needStr(a[1]); return isStorage(s) && d.length <= 8 ? astype(s, d) : castPair(needC(s), d); });
+        fn("dtype", 1, (a) => needSC(a[0]).dtype);
+        fn("size", 1, (a) => { const s = a[0]; return BigInt(isStorage(s) ? s.data.length : count(needC(s))); });
+        fn("version", 1, (a) => BigInt(root(needSC(a[0])).version));
         // Autograd's view of the version: writes made through `.data` (which
         // PyTorch gives a version counter of its own) are not counted, the
         // total `version` above still is.
-        fn("aversion", 1, (a) => { const s = needS(a[0]); return BigInt(s.version - s.untracked); });
-        fn("untrack", 1, (a) => { needS(a[0]).untracked++; return null; });
-        fn("all_finite", 1, (a) => allFinite(needS(a[0])));
+        fn("aversion", 1, (a) => { const s = root(needSC(a[0])); return BigInt(s.version - s.untracked); });
+        fn("untrack", 1, (a) => { root(needSC(a[0])).untracked++; return null; });
+        fn("all_finite", 1, (a) => { const s = a[0]; return isStorage(s) ? allFinite(s) : allFinite(realOf(needC(s))); });
         // _native(on): switch the native loops (`vm::py_tensor`) on or off,
         // returning whether they were on; for comparing the two paths.
         fn("_native", 1, (a) => { const was = NATIVE !== null; NATIVE = rt.truth(a[0]) ? NATIVE_FN : null; return was; });
@@ -1824,9 +2374,21 @@
         fn("graph_gather", 5, (a) => graphGather(needS(a[0]), needS(a[1]), graphInts(a[2]), graphInts(a[3]), num(a[4])));
         fn("graph_scatter_add", 6, (a) => graphScatterAdd(needS(a[0]), needS(a[1]), needS(a[2]), graphInts(a[3]), graphInts(a[4]), num(a[5])));
         fn("life", 3, (a) => life(needS(a[0]), num(a[1]), num(a[2])));
-        fn("fill", 2, (a) => { const s = needS(a[0]); s.data.fill(enc(s.dtype, num(a[1]))); written(s); return null; });
+        fn("fill", 2, (a) => { const s = a[0]; if (isStorage(s)) s.data.fill(enc(s.dtype, num(a[1]))); else fillPair(needC(s), num(a[1]), 0); written(s); return null; });
         fn("copy_into", 2, (a) => {
-            const d = needS(a[0]), s = needS(a[1]); if (d.data.length !== s.data.length) fail(E.RuntimeError, "size mismatch");
+            const d = a[0], s = a[1];
+            if (!isStorage(d) || !isStorage(s)) {
+                needC(d); needC(s);
+                // Into a complex storage: a real source's values with zero
+                // imaginary parts; a complex source is never written into
+                // a real storage (the caller refuses that cast).
+                if (d.cls !== CStorage) fail(E.RuntimeError, "a complex value cannot be written into a real storage");
+                if (count(d) !== count(s)) fail(E.RuntimeError, "size mismatch");
+                d.data.set(toPair(s, d.dtype).data);
+                written(d);
+                return null;
+            }
+            if (d.data.length !== s.data.length) fail(E.RuntimeError, "size mismatch");
             // A float storage of its own dtype holds values castValue leaves
             // unchanged, so a block copy is the same store.
             if (d.dtype === s.dtype && isFloatDtype(d.dtype)) d.data.set(s.data);
@@ -1840,27 +2402,111 @@
         // storage exactly as `full` stores it (`flip`: the number is the
         // left operand), so no 0-d tensor has to be built for it.
         fn("binary_scalar", 7, (a) => {
-            const s = alloc(rt.needStr(a[4]), 1);
+            const sd = rt.needStr(a[4]), t = a[1], want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
+            if (sd.length <= 8 && isStorage(t)) {
+                const s = alloc(sd, 1);
+                s.data[0] = enc(s.dtype, num(a[3]));
+                return rt.truth(a[6]) ? binary(rt.needStr(a[0]), s, [], t, shapeOf(a[2]), undefined, a[2], want)
+                    : binary(rt.needStr(a[0]), t, shapeOf(a[2]), s, [], a[2], undefined, want);
+            }
+            const s = anyAlloc(sd, 1);
             s.data[0] = enc(s.dtype, num(a[3]));
-            const want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
-            return rt.truth(a[6]) ? binary(rt.needStr(a[0]), s, [], needS(a[1]), shapeOf(a[2]), undefined, a[2], want)
-                : binary(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), s, [], a[2], undefined, want);
+            needC(t);
+            return rt.truth(a[6]) ? cbinary(rt.needStr(a[0]), s, [], t, shapeOf(a[2]), want) : cbinary(rt.needStr(a[0]), t, shapeOf(a[2]), s, [], want);
         });
-        fn("binary", 6, (a) => binary(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), needS(a[3]), shapeOf(a[4]), a[2], a[4], a[5] === undefined || a[5] === null ? null : rt.needStr(a[5])), 5);
-        fn("unary", 4, (a) => unary(rt.needStr(a[0]), needS(a[1]), a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]), 2);
-        fn("reduce", 6, (a) => reduce(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])), 5);
-        fn("permute", 3, (a) => permute(needS(a[0]), shapeOf(a[1]), a[2]));
-        fn("expand", 3, (a) => expand(needS(a[0]), shapeOf(a[1]), a[2]));
-        fn("slice", 3, (a) => slice(needS(a[0]), shapeOf(a[1]), a[2]));
-        fn("setslice", 5, (a) => setSlice(needS(a[0]), shapeOf(a[1]), a[2], needS(a[3]), shapeOf(a[4])));
-        fn("gather", 4, (a) => gather(needS(a[0]), shapeOf(a[1]), a[2], a[3]));
-        fn("scatter", 6, (a) => scatter(needS(a[0]), shapeOf(a[1]), a[2], a[3], needS(a[4]), shapeOf(a[5])));
-        fn("scatter_add", 6, (a) => scatterAdd(needS(a[0]), shapeOf(a[1]), a[2], a[3], needS(a[4]), shapeOf(a[5])));
-        fn("index_select", 4, (a) => indexSelect(needS(a[0]), shapeOf(a[1]), num(a[2]), needS(a[3])));
-        fn("cat", 2, (a) => cat(a[0], num(a[1])));
-        fn("roll", 4, (a) => roll(needS(a[0]), shapeOf(a[1]), num(a[2]), num(a[3])));
+        fn("binary", 6, (a) => {
+            const x = a[1], y = a[3], want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
+            if (isStorage(x) && isStorage(y) && (want === null || want.length <= 8)) return binary(rt.needStr(a[0]), x, shapeOf(a[2]), y, shapeOf(a[4]), a[2], a[4], want);
+            return cbinary(rt.needStr(a[0]), needC(x), shapeOf(a[2]), needC(y), shapeOf(a[4]), want);
+        }, 5);
+        fn("unary", 4, (a) => { const x = a[1]; return isStorage(x) ? unary(rt.needStr(a[0]), x, a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]) : cunary(rt.needStr(a[0]), needC(x)); }, 2);
+        fn("reduce", 6, (a) => { const x = a[1]; return isStorage(x) ? reduce(rt.needStr(a[0]), x, shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])) : creduce(rt.needStr(a[0]), needC(x), shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])); }, 5);
+        // The copying kernels on a complex storage: the same kernel over
+        // its real memory with a trailing dimension of 2.
+        fn("permute", 3, (a) => {
+            const x = a[0];
+            if (isStorage(x)) { const sh = shapeOf(a[1]); return permute(x, sh, a[2]); }
+            needC(x);
+            const sh = shapeOf(a[1]);
+            const p = ints(a[2]); p.push(sh.length);
+            return lowered(permute(realOf(x), sh.concat([2]), pyInts(p)), x.dtype);
+        });
+        fn("expand", 3, (a) => {
+            const x = a[0];
+            if (isStorage(x)) { const sh = shapeOf(a[1]); return expand(x, sh, a[2]); }
+            needC(x);
+            const sh = shapeOf(a[1]);
+            return asPair(expand(realOf(x), sh.concat([2]), pyInts(ints(a[2]).concat([2]))), x.dtype);
+        });
+        fn("slice", 3, (a) => {
+            const x = a[0];
+            if (isStorage(x)) { const sh = shapeOf(a[1]); return slice(x, sh, a[2]); }
+            needC(x);
+            const sh = shapeOf(a[1]);
+            return lowered(slice(realOf(x), sh.concat([2]), a[2]), x.dtype);
+        });
+        fn("setslice", 5, (a) => {
+            const x = a[0];
+            if (isStorage(x)) { const sh = shapeOf(a[1]); return setSlice(x, sh, a[2], needS(a[3]), shapeOf(a[4])); }
+            needC(x);
+            const sh = shapeOf(a[1]);
+            setSlice(realOf(x), sh.concat([2]), a[2], realOf(toPair(needSC(a[3]), x.dtype)), shapeOf(a[4]).concat([2]));
+            written(x);
+            return null;
+        });
+        fn("gather", 4, (a) => {
+            const x = a[0];
+            if (isStorage(x)) { const sh = shapeOf(a[1]); return gather(x, sh, a[2], a[3]); }
+            needC(x);
+            const sh = shapeOf(a[1]);
+            return lowered(gather(realOf(x), sh.concat([2]), a[2], a[3]), x.dtype);
+        });
+        const scatterC = (f) => (a) => {
+            const x = a[0];
+            if (isStorage(x)) { const sh = shapeOf(a[1]); return f(x, sh, a[2], a[3], needS(a[4]), shapeOf(a[5])); }
+            needC(x);
+            const sh = shapeOf(a[1]);
+            f(realOf(x), sh.concat([2]), a[2], a[3], realOf(toPair(needSC(a[4]), x.dtype)), shapeOf(a[5]).concat([2]));
+            written(x);
+            return null;
+        };
+        fn("scatter", 6, scatterC(scatter));
+        fn("scatter_add", 6, scatterC(scatterAdd));
+        fn("index_select", 4, (a) => {
+            const x = a[0], d = num(a[2]);
+            if (isStorage(x)) { const sh = shapeOf(a[1]); return indexSelect(x, sh, d, needS(a[3])); }
+            needC(x);
+            const sh = shapeOf(a[1]);
+            return lowered(indexSelect(realOf(x), sh.concat([2]), d < 0 ? d + sh.length : d, needS(a[3])), x.dtype);
+        });
+        fn("cat", 2, (a) => {
+            const items = a[0].items;
+            let cdt = null;
+            for (let i = 0; i < items.length; i++) { const st = items[i].items[0]; if (!isStorage(st) && isCStorage(st)) cdt = cdt === null ? st.dtype : promote(cdt, st.dtype); }
+            if (cdt === null) return cat(a[0], num(a[1]));
+            for (let i = 0; i < items.length; i++) cdt = promote(cdt, items[i].items[0].dtype);
+            const parts = new Array(items.length);
+            for (let i = 0; i < items.length; i++) parts[i] = tuple([realOf(toPair(items[i].items[0], cdt)), pyShape(shapeOf(items[i].items[1]).concat([2]))]);
+            const rank = shapeOf(items[0].items[1]).length, d = num(a[1]);
+            return lowered(cat(list(parts), d < 0 ? d + rank : d), cdt);
+        });
+        fn("roll", 4, (a) => {
+            const x = a[0], d = num(a[3]);
+            if (isStorage(x)) { const sh = shapeOf(a[1]); return roll(x, sh, num(a[2]), d); }
+            needC(x);
+            const sh = shapeOf(a[1]);
+            return asPair(roll(realOf(x), sh.concat([2]), num(a[2]), d < 0 ? d + sh.length : d), x.dtype);
+        });
         fn("pad_last", 5, (a) => padLast(needS(a[0]), shapeOf(a[1]), num(a[2]), num(a[3]), num(a[4])));
-        fn("matmul", 5, (a) => matmul(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), a[4] !== undefined && a[4] !== null && rt.truth(a[4])), 4);
+        fn("matmul", 5, (a) => {
+            const x = a[0], y = a[2], transB = a[4] !== undefined && a[4] !== null && rt.truth(a[4]);
+            if (!isStorage(x) || !isStorage(y)) {
+                needC(x); needC(y);
+                if (transB) fail(E.RuntimeError, "matmul: a transposed complex operand is not supported");
+                return cmatmul(x, shapeOf(a[1]), y, shapeOf(a[3]));
+            }
+            return matmul(x, shapeOf(a[1]), y, shapeOf(a[3]), transB);
+        }, 4);
         fn("max_pool2d", 3, (a) => maxPool2d(needS(a[0]), shapeOf(a[1]), ints(a[2])));
         fn("max_pool2d_backward", 4, (a) => maxPool2dBackward(needS(a[0]), needS(a[1]), shapeOf(a[2]), ints(a[3])));
         fn("conv1d", 5, (a) => conv1d(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), a[4] === null ? null : needS(a[4])));
@@ -1870,13 +2516,25 @@
         fn("softmax", 4, (a) => softmax(needS(a[0]), shapeOf(a[1]), num(a[2]), rt.truth(a[3])));
         fn("argsort", 4, (a) => argsort(needS(a[0]), shapeOf(a[1]), num(a[2]), rt.truth(a[3])));
         fn("one_hot", 2, (a) => oneHot(needS(a[0]), num(a[1])));
-        fn("where", 7, (a) => where(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), needS(a[4]), shapeOf(a[5]), a[6] === undefined || a[6] === null ? null : rt.needStr(a[6])), 6);
-        fn("scan", 4, (a) => scan(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), num(a[3])));
-        fn("strided", 4, (a) => strided(needS(a[0]), shapeOf(a[1]), shapeOf(a[2]), num(a[3])));
+        fn("where", 7, (a) => {
+            const x = a[2], y = a[4], want = a[6] === undefined || a[6] === null ? null : rt.needStr(a[6]);
+            if (isStorage(x) && isStorage(y) && (want === null || want.length <= 8))
+                return where(needS(a[0]), shapeOf(a[1]), x, shapeOf(a[3]), y, shapeOf(a[5]), want);
+            needC(x); needC(y);
+            const cdt = want !== null && PAIR[want] !== undefined ? want : promote(x.dtype, y.dtype);
+            return lowered(where(needS(a[0]), shapeOf(a[1]).concat([1]), realOf(toPair(x, cdt)), shapeOf(a[3]).concat([2]), realOf(toPair(y, cdt)), shapeOf(a[5]).concat([2]), PAIR[cdt]), cdt);
+        }, 6);
+        fn("scan", 4, (a) => { const x = a[1]; return isStorage(x) ? scan(rt.needStr(a[0]), x, shapeOf(a[2]), num(a[3])) : cscan(rt.needStr(a[0]), needC(x), shapeOf(a[2]), num(a[3])); });
+        fn("strided", 4, (a) => {
+            const x = a[0], sh = shapeOf(a[1]), st = shapeOf(a[2]), off = num(a[3]);
+            if (isStorage(x)) return strided(x, sh, st, off);
+            needC(x);
+            return asPair(strided(realOf(x), sh.concat([2]), st.map((v) => 2 * v).concat([1]), 2 * off), x.dtype);
+        });
         fn("gen_get_state", 1, (a) => genGetState(a[0]));
         fn("gen_set_state", 2, (a) => genSetState(a[0], a[1]));
         fn("allclose", 4, (a) => { const x = needS(a[0]), y = needS(a[1]); const rtol = num(a[2]), atol = num(a[3]); if (x.data.length !== y.data.length) return false; const X = vals(x), Y = vals(y); for (let i = 0; i < X.length; i++) { const p = X[i], q = Y[i]; if (p === q) continue; if (!Number.isFinite(p) || !Number.isFinite(q) || Math.abs(p - q) > atol + rtol * Math.abs(q)) return false; } return true; });
-        fn("equal", 2, (a) => { const x = needS(a[0]), y = needS(a[1]); if (x.data.length !== y.data.length) return false; const X = vals(x), Y = vals(y); for (let i = 0; i < X.length; i++) if (X[i] !== Y[i]) return false; return true; });
+        fn("equal", 2, (a) => { const x = needSC(a[0]), y = needSC(a[1]); if (x.data.length !== y.data.length) return false; const X = vals(x), Y = vals(y); for (let i = 0; i < X.length; i++) if (X[i] !== Y[i]) return false; return true; });
         fn("gen", 1, (a) => genNew(rt.asInt(rt.needInt(a[0]))));
         fn("gen_seed", 2, (a) => { const g = a[0]; g.seed = rt.asInt(rt.needInt(a[1])); g.state = mt(Number(BigInt.asUintN(32, g.seed))); return null; });
         fn("gen_initial_seed", 1, (a) => a[0].seed);
@@ -1887,20 +2545,34 @@
         fn("multinomial", 5, (a) => multinomial(a[0], needS(a[1]), shapeOf(a[2]), num(a[3]), rt.truth(a[4])));
         fn("randperm", 2, (a) => randperm(a[0], num(a[1])));
         fn("random64", 2, (a) => random64(a[0], num(a[1])));
-        fn("tobytes", 1, (a) => toBytes(needS(a[0])));
+        fn("tobytes", 1, (a) => toBytes(needSC(a[0])));
         fn("frombytes", 3, (a) => fromBytes(rt.needStr(a[0]), a[1], a[2] === undefined || a[2] === null ? null : num(a[2])), 2);
         // zlib's CRC-32 of a bytes object, for zipfile (torch.save checkpoints).
         fn("crc32", 2, (a) => BigInt(crc32(a[0].items, a[1] === undefined ? 0 : num(a[1]))), 1);
         fn("dot_sum", 2, (a) => { const x = vals(needS(a[0])), y = vals(needS(a[1])); let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; });
         fn("axpy", 3, (a) => {
-            const alpha = num(a[0]), x = vals(needS(a[1])), ys = needS(a[2]), y = ys.data, dt = ys.dtype;
+            const alpha = num(a[0]), xs = a[1], ys = a[2];
+            if (!isStorage(xs) || !isStorage(ys)) {
+                needC(xs); needC(ys);
+                // y += alpha * x on complex storages of one dtype, part by part.
+                if (xs.dtype !== ys.dtype) fail(E.RuntimeError, "axpy: complex storages must share a dtype");
+                const X = xs.data, Y = ys.data;
+                for (let i = 0; i < Y.length; i++) Y[i] = Y[i] + alpha * X[i];
+                written(ys);
+                return null;
+            }
+            const x = vals(xs), y = ys.data, dt = ys.dtype;
             if (dt === "bfloat16") for (let i = 0; i < y.length; i++) y[i] = bfBits(Math.fround(bfValue(y[i]) + alpha * x[i]));
             else for (let i = 0; i < y.length; i++) y[i] = castValue(dt, y[i] + alpha * x[i]);
             written(ys);
             return null;
         });
         // nbytes(s): the bytes a storage's elements occupy.
-        fn("nbytes", 1, (a) => BigInt(needS(a[0]).data.byteLength));
+        fn("nbytes", 1, (a) => BigInt(needSC(a[0]).data.byteLength));
+        // fft(s, rows, n_in, n, mode, inverse, scale): see `fft`.
+        fn("fft", 7, (a) => fft(needSC(a[0]), num(a[1]), num(a[2]), num(a[3]), num(a[4]), rt.truth(a[5]), num(a[6])));
+        // linalg(op, [storages], dims): see `linalg`.
+        fn("linalg", 3, (a) => { const items = a[1].items, ins = new Array(items.length); for (let i = 0; i < items.length; i++) ins[i] = needS(items[i]); return linalg(num(a[0]), ins, ints(a[2])); });
         // view_dtype(s, dtype): a storage of `dtype` over the same memory,
         // for two dtypes whose elements have the same typed-array layout
         // (float16/bfloat16/int16, uint8/int8), else None.
@@ -1911,6 +2583,6 @@
             if (!same) return null;
             return make(d, new C(s.data.buffer, s.data.byteOffset, s.data.length));
         });
-        g.set("Storage", Storage); g.set("Generator", Gen);
+        g.set("Storage", Storage); g.set("ComplexStorage", CStorage); g.set("Generator", Gen);
     });
 })(__zipp_py);

@@ -1,18 +1,21 @@
 """torch.linalg for Zipp: decompositions, solvers, inverses and norms over
 batches of matrices [..., m, n] of float32/float64.
 
-The factorizations run on the CPU in Python floats (double precision) and
-round once to the input's dtype: LU with partial pivoting (det, slogdet,
-inv, solve), LAPACK-style Householder QR (R's diagonal has geqrf's signs),
-cyclic Jacobi for symmetric eigenproblems, one-sided Jacobi for the SVD and
-Hessenberg + Francis double-shift QR for real eigenvalues. Gradients are
+The factorizations run in double precision and round once to the input's
+dtype: LU with partial pivoting (det, slogdet, inv, solve), LAPACK-style
+Householder QR (R's diagonal has geqrf's signs), Cholesky, triangular
+solves, the symmetric eigenproblem, a one-sided Jacobi SVD and Hessenberg +
+Francis double-shift QR for the general eigenproblem. They run as native
+loops (`_zipp_tensor.linalg`, the engine's `vm::py_tensor::linalg`) when the
+engine takes them, and otherwise as the Python algorithms below, which the
+native ones match to the documented tolerances (the symmetric eigenproblem
+runs tridiagonal QL natively and cyclic Jacobi here). Gradients are
 PyTorch's formulas written with tensor operations, so they batch, broadcast
-and (through `create_graph=True`) differentiate again. These are small-matrix
-algorithms, not LAPACK: fine for the matrices a model or a test builds, slow
-for large ones.
+and (through `create_graph=True`) differentiate again.
 
-Complex tensors do not exist here: `eig`/`eigvals` return real tensors when
-every eigenvalue is real and raise NotImplementedError otherwise.
+`eig`/`eigvals` return complex tensors (complex64 for float32 input,
+complex128 for float64), as PyTorch does, with unit eigenvectors whose
+largest component is real and positive (real ones: largest entry positive).
 """
 import math as _math
 import torch
@@ -36,23 +39,27 @@ def _returns(name, fields, items):
     return torch._ReturnTypes(tuple(items), name, fields)
 
 
-def _check_float(A, fname, arg="A"):
+def _check_float(A, fname, arg="A", allow_complex=False):
     if not isinstance(A, torch.Tensor):
         raise TypeError("linalg_%s(): argument '%s' must be Tensor, not %s" % (fname, arg, type(A).__name__))
+    if A.dtype.is_complex:
+        if allow_complex and A.dtype.name in ("complex64", "complex128"):
+            return
+        raise NotImplementedError("linalg.%s: complex input is not supported on Zipp" % fname)
     if not A.dtype.is_floating_point:
         raise RuntimeError("linalg.%s: Expected a floating point or complex tensor as input. Got %s" % (fname, torch._CAST_NAME.get(A.dtype.name, A.dtype.name)))
     if A.dtype.name not in ("float32", "float64"):
         raise RuntimeError("linalg.%s: Low precision dtypes not supported. Got %s" % (fname, {"float16": "Half", "bfloat16": "BFloat16"}.get(A.dtype.name, A.dtype.name)))
 
 
-def _check_matrix(A, fname, arg="A"):
-    _check_float(A, fname, arg)
+def _check_matrix(A, fname, arg="A", allow_complex=False):
+    _check_float(A, fname, arg, allow_complex)
     if A.ndim < 2:
         raise RuntimeError("linalg.%s: The input tensor %s must have at least 2 dimensions." % (fname, arg))
 
 
-def _check_square(A, fname, arg="A"):
-    _check_matrix(A, fname, arg)
+def _check_square(A, fname, arg="A", allow_complex=False):
+    _check_matrix(A, fname, arg, allow_complex)
     if A.shape[-1] != A.shape[-2]:
         raise RuntimeError("linalg.%s: %s must be batches of square matrices, but they are %d by %d matrices" % (fname, arg, A.shape[-2], A.shape[-1]))
 
@@ -94,6 +101,32 @@ def _flat_tensor(flat, shape, dt):
     else:
         flat = [_int(v) for v in flat]
     return torch.Tensor(torch._k.from_flat(dt.name, flat), tuple(shape), dt)
+
+
+# The native factorizations (`_zipp_tensor.linalg`): op codes and a caller.
+_NAT_LU, _NAT_SOLVE, _NAT_TRI, _NAT_CHOL, _NAT_QR, _NAT_EIGH, _NAT_SVD, _NAT_EIG = 1, 2, 3, 4, 5, 6, 7, 8
+
+
+def _native(op, ins, dims):
+    """The float64 output storages of a native factorization of the
+    (contiguous float32/float64) tensors `ins`, or None when the engine
+    declines; the caller then runs its Python algorithm."""
+    return torch._k.linalg(op, [t._s for t in ins], list(dims))
+
+
+def _t64(storage, shape):
+    return torch.Tensor(storage, tuple(shape), torch.float64)
+
+
+def _as(storage, shape, dt):
+    """A native float64 result as a tensor of `dt` (rounded once)."""
+    if dt is torch.float64:
+        return torch.Tensor(storage, tuple(shape), dt)
+    return torch.Tensor(torch._k.astype(storage, dt.name), tuple(shape), dt)
+
+
+def _floats(storage):
+    return torch._k.to_list(storage)
 
 
 def _needs(*ts):
@@ -612,8 +645,8 @@ def _hqr(M):
                         wi[nn - 1] = wi[nn] = 0.0
                     else:
                         wr[nn - 1] = wr[nn] = x + p
-                        wi[nn] = z
-                        wi[nn - 1] = -z
+                        wi[nn - 1] = z
+                        wi[nn] = -z
                     nn -= 2
                 else:
                     if its == 60:
@@ -696,34 +729,75 @@ def _hqr(M):
     return wr[1:], wi[1:]
 
 
-def _real_eig(M, fname, vectors):
+def _unit_complex(x, y):
+    """(x + i y) scaled to unit norm and rotated so that its largest
+    component (the first within a relative 1e-12) is real and positive."""
+    n = len(x)
+    nrm = _math.sqrt(_math.fsum([x[i] * x[i] + y[i] * y[i] for i in _range(n)]))
+    if nrm > 0.0:
+        x = [v / nrm for v in x]
+        y = [v / nrm for v in y]
+    best = 0.0
+    at = 0
+    for i in _range(n):
+        r = _math.hypot(x[i], y[i])
+        if r > best + 1e-12 * best:
+            best = r
+            at = i
+    if best > 0.0:
+        c = x[at] / best
+        s_ = -y[at] / best
+        x, y = [x[i] * c - y[i] * s_ for i in _range(n)], [x[i] * s_ + y[i] * c for i in _range(n)]
+        y[at] = 0.0
+    return x, y
+
+
+def _eig_lists(M):
+    """Eigenvalues (wr, wi) of a real matrix in Schur-diagonal order (a
+    conjugate pair with its positive imaginary part first) and its unit
+    eigenvectors (vr, vi as column lists): the null vectors of A - lambda I
+    from an SVD (of the real 2n x 2n form of A - lambda I for a complex
+    lambda), one group per (numerically) repeated real eigenvalue."""
     n = len(M)
     wr, wi = _hqr(M) if n else ([], [])
     scale = _max([_abs(v) for row in M for v in row] + [1e-300])
-    for re_, im in zip(wr, wi):
-        if _abs(im) > 1e-9 * _max(scale, _abs(re_)):
-            raise NotImplementedError("torch.linalg.%s: the matrix has complex eigenvalues (%r%+rj); complex tensors are not supported on Zipp, so eig/eigvals only handle real spectra" % (fname, re_, im))
-    vals = list(wr)
-    if not vectors:
-        return vals, None
-    # Eigenvectors: null vectors of A - lambda I from its SVD, one group per
-    # (numerically) repeated eigenvalue.
     tol = 1e-9 * _max(scale, 1.0)
-    cols = [None] * n
+    vr = [None] * n
+    vi = [None] * n
     done = [False] * n
     for i in _range(n):
         if done[i]:
             continue
-        group = [j for j in _range(n) if not done[j] and _abs(vals[j] - vals[i]) <= tol]
-        lam = _math.fsum([vals[j] for j in group]) / len(group)
-        shifted = [[M[r][c] - (lam if r == c else 0.0) for c in _range(n)] for r in _range(n)]
-        U, S, Vh = _svd(shifted, n, n, False)
-        for idx, j in enumerate(group):
-            v = Vh[n - 1 - idx][:]
-            _fix_sign(v)
-            cols[j] = v
-            done[j] = True
-    return vals, _transpose(cols)
+        if wi[i] == 0.0:
+            group = [j for j in _range(n) if not done[j] and wi[j] == 0.0 and _abs(wr[j] - wr[i]) <= tol]
+            lam = _math.fsum([wr[j] for j in group]) / len(group)
+            shifted = [[M[r][c] - (lam if r == c else 0.0) for c in _range(n)] for r in _range(n)]
+            U, S, Vh = _svd(shifted, n, n, False)
+            for idx, j in enumerate(group):
+                v = Vh[n - 1 - idx][:]
+                _fix_sign(v)
+                vr[j] = v
+                vi[j] = [0.0] * n
+                done[j] = True
+            continue
+        a, b = wr[i], wi[i]
+        big = [[0.0] * (2 * n) for _ in _range(2 * n)]
+        for r in _range(n):
+            for c in _range(n):
+                v = M[r][c] - (a if r == c else 0.0)
+                big[r][c] = v
+                big[n + r][n + c] = v
+            big[r][n + r] = b
+            big[n + r][r] = -b
+        U, S, Vh = _svd(big, 2 * n, 2 * n, False)
+        v = Vh[2 * n - 1]
+        x, y = _unit_complex(v[:n], v[n:])
+        vr[i], vi[i], done[i] = x, y, True
+        for j in _range(i + 1, n):
+            if not done[j] and wi[j] == -b and wr[j] == a:
+                vr[j], vi[j], done[j] = x[:], [-t for t in y], True
+                break
+    return wr, wi, vr, vi
 
 
 # ---- LU family: det, slogdet, inv, solve -------------------------------------------------
@@ -751,15 +825,31 @@ def _cofactor_backward(A, out, name):
     return _attach(out, (A,), backward, name, (A, out))
 
 
+def _lu_diagonals(A):
+    """Per matrix of A: (sign of the pivoting permutation, U's diagonal)."""
+    batch = _batch(A)
+    n = A.shape[-1]
+    count = _count(batch)
+    nat = _native(_NAT_LU, [A.detach()], (count, n, n))
+    if nat is not None:
+        diag = _floats(torch.diagonal(_t64(nat[0], (count, n, n)), 0, -2, -1)._s)
+        signs = _floats(nat[3])
+        return [(signs[b], diag[b * n:(b + 1) * n]) for b in _range(count)]
+    out = []
+    for M in _mats(A):
+        LU, perm, piv, sign, info = _lu(M)
+        out.append((sign, [LU[i][i] for i in _range(len(M))]))
+    return out
+
+
 def det(A, *, out=None):
     _check_square(A, "det")
     batch = _batch(A)
     vals = []
-    for M in _mats(A):
-        LU, perm, piv, sign, info = _lu(M)
+    for sign, diag in _lu_diagonals(A):
         d = sign
-        for i in _range(len(M)):
-            d *= LU[i][i]
+        for v in diag:
+            d *= v
         vals.append(d)
     res = _flat_tensor(vals, batch, A.dtype)
     if _needs(A):
@@ -771,12 +861,10 @@ def slogdet(A, *, out=None):
     _check_square(A, "slogdet")
     batch = _batch(A)
     signs, logs = [], []
-    for M in _mats(A):
-        LU, perm, piv, sign, info = _lu(M)
+    for sign, diag in _lu_diagonals(A):
         s = sign
         la = 0.0
-        for i in _range(len(M)):
-            d = LU[i][i]
+        for d in diag:
             if d == 0.0:
                 s = 0.0
                 la = -_math.inf
@@ -803,15 +891,25 @@ def slogdet(A, *, out=None):
 def _inv_core(A, fname="linalg.inv", check=True):
     batch = _batch(A)
     n = A.shape[-1]
-    mats = _mats(A)
-    res, infos = [], []
-    for b, M in enumerate(mats):
-        LU, perm, piv, sign, info = _lu(M)
-        if info and check:
-            raise LinAlgError(_batch_msg(fname, b, len(mats), "The diagonal element %d is zero, the inversion could not be completed because the input matrix is singular." % info))
-        res.append(_lu_solve(LU, perm, _identity(n)))
-        infos.append(info)
-    out = _tensor(res, batch, n, n, A.dtype)
+    count = _count(batch)
+    nat = _native(_NAT_SOLVE, [A.detach(), _eye_like(n, (count,), torch.float64).contiguous()], (count, n, n))
+    if nat is not None:
+        infos = [_int(v) for v in _floats(nat[1])]
+        if check:
+            for b, info in enumerate(infos):
+                if info:
+                    raise LinAlgError(_batch_msg(fname, b, count, "The diagonal element %d is zero, the inversion could not be completed because the input matrix is singular." % info))
+        out = _as(nat[0], batch + (n, n), A.dtype)
+    else:
+        mats = _mats(A)
+        res, infos = [], []
+        for b, M in enumerate(mats):
+            LU, perm, piv, sign, info = _lu(M)
+            if info and check:
+                raise LinAlgError(_batch_msg(fname, b, len(mats), "The diagonal element %d is zero, the inversion could not be completed because the input matrix is singular." % info))
+            res.append(_lu_solve(LU, perm, _identity(n)))
+            infos.append(info)
+        out = _tensor(res, batch, n, n, A.dtype)
     if _needs(A):
         def backward(g):
             t = _mT(out)
@@ -821,7 +919,10 @@ def _inv_core(A, fname="linalg.inv", check=True):
 
 
 def inv(A, *, out=None):
-    _check_square(A, "inv")
+    _check_square(A, "inv", allow_complex=True)
+    if A.dtype.is_complex:
+        n = A.shape[-1]
+        return _csolve(A, _eye_like(n, _batch(A), A.dtype))
     return _inv_core(A)
 
 
@@ -843,16 +944,27 @@ def _solve_core(A, B, check=True, fname="torch.linalg.solve"):
     batch = _batch(A)
     n = A.shape[-1]
     k = B.shape[-1]
-    res, infos = [], []
-    Ams = _mats(A)
-    Bms = _mats(B)
-    for b, (M, R) in enumerate(zip(Ams, Bms)):
-        LU, perm, piv, sign, info = _lu(M)
-        if info and check:
-            raise LinAlgError(_batch_msg(fname, b, len(Ams), "The solver failed because the input matrix is singular."))
-        res.append(_lu_solve(LU, perm, R))
-        infos.append(info)
-    out = _tensor(res, batch, n, k, torch.promote_types(A.dtype, B.dtype))
+    count = _count(batch)
+    dt = torch.promote_types(A.dtype, B.dtype)
+    nat = _native(_NAT_SOLVE, [A.detach(), B.detach()], (count, n, k))
+    if nat is not None:
+        infos = [_int(v) for v in _floats(nat[1])]
+        if check:
+            for b, info in enumerate(infos):
+                if info:
+                    raise LinAlgError(_batch_msg(fname, b, count, "The solver failed because the input matrix is singular."))
+        out = _as(nat[0], batch + (n, k), dt)
+    else:
+        res, infos = [], []
+        Ams = _mats(A)
+        Bms = _mats(B)
+        for b, (M, R) in enumerate(zip(Ams, Bms)):
+            LU, perm, piv, sign, info = _lu(M)
+            if info and check:
+                raise LinAlgError(_batch_msg(fname, b, len(Ams), "The solver failed because the input matrix is singular."))
+            res.append(_lu_solve(LU, perm, R))
+            infos.append(info)
+        out = _tensor(res, batch, n, k, dt)
     if _needs(A, B):
         def backward(g):
             gB = _solve_core(_mT(A), g)
@@ -863,8 +975,8 @@ def _solve_core(A, B, check=True, fname="torch.linalg.solve"):
 
 
 def _solve(A, B, left, check, fname, allow_vector=True):
-    _check_square(A, fname)
-    _check_float(B, fname, "B")
+    _check_square(A, fname, allow_complex=True)
+    _check_float(B, fname, "B", allow_complex=True)
     if A.dtype != B.dtype:
         raise RuntimeError("%s: Expected A and B to have the same dtype, but found A of type %s and B of type %s instead" % (fname, torch._CAST_NAME[A.dtype.name], torch._CAST_NAME[B.dtype.name]))
     vector = allow_vector and _is_vector_rhs(A, B)
@@ -878,7 +990,12 @@ def _solve(A, B, left, check, fname, allow_vector=True):
     if Bm.shape[-2] != n:
         raise RuntimeError("linalg.solve: Incompatible shapes of A and B for the equation %s (%dx%d and %dx%d)" % ("AX = B" if left else "XA = B", A.shape[-2], A.shape[-1], Bm.shape[-2], Bm.shape[-1]))
     A2, B2, batch = _broadcast_batch(A, Bm)
-    got = _solve_core(A2, B2, check, "torch.linalg.solve")
+    if A2.dtype.is_complex:
+        got = _csolve(A2, B2)
+        if not check:
+            got = (got, [0] * _count(batch))
+    else:
+        got = _solve_core(A2, B2, check, "torch.linalg.solve")
     X, infos = (got, None) if check else got
     if not left and not vector:
         X = _mT(X)
@@ -903,8 +1020,12 @@ def _tri_core(A, B, upper, unit):
     batch = _batch(A)
     n = A.shape[-1]
     k = B.shape[-1]
-    res = [_tri_solve(M, R, upper, unit) for M, R in zip(_mats(A), _mats(B))]
-    out = _tensor(res, batch, n, k, A.dtype)
+    nat = _native(_NAT_TRI, [A.detach(), B.detach()], (_count(batch), n, k, 1 if upper else 0, 1 if unit else 0))
+    if nat is not None:
+        out = _as(nat[0], batch + (n, k), A.dtype)
+    else:
+        res = [_tri_solve(M, R, upper, unit) for M, R in zip(_mats(A), _mats(B))]
+        out = _tensor(res, batch, n, k, A.dtype)
     if _needs(A, B):
         def backward(g):
             gB = _tri_core(_mT(A), g, not upper, unit)
@@ -939,23 +1060,120 @@ def solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=None):
     return _mT(_tri_core(A2, B2, not upper, bool(unitriangular)))
 
 
-def lu_factor_ex(A, *, pivot=True, check_errors=False, out=None):
-    _check_matrix(A, "lu_factor_ex")
-    if not pivot:
-        raise NotImplementedError("linalg.lu_factor: LU without pivoting is not supported on Zipp")
-    if _needs(A):
-        raise NotImplementedError("linalg.lu_factor: the derivative of the LU factorization is not implemented on Zipp")
+def _lu_factors(A):
+    """The packed LU factors (A's dtype), the 1-based pivots and the infos
+    of every matrix of A, and each row permutation (perm[i] the source row
+    of row i), without history."""
     batch = _batch(A)
     m, n = A.shape[-2], A.shape[-1]
-    mats, pivs, infos = [], [], []
+    k = _min(m, n)
+    count = _count(batch)
+    nat = _native(_NAT_LU, [A.detach()], (count, m, n))
+    if nat is not None:
+        LU = _as(nat[0], batch + (m, n), A.dtype)
+        perms = [_int(v) for v in _floats(nat[1])]
+        pivs = [_int(v) for v in _floats(nat[2])]
+        infos = [_int(v) for v in _floats(nat[4])]
+        return LU, pivs, infos, [perms[b * m:(b + 1) * m] for b in _range(count)]
+    mats, pivs, infos, perms = [], [], [], []
     for M in _mats(A):
         LU, perm, piv, sign, info = _lu(M)
         mats.append(LU)
         pivs.extend(piv)
         infos.append(info)
+        perms.append(perm)
+    return _tensor(mats, batch, m, n, A.dtype), pivs, infos, perms
+
+
+def _perm_matrices(perms, batch, m, dt):
+    """P with A = P L U: P[perm[i]][i] = 1."""
+    flat = []
+    for perm in perms:
+        P = [[0.0] * m for _ in _range(m)]
+        for i in _range(m):
+            P[perm[i]][i] = 1.0
+        for row in P:
+            flat.extend(row)
+    return _flat_tensor(flat, batch + (m, m), dt)
+
+
+def _unpack(LU):
+    """L (unit lower, m x k) and U (upper, k x n) of packed factors, as
+    tensor operations (so differentiable)."""
+    m, n = LU.shape[-2], LU.shape[-1]
+    k = _min(m, n)
+    batch = _batch(LU)
+    L = torch.tril(LU[..., :, :k], -1) + torch.eye(m, k, dtype=LU.dtype)
+    U = torch.triu(LU[..., :k, :])
+    return L, U
+
+
+def _lu_backward(gL, gU, P, L, U):
+    """PyTorch's linalg_lu_backward: A's gradient from those of L and U
+    (either may be None), for A = P L U."""
+    m, n = L.shape[-2], U.shape[-1]
+    k = _min(m, n)
+    if m == n:
+        gA = None
+        if gL is not None:
+            gA = torch.tril(torch.matmul(_mT(L), gL), -1)
+        if gU is not None:
+            t = torch.triu(torch.matmul(gU, _mT(U)))
+            gA = t if gA is None else gA + t
+        gA = solve_triangular(_mT(U), gA, upper=False, left=False)
+        gA = solve_triangular(_mT(L), gA, upper=True, unitriangular=True)
+        return torch.matmul(P, gA)
+    if m < n:
+        U1 = U[..., :, :k]
+        gA = None
+        if gL is not None:
+            gA = torch.matmul(_mT(L), gL)
+        if gU is not None:
+            t = torch.matmul(torch.triu(gU), _mT(U))
+            gA = -t if gA is None else gA - t
+        gA = solve_triangular(_mT(U1), torch.tril(gA, -1), upper=False, left=False)
+        if gU is not None:
+            gA = torch.cat([gA + torch.triu(gU[..., :, :k]), gU[..., :, k:]], -1)
+        gA = solve_triangular(_mT(L), gA, upper=True, unitriangular=True)
+        if gU is None:
+            gA = torch.cat([gA, torch.zeros_like(U[..., :, k:])], -1)
+        return torch.matmul(P, gA)
+    L1 = L[..., :k, :]
+    gA = None
+    if gU is not None:
+        gA = torch.matmul(gU, _mT(U))
+    if gL is not None:
+        t = torch.matmul(_mT(L), torch.tril(gL, -1))
+        gA = -t if gA is None else gA - t
+    gA = solve_triangular(_mT(L1), torch.triu(gA), upper=True, unitriangular=True)
+    if gL is not None:
+        gA = torch.cat([gA + torch.tril(gL[..., :k, :], -1), gL[..., k:, :]], -2)
+    gA = solve_triangular(_mT(U), gA, upper=False, left=False)
+    if gL is None:
+        gA = torch.cat([gA, torch.zeros_like(L[..., k:, :])], -2)
+    return torch.matmul(P, gA)
+
+
+def lu_factor_ex(A, *, pivot=True, check_errors=False, out=None):
+    _check_matrix(A, "lu_factor_ex")
+    if not pivot:
+        raise NotImplementedError("linalg.lu_factor: LU without pivoting is not supported on Zipp")
+    batch = _batch(A)
+    m, n = A.shape[-2], A.shape[-1]
+    LU, pivs, infos, perms = _lu_factors(A)
     if check_errors and any(infos):
         raise LinAlgError("torch.linalg.lu_factor_ex: U[%d,%d] is zero and using it on lu_solve would result in a division by zero. If you still want to perform the factorization, consider calling linalg.lu(A, pivot) or linalg.lu_factor_ex(A, pivot)" % (max(infos), max(infos)))
-    return _returns("linalg_lu_factor_ex", ("LU", "pivots", "info"), (_tensor(mats, batch, m, n, A.dtype), _flat_tensor(pivs, batch + (_min(m, n),), torch.int32), _flat_tensor(infos, batch, torch.int32)))
+    if _needs(A):
+        k = _min(m, n)
+        P = _perm_matrices(perms, batch, m, A.dtype)
+
+        def backward(g):
+            # PyTorch's lu_factor_ex_backward: L's part of the packed
+            # gradient is its first k columns, U's its first k rows.
+            L, U = _unpack(LU)
+            return (_lu_backward(g[..., :, :k], g[..., :k, :], P, L, U),)
+        _attach(LU, (A,), backward, "LinalgLuFactorEx", (LU,))
+    return _returns("linalg_lu_factor_ex", ("LU", "pivots", "info"), (LU, _flat_tensor(pivs, batch + (_min(m, n),), torch.int32), _flat_tensor(infos, batch, torch.int32)))
 
 
 def lu_factor(A, *, pivot=True, out=None):
@@ -968,43 +1186,35 @@ def lu(A, *, pivot=True, out=None):
     _check_matrix(A, "lu")
     if not pivot:
         raise NotImplementedError("linalg.lu: LU without pivoting is not supported on Zipp")
-    if _needs(A):
-        raise NotImplementedError("linalg.lu: the derivative of the LU factorization is not implemented on Zipp")
     batch = _batch(A)
-    m, n = A.shape[-2], A.shape[-1]
-    k = _min(m, n)
-    Ps, Ls, Us = [], [], []
-    for M in _mats(A):
-        LU, perm, piv, sign, info = _lu(M)
-        P = [[0.0] * m for _ in _range(m)]
-        for i in _range(m):
-            P[perm[i]][i] = 1.0
-        Ps.append(P)
-        Ls.append([[LU[i][j] if j < i else (1.0 if i == j else 0.0) for j in _range(k)] for i in _range(m)])
-        Us.append([[LU[i][j] if j >= i else 0.0 for j in _range(n)] for i in _range(k)])
-    return _returns("linalg_lu", ("P", "L", "U"), (_tensor(Ps, batch, m, m, A.dtype), _tensor(Ls, batch, m, k, A.dtype), _tensor(Us, batch, k, n, A.dtype)))
+    m = A.shape[-2]
+    LU, pivs, infos, perms = _lu_factors(A)
+    P = _perm_matrices(perms, batch, m, A.dtype)
+    with torch.no_grad():
+        L, U = _unpack(LU)
+    if _needs(A):
+        _attach(L, (A,), lambda g: (_lu_backward(g, None, P, L, U),), "LinalgLuBackward", (L, U))
+        _attach(U, (A,), lambda g: (_lu_backward(None, g, P, L, U),), "LinalgLuBackward", (L, U))
+    return _returns("linalg_lu", ("P", "L", "U"), (P, L, U))
 
 
 def lu_solve(LU, pivots, B, *, left=True, adjoint=False, out=None):
+    """Solves with A = P L U rebuilt from the packed factors by tensor
+    operations, so the gradients reach LU (through tril/triu) and B."""
     _check_square(LU, "lu_solve", "LU")
-    if _needs(LU, B):
-        raise NotImplementedError("linalg.lu_solve: the derivative is not implemented on Zipp; use linalg.solve")
     n = LU.shape[-1]
-    Ls = _mats(LU)
+    batch = _batch(LU)
     piv = torch._k.to_list(pivots._s)
-    As = []
-    for b, F in enumerate(Ls):
+    perms = []
+    for b in _range(_count(batch)):
         perm = list(_range(n))
         for i in _range(n):
             p = _int(piv[b * n + i]) - 1
             perm[i], perm[p] = perm[p], perm[i]
-        Lm = [[F[i][j] if j < i else (1.0 if i == j else 0.0) for j in _range(n)] for i in _range(n)]
-        Um = [[F[i][j] if j >= i else 0.0 for j in _range(n)] for i in _range(n)]
-        P = [[0.0] * n for _ in _range(n)]
-        for i in _range(n):
-            P[perm[i]][i] = 1.0
-        As.append(_matmul(P, _matmul(Lm, Um)))
-    A = _tensor(As, _batch(LU), n, n, LU.dtype)
+        perms.append(perm)
+    P = _perm_matrices(perms, batch, n, LU.dtype)
+    L, U = _unpack(LU)
+    A = torch.matmul(P, torch.matmul(L, U))
     if adjoint:
         A = _mT(A)
     return _solve(A, B, left, True, "linalg.lu_solve", False)[0]
@@ -1014,15 +1224,27 @@ def lu_solve(LU, pivots, B, *, left=True, adjoint=False, out=None):
 def _cholesky_core(A, upper, check, fname):
     batch = _batch(A)
     n = A.shape[-1]
-    mats = _mats(A)
-    res, infos = [], []
-    for b, M in enumerate(mats):
-        L, info = _cholesky(M)
-        if info and check:
-            raise LinAlgError(_batch_msg(fname, b, len(mats), "The factorization could not be completed because the input is not positive-definite (the leading minor of order %d is not positive-definite)." % info))
-        res.append(_transpose(L) if upper else L)
-        infos.append(info)
-    out = _tensor(res, batch, n, n, A.dtype)
+    count = _count(batch)
+    nat = _native(_NAT_CHOL, [A.detach()], (count, n))
+    if nat is not None:
+        infos = [_int(v) for v in _floats(nat[1])]
+        if check:
+            for b, info in enumerate(infos):
+                if info:
+                    raise LinAlgError(_batch_msg(fname, b, count, "The factorization could not be completed because the input is not positive-definite (the leading minor of order %d is not positive-definite)." % info))
+        out = _as(nat[0], batch + (n, n), A.dtype)
+        if upper:
+            out = _mT(out).contiguous()
+    else:
+        mats = _mats(A)
+        res, infos = [], []
+        for b, M in enumerate(mats):
+            L, info = _cholesky(M)
+            if info and check:
+                raise LinAlgError(_batch_msg(fname, b, len(mats), "The factorization could not be completed because the input is not positive-definite (the leading minor of order %d is not positive-definite)." % info))
+            res.append(_transpose(L) if upper else L)
+            infos.append(info)
+        out = _tensor(res, batch, n, n, A.dtype)
     if _needs(A):
         def backward(g):
             L = _mT(out) if upper else out
@@ -1073,14 +1295,19 @@ def qr(A, mode="reduced", *, out=None):
     k = _min(m, n)
     qcols = m if mode == "complete" else k
     rrows = m if mode == "complete" else k
-    Qs, Rs = [], []
-    for M in _mats(A):
-        W, taus = _householder(M)
-        Rs.append([[W[i][j] if j >= i else 0.0 for j in _range(n)] for i in _range(rrows)])
-        if mode != "r":
-            Qs.append(_form_q(W, taus, m, qcols))
-    R = _tensor(Rs, batch, rrows, n, A.dtype)
-    Q = _tensor(Qs, batch, m, qcols, A.dtype) if mode != "r" else torch.zeros(0, dtype=A.dtype)
+    nat = _native(_NAT_QR, [A.detach()], (_count(batch), m, n, qcols if mode != "r" else 0, rrows))
+    if nat is not None:
+        R = _as(nat[1], batch + (rrows, n), A.dtype)
+        Q = _as(nat[0], batch + (m, qcols), A.dtype) if mode != "r" else torch.zeros(0, dtype=A.dtype)
+    else:
+        Qs, Rs = [], []
+        for M in _mats(A):
+            W, taus = _householder(M)
+            Rs.append([[W[i][j] if j >= i else 0.0 for j in _range(n)] for i in _range(rrows)])
+            if mode != "r":
+                Qs.append(_form_q(W, taus, m, qcols))
+        R = _tensor(Rs, batch, rrows, n, A.dtype)
+        Q = _tensor(Qs, batch, m, qcols, A.dtype) if mode != "r" else torch.zeros(0, dtype=A.dtype)
     if _needs(A):
         def check():
             if mode == "r":
@@ -1153,13 +1380,7 @@ def _eigh_core(A, uplo, want_vectors, fname):
         raise RuntimeError("Expected UPLO argument to be 'L' or 'U', but got %s" % uplo)
     batch = _batch(A)
     n = A.shape[-1]
-    vals, vecs = [], []
-    for M in _mats(A):
-        w, V = _jacobi_eigh(_sym_from(M, uplo))
-        vals.extend(w)
-        vecs.append(V if V else [[] for _ in _range(n)])
-    L = _flat_tensor(vals, batch + (n,), A.dtype)
-    V = _tensor(vecs, batch, n, n, A.dtype)
+    L, V = _eigh_values(A, uplo)
     if _needs(A):
         def gl_backward(g):
             return (torch.matmul(V * g.unsqueeze(-2), _mT(V)),)
@@ -1179,6 +1400,22 @@ def _eigh_core(A, uplo, want_vectors, fname):
     return L, V
 
 
+def _eigh_values(A, uplo):
+    """Eigenvalues (ascending) and eigenvectors of the symmetric matrices
+    A's `uplo` triangles name, without history."""
+    batch = _batch(A)
+    n = A.shape[-1]
+    nat = _native(_NAT_EIGH, [A.detach()], (_count(batch), n, 1 if uplo == "L" else 0))
+    if nat is not None:
+        return _as(nat[0], batch + (n,), A.dtype), _as(nat[1], batch + (n, n), A.dtype)
+    vals, vecs = [], []
+    for M in _mats(A):
+        w, V = _jacobi_eigh(_sym_from(M, uplo))
+        vals.extend(w)
+        vecs.append(V if V else [[] for _ in _range(n)])
+    return _flat_tensor(vals, batch + (n,), A.dtype), _tensor(vecs, batch, n, n, A.dtype)
+
+
 def eigh(A, UPLO="L", *, out=None):
     L, V = _eigh_core(A, UPLO, True, "eigh")
     return _returns("linalg_eigh", ("eigenvalues", "eigenvectors"), (L, V))
@@ -1189,31 +1426,69 @@ def eigvalsh(A, UPLO="L", *, out=None):
 
 
 # ---- general eigenproblem (real spectra only) --------------------------------------------
+def _csolve(A, B):
+    """X = A^{-1} B for complex A [..., n, n] and B [..., n, k], through the
+    real system [[Re A, -Im A], [Im A, Re A]] [Re X; Im X] = [Re B; Im B]
+    (differentiable through the real solve)."""
+    Ar, Ai = torch.real(A), torch.imag(A)
+    Br, Bi = torch.real(B), torch.imag(B)
+    M = torch.cat([torch.cat([Ar, -Ai], -1), torch.cat([Ai, Ar], -1)], -2)
+    R = torch.cat([Br, Bi], -2)
+    M2, R2, batch = _broadcast_batch(M, R)
+    X = _solve_core(M2, R2)
+    n = A.shape[-1]
+    return torch.complex(X[..., :n, :], X[..., n:, :])
+
+
 def _eig_core(A, want_vectors, fname):
+    """Eigenvalues and eigenvectors of real matrices as complex tensors
+    (complex64 for float32, complex128 for float64), with PyTorch's
+    gradients (linalg_eig_backward; a real input takes the real part)."""
     _check_square(A, fname)
     batch = _batch(A)
     n = A.shape[-1]
-    vals, vecs = [], []
-    for M in _mats(A):
-        w, V = _real_eig(M, fname, True)
-        vals.extend(w)
-        vecs.append(V if V else [[] for _ in _range(n)])
-    L = _flat_tensor(vals, batch + (n,), A.dtype)
-    V = _tensor(vecs, batch, n, n, A.dtype)
+    count = _count(batch)
+    cdt = A.dtype.to_complex()
+    nat = _native(_NAT_EIG, [A.detach()], (count, n))
+    if nat is not None:
+        if any(ok == 0.0 for ok in _floats(nat[4])):
+            raise LinAlgError("linalg.eig: The algorithm failed to converge")
+        wr, wi = _t64(nat[0], batch + (n,)), _t64(nat[1], batch + (n,))
+        vr, vi = _t64(nat[2], batch + (n, n)), _t64(nat[3], batch + (n, n))
+    else:
+        fr, fi, gr, gi = [], [], [], []
+        for M in _mats(A):
+            wr_, wi_, vr_, vi_ = _eig_lists(M)
+            fr.extend(wr_)
+            fi.extend(wi_)
+            for r in _range(n):
+                gr.extend([vr_[c][r] for c in _range(n)])
+                gi.extend([vi_[c][r] for c in _range(n)])
+        wr, wi = _flat_tensor(fr, batch + (n,), torch.float64), _flat_tensor(fi, batch + (n,), torch.float64)
+        vr, vi = _flat_tensor(gr, batch + (n, n), torch.float64), _flat_tensor(gi, batch + (n, n), torch.float64)
+    with torch.no_grad():
+        L = torch.complex(wr, wi).to(cdt)
+        V = torch.complex(vr, vi).to(cdt)
     if _needs(A):
+        Vh = V.mH
+
         def conj_by(inner):
-            # V^{-T} inner V^T
-            return _solve_core(_mT(V), torch.matmul(inner, _mT(V)))
+            # V^{-H} inner V^H, whose real part is a real input's gradient
+            return torch.real(_csolve(Vh, torch.matmul(inner, Vh)))
 
         def gl_backward(g):
-            return (conj_by(torch.diag_embed(g)),)
+            return (conj_by(torch.diag_embed(g.to(cdt))),)
 
         def gv_backward(g):
-            VhgV = torch.matmul(_mT(V), g)
+            VhgV = torch.matmul(Vh, g.to(cdt))
             d = torch.diagonal(VhgV, 0, -2, -1)
-            VhgV = VhgV - torch.matmul(_mT(V), V * d.unsqueeze(-2))
-            E = L.unsqueeze(-2) - L.unsqueeze(-1)
-            E = E + torch.eye(n, dtype=A.dtype)
+            im = torch.imag(d)
+            if not torch.allclose(im, torch.zeros_like(im), rtol=1e-2, atol=1e-2):
+                raise RuntimeError("linalg_eig_backward: The eigenvectors in the complex case are specified up to multiplication by e^{i phi}. The specified loss function depends on this quantity, so it is ill-defined.")
+            VhgV = VhgV - torch.matmul(Vh, V * torch.real(d).unsqueeze(-2))
+            Lc = torch.conj(L)
+            E = Lc.unsqueeze(-2) - Lc.unsqueeze(-1)
+            E = E + torch.eye(n, dtype=cdt)
             inner = VhgV / E
             inner = inner - torch.diag_embed(torch.diagonal(inner, 0, -2, -1))
             return (conj_by(inner),)
@@ -1224,10 +1499,11 @@ def _eig_core(A, want_vectors, fname):
 
 
 def eig(A, *, out=None):
-    """Eigenvalues and unit eigenvectors of a real matrix whose eigenvalues
-    are all real, as real tensors (PyTorch returns complex tensors; Zipp has
-    none). Complex spectra raise NotImplementedError. The order follows the
-    Schur form Zipp computes, which need not be LAPACK's."""
+    """Eigenvalues and unit eigenvectors of real matrices, as complex
+    tensors like PyTorch's. The eigenvalues come in the Schur form's
+    diagonal order (a conjugate pair with its positive imaginary part
+    first), which is LAPACK's for most matrices but not guaranteed to be;
+    each eigenvector's largest component is real and positive."""
     L, V = _eig_core(A, True, "eig")
     return _returns("linalg_eig", ("eigenvalues", "eigenvectors"), (L, V))
 
@@ -1242,17 +1518,9 @@ def _svd_core(A, full_matrices, want_uv, fname):
     batch = _batch(A)
     m, n = A.shape[-2], A.shape[-1]
     k = _min(m, n)
-    Us, Ss, Vhs = [], [], []
-    for M in _mats(A):
-        U, S, Vh = _svd(M, m, n, full_matrices and want_uv)
-        Us.append(U)
-        Ss.extend(S)
-        Vhs.append(Vh)
     ucols = m if (full_matrices and want_uv) else k
     vrows = n if (full_matrices and want_uv) else k
-    U = _tensor(Us, batch, m, ucols, A.dtype)
-    S = _flat_tensor(Ss, batch + (k,), A.dtype)
-    Vh = _tensor(Vhs, batch, vrows, n, A.dtype)
+    U, S, Vh = _svd_values(A, full_matrices and want_uv)
     if _needs(A):
         def Uk():
             return U if ucols == k else U[..., :, :k]
@@ -1299,6 +1567,26 @@ def _svd_core(A, full_matrices, want_uv, fname):
         _attach(U, (A,), lambda g: uv_backward(g, None), "LinalgSvd", (U, S, Vh))
         _attach(Vh, (A,), lambda g: uv_backward(None, g), "LinalgSvd", (U, S, Vh))
     return U, S, Vh
+
+
+def _svd_values(A, full):
+    """U, S (descending), Vh of every matrix of A, without history, in
+    A's dtype, or float64 with `f64`."""
+    batch = _batch(A)
+    m, n = A.shape[-2], A.shape[-1]
+    k = _min(m, n)
+    ucols = m if full else k
+    vrows = n if full else k
+    nat = _native(_NAT_SVD, [A.detach()], (_count(batch), m, n, 1 if full else 0))
+    if nat is not None:
+        return _as(nat[0], batch + (m, ucols), A.dtype), _as(nat[1], batch + (k,), A.dtype), _as(nat[2], batch + (vrows, n), A.dtype)
+    Us, Ss, Vhs = [], [], []
+    for M in _mats(A):
+        U, S, Vh = _svd(M, m, n, full)
+        Us.append(U)
+        Ss.extend(S)
+        Vhs.append(Vh)
+    return _tensor(Us, batch, m, ucols, A.dtype), _flat_tensor(Ss, batch + (k,), A.dtype), _tensor(Vhs, batch, vrows, n, A.dtype)
 
 
 def svd(A, full_matrices=True, *, driver=None, out=None):
@@ -1360,24 +1648,32 @@ def pinv(A, rcond=None, hermitian=False, *, atol=None, rtol=None, out=None):
         rtol = rcond
     batch = _batch(A)
     m, n = A.shape[-2], A.shape[-1]
-    mats = _mats(A)
-    tols = _thresholds(A, atol, rtol, len(mats))
-    res = []
-    for M, (a, r) in zip(mats, tols):
+    count = _count(batch)
+    tols = _thresholds(A, atol, rtol, count)
+    A64 = A.detach().to(torch.float64)
+    with torch.no_grad():
         if hermitian:
-            w, V = _jacobi_eigh(_sym_from(M, "L"))
-            big = _max([_abs(x) for x in w] + [0.0])
-            thr = _max(a, r * big)
-            inv_w = [1.0 / x if _abs(x) > thr else 0.0 for x in w]
-            res.append([[_math.fsum([V[i][c] * inv_w[c] * V[j][c] for c in _range(n)]) for j in _range(n)] for i in _range(n)])
+            w, V = _eigh_values(A64, "L")
+            ws = _floats(w._s)
+            inv = []
+            for b, (a, r) in enumerate(tols):
+                row = ws[b * n:(b + 1) * n]
+                big = _max([_abs(x) for x in row] + [0.0])
+                thr = _max(a, r * big)
+                inv.extend([1.0 / x if _abs(x) > thr else 0.0 for x in row])
+            P = torch.matmul(V * _flat_tensor(inv, batch + (1, n), torch.float64), _mT(V))
         else:
-            U, S, Vh = _svd(M, m, n, False)
-            big = S[0] if S else 0.0
-            thr = _max(a, r * big)
-            inv_s = [1.0 / s if s > thr else 0.0 for s in S]
-            k = len(S)
-            res.append([[_math.fsum([Vh[c][i] * inv_s[c] * U[j][c] for c in _range(k)]) for j in _range(m)] for i in _range(n)])
-    P = _tensor(res, batch, n, m, A.dtype)
+            U, S, Vh = _svd_values(A64, False)
+            k = _min(m, n)
+            ss = _floats(S._s)
+            inv = []
+            for b, (a, r) in enumerate(tols):
+                row = ss[b * k:(b + 1) * k]
+                big = row[0] if row else 0.0
+                thr = _max(a, r * big)
+                inv.extend([1.0 / x if x > thr else 0.0 for x in row])
+            P = torch.matmul(_mT(Vh) * _flat_tensor(inv, batch + (1, k), torch.float64), _mT(U))
+    P = P.to(A.dtype) if A.dtype is not torch.float64 else P
     if _needs(A):
         _attach(P, (A,), lambda g: (_pinv_backward(g, P, A),), "LinalgPinv", (A, P))
     return P
@@ -1389,15 +1685,20 @@ def matrix_rank(A, tol=None, hermitian=False, *, atol=None, rtol=None, out=None)
         atol = tol
     batch = _batch(A)
     m, n = A.shape[-2], A.shape[-1]
-    mats = _mats(A)
-    tols = _thresholds(A, atol, rtol, len(mats))
+    count = _count(batch)
+    tols = _thresholds(A, atol, rtol, count)
     ranks = []
-    for M, (a, r) in zip(mats, tols):
+    with torch.no_grad():
         if hermitian:
-            w, V = _jacobi_eigh(_sym_from(M, "L"))
-            S = sorted([_abs(x) for x in w], reverse=True)
+            vals = _floats(_eigh_values(A.detach().to(torch.float64), "L")[0]._s)
+            k = n
         else:
-            S = _svd(M, m, n, False)[1]
+            vals = _floats(_svd_values(A.detach().to(torch.float64), False)[1]._s)
+            k = _min(m, n)
+    for b, (a, r) in enumerate(tols):
+        S = vals[b * k:(b + 1) * k]
+        if hermitian:
+            S = sorted([_abs(x) for x in S], reverse=True)
         big = S[0] if S else 0.0
         thr = _max(a, r * big)
         ranks.append(len([s for s in S if s > thr]))
@@ -1449,6 +1750,9 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, *, dtype=None, out=None):
         raise TypeError("linalg_vector_norm(): argument 'ord' must be Number, not str")
     if dtype is not None:
         x = x.to(dtype)
+    if isinstance(x, torch.Tensor) and x.dtype.is_complex:
+        # A complex vector's norms are its moduli's.
+        x = torch.abs(x)
     _check_float(x, "vector_norm")
     if dim is None:
         dims = tuple(_range(x.ndim))
@@ -1472,6 +1776,9 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, *, dtype=None, out=None):
 def matrix_norm(A, ord="fro", dim=(-2, -1), keepdim=False, *, dtype=None, out=None):
     if dtype is not None:
         A = A.to(dtype)
+    if isinstance(A, torch.Tensor) and A.dtype.is_complex and ord in ("fro", 1, -1, _math.inf, -_math.inf):
+        # These norms of a complex matrix are its moduli's.
+        A = torch.abs(A)
     _check_float(A, "matrix_norm")
     if A.ndim < 2:
         raise RuntimeError("linalg.matrix_norm: The input tensor A must have at least 2 dimensions.")

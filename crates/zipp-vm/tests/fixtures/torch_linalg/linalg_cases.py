@@ -294,6 +294,47 @@ def results():
     lfe = LA.lu_factor_ex(sing)
     R["lu"] = flat([P_, L_, U_, Pw, Lw, Uw, Pt, Lt, Ut, LUf, piv, LA.lu_solve(LUf, piv, Bb), LA.lu_solve(LUf, piv, mat(2, 3, 0.1), left=False),
                     LA.lu_solve(LUf, piv, Bb, adjoint=True), lfe.info, LA.solve_ex(sing, torch.ones(2, 1, dtype=D)).info])
+    # LU gradients (PyTorch's linalg_lu_backward, lu_factor_ex_backward and
+    # lu_solve's)
+    R["lu_grad"] = grads(lambda a: wsum(LA.lu(a).L, 60) + wsum(LA.lu(a).U, 61), A4)
+    R["lu_grad_wide"] = grads(lambda a: wsum(LA.lu(a).L, 62) + wsum(LA.lu(a).U, 63), wide)
+    R["lu_grad_tall"] = grads(lambda a: wsum(LA.lu(a).L, 64) + wsum(LA.lu(a).U, 65), tall)
+    R["lu_grad_batch"] = grads(lambda a: wsum(LA.lu(a).U, 66), B3)
+    R["lu_factor_grad"] = grads(lambda a: wsum(LA.lu_factor(a).LU, 67), B3)
+    R["lu_factor_grad_rect"] = grads(lambda a, b: wsum(LA.lu_factor(a).LU, 68) + wsum(LA.lu_factor(b).LU, 69), wide, tall)
+    R["lu_solve_grad"] = grads(lambda f, b: wsum(LA.lu_solve(f, piv, b), 70) + wsum(LA.lu_solve(f, piv, b, adjoint=True), 71), LUf, Bb)
+    R["lu_solve_grad_right"] = grads(lambda f, b: wsum(LA.lu_solve(f, piv, b, left=False), 72), LUf, mat(2, 3, 0.1))
+
+    # eig / eigvals with complex spectra (PyTorch returns complex tensors):
+    # eigenvalues sorted by (real, imag) and |V| in that order (the order
+    # and each eigenvector's phase are not unique), reconstructions, and
+    # the gradients of losses that depend on neither.
+    def eig_sorted(a):
+        lam, vec = LA.eig(a)
+        lr, li = lam.real.reshape(-1).tolist(), lam.imag.reshape(-1).tolist()
+        order = sorted(range(len(lr)), key=lambda i: (round(lr[i], 9), round(li[i], 9)))
+        idx = torch.tensor(order)
+        return [torch.view_as_real(lam)[idx], vec.abs()[:, idx], (a.to(lam.dtype) @ vec - vec * lam).abs().amax() < 1e-9]
+    Cm = mat(4, 4, 0.5) - mat(4, 4, 1.3).T
+    rot = torch.tensor([[0.0, -1.0], [1.0, 0.0]], dtype=D)
+    C5 = mat(5, 5, 2.4) - 1.5 * mat(5, 5, 0.1).T
+    M4 = mat(4, 4, 0.3) + 0.5 * mat(4, 4, 1.9).T
+    R["eig_complex"] = flat(eig_sorted(Cm) + eig_sorted(rot) + eig_sorted(C5) + eig_sorted(M4))
+    R["eig_complex_dtypes"] = [float(LA.eig(Cm).eigenvalues.dtype == torch.complex128), float(LA.eig(Cm.float()).eigenvectors.dtype == torch.complex64),
+                               float(LA.eigvals(Rm).dtype == torch.complex128), float(LA.eigvals(Cm.float()).dtype == torch.complex64)]
+    R["f32_eig_complex"] = flat(eig_sorted(Cm.float())[:2])
+
+    def eig_inv_loss(a, seed):
+        lam, vec = LA.eig(a)
+        rows = weights((a.shape[-1], 1), seed)
+        return ((lam * lam).real.sum() + (lam.abs() ** 3).sum() + (vec.abs() ** 2 * rows * lam.real.unsqueeze(-2)).sum()
+                + (vec.abs() ** 2 * rows * lam.imag.abs().unsqueeze(-2)).sum())
+    R["eig_complex_grad"] = grads(lambda a: eig_inv_loss(a, 73), Cm)
+    R["eig_complex_grad5"] = grads(lambda a: eig_inv_loss(a, 74), C5)
+    R["eig_complex_grad_real"] = grads(lambda a: eig_inv_loss(a, 75), C5)
+    R["eig_complex_grad4"] = grads(lambda a: eig_inv_loss(a, 77), M4)
+    R["eigvals_complex_grad"] = grads(lambda a: (LA.eigvals(a) ** 3).real.sum() + LA.eigvals(a).abs().sum(), Cm)
+    R["eig_complex_grad_batch"] = grads(lambda a: eig_inv_loss(a, 76), torch.stack([Cm, M4]))
 
     # tensorinv / tensorsolve / matmul
     T4 = mat(4, 6, 0.3).reshape(4, 6)[:, :4].reshape(2, 2, 4) + torch.eye(4, dtype=D).reshape(2, 2, 4)

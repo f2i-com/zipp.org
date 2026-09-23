@@ -1,0 +1,26 @@
+tensor([[ 0.5431+0.7155j,  0.6408+0.8407j,  1.0038+0.5375j],|        [ 0.2451-0.8659j, -0.9669-0.8978j, -0.7282-0.5112j]])
+tensor([0.7166+0.7037j, 0.8261+0.7253j, 0.6201-0.5001j],|       dtype=torch.complex128)
+tensor(0.6415+0.7078j)
+tensor([ 1.0000+3.j, -2.5000-0.j])
+tensor([1.0000e-05+1.0000e+06j, 2.0000e+02+5.0000e-01j])
+tensor([], dtype=torch.complex64)
+tensor([[ 0.5431+0.7155j,  0.6408+0.8407j,  1.0038+0.5375j],|        [ 0.2451-0.8659j, -0.9669-0.8978j, -0.7282-0.5112j]],|       requires_grad=True)
+tensor([[1.+0.j, 1.+0.j],|        [1.+0.j, 1.+0.j]], dtype=torch.complex128)
+tensor([0.+1.j, 1.+1.j, 2.+1.j, 3.+1.j])
+[torch.complex64, torch.complex128, torch.complex64, torch.complex128]
+[True, False, 8, 16, torch.float32, torch.float64, torch.complex64, torch.complex128]
+[True, True, False, False, 8, torch.complex64, torch.float32, torch.float32, torch.float32, torch.bool, False, False]
+[1.1920928955078125e-07, 2.220446049250313e-16, 3.4028234663852886e+38]
+[torch.complex128, torch.complex64, torch.complex64, torch.complex128, torch.complex64, torch.complex128, torch.complex64, torch.complex64, torch.complex128, torch.complex64, torch.complex64, torch.complex64, torch.complex128, torch.complex64, False, True]
+[torch.complex64, torch.Size([2, 2]), torch.complex64, torch.complex64, torch.Size([2, 3, 2]), torch.float32]
+RuntimeError: view_as_real is only supported for complex tensors
+RuntimeError: Tensor must have a last dimension of size 2
+RuntimeError: view_as_complex is only supported for half, float and double tensors, but got a tensor of scalar type: Long
+RuntimeError: Expected object of scalar type Float but got scalar type Double for second argument
+RuntimeError: Expected both inputs to be Half, Float or Double tensors but got Long and Long
+RuntimeError: imag is not implemented for tensors with non-complex dtypes.
+NotImplementedError: Unlike NumPy, torch.sign is not intended to support complex numbers. Please use torch.sgn instead.
+RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
+RuntimeError: Expected object of scalar type Float but got scalar type Double for second argument
+RuntimeError True
+['MulBackward0', 'AbsBackward0', 'ViewAsRealBackward0', 'ConjBackward0', 'ExpBackward0', 'SelectBackward0', 'SumBackward0']
