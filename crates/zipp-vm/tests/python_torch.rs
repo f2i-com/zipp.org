@@ -70,7 +70,7 @@ from torch import nn
 import torch.nn.functional as F
 x = torch.ones(1, 2, 3, 3)
 w = torch.ones(2, 2, 2, 2)
-for action in [lambda: F.conv2d(x,w,stride=0), lambda: F.conv2d(x,w,padding=-1), lambda: F.conv2d(x,w,groups=2), lambda: F.conv2d(x,w,torch.ones(3)), lambda: nn.Conv2d(2,3,3,groups=2), lambda: nn.Conv2d(1,1,3,device='cuda'), lambda: nn.Conv2d(1,1,3,padding_mode='reflect'), lambda: F.conv2d(torch.ones(1,2,1,1),w)]:
+for action in [lambda: F.conv2d(x,w,stride=0), lambda: F.conv2d(x,w,padding=-1), lambda: F.conv2d(x,w,groups=2), lambda: F.conv2d(x,w,torch.ones(3)), lambda: nn.Conv2d(2,3,3,groups=2), lambda: nn.Conv2d(1,1,3,device='cuda'), lambda: nn.Conv2d(1,1,3,padding_mode='mirror'), lambda: F.conv2d(torch.ones(1,2,1,1),w)]:
     try:
         action()
         print('not rejected')

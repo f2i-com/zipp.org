@@ -663,6 +663,10 @@ class Module:
         for key, param in self._parameters.items():
             if param is None:
                 continue
+            if _is_lazy(param):
+                # An uninitialized parameter only takes the new dtype.
+                param.__dict__["dtype"] = fn(param).dtype
+                continue
             with torch.no_grad():
                 applied = fn(param)
             if applied is not param:
@@ -1473,9 +1477,6 @@ class _ConvNd(Module):
                 raise ValueError("padding='same' is not supported for strided convolutions")
         if padding_mode not in ("zeros", "reflect", "replicate", "circular"):
             raise ValueError("padding_mode must be one of ['zeros', 'reflect', 'replicate', 'circular'], but got padding_mode='%s'" % padding_mode)
-        if padding_mode != "zeros":
-            # F.pad has these modes; the layers keep rejecting them for now.
-            raise NotImplementedError("%s supports padding_mode='zeros' only" % type(self).__name__)
         if dtype is not None and dtype not in (torch.float32, torch.float64):
             raise TypeError("convolutions require float32 or float64")
         self.in_channels = in_channels
@@ -1500,6 +1501,7 @@ class _ConvNd(Module):
             rev = []
             for p in reversed(self.padding):
                 rev += [p, p]
+            rev = tuple(rev)
         self._reversed_padding_repeated_twice = rev
         if transposed:
             shape = (in_channels, out_channels // groups) + self.kernel_size
@@ -3550,6 +3552,103 @@ class LazyInstanceNorm3d(_LazyNormBase, _InstanceNorm):
     _batched_rank = 5
 
 
+# ---- fractional max pooling, CTC and SyncBatchNorm -----------------------------------------
+def _float_tuple(value, n):
+    if isinstance(value, (tuple, list)):
+        return tuple(value)
+    return (value,) * n
+
+
+class _FractionalMaxPoolNd(Module):
+    _nd = 2
+
+    def __init__(self, kernel_size, output_size=None, output_ratio=None, return_indices=False, _random_samples=None):
+        super().__init__()
+        nd = self._nd
+        name = type(self).__name__
+        if nd == 3 and ((isinstance(kernel_size, int) and kernel_size <= 0) or (isinstance(kernel_size, (tuple, list)) and not all(k > 0 for k in kernel_size))):
+            raise ValueError("kernel_size must greater than 0, but got %s" % (kernel_size,))
+        self.kernel_size = F._ntuple(kernel_size, nd, "kernel_size")
+        self.return_indices = return_indices
+        self.register_buffer("_random_samples", _random_samples)
+        self.output_size = F._ntuple(output_size, nd, "output_size") if output_size is not None else None
+        self.output_ratio = _float_tuple(output_ratio, nd) if output_ratio is not None else None
+        if output_size is None and output_ratio is None:
+            raise ValueError("%s requires specifying either an output size, or a pooling ratio" % name)
+        if output_size is not None and output_ratio is not None:
+            raise ValueError("only one of output_size and output_ratio may be specified")
+        if self.output_ratio is not None:
+            if not all(0 < r < 1 for r in self.output_ratio[:nd]):
+                raise ValueError("output_ratio must be between 0 and 1 (got %s)" % (output_ratio,))
+
+
+class FractionalMaxPool2d(_FractionalMaxPoolNd):
+    _nd = 2
+
+    def forward(self, input):
+        return F.fractional_max_pool2d(input, self.kernel_size, self.output_size, self.output_ratio, self.return_indices, _random_samples=self._random_samples)
+
+
+class FractionalMaxPool3d(_FractionalMaxPoolNd):
+    _nd = 3
+
+    def forward(self, input):
+        return F.fractional_max_pool3d(input, self.kernel_size, self.output_size, self.output_ratio, self.return_indices, _random_samples=self._random_samples)
+
+
+class CTCLoss(_Loss):
+    def __init__(self, blank=0, reduction="mean", zero_infinity=False):
+        super().__init__(reduction=reduction)
+        self.blank = blank
+        self.zero_infinity = zero_infinity
+
+    def forward(self, log_probs, targets, input_lengths, target_lengths):
+        return F.ctc_loss(log_probs, targets, input_lengths, target_lengths, self.blank, self.reduction, self.zero_infinity)
+
+
+class SyncBatchNorm(_BatchNorm):
+    """BatchNorm whose statistics PyTorch all-reduces across the processes
+    of a group. Zipp runs one process and has no torch.distributed, so
+    (as PyTorch does without an initialized process group) it normalizes
+    with the local batch statistics, exactly like BatchNorm."""
+
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True, process_group=None, device=None, dtype=None):
+        super().__init__(num_features, eps, momentum, affine, track_running_stats, device, dtype)
+        self.process_group = process_group
+
+    def _check_input_dim(self, input):
+        if input.dim() < 2:
+            raise ValueError("expected at least 2D input (got %dD input)" % input.dim())
+
+    def _check_non_zero_input_channels(self, input):
+        if input.size(1) == 0:
+            raise ValueError("SyncBatchNorm number of input channels should be non-zero")
+
+    def forward(self, input):
+        self._check_input_dim(input)
+        self._check_non_zero_input_channels(input)
+        return _BatchNorm.forward(self, input)
+
+    @classmethod
+    def convert_sync_batchnorm(cls, module, process_group=None):
+        module_output = module
+        if isinstance(module, _BatchNorm):
+            module_output = SyncBatchNorm(module.num_features, module.eps, module.momentum, module.affine, module.track_running_stats, process_group)
+            if module.affine:
+                with torch.no_grad():
+                    module_output.weight = module.weight
+                    module_output.bias = module.bias
+            module_output.running_mean = module.running_mean
+            module_output.running_var = module.running_var
+            module_output.num_batches_tracked = module.num_batches_tracked
+            module_output.training = module.training
+            if hasattr(module, "qconfig"):
+                module_output.qconfig = module.qconfig
+        for name, child in module.named_children():
+            module_output.add_module(name, cls.convert_sync_batchnorm(child, process_group))
+        return module_output
+
+
 functional = F
 
 # torch.nn.utils.parametrize/parametrizations subclass ModuleList and Module,
@@ -3557,3 +3656,8 @@ functional = F
 # torch.nn.utils after `import torch`).
 import torch.nn.utils.parametrize
 import torch.nn.utils.parametrizations
+
+# torch.nn.parallel subclasses Module too; PyTorch exposes its DataParallel
+# as nn.DataParallel.
+import torch.nn.parallel as parallel
+from torch.nn.parallel import DataParallel

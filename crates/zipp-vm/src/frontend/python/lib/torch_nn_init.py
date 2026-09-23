@@ -29,7 +29,7 @@ def calculate_gain(nonlinearity, param=None):
 
 
 def _calculate_fan_in_and_fan_out(tensor):
-    if len(tensor.shape) < 2:
+    if tensor.dim() < 2:
         raise ValueError("Fan in and fan out can not be computed for tensor with fewer than 2 dimensions")
     receptive = 1
     for d in tensor.shape[2:]:
@@ -55,11 +55,15 @@ def constant_(t, val):
 
 
 def zeros_(t):
-    return constant_(t, 0.0)
+    with torch.no_grad():
+        t.zero_()
+    return t
 
 
 def ones_(t):
-    return constant_(t, 1.0)
+    with torch.no_grad():
+        t.fill_(1.0)
+    return t
 
 
 def uniform_(t, a=0.0, b=1.0, generator=None):
@@ -136,7 +140,7 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0, generator=None):
 
 
 def eye_(t):
-    if len(t.shape) != 2:
+    if t.dim() != 2:
         raise ValueError("Only tensors with 2 dimensions are supported")
     with torch.no_grad():
         t.copy_(torch.eye(t.shape[0], t.shape[1], dtype=t.dtype))
@@ -144,7 +148,7 @@ def eye_(t):
 
 
 def dirac_(tensor, groups=1):
-    dims = len(tensor.shape)
+    dims = tensor.dim()
     if dims not in (3, 4, 5):
         raise ValueError("Only tensors with 3, 4, or 5 dimensions are supported")
     sizes = tuple(tensor.shape)
@@ -179,7 +183,7 @@ def _orthonormal_columns(a):
 
 
 def orthogonal_(tensor, gain=1, generator=None):
-    if len(tensor.shape) < 2:
+    if tensor.dim() < 2:
         raise ValueError("Only tensors with 2 or more dimensions are supported")
     if tensor.numel() == 0:
         return tensor
@@ -197,7 +201,7 @@ def orthogonal_(tensor, gain=1, generator=None):
 
 
 def sparse_(tensor, sparsity, std=0.01, generator=None):
-    if len(tensor.shape) != 2:
+    if tensor.dim() != 2:
         raise ValueError("Only tensors with 2 dimensions are supported")
     rows, cols = tensor.shape
     num_zeros = int(math.ceil(sparsity * rows))
@@ -209,6 +213,24 @@ def sparse_(tensor, sparsity, std=0.01, generator=None):
                 tensor[r, col] = 0
     return tensor
 
+
+def _guarded(fn):
+    """fn, refusing an uninitialized (lazy) parameter with PyTorch's error."""
+    def init(tensor, *args, **kwargs):
+        if getattr(tensor, "_uninitialized", False):
+            raise ValueError("Attempted to use an uninitialized parameter in <function %s>. This error happens when you are using a `LazyModule` or explicitly manipulating `torch.nn.parameter.%s` objects. When using LazyModules Call `forward` with a dummy batch to initialize the parameters before calling torch functions" % (fn.__name__, type(tensor).__name__))
+        return fn(tensor, *args, **kwargs)
+    init.__name__ = fn.__name__
+    init.__doc__ = fn.__doc__
+    return init
+
+
+# PyTorch routes these four through __torch_function__; the others reach
+# an uninitialized tensor's own methods (or its shape) first.
+constant_ = _guarded(constant_)
+uniform_ = _guarded(uniform_)
+normal_ = _guarded(normal_)
+kaiming_uniform_ = _guarded(kaiming_uniform_)
 
 # The deprecated names without the trailing underscore.
 uniform = uniform_

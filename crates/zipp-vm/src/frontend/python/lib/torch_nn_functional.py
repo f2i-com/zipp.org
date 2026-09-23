@@ -310,6 +310,7 @@ def _pad_dim(x, dim, left, right, value):
         if torch._needs_grad(x):
             out.requires_grad = True
             out._node = torch._Node(lambda g: (g.narrow(dim, left, x.shape[dim]),), (x,), "ConstantPadNd")
+            out._node.diff = True
         return out
     moved = torch.movedim(x, dim, -1)
     return torch.movedim(_pad_dim(moved, len(x.shape) - 1, left, right, value), -1, dim)
@@ -398,10 +399,15 @@ def conv1d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     out = Tensor(storage, shape, x.dtype)
     if torch._needs_grad(x, weight, bias):
         def backward(g):
+            if torch._grad_enabled:
+                # create_graph: the same gradients as differentiable ops.
+                gx, gw, gb = _conv2d_grads(x.unsqueeze(2), weight.unsqueeze(2), bias, g.unsqueeze(2), (1, 1), (0, 0), (1, 1), 1, x.requires_grad, weight.requires_grad)
+                return (None if gx is None else gx.squeeze(2), None if gw is None else gw.squeeze(2), gb)
             gx, gw, gb = _k.conv1d_backward(x._s, x.shape, weight._s, weight.shape, g._s)
             return (Tensor(gx, x.shape, x.dtype), Tensor(gw, weight.shape, weight.dtype), Tensor(gb, (weight.shape[0],), weight.dtype))
         out.requires_grad = True
         out._node = torch._Node(backward, (x, weight, bias), "Conv1d")
+        out._node.diff = True
     return out
 
 
@@ -432,11 +438,47 @@ def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     out = Tensor(storage, shape, x.dtype)
     if torch._needs_grad(x, weight, bias):
         def backward(g):
+            if torch._grad_enabled:
+                # create_graph: the same gradients as differentiable ops.
+                return _conv2d_grads(x, weight, bias, g, stride, padding, dilation, groups, x.requires_grad, weight.requires_grad)
             gx, gw, gb = _k.conv2d_backward(x._s, x.shape, weight._s, weight.shape, g._s, stride, padding, dilation, groups)
             return (Tensor(gx, x.shape, x.dtype), Tensor(gw, weight.shape, weight.dtype), None if bias is None else Tensor(gb, bias.shape, bias.dtype))
         out.requires_grad = True
         out._node = torch._Node(backward, (x, weight, bias), "Conv2d")
+        out._node.diff = True
     return out
+
+
+def _conv2d_weight_grad(x, g, kernel, stride, padding, dilation, groups):
+    """The weight gradient of conv2d(x, w) for the output gradient g, as a
+    batched matmul of g with the unfolded input (differentiable in both)."""
+    n, cin = x.shape[0], x.shape[1]
+    cout = g.shape[1]
+    views, outs = _patches(x, kernel, dilation, padding, stride, 0.0, "conv2d")
+    cg, og, taps = cin // groups, cout // groups, len(views)
+    length = outs[0] * outs[1]
+    cols = torch.stack(views, 2).reshape(n, groups, cg * taps, length)
+    gw = torch.matmul(g.reshape(n, groups, og, length), cols.transpose(-1, -2)).sum(0)
+    return gw.reshape(cout, cg, kernel[0], kernel[1])
+
+
+def _conv2d_grads(x, weight, bias, g, stride, padding, dilation, groups, need_x, need_w):
+    """conv2d's input, weight and bias gradients built from differentiable
+    operations, for backward(create_graph=True): the input gradient is the
+    transposed convolution of g (output_padding restores the rows a stride
+    skipped), the weight gradient `_conv2d_weight_grad`. Without
+    create_graph the native backward kernel runs instead."""
+    gx = gw = gb = None
+    kh, kw = weight.shape[2], weight.shape[3]
+    if need_x:
+        oph = x.shape[2] + 2 * padding[0] - dilation[0] * (kh - 1) - 1 - (g.shape[2] - 1) * stride[0]
+        opw = x.shape[3] + 2 * padding[1] - dilation[1] * (kw - 1) - 1 - (g.shape[3] - 1) * stride[1]
+        gx = conv_transpose2d(g, weight, None, stride, padding, (oph, opw), groups, dilation)
+    if need_w:
+        gw = _conv2d_weight_grad(x, g, (kh, kw), stride, padding, dilation, groups)
+    if bias is not None and bias.requires_grad:
+        gb = g.sum((0, 2, 3))
+    return (gx, gw, gb)
 
 
 def conv_transpose2d(input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1):
@@ -481,6 +523,19 @@ def conv_transpose2d(input, weight, bias=None, stride=1, padding=0, output_paddi
             out = out + bias.detach().reshape(1, cout, 1, 1)
     if torch._needs_grad(x, weight, bias):
         def backward(g):
+            if torch._grad_enabled:
+                # create_graph: differentiable in g, x and weight.
+                gin = gw = gb = None
+                if x.requires_grad:
+                    gin = conv2d(g, weight, None, stride, padding, dilation, groups)
+                    if (hc, wc) != (h, w):
+                        gin = gin[:, :, :h, :w]
+                if weight.requires_grad:
+                    xg = x if (hc, wc) == (h, w) else pad(x, (0, wc - w, 0, hc - h))
+                    gw = _conv2d_weight_grad(g, xg, (kh, kw), stride, padding, dilation, groups)
+                if bias is not None and bias.requires_grad:
+                    gb = g.sum((0, 2, 3))
+                return (gin, gw, gb)
             gin = conv2d(g, weight.detach(), None, stride, padding, dilation, groups)
             if (hc, wc) != (h, w):
                 gin = gin[:, :, :h, :w]
@@ -489,6 +544,7 @@ def conv_transpose2d(input, weight, bias=None, stride=1, padding=0, output_paddi
             return (gin, Tensor(gw, weight.shape, weight.dtype), gb)
         out.requires_grad = True
         out._node = torch._Node(backward, (x, weight, bias), "ConvolutionBackward0")
+        out._node.diff = True
     return out
 
 
@@ -1721,8 +1777,17 @@ def dropout(x, p=0.5, training=True, inplace=False):
         out = x * torch.zeros_like(x)
     else:
         mask = (torch.rand(*x.shape) >= p).to(x.dtype)
-        out = x * mask / (1 - p)
+        out = x * (mask * _dropout_scale(p, x.dtype))
     return out
+
+
+def _dropout_scale(p, dtype):
+    """The kept-value factor of PyTorch's CPU dropout: its noise is divided
+    by 1 - p as a scalar, which the kernel does as a multiply by the
+    reciprocal in the op math type (float32 below float64)."""
+    if dtype is torch.float64:
+        return 1.0 / (1.0 - p)
+    return _f32(1.0 / _f32(1.0 - p))
 
 
 def _feature_dropout(x, p, training, inplace, batched_rank, name):
@@ -1740,7 +1805,7 @@ def _feature_dropout(x, p, training, inplace, batched_rank, name):
         out = x * torch.zeros_like(x)
     else:
         mask = (torch.rand(*mask_shape) >= p).to(x.dtype)
-        out = x * mask / (1 - p)
+        out = x * (mask * _dropout_scale(p, x.dtype))
     return out
 
 
@@ -2299,3 +2364,502 @@ def multi_head_attention_forward(query, key, value, embed_dim_to_check, num_head
     if not is_batched:
         weights = weights.squeeze(0)
     return out, weights
+
+
+# ---- grid sampling -------------------------------------------------------------------------
+# grid_sample follows PyTorch's CPU kernels: 4-D input runs its vectorized
+# kernel (GridSamplerKernel.cpp), 5-D input the scalar one (GridSampler.h),
+# whose unnormalization and reflection round differently. Sampling is
+# composed from gathers and elementwise ops, so the input and grid
+# gradients come from autograd; integer tap positions are detached.
+def _grid_unnormalize(coord, size, align_corners, vectorized):
+    if vectorized:
+        if align_corners:
+            return (coord + 1) * ((size - 1) / 2)
+        return (coord + 1) * (size / 2) - 0.5
+    if align_corners:
+        return ((coord + 1) / 2) * (size - 1)
+    return ((coord + 1) * size - 1) / 2
+
+
+def _grid_reflect(x, size, align_corners, vectorized):
+    low, span = (0.0, size - 1) if align_corners else (-0.5, size)
+    if span <= 0:
+        return torch.zeros_like(x)
+    a = (x - low).abs()
+    if vectorized:
+        twice = 2 * span
+        extra = a - torch.trunc(a.detach() / twice) * twice
+        return torch.minimum(extra, twice - extra) + low
+    extra = torch.fmod(a, span)
+    odd = torch.remainder(torch.floor(a.detach() / span), 2) == 1
+    return torch.where(odd, (span - extra) + low, extra + low)
+
+
+def _grid_pad(x, size, padding_mode, align_corners, vectorized):
+    if padding_mode == "border":
+        return torch.clamp(x, 0, size - 1)
+    if padding_mode == "reflection":
+        return torch.clamp(_grid_reflect(x, size, align_corners, vectorized), 0, size - 1)
+    return x
+
+
+class _GridTaps:
+    """Gathers input values at integer (detached, floating) tap positions
+    of an (N, *out) grid, zero where a checked tap falls outside the input."""
+
+    def __init__(self, input, out_shape):
+        self.n, self.c = input.shape[0], input.shape[1]
+        self.sizes = tuple(input.shape[2:])
+        self.out_shape = tuple(out_shape)
+        self.count = _prod(self.out_shape)
+        self.flat = input.reshape(self.n, self.c, _prod(self.sizes))
+
+    def __call__(self, coords, check=True):
+        # coords: a (N, *out) tensor per spatial dim, outermost first.
+        valid = None
+        index = None
+        for pos, size in zip(coords, self.sizes):
+            if check:
+                ok = (pos > -1) & (pos < size)
+                valid = ok if valid is None else valid & ok
+            pos = pos.clamp(0, size - 1)
+            index = pos if index is None else index * size + pos
+        index = index.to(torch.int64).reshape(self.n, 1, self.count).expand(self.n, self.c, self.count)
+        v = torch.gather(self.flat, 2, index).reshape((self.n, self.c) + self.out_shape)
+        if check:
+            v = torch.where(valid.unsqueeze(1), v, 0.0)
+        return v
+
+
+def _with_zero_grad(out, t):
+    """`out`, reporting a zero gradient to `t` as well (PyTorch's grid
+    gradient for nearest sampling is zeros, not absent)."""
+    if not torch._needs_grad(t):
+        return out
+    res = Tensor(_k.copy(out._s), out.shape, out.dtype)
+    res.requires_grad = True
+    res._node = torch._Node(lambda g: (g, torch.zeros_like(t)), (out, t), "GridSampler2DBackward0")
+    res._node.diff = True
+    return res
+
+
+def _cubic_coeffs(t):
+    a = -0.75
+    x = t + 1
+    c0 = ((x * a - 5 * a) * x + 8 * a) * x - 4 * a
+    c1 = ((t * (a + 2) - (a + 3)) * t) * t + 1
+    x = 1 - t
+    c2 = ((x * (a + 2) - (a + 3)) * x) * x + 1
+    x = 2 - t
+    c3 = ((x * a - 5 * a) * x + 8 * a) * x - 4 * a
+    return (c0, c1, c2, c3)
+
+
+def _grid_sample_2d(input, grid, mode, padding_mode, align_corners):
+    n, c, h, w = input.shape
+    taps = _GridTaps(input, grid.shape[1:3])
+    gx, gy = grid[..., 0], grid[..., 1]
+    zeros = padding_mode == "zeros"
+    if mode == "bicubic":
+        x = _grid_unnormalize(gx, w, align_corners, True)
+        y = _grid_unnormalize(gy, h, align_corners, True)
+        x0, y0 = torch.floor(x.detach()), torch.floor(y.detach())
+        cx = [k.unsqueeze(1) for k in _cubic_coeffs(x - x0)]
+        cy = [k.unsqueeze(1) for k in _cubic_coeffs(y - y0)]
+        with torch.no_grad():
+            xs = [_grid_pad(x0 + (i - 1), w, padding_mode, align_corners, True) for i in range(4)]
+            ys = [_grid_pad(y0 + (i - 1), h, padding_mode, align_corners, True) for i in range(4)]
+        out = None
+        for i in range(4):
+            row = None
+            for j in range(4):
+                term = cx[j] * taps((ys[i], xs[j]), zeros)
+                row = term if row is None else row + term
+            term = cy[i] * row
+            out = term if out is None else out + term
+        return out
+    x = _grid_pad(_grid_unnormalize(gx, w, align_corners, True), w, padding_mode, align_corners, True)
+    y = _grid_pad(_grid_unnormalize(gy, h, align_corners, True), h, padding_mode, align_corners, True)
+    if mode == "nearest":
+        with torch.no_grad():
+            xr, yr = torch.round(x), torch.round(y)
+        return _with_zero_grad(taps((yr, xr), zeros), grid)
+    x0, y0 = torch.floor(x.detach()), torch.floor(y.detach())
+    we = x - x0
+    ea = 1 - we
+    ns = y - y0
+    so = 1 - ns
+    x1, y1 = x0 + 1, y0 + 1
+    # The east and south taps can lie past the edge even when clamped.
+    out = taps((y0, x0), zeros) * (so * ea).unsqueeze(1)
+    out = out + taps((y0, x1)) * (so * we).unsqueeze(1)
+    out = out + taps((y1, x0)) * (ns * ea).unsqueeze(1)
+    return out + taps((y1, x1)) * (ns * we).unsqueeze(1)
+
+
+def _grid_sample_3d(input, grid, mode, padding_mode, align_corners):
+    n, c, d, h, w = input.shape
+    taps = _GridTaps(input, grid.shape[1:4])
+    x = _grid_pad(_grid_unnormalize(grid[..., 0], w, align_corners, False), w, padding_mode, align_corners, False)
+    y = _grid_pad(_grid_unnormalize(grid[..., 1], h, align_corners, False), h, padding_mode, align_corners, False)
+    z = _grid_pad(_grid_unnormalize(grid[..., 2], d, align_corners, False), d, padding_mode, align_corners, False)
+    if mode == "nearest":
+        with torch.no_grad():
+            xr, yr, zr = torch.round(x), torch.round(y), torch.round(z)
+        return _with_zero_grad(taps((zr, yr, xr)), grid)
+    x0, y0, z0 = torch.floor(x.detach()), torch.floor(y.detach()), torch.floor(z.detach())
+    x1, y1, z1 = x0 + 1, y0 + 1, z0 + 1
+    wx0, wx1 = x1 - x, x - x0
+    wy0, wy1 = y1 - y, y - y0
+    wz0, wz1 = z1 - z, z - z0
+    out = None
+    # PyTorch's order: tnw, tne, tsw, tse, bnw, bne, bsw, bse.
+    for zc, wz in ((z0, wz0), (z1, wz1)):
+        for yc, wy in ((y0, wy0), (y1, wy1)):
+            for xc, wx in ((x0, wx0), (x1, wx1)):
+                term = taps((zc, yc, xc)) * (wx * wy * wz).unsqueeze(1)
+                out = term if out is None else out + term
+    return out
+
+
+def grid_sample(input, grid, mode="bilinear", padding_mode="zeros", align_corners=None):
+    if mode not in ("bilinear", "nearest", "bicubic"):
+        raise ValueError("nn.functional.grid_sample(): expected mode to be 'bilinear', 'nearest' or 'bicubic', but got: '%s'" % mode)
+    if padding_mode not in ("zeros", "border", "reflection"):
+        raise ValueError("nn.functional.grid_sample(): expected padding_mode to be 'zeros', 'border', or 'reflection', but got: '%s'" % padding_mode)
+    align_corners = bool(align_corners)
+    if input.dtype != grid.dtype:
+        raise RuntimeError("grid_sampler(): expected input and grid to have same dtype, but input has %s and grid has %s" % (input.dtype, grid.dtype))
+    nd = input.dim()
+    if nd not in (4, 5) or grid.dim() != nd:
+        raise RuntimeError("grid_sampler(): expected 4D or 5D input and grid with same number of dimensions, but got input with sizes %s and grid with sizes %s" % (list(input.shape), list(grid.shape)))
+    if input.shape[0] != grid.shape[0]:
+        raise RuntimeError("grid_sampler(): expected grid and input to have same batch size, but got input with sizes %s and grid with sizes %s" % (list(input.shape), list(grid.shape)))
+    if grid.shape[-1] != nd - 2:
+        raise RuntimeError("grid_sampler(): expected grid to have size %d in last dimension, but got grid with sizes %s" % (nd - 2, list(grid.shape)))
+    for i in range(2, nd):
+        if input.shape[i] <= 0:
+            raise RuntimeError("grid_sampler(): expected input to have non-empty spatial dimensions, but input has sizes %s with dimension %d being empty" % (list(input.shape), i))
+    if not input.dtype.is_floating_point:
+        raise RuntimeError("\"grid_sampler_2d_cpu\" not implemented for '%s'" % input.dtype)
+    if nd == 4:
+        return _grid_sample_2d(input, grid, mode, padding_mode, align_corners)
+    if mode == "bicubic":
+        raise RuntimeError("grid_sampler(): bicubic interpolation only supports 4D input")
+    return _grid_sample_3d(input, grid, mode, padding_mode, align_corners)
+
+
+def _linspace_from_neg_one(steps, align_corners, dtype):
+    if steps <= 1:
+        return torch.zeros(1, dtype=dtype)
+    r = torch.linspace(-1, 1, steps, dtype=dtype)
+    if not align_corners:
+        r = r * (steps - 1) / steps
+    return r
+
+
+def affine_grid(theta, size, align_corners=None):
+    align_corners = bool(align_corners)
+    if not theta.dtype.is_floating_point:
+        raise ValueError("Expected theta to have floating point type, but got %s" % theta.dtype)
+    size = [int(s) for s in size]
+    if len(size) == 4:
+        if theta.dim() != 3 or theta.shape[-2] != 2 or theta.shape[-1] != 3:
+            raise ValueError("Expected a batch of 2D affine matrices of shape Nx2x3 for size %s. Got %s." % (torch.Size(size), theta.shape))
+        spatial = size[-2:]
+    elif len(size) == 5:
+        if theta.dim() != 3 or theta.shape[-2] != 3 or theta.shape[-1] != 4:
+            raise ValueError("Expected a batch of 3D affine matrices of shape Nx3x4 for size %s. Got %s." % (torch.Size(size), theta.shape))
+        spatial = size[-3:]
+    else:
+        raise NotImplementedError("affine_grid only supports 4D and 5D sizes, for 2D and 3D affine transforms, respectively. Got size %s." % (torch.Size(size),))
+    if not (align_corners and min(spatial) == 1) and min(size) <= 0:
+        raise ValueError("Expected non-zero, positive output size. Got %s" % (torch.Size(size),))
+    n = size[0]
+    if theta.shape[0] != n:
+        raise RuntimeError("Expected size[0] (%d) to match the batch of theta (%d)" % (n, theta.shape[0]))
+    dt = theta.dtype
+    # The base grid (x, y[, z], 1) of every output position, x fastest.
+    lins = [_linspace_from_neg_one(s, align_corners, dt) for s in spatial]
+    k = len(spatial)
+    shape = tuple(spatial)
+    cols = []
+    for axis in range(k - 1, -1, -1):
+        view = [1] * k
+        view[axis] = lins[axis].shape[0]
+        cols.append(lins[axis].reshape(*view).expand(*shape))
+    cols.append(torch.ones(*shape, dtype=dt))
+    base = torch.stack(cols, -1).reshape(_prod(shape), k + 1)
+    grid = torch.matmul(base, theta.transpose(1, 2))
+    return grid.reshape(*([n] + list(shape) + [k]))
+
+
+# ---- CTC loss ------------------------------------------------------------------------------
+def _lengths(value, name):
+    if isinstance(value, Tensor):
+        if value.dtype.is_floating_point or value.dtype == torch.bool:
+            raise RuntimeError("%s must be integral" % name)
+        return [int(v) for v in value.reshape(-1).tolist()]
+    if isinstance(value, int):
+        return [value]
+    return [int(v) for v in value]
+
+
+def _logsumexp3(a, b, c):
+    """log(exp(a) + exp(b) + exp(c)) the way PyTorch's CTC kernel adds:
+    about the largest, which counts as 0 when all are -inf."""
+    m = torch.maximum(torch.maximum(a, b), c)
+    m = torch.where(m == -_inf, 0.0, m)
+    return torch.log(torch.exp(a - m) + torch.exp(b - m) + torch.exp(c - m)) + m
+
+
+def ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0, reduction="mean", zero_infinity=False):
+    """PyTorch's CPU CTC: the forward (alpha) recursion in log space, one
+    tensor step per time step for the whole batch; backward runs the beta
+    recursion and forms PyTorch's gradient, exp(log_probs) minus each
+    label's posterior (which presumes log_softmax inputs, as PyTorch's
+    does)."""
+    if reduction not in ("none", "mean", "sum"):
+        raise ValueError("%s is not a valid value for reduction" % reduction)
+    lp = log_probs
+    batched = lp.dim() == 3
+    if not batched:
+        if lp.dim() != 2:
+            raise RuntimeError("ctc_loss expects 2-D (unbatched) or 3-D log_probs, got %s" % list(lp.shape))
+        lp = lp.unsqueeze(1)
+    il = _lengths(input_lengths, "input_lengths")
+    tl = _lengths(target_lengths, "target_lengths")
+    t_max, n, c = lp.shape
+    if not (0 <= blank < c):
+        raise RuntimeError("blank must be in label range")
+    if len(il) != n:
+        raise RuntimeError("input_lengths must be of size batch_size")
+    if len(tl) != n:
+        raise RuntimeError("target_lengths must be of size batch_size")
+    if targets.dtype.is_floating_point:
+        raise RuntimeError("Expected tensor for argument #2 'targets' to have one of the following scalar types: Long, Int; but got %s instead (while checking arguments for ctc_loss_cpu)" % targets.dtype)
+    for v in tl:
+        if v < 0:
+            raise RuntimeError("Expected target_lengths to have value at least 0, but got value %d (while checking arguments for ctc_loss_cpu)" % v)
+    l_max = max(tl) if tl else 0
+    flat = [int(v) for v in targets.reshape(-1).tolist()]
+    rows = []
+    if targets.dim() == 1:
+        # Concatenated targets.
+        if len(flat) != sum(tl):
+            raise RuntimeError("Expected tensor to have size %d at dimension 0, but got size %d for argument #2 'targets' (while checking arguments for ctc_loss_cpu)" % (sum(tl), len(flat)))
+        pos = 0
+        for v in tl:
+            rows.append(flat[pos:pos + v])
+            pos += v
+    else:
+        if targets.dim() != 2 or targets.shape[0] != n:
+            raise RuntimeError("Expected tensor to have size %d at dimension 0, but got size %d for argument #2 'targets' (while checking arguments for ctc_loss_cpu)" % (n, targets.shape[0]))
+        width = targets.shape[1]
+        if width < l_max:
+            raise RuntimeError("Expected tensor to have size at least %d at dimension 1, but got size %d for argument #2 'targets' (while checking arguments for ctc_loss_cpu)" % (l_max, width))
+        for b in range(n):
+            rows.append(flat[b * width:b * width + tl[b]])
+    for v in il:
+        if v < 0:
+            raise RuntimeError("Expected input_lengths to have value at least 0, but got value %d (while checking arguments for ctc_loss_cpu)" % v)
+        if v > t_max:
+            raise RuntimeError("Expected input_lengths to have value at most %d, but got value %d (while checking arguments for ctc_loss_cpu)" % (t_max, v))
+    s_len = 2 * l_max + 1
+    # Extended labels: blanks between (and around) the targets; `skip`
+    # marks the positions alpha may also reach from two back.
+    ext, skip = [], []
+    for b in range(n):
+        lab = [blank] * s_len
+        for i, v in enumerate(rows[b]):
+            if not (0 <= v < c):
+                raise IndexError("index %d is out of bounds for dimension 1 with size %d" % (v, c))
+            lab[2 * i + 1] = v
+        ext.append(lab)
+        skip.append([s >= 2 and lab[s] != lab[s - 2] for s in range(s_len)])
+    dt = lp.dtype
+    lab_t = torch.tensor(ext, dtype=torch.int64).reshape(n, s_len)
+    skip_t = torch.tensor(skip, dtype=torch.bool).reshape(n, s_len)
+    il_t = torch.tensor(il, dtype=torch.int64)
+    tl_t = torch.tensor(tl, dtype=torch.int64)
+    lpd = lp.detach()
+    alphas = []
+    with torch.no_grad():
+        lpe = torch.gather(lpd, 2, lab_t.reshape(1, n, s_len).expand(t_max, n, s_len))
+        if t_max:
+            neg = torch.full((n, 1), -_inf, dtype=dt)
+            neg2 = torch.full((n, 2), -_inf, dtype=dt)
+            positions = torch.arange(s_len).reshape(1, s_len)
+            alpha = torch.where((positions == 0) | ((positions == 1) & (tl_t.reshape(n, 1) > 0)), lpe[0], -_inf)
+            alphas.append(alpha)
+            for t in range(1, t_max):
+                a1 = torch.cat([neg, alpha[:, :-1]], 1)
+                a2 = torch.where(skip_t, torch.cat([neg2, alpha[:, :-2]], 1), -_inf) if s_len > 2 else torch.full((n, s_len), -_inf, dtype=dt)
+                new = _logsumexp3(alpha, a1, a2) + lpe[t]
+                # Past its input length a sequence's alpha stays put.
+                alpha = torch.where((il_t > t).reshape(n, 1), new, alpha)
+                alphas.append(alpha)
+            ends = torch.stack([(2 * tl_t).clamp(0, s_len - 1), (2 * tl_t - 1).clamp(0, s_len - 1)], 1)
+            last = torch.gather(alpha, 1, ends)
+            l1, l2 = last[:, 0], last[:, 1]
+            top = torch.maximum(l1, l2)
+            m = torch.where(top == -_inf, 0.0, top)
+            ll = torch.where(tl_t > 0, torch.log(torch.exp(l1 - m) + torch.exp(l2 - m)) + m, l1)
+        else:
+            ll = torch.zeros(n, dtype=dt)
+        # An empty input: likelihood 1 for an empty target, else 0.
+        ll = torch.where(il_t == 0, torch.where(tl_t == 0, 0.0, -_inf), ll)
+        nll = -ll
+    raw = Tensor(_k.copy(nll._s), nll.shape, dt)
+    if torch._needs_grad(lp):
+        def backward(g):
+            return (_ctc_grad(lpd, lpe, alphas, nll, g, lab_t, skip_t, il_t, tl_t, zero_infinity),)
+        raw.requires_grad = True
+        raw._node = torch._Node(backward, (lp,), "CtcLossBackward0")
+    res = raw
+    if zero_infinity:
+        res = torch.where(res == _inf, torch.zeros((), dtype=dt), res)
+    if reduction == "mean":
+        return (res / tl_t.to(dt).clamp(min=1)).mean()
+    if reduction == "sum":
+        return res.sum()
+    return res if batched else res.squeeze(0)
+
+
+def _ctc_grad(lp, lpe, alphas, nll, g, lab_t, skip_t, il_t, tl_t, zero_infinity):
+    t_max, n, c = lp.shape
+    s_len = lpe.shape[2]
+    dt = lp.dtype
+    with torch.no_grad():
+        if not t_max:
+            return torch.zeros(t_max, n, c, dtype=dt)
+        neg = torch.full((n, 1), -_inf, dtype=dt)
+        neg2 = torch.full((n, 2), -_inf, dtype=dt)
+        positions = torch.arange(s_len).reshape(1, s_len)
+        end = 2 * tl_t.reshape(n, 1)
+        # Beta starts at each sequence's last step t = il - 1, on the final
+        # blank and the last label.
+        init_mask = (positions == end) | ((positions == end - 1) & (end > 0))
+        skip_next = torch.cat([skip_t[:, 2:], torch.zeros(n, 2, dtype=torch.bool)], 1) if s_len > 2 else torch.zeros(n, s_len, dtype=torch.bool)
+        beta = torch.full((n, s_len), -_inf, dtype=dt)
+        betas = [None] * t_max
+        for t in range(t_max - 1, -1, -1):
+            b1 = torch.cat([beta[:, 1:], neg], 1)
+            b2 = torch.where(skip_next, torch.cat([beta[:, 2:], neg2], 1), -_inf) if s_len > 2 else torch.full((n, s_len), -_inf, dtype=dt)
+            new = _logsumexp3(beta, b1, b2) + lpe[t]
+            init = torch.where(init_mask, lpe[t], -_inf)
+            beta = torch.where((il_t == t + 1).reshape(n, 1), init, torch.where((il_t > t + 1).reshape(n, 1), new, -_inf))
+            betas[t] = beta
+        ab = torch.stack(alphas, 0) + torch.stack(betas, 0)
+        # PyTorch's kernel assigns (rather than adds) the last label's term
+        # at the final step, so a target that uses the blank's index there
+        # drops the final blank's term.
+        last_lab = torch.gather(lab_t, 1, (end - 1).clamp(min=0)).reshape(n)
+        drop = ((tl_t > 0) & (last_lab == lab_t[:, 0])).reshape(1, n, 1) & (positions == end).reshape(1, n, s_len) & (torch.arange(t_max).reshape(t_max, 1, 1) == (il_t - 1).reshape(1, n, 1))
+        ab = torch.where(drop, -_inf, ab)
+        # log of the summed exp(alpha + beta) over the positions carrying
+        # each label, per (t, b, label).
+        m = ab.amax(2, keepdim=True)
+        m = torch.where(m == -_inf, 0.0, m)
+        lab = lab_t.reshape(1, n, s_len).expand(t_max, n, s_len)
+        acc = torch.zeros(t_max, n, c, dtype=dt).scatter_add(2, lab, torch.exp(ab - m))
+        lcab = torch.log(acc) + m
+        grad = (torch.exp(lp) - torch.exp(lcab + nll.reshape(1, n, 1) - lp)) * g.reshape(1, n, 1)
+        live = torch.arange(t_max).reshape(t_max, 1) < il_t.reshape(1, n)
+        if zero_infinity:
+            live = live & (nll != _inf).reshape(1, n)
+        return torch.where(live.unsqueeze(2), grad, torch.zeros((), dtype=dt))
+
+
+# ---- fractional max pooling ----------------------------------------------------------------
+def _fractional_starts(samples, in_size, out_size, pool):
+    """PyTorch's generate_intervals for every plane at once: `samples` is
+    (planes,) in the input dtype, whose arithmetic the kernel uses."""
+    planes = samples.shape[0]
+    last = torch.full((planes, 1), in_size - pool, dtype=torch.int64)
+    if out_size <= 1:
+        return last if out_size == 1 else last[:, :0]
+    alpha = (in_size - pool) / (out_size - 1)
+    if samples.dtype != torch.float64:
+        alpha = _f32(alpha)
+    i = torch.arange(out_size - 1, dtype=samples.dtype).reshape(1, out_size - 1)
+    s = samples.reshape(planes, 1)
+    seq = torch.trunc((i + s) * alpha).to(torch.int64) - torch.trunc(s * alpha).to(torch.int64)
+    return torch.cat([seq, last], 1)
+
+
+def _fractional_max_pool(input, nd, kernel_size, output_size, output_ratio, return_indices, _random_samples, name):
+    x = input
+    if output_size is None and output_ratio is None:
+        raise ValueError("%s requires specifying either an output_size or an output_ratio" % name)
+    if output_size is None:
+        if nd == 2 and not isinstance(output_ratio, (tuple, list)):
+            # PyTorch 2.11's F.fractional_max_pool2d takes len() of the ratio.
+            raise TypeError("object of type '%s' has no len()" % type(output_ratio).__name__)
+        ratio = tuple(output_ratio) if isinstance(output_ratio, (tuple, list)) else (output_ratio,)
+        if len(ratio) == 1:
+            ratio = ratio * nd
+        if len(ratio) != nd:
+            raise ValueError("%s requires output_ratio to either be a single Int or tuple of Ints." % name)
+        output_size = [int(x.shape[-nd + i] * ratio[i]) for i in range(nd)]
+    samples = _random_samples
+    if samples is None:
+        samples = torch.rand(1 if x.dim() == nd + 1 else x.size(0), x.size(-nd - 1), nd, dtype=x.dtype)
+    kernel = _ntuple(kernel_size, nd, "kernel_size")
+    out = _ntuple(output_size, nd, "output_size")
+    if x.dim() not in (nd + 1, nd + 2) or x.numel() == 0:
+        raise RuntimeError("%s(): Expected %dD or %dD tensor, but got: %s" % (name, nd + 1, nd + 2, list(x.shape)))
+    unbatched = x.dim() == nd + 1
+    if unbatched:
+        x = x.unsqueeze(0)
+    n, c = x.shape[0], x.shape[1]
+    sizes = tuple(x.shape[2:])
+    dims = ("time", "height", "width")[3 - nd:]
+    for i in range(nd):
+        if out[i] + kernel[i] - 1 > sizes[i]:
+            raise RuntimeError("%s(): pool %s %d too large relative to input %s %d" % (name, dims[i], kernel[i], dims[i], sizes[i]))
+    if samples.dim() != 3 or samples.shape[0] != n or samples.shape[1] != c or samples.shape[2] != nd:
+        raise RuntimeError("%s(): expected _random_samples of shape (%d, %d, %d), but got %s" % (name, n, c, nd, list(samples.shape)))
+    planes = n * c
+    samples = samples.detach().to(x.dtype).reshape(planes, nd)
+    # A 2-D sample is (width, height); a 3-D one (time, height, width).
+    order = [1, 0] if nd == 2 else [0, 1, 2]
+    index = None
+    for i in range(nd):
+        starts = _fractional_starts(samples[:, order[i]], sizes[i], out[i], kernel[i])
+        view = [planes] + [1] * (2 * nd)
+        view[1 + i] = out[i]
+        kview = [1] * (1 + 2 * nd)
+        kview[1 + nd + i] = kernel[i]
+        pos = starts.reshape(*view) + torch.arange(kernel[i]).reshape(*kview)
+        index = pos if index is None else index * sizes[i] + pos
+    total = _prod(out)
+    window = _prod(kernel)
+    index = index.expand(*([planes] + list(out) + list(kernel))).reshape(planes, total, window)
+    values = torch.gather(x.reshape(planes, _prod(sizes)), 1, index.reshape(planes, total * window)).reshape(planes, total, window)
+    best, arg = values.max(2)
+    shape = [n, c] + list(out)
+    result = best.reshape(*shape)
+    if not return_indices:
+        return result.squeeze(0) if unbatched else result
+    idx = torch.gather(index, 2, arg.unsqueeze(2)).reshape(*shape)
+    if unbatched:
+        return result.squeeze(0), idx.squeeze(0)
+    return result, idx
+
+
+def fractional_max_pool2d(input, kernel_size, output_size=None, output_ratio=None, return_indices=False, _random_samples=None):
+    return _fractional_max_pool(input, 2, kernel_size, output_size, output_ratio, return_indices, _random_samples, "fractional_max_pool2d")
+
+
+def fractional_max_pool3d(input, kernel_size, output_size=None, output_ratio=None, return_indices=False, _random_samples=None):
+    return _fractional_max_pool(input, 3, kernel_size, output_size, output_ratio, return_indices, _random_samples, "fractional_max_pool3d")
+
+
+def fractional_max_pool2d_with_indices(input, kernel_size, output_size=None, output_ratio=None, return_indices=False, _random_samples=None):
+    return _fractional_max_pool(input, 2, kernel_size, output_size, output_ratio, True, _random_samples, "fractional_max_pool2d")
+
+
+def fractional_max_pool3d_with_indices(input, kernel_size, output_size=None, output_ratio=None, return_indices=False, _random_samples=None):
+    return _fractional_max_pool(input, 3, kernel_size, output_size, output_ratio, True, _random_samples, "fractional_max_pool3d")

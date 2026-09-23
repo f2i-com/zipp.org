@@ -1,0 +1,133 @@
+== DataParallel
+DataParallel(
+  (module): Sequential(
+    (0): Linear(in_features=3, out_features=2, bias=True)
+    (1): BatchNorm1d(2, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+  )
+)
+True [] True True
+['module.0.weight', 'module.0.bias', 'module.1.weight', 'module.1.bias', 'module.1.running_mean', 'module.1.running_var', 'module.1.num_batches_tracked']
+['module.0.weight', 'module.0.bias', 'module.1.weight', 'module.1.bias']
+True
+RuntimeError
+<All keys matched successfully>
+True
+False False
+True
+== DistributedDataParallel
+DistributedDataParallel(
+  (module): Sequential(
+    (0): Linear(in_features=3, out_features=2, bias=True)
+    (1): BatchNorm1d(2, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+  )
+)
+True None None 0 True False False False cpu cpu
+['module.0.weight', 'module.0.bias', 'module.1.weight', 'module.1.bias', 'module.1.running_mean', 'module.1.running_var', 'module.1.num_batches_tracked']
+True True
+False
+True True
+True
+ValueError
+no error
+RuntimeError
+roundtrip ok
+== SyncBatchNorm
+SyncBatchNorm(3, eps=1e-05, momentum=0.2, affine=True, track_running_stats=True) None False
+ValueError
+ValueError
+(4, 3) (2, 3, 2, 2, 2) 2
+True ['Sequential', 'Conv2d', 'SyncBatchNorm', 'Sequential', 'SyncBatchNorm', 'InstanceNorm2d']
+True False pg False None
+SyncBatchNorm 5 ['weight', 'bias', 'running_mean', 'running_var', 'num_batches_tracked']
+== fractional max pooling
+FractionalMaxPool2d() (4, 4, 4)
+[] ['_random_samples']
+(2, 3, 3, 3)
+(3, 2, 3, 3) torch.int64
+ValueError
+ValueError
+ValueError
+ValueError
+TypeError
+ValueError
+RuntimeError
+IndexError
+[7.0, 9.0, 11.0, 19.0, 21.0, 23.0, 31.0, 33.0, 35.0] [7, 9, 11, 19, 21, 23, 31, 33, 35]
+== CTC
+CTCLoss() True
+RuntimeError
+RuntimeError
+RuntimeError
+RuntimeError
+RuntimeError
+RuntimeError
+ValueError
+torch.Size([2]) torch.Size([])
+== grid_sample and affine_grid
+ValueError
+ValueError
+RuntimeError
+RuntimeError
+RuntimeError
+RuntimeError
+RuntimeError
+ValueError
+ValueError
+NotImplementedError
+ValueError
+[-1.0, -1.0, 0.0, -1.0, 1.0, -1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0]
+[0.0, 0.5, 1.0, 2.0, 2.5, 3.0]
+== convolution padding modes
+Conv2d(2, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), padding_mode=reflect)
+circular (1, 1, 1, 1, 1, 1)
+ValueError
+ValueError
+RuntimeError
+torch.Size([1, 1, 3, 3])
+== second derivatives through convolutions
+True [23.0, -18.0, -56.0, 49.5, 50.0, -2.0, 19.0, 135.5, 129.0]
+[935.0, -1418.0, -904.0, 1929.5, 2142.0, -2714.0, 731.0, 5403.5, 6105.0] [21090.0, 17526.0, 45804.0, 56094.0]
+== uninitialized parameters
+ValueError Attempted to use an uninitialized parameter in <method 'add' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'mul' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'sum' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'view' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'numel' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'detach' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'neg' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'clone' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'dim' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <slot wrapper '__getitem__' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'tolist' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'requires_grad_' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <function uniform_
+ValueError Attempted to use an uninitialized parameter in <function kaiming_uniform_
+ValueError Attempted to use an uninitialized parameter in <function constant_
+ValueError Attempted to use an uninitialized parameter in <method 'zero_' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'fill_' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <function normal_
+RuntimeError Can't access the shape of an uninitialized parameter or buffer. This error usually happens in `load_state_dict` when trying to load an uninitialized parameter into an initialized one. Call `forward` to initialize the parameters before accessing their attributes.
+ValueError Attempted to use an uninitialized parameter in <method 'dim' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'dim' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'uniform_' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'dim' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'dim' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'dim' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'dim' of 'torch._C.TensorBase' objects
+ValueError Attempted to use an uninitialized parameter in <method 'mul' of 'torch._C.TensorBase' objects
+RuntimeError Can't access the shape of an uninitialized parameter or buffer. This error usually happens in `load_state_dict` when trying to load an uninitialized parameter into an initialized one. Call `forward` to initialize the parameters before accessing their attributes.
+ValueError
+torch.Size([0]) torch.float32 True True UninitializedParameter
+UninitializedParameter torch.float64 True
+torch.float64 Parameter True (3, 4)
+UninitializedBuffer torch.float64 torch.float64
+== dropout keeps x * (1 / (1 - p)) rounded as PyTorch's CPU kernel
+0.1 95901.13085211394 -4.44444465637207 4.148220539093018 1.8825955390930176 -0.3830295205116272
+0.3 123301.45120656257 -5.714285850524902 5.333426475524902 2.4204800128936768 -0.492466539144516
+0.7 287703.3702195273 -13.333333015441895 12.444661140441895 5.6477861404418945 -1.1490885019302368
+float64 123301.44810267855 -5.714285714285714 5.333426339285714 2.4204799107142856 -0.49246651785714285
+module 123301.45120656257 -5.714285850524902 5.333426475524902 2.4204800128936768 -0.492466539144516
+inplace 95901.13085211394 -4.44444465637207 4.148220539093018 1.8825955390930176 -0.3830295205116272
+dropout1d 123301.45120656257 -5.714285850524902 5.333426475524902 2.4204800128936768 -0.492466539144516
+dropout2d 287703.3702195273 -13.333333015441895 12.444661140441895 5.6477861404418945 -1.1490885019302368
+eval True
