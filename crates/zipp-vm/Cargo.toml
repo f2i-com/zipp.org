@@ -38,6 +38,10 @@ self_cell = "1.3.0"
 python = ["dep:rustpython-parser", "instrument"]
 # Trusted mixed-language programs sharing one VM scope; deliberately opt-in.
 python-js-interop = ["python"]
+# `_zipp_gpu.native`: zipp_gpu graphs answered synchronously by an embedder
+# that serves `zipp.gpu.*` host calls (the native CLI's GPU). Inert without
+# such a host; enabled only by zipp-cli's `gpu` feature.
+python-native-gpu = ["python"]
 # Native x86-64 and ARM64 JIT tiers (dynasm). On by default on supported targets; the
 # `codegen` module is `#[cfg(feature = "jit")]` so a `--no-default-features`
 # build is a pure interpreter with no unsafe codegen.

@@ -20,13 +20,21 @@ serde_json = "1.0"
 # Ordinary `zipp js` does not attach a recorder, preserving its semantics; the
 # feature contributes one predictable null check to interpreted dispatch.
 zipp-vm = { path = "../zipp-vm", features = ["instrument"] }
+# Native GPU execution of a Python program's torch.compile / zipp_gpu graphs
+# (feature `gpu`): gpu-lab's runtime over wgpu. Only this trusted CLI links
+# it; zipp-sandbox and zipp-wasm are separate workspaces and never do.
+zipp-gpu = { path = "../zipp-gpu", optional = true }
 
 [features]
 # The experimental Python-subset frontend (`zipp py file.py`, `zipp run`,
 # `--lang=python`). Default-on for the CLI only; `--no-default-features`
 # yields the JavaScript-only binary.
-default = ["python"]
+default = ["python", "gpu"]
 python = ["zipp-vm/python"]
+# Run `zipp py` graphs on a hardware GPU (Vulkan, Direct3D 12 or Metal,
+# loaded at run time) when one is present, synchronously, exactly where the
+# CPU evaluator would have run them; the CPU evaluator otherwise.
+gpu = ["python", "dep:zipp-gpu", "zipp-vm/python-native-gpu"]
 python-js-interop = ["python", "zipp-vm/python-js-interop"]
 secure-allocator = ["mimalloc/secure"]
 regex-linear = ["zipp-vm/regex-linear"]

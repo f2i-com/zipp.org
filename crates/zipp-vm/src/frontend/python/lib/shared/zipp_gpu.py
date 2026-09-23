@@ -50,6 +50,38 @@ except ImportError:
 __all__ = ["Graph", "Tensor", "Session", "GraphError", "ComputeError", "execute_locally"]
 
 
+# The native CLI's GPU, asked once, on the first graph (`_zipp_gpu.native`
+# exists only in the native CLI's runtime and answers only when the CLI
+# serves it): `None` until asked, then the request function or False.
+_native_gpu = None
+
+
+def _native():
+    """The native GPU's synchronous request function, or None.
+
+    Without a host (`zipp py`, CPython) a graph is evaluated where it is
+    submitted. The native CLI keeps exactly that: a request it can run on a
+    GPU is answered here, before `submit` returns, and the CPU tensor
+    kernels evaluate anything it cannot."""
+    global _native_gpu
+    if _native_gpu is None:
+        _native_gpu = False
+        native = getattr(_zipp_gpu, "native", None) if _zipp_gpu is not None else None
+        if native is not None and not _zipp_gpu.hosted() and _zipp_gpu.native_open():
+            _native_gpu = native
+    return _native_gpu or None
+
+
+def _native_value(reply, storage):
+    """A native reply's value with its outputs as the caller takes them, or None when it failed."""
+    if not isinstance(reply, dict) or not reply.get("ok"):
+        return None
+    value = reply["value"]
+    for out in value["outputs"].values():
+        out["data"] = _host_data(out["data"], storage)
+    return value
+
+
 class GraphError(ValueError):
     """A graph was built or requested incorrectly."""
 
@@ -786,6 +818,16 @@ class Graph:
                 on_error(exc)
             _zipp_gpu.post(program, deliver)
             return None
+        native = _native()
+        if native is not None:
+            # On the GPU, synchronously. A request it refuses or fails (a
+            # device lost, a kernel its compiler rejects, a non-finite
+            # result) goes to the CPU evaluator below, which then succeeds
+            # or fails exactly as it would with no GPU present.
+            value = _native_value(native("gpu.execute", program), storage)
+            if value is not None:
+                callback(value)
+                return None
         callback(execute_locally(program) if _k is None else _execute_kernels(program, storage))
         return None
 
@@ -1509,6 +1551,12 @@ class Session:
         self._began = False
         self._disposed = False
         self._queue = []
+        # The native GPU's session id, while this session lives there (see
+        # _native); `_native_ran`: a step has run there, so its state is
+        # the device's and can no longer move to the CPU.
+        self._native_id = None
+        self._native_ran = False
+        self._requested = backend
         self._hosted = _zipp_gpu is not None and _zipp_gpu.hosted()
         if self._hosted:
             payload = {"program": program, "resident": self._resident}
@@ -1540,6 +1588,24 @@ class Session:
 
             _zipp_gpu.request("gpu.session.create", payload, created)
             return
+        native = _native()
+        if native is not None and backend in (None, "webgpu"):
+            payload = {"program": program, "resident": self._resident}
+            if backend is not None:
+                payload["backend"] = backend
+            reply = native("gpu.session.create", payload)
+            if isinstance(reply, dict) and reply.get("ok"):
+                value = reply["value"]
+                self._native_id = value["session"]
+                self.backend = value["backend"]
+                self.step = int(value.get("step", 1))
+                # What a move to the CPU starts from, should the device fail
+                # before the first step has run.
+                self._values = {node["id"]: node["data"] for node in program["nodes"] if node["op"] == "input" and "data" in node}
+                self._residents = {}
+                if on_ready is not None:
+                    on_ready(self)
+                return
         if backend not in (None, "cpu-python"):
             exc = ComputeError("BACKEND", "Session requires backend %s; the reference is cpu-python" % backend)
             if on_error is None:
@@ -1698,8 +1764,58 @@ class Session:
 
             self._request("gpu.session.run", body, lambda reply: self._reply(reply, callback, on_error, convert))
             return None
+        if self._native_id is not None:
+            value = self._run_native(payload_steps, names, step, storage)
+            if value is not None:
+                callback(value)
+                return None
         callback(self._run_locally(payload_steps, names, step, storage))
         return None
+
+    def _run_native(self, payload_steps, names, step, storage):
+        """Run on the native GPU session: its result, or None once the session
+        has moved to the CPU (the device failed before any step ran there, so
+        the CPU starts from the same values). A failure after steps ran there
+        is raised as the CPU evaluator raises it, poisoning the session when
+        device work had begun."""
+        # A host runs at most 64 steps per request; the CPU evaluator has no
+        # such limit, so a longer run goes as several requests.
+        done = []
+        for start in range(0, len(payload_steps), 64):
+            body = {"session": self._native_id, "steps": payload_steps[start:start + 64], "readback": names}
+            if start == 0 and step is not None:
+                body["step"] = step
+            reply = _native()("gpu.session.run", body)
+            if not (isinstance(reply, dict) and reply.get("ok")):
+                break
+            value = reply["value"]
+            for entry in value["steps"]:
+                for out in entry["outputs"].values():
+                    out["data"] = _host_data(out["data"], storage)
+            done.extend(value["steps"])
+            self.step = int(value.get("step", self.step + len(body["steps"])))
+            self._native_ran = True
+        else:
+            value["steps"] = done
+            value["outputs"] = done[-1]["outputs"]
+            return value
+        error = (reply.get("error") if isinstance(reply, dict) else None) or {}
+        if not self._native_ran and self._requested != "webgpu":
+            self._leave_native()
+            return None
+        code = error.get("code", "GPU")
+        # The CPU evaluator's own words for the one failure both can report.
+        message = "Output contains non-finite values" if code == "NUMBER" else error.get("message", "GPU request failed")
+        exc = ComputeError(code, message)
+        if error.get("poisoned"):
+            self._failed = _poisoned(exc)
+        raise exc
+
+    def _leave_native(self):
+        """Release the device session; the CPU session takes over from `_values`."""
+        session, self._native_id = self._native_id, None
+        self.backend = "cpu-python"
+        _native()("gpu.session.dispose", {"session": session})
 
     def _run_locally(self, payload_steps, names, step, storage=False):
         try:
@@ -1782,6 +1898,18 @@ class Session:
 
             self._request("gpu.session.download", {"names": wanted}, lambda reply: self._reply(reply, callback, on_error, convert))
             return None
+        if self._native_id is not None and self._native_ran:
+            reply = _native()("gpu.session.download", {"session": self._native_id, "names": wanted})
+            value = _native_value(reply, storage)
+            if value is None:
+                error = (reply.get("error") if isinstance(reply, dict) else None) or {}
+                exc = ComputeError(error.get("code", "GPU"), error.get("message", "GPU request failed"))
+                if on_error is None:
+                    raise exc
+                on_error(exc)
+                return None
+            callback(value)
+            return None
         outputs = {}
         for name in wanted:
             if name not in self._residents:
@@ -1814,5 +1942,8 @@ class Session:
             if self._id is not None or self._failed is None:
                 self._request("gpu.session.dispose", {}, lambda reply: None)
             return
+        if self._native_id is not None:
+            session, self._native_id = self._native_id, None
+            _native()("gpu.session.dispose", {"session": session})
         self._values = {}
         self._residents = {}

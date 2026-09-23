@@ -10,6 +10,8 @@ use std::process::ExitCode;
 
 mod sandbox;
 mod frontend_cli;
+#[cfg(feature = "gpu")]
+mod gpu;
 
 /// The engine is allocation-bound: every object owns three parallel `Vec`s plus
 /// a `String` per property, so constructing `{a: 1}` costs four allocations.
@@ -535,6 +537,8 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             println!("  zipp mjs <file.mjs>             run a file as an ES module");
             println!("  zipp py  <file.py>              run a Python program (--bc prints the bytecode)");
+            #[cfg(feature = "gpu")]
+            println!("                                  torch.compile graphs run on a GPU when one is present (--no-gpu or ZIPP_GPU=0: CPU)");
             println!("  zipp run [--lang=L] <file>      run; L = javascript|python, else by extension/shebang");
             println!("  zipp bc  <file.js> [--module]   compile only, print the bytecode");
             println!("  zipp bcdiff <path>...           compile a corpus twice, diff the result");

@@ -36,6 +36,13 @@ const RUNTIME_BASE: &str = concat!(
     include_str!("runtime/tensor.js"),
 );
 const RUNTIME_ENTRY: &str = include_str!("runtime/entry.js");
+// The native CLI's synchronous GPU bridge (`_zipp_gpu.native`): inert
+// unless the embedder answers `zipp.gpu.*` host calls. Only the native CLI
+// enables it, so the WebAssembly and sandbox runtimes are unchanged.
+#[cfg(feature = "python-native-gpu")]
+const NATIVE_GPU_RUNTIME: &str = include_str!("runtime/native_gpu.js");
+#[cfg(not(feature = "python-native-gpu"))]
+const NATIVE_GPU_RUNTIME: &str = "";
 #[cfg(feature = "python-js-interop")]
 const INTEROP_RUNTIME: &str = include_str!("runtime/javascript.js");
 #[cfg(not(feature = "python-js-interop"))]
@@ -808,7 +815,8 @@ fn runtime_seed() -> R<RuntimeSeed> {
 }
 
 fn compile_runtime_seed() -> R<RuntimeSeed> {
-    let runtime = format!("{RUNTIME_BASE}\n{INTEROP_RUNTIME}\n{RUNTIME_ENTRY}");
+    let runtime =
+        format!("{RUNTIME_BASE}\n{NATIVE_GPU_RUNTIME}\n{INTEROP_RUNTIME}\n{RUNTIME_ENTRY}");
     let mut program = crate::compile_only(&runtime, false)?;
     // Only this program — the Python runtime every Python state is built
     // from — gets the native tensor loops (`vm::py_tensor`).

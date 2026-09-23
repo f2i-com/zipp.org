@@ -33,6 +33,9 @@ fn run(args: &[String]) -> Result<(), String> {
     };
     let mut options = true;
     let mut bytecode = false;
+    // `--no-gpu`: keep a torch/zipp_gpu program on the CPU graph evaluator
+    // even when a GPU adapter is available (as `ZIPP_GPU=0` does).
+    let mut gpu = true;
     let mut program_args: Vec<String> = Vec::new();
     while index < args.len() {
         let arg = &args[index];
@@ -43,6 +46,11 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         if options && arg == "--bc" {
             bytecode = true;
+            index += 1;
+            continue;
+        }
+        if options && arg == "--no-gpu" {
+            gpu = false;
             index += 1;
             continue;
         }
@@ -75,7 +83,7 @@ fn run(args: &[String]) -> Result<(), String> {
         index += 1;
     }
     let filename = filename.ok_or(
-        "usage: zipp py [--bc] FILE|DIR [ARGS...] | zipp run [--lang=python|javascript] FILE [ARGS...] | zipp --lang=python -",
+        "usage: zipp py [--bc] [--no-gpu] FILE|DIR [ARGS...] | zipp run [--lang=python|javascript] [--no-gpu] FILE [ARGS...] | zipp --lang=python -",
     )?;
     let stdin = filename == "-";
     // A directory is a Python project rooted there with `main.py` as the
@@ -89,7 +97,7 @@ fn run(args: &[String]) -> Result<(), String> {
         if bytecode {
             return Err("--bc takes a file, not a directory".into());
         }
-        return run_project(Path::new(&filename), None, &program_args);
+        return run_project(Path::new(&filename), None, &program_args, gpu);
     }
     if !stdin
         && !bytecode
@@ -98,7 +106,7 @@ fn run(args: &[String]) -> Result<(), String> {
     {
         let path = Path::new(&filename);
         let root = project_root_of(path);
-        return run_project(&root, Some(path), &program_args);
+        return run_project(&root, Some(path), &program_args, gpu);
     }
     // Bound ingestion before allocating an unbounded stdin/file buffer. This is
     // not a sandbox switch. The old CLI commands retain their existing policy.
@@ -148,7 +156,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // is the entry of its project exactly like a `.py` file.
     if detected.language == LanguageId::Python && !stdin && !bytecode {
         let path = Path::new(&filename);
-        return run_project(&project_root_of(path), Some(path), &program_args);
+        return run_project(&project_root_of(path), Some(path), &program_args, gpu);
     }
     let frontend = match detected.language {
         LanguageId::JavaScript => Frontend::JavaScript {
@@ -167,13 +175,25 @@ fn run(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let compiled = compile_source(&source, frontend)?;
-    execute(compiled)
+    execute(compiled, gpu)
 }
 
-fn execute(mut compiled: zipp_vm::frontend::CompiledSource) -> Result<(), String> {
+/// A Python program's graphs on the native GPU, when the build has it and
+/// the run did not opt out.
+fn install_gpu(state: &mut ScriptState, gpu: bool) {
+    #[cfg(feature = "gpu")]
+    super::gpu::install(state, gpu);
+    #[cfg(not(feature = "gpu"))]
+    let _ = (state, gpu);
+}
+
+fn execute(mut compiled: zipp_vm::frontend::CompiledSource, gpu: bool) -> Result<(), String> {
     let python = compiled.language() == LanguageId::Python;
     let state = compiled.state_mut();
     stream_console(state);
+    if python {
+        install_gpu(state, gpu);
+    }
     let outcome = state.run_init();
     // A program read from standard input has no project folder to write to.
     if python {
@@ -600,8 +620,15 @@ fn note_left_out(what: &str, paths: &[String]) {
 /// Run the project rooted at `root`: every `.py` file in the tree is an
 /// importable module, every file is readable through the virtual
 /// filesystem, `script` (or `main.py`) is the entry, and files the program
-/// writes are written back under `root` when it finishes.
-fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<(), String> {
+/// writes are written back under `root` when it finishes. With `gpu`, its
+/// `torch.compile` / `zipp_gpu` graphs run on a hardware GPU when one is
+/// available, with unchanged semantics (see `gpu.rs`).
+fn run_project(
+    root: &Path,
+    script: Option<&Path>,
+    argv: &[String],
+    gpu: bool,
+) -> Result<(), String> {
     let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
     let root = canonical_root.as_path();
     let script = match script {
@@ -757,6 +784,7 @@ fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<()
     drop(files);
     let state = compiled.state_mut();
     stream_console(state);
+    install_gpu(state, gpu);
     let outcome = state.run_init();
     // Files the program wrote go back to disk, inside the root only. The
     // program's own failure (and its traceback) is the run's result even

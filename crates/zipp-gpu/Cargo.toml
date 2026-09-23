@@ -1,0 +1,22 @@
+[package]
+name = "zipp-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native GPU host for ZIPP's torch.compile graphs: gpu-lab's JavaScript runtime over a wgpu-backed WebGPU subset"
+publish = false
+
+# The trusted native CLI's GPU host. It is linked only by zipp-cli (feature
+# `gpu`); zipp-sandbox and zipp-wasm are separate workspaces and never see it.
+[dependencies]
+zipp-vm = { path = "../zipp-vm" }
+# Only the native backends. No `webgpu`/`webgl` (browser targets), no `gles`
+# (EGL/WGL probing on Windows, and a second shader path), no naga front ends
+# beyond WGSL. Every backend library is loaded at run time (Vulkan through the
+# loader, D3D12 from the system, Metal from the OS), so building needs no
+# system SDK and a machine without a driver simply reports no adapter.
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "dx12", "metal"] }
+pollster = "0.4"
+# The bridge's request JSON (already the CLI's); `float_roundtrip` parses every
+# number to the exact f64 JavaScript printed.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
