@@ -112,6 +112,20 @@ pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
     ),
     ("torch.linalg", include_str!("lib/torch_linalg.py")),
     ("torch.distributions", include_str!("lib/torch_distributions.py")),
+    (
+        "torch.distributions.constraints",
+        include_str!("lib/torch_distributions_constraints.py"),
+    ),
+    (
+        "torch.distributions.transforms",
+        include_str!("lib/torch_distributions_transforms.py"),
+    ),
+    (
+        "torch.distributions.kl",
+        include_str!("lib/torch_distributions_kl.py"),
+    ),
+    ("torch.fft", include_str!("lib/torch_fft.py")),
+    ("torch.nn.parallel", include_str!("lib/torch_nn_parallel.py")),
     ("torch.amp", include_str!("lib/torch_amp.py")),
     ("torch.special", include_str!("lib/torch_special.py")),
     ("torch.optim", include_str!("lib/torch_optim.py")),
