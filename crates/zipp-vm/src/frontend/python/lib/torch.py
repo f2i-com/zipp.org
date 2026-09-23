@@ -1,5 +1,5 @@
-"""A PyTorch-compatible tensor library for Zipp: contiguous float32/float64/
-int64/bool tensors with broadcasting, reverse-mode autograd, and the modules,
+"""A PyTorch-compatible tensor library for Zipp: contiguous float16/bfloat16/
+float32/float64, int8/int16/int32/int64, uint8 and bool tensors with broadcasting, reverse-mode autograd, and the modules,
 functional ops, optimizers and checkpoint format the bundled `torch.nn`,
 `torch.nn.functional`, `torch.optim` and `torch.autograd` provide.
 
@@ -18,11 +18,19 @@ _int, _float, _bool, _isinstance, _len, _range, _tuple, _list = _b.int, _b.float
 _issubclass = _b.issubclass
 
 
+_ITEMSIZE = {"float64": 8, "int64": 8, "float32": 4, "int32": 4, "float16": 2, "bfloat16": 2, "int16": 2}
+
+
 class dtype:
     def __init__(self, name, is_floating):
         self.name = name
         self.is_floating_point = is_floating
-        self.itemsize = 8 if name in ("float64", "int64") else 4 if name in ("float32", "int32") else 1
+        self.itemsize = _ITEMSIZE.get(name, 1)
+        self.is_signed = name not in ("uint8", "bool")
+        self.is_complex = False
+        # float16/bfloat16: stored as float32 values, every result rounded
+        # to the format; arithmetic follows PyTorch's float `opmath`.
+        self._reduced = name in ("float16", "bfloat16")
 
     def __repr__(self):
         return "torch." + self.name
@@ -44,7 +52,14 @@ int64 = dtype("int64", False)
 int32 = dtype("int32", False)
 uint8 = dtype("uint8", False)
 _bool_dtype = dtype("bool", False)
-_DTYPES = {"float32": float32, "float64": float64, "int64": int64, "int32": int32, "uint8": uint8, "bool": _bool_dtype}
+float16 = dtype("float16", True)
+bfloat16 = dtype("bfloat16", True)
+int8 = dtype("int8", False)
+int16 = dtype("int16", False)
+half = float16
+short = int16
+_DTYPES = {"float32": float32, "float64": float64, "int64": int64, "int32": int32, "uint8": uint8, "bool": _bool_dtype,
+           "float16": float16, "bfloat16": bfloat16, "int8": int8, "int16": int16}
 _default_dtype = float32
 
 
@@ -435,8 +450,11 @@ def _frozen(t, s):
 # PyTorch's result_type: bool < integer < floating categories; within the
 # winning category a dimensioned tensor's dtype outranks a 0-d tensor's,
 # which outranks a Python scalar's (int -> int64, float -> the default dtype).
-_RANK = {"bool": 0, "uint8": 1, "int32": 2, "int64": 3, "float32": 4, "float64": 5}
-_CAST_NAME = {"float32": "Float", "float64": "Double", "int64": "Long", "int32": "Int", "bool": "Bool", "uint8": "Byte"}
+# Not a total order: uint8 with int8 promotes to int16 and float16 with
+# bfloat16 to float32 (the pairs of equal rank).
+_RANK = {"bool": 0, "uint8": 1, "int8": 1, "int16": 2, "int32": 3, "int64": 4, "float16": 5, "bfloat16": 5, "float32": 6, "float64": 7}
+_CAST_NAME = {"float32": "Float", "float64": "Double", "int64": "Long", "int32": "Int", "bool": "Bool", "uint8": "Byte",
+              "float16": "Half", "bfloat16": "BFloat16", "int8": "Char", "int16": "Short"}
 
 
 def _promote_types(x, y):
@@ -444,7 +462,10 @@ def _promote_types(x, y):
         return y
     if y is None or x is y:
         return x
-    return x if _RANK[x.name] >= _RANK[y.name] else y
+    rx, ry = _RANK[x.name], _RANK[y.name]
+    if rx == ry:
+        return int16 if rx == 1 else float32
+    return x if rx > ry else y
 
 
 promote_types = _promote_types
@@ -493,18 +514,22 @@ def can_cast(from_, to):
     return _CATEGORY[from_.name] <= _CATEGORY[to.name]
 
 
-_CATEGORY = {"bool": 0, "uint8": 1, "int32": 1, "int64": 1, "float32": 2, "float64": 2}
+_CATEGORY = {"bool": 0, "uint8": 1, "int8": 1, "int16": 1, "int32": 1, "int64": 1, "float16": 2, "bfloat16": 2, "float32": 2, "float64": 2}
 
 
-def _operands(a, b):
+def _operands(a, b, opmath=False):
     """Both operands as tensors plus the promoted result dtype (None when the
     kernel's own promotion of the two storages already gives it). A Python
-    scalar becomes a 0-d tensor of the result dtype, as PyTorch converts it."""
+    scalar becomes a 0-d tensor of the result dtype, as PyTorch converts it.
+    `opmath` (mul, div): a float16/bfloat16 result keeps a scalar second
+    operand in float32 instead, as PyTorch's kernels read it."""
     if _isinstance(a, Tensor):
         if _isinstance(b, Tensor):
             if a.dtype is b.dtype:
                 return a, b, None
             dt = _result_type(a, b)
+            if opmath and dt._reduced and not b.shape and a.dtype is dt:
+                return a, (b if b.dtype is float32 else Tensor(_k.astype(b._s, "float32"), (), float32)), dt
             # Only a 0-d operand can lose to the other's dtype; cast it, so
             # the kernel computes in the result dtype as PyTorch does.
             if b.dtype is not dt and not b.shape:
@@ -519,6 +544,8 @@ def _operands(a, b):
             dt = a.dtype
             if not dt.is_floating_point:
                 dt = _default_dtype if tb is _float else (int64 if dt is _bool_dtype else dt)
+            if opmath and dt._reduced:
+                return a, Tensor(_k.full("float32", 1, b), _SCALAR_SHAPE, float32), dt
             return a, Tensor(_k.full(dt.name, 1, b), _SCALAR_SHAPE, dt), dt
         dt = _scalar_result(a.dtype, b)
         return a, _as_tensor(b, None, dt), dt
@@ -822,6 +849,9 @@ class Tensor:
         return div(self, other)
 
     def __rtruediv__(self, other):
+        if self.dtype._reduced and not _isinstance(other, Tensor):
+            # PyTorch's Tensor.__rdiv__: the reciprocal times the scalar.
+            return mul(reciprocal(self), other)
         return div(other, self)
 
     def __floordiv__(self, other):
@@ -995,7 +1025,10 @@ class Tensor:
     def fill_(self, value):
         if _grad_enabled and (self.requires_grad or (_isinstance(value, Tensor) and value.requires_grad)):
             return self._inplace_op(_filled, value)
-        _k.fill(self._s, value.item() if _isinstance(value, Tensor) else value)
+        value = value.item() if _isinstance(value, Tensor) else value
+        if self.dtype.name in _NARROW_INT:
+            _check_narrow(self.dtype, [value], "_t")
+        _k.fill(self._s, value)
         self._wrote()
         return self
 
@@ -1078,7 +1111,7 @@ class Tensor:
     def random_(self, from_=0, to=None, generator=None):
         if to is None:
             if from_ == 0 or from_ is None:
-                to = 2 ** 24 if self.dtype is float32 else (2 ** 53 if self.dtype.is_floating_point else (2 if self.dtype is _bool_dtype else (256 if self.dtype is uint8 else 2 ** 31 if self.dtype is int32 else 2 ** 53)))
+                to = _RANDOM_TO.get(self.dtype.name, 2 ** 53)
             else:
                 from_, to = 0, from_
         return self._overwrite(randint(_int(from_), _int(to), self.shape, generator=generator))
@@ -1306,6 +1339,45 @@ class Tensor:
 
     def erfinv(self):
         return erfinv(self)
+
+    def lgamma(self):
+        return lgamma(self)
+
+    def digamma(self):
+        return digamma(self)
+
+    def polygamma(self, n):
+        return polygamma(n, self)
+
+    def polygamma_(self, n):
+        return self._inplace_op(lambda src: polygamma(n, src))
+
+    def mvlgamma(self, p):
+        return mvlgamma(self, p)
+
+    def mvlgamma_(self, p):
+        return self._inplace_op(mvlgamma, p)
+
+    def i0(self):
+        return i0(self)
+
+    def sinc(self):
+        return sinc(self)
+
+    def logit(self, eps=None):
+        return logit(self, eps)
+
+    def logit_(self, eps=None):
+        return self._inplace_op(logit, eps)
+
+    def xlogy(self, other):
+        return xlogy(self, other)
+
+    def igamma(self, other):
+        return igamma(self, other)
+
+    def igammac(self, other):
+        return igammac(self, other)
 
     def repeat_interleave(self, repeats, dim=None):
         return repeat_interleave(self, repeats, dim)
@@ -1724,7 +1796,7 @@ class Tensor:
 
     def type(self, dtype=None, non_blocking=False):
         if dtype is None:
-            return "torch." + {"float32": "FloatTensor", "float64": "DoubleTensor", "int64": "LongTensor", "int32": "IntTensor", "bool": "BoolTensor", "uint8": "ByteTensor"}[self.dtype.name]
+            return "torch." + _CAST_NAME[self.dtype.name] + "Tensor"
         if _isinstance(dtype, _b.str):
             name = dtype.rsplit(".", 1)[-1]
             if name not in _LEGACY_TYPES:
@@ -1771,10 +1843,16 @@ class Tensor:
         return self.to(uint8)
 
     def half(self):
-        return self.to(float32)
+        return self.to(float16)
 
     def bfloat16(self):
-        return self.to(float32)
+        return self.to(bfloat16)
+
+    def char(self):
+        return self.to(int8)
+
+    def short(self):
+        return self.to(int16)
 
     def cpu(self):
         return self
@@ -2180,8 +2258,23 @@ def tensor(data, dtype=None, device=None, requires_grad=False, pin_memory=False)
         dt = data.dtype
     else:
         dt = _dtype_of(dtype) or _infer_dtype(flat, hint)
+    if dt.name in _NARROW_INT and not _isinstance(data, Tensor):
+        _check_narrow(dt, flat, "")
     flat = [_float(v) if dt.is_floating_point else (_int(v) if dt is not _bool_dtype else (1 if v else 0)) for v in flat]
     return Tensor(_k.from_flat(dt.name, flat), shape, dt, requires_grad)
+
+
+# int8/int16 refuse a Python value outside their range when a tensor is
+# made or filled from it (arithmetic wraps instead), as PyTorch's checked
+# scalar conversion does.
+_NARROW_INT = {"int8": (-128, 127), "int16": (-32768, 32767)}
+
+
+def _check_narrow(dt, values, suffix):
+    lo, hi = _NARROW_INT[dt.name]
+    for v in values:
+        if v < lo or v > hi:
+            raise RuntimeError("value cannot be converted to type %s%s without overflow" % (dt.name, suffix))
 
 
 def as_tensor(data, dtype=None, device=None):
@@ -2263,6 +2356,8 @@ def full(size, fill_value, dtype=None, layout=None, device=None, requires_grad=F
     if _isinstance(fill_value, Tensor):
         fill_value = fill_value.item()
     dt = _dtype_of(dtype) or (_default_dtype if _isinstance(fill_value, _float) else (_bool_dtype if _isinstance(fill_value, _b.bool) else int64))
+    if dt.name in _NARROW_INT:
+        _check_narrow(dt, [fill_value], "_t")
     return Tensor(_k.full(dt.name, _numel(shape), fill_value), shape, dt, requires_grad)
 
 
@@ -2346,6 +2441,14 @@ def linspace(start, end, steps, dtype=None, layout=None, device=None, requires_g
         half = steps // 2
         values = [start + step * i if i < half else end - step * (steps - i - 1) for i in _range(steps)]
     dt = _dtype_of(dtype) or _default_dtype
+    if dt._reduced and steps > 1:
+        # PyTorch's kernel steps in the format itself: the step and every
+        # product and sum round to float16/bfloat16.
+        r = lambda v: _k.item(_k.full(dt.name, 1, v), 0)
+        s, e = r(start), r(end)
+        step = r(r(e - s) / r(steps - 1))
+        half = steps // 2
+        values = [r(s + r(step * r(i))) if i < half else r(e - r(step * r(steps - i - 1))) for i in _range(steps)]
     return Tensor(_k.from_flat(dt.name, values), (steps,), dt, requires_grad)
 
 
@@ -2369,10 +2472,18 @@ def one_hot_(idx, n):
     return Tensor(_k.one_hot(idx._s, n), _tuple(idx.shape) + (n,), int64)
 
 
+# random_() without bounds: [0, 2**mantissa digits] for a float, [0, max]
+# for an integer type, as PyTorch draws them.
+_RANDOM_TO = {"float32": 2 ** 24, "float64": 2 ** 53, "float16": 2 ** 11 + 1, "bfloat16": 2 ** 8 + 1, "bool": 2, "uint8": 256,
+              "int8": 128, "int16": 32768, "int32": 2 ** 31, "int64": 2 ** 53}
+
+
 class finfo:
     _INFO = {
         "float32": (32, 1.1920928955078125e-07, 3.4028234663852886e+38, 1.1754943508222875e-38, 1.401298464324817e-45, 1e-06, 6),
         "float64": (64, 2.220446049250313e-16, 1.7976931348623157e+308, 2.2250738585072014e-308, 5e-324, 1e-15, 15),
+        "float16": (16, 0.0009765625, 65504.0, 6.103515625e-05, 5.960464477539063e-08, 0.001, 3),
+        "bfloat16": (16, 0.0078125, 3.3895313892515355e+38, 1.1754943508222875e-38, 9.183549615799121e-41, 0.01, 2),
     }
 
     def __init__(self, type=None):
@@ -2389,7 +2500,8 @@ class finfo:
 
 
 class iinfo:
-    _INFO = {"uint8": (8, 0, 255), "int32": (32, -2 ** 31, 2 ** 31 - 1), "int64": (64, -2 ** 63, 2 ** 63 - 1), "bool": (8, 0, 1)}
+    _INFO = {"uint8": (8, 0, 255), "int8": (8, -128, 127), "int16": (16, -32768, 32767), "int32": (32, -2 ** 31, 2 ** 31 - 1),
+             "int64": (64, -2 ** 63, 2 ** 63 - 1), "bool": (8, 0, 1)}
 
     def __init__(self, type):
         dt = _dtype_of(type)
@@ -2494,7 +2606,7 @@ def rand(*size, generator=None, dtype=None, layout=None, device=None, requires_g
     _check_cpu_device(device)
     shape = _shape_args(size)
     dt = _dtype_of(dtype) or _default_dtype
-    storage = _k.rand(_gen(generator), _numel(shape)) if dt is float32 else _k.rand_double(_gen(generator), _numel(shape))
+    storage = _k.rand(_gen(generator), _numel(shape), dt.name) if dt is float32 or dt._reduced else _k.rand_double(_gen(generator), _numel(shape))
     return Tensor(storage, shape, dt, requires_grad)
 
 
@@ -2630,11 +2742,11 @@ def _unary_nograd(op, a, p1=None, p2=None):
 _NOSAVE = ("", "")
 
 
-def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None):
+def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=False):
     """An elementwise binary op. `saves` names the values backward reads
     when the first/second operand requires grad ("x", "y", "o" for the
     output), so writing one of them in place before backward raises."""
-    ta, tb, dt = _operands(a, b)
+    ta, tb, dt = _operands(a, b, opmath)
     if want is not None:
         dt = want
     storage, shape = _k.binary(op, ta._s, ta.shape, tb._s, tb.shape, None if dt is None else dt.name)
@@ -2684,6 +2796,13 @@ def _scaled(b, alpha):
     return mul(b, alpha) if _isinstance(b, Tensor) else b * alpha
 
 
+def _alpha_scaled(b, alpha):
+    """alpha * b for a float16/bfloat16 add/sub: PyTorch's kernel rounds
+    alpha to the format and forms the product in float, rounding only the
+    sum."""
+    return mul(_cast(b, float32), _k.item(_k.full(b.dtype.name, 1, alpha), 0))
+
+
 def add(input, other, alpha=1):
     a, b = input, other
     if _graph_recording:
@@ -2693,6 +2812,8 @@ def add(input, other, alpha=1):
             return a.__add__(b if alpha == 1 else b * alpha)
         if hasattr(b, "_zipp_graph"):
             return (b if alpha == 1 else b * alpha).__radd__(a)
+    if alpha != 1 and _isinstance(b, Tensor) and b.dtype._reduced and _isinstance(a, Tensor) and a.dtype is b.dtype:
+        return _binary("add", a, _alpha_scaled(b, alpha), "Add", _add_backward, _NOSAVE, a.dtype)
     return _binary("add", a, b if alpha == 1 else _scaled(b, alpha), "Add", _add_backward, _NOSAVE)
 
 
@@ -2705,6 +2826,8 @@ def sub(input, other, alpha=1):
             return (b if alpha == 1 else b * alpha).__rsub__(a)
     if _isinstance(a, Tensor) and a.dtype is _bool_dtype and _isinstance(b, Tensor) and b.dtype is _bool_dtype:
         raise RuntimeError("Subtraction, the `-` operator, with two bool tensors is not supported. If you are trying to invert a mask, use the `~` or `logical_not()` operator instead.")
+    if alpha != 1 and _isinstance(b, Tensor) and b.dtype._reduced and _isinstance(a, Tensor) and a.dtype is b.dtype:
+        return _binary("sub", a, _alpha_scaled(b, alpha), "Sub", _sub_backward, _NOSAVE, a.dtype)
     return _binary("sub", a, b if alpha == 1 else _scaled(b, alpha), "Sub", _sub_backward, _NOSAVE)
 
 
@@ -2722,7 +2845,7 @@ def mul(input, other):
             return a.__mul__(b)
         if hasattr(b, "_zipp_graph"):
             return b.__rmul__(a)
-    return _binary("mul", a, b, "Mul", _mul_backward, ("y", "x"))
+    return _binary("mul", a, b, "Mul", _mul_backward, ("y", "x"), None, True)
 
 
 multiply = mul
@@ -2746,7 +2869,7 @@ def div(input, other, rounding_mode=None):
     if _graph_recording and rounding_mode is None and (getattr(a, "_zipp_graph", False) or getattr(b, "_zipp_graph", False)):
         return a / b
     if rounding_mode is None:
-        return _binary("div", a, b, "Div", _div_backward, ("y", "yo"), want=_float_result(a, b))
+        return _binary("div", a, b, "Div", _div_backward, ("y", "yo"), _float_result(a, b), True)
     if rounding_mode == "floor":
         return floor_divide(a, b)
     if rounding_mode == "trunc":
@@ -3071,6 +3194,106 @@ def erfinv(input):
     return _unary("erfinv", input, "Erfinv", lambda g, x, o: mul(g, mul(exp(square(o)), 0.886226925452758)), saves="o")
 
 
+# ---- special functions (torch.special has the rest) --------------------------------------
+# The kernels compute in double precision with ATen's algorithms (Cephes),
+# rounding once to the result dtype; integer inputs give the default float.
+def _float_input(a):
+    return a if _isinstance(a, Tensor) else tensor(a, dtype=_default_dtype)
+
+
+def lgamma(input):
+    return _unary("lgamma", _float_input(input), "Lgamma", lambda g, x, o: mul(g, digamma(x)))
+
+
+def digamma(input):
+    return _unary("digamma", _float_input(input), "Digamma", lambda g, x, o: mul(g, polygamma(1, x)))
+
+
+def polygamma(n, input):
+    n = _int(n)
+    if n < 0:
+        raise RuntimeError("polygamma(n, x) does not support negative n.")
+    return _unary("polygamma", _float_input(input), "Polygamma", lambda g, x, o: mul(g, polygamma(n + 1, x)), n)
+
+
+def mvlgamma(input, p):
+    """The multivariate log-gamma of dimension p: sum over i < p of
+    lgamma(x - i/2), plus p(p-1)/4 log(pi) (PyTorch's composition, so
+    autograd follows)."""
+    a = _float_input(input)
+    p = _int(p)
+    if p < 1:
+        raise RuntimeError("p has to be greater than or equal to 1")
+    if not a.dtype.is_floating_point:
+        a = a.to(_default_dtype)
+    offsets = tensor([-(i / 2.0) for i in _range(p)], dtype=a.dtype)
+    return add(sum(lgamma(add(unsqueeze(a, -1), offsets)), -1), p * (p - 1) * _math.log(_math.pi) / 4)
+
+
+def i0(input):
+    return _unary("i0", _float_input(input), "I0", lambda g, x, o: mul(g, _unary("i1", x, "SpecialI1", _i1_backward)))
+
+
+def _i1_backward(g, x, o):
+    # i1'(x) = i0(x) - i1(x)/x, 1/2 at 0.
+    return mul(g, where(x == 0, 0.5, sub(i0(x), div(o, x))))
+
+
+def _i0e_backward(g, x, o):
+    return mul(g, sub(_unary("i1e", x, "SpecialI1E", _i1e_backward), mul(sign(x), o)))
+
+
+def _i1e_backward(g, x, o):
+    return mul(g, where(x == 0, 0.5, sub(_unary("i0e", x, "SpecialI0E", _i0e_backward), mul(o, add(sign(x), reciprocal(x))))))
+
+
+def sinc(input):
+    def backward(g, x, o):
+        px = mul(x, _math.pi)
+        d = div(sub(mul(px, cos(px)), sin(px)), mul(px, x))
+        return mul(g, where(x == 0, 0.0, d))
+    return _unary("sinc", _float_input(input), "Sinc", backward)
+
+
+def logit(input, eps=None):
+    lo = None if eps is None else _float(eps)
+
+    def backward(g, x, o):
+        d = div(g, mul(x, sub(1, x)))
+        if lo is None:
+            return where(logical_or(x < 0, x > 1), _math.nan, d)
+        return where(logical_or(x < lo, x > 1 - lo), 0.0, d)
+    return _unary("logit", _float_input(input), "Logit", backward, lo)
+
+
+def xlogy(input, other):
+    def backward(g, x, y, o):
+        # PyTorch's: xlogy(g, y), zero where x is 0 and y <= 0.
+        return (_unbroadcast(where(logical_and(x == 0, y <= 0), 0.0, xlogy(g, y)), x.shape) if x.requires_grad else None,
+                _unbroadcast(mul(g, div(x, y)), y.shape) if y.requires_grad else None)
+    return _binary("xlogy", input, other, "Xlogy", backward, ("xy", "xy"), _float_result(input, other))
+
+
+def igamma(input, other):
+    """The regularized lower incomplete gamma function P(input, other)."""
+    return _binary("igamma", input, other, "Igamma", _igamma_backward("igamma", 1), ("xy", "xy"), _float_result(input, other))
+
+
+def igammac(input, other):
+    """The regularized upper incomplete gamma function Q(input, other)."""
+    return _binary("igammac", input, other, "Igammac", _igamma_backward("igammac", -1), ("xy", "xy"), _float_result(input, other))
+
+
+def _igamma_backward(name, sign_):
+    def backward(g, a, x, o):
+        if a.requires_grad:
+            raise NotImplementedError("the derivative for '%s: input' is not implemented." % name)
+        # d/dx P(a, x) = x^(a-1) e^-x / Gamma(a).
+        d = exp(sub(sub(mul(sub(a, 1), log(x)), x), lgamma(a)))
+        return (None, _unbroadcast(mul(g, d if sign_ > 0 else neg(d)), x.shape))
+    return backward
+
+
 def square(input):
     if _graph_recording and getattr(input, "_zipp_graph", False):
         return input.square()
@@ -3275,7 +3498,25 @@ def nan_to_num(input, nan=0.0, posinf=None, neginf=None):
     return where(isneginf(out), info.min if neginf is None else _float(neginf), out)
 
 
+def _float_op(a, *others):
+    """Whether a float16/bfloat16 op on `a` (with tensors of its dtype or
+    Python numbers) should compute in float32 and round once, as PyTorch's
+    fused kernels (lerp, addcmul, addcdiv) do in their float `opmath`."""
+    if not (_isinstance(a, Tensor) and a.dtype._reduced):
+        return False
+    for o in others:
+        if _isinstance(o, Tensor) and o.dtype is not a.dtype:
+            return False
+    return True
+
+
+def _f32(v):
+    return _cast(v, float32) if _isinstance(v, Tensor) else v
+
+
 def lerp(input, end, weight):
+    if _float_op(input, end, weight):
+        return _cast(lerp(_f32(input), _f32(end), _f32(weight)), input.dtype)
     # PyTorch's two-branch form: start + w * (end - start) for |w| < 0.5,
     # end - (end - start) * (1 - w) otherwise, so both ends are exact.
     diff = sub(end, input)
@@ -3287,10 +3528,14 @@ def lerp(input, end, weight):
 
 
 def addcmul(input, tensor1, tensor2, value=1):
+    if _float_op(input, tensor1, tensor2):
+        return _cast(addcmul(_f32(input), _f32(tensor1), _f32(tensor2), value), input.dtype)
     return add(input, mul(mul(tensor1, value) if value != 1 else tensor1, tensor2))
 
 
 def addcdiv(input, tensor1, tensor2, value=1):
+    if _float_op(input, tensor1, tensor2):
+        return _cast(addcdiv(_f32(input), _f32(tensor1), _f32(tensor2), value), input.dtype)
     return add(input, div(mul(tensor1, value) if value != 1 else tensor1, tensor2))
 
 
@@ -3646,7 +3891,7 @@ def var(input, dim=None, unbiased=None, keepdim=False, correction=None):
     dims = _dims_arg(_all_if_empty(dim), _len(a.shape))
     # float32 is computed in float64 and rounded once, as PyTorch's
     # double-precision accumulation gives.
-    x = a.double() if a.dtype is float32 else a
+    x = a.double() if a.dtype is float32 or a.dtype._reduced else a
     m = mean(x, dims, True)
     sq = square(sub(x, m))
     n = _numel(a.shape) / _b.max(1, _numel(sum(sq, dims, True).shape))
@@ -3709,7 +3954,7 @@ def norm(input, p="fro", dim=None, keepdim=False, out=None, dtype=None):
     if p is None or p == "fro" or p == 2:
         return _norm2(a, dims, keepdim)
     if p == "nuc":
-        raise NotImplementedError("torch.norm(p='nuc') is not supported on Zipp")
+        return linalg.matrix_norm(a, "nuc", dims if dims is not None else (-2, -1), keepdim)
     p = _float(p)
     if p == 1:
         return sum(abs(a), dims, keepdim)
@@ -4782,7 +5027,7 @@ def _getitem(a, key):
             new_axes.append(_len(spec) - _b.sum(1 for s in spec if _isinstance(s, _int)) + _len(new_axes))
             continue
         if _isinstance(k, Tensor):
-            if k.dtype.is_floating_point:
+            if k.dtype.is_floating_point or k.dtype.name in _NARROW_INT:
                 raise IndexError("tensors used as indices must be long, int, byte or bool tensors")
             advanced.append((d, k if k.dtype is int64 else k.long()))
             spec.append(slice(None))
@@ -5580,6 +5825,8 @@ _DIFFERENTIABLE = frozenset([
     "Index", "IndexBackward", "IndexSelect", "IndexAdd", "IndexCopy", "IndexPut", "Scatter", "ScatterAdd",
     "Mm", "Dot", "Softmax", "LogSoftmax", "Cumsum", "Cummax", "Cummin", "Logcumsumexp", "Remainder", "Fmod",
     "Atan2", "Maximum", "Minimum", "Fill", "Zero", "Copy", "CopySlices", "Median",
+    "Lgamma", "Digamma", "Polygamma", "I0", "SpecialI0E", "SpecialI1", "SpecialI1E", "Sinc", "Logit", "Xlogy", "Igamma", "Igammac",
+    "SpecialErfcx", "SpecialNdtr", "SpecialNdtri", "SpecialLogNdtr", "SpecialEntr", "SpecialXlog1Py", "SpecialZeta",
 ])
 
 
@@ -5952,7 +6199,24 @@ class ByteStorage(_Storage):
     dtype = uint8
 
 
-_STORAGE_TYPES = {"float32": FloatStorage, "float64": DoubleStorage, "int64": LongStorage, "int32": IntStorage, "bool": BoolStorage, "uint8": ByteStorage}
+class HalfStorage(_Storage):
+    dtype = float16
+
+
+class BFloat16Storage(_Storage):
+    dtype = bfloat16
+
+
+class CharStorage(_Storage):
+    dtype = int8
+
+
+class ShortStorage(_Storage):
+    dtype = int16
+
+
+_STORAGE_TYPES = {"float32": FloatStorage, "float64": DoubleStorage, "int64": LongStorage, "int32": IntStorage, "bool": BoolStorage, "uint8": ByteStorage,
+                  "float16": HalfStorage, "bfloat16": BFloat16Storage, "int8": CharStorage, "int16": ShortStorage}
 
 
 def _contiguous_strides(shape):
@@ -6069,12 +6333,13 @@ for _name, _fn in (("exp", exp), ("exp2", exp2), ("expm1", expm1), ("log", log),
                    ("erf", erf), ("erfc", erfc), ("erfinv", erfinv), ("reciprocal", reciprocal), ("square", square), ("sign", sign),
                    ("sgn", sign), ("logical_not", logical_not), ("bitwise_not", bitwise_not), ("atan2", atan2), ("arctan2", atan2),
                    ("float_power", float_power), ("logical_and", logical_and), ("logical_or", logical_or), ("logical_xor", logical_xor),
-                   ("bitwise_and", bitwise_and), ("bitwise_or", bitwise_or), ("bitwise_xor", bitwise_xor)):
+                   ("bitwise_and", bitwise_and), ("bitwise_or", bitwise_or), ("bitwise_xor", bitwise_xor), ("lgamma", lgamma),
+                   ("digamma", digamma), ("i0", i0), ("sinc", sinc), ("xlogy", xlogy), ("igamma", igamma), ("igammac", igammac)):
     if _fn is not None and not hasattr(Tensor, _name + "_"):
         setattr(Tensor, _name + "_", _make_inplace(_fn))
 
 
-_STORAGE_NAMES = {c.__name__: c for c in (FloatStorage, DoubleStorage, LongStorage, IntStorage, BoolStorage, ByteStorage)}
+_STORAGE_NAMES = {c.__name__: c for c in _STORAGE_TYPES.values()}
 from collections import OrderedDict as _OrderedDict
 
 # The dtype aliases that shadow builtins go last, after every use of the
@@ -6085,8 +6350,6 @@ double = float64
 long = int64
 int = int32
 bool = _bool_dtype
-half = float32
-bfloat16 = float32
 # torch.FloatTensor is the default-dtype Tensor class itself (isinstance
 # holds for every tensor, as before); the others construct their dtype.
 # Zipp's isinstance does not consult a metaclass __instancecheck__, so
@@ -6097,8 +6360,13 @@ LongTensor = _legacy_class("LongTensor", int64)
 IntTensor = _legacy_class("IntTensor", int32)
 BoolTensor = _legacy_class("BoolTensor", _bool_dtype)
 ByteTensor = _legacy_class("ByteTensor", uint8)
-_LEGACY_TYPES = {"FloatTensor": float32, "DoubleTensor": float64, "LongTensor": int64, "IntTensor": int32, "BoolTensor": _bool_dtype, "ByteTensor": uint8, "HalfTensor": float32, "BFloat16Tensor": float32}
-_LEGACY_CLASSES = {Tensor: float32, DoubleTensor: float64, LongTensor: int64, IntTensor: int32, BoolTensor: _bool_dtype, ByteTensor: uint8}
+HalfTensor = _legacy_class("HalfTensor", float16)
+BFloat16Tensor = _legacy_class("BFloat16Tensor", bfloat16)
+CharTensor = _legacy_class("CharTensor", int8)
+ShortTensor = _legacy_class("ShortTensor", int16)
+_LEGACY_TYPES = {_CAST_NAME[_n] + "Tensor": _DTYPES[_n] for _n in _DTYPES}
+_LEGACY_CLASSES = {Tensor: float32, DoubleTensor: float64, LongTensor: int64, IntTensor: int32, BoolTensor: _bool_dtype, ByteTensor: uint8,
+                   HalfTensor: float16, BFloat16Tensor: bfloat16, CharTensor: int8, ShortTensor: int16}
 inf = _math.inf
 nan = _math.nan
 pi = _math.pi
@@ -6108,6 +6376,39 @@ import torch.autograd as autograd
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as _F
+# The submodules PyTorch exposes as attributes after `import torch`.
+# special, linalg (which installs torch.det/inverse/... and their Tensor
+# methods) and amp (the real torch.autocast, is_autocast_enabled) are
+# imported now; distributions, the largest, on first use (this runtime has
+# no module-level __getattr__, so a stand-in forwards attribute reads to the
+# real module, which replaces it as `torch.distributions` once imported).
+import torch.special as special
+import torch.linalg as linalg
+import torch.amp as amp
+
+
+class _LazySubmodule:
+    def __init__(self, name):
+        self._lazy_name = name
+
+    def _lazy_load(self):
+        import torch.distributions as module
+        globals()[self._lazy_name] = module
+        return module
+
+    def __getattr__(self, attr):
+        if attr.startswith("_lazy_"):
+            raise AttributeError(attr)
+        return getattr(self._lazy_load(), attr)
+
+    def __dir__(self):
+        return dir(self._lazy_load())
+
+    def __repr__(self):
+        return repr(self._lazy_load())
+
+
+distributions = _LazySubmodule("distributions")
 
 
 class _Fx:

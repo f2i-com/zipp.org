@@ -43,8 +43,13 @@
         ceil: 22, trunc: 23, isfinite: 24, isnan: 25, not: 26, clamp: 27, frac: 28, tan: 29, atan: 30, log2: 31, log10: 32,
         isinf: 33, exp2: 34, sinh: 35, cosh: 36, asin: 37, acos: 38, asinh: 39, acosh: 40, atanh: 41 };
     const RED_CODE = { sum: 1, mean: 2, prod: 3, max: 4, min: 5, argmax: 6, argmin: 7, all: 8, any: 9 };
-    const ARRAY = { float32: Float32Array, float64: Float64Array, int64: Float64Array, int32: Float64Array, bool: Uint8Array, uint8: Uint8Array };
-    const RANK = { bool: 0, uint8: 1, int32: 2, int64: 3, float32: 4, float64: 5 };
+    // float16 and bfloat16 live in a Float32Array (every value of either is
+    // a float32 value) and every kernel that computes one rounds its result
+    // to the format (`finish`); int8/int16 wrap on store as uint8 does.
+    const ARRAY = { float32: Float32Array, float64: Float64Array, int64: Float64Array, int32: Float64Array, bool: Uint8Array, uint8: Uint8Array,
+        float16: Float32Array, bfloat16: Float32Array, int8: Int8Array, int16: Int16Array };
+    const RANK = { bool: 0, uint8: 1, int8: 1, int16: 2, int32: 3, int64: 4, float16: 5, bfloat16: 5, float32: 6, float64: 7 };
+    const FLOAT = { float16: 1, bfloat16: 1, float32: 1, float64: 1 };
     function make(dtype, data) { if (ARRAY[dtype] === undefined) fail(E.TypeError, "unknown dtype " + dtype); return { cls: Storage, dtype: dtype, data: data, version: 0, untracked: 0 }; }
     function alloc(dtype, n) { return make(dtype, new ARRAY[dtype](n)); }
     function isStorage(v) { return v !== null && typeof v === "object" && v.cls === Storage; }
@@ -55,7 +60,29 @@
     // that owns it (the VM made it from the host's copy).
     rt.float32Storage = (data) => make("float32", data);
     rt.isFloat32Storage = (v) => isStorage(v) && v.dtype === "float32";
-    function isFloatDtype(dtype) { return dtype === "float32" || dtype === "float64"; }
+    function isFloatDtype(dtype) { return FLOAT[dtype] === 1; }
+    // Rounding a float32 value to float16 (Math.f16round of a float32 is the
+    // second step of PyTorch's double -> float -> half conversion) or to
+    // bfloat16 (round to nearest even on the upper 16 bits; NaN stays NaN,
+    // overflow gives infinity).
+    const BF_F = new Float32Array(1), BF_U = new Uint32Array(BF_F.buffer);
+    function bf16(x) {
+        if (x !== x) return x;
+        BF_F[0] = x;
+        const u = BF_U[0];
+        BF_U[0] = (u + 0x7fff + ((u >>> 16) & 1)) & 0xffff0000;
+        return BF_F[0];
+    }
+    const f16 = Math.f16round;
+    const HALF = { float16: 1, bfloat16: 1 };
+    // Round a new float16/bfloat16 result (a Float32Array holding float32
+    // values) to its format; any other storage is left as it is.
+    function finish(s) {
+        const d = s.dtype;
+        if (d === "float16") { const O = s.data, n = O.length; for (let i = 0; i < n; i++) O[i] = f16(O[i]); }
+        else if (d === "bfloat16") { const O = s.data, n = O.length; for (let i = 0; i < n; i++) O[i] = bf16(O[i]); }
+        return s;
+    }
     // Indexed loops, not for...of: these run on every kernel call, and the
     // iterator protocol is several interpreter calls per element.
     function shapeOf(v) { if (v === null || typeof v !== "object" || v.items === undefined) fail(E.TypeError, "shape must be a tuple"); const items = v.items, out = new Array(items.length); for (let i = 0; i < items.length; i++) out[i] = Number(rt.asInt(items[i])); return out; }
@@ -71,10 +98,17 @@
     }
     function numel(shape) { let n = 1; for (let i = 0; i < shape.length; i++) n *= shape[i]; return n; }
     function strides(shape) { const s = new Array(shape.length); let acc = 1; for (let i = shape.length - 1; i >= 0; i--) { s[i] = acc; acc *= shape[i]; } return s; }
-    function promote(a, b) { return RANK[a] >= RANK[b] ? a : b; }
+    // PyTorch's promote_types: the higher rank wins, except uint8 with
+    // int8 (int16) and float16 with bfloat16 (float32).
+    function promote(a, b) {
+        if (a === b) return a;
+        const ra = RANK[a], rb = RANK[b];
+        if (ra === rb) return ra === 1 ? "int16" : "float32";
+        return ra > rb ? a : b;
+    }
     function pyNumber(dtype, v) {
         if (dtype === "bool") return v !== 0;
-        if (dtype === "int64" || dtype === "int32" || dtype === "uint8") return BigInt(Math.trunc(v));
+        if (!FLOAT[dtype]) return BigInt(Math.trunc(v));
         return v;
     }
     function jsNumber(v) {
@@ -88,6 +122,9 @@
         if (dtype === "bool") return v !== 0 ? 1 : 0;
         if (dtype === "int64" || dtype === "int32") return Math.trunc(v);
         if (dtype === "uint8") return Math.trunc(v) & 255;
+        if (dtype === "float16") return f16(Math.fround(v));
+        if (dtype === "bfloat16") return bf16(Math.fround(v));
+        if (dtype === "int8" || dtype === "int16") return Math.trunc(v);
         return v;
     }
     // Broadcast `shape` against `target`: the stride per target dim (0 where broadcast).
@@ -136,6 +173,7 @@
         bitand: (x, y) => bitwise(x, y, 0), bitor: (x, y) => bitwise(x, y, 1), bitxor: (x, y) => bitwise(x, y, 2),
         lshift: (x, y) => x * Math.pow(2, y), rshift: (x, y) => Math.floor(x / Math.pow(2, y)),
         atan2: Math.atan2, ipow: intPow,
+        xlogy: (x, y) => xlogy(x, y), xlog1py: (x, y) => xlog1py(x, y), zeta: (x, y) => zeta(x, y), igamma: (x, y) => igamma(x, y), igammac: (x, y) => igammac(x, y),
     };
     // Integer bitwise ops on the float64 storage of int64 values: 32-bit JS
     // operators when both fit, BigInt otherwise (exact up to 2**53 either way).
@@ -215,10 +253,10 @@
     function binary(op, a, ashape, b, bshape, apy, bpy, want) {
         const shape = broadcastShape(ashape, bshape);
         let dtype = COMPARE.has(op) ? "bool" : (want ? want : promote(a.dtype, b.dtype));
-        if ((op === "div" || op === "atan2") && RANK[dtype] < RANK.float32) dtype = "float32";
+        if ((op === "div" || op === "atan2") && !isFloatDtype(dtype)) dtype = "float32";
         // An integer result: powers stay integral (the other arithmetic is
         // exact on integers already).
-        if (op === "pow" && RANK[dtype] < RANK.float32) op = "ipow";
+        if (op === "pow" && !isFloatDtype(dtype)) op = "ipow";
         const f = BIN[op]; if (f === undefined) fail(E.ValueError, "unknown op " + op);
         if (dtype === "bool" && !COMPARE.has(op)) return binaryBool(f, a, ashape, b, bshape, shape);
         const n = numel(shape), out = alloc(dtype, n), A = a.data, Bd = b.data, O = out.data;
@@ -231,13 +269,13 @@
             : n !== 0 && nb === n && bshape.length === shape.length && tupleShape(bpy) ? bpy : null;
         if (n >= NATIVE_MIN && NATIVE !== null && BIN_CODE[op] !== undefined
             && NATIVE(N_BINARY, BIN_CODE[op], A, Bd, O, shape, bstrides(ashape, shape), bstrides(bshape, shape)))
-            return tuple([out, outShape === null ? pyShape(shape) : outShape]);
+            { if (HALF[out.dtype] === 1) finish(out); return tuple([out, outShape === null ? pyShape(shape) : outShape]); }
         if (na === n && ashape.length === shape.length) {
             if (nb === 1 ? binaryScalar(op, O, A, Bd[0], false) : (nb === n && bshape.length === shape.length ? binaryTile(op, O, A, Bd, n, false) : (suffixTile(bshape, shape) === nb && binaryTile(op, O, A, Bd, nb, false))))
-                return tuple([out, outShape === null ? pyShape(shape) : outShape]);
+                { if (HALF[out.dtype] === 1) finish(out); return tuple([out, outShape === null ? pyShape(shape) : outShape]); }
         } else if (nb === n && bshape.length === shape.length) {
             if (na === 1 ? binaryScalar(op, O, Bd, A[0], true) : (suffixTile(ashape, shape) === na && binaryTile(op, O, Bd, A, na, true)))
-                return tuple([out, outShape === null ? pyShape(shape) : outShape]);
+                { if (HALF[out.dtype] === 1) finish(out); return tuple([out, outShape === null ? pyShape(shape) : outShape]); }
         }
         if (ashape.length === shape.length && bshape.length === shape.length && na === n && nb === n) {
             for (let i = 0; i < n; i++) O[i] = f(A[i], Bd[i]);
@@ -246,7 +284,7 @@
         } else {
             forEachBroadcast(shape, bstrides(ashape, shape), bstrides(bshape, shape), (o, x, y) => { O[o] = f(A[x], Bd[y]); });
         }
-        return tuple([out, outShape === null ? pyShape(shape) : outShape]);
+        { if (HALF[out.dtype] === 1) finish(out); return tuple([out, outShape === null ? pyShape(shape) : outShape]); }
     }
     // Arithmetic with a bool result: computed like the others, then any
     // nonzero stores as 1 (True + True is True).
@@ -265,6 +303,8 @@
         log2: Math.log2, log10: Math.log10, exp2: (x) => Math.pow(2, x), erf: erf, erfc: erfc, erfinv: erfinv, trunc: Math.trunc, frac: (x) => x - Math.trunc(x),
         isinf: (x) => (x === Infinity || x === -Infinity ? 1 : 0), isposinf: (x) => (x === Infinity ? 1 : 0), isneginf: (x) => (x === -Infinity ? 1 : 0),
         bitnot: (x) => -x - 1, signbit: (x) => (x < 0 || Object.is(x, -0) ? 1 : 0),
+        lgamma: (x) => lgamma(x), digamma: (x) => digamma(x), erfcx: (x) => erfcx(x), i0: (x) => i0(x), i0e: (x) => i0e(x),
+        i1: (x) => i1(x), i1e: (x) => i1e(x), ndtr: (x) => ndtr(x), ndtri: (x) => ndtri(x), log_ndtr: (x) => logNdtr(x), entr: (x) => entr(x),
     };
     // erf to double precision: below 3 the all-positive series
     // 2/sqrt(pi) e^(-x^2) sum 2^n x^(2n+1) / (2n+1)!! (no cancellation),
@@ -342,16 +382,296 @@
     }
     // d/dx gelu(x) = cdf(x) + x * pdf(x).
     function geluGrad(x) { return cdf(x) + x * 0.3989422804014327 * Math.exp(-0.5 * x * x); }
+    // ---- special functions (torch.special), in double precision --------------------------
+    // The algorithms PyTorch's CPU kernels use (Cephes, as in ATen's
+    // Math.h), so values agree to double rounding.
+    const LOG_SQRT_2PI = 0.9189385332046727, SQRT_2PI = 2.5066282746310002, INV_SQRT_PI = 0.5641895835477563;
+    function polevl(x, c) { let r = c[0]; for (let i = 1; i < c.length; i++) r = r * x + c[i]; return r; }
+    function p1evl(x, c) { let r = x + c[0]; for (let i = 1; i < c.length; i++) r = r * x + c[i]; return r; }
+    // Lanczos (g = 7, n = 9) below 10, Stirling's series above; the
+    // reflection formula below 0.5.
+    const LANCZOS = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059,
+        12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+    function lgamma(x) {
+        if (x !== x) return NaN;
+        if (x === Infinity || x === -Infinity) return Infinity;
+        if (x <= 0 && x === Math.floor(x)) return Infinity;
+        if (x < 0.5) return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - lgamma(1 - x);
+        if (x === 1 || x === 2) return 0;
+        if (x >= 10) {
+            const z = 1 / (x * x);
+            return (x - 0.5) * Math.log(x) - x + LOG_SQRT_2PI + (1 / 12 - z * (1 / 360 - z * (1 / 1260 - z * (1 / 1680 - z / 1188)))) / x;
+        }
+        const y = x - 1;
+        let a = LANCZOS[0];
+        const t = y + 7.5;
+        for (let i = 1; i < 9; i++) a += LANCZOS[i] / (y + i);
+        return LOG_SQRT_2PI + (y + 0.5) * Math.log(t) - t + Math.log(a);
+    }
+    // ATen's calc_digamma: reflection for negative x (NaN at the negative
+    // integers, -inf/+inf at -0/+0), the recurrence up to 10, then the
+    // asymptotic series.
+    function digamma(x) {
+        if (x === 0) return Object.is(x, -0) ? Infinity : -Infinity;
+        if (x !== x) return NaN;
+        if (x < 0) {
+            if (x === Math.trunc(x)) return NaN;
+            if (x === -Infinity) return NaN;
+            const r = x - Math.trunc(x);
+            return digamma(1 - x) - Math.PI / Math.tan(Math.PI * r);
+        }
+        if (x === Infinity) return Infinity;
+        let result = 0;
+        while (x < 10) { result -= 1 / x; x += 1; }
+        if (x === 10) return result + 2.25175258906672110764;
+        let y = 0;
+        if (x < 1e17) {
+            const z = 1 / (x * x);
+            y = z * polevl(z, [8.33333333333333333333E-2, -2.10927960927960927961E-2, 7.57575757575757575758E-3,
+                -4.16666666666666666667E-3, 3.96825396825396825397E-3, -8.33333333333333333333E-3, 8.33333333333333333333E-2]);
+        }
+        return result + Math.log(x) - 0.5 / x - y;
+    }
+    // ATen's calc_trigamma.
+    function trigamma(x) {
+        let sign = 1, result = 0;
+        if (x < 0.5) {
+            sign = -1;
+            const s = Math.sin(Math.PI * x);
+            result -= (Math.PI * Math.PI) / (s * s);
+            x = 1 - x;
+        }
+        for (let i = 0; i < 6; i++) { result += 1 / (x * x); x += 1; }
+        const ixx = 1 / (x * x);
+        result += (1 + 1 / (2 * x) + ixx * (1 / 6 - ixx * (1 / 30 - ixx * (1 / 42)))) / x;
+        return sign * result;
+    }
+    // The Hurwitz zeta function zeta(x, q) (Cephes, as ATen's zeta).
+    const ZETA_A = [12.0, -720.0, 30240.0, -1209600.0, 47900160.0, -1.8924375803183791606e9, 7.47242496e10,
+        -2.950130727918164224e12, 1.1646782814350067249e14, -4.5979787224074726105e15, 1.8152105401943546773e17, -7.1661652561756670113e18];
+    function zeta(x, q) {
+        const MACHEP = 1.11022302462515654042E-16;
+        if (x === 1) return Infinity;
+        if (x < 1) return NaN;
+        if (q <= 0) {
+            if (q === Math.floor(q)) return Infinity;
+            if (x !== Math.floor(x)) return NaN;
+        }
+        let s = Math.pow(q, -x), a = q, i = 0, b = 0;
+        while (i < 9 || a <= 9) {
+            i += 1; a += 1; b = Math.pow(a, -x); s += b;
+            if (Math.abs(b / s) < MACHEP) return s;
+        }
+        const w = a;
+        s += b * w / (x - 1);
+        s -= 0.5 * b;
+        let aa = 1, k = 0;
+        for (let j = 0; j < 12; j++) {
+            aa *= x + k; b /= w;
+            let t = aa * b / ZETA_A[j];
+            s += t;
+            t = Math.abs(t / s);
+            if (t < MACHEP) return s;
+            k += 1; aa *= x + k; b /= w; k += 1;
+        }
+        return s;
+    }
+    function polygamma(n, x) {
+        if (n === 0) return digamma(x);
+        if (n === 1) return trigamma(x);
+        return ((n % 2) ? 1 : -1) * Math.exp(lgamma(n + 1)) * zeta(n + 1, x);
+    }
+    // erfcx(x) = exp(x^2) erfc(x): erfc's continued fraction without its
+    // exp(-x^2) factor from 3 up, exp(x^2) erfc(x) below, and
+    // 2 exp(x^2) - erfcx(-x) for negative x.
+    function erfcx(x) {
+        if (x !== x) return NaN;
+        if (x < 0) return x < -26.7 ? Infinity : 2 * Math.exp(x * x) - erfcx(-x);
+        if (x < 3) return Math.exp(x * x) * erfc(x);
+        if (x > 1e150) return INV_SQRT_PI / x;
+        const tiny = 1e-300;
+        let f = x, C = x, D = 0;
+        for (let n = 1; n < 300; n++) {
+            const an = n / 2;
+            D = x + an * D; if (D === 0) D = tiny; D = 1 / D;
+            C = x + an / C; if (C === 0) C = tiny;
+            const delta = C * D; f *= delta;
+            if (Math.abs(delta - 1) < 1e-16) break;
+        }
+        return INV_SQRT_PI / f;
+    }
+    function ndtr(x) {
+        if (x !== x) return NaN;
+        const t = x * 0.7071067811865476, z = Math.abs(t);
+        if (z < 0.7071067811865476) return 0.5 + 0.5 * erf(t);
+        const y = 0.5 * erfc(z);
+        return t > 0 ? 1 - y : y;
+    }
+    function logNdtr(x) {
+        const t = x * 0.7071067811865476;
+        if (x < -1) return Math.log(erfcx(-t) / 2) - t * t;
+        return Math.log1p(-erfc(t) / 2);
+    }
+    // Cephes ndtri.
+    const NDTRI_P0 = [-5.99633501014107895267E1, 9.80010754185999661536E1, -5.66762857469070293439E1, 1.39312609387279679503E1, -1.23916583867381258016E0];
+    const NDTRI_Q0 = [1.95448858338141759834E0, 4.67627912898881538453E0, 8.63602421390890590575E1, -2.25462687854119370527E2, 2.00260212380060660359E2,
+        -8.20372256168333339912E1, 1.59056225126211695515E1, -1.18331621121330003142E0];
+    const NDTRI_P1 = [4.05544892305962419923E0, 3.15251094599893866154E1, 5.71628192246421288162E1, 4.40805073893200834700E1, 1.46849561928858024014E1,
+        2.18663306850790267539E0, -1.40256079171354495875E-1, -3.50424626827848203418E-2, -8.57456785154685413611E-4];
+    const NDTRI_Q1 = [1.57799883256466749731E1, 4.53907635128879210584E1, 4.13172038254672030440E1, 1.50425385692907503408E1, 2.50464946208309415979E0,
+        -1.42182922854787788574E-1, -3.80806407691578277194E-2, -9.33259480895457427372E-4];
+    const NDTRI_P2 = [3.23774891776946035970E0, 6.91522889068984211695E0, 3.93881025292474443415E0, 1.33303460815807542389E0, 2.01485389549179081538E-1,
+        1.23716634817820021358E-2, 3.01581553508235416007E-4, 2.65806974686737550832E-6, 6.23974539184983293730E-9];
+    const NDTRI_Q2 = [6.02427039364742014255E0, 3.67983563856160859403E0, 1.37702099489081330271E0, 2.16236993594496635890E-1, 1.34204006088543189037E-2,
+        3.28014464682127739104E-4, 2.89247864745380683936E-6, 6.79019408009981274425E-9];
+    function ndtri(y0) {
+        if (y0 !== y0 || y0 < 0 || y0 > 1) return NaN;
+        if (y0 === 0) return -Infinity;
+        if (y0 === 1) return Infinity;
+        const EXP_M2 = 0.13533528323661269189;
+        let code = true, y = y0;
+        if (y > 1 - EXP_M2) { y = 1 - y; code = false; }
+        let x;
+        if (y > EXP_M2) {
+            y -= 0.5;
+            const y2 = y * y;
+            x = (y + y * (y2 * polevl(y2, NDTRI_P0) / p1evl(y2, NDTRI_Q0))) * SQRT_2PI;
+            return x;
+        }
+        x = Math.sqrt(-2 * Math.log(y));
+        const x0 = x - Math.log(x) / x, z = 1 / x;
+        const x1 = x < 8 ? z * polevl(z, NDTRI_P1) / p1evl(z, NDTRI_Q1) : z * polevl(z, NDTRI_P2) / p1evl(z, NDTRI_Q2);
+        x = x0 - x1;
+        return code ? -x : x;
+    }
+    // Modified Bessel functions of the first kind (Cephes' Chebyshev
+    // expansions, as ATen's calc_i0/i0e/i1/i1e).
+    function chbevl(x, c) {
+        let b0 = c[0], b1 = 0, b2 = 0;
+        for (let i = 1; i < c.length; i++) { b2 = b1; b1 = b0; b0 = x * b1 - b2 + c[i]; }
+        return 0.5 * (b0 - b2);
+    }
+    const I0_A = [-4.41534164647933937950E-18, 3.33079451882223809783E-17, -2.43127984654795469359E-16, 1.71539128555513303061E-15,
+        -1.16853328779934516808E-14, 7.67618549860493561688E-14, -4.85644678311192946090E-13, 2.95505266312963983461E-12,
+        -1.72682629144155570723E-11, 9.67580903537323691224E-11, -5.18979560163526290666E-10, 2.65982372468238665035E-9,
+        -1.30002500998624804212E-8, 6.04699502254191894932E-8, -2.67079385394061173391E-7, 1.11738753912010371815E-6,
+        -4.41673835845875056359E-6, 1.64484480707288970893E-5, -5.75419501008210370398E-5, 1.88502885095841655729E-4,
+        -5.76375574538582365885E-4, 1.63947561694133579842E-3, -4.32430999505057594430E-3, 1.05464603945949983183E-2,
+        -2.37374148058994688156E-2, 4.93052842396707084878E-2, -9.49010970480476444210E-2, 1.71620901522208775349E-1,
+        -3.04682672343198398683E-1, 6.76795274409476084995E-1];
+    const I0_B = [-7.23318048787475395456E-18, -4.83050448594418207126E-18, 4.46562142029675999901E-17, 3.46122286769746109310E-17,
+        -2.82762398051658348494E-16, -3.42548561967721913462E-16, 1.77256013305652638360E-15, 3.81168066935262242075E-15,
+        -9.55484669882830764870E-15, -4.15056934728722208663E-14, 1.54008621752140982691E-14, 3.85277838274214270114E-13,
+        7.18012445138366623367E-13, -1.79417853150680611778E-12, -1.32158118404477131188E-11, -3.14991652796324136454E-11,
+        1.18891471078464383424E-11, 4.94060238822496958910E-10, 3.39623202570838634515E-9, 2.26666899049817806459E-8,
+        2.04891858946906374183E-7, 2.89137052083475648297E-6, 6.88975834691682398426E-5, 3.36911647825569408990E-3,
+        8.04490411014108831608E-1];
+    const I1_A = [2.77791411276104639959E-18, -2.11142121435816608115E-17, 1.55363195773620046921E-16, -1.10559694773538630805E-15,
+        7.60068429473540693410E-15, -5.04218550472791168711E-14, 3.22379336594557470981E-13, -1.98397439776494371520E-12,
+        1.17361862988909016308E-11, -6.66348972350202774223E-11, 3.62559028155211703701E-10, -1.88724975172282928790E-9,
+        9.38153738649577178388E-9, -4.44505912879632808065E-8, 2.00329475355213526229E-7, -8.56872026469545474066E-7,
+        3.47025130813767847674E-6, -1.32731636560394358279E-5, 4.78156510755005422638E-5, -1.61760815825896745588E-4,
+        5.12285956168575772895E-4, -1.51357245063125314899E-3, 4.15642294431288815669E-3, -1.05640848946261981558E-2,
+        2.47264490306265168283E-2, -5.29459812080949914269E-2, 1.02643658689847095384E-1, -1.76416518357834055153E-1,
+        2.52587186443633654823E-1];
+    const I1_B = [7.51729631084210481353E-18, 4.41434832307170791151E-18, -4.65030536848935832153E-17, -3.20952592199342395980E-17,
+        2.96262899764595013876E-16, 3.30820231092092828324E-16, -1.88035477551078244854E-15, -3.81440307243700780478E-15,
+        1.04202769841288027642E-14, 4.27244001671195135429E-14, -2.10154184277266431302E-14, -4.08355111109219731823E-13,
+        -7.19855177624590851209E-13, 2.03562854414708950722E-12, 1.41258074366137813316E-11, 3.25260358301548823856E-11,
+        -1.89749581235054123450E-11, -5.58974346219658380687E-10, -3.83538038596423702205E-9, -2.63146884688951950684E-8,
+        -2.51223623787020892529E-7, -3.88256480887769039346E-6, -1.10588938762623716291E-4, -9.76109749136146840777E-3,
+        7.78576235018280120474E-1];
+    // i0e(x) = exp(-|x|) i0(x); i1e likewise, odd.
+    function i0e(x) {
+        const a = Math.abs(x);
+        if (a <= 8) return chbevl(a / 2 - 2, I0_A);
+        return chbevl(32 / a - 2, I0_B) / Math.sqrt(a);
+    }
+    function i0(x) { return Math.exp(Math.abs(x)) * i0e(x); }
+    function i1e(x) {
+        const a = Math.abs(x);
+        const r = a <= 8 ? chbevl(a / 2 - 2, I1_A) * a : chbevl(32 / a - 2, I1_B) / Math.sqrt(a);
+        return x < 0 ? -r : r;
+    }
+    function i1(x) { return Math.exp(Math.abs(x)) * i1e(x); }
+    function entr(x) {
+        if (x !== x) return NaN;
+        if (x > 0) return -x * Math.log(x);
+        if (x === 0) return 0;
+        return -Infinity;
+    }
+    // The regularized incomplete gamma functions P(a, x) (igamma) and
+    // Q(a, x) (igammac): the power series below max(a, 1), the continued
+    // fraction above (Cephes igam/igamc), with ATen's edge cases.
+    function igamFactor(a, x) { return Math.exp(a * Math.log(x) - x - lgamma(a)); }
+    function igamSeries(a, x) {
+        const ax = igamFactor(a, x);
+        if (ax === 0) return 0;
+        let r = a, c = 1, sum = 1;
+        for (let n = 0; n < 100000; n++) { r += 1; c *= x / r; sum += c; if (c <= 1.11022302462515654042E-16 * sum) break; }
+        return sum * ax / a;
+    }
+    function igamcFraction(a, x) {
+        const ax = igamFactor(a, x);
+        if (ax === 0) return 0;
+        const big = 4.503599627370496e15, biginv = 2.22044604925031308085e-16;
+        let y = 1 - a, z = x + y + 1, c = 0, pkm2 = 1, qkm2 = x, pkm1 = x + 1, qkm1 = z * x, ans = pkm1 / qkm1, t;
+        for (let n = 0; n < 100000; n++) {
+            c += 1; y += 1; z += 2;
+            const yc = y * c, pk = pkm1 * z - pkm2 * yc, qk = qkm1 * z - qkm2 * yc;
+            if (qk !== 0) { const r = pk / qk; t = Math.abs((ans - r) / r); ans = r; } else t = 1;
+            pkm2 = pkm1; pkm1 = pk; qkm2 = qkm1; qkm1 = qk;
+            if (Math.abs(pk) > big) { pkm2 *= biginv; pkm1 *= biginv; qkm2 *= biginv; qkm1 *= biginv; }
+            if (t <= 1.11022302462515654042E-16) break;
+        }
+        return ans * ax;
+    }
+    function igamma(a, x) {
+        if (x < 0 || a < 0 || a !== a || x !== x) return NaN;
+        if (a === 0) return x > 0 ? 1 : NaN;
+        if (x === 0) return 0;
+        if (a === Infinity) return x === Infinity ? NaN : 0;
+        if (x === Infinity) return 1;
+        if (x > 1 && x > a) return 1 - igamcFraction(a, x);
+        return igamSeries(a, x);
+    }
+    function igammac(a, x) {
+        if (x < 0 || a < 0 || a !== a || x !== x) return NaN;
+        if (a === 0) return x > 0 ? 0 : NaN;
+        if (x === 0) return 1;
+        if (a === Infinity) return x === Infinity ? NaN : 1;
+        if (x === Infinity) return 0;
+        if (x < 1 || x < a) return 1 - igamSeries(a, x);
+        return igamcFraction(a, x);
+    }
+    // xlogy(x, y) = x log y, 0 where x is 0 (NaN y stays NaN).
+    function xlogy(x, y) { if (y !== y) return NaN; return x === 0 ? 0 : x * Math.log(y); }
+    function xlog1py(x, y) { if (y !== y) return NaN; return x === 0 ? 0 : x * Math.log1p(y); }
+    // sinc(x) = sin(pi x) / (pi x), 1 at 0. PyTorch forms pi * x in the
+    // op's precision (float for float32/float16/bfloat16), which matters
+    // for large x: `f` rounds as that product rounds.
+    function sinc(x, f) { if (x === 0) return 1; if (x !== x) return NaN; const p = f(f(Math.PI) * x); return Math.sin(p) / p; }
+    const same = (x) => x;
     const BOOL_UNARY = new Set(["isfinite", "isnan", "not", "isinf", "isposinf", "isneginf", "signbit"]);
     const FLOAT_UNARY = new Set(["exp", "log", "tanh", "sigmoid", "silu", "sqrt", "reciprocal", "log1p", "expm1", "gelu", "gelu_grad", "softplus", "sin", "cos", "rsqrt",
-        "tan", "asin", "acos", "atan", "sinh", "cosh", "asinh", "acosh", "atanh", "log2", "log10", "exp2", "erf", "erfc", "erfinv"]);
+        "tan", "asin", "acos", "atan", "sinh", "cosh", "asinh", "acosh", "atanh", "log2", "log10", "exp2", "erf", "erfc", "erfinv",
+        "lgamma", "digamma", "polygamma", "erfcx", "i0", "i0e", "i1", "i1e", "ndtr", "ndtri", "log_ndtr", "entr", "sinc", "logit"]);
     function unary(op, a, p1, p2) {
         let f = UN[op], lo = 0, hi = 0;
         if (op === "clamp") { lo = p1 === null ? -Infinity : jsNumber(p1); hi = p2 === null ? Infinity : jsNumber(p2); f = (x) => (x < lo ? lo : x > hi ? hi : x); }
+        const dtype = BOOL_UNARY.has(op) ? "bool" : (FLOAT_UNARY.has(op) && !isFloatDtype(a.dtype) ? "float32" : a.dtype);
+        if (op === "polygamma") { const k = jsNumber(p1); f = (x) => polygamma(k, x); }
+        else if (op === "sinc") { const r = dtype === "float64" ? same : Math.fround; f = (x) => sinc(x, r); }
+        else if (op === "logit") {
+            // log(x / (1 - x)), x first clamped to [eps, 1 - eps] when eps is
+            // given; the bounds and 1 - x in the op's precision, as PyTorch.
+            const r = dtype === "float64" ? same : Math.fround;
+            if (p1 === null) f = (x) => Math.log(x / r(1 - x));
+            else { const e = r(jsNumber(p1)), top = r(1 - e); f = (x) => { const c = x < e ? e : x > top ? top : x; return Math.log(c / r(1 - c)); }; }
+        }
         if (f === undefined) fail(E.ValueError, "unknown op " + op);
-        const dtype = BOOL_UNARY.has(op) ? "bool" : (FLOAT_UNARY.has(op) && RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype);
         const out = alloc(dtype, a.data.length), A = a.data, O = out.data, n = O.length;
-        if (n >= NATIVE_MIN && NATIVE !== null && UN_CODE[op] !== undefined && NATIVE(N_UNARY, UN_CODE[op], A, O, lo, hi)) return out;
+        if (n >= NATIVE_MIN && NATIVE !== null && UN_CODE[op] !== undefined && NATIVE(N_UNARY, UN_CODE[op], A, O, lo, hi)) { if (HALF[out.dtype] === 1) finish(out); return out; }
         // The hot activations and their gradients inline; the expressions
         // are the table's own.
         switch (op) {
@@ -367,7 +687,7 @@
             case "sign": for (let i = 0; i < n; i++) { const x = A[i]; O[i] = x > 0 ? 1 : x < 0 ? -1 : 0; } break;
             default: for (let i = 0; i < n; i++) O[i] = f(A[i]);
         }
-        return out;
+        { if (HALF[out.dtype] === 1) finish(out); return out; }
     }
     // ---- reductions ------------------------------------------------------------------
     const CONTIGUOUS_REDUCE = new Set(["sum", "mean", "prod", "max", "min", "argmax", "argmin", "all", "any"]);
@@ -387,7 +707,10 @@
         const finalShape = keepdim ? keptShape : outShape;
         const nOut = numel(keptShape), nIn = numel(shape);
         const argOp = op === "argmax" || op === "argmin";
-        const dtype = argOp ? "int64" : (op === "all" || op === "any") ? "bool" : (op === "mean" && RANK[a.dtype] < RANK.float32) ? "float32" : a.dtype;
+        const dtype = argOp ? "int64" : (op === "all" || op === "any") ? "bool" : (op === "mean" && !isFloatDtype(a.dtype)) ? "float32" : a.dtype;
+        // A float16/bfloat16 product rounds every partial product to the
+        // format, as PyTorch's reduced-precision prod accumulates.
+        if (op === "prod" && HALF[dtype] === 1) return halfProd(a, shape, rank, red, keepdim, dtype);
         const out = alloc(dtype, nOut), A = a.data;
         // Reductions accumulate in double precision (O) and round once when
         // stored into the result's dtype: a precise float32 sum of a million
@@ -412,7 +735,7 @@
             // The native loop accumulates as O does: rounding every update
             // when O is the float32 result itself, once on store otherwise.
             if (nIn >= NATIVE_MIN && NATIVE !== null && NATIVE(N_REDUCE, RED_CODE[op], A, out.data, outer, block, inner, count, O === out.data))
-                return tuple([out, pyShape(finalShape)]);
+                { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(finalShape)]); }
             let i = 0;
             switch (op) {
                 case "sum": case "mean":
@@ -442,7 +765,7 @@
                     break;
             }
             if (O !== out.data) out.data.set(O);
-            return tuple([out, pyShape(finalShape)]);
+            { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(finalShape)]); }
         }
         // Map every input index to its output offset.
         const inS = strides(shape), outS = strides(keptShape);
@@ -469,7 +792,28 @@
         }
         if (op === "mean") for (let i = 0; i < O.length; i++) O[i] /= count;
         if (O !== out.data) out.data.set(O);
-        return tuple([out, pyShape(finalShape)]);
+        { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(finalShape)]); }
+    }
+    function halfProd(a, shape, rank, red, keepdim, dtype) {
+        const round = dtype === "float16" ? f16 : bf16;
+        const isRed = new Array(rank).fill(red === null);
+        if (red !== null) for (let i = 0; i < red.length; i++) isRed[red[i]] = true;
+        const outShape = [], keptShape = [];
+        for (let d = 0; d < rank; d++) { if (isRed[d]) keptShape.push(1); else { outShape.push(shape[d]); keptShape.push(shape[d]); } }
+        const out = alloc(dtype, numel(keptShape)), O = out.data, A = a.data, outS = strides(keptShape), nIn = numel(shape);
+        O.fill(1);
+        const pos = new Array(rank).fill(0);
+        let oo = 0;
+        for (let flat = 0; flat < nIn; flat++) {
+            O[oo] = round(O[oo] * A[flat]);
+            for (let d = rank - 1; d >= 0; d--) {
+                pos[d]++; if (!isRed[d]) oo += outS[d];
+                if (pos[d] < shape[d]) break;
+                if (!isRed[d]) oo -= outS[d] * shape[d];
+                pos[d] = 0;
+            }
+        }
+        return tuple([out, pyShape(keepdim ? keptShape : outShape)]);
     }
     // The flat index within the reduced dims (row-major over them).
     function redIndex(pos, isRed, shape) {
@@ -649,7 +993,7 @@
             const A = items[i].items[0].data, n = shapes[i][d] * inner, base = x * n;
             for (let r = 0; r < n; r++) O[o++] = A[base + r];
         }
-        return tuple([out, pyShape(outShape)]);
+        { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(outShape)]); }
     }
     function roll(a, shape, shift, dim) {
         const d = dim < 0 ? dim + shape.length : dim, n = shape[d];
@@ -668,7 +1012,7 @@
         const out = alloc(a.dtype, outer * newLast), O = out.data, A = a.data;
         if (value !== 0) O.fill(value);
         for (let x = 0; x < outer; x++) for (let i = 0; i < last; i++) O[x * newLast + left + i] = A[x * last + i];
-        return tuple([out, pyShape(outShape)]);
+        { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(outShape)]); }
     }
     // ---- linear algebra ----------------------------------------------------------------
     function matmul(a, ashape, b, bshape) {
@@ -703,7 +1047,7 @@
         let outShape = batch.concat([m, n]);
         if (squeezeA) outShape.splice(outShape.length - 2, 1);
         if (squeezeB) outShape.splice(outShape.length - 1, 1);
-        return tuple([out, pyShape(outShape)]);
+        { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(outShape)]); }
     }
     // conv1d, stride 1, no padding, no dilation: x [B,C,L], w [O,C,K], bias [O]?
     function conv1d(x, xs, w, ws, bias) {
@@ -712,7 +1056,7 @@
         const Lo = L - K + 1; if (Lo < 1) fail(E.RuntimeError, "conv1d: kernel size can't be greater than actual input size");
         const dtype = promote(x.dtype, w.dtype), out = alloc(dtype, B * Oc * Lo), O = out.data, X = x.data, W = w.data;
         const Bi = bias === null ? null : bias.data;
-        if (NATIVE !== null && NATIVE(N_CONV1D, X, W, Bi, O, B, C, L, Oc, K, Lo)) return tuple([out, pyShape([B, Oc, Lo])]);
+        if (NATIVE !== null && NATIVE(N_CONV1D, X, W, Bi, O, B, C, L, Oc, K, Lo)) { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape([B, Oc, Lo])]); }
         for (let b = 0; b < B; b++) for (let o = 0; o < Oc; o++) {
             const bv = Bi === null ? 0 : Bi[o];
             for (let t = 0; t < Lo; t++) {
@@ -721,19 +1065,19 @@
                 O[(b * Oc + o) * Lo + t] = s;
             }
         }
-        return tuple([out, pyShape([B, Oc, Lo])]);
+        { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape([B, Oc, Lo])]); }
     }
     function conv1dBackward(x, xs, w, ws, g) {
         const [B, C, L] = xs, [Oc, , K] = ws, Lo = L - K + 1;
         const gx = alloc(x.dtype, B * C * L), gw = alloc(w.dtype, Oc * C * K), gb = alloc(w.dtype, Oc);
         const GX = gx.data, GW = gw.data, GB = gb.data, X = x.data, W = w.data, G = g.data;
-        if (NATIVE !== null && NATIVE(N_CONV1D_BACKWARD, X, W, G, GX, GW, GB, B, C, L, Oc, K, Lo)) return tuple([gx, gw, gb]);
+        if (NATIVE !== null && NATIVE(N_CONV1D_BACKWARD, X, W, G, GX, GW, GB, B, C, L, Oc, K, Lo)) return tuple([finish(gx), finish(gw), finish(gb)]);
         for (let b = 0; b < B; b++) for (let o = 0; o < Oc; o++) for (let t = 0; t < Lo; t++) {
             const gv = G[(b * Oc + o) * Lo + t]; if (gv === 0) continue;
             GB[o] += gv;
             for (let c = 0; c < C; c++) { const xb = (b * C + c) * L + t, wb = (o * C + c) * K; for (let k = 0; k < K; k++) { GX[xb + k] += gv * W[wb + k]; GW[wb + k] += gv * X[xb + k]; } }
         }
-        return tuple([gx, gw, gb]);
+        return tuple([finish(gx), finish(gw), finish(gb)]);
     }
     // Contiguous NCHW cross-correlation; the same index walk computes gradients.
     function conv2d(x, xs, w, ws, bias, stride, padding, dilation, groups, grad = null) {
@@ -743,7 +1087,7 @@
         if (![B,C,H,W,O,Cg,Kh,Kw,groups,...stride,...padding,...dilation].every(Number.isSafeInteger) ||
             B < 0 || Math.min(C,H,W,O,Cg,Kh,Kw,groups,...stride,...dilation) < 1 || Math.min(...padding) < 0 ||
             C !== Cg * groups || O % groups !== 0 || x.data.length !== B*C*H*W || w.data.length !== O*Cg*Kh*Kw ||
-            !["float32","float64"].includes(x.dtype) || x.dtype !== w.dtype || (bias && (bias.data.length !== O || bias.dtype !== x.dtype)))
+            !isFloatDtype(x.dtype) || x.dtype !== w.dtype || (bias && (bias.data.length !== O || bias.dtype !== x.dtype)))
             fail(E.RuntimeError, "conv2d: incompatible shape, dtype or convolution parameters");
         const [Sh, Sw] = stride, [Ph, Pw] = padding, [Dh, Dw] = dilation;
         const Ho = Math.floor((H + 2*Ph - Dh*(Kh-1) - 1)/Sh) + 1;
@@ -758,7 +1102,7 @@
         if (NATIVE !== null && (grad
             ? NATIVE(N_CONV2D_BACKWARD, x.data, w.data, grad.data, gx.data, gw.data, gb.data, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, groups, Ho, Wo)
             : NATIVE(N_CONV2D, x.data, w.data, bias ? bias.data : null, out.data, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, groups, Ho, Wo)))
-            return grad ? tuple([gx,gw,gb]) : tuple([out,pyShape([B,O,Ho,Wo])]);
+            return grad ? tuple([finish(gx),finish(gw),finish(gb)]) : tuple([finish(out),pyShape([B,O,Ho,Wo])]);
         for (let b=0; b<B; b++) for (let o=0; o<O; o++) {
             const firstChannel = Math.floor(o/perGroup)*Cg;
             for (let h=0; h<Ho; h++) for (let v=0; v<Wo; v++) {
@@ -777,13 +1121,13 @@
                 if (!grad) out.data[oi] = sum;
             }
         }
-        return grad ? tuple([gx,gw,gb]) : tuple([out,pyShape([B,O,Ho,Wo])]);
+        return grad ? tuple([finish(gx),finish(gw),finish(gb)]) : tuple([finish(out),pyShape([B,O,Ho,Wo])]);
     }
     function softmax(a, shape, dim, log) {
         const d = dim < 0 ? dim + shape.length : dim, n = shape[d];
         const outer = numel(shape.slice(0, d)), inner = numel(shape.slice(d + 1));
-        const dtype = RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype, out = alloc(dtype, a.data.length), O = out.data, A = a.data;
-        if (NATIVE !== null && NATIVE(N_SOFTMAX, A, O, outer, n, inner, !!log)) return out;
+        const dtype = !isFloatDtype(a.dtype) ? "float32" : a.dtype, out = alloc(dtype, a.data.length), O = out.data, A = a.data;
+        if (NATIVE !== null && NATIVE(N_SOFTMAX, A, O, outer, n, inner, !!log)) { if (HALF[out.dtype] === 1) finish(out); return out; }
         for (let x = 0; x < outer; x++) for (let r = 0; r < inner; r++) {
             const base = x * n * inner + r;
             let mx = -Infinity; for (let i = 0; i < n; i++) { const v = A[base + i * inner]; if (v > mx) mx = v; }
@@ -791,7 +1135,7 @@
             const ls = Math.log(sum);
             for (let i = 0; i < n; i++) { const z = A[base + i * inner] - mx; O[base + i * inner] = log ? z - ls : Math.exp(z) / sum; }
         }
-        return out;
+        { if (HALF[out.dtype] === 1) finish(out); return out; }
     }
     // A running reduction along `dim`, accumulated in double precision and
     // rounded on store. cummax/cummin also return the index of each running
@@ -818,7 +1162,7 @@
                 if (arg) I[p] = at;
             }
         }
-        return arg ? tuple([out, idx]) : out;
+        { if (HALF[out.dtype] === 1) finish(out); return arg ? tuple([out, idx]) : out; }
     }
     // Stable merge sort of indices along `dim`.
     function argsort(a, shape, dim, descending) {
@@ -862,14 +1206,14 @@
         const out = alloc(dtype, numel(shape)), O = out.data;
         const sc = bstrides(cs, shape), sa = bstrides(as_, shape), sb = bstrides(bs, shape);
         const Cd = c.data, Ad = a.data, Bd = b.data;
-        if (O.length >= NATIVE_MIN && NATIVE !== null && NATIVE(N_WHERE, Cd, Ad, Bd, O, shape, sc, sa, sb)) return tuple([out, pyShape(shape)]);
+        if (O.length >= NATIVE_MIN && NATIVE !== null && NATIVE(N_WHERE, Cd, Ad, Bd, O, shape, sc, sa, sb)) { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(shape)]); }
         const rank = shape.length, idx = new Array(rank).fill(0);
         let oc = 0, oa = 0, ob = 0;
         for (let flat = 0; flat < O.length; flat++) {
             O[flat] = Cd[oc] ? Ad[oa] : Bd[ob];
             for (let d = rank - 1; d >= 0; d--) { idx[d]++; oc += sc[d]; oa += sa[d]; ob += sb[d]; if (idx[d] < shape[d]) break; oc -= sc[d] * shape[d]; oa -= sa[d] * shape[d]; ob -= sb[d] * shape[d]; idx[d] = 0; }
         }
-        return tuple([out, pyShape(shape)]);
+        { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(shape)]); }
     }
     // ---- random: MT19937, with PyTorch's CPU transforms ------------------------------------------
     function mt(seed) {
@@ -919,10 +1263,13 @@
         return null;
     }
     function needGen(g) { if (g === null || typeof g !== "object" || g.cls !== Gen) fail(E.TypeError, "a Generator is required"); return g.state; }
-    function rand(g, n) {
-        // float32 uniform from 24 random bits, as torch's uniform_ for float.
-        const s = needGen(g), out = alloc("float32", n), O = out.data;
-        for (let i = 0; i < n; i++) O[i] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
+    function rand(g, n, dtype) {
+        // float32 uniform from 24 random bits, as torch's uniform_ for float;
+        // float16 from 11 and bfloat16 from 8 (their mantissa digits).
+        const s = needGen(g), out = alloc(dtype, n), O = out.data;
+        if (dtype === "float16") for (let i = 0; i < n; i++) O[i] = (next32(s) & 0x7ff) * 0.00048828125;
+        else if (dtype === "bfloat16") for (let i = 0; i < n; i++) O[i] = (next32(s) & 0xff) * 0.00390625;
+        else for (let i = 0; i < n; i++) O[i] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
         return out;
     }
     function randDouble(g, n) {
@@ -939,7 +1286,7 @@
             O[i] = r * Math.cos(t);
             if (i + 1 < n) O[i + 1] = r * Math.sin(t);
         }
-        return out;
+        { if (HALF[out.dtype] === 1) finish(out); return out; }
     }
     // PyTorch's CPU randint: a range below 2**28 takes one 32-bit word per
     // element; a larger one takes random64() (two words, the first high)
@@ -995,6 +1342,15 @@
         else if (a.dtype === "float64") bytes = new Uint8Array(Float64Array.from(a.data).buffer);
         else if (a.dtype === "int64") { const b = new ArrayBuffer(n * 8), v = new DataView(b); for (let i = 0; i < n; i++) v.setBigInt64(i * 8, BigInt(Math.trunc(a.data[i])), true); bytes = new Uint8Array(b); }
         else if (a.dtype === "int32") { const b = new ArrayBuffer(n * 4), v = new DataView(b); for (let i = 0; i < n; i++) v.setInt32(i * 4, a.data[i], true); bytes = new Uint8Array(b); }
+        else if (a.dtype === "int16") bytes = new Uint8Array(Int16Array.from(a.data).buffer);
+        else if (a.dtype === "float16") { const h = new Float16Array(n); for (let i = 0; i < n; i++) h[i] = a.data[i]; bytes = new Uint8Array(h.buffer); }
+        else if (a.dtype === "bfloat16") {
+            // The upper half of each float32 (the value is a bfloat16 already);
+            // NaN as PyTorch writes it, 0x7fc0 with its sign.
+            const u = new Uint32Array(Float32Array.from(a.data).buffer), h = new Uint16Array(n);
+            for (let i = 0; i < n; i++) { const w = u[i]; h[i] = (w & 0x7fffffff) > 0x7f800000 ? ((w >>> 16) & 0x8000) | 0x7fc0 : w >>> 16; }
+            bytes = new Uint8Array(h.buffer);
+        }
         else bytes = Uint8Array.from(a.data);
         return rt.bytes(rt.bytesFromU8(bytes));
     }
@@ -1017,6 +1373,10 @@
         if (dtype === "float64") { const m = n === undefined ? items.length / 8 : n, out = alloc("float64", m); for (let i = 0; i < m; i++) out.data[i] = view.getFloat64(i * 8, true); return out; }
         if (dtype === "int64") { const m = n === undefined ? items.length / 8 : n, out = alloc("int64", m); for (let i = 0; i < m; i++) out.data[i] = Number(view.getBigInt64(i * 8, true)); return out; }
         if (dtype === "int32") { const m = n === undefined ? items.length / 4 : n, out = alloc("int32", m); for (let i = 0; i < m; i++) out.data[i] = view.getInt32(i * 4, true); return out; }
+        if (dtype === "int16") { const m = n === undefined ? items.length / 2 : n, out = alloc("int16", m); for (let i = 0; i < m; i++) out.data[i] = view.getInt16(i * 2, true); return out; }
+        if (dtype === "int8") { const m = n === undefined ? items.length : n, out = alloc("int8", m); for (let i = 0; i < m; i++) out.data[i] = view.getInt8(i); return out; }
+        if (dtype === "float16") { const m = n === undefined ? items.length / 2 : n, out = alloc("float16", m), h = new Uint16Array(m); for (let i = 0; i < m; i++) h[i] = view.getUint16(i * 2, true); out.data.set(new Float16Array(h.buffer)); return out; }
+        if (dtype === "bfloat16") { const m = n === undefined ? items.length / 2 : n, out = alloc("bfloat16", m), u = new Uint32Array(m); for (let i = 0; i < m; i++) u[i] = view.getUint16(i * 2, true) * 65536; out.data.set(new Float32Array(u.buffer)); return out; }
         if (dtype === "bool" || dtype === "uint8") { const m = n === undefined ? items.length : n, out = alloc(dtype, m); for (let i = 0; i < m; i++) out.data[i] = items[i]; return out; }
         fail(E.TypeError, "unknown dtype " + dtype);
     }
@@ -1157,6 +1517,19 @@
         }
         return out;
     }
+    // The graph protocol's `uniform` draw, from the two keys zipp_gpu derives
+    // from (seed, step): element i is (mix(mix(i ^ k2) + k1) >>> 8) * 2^-24,
+    // mix being lowbias32, all modulo 2^32, so the bits equal every backend's.
+    function graphUniformMix(x) {
+        x = (x ^ (x >>> 16)) >>> 0; x = Math.imul(x, 0x7feb352d) >>> 0;
+        x = (x ^ (x >>> 15)) >>> 0; x = Math.imul(x, 0x846ca68b) >>> 0;
+        return (x ^ (x >>> 16)) >>> 0;
+    }
+    function graphUniform(n, k1, k2) {
+        const out = alloc("float32", n), O = out.data;
+        for (let i = 0; i < n; i++) O[i] = (graphUniformMix((graphUniformMix((i ^ k2) >>> 0) + k1) >>> 0) >>> 8) * 5.9604644775390625e-8;
+        return out;
+    }
     function life(a, h, w) {
         const out = alloc("float32", h * w), O = out.data, A = a.data;
         for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -1220,7 +1593,8 @@
             const s = needS(a[0]), d = rt.needStr(a[1]); const out = alloc(d, s.data.length);
             // A float target converts exactly as castValue does (the typed
             // array rounds float32 on store); integer targets truncate.
-            if (isFloatDtype(d)) out.data.set(s.data);
+            if (d === "float32" || d === "float64" || (d === s.dtype && HALF[d] === 1)) out.data.set(s.data);
+            else if (HALF[d] === 1) { const O = out.data, S = s.data, round = d === "float16" ? f16 : bf16; for (let i = 0; i < O.length; i++) O[i] = round(Math.fround(S[i])); }
             else for (let i = 0; i < out.data.length; i++) out.data[i] = castValue(d, s.data[i]);
             return out;
         });
@@ -1246,6 +1620,8 @@
         fn("graph_cross_entropy", 5, (a) => graphCrossEntropy(needS(a[0]), needS(a[1]), num(a[2]), num(a[3]), rt.truth(a[4])));
         // graph_step(op, a, b, c_or_None, scalars): one optimizer update.
         fn("graph_step", 5, (a) => { const s = a[4].items, sc = new Array(s.length); for (let i = 0; i < s.length; i++) sc[i] = jsNumber(s[i]); return graphStep(rt.needStr(a[0]), needS(a[1]), needS(a[2]), a[3] === null ? null : needS(a[3]), sc); });
+        // graph_uniform(n, k1, k2): the protocol's counter-based uniform draw.
+        fn("graph_uniform", 3, (a) => graphUniform(num(a[0]), num(a[1]) >>> 0, num(a[2]) >>> 0));
         fn("life", 3, (a) => life(needS(a[0]), num(a[1]), num(a[2])));
         fn("fill", 2, (a) => { const s = needS(a[0]); s.data.fill(castValue(s.dtype, num(a[1]))); written(s); return null; });
         fn("copy_into", 2, (a) => {
@@ -1290,7 +1666,7 @@
         fn("gen", 1, (a) => genNew(rt.asInt(rt.needInt(a[0]))));
         fn("gen_seed", 2, (a) => { const g = a[0]; g.seed = rt.asInt(rt.needInt(a[1])); g.state = mt(Number(BigInt.asUintN(32, g.seed))); return null; });
         fn("gen_initial_seed", 1, (a) => a[0].seed);
-        fn("rand", 2, (a) => rand(a[0], num(a[1])));
+        fn("rand", 3, (a) => rand(a[0], num(a[1]), a[2] === undefined ? "float32" : rt.needStr(a[2])), 2);
         fn("rand_double", 2, (a) => randDouble(a[0], num(a[1])));
         fn("randn", 3, (a) => randn(a[0], num(a[1]), rt.needStr(a[2])));
         fn("randint", 4, (a) => randint(a[0], num(a[1]), num(a[2]), num(a[3])));
