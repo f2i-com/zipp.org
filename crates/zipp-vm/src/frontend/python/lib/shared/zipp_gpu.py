@@ -1186,7 +1186,10 @@ class Session:
                 # guest, so a hosted step does not scan twice.
                 if not self._hosted and not _k.all_finite(value):
                     raise GraphError("Only finite float32 values are supported")
-                flat, count = value, _k.size(value)
+                # A host takes the run after the current call returns: post a
+                # copy, or a buffer refilled in place before then (the next
+                # batch) would be what every queued step reads.
+                flat, count = (_k.copy(value) if self._hosted else value), _k.size(value)
             else:
                 flat, _ = _flatten(value)
                 count = len(flat)

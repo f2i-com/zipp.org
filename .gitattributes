@@ -37,3 +37,8 @@ crates/zipp-wasm/**/*.wasm -text
 # A GGUF is a container of packed blocks and f16 scales. Bytes that happen to be
 # 0x0D 0x0A are data, and this repository sets `text` on everything by default.
 *.gguf binary
+
+# Pickles and checkpoints are bytes: a protocol-0 pickle is ASCII, and
+# line-ending conversion on checkout would corrupt it.
+*.pkl binary
+*.pt binary

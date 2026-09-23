@@ -110,6 +110,22 @@ class _Capture:
         self.optimizer_params = ()
         self.did_backward = False
         self.did_step = False
+        # Eager tensors computed from a parameter inside the step (`W.T`,
+        # `(p ** 2).sum()`), re-recorded as graph operations on the
+        # parameter, by id; each entry keeps its tensor alive.
+        self.derived = {}
+        # Input storage already in the graph, by id: another tensor over the
+        # same storage (`p.detach()`, `.data`) reads the same input node, so a
+        # prepared session carries it with the parameter.
+        self.storages = {}
+        # Whether the step drew random numbers (see `_record`).
+        self.used_random = False
+        # Prepared only: the tensors created while the step recorded (see `_record`).
+        self.created = ((), set())
+
+    def derived_input(self, value):
+        """Whether `value` is an eager result with a gradient path to a leaf."""
+        return self.training and isinstance(value, torch.Tensor) and value.requires_grad and value._node is not None
 
     def tensor(self, value, row=False):
         if isinstance(value, _Tensor):
@@ -117,6 +133,11 @@ class _Capture:
                 raise ValueError("Cannot mix separate compiled GPU calls")
             return value
         if isinstance(value, torch.Tensor):
+            if self.derived_input(value):
+                # Never a fresh leaf: its gradient would stop here instead
+                # of reaching the parameter it was computed from.
+                symbolic = self._replay(value)
+                return symbolic.reshape(1, value.shape[0]) if row else symbolic
             if len(value.shape) > 2:
                 raise NotImplementedError("Compiled GPU calls support scalar, vector and matrix tensors only")
             if value.dtype != torch.float32:
@@ -128,7 +149,16 @@ class _Capture:
             if key not in self.inputs:
                 # The graph copies the storage (one pass, no Python floats);
                 # staleness is checked against storage identity and version.
-                symbolic = _Tensor(self, self.graph.tensor(value._s, shape), requires_grad=value.requires_grad)
+                memo = self.storages.get(id(value._s))
+                if memo is not None and memo[2] == shape:
+                    node = memo[1]
+                elif memo is not None and not value.requires_grad and torch._numel(memo[2]) == torch._numel(shape):
+                    node = self.graph.reshape(memo[1], shape)
+                else:
+                    node = self.graph.tensor(value._s, shape)
+                    if memo is None:
+                        self.storages[id(value._s)] = (value._s, node, shape)
+                symbolic = _Tensor(self, node, requires_grad=value.requires_grad)
                 self.inputs[key] = (value, symbolic, (value._s, _k.version(value._s)))
                 grad = value.grad
                 # The data too: a gradient that is not the optimizer's own
@@ -137,9 +167,111 @@ class _Capture:
                 self.input_metadata[key] = (tuple(value.shape), value.requires_grad)
             original, symbolic, snapshot = self.inputs[key]
             if tuple(symbolic.shape) != shape:
-                raise NotImplementedError("A captured tensor cannot have two different layouts")
+                # A bias read both as a row and as a vector: one leaf, reshaped.
+                return symbolic.reshape(shape)
             return symbolic
         return _Tensor(self, self.graph.tensor(value))
+
+    # ---- eager results computed from parameters -------------------------------------------
+    # A parameter the step touches with an ordinary tensor operation (`W.T`,
+    # `W * 2`, `(p ** 2).sum()`, `torch.add(h, b)`'s `b * alpha`) yields an
+    # eager tensor whose autograd node leads back to the parameter. That node
+    # is re-recorded here as graph operations on the parameter's own input,
+    # so the gradient reaches it (and a prepared session recomputes the value
+    # from the resident weights each step). A node that cannot be recorded
+    # exactly raises; it never becomes a separate leaf.
+
+    def _replay(self, value):
+        entry = self.derived.get(id(value))
+        if entry is not None:
+            return entry[1]
+        node = value._node
+        name = node.name
+        parents = node.parents
+        for i, parent in enumerate(parents):
+            # Each parent's history as the node consumed it comes first in
+            # its `pstate`; an in-place operation since gave it another.
+            if parent is not None and node.pstate[i][0] is not parent._node:
+                raise NotImplementedError("torch.compile cannot record %s on a parameter whose operand was modified in place afterwards" % name)
+        operands = [None if parent is None else self.tensor(parent) for parent in parents]
+        shape = tuple(value.shape)
+        if name in _REPLAY_BINARY and len(operands) == 2 and None not in operands:
+            a, b = operands
+            result = a + b if name == "Add" else a - b if name == "Sub" else a * b if name == "Mul" else a / b
+        elif name == "Pow":
+            if len(parents) == 1:
+                result = operands[0].square()
+            else:
+                exponent = parents[1]
+                if exponent.requires_grad or exponent.shape.numel() != 1:
+                    raise NotImplementedError("torch.compile records a parameter raised to a constant power only")
+                result = operands[0] ** exponent.item()
+        elif name in _REPLAY_UNARY:
+            result = getattr(operands[0], _REPLAY_UNARY[name])()
+        elif name == "View":
+            result = operands[0].reshape(shape)
+        elif name in ("clone", "ToCopy"):
+            if value.dtype != torch.float32:
+                raise TypeError("GPU compilation requires float32 tensors")
+            result = operands[0]
+        elif name in ("Sum", "Mean"):
+            result = self._replay_reduction(node, parents[0], operands[0], shape, name)
+        elif name == "Permute":
+            result = operands[0].permute(self._replay_permutation(node, parents[0], shape))
+        elif name == "Mm":
+            result = operands[0] @ operands[1]
+        elif name in ("Softmax", "LogSoftmax"):
+            method = "softmax" if name == "Softmax" else "log_softmax"
+            with torch.no_grad():
+                dims = [d for d in range(len(shape)) if torch.equal(getattr(torch, method)(parents[0], d), value)]
+            if len(dims) != 1:
+                raise NotImplementedError("torch.compile cannot tell which dimension an eager %s of a parameter used" % method)
+            result = getattr(operands[0], method)(dims[0])
+        else:
+            raise NotImplementedError(
+                "torch.compile cannot record the eager operation %s applied to a parameter inside a compiled training step "
+                "(its gradient would not reach the parameter); apply it to graph tensors or outside the step" % name)
+        if tuple(result.shape) != shape:
+            raise NotImplementedError("torch.compile could not record the eager operation %s on a parameter" % name)
+        self.derived[id(value)] = (value, result)
+        return result
+
+    @staticmethod
+    def _probe(node, shape):
+        # A linear node's backward applied to distinct values reveals which
+        # elements it moved or reduced (the dims live in its closure only).
+        count = torch._numel(shape)
+        if count > 1 << 24:
+            raise NotImplementedError("torch.compile cannot record an eager operation this large on a parameter")
+        with torch.no_grad():
+            probe = torch.arange(1, count + 1, dtype=torch.float32).reshape(shape)
+            return probe, node.backward(probe)[0]
+
+    def _replay_reduction(self, node, parent, operand, shape, name):
+        probe, spread = self._probe(node, shape)
+        dims = []
+        with torch.no_grad():
+            for d, size in enumerate(parent.shape):
+                if size > 1 and torch.equal(spread, spread.narrow(d, 0, 1).expand(*parent.shape)):
+                    dims.append(d)
+        if not dims:
+            return operand.reshape(shape)
+        if not shape and len(dims) == sum(1 for size in parent.shape if size > 1):
+            # The whole tensor: the pairwise (protocol version 1) form.
+            return operand.sum() if name == "Sum" else operand.mean()
+        reduced = operand.sum(dims, True) if name == "Sum" else operand.mean(dims, True)
+        return reduced.reshape(shape)
+
+    def _replay_permutation(self, node, parent, shape):
+        probe, moved = self._probe(node, shape)
+        found = []
+        with torch.no_grad():
+            for dims in _permutations(len(shape)):
+                if tuple(parent.shape[d] for d in dims) == shape and torch.equal(moved.permute(*dims), probe):
+                    found.append(dims)
+        if len(found) != 1:
+            raise NotImplementedError("torch.compile could not record an eager permutation of a parameter")
+        return found[0]
 
     def class_targets(self, value):
         """Integer class indices for the fused cross-entropy, recorded once.
@@ -159,6 +291,10 @@ class _Capture:
             raise NotImplementedError("GPU cross_entropy supports class targets of shape [N] for logits [N, C]")
         key = id(value)
         if key not in self.targets:
+            for original, symbolic, snapshot, dtype in self.targets.values():
+                if snapshot[0] is value._s and original.shape == value.shape:
+                    # Another view of the same targets (`y.view(-1)` twice): one input.
+                    return symbolic
             symbolic = self.graph.tensor(_k.astype(value._s, "float32"), tuple(value.shape))
             self.targets[key] = (value, symbolic, (value._s, _k.version(value._s)), value.dtype)
         return self.targets[key][1]
@@ -301,6 +437,23 @@ class _Capture:
         self._end_step()
 
 
+_REPLAY_BINARY = ("Add", "Sub", "Mul", "Div")
+# Eager autograd node names and the graph tensor method recording each.
+_REPLAY_UNARY = {"Neg": "__neg__", "Exp": "exp", "Log": "log", "Tanh": "tanh", "Sigmoid": "sigmoid", "Relu": "relu",
+                 "Sqrt": "sqrt", "Rsqrt": "rsqrt", "Gelu": "gelu", "Abs": "abs", "Silu": "silu"}
+
+
+def _permutations(rank):
+    if rank == 0:
+        return [()]
+    return [rest[:i] + (rank - 1,) + rest[i:] for rest in _permutations(rank - 1) for i in range(rank)]
+
+
+class CompileUnsupportedError(NotImplementedError, AttributeError):
+    """An operation torch.compile cannot record. Also an AttributeError, so
+    `hasattr`/`getattr(x, name, default)` on a graph tensor keep working."""
+
+
 def _unbroadcast(g, tensor):
     """Reduce a broadcast gradient back to the operand's shape."""
     shape = tuple(tensor.shape)
@@ -316,14 +469,29 @@ def _unbroadcast(g, tensor):
     return g
 
 
-def _one_dim(dim, rank, name):
-    if isinstance(dim, (tuple, list)):
-        if len(dim) != 1:
-            raise NotImplementedError("GPU %s reduces all elements or one dimension" % name)
-        dim = dim[0]
-    if isinstance(dim, bool) or not isinstance(dim, int) or not -rank <= dim < rank:
-        raise IndexError("Dimension out of range (expected to be in range of [%d, %d], but got %r)" % (-rank, rank - 1, dim))
+def _dim(dim, rank):
+    if isinstance(dim, bool) or not isinstance(dim, int) or not -max(rank, 1) <= dim < max(rank, 1):
+        raise IndexError("Dimension out of range (expected to be in range of [%d, %d], but got %r)" % (-max(rank, 1), max(rank, 1) - 1, dim))
     return dim + rank if dim < 0 else dim
+
+
+def _dims(dim, rank):
+    """A reduction's dimensions, sorted and distinct; None for the whole tensor."""
+    if dim is None:
+        return None
+    dims = tuple(dim) if isinstance(dim, (tuple, list)) else (dim,)
+    if not dims:
+        return None
+    result = sorted(set(_dim(d, rank) for d in dims))
+    if len(result) != len(dims):
+        raise RuntimeError("dim appears multiple times in the list of dims")
+    return result
+
+
+def _shape_args(shape):
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list, torch.Size)):
+        shape = shape[0]
+    return tuple(int(d) for d in shape)
 
 
 class _Tensor:
@@ -344,22 +512,39 @@ class _Tensor:
         if self.requires_grad:
             capture.tape.append(self)
 
+    def __getattr__(self, name):
+        # Only reached for what the class does not define.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        if name == "_s":
+            # An eager torch function asked a graph tensor for its storage.
+            raise CompileUnsupportedError("This torch function is not supported by torch.compile: it cannot record it on a compiled graph tensor "
+                               "(the supported operations are listed in docs/TORCH_COMPATIBILITY.md)")
+        raise CompileUnsupportedError("Tensor.%s is not supported by torch.compile" % name)
+
     def _binary(self, operation, other, reverse=False):
-        if isinstance(other, torch.Tensor) and len(self.shape) == 2 and tuple(other.shape) == (self.shape[1],):
+        capture = self._capture
+        if (isinstance(other, torch.Tensor) and len(self.shape) == 2 and tuple(other.shape) == (self.shape[1],)
+                and not capture.derived_input(other)):
             # A bias row broadcast by a ones-matmul keeps dense layers within
             # protocol version 1; other broadcasting uses the graph's own.
-            other = self._capture.tensor(other, row=True)
-            ones = _Tensor(self._capture, self._capture.graph.full((self.shape[0], 1), 1.0))
+            other = capture.tensor(other, row=True)
+            ones = _Tensor(capture, capture.graph.full((self.shape[0], 1), 1.0))
             other = ones @ other
-        rhs = self._capture.tensor(other)
+        rhs = capture.tensor(other)
         a, b = (rhs, self) if reverse else (self, rhs)
         av, bv = a._value, b._value
+        if operation == "div":
+            result = av / bv
+            def backward(g):
+                return (_unbroadcast(g / bv, a), _unbroadcast(-(g * (result / bv)), b))
+            return _Tensor(capture, result, (a, b), backward)
         result = av + bv if operation == "add" else av - bv if operation == "sub" else av * bv
         def backward(g):
             ga = g * bv if operation == "mul" else g
             gb = g * av if operation == "mul" else g * -1.0 if operation == "sub" else g
             return (_unbroadcast(ga, a), _unbroadcast(gb, b))
-        return _Tensor(self._capture, result, (a, b), backward)
+        return _Tensor(capture, result, (a, b), backward)
 
     def _unary(self, value, pullback):
         return _Tensor(self._capture, value, (self,), pullback)
@@ -372,27 +557,169 @@ class _Tensor:
     def __rmul__(self, other): return self._binary("mul", other, True)
     def __neg__(self): return self * -1.0
     def __truediv__(self, other):
-        if not isinstance(other, (int, float)) or isinstance(other, bool):
-            raise NotImplementedError("GPU division supports a numeric scalar divisor only")
-        return self * (1.0 / other)
+        if isinstance(other, bool):
+            raise TypeError("GPU division needs a number or a tensor divisor")
+        if isinstance(other, (int, float)):
+            # A scalar divisor stays a multiplication (protocol version 1).
+            return self * (1.0 / other)
+        return self._binary("div", other)
+    def __rtruediv__(self, other):
+        if isinstance(other, bool):
+            raise TypeError("GPU division needs a number or a tensor dividend")
+        return self._binary("div", other, True)
+    def div(self, other): return self / other
     def __pow__(self, exponent):
-        if exponent != 2:
-            raise NotImplementedError("GPU power currently supports exponent 2 only")
-        return self * self
+        if isinstance(exponent, bool) or not isinstance(exponent, (int, float)):
+            raise NotImplementedError("GPU power supports a constant numeric exponent")
+        if exponent == 2:
+            return self * self
+        if exponent == 1:
+            return self
+        if exponent == 0.5:
+            return self.sqrt()
+        if exponent == -1:
+            return 1.0 / self
+        if exponent == -0.5:
+            return self.rsqrt()
+        raise NotImplementedError("GPU power supports the exponents 2, 1, 0.5, -1 and -0.5")
+    def pow(self, exponent): return self ** exponent
+    def square(self): return self * self
+    def __lt__(self, other): raise CompileUnsupportedError("Comparisons are not supported by torch.compile")
+    __le__ = __gt__ = __ge__ = __lt__
+
     def __matmul__(self, other):
         b = self._capture.tensor(other)
+        ra, rb = len(self.shape), len(b.shape)
+        if ra == 1 or rb == 1:
+            # A vector is a one-row (left) or one-column (right) matrix.
+            if ra not in (1, 2) or rb not in (1, 2):
+                raise NotImplementedError("GPU matmul supports vectors and matrices")
+            left = self.reshape(1, self.shape[0]) if ra == 1 else self
+            right = b.reshape(b.shape[0], 1) if rb == 1 else b
+            out = left @ right
+            return out.reshape(tuple(out.shape[:1] if ra == 2 else ()) + tuple(out.shape[1:] if rb == 2 else ()))
+        if ra != 2 or rb != 2:
+            raise NotImplementedError("GPU matmul supports vectors and matrices")
         a = self._value
         return _Tensor(self._capture, a @ b._value, (self, b), lambda g: (g @ b._value.transpose(), a.transpose() @ g))
     def __rmatmul__(self, other): return self._capture.tensor(other) @ self
-    def transpose(self, dim0, dim1):
-        if len(self.shape) != 2 or (dim0 % 2, dim1 % 2) not in ((0, 1), (1, 0)) or not -2 <= dim0 < 2 or not -2 <= dim1 < 2:
-            raise NotImplementedError("GPU transpose supports swapping the two matrix dimensions")
-        return self._unary(self._value.transpose(), lambda g: (g.transpose(),))
-    @property
-    def T(self): return self.transpose(0, 1)
+    def matmul(self, other): return self @ other
+    def mm(self, other): return self @ other
     def linear(self, weight, bias):
         result = self @ self._capture.tensor(weight).T
         return result if bias is None else result + bias
+
+    # ---- shape: views, permutations and transposes ----------------------------------
+    def size(self, dim=None):
+        return self.shape if dim is None else self.shape[_dim(dim, len(self.shape))]
+    def dim(self): return len(self.shape)
+    @property
+    def ndim(self): return len(self.shape)
+    def numel(self): return self.shape.numel()
+    def __len__(self):
+        if not self.shape:
+            raise TypeError("len() of a 0-d tensor")
+        return self.shape[0]
+    def detach(self):
+        # A stop-gradient: the same value, no path back to its sources.
+        return _Tensor(self._capture, self._value, requires_grad=False)
+    def float(self): return self
+    def contiguous(self): return self
+    def clone(self): return self
+    def to(self, *args, **kwargs):
+        for value in list(args) + list(kwargs.values()):
+            if value not in (torch.float32, "cpu") and not (isinstance(value, bool) or value is None):
+                raise NotImplementedError("A compiled graph tensor is float32 on the host GPU; .to(%r) is not supported" % (value,))
+        return self
+    def type_as(self, other):
+        return self.to(other.dtype)
+
+    def reshape(self, *shape):
+        shape = _shape_args(shape)
+        before = tuple(self.shape)
+        value = self._capture.graph.reshape(self._value, shape)
+        if tuple(value.shape) == before:
+            return self
+        return self._unary(value, lambda g: (g.reshape(before),))
+    view = reshape
+    def view_as(self, other): return self.reshape(tuple(other.shape))
+    reshape_as = view_as
+    def flatten(self, start_dim=0, end_dim=-1):
+        rank = len(self.shape)
+        if rank == 0:
+            return self.reshape(1)
+        s, e = _dim(start_dim, rank), _dim(end_dim, rank)
+        if s > e:
+            raise RuntimeError("flatten() has invalid args: start_dim cannot come after end_dim")
+        return self.reshape(tuple(self.shape[:s]) + (torch._numel(self.shape[s:e + 1]),) + tuple(self.shape[e + 1:]))
+    def unsqueeze(self, dim):
+        d = _dim(dim, len(self.shape) + 1)
+        return self.reshape(tuple(self.shape[:d]) + (1,) + tuple(self.shape[d:]))
+    def squeeze(self, dim=None):
+        rank = len(self.shape)
+        dims = range(rank) if dim is None else [_dim(d, rank) for d in (dim if isinstance(dim, (tuple, list)) else (dim,))]
+        drop = set(d for d in dims if self.shape[d] == 1)
+        return self.reshape(tuple(size for d, size in enumerate(self.shape) if d not in drop))
+    def permute(self, *dims):
+        dims = _shape_args(dims)
+        rank = len(self.shape)
+        dims = tuple(_dim(d, rank) for d in dims)
+        if sorted(dims) != list(range(rank)):
+            raise RuntimeError("permute(): dims must be a permutation of the tensor's dimensions")
+        if dims == tuple(range(rank)):
+            return self
+        if rank == 2:
+            return self._unary(self._value.transpose(), lambda g: (g.transpose(),))
+        inverse = [0] * rank
+        for i, d in enumerate(dims):
+            inverse[d] = i
+        return self._unary(self._value.permute(dims), lambda g: (g.permute(inverse),))
+    def transpose(self, dim0, dim1):
+        rank = len(self.shape)
+        dims = list(range(rank))
+        i, j = _dim(dim0, rank), _dim(dim1, rank)
+        dims[i], dims[j] = dims[j], dims[i]
+        return self.permute(dims)
+    swapaxes = transpose
+    def t(self):
+        if len(self.shape) > 2:
+            raise RuntimeError("t() expects a tensor with <= 2 dimensions")
+        return self.transpose(0, 1) if len(self.shape) == 2 else self
+    @property
+    def T(self): return self.permute(tuple(reversed(range(len(self.shape)))))
+
+    def __getitem__(self, key):
+        # Indexing that only reshapes: `x[None]`, `x[:, 0]` on a size-1
+        # dimension, `x[...]`, full slices. The protocol has no gather or
+        # slice operation, so anything that selects elements is rejected.
+        key = key if isinstance(key, tuple) else (key,)
+        if sum(1 for k in key if k is Ellipsis) > 1:
+            raise IndexError("an index can only have a single ellipsis ('...')")
+        consumed = sum(1 for k in key if k is not None and k is not Ellipsis)
+        if consumed > len(self.shape):
+            raise IndexError("too many indices for tensor of dimension %d" % len(self.shape))
+        expanded = []
+        for k in key:
+            if k is Ellipsis:
+                expanded.extend([slice(None)] * (len(self.shape) - consumed))
+            else:
+                expanded.append(k)
+        expanded.extend([slice(None)] * (len(self.shape) - sum(1 for k in expanded if k is not None)))
+        shape, axis = [], 0
+        for k in expanded:
+            if k is None:
+                shape.append(1)
+                continue
+            size = self.shape[axis]
+            if isinstance(k, slice) and k.step in (None, 1) and k.start in (None, 0) and (k.stop is None or k.stop >= size):
+                shape.append(size)
+            elif isinstance(k, int) and not isinstance(k, bool) and size == 1 and k in (0, -1):
+                pass
+            else:
+                raise NotImplementedError("torch.compile supports indexing that only reshapes (None, full slices, index 0 of a size-1 "
+                                          "dimension); slicing and gathering elements are not supported")
+            axis += 1
+        return self.reshape(tuple(shape))
 
     # ---- activations: each pullback is composed from graph operations -------------
     def relu(self):
@@ -414,19 +741,36 @@ class _Tensor:
     def log(self):
         x = self._value
         return self._unary(x.log(), lambda g: (g / x,))
-    def _last_axis(self, dim, name):
-        if not self.shape or _one_dim(dim, len(self.shape), name) != len(self.shape) - 1:
-            raise NotImplementedError("GPU %s supports the last dimension of a tensor with at least one dimension" % name)
+    def sqrt(self):
+        s = self._value.sqrt()
+        return self._unary(s, lambda g: (g / (s * 2.0),))
+    def rsqrt(self):
+        r = 1.0 / self._value.sqrt()
+        return self._unary(r, lambda g: (g * ((r * (r * r)) * -0.5),))
+    def reciprocal(self): return 1.0 / self
+    def abs(self):
+        # relu(x) + relu(-x) is |x| exactly; the gradient is sign(x), 0 at 0.
+        x = self._value
+        return self._unary(x.relu() + (-x).relu(), lambda g: (g * (x.positive() - (-x).positive()),))
+    def silu(self):
+        return self * self.sigmoid()
     def softmax(self, dim=-1, dtype=None):
-        self._last_axis(dim, "softmax")
-        if dtype is not None and dtype != torch.float32:
-            raise NotImplementedError("GPU softmax computes float32 only")
-        s = self._value.softmax()
-        return self._unary(s, lambda g: (s * (g - (g * s).sum(-1, keepdim=True)),))
+        return self._softmax("softmax", dim, dtype)
     def log_softmax(self, dim=-1, dtype=None):
-        self._last_axis(dim, "log_softmax")
+        return self._softmax("log_softmax", dim, dtype)
+    def _softmax(self, name, dim, dtype):
         if dtype is not None and dtype != torch.float32:
-            raise NotImplementedError("GPU log_softmax computes float32 only")
+            raise NotImplementedError("GPU %s computes float32 only" % name)
+        rank = len(self.shape)
+        if not rank:
+            raise NotImplementedError("GPU %s needs a tensor with at least one dimension" % name)
+        axis = _dim(dim, rank)
+        if axis != rank - 1:
+            # The protocol normalizes the last axis: move `dim` there and back.
+            return getattr(self.transpose(axis, -1), name)(-1).transpose(axis, -1)
+        if name == "softmax":
+            s = self._value.softmax()
+            return self._unary(s, lambda g: (s * (g - (g * s).sum(-1, keepdim=True)),))
         ls = self._value.log_softmax()
         return self._unary(ls, lambda g: (g - ls.exp() * g.sum(-1, keepdim=True),))
 
@@ -438,18 +782,29 @@ class _Tensor:
             raise TypeError("keepdim must be a bool")
         shape = tuple(self.shape)
         graph = self._capture.graph
-        if dim is None:
+        dims = _dims(dim, len(shape))
+        if dims is None:
             if not keepdim and op == "sum":
                 # Whole-tensor sum, the protocol version 1 form (mean is sum / n).
                 return self._unary(self._value.sum(), lambda g: (graph.full(shape, 1.0) * g,))
             if not keepdim:
                 return self.sum() / self.shape.numel()
-            axis, count, kept = None, self.shape.numel(), tuple(1 for _ in shape)
+            dims = list(range(len(shape)))
+        kept = tuple(1 if i in dims else d for i, d in enumerate(shape))
+        count = torch._numel([shape[d] for d in dims])
+        if len(dims) == 1 and not (dim is None and keepdim):
+            value = self._value.sum(dims[0], keepdim) if op == "sum" else self._value.mean(dims[0], keepdim)
+        elif dim is None:
+            value = self._value.sum(None, True) if op == "sum" else self._value.mean(None, True)
         else:
-            axis = _one_dim(dim, len(shape), op)
-            count = shape[axis]
-            kept = tuple(1 if i == axis else d for i, d in enumerate(shape))
-        value = self._value.sum(axis, keepdim) if op == "sum" else self._value.mean(axis, keepdim)
+            # Several dimensions: one axis at a time, then the mean's one division.
+            value = self._value
+            for d in reversed(dims):
+                value = value.sum(d, True)
+            if op == "mean":
+                value = value / float(count)
+            if not keepdim:
+                value = value.reshape(tuple(d for i, d in enumerate(shape) if i not in dims))
         scale = 1.0 if op == "sum" else 1.0 / count
         def backward(g):
             spread = g if keepdim else g.reshape(kept)
@@ -585,10 +940,43 @@ def _record(model, training, args, kwargs, prepared=False):
     convert = lambda value: capture.tensor(value) if isinstance(value, torch.Tensor) and value.dtype.is_floating_point else value
     # Eager ops look for graph tensors only while a call records.
     torch._recording(1)
+    # A prepared step is one recorded program run many times: a random draw
+    # inside it (a dropout mask, torch.randn noise) would become a constant
+    # replayed at every step. Every draw goes through torch._gen, so watch it.
+    draw = getattr(torch, "_gen", None) if prepared else None
+    if draw is not None:
+        def watched(generator):
+            capture.used_random = True
+            return draw(generator)
+        torch._gen = watched
+    # And every tensor the step creates (a constant built inside it, a value
+    # computed from parameters under no_grad or from Python state): read as
+    # a graph input, it too would keep its prepare-time value. Scalars that
+    # eager arithmetic wraps (`W * 2.0`) are literals, not such tensors.
+    init = torch.Tensor.__init__ if prepared else None
+    wrap = getattr(torch, "_as_tensor", None) if prepared else None
+    created, literals = [], []
+    if prepared:
+        def made(self, *a, **k):
+            init(self, *a, **k)
+            created.append(self)
+        torch.Tensor.__init__ = made
+        if wrap is not None:
+            def literal(value, *a, **k):
+                result = wrap(value, *a, **k)
+                if not isinstance(value, torch.Tensor):
+                    literals.append(result)
+                return result
+            torch._as_tensor = literal
     try:
         _active = capture if training else None
         with torch.enable_grad() if training else torch.no_grad():
             output = model(*[convert(value) for value in args], **{key: convert(value) for key, value in kwargs.items()})
+        if capture.used_random:
+            raise NotImplementedError(
+                "prepare() cannot record a step that draws random numbers (F.dropout or nn.Dropout in training mode, "
+                "torch.rand/randn/randint...): the prepared session would replay the same draw at every step. "
+                "Use per-call torch.compile, or draw outside the step and pass the tensor as an argument")
         if not isinstance(output, _Tensor):
             raise TypeError("Compiled GPU calls must return one supported graph tensor")
         if training and not capture.did_step:
@@ -596,6 +984,16 @@ def _record(model, training, args, kwargs, prepared=False):
         return capture, output
     finally:
         _active = None
+        if draw is not None:
+            torch._gen = draw
+        if init is not None:
+            torch.Tensor.__init__ = init
+        if wrap is not None:
+            torch._as_tensor = wrap
+        if prepared:
+            # The tensors stay referenced by `capture` until prepare() has
+            # checked its inputs, so their ids stay theirs.
+            capture.created = (created, set(id(t) for t in created) - set(id(t) for t in literals))
         torch._recording(-1)
 
 
@@ -664,25 +1062,54 @@ class Prepared:
         self._constants = []
         feeds = {}
         optimizer_ids = set(id(p) for p in capture.optimizer_params)
-        for position, value in list(enumerate(args)) + list(kwargs.items()):
+        arguments = list(enumerate(args)) + list(kwargs.items())
+        for position, value in arguments:
             if not isinstance(value, torch.Tensor):
                 self._constants.append((position, value))
                 continue
             key = id(value)
             if value.dtype.is_floating_point:
                 entry = capture.inputs.get(key)
-                if entry is None:
-                    continue
+                nodes = [] if entry is None else [("f", entry[1]._value)]
                 if key in optimizer_ids:
                     raise ValueError("A step argument cannot also be an optimizer parameter")
-                name, node = "f%d" % len(feeds), entry[1]._value
             else:
-                entry = capture.targets.get(key)
-                if entry is None:
-                    continue
-                name, node = "t%d" % len(feeds), entry[1]
-            feeds[name] = node
-            self._feeds.append((position, name, tuple(value.shape), value.dtype))
+                # The class targets read from this argument's storage: the
+                # argument itself, or a view of it (`y.view(-1)`, `y.squeeze(1)`).
+                nodes = [("t", entry[1]) for entry in capture.targets.values() if entry[2][0] is value._s]
+            if not nodes:
+                # The step did not read this tensor as a graph input: it
+                # ignored it, or used a copy derived from it (a slice, a
+                # dtype cast), which one recorded program would freeze.
+                raise NotImplementedError(
+                    "prepare(): tensor argument %r is not read by the recorded step as a feed; the step ignores it or derives a copy "
+                    "from it (a slice, a dtype cast, arithmetic), which the session would freeze at its prepare() value. "
+                    "Pass the derived tensor as the argument instead" % (position,))
+            for prefix, node in nodes:
+                name = "%s%d" % (prefix, len(feeds))
+                feeds[name] = node
+                self._feeds.append((position, name, tuple(value.shape), value.dtype))
+        # A tensor over a parameter's storage captured as its own input
+        # (`p.detach().view(...)`) would keep the prepare-time weights.
+        argument_ids = set(id(value) for position, value in arguments)
+        parameter_nodes = dict((id(p._s), capture.inputs[id(p)][1]._value) for p in capture.optimizer_params if id(p) in capture.inputs)
+        for original, symbolic, snapshot in capture.inputs.values():
+            node = parameter_nodes.get(id(original._s))
+            if node is None or id(original) in optimizer_ids or id(original) in argument_ids:
+                continue
+            recorded = capture.graph._nodes[symbolic._value._id]
+            if symbolic._value is not node and not (recorded["op"] == "reshape" and recorded["a"] == node._id):
+                raise NotImplementedError("prepare(): the step reads a parameter through another tensor over its storage in a different "
+                                          "layout; that input would keep the prepare-time weights")
+        created = capture.created[1]
+        for original, symbolic, snapshot in capture.inputs.values():
+            if id(original) in created and id(original._s) not in parameter_nodes and id(original) not in argument_ids:
+                raise NotImplementedError(
+                    "prepare(): the step creates a tensor while it runs and reads it as a graph input (a constant built inside the step, "
+                    "or a value computed from parameters under no_grad or from Python state); the session would keep its prepare() value "
+                    "at every step. Create constants outside the step, pass per-step values as arguments, and compute values from "
+                    "parameters with graph operations")
+        capture.created = ((), set())
         # Outputs: the result read back each step; per parameter its weight,
         # optimizer buffers and gradient resident, carried into their inputs.
         self._leaves = [entry for entry in capture.inputs.values() if id(entry[1]) in capture.grads]

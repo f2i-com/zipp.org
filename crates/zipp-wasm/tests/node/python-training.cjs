@@ -283,5 +283,60 @@ def eager(index):
       console.log(`${backend} ${kase}: prepared session over ${expected.length} batches tracks PyTorch (max abs error ${worstPyTorch.toExponential(2)}) and chained compiled calls (${worstChained.toExponential(2)}); refusals, sync and dispose checked`);
     }
   }
+
+  // ---- a batch buffer refilled in place between steps queued in one call ----
+  // The host takes queued steps after the guest's call returns, so each
+  // step's feed must be posted as a copy: refilling one buffer in place
+  // before the next step() must not change what an earlier step trains on.
+  {
+    const kase = 'gelu_ce_adam';
+    const e = new Engine();
+    e.initPythonProject({main: `case = ${JSON.stringify(kase)}\n` + preparedSource + `
+import json
+compiled = torch.compile(train_step, training=True)
+initial = [p.detach().clone() for p in model.parameters()]
+xbuf, ybuf = batches[0][0].clone(), batches[0][1].clone()
+prepared = None
+def prepare():
+    global prepared
+    for p, value in zip(model.parameters(), initial):
+        p.data = value.clone()
+        p.grad = None
+    optimizer.state.clear()
+    prepared = compiled.prepare(xbuf, ybuf)
+def run(in_place):
+    for x, y in batches[:4]:
+        if in_place:
+            xbuf.copy_(x)
+            ybuf.copy_(y)
+            prepared.step(lambda loss: print(json.dumps(loss.item())), xbuf, ybuf)
+        else:
+            prepared.step(lambda loss: print(json.dumps(loss.item())), x.clone(), y.clone())
+def dispose():
+    prepared.dispose()
+`}, 'main');
+    const runtime = await createRuntime({backend: 'cpu-js', wasmBytes});
+    const adapter = createPythonGPUAdapter(e, runtime, {allowExecute: true});
+    const settle = async () => {
+      for (let i = 0; i < 16; i++) {
+        adapter.drain(); await adapter.idle();
+        if (adapter.pending === 0 && e.pythonCall('__zipp_py_pending_host', []) === 0) return;
+      }
+      throw new Error('host requests did not settle');
+    };
+    const losses = {};
+    for (const inPlace of [false, true]) {
+      e.pythonCall('prepare', []); await settle();
+      e.pythonCall('run', [inPlace]); await settle();
+      losses[inPlace] = e.takeOutput().map(line => JSON.parse(line));
+      e.pythonCall('dispose', []); await settle();
+    }
+    const expected = preparedExpected[kase].slice(0, 4).map(s => s[0]);
+    assert.equal(losses[true].length, 4);
+    losses[false].forEach((loss, i) => assert.ok(Math.abs(loss - expected[i]) < 2e-6, `fresh batch ${i}: ${loss} vs ${expected[i]}`));
+    assert.deepEqual(losses[true], losses[false], 'steps queued in one call must each train on the batch passed to them');
+    adapter.invalidate(); runtime.dispose(); e.dispose();
+    console.log('cpu-js: steps queued in one call over a buffer refilled in place train on their own batches');
+  }
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});
