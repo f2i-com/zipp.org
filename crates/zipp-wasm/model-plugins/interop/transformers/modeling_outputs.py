@@ -34,3 +34,23 @@ class BaseModelOutputWithPast(ModelOutput):
 
 class CausalLMOutputWithPast(ModelOutput):
     pass
+
+
+class BaseModelOutputWithPastAndCrossAttentions(ModelOutput):
+    pass
+
+
+class CausalLMOutputWithCrossAttentions(ModelOutput):
+    pass
+
+
+class QuestionAnsweringModelOutput(ModelOutput):
+    pass
+
+
+class SequenceClassifierOutputWithPast(ModelOutput):
+    pass
+
+
+class TokenClassifierOutput(ModelOutput):
+    pass

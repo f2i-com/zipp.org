@@ -31,9 +31,9 @@ const staged = await exists(modelsURL)
   : [];
 // Files that are known not to load, and exactly why. Asserted rather than
 // skipped: if one starts working, this list is what should change.
-const KNOWN_UNSUPPORTED = {
-  gpt_neo: /flex_attention/,
-};
+// (GPT-Neo was here, for flex_attention: the frontend then resolved every
+// import while compiling, so a guarded optional backend was still looked up.)
+const KNOWN_UNSUPPORTED = {};
 const haveEngine = await exists(engineURL);
 const reason = 'Needs dist/all and a staged model (tools/stage_transformers_model.py)';
 
@@ -102,8 +102,6 @@ async function runOne(zipp, model) {
     const compiled = Date.now();
     const expected = KNOWN_UNSUPPORTED[model];
     if (expected) {
-      // This frontend resolves every import while compiling, so an optional
-      // backend guarded by an availability check is still looked up.
       assert.throws(() => engine.initPythonProject(files, 'main.py', []), error =>
         expected.test(String(error?.message ?? error)),
         `${model} is listed as unsupported for a reason that no longer applies`);

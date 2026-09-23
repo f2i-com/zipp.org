@@ -61,8 +61,8 @@ frontends use the same engine, with native and WebAssembly builds.
   backend, so Qwen3-0.6B holds at 373 MB instead of 2,274. The experimental,
   source-only [local-model plugins](crates/zipp-wasm/model-plugins/README.md)
   run it from the file, in the browser or split across several machines, and
-  Hugging Face's own Qwen3, Qwen2, Llama and Mistral modelling files run on the
-  Python frontend unmodified.
+  Hugging Face's own Qwen3, Qwen2, Llama, Mistral and GPT-Neo modelling files
+  run on the Python frontend unmodified.
 - **Keep the host in control.** Execution budgets and explicit host capabilities
   let embedders decide which resources a program can use.
 - **Explore one engine across languages.** An optional trusted-code build adds

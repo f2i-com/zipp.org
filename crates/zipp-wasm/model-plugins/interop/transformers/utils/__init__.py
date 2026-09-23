@@ -14,3 +14,8 @@ def can_return_tuple(function):
 
 def is_torchdynamo_compiling():
     return False
+
+
+def is_torch_flex_attn_available():
+    """No flex attention here; files that guard on it take the eager path."""
+    return False

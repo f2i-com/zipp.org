@@ -2,7 +2,7 @@
 
 `transformers/` here is **not** the Hugging Face package. It is the handful of
 base classes, decorators and type shims that package's *modelling files* import
-— 21 modules, 341 lines — so that one of those files can be read by ZIPP's
+— 21 modules, 423 lines — so that one of those files can be read by ZIPP's
 Python exactly as published, with nothing rewritten.
 
 It works, and not only for one model. Each file below was copied byte for byte
@@ -15,6 +15,7 @@ what transformers itself produced for the same weights:
 | `modeling_qwen2.py` | 6.0e-08 |
 | `modeling_llama.py` | 1.8e-07 |
 | `modeling_mistral.py` | 1.8e-07 |
+| `modeling_gpt_neo.py` | 6.0e-08 |
 
 The test hashes each file against the digest recorded when the reference was
 made, so "unmodified" is checked rather than asserted, and it runs every model
@@ -40,22 +41,22 @@ runs on ZIPP's own `torch` subset.
 
 So: a numpy implementation is not what stands between ZIPP and a published
 model. What stood there was four tensor operations (`sin`, `cos`, `rsqrt`,
-`repeat_interleave`), `torch.autocast`, relative imports, and these 341 lines.
+`repeat_interleave`), `torch.autocast`, relative imports, and these 423 lines.
 
 ## Where it stops
 
-Older modelling files do not load yet, and the test records that rather than
-skipping it: `gpt_neo` is asserted to fail for the reason below, so if it ever
-starts working, the list is what changes. `modeling_gpt_neo.py` reaches for
-`torch.nn.attention.flex_attention` behind an availability check; CPython never
-runs that branch, but ZIPP resolves every import while compiling, so a guarded
-import of a module that does not exist fails before the guard can decide. That
-is a real difference in import semantics, not a missing shim, and changing it
-would mean deferring import errors to runtime for every program.
+A file that does not load is listed in the test's `KNOWN_UNSUPPORTED` with
+the reason it fails, and asserted to fail that way, so if it starts working the
+list is what changes. The list is empty today. `modeling_gpt_neo.py` was on it:
+it reaches for `torch.nn.attention.flex_attention` behind an availability
+check, and ZIPP used to resolve every import while compiling, so the guarded
+import failed before the guard could decide. Imports now fail when they run,
+as in CPython, and GPT-Neo needed only what an older file asks of its base
+classes (`get_head_mask`, a config's `attribute_map` and `use_return_dict`,
+`gelu_new`, `torch.fx.wrap`).
 
-The four files above are the current generation and share one shape. A file
-that wants a fused kernel, an ONNX export path or a tokenizer will want more
-than this directory has.
+The files above share one shape. A file that wants a fused kernel, an ONNX
+export path or a tokenizer will want more than this directory has.
 
 ## What is deliberately missing
 
