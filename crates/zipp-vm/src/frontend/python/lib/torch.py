@@ -481,7 +481,7 @@ def _check_saved(node):
 
 
 def _grad_fn_name(name):
-    return name if name.endswith("Backward") or name == "CopySlices" else name + "Backward0"
+    return name if name.endswith("Backward") or name == "CopySlices" or name.endswith("Backward1") else name + "Backward0"
 
 
 class _GradFn:
@@ -778,6 +778,9 @@ class Tensor:
     _bwe = None
     _pg = None
     _bps = None
+    # A strided tensor (the sparse layouts are `_SparseTensor`).
+    is_sparse = False
+    is_sparse_csr = False
 
     def __init__(self, storage=None, shape=None, dt=None, requires_grad=False, node=None):
         if dt.__class__ is not dtype:
@@ -1239,9 +1242,13 @@ class Tensor:
         return self._inplace_op(bitwise_right_shift, other)
 
     def add_(self, other, alpha=1):
+        if other.__class__ is _SparseTensor:
+            return _sp._dense_add_(self, other, alpha)
         return self._inplace_op(add, other, alpha)
 
     def sub_(self, other, alpha=1):
+        if other.__class__ is _SparseTensor:
+            return _sp._dense_add_(self, other, -alpha)
         return self._inplace_op(sub, other, alpha)
 
     subtract_ = sub_
@@ -2250,6 +2257,29 @@ _tensor_getitem = Tensor.__getitem__
 _tensor_init = Tensor.__init__
 
 
+# ---- sparse layouts ---------------------------------------------------------------------
+# A sparse COO or CSR tensor is an instance of this subclass, also named
+# `Tensor` (so `type(t)` prints as torch.Tensor and isinstance holds; `type(t)
+# is torch.Tensor` is False), holding index and value tensors instead of a
+# storage. torch.sparse (torch_sparse.py) builds them and installs their
+# methods; the dense ops that accept one check for it (`_sp`). Reading `_s`
+# raises PyTorch's error for an operator without a sparse kernel, so a dense
+# kernel is never handed one by mistake.
+_DenseTensor = Tensor
+
+
+class Tensor(_DenseTensor):
+    @property
+    def _s(self):
+        raise NotImplementedError("Could not run this operator with arguments from the '%s' backend: it needs a strided (dense) tensor. This could be because the operator doesn't exist for this backend. Use Tensor.to_dense() first." % ("SparseCPU" if self.is_sparse else "SparseCsrCPU"))
+
+
+_SparseTensor = Tensor
+Tensor = _DenseTensor
+# torch.sparse, set once it is imported (the end of this module).
+_sp = None
+
+
 class _NdArray:
     """Enough of a numpy view for `.numpy().tobytes()` and `.tolist()`."""
 
@@ -2432,6 +2462,45 @@ def _tensor_body(rows, rank, indent, summarize, fmt):
     return "[" + ("," + "\n" * (rank - 1) + " " * (indent + 1)).join(parts) + "]"
 
 
+def _tensor_str(t, indent):
+    """PyTorch's _tensor_str: the bracketed elements of a non-empty dense
+    tensor, continuation lines indented by `indent`."""
+    rank = _len(t.shape)
+    if t.dtype.is_complex:
+        parts = _k.to_list(_k.as_real(t._s))
+        flat = [(parts[i], parts[i + 1]) for i in _range(0, _len(parts), 2)]
+    else:
+        flat = _k.to_list(t._s)
+    rows = flat[0] if rank == 0 else _nested(flat, _list(t.shape), 0)
+    summarize = _numel(t.shape) > _PRINT.threshold
+    shown = _summarized(rows, rank, _PRINT.edgeitems) if summarize else rows
+    if t.dtype.is_complex:
+        leaves = _leaves(shown, rank, [])
+        rdt = t.dtype.to_real()
+        fmt = _ComplexFormatter(_Formatter([v[0] for v in leaves], rdt), _Formatter([v[1] for v in leaves], rdt))
+    else:
+        fmt = _Formatter(_leaves(shown, rank, []), t.dtype)
+    return _tensor_body(rows, rank, indent, summarize, fmt)
+
+
+def _add_suffixes(text, suffixes, indent, force_newline=False):
+    """PyTorch's _add_suffixes: `, suffix` after the body, each on a new
+    line once the line would pass `linewidth` (the first always, for a
+    sparse tensor)."""
+    out = [text]
+    last = _len(text) - text.rfind("\n") + 1
+    for suffix in suffixes:
+        if force_newline or last + _len(suffix) + 2 > _PRINT.linewidth:
+            out.append(",\n" + " " * indent + suffix)
+            last = indent + _len(suffix)
+            force_newline = False
+        else:
+            out.append(", " + suffix)
+            last += _len(suffix) + 2
+    out.append(")")
+    return "".join(out)
+
+
 def _repr(t):
     """PyTorch's tensor repr: layout and padding from torch/_tensor_str.py,
     summarised with '...' beyond `threshold` elements (set_printoptions)."""
@@ -2450,36 +2519,12 @@ def _repr(t):
     else:
         if not default:
             suffixes.append("dtype=" + repr(t.dtype))
-        if t.dtype.is_complex:
-            parts = _k.to_list(_k.as_real(t._s))
-            flat = [(parts[i], parts[i + 1]) for i in _range(0, _len(parts), 2)]
-        else:
-            flat = _k.to_list(t._s)
-        rows = flat[0] if rank == 0 else _nested(flat, _list(t.shape), 0)
-        summarize = n > _PRINT.threshold
-        shown = _summarized(rows, rank, _PRINT.edgeitems) if summarize else rows
-        if t.dtype.is_complex:
-            leaves = _leaves(shown, rank, [])
-            rdt = t.dtype.to_real()
-            fmt = _ComplexFormatter(_Formatter([v[0] for v in leaves], rdt), _Formatter([v[1] for v in leaves], rdt))
-        else:
-            fmt = _Formatter(_leaves(shown, rank, []), t.dtype)
-        body = _tensor_body(rows, rank, indent, summarize, fmt)
+        body = _tensor_str(t, indent)
     if t._node is not None:
         suffixes.append("grad_fn=<%s>" % _grad_fn_name(t._node.name))
     elif t.requires_grad:
         suffixes.append("requires_grad=True")
-    out = [prefix + body]
-    last = _len(out[0]) - out[0].rfind("\n") + 1
-    for suffix in suffixes:
-        if last + _len(suffix) + 2 > _PRINT.linewidth:
-            out.append(",\n" + " " * indent + suffix)
-            last = indent + _len(suffix)
-        else:
-            out.append(", " + suffix)
-            last += _len(suffix) + 2
-    out.append(")")
-    return "".join(out)
+    return _add_suffixes(prefix + body, suffixes, indent)
 
 
 # ---- creation ---------------------------------------------------------------------------
@@ -2717,6 +2762,8 @@ def empty(*size, dtype=None, layout=None, device=None, requires_grad=False, pin_
 
 def zeros_like(input, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None):
     _check_cpu_device(device)
+    if input.__class__ is _SparseTensor:
+        return _sp._zeros_like(input, dtype, requires_grad)
     return zeros(*input.shape, dtype=dtype or input.dtype, requires_grad=requires_grad)
 
 
@@ -2869,11 +2916,35 @@ class iinfo:
 
 
 class _Layout:
+    def __init__(self, name="strided"):
+        self._name = name
+
     def __repr__(self):
-        return "torch.strided"
+        return "torch." + self._name
+
+    # A layout is a singleton: copies are the layout itself.
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
 
 
+def _get_layout(name):
+    """How a checkpoint names a layout (torch.serialization._get_layout)."""
+    for layout in (strided, sparse_coo, sparse_csr, sparse_csc, sparse_bsr, sparse_bsc):
+        if repr(layout) == name:
+            return layout
+    raise RuntimeError("unknown layout " + str(name))
+
+
+_get_layout.__module__ = "torch.serialization"
 strided = _Layout()
+sparse_coo = _Layout("sparse_coo")
+sparse_csr = _Layout("sparse_csr")
+sparse_csc = _Layout("sparse_csc")
+sparse_bsr = _Layout("sparse_bsr")
+sparse_bsc = _Layout("sparse_bsc")
 
 
 class memory_format:
@@ -3106,6 +3177,8 @@ def _binary_nograd(op, a, b):
                 dt = _default_dtype if cb is _float else (int64 if dt is _bool_dtype else dt)
             storage, shape = _k.binary_scalar(op, a._s, a.shape, b, dt.name, dt.name, False)
             return _new3(storage, shape, _DTYPES[_k.dtype(storage)])
+    if a.__class__ is _SparseTensor or b.__class__ is _SparseTensor:
+        return _sp._binary(op, a, b)
     try:
         ta, tb, dt = _operands(a, b)
         ta.shape, tb.shape
@@ -3116,6 +3189,8 @@ def _binary_nograd(op, a, b):
 
 
 def _unary_nograd(op, a, p1=None, p2=None):
+    if a.__class__ is _SparseTensor:
+        return _sp._unary_nograd(op, a, p1, p2)
     storage = _k.unary(op, a._s, p1, p2)
     try:
         shape = a.shape
@@ -3165,6 +3240,8 @@ def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=Fals
             return _new3(storage, shape, dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)])
         ta, tb = _scalar_operand(a, sdt), b
     else:
+        if ca is _SparseTensor or cb is _SparseTensor:
+            return _sp._binary(op, a, b)
         try:
             ta, tb, dt = _operands(a, b, opmath)
             # (an uninitialized parameter's shape raises here, not below)
@@ -3472,6 +3549,8 @@ _BOOL_UNARY = frozenset(["isfinite", "isnan", "not", "isinf", "isposinf", "isneg
 
 def _unary(op, a, name, backward, p1=None, p2=None, saves="x"):
     """An elementwise unary op; `saves` as in `_binary` ("x" input, "o" output)."""
+    if a.__class__ is _SparseTensor:
+        return _sp._unary(op, a, name, backward, p1, p2, saves)
     dt = a.dtype
     if dt.is_floating_point:
         storage = _k.unary(op, a._s, p1, p2)
@@ -4075,6 +4154,8 @@ def where(condition, input=None, other=None):
 
 
 def _cast(a, dt):
+    if a.__class__ is _SparseTensor:
+        return _sp._to(a, dt)
     if a.dtype.is_complex and not dt.is_complex and dt is not _bool_dtype:
         _warn_complex_cast()
     out = Tensor(_k.astype(a._s, dt.name), a.shape, dt)
@@ -4191,6 +4272,8 @@ def sum(input, dim=None, keepdim=False, dtype=None):
     a = input
     if _graph_recording and hasattr(a, "_zipp_graph"):
         return a.sum(dim, keepdim, dtype)
+    if a.__class__ is _SparseTensor:
+        return _sp._tensor_sum(a, dim, keepdim, dtype)
     if dtype is not None:
         a = a.to(dtype)
     elif not a.dtype._inexact and a.dtype is not int64:
@@ -5019,6 +5102,8 @@ def transpose(input, dim0, dim1):
     a = input
     if _graph_recording and getattr(a, "_zipp_graph", False):
         return a.transpose(dim0, dim1)
+    if a.__class__ is _SparseTensor:
+        return _sp._transpose(a, dim0, dim1)
     rank = _len(a.shape)
     if rank == 0:
         _norm_dim(dim0, 1)
@@ -5038,6 +5123,8 @@ def t(input):
     a = input
     if _graph_recording and getattr(a, "_zipp_graph", False):
         return a.t()
+    if a.__class__ is _SparseTensor:
+        return _sp._t(a)
     if _len(a.shape) > 2:
         raise RuntimeError("t() expects a tensor with <= 2 dimensions, but self is %dD" % _len(a.shape))
     return a if _len(a.shape) < 2 else transpose(a, 0, 1)
@@ -5159,6 +5246,8 @@ def cat(tensors, dim=0):
     tensors = [_as_tensor(t) for t in tensors]
     if not tensors:
         raise RuntimeError("torch.cat(): expected a non-empty list of Tensors")
+    if tensors[0].__class__ is _SparseTensor:
+        return _sp._cat(tensors, dim)
     # PyTorch skips legacy empty 1-d tensors when the others differ in rank.
     try:
         ranks = set(_len(t.shape) for t in tensors)
@@ -5196,6 +5285,8 @@ def stack(tensors, dim=0):
     tensors = [t if type(t) is Tensor else _as_tensor(t) for t in tensors]
     if not tensors:
         raise RuntimeError("stack expects a non-empty TensorList")
+    if tensors[0].__class__ is _SparseTensor:
+        return _sp._stack(tensors, dim)
     first = _tuple(tensors[0].shape)
     for i, t_ in enumerate(tensors):
         if not _shape_eq(t_.shape, first):
@@ -5822,6 +5913,8 @@ def _setitem_general(dst, a, key, value):
 
 def index_select(input, dim, index):
     a = input
+    if a.__class__ is _SparseTensor:
+        return _sp._index_select(a, dim, index)
     d = _norm_dim(dim, _b.max(_len(a.shape), 1))
     if not a.shape:
         return a.clone()
@@ -6066,8 +6159,18 @@ def matmul(input, other):
             return a @ b
         if getattr(b, "_zipp_graph", False):
             return b.__rmatmul__(a)
-    ta = a if type(a) is Tensor else _as_tensor(a)
-    tb = b if type(b) is Tensor else _as_tensor(b)
+    if type(a) is Tensor:
+        ta = a
+    elif a.__class__ is _SparseTensor:
+        return _sp._matmul(a, b)
+    else:
+        ta = _as_tensor(a)
+    if type(b) is Tensor:
+        tb = b
+    elif b.__class__ is _SparseTensor:
+        return _sp._matmul(ta, b)
+    else:
+        tb = _as_tensor(b)
     if ta.dtype is not tb.dtype and ta.dtype.is_complex is not tb.dtype.is_complex:
         # PyTorch does not promote a real operand of a complex product.
         raise RuntimeError("expected m1 and m2 to have the same dtype, but got: %s != %s" % (_CPP_NAME.get(ta.dtype.name, ta.dtype.name), _CPP_NAME.get(tb.dtype.name, tb.dtype.name)))
@@ -6216,6 +6319,8 @@ def _linear_mm(x, w):
 def mm(input, mat2):
     if _autocast_cpu is not None:
         return _autocast_run(mm, "lower", (input, mat2))
+    if input.__class__ is _SparseTensor or mat2.__class__ is _SparseTensor:
+        return _sp._mm(input, mat2)
     if _len(input.shape) != 2 or _len(mat2.shape) != 2:
         raise RuntimeError("self must be a matrix" if _len(input.shape) != 2 else "mat2 must be a matrix")
     return matmul(input, mat2)
@@ -6499,6 +6604,8 @@ def softmax(input, dim=-1, dtype=None):
     a = input
     if _graph_recording and getattr(a, "_zipp_graph", False):
         return a.softmax(dim, dtype)
+    if a.__class__ is _SparseTensor:
+        raise _sp._no_kernel("aten::_softmax", a)
     if dtype is not None:
         a = a.to(dtype)
     d = _norm_dim(dim, _b.max(_len(a.shape), 1))
@@ -6518,6 +6625,8 @@ def log_softmax(input, dim=-1, dtype=None):
     a = input
     if _graph_recording and getattr(a, "_zipp_graph", False):
         return a.log_softmax(dim, dtype)
+    if a.__class__ is _SparseTensor:
+        raise _sp._no_kernel("aten::_log_softmax", a)
     if dtype is not None:
         a = a.to(dtype)
     d = _norm_dim(dim, _b.max(_len(a.shape), 1))
@@ -6599,6 +6708,8 @@ def _run_backward(tensors, grad_tensors, create_graph=False, inputs=None):
 
 
 def _accumulate_grad(t_, g, create_graph):
+    if g.__class__ is _SparseTensor or t_.grad.__class__ is _SparseTensor:
+        return _sp._accumulate_grad(t_, g)
     if g.dtype is not t_.dtype and t_.dtype._inexact:
         g = _grad_as(g, t_.dtype)
     if t_.grad is None:
@@ -6723,7 +6834,7 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
             g = grads[i]
             i += 1
             prior = r._pg
-            r._pg = g if prior is None else add(prior, g)
+            r._pg = g if prior is None else (add(prior, g) if prior.__class__ is not _SparseTensor else _sp._buffer_add(prior, g))
         captured = {}
         wanted = None if inputs is None else set(id(t_) for t_ in inputs)
         # The grad mode for the backward functions: recording only for
@@ -6789,7 +6900,7 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
                     if pg.dtype is not pdt and pg.dtype != pdt and pdt._inexact:
                         pg = _grad_as(pg, pdt)
                     prior = p._pg
-                    p._pg = pg if prior is None else add(prior, pg)
+                    p._pg = pg if prior is None else (add(prior, pg) if prior.__class__ is not _SparseTensor else _sp._buffer_add(prior, pg))
         finally:
             _grad_enabled = prev_mode
         return captured
@@ -6845,7 +6956,7 @@ def _backward_dict(roots, grads, accumulate=True, inputs=None, create_graph=Fals
                 i -= 1
     pending = {}
     for r, g in zip(roots, grads):
-        pending[id(r)] = g if id(r) not in pending else add(pending[id(r)], g)
+        pending[id(r)] = g if id(r) not in pending else _sp._buffer_add(pending[id(r)], g)
     captured = {}
     wanted = None if inputs is None else set(id(t_) for t_ in inputs)
     # The grad mode for the backward functions: recording only for
@@ -6895,7 +7006,7 @@ def _backward_dict(roots, grads, accumulate=True, inputs=None, create_graph=Fals
                     pg = _grad_as(pg, p.dtype)
                 pk = id(p)
                 prior = pending.get(pk)
-                pending[pk] = pg if prior is None else add(prior, pg)
+                pending[pk] = pg if prior is None else _sp._buffer_add(prior, pg)
     finally:
         _grad_enabled = prev_mode
     return captured
@@ -7676,6 +7787,12 @@ def save(obj, f, pickle_protocol=2):
         return None
 
     def reduce_tensor(t):
+        if t.__class__ is _SparseTensor:
+            # As PyTorch pickles one: torch._utils._rebuild_sparse_tensor(
+            # layout, (indices, values, size, is_coalesced)) for COO and
+            # (crow_indices, col_indices, values, size) for CSR.
+            import torch._utils
+            return (torch._utils._rebuild_sparse_tensor, (t.layout, _sp._reduce_args(t)))
         if type(t) is not Tensor and type(t).__name__ == "Parameter":
             # As PyTorch pickles an nn.Parameter, so it loads back as one.
             import torch._utils
@@ -7684,7 +7801,7 @@ def save(obj, f, pickle_protocol=2):
         st = _STORAGE_TYPES[t.dtype.name](t._s)
         return (_rebuild_tensor_v2, (st, 0, _tuple(t.shape), t.stride(), _bool(t.requires_grad), _OrderedDict()))
 
-    data = pickle.dumps(obj, protocol=2, persistent_id=persistent_id, reducers={Tensor: reduce_tensor})
+    data = pickle.dumps(obj, protocol=2, persistent_id=persistent_id, reducers={Tensor: reduce_tensor, _Layout: lambda layout: (_get_layout, (repr(layout),))})
     with zipfile.ZipFile(f, "w") as z:
         z.writestr(name + "/data.pkl", data)
         for i, blob in enumerate(records):
@@ -7793,6 +7910,18 @@ import torch.nn.functional as _F
 import torch.special as special
 import torch.linalg as linalg
 import torch.amp as amp
+# torch.sparse builds the sparse layouts; the dense ops above that accept a
+# sparse operand hand it over through `_sp`.
+import torch.sparse as sparse
+_sp = sparse
+sparse_coo_tensor = sparse._sparse_coo_tensor
+sparse_csr_tensor = sparse._sparse_csr_tensor
+sparse_csc_tensor = sparse._sparse_csc_tensor
+sparse_bsr_tensor = sparse._sparse_bsr_tensor
+sparse_bsc_tensor = sparse._sparse_bsc_tensor
+sparse_compressed_tensor = sparse._sparse_compressed_tensor
+smm = sparse._smm
+hspmm = sparse._hspmm
 
 
 class _LazySubmodule:

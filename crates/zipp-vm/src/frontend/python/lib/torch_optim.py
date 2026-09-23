@@ -343,10 +343,17 @@ class Optimizer:
         raise NotImplementedError
 
     def _params(self):
+        refuse = self._sparse_error
         for g in self.param_groups:
             for p in g["params"]:
                 if p.grad is not None:
+                    if refuse is not None and p.grad.is_sparse:
+                        raise RuntimeError(refuse)
                     yield g, p
+
+    # The error a step raises for a sparse gradient (None: this optimizer
+    # takes them, as SGD, Adagrad and SparseAdam do).
+    _sparse_error = None
 
     def _eager(self, name=None):
         """Refuse parameters a prepared GPU session holds; for optimizers the
@@ -398,6 +405,7 @@ class SGD(Optimizer):
 
 class Adam(Optimizer):
     _decoupled = False
+    _sparse_error = "Adam does not support sparse gradients, please consider SparseAdam instead"
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, amsgrad=False, *, foreach=None,
                  maximize=False, capturable=False, differentiable=False, fused=None, decoupled_weight_decay=None):
@@ -471,6 +479,8 @@ class AdamW(Adam):
 
 
 class RMSprop(Optimizer):
+    _sparse_error = "RMSprop does not support sparse gradients"
+
     def __init__(self, params, lr=1e-2, alpha=0.99, eps=1e-8, weight_decay=0, momentum=0, centered=False, capturable=False,
                  foreach=None, maximize=False, differentiable=False):
         _check_non_negative("lr", _value(lr), "learning rate")
@@ -564,15 +574,103 @@ class Adagrad(Optimizer):
                 grad = -grad
             value = p.detach()
             if g["weight_decay"]:
+                if grad.is_sparse:
+                    raise RuntimeError("weight_decay option is not compatible with sparse gradients")
                 grad = grad + value * g["weight_decay"]
             clr = g["lr"] / (1 + (st["step"] - 1) * g["lr_decay"])
+            if grad.is_sparse:
+                # Only the rows the gradient has are updated (coalesced first:
+                # the update is not linear).
+                grad = grad.coalesce()
+                indices, values, size = grad._indices(), grad._values(), grad.size()
+                st["sum"].add_(torch.sparse_coo_tensor(indices, values.pow(2), size))
+                std_values = st["sum"].sparse_mask(grad)._values().sqrt_().add_(g["eps"])
+                p.add_(torch.sparse_coo_tensor(indices, values / std_values, size), alpha=-clr)
+                continue
             st["sum"] = st["sum"] + grad * grad
             std = torch.sqrt(st["sum"]) + g["eps"]
             p.data = value - grad / std * clr
         return loss
 
 
+class SparseAdam(Optimizer):
+    """PyTorch's SparseAdam: Adam's update applied only to the entries a
+    sparse gradient (nn.Embedding(sparse=True)) has; the moments of the
+    other entries are left as they are."""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, maximize=False):
+        if isinstance(lr, torch.Tensor) and lr.numel() != 1:
+            raise ValueError("Tensor lr must be 1-element")
+        if not 0.0 < lr:
+            raise ValueError("Invalid learning rate: %s" % (lr,))
+        if not 0.0 < eps:
+            raise ValueError("Invalid epsilon value: %s" % (eps,))
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: %s" % (betas[0],))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: %s" % (betas[1],))
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, maximize=maximize))
+        sparse_params, complex_params = [], []
+        for index, param_group in enumerate(self.param_groups):
+            for d_index, d_param in enumerate(param_group["params"]):
+                if d_param.is_sparse:
+                    sparse_params.append([index, d_index])
+                if d_param.is_complex():
+                    complex_params.append([index, d_index])
+        if sparse_params:
+            raise ValueError("Sparse params at indices %s: SparseAdam requires dense parameter tensors" % (sparse_params,))
+        if complex_params:
+            raise ValueError("Complex params at indices %s: SparseAdam does not support complex parameters" % (complex_params,))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        self._eager("SparseAdam")
+        loss = _closure_loss(closure)
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            eps, lr, maximize = group["eps"], _value(group["lr"]), group.get("maximize", False)
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if not p.grad.is_sparse:
+                    raise RuntimeError("SparseAdam does not support dense gradients, please consider Adam instead")
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+                state["step"] += 1
+                grad = p.grad if not maximize else -p.grad
+                grad = grad.coalesce()
+                grad_indices = grad._indices()
+                grad_values = grad._values()
+                if grad_values.numel() == 0:
+                    continue
+                size = grad.size()
+                exp_avg, exp_avg_sq, step = state["exp_avg"], state["exp_avg_sq"], state["step"]
+
+                def make_sparse(values):
+                    return torch.sparse_coo_tensor(grad_indices, values, size)
+                # old <- b * old + (1 - b) * new  <==>  old += (1 - b) * (new - old)
+                old_exp_avg_values = exp_avg.sparse_mask(grad)._values()
+                exp_avg_update_values = grad_values.sub(old_exp_avg_values).mul_(1 - beta1)
+                exp_avg.add_(make_sparse(exp_avg_update_values))
+                old_exp_avg_sq_values = exp_avg_sq.sparse_mask(grad)._values()
+                exp_avg_sq_update_values = grad_values.pow(2).sub_(old_exp_avg_sq_values).mul_(1 - beta2)
+                exp_avg_sq.add_(make_sparse(exp_avg_sq_update_values))
+                numer = exp_avg_update_values.add_(old_exp_avg_values)
+                exp_avg_sq_update_values.add_(old_exp_avg_sq_values)
+                denom = exp_avg_sq_update_values.sqrt_().add_(eps)
+                bias_correction1 = 1 - beta1 ** step
+                bias_correction2 = 1 - beta2 ** step
+                step_size = lr * math.sqrt(bias_correction2) / bias_correction1
+                p.add_(make_sparse(-step_size * numer.div_(denom)))
+        return loss
+
+
 class Adamax(Optimizer):
+    _sparse_error = "Adamax does not support sparse gradients"
+
     def __init__(self, params, lr=2e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, foreach=None, *, maximize=False,
                  differentiable=False, capturable=False):
         _check_non_negative("lr", _value(lr), "learning rate")
@@ -609,6 +707,8 @@ class Adamax(Optimizer):
 
 
 class NAdam(Optimizer):
+    _sparse_error = "NAdam does not support sparse gradients"
+
     def __init__(self, params, lr=2e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, momentum_decay=4e-3,
                  decoupled_weight_decay=False, *, foreach=None, maximize=False, capturable=False, differentiable=False):
         _check_non_negative("lr", _value(lr), "learning rate")
@@ -664,6 +764,8 @@ class NAdam(Optimizer):
 
 
 class RAdam(Optimizer):
+    _sparse_error = "RAdam does not support sparse gradients"
+
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, decoupled_weight_decay=False, *,
                  foreach=None, maximize=False, capturable=False, differentiable=False):
         _check_non_negative("lr", _value(lr), "learning rate")
@@ -715,6 +817,8 @@ class RAdam(Optimizer):
 
 
 class Adadelta(Optimizer):
+    _sparse_error = "Adadelta does not support sparse gradients"
+
     def __init__(self, params, lr=1.0, rho=0.9, eps=1e-6, weight_decay=0, foreach=None, *, capturable=False, maximize=False,
                  differentiable=False):
         _check_non_negative("lr", _value(lr), "learning rate")
@@ -753,6 +857,8 @@ class Adadelta(Optimizer):
 
 
 class ASGD(Optimizer):
+    _sparse_error = "ASGD does not support sparse gradients"
+
     def __init__(self, params, lr=1e-2, lambd=1e-4, alpha=0.75, t0=1e6, weight_decay=0, foreach=None, maximize=False,
                  differentiable=False, capturable=False):
         _check_non_negative("lr", _value(lr), "learning rate")
@@ -799,6 +905,8 @@ class ASGD(Optimizer):
 
 
 class Rprop(Optimizer):
+    _sparse_error = "Rprop does not support sparse gradients"
+
     def __init__(self, params, lr=1e-2, etas=(0.5, 1.2), step_sizes=(1e-6, 50), *, capturable=False, foreach=None,
                  maximize=False, differentiable=False):
         _check_non_negative("lr", _value(lr), "learning rate")

@@ -185,6 +185,9 @@ def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, sca
             padding_idx += weight.shape[0]
     if max_norm is not None:
         _embedding_renorm(weight, idx, max_norm, norm_type)
+    if sparse and torch.is_grad_enabled() and weight.requires_grad:
+        # A sparse COO gradient for weight: one row per lookup.
+        return torch.sparse._embedding(weight, idx, padding_idx, scale_grad_by_freq)
     flat = idx.reshape(-1)
     rows = torch.index_select(weight, 0, flat)
     if padding_idx is not None and torch.is_grad_enabled() and weight.requires_grad:
@@ -232,7 +235,10 @@ def embedding_bag(input, weight, offsets=None, max_norm=None, norm_type=2, scale
     _check_indices(flat, weight.shape[0])
     if max_norm is not None:
         _embedding_renorm(weight, flat, max_norm, norm_type)
-    rows = torch.index_select(weight, 0, flat)
+    if sparse and torch.is_grad_enabled() and weight.requires_grad:
+        rows = torch.sparse._embedding(weight, flat, padding_idx)
+    else:
+        rows = torch.index_select(weight, 0, flat)
     if psw is not None:
         rows = rows * psw.unsqueeze(1)
     keep_all = padding_idx is None

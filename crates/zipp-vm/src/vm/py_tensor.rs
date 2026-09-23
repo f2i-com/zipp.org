@@ -42,6 +42,7 @@
 //! and polls the host abort flag between blocks of work.
 mod fft;
 mod linalg;
+mod sparse;
 
 use super::helpers_num2::{f16_bits_to_f64, f64_to_f16_bits, math_unary};
 use super::helpers_numeric::to_uint_modular;
@@ -76,6 +77,12 @@ const OP_MAX_POOL2D: u32 = 14;
 const OP_MAX_POOL2D_BACKWARD: u32 = 15;
 const OP_FFT: u32 = 16;
 const OP_LINALG: u32 = 17;
+const OP_SPMM: u32 = 18;
+const OP_SP_COALESCE: u32 = 19;
+const OP_SP_KEYS: u32 = 20;
+const OP_SP_SCATTER: u32 = 21;
+const OP_SP_MERGE: u32 = 22;
+const OP_INDEX_SELECT: u32 = 23;
 
 // TypedArray kinds (`native::TA_KINDS`) a tensor storage can be.
 const KIND_U8: u8 = 1;
@@ -437,6 +444,12 @@ impl Vm<'_> {
             OP_WHERE => Value::bool(self.pt_where(a).is_some()),
             OP_FFT => Value::bool(self.pt_fft(a).is_some()),
             OP_LINALG => Value::bool(self.pt_linalg(a).is_some()),
+            OP_SPMM => Value::bool(self.pt_spmm(a).is_some()),
+            OP_SP_COALESCE => Value::bool(self.pt_sp_coalesce(a).is_some()),
+            OP_SP_KEYS => Value::bool(self.pt_sp_keys(a).is_some()),
+            OP_SP_SCATTER => Value::bool(self.pt_sp_scatter(a).is_some()),
+            OP_SP_MERGE => Value::bool(self.pt_sp_merge(a).is_some()),
+            OP_INDEX_SELECT => Value::bool(self.pt_index_select(a).is_some()),
             _ => Value::bool(false),
         })
     }
@@ -1345,6 +1358,241 @@ impl Vm<'_> {
         Some(())
     }
 
+    /// `(R, C, V, D, O, nnz, m, k, n)`: tensor.js's `spSpmm` (see
+    /// `sparse::spmm`), the [m, n] product of a sparse matrix (row, column
+    /// and value of each of nnz nonzeros) and the dense [k, n] D, each result
+    /// summed in an f64 and rounded once on store into O. Declines a uint8
+    /// or bool output (tensor.js stores those itself).
+    fn pt_spmm(&mut self, a: &[Value]) -> Option<()> {
+        let (vr, vc, vv, vd, vo) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?, self.pt_view(arg(a, 3))?, self.pt_view(arg(a, 4))?);
+        if vr.kind != KIND_F64 || vc.kind != KIND_F64 || vo.kind == KIND_U8 || vo.kind == KIND_U16 {
+            return None;
+        }
+        if [vr.buffer, vc.buffer, vv.buffer, vd.buffer].contains(&vo.buffer) {
+            return None;
+        }
+        let (nnz, m, k, n) = (int_arg(a, 5)?, int_arg(a, 6)?, int_arg(a, 7)?, int_arg(a, 8)?);
+        let (kn, mn) = (k.checked_mul(n)?, m.checked_mul(n)?);
+        if vr.len != nnz || vc.len != nnz || vv.len != nnz || vd.len != kn || vo.len != mn || n == 0 {
+            return None;
+        }
+        let cost = self.pt_admit(nnz.checked_mul(n)?.checked_add(mn)?, nnz.saturating_mul(3).saturating_add(kn).saturating_add(mn))?;
+        let rows = self.pt_read_all(vr)?;
+        let cols = self.pt_read_all(vc)?;
+        let vals = self.pt_read_all(vv)?;
+        let dense = self.pt_read_all(vd)?;
+        let mut acc = zeroed(mn)?;
+        sparse::spmm(&rows, &cols, &vals, &dense, &mut acc, m, k, n, POLL_UNITS, || self.native_kernel_interrupted())?;
+        self.pt_write(vo, 0, &acc)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(K, V, F, O, G, n, block)`: tensor.js's `spCoalesce` (see
+    /// `sparse::coalesce`) over n nonzeros' keys K and values V: the kept
+    /// entries' first positions into F, their summed values into O (both
+    /// sized for n), their count into G[0]. Declines the uint8/bool and
+    /// bfloat16 storages, whose sums tensor.js makes itself.
+    fn pt_sp_coalesce(&mut self, a: &[Value]) -> Option<()> {
+        let (vk, vv, vf, vo, vg) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?, self.pt_view(arg(a, 3))?, self.pt_view(arg(a, 4))?);
+        if vk.kind != KIND_F64 || vf.kind != KIND_F64 || vg.kind != KIND_F64 || vv.kind != vo.kind || matches!(vo.kind, KIND_U8 | KIND_U16) {
+            return None;
+        }
+        let outs = [vf.buffer, vo.buffer, vg.buffer];
+        if outs.contains(&vk.buffer) || outs.contains(&vv.buffer) || vf.buffer == vo.buffer || vf.buffer == vg.buffer || vo.buffer == vg.buffer {
+            return None;
+        }
+        let (n, block) = (int_arg(a, 5)?, int_arg(a, 6)?);
+        let nb = n.checked_mul(block)?;
+        if vk.len != n || vv.len != nb || vf.len != n || vo.len != nb || vg.len != 1 || block == 0 {
+            return None;
+        }
+        let log = (usize::BITS - n.leading_zeros()) as usize;
+        let cost = self.pt_admit(n.checked_mul(log.max(1))?.checked_add(nb)?, n.saturating_mul(3).saturating_add(nb.saturating_mul(2)))?;
+        let keys = self.pt_read_all(vk)?;
+        let vals = self.pt_read_all(vv)?;
+        let mut first = zeroed(n)?;
+        let mut out = zeroed(nb)?;
+        let kind = vo.kind;
+        let groups = sparse::coalesce(&keys, &vals, block, |x| stored(kind, x), &mut first, &mut out, POLL_UNITS, || self.native_kernel_interrupted())?;
+        self.pt_write(vf, 0, &first[..groups])?;
+        self.pt_write(vo, 0, &out[..groups * block])?;
+        self.pt_write(vg, 0, &[groups as f64])?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(A, I, O, outer, size, inner)`: tensor.js's `indexSelect`, a copy:
+    /// for each of `outer` slices of A ([outer, size, inner]) the `inner`
+    /// elements at each index of I (a negative one counting from the end)
+    /// in turn. The elements move as they are (A and O share an element
+    /// type); an index out of range declines, for the JavaScript loop to
+    /// report.
+    fn pt_index_select(&mut self, a: &[Value]) -> Option<()> {
+        let (va, vi, vo) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?);
+        if vi.kind != KIND_F64 || va.kind != vo.kind || vo.buffer == va.buffer || vo.buffer == vi.buffer {
+            return None;
+        }
+        let (outer, size, inner) = (int_arg(a, 3)?, int_arg(a, 4)?, int_arg(a, 5)?);
+        let n = vi.len;
+        if va.len != outer.checked_mul(size)?.checked_mul(inner)? || vo.len != outer.checked_mul(n)?.checked_mul(inner)? {
+            return None;
+        }
+        let cost = self.pt_admit(vo.len.checked_add(n)?, n.saturating_add(vo.len))?;
+        let idx = self.pt_read_all(vi)?;
+        let mut at = Vec::new();
+        at.try_reserve_exact(n).ok()?;
+        for &j in &idx {
+            let j = if j < 0.0 { j + size as f64 } else { j };
+            if !(j >= 0.0) || j.fract() != 0.0 || j >= size as f64 {
+                return None;
+            }
+            at.push(j as usize);
+        }
+        let es = va.size();
+        let (a_hi, o_hi) = (va.offset.checked_add(va.len.checked_mul(es)?)?, vo.offset.checked_add(vo.len.checked_mul(es)?)?);
+        // The selected rows gathered under the source's borrow (only the
+        // output's bytes are held), then stored in one copy.
+        let row = inner * es;
+        let mut gathered = Vec::new();
+        gathered.try_reserve_exact(o_hi - vo.offset).ok()?;
+        match self.heap.get(va.buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached && a_hi <= data.len() => {
+                let src = &data[va.offset..a_hi];
+                for x in 0..outer {
+                    for &j in &at {
+                        let from = (x * size + j) * row;
+                        gathered.extend_from_slice(&src[from..from + row]);
+                    }
+                }
+            }
+            _ => return None,
+        }
+        let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(vo.buffer) else {
+            return None;
+        };
+        if *detached || o_hi > data.len() || gathered.len() != o_hi - vo.offset {
+            return None;
+        }
+        data[vo.offset..o_hi].copy_from_slice(&gathered);
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(I, O, nnz, sizes)`: tensor.js's `spKeys` (see `sparse::keys`),
+    /// the linear keys of nnz nonzeros' indices I into the zeroed O.
+    fn pt_sp_keys(&mut self, a: &[Value]) -> Option<()> {
+        let (vi, vo) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?);
+        if vi.kind != KIND_F64 || vo.kind != KIND_F64 || vi.buffer == vo.buffer {
+            return None;
+        }
+        let nnz = int_arg(a, 2)?;
+        let sizes = self.pt_ints(arg(a, 3))?;
+        let n_idx = sizes.len().checked_mul(nnz)?;
+        if vi.len != n_idx || vo.len != nnz {
+            return None;
+        }
+        let cost = self.pt_admit(n_idx.checked_add(nnz)?, n_idx.saturating_add(nnz))?;
+        let indices = self.pt_read_all(vi)?;
+        let mut out = zeroed(nnz)?;
+        sparse::keys(&indices, &sizes, nnz, &mut out)?;
+        self.pt_write(vo, 0, &out)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(O, K, V, n, block)`: tensor.js's `spScatterAdd` for float32 and
+    /// float64 storages: each nonzero's block of V added into O at key *
+    /// block, in order, each sum rounded to O's element type. Only the
+    /// blocks the keys name are read and written.
+    fn pt_sp_scatter(&mut self, a: &[Value]) -> Option<()> {
+        let (vo, vk, vv) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?);
+        if vk.kind != KIND_F64 || !matches!(vo.kind, KIND_F32 | KIND_F64) || vv.kind != vo.kind || vo.buffer == vk.buffer || vo.buffer == vv.buffer {
+            return None;
+        }
+        let (n, block) = (int_arg(a, 3)?, int_arg(a, 4)?);
+        let nb = n.checked_mul(block)?;
+        if vk.len != n || vv.len != nb || block == 0 {
+            return None;
+        }
+        let cost = self.pt_admit(nb, n.saturating_add(nb))?;
+        let keys = self.pt_read_all(vk)?;
+        let vals = self.pt_read_all(vv)?;
+        // Every block first: an index out of range leaves O for the
+        // JavaScript loop to report.
+        let mut bases = Vec::new();
+        bases.try_reserve_exact(n).ok()?;
+        for &k in &keys {
+            let base = sparse_index(k, block, vo.len)?;
+            bases.push(base);
+        }
+        let size = vo.size();
+        let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(vo.buffer) else {
+            return None;
+        };
+        let hi = vo.offset.checked_add(vo.len.checked_mul(size)?)?;
+        if *detached || hi > data.len() {
+            return None;
+        }
+        let bytes = &mut data[vo.offset..hi];
+        for (e, &base) in bases.iter().enumerate() {
+            let src = &vals[e * block..(e + 1) * block];
+            if vo.kind == KIND_F32 {
+                for (b, &x) in src.iter().enumerate() {
+                    let at = (base + b) * 4;
+                    let mut w = [0u8; 4];
+                    w.copy_from_slice(&bytes[at..at + 4]);
+                    let sum = (f32::from_le_bytes(w) as f64 + x) as f32;
+                    bytes[at..at + 4].copy_from_slice(&sum.to_le_bytes());
+                }
+            } else {
+                for (b, &x) in src.iter().enumerate() {
+                    let at = (base + b) * 8;
+                    let mut w = [0u8; 8];
+                    w.copy_from_slice(&bytes[at..at + 8]);
+                    let sum = f64::from_le_bytes(w) + x;
+                    bytes[at..at + 8].copy_from_slice(&sum.to_le_bytes());
+                }
+            }
+        }
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(TK, TV, SK, SV, TAKE, O, G, tn, sn, block, alpha)`: tensor.js's
+    /// `spMerge` (see `sparse::merge`) for float32/float64 values: the
+    /// result entries' positions into TAKE, values into the zeroed O (both
+    /// sized for tn + sn entries), their count into G[0].
+    fn pt_sp_merge(&mut self, a: &[Value]) -> Option<()> {
+        let (tk, tv, sk, sv) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?, self.pt_view(arg(a, 3))?);
+        let (vt, vo, vg) = (self.pt_view(arg(a, 4))?, self.pt_view(arg(a, 5))?, self.pt_view(arg(a, 6))?);
+        if [tk.kind, sk.kind, vt.kind, vg.kind].iter().any(|&k| k != KIND_F64) || !matches!(vo.kind, KIND_F32 | KIND_F64) || tv.kind != vo.kind || sv.kind != vo.kind {
+            return None;
+        }
+        let ins = [tk.buffer, tv.buffer, sk.buffer, sv.buffer];
+        if ins.contains(&vt.buffer) || ins.contains(&vo.buffer) || ins.contains(&vg.buffer) || vt.buffer == vo.buffer || vt.buffer == vg.buffer || vo.buffer == vg.buffer {
+            return None;
+        }
+        let (tn, sn, block) = (int_arg(a, 7)?, int_arg(a, 8)?, int_arg(a, 9)?);
+        let alpha = num_arg(a, 10)?;
+        let total = tn.checked_add(sn)?;
+        let tb = total.checked_mul(block)?;
+        if tk.len != tn || sk.len != sn || tv.len != tn.checked_mul(block)? || sv.len != sn.checked_mul(block)? || vt.len != total || vo.len != tb || vg.len != 1 || block == 0 {
+            return None;
+        }
+        let cost = self.pt_admit(tb.checked_add(total)?, total.saturating_mul(2).saturating_add(tb.saturating_mul(2)))?;
+        let (tkv, tvv, skv, svv) = (self.pt_read_all(tk)?, self.pt_read_all(tv)?, self.pt_read_all(sk)?, self.pt_read_all(sv)?);
+        let mut take = zeroed(total)?;
+        let mut out = zeroed(tb)?;
+        let kind = vo.kind;
+        let r = sparse::merge(&tkv, &tvv, &skv, &svv, block, alpha, |x| stored(kind, x), &mut take, &mut out)?;
+        self.pt_write(vt, 0, &take[..r])?;
+        self.pt_write(vo, 0, &out[..r * block])?;
+        self.pt_write(vg, 0, &[r as f64])?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
     /// `(op, nIn, nOut, ...inputs, ...outputs, ...dims)`: tensor.js's
     /// `linalg`, a batch of dense factorizations (`linalg`). Inputs are
     /// float32/float64 matrices, outputs float64 storages the runtime
@@ -1619,6 +1867,16 @@ fn as_index(v: Value) -> Option<usize> {
 
 fn int_arg(args: &[Value], i: usize) -> Option<usize> {
     as_index(arg(args, i))
+}
+
+/// The first element a sparse key names in a storage of `len` elements
+/// holding blocks of `block`: key * block, when that block fits.
+fn sparse_index(key: f64, block: usize, len: usize) -> Option<usize> {
+    if !(0.0..=9007199254740991.0).contains(&key) || key.fract() != 0.0 {
+        return None;
+    }
+    let base = usize::try_from(key as u64).ok()?.checked_mul(block)?;
+    (base.checked_add(block)? <= len).then_some(base)
 }
 
 #[allow(dead_code)]

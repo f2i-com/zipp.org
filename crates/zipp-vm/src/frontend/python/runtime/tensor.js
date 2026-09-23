@@ -35,7 +35,7 @@
     // as cheap as the native call.
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
-        N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17;
+        N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -1081,6 +1081,7 @@
         const outShape = shape.slice(); outShape[d] = I.length;
         const inner = numel(shape.slice(d + 1)), outer = numel(shape.slice(0, d));
         const out = alloc(a.dtype, numel(outShape)), O = out.data, A = a.data;
+        if (NATIVE !== null && O.length >= NATIVE_MIN && NATIVE(N_INDEX_SELECT, A, I, O, outer, shape[d], inner)) return tuple([out, pyShape(outShape)]);
         let o = 0;
         for (let x = 0; x < outer; x++) for (let i = 0; i < I.length; i++) {
             let j = I[i]; if (j < 0) j += shape[d]; if (j < 0 || j >= shape[d]) fail(E.IndexError, "index out of range");
@@ -2279,9 +2280,358 @@
         return true;
     }
     // ---- the module --------------------------------------------------------------------------------
+    // ---- sparse COO/CSR (torch.sparse) -------------------------------------------------
+    // A sparse tensor is an int64 index storage and a values storage whose
+    // nonzero k is the contiguous block [k * block, (k + 1) * block) (the
+    // dense dims of a hybrid tensor, 1 otherwise). Entries are compared by
+    // their row-major linear key over the sparse dims (`spKeys`), which
+    // orders in-range indices as PyTorch's lexicographic compares do.
+    //
+    // y += x on one element of a storage of `dt`, as PyTorch's cpublas axpy
+    // for that type stores it: the typed array rounds (float32/float16) or
+    // wraps (uint8/int8/int16) on store; bool is a logical or; bfloat16
+    // (bits) adds in float and rounds.
+    function spAcc(dt) {
+        if (dt === "bool") return (O, d, x) => { O[d] = (O[d] !== 0 || x !== 0) ? 1 : 0; };
+        if (dt === "bfloat16") return (O, d, x) => { O[d] = bfBits(Math.fround(bfValue(O[d]) + bfValue(x))); };
+        return null;
+    }
+    // The stable ascending order of the keys K (positions; equal keys keep
+    // their order): a native numeric sort of key * n + position when that is
+    // exact in a double, the merge sort otherwise.
+    function stableOrder(K) {
+        const n = K.length, perm = new Float64Array(n);
+        let lo = 0, hi = 0;
+        for (let i = 0; i < n; i++) { const k = K[i]; if (k < lo) lo = k; if (k > hi) hi = k; }
+        if (lo >= 0 && (hi + 1) * n <= 9007199254740991) {
+            const enc = new Float64Array(n);
+            for (let i = 0; i < n; i++) enc[i] = K[i] * n + i;
+            enc.sort();
+            for (let i = 0; i < n; i++) perm[i] = enc[i] % n;
+            return perm;
+        }
+        for (let i = 0; i < n; i++) perm[i] = i;
+        mergeSort(perm, new Float64Array(n), K, n, false);
+        return perm;
+    }
+    // sp_keys(indices, nnz, sizes): each nonzero's linear key over the
+    // sparse dims (indices is [len(sizes), nnz], row-major).
+    function spKeys(ind, nnz, sizes) {
+        const I = ind.data, sd = sizes.length, out = alloc("int64", nnz), O = out.data;
+        if (I.length !== sd * nnz) fail(E.RuntimeError, "sparse indices: size mismatch");
+        if (NATIVE !== null && nnz >= NATIVE_MIN && NATIVE(N_SP_KEYS, I, O, nnz, sizes)) return out;
+        let stride = 1;
+        for (let d = sd - 1; d >= 0; d--) {
+            const base = d * nnz;
+            for (let k = 0; k < nnz; k++) O[k] += I[base + k] * stride;
+            stride *= sizes[d];
+        }
+        return out;
+    }
+    // sp_coalesce(keys, values, block): PyTorch's _coalesce_sparse_cpu. The
+    // nonzeros in stable key order; a run of equal keys becomes one entry,
+    // its values copied from the first and the rest added in that order.
+    // Returns (first, values): the original position of each entry's first
+    // nonzero (to gather its indices) and the summed values.
+    function spCoalesce(keys, v, block) {
+        const K = keys.data, n = K.length, V = v.data, dt = v.dtype, acc = spAcc(dt);
+        if (V.length !== n * block) fail(E.RuntimeError, "sparse values: size mismatch");
+        if (NATIVE !== null && acc === null && n * block >= NATIVE_MIN) {
+            // The native loop sorts and sums into outputs of the input's
+            // size and reports how many entries it kept.
+            const F = new Float64Array(n), O = new V.constructor(n * block), G = new Float64Array(1);
+            if (NATIVE(N_SP_COALESCE, K, V, F, O, G, n, block)) {
+                const groups = G[0], first = alloc("int64", groups);
+                first.data.set(F.subarray(0, groups));
+                return tuple([first, make(dt, O.slice(0, groups * block))]);
+            }
+        }
+        const perm = stableOrder(K);
+        let groups = 0;
+        for (let j = 0; j < n; j++) if (j === 0 || K[perm[j]] !== K[perm[j - 1]]) groups++;
+        const first = alloc("int64", groups), F = first.data;
+        const out = make(dt, new V.constructor(groups * block)), O = out.data;
+        let g = -1, prev = 0;
+        for (let j = 0; j < n; j++) {
+            const p = perm[j], k = K[p], src = p * block;
+            if (j === 0 || k !== prev) {
+                g++;
+                F[g] = p;
+                const dst = g * block;
+                for (let b = 0; b < block; b++) O[dst + b] = V[src + b];
+            } else {
+                const dst = g * block;
+                if (acc === null) for (let b = 0; b < block; b++) O[dst + b] = O[dst + b] + V[src + b];
+                else for (let b = 0; b < block; b++) acc(O, dst + b, V[src + b]);
+            }
+            prev = k;
+        }
+        return tuple([first, out]);
+    }
+    // sp_merge(tkeys, tvalues, skeys, svalues, block, alpha): PyTorch's
+    // add_out_sparse_contiguous, t + alpha * s. One pass over both lists as
+    // if each were sorted: the smaller key goes out first, equal keys are
+    // summed. Returns (take, values): for each result entry the position of
+    // its indices in cat([t_indices, s_indices], 1), and its values (t's,
+    // then alpha * s's added, into zeros).
+    function spMerge(tk, tv, sk, sv, block, alpha) {
+        const TK = tk.data, SK = sk.data, tn = TK.length, sn = SK.length;
+        const TV = tv.data, SV = sv.data, dt = tv.dtype, acc = spAcc(dt);
+        if (sv.dtype !== dt) fail(E.RuntimeError, "sparse add: values must share a dtype");
+        const take = new Float64Array(tn + sn), O = new TV.constructor((tn + sn) * block);
+        const a = castValue(dt === "bfloat16" ? "float32" : dt, alpha), scaled = alpha !== 1;
+        if (NATIVE !== null && (dt === "float32" || dt === "float64") && (tn + sn) * block >= NATIVE_MIN) {
+            const G = new Float64Array(1);
+            if (NATIVE(N_SP_MERGE, TK, TV, SK, SV, take, O, G, tn, sn, block, a)) {
+                const r = G[0], t = alloc("int64", r);
+                t.data.set(take.subarray(0, r));
+                return tuple([t, make(dt, O.slice(0, r * block))]);
+            }
+        }
+        let r = 0, i = 0, j = 0;
+        while (i < tn || j < sn) {
+            const cmp = i >= tn ? -1 : j >= sn ? 1 : (TK[i] < SK[j] ? 1 : TK[i] > SK[j] ? -1 : 0);
+            const dst = r * block;
+            if (cmp >= 0) {
+                take[r] = i;
+                const src = i * block;
+                if (acc === null) for (let b = 0; b < block; b++) O[dst + b] = O[dst + b] + TV[src + b];
+                else for (let b = 0; b < block; b++) acc(O, dst + b, TV[src + b]);
+                i++;
+            }
+            if (cmp <= 0) {
+                take[r] = tn + j;
+                const src = j * block;
+                for (let b = 0; b < block; b++) {
+                    let x = SV[src + b];
+                    if (scaled) x = dt === "bfloat16" ? bfBits(Math.fround(a * bfValue(x))) : castValue(dt, a * x);
+                    if (acc === null) O[dst + b] = O[dst + b] + x; else acc(O, dst + b, x);
+                }
+                j++;
+            }
+            r++;
+        }
+        const t = alloc("int64", r); t.data.set(take.subarray(0, r));
+        return tuple([t, make(dt, O.slice(0, r * block))]);
+    }
+    // sp_spmm(rows, cols, values, m, dense, n): the [m, n] product of the
+    // sparse [m, k] matrix (nonzero e at (rows[e], cols[e])) and the dense
+    // [k, n] one. Each result row sums its products in nonzero order in a
+    // double and rounds once to the values' dtype.
+    function spSpmm(rows, cols, v, m, dense, n) {
+        const Rw = rows.data, C = cols.data, V = vals(v), D = vals(dense), nnz = Rw.length;
+        const out = work(v.dtype, m * n), O = out.data;
+        const k = n === 0 ? 0 : D.length / n;
+        if (NATIVE !== null && nnz * n >= NATIVE_MIN && NATIVE(N_SPMM, Rw, C, V, D, O, nnz, m, k, n)) { if (HALF[out.dtype] === 1) finish(out); return out; }
+        const acc = new Float64Array(m * n);
+        for (let e = 0; e < nnz; e++) {
+            const r = Rw[e], c = C[e], x = V[e];
+            if (r < 0 || r >= m || c < 0 || c >= k) fail(E.RuntimeError, "sparse mm: index out of bounds");
+            const ro = r * n, co = c * n;
+            for (let j = 0; j < n; j++) acc[ro + j] += x * D[co + j];
+        }
+        if (out.dtype === "bool") for (let i = 0; i < acc.length; i++) O[i] = acc[i] !== 0 ? 1 : 0;
+        else O.set(acc);
+        if (HALF[out.dtype] === 1) finish(out);
+        return out;
+    }
+    // sp_search(sorted, queries): the position of each query key in the
+    // ascending keys `sorted`, or -1.
+    function spSearch(sorted, queries) {
+        const S = sorted.data, Q = queries.data, n = S.length, out = alloc("int64", Q.length), O = out.data;
+        let ascending = true;
+        for (let i = 1; i < Q.length; i++) if (Q[i] < Q[i - 1]) { ascending = false; break; }
+        if (ascending) {
+            for (let i = 0, j = 0; i < Q.length; i++) {
+                const q = Q[i];
+                while (j < n && S[j] < q) j++;
+                O[i] = j < n && S[j] === q ? j : -1;
+            }
+            return out;
+        }
+        for (let i = 0; i < Q.length; i++) {
+            const q = Q[i];
+            let lo = 0, hi = n;
+            while (lo < hi) { const mid = (lo + hi) >>> 1; if (S[mid] < q) lo = mid + 1; else hi = mid; }
+            O[i] = lo < n && S[lo] === q ? lo : -1;
+        }
+        return out;
+    }
+    // sp_pool(op, pools, values, block): per pool of nonzeros sharing a key
+    // (softmax's rows), each of the `block` dense columns: 0 softmax, 1
+    // log_softmax, 2 the pool's sum at every member (softmax backward).
+    // Computed in doubles, rounded once to the values' dtype.
+    function spPool(op, pools, v, block) {
+        const P = pools.data, n = P.length, V = vals(v), out = work(v.dtype, n * block), O = out.data;
+        const gid = new Float64Array(n);
+        let groups = 0, runs = true;
+        for (let e = 1; e < n; e++) if (P[e] < P[e - 1]) { runs = false; break; }
+        if (runs) {
+            // Ascending keys (a coalesced tensor's rows): each run is a pool.
+            for (let e = 0; e < n; e++) { if (e === 0 || P[e] !== P[e - 1]) groups++; gid[e] = groups - 1; }
+        } else {
+            const ids = new Map();
+            for (let e = 0; e < n; e++) { let g = ids.get(P[e]); if (g === undefined) { g = groups++; ids.set(P[e], g); } gid[e] = g; }
+        }
+        const mx = new Float64Array(groups * block), sum = new Float64Array(groups * block);
+        if (op === 2) {
+            for (let e = 0; e < n; e++) { const g = gid[e] * block; for (let b = 0; b < block; b++) sum[g + b] += V[e * block + b]; }
+            for (let e = 0; e < n; e++) { const g = gid[e] * block; for (let b = 0; b < block; b++) O[e * block + b] = sum[g + b]; }
+        } else {
+            mx.fill(-Infinity);
+            for (let e = 0; e < n; e++) { const g = gid[e] * block; for (let b = 0; b < block; b++) { const x = V[e * block + b]; if (x > mx[g + b] || x !== x) mx[g + b] = x; } }
+            for (let e = 0; e < n; e++) { const g = gid[e] * block; for (let b = 0; b < block; b++) sum[g + b] += Math.exp(V[e * block + b] - mx[g + b]); }
+            for (let e = 0; e < n; e++) {
+                const g = gid[e] * block;
+                for (let b = 0; b < block; b++) {
+                    const z = V[e * block + b] - mx[g + b];
+                    O[e * block + b] = op === 1 ? z - Math.log(sum[g + b]) : Math.exp(z) / sum[g + b];
+                }
+            }
+        }
+        if (HALF[out.dtype] === 1) finish(out);
+        return out;
+    }
+    // sp_index_select(dimvals, index, size): for each entry of `index` in
+    // turn, the nonzeros whose index along the selected dim is that value,
+    // in their order. Returns (positions, new index along the dim).
+    function spIndexSelect(dv, index, size) {
+        const D = dv.data, X = index.data, where = new Map();
+        for (let e = 0; e < D.length; e++) { const k = D[e]; let l = where.get(k); if (l === undefined) { l = []; where.set(k, l); } l.push(e); }
+        const pos = [], nv = [];
+        for (let i = 0; i < X.length; i++) {
+            let j = X[i];
+            if (j < -size || j >= size) fail(E.IndexError, "index out of range in self");
+            if (j < 0) j += size;
+            const l = where.get(j);
+            if (l !== undefined) for (let q = 0; q < l.length; q++) { pos.push(l[q]); nv.push(i); }
+        }
+        const p = alloc("int64", pos.length), q = alloc("int64", nv.length);
+        for (let i = 0; i < pos.length; i++) { p.data[i] = pos[i]; q.data[i] = nv[i]; }
+        return tuple([p, q]);
+    }
+    // sp_compress(rows, n): the compressed (CSR crow) indices [n + 1] of
+    // row indices sorted ascending in [0, n).
+    function spCompress(rows, n) {
+        const R = rows.data, out = alloc("int64", n + 1), O = out.data;
+        for (let e = 0; e < R.length; e++) {
+            const r = R[e];
+            if (r < 0 || r >= n) fail(E.RuntimeError, "sparse compress: row index out of range");
+            O[r + 1]++;
+        }
+        for (let i = 0; i < n; i++) O[i + 1] += O[i];
+        return out;
+    }
+    // sp_expand(crow): each entry's row index, from compressed indices.
+    function spExpand(crow) {
+        const C = crow.data, n = C.length - 1, nnz = n >= 0 ? C[n] : 0;
+        if (!(nnz >= 0)) fail(E.RuntimeError, "sparse expand: invalid compressed indices");
+        const out = alloc("int64", nnz), O = out.data;
+        for (let i = 0; i < n; i++) {
+            const lo = C[i], hi = C[i + 1];
+            if (lo > hi || hi > nnz) fail(E.RuntimeError, "sparse expand: compressed indices must be non-decreasing and end at nnz");
+            for (let e = lo; e < hi; e++) O[e] = i;
+        }
+        return out;
+    }
+    // sp_compact(s): the positions of the nonzero elements of s, ascending.
+    function spCompact(s) {
+        const S = vals(s), keep = [];
+        for (let i = 0; i < S.length; i++) if (S[i] !== 0) keep.push(i);
+        const out = alloc("int64", keep.length), O = out.data;
+        for (let i = 0; i < keep.length; i++) O[i] = keep[i];
+        return out;
+    }
+    // sp_nonzero(s, shape, sd): the [sd, nnz] indices, in row-major order, of
+    // the positions over the first sd dims whose block of trailing elements
+    // has a nonzero (a NaN counts), as to_sparse(sd) finds them.
+    function spNonzero(s, shape, sd) {
+        const S = vals(s), outer = numel(shape.slice(0, sd)), block = numel(shape.slice(sd)), hits = [];
+        for (let p = 0; p < outer; p++) {
+            const base = p * block;
+            for (let b = 0; b < block; b++) if (S[base + b] !== 0) { hits.push(p); break; }
+        }
+        const n = hits.length, out = alloc("int64", sd * n), O = out.data;
+        for (let k = 0; k < n; k++) {
+            let rest = hits[k];
+            for (let d = sd - 1; d >= 0; d--) { const q = Math.floor(rest / shape[d]); O[d * n + k] = rest - q * shape[d]; rest = q; }
+        }
+        return out;
+    }
+    // sp_spgemm(arows, acols, avals, bcrow, bcols, bvals): the products of a
+    // sparse a (entries in row-major order) and b (compressed by row), as
+    // Gustavson's algorithm reaches them: for each entry (i, j) of a, the
+    // entries of b's row j. Returns (rows, cols, values), not summed.
+    function spSpgemm(ar, ac, av, bc, bcol, bv) {
+        const AR = ar.data, AC = ac.data, AV = vals(av), BC = bc.data, BK = bcol.data, BV = vals(bv), k = BC.length - 1;
+        let total = 0;
+        for (let e = 0; e < AR.length; e++) { const j = AC[e]; if (j < 0 || j >= k) fail(E.RuntimeError, "sparse mm: index out of bounds"); total += BC[j + 1] - BC[j]; }
+        const rows = alloc("int64", total), cols = alloc("int64", total), out = work(av.dtype, total), R = rows.data, C = cols.data, O = out.data;
+        let t = 0;
+        for (let e = 0; e < AR.length; e++) {
+            const i = AR[e], j = AC[e], x = AV[e];
+            for (let q = BC[j]; q < BC[j + 1]; q++, t++) { R[t] = i; C[t] = BK[q]; O[t] = x * BV[q]; }
+        }
+        if (HALF[out.dtype] === 1) finish(out);
+        return tuple([rows, cols, out]);
+    }
+    // sp_scatter_add(dst, keys, values, block): each nonzero's block of
+    // values added into dst at key * block, in nonzero order, each sum
+    // stored as `scatter_add` stores it (to_dense, dense + sparse).
+    function spScatterAdd(dst, keys, v, block) {
+        const O = dst.data, K = keys.data, V = vals(v), dt = dst.dtype, n = K.length, size = O.length;
+        if (V.length !== n * block) fail(E.RuntimeError, "sparse scatter: size mismatch");
+        const f32 = dt === "float32" || dt === "float64", bf = dt === "bfloat16";
+        if (NATIVE !== null && f32 && n * block >= NATIVE_MIN && NATIVE(N_SP_SCATTER, O, K, V, n, block)) { written(dst); return null; }
+        for (let e = 0; e < n; e++) {
+            const base = K[e] * block, src = e * block;
+            if (!(base >= 0 && base + block <= size)) fail(E.IndexError, "index out of bounds");
+            if (f32) for (let b = 0; b < block; b++) O[base + b] = O[base + b] + V[src + b];
+            else if (bf) for (let b = 0; b < block; b++) O[base + b] = bfBits(Math.fround(bfValue(O[base + b]) + V[src + b]));
+            else for (let b = 0; b < block; b++) O[base + b] = castValue(dt, O[base + b] + V[src + b]);
+        }
+        written(dst);
+        return null;
+    }
     rt.defineModule("_zipp_tensor", (g) => {
         const fn = (name, arity, code, min) => g.set(name, rt.builtin(name, arity, code, min));
         const num = (v) => jsNumber(v);
+        fn("sp_scatter_add", 4, (a) => {
+            const d = a[0], v = a[2], block = num(a[3]);
+            if (isStorage(d) && isStorage(v)) return spScatterAdd(d, needS(a[1]), v, block);
+            needC(d); needC(v);
+            if (d.dtype !== v.dtype) fail(E.RuntimeError, "sparse scatter: complex storages must share a dtype");
+            spScatterAdd(realOf(d), needS(a[1]), realOf(v), 2 * block);
+            written(d);
+            return null;
+        });
+        fn("sp_compress", 2, (a) => spCompress(needS(a[0]), num(a[1])));
+        fn("sp_expand", 1, (a) => spExpand(needS(a[0])));
+        fn("sp_compact", 1, (a) => spCompact(needS(a[0])));
+        fn("sp_nonzero", 3, (a) => spNonzero(needS(a[0]), shapeOf(a[1]), num(a[2])));
+        fn("sp_spgemm", 6, (a) => spSpgemm(needS(a[0]), needS(a[1]), needS(a[2]), needS(a[3]), needS(a[4]), needS(a[5])));
+        // Sparse kernels (see `spKeys` ...). A complex values storage runs as
+        // its real pairs (block doubled): coalescing and merging only add.
+        fn("sp_keys", 3, (a) => spKeys(needS(a[0]), num(a[1]), shapeOf(a[2])));
+        fn("sp_coalesce", 3, (a) => {
+            const v = a[1], block = num(a[2]);
+            if (isStorage(v)) return spCoalesce(needS(a[0]), v, block);
+            needC(v);
+            const r = spCoalesce(needS(a[0]), realOf(v), 2 * block);
+            return tuple([r.items[0], asPair(r.items[1], v.dtype)]);
+        });
+        fn("sp_merge", 6, (a) => {
+            const tv = a[1], sv = a[3], block = num(a[4]), alpha = num(a[5]);
+            if (isStorage(tv) && isStorage(sv)) return spMerge(needS(a[0]), tv, needS(a[2]), sv, block, alpha);
+            needC(tv); needC(sv);
+            if (tv.dtype !== sv.dtype || alpha !== 1) fail(E.RuntimeError, "sparse add: complex values need one dtype and alpha 1");
+            const r = spMerge(needS(a[0]), realOf(tv), needS(a[2]), realOf(sv), 2 * block, 1);
+            return tuple([r.items[0], asPair(r.items[1], tv.dtype)]);
+        });
+        fn("sp_spmm", 6, (a) => spSpmm(needS(a[0]), needS(a[1]), needS(a[2]), num(a[3]), needS(a[4]), num(a[5])));
+        fn("sp_search", 2, (a) => spSearch(needS(a[0]), needS(a[1])));
+        fn("sp_pool", 4, (a) => spPool(num(a[0]), needS(a[1]), needS(a[2]), num(a[3])));
+        fn("sp_index_select", 3, (a) => spIndexSelect(needS(a[0]), needS(a[1]), num(a[2])));
         fn("zeros", 2, (a) => { const d = rt.needStr(a[0]); return d.length > 8 ? calloc(d, num(a[1])) : alloc(d, num(a[1])); });
         fn("full", 3, (a) => { const d = rt.needStr(a[0]); if (d.length > 8) { const c = calloc(d, num(a[1])); fillPair(c, num(a[2]), 0); return c; } const s = alloc(d, num(a[1])); s.data.fill(enc(s.dtype, num(a[2]))); return s; });
         // arange(dtype, start, step, n): element i is castValue(start + i * step),

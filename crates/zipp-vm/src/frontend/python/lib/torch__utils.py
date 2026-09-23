@@ -6,6 +6,13 @@ from collections import OrderedDict
 _rebuild_tensor_v2 = torch._rebuild_tensor_v2
 
 
+def _rebuild_sparse_tensor(layout, data):
+    """A checkpoint's sparse tensor: (indices, values, size, is_coalesced)
+    for COO (PyTorch before 2.1 wrote no is_coalesced), (compressed
+    indices, plain indices, values, size) for CSR."""
+    return torch.sparse._rebuild(layout, data)
+
+
 def _rebuild_parameter(data, requires_grad, backward_hooks):
     # How PyTorch pickles an nn.Parameter: its data, then requires_grad.
     return torch.nn.Parameter(data, requires_grad)
@@ -34,6 +41,10 @@ def _weights_only_find_class(module, name):
             return _rebuild_parameter
         if name == "_rebuild_parameter_with_state":
             return _rebuild_parameter_with_state
+        if name == "_rebuild_sparse_tensor":
+            return _rebuild_sparse_tensor
+    if module == "torch.serialization" and name == "_get_layout":
+        return torch._get_layout
     if module == "torch":
         if name in torch._STORAGE_NAMES:
             return torch._STORAGE_NAMES[name]

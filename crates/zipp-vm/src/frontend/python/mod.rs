@@ -118,6 +118,7 @@ pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
         include_str!("lib/torch_nn_utils_parametrizations.py"),
     ),
     ("torch.linalg", include_str!("lib/torch_linalg.py")),
+    ("torch.sparse", include_str!("lib/torch_sparse.py")),
     ("torch.distributions", include_str!("lib/torch_distributions.py")),
     (
         "torch.distributions.constraints",
