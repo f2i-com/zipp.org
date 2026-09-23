@@ -173,10 +173,6 @@ fn run(args: &[String]) -> Result<(), String> {
 fn execute(mut compiled: zipp_vm::frontend::CompiledSource) -> Result<(), String> {
     let python = compiled.language() == LanguageId::Python;
     let state = compiled.state_mut();
-    if python {
-        // No instruction budget here, so the JIT's metering does not matter.
-        state.enable_vm_jit();
-    }
     stream_console(state);
     let outcome = state.run_init();
     // A program read from standard input has no project folder to write to.
@@ -760,8 +756,6 @@ fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<()
     drop(modules);
     drop(files);
     let state = compiled.state_mut();
-    // No instruction budget here, so the JIT's metering does not matter.
-    state.enable_vm_jit();
     stream_console(state);
     let outcome = state.run_init();
     // Files the program wrote go back to disk, inside the root only. The

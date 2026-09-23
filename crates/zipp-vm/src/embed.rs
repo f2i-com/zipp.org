@@ -348,18 +348,6 @@ impl ScriptState {
         self.with_vm(|vm| vm.set_jit_enabled(false));
     }
 
-    /// Undo [`Self::disable_vm_jit`], back to the process default: on unless
-    /// `ZIPP_NOJIT` is set. The Python frontend disables the JIT when it builds
-    /// a state, because a JIT under an instruction budget meters differently
-    /// from the interpreter; a host that runs a Python program with no budget
-    /// (the `zipp py` CLI) turns it back on, which mostly speeds up the
-    /// runtime's own tensor kernels. A budgeted state stays interpreted.
-    #[cfg(feature = "instrument")]
-    pub fn enable_vm_jit(&mut self) {
-        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-        self.with_vm(|vm| vm.set_jit_enabled(std::env::var_os("ZIPP_NOJIT").is_none()));
-    }
-
     /// Execute the program's top level and drain the job queue.
     ///
     /// `Err` carries the uncaught throw's message. Output produced *before* the
