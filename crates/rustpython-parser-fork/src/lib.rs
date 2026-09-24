@@ -120,8 +120,12 @@ pub use rustpython_parser_core::{text_size, Mode};
 mod function;
 // Skip flattening lexer to distinguish from full parser
 mod context;
+mod descent;
 pub mod lexer;
 mod parser;
+#[cfg(feature = "reference-parser")]
+#[doc(hidden)]
+pub mod reference;
 mod soft_keywords;
 mod string;
 mod token;
@@ -134,14 +138,12 @@ pub use token::{StringKind, Tok};
 #[allow(deprecated)]
 pub use parser::{parse_expression, parse_expression_starts_at, parse_program};
 
+// The generated LR parser, kept only as the differential test's reference.
+#[cfg(feature = "reference-parser")]
 #[rustfmt::skip]
 mod python {
     #![allow(clippy::all)]
     #![allow(unused)]
 
-    #[cfg(feature = "lalrpop")]
-    include!(concat!(env!("OUT_DIR"), "/src/python.rs"));
-
-    #[cfg(not(feature = "lalrpop"))]
     include!("python.rs");
 }

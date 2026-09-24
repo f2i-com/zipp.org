@@ -189,10 +189,52 @@ pub struct Lexer<T: Iterator<Item = char>> {
     location: TextSize,
 }
 
-// generated in build.rs, in gen_phf()
-/// A map of keywords to their tokens.
-pub static KEYWORDS: phf::Map<&'static str, Tok> =
-    include!(concat!(env!("OUT_DIR"), "/keywords.rs"));
+/// The keyword (or `...`, which is lexed separately) spelled `name`.
+/// (Upstream generated a `phf` map, `KEYWORDS`; a `match` compiles to
+/// length and byte comparisons, needs no build script and no hashing.)
+fn keyword(name: &str) -> Option<Tok> {
+    Some(match name {
+        "False" => Tok::False,
+        "None" => Tok::None,
+        "True" => Tok::True,
+        "and" => Tok::And,
+        "as" => Tok::As,
+        "assert" => Tok::Assert,
+        "async" => Tok::Async,
+        "await" => Tok::Await,
+        "break" => Tok::Break,
+        "case" => Tok::Case,
+        "class" => Tok::Class,
+        "continue" => Tok::Continue,
+        "def" => Tok::Def,
+        "del" => Tok::Del,
+        "elif" => Tok::Elif,
+        "else" => Tok::Else,
+        "except" => Tok::Except,
+        "finally" => Tok::Finally,
+        "for" => Tok::For,
+        "from" => Tok::From,
+        "global" => Tok::Global,
+        "if" => Tok::If,
+        "import" => Tok::Import,
+        "in" => Tok::In,
+        "is" => Tok::Is,
+        "lambda" => Tok::Lambda,
+        "match" => Tok::Match,
+        "nonlocal" => Tok::Nonlocal,
+        "not" => Tok::Not,
+        "or" => Tok::Or,
+        "pass" => Tok::Pass,
+        "raise" => Tok::Raise,
+        "return" => Tok::Return,
+        "try" => Tok::Try,
+        "type" => Tok::Type,
+        "while" => Tok::While,
+        "with" => Tok::With,
+        "yield" => Tok::Yield,
+        _ => return None,
+    })
+}
 
 /// Contains a Token along with its `range`.
 pub type Spanned = (Tok, TextRange);
@@ -281,8 +323,8 @@ where
         }
         let end_pos = self.get_pos();
 
-        if let Some(tok) = KEYWORDS.get(&name) {
-            Ok((tok.clone(), TextRange::new(start_pos, end_pos)))
+        if let Some(tok) = keyword(&name) {
+            Ok((tok, TextRange::new(start_pos, end_pos)))
         } else {
             Ok((Tok::Name { name }, TextRange::new(start_pos, end_pos)))
         }
@@ -1278,7 +1320,7 @@ where
 /// [lexer] implementation.
 ///
 /// [lexer]: crate::lexer
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LexicalError {
     /// The type of error that occurred.
     pub error: LexicalErrorType,
@@ -1294,7 +1336,7 @@ impl LexicalError {
 }
 
 /// Represents the different types of errors that can occur during lexing.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LexicalErrorType {
     // TODO: Can probably be removed, the places it is used seem to be able
     // to use the `UnicodeError` variant instead.

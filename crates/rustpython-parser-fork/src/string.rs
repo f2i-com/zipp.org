@@ -7,10 +7,9 @@ use crate::text_size::TextRange;
 use crate::{
     ast::{self, Constant, Expr},
     lexer::{LexicalError, LexicalErrorType},
-    parser::{LalrpopError, Parse, ParseError, ParseErrorType},
-    token::{StringKind, Tok},
+    parser::{Parse, ParseError, ParseErrorType},
+    token::StringKind,
 };
-use itertools::Itertools;
 use rustpython_parser_core::{
     text_size::{TextLen, TextSize},
     ConversionFlag,
@@ -721,7 +720,7 @@ pub(crate) fn parse_strings(
 
     let take_current = |current: &mut Vec<String>| -> Expr {
         Expr::Constant(ast::ExprConstant {
-            value: Constant::Str(current.drain(..).join("")),
+            value: Constant::Str(std::mem::take(current).concat()),
             kind: initial_kind.clone(),
             range: TextRange::new(initial_start, last_end),
         })
@@ -781,7 +780,7 @@ impl From<FStringError> for LexicalError {
 }
 
 /// Represents the different types of errors that can occur during parsing of an f-string.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FStringErrorType {
     /// Expected a right brace after an opened left brace.
     UnclosedLbrace,
@@ -845,7 +844,8 @@ impl std::fmt::Display for FStringErrorType {
     }
 }
 
-impl From<FStringError> for LalrpopError<TextSize, Tok, LexicalError> {
+#[cfg(feature = "reference-parser")]
+impl From<FStringError> for lalrpop_util::ParseError<TextSize, crate::token::Tok, LexicalError> {
     fn from(err: FStringError) -> Self {
         lalrpop_util::ParseError::User {
             error: LexicalError {

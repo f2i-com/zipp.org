@@ -83,6 +83,16 @@ jobs:
           cargo +1.92.0 test --locked -p zipp-vm --features python --lib minify_check
           cargo +1.92.0 test --locked -p zipp-cli
           cargo +1.92.0 test --locked -p zipp-gpu
+      # The hand-written Python parser against the generated LALRPOP parser it
+      # replaced (compiled only here, by the test-only `reference-parser`
+      # feature): equal ASTs, ranges included, or equal errors, over every
+      # Python source in the repository, syntax-error snippets, mutated token
+      # streams and the runner's CPython Lib. See the fork's FORK.md.
+      - name: Test the Python parser against the one it replaced
+        working-directory: crates/rustpython-parser-fork
+        run: |
+          cargo +1.92.0 test --locked --no-default-features --features location,num-bigint --lib
+          cargo +1.92.0 test --locked --release --no-default-features --features location,num-bigint,reference-parser --test differential -- --include-ignored --skip throughput
       - name: Build the Python-enabled browser artifact
         working-directory: crates/zipp-wasm
         run: |

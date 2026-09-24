@@ -4,7 +4,7 @@ This directory has the code for python lexing, parsing and generating Abstract S
 
 The steps are:
 - Lexical analysis: splits the source code into tokens.
-- Parsing and generating the AST: transforms those tokens into an AST. Uses `LALRPOP`, a Rust parser generator framework.
+- Parsing and generating the AST: transforms those tokens into an AST. In ZIPP's fork this is a hand-written recursive-descent parser (`src/descent/`); upstream's LALRPOP grammar (`src/python.lalrpop`, generated into `src/python.rs`) is kept only as the test-only reference parser. See `FORK.md`.
 
 This crate is published on [https://docs.rs/rustpython-parser](https://docs.rs/rustpython-parser).
 
@@ -17,7 +17,6 @@ There is a readme in the `src` folder with the details of each file.
 
 ## Directory content
 
-`build.rs`: The build script.
 `Cargo.toml`: The config file.
 
 The `src` directory has:
@@ -34,8 +33,11 @@ A python parsing module. Use this module to parse python code into an AST. There
 **ast.rs**   
  Implements abstract syntax tree (AST) nodes for the python language. Roughly equivalent to [the python AST](https://docs.python.org/3/library/ast.html).
 
+**descent/**   
+The parser: recursive descent, with precedence climbing for binary operators.
+
 **python.lalrpop**   
-Python grammar.
+Upstream's Python grammar. Its generated parser (`python.rs`) is compiled only by the test-only `reference-parser` feature, to check `descent/` against.
 
 **token.rs**   
 Different token definitions. Loosely based on token.h from CPython source.

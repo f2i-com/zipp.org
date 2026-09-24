@@ -13,18 +13,14 @@
 //! [`Mode`]: crate::mode
 
 use crate::{
-    ast::{self, OptionalRange, Ranged},
-    lexer::{self, LexResult, LexicalError, LexicalErrorType},
-    python,
+    ast::{self, Ranged},
+    lexer::{self, LexResult, LexicalErrorType},
     text_size::TextSize,
     token::Tok,
     Mode,
 };
-use itertools::Itertools;
-use std::iter;
 
-use crate::{lexer::Lexer, soft_keywords::SoftKeywordTransformer, text_size::TextRange};
-pub(super) use lalrpop_util::ParseError as LalrpopError;
+use crate::{lexer::Lexer, soft_keywords::SoftKeywordTransformer};
 
 /// Parse Python code string to implementor's type.
 ///
@@ -69,8 +65,8 @@ where
     ) -> Result<Self, ParseError> {
         let lxr = Self::lex_starts_at(source, offset);
         #[cfg(feature = "full-lexer")]
-        let lxr =
-            lxr.filter_ok(|(tok, _)| !matches!(tok, Tok::Comment { .. } | Tok::NonLogicalNewline));
+        let lxr = lxr
+            .filter(|item| !matches!(item, Ok((Tok::Comment { .. } | Tok::NonLogicalNewline, _))));
         Self::parse_tokens(lxr, source_path)
     }
     fn lex_starts_at(
@@ -410,7 +406,7 @@ pub fn parse_tokens(
     let lxr = lxr.into_iter();
     #[cfg(feature = "full-lexer")]
     let lxr =
-        lxr.filter_ok(|(tok, _)| !matches!(tok, Tok::Comment { .. } | Tok::NonLogicalNewline));
+        lxr.filter(|item| !matches!(item, Ok((Tok::Comment { .. } | Tok::NonLogicalNewline, _))));
     parse_filtered_tokens(lxr, mode, source_path)
 }
 
@@ -419,15 +415,11 @@ fn parse_filtered_tokens(
     mode: Mode,
     source_path: &str,
 ) -> Result<ast::Mod, ParseError> {
-    let marker_token = (Tok::start_marker(mode), Default::default());
-    let lexer = iter::once(Ok(marker_token)).chain(lxr);
-    python::TopParser::new()
-        .parse(
-            lexer
-                .into_iter()
-                .map_ok(|(t, range)| (range.start(), t, range.end())),
-        )
-        .map_err(|e| parse_error_from_lalrpop(e, source_path))
+    #[cfg(feature = "reference-parser")]
+    if crate::reference::active() {
+        return crate::reference::parse_lalrpop(lxr, mode, source_path);
+    }
+    crate::descent::parse_tokens(lxr.into_iter(), mode, source_path)
 }
 
 /// Represents represent errors that occur during parsing and are
@@ -435,7 +427,7 @@ fn parse_filtered_tokens(
 pub type ParseError = rustpython_parser_core::BaseError<ParseErrorType>;
 
 /// Represents the different types of errors that can occur during parsing.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ParseErrorType {
     /// Parser encountered an unexpected end of input
     Eof,
@@ -451,60 +443,6 @@ pub enum ParseErrorType {
 }
 
 impl std::error::Error for ParseErrorType {}
-
-// Convert `lalrpop_util::ParseError` to our internal type
-fn parse_error_from_lalrpop(
-    err: LalrpopError<TextSize, Tok, LexicalError>,
-    source_path: &str,
-) -> ParseError {
-    let source_path = source_path.to_owned();
-
-    match err {
-        // TODO: Are there cases where this isn't an EOF?
-        LalrpopError::InvalidToken { location } => ParseError {
-            error: ParseErrorType::Eof,
-            offset: location,
-            source_path,
-        },
-        LalrpopError::ExtraToken { token } => ParseError {
-            error: ParseErrorType::ExtraToken(token.1),
-            offset: token.0,
-            source_path,
-        },
-        LalrpopError::User { error } => ParseError {
-            error: ParseErrorType::Lexical(error.error),
-            offset: error.location,
-            source_path,
-        },
-        LalrpopError::UnrecognizedToken { token, expected } => {
-            // Hacky, but it's how CPython does it. See PyParser_AddToken,
-            // in particular "Only one possible expected token" comment.
-            let expected = (expected.len() == 1).then(|| expected[0].clone());
-            ParseError {
-                error: ParseErrorType::UnrecognizedToken(token.1, expected),
-                offset: token.0,
-                source_path,
-            }
-        }
-        LalrpopError::UnrecognizedEof { location, expected } => {
-            // This could be an initial indentation error that we should ignore
-            let indent_error = expected == ["Indent"];
-            if indent_error {
-                ParseError {
-                    error: ParseErrorType::Lexical(LexicalErrorType::IndentationError),
-                    offset: location,
-                    source_path,
-                }
-            } else {
-                ParseError {
-                    error: ParseErrorType::Eof,
-                    offset: location,
-                    source_path,
-                }
-            }
-        }
-    }
-}
 
 impl std::fmt::Display for ParseErrorType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -548,9 +486,13 @@ impl ParseErrorType {
     }
 }
 
+#[cfg(feature = "reference-parser")]
 #[inline(always)]
-pub(super) fn optional_range(start: TextSize, end: TextSize) -> OptionalRange<TextRange> {
-    OptionalRange::<TextRange>::new(start, end)
+pub(super) fn optional_range(
+    start: TextSize,
+    end: TextSize,
+) -> ast::OptionalRange<crate::text_size::TextRange> {
+    ast::OptionalRange::<crate::text_size::TextRange>::new(start, end)
 }
 
 include!("gen/parse.rs");

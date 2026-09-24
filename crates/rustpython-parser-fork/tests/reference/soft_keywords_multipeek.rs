@@ -1,40 +1,9 @@
-use crate::{lexer::LexResult, token::Tok, Mode};
-use std::collections::VecDeque;
-use std::iter::Fuse;
-
-/// Tokens after the current one, looked at without consuming them: each
-/// `peek` looks one token further, `next` resets that cursor. (Upstream used
-/// `itertools::MultiPeek`, which behaves the same; this is its only use of
-/// `itertools`.)
-struct MultiPeek<I: Iterator> {
-    iter: Fuse<I>,
-    buf: VecDeque<I::Item>,
-    index: usize,
-}
-
-impl<I: Iterator> MultiPeek<I> {
-    fn new(iter: I) -> Self {
-        Self {
-            iter: iter.fuse(),
-            buf: VecDeque::new(),
-            index: 0,
-        }
-    }
-
-    fn peek(&mut self) -> Option<&I::Item> {
-        if self.index == self.buf.len() {
-            self.buf.push_back(self.iter.next()?);
-        }
-        self.index += 1;
-        Some(&self.buf[self.index - 1])
-    }
-
-    #[inline]
-    fn next(&mut self) -> Option<I::Item> {
-        self.index = 0;
-        self.buf.pop_front().or_else(|| self.iter.next())
-    }
-}
+// Upstream's `src/soft_keywords.rs` (rustpython-parser 0.4.0, MIT), which
+// peeked through `itertools::MultiPeek`; the crate's own copy now peeks
+// through a small buffer of its own. `tests/differential.rs` checks that
+// both produce the same token stream.
+use itertools::{Itertools, MultiPeek};
+use rustpython_parser::{lexer::LexResult, Mode, Tok};
 
 /// An [`Iterator`] that transforms a token stream to accommodate soft keywords (namely, `match`
 /// `case`, and `type`).
@@ -65,7 +34,7 @@ where
 {
     pub fn new(lexer: I, mode: Mode) -> Self {
         Self {
-            underlying: MultiPeek::new(lexer),
+            underlying: lexer.multipeek(), // spell-checker:ignore multipeek
             start_of_line: matches!(mode, Mode::Interactive | Mode::Module),
         }
     }

@@ -15,7 +15,6 @@ rust-version = "1.72.1"
 name = "rustpython-parser"
 version = "0.4.0"
 authors = ["RustPython Team"]
-build = "build.rs"
 autobins = false
 autoexamples = false
 autotests = false
@@ -29,15 +28,18 @@ repository = "https://github.com/RustPython/Parser"
 name = "rustpython_parser"
 path = "src/lib.rs"
 
+[[test]]
+name = "differential"
+path = "tests/differential.rs"
+required-features = ["reference-parser"]
+
 [dependencies.is-macro]
 version = "0.3.0"
-
-[dependencies.itertools]
-version = "0.11.0"
 
 [dependencies.lalrpop-util]
 version = "0.20.0"
 default-features = false
+optional = true
 
 [dependencies.log]
 version = "0.4.16"
@@ -52,9 +54,6 @@ optional = true
 
 [dependencies.num-traits]
 version = "0.2"
-
-[dependencies.phf]
-version = "0.11.1"
 
 [dependencies.rustc-hash]
 version = "1.1.0"
@@ -84,20 +83,10 @@ features = ["emoji"]
 [dev-dependencies.insta]
 version = "1.14.0"
 
-[build-dependencies.anyhow]
-version = "1.0.45"
-
-[build-dependencies.lalrpop]
-version = "0.20.0"
-optional = true
-default-features = false
-
-[build-dependencies.phf_codegen]
-version = "0.11.1"
-
-[build-dependencies.tiny-keccak]
-version = "2"
-features = ["sha3"]
+# Only for upstream's soft-keyword pass, kept in `tests/reference/` to check
+# the crate's own copy against.
+[dev-dependencies.itertools]
+version = "0.11.0"
 
 [features]
 all-nodes-with-ranges = ["rustpython-ast/all-nodes-with-ranges"]
@@ -118,6 +107,9 @@ num-bigint = [
     "dep:num-bigint",
     "rustpython-ast/num-bigint",
 ]
+# Test-only: compile the generated LALRPOP parser (`src/python.rs`) as
+# `reference::parse_tokens`, for `tests/differential.rs`.
+reference-parser = ["dep:lalrpop-util"]
 serde = [
     "dep:serde",
     "rustpython-parser-core/serde",
