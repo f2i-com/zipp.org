@@ -744,6 +744,12 @@ class Module:
             keep_vars = args[2] if len(args) > 2 else keep_vars
         if destination is None:
             destination = OrderedDict()
+            destination._metadata = OrderedDict()
+        # Each module's version, as PyTorch records it (its loaders read it
+        # from a checkpoint's state dict).
+        metadata = getattr(destination, "_metadata", None)
+        if metadata is not None:
+            metadata[prefix[:-1]] = {"version": self._version}
         d = self.__dict__
         pre = d.get("_state_dict_pre_hooks")
         if pre:
@@ -1542,6 +1548,14 @@ class _ConvNd(Module):
         if self.padding_mode != "zeros":
             return fn(F.pad(x, self._reversed_padding_repeated_twice, mode=self.padding_mode), self.weight, self.bias, self.stride, 0, self.dilation, self.groups)
         return fn(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+    def _conv_forward(self, input, weight, bias):
+        """The convolution with the given weight and bias (PyTorch's
+        _conv_forward, which the quantization-aware modules call)."""
+        fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[self._nd]
+        if self.padding_mode != "zeros":
+            return fn(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode), weight, bias, self.stride, 0, self.dilation, self.groups)
+        return fn(input, weight, bias, self.stride, self.padding, self.dilation, self.groups)
 
 
 class Conv1d(_ConvNd):

@@ -569,8 +569,9 @@ third-party ML packages is not supported; within the bundled `torch`:
   without a process group) and `convert_sync_batchnorm`; and
   `nn.DataParallel`/`nn.parallel.DistributedDataParallel` as single-device
   wrappers (`.module`, `module.`-prefixed state_dict keys, forward passes
-  through; DDP follows PyTorch's CPU-module path but needs no `torch.distributed`
-  process group, which Zipp does not provide, and `register_comm_hook` hooks are
+  through; DDP follows PyTorch's CPU-module path, uses
+  `torch.distributed`'s default process group when one is initialized and,
+  unlike PyTorch, also works without one; `register_comm_hook` hooks are
   recorded but never run). `torch.grid_sampler`, `torch.affine_grid_generator`
   and `torch.ctc_loss` take PyTorch's integer mode and reduction codes.
 - **`torch.optim`.** SGD, Adam, AdamW, RMSprop (`centered`, `maximize`),
@@ -739,6 +740,67 @@ third-party ML packages is not supported; within the bundled `torch`:
   - Multiplying by a dense tensor of a larger broadcast shape raises
     `NotImplementedError`.
   - PyTorch 2.11 has no `Tensor.nnz()`; `_nnz()` is the count.
+- **Quantization.** Quantized tensors of `torch.quint8`, `qint8` and `qint32`
+  (`quint4x2` is named only): `torch.quantize_per_tensor` (scalar or tensor
+  parameters, list form), `quantize_per_channel`,
+  `quantize_per_tensor_dynamic`, `_make_per_tensor_quantized_tensor`/`_make_pe
+  r_channel_quantized_tensor`/`_empty_affine_quantized` (zero-filled),
+  `torch.dequantize` and `dequantize`/`int_repr`/`q_scale`/`q_zero_point`/`q_p
+  er_channel_scales`/`q_per_channel_zero_points`/`q_per_channel_axis`/`qscheme
+  `/`is_quantized`, printed as PyTorch prints them; shape ops, indexing,
+  `clone`/`detach`/`copy.deepcopy`, `torch.cat`/`stack`/`equal`/`max`/`min`,
+  `relu`/`relu6`/`hardtanh`, max/avg/adaptive-avg pooling and nearest
+  `interpolate` on quantized tensors (arithmetic raises PyTorch's QuantizedCPU
+  error). `torch.fake_quantize_per_tensor_affine`/`per_channel_affine` and
+  `fused_moving_avg_obs_fake_quant` with PyTorch's straight-through gradients.
+  `torch.ao.quantization` (and `torch.quantization`): the MinMax,
+  MovingAverageMinMax, PerChannelMinMax, MovingAveragePerChannelMinMax,
+  Histogram, FixedQParams, Placeholder, Recording and Noop observers;
+  FakeQuantize, FixedQParamsFakeQuantize, FusedMovingAvgObsFakeQuantize and
+  the default fake quantizers; QConfig, the default qconfigs,
+  `get_default_qconfig`/`get_default_qat_qconfig` ('x86', 'fbgemm', 'qnnpack',
+  'onednn'); QuantStub/DeQuantStub/QuantWrapper; `prepare`, `convert`,
+  `quantize`, `prepare_qat`, `quantize_qat`, `quantize_dynamic`,
+  `fuse_modules`/`fuse_modules_qat`. Modules: `torch.ao.nn.quantized` Linear,
+  Conv1d, Conv2d, ReLU6, Quantize, DeQuantize, Dropout,
+  FloatFunctional/QFunctional; `torch.ao.nn.intrinsic` and its
+  `.quantized`/`.qat` forms; `torch.ao.nn.qat`; dynamic Linear (qint8 or
+  float16 weights) and LSTM; the `torch.nn.quantized`/`intrinsic`/`qat`
+  aliases. `torch.backends.quantized.engine` picks the arithmetic ('x86'
+  default, 'fbgemm', 'onednn'; 'qnnpack' raises): Linear requantizes as
+  fbgemm, convolutions under 'x86' round as oneDNN for symmetric weights and
+  at most 100 groups (PyTorch's Linux AVX512-VNNI dispatch) and as fbgemm
+  otherwise, dynamic Linear returns `fma(acc, sx*sw, bias)` with
+  `reduce_range`. The integer and requantization loops are native, charged to
+  the budget, with JavaScript loops storing the same bytes. Checkpoints use
+  PyTorch's `_rebuild_qtensor` records and quantized state-dict keys, with
+  `_metadata` versions, so PyTorch loads Zipp's files. Quantized values,
+  observer parameters, fake quantization and gradients match PyTorch 2.11
+  exactly, with these exceptions:
+  - Scales observed from float activations (prepare/convert and QAT) can
+    differ in the last bits (Zipp sums float convolutions in a double).
+  - HistogramObserver may choose a neighbouring range at a near-tie.
+  - Dynamic LSTM gates use Zipp's sigmoid/tanh (within 2e-7).
+  - 'onednn' dynamic Linear uses fbgemm's arithmetic.
+  - PyTorch's x86 convolutions on Windows/macOS use fbgemm's rounding and can
+    differ by one step at exact ties.
+  - `quint4x2` tensors, float zero points, FX graph mode and PT2E, reference
+    modules, and quantized BatchNorm, LayerNorm/GroupNorm/InstanceNorm,
+    Hardswish, ELU, LeakyReLU, PReLU, Sigmoid, Softmax, Embedding(Bag),
+    Conv3d, ConvTranspose, static LSTM, MultiheadAttention, dynamic GRU and
+    the RNN cells raise `NotImplementedError`.
+- **`torch.distributed`.** One process: `init_process_group` accepts world
+  size 1 (rank 0) with gloo (or no backend, reported as "undefined" as CPU-
+  only PyTorch does) via env://, tcp://, file:// or a store; nccl/mpi/ucc/xccl
+  raise PyTorch's "not built in" errors and a world size above 1 raises an
+  explanation. Queries, `new_group`, `barrier`, `destroy_process_group` and
+  every collective (`all_reduce` with each `ReduceOp`, `reduce`, `broadcast`,
+  the gathers, scatters, object collectives,
+  `reduce_scatter`/`reduce_scatter_tensor`, `all_to_all_single`; `all_to_all`
+  raises as gloo does) behave as on a one-rank gloo group, sync or `async_op`,
+  with PyTorch's argument errors; `send`/`recv` raise; stores are in memory.
+  `torch.utils.data.DistributedSampler` reproduces PyTorch's index order.
+  `torch.distributed.elastic`, `launch` and `run` raise ImportError.
 - **`torch.distributions`.** Every distribution in PyTorch 2.11's
   `torch.distributions.__all__`: Normal, LogNormal, Uniform, Bernoulli,
   Categorical, OneHotCategorical (and StraightThrough), Binomial, Multinomial,
@@ -823,6 +885,12 @@ derivatives; fixtures regenerated by `fixtures/torch_nn3/gen.py`),
 [python_torch_fft.rs](../crates/zipp-vm/tests/python_torch_fft.rs),
 [python_torch_sparse.rs](../crates/zipp-vm/tests/python_torch_sparse.rs) (fixtures
 regenerated by `fixtures/torch_sparse/gen.py`),
+[python_torch_quant.rs](../crates/zipp-vm/tests/python_torch_quant.rs) (fixtures
+regenerated by `fixtures/torch_quant/gen.py` under a PyTorch with the x86
+quantized engine, e.g. Linux/WSL),
+[python_torch_distributed.rs](../crates/zipp-vm/tests/python_torch_distributed.rs)
+(fixtures regenerated by `fixtures/torch_distributed/gen.py` under a CPU-only
+build),
 [python_torch_optim.rs](../crates/zipp-vm/tests/python_torch_optim.rs) and
 [python_torch_gpu.rs](../crates/zipp-vm/tests/python_torch_gpu.rs).
 

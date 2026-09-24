@@ -57,8 +57,9 @@ integration date every corpus program matched.
   CLI copies written files back under the project folder when the run
   finishes; the wasm engine only reports them). `input()` raises `EOFError`.
 - Parts of `torch`: the blocked sparse layouts (`torch.sparse_bsr`/
-  `sparse_bsc`), quantization, `torch.distributed`, CUDA devices (the GPU is
-  reached through `torch.compile`; see
+  `sparse_bsc`), FX graph-mode quantization and some quantized modules,
+  multi-process `torch.distributed` (one process, world size 1, works), CUDA
+  devices (the GPU is reached through `torch.compile`; see
   [Torch compatibility](TORCH_COMPATIBILITY.md)) and full PyTorch compiler
   support are missing, and float64 accumulations differ from PyTorch's
   float32 kernels in the last bits.

@@ -107,8 +107,14 @@ pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
     ),
     ("torch.nn.init", include_str!("lib/torch_nn_init.py")),
     ("torch.nn.utils", include_str!("lib/torch_nn_utils.py")),
-    ("torch.nn.utils.rnn", include_str!("lib/torch_nn_utils_rnn.py")),
-    ("torch.nn.parameter", include_str!("lib/torch_nn_parameter.py")),
+    (
+        "torch.nn.utils.rnn",
+        include_str!("lib/torch_nn_utils_rnn.py"),
+    ),
+    (
+        "torch.nn.parameter",
+        include_str!("lib/torch_nn_parameter.py"),
+    ),
     (
         "torch.nn.utils.parametrize",
         include_str!("lib/torch_nn_utils_parametrize.py"),
@@ -119,7 +125,131 @@ pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
     ),
     ("torch.linalg", include_str!("lib/torch_linalg.py")),
     ("torch.sparse", include_str!("lib/torch_sparse.py")),
-    ("torch.distributions", include_str!("lib/torch_distributions.py")),
+    ("torch._quant", include_str!("lib/torch_quant.py")),
+    ("torch.ao", include_str!("lib/torch_ao.py")),
+    ("torch.ao.nn", include_str!("lib/torch_ao_nn.py")),
+    (
+        "torch.distributed",
+        include_str!("lib/torch_distributed.py"),
+    ),
+    (
+        "torch.distributed.distributed_c10d",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.utils.data.distributed",
+        include_str!("lib/torch_utils_data_distributed.py"),
+    ),
+    (
+        "torch.distributed.elastic",
+        include_str!("lib/torch_distributed_unsupported.py"),
+    ),
+    (
+        "torch.distributed.launch",
+        include_str!("lib/torch_distributed_unsupported.py"),
+    ),
+    (
+        "torch.distributed.run",
+        include_str!("lib/torch_distributed_unsupported.py"),
+    ),
+    (
+        "torch.ao.nn.intrinsic",
+        include_str!("lib/torch_ao_nn_intrinsic.py"),
+    ),
+    ("torch.ao.nn.qat", include_str!("lib/torch_ao_nn_qat.py")),
+    (
+        "torch.ao.nn.intrinsic.qat",
+        include_str!("lib/torch_ao_nn_intrinsic_qat.py"),
+    ),
+    (
+        "torch.ao.nn.quantized",
+        include_str!("lib/torch_ao_nn_quantized.py"),
+    ),
+    (
+        "torch.ao.nn.quantized.functional",
+        include_str!("lib/torch_ao_nn_quantized_functional.py"),
+    ),
+    (
+        "torch.ao.nn.quantized.dynamic",
+        include_str!("lib/torch_ao_nn_quantized_dynamic.py"),
+    ),
+    (
+        "torch.ao.nn.intrinsic.quantized",
+        include_str!("lib/torch_ao_nn_intrinsic_quantized.py"),
+    ),
+    (
+        "torch.ao.quantization",
+        include_str!("lib/torch_ao_quantization.py"),
+    ),
+    (
+        "torch.ao.nn.intrinsic.quantized.dynamic",
+        include_str!("lib/torch_alias.py"),
+    ),
+    ("torch.quantization", include_str!("lib/torch_alias.py")),
+    (
+        "torch.ao.quantization.observer",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.ao.quantization.fake_quantize",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.ao.quantization.qconfig",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.ao.quantization.quantize",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.ao.quantization.fuse_modules",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.ao.quantization.stubs",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.ao.quantization.utils",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.ao.quantization.quantize_fx",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.quantization.observer",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.quantization.qconfig",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.quantization.quantize",
+        include_str!("lib/torch_alias.py"),
+    ),
+    ("torch.nn.quantized", include_str!("lib/torch_alias.py")),
+    (
+        "torch.nn.quantized.dynamic",
+        include_str!("lib/torch_alias.py"),
+    ),
+    (
+        "torch.nn.quantized.functional",
+        include_str!("lib/torch_alias.py"),
+    ),
+    ("torch.nn.intrinsic", include_str!("lib/torch_alias.py")),
+    (
+        "torch.nn.intrinsic.quantized",
+        include_str!("lib/torch_alias.py"),
+    ),
+    ("torch.nn.intrinsic.qat", include_str!("lib/torch_alias.py")),
+    ("torch.nn.qat", include_str!("lib/torch_alias.py")),
+    (
+        "torch.distributions",
+        include_str!("lib/torch_distributions.py"),
+    ),
     (
         "torch.distributions.constraints",
         include_str!("lib/torch_distributions_constraints.py"),
@@ -309,11 +439,17 @@ pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
         include_str!("lib/torch_distributions_submodule.py"),
     ),
     ("torch.fft", include_str!("lib/torch_fft.py")),
-    ("torch.nn.parallel", include_str!("lib/torch_nn_parallel.py")),
+    (
+        "torch.nn.parallel",
+        include_str!("lib/torch_nn_parallel.py"),
+    ),
     ("torch.amp", include_str!("lib/torch_amp.py")),
     ("torch.special", include_str!("lib/torch_special.py")),
     ("torch.optim", include_str!("lib/torch_optim.py")),
-    ("torch.optim.optimizer", include_str!("lib/torch_optim_optimizer.py")),
+    (
+        "torch.optim.optimizer",
+        include_str!("lib/torch_optim_optimizer.py"),
+    ),
     (
         "torch.optim.lr_scheduler",
         include_str!("lib/torch_optim_lr_scheduler.py"),

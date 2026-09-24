@@ -35,7 +35,8 @@
     // as cheap as the native call.
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
-        N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23;
+        N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23,
+        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -2593,9 +2594,195 @@
         written(dst);
         return null;
     }
+    // ---- quantization ---------------------------------------------------------------------
+    // The integer kernels behind torch.quantize_per_tensor/per_channel,
+    // dequantize and the quantized Linear/Conv modules (torch_quant.py),
+    // reproducing PyTorch 2.11's CPU arithmetic (fbgemm, and oneDNN where
+    // the x86 engine uses it) bit for bit. Every float32 step is a
+    // Math.fround of the double result, which is the correctly rounded
+    // float32 operation (+, -, *, / of float32 values in double round once
+    // more innocuously); rounding to an integer is half-to-even (nearbyint).
+    // An int32 storage is a Float64Array, as everywhere in this file.
+    function rintEven(v) { const r = Math.round(v); return (r - v === 0.5 && r % 2 !== 0) ? r - 1 : r; }
+    // A per-tensor parameter (a number) or per-channel one (a storage).
+    function qParams(v) { return isStorage(v) ? vals(v) : [jsNumber(v)]; }
+    // The same for a native call: the values, or the one number.
+    function qNat(v, P) { return isStorage(v) ? P : P[0]; }
+    // The float32 fma(a, b, c) (one rounding of the exact a * b + c) of
+    // float32 values: a * b is exact in double; the double sum's error term
+    // (TwoSum) decides a tie that its rounding to float32 would meet.
+    const FMA_F = new Float32Array(1), FMA_I = new Int32Array(FMA_F.buffer);
+    function fma32(a, b, c) {
+        const p = a * b, s = p + c, bb = s - p, err = (p - (s - bb)) + (c - bb), r = Math.fround(s);
+        if (err === 0 || r === s || !Number.isFinite(r)) return r;
+        // The float32 neighbour of r on s's side; s is a tie only when it
+        // is exactly halfway between them.
+        FMA_F[0] = r;
+        FMA_I[0] += (s > r) === (r >= 0) ? 1 : -1;
+        const other = FMA_F[0];
+        if (s - r !== (other - r) / 2) return r;
+        return (err > 0) === (other > r) ? other : r;
+    }
+    // q_quantize(x, scales, zero_points, outer, C, inner, qmin, qmax, dtype,
+    // mode): x (float32) viewed as [outer, C, inner], channel c quantized
+    // with scale[c]/zero_point[c] (C = 1: per tensor) as PyTorch does:
+    // clamp(nearbyint(x * float(1 / float(scale))) + zero_point). The modes
+    // are the three CPU paths' treatment of NaN and of values past int32:
+    // 0, fbgemm's per-tensor uint8/int8 loop (NaN and large values go to
+    // qmax; the rounded value saturates to int32 - 128 above and wraps in
+    // int32 when the zero point is added); 1, the per-tensor int32 loop
+    // (NaN to qmin, otherwise saturating); 2, the per-channel loop (NaN to
+    // 0 for the 8-bit types and qmin for int32, otherwise saturating).
+    function qQuantize(x, scales, zps, outer, C, inner, qmin, qmax, dtype, mode) {
+        const X = vals(x), n = X.length, S = qParams(scales), Z = qParams(zps);
+        if (x.dtype !== "float32" || n !== outer * C * inner || S.length !== C || Z.length !== C || !(mode === 0 || mode === 1 || mode === 2)) fail(E.RuntimeError, "q_quantize: invalid arguments");
+        const out = alloc(dtype, n), O = out.data, nan = mode === 0 ? qmax : mode === 1 || dtype === "int32" ? qmin : 0;
+        if (NATIVE !== null && n >= NATIVE_MIN && NATIVE(N_Q_QUANTIZE, X, qNat(scales, S), qNat(zps, Z), O, outer, C, inner, qmin, qmax, nan, mode)) return out;
+        let i = 0;
+        for (let o = 0; o < outer; o++) for (let c = 0; c < C; c++) {
+            const inv = Math.fround(1 / Math.fround(S[c])), z = Z[c];
+            for (let k = 0; k < inner; k++, i++) {
+                const v = X[i];
+                let q;
+                if (v !== v) q = nan;
+                else {
+                    q = rintEven(Math.fround(v * inv));
+                    if (mode === 0) {
+                        if (q > 2147483520) q = 2147483520; else if (q < -2147483648) q = -2147483648;
+                        q += z;
+                        if (q > 2147483647) q -= 4294967296; else if (q < -2147483648) q += 4294967296;
+                    } else q += z;
+                    if (q < qmin) q = qmin; else if (q > qmax) q = qmax;
+                }
+                O[i] = q;
+            }
+        }
+        return out;
+    }
+    // q_fake_quant(x, scales, zero_points, outer, C, inner, qmin, qmax):
+    // torch.fake_quantize_per_tensor/per_channel_affine's cachemask kernel
+    // over x viewed as [outer, C, inner]: r = nearbyint(x * float(1 /
+    // float(scale))) + zero_point, the output (clamp(r) - zero_point) *
+    // float(scale) in x's dtype, and the mask qmin <= r <= qmax (bool)
+    // that passes the straight-through gradient.
+    function qFakeQuant(x, scales, zps, outer, C, inner, qmin, qmax) {
+        const X = vals(x), n = X.length, S = qParams(scales), Z = qParams(zps), f32 = x.dtype === "float32";
+        if ((!f32 && x.dtype !== "float64") || n !== outer * C * inner || S.length !== C || Z.length !== C) fail(E.RuntimeError, "q_fake_quant: invalid arguments");
+        const out = alloc(x.dtype, n), mask = alloc("bool", n), O = out.data, Mk = mask.data;
+        if (NATIVE !== null && n >= NATIVE_MIN && NATIVE(N_Q_FAKE, X, qNat(scales, S), qNat(zps, Z), O, Mk, outer, C, inner, qmin, qmax)) return tuple([out, mask]);
+        let i = 0;
+        for (let o = 0; o < outer; o++) for (let c = 0; c < C; c++) {
+            const s = Math.fround(S[c]), inv = Math.fround(1 / s), z = Z[c];
+            for (let k = 0; k < inner; k++, i++) {
+                const p = X[i] * inv, r = rintEven(f32 ? Math.fround(p) : p) + z;
+                Mk[i] = r >= qmin && r <= qmax ? 1 : 0;
+                O[i] = s * ((r < qmin ? qmin : r > qmax ? qmax : r) - z);
+            }
+        }
+        return tuple([out, mask]);
+    }
+    // q_dequantize(q, scales, zero_points, outer, C, inner, double): the
+    // float32 values float(scale) * (q - zero_point), or with `double` (the
+    // per-channel kernel) (q - zero_point) times the double scale, rounded
+    // once.
+    function qDequantize(q, scales, zps, outer, C, inner, dbl) {
+        const Q = q.data, n = Q.length, S = qParams(scales), Z = qParams(zps);
+        if (n !== outer * C * inner || S.length !== C || Z.length !== C) fail(E.RuntimeError, "q_dequantize: invalid arguments");
+        const out = alloc("float32", n), O = out.data;
+        if (NATIVE !== null && n >= NATIVE_MIN && NATIVE(N_Q_DEQUANTIZE, Q, qNat(scales, S), qNat(zps, Z), O, outer, C, inner, dbl)) return out;
+        let i = 0;
+        for (let o = 0; o < outer; o++) for (let c = 0; c < C; c++) {
+            const s = dbl ? S[c] : Math.fround(S[c]), z = Z[c];
+            for (let k = 0; k < inner; k++, i++) O[i] = s * Math.fround(Q[i] - z);
+        }
+        return out;
+    }
+    // q_matmul(x, x_zp, M, K, w, w_zps, N): the exact integer products
+    // acc[i, j] = sum_k (x[i, k] - x_zp) * (w[j, k] - w_zp[j]) of a
+    // quantized [M, K] input and [N, K] weight (an int32 accumulator in
+    // PyTorch; here a double, exact below 2^53).
+    function qMatmul(x, xzp, M, K, w, wzps, N) {
+        const X = x.data, W = w.data, Z = qParams(wzps);
+        if (X.length !== M * K || W.length !== N * K || (Z.length !== N && Z.length !== 1)) fail(E.RuntimeError, "q_matmul: invalid arguments");
+        const out = alloc("float64", M * N), O = out.data;
+        if (NATIVE !== null && M * N * K >= NATIVE_MIN && NATIVE(N_Q_MATMUL, X, W, qNat(wzps, Z), O, xzp, M, K, N)) return out;
+        for (let i = 0; i < M; i++) for (let j = 0; j < N; j++) {
+            const zw = Z.length === 1 ? Z[0] : Z[j], xb = i * K, wb = j * K;
+            let s = 0;
+            for (let k = 0; k < K; k++) s += (X[xb + k] - xzp) * (W[wb + k] - zw);
+            O[i * N + j] = s;
+        }
+        return out;
+    }
+    // q_conv2d(x, [B, C, H, W], x_zp, w, [O, Cg, Kh, Kw], w_zps, stride,
+    // padding, dilation, groups): the exact integer accumulators of a
+    // quantized convolution, [B, O, Ho, Wo]; padding reads x_zp (a zero).
+    function qConv2d(x, xs, xzp, w, ws, wzps, stride, padding, dilation, groups) {
+        const [B, C, H, W] = xs, [O, Cg, Kh, Kw] = ws, [Sh, Sw] = stride, [Ph, Pw] = padding, [Dh, Dw] = dilation;
+        const Z = qParams(wzps);
+        if (x.data.length !== B * C * H * W || w.data.length !== O * Cg * Kh * Kw || C !== Cg * groups || O % groups !== 0 || (Z.length !== O && Z.length !== 1))
+            fail(E.RuntimeError, "q_conv2d: invalid arguments");
+        const Ho = Math.floor((H + 2 * Ph - Dh * (Kh - 1) - 1) / Sh) + 1, Wo = Math.floor((W + 2 * Pw - Dw * (Kw - 1) - 1) / Sw) + 1;
+        if (Ho < 1 || Wo < 1) fail(E.RuntimeError, "q_conv2d: kernel exceeds padded input");
+        const out = alloc("float64", B * O * Ho * Wo), Od = out.data, X = x.data, Wd = w.data, perGroup = O / groups;
+        if (NATIVE !== null && Od.length * Cg * Kh * Kw >= NATIVE_MIN && NATIVE(N_Q_CONV2D, X, Wd, qNat(wzps, Z), Od, xzp, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw, groups, Ho, Wo))
+            return tuple([out, pyShape([B, O, Ho, Wo])]);
+        for (let b = 0; b < B; b++) for (let o = 0; o < O; o++) {
+            const first = Math.floor(o / perGroup) * Cg, zw = Z.length === 1 ? Z[0] : Z[o];
+            for (let h = 0; h < Ho; h++) for (let v = 0; v < Wo; v++) {
+                let s = 0;
+                for (let c = 0; c < Cg; c++) for (let kh = 0; kh < Kh; kh++) {
+                    const ih = h * Sh - Ph + kh * Dh;
+                    if (ih < 0 || ih >= H) continue;
+                    for (let kw = 0; kw < Kw; kw++) {
+                        const iw = v * Sw - Pw + kw * Dw;
+                        if (iw < 0 || iw >= W) continue;
+                        s += (X[((b * C + first + c) * H + ih) * W + iw] - xzp) * (Wd[((o * Cg + c) * Kh + kh) * Kw + kw] - zw);
+                    }
+                }
+                Od[((b * O + o) * Ho + h) * Wo + v] = s;
+            }
+        }
+        return tuple([out, pyShape([B, O, Ho, Wo])]);
+    }
+    // q_requant(acc, outer, N, inner, bias, atw, mult, out_zp, lo, hi, mode):
+    // accumulators [outer, N, inner] (channel j = the middle index) to the
+    // output. atw[j] is float(x_scale) * float(w_scale[j]) and mult[j]
+    // atw[j] / float(y_scale), both float32. Mode 0 is fbgemm's
+    // ReQuantizeOutput (a uint8 result: nearbyint(float(float(acc) +
+    // bias/atw) * mult) + zp, clamped to [lo, hi]); mode 1 oneDNN's (the
+    // zero point added in float before rounding); mode 2 fbgemm's
+    // ReQuantizeForFloat (a float32 result: fma(float(acc), atw, bias)).
+    function qRequant(acc, outer, N, inner, bias, atw, mult, ozp, lo, hi, mode) {
+        const A = acc.data, n = A.length, Bv = bias === null ? null : vals(bias), T = qParams(atw), Mu = qParams(mult);
+        if (n !== outer * N * inner || T.length !== N || Mu.length !== N || (Bv !== null && Bv.length !== N)) fail(E.RuntimeError, "q_requant: invalid arguments");
+        const out = alloc(mode === 2 ? "float32" : "uint8", n), O = out.data;
+        if (NATIVE !== null && n >= NATIVE_MIN && NATIVE(N_Q_REQUANT, A, Bv, qNat(atw, T), qNat(mult, Mu), O, outer, N, inner, ozp, lo, hi, mode)) return out;
+        let i = 0;
+        for (let o = 0; o < outer; o++) for (let j = 0; j < N; j++) {
+            const t = T[j], m = Mu[j], b = Bv === null ? 0 : Bv[j], bt = Bv === null ? 0 : Math.fround(b / t);
+            for (let k = 0; k < inner; k++, i++) {
+                const a = Math.fround(A[i]);
+                if (mode === 2) { O[i] = fma32(a, t, b); continue; }
+                const ab = Math.fround(Math.fround(a + bt) * m);
+                let q = mode === 0 ? rintEven(ab) + ozp : rintEven(Math.fround(ab + ozp));
+                if (q < lo) q = lo; else if (q > hi) q = hi;
+                O[i] = q;
+            }
+        }
+        return out;
+    }
     rt.defineModule("_zipp_tensor", (g) => {
         const fn = (name, arity, code, min) => g.set(name, rt.builtin(name, arity, code, min));
         const num = (v) => jsNumber(v);
+        // fround(x): the float32 nearest a Python float (PyTorch's float(x)).
+        fn("fround", 1, (a) => Math.fround(num(a[0])));
+        fn("q_quantize", 10, (a) => qQuantize(needS(a[0]), a[1], a[2], num(a[3]), num(a[4]), num(a[5]), num(a[6]), num(a[7]), rt.needStr(a[8]), num(a[9])));
+        fn("q_fake_quant", 8, (a) => qFakeQuant(needS(a[0]), a[1], a[2], num(a[3]), num(a[4]), num(a[5]), num(a[6]), num(a[7])));
+        fn("q_dequantize", 7, (a) => qDequantize(needS(a[0]), a[1], a[2], num(a[3]), num(a[4]), num(a[5]), rt.truth(a[6])));
+        fn("q_matmul", 7, (a) => qMatmul(needS(a[0]), num(a[1]), num(a[2]), num(a[3]), needS(a[4]), a[5], num(a[6])));
+        fn("q_conv2d", 10, (a) => qConv2d(needS(a[0]), shapeOf(a[1]), num(a[2]), needS(a[3]), shapeOf(a[4]), a[5], ints(a[6]), ints(a[7]), ints(a[8]), num(a[9])));
+        fn("q_requant", 11, (a) => qRequant(needS(a[0]), num(a[1]), num(a[2]), num(a[3]), a[4] === null ? null : needS(a[4]), a[5], a[6], num(a[7]), num(a[8]), num(a[9]), num(a[10])));
         fn("sp_scatter_add", 4, (a) => {
             const d = a[0], v = a[2], block = num(a[3]);
             if (isStorage(d) && isStorage(v)) return spScatterAdd(d, needS(a[1]), v, block);

@@ -13,6 +13,13 @@ def _rebuild_sparse_tensor(layout, data):
     return torch.sparse._rebuild(layout, data)
 
 
+def _rebuild_qtensor(storage, storage_offset, size, stride, quantizer_params, requires_grad=False, backward_hooks=None):
+    """A checkpoint's quantized tensor: its integers in a QUInt8/QInt8/QInt32
+    storage and (qscheme, scale, zero_point) or (qscheme, scales,
+    zero_points, axis)."""
+    return torch._quant._rebuild_qtensor(storage, storage_offset, size, stride, quantizer_params, requires_grad, backward_hooks)
+
+
 def _rebuild_parameter(data, requires_grad, backward_hooks):
     # How PyTorch pickles an nn.Parameter: its data, then requires_grad.
     return torch.nn.Parameter(data, requires_grad)
@@ -43,6 +50,8 @@ def _weights_only_find_class(module, name):
             return _rebuild_parameter_with_state
         if name == "_rebuild_sparse_tensor":
             return _rebuild_sparse_tensor
+        if name == "_rebuild_qtensor":
+            return _rebuild_qtensor
     if module == "torch.serialization" and name == "_get_layout":
         return torch._get_layout
     if module == "torch":
@@ -50,6 +59,10 @@ def _weights_only_find_class(module, name):
             return torch._STORAGE_NAMES[name]
         if name in torch._DTYPES:
             return torch._DTYPES[name]
+        if name in torch._QDTYPES:
+            return torch._QDTYPES[name]
+        if name in torch._QSCHEMES:
+            return torch._QSCHEMES[name]
         if name == "Size":
             return torch.Size
         if name == "device":

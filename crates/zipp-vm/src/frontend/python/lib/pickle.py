@@ -572,6 +572,12 @@ class Pickler:
                     self._save(k)
                     self._save(v)
                 self._w(b"u")
+            # A state dict's `_metadata` (each module's version), which
+            # PyTorch's loaders read, travels as the dict's BUILD state.
+            metadata = getattr(obj, "_metadata", None)
+            if metadata is not None:
+                self._save({"_metadata": metadata})
+                self._w(b"b")
         elif isinstance(obj, dict):
             self._w(b"}")
             self._memoize(obj)

@@ -42,6 +42,7 @@
 //! and polls the host abort flag between blocks of work.
 mod fft;
 mod linalg;
+mod quant;
 mod sparse;
 
 use super::helpers_num2::{f16_bits_to_f64, f64_to_f16_bits, math_unary};
@@ -83,8 +84,17 @@ const OP_SP_KEYS: u32 = 20;
 const OP_SP_SCATTER: u32 = 21;
 const OP_SP_MERGE: u32 = 22;
 const OP_INDEX_SELECT: u32 = 23;
+const OP_Q_QUANTIZE: u32 = 24;
+const OP_Q_DEQUANTIZE: u32 = 25;
+const OP_Q_MATMUL: u32 = 26;
+const OP_Q_CONV2D: u32 = 27;
+const OP_Q_REQUANT: u32 = 28;
+const OP_Q_FAKE: u32 = 29;
 
-// TypedArray kinds (`native::TA_KINDS`) a tensor storage can be.
+// TypedArray kinds (`native::TA_KINDS`) a tensor storage can be. An int8
+// storage (Int8Array) reaches only the quantization kernels
+// (`pt_view_q`); every other kernel declines it.
+const KIND_I8: u8 = 0;
 const KIND_U8: u8 = 1;
 const KIND_U16: u8 = 4;
 const KIND_F32: u8 = 7;
@@ -104,7 +114,7 @@ struct View {
 impl View {
     fn size(self) -> usize {
         match self.kind {
-            KIND_U8 => 1,
+            KIND_I8 | KIND_U8 => 1,
             KIND_U16 | KIND_F16 => 2,
             KIND_F32 => 4,
             _ => 8,
@@ -450,6 +460,12 @@ impl Vm<'_> {
             OP_SP_SCATTER => Value::bool(self.pt_sp_scatter(a).is_some()),
             OP_SP_MERGE => Value::bool(self.pt_sp_merge(a).is_some()),
             OP_INDEX_SELECT => Value::bool(self.pt_index_select(a).is_some()),
+            OP_Q_QUANTIZE => Value::bool(self.pt_q_quantize(a).is_some()),
+            OP_Q_DEQUANTIZE => Value::bool(self.pt_q_dequantize(a).is_some()),
+            OP_Q_MATMUL => Value::bool(self.pt_q_matmul(a).is_some()),
+            OP_Q_CONV2D => Value::bool(self.pt_q_conv2d(a).is_some()),
+            OP_Q_REQUANT => Value::bool(self.pt_q_requant(a).is_some()),
+            OP_Q_FAKE => Value::bool(self.pt_q_fake(a).is_some()),
             _ => Value::bool(false),
         })
     }
@@ -514,6 +530,7 @@ impl Vm<'_> {
             })),
             KIND_F16 => out.extend(bytes.chunks_exact(2).map(|c| f16_bits_to_f64(u16::from_le_bytes([c[0], c[1]])))),
             KIND_U16 => out.extend(bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as f64)),
+            KIND_I8 => out.extend(bytes.iter().map(|&b| b as i8 as f64)),
             _ => out.extend(bytes.iter().map(|&b| b as f64)),
         }
         Some(out)
@@ -1804,6 +1821,195 @@ impl Vm<'_> {
 
     /// `(C, A, B, O, shape, stridesC, stridesA, stridesB)`: tensor.js's
     /// `where`, `O[i] = C[.] ? A[.] : B[.]`.
+    // ---- quantization (see `quant`) ----------------------------------------------------
+
+    /// `pt_view`, admitting an Int8Array too (a qint8 storage).
+    fn pt_view_q(&self, v: Value) -> Option<View> {
+        if !v.is_heap() {
+            return None;
+        }
+        let idx = v.heap_index();
+        let HeapObj::TypedArray { buffer, kind, byte_offset, .. } = *self.heap.get(idx) else {
+            return None;
+        };
+        if kind != KIND_I8 {
+            return self.pt_view(v);
+        }
+        let len = self.ta_effective_len(idx)?;
+        Some(View { buffer, kind, offset: byte_offset, len })
+    }
+
+    /// A per-tensor parameter (a number) or per-channel values (a view).
+    fn pt_params(&self, v: Value) -> Option<quant::Params> {
+        if v.is_number() {
+            return Some(quant::Params::One(v.as_f64()));
+        }
+        let view = self.pt_view_q(v)?;
+        Some(quant::Params::Many(self.pt_read_all(view)?))
+    }
+
+    /// `(X, S, Z, O, outer, C, inner, qmin, qmax, nan, mode)`: tensor.js's
+    /// `qQuantize` (see `quant::quantize`) of a float32 X into O.
+    fn pt_q_quantize(&mut self, a: &[Value]) -> Option<()> {
+        let (vx, vo) = (self.pt_view(arg(a, 0))?, self.pt_view_q(arg(a, 3))?);
+        if vx.kind != KIND_F32 || !matches!(vo.kind, KIND_U8 | KIND_I8 | KIND_F64) || vo.buffer == vx.buffer {
+            return None;
+        }
+        let (scales, zps) = (self.pt_params(arg(a, 1))?, self.pt_params(arg(a, 2))?);
+        let (outer, c, inner) = (int_arg(a, 4)?, int_arg(a, 5)?, int_arg(a, 6)?);
+        let (qmin, qmax, nan) = (num_arg(a, 7)?, num_arg(a, 8)?, num_arg(a, 9)?);
+        let mode = u32::try_from(int_arg(a, 10)?).ok()?;
+        if vx.len != vo.len || mode > 2 {
+            return None;
+        }
+        let cost = self.pt_admit(vx.len, vx.len.saturating_mul(2))?;
+        let x = self.pt_read_all(vx)?;
+        let mut out = zeroed(vx.len)?;
+        quant::quantize(&x, &scales, &zps, &mut out, outer, c, inner, qmin, qmax, nan, mode)?;
+        self.pt_write(vo, 0, &out)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(Q, S, Z, O, outer, C, inner, double)`: tensor.js's `qDequantize`
+    /// into the float32 O.
+    fn pt_q_dequantize(&mut self, a: &[Value]) -> Option<()> {
+        let (vq, vo) = (self.pt_view_q(arg(a, 0))?, self.pt_view(arg(a, 3))?);
+        if !matches!(vq.kind, KIND_U8 | KIND_I8 | KIND_F64) || vo.kind != KIND_F32 || vo.buffer == vq.buffer || vq.len != vo.len {
+            return None;
+        }
+        let (scales, zps) = (self.pt_params(arg(a, 1))?, self.pt_params(arg(a, 2))?);
+        let (outer, c, inner) = (int_arg(a, 4)?, int_arg(a, 5)?, int_arg(a, 6)?);
+        let dbl = arg(a, 7).is_bool() && arg(a, 7).as_bool();
+        let cost = self.pt_admit(vq.len, vq.len.saturating_mul(2))?;
+        let q = self.pt_read_all(vq)?;
+        let mut out = zeroed(vq.len)?;
+        quant::dequantize(&q, &scales, &zps, &mut out, outer, c, inner, dbl)?;
+        self.pt_write(vo, 0, &out)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(X, S, Z, O, M, outer, C, inner, qmin, qmax)`: tensor.js's
+    /// `qFakeQuant` of a float32/float64 X into O (X's type) and the bool
+    /// mask M.
+    fn pt_q_fake(&mut self, a: &[Value]) -> Option<()> {
+        let (vx, vo, vm) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 3))?, self.pt_view(arg(a, 4))?);
+        if !matches!(vx.kind, KIND_F32 | KIND_F64) || vo.kind != vx.kind || vm.kind != KIND_U8 || vx.len != vo.len || vx.len != vm.len {
+            return None;
+        }
+        if vo.buffer == vx.buffer || vm.buffer == vx.buffer || vm.buffer == vo.buffer {
+            return None;
+        }
+        let (scales, zps) = (self.pt_params(arg(a, 1))?, self.pt_params(arg(a, 2))?);
+        let (outer, c, inner) = (int_arg(a, 5)?, int_arg(a, 6)?, int_arg(a, 7)?);
+        let (qmin, qmax) = (num_arg(a, 8)?, num_arg(a, 9)?);
+        let cost = self.pt_admit(vx.len, vx.len.saturating_mul(3))?;
+        let x = self.pt_read_all(vx)?;
+        let mut out = zeroed(vx.len)?;
+        let mut mask = zeroed(vx.len)?;
+        quant::fake_quant(&x, vx.kind == KIND_F32, &scales, &zps, &mut out, &mut mask, outer, c, inner, qmin, qmax)?;
+        self.pt_write(vo, 0, &out)?;
+        self.pt_write(vm, 0, &mask)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(X, W, Z, O, x_zp, M, K, N)`: tensor.js's `qMatmul`, the integer
+    /// accumulators of a quantized [M, K] x [N, K]^T product into the
+    /// float64 O.
+    fn pt_q_matmul(&mut self, a: &[Value]) -> Option<()> {
+        let (vx, vw, vo) = (self.pt_view_q(arg(a, 0))?, self.pt_view_q(arg(a, 1))?, self.pt_view(arg(a, 3))?);
+        if !matches!(vx.kind, KIND_U8 | KIND_I8) || !matches!(vw.kind, KIND_U8 | KIND_I8) || vo.kind != KIND_F64 {
+            return None;
+        }
+        if vo.buffer == vx.buffer || vo.buffer == vw.buffer {
+            return None;
+        }
+        let zps = self.pt_params(arg(a, 2))?;
+        let xzp = num_arg(a, 4)?;
+        let (m, k, n) = (int_arg(a, 5)?, int_arg(a, 6)?, int_arg(a, 7)?);
+        let (mk, kn, mn) = (m.checked_mul(k)?, k.checked_mul(n)?, m.checked_mul(n)?);
+        if vx.len != mk || vw.len != kn || vo.len != mn {
+            return None;
+        }
+        let cost = self.pt_admit(mn.checked_mul(k)?.checked_add(mn)?, mk.saturating_add(kn).saturating_add(mn))?;
+        let x = self.pt_read_all(vx)?;
+        let w = self.pt_read_all(vw)?;
+        let mut out = zeroed(mn)?;
+        quant::matmul(&x, &w, &zps, &mut out, xzp, m, k, n, POLL_UNITS, || self.native_kernel_interrupted())?;
+        self.pt_write(vo, 0, &out)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(X, W, Z, O, x_zp, B, C, H, W, O, Cg, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw,
+    /// groups, Ho, Wo)`: tensor.js's `qConv2d` into the float64 O.
+    fn pt_q_conv2d(&mut self, a: &[Value]) -> Option<()> {
+        let (vx, vw, vo) = (self.pt_view_q(arg(a, 0))?, self.pt_view_q(arg(a, 1))?, self.pt_view(arg(a, 3))?);
+        if !matches!(vx.kind, KIND_U8 | KIND_I8) || !matches!(vw.kind, KIND_U8 | KIND_I8) || vo.kind != KIND_F64 {
+            return None;
+        }
+        if vo.buffer == vx.buffer || vo.buffer == vw.buffer {
+            return None;
+        }
+        let zps = self.pt_params(arg(a, 2))?;
+        let xzp = num_arg(a, 4)?;
+        let mut d = [0usize; 17];
+        for (i, slot) in d.iter_mut().enumerate() {
+            *slot = int_arg(a, 5 + i)?;
+        }
+        let [b, c, h, w, o, cg, kh, kw, sh, sw, ph, pw, dh, dw, groups, ho, wo] = d;
+        let dims = quant::ConvDims { b, c, h, w, o, cg, kh, kw, sh, sw, ph, pw, dh, dw, groups, ho, wo };
+        if vx.len != b.checked_mul(c)?.checked_mul(h)?.checked_mul(w)? || vw.len != o.checked_mul(cg)?.checked_mul(kh)?.checked_mul(kw)? {
+            return None;
+        }
+        let n_out = b.checked_mul(o)?.checked_mul(ho)?.checked_mul(wo)?;
+        if vo.len != n_out {
+            return None;
+        }
+        let units = n_out.checked_mul(cg.checked_mul(kh)?.checked_mul(kw)?)?.checked_add(n_out)?;
+        let cost = self.pt_admit(units, vx.len.saturating_add(vw.len).saturating_add(n_out))?;
+        let x = self.pt_read_all(vx)?;
+        let wt = self.pt_read_all(vw)?;
+        let mut out = zeroed(n_out)?;
+        quant::conv2d(&x, &wt, &zps, &mut out, xzp, &dims, POLL_UNITS, || self.native_kernel_interrupted())?;
+        self.pt_write(vo, 0, &out)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(A, bias|null, atw, mult, O, outer, N, inner, out_zp, lo, hi,
+    /// mode)`: tensor.js's `qRequant` of float64 accumulators into the
+    /// uint8 (modes 0, 1) or float32 (mode 2) O.
+    fn pt_q_requant(&mut self, a: &[Value]) -> Option<()> {
+        let (vacc, vo) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 4))?);
+        let mode = u32::try_from(int_arg(a, 11)?).ok()?;
+        let want = if mode == 2 { KIND_F32 } else { KIND_U8 };
+        if vacc.kind != KIND_F64 || vo.kind != want || mode > 2 || vacc.len != vo.len || vo.buffer == vacc.buffer {
+            return None;
+        }
+        let bias = if arg(a, 1).is_null() {
+            None
+        } else {
+            let vb = self.pt_view(arg(a, 1))?;
+            if vb.buffer == vo.buffer {
+                return None;
+            }
+            Some(self.pt_read_all(vb)?)
+        };
+        let (atw, mult) = (self.pt_params(arg(a, 2))?, self.pt_params(arg(a, 3))?);
+        let (outer, n, inner) = (int_arg(a, 5)?, int_arg(a, 6)?, int_arg(a, 7)?);
+        let (ozp, lo, hi) = (num_arg(a, 8)?, num_arg(a, 9)?, num_arg(a, 10)?);
+        let cost = self.pt_admit(vacc.len, vacc.len.saturating_mul(2))?;
+        let acc = self.pt_read_all(vacc)?;
+        let mut out = zeroed(vacc.len)?;
+        quant::requant(&acc, bias.as_deref(), &atw, &mult, &mut out, outer, n, inner, ozp, lo, hi, mode)?;
+        self.pt_write(vo, 0, &out)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
     fn pt_where(&mut self, a: &[Value]) -> Option<()> {
         let (vc, va, vb, vo) = (
             self.pt_view(arg(a, 0))?,

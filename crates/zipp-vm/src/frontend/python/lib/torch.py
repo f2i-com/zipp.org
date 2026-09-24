@@ -19,7 +19,7 @@ _issubclass = _b.issubclass
 
 
 _ITEMSIZE = {"float64": 8, "int64": 8, "float32": 4, "int32": 4, "float16": 2, "bfloat16": 2, "int16": 2,
-             "complex64": 8, "complex128": 16, "complex32": 4}
+             "complex64": 8, "complex128": 16, "complex32": 4, "qint32": 4}
 
 
 class dtype:
@@ -27,7 +27,7 @@ class dtype:
         self.name = name
         self.is_floating_point = is_floating
         self.itemsize = _ITEMSIZE.get(name, 1)
-        self.is_signed = name not in ("uint8", "bool")
+        self.is_signed = name not in ("uint8", "bool", "quint8", "quint4x2")
         # complex64/complex128: interleaved (real, imaginary) pairs of
         # float32/float64 (`_zipp_tensor`'s pair storages). Not floating
         # point, as in PyTorch; `_inexact` is "floating or complex".
@@ -72,6 +72,41 @@ complex64 = dtype("complex64", False)
 complex128 = dtype("complex128", False)
 # complex32 (ComplexHalf) is named, but no tensor of it can be made here.
 complex32 = dtype("complex32", False)
+# The quantized dtypes: a quantized tensor (`_QTensor`, torch/_quant) keeps
+# its integers in a uint8/int8/int32 tensor. quint4x2 is named only.
+quint8 = dtype("quint8", False)
+qint8 = dtype("qint8", False)
+qint32 = dtype("qint32", False)
+quint4x2 = dtype("quint4x2", False)
+_QDTYPES = {"quint8": quint8, "qint8": qint8, "qint32": qint32, "quint4x2": quint4x2}
+
+
+class qscheme:
+    """A quantization scheme (torch.per_tensor_affine, ...)."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return "torch." + self.name
+
+    def __reduce__(self):
+        # Pickled as the global torch.<name>, as PyTorch writes one.
+        return self.name
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+per_tensor_affine = qscheme("per_tensor_affine")
+per_channel_affine = qscheme("per_channel_affine")
+per_tensor_symmetric = qscheme("per_tensor_symmetric")
+per_channel_symmetric = qscheme("per_channel_symmetric")
+per_channel_affine_float_qparams = qscheme("per_channel_affine_float_qparams")
+_QSCHEMES = {q.name: q for q in (per_tensor_affine, per_channel_affine, per_tensor_symmetric, per_channel_symmetric, per_channel_affine_float_qparams)}
 half = float16
 short = int16
 cfloat = complex64
@@ -778,9 +813,11 @@ class Tensor:
     _bwe = None
     _pg = None
     _bps = None
-    # A strided tensor (the sparse layouts are `_SparseTensor`).
+    # A strided tensor (the sparse layouts are `_SparseTensor`, quantized
+    # tensors `_QTensor`).
     is_sparse = False
     is_sparse_csr = False
+    is_quantized = False
 
     def __init__(self, storage=None, shape=None, dt=None, requires_grad=False, node=None):
         if dt.__class__ is not dtype:
@@ -2275,6 +2312,22 @@ class Tensor(_DenseTensor):
 
 
 _SparseTensor = Tensor
+
+
+# A quantized tensor: a `_QTensor` (also named Tensor) holding its integers
+# as an ordinary uint8/int8/int32 tensor (`_q`) with its scheme, scale(s)
+# and zero point(s); torch/_quant builds them and installs their methods.
+# Reading `_s` raises PyTorch's error for an operator without a quantized
+# kernel.
+class Tensor(_DenseTensor):
+    is_quantized = True
+
+    @property
+    def _s(self):
+        raise NotImplementedError("Could not run this operator with arguments from the 'QuantizedCPU' backend. This could be because the operator doesn't exist for this backend. Use Tensor.dequantize() first.")
+
+
+_QTensor = Tensor
 Tensor = _DenseTensor
 # torch.sparse, set once it is imported (the end of this module).
 _sp = None
@@ -2902,7 +2955,8 @@ class finfo:
 
 class iinfo:
     _INFO = {"uint8": (8, 0, 255), "int8": (8, -128, 127), "int16": (16, -32768, 32767), "int32": (32, -2 ** 31, 2 ** 31 - 1),
-             "int64": (64, -2 ** 63, 2 ** 63 - 1), "bool": (8, 0, 1)}
+             "int64": (64, -2 ** 63, 2 ** 63 - 1), "bool": (8, 0, 1),
+             "quint8": (8, 0, 255), "qint8": (8, -128, 127), "qint32": (32, -2 ** 31, 2 ** 31 - 1), "quint4x2": (4, 0, 15)}
 
     def __init__(self, type):
         dt = _dtype_of(type)
@@ -3659,7 +3713,7 @@ def _silu_grad(x):
 
 def relu(input):
     a = input
-    if _graph_recording and getattr(a, "_zipp_graph", False):
+    if (_graph_recording and getattr(a, "_zipp_graph", False)) or a.__class__ is _QTensor:
         return a.relu()
     # PyTorch's threshold_backward: the gradient passes where the result is
     # not <= 0, so a NaN input (a NaN result) passes it too.
@@ -4355,6 +4409,8 @@ def _returns(name, values, indices):
 
 def max(input, dim=None, keepdim=False, out=None):
     a = input
+    if a.__class__ is _QTensor:
+        return a.max() if dim is None else a.max(dim, keepdim)
     if _isinstance(dim, Tensor):
         return maximum(a, dim)
     if dim is None:
@@ -4369,6 +4425,8 @@ def max(input, dim=None, keepdim=False, out=None):
 
 def min(input, dim=None, keepdim=False, out=None):
     a = input
+    if a.__class__ is _QTensor:
+        return a.min() if dim is None else a.min(dim, keepdim)
     if _isinstance(dim, Tensor):
         return minimum(a, dim)
     if dim is None:
@@ -4981,7 +5039,7 @@ def topk(input, k, dim=-1, largest=True, sorted=True):
 # ---- shape ops ---------------------------------------------------------------------------
 def reshape(input, *shape):
     a = input
-    if _graph_recording and getattr(a, "_zipp_graph", False):
+    if (_graph_recording and getattr(a, "_zipp_graph", False)) or a.__class__ is _QTensor:
         return a.reshape(*shape)
     shape = _shape_args(shape)
     n = _numel(a.shape)
@@ -5047,7 +5105,7 @@ def unflatten(input, dim, sizes):
 
 def unsqueeze(input, dim):
     a = input
-    if _graph_recording and getattr(a, "_zipp_graph", False):
+    if (_graph_recording and getattr(a, "_zipp_graph", False)) or a.__class__ is _QTensor:
         return a.unsqueeze(dim)
     d = _norm_dim(dim, _len(a.shape) + 1)
     shape = _list(a.shape)
@@ -5057,7 +5115,7 @@ def unsqueeze(input, dim):
 
 def squeeze(input, dim=None):
     a = input
-    if _graph_recording and getattr(a, "_zipp_graph", False):
+    if (_graph_recording and getattr(a, "_zipp_graph", False)) or a.__class__ is _QTensor:
         return a.squeeze() if dim is None else a.squeeze(dim)
     rank = _len(a.shape)
     if dim is None:
@@ -5072,7 +5130,7 @@ def squeeze(input, dim=None):
 
 def permute(input, *dims):
     a = input
-    if _graph_recording and getattr(a, "_zipp_graph", False):
+    if (_graph_recording and getattr(a, "_zipp_graph", False)) or a.__class__ is _QTensor:
         return a.permute(*dims)
     dims = _shape_args(dims)
     rank = _len(a.shape)
@@ -5100,7 +5158,7 @@ def _permute(a, dims, rank):
 
 def transpose(input, dim0, dim1):
     a = input
-    if _graph_recording and getattr(a, "_zipp_graph", False):
+    if (_graph_recording and getattr(a, "_zipp_graph", False)) or a.__class__ is _QTensor:
         return a.transpose(dim0, dim1)
     if a.__class__ is _SparseTensor:
         return _sp._transpose(a, dim0, dim1)
@@ -5121,7 +5179,7 @@ swapdims = transpose
 
 def t(input):
     a = input
-    if _graph_recording and getattr(a, "_zipp_graph", False):
+    if (_graph_recording and getattr(a, "_zipp_graph", False)) or a.__class__ is _QTensor:
         return a.t()
     if a.__class__ is _SparseTensor:
         return _sp._t(a)
@@ -5248,6 +5306,8 @@ def cat(tensors, dim=0):
         raise RuntimeError("torch.cat(): expected a non-empty list of Tensors")
     if tensors[0].__class__ is _SparseTensor:
         return _sp._cat(tensors, dim)
+    if tensors[0].__class__ is _QTensor:
+        return _quant._cat(tensors, dim)
     # PyTorch skips legacy empty 1-d tensors when the others differ in rank.
     try:
         ranks = set(_len(t.shape) for t in tensors)
@@ -5287,6 +5347,8 @@ def stack(tensors, dim=0):
         raise RuntimeError("stack expects a non-empty TensorList")
     if tensors[0].__class__ is _SparseTensor:
         return _sp._stack(tensors, dim)
+    if tensors[0].__class__ is _QTensor:
+        return _quant._stack(tensors, dim)
     first = _tuple(tensors[0].shape)
     for i, t_ in enumerate(tensors):
         if not _shape_eq(t_.shape, first):
@@ -6579,6 +6641,8 @@ def einsum(equation, *operands):
 
 
 def equal(input, other):
+    if input.__class__ is _QTensor or other.__class__ is _QTensor:
+        return _quant._equal(input, other)
     return _tuple(input.shape) == _tuple(other.shape) and _bool(_k.equal(input._s, other._s))
 
 
@@ -7663,6 +7727,29 @@ class _Backends:
 
     mps = _Mps()
 
+    class _Quantized:
+        """torch.backends.quantized: the engine whose arithmetic the
+        quantized kernels reproduce ('x86' as on an x86 Linux build,
+        'fbgemm' or 'onednn'); qnnpack is not built."""
+        _engine = "x86"
+        _IDS = ("none", "fbgemm", "qnnpack", "onednn", "x86")
+        supported_engines = ["onednn", "x86", "fbgemm"]
+
+        @property
+        def engine(self):
+            return self._engine
+
+        @engine.setter
+        def engine(self, value):
+            value = str(value)
+            if value not in self._IDS:
+                raise RuntimeError("%s is not a valid value for quantized engine" % value)
+            if value not in self.supported_engines:
+                raise RuntimeError("quantized engine %s is not supported" % value.upper())
+            _Backends._Quantized._engine = value
+
+    quantized = _Quantized()
+
 
 backends = _Backends()
 
@@ -7681,6 +7768,9 @@ class _Storage:
 
     def nbytes(self):
         return _k.size(self._s) * self.dtype.itemsize
+
+    def element_size(self):
+        return self.dtype.itemsize
 
 
 class FloatStorage(_Storage):
@@ -7731,9 +7821,24 @@ class ComplexDoubleStorage(_Storage):
     dtype = complex128
 
 
+class QUInt8Storage(_Storage):
+    dtype = quint8
+
+
+class QInt8Storage(_Storage):
+    dtype = qint8
+
+
+class QInt32Storage(_Storage):
+    dtype = qint32
+
+
 _STORAGE_TYPES = {"float32": FloatStorage, "float64": DoubleStorage, "int64": LongStorage, "int32": IntStorage, "bool": BoolStorage, "uint8": ByteStorage,
                   "float16": HalfStorage, "bfloat16": BFloat16Storage, "int8": CharStorage, "int16": ShortStorage,
-                  "complex64": ComplexFloatStorage, "complex128": ComplexDoubleStorage}
+                  "complex64": ComplexFloatStorage, "complex128": ComplexDoubleStorage,
+                  "quint8": QUInt8Storage, "qint8": QInt8Storage, "qint32": QInt32Storage}
+# The storage dtype a quantized storage's bytes are read as.
+_Q_STORAGE_DTYPE = {"quint8": "uint8", "qint8": "int8", "qint32": "int32"}
 
 
 def _contiguous_strides(shape):
@@ -7787,6 +7892,11 @@ def save(obj, f, pickle_protocol=2):
         return None
 
     def reduce_tensor(t):
+        if t.__class__ is _QTensor:
+            # torch._utils._rebuild_qtensor(storage, offset, size, stride,
+            # quantizer_params, requires_grad, backward_hooks), as PyTorch.
+            import torch._utils
+            return (torch._utils._rebuild_qtensor, _quant._q_reduce_args(t) + (False, _OrderedDict()))
         if t.__class__ is _SparseTensor:
             # As PyTorch pickles one: torch._utils._rebuild_sparse_tensor(
             # layout, (indices, values, size, is_coalesced)) for COO and
@@ -7828,7 +7938,7 @@ def load(f, map_location=None, weights_only=True, **kwargs):
             if key not in blobs:
                 raw = z.read(prefix + "data/" + str(key))
                 dt = storage_type.dtype if _isinstance(storage_type, type) else _DTYPES[str(storage_type)]
-                blobs[key] = storage_type(_k.frombytes(dt.name, raw, _int(numel)))
+                blobs[key] = storage_type(_k.frombytes(_Q_STORAGE_DTYPE.get(dt.name, dt.name), raw, _int(numel)))
             return blobs[key]
 
         # PyTorch's weights-only allowlist (torch._utils): the rebuild
@@ -7922,6 +8032,26 @@ sparse_bsc_tensor = sparse._sparse_bsc_tensor
 sparse_compressed_tensor = sparse._sparse_compressed_tensor
 smm = sparse._smm
 hspmm = sparse._hspmm
+# torch._quant builds quantized tensors (`_QTensor`) and their kernels.
+import torch._quant as _quant
+quantize_per_tensor = _quant.quantize_per_tensor
+quantize_per_channel = _quant.quantize_per_channel
+quantize_per_tensor_dynamic = _quant.quantize_per_tensor_dynamic
+dequantize = _quant.dequantize
+fake_quantize_per_tensor_affine = _quant.fake_quantize_per_tensor_affine
+fake_quantize_per_channel_affine = _quant.fake_quantize_per_channel_affine
+fused_moving_avg_obs_fake_quant = _quant.fused_moving_avg_obs_fake_quant
+_make_per_tensor_quantized_tensor = _quant._make_per_tensor_quantized_tensor
+_make_per_channel_quantized_tensor = _quant._make_per_channel_quantized_tensor
+_empty_affine_quantized = _quant._empty_affine_quantized
+_empty_per_channel_affine_quantized = _quant._empty_per_channel_affine_quantized
+_choose_qparams_per_tensor = _quant._choose_qparams_per_tensor
+int_repr = lambda input: input.int_repr()
+q_scale = lambda input: input.q_scale()
+q_zero_point = lambda input: input.q_zero_point()
+q_per_channel_scales = lambda input: input.q_per_channel_scales()
+q_per_channel_zero_points = lambda input: input.q_per_channel_zero_points()
+q_per_channel_axis = lambda input: input.q_per_channel_axis()
 
 
 class _LazySubmodule:
@@ -7929,8 +8059,15 @@ class _LazySubmodule:
         self._lazy_name = name
 
     def _lazy_load(self):
-        if self._lazy_name == "fft":
+        name = self._lazy_name
+        if name == "fft":
             import torch.fft as module
+        elif name == "ao":
+            import torch.ao as module
+        elif name == "quantization":
+            import torch.quantization as module
+        elif name == "distributed":
+            import torch.distributed as module
         else:
             import torch.distributions as module
         globals()[self._lazy_name] = module
@@ -7950,6 +8087,9 @@ class _LazySubmodule:
 
 distributions = _LazySubmodule("distributions")
 fft = _LazySubmodule("fft")
+ao = _LazySubmodule("ao")
+quantization = _LazySubmodule("quantization")
+distributed = _LazySubmodule("distributed")
 
 
 class _Fx:

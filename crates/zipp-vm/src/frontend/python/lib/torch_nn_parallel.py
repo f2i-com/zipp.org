@@ -8,10 +8,11 @@ DataParallel behaves as PyTorch's does when no accelerator is available:
 `device_ids`, `output_device` and `dim` are accepted and ignored, and
 `device_ids` reads `[]`. DistributedDataParallel follows PyTorch's CPU
 module path (`device_ids`/`output_device` must be None, `device` is cpu)
-but, unlike PyTorch, does not require an initialized process group; with
-one process there is nothing to synchronize, so gradients are left exactly
-as backward computed them and communication hooks are recorded but never
-run.
+and uses torch.distributed's default process group (world_size 1) when one
+is initialized; unlike PyTorch it does not require one. With one process
+there is nothing to synchronize, so gradients are left exactly as backward
+computed them (the all-reduce of a one-rank group) and communication
+hooks are recorded but never run.
 """
 from contextlib import contextmanager
 import torch
@@ -65,6 +66,10 @@ class DistributedDataParallel(Module):
         if device_ids or output_device:
             raise ValueError("DistributedDataParallel device_ids and output_device arguments only work with single-device/multiple-device GPU modules or CPU modules, but got device_ids %s, output_device %s, and module parameters {device(type='cpu')}." % (device_ids, output_device))
         self.module = module
+        if process_group is None and device_mesh is None:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                process_group = dist.group.WORLD
         self.process_group = process_group
         self.device_mesh = device_mesh
         self.device_ids = None

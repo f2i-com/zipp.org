@@ -1,0 +1,256 @@
+tensor([[-1.0000,  0.5000,  2.0000],
+        [ 3.2000, -0.1000,  0.0000]], size=(2, 3), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.1, zero_point=10)
+tensor([[-1.0000,  0.5000,  2.0000],
+        [ 3.2000,  0.0000,  0.0000]], size=(2, 3), dtype=torch.qint8,
+       quantization_scheme=torch.per_channel_affine,
+       scale=tensor([0.1000, 0.2000], dtype=torch.float64),
+       zero_point=tensor([0, 3]), axis=0)
+tensor([[-0.9990,  0.5180,  1.9980],
+        [ 3.2560, -0.1110,  0.0000]], size=(2, 3), dtype=torch.qint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.037, zero_point=-3)
+tensor([[-1.0000,  0.5000,  2.0000],
+        [ 3.0000,  0.0000,  0.0000]], size=(2, 3), dtype=torch.qint32,
+       quantization_scheme=torch.per_tensor_affine, scale=0.5, zero_point=7)
+tensor(1.5000, size=(), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.1, zero_point=10)
+tensor([], size=(0,), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.1, zero_point=10)
+tensor([[ 2.1000,  2.5000,  1.9000,  ..., -1.0000,  1.3000,  2.7000],
+        [ 2.1000,  1.6000, -1.0000,  ...,  1.4000,  3.2000,  1.7000],
+        [ 1.1000, -1.0000, -1.0000,  ...,  3.6000,  1.4000,  0.5000],
+        ...,
+        [-1.0000, -0.7000,  0.9000,  ...,  0.0000, -1.0000, -1.0000],
+        [-0.7000,  1.6000,  2.2000,  ..., -1.0000, -1.0000, -0.7000],
+        [ 2.2000,  2.1000,  2.7000,  ..., -1.0000, -0.7000,  2.7000]],
+       size=(50, 50), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.1, zero_point=10)
+tensor([-1.0000,  0.5000,  2.0000], size=(3,), dtype=torch.qint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.1, zero_point=0)
+tensor([[0.5000, 2.0000],
+        [0.0000, 0.0000]], size=(2, 2), dtype=torch.qint8,
+       quantization_scheme=torch.per_channel_affine,
+       scale=tensor([0.1000, 0.2000], dtype=torch.float64),
+       zero_point=tensor([0, 3]), axis=0)
+tensor([[[ 1.4000,  1.1000],
+         [-1.6000, -2.1000]],
+
+        [[-0.7500, -0.2500],
+         [ 2.0000,  2.0000]],
+
+        [[ 0.0000, -0.6666],
+         [-2.3331, -1.6665]]], size=(3, 2, 2), dtype=torch.qint8,
+       quantization_scheme=torch.per_channel_affine,
+       scale=tensor([0.1000, 0.2500, 0.3333], dtype=torch.float64),
+       zero_point=tensor([ 0,  1, -2]), axis=0)
+tensor([[-1.0000,  0.5000,  2.0000],
+        [ 3.2000, -0.1000,  0.0000]], size=(2, 3), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.10000000149011612,
+       zero_point=10)
+tensor(0.5000, size=(), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.1, zero_point=10)
+tensor([[-1.0000,  3.2000],
+        [ 0.5000, -0.1000],
+        [ 2.0000,  0.0000]], size=(3, 2), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.1, zero_point=10)
+tensor([[-1.0039,  0.5020,  2.0079],
+        [ 3.2461, -0.1004,  0.0000]], size=(2, 3), dtype=torch.qint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.03346456692913386,
+       zero_point=-34)
+torch.quint8 torch.per_tensor_affine True False 0.1 10
+1 (3, 1) True False torch.strided cpu torch.Size([2, 3])
+tensor([0.1000, 0.2000], dtype=torch.float64) tensor([0, 3]) 0 torch.per_channel_affine
+tensor([[ 0, 15, 30],
+        [42,  9, 10]], dtype=torch.uint8) tensor([[-10,   5,  20],
+        [ 19,   3,   3]], dtype=torch.int8) torch.uint8
+torch.quint8 torch.qint8 torch.qint32 torch.quint4x2
+torch.per_tensor_affine torch.per_channel_affine torch.per_tensor_symmetric torch.per_channel_symmetric torch.per_channel_affine_float_qparams
+False False 4
+True False 0.5 2 2
+(tensor([[-1.0000,  0.5000,  2.0000],
+        [ 3.2000, -0.1000,  0.0000]]), tensor([[-1.0000,  0.5000,  2.0000],
+        [ 3.2000,  0.0000,  0.0000]]))
+True tensor([-1.0000, -0.5000], size=(2,), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.5, zero_point=3)
+tensor([[0.0000, 0.5000]], size=(1, 2), dtype=torch.qint8,
+       quantization_scheme=torch.per_channel_affine,
+       scale=tensor([0.5000], dtype=torch.float64), zero_point=tensor([1]),
+       axis=0)
+x86
+ERR RuntimeError: Quantize only works on Float Tensor, got Double
+ERR RuntimeError: Quantize only works on Float Tensor, got Half
+ERR RuntimeError: Quantize only works on Float Tensor, got Long
+ERR RuntimeError: ScalarType Float is not supported in new_qtensor.
+ERR RuntimeError: quantize_tensor_per_tensor_affine zero_point 300 is above upper bound.
+ERR RuntimeError: quantize_tensor_per_tensor_affine zero_point -1 is below lower bound.
+ERR RuntimeError: quantize_tensor_per_tensor_affine zero_point 200 is above upper bound.
+ERR RuntimeError: length of scales must equal to channel, expected 3 got, 2
+ERR RuntimeError: dtype QInt32not supported
+ERR RuntimeError: Expected quantizer->qscheme() == kPerTensorAffine to be true, but got false.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)
+ERR RuntimeError: Expected quantizer->qscheme() == kPerTensorAffine to be true, but got false.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)
+ERR RuntimeError: Expected quantizer->qscheme() == kPerChannelAffine || quantizer->qscheme() == kPerChannelAffineFloatQParams to be true, but got false.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)
+ERR RuntimeError: Expected quantizer->qscheme() == kPerChannelAffine || quantizer->qscheme() == kPerChannelAffineFloatQParams to be true, but got false.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)
+ERR RuntimeError: Expected quantizer->qscheme() == kPerTensorAffine to be true, but got false.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)
+ERR RuntimeError: length of scales must equal to channel, expected 3 got, 2
+ERR RuntimeError: Setting strides is possible only on uniformly quantized tensor
+ERR RuntimeError: Setting strides is possible only on uniformly quantized tensor
+ERR RuntimeError: load_scalar: invalid type
+ERR TypeError: Got unsupported ScalarType QUInt8
+ERR RuntimeError: Creation of quantized tensor requires quantized dtype like torch.quint8
+ERR RuntimeError: Creation of quantized tensor requires quantized dtype like torch.quint8
+ERR NotImplementedError: no kernel for the QuantizedCPU backend
+ERR NotImplementedError: no kernel for the QuantizedCPU backend
+ERR NotImplementedError: no kernel for the CPU backend
+ERR NotImplementedError: no kernel for the CPU backend
+ERR RuntimeError: `zero_point` must be between `quant_min` and `quant_max`.
+ERR RuntimeError: `quant_min` should be less than or         equal to `quant_max`.
+ERR RuntimeError: Zero-point must be Int32, Float or Half, found Long
+ERR AssertionError: backend: mkl not supported. backend must be one of ['fbgemm', 'x86', 'qnnpack', 'onednn']
+ERR ValueError: QConfig received observer instance, please pass observer class instead. Use MyObserver.with_args(x=1) to override arguments to constructor if needed
+ERR NotImplementedError: MinMaxObserver's qscheme only support torch.per_tensor_symmetric                     and torch.per_tensor_affine.
+ERR NotImplementedError: PerChannelMinMaxObserver's qscheme only support                     torch.per_channel_symmetric, torch.per_channel_affine and torch.per_channel_affine_float_qparams.
+ERR AssertionError: Used-specified quantization range must include 0.
+ERR AssertionError: prepare_qat only works on models in training mode
+ERR NotImplementedError: no kernel for the CPU backend
+FakeQuantizePerTensorAffineCachemaskBackward0 FakeQuantizePerTensorAffineCachemaskTensorQparamsBackward0
+FakeQuantizePerChannelAffineCachemaskBackward0
+MinMaxObserver(min_val=inf, max_val=-inf)
+MinMaxObserver(min_val=-1.0, max_val=3.25)
+PerChannelMinMaxObserver(min_val=tensor([]), max_val=tensor([]))
+QConfig(activation=functools.partial(<class 'torch.ao.quantization.observer.MinMaxObserver'>, quant_min=0, quant_max=127){}, weight=functools.partial(<class 'torch.ao.quantization.observer.MinMaxObserver'>, dtype=torch.qint8, qscheme=torch.per_tensor_symmetric){})
+QConfig(activation=functools.partial(<class 'torch.ao.quantization.observer.HistogramObserver'>, reduce_range=True){}, weight=functools.partial(<class 'torch.ao.quantization.observer.PerChannelMinMaxObserver'>, dtype=torch.qint8, qscheme=torch.per_channel_symmetric){})
+QConfig(activation=functools.partial(<class 'torch.ao.quantization.observer.PlaceholderObserver'>, dtype=torch.quint8, quant_min=0, quant_max=255, is_dynamic=True){}, weight=functools.partial(<class 'torch.ao.quantization.observer.MinMaxObserver'>, dtype=torch.qint8, qscheme=torch.per_tensor_symmetric){})
+QConfig(activation=<class 'torch.ao.quantization.observer.MinMaxObserver'>, weight=functools.partial(<class 'torch.ao.quantization.observer.MinMaxObserver'>, dtype=torch.qint8, qscheme=torch.per_tensor_symmetric){})
+FakeQuantize(
+  fake_quant_enabled=tensor([1], dtype=torch.uint8), observer_enabled=tensor([1], dtype=torch.uint8), quant_min=0, quant_max=127, dtype=torch.quint8, qscheme=torch.per_tensor_affine, ch_axis=-1, scale=tensor([1.]), zero_point=tensor([0], dtype=torch.int32)
+  (activation_post_process): MovingAverageMinMaxObserver(min_val=inf, max_val=-inf)
+)
+FusedMovingAvgObsFakeQuantize(
+  fake_quant_enabled=tensor([1]), observer_enabled=tensor([1]), scale=tensor([1.]), zero_point=tensor([0], dtype=torch.int32), dtype=torch.quint8, quant_min=0, quant_max=255, qscheme=torch.per_tensor_affine, reduce_range=False
+  (activation_post_process): MovingAverageMinMaxObserver(min_val=inf, max_val=-inf)
+)
+QuantizedLinear(in_features=3, out_features=2, scale=1.0, zero_point=0, qscheme=torch.per_tensor_affine)
+torch.qint8 (2, 3) torch.per_tensor_affine 1.0 tensor([0., 0.])
+QuantizedLinearReLU(in_features=3, out_features=2, scale=1.0, zero_point=0, qscheme=torch.per_tensor_affine)
+QuantizedConv2d(2, 4, kernel_size=(3, 3), stride=(2, 2), scale=1.0, zero_point=0, padding=(1, 1), groups=2)
+DynamicQuantizedLinear(in_features=3, out_features=2, dtype=torch.qint8, qscheme=torch.per_tensor_affine)
+Quantize(scale=tensor([0.5000]), zero_point=tensor([3]), dtype=torch.quint8)
+DeQuantize()
+['scale', 'zero_point', '_packed_params.dtype', '_packed_params._packed_params']
+['weight', 'bias', 'scale', 'zero_point']
+ Net Net 0
+quant QuantStub QuantStub 1
+quant.activation_post_process HistogramObserver HistogramObserver 0
+conv1 ConvReLU2d ConvReLU2d 1
+conv1.0 Conv2d Conv2d 0
+conv1.1 ReLU ReLU 0
+conv1.activation_post_process HistogramObserver HistogramObserver 0
+bn1 Identity Identity 0
+relu1 Identity Identity 0
+pool MaxPool2d MaxPool2d 0
+conv2 ConvReLU2d ConvReLU2d 1
+conv2.0 Conv2d Conv2d 0
+conv2.1 ReLU ReLU 0
+conv2.activation_post_process HistogramObserver HistogramObserver 0
+relu2 Identity Identity 0
+gap AdaptiveAvgPool2d AdaptiveAvgPool2d 0
+fc1 LinearReLU LinearReLU 1
+fc1.0 Linear Linear 0
+fc1.1 ReLU ReLU 0
+fc1.activation_post_process HistogramObserver HistogramObserver 0
+relu3 Identity Identity 0
+fc2 Linear Linear 1
+fc2.activation_post_process HistogramObserver HistogramObserver 0
+dequant DeQuantStub DeQuantStub 0
+ Net Net 0
+quant Quantize Quantize 0
+conv1 ConvReLU2d QuantizedConvReLU2d 0
+bn1 Identity Identity 0
+relu1 Identity Identity 0
+pool MaxPool2d MaxPool2d 0
+conv2 ConvReLU2d QuantizedConvReLU2d 0
+relu2 Identity Identity 0
+gap AdaptiveAvgPool2d AdaptiveAvgPool2d 0
+fc1 LinearReLU QuantizedLinearReLU 0
+fc1._packed_params LinearPackedParams LinearPackedParams 0
+relu3 Identity Identity 0
+fc2 Linear QuantizedLinear 0
+fc2._packed_params LinearPackedParams LinearPackedParams 0
+dequant DeQuantize DeQuantize 0
+['quant.scale', 'quant.zero_point', 'conv1.weight', 'conv1.bias', 'conv1.scale', 'conv1.zero_point', 'conv2.weight', 'conv2.bias', 'conv2.scale', 'conv2.zero_point', 'fc1.scale', 'fc1.zero_point', 'fc1._packed_params.dtype', 'fc1._packed_params._packed_params', 'fc2.scale', 'fc2.zero_point', 'fc2._packed_params.dtype', 'fc2._packed_params._packed_params']
+ Net Net False
+quant QuantStub QuantStub False
+quant.activation_post_process FusedMovingAvgObsFakeQuantize FusedMovingAvgObsFakeQuantize False
+quant.activation_post_process.activation_post_process MovingAverageMinMaxObserver MovingAverageMinMaxObserver False
+conv1 ConvBnReLU2d ConvBnReLU2d False
+conv1.bn BatchNorm2d BatchNorm2d False
+conv1.weight_fake_quant FusedMovingAvgObsFakeQuantize FusedMovingAvgObsFakeQuantize False
+conv1.weight_fake_quant.activation_post_process MovingAveragePerChannelMinMaxObserver MovingAveragePerChannelMinMaxObserver False
+conv1.activation_post_process FusedMovingAvgObsFakeQuantize FusedMovingAvgObsFakeQuantize False
+conv1.activation_post_process.activation_post_process MovingAverageMinMaxObserver MovingAverageMinMaxObserver False
+bn1 Identity Identity False
+relu1 Identity Identity False
+pool MaxPool2d MaxPool2d False
+conv2 ConvReLU2d ConvReLU2d False
+conv2.weight_fake_quant FusedMovingAvgObsFakeQuantize FusedMovingAvgObsFakeQuantize False
+conv2.weight_fake_quant.activation_post_process MovingAveragePerChannelMinMaxObserver MovingAveragePerChannelMinMaxObserver False
+conv2.activation_post_process FusedMovingAvgObsFakeQuantize FusedMovingAvgObsFakeQuantize False
+conv2.activation_post_process.activation_post_process MovingAverageMinMaxObserver MovingAverageMinMaxObserver False
+relu2 Identity Identity False
+gap AdaptiveAvgPool2d AdaptiveAvgPool2d False
+fc1 LinearReLU LinearReLU False
+fc1.weight_fake_quant FusedMovingAvgObsFakeQuantize FusedMovingAvgObsFakeQuantize False
+fc1.weight_fake_quant.activation_post_process MovingAveragePerChannelMinMaxObserver MovingAveragePerChannelMinMaxObserver False
+fc1.activation_post_process FusedMovingAvgObsFakeQuantize FusedMovingAvgObsFakeQuantize False
+fc1.activation_post_process.activation_post_process MovingAverageMinMaxObserver MovingAverageMinMaxObserver False
+relu3 Identity Identity False
+fc2 Linear Linear False
+fc2.weight_fake_quant FusedMovingAvgObsFakeQuantize FusedMovingAvgObsFakeQuantize False
+fc2.weight_fake_quant.activation_post_process MovingAveragePerChannelMinMaxObserver MovingAveragePerChannelMinMaxObserver False
+fc2.activation_post_process FusedMovingAvgObsFakeQuantize FusedMovingAvgObsFakeQuantize False
+fc2.activation_post_process.activation_post_process MovingAverageMinMaxObserver MovingAverageMinMaxObserver False
+dequant DeQuantStub DeQuantStub False
+ Net Net False
+quant Quantize Quantize True
+conv1 ConvReLU2d QuantizedConvReLU2d True
+bn1 Identity Identity False
+relu1 Identity Identity False
+pool MaxPool2d MaxPool2d False
+conv2 ConvReLU2d QuantizedConvReLU2d True
+relu2 Identity Identity False
+gap AdaptiveAvgPool2d AdaptiveAvgPool2d False
+fc1 LinearReLU QuantizedLinearReLU True
+fc1._packed_params LinearPackedParams LinearPackedParams True
+relu3 Identity Identity False
+fc2 Linear QuantizedLinear True
+fc2._packed_params LinearPackedParams LinearPackedParams True
+dequant DeQuantize DeQuantize True
+['conv1.activation_post_process.activation_post_process.eps', 'conv1.activation_post_process.activation_post_process.max_val', 'conv1.activation_post_process.activation_post_process.min_val', 'conv1.activation_post_process.fake_quant_enabled', 'conv1.activation_post_process.observer_enabled', 'conv1.activation_post_process.scale', 'conv1.activation_post_process.zero_point', 'conv1.bias', 'conv1.bn.bias', 'conv1.bn.num_batches_tracked', 'conv1.bn.running_mean', 'conv1.bn.running_var', 'conv1.bn.weight', 'conv1.weight', 'conv1.weight_fake_quant.activation_post_process.eps', 'conv1.weight_fake_quant.activation_post_process.max_val', 'conv1.weight_fake_quant.activation_post_process.min_val', 'conv1.weight_fake_quant.fake_quant_enabled', 'conv1.weight_fake_quant.observer_enabled', 'conv1.weight_fake_quant.scale', 'conv1.weight_fake_quant.zero_point', 'conv2.activation_post_process.activation_post_process.eps', 'conv2.activation_post_process.activation_post_process.max_val', 'conv2.activation_post_process.activation_post_process.min_val', 'conv2.activation_post_process.fake_quant_enabled', 'conv2.activation_post_process.observer_enabled', 'conv2.activation_post_process.scale', 'conv2.activation_post_process.zero_point', 'conv2.bias', 'conv2.weight', 'conv2.weight_fake_quant.activation_post_process.eps', 'conv2.weight_fake_quant.activation_post_process.max_val', 'conv2.weight_fake_quant.activation_post_process.min_val', 'conv2.weight_fake_quant.fake_quant_enabled', 'conv2.weight_fake_quant.observer_enabled', 'conv2.weight_fake_quant.scale', 'conv2.weight_fake_quant.zero_point', 'fc1.activation_post_process.activation_post_process.eps', 'fc1.activation_post_process.activation_post_process.max_val', 'fc1.activation_post_process.activation_post_process.min_val', 'fc1.activation_post_process.fake_quant_enabled', 'fc1.activation_post_process.observer_enabled', 'fc1.activation_post_process.scale', 'fc1.activation_post_process.zero_point', 'fc1.bias', 'fc1.weight', 'fc1.weight_fake_quant.activation_post_process.eps', 'fc1.weight_fake_quant.activation_post_process.max_val', 'fc1.weight_fake_quant.activation_post_process.min_val', 'fc1.weight_fake_quant.fake_quant_enabled', 'fc1.weight_fake_quant.observer_enabled', 'fc1.weight_fake_quant.scale', 'fc1.weight_fake_quant.zero_point', 'fc2.activation_post_process.activation_post_process.eps', 'fc2.activation_post_process.activation_post_process.max_val', 'fc2.activation_post_process.activation_post_process.min_val', 'fc2.activation_post_process.fake_quant_enabled', 'fc2.activation_post_process.observer_enabled', 'fc2.activation_post_process.scale', 'fc2.activation_post_process.zero_point', 'fc2.bias', 'fc2.weight', 'fc2.weight_fake_quant.activation_post_process.eps', 'fc2.weight_fake_quant.activation_post_process.max_val', 'fc2.weight_fake_quant.activation_post_process.min_val', 'fc2.weight_fake_quant.fake_quant_enabled', 'fc2.weight_fake_quant.observer_enabled', 'fc2.weight_fake_quant.scale', 'fc2.weight_fake_quant.zero_point', 'quant.activation_post_process.activation_post_process.eps', 'quant.activation_post_process.activation_post_process.max_val', 'quant.activation_post_process.activation_post_process.min_val', 'quant.activation_post_process.fake_quant_enabled', 'quant.activation_post_process.observer_enabled', 'quant.activation_post_process.scale', 'quant.activation_post_process.zero_point']
+Sequential(
+  (0): DynamicQuantizedLinear(in_features=6, out_features=5, dtype=torch.qint8, qscheme=torch.per_tensor_affine)
+  (1): ReLU()
+  (2): DynamicQuantizedLSTM(5, 3)
+)
+Net(
+  (quant): QuantStub()
+  (conv1): ConvReLU2d(
+    (0): Conv2d(2, 4, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (1): ReLU()
+  )
+  (bn1): Identity()
+  (relu1): Identity()
+  (pool): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+  (conv2): ConvReLU2d(
+    (0): Conv2d(4, 6, kernel_size=(3, 3), stride=(1, 1), groups=2)
+    (1): ReLU()
+  )
+  (relu2): Identity()
+  (gap): AdaptiveAvgPool2d(output_size=1)
+  (fc1): LinearReLU(
+    (0): Linear(in_features=6, out_features=5, bias=True)
+    (1): ReLU()
+  )
+  (relu3): Identity()
+  (fc2): Linear(in_features=5, out_features=3, bias=True)
+  (dequant): DeQuantStub()
+)

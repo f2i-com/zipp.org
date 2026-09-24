@@ -1,0 +1,42 @@
+tensor([[ 0.8000,  1.2000,  1.9500],
+        [ 1.1000, -0.6000, -0.6000]], size=(2, 3), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.05, zero_point=12)
+q torch.quint8 (2, 3) [[28, 36, 51], [34, 0, 0]]
+tensor([0.9600, 1.2300, 1.9800, 0.7800], size=(4,), dtype=torch.qint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.03, zero_point=-5)
+qi torch.qint8 (4,) [27, 36, 61, 21]
+tensor([1.0860, 1.2820, 2.0080], size=(3,), dtype=torch.qint32,
+       quantization_scheme=torch.per_tensor_affine, scale=0.001, zero_point=7)
+q32 torch.qint32 (3,) [1093, 1289, 2015]
+tensor([[[ 1.2000,  1.3200],
+         [ 2.0000,  0.1800]],
+
+        [[-2.0000, -1.4000],
+         [-1.2000,  0.6000]],
+
+        [[ 2.4900,  1.0800],
+         [ 0.1800, -1.2000]]], size=(3, 2, 2), dtype=torch.qint8,
+       quantization_scheme=torch.per_channel_affine,
+       scale=tensor([0.0200, 0.0400, 0.0300], dtype=torch.float64),
+       zero_point=tensor([ 0,  1, -1]), axis=0)
+qc torch.qint8 (3, 2, 2) [[[60, 66], [100, 9]], [[-49, -34], [-29, 16]], [[82, 35], [5, -41]]]
+tensor([[ 1.3400, -0.0600],
+        [ 1.4400, -0.0600],
+        [ 1.8800,  1.1600],
+        [-0.0600,  2.4400],
+        [-0.0600,  0.7200]], size=(5, 2), dtype=torch.quint8,
+       quantization_scheme=torch.per_tensor_affine, scale=0.02, zero_point=3)
+qct torch.quint8 (5, 2) [[70, 0], [75, 0], [97, 61], [0, 125], [0, 39]]
+torch.quint8 torch.per_channel_affine
+['quant.scale', 'quant.zero_point', 'conv1.weight', 'conv1.bias', 'conv1.scale', 'conv1.zero_point', 'conv2.weight', 'conv2.bias', 'conv2.scale', 'conv2.zero_point', 'fc1.scale', 'fc1.zero_point', 'fc1._packed_params.dtype', 'fc1._packed_params._packed_params', 'fc2.scale', 'fc2.zero_point', 'fc2._packed_params.dtype', 'fc2._packed_params._packed_params']
+tensor([[ 0.7300,  0.3813, -0.1307],
+        [ 0.7736,  0.4140, -0.1852]])
+tensor([[ 0.2854,  0.3339,  0.2255, -0.3368, -0.3653],
+        [-0.2058, -0.0523,  0.4430,  0.3593,  0.0279],
+        [-0.1120, -0.4778, -0.2800,  0.1717,  0.2352]], size=(3, 5),
+       dtype=torch.qint8, quantization_scheme=torch.per_channel_affine,
+       scale=tensor([0.0029, 0.0035, 0.0037], dtype=torch.float64),
+       zero_point=tensor([0, 0, 0]), axis=0)
+True True True
+tensor([[ 0.7300,  0.3813, -0.1307],
+        [ 0.7736,  0.4140, -0.1852]])

@@ -759,6 +759,9 @@ def _pool_input(x, nd, name):
 
 
 def _max_pool(x, nd, kernel_size, stride, padding, dilation, ceil_mode, return_indices, name):
+    if x.__class__ is torch._QTensor:
+        # The pool of the integers (their order is the values' order).
+        return torch._quant._max_pool(x, _max_pool, nd, kernel_size, stride, padding, dilation, ceil_mode, return_indices, name)
     x, unbatched = _pool_input(x, nd, name)
     k = _ntuple(kernel_size, nd, "kernel_size")
     s = k if stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0) else _ntuple(stride, nd, "stride")
@@ -899,6 +902,10 @@ def avg_pool1d(input, kernel_size, stride=None, padding=0, ceil_mode=False, coun
 
 
 def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True, divisor_override=None):
+    if input.__class__ is torch._QTensor:
+        k = _ntuple(kernel_size, 2, "kernel_size")
+        st = k if stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0) else _ntuple(stride, 2, "stride")
+        return torch._quant._avg_pool2d(input, k, st, _ntuple(padding, 2, "padding"), ceil_mode, count_include_pad, divisor_override)
     return _avg_pool(input, 2, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override, "avg_pool2d")
 
 
@@ -934,6 +941,8 @@ def _bins(size, out):
 
 
 def _adaptive_avg(x, nd, output_size, name):
+    if x.__class__ is torch._QTensor:
+        return torch._quant._adaptive_avg_pool(x, output_size, nd)
     x, unbatched = _pool_input(x, nd, name)
     outs = _adaptive_sizes(x, nd, output_size)
     spatial = x.shape[2:]
@@ -1096,6 +1105,10 @@ native_channel_shuffle = channel_shuffle
 
 
 def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corners=None, recompute_scale_factor=None, antialias=False):
+    if input.__class__ is torch._QTensor:
+        if mode != "nearest":
+            raise NotImplementedError("quantized interpolate supports mode='nearest' on Zipp")
+        return torch._quant._interpolate_nearest(input, interpolate, size, scale_factor, mode, align_corners, recompute_scale_factor, antialias)
     x = input
     nd = len(x.shape) - 2
     if nd < 1:
@@ -1329,6 +1342,8 @@ def silu(x, inplace=False):
 
 
 def relu(x, inplace=False):
+    if x.__class__ is torch._QTensor:
+        return torch._quant._relu(x, inplace)
     if inplace:
         return _apply_inplace(x, relu)
     out = torch.relu(x)
@@ -1350,6 +1365,8 @@ def threshold(input, threshold, value, inplace=False):
 
 
 def hardtanh(input, min_val=-1.0, max_val=1.0, inplace=False):
+    if input.__class__ is torch._QTensor:
+        return torch._quant._hardtanh(input, min_val, max_val, inplace)
     if inplace:
         return _apply_inplace(input, hardtanh, min_val, max_val)
     if min_val > max_val:
@@ -1777,6 +1794,8 @@ def dropout(x, p=0.5, training=True, inplace=False):
     _check_p(p)
     if not training or p == 0:
         return x
+    if x.__class__ is torch._QTensor:
+        raise torch._quant._no_kernel("aten::native_dropout")
     if inplace:
         return _apply_inplace(x, dropout, p, training)
     if p == 1:

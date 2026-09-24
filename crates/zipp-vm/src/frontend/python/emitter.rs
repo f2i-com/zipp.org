@@ -54,7 +54,7 @@ pub(super) const MAX_DEPTH: usize = 96;
 /// parameters (registers 1..=n); larger ones take one array. The runtime's
 /// `MAX_DIRECT` (core.js) must agree.
 pub(super) const MAX_DIRECT: usize = 12;
-pub(super) const MAX_FUNCTIONS: usize = 8192;
+pub(super) const MAX_FUNCTIONS: usize = 32768;
 pub(super) const MAX_INSTRUCTIONS: usize = 1 << 20;
 /// Register 0 is `this` (the function object). The bound values follow as
 /// parameters from register 1, or, for a code object with more than
