@@ -4775,7 +4775,9 @@ impl<'p> Vm<'p> {
             FR_REGISTER => self.finreg_method(this, "register", args)?,
             FR_UNREGISTER => self.finreg_method(this, "unregister", args)?,
             ITER_NEXT => {
-                let it_idx = this.heap_index();
+                // A non-heap `this` (a primitive) is refused below; its bits
+                // name no heap slot.
+                let it_idx = if this.is_heap() { this.heap_index() } else { 0 };
                 let (live, mut index) =
                     match this.is_heap().then(|| self.heap.get(it_idx)) {
                         Some(HeapObj::Iterator { live, index, .. }) => (*live, *index),

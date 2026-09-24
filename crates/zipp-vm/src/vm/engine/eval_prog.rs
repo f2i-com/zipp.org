@@ -150,7 +150,13 @@ impl<'p> Vm<'p> {
                 &mut cd.static_setters,
             ] {
                 for (_, fid) in lst.iter_mut() {
-                    *fid += base_func;
+                    // `u32::MAX` is a computed-key placeholder (no function of
+                    // its own; see `MakeClass`): not a func id to rebase.
+                    // Rebasing it wrapped to `base_func - 1` in a release build,
+                    // naming an unrelated function.
+                    if *fid != u32::MAX {
+                        *fid += base_func;
+                    }
                 }
             }
             self.eval_classes.push(Box::leak(Box::new(cd)));

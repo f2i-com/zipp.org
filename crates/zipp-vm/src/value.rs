@@ -256,9 +256,11 @@ impl Value {
         (self.0 & 1) != 0
     }
 
-    /// Heap index (only valid when `is_heap`).
+    /// Heap index (only valid when `is_heap`; debug builds check it, since
+    /// any other value's payload names an unrelated heap slot).
     #[inline(always)]
     pub fn heap_index(self) -> u32 {
+        debug_assert!(self.is_heap(), "heap_index of a non-heap value {:#x}", self.0);
         (self.0 & PAYLOAD_MASK) as u32
     }
 

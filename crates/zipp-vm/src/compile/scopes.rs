@@ -517,9 +517,14 @@ impl<'a> FnCompiler<'a> {
         // Box the local into a cell if a nested function captures it, so the
         // closure and this scope share one mutable slot — or unconditionally in
         // a function whose body may direct-eval (the eval closes over cells).
-        if self.box_all_locals
+        // A compiler-internal `<…>` register (a loop's iterator, index, …) is
+        // never nameable by eval and is written directly, not through a cell:
+        // boxing it made an eval-capturing closure capture whatever raw value
+        // the loop later stored there as if it were a cell.
+        let internal = name.starts_with('<');
+        if (self.box_all_locals && !internal)
             || self.captured.contains(name)
-            || (self.script_eval_lexicals && !name.starts_with('<'))
+            || (self.script_eval_lexicals && !internal)
         {
             self.emit(Instr::MakeCell { reg: r });
             self.cell_regs.insert(r);
