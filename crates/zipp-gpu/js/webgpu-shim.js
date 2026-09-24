@@ -226,7 +226,7 @@ var __zgpuShim = (function () {
     _pipeline(descriptor) {
       const layout = descriptor.layout, compute = descriptor.compute;
       if (!layout || layout === 'auto') throw new TypeError('An explicit pipeline layout is required');
-      return host('gpu.pipeline', this._id, idOf(layout, 'layout'), idOf(compute.module, 'module'), compute.entryPoint || 'main');
+      return host('gpu.pipeline', this._id, idOf(layout, 'layout'), idOf(compute.module, 'module'), compute.entryPoint || 'main', String(descriptor.label || ''));
     }
     createComputePipeline(descriptor) {
       const reply = this._pipeline(descriptor);

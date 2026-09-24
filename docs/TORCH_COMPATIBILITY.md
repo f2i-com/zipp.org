@@ -299,7 +299,7 @@ medians over 15 calls, 7 runs for the eight-step row):
 | WebGPU | 74.4 ms | 5.1 ms | 1.84 ms |
 | WebGL2 | 88.8 ms | 3.3 ms | 2.24 ms |
 | WebAssembly | 73.7 ms | 4.9 ms | 3.63 ms |
-| Native Zipp, WebGPU over wgpu/Vulkan | ≈26 ms | ≈2.7 ms | ≈2.2 ms |
+| Native Zipp, WebGPU over wgpu/Vulkan | ≈26 ms | ≈2.4 ms | ≈1.8 ms |
 
 Of a `compiled()` call about 34 ms is the guest recording and validating the
 step (every input storage is scanned for finiteness in the interpreter), the
@@ -439,20 +439,41 @@ fixtures print the same lines on the GPU as on the CPU evaluator: losses and
 state within 1.2e-7 of PyTorch 2.11 for prepared sessions, 5.9e-7 relative for
 the protocol v3/v4 families.
 
-**Speed** (RTX 5090, Vulkan):
+**Speed** (RTX 5090, Vulkan, ms per training step; measured on a shared
+machine, treat as ±30%):
 
 | Model | `compiled()` per call | `prepared.step` | `prepared.steps`, 8 per run, per step | CPU evaluator, `compiled()` |
 |---|---|---|---|---|
-| 784-256-10, batch 64, Adam | ≈26 ms | ≈2.7 ms | ≈2.2 ms | ≈2.8-4.4 s |
-| 784-1024-1024-10, batch 256, Adam | 106 ms | 5.0 ms | 4.8 ms | 118 s |
-| 784-2048-2048-10, batch 1024, Adam | 314 ms | 19.0 ms | 17.1 ms | 1,487 s |
+| 784-256-10, batch 64, Adam | ≈26 ms | ≈2.4 ms | ≈1.8 ms | ≈2.9-4.8 s |
+| 784-1024-1024-10, batch 256, Adam | ≈150 ms | ≈5-6 ms | ≈3.4-3.9 ms | 118 s |
+| 784-2048-2048-10, batch 1024, Adam | ≈430 ms | ≈13 ms | ≈10 ms | 1,487 s |
 
-A per-call `compiled()` uploads and reads back every weight, gradient and moment.
-gpu-lab's finiteness checks on those tensors run natively, so a call costs about
-a third of the browser's (74 ms); what remains is the Python recording (~12 ms),
-copying the tensors, and the GPU work. Prepared sessions are where the GPU pays
-off.
-Reproduce with `crates/zipp-cli/tests/native_gpu/bench.py`.
+Float matmuls at least 64x64 with enough output tiles run a register-blocked
+64x64 tile (27-34 TFLOP/s on a 4096² product, against about 5 for the 16x16
+kernel). Every output keeps the 16x16 kernel's arithmetic, so results are the
+same bits. Direct3D 12 keeps the 16x16 kernel, because FXC takes about 18 s to
+compile the tile. A per-call `compiled()` uploads and reads back every weight,
+gradient and moment; prepared sessions are where the GPU pays off.
+`ZIPP_GPU_PROFILE=1` prints where a run's host time went, and `=kernels` adds
+per-kernel GPU time. Reproduce with `crates/zipp-cli/tests/native_gpu/bench.py`
+and `bench_vs_torch.py`.
+
+**Against PyTorch CUDA** (PyTorch 2.11 + CUDA 12.8, same GPU, same weights and
+batches; ms per step; `crates/zipp-cli/tests/native_gpu/bench_vs_torch.py`):
+
+| Case | PyTorch CUDA eager | PyTorch CUDA graph | Zipp `prepared.step` / 8 per run | Zipp in Chrome (WebGPU) / 8 per run |
+|---|---|---|---|---|
+| 784-256-10, batch 64, Adam | 0.70 | 0.20 | 2.4 / 1.8 | 2.9 / 0.71 |
+| 784-1024-1024-10, batch 256 | 0.96 | 0.33 | 5.1 / 3.4 | 3.9 / 1.7 |
+| 784-2048-2048-10, batch 1024 | 1.31 | 0.93 | 12.9 / 9.9 | 6.7 / 9.0 |
+| 2048² matmul x4, inference | 1.31 (TF32 0.90) | – | 5.1 / 3.7 | 3.5 / 3.3 |
+| Embedding 8192x128 + gather NLL | 1.11 | 0.31 | 3.5 / 2.6 | 2.6 / 0.46 |
+
+Losses agree within 1.4e-7 (small MLP) and 3.1e-5 (medium). On a small model
+Zipp's GPU work is as fast as a CUDA graph (0.18 ms per step); the rest is
+recording the step in Zipp's JavaScript engine and the Python side. On large
+ones the gap is matmul throughput: fp32 without tensor cores. torch.compile's
+default backend needs triton, which is unavailable on Windows.
 
 ## Compatibility boundaries
 

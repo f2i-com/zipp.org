@@ -235,3 +235,28 @@ fn accelerated_readback_check_matches_gpu_labs() {
         );
     });
 }
+
+/// The faster WebGPU kernels change who computes an output and how its
+/// operands arrive, never its arithmetic: the 64x64 register-blocked matmul
+/// tile equals the 16x16 kernel on this device bit for bit (ragged, batched,
+/// transposed and split-K shapes), and the unrolled axis sum and the
+/// row-per-workgroup index_add equal cpu-js bit for bit
+/// (`tests/exact_kernels.js`).
+#[test]
+fn faster_kernels_are_bit_identical() {
+    on_big_stack(|| {
+        let Some(mut host) = open() else { return };
+        host.eval(concat!(
+            include_str!("exact_kernels.js"),
+            "\nglobalThis.exactMatmulTiles = exactMatmulTiles; globalThis.exactReductions = exactReductions; null"
+        ))
+        .expect("checks");
+        for check in ["exactMatmulTiles", "exactReductions"] {
+            let json = run_json(
+                &mut host,
+                &format!("{check}(Object.assign({{}}, __zgpuModules['src/runtime.mjs']))"),
+            );
+            assert!(json.starts_with("{\"failures\":0,"), "{check}: {json}");
+        }
+    });
+}

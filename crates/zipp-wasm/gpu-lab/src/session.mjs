@@ -1,5 +1,14 @@
 import {check, checkFiniteOutput, ComputeError, float32Data, checkClassTargets, checkIndices, adamStep, sizeOf} from './graph.mjs';
 const clock=()=>globalThis.performance?.now()??Date.now();
+/** A plan node with some fields replaced for one step: the node as prototype
+ * (backends only read a node's fields), not a copy of its every field. The
+ * fields are defined, not assigned: a plan's nodes are frozen, and a frozen
+ * prototype's field cannot be assigned over. */
+const derived=(n,fields)=>{
+  const node=Object.create(n);
+  for(const k of Object.keys(fields))Object.defineProperty(node,k,{value:fields[k],enumerable:true,writable:true,configurable:true});
+  return node;
+};
 
 /**
  * A prepared plan with device-resident tensors: `runtime.prepare(program)`
@@ -125,14 +134,14 @@ export class Session {
         const stepNo=first+s,uses=[...plan.uses];handles.clear();
         for(const n of this.inputs){
           const data=fed[s].get(n.id);
-          handles.set(n.id,data?await this.impl.run({...n,data},[]):this.materialize(this.held.get(n.id)));
+          handles.set(n.id,data?await this.impl.run(derived(n,{data}),[]):this.materialize(this.held.get(n.id)));
         }
         for(const n of this.inputs)if(uses[n.id]===0)freeLocal(n.id); // nothing reads it
         for(const n of nodes){
           if(n.alias||n.op==='input')continue;
           // Step-dependent nodes follow the session's step: Adam's bias
           // correction, and a `uniform` draw, which is fresh every step.
-          const node=stepNo===1?n:n.op==='adam_update'?{...n,...adamStep(n.raw,n.step+stepNo-1)}:n.op==='uniform'?{...n,step:n.step+stepNo-1}:n;
+          const node=stepNo===1?n:n.op==='adam_update'?derived(n,adamStep(n.raw,n.step+stepNo-1)):n.op==='uniform'?derived(n,{step:n.step+stepNo-1}):n;
           handles.set(n.id,await this.impl.run(node,n.refs.map(r=>handles.get(root[r]))));
           for(const r of n.refs){uses[root[r]]--;if(uses[root[r]]===0)freeLocal(root[r]);}
           if(uses[n.id]===0)freeLocal(n.id);

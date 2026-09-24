@@ -136,10 +136,38 @@ const KERNELS = {
   O[i] = A[(o * P.g.x + p) * inner + r];`)],
   // index_add: the base (A) plus every source row (B, [outer, len, inner]) whose
   // index (C) names this position, in ascending k.
-  index_add: [['A', 'B', 'C'], each(`let inner = P.g.y; let r = i % inner; let p = (i / inner) % P.g.x; let o = i / (inner * P.g.x);
-  var v = A[i];
-  for (var k = 0u; k < P.len; k = k + 1u) { if (i32(C[k]) == i32(p)) { v = v + B[(o * P.len + k) * inner + r]; } }
-  O[i] = v;`)],
+  // One 64-wide workgroup per output row (o, p): the row starts as the base,
+  // then the workgroup walks the index 64 entries at a time, and every entry
+  // naming p adds its source row, in ascending k -- each element's additions
+  // are the per-element loop's, one float32 addition at a time, while the
+  // index is read once per row instead of once per element.
+  index_add: [['A', 'B', 'C'], `var<workgroup> hitAt: array<u32, 64>;
+var<workgroup> hits: atomic<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+  let inner = P.g.y; let row = wg.x + wg.y * nwg.x;
+  if (row >= P.n / inner) { return; }
+  let p = row % P.g.x; let o = row / P.g.x; let base = row * inner;
+  for (var r = lid; r < inner; r = r + 64u) { O[base + r] = A[base + r]; }
+  for (var k0 = 0u; k0 < P.len; k0 = k0 + 64u) {
+    let before = atomicLoad(&hits);
+    workgroupBarrier();
+    let k = k0 + lid;
+    var hit = 0u;
+    if (k < P.len) { if (i32(C[k]) == i32(p)) { hit = 1u; atomicAdd(&hits, 1u); } }
+    hitAt[lid] = hit;
+    workgroupBarrier();
+    if (atomicLoad(&hits) != before) {
+      let span = min(64u, P.len - k0);
+      for (var j = 0u; j < span; j = j + 1u) {
+        if (hitAt[j] != 0u) {
+          let src = (o * P.len + k0 + j) * inner;
+          for (var r = lid; r < inner; r = r + 64u) { O[base + r] = O[base + r] + B[src + r]; }
+        }
+      }
+    }
+  }
+}`],
   // gather over the index's padded dims (d): a's strides with the axis zeroed
   // (sa), plus the index value (B, clamped below g.y) times the axis stride g.x.
   gather_axis: [['A', 'B'], each('O[i] = A[strided(i, P.sa) + u32(clamp(i32(B[i]), 0, i32(P.g.y) - 1)) * P.g.x];')],
@@ -166,9 +194,18 @@ const KERNELS = {
   O[i] = v;`)],
   pair: [['A'], each('let j = i * 2u; var other = 0.0; if (j + 1u < P.len) { other = A[j + 1u]; } O[i] = A[j] + other;')],
   scale: [['A'], each('O[i] = A[i] / P.f.x;')],
+  // Eight loads issued before their eight additions, which stay one at a
+  // time in ascending j: the same sum, without a memory round trip per term.
   reduce: [['A'], each(`let inner = P.g.x; let base = (i / inner) * P.len * inner + i % inner;
   var s = 0.0;
-  for (var j = 0u; j < P.len; j = j + 1u) { s = s + A[base + j * inner]; }
+  var j = 0u;
+  for (; j + 8u <= P.len; j = j + 8u) {
+    let at = base + j * inner;
+    let v0 = A[at]; let v1 = A[at + inner]; let v2 = A[at + 2u * inner]; let v3 = A[at + 3u * inner];
+    let v4 = A[at + 4u * inner]; let v5 = A[at + 5u * inner]; let v6 = A[at + 6u * inner]; let v7 = A[at + 7u * inner];
+    s = s + v0; s = s + v1; s = s + v2; s = s + v3; s = s + v4; s = s + v5; s = s + v6; s = s + v7;
+  }
+  for (; j < P.len; j = j + 1u) { s = s + A[base + j * inner]; }
   O[i] = select(s, s / f32(P.len), P.mode == 1u);`)],
   softmax: [['A'], each(`${ROW_STATS}
   if (P.mode == 1u) { let ls = log(s); for (var j = 0u; j < P.len; j = j + 1u) { O[base + j] = (A[base + j] - m) - ls; } }
@@ -592,6 +629,77 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   if (row < M && col < N) { O[(part * batches + b) * M * N + row * N + col] = acc; }
 }`],
 };
+/**
+ * A register-blocked matmul: each 16x16 workgroup computes a (16 * tm) x
+ * (16 * tn) output tile and each invocation tm x tn of it -- rows
+ * 64g + 4 lid.y + q and columns 64h + 4 lid.x + q -- from bk-deep slices of A
+ * and B staged in workgroup memory as vec4s of four rows (A) or four columns
+ * (B), so one 16-byte load feeds four accumulators. The arithmetic of every
+ * output is the 16x16 kernel's exactly: one `acc = acc + a * b` per k, in
+ * ascending k, from zero, and no product past the end of the reduced range
+ * (a padded `+ 0 * b` could turn a -0 sum into +0). Only who computes which
+ * output, and how the operands reach it, change. Accumulators and the inner
+ * loop are straight-line scalars (an array indexed in a loop may stay in
+ * indexable memory on Direct3D's FXC), and vectors are only ever written
+ * whole (FXC refuses a component written through a runtime index).
+ * `transposed`: B is stored [N, K]. `split`: the reduced axis is one slice
+ * of `matmul_split`'s (part = wg.z / batches, P.sa.z long).
+ */
+function tiledMatmul(tm, tn, bk, transposed, split) {
+  const bm = 16 * tm, bn = 16 * tn, am = bm / 4, an = bn / 4, Q = [0, 1, 2, 3], X = 'xyzw';
+  const rows = [...Array(tm).keys()], cols = [...Array(tn).keys()];
+  // Output i of the invocation: vec4 group i >> 2, component i & 3.
+  const row = i => `${64 * (i >> 2)}u + lid.y * 4u + ${i & 3}u`, col = j => `${64 * (j >> 2)}u + lid.x * 4u + ${j & 3}u`;
+  const step = k => `{ ${[...Array(tm / 4).keys()].map(g => `let a${g} = As[${k} * ${am}u + ${16 * g}u + lid.y];`).join(' ')}
+      ${[...Array(tn / 4).keys()].map(h => `let b${h} = Bs[${k} * ${an}u + ${16 * h}u + lid.x];`).join(' ')}
+      ${rows.flatMap(i => cols.map(j => `c${i}_${j} = c${i}_${j} + a${i >> 2}.${X[i & 3]} * b${j >> 2}.${X[j & 3]};`)).join(' ')} }`;
+  // One vec4 each per 256 invocations: four rows of A at one k, four columns of B at one k.
+  const loadA = `let kk = e % ${bk}u; let r4 = e / ${bk}u; let gk = t + kk; let gr = row0 + r4 * 4u;
+      ${Q.map(q => `var v${q} = 0.0; if (gr + ${q}u < M && gk < k1) { v${q} = A[aBase + (gr + ${q}u) * K + gk]; }`).join(' ')}
+      As[kk * ${am}u + r4] = vec4<f32>(v0, v1, v2, v3);`;
+  const loadB = transposed
+    ? `let kk = e % ${bk}u; let c4 = e / ${bk}u; let gk = t + kk; let gc = col0 + c4 * 4u;
+      ${Q.map(q => `var v${q} = 0.0; if (gc + ${q}u < N && gk < k1) { v${q} = B[bBase + (gc + ${q}u) * K + gk]; }`).join(' ')}
+      Bs[kk * ${an}u + c4] = vec4<f32>(v0, v1, v2, v3);`
+    : `let c4 = e % ${an}u; let kk = e / ${an}u; let gk = t + kk; let gc = col0 + c4 * 4u;
+      ${Q.map(q => `var v${q} = 0.0; if (gc + ${q}u < N && gk < k1) { v${q} = B[bBase + gk * N + gc + ${q}u]; }`).join(' ')}
+      Bs[kk * ${an}u + c4] = vec4<f32>(v0, v1, v2, v3);`;
+  return [['A', 'B'], `var<workgroup> As: array<vec4<f32>, ${bk * am}>;
+var<workgroup> Bs: array<vec4<f32>, ${bk * an}>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  ${split ? `let batches = max(P.g.w, 1u); let part = wg.z / batches; let b = wg.z % batches;
+  let k0 = part * P.sa.z; let k1 = min(K, k0 + P.sa.z); let outBase = (part * batches + b) * M * N;`
+    : 'let b = wg.z; let k0 = 0u; let k1 = K; let outBase = b * M * N;'}
+  let row0 = wg.y * ${bm}u; let col0 = wg.x * ${bn}u;
+  let aBase = b * P.sa.x; let bBase = b * P.sa.y;
+  ${rows.flatMap(i => cols.map(j => `var c${i}_${j} = 0.0;`)).join(' ')}
+  for (var t = k0; t < k1; t = t + ${bk}u) {
+    for (var i = 0u; i < ${bk * am / 256}u; i = i + 1u) {
+      let e = li + i * 256u; ${loadA}
+    }
+    for (var i = 0u; i < ${bk * an / 256}u; i = i + 1u) {
+      let e = li + i * 256u; ${loadB}
+    }
+    workgroupBarrier();
+    let span = min(${bk}u, k1 - t);
+    if (span == ${bk}u) {
+      for (var k = 0u; k < ${bk}u; k = k + 1u) ${step('k')}
+    } else {
+      for (var k = 0u; k < span; k = k + 1u) ${step('k')}
+    }
+    workgroupBarrier();
+  }
+  ${rows.flatMap(i => cols.map(j => `{ let r = row0 + ${row(i)}; let c = col0 + ${col(j)}; if (r < M && c < N) { O[outBase + r * N + c] = c${i}_${j}; } }`)).join('\n  ')}
+}`];
+}
+// Register-blocked variants of the four float matmul kernels: `_r4`, 64x64
+// tiles, 16 deep. (128x128 tiles measured no faster, and Direct3D's FXC takes
+// minutes over their 64 accumulators.) See `tileFor` for which a product uses.
+for (const transposed of [false, true])
+  for (const split of [false, true])
+    KERNELS[`matmul${transposed ? '_t' : ''}${split ? '_split' : ''}_r4`] = tiledMatmul(4, 4, 16, transposed, split);
 const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
 const BINARY = {add: 0, sub: 1, mul: 2, div: 3, maximum: 4, minimum: 5, eq: 6, ne: 7, lt: 8, le: 9, gt: 10, ge: 11};
 const MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
@@ -603,6 +711,8 @@ const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_upd
 // Enough outputs to fill a GPU, and the smallest slice of the reduced axis
 // worth a pass of its own. Round numbers: the win is the order of magnitude.
 const WIDE_ENOUGH = 65536, MIN_SPLIT_K = 512, MIN_SPLIT_CHUNK = 128, MAX_SPLIT = 32;
+// Workgroups a register-blocked matmul tile must produce to be chosen.
+const TILE_GROUPS = 256;
 const SLOT = 256, UNIFORM_SLOTS = 16384, POOL_BYTES = 256 * 1024 * 1024, GROUP_CACHE = 8192;
 const COMPUTE = () => globalThis.GPUShaderStage?.COMPUTE ?? 4;
 /** Blocks as whole four-byte words. A Q6_K block is 210 bytes, so a buffer of
@@ -631,12 +741,16 @@ export class WebGPUBackend {
     this.name = 'webgpu'; this.description = 'WebGPU compute shaders (WGSL)';
     this.device = device; this.debug = debug; this.info = info ? {vendor: info.vendor, architecture: info.architecture,
       description: info.description, isFallbackAdapter: info.isFallbackAdapter ?? null} : null;
-    this.pipelines = new Map(); this.lost = null; this.scopeOpen = false;
+    this.pipelines = new Map(); this.lost = null; this.scopeOpen = false; this.matmulTile = null;
+    // Idle bytes kept for reuse; a host with device memory to spare raises it.
+    this.poolBytes = POOL_BYTES;
     // Idle buffers are free across executions; recycled ones were freed during the
     // current one and may still be read by commands recorded before the free.
     this.idle = new Map(); this.recycled = []; this.idleBytes = 0;
     this.groups = new Map(); this.bufferIds = new WeakMap(); this.nextBufferId = 1;
     this.uniformBuffer = null; this.uniformData = new ArrayBuffer(UNIFORM_SLOTS * SLOT); this.slot = 0;
+    this.uniformWords = new Uint32Array(this.uniformData);
+    this.scratchU = new Uint32Array(24); this.scratchF = new Float32Array(this.scratchU.buffer);
     this.staging = null; this.encoder = null; this.pass = null;
     this.peakBufferBytes = 0; this.liveBufferBytes = 0;
     device.lost.then(reason => {this.lost = reason.message || reason.reason || 'Device lost';});
@@ -664,11 +778,12 @@ export class WebGPUBackend {
     check(size * 4 <= this.device.limits.maxStorageBufferBindingSize && size * 4 <= this.device.limits.maxBufferSize,
       'LIMIT', 'Tensor exceeds WebGPU buffer limits');
     const bytes = this.bytesFor(size), list = this.idle.get(bytes);
-    let buffer = list?.pop();
-    if (buffer) this.idleBytes -= bytes;
+    let buffer;
     // A buffer freed during this execution is safe for outputs only: a queue write
-    // would land before commands recorded earlier in the pending encoder.
-    else if (!data) { const i = this.recycled.findIndex(b => b.bytes === bytes); if (i >= 0) buffer = this.recycled.splice(i, 1)[0].buffer; }
+    // would land before commands recorded earlier in the pending encoder. Outputs
+    // take those first, so idle buffers stay for the uploads of later steps.
+    if (!data) { const i = this.recycled.findIndex(b => b.bytes === bytes); if (i >= 0) buffer = this.recycled.splice(i, 1)[0].buffer; }
+    if (!buffer) { buffer = list?.pop(); if (buffer) this.idleBytes -= bytes; }
     if (buffer) {
       if (data) this.device.queue.writeBuffer(buffer, 0, data.buffer, data.byteOffset, size * 4);
     } else {
@@ -694,7 +809,7 @@ export class WebGPUBackend {
         ...inputs.map((_, i) => ({binding: i + 1, visibility: COMPUTE(), buffer: {type: 'read-only-storage'}})),
         {binding: inputs.length + 1, visibility: COMPUTE(), buffer: {type: 'storage'}}]});
       const module = this.device.createShaderModule({code: `${PRELUDE}\n${io(inputs)}\n${body}`});
-      const pipeline = await this.device.createComputePipelineAsync({layout: this.device.createPipelineLayout({bindGroupLayouts: [layout]}),
+      const pipeline = await this.device.createComputePipelineAsync({label: name, layout: this.device.createPipelineLayout({bindGroupLayouts: [layout]}),
         compute: {module, entryPoint: 'main'}});
       entry = {pipeline, layout}; this.pipelines.set(name, entry);
     }
@@ -712,17 +827,33 @@ export class WebGPUBackend {
     const parts = Math.ceil(n.k / chunk);
     return parts > 1 ? {parts, chunk} : null;
   }
+  /**
+   * Outputs per invocation along each side of a float matmul's workgroup
+   * tile: 4 (64x64 tiles) when a product is at least a tile wide and tall and
+   * has enough of them to fill the GPU, else 1 (the 16x16 kernel, the most
+   * workgroups for a small product).
+   * `matmulTile` pins it: tests compare the tiles' bits, and a host whose
+   * shader compiler is slow on the large tile (FXC) keeps 1.
+   */
+  tileFor(m, n, z) {
+    if (this.matmulTile) return this.matmulTile;
+    // A product narrower than a tile (a decode step's single row) would leave
+    // most of each 64x64 tile idle: it keeps the 16x16 kernel and split-K.
+    return m >= 64 && n >= 64 && Math.ceil(m / 64) * Math.ceil(n / 64) * z >= TILE_GROUPS ? 4 : 1;
+  }
   /** Fills the next 256-byte uniform slot and returns its dynamic offset; slots upload once, at submit. */
   uniform(fill) {
     check(this.slot < UNIFORM_SLOTS, 'LIMIT', `One submission dispatches at most ${UNIFORM_SLOTS} kernels; run fewer steps at a time`);
-    const offset = this.slot++ * SLOT, u = new Uint32Array(this.uniformData, offset, 24), f = new Float32Array(this.uniformData, offset, 24);
-    u.fill(0); fill(u, f);
+    // Filled through two fixed views of one 96-byte scratch block, then
+    // copied into the slot: no typed-array views made per dispatch.
+    const offset = this.slot++ * SLOT, u = this.scratchU;
+    u.fill(0); fill(u, this.scratchF); this.uniformWords.set(u, offset / 4);
     return offset;
   }
   /** Bind groups are cached by kernel and storage buffers: fixed buffers (a session's) never rebuild one. */
   bindGroup(kernel, layout, handles) {
     let key = kernel;
-    for (const h of handles) key += `|${this.idOf(h.buffer)}:${h.size}`;
+    for (const h of handles) key += h.key ??= `|${this.idOf(h.buffer)}:${h.size}`;
     let group = this.groups.get(key);
     if (!group) {
       if (this.groups.size >= GROUP_CACHE) this.groups.clear();
@@ -734,7 +865,7 @@ export class WebGPUBackend {
   }
   async dispatch(kernel, fill, inputs, out, count, groups = null) {
     this.live();
-    const {pipeline, layout} = await this.pipeline(kernel), limit = this.device.limits.maxComputeWorkgroupsPerDimension;
+    const {pipeline, layout} = this.pipelines.get(kernel) ?? await this.pipeline(kernel), limit = this.device.limits.maxComputeWorkgroupsPerDimension;
     let [x, y, z] = groups ?? [Math.ceil(count / 256), 1, 1];
     if (!groups && x > limit) { y = Math.ceil(x / limit); x = limit; }
     check(x <= limit && y <= limit && z <= limit, 'LIMIT', 'Dispatch exceeds WebGPU workgroup limit');
@@ -795,8 +926,12 @@ export class WebGPUBackend {
         case 'slice_scatter':
           await this.dispatch('slice_scatter', u => {u[0] = n.size; u.set(n.dims, 4); u.set(n.begin4, 8); u.set(n.stride4.map(v => v >>> 0), 12); u.set(n.boxDims, 16);},
             refs, out, n.size); break;
-        case 'index_select': case 'index_add':
-          await this.dispatch(n.op, u => {u[0] = n.size; u[3] = n.count; u[16] = n.len; u[17] = n.inner;}, refs, out, n.size); break;
+        case 'index_select': case 'index_add': {
+          // index_add: a workgroup per output row, [outer * N] of them.
+          const rows = n.size / n.inner, limit = this.device.limits.maxComputeWorkgroupsPerDimension;
+          await this.dispatch(n.op, u => {u[0] = n.size; u[3] = n.count; u[16] = n.len; u[17] = n.inner;}, refs, out, n.size,
+            n.op === 'index_add' ? [Math.min(rows, limit), Math.ceil(rows / limit), 1] : null); break;
+        }
         case 'gather':
           await this.dispatch('gather_axis', u => {u[0] = n.size; u.set(n.dims, 4); u.set(n.srcStrides, 8); u[16] = n.axisStride; u[17] = n.len;}, refs, out, n.size); break;
         case 'scatter_add':
@@ -837,17 +972,20 @@ export class WebGPUBackend {
         case 'matmul': {
           const kernel = n.bQuant ? `matmul_${n.bQuant.dtype.replace('_', '')}` : n.transposed ? 'matmul_t' : 'matmul';
           const split = this.splitParts(n);
+          // The tile changes who computes an output, never its arithmetic.
+          const tile = n.bQuant ? 1 : this.tileFor(n.m, n.n, n.batch * (split ? split.parts : 1)), side = 16 * tile;
+          const suffix = tile === 1 ? '' : `_r${tile}`;
           if (!split) {
-            await this.dispatch(kernel, u => {u.set([n.m, n.k, n.n, n.batch], 16); u[8] = n.aBatchStride; u[9] = n.bBatchStride;},
-              refs, out, n.size, [Math.ceil(n.n / 16), Math.ceil(n.m / 16), n.batch]);
+            await this.dispatch(kernel + suffix, u => {u.set([n.m, n.k, n.n, n.batch], 16); u[8] = n.aBatchStride; u[9] = n.bBatchStride;},
+              refs, out, n.size, [Math.ceil(n.n / side), Math.ceil(n.m / side), n.batch]);
             break;
           }
           const {parts, chunk} = split, partials = this.alloc(n.size * parts);
           try {
-            await this.dispatch(`${kernel}_split`, u => {
+            await this.dispatch(`${kernel}_split${suffix}`, u => {
               u.set([n.m, n.k, n.n, n.batch], 16);
               u[8] = n.aBatchStride; u[9] = n.bBatchStride; u[10] = chunk;
-            }, refs, partials, n.size * parts, [Math.ceil(n.n / 16), Math.ceil(n.m / 16), n.batch * parts]);
+            }, refs, partials, n.size * parts, [Math.ceil(n.n / side), Math.ceil(n.m / side), n.batch * parts]);
             // `reduce` sums a [parts, outputs] layout straight down the parts.
             await this.dispatch('reduce', u => {u[0] = n.size; u[1] = 0; u[3] = parts; u[16] = n.size;},
               [partials], out, n.size);
@@ -937,7 +1075,7 @@ export class WebGPUBackend {
   // the same pool allocates the same buffers every time (and its cached bind
   // groups keep matching); alloc takes from the end.
   pool(h) {
-    if (this.idleBytes + h.bytes > POOL_BYTES) {h.buffer.destroy(); this.liveBufferBytes -= h.bytes; return;}
+    if (this.idleBytes + h.bytes > this.poolBytes) {h.buffer.destroy(); this.liveBufferBytes -= h.bytes; return;}
     if (!this.idle.has(h.bytes)) this.idle.set(h.bytes, []);
     const list = this.idle.get(h.bytes), id = this.idOf(h.buffer);
     let i = list.length; while (i > 0 && this.idOf(list[i - 1]) > id) i--;

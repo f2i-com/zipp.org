@@ -130,6 +130,18 @@ def _shape(shape):
     return result
 
 
+def _integers_below(flat, bound):
+    """True when tensor storage `flat` surely holds integers in [0, bound),
+    by three whole-storage kernels rather than a Python loop per element;
+    False sends the caller to its own per-element check and error."""
+    if _k is None or not isinstance(flat, _k.Storage) or _k.size(flat) == 0:
+        return False
+    n = _k.size(flat)
+    return (_k.equal(flat, _k.unary("trunc", flat))
+            and _k.item(_k.reduce("min", flat, (n,), None, False)[0], 0) >= 0
+            and _k.item(_k.reduce("max", flat, (n,), None, False)[0], 0) < bound)
+
+
 def _size(shape):
     result = 1
     for d in shape:
@@ -1699,11 +1711,11 @@ class Session:
                 count = len(flat)
             if count != self._sizes[node_id]:
                 raise GraphError("Input %s length does not match shape in step %d" % (name, index))
-            if node_id in self._classes:
+            if node_id in self._classes and not _integers_below(flat, self._classes[node_id]):
                 values = _k.to_list(flat) if _k is not None and isinstance(flat, _k.Storage) else flat
                 if any(v != int(v) or not 0 <= v < self._classes[node_id] for v in values):
                     raise GraphError("%s must hold integer class indices in [0, %d)" % (name, self._classes[node_id]))
-            if node_id in self._bounds:
+            if node_id in self._bounds and not _integers_below(flat, self._bounds[node_id]):
                 values = _k.to_list(flat) if _k is not None and isinstance(flat, _k.Storage) else flat
                 if any(v != int(v) or not 0 <= v < self._bounds[node_id] for v in values):
                     raise GraphError("%s must hold integer indices in [0, %d)" % (name, self._bounds[node_id]))

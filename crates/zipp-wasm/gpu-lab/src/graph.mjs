@@ -159,16 +159,17 @@ export function checkFiniteOutput(values) {
 }
 /** Cross-entropy targets are indices: every value an integer in [0, classes). */
 export function checkClassTargets(data, classes, op = 'cross_entropy') {
+  // The message is built only for a failure: per element it was most of the check's cost.
   for (let i = 0; i < data.length; i++) {
     const t = data[i];
-    check(Number.isInteger(t) && t >= 0 && t < classes, 'NUMBER', `${op} targets must be an input of integer class indices in [0, C)`);
+    if (!(Number.isInteger(t) && t >= 0 && t < classes)) check(false, 'NUMBER', `${op} targets must be an input of integer class indices in [0, C)`);
   }
 }
 /** An index input of the version-4 selections: every value an integer in [0, bound). */
 export function checkIndices(data, bound) {
   for (let i = 0; i < data.length; i++) {
     const t = data[i];
-    check(Number.isInteger(t) && t >= 0 && t < bound, 'NUMBER', `Index values must be integers in [0, ${bound})`);
+    if (!(Number.isInteger(t) && t >= 0 && t < bound)) check(false, 'NUMBER', `Index values must be integers in [0, ${bound})`);
   }
 }
 function sameShape(a, b) { return a.length === b.length && a.every((v, i) => v === b[i]); }

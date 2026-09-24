@@ -84,6 +84,8 @@ pub struct GpuHost {
     take_slot: u32,
     summary: AdapterSummary,
     status: HostValue,
+    /// `ZIPP_GPU_PROFILE`: ms running requests in the runtime, and taking replies.
+    profile: Option<(f64, f64)>,
 }
 
 fn slot_of(state: &ScriptState, name: &str) -> Result<u32, String> {
@@ -181,6 +183,7 @@ impl GpuHost {
             gpu,
             summary,
             status,
+            profile: std::env::var_os("ZIPP_GPU_PROFILE").map(|_| (0.0, 0.0)),
         })
     }
 
@@ -198,17 +201,34 @@ impl GpuHost {
     /// return the reply to deliver: `{ok: true, value}` or
     /// `{ok: false, error: {code, message[, poisoned]}}`.
     pub fn handle(&mut self, id: f64, kind: &str, payload: HostValue) -> HostValue {
+        self.handle_owned(id, kind, payload, false)
+    }
+
+    /// [`GpuHost::handle`] for a payload built for this request alone whose
+    /// float32 arrays the caller has checked are all finite (`finite`):
+    /// gpu-lab then takes those arrays as they are instead of scanning and
+    /// copying each one (`js/accelerate.js`). Nothing else may hold them.
+    pub fn handle_owned(
+        &mut self,
+        id: f64,
+        kind: &str,
+        payload: HostValue,
+        finite: bool,
+    ) -> HostValue {
+        let begun = std::time::Instant::now();
         let started = self.state.call_slot(
             self.handle_slot,
             &[
                 HostValue::Number(id),
                 HostValue::String(kind.to_owned()),
                 payload,
+                HostValue::Bool(finite),
             ],
         );
         if let Err(message) = started {
             return failure("GPU", &message);
         }
+        let taken = std::time::Instant::now();
         let mut budget = HostValueBudget::new(REPLY_NODES, REPLY_BYTES);
         let replies = match self
             .state
@@ -218,6 +238,10 @@ impl GpuHost {
             Ok(_) => Vec::new(),
             Err(error) => return failure("GPU", &error.into_message()),
         };
+        if let Some(p) = self.profile.as_mut() {
+            p.0 += (taken - begun).as_secs_f64() * 1000.0;
+            p.1 += taken.elapsed().as_secs_f64() * 1000.0;
+        }
         let uncaptured = self.gpu.borrow_mut().take_uncaptured();
         if !uncaptured.is_empty() && std::env::var_os("ZIPP_GPU_LOG").is_some() {
             for line in &uncaptured {
@@ -245,6 +269,9 @@ impl GpuHost {
 
 impl Drop for GpuHost {
     fn drop(&mut self) {
+        if let Some((run, take)) = self.profile {
+            eprintln!("zipp-gpu host: {run:.1} ms serving requests in the runtime, {take:.1} ms taking replies");
+        }
         if let Ok(slot) = slot_of(&self.state, "__zgpuDispose") {
             let _ = self.state.call_slot(slot, &[]);
         }

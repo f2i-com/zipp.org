@@ -243,6 +243,69 @@ pub struct WebGpu {
     groups: HashMap<u32, wgpu::BindGroup>,
     commands: HashMap<u32, wgpu::CommandBuffer>,
     epoch: Instant,
+    /// `ZIPP_GPU_PROFILE`: time spent in each host call kind (and blocked
+    /// on the device inside them), printed to stderr when the host drops.
+    profile: Option<Profile>,
+}
+
+/// A timestamped command buffer: readback and resolve buffers, the query
+/// set, and each dispatch's (start query, end query, pipeline label).
+type Timed = (
+    wgpu::Buffer,
+    wgpu::Buffer,
+    wgpu::QuerySet,
+    Vec<(u32, u32, String)>,
+);
+
+/// Where the shim's host calls spend their time (`ZIPP_GPU_PROFILE=1`, or
+/// `=kernels` to add per-kernel GPU time from timestamp queries).
+#[derive(Default)]
+struct Profile {
+    calls: HashMap<String, (u64, f64)>,
+    /// Blocked in `device.poll` waiting for submitted work (map, queue drain).
+    wait_ms: f64,
+    waits: u64,
+    dispatches: u64,
+    passes: u64,
+    /// With timestamp queries: GPU time per pipeline label (count, ms).
+    kernels: HashMap<String, (u64, f64)>,
+    labels: HashMap<u32, String>,
+    /// Command buffers whose dispatches were timestamped: the readback
+    /// buffer, the query set and each dispatch's (start, end, label).
+    timed: HashMap<u32, Timed>,
+    timestamps: bool,
+}
+
+impl Drop for WebGpu {
+    fn drop(&mut self) {
+        if let Some(p) = &self.profile {
+            let mut rows: Vec<_> = p.calls.iter().collect();
+            rows.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+            eprintln!(
+                "zipp-gpu profile: {} dispatches in {} passes; blocked on the device {:.1} ms in {} waits",
+                p.dispatches, p.passes, p.wait_ms, p.waits
+            );
+            for (kind, (count, ms)) in rows {
+                eprintln!("  {kind:<22} {count:>8} calls {ms:>10.1} ms");
+            }
+            if !p.kernels.is_empty() {
+                let mut rows: Vec<_> = p.kernels.iter().collect();
+                rows.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+                let total: f64 = rows
+                    .iter()
+                    .filter(|r| !r.0.starts_with('('))
+                    .map(|r| r.1 .1)
+                    .sum();
+                eprintln!("zipp-gpu kernels (timestamp queries): {total:.1} ms of GPU time");
+                for (kind, (count, ms)) in rows {
+                    eprintln!(
+                        "  {kind:<22} {count:>8} dispatches {ms:>10.2} ms {:>8.1} us each",
+                        ms * 1000.0 / *count as f64
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn num(args: &[String], i: usize) -> Result<f64, String> {
@@ -298,6 +361,7 @@ impl WebGpu {
             groups: HashMap::new(),
             commands: HashMap::new(),
             epoch: Instant::now(),
+            profile: std::env::var_os("ZIPP_GPU_PROFILE").map(|_| Profile::default()),
         }
     }
 
@@ -333,16 +397,46 @@ impl WebGpu {
             .and_then(|d| d.recorded.lock().unwrap().lost.clone())
     }
     /// Block until the queue's submitted work (and every map callback) is done.
-    fn wait(&self) -> Result<(), String> {
+    fn wait(&mut self) -> Result<(), String> {
+        let start = self.profile.as_ref().map(|_| Instant::now());
         let device = self.device()?;
-        device
+        let done = device
             .poll(wgpu::PollType::wait_indefinitely())
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        if let (Some(p), Some(start)) = (self.profile.as_mut(), start) {
+            p.wait_ms += start.elapsed().as_secs_f64() * 1000.0;
+            p.waits += 1;
+        }
+        done
     }
 
     /// Serve one `__zippHostCall("gpu.<kind>", ...)`.
     pub fn call(
+        &mut self,
+        ctx: &mut dyn HostCtx,
+        kind: &str,
+        args: &[String],
+    ) -> Result<String, String> {
+        if self.profile.is_none() {
+            return self.serve(ctx, kind, args);
+        }
+        let start = Instant::now();
+        let result = self.serve(ctx, kind, args);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(p) = self.profile.as_mut() {
+            let name = match (kind, args.get(4)) {
+                ("gpu.pipeline", Some(label)) => format!("gpu.pipeline {label}"),
+                _ => kind.to_owned(),
+            };
+            let slot = p.calls.entry(name).or_default();
+            slot.0 += 1;
+            slot.1 += ms;
+        }
+        result
+    }
+
+    fn serve(
         &mut self,
         ctx: &mut dyn HostCtx,
         kind: &str,
@@ -365,6 +459,23 @@ impl WebGpu {
                     .chunks_exact(4)
                     .all(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).is_finite());
                 return Ok(if finite { "1" } else { "0" }.into());
+            }
+            "gpu.allIndices" => {
+                // Whether the first `n` float32 values in `__zgpuUp` are all
+                // integers in [0, bound) (js/accelerate.js: gpu-lab's
+                // checkIndices and checkClassTargets).
+                let n = int(args, 0)? as usize;
+                let bound = num(args, 1)?;
+                let bytes = region(
+                    ctx,
+                    "__zgpuUp",
+                    n.checked_mul(4).ok_or("RangeError: too long")?,
+                )?;
+                let ok = bytes[..n * 4].chunks_exact(4).all(|b| {
+                    let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64;
+                    v.fract() == 0.0 && v >= 0.0 && v < bound
+                });
+                return Ok(if ok { "1" } else { "0" }.into());
             }
             _ => {}
         }
@@ -440,6 +551,9 @@ impl WebGpu {
                     );
                 }
                 self.queue()?.submit(list);
+                if self.profile.as_ref().is_some_and(|p| !p.timed.is_empty()) {
+                    self.collect_timestamps(args.first().map(String::as_str).unwrap_or(""))?;
+                }
                 Ok(String::new())
             }
             "gpu.done" => {
@@ -549,7 +663,21 @@ impl WebGpu {
         }
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("zipp-gpu"),
-            required_features: wgpu::Features::empty(),
+            required_features: if self.profile.is_some()
+                && self.adapter.features().contains(
+                    wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES,
+                ) {
+                if let Some(p) = self.profile.as_mut() {
+                    p.timestamps = std::env::var("ZIPP_GPU_PROFILE").as_deref() == Ok("kernels");
+                }
+                if self.profile.as_ref().is_some_and(|p| p.timestamps) {
+                    wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                } else {
+                    wgpu::Features::empty()
+                }
+            } else {
+                wgpu::Features::empty()
+            },
             required_limits: limits.clone(),
             ..Default::default()
         };
@@ -776,6 +904,9 @@ impl WebGpu {
             return Ok(format!("ERR:{}", error_text(&error)));
         }
         let id = self.fresh();
+        if let (Some(p), Some(label)) = (self.profile.as_mut(), args.get(3)) {
+            p.labels.insert(id, label.clone());
+        }
         self.pipelines.insert(id, pipeline);
         Ok(id.to_string())
     }
@@ -834,7 +965,34 @@ impl WebGpu {
     /// inside it; `C<src>,<srcOffset>,<dst>,<dstOffset>,<size>` outside.
     fn finish(&mut self, args: &[String]) -> Result<String, String> {
         let script = args.first().map(String::as_str).unwrap_or("");
+        let mut timing = 0u32;
+        if let Some(p) = self.profile.as_mut() {
+            for op in script.split(';') {
+                match op.as_bytes().first() {
+                    Some(b'D') => {
+                        p.dispatches += 1;
+                        timing += 2;
+                    }
+                    Some(b'P') => p.passes += 1,
+                    _ => {}
+                }
+            }
+            if !p.timestamps {
+                timing = 0;
+            }
+        }
+        let timing = timing.min(4096);
         let device = self.device()?;
+        let queries = (timing > 0).then(|| {
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: None,
+                ty: wgpu::QueryType::Timestamp,
+                count: timing,
+            })
+        });
+        let mut spans: Vec<(u32, u32, String)> = Vec::new();
+        let mut current_label = String::new();
+        let labels = self.profile.as_ref().map(|p| &p.labels);
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let mut ops = script.split(';').filter(|s| !s.is_empty()).peekable();
@@ -860,6 +1018,12 @@ impl WebGpu {
                             "E" => break,
                             "S" => {
                                 let key: u32 = rest.parse().map_err(|_| missing("pipeline"))?;
+                                if let Some(labels) = labels {
+                                    current_label = labels
+                                        .get(&key)
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("pipeline {key}"));
+                                }
                                 pass.set_pipeline(
                                     self.pipelines
                                         .get(&key)
@@ -883,7 +1047,16 @@ impl WebGpu {
                                 if n.len() != 3 {
                                     return Err("TypeError: malformed dispatch".into());
                                 }
+                                let q = spans.len() as u32 * 2;
+                                let timed = queries.as_ref().filter(|_| q + 2 <= timing);
+                                if let Some(set) = timed {
+                                    pass.write_timestamp(set, q);
+                                }
                                 pass.dispatch_workgroups(n[0] as u32, n[1] as u32, n[2] as u32);
+                                if let Some(set) = timed {
+                                    pass.write_timestamp(set, q + 1);
+                                    spans.push((q, q + 1, current_label.clone()));
+                                }
                             }
                             _ => {
                                 return Err(format!(
@@ -905,10 +1078,83 @@ impl WebGpu {
                 _ => return Err(format!("TypeError: unknown command {tag}")),
             }
         }
+        let mut timed = None;
+        if let (Some(set), false) = (queries, spans.is_empty()) {
+            let bytes = spans.len() as u64 * 16;
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: bytes,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let read = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.resolve_query_set(&set, 0..spans.len() as u32 * 2, &resolve, 0);
+            encoder.copy_buffer_to_buffer(&resolve, 0, &read, 0, Some(bytes));
+            timed = Some((read, resolve, set, spans));
+        }
         let commands = encoder.finish();
         let id = self.fresh();
+        if let (Some(t), Some(p)) = (timed, self.profile.as_mut()) {
+            p.timed.insert(id, t);
+        }
         self.commands.insert(id, commands);
         Ok(id.to_string())
+    }
+}
+
+impl WebGpu {
+    /// `ZIPP_GPU_PROFILE=kernels`: wait for the command buffers just
+    /// submitted and add their dispatches' timestamps to the profile.
+    fn collect_timestamps(&mut self, ids: &str) -> Result<(), String> {
+        let period = self.queue()?.get_timestamp_period() as f64;
+        let device = self.device()?.clone();
+        let Some(p) = self.profile.as_mut() else {
+            return Ok(());
+        };
+        for part in ids.split(',').filter(|s| !s.is_empty()) {
+            let Ok(key) = part.parse::<u32>() else {
+                continue;
+            };
+            let Some((read, _resolve, _set, spans)) = p.timed.remove(&key) else {
+                continue;
+            };
+            read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| e.to_string())?;
+            let view = read
+                .slice(..)
+                .get_mapped_range()
+                .map_err(|e| format!("OperationError: {e}"))?;
+            let stamps: Vec<u64> = view
+                .chunks_exact(8)
+                .map(|b: &[u8]| u64::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            drop(view);
+            read.unmap();
+            if let (Some(first), Some(last)) = (spans.first(), spans.last()) {
+                let span = stamps[last.1 as usize].saturating_sub(stamps[first.0 as usize]) as f64
+                    * period;
+                let slot = p
+                    .kernels
+                    .entry("(first to last dispatch)".into())
+                    .or_default();
+                slot.0 += 1;
+                slot.1 += span / 1e6;
+            }
+            for (a, b, label) in spans {
+                let ns = stamps[b as usize].saturating_sub(stamps[a as usize]) as f64 * period;
+                let slot = p.kernels.entry(label).or_default();
+                slot.0 += 1;
+                slot.1 += ns / 1e6;
+            }
+        }
+        Ok(())
     }
 }
 
