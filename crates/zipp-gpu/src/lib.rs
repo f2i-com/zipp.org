@@ -28,6 +28,7 @@ use zipp_vm::embed::{HostValue, HostValueBudget, ScriptState};
 pub mod bridge;
 pub mod bundle;
 pub mod device;
+mod replay;
 
 pub use bridge::SyncBridge;
 pub use device::AdapterSummary;
@@ -51,6 +52,9 @@ pub struct GpuOptions {
     /// Keep gpu-lab's browser limits (64 MiB of graph storage, 4M elements a
     /// tensor, a 1G work budget) instead of the device-bounded native ones.
     pub browser_limits: bool,
+    /// Run every prepared step through gpu-lab (no native replay). From
+    /// `ZIPP_GPU_REPLAY=0` in [`GpuOptions::from_env`].
+    pub no_replay: bool,
 }
 
 impl GpuOptions {
@@ -58,6 +62,7 @@ impl GpuOptions {
     pub fn from_env() -> Self {
         GpuOptions {
             backend: std::env::var("ZIPP_GPU_BACKEND").ok(),
+            no_replay: std::env::var("ZIPP_GPU_REPLAY").is_ok_and(|v| v.trim() == "0"),
             ..Default::default()
         }
     }
@@ -82,8 +87,15 @@ pub struct GpuHost {
     gpu: Rc<RefCell<device::WebGpu>>,
     handle_slot: u32,
     take_slot: u32,
+    begin_slot: u32,
+    end_slot: u32,
+    /// Prepared steps replay natively (`ZIPP_GPU_REPLAY=0` turns it off).
+    replay: bool,
     summary: AdapterSummary,
     status: HostValue,
+    /// Ids of requests the host makes itself (negative: never a bridge's).
+    next_internal: f64,
+    next_request: f64,
     /// `ZIPP_GPU_PROFILE`: ms running requests in the runtime, and taking replies.
     profile: Option<(f64, f64)>,
 }
@@ -160,6 +172,7 @@ impl GpuHost {
                     HostValue::String("webgpu".into()),
                     HostValue::String(if options.browser_limits { "" } else { "native" }.into()),
                     HostValue::String(summary.describe()),
+                    HostValue::Bool(!options.no_replay),
                 ],
             )
             .map_err(|e| format!("zipp-gpu: {e}"))?;
@@ -179,10 +192,15 @@ impl GpuHost {
         Ok(GpuHost {
             handle_slot: slot_of(&state, "__zgpuHandle")?,
             take_slot: slot_of(&state, "__zgpuTake")?,
+            begin_slot: slot_of(&state, "__zgpuReplayBegin")?,
+            end_slot: slot_of(&state, "__zgpuReplayEnd")?,
+            replay: !options.no_replay,
             state,
             gpu,
             summary,
             status,
+            next_internal: 0.0,
+            next_request: 0.0,
             profile: std::env::var_os("ZIPP_GPU_PROFILE").map(|_| (0.0, 0.0)),
         })
     }
@@ -258,6 +276,324 @@ impl GpuHost {
         failure("GPU", "the GPU runtime did not complete the request")
     }
 
+    /// Serve one request as the CLI's bridge sends it: `body` is its JSON,
+    /// with each float32 tensor as `{"$f32": [offset, length]}` into `bytes`.
+    /// A prepared step the session's replay covers runs natively
+    /// ([`GpuHost::try_replay`]); anything else goes to gpu-lab.
+    pub fn request(
+        &mut self,
+        kind: &str,
+        body: &serde_json::Value,
+        bytes: &[u8],
+    ) -> Result<HostValue, String> {
+        if kind == "gpu.session.run" {
+            if let Some(reply) = self.try_replay(body, bytes) {
+                return Ok(reply);
+            }
+        }
+        // Every float32 value of the request finite: gpu-lab may then take
+        // the arrays as they are (they are this request's alone).
+        let finite = bytes.len() % 4 == 0
+            && bytes
+                .chunks_exact(4)
+                .all(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x7f80_0000 != 0x7f80_0000);
+        let payload = crate::bridge::to_host(body, bytes)?;
+        self.next_request += 1.0;
+        let id = self.next_request;
+        Ok(self.handle_owned(id, kind, payload, finite))
+    }
+
+    /// Serve a `gpu.session.run` request natively when the session has a
+    /// replay (`replay.rs`) that covers it: `body` is the request's JSON, its
+    /// `{"$f32": [offset, length]}` tensors in `bytes`. `None` hands the
+    /// request to gpu-lab (no replay, another feed set or read-back list, a
+    /// value a check refuses, a session that cannot run): gpu-lab then gives
+    /// the result or the error it always gives. A run of several steps on a
+    /// session with no replay yet runs its first step through gpu-lab (which
+    /// may capture one) and the rest natively when it did: the same steps.
+    pub fn try_replay(&mut self, body: &serde_json::Value, bytes: &[u8]) -> Option<HostValue> {
+        if !self.replay {
+            return None;
+        }
+        let token = body.get("session")?.as_str()?.to_owned();
+        let steps = body.get("steps")?.as_array()?;
+        if steps.len() < 2 || self.gpu.borrow().replays.contains_key(&token) {
+            return self.replay_run(body, bytes);
+        }
+        let object = body.as_object()?;
+        let part = |steps: Vec<serde_json::Value>, keep_step: bool| {
+            let mut o = object.clone();
+            o.insert("steps".into(), serde_json::Value::Array(steps));
+            if !keep_step {
+                o.remove("step");
+            }
+            serde_json::Value::Object(o)
+        };
+        // The first step through gpu-lab, which captures the session's step.
+        let head = part(vec![steps[0].clone()], true);
+        let tail = part(steps[1..].to_vec(), false);
+        let payload = crate::bridge::to_host(&head, bytes).ok()?;
+        let id = self.fresh_id();
+        let first = self.handle_owned(id, "gpu.session.run", payload, false);
+        if !reply_ok(&first) {
+            return Some(first);
+        }
+        let rest = match self.replay_run(&tail, bytes) {
+            Some(reply) => reply,
+            None => {
+                let payload = crate::bridge::to_host(&tail, bytes).ok()?;
+                let id = self.fresh_id();
+                self.handle_owned(id, "gpu.session.run", payload, false)
+            }
+        };
+        Some(merge_runs(first, rest))
+    }
+
+    fn fresh_id(&mut self) -> f64 {
+        self.next_internal -= 1.0;
+        self.next_internal
+    }
+
+    fn replay_run(&mut self, body: &serde_json::Value, bytes: &[u8]) -> Option<HostValue> {
+        let obj = body.as_object()?;
+        if obj
+            .keys()
+            .any(|k| !matches!(k.as_str(), "session" | "steps" | "readback" | "step"))
+        {
+            return None;
+        }
+        let token = obj.get("session")?.as_str()?;
+        let steps = obj.get("steps")?.as_array()?;
+        let readback: Vec<&str> = obj
+            .get("readback")?
+            .as_array()?
+            .iter()
+            .map(|v| v.as_str())
+            .collect::<Option<_>>()?;
+        let step = match obj.get("step") {
+            None | Some(serde_json::Value::Null) => HostValue::Null,
+            Some(v) => HostValue::Number(v.as_f64()?),
+        };
+        if steps.is_empty() {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let mut feeds: Vec<Vec<&[u8]>> = Vec::with_capacity(steps.len());
+        {
+            let gpu = self.gpu.borrow();
+            let replay = gpu.replays.get(token)?;
+            let mut want: Vec<&str> = readback.clone();
+            want.sort_unstable();
+            want.dedup();
+            let mut have: Vec<&str> = replay.outputs.iter().map(|o| o.name.as_str()).collect();
+            have.sort_unstable();
+            if want != have || want.len() != readback.len() {
+                return None;
+            }
+            for entry in steps {
+                let entry = entry.as_object()?;
+                if entry.len() != 1 {
+                    return None;
+                }
+                let inputs = entry.get("inputs")?.as_object()?;
+                if inputs.len() != replay.feeds.len() {
+                    return None;
+                }
+                let mut step_feeds = Vec::with_capacity(replay.feeds.len());
+                for feed in &replay.feeds {
+                    let at = inputs.get(&feed.id.to_string())?.as_object()?;
+                    if at.len() != 1 {
+                        return None;
+                    }
+                    let at = at.get("$f32")?.as_array()?;
+                    let (offset, length) = (
+                        at.first()?.as_u64()? as usize,
+                        at.get(1)?.as_u64()? as usize,
+                    );
+                    if length != feed.size {
+                        return None;
+                    }
+                    let data = bytes.get(offset..offset.checked_add(length.checked_mul(4)?)?)?;
+                    // gpu-lab's checks of a feed (float32Data, checkClassTargets,
+                    // checkIndices): anything they would refuse goes to gpu-lab.
+                    let bound = feed.classes.or(feed.bound);
+                    let ok = data.chunks_exact(4).all(|b| {
+                        let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        v.is_finite()
+                            && bound.is_none_or(|n| {
+                                let v = v as f64;
+                                v.fract() == 0.0 && v >= 0.0 && v < n
+                            })
+                    });
+                    if !ok {
+                        return None;
+                    }
+                    step_feeds.push(data);
+                }
+                feeds.push(step_feeds);
+            }
+        }
+        let count = steps.len() as f64;
+        let begun = self
+            .state
+            .call_slot(
+                self.begin_slot,
+                &[
+                    HostValue::String(token.to_owned()),
+                    HostValue::Number(count),
+                    step,
+                ],
+            )
+            .ok()?;
+        let first = match field(&begun, "first") {
+            Some(HostValue::Number(n)) => *n,
+            _ => return None,
+        };
+        let mut patches = Vec::with_capacity(steps.len());
+        if let Some(HostValue::Array(list)) = field(&begun, "patches") {
+            for words in list {
+                let HostValue::Array(words) = words else {
+                    return None;
+                };
+                patches.push(
+                    words
+                        .chunks_exact(2)
+                        .map(|p| match p {
+                            [HostValue::Number(w), HostValue::Number(b)] => {
+                                (*w as usize, *b as u32)
+                            }
+                            _ => (usize::MAX, 0),
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        let submitted = std::time::Instant::now();
+        let result = if patches.len() == steps.len() {
+            self.gpu.borrow_mut().replay_run(token, &feeds, &patches)
+        } else {
+            Err((
+                "GPU".into(),
+                "the replay's uniforms were not computed".into(),
+            ))
+        };
+        let ended = self.state.call_slot(
+            self.end_slot,
+            &[
+                HostValue::String(token.to_owned()),
+                HostValue::Number(count),
+                HostValue::Bool(result.is_ok()),
+                HostValue::Number(first),
+            ],
+        );
+        let values = match result {
+            Ok(values) => values,
+            Err((code, message)) => {
+                return Some(HostValue::Object(vec![
+                    ("ok".into(), HostValue::Bool(false)),
+                    (
+                        "error".into(),
+                        HostValue::Object(vec![
+                            ("code".into(), HostValue::String(code)),
+                            (
+                                "message".into(),
+                                HostValue::String(message.chars().take(512).collect()),
+                            ),
+                            ("poisoned".into(), HostValue::Bool(true)),
+                        ]),
+                    ),
+                ]))
+            }
+        };
+        let session_step = match ended.as_ref().ok().and_then(|v| field(v, "step")) {
+            Some(HostValue::Number(n)) => *n,
+            _ => first + count,
+        };
+        let peak = ended
+            .as_ref()
+            .ok()
+            .and_then(|v| field(v, "peak"))
+            .cloned()
+            .unwrap_or(HostValue::Null);
+        let gpu = self.gpu.borrow();
+        let replay = gpu.replays.get(token)?;
+        let mut out_steps = Vec::with_capacity(values.len());
+        let mut read = 0usize;
+        for (s, step_values) in values.into_iter().enumerate() {
+            let mut outputs = Vec::with_capacity(replay.outputs.len());
+            let mut at = 0usize;
+            for o in &replay.outputs {
+                outputs.push((
+                    o.name.clone(),
+                    HostValue::Object(vec![
+                        (
+                            "shape".into(),
+                            HostValue::Array(
+                                o.shape.iter().map(|&d| HostValue::Number(d)).collect(),
+                            ),
+                        ),
+                        ("dtype".into(), HostValue::String("float32".into())),
+                        (
+                            "data".into(),
+                            HostValue::Float32Array(step_values[at..at + o.size].to_vec()),
+                        ),
+                    ]),
+                ));
+                at += o.size;
+                read += o.size;
+            }
+            out_steps.push(HostValue::Object(vec![
+                ("step".into(), HostValue::Number(first + s as f64)),
+                ("outputs".into(), HostValue::Object(outputs)),
+            ]));
+        }
+        // As gpu-lab's reply: the last step's outputs again, at the top.
+        let last_outputs = out_steps
+            .last()
+            .and_then(|s| field(s, "outputs"))
+            .cloned()
+            .unwrap_or(HostValue::Null);
+        let upload: usize = replay.feeds.iter().map(|f| f.size).sum::<usize>() * steps.len();
+        drop(gpu);
+        let ms = |d: std::time::Duration| HostValue::Number(d.as_secs_f64() * 1000.0);
+        let mut stats = vec![("steps".to_string(), HostValue::Number(count))];
+        for key in [
+            "nodes",
+            "estimatedWork",
+            "logicalAllocationBytes",
+            "residentBytes",
+        ] {
+            stats.push((
+                key.into(),
+                field(&begun, key).cloned().unwrap_or(HostValue::Null),
+            ));
+        }
+        stats.extend([
+            ("uploadElements".into(), HostValue::Number(upload as f64)),
+            ("readbackElements".into(), HostValue::Number(read as f64)),
+            ("submitWallMs".into(), ms(submitted - started)),
+            ("readbackWallMs".into(), ms(submitted.elapsed())),
+            ("totalWallMs".into(), ms(started.elapsed())),
+            ("webgpuBufferPeakBytes".into(), peak),
+            ("adapter".into(), HostValue::String(self.summary.describe())),
+            ("replayed".into(), HostValue::Bool(true)),
+        ]);
+        Some(HostValue::Object(vec![
+            ("ok".into(), HostValue::Bool(true)),
+            (
+                "value".into(),
+                HostValue::Object(vec![
+                    ("version".into(), HostValue::Number(1.0)),
+                    ("backend".into(), HostValue::String("webgpu".into())),
+                    ("outputs".into(), last_outputs),
+                    ("steps".into(), HostValue::Array(out_steps)),
+                    ("stats".into(), HostValue::Object(stats)),
+                    ("step".into(), HostValue::Number(session_step)),
+                ]),
+            ),
+        ]))
+    }
+
     /// Evaluate `source` in the runtime's state (tests and benchmarks drive
     /// gpu-lab's own harness this way) and drain its jobs.
     pub fn eval(&mut self, source: &str) -> Result<zipp_vm::embed::JsValue, String> {
@@ -276,6 +612,64 @@ impl Drop for GpuHost {
             let _ = self.state.call_slot(slot, &[]);
         }
     }
+}
+
+fn reply_ok(reply: &HostValue) -> bool {
+    matches!(field(reply, "ok"), Some(HostValue::Bool(true)))
+}
+
+/// Two consecutive runs' replies as one run's: the steps of both, the later
+/// run's other fields (its step count and element counts summed with the
+/// earlier's), or the later one's failure.
+fn merge_runs(head: HostValue, tail: HostValue) -> HostValue {
+    if !reply_ok(&tail) {
+        return tail;
+    }
+    let steps_of = |r: &HostValue| match field(r, "value").and_then(|v| field(v, "steps")) {
+        Some(HostValue::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    };
+    let stat = |r: &HostValue, k: &str| match field(r, "value")
+        .and_then(|v| field(v, "stats"))
+        .and_then(|s| field(s, k))
+    {
+        Some(HostValue::Number(n)) => *n,
+        _ => 0.0,
+    };
+    let mut steps = steps_of(&head);
+    steps.extend(steps_of(&tail));
+    let HostValue::Object(mut pairs) = tail.clone() else {
+        return tail;
+    };
+    for (key, value) in pairs.iter_mut() {
+        let (true, HostValue::Object(fields)) = (key == "value", value) else {
+            continue;
+        };
+        for (k, v) in fields.iter_mut() {
+            match (k.as_str(), v) {
+                ("steps", v) => *v = HostValue::Array(steps.clone()),
+                ("outputs", v) => {
+                    if let Some(HostValue::Object(last)) = steps.last() {
+                        if let Some((_, o)) = last.iter().find(|(n, _)| n == "outputs") {
+                            *v = o.clone();
+                        }
+                    }
+                }
+                ("stats", HostValue::Object(stats)) => {
+                    for (sk, sv) in stats.iter_mut() {
+                        if matches!(
+                            sk.as_str(),
+                            "steps" | "uploadElements" | "readbackElements" | "estimatedWork"
+                        ) {
+                            *sv = HostValue::Number(stat(&head, sk) + stat(&tail, sk));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    HostValue::Object(pairs)
 }
 
 fn failure(code: &str, message: &str) -> HostValue {

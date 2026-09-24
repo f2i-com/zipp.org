@@ -82,6 +82,8 @@ pub struct AdapterSummary {
     pub device_type: String,
     /// A software rasterizer (WARP, lavapipe, SwiftShader): gpu-lab refuses it.
     pub is_fallback: bool,
+    /// Direct3D 12's shader compiler, `dxc` or `fxc` (see [`find_adapter`]).
+    pub shader_compiler: Option<String>,
 }
 
 impl AdapterSummary {
@@ -106,14 +108,19 @@ impl AdapterSummary {
             driver,
             device_type: device_type.to_owned(),
             is_fallback: info.device_type == wgpu::DeviceType::Cpu,
+            shader_compiler: None,
         }
     }
-    /// One line for a log: name, backend, driver.
+    /// One line for a log: name, backend, driver (and D3D12's shader compiler).
     pub fn describe(&self) -> String {
         let mut text = format!("{} ({}", self.name, self.backend);
         if !self.driver.is_empty() {
             text.push_str(", ");
             text.push_str(&self.driver);
+        }
+        if let Some(compiler) = &self.shader_compiler {
+            text.push_str(", ");
+            text.push_str(compiler);
         }
         text.push(')');
         text
@@ -149,11 +156,45 @@ fn default_order() -> Vec<wgpu::Backends> {
     ]
 }
 
+/// DXC (`dxcompiler.dll`) where the program's loader would find it: next to
+/// the executable, then on PATH. Direct3D 12 compiles WGSL with it when one
+/// is there -- seconds faster per large kernel than the system's FXC, which
+/// is what it uses otherwise.
+fn find_dxc() -> Option<String> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_owned()))
+    {
+        dirs.push(dir);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs.into_iter()
+        .map(|d| d.join("dxcompiler.dll"))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Find a hardware adapter. `Ok(None)`: no driver, or only a software one.
+/// Direct3D 12 is tried with DXC first when [`find_dxc`] finds one (and with
+/// FXC if that instance offers no adapter), unless `WGPU_DX12_COMPILER` says.
 pub fn find_adapter(
     order: &[wgpu::Backends],
-) -> Result<Option<(wgpu::Instance, wgpu::Adapter)>, String> {
+) -> Result<Option<(wgpu::Instance, wgpu::Adapter, Option<String>)>, String> {
+    let mut attempts: Vec<(wgpu::Backends, Option<wgpu::Dx12Compiler>)> = Vec::new();
     for &backends in order {
+        if backends == wgpu::Backends::DX12 && std::env::var_os("WGPU_DX12_COMPILER").is_none() {
+            if let Some(dxc_path) = find_dxc() {
+                attempts.push((backends, Some(wgpu::Dx12Compiler::DynamicDxc { dxc_path })));
+            }
+            attempts.push((backends, Some(wgpu::Dx12Compiler::Fxc)));
+        } else {
+            attempts.push((backends, None));
+        }
+    }
+    for (backends, compiler) in attempts {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         // No backend validation layers (they are slow and chatty); WGPU_*
         // environment variables still apply for debugging, except that the
@@ -161,6 +202,17 @@ pub fn find_adapter(
         descriptor.flags = wgpu::InstanceFlags::empty();
         let mut descriptor = descriptor.with_env();
         descriptor.backends = backends;
+        let name = match &compiler {
+            Some(wgpu::Dx12Compiler::DynamicDxc { .. }) => Some("dxc".to_string()),
+            Some(_) => Some("fxc".to_string()),
+            None if backends == wgpu::Backends::DX12 => {
+                Some("compiler per WGPU_DX12_COMPILER".to_string())
+            }
+            None => None,
+        };
+        if let Some(compiler) = compiler {
+            descriptor.backend_options.dx12.shader_compiler = compiler;
+        }
         let instance = wgpu::Instance::new(descriptor);
         let options = wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -172,7 +224,7 @@ pub fn find_adapter(
         };
         if let Ok(adapter) = pollster::block_on(instance.request_adapter(&options)) {
             if adapter.get_info().device_type != wgpu::DeviceType::Cpu {
-                return Ok(Some((instance, adapter)));
+                return Ok(Some((instance, adapter, name)));
             }
         }
     }
@@ -183,7 +235,9 @@ pub fn find_adapter(
 /// the GPU's start-up (creating a Vulkan instance alone takes ~130 ms on an
 /// NVIDIA driver), and the runtime's script compiles meanwhile.
 pub struct Probe {
-    thread: std::thread::JoinHandle<Result<Option<(wgpu::Instance, wgpu::Adapter)>, String>>,
+    thread: std::thread::JoinHandle<
+        Result<Option<(wgpu::Instance, wgpu::Adapter, Option<String>)>, String>,
+    >,
 }
 
 impl Probe {
@@ -201,13 +255,17 @@ impl Probe {
             .thread
             .join()
             .map_err(|_| "zipp-gpu: the adapter probe failed".to_string())??;
-        Ok(found.map(|(instance, adapter)| WebGpu::new(instance, adapter)))
+        Ok(found.map(|(instance, adapter, compiler)| {
+            let mut gpu = WebGpu::new(instance, adapter);
+            gpu.summary.shader_compiler = compiler;
+            gpu
+        }))
     }
 }
 
-struct BufferEntry {
-    buffer: wgpu::Buffer,
-    size: u64,
+pub(crate) struct BufferEntry {
+    pub(crate) buffer: wgpu::Buffer,
+    pub(crate) size: u64,
 }
 
 /// Errors wgpu reports outside every scope the script pushed.
@@ -218,9 +276,9 @@ struct Recorded {
 }
 
 /// One requested device, its queue and its error-scope stack.
-struct Dev {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+pub(crate) struct Dev {
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     scopes: Vec<wgpu::ErrorScopeGuard>,
     recorded: Arc<Mutex<Recorded>>,
 }
@@ -230,17 +288,25 @@ pub struct WebGpu {
     _instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     pub summary: AdapterSummary,
-    devices: HashMap<u32, Dev>,
+    pub(crate) devices: HashMap<u32, Dev>,
     /// The device the current call addresses (every call after
     /// `requestDevice` names one first).
-    current: u32,
+    pub(crate) current: u32,
     next: u32,
-    buffers: HashMap<u32, BufferEntry>,
+    pub(crate) buffers: HashMap<u32, BufferEntry>,
     modules: HashMap<u32, wgpu::ShaderModule>,
-    group_layouts: HashMap<u32, wgpu::BindGroupLayout>,
+    pub(crate) group_layouts: HashMap<u32, wgpu::BindGroupLayout>,
     pipeline_layouts: HashMap<u32, wgpu::PipelineLayout>,
-    pipelines: HashMap<u32, wgpu::ComputePipeline>,
+    pub(crate) pipelines: HashMap<u32, wgpu::ComputePipeline>,
     groups: HashMap<u32, wgpu::BindGroup>,
+    /// How each live bind group was made: its layout and its
+    /// [binding, buffer, offset, size or -1] entries (a replay rebinds them).
+    pub(crate) group_specs: HashMap<u32, (u32, Vec<(u32, u32, u64, i64)>)>,
+    /// `gpu.capture`: command scripts finished while capturing (a replay's source).
+    capturing: bool,
+    pub(crate) captured: Vec<String>,
+    /// Prepared sessions replayed natively, by the handler's session token.
+    pub(crate) replays: HashMap<String, crate::replay::Replay>,
     commands: HashMap<u32, wgpu::CommandBuffer>,
     epoch: Instant,
     /// `ZIPP_GPU_PROFILE`: time spent in each host call kind (and blocked
@@ -308,12 +374,12 @@ impl Drop for WebGpu {
     }
 }
 
-fn num(args: &[String], i: usize) -> Result<f64, String> {
+pub(crate) fn num(args: &[String], i: usize) -> Result<f64, String> {
     args.get(i)
         .and_then(|s| s.parse::<f64>().ok())
         .ok_or_else(|| format!("TypeError: WebGPU host call argument {i} must be a number"))
 }
-fn int(args: &[String], i: usize) -> Result<u64, String> {
+pub(crate) fn int(args: &[String], i: usize) -> Result<u64, String> {
     let v = num(args, i)?;
     if v < 0.0 || v.fract() != 0.0 || v > 9_007_199_254_740_991.0 {
         return Err(format!(
@@ -322,14 +388,14 @@ fn int(args: &[String], i: usize) -> Result<u64, String> {
     }
     Ok(v as u64)
 }
-fn id(args: &[String], i: usize) -> Result<u32, String> {
+pub(crate) fn id(args: &[String], i: usize) -> Result<u32, String> {
     let v = int(args, i)?;
     u32::try_from(v).map_err(|_| "TypeError: not a WebGPU object id".to_string())
 }
 fn missing(what: &str) -> String {
     format!("TypeError: unknown or destroyed WebGPU {what}")
 }
-fn error_text(error: &wgpu::Error) -> String {
+pub(crate) fn error_text(error: &wgpu::Error) -> String {
     let mut text = error.to_string();
     let mut source = std::error::Error::source(error);
     while let Some(inner) = source {
@@ -359,6 +425,10 @@ impl WebGpu {
             pipeline_layouts: HashMap::new(),
             pipelines: HashMap::new(),
             groups: HashMap::new(),
+            group_specs: HashMap::new(),
+            capturing: false,
+            captured: Vec::new(),
+            replays: HashMap::new(),
             commands: HashMap::new(),
             epoch: Instant::now(),
             profile: std::env::var_os("ZIPP_GPU_PROFILE").map(|_| Profile::default()),
@@ -380,18 +450,18 @@ impl WebGpu {
         id
     }
 
-    fn dev(&self) -> Result<&Dev, String> {
+    pub(crate) fn dev(&self) -> Result<&Dev, String> {
         self.devices
             .get(&self.current)
             .ok_or_else(|| "InvalidStateError: the WebGPU device has been destroyed".into())
     }
-    fn device(&self) -> Result<&wgpu::Device, String> {
+    pub(crate) fn device(&self) -> Result<&wgpu::Device, String> {
         self.dev().map(|d| &d.device)
     }
     fn queue(&self) -> Result<&wgpu::Queue, String> {
         self.dev().map(|d| &d.queue)
     }
-    fn lost(&self) -> Option<String> {
+    pub(crate) fn lost(&self) -> Option<String> {
         self.dev()
             .ok()
             .and_then(|d| d.recorded.lock().unwrap().lost.clone())
@@ -605,12 +675,27 @@ impl WebGpu {
                 }
                 Ok(String::new())
             }
+            "gpu.capture" => {
+                self.capturing = args.first().map(String::as_str) == Some("1");
+                if self.capturing {
+                    self.captured.clear();
+                }
+                Ok(String::new())
+            }
+            "gpu.replayCreate" => self.replay_create(ctx, args),
+            "gpu.replayDrop" => {
+                if let Some(token) = args.first() {
+                    self.replays.remove(token);
+                }
+                Ok(String::new())
+            }
             "gpu.drop" => {
                 // Objects the script no longer references (FinalizationRegistry).
                 let key = id(args, 1)?;
                 match args.first().map(String::as_str) {
                     Some("group") => {
                         self.groups.remove(&key);
+                        self.group_specs.remove(&key);
                     }
                     Some("pipeline") => {
                         self.pipelines.remove(&key);
@@ -920,6 +1005,8 @@ impl WebGpu {
             .get(1)
             .ok_or("TypeError: bind group entries are required")?;
         let rows = parse_rows(spec)?;
+        let layout_id = id(args, 0)?;
+        let mut record = Vec::with_capacity(rows.len());
         let mut entries = Vec::with_capacity(rows.len());
         for item in &rows {
             // [binding, buffer, offset, size or -1]
@@ -935,6 +1022,7 @@ impl WebGpu {
                 .buffer;
             let offset = item[2].parse::<u64>().map_err(|_| "TypeError: offset")?;
             let size = item[3].parse::<i64>().map_err(|_| "TypeError: size")?;
+            record.push((binding, key, offset, size));
             entries.push(wgpu::BindGroupEntry {
                 binding,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -957,6 +1045,7 @@ impl WebGpu {
             });
         let id = self.fresh();
         self.groups.insert(id, group);
+        self.group_specs.insert(id, (layout_id, record));
         Ok(id.to_string())
     }
 
@@ -965,6 +1054,9 @@ impl WebGpu {
     /// inside it; `C<src>,<srcOffset>,<dst>,<dstOffset>,<size>` outside.
     fn finish(&mut self, args: &[String]) -> Result<String, String> {
         let script = args.first().map(String::as_str).unwrap_or("");
+        if self.capturing {
+            self.captured.push(script.to_owned());
+        }
         let mut timing = 0u32;
         if let Some(p) = self.profile.as_mut() {
             for op in script.split(';') {

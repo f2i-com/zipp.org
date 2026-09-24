@@ -467,3 +467,27 @@ fn every_fixture_case_matches_pytorch() {
         }
     }
 }
+
+/// Prepared steps the native GPU replays (crates/zipp-gpu/src/replay.rs) are
+/// gpu-lab's own steps bit for bit: a run with `ZIPP_GPU_REPLAY=0` prints the
+/// same losses, synced weights and optimizer state (Adam, momentum SGD with
+/// device-drawn dropout masks, and embedding lookups fed their indices), and
+/// the CPU evaluator agrees within the float tolerance.
+#[test]
+fn replayed_prepared_steps_are_gpu_labs() {
+    let project = Project::new(&read(DRIVERS, "replay.py"));
+    let replayed = project.run(&[("ZIPP_GPU_LOG", "1")], &[]);
+    let plain = project.run(&[("ZIPP_GPU_REPLAY", "0")], &[]);
+    let (a, b) = (
+        lines(&replayed, "replayed run"),
+        lines(&plain, "run without replay"),
+    );
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(x, y);
+    }
+    assert!(
+        a.iter().filter(|l| l.contains(" losses ")).count() == 3,
+        "{a:?}"
+    );
+}

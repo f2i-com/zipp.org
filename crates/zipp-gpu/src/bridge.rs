@@ -37,7 +37,6 @@ pub struct SyncBridge {
     log: bool,
     host: Opened,
     pending: Vec<u8>,
-    next_id: f64,
     /// `ZIPP_GPU_PROFILE`: requests, time in the GPU runtime, time converting.
     profile: Option<(u64, f64, f64)>,
 }
@@ -46,7 +45,7 @@ impl Drop for SyncBridge {
     fn drop(&mut self) {
         if let Some((count, runtime, convert)) = self.profile {
             eprintln!(
-                "zipp-gpu bridge: {count} requests, {runtime:.1} ms in the GPU runtime, {convert:.1} ms converting payloads"
+                "zipp-gpu bridge: {count} requests, {runtime:.1} ms serving them, {convert:.1} ms writing replies"
             );
         }
     }
@@ -61,7 +60,6 @@ impl SyncBridge {
             log,
             host: Opened::Unknown,
             pending: Vec::new(),
-            next_id: 1.0,
             profile: std::env::var_os("ZIPP_GPU_PROFILE").map(|_| (0, 0.0, 0.0)),
         }
     }
@@ -125,27 +123,18 @@ impl SyncBridge {
                 let upload = crate::device::region(ctx, "__zipp_ngpu_up", bytes)?;
                 let json: serde_json::Value = serde_json::from_str(text)
                     .map_err(|e| format!("TypeError: GPU request: {e}"))?;
-                // Every float32 value of the request finite: gpu-lab may then
-                // take the arrays as they are (they are this request's alone).
-                let finite = upload[..bytes].chunks_exact(4).all(|b| {
-                    u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x7f80_0000 != 0x7f80_0000
-                });
-                let payload = to_host(&json, &upload[..bytes])?;
-                let id = self.next_id;
-                self.next_id += 1.0;
                 let Opened::Yes(host) = &mut self.host else {
                     unreachable!("opened above")
                 };
+                let reply = host.request(&request, &json, &upload[..bytes])?;
                 let t1 = std::time::Instant::now();
-                let reply = host.handle_owned(id, &request, payload, finite && bytes % 4 == 0);
-                let t2 = std::time::Instant::now();
                 let mut blob = Vec::new();
                 let mut out = String::new();
                 write_json(&reply, &mut out, &mut blob);
                 if let Some(p) = self.profile.as_mut() {
                     p.0 += 1;
-                    p.1 += (t2 - t1).as_secs_f64() * 1000.0;
-                    p.2 += ((t1 - t0) + t2.elapsed()).as_secs_f64() * 1000.0;
+                    p.1 += (t1 - t0).as_secs_f64() * 1000.0;
+                    p.2 += t1.elapsed().as_secs_f64() * 1000.0;
                 }
                 let head = format!("{}\n{out}", blob.len());
                 self.pending = blob;
@@ -163,7 +152,7 @@ impl SyncBridge {
 }
 
 /// A request's JSON as a host value, `{"$f32": [offset, length]}` read from `bytes`.
-fn to_host(value: &serde_json::Value, bytes: &[u8]) -> Result<HostValue, String> {
+pub fn to_host(value: &serde_json::Value, bytes: &[u8]) -> Result<HostValue, String> {
     use serde_json::Value;
     Ok(match value {
         Value::Null => HostValue::Null,

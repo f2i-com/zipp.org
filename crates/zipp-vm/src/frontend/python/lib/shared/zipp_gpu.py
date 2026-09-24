@@ -125,9 +125,18 @@ def _shape(shape):
     if any(type(d) is not int or not 0 < d <= 65536 for d in shape):
         raise GraphError("Dimensions must be integers in 1..65536")
     result = tuple(shape)
-    if _size(result) > 4194304:
-        raise GraphError("Tensor exceeds 4,194,304 elements")
+    if _size(result) > _max_elements():
+        raise GraphError("Tensor exceeds %s elements" % format(_max_elements(), ","))
     return result
+
+
+def _max_elements():
+    """A tensor's element bound: the protocol's 4,194,304 (a browser host's
+    limit, and CPython's reference), or in the native CLI 268,435,456 (a 1 GiB
+    storage binding; its CPU evaluator has none), whether or not a GPU is
+    present, so a program's output does not depend on one."""
+    native = _zipp_gpu is not None and getattr(_zipp_gpu, "native", None) is not None and not _zipp_gpu.hosted()
+    return 268435456 if native else 4194304
 
 
 def _integers_below(flat, bound):
@@ -136,10 +145,15 @@ def _integers_below(flat, bound):
     False sends the caller to its own per-element check and error."""
     if _k is None or not isinstance(flat, _k.Storage) or _k.size(flat) == 0:
         return False
-    n = _k.size(flat)
-    return (_k.equal(flat, _k.unary("trunc", flat))
-            and _k.item(_k.reduce("min", flat, (n,), None, False)[0], 0) >= 0
-            and _k.item(_k.reduce("max", flat, (n,), None, False)[0], 0) < bound)
+    try:
+        n = _k.size(flat)
+        low = _k.reduce("min", flat, (n,), None, False)
+        high = _k.reduce("max", flat, (n,), None, False)
+        low, high = (low[0] if isinstance(low, tuple) else low), (high[0] if isinstance(high, tuple) else high)
+        return bool(_k.equal(flat, _k.unary("trunc", flat))) and _k.item(low, 0) >= 0 and _k.item(high, 0) < bound
+    except Exception:
+        # A kernel this runtime lacks or shapes differently: the caller's own check decides.
+        return False
 
 
 def _size(shape):
@@ -1568,6 +1582,7 @@ class Session:
         # the device's and can no longer move to the CPU.
         self._native_id = None
         self._native_ran = False
+        self._input_ids = None
         self._requested = backend
         self._hosted = _zipp_gpu is not None and _zipp_gpu.hosted()
         if self._hosted:
@@ -1755,12 +1770,16 @@ class Session:
         if not self._hosted:
             # As the host does: every input has a value at every step, or the whole run is refused before any work.
             covered = set(self._values)
-            carries = [node["id"] for node in self._program["nodes"] if node.get("carry") is not None]
+            if self._input_ids is None:
+                # The program's inputs and carries, found once (a step walks only them).
+                nodes = self._program["nodes"]
+                self._input_ids = [(node["id"], str(node["id"])) for node in nodes if node["op"] == "input"]
+                self._carry_ids = [node["id"] for node in nodes if node.get("carry") is not None]
             for index, entry in enumerate(payload_steps):
-                for node in self._program["nodes"]:
-                    if node["op"] == "input" and str(node["id"]) not in entry["inputs"] and node["id"] not in covered:
-                        raise ComputeError("REFERENCE", "Input %d has no value: feed it in step %d" % (node["id"], index))
-                covered.update(carries)
+                for node_id, key in self._input_ids:
+                    if key not in entry["inputs"] and node_id not in covered:
+                        raise ComputeError("REFERENCE", "Input %d has no value: feed it in step %d" % (node_id, index))
+                covered.update(self._carry_ids)
         if self._hosted:
             body = {"steps": payload_steps, "readback": names}
             if step is not None:

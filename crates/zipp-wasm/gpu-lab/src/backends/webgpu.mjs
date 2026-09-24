@@ -71,10 +71,10 @@ fn tanh_s(x: f32) -> f32 {
 }`;
 // A binds as array<f32>; B:u32 binds the same buffer as raw words, which is
 // how a quantized weight arrives -- blocks, not values.
-const io = inputs => inputs.map((name, i) => {
+const io = (inputs, outputs = ['O']) => inputs.map((name, i) => {
   const [id, type = 'f32'] = name.split(':');
   return `@group(0) @binding(${i + 1}) var<storage, read> ${id}: array<${type}>;`;
-}).join('\n') + `\n@group(0) @binding(${inputs.length + 1}) var<storage, read_write> O: array<f32>;`;
+}).join('\n') + outputs.map((name, i) => `\n@group(0) @binding(${inputs.length + 1 + i}) var<storage, read_write> ${name}: array<f32>;`).join('');
 const each = body => `@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
   let i = flat(gid, nwg);
@@ -216,6 +216,26 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
   ce_grad: [['A', 'T'], each(`${ROW_STATS}
   let t = min(u32(max(T[i], 0.0)), P.len - 1u);
   for (var j = 0u; j < P.len; j = j + 1u) { O[base + j] = (exp(A[base + j] - m) / s - select(0.0, 1.0, j == t)) / f32(P.n); }`)],
+  // Adam's adam_m, adam_v and adam_update of one parameter in one pass
+  // (graph.mjs adamGroups): each the same expression as `optim`'s case, in
+  // the same order, with m and v passed on in registers rather than through
+  // memory. sb holds adam_m's w and adam_v's beta2 and w as float bits; f the
+  // update's stepSize, bc2Sqrt and eps, where `optim` has them.
+  adam: [['W', 'Mi', 'Vi', 'G'], each(`let g = G[i]; let a = Mi[i]; let w = bitcast<f32>(P.sb.x);
+  var m: f32;
+  if (w < 0.5) { m = a + w * (g - a); } else { m = g - (g - a) * (1.0 - w); }
+  let v = Vi[i] * bitcast<f32>(P.sb.y) + bitcast<f32>(P.sb.z) * g * g;
+  O[i] = m; O2[i] = v;
+  O3[i] = W[i] - P.f.x * (m / (sqrt(v) / P.f.y + P.f.z));`), ['O', 'O2', 'O3']],
+  // The same, updating a session's held m, v and p where they are: each
+  // element is read before it is written, by the one invocation that owns it.
+  adam_inplace: [['G'], each(`let g = G[i]; let a = O[i]; let w = bitcast<f32>(P.sb.x);
+  var m: f32;
+  if (w < 0.5) { m = a + w * (g - a); } else { m = g - (g - a) * (1.0 - w); }
+  let v = O2[i] * bitcast<f32>(P.sb.y) + bitcast<f32>(P.sb.z) * g * g;
+  let p = O3[i];
+  O[i] = m; O2[i] = v;
+  O3[i] = p - P.f.x * (m / (sqrt(v) / P.f.y + P.f.z));`), ['O', 'O2', 'O3']],
   optim: [['A', 'B', 'C'], each(`let a = A[i]; let b = B[i];
   var r: f32;
   switch P.op {
@@ -742,6 +762,8 @@ export class WebGPUBackend {
     this.device = device; this.debug = debug; this.info = info ? {vendor: info.vendor, architecture: info.architecture,
       description: info.description, isFallbackAdapter: info.isFallbackAdapter ?? null} : null;
     this.pipelines = new Map(); this.lost = null; this.scopeOpen = false; this.matmulTile = null;
+    // Adam groups in one pass (`adam`); false keeps three (tests compare the bits).
+    this.fuseAdam = true;
     // Idle bytes kept for reuse; a host with device memory to spare raises it.
     this.poolBytes = POOL_BYTES;
     // Idle buffers are free across executions; recycled ones were freed during the
@@ -803,12 +825,12 @@ export class WebGPUBackend {
   async pipeline(name) {
     let entry = this.pipelines.get(name);
     if (!entry) {
-      const [inputs, body] = KERNELS[name];
+      const [inputs, body, outputs = ['O']] = KERNELS[name];
       const layout = this.device.createBindGroupLayout({entries: [
         {binding: 0, visibility: COMPUTE(), buffer: {type: 'uniform', hasDynamicOffset: true}},
         ...inputs.map((_, i) => ({binding: i + 1, visibility: COMPUTE(), buffer: {type: 'read-only-storage'}})),
-        {binding: inputs.length + 1, visibility: COMPUTE(), buffer: {type: 'storage'}}]});
-      const module = this.device.createShaderModule({code: `${PRELUDE}\n${io(inputs)}\n${body}`});
+        ...outputs.map((_, i) => ({binding: inputs.length + 1 + i, visibility: COMPUTE(), buffer: {type: 'storage'}}))]});
+      const module = this.device.createShaderModule({code: `${PRELUDE}\n${io(inputs, outputs)}\n${body}`});
       const pipeline = await this.device.createComputePipelineAsync({label: name, layout: this.device.createPipelineLayout({bindGroupLayouts: [layout]}),
         compute: {module, entryPoint: 'main'}});
       entry = {pipeline, layout}; this.pipelines.set(name, entry);
@@ -869,10 +891,37 @@ export class WebGPUBackend {
     let [x, y, z] = groups ?? [Math.ceil(count / 256), 1, 1];
     if (!groups && x > limit) { y = Math.ceil(x / limit); x = limit; }
     check(x <= limit && y <= limit && z <= limit, 'LIMIT', 'Dispatch exceeds WebGPU workgroup limit');
-    const offset = this.uniform(fill), group = this.bindGroup(kernel, layout, [...inputs, out]);
+    const offset = this.uniform(fill), group = this.bindGroup(kernel, layout, [...inputs, ...(Array.isArray(out) ? out : [out])]);
     if (!this.encoder) this.encoder = this.device.createCommandEncoder();
     if (!this.pass) this.pass = this.encoder.beginComputePass();
     this.pass.setPipeline(pipeline); this.pass.setBindGroup(0, group, [offset]); this.pass.dispatchWorkgroups(x, y, z);
+  }
+  /**
+   * One parameter's Adam group (graph.mjs adamGroups) in one dispatch: new
+   * m, v and p from the old ones and the gradient, into fresh buffers, or
+   * into `inPlace` (the held m, v and p a session carries them back into).
+   * Of the update's refs only p is read; its m and v are this pass's own.
+   */
+  async adam(m, v, u, [mIn, g], [vIn], [p], inPlace = null) {
+    this.live();
+    const outs = inPlace ?? [this.alloc(u.size), this.alloc(u.size), this.alloc(u.size)];
+    const fill = (w, f) => {w[0] = u.size; f[12] = m.w; f[13] = v.beta2; f[14] = v.w; f.set([u.stepSize, u.bc2Sqrt, u.eps], 20);};
+    let scoped = this.debug;
+    if (scoped) this.device.pushErrorScope('validation');
+    try {
+      if (inPlace) await this.dispatch('adam_inplace', fill, [g], outs, u.size);
+      else await this.dispatch('adam', fill, [p, mIn, vIn, g], outs, u.size);
+      if (scoped) {
+        scoped = false;
+        const error = await this.device.popErrorScope();
+        check(!error, 'GPU', `adam: ${error?.message}`);
+      }
+      return outs;
+    } catch (error) {
+      if (scoped) await this.device.popErrorScope().catch(() => {});
+      if (!inPlace) for (const h of outs) this.free(h);
+      throw error;
+    }
   }
   /** A session carry: the step's output is copied into the input's fixed buffer, in stream order. */
   carry(src, dst) {

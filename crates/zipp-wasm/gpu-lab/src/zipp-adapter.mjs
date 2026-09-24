@@ -52,7 +52,8 @@ export function createZippGPUHandler(runtime, {allowExecute=false,maxSessions=16
       } else if(kind==='gpu.session.run'){
         fields(payload,kind);
         const session=lookup(payload.session);
-        try{result=await session.run(payload.steps,{readback:payload.readback,step:payload.step});}
+        // `owned`: the caller's payload is its own private copy, so feeds are checked, not copied again.
+        try{result=await session.run(payload.steps,{readback:payload.readback,step:payload.step,owned:options.owned===true});}
         catch(error){if(session.poisoned&&error!==null&&typeof error==='object')error.poisoned=true;throw error;}
         result.step=session.stepNumber;
       } else if(kind==='gpu.session.download'){
@@ -99,7 +100,7 @@ export function createZippGPUAdapter(engine,runtime,{allowExecute=false,maxReque
       const run=tail.then(async()=>{
         if(!live())return {delivered:false,cancelled:true};
         let reply;
-        try{reply={ok:true,value:await handler.handle(kind,args)};}
+        try{reply={ok:true,value:await handler.handle(kind,args,{owned:true})};}
         catch(error){reply={ok:false,error:{code:error.code||'GPU',message:String(error.message||error).slice(0,512),...(error?.poisoned?{poisoned:true}:{})}};}
         if(!live())return {delivered:false,cancelled:true};
         // This is after asynchronous host work and outside an active Engine export.

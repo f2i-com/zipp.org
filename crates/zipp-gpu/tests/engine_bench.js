@@ -17,6 +17,8 @@ async function engineBench(M, backend, opts = {}) {
   const rt = await createRuntime({backend, limits});
   // Natively, the pool the CLI's driver keeps (js/driver.js).
   if (typeof __zgpuInit === 'function' && rt.impl.poolBytes) rt.impl.poolBytes = opts.poolBytes ?? 2 * 1024 * 1024 * 1024;
+  if (opts.fuseAdam !== undefined) rt.impl.fuseAdam = opts.fuseAdam;
+  if (opts.inPlace !== undefined) rt.impl.adamInPlace = opts.inPlace;
   const out = {backend, info: rt.info(), cases: []};
   // A ramp exact in float32, like the Python side's.
   const ramp = (n, seed, scale = 1) => {

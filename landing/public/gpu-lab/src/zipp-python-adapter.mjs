@@ -71,7 +71,8 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
     const run = tail.then(async () => {
       if (!live()) return {delivered: false, cancelled: true};
       let reply;
-      try { reply = {ok: true, value: await handler.handle(kind, [payload], {typedOutputs})}; }
+      // The payload is this adapter's structuredClone: its feeds need no second copy.
+      try { reply = {ok: true, value: await handler.handle(kind, [payload], {typedOutputs, owned: true})}; }
       catch (error) { reply = {ok: false, error: {code: error.code || 'GPU', message: String(error.message || error).slice(0, 512), ...(error?.poisoned ? {poisoned: true} : {})}}; }
       if (!live()) return {delivered: false, cancelled: true};
       // After the asynchronous host work, outside any engine call.

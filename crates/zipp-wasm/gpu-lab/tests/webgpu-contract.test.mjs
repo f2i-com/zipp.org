@@ -106,11 +106,16 @@ test('WebGPU session mock: an eight-step run is one submit, one map, carries as 
   const r=await s.run(Array.from({length:8},()=>({inputs:{0:x,1:y}})),{readback:['loss']});
   assert.equal(d.submits,1,'one command buffer for eight steps');
   assert.equal(r.steps.length,8);assert.equal(d.scopes,0);
-  // 12 carries per step plus one loss copy per step into the staging buffer.
-  assert.equal(d.copies.length,8*12+8);
+  // Adam updates the held p, m and v in place (webgpu.mjs `adam`), so the
+  // only copies are one loss per step into the staging buffer.
+  assert.equal(d.copies.length,8);
   assert.equal(d.copies.filter(c=>c.dst.usage&GPUBufferUsage.MAP_READ).length,8,'eight scalar losses into one staging buffer');
   assert.ok(d.events.indexOf('submit')>d.events.lastIndexOf('copy'),'copies are recorded before the submit');
   assert.ok(d.events.indexOf('submit')>d.events.lastIndexOf('write'),'uniforms upload before the submit');
+  // Without the fused pass: 12 carries per step as in-stream copies.
+  rt.impl.fuseAdam=false;d.submits=0;d.copies=[];
+  await s.run(Array.from({length:8},()=>({inputs:{0:x,1:y}})),{readback:['loss']});
+  assert.equal(d.submits,1);assert.equal(d.copies.length,8*12+8);
   rt.dispose();
 });
 test('WebGPU session mock: resident buffers never enter the idle pool and bind groups stop being created once warm',async()=>{

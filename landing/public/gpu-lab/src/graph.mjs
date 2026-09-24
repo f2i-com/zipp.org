@@ -153,6 +153,16 @@ export function float32Data(data) {
   }
   return out;
 }
+/**
+ * A Float32Array its caller hands over (a host's private copy of a request,
+ * held by nothing else): checked like float32Data but not copied. Anything
+ * else, or a non-finite value, goes through float32Data (its copy, its error).
+ */
+export function ownedFloat32(data) {
+  if (!(data instanceof Float32Array)) return float32Data(data);
+  for (let i = 0; i < data.length; i++) if (!Number.isFinite(data[i])) return float32Data(data);
+  return data;
+}
 /** Readback's rule: every value of an output finite (a host may serve this natively). */
 export function checkFiniteOutput(values) {
   for (let i = 0; i < values.length; i++) if (!Number.isFinite(values[i])) throw new ComputeError('NUMBER', 'Output contains non-finite values; graph readback requires finite float32');
@@ -674,5 +684,37 @@ export function validateProgram(program, overrides = {}, {session = false} = {})
   const uses = Array(nodes.length).fill(0);
   for (const n of nodes) if (!n.alias) for (const r of n.refs) uses[root[r]]++;
   for (const o of outputs) uses[root[o.id]]++;
-  return {nodes, outputs, uses, root, limits, logicalBytes, work, inputElements, outputElements, session};
+  const adam = adamGroups(nodes, outputs, root), adamMembers = new Set([...adam.values()].flatMap(g => [g.m, g.v, g.u]));
+  return {nodes, outputs, uses, root, limits, logicalBytes, work, inputElements, outputElements, session, adam, adamMembers};
+}
+
+/**
+ * One parameter's Adam update as a group a backend may compute in one pass
+ * (`impl.adam`): an adam_update whose moments are an adam_m and an adam_v of
+ * the same gradient, every input of the three computed before the first of
+ * them, so all three can run at the later of adam_m and adam_v (a loop holds
+ * the earlier one, and what it releases, until then). Each element's
+ * arithmetic is the three nodes' own. Keyed by that position: `{m, v, u, p, mIn, vIn,
+ * inPlace}`, where `inPlace` says nothing after the group reads the old p, m
+ * or v and no output is one of them (a session whose outputs are carried
+ * straight back into those inputs may then update them where they are).
+ */
+function adamGroups(nodes, outputs, root) {
+  const groups = new Map(), grouped = new Set();
+  for (const u of nodes) {
+    if (u.op !== 'adam_update') continue;
+    const [p, mr, vr] = u.refs, M = nodes[mr], V = nodes[vr];
+    if (M?.op !== 'adam_m' || V?.op !== 'adam_v' || root[M.refs[1]] !== root[V.refs[1]]) continue;
+    if ([M.id, V.id, u.id].some(id => grouped.has(id))) continue;
+    // The group runs where the later of adam_m and adam_v stands (every input
+    // of both exists by then) if nothing before that reads the earlier one.
+    const at = Math.max(M.id, V.id), early = Math.min(M.id, V.id), mIn = root[M.refs[0]], vIn = root[V.refs[0]], pIn = root[p];
+    if (pIn >= at || nodes.some(n => !n.alias && n.id > early && n.id < at && n.refs.some(r => root[r] === early))) continue;
+    const members = new Set([M.id, V.id, u.id]), olds = new Set([pIn, mIn, vIn]);
+    let inPlace = olds.size === 3 && !outputs.some(o => olds.has(root[o.id]));
+    for (const n of nodes) if (inPlace && !n.alias && n.id >= at && !members.has(n.id)) inPlace = !n.refs.some(r => olds.has(root[r]));
+    groups.set(at, Object.freeze({m: M.id, v: V.id, u: u.id, p: pIn, mIn, vIn, inPlace}));
+    for (const id of members) grouped.add(id);
+  }
+  return groups;
 }

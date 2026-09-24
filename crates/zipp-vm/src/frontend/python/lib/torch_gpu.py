@@ -64,19 +64,28 @@ def _optimizer_configuration(optimizer, kind):
     # Keep values and parameter identities, never aliases to mutable groups/lists.
     # The step counts come along: an eager step between capture and readback
     # is a change of optimizer state, not a continuation of this one.
+    # (Plain loops: a prepared session compares this every step.)
     groups = []
     for group in optimizer.param_groups:
         values = []
         for name in _OPTIONS[kind]:
             value = group[name]
             items = tuple(value) if name == "betas" and type(value) in (tuple, list) else (value,)
-            if any(type(item) not in (int, float, bool) for item in items):
-                raise NotImplementedError("GPU optimizer options must be numeric or boolean scalars")
+            for item in items:
+                if type(item) not in _SCALAR_TYPES:
+                    raise NotImplementedError("GPU optimizer options must be numeric or boolean scalars")
             values.append(items if name == "betas" else value)
         params = group["params"]
-        steps = tuple(_step_count(optimizer, p) for p in params)
-        groups.append((tuple(id(p) for p in params), tuple(values), steps))
+        steps = []
+        ids = []
+        for p in params:
+            steps.append(_step_count(optimizer, p))
+            ids.append(id(p))
+        groups.append((tuple(ids), tuple(values), tuple(steps)))
     return (id(optimizer), kind, bool(getattr(optimizer, "_decoupled", False)), tuple(groups))
+
+
+_SCALAR_TYPES = (int, float, bool)
 
 
 def _step_count(optimizer, parameter):

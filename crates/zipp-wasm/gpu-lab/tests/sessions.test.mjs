@@ -258,3 +258,22 @@ test('wasm: pinned arena memory is released and does not creep per run',async()=
     s.dispose();
   }finally{rt.dispose();}
 });
+
+test('owned feeds (a host\'s private copy) are checked, not copied: same results, same errors', async () => {
+  const {mlpSessionProgram} = await import('./ml-cases.mjs');
+  const {createRuntime: make} = await import('../src/runtime.mjs');
+  const spec = mlpSessionProgram({sizes: [12, 6, 3], batch: 4});
+  const feed = () => ({inputs: {0: Float32Array.from({length: 48}, (_, i) => (i % 7) / 7), 1: new Float32Array([0, 1, 2, 1])}});
+  const results = [];
+  for (const owned of [false, true]) {
+    const rt = await make({backend: 'cpu-js'}), s = await rt.prepare(spec.program, {resident: spec.resident});
+    const losses = [];
+    for (let i = 0; i < 3; i++) losses.push((await s.run(feed(), {readback: ['loss'], owned})).outputs.loss.data[0]);
+    const bad = feed(); bad.inputs[0][5] = NaN;
+    let error; try { await s.run(bad, {readback: ['loss'], owned}); } catch (e) { error = `${e.code}: ${e.message}`; }
+    results.push({losses, error, params: Array.from((await s.download(['p0'])).outputs.p0.data)});
+    rt.dispose();
+  }
+  assert.deepEqual(results[1], results[0]);
+  assert.equal(results[0].error, 'NUMBER: Values must be finite float32 numbers');
+});

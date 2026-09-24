@@ -88,3 +88,38 @@ async function exactReductions(M) {
   gpu.dispose(); cpu.dispose();
   return {failures, report};
 }
+
+// Adam groups in one pass (in place in a session, into fresh buffers in an
+// execute) against the three separate kernels, on the same device: every
+// loss, weight and moment the same bits after several steps.
+async function exactAdam(M) {
+  const limits = {maxElements: 1 << 26, maxInputElements: 1 << 26, maxOutputElements: 1 << 26, maxWork: Number.MAX_SAFE_INTEGER, maxLogicalBytes: 8 * 1024 * 1024 * 1024};
+  const bits = a => Array.from(new Uint32Array(Float32Array.from(a).buffer));
+  const report = [];
+  let failures = 0;
+  for (const [sizes, batch] of [[[784, 64, 10], 32], [[30, 17, 5], 7], [[784, 256, 256, 10], 64]]) {
+    const out = {};
+    for (const fuse of [true, false]) {
+      const rt = await M.createRuntime({backend: 'webgpu', limits});
+      rt.impl.fuseAdam = fuse;
+      const spec = M.mlpSessionProgram({sizes, batch, lr: 0.01}), rnd = M.seeded(3);
+      const feeds = Array.from({length: 6}, () => ({inputs: {0: Float32Array.from({length: batch * sizes[0]}, () => rnd(0, 1)),
+        1: Float32Array.from({length: batch}, () => Math.floor(rnd(0, sizes[sizes.length - 1])))}}));
+      const s = await rt.prepare(spec.program, {resident: spec.resident});
+      const losses = [];
+      for (const f of feeds.slice(0, 2)) losses.push(...(await s.run(f, {readback: ['loss']})).outputs.loss.data);
+      for (const r of (await s.run(feeds.slice(2), {readback: ['loss']})).steps) losses.push(...r.outputs.loss.data);
+      const params = (await s.download(spec.resident)).outputs;
+      s.dispose();
+      const step = M.mlpTrainingStep({sizes, batch, lr: 0.01, step: 3}).program;
+      const executed = (await rt.execute(step, {typedOutputs: true})).outputs;
+      rt.dispose();
+      out[fuse] = [bits(losses), ...Object.keys(params).sort().map(k => bits(params[k].data)), ...Object.keys(executed).sort().map(k => bits(executed[k].data))];
+    }
+    let diff = 0;
+    out[true].forEach((a, i) => { const b = out[false][i]; for (let j = 0; j < a.length; j++) if (a[j] !== b[j]) diff++; });
+    if (diff) failures++;
+    report.push({sizes, batch, arrays: out[true].length, diff});
+  }
+  return {failures, report};
+}

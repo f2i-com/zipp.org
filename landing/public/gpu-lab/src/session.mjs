@@ -1,4 +1,4 @@
-import {check, checkFiniteOutput, ComputeError, float32Data, checkClassTargets, checkIndices, adamStep, sizeOf} from './graph.mjs';
+import {check, checkFiniteOutput, ComputeError, float32Data, ownedFloat32, checkClassTargets, checkIndices, adamStep, sizeOf} from './graph.mjs';
 const clock=()=>globalThis.performance?.now()??Date.now();
 /** A plan node with some fields replaced for one step: the node as prototype
  * (backends only read a node's fields), not a copy of its every field. The
@@ -37,6 +37,11 @@ export class Session {
     this.residents=new Map();  // output name -> persisted handle
     this.retained=new Map();   // persisted handle -> holders
     this.stepNumber=1;this.busy=false;this.disposed=false;this.disposeRequested=false;this.runs=0;
+    // Adam groups (graph.mjs adamGroups) whose p, m and v outputs are carried
+    // straight back into the inputs they read: those may update in place.
+    this.inPlace=new Set();
+    const carriedInto=id=>{const into=new Set();for(const o of plan.outputs)if(plan.root[o.id]===id)for(const c of this.carries)if(c.carry===o.name)into.add(c.id);return into;};
+    for(const [first,g] of plan.adam??[])if(g.inPlace&&[[g.m,g.mIn],[g.v,g.vIn],[g.u,g.p]].every(([out,input])=>{const into=carriedInto(out);return into.size===1&&into.has(input);}))this.inPlace.add(first);
     // Set when a run failed after `begin`: carries and residents may hold any step's values
     // while stepNumber did not advance, so nothing but dispose() may touch them again.
     this.poisoned=false;
@@ -68,7 +73,7 @@ export class Session {
     finally{if(began)await this.impl.finish();}
   }
   /** Validates one run's step inputs before any device work; returns owned float32 copies by node id. */
-  uploads(steps){
+  uploads(steps,handedOver=false){
     // `covered`: inputs that have a value when a step starts (held now, or carried by an earlier step).
     const limits=this.plan.limits,nodes=this.plan.nodes,covered=new Set(this.held.keys());let elements=0;
     return steps.map((step,index)=>{
@@ -84,7 +89,7 @@ export class Session {
         const data=given[key];
         check((data instanceof Float32Array||Array.isArray(data))&&data.length===n.size,'SHAPE',`Input ${key} length does not match shape`);
         elements+=data.length;check(elements<=limits.maxInputElements,'LIMIT','Total input exceeds limit');
-        const owned=float32Data(data);
+        const owned=handedOver?ownedFloat32(data):float32Data(data);
         if(n.classes!==undefined)checkClassTargets(owned,n.classes);
         if(n.indexBound!==undefined)checkIndices(owned,n.indexBound);
         fed.set(id,owned);
@@ -104,7 +109,7 @@ export class Session {
    * follows it, so one prepared step trains a whole run, and a `uniform`
    * node draws with its recorded step plus this one minus 1, a new draw per step.
    */
-  async run(steps,{readback,step}={}){
+  async run(steps,{readback,step,owned=false}={}){
     check(!this.disposed,'DISPOSED','Session has been disposed');
     check(!this.runtime.disposed,'DISPOSED','Runtime has been disposed');
     check(!this.poisoned,'STATE','Session state is undefined after a failed run; dispose it');
@@ -121,7 +126,7 @@ export class Session {
       if(wanted.has(name))continue;wanted.add(name);readbackElements+=nodes[o.id].size*list.length;
     }
     check(readbackElements<=limits.maxOutputElements,'LIMIT','Requested readback exceeds limit');
-    const fed=this.uploads(list);
+    const fed=this.uploads(list,owned);
     let uploadElements=0;for(const m of fed)for(const d of m.values())uploadElements+=d.length;
     this.busy=this.runtime.busy=true;
     const start=clock(),pending=[],result={steps:[]};let began=false,error,finishError,submitted;
@@ -129,6 +134,7 @@ export class Session {
     const handles=new Map(),freeLocal=id=>{const h=handles.get(id);if(h!==undefined){if(!this.retained.has(h))this.impl.free(h);handles.delete(id);}};
     try{
       await this.impl.begin(plan);began=true;
+      const adam=this.impl.adam&&this.impl.fuseAdam!==false?plan.adam:null;
       for(let s=0;s<list.length;s++){
         if(s>0)this.impl.nextStep?.();
         const stepNo=first+s,uses=[...plan.uses];handles.clear();
@@ -137,14 +143,29 @@ export class Session {
           handles.set(n.id,data?await this.impl.run(derived(n,{data}),[]):this.materialize(this.held.get(n.id)));
         }
         for(const n of this.inputs)if(uses[n.id]===0)freeLocal(n.id); // nothing reads it
+        // Step-dependent nodes follow the session's step: Adam's bias
+        // correction, and a `uniform` draw, which is fresh every step.
+        const stepped=n=>stepNo===1?n:n.op==='adam_update'?derived(n,adamStep(n.raw,n.step+stepNo-1)):n.op==='uniform'?derived(n,{step:n.step+stepNo-1}):n;
+        const refs=n=>n.refs.map(r=>handles.get(root[r])),done=new Set();
         for(const n of nodes){
           if(n.alias||n.op==='input')continue;
-          // Step-dependent nodes follow the session's step: Adam's bias
-          // correction, and a `uniform` draw, which is fresh every step.
-          const node=stepNo===1?n:n.op==='adam_update'?derived(n,adamStep(n.raw,n.step+stepNo-1)):n.op==='uniform'?derived(n,{step:n.step+stepNo-1}):n;
-          handles.set(n.id,await this.impl.run(node,n.refs.map(r=>handles.get(root[r]))));
-          for(const r of n.refs){uses[root[r]]--;if(uses[root[r]]===0)freeLocal(root[r]);}
-          if(uses[n.id]===0)freeLocal(n.id);
+          const group=adam?.get(n.id);
+          // A group's earlier moment node waits for the group (with what it releases).
+          if(!group&&adam&&plan.adamMembers.has(n.id)&&!done.has(n.id))continue;
+          let released=[n];
+          if(group){
+            // One pass for the group; where its outputs are carried straight
+            // back into the held buffers it reads, it updates them in place.
+            const inPlace=this.impl.adamInPlace!==false&&this.inPlace.has(n.id)&&[group.mIn,group.vIn,group.p].every(id=>this.held.has(id))?[group.mIn,group.vIn,group.p].map(id=>handles.get(id)):null;
+            const [M,V,U]=[group.m,group.v,group.u].map(id=>nodes[id]);
+            const hs=await this.impl.adam(stepped(M),stepped(V),stepped(U),refs(M),refs(V),refs(U),inPlace);
+            [group.m,group.v,group.u].forEach((id,i)=>{handles.set(id,hs[i]);done.add(id);});
+            released=[M,V];
+          } else if(!done.has(n.id))handles.set(n.id,await this.impl.run(stepped(n),refs(n)));
+          for(const x of released){
+            for(const r of x.refs){uses[root[r]]--;if(uses[root[r]]===0)freeLocal(root[r]);}
+            if(uses[x.id]===0)freeLocal(x.id);
+          }
         }
         // Outputs: carried into their inputs, kept resident, queued for readback.
         for(const o of plan.outputs){

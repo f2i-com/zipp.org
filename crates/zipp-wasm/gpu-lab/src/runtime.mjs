@@ -63,11 +63,24 @@ export class ComputeRuntime {
     const free=id=>{const h=handles.get(id);if(h!==undefined){this.impl.free(h);handles.delete(id);}};
     try {
       await this.impl.begin(plan);began=true;
-      for(const n of plan.nodes){
+      // Adam groups (graph.mjs adamGroups) in one pass where the backend has one.
+      const adam=this.impl.adam&&this.impl.fuseAdam!==false?plan.adam:null,done=new Set(),nodes=plan.nodes;
+      const refs=m=>m.refs.map(r=>handles.get(root[r]));
+      for(const n of nodes){
         if(n.alias)continue;
-        const h=await this.impl.run(n,n.refs.map(r=>handles.get(root[r])));handles.set(n.id,h);
-        for(const r of n.refs){uses[root[r]]--;if(uses[root[r]]===0)free(root[r]);}
-        if(uses[n.id]===0)free(n.id);
+        const group=adam?.get(n.id);
+        // A group's earlier moment node waits for the group (with what it releases).
+        if(!group&&adam&&plan.adamMembers.has(n.id)&&!done.has(n.id))continue;
+        let released=[n];
+        if(group){
+          const hs=await this.impl.adam(nodes[group.m],nodes[group.v],nodes[group.u],refs(nodes[group.m]),refs(nodes[group.v]),refs(nodes[group.u]));
+          [group.m,group.v,group.u].forEach((id,i)=>{handles.set(id,hs[i]);done.add(id);});
+          released=[nodes[group.m],nodes[group.v]];
+        } else if(!done.has(n.id)){const h=await this.impl.run(n,refs(n));handles.set(n.id,h);}
+        for(const x of released){
+          for(const r of x.refs){uses[root[r]]--;if(uses[root[r]]===0)free(root[r]);}
+          if(uses[x.id]===0)free(x.id);
+        }
       }
       const submitted=clock(),outputs=Object.create(null),ids=[...new Set(plan.outputs.map(o=>root[o.id]))];
       // One batched readback when the backend offers it (one GPU round trip).
