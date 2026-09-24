@@ -292,12 +292,19 @@ pub(crate) fn compile_region_mem(
     // accessor way. `ZIPP_ACC_ALWAYS_EMIT=1` sets every flag (wave-2's shape).
     ic_emit: &[IcSiteEmit],
     meter: Option<crate::codegen::meter::Meter>,
+    // An extended Python region (see `codegen::py::py_region_members`): the
+    // loop plus the out-of-line blocks it reaches, `[start, end]` spanning
+    // them all, with a membership flag per ip. A non-member ip, or a member
+    // op the region tiers do not admit, compiles to an exit that resumes the
+    // interpreter there.
+    py_members: Option<&[bool]>,
 ) -> Option<JitFn> {
-    if !region_can_compile(proto, start, end, Some(const_strs)) {
+    let py_ext = py_members.is_some();
+    if !py_ext && !region_can_compile(proto, start, end, Some(const_strs)) {
         return None;
     }
-    let scalar_matchall = rx_scalar_matchall_plan(proto, start, end);
-    let scalar_exec = rx_scalar_exec_plan(proto, start, end, ta_plan);
+    let scalar_matchall = (!py_ext).then(|| rx_scalar_matchall_plan(proto, start, end)).flatten();
+    let scalar_exec = (!py_ext).then(|| rx_scalar_exec_plan(proto, start, end, ta_plan)).flatten();
     // Scalarization elides source bytecodes and therefore their individual
     // meter charges. Metered execution retains the byte-for-byte ordinary
     // region/interpreter path rather than under-counting steps.
@@ -306,6 +313,30 @@ pub(crate) fn compile_region_mem(
     }
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let (s, e) = (start as usize, end as usize);
+    // A Python loop (see `codegen::py`).
+    let py = py_ext || has_py_ops(&proto.code[s..=e]);
+    // The ips an extended Python region compiles (every ip otherwise).
+    let emitted = |ip: usize| -> bool {
+        match py_members {
+            None => true,
+            Some(m) => {
+                m.get(ip - s).copied().unwrap_or(false)
+                    && (py_op_edges(&proto.code[ip]).is_some()
+                        || py_body_op(&proto.code[ip])
+                        || matches!(proto.code[ip], Instr::LoadConst { .. })
+                        || region_op_admitted(
+                            proto,
+                            ip,
+                            &proto.code[ip],
+                            start,
+                            end,
+                            Some(const_strs),
+                            None,
+                            false,
+                        ))
+            }
+        }
+    };
 
     if std::env::var_os("ZIPP_JITDUMP").is_some() {
         for ip in s..=e {
@@ -448,7 +479,13 @@ pub(crate) fn compile_region_mem(
     let entry_len_bail = ops.new_dynamic_label();
     let lbl = |ip: u32, in_region: &[dynasmrt::DynamicLabel]| in_region[(ip - start) as usize];
     // Step metering (a metered VM only) — see codegen::meter.
-    let blocks = crate::codegen::meter::block_map(meter, &proto.code, s, e);
+    let blocks = match py_members {
+        None => crate::codegen::meter::block_map(meter, &proto.code, s, e),
+        Some(_) => {
+            let heads: Vec<bool> = (s..=e).map(|ip| !emitted(ip)).collect();
+            crate::codegen::meter::block_map_split(meter, &proto.code, s, e, &heads)
+        }
+    };
 
     // ── prologue ── save callee-saved, stash inputs, fetch globals base, jump to
     // the loop header (OSR entry).
@@ -482,8 +519,7 @@ pub(crate) fn compile_region_mem(
     // sound fallback; DOUBLE still wins whenever it compiles successfully.
     // The helper repeats the complete recognition and receiver/effect preflight;
     // a miss has changed no JS state and falls through below.
-    let field_read_prefix = meter
-        .is_none()
+    let field_read_prefix = (meter.is_none() && !py)
         .then(|| pack_field_stream_region(heap.func_id, s, e))
         .flatten()
         .filter(|_| field_read_stream_enabled() && field_read_stream_shape(proto, s, e));
@@ -515,8 +551,7 @@ pub(crate) fn compile_region_mem(
     // touched slot and publishes the loop-carried locals.  It runs before any
     // TA pin or region-local state is materialized, so a guard miss has changed
     // nothing and simply enters the byte-identical ordinary region below.
-    let field_write_prefix = meter
-        .is_none()
+    let field_write_prefix = (meter.is_none() && !py)
         .then(|| pack_field_stream_region(heap.func_id, s, e))
         .flatten()
         .filter(|_| {
@@ -576,7 +611,7 @@ pub(crate) fn compile_region_mem(
     // of a helper call every iteration. The body skips the hoisted GetProp, so its
     // dst keeps this value. If `g` isn't a string/array at entry the helper deopts
     // → resume the loop in the interpreter (it recomputes `.length` correctly).
-    let hoisted_len = hoistable_length(proto, start, end);
+    let hoisted_len = if py_ext { None } else { hoistable_length(proto, start, end) };
     if let Some((_get_ip, dst, g, name_idx)) = hoisted_len {
         let packed = ((heap.func_id as u64) << 32) | name_idx as u64;
         dynasm!(ops
@@ -607,7 +642,7 @@ pub(crate) fn compile_region_mem(
     // arms). Declined under step metering: the fused branch would skip the
     // JumpIf block's charge.
     let cmp_branch_pair = |ip: usize, dst: u16| -> Option<(bool, u32)> {
-        if !mem_cmp_fuse_enabled() || blocks.is_some() || ip + 2 > e {
+        if !mem_cmp_fuse_enabled() || blocks.is_some() || ip + 2 > e || py_ext {
             return None;
         }
         match proto.code[ip + 1] {
@@ -630,6 +665,18 @@ pub(crate) fn compile_region_mem(
         }
         let ipl = lbl(ip as u32, &in_region);
         dynasm!(ops ; => ipl);
+        if !emitted(ip) {
+            // An extended Python region's exit: the interpreter resumes here.
+            // A skipped property op still owns its inline-cache site number.
+            if matches!(proto.code[ip], Instr::GetProp { .. } | Instr::SetProp { .. }) {
+                ic_site += 1;
+            }
+            dynasm!(ops
+                ; mov DWORD [rsi], ip as i32
+                ; jmp => epilogue
+            );
+            continue;
+        }
         crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         if let Some(plan) = scalar_exec.filter(|p| p.result_reload_ip == ip) {
             // The call helper left its true/null control value in
@@ -660,6 +707,44 @@ pub(crate) fn compile_region_mem(
         }
         let bail = ops.new_dynamic_label();
         match proto.code[ip] {
+            // An extended Python region's string load the dispatcher did not
+            // intern (its out-of-line code): resolved at run time.
+            Instr::LoadConst { dst, idx }
+                if py_ext
+                    && single_char_const_bits(proto, proto.constants[idx as usize]).is_none()
+                    && !const_strs.contains_key(&idx)
+                    && !proto.constants[idx as usize].is_number() =>
+            {
+                let (vb, icb) = (heap.versions_base, heap.ic_base);
+                emit_py_load_const(&mut ops, heap.func_id, dst, idx, &mut |ops| {
+                    if refetch_pinned {
+                        emit_refetch_pinned(ops, vb, Some(icb));
+                    }
+                    if let Some((snap, plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(ops, snap, plan, cache);
+                    }
+                });
+            }
+            // A Python loop's counters are Python ints (BigInts): see
+            // `codegen::py`. Ahead of the JavaScript arms below.
+            Instr::AddInt { dst, a, imm, upd } if py => {
+                let (vb, icb) = (heap.versions_base, heap.ic_base);
+                emit_py_add_int(&mut ops, dst, a, imm, upd, bail, &mut |ops| {
+                    if refetch_pinned {
+                        emit_refetch_pinned(ops, vb, Some(icb));
+                    }
+                    if let Some((snap, plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(ops, snap, plan, cache);
+                    }
+                });
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::JumpIfNotLt { a, b, target } | Instr::JumpIfNotLe { a, b, target } if py => {
+                let le = matches!(proto.code[ip], Instr::JumpIfNotLe { .. });
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                emit_py_jump_if_not(&mut ops, a, b, le, t, bail);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::LoadInt { dst, val } => {
                 let boxed = INT_TAG | (val as u32 as u64);
                 dynasm!(ops
@@ -4044,8 +4129,102 @@ pub(crate) fn compile_region_mem(
                     ; jmp => epilogue
                 );
             }
+            // ── Python loops (see `codegen::py`) ── admitted only in a body
+            // holding fused Python instructions.
+            ref instr if py_op_edges(instr).is_some() => {
+                let Some((slow, target)) = py_op_edges(instr) else {
+                    return None;
+                };
+                let slow = region_target(slow, start, end, &in_region, &mut exit_stubs, &mut ops);
+                let target =
+                    target.map(|t| region_target(t, start, end, &in_region, &mut exit_stubs, &mut ops));
+                let labels = PyLabels { slow, target, bail };
+                let (vb, icb) = (heap.versions_base, heap.ic_base);
+                emit_py_op(&mut ops, heap.func_id, ip, instr, &labels, &mut |ops| {
+                    if refetch_pinned {
+                        emit_refetch_pinned(ops, vb, Some(icb));
+                    }
+                    if let Some((snap, plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(ops, snap, plan, cache);
+                    }
+                });
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::LoadBigInt { dst, value } => {
+                if let Some(bits) = interned_bigint_bits(value) {
+                    dynasm!(ops
+                        ; mov rax, QWORD bits as i64
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                } else {
+                    let (vb, icb) = (heap.versions_base, heap.ic_base);
+                    emit_py_load_bigint(&mut ops, heap.func_id, ip, dst, bail, &mut |ops| {
+                        if refetch_pinned {
+                            emit_refetch_pinned(ops, vb, Some(icb));
+                        }
+                        if let Some((snap, plan, cache)) = ta_refetch {
+                            emit_cross_refetch_ta(ops, snap, plan, cache);
+                        }
+                    });
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                }
+            }
+            Instr::NewArray { dst, arg_base, argc } if py => {
+                let (vb, icb) = (heap.versions_base, heap.ic_base);
+                emit_py_new_array(&mut ops, proto.reg_count, dst, arg_base, argc, bail, &mut |ops| {
+                    if refetch_pinned {
+                        emit_refetch_pinned(ops, vb, Some(icb));
+                    }
+                    if let Some((snap, plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(ops, snap, plan, cache);
+                    }
+                });
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::ArrayAppend {
+                arr,
+                val,
+                spread: false,
+            } if py => {
+                emit_py_array_append(&mut ops, arr, val, bail);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::PushHandler {
+                catch_target,
+                catch_reg,
+            } => {
+                // The interpreter arm verbatim, on the region's own frame.
+                let packed = ((catch_target as u64) << 16) | catch_reg as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed as i64
+                    ; mov rax, QWORD crate::vm::Vm::jit_py_push_handler as usize as i64
+                    ; call rax
+                );
+            }
+            Instr::PopHandler => {
+                // `handlers.pop()`, exactly `PopFinally`'s helper.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD heap.pop_finally as i64
+                    ; call rax
+                );
+            }
+            Instr::Throw { .. } => {
+                // The interpreter raises.
+                dynasm!(ops
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => epilogue
+                );
+            }
             _ => return None, // region_can_compile already filtered; defensive
         }
+    }
+    // An extended Python region may end in an op that falls through: its
+    // successor is outside the region.
+    if py_ext {
+        let t = region_target(end + 1, start, end, &in_region, &mut exit_stubs, &mut ops);
+        dynasm!(ops ; jmp => t);
     }
 
     // Hoisted-`.length` deopt landing: resume the loop in the interpreter.

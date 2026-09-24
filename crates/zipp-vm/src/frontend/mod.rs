@@ -73,9 +73,7 @@ pub fn compile_source(source: &str, frontend: Frontend) -> Result<CompiledSource
             {
                 let program = python::compile(source)?;
                 let mut state = ScriptState::from_program(program);
-                // The Python emitter has not been validated against the JIT.
-                // This affects this state only, never JavaScript engines.
-                state.disable_vm_jit();
+                python_jit_default(&mut state);
                 state
             }
             #[cfg(not(feature = "python"))]
@@ -87,6 +85,28 @@ pub fn compile_source(source: &str, frontend: Frontend) -> Result<CompiledSource
         }
     };
     Ok(CompiledSource { language, state })
+}
+/// A Python state starts with the VM JIT off: an embedder's instruction
+/// budget is charged per interpreted instruction, and compiled code meters by
+/// basic block (it over-charges a block it leaves through a guard bail), so a
+/// budgeted Python program could run out of steps where the interpreter would
+/// not. A host that attaches no budget, such as the command line's `zipp py`,
+/// turns it on with [`ScriptState::enable_vm_jit`]. `ZIPP_PY_JIT=1` in the
+/// environment keeps it on from the start (the test lanes' JIT
+/// configuration); `ZIPP_PY_JIT=0` keeps it off even when a host asks.
+#[cfg(feature = "python")]
+fn python_jit_default(state: &mut ScriptState) {
+    if python_jit_env() != Some(true) {
+        state.disable_vm_jit();
+    }
+}
+/// `ZIPP_PY_JIT`: `Some(true)` for `1`, `Some(false)` for `0`, else `None`.
+pub fn python_jit_env() -> Option<bool> {
+    match std::env::var_os("ZIPP_PY_JIT")?.to_str()? {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
 }
 /// Compile a multi-module Python project: `modules` pairs each module name
 /// (the `.py` file's stem) with its source, and `entry` names the module whose
@@ -163,7 +183,7 @@ fn compile_python_entry<S: AsRef<str>>(
     {
         let program = python::compile_project(entry, entry_file, modules, files, argv, hosted)?;
         let mut state = ScriptState::from_program(program);
-        state.disable_vm_jit();
+        python_jit_default(&mut state);
         Ok(CompiledSource {
             language: LanguageId::Python,
             state,

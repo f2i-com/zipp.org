@@ -1363,8 +1363,15 @@ impl super::Vm<'_> {
                 rec.remaining += unspent;
                 // Zero means native code consumed its final permitted block
                 // exactly. Only a negative counter says it attempted to enter a
-                // block that did not fit and took the metering exit.
-                if self.jit_steps < 0 {
+                // block that did not fit and took the metering exit, and that
+                // is the budget's end only when the loan was the rest of it:
+                // a native run that merely outlasted its chunk (a hot loop
+                // longer than `NATIVE_CHUNK` steps, with budget to spare)
+                // resumes in the interpreter at the block it did not enter,
+                // and its next native entry borrows the next chunk. Treating
+                // every overshoot as exhaustion failed such a loop at the
+                // first chunk boundary, far inside its budget.
+                if self.jit_steps < 0 && rec.remaining <= 0 {
                     rec.exhaust(ResourceExhaustion::Steps);
                 }
             }

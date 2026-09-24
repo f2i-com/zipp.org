@@ -669,7 +669,9 @@ pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
     let code = &proto.code;
     let n = code.len();
     let mut out = vec![false; n];
-    if n == 0 || !crate::codegen::int32_trunc_add_enabled() {
+    // A Python body's fused instructions have `slow` edges this walk does
+    // not follow; its arithmetic is not the JavaScript kind anyway.
+    if n == 0 || !crate::codegen::int32_trunc_add_enabled() || crate::codegen::has_py_ops(code) {
         return out;
     }
     let by_name_scope = !proto.eval_sites.is_empty()

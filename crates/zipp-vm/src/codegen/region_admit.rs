@@ -576,16 +576,6 @@ pub(crate) fn region_can_compile(
     // rejection returns immediately exactly as before).
     let dump = std::env::var_os("ZIPP_JITDUMP").is_some();
     let mut ok = true;
-    macro_rules! reject {
-        ($($arg:tt)*) => {{
-            if dump {
-                eprintln!($($arg)*);
-                ok = false;
-            } else {
-                return false;
-            }
-        }};
-    }
     // The back-edge must be an unconditional jump to the header (canonical
     // while/for shape). This guarantees no fall-through past `end`, so the only
     // out-of-region control transfers are explicit jump targets (loop exit /
@@ -594,306 +584,20 @@ pub(crate) fn region_can_compile(
         Instr::Jump { target } if target == start => {}
         _ => return false,
     }
+    // A Python loop (see `codegen::py`): the fused instructions and the
+    // Python body ops, on the MEMORY path only (the register tiers pass no
+    // `const_strs` and keep rejecting them through the catch-all).
+    let py = const_strs.is_some() && has_py_ops(&code[s..=e]);
     for (ip, instr) in code[s..=e].iter().enumerate() {
         let ip = s + ip;
-        match *instr {
-            Instr::LoadInt { .. }
-            | Instr::Move { .. }
-            | Instr::LoadGlobal { .. }
-            | Instr::StoreGlobal { .. }
-            // A `let`/`const` global write (TDZ-checked); inside a hot loop region the
-            // binding is already initialized, so the JIT treats it like StoreGlobal.
-            | Instr::StoreGlobalStrict { .. }
-            | Instr::StoreGlobalResolved { .. }
-            | Instr::Add { .. }
-            | Instr::Sub { .. }
-            | Instr::Mul { .. }
-            | Instr::Div { .. }
-            | Instr::Mod { .. }
-            | Instr::AddInt { .. }
-            | Instr::Neg { .. }
-            // Bitwise ops (`|`/`&`/`^`/`<<`/`>>`/`>>>`) — handled by the MEMORY
-            // path (Int or exactly-integral-double operands; anything else
-            // bails). The `(x + y) | 0` / `i & 7` idioms gate most real
-            // object/method loops, so regions must admit them.
-            | Instr::Bitwise { .. }
-            | Instr::Lt { .. }
-            | Instr::Le { .. }
-            | Instr::Gt { .. }
-            | Instr::Ge { .. }
-            | Instr::Eq { .. }
-            | Instr::Ne { .. }
-            | Instr::Jump { .. }
-            | Instr::JumpIfFalse { .. }
-            | Instr::JumpIfTrue { .. }
-            | Instr::JumpIfNotLt { .. }
-            | Instr::JumpIfNotLe { .. }
-            // Heap property ops — handled by the MEMORY path via win64 helper
-            // calls (the int/regalloc paths decline, so heap regions take the
-            // mem path). A `Print`/etc. anywhere still rejects the region.
-            // A strict-FORCED SetProp (a strict ClassTail region inside a
-            // sloppy function) declines: the JIT slow path derives strictness
-            // from the proto flag, which cannot see that region.
-            | Instr::GetProp { .. }
-            | Instr::SetProp { strict: false, .. }
-            // Dense-array element read/write `a[i]` / `a[i]=v` — handled by the
-            // MEMORY path via win64 helpers (the int/regalloc paths decline).
-            | Instr::GetIndex { .. }
-            | Instr::SetIndex { .. }
-            // Read-modify-write key coercion (`o[k] += v`, `o[k]++`): a NUMBER
-            // key on a non-nullish base is a plain move (the MEMORY path's
-            // inline case); anything else bails to the interpreter.
-            | Instr::ToPropKey { .. }
-            // String concat (`s += …`) — handled by the MEMORY path via the
-            // `jit_concat` / `jit_str_append` win64 helpers (the numeric
-            // int/regalloc paths don't list them, so they decline → mem path).
-            | Instr::StrConcat { .. }
-            | Instr::StrAppendInPlace { .. }
-            | Instr::StrAppendIndex { .. }
-            | Instr::AddRightPair { .. }
-            | Instr::Pad2Concat { .. }
-            | Instr::Pad2Conditional { .. }
-            // W11 (B124) fused chain link — MEM path via `jit_concat_chain`
-            // (same decline-to-mem shape as the two ops above). LOAD-BEARING:
-            // without this the fused gen-loop regions (regex-log-scan) would
-            // DECLINE outright and the whole row regresses.
-            | Instr::StrConcatChain { .. }
-            | Instr::Return { .. }
-            | Instr::ReturnUndefined => {}
-            // Method calls — handled by the MEMORY path. `arr.push(x)` /
-            // `str.charCodeAt(i)` keep their dedicated win64 helpers; every
-            // other `obj.m(…)` compiles to a `jit_call_method_ic` helper call
-            // that consults the interpreter's per-site inline cache and
-            // frame-calls the resolved plain user function (IC miss /
-            // megamorphic / native callee → deopt to the interpreter at this
-            // op; repeated deopts evict the region).
-            Instr::CallMethod { .. } => {}
-            // Computed calls are MEMORY-only. The helper is deliberately a
-            // pure prefix: it claims only a plain callable stored in a present
-            // own dense-Array slot, preserving `this = receiver`; every exotic
-            // or observable lookup returns to the interpreter untouched.
-            Instr::CallMethodComputed { .. } => {
-                if !crate::codegen::computed_call_dense_enabled() {
-                    reject!("[decline] CallMethodComputed (dense helper disabled) at region [{start},{end}]");
-                }
-            }
-            // Plain calls `f(…)`, plus calls carrying a previously captured
-            // receiver/reference — same completion/deopt protocol via their
-            // respective exact-call helpers.
-            Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
-            // Logical `!` — MEM path (Bool flips natively; anything else goes
-            // through the `jit_truthy` helper).
-            Instr::Not { .. } => {}
-            // `Math.<op>(args…)` — MEM path. A 1-arg unary op (`abs`/`sqrt`/
-            // `floor`/`sin`/…) loads its arg as a number (bails to the
-            // interpreter — which runs ToNumber coercion — if not) and calls the
-            // PURE `jit_math_unary` helper (the interpreter's exact `math_unary`,
-            // so every JS quirk matches). A 2-arg op (`pow`/`atan2`/`imul`/
-            // `min`/`max`/`hypot` with EXACTLY two args) uses `jit_math_two`.
-            // Any other arity (variadic min/max/hypot, a 0-arg call) declines —
-            // the interpreter handles it. The helpers run no user code and never
-            // allocate (a non-numeric arg already bailed), so no pinned-pointer
-            // re-fetch is needed.
-            Instr::MathOp { op, argc, .. } => {
-                // Exactly what `emit_math_op` implements — shared with Tier C's
-                // check so the two admission lists cannot drift apart again.
-                if !math_op_emittable(op, argc) {
-                    reject!("[decline] MathOp arity {argc} op {op:?} at region [{start},{end}]");
-                }
-            }
-            // `LoadBool` — materialise the boolean Value bits inline (a single
-            // store; call-free, pure). Unblocks loops carrying a bool literal
-            // (parser flags, `done=false`).
-            Instr::LoadBool { .. } => {}
-            // `undefined` / `null` as constants — one store of the canonical
-            // bits each, the same shape as `LoadBool` above and call-free. Both
-            // were simply absent, and the cost of that is not proportional to
-            // how trivial they are: a single `LoadUndefined` declines the WHOLE
-            // region, so map-set-heavy's largest loop ([39,110], 71 ops) ran
-            // interpreted for want of three of them. The int/regalloc planners
-            // still reject the region through their own catch-alls — these bits
-            // are not an i64 or an f64 — so it takes the MEM path, exactly as
-            // `LoadBool` does.
-            Instr::LoadUndefined { .. } | Instr::LoadNull { .. } => {}
-            // Fused `typeof` comparisons — MEM paths via PURE classifier
-            // helpers. They allocate nothing, run no user code and are total.
-            // helper (no alloc, no user code, total). The UNFUSED `TypeOf` is
-            // still not admitted here: it allocates its result string, and after
-            // this fusion the bare form is rare enough not to be worth the
-            // refetch plumbing.
-            Instr::TypeOfIs { .. } | Instr::TypeOfSame { .. } => {}
-            // `Promise.resolve(x)` / `Number.is*(x)` at exactly one argument —
-            // MEM path via `jit_static_fn`. `Promise.resolve` was async-
-            // promise-chain's fill-loop's ONLY blocker (`a[j] =
-            // Promise.resolve(j)` blacklisted the whole region, B38/B42); the
-            // helper handles the non-heap-argument fast path (no user code, no
-            // microtask) and deopts a heap argument to the interpreter's
-            // identity/thenable protocol. Every other StaticFn keeps declining.
-            Instr::StaticFn { op, argc, .. } => {
-                use crate::bytecode::StaticFn as S;
-                let ok = argc == 1
-                    && matches!(
-                        op,
-                        S::PromiseResolve
-                            | S::NumberIsInteger
-                            | S::NumberIsNaN
-                            | S::NumberIsFinite
-                            | S::NumberIsSafeInteger
-                    );
-                if !ok {
-                    reject!("[decline] StaticFn {op:?}/{argc} at region [{start},{end}]");
-                }
-            }
-            // `CheckCoercible` — RequireObjectCoercible before a member access
-            // (`objs[i&3].area()` emits one). MEM path: a null/undefined operand
-            // bails to the interpreter (which throws the TypeError); any other
-            // value is a pure no-op. Pure, call-free, no alloc — unblocks the
-            // class-method-call loops (the GetIndex'd receiver is coerced before
-            // the CallMethod).
-            Instr::CheckCoercible { .. } => {}
-            // Closure-cell / upvalue READS — MEM path via the pure `jit_cell_get`
-            // / `jit_upval_get` helpers (a single heap LOAD of the cell's inner
-            // Value; a TDZ cell → deopt sentinel → interpreter throws). Emitted
-            // PER-OP (never hoisted across a Call/CallMethod), so a value an inner
-            // closure mutated via a call in the SAME region is re-read on the next
-            // execution. The helpers allocate nothing and run no user code, so no
-            // pinned-pointer (r13/r14/TA) re-fetch is needed.
-            Instr::CellGet { .. } | Instr::UpvalGet { .. } => {}
-            // Closure-cell / upvalue WRITES. `CellSet` is the declaring scope's
-            // unconditional store. `UpvalSet` is different: its helper first
-            // declines captured const / named-function / TDZ cells, so the
-            // interpreter replays the op and applies PutValue's throw/no-op
-            // semantics. Both hit paths are allocation- and user-code-free.
-            Instr::CellSet { .. } | Instr::UpvalSet { .. } => {}
-            // `+x` — a NUMBER passes straight through (the interpreter returns
-            // the Value verbatim); anything else needs observable ToNumber
-            // coercion and bails. It was simply absent from this list, which
-            // declined sparse-array's for-in `keyFold` region outright.
-            Instr::ToNum { .. } => {}
-            // `obj["name" + i]` — the fused computed key. MEM path via
-            // `jit_get_index_concat`, which handles only the own-DATA hit (no
-            // alloc, no user code) and deopts otherwise.
-            Instr::GetIndexConcat { .. } => {}
-            // The fused computed-key WRITE and its evaluation-order shim.
-            // Both MUST be admitted together with the fusion in
-            // `compile/assign.rs`, or every loop that previously compiled its
-            // `o["k" + i] = v` as Add+SetIndex would now DECLINE. ToConcatKey
-            // is identity for primitives/strings (pure helper, deopts a real
-            // coercion to the interpreter); SetIndexConcat handles the own
-            // writable data-slot hit in place (scratch-formatted key, no
-            // alloc, no version bump) and deopts a NEW key / exotic / string
-            // key — exactly the cases the old Add+SetIndex pair also failed
-            // to compile.
-            Instr::ToConcatKey { .. } | Instr::SetIndexConcat { .. } => {}
-            // The fused computed-key DELETE (W19 M3). `region_mem.rs` had no
-            // `Delete` arm of any kind, so ONE opcode blacklisted the whole
-            // `delete obj["prop_" + p]` loop of `polymorphic-objects`
-            // (`[145,155]`) and it ran 100% interpreted. The MEM emitter calls
-            // `jit_delete_index_concat`, a thin wrapper over the SAME
-            // `Vm::delete_index_concat` the interpreter arm calls — so there is
-            // no re-derived semantics to get wrong, and no deopt sentinel:
-            // every receiver shape (Proxy, global, array, frozen) is served by
-            // the shared waterfall. It CAN allocate and CAN run user code, and a
-            // successful delete shifts slots and bumps the receiver version, so
-            // the emitter owes the full `CALL_THREW` + `emit_refetch_pinned`
-            // protocol — the `SetIndexConcat` treatment, for stronger reasons.
-            // Only the MEM tier gets it; `region_int.rs` keeps its own list.
-            Instr::DeleteIndexConcat { .. } if crate::codegen::jit_delete_enabled() => {}
-            // Ordinary computed delete, but only through the fail-closed helper:
-            // exact Array + non-negative tagged Int + no descriptor/arguments
-            // side table. Every rejected shape bails before mutation and lets
-            // the interpreter perform ToPropertyKey, strict failure and exotic
-            // semantics. The admission-time switch restores the historical
-            // blacklist when disabled.
-            Instr::DeleteIndex { .. } if crate::codegen::jit_array_delete_enabled() => {}
-            // `ForInLive` — the per-iteration for-in liveness check — MEM path via
-            // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
-            // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
-            // point — and it is GC-locked internally for belt-and-suspenders).
-            // Emitted per-op (re-derives the live shape each execution). Lets
-            // `for (k in obj)` loops over plain objects compile.
-            Instr::ForInLive { .. } => {}
-            // `HasProp` — the `in` operator — MEM path via the `jit_has_property`
-            // helper (read-only `Vm::has_property_jit`, byte-identical to the
-            // interpreter's `has_property_dyn` on a non-Proxy chain). Only a plain
-            // `in` (`brand: false`) is admitted; the `#x in obj` ergonomic brand
-            // check needs the private machinery → keeps declining. The helper runs
-            // no user code and never allocates on the VM heap (a Proxy/exotic/
-            // throwing case returns the deopt sentinel and the interpreter takes
-            // over), so no r13/r14/TA refetch. Unblocks sparse-array's 8M
-            // hole-aware `if (i in packed)` loops.
-            Instr::HasProp { brand: false, .. } => {}
-            Instr::HasProp { brand: true, .. } => {
-                reject!("[decline] HasProp brand-check at region [{start},{end}]");
-            }
-            // `IterNext` with a PRIMED next register — the for-of step — MEM
-            // path via `jit_iter_next`, which serves ONLY the three intrinsic
-            // iterator kinds the interpreter's own fast path steps inline
-            // (%RegExpStringIterator% / live %ArrayIterator% / Map-Set
-            // collection iterators, all behind the pristine `ITER_NEXT`
-            // native check) and deopts everything else BEFORE touching state.
-            // This was `regex-log-scan`'s matchAll-loop blocker: the whole
-            // 450k-step for-of region blacklisted for want of this one op
-            // (plus the Push/PopFinally pair below) and ran interpreted.
-            // An UNPRIMED next (u16::MAX — destructuring sites) keeps
-            // declining: its per-step `Get(it,"next")` is observable.
-            Instr::IterNext { next, .. } => {
-                if !iter_region_enabled() || next == u16::MAX {
-                    reject!("[decline] IterNext at region [{start},{end}]");
-                }
-            }
-            Instr::GetIterator { .. }
-                if scalar_matchall.is_some_and(|p| p.get_iterator_ip == ip) => {}
-            Instr::IterPrime { .. }
-                if scalar_matchall.is_some_and(|p| p.iter_prime_ip == ip) => {}
-            Instr::IterCloseFinally { .. }
-                if scalar_matchall.is_some_and(|p| p.close_ip == ip) => {}
-            Instr::EndFinally { .. }
-                if scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) => {}
-            // The for-of close-handler bracket around each iteration. Both
-            // are ONE Vec push/pop on the current frame's handler stack via
-            // helpers that mirror the interpreter arms exactly, keeping the
-            // unwind state identical whichever engine executes the loop body
-            // (a throwing helper exits the region with `pending_throw` set
-            // and the interpreter unwinds using these handlers). `EndFinally`
-            // — the handler BODY's terminator — is not admitted; it lives
-            // outside the loop region.
-            Instr::PushFinally { .. } | Instr::PopFinally => {
-                if !iter_region_enabled() {
-                    reject!("[decline] finally bracket at region [{start},{end}]");
-                }
-            }
-            Instr::LoadConst { idx, .. } => {
-                // Numeric constants run in the f64 region; a single-ASCII-char
-                // string constant is resolvable to its interned slot (for
-                // `s[i] === "x"` scans); a multi-char string constant is
-                // accepted on the MEM path when its pre-interned bits are in
-                // `const_strs`. Anything else rejects the region.
-                //
-                // BOTH string arms require `const_strs`, i.e. the MEM path. The
-                // register paths (int/regalloc, which pass None) home values in
-                // i64/f64 registers and have no way to hold a string: their
-                // `emit_load_const` writes `v.bits()` straight into an xmm home,
-                // and for a not-yet-interned constant those bits are the
-                // `STRING_CONST_BIT | idx` SENTINEL, not a heap value. Admitting
-                // a single-char literal there put that sentinel in a float
-                // register, where it escaped on flush and was indexed as a heap
-                // slot (`for (var s,i=0;i<20;i++) s="a"` aborted the process at
-                // heap.rs), read as a NaN by arithmetic (so `1 < "2"` inside a
-                // hot loop was always false), or flushed as a bogus value
-                // (`typeof s` becoming "number"). MEM resolves it properly.
-                match proto.constants.get(idx as usize) {
-                    Some(c) if c.is_number() => {}
-                    Some(&c)
-                        if const_strs.is_some() && single_char_const_bits(proto, c).is_some() => {}
-                    Some(_) if const_strs.is_some_and(|m| m.contains_key(&idx)) => {}
-                    _ => {
-                        reject!("[decline] non-region LoadConst at region [{start},{end}]");
-                    }
-                }
-            }
-            ref other => {
-                reject!("[decline] {other:?} at region [{start},{end}]");
+        if py && (py_op_edges(instr).is_some() || py_body_op(instr)) {
+            continue;
+        }
+        if !region_op_admitted(proto, ip, instr, start, end, const_strs, scalar_matchall.as_ref(), dump) {
+            if dump {
+                ok = false;
+            } else {
+                return false;
             }
         }
     }
@@ -907,6 +611,332 @@ pub(crate) fn region_can_compile(
     // a nested region compile can move. The memory path now RE-FETCHES those
     // pinned pointers after every such helper call instead (see
     // `emit_refetch_pinned`), so the mix is allowed.
+    true
+}
+
+/// One instruction of a candidate MEM/register region: whether the region
+/// tiers admit it (see [`region_can_compile`], which calls this for every
+/// op of `[start, end]`). A rejection is printed under `ZIPP_JITDUMP`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn region_op_admitted(
+    proto: &FuncProto,
+    ip: usize,
+    instr: &Instr,
+    start: u32,
+    end: u32,
+    const_strs: Option<&FxHashMap<u32, u64>>,
+    scalar_matchall: Option<&RxScalarMatchallPlan>,
+    dump: bool,
+) -> bool {
+    let _ = ip;
+    macro_rules! reject {
+        ($($arg:tt)*) => {{
+            if dump {
+                eprintln!($($arg)*);
+            }
+            return false;
+        }};
+    }
+    match *instr {
+        Instr::LoadInt { .. }
+        | Instr::Move { .. }
+        | Instr::LoadGlobal { .. }
+        | Instr::StoreGlobal { .. }
+        // A `let`/`const` global write (TDZ-checked); inside a hot loop region the
+        // binding is already initialized, so the JIT treats it like StoreGlobal.
+        | Instr::StoreGlobalStrict { .. }
+        | Instr::StoreGlobalResolved { .. }
+        | Instr::Add { .. }
+        | Instr::Sub { .. }
+        | Instr::Mul { .. }
+        | Instr::Div { .. }
+        | Instr::Mod { .. }
+        | Instr::AddInt { .. }
+        | Instr::Neg { .. }
+        // Bitwise ops (`|`/`&`/`^`/`<<`/`>>`/`>>>`) — handled by the MEMORY
+        // path (Int or exactly-integral-double operands; anything else
+        // bails). The `(x + y) | 0` / `i & 7` idioms gate most real
+        // object/method loops, so regions must admit them.
+        | Instr::Bitwise { .. }
+        | Instr::Lt { .. }
+        | Instr::Le { .. }
+        | Instr::Gt { .. }
+        | Instr::Ge { .. }
+        | Instr::Eq { .. }
+        | Instr::Ne { .. }
+        | Instr::Jump { .. }
+        | Instr::JumpIfFalse { .. }
+        | Instr::JumpIfTrue { .. }
+        | Instr::JumpIfNotLt { .. }
+        | Instr::JumpIfNotLe { .. }
+        // Heap property ops — handled by the MEMORY path via win64 helper
+        // calls (the int/regalloc paths decline, so heap regions take the
+        // mem path). A `Print`/etc. anywhere still rejects the region.
+        // A strict-FORCED SetProp (a strict ClassTail region inside a
+        // sloppy function) declines: the JIT slow path derives strictness
+        // from the proto flag, which cannot see that region.
+        | Instr::GetProp { .. }
+        | Instr::SetProp { strict: false, .. }
+        // Dense-array element read/write `a[i]` / `a[i]=v` — handled by the
+        // MEMORY path via win64 helpers (the int/regalloc paths decline).
+        | Instr::GetIndex { .. }
+        | Instr::SetIndex { .. }
+        // Read-modify-write key coercion (`o[k] += v`, `o[k]++`): a NUMBER
+        // key on a non-nullish base is a plain move (the MEMORY path's
+        // inline case); anything else bails to the interpreter.
+        | Instr::ToPropKey { .. }
+        // String concat (`s += …`) — handled by the MEMORY path via the
+        // `jit_concat` / `jit_str_append` win64 helpers (the numeric
+        // int/regalloc paths don't list them, so they decline → mem path).
+        | Instr::StrConcat { .. }
+        | Instr::StrAppendInPlace { .. }
+        | Instr::StrAppendIndex { .. }
+        | Instr::AddRightPair { .. }
+        | Instr::Pad2Concat { .. }
+        | Instr::Pad2Conditional { .. }
+        // W11 (B124) fused chain link — MEM path via `jit_concat_chain`
+        // (same decline-to-mem shape as the two ops above). LOAD-BEARING:
+        // without this the fused gen-loop regions (regex-log-scan) would
+        // DECLINE outright and the whole row regresses.
+        | Instr::StrConcatChain { .. }
+        | Instr::Return { .. }
+        | Instr::ReturnUndefined => {}
+        // Method calls — handled by the MEMORY path. `arr.push(x)` /
+        // `str.charCodeAt(i)` keep their dedicated win64 helpers; every
+        // other `obj.m(…)` compiles to a `jit_call_method_ic` helper call
+        // that consults the interpreter's per-site inline cache and
+        // frame-calls the resolved plain user function (IC miss /
+        // megamorphic / native callee → deopt to the interpreter at this
+        // op; repeated deopts evict the region).
+        Instr::CallMethod { .. } => {}
+        // Computed calls are MEMORY-only. The helper is deliberately a
+        // pure prefix: it claims only a plain callable stored in a present
+        // own dense-Array slot, preserving `this = receiver`; every exotic
+        // or observable lookup returns to the interpreter untouched.
+        Instr::CallMethodComputed { .. } => {
+            if !crate::codegen::computed_call_dense_enabled() {
+                reject!("[decline] CallMethodComputed (dense helper disabled) at region [{start},{end}]");
+            }
+        }
+        // Plain calls `f(…)`, plus calls carrying a previously captured
+        // receiver/reference — same completion/deopt protocol via their
+        // respective exact-call helpers.
+        Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
+        // Logical `!` — MEM path (Bool flips natively; anything else goes
+        // through the `jit_truthy` helper).
+        Instr::Not { .. } => {}
+        // `Math.<op>(args…)` — MEM path. A 1-arg unary op (`abs`/`sqrt`/
+        // `floor`/`sin`/…) loads its arg as a number (bails to the
+        // interpreter — which runs ToNumber coercion — if not) and calls the
+        // PURE `jit_math_unary` helper (the interpreter's exact `math_unary`,
+        // so every JS quirk matches). A 2-arg op (`pow`/`atan2`/`imul`/
+        // `min`/`max`/`hypot` with EXACTLY two args) uses `jit_math_two`.
+        // Any other arity (variadic min/max/hypot, a 0-arg call) declines —
+        // the interpreter handles it. The helpers run no user code and never
+        // allocate (a non-numeric arg already bailed), so no pinned-pointer
+        // re-fetch is needed.
+        Instr::MathOp { op, argc, .. } => {
+            // Exactly what `emit_math_op` implements — shared with Tier C's
+            // check so the two admission lists cannot drift apart again.
+            if !math_op_emittable(op, argc) {
+                reject!("[decline] MathOp arity {argc} op {op:?} at region [{start},{end}]");
+            }
+        }
+        // `LoadBool` — materialise the boolean Value bits inline (a single
+        // store; call-free, pure). Unblocks loops carrying a bool literal
+        // (parser flags, `done=false`).
+        Instr::LoadBool { .. } => {}
+        // `undefined` / `null` as constants — one store of the canonical
+        // bits each, the same shape as `LoadBool` above and call-free. Both
+        // were simply absent, and the cost of that is not proportional to
+        // how trivial they are: a single `LoadUndefined` declines the WHOLE
+        // region, so map-set-heavy's largest loop ([39,110], 71 ops) ran
+        // interpreted for want of three of them. The int/regalloc planners
+        // still reject the region through their own catch-alls — these bits
+        // are not an i64 or an f64 — so it takes the MEM path, exactly as
+        // `LoadBool` does.
+        Instr::LoadUndefined { .. } | Instr::LoadNull { .. } => {}
+        // Fused `typeof` comparisons — MEM paths via PURE classifier
+        // helpers. They allocate nothing, run no user code and are total.
+        // helper (no alloc, no user code, total). The UNFUSED `TypeOf` is
+        // still not admitted here: it allocates its result string, and after
+        // this fusion the bare form is rare enough not to be worth the
+        // refetch plumbing.
+        Instr::TypeOfIs { .. } | Instr::TypeOfSame { .. } => {}
+        // `Promise.resolve(x)` / `Number.is*(x)` at exactly one argument —
+        // MEM path via `jit_static_fn`. `Promise.resolve` was async-
+        // promise-chain's fill-loop's ONLY blocker (`a[j] =
+        // Promise.resolve(j)` blacklisted the whole region, B38/B42); the
+        // helper handles the non-heap-argument fast path (no user code, no
+        // microtask) and deopts a heap argument to the interpreter's
+        // identity/thenable protocol. Every other StaticFn keeps declining.
+        Instr::StaticFn { op, argc, .. } => {
+            use crate::bytecode::StaticFn as S;
+            let ok = argc == 1
+                && matches!(
+                    op,
+                    S::PromiseResolve
+                        | S::NumberIsInteger
+                        | S::NumberIsNaN
+                        | S::NumberIsFinite
+                        | S::NumberIsSafeInteger
+                );
+            if !ok {
+                reject!("[decline] StaticFn {op:?}/{argc} at region [{start},{end}]");
+            }
+        }
+        // `CheckCoercible` — RequireObjectCoercible before a member access
+        // (`objs[i&3].area()` emits one). MEM path: a null/undefined operand
+        // bails to the interpreter (which throws the TypeError); any other
+        // value is a pure no-op. Pure, call-free, no alloc — unblocks the
+        // class-method-call loops (the GetIndex'd receiver is coerced before
+        // the CallMethod).
+        Instr::CheckCoercible { .. } => {}
+        // Closure-cell / upvalue READS — MEM path via the pure `jit_cell_get`
+        // / `jit_upval_get` helpers (a single heap LOAD of the cell's inner
+        // Value; a TDZ cell → deopt sentinel → interpreter throws). Emitted
+        // PER-OP (never hoisted across a Call/CallMethod), so a value an inner
+        // closure mutated via a call in the SAME region is re-read on the next
+        // execution. The helpers allocate nothing and run no user code, so no
+        // pinned-pointer (r13/r14/TA) re-fetch is needed.
+        Instr::CellGet { .. } | Instr::UpvalGet { .. } => {}
+        // Closure-cell / upvalue WRITES. `CellSet` is the declaring scope's
+        // unconditional store. `UpvalSet` is different: its helper first
+        // declines captured const / named-function / TDZ cells, so the
+        // interpreter replays the op and applies PutValue's throw/no-op
+        // semantics. Both hit paths are allocation- and user-code-free.
+        Instr::CellSet { .. } | Instr::UpvalSet { .. } => {}
+        // `+x` — a NUMBER passes straight through (the interpreter returns
+        // the Value verbatim); anything else needs observable ToNumber
+        // coercion and bails. It was simply absent from this list, which
+        // declined sparse-array's for-in `keyFold` region outright.
+        Instr::ToNum { .. } => {}
+        // `obj["name" + i]` — the fused computed key. MEM path via
+        // `jit_get_index_concat`, which handles only the own-DATA hit (no
+        // alloc, no user code) and deopts otherwise.
+        Instr::GetIndexConcat { .. } => {}
+        // The fused computed-key WRITE and its evaluation-order shim.
+        // Both MUST be admitted together with the fusion in
+        // `compile/assign.rs`, or every loop that previously compiled its
+        // `o["k" + i] = v` as Add+SetIndex would now DECLINE. ToConcatKey
+        // is identity for primitives/strings (pure helper, deopts a real
+        // coercion to the interpreter); SetIndexConcat handles the own
+        // writable data-slot hit in place (scratch-formatted key, no
+        // alloc, no version bump) and deopts a NEW key / exotic / string
+        // key — exactly the cases the old Add+SetIndex pair also failed
+        // to compile.
+        Instr::ToConcatKey { .. } | Instr::SetIndexConcat { .. } => {}
+        // The fused computed-key DELETE (W19 M3). `region_mem.rs` had no
+        // `Delete` arm of any kind, so ONE opcode blacklisted the whole
+        // `delete obj["prop_" + p]` loop of `polymorphic-objects`
+        // (`[145,155]`) and it ran 100% interpreted. The MEM emitter calls
+        // `jit_delete_index_concat`, a thin wrapper over the SAME
+        // `Vm::delete_index_concat` the interpreter arm calls — so there is
+        // no re-derived semantics to get wrong, and no deopt sentinel:
+        // every receiver shape (Proxy, global, array, frozen) is served by
+        // the shared waterfall. It CAN allocate and CAN run user code, and a
+        // successful delete shifts slots and bumps the receiver version, so
+        // the emitter owes the full `CALL_THREW` + `emit_refetch_pinned`
+        // protocol — the `SetIndexConcat` treatment, for stronger reasons.
+        // Only the MEM tier gets it; `region_int.rs` keeps its own list.
+        Instr::DeleteIndexConcat { .. } if crate::codegen::jit_delete_enabled() => {}
+        // Ordinary computed delete, but only through the fail-closed helper:
+        // exact Array + non-negative tagged Int + no descriptor/arguments
+        // side table. Every rejected shape bails before mutation and lets
+        // the interpreter perform ToPropertyKey, strict failure and exotic
+        // semantics. The admission-time switch restores the historical
+        // blacklist when disabled.
+        Instr::DeleteIndex { .. } if crate::codegen::jit_array_delete_enabled() => {}
+        // `ForInLive` — the per-iteration for-in liveness check — MEM path via
+        // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
+        // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
+        // point — and it is GC-locked internally for belt-and-suspenders).
+        // Emitted per-op (re-derives the live shape each execution). Lets
+        // `for (k in obj)` loops over plain objects compile.
+        Instr::ForInLive { .. } => {}
+        // `HasProp` — the `in` operator — MEM path via the `jit_has_property`
+        // helper (read-only `Vm::has_property_jit`, byte-identical to the
+        // interpreter's `has_property_dyn` on a non-Proxy chain). Only a plain
+        // `in` (`brand: false`) is admitted; the `#x in obj` ergonomic brand
+        // check needs the private machinery → keeps declining. The helper runs
+        // no user code and never allocates on the VM heap (a Proxy/exotic/
+        // throwing case returns the deopt sentinel and the interpreter takes
+        // over), so no r13/r14/TA refetch. Unblocks sparse-array's 8M
+        // hole-aware `if (i in packed)` loops.
+        Instr::HasProp { brand: false, .. } => {}
+        Instr::HasProp { brand: true, .. } => {
+            reject!("[decline] HasProp brand-check at region [{start},{end}]");
+        }
+        // `IterNext` with a PRIMED next register — the for-of step — MEM
+        // path via `jit_iter_next`, which serves ONLY the three intrinsic
+        // iterator kinds the interpreter's own fast path steps inline
+        // (%RegExpStringIterator% / live %ArrayIterator% / Map-Set
+        // collection iterators, all behind the pristine `ITER_NEXT`
+        // native check) and deopts everything else BEFORE touching state.
+        // This was `regex-log-scan`'s matchAll-loop blocker: the whole
+        // 450k-step for-of region blacklisted for want of this one op
+        // (plus the Push/PopFinally pair below) and ran interpreted.
+        // An UNPRIMED next (u16::MAX — destructuring sites) keeps
+        // declining: its per-step `Get(it,"next")` is observable.
+        Instr::IterNext { next, .. } => {
+            if !iter_region_enabled() || next == u16::MAX {
+                reject!("[decline] IterNext at region [{start},{end}]");
+            }
+        }
+        Instr::GetIterator { .. }
+            if scalar_matchall.is_some_and(|p| p.get_iterator_ip == ip) => {}
+        Instr::IterPrime { .. }
+            if scalar_matchall.is_some_and(|p| p.iter_prime_ip == ip) => {}
+        Instr::IterCloseFinally { .. }
+            if scalar_matchall.is_some_and(|p| p.close_ip == ip) => {}
+        Instr::EndFinally { .. }
+            if scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) => {}
+        // The for-of close-handler bracket around each iteration. Both
+        // are ONE Vec push/pop on the current frame's handler stack via
+        // helpers that mirror the interpreter arms exactly, keeping the
+        // unwind state identical whichever engine executes the loop body
+        // (a throwing helper exits the region with `pending_throw` set
+        // and the interpreter unwinds using these handlers). `EndFinally`
+        // — the handler BODY's terminator — is not admitted; it lives
+        // outside the loop region.
+        Instr::PushFinally { .. } | Instr::PopFinally => {
+            if !iter_region_enabled() {
+                reject!("[decline] finally bracket at region [{start},{end}]");
+            }
+        }
+        Instr::LoadConst { idx, .. } => {
+            // Numeric constants run in the f64 region; a single-ASCII-char
+            // string constant is resolvable to its interned slot (for
+            // `s[i] === "x"` scans); a multi-char string constant is
+            // accepted on the MEM path when its pre-interned bits are in
+            // `const_strs`. Anything else rejects the region.
+            //
+            // BOTH string arms require `const_strs`, i.e. the MEM path. The
+            // register paths (int/regalloc, which pass None) home values in
+            // i64/f64 registers and have no way to hold a string: their
+            // `emit_load_const` writes `v.bits()` straight into an xmm home,
+            // and for a not-yet-interned constant those bits are the
+            // `STRING_CONST_BIT | idx` SENTINEL, not a heap value. Admitting
+            // a single-char literal there put that sentinel in a float
+            // register, where it escaped on flush and was indexed as a heap
+            // slot (`for (var s,i=0;i<20;i++) s="a"` aborted the process at
+            // heap.rs), read as a NaN by arithmetic (so `1 < "2"` inside a
+            // hot loop was always false), or flushed as a bogus value
+            // (`typeof s` becoming "number"). MEM resolves it properly.
+            match proto.constants.get(idx as usize) {
+                Some(c) if c.is_number() => {}
+                Some(&c)
+                    if const_strs.is_some() && single_char_const_bits(proto, c).is_some() => {}
+                Some(_) if const_strs.is_some_and(|m| m.contains_key(&idx)) => {}
+                _ => {
+                    reject!("[decline] non-region LoadConst at region [{start},{end}]");
+                }
+            }
+        }
+        ref other => {
+            reject!("[decline] {other:?} at region [{start},{end}]");
+        }
+    }
     true
 }
 
@@ -1874,6 +1904,7 @@ pub(crate) fn compile_region(
         cross_plan,
         ic_emit,
         meter,
+        None,
     )
     .map(|f| (f, true, false))
 }

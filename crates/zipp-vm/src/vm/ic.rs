@@ -742,7 +742,13 @@ impl<'p> Vm<'p> {
     /// safe-sandbox builds are interpreter-only by construction.
     #[inline]
     fn interp_own_resolve_vm_is_interpreter(&self) -> bool {
-        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            // A Python program's runtime stays interpreted and builds no
+            // native property plans from this training (`codegen::py`).
+            !self.jit_enabled || self.jit.runtime_interpreted()
+        }
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         {
             !self.jit_enabled
         }

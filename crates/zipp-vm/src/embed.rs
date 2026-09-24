@@ -348,6 +348,23 @@ impl ScriptState {
         self.with_vm(|vm| vm.set_jit_enabled(false));
     }
 
+    /// Turn the VM's native code generators back on for this script state
+    /// (a Python state starts with them off; see
+    /// [`crate::frontend::compile_python_program`]). A no-op in a build
+    /// without the JIT, and it never overrides `ZIPP_NOJIT`. Call it before
+    /// `run_init`, and only for a state that will run without an instruction
+    /// budget: compiled code meters by basic block, which can over-charge.
+    #[cfg(feature = "instrument")]
+    pub fn enable_vm_jit(&mut self) {
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            if std::env::var_os("ZIPP_NOJIT").is_some() {
+                return;
+            }
+            self.with_vm(|vm| vm.set_jit_enabled(true));
+        }
+    }
+
     /// Execute the program's top level and drain the job queue.
     ///
     /// `Err` carries the uncaught throw's message. Output produced *before* the

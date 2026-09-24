@@ -317,7 +317,7 @@ fn captured_span_code_unit_pred_plan(
                 .is_some_and(|reg| reg == call_callee || reg == call_receiver)
         })
         || callee.code.iter().any(|ins| {
-            slot_guard_jump_target(ins).is_some_and(|target| (15..=17).contains(&(target as usize)))
+            slot_guard_jump_targets(ins).any(|target| (15..=17).contains(&(target as usize)))
         })
     {
         return None;
@@ -440,6 +440,21 @@ fn call_result_reaches_lookup_on_all_paths(
 }
 
 impl<'p> Vm<'p> {
+    /// Whether the plan builders below skip `func_id`: a Python program's
+    /// Python-emitted body (`codegen::py`). Its loops compile as extended
+    /// memory regions, which take no typed-array pins or computed leaves (the
+    /// register tiers' plans); the cross-call lanes need a frame-free callee,
+    /// which a Python function (it pushes a traceback handler) is not; and
+    /// the leaf and method inliners' plans, built from a scan of the whole
+    /// body per call site, measured costlier than they return on the large
+    /// generated bodies. A JavaScript program builds every plan as before.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn py_plans_skipped(&self, func_id: u32) -> bool {
+        self.jit.python_program()
+            && (func_id as usize) < self.main_func_count.saturating_add(self.eval_funcs.len())
+            && crate::codegen::has_py_ops(&self.func(func_id as usize).code)
+    }
+
     /// Build the TypedArray pin plan for the OSR region `[start, end]` from
     /// LIVE VM state (called right before `compile_region`, frame `base` on
     /// top): for each `GetIndex`/`SetIndex`, find the receiver's nearest
@@ -460,6 +475,11 @@ impl<'p> Vm<'p> {
         end: u32,
         base: usize,
     ) -> crate::codegen::TaPinPlan {
+        // A Python program's own bodies take none of these plans (see
+        // `Vm::py_plans_skipped`).
+        if self.py_plans_skipped(func_id) {
+            return Default::default();
+        }
         use crate::codegen::{TaPin, TaPinPlan, TaPinSrc};
         let b192_log = std::env::var_os("ZIPP_JITLOG").is_some();
         // Conservative "does this instruction write register r" cover. An op
@@ -585,8 +605,8 @@ impl<'p> Vm<'p> {
                     if proto.code[get_ip + 1..aip].iter().any(|ins| {
                         crate::codegen::writes_reg(ins).is_some_and(|r| r == callee || r == this_v)
                     }) || proto.code.iter().any(|ins| {
-                        slot_guard_jump_target(ins)
-                            .is_some_and(|target| (get_ip + 1..=aip).contains(&(target as usize)))
+                        slot_guard_jump_targets(ins)
+                            .any(|target| (get_ip + 1..=aip).contains(&(target as usize)))
                     }) {
                         continue;
                     }
@@ -981,6 +1001,11 @@ impl<'p> Vm<'p> {
         end: u32,
         base: usize,
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::DenseComputedLeafPlan> {
+        // A Python program's own bodies take none of these plans (see
+        // `Vm::py_plans_skipped`).
+        if self.py_plans_skipped(func_id) {
+            return Default::default();
+        }
         use crate::codegen::{DenseComputedLeafPlan, LeafInlinePlan, TaPinSrc};
         use crate::heap::HeapObj;
         use rustc_hash::FxHashMap;
@@ -1114,8 +1139,8 @@ impl<'p> Vm<'p> {
                     drop_obj_def = Some(def_ip);
                 }
                 if caller.code.iter().any(|ins| {
-                    slot_guard_jump_target(ins)
-                        .is_some_and(|t| (def_ip + 1..=cursor).contains(&(t as usize)))
+                    slot_guard_jump_targets(ins)
+                        .any(|t| (def_ip + 1..=cursor).contains(&(t as usize)))
                 }) {
                     break 'source None;
                 }
@@ -1418,6 +1443,11 @@ impl<'p> Vm<'p> {
         &self,
         func_id: u32,
     ) -> rustc_hash::FxHashMap<usize, u32> {
+        // A Python program's own bodies take none of these plans (see
+        // `Vm::py_plans_skipped`).
+        if self.py_plans_skipped(func_id) {
+            return Default::default();
+        }
         let mut out = rustc_hash::FxHashMap::default();
         if !crate::heap::thin_alloc_enabled() || !crate::codegen::makefunc_plain_enabled() {
             return out;
@@ -1460,6 +1490,11 @@ impl<'p> Vm<'p> {
         func_id: u32,
         exemplar_base: Option<usize>,
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::RandomScaleFusePlan> {
+        // A Python program's own bodies take none of these plans (see
+        // `Vm::py_plans_skipped`).
+        if self.py_plans_skipped(func_id) {
+            return Default::default();
+        }
         let mut out = rustc_hash::FxHashMap::default();
         if !crate::codegen::random_fuse_enabled() || self.global_route_epoch != 0 {
             return out;
@@ -2008,6 +2043,11 @@ impl<'p> Vm<'p> {
         func_id: u32,
         exemplar_base: Option<usize>,
     ) -> (crate::codegen::CrossCallPlan, Vec<u32>, Vec<u32>) {
+        // A Python program's own bodies take none of these plans (see
+        // `Vm::py_plans_skipped`).
+        if self.py_plans_skipped(func_id) {
+            return Default::default();
+        }
         let mut plan = crate::codegen::CrossCallPlan::default();
         // B199: callee fids whose entry was missing at plan time.
         let mut pending: Vec<u32> = Vec::new();
@@ -2452,7 +2492,7 @@ impl<'p> Vm<'p> {
         // setup ops; otherwise the baked first code unit need not be live.
         if code
             .iter()
-            .filter_map(slot_guard_jump_target)
+            .flat_map(slot_guard_jump_targets)
             .any(|target| {
                 let target = target as usize;
                 target > call_ip - 3 && target <= call_ip
@@ -2547,6 +2587,11 @@ impl<'p> Vm<'p> {
         start: u32,
         end: u32,
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::LeafInlinePlan> {
+        // A Python program's own bodies take none of these plans (see
+        // `Vm::py_plans_skipped`).
+        if self.py_plans_skipped(func_id) {
+            return Default::default();
+        }
         use crate::codegen::{callee_leaf_ok_for_call, callee_leaf_ok_one_call, LeafInlinePlan};
         let mut plan = rustc_hash::FxHashMap::default();
         // A leaf splice executes callee bytecodes inside the caller's native
@@ -3173,7 +3218,7 @@ impl<'p> Vm<'p> {
             return Err("nearest-def-not-loadglobal");
         };
         for ins in &caller.code {
-            if let Some(t) = slot_guard_jump_target(ins) {
+            for t in slot_guard_jump_targets(ins) {
                 let t = t as usize;
                 if t > def_ip && t <= call_ip {
                     return Err("jump-target-in-gap");
@@ -3226,6 +3271,11 @@ impl<'p> Vm<'p> {
         base: usize,
         allow_global_methods: bool,
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::MethodInlinePlan> {
+        // A Python program's own bodies take none of these plans (see
+        // `Vm::py_plans_skipped`).
+        if self.py_plans_skipped(func_id) {
+            return Default::default();
+        }
         use crate::codegen::MethodInlinePlan;
         use crate::heap::HeapObj;
         const MAX_ARMS: usize = crate::codegen::JIT_IC_WAYS; // = 8
@@ -3301,8 +3351,8 @@ impl<'p> Vm<'p> {
             if caller.code[get_ip + 1..call_ip].iter().any(|ins| {
                 crate::codegen::writes_reg(ins).is_some_and(|r| r == callee || r == this_v)
             }) || caller.code.iter().any(|ins| {
-                slot_guard_jump_target(ins)
-                    .is_some_and(|target| (get_ip + 1..=call_ip).contains(&(target as usize)))
+                slot_guard_jump_targets(ins)
+                    .any(|target| (get_ip + 1..=call_ip).contains(&(target as usize)))
             }) {
                 continue;
             }
@@ -4953,22 +5003,14 @@ fn slot_guard_def(i: &Instr) -> Option<Option<u16>> {
     })
 }
 
-/// W12 slot-guard control model: the jump target this op carries, if any.
-/// These are the ONLY ops with instruction-index targets (`bytecode.rs`); a
-/// target inside the def→call gap breaks the straight-line dominance proof.
+/// W12 slot-guard control model: the jump targets this op carries. These are
+/// the ONLY ops with instruction-index targets (`bytecode.rs`: the ordinary
+/// jumps, the handler pushes, and a fused Python instruction's `slow` edge
+/// and branch target); a target inside the def→call gap breaks the
+/// straight-line dominance proof.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn slot_guard_jump_target(i: &Instr) -> Option<u32> {
-    match *i {
-        Instr::Jump { target }
-        | Instr::JumpIfFalse { target, .. }
-        | Instr::JumpIfTrue { target, .. }
-        | Instr::JumpIfNotLt { target, .. }
-        | Instr::JumpIfNotLe { target, .. }
-        | Instr::PushFinally { target, .. }
-        | Instr::JumpFinally { target, .. } => Some(target),
-        Instr::PushHandler { catch_target, .. } => Some(catch_target),
-        _ => None,
-    }
+fn slot_guard_jump_targets(i: &Instr) -> impl Iterator<Item = u32> {
+    crate::codegen::control_targets(i).into_iter().flatten()
 }
 
 /// B205: the exact seeded-xorshift body — three `g ^= g SHIFT c` steps over

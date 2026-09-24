@@ -486,7 +486,15 @@ impl<'p> Vm<'p> {
             string_iter_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
-            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit: {
+                let mut jit = crate::codegen::Jit::new();
+                // A Python program compiles only its Python-emitted bodies;
+                // see `Jit::set_python_program`.
+                jit.set_python_program(program.python_natives, &program.functions);
+                jit
+            },
+            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
             jit: crate::codegen::Jit::new(),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             jit_enabled: std::env::var_os("ZIPP_NOJIT").is_none(),
@@ -544,7 +552,9 @@ impl<'p> Vm<'p> {
         if self.jit.metered() {
             return false;
         }
-        self.jit_enabled
+        // A Python program's JavaScript runtime stays interpreted
+        // (`Jit::set_python_program`), its callbacks included.
+        self.jit_enabled && !self.jit.runtime_interpreted()
     }
 
     /// Slots of `globals` / `global_gens` to charge as resident. The native

@@ -187,12 +187,22 @@ fn install_gpu(state: &mut ScriptState, gpu: bool) {
     let _ = (state, gpu);
 }
 
+/// A command-line Python run has no instruction budget, so it runs on the
+/// VM JIT like `zipp js` (the embedding API's Python states start without it);
+/// `ZIPP_PY_JIT=0` keeps it interpreted, `ZIPP_NOJIT=1` turns every JIT off.
+fn enable_python_jit(state: &mut ScriptState) {
+    if zipp_vm::frontend::python_jit_env() != Some(false) {
+        state.enable_vm_jit();
+    }
+}
+
 fn execute(mut compiled: zipp_vm::frontend::CompiledSource, gpu: bool) -> Result<(), String> {
     let python = compiled.language() == LanguageId::Python;
     let state = compiled.state_mut();
     stream_console(state);
     if python {
         install_gpu(state, gpu);
+        enable_python_jit(state);
     }
     let outcome = state.run_init();
     // A program read from standard input has no project folder to write to.
@@ -785,6 +795,7 @@ fn run_project(
     let state = compiled.state_mut();
     stream_console(state);
     install_gpu(state, gpu);
+    enable_python_jit(state);
     let outcome = state.run_init();
     // Files the program wrote go back to disk, inside the root only. The
     // program's own failure (and its traceback) is the run's result even

@@ -625,7 +625,9 @@ print(seen, t._s is s)
 t.add_(1)
 print(t._s is s, k.version(t._s))
 "#);
-        assert_eq!(out, ["[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9] True", "False 0"]);
+        // `add_` writes in place, as PyTorch does: the storage stays and its
+        // version counts the write.
+        assert_eq!(out, ["[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9] True", "True 10"]);
     }
 
     #[test]

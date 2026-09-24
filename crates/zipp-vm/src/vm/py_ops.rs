@@ -1449,6 +1449,7 @@ impl<'p> Vm<'p> {
 
     /// `a <op> b` for [`Instr::PyArith`]; `None` sends the instruction to
     /// its slow path.
+    #[inline(always)] // one copy in the step, one in its JIT helper (`engine/py_jit.rs`)
     pub(crate) fn py_arith(&mut self, op: PyArithOp, va: Value, vb: Value) -> Result<Option<Value>, Thrown> {
         // Two floats: exactly the VM's own Number arithmetic (the int-tagged
         // fast forms included), as the inline code this replaces used.
@@ -1552,6 +1553,7 @@ impl<'p> Vm<'p> {
     }
 
     /// `a + imm` for [`Instr::PyAddImm`].
+    #[inline(always)] // one copy in the step, one in its JIT helper (`engine/py_jit.rs`)
     pub(crate) fn py_add_imm(&mut self, va: Value, imm: i32) -> Result<Option<Value>, Thrown> {
         if va.is_int() {
             return Ok(Some(match va.as_int().checked_add(imm) {
@@ -1579,6 +1581,7 @@ impl<'p> Vm<'p> {
     }
 
     /// `a <op> b` for [`Instr::PyCompare`] / [`Instr::PyJumpCompare`].
+    #[inline(always)] // one copy in the step, one in its JIT helper (`engine/py_jit.rs`)
     pub(crate) fn py_compare(&mut self, op: PyCmpOp, va: Value, vb: Value) -> Result<Option<bool>, Thrown> {
         if va.is_int() && vb.is_int() {
             return Ok(Some(order_holds(op, va.as_int().cmp(&vb.as_int()))));

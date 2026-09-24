@@ -1022,6 +1022,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             }
         }};
     }
+    // A Python body (see `codegen::py`): the fused instructions and the
+    // Python body ops are admitted here, and nowhere in a JavaScript body.
+    let py = has_py_ops(&proto.code);
     for (ip, instr) in proto.code.iter().enumerate() {
         // Tier C turns register operands into unchecked native displacements
         // and branch targets into label-table indices. Compiler-produced
@@ -1029,6 +1032,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         // malformed internal proto declines at the final native-code boundary.
         if !tierc_operands_in_bounds(instr, proto.reg_count, proto.code.len()) {
             reject!("[tierC-reject] malformed operands at ip {ip}");
+            continue;
+        }
+        if py && (py_op_edges(instr).is_some() || py_body_op(instr)) {
             continue;
         }
         match *instr {
@@ -1347,8 +1353,23 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
 
 fn tierc_operands_in_bounds(instr: &Instr, reg_count: u16, code_len: usize) -> bool {
     let reg = |r: u16| r < reg_count;
-    if bytecode_control_target(instr).is_some_and(|target| target as usize >= code_len) {
+    if control_targets(instr)
+        .into_iter()
+        .flatten()
+        .any(|target| target as usize >= code_len)
+    {
         return false;
+    }
+    if let Some((uses, dst)) = py_op_regs(instr) {
+        return uses.into_iter().all(reg) && dst.is_none_or(reg);
+    }
+    match *instr {
+        Instr::LoadBigInt { dst, .. } => return reg(dst),
+        Instr::PushHandler { catch_reg, .. } => return reg(catch_reg),
+        Instr::PopHandler => return true,
+        Instr::Throw { src } => return reg(src),
+        Instr::ArrayAppend { arr, val, .. } => return reg(arr) && reg(val),
+        _ => {}
     }
     match *instr {
         Instr::PushFinally {
@@ -2803,6 +2824,8 @@ pub(crate) fn compile_proto_mem(
     }
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let n = proto.code.len();
+    // A Python body (see `codegen::py`).
+    let py = has_py_ops(&proto.code);
     let protected_returns = tierc_protected_return_map(&proto.code);
     let method_own_slot_direct = meter.is_none() && tierc_method_own_slot_direct_enabled();
     if method_own_slot_direct && std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -2837,6 +2860,20 @@ pub(crate) fn compile_proto_mem(
         };
         if let Some(target) = target.filter(|&target| target < n) {
             targeted[target] = true;
+        }
+        // A Python body's fused-instruction edges (and its handler targets,
+        // which only the interpreter's unwind reaches) enter blocks too.
+        if let Some((slow, t)) = py_op_edges(instr) {
+            for target in [Some(slow), t].into_iter().flatten() {
+                if (target as usize) < n {
+                    targeted[target as usize] = true;
+                }
+            }
+        }
+        if let Instr::PushHandler { catch_target, .. } = *instr {
+            if (catch_target as usize) < n {
+                targeted[catch_target as usize] = true;
+            }
         }
     }
     // Truncation-only `Add`/`Sub`/`AddInt` results wrap in i32 instead of
@@ -3228,6 +3265,13 @@ pub(crate) fn compile_proto_mem(
                 if let Some(t) = t.filter(|&t| t < n) {
                     targeted[t] = true;
                 }
+                if let Some((slow, pt)) = py_op_edges(instr) {
+                    for t in [Some(slow), pt].into_iter().flatten() {
+                        if (t as usize) < n {
+                            targeted[t as usize] = true;
+                        }
+                    }
+                }
             }
             for ip in 0..n.saturating_sub(3) {
                 if !trunc_arith[ip] {
@@ -3474,6 +3518,21 @@ pub(crate) fn compile_proto_mem(
         // miss resumes the interpreter exactly here, side-effect-free.
         let bail = ops.new_dynamic_label();
         match proto.code[ip] {
+            // A Python body's counters are Python ints (BigInts): see
+            // `codegen::py`. Ahead of the JavaScript arms below.
+            Instr::AddInt { dst, a, imm, upd } if py => {
+                emit_py_add_int(&mut ops, dst, a, imm, upd, bail, &mut |ops| {
+                    if let Some((vb, icb)) = refetch {
+                        emit_refetch_pinned(ops, vb, Some(icb));
+                    }
+                });
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::JumpIfNotLt { a, b, target } | Instr::JumpIfNotLe { a, b, target } if py => {
+                let le = matches!(proto.code[ip], Instr::JumpIfNotLe { .. });
+                emit_py_jump_if_not(&mut ops, a, b, le, labels[target as usize], bail);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::LoadInt { dst, val } => {
                 let boxed = INT_TAG | (val as u32 as u64);
                 dynasm!(ops
@@ -3849,6 +3908,74 @@ pub(crate) fn compile_proto_mem(
                     ; mov rcx, rdi
                     ; mov rax, QWORD heap.pop_finally as i64
                     ; call rax
+                );
+            }
+            // ── Python bodies (see `codegen::py`) ── admitted only in a body
+            // holding fused Python instructions; such a body has handler ops,
+            // so it is entered frame-backed only.
+            ref instr if py_op_edges(instr).is_some() => {
+                let Some((slow, target)) = py_op_edges(instr) else {
+                    return None;
+                };
+                let labels = PyLabels {
+                    slow: labels[slow as usize],
+                    target: target.map(|t| labels[t as usize]),
+                    bail,
+                };
+                emit_py_op(&mut ops, func_id, ip, instr, &labels, &mut |ops| {
+                    if let Some((vb, icb)) = refetch {
+                        emit_refetch_pinned(ops, vb, Some(icb));
+                    }
+                });
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::LoadBigInt { dst, value } => {
+                if let Some(bits) = interned_bigint_bits(value) {
+                    dynasm!(ops
+                        ; mov rax, QWORD bits as i64
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                } else {
+                    emit_py_load_bigint(&mut ops, func_id, ip, dst, bail, &mut |ops| {
+                        if let Some((vb, icb)) = refetch {
+                            emit_refetch_pinned(ops, vb, Some(icb));
+                        }
+                    });
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                }
+            }
+            Instr::ArrayAppend {
+                arr,
+                val,
+                spread: false,
+            } if py => {
+                emit_py_array_append(&mut ops, arr, val, bail);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::PushHandler {
+                catch_target,
+                catch_reg,
+            } => {
+                let packed = ((catch_target as u64) << 16) | catch_reg as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed as i64
+                    ; mov rax, QWORD crate::vm::Vm::jit_py_push_handler as usize as i64
+                    ; call rax
+                );
+            }
+            Instr::PopHandler => {
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD heap.pop_finally as i64
+                    ; call rax
+                );
+            }
+            Instr::Throw { .. } => {
+                // The interpreter raises (and unwinds this frame's handlers).
+                dynasm!(ops
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => epilogue
                 );
             }
             Instr::EndFinally { kind_reg, .. } => {

@@ -105,6 +105,21 @@ pub(crate) fn block_map(
     Some((m, blocks(code, start, end).into_iter().collect()))
 }
 
+/// [`block_map`] for an extended Python region: `split[i]` marks ip
+/// `start + i` as not compiled (the region exits there), so it and the ip
+/// after it head blocks of their own, and no compiled block's charge covers
+/// an instruction the interpreter will execute and charge itself.
+pub(crate) fn block_map_split(
+    meter: Option<Meter>,
+    code: &[Instr],
+    start: usize,
+    end: usize,
+    split: &[bool],
+) -> BlockMap {
+    let m = meter?;
+    Some((m, blocks_split(code, start, end, Some(split)).into_iter().collect()))
+}
+
 /// Charge the basic block starting at `ip`, if one starts there.
 ///
 /// Reuses the region's existing `exit_stubs` map: a stub is `mov [rsi], ip ;
@@ -138,7 +153,19 @@ pub(crate) fn charge_block(
 /// instruction after a branch (its fall-through). Charging every head therefore
 /// charges every instruction the region can execute exactly once per pass.
 pub(crate) fn blocks(code: &[Instr], start: usize, end: usize) -> Vec<(usize, u32)> {
+    blocks_split(code, start, end, None)
+}
+
+fn blocks_split(code: &[Instr], start: usize, end: usize, split: Option<&[bool]>) -> Vec<(usize, u32)> {
     let mut heads = vec![false; end - start + 2];
+    if let Some(split) = split {
+        for (i, &x) in split.iter().enumerate() {
+            if x {
+                heads[i] = true;
+                heads[i + 1] = true;
+            }
+        }
+    }
     let mut mark = |ip: usize| {
         if ip >= start && ip <= end {
             heads[ip - start] = true;
@@ -151,6 +178,16 @@ pub(crate) fn blocks(code: &[Instr], start: usize, end: usize) -> Vec<(usize, u3
         // fallback is unreachable from the returning path and must belong to a
         // separate block or native execution bills it without executing it.
         if matches!(code[ip], Instr::Return { .. } | Instr::ReturnUndefined) {
+            mark(ip + 1);
+            continue;
+        }
+        // A fused Python instruction branches to its `slow` edge (and a
+        // `PyJumpCompare` to its target) besides falling through.
+        if let Some((slow, target)) = crate::codegen::py_op_edges(&code[ip]) {
+            mark(slow as usize);
+            if let Some(t) = target {
+                mark(t as usize);
+            }
             mark(ip + 1);
             continue;
         }

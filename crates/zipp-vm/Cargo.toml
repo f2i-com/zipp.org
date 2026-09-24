@@ -33,8 +33,11 @@ self_cell = "1.3.0"
 
 [features]
 # Experimental Python-subset frontend (see docs/PYTHON_FRONTEND_EXPERIMENT.md).
-# Pulls in the RustPython parser and `instrument` (Python states run with the
-# VM JIT disabled). Off by default so the JavaScript engine is unchanged.
+# Pulls in the Python parser and `instrument` (a Python state starts with the
+# VM JIT off; a host without an instruction budget, such as the CLI's
+# `zipp py`/`zipp run`, turns on its Python loop tier with
+# `ScriptState::enable_vm_jit`). Off by default so the JavaScript engine is
+# unchanged.
 python = ["dep:rustpython-parser", "instrument"]
 # Trusted mixed-language programs sharing one VM scope; deliberately opt-in.
 python-js-interop = ["python"]

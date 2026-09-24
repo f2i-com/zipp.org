@@ -95,6 +95,21 @@ pub const JIT_THRESHOLD: u32 = 8;
 /// to the OSR (on-stack-replacement) compiler. Low so hot loops promote fast.
 pub const OSR_THRESHOLD: u32 = 8;
 
+/// `Jit::interp_only` flags: the function never compiles whole.
+const INTERP_NO_FN: u8 = 1;
+/// `Jit::interp_only` flags: the function's loops never compile.
+const INTERP_NO_REGIONS: u8 = 2;
+
+/// [`OSR_THRESHOLD`] for a Python program's loops. A Python loop's compile
+/// (an extended region, its slow paths included) costs more than a
+/// JavaScript loop's and its per-iteration saving is smaller (most of its
+/// work is out-of-line steps either way), so only a loop that has run long
+/// enough to repay it compiles: measured on the bundled torch's training
+/// steps, whose many short library loops compiled at 8 back-edges cost more
+/// than they saved, while every long-running loop still compiles within its
+/// first thousand iterations.
+pub const PY_OSR_THRESHOLD: u32 = 1024;
+
 /// How many times a compiled region may "deopt" (a native run that resumes
 /// INSIDE the region — a type guard bailed — rather than exiting cleanly) before
 /// it is evicted and blacklisted. Prevents a livelock where the interpreter
@@ -3611,6 +3626,14 @@ pub struct Jit {
     /// Funcs whose yield-decline was already logged (JITLOG only — keeps the
     /// per-call decline from spamming one line per call).
     yield_logged: FxHashSet<u32>,
+    /// A Python program (see `set_python_program`).
+    python_program: bool,
+    /// A Python program whose JavaScript runtime stays interpreted: only
+    /// Python-emitted bodies compile.
+    python_only: bool,
+    /// Per main-program function of a Python program: `INTERP_*` flags
+    /// (answered as dead by `fn_state` / `region_dead`).
+    interp_only: Vec<u8>,
 }
 
 impl Jit {
@@ -3629,6 +3652,81 @@ impl Jit {
         jit
     }
 
+    /// Mark this VM as running a Python program (the Python frontend's
+    /// runtime plus the program's modules). Its JavaScript runtime functions
+    /// then stay interpreted: they are large, called with many shapes, and
+    /// measured slower compiled than interpreted (compile and planning cost
+    /// on short runs, helper-bound bodies on long ones), while the Python
+    /// program's own bodies (those holding fused Python instructions) still
+    /// compile. `ZIPP_PY_JIT_RUNTIME=1` compiles the runtime too.
+    pub fn set_python_program(&mut self, python: bool, functions: &[FuncProto]) {
+        self.python_program = python;
+        self.python_only = python && std::env::var_os("ZIPP_PY_JIT_RUNTIME").is_none();
+        // Mark what never compiles up front (the runtime's functions: every
+        // body without a fused Python instruction; and, without Tier C, the
+        // Python functions' whole bodies), so a call or a loop there never
+        // even counts toward a compile (which would intern and root its
+        // string constants and build its plans before declining).
+        if python {
+            let tierc = py_tierc_enabled();
+            self.interp_only = functions
+                .iter()
+                .map(|f| {
+                    let py = has_py_ops(&f.code);
+                    // A runtime function: nothing compiles. A Python function:
+                    // its loops compile; the whole body only under Tier C.
+                    match (py, self.python_only) {
+                        (false, true) => INTERP_NO_FN | INTERP_NO_REGIONS,
+                        (true, _) if !tierc => INTERP_NO_FN,
+                        _ => 0,
+                    }
+                })
+                .collect();
+        }
+    }
+
+    /// `func_id`'s `INTERP_*` flags in a Python program (see
+    /// `set_python_program`); 0 in any other.
+    #[inline]
+    fn interp_flags(&self, func_id: u32) -> u8 {
+        if !self.python_program {
+            return 0;
+        }
+        self.interp_only.get(func_id as usize).copied().unwrap_or(0)
+    }
+
+    /// Whether a body may compile at all: in a Python program, only one the
+    /// Python frontend emitted.
+    #[inline]
+    pub(crate) fn body_eligible(&self, code: &[Instr]) -> bool {
+        !self.python_only || has_py_ops(code)
+    }
+
+    /// Whether a whole function may compile: as [`Jit::body_eligible`], and a
+    /// Python-emitted function only under `ZIPP_PY_TIERC=1`. Its loops still
+    /// compile as regions. Measured on the Python suite, whole Python
+    /// functions ran slower compiled than interpreted: every call enters the
+    /// native body through the full frame-backed entry (the traceback handler
+    /// every Python function pushes rules out the frame-free lanes), which
+    /// costs more than the straight-line code it saves.
+    pub(crate) fn fn_body_eligible(&self, code: &[Instr]) -> bool {
+        !self.python_program || (self.body_eligible(code) && (!has_py_ops(code) || py_tierc_enabled()))
+    }
+
+    /// A Python program (see `set_python_program`).
+    #[inline]
+    pub(crate) fn python_program(&self) -> bool {
+        self.python_program
+    }
+
+    /// A Python program whose JavaScript runtime stays interpreted (the
+    /// default; see `set_python_program`): no native plan reads the
+    /// interpreter's inline-cache training, and no runtime callback compiles.
+    #[inline]
+    pub fn runtime_interpreted(&self) -> bool {
+        self.python_only
+    }
+
     /// Interpreter entries before a function is offered to the JIT.
     #[inline]
     fn fn_threshold(&self) -> u32 {
@@ -3644,6 +3742,8 @@ impl Jit {
     fn loop_threshold(&self) -> u32 {
         if self.threshold_override != 0 {
             self.threshold_override
+        } else if self.python_program {
+            PY_OSR_THRESHOLD
         } else {
             OSR_THRESHOLD
         }
@@ -4014,6 +4114,9 @@ impl Jit {
     /// Dense tier state of `func_id` — the frame-entry fast path.
     #[inline]
     pub fn fn_state(&self, func_id: u32) -> u8 {
+        if self.interp_flags(func_id) & INTERP_NO_FN != 0 {
+            return FN_DEAD;
+        }
         self.fn_state
             .get(func_id as usize)
             .copied()
@@ -4061,6 +4164,11 @@ impl Jit {
         plain_makefunc: &FxHashMap<usize, u32>,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
+            return;
+        }
+        if !self.fn_body_eligible(&proto.code) {
+            self.blacklist.insert(func_id);
+            self.set_fn_state(func_id, FN_DEAD);
             return;
         }
         let meter = self.meter;
@@ -4198,7 +4306,11 @@ impl Jit {
                 // invocation goes through the ordinary framed call path.
                 // B272: such a body still receives an entry, flagged so only
                 // the generic helper (which pushes the frame first) enters it.
-                let needs_frame = proto_has_handler_ops(proto);
+                // A Python body (see `codegen::py`) is always entered
+                // frame-backed. Every Python function already carries the
+                // traceback handler's `PushHandler`; the second test states
+                // the requirement rather than relying on that emitter habit.
+                let needs_frame = proto_has_handler_ops(proto) || has_py_ops(&proto.code);
                 if needs_frame && !cross_framed_entry_enabled() {
                     self.clear_cross_entry(func_id);
                     return;
@@ -4305,11 +4417,12 @@ impl Jit {
     /// frame entry.
     #[inline]
     pub fn region_dead(&self, func_id: u32, entry_ip: u32) -> bool {
-        self.dense_backedge
-            && self
-                .region_dead
-                .get(func_id as usize)
-                .is_some_and(|v| v.get(entry_ip as usize).copied().unwrap_or(0) != 0)
+        self.interp_flags(func_id) & INTERP_NO_REGIONS != 0
+            || (self.dense_backedge
+                && self
+                    .region_dead
+                    .get(func_id as usize)
+                    .is_some_and(|v| v.get(entry_ip as usize).copied().unwrap_or(0) != 0))
     }
 
     /// Mirror a `region_blacklist` insert into the dense side table. Called at
@@ -4518,6 +4631,34 @@ impl Jit {
             return;
         }
         let meter = self.meter;
+        if !self.body_eligible(&proto.code[start as usize..=end as usize]) {
+            self.region_blacklist.insert(key);
+            self.set_region_dead(key.0, key.1);
+            return;
+        }
+        // A Python loop (see `codegen::py`) takes the memory path alone: the
+        // register tiers and scalar replacement reason about control flow
+        // without its fused instructions' `slow` edges, and its element
+        // accesses are the runtime's, not typed-array pins.
+        let py = has_py_ops(&proto.code[start as usize..=end as usize]);
+        let empty_ta_plan = TaPinPlan::default();
+        let ta_plan = if py { &empty_ta_plan } else { ta_plan };
+        if py {
+            self.region_int_blacklist.insert(key);
+            self.compile_py_region(
+                func_id,
+                proto,
+                start,
+                end,
+                globals_base_helper,
+                heap_helpers,
+                const_strs,
+                leaf_plan,
+                method_plan,
+                cross_plan,
+            );
+            return;
+        }
 
         // Fresh LOCAL aggregate scalar replacement. Unlike the older global-
         // object field promotion below, scalar homes are otherwise-unused
@@ -5376,6 +5517,7 @@ pub(crate) mod meter;
 mod plan;
 mod plan_region;
 mod proto_mem;
+mod py;
 mod regalloc;
 mod region_admit;
 mod region_int;
@@ -5393,6 +5535,7 @@ pub(crate) use kernels::*;
 pub(crate) use plan::*;
 pub(crate) use plan_region::*;
 pub(crate) use proto_mem::*;
+pub(crate) use py::*;
 pub(crate) use proto_mem::{splice_body_defs, splice_uninit_mask};
 pub(crate) use regalloc::*;
 pub(crate) use region_admit::*;

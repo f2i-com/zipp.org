@@ -91,17 +91,28 @@ integration date every corpus program matched.
 - `str` formatting of `float` uses Python's rules for `repr`, `f`, `e`, `g`,
   `%`; a few exotic spec combinations (`=` alignment with `0` padding of
   strings, `n` locale forms) are approximations.
-- Performance: ints are BigInts (the VM interns small ones and has fast
-  paths for BigInt arithmetic and comparison); int arithmetic, `for` over
-  `range`, comparisons, truth tests and calls of plain functions compile to
-  inline register code, and dict/list indexing, method calls and attribute
-  reads take short paths in the runtime. It is still an interpreter over a
-  JavaScript-shaped VM: on a release build, `fib(25)` takes about 0.09 s,
-  a million-iteration `total += i % 7` loop about 0.5 s and 200k dict
-  insertions with `str` keys about 0.7 s (CPython: 0.005 s, 0.05 s and
-  0.03 s). The remaining cost is dominated by BigInt allocation for large
-  values and by per-operation dispatch; dedicated Python bytecodes are the
-  next step.
+- Performance: Python compiles to the engine's register bytecode plus 27
+  fused Python-only instructions (arithmetic and compare-and-branch, class
+  guards, instance-dict and global reads with per-site caches, attribute and
+  method lookup, subscripts, `len`, `isinstance`, unpacking, sequence
+  displays, raise and handler entry, the generator loop step) and native
+  helpers for json, the common `str` methods, `str %`, `hash`, `heapq`,
+  `bisect`, generator steps and iterator steps; every one defers to the
+  JavaScript runtime whenever it cannot answer exactly. On the command line
+  (`zipp py`/`zipp run`, no instruction budget) hot Python loops (1024
+  iterations) also compile to native code: float and small-int arithmetic,
+  comparisons and `range` counters run inline, and every other fused
+  instruction calls the interpreter's own step, so results are identical (a
+  139-program corpus is byte-identical JIT on/off). Loops that spend most of
+  their time in calls, and whole functions, stay interpreted; embedders with
+  an instruction budget, sandbox and WebAssembly keep the JIT off. Measured
+  against CPython 3.13 over the 36 programs of `tools/python_bench.py`
+  (geomean of work time): about 5.1x slower interpreted and 4.5-4.8x with
+  the JIT, from `float_arith` (faster than CPython with the JIT) and
+  `int_arith` (1.3x) to exceptions and generators (about 13x). Ints are
+  BigInts outside a small interned range, and object-heavy code still goes
+  through the JavaScript runtime's records; native core types are the next
+  step.
 
 ## Language selection
 
