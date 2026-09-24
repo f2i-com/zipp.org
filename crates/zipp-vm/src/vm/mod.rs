@@ -2975,6 +2975,8 @@ mod py_key;
 #[cfg(feature = "python")]
 mod py_str;
 #[cfg(feature = "python")]
+mod py_table;
+#[cfg(feature = "python")]
 mod py_tensor;
 pub(crate) use prof::dump as prof_stats;
 pub(crate) use temporal::tzdb_version;
