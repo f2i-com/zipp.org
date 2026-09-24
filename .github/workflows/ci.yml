@@ -80,6 +80,7 @@ jobs:
         run: |
           cargo +1.92.0 test --locked -p zipp-vm --features python --test python_frontend --test python_project --test python_corpus --test python_torch --test python_javascript --test python_torch_core --test python_torch_nn --test python_torch_optim --test python_torch_gpu --test python_torch_native --test python_torch_gpu2 --test python_torch_nn2 --test python_torch_dtypes --test python_torch_linalg --test python_torch_distributions --test python_torch_amp --test python_torch_nn3 --test python_torch_gpu3 --test python_torch_complex --test python_torch_fft --test python_torch_sparse --test python_torch_quant --test python_torch_distributed
           cargo +1.92.0 test --locked -p zipp-vm --features python-js-interop --test python_javascript
+          cargo +1.92.0 test --locked -p zipp-vm --features python --lib minify_check
           cargo +1.92.0 test --locked -p zipp-cli
           cargo +1.92.0 test --locked -p zipp-gpu
       - name: Build the Python-enabled browser artifact

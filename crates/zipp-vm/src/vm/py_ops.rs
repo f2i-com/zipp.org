@@ -57,6 +57,7 @@ static HINT_TDICT: AtomicU16 = AtomicU16::new(0);
 static HINT_TSET: AtomicU16 = AtomicU16::new(0);
 static HINT_ITEMS: AtomicU16 = AtomicU16::new(1);
 static HINT_SIZE: AtomicU16 = AtomicU16::new(2);
+#[cfg(feature = "python")]
 static HINT_SEQTMPL: AtomicU16 = AtomicU16::new(0);
 static HINT_EBASE: AtomicU16 = AtomicU16::new(0);
 static HINT_EXCSTACK: AtomicU16 = AtomicU16::new(0);

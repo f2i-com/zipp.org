@@ -20,31 +20,40 @@ mod exprs;
 mod nesting;
 mod stmts;
 mod symtable;
+#[cfg(test)]
+mod minify_check;
 
 use emitter::{Emitter, Unit, MAX_FUNCTIONS};
 
 type R<T> = Result<T, String>;
+/// A frontend source file as embedded: the comment-stripped copy `build.rs`
+/// writes (every token keeps its line and column; see build/minify.rs).
+macro_rules! pysrc {
+    ($path:literal) => {
+        include_str!(concat!(env!("OUT_DIR"), "/pysrc/", $path))
+    };
+}
 const RUNTIME_BASE: &str = concat!(
-    include_str!("runtime/core.js"),
+    pysrc!("runtime/core.js"),
     "\n",
-    include_str!("runtime/types.js"),
+    pysrc!("runtime/types.js"),
     "\n",
-    include_str!("runtime/builtins.js"),
+    pysrc!("runtime/builtins.js"),
     "\n",
-    include_str!("runtime/stdlib.js"),
+    pysrc!("runtime/stdlib.js"),
     "\n",
-    include_str!("runtime/tensor.js"),
+    pysrc!("runtime/tensor.js"),
 );
-const RUNTIME_ENTRY: &str = include_str!("runtime/entry.js");
+const RUNTIME_ENTRY: &str = pysrc!("runtime/entry.js");
 // The native CLI's synchronous GPU bridge (`_zipp_gpu.native`): inert
 // unless the embedder answers `zipp.gpu.*` host calls. Only the native CLI
 // enables it, so the WebAssembly and sandbox runtimes are unchanged.
 #[cfg(feature = "python-native-gpu")]
-const NATIVE_GPU_RUNTIME: &str = include_str!("runtime/native_gpu.js");
+const NATIVE_GPU_RUNTIME: &str = pysrc!("runtime/native_gpu.js");
 #[cfg(not(feature = "python-native-gpu"))]
 const NATIVE_GPU_RUNTIME: &str = "";
 #[cfg(feature = "python-js-interop")]
-const INTEROP_RUNTIME: &str = include_str!("runtime/javascript.js");
+const INTEROP_RUNTIME: &str = pysrc!("runtime/javascript.js");
 #[cfg(not(feature = "python-js-interop"))]
 const INTEROP_RUNTIME: &str = "";
 const MAX_SOURCE: usize = 1024 * 1024;
@@ -97,373 +106,373 @@ pub(super) const BUILTIN_MODULES: &[&str] = &[
 /// (directly or through another bundled module), so a program that never
 /// mentions it pays nothing.
 pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
-    ("zipp_gpu", include_str!("lib/shared/zipp_gpu.py")),
-    ("torch", include_str!("lib/torch.py")),
-    ("torch._gpu", include_str!("lib/torch_gpu.py")),
-    ("torch.nn", include_str!("lib/torch_nn.py")),
+    ("zipp_gpu", pysrc!("lib/shared/zipp_gpu.py")),
+    ("torch", pysrc!("lib/torch.py")),
+    ("torch._gpu", pysrc!("lib/torch_gpu.py")),
+    ("torch.nn", pysrc!("lib/torch_nn.py")),
     (
         "torch.nn.functional",
-        include_str!("lib/torch_nn_functional.py"),
+        pysrc!("lib/torch_nn_functional.py"),
     ),
-    ("torch.nn.init", include_str!("lib/torch_nn_init.py")),
-    ("torch.nn.utils", include_str!("lib/torch_nn_utils.py")),
+    ("torch.nn.init", pysrc!("lib/torch_nn_init.py")),
+    ("torch.nn.utils", pysrc!("lib/torch_nn_utils.py")),
     (
         "torch.nn.utils.rnn",
-        include_str!("lib/torch_nn_utils_rnn.py"),
+        pysrc!("lib/torch_nn_utils_rnn.py"),
     ),
     (
         "torch.nn.parameter",
-        include_str!("lib/torch_nn_parameter.py"),
+        pysrc!("lib/torch_nn_parameter.py"),
     ),
     (
         "torch.nn.utils.parametrize",
-        include_str!("lib/torch_nn_utils_parametrize.py"),
+        pysrc!("lib/torch_nn_utils_parametrize.py"),
     ),
     (
         "torch.nn.utils.parametrizations",
-        include_str!("lib/torch_nn_utils_parametrizations.py"),
+        pysrc!("lib/torch_nn_utils_parametrizations.py"),
     ),
-    ("torch.linalg", include_str!("lib/torch_linalg.py")),
-    ("torch.sparse", include_str!("lib/torch_sparse.py")),
-    ("torch._quant", include_str!("lib/torch_quant.py")),
-    ("torch.ao", include_str!("lib/torch_ao.py")),
-    ("torch.ao.nn", include_str!("lib/torch_ao_nn.py")),
+    ("torch.linalg", pysrc!("lib/torch_linalg.py")),
+    ("torch.sparse", pysrc!("lib/torch_sparse.py")),
+    ("torch._quant", pysrc!("lib/torch_quant.py")),
+    ("torch.ao", pysrc!("lib/torch_ao.py")),
+    ("torch.ao.nn", pysrc!("lib/torch_ao_nn.py")),
     (
         "torch.distributed",
-        include_str!("lib/torch_distributed.py"),
+        pysrc!("lib/torch_distributed.py"),
     ),
     (
         "torch.distributed.distributed_c10d",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.utils.data.distributed",
-        include_str!("lib/torch_utils_data_distributed.py"),
+        pysrc!("lib/torch_utils_data_distributed.py"),
     ),
     (
         "torch.distributed.elastic",
-        include_str!("lib/torch_distributed_unsupported.py"),
+        pysrc!("lib/torch_distributed_unsupported.py"),
     ),
     (
         "torch.distributed.launch",
-        include_str!("lib/torch_distributed_unsupported.py"),
+        pysrc!("lib/torch_distributed_unsupported.py"),
     ),
     (
         "torch.distributed.run",
-        include_str!("lib/torch_distributed_unsupported.py"),
+        pysrc!("lib/torch_distributed_unsupported.py"),
     ),
     (
         "torch.ao.nn.intrinsic",
-        include_str!("lib/torch_ao_nn_intrinsic.py"),
+        pysrc!("lib/torch_ao_nn_intrinsic.py"),
     ),
-    ("torch.ao.nn.qat", include_str!("lib/torch_ao_nn_qat.py")),
+    ("torch.ao.nn.qat", pysrc!("lib/torch_ao_nn_qat.py")),
     (
         "torch.ao.nn.intrinsic.qat",
-        include_str!("lib/torch_ao_nn_intrinsic_qat.py"),
+        pysrc!("lib/torch_ao_nn_intrinsic_qat.py"),
     ),
     (
         "torch.ao.nn.quantized",
-        include_str!("lib/torch_ao_nn_quantized.py"),
+        pysrc!("lib/torch_ao_nn_quantized.py"),
     ),
     (
         "torch.ao.nn.quantized.functional",
-        include_str!("lib/torch_ao_nn_quantized_functional.py"),
+        pysrc!("lib/torch_ao_nn_quantized_functional.py"),
     ),
     (
         "torch.ao.nn.quantized.dynamic",
-        include_str!("lib/torch_ao_nn_quantized_dynamic.py"),
+        pysrc!("lib/torch_ao_nn_quantized_dynamic.py"),
     ),
     (
         "torch.ao.nn.intrinsic.quantized",
-        include_str!("lib/torch_ao_nn_intrinsic_quantized.py"),
+        pysrc!("lib/torch_ao_nn_intrinsic_quantized.py"),
     ),
     (
         "torch.ao.quantization",
-        include_str!("lib/torch_ao_quantization.py"),
+        pysrc!("lib/torch_ao_quantization.py"),
     ),
     (
         "torch.ao.nn.intrinsic.quantized.dynamic",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
-    ("torch.quantization", include_str!("lib/torch_alias.py")),
+    ("torch.quantization", pysrc!("lib/torch_alias.py")),
     (
         "torch.ao.quantization.observer",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.ao.quantization.fake_quantize",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.ao.quantization.qconfig",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.ao.quantization.quantize",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.ao.quantization.fuse_modules",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.ao.quantization.stubs",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.ao.quantization.utils",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.ao.quantization.quantize_fx",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.quantization.observer",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.quantization.qconfig",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.quantization.quantize",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
-    ("torch.nn.quantized", include_str!("lib/torch_alias.py")),
+    ("torch.nn.quantized", pysrc!("lib/torch_alias.py")),
     (
         "torch.nn.quantized.dynamic",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
     (
         "torch.nn.quantized.functional",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
-    ("torch.nn.intrinsic", include_str!("lib/torch_alias.py")),
+    ("torch.nn.intrinsic", pysrc!("lib/torch_alias.py")),
     (
         "torch.nn.intrinsic.quantized",
-        include_str!("lib/torch_alias.py"),
+        pysrc!("lib/torch_alias.py"),
     ),
-    ("torch.nn.intrinsic.qat", include_str!("lib/torch_alias.py")),
-    ("torch.nn.qat", include_str!("lib/torch_alias.py")),
+    ("torch.nn.intrinsic.qat", pysrc!("lib/torch_alias.py")),
+    ("torch.nn.qat", pysrc!("lib/torch_alias.py")),
     (
         "torch.distributions",
-        include_str!("lib/torch_distributions.py"),
+        pysrc!("lib/torch_distributions.py"),
     ),
     (
         "torch.distributions.constraints",
-        include_str!("lib/torch_distributions_constraints.py"),
+        pysrc!("lib/torch_distributions_constraints.py"),
     ),
     (
         "torch.distributions.transforms",
-        include_str!("lib/torch_distributions_transforms.py"),
+        pysrc!("lib/torch_distributions_transforms.py"),
     ),
     (
         "torch.distributions.kl",
-        include_str!("lib/torch_distributions_kl.py"),
+        pysrc!("lib/torch_distributions_kl.py"),
     ),
     (
         "torch.distributions.bernoulli",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.beta",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.binomial",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.categorical",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.cauchy",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.chi2",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.constraint_registry",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.continuous_bernoulli",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.dirichlet",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.distribution",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.exp_family",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.exponential",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.fishersnedecor",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.gamma",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.generalized_pareto",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.geometric",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.gumbel",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.half_cauchy",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.half_normal",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.independent",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.inverse_gamma",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.kumaraswamy",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.laplace",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.lkj_cholesky",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.log_normal",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.logistic_normal",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.lowrank_multivariate_normal",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.mixture_same_family",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.multinomial",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.multivariate_normal",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.negative_binomial",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.normal",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.one_hot_categorical",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.pareto",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.poisson",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.relaxed_bernoulli",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.relaxed_categorical",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.studentT",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.transformed_distribution",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.uniform",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.utils",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.von_mises",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.weibull",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
     (
         "torch.distributions.wishart",
-        include_str!("lib/torch_distributions_submodule.py"),
+        pysrc!("lib/torch_distributions_submodule.py"),
     ),
-    ("torch.fft", include_str!("lib/torch_fft.py")),
+    ("torch.fft", pysrc!("lib/torch_fft.py")),
     (
         "torch.nn.parallel",
-        include_str!("lib/torch_nn_parallel.py"),
+        pysrc!("lib/torch_nn_parallel.py"),
     ),
-    ("torch.amp", include_str!("lib/torch_amp.py")),
-    ("torch.special", include_str!("lib/torch_special.py")),
-    ("torch.optim", include_str!("lib/torch_optim.py")),
+    ("torch.amp", pysrc!("lib/torch_amp.py")),
+    ("torch.special", pysrc!("lib/torch_special.py")),
+    ("torch.optim", pysrc!("lib/torch_optim.py")),
     (
         "torch.optim.optimizer",
-        include_str!("lib/torch_optim_optimizer.py"),
+        pysrc!("lib/torch_optim_optimizer.py"),
     ),
     (
         "torch.optim.lr_scheduler",
-        include_str!("lib/torch_optim_lr_scheduler.py"),
+        pysrc!("lib/torch_optim_lr_scheduler.py"),
     ),
-    ("torch.utils", include_str!("lib/torch_utils.py")),
-    ("torch.utils.data", include_str!("lib/torch_utils_data.py")),
-    ("torch.autograd", include_str!("lib/torch_autograd.py")),
-    ("torch._utils", include_str!("lib/torch__utils.py")),
-    ("pickle", include_str!("lib/pickle.py")),
-    ("zipfile", include_str!("lib/zipfile.py")),
-    ("pathlib", include_str!("lib/pathlib.py")),
-    ("argparse", include_str!("lib/argparse.py")),
-    ("inspect", include_str!("lib/inspect.py")),
-    ("pytest", include_str!("lib/pytest.py")),
+    ("torch.utils", pysrc!("lib/torch_utils.py")),
+    ("torch.utils.data", pysrc!("lib/torch_utils_data.py")),
+    ("torch.autograd", pysrc!("lib/torch_autograd.py")),
+    ("torch._utils", pysrc!("lib/torch__utils.py")),
+    ("pickle", pysrc!("lib/pickle.py")),
+    ("zipfile", pysrc!("lib/zipfile.py")),
+    ("pathlib", pysrc!("lib/pathlib.py")),
+    ("argparse", pysrc!("lib/argparse.py")),
+    ("inspect", pysrc!("lib/inspect.py")),
+    ("pytest", pysrc!("lib/pytest.py")),
 ];
 
 /// A single-file program: the source is the `main` module.
