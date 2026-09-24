@@ -1358,6 +1358,9 @@ pub struct Vm<'p> {
     /// guard model; intentionally NOT a GC root (entries are validated or
     /// re-read against live, guard-checked objects before any use).
     site_ics: Vec<Option<Box<[Option<Box<ic::SiteIc>>]>>>,
+    /// The Python runtime's registry (`vm::py_rt`), once it bound itself.
+    #[cfg(feature = "python")]
+    py_rt: Option<Box<py_rt::PyRt>>,
     /// Bytes of `site_ics` storage drawn by runtime-installed (`eval` /
     /// `new Function`) functions, against `ic::DYNAMIC_IC_BUDGET_BYTES`.
     dynamic_ic_bytes: usize,
@@ -2964,8 +2967,14 @@ pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_c
 pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 pub(crate) mod prof;
 mod handler_pool;
+#[cfg(feature = "python")]
 mod py_attr;
+#[cfg(feature = "python")]
 mod py_ops;
+#[cfg(feature = "python")]
+pub(crate) mod prof_py;
+#[cfg(feature = "python")]
+mod py_rt;
 #[cfg(feature = "python")]
 mod py_gen;
 #[cfg(feature = "python")]

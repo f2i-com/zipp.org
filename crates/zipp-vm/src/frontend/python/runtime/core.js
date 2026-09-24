@@ -65,6 +65,12 @@ var __zipp_py = (function () {
         function (a, b, c, d, e) { return this.code([a, b, c, d, e]); },
         function (a, b, c, d, e, f) { return this.code([a, b, c, d, e, f]); },
     ];
+    // `ver` counts the changes to what the cache tables below (`ga`, ...,
+    // `gv`, the `c<n>` entries) may answer for the class: it grows whenever
+    // an entry leaves them (`clearFlags`, `forgetName`, `clearCtorEntries`),
+    // so the engine's per-site caches of those answers (`vm::py_rt`) check
+    // one number. A class record never loses a key (the engine reads `ver`
+    // at the literal's slot).
     function makeType(name, bases, dict, module) {
         // `code` makes a class callable through the same member-call path as
         // functions (`prepare` returns self = the class, code = constructCode).
@@ -72,7 +78,7 @@ var __zipp_py = (function () {
             bases: bases, mro: null, dict: dict || new Map(), id: nextId++, isType: true, code: constructCode, fast: typeFast,
             ga: Object.create(null), sa: Object.create(null), gm: Object.create(null), gb: Object.create(null),
             gp: Object.create(null), sp: Object.create(null), gx: Object.create(null),
-            userClass: false, flagged: false, gs: Object.create(null), gv: Object.create(null) };
+            userClass: false, flagged: false, gs: Object.create(null), gv: Object.create(null), ver: 0 };
         t.mro = computeMro(t);
         return t;
     }
@@ -415,7 +421,7 @@ var __zipp_py = (function () {
         t.ga = Object.create(null); t.sa = Object.create(null); t.gm = Object.create(null); t.gb = Object.create(null);
         t.gp = Object.create(null); t.sp = Object.create(null); t.gx = Object.create(null);
         t.gs = Object.create(null); t.gv = Object.create(null);
-        t.flagged = false;
+        t.flagged = false; t.ver++;
         if (t.ctorEntries !== undefined) clearCtorEntries(t);
     }
     rt.noteFlagged = noteFlagged;
@@ -426,6 +432,7 @@ var __zipp_py = (function () {
         flagged.length = 0;
     };
     function forgetName(t, name) {
+        t.ver++;
         if (t.flagged === true) {
             if (name === "__setattr__") clearFlags(t);
             else {
@@ -1188,6 +1195,7 @@ var __zipp_py = (function () {
         noteFlagged(cls);
     }
     function clearCtorEntries(cls) {
+        cls.ver++;
         const set = cls.ctorEntries;
         if (set === undefined || set === null) return;
         for (let i = 0; i < set.length; i++) cls["c" + set[i]] = undefined;

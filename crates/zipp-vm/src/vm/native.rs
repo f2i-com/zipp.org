@@ -395,6 +395,13 @@ pub const PY_IN_NAME: &str = "__zipp_py_in";
 pub const PY_SMFIND: u16 = 1961;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_SMFIND_NAME: &str = "__zipp_py_smfind";
+/// The Python runtime's registration with the engine (`vm::py_rt`): called
+/// once, with the runtime's helper object. Bound like [`PY_TENSOR`], only in
+/// a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_BIND: u16 = 1975;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_BIND_NAME: &str = "__zipp_py_bind";
 
 // ── decorator context closures (proposal-decorators) ────────────────────────
 // Each is a `HeapObj::NativeClosure`, not a bare `Native`: they close over the
@@ -1748,6 +1755,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PY_IN => ("", 2),
         #[cfg(feature = "python")]
         PY_SMFIND => ("", 3),
+        #[cfg(feature = "python")]
+        PY_BIND => ("", 3),
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),

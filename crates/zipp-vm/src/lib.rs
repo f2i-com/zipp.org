@@ -173,6 +173,14 @@ pub fn prof_stats() -> (Vec<(&'static str, u64, f64)>, u64) {
     vm::prof_stats()
 }
 
+/// `ZIPP_PY_PROF=1` Python-tier counters (fused-op hits and slow edges,
+/// interpreted calls by callee, allocations by kind), as report lines; empty
+/// unless the variable was set.
+#[cfg(feature = "python")]
+pub fn py_prof_report() -> String {
+    vm::prof_py::report()
+}
+
 /// `ZIPP_PROF_PC=1` instruction-pointer profile: `(emitted body, samples,
 /// percent)` sorted by samples, plus the total. Answers "which compiled body",
 /// which the phase profiler cannot -- see `vm::prof::pc`. Empty off Windows

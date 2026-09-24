@@ -1,5 +1,5 @@
 //! The Python frontend's fused fast paths (`Instr::PyArith`, `PyAddImm`,
-//! `PyCompare`, `PyJumpCompare`).
+//! `PyCompare`, `PyJumpCompare`, and the later rounds' `Py*`).
 //!
 //! Python's value model maps int to BigInt, float to Number, str to string
 //! and bool to boolean. For the operand pairs handled here Python's result is
@@ -8,8 +8,12 @@
 //! `None`, and the instruction then jumps to the emitter's slow path, which
 //! asks the Python runtime. Nothing here coerces, calls out or observes
 //! anything but the two primitive operands.
+//!
+//! The runtime's records and type objects are recognised through the VM's
+//! registry of the runtime (`vm::py_rt`): the records' shapes, the class
+//! record's field slots, and per-site caches.
 
-#![allow(unused_imports)]
+use super::py_rt::{ic, PyIc, EXC_KEYS};
 use super::*;
 use crate::bytecode::{PyArithOp, PyCmpOp};
 use crate::heap::HeapObj;
@@ -19,84 +23,8 @@ use crate::vm::helpers_misc::BigOp;
 /// Magnitudes of ints that convert to a float exactly (for comparisons).
 const EXACT_F64: i128 = 1 << 53;
 
-use std::sync::atomic::{AtomicU16, Ordering};
-
-/// The keys of the record `makeExc` builds, in its literal's order.
-const EXC_KEYS: [&str; 7] = ["cls", "dict", "args", "cause", "context", "tbline", "suppress"];
-/// The keys of a list or tuple record (`sequence`'s literal).
-#[cfg_attr(not(feature = "python"), allow(dead_code))]
-const SEQ_KEYS: [&str; 2] = ["cls", "items"];
-/// [`Vm::py_alloc_like`]'s cache slots.
-#[cfg_attr(not(feature = "python"), allow(dead_code))]
-const TMPL_EXC: usize = 0;
-#[cfg_attr(not(feature = "python"), allow(dead_code))]
-const TMPL_SEQ: usize = 1;
-#[cfg_attr(not(feature = "python"), allow(dead_code))]
-pub(super) const TMPL_INST: usize = 2;
-
-thread_local! {
-    /// The shape of an exception record found to have exactly [`EXC_KEYS`],
-    /// all data properties (`shape::DICT`, which never matches, until one is
-    /// seen). Shapes are this thread's (`shape::TABLE`), hence thread-local.
-    static EXC_SHAPE: std::cell::Cell<u32> = const { std::cell::Cell::new(crate::shape::DICT) };
-    /// [`Vm::py_alloc_like`]'s templates' shapes found plain, by kind
-    /// ([`TMPL_EXC`], [`TMPL_SEQ`], [`TMPL_INST`]).
-    static TMPL_SHAPES: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([crate::shape::DICT; 3]) };
-    /// [`Vm::py_map_get_at`]'s per-site entry positions (hints only: every
-    /// use re-checks the key at the position, so an entry left by another
-    /// program or VM on this thread is merely a miss).
-    static PY_GLOBAL_SITES: std::cell::RefCell<rustc_hash::FxHashMap<u64, u32>> =
-        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-}
-
-/// Whether two flat heap strings hold the same text (anything else: false).
-fn py_str_eq(heap: &crate::heap::Heap, a: Value, b: Value) -> bool {
-    if !a.is_heap() || !b.is_heap() {
-        return false;
-    }
-    match (heap.get(a.heap_index()), heap.get(b.heap_index())) {
-        (HeapObj::Str(x), HeapObj::Str(y)) => x.as_bytes() == y.as_bytes(),
-        _ => false,
-    }
-}
-/// Slot hints for the runtime records' fields the attribute instructions
-/// read (see `Vm::py_hinted_prop`): a class's `ga` / `sa` tables and an
-/// instance's `dict`. Only hints: every use re-checks the key at the slot.
-static HINT_DICT: AtomicU16 = AtomicU16::new(1);
-static HINT_ISTYPE: AtomicU16 = AtomicU16::new(8);
-static HINT_MRO: AtomicU16 = AtomicU16::new(5);
-static HINT_ISTYPES: AtomicU16 = AtomicU16::new(0);
-static HINT_TSTR: AtomicU16 = AtomicU16::new(0);
-static HINT_GM: AtomicU16 = AtomicU16::new(13);
-static HINT_GB: AtomicU16 = AtomicU16::new(14);
-static HINT_TMODULE: AtomicU16 = AtomicU16::new(0);
-static HINT_GLOBALS: AtomicU16 = AtomicU16::new(3);
-static HINT_TLIST: AtomicU16 = AtomicU16::new(0);
-static HINT_TTUPLE: AtomicU16 = AtomicU16::new(0);
-static HINT_TDICT: AtomicU16 = AtomicU16::new(0);
-static HINT_TSET: AtomicU16 = AtomicU16::new(0);
-static HINT_ITEMS: AtomicU16 = AtomicU16::new(1);
-static HINT_SIZE: AtomicU16 = AtomicU16::new(2);
-#[cfg_attr(not(feature = "python"), allow(dead_code))]
-#[cfg(feature = "python")]
-static HINT_SEQTMPL: AtomicU16 = AtomicU16::new(0);
-static HINT_EBASE: AtomicU16 = AtomicU16::new(0);
-static HINT_EXCSTACK: AtomicU16 = AtomicU16::new(0);
-#[cfg_attr(not(feature = "python"), allow(dead_code))]
-static HINT_EXCTMPL: AtomicU16 = AtomicU16::new(0);
-static HINT_GV: AtomicU16 = AtomicU16::new(21);
-static HINT_DCLS: AtomicU16 = AtomicU16::new(0);
-static HINT_DMAP: AtomicU16 = AtomicU16::new(1);
-static HINT_DSTR: AtomicU16 = AtomicU16::new(3);
-/// A class's property getter (`gp`) and setter (`sp`) caches.
-static PY_FN_TABLES: [(AtomicU16, &str); 2] = [(AtomicU16::new(15), "gp"), (AtomicU16::new(16), "sp")];
-const HINT_GA: usize = 0;
-const HINT_SA: usize = 1;
-static PY_ATTR_TABLES: [(AtomicU16, &str); 2] = [(AtomicU16::new(11), "ga"), (AtomicU16::new(12), "sa")];
-
 /// A value as `__zipp_py_ord` orders it (Python's `<` and `==` on these are
 /// side-effect free and total except for NaN).
-#[cfg(feature = "python")]
 enum OrdKey {
     Int(super::bigint::BigVal),
     Float(f64),
@@ -109,11 +37,9 @@ enum OrdKey {
 }
 
 /// An [`OrdKey`] for another module.
-#[cfg(feature = "python")]
 pub(super) struct OrdKeyBox(OrdKey);
 
 /// Instruction steps charged per key and per comparison of a native sort.
-#[cfg(feature = "python")]
 const ORD_STEPS_PER_UNIT: u64 = 8;
 
 /// One operand, classified.
@@ -134,12 +60,21 @@ impl<'p> Vm<'p> {
     /// interpreter's) stays as it was around this one arm.
     #[inline(never)]
     pub(crate) fn py_step(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
+        let r = self.py_step_run(func_id, base, ip, instr);
+        if super::prof_py::on() {
+            self.py_prof_step(func_id, ip, instr, &r);
+        }
+        r
+    }
+
+    #[inline(always)]
+    fn py_step_run(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
         use crate::bytecode::Instr;
         Ok(match *instr {
             Instr::PyClassOf { dst, obj, slow } => {
                 let o = self.get(base, obj);
-                match self.py_record_prop(func_id, ip, o, "cls") {
-                    Some(c) if c.is_heap() && self.py_is_plain_object(c) => {
+                match self.py_cls_of(o) {
+                    Some(c) if self.py_plain_rec(c) => {
                         self.set(base, dst, c);
                         ip + 1
                     }
@@ -148,7 +83,7 @@ impl<'p> Vm<'p> {
             }
             Instr::PyDictGet { dst, obj, key, absent, slow } => {
                 let o = self.get(base, obj);
-                let Some(map) = self.py_record_map(func_id, ip, o) else {
+                let Some(map) = self.py_inst_map(o) else {
                     return Ok(slow as usize);
                 };
                 let k = self.resolve_const_slot(func_id, key);
@@ -164,15 +99,12 @@ impl<'p> Vm<'p> {
             }
             Instr::PyCallEntry { dst, f, name, slow } => {
                 let fv = self.get(base, f);
-                let func = self.func(func_id as usize);
-                let key: &str = func.string_constants[name as usize].as_str();
-                // `func` borrows the program, not the VM (see `Vm::func`).
-                match self.py_record_prop(func_id, ip, fv, key) {
-                    Some(e) if self.type_of(e) == "function" => {
+                match self.py_call_entry(func_id, ip, fv, name) {
+                    Some(e) => {
                         self.set(base, dst, e);
                         ip + 1
                     }
-                    _ => slow as usize,
+                    None => slow as usize,
                 }
             }
             Instr::PyGetItem { dst, o, k, seq, dict, slow } => {
@@ -197,7 +129,7 @@ impl<'p> Vm<'p> {
             }
             Instr::PyDictSet { obj, key, val, slow } => {
                 let o = self.get(base, obj);
-                let Some(map) = self.py_record_map(func_id, ip, o) else {
+                let Some(map) = self.py_inst_map(o) else {
                     return Ok(slow as usize);
                 };
                 let k = self.resolve_const_slot(func_id, key);
@@ -261,24 +193,24 @@ impl<'p> Vm<'p> {
     /// their own so the round-1 arms' code is exactly as it was.
     #[inline(never)]
     pub(crate) fn py_step_ext(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
+        let r = self.py_step_ext_run(func_id, base, ip, instr);
+        if super::prof_py::on() {
+            self.py_prof_step(func_id, ip, instr, &r);
+        }
+        r
+    }
+
+    #[inline(always)]
+    fn py_step_ext_run(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
         use crate::bytecode::Instr;
         Ok(match *instr {
             Instr::PyGlobal { dst, globals, rt, key, slow } => {
-                let k = self.resolve_const_slot(func_id, key);
-                let g = self.get(base, globals);
-                if let Some(v) = self.py_map_get_at(g, k, func_id, ip, false) {
-                    self.set(base, dst, v);
-                    return Ok(ip + 1);
-                }
-                let r = self.get(base, rt);
-                match self.py_record_prop(func_id, ip, r, "BUILTINS") {
-                    Some(b) => match self.py_map_get_at(b, k, func_id, ip, true) {
-                        Some(v) => {
-                            self.set(base, dst, v);
-                            ip + 1
-                        }
-                        None => slow as usize,
-                    },
+                let (g, r) = (self.get(base, globals), self.get(base, rt));
+                match self.py_global(func_id, ip, g, r, key) {
+                    Some(v) => {
+                        self.set(base, dst, v);
+                        ip + 1
+                    }
                     None => slow as usize,
                 }
             }
@@ -305,18 +237,8 @@ impl<'p> Vm<'p> {
             }
             Instr::PyGetAttr { dst, obj, key, slow } => {
                 let o = self.get(base, obj);
-                // This site's hinted positions first (`vm::py_attr`).
-                if let Some(v) = self.py_attr_get_fast(func_id, ip, o, key) {
-                    self.set(base, dst, v);
-                    return Ok(ip + 1);
-                }
-                let Some((map, slot)) = self.py_attr_plain_at(func_id, ip, o, key, HINT_GA) else {
-                    return Ok(slow as usize);
-                };
-                let k = self.resolve_const_slot(func_id, key);
-                match self.py_map_find(Value::heap(map), k) {
-                    Some((pos, v)) => {
-                        self.py_attr_note(func_id, ip, slot, Some(pos));
+                match self.py_attr_get(func_id, ip, o, key) {
+                    Some(v) => {
                         self.set(base, dst, v);
                         ip + 1
                     }
@@ -326,21 +248,11 @@ impl<'p> Vm<'p> {
             Instr::PySetAttr { obj, key, val, slow } => {
                 let o = self.get(base, obj);
                 let v = self.get(base, val);
-                if self.py_attr_set_fast(func_id, ip, o, key, v) {
-                    return Ok(ip + 1);
+                if self.py_attr_set(func_id, ip, o, key, v)? {
+                    ip + 1
+                } else {
+                    slow as usize
                 }
-                let Some((map, slot)) = self.py_attr_plain_at(func_id, ip, o, key, HINT_SA) else {
-                    return Ok(slow as usize);
-                };
-                let k = self.resolve_const_slot(func_id, key);
-                self.map_method(map, "set", &[k, v])?;
-                // Where the entry is now (replaced in place, or appended).
-                let pos = match self.heap.get(map) {
-                    HeapObj::Map { keys, .. } if keys.last().is_some_and(|l| l.bits() == k.bits()) => Some(keys.len() - 1),
-                    _ => self.py_map_find(Value::heap(map), k).map(|(p, _)| p),
-                };
-                self.py_attr_note(func_id, ip, slot, pos);
-                ip + 1
             }
             Instr::PyIsInstance { dst, v, t, rt, slow } => {
                 let (vv, tv, rv) = (self.get(base, v), self.get(base, t), self.get(base, rt));
@@ -352,7 +264,6 @@ impl<'p> Vm<'p> {
                     None => slow as usize,
                 }
             }
-            #[cfg(feature = "python")]
             Instr::PyGenNext { dst, next, this, slow } => {
                 let nv = self.get(base, next);
                 let native = nv.is_heap()
@@ -377,7 +288,7 @@ impl<'p> Vm<'p> {
             }
             Instr::PyModGet { dst, obj, rt, key, slow } => {
                 let (o, r) = (self.get(base, obj), self.get(base, rt));
-                match self.py_mod_get(func_id, ip, o, r, key) {
+                match self.py_mod_get(func_id, o, r, key) {
                     Some(v) => {
                         self.set(base, dst, v);
                         ip + 1
@@ -387,7 +298,7 @@ impl<'p> Vm<'p> {
             }
             Instr::PyLen { dst, v, rt, slow } => {
                 let (vv, rv) = (self.get(base, v), self.get(base, rt));
-                match self.py_len(func_id, ip, vv, rv) {
+                match self.py_len(vv, rv) {
                     Some(n) => {
                         let r = self.make_bigint(n as i128);
                         self.set(base, dst, r);
@@ -406,7 +317,6 @@ impl<'p> Vm<'p> {
                     None => slow as usize,
                 }
             }
-            #[cfg(feature = "python")]
             Instr::PySeq { dst, items, rt, tuple, slow } => {
                 let (iv, rv) = (self.get(base, items), self.get(base, rt));
                 match self.py_seq(iv, rv, tuple) {
@@ -505,10 +415,18 @@ impl<'p> Vm<'p> {
     /// [`Vm::py_step`] for the round-3 fused instructions, in a function of
     /// their own so the earlier rounds' arms' code is exactly as it was.
     #[inline(never)]
-    pub(crate) fn py_step_ext2(&mut self, _func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
+    pub(crate) fn py_step_ext2(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
+        let r = self.py_step_ext2_run(func_id, base, ip, instr);
+        if super::prof_py::on() {
+            self.py_prof_step(func_id, ip, instr, &r);
+        }
+        r
+    }
+
+    #[inline(always)]
+    fn py_step_ext2_run(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
         use crate::bytecode::Instr;
         Ok(match *instr {
-            #[cfg(feature = "python")]
             Instr::PyMakeExc { dst, cls, args, rt, slow } => {
                 let (c, a, r) = (self.get(base, cls), self.get(base, args), self.get(base, rt));
                 match self.py_make_exc(c, a, r) {
@@ -519,10 +437,9 @@ impl<'p> Vm<'p> {
                     None => slow as usize,
                 }
             }
-            #[cfg(feature = "python")]
             Instr::PyNew { dst, entry, this_f, cls, rt, n, slow } => {
                 let (c, r) = (self.get(base, cls), self.get(base, rt));
-                match self.py_new(_func_id, ip, c, r, n as usize) {
+                match self.py_new(func_id, ip, c, r, n as usize) {
                     Some((obj, e, t)) => {
                         self.set(base, dst, obj);
                         self.set(base, entry, e);
@@ -544,13 +461,160 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// [`Instr::PyCallEntry`]: the function record `f`'s own data entry
+    /// `name` (`c<n>`) when it is callable. This site's entry names the
+    /// record and its heap version (so its keys are as they were) and the
+    /// entry's slot; the value there is read afresh.
+    #[inline(never)]
+    fn py_call_entry(&mut self, func_id: u32, ip: usize, f: Value, name: u32) -> Option<Value> {
+        if !f.is_heap() {
+            return None;
+        }
+        let fi = f.heap_index();
+        let e = self.py_ic(func_id, ip);
+        if e.kind == ic::CALL_ENTRY && e.a == f.bits() && self.heap.version_of(fi) == e.hver {
+            if let HeapObj::Object(m) = self.heap.get(fi) {
+                let pos = e.pos as usize;
+                if pos < m.len() && !m.is_accessor_at(pos) {
+                    let v = m.val_at(pos);
+                    if self.py_callable_fn(v) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        let key: &str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        // `func` borrows the program, not the VM (see `Vm::func`).
+        let (v, slot) = match self.heap.get(fi) {
+            HeapObj::Object(m) if !m.is_ctor => {
+                let s = m.pos(key)?;
+                if m.is_accessor_at(s) {
+                    return None;
+                }
+                (m.val_at(s), s)
+            }
+            _ => return None,
+        };
+        if !self.py_callable_fn(v) {
+            return None;
+        }
+        if let Ok(pos) = u32::try_from(slot) {
+            let hver = self.heap.version_of(fi);
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::CALL_ENTRY, pos, hver, a: f.bits(), b: 0, c: 0, d: 0 });
+        }
+        Some(v)
+    }
+
+    /// Whether `e` is callable (`typeof e === "function"`).
+    #[inline]
+    pub(super) fn py_callable_fn(&self, e: Value) -> bool {
+        if !e.is_heap() {
+            return false;
+        }
+        match self.heap.get(e.heap_index()) {
+            HeapObj::Closure { .. } | HeapObj::Func(_) | HeapObj::Bound { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => true,
+            HeapObj::Object(m) if !m.is_ctor => false,
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Array(_) | HeapObj::Map { .. } | HeapObj::BigInt(_) => false,
+            _ => self.type_of(e) == "function",
+        }
+    }
+
+    /// [`Instr::PyGlobal`]: a module global, else a builtin; `None` for the
+    /// slow edge (see `vm::py_rt` for the site cache's entries).
+    #[inline(never)]
+    fn py_global(&mut self, func_id: u32, ip: usize, g: Value, r: Value, key: u32) -> Option<Value> {
+        if !g.is_heap() {
+            return None;
+        }
+        let gi = g.heap_index();
+        let e = self.py_ic(func_id, ip);
+        if e.a == g.bits() && self.heap.version_of(gi) == e.hver {
+            if e.kind == ic::GLOBAL {
+                if let Some(v) = self.py_map_at_bits(g, e.pos, e.b) {
+                    return Some(v);
+                }
+            } else if e.kind == ic::BUILTIN {
+                // No key appended to the globals since the name was found
+                // missing there: still missing.
+                let absent = matches!(self.heap.get(gi), HeapObj::Map { keys, .. } if keys.len() as u64 == e.c);
+                if absent {
+                    if let Some(b) = self.py_rt_for(r).map(|p| p.builtins) {
+                        if let Some(v) = self.py_map_at_bits(b, e.pos, e.b) {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
+        }
+        if !matches!(self.heap.get(gi), HeapObj::Map { .. }) {
+            return None;
+        }
+        let k = self.resolve_const_slot(func_id, key);
+        // Module globals are asked for every builtin name they lack: through
+        // the Map's hash index, not a scan of every global.
+        self.coll_index_early(gi);
+        let hver = self.heap.version_of(gi);
+        match self.coll_find(gi, k) {
+            Some(i) => {
+                let (v, kb) = match self.heap.get(gi) {
+                    HeapObj::Map { keys, vals } => (*vals.get(i)?, keys.get(i)?.bits()),
+                    _ => return None,
+                };
+                if v.is_undefined() {
+                    return None;
+                }
+                if let Ok(pos) = u32::try_from(i) {
+                    self.py_ic_put(func_id, ip, PyIc { kind: ic::GLOBAL, pos, hver, a: g.bits(), b: kb, c: 0, d: 0 });
+                }
+                Some(v)
+            }
+            None => {
+                let glen = match self.heap.get(gi) {
+                    HeapObj::Map { keys, .. } => keys.len() as u64,
+                    _ => return None,
+                };
+                let b = self.py_rt_for(r)?.builtins;
+                if !b.is_heap() || !matches!(self.heap.get(b.heap_index()), HeapObj::Map { .. }) {
+                    return None;
+                }
+                let bi = b.heap_index();
+                let i = self.coll_find(bi, k)?;
+                let (v, kb) = match self.heap.get(bi) {
+                    HeapObj::Map { keys, vals } => (*vals.get(i)?, keys.get(i)?.bits()),
+                    _ => return None,
+                };
+                if v.is_undefined() {
+                    return None;
+                }
+                if let Ok(pos) = u32::try_from(i) {
+                    self.py_ic_put(func_id, ip, PyIc { kind: ic::BUILTIN, pos, hver, a: g.bits(), b: kb, c: glen, d: 0 });
+                }
+                Some(v)
+            }
+        }
+    }
+
+    /// The value of the `Map` `m`'s entry at `pos` when its key there has
+    /// the bits `key` (and its value is not `undefined`).
+    #[inline]
+    fn py_map_at_bits(&self, m: Value, pos: u32, key: u64) -> Option<Value> {
+        if !m.is_heap() {
+            return None;
+        }
+        let HeapObj::Map { keys, vals } = self.heap.get(m.heap_index()) else {
+            return None;
+        };
+        let pos = pos as usize;
+        match (keys.get(pos), vals.get(pos)) {
+            (Some(k), Some(&v)) if k.bits() == key && !v.is_undefined() => Some(v),
+            _ => None,
+        }
+    }
+
     /// [`Instr::PyExcPop`]: `Some` when it popped (see the instruction).
     #[inline(never)]
     fn py_exc_pop(&mut self, rt: Value) -> Option<()> {
-        if !rt.is_heap() {
-            return None;
-        }
-        let stack = self.py_hinted_prop(rt.heap_index(), &HINT_EXCSTACK, "EXCSTACK")?;
+        let stack = self.py_rt_for(rt)?.excstack;
         if !stack.is_heap() {
             return None;
         }
@@ -578,86 +642,56 @@ impl<'p> Vm<'p> {
         Some(())
     }
 
+    /// Whether [`Vm::py_alloc_like`] can copy `tmpl`'s literal plan: an
+    /// ordinary extensible object of the (guardable) shape `shape` whose keys
+    /// are still its literal's plan.
+    pub(super) fn py_alloc_like_ok(&self, tmpl: Value, shape: u32) -> bool {
+        if !tmpl.is_heap() || shape == crate::shape::DICT {
+            return false;
+        }
+        let HeapObj::Object(m) = self.heap.get(tmpl.heap_index()) else {
+            return false;
+        };
+        if m.is_ctor || !m.extensible || m.sealed || m.frozen || m.is_raw_json || m.class.is_some() || m.shape() != shape {
+            return false;
+        }
+        let crate::heap::PropKeys::Planned { all, visible_len } = &m.keys else {
+            return false;
+        };
+        *visible_len == m.len() && all.len() == m.len() && (1..=crate::bytecode::FINALIZE_STAGE_SLOTS).contains(&m.len())
+    }
+
     /// A new plain record laid out like the literal-born record `tmpl`
-    /// (the one its own literal made: its static key plan and its shape),
-    /// holding `vals`, allocated as that literal allocates one. `tmpl` must
-    /// be an ordinary extensible object whose own properties are exactly
-    /// `keys`, in order, all plain data properties; `kind` names the cache
-    /// slot remembering a shape found so (shapes are this thread's).
-    #[cfg(feature = "python")]
+    /// (which [`Vm::py_alloc_like_ok`] accepts for `shape`: its static key
+    /// plan and its shape, whose keys are all plain data properties, as
+    /// `vm::py_rt` checked of the template), holding `vals`, allocated as
+    /// that literal allocates one.
     #[inline(never)]
-    pub(super) fn py_alloc_like(&mut self, tmpl: Value, keys: &[&str], kind: usize, vals: &[Value]) -> Option<Value> {
-        if vals.len() != keys.len() {
-            return None;
-        }
-        if self.py_alloc_like_ok(tmpl, keys, kind) {
-            let HeapObj::Object(m) = self.heap.get(tmpl.heap_index()) else {
-                return None;
-            };
-            let crate::heap::PropKeys::Planned { all, .. } = &m.keys else {
-                return None;
-            };
-            let (plan, shape) = (all.clone(), m.shape());
-            let idx = self.heap.alloc_finalized(&plan, vals, shape);
-            self.realm_born(idx, self.obj_proto);
-            return Some(Value::heap(idx));
-        }
-        // A template its literal did not plan: a copy of it.
-        let (mut rec, _) = self.py_json_template(tmpl, keys)?;
-        for (i, &v) in vals.iter().enumerate() {
-            rec.set_val_at(i, v);
-        }
-        Some(self.alloc_object_current_realm(rec))
-    }
-
-    /// Whether [`Vm::py_alloc_like`] takes `tmpl` as a template for `keys`.
-    #[cfg(feature = "python")]
-    pub(super) fn py_alloc_like_ok(&self, tmpl: Value, keys: &[&str], kind: usize) -> bool {
-        self.py_alloc_like_check(tmpl, keys, kind).is_some()
-    }
-
-    #[cfg(feature = "python")]
-    fn py_alloc_like_check(&self, tmpl: Value, keys: &[&str], kind: usize) -> Option<()> {
-        if !tmpl.is_heap() || !(1..=crate::bytecode::FINALIZE_STAGE_SLOTS).contains(&keys.len()) {
+    pub(super) fn py_alloc_like(&mut self, tmpl: Value, shape: u32, vals: &[Value]) -> Option<Value> {
+        if !self.py_alloc_like_ok(tmpl, shape) {
             return None;
         }
         let HeapObj::Object(m) = self.heap.get(tmpl.heap_index()) else {
             return None;
         };
-        if m.is_ctor || !m.extensible || m.sealed || m.frozen || m.is_raw_json || m.class.is_some() || !m.shape_guardable() {
+        if m.len() != vals.len() {
             return None;
         }
-        let crate::heap::PropKeys::Planned { all, visible_len } = &m.keys else {
+        let crate::heap::PropKeys::Planned { all, .. } = &m.keys else {
             return None;
         };
-        if *visible_len != keys.len() || all.len() != keys.len() || m.len() != keys.len() {
-            return None;
-        }
-        let shape = m.shape();
-        if TMPL_SHAPES.with(|c| c.get()[kind]) != shape {
-            let plain = keys.iter().enumerate().all(|(i, k)| {
-                let a = m.attr_at(i);
-                m.key_at(i) == *k && a.writable && a.enumerable && a.configurable && !a.accessor
-            });
-            if !plain {
-                return None;
-            }
-            TMPL_SHAPES.with(|c| {
-                let mut s = c.get();
-                s[kind] = shape;
-                c.set(s);
-            });
-        }
-        Some(())
+        let plan = all.clone();
+        let idx = self.heap.alloc_finalized(&plan, vals, shape);
+        self.realm_born(idx, self.obj_proto);
+        Some(Value::heap(idx))
     }
 
     /// The runtime's `makeExc(cls, args)` for [`Instr::PyMakeExc`] and the
     /// native `__zipp_py_exc`: the record its literal builds (see the
     /// instruction), or `None` when an input is not of the expected shape.
-    #[cfg(feature = "python")]
     #[inline(never)]
     pub(crate) fn py_make_exc(&mut self, cls: Value, args: Value, rt: Value) -> Option<Value> {
-        if !self.py_plain(cls) || !args.is_heap() || !rt.is_heap() {
+        if !self.py_plain_rec(cls) || !args.is_heap() {
             return None;
         }
         // `sequence`'s limit reads `items.length`: a dense Array's own.
@@ -668,11 +702,8 @@ impl<'p> Vm<'p> {
         if self.array_js_len.contains_key(&args.heap_index()) {
             return None;
         }
-        let r = rt.heap_index();
-        let tmpl = self.py_hinted_prop(r, &HINT_EXCTMPL, "EXCTMPL")?;
-        let seq_tmpl = self.py_hinted_prop(r, &HINT_SEQTMPL, "SEQTMPL")?;
-        let ttuple = self.py_hinted_prop(r, &HINT_TTUPLE, "TTUPLE")?;
-        let stack = self.py_hinted_prop(r, &HINT_EXCSTACK, "EXCSTACK")?;
+        let p = self.py_rt_for(rt)?;
+        let (tmpl, exc_shape, seq_tmpl, seq_shape, ttuple, stack) = (p.exc_tmpl, p.exc_shape, p.seq_tmpl, p.seq_shape, p.t_tuple, p.excstack);
         if !stack.is_heap() || self.array_js_len.contains_key(&stack.heap_index()) {
             return None;
         }
@@ -686,33 +717,24 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         // Both templates are checked before anything is allocated.
-        let usable = |vm: &Self, t: Value, keys: &[&str], kind: usize| {
-            vm.py_alloc_like_ok(t, keys, kind) || vm.py_json_template(t, keys).is_some()
-        };
-        if !usable(self, tmpl, &EXC_KEYS, TMPL_EXC) || !usable(self, seq_tmpl, &SEQ_KEYS, TMPL_SEQ) {
+        if !self.py_alloc_like_ok(tmpl, exc_shape) || !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
             return None;
         }
-        let tuple = self.py_alloc_like(seq_tmpl, &SEQ_KEYS, TMPL_SEQ, &[ttuple, args])?;
+        let tuple = self.py_alloc_like(seq_tmpl, seq_shape, &[ttuple, args])?;
         let map = self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
         self.adopt_native_result_realm(map, self.map_proto);
         let vals = [cls, Value::heap(map), tuple, Value::NULL, context, Value::int(-1), Value::FALSE];
-        self.py_alloc_like(tmpl, &EXC_KEYS, TMPL_EXC, &vals)
+        self.py_alloc_like(tmpl, exc_shape, &vals)
     }
 
     /// The Array for [`Instr::PyUnpack`].
     fn py_unpack(&self, v: Value, rt: Value, n: u32) -> Option<Value> {
-        if !v.is_heap() || !rt.is_heap() {
+        let p = self.py_rt_for(rt)?;
+        let (tl, tt) = (p.t_list.bits(), p.t_tuple.bits());
+        let (cls, items) = self.py_seq_parts(v)?;
+        if cls.bits() != tt && cls.bits() != tl {
             return None;
         }
-        let vi = v.heap_index();
-        let cls = self.py_hinted_prop(vi, &HINT_DCLS, "cls")?;
-        let r = rt.heap_index();
-        let seq = self.py_hinted_prop(r, &HINT_TTUPLE, "TTUPLE")?.bits() == cls.bits()
-            || self.py_hinted_prop(r, &HINT_TLIST, "TLIST")?.bits() == cls.bits();
-        if !seq {
-            return None;
-        }
-        let items = self.py_hinted_prop(vi, &HINT_ITEMS, "items")?;
         if !items.is_heap() {
             return None;
         }
@@ -725,16 +747,16 @@ impl<'p> Vm<'p> {
     /// [`Instr::PyDictLookup`]: `Some(Some(value))`, `Some(None)` for no
     /// entry, `None` for the slow edge.
     fn py_dict_lookup(&mut self, d: Value, k: Value, rt: Value) -> Option<Option<Value>> {
-        if !d.is_heap() || !rt.is_heap() || !k.is_heap() {
+        if !d.is_heap() || !k.is_heap() {
             return None;
         }
-        let tdict = self.py_hinted_prop(rt.heap_index(), &HINT_TDICT, "TDICT")?;
+        let tdict = self.py_rt_for(rt)?.t_dict;
+        if self.py_cls_of(d)?.bits() != tdict.bits() {
+            return None;
+        }
         let di = d.heap_index();
-        if self.py_hinted_prop(di, &HINT_DCLS, "cls")?.bits() != tdict.bits() {
-            return None;
-        }
-        let map = self.py_hinted_prop(di, &HINT_DMAP, "map")?;
-        let str_mode = self.py_hinted_prop(di, &HINT_DSTR, "str")?;
+        let (_, map) = self.py_dict_field(di, 0)?;
+        let (_, str_mode) = self.py_dict_field(di, 2)?;
         if !map.is_heap() || !matches!(self.heap.get(map.heap_index()), HeapObj::Map { .. }) {
             return None;
         }
@@ -782,46 +804,26 @@ impl<'p> Vm<'p> {
         (value != Value::HOLE).then_some(Some(value))
     }
 
-    /// The value for [`Instr::PyClassAttr`].
-    fn py_class_attr(&mut self, func_id: u32, ip: usize, o: Value, key: u32) -> Option<Value> {
-        let map = self.py_attr_plain(func_id, ip, o, key, HINT_GA)?;
-        let k = self.resolve_const_slot(func_id, key);
-        if self.py_map_get(Value::heap(map), k).is_some() {
-            return None;
-        }
-        let cls = self.py_record_prop(func_id, ip, o, "cls")?;
-        let gv = self.py_hinted_prop(cls.heap_index(), &HINT_GV, "gv")?;
-        if !self.py_plain(gv) {
-            return None;
-        }
-        let func = self.func(func_id as usize);
-        let raw = func.constants[key as usize];
-        let name: &str = func.string_constants
-            [(raw.heap_index() & !crate::vm::helpers_misc::STRING_CONST_BIT) as usize]
-            .as_str();
-        let v = self.py_json_like_own(gv.heap_index(), name)?;
-        (!v.is_undefined() && v != Value::HOLE).then_some(v)
-    }
-
     /// For [`Instr::PyRaise`] / [`Instr::PyCaught`]: whether `e` is an
     /// exception record (own data `cls` a plain object whose own data `mro`
     /// Array holds `rt.EBASE`; for a raise, no own `isType` of `true`), and
     /// the slots of its own data `context` (a raise only) and `tbline`.
     fn py_exc_record(&self, e: Value, rt: Value, raise: bool) -> Option<(usize, usize)> {
-        if !e.is_heap() || !rt.is_heap() {
+        if !e.is_heap() {
             return None;
         }
-        let ebase = self.py_hinted_prop(rt.heap_index(), &HINT_EBASE, "EBASE")?;
+        let p = self.py_rt_for(rt)?;
+        let (ebase, exc_shape, ty) = (p.ebase, p.exc_shape, p.ty?);
         let HeapObj::Object(m) = self.heap.get(e.heap_index()) else {
             return None;
         };
         if m.is_ctor {
             return None;
         }
-        // A record with the layout `makeExc` builds (its shape, once one such
-        // record was checked key by key below): the slots are known.
+        // A record with the layout `makeExc` builds (its shape): the slots
+        // are known.
         let shape = m.shape();
-        let (cls, ctx_slot, tb_slot) = if shape != crate::shape::DICT && shape == EXC_SHAPE.with(|c| c.get()) {
+        let (cls, ctx_slot, tb_slot) = if shape != crate::shape::DICT && shape == exc_shape {
             (m.val_at(0), 4, 5)
         } else {
             let own = |key: &str| m.pos(key).filter(|&s| !m.attr_at(s).accessor);
@@ -831,18 +833,13 @@ impl<'p> Vm<'p> {
             let cls = m.val_at(own("cls")?);
             let tb_slot = own("tbline")?;
             let ctx_slot = if raise { own("context")? } else { 0 };
-            if m.shape_guardable()
-                && m.len() == EXC_KEYS.len()
-                && EXC_KEYS.iter().enumerate().all(|(i, k)| m.key_at(i) == *k && !m.attr_at(i).accessor)
-            {
-                EXC_SHAPE.with(|c| c.set(shape));
-            }
             (cls, ctx_slot, tb_slot)
         };
-        if !cls.is_heap() || !self.py_is_plain_object(cls) {
+        debug_assert!(EXC_KEYS[4] == "context" && EXC_KEYS[5] == "tbline");
+        if !self.py_plain_rec(cls) {
             return None;
         }
-        let mro = self.py_hinted_prop(cls.heap_index(), &HINT_MRO, "mro")?;
+        let mro = self.py_ty_field(cls.heap_index(), ty.mro, "mro")?;
         if !mro.is_heap() {
             return None;
         }
@@ -856,7 +853,7 @@ impl<'p> Vm<'p> {
     /// (`None` when `rt.EXCSTACK` is empty).
     fn py_raise_plan(&self, e: Value, rt: Value) -> Option<(usize, usize, Option<Value>)> {
         let (ctx, tb) = self.py_exc_record(e, rt, true)?;
-        let stack = self.py_hinted_prop(rt.heap_index(), &HINT_EXCSTACK, "EXCSTACK")?;
+        let stack = self.py_rt_for(rt)?.excstack;
         if !stack.is_heap() {
             return None;
         }
@@ -867,38 +864,33 @@ impl<'p> Vm<'p> {
     }
 
     /// The record for [`Instr::PySeq`].
-    #[cfg(feature = "python")]
     fn py_seq(&mut self, items: Value, rt: Value, tuple: bool) -> Option<Value> {
-        if !items.is_heap() || !rt.is_heap() {
+        if !items.is_heap() {
             return None;
         }
         match self.heap.get(items.heap_index()) {
             HeapObj::Array(a) if a.len() <= (1 << 24) => {}
             _ => return None,
         }
-        let r = rt.heap_index();
-        let cls = if tuple {
-            self.py_hinted_prop(r, &HINT_TTUPLE, "TTUPLE")?
-        } else {
-            self.py_hinted_prop(r, &HINT_TLIST, "TLIST")?
-        };
-        let tmpl = self.py_hinted_prop(r, &HINT_SEQTMPL, "SEQTMPL")?;
-        self.py_alloc_like(tmpl, &SEQ_KEYS, TMPL_SEQ, &[cls, items])
+        let p = self.py_rt_for(rt)?;
+        let cls = if tuple { p.t_tuple } else { p.t_list };
+        let (tmpl, shape) = (p.seq_tmpl, p.seq_shape);
+        self.py_alloc_like(tmpl, shape, &[cls, items])
     }
 
     /// `len(v)` for [`Instr::PyLen`].
-    fn py_len(&mut self, func_id: u32, ip: usize, v: Value, rt: Value) -> Option<usize> {
-        if !v.is_heap() || !rt.is_heap() {
+    fn py_len(&mut self, v: Value, rt: Value) -> Option<usize> {
+        if !v.is_heap() {
             return None;
         }
         if self.heap.is_str_like(v.heap_index()) {
             return self.py_str_len(v);
         }
-        let cls = self.py_record_prop(func_id, ip, v, "cls")?;
-        let r = rt.heap_index();
-        let is = |vm: &Self, hint: &AtomicU16, key: &str| vm.py_hinted_prop(r, hint, key).is_some_and(|t| t.bits() == cls.bits());
-        if is(self, &HINT_TLIST, "TLIST") || is(self, &HINT_TTUPLE, "TTUPLE") {
-            let items = self.py_hinted_prop(v.heap_index(), &HINT_ITEMS, "items")?;
+        let p = self.py_rt_for(rt)?;
+        let (tl, tt, td, ts) = (p.t_list.bits(), p.t_tuple.bits(), p.t_dict.bits(), p.t_set.bits());
+        let cls = self.py_cls_of(v)?.bits();
+        if cls == tl || cls == tt {
+            let (_, items) = self.py_seq_parts(v)?;
             if !items.is_heap() {
                 return None;
             }
@@ -907,8 +899,8 @@ impl<'p> Vm<'p> {
                 _ => None,
             };
         }
-        if is(self, &HINT_TDICT, "TDICT") || is(self, &HINT_TSET, "TSET") {
-            let size = self.py_hinted_prop(v.heap_index(), &HINT_SIZE, "size")?;
+        if cls == td || cls == ts {
+            let (_, size) = self.py_dict_field(v.heap_index(), 1)?;
             if !size.is_number() {
                 return None;
             }
@@ -918,143 +910,35 @@ impl<'p> Vm<'p> {
         None
     }
 
-    /// The accessor for [`Instr::PyAttrFn`].
-    fn py_attr_fn(&mut self, func_id: u32, ip: usize, o: Value, key: u32, set: bool) -> Option<Value> {
-        let cls = self.py_record_prop(func_id, ip, o, "cls")?;
-        if !cls.is_heap() || !self.py_is_plain_object(cls) {
-            return None;
-        }
-        let func = self.func(func_id as usize);
-        let raw = func.constants[key as usize];
-        if !raw.is_heap() || raw.heap_index() & crate::vm::helpers_misc::STRING_CONST_BIT == 0 {
-            return None;
-        }
-        let name: &str = func.string_constants
-            [(raw.heap_index() & !crate::vm::helpers_misc::STRING_CONST_BIT) as usize]
-            .as_str();
-        let (plain_hint, plain_key) = &PY_ATTR_TABLES[if set { HINT_SA } else { HINT_GA }];
-        let plain = self.py_hinted_prop(cls.heap_index(), plain_hint, plain_key)?;
-        if !self.py_plain(plain) || self.py_json_like_own(plain.heap_index(), name) == Some(Value::TRUE) {
-            return None;
-        }
-        let (fn_hint, fn_key) = &PY_FN_TABLES[set as usize];
-        let table = self.py_hinted_prop(cls.heap_index(), fn_hint, fn_key)?;
-        if !self.py_plain(table) {
-            return None;
-        }
-        let f = self.py_json_like_own(table.heap_index(), name)?;
-        self.py_plain(f).then_some(f)
-    }
-
     /// The module global for [`Instr::PyModGet`].
-    fn py_mod_get(&mut self, func_id: u32, ip: usize, o: Value, rt: Value, key: u32) -> Option<Value> {
-        let cls = self.py_record_prop(func_id, ip, o, "cls")?;
-        if !rt.is_heap() || !cls.is_heap() {
-            return None;
-        }
-        let tmodule = self.py_hinted_prop(rt.heap_index(), &HINT_TMODULE, "TMODULE")?;
+    fn py_mod_get(&mut self, func_id: u32, o: Value, rt: Value, key: u32) -> Option<Value> {
+        let tmodule = self.py_rt_for(rt)?.t_module;
+        let cls = self.py_cls_of(o)?;
         if tmodule.bits() != cls.bits() {
             return None;
         }
-        let g = self.py_hinted_prop(o.heap_index(), &HINT_GLOBALS, "globals")?;
+        let g = self.py_hint_field(super::py_rt::hint::GLOBALS, o.heap_index(), "globals")?;
         let k = self.resolve_const_slot(func_id, key);
         self.py_map_get(g, k)
     }
 
-    /// A plain object (a runtime record: `typeof` "object", not exotic).
-    fn py_plain(&self, v: Value) -> bool {
-        v.is_heap() && self.py_is_plain_object(v)
-    }
-
-    /// The method for [`Instr::PyMethod`].
-    fn py_method(&mut self, func_id: u32, ip: usize, o: Value, rt: Value, key: u32, gb: u32) -> Option<Value> {
-        if !o.is_heap() {
-            return None;
-        }
-        let func = self.func(func_id as usize);
-        let gb_name: &str = func.string_constants[gb as usize].as_str();
-        let cls = if self.heap.is_str_like(o.heap_index()) {
-            if !rt.is_heap() {
-                return None;
-            }
-            let t = self.py_hinted_prop(rt.heap_index(), &HINT_TSTR, "TSTR")?;
-            if !self.py_plain(t) {
-                return None;
-            }
-            t
-        } else {
-            let cls = self.py_record_prop(func_id, ip, o, "cls")?;
-            if !self.py_plain(cls) || !rt.is_heap() {
-                return None;
-            }
-            // A module's functions are its globals (`PyModGet`).
-            let tmodule = self.py_hinted_prop(rt.heap_index(), &HINT_TMODULE, "TMODULE")?;
-            if tmodule.bits() == cls.bits() {
-                return None;
-            }
-            // A user class's function, unless the instance dict shadows it.
-            let gm = self.py_hinted_prop(cls.heap_index(), &HINT_GM, "gm")?;
-            if !self.py_plain(gm) {
-                return None;
-            }
-            let raw = func.constants[key as usize];
-            if !raw.is_heap() || raw.heap_index() & crate::vm::helpers_misc::STRING_CONST_BIT == 0 {
-                return None;
-            }
-            let name: &str = func.string_constants
-                [(raw.heap_index() & !crate::vm::helpers_misc::STRING_CONST_BIT) as usize]
-                .as_str();
-            // A class with many methods: its table read at this site's slot
-            // (`vm::py_attr`); a small one is scanned.
-            let many = matches!(self.heap.get(gm.heap_index()), HeapObj::Object(t) if t.len() > 8);
-            let found = if many {
-                self.py_table_own(func_id, ip, gm.heap_index(), name)
-            } else {
-                self.py_json_like_own(gm.heap_index(), name)
-            };
-            if let Some(m) = found {
-                if self.py_plain(m) {
-                    let d = self.py_hinted_prop(o.heap_index(), &HINT_DICT, "dict")?;
-                    if !d.is_heap() || !matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. }) {
-                        return None;
-                    }
-                    // A small dict is scanned by name (`vm::py_attr`).
-                    if let Some(lacks) = self.py_map_lacks_name(d.heap_index(), name) {
-                        return lacks.then_some(m);
-                    }
-                    let k = self.resolve_const_slot(func_id, key);
-                    return match self.py_map_get(d, k) {
-                        None => Some(m),
-                        Some(_) => None,
-                    };
-                }
-            }
-            cls
-        };
-        let table = self.py_hinted_prop(cls.heap_index(), &HINT_GB, "gb")?;
-        if !self.py_plain(table) {
-            return None;
-        }
-        let b = self.py_json_like_own(table.heap_index(), gb_name)?;
-        self.py_plain(b).then_some(b)
-    }
-
-    /// An own data property of the plain object `idx` (a linear lookup).
-    fn py_json_like_own(&self, idx: u32, key: &str) -> Option<Value> {
-        let HeapObj::Object(m) = self.heap.get(idx) else {
-            return None;
-        };
-        let slot = m.pos(key)?;
-        if m.attr_at(slot).accessor {
-            return None;
-        }
-        Some(m.val_at(slot))
-    }
-
     /// `isinstance(v, t)` for [`Instr::PyIsInstance`].
+    #[inline(never)]
     fn py_isinstance(&mut self, func_id: u32, ip: usize, v: Value, t: Value, rt: Value) -> Option<bool> {
-        if !t.is_heap() || self.py_hinted_prop(t.heap_index(), &HINT_ISTYPE, "isType")? != Value::TRUE {
+        if !t.is_heap() {
             return None;
+        }
+        let p = self.py_rt_for(rt)?;
+        let (ty, istypes) = (p.ty?, p.istypes);
+        let ti = t.heap_index();
+        // `t` a type: this site's entry, else its own `isType`.
+        let e = self.py_ic(func_id, ip);
+        if !(e.kind == ic::IS_TYPE && e.a == t.bits() && self.heap.version_of(ti) == e.hver) {
+            if self.py_ty_field(ti, ty.is_type, "isType")? != Value::TRUE {
+                return None;
+            }
+            let hver = self.heap.version_of(ti);
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::IS_TYPE, pos: 0, hver, a: t.bits(), b: 0, c: 0, d: 0 });
         }
         let prim = if v == Value::NULL {
             Some(0)
@@ -1071,31 +955,15 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
-        if !rt.is_heap() {
-            return None;
-        }
-        let types = self.py_hinted_prop(rt.heap_index(), &HINT_ISTYPES, "ISTYPES")?;
-        if !types.is_heap() {
-            return None;
-        }
-        let (c, bytes) = {
-            let HeapObj::Array(items) = self.heap.get(types.heap_index()) else {
-                return None;
-            };
-            let bytes = *items.get(5)?;
-            match prim {
-                Some(i) => (*items.get(i)?, bytes),
-                None => (Value::UNDEFINED, bytes),
+        let c = match prim {
+            Some(i) => istypes[i],
+            None => {
+                let c = self.py_cls_of(v)?;
+                if !self.py_plain_rec(c) {
+                    return None;
+                }
+                c
             }
-        };
-        let c = if prim.is_some() {
-            c
-        } else {
-            let c = self.py_record_prop(func_id, ip, v, "cls")?;
-            if !c.is_heap() || !self.py_is_plain_object(c) {
-                return None;
-            }
-            c
         };
         if c.bits() == t.bits() {
             return Some(true);
@@ -1103,7 +971,7 @@ impl<'p> Vm<'p> {
         if !c.is_heap() {
             return None;
         }
-        let mro = self.py_hinted_prop(c.heap_index(), &HINT_MRO, "mro")?;
+        let mro = self.py_ty_field(c.heap_index(), ty.mro, "mro")?;
         if !mro.is_heap() {
             return None;
         }
@@ -1114,71 +982,7 @@ impl<'p> Vm<'p> {
             return Some(false);
         }
         // `bytes` excludes bytearray, which the runtime models as a subclass.
-        (t.bits() != bytes.bits()).then_some(true)
-    }
-
-    /// An own data property of the plain object `idx`, found at the slot
-    /// `hint` remembers for `key` when it is still there (records made by
-    /// one runtime literal share their layout), else by a lookup that
-    /// updates the hint.
-    fn py_hinted_prop(&self, idx: u32, hint: &AtomicU16, key: &str) -> Option<Value> {
-        let HeapObj::Object(m) = self.heap.get(idx) else {
-            return None;
-        };
-        if m.is_ctor {
-            return None;
-        }
-        let h = hint.load(Ordering::Relaxed) as usize;
-        let slot = if h < m.len() && m.key_at(h) == key {
-            h
-        } else {
-            let slot = m.pos(key)?;
-            if slot <= u16::MAX as usize {
-                hint.store(slot as u16, Ordering::Relaxed);
-            }
-            slot
-        };
-        if m.attr_at(slot).accessor {
-            return None;
-        }
-        Some(m.val_at(slot))
-    }
-
-    /// For [`Instr::PyGetAttr`] / [`Instr::PySetAttr`]: `obj.dict` (its heap
-    /// index) when `obj.cls[table][key]` is `true` (`table` the class's
-    /// `ga` or `sa`) and `obj.dict` is a `Map`.
-    fn py_attr_plain(&mut self, func_id: u32, ip: usize, o: Value, key: u32, table: usize) -> Option<u32> {
-        self.py_attr_plain_at(func_id, ip, o, key, table).map(|(d, _)| d)
-    }
-
-    /// [`Vm::py_attr_plain`], with the slot of `key` in the class table.
-    fn py_attr_plain_at(&mut self, func_id: u32, ip: usize, o: Value, key: u32, table: usize) -> Option<(u32, usize)> {
-        let cls = self.py_record_prop(func_id, ip, o, "cls")?;
-        if !cls.is_heap() || !self.py_is_plain_object(cls) {
-            return None;
-        }
-        let (hint, table_key) = &PY_ATTR_TABLES[table];
-        let t = self.py_hinted_prop(cls.heap_index(), hint, table_key)?;
-        if !t.is_heap() {
-            return None;
-        }
-        let func = self.func(func_id as usize);
-        let raw = func.constants[key as usize];
-        if !raw.is_heap() || raw.heap_index() & crate::vm::helpers_misc::STRING_CONST_BIT == 0 {
-            return None;
-        }
-        let name: &str = func.string_constants
-            [(raw.heap_index() & !crate::vm::helpers_misc::STRING_CONST_BIT) as usize]
-            .as_str();
-        let HeapObj::Object(m) = self.heap.get(t.heap_index()) else {
-            return None;
-        };
-        let slot = m.pos(name)?;
-        if m.attr_at(slot).accessor || m.val_at(slot) != Value::TRUE {
-            return None;
-        }
-        let d = self.py_hinted_prop(o.heap_index(), &HINT_DICT, "dict")?;
-        (d.is_heap() && matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. })).then(|| (d.heap_index(), slot))
+        (t.bits() != istypes[5].bits()).then_some(true)
     }
 
     /// `s[k]` for [`Instr::PyStrItem`].
@@ -1229,53 +1033,8 @@ impl<'p> Vm<'p> {
         Some(bytes.iter().filter(|&&b| b & 0xC0 != 0x80).count())
     }
 
-    /// [`Vm::py_map_get`] trying first the entry position this site found
-    /// last time (`builtins`: its second lookup). A position is only a hint:
-    /// it is used when the entry there still has a key equal to `k`, which
-    /// makes it `k`'s entry (a Map's keys are distinct).
-    fn py_map_get_at(&mut self, m: Value, k: Value, func_id: u32, ip: usize, builtins: bool) -> Option<Value> {
-        if !m.is_heap() {
-            return None;
-        }
-        let site = ((func_id as u64) << 33) | ((ip as u64) << 1) | builtins as u64;
-        let hint = PY_GLOBAL_SITES.with(|c| c.borrow().get(&site).copied());
-        let idx = m.heap_index();
-        if let Some(pos) = hint {
-            if let HeapObj::Map { keys, vals } = self.heap.get(idx) {
-                if let (Some(&stored), Some(&v)) = (keys.get(pos as usize), vals.get(pos as usize)) {
-                    if (stored.bits() == k.bits() || py_str_eq(&self.heap, stored, k)) && !v.is_undefined() {
-                        return Some(v);
-                    }
-                }
-            }
-        }
-        if !matches!(self.heap.get(idx), HeapObj::Map { .. }) {
-            return None;
-        }
-        // Module globals are asked for every builtin name they lack: through
-        // the Map's hash index, not a scan of every global.
-        if !builtins {
-            self.coll_index_early(idx);
-        }
-        let i = self.coll_find(idx, k)?;
-        let v = match self.heap.get(idx) {
-            HeapObj::Map { vals, .. } => vals.get(i).copied().filter(|v| !v.is_undefined())?,
-            _ => return None,
-        };
-        if let Ok(pos) = u32::try_from(i) {
-            PY_GLOBAL_SITES.with(|c| {
-                let mut c = c.borrow_mut();
-                if c.len() >= 1 << 16 {
-                    c.clear();
-                }
-                c.insert(site, pos);
-            });
-        }
-        Some(v)
-    }
-
     /// [`Vm::py_map_get`] with the entry's position.
-    fn py_map_find(&mut self, m: Value, k: Value) -> Option<(usize, Value)> {
+    pub(super) fn py_map_find(&mut self, m: Value, k: Value) -> Option<(usize, Value)> {
         if !m.is_heap() {
             return None;
         }
@@ -1294,61 +1053,14 @@ impl<'p> Vm<'p> {
     /// value is never `undefined`, and an `undefined` entry answers `None`
     /// like a missing one); `None` for anything else.
     #[inline]
-    fn py_map_get(&mut self, m: Value, k: Value) -> Option<Value> {
-        if !m.is_heap() {
-            return None;
-        }
-        let idx = m.heap_index();
-        if !matches!(self.heap.get(idx), HeapObj::Map { .. }) {
-            return None;
-        }
-        let i = self.coll_find(idx, k)?;
-        match self.heap.get(idx) {
-            HeapObj::Map { vals, .. } => vals.get(i).copied().filter(|v| !v.is_undefined()),
-            _ => None,
-        }
-    }
-
-    /// Whether `v` is a plain object (a runtime record: not a function,
-    /// array, Map, proxy or other exotic object).
-    #[inline]
-    fn py_is_plain_object(&self, v: Value) -> bool {
-        matches!(self.heap.get(v.heap_index()), HeapObj::Object(m) if !m.is_ctor)
-    }
-
-    /// An own data property of a plain-object record, read through this
-    /// site's inline cache (filled on a miss); `None` for anything else,
-    /// getters included.
-    fn py_record_prop(&mut self, func_id: u32, ip: usize, o: Value, key: &str) -> Option<Value> {
-        if !o.is_heap() || !self.py_is_plain_object(o) {
-            return None;
-        }
-        match self.ic_get_prop(func_id, ip, o, key) {
-            GetAct::Value(v) => Some(v),
-            GetAct::Accessor { .. } => None,
-            GetAct::None => {
-                // The cache declined: the record's own data property, if it
-                // has one (never a getter).
-                let HeapObj::Object(m) = self.heap.get(o.heap_index()) else {
-                    return None;
-                };
-                let slot = m.pos(key)?;
-                if m.attr_at(slot).accessor {
-                    return None;
-                }
-                Some(m.val_at(slot))
-            }
-        }
+    pub(super) fn py_map_get(&mut self, m: Value, k: Value) -> Option<Value> {
+        self.py_map_find(m, k).map(|(_, v)| v)
     }
 
     /// `o.dict` when it is a `Map` (a Python instance's attribute storage).
-    fn py_record_map(&mut self, func_id: u32, ip: usize, o: Value) -> Option<u32> {
-        let d = self.py_record_prop(func_id, ip, o, "dict")?;
-        if d.is_heap() && matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. }) {
-            Some(d.heap_index())
-        } else {
-            None
-        }
+    fn py_inst_map(&self, o: Value) -> Option<u32> {
+        let (_, d) = self.py_inst_parts(o)?;
+        (d.is_heap() && matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. })).then(|| d.heap_index())
     }
 
     /// `__zipp_py_str(s)`: whether `s` holds a UTF-16 surrogate unit (an
@@ -1357,7 +1069,6 @@ impl<'p> Vm<'p> {
     /// is a four-byte sequence, a lone surrogate `ED A0..BF ..`). A
     /// non-string answers `true`, which sends every caller to its general
     /// code-point path.
-    #[cfg(feature = "python")]
     pub(crate) fn py_str_has_surrogate(&mut self, v: Value) -> Value {
         if !v.is_heap() || !self.heap.is_str_like(v.heap_index()) {
             return Value::bool(true);
@@ -1384,7 +1095,6 @@ impl<'p> Vm<'p> {
     /// (an array stands for a tuple's items, at the top level only), when a
     /// pair is not ordered (a str against a number, None against anything,
     /// a NaN), or when the budget cannot cover the sort.
-    #[cfg(feature = "python")]
     pub(crate) fn py_ord(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let op = args.first().copied().unwrap_or(Value::UNDEFINED);
         let a = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -1459,7 +1169,6 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
     }
 
-    #[cfg(feature = "python")]
     fn py_ord_key(&mut self, v: Value, depth: u32) -> Option<OrdKey> {
         use super::bigint::BigVal;
         if v.is_number() {
@@ -1502,7 +1211,6 @@ impl<'p> Vm<'p> {
     /// `items` Array), taken at nesting depth 8 at most, as the runtime's
     /// `ordForm` takes one; with `top`, a bare Array stands for the items
     /// of a list or tuple at the top level (op 3), and never below it.
-    #[cfg(feature = "python")]
     fn py_ord_key_rec(&mut self, v: Value, depth: u32, tuple: Value, top: bool) -> Option<OrdKey> {
         if !v.is_heap() {
             return self.py_ord_key(v, depth);
@@ -1515,11 +1223,10 @@ impl<'p> Vm<'p> {
                 if depth > 8 {
                     return None;
                 }
-                let cls = m.pos("cls").filter(|&s| !m.attr_at(s).accessor).map(|s| m.val_at(s))?;
+                let (cls, items) = self.py_seq_parts(v)?;
                 if cls.bits() != tuple.bits() {
                     return None;
                 }
-                let items = m.pos("items").filter(|&s| !m.attr_at(s).accessor).map(|s| m.val_at(s))?;
                 if !items.is_heap() {
                     return None;
                 }
@@ -1538,19 +1245,16 @@ impl<'p> Vm<'p> {
     }
 
     /// A value's key as op 2 reads it, for `vm::py_str`'s heap operations.
-    #[cfg(feature = "python")]
     pub(super) fn py_ord_key_boxed(&mut self, v: Value, tuple: Value) -> Option<OrdKeyBox> {
         self.py_ord_key_rec(v, 0, tuple, false).map(OrdKeyBox)
     }
 
     /// Python's `a < b` on two keys, when they are ordered.
-    #[cfg(feature = "python")]
     pub(super) fn py_ord_lt_boxed(&self, a: &OrdKeyBox, b: &OrdKeyBox) -> Option<bool> {
         self.py_ord_cmp(&a.0, &b.0).map(|o| o == std::cmp::Ordering::Less)
     }
 
     /// Python's `<` as an ordering (`None`: not ordered, or a NaN).
-    #[cfg(feature = "python")]
     fn py_ord_cmp(&self, a: &OrdKey, b: &OrdKey) -> Option<std::cmp::Ordering> {
         use super::bigint::BigVal;
         use std::cmp::Ordering;
@@ -1612,41 +1316,21 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// A plain-object record's own data property (a small record: a scan
-    /// of its keys), never a getter.
-    fn py_field(&self, idx: u32, key: &str) -> Option<(usize, Value)> {
-        let HeapObj::Object(m) = self.heap.get(idx) else {
-            return None;
-        };
-        if m.is_ctor {
-            return None;
-        }
-        let slot = m.pos(key)?;
-        if m.attr_at(slot).accessor {
-            return None;
-        }
-        Some((slot, m.val_at(slot)))
-    }
-
     /// The record's class and which of the two expected ones it is.
     fn py_item_kind(&self, o: Value, seq: Value, dict: Value) -> Option<(u32, bool)> {
-        if !o.is_heap() {
-            return None;
-        }
-        let idx = o.heap_index();
-        let (_, cls) = self.py_field(idx, "cls")?;
+        let cls = self.py_cls_of(o)?;
         if cls.bits() == seq.bits() {
-            Some((idx, true))
+            Some((o.heap_index(), true))
         } else if cls.bits() == dict.bits() {
-            Some((idx, false))
+            Some((o.heap_index(), false))
         } else {
             None
         }
     }
 
     /// `o.items` and a valid index into it for `k`.
-    fn py_seq_slot(&self, idx: u32, k: Value) -> Option<(u32, usize)> {
-        let (_, items) = self.py_field(idx, "items")?;
+    fn py_seq_slot(&self, o: Value, k: Value) -> Option<(u32, usize)> {
+        let (_, items) = self.py_seq_parts(o)?;
         if !items.is_heap() || !k.is_heap() {
             return None;
         }
@@ -1665,11 +1349,11 @@ impl<'p> Vm<'p> {
         if !k.is_heap() || !self.heap.is_str_like(k.heap_index()) {
             return None;
         }
-        let (_, flag) = self.py_field(idx, "str")?;
+        let (_, flag) = self.py_dict_field(idx, 2)?;
         if flag != Value::TRUE {
             return None;
         }
-        let (_, map) = self.py_field(idx, "map")?;
+        let (_, map) = self.py_dict_field(idx, 0)?;
         (map.is_heap() && matches!(self.heap.get(map.heap_index()), HeapObj::Map { .. })).then(|| map.heap_index())
     }
 
@@ -1678,7 +1362,7 @@ impl<'p> Vm<'p> {
             return Ok(None);
         };
         if is_seq {
-            let Some((items, i)) = self.py_seq_slot(idx, k) else {
+            let Some((items, i)) = self.py_seq_slot(o, k) else {
                 return Ok(None);
             };
             let HeapObj::Array(vals) = self.heap.get(items) else {
@@ -1699,7 +1383,7 @@ impl<'p> Vm<'p> {
             return Ok(false);
         };
         if is_seq {
-            let Some((items, i)) = self.py_seq_slot(idx, k) else {
+            let Some((items, i)) = self.py_seq_slot(o, k) else {
                 return Ok(false);
             };
             self.set_index(Value::heap(items), Value::int(i as i32), v, true)?;
@@ -1708,7 +1392,7 @@ impl<'p> Vm<'p> {
         let Some(map) = self.py_str_map(idx, k) else {
             return Ok(false);
         };
-        let Some((size_slot, _)) = self.py_field(idx, "size") else {
+        let Some((size_slot, _)) = self.py_dict_field(idx, 1) else {
             return Ok(false);
         };
         self.map_method(map, "set", &[k, v])?;

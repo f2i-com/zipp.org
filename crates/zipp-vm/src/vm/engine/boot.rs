@@ -163,6 +163,8 @@ impl<'p> Vm<'p> {
             idx_key_scratch: String::new(),
             json_default_tj: None,
             site_ics: Vec::new(),
+            #[cfg(feature = "python")]
+            py_rt: None,
             dynamic_ic_bytes: 0,
             const_string_cache: rustc_hash::FxHashMap::default(),
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),

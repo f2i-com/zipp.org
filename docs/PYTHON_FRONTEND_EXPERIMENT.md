@@ -96,7 +96,8 @@ integration date every corpus program matched.
   strings, `n` locale forms) are approximations.
 - Performance: Python compiles to the engine's register bytecode plus 27
   fused Python-only instructions (arithmetic and compare-and-branch, class
-  guards, instance-dict and global reads with per-site caches, attribute and
+  guards, instance-dict, global, method and class-attribute reads through
+  per-VM, per-site caches keyed by class version, attribute and
   method lookup, subscripts, `len`, `isinstance`, unpacking, sequence
   displays, raise and handler entry, the generator loop step) and native
   helpers for json, the common `str` methods, `str %`, `hash`, `heapq`,
@@ -106,16 +107,21 @@ integration date every corpus program matched.
   iterations) also compile to native code: float and small-int arithmetic,
   comparisons and `range` counters run inline, and every other fused
   instruction calls the interpreter's own step, so results are identical (a
-  139-program corpus is byte-identical JIT on/off). Loops that spend most of
-  their time in calls, and whole functions, stay interpreted; embedders with
+  139-program corpus is byte-identical JIT on/off). Loops over generators also compile (each
+  generator step runs on a nested interpreter loop, as a call from compiled
+  code does), and `try`/`except`/`finally` inside a hot loop compiles with its
+  normal completion inline. Loops that spend most of their time in calls, and
+  whole functions (`ZIPP_PY_TIERC=1` compiles them, measured slower on
+  call-heavy code), stay interpreted; the tier is x86-64 only; embedders with
   an instruction budget, sandbox and WebAssembly keep the JIT off. Measured
   against CPython 3.13 over the 36 programs of `tools/python_bench.py`
-  (geomean of work time): about 5.1x slower interpreted and 4.5-4.8x with
-  the JIT, from `float_arith` (faster than CPython with the JIT) and
-  `int_arith` (1.3x) to exceptions and generators (about 13x). Ints are
+  (geomean of work time): about 4.3x slower interpreted and 3.6x with the
+  JIT, from `float_arith` (faster than CPython with the JIT) and
+  `int_arith` (1.3x) to instance creation and list comprehensions (about 7x). Ints are
   BigInts outside a small interned range, and object-heavy code still goes
   through the JavaScript runtime's records; native core types are the next
-  step.
+  step. `ZIPP_PY_PROF=1` prints fused-op hit and slow-path counts, runtime
+  helper call counts and the allocation mix at exit.
 
 ## Language selection
 

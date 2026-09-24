@@ -39,12 +39,9 @@ const F_RETURNED: (usize, &str) = (5, "returned");
 const F_EXCS: (usize, &str) = (6, "excs");
 const F_GRT: (usize, &str) = (13, "grt");
 
-thread_local! {
-    /// The shape of a generator record whose fields above were all found at
-    /// their usual slots, as data properties (`shape::DICT`, which never
-    /// matches, until one is seen). Shapes are this thread's.
-    static GEN_SHAPE: std::cell::Cell<u32> = const { std::cell::Cell::new(crate::shape::DICT) };
-}
+// The shape of a generator record whose fields above were all found at
+// their usual slots, as data properties, is the VM's `PyRt::gen_shape`
+// (`shape::DICT`, which never matches, until one is seen).
 
 /// The runtime values the step needs (`grt`, one array shared by every
 /// generator record): the JavaScript `genNext`, the current-exception
@@ -125,7 +122,7 @@ impl<'p> Vm<'p> {
         // A record of the shape already seen with every field at its usual
         // slot has them all there (a shape fixes keys, order and kinds).
         let known = match self.heap.get(g) {
-            HeapObj::Object(m) => m.shape() != crate::shape::DICT && m.shape() == GEN_SHAPE.with(|c| c.get()),
+            HeapObj::Object(m) => m.shape() != crate::shape::DICT && self.py_rt.as_deref().is_some_and(|p| p.gen_shape.get() == m.shape()),
             _ => false,
         };
         let rt = if known {
@@ -155,7 +152,9 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get(g) {
                 if m.shape_guardable() {
                     let shape = m.shape();
-                    GEN_SHAPE.with(|c| c.set(shape));
+                    if let Some(p) = self.py_rt.as_deref() {
+                        p.gen_shape.set(shape);
+                    }
                 }
             }
         }

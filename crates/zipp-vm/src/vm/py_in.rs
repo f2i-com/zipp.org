@@ -23,16 +23,8 @@
 use super::*;
 use crate::heap::HeapObj;
 use crate::value::Value;
-use std::sync::atomic::AtomicU16;
+use super::py_rt::hint;
 
-static HINT_CLS: AtomicU16 = AtomicU16::new(0);
-static HINT_ITEMS: AtomicU16 = AtomicU16::new(1);
-static HINT_MAP: AtomicU16 = AtomicU16::new(1);
-static HINT_STR: AtomicU16 = AtomicU16::new(3);
-static HINT_TLIST: AtomicU16 = AtomicU16::new(0);
-static HINT_TTUPLE: AtomicU16 = AtomicU16::new(0);
-static HINT_TDICT: AtomicU16 = AtomicU16::new(0);
-static HINT_TSET: AtomicU16 = AtomicU16::new(0);
 
 /// A plain value as `eq` sees it.
 #[derive(Clone, Copy)]
@@ -153,11 +145,10 @@ impl<'p> Vm<'p> {
             self.charge_steps(cost as i64);
             return Some(found);
         }
-        let cls = self.py_rec_field_in(ci, &HINT_CLS, "cls")?;
-        let r = rt.heap_index();
-        let is = |vm: &Self, hint: &AtomicU16, key: &str| vm.py_rec_field_in(r, hint, key).is_some_and(|t| t.bits() == cls.bits());
-        if is(self, &HINT_TLIST, "TLIST") || is(self, &HINT_TTUPLE, "TTUPLE") {
-            let items = self.py_rec_field_in(ci, &HINT_ITEMS, "items")?;
+        let cls = self.py_cls_of(Value::heap(ci))?;
+        let (tl, tt) = self.py_rt_for(rt).map(|p| (p.t_list.bits(), p.t_tuple.bits()))?;
+        if cls.bits() == tl || cls.bits() == tt {
+            let (_, items) = self.py_seq_parts(Value::heap(ci))?;
             if !items.is_heap() {
                 return None;
             }
@@ -205,18 +196,17 @@ impl<'p> Vm<'p> {
 
     /// A dict's or set's key test for [`Vm::py_in`].
     fn py_in_keyed(&mut self, ci: u32, cls: Value, rt: Value, needle: Value, p: Prim) -> Option<bool> {
-        let r = rt.heap_index();
-        let is = |vm: &Self, hint: &AtomicU16, key: &str| vm.py_rec_field_in(r, hint, key).is_some_and(|t| t.bits() == cls.bits());
-        let dict = is(self, &HINT_TDICT, "TDICT");
-        if !dict && !is(self, &HINT_TSET, "TSET") {
+        let (td, ts) = self.py_rt_for(rt).map(|p| (p.t_dict.bits(), p.t_set.bits()))?;
+        let dict = cls.bits() == td;
+        if !dict && cls.bits() != ts {
             return None;
         }
-        let map = self.py_rec_field_in(ci, &HINT_MAP, "map")?;
+        let map = self.py_hint_field(hint::MAP, ci, "map")?;
         if !map.is_heap() || !matches!(self.heap.get(map.heap_index()), HeapObj::Map { .. }) {
             return None;
         }
         if dict {
-            let str_mode = self.py_rec_field_in(ci, &HINT_STR, "str")?;
+            let str_mode = self.py_own_data(ci, "str")?;
             if str_mode == Value::TRUE {
                 // Every key a str: a str is looked up, anything else (plain,
                 // so hashable) is absent.
@@ -272,27 +262,5 @@ impl<'p> Vm<'p> {
             }
         }
         Some(false)
-    }
-
-    /// An own data property of the plain object `idx`, through `hint`.
-    fn py_rec_field_in(&self, idx: u32, hint: &AtomicU16, key: &str) -> Option<Value> {
-        use std::sync::atomic::Ordering;
-        let HeapObj::Object(m) = self.heap.get(idx) else {
-            return None;
-        };
-        if m.is_ctor {
-            return None;
-        }
-        let h = hint.load(Ordering::Relaxed) as usize;
-        let slot = if h < m.len() && m.key_at(h) == key {
-            h
-        } else {
-            let slot = m.pos(key)?;
-            if slot <= u16::MAX as usize {
-                hint.store(slot as u16, Ordering::Relaxed);
-            }
-            slot
-        };
-        (!m.is_accessor_at(slot)).then(|| m.val_at(slot))
     }
 }

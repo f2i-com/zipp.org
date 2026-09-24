@@ -57,6 +57,10 @@ fn main() -> ExitCode {
             eprintln!("[prof] {n:>8}  {pct:>5.1}%  {name}");
         }
     }
+    #[cfg(feature = "python")]
+    if std::env::var_os("ZIPP_PY_PROF").is_some() {
+        eprint!("{}", zipp_vm::py_prof_report());
+    }
     if std::env::var_os("ZIPP_PROF_PC").is_some() {
         let (rows, total) = zipp_vm::prof_pc_stats();
         eprintln!("[profpc] {total} instruction-pointer samples");

@@ -5277,6 +5277,8 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "python")]
             PY_COMPILE => self.py_compile_module(a0)?,
             #[cfg(feature = "python")]
+            PY_BIND => self.py_bind(args),
+            #[cfg(feature = "python")]
             PY_STR => self.py_str_has_surrogate(a0),
             #[cfg(feature = "python")]
             PY_ORD => self.py_ord(args)?,

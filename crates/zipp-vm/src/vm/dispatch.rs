@@ -1551,6 +1551,7 @@ impl<'p> Vm<'p> {
                     }
                     // The Python frontend's fused fast paths: one out-of-line
                     // step (see `py_ops`), so this loop's own code is unchanged.
+                    #[cfg(feature = "python")]
                     Instr::PyArith { .. }
                     | Instr::PyAddImm { .. }
                     | Instr::PyCompare { .. }
@@ -1563,6 +1564,7 @@ impl<'p> Vm<'p> {
                     | Instr::PySetItem { .. } => {
                         ip = self.py_step(func_id, base, ip, instr)?;
                     }
+                    #[cfg(feature = "python")]
                     Instr::PyGlobal { .. }
                     | Instr::PyStrItem { .. }
                     | Instr::PyStrLen { .. }
@@ -1582,8 +1584,44 @@ impl<'p> Vm<'p> {
                     | Instr::PyUnpack { .. } => {
                         ip = self.py_step_ext(func_id, base, ip, instr)?;
                     }
+                    #[cfg(feature = "python")]
                     Instr::PyMakeExc { .. } | Instr::PyExcPop { .. } | Instr::PyNew { .. } => {
                         ip = self.py_step_ext2(func_id, base, ip, instr)?;
+                    }
+                    // Only the Python frontend emits these; a build without it
+                    // carries none of their code.
+                    #[cfg(not(feature = "python"))]
+                    Instr::PyArith { .. }
+                    | Instr::PyAddImm { .. }
+                    | Instr::PyCompare { .. }
+                    | Instr::PyJumpCompare { .. }
+                    | Instr::PyClassOf { .. }
+                    | Instr::PyDictGet { .. }
+                    | Instr::PyDictSet { .. }
+                    | Instr::PyCallEntry { .. }
+                    | Instr::PyGetItem { .. }
+                    | Instr::PySetItem { .. }
+                    | Instr::PyGlobal { .. }
+                    | Instr::PyStrItem { .. }
+                    | Instr::PyStrLen { .. }
+                    | Instr::PyGetAttr { .. }
+                    | Instr::PySetAttr { .. }
+                    | Instr::PyIsInstance { .. }
+                    | Instr::PyGenNext { .. }
+                    | Instr::PyMethod { .. }
+                    | Instr::PyModGet { .. }
+                    | Instr::PyLen { .. }
+                    | Instr::PyAttrFn { .. }
+                    | Instr::PySeq { .. }
+                    | Instr::PyRaise { .. }
+                    | Instr::PyCaught { .. }
+                    | Instr::PyClassAttr { .. }
+                    | Instr::PyDictLookup { .. }
+                    | Instr::PyUnpack { .. }
+                    | Instr::PyMakeExc { .. }
+                    | Instr::PyExcPop { .. }
+                    | Instr::PyNew { .. } => {
+                        return Err(Thrown("InternalError: Python instruction in a build without Python".to_string()));
                     }
                     Instr::AddInt { dst, a, imm, upd } => {
                         let va = self.get(base, a);
@@ -9983,6 +10021,10 @@ impl<'p> Vm<'p> {
             return Err(Thrown(
                 "RangeError: Maximum call stack size exceeded".into(),
             ));
+        }
+        #[cfg(feature = "python")]
+        if super::prof_py::on() {
+            self.py_prof_call(func_id);
         }
         // ONE proto fetch for every layout field this call needs (each
         // `func()` is a bounds-checked double index; this runs per call).

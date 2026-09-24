@@ -189,6 +189,10 @@ function __zipp_py_set_input(json) {
         }
     };
 })(__zipp_py);
+// The engine's registry of the runtime (`vm::py_rt`), taken once everything
+// above has set `R` up: `R`, an array `R` keeps (which holds what the
+// registry names) and a dict record (its layout).
+try { if (typeof __zipp_py_bind === "function") { __zipp_py.PINS = []; __zipp_py_bind(__zipp_py, __zipp_py.PINS, __zipp_py.__rt.dict()); } } catch (e) { }
 // The Rust frontend replaces this prototype's body with Python bytecode that
 // registers the modules and runs the entry module. Keeping the CALL in the
 // bootstrap avoids relocating any JS jumps.

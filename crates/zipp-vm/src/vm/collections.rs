@@ -569,6 +569,7 @@ impl<'p> Vm<'p> {
     /// authoritative). For a Map read far more often than it changes and
     /// often probed for keys it lacks: the Python frontend's module globals,
     /// asked for every builtin name before the builtins are.
+    #[cfg(feature = "python")]
     pub(crate) fn coll_index_early(&mut self, idx: u32) {
         if self.collection_index.contains_key(&idx) {
             return;

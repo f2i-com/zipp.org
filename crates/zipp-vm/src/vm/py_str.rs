@@ -73,14 +73,10 @@ impl<'p> Vm<'p> {
         let items: Vec<Value> = if values.is_heap() && matches!(self.heap.get(values.heap_index()), HeapObj::Object(_)) {
             // An exact tuple's items; any other record (a dict is a mapping,
             // another object's str() may run code) takes the runtime's path.
-            let HeapObj::Object(m) = self.heap.get(values.heap_index()) else {
-                return None;
-            };
-            let cls = m.pos("cls").map(|s| m.val_at(s))?;
+            let (cls, items) = self.py_seq_parts(values)?;
             if cls.bits() != tuple.bits() {
                 return None;
             }
-            let items = m.pos("items").map(|s| m.val_at(s))?;
             if !items.is_heap() {
                 return None;
             }
@@ -234,13 +230,10 @@ impl<'p> Vm<'p> {
 // Results longer than the runtime's text limit (`MAX_TEXT` UTF-16 units)
 // take the `j<n>` path, which raises as it always did.
 
-use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
+use super::py_rt::hint;
 
 /// `rt.MAX_TEXT` (UTF-16 units).
 const STRM_MAX_TEXT: usize = 1 << 26;
-static HINT_STROP: AtomicU16 = AtomicU16::new(0);
-static HINT_LTMPL: AtomicU16 = AtomicU16::new(0);
-static HINT_TTYPE: AtomicU16 = AtomicU16::new(0);
 
 /// The runtime's str hash (`strHashOf` in `runtime/types.js`) over the
 /// string's UTF-16 code units: two 32-bit shift-add lanes, mixed, combined
@@ -271,21 +264,8 @@ fn js_space(b: u8) -> bool {
 impl<'p> Vm<'p> {
     /// An own data property of the plain object `idx`, at the slot `hint`
     /// remembers when that still holds `key`.
-    fn py_strm_prop(&self, idx: u32, hint: &AtomicU16, key: &str) -> Option<Value> {
-        let HeapObj::Object(m) = self.heap.get(idx) else {
-            return None;
-        };
-        let h = hint.load(AtomicOrdering::Relaxed) as usize;
-        let slot = if h < m.len() && m.key_at(h) == key {
-            h
-        } else {
-            let slot = m.pos(key)?;
-            if slot <= u16::MAX as usize {
-                hint.store(slot as u16, AtomicOrdering::Relaxed);
-            }
-            slot
-        };
-        (!m.attr_at(slot).accessor).then(|| m.val_at(slot))
+    fn py_strm_prop(&self, idx: u32, h: usize, key: &str) -> Option<Value> {
+        self.py_hint_field(h, idx, key)
     }
 
     /// A primitive str with no lone surrogate: its bytes and whether it is
@@ -333,7 +313,7 @@ impl<'p> Vm<'p> {
         if !this.is_heap() {
             return None;
         }
-        let op = self.py_strm_prop(this.heap_index(), &HINT_STROP, "strop")?;
+        let op = self.py_strm_prop(this.heap_index(), hint::STROP, "strop")?;
         if !op.is_int() {
             return None;
         }
@@ -469,8 +449,8 @@ impl<'p> Vm<'p> {
                 if !items.is_heap() {
                     return None;
                 }
-                let tmpl = self.py_strm_prop(this.heap_index(), &HINT_LTMPL, "ltmpl")?;
-                let ttype = self.py_strm_prop(this.heap_index(), &HINT_TTYPE, "ttype")?;
+                let tmpl = self.py_strm_prop(this.heap_index(), hint::LTMPL, "ltmpl")?;
+                let ttype = self.py_strm_prop(this.heap_index(), hint::TTYPE, "ttype")?;
                 if !tmpl.is_heap() {
                     return None;
                 }
@@ -530,7 +510,7 @@ impl<'p> Vm<'p> {
         if parts.len() > (1 << 24) {
             return None;
         }
-        let tmpl = self.py_strm_prop(this.heap_index(), &HINT_LTMPL, "ltmpl")?;
+        let tmpl = self.py_strm_prop(this.heap_index(), hint::LTMPL, "ltmpl")?;
         let (rec, slot) = self.py_json_template(tmpl, &["cls", "items"])?;
         let total: u64 = parts.iter().map(|p| p.len() as u64).sum();
         let items: Vec<Value> = parts.into_iter().map(|p| self.py_strm_new(p)).collect();
@@ -578,8 +558,8 @@ impl<'p> Vm<'p> {
         if !seq.is_heap() || !this.is_heap() {
             return None;
         }
-        let tmpl = self.py_strm_prop(this.heap_index(), &HINT_LTMPL, "ltmpl")?;
-        let ttype = self.py_strm_prop(this.heap_index(), &HINT_TTYPE, "ttype")?;
+        let tmpl = self.py_strm_prop(this.heap_index(), hint::LTMPL, "ltmpl")?;
+        let ttype = self.py_strm_prop(this.heap_index(), hint::TTYPE, "ttype")?;
         if !tmpl.is_heap() {
             return None;
         }
@@ -764,16 +744,6 @@ impl<'p> Vm<'p> {
 // (the end, a changed dict, a record of another shape), so errors and the
 // end are the runtime's own.
 
-static HINT_IKIND: AtomicU16 = AtomicU16::new(3);
-static HINT_IA: AtomicU16 = AtomicU16::new(4);
-static HINT_II: AtomicU16 = AtomicU16::new(5);
-static HINT_IB: AtomicU16 = AtomicU16::new(6);
-static HINT_ISIZE: AtomicU16 = AtomicU16::new(7);
-static HINT_IPICK: AtomicU16 = AtomicU16::new(8);
-static HINT_ITMPL: AtomicU16 = AtomicU16::new(9);
-static HINT_ITTYPE: AtomicU16 = AtomicU16::new(10);
-static HINT_ISIZE_DICT: AtomicU16 = AtomicU16::new(2);
-static HINT_IITEMS: AtomicU16 = AtomicU16::new(1);
 
 impl<'p> Vm<'p> {
     /// `__zipp_py_iter`, called as `it.next()`.
@@ -781,7 +751,7 @@ impl<'p> Vm<'p> {
         if let Some(v) = self.py_iter_fast(this) {
             return Ok(v);
         }
-        let jnext = if this.is_heap() { self.py_strm_prop(this.heap_index(), &AtomicU16::new(2), "jnext") } else { None };
+        let jnext = if this.is_heap() { self.py_strm_prop(this.heap_index(), hint::JNEXT, "jnext") } else { None };
         match jnext {
             Some(f) => self.call_value(f, this, &[]),
             None => Err(Thrown("TypeError: iterator step on a non-iterator".into())),
@@ -789,15 +759,8 @@ impl<'p> Vm<'p> {
     }
 
     /// Write the record's own data slot for `key` (found through `hint`).
-    fn py_iter_set(&mut self, rec: u32, hint: &AtomicU16, key: &str, v: Value) -> Option<()> {
-        let HeapObj::Object(m) = self.heap.get(rec) else {
-            return None;
-        };
-        let h = hint.load(AtomicOrdering::Relaxed) as usize;
-        let slot = if h < m.len() && m.key_at(h) == key { h } else { m.pos(key)? };
-        if m.attr_at(slot).accessor {
-            return None;
-        }
+    fn py_iter_set(&mut self, rec: u32, h: usize, key: &str, v: Value) -> Option<()> {
+        let (_, slot) = self.py_hint_slot(h, rec, key)?;
         if v.is_heap() {
             self.heap.write_barrier_val(rec, v);
         }
@@ -814,8 +777,8 @@ impl<'p> Vm<'p> {
 
     /// A tuple of `items` made from the record's template.
     fn py_iter_tuple(&mut self, rec: u32, items: Vec<Value>) -> Option<Value> {
-        let tmpl = self.py_strm_prop(rec, &HINT_ITMPL, "tmpl")?;
-        let ttype = self.py_strm_prop(rec, &HINT_ITTYPE, "ttype")?;
+        let tmpl = self.py_strm_prop(rec, hint::ITMPL, "tmpl")?;
+        let ttype = self.py_strm_prop(rec, hint::ITTYPE, "ttype")?;
         let (mut obj, slot) = self.py_json_template(tmpl, &["cls", "items"])?;
         let items = Value::heap(self.heap.alloc(HeapObj::Array(items)));
         obj.set_val_at(0, ttype);
@@ -828,20 +791,20 @@ impl<'p> Vm<'p> {
             return None;
         }
         let rec = this.heap_index();
-        let kind = self.py_strm_prop(rec, &HINT_IKIND, "kind")?;
-        let i = self.py_strm_prop(rec, &HINT_II, "i")?;
+        let kind = self.py_strm_prop(rec, hint::IKIND, "kind")?;
+        let i = self.py_strm_prop(rec, hint::II, "i")?;
         if !i.is_int() || i.as_int() < 0 {
             return None;
         }
         let pos = i.as_int() as usize;
-        let a = self.py_strm_prop(rec, &HINT_IA, "a")?;
-        let b = self.py_strm_prop(rec, &HINT_IB, "b")?;
+        let a = self.py_strm_prop(rec, hint::IA, "a")?;
+        let b = self.py_strm_prop(rec, hint::IB, "b")?;
         if kind == Value::int(3) {
-            let size = self.py_strm_prop(rec, &HINT_ISIZE, "size")?;
+            let size = self.py_strm_prop(rec, hint::ISIZE, "size")?;
             if !b.is_heap() || !a.is_heap() {
                 return None;
             }
-            let now = self.py_strm_prop(b.heap_index(), &HINT_ISIZE_DICT, "size")?;
+            let now = self.py_strm_prop(b.heap_index(), hint::ISIZE_DICT, "size")?;
             if !size.is_number() || !now.is_number() || size.as_f64() != now.as_f64() {
                 return None;
             }
@@ -852,7 +815,7 @@ impl<'p> Vm<'p> {
             if k == Value::HOLE {
                 return None;
             }
-            self.py_iter_set(rec, &HINT_II, "i", Value::int(i32::try_from(pos + 1).ok()?))?;
+            self.py_iter_set(rec, hint::II, "i", Value::int(i32::try_from(pos + 1).ok()?))?;
             return Some(k);
         }
         if kind == Value::int(4) {
@@ -868,7 +831,7 @@ impl<'p> Vm<'p> {
                 if !src.is_heap() {
                     return None;
                 }
-                let items = self.py_strm_prop(src.heap_index(), &HINT_IITEMS, "items")?;
+                let items = self.py_strm_prop(src.heap_index(), hint::IITEMS, "items")?;
                 if !items.is_heap() {
                     return None;
                 }
@@ -879,16 +842,16 @@ impl<'p> Vm<'p> {
             }
             let step = Value::int(i32::try_from(pos + 1).ok()?);
             let t = self.py_iter_tuple(rec, out)?;
-            self.py_iter_set(rec, &HINT_II, "i", step)?;
+            self.py_iter_set(rec, hint::II, "i", step)?;
             return Some(t);
         }
         if kind == Value::int(1) {
             // `if (d.size !== this.size) fail(...)`: the dict is `b`.
-            let size = self.py_strm_prop(rec, &HINT_ISIZE, "size")?;
+            let size = self.py_strm_prop(rec, hint::ISIZE, "size")?;
             if !b.is_heap() {
                 return None;
             }
-            let now = self.py_strm_prop(b.heap_index(), &HINT_ISIZE_DICT, "size")?;
+            let now = self.py_strm_prop(b.heap_index(), hint::ISIZE_DICT, "size")?;
             if !size.is_number() || !now.is_number() || size.as_f64() != now.as_f64() {
                 return None;
             }
@@ -906,7 +869,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(kv) => (*kv.first()?, *kv.get(1)?),
                 _ => return None,
             };
-            let pick = self.py_strm_prop(rec, &HINT_IPICK, "pick")?;
+            let pick = self.py_strm_prop(rec, hint::IPICK, "pick")?;
             let out = if pick == Value::int(0) {
                 k
             } else if pick == Value::int(1) {
@@ -916,7 +879,7 @@ impl<'p> Vm<'p> {
             } else {
                 return None;
             };
-            self.py_iter_set(rec, &HINT_II, "i", Value::int(i32::try_from(pos + 1).ok()?))?;
+            self.py_iter_set(rec, hint::II, "i", Value::int(i32::try_from(pos + 1).ok()?))?;
             return Some(out);
         }
         if kind == Value::int(2) {
@@ -924,7 +887,7 @@ impl<'p> Vm<'p> {
             if !a.is_heap() || !b.is_heap() {
                 return None;
             }
-            let items = self.py_strm_prop(a.heap_index(), &HINT_IITEMS, "items")?;
+            let items = self.py_strm_prop(a.heap_index(), hint::IITEMS, "items")?;
             if !items.is_heap() {
                 return None;
             }
@@ -939,8 +902,8 @@ impl<'p> Vm<'p> {
             let out = self.py_iter_pair(rec, b, v)?;
             let step = Value::int(i32::try_from(pos + 1).ok()?);
             let nb = self.make_bigint(next);
-            self.py_iter_set(rec, &HINT_IB, "b", nb)?;
-            self.py_iter_set(rec, &HINT_II, "i", step)?;
+            self.py_iter_set(rec, hint::IB, "b", nb)?;
+            self.py_iter_set(rec, hint::II, "i", step)?;
             return Some(out);
         }
         None

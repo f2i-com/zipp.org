@@ -106,6 +106,12 @@ impl Vm<'_> {
             resolved.is_heap(),
             "a string constant resolves to a heap value"
         );
+        // A Python program's names are one heap string per text (`vm::py_rt`).
+        #[cfg(feature = "python")]
+        let resolved = {
+            let text = self.func(func_id as usize).string_constants[string_idx].as_str();
+            self.py_intern(text, resolved)
+        };
         self.const_string_cache.insert(key, resolved);
         resolved
     }
