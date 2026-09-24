@@ -2,10 +2,13 @@
 
 Status: Zipp's own Python 3 implementation, integrated and validated on 13
 September 2026 (Rust 1.92.0, Windows x86-64 native CLI and the wasm32
-build). Python source is parsed by Zipp's hand-written recursive-descent
-parser (in the vendored RustPython parser fork,
-`crates/rustpython-parser-fork`, which keeps RustPython's lexer and AST; a
-parser only, no second interpreter; see its `FORK.md`) and lowered by Zipp's own compiler straight to Zipp
+build). Python source is parsed by Zipp's own front end,
+`crates/zipp-pyparse` (a byte-oriented lexer, an arena AST and a
+recursive-descent parser for Python 3.13 syntax: PEP 701 f-strings, PEP 695
+type parameters, `except*`), whose tree is converted to the RustPython 0.4
+`ast` types the compiler still consumes (`crates/rustpython-parser-fork` now
+supplies only those types; see its `FORK.md` and the crate's README). It is a
+parser only, with no second interpreter, and the result is lowered by Zipp's own compiler straight to Zipp
 register bytecode; Python's object model lives in a fixed JavaScript runtime
 that Zipp compiles once per program. Guest Python is never translated to
 JavaScript source and never sees the host's JavaScript globals.

@@ -375,6 +375,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zipp-pyparse"
+version = "0.0.20"
+dependencies = [
+ "num-bigint 0.4.8",
+ "rustc-hash 2.1.3",
+ "rustpython-ast",
+ "unicode-ident",
+ "unicode-properties",
+]
+
+[[package]]
 name = "zipp-regress"
 version = "0.11.1"
 dependencies = [
@@ -393,6 +404,7 @@ dependencies = [
  "self_cell",
  "unicode-id-start",
  "unicode-normalization",
+ "zipp-pyparse",
  "zipp-regress",
 ]
 

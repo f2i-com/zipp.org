@@ -93,6 +93,15 @@ jobs:
         run: |
           cargo +1.92.0 test --locked --no-default-features --features location,num-bigint --lib
           cargo +1.92.0 test --locked --release --no-default-features --features location,num-bigint,reference-parser --test differential -- --include-ignored --skip throughput
+      # ZIPP's own Python front end (crates/zipp-pyparse), which the frontend
+      # parses with, against that parser: equal RustPython ASTs, ranges
+      # included, or equal errors, over the same corpora. Programs only it
+      # accepts (PEP 701 f-strings, PEP 696 defaults) and every file of the
+      # runner's CPython Lib must give CPython's own `ast` tree. See its README.
+      - name: Test ZIPP's Python front end against the parser it replaced and CPython
+        working-directory: crates/zipp-pyparse
+        run: |
+          cargo +1.92.0 test --locked --release --features rustpython -- --include-ignored --skip throughput
       - name: Build the Python-enabled browser artifact
         working-directory: crates/zipp-wasm
         run: |

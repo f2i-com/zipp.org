@@ -7,6 +7,14 @@ https://github.com/RustPython/Parser (the published crates.io parser directory).
 integration (`rustpython-ast` 0.4), string and f-string parsing and the
 public API are upstream's; the parser itself is ZIPP's (below).
 
+Role now: ZIPP's Python frontend parses with its own front end,
+`crates/zipp-pyparse`, and converts that to the `rustpython_ast` nodes the
+emitter consumes. `zipp-vm` still depends on this crate for three things: its
+`ast` re-export, `text_size`, and the lexer of the `minify_check` test. In
+shipped builds the linker drops the lexer and parser. The crate is also the
+reference that `zipp-pyparse`'s differential tests compare against. Once
+the emitter reads the arena AST directly, the dependency can go.
+
 ## The parser: hand-written, replacing the generated LR parser
 
 Upstream compiles `src/python.lalrpop` with LALRPOP into `src/python.rs`

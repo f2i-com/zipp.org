@@ -10,9 +10,8 @@
 //! resolves project modules and the built-in modules at compile time.
 use crate::bytecode::{Instr, Program, PyLazy, PyLazyModule};
 use crate::vm::prof::{self, Phase};
-use rustpython_parser::lexer::{LexResult, LexicalError, LexicalErrorType};
-use rustpython_parser::{ast, lexer, Mode, Parse, Tok};
-use std::cell::{Cell, RefCell};
+use rustpython_parser::ast;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod emitter;
@@ -828,52 +827,30 @@ fn is_module_name(name: &str) -> bool {
     })
 }
 
-/// Parse one module under the conservative compiler limits (additional to
-/// host execution limits). The limits are counted on the parser's own token
-/// stream, so the source is lexed once: the counter ends the stream as soon
-/// as a limit is crossed, before the parser sees a deeper token.
+/// Parse one module (with ZIPP's own front end, crates/zipp-pyparse) under
+/// the conservative compiler limits (additional to host execution limits).
+/// The lexer counts them as it goes: the token stream ends as soon as a limit
+/// is crossed, before the parser sees a deeper token.
 fn parse_module(file: &str, source: &str) -> R<Vec<ast::Stmt>> {
     if source.len() > MAX_SOURCE {
         return Err(format!("Python: {file} exceeds 1 MiB"));
     }
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
-    let exceeded = Cell::new(false);
-    let (mut count, mut brackets, mut indent) = (0usize, 0usize, 0usize);
-    let tokens = lexer::lex(source, Mode::Module).map_while(|item: LexResult| {
-        if exceeded.get() {
-            return None;
+    let limits = zipp_pyparse::Limits {
+        max_tokens: MAX_TOKENS,
+        max_brackets: 200,
+        max_indent: 100,
+    };
+    zipp_pyparse::rustpython::parse_module(source, limits).map_err(|e| {
+        if e.limit {
+            format!("Python: compiler complexity limit exceeded in {file}")
+        } else {
+            format!(
+                "SyntaxError: {} ({})",
+                e.message,
+                position(file, source, e.offset.into())
+            )
         }
-        if let Ok((token, range)) = &item {
-            count += 1;
-            match token {
-                Tok::Indent => indent += 1,
-                Tok::Dedent => indent = indent.saturating_sub(1),
-                Tok::Lpar | Tok::Lsqb | Tok::Lbrace => brackets += 1,
-                Tok::Rpar | Tok::Rsqb | Tok::Rbrace => brackets = brackets.saturating_sub(1),
-                _ => {}
-            }
-            if count > MAX_TOKENS || brackets > 200 || indent > 100 {
-                exceeded.set(true);
-                return Some(Err(LexicalError::new(
-                    LexicalErrorType::OtherError("compiler complexity limit".into()),
-                    range.start(),
-                )));
-            }
-        }
-        Some(item)
-    });
-    let parsed = ast::Suite::parse_tokens(tokens, file);
-    if exceeded.get() {
-        return Err(format!(
-            "Python: compiler complexity limit exceeded in {file}"
-        ));
-    }
-    parsed.map_err(|e| {
-        format!(
-            "SyntaxError: {} ({})",
-            e.error,
-            position(file, source, e.offset)
-        )
     })
 }
 
