@@ -222,9 +222,9 @@ The kernel module is separate from Zipp WASM; rebuilding it does not rebuild Pyt
 
 This remains an experimental graph engine: no general kernel fusion, persistent
 cross-request tensors, float16, convolutions or general shader compiler. WebGPU
-fuses only what keeps every element's arithmetic unchanged (`src/fusion.mjs`:
-elementwise chains, transposes read by matmuls, one-dispatch sums and
-cross-entropy, Adam's three updates). Matrix products are tiled only on WebGPU
+fuses only what keeps every element's arithmetic unchanged (`src/fusion.mjs`: elementwise chains, computed in the small matmul they read; transposes read by
+matmuls; one-dispatch sums and cross-entropy with its gradient; Adam's three updates, two
+parameters per dispatch). Matrix products are tiled only on WebGPU
 (16x16 workgroup tiles, and register-blocked 64x64 or 128x128 tiles for large
 products) and register-blocked in the SIMD WASM kernels. Measured timings are in `docs/VALIDATION.md`; at MNIST
 scale a step is dominated by host transfers, not GPU arithmetic. Source and

@@ -232,8 +232,10 @@ computed once and kept; and a backend may run several nodes as one item.
 WebGPU does so only where each element's arithmetic is unchanged: Adam's three
 updates of a parameter, a matmul reading a transposed operand in place or
 writing its result transposed, whole sums and means of up to 2048 values and
-cross-entropy of up to 1024 rows in one workgroup (the same pairwise tree), and
-chains of elementwise nodes of one size (a K=1 bias matmul may start one). A
+cross-entropy of up to 1024 rows in one workgroup (the same pairwise tree), chains of elementwise nodes of one size (a K=1 bias matmul may start one; a small 2-D matmul
+only the chain reads is computed in its kernel, or, split along k, summed there), a
+cross_entropy with its gradient (and that gradient's product with a scalar) for up to 256 rows,
+and two in-place Adam groups per dispatch. A
 chain kernel passes every intermediate through a bit operation against a
 uniform zero, so no compiler can contract a product into a following sum; it
 binds at most the device's storage buffers per stage. Use counts are recounted

@@ -132,6 +132,11 @@ const ADAM_LANE = `fn adam1(a: f32, g: f32, vv: f32, p: f32) -> vec3<f32> {
   let v = vv * bitcast<f32>(P.sb.y) + bitcast<f32>(P.sb.z) * g * g;
   return vec3<f32>(m, v, p - P.f.x * (m / (sqrt(v) / P.f.y + P.f.z)));
 }`;
+// ADAM_LANE for a second parameter in the same dispatch (`adam_pair_inplace4`):
+// its scalars in d (w, beta2, w of adam_v) and sa (stepSize, bc2Sqrt, eps).
+const ADAM_LANE_B = ADAM_LANE.replace('fn adam1(', 'fn adam1b(').replace('P.sb.x', 'P.d.x').replace('P.sb.y', 'P.d.y')
+  .replace('P.sb.z', 'P.d.z').replace('P.f.x', 'bitcast<f32>(P.sa.x)').replace('P.f.y', 'bitcast<f32>(P.sa.y)')
+  .replace('P.f.z', 'bitcast<f32>(P.sa.z)');
 /**
  * One kernel for a chain of elementwise nodes (`fusion`'s chain groups):
  * each member's value computed as its own kernel computes it -- the unary
@@ -147,14 +152,53 @@ const ADAM_LANE = `fn adam1(a: f32, g: f32, vv: f32, p: f32) -> vec3<f32> {
  */
 function chainKernel(members, inputs, outputs) {
   const operand = a => a.member !== undefined ? `w${a.member}` : a.scalar ? `E${a.input}[0]` : `E${a.input}[i]`;
-  const lines = members.map((m, j) => {
+  return [inputs.map((_, k) => `E${k}`), `${CHAIN_FNS}
+${each(chainLines(members, operand, 'P.g.x').join('\n  '))}`, outputs.map((_, k) => `O${k}`)];
+}
+/**
+ * A chain's statements at element `i` (`cols`: a K=1 member's row length;
+ * `zero`: a uniform word that is zero, as `chainFns` was given).
+ */
+function chainLines(members, operand, cols, zero = 'P.len') {
+  return members.map((m, j) => {
     const [x, y] = m.args.map(operand);
     const value = m.kind === 'unary' ? `un(${m.op}u, ${x})`
       : m.kind === 'binary' ? `binop(${m.op}u, ${x}, ${y})`
-      : `bitcast<f32>(P.len) + E${m.args[0].input}[i / P.g.x] * E${m.args[1].input}[i % P.g.x]`;
+      : `bitcast<f32>(${zero}) + E${m.args[0].input}[i / ${cols}] * E${m.args[1].input}[i % ${cols}]`;
     return `let v${j} = ${value}; let w${j} = opaque(v${j});${m.out >= 0 ? ` O${m.out}[i] = v${j};` : ''}`;
   });
-  return [inputs.map((_, k) => `E${k}`), `fn opaque(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) ^ P.len); }
+}
+/**
+ * A chain whose input `mm.input` is a 2-D matmul's result, computed where the
+ * matmul's 16x16 deep-slice kernel (`deepMatmul`) has each output: the
+ * product as that kernel sums it, passed through `opaque` as the chain reads
+ * it from memory, then the chain at that element. Inputs A, B (the
+ * product's), then the chain's others (E<k>).
+ */
+function matmulChainKernel(members, inputs, outputs, mm) {
+  const operand = a => a.member !== undefined ? `w${a.member}` : a.input === mm.input ? 'mmv' : a.scalar ? `E${a.input}[0]` : `E${a.input}[i]`;
+  const [ins, source] = deepMatmul(mm.transB, false, mm.transA, false, DEEP_K,
+    chainLines(members, operand, 'N'));
+  return [[...ins, ...inputs.map((_, k) => k).filter(k => k !== mm.input).map(k => `E${k}`)], source, outputs.map((_, k) => `O${k}`)];
+}
+/**
+ * A split matmul's chain (see `matmulChainKernel`): `reduce`'s sum of the
+ * slices at each output, passed through `opaque`, then the chain there.
+ * Inputs A (the slices), then the chain's others; P.op is the zero word and
+ * g.y the product's row length.
+ */
+function reduceChainKernel(members, inputs, outputs, mmInput) {
+  const operand = a => a.member !== undefined ? `w${a.member}` : a.input === mmInput ? 'mmv' : a.scalar ? `E${a.input}[0]` : `E${a.input}[i]`;
+  const store = '  O[i] = select(s, s / f32(P.len), P.mode == 1u);\n}';
+  const source = KERNELS.reduce[1];
+  if (!source.endsWith(store)) throw new Error('reduce kernel changed');
+  return [['A', ...inputs.map((_, k) => k).filter(k => k !== mmInput).map(k => `E${k}`)],
+    `${chainFns('P.op')}\n${source.slice(0, -store.length)}  let mmv = opaque(s);
+  ${chainLines(members, operand, 'P.g.y', 'P.op').join('\n  ')}
+}`, outputs.map((_, k) => `O${k}`), {threads: 64}];
+}
+const chainFns = zero => CHAIN_FNS.replace('^ P.len)', `^ ${zero})`);
+const CHAIN_FNS = `fn opaque(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) ^ P.len); }
 fn un(op: u32, x: f32) -> f32 {
   var r: f32;
   switch op {
@@ -170,14 +214,45 @@ fn un(op: u32, x: f32) -> f32 {
     default: { r = cdf(x) + x * 0.3989422804014327 * exp(-0.5 * min(x * x, 200.0)); }
   }
   return r;
-}
-${each(lines.join('\n  '))}`, outputs.map((_, k) => `O${k}`)];
-}
+}`;
 const ROW_STATS = `let base = i * P.len;
   var m = A[base];
   for (var j = 1u; j < P.len; j = j + 1u) { let v = A[base + j]; m = select(m, v, v > m || v != v); }
   var s = 0.0;
   for (var j = 0u; j < P.len; j = j + 1u) { s = s + exp(A[base + j] - m); }`;
+function ceBoth(scaled) {
+  const grad = scaled ? 'select(binop(2u, opaque(g), S[0]), binop(2u, S[0], opaque(g)), P.mode == 1u)' : 'g';
+  return `var<workgroup> T: array<f32, 2048>;
+fn opaque(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) ^ P.op); }
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32) {
+  let rows = P.n;
+  for (var i = li; i < rows; i = i + 256u) {
+    ${ROW_STATS}
+    let t = min(u32(max(Tg[i], 0.0)), P.len - 1u);
+    T[i] = log(s) - (A[base + t] - m);
+    for (var j = 0u; j < P.len; j = j + 1u) {
+      let g = (exp(A[base + j] - m) / s - select(0.0, 1.0, j == t)) / f32(P.n);
+      O2[base + j] = ${grad};
+    }
+  }
+  workgroupBarrier();
+  var total = 0.0;
+  if (rows == 1u) { total = T[0] / 1.0; }
+  var len = rows; var src = 0u;
+  loop {
+    if (len <= 1u) { break; }
+    let next = (len + 1u) / 2u; let dst = 1024u - src;
+    for (var j = li; j < next; j = j + 256u) { let jj = j * 2u; var other = 0.0; if (jj + 1u < len) { other = T[src + jj + 1u]; } T[dst + j] = T[src + jj] + other; }
+    workgroupBarrier();
+    src = dst; len = next;
+  }
+  if (li == 0u) {
+    if (rows != 1u) { total = T[src]; }
+    O[0] = total / P.f.x;
+  }
+}`;
+}
 const KERNELS = {
   fill: [[], each('O[i] = P.f.x;')],
   unary: [['A'], each(`let x = A[i];
@@ -338,6 +413,15 @@ fn main(@builtin(local_invocation_index) li: u32) {
     O[0] = total / P.f.x;
   }
 }`],
+  // cross_entropy and its gradient over the same logits and targets in one
+  // workgroup, for up to 256 rows (fusion's `ce` groups): each row's
+  // statistics as both kernels compute them, its loss as `ce_small` and its
+  // gradient as `ce_grad` (O2), then the loss's pairwise sum and mean.
+  ce_both: [['A', 'Tg'], ceBoth(false), ['O', 'O2']],
+  // The same, the gradient then multiplied by a scalar (S[0]) as `binary`
+  // multiplies it: P.mode 1, S is the product's first operand, else its
+  // second. The gradient passes through `opaque` (P.op is zero) first.
+  ce_both_s: [['A', 'Tg', 'S'], ceBoth(true), ['O', 'O2']],
   pair: [['A'], each('let j = i * 2u; var other = 0.0; if (j + 1u < P.len) { other = A[j + 1u]; } O[i] = A[j] + other;')],
   scale: [['A'], each('O[i] = A[i] / P.f.x;')],
   // Eight loads issued before their eight additions, which stay one at a
@@ -915,6 +999,53 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   if (row < M && col < N) { O[outBase + ${transOut ? 'col * M + row' : 'row * N + col'}] = acc; }
 }`];
 }
+/**
+ * The 16x16 kernel with a deeper slice of the reduced axis staged per step
+ * (`bk` values, loaded `bk / 16` per invocation): a small product -- a
+ * layer of a small model, a split-K slice -- waits on global memory once per
+ * slice, so it waits `bk / 16` times less often. Each output still adds its
+ * products one at a time in ascending k from zero, and none past the end of
+ * the range. Operands are loaded along their rows (transposes included).
+ */
+const DEEP_K = 64;
+function deepMatmul(transB, split, transA, transOut, bk, epilogue = null) {
+  const reps = [...Array(bk / 16).keys()];
+  const loadA = transA
+    ? reps.map(q => `{ let kb = t + lid.y + ${16 * q}u; var av = 0.0; if (arow < M && kb < k1) { av = A[aBase + kb * M + arow]; } As[lid.x][lid.y + ${16 * q}u] = av; }`)
+    : reps.map(q => `{ let ka = t + lid.x + ${16 * q}u; var av = 0.0; if (row < M && ka < k1) { av = A[aBase + row * K + ka]; } As[lid.y][lid.x + ${16 * q}u] = av; }`);
+  const loadB = transB
+    ? reps.map(q => `{ let kb = t + lid.x + ${16 * q}u; var bv = 0.0; if (kb < k1 && bcol < N) { bv = B[bBase + bcol * K + kb]; } Bs[lid.x + ${16 * q}u][lid.y] = bv; }`)
+    : reps.map(q => `{ let kb = t + lid.y + ${16 * q}u; var bv = 0.0; if (kb < k1 && col < N) { bv = B[bBase + kb * N + col]; } Bs[lid.y + ${16 * q}u][lid.x] = bv; }`);
+  return [['A', 'B'], `${epilogue ? CHAIN_FNS : ''}
+var<workgroup> As: array<array<f32, ${bk}>, 16>;
+var<workgroup> Bs: array<array<f32, 16>, ${bk}>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  ${split ? `let batches = max(P.g.w, 1u);
+  let part = wg.z / batches; let b = wg.z % batches;
+  let k0 = part * P.sa.z; let k1 = min(K, k0 + P.sa.z); let outBase = (part * batches + b) * M * N;`
+    : 'let b = wg.z; let k0 = 0u; let k1 = K; let outBase = b * M * N;'}
+  let row = wg.y * 16u + lid.y; let col = wg.x * 16u + lid.x;
+  let arow = wg.y * 16u + lid.x; let bcol = wg.x * 16u + lid.y;
+  let aBase = b * P.sa.x; let bBase = b * P.sa.y;
+  var acc = 0.0;
+  for (var t = k0; t < k1; t = t + ${bk}u) {
+    ${loadA.join('\n    ')}
+    ${loadB.join('\n    ')}
+    workgroupBarrier();
+    let span = min(${bk}u, k1 - t);
+    if (span == ${bk}u) {
+      ${[...Array(bk).keys()].map(k => `acc = acc + As[lid.y][${k}u] * Bs[${k}u][lid.x];`).join(' ')}
+    } else {
+      for (var k = 0u; k < span; k = k + 1u) { acc = acc + As[lid.y][k] * Bs[k][lid.x]; }
+    }
+    workgroupBarrier();
+  }
+  if (row < M && col < N) { ${epilogue ? `let i = row * N + col; let mmv = opaque(acc);
+    ${epilogue.join('\n    ')}` : `O[outBase + ${transOut ? 'col * M + row' : 'row * N + col'}] = acc;`} }
+}`];
+}
 // Vectorised elementwise kernels (`each4`): { vec4: true } marks their
 // bindings as vec4 arrays sized to whole vec4s.
 const VEC4 = {vec4: true};
@@ -930,6 +1061,25 @@ Object.assign(KERNELS, {
   adam4: [['W', 'Mi', 'Vi', 'G'], `${ADAM_LANE}\n${each4(`let a = Mi[i]; let g = G[i]; let vv = Vi[i]; let p = W[i];
   let x = adam1(a.x, g.x, vv.x, p.x); let y = adam1(a.y, g.y, vv.y, p.y); let z = adam1(a.z, g.z, vv.z, p.z); let w = adam1(a.w, g.w, vv.w, p.w);
   O[i] = vec4<f32>(x.x, y.x, z.x, w.x); O2[i] = vec4<f32>(x.y, y.y, z.y, w.y); O3[i] = vec4<f32>(x.z, y.z, z.z, w.z);`)}`, ['O', 'O2', 'O3'], VEC4],
+  // Two parameters' in-place Adam passes in one dispatch (fusion's `adam2`
+  // groups): the first P.n values (O, O2, O3 from G), then P.len values
+  // (O4, O5, O6 from G2), each element as adam_inplace4 computes it.
+  adam_pair_inplace4: [['G', 'G2'], `${ADAM_LANE}\n${ADAM_LANE_B}\n@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let i = flat(gid, nwg);
+  let na = (P.n + 3u) / 4u;
+  if (i < na) {
+    let a = O[i]; let g = G[i]; let vv = O2[i]; let p = O3[i];
+    let x = adam1(a.x, g.x, vv.x, p.x); let y = adam1(a.y, g.y, vv.y, p.y); let z = adam1(a.z, g.z, vv.z, p.z); let w = adam1(a.w, g.w, vv.w, p.w);
+    O[i] = vec4<f32>(x.x, y.x, z.x, w.x); O2[i] = vec4<f32>(x.y, y.y, z.y, w.y); O3[i] = vec4<f32>(x.z, y.z, z.z, w.z);
+    return;
+  }
+  let j = i - na;
+  if (j >= (P.len + 3u) / 4u) { return; }
+  let a = O4[j]; let g = G2[j]; let vv = O5[j]; let p = O6[j];
+  let x = adam1b(a.x, g.x, vv.x, p.x); let y = adam1b(a.y, g.y, vv.y, p.y); let z = adam1b(a.z, g.z, vv.z, p.z); let w = adam1b(a.w, g.w, vv.w, p.w);
+  O4[j] = vec4<f32>(x.x, y.x, z.x, w.x); O5[j] = vec4<f32>(x.y, y.y, z.y, w.y); O6[j] = vec4<f32>(x.z, y.z, z.z, w.z);
+}`, ['O', 'O2', 'O3', 'O4', 'O5', 'O6'], VEC4],
   adam_inplace4: [['G'], `${ADAM_LANE}\n${each4(`let a = O[i]; let g = G[i]; let vv = O2[i]; let p = O3[i];
   let x = adam1(a.x, g.x, vv.x, p.x); let y = adam1(a.y, g.y, vv.y, p.y); let z = adam1(a.z, g.z, vv.z, p.z); let w = adam1(a.w, g.w, vv.w, p.w);
   O[i] = vec4<f32>(x.x, y.x, z.x, w.x); O2[i] = vec4<f32>(x.y, y.y, z.y, w.y); O3[i] = vec4<f32>(x.z, y.z, z.z, w.z);`)}`, ['O', 'O2', 'O3'], VEC4],
@@ -948,6 +1098,7 @@ for (const transposed of [false, true])
         KERNELS[`${name}_r4`] = tiledMatmul(4, 4, 16, transposed, split, transA, transOut);
         KERNELS[`${name}_r8`] = tiledMatmul(8, 8, 32, transposed, split, transA, transOut);
         if (transA || transOut) KERNELS[name] = baseMatmul(transposed, split, transA, transOut);
+        KERNELS[`${name}_d`] = deepMatmul(transposed, split, transA, transOut, DEEP_K);
       }
 /** A float matmul kernel's name: `_t` B stored [N, K], `_ta` A read through
  * its transpose, `_to` the output written transposed, `_split` a K slice. */
@@ -1000,6 +1151,7 @@ export class WebGPUBackend {
       description: info.description, isFallbackAdapter: info.isFallbackAdapter ?? null} : null;
     this.pipelines = new Map(); this.lost = null; this.scopeOpen = false; this.matmulTile = null;
     this.bigTiles = (device.limits?.maxComputeWorkgroupStorageSize ?? 0) >= BIG_TILE_BYTES;
+    this.deep = true;
     // Adam groups in one pass (`adam`); false keeps three (tests compare the bits).
     this.fuseAdam = true;
     // Transposes read through by matmuls and one-dispatch reductions; false
@@ -1174,6 +1326,34 @@ export class WebGPUBackend {
     }
   }
   /**
+   * Two Adam groups updating in place (`adam2`), in one dispatch: each
+   * parameter's elements computed exactly as `adam` computes them. `gA`,
+   * `gB` the gradients; `ipA`, `ipB` the held m, v and p of each.
+   */
+  async adamPair(A, B, gA, gB, ipA, ipB, stepped) {
+    this.live();
+    const [mA, vA, uA, mB, vB, uB] = [A.M, A.V, A.U, B.M, B.V, B.U].map(stepped);
+    const fill = (w, f) => {
+      w[0] = uA.size; w[3] = uB.size;
+      f[12] = mA.w; f[13] = vA.beta2; f[14] = vA.w; f.set([uA.stepSize, uA.bc2Sqrt, uA.eps], 20);
+      f[4] = mB.w; f[5] = vB.beta2; f[6] = vB.w; f.set([uB.stepSize, uB.bc2Sqrt, uB.eps], 8);
+    };
+    let scoped = this.debug;
+    if (scoped) this.device.pushErrorScope('validation');
+    try {
+      await this.dispatch('adam_pair_inplace4', fill, [gA, gB], [...ipA, ...ipB], (Math.ceil(uA.size / 4) + Math.ceil(uB.size / 4)) * 4);
+      if (scoped) {
+        scoped = false;
+        const error = await this.device.popErrorScope();
+        check(!error, 'GPU', `adam: ${error?.message}`);
+      }
+      return [...ipA, ...ipB];
+    } catch (error) {
+      if (scoped) await this.device.popErrorScope().catch(() => {});
+      throw error;
+    }
+  }
+  /**
    * One matmul: A (read through its transpose with `transA`), B (stored
    * [N, K] with `transB`), into `out` (written transposed with `transOut`).
    * The tile, the addressing and a split of K change who computes an output
@@ -1183,7 +1363,8 @@ export class WebGPUBackend {
     const kernel = n.bQuant ? `matmul_${n.bQuant.dtype.replace('_', '')}` : matmulName(transB, transA, transOut, false);
     const split = transOut ? null : this.splitParts(n);
     const tile = n.bQuant ? 1 : this.tileFor(n.m, n.n, n.batch * (split ? split.parts : 1)), side = 16 * tile;
-    const suffix = tile === 1 ? '' : `_r${tile}`;
+    // The 16x16 kernel's deep-slice variant (`deepMatmul`) unless pinned off.
+    const suffix = tile !== 1 ? `_r${tile}` : this.deep !== false && !n.bQuant ? '_d' : '';
     if (!split) {
       await this.dispatch(kernel + suffix, u => {u.set([n.m, n.k, n.n, n.batch], 16); u[8] = n.aBatchStride; u[9] = n.bBatchStride;},
         refs, out, n.size, [Math.ceil(n.n / side), Math.ceil(n.m / side), n.batch]);
@@ -1202,7 +1383,7 @@ export class WebGPUBackend {
     } finally { this.free(partials); }
   }
   /** What the fusion plan depends on besides the plan (fusion.mjs caches by it). */
-  fusionKey() { return `${this.fuse !== false}|${this.fuseAdam !== false}`; }
+  fusionKey() { return `${this.fuse !== false}|${this.fuseAdam !== false}|${this.matmulTile}|${this.deep !== false}|${this.bigTiles}`; }
   /**
    * The groups this backend computes together (fusion.mjs): Adam's three
    * updates of a parameter (one pass), and a 2-D matmul reading an operand
@@ -1221,6 +1402,17 @@ export class WebGPUBackend {
     if (this.fuse === false) return {groups, elided};
     const consumers = nodes.map(() => []), outputs = new Set(plan.outputs.map(o => root[o.id]));
     for (const n of nodes) if (live[n.id] && !n.alias) for (const r of n.refs) consumers[root[r]].push([n.id, r]);
+    // Adam groups two by two (`adam2`): run where the later one stands, as
+    // one dispatch when both update in place. The earlier one's results
+    // must not be read before then.
+    const adams = groups.filter(g => g.kind === 'adam').sort((a, b) => a.id - b.id);
+    for (let k = 0; k + 1 < adams.length; k += 2) {
+      const [A, B] = [adams[k], adams[k + 1]];
+      if (!A.exposed.every(id => consumers[id].every(([c]) => c > B.id || A.exposed.includes(c)))) { k--; continue; }
+      groups.splice(groups.indexOf(A), 1);
+      groups.splice(groups.indexOf(B), 1, {kind: 'adam2', id: B.id, parts: [A, B], refs: [...A.refs, ...B.refs], exposed: [...A.exposed, ...B.exposed]});
+      elided.add(A.id);
+    }
     const eligible = m => m.op === 'matmul' && !m.bQuant && m.batch === 1 && nodes[m.a].shape.length === 2 && nodes[m.b].shape.length === 2;
     const isT = id => nodes[id].op === 'transpose';
     const memo = new Map();
@@ -1249,6 +1441,7 @@ export class WebGPUBackend {
       if (outT !== null) elided.add(n.id);
     }
     for (const id of memo.keys()) if (memo.get(id)) elided.add(id);
+    this.crossEntropy(plan, live, consumers, outputs, groups, elided);
     this.chains(plan, live, consumers, outputs, groups, elided);
     return {groups, elided};
   }
@@ -1301,22 +1494,105 @@ export class WebGPUBackend {
       }
       if (members.length < 2) continue;
       const sig = JSON.stringify(spec.map(m => [m.kind, m.op, m.args.map(a => a.member ?? `${a.scalar ? 's' : 'e'}${a.input}`), m.out]));
-      const name = `chain:${sig}`;
-      if (!KERNELS[name]) KERNELS[name] = chainKernel(spec, inputs, exposed);
       const k1 = members.map(id => nodes[id]).find(m => m.op === 'matmul');
-      groups.push({kind: 'chain', id: anchor, kernel: name, size: n.size, cols: k1 ? k1.n : 0, refs: inputs, exposed});
+      // A 2-D matmul only this chain reads, element for element, which runs
+      // on the 16x16 deep-slice kernel whole: computed in the chain's kernel.
+      let mm = null;
+      for (let k = 0; k < inputs.length && !mm && this.deep !== false && inputs.length + exposed.length + 1 <= buffers; k++) {
+        const id = root[inputs[k]], node = nodes[id];
+        if (outputs.has(id) || !consumers[id].every(([c]) => set.has(c)) || spec.some(m => m.args.some(a => a.input === k && a.scalar))) continue;
+        const g = groups.find(x => x.kind === 'matmul' && x.id === id);
+        const src = g ? (g.transOut ? null : {node: g.node, transA: g.transA, transB: g.transB, refs: g.refs, group: g})
+          : node.op === 'matmul' && !taken.has(id) && !elided.has(id) && !kind(id) ? {node, transA: false, transB: !!node.transposed, refs: node.refs} : null;
+        const m = src?.node;
+        if (!m || m.bQuant || m.batch !== 1 || m.size !== n.size || nodes[m.a].shape.length !== 2 || nodes[m.b].shape.length !== 2 ||
+          (k1 && k1.n !== m.n)) continue;
+        const split = this.splitParts(m);
+        if (this.tileFor(m.m, m.n, split ? split.parts : 1) !== 1) continue;
+        mm = {...src, input: k, split};
+      }
+      const name = !mm ? `chain:${sig}` : mm.split ? `reducechain:${mm.input}:${sig}`
+        : `mmchain:${matmulName(mm.transB, mm.transA, false, false)}:${mm.input}:${sig}`;
+      if (!KERNELS[name]) KERNELS[name] = !mm ? chainKernel(spec, inputs, exposed) : mm.split ? reduceChainKernel(spec, inputs, exposed, mm.input)
+        : matmulChainKernel(spec, inputs, exposed, mm);
+      const refs = mm ? [...mm.refs, ...inputs.filter((_, k) => k !== mm.input)] : inputs;
+      groups.push({kind: 'chain', id: anchor, kernel: name, size: n.size, cols: k1 ? k1.n : 0, refs, exposed,
+        mm: mm && {node: mm.node, transA: mm.transA, transB: mm.transB, split: mm.split}});
+      if (mm) {
+        const id = root[inputs[mm.input]];
+        if (mm.group) groups.splice(groups.indexOf(mm.group), 1);
+        taken.add(id); elided.add(id);
+      }
       for (const id of members) { taken.add(id); if (id !== anchor) elided.add(id); }
+    }
+  }
+  /**
+   * A cross_entropy and its gradient over the same logits and targets, of at
+   * most 256 rows, as one `ce_both` dispatch -- with the gradient's product
+   * by a scalar when that is its only reader. Every reader of a member
+   * outside the group must come after it.
+   */
+  crossEntropy(plan, live, consumers, outputs, groups, elided) {
+    const nodes = plan.nodes, root = plan.root, taken = new Set(groups.map(g => g.id));
+    const free = n => live[n.id] && !n.alias && !taken.has(n.id) && !elided.has(n.id);
+    for (const G of nodes) {
+      if (G.op !== 'cross_entropy_grad' || !free(G) || G.rows > 256) continue;
+      const L = nodes.find(n => n.op === 'cross_entropy' && free(n) && root[n.refs[0]] === root[G.refs[0]] && root[n.refs[1]] === root[G.refs[1]]);
+      if (!L) continue;
+      let S = null;
+      const readers = consumers[G.id];
+      if (!outputs.has(G.id) && readers.length === 1) {
+        const M = nodes[readers[0][0]];
+        const side = M.mode === 'aScalar' ? 1 : M.mode === 'bScalar' ? 0 : -1;
+        if (M.op === 'mul' && side >= 0 && free(M) && root[M.refs[side]] === G.id && M.size === G.size) S = M;
+      }
+      const members = S ? [L, G, S] : [L, G], ids = new Set(members.map(n => n.id));
+      const anchor = Math.max(...ids);
+      if (!members.every(n => n.id === anchor || consumers[n.id].every(([c]) => ids.has(c) || c > anchor))) continue;
+      const refs = [L.refs[0], L.refs[1], ...(S ? [S.refs[S.mode === 'aScalar' ? 0 : 1]] : [])];
+      groups.push({kind: 'ce', id: anchor, rows: L.rows, cols: L.cols, gradSize: G.size, scalar: S ? (S.mode === 'aScalar' ? 1 : 2) : 0,
+        refs, exposed: [L.id, S ? S.id : G.id]});
+      for (const n of members) { taken.add(n.id); if (n.id !== anchor) elided.add(n.id); }
     }
   }
   /** Runs one fusion group; returns the handles of its `exposed` nodes. */
   async runGroup(item, hs, {stepped, inPlace = null}) {
+    if (item.kind === 'adam2') {
+      const [A, B] = item.parts, n = A.refs.length, [ipA, ipB] = inPlace ?? [null, null];
+      // Each group's refs: m's (mIn, g), v's (vIn, g), then p.
+      if (ipA && ipB && this.vectorize) return this.adamPair(A, B, hs[1], hs[n + 1], ipA, ipB, stepped);
+      const a = await this.runGroup(A, hs.slice(0, n), {stepped, inPlace: ipA});
+      return [...a, ...await this.runGroup(B, hs.slice(n), {stepped, inPlace: ipB})];
+    }
     if (item.kind === 'adam') {
       return this.adam(stepped(item.M), stepped(item.V), stepped(item.U), [hs[0], hs[1]], [hs[2], hs[3]], [hs[4]], inPlace);
     }
-    if (item.kind === 'chain') {
-      const outs = item.exposed.map(() => this.alloc(item.size));
+    if (item.kind === 'ce') {
+      const outs = [this.alloc(1), this.alloc(item.gradSize)];
       try {
-        await this.dispatch(item.kernel, u => {u[0] = item.size; u[3] = 0; u[16] = item.cols;}, hs, outs, item.size);
+        await this.dispatch(item.scalar ? 'ce_both_s' : 'ce_both', (u, f) => {
+          u[0] = item.rows; u[1] = item.scalar; u[2] = 0; u[3] = item.cols; f[20] = item.rows;
+        }, hs, outs, 1, [1, 1, 1]);
+      } catch (error) { for (const h of outs) this.free(h); throw error; }
+      return outs;
+    }
+    if (item.kind === 'chain') {
+      const outs = item.exposed.map(() => this.alloc(item.size)), mm = item.mm, m = mm?.node;
+      try {
+        if (mm?.split) {
+          // The product's slices as `matmul` computes them, then their sum and the chain.
+          const {parts, chunk} = mm.split, partials = this.alloc(m.size * parts);
+          try {
+            await this.dispatch(`${matmulName(mm.transB, mm.transA, false, true)}_d`, u => {
+              u.set([m.m, m.k, m.n, m.batch], 16); u[8] = m.aBatchStride; u[9] = m.bBatchStride; u[10] = chunk;
+            }, hs.slice(0, 2), partials, m.size * parts, [Math.ceil(m.n / 16), Math.ceil(m.m / 16), parts]);
+            await this.dispatch(item.kernel, u => {u[0] = m.size; u[1] = 0; u[2] = 0; u[3] = parts; u[16] = m.size; u[17] = m.n;},
+              [partials, ...hs.slice(2)], outs, m.size);
+          } finally { this.free(partials); }
+        } else if (mm) {
+          await this.dispatch(item.kernel, u => {u.set([m.m, m.k, m.n, m.batch], 16); u[8] = m.aBatchStride; u[9] = m.bBatchStride; u[3] = 0;},
+            hs, outs, item.size, [Math.ceil(m.n / 16), Math.ceil(m.m / 16), 1]);
+        } else await this.dispatch(item.kernel, u => {u[0] = item.size; u[3] = 0; u[16] = item.cols;}, hs, outs, item.size);
       } catch (error) { for (const h of outs) this.free(h); throw error; }
       return outs;
     }

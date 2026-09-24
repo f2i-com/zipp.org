@@ -21,6 +21,20 @@
 //!   `bytes` bytes of the Python state's `__zipp_ngpu_up`. Returns
 //!   `"<n>\n<json>"`: the reply, its arrays likewise out of line in `n` bytes
 //!   that `zipp.gpu.fetch` then copies into `__zipp_ngpu_down`.
+//! - `zipp.gpu.step(session, ids, readback, bytes)`: a run of prepared steps
+//!   in binary form, for the session's replay only (see
+//!   [`GpuHost::replay_binary`]): each step's fed float32 arrays one after
+//!   another in the first `bytes` bytes of `__zipp_ngpu_up`, in the order of
+//!   `ids` (comma-separated input ids), `readback` the output names one per
+//!   line. Returns `""` when the replay does not serve it (the caller then
+//!   sends `gpu.session.run`), `"E\n<code>\n<message>"` when it failed once
+//!   device work had begun (the session is poisoned), or
+//!   `"R\n<n>\n<fetch>\n<json>\n<stats>"`: `json` is `{"first", "step",
+//!   "outputs": [[name, elements, shape], ...]}`, `stats` the run's statistics
+//!   as JSON (gpu-lab's `stats`), and the run's values are `n`
+//!   bytes, step after step and output after output, already in
+//!   `__zipp_ngpu_down` or, when `fetch` is 1 (it was too small), left for
+//!   `zipp.gpu.fetch`.
 use zipp_vm::embed::{HostCtx, HostValue};
 
 use crate::{GpuHost, GpuOptions};
@@ -138,6 +152,89 @@ impl SyncBridge {
                 }
                 let head = format!("{}\n{out}", blob.len());
                 self.pending = blob;
+                Ok(head)
+            }
+            "zipp.gpu.step" => {
+                if !self.open() {
+                    return Err("RuntimeError: no native GPU host".into());
+                }
+                let t0 = std::time::Instant::now();
+                let token = args.first().ok_or("TypeError: step session")?;
+                let ids: Vec<u32> = args
+                    .get(1)
+                    .ok_or("TypeError: step ids")?
+                    .split(',')
+                    .map(|id| id.parse().map_err(|_| "TypeError: step ids"))
+                    .collect::<Result<_, _>>()?;
+                let readback: Vec<&str> = args
+                    .get(2)
+                    .ok_or("TypeError: step read-back")?
+                    .split('\n')
+                    .collect();
+                let bytes: usize = args
+                    .get(3)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("TypeError: step byte count")?;
+                let upload = crate::device::region(ctx, "__zipp_ngpu_up", bytes)?;
+                let Opened::Yes(host) = &mut self.host else {
+                    unreachable!("opened above")
+                };
+                let run = host.replay_binary(token, &ids, &readback, &upload[..bytes]);
+                let t1 = std::time::Instant::now();
+                let head = match run {
+                    None => String::new(),
+                    Some(crate::BinaryRun::Failed { code, message }) => {
+                        format!("E\n{code}\n{}", message.chars().take(512).collect::<String>())
+                    }
+                    Some(crate::BinaryRun::Ran {
+                        first,
+                        step,
+                        outputs,
+                        values,
+                        stats,
+                    }) => {
+                        let mut json = format!("{{\"first\":{first},\"step\":{step},\"outputs\":[");
+                        for (i, (name, size, shape)) in outputs.iter().enumerate() {
+                            if i > 0 {
+                                json.push(',');
+                            }
+                            json.push('[');
+                            json_string(name, &mut json);
+                            json.push_str(&format!(",{size},["));
+                            for (j, d) in shape.iter().enumerate() {
+                                if j > 0 {
+                                    json.push(',');
+                                }
+                                json.push_str(&format!("{d}"));
+                            }
+                            json.push_str("]]");
+                        }
+                        json.push_str("]}\n");
+                        write_json(&stats, &mut json, &mut Vec::new());
+                        let n: usize = values.iter().map(|v| v.len() * 4).sum();
+                        // Straight into the Python state's read-back buffer when it fits.
+                        let fits = ctx
+                            .typed_array_region("__zipp_ngpu_down")
+                            .is_ok_and(|(_, count, kind)| kind == 1 && count >= n);
+                        let target: &mut [u8] = if fits {
+                            crate::device::region(ctx, "__zipp_ngpu_down", n)?
+                        } else {
+                            self.pending.resize(n, 0);
+                            &mut self.pending[..]
+                        };
+                        let mut at = 0;
+                        for v in values.iter().flatten() {
+                            target[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                            at += 4;
+                        }
+                        format!("R\n{n}\n{}\n{json}", if fits { 0 } else { 1 })
+                    }
+                };
+                if let Some(p) = self.profile.as_mut() {
+                    p.0 += 1;
+                    p.1 += (t1 - t0).as_secs_f64() * 1000.0;
+                    p.2 += t1.elapsed().as_secs_f64() * 1000.0;
+                }
                 Ok(head)
             }
             "zipp.gpu.fetch" => {

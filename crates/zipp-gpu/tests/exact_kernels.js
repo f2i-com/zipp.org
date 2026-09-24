@@ -1,6 +1,7 @@
 // Exactness checks for the WebGPU backend's faster kernels, run natively by
-// tests/protocol_cases.rs (and in Chrome the same way): the register-blocked
-// matmul tiles against the 16x16 kernel on the same device, and the axis-sum
+// tests/protocol_cases.rs (and in Chrome the same way): the 16x16 matmul
+// kernel's deep-slice variant and the register-blocked tiles against the
+// 16x16 kernel on the same device, and the axis-sum
 // and index_add kernels against cpu-js, bit for bit (a zero's sign included).
 // Each returns {failures, report}.
 
@@ -9,8 +10,11 @@
 // its 64 accumulators, DXC half a minute; zipp-gpu's driver.js). There, too,
 // fused matmuls are checked on the tile they choose only: FXC takes ~20 s
 // over each 64x64 variant (and the native host keeps the 16x16 kernel on it).
+// With FXC the native host also keeps the 16x16 kernel's plain 16-deep
+// slices (FXC takes 9 s over the 64-deep variant): checked as it runs there.
 const D3D12 = typeof __zgpuAdapter === 'string' && /\(dx12\b/.test(__zgpuAdapter);
-const TILES = D3D12 ? [4] : [4, 8], FUSED_TILES = D3D12 ? [] : TILES;
+const FXC = D3D12 && /\bfxc\)$/.test(__zgpuAdapter);
+const TILES = D3D12 ? [4] : [4, 8], FUSED_TILES = D3D12 ? [] : TILES, DEEP = FXC ? [] : [1];
 async function exactMatmulTiles(M) {
   const rt = await M.createRuntime({backend: 'webgpu', limits: {maxElements: 1 << 26, maxInputElements: 1 << 26, maxOutputElements: 1 << 26, maxWork: Number.MAX_SAFE_INTEGER, maxLogicalBytes: 8 * 1024 * 1024 * 1024}});
   const impl = rt.impl;
@@ -41,17 +45,21 @@ async function exactMatmulTiles(M) {
     const nodes = [{id: 0, op: 'input', shape: sa, data: data(size(sa))}, {id: 1, op: 'input', shape: sb, data: data(size(sb))},
       transposed ? {id: 2, op: 'matmul', a: 0, b: 1, transposed: true} : {id: 2, op: 'matmul', a: 0, b: 1}];
     const program = {version: 2, nodes, outputs: [{name: 'r', id: 2}]};
+    // The reference: the 16x16 kernel staging 16 values of k per step.
     const bits = {};
-    for (const tile of [1, ...TILES]) {
-      impl.matmulTile = tile;
+    impl.deep = false;
+    for (const tile of ['ref', ...DEEP, ...TILES]) {
+      impl.matmulTile = tile === 'ref' ? 1 : tile;
       const out = await rt.execute(program, {typedOutputs: true});
       bits[tile] = new Uint32Array(out.outputs.r.data.buffer.slice(0));
+      impl.deep = true;
     }
     impl.matmulTile = null;
-    const row = {a: sa, b: sb, transposed: !!transposed, n: bits[1].length};
-    for (const tile of TILES) {
+    const row = {a: sa, b: sb, transposed: !!transposed, n: bits.ref.length};
+    // r1: the same kernel staging 64 (`_d`); r4, r8: the register-blocked tiles.
+    for (const tile of [...DEEP, ...TILES]) {
       let diff = 0, first = -1;
-      for (let i = 0; i < bits[1].length; i++) if (bits[1][i] !== bits[tile][i]) { diff++; if (first < 0) first = i; }
+      for (let i = 0; i < bits.ref.length; i++) if (bits.ref[i] !== bits[tile][i]) { diff++; if (first < 0) first = i; }
       row[`r${tile}`] = diff;
       if (diff) { failures++; row[`first${tile}`] = first; }
     }
@@ -221,6 +229,7 @@ async function exactFusion(M) {
   const data = n => Float32Array.from({length: n}, () => { const r = rnd(); return r < 0.04 ? (r < 0.02 ? -0 : 0) : (rnd() - 0.5) * (r < 0.1 ? 40 : 3); });
   // One runtime, the fused and unfused plans by turns (fusion.mjs caches each).
   const rt = await M.createRuntime({backend: 'webgpu', limits});
+  rt.impl.deep = !FXC;
   const run = async (program, fuse) => {
     rt.impl.fuse = fuse;
     const out = await rt.execute(program, {typedOutputs: true});
@@ -244,13 +253,15 @@ async function exactFusion(M) {
       {id: 10, op: 'transpose', a: 6}, {id: 11, op: 'matmul', a: 2, b: 1, transposed: true}, {id: 12, op: 'transpose', a: 11},
       {id: 13, op: 'matmul', a: 4, b: 10}, {id: 14, op: 'transpose', a: 13}];
     // Each tile (the chosen one, and 4 and 8 pinned) reading through the transposes.
-    for (const tile of [null, ...FUSED_TILES]) {
-      if (tile && m * n < 4096) continue;
-      rt.impl.matmulTile = tile;
+    for (const tile of [null, 'shallow', ...FUSED_TILES]) {
+      if (typeof tile === 'number' && m * n < 4096) continue;
+      rt.impl.matmulTile = typeof tile === 'number' ? tile : null;
+      rt.impl.deep = tile !== 'shallow' && !FXC;
       await compare(`matmul ${m}x${k}x${n} through transposes${tile ? `, tile ${tile}` : ''}`, {version: 2, nodes,
         outputs: [{name: 'a', id: 7}, {name: 'b', id: 8}, {name: 'c', id: 9}, {name: 'd', id: 12}, {name: 'e', id: 14}]});
     }
     rt.impl.matmulTile = null;
+    rt.impl.deep = !FXC;
   }
   for (const n of [1, 2, 3, 63, 64, 65, 255, 256, 257, 1000, 1023, 1024, 1025, 2047, 2048]) {
     const nodes = [{id: 0, op: 'input', shape: [n], data: data(n)}, {id: 1, op: 'sum', a: 0}, {id: 2, op: 'mean', a: 0}];
@@ -261,6 +272,14 @@ async function exactFusion(M) {
       {id: 1, op: 'input', shape: [rows], data: Float32Array.from({length: rows}, () => Math.floor(rnd() * cols))},
       {id: 2, op: 'cross_entropy', a: 0, b: 1}];
     await compare(`cross_entropy ${rows}x${cols}`, {version: 2, nodes, outputs: [{name: 'l', id: 2}]});
+    // With its gradient (one dispatch up to 256 rows): alone, and times a
+    // scalar on either side of the product.
+    nodes.push({id: 3, op: 'cross_entropy_grad', a: 0, b: 1}, {id: 4, op: 'input', shape: [], data: [0.75]},
+      {id: 5, op: 'cross_entropy_grad', a: 0, b: 1}, {id: 6, op: 'mul', a: 4, b: 5},
+      {id: 7, op: 'cross_entropy', a: 0, b: 1}, {id: 8, op: 'cross_entropy_grad', a: 0, b: 1}, {id: 9, op: 'mul', a: 8, b: 4});
+    await compare(`cross_entropy ${rows}x${cols} with its gradient`, {version: 2, nodes, outputs: [{name: 'l', id: 2}, {name: 'g', id: 3}]});
+    await compare(`cross_entropy ${rows}x${cols} with its gradient times a scalar`, {version: 2, nodes,
+      outputs: [{name: 'l', id: 2}, {name: 'g', id: 6}, {name: 'm', id: 7}, {name: 'h', id: 9}]});
   }
   // Elementwise chains: a product into a sum (x*y + z), scalar operands on
   // either side, a member read twice, members read after the chain, a K=1
@@ -276,6 +295,21 @@ async function exactFusion(M) {
       {id: 18, op: 'div', a: 17, b: 3}, {id: 19, op: 'exp', a: 10}, {id: 20, op: 'gt', a: 19, b: 3}, {id: 21, op: 'mul', a: 20, b: 15}];
     await compare(`chains ${r}x${c}`, {version: 3, nodes,
       outputs: [{name: 'a', id: 11}, {name: 'b', id: 18}, {name: 'c', id: 21}, {name: 'd', id: 6}]});
+  }
+  // Matmuls computed in the chain that reads them: a layer (x W^T + b,
+  // activation), a gradient through an activation's mask, plain and through
+  // transposes, ragged sizes, split along k (summed in the chain's kernel),
+  // and one whose product another node also reads.
+  for (const [m, k, n] of [[1, 1, 1], [5, 3, 7], [64, 256, 10], [33, 100, 257], [64, 64, 64], [17, 300, 31], [64, 784, 256], [16, 2048, 100], [3, 5000, 9]]) {
+    const nodes = [{id: 0, op: 'input', shape: [m, k], data: data(m * k)}, {id: 1, op: 'input', shape: [n, k], data: data(n * k)},
+      {id: 2, op: 'transpose', a: 1}, {id: 3, op: 'matmul', a: 0, b: 2}, {id: 4, op: 'input', shape: [m, 1], data: new Float32Array(m).fill(1)},
+      {id: 5, op: 'input', shape: [1, n], data: data(n)}, {id: 6, op: 'matmul', a: 4, b: 5}, {id: 7, op: 'add', a: 3, b: 6}, {id: 8, op: 'relu', a: 7},
+      {id: 9, op: 'input', shape: [m, k], data: data(m * k)}, {id: 10, op: 'matmul', a: 9, b: 1, transposed: true},
+      {id: 11, op: 'positive', a: 7}, {id: 12, op: 'mul', a: 10, b: 11},
+      {id: 13, op: 'input', shape: [k, m], data: data(m * k)}, {id: 14, op: 'transpose', a: 13}, {id: 15, op: 'matmul', a: 14, b: 2},
+      {id: 16, op: 'tanh', a: 15}, {id: 17, op: 'exp', a: 16}, {id: 18, op: 'matmul', a: 0, b: 2}, {id: 19, op: 'neg', a: 18}, {id: 20, op: 'sigmoid', a: 19}];
+    await compare(`matmul ${m}x${k}x${n} into chains`, {version: 2, nodes,
+      outputs: [{name: 'a', id: 8}, {name: 'b', id: 12}, {name: 'c', id: 17}, {name: 'd', id: 20}, {name: 'e', id: 18}]});
   }
   // A chain reading more inputs than one shader may bind (split in two).
   {

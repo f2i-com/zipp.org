@@ -10,6 +10,21 @@
  *                             "value": ...} or {"ok": False, "error": ...}),
  *                             for the same five request kinds a browser
  *                             host serves, answered before it returns
+ *   native_step(session, ids, readback, arrays)
+ *                          -> a prepared session's run of steps in binary
+ *                             form, for the embedder's native replay of it:
+ *                             `arrays` each step's fed float32 storages in
+ *                             the order of `ids` (comma-separated input ids),
+ *                             `readback` the output names one per line.
+ *                             None when the replay does not serve it (send
+ *                             `gpu.session.run`, which then serves it as
+ *                             always); (False, code, message) when it failed
+ *                             once device work began (the session is
+ *                             poisoned); else (True, first, step, names,
+ *                             shapes, values, stats): `values[s][o]` step s's
+ *                             output `names[o]` as float32 storage, `stats`
+ *                             the run's statistics as JSON text (decoded by
+ *                             whoever reads them)
  *
  * Both go through `__zippHostCall`, which throws when the embedder installed
  * no host (any other build, a sandbox, the browser engine answering "unknown
@@ -91,6 +106,56 @@ var __zipp_ngpu_down = new Uint8Array(1 << 16);
         }
         return decode(JSON.parse(head.slice(split + 1)), 0);
     }
+    // The binary prepared step (see the header): no JSON either way.
+    function step(token, ids, readback, arrays) {
+        const items = arrays.items;
+        let bytes = 0;
+        for (let i = 0; i < items.length; i++) {
+            if (!rt.isFloat32Storage(items[i])) return null;
+            bytes += items[i].data.byteLength;
+        }
+        __zipp_ngpu_up = grow(__zipp_ngpu_up, bytes);
+        let at = 0;
+        for (let i = 0; i < items.length; i++) {
+            const d = items[i].data;
+            __zipp_ngpu_up.set(new Uint8Array(d.buffer, d.byteOffset, d.byteLength), at);
+            at += d.byteLength;
+        }
+        const head = String(__zippHostCall("zipp.gpu.step", token, ids, readback, bytes));
+        if (head.length === 0) return null;
+        if (head.charCodeAt(0) === 69) { // "E\n<code>\n<message>"
+            const split = head.indexOf("\n", 2);
+            return rt.tuple([false, head.slice(2, split), head.slice(split + 1)]);
+        }
+        // "R\n<bytes>\n<fetch>\n<json>\n<stats>"
+        const a = head.indexOf("\n", 2), b = head.indexOf("\n", a + 1), c = head.indexOf("\n", b + 1);
+        const size = Number(head.slice(2, a));
+        if (head.charCodeAt(a + 1) === 49) {
+            __zipp_ngpu_down = grow(__zipp_ngpu_down, size);
+            __zippHostCall("zipp.gpu.fetch");
+        }
+        const reply = JSON.parse(head.slice(b + 1, c)), outputs = reply.outputs;
+        const names = [], shapes = [];
+        let stepBytes = 0;
+        for (let o = 0; o < outputs.length; o++) {
+            names.push(outputs[o][0]);
+            shapes.push(decode(outputs[o][2], 1));
+            stepBytes += outputs[o][1] * 4;
+        }
+        const values = [];
+        for (let s = 0, off = 0; off < size; s++) {
+            const row = [];
+            for (let o = 0; o < outputs.length; o++) {
+                const n = outputs[o][1] * 4;
+                row.push(rt.float32Storage(new Float32Array(__zipp_ngpu_down.slice(off, off + n).buffer)));
+                off += n;
+            }
+            values.push(rt.list(row));
+            if (stepBytes === 0) break;
+        }
+        return rt.tuple([true, decode(reply.first, 1), decode(reply.step, 1), rt.list(names), rt.list(shapes),
+            rt.list(values), head.slice(c + 1)]);
+    }
     const factory = rt.builtinModules.get("_zipp_gpu");
     if (factory === undefined) return;
     rt.builtinModules.set("_zipp_gpu", () => {
@@ -100,6 +165,12 @@ var __zipp_ngpu_down = new Uint8Array(1 << 16);
             if (typeof a[0] !== "string") rt.fail(E.TypeError, "native() needs a request kind");
             if (!open()) rt.fail(E.RuntimeError, "no native GPU host");
             return request(a[0], a[1]);
+        }));
+        m.globals.set("native_step", rt.builtin("native_step", 4, (a) => {
+            if (typeof a[0] !== "string" || typeof a[1] !== "string" || typeof a[2] !== "string" ||
+                a[3] === null || typeof a[3] !== "object" || a[3].cls !== T.list) rt.fail(E.TypeError, "native_step(session, ids, readback, arrays)");
+            if (!open()) rt.fail(E.RuntimeError, "no native GPU host");
+            return step(a[0], a[1], a[2], a[3]);
         }));
         return m;
     });

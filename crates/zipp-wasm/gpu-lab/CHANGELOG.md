@@ -10,6 +10,13 @@ index, which Direct3D's FXC compiler refuses; results are unchanged.
 Readback's finiteness rule is now one exported function, `checkFiniteOutput`
 (graph.mjs), which a host may serve natively.
 
+## Fewer dispatches per training step
+
+WebGPU computes a cross-entropy loss and its gradient in one dispatch, two parameters' Adam
+updates in one, and an elementwise chain in the kernel of the small matmul (or split-K sum) it
+reads; small matmuls stage 64 values of the reduced axis per step (the same order of additions).
+A small MLP's training step goes from about 20 dispatches to 12, bit for bit the same.
+
 ## Execution plans, fusion and a 128x128 matmul tile
 
 A plan now runs as execution items (`src/fusion.mjs`): dead nodes are dropped,

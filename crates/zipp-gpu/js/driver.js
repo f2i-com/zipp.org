@@ -39,9 +39,13 @@ function __zgpuInit(backend, policy, adapter, replay) {
       // Direct3D 12 with FXC takes ~20 s to compile the 64x64 matmul tile
       // (the 16x16 kernel: half a second; DXC, when a dxcompiler.dll is
       // there, 1.6 s), and the 128x128 one DXC ~28 s, FXC 15 minutes
-      // (Vulkan: 0.06 s). The tile changes no result bit, only speed, so
-      // D3D12 on FXC keeps the 16x16 kernel and on DXC the 64x64 tile.
-      if (/\(dx12\b.*\bfxc\)$/.test(__zgpuAdapter || '') && 'matmulTile' in runtime.impl) runtime.impl.matmulTile = 1;
+      // (Vulkan: 0.06 s); the 16x16 kernel's 64-deep variant FXC 9 s (DXC
+      // 1.4 s). The kernel changes no result bit, only speed, so D3D12 on FXC
+      // keeps the plain 16x16 kernel and on DXC the 64x64 tile.
+      if (/\(dx12\b.*\bfxc\)$/.test(__zgpuAdapter || '') && 'matmulTile' in runtime.impl) {
+        runtime.impl.matmulTile = 1;
+        runtime.impl.deep = false;
+      }
       if (/\(dx12\b/.test(__zgpuAdapter || '') && 'bigTiles' in runtime.impl) runtime.impl.bigTiles = false;
     }
     __zgpuRuntime = runtime;
@@ -101,6 +105,20 @@ function __zgpuPatches(dependent, stepNo) {
   return out;
 }
 
+// A replay's patches for `stepNo`, from those computed 32 steps at a time
+// (a pure function of the step: the same words as computed one by one).
+function __zgpuPatchesAt(r, stepNo) {
+  let c = r.patches;
+  if (!c || stepNo < c.from || stepNo >= c.from + c.list.length) {
+    const list = [];
+    for (let i = 0; i < 32; i++) {
+      try { list.push(__zgpuPatches(r.dependent, stepNo + i)); } catch (e) { if (i === 0) throw e; break; }
+    }
+    c = r.patches = {from: stepNo, list};
+  }
+  return c.list[stepNo - c.from];
+}
+
 // Wraps the backend for one session run: what the replay record needs.
 function __zgpuCaptureStart(session) {
   const impl = session.impl, cap = {feeds: new Map(), slots: [], complete: null, node: null};
@@ -121,11 +139,19 @@ function __zgpuCaptureStart(session) {
     cap.node = u;
     return adam.call(this, m, v, u, ...rest).then((hs) => { cap.node = outer; return hs; });
   };
+  // A pair's dispatch carries both updates' step words (the second's 12
+  // words earlier: sa.x and sa.y, see webgpu.mjs adamPair).
+  const pair = impl.adamPair;
+  if (pair) impl.adamPair = function (A, B, ...rest) {
+    const outer = cap.node, stepped = rest[rest.length - 1];
+    cap.node = [stepped(A.U), stepped(B.U)];
+    return pair.call(this, A, B, ...rest).then((hs) => { cap.node = outer; return hs; });
+  };
   impl.uniform = function (fill) { const offset = uniform.call(this, fill); cap.slots.push([offset, cap.node]); return offset; };
   impl.complete = function (handles) { cap.complete = handles.slice(); return complete.call(this, handles); };
   __zippHostCall('gpu.capture', impl.device._id, '1');
   cap.restore = () => {
-    delete impl.run; delete impl.uniform; delete impl.complete; delete impl.adam;
+    delete impl.run; delete impl.uniform; delete impl.complete; delete impl.adam; delete impl.adamPair;
     __zippHostCall('gpu.capture', impl.device._id, '0');
   };
   return cap;
@@ -138,10 +164,12 @@ function __zgpuReplayRecord(token, session, cap, payload) {
   if (!cap.complete || cap.complete.length !== outs.length || wanted.size !== names.length) return;
   // Step-dependent dispatches: one uniform slot each.
   const dependent = [], seen = new Set();
-  for (const [offset, node] of cap.slots) {
-    if (!node || (node.op !== 'adam_update' && node.op !== 'uniform')) continue;
-    if (seen.has(node.id)) return;
-    seen.add(node.id); dependent.push({word: offset / 4, node: nodes[node.id]});
+  for (const [offset, slot] of cap.slots) {
+    for (const [node, shift] of Array.isArray(slot) ? [[slot[0], 0], [slot[1], -12]] : [[slot, 0]]) {
+      if (!node || (node.op !== 'adam_update' && node.op !== 'uniform')) continue;
+      if (seen.has(node.id)) return;
+      seen.add(node.id); dependent.push({word: offset / 4 + shift, node: nodes[node.id]});
+    }
   }
   const template = new Uint8Array(impl.uniformData, 0, impl.slot * 256).slice();
   // The words as this run filled them must be what the patch rule gives for its step.
@@ -187,7 +215,7 @@ function __zgpuReplayBegin(token, count, step) {
   if (!(Number.isSafeInteger(first) && first >= 1 && first + count - 1 <= 2 ** 31)) return null;
   if (r.readbackElements * count > limits.maxOutputElements || r.feedElements * count > limits.maxInputElements) return null;
   const patches = [];
-  try { for (let i = 0; i < count; i++) patches.push(__zgpuPatches(r.dependent, first + i)); } catch (e) { return null; }
+  try { for (let i = 0; i < count; i++) patches.push(__zgpuPatchesAt(r, first + i)); } catch (e) { return null; }
   s.busy = s.runtime.busy = true;
   return {first, patches, nodes: s.plan.nodes.length, estimatedWork: s.plan.work * count,
     logicalAllocationBytes: s.plan.logicalBytes, residentBytes: s.residentBytes};

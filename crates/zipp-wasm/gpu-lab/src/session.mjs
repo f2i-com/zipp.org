@@ -158,9 +158,10 @@ export class Session {
             if(item.static)this.statics.set(item.id,this.retain(this.persist(h,true)));
           } else {
             // An Adam group whose outputs are carried straight back into the
-            // held buffers it reads updates them in place.
-            const g=item.group,inPlace=item.kind==='adam'&&this.impl.adamInPlace!==false&&this.inPlace.has(item.id)&&
-              [g.mIn,g.vIn,g.p].every(id=>this.held.has(id))?[g.mIn,g.vIn,g.p].map(id=>handles.get(id)):null;
+            // held buffers it reads updates them in place (each of a pair's).
+            const held=a=>{const g=a.group;return this.impl.adamInPlace!==false&&this.inPlace.has(a.id)&&
+              [g.mIn,g.vIn,g.p].every(id=>this.held.has(id))?[g.mIn,g.vIn,g.p].map(id=>handles.get(id)):null;};
+            const inPlace=item.kind==='adam'?held(item):item.kind==='adam2'?item.parts.map(held):null;
             (await this.impl.runGroup(item,hs,{stepped,inPlace})).forEach((h,i)=>handles.set(item.exposed[i],h));
           }
           for(const r of item.refs){uses[root[r]]--;if(uses[root[r]]===0)freeLocal(root[r]);}

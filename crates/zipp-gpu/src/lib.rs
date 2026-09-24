@@ -382,12 +382,7 @@ impl GpuHost {
         {
             let gpu = self.gpu.borrow();
             let replay = gpu.replays.get(token)?;
-            let mut want: Vec<&str> = readback.clone();
-            want.sort_unstable();
-            want.dedup();
-            let mut have: Vec<&str> = replay.outputs.iter().map(|o| o.name.as_str()).collect();
-            have.sort_unstable();
-            if want != have || want.len() != readback.len() {
+            if !reads_back(replay, &readback) {
                 return None;
             }
             for entry in steps {
@@ -414,18 +409,7 @@ impl GpuHost {
                         return None;
                     }
                     let data = bytes.get(offset..offset.checked_add(length.checked_mul(4)?)?)?;
-                    // gpu-lab's checks of a feed (float32Data, checkClassTargets,
-                    // checkIndices): anything they would refuse goes to gpu-lab.
-                    let bound = feed.classes.or(feed.bound);
-                    let ok = data.chunks_exact(4).all(|b| {
-                        let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                        v.is_finite()
-                            && bound.is_none_or(|n| {
-                                let v = v as f64;
-                                v.fract() == 0.0 && v >= 0.0 && v < n
-                            })
-                    });
-                    if !ok {
+                    if !feed_accepted(feed, data) {
                         return None;
                     }
                     step_feeds.push(data);
@@ -433,7 +417,151 @@ impl GpuHost {
                 feeds.push(step_feeds);
             }
         }
-        let count = steps.len() as f64;
+        let ran = match self.replay_steps(token, &feeds, step, started)? {
+            Replayed::Ran(ran) => ran,
+            Replayed::Failed(code, message) => return Some(replay_failure(code, message)),
+        };
+        let replying = std::time::Instant::now();
+        let gpu = self.gpu.borrow();
+        let replay = gpu.replays.get(token)?;
+        let mut out_steps = Vec::with_capacity(ran.values.len());
+        for (s, step_values) in ran.values.into_iter().enumerate() {
+            let mut outputs = Vec::with_capacity(replay.outputs.len());
+            let mut at = 0usize;
+            for o in &replay.outputs {
+                outputs.push((
+                    o.name.clone(),
+                    HostValue::Object(vec![
+                        (
+                            "shape".into(),
+                            HostValue::Array(
+                                o.shape.iter().map(|&d| HostValue::Number(d)).collect(),
+                            ),
+                        ),
+                        ("dtype".into(), HostValue::String("float32".into())),
+                        (
+                            "data".into(),
+                            HostValue::Float32Array(step_values[at..at + o.size].to_vec()),
+                        ),
+                    ]),
+                ));
+                at += o.size;
+            }
+            out_steps.push(HostValue::Object(vec![
+                ("step".into(), HostValue::Number(ran.first + s as f64)),
+                ("outputs".into(), HostValue::Object(outputs)),
+            ]));
+        }
+        // As gpu-lab's reply: the last step's outputs again, at the top.
+        let last_outputs = out_steps
+            .last()
+            .and_then(|s| field(s, "outputs"))
+            .cloned()
+            .unwrap_or(HostValue::Null);
+        drop(gpu);
+        self.gpu
+            .borrow_mut()
+            .replay_phase(8, replying.elapsed().as_secs_f64() * 1000.0, false);
+        Some(HostValue::Object(vec![
+            ("ok".into(), HostValue::Bool(true)),
+            (
+                "value".into(),
+                HostValue::Object(vec![
+                    ("version".into(), HostValue::Number(1.0)),
+                    ("backend".into(), HostValue::String("webgpu".into())),
+                    ("outputs".into(), last_outputs),
+                    ("steps".into(), HostValue::Array(out_steps)),
+                    ("stats".into(), HostValue::Object(ran.stats)),
+                    ("step".into(), HostValue::Number(ran.session_step)),
+                ]),
+            ),
+        ]))
+    }
+
+    /// A prepared step request in binary form (the bridge's `zipp.gpu.step`,
+    /// which the Python runtime sends instead of `gpu.session.run`'s JSON
+    /// for a run of steps whose inputs are all fed float32 tensors): `ids` the
+    /// fed input ids in the order each step's arrays follow one another in
+    /// `bytes`, `readback` the outputs read back. Served only by the
+    /// session's replay, with the same checks, results and failures as
+    /// [`GpuHost::try_replay`] gives the same request as JSON; `None` when a
+    /// replay would not serve it (the caller then sends the JSON request,
+    /// which gpu-lab serves as it always does).
+    pub fn replay_binary(
+        &mut self,
+        token: &str,
+        ids: &[u32],
+        readback: &[&str],
+        bytes: &[u8],
+    ) -> Option<BinaryRun> {
+        if !self.replay {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let mut feeds: Vec<Vec<&[u8]>> = Vec::new();
+        let outputs;
+        {
+            let gpu = self.gpu.borrow();
+            let replay = gpu.replays.get(token)?;
+            if !reads_back(replay, readback) || ids.len() != replay.feeds.len() {
+                return None;
+            }
+            // Where each of the replay's feeds sits within one step's bytes.
+            let mut offsets: Vec<Option<usize>> = vec![None; replay.feeds.len()];
+            let mut step_bytes = 0usize;
+            for &id in ids {
+                let i = replay.feeds.iter().position(|f| f.id == id)?;
+                if offsets[i].is_some() {
+                    return None;
+                }
+                offsets[i] = Some(step_bytes);
+                step_bytes += replay.feeds[i].size * 4;
+            }
+            let offsets: Vec<usize> = offsets.into_iter().collect::<Option<_>>()?;
+            if step_bytes == 0 || bytes.is_empty() || bytes.len() % step_bytes != 0 {
+                return None;
+            }
+            for step in bytes.chunks_exact(step_bytes) {
+                let mut step_feeds = Vec::with_capacity(replay.feeds.len());
+                for (feed, &at) in replay.feeds.iter().zip(&offsets) {
+                    let data = &step[at..at + feed.size * 4];
+                    if !feed_accepted(feed, data) {
+                        return None;
+                    }
+                    step_feeds.push(data);
+                }
+                feeds.push(step_feeds);
+            }
+            outputs = replay
+                .outputs
+                .iter()
+                .map(|o| (o.name.clone(), o.size, o.shape.clone()))
+                .collect::<Vec<_>>();
+        }
+        Some(match self.replay_steps(token, &feeds, HostValue::Null, started)? {
+            Replayed::Ran(ran) => BinaryRun::Ran {
+                first: ran.first,
+                step: ran.session_step,
+                outputs,
+                values: ran.values,
+                stats: HostValue::Object(ran.stats),
+            },
+            Replayed::Failed(code, message) => BinaryRun::Failed { code, message },
+        })
+    }
+
+    /// Run `feeds.len()` steps of `token`'s replay (`feeds[s]` in the
+    /// replay's feed order, already checked): gpu-lab's checks and uniform
+    /// words (`__zgpuReplayBegin`), the device work, then its bookkeeping
+    /// (`__zgpuReplayEnd`). `None`: gpu-lab should run it instead.
+    fn replay_steps(
+        &mut self,
+        token: &str,
+        feeds: &[Vec<&[u8]>],
+        step: HostValue,
+        started: std::time::Instant,
+    ) -> Option<Replayed> {
+        let count = feeds.len() as f64;
         let checked = std::time::Instant::now();
         let begun = self
             .state
@@ -450,7 +578,7 @@ impl GpuHost {
             Some(HostValue::Number(n)) => *n,
             _ => return None,
         };
-        let mut patches = Vec::with_capacity(steps.len());
+        let mut patches = Vec::with_capacity(feeds.len());
         if let Some(HostValue::Array(list)) = field(&begun, "patches") {
             for words in list {
                 let HostValue::Array(words) = words else {
@@ -475,8 +603,8 @@ impl GpuHost {
             gpu.replay_phase(0, (checked - started).as_secs_f64() * 1000.0, true);
             gpu.replay_phase(1, (submitted - checked).as_secs_f64() * 1000.0, false);
         }
-        let result = if patches.len() == steps.len() {
-            self.gpu.borrow_mut().replay_run(token, &feeds, &patches)
+        let result = if patches.len() == feeds.len() {
+            self.gpu.borrow_mut().replay_run(token, feeds, &patches)
         } else {
             Err((
                 "GPU".into(),
@@ -495,27 +623,11 @@ impl GpuHost {
         );
         let values = match result {
             Ok(values) => values,
-            Err((code, message)) => {
-                return Some(HostValue::Object(vec![
-                    ("ok".into(), HostValue::Bool(false)),
-                    (
-                        "error".into(),
-                        HostValue::Object(vec![
-                            ("code".into(), HostValue::String(code)),
-                            (
-                                "message".into(),
-                                HostValue::String(message.chars().take(512).collect()),
-                            ),
-                            ("poisoned".into(), HostValue::Bool(true)),
-                        ]),
-                    ),
-                ]))
-            }
+            Err((code, message)) => return Some(Replayed::Failed(code, message)),
         };
-        let replying = std::time::Instant::now();
         self.gpu
             .borrow_mut()
-            .replay_phase(7, (replying - ending).as_secs_f64() * 1000.0, false);
+            .replay_phase(7, ending.elapsed().as_secs_f64() * 1000.0, false);
         let session_step = match ended.as_ref().ok().and_then(|v| field(v, "step")) {
             Some(HostValue::Number(n)) => *n,
             _ => first + count,
@@ -526,46 +638,14 @@ impl GpuHost {
             .and_then(|v| field(v, "peak"))
             .cloned()
             .unwrap_or(HostValue::Null);
-        let gpu = self.gpu.borrow();
-        let replay = gpu.replays.get(token)?;
-        let mut out_steps = Vec::with_capacity(values.len());
-        let mut read = 0usize;
-        for (s, step_values) in values.into_iter().enumerate() {
-            let mut outputs = Vec::with_capacity(replay.outputs.len());
-            let mut at = 0usize;
-            for o in &replay.outputs {
-                outputs.push((
-                    o.name.clone(),
-                    HostValue::Object(vec![
-                        (
-                            "shape".into(),
-                            HostValue::Array(
-                                o.shape.iter().map(|&d| HostValue::Number(d)).collect(),
-                            ),
-                        ),
-                        ("dtype".into(), HostValue::String("float32".into())),
-                        (
-                            "data".into(),
-                            HostValue::Float32Array(step_values[at..at + o.size].to_vec()),
-                        ),
-                    ]),
-                ));
-                at += o.size;
-                read += o.size;
-            }
-            out_steps.push(HostValue::Object(vec![
-                ("step".into(), HostValue::Number(first + s as f64)),
-                ("outputs".into(), HostValue::Object(outputs)),
-            ]));
-        }
-        // As gpu-lab's reply: the last step's outputs again, at the top.
-        let last_outputs = out_steps
-            .last()
-            .and_then(|s| field(s, "outputs"))
-            .cloned()
-            .unwrap_or(HostValue::Null);
-        let upload: usize = replay.feeds.iter().map(|f| f.size).sum::<usize>() * steps.len();
-        drop(gpu);
+        let (upload, read) = {
+            let gpu = self.gpu.borrow();
+            let replay = gpu.replays.get(token)?;
+            (
+                replay.feeds.iter().map(|f| f.size).sum::<usize>() * feeds.len(),
+                replay.outputs.iter().map(|o| o.size).sum::<usize>() * feeds.len(),
+            )
+        };
         let ms = |d: std::time::Duration| HostValue::Number(d.as_secs_f64() * 1000.0);
         let mut stats = vec![("steps".to_string(), HostValue::Number(count))];
         for key in [
@@ -589,23 +669,12 @@ impl GpuHost {
             ("adapter".into(), HostValue::String(self.summary.describe())),
             ("replayed".into(), HostValue::Bool(true)),
         ]);
-        self.gpu
-            .borrow_mut()
-            .replay_phase(8, replying.elapsed().as_secs_f64() * 1000.0, false);
-        Some(HostValue::Object(vec![
-            ("ok".into(), HostValue::Bool(true)),
-            (
-                "value".into(),
-                HostValue::Object(vec![
-                    ("version".into(), HostValue::Number(1.0)),
-                    ("backend".into(), HostValue::String("webgpu".into())),
-                    ("outputs".into(), last_outputs),
-                    ("steps".into(), HostValue::Array(out_steps)),
-                    ("stats".into(), HostValue::Object(stats)),
-                    ("step".into(), HostValue::Number(session_step)),
-                ]),
-            ),
-        ]))
+        Some(Replayed::Ran(ReplayRan {
+            first,
+            session_step,
+            values,
+            stats,
+        }))
     }
 
     /// Evaluate `source` in the runtime's state (tests and benchmarks drive
@@ -626,6 +695,86 @@ impl Drop for GpuHost {
             let _ = self.state.call_slot(slot, &[]);
         }
     }
+}
+
+/// A replay's outcome, before it is shaped into a reply.
+enum Replayed {
+    Ran(ReplayRan),
+    /// Device work had begun: the session is poisoned, as gpu-lab leaves it.
+    Failed(String, String),
+}
+
+struct ReplayRan {
+    first: f64,
+    session_step: f64,
+    /// Each step's read-back values, in the replay's output order.
+    values: Vec<Vec<f32>>,
+    stats: Vec<(String, HostValue)>,
+}
+
+/// What [`GpuHost::replay_binary`] ran.
+pub enum BinaryRun {
+    Ran {
+        /// The run's first step number, and the session's step after it.
+        first: f64,
+        step: f64,
+        /// (name, elements, shape) of each read-back output, in the order
+        /// each step's values follow one another in `values`.
+        outputs: Vec<(String, usize, Vec<f64>)>,
+        values: Vec<Vec<f32>>,
+        stats: HostValue,
+    },
+    Failed {
+        code: String,
+        message: String,
+    },
+}
+
+/// Whether `readback` names exactly the replay's read-back outputs.
+fn reads_back(replay: &replay::Replay, readback: &[&str]) -> bool {
+    let mut want: Vec<&str> = readback.to_vec();
+    want.sort_unstable();
+    want.dedup();
+    let mut have: Vec<&str> = replay.outputs.iter().map(|o| o.name.as_str()).collect();
+    have.sort_unstable();
+    want == have && want.len() == readback.len()
+}
+
+/// gpu-lab's checks of a fed value (float32Data, checkClassTargets,
+/// checkIndices): anything they would refuse goes to gpu-lab.
+fn feed_accepted(feed: &replay::Feed, data: &[u8]) -> bool {
+    match feed.classes.or(feed.bound) {
+        // Finiteness only: the exponent bits of every value, folded over
+        // blocks without an early exit, so the scan vectorizes.
+        None => data.chunks(256).all(|block| {
+            block.chunks_exact(4).fold(0u32, |bad, b| {
+                let bits = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                bad | ((bits & 0x7f80_0000 == 0x7f80_0000) as u32)
+            }) == 0
+        }),
+        Some(n) => data.chunks_exact(4).all(|b| {
+            let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            let v = v as f64;
+            v.is_finite() && v.fract() == 0.0 && v >= 0.0 && v < n
+        }),
+    }
+}
+
+fn replay_failure(code: String, message: String) -> HostValue {
+    HostValue::Object(vec![
+        ("ok".into(), HostValue::Bool(false)),
+        (
+            "error".into(),
+            HostValue::Object(vec![
+                ("code".into(), HostValue::String(code)),
+                (
+                    "message".into(),
+                    HostValue::String(message.chars().take(512).collect()),
+                ),
+                ("poisoned".into(), HostValue::Bool(true)),
+            ]),
+        ),
+    ])
 }
 
 fn reply_ok(reply: &HostValue) -> bool {

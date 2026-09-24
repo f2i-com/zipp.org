@@ -299,7 +299,7 @@ medians over 15 calls, 7 runs for the eight-step row):
 | WebGPU | 74.4 ms | 5.1 ms | 1.84 ms |
 | WebGL2 | 88.8 ms | 3.3 ms | 2.24 ms |
 | WebAssembly | 73.7 ms | 4.9 ms | 3.63 ms |
-| Native Zipp, WebGPU over wgpu/Vulkan | ≈26 ms | ≈0.42 ms | ≈0.19 ms |
+| Native Zipp, WebGPU over wgpu/Vulkan | ≈26 ms | ≈0.27 ms | ≈0.12 ms |
 
 Of a `compiled()` call about 34 ms is the guest recording and validating the
 step (every input storage is scanned for finiteness in the interpreter), the
@@ -446,9 +446,9 @@ machine, treat as ±30%):
 
 | Model | `compiled()` per call | `prepared.step` | `prepared.steps`, 8 per run, per step | CPU evaluator, `compiled()` |
 |---|---|---|---|---|
-| 784-256-10, batch 64, Adam | ≈26 ms | ≈0.42 ms | ≈0.19 ms | ≈2.9-4.8 s |
-| 784-1024-1024-10, batch 256, Adam | ≈100-120 ms | ≈1.05 ms | ≈0.75 ms | 118 s |
-| 784-2048-2048-10, batch 1024, Adam | ≈270-340 ms | ≈2.5 ms | ≈2.0 ms | 1,487 s |
+| 784-256-10, batch 64, Adam | ≈26 ms | ≈0.27 ms | ≈0.12 ms | ≈2.9-4.8 s |
+| 784-1024-1024-10, batch 256, Adam | ≈100-120 ms | ≈0.75 ms | ≈0.5 ms | 118 s |
+| 784-2048-2048-10, batch 1024, Adam | ≈270-320 ms | ≈2.3 ms | ≈1.85 ms | 1,487 s |
 
 Once a prepared session has run a step, the native host replays that step's
 recorded commands itself: it writes each batch straight from the program to
@@ -457,18 +457,21 @@ back only the result. The results are gpu-lab's own steps bit for bit
 (`ZIPP_GPU_REPLAY=0` turns replay off). Adam updates each parameter in one
 pass, in place in a prepared session, with each element's arithmetic
 unchanged. Elementwise kernels, the optimizer updates and Adam's pass read and
-write four values at a time, each computed as before. After a session's first
-step, a `prepared.step` on the native GPU builds its request from what every
-step shares; the host checks each fed value as the full path does, and a value
-it refuses gets that path's own error. Before it runs a graph, gpu-lab plans it for the backend (`src/fusion.mjs`):
+write four values at a time, each computed as before. After a session's first step, a `prepared.step` on the native GPU builds its
+request from what every step shares and sends it to the replay in binary form
+(no JSON either way; `.stats` is decoded when first read); the host checks
+each fed value as the full path does, and a value it refuses gets that path's
+own error. Before it runs a graph, gpu-lab plans it for the backend (`src/fusion.mjs`):
 nodes no output needs are dropped, a prepared session computes nodes that
 cannot change between steps once, and WebGPU runs several nodes as one kernel
 where each element's arithmetic is unchanged: a matmul reads a transposed
 operand in place or writes its result transposed, a whole sum or mean of up to
-2048 values and a cross-entropy of up to 1024 rows take one dispatch, and
-chains of elementwise operations (with a bias broadcast into them) run as one
-kernel whose every intermediate is rounded as before. The small MLP's step
-went from about 45 dispatches to about 20, with the same bits. Float matmuls
+2048 values and a cross-entropy of up to 1024 rows take one dispatch, and chains of elementwise operations (with a bias broadcast into them) run as
+one kernel whose every intermediate is rounded as before, computed in the
+kernel of the matmul they read where that is a small one, a cross-entropy loss
+and its gradient take one dispatch, and Adam updates two parameters per
+dispatch. Small products stage 64 values of k per step instead of 16. The
+small MLP's step went from about 45 dispatches to 12, with the same bits. Float matmuls
 with enough output tiles run a register-blocked tile: 128x128 (48 TFLOP/s on a
 4096³ product) where the device has 32 KB of workgroup memory, else 64x64 (37
 TFLOP/s; the 16x16 kernel: about 5), every output with the same additions in
@@ -486,21 +489,22 @@ batches; ms per step; `crates/zipp-cli/tests/native_gpu/bench_vs_torch.py`):
 
 | Case | PyTorch CUDA eager | PyTorch CUDA graph | Zipp `prepared.step` / 8 per run | Zipp in Chrome (WebGPU) / 8 per run |
 |---|---|---|---|---|
-| 784-256-10, batch 64, Adam | 0.71 | 0.17 | 0.42 / 0.19 | 3.1 / 0.68 |
-| 784-1024-1024-10, batch 256 | 0.99 | 0.29 | 1.05 / 0.74 | 3.8 / 1.65 |
-| 784-2048-2048-10, batch 1024 | 1.11 | 0.91 | 2.48 / 1.96 | 6.8 / 8.8 |
-| 2048² matmul x4, inference | 1.24 (TF32 0.87) | – | 1.91 / 1.72 | 3.8 / 2.7 |
-| 4096² matmul x4, inference | 10.2 (TF32 5.9) | – | 13.8 / 14.2 | 22.5 / 20.3 |
-| Embedding 8192x128 + gather NLL | 1.14 | 0.32 | 0.46 / 0.28 | 2.7 / 0.41 |
+| 784-256-10, batch 64, Adam | 0.78 | 0.17 | 0.27 / 0.12 | 2.9 / 0.65 |
+| 784-1024-1024-10, batch 256 | 1.16 | 0.33 | 0.77 / 0.52 | 3.9 / 1.5 |
+| 784-2048-2048-10, batch 1024 | 1.14 | 0.94 | 2.3 / 1.85 | 6.5 / 8.5 |
+| 2048² matmul x4, inference | 1.22 (TF32 0.87) | – | 1.85 / 1.72 | 3.3 / 2.6 |
+| 4096² matmul x4, inference | 10.3 (TF32 5.9) | – | 13.7 / 14.2 | 23 / 20 |
+| Embedding 8192x128 + gather NLL | 1.14 | 0.30 | 0.36 / 0.24 | 2.7 / 0.40 |
 
 Losses agree within 1.4e-7 (small MLP) and 3.1e-5 (medium). A single step of
 the small and medium MLPs and the embedding model is faster than PyTorch's
-eager CUDA (0.42 vs about 0.7 ms, 1.05 vs 1.0, 0.46 vs 1.1), and with 8 steps
-per run the small MLP is within 20% of a CUDA graph. A single step is still
-launch-bound: about 20 dispatches, 0.11 ms of GPU time, about 0.13 ms of
-driver submit and wait, and about 0.14 ms in Python. On large ones the gap is
-matmul throughput: fp32 without tensor cores or fused multiply-add.
-torch.compile's default backend needs triton, which is unavailable on Windows.
+eager CUDA (0.27 vs about 0.78 ms, 0.77 vs 1.16, 0.36 vs 1.14), and with 8
+steps per run the small MLP (0.12 ms) is faster than its CUDA graph (0.17). A
+single step is still bound by fixed costs: about 0.06 ms in Python, 0.07 ms of
+GPU time after submission, and about 0.1 ms of host work around it (writing
+the batch, the submit). On large ones the gap is matmul throughput: fp32
+without tensor cores or fused multiply-add. torch.compile's default backend
+needs triton, which is unavailable on Windows.
 
 ## Compatibility boundaries
 

@@ -72,6 +72,12 @@ def _native():
     return _native_gpu or None
 
 
+def _native_step():
+    """The native GPU's binary prepared-step function (`_zipp_gpu.native_step`,
+    which only the native CLI's runtime has), or None."""
+    return None if _native() is None else getattr(_zipp_gpu, "native_step", None)
+
+
 def _native_value(reply, storage):
     """A native reply's value with its outputs as the caller takes them, or None when it failed."""
     if not isinstance(reply, dict) or not reply.get("ok"):
