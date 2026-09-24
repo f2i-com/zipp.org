@@ -433,7 +433,8 @@ logical graph storage, no estimated-work budget. The protocol's 512 nodes and
 64 outputs still apply.
 
 **Accuracy.** gpu-lab's browser protocol cases pass 276/276 on the native backend
-(Vulkan, and Direct3D 12 with its default FXC compiler) with the browser
+(Vulkan, Direct3D 12 with its default FXC compiler, and Direct3D 12 with DXC under
+`ZIPP_GPU_DXC=1`) with the browser
 harness's tolerances. The 112 exact cases (masks, where,
 dropout's `uniform` draws, slices, index_select, gather, and index_add/scatter_add
 accumulation order) match the JavaScript reference bit for bit. The Python
@@ -475,10 +476,14 @@ small MLP's step went from about 45 dispatches to 12, with the same bits. Float 
 with enough output tiles run a register-blocked tile: 128x128 (48 TFLOP/s on a
 4096³ product) where the device has 32 KB of workgroup memory, else 64x64 (37
 TFLOP/s; the 16x16 kernel: about 5), every output with the same additions in
-the same order. Direct3D 12 compiles with DXC when a `dxcompiler.dll` is next
-to `zipp` or on PATH, and keeps the 64x64 tile (DXC takes about 28 s over the
-128x128 one); with the system's FXC it keeps the 16x16 kernel, because FXC
-takes about 20 s to compile the 64x64 tile. A per-call
+the same order. Direct3D 12 compiles with the system's FXC and there keeps the 16x16 kernel,
+because FXC takes about 20 s to compile the 64x64 tile. `ZIPP_GPU_DXC=1`, with
+a `dxcompiler.dll` next to `zipp` or on PATH, compiles with DXC instead and
+keeps the 64x64 tile (DXC takes about 28 s over the 128x128 one). Results then
+differ from FXC's in the last bits on some kernels -- every shader compiler
+contracts multiply-adds and lowers divisions its own way, as Vulkan's and FXC's
+also differ from each other -- within the same tolerances; a DLL on PATH alone
+never changes them. A per-call
 `compiled()` uploads and reads back every weight, gradient and moment; prepared
 sessions are where the GPU pays off. `ZIPP_GPU_PROFILE=1` prints where a run's
 host time went, and `=kernels` adds per-kernel GPU time. Reproduce with

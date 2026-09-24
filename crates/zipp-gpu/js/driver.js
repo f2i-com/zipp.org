@@ -37,8 +37,8 @@ function __zgpuInit(backend, policy, adapter, replay) {
       // MiB): a large model's steps then allocate nothing after the first.
       runtime.impl.poolBytes = Math.max(runtime.impl.poolBytes || 0, 2 * 1024 * 1024 * 1024);
       // Direct3D 12 with FXC takes ~20 s to compile the 64x64 matmul tile
-      // (the 16x16 kernel: half a second; DXC, when a dxcompiler.dll is
-      // there, 1.6 s), and the 128x128 one DXC ~28 s, FXC 15 minutes
+      // (the 16x16 kernel: half a second; DXC, with ZIPP_GPU_DXC=1 and a
+      // dxcompiler.dll, 1.6 s), and the 128x128 one DXC ~28 s, FXC 15 minutes
       // (Vulkan: 0.06 s); the 16x16 kernel's 64-deep variant FXC 9 s (DXC
       // 1.4 s). The kernel changes no result bit, only speed, so D3D12 on FXC
       // keeps the plain 16x16 kernel and on DXC the 64x64 tile.

@@ -109,7 +109,10 @@ Numerical rules that all four backends share:
   accumulate each output in index order, so the WASM kernels reproduce the
   JavaScript reference bit for bit; transcendental functions are evaluated in
   double (or by the shared polynomial approximations on the GPUs) and rounded once,
-  agreeing to about one float32 ulp.
+  agreeing to about one float32 ulp. The same holds between shader compilers on one GPU (Vulkan's, Direct3D's FXC
+and DXC): each may contract a multiply-add or lower a division differently, so
+float results agree to about an ulp, not bit for bit; the `exact` cases (masks,
+selections, integer-exact arithmetic) are bit for bit everywhere.
 - **Whole-tensor reductions** use a pairwise tree, the same topology on all
   backends, so `sum` does not depend on the device's reduction width.
 - **Softmax family** subtracts the row maximum before exponentiating.

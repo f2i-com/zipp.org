@@ -157,10 +157,15 @@ fn default_order() -> Vec<wgpu::Backends> {
 }
 
 /// DXC (`dxcompiler.dll`) where the program's loader would find it: next to
-/// the executable, then on PATH. Direct3D 12 compiles WGSL with it when one
-/// is there -- seconds faster per large kernel than the system's FXC, which
-/// is what it uses otherwise.
+/// the executable, then on PATH, when `ZIPP_GPU_DXC=1` asks for it. It is
+/// seconds faster per large kernel than the system's FXC, but each compiler
+/// rounds some kernels (fused multiply-adds, divisions) its own way, in the
+/// last bits; FXC is always there, so by default Direct3D 12's results do not
+/// depend on what else is on PATH.
 fn find_dxc() -> Option<String> {
+    if std::env::var_os("ZIPP_GPU_DXC").is_none_or(|v| v != "1") {
+        return None;
+    }
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     if let Some(dir) = std::env::current_exe()
         .ok()
@@ -178,8 +183,9 @@ fn find_dxc() -> Option<String> {
 }
 
 /// Find a hardware adapter. `Ok(None)`: no driver, or only a software one.
-/// Direct3D 12 is tried with DXC first when [`find_dxc`] finds one (and with
-/// FXC if that instance offers no adapter), unless `WGPU_DX12_COMPILER` says.
+/// Direct3D 12 is tried with DXC first when [`find_dxc`] finds one (asked for
+/// with `ZIPP_GPU_DXC=1`; with FXC if that instance offers no adapter), else
+/// with FXC, unless `WGPU_DX12_COMPILER` says.
 pub fn find_adapter(
     order: &[wgpu::Backends],
 ) -> Result<Option<(wgpu::Instance, wgpu::Adapter, Option<String>)>, String> {
