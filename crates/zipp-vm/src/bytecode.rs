@@ -3118,6 +3118,46 @@ pub struct Program {
     /// it, whatever names it uses.
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub python_natives: bool,
+    /// Set only on a Python program: the library modules it compiles on
+    /// first import rather than up front (see [`PyLazy`]).
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub python_lazy: Option<Box<PyLazy>>,
+}
+
+/// The modules of a Python program that compile on first import: the
+/// bundled library (and installed packages) the program may import. The
+/// runtime registers each by name and, when one is first imported, calls
+/// the hidden native `__zipp_py_compile`, which compiles it with
+/// [`PyLazy::compile`] (the Python frontend's), installs its functions past
+/// every function already installed and answers its top-level code object.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub struct PyLazy {
+    /// Compile `modules[k]` for a program whose next function id is `base`:
+    /// the module's functions, top level last, function ids absolute.
+    pub compile: fn(&PyLazy, usize, u32) -> Result<Vec<FuncProto>, String>,
+    /// Every module name of the program by module index (the traceback file
+    /// index): `modules` in order, then the eagerly compiled modules.
+    pub names: Vec<String>,
+    /// The module run as the program.
+    pub entry: String,
+    /// The runtime seed's `__zipp_py` and `__zipp_py_line` global slots.
+    pub rt_slot: u32,
+    pub line_slot: u32,
+    pub modules: Vec<PyLazyModule>,
+}
+
+/// One module of a [`PyLazy`].
+#[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub struct PyLazyModule {
+    pub name: String,
+    /// The file name tracebacks print (`torch/nn.py`).
+    pub file: String,
+    pub source: &'static str,
+    /// Once compiled: the first function id and the module's functions,
+    /// owned here so they live exactly as long as the program does.
+    pub installed: std::sync::OnceLock<(u32, Box<[FuncProto]>)>,
 }
 
 /// A compiled class: the constructor func id (runs field inits + user ctor body),

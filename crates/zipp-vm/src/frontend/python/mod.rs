@@ -8,7 +8,7 @@
 //! everything else to runtime helper calls. A program is a PROJECT: one
 //! module per `.py` file plus the name of the entry module; `import`
 //! resolves project modules and the built-in modules at compile time.
-use crate::bytecode::{Instr, Program};
+use crate::bytecode::{Instr, Program, PyLazy, PyLazyModule};
 use crate::vm::prof::{self, Phase};
 use rustpython_parser::lexer::{LexResult, LexicalError, LexicalErrorType};
 use rustpython_parser::{ast, lexer, Mode, Parse, Tok};
@@ -20,6 +20,8 @@ mod exprs;
 mod nesting;
 mod stmts;
 mod symtable;
+#[cfg(test)]
+mod library_check;
 #[cfg(test)]
 mod minify_check;
 
@@ -101,379 +103,27 @@ pub(super) const BUILTIN_MODULES: &[&str] = &[
     "_zipp_tensor",
 ];
 
-/// Library modules written in Python and bundled with the frontend. One is
-/// compiled into a program only when a module of the program imports it
-/// (directly or through another bundled module), so a program that never
-/// mentions it pays nothing.
-pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
-    ("zipp_gpu", pysrc!("lib/shared/zipp_gpu.py")),
-    ("torch", pysrc!("lib/torch.py")),
-    ("torch._gpu", pysrc!("lib/torch_gpu.py")),
-    ("torch.nn", pysrc!("lib/torch_nn.py")),
-    (
-        "torch.nn.functional",
-        pysrc!("lib/torch_nn_functional.py"),
-    ),
-    ("torch.nn.init", pysrc!("lib/torch_nn_init.py")),
-    ("torch.nn.utils", pysrc!("lib/torch_nn_utils.py")),
-    (
-        "torch.nn.utils.rnn",
-        pysrc!("lib/torch_nn_utils_rnn.py"),
-    ),
-    (
-        "torch.nn.parameter",
-        pysrc!("lib/torch_nn_parameter.py"),
-    ),
-    (
-        "torch.nn.utils.parametrize",
-        pysrc!("lib/torch_nn_utils_parametrize.py"),
-    ),
-    (
-        "torch.nn.utils.parametrizations",
-        pysrc!("lib/torch_nn_utils_parametrizations.py"),
-    ),
-    ("torch.linalg", pysrc!("lib/torch_linalg.py")),
-    ("torch.sparse", pysrc!("lib/torch_sparse.py")),
-    ("torch._quant", pysrc!("lib/torch_quant.py")),
-    ("torch.ao", pysrc!("lib/torch_ao.py")),
-    ("torch.ao.nn", pysrc!("lib/torch_ao_nn.py")),
-    (
-        "torch.distributed",
-        pysrc!("lib/torch_distributed.py"),
-    ),
-    (
-        "torch.distributed.distributed_c10d",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.utils.data.distributed",
-        pysrc!("lib/torch_utils_data_distributed.py"),
-    ),
-    (
-        "torch.distributed.elastic",
-        pysrc!("lib/torch_distributed_unsupported.py"),
-    ),
-    (
-        "torch.distributed.launch",
-        pysrc!("lib/torch_distributed_unsupported.py"),
-    ),
-    (
-        "torch.distributed.run",
-        pysrc!("lib/torch_distributed_unsupported.py"),
-    ),
-    (
-        "torch.ao.nn.intrinsic",
-        pysrc!("lib/torch_ao_nn_intrinsic.py"),
-    ),
-    ("torch.ao.nn.qat", pysrc!("lib/torch_ao_nn_qat.py")),
-    (
-        "torch.ao.nn.intrinsic.qat",
-        pysrc!("lib/torch_ao_nn_intrinsic_qat.py"),
-    ),
-    (
-        "torch.ao.nn.quantized",
-        pysrc!("lib/torch_ao_nn_quantized.py"),
-    ),
-    (
-        "torch.ao.nn.quantized.functional",
-        pysrc!("lib/torch_ao_nn_quantized_functional.py"),
-    ),
-    (
-        "torch.ao.nn.quantized.dynamic",
-        pysrc!("lib/torch_ao_nn_quantized_dynamic.py"),
-    ),
-    (
-        "torch.ao.nn.intrinsic.quantized",
-        pysrc!("lib/torch_ao_nn_intrinsic_quantized.py"),
-    ),
-    (
-        "torch.ao.quantization",
-        pysrc!("lib/torch_ao_quantization.py"),
-    ),
-    (
-        "torch.ao.nn.intrinsic.quantized.dynamic",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    ("torch.quantization", pysrc!("lib/torch_alias.py")),
-    (
-        "torch.ao.quantization.observer",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.ao.quantization.fake_quantize",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.ao.quantization.qconfig",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.ao.quantization.quantize",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.ao.quantization.fuse_modules",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.ao.quantization.stubs",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.ao.quantization.utils",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.ao.quantization.quantize_fx",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.quantization.observer",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.quantization.qconfig",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.quantization.quantize",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    ("torch.nn.quantized", pysrc!("lib/torch_alias.py")),
-    (
-        "torch.nn.quantized.dynamic",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    (
-        "torch.nn.quantized.functional",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    ("torch.nn.intrinsic", pysrc!("lib/torch_alias.py")),
-    (
-        "torch.nn.intrinsic.quantized",
-        pysrc!("lib/torch_alias.py"),
-    ),
-    ("torch.nn.intrinsic.qat", pysrc!("lib/torch_alias.py")),
-    ("torch.nn.qat", pysrc!("lib/torch_alias.py")),
-    (
-        "torch.distributions",
-        pysrc!("lib/torch_distributions.py"),
-    ),
-    (
-        "torch.distributions.constraints",
-        pysrc!("lib/torch_distributions_constraints.py"),
-    ),
-    (
-        "torch.distributions.transforms",
-        pysrc!("lib/torch_distributions_transforms.py"),
-    ),
-    (
-        "torch.distributions.kl",
-        pysrc!("lib/torch_distributions_kl.py"),
-    ),
-    (
-        "torch.distributions.bernoulli",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.beta",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.binomial",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.categorical",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.cauchy",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.chi2",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.constraint_registry",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.continuous_bernoulli",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.dirichlet",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.distribution",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.exp_family",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.exponential",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.fishersnedecor",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.gamma",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.generalized_pareto",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.geometric",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.gumbel",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.half_cauchy",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.half_normal",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.independent",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.inverse_gamma",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.kumaraswamy",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.laplace",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.lkj_cholesky",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.log_normal",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.logistic_normal",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.lowrank_multivariate_normal",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.mixture_same_family",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.multinomial",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.multivariate_normal",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.negative_binomial",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.normal",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.one_hot_categorical",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.pareto",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.poisson",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.relaxed_bernoulli",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.relaxed_categorical",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.studentT",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.transformed_distribution",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.uniform",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.utils",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.von_mises",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.weibull",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    (
-        "torch.distributions.wishart",
-        pysrc!("lib/torch_distributions_submodule.py"),
-    ),
-    ("torch.fft", pysrc!("lib/torch_fft.py")),
-    (
-        "torch.nn.parallel",
-        pysrc!("lib/torch_nn_parallel.py"),
-    ),
-    ("torch.amp", pysrc!("lib/torch_amp.py")),
-    ("torch.special", pysrc!("lib/torch_special.py")),
-    ("torch.optim", pysrc!("lib/torch_optim.py")),
-    (
-        "torch.optim.optimizer",
-        pysrc!("lib/torch_optim_optimizer.py"),
-    ),
-    (
-        "torch.optim.lr_scheduler",
-        pysrc!("lib/torch_optim_lr_scheduler.py"),
-    ),
-    ("torch.utils", pysrc!("lib/torch_utils.py")),
-    ("torch.utils.data", pysrc!("lib/torch_utils_data.py")),
-    ("torch.autograd", pysrc!("lib/torch_autograd.py")),
-    ("torch._utils", pysrc!("lib/torch__utils.py")),
-    ("pickle", pysrc!("lib/pickle.py")),
-    ("zipfile", pysrc!("lib/zipfile.py")),
-    ("pathlib", pysrc!("lib/pathlib.py")),
-    ("argparse", pysrc!("lib/argparse.py")),
-    ("inspect", pysrc!("lib/inspect.py")),
-    ("pytest", pysrc!("lib/pytest.py")),
-];
+/// A library module written in Python and bundled with the frontend
+/// (`lib/modules.txt`). Every one a project does not shadow is registered
+/// by name; one compiles only when it is first imported (`vm::py_lazy`), so
+/// a program pays nothing for the modules it never imports. Its import
+/// statements, read at build time (build/pyimports.rs), let a project's
+/// imports be followed through it without compiling it.
+pub(super) struct Bundled {
+    pub name: &'static str,
+    pub source: &'static str,
+    /// Its import statements: `;` between statements, each `i|a.b,c`
+    /// (`import a.b, c`) or `<level>|<module>|x,y` (`from ..m import x, y`).
+    pub imports: &'static str,
+    /// The file under `lib/`.
+    #[cfg(test)]
+    pub file: &'static str,
+    /// The package it ships in: `base` or `torch`.
+    #[cfg(test)]
+    pub package: &'static str,
+}
+
+pub(super) const BUNDLED_MODULES: &[Bundled] = include!(concat!(env!("OUT_DIR"), "/bundled.rs"));
 
 /// A single-file program: the source is the `main` module.
 pub(super) fn compile(source: &str) -> R<Program> {
@@ -523,6 +173,74 @@ fn relative_bases(here: &str, level: u32) -> Vec<String> {
         }
     }
     out
+}
+
+/// Queue what `wanted` names: project modules (and the packages above
+/// them), and every library module of a head no project module shadows.
+fn follow(
+    wanted: &BTreeSet<String>,
+    candidates: &BTreeMap<&str, &str>,
+    queued: &mut BTreeSet<String>,
+    queue: &mut Vec<String>,
+    heads: &mut BTreeSet<String>,
+) {
+    for imported in wanted {
+        // `a.b.c` also needs the packages `a` and `a.b` when they exist.
+        let mut prefix = String::new();
+        for segment in imported.split('.') {
+            if !prefix.is_empty() {
+                prefix.push('.');
+            }
+            prefix.push_str(segment);
+            if candidates.contains_key(prefix.as_str()) && queued.insert(prefix.clone()) {
+                queue.push(prefix.clone());
+            }
+        }
+        let head = module_head(imported);
+        if candidates.contains_key(head) || !heads.insert(head.to_owned()) {
+            continue;
+        }
+        for bundled in BUNDLED_MODULES {
+            if module_head(bundled.name) == head && queued.insert(bundled.name.to_owned()) {
+                queue.push(bundled.name.to_owned());
+            }
+        }
+    }
+}
+
+/// [`imported_modules`] of a bundled module, from its import statements
+/// ([`Bundled::imports`]).
+fn bundled_imports(imports: &str, here: &str, out: &mut BTreeSet<String>) {
+    for stmt in imports.split(';').filter(|s| !s.is_empty()) {
+        let mut fields = stmt.split('|');
+        let kind = fields.next().unwrap_or("");
+        if kind == "i" {
+            for name in fields.next().unwrap_or("").split(',').filter(|n| !n.is_empty()) {
+                out.insert(name.to_owned());
+            }
+            continue;
+        }
+        let level: u32 = kind.parse().unwrap_or(0);
+        let module = fields.next().filter(|m| !m.is_empty());
+        let names = fields.next().unwrap_or("");
+        let bases = if level == 0 {
+            vec![String::new()]
+        } else {
+            relative_bases(here, level)
+        };
+        for base in bases {
+            let full = match (module, base.is_empty()) {
+                (Some(module), true) => module.to_owned(),
+                (Some(module), false) => format!("{base}.{module}"),
+                (None, true) => continue,
+                (None, false) => base.clone(),
+            };
+            out.insert(full.clone());
+            for name in names.split(',').filter(|n| !n.is_empty()) {
+                out.insert(format!("{full}.{name}"));
+            }
+        }
+    }
 }
 
 /// The module names a suite imports anywhere in its statements.
@@ -654,14 +372,17 @@ pub(super) fn compile_project<S: AsRef<str>>(
     // Breadth-first from the entry: a module is compiled only when something
     // imports it, so an unrelated file with a syntax error costs nothing.
     // Bundled library modules come in by head name (`import torch.nn` brings
-    // every `torch.*` module); a project module of the same name shadows them.
-    // Sources are borrowed from `modules` or the bundled library, never
-    // copied per module.
+    // every `torch.*` module) and are followed through their import lists
+    // but not compiled here: every one the project does not shadow is
+    // registered by name and compiles on first import (see `lazy_modules`).
+    // Sources are borrowed from `modules`, never copied per module.
     let mut sources: Vec<(String, &str)> = Vec::new();
     let mut names: BTreeSet<String> = BTreeSet::new();
     let mut parsed = Vec::new();
     let mut queue: Vec<String> = vec![entry.to_owned()];
     let mut queued: BTreeSet<String> = BTreeSet::new();
+    // The heads whose library modules are queued already.
+    let mut heads: BTreeSet<String> = BTreeSet::new();
     queued.insert(entry.to_owned());
     // A `test_*.py` entry runs its tests through the bundled pytest, so that
     // module comes along even when the file never imports it.
@@ -680,10 +401,18 @@ pub(super) fn compile_project<S: AsRef<str>>(
         queue.remove(0);
         let source: &str = match candidates.get(name.as_str()) {
             Some(s) => s,
-            None => match BUNDLED_MODULES.iter().find(|(n, _)| *n == name) {
-                Some((_, text)) => text,
-                None => continue,
-            },
+            None => {
+                // A library module is not compiled here, but what it imports
+                // is followed exactly as if it were: a project module only it
+                // imports is still the project's (as a script-directory
+                // module shadows the stdlib for every importer in CPython).
+                if let Some(module) = BUNDLED_MODULES.iter().find(|m| m.name == name) {
+                    let mut wanted = BTreeSet::new();
+                    bundled_imports(module.imports, &name, &mut wanted);
+                    follow(&wanted, &candidates, &mut queued, &mut queue, &mut heads);
+                }
+                continue;
+            }
         };
         let file = match entry_file {
             Some(label) if name == entry => label.to_owned(),
@@ -703,32 +432,20 @@ pub(super) fn compile_project<S: AsRef<str>>(
         if sources.len() > MAX_MODULES {
             return Err(format!("Python project: more than {MAX_MODULES} modules"));
         }
-        for imported in wanted {
-            // `a.b.c` also needs the packages `a` and `a.b` when they exist.
-            let mut prefix = String::new();
-            for segment in imported.split('.') {
-                if !prefix.is_empty() {
-                    prefix.push('.');
-                }
-                prefix.push_str(segment);
-                if candidates.contains_key(prefix.as_str()) && queued.insert(prefix.clone()) {
-                    queue.push(prefix.clone());
-                }
-            }
-            let head = module_head(&imported);
-            if candidates.contains_key(head) {
-                continue;
-            }
-            for (bundled, _) in BUNDLED_MODULES {
-                if module_head(bundled) == head && queued.insert((*bundled).to_owned()) {
-                    queue.push((*bundled).to_owned());
-                }
-            }
-        }
+        follow(&wanted, &candidates, &mut queued, &mut queue, &mut heads);
     }
     let sources = &sources;
-    let names: BTreeSet<&str> = names.iter().map(String::as_str).collect();
-    let module_names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
+    // Module indices (the traceback file index): the library modules first,
+    // in their fixed order, so a library module's index, and with it its
+    // compiled code, is the same whatever project imports it; then the
+    // project's modules in the order found.
+    let lazy = lazy_modules(&candidates);
+    let mut names: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    let mut module_names: Vec<&str> = lazy.iter().map(|(name, _)| *name).collect();
+    module_names.extend(sources.iter().map(|(n, _)| n.as_str()));
+    for (name, _) in &lazy {
+        names.insert(name);
+    }
     let parsed: Vec<_> = parsed
         .into_iter()
         .map(|(index, file, suite, table)| {
@@ -765,39 +482,10 @@ pub(super) fn compile_project<S: AsRef<str>>(
         let unit = Unit {
             file,
             source,
-            module_index: index as u32,
+            module_index: (lazy.len() + index) as u32,
             lines,
         };
-        let mut out = Emitter::new(
-            &format!("<module {name}>"),
-            unit,
-            rt_slot,
-            line_slot,
-            table,
-            0,
-            &project,
-            &program,
-            "<module>".to_owned(),
-        )?;
-        out.future_annotations = suite.iter().any(|s| match s {
-            ast::Stmt::ImportFrom(i) => {
-                i.module
-                    .as_ref()
-                    .is_some_and(|m| m.as_str() == "__future__")
-                    && i.names.iter().any(|a| a.name.as_str() == "annotations")
-            }
-            _ => false,
-        });
-        out.hoist_ints(&suite)?;
-        out.frame_guard(1, |out| {
-            out.suite(suite, 0)?;
-            let value = out.none()?;
-            out.emit(Instr::Return { src: value })?;
-            Ok(())
-        })?;
-        let mut p = program.borrow_mut();
-        let func_id = p.functions.len() as u32;
-        p.functions.push(out.finish());
+        let func_id = emit_module(name, unit, suite, table, &project, &program, rt_slot, line_slot)?;
         inits.push((*name, file.as_str(), func_id));
     }
     // The entry: plain JS-shaped bytecode with no Python scope, built by hand.
@@ -821,6 +509,20 @@ pub(super) fn compile_project<S: AsRef<str>>(
     )?;
     // Registers are reclaimed after every call: the entry's register count
     // must not grow with the number of modules or files.
+    //
+    // The library modules first (module indices from 0), named in one call:
+    // the runtime makes a module's record when it is first looked up and
+    // compiles it when it is first imported (`__zipp_py_compile`). Their
+    // files are `lazy_file`'s.
+    if !lazy.is_empty() {
+        let mark = out.mark();
+        let names: Vec<&str> = lazy.iter().map(|(name, _)| *name).collect();
+        let names_r = out.string(&names.join("\n"))?;
+        let count = i32::try_from(names.len()).map_err(|_| "Python project: too many library modules")?;
+        let count_r = out.small_int(count)?;
+        out.helper("lazy", &[names_r, count_r])?;
+        out.release(mark);
+    }
     for (name, file, func_id) in inits {
         let mark = out.mark();
         let code = out.alloc()?;
@@ -859,7 +561,260 @@ pub(super) fn compile_project<S: AsRef<str>>(
     proto.name_global = name_global;
     let mut program = program.into_inner();
     program.functions[entry_fn] = proto;
+    program.python_lazy = Some(Box::new(PyLazy {
+        compile: compile_lazy,
+        names: project.module_names.iter().map(|n| (*n).to_owned()).collect(),
+        entry: entry.to_owned(),
+        rt_slot,
+        line_slot,
+        modules: lazy
+            .iter()
+            .map(|&(name, source)| PyLazyModule {
+                name: name.to_owned(),
+                file: lazy_file(name),
+                source,
+                installed: std::sync::OnceLock::new(),
+            })
+            .collect(),
+    }));
     Ok(program)
+}
+
+/// One module's top level as a code object appended to `program`: the
+/// same code whether the module is compiled with the program or on first
+/// import. Returns its function id.
+#[allow(clippy::too_many_arguments)]
+fn emit_module<'a>(
+    name: &str,
+    unit: Unit<'a>,
+    suite: &[ast::Stmt],
+    table: &'a symtable::SymTable,
+    project: &'a Project<'a>,
+    program: &'a RefCell<Program>,
+    rt_slot: u32,
+    line_slot: u32,
+) -> R<u32> {
+    let mut out = Emitter::new(
+        &format!("<module {name}>"),
+        unit,
+        rt_slot,
+        line_slot,
+        table,
+        0,
+        project,
+        program,
+        "<module>".to_owned(),
+    )?;
+    out.future_annotations = suite.iter().any(|s| match s {
+        ast::Stmt::ImportFrom(i) => {
+            i.module
+                .as_ref()
+                .is_some_and(|m| m.as_str() == "__future__")
+                && i.names.iter().any(|a| a.name.as_str() == "annotations")
+        }
+        _ => false,
+    });
+    out.hoist_ints(suite)?;
+    out.frame_guard(1, |out| {
+        out.suite(suite, 0)?;
+        let value = out.none()?;
+        out.emit(Instr::Return { src: value })?;
+        Ok(())
+    })?;
+    let mut p = program.borrow_mut();
+    let func_id = p.functions.len() as u32;
+    p.functions.push(out.finish());
+    Ok(func_id)
+}
+
+/// The library modules a project may import, compiled on first import: every
+/// bundled module whose head the project does not shadow (a project module
+/// `torch` hides all of `torch.*`, as a script-directory package hides an
+/// installed one) and that the project does not define itself.
+fn lazy_modules(candidates: &BTreeMap<&str, &str>) -> Vec<(&'static str, &'static str)> {
+    BUNDLED_MODULES
+        .iter()
+        .filter(|m| !candidates.contains_key(module_head(m.name)) && !candidates.contains_key(m.name))
+        .map(|m| (m.name, m.source))
+        .collect()
+}
+
+/// The file a library module's tracebacks name: `torch/nn.py` (the runtime's
+/// `R.lazy` derives the same).
+fn lazy_file(name: &str) -> String {
+    format!("{}.py", name.replace('.', "/"))
+}
+
+/// [`PyLazy::compile`]: module `k` of `lazy` (module index `k`), compiled
+/// against the program's module names exactly as `compile_project` compiles
+/// an eager module, with function ids from `base`. Compiled modules are kept
+/// per process (when the runtime seed is, see [`set_runtime_memo`]), keyed on
+/// everything their code depends on; each program gets its own copy.
+fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::FuncProto>> {
+    use crate::bytecode::FuncProto;
+    use std::collections::HashMap;
+    use std::fmt::Write;
+    use std::sync::{Arc, Mutex};
+    static CACHE: Mutex<Option<HashMap<String, Arc<Vec<FuncProto>>>>> = Mutex::new(None);
+    const CACHE_MAX: usize = 1024;
+    let module = lazy.modules.get(k).ok_or("Python: no such library module")?;
+    let module_index = k;
+    let memo = SEED_MEMO.load(std::sync::atomic::Ordering::Relaxed);
+    // The module's code depends on the program only through its module
+    // index (`k`: library modules come first), the library's module names,
+    // the seed's slots and the project modules that could answer one of its
+    // imports: those sharing a head with a name it imports, or with itself
+    // (`Emitter::module_exists`, `package_of`). So projects that do not
+    // define such modules share one compile.
+    let key = if memo {
+        let mut heads = BTreeSet::new();
+        if let Some(bundled) = BUNDLED_MODULES.iter().find(|m| m.name == module.name) {
+            bundled_imports(bundled.imports, bundled.name, &mut heads);
+        }
+        let mut heads: BTreeSet<&str> = heads.iter().map(|m| module_head(m)).collect();
+        heads.insert(module_head(&module.name));
+        let mut relevant: Vec<&str> = lazy.names[lazy.modules.len()..]
+            .iter()
+            .map(String::as_str)
+            .filter(|name| heads.contains(module_head(name)))
+            .collect();
+        relevant.sort_unstable();
+        let mut key = format!(
+            "{}|{module_index}|{}|{}|{}|",
+            module.name,
+            lazy.rt_slot,
+            lazy.line_slot,
+            crate::front::pure_script_goal()
+        );
+        for name in &lazy.names[..lazy.modules.len()] {
+            let _ = write!(key, "{name},");
+        }
+        key.push('|');
+        for name in relevant {
+            let _ = write!(key, "{name},");
+        }
+        Some(key)
+    } else {
+        None
+    };
+    let cached = key
+        .as_ref()
+        .and_then(|key| CACHE.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.get(key).cloned())));
+    let functions = match cached {
+        Some(functions) => functions,
+        None => {
+            let _phase = prof::enter(Phase::PyFrontend);
+            let name = module.name.as_str();
+            let file = module.file.as_str();
+            let suite = parse_module(file, module.source)?;
+            let source: &str = module.source.strip_prefix('\u{feff}').unwrap_or(module.source);
+            let suite = nesting::check(suite, file, source)?;
+            let table = symtable::analyse(&suite, name).map_err(|e| format!("{file}: {e}"))?;
+            let lines = emitter::line_starts(source);
+            let project = Project {
+                modules: lazy.names.iter().map(String::as_str).collect(),
+                module_names: lazy.names.iter().map(String::as_str).collect(),
+                entry: &lazy.entry,
+            };
+            let mut fragment = crate::compile_only("", false)?;
+            fragment.functions.clear();
+            let fragment = RefCell::new(fragment);
+            let unit = Unit {
+                file,
+                source,
+                module_index: module_index as u32,
+                lines: &lines,
+            };
+            emit_module(name, unit, &suite, &table, &project, &fragment, lazy.rt_slot, lazy.line_slot)?;
+            let fragment = fragment.into_inner();
+            relocatable(name, &fragment, lazy.rt_slot, lazy.line_slot)?;
+            let functions = Arc::new(fragment.functions);
+            if let Some(key) = key {
+                if let Ok(mut cache) = CACHE.lock() {
+                    let cache = cache.get_or_insert_with(HashMap::new);
+                    if cache.len() >= CACHE_MAX {
+                        cache.clear();
+                    }
+                    cache.insert(key, functions.clone());
+                }
+            }
+            functions
+        }
+    };
+    if (base as usize).saturating_add(functions.len()) > MAX_FUNCTIONS {
+        return Err(format!("Python: importing {}: function count limit exceeded", module.name));
+    }
+    let mut functions = (*functions).clone();
+    for f in &mut functions {
+        for ins in &mut f.code {
+            if let Instr::MakeFunc { func_id, .. } = ins {
+                *func_id += base;
+            }
+        }
+    }
+    Ok(functions)
+}
+
+/// Whether a module compiled for installation (`compile_lazy`) is code that
+/// only `MakeFunc` ids tie to its place in the program: the relocation
+/// `compile_lazy` does. Anything else carrying a function, class or global
+/// slot id (what `prepare_eval_program` remaps for `eval`) would run against
+/// the wrong one, so it is refused loudly, never installed. A constraint on
+/// the Python emitter, which today emits none of it.
+fn relocatable(name: &str, fragment: &Program, rt_slot: u32, line_slot: u32) -> R<()> {
+    if !fragment.classes.is_empty() {
+        return Err(format!("Python: library module {name} defines class records compile-on-import cannot relocate"));
+    }
+    for f in &fragment.functions {
+        let movable = f.name_global.is_none()
+            && f.code.iter().all(|ins| match ins {
+                Instr::LoadGlobal { idx, .. } => *idx == rt_slot || *idx == line_slot,
+                Instr::MakeClosure { .. }
+                | Instr::MakeArrow { .. }
+                | Instr::ClassAddMember { .. }
+                | Instr::MakeClass { .. }
+                | Instr::LoadClassValue { .. }
+                | Instr::LoadGlobalOrUndefined { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+                | Instr::LoadGlobalDyn { .. }
+                | Instr::LoadGlobalOrUndefinedDyn { .. }
+                | Instr::StoreGlobalDyn { .. }
+                | Instr::EvalScopeHas { .. }
+                | Instr::EvalScopeSet { .. }
+                | Instr::DeleteGlobal { .. }
+                | Instr::MathOp { .. }
+                | Instr::LoadUpvalDyn { .. }
+                | Instr::StoreUpvalDyn { .. }
+                | Instr::SuperCtorFetch { .. }
+                | Instr::SuperCtor { .. }
+                | Instr::SuperCtorSpread { .. }
+                | Instr::SuperBase { .. }
+                | Instr::SuperMethod { .. }
+                | Instr::SuperGet { .. }
+                | Instr::SuperGetComputed { .. }
+                | Instr::SuperMethodComputed { .. }
+                | Instr::SuperMethodSpread { .. }
+                | Instr::SuperMethodComputedSpread { .. }
+                | Instr::SuperSet { .. }
+                | Instr::SuperSetComputed { .. }
+                | Instr::DirectEval { .. }
+                | Instr::FieldInit { .. }
+                | Instr::DecKey { .. }
+                | Instr::DecElem { .. }
+                | Instr::DecInits { .. }
+                | Instr::DecField { .. } => false,
+                _ => true,
+            });
+        if !movable {
+            return Err(format!(
+                "Python: library module {name} uses code compile-on-import cannot relocate (in {})",
+                f.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_module_name(name: &str) -> bool {

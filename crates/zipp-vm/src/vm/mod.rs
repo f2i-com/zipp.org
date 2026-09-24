@@ -1264,7 +1264,7 @@ pub struct Vm<'p> {
     /// run loop hold raw pointers into FuncProtos, so they must never move). A
     /// unified `func_id` addresses `program.functions` for `id < main_func_count`
     /// and `eval_funcs[id - main_func_count]` beyond it.
-    eval_funcs: Vec<&'static crate::bytecode::FuncProto>,
+    eval_funcs: Vec<&'p crate::bytecode::FuncProto>,
     /// Aggregate retained static-key plans across the main Program and every
     /// successfully/partially prepared eval/module Program. Incoming programs
     /// beyond either ceiling are rewritten to legacy NewObject before leaking.
@@ -2968,6 +2968,8 @@ mod py_ops;
 mod py_gen;
 #[cfg(feature = "python")]
 mod py_json;
+#[cfg(feature = "python")]
+mod py_lazy;
 #[cfg(feature = "python")]
 mod py_key;
 #[cfg(feature = "python")]

@@ -5273,6 +5273,9 @@ impl<'p> Vm<'p> {
             // kernel ran, `false` when the caller must run its own loop.
             #[cfg(feature = "python")]
             PY_TENSOR => self.py_tensor(args)?,
+            // A library module's code object, compiled on first import.
+            #[cfg(feature = "python")]
+            PY_COMPILE => self.py_compile_module(a0)?,
             #[cfg(feature = "python")]
             PY_STR => self.py_str_has_surrogate(a0),
             #[cfg(feature = "python")]

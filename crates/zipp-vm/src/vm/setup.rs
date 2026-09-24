@@ -2948,6 +2948,16 @@ impl<'p> Vm<'p> {
                 .program
                 .global_names
                 .iter()
+                .position(|name| name == native::PY_COMPILE_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let compile = self.heap.alloc(HeapObj::Native(native::PY_COMPILE));
+                self.globals[slot] = Value::heap(compile);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
                 .position(|name| name == native::PY_STR_NAME);
             if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
                 let query = self.heap.alloc(HeapObj::Native(native::PY_STR));

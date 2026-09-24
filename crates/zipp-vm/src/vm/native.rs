@@ -316,6 +316,14 @@ pub const HOST_CALL_NAME: &str = "__zippHostCall";
 pub const PY_TENSOR: u16 = 1950;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_TENSOR_NAME: &str = "__zipp_py_native";
+/// The Python runtime's compile-on-import (`vm::py_lazy`): a library
+/// module's code object, compiled when it is first imported. Bound like
+/// [`PY_TENSOR`], only in a Python program. Numbered apart from the
+/// sequence below, which other work extends.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_COMPILE: u16 = 1990;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_COMPILE_NAME: &str = "__zipp_py_compile";
 /// The Python runtime's string query (`vm::py_ops`): whether a string holds
 /// any UTF-16 surrogate unit, answered from the heap string's ASCII flag
 /// when it can be. Bound like [`PY_TENSOR`], only in a Python program.
@@ -1698,6 +1706,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         HOST_CALL => (HOST_CALL_NAME, 1),
         #[cfg(feature = "python")]
         PY_TENSOR => ("", 0),
+        #[cfg(feature = "python")]
+        PY_COMPILE => ("", 1),
         #[cfg(feature = "python")]
         PY_STR => ("", 1),
         #[cfg(feature = "python")]

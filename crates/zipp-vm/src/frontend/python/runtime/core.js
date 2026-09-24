@@ -1713,6 +1713,27 @@ var __zipp_py = (function () {
         fail(E.AttributeError, "module '" + m.name + "' has no attribute '" + name + "'");
     };
     R.module = function (name, code, file) { inits.set(name, { code: code, file: file }); files.push(file); return null; };
+    // The library modules the program may import, one name per line, at
+    // module indices 0.. (before the eager modules'): each gets its record,
+    // without code, when first looked up (`initOf`), and compiles on its
+    // first import (`vm::py_lazy`).
+    let lazyNames = "\n";
+    R.lazy = function (names, count) { lazyNames = "\n" + names + "\n"; files.length = count; return null; };
+    function initOf(name) {
+        let init = inits.get(name);
+        if (init === undefined && lazyNames.length > 1) {
+            const at = lazyNames.indexOf("\n" + name + "\n");
+            if (at >= 0) {
+                let index = 0;
+                for (let i = lazyNames.indexOf("\n", 1); i >= 0 && i <= at; i = lazyNames.indexOf("\n", i + 1)) index++;
+                const file = name.split(".").join("/") + ".py";
+                init = { code: null, file: file };
+                inits.set(name, init);
+                files[index] = file;
+            }
+        }
+        return init;
+    }
     rt.moduleInits = inits;
     R.entry = function (name) { entryName = name; return null; };
     // Dotted names are packages: `a.b.c` imports `a`, then `a.b`, then `a.b.c`
@@ -1723,7 +1744,7 @@ var __zipp_py = (function () {
     function hasSubmodules(name) {
         const prefix = name + ".";
         for (const k of inits.keys()) if (k.startsWith(prefix)) return true;
-        return false;
+        return lazyNames.indexOf("\n" + prefix) >= 0;
     }
     R.import = function (name, importerGlobals) {
         if (modules.has(name)) return modules.get(name);
@@ -1735,8 +1756,13 @@ var __zipp_py = (function () {
             if (modules.has(name)) return modules.get(name);
         }
         let m;
-        const init = inits.get(name);
-        if (init !== undefined) m = runModule(name, init, name === entryName ? "__main__" : name);
+        const init = initOf(name);
+        if (init !== undefined) {
+            // A library module registered without code compiles now, on its
+            // first import (`vm::py_lazy`); its code object is kept.
+            if (init.code === null) init.code = __zipp_py_compile(name);
+            m = runModule(name, init, name === entryName ? "__main__" : name);
+        }
         else {
             const b = builtinModules.get(name);
             if (b !== undefined) { m = typeof b === "function" ? b() : b; modules.set(name, m); }
@@ -1833,7 +1859,7 @@ var __zipp_py = (function () {
         const m = runModule(name, init, "__main__");
         // A test file as the entry runs its tests, as `pytest file.py` would.
         const base = String(init.file || "").split("/").pop();
-        if ((/^test_.*\.py$/.test(base) || /_test\.py$/.test(base)) && inits.has("pytest")) {
+        if ((/^test_.*\.py$/.test(base) || /_test\.py$/.test(base)) && initOf("pytest") !== undefined) {
             const pytest = R.import("pytest", null);
             const run = pytest.globals.get("run_module");
             if (run !== undefined) {
@@ -1849,7 +1875,7 @@ var __zipp_py = (function () {
         // `from pkg import sub`: a submodule that is not an attribute yet.
         if (m !== null && typeof m === "object" && m.globals !== undefined && typeof m.name === "string") {
             const full = m.name + "." + name;
-            if (inits.has(full) || builtinModules.has(full) || hasSubmodules(full)) return R.import(full, null);
+            if (initOf(full) !== undefined || builtinModules.has(full) || hasSubmodules(full)) return R.import(full, null);
         }
         const e = makeExc(E.ImportError, ["cannot import name '" + name + "' from '" + m.name + "'"]);
         e.dict.set("name", m.name);

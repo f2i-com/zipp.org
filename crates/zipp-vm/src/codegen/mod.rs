@@ -3668,20 +3668,38 @@ impl Jit {
         // even counts toward a compile (which would intern and root its
         // string constants and build its plans before declining).
         if python {
-            let tierc = py_tierc_enabled();
-            self.interp_only = functions
-                .iter()
-                .map(|f| {
-                    let py = has_py_ops(&f.code);
-                    // A runtime function: nothing compiles. A Python function:
-                    // its loops compile; the whole body only under Tier C.
-                    match (py, self.python_only) {
-                        (false, true) => INTERP_NO_FN | INTERP_NO_REGIONS,
-                        (true, _) if !tierc => INTERP_NO_FN,
-                        _ => 0,
-                    }
-                })
-                .collect();
+            self.interp_only = functions.iter().map(|f| self.python_interp_flags(f)).collect();
+        }
+    }
+
+    /// A Python program's function's `INTERP_*` flags (see
+    /// [`Jit::set_python_program`]).
+    fn python_interp_flags(&self, f: &FuncProto) -> u8 {
+        let py = has_py_ops(&f.code);
+        // A runtime function: nothing compiles. A Python function:
+        // its loops compile; the whole body only under Tier C.
+        match (py, self.python_only) {
+            (false, true) => INTERP_NO_FN | INTERP_NO_REGIONS,
+            (true, _) if !py_tierc_enabled() => INTERP_NO_FN,
+            _ => 0,
+        }
+    }
+
+    /// A Python library module's functions, installed from id `first` on
+    /// when the module is first imported (`vm::py_lazy`): flagged exactly as
+    /// [`Jit::set_python_program`] flags the program's own functions.
+    #[cfg(feature = "python")]
+    pub fn python_functions_installed(&mut self, first: usize, functions: &[FuncProto]) {
+        if !self.python_program {
+            return;
+        }
+        if self.interp_only.len() < first {
+            self.interp_only.resize(first, 0);
+        }
+        self.interp_only.truncate(first);
+        for f in functions {
+            let flags = self.python_interp_flags(f);
+            self.interp_only.push(flags);
         }
     }
 

@@ -88,6 +88,7 @@ pub(crate) fn compile_program_inner(
         module_imports: std::mem::take(&mut c.module_imports),
         module_decl_globals,
         python_natives: false,
+        python_lazy: None,
     })
 }
 
@@ -396,6 +397,7 @@ pub fn compile_eval(
         module_imports: std::mem::take(&mut c.module_imports),
         module_decl_globals,
         python_natives: false,
+        python_lazy: None,
     })
 }
 
