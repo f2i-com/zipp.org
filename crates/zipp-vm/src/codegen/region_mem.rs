@@ -4112,6 +4112,23 @@ pub(crate) fn compile_region_mem(
                     ; jmp => epilogue
                 );
             }
+            Instr::EndFinally { kind_reg, .. } if py => {
+                // A Python `try`/`finally` (or `except` clause) completing
+                // normally falls through; any abrupt completion leaves the
+                // region at the instruction for the interpreter's routing
+                // (Tier C's arm, `proto_mem`).
+                let helper = crate::vm::jit_end_finally as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(kind_reg)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::EndFinally { .. } => {
                 if !scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) {
                     return None;
@@ -4194,13 +4211,7 @@ pub(crate) fn compile_region_mem(
                 catch_reg,
             } => {
                 // The interpreter arm verbatim, on the region's own frame.
-                let packed = ((catch_target as u64) << 16) | catch_reg as u64;
-                dynasm!(ops
-                    ; mov rcx, rdi
-                    ; mov rdx, QWORD packed as i64
-                    ; mov rax, QWORD crate::vm::Vm::jit_py_push_handler as usize as i64
-                    ; call rax
-                );
+                emit_py_push_handler(&mut ops, catch_target, catch_reg);
             }
             Instr::PopHandler => {
                 // `handlers.pop()`, exactly `PopFinally`'s helper.

@@ -1360,8 +1360,8 @@ fn tierc_operands_in_bounds(instr: &Instr, reg_count: u16, code_len: usize) -> b
     {
         return false;
     }
-    if let Some((uses, dst)) = py_op_regs(instr) {
-        return uses.into_iter().all(reg) && dst.is_none_or(reg);
+    if let Some((uses, defs)) = py_op_regs(instr) {
+        return uses.into_iter().chain(defs).all(reg);
     }
     match *instr {
         Instr::LoadBigInt { dst, .. } => return reg(dst),
@@ -3956,13 +3956,7 @@ pub(crate) fn compile_proto_mem(
                 catch_target,
                 catch_reg,
             } => {
-                let packed = ((catch_target as u64) << 16) | catch_reg as u64;
-                dynasm!(ops
-                    ; mov rcx, rdi
-                    ; mov rdx, QWORD packed as i64
-                    ; mov rax, QWORD crate::vm::Vm::jit_py_push_handler as usize as i64
-                    ; call rax
-                );
+                emit_py_push_handler(&mut ops, catch_target, catch_reg);
             }
             Instr::PopHandler => {
                 dynasm!(ops

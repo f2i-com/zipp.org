@@ -60,11 +60,13 @@ pub(crate) const PY_THREW: u64 = 4;
 /// edge). `None` for every other instruction,
 /// including a fused instruction this tier does not know (an unknown one in
 /// a Python loop's out-of-line code compiles to an exit, and one in the loop
-/// itself keeps the loop interpreted), and `PyGenNext`, which resumes a
-/// generator (guest code) and stays with the interpreter. Every instruction
-/// listed here must be one `Vm::py_exec` routes to the interpreter's own
-/// step for it; none calls out to guest code (`PyRaise` always ends in a
-/// throw, which the native code unwinds like any helper's).
+/// itself keeps the loop interpreted). Every instruction listed here must be
+/// one `Vm::py_exec` routes to the interpreter's own step for it. One runs
+/// guest code: `PyGenNext` resumes a generator to its next yield on a nested
+/// interpreter loop (`Vm::py_gen_next`, run to completion exactly as the
+/// interpreter runs it, like a frame call from compiled code; the register
+/// file is pinned while native code runs, see `reserve_jit_regs`). `PyRaise`
+/// always ends in a throw, which the native code unwinds like any helper's.
 #[inline]
 pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
     Some(match *i {
@@ -90,7 +92,11 @@ pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
         | Instr::PyRaise { slow, .. }
         | Instr::PyCaught { slow, .. }
         | Instr::PyClassAttr { slow, .. }
-        | Instr::PyUnpack { slow, .. } => (slow, None),
+        | Instr::PyUnpack { slow, .. }
+        | Instr::PyGenNext { slow, .. }
+        | Instr::PyMakeExc { slow, .. }
+        | Instr::PyExcPop { slow, .. }
+        | Instr::PyNew { slow, .. } => (slow, None),
         // Its second edge: the key's absence (a `.get` default).
         Instr::PyDictLookup { slow, absent, .. } => (slow, Some(absent)),
         #[cfg(feature = "python")]
@@ -100,11 +106,15 @@ pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
     })
 }
 
-/// The registers a fused Python instruction reads and the one it writes
-/// (`None` for a `PyJumpCompare`/`PyDictSet`/`PySetItem`). Exact: the
-/// operand-bounds check below relies on it.
-pub(crate) fn py_op_regs(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
-    Some(match *i {
+/// The registers a fused Python instruction reads and the ones it writes
+/// (none for a `PyJumpCompare`/`PyDictSet`/`PySetItem`/`PyRaise`/
+/// `PyExcPop`; three for `PyNew`). Exact: the operand-bounds check
+/// (`tierc_operands_in_bounds`) relies on it.
+pub(crate) fn py_op_regs(i: &Instr) -> Option<(Vec<u16>, Vec<u16>)> {
+    let (uses, dst) = match *i {
+        Instr::PyNew { dst, entry, this_f, cls, rt, .. } => return Some((vec![cls, rt], vec![dst, entry, this_f])),
+        Instr::PyMakeExc { dst, cls, args, rt, .. } => (vec![cls, args, rt], Some(dst)),
+        Instr::PyExcPop { rt, .. } => (vec![rt], None),
         Instr::PyArith { dst, a, b, .. } | Instr::PyCompare { dst, a, b, .. } => (vec![a, b], Some(dst)),
         Instr::PyAddImm { dst, a, .. } => (vec![a], Some(dst)),
         Instr::PyJumpCompare { a, b, .. } => (vec![a, b], None),
@@ -128,8 +138,10 @@ pub(crate) fn py_op_regs(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         Instr::PyClassAttr { dst, obj, .. } => (vec![obj], Some(dst)),
         Instr::PyDictLookup { dst, d, k, rt, .. } => (vec![d, k, rt], Some(dst)),
         Instr::PyUnpack { dst, v, rt, .. } => (vec![v, rt], Some(dst)),
+        Instr::PyGenNext { dst, next, this, .. } => (vec![next, this], Some(dst)),
         _ => return None,
-    })
+    };
+    Some((uses, dst.into_iter().collect()))
 }
 
 /// Whether `code` holds a fused Python instruction (a body the Python
@@ -153,8 +165,10 @@ pub(crate) fn control_targets(i: &Instr) -> [Option<u32>; 2] {
 /// instructions: `LoadBigInt` (an int literal), the per-call traceback
 /// handler's `PushHandler`/`PopHandler`, `Throw` (re-raising from that
 /// handler, or raising from a statement), which compiles to a bail so the
-/// interpreter performs it, and the list/tuple builders `NewArray` and a
-/// plain `ArrayAppend`.
+/// interpreter performs it, a `try` statement's `EndFinally` (its normal
+/// completion falls through; an abrupt one bails to the interpreter's
+/// routing), and the list/tuple builders `NewArray` and a plain
+/// `ArrayAppend`.
 pub(crate) fn py_body_op(i: &Instr) -> bool {
     matches!(
         i,
@@ -162,6 +176,7 @@ pub(crate) fn py_body_op(i: &Instr) -> bool {
             | Instr::PushHandler { .. }
             | Instr::PopHandler
             | Instr::Throw { .. }
+            | Instr::EndFinally { .. }
             | Instr::NewArray { .. }
             | Instr::ArrayAppend { spread: false, .. }
     )
@@ -1180,16 +1195,11 @@ pub(crate) fn py_region_plan(proto: &FuncProto, start: u32, end: u32) -> Result<
         .collect();
     // An op the region cannot compile inside the loop proper would exit the
     // region on (nearly) every iteration: keep such a loop interpreted.
-    // (Out-of-line code may hold them: it runs rarely.) `PyGenNext` is the
-    // exception: every `for` loop's generic iteration step carries one for a
-    // generator, beside the list and range paths, and it is an exit only
-    // when the loop really iterates a generator (whose region then evicts
-    // itself after its deopt limit).
+    // (Out-of-line code may hold them: it runs rarely.)
     if let Some(ip) = (start as usize..=end as usize).find(|&ip| {
         let i = &proto.code[ip];
         py_op_edges(i).is_none()
             && !py_body_op(i)
-            && !matches!(i, Instr::PyGenNext { .. })
             && !region_op_admitted(proto, ip, i, start, end, Some(&strings), None, false)
     }) {
         return Err(format!("loop op at {ip}: {:?}", proto.code[ip]));
@@ -1235,4 +1245,17 @@ pub(crate) fn emit_py_load_const(
         ; mov [rbx + dreg(dst)], rax
     );
     refetch(ops);
+}
+
+/// A Python body's `PushHandler` (the per-call traceback handler, or a
+/// `try`): `Vm::jit_py_push_handler`, the interpreter's arm verbatim on the
+/// body's own frame.
+pub(crate) fn emit_py_push_handler(ops: &mut dynasmrt::x64::Assembler, catch_target: u32, catch_reg: u16) {
+    let packed = ((catch_target as u64) << 16) | catch_reg as u64;
+    dynasm!(ops
+        ; mov rcx, rdi
+        ; mov rdx, QWORD packed as i64
+        ; mov rax, QWORD crate::vm::Vm::jit_py_push_handler as usize as i64
+        ; call rax
+    );
 }

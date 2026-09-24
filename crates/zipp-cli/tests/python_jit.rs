@@ -215,6 +215,163 @@ print(fib(20), loop(1500), sum(gen(100)))
     );
 }
 
+/// Loops over generators (the generator step runs from compiled code),
+/// `try`/`except`/`finally` inside a hot loop (normal and raising
+/// iterations), exception construction and plain class instantiation.
+#[test]
+fn generators_exceptions_and_instances_in_loops() {
+    same_everywhere(
+        r#"class Err(Exception):
+    pass
+
+class P:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+class Q:
+    pass
+
+def squares(n):
+    for i in range(n):
+        yield i * i
+
+def boom(n):
+    for i in range(n):
+        if i == n - 1:
+            raise Err("gen", i)
+        yield i
+
+def tree(d):
+    if d == 0:
+        yield 1
+        return
+    for v in tree(d - 1):
+        yield v
+    for v in tree(d - 1):
+        yield v + 1
+
+def loops(n):
+    acc = 0
+    for v in squares(n):
+        acc += v
+    caught = 0
+    for k in range(n):
+        try:
+            acc += k
+            if k % 97 == 0:
+                raise Err(k)
+            if k % 89 == 0:
+                {}["x"]
+        except Err as e:
+            caught += e.args[0]
+        except KeyError:
+            caught -= 1
+        finally:
+            acc -= 1
+    pts = []
+    for k in range(n):
+        p = P(k, -k)
+        q = Q()
+        q.z = p.x + p.y + k
+        pts.append(q.z)
+    try:
+        for v in boom(n):
+            acc += v
+    except Err as e:
+        acc += e.args[1] * 1000
+    t = 0
+    for v in tree(9):
+        t += v
+    g = squares(n)
+    first = [next(g) for _ in range(5)]
+    return acc, caught, sum(pts), t, first
+
+print(loops(3000))
+print(loops(40))
+"#,
+        EXPECTED_GENERATORS,
+    );
+}
+
+/// `finally` and `with` left abruptly from hot loops: `continue`, `break`
+/// and `return` through a `finally`, a context manager swallowing an
+/// exception, and raises from inside a `finally`. Compiled code leaves every
+/// abrupt completion to the interpreter's routing; a loop with `continue` or
+/// `break` inside a `try` (`JumpFinally`) stays interpreted, and the loop
+/// raising from its `finally` compiles.
+#[test]
+fn abrupt_finally_paths() {
+    same_everywhere(
+        r#"class Err(Exception):
+    pass
+
+class Ctx:
+    def __init__(self, log):
+        self.log = log
+    def __enter__(self):
+        self.log.append(1)
+        return self
+    def __exit__(self, t, v, tb):
+        self.log.append(2 if t is None else 3)
+        return t is Err
+
+def early(k):
+    try:
+        if k % 5 == 0:
+            return k * 2
+        return k
+    finally:
+        k += 1000
+
+def abrupt(n):
+    acc = 0
+    log = []
+    for k in range(n):
+        try:
+            if k % 7 == 0:
+                continue
+            if k == n - 3:
+                break
+            acc += early(k)
+        finally:
+            acc += 1
+        with Ctx(log):
+            if k % 13 == 0:
+                raise Err(k)
+            acc += 2
+        try:
+            try:
+                if k % 17 == 0:
+                    raise Err("inner")
+            finally:
+                if k % 34 == 0:
+                    raise KeyError(k)
+        except Err:
+            acc += 3
+        except KeyError as e:
+            acc += e.args[0]
+    return acc, len(log), sum(log)
+
+def raise_in_finally(n):
+    out = 0
+    for k in range(n):
+        try:
+            try:
+                out += k
+            finally:
+                if k == n - 1:
+                    raise Err("last")
+        except Err as e:
+            out = -out
+    return out
+
+print(abrupt(3000), abrupt(50), raise_in_finally(2500))
+"#,
+        EXPECTED_FINALLY,
+    );
+}
+
 /// CPython 3.13's output for each program above.
 const EXPECTED_ARITHMETIC: &str = r#"0 -293 -879 1180591620717411303424 True True False True
 1 -286 -1731 1180591620717411303425 True True False True
@@ -232,4 +389,9 @@ const EXPECTED_ARITHMETIC: &str = r#"0 -293 -879 1180591620717411303424 True Tru
 const EXPECTED_CONTAINERS: &str = r#"(-47393699, 4000, -93600, {'a': 1999}, [199000, 199200, 199400, 199600, 199800, 200000, 200200, 200400, 200600, 200800])
 "#;
 const EXPECTED_CALLS: &str = r#"6765 4440679 328350
+"#;
+const EXPECTED_GENERATORS: &str = r#"(9007490501, 45072, 4498500, 2816, [0, 1, 4, 9, 16])
+(61021, 0, 780, 2816, [0, 1, 4, 9, 16])
+"#;
+const EXPECTED_FINALLY: &str = r#"(4739982, 5136, 7902) (1283, 80, 123) -3123750
 "#;

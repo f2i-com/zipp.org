@@ -354,9 +354,10 @@ impl ScriptState {
     /// without the JIT, and it never overrides `ZIPP_NOJIT`. Call it before
     /// `run_init`, and only for a state that will run without an instruction
     /// budget: compiled code meters by basic block, which can over-charge.
+    /// The JIT's Python tier is x86-64 only: a no-op elsewhere.
     #[cfg(feature = "instrument")]
     pub fn enable_vm_jit(&mut self) {
-        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             if std::env::var_os("ZIPP_NOJIT").is_some() {
                 return;

@@ -49,5 +49,6 @@ mod jit_frame;
 mod jit_plans;
 mod method_inline;
 mod modules;
+#[cfg(feature = "python")]
 mod py_jit;
 mod run;

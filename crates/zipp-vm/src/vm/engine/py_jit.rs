@@ -57,7 +57,25 @@ impl<'p> Vm<'p> {
             return PY_BAIL;
         }
         vm.maybe_gc();
-        let Some(r) = vm.py_exec(func_id, base, ip, instr) else {
+        // `PyGenNext` runs guest code on a nested interpreter loop: bounded
+        // like a frame call from compiled code (`jit_frame_call`), and its
+        // throw is not a region-quality signal.
+        let guest = matches!(instr, Instr::PyGenNext { .. });
+        if guest {
+            if vm.jit_call_depth >= JIT_REGION_CALL_MAX {
+                vm.osr_deopt_exempt = true;
+                return PY_BAIL;
+            }
+            vm.jit_call_depth += 1;
+        }
+        let r = vm.py_exec(func_id, base, ip, instr);
+        if guest {
+            vm.jit_call_depth -= 1;
+            if matches!(r, Some(Err(_))) {
+                vm.osr_deopt_exempt = true;
+            }
+        }
+        let Some(r) = r else {
             return PY_BAIL;
         };
         match r {
@@ -270,7 +288,8 @@ impl<'p> Vm<'p> {
 
     /// The interpreter's own step for a fused Python instruction the native
     /// tiers admit (`codegen::py_op_edges`): `py_step` for the first round of
-    /// them, `py_step_ext` for the second, exactly as the dispatch loop
+    /// them, `py_step_ext` for the second, `py_step_ext2` for the third,
+    /// exactly as the dispatch loop
     /// routes them. `None` for any other instruction (each step function
     /// answers an instruction it does not know by falling through, so the
     /// routing must be explicit).
@@ -301,9 +320,13 @@ impl<'p> Vm<'p> {
             | Instr::PyCaught { .. }
             | Instr::PyClassAttr { .. }
             | Instr::PyDictLookup { .. }
+            | Instr::PyGenNext { .. }
             | Instr::PyUnpack { .. } => Some(self.py_step_ext(func_id, base, ip, instr)),
             #[cfg(feature = "python")]
             Instr::PySeq { .. } => Some(self.py_step_ext(func_id, base, ip, instr)),
+            Instr::PyMakeExc { .. } | Instr::PyExcPop { .. } | Instr::PyNew { .. } => {
+                Some(self.py_step_ext2(func_id, base, ip, instr))
+            }
             _ => None,
         }
     }

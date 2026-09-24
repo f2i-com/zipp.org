@@ -5535,6 +5535,11 @@ pub(crate) mod meter;
 mod plan;
 mod plan_region;
 mod proto_mem;
+#[cfg(feature = "python")]
+mod py;
+// No Python program in this build: the tier's questions answer "none".
+#[cfg(not(feature = "python"))]
+#[path = "py_off.rs"]
 mod py;
 mod regalloc;
 mod region_admit;

@@ -190,8 +190,9 @@ fn install_gpu(state: &mut ScriptState, gpu: bool) {
 /// A command-line Python run has no instruction budget, so it runs on the
 /// VM JIT like `zipp js` (the embedding API's Python states start without it);
 /// `ZIPP_PY_JIT=0` keeps it interpreted, `ZIPP_NOJIT=1` turns every JIT off.
+/// The JIT's Python tier is x86-64 only: elsewhere Python stays interpreted.
 fn enable_python_jit(state: &mut ScriptState) {
-    if zipp_vm::frontend::python_jit_env() != Some(false) {
+    if cfg!(target_arch = "x86_64") && zipp_vm::frontend::python_jit_env() != Some(false) {
         state.enable_vm_jit();
     }
 }

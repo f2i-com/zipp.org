@@ -96,7 +96,8 @@ pub fn compile_source(source: &str, frontend: Frontend) -> Result<CompiledSource
 /// configuration); `ZIPP_PY_JIT=0` keeps it off even when a host asks.
 #[cfg(feature = "python")]
 fn python_jit_default(state: &mut ScriptState) {
-    if python_jit_env() != Some(true) {
+    // The JIT's Python tier is x86-64 only (see `ScriptState::enable_vm_jit`).
+    if python_jit_env() != Some(true) || !cfg!(target_arch = "x86_64") {
         state.disable_vm_jit();
     }
 }
