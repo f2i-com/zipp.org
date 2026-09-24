@@ -1,8 +1,16 @@
 // Exactness checks for the WebGPU backend's faster kernels, run natively by
 // tests/protocol_cases.rs (and in Chrome the same way): the register-blocked
-// matmul tile against the 16x16 kernel on the same device, and the axis-sum
+// matmul tiles against the 16x16 kernel on the same device, and the axis-sum
 // and index_add kernels against cpu-js, bit for bit (a zero's sign included).
 // Each returns {failures, report}.
+
+// The register-blocked tiles checked: the 128x128 one everywhere but the
+// native host on Direct3D 12, which never runs it (FXC takes 15 minutes over
+// its 64 accumulators, DXC half a minute; zipp-gpu's driver.js). There, too,
+// fused matmuls are checked on the tile they choose only: FXC takes ~20 s
+// over each 64x64 variant (and the native host keeps the 16x16 kernel on it).
+const D3D12 = typeof __zgpuAdapter === 'string' && /\(dx12\b/.test(__zgpuAdapter);
+const TILES = D3D12 ? [4] : [4, 8], FUSED_TILES = D3D12 ? [] : TILES;
 async function exactMatmulTiles(M) {
   const rt = await M.createRuntime({backend: 'webgpu', limits: {maxElements: 1 << 26, maxInputElements: 1 << 26, maxOutputElements: 1 << 26, maxWork: Number.MAX_SAFE_INTEGER, maxLogicalBytes: 8 * 1024 * 1024 * 1024}});
   const impl = rt.impl;
@@ -34,14 +42,14 @@ async function exactMatmulTiles(M) {
       transposed ? {id: 2, op: 'matmul', a: 0, b: 1, transposed: true} : {id: 2, op: 'matmul', a: 0, b: 1}];
     const program = {version: 2, nodes, outputs: [{name: 'r', id: 2}]};
     const bits = {};
-    for (const tile of [1, 4]) {
+    for (const tile of [1, ...TILES]) {
       impl.matmulTile = tile;
       const out = await rt.execute(program, {typedOutputs: true});
       bits[tile] = new Uint32Array(out.outputs.r.data.buffer.slice(0));
     }
     impl.matmulTile = null;
     const row = {a: sa, b: sb, transposed: !!transposed, n: bits[1].length};
-    for (const tile of [4]) {
+    for (const tile of TILES) {
       let diff = 0, first = -1;
       for (let i = 0; i < bits[1].length; i++) if (bits[1][i] !== bits[tile][i]) { diff++; if (first < 0) first = i; }
       row[`r${tile}`] = diff;
@@ -195,5 +203,128 @@ async function exactVectorised(M) {
     if (diff) failures++;
     report.push({sizes, batch, diff});
   }
+  return {failures, report};
+}
+
+// The WebGPU backend's fused execution (transposes read through by matmuls,
+// one-dispatch sums and cross-entropy, elementwise chains) against every node as its own
+// kernel, on the same device, bit for bit: matmuls reading one or both
+// operands through a transpose (twice-transposed too) or writing their result
+// transposed, over ragged and tiled sizes; whole sums and means of 1 to 2048
+// values; cross-entropy over 1 to 1024 rows; and a training session shaped
+// as torch.compile records one (bias by a ones-matmul, dead gradients, the
+// weights' transposes), several steps, then its weights and moments.
+async function exactFusion(M) {
+  const limits = {maxElements: 1 << 26, maxInputElements: 1 << 26, maxOutputElements: 1 << 26, maxWork: Number.MAX_SAFE_INTEGER, maxLogicalBytes: 8 * 1024 * 1024 * 1024};
+  let seed = 99;
+  const rnd = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296;
+  const data = n => Float32Array.from({length: n}, () => { const r = rnd(); return r < 0.04 ? (r < 0.02 ? -0 : 0) : (rnd() - 0.5) * (r < 0.1 ? 40 : 3); });
+  // One runtime, the fused and unfused plans by turns (fusion.mjs caches each).
+  const rt = await M.createRuntime({backend: 'webgpu', limits});
+  const run = async (program, fuse) => {
+    rt.impl.fuse = fuse;
+    const out = await rt.execute(program, {typedOutputs: true});
+    return Object.keys(out.outputs).sort().map(k => new Uint32Array(out.outputs[k].data.buffer.slice(0)));
+  };
+  const report = [];
+  let failures = 0;
+  const compare = async (name, program) => {
+    const a = await run(program, true), b = await run(program, false);
+    let diff = 0;
+    a.forEach((x, i) => { for (let j = 0; j < x.length; j++) if (x[j] !== b[i][j]) diff++; });
+    if (diff) failures++;
+    report.push({name, diff});
+  };
+  // Matmuls through transposes: X [m,k], Y [k,n] given as stored transposes.
+  for (const [m, k, n] of [[1, 1, 1], [3, 5, 7], [17, 13, 9], [64, 784, 256], [256, 64, 784], [130, 257, 70], [300, 700, 1], [1024, 1024, 1024], [5, 4096, 33]]) {
+    const nodes = [{id: 0, op: 'input', shape: [k, m], data: data(m * k)}, {id: 1, op: 'input', shape: [n, k], data: data(k * n)},
+      {id: 2, op: 'input', shape: [m, k], data: data(m * k)}, {id: 3, op: 'input', shape: [k, n], data: data(k * n)},
+      {id: 4, op: 'transpose', a: 0}, {id: 5, op: 'transpose', a: 1}, {id: 6, op: 'transpose', a: 5},
+      {id: 7, op: 'matmul', a: 4, b: 5}, {id: 8, op: 'matmul', a: 4, b: 3}, {id: 9, op: 'matmul', a: 2, b: 5},
+      {id: 10, op: 'transpose', a: 6}, {id: 11, op: 'matmul', a: 2, b: 1, transposed: true}, {id: 12, op: 'transpose', a: 11},
+      {id: 13, op: 'matmul', a: 4, b: 10}, {id: 14, op: 'transpose', a: 13}];
+    // Each tile (the chosen one, and 4 and 8 pinned) reading through the transposes.
+    for (const tile of [null, ...FUSED_TILES]) {
+      if (tile && m * n < 4096) continue;
+      rt.impl.matmulTile = tile;
+      await compare(`matmul ${m}x${k}x${n} through transposes${tile ? `, tile ${tile}` : ''}`, {version: 2, nodes,
+        outputs: [{name: 'a', id: 7}, {name: 'b', id: 8}, {name: 'c', id: 9}, {name: 'd', id: 12}, {name: 'e', id: 14}]});
+    }
+    rt.impl.matmulTile = null;
+  }
+  for (const n of [1, 2, 3, 63, 64, 65, 255, 256, 257, 1000, 1023, 1024, 1025, 2047, 2048]) {
+    const nodes = [{id: 0, op: 'input', shape: [n], data: data(n)}, {id: 1, op: 'sum', a: 0}, {id: 2, op: 'mean', a: 0}];
+    await compare(`sum and mean of ${n}`, {version: 2, nodes, outputs: [{name: 's', id: 1}, {name: 'm', id: 2}]});
+  }
+  for (const [rows, cols] of [[1, 3], [2, 10], [64, 10], [255, 7], [256, 1000], [257, 5], [1000, 17], [1024, 2]]) {
+    const nodes = [{id: 0, op: 'input', shape: [rows, cols], data: data(rows * cols)},
+      {id: 1, op: 'input', shape: [rows], data: Float32Array.from({length: rows}, () => Math.floor(rnd() * cols))},
+      {id: 2, op: 'cross_entropy', a: 0, b: 1}];
+    await compare(`cross_entropy ${rows}x${cols}`, {version: 2, nodes, outputs: [{name: 'l', id: 2}]});
+  }
+  // Elementwise chains: a product into a sum (x*y + z), scalar operands on
+  // either side, a member read twice, members read after the chain, a K=1
+  // matmul broadcast (a bias) into an add and an activation.
+  for (const [r, c] of [[1, 1], [3, 5], [64, 256], [97, 1031]]) {
+    const n = r * c;
+    const nodes = [{id: 0, op: 'input', shape: [r, c], data: data(n)}, {id: 1, op: 'input', shape: [r, c], data: data(n)},
+      {id: 2, op: 'input', shape: [r, c], data: data(n)}, {id: 3, op: 'input', shape: [], data: [1.375]},
+      {id: 4, op: 'mul', a: 0, b: 1}, {id: 5, op: 'add', a: 4, b: 2}, {id: 6, op: 'mul', a: 5, b: 3}, {id: 7, op: 'sub', a: 3, b: 6},
+      {id: 8, op: 'tanh', a: 7}, {id: 9, op: 'mul', a: 8, b: 8}, {id: 10, op: 'sigmoid', a: 9}, {id: 11, op: 'maximum', a: 10, b: 5},
+      {id: 12, op: 'input', shape: [r, 1], data: data(r)}, {id: 13, op: 'input', shape: [1, c], data: data(c)},
+      {id: 14, op: 'matmul', a: 12, b: 13}, {id: 15, op: 'add', a: 0, b: 14}, {id: 16, op: 'relu', a: 15}, {id: 17, op: 'gelu', a: 16},
+      {id: 18, op: 'div', a: 17, b: 3}, {id: 19, op: 'exp', a: 10}, {id: 20, op: 'gt', a: 19, b: 3}, {id: 21, op: 'mul', a: 20, b: 15}];
+    await compare(`chains ${r}x${c}`, {version: 3, nodes,
+      outputs: [{name: 'a', id: 11}, {name: 'b', id: 18}, {name: 'c', id: 21}, {name: 'd', id: 6}]});
+  }
+  // A chain reading more inputs than one shader may bind (split in two).
+  {
+    const nodes = Array.from({length: 12}, (_, i) => ({id: i, op: 'input', shape: [33, 7], data: data(231)}));
+    for (let i = 0; i < 11; i++) nodes.push({id: 12 + i, op: i % 2 ? 'mul' : 'add', a: i ? 11 + i : 0, b: i + 1});
+    await compare('chain of 12 inputs', {version: 2, nodes, outputs: [{name: 'r', id: 22}, {name: 's', id: 17}]});
+  }
+  // A torch.compile-shaped training session: several steps, then the state.
+  const [I, H, C, B] = [40, 24, 5, 16];
+  const W1 = data(H * I).map(v => v / 8), W2 = data(C * H).map(v => v / 8), b1 = data(H).map(v => v / 8), b2 = data(C).map(v => v / 8);
+  const nodes = [{id: 0, op: 'input', shape: [B, I]}, {id: 1, op: 'input', shape: [H, I], data: W1, carry: 'w0'},
+    {id: 2, op: 'transpose', a: 1}, {id: 3, op: 'matmul', a: 0, b: 2}, {id: 4, op: 'input', shape: [1, H], data: b1, carry: 'w1'},
+    {id: 5, op: 'full', shape: [B, 1], value: 1}, {id: 6, op: 'matmul', a: 5, b: 4}, {id: 7, op: 'add', a: 3, b: 6}, {id: 8, op: 'relu', a: 7},
+    {id: 9, op: 'input', shape: [C, H], data: W2, carry: 'w2'}, {id: 10, op: 'transpose', a: 9}, {id: 11, op: 'matmul', a: 8, b: 10},
+    {id: 12, op: 'input', shape: [1, C], data: b2, carry: 'w3'}, {id: 13, op: 'full', shape: [B, 1], value: 1}, {id: 14, op: 'matmul', a: 13, b: 12},
+    {id: 15, op: 'add', a: 11, b: 14}, {id: 16, op: 'input', shape: [B]}, {id: 17, op: 'cross_entropy', a: 15, b: 16},
+    {id: 18, op: 'full', shape: [], value: 1}, {id: 19, op: 'cross_entropy_grad', a: 15, b: 16}, {id: 20, op: 'mul', a: 18, b: 19},
+    {id: 21, op: 'transpose', a: 12}, {id: 22, op: 'matmul', a: 20, b: 21}, {id: 23, op: 'transpose', a: 13}, {id: 24, op: 'matmul', a: 23, b: 20},
+    {id: 25, op: 'transpose', a: 10}, {id: 26, op: 'matmul', a: 20, b: 25}, {id: 27, op: 'transpose', a: 8}, {id: 28, op: 'matmul', a: 27, b: 20},
+    {id: 29, op: 'transpose', a: 28}, {id: 30, op: 'positive', a: 7}, {id: 31, op: 'mul', a: 26, b: 30}, {id: 32, op: 'transpose', a: 4},
+    {id: 33, op: 'matmul', a: 31, b: 32}, {id: 34, op: 'transpose', a: 5}, {id: 35, op: 'matmul', a: 34, b: 31}, {id: 36, op: 'transpose', a: 2},
+    {id: 37, op: 'matmul', a: 31, b: 36}, {id: 38, op: 'transpose', a: 0}, {id: 39, op: 'matmul', a: 38, b: 31}, {id: 40, op: 'transpose', a: 39}];
+  const outputs = [{name: 'result', id: 17}, {name: 'g0', id: 40}, {name: 'g1', id: 35}, {name: 'g2', id: 29}, {name: 'g3', id: 24}];
+  const grads = [[1, 40, [H, I]], [4, 35, [1, H]], [9, 29, [C, H]], [12, 24, [1, C]]];
+  grads.forEach(([p, g, shape], i) => {
+    const at = nodes.length;
+    nodes.push({id: at, op: 'input', shape, data: new Float32Array(shape[0] * shape[1]), carry: `m${i}`},
+      {id: at + 1, op: 'input', shape, data: new Float32Array(shape[0] * shape[1]), carry: `v${i}`},
+      {id: at + 2, op: 'adam_m', a: at, b: g, beta1: 0.9}, {id: at + 3, op: 'adam_v', a: at + 1, b: g, beta2: 0.999},
+      {id: at + 4, op: 'adam_update', a: p, b: at + 2, c: at + 3, lr: 0.01, beta1: 0.9, beta2: 0.999, eps: 1e-8, step: 1});
+    outputs.push({name: `w${i}`, id: at + 4}, {name: `m${i}`, id: at + 2}, {name: `v${i}`, id: at + 3});
+  });
+  const resident = outputs.map(o => o.name).filter(n => n !== 'result');
+  const feeds = Array.from({length: 6}, () => ({inputs: {0: data(B * I), 16: Float32Array.from({length: B}, () => Math.floor(rnd() * C))}}));
+  const bits = {};
+  for (const fuse of [true, false]) {
+    rt.impl.fuse = fuse;
+    const s = await rt.prepare({version: 2, nodes, outputs}, {resident});
+    const losses = [];
+    for (const f of feeds.slice(0, 2)) losses.push(...(await s.run(f, {readback: ['result']})).outputs.result.data);
+    for (const r of (await s.run(feeds.slice(2), {readback: ['result']})).steps) losses.push(...r.outputs.result.data);
+    const state = (await s.download(resident)).outputs;
+    s.dispose();
+    bits[fuse] = [Float32Array.from(losses), ...resident.map(n => state[n].data)].map(a => new Uint32Array(Float32Array.from(a).buffer));
+  }
+  rt.dispose();
+  let diff = 0;
+  bits[true].forEach((a, i) => { for (let j = 0; j < a.length; j++) if (a[j] !== bits[false][i][j]) diff++; });
+  if (diff) failures++;
+  report.push({name: 'torch-shaped training session, 6 steps', diff});
   return {failures, report};
 }

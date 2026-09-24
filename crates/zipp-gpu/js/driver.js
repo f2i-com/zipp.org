@@ -36,11 +36,13 @@ function __zgpuInit(backend, policy, adapter, replay) {
       // Keep up to 2 GiB of freed buffers for reuse (the browser keeps 256
       // MiB): a large model's steps then allocate nothing after the first.
       runtime.impl.poolBytes = Math.max(runtime.impl.poolBytes || 0, 2 * 1024 * 1024 * 1024);
-      // Direct3D 12 with FXC takes ~18 s to compile the register-blocked
-      // matmul tile (the 16x16 kernel: half a second; DXC, when a
-      // dxcompiler.dll is there, 1.5 s). The tile changes no result bit, only
-      // speed, so D3D12 on FXC keeps the 16x16 one.
+      // Direct3D 12 with FXC takes ~20 s to compile the 64x64 matmul tile
+      // (the 16x16 kernel: half a second; DXC, when a dxcompiler.dll is
+      // there, 1.6 s), and the 128x128 one DXC ~28 s, FXC 15 minutes
+      // (Vulkan: 0.06 s). The tile changes no result bit, only speed, so
+      // D3D12 on FXC keeps the 16x16 kernel and on DXC the 64x64 tile.
       if (/\(dx12\b.*\bfxc\)$/.test(__zgpuAdapter || '') && 'matmulTile' in runtime.impl) runtime.impl.matmulTile = 1;
+      if (/\(dx12\b/.test(__zgpuAdapter || '') && 'bigTiles' in runtime.impl) runtime.impl.bigTiles = false;
     }
     __zgpuRuntime = runtime;
     __zgpuHandler = createZippGPUHandler(runtime, {allowExecute: true, maxSessions: 16});

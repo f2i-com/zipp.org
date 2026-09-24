@@ -65,9 +65,13 @@ test('WebGPU contract mock: a buffer freed during an execution is reused for out
 });
 test('WebGPU contract mock: pairwise sum records guarded tails and returns scratch to the pool',async()=>{
   const d=fakeDevice(),b=new WebGPUBackend(d),nodes=plan(65,'sum');await b.begin();
+  // Past 2048 values (or unfused), a pass per level; up to 2048, one workgroup does the same tree.
+  b.fuse=false;
   const a=await b.run(nodes[0],[]),o=await b.run(nodes[1],[a]);
   assert.equal(d.dispatches.length,7);assert.ok(d.codes.some(code=>code.includes('if (j + 1u < P.len)')));
-  assert.equal(b.recycled.length,6);b.free(a);b.free(o);await b.finish();assert.equal(b.recycled.length,0);b.dispose();
+  assert.equal(b.recycled.length,6);b.free(a);b.free(o);await b.finish();assert.equal(b.recycled.length,0);
+  b.fuse=true;await b.begin();const a2=await b.run(nodes[0],[]),o2=await b.run(nodes[1],[a2]);
+  assert.equal(d.dispatches.length,8,'one more dispatch');assert.equal(b.recycled.length,0);b.free(a2);b.free(o2);await b.finish();b.dispose();
 });
 test('WebGPU contract mock: rejected compilation releases the output allocation',async()=>{
   const d=fakeDevice(),b=new WebGPUBackend(d),nodes=plan(3);await b.begin();const a=await b.run(nodes[0],[]);d.failCompile=true;

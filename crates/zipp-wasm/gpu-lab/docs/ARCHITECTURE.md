@@ -225,6 +225,23 @@ pool allocates the same buffers and rebuilds nothing). Validation and out-of-mem
 error scopes are pushed once per execution (per node in `debug` mode) and awaited
 together with the queue drain.
 
+Before recording, a plan is turned into its execution items (`src/fusion.mjs`,
+cached per plan and backend): nodes no output depends on are dropped on every
+backend; in a prepared session a node that depends only on constants is
+computed once and kept; and a backend may run several nodes as one item.
+WebGPU does so only where each element's arithmetic is unchanged: Adam's three
+updates of a parameter, a matmul reading a transposed operand in place or
+writing its result transposed, whole sums and means of up to 2048 values and
+cross-entropy of up to 1024 rows in one workgroup (the same pairwise tree), and
+chains of elementwise nodes of one size (a K=1 bias matmul may start one). A
+chain kernel passes every intermediate through a bit operation against a
+uniform zero, so no compiler can contract a product into a following sum; it
+binds at most the device's storage buffers per stage. Use counts are recounted
+over the items, so a fused intermediate never exists as a buffer.
+`impl.fuse = false` turns backend fusion off for differential tests
+(`crates/zipp-gpu/tests/exact_kernels.js` compares both, bit for bit, on
+Vulkan, Direct3D 12 and Chrome).
+
 The WebGL2 backend stores one scalar per texel: R32F (4 bytes) where the driver
 reports it renderable, falling back to RGBA32F (16 bytes) where it does not, with
 readback through `RED/FLOAT` only where `IMPLEMENTATION_COLOR_READ_FORMAT` allows
@@ -324,11 +341,11 @@ Do not keep views into guest WASM memory across asynchronous work without a corr
 lifetime and memory-growth contract. GPU uploads still involve copies unless an
 actual supported sharing mechanism exists.
 
-**Third: fuse easy expressions.** Lower an elementwise subgraph such as
-`relu(a*b+scalar)` to one shader dispatch. The present implementation emits separate
-nodes and kernels. Cache by structural expression and relevant dtype/shape policy.
-Compare kernel launch savings against shader compile cost and cache growth. Keep a
-reference interpreter and a way to disable fusion during differential tests.
+**Third: fuse easy expressions.** Partly done (see `src/fusion.mjs` above):
+WebGPU runs elementwise chains, transposes into matmuls and small reductions
+as single dispatches with unchanged arithmetic, keyed by the chain's
+structure. Still open: fusing across reductions and softmax-shaped patterns,
+and weighing shader compile cost against launch savings for rarely run chains.
 
 **Fourth: tiled matrix kernels and batching.** Partly done. WebGPU multiplies
 through 16x16 workgroup tiles (bounds handled by zero padding, so every invocation

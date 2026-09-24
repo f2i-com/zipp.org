@@ -220,9 +220,12 @@ Rebuild the standalone kernel with `sh scripts/build_wasm.sh`: cargo with Rust
 WebAssembly SIMD fall back to JavaScript).
 The kernel module is separate from Zipp WASM; rebuilding it does not rebuild Python.
 
-This remains an experimental graph engine: no kernel fusion, persistent
-cross-request tensors, float16, convolutions or general shader compiler. Matrix
-products are tiled only on WebGPU (16x16 workgroup tiles) and register-blocked
-in the SIMD WASM kernels. Measured timings are in `docs/VALIDATION.md`; at MNIST
+This remains an experimental graph engine: no general kernel fusion, persistent
+cross-request tensors, float16, convolutions or general shader compiler. WebGPU
+fuses only what keeps every element's arithmetic unchanged (`src/fusion.mjs`:
+elementwise chains, transposes read by matmuls, one-dispatch sums and
+cross-entropy, Adam's three updates). Matrix products are tiled only on WebGPU
+(16x16 workgroup tiles, and register-blocked 64x64 or 128x128 tiles for large
+products) and register-blocked in the SIMD WASM kernels. Measured timings are in `docs/VALIDATION.md`; at MNIST
 scale a step is dominated by host transfers, not GPU arithmetic. Source and
 kernels are Apache-2.0; see LICENSE and NOTICE.

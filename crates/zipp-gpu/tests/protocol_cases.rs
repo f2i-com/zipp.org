@@ -237,20 +237,23 @@ fn accelerated_readback_check_matches_gpu_labs() {
 }
 
 /// The faster WebGPU kernels change who computes an output and how its
-/// operands arrive, never its arithmetic: the 64x64 register-blocked matmul
-/// tile equals the 16x16 kernel on this device bit for bit (ragged, batched,
-/// transposed and split-K shapes), the unrolled axis sum and the
+/// operands arrive, never its arithmetic: the 64x64 and 128x128
+/// register-blocked matmul tiles equal the 16x16 kernel on this device bit for
+/// bit (ragged, batched, transposed and split-K shapes, and read through
+/// transposes), the unrolled axis sum and the
 /// row-per-workgroup index_add equal cpu-js bit for bit, and Adam's fused
 /// pass (in place in a session, out of place in an execute) equals its three
 /// separate kernels bit for bit, and the vectorised elementwise kernels equal
-/// the one-element ones bit for bit (`tests/exact_kernels.js`).
+/// the one-element ones bit for bit, and the fused execution (transposes read
+/// through by matmuls, one-dispatch reductions) equals every node as its own
+/// kernel bit for bit (`tests/exact_kernels.js`).
 #[test]
 fn faster_kernels_are_bit_identical() {
     on_big_stack(|| {
         let Some(mut host) = open() else { return };
         host.eval(concat!(
             include_str!("exact_kernels.js"),
-            "\nglobalThis.exactMatmulTiles = exactMatmulTiles; globalThis.exactReductions = exactReductions; globalThis.exactAdam = exactAdam; globalThis.exactVectorised = exactVectorised; null"
+            "\nglobalThis.exactMatmulTiles = exactMatmulTiles; globalThis.exactReductions = exactReductions; globalThis.exactAdam = exactAdam; globalThis.exactVectorised = exactVectorised; globalThis.exactFusion = exactFusion; null"
         ))
         .expect("checks");
         for check in [
@@ -258,6 +261,7 @@ fn faster_kernels_are_bit_identical() {
             "exactReductions",
             "exactAdam",
             "exactVectorised",
+            "exactFusion",
         ] {
             let json = run_json(
                 &mut host,

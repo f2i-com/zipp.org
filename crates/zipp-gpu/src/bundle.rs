@@ -27,6 +27,7 @@ macro_rules! lab {
 /// imported by runtime.mjs; they are never selected here, but must parse).
 pub const RUNTIME: &[Module] = &[
     lab!("src/graph.mjs"),
+    lab!("src/fusion.mjs"),
     lab!("src/kernel-math.mjs"),
     lab!("src/quant.mjs"),
     lab!("src/session.mjs"),

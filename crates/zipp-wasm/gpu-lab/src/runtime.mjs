@@ -1,5 +1,6 @@
 import {validateProgram, check, checkFiniteOutput, ComputeError, DEFAULT_LIMITS} from './graph.mjs';
 import {Session} from './session.mjs';
+import {execution} from './fusion.mjs';
 import {CPUBackend} from './backends/cpu.mjs';
 import {WasmBackend} from './backends/wasm.mjs';
 import {WebGPUBackend} from './backends/webgpu.mjs';
@@ -57,30 +58,21 @@ export class ComputeRuntime {
     // Validation and owned input copies happen before any asynchronous work or GPU allocation.
     const plan=validateProgram(program,{...(this.impl.limitHints?.()??{}),...this.limits});
     refuseUnsupported(plan,this.impl);this.busy=true;
-    const start=clock(),handles=new Map(),uses=[...plan.uses],root=plan.root;
+    const start=clock(),handles=new Map(),root=plan.root;
     let value,error,began=false,finishError;
     // Handles belong to storage roots; a reshape shares its source's handle.
     const free=id=>{const h=handles.get(id);if(h!==undefined){this.impl.free(h);handles.delete(id);}};
     try {
       await this.impl.begin(plan);began=true;
-      // Adam groups (graph.mjs adamGroups) in one pass where the backend has one.
-      const adam=this.impl.adam&&this.impl.fuseAdam!==false?plan.adam:null,done=new Set(),nodes=plan.nodes;
-      const refs=m=>m.refs.map(r=>handles.get(root[r]));
-      for(const n of nodes){
-        if(n.alias)continue;
-        const group=adam?.get(n.id);
-        // A group's earlier moment node waits for the group (with what it releases).
-        if(!group&&adam&&plan.adamMembers.has(n.id)&&!done.has(n.id))continue;
-        let released=[n];
-        if(group){
-          const hs=await this.impl.adam(nodes[group.m],nodes[group.v],nodes[group.u],refs(nodes[group.m]),refs(nodes[group.v]),refs(nodes[group.u]));
-          [group.m,group.v,group.u].forEach((id,i)=>{handles.set(id,hs[i]);done.add(id);});
-          released=[nodes[group.m],nodes[group.v]];
-        } else if(!done.has(n.id)){const h=await this.impl.run(n,refs(n));handles.set(n.id,h);}
-        for(const x of released){
-          for(const r of x.refs){uses[root[r]]--;if(uses[root[r]]===0)free(root[r]);}
-          if(uses[x.id]===0)free(x.id);
-        }
+      // The plan's live work as the backend runs it (fusion.mjs): nodes, and
+      // groups of nodes it computes together.
+      const exec=execution(plan,this.impl),uses=[...exec.uses];
+      for(const item of exec.items){
+        const hs=item.refs.map(r=>handles.get(root[r]));
+        if(item.kind==='node')handles.set(item.id,await this.impl.run(item.node,hs));
+        else(await this.impl.runGroup(item,hs,{stepped:n=>n})).forEach((h,i)=>handles.set(item.exposed[i],h));
+        for(const r of item.refs){uses[root[r]]--;if(uses[root[r]]===0)free(root[r]);}
+        for(const id of item.exposed)if(uses[id]===0)free(id);
       }
       const submitted=clock(),outputs=Object.create(null),ids=[...new Set(plan.outputs.map(o=>root[o.id]))];
       // One batched readback when the backend offers it (one GPU round trip).

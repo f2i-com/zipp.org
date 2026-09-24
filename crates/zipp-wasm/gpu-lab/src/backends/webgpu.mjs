@@ -132,6 +132,47 @@ const ADAM_LANE = `fn adam1(a: f32, g: f32, vv: f32, p: f32) -> vec3<f32> {
   let v = vv * bitcast<f32>(P.sb.y) + bitcast<f32>(P.sb.z) * g * g;
   return vec3<f32>(m, v, p - P.f.x * (m / (sqrt(v) / P.f.y + P.f.z)));
 }`;
+/**
+ * One kernel for a chain of elementwise nodes (`fusion`'s chain groups):
+ * each member's value computed as its own kernel computes it -- the unary
+ * switch's case, `binop`, or a K=1 matmul's `0.0 + a * b` -- from earlier
+ * members' values and the inputs, in the chain's order. Every member value
+ * passes through `opaque` (its bits XOR a uniform word that is zero) before
+ * anything reads it, so the compiler can neither see nor fuse across it: a
+ * product feeding a sum stays two roundings, as when it went through memory.
+ * The K=1 matmul's zero is that uniform word too: a literal `0.0 + x` may be
+ * folded to `x`, which keeps a -0 the matmul kernel's sum makes +0.
+ * `members`: [{kind, op, args: [{member: j} | {input: k, scalar}], out: k|-1}],
+ * inputs E0.., outputs O0...
+ */
+function chainKernel(members, inputs, outputs) {
+  const operand = a => a.member !== undefined ? `w${a.member}` : a.scalar ? `E${a.input}[0]` : `E${a.input}[i]`;
+  const lines = members.map((m, j) => {
+    const [x, y] = m.args.map(operand);
+    const value = m.kind === 'unary' ? `un(${m.op}u, ${x})`
+      : m.kind === 'binary' ? `binop(${m.op}u, ${x}, ${y})`
+      : `bitcast<f32>(P.len) + E${m.args[0].input}[i / P.g.x] * E${m.args[1].input}[i % P.g.x]`;
+    return `let v${j} = ${value}; let w${j} = opaque(v${j});${m.out >= 0 ? ` O${m.out}[i] = v${j};` : ''}`;
+  });
+  return [inputs.map((_, k) => `E${k}`), `fn opaque(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) ^ P.len); }
+fn un(op: u32, x: f32) -> f32 {
+  var r: f32;
+  switch op {
+    case 0u: { r = select(0.0, x, x > 0.0 || x != x); }
+    case 1u: { r = select(0.0, 1.0, x > 0.0); }
+    case 2u: { r = -x; }
+    case 3u: { r = exp(x); }
+    case 4u: { r = log(x); }
+    case 5u: { r = sqrt(x); }
+    case 6u: { r = tanh_s(x); }
+    case 7u: { let e = exp(-abs(x)); r = select(e / (1.0 + e), 1.0 / (1.0 + e), x >= 0.0); }
+    case 8u: { r = x * cdf(x); }
+    default: { r = cdf(x) + x * 0.3989422804014327 * exp(-0.5 * min(x * x, 200.0)); }
+  }
+  return r;
+}
+${each(lines.join('\n  '))}`, outputs.map((_, k) => `O${k}`)];
+}
 const ROW_STATS = `let base = i * P.len;
   var m = A[base];
   for (var j = 1u; j < P.len; j = j + 1u) { let v = A[base + j]; m = select(m, v, v > m || v != v); }
@@ -243,6 +284,60 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     }
   }
   O[i] = v;`)],
+  // A whole sum of up to 2048 values in one workgroup: the same pairwise
+  // tree as `pair` (level by level, out[j] = in[2j] + in[2j+1] or + 0.0 for
+  // an odd one out), through workgroup memory, then `scale`'s division
+  // (by f.x) when P.mode is 1. A lone value is divided by 1.0 first, as the
+  // pairwise sum of one value does.
+  sum_small: [['A'], `var<workgroup> T: array<f32, 2048>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32) {
+  let n = P.n;
+  var len = (n + 1u) / 2u;
+  for (var j = li; j < len; j = j + 256u) { let jj = j * 2u; var other = 0.0; if (jj + 1u < n) { other = A[jj + 1u]; } T[j] = A[jj] + other; }
+  workgroupBarrier();
+  var src = 0u;
+  loop {
+    if (len <= 1u) { break; }
+    let next = (len + 1u) / 2u; let dst = 1024u - src;
+    for (var j = li; j < next; j = j + 256u) { let jj = j * 2u; var other = 0.0; if (jj + 1u < len) { other = T[src + jj + 1u]; } T[dst + j] = T[src + jj] + other; }
+    workgroupBarrier();
+    src = dst; len = next;
+  }
+  if (li == 0u) {
+    var total = T[src];
+    if (n == 1u) { total = A[0] / 1.0; }
+    O[0] = select(total, total / P.f.x, P.mode == 1u);
+  }
+}`],
+  // cross_entropy in one workgroup for up to 1024 rows: each row's loss as
+  // `ce_rows` computes it, the rows' pairwise sum as `sum_small`, then the
+  // mean as `scale` (divided by f.x = rows).
+  ce_small: [['A', 'Tg'], `var<workgroup> T: array<f32, 2048>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32) {
+  let rows = P.n;
+  for (var i = li; i < rows; i = i + 256u) {
+    ${ROW_STATS}
+    let t = min(u32(max(Tg[i], 0.0)), P.len - 1u);
+    T[i] = log(s) - (A[base + t] - m);
+  }
+  workgroupBarrier();
+  var total = 0.0;
+  if (rows == 1u) { total = T[0] / 1.0; }
+  var len = rows; var src = 0u;
+  loop {
+    if (len <= 1u) { break; }
+    let next = (len + 1u) / 2u; let dst = 1024u - src;
+    for (var j = li; j < next; j = j + 256u) { let jj = j * 2u; var other = 0.0; if (jj + 1u < len) { other = T[src + jj + 1u]; } T[dst + j] = T[src + jj] + other; }
+    workgroupBarrier();
+    src = dst; len = next;
+  }
+  if (li == 0u) {
+    if (rows != 1u) { total = T[src]; }
+    O[0] = total / P.f.x;
+  }
+}`],
   pair: [['A'], each('let j = i * 2u; var other = 0.0; if (j + 1u < P.len) { other = A[j + 1u]; } O[i] = A[j] + other;')],
   scale: [['A'], each('O[i] = A[i] / P.f.x;')],
   // Eight loads issued before their eight additions, which stay one at a
@@ -715,7 +810,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
  * (16 * tn) output tile and each invocation tm x tn of it -- rows
  * 64g + 4 lid.y + q and columns 64h + 4 lid.x + q -- from bk-deep slices of A
  * and B staged in workgroup memory as vec4s of four rows (A) or four columns
- * (B), so one 16-byte load feeds four accumulators. The arithmetic of every
+ * (B), so one 16-byte load feeds four accumulators. A whole slice is
+ * multiplied by straight-line code (no loop counter or index arithmetic
+ * between the products), a partial last one by a loop. The arithmetic of every
  * output is the 16x16 kernel's exactly: one `acc = acc + a * b` per k, in
  * ascending k, from zero, and no product past the end of the reduced range
  * (a padded `+ 0 * b` could turn a -0 sum into +0). Only who computes which
@@ -726,7 +823,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
  * `transposed`: B is stored [N, K]. `split`: the reduced axis is one slice
  * of `matmul_split`'s (part = wg.z / batches, P.sa.z long).
  */
-function tiledMatmul(tm, tn, bk, transposed, split) {
+function tiledMatmul(tm, tn, bk, transposed, split, transA = false, transOut = false) {
   const bm = 16 * tm, bn = 16 * tn, am = bm / 4, an = bn / 4, Q = [0, 1, 2, 3], X = 'xyzw';
   const rows = [...Array(tm).keys()], cols = [...Array(tn).keys()];
   // Output i of the invocation: vec4 group i >> 2, component i & 3.
@@ -735,7 +832,13 @@ function tiledMatmul(tm, tn, bk, transposed, split) {
       ${[...Array(tn / 4).keys()].map(h => `let b${h} = Bs[${k} * ${an}u + ${16 * h}u + lid.x];`).join(' ')}
       ${rows.flatMap(i => cols.map(j => `c${i}_${j} = c${i}_${j} + a${i >> 2}.${X[i & 3]} * b${j >> 2}.${X[j & 3]};`)).join(' ')} }`;
   // One vec4 each per 256 invocations: four rows of A at one k, four columns of B at one k.
-  const loadA = `let kk = e % ${bk}u; let r4 = e / ${bk}u; let gk = t + kk; let gr = row0 + r4 * 4u;
+  // transA: A holds the [K, M] transpose; consecutive invocations take
+  // consecutive rows, so its reads run along its rows.
+  const loadA = transA
+    ? `let r4 = e % ${am}u; let kk = e / ${am}u; let gk = t + kk; let gr = row0 + r4 * 4u;
+      ${Q.map(q => `var v${q} = 0.0; if (gr + ${q}u < M && gk < k1) { v${q} = A[aBase + gk * M + gr + ${q}u]; }`).join(' ')}
+      As[kk * ${am}u + r4] = vec4<f32>(v0, v1, v2, v3);`
+    : `let kk = e % ${bk}u; let r4 = e / ${bk}u; let gk = t + kk; let gr = row0 + r4 * 4u;
       ${Q.map(q => `var v${q} = 0.0; if (gr + ${q}u < M && gk < k1) { v${q} = A[aBase + (gr + ${q}u) * K + gk]; }`).join(' ')}
       As[kk * ${am}u + r4] = vec4<f32>(v0, v1, v2, v3);`;
   const loadB = transposed
@@ -766,13 +869,50 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     workgroupBarrier();
     let span = min(${bk}u, k1 - t);
     if (span == ${bk}u) {
-      for (var k = 0u; k < ${bk}u; k = k + 1u) ${step('k')}
+      ${[...Array(bk).keys()].map(k => step(`${k}u`)).join('\n      ')}
     } else {
       for (var k = 0u; k < span; k = k + 1u) ${step('k')}
     }
     workgroupBarrier();
   }
-  ${rows.flatMap(i => cols.map(j => `{ let r = row0 + ${row(i)}; let c = col0 + ${col(j)}; if (r < M && c < N) { O[outBase + r * N + c] = c${i}_${j}; } }`)).join('\n  ')}
+  ${rows.flatMap(i => cols.map(j => `{ let r = row0 + ${row(i)}; let c = col0 + ${col(j)}; if (r < M && c < N) { O[outBase + ${transOut ? 'c * M + r' : 'r * N + c'}] = c${i}_${j}; } }`)).join('\n  ')}
+}`];
+}
+/**
+ * The 16x16 kernel with A read through its [K, M] transpose (`transA`) and/or
+ * the output written as its [N, M] transpose (`transOut`): the same
+ * products summed in the same order, only addressed differently. A's tile
+ * is loaded along the transpose's rows and stored where the plain kernel
+ * stores it. The four plain combinations are the hand-written kernels above.
+ */
+function baseMatmul(transB, split, transA, transOut) {
+  return [['A', 'B'], `var<workgroup> As: array<array<f32, 16>, 16>;
+var<workgroup> Bs: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let M = P.g.x; let K = P.g.y; let N = P.g.z;
+  ${split ? `let batches = max(P.g.w, 1u);
+  let part = wg.z / batches; let b = wg.z % batches;
+  let k0 = part * P.sa.z; let k1 = min(K, k0 + P.sa.z); let outBase = (part * batches + b) * M * N;`
+    : 'let b = wg.z; let k0 = 0u; let k1 = K; let outBase = b * M * N;'}
+  let row = wg.y * 16u + lid.y; let col = wg.x * 16u + lid.x;
+  let aBase = b * P.sa.x; let bBase = b * P.sa.y;
+  var acc = 0.0;
+  for (var t = k0; t < k1; t = t + 16u) {
+    let ka = t + lid.x; let kb = t + lid.y;
+    var av = 0.0; var bv = 0.0;
+    ${transA ? `let arow = wg.y * 16u + lid.x;
+    if (arow < M && kb < k1) { av = A[aBase + kb * M + arow]; }
+    As[lid.x][lid.y] = av;` : `if (row < M && ka < k1) { av = A[aBase + row * K + ka]; }
+    As[lid.y][lid.x] = av;`}
+    if (kb < k1 && col < N) { bv = B[bBase + ${transB ? 'col * K + kb' : 'kb * N + col'}]; }
+    Bs[lid.y][lid.x] = bv;
+    workgroupBarrier();
+    let span = min(16u, k1 - t);
+    for (var k = 0u; k < span; k = k + 1u) { acc = acc + As[lid.y][k] * Bs[k][lid.x]; }
+    workgroupBarrier();
+  }
+  if (row < M && col < N) { O[outBase + ${transOut ? 'col * M + row' : 'row * N + col'}] = acc; }
 }`];
 }
 // Vectorised elementwise kernels (`each4`): { vec4: true } marks their
@@ -794,14 +934,26 @@ Object.assign(KERNELS, {
   let x = adam1(a.x, g.x, vv.x, p.x); let y = adam1(a.y, g.y, vv.y, p.y); let z = adam1(a.z, g.z, vv.z, p.z); let w = adam1(a.w, g.w, vv.w, p.w);
   O[i] = vec4<f32>(x.x, y.x, z.x, w.x); O2[i] = vec4<f32>(x.y, y.y, z.y, w.y); O3[i] = vec4<f32>(x.z, y.z, z.z, w.z);`)}`, ['O', 'O2', 'O3'], VEC4],
 });
-// Register-blocked variants of the four float matmul kernels: `_r4`, 64x64
-// tiles, 16 deep. (128x128 tiles, and double-buffered k-slices loaded into
-// registers while the last is multiplied, measured no faster on an RTX 5090:
-// 30-34 TFLOP/s all; and Direct3D's FXC takes minutes over 64 accumulators.)
-// See `tileFor` for which a product uses.
+// Register-blocked variants of the float matmul kernels: `_r4`, 64x64 tiles,
+// 16 deep, and `_r8`, 128x128 tiles 32 deep (64 accumulators an invocation,
+// 32 KB of workgroup memory). On an RTX 5090 (Vulkan), 4096^3: 37 and 48
+// TFLOP/s (the 64x64 tile with a loop over k: 34). Double-buffered k-slices
+// measured no faster; a 32-deep 64x64 tile is 15% faster on 1024^3 but
+// takes DXC 7 s to compile. See `tileFor` for which a product uses.
 for (const transposed of [false, true])
   for (const split of [false, true])
-    KERNELS[`matmul${transposed ? '_t' : ''}${split ? '_split' : ''}_r4`] = tiledMatmul(4, 4, 16, transposed, split);
+    for (const transA of [false, true])
+      for (const transOut of split ? [false] : [false, true]) {
+        const name = matmulName(transposed, transA, transOut, split);
+        KERNELS[`${name}_r4`] = tiledMatmul(4, 4, 16, transposed, split, transA, transOut);
+        KERNELS[`${name}_r8`] = tiledMatmul(8, 8, 32, transposed, split, transA, transOut);
+        if (transA || transOut) KERNELS[name] = baseMatmul(transposed, split, transA, transOut);
+      }
+/** A float matmul kernel's name: `_t` B stored [N, K], `_ta` A read through
+ * its transpose, `_to` the output written transposed, `_split` a K slice. */
+function matmulName(transB, transA, transOut, split) {
+  return `matmul${transB ? '_t' : ''}${transA ? '_ta' : ''}${transOut ? '_to' : ''}${split ? '_split' : ''}`;
+}
 const UNARY = {relu: 0, positive: 1, neg: 2, exp: 3, log: 4, sqrt: 5, tanh: 6, sigmoid: 7, gelu: 8, gelu_grad: 9};
 const BINARY = {add: 0, sub: 1, mul: 2, div: 3, maximum: 4, minimum: 5, eq: 6, ne: 7, lt: 8, le: 9, gt: 10, ge: 11};
 const MODE = {same: 0, aScalar: 1, bScalar: 2, general: 3};
@@ -813,8 +965,9 @@ const OPTIM = {sgd_update: 0, momentum_update: 1, adam_m: 2, adam_v: 3, adam_upd
 // Enough outputs to fill a GPU, and the smallest slice of the reduced axis
 // worth a pass of its own. Round numbers: the win is the order of magnitude.
 const WIDE_ENOUGH = 65536, MIN_SPLIT_K = 512, MIN_SPLIT_CHUNK = 128, MAX_SPLIT = 32;
-// Workgroups a register-blocked matmul tile must produce to be chosen.
-const TILE_GROUPS = 256;
+// Workgroups a register-blocked matmul tile must produce to be chosen, and
+// the workgroup memory of the 128x128 one.
+const TILE_GROUPS = 256, BIG_TILE_BYTES = 32768;
 const SLOT = 256, UNIFORM_SLOTS = 16384, POOL_BYTES = 256 * 1024 * 1024, GROUP_CACHE = 8192;
 const COMPUTE = () => globalThis.GPUShaderStage?.COMPUTE ?? 4;
 /** Blocks as whole four-byte words. A Q6_K block is 210 bytes, so a buffer of
@@ -832,10 +985,12 @@ export class WebGPUBackend {
     const adapter = await navigator.gpu.requestAdapter({powerPreference: 'high-performance'});
     check(adapter, 'UNAVAILABLE', 'No WebGPU adapter is available');
     check(!(adapter.info?.isFallbackAdapter ?? adapter.isFallbackAdapter), 'UNAVAILABLE', 'Hardware WebGPU required; browser returned a fallback adapter');
-    // Ask for the storage sizes the adapter supports (bounded), not the portable minimum.
+    // Ask for the storage sizes the adapter supports (bounded), not the portable
+    // minimum, and the workgroup memory the 128x128 matmul tile needs.
     const requiredLimits = {};
     for (const key of ['maxStorageBufferBindingSize', 'maxBufferSize'])
       if (adapter.limits?.[key]) requiredLimits[key] = Math.min(adapter.limits[key], 1024 * 1024 * 1024);
+    if (adapter.limits?.maxComputeWorkgroupStorageSize >= BIG_TILE_BYTES) requiredLimits.maxComputeWorkgroupStorageSize = BIG_TILE_BYTES;
     const device = await adapter.requestDevice({requiredLimits});
     return new WebGPUBackend(device, adapter.info, {debug});
   }
@@ -844,8 +999,12 @@ export class WebGPUBackend {
     this.device = device; this.debug = debug; this.info = info ? {vendor: info.vendor, architecture: info.architecture,
       description: info.description, isFallbackAdapter: info.isFallbackAdapter ?? null} : null;
     this.pipelines = new Map(); this.lost = null; this.scopeOpen = false; this.matmulTile = null;
+    this.bigTiles = (device.limits?.maxComputeWorkgroupStorageSize ?? 0) >= BIG_TILE_BYTES;
     // Adam groups in one pass (`adam`); false keeps three (tests compare the bits).
     this.fuseAdam = true;
+    // Transposes read through by matmuls and one-dispatch reductions; false
+    // runs every node as its own kernel (tests compare the bits).
+    this.fuse = true;
     // Elementwise kernels four elements an invocation (`each4`); false keeps
     // the one-element kernels (tests compare the bits).
     this.vectorize = true;
@@ -936,9 +1095,11 @@ export class WebGPUBackend {
   }
   /**
    * Outputs per invocation along each side of a float matmul's workgroup
-   * tile: 4 (64x64 tiles) when a product is at least a tile wide and tall and
-   * has enough of them to fill the GPU, else 1 (the 16x16 kernel, the most
-   * workgroups for a small product).
+   * tile: 8 (128x128 tiles) or 4 (64x64) when a product is at least a tile
+   * wide and tall and has enough of them to fill the GPU, the larger first
+   * (where the device has its workgroup memory), else 1 (the 16x16 kernel,
+   * the most workgroups for a small product). Every tile computes every
+   * output with the same additions in the same order.
    * `matmulTile` pins it: tests compare the tiles' bits, and a host whose
    * shader compiler is slow on the large tile (FXC) keeps 1.
    */
@@ -946,7 +1107,9 @@ export class WebGPUBackend {
     if (this.matmulTile) return this.matmulTile;
     // A product narrower than a tile (a decode step's single row) would leave
     // most of each 64x64 tile idle: it keeps the 16x16 kernel and split-K.
-    return m >= 64 && n >= 64 && Math.ceil(m / 64) * Math.ceil(n / 64) * z >= TILE_GROUPS ? 4 : 1;
+    const fills = side => m >= side && n >= side && Math.ceil(m / side) * Math.ceil(n / side) * z >= TILE_GROUPS;
+    if (this.bigTiles && fills(128)) return 8;
+    return fills(64) ? 4 : 1;
   }
   /** Fills the next 256-byte uniform slot and returns its dynamic offset; slots upload once, at submit. */
   uniform(fill) {
@@ -1009,6 +1172,159 @@ export class WebGPUBackend {
       if (!inPlace) for (const h of outs) this.free(h);
       throw error;
     }
+  }
+  /**
+   * One matmul: A (read through its transpose with `transA`), B (stored
+   * [N, K] with `transB`), into `out` (written transposed with `transOut`).
+   * The tile, the addressing and a split of K change who computes an output
+   * and where its operands come from, never the sum each output is.
+   */
+  async matmul(n, refs, out, transB, transA, transOut) {
+    const kernel = n.bQuant ? `matmul_${n.bQuant.dtype.replace('_', '')}` : matmulName(transB, transA, transOut, false);
+    const split = transOut ? null : this.splitParts(n);
+    const tile = n.bQuant ? 1 : this.tileFor(n.m, n.n, n.batch * (split ? split.parts : 1)), side = 16 * tile;
+    const suffix = tile === 1 ? '' : `_r${tile}`;
+    if (!split) {
+      await this.dispatch(kernel + suffix, u => {u.set([n.m, n.k, n.n, n.batch], 16); u[8] = n.aBatchStride; u[9] = n.bBatchStride;},
+        refs, out, n.size, [Math.ceil(n.n / side), Math.ceil(n.m / side), n.batch]);
+      return;
+    }
+    const {parts, chunk} = split, partials = this.alloc(n.size * parts);
+    const name = n.bQuant ? `${kernel}_split` : matmulName(transB, transA, false, true);
+    try {
+      await this.dispatch(`${name}${suffix}`, u => {
+        u.set([n.m, n.k, n.n, n.batch], 16);
+        u[8] = n.aBatchStride; u[9] = n.bBatchStride; u[10] = chunk;
+      }, refs, partials, n.size * parts, [Math.ceil(n.n / side), Math.ceil(n.m / side), n.batch * parts]);
+      // `reduce` sums a [parts, outputs] layout straight down the parts.
+      await this.dispatch('reduce', u => {u[0] = n.size; u[1] = 0; u[3] = parts; u[16] = n.size;},
+        [partials], out, n.size);
+    } finally { this.free(partials); }
+  }
+  /** What the fusion plan depends on besides the plan (fusion.mjs caches by it). */
+  fusionKey() { return `${this.fuse !== false}|${this.fuseAdam !== false}`; }
+  /**
+   * The groups this backend computes together (fusion.mjs): Adam's three
+   * updates of a parameter (one pass), and a 2-D matmul reading an operand
+   * that is only a transpose -- or writing a result only a transpose reads --
+   * through the transpose's addressing instead of a transpose pass. A
+   * transpose is elided only when every consumer reads through it this way.
+   */
+  fusion(plan, {live}) {
+    const nodes = plan.nodes, root = plan.root, groups = [], elided = new Set();
+    if (this.fuseAdam !== false) for (const [at, g] of plan.adam) {
+      if (!live[g.u]) continue;
+      const M = nodes[g.m], V = nodes[g.v], U = nodes[g.u];
+      groups.push({kind: 'adam', id: at, group: g, M, V, U, refs: [...M.refs, ...V.refs, U.refs[0]], exposed: [g.m, g.v, g.u]});
+      for (const id of [g.m, g.v, g.u]) if (id !== at) elided.add(id);
+    }
+    if (this.fuse === false) return {groups, elided};
+    const consumers = nodes.map(() => []), outputs = new Set(plan.outputs.map(o => root[o.id]));
+    for (const n of nodes) if (live[n.id] && !n.alias) for (const r of n.refs) consumers[root[r]].push([n.id, r]);
+    const eligible = m => m.op === 'matmul' && !m.bQuant && m.batch === 1 && nodes[m.a].shape.length === 2 && nodes[m.b].shape.length === 2;
+    const isT = id => nodes[id].op === 'transpose';
+    const memo = new Map();
+    // A transpose no one needs as a tensor: every consumer is a 2-D matmul
+    // reading it directly, or such a transpose.
+    const foldable = id => {
+      if (memo.has(id)) return memo.get(id);
+      memo.set(id, false);
+      const ok = isT(id) && !outputs.has(id) && consumers[id].length > 0 && consumers[id].every(([c, r]) => r === id &&
+        ((eligible(nodes[c]) && (nodes[c].a === id || nodes[c].b === id)) || foldable(c)));
+      memo.set(id, ok);
+      return ok;
+    };
+    const through = ref => { let id = ref, flip = false; while (isT(id) && foldable(id)) { id = nodes[id].a; flip = !flip; } return {id, flip}; };
+    for (const n of nodes) {
+      if (!live[n.id] || !eligible(n)) continue;
+      const a = through(n.a), b = through(n.b), [only] = consumers[n.id];
+      // The result written transposed where a transpose (itself needed as a
+      // tensor) is its one reader and K is not split.
+      const outT = consumers[n.id].length === 1 && only[1] === n.id && isT(only[0]) && !foldable(only[0]) &&
+        !outputs.has(n.id) && !this.splitParts(n) ? only[0] : null;
+      // Unchanged unless an operand is read through (an even number of) transposes or the result is.
+      if (a.id === n.a && b.id === n.b && outT === null) continue;
+      groups.push({kind: 'matmul', id: outT ?? n.id, node: n, transA: a.flip, transB: n.transposed !== b.flip, transOut: outT !== null,
+        refs: [a.id, b.id], exposed: [outT ?? n.id]});
+      if (outT !== null) elided.add(n.id);
+    }
+    for (const id of memo.keys()) if (memo.get(id)) elided.add(id);
+    this.chains(plan, live, consumers, outputs, groups, elided);
+    return {groups, elided};
+  }
+  /**
+   * Chains of elementwise nodes (unary, same-shape or scalar binary, and the
+   * K=1 matmul a bias is broadcast with) of one size, each after the first
+   * reading an earlier one, computed by one kernel (`chainKernel`) where the
+   * last of them stands. A member another node reads is written out too, and
+   * only when every such node comes after the chain.
+   */
+  chains(plan, live, consumers, outputs, groups, elided) {
+    const nodes = plan.nodes, root = plan.root, taken = new Set(groups.map(g => g.id));
+    const buffers = this.device.limits?.maxStorageBuffersPerShaderStage ?? 8;
+    const kind = id => {
+      const n = nodes[id];
+      if (!live[id] || n.alias || taken.has(id) || elided.has(id)) return null;
+      if (UNARY[n.op] !== undefined) return 'unary';
+      if (BINARY[n.op] !== undefined && n.mode !== 'general') return 'binary';
+      if (n.op === 'matmul' && !n.bQuant && n.batch === 1 && n.k === 1 && nodes[n.a].shape.length === 2 && nodes[n.b].shape.length === 2) return 'k1';
+      return null;
+    };
+    for (const n of nodes) {
+      if (!kind(n.id) || taken.has(n.id)) continue;
+      const members = [n.id];
+      for (let tail = n.id; ;) {
+        const next = consumers[tail].map(([c]) => c).filter(c => c > tail && kind(c) && !taken.has(c) && !members.includes(c) &&
+          nodes[c].size === n.size).sort((x, y) => x - y)[0];
+        // A K=1 matmul only starts a chain: its operands are inputs, not members.
+        if (next === undefined || kind(next) === 'k1') break;
+        members.push(next); tail = next;
+      }
+      // Every reader of a member outside the chain must come after it, and
+      // the kernel's inputs and outputs must fit the storage buffers one
+      // shader may bind.
+      let set, anchor, inputs, exposed, spec;
+      for (; members.length >= 2; members.pop()) {
+        set = new Set(members); anchor = members[members.length - 1];
+        if (!members.slice(0, -1).every(id => consumers[id].every(([c]) => set.has(c) || c > anchor))) continue;
+        inputs = []; exposed = [];
+        const input = r => { let k = inputs.indexOf(r); if (k < 0) { k = inputs.length; inputs.push(r); } return k; };
+        spec = members.map(id => {
+          const m = nodes[id], k = kind(id);
+          const writes = id === anchor || outputs.has(id) || consumers[id].some(([c]) => !set.has(c));
+          const args = m.refs.map((r, a) => set.has(root[r]) ? {member: members.indexOf(root[r])}
+            : {input: input(r), scalar: k === 'binary' && ((a === 0 && m.mode === 'aScalar') || (a === 1 && m.mode === 'bScalar'))});
+          if (writes) exposed.push(id);
+          return {kind: k, op: k === 'unary' ? UNARY[m.op] : k === 'binary' ? BINARY[m.op] : 0, args, out: writes ? exposed.length - 1 : -1};
+        });
+        if (inputs.length + exposed.length <= buffers) break;
+      }
+      if (members.length < 2) continue;
+      const sig = JSON.stringify(spec.map(m => [m.kind, m.op, m.args.map(a => a.member ?? `${a.scalar ? 's' : 'e'}${a.input}`), m.out]));
+      const name = `chain:${sig}`;
+      if (!KERNELS[name]) KERNELS[name] = chainKernel(spec, inputs, exposed);
+      const k1 = members.map(id => nodes[id]).find(m => m.op === 'matmul');
+      groups.push({kind: 'chain', id: anchor, kernel: name, size: n.size, cols: k1 ? k1.n : 0, refs: inputs, exposed});
+      for (const id of members) { taken.add(id); if (id !== anchor) elided.add(id); }
+    }
+  }
+  /** Runs one fusion group; returns the handles of its `exposed` nodes. */
+  async runGroup(item, hs, {stepped, inPlace = null}) {
+    if (item.kind === 'adam') {
+      return this.adam(stepped(item.M), stepped(item.V), stepped(item.U), [hs[0], hs[1]], [hs[2], hs[3]], [hs[4]], inPlace);
+    }
+    if (item.kind === 'chain') {
+      const outs = item.exposed.map(() => this.alloc(item.size));
+      try {
+        await this.dispatch(item.kernel, u => {u[0] = item.size; u[3] = 0; u[16] = item.cols;}, hs, outs, item.size);
+      } catch (error) { for (const h of outs) this.free(h); throw error; }
+      return outs;
+    }
+    const out = this.alloc(item.node.size);
+    try {
+      await this.matmul(item.node, hs, out, item.transB, item.transA, item.transOut);
+    } catch (error) { this.free(out); throw error; }
+    return [out];
   }
   /** A session carry: the step's output is copied into the input's fixed buffer, in stream order. */
   carry(src, dst) {
@@ -1073,6 +1389,10 @@ export class WebGPUBackend {
         case 'scatter_add':
           await this.dispatch('scatter_add', u => {u[0] = n.size; u.set(n.dims, 4); u.set(n.indexDims, 8); u[16] = n.axis4;}, refs, out, n.size); break;
         case 'sum': case 'mean':
+          if (n.whole && this.fuse !== false && n.inputSize <= 2048) {
+            await this.dispatch('sum_small', (u, f) => {u[0] = n.inputSize; u[1] = +(n.op === 'mean'); f[20] = n.inputSize;}, refs, out, 1, [1, 1, 1]);
+            break;
+          }
           if (n.whole) {
             if (n.op === 'sum') { await this.pairwise(a, out); break; }
             const total = this.alloc(1);
@@ -1085,6 +1405,10 @@ export class WebGPUBackend {
         case 'softmax': case 'log_softmax':
           await this.dispatch('softmax', u => {u[0] = n.rows; u[1] = +(n.op === 'log_softmax'); u[3] = n.cols;}, refs, out, n.rows); break;
         case 'cross_entropy': {
+          if (this.fuse !== false && n.rows <= 1024) {
+            await this.dispatch('ce_small', (u, f) => {u[0] = n.rows; u[3] = n.cols; f[20] = n.rows;}, refs, out, 1, [1, 1, 1]);
+            break;
+          }
           const rows = this.alloc(n.rows), total = this.alloc(1);
           try {
             await this.dispatch('ce_rows', u => {u[0] = n.rows; u[3] = n.cols;}, refs, rows, n.rows);
@@ -1105,29 +1429,7 @@ export class WebGPUBackend {
         // can end in a fall-through to the float32 `matmul` below.
         case 'matmul_fixed': throw new ComputeError('UNSUPPORTED',
           'matmul_fixed needs a 64-bit integer accumulator, which WebGPU has no native type for; run it on the wasm or cpu-js backend');
-        case 'matmul': {
-          const kernel = n.bQuant ? `matmul_${n.bQuant.dtype.replace('_', '')}` : n.transposed ? 'matmul_t' : 'matmul';
-          const split = this.splitParts(n);
-          // The tile changes who computes an output, never its arithmetic.
-          const tile = n.bQuant ? 1 : this.tileFor(n.m, n.n, n.batch * (split ? split.parts : 1)), side = 16 * tile;
-          const suffix = tile === 1 ? '' : `_r${tile}`;
-          if (!split) {
-            await this.dispatch(kernel + suffix, u => {u.set([n.m, n.k, n.n, n.batch], 16); u[8] = n.aBatchStride; u[9] = n.bBatchStride;},
-              refs, out, n.size, [Math.ceil(n.n / side), Math.ceil(n.m / side), n.batch]);
-            break;
-          }
-          const {parts, chunk} = split, partials = this.alloc(n.size * parts);
-          try {
-            await this.dispatch(`${kernel}_split${suffix}`, u => {
-              u.set([n.m, n.k, n.n, n.batch], 16);
-              u[8] = n.aBatchStride; u[9] = n.bBatchStride; u[10] = chunk;
-            }, refs, partials, n.size * parts, [Math.ceil(n.n / side), Math.ceil(n.m / side), n.batch * parts]);
-            // `reduce` sums a [parts, outputs] layout straight down the parts.
-            await this.dispatch('reduce', u => {u[0] = n.size; u[1] = 0; u[3] = parts; u[16] = n.size;},
-              [partials], out, n.size);
-          } finally { this.free(partials); }
-          break;
-        }
+        case 'matmul': await this.matmul(n, refs, out, n.transposed, false, false); break;
         case 'sgd_update': case 'momentum_update': case 'adam_m': case 'adam_v': case 'adam_update': {
           const scalars = {sgd_update: [n.lr], momentum_update: [n.momentum, n.w], adam_m: [n.w], adam_v: [n.beta2, n.w],
             adam_update: [n.stepSize, n.bc2Sqrt, n.eps]}[n.op];

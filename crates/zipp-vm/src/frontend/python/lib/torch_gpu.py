@@ -92,22 +92,31 @@ def _optimizer_unchanged(optimizer, kind, snapshot):
     """Whether `_optimizer_configuration(optimizer, kind) == snapshot`, compared
     in place, as a prepared step checks it every step. False where the
     snapshot's own types or form differ (the caller's full comparison then
-    decides, or raises), so True only when the full one would say equal."""
+    decides, or raises), so True only when the full one would say equal.
+    (Loops over the objects themselves, not indices, and an option that is
+    still the recorded object passes at once: a third less time than
+    indexing, on a check a small model's every step pays.)"""
     groups = snapshot[3]
     param_groups = optimizer.param_groups
-    count = len(groups)
-    if id(optimizer) != snapshot[0] or len(param_groups) != count or bool(getattr(optimizer, "_decoupled", False)) != snapshot[2]:
+    if id(optimizer) != snapshot[0] or len(param_groups) != len(groups) or bool(getattr(optimizer, "_decoupled", False)) != snapshot[2]:
         return False
     names = _OPTIONS[kind]
     state = optimizer.state
     # torch.optim's own state map, read by id as its `get` does.
     entries = state._entries if type(state).__name__ == "_ParamState" and type(getattr(state, "_entries", None)) is dict else None
-    for g in range(count):
-        group = param_groups[g]
+    g = 0
+    for group in param_groups:
         ids, values, steps = groups[g]
-        for k in range(len(names)):
-            value = group[names[k]]
+        g += 1
+        k = 0
+        for name in names:
+            value = group[name]
             recorded = values[k]
+            k += 1
+            # The recorded object itself: the full (tuple) comparison finds
+            # it equal, whatever it is.
+            if value is recorded:
+                continue
             if type(value) is not type(recorded) or value != recorded:
                 return False
             if type(recorded) is tuple:
@@ -118,18 +127,20 @@ def _optimizer_unchanged(optimizer, kind, snapshot):
         params = group["params"]
         if len(params) != len(ids):
             return False
-        for j in range(len(ids)):
-            parameter = params[j]
-            if id(parameter) != ids[j]:
+        j = 0
+        for parameter in params:
+            key = ids[j]
+            if id(parameter) != key:
                 return False
             if entries is not None:
-                entry = entries.get(ids[j])
+                entry = entries.get(key)
                 entry = None if entry is None else entry[1]
             else:
                 entry = state.get(parameter)
             step = 0 if entry is None else entry.get("step", 0)
             if type(step) is not int or step != steps[j]:
                 return False
+            j += 1
     return True
 
 
@@ -2480,7 +2491,9 @@ class Prepared:
                 if position >= len(args):
                     return False
                 value = args[position]
-                if not isinstance(value, torch.Tensor) or value.dtype != dtype or value.shape != shape:
+                # dtypes are the module's own objects, and the shape compares
+                # natively: a tensor that fails either goes the long way.
+                if not isinstance(value, torch.Tensor) or value.dtype is not dtype or not _k._shape_eq(value.shape, shape):
                     return False
                 inputs[key] = value._s if is_float else _k.astype(value._s, "float32")
             steps.append({"inputs": inputs})

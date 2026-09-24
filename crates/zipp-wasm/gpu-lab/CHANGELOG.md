@@ -10,6 +10,17 @@ index, which Direct3D's FXC compiler refuses; results are unchanged.
 Readback's finiteness rule is now one exported function, `checkFiniteOutput`
 (graph.mjs), which a host may serve natively.
 
+## Execution plans, fusion and a 128x128 matmul tile
+
+A plan now runs as execution items (`src/fusion.mjs`): dead nodes are dropped,
+a session computes constant nodes once, and WebGPU runs Adam's updates,
+transposes into matmuls, small whole sums and cross-entropy, and elementwise
+chains as single kernels with every element's arithmetic unchanged (a small
+MLP step: about 45 dispatches to about 20). Large float matmuls use a
+128x128 register-blocked tile where the device offers 32 KB of workgroup
+memory (48 TFLOP/s on an RTX 5090, 4096³), else the 64x64 one, now unrolled
+over k (37 TFLOP/s). Results are bit-identical to the unfused kernels.
+
 ## `matmul_fixed`
 
 A second matrix product, accumulated in integers instead of float32. Both sides

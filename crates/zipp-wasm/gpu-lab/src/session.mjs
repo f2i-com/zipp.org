@@ -1,3 +1,4 @@
+import {execution} from './fusion.mjs';
 import {check, checkFiniteOutput, ComputeError, float32Data, ownedFloat32, checkClassTargets, checkIndices, adamStep, sizeOf} from './graph.mjs';
 const clock=()=>globalThis.performance?.now()??Date.now();
 /** A plan node with some fields replaced for one step: the node as prototype
@@ -35,6 +36,7 @@ export class Session {
     for(const c of this.carries)check(plan.nodes[plan.root[this.byName.get(c.carry).id]].op!=='input','REFERENCE',`carry ${c.carry} must name a computed output`);
     this.held=new Map();       // node id -> persisted handle of a static or carried input
     this.residents=new Map();  // output name -> persisted handle
+    this.statics=new Map();    // node id -> persisted handle of a node computed once (fusion.mjs `static`)
     this.retained=new Map();   // persisted handle -> holders
     this.stepNumber=1;this.busy=false;this.disposed=false;this.disposeRequested=false;this.runs=0;
     // Adam groups (graph.mjs adamGroups) whose p, m and v outputs are carried
@@ -134,10 +136,10 @@ export class Session {
     const handles=new Map(),freeLocal=id=>{const h=handles.get(id);if(h!==undefined){if(!this.retained.has(h))this.impl.free(h);handles.delete(id);}};
     try{
       await this.impl.begin(plan);began=true;
-      const adam=this.impl.adam&&this.impl.fuseAdam!==false?plan.adam:null;
+      const exec=execution(plan,this.impl,{session:true});
       for(let s=0;s<list.length;s++){
         if(s>0)this.impl.nextStep?.();
-        const stepNo=first+s,uses=[...plan.uses];handles.clear();
+        const stepNo=first+s,uses=[...exec.uses];handles.clear();
         for(const n of this.inputs){
           const data=fed[s].get(n.id);
           handles.set(n.id,data?await this.impl.run(derived(n,{data}),[]):this.materialize(this.held.get(n.id)));
@@ -146,26 +148,23 @@ export class Session {
         // Step-dependent nodes follow the session's step: Adam's bias
         // correction, and a `uniform` draw, which is fresh every step.
         const stepped=n=>stepNo===1?n:n.op==='adam_update'?derived(n,adamStep(n.raw,n.step+stepNo-1)):n.op==='uniform'?derived(n,{step:n.step+stepNo-1}):n;
-        const refs=n=>n.refs.map(r=>handles.get(root[r])),done=new Set();
-        for(const n of nodes){
-          if(n.alias||n.op==='input')continue;
-          const group=adam?.get(n.id);
-          // A group's earlier moment node waits for the group (with what it releases).
-          if(!group&&adam&&plan.adamMembers.has(n.id)&&!done.has(n.id))continue;
-          let released=[n];
-          if(group){
-            // One pass for the group; where its outputs are carried straight
-            // back into the held buffers it reads, it updates them in place.
-            const inPlace=this.impl.adamInPlace!==false&&this.inPlace.has(n.id)&&[group.mIn,group.vIn,group.p].every(id=>this.held.has(id))?[group.mIn,group.vIn,group.p].map(id=>handles.get(id)):null;
-            const [M,V,U]=[group.m,group.v,group.u].map(id=>nodes[id]);
-            const hs=await this.impl.adam(stepped(M),stepped(V),stepped(U),refs(M),refs(V),refs(U),inPlace);
-            [group.m,group.v,group.u].forEach((id,i)=>{handles.set(id,hs[i]);done.add(id);});
-            released=[M,V];
-          } else if(!done.has(n.id))handles.set(n.id,await this.impl.run(stepped(n),refs(n)));
-          for(const x of released){
-            for(const r of x.refs){uses[root[r]]--;if(uses[root[r]]===0)freeLocal(root[r]);}
-            if(uses[x.id]===0)freeLocal(x.id);
+        for(const item of exec.items){
+          if(item.kind==='node'&&item.node.op==='input')continue; // above
+          const hs=item.refs.map(r=>handles.get(root[r]));
+          if(item.static&&this.statics.has(item.id))handles.set(item.id,this.materialize(this.statics.get(item.id)));
+          else if(item.kind==='node'){
+            const h=await this.impl.run(stepped(item.node),hs);handles.set(item.id,h);
+            // A static node is computed once and kept for every later step.
+            if(item.static)this.statics.set(item.id,this.retain(this.persist(h,true)));
+          } else {
+            // An Adam group whose outputs are carried straight back into the
+            // held buffers it reads updates them in place.
+            const g=item.group,inPlace=item.kind==='adam'&&this.impl.adamInPlace!==false&&this.inPlace.has(item.id)&&
+              [g.mIn,g.vIn,g.p].every(id=>this.held.has(id))?[g.mIn,g.vIn,g.p].map(id=>handles.get(id)):null;
+            (await this.impl.runGroup(item,hs,{stepped,inPlace})).forEach((h,i)=>handles.set(item.exposed[i],h));
           }
+          for(const r of item.refs){uses[root[r]]--;if(uses[root[r]]===0)freeLocal(root[r]);}
+          for(const id of item.exposed)if(uses[id]===0)freeLocal(id);
         }
         // Outputs: carried into their inputs, kept resident, queued for readback.
         for(const o of plan.outputs){
@@ -240,7 +239,7 @@ export class Session {
     picks.forEach((p,i)=>{const v=values[i];outputs[p.name]={shape:p.shape,dtype:'float32',data:this.typedOutputs?(v instanceof Float32Array?v:Float32Array.from(v)):Array.from(v)};});
     return {version:1,backend:this.backend,outputs};
   }
-  free(){for(const h of this.retained.keys())this.impl.free(h);this.retained.clear();this.held.clear();this.residents.clear();}
+  free(){for(const h of this.retained.keys())this.impl.free(h);this.retained.clear();this.held.clear();this.residents.clear();this.statics.clear();}
   /** Releases every resident tensor; a run in flight finishes first. */
   dispose(){
     if(this.disposed)return;

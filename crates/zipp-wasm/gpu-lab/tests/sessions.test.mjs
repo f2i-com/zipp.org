@@ -252,7 +252,10 @@ test('wasm: pinned arena memory is released and does not creep per run',async()=
     {id:1,op:'input',shape:[64,64],data:new Float32Array(64*64).fill(0.5)},{id:2,op:'matmul',a:0,b:1}],outputs:[{name:'y',id:2}]};
   try{
     for(let i=0;i<3;i++){const s=await rt.prepare(program);await s.run({});s.dispose();assert.equal(be.pinned,be.base,`cycle ${i}`);}
-    const s=await rt.prepare(program),pinned=be.pinned;
+    // The product of two constants is computed once, on the first run, and
+    // kept (fusion.mjs `static`); no run after that pins anything more.
+    const s=await rt.prepare(program);assert.equal((await s.run({})).outputs.y.data[0],32);
+    const pinned=be.pinned;
     for(let i=0;i<20;i++)assert.equal((await s.run({})).outputs.y.data[0],32);
     assert.equal(be.pinned,pinned,'running a session pins nothing more');
     s.dispose();

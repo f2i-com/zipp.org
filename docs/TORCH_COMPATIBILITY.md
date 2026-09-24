@@ -299,7 +299,7 @@ medians over 15 calls, 7 runs for the eight-step row):
 | WebGPU | 74.4 ms | 5.1 ms | 1.84 ms |
 | WebGL2 | 88.8 ms | 3.3 ms | 2.24 ms |
 | WebAssembly | 73.7 ms | 4.9 ms | 3.63 ms |
-| Native Zipp, WebGPU over wgpu/Vulkan | ≈26 ms | ≈0.55 ms | ≈0.3 ms |
+| Native Zipp, WebGPU over wgpu/Vulkan | ≈26 ms | ≈0.42 ms | ≈0.19 ms |
 
 Of a `compiled()` call about 34 ms is the guest recording and validating the
 step (every input storage is scanned for finiteness in the interpreter), the
@@ -446,9 +446,9 @@ machine, treat as ±30%):
 
 | Model | `compiled()` per call | `prepared.step` | `prepared.steps`, 8 per run, per step | CPU evaluator, `compiled()` |
 |---|---|---|---|---|
-| 784-256-10, batch 64, Adam | ≈26 ms | ≈0.55 ms | ≈0.3 ms | ≈2.9-4.8 s |
-| 784-1024-1024-10, batch 256, Adam | ≈120 ms | ≈1.4 ms | ≈1.0 ms | 118 s |
-| 784-2048-2048-10, batch 1024, Adam | ≈400 ms | ≈3.7 ms | ≈3.2 ms | 1,487 s |
+| 784-256-10, batch 64, Adam | ≈26 ms | ≈0.42 ms | ≈0.19 ms | ≈2.9-4.8 s |
+| 784-1024-1024-10, batch 256, Adam | ≈100-120 ms | ≈1.05 ms | ≈0.75 ms | 118 s |
+| 784-2048-2048-10, batch 1024, Adam | ≈270-340 ms | ≈2.5 ms | ≈2.0 ms | 1,487 s |
 
 Once a prepared session has run a step, the native host replays that step's
 recorded commands itself: it writes each batch straight from the program to
@@ -460,11 +460,22 @@ unchanged. Elementwise kernels, the optimizer updates and Adam's pass read and
 write four values at a time, each computed as before. After a session's first
 step, a `prepared.step` on the native GPU builds its request from what every
 step shares; the host checks each fed value as the full path does, and a value
-it refuses gets that path's own error. Float matmuls at least 64x64 with enough output tiles run a
-register-blocked 64x64 tile (27-35 TFLOP/s on a 4096² product, against about 5
-for the 16x16 kernel), with the same bits. Direct3D 12 compiles with DXC when a
-`dxcompiler.dll` is next to `zipp` or on PATH; with the system's FXC it keeps
-the 16x16 kernel, because FXC takes about 18 s to compile the tile. A per-call
+it refuses gets that path's own error. Before it runs a graph, gpu-lab plans it for the backend (`src/fusion.mjs`):
+nodes no output needs are dropped, a prepared session computes nodes that
+cannot change between steps once, and WebGPU runs several nodes as one kernel
+where each element's arithmetic is unchanged: a matmul reads a transposed
+operand in place or writes its result transposed, a whole sum or mean of up to
+2048 values and a cross-entropy of up to 1024 rows take one dispatch, and
+chains of elementwise operations (with a bias broadcast into them) run as one
+kernel whose every intermediate is rounded as before. The small MLP's step
+went from about 45 dispatches to about 20, with the same bits. Float matmuls
+with enough output tiles run a register-blocked tile: 128x128 (48 TFLOP/s on a
+4096³ product) where the device has 32 KB of workgroup memory, else 64x64 (37
+TFLOP/s; the 16x16 kernel: about 5), every output with the same additions in
+the same order. Direct3D 12 compiles with DXC when a `dxcompiler.dll` is next
+to `zipp` or on PATH, and keeps the 64x64 tile (DXC takes about 28 s over the
+128x128 one); with the system's FXC it keeps the 16x16 kernel, because FXC
+takes about 20 s to compile the 64x64 tile. A per-call
 `compiled()` uploads and reads back every weight, gradient and moment; prepared
 sessions are where the GPU pays off. `ZIPP_GPU_PROFILE=1` prints where a run's
 host time went, and `=kernels` adds per-kernel GPU time. Reproduce with
@@ -475,20 +486,21 @@ batches; ms per step; `crates/zipp-cli/tests/native_gpu/bench_vs_torch.py`):
 
 | Case | PyTorch CUDA eager | PyTorch CUDA graph | Zipp `prepared.step` / 8 per run | Zipp in Chrome (WebGPU) / 8 per run |
 |---|---|---|---|---|
-| 784-256-10, batch 64, Adam | 0.70 | 0.20 | 0.53 / 0.28 | 2.9 / 0.71 |
-| 784-1024-1024-10, batch 256 | 0.96 | 0.33 | 1.33 / 0.99 | 3.9 / 1.7 |
-| 784-2048-2048-10, batch 1024 | 1.31 | 0.93 | 3.69 / 3.15 | 6.7 / 9.0 |
-| 2048² matmul x4, inference | 1.31 (TF32 0.90) | – | 2.73 / 2.59 | 3.5 / 3.3 |
-| 4096² matmul x4, inference | 10.9 (TF32 6.0) | – | 20.4 / 21.2 | 25 / 24 |
-| Embedding 8192x128 + gather NLL | 1.11 | 0.31 | 0.61 / 0.34 | 2.6 / 0.46 |
+| 784-256-10, batch 64, Adam | 0.71 | 0.17 | 0.42 / 0.19 | 3.1 / 0.68 |
+| 784-1024-1024-10, batch 256 | 0.99 | 0.29 | 1.05 / 0.74 | 3.8 / 1.65 |
+| 784-2048-2048-10, batch 1024 | 1.11 | 0.91 | 2.48 / 1.96 | 6.8 / 8.8 |
+| 2048² matmul x4, inference | 1.24 (TF32 0.87) | – | 1.91 / 1.72 | 3.8 / 2.7 |
+| 4096² matmul x4, inference | 10.2 (TF32 5.9) | – | 13.8 / 14.2 | 22.5 / 20.3 |
+| Embedding 8192x128 + gather NLL | 1.14 | 0.32 | 0.46 / 0.28 | 2.7 / 0.41 |
 
 Losses agree within 1.4e-7 (small MLP) and 3.1e-5 (medium). A single step of
-the small MLP or the embedding model is now faster than PyTorch's eager CUDA
-(0.53 vs about 0.75 ms, 0.61 vs 1.2 ms); a CUDA graph is still about three
-times faster, because Zipp's step is launch-bound (about 45 small dispatches,
-0.13 ms of GPU time) and spends about 0.15 ms in Python. On large
-ones the gap is matmul throughput: fp32 without tensor cores. torch.compile's
-default backend needs triton, which is unavailable on Windows.
+the small and medium MLPs and the embedding model is faster than PyTorch's
+eager CUDA (0.42 vs about 0.7 ms, 1.05 vs 1.0, 0.46 vs 1.1), and with 8 steps
+per run the small MLP is within 20% of a CUDA graph. A single step is still
+launch-bound: about 20 dispatches, 0.11 ms of GPU time, about 0.13 ms of
+driver submit and wait, and about 0.14 ms in Python. On large ones the gap is
+matmul throughput: fp32 without tensor cores or fused multiply-add.
+torch.compile's default backend needs triton, which is unavailable on Windows.
 
 ## Compatibility boundaries
 
@@ -500,7 +512,8 @@ backend and stats become available before the success callback runs.
 
 General GPU autograd (outside the training subset above), GPU convolution, GPU recurrent modules,
 data-dependent tensor branches, device tensors outside a prepared session,
-kernel fusion, ONNX import and live model proxies are not implemented.
+general kernel fusion (beyond the exact elementwise and matmul fusions
+above), ONNX import and live model proxies are not implemented.
 Unsupported graph operations fail rather than claim GPU acceleration. `device="cuda"`
 and `.to("cuda")` are rejected; the CPU layer does not silently relabel storage.
 `torch.amp.autocast("cuda")` and `GradScaler("cuda")` are accepted and disable
