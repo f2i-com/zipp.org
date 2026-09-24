@@ -1350,6 +1350,72 @@ impl super::Vm<'_> {
         lend
     }
 
+    /// Steps an enclosing native run holds on loan and has not spent, handed
+    /// back to the budget so work nested inside that run can use them.
+    ///
+    /// A native run is lent up to `NATIVE_CHUNK` steps up front. Guest code it
+    /// calls (a frame call to the interpreter, a native kernel, another native
+    /// run) charges the budget's `remaining` instead, which the loan may have
+    /// emptied: a budget smaller than one chunk is lent whole, so nested work
+    /// found nothing left and failed at once, far inside the budget. Taking
+    /// the loan's unspent part back is exact: the enclosing run's counter is
+    /// lowered by the same amount, so it leaves at its next block charge when
+    /// that no longer fits, and its `meter_return` settles the rest. Only a
+    /// finite budget needs it (an unlimited one never runs out). `true` when
+    /// something came back.
+    #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
+    #[cold]
+    #[inline(never)]
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    pub(crate) fn meter_reclaim(&mut self) -> bool {
+        let k = self.jit_steps;
+        if k <= 0 {
+            return false;
+        }
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return false;
+        };
+        if rec.remaining == i64::MAX {
+            return false;
+        }
+        self.jit_steps = 0;
+        rec.remaining = rec.remaining.saturating_add(k);
+        rec.used = rec.used.saturating_sub(k as u64);
+        true
+    }
+
+    /// Before a native run nested inside another: the enclosing run's
+    /// unspent loan goes back to the budget ([`Self::meter_reclaim`]), so the
+    /// nested run's own `meter_lend` sees it. Returns what
+    /// [`Self::meter_unpark`] needs to hand the enclosing run its counter
+    /// back afterwards.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn meter_park(&mut self) -> (i64, bool) {
+        let outer = self.jit_steps;
+        let parked = self.meter_reclaim();
+        (outer, parked)
+    }
+
+    /// After a nested native run (see [`Self::meter_park`]): the enclosing
+    /// run gets back as much of its parked loan as the budget still holds
+    /// (less, when the nested work spent into it), or its own counter
+    /// unchanged when nothing was parked.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn meter_unpark(&mut self, (outer, parked): (i64, bool)) {
+        if !parked {
+            self.jit_steps = outer;
+            return;
+        }
+        let Some(rec) = self.instr_rec.as_mut() else {
+            self.jit_steps = outer;
+            return;
+        };
+        let back = rec.remaining.clamp(0, outer);
+        rec.remaining -= back;
+        rec.used = rec.used.wrapping_add(back as u64);
+        self.jit_steps = back;
+    }
+
     /// Reconcile after a native run: give back what it did not spend.
     ///
     /// A negative `jit_steps` is the overshoot of the block that tripped the
@@ -1418,7 +1484,15 @@ impl super::Vm<'_> {
                 return false;
             }
         }
-        rec.finite_remaining().is_none_or(|left| left >= cost)
+        rec.finite_remaining()
+            .is_none_or(|left| left.saturating_add(self.meter_loan()) >= cost)
+    }
+
+    /// An enclosing native run's unspent loan, which work nested inside it
+    /// may still spend (see `meter_reclaim`); 0 outside one.
+    #[cfg(feature = "python")]
+    fn meter_loan(&self) -> u64 {
+        self.jit_steps.max(0) as u64
     }
 
     /// What [`Vm::native_kernel_admits`] decides from, as data, for a kernel
@@ -1446,7 +1520,7 @@ impl super::Vm<'_> {
         } else {
             rec.heap_limit.saturating_sub(self.instrument_heap_estimate())
         };
-        Some((open, room, rec.finite_remaining()))
+        Some((open, room, rec.finite_remaining().map(|left| left.saturating_add(self.meter_loan()))))
     }
 
     /// Polled between blocks of a long native kernel: a host abort request
@@ -1491,6 +1565,19 @@ impl super::Vm<'_> {
             }
             #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
             {
+                // Off-loop work nested inside a native run may spend that
+                // run's unspent loan (see `meter_reclaim`).
+                let rec = if rec.remaining != i64::MAX && n > rec.remaining && self.meter_reclaim() {
+                    match self.instr_rec.as_mut() {
+                        Some(rec) => rec,
+                        None => return,
+                    }
+                } else {
+                    match self.instr_rec.as_mut() {
+                        Some(rec) => rec,
+                        None => return,
+                    }
+                };
                 if rec.remaining != i64::MAX {
                     let before = rec.remaining;
                     rec.remaining = rec.remaining.saturating_sub(n);
@@ -1602,10 +1689,19 @@ impl super::Vm<'_> {
         }
         if rec.remaining != i64::MAX {
             if rec.remaining <= 0 {
-                return Err(rec.exhaust(ResourceExhaustion::Steps));
+                // An enclosing native run may still hold unspent steps.
+                if !self.meter_reclaim() {
+                    return Err(self.instrument_steps_out());
+                }
             }
+            let Some(rec) = self.instr_rec.as_mut() else {
+                return Ok(());
+            };
             rec.remaining -= 1;
         }
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return Ok(());
+        };
         rec.ticks = rec.ticks.wrapping_add(1);
         let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
 
@@ -1639,10 +1735,19 @@ impl super::Vm<'_> {
         }
         if rec.remaining != i64::MAX {
             if rec.remaining <= 0 {
-                return Err(rec.exhaust(ResourceExhaustion::Steps));
+                // An enclosing native run may still hold unspent steps.
+                if !self.meter_reclaim() {
+                    return Err(self.instrument_steps_out());
+                }
             }
+            let Some(rec) = self.instr_rec.as_mut() else {
+                return Ok(());
+            };
             rec.remaining -= 1;
         }
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return Ok(());
+        };
         rec.ticks = rec.ticks.wrapping_add(1);
         let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
 
@@ -1650,6 +1755,18 @@ impl super::Vm<'_> {
             self.instrument_heap_poll()?;
         }
         Ok(())
+    }
+
+    /// The step budget has run out: record it and name it.
+    #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
+    #[cold]
+    #[inline(never)]
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    fn instrument_steps_out(&mut self) -> &'static str {
+        match self.instr_rec.as_mut() {
+            Some(rec) => rec.exhaust(ResourceExhaustion::Steps),
+            None => "",
+        }
     }
 
     /// Trace/abort-enabled metering. Kept out of the production wasm dispatch
@@ -1675,10 +1792,19 @@ impl super::Vm<'_> {
         }
         if rec.remaining != i64::MAX {
             if rec.remaining <= 0 {
-                return Err(rec.exhaust(ResourceExhaustion::Steps));
+                // An enclosing native run may still hold unspent steps.
+                if !self.meter_reclaim() {
+                    return Err(self.instrument_steps_out());
+                }
             }
+            let Some(rec) = self.instr_rec.as_mut() else {
+                return Ok(());
+            };
             rec.remaining -= 1;
         }
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return Ok(());
+        };
         // `ticks` is both the polling clock and the interpreter-work counter.
         // Advance it only after the budget check: an instruction rejected at
         // zero remaining steps did not execute and must not be billed.

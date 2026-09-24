@@ -9285,8 +9285,10 @@ impl<'p> Vm<'p> {
         // compiled body charges directly. Saved and restored around the run
         // because native code re-enters Rust through its call helpers, and that
         // Rust can enter native again.
+        // An enclosing native run's unspent loan is parked in the budget for
+        // this one (`meter_park`) and handed back after.
         #[cfg(feature = "instrument")]
-        let outer_steps = self.jit_steps;
+        let outer_steps = self.meter_park();
         #[cfg(feature = "instrument")]
         let _ = self.meter_lend();
         let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
@@ -9294,7 +9296,7 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "instrument")]
         {
             self.meter_return();
-            self.jit_steps = outer_steps;
+            self.meter_unpark(outer_steps);
         }
         Some((Value::from_bits(bits), bail))
     }
@@ -9408,8 +9410,10 @@ impl<'p> Vm<'p> {
         // SAFETY: `entry` points into the region's mmap'd ExecutableBuffer
         // (stable even if `jit.regions` rehashes; eviction parks, never drops,
         // a possibly-running region); regs/globals never reallocate (pinned).
+        // An enclosing native run's unspent loan is parked in the budget for
+        // this one (`meter_park`) and handed back after.
         #[cfg(feature = "instrument")]
-        let outer_steps = self.jit_steps;
+        let outer_steps = self.meter_park();
         #[cfg(feature = "instrument")]
         let _ = self.meter_lend();
         let resume = {
@@ -9440,7 +9444,7 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "instrument")]
         {
             self.meter_return();
-            self.jit_steps = outer_steps;
+            self.meter_unpark(outer_steps);
         }
         #[cfg(not(feature = "instrument"))]
         let meter_exit = false;
