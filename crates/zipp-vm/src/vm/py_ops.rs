@@ -21,7 +21,27 @@ const EXACT_F64: i128 = 1 << 53;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
+/// The keys of the record `makeExc` builds, in its literal's order.
+const EXC_KEYS: [&str; 7] = ["cls", "dict", "args", "cause", "context", "tbline", "suppress"];
+/// The keys of a list or tuple record (`sequence`'s literal).
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+const SEQ_KEYS: [&str; 2] = ["cls", "items"];
+/// [`Vm::py_alloc_like`]'s cache slots.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+const TMPL_EXC: usize = 0;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+const TMPL_SEQ: usize = 1;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub(super) const TMPL_INST: usize = 2;
+
 thread_local! {
+    /// The shape of an exception record found to have exactly [`EXC_KEYS`],
+    /// all data properties (`shape::DICT`, which never matches, until one is
+    /// seen). Shapes are this thread's (`shape::TABLE`), hence thread-local.
+    static EXC_SHAPE: std::cell::Cell<u32> = const { std::cell::Cell::new(crate::shape::DICT) };
+    /// [`Vm::py_alloc_like`]'s templates' shapes found plain, by kind
+    /// ([`TMPL_EXC`], [`TMPL_SEQ`], [`TMPL_INST`]).
+    static TMPL_SHAPES: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([crate::shape::DICT; 3]) };
     /// [`Vm::py_map_get_at`]'s per-site entry positions (hints only: every
     /// use re-checks the key at the position, so an entry left by another
     /// program or VM on this thread is merely a miss).
@@ -57,10 +77,13 @@ static HINT_TDICT: AtomicU16 = AtomicU16::new(0);
 static HINT_TSET: AtomicU16 = AtomicU16::new(0);
 static HINT_ITEMS: AtomicU16 = AtomicU16::new(1);
 static HINT_SIZE: AtomicU16 = AtomicU16::new(2);
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 #[cfg(feature = "python")]
 static HINT_SEQTMPL: AtomicU16 = AtomicU16::new(0);
 static HINT_EBASE: AtomicU16 = AtomicU16::new(0);
 static HINT_EXCSTACK: AtomicU16 = AtomicU16::new(0);
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+static HINT_EXCTMPL: AtomicU16 = AtomicU16::new(0);
 static HINT_GV: AtomicU16 = AtomicU16::new(21);
 static HINT_DCLS: AtomicU16 = AtomicU16::new(0);
 static HINT_DMAP: AtomicU16 = AtomicU16::new(1);
@@ -282,12 +305,18 @@ impl<'p> Vm<'p> {
             }
             Instr::PyGetAttr { dst, obj, key, slow } => {
                 let o = self.get(base, obj);
-                let Some(map) = self.py_attr_plain(func_id, ip, o, key, HINT_GA) else {
+                // This site's hinted positions first (`vm::py_attr`).
+                if let Some(v) = self.py_attr_get_fast(func_id, ip, o, key) {
+                    self.set(base, dst, v);
+                    return Ok(ip + 1);
+                }
+                let Some((map, slot)) = self.py_attr_plain_at(func_id, ip, o, key, HINT_GA) else {
                     return Ok(slow as usize);
                 };
                 let k = self.resolve_const_slot(func_id, key);
-                match self.py_map_get(Value::heap(map), k) {
-                    Some(v) => {
+                match self.py_map_find(Value::heap(map), k) {
+                    Some((pos, v)) => {
+                        self.py_attr_note(func_id, ip, slot, Some(pos));
                         self.set(base, dst, v);
                         ip + 1
                     }
@@ -296,12 +325,21 @@ impl<'p> Vm<'p> {
             }
             Instr::PySetAttr { obj, key, val, slow } => {
                 let o = self.get(base, obj);
-                let Some(map) = self.py_attr_plain(func_id, ip, o, key, HINT_SA) else {
+                let v = self.get(base, val);
+                if self.py_attr_set_fast(func_id, ip, o, key, v) {
+                    return Ok(ip + 1);
+                }
+                let Some((map, slot)) = self.py_attr_plain_at(func_id, ip, o, key, HINT_SA) else {
                     return Ok(slow as usize);
                 };
                 let k = self.resolve_const_slot(func_id, key);
-                let v = self.get(base, val);
                 self.map_method(map, "set", &[k, v])?;
+                // Where the entry is now (replaced in place, or appended).
+                let pos = match self.heap.get(map) {
+                    HeapObj::Map { keys, .. } if keys.last().is_some_and(|l| l.bits() == k.bits()) => Some(keys.len() - 1),
+                    _ => self.py_map_find(Value::heap(map), k).map(|(p, _)| p),
+                };
+                self.py_attr_note(func_id, ip, slot, pos);
                 ip + 1
             }
             Instr::PyIsInstance { dst, v, t, rt, slow } => {
@@ -399,10 +437,13 @@ impl<'p> Vm<'p> {
                     m.set_val_at(tb_slot, Value::int(-1));
                 }
                 // As `Throw`: the frame's ip kept coherent, the value thrown.
+                // The message is left empty: `run_loop` builds it from the
+                // pending value, which nothing changes before then, when the
+                // throw leaves the loop uncaught (a caught one never reads it).
                 let top = self.frames.len() - 1;
                 self.frames[top].ip = ip;
                 self.pending_throw = Some(ev);
-                return Err(Thrown(self.throw_message(ev)));
+                return Err(Thrown(String::new()));
             }
             Instr::PyCaught { dst, e, line, rt, slow } => {
                 let (ev, rv) = (self.get(base, e), self.get(base, rt));
@@ -459,6 +500,203 @@ impl<'p> Vm<'p> {
             }
             _ => ip + 1,
         })
+    }
+
+    /// [`Vm::py_step`] for the round-3 fused instructions, in a function of
+    /// their own so the earlier rounds' arms' code is exactly as it was.
+    #[inline(never)]
+    pub(crate) fn py_step_ext2(&mut self, _func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
+        use crate::bytecode::Instr;
+        Ok(match *instr {
+            #[cfg(feature = "python")]
+            Instr::PyMakeExc { dst, cls, args, rt, slow } => {
+                let (c, a, r) = (self.get(base, cls), self.get(base, args), self.get(base, rt));
+                match self.py_make_exc(c, a, r) {
+                    Some(e) => {
+                        self.set(base, dst, e);
+                        ip + 1
+                    }
+                    None => slow as usize,
+                }
+            }
+            #[cfg(feature = "python")]
+            Instr::PyNew { dst, entry, this_f, cls, rt, n, slow } => {
+                let (c, r) = (self.get(base, cls), self.get(base, rt));
+                match self.py_new(_func_id, ip, c, r, n as usize) {
+                    Some((obj, e, t)) => {
+                        self.set(base, dst, obj);
+                        self.set(base, entry, e);
+                        self.set(base, this_f, t);
+                        ip + 1
+                    }
+                    None => slow as usize,
+                }
+            }
+            Instr::PyExcPop { rt, slow } => {
+                let r = self.get(base, rt);
+                if self.py_exc_pop(r).is_some() {
+                    ip + 1
+                } else {
+                    slow as usize
+                }
+            }
+            _ => ip + 1,
+        })
+    }
+
+    /// [`Instr::PyExcPop`]: `Some` when it popped (see the instruction).
+    #[inline(never)]
+    fn py_exc_pop(&mut self, rt: Value) -> Option<()> {
+        if !rt.is_heap() {
+            return None;
+        }
+        let stack = self.py_hinted_prop(rt.heap_index(), &HINT_EXCSTACK, "EXCSTACK")?;
+        if !stack.is_heap() {
+            return None;
+        }
+        let idx = stack.heap_index();
+        // As `array_method`'s own `pop` path requires: no side-table
+        // properties, no virtual length, the default prototype (so an
+        // inherited index cannot matter), and a present last element.
+        match self.heap.get(idx) {
+            HeapObj::Array(items) if items.last().is_none_or(|v| !v.is_hole()) => {}
+            _ => return None,
+        }
+        if self.arr_props.contains_key(&idx)
+            || self.array_js_len.contains_key(&idx)
+            || self.proto_of.contains_key(&idx)
+            || self.array_proto_has_index
+            || !self.array_method_is_intrinsic("pop")
+        {
+            return None;
+        }
+        if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+            items.pop();
+        }
+        // As that path does: a pop can remove a for-in snapshot's last index.
+        self.heap.bump_version(idx);
+        Some(())
+    }
+
+    /// A new plain record laid out like the literal-born record `tmpl`
+    /// (the one its own literal made: its static key plan and its shape),
+    /// holding `vals`, allocated as that literal allocates one. `tmpl` must
+    /// be an ordinary extensible object whose own properties are exactly
+    /// `keys`, in order, all plain data properties; `kind` names the cache
+    /// slot remembering a shape found so (shapes are this thread's).
+    #[cfg(feature = "python")]
+    #[inline(never)]
+    pub(super) fn py_alloc_like(&mut self, tmpl: Value, keys: &[&str], kind: usize, vals: &[Value]) -> Option<Value> {
+        if vals.len() != keys.len() {
+            return None;
+        }
+        if self.py_alloc_like_ok(tmpl, keys, kind) {
+            let HeapObj::Object(m) = self.heap.get(tmpl.heap_index()) else {
+                return None;
+            };
+            let crate::heap::PropKeys::Planned { all, .. } = &m.keys else {
+                return None;
+            };
+            let (plan, shape) = (all.clone(), m.shape());
+            let idx = self.heap.alloc_finalized(&plan, vals, shape);
+            self.realm_born(idx, self.obj_proto);
+            return Some(Value::heap(idx));
+        }
+        // A template its literal did not plan: a copy of it.
+        let (mut rec, _) = self.py_json_template(tmpl, keys)?;
+        for (i, &v) in vals.iter().enumerate() {
+            rec.set_val_at(i, v);
+        }
+        Some(self.alloc_object_current_realm(rec))
+    }
+
+    /// Whether [`Vm::py_alloc_like`] takes `tmpl` as a template for `keys`.
+    #[cfg(feature = "python")]
+    pub(super) fn py_alloc_like_ok(&self, tmpl: Value, keys: &[&str], kind: usize) -> bool {
+        self.py_alloc_like_check(tmpl, keys, kind).is_some()
+    }
+
+    #[cfg(feature = "python")]
+    fn py_alloc_like_check(&self, tmpl: Value, keys: &[&str], kind: usize) -> Option<()> {
+        if !tmpl.is_heap() || !(1..=crate::bytecode::FINALIZE_STAGE_SLOTS).contains(&keys.len()) {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(tmpl.heap_index()) else {
+            return None;
+        };
+        if m.is_ctor || !m.extensible || m.sealed || m.frozen || m.is_raw_json || m.class.is_some() || !m.shape_guardable() {
+            return None;
+        }
+        let crate::heap::PropKeys::Planned { all, visible_len } = &m.keys else {
+            return None;
+        };
+        if *visible_len != keys.len() || all.len() != keys.len() || m.len() != keys.len() {
+            return None;
+        }
+        let shape = m.shape();
+        if TMPL_SHAPES.with(|c| c.get()[kind]) != shape {
+            let plain = keys.iter().enumerate().all(|(i, k)| {
+                let a = m.attr_at(i);
+                m.key_at(i) == *k && a.writable && a.enumerable && a.configurable && !a.accessor
+            });
+            if !plain {
+                return None;
+            }
+            TMPL_SHAPES.with(|c| {
+                let mut s = c.get();
+                s[kind] = shape;
+                c.set(s);
+            });
+        }
+        Some(())
+    }
+
+    /// The runtime's `makeExc(cls, args)` for [`Instr::PyMakeExc`] and the
+    /// native `__zipp_py_exc`: the record its literal builds (see the
+    /// instruction), or `None` when an input is not of the expected shape.
+    #[cfg(feature = "python")]
+    #[inline(never)]
+    pub(crate) fn py_make_exc(&mut self, cls: Value, args: Value, rt: Value) -> Option<Value> {
+        if !self.py_plain(cls) || !args.is_heap() || !rt.is_heap() {
+            return None;
+        }
+        // `sequence`'s limit reads `items.length`: a dense Array's own.
+        match self.heap.get(args.heap_index()) {
+            HeapObj::Array(a) if a.len() <= (1 << 24) => {}
+            _ => return None,
+        }
+        if self.array_js_len.contains_key(&args.heap_index()) {
+            return None;
+        }
+        let r = rt.heap_index();
+        let tmpl = self.py_hinted_prop(r, &HINT_EXCTMPL, "EXCTMPL")?;
+        let seq_tmpl = self.py_hinted_prop(r, &HINT_SEQTMPL, "SEQTMPL")?;
+        let ttuple = self.py_hinted_prop(r, &HINT_TTUPLE, "TTUPLE")?;
+        let stack = self.py_hinted_prop(r, &HINT_EXCSTACK, "EXCSTACK")?;
+        if !stack.is_heap() || self.array_js_len.contains_key(&stack.heap_index()) {
+            return None;
+        }
+        // `excStack.length ? excStack[excStack.length - 1] : null`.
+        let context = match self.heap.get(stack.heap_index()) {
+            HeapObj::Array(items) => match items.last() {
+                None => Value::NULL,
+                Some(&v) if v != Value::HOLE && !v.is_undefined() => v,
+                Some(_) => return None,
+            },
+            _ => return None,
+        };
+        // Both templates are checked before anything is allocated.
+        let usable = |vm: &Self, t: Value, keys: &[&str], kind: usize| {
+            vm.py_alloc_like_ok(t, keys, kind) || vm.py_json_template(t, keys).is_some()
+        };
+        if !usable(self, tmpl, &EXC_KEYS, TMPL_EXC) || !usable(self, seq_tmpl, &SEQ_KEYS, TMPL_SEQ) {
+            return None;
+        }
+        let tuple = self.py_alloc_like(seq_tmpl, &SEQ_KEYS, TMPL_SEQ, &[ttuple, args])?;
+        let map = self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
+        self.adopt_native_result_realm(map, self.map_proto);
+        let vals = [cls, Value::heap(map), tuple, Value::NULL, context, Value::int(-1), Value::FALSE];
+        self.py_alloc_like(tmpl, &EXC_KEYS, TMPL_EXC, &vals)
     }
 
     /// The Array for [`Instr::PyUnpack`].
@@ -580,13 +818,27 @@ impl<'p> Vm<'p> {
         if m.is_ctor {
             return None;
         }
-        let own = |key: &str| m.pos(key).filter(|&s| !m.attr_at(s).accessor);
-        if raise && own("isType").is_some_and(|s| m.val_at(s) == Value::TRUE) {
-            return None;
-        }
-        let cls = m.val_at(own("cls")?);
-        let tb_slot = own("tbline")?;
-        let ctx_slot = if raise { own("context")? } else { 0 };
+        // A record with the layout `makeExc` builds (its shape, once one such
+        // record was checked key by key below): the slots are known.
+        let shape = m.shape();
+        let (cls, ctx_slot, tb_slot) = if shape != crate::shape::DICT && shape == EXC_SHAPE.with(|c| c.get()) {
+            (m.val_at(0), 4, 5)
+        } else {
+            let own = |key: &str| m.pos(key).filter(|&s| !m.attr_at(s).accessor);
+            if raise && own("isType").is_some_and(|s| m.val_at(s) == Value::TRUE) {
+                return None;
+            }
+            let cls = m.val_at(own("cls")?);
+            let tb_slot = own("tbline")?;
+            let ctx_slot = if raise { own("context")? } else { 0 };
+            if m.shape_guardable()
+                && m.len() == EXC_KEYS.len()
+                && EXC_KEYS.iter().enumerate().all(|(i, k)| m.key_at(i) == *k && !m.attr_at(i).accessor)
+            {
+                EXC_SHAPE.with(|c| c.set(shape));
+            }
+            (cls, ctx_slot, tb_slot)
+        };
         if !cls.is_heap() || !self.py_is_plain_object(cls) {
             return None;
         }
@@ -631,10 +883,7 @@ impl<'p> Vm<'p> {
             self.py_hinted_prop(r, &HINT_TLIST, "TLIST")?
         };
         let tmpl = self.py_hinted_prop(r, &HINT_SEQTMPL, "SEQTMPL")?;
-        let (mut rec, slot) = self.py_json_template(tmpl, &["cls", "items"])?;
-        rec.set_val_at(0, cls);
-        rec.set_val_at(slot, items);
-        Some(self.alloc_object_current_realm(rec))
+        self.py_alloc_like(tmpl, &SEQ_KEYS, TMPL_SEQ, &[cls, items])
     }
 
     /// `len(v)` for [`Instr::PyLen`].
@@ -755,13 +1004,25 @@ impl<'p> Vm<'p> {
             let name: &str = func.string_constants
                 [(raw.heap_index() & !crate::vm::helpers_misc::STRING_CONST_BIT) as usize]
                 .as_str();
-            if let Some(m) = self.py_json_like_own(gm.heap_index(), name) {
+            // A class with many methods: its table read at this site's slot
+            // (`vm::py_attr`); a small one is scanned.
+            let many = matches!(self.heap.get(gm.heap_index()), HeapObj::Object(t) if t.len() > 8);
+            let found = if many {
+                self.py_table_own(func_id, ip, gm.heap_index(), name)
+            } else {
+                self.py_json_like_own(gm.heap_index(), name)
+            };
+            if let Some(m) = found {
                 if self.py_plain(m) {
                     let d = self.py_hinted_prop(o.heap_index(), &HINT_DICT, "dict")?;
-                    let k = self.resolve_const_slot(func_id, key);
                     if !d.is_heap() || !matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. }) {
                         return None;
                     }
+                    // A small dict is scanned by name (`vm::py_attr`).
+                    if let Some(lacks) = self.py_map_lacks_name(d.heap_index(), name) {
+                        return lacks.then_some(m);
+                    }
+                    let k = self.resolve_const_slot(func_id, key);
                     return match self.py_map_get(d, k) {
                         None => Some(m),
                         Some(_) => None,
@@ -887,6 +1148,11 @@ impl<'p> Vm<'p> {
     /// index) when `obj.cls[table][key]` is `true` (`table` the class's
     /// `ga` or `sa`) and `obj.dict` is a `Map`.
     fn py_attr_plain(&mut self, func_id: u32, ip: usize, o: Value, key: u32, table: usize) -> Option<u32> {
+        self.py_attr_plain_at(func_id, ip, o, key, table).map(|(d, _)| d)
+    }
+
+    /// [`Vm::py_attr_plain`], with the slot of `key` in the class table.
+    fn py_attr_plain_at(&mut self, func_id: u32, ip: usize, o: Value, key: u32, table: usize) -> Option<(u32, usize)> {
         let cls = self.py_record_prop(func_id, ip, o, "cls")?;
         if !cls.is_heap() || !self.py_is_plain_object(cls) {
             return None;
@@ -912,7 +1178,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let d = self.py_hinted_prop(o.heap_index(), &HINT_DICT, "dict")?;
-        (d.is_heap() && matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. })).then(|| d.heap_index())
+        (d.is_heap() && matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. })).then(|| (d.heap_index(), slot))
     }
 
     /// `s[k]` for [`Instr::PyStrItem`].
@@ -986,6 +1252,11 @@ impl<'p> Vm<'p> {
         if !matches!(self.heap.get(idx), HeapObj::Map { .. }) {
             return None;
         }
+        // Module globals are asked for every builtin name they lack: through
+        // the Map's hash index, not a scan of every global.
+        if !builtins {
+            self.coll_index_early(idx);
+        }
         let i = self.coll_find(idx, k)?;
         let v = match self.heap.get(idx) {
             HeapObj::Map { vals, .. } => vals.get(i).copied().filter(|v| !v.is_undefined())?,
@@ -1001,6 +1272,22 @@ impl<'p> Vm<'p> {
             });
         }
         Some(v)
+    }
+
+    /// [`Vm::py_map_get`] with the entry's position.
+    fn py_map_find(&mut self, m: Value, k: Value) -> Option<(usize, Value)> {
+        if !m.is_heap() {
+            return None;
+        }
+        let idx = m.heap_index();
+        if !matches!(self.heap.get(idx), HeapObj::Map { .. }) {
+            return None;
+        }
+        let i = self.coll_find(idx, k)?;
+        match self.heap.get(idx) {
+            HeapObj::Map { vals, .. } => vals.get(i).copied().filter(|v| !v.is_undefined()).map(|v| (i, v)),
+            _ => None,
+        }
     }
 
     /// `m.get(k)` for a `Map` `m` holding `k` (never `undefined`: a Python

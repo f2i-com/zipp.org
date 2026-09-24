@@ -39,6 +39,13 @@ const F_RETURNED: (usize, &str) = (5, "returned");
 const F_EXCS: (usize, &str) = (6, "excs");
 const F_GRT: (usize, &str) = (13, "grt");
 
+thread_local! {
+    /// The shape of a generator record whose fields above were all found at
+    /// their usual slots, as data properties (`shape::DICT`, which never
+    /// matches, until one is seen). Shapes are this thread's.
+    static GEN_SHAPE: std::cell::Cell<u32> = const { std::cell::Cell::new(crate::shape::DICT) };
+}
+
 /// The runtime values the step needs (`grt`, one array shared by every
 /// generator record): the JavaScript `genNext`, the current-exception
 /// stack, the STOP sentinel and `genEscape`.
@@ -115,22 +122,43 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: generator step on a non-generator".into()));
         }
         let g = this.heap_index();
-        let rt = self
-            .py_gen_slot(g, F_GRT)
-            .and_then(|s| self.py_gen_runtime(self.py_gen_read(g, s)));
+        // A record of the shape already seen with every field at its usual
+        // slot has them all there (a shape fixes keys, order and kinds).
+        let known = match self.heap.get(g) {
+            HeapObj::Object(m) => m.shape() != crate::shape::DICT && m.shape() == GEN_SHAPE.with(|c| c.get()),
+            _ => false,
+        };
+        let rt = if known {
+            self.py_gen_runtime(self.py_gen_read(g, F_GRT.0))
+        } else {
+            self.py_gen_slot(g, F_GRT)
+                .and_then(|s| self.py_gen_runtime(self.py_gen_read(g, s)))
+        };
         let Some(rt) = rt else {
             return Err(Thrown("TypeError: generator step on a non-generator".into()));
         };
-        let slots = (|| {
-            Some((
-                self.py_gen_slot(g, F_JS)?,
-                self.py_gen_slot(g, F_DONE)?,
-                self.py_gen_slot(g, F_STARTED)?,
-                self.py_gen_slot(g, F_RUNNING)?,
-                self.py_gen_slot(g, F_RETURNED)?,
-                self.py_gen_slot(g, F_EXCS)?,
-            ))
-        })();
+        let slots = if known {
+            Some((F_JS.0, F_DONE.0, F_STARTED.0, F_RUNNING.0, F_RETURNED.0, F_EXCS.0))
+        } else {
+            (|| {
+                Some((
+                    self.py_gen_slot(g, F_JS)?,
+                    self.py_gen_slot(g, F_DONE)?,
+                    self.py_gen_slot(g, F_STARTED)?,
+                    self.py_gen_slot(g, F_RUNNING)?,
+                    self.py_gen_slot(g, F_RETURNED)?,
+                    self.py_gen_slot(g, F_EXCS)?,
+                ))
+            })()
+        };
+        if !known && slots == Some((F_JS.0, F_DONE.0, F_STARTED.0, F_RUNNING.0, F_RETURNED.0, F_EXCS.0)) && self.py_gen_slot(g, F_GRT) == Some(F_GRT.0) {
+            if let HeapObj::Object(m) = self.heap.get(g) {
+                if m.shape_guardable() {
+                    let shape = m.shape();
+                    GEN_SHAPE.with(|c| c.set(shape));
+                }
+            }
+        }
         let Some((s_js, s_done, s_started, s_running, s_returned, s_excs)) = slots else {
             return self.call_value(rt.gen_next, this, &[]);
         };
@@ -150,11 +178,16 @@ impl<'p> Vm<'p> {
             return self.call_value(rt.gen_next, this, &[]);
         };
         self.py_gen_write(g, s_running, Value::TRUE);
-        self.py_gen_write(g, s_started, Value::TRUE);
-        let step = self.generator_method(js.heap_index(), "next", &[Value::UNDEFINED]);
+        if self.py_gen_read(g, s_started) != Value::TRUE {
+            self.py_gen_write(g, s_started, Value::TRUE);
+        }
+        // The engine's `next` step, its iterator result not built.
+        let step = self.generator_next_step(js.heap_index());
         let res = match step {
-            Ok(Some(res)) => res,
-            Ok(None) => Value::UNDEFINED,
+            Ok(Some(super::async_runtime::GenStep::Yield(v))) => Ok((v, false)),
+            Ok(Some(super::async_runtime::GenStep::Done(v))) => Ok((v, true)),
+            Ok(Some(super::async_runtime::GenStep::Raw(res))) => Err(res),
+            Ok(None) => Err(Value::UNDEFINED),
             Err(t) => {
                 // `catch (e) { excStack.length = depth; throw genEscape(g, e); }`
                 let e = match self.pending_throw.take() {
@@ -171,13 +204,16 @@ impl<'p> Vm<'p> {
                 return Err(Thrown(self.throw_message(converted)));
             }
         };
-        let (value, finished) = match self.iter_result_unwrap(res) {
-            Some((v, d)) => (v, self.truthy(d)),
-            None => {
-                let d = self.get_prop(res, "done")?;
-                let v = self.get_prop(res, "value")?;
-                (v, self.truthy(d))
-            }
+        let (value, finished) = match res {
+            Ok(step) => step,
+            Err(res) => match self.iter_result_unwrap(res) {
+                Some((v, d)) => (v, self.truthy(d)),
+                None => {
+                    let d = self.get_prop(res, "done")?;
+                    let v = self.get_prop(res, "value")?;
+                    (v, self.truthy(d))
+                }
+            },
         };
         // `if (!r.done && excStack.length > depth) g.excs = excStack.splice(depth);
         //  else if (excStack.length !== depth) excStack.length = depth;`

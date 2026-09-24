@@ -1,0 +1,16 @@
+[(True, False), (True, False), (True, False), (False, True), (True, False), (True, False), (False, True), (True, False)]
+[True, True, False, True, True, False, True, True, False, False, True, False, False, False] [True, True, False, True, True, False, True, True, False, False, True, False, False, False]
+[True, True, True, True, True, False] False True True
+True True 1
+True True False
+[True, False, False, False, False, False, False]
+[True, True, True, True, True, True, True, False, True, False, True, False, True, True, False, False, False]
+[True, True, True, True, True, False, True, True, True, False, False]
+True True True False
+True False True True False
+True True True True False
+True True False True False
+["'in <string>' requires string as left operand, not int", "'in <string>' requires string as left operand, not NoneType", "unhashable type: 'list'", "unhashable type: 'dict'", "unhashable type: 'list'", "unhashable type: 'list'"]
+197 [('alpha', 50), ('beta', 100), ('gamma', 50)]
+25
+100 100

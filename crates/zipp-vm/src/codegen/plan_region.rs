@@ -5494,6 +5494,9 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::PyClassAttr { obj, .. } => vec![obj],
         Instr::PyDictLookup { d, k, rt, .. } => vec![d, k, rt],
         Instr::PyUnpack { v, rt, .. } => vec![v, rt],
+        Instr::PyMakeExc { cls, args, rt, .. } => vec![cls, args, rt],
+        Instr::PyExcPop { rt, .. } => vec![rt],
+        Instr::PyNew { cls, rt, .. } => vec![cls, rt],
         Instr::Call { callee, arg_base, argc, .. }
         | Instr::TailCall { callee, arg_base, argc }
         | Instr::New { callee, arg_base, argc, .. } => win(&[callee], arg_base, argc),

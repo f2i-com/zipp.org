@@ -1091,5 +1091,21 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
             *v = m(*v);
             *rt = m(*rt);
         }
+        Instr::PyMakeExc { dst, cls, args, rt, .. } => {
+            *dst = m(*dst);
+            *cls = m(*cls);
+            *args = m(*args);
+            *rt = m(*rt);
+        }
+        Instr::PyExcPop { rt, .. } => {
+            *rt = m(*rt);
+        }
+        Instr::PyNew { dst, entry, this_f, cls, rt, .. } => {
+            *dst = m(*dst);
+            *entry = m(*entry);
+            *this_f = m(*this_f);
+            *cls = m(*cls);
+            *rt = m(*rt);
+        }
     }
 }

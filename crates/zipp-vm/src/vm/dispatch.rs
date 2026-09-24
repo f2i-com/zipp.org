@@ -239,6 +239,14 @@ impl<'p> Vm<'p> {
         false
     }
 
+    /// Whether [`Self::unwind_to_handler`] with this `stop_depth` would find a
+    /// handler: some frame above `stop_depth` has one.
+    pub(crate) fn handler_within(&self, stop_depth: usize) -> bool {
+        self.frames
+            .get(stop_depth..)
+            .is_some_and(|fs| fs.iter().rev().any(|f| !f.handlers.is_empty()))
+    }
+
     /// On a non-throw leave of the top frame (`return`, and later break/continue),
     /// run any pending `finally` first. Discards `Catch` handlers we are exiting;
     /// on the innermost `Finally`, deposits the completion (`kind` 1=return + the
@@ -1573,6 +1581,9 @@ impl<'p> Vm<'p> {
                     | Instr::PyDictLookup { .. }
                     | Instr::PyUnpack { .. } => {
                         ip = self.py_step_ext(func_id, base, ip, instr)?;
+                    }
+                    Instr::PyMakeExc { .. } | Instr::PyExcPop { .. } | Instr::PyNew { .. } => {
+                        ip = self.py_step_ext2(func_id, base, ip, instr)?;
                     }
                     Instr::AddInt { dst, a, imm, upd } => {
                         let va = self.get(base, a);
@@ -7594,7 +7605,14 @@ impl<'p> Vm<'p> {
 
                     Instr::Throw { src } => {
                         let v = self.get(base, src);
-                        let msg = self.throw_message(v);
+                        // The message is only read when the throw leaves this
+                        // run loop uncaught; a handler in a frame it unwinds
+                        // through catches it first, so it is not built then.
+                        let msg = if self.handler_within(stop_depth) {
+                            String::new()
+                        } else {
+                            self.throw_message(v)
+                        };
                         // Persist ip so the (unused) frame state is coherent,
                         // then signal unwinding via pending_throw + Err.
                         let top = self.frames.len() - 1;
@@ -7607,7 +7625,12 @@ impl<'p> Vm<'p> {
                         catch_reg,
                     } => {
                         let top = self.frames.len() - 1;
-                        self.frames[top].handlers.push(Handler::Catch {
+                        let hs = &mut self.frames[top].handlers;
+                        // A recycled buffer for the frame's first push.
+                        if hs.capacity() == 0 {
+                            *hs = super::handler_pool::take();
+                        }
+                        hs.push(Handler::Catch {
                             target: catch_target,
                             reg: catch_reg,
                         });
@@ -7624,7 +7647,11 @@ impl<'p> Vm<'p> {
                         val_reg,
                     } => {
                         let top = self.frames.len() - 1;
-                        self.frames[top].handlers.push(Handler::Finally {
+                        let hs = &mut self.frames[top].handlers;
+                        if hs.capacity() == 0 {
+                            *hs = super::handler_pool::take();
+                        }
+                        hs.push(Handler::Finally {
                             target,
                             kind_reg,
                             val_reg,
@@ -9568,7 +9595,11 @@ impl<'p> Vm<'p> {
                 self.args_sync_dense(aidx);
             }
         }
-        let finished = self.frames.pop().expect("frame underflow");
+        let mut finished = self.frames.pop().expect("frame underflow");
+        // Its handler buffer's storage, for another frame's first push.
+        if finished.handlers.capacity() != 0 {
+            super::handler_pool::give(std::mem::take(&mut finished.handlers));
+        }
         // A real pop proves the tail-reuse streak terminated — reset its budget.
         self.tail_reuse_streak = 0;
         // Shrink the register file back to the caller's window top.

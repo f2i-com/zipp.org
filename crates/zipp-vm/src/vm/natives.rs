@@ -5292,6 +5292,27 @@ impl<'p> Vm<'p> {
             PY_TKEY => self.py_tkey(args)?,
             #[cfg(feature = "python")]
             PY_ITER => self.py_iter_next(this)?,
+            // `makeExc(cls, args)` natively (`undefined`: the runtime's own
+            // literal builds it).
+            #[cfg(feature = "python")]
+            PY_EXC => {
+                let (c, a, r) = (a0, args.get(1).copied().unwrap_or(Value::UNDEFINED), args.get(2).copied().unwrap_or(Value::UNDEFINED));
+                self.py_make_exc(c, a, r).unwrap_or(Value::UNDEFINED)
+            }
+            // `contains(container, needle)` natively (`undefined`: the
+            // runtime's own test answers).
+            #[cfg(feature = "python")]
+            PY_IN => {
+                let c = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                self.py_in(a0, c, this)
+            }
+            // `smfind`'s cached hit natively (`undefined`: the runtime's own
+            // `smfind` answers).
+            #[cfg(feature = "python")]
+            PY_SMFIND => {
+                let (s, n) = (args.get(1).copied().unwrap_or(Value::UNDEFINED), args.get(2).copied().unwrap_or(Value::UNDEFINED));
+                self.py_smfind(a0, s, n, this)
+            }
             HOST_CALL => {
                 let kind = self.to_js_string(a0)?;
                 self.preflight_native_iteration_work(args.len().saturating_sub(1) as u64)?;

@@ -3034,6 +3034,36 @@ impl<'p> Vm<'p> {
                 self.globals[slot] = Value::heap(step);
                 self.bump_global_gen(slot as u32);
             }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_EXC_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let exc = self.heap.alloc(HeapObj::Native(native::PY_EXC));
+                self.globals[slot] = Value::heap(exc);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_IN_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let test = self.heap.alloc(HeapObj::Native(native::PY_IN));
+                self.globals[slot] = Value::heap(test);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_SMFIND_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let find = self.heap.alloc(HeapObj::Native(native::PY_SMFIND));
+                self.globals[slot] = Value::heap(find);
+                self.bump_global_gen(slot as u32);
+            }
         }
         // `get [Symbol.species]` (a shared getter returning `this`) on every
         // species-aware constructor — used by slice/map/etc. and required by the

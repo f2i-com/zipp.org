@@ -144,8 +144,17 @@ pub(super) struct Emitter<'a> {
     pub handler_depth: usize,
     pub qualname: String,
     last_line: i32,
+    /// The frame guard's opening line stamp, not emitted yet (see
+    /// [`Emitter::frame_guard`]): the next instruction emitted (or a jump
+    /// target taken) first puts it in the line register, unless that
+    /// instruction is itself a line stamp, which makes it dead.
+    pending_line: Option<i32>,
     /// [`py_fast_paths`], read once per code object.
     pub fast: bool,
+    /// Set by a call whose callee is written as a class usually is (a
+    /// CapWords name, or `cls`) for the next [`Emitter::call_with`]: that
+    /// site gets the inline construction path out of line (`PyNew`).
+    pub ctor_site: bool,
     /// Constant-pool indices already handed out, so every use of the same
     /// string or float shares one entry (and one string constant).
     string_ids: HashMap<String, u32>,
@@ -227,7 +236,9 @@ impl<'a> Emitter<'a> {
             handler_depth: 0,
             qualname,
             last_line: -1,
+            pending_line: None,
             fast: py_fast_paths(),
+            ctor_site: false,
             string_ids: HashMap::new(),
             string_consts: HashMap::new(),
             float_consts: HashMap::new(),
@@ -519,6 +530,11 @@ impl<'a> Emitter<'a> {
 
     // ---- instructions ---------------------------------------------------------
     pub fn emit(&mut self, instr: Instr) -> R<usize> {
+        if let Some(val) = self.pending_line.take() {
+            if !matches!(instr, Instr::LoadInt { dst, .. } if dst == self.r_line) {
+                self.emit(Instr::LoadInt { dst: self.r_line, val })?;
+            }
+        }
         if self.proto.code.len() >= MAX_INSTRUCTIONS {
             return Err("Python: per-function bytecode limit exceeded".into());
         }
@@ -526,7 +542,12 @@ impl<'a> Emitter<'a> {
         self.proto.code.push(instr);
         Ok(at)
     }
-    pub fn here(&self) -> u32 {
+    pub fn here(&mut self) -> u32 {
+        // A jump target: the pending stamp goes in first, so a jump there
+        // runs everything the fall-through does.
+        if let Some(val) = self.pending_line.take() {
+            let _ = self.emit(Instr::LoadInt { dst: self.r_line, val });
+        }
         self.proto.code.len() as u32
     }
     pub fn patch(&mut self, at: usize, target: u32) -> R<()> {
@@ -567,7 +588,10 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyCaught { slow: dst, .. })
             | Some(Instr::PyClassAttr { slow: dst, .. })
             | Some(Instr::PyDictLookup { slow: dst, .. })
-            | Some(Instr::PyUnpack { slow: dst, .. }) => {
+            | Some(Instr::PyUnpack { slow: dst, .. })
+            | Some(Instr::PyMakeExc { slow: dst, .. })
+            | Some(Instr::PyExcPop { slow: dst, .. })
+            | Some(Instr::PyNew { slow: dst, .. }) => {
                 *dst = target;
                 Ok(())
             }
@@ -613,7 +637,10 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyCaught { slow: dst, .. })
             | Some(Instr::PyClassAttr { slow: dst, .. })
             | Some(Instr::PyDictLookup { slow: dst, .. })
-            | Some(Instr::PyUnpack { slow: dst, .. }) => {
+            | Some(Instr::PyUnpack { slow: dst, .. })
+            | Some(Instr::PyMakeExc { slow: dst, .. })
+            | Some(Instr::PyExcPop { slow: dst, .. })
+            | Some(Instr::PyNew { slow: dst, .. }) => {
                 *dst = target;
                 Ok(())
             }
@@ -887,15 +914,15 @@ impl<'a> Emitter<'a> {
         line: i32,
         body: impl FnOnce(&mut Emitter<'a>) -> R<()>,
     ) -> R<()> {
-        self.emit(Instr::LoadInt {
-            dst: self.r_line,
-            val: self.unit.module_index as i32 * 1_000_000 + line,
-        })?;
         let ereg = self.alloc()?;
         let push = self.emit(Instr::PushHandler {
             catch_target: 0,
             catch_reg: ereg,
         })?;
+        // The definition line, stamped lazily: the body's first statement
+        // usually stamps its own line first, and nothing runs in between
+        // that could read the register (see `pending_line`).
+        self.pending_line = Some(self.unit.module_index as i32 * 1_000_000 + line);
         self.handler_depth += 1;
         body(self)?;
         self.handler_depth -= 1;
@@ -917,6 +944,7 @@ impl<'a> Emitter<'a> {
     /// its parameters; anything else (including a count the function does
     /// not accept, which then raises) takes [`Emitter::call_positional`].
     pub fn call_with(&mut self, f: Reg, regs: &[Reg]) -> R<Reg> {
+        let ctor_site = std::mem::replace(&mut self.ctor_site, false) && regs.len() < 7 && regs.len() < MAX_DIRECT;
         if !self.fast || regs.len() > MAX_DIRECT {
             let args = self.array(regs)?;
             return self.call_positional(f, args);
@@ -925,6 +953,17 @@ impl<'a> Emitter<'a> {
         let entry = self.alloc()?;
         let name = self.string_index(&format!("c{}", regs.len()));
         let at = self.emit(Instr::PyCallEntry { dst: entry, f, name, slow: 0 })?;
+        // At a site that likely constructs (`ctor_site`): a class whose entry
+        // is the runtime's plain construction (`R.CTOR<n>`) is constructed
+        // here instead, out of line (`PyNew`, then its `__init__` called
+        // directly, as that entry does both).
+        let mut to_ctor = None;
+        if ctor_site {
+            let plain = self.prop(self.r_rt, &format!("CTOR{}", regs.len()))?;
+            let is_plain = self.alloc()?;
+            self.emit(Instr::Eq { dst: is_plain, a: entry, b: plain })?;
+            to_ctor = Some(self.jump_if_true(is_plain)?);
+        }
         let (arg_base, argc) = self.arguments(regs)?;
         self.emit(Instr::CallWithThis {
             dst,
@@ -934,8 +973,49 @@ impl<'a> Emitter<'a> {
             argc,
             name: NO_NAME,
         })?;
-        // No entry for the count: the positional-array path, out of line.
         let regs = regs.to_vec();
+        if let Some(to_ctor) = to_ctor {
+            let regs = regs.clone();
+            self.defer_cold(vec![to_ctor], Vec::new(), move |e| {
+                let (obj, init, init_this) = (e.alloc()?, e.alloc()?, e.alloc()?);
+                let rt = e.r_rt;
+                let at_new = e.emit(Instr::PyNew { dst: obj, entry: init, this_f: init_this, cls: f, rt, n: regs.len() as u16, slow: 0 })?;
+                let mut built = Vec::new();
+                if regs.is_empty() {
+                    // No `__init__` at all: nothing to call.
+                    let null = e.none()?;
+                    let absent = e.alloc()?;
+                    e.emit(Instr::Eq { dst: absent, a: init, b: null })?;
+                    built.push(e.jump_if_true(absent)?);
+                }
+                let mut with_self = Vec::with_capacity(regs.len() + 1);
+                with_self.push(obj);
+                with_self.extend_from_slice(&regs);
+                let (arg_base, argc) = e.arguments(&with_self)?;
+                let r = e.alloc()?;
+                e.emit(Instr::CallWithThis { dst: r, callee: init, this_v: init_this, arg_base, argc, name: NO_NAME })?;
+                let none = e.none()?;
+                let is_none = e.alloc()?;
+                e.emit(Instr::Eq { dst: is_none, a: r, b: none })?;
+                built.push(e.jump_if_true(is_none)?);
+                e.helper("initret", &[r])?;
+                let here = e.here();
+                for j in built {
+                    e.patch(j, here)?;
+                }
+                e.emit(Instr::Move { dst, src: obj })?;
+                let done = e.jump()?;
+                // Declined: the class's own entry, called as the site would.
+                let here = e.here();
+                e.patch_slow(at_new, here)?;
+                let (arg_base, argc) = e.arguments(&regs)?;
+                e.emit(Instr::CallWithThis { dst, callee: entry, this_v: f, arg_base, argc, name: NO_NAME })?;
+                let here = e.here();
+                e.patch(done, here)?;
+                Ok(())
+            });
+        }
+        // No entry for the count: the positional-array path, out of line.
         self.defer_cold(Vec::new(), vec![at], move |e| {
             let args = e.array(&regs)?;
             let r = e.call_positional(f, args)?;
@@ -1213,11 +1293,29 @@ impl<'a> Emitter<'a> {
             let done = e.jump()?;
             let here = e.here();
             e.patch_slow(at, here)?;
+            // An exact dict: its entry (`PyDictLookup`), or for no entry the
+            // `KeyError(k)` the helper would raise, made and raised natively
+            // (`PyMakeExc`, `PyRaise`) as its `makeExc` and `throw` do.
+            let rt = e.r_rt;
+            let at_look = e.emit(Instr::PyDictLookup { dst, d: o, k, rt, absent: 0, slow: 0 })?;
+            let look_done = e.jump()?;
+            let here = e.here();
+            e.patch_absent(at_look, here)?;
+            let args = e.array(&[k])?;
+            let cls = e.prop(rt, "KEYERROR")?;
+            let exc = e.alloc()?;
+            let at_make = e.emit(Instr::PyMakeExc { dst: exc, cls, args, rt, slow: 0 })?;
+            let at_raise = e.emit(Instr::PyRaise { e: exc, rt, slow: 0 })?;
+            let here = e.here();
+            e.patch_slow(at_look, here)?;
+            e.patch_slow(at_make, here)?;
+            e.patch_slow(at_raise, here)?;
             let r = e.helper("getitem", &[o, k])?;
             e.emit(Instr::Move { dst, src: r })?;
             let here = e.here();
             e.patch(done, here)?;
             e.patch(str_done, here)?;
+            e.patch(look_done, here)?;
             Ok(())
         });
         Ok(dst)
@@ -1272,11 +1370,17 @@ impl<'a> Emitter<'a> {
             self.helper("popexc", &[])?;
             return Ok(());
         }
-        let stack = self.prop(self.r_rt, "EXCSTACK")?;
-        let pop = self.string_index("pop");
-        let base = self.block(1)?;
-        let ignored = self.alloc()?;
-        self.emit(Instr::CallMethod { dst: ignored, obj: stack, name: pop, arg_base: base, argc: 0 })?;
+        // Natively (`PyExcPop`); the array's own `pop` out of line.
+        let rt = self.r_rt;
+        let at = self.emit(Instr::PyExcPop { rt, slow: 0 })?;
+        self.defer_cold(Vec::new(), vec![at], move |e| {
+            let stack = e.prop(rt, "EXCSTACK")?;
+            let pop = e.string_index("pop");
+            let base = e.block(1)?;
+            let ignored = e.alloc()?;
+            e.emit(Instr::CallMethod { dst: ignored, obj: stack, name: pop, arg_base: base, argc: 0 })?;
+            Ok(())
+        });
         Ok(())
     }
     pub fn cell_get(&mut self, cell: Reg) -> R<Reg> {

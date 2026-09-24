@@ -780,6 +780,12 @@
     R.is = function (a, b) { return typeof a === "number" && typeof b === "number" ? Object.is(a, b) : a === b; };
     R.isnot = function (a, b) { return typeof a === "number" && typeof b === "number" ? !Object.is(a, b) : a !== b; };
     R.in = function (a, b) { return contains(b, a); };
+    // What the emitter calls first for `in` / `not in`: the engine's answer
+    // for plain values (`vm::py_in`), `undefined` when this `contains` must
+    // answer (always, without the native).
+    let IN_NATIVE = null;
+    try { IN_NATIVE = typeof __zipp_py_in === "function" ? __zipp_py_in : null; } catch (e) { IN_NATIVE = null; }
+    R.INNATIVE = IN_NATIVE !== null ? IN_NATIVE : function () { return undefined; };
     R.notin = function (a, b) { return !contains(b, a); };
     function compareStrings(a, b) {
         // Code-point order (JS compares UTF-16 units, which differs for astral characters).
@@ -1082,6 +1088,19 @@
         if (b.length === 0) d.map.delete(k);
         return true;
     }
+    // Remove the entry `e` a caller took from `dictEntryList(d)` (`popitem`)
+    // by the entry itself, not by re-finding its key: a NaN key equals no
+    // key, itself included, so `dictDel` would leave it in place.
+    function dictDelEntry(d, e) {
+        if (d.str === true) return dictDel(d, e[0]);
+        const k = keyOf(e[0]);
+        const b = d.map.get(k);
+        const i = b === undefined ? -1 : b.indexOf(e);
+        if (i < 0) return dictDel(d, e[0]);
+        b.splice(i, 1); d.size--;
+        if (b.length === 0) d.map.delete(k);
+        return true;
+    }
     function dictClear(d) { d.map.clear(); d.size = 0; d.str = true; d.coll = false; }
     function dictHas(d, key) { return dictGet(d, key) !== undefined; }
     function* dictEntries(d) {
@@ -1155,7 +1174,7 @@
         }
         fail(E.TypeError, message || "'" + typeOf(v).name + "' object is not a mapping");
     }
-    Object.assign(rt, { dict, dictGet, dictSet, dictDel, dictClear, dictHas, dictEntries, dictEntryList, dictKeyIter, dictEq, dictCopy, dictFromMap, mapFromDict, asDict });
+    Object.assign(rt, { dict, dictGet, dictSet, dictDel, dictDelEntry, dictClear, dictHas, dictEntries, dictEntryList, dictKeyIter, dictEq, dictCopy, dictFromMap, mapFromDict, asDict });
     R.dict = function () { return dict(); };
     R.dictfill = function (d, keys, values) { for (let i = 0; i < keys.length; i++) dictSet(d, keys[i], values[i]); return null; };
     R.dictmerge = function (d, mapping) { for (const [k, v] of dictEntries(asDict(mapping))) dictSet(d, k, v); return d; };
@@ -1176,6 +1195,17 @@
     function setDel(s, v) {
         const k = keyOf(v); const b = s.map.get(k); if (b === undefined) return false;
         const i = rt.aindex(b, (x) => eq(x, v)); if (i < 0) return false;
+        b.splice(i, 1); s.size--; if (b.length === 0) s.map.delete(k); return true;
+    }
+    // Remove the element `v` a caller took from `setList(s)` (`pop`): the
+    // entry holding that very value, or a NaN for a NaN (a NaN equals
+    // nothing, itself included, so `setDel` would leave it in place; NaN
+    // floats have no identity here, and any NaN entry is as good as another).
+    function setDelPicked(s, v) {
+        const k = keyOf(v); const b = s.map.get(k); if (b === undefined) return false;
+        let i = -1;
+        for (let j = 0; j < b.length; j++) { const x = b[j]; if (x === v || (x !== x && v !== v)) { i = j; break; } }
+        if (i < 0) return setDel(s, v);
         b.splice(i, 1); s.size--; if (b.length === 0) s.map.delete(k); return true;
     }
     function* setValues(s) { for (const x of setList(s)) yield x; }
@@ -1232,7 +1262,7 @@
         }
         return false;
     }
-    Object.assign(rt, { set, setAdd, setHas, setDel, setValues, setList, setIter, setFrom, setEq, setBinop, setCompare });
+    Object.assign(rt, { set, setAdd, setHas, setDel, setDelPicked, setValues, setList, setIter, setFrom, setEq, setBinop, setCompare });
     R.set = function (items) { const s = set(); if (items !== undefined) for (const x of items) setAdd(s, x); return s; };
 
     // ---- range, slice, bytes ---------------------------------------------------------------------------------

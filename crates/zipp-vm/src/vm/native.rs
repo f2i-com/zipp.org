@@ -377,6 +377,24 @@ pub const PY_TKEY_NAME: &str = "__zipp_py_tkey";
 pub const PY_ITER: u16 = 1958;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_ITER_NAME: &str = "__zipp_py_iter";
+/// The Python runtime's exception record (`makeExc`, `vm::py_ops`). Bound
+/// like [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_EXC: u16 = 1959;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_EXC_NAME: &str = "__zipp_py_exc";
+/// The Python runtime's membership test (`x in c`, `vm::py_in`). Bound like
+/// [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_IN: u16 = 1960;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_IN_NAME: &str = "__zipp_py_in";
+/// The Python runtime's `super().name` method lookup fast path (`smfind`,
+/// `vm::py_attr`). Bound like [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_SMFIND: u16 = 1961;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_SMFIND_NAME: &str = "__zipp_py_smfind";
 
 // ── decorator context closures (proposal-decorators) ────────────────────────
 // Each is a `HeapObj::NativeClosure`, not a bare `Native`: they close over the
@@ -1724,6 +1742,12 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PY_TKEY => ("", 2),
         #[cfg(feature = "python")]
         PY_ITER => ("next", 0),
+        #[cfg(feature = "python")]
+        PY_EXC => ("", 3),
+        #[cfg(feature = "python")]
+        PY_IN => ("", 2),
+        #[cfg(feature = "python")]
+        PY_SMFIND => ("", 3),
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),

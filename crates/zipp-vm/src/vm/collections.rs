@@ -563,6 +563,24 @@ impl<'p> Vm<'p> {
         found
     }
 
+    /// Give the `Map` `idx` its index now when it has at least 8 slots and
+    /// none yet, rather than at [`INDEX_THRESHOLD`] (the index is pure
+    /// acceleration: every hit is confirmed against the backing, which stays
+    /// authoritative). For a Map read far more often than it changes and
+    /// often probed for keys it lacks: the Python frontend's module globals,
+    /// asked for every builtin name before the builtins are.
+    pub(crate) fn coll_index_early(&mut self, idx: u32) {
+        if self.collection_index.contains_key(&idx) {
+            return;
+        }
+        if let HeapObj::Map { keys, .. } = self.heap.get(idx) {
+            if keys.len() >= 8 {
+                let ix = CollIndex::build(&self.heap, keys);
+                self.collection_index.insert(idx, ix);
+            }
+        }
+    }
+
     /// Record `key` newly PUSHED at slot `pos` of collection `idx`. No-op
     /// while the collection has no index (it is built lazily by `coll_find`,
     /// which every insertion path calls first).

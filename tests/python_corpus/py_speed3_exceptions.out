@@ -1,0 +1,43 @@
+hit:1
+hit:2
+miss:('c',):KeyError('c'):'c':'KeyError'
+miss:('',):KeyError(''):'':'KeyError'
+miss:('A',):KeyError('A'):'A':'KeyError'
+hit:'one'
+hit:'two'
+miss:(3,):KeyError(3):3:'KeyError'
+hit:'minus'
+hit:'big'
+miss:(1152921504606846977,):KeyError(1152921504606846977):1152921504606846977:'KeyError'
+hit:'one'
+hit:'one'
+miss:(0,):KeyError(0):0:'KeyError'
+hit:'f'
+hit:'t'
+hit:'t'
+hit:'n'
+hit:'tup'
+miss:((2, 1),):KeyError((2, 1)):(2, 1):'KeyError'
+hit:'str'
+miss:('t',):KeyError('t'):'t':'KeyError'
+miss:(0.0,):KeyError(0.0):0.0:'KeyError'
+1 default-y default-3 False
+hit:1 miss:('y',):KeyError('y'):'y':'KeyError'
+LookupError no q here None
+(('second',), ('first',), None, None, False)
+('inner ctx', ('v',))
+('after ctx', ('v',))
+('finally ctx', None)
+('finally-propagating ctx', "TypeError('t')")
+('fresh ctx', None)
+[1, "gen-miss ('b',) ctx=None", 1, "gen-miss ('c',) ctx=None"]
+caught 300
+[('IndexError', 'list index out of range', 1), ('ZeroDivisionError', 'integer division or modulo by zero', 1), ('AttributeError', "'NoneType' object has no attribute 'attr'", 1), ('TypeError', 'can only concatenate str (not "int") to str', 1), ('KeyError', '4', 1), ('TypeError', "unsupported operand type(s) for +: 'int' and 'NoneType'", 1)]
+attached ('k',) 'k' KeyError('k')
+KeyError() KeyError(1, 2) (1, 2) ('x',)
+Exception() ('a', 'b') ValueError('v')
+True None
+deep ('deep',)
+reraise ('x',) None
+KeyError('x') KeyError('x') True
+[0, '-', 1, '-', 2, '-', 3, '-', 4, '-'] ['hit:2', "miss:(5,):KeyError(5):5:'KeyError'"]

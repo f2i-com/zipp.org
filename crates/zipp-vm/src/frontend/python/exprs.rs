@@ -933,6 +933,39 @@ impl<'a> Emitter<'a> {
         Ok(Some(slow))
     }
 
+    /// `left in right` / `left not in right`: the engine's native test first
+    /// (`R.INNATIVE`, `vm::py_in`), which answers a bool for plain values in
+    /// the builtin containers and `undefined` otherwise; then the runtime's
+    /// `in` / `notin` helper, out of line.
+    fn membership(&mut self, op: &ast::CmpOp, left: Reg, right: Reg) -> R<Reg> {
+        let dst = self.alloc()?;
+        // An object needle (or None) is always the helper's: the native
+        // answers plain values only.
+        let is_object = self.typeof_is(left, "object")?;
+        let object = self.jump_if_true(is_object)?;
+        let native = self.prop(self.r_rt, "INNATIVE")?;
+        // Called with the runtime as `this` (a register-window call: no
+        // argument array).
+        let (arg_base, argc) = self.arguments(&[left, right])?;
+        let r = self.alloc()?;
+        let rt = self.r_rt;
+        self.emit(Instr::CallWithThis { dst: r, callee: native, this_v: rt, arg_base, argc, name: crate::bytecode::NO_NAME })?;
+        let answered = self.typeof_is(r, "boolean")?;
+        let at = self.jump_if_false(answered)?;
+        if matches!(op, ast::CmpOp::NotIn) {
+            self.emit(Instr::Not { dst, a: r })?;
+        } else {
+            self.emit(Instr::Move { dst, src: r })?;
+        }
+        let helper = cmpop_name(op);
+        self.defer_cold(vec![at, object], Vec::new(), move |e| {
+            let v = e.helper(helper, &[left, right])?;
+            e.emit(Instr::Move { dst, src: v })?;
+            Ok(())
+        });
+        Ok(dst)
+    }
+
     /// One comparison: inline tiers for ints, floats, strs and identity,
     /// everything else (and every guard miss) through the runtime.
     fn compare_once(&mut self, op: &ast::CmpOp, left: Reg, lk: Known, right: Reg, rk: Known) -> R<Reg> {
@@ -946,6 +979,9 @@ impl<'a> Emitter<'a> {
                 Ok(())
             });
             return Ok(dst);
+        }
+        if self.fast && matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn) {
+            return self.membership(op, left, right);
         }
         let dst = self.alloc()?;
         let mut end = Vec::new();
@@ -1334,6 +1370,12 @@ impl<'a> Emitter<'a> {
             for a in &c.args {
                 regs.push(self.expr(a, depth)?);
             }
+            // A callee named as classes are (`Point(...)`, `cls(...)`) gets
+            // the inline construction path (see `call_with`).
+            if let ast::Expr::Name(n) = c.func.as_ref() {
+                let id = n.id.as_str();
+                self.ctor_site = id == "cls" || id.starts_with(|ch: char| ch.is_ascii_uppercase());
+            }
             return self.call_with(f, &regs);
         }
         if let Some(r) = self.keyword_call(f, c, depth)? {
@@ -1506,7 +1548,22 @@ impl<'a> Emitter<'a> {
         self.emit(Instr::Move { dst: receiver, src: first })?;
         let first = receiver;
         let key = self.string(a.attr.as_str())?;
-        let f = self.helper("smfind", &[cls, first, key])?;
+        // The engine's form of `smfind`'s cached hit first (`R.SMFNATIVE`,
+        // with the runtime as `this`), `smfind` itself when it declines.
+        let f = self.alloc()?;
+        let native = self.prop(self.r_rt, "SMFNATIVE")?;
+        let (arg_base, argc) = self.arguments(&[cls, first, key])?;
+        let rt = self.r_rt;
+        self.emit(Instr::CallWithThis { dst: f, callee: native, this_v: rt, arg_base, argc, name: crate::bytecode::NO_NAME })?;
+        let undef = self.undefined()?;
+        let missed = self.alloc()?;
+        self.emit(Instr::Eq { dst: missed, a: f, b: undef })?;
+        let at = self.jump_if_true(missed)?;
+        self.defer_cold(vec![at], Vec::new(), move |e| {
+            let r = e.helper("smfind", &[cls, first, key])?;
+            e.emit(Instr::Move { dst: f, src: r })?;
+            Ok(())
+        });
         let flag = self.string_index("mself");
         let prepend = self.alloc()?;
         self.emit(Instr::GetProp { dst: prepend, obj: self.r_rt, name: flag })?;

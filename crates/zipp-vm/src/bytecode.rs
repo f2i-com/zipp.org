@@ -2427,6 +2427,56 @@ pub enum Instr {
         n: u32,
         slow: u32,
     },
+    /// `dst = makeExc(cls, args)` as the runtime's `makeExc` builds an
+    /// exception record: a copy of the record `rt.EXCTMPL` (a plain object
+    /// whose own keys are exactly `cls, dict, args, cause, context, tbline,
+    /// suppress`, all data) holding `cls`, a new empty `Map`, the tuple of
+    /// the Array `args` (a copy of the record `rt.SEQTMPL` holding
+    /// `rt.TTUPLE` and `args` itself, as `sequence` builds one), `null`, the
+    /// last element of the Array `rt.EXCSTACK` (or `null`), `-1` and
+    /// `false`. `cls` must be a plain object and `args` an Array of at most
+    /// 2^24 elements. Anything else jumps to `slow`, leaving `dst`
+    /// untouched. Allocates; runs no guest code.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyMakeExc {
+        dst: Reg,
+        cls: Reg,
+        args: Reg,
+        rt: Reg,
+        slow: u32,
+    },
+    /// `rt.EXCSTACK.pop()` (the result unused) when that is the intrinsic
+    /// `Array.prototype.pop` on a dense Array with its own default
+    /// prototype, no own properties beyond its elements and no last element
+    /// missing: its last element removed (nothing, when it is empty).
+    /// Anything else jumps to `slow` having changed nothing.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyExcPop {
+        rt: Reg,
+        slow: u32,
+    },
+    /// The plain construction of a user class instance, as the runtime's
+    /// positional class entry `CTOR_ENTRY[n]` performs it, for `cls` a plain
+    /// object whose own data `c<n>` is that entry (`rt.CTORS[n]`, which the
+    /// runtime installs only while the plain path is exactly what a call of
+    /// the class does) and whose own data `ctorInit` is the `__init__` the
+    /// entry calls: `dst` = a new record `{cls, dict}` (a copy of the
+    /// literal-born `rt.INSTTMPL` holding `cls` and a new empty `Map`),
+    /// `this_f` = `ctorInit` and `entry` = its own data `c<n+1>`, a function
+    /// the caller then calls on `(dst, args...)` with `this_f` as `this`,
+    /// requiring `None` back. For `n` 0 a `ctorInit` of `null` (no
+    /// `__init__`) gives `entry` = `null` (nothing to call). Anything else
+    /// jumps to `slow` having changed nothing. Allocates; runs no guest code.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyNew {
+        dst: Reg,
+        entry: Reg,
+        this_f: Reg,
+        cls: Reg,
+        rt: Reg,
+        n: u16,
+        slow: u32,
+    },
 }
 
 /// The operators of [`Instr::PyArith`]. `Add`, `Sub` and `Mul` take every

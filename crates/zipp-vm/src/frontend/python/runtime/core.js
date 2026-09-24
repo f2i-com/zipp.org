@@ -205,7 +205,12 @@ var __zipp_py = (function () {
     // (-1) until the frame it was raised in handles it (`R.caught`,
     // `R.withexit`) or lets it out (`R.addframe`): that frame's line register
     // still holds the raising statement's line then.
+    // The engine builds the same record natively when it can
+    // (`__zipp_py_exc`, set below once `R.EXCTMPL` exists); `undefined`
+    // from it leaves the literal here to build it.
+    let EXC_NATIVE = null;
     function makeExc(cls, args) {
+        if (EXC_NATIVE !== null) { const e = EXC_NATIVE(cls, args, R); if (e !== undefined) return e; }
         return { cls: cls, dict: new Map(), args: sequence(T.tuple, args), cause: null,
             context: excStack.length ? excStack[excStack.length - 1] : null, tbline: -1, suppress: false };
     }
@@ -300,6 +305,12 @@ var __zipp_py = (function () {
     R.pushexc = function (e) { excStack.push(e); return null; };
     // The emitter pushes and pops this array itself (never replaced).
     R.EXCSTACK = excStack;
+    // The record `makeExc` copies natively (`PyMakeExc`, `__zipp_py_exc`):
+    // one its own literal made, so the copies share its layout.
+    R.EXCTMPL = makeExc(E.BaseException, []);
+    // What the emitter raises for a missing key of an exact dict.
+    R.KEYERROR = E.KeyError;
+    try { if (typeof __zipp_py_exc === "function") EXC_NATIVE = __zipp_py_exc; } catch (e) { EXC_NATIVE = null; }
     // What the emitter's native `raise` / handler entry (`PyRaise`,
     // `PyCaught`) test exceptions against.
     R.EBASE = E.BaseException;
@@ -1162,6 +1173,13 @@ var __zipp_py = (function () {
         cls.ctorEntries.push(n);
         noteFlagged(cls);
     }
+    // What the emitter's inline construction (`PyNew`) checks a class's
+    // `c<n>` against (one by one, for its call sites' compare), the record it
+    // copies, and its `__init__` result check.
+    R.CTORS = CTOR_ENTRY;
+    for (let n = 0; n < CTOR_ENTRY.length; n++) R["CTOR" + n] = CTOR_ENTRY[n];
+    R.INSTTMPL = { cls: null, dict: null };
+    R.initret = initReturned;
     function setCtorEntry(cls, n, init) {
         if (cls.ctorInit !== init) { clearCtorEntries(cls); cls.ctorInit = init; }
         if (cls.ctorEntries === undefined || cls.ctorEntries === null) cls.ctorEntries = [];

@@ -1053,7 +1053,7 @@
     method(D, "get", 3, (a) => { const v = dictGet(dictSelf(a), a[1]); return v === undefined ? (a[2] === undefined ? null : a[2]) : v; }, 2);
     method(D, "setdefault", 3, (a) => { const d = dictSelf(a); const v = dictGet(d, a[1]); if (v !== undefined) return v; const dflt = a[2] === undefined ? null : a[2]; dictSet(d, a[1], dflt); return dflt; }, 2);
     method(D, "pop", 3, (a) => { const d = dictSelf(a); const v = dictGet(d, a[1]); if (v === undefined) { if (a[2] === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return a[2]; } dictDel(d, a[1]); return v; }, 2);
-    method(D, "popitem", 1, (a) => { const d = dictSelf(a); const entries = dictEntryList(d); if (!entries.length) fail(E.KeyError, "popitem(): dictionary is empty"); const [k, v] = entries[entries.length - 1]; dictDel(d, k); return tuple([k, v]); });
+    method(D, "popitem", 1, (a) => { const d = dictSelf(a); const entries = dictEntryList(d); if (!entries.length) fail(E.KeyError, "popitem(): dictionary is empty"); const e = entries[entries.length - 1]; const [k, v] = e; rt.dictDelEntry(d, e); return tuple([k, v]); });
     methodkw(D, "update", (a) => { const kw = kwOf(a, null); fillDict(dictSelf(a), a[1], kw); return null; });
     method(D, "clear", 1, (a) => { rt.dictClear(dictSelf(a)); return null; });
     method(D, "copy", 1, (a) => rt.dictCopy(dictSelf(a)));
@@ -1132,7 +1132,7 @@
         method(type, "add", 2, (a) => { setAdd(a[0], a[1]); return null; });
         method(type, "remove", 2, (a) => { if (!setDel(a[0], a[1])) throw rt.makeExc(E.KeyError, [a[1]]); return null; });
         method(type, "discard", 2, (a) => { setDel(a[0], a[1]); return null; });
-        method(type, "pop", 1, (a) => { const items = setList(a[0]); if (!items.length) fail(E.KeyError, "pop from an empty set"); setDel(a[0], items[0]); return items[0]; });
+        method(type, "pop", 1, (a) => { const items = setList(a[0]); if (!items.length) fail(E.KeyError, "pop from an empty set"); rt.setDelPicked(a[0], items[0]); return items[0]; });
         method(type, "clear", 1, (a) => { a[0].map.clear(); a[0].size = 0; return null; });
         method(type, "update", -1, (a) => { for (let i = 1; i < a.length; i++) for (const x of drain(a[i])) setAdd(a[0], x); return null; });
         method(type, "intersection_update", -1, (a) => { for (let i = 1; i < a.length; i++) { const out = intersectIterable(a[0], a[i]); a[0].map = out.map; a[0].size = out.size; } return null; });
@@ -1885,6 +1885,12 @@
     // An instance's class keeps the plain functions found this way
     // (`gs[name]`: the class searched past and the function), dropped
     // wherever its other lookup tables are.
+    // What the emitter calls first: the engine's form of the cached hit
+    // below (`vm::py_attr`), `undefined` when this function must answer
+    // (always, without the native).
+    let SMFIND = null;
+    try { SMFIND = typeof __zipp_py_smfind === "function" ? __zipp_py_smfind : null; } catch (e) { SMFIND = null; }
+    R.SMFNATIVE = SMFIND !== null ? SMFIND : function () { return undefined; };
     R.smfind = function (cls, self, name) {
         if (self !== null && typeof self === "object" && self.isType !== true) {
             const t = self.cls;

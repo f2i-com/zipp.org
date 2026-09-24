@@ -716,6 +716,10 @@ impl<'a> Emitter<'a> {
         let here = self.here();
         self.patch(tuple_check, here)?;
         let index = self.small_int(0)?;
+        // An exact list or tuple always takes the indexed mode (the loop
+        // head tests it first, and it never changes): the other modes'
+        // set-up below is skipped, and their registers never read.
+        let seq_ready = self.jump_if_true(is_seq)?;
         let range = self.prop(self.r_rt, "TRANGE")?;
         let is_range = self.alloc()?;
         self.emit(Instr::Eq { dst: is_range, a: cls, b: range })?;
@@ -744,6 +748,8 @@ impl<'a> Emitter<'a> {
         let here = self.here();
         self.patch(no_next, here)?;
         let stop = self.stop()?;
+        let here = self.here();
+        self.patch(seq_ready, here)?;
         Ok(Stepper {
             direct_next: Some((direct, next)),
             counted: Some(Counted {

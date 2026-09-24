@@ -18,6 +18,18 @@ enum GenResumeMode {
     Return(Value),
 }
 
+/// One step of a sync generator before it becomes an iterator result
+/// (`gen_resume_step`): `gen_resume` wraps `Yield`/`Done` in a fresh
+/// `{value, done}` and passes `Raw` through; a raw consumer reads them as is.
+pub(crate) enum GenStep {
+    /// Suspended at a plain `yield` of this value (`done: false`).
+    Yield(Value),
+    /// Completed with this value (`done: true`).
+    Done(Value),
+    /// A `yield*` step: the inner iterator's result object, verbatim.
+    Raw(Value),
+}
+
 /// `ZIPP_ASYNCSTATS=1` -- how many activation re-parks reused the buffer the
 /// resume detached, and how many had to grow it. Exists because "the allocation
 /// is gone" is not a performance result on its own and this file's standing rule
@@ -534,14 +546,30 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Splice a suspended generator's saved register window back onto the live
-    /// register file, RESTORE its parked `try` handlers, and resume it with one of
-    /// three completions at the yield point: `Next(v)` delivers a sent value (from
-    /// `gen.next(v)`); `Throw(e)` throws a value in there (`gen.throw(e)`), which
-    /// unwinds through the body's try/catch/finally; `Return(v)` injects a return
-    /// completion (`gen.return(v)`), running any `finally` on the way out. On a
-    /// further yield it re-parks the window + handlers; on completion or an
-    /// uncaught throw it clears them. Returns the iterator-result `{value,done}`.
+    /// `generator_method(idx, "next", [undefined])` as a [`GenStep`], without
+    /// the iterator-result object (`None`: `idx` is not a sync generator).
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub(crate) fn generator_next_step(&mut self, idx: u32) -> Result<Option<GenStep>, Thrown> {
+        let (state, fid, closure) = match self.heap.get(idx) {
+            HeapObj::Generator {
+                state,
+                func,
+                closure,
+                ..
+            } => (*state, *func, *closure),
+            _ => return Ok(None),
+        };
+        match state {
+            GenState::Completed => Ok(Some(GenStep::Done(Value::UNDEFINED))),
+            GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
+            GenState::Suspended(ip) => {
+                self.gen_resume_step(idx, fid, closure, ip, GenResumeMode::Next(Value::UNDEFINED))
+            }
+        }
+    }
+
+    /// [`Self::gen_resume_step`] with its step as the iterator result
+    /// `generator_method` returns.
     fn gen_resume(
         &mut self,
         idx: u32,
@@ -550,6 +578,30 @@ impl<'p> Vm<'p> {
         resume_ip: usize,
         input: GenResumeMode,
     ) -> Result<Option<Value>, Thrown> {
+        Ok(match self.gen_resume_step(idx, fid, closure, resume_ip, input)? {
+            None => None,
+            Some(GenStep::Yield(y)) => Some(self.iter_result(y, false)),
+            Some(GenStep::Done(v)) => Some(self.iter_result(v, true)),
+            Some(GenStep::Raw(r)) => Some(r),
+        })
+    }
+
+    /// Splice a suspended generator's saved register window back onto the live
+    /// register file, RESTORE its parked `try` handlers, and resume it with one of
+    /// three completions at the yield point: `Next(v)` delivers a sent value (from
+    /// `gen.next(v)`); `Throw(e)` throws a value in there (`gen.throw(e)`), which
+    /// unwinds through the body's try/catch/finally; `Return(v)` injects a return
+    /// completion (`gen.return(v)`), running any `finally` on the way out. On a
+    /// further yield it re-parks the window + handlers; on completion or an
+    /// uncaught throw it clears them. Returns the step (see [`GenStep`]).
+    fn gen_resume_step(
+        &mut self,
+        idx: u32,
+        fid: u32,
+        closure: u32,
+        resume_ip: usize,
+        input: GenResumeMode,
+    ) -> Result<Option<GenStep>, Thrown> {
         let (saved, saved_handlers) = match self.heap.get_mut(idx) {
             HeapObj::Generator {
                 state,
@@ -701,7 +753,7 @@ impl<'p> Vm<'p> {
                             regs.clear();
                             handlers.clear();
                         }
-                        return Ok(Some(self.iter_result(v, true)));
+                        return Ok(Some(GenStep::Done(v)));
                     }
                 }
             }
@@ -733,9 +785,9 @@ impl<'p> Vm<'p> {
             // object VERBATIM (spec GeneratorYield(innerResult)); a plain yield
             // wraps the value in a fresh `{value, done: false}`.
             if raw {
-                return Ok(Some(y));
+                return Ok(Some(GenStep::Raw(y)));
             }
-            return Ok(Some(self.iter_result(y, false)));
+            return Ok(Some(GenStep::Yield(y)));
         }
         match outcome {
             Ok(ret) => {
@@ -750,7 +802,7 @@ impl<'p> Vm<'p> {
                     regs.clear();
                     handlers.clear();
                 }
-                Ok(Some(self.iter_result(ret, true)))
+                Ok(Some(GenStep::Done(ret)))
             }
             Err(t) => {
                 self.regs.truncate(new_base);
