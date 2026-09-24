@@ -1,13 +1,17 @@
 //! Arbitrary-precision BigInt support.
 //!
-//! Two-tier representation: `HeapObj::BigInt(i128)` is the FAST tier (every
-//! value that fits i128 — virtually all real arithmetic stays here, allocation
-//! free beyond the heap slot), `HeapObj::BigIntBig(Box<num_bigint::BigInt>)` is
-//! the slow tier for values outside i128 range.
+//! Three-tier representation: an IMMEDIATE `Value` for a small value (a
+//! signed 47-bit value, see value.rs: no allocation at all),
+//! `HeapObj::BigInt(i128)` for the rest of the i128 range, and
+//! `HeapObj::BigIntBig(Box<num_bigint::BigInt>)` beyond it. `BigVal::Small`
+//! covers the first two (the i128 range).
 //!
-//! CANONICAL-FORM INVARIANT: a `BigIntBig` never holds an i128-representable
-//! value. Every constructor funnels through `BigVal::from_num` /
-//! `Vm::make_bigint_val`, which demote a fitting result back to the fast tier.
+//! CANONICAL-FORM INVARIANT: each value has exactly one representation: a
+//! value in the immediate range is always the immediate (`Vm::make_bigint`,
+//! the only producer of the first two tiers), and a `BigIntBig` never holds
+//! an i128-representable value. Every constructor funnels through
+//! `BigVal::from_num` / `Vm::make_bigint_val` / `Vm::make_bigint`, which
+//! demote a fitting result to the smallest tier.
 //! Consequences relied on throughout the engine:
 //!   * `BigInt(x) == BigInt(y)` / `BigIntBig(x) == BigIntBig(y)` compare by
 //!     value; a `BigInt` and a `BigIntBig` are ALWAYS unequal (`===`, Map/Set
@@ -222,8 +226,11 @@ impl<'p> Vm<'p> {
         self.make_bigint_val(v)
     }
 
-    /// The `BigVal` of a BigInt PRIMITIVE (either tier; clones a Big), else None.
+    /// The `BigVal` of a BigInt PRIMITIVE (any tier; clones a Big), else None.
     pub(crate) fn bigint_val(&self, v: Value) -> Option<BigVal> {
+        if let Some(n) = v.small_bigint_val() {
+            return Some(BigVal::Small(n as i128));
+        }
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::BigInt(n) => return Some(BigVal::Small(*n)),
@@ -234,9 +241,28 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// The value of a BigInt in the i128 range: an immediate or a heap
+    /// `BigInt` (`BigVal::Small`'s domain); `None` for anything else,
+    /// including a BigInt beyond i128.
+    #[inline]
+    pub(crate) fn bigint_i128(&self, v: Value) -> Option<i128> {
+        if let Some(n) = v.small_bigint_val() {
+            return Some(n as i128);
+        }
+        if v.is_heap() {
+            if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
+                return Some(*n);
+            }
+        }
+        None
+    }
+
     /// thisBigIntValue(v): a BigInt primitive OR a boxed BigInt wrapper
     /// (`Object(1n)`, a Boxed of kind 4). Backs BigInt.prototype methods.
     pub(crate) fn this_bigint_val(&self, v: Value) -> Option<BigVal> {
+        if let Some(n) = v.small_bigint_val() {
+            return Some(BigVal::Small(n as i128));
+        }
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::BigInt(n) => return Some(BigVal::Small(*n)),
@@ -248,13 +274,14 @@ impl<'p> Vm<'p> {
         None
     }
 
-    /// Whether `v` is a BigInt primitive (either tier; NOT a Boxed wrapper).
+    /// Whether `v` is a BigInt primitive (any tier; NOT a Boxed wrapper).
     pub(crate) fn is_bigint_prim(&self, v: Value) -> bool {
-        v.is_heap()
-            && matches!(
-                self.heap.get(v.heap_index()),
-                HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
-            )
+        v.is_small_bigint()
+            || v.is_heap()
+                && matches!(
+                    self.heap.get(v.heap_index()),
+                    HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                )
     }
 
     /// ToNumeric's ToPrimitive(number) step for an operand of a numeric
@@ -287,6 +314,25 @@ impl<'p> Vm<'p> {
         va: Value,
         vb: Value,
     ) -> Result<Value, Thrown> {
+        // Two small (immediate) BigInts: i64 arithmetic, which cannot
+        // overflow for 47-bit operands except in a product (checked) and
+        // needs no i128 division. A zero divisor takes the general path.
+        if let (Some(x), Some(y)) = (va.small_bigint_val(), vb.small_bigint_val()) {
+            let r = match op {
+                BigOp::Add => Some(x + y),
+                BigOp::Sub => Some(x - y),
+                BigOp::Mul => x.checked_mul(y),
+                BigOp::Div => x.checked_div(y),
+                BigOp::Mod => x.checked_rem(y),
+                BigOp::And => Some(x & y),
+                BigOp::Or => Some(x | y),
+                BigOp::Xor => Some(x ^ y),
+                _ => None,
+            };
+            if let Some(r) = r {
+                return Ok(self.make_bigint(r as i128));
+            }
+        }
         // Two fast-tier BigInts need no coercion; a checked op that fails
         // (overflow, zero divisor) takes the general path below.
         if let Some((x, y)) = self.small_bigint_pair(va, vb) {

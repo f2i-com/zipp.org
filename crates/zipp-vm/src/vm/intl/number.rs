@@ -264,6 +264,9 @@ impl<'p> Vm<'p> {
         } else {
             value
         };
+        if prim.is_small_bigint() {
+            return Ok(IntlMv::from_bigint_string(&prim.as_small_bigint().to_string()));
+        }
         if prim.is_heap() {
             match self.heap.get(prim.heap_index()) {
                 HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {

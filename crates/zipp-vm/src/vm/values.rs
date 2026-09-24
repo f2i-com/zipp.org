@@ -1922,15 +1922,15 @@ impl<'p> Vm<'p> {
         self.to_js_string(prim).map(escape_guest_key)
     }
 
-    /// Allocate a BigInt value.
+    /// The BigInt value `v`: the immediate for a small value (value.rs), a
+    /// heap BigInt otherwise. The one producer of BigInts in the i128 range,
+    /// which keeps them canonical.
+    #[inline]
     pub(crate) fn make_bigint(&mut self, v: i128) -> Value {
-        // Small values come from the pinned intern table (no allocation).
-        if (crate::heap::INTERN_BIGINT_MIN..=crate::heap::INTERN_BIGINT_MAX).contains(&v) {
-            return Value::heap(
-                crate::heap::INTERN_BIGINT_START + (v - crate::heap::INTERN_BIGINT_MIN) as u32,
-            );
+        match Value::small_bigint(v) {
+            Some(x) => x,
+            None => Value::heap(self.heap.alloc(HeapObj::BigInt(v))),
         }
-        Value::heap(self.heap.alloc(HeapObj::BigInt(v)))
     }
 
     /// `ToBigInt(v)` (used by `BigInt(x)`, asIntN/asUintN, and `==`). A non-integer

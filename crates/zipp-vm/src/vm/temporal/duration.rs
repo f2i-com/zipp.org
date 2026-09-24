@@ -44,11 +44,7 @@ impl<'p> Vm<'p> {
     /// (ToNumber semantics; our plain to_number is lenient on BigInt), a user
     /// valueOf/toString is honoured, and the result must be a finite integer.
     pub(crate) fn duration_field(&mut self, v: Value) -> Result<f64, Thrown> {
-        if v.is_heap()
-            && matches!(
-                self.heap.get(v.heap_index()),
-                HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
-            )
+        if self.is_bigint_prim(v)
         {
             return Err(Thrown(
                 "TypeError: Cannot convert a BigInt value to a number".into(),

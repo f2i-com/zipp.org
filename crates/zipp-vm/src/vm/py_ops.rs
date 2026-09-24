@@ -747,7 +747,7 @@ impl<'p> Vm<'p> {
     /// [`Instr::PyDictLookup`]: `Some(Some(value))`, `Some(None)` for no
     /// entry, `None` for the slow edge.
     fn py_dict_lookup(&mut self, d: Value, k: Value, rt: Value) -> Option<Option<Value>> {
-        if !d.is_heap() || !k.is_heap() {
+        if !d.is_heap() || !(k.is_heap() || k.is_small_bigint()) {
             return None;
         }
         let tdict = self.py_rt_for(rt)?.t_dict;
@@ -760,9 +760,8 @@ impl<'p> Vm<'p> {
         if !map.is_heap() || !matches!(self.heap.get(map.heap_index()), HeapObj::Map { .. }) {
             return None;
         }
-        let ki = k.heap_index();
         if str_mode == Value::TRUE {
-            if !self.heap.is_str_like(ki) {
+            if !k.is_heap() || !self.heap.is_str_like(k.heap_index()) {
                 return None;
             }
             return Some(self.py_map_get(map, k));
@@ -770,10 +769,7 @@ impl<'p> Vm<'p> {
         if str_mode != Value::FALSE {
             return None;
         }
-        let HeapObj::BigInt(n) = self.heap.get(ki) else {
-            return None;
-        };
-        let n = *n;
+        let n = self.bigint_i128(k)?;
         if n.unsigned_abs() > 9_007_199_254_740_991 {
             return None;
         }
@@ -798,7 +794,7 @@ impl<'p> Vm<'p> {
         let (Some(&stored), Some(&value)) = (e.first(), e.get(1)) else {
             return None;
         };
-        if !stored.is_heap() || !matches!(self.heap.get(stored.heap_index()), HeapObj::BigInt(s) if *s == n) {
+        if self.bigint_i128(stored) != Some(n) {
             return None;
         }
         (value != Value::HOLE).then_some(Some(value))
@@ -946,6 +942,8 @@ impl<'p> Vm<'p> {
             Some(1)
         } else if v.is_number() {
             Some(3)
+        } else if v.is_small_bigint() {
+            Some(2)
         } else if !v.is_heap() {
             return None;
         } else if self.heap.is_str_like(v.heap_index()) {
@@ -987,13 +985,10 @@ impl<'p> Vm<'p> {
 
     /// `s[k]` for [`Instr::PyStrItem`].
     fn py_str_item(&mut self, s: Value, k: Value) -> Option<Value> {
-        if !s.is_heap() || !k.is_heap() || !self.heap.is_str_like(s.heap_index()) {
+        if !s.is_heap() || !self.heap.is_str_like(s.heap_index()) {
             return None;
         }
-        let HeapObj::BigInt(i) = self.heap.get(k.heap_index()) else {
-            return None;
-        };
-        let i = *i;
+        let i = self.bigint_i128(k)?;
         let idx = s.heap_index();
         self.heap.flatten(idx);
         let HeapObj::Str(st) = self.heap.get(idx) else {
@@ -1183,6 +1178,9 @@ impl<'p> Vm<'p> {
         if v == Value::NULL {
             return Some(OrdKey::None);
         }
+        if let Some(n) = v.small_bigint_val() {
+            return Some(OrdKey::Int(BigVal::Small(n as i128)));
+        }
         if !v.is_heap() {
             return None;
         }
@@ -1331,16 +1329,14 @@ impl<'p> Vm<'p> {
     /// `o.items` and a valid index into it for `k`.
     fn py_seq_slot(&self, o: Value, k: Value) -> Option<(u32, usize)> {
         let (_, items) = self.py_seq_parts(o)?;
-        if !items.is_heap() || !k.is_heap() {
+        if !items.is_heap() {
             return None;
         }
-        let HeapObj::BigInt(n) = self.heap.get(k.heap_index()) else {
-            return None;
-        };
+        let n = self.bigint_i128(k)?;
         let HeapObj::Array(vals) = self.heap.get(items.heap_index()) else {
             return None;
         };
-        let i = usize::try_from(*n).ok().filter(|&i| i < vals.len())?;
+        let i = usize::try_from(n).ok().filter(|&i| i < vals.len())?;
         Some((items.heap_index(), i))
     }
 
@@ -1408,6 +1404,9 @@ impl<'p> Vm<'p> {
         if v.is_number() {
             return Num::Float(v.as_f64());
         }
+        if let Some(n) = v.small_bigint_val() {
+            return Num::Int(n as i128);
+        }
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::BigInt(n) => return Num::Int(*n),
@@ -1455,6 +1454,12 @@ impl<'p> Vm<'p> {
                 }
                 _ => None,
             });
+        }
+        // Two small (immediate) ints: i64 arithmetic (value.rs).
+        if let (Some(x), Some(y)) = (va.small_bigint_val(), vb.small_bigint_val()) {
+            if let Some(r) = py_small_arith(op, x, y) {
+                return Ok(Some(self.make_bigint(r as i128)));
+            }
         }
         match (self.py_num(va), self.py_num(vb)) {
             (Num::Int(x), Num::Int(y)) => Ok(match op {
@@ -1593,6 +1598,30 @@ impl<'p> Vm<'p> {
             _ => Ok(None),
         }
     }
+}
+
+/// `x <op> y` for two small (immediate, 47-bit) ints as `py_arith` computes
+/// it for ints, in i64 (none of these can overflow i64 except a product,
+/// which is checked); `None` for true division, a zero divisor and an
+/// overflowing product, which take `py_arith`'s general path.
+fn py_small_arith(op: PyArithOp, x: i64, y: i64) -> Option<i64> {
+    Some(match op {
+        PyArithOp::Add => x + y,
+        PyArithOp::Sub => x - y,
+        PyArithOp::Mul => x.checked_mul(y)?,
+        PyArithOp::BitAnd => x & y,
+        PyArithOp::BitOr => x | y,
+        PyArithOp::BitXor => x ^ y,
+        PyArithOp::FloorDiv | PyArithOp::Mod if y != 0 => {
+            let (q, r) = (x / y, x % y);
+            let adjust = r != 0 && ((r < 0) != (y < 0));
+            match op {
+                PyArithOp::FloorDiv => q - adjust as i64,
+                _ => r + if adjust { y } else { 0 },
+            }
+        }
+        _ => return None,
+    })
 }
 
 fn big_op(op: PyArithOp) -> BigOp {

@@ -22,6 +22,7 @@
 //! | 0x7FF9 | `Int`       | i32 (zero-extended)          |
 //! | 0x7FFA | `Bool`      | 0 or 1                       |
 //! | 0x7FFB | `Null`      | 0                            |
+//! | 0x7FFB | small BigInt| bit 47 set; bits 0..47 an i47 |
 //! | 0x7FFC | `Undefined` | 0                            |
 //! | 0x7FFD | `Heap`      | u32 index into the heap      |
 //!
@@ -32,6 +33,23 @@
 //! Numbers that fit in i32 are stored as `Int` so integer arithmetic stays in
 //! the integer domain (cheap, exact, and what hot loops/recursion use); any
 //! other number is a `Double`.
+//!
+//! ## Small BigInts
+//!
+//! A BigInt in `[SMALL_BIGINT_MIN, SMALL_BIGINT_MAX]` (a signed 47-bit value,
+//! about ±7.0e13) is an IMMEDIATE: the Null tag's pattern with payload bit 47
+//! set and the value's two's complement in bits 0..47. `null` itself is the
+//! Null tag with a zero payload, which never has bit 47 set, and `is_null` /
+//! `is_nullish` compare the whole word, so the two cannot be confused. Living
+//! inside an existing tag keeps every "is this a double" range check (here
+//! and in the JIT's emitted code) exactly as it was: an immediate BigInt is a
+//! tagged non-number, non-heap value, which is what it is.
+//!
+//! CANONICAL: a BigInt whose value is in that range is ALWAYS the immediate
+//! (`Vm::make_bigint` is the one producer); `HeapObj::BigInt` holds only
+//! values outside it. So two BigInts are equal iff their bits are equal when
+//! either one is an immediate, and `===`, SameValue, Map/Set keys and hashing
+//! by bits are exact for them.
 
 /// Quiet-NaN base: sign=0, all exponent bits set, top mantissa bit set.
 const QNAN: u64 = 0x7FF8_0000_0000_0000;
@@ -48,6 +66,15 @@ const TAG_BOOL: u64 = QNAN | (2 << TAG_SHIFT); // 0x7FFA…
 const TAG_NULL: u64 = QNAN | (3 << TAG_SHIFT); // 0x7FFB…
 const TAG_UNDEFINED: u64 = QNAN | (4 << TAG_SHIFT); // 0x7FFC…
 const TAG_HEAP: u64 = QNAN | (5 << TAG_SHIFT); // 0x7FFD…
+/// A small BigInt: the Null tag with payload bit 47 set (see the module doc).
+const TAG_SMALL_BIGINT: u64 = TAG_NULL | (1 << 47); // 0x7FFB_8…
+/// The bits that select a small BigInt: the tag and the marker bit.
+const SMALL_BIGINT_MASK: u64 = 0xFFFF_8000_0000_0000;
+/// The small BigInt payload (its value's low 47 bits).
+const SMALL_BIGINT_PAYLOAD: u64 = 0x0000_7FFF_FFFF_FFFF;
+/// The range a small (immediate) BigInt covers: a signed 47-bit value.
+pub const SMALL_BIGINT_MIN: i64 = -(1 << 46);
+pub const SMALL_BIGINT_MAX: i64 = (1 << 46) - 1;
 
 /// Mask covering the full top 16 bits — selects the tag pattern. A tagged
 /// value's `bits & TAG_MASK` equals its `TAG_*` constant exactly.
@@ -107,6 +134,36 @@ impl Value {
     #[inline(always)]
     pub fn bool(b: bool) -> Value {
         Value(TAG_BOOL | b as u64)
+    }
+
+    /// The immediate BigInt `v`, or `None` outside [`SMALL_BIGINT_MIN`,
+    /// `SMALL_BIGINT_MAX`] (such a value is a heap BigInt). Only
+    /// `Vm::make_bigint` should call this: it is what keeps BigInts canonical.
+    #[inline(always)]
+    pub fn small_bigint(v: i128) -> Option<Value> {
+        if (SMALL_BIGINT_MIN as i128..=SMALL_BIGINT_MAX as i128).contains(&v) {
+            Some(Value(TAG_SMALL_BIGINT | (v as i64 as u64 & SMALL_BIGINT_PAYLOAD)))
+        } else {
+            None
+        }
+    }
+
+    /// Whether this is an immediate (small) BigInt.
+    #[inline(always)]
+    pub fn is_small_bigint(self) -> bool {
+        (self.0 & SMALL_BIGINT_MASK) == TAG_SMALL_BIGINT
+    }
+
+    /// The value of an immediate BigInt (only valid when `is_small_bigint`).
+    #[inline(always)]
+    pub fn as_small_bigint(self) -> i64 {
+        ((self.0 << 17) as i64) >> 17
+    }
+
+    /// The value of an immediate BigInt, `None` for anything else.
+    #[inline(always)]
+    pub fn small_bigint_val(self) -> Option<i64> {
+        self.is_small_bigint().then(|| self.as_small_bigint())
     }
 
     #[inline(always)]
@@ -233,6 +290,8 @@ impl Value {
             Some(self.as_bool())
         } else if self.is_nullish() {
             Some(false)
+        } else if self.is_small_bigint() {
+            Some(self.as_small_bigint() != 0)
         } else if self.is_double() {
             let d = f64::from_bits(self.0);
             Some(d != 0.0 && !d.is_nan())
@@ -254,6 +313,8 @@ impl std::fmt::Debug for Value {
             write!(f, "Undefined")
         } else if self.is_heap() {
             write!(f, "Heap({})", self.heap_index())
+        } else if self.is_small_bigint() {
+            write!(f, "BigInt({})", self.as_small_bigint())
         } else {
             write!(f, "Double({})", f64::from_bits(self.0))
         }
@@ -263,6 +324,23 @@ impl std::fmt::Debug for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_bigint_roundtrip() {
+        for v in [0i128, 1, -1, 7, -7, 1 << 40, -(1 << 40), SMALL_BIGINT_MIN as i128, SMALL_BIGINT_MAX as i128] {
+            let x = Value::small_bigint(v).unwrap();
+            assert!(x.is_small_bigint());
+            assert_eq!(x.as_small_bigint() as i128, v);
+            assert!(!x.is_null() && !x.is_nullish() && !x.is_undefined());
+            assert!(!x.is_double() && !x.is_int() && !x.is_bool() && !x.is_heap() && !x.is_number());
+            assert_eq!(x.truthy_primitive(), Some(v != 0));
+        }
+        assert!(Value::small_bigint(SMALL_BIGINT_MAX as i128 + 1).is_none());
+        assert!(Value::small_bigint(SMALL_BIGINT_MIN as i128 - 1).is_none());
+        assert!(!Value::NULL.is_small_bigint());
+        assert!(!Value::num(f64::NAN).is_small_bigint());
+        assert_ne!(Value::small_bigint(0).unwrap(), Value::NULL);
+    }
 
     #[test]
     fn int_roundtrip() {

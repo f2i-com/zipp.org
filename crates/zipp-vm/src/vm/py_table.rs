@@ -533,7 +533,8 @@ impl PyTable {
             let bound = cpython_set_size(n) as i128;
             let small = order.iter().all(|&i| {
                 let k = self.keys[i];
-                k.is_heap() && matches!(heap.get(k.heap_index()), HeapObj::BigInt(v) if (0..bound).contains(v))
+                k.small_bigint_val().is_some_and(|v| (0..bound).contains(&(v as i128)))
+                    || k.is_heap() && matches!(heap.get(k.heap_index()), HeapObj::BigInt(v) if (0..bound).contains(v))
             });
             if small {
                 // Such an int's hash is itself (and below 2^17).
@@ -662,6 +663,9 @@ fn classify<'h>(heap: &'h Heap, kinds: &PyKinds, v: Value) -> Option<Kind<'h>> {
     }
     if v.is_null() {
         return Some(Kind::None);
+    }
+    if let Some(n) = v.small_bigint_val() {
+        return Some(Kind::Int(n as i128));
     }
     if !v.is_heap() {
         return None;

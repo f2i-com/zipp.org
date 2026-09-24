@@ -136,6 +136,9 @@ impl Vm<'_> {
         if v.is_undefined() {
             return Arg::Undefined;
         }
+        if v.is_small_bigint() {
+            return Arg::SmallBigInt(v.as_small_bigint() != 0);
+        }
         if !v.is_heap() {
             return Arg::Other;
         }

@@ -1512,6 +1512,8 @@ impl<'p> Vm<'p> {
         } else if this.is_bool() {
             "Boolean"
         } else {
+            // An immediate BigInt has no builtin tag (BigInt.prototype's
+            // @@toStringTag supplies "BigInt" below), like a heap one.
             "Object"
         };
         // A string @@toStringTag overrides the builtin tag. Step 15 reads it from
@@ -1525,6 +1527,8 @@ impl<'p> Vm<'p> {
             Some(Value::heap(self.num_proto))
         } else if this.is_bool() && self.bool_proto != 0 {
             Some(Value::heap(self.bool_proto))
+        } else if this.is_small_bigint() && self.bigint_proto != 0 {
+            Some(Value::heap(self.bigint_proto))
         } else {
             None
         };
@@ -3684,11 +3688,7 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         let raw_size = self.get_prop(a0, "size")?;
-                        if raw_size.is_heap()
-                            && matches!(
-                                self.heap.get(raw_size.heap_index()),
-                                HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
-                            )
+                        if self.is_bigint_prim(raw_size)
                         {
                             return Err(Thrown(
                                 "TypeError: Set-like 'size' cannot be a BigInt".into(),

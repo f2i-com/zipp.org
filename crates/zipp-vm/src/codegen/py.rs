@@ -32,7 +32,7 @@
 //! `PyJumpCompare` also jumps to its `target`) or jumps to `slow`, the
 //! emitter's generic code, having changed nothing. Compiled code runs an
 //! inline fast path for the commonest operand shapes (Numbers, which are
-//! Python floats; interned small ints; Int-tagged loop counters) and
+//! Python floats; small (immediate) ints; Int-tagged loop counters) and
 //! otherwise calls a helper: `Vm::jit_py_arith`/`jit_py_add_imm`/`jit_py_cmp`
 //! for the arithmetic and comparisons (the step's own `py_arith`/
 //! `py_add_imm`/`py_compare` over operand bits), `Vm::jit_py_op` for the rest,
@@ -182,13 +182,10 @@ pub(crate) fn py_body_op(i: &Instr) -> bool {
     )
 }
 
-/// The heap value of an interned small int (`make_bigint`'s pinned table),
-/// or `None` outside the table's range.
-pub(crate) fn interned_bigint_bits(v: i128) -> Option<u64> {
-    use crate::heap::{INTERN_BIGINT_MAX, INTERN_BIGINT_MIN, INTERN_BIGINT_START};
-    (INTERN_BIGINT_MIN..=INTERN_BIGINT_MAX)
-        .contains(&v)
-        .then(|| Value::heap(INTERN_BIGINT_START + (v - INTERN_BIGINT_MIN) as u32).bits())
+/// The bits of the int literal `v` when it is an immediate (small) BigInt
+/// (`Vm::make_bigint`'s canonical form, value.rs), `None` otherwise.
+pub(crate) fn small_bigint_bits(v: i128) -> Option<u64> {
+    Value::small_bigint(v).map(Value::bits)
 }
 
 /// Where a fused Python instruction's successors live in the emitted body.
@@ -250,7 +247,7 @@ pub(crate) fn emit_py_step(
     );
 }
 
-/// `LoadBigInt` of a value outside the interned table: `make_bigint` through
+/// `LoadBigInt` of a value beyond the immediate range: `make_bigint` through
 /// `Vm::jit_py_load_bigint` (an allocation, so `refetch` follows). `bail`
 /// resumes the interpreter at the instruction.
 pub(crate) fn emit_py_load_bigint(
@@ -277,16 +274,50 @@ pub(crate) fn emit_py_load_bigint(
     refetch(ops);
 }
 
-/// `(TAG_HEAP | INTERN_BIGINT_START)`: subtracting it from a Value's bits
-/// leaves, for an interned small int, its table offset (`value - MIN`), and
-/// for anything else a number above `INTERN_SPAN` (as unsigned).
-const INTERN_BASE_BITS: u64 = HEAP_TAG | crate::heap::INTERN_BIGINT_START as u64;
-/// The largest interned table offset.
-const INTERN_SPAN: i32 = (crate::heap::INTERN_BIGINT_COUNT - 1) as i32;
+/// A small (immediate) BigInt's top 17 bits: the Null tag and the marker bit
+/// (value.rs); `bits >> 47` equals this exactly for one.
+const SMALL_BIGINT_HI17: i32 = 0xFFF7;
+/// A small BigInt's tag bits (its value's low 47 bits go below them).
+const SMALL_BIGINT_TAG: u64 = 0x7FFB_8000_0000_0000;
+/// The low 47 bits: a small BigInt's payload.
+const SMALL_BIGINT_PAYLOAD: u64 = 0x0000_7FFF_FFFF_FFFF;
+/// `2^46`: adding it maps the small range `[-2^46, 2^46)` onto `[0, 2^47)`.
+const SMALL_BIGINT_BIAS: u64 = 1 << 46;
+
+/// Load `regs[reg]` into `dst` as the value of a small BigInt (sign-extended
+/// to 64 bits), or jump to `no` for anything else. Clobbers r10.
+fn py_load_small(ops: &mut dynasmrt::x64::Assembler, reg: u16, dst: u8, no: dynasmrt::DynamicLabel) {
+    dynasm!(ops
+        ; mov Rq(dst), [rbx + dreg(reg)]
+        ; mov r10, Rq(dst)
+        ; shr r10, 47
+        ; cmp r10d, SMALL_BIGINT_HI17
+        ; jne => no
+        ; shl Rq(dst), 17
+        ; sar Rq(dst), 17
+    );
+}
+
+/// Store the i64 in r8 into `regs[dst]` as a small BigInt when it is in the
+/// immediate range, else jump to `no` (the helper the caller jumps to
+/// recomputes from the operands). Clobbers r10, r11.
+fn py_store_small(ops: &mut dynasmrt::x64::Assembler, dst: u16, no: dynasmrt::DynamicLabel) {
+    dynasm!(ops
+        ; mov r10, QWORD SMALL_BIGINT_BIAS as i64
+        ; add r10, r8
+        ; shr r10, 47
+        ; jnz => no
+        ; mov r10, QWORD SMALL_BIGINT_PAYLOAD as i64
+        ; and r10, r8
+        ; mov r11, QWORD SMALL_BIGINT_TAG as i64
+        ; or r10, r11
+        ; mov [rbx + dreg(dst)], r10
+    );
+}
 
 /// `JumpIfNotLt`/`JumpIfNotLe` in a Python body, whose loop counters are
-/// Python ints (BigInts): two Ints compare inline, two interned small ints
-/// compare by their table offsets, and anything else asks the pure
+/// Python ints (BigInts): two Ints compare inline, two small (immediate)
+/// BigInts compare by value, and anything else asks the pure
 /// `Vm::jit_py_rel` (a Number or BigInt pair; any other operand resumes the
 /// interpreter at `bail`, which performs the coercing comparison).
 pub(crate) fn emit_py_jump_if_not(
@@ -321,15 +352,10 @@ pub(crate) fn emit_py_jump_if_not(
     dynasm!(ops
         ; jmp => done
         ; => not_ii
-        ; mov r10, QWORD INTERN_BASE_BITS as i64
-        ; mov r8, rax
-        ; sub r8, r10
-        ; cmp r8, INTERN_SPAN
-        ; ja => helper
-        ; mov r9, rcx
-        ; sub r9, r10
-        ; cmp r9, INTERN_SPAN
-        ; ja => helper
+    );
+    py_load_small(ops, a, 8, helper);
+    py_load_small(ops, b, 9, helper);
+    dynasm!(ops
         ; cmp r8, r9
     );
     if le {
@@ -340,8 +366,8 @@ pub(crate) fn emit_py_jump_if_not(
     dynasm!(ops
         ; jmp => done
         ; => helper
-        ; mov r8, rcx
-        ; mov rdx, rax
+        ; mov rdx, [rbx + dreg(a)]
+        ; mov r8, [rbx + dreg(b)]
         ; mov rcx, rdi
         ; mov r9d, le as i32
         ; mov rax, QWORD crate::vm::Vm::jit_py_rel as usize as i64
@@ -356,8 +382,8 @@ pub(crate) fn emit_py_jump_if_not(
 }
 
 /// `AddInt` in a Python body: an Int adds inline (overflow goes to the
-/// helper), an interned small int whose sum stays interned (under `upd`,
-/// the BigInt `+ 1n` a Python `i += 1` compiles to) is table arithmetic, and
+/// helper), a small (immediate) BigInt whose sum stays one (under `upd`, the
+/// BigInt `+ 1n` a Python `i += 1` compiles to) adds inline too, and
 /// anything else asks `Vm::jit_py_add_int` (which allocates, so `refetch`
 /// follows it; a decline resumes the interpreter at `bail`).
 pub(crate) fn emit_py_add_int(
@@ -389,25 +415,16 @@ pub(crate) fn emit_py_add_int(
         ; => not_int
     );
     if upd {
-        dynasm!(ops
-            ; mov r10, QWORD INTERN_BASE_BITS as i64
-            ; mov r8, rax
-            ; sub r8, r10
-            ; cmp r8, INTERN_SPAN
-            ; ja => helper
-            ; add r8, imm
-            ; cmp r8, INTERN_SPAN
-            ; ja => helper
-            ; add r8, r10
-            ; mov [rbx + dreg(dst)], r8
-            ; jmp => done
-        );
+        py_load_small(ops, a, 8, helper);
+        dynasm!(ops ; add r8, imm);
+        py_store_small(ops, dst, helper);
+        dynasm!(ops ; jmp => done);
     }
     let packed = (imm as u32 as u64) | ((upd as u64) << 32);
     dynasm!(ops
         ; => helper
         ; mov rcx, rdi
-        ; mov rdx, rax
+        ; mov rdx, [rbx + dreg(a)]
         ; mov r8, QWORD packed as i64
         ; mov rax, QWORD crate::vm::Vm::jit_py_add_int as usize as i64
         ; call rax
@@ -519,33 +536,6 @@ fn py_store_num(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
     );
 }
 
-/// Both operands interned small ints: their table offsets in r8 (a) and r9
-/// (b), else a jump to `no`. Clobbers r10.
-fn py_load_interned_pair(ops: &mut dynasmrt::x64::Assembler, a: u16, b: u16, no: dynasmrt::DynamicLabel) {
-    dynasm!(ops
-        ; mov r10, QWORD INTERN_BASE_BITS as i64
-        ; mov r8, [rbx + dreg(a)]
-        ; sub r8, r10
-        ; cmp r8, INTERN_SPAN
-        ; ja => no
-        ; mov r9, [rbx + dreg(b)]
-        ; sub r9, r10
-        ; cmp r9, INTERN_SPAN
-        ; ja => no
-    );
-}
-
-/// Store the interned small int at table offset r8, if r8 is one, else jump
-/// to `no`. Clobbers r10.
-fn py_store_interned(ops: &mut dynasmrt::x64::Assembler, dst: u16, no: dynasmrt::DynamicLabel) {
-    dynasm!(ops
-        ; cmp r8, INTERN_SPAN
-        ; ja => no
-        ; mov r10, QWORD INTERN_BASE_BITS as i64
-        ; add r8, r10
-        ; mov [rbx + dreg(dst)], r8
-    );
-}
 
 /// After `cmp a, b` (signed): branch to `to` when `a <op> b` is `holds`.
 fn int_cond_jump(ops: &mut dynasmrt::x64::Assembler, op: crate::bytecode::PyCmpOp, holds: bool, to: dynasmrt::DynamicLabel) {
@@ -624,21 +614,51 @@ pub(crate) fn emit_py_op(
                 py_store_num(ops, dst);
                 dynasm!(ops ; jmp => done ; => not_num);
             }
-            if matches!(op, A::Add | A::Sub | A::Mul) {
-                // Two interned small ints whose result stays interned.
-                py_load_interned_pair(ops, a, b, helper);
-                let off = -(crate::heap::INTERN_BIGINT_MIN as i32);
+            if matches!(op, A::Add | A::Sub | A::Mul | A::FloorDiv | A::Mod | A::BitAnd | A::BitOr | A::BitXor) {
+                // Two small (immediate) ints whose result stays small: the
+                // i64 operation on their sign-extended values (a 47-bit
+                // value's sum, difference and product fit i64 unless `jo`
+                // says otherwise; a quotient or remainder by a nonzero
+                // 47-bit divisor always does).
+                py_load_small(ops, a, 8, helper);
+                py_load_small(ops, b, 9, helper);
                 match op {
-                    A::Add => dynasm!(ops ; add r8, r9 ; sub r8, off),
-                    A::Sub => dynasm!(ops ; sub r8, r9 ; add r8, off),
-                    _ => dynasm!(ops
-                        ; sub r8, off
-                        ; sub r9, off
-                        ; imul r8, r9
-                        ; add r8, off
-                    ),
+                    A::Add => dynasm!(ops ; add r8, r9),
+                    A::Sub => dynasm!(ops ; sub r8, r9),
+                    A::Mul => dynasm!(ops ; imul r8, r9 ; jo => helper),
+                    A::BitAnd => dynasm!(ops ; and r8, r9),
+                    A::BitOr => dynasm!(ops ; or r8, r9),
+                    A::BitXor => dynasm!(ops ; xor r8, r9),
+                    _ => {
+                        // Python's floor division and modulo: the truncating
+                        // `idiv`, then the quotient one lower and the
+                        // remainder plus the divisor when the remainder is
+                        // nonzero with the divisor's opposite sign. A zero
+                        // divisor (ZeroDivisionError) goes to the helper.
+                        let exact = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; test r9, r9
+                            ; jz => helper
+                            ; mov rax, r8
+                            ; cqo
+                            ; idiv r9
+                            ; test rdx, rdx
+                            ; jz => exact
+                            ; mov r10, rdx
+                            ; xor r10, r9
+                            ; jns => exact
+                            ; dec rax
+                            ; add rdx, r9
+                            ; => exact
+                        );
+                        if op == A::Mod {
+                            dynasm!(ops ; mov r8, rdx);
+                        } else {
+                            dynasm!(ops ; mov r8, rax);
+                        }
+                    }
                 }
-                py_store_interned(ops, dst, helper);
+                py_store_small(ops, dst, helper);
                 dynasm!(ops ; jmp => done);
             }
             dynasm!(ops
@@ -684,14 +704,10 @@ pub(crate) fn emit_py_op(
             dynasm!(ops
                 ; jmp => done
                 ; => not_num
-                ; mov r10, QWORD INTERN_BASE_BITS as i64
-                ; mov r8, [rbx + dreg(a)]
-                ; sub r8, r10
-                ; cmp r8, INTERN_SPAN
-                ; ja => helper
-                ; add r8, imm
             );
-            py_store_interned(ops, dst, helper);
+            py_load_small(ops, a, 8, helper);
+            dynasm!(ops ; add r8, imm);
+            py_store_small(ops, dst, helper);
             dynasm!(ops
                 ; jmp => done
                 ; => helper
@@ -739,7 +755,8 @@ pub(crate) fn emit_py_op(
                 ; jmp => no
                 ; => not_num
             );
-            py_load_interned_pair(ops, a, b, helper);
+            py_load_small(ops, a, 8, helper);
+            py_load_small(ops, b, 9, helper);
             dynasm!(ops ; cmp r8, r9);
             int_cond_jump(ops, op, when, yes);
             dynasm!(ops

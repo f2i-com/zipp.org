@@ -1130,6 +1130,11 @@ impl<'p> Vm<'p> {
                 self.heap.alloc(HeapObj::Boxed { kind: 2, value: v }),
             ));
         }
+        if v.is_small_bigint() {
+            return Ok(Value::heap(
+                self.heap.alloc(HeapObj::Boxed { kind: 4, value: v }),
+            ));
+        }
         if !v.is_heap() {
             // null / undefined → a fresh ordinary object.
             return Ok(Value::heap(
@@ -1462,15 +1467,11 @@ impl<'p> Vm<'p> {
     /// shortcut changes nothing observable.
     #[inline]
     pub(crate) fn small_bigint_pair(&self, va: Value, vb: Value) -> Option<(i128, i128)> {
-        if va.is_heap() && vb.is_heap() {
-            if let (HeapObj::BigInt(x), HeapObj::BigInt(y)) = (
-                self.heap.get(va.heap_index()),
-                self.heap.get(vb.heap_index()),
-            ) {
-                return Some((*x, *y));
-            }
+        // Two immediates (the common case) without touching the heap.
+        if let (Some(x), Some(y)) = (va.small_bigint_val(), vb.small_bigint_val()) {
+            return Some((x as i128, y as i128));
         }
-        None
+        Some((self.bigint_i128(va)?, self.bigint_i128(vb)?))
     }
 
     /// Preflight a mutation of a flat guest string. The optimized append paths
@@ -2544,6 +2545,10 @@ impl<'p> Vm<'p> {
         if v.is_undefined() {
             return Ok(f64::NAN);
         }
+        // A BigInt's numeric value (see the heap BigInt arm below).
+        if let Some(n) = v.small_bigint_val() {
+            return Ok(n as f64);
+        }
         // A Date coerces to its epoch ms (so `d2 - d1`, `+d`, `d1 < d2` work).
         if let HeapObj::Date(ms) = self.heap.get(v.heap_index()) {
             return Ok(*ms);
@@ -2679,6 +2684,11 @@ impl<'p> Vm<'p> {
         } else {
             v
         };
+        if prim.is_small_bigint() {
+            return Err(Thrown(
+                "TypeError: Cannot convert a BigInt value to a number".into(),
+            ));
+        }
         if prim.is_heap() {
             match self.heap.get(prim.heap_index()) {
                 HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
@@ -2992,6 +3002,8 @@ impl<'p> Vm<'p> {
             out.push_str("null");
         } else if v.is_undefined() {
             out.push_str("undefined");
+        } else if let Some(n) = v.small_bigint_val() {
+            let _ = write!(out, "{n}");
         } else if v.is_heap() {
             let idx = v.heap_index();
             // Cycles through arrays/proxies/boxed values stringify as an empty
@@ -3272,6 +3284,11 @@ impl<'p> Vm<'p> {
         }
         if v.is_null() {
             out.push_str("null");
+            return;
+        }
+        // console.log shows BigInt with the `n` suffix (1n), unlike ToString.
+        if let Some(n) = v.small_bigint_val() {
+            let _ = write!(out, "{n}n");
             return;
         }
         if v.is_undefined() || !v.is_heap() {

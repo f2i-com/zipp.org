@@ -95,6 +95,15 @@ impl<'p> Vm<'p> {
             out.extend_from_slice(text.as_bytes());
             return Some(());
         }
+        // A small int is an immediate (value.rs): as the heap BigInt arm.
+        if let Some(n) = x.small_bigint_val() {
+            if (n as i128).unsigned_abs() > SAFE as u128 {
+                return None;
+            }
+            out.push(b'n');
+            out.extend_from_slice(n.to_string().as_bytes());
+            return Some(());
+        }
         if !x.is_heap() {
             return None;
         }

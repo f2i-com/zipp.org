@@ -848,11 +848,7 @@ impl<'p> Vm<'p> {
         if v == Value::UNDEFINED {
             return Ok(1);
         }
-        if v.is_heap()
-            && matches!(
-                self.heap.get(v.heap_index()),
-                HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
-            )
+        if self.is_bigint_prim(v)
         {
             return Err(Thrown(
                 "TypeError: Cannot convert a BigInt value to a number".into(),

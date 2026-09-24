@@ -271,6 +271,10 @@ impl<'p> Vm<'p> {
             }
             return Some(());
         }
+        if let Some(n) = v.small_bigint_val() {
+            out.push_str(&n.to_string());
+            return Some(());
+        }
         if !v.is_heap() {
             return None;
         }

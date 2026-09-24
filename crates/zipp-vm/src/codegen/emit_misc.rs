@@ -46,12 +46,12 @@ fn typeof_is_inline_enabled() -> bool {
 ///
 /// A NaN-boxed value's tag decides five of the eight answers without the
 /// heap: any double or Int is "number", the Bool tag is "boolean", the
-/// Undefined tag is "undefined" (with any payload — `Vm::type_of` answers
-/// "undefined" for every non-heap value that is not exactly `null`), the
-/// exact `null` is "object". Each of those is a compile-time constant for
-/// this `code`/`neg`, so the arm is a tag test and a constant store. Only a
-/// heap value — string, object, function, symbol, BigInt, the `[[IsHTMLDDA]]`
-/// exotic, or a Cell/Proxy that unwraps to anything — calls `jit_typeof_is`,
+/// Undefined tag is "undefined" (with any payload), the exact `null` is
+/// "object". Each of those is a compile-time constant for this `code`/`neg`,
+/// so the arm is a tag test and a constant store. Only a heap value —
+/// string, object, function, symbol, BigInt, the `[[IsHTMLDDA]]` exotic, or
+/// a Cell/Proxy that unwraps to anything — and a small (immediate) BigInt
+/// (the Null tag with a payload) call `jit_typeof_is`,
 /// which is where those rules live. PURE and total: no bail, no refetch,
 /// clobbers only rax/rcx/rdx/r8 (the helper call's own set).
 ///
@@ -105,11 +105,11 @@ pub(crate) fn emit_typeof_is(
         ; je => is_boolean
         ; cmp edx, 3
         ; je => is_undefined
-        // Null tag. Exactly `null` is "object"; a Null-tagged payload is not
-        // `is_null()` and classifies as "undefined" like any non-heap leftover.
+        // Null tag. Exactly `null` is "object"; any other Null-tagged value
+        // is a small (immediate) BigInt (value.rs), which the helper names.
         ; mov r8, QWORD crate::value::Value::NULL.bits() as i64
         ; cmp rax, r8
-        ; jne => is_undefined
+        ; jne => heap
         ; mov rax, QWORD res_object
         ; jmp => store
         ; => is_number

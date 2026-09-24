@@ -1215,6 +1215,11 @@ impl<'p> Vm<'p> {
                 let p = self.active_realm_proto(self.bool_proto);
                 return self.proto_member_get(p, key, obj);
             }
+            // An immediate BigInt: as a heap BigInt's arm below.
+            if obj.is_small_bigint() {
+                let p = self.active_realm_proto(self.bigint_proto);
+                return self.proto_member_get(p, key, obj);
+            }
             return Ok(Value::UNDEFINED);
         }
         // A String exotic object reports each in-range char index as an own data

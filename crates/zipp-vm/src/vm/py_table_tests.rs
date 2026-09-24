@@ -39,7 +39,8 @@ impl Env {
     fn int(&mut self, digits: &str) -> Value {
         let n: NumBig = digits.parse().expect("int literal");
         match i128::try_from(&n) {
-            Ok(v) => Value::heap(self.heap.alloc(HeapObj::BigInt(v))),
+            // Canonical, as `Vm::make_bigint` builds it: a small value is an immediate.
+            Ok(v) => Value::small_bigint(v).unwrap_or_else(|| Value::heap(self.heap.alloc(HeapObj::BigInt(v)))),
             Err(_) => Value::heap(self.heap.alloc(HeapObj::BigIntBig(Box::new(n)))),
         }
     }

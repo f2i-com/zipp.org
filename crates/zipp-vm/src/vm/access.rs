@@ -129,6 +129,8 @@ impl<'p> Vm<'p> {
         loop {
             if v.is_int() || v.is_double() {
                 return "number";
+            } else if v.is_small_bigint() {
+                return "bigint";
             } else if v.is_bool() {
                 return "boolean";
             } else if v.is_undefined() {
@@ -2055,6 +2057,8 @@ impl<'p> Vm<'p> {
             self.num_proto
         } else if obj.is_bool() {
             self.bool_proto
+        } else if obj.is_small_bigint() {
+            self.bigint_proto
         } else if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => self.str_proto,

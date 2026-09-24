@@ -115,12 +115,13 @@ integration date every corpus program matched.
   call-heavy code), stay interpreted; the tier is x86-64 only; embedders with
   an instruction budget, sandbox and WebAssembly keep the JIT off. Measured
   against CPython 3.13 over the 36 programs of `tools/python_bench.py`
-  (geomean of work time): about 4.3x slower interpreted and 3.6x with the
-  JIT, from `float_arith` (faster than CPython with the JIT) and
-  `int_arith` (1.3x) to instance creation and list comprehensions (about 7x). Ints are
-  BigInts outside a small interned range, and object-heavy code still goes
-  through the JavaScript runtime's records; native core types are the next
-  step. `ZIPP_PY_PROF=1` prints fused-op hit and slow-path counts, runtime
+  (geomean of work time): about 3.3x slower interpreted and 2.1x with the
+  JIT, from `range_loop`, `int_arith`, `float_arith`, `tuple_swap` and
+  `global_read` (faster than CPython with the JIT) to instance creation and
+  list comprehensions (about 5-7x). Ints within ±2^46 are unboxed
+  immediates in the value word (larger ones are heap BigInts), and
+  object-heavy code still goes through the JavaScript runtime's records;
+  native dict, set and instance storage are the next step. `ZIPP_PY_PROF=1` prints fused-op hit and slow-path counts, runtime
   helper call counts and the allocation mix at exit.
 
 ## Language selection

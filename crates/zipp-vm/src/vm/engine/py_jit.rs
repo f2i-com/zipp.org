@@ -94,8 +94,8 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// `LoadBigInt` beyond the interned table (compiled code inlines the
-    /// table's values): `make_bigint` of the literal at `packed = (func_id
+    /// `LoadBigInt` beyond the immediate range (compiled code stores an
+    /// immediate itself): `make_bigint` of the literal at `packed = (func_id
     /// << 32) | ip`. An allocation, so a GC safe point. `SELF_CALL_DEOPT`
     /// (nothing ran) for anything but that instruction.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -156,13 +156,11 @@ impl<'p> Vm<'p> {
         if !upd {
             return crate::codegen::SELF_CALL_DEOPT;
         }
-        // The common case: a fast-tier int whose sum stays one.
-        if va.is_heap() {
-            if let HeapObj::BigInt(n) = vm.heap.get(va.heap_index()) {
-                if let Some(r) = n.checked_add(imm as i128) {
-                    vm.maybe_gc();
-                    return vm.make_bigint(r).bits();
-                }
+        // The common case: an int in the i128 range whose sum stays one.
+        if let Some(n) = vm.bigint_i128(va) {
+            if let Some(r) = n.checked_add(imm as i128) {
+                vm.maybe_gc();
+                return vm.make_bigint(r).bits();
             }
         }
         let Some(b) = vm.bigint_val(va) else {
@@ -188,14 +186,8 @@ impl<'p> Vm<'p> {
     pub(crate) extern "win64" fn jit_py_rel(vm: *mut core::ffi::c_void, a_bits: u64, b_bits: u64, le: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let (va, vb) = (Value::from_bits(a_bits), Value::from_bits(b_bits));
-        // The common case: two fast-tier ints.
-        let small = |vm: &Vm, v: Value| -> Option<i128> {
-            match v.is_heap().then(|| vm.heap.get(v.heap_index())) {
-                Some(HeapObj::BigInt(n)) => Some(*n),
-                _ => None,
-            }
-        };
-        if let (Some(x), Some(y)) = (small(vm, va), small(vm, vb)) {
+        // The common case: two ints in the i128 range.
+        if let (Some(x), Some(y)) = (vm.bigint_i128(va), vm.bigint_i128(vb)) {
             return if le == 0 { (x < y) as u64 } else { (x <= y) as u64 };
         }
         let numeric = |vm: &Vm, v: Value| v.is_number() || vm.bigint_val(v).is_some();

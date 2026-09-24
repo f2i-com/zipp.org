@@ -1071,11 +1071,7 @@ impl<'p> Vm<'p> {
             }
             self.to_bigint(v)?;
         } else {
-            if v.is_heap()
-                && matches!(
-                    self.heap.get(v.heap_index()),
-                    HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
-                )
+            if self.is_bigint_prim(v)
             {
                 return Err(Thrown(
                     "TypeError: cannot convert a BigInt to a number".into(),
@@ -1116,11 +1112,7 @@ impl<'p> Vm<'p> {
         } else {
             // ToNumber(BigInt) throws in SetTypedArrayElement (the engine's
             // to_number is deliberately lenient on BigInt for comparisons).
-            if v.is_heap()
-                && matches!(
-                    self.heap.get(v.heap_index()),
-                    HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
-                )
+            if self.is_bigint_prim(v)
             {
                 return Err(Thrown(
                     "TypeError: cannot convert a BigInt to a number".into(),

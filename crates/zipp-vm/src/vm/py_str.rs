@@ -51,6 +51,9 @@ impl<'p> Vm<'p> {
         if v == Value::FALSE {
             return Some((false, "0".into()));
         }
+        if let Some(n) = v.small_bigint_val() {
+            return Some((n < 0, n.unsigned_abs().to_string()));
+        }
         if !v.is_heap() {
             return None;
         }
@@ -884,7 +887,7 @@ impl<'p> Vm<'p> {
         }
         if kind == Value::int(2) {
             // `const items = this.a.items; if (this.i < items.length) ...`
-            if !a.is_heap() || !b.is_heap() {
+            if !a.is_heap() {
                 return None;
             }
             let items = self.py_strm_prop(a.heap_index(), hint::IITEMS, "items")?;
@@ -895,10 +898,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(it) => *it.get(pos)?,
                 _ => return None,
             };
-            let HeapObj::BigInt(c) = self.heap.get(b.heap_index()) else {
-                return None;
-            };
-            let next = c.checked_add(1)?;
+            let next = self.bigint_i128(b)?.checked_add(1)?;
             let out = self.py_iter_pair(rec, b, v)?;
             let step = Value::int(i32::try_from(pos + 1).ok()?);
             let nb = self.make_bigint(next);

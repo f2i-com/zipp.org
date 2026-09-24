@@ -51,6 +51,8 @@ pub(crate) enum Arg {
     Bool(bool),
     Null,
     Undefined,
+    /// A BigInt the value word holds, by its truthiness (the only use).
+    SmallBigInt(bool),
     /// Anything else (a detached or out-of-range view included).
     Other,
 }
@@ -79,7 +81,7 @@ impl Arg {
     pub(crate) fn truthy_primitive(&self) -> Option<bool> {
         match *self {
             Arg::Num(x) => Some(x != 0.0 && !x.is_nan()),
-            Arg::Bool(b) => Some(b),
+            Arg::Bool(b) | Arg::SmallBigInt(b) => Some(b),
             Arg::Null | Arg::Undefined => Some(false),
             Arg::View(_) | Arg::Ints(_) | Arg::Other => None,
         }

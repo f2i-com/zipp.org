@@ -6495,6 +6495,11 @@ impl Heap {
     fn alloc_settled(&mut self, obj: HeapObj, hot: HotMirrorHint) -> u32 {
         #[cfg(all(feature = "meter-only", not(feature = "jit")))]
         let _ = hot;
+        // A BigInt in the immediate range is never a heap object (value.rs).
+        debug_assert!(
+            !matches!(&obj, HeapObj::BigInt(n) if crate::value::Value::small_bigint(*n).is_some()),
+            "non-canonical heap BigInt"
+        );
         // Ask for a collection on BYTES as well as on count. Only large
         // payloads are weighed: `resident_payload_bytes` is a capacity read
         // for the variants that can be big, and the threshold test rejects

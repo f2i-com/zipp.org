@@ -3930,7 +3930,7 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::LoadBigInt { dst, value } => {
-                if let Some(bits) = interned_bigint_bits(value) {
+                if let Some(bits) = small_bigint_bits(value) {
                     dynasm!(ops
                         ; mov rax, QWORD bits as i64
                         ; mov [rbx + dreg(dst)], rax

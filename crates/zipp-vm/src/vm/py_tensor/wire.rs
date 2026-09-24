@@ -94,6 +94,7 @@ const TAG_INTS: u8 = 4;
 const TAG_BOOL: u8 = 5;
 const TAG_NULL: u8 = 6;
 const TAG_UNDEFINED: u8 = 7;
+const TAG_SMALL_BIGINT: u8 = 8;
 
 /// The request for `op(args)`. `bytes(id)` is buffer `id`'s whole contents,
 /// or `None` when it is detached.
@@ -143,6 +144,10 @@ pub(crate) fn encode_request<'b>(op: u32, args: &[Arg], budget: Budget, bytes: i
             }
             Arg::Null => w.u8(TAG_NULL),
             Arg::Undefined => w.u8(TAG_UNDEFINED),
+            Arg::SmallBigInt(b) => {
+                w.u8(TAG_SMALL_BIGINT);
+                w.u8(*b as u8);
+            }
         }
     }
     w.u32(ranges.len() as u32);
@@ -222,6 +227,7 @@ pub(crate) fn decode_request(b: &[u8]) -> Option<WireHost> {
             TAG_BOOL => Arg::Bool(r.u8()? != 0),
             TAG_NULL => Arg::Null,
             TAG_UNDEFINED => Arg::Undefined,
+            TAG_SMALL_BIGINT => Arg::SmallBigInt(r.u8()? != 0),
             _ => return None,
         });
     }

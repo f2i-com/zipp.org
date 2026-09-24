@@ -52,6 +52,9 @@ impl<'p> Vm<'p> {
         if v == Value::NULL {
             return Some(Prim::None);
         }
+        if let Some(n) = v.small_bigint_val() {
+            return Some(Prim::Int(n as i128));
+        }
         if !v.is_heap() {
             return None;
         }

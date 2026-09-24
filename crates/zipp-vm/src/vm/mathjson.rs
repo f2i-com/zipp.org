@@ -1609,6 +1609,15 @@ impl<'p> Vm<'p> {
                     v
                 }
             }
+        } else if v.is_small_bigint() {
+            // Step 2: a BigInt's `toJSON` (BigInt.prototype's, when defined).
+            let tj = self.get_prop(v, "toJSON")?;
+            if self.is_callable(tj) {
+                let kv = self.alloc_key_str(key.to_string());
+                self.call_value(tj, v, &[kv])?
+            } else {
+                v
+            }
         } else {
             v
         };
@@ -1634,6 +1643,11 @@ impl<'p> Vm<'p> {
         if v.is_number() {
             self.json_push_number_output(out, v.as_f64())?;
             return Ok(true);
+        }
+        if v.is_small_bigint() {
+            return Err(Thrown(
+                "TypeError: Do not know how to serialize a BigInt".into(),
+            ));
         }
         if !v.is_heap() {
             return Ok(false);
@@ -1686,11 +1700,7 @@ impl<'p> Vm<'p> {
             // A boxed BigInt (Object(0n)) throws like a primitive BigInt; a boxed
             // Symbol falls through to SerializeJSONObject ("{}").
             HeapObj::Boxed { value, .. } => {
-                if value.is_heap()
-                    && matches!(
-                        self.heap.get(value.heap_index()),
-                        HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
-                    )
+                if self.is_bigint_prim(*value)
                 {
                     return Err(Thrown(
                         "TypeError: Do not know how to serialize a BigInt".into(),

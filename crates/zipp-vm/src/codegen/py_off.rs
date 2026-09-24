@@ -32,7 +32,7 @@ pub(crate) fn py_body_op(i: &Instr) -> bool {
 }
 
 #[inline(always)]
-pub(crate) fn interned_bigint_bits(v: i128) -> Option<u64> {
+pub(crate) fn small_bigint_bits(v: i128) -> Option<u64> {
     None
 }
 
