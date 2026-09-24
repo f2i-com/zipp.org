@@ -64,3 +64,6 @@ default = []
 # frontend (docs/PYTHON_FRONTEND_EXPERIMENT.md).
 python = ["zipp-vm/python"]
 python-js-interop = ["python", "zipp-vm/python-js-interop"]
+# The Python frontend without the torch package (the `python` artifact): a
+# host adds torch at run time with zipp_torch.wasm (`addPythonPackage`).
+python-base = ["python", "zipp-vm/python-no-torch"]

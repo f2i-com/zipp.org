@@ -81,6 +81,8 @@ jobs:
           cargo +1.92.0 test --locked -p zipp-vm --features python --test python_frontend --test python_project --test python_corpus --test python_torch --test python_javascript --test python_torch_core --test python_torch_nn --test python_torch_optim --test python_torch_gpu --test python_torch_native --test python_torch_gpu2 --test python_torch_nn2 --test python_torch_dtypes --test python_torch_linalg --test python_torch_distributions --test python_torch_amp --test python_torch_nn3 --test python_torch_gpu3 --test python_torch_complex --test python_torch_fft --test python_torch_sparse --test python_torch_quant --test python_torch_distributed --test python_lazy_import
           cargo +1.92.0 test --locked -p zipp-vm --features python-js-interop --test python_javascript
           cargo +1.92.0 test --locked -p zipp-vm --features python --lib _check
+          cargo +1.92.0 test --locked -p zipp-vm --features python --test python_packages
+          cargo +1.92.0 test --locked -p zipp-vm --no-default-features --features python-no-torch --lib --test python_packages --test python_frontend --test python_project
           cargo +1.92.0 test --locked -p zipp-cli
           cargo +1.92.0 test --locked -p zipp-gpu
       # The hand-written Python parser against the generated LALRPOP parser it
@@ -115,6 +117,12 @@ jobs:
           node tests/node/python-conv2d.cjs
           node tests/node/python-training.cjs
           node tests/node/python-javascript.cjs
+          # Python without torch, plus torch as a separately loaded package
+          # (zipp_torch.wasm): identical output to the prebundled `all` build.
+          ./build-variants.sh python torch
+          wasm-bindgen --target nodejs --out-dir /tmp/pkg-all target/variants/all/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          wasm-bindgen --target nodejs --out-dir /tmp/pkg-python target/variants/python/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node tests/node/python-plugin.cjs /tmp/pkg-all /tmp/pkg-python
           ./build-variants.sh interop
           wasm-bindgen --target nodejs --out-dir tests/node/pkg target/variants/interop/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/python-javascript.cjs --enabled

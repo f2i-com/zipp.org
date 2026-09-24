@@ -43,8 +43,13 @@ const RUNTIME_BASE: &str = concat!(
     "\n",
     pysrc!("runtime/stdlib.js"),
     "\n",
-    pysrc!("runtime/tensor.js"),
+    pysrc!("runtime/storage.js"),
 );
+/// The torch package's runtime, when it is built in (otherwise a host adds
+/// it as a package, see `crate::python_packages`). Compiled right after the
+/// base runtime, as an installed package's runtime is.
+#[cfg(not(feature = "python-no-torch"))]
+const TORCH_RUNTIME: &str = pysrc!("runtime/tensor.js");
 const RUNTIME_ENTRY: &str = pysrc!("runtime/entry.js");
 // The native CLI's synchronous GPU bridge (`_zipp_gpu.native`): inert
 // unless the embedder answers `zipp.gpu.*` host calls. Only the native CLI
@@ -100,6 +105,7 @@ pub(super) const BUILTIN_MODULES: &[&str] = &[
     "importlib",
     "_zipp_gpu",
     "_zipp_tensor",
+    "_zipp_crc",
 ];
 
 /// A library module written in Python and bundled with the frontend
@@ -123,6 +129,56 @@ pub(super) struct Bundled {
 }
 
 pub(super) const BUNDLED_MODULES: &[Bundled] = include!(concat!(env!("OUT_DIR"), "/bundled.rs"));
+/// The torch package's modules (`lib/modules.txt` rows of package `torch`),
+/// when it is built in.
+#[cfg(not(feature = "python-no-torch"))]
+pub(super) const TORCH_MODULES: &[Bundled] = include!(concat!(env!("OUT_DIR"), "/bundled_torch.rs"));
+
+/// A library module a program may import: bundled, from the built-in torch
+/// package, or from a package the host installed.
+#[derive(Clone, Copy)]
+pub(super) struct LibModule {
+    pub name: &'static str,
+    pub source: &'static str,
+    /// Its import statements ([`Bundled::imports`]).
+    pub imports: &'static str,
+}
+
+/// What `import torch` finds in an engine without the torch package, until
+/// the host adds it: a module that raises the ModuleNotFoundError a missing
+/// module raises, saying how to add it.
+const TORCH_MISSING: LibModule = LibModule {
+    name: "torch",
+    source: "_error = ModuleNotFoundError(\"No module named 'torch': this ZIPP engine is built without the torch \
+package. The host adds it with addPythonPackage (zipp_torch.wasm, see the zipp-wasm README), or uses the \
+build that has it built in.\")\n_error.name = \"torch\"\nraise _error\n",
+    imports: "",
+};
+
+/// Every library module, in module-index order: the bundled library, the
+/// built-in torch package, then each installed package's modules; and, when
+/// nothing provides `torch`, [`TORCH_MISSING`].
+fn library() -> Vec<LibModule> {
+    let of = |b: &Bundled| LibModule {
+        name: b.name,
+        source: b.source,
+        imports: b.imports,
+    };
+    let mut out: Vec<LibModule> = BUNDLED_MODULES.iter().map(of).collect();
+    #[cfg(not(feature = "python-no-torch"))]
+    out.extend(TORCH_MODULES.iter().map(of));
+    for package in crate::python_packages::installed().1 {
+        out.extend(package.modules.iter().map(|m| LibModule {
+            name: m.name,
+            source: m.source,
+            imports: m.imports,
+        }));
+    }
+    if !out.iter().any(|m| module_head(m.name) == "torch") {
+        out.push(TORCH_MISSING);
+    }
+    out
+}
 
 /// A single-file program: the source is the `main` module.
 pub(super) fn compile(source: &str) -> R<Program> {
@@ -182,6 +238,7 @@ fn follow(
     queued: &mut BTreeSet<String>,
     queue: &mut Vec<String>,
     heads: &mut BTreeSet<String>,
+    library: &[LibModule],
 ) {
     for imported in wanted {
         // `a.b.c` also needs the packages `a` and `a.b` when they exist.
@@ -199,9 +256,9 @@ fn follow(
         if candidates.contains_key(head) || !heads.insert(head.to_owned()) {
             continue;
         }
-        for bundled in BUNDLED_MODULES {
-            if module_head(bundled.name) == head && queued.insert(bundled.name.to_owned()) {
-                queue.push(bundled.name.to_owned());
+        for module in library {
+            if module_head(module.name) == head && queued.insert(module.name.to_owned()) {
+                queue.push(module.name.to_owned());
             }
         }
     }
@@ -382,6 +439,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
     let mut queued: BTreeSet<String> = BTreeSet::new();
     // The heads whose library modules are queued already.
     let mut heads: BTreeSet<String> = BTreeSet::new();
+    let library = library();
     queued.insert(entry.to_owned());
     // A `test_*.py` entry runs its tests through the bundled pytest, so that
     // module comes along even when the file never imports it.
@@ -405,10 +463,10 @@ pub(super) fn compile_project<S: AsRef<str>>(
                 // is followed exactly as if it were: a project module only it
                 // imports is still the project's (as a script-directory
                 // module shadows the stdlib for every importer in CPython).
-                if let Some(module) = BUNDLED_MODULES.iter().find(|m| m.name == name) {
+                if let Some(module) = library.iter().find(|m| m.name == name) {
                     let mut wanted = BTreeSet::new();
                     bundled_imports(module.imports, &name, &mut wanted);
-                    follow(&wanted, &candidates, &mut queued, &mut queue, &mut heads);
+                    follow(&wanted, &candidates, &mut queued, &mut queue, &mut heads, &library);
                 }
                 continue;
             }
@@ -431,14 +489,14 @@ pub(super) fn compile_project<S: AsRef<str>>(
         if sources.len() > MAX_MODULES {
             return Err(format!("Python project: more than {MAX_MODULES} modules"));
         }
-        follow(&wanted, &candidates, &mut queued, &mut queue, &mut heads);
+        follow(&wanted, &candidates, &mut queued, &mut queue, &mut heads, &library);
     }
     let sources = &sources;
     // Module indices (the traceback file index): the library modules first,
     // in their fixed order, so a library module's index, and with it its
     // compiled code, is the same whatever project imports it; then the
     // project's modules in the order found.
-    let lazy = lazy_modules(&candidates);
+    let lazy = lazy_modules(&candidates, &library);
     let mut names: BTreeSet<&str> = names.iter().map(String::as_str).collect();
     let mut module_names: Vec<&str> = lazy.iter().map(|(name, _)| *name).collect();
     module_names.extend(sources.iter().map(|(n, _)| n.as_str()));
@@ -630,8 +688,8 @@ fn emit_module<'a>(
 /// bundled module whose head the project does not shadow (a project module
 /// `torch` hides all of `torch.*`, as a script-directory package hides an
 /// installed one) and that the project does not define itself.
-fn lazy_modules(candidates: &BTreeMap<&str, &str>) -> Vec<(&'static str, &'static str)> {
-    BUNDLED_MODULES
+fn lazy_modules(candidates: &BTreeMap<&str, &str>, library: &[LibModule]) -> Vec<(&'static str, &'static str)> {
+    library
         .iter()
         .filter(|m| !candidates.contains_key(module_head(m.name)) && !candidates.contains_key(m.name))
         .map(|m| (m.name, m.source))
@@ -667,7 +725,7 @@ fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::Fu
     // define such modules share one compile.
     let key = if memo {
         let mut heads = BTreeSet::new();
-        if let Some(bundled) = BUNDLED_MODULES.iter().find(|m| m.name == module.name) {
+        if let Some(bundled) = library().into_iter().find(|m| m.name == module.name) {
             bundled_imports(bundled.imports, bundled.name, &mut heads);
         }
         let mut heads: BTreeSet<&str> = heads.iter().map(|m| module_head(m)).collect();
@@ -879,22 +937,43 @@ pub(super) fn set_runtime_memo(enabled: bool) {
 /// values (string constants are resolved per VM), so every program built
 /// from one seed is independent. With the memo off (a process that compiles
 /// one program) the seed is handed over without keeping a copy.
+///
+/// The runtime also holds the torch package's runtime (built in) and each
+/// installed package's, so the memo is keyed by the installed packages'
+/// generation too.
 fn runtime_seed() -> R<RuntimeSeed> {
-    use std::sync::OnceLock;
-    static SEEDS: [OnceLock<Result<RuntimeSeed, String>>; 2] = [OnceLock::new(), OnceLock::new()];
-    let seed = &SEEDS[crate::front::pure_script_goal() as usize];
-    if let Some(seed) = seed.get() {
+    use std::sync::Mutex;
+    type Seeds = Vec<(bool, u64, Result<RuntimeSeed, String>)>;
+    static SEEDS: Mutex<Seeds> = Mutex::new(Vec::new());
+    let goal = crate::front::pure_script_goal();
+    let (generation, packages) = crate::python_packages::installed();
+    if !SEED_MEMO.load(std::sync::atomic::Ordering::Relaxed) {
+        return compile_runtime_seed(&packages);
+    }
+    let mut seeds = SEEDS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, seed)) = seeds.iter().find(|(g, gen, _)| *g == goal && *gen == generation) {
         return seed.clone();
     }
-    if !SEED_MEMO.load(std::sync::atomic::Ordering::Relaxed) {
-        return compile_runtime_seed();
-    }
-    seed.get_or_init(compile_runtime_seed).clone()
+    let seed = compile_runtime_seed(&packages);
+    seeds.retain(|(g, _, _)| *g != goal);
+    seeds.push((goal, generation, seed.clone()));
+    seed
 }
 
-fn compile_runtime_seed() -> R<RuntimeSeed> {
-    let runtime =
-        format!("{RUNTIME_BASE}\n{NATIVE_GPU_RUNTIME}\n{INTEROP_RUNTIME}\n{RUNTIME_ENTRY}");
+fn compile_runtime_seed(packages: &[&crate::python_packages::Installed]) -> R<RuntimeSeed> {
+    let mut runtime = String::from(RUNTIME_BASE);
+    #[cfg(not(feature = "python-no-torch"))]
+    {
+        runtime.push('\n');
+        runtime.push_str(TORCH_RUNTIME);
+    }
+    for package in packages {
+        for chunk in &package.runtime {
+            runtime.push('\n');
+            runtime.push_str(chunk);
+        }
+    }
+    let runtime = format!("{runtime}\n{NATIVE_GPU_RUNTIME}\n{INTEROP_RUNTIME}\n{RUNTIME_ENTRY}");
     let mut program = crate::compile_only(&runtime, false)?;
     // Only this program — the Python runtime every Python state is built
     // from — gets the native tensor loops (`vm::py_tensor`).

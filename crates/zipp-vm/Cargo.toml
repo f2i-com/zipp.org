@@ -45,6 +45,13 @@ self_cell = "1.3.0"
 python = ["dep:rustpython-parser", "dep:zipp-pyparse", "instrument"]
 # Trusted mixed-language programs sharing one VM scope; deliberately opt-in.
 python-js-interop = ["python"]
+# Artifact-internal (the zipp-wasm `python` variant): the Python frontend
+# without the bundled torch package: no `lib/torch*.py`, no `tensor.js`, no
+# native tensor kernels. A host adds torch at run time as a package
+# (`python_packages`, zipp_torch.wasm), whose kernels the engine reaches
+# through one host call. Subtractive, like `wasm-no-fs-loader`: keep it out
+# of feature-unified general zipp-vm graphs.
+python-no-torch = ["python"]
 # `_zipp_gpu.native`: zipp_gpu graphs answered synchronously by an embedder
 # that serves `zipp.gpu.*` host calls (the native CLI's GPU). Inert without
 # such a host; enabled only by zipp-cli's `gpu` feature.

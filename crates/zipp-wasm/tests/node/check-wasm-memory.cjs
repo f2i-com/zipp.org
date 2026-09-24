@@ -98,7 +98,13 @@ const expectedImportStems = [
   "__wbindgen_cast",
   "__wbindgen_cast",
   "__wbindgen_init_externref_table",
-].sort();
+];
+// A Python module (it exports addPythonPackage) calls one more host function:
+// the tensor-kernel entry of a package the host added (zipp_torch.wasm's
+// loader), `kernels.zippTorchKernel(request)`. Bytes in, bytes out.
+const exportNames = WebAssembly.Module.exports(new WebAssembly.Module(bytes)).map((entry) => entry.name);
+if (exportNames.includes("addPythonPackage")) expectedImportStems.push("__wbg_zippTorchKernel");
+expectedImportStems.sort();
 
 for (const entry of moduleImports) {
   if (entry.module !== "./zipp_wasm_bg.js" || entry.kind !== "function") {

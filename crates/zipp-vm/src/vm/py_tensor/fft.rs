@@ -9,8 +9,7 @@
 //! odd primes to 31); any other length runs Bluestein's chirp-z algorithm
 //! over a power-of-two convolution. Twiddles are cos/sin of 2*pi*k/N,
 //! folded into the first octant, computed directly.
-use super::super::helpers_num2::math_unary;
-use crate::bytecode::MathFn as M;
+use super::jsmath::{math_unary, M};
 use std::f64::consts::PI;
 
 #[inline]

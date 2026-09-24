@@ -1,0 +1,31 @@
+# zipp_torch.wasm: the torch package for the WebAssembly `python` artifact,
+# which ships without it. One module holds the package archive (torch's
+# Python modules and its runtime JavaScript, comment-stripped as the engine
+# embeds its own, with a manifest of SHA-256 digests and the engine ABI they
+# were built against) and the native tensor kernels, compiled from the same
+# source the engine compiles into the `all` artifact
+# (crates/zipp-vm/src/vm/py_tensor/*). A host adds it with the loader
+# `zipp_torch.js`; see ../README.md.
+#
+# Its own workspace, like ../rust: a freestanding module with no imports and
+# its own profile, never feature-unified with the engine.
+[workspace]
+resolver = "2"
+
+[package]
+name = "zipp-torch"
+version = "0.0.20"
+edition = "2021"
+license = "Apache-2.0"
+description = "The torch package of ZIPP's WebAssembly Python artifact: sources as data, tensor kernels as code."
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

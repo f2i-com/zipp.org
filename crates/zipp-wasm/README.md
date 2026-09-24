@@ -24,30 +24,35 @@ node tests/node/check-wasm-memory.cjs pkg/zipp_wasm_bg.wasm
 brotli -q 11 -f -o pkg/zipp_wasm_bg.wasm.br pkg/zipp_wasm_bg.wasm
 ```
 
-## Build variants: JavaScript only, or JavaScript and Python
+## Build variants: JavaScript only, Python, and the torch package
 
-The crate builds two language variants. The default is JavaScript-only;
-the `python` feature adds
-the experimental Python-subset frontend (`docs/PYTHON_FRONTEND_EXPERIMENT.md`)
-behind `Engine.initSource(source, "python")` alongside the unchanged
-JavaScript entry points.
+The crate builds several variants. The default is JavaScript-only; the Python
+variants add the experimental Python-subset frontend
+(`docs/PYTHON_FRONTEND_EXPERIMENT.md`) behind `Engine.initSource(source,
+"python")` alongside the unchanged JavaScript entry points. Torch is a package:
+built into `all`, or added to `python` at run time from a second module,
+`zipp_torch.wasm`, for hosts that want it.
 
 | variant | features | entry points |
 | --- | --- | --- |
 | `javascript` (default) | none | `initScript`, `initSource(src, "javascript")` |
-| `all` | `--features python` | the above plus `initSource(src, "python")` |
+| `python` | `--features python-base` | the above plus `initSource(src, "python")`; torch only after `addPythonPackage` (below) |
+| `torch` | `torch/` crate | `zipp_torch.wasm` + its loader `zipp_torch.js`: the torch package for `python` |
+| `all` | `--features python` | `python` with torch built in: the same engine, one download |
+| `interop` | `--features python-js-interop` | `all` plus the trusted Python/JavaScript interop |
 
 ```sh
 cd crates/zipp-wasm
-./build-variants.sh            # both into dist/<variant>/, with sizes
-./build-variants.sh all        # one variant
+./build-variants.sh                   # javascript and all, into dist/<variant>/
+./build-variants.sh python torch      # any of: javascript | python | torch | all | interop
 ```
 
 The script applies exactly the post-processing above (section strip,
-`target_features` strip, memory/import check, Brotli) to each build, in its
-own target directory, and prints a raw / Brotli-11 size table. A host can tell
-the variants apart at runtime: `zippProfile().languages` is `["javascript"]`
-or `["javascript","python"]`, and `initSource(src, "python")` on the
+`target_features` strip, memory/import check, Brotli) to each engine build, in
+its own target directory, and prints a raw / Brotli-11 size table. A host can
+tell the variants apart at runtime: `zippProfile().languages` is
+`["javascript"]` or `["javascript","python"]`, `pythonPackages().torchBuiltIn`
+says whether torch is built in, and `initSource(src, "python")` on the
 JavaScript-only module fails with a clear message and disposes the engine like
 any failed initialization.
 
@@ -55,15 +60,57 @@ There is deliberately no Python-only variant. The engine is the JavaScript VM
 and the Python runtime's helpers are themselves JavaScript that the VM
 compiles, so a build without the JavaScript entry points still carries the
 whole engine; measured, it came out 85 bytes *larger* on the wire than the
-combined module. The size that matters is the parser and lowering code the
-`python` feature adds. Measured on this source, same toolchain and
-post-processing as the table above (Rust 1.92.0, wasm-bindgen 0.2.126, fat
-LTO, one codegen unit, 13 September 2026, Windows x86-64):
+combined module. Measured on this source, same toolchain and post-processing
+as the table above (Rust 1.92.0, wasm-bindgen 0.2.126, fat LTO, one codegen
+unit, 24 September 2026, Windows x86-64):
 
 | variant | raw | Brotli-11 | vs. JavaScript-only (wire) |
 | --- | ---: | ---: | ---: |
-| `javascript` | 5,308,147 | 1,239,957 | baseline |
-| `all` | 7,773,932 | 1,777,382 | +537,425 (+43%) |
+| `javascript` | 5,747,880 | 1,327,957 | baseline |
+| `python` | 7,562,298 | 1,694,759 | +366,802 (+28%) |
+| `torch` (`zipp_torch.wasm`) | 2,043,372 | 377,930 | added to `python` on demand |
+| `all` | 9,479,934 | 2,046,911 | +718,954 (+54%) |
+
+`python` + `torch` is 2,072,689 bytes on the wire, 25,778 more than `all`
+(the package carries its own copy of the kernels' support code and a manifest);
+a page that never imports torch saves 377,930.
+
+### Adding torch to `python`
+
+```js
+import init, * as zipp from "./zipp_wasm.js";        // the python variant
+import { addTorch } from "./zipp_torch.js";           // dist/torch/
+await init();
+await addTorch(zipp, "./zipp_torch.wasm");            // a URL, Response, bytes or WebAssembly.Module
+new zipp.Engine().initSource("import torch\n...", "python");
+```
+
+`addTorchSync(zipp, bytesOrModule)` does the same synchronously (Node, a
+Worker that already holds the bytes). The package is process-wide (one per
+wasm instance): add it once, before creating the engines that import torch.
+Without it, `import torch` raises `ModuleNotFoundError` (`e.name == "torch"`)
+saying how the host adds it; the rest of the Python library works.
+
+The loader reads the package archive out of `zipp_torch.wasm` and calls
+`addPythonPackage(archive, kernels)`. The engine checks the archive before it
+registers anything: its format, the engine ABI it was built against (a hash of
+the base runtime and the kernel wire format; `pythonPackages().engineAbi`), and
+the SHA-256 of every file against the manifest; it refuses a mismatch with the
+reason. Torch's Python modules then compile on first import like the bundled
+library, its runtime JavaScript is compiled into the Python runtime, and each
+native tensor kernel call goes to the package's module through one host
+function (`kernels.zippTorchKernel(request)`, the one import the Python
+engine adds to the audited surface): the arguments and the bytes they view go
+over, the kernel runs there over them, and the written bytes and the step
+charge come back. The kernels are the engine's own source compiled into that
+module, so results are the same bits as `all`'s; `tests/node/python-plugin.cjs`
+runs the torch suites against both and compares their output byte for byte.
+
+A package is trusted code once added: its runtime JavaScript runs with the
+Python runtime's own reach and its kernels run on the program's data. Pin
+`zipp_torch.wasm` by hash (SRI, `SHA256SUMS`) exactly as you pin the engine,
+and serve the pair from the same build: a package built from another engine
+source is refused by the ABI check.
 
 A Python state keeps every host-boundary limit of a JavaScript one (initial
 source size, instruction budget, heap, output, dynamic-code gates) and adds the

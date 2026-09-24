@@ -3,7 +3,7 @@
 //! bundled module it named was compiled up front: imports, tracebacks
 //! through library code, shadowing by project modules; plus the modules it
 //! never names statically, which `importlib` can now reach as CPython's can.
-#![cfg(feature = "python")]
+#![cfg(all(feature = "python", not(feature = "python-no-torch")))]
 use zipp_vm::frontend::compile_python_project;
 
 fn big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {

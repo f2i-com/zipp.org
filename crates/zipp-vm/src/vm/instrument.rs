@@ -1421,11 +1421,40 @@ impl super::Vm<'_> {
         rec.finite_remaining().is_none_or(|left| left >= cost)
     }
 
+    /// What [`Vm::native_kernel_admits`] decides from, as data, for a kernel
+    /// that runs outside the VM (the torch package's module, see
+    /// `py_tensor::wire::Budget`): `None` without a meter (everything is
+    /// admitted); else whether the meter is open (no terminal status, trace
+    /// or abort request), the heap room under the ceiling (`usize::MAX`
+    /// without one) and the steps left when finite.
+    #[cfg(feature = "python-no-torch")]
+    pub(crate) fn native_kernel_budget(&self) -> Option<(bool, usize, Option<u64>)> {
+        let rec = self.instr_rec.as_ref()?;
+        #[allow(unused_mut)]
+        let mut open = rec.terminal_message().is_none();
+        #[cfg(not(feature = "meter-only"))]
+        {
+            open = open
+                && !rec.tracing
+                && !rec
+                    .abort
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        let room = if rec.heap_limit == usize::MAX {
+            usize::MAX
+        } else {
+            rec.heap_limit.saturating_sub(self.instrument_heap_estimate())
+        };
+        Some((open, room, rec.finite_remaining()))
+    }
+
     /// Polled between blocks of a long native kernel: a host abort request
     /// makes the kernel stop and decline, discarding its unwritten result;
     /// the runtime's JavaScript loop then observes the abort at its first
     /// poll. Always false in the wasm meter, which has no abort flag.
     #[cfg(feature = "python")]
+    #[cfg_attr(feature = "python-no-torch", allow(dead_code))]
     pub(crate) fn native_kernel_interrupted(&self) -> bool {
         #[cfg(not(feature = "meter-only"))]
         if let Some(rec) = self.instr_rec.as_ref() {

@@ -52,6 +52,9 @@ extern "C" {
     fn new(source: &JsValue) -> Result<Float32ArrayCopy, JsValue>;
 }
 
+#[cfg(feature = "python")]
+mod packages;
+
 const PREAMBLE: &str = include_str!("preamble.js");
 const EVAL_PREFIX: &str = "JSON.stringify((function () { return (";
 const EVAL_SUFFIX: &str = "); })())";

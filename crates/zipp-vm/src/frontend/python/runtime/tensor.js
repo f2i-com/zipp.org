@@ -21,7 +21,9 @@
     "use strict";
     const rt = R.__rt, T = rt.T, E = rt.E, fail = rt.fail;
     const tuple = rt.tuple, list = rt.list;
-    const Storage = rt.newType("_Storage", [rt.ObjectType], new Map(), "_zipp_tensor");
+    // The storage type and the host transport over it live in the base
+    // runtime (storage.js), which has them with or without this package.
+    const Storage = rt.StorageType;
     // The engine's native loops (`vm::py_tensor`), bound only in Python
     // states. `NATIVE(op, ...)` runs one kernel's loop in Rust over the same
     // typed arrays and returns true, or declines with false (an odd view, a
@@ -129,11 +131,6 @@
         return out;
     }
     function pyInts(arr) { const out = new Array(arr.length); for (let i = 0; i < arr.length; i++) out[i] = BigInt(arr[i]); return tuple(out); }
-    // The host transport (entry.js): a float32 storage leaves as its
-    // Float32Array, and a Float32Array the host sends arrives as a storage
-    // that owns it (the VM made it from the host's copy).
-    rt.float32Storage = (data) => make("float32", data);
-    rt.isFloat32Storage = (v) => isStorage(v) && v.dtype === "float32";
     function isFloatDtype(dtype) { return FLOAT[dtype] === 1; }
     // Rounding a float32 value to float16 (Math.f16round of a float32 is the
     // second step of PyTorch's double -> float -> half conversion) or to
@@ -2018,16 +2015,6 @@
         else bytes = Uint8Array.from(a.data);
         return rt.bytes(rt.bytesFromU8(bytes));
     }
-    let CRC_TABLE = null;
-    function crc32(items, start) {
-        if (CRC_TABLE === null) {
-            CRC_TABLE = new Int32Array(256);
-            for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; CRC_TABLE[n] = c; }
-        }
-        let c = start ^ 0xFFFFFFFF;
-        for (let i = 0; i < items.length; i++) c = CRC_TABLE[(c ^ items[i]) & 0xFF] ^ (c >>> 8);
-        return (c ^ 0xFFFFFFFF) >>> 0;
-    }
     function fromBytes(dtype, b, count) {
         const items = b.items, buf = new ArrayBuffer(items.length), u8 = new Uint8Array(buf);
         for (let i = 0; i < items.length; i++) u8[i] = items[i];
@@ -3085,7 +3072,7 @@
         fn("tobytes", 1, (a) => toBytes(needSC(a[0])));
         fn("frombytes", 3, (a) => fromBytes(rt.needStr(a[0]), a[1], a[2] === undefined || a[2] === null ? null : num(a[2])), 2);
         // zlib's CRC-32 of a bytes object, for zipfile (torch.save checkpoints).
-        fn("crc32", 2, (a) => BigInt(crc32(a[0].items, a[1] === undefined ? 0 : num(a[1]))), 1);
+        fn("crc32", 2, (a) => BigInt(rt.crc32(a[0].items, a[1] === undefined ? 0 : num(a[1]))), 1);
         fn("dot_sum", 2, (a) => { const x = vals(needS(a[0])), y = vals(needS(a[1])); let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; });
         fn("axpy", 3, (a) => {
             const alpha = num(a[0]), xs = a[1], ys = a[2];

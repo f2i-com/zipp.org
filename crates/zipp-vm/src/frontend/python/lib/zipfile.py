@@ -5,7 +5,7 @@ compressed or not, are kept byte for byte) and mode "x" refuses to replace
 an existing file. The archive is assembled in memory and written on close."""
 import os
 import struct
-import _zipp_tensor as _k
+import _zipp_crc as _k
 
 ZIP_STORED = 0
 ZIP_DEFLATED = 8

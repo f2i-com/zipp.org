@@ -69,6 +69,10 @@ mod compile;
 /// re-entries rather than running it once (see the module docs).
 pub mod embed;
 pub mod frontend;
+/// Python packages a host adds at run time (the torch package of the
+/// WebAssembly `python` artifact).
+#[cfg(feature = "python")]
+pub mod python_packages;
 
 /// B187 scouting support: expose the exact object-construction floor to the
 /// `build_floor_micro` bench test without widening any real API. Not for

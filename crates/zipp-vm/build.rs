@@ -10,11 +10,19 @@ use std::path::{Path, PathBuf};
 mod minify;
 #[path = "build/pyimports.rs"]
 mod pyimports;
+#[path = "build/sha256.rs"]
+mod sha256;
+#[path = "build/abi.rs"]
+mod abi;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build/minify.rs");
     println!("cargo:rerun-if-changed=build/pyimports.rs");
+    println!("cargo:rerun-if-changed=build/sha256.rs");
+    println!("cargo:rerun-if-changed=build/abi.rs");
+    println!("cargo:rerun-if-changed=src/vm/py_tensor/args.rs");
+    println!("cargo:rerun-if-changed=src/vm/py_tensor/wire.rs");
     let root = Path::new("src/frontend/python");
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("pysrc");
     for dir in ["lib", "runtime"] {
@@ -22,13 +30,30 @@ fn main() {
         println!("cargo:rerun-if-changed={}", root.join(dir).display());
         mirror(&root.join(dir), &out.join(dir));
     }
-    bundled(&root.join("lib"), &out.parent().unwrap().join("bundled.rs"));
+    let gen = out.parent().unwrap();
+    bundled(&root.join("lib"), "base", &gen.join("bundled.rs"));
+    bundled(&root.join("lib"), "torch", &gen.join("bundled_torch.rs"));
+    write_if_changed(&gen.join("package_abi.txt"), &abi::package_abi(Path::new(".")));
+    for package in ["base", "torch"] {
+        let names: Vec<String> = std::fs::read_to_string(root.join("lib/modules.txt"))
+            .expect("read lib/modules.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                (f.get(2) == Some(&package)).then(|| f[0].to_owned())
+            })
+            .collect();
+        write_if_changed(&gen.join(format!("library_{package}.txt")), &names.join("\n"));
+    }
 }
 
-/// `$OUT_DIR/bundled.rs`: the bundled library table (`lib/modules.txt`),
-/// each module with its source (the stripped copy) and its import
-/// statements, which `mod.rs` includes as `BUNDLED_MODULES`.
-fn bundled(lib: &Path, dst: &Path) {
+/// `$OUT_DIR/bundled.rs` / `bundled_torch.rs`: the rows of the bundled
+/// library table (`lib/modules.txt`) of one package (`base`, `torch`), each
+/// module with its source (the stripped copy) and its import statements,
+/// which `mod.rs` includes as `BUNDLED_MODULES` / `TORCH_MODULES`.
+fn bundled(lib: &Path, only: &str, dst: &Path) {
     use pyimports::ImportStmt;
     use std::fmt::Write;
     let list = std::fs::read_to_string(lib.join("modules.txt")).expect("read lib/modules.txt");
@@ -43,6 +68,10 @@ fn bundled(lib: &Path, dst: &Path) {
         let [name, file, package] = fields[..] else {
             panic!("lib/modules.txt: expected `name file package`, got {line:?}");
         };
+        assert!(matches!(package, "base" | "torch"), "lib/modules.txt: unknown package {package:?}");
+        if package != only {
+            continue;
+        }
         let source = std::fs::read_to_string(lib.join(file)).unwrap_or_else(|e| panic!("lib/{file}: {e}"));
         // The import statements as one string: `;` between statements, a
         // statement `i|a.b,c` (`import a.b, c`) or `2|m|x,y` (`from ..m
