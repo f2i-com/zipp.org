@@ -43,7 +43,8 @@ test('WebGPU contract mock: pipelines are keyed by kernel, not by shape, and car
   for(const n of [65,1000,3])await rt.execute(graph(n,'relu'));
   await rt.execute({version:2,nodes:[{id:0,op:'full',shape:[5],value:1234.5},{id:1,op:'tanh',a:0}],outputs:[{name:'r',id:1}]});
   assert.equal(d.codes.length,2);assert.ok(d.codes.every(code=>!/\b(65|1000|1234\.5)u?\b/.test(code)));
-  assert.ok(d.codes.every(code=>code.includes('if (i >= P.n) { return; }')));assert.ok(d.codes.some(code=>code.includes('@workgroup_size(256)')));
+  // Every invocation stops at the tensor's end: one element, or (vectorised) four.
+  assert.ok(d.codes.every(code=>code.includes('if (i >= P.n) { return; }')||code.includes('if (i >= (P.n + 3u) / 4u) { return; }')));assert.ok(d.codes.some(code=>code.includes('@workgroup_size(256)')));
   rt.dispose();
 });
 test('WebGPU contract mock: storage buffers are pooled across executions',async()=>{
@@ -83,7 +84,10 @@ test('WebGPU contract mock: limit rejection happens before buffer creation',()=>
 });
 test('WebGPU contract mock: large element counts dispatch in two dimensions',async()=>{
   const d=fakeDevice();d.limits.maxComputeWorkgroupsPerDimension=4;const b=new WebGPUBackend(d),nodes=plan(2000);await b.begin();
-  const a=await b.run(nodes[0],[]);await b.run(nodes[1],[a]);assert.deepEqual(d.dispatches[0],[4,2,1]);b.dispose();
+  const a=await b.run(nodes[0],[]);await b.run(nodes[1],[a]);
+  // Vectorised: 2000 elements are 500 invocations, two workgroups.
+  assert.deepEqual(d.dispatches[0],[2,1,1]);
+  b.vectorize=false;await b.run(nodes[1],[a]);assert.deepEqual(d.dispatches[1],[4,2,1]);b.dispose();
 });
 test('WebGPU contract mock: lost device fails closed',async()=>{
   const d=fakeDevice(),b=new WebGPUBackend(d);b.lost='test loss';await assert.rejects(()=>b.begin(),e=>e.code==='DEVICE_LOST');b.dispose();

@@ -434,6 +434,7 @@ impl GpuHost {
             }
         }
         let count = steps.len() as f64;
+        let checked = std::time::Instant::now();
         let begun = self
             .state
             .call_slot(
@@ -469,6 +470,11 @@ impl GpuHost {
             }
         }
         let submitted = std::time::Instant::now();
+        {
+            let mut gpu = self.gpu.borrow_mut();
+            gpu.replay_phase(0, (checked - started).as_secs_f64() * 1000.0, true);
+            gpu.replay_phase(1, (submitted - checked).as_secs_f64() * 1000.0, false);
+        }
         let result = if patches.len() == steps.len() {
             self.gpu.borrow_mut().replay_run(token, &feeds, &patches)
         } else {
@@ -477,6 +483,7 @@ impl GpuHost {
                 "the replay's uniforms were not computed".into(),
             ))
         };
+        let ending = std::time::Instant::now();
         let ended = self.state.call_slot(
             self.end_slot,
             &[
@@ -505,6 +512,10 @@ impl GpuHost {
                 ]))
             }
         };
+        let replying = std::time::Instant::now();
+        self.gpu
+            .borrow_mut()
+            .replay_phase(7, (replying - ending).as_secs_f64() * 1000.0, false);
         let session_step = match ended.as_ref().ok().and_then(|v| field(v, "step")) {
             Some(HostValue::Number(n)) => *n,
             _ => first + count,
@@ -578,6 +589,9 @@ impl GpuHost {
             ("adapter".into(), HostValue::String(self.summary.describe())),
             ("replayed".into(), HostValue::Bool(true)),
         ]);
+        self.gpu
+            .borrow_mut()
+            .replay_phase(8, replying.elapsed().as_secs_f64() * 1000.0, false);
         Some(HostValue::Object(vec![
             ("ok".into(), HostValue::Bool(true)),
             (

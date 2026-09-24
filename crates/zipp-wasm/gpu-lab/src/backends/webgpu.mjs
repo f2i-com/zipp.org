@@ -71,15 +71,66 @@ fn tanh_s(x: f32) -> f32 {
 }`;
 // A binds as array<f32>; B:u32 binds the same buffer as raw words, which is
 // how a quantized weight arrives -- blocks, not values.
-const io = (inputs, outputs = ['O']) => inputs.map((name, i) => {
-  const [id, type = 'f32'] = name.split(':');
+const io = (inputs, outputs = ['O'], vec4 = false) => inputs.map((name, i) => {
+  const [id, type = vec4 ? 'vec4<f32>' : 'f32'] = name.split(':');
   return `@group(0) @binding(${i + 1}) var<storage, read> ${id}: array<${type}>;`;
-}).join('\n') + outputs.map((name, i) => `\n@group(0) @binding(${inputs.length + 1 + i}) var<storage, read_write> ${name}: array<f32>;`).join('');
+}).join('\n') + outputs.map((name, i) => `\n@group(0) @binding(${inputs.length + 1 + i}) var<storage, read_write> ${name}: array<${vec4 ? 'vec4<f32>' : 'f32'}>;`).join('');
 const each = body => `@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
   let i = flat(gid, nwg);
   if (i >= P.n) { return; }
   ${body}
+}`;
+/**
+ * The vectorised form of an elementwise kernel: one invocation per four
+ * consecutive elements, loaded and stored as vec4s through bindings sized to
+ * whole vec4s. Each lane runs the scalar kernel's own arithmetic (the same
+ * function on one f32), so every element's bits are the scalar kernel's; the
+ * lanes past the tensor's end compute on the buffer's padding (every buffer
+ * is a whole number of 256-byte blocks) and are never read.
+ */
+const each4 = body => `@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let i = flat(gid, nwg);
+  if (i >= (P.n + 3u) / 4u) { return; }
+  ${body}
+}`;
+const lanes = f => `vec4<f32>(${['x', 'y', 'z', 'w'].map(f).join(', ')})`;
+// The scalar kernels' per-element code as functions of one lane.
+const UNARY_LANE = `fn un(x: f32) -> f32 {
+  var r: f32;
+  switch P.op {
+    case 0u: { r = select(0.0, x, x > 0.0 || x != x); }
+    case 1u: { r = select(0.0, 1.0, x > 0.0); }
+    case 2u: { r = -x; }
+    case 3u: { r = exp(x); }
+    case 4u: { r = log(x); }
+    case 5u: { r = sqrt(x); }
+    case 6u: { r = tanh_s(x); }
+    case 7u: { let e = exp(-abs(x)); r = select(e / (1.0 + e), 1.0 / (1.0 + e), x >= 0.0); }
+    case 8u: { r = x * cdf(x); }
+    default: { r = cdf(x) + x * 0.3989422804014327 * exp(-0.5 * min(x * x, 200.0)); }
+  }
+  return r;
+}`;
+const OPTIM_LANE = `fn opt(a: f32, b: f32, c: f32) -> f32 {
+  var r: f32;
+  switch P.op {
+    case 0u: { r = a - P.f.x * b; }
+    case 1u: { r = P.f.x * a + P.f.y * b; }
+    case 2u: { let w = P.f.x; if (w < 0.5) { r = a + w * (b - a); } else { r = b - (b - a) * (1.0 - w); } }
+    case 3u: { r = a * P.f.x + P.f.y * b * b; }
+    default: { r = a - P.f.x * (b / (sqrt(c) / P.f.y + P.f.z)); }
+  }
+  return r;
+}`;
+// Adam's group on one lane: new (m, v, p) from a (m), g, vv (v) and p.
+const ADAM_LANE = `fn adam1(a: f32, g: f32, vv: f32, p: f32) -> vec3<f32> {
+  let w = bitcast<f32>(P.sb.x);
+  var m: f32;
+  if (w < 0.5) { m = a + w * (g - a); } else { m = g - (g - a) * (1.0 - w); }
+  let v = vv * bitcast<f32>(P.sb.y) + bitcast<f32>(P.sb.z) * g * g;
+  return vec3<f32>(m, v, p - P.f.x * (m / (sqrt(v) / P.f.y + P.f.z)));
 }`;
 const ROW_STATS = `let base = i * P.len;
   var m = A[base];
@@ -196,17 +247,27 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
   scale: [['A'], each('O[i] = A[i] / P.f.x;')],
   // Eight loads issued before their eight additions, which stay one at a
   // time in ascending j: the same sum, without a memory round trip per term.
-  reduce: [['A'], each(`let inner = P.g.x; let base = (i / inner) * P.len * inner + i % inner;
+  // 64 invocations a workgroup: a sum over few outputs still spreads over
+  // many of the GPU's cores (each output's additions stay in one invocation).
+  reduce: [['A'], `@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let i = gid.x + gid.y * nwg.x * 64u;
+  if (i >= P.n) { return; }
+  let inner = P.g.x; let base = (i / inner) * P.len * inner + i % inner;
   var s = 0.0;
   var j = 0u;
-  for (; j + 8u <= P.len; j = j + 8u) {
+  for (; j + 16u <= P.len; j = j + 16u) {
     let at = base + j * inner;
     let v0 = A[at]; let v1 = A[at + inner]; let v2 = A[at + 2u * inner]; let v3 = A[at + 3u * inner];
     let v4 = A[at + 4u * inner]; let v5 = A[at + 5u * inner]; let v6 = A[at + 6u * inner]; let v7 = A[at + 7u * inner];
+    let v8 = A[at + 8u * inner]; let v9 = A[at + 9u * inner]; let v10 = A[at + 10u * inner]; let v11 = A[at + 11u * inner];
+    let v12 = A[at + 12u * inner]; let v13 = A[at + 13u * inner]; let v14 = A[at + 14u * inner]; let v15 = A[at + 15u * inner];
     s = s + v0; s = s + v1; s = s + v2; s = s + v3; s = s + v4; s = s + v5; s = s + v6; s = s + v7;
+    s = s + v8; s = s + v9; s = s + v10; s = s + v11; s = s + v12; s = s + v13; s = s + v14; s = s + v15;
   }
   for (; j < P.len; j = j + 1u) { s = s + A[base + j * inner]; }
-  O[i] = select(s, s / f32(P.len), P.mode == 1u);`)],
+  O[i] = select(s, s / f32(P.len), P.mode == 1u);
+}`, ['O'], {threads: 64}],
   softmax: [['A'], each(`${ROW_STATS}
   if (P.mode == 1u) { let ls = log(s); for (var j = 0u; j < P.len; j = j + 1u) { O[base + j] = (A[base + j] - m) - ls; } }
   else { for (var j = 0u; j < P.len; j = j + 1u) { O[base + j] = exp(A[base + j] - m) / s; } }`)],
@@ -714,9 +775,30 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   ${rows.flatMap(i => cols.map(j => `{ let r = row0 + ${row(i)}; let c = col0 + ${col(j)}; if (r < M && c < N) { O[outBase + r * N + c] = c${i}_${j}; } }`)).join('\n  ')}
 }`];
 }
+// Vectorised elementwise kernels (`each4`): { vec4: true } marks their
+// bindings as vec4 arrays sized to whole vec4s.
+const VEC4 = {vec4: true};
+Object.assign(KERNELS, {
+  fill4: [[], each4('O[i] = vec4<f32>(P.f.x);'), ['O'], VEC4],
+  unary4: [['A'], `${UNARY_LANE}\n${each4(`let x = A[i]; O[i] = ${lanes(c => `un(x.${c})`)};`)}`, ['O'], VEC4],
+  // Modes 0 (same shape), 1 (a is a scalar), 2 (b is a scalar).
+  binary4: [['A', 'B'], each4(`var a: vec4<f32>; var b: vec4<f32>;
+  if (P.mode == 1u) { a = vec4<f32>(A[0].x); } else { a = A[i]; }
+  if (P.mode == 2u) { b = vec4<f32>(B[0].x); } else { b = B[i]; }
+  O[i] = ${lanes(c => `binop(P.op, a.${c}, b.${c})`)};`), ['O'], VEC4],
+  optim4: [['A', 'B', 'C'], `${OPTIM_LANE}\n${each4(`let a = A[i]; let b = B[i]; let c = C[i]; O[i] = ${lanes(k => `opt(a.${k}, b.${k}, c.${k})`)};`)}`, ['O'], VEC4],
+  adam4: [['W', 'Mi', 'Vi', 'G'], `${ADAM_LANE}\n${each4(`let a = Mi[i]; let g = G[i]; let vv = Vi[i]; let p = W[i];
+  let x = adam1(a.x, g.x, vv.x, p.x); let y = adam1(a.y, g.y, vv.y, p.y); let z = adam1(a.z, g.z, vv.z, p.z); let w = adam1(a.w, g.w, vv.w, p.w);
+  O[i] = vec4<f32>(x.x, y.x, z.x, w.x); O2[i] = vec4<f32>(x.y, y.y, z.y, w.y); O3[i] = vec4<f32>(x.z, y.z, z.z, w.z);`)}`, ['O', 'O2', 'O3'], VEC4],
+  adam_inplace4: [['G'], `${ADAM_LANE}\n${each4(`let a = O[i]; let g = G[i]; let vv = O2[i]; let p = O3[i];
+  let x = adam1(a.x, g.x, vv.x, p.x); let y = adam1(a.y, g.y, vv.y, p.y); let z = adam1(a.z, g.z, vv.z, p.z); let w = adam1(a.w, g.w, vv.w, p.w);
+  O[i] = vec4<f32>(x.x, y.x, z.x, w.x); O2[i] = vec4<f32>(x.y, y.y, z.y, w.y); O3[i] = vec4<f32>(x.z, y.z, z.z, w.z);`)}`, ['O', 'O2', 'O3'], VEC4],
+});
 // Register-blocked variants of the four float matmul kernels: `_r4`, 64x64
-// tiles, 16 deep. (128x128 tiles measured no faster, and Direct3D's FXC takes
-// minutes over their 64 accumulators.) See `tileFor` for which a product uses.
+// tiles, 16 deep. (128x128 tiles, and double-buffered k-slices loaded into
+// registers while the last is multiplied, measured no faster on an RTX 5090:
+// 30-34 TFLOP/s all; and Direct3D's FXC takes minutes over 64 accumulators.)
+// See `tileFor` for which a product uses.
 for (const transposed of [false, true])
   for (const split of [false, true])
     KERNELS[`matmul${transposed ? '_t' : ''}${split ? '_split' : ''}_r4`] = tiledMatmul(4, 4, 16, transposed, split);
@@ -764,6 +846,9 @@ export class WebGPUBackend {
     this.pipelines = new Map(); this.lost = null; this.scopeOpen = false; this.matmulTile = null;
     // Adam groups in one pass (`adam`); false keeps three (tests compare the bits).
     this.fuseAdam = true;
+    // Elementwise kernels four elements an invocation (`each4`); false keeps
+    // the one-element kernels (tests compare the bits).
+    this.vectorize = true;
     // Idle bytes kept for reuse; a host with device memory to spare raises it.
     this.poolBytes = POOL_BYTES;
     // Idle buffers are free across executions; recycled ones were freed during the
@@ -825,15 +910,15 @@ export class WebGPUBackend {
   async pipeline(name) {
     let entry = this.pipelines.get(name);
     if (!entry) {
-      const [inputs, body, outputs = ['O']] = KERNELS[name];
+      const [inputs, body, outputs = ['O'], options = {}] = KERNELS[name];
       const layout = this.device.createBindGroupLayout({entries: [
         {binding: 0, visibility: COMPUTE(), buffer: {type: 'uniform', hasDynamicOffset: true}},
         ...inputs.map((_, i) => ({binding: i + 1, visibility: COMPUTE(), buffer: {type: 'read-only-storage'}})),
         ...outputs.map((_, i) => ({binding: inputs.length + 1 + i, visibility: COMPUTE(), buffer: {type: 'storage'}}))]});
-      const module = this.device.createShaderModule({code: `${PRELUDE}\n${io(inputs, outputs)}\n${body}`});
+      const module = this.device.createShaderModule({code: `${PRELUDE}\n${io(inputs, outputs, options.vec4)}\n${body}`});
       const pipeline = await this.device.createComputePipelineAsync({label: name, layout: this.device.createPipelineLayout({bindGroupLayouts: [layout]}),
         compute: {module, entryPoint: 'main'}});
-      entry = {pipeline, layout}; this.pipelines.set(name, entry);
+      entry = {pipeline, layout, vec4: !!options.vec4, threads: options.threads ?? 256}; this.pipelines.set(name, entry);
     }
     return entry;
   }
@@ -873,25 +958,26 @@ export class WebGPUBackend {
     return offset;
   }
   /** Bind groups are cached by kernel and storage buffers: fixed buffers (a session's) never rebuild one. */
-  bindGroup(kernel, layout, handles) {
+  bindGroup(kernel, layout, handles, vec4 = false) {
     let key = kernel;
     for (const h of handles) key += h.key ??= `|${this.idOf(h.buffer)}:${h.size}`;
     let group = this.groups.get(key);
     if (!group) {
       if (this.groups.size >= GROUP_CACHE) this.groups.clear();
+      // A vec4 kernel binds whole vec4s (within the buffer's 256-byte blocks).
       group = this.device.createBindGroup({layout, entries: [{binding: 0, resource: {buffer: this.uniformBuffer, offset: 0, size: 96}},
-        ...handles.map((h, i) => ({binding: i + 1, resource: {buffer: h.buffer, size: h.size * 4}}))]});
+        ...handles.map((h, i) => ({binding: i + 1, resource: {buffer: h.buffer, size: vec4 ? Math.ceil(h.size / 4) * 16 : h.size * 4}}))]});
       this.groups.set(key, group);
     }
     return group;
   }
   async dispatch(kernel, fill, inputs, out, count, groups = null) {
     this.live();
-    const {pipeline, layout} = this.pipelines.get(kernel) ?? await this.pipeline(kernel), limit = this.device.limits.maxComputeWorkgroupsPerDimension;
-    let [x, y, z] = groups ?? [Math.ceil(count / 256), 1, 1];
+    const {pipeline, layout, vec4, threads} = this.pipelines.get(kernel) ?? await this.pipeline(kernel), limit = this.device.limits.maxComputeWorkgroupsPerDimension;
+    let [x, y, z] = groups ?? [Math.ceil((vec4 ? Math.ceil(count / 4) : count) / threads), 1, 1];
     if (!groups && x > limit) { y = Math.ceil(x / limit); x = limit; }
     check(x <= limit && y <= limit && z <= limit, 'LIMIT', 'Dispatch exceeds WebGPU workgroup limit');
-    const offset = this.uniform(fill), group = this.bindGroup(kernel, layout, [...inputs, ...(Array.isArray(out) ? out : [out])]);
+    const offset = this.uniform(fill), group = this.bindGroup(kernel, layout, [...inputs, ...(Array.isArray(out) ? out : [out])], vec4);
     if (!this.encoder) this.encoder = this.device.createCommandEncoder();
     if (!this.pass) this.pass = this.encoder.beginComputePass();
     this.pass.setPipeline(pipeline); this.pass.setBindGroup(0, group, [offset]); this.pass.dispatchWorkgroups(x, y, z);
@@ -909,8 +995,9 @@ export class WebGPUBackend {
     let scoped = this.debug;
     if (scoped) this.device.pushErrorScope('validation');
     try {
-      if (inPlace) await this.dispatch('adam_inplace', fill, [g], outs, u.size);
-      else await this.dispatch('adam', fill, [p, mIn, vIn, g], outs, u.size);
+      const v4 = this.vectorize ? '4' : '';
+      if (inPlace) await this.dispatch(`adam_inplace${v4}`, fill, [g], outs, u.size);
+      else await this.dispatch(`adam${v4}`, fill, [p, mIn, vIn, g], outs, u.size);
       if (scoped) {
         scoped = false;
         const error = await this.device.popErrorScope();
@@ -954,14 +1041,14 @@ export class WebGPUBackend {
     if (scoped) this.device.pushErrorScope('validation');
     try {
       switch (n.op) {
-        case 'full': await this.dispatch('fill', (u, f) => {u[0] = n.size; f[20] = n.value;}, [], out, n.size); break;
+        case 'full': await this.dispatch(this.vectorize ? 'fill4' : 'fill', (u, f) => {u[0] = n.size; f[20] = n.value;}, [], out, n.size); break;
         case 'add': case 'sub': case 'mul': case 'div': case 'maximum': case 'minimum':
         case 'eq': case 'ne': case 'lt': case 'le': case 'gt': case 'ge':
-          await this.dispatch('binary', u => {u[0] = n.size; u[1] = MODE[n.mode]; u[2] = BINARY[n.op];
+          await this.dispatch(this.vectorize && n.mode !== 'general' ? 'binary4' : 'binary', u => {u[0] = n.size; u[1] = MODE[n.mode]; u[2] = BINARY[n.op];
             if (n.mode === 'general') {u.set(n.dims, 4); u.set(n.aStrides, 8); u.set(n.bStrides, 12);}}, refs, out, n.size); break;
         case 'relu': case 'positive': case 'neg': case 'exp': case 'log': case 'sqrt':
         case 'tanh': case 'sigmoid': case 'gelu': case 'gelu_grad':
-          await this.dispatch('unary', u => {u[0] = n.size; u[2] = UNARY[n.op];}, refs, out, n.size); break;
+          await this.dispatch(this.vectorize ? 'unary4' : 'unary', u => {u[0] = n.size; u[2] = UNARY[n.op];}, refs, out, n.size); break;
         case 'where':
           await this.dispatch('where', u => {u[0] = n.size; u[1] = n.mode === 'same' ? 0 : 3;
             u.set(n.dims, 4); u.set(n.cStrides, 8); u.set(n.aStrides, 12); u.set(n.bStrides, 16);}, refs, out, n.size); break;
@@ -1044,7 +1131,7 @@ export class WebGPUBackend {
         case 'sgd_update': case 'momentum_update': case 'adam_m': case 'adam_v': case 'adam_update': {
           const scalars = {sgd_update: [n.lr], momentum_update: [n.momentum, n.w], adam_m: [n.w], adam_v: [n.beta2, n.w],
             adam_update: [n.stepSize, n.bc2Sqrt, n.eps]}[n.op];
-          await this.dispatch('optim', (u, f) => {u[0] = n.size; u[2] = OPTIM[n.op]; f.set(scalars, 20);},
+          await this.dispatch(this.vectorize ? 'optim4' : 'optim', (u, f) => {u[0] = n.size; u[2] = OPTIM[n.op]; f.set(scalars, 20);},
             [refs[0], refs[1], refs[2] ?? refs[1]], out, n.size); break;
         }
         case 'life': await this.dispatch('life', u => {u[0] = n.size; u[16] = n.shape[0]; u[17] = n.shape[1];}, refs, out, n.size); break;

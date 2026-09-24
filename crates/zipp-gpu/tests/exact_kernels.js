@@ -123,3 +123,77 @@ async function exactAdam(M) {
   }
   return {failures, report};
 }
+
+// The vectorised elementwise kernels (four elements an invocation) against
+// the one-element kernels on the same device, bit for bit: every unary and
+// binary operation (same shape and either side a scalar), fills, the
+// optimizer updates and Adam's fused pass, over sizes that end mid-vec4.
+async function exactVectorised(M) {
+  const limits = {maxElements: 1 << 26, maxInputElements: 1 << 26, maxOutputElements: 1 << 26, maxWork: Number.MAX_SAFE_INTEGER, maxLogicalBytes: 8 * 1024 * 1024 * 1024};
+  let seed = 4242;
+  const rnd = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296;
+  const data = (n, positive) => Float32Array.from({length: n}, () => {
+    const r = rnd(); const v = r < 0.05 ? (r < 0.025 ? -0 : 0) : (rnd() - 0.5) * (r < 0.15 ? 60 : 8);
+    return positive ? Math.abs(v) + 0.25 : v;
+  });
+  const unary = ['relu', 'positive', 'neg', 'exp', 'log', 'sqrt', 'tanh', 'sigmoid', 'gelu', 'gelu_grad'];
+  const binary = ['add', 'sub', 'mul', 'div', 'maximum', 'minimum', 'eq', 'ne', 'lt', 'le', 'gt', 'ge'];
+  const report = [];
+  let failures = 0;
+  for (const shape of [[1], [3], [5], [8], [1023], [97, 1031]]) {
+    const n = shape.reduce((a, b) => a * b, 1);
+    const nodes = [{id: 0, op: 'input', shape, data: data(n)}, {id: 1, op: 'input', shape, data: data(n).map(v => v === 0 ? 0.5 : v)},
+      {id: 2, op: 'input', shape, data: data(n, true)}, {id: 3, op: 'input', shape: [], data: [1.75]}, {id: 4, op: 'input', shape, data: data(n, true)}];
+    const outputs = [], add = node => { node.id = nodes.length; nodes.push(node); outputs.push({name: 'o' + node.id, id: node.id}); };
+    for (const op of unary) add({op, a: ['log', 'sqrt'].includes(op) ? 2 : 0});
+    // Input 1 has no zeros (it divides); 0 has signed zeros (it never does).
+    for (const op of binary) { add({op, a: 0, b: 1}); add({op, a: 3, b: op === 'div' ? 1 : 0}); add({op, a: 0, b: 3}); }
+    add({op: 'full', shape, value: -0.375});
+    add({op: 'sgd_update', a: 0, b: 1, lr: 0.01});
+    add({op: 'momentum_update', a: 0, b: 1, momentum: 0.9, dampening: 0.1});
+    add({op: 'adam_m', a: 0, b: 1, beta1: 0.9});
+    add({op: 'adam_v', a: 4, b: 1, beta2: 0.999});
+    add({op: 'adam_update', a: 0, b: 1, c: 4, lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8, step: 3});
+    const bits = {};
+    for (const vectorize of [true, false]) {
+      const rt = await M.createRuntime({backend: 'webgpu', limits});
+      rt.impl.vectorize = vectorize;
+      const chunks = [];
+      for (let k = 0; k < outputs.length; k += 60) {
+        const out = await rt.execute({version: 3, nodes, outputs: outputs.slice(k, k + 60)}, {typedOutputs: true});
+        for (const o of outputs.slice(k, k + 60)) chunks.push(new Uint32Array(out.outputs[o.name].data.buffer.slice(0)));
+      }
+      rt.dispose();
+      bits[vectorize] = chunks;
+    }
+    let diff = 0;
+    bits[true].forEach((a, i) => { const b = bits[false][i]; for (let j = 0; j < a.length; j++) if (a[j] !== b[j]) diff++; });
+    if (diff) failures++;
+    report.push({n, outputs: outputs.length, diff});
+  }
+  // Adam's fused pass (in place in a session, fresh buffers in an execute).
+  for (const [sizes, batch] of [[[784, 64, 10], 32], [[30, 17, 5], 7]]) {
+    const out = {};
+    for (const vectorize of [true, false]) {
+      const rt = await M.createRuntime({backend: 'webgpu', limits});
+      rt.impl.vectorize = vectorize;
+      const spec = M.mlpSessionProgram({sizes, batch, lr: 0.01}), rnd2 = M.seeded(3);
+      const feeds = Array.from({length: 4}, () => ({inputs: {0: Float32Array.from({length: batch * sizes[0]}, () => rnd2(0, 1)),
+        1: Float32Array.from({length: batch}, () => Math.floor(rnd2(0, sizes[sizes.length - 1])))}}));
+      const s = await rt.prepare(spec.program, {resident: spec.resident});
+      const losses = [];
+      for (const r of (await s.run(feeds, {readback: ['loss']})).steps) losses.push(...r.outputs.loss.data);
+      const params = (await s.download(spec.resident)).outputs;
+      s.dispose();
+      const executed = (await rt.execute(M.mlpTrainingStep({sizes, batch, lr: 0.01, step: 3}).program, {typedOutputs: true})).outputs;
+      rt.dispose();
+      const b = a => Array.from(new Uint32Array(Float32Array.from(a).buffer));
+      out[vectorize] = [b(losses), ...Object.keys(params).sort().map(k => b(params[k].data)), ...Object.keys(executed).sort().map(k => b(executed[k].data))];
+    }
+    let diff = 0;
+    out[true].forEach((a, i) => { for (let j = 0; j < a.length; j++) if (a[j] !== out[false][i][j]) diff++; });
+    if (diff) failures++;
+    report.push({sizes, batch, diff});
+  }
+  return {failures, report};
+}

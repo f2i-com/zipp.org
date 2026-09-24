@@ -242,17 +242,23 @@ fn accelerated_readback_check_matches_gpu_labs() {
 /// transposed and split-K shapes), the unrolled axis sum and the
 /// row-per-workgroup index_add equal cpu-js bit for bit, and Adam's fused
 /// pass (in place in a session, out of place in an execute) equals its three
-/// separate kernels bit for bit (`tests/exact_kernels.js`).
+/// separate kernels bit for bit, and the vectorised elementwise kernels equal
+/// the one-element ones bit for bit (`tests/exact_kernels.js`).
 #[test]
 fn faster_kernels_are_bit_identical() {
     on_big_stack(|| {
         let Some(mut host) = open() else { return };
         host.eval(concat!(
             include_str!("exact_kernels.js"),
-            "\nglobalThis.exactMatmulTiles = exactMatmulTiles; globalThis.exactReductions = exactReductions; globalThis.exactAdam = exactAdam; null"
+            "\nglobalThis.exactMatmulTiles = exactMatmulTiles; globalThis.exactReductions = exactReductions; globalThis.exactAdam = exactAdam; globalThis.exactVectorised = exactVectorised; null"
         ))
         .expect("checks");
-        for check in ["exactMatmulTiles", "exactReductions", "exactAdam"] {
+        for check in [
+            "exactMatmulTiles",
+            "exactReductions",
+            "exactAdam",
+            "exactVectorised",
+        ] {
             let json = run_json(
                 &mut host,
                 &format!("{check}(Object.assign({{}}, __zgpuModules['src/runtime.mjs'], __zgpuModules['tests/ml-cases.mjs']))"),

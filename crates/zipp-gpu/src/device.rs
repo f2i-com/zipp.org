@@ -340,6 +340,34 @@ struct Profile {
     /// buffer, the query set and each dispatch's (start, end, label).
     timed: HashMap<u32, Timed>,
     timestamps: bool,
+    /// Native replays: runs, and ms per phase (see [`REPLAY_PHASES`]).
+    replays: u64,
+    replay_ms: [f64; REPLAY_PHASES.len()],
+}
+
+/// The phases of a replayed run the profile times.
+pub(crate) const REPLAY_PHASES: [&str; 9] = [
+    "check feeds",
+    "begin (JS)",
+    "write feeds+uniforms",
+    "encode",
+    "submit",
+    "wait for the GPU",
+    "read back",
+    "end (JS)",
+    "build reply",
+];
+
+impl WebGpu {
+    /// Adds `ms` to replay phase `phase` (`ZIPP_GPU_PROFILE`); `run` counts a run.
+    pub(crate) fn replay_phase(&mut self, phase: usize, ms: f64, run: bool) {
+        if let Some(p) = self.profile.as_mut() {
+            p.replay_ms[phase] += ms;
+            if run {
+                p.replays += 1;
+            }
+        }
+    }
 }
 
 impl Drop for WebGpu {
@@ -353,6 +381,12 @@ impl Drop for WebGpu {
             );
             for (kind, (count, ms)) in rows {
                 eprintln!("  {kind:<22} {count:>8} calls {ms:>10.1} ms");
+            }
+            if p.replays > 0 {
+                eprintln!("zipp-gpu replays: {} runs, per run:", p.replays);
+                for (name, ms) in REPLAY_PHASES.iter().zip(p.replay_ms) {
+                    eprintln!("  {name:<22} {:>10.1} us", ms * 1000.0 / p.replays as f64);
+                }
             }
             if !p.kernels.is_empty() {
                 let mut rows: Vec<_> = p.kernels.iter().collect();

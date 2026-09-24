@@ -299,7 +299,7 @@ medians over 15 calls, 7 runs for the eight-step row):
 | WebGPU | 74.4 ms | 5.1 ms | 1.84 ms |
 | WebGL2 | 88.8 ms | 3.3 ms | 2.24 ms |
 | WebAssembly | 73.7 ms | 4.9 ms | 3.63 ms |
-| Native Zipp, WebGPU over wgpu/Vulkan | ≈26 ms | ≈1.0 ms | ≈0.5 ms |
+| Native Zipp, WebGPU over wgpu/Vulkan | ≈26 ms | ≈0.55 ms | ≈0.3 ms |
 
 Of a `compiled()` call about 34 ms is the guest recording and validating the
 step (every input storage is scanned for finiteness in the interpreter), the
@@ -446,9 +446,9 @@ machine, treat as ±30%):
 
 | Model | `compiled()` per call | `prepared.step` | `prepared.steps`, 8 per run, per step | CPU evaluator, `compiled()` |
 |---|---|---|---|---|
-| 784-256-10, batch 64, Adam | ≈26 ms | ≈1.0 ms | ≈0.5 ms | ≈2.9-4.8 s |
-| 784-1024-1024-10, batch 256, Adam | ≈120 ms | ≈2 ms | ≈1.2 ms | 118 s |
-| 784-2048-2048-10, batch 1024, Adam | ≈400 ms | ≈5 ms | ≈4 ms | 1,487 s |
+| 784-256-10, batch 64, Adam | ≈26 ms | ≈0.55 ms | ≈0.3 ms | ≈2.9-4.8 s |
+| 784-1024-1024-10, batch 256, Adam | ≈120 ms | ≈1.4 ms | ≈1.0 ms | 118 s |
+| 784-2048-2048-10, batch 1024, Adam | ≈400 ms | ≈3.7 ms | ≈3.2 ms | 1,487 s |
 
 Once a prepared session has run a step, the native host replays that step's
 recorded commands itself: it writes each batch straight from the program to
@@ -456,7 +456,11 @@ the device, patches the few step-dependent values gpu-lab computes, and reads
 back only the result. The results are gpu-lab's own steps bit for bit
 (`ZIPP_GPU_REPLAY=0` turns replay off). Adam updates each parameter in one
 pass, in place in a prepared session, with each element's arithmetic
-unchanged. Float matmuls at least 64x64 with enough output tiles run a
+unchanged. Elementwise kernels, the optimizer updates and Adam's pass read and
+write four values at a time, each computed as before. After a session's first
+step, a `prepared.step` on the native GPU builds its request from what every
+step shares; the host checks each fed value as the full path does, and a value
+it refuses gets that path's own error. Float matmuls at least 64x64 with enough output tiles run a
 register-blocked 64x64 tile (27-35 TFLOP/s on a 4096² product, against about 5
 for the 16x16 kernel), with the same bits. Direct3D 12 compiles with DXC when a
 `dxcompiler.dll` is next to `zipp` or on PATH; with the system's FXC it keeps
@@ -471,17 +475,18 @@ batches; ms per step; `crates/zipp-cli/tests/native_gpu/bench_vs_torch.py`):
 
 | Case | PyTorch CUDA eager | PyTorch CUDA graph | Zipp `prepared.step` / 8 per run | Zipp in Chrome (WebGPU) / 8 per run |
 |---|---|---|---|---|
-| 784-256-10, batch 64, Adam | 0.70 | 0.20 | 1.05 / 0.52 | 2.9 / 0.71 |
-| 784-1024-1024-10, batch 256 | 0.96 | 0.33 | 2.1 / 1.2 | 3.9 / 1.7 |
-| 784-2048-2048-10, batch 1024 | 1.31 | 0.93 | 4.8 / 3.8 | 6.7 / 9.0 |
-| 2048² matmul x4, inference | 1.31 (TF32 0.90) | – | 3.0 / 2.7 | 3.5 / 3.3 |
-| 4096² matmul x4, inference | 10.9 (TF32 6.0) | – | 19.7 / 19.3 | 25 / 24 |
-| Embedding 8192x128 + gather NLL | 1.11 | 0.31 | 1.6 / 1.2 | 2.6 / 0.46 |
+| 784-256-10, batch 64, Adam | 0.70 | 0.20 | 0.53 / 0.28 | 2.9 / 0.71 |
+| 784-1024-1024-10, batch 256 | 0.96 | 0.33 | 1.33 / 0.99 | 3.9 / 1.7 |
+| 784-2048-2048-10, batch 1024 | 1.31 | 0.93 | 3.69 / 3.15 | 6.7 / 9.0 |
+| 2048² matmul x4, inference | 1.31 (TF32 0.90) | – | 2.73 / 2.59 | 3.5 / 3.3 |
+| 4096² matmul x4, inference | 10.9 (TF32 6.0) | – | 20.4 / 21.2 | 25 / 24 |
+| Embedding 8192x128 + gather NLL | 1.11 | 0.31 | 0.61 / 0.34 | 2.6 / 0.46 |
 
-Losses agree within 1.4e-7 (small MLP) and 3.1e-5 (medium). On a small model
-Zipp's GPU work is as fast as a CUDA graph (0.18 ms per step) and eight
-replayed steps cost about 0.5 ms each; a single step still spends about 0.6 ms
-in Python. On large
+Losses agree within 1.4e-7 (small MLP) and 3.1e-5 (medium). A single step of
+the small MLP or the embedding model is now faster than PyTorch's eager CUDA
+(0.53 vs about 0.75 ms, 0.61 vs 1.2 ms); a CUDA graph is still about three
+times faster, because Zipp's step is launch-bound (about 45 small dispatches,
+0.13 ms of GPU time) and spends about 0.15 ms in Python. On large
 ones the gap is matmul throughput: fp32 without tensor cores. torch.compile's
 default backend needs triton, which is unavailable on Windows.
 

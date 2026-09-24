@@ -83,8 +83,61 @@ pub(crate) struct Replay {
     /// Bytes one step reads back.
     step_bytes: u64,
     staging: Option<(wgpu::Buffer, u64)>,
+    /// Bumped when the read-back buffer is replaced.
+    staging_generation: u64,
+    /// The next run's first step, encoded ahead (with the read-back
+    /// buffer's generation it copies into).
+    ready: Option<(wgpu::CommandBuffer, u64)>,
     /// Buffers this replay made (kept alive with it).
     _owned: Vec<wgpu::Buffer>,
+}
+
+impl Replay {
+    /// One step's commands: the recorded passes and copies, then its
+    /// read-backs into the staging buffer at step `s`'s offset.
+    fn encode(&self, device: &wgpu::Device, s: u64) -> wgpu::CommandBuffer {
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        for op in &self.ops {
+            match op {
+                Op::Pass(list) => {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    for p in list {
+                        match p {
+                            PassOp::Pipeline(pipeline) => pass.set_pipeline(pipeline),
+                            PassOp::Group(index, group, offsets) => {
+                                pass.set_bind_group(*index, group, &offsets[..])
+                            }
+                            PassOp::Dispatch(x, y, z) => pass.dispatch_workgroups(*x, *y, *z),
+                        }
+                    }
+                }
+                Op::Copy {
+                    src,
+                    src_offset,
+                    dst,
+                    dst_offset,
+                    size,
+                } => encoder.copy_buffer_to_buffer(src, *src_offset, dst, *dst_offset, Some(*size)),
+            }
+        }
+        if let Some((staging, _)) = &self.staging {
+            let base = s * self.step_bytes;
+            for o in &self.outputs {
+                encoder.copy_buffer_to_buffer(
+                    &o.buffer,
+                    0,
+                    staging,
+                    base + o.offset,
+                    Some(o.size as u64 * 4),
+                );
+            }
+        }
+        encoder.finish()
+    }
 }
 
 /// Why a replay failed after device work began: `(code, message)`.
@@ -348,6 +401,8 @@ impl WebGpu {
             outputs,
             step_bytes,
             staging: None,
+            staging_generation: 0,
+            ready: None,
             _owned: owned,
         })
     }
@@ -372,6 +427,7 @@ impl WebGpu {
         let total = replay.step_bytes * steps;
         if total > 0 && replay.staging.as_ref().is_none_or(|s| s.1 < total) {
             let size = total.max(4096);
+            replay.staging_generation += 1;
             replay.staging = Some((
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("zipp-gpu replay read-back"),
@@ -385,7 +441,9 @@ impl WebGpu {
         let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut uniforms = replay.template.clone();
+        let mut phase = [0.0f64; 3];
         for (s, step) in feeds.iter().enumerate() {
+            let t0 = std::time::Instant::now();
             for (feed, bytes) in replay.feeds.iter().zip(step) {
                 queue.write_buffer(&feed.buffer, 0, bytes);
             }
@@ -396,54 +454,30 @@ impl WebGpu {
                 }
             }
             queue.write_buffer(&replay.uniform, 0, &uniforms);
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            for op in &replay.ops {
-                match op {
-                    Op::Pass(list) => {
-                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: None,
-                            timestamp_writes: None,
-                        });
-                        for p in list {
-                            match p {
-                                PassOp::Pipeline(pipeline) => pass.set_pipeline(pipeline),
-                                PassOp::Group(index, group, offsets) => {
-                                    pass.set_bind_group(*index, group, &offsets[..])
-                                }
-                                PassOp::Dispatch(x, y, z) => pass.dispatch_workgroups(*x, *y, *z),
-                            }
-                        }
-                    }
-                    Op::Copy {
-                        src,
-                        src_offset,
-                        dst,
-                        dst_offset,
-                        size,
-                    } => encoder.copy_buffer_to_buffer(
-                        src,
-                        *src_offset,
-                        dst,
-                        *dst_offset,
-                        Some(*size),
-                    ),
+            let t1 = std::time::Instant::now();
+            phase[0] += (t1 - t0).as_secs_f64() * 1000.0;
+            // The first step's commands were encoded while the last run's
+            // were executing, unless the read-back buffer has changed since.
+            let commands = match replay.ready.take() {
+                Some((commands, generation))
+                    if s == 0 && generation == replay.staging_generation =>
+                {
+                    commands
                 }
-            }
-            if let Some((staging, _)) = &replay.staging {
-                let base = s as u64 * replay.step_bytes;
-                for o in &replay.outputs {
-                    encoder.copy_buffer_to_buffer(
-                        &o.buffer,
-                        0,
-                        staging,
-                        base + o.offset,
-                        Some(o.size as u64 * 4),
-                    );
-                }
-            }
-            queue.submit([encoder.finish()]);
+                _ => replay.encode(&device, s as u64),
+            };
+            let t2 = std::time::Instant::now();
+            phase[1] += (t2 - t1).as_secs_f64() * 1000.0;
+            queue.submit([commands]);
+            phase[2] += t2.elapsed().as_secs_f64() * 1000.0;
         }
+        // The next run's first step, encoded while this one executes (a
+        // command buffer is single-use; its commands are the same every step).
+        let t3 = std::time::Instant::now();
+        replay.ready = Some((replay.encode(&device, 0), replay.staging_generation));
+        phase[1] += t3.elapsed().as_secs_f64() * 1000.0;
+        let waited = std::time::Instant::now();
+        let mut wait_ms = 0.0;
         let mut values = Vec::with_capacity(feeds.len());
         let mapped = if let (Some((staging, _)), true) = (&replay.staging, total > 0) {
             let slice = staging.slice(0..total);
@@ -455,6 +489,7 @@ impl WebGpu {
             device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .map_err(|e| gpu_error(e.to_string()))?;
+            wait_ms = waited.elapsed().as_secs_f64() * 1000.0;
             let result = outcome.lock().unwrap().take();
             match result {
                 Some(Ok(())) => {
@@ -489,6 +524,16 @@ impl WebGpu {
             pollster::block_on(memory.pop()),
         ];
         let device_id = replay.device_id;
+        let read_ms = waited.elapsed().as_secs_f64() * 1000.0 - wait_ms;
+        for (i, ms) in [
+            (2, phase[0]),
+            (3, phase[1]),
+            (4, phase[2]),
+            (5, wait_ms),
+            (6, read_ms),
+        ] {
+            self.replay_phase(i, ms, false);
+        }
         if let Some(error) = errors.into_iter().flatten().next() {
             return Err(gpu_error(error_text(&error)));
         }

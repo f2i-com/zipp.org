@@ -1834,13 +1834,18 @@ class Session:
         if not self._native_ran and self._requested != "webgpu":
             self._leave_native()
             return None
+        raise self._native_error(error)
+
+    def _native_error(self, error):
+        """A failed native run's error, as the CPU evaluator would raise it
+        (poisoning the session when device work had begun)."""
         code = error.get("code", "GPU")
         # The CPU evaluator's own words for the one failure both can report.
         message = "Output contains non-finite values" if code == "NUMBER" else error.get("message", "GPU request failed")
         exc = ComputeError(code, message)
         if error.get("poisoned"):
             self._failed = _poisoned(exc)
-        raise exc
+        return exc
 
     def _leave_native(self):
         """Release the device session; the CPU session takes over from `_values`."""

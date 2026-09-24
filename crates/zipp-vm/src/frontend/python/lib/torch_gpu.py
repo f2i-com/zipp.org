@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn.functional as _F
 import _zipp_tensor as _k
-from zipp_gpu import Graph, ComputeError, _f32
+from zipp_gpu import Graph, ComputeError, _f32, _host_data, _native
 
 _active = None
 # Parameters held by a live prepared session, by id: while one holds a
@@ -86,6 +86,51 @@ def _optimizer_configuration(optimizer, kind):
 
 
 _SCALAR_TYPES = (int, float, bool)
+
+
+def _optimizer_unchanged(optimizer, kind, snapshot):
+    """Whether `_optimizer_configuration(optimizer, kind) == snapshot`, compared
+    in place, as a prepared step checks it every step. False where the
+    snapshot's own types or form differ (the caller's full comparison then
+    decides, or raises), so True only when the full one would say equal."""
+    groups = snapshot[3]
+    param_groups = optimizer.param_groups
+    count = len(groups)
+    if id(optimizer) != snapshot[0] or len(param_groups) != count or bool(getattr(optimizer, "_decoupled", False)) != snapshot[2]:
+        return False
+    names = _OPTIONS[kind]
+    state = optimizer.state
+    # torch.optim's own state map, read by id as its `get` does.
+    entries = state._entries if type(state).__name__ == "_ParamState" and type(getattr(state, "_entries", None)) is dict else None
+    for g in range(count):
+        group = param_groups[g]
+        ids, values, steps = groups[g]
+        for k in range(len(names)):
+            value = group[names[k]]
+            recorded = values[k]
+            if type(value) is not type(recorded) or value != recorded:
+                return False
+            if type(recorded) is tuple:
+                # betas: the snapshot holds scalars; so must these.
+                for j in range(len(recorded)):
+                    if type(value[j]) is not type(recorded[j]):
+                        return False
+        params = group["params"]
+        if len(params) != len(ids):
+            return False
+        for j in range(len(ids)):
+            parameter = params[j]
+            if id(parameter) != ids[j]:
+                return False
+            if entries is not None:
+                entry = entries.get(ids[j])
+                entry = None if entry is None else entry[1]
+            else:
+                entry = state.get(parameter)
+            step = 0 if entry is None else entry.get("step", 0)
+            if type(step) is not int or step != steps[j]:
+                return False
+    return True
 
 
 def _step_count(optimizer, parameter):
@@ -2198,6 +2243,8 @@ class Prepared:
         self._failed = None
         self._disposed = False
         self._session = None
+        # `_thin_run`'s plan, once a step has run on the native GPU.
+        self._thin = None
         # The feeds: each float tensor argument and each integer class-target
         # argument that the recorded step reads, by position or keyword.
         self._feeds = []
@@ -2385,13 +2432,84 @@ class Prepared:
         if self._failed is not None:
             raise RuntimeError("Prepared GPU session failed (%s); dispose() it and prepare again" % self._failed)
         capture = self._capture
-        if capture.optimizer is not None:
+        # The in-place comparison first (every step pays it); the full one decides otherwise.
+        if capture.optimizer is not None and not _optimizer_unchanged(capture.optimizer, capture.optimizer_kind, self._snapshot):
             try:
                 changed = _optimizer_configuration(capture.optimizer, capture.optimizer_kind) != self._snapshot
             except Exception:
                 changed = True
             if changed:
                 raise RuntimeError("Optimizer changed since prepare(); sync(), dispose() and prepare again")
+
+    def _thin_plan(self):
+        """What a step on the native GPU takes from its arguments, found once:
+        (session, read-back names, [(position, feed key, shape, dtype, float)]).
+        None where a step needs more than that (a keyword feed, a recorded
+        constant, a CPU random draw, a hosted or CPU session)."""
+        session = self._session
+        if (self._draws or self._constants or session is None or session._hosted or session._native_id is None
+                or not session._native_ran or any(type(position) is not int for position, *_ in self._feeds)):
+            return None
+        feeds = [(position, str(session._feeds[name]), shape, dtype, dtype == torch.float32)
+                 for position, name, shape, dtype in self._feeds]
+        return (session, [n for n in session._outputs if n not in session._resident], feeds)
+
+    def _thin_run(self, callback, arguments, on_error, many):
+        """`_run` on the native GPU without re-deriving what every step shares.
+
+        Cheap checks here (the arguments' types, shapes and dtypes, the
+        optimizer against its snapshot, the session's state), then the request;
+        the host checks every fed value as `_run` would (finite, class targets,
+        indices) and refuses a bad one before any device work. A refusal is
+        answered as `_run` answers it: its own checks run and raise their error,
+        or, when they pass, the host's error fails the session as in `_run`.
+        False: this call needs `_run` (which then raises or runs it)."""
+        plan = self._thin
+        session = plan[0]
+        if (self._disposed or self._failed is not None or session._disposed or session._failed is not None
+                or session._native_id is None or not callable(callback) or (on_error is not None and not callable(on_error))
+                or not 1 <= len(arguments) <= 64):
+            return False
+        capture = self._capture
+        if capture.optimizer is not None and not _optimizer_unchanged(capture.optimizer, capture.optimizer_kind, self._snapshot):
+            return False
+        steps = []
+        for args in arguments:
+            inputs = {}
+            for position, key, shape, dtype, is_float in plan[2]:
+                if position >= len(args):
+                    return False
+                value = args[position]
+                if not isinstance(value, torch.Tensor) or value.dtype != dtype or value.shape != shape:
+                    return False
+                inputs[key] = value._s if is_float else _k.astype(value._s, "float32")
+            steps.append({"inputs": inputs})
+        count = len(steps)
+        reply = _native()("gpu.session.run", {"session": session._native_id, "steps": steps, "readback": plan[1]})
+        if not (isinstance(reply, dict) and reply.get("ok")):
+            # What `_run` checks before it sends raises here as it would there.
+            for i, args in enumerate(arguments):
+                session._step_inputs(self._step_feeds(args, {}, i), i)
+            error = (reply.get("error") if isinstance(reply, dict) else None) or {}
+            self._fail(session._native_error(error), on_error)
+            return True
+        value = reply["value"]
+        session.step = int(value.get("step", session.step + count))
+        self.executed += count
+        self._since_sync += count
+        self.backend = value["backend"]
+        self.stats = value.get("stats")
+        try:
+            results = []
+            for i, entry in enumerate(value["steps"]):
+                out = entry["outputs"]["result"]
+                out["data"] = _host_data(out["data"], True)
+                results.append(self._read(entry, i))
+        except Exception as error:
+            self._fail(error, on_error)
+            return True
+        callback(results if many else results[0])
+        return True
 
     def _step_feeds(self, args, kwargs, index):
         # A step passes the recorded arguments: tensors of the recorded
@@ -2448,6 +2566,8 @@ class Prepared:
             self._since_sync += count
             self.backend = result["backend"]
             self.stats = result.get("stats")
+            if self._thin is None:
+                self._thin = self._thin_plan()
             try:
                 values = [self._read(entry, i) for i, entry in enumerate(result["steps"])]
             except Exception as error:
@@ -2462,6 +2582,8 @@ class Prepared:
 
     def step(self, callback, *args, on_error=None, **kwargs):
         """Run one step with these arguments; `callback(result)` receives the returned tensor read back."""
+        if self._thin is not None and not kwargs and self._thin_run(callback, (args,), on_error, False):
+            return None
         return self._run(callback, [(args, kwargs)], on_error, False)
 
     def steps(self, callback, batches, on_error=None):
@@ -2477,6 +2599,9 @@ class Prepared:
                 normalized.append((tuple(batch), {}))
             else:
                 normalized.append(((batch,), {}))
+        if self._thin is not None and all(not kw for _, kw in normalized) and \
+                self._thin_run(callback, [args for args, _ in normalized], on_error, True):
+            return None
         return self._run(callback, normalized, on_error, True)
 
     def sync(self, callback, on_error=None):
