@@ -550,11 +550,38 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyDictSet { slow: dst, .. })
             | Some(Instr::PyCallEntry { slow: dst, .. })
             | Some(Instr::PyGetItem { slow: dst, .. })
-            | Some(Instr::PySetItem { slow: dst, .. }) => {
+            | Some(Instr::PySetItem { slow: dst, .. })
+            | Some(Instr::PyGlobal { slow: dst, .. })
+            | Some(Instr::PyStrItem { slow: dst, .. })
+            | Some(Instr::PyStrLen { slow: dst, .. })
+            | Some(Instr::PyGetAttr { slow: dst, .. })
+            | Some(Instr::PySetAttr { slow: dst, .. })
+            | Some(Instr::PyIsInstance { slow: dst, .. })
+            | Some(Instr::PyGenNext { slow: dst, .. })
+            | Some(Instr::PyMethod { slow: dst, .. })
+            | Some(Instr::PyModGet { slow: dst, .. })
+            | Some(Instr::PyLen { slow: dst, .. })
+            | Some(Instr::PyAttrFn { slow: dst, .. })
+            | Some(Instr::PySeq { slow: dst, .. })
+            | Some(Instr::PyRaise { slow: dst, .. })
+            | Some(Instr::PyCaught { slow: dst, .. })
+            | Some(Instr::PyClassAttr { slow: dst, .. })
+            | Some(Instr::PyDictLookup { slow: dst, .. })
+            | Some(Instr::PyUnpack { slow: dst, .. }) => {
                 *dst = target;
                 Ok(())
             }
             _ => Err("Python emitter: invalid jump patch".into()),
+        }
+    }
+    /// Patch the `absent` edge of a [`Instr::PyDictLookup`].
+    pub fn patch_absent(&mut self, at: usize, target: u32) -> R<()> {
+        match self.proto.code.get_mut(at) {
+            Some(Instr::PyDictLookup { absent, .. }) => {
+                *absent = target;
+                Ok(())
+            }
+            _ => Err("Python emitter: invalid absent-edge patch".into()),
         }
     }
     /// Patch the slow-path target of a fused Python fast-path instruction.
@@ -569,7 +596,24 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyDictSet { slow: dst, .. })
             | Some(Instr::PyCallEntry { slow: dst, .. })
             | Some(Instr::PyGetItem { slow: dst, .. })
-            | Some(Instr::PySetItem { slow: dst, .. }) => {
+            | Some(Instr::PySetItem { slow: dst, .. })
+            | Some(Instr::PyGlobal { slow: dst, .. })
+            | Some(Instr::PyStrItem { slow: dst, .. })
+            | Some(Instr::PyStrLen { slow: dst, .. })
+            | Some(Instr::PyGetAttr { slow: dst, .. })
+            | Some(Instr::PySetAttr { slow: dst, .. })
+            | Some(Instr::PyIsInstance { slow: dst, .. })
+            | Some(Instr::PyGenNext { slow: dst, .. })
+            | Some(Instr::PyMethod { slow: dst, .. })
+            | Some(Instr::PyModGet { slow: dst, .. })
+            | Some(Instr::PyLen { slow: dst, .. })
+            | Some(Instr::PyAttrFn { slow: dst, .. })
+            | Some(Instr::PySeq { slow: dst, .. })
+            | Some(Instr::PyRaise { slow: dst, .. })
+            | Some(Instr::PyCaught { slow: dst, .. })
+            | Some(Instr::PyClassAttr { slow: dst, .. })
+            | Some(Instr::PyDictLookup { slow: dst, .. })
+            | Some(Instr::PyUnpack { slow: dst, .. }) => {
                 *dst = target;
                 Ok(())
             }
@@ -769,6 +813,40 @@ impl<'a> Emitter<'a> {
         })?;
         Ok(())
     }
+    /// The runtime's `caught(e, line)` for the exception in `e`: natively
+    /// (`PyCaught`), and through the helper, out of line, when that declines.
+    pub fn caught(&mut self, e: Reg) -> R<Reg> {
+        let line = self.r_line;
+        if !self.fast {
+            return self.helper("caught", &[e, line]);
+        }
+        let dst = self.alloc()?;
+        let rt = self.r_rt;
+        let at = self.emit(Instr::PyCaught { dst, e, line, rt, slow: 0 })?;
+        self.defer_cold(Vec::new(), vec![at], move |em| {
+            let r = em.helper("caught", &[e, line])?;
+            em.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
+        Ok(dst)
+    }
+    /// A list (`tuple` false) or tuple of the Array in `arr`, as the
+    /// runtime's `list` / `tuple` helpers make it: natively (`PySeq`), and
+    /// through the helper, out of line, when that declines.
+    pub fn seq_of(&mut self, arr: Reg, tuple: bool) -> R<Reg> {
+        if !self.fast {
+            return self.helper(if tuple { "tuple" } else { "list" }, &[arr]);
+        }
+        let dst = self.alloc()?;
+        let rt = self.r_rt;
+        let at = self.emit(Instr::PySeq { dst, items: arr, rt, tuple, slow: 0 })?;
+        self.defer_cold(Vec::new(), vec![at], move |e| {
+            let r = e.helper(if tuple { "tuple" } else { "list" }, &[arr])?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
+        Ok(dst)
+    }
     /// `runtime.method(args...)`. A plain Get and Call: the interpreter's
     /// fused `CallMethod` measured slower on the runtime object than the pair
     /// (its receiver-kind probes run before the method cache).
@@ -958,6 +1036,39 @@ impl<'a> Emitter<'a> {
             let key = self.string(name)?;
             return self.helper("getattr", &[obj, key]);
         }
+        // The whole inline read as one `PyGetAttr`; its general form, out of
+        // line, for everything else.
+        let dst = self.alloc()?;
+        let key = self.string_const(name);
+        let at = self.emit(Instr::PyGetAttr { dst, obj, key, slow: 0 })?;
+        let name = name.to_owned();
+        self.defer_cold(Vec::new(), vec![at], move |e| {
+            // A plain class attribute, or a property's getter, found
+            // natively; the general read else.
+            let at_cls = e.emit(Instr::PyClassAttr { dst, obj, key, slow: 0 })?;
+            let cls_done = e.jump()?;
+            let here = e.here();
+            e.patch_slow(at_cls, here)?;
+            let getter = e.alloc()?;
+            let at_fn = e.emit(Instr::PyAttrFn { dst: getter, obj, key, set: false, slow: 0 })?;
+            let entry = e.prop(getter, "c1")?;
+            let (arg_base, argc) = e.arguments(&[obj])?;
+            e.emit(Instr::CallWithThis { dst, callee: entry, this_v: getter, arg_base, argc, name: NO_NAME })?;
+            let done = e.jump()?;
+            let here = e.here();
+            e.patch_slow(at_fn, here)?;
+            let r = e.attr_get_inline(obj, &name)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            let here = e.here();
+            e.patch(done, here)?;
+            e.patch(cls_done, here)?;
+            Ok(())
+        });
+        Ok(dst)
+    }
+    /// [`Emitter::attr_get`]'s general form: the inline class-table read,
+    /// the property getter, and the `getattr` helper.
+    fn attr_get_inline(&mut self, obj: Reg, name: &str) -> R<Reg> {
         let dst = self.alloc()?;
         let mut slow = Vec::new();
         let cls = self.instance_class(obj, &mut slow)?;
@@ -1005,6 +1116,32 @@ impl<'a> Emitter<'a> {
             self.helper("setattr", &[obj, key, value])?;
             return Ok(());
         }
+        // The whole inline store as one `PySetAttr`; its general form, out
+        // of line, for everything else.
+        let key = self.string_const(name);
+        let at = self.emit(Instr::PySetAttr { obj, key, val: value, slow: 0 })?;
+        let name = name.to_owned();
+        self.defer_cold(Vec::new(), vec![at], move |e| {
+            // A property's setter, found natively; the general store else.
+            let setter = e.alloc()?;
+            let at_fn = e.emit(Instr::PyAttrFn { dst: setter, obj, key, set: true, slow: 0 })?;
+            let entry = e.prop(setter, "c2")?;
+            let ignored = e.alloc()?;
+            let (arg_base, argc) = e.arguments(&[obj, value])?;
+            e.emit(Instr::CallWithThis { dst: ignored, callee: entry, this_v: setter, arg_base, argc, name: NO_NAME })?;
+            let done = e.jump()?;
+            let here = e.here();
+            e.patch_slow(at_fn, here)?;
+            e.attr_set_inline(obj, &name, value)?;
+            let here = e.here();
+            e.patch(done, here)?;
+            Ok(())
+        });
+        Ok(())
+    }
+    /// [`Emitter::attr_set`]'s general form: the inline class-table store,
+    /// the property setter, and the `setattr` helper.
+    fn attr_set_inline(&mut self, obj: Reg, name: &str, value: Reg) -> R<()> {
         let mut slow = Vec::new();
         let cls = self.instance_class(obj, &mut slow)?;
         let table = self.prop(cls, "sa")?;
@@ -1041,10 +1178,6 @@ impl<'a> Emitter<'a> {
         });
         Ok(())
     }
-    /// Jumps to `slow` unless `obj` is a non-null object; returns its `cls`.
-    pub fn object_class(&mut self, obj: Reg, slow: &mut Vec<usize>) -> R<Reg> {
-        self.instance_class(obj, slow)
-    }
     /// `dst = Number(big)` for a BigInt in `big`, through the VM's guarded
     /// `Number` intrinsic (the callee is the runtime's own reference).
     pub fn bigint_to_number(&mut self, big: Reg) -> R<Reg> {
@@ -1068,8 +1201,13 @@ impl<'a> Emitter<'a> {
         let seq = self.prop(self.r_rt, "TLIST")?;
         let dict = self.prop(self.r_rt, "TDICT")?;
         let at = self.emit(Instr::PyGetItem { dst, o, k, seq, dict, slow: 0 })?;
-        // A tuple, else the helper (which also answers every miss).
+        // An ASCII str, a tuple, else the helper (which also answers every
+        // miss).
         self.defer_cold(Vec::new(), vec![at], move |e| {
+            let at_str = e.emit(Instr::PyStrItem { dst, s: o, k, slow: 0 })?;
+            let str_done = e.jump()?;
+            let here = e.here();
+            e.patch_slow(at_str, here)?;
             let tuple = e.prop(e.r_rt, "TTUPLE")?;
             let at = e.emit(Instr::PyGetItem { dst, o, k, seq: tuple, dict, slow: 0 })?;
             let done = e.jump()?;
@@ -1079,6 +1217,7 @@ impl<'a> Emitter<'a> {
             e.emit(Instr::Move { dst, src: r })?;
             let here = e.here();
             e.patch(done, here)?;
+            e.patch(str_done, here)?;
             Ok(())
         });
         Ok(dst)
@@ -1223,40 +1362,32 @@ impl<'a> Emitter<'a> {
             }
             SymKind::Global => {
                 let globals = self.globals()?;
-                let key = self.string(name)?;
                 if !self.fast {
+                    let key = self.string(name)?;
                     return self.helper("gload", &[globals, key]);
                 }
-                self.global_read(globals, key)
+                self.global_read(globals, name)
             }
         }
     }
-    /// A global read with fast paths on: the module dictionary's `get`,
-    /// then the builtins', as the VM's own Map method calls (no runtime
-    /// frame), and the `gload` helper only when both miss (it raises the
-    /// NameError, and answers `__builtins__`). `get` returns `undefined`
-    /// for a missing key and never for a bound name, so the miss test is
-    /// exact; the lookups are the same two the helper starts with, in the
-    /// same order, so shadowing a builtin at module level is seen at once.
-    fn global_read(&mut self, globals: Reg, key: Reg) -> R<Reg> {
+    /// A global read with fast paths on: one fused `PyGlobal`, which makes
+    /// the module dictionary's lookup and then the builtins' natively (the
+    /// same two the `gload` helper starts with, in the same order, so
+    /// shadowing a builtin at module level is seen at once), and the
+    /// `gload` helper, out of line, only when both miss (it raises the
+    /// NameError, and answers `__builtins__`).
+    fn global_read(&mut self, globals: Reg, name: &str) -> R<Reg> {
         let dst = self.alloc()?;
-        let get = self.string_index("get");
-        let undefined = self.undefined()?;
-        let found = self.alloc()?;
-        let (arg_base, argc) = self.arguments(&[key])?;
-        self.emit(Instr::CallMethod { dst, obj: globals, name: get, arg_base, argc })?;
-        self.emit(Instr::Ne { dst: found, a: dst, b: undefined })?;
-        let hit = self.jump_if_true(found)?;
-        let builtins = self.prop(self.r_rt, "BUILTINS")?;
-        let (arg_base, argc) = self.arguments(&[key])?;
-        self.emit(Instr::CallMethod { dst, obj: builtins, name: get, arg_base, argc })?;
-        self.emit(Instr::Ne { dst: found, a: dst, b: undefined })?;
-        let hit2 = self.jump_if_true(found)?;
-        let r = self.helper("gload", &[globals, key])?;
-        self.emit(Instr::Move { dst, src: r })?;
-        let here = self.here();
-        self.patch(hit, here)?;
-        self.patch(hit2, here)?;
+        let key = self.string_const(name);
+        let rt = self.r_rt;
+        let at = self.emit(Instr::PyGlobal { dst, globals, rt, key, slow: 0 })?;
+        let name = name.to_owned();
+        self.defer_cold(Vec::new(), vec![at], move |e| {
+            let key = e.string(&name)?;
+            let r = e.helper("gload", &[globals, key])?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
         Ok(dst)
     }
     pub fn cell_reg(&self, name: &str) -> R<Reg> {

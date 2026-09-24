@@ -1,0 +1,38 @@
+[0, 1, 2, 3, 4] 45 [(0, 0), (1, 1), (2, 2)]
+[0, 1, 4, 'done-3', 1, None]
+499500
+broke at 3
+0 1
+stop value done-2 ('done-2',)
+after stop None ()
+dflt empty
+[0, 1] []
+0 1 2
+closing with ['a', 'b']
+send after close: StopIteration
+TypeError: can't send non-None value to a just-started generator
+caught inside boom
+ready recovered ready
+propagated KeyError('k')
+finished
+got 1
+RuntimeError: generator raised StopIteration | cause: StopIteration('inner') | suppress: True
+seen [0, 1] error mid 2
+0 1
+next raised mid 2
+exhausted after error
+ValueError: generator already executing
+ValueError None
+ValueError None
+context ValueError('handled')
+ValueError IndexError
+context2 ValueError('handled') IndexError('outer')
+finally runs
+finally runs
+[1]
+['leaf1234']
+0 [2, 4, 6] []
+[4, 3, 2, 1, 0] 6 0 012345
+{0: 'a', 1: 'b', 2: 'c'} ((0, 0), (1, 1)) True False
+[None, None] [None, None]
+True 0 [1, 2]

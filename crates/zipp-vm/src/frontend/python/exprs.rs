@@ -194,11 +194,11 @@ impl<'a> Emitter<'a> {
             ast::Expr::Call(c) => self.call(expr, c, depth + 1),
             ast::Expr::List(l) => {
                 let arr = self.sequence_array(&l.elts, depth + 1)?;
-                self.helper("list", &[arr])
+                self.seq_of(arr, false)
             }
             ast::Expr::Tuple(t) => {
                 let arr = self.sequence_array(&t.elts, depth + 1)?;
-                self.helper("tuple", &[arr])
+                self.seq_of(arr, true)
             }
             ast::Expr::Set(s) => {
                 let arr = self.sequence_array(&s.elts, depth + 1)?;
@@ -1444,27 +1444,23 @@ impl<'a> Emitter<'a> {
         let other = self.jump_if_false(same)?;
         let mut done_early = Vec::new();
         if direct == "len1" {
-            // An exact list or tuple: its items' count, as an int.
+            // An exact list, tuple, dict or set, or a str: natively; anything
+            // else the helper.
             let v = regs[0];
-            let mut slow = Vec::new();
-            let cls = self.object_class(v, &mut slow)?;
-            let t = self.alloc()?;
-            let list = self.prop(self.r_rt, "TLIST")?;
-            self.emit(Instr::Eq { dst: t, a: cls, b: list })?;
-            let is_list = self.jump_if_true(t)?;
-            let tuple = self.prop(self.r_rt, "TTUPLE")?;
-            self.emit(Instr::Eq { dst: t, a: cls, b: tuple })?;
-            slow.push(self.jump_if_false(t)?);
-            let here = self.here();
-            self.patch(is_list, here)?;
-            let items = self.prop(v, "items")?;
-            let n = self.prop(items, "length")?;
-            self.emit(Instr::BigIntFrom { dst, arg: n })?;
+            let rt = self.r_rt;
+            let at_len = self.emit(Instr::PyLen { dst, v, rt, slow: 0 })?;
             done_early.push(self.jump()?);
             let here = self.here();
-            for j in slow {
-                self.patch(j, here)?;
-            }
+            self.patch_slow(at_len, here)?;
+        }
+        if direct == "isinst" {
+            // A class: natively, as `isinst` answers it; anything else the
+            // helper.
+            let rt = self.r_rt;
+            let at = self.emit(Instr::PyIsInstance { dst, v: regs[0], t: regs[1], rt, slow: 0 })?;
+            done_early.push(self.jump()?);
+            let here = self.here();
+            self.patch_slow(at, here)?;
         }
         let r = self.helper(direct, &regs)?;
         self.emit(Instr::Move { dst, src: r })?;
@@ -1672,6 +1668,21 @@ impl<'a> Emitter<'a> {
         let mut slow = Vec::new();
         let mut found = Vec::new();
         let gb_key = format!("{name}#{n}");
+        // A user class's method or a builtin type's, found natively (every
+        // other case resolves below).
+        let rt = self.r_rt;
+        let key = self.string_const(name);
+        let gb = self.string_index(&gb_key);
+        let at_m = self.emit(Instr::PyMethod { dst: f, obj, rt, key, gb, slow: 0 })?;
+        self.emit(Instr::LoadBool { dst: prepend, val: true })?;
+        let fused = self.jump()?;
+        let here = self.here();
+        self.patch_slow(at_m, here)?;
+        let at_mod = self.emit(Instr::PyModGet { dst: f, obj, rt, key, slow: 0 })?;
+        self.emit(Instr::LoadBool { dst: prepend, val: false })?;
+        let fused_mod = self.jump()?;
+        let here = self.here();
+        self.patch_slow(at_mod, here)?;
         // An object receiver: a user class's method, or a builtin's.
         let cls = self.alloc()?;
         let not_obj = self.emit(Instr::PyClassOf { dst: cls, obj, slow: 0 })?;
@@ -1739,6 +1750,8 @@ impl<'a> Emitter<'a> {
         let here = self.here();
         self.patch(resolved, here)?;
         self.patch(module_found, here)?;
+        self.patch(fused, here)?;
+        self.patch(fused_mod, here)?;
         let mut regs = Vec::with_capacity(n);
         for a in args {
             regs.push(self.expr(a, depth)?);
@@ -1781,6 +1794,58 @@ impl<'a> Emitter<'a> {
             regs.push(self.expr(a, depth)?);
         }
         let dst = self.alloc()?;
+        // A user class's method or a builtin type's, found natively, then
+        // called with the receiver first; the general resolution out of
+        // line.
+        let f = self.alloc()?;
+        let rt = self.r_rt;
+        let key = self.string_const(name);
+        let gb = self.string_index(&format!("{name}#{n}"));
+        let at_m = self.emit(Instr::PyMethod { dst: f, obj, rt, key, gb, slow: 0 })?;
+        let mut done = Vec::new();
+        match (name, n) {
+            ("append", 1) => self.list_append_intrinsic(obj, f, regs[0], dst, &mut done)?,
+            ("get", 1 | 2) => self.dict_get_intrinsic(obj, f, &regs, dst, &mut done)?,
+            _ => {}
+        }
+        let mut with_self = Vec::with_capacity(n + 1);
+        with_self.push(obj);
+        with_self.extend_from_slice(&regs);
+        let r = self.call_with(f, &with_self)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let here = self.here();
+        for j in done {
+            self.patch(j, here)?;
+        }
+        let name = name.to_owned();
+        self.defer_cold(Vec::new(), vec![at_m], move |e| e.method_call_resolved(obj, &name, &regs, dst));
+        Ok(dst)
+    }
+
+    /// [`Emitter::method_call_transparent`]'s general form, for evaluated
+    /// order-transparent arguments `regs`: a user-class method found
+    /// inline, a module's function, a builtin method, or `mfind`.
+    fn method_call_resolved(&mut self, obj: Reg, name: &str, regs: &[Reg], dst: Reg) -> R<()> {
+        // A module's function, called as it is.
+        let g = self.alloc()?;
+        let rt = self.r_rt;
+        let key = self.string_const(name);
+        let at_mod = self.emit(Instr::PyModGet { dst: g, obj, rt, key, slow: 0 })?;
+        let r = self.call_with(g, &regs)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let mod_done = self.jump()?;
+        let here = self.here();
+        self.patch_slow(at_mod, here)?;
+        self.method_call_general(obj, name, &regs, dst)?;
+        let here = self.here();
+        self.patch(mod_done, here)?;
+        Ok(())
+    }
+
+    /// [`Emitter::method_call_resolved`] past a module's function.
+    fn method_call_general(&mut self, obj: Reg, name: &str, regs: &[Reg], dst: Reg) -> R<()> {
+        let n = regs.len();
+        let regs = regs.to_vec();
         let cls = self.alloc()?;
         let at_cls = self.emit(Instr::PyClassOf { dst: cls, obj, slow: 0 })?;
         let gm = self.prop(cls, "gm")?;
@@ -1864,7 +1929,7 @@ impl<'a> Emitter<'a> {
             }
             Ok(())
         });
-        Ok(dst)
+        Ok(())
     }
 
     /// The general method call: `mfind` resolves `obj.name` (filling the
@@ -1925,6 +1990,13 @@ impl<'a> Emitter<'a> {
         let t = self.alloc()?;
         self.emit(Instr::Eq { dst: t, a: f, b: expected })?;
         other.push(self.jump_if_false(t)?);
+        // The lookup natively (`PyDictLookup`); the inline reads below when
+        // it declines.
+        let rt = self.r_rt;
+        let at_lookup = self.emit(Instr::PyDictLookup { dst, d: obj, k, rt, absent: 0, slow: 0 })?;
+        done.push(self.jump()?);
+        let here = self.here();
+        self.patch_slow(at_lookup, here)?;
         let cls = self.prop(obj, "cls")?;
         let tdict = self.prop(self.r_rt, "TDICT")?;
         self.emit(Instr::Eq { dst: t, a: cls, b: tdict })?;
@@ -1973,6 +2045,7 @@ impl<'a> Emitter<'a> {
         let here = self.here();
         self.patch(absent, here)?;
         self.patch(absent2, here)?;
+        self.patch_absent(at_lookup, here)?;
         match regs.get(1) {
             Some(&default) => {
                 self.emit(Instr::Move { dst, src: default })?;
@@ -2018,8 +2091,14 @@ impl<'a> Emitter<'a> {
     ) -> R<Reg> {
         let outer = self.expr(&generators[0].iter, depth)?;
         // With fast paths on, an exact list, tuple or range is passed as
-        // itself for the comprehension to index or count in place.
-        let outer_iter = self.helper(if self.fast { "seqiter" } else { "iter" }, &[outer])?;
+        // itself for the comprehension to index or count in place (a list
+        // or tuple display always makes an exact one: `seqiter` would
+        // answer it unchanged).
+        let outer_iter = if self.fast && is_sequence_display(&generators[0].iter) {
+            outer
+        } else {
+            self.helper(if self.fast { "seqiter" } else { "iter" }, &[outer])?
+        };
         if let Some(scope) = self.inlinable(node, kind) {
             return self.inline_comprehension(scope, kind, generators, elts, outer_iter, depth);
         }
@@ -2030,7 +2109,10 @@ impl<'a> Emitter<'a> {
         };
         let (func_id, child) = self.compile_child(node, kind, qualname.clone(), None, |e| {
             let acc = match kind {
-                "<listcomp>" => Some(e.helper("list", &[])?),
+                "<listcomp>" => {
+                    let arr = e.array(&[])?;
+                    Some(e.seq_of(arr, false)?)
+                }
                 "<setcomp>" => Some(e.helper("set", &[])?),
                 "<dictcomp>" => Some(e.helper("dict", &[])?),
                 _ => None,
@@ -2085,7 +2167,10 @@ impl<'a> Emitter<'a> {
         depth: usize,
     ) -> R<Reg> {
         let acc = match kind {
-            "<listcomp>" => self.helper("list", &[])?,
+            "<listcomp>" => {
+                let arr = self.array(&[])?;
+                self.seq_of(arr, false)?
+            }
             "<setcomp>" => self.helper("set", &[])?,
             _ => self.helper("dict", &[])?,
         };
@@ -2250,4 +2335,9 @@ pub(super) fn cmpop_name(op: &ast::CmpOp) -> &'static str {
         ast::CmpOp::Is => "is",
         ast::CmpOp::IsNot => "isnot",
     }
+}
+
+/// A list or tuple display: its value is always an exact list or tuple.
+pub(super) fn is_sequence_display(e: &ast::Expr) -> bool {
+    matches!(e, ast::Expr::List(_) | ast::Expr::Tuple(_))
 }

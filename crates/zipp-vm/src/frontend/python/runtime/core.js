@@ -72,7 +72,7 @@ var __zipp_py = (function () {
             bases: bases, mro: null, dict: dict || new Map(), id: nextId++, isType: true, code: constructCode, fast: typeFast,
             ga: Object.create(null), sa: Object.create(null), gm: Object.create(null), gb: Object.create(null),
             gp: Object.create(null), sp: Object.create(null), gx: Object.create(null),
-            userClass: false, flagged: false };
+            userClass: false, flagged: false, gs: Object.create(null), gv: Object.create(null) };
         t.mro = computeMro(t);
         return t;
     }
@@ -300,6 +300,9 @@ var __zipp_py = (function () {
     R.pushexc = function (e) { excStack.push(e); return null; };
     // The emitter pushes and pops this array itself (never replaced).
     R.EXCSTACK = excStack;
+    // What the emitter's native `raise` / handler entry (`PyRaise`,
+    // `PyCaught`) test exceptions against.
+    R.EBASE = E.BaseException;
     R.popexc = function () { excStack.pop(); return null; };
     rt.currentExc = function () { return excStack.length ? excStack[excStack.length - 1] : null; };
     R.excmatch = function (e, spec) {
@@ -400,10 +403,12 @@ var __zipp_py = (function () {
     function clearFlags(t) {
         t.ga = Object.create(null); t.sa = Object.create(null); t.gm = Object.create(null); t.gb = Object.create(null);
         t.gp = Object.create(null); t.sp = Object.create(null); t.gx = Object.create(null);
+        t.gs = Object.create(null); t.gv = Object.create(null);
         t.flagged = false;
         if (t.ctorEntries !== undefined) clearCtorEntries(t);
     }
     rt.noteFlagged = noteFlagged;
+    rt.builtinsTouched = false;
     rt.bumpEpoch = function () {
         typeEpoch++;
         for (let i = 0; i < flagged.length; i++) { const t = flagged[i].deref(); if (t !== undefined) clearFlags(t); }
@@ -414,7 +419,7 @@ var __zipp_py = (function () {
             if (name === "__setattr__") clearFlags(t);
             else {
                 t.ga[name] = undefined; t.sa[name] = undefined; t.gm[name] = undefined; t.gb = Object.create(null);
-                t.gp[name] = undefined; t.sp[name] = undefined; t.gx[name] = undefined;
+                t.gp[name] = undefined; t.sp[name] = undefined; t.gx[name] = undefined; t.gs[name] = undefined; t.gv[name] = undefined;
                 if (name === "__getattr__") t.gx = Object.create(null);
             }
         }
@@ -426,6 +431,10 @@ var __zipp_py = (function () {
         else if (name === "__setattr__") cache.delete(SET_PLAN);
     }
     function typeChanged(t, name) {
+        // A builtin type changed (the runtime's own types are never changed
+        // otherwise): the comparisons' shortcut for exact tuples and lists
+        // (`R.richcmp`) stops assuming their dunders are the base ones.
+        if (t.userClass !== true) rt.builtinsTouched = true;
         forgetName(t, name);
         liveSubclasses(t, (s) => forgetName(s, name));
     }
@@ -572,6 +581,13 @@ var __zipp_py = (function () {
             const v = dict.get(name);
             if (v !== undefined) return v;
             if (name === "__dict__" && t.noDict !== true) return rt.instanceDict(obj);
+            // A plain class attribute (an int, float, str or bool): the
+            // answer for an instance dict without the name, until the name
+            // changes on the class (`gv`, read by the emitter's `PyClassAttr`).
+            const ta = typeof attr;
+            if (t.userClass === true && t.ga[name] === true && (ta === "bigint" || ta === "number" || ta === "string" || ta === "boolean")) {
+                t.gv[name] = attr; if (t.flagged !== true) noteFlagged(t);
+            }
         }
         if (attr !== undefined) return descrGet(attr, obj, t);
         const special = rt.specialAttr(obj, t, name);
@@ -1026,6 +1042,13 @@ var __zipp_py = (function () {
         return self.cls === T.function ? invoke(self, p.args) : self.code(p.args);
     }
     rt.call = call;
+    // `call(f, [x], null)` through `f`'s one-argument entry when it has one
+    // (what a positional call site calls: the same binding, no array).
+    function call1(f, x) {
+        if (f !== null && typeof f === "object") { const c1 = f.c1; if (typeof c1 === "function") return f.c1(x); }
+        return call(f, [x], null);
+    }
+    rt.call1 = call1;
     // `Class(args)`: __new__/__init__.
     function constructCode(payload) {
         const cls = payload[0], args = payload[1], kwargs = payload[2];
@@ -1077,6 +1100,13 @@ var __zipp_py = (function () {
                 else if (init !== undefined && init !== null && init.cls === T.function && typeof init["c" + (n + 1)] === "function") setCtorEntry(cls, n, init);
             }
         }
+        // An exception class with the base allocation and __init__ (a
+        // builtin one, or a user subclass adding neither): the positional
+        // entry builds the instance the path below builds.
+        if (plan.alloc === rt.excAlloc && plan.init === rt.excInit && plan.newf === undefined && plan.builtinBase === undefined
+            && cls.cls === TypeType && !cls.isABC && (kwargs === null || kwargs.size === 0) && args.length < EXC_ENTRY.length) {
+            setExcEntry(cls, args.length);
+        }
         // A subclass of an immutable builtin (int, str, tuple, ...) takes its
         // value from that builtin's __new__; a user __init__ then runs.
         if (plan.builtinBase !== undefined) {
@@ -1119,6 +1149,19 @@ var __zipp_py = (function () {
         function (a, b, c, d, e) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c6(obj, a, b, c, d, e); if (r !== null) initReturned(r); return obj; },
         function (a, b, c, d, e, f) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c7(obj, a, b, c, d, e, f); if (r !== null) initReturned(r); return obj; },
     ];
+    const EXC_ENTRY = [
+        function () { const e = makeExc(this, []); e.context = null; return e; },
+        function (a) { const e = makeExc(this, [a]); e.context = null; return e; },
+        function (a, b) { const e = makeExc(this, [a, b]); e.context = null; return e; },
+        function (a, b, c) { const e = makeExc(this, [a, b, c]); e.context = null; return e; },
+    ];
+    function setExcEntry(cls, n) {
+        if (cls.ctorInit !== rt.excInit) { clearCtorEntries(cls); cls.ctorInit = rt.excInit; }
+        if (cls.ctorEntries === undefined || cls.ctorEntries === null) cls.ctorEntries = [];
+        cls["c" + n] = EXC_ENTRY[n];
+        cls.ctorEntries.push(n);
+        noteFlagged(cls);
+    }
     function setCtorEntry(cls, n, init) {
         if (cls.ctorInit !== init) { clearCtorEntries(cls); cls.ctorInit = init; }
         if (cls.ctorEntries === undefined || cls.ctorEntries === null) cls.ctorEntries = [];
@@ -1639,9 +1682,16 @@ var __zipp_py = (function () {
         g.done = true; g.returned = null;
         return r.value === undefined ? null : r.value;
     }
+    // In a Python program `next` is the engine's native form of genNext
+    // (`vm::py_gen`, `__zipp_py_gen`): it resumes a plain suspended
+    // generator itself and calls genNext (`grt[0]`) for every other state.
+    // `grt` is what it needs of this runtime, shared by every record.
+    let GEN_NEXT = genNext;
+    try { if (typeof __zipp_py_gen === "function") GEN_NEXT = __zipp_py_gen; } catch (e) { GEN_NEXT = genNext; }
+    const GEN_RT = [genNext, excStack, STOP, genEscape];
     rt.makeGenerator = function (jsgen, f) {
         return { cls: T.generator, js: jsgen, done: false, started: false, running: false, returned: null, excs: null,
-            name: f.name, qualname: f.qualname, next: genNext, send: genSend, throwIn: genThrow, close: genClose };
+            name: f.name, qualname: f.qualname, next: GEN_NEXT, send: genSend, throwIn: genThrow, close: genClose, grt: GEN_RT };
     };
 
     // ---- modules ----------------------------------------------------------------------------------------

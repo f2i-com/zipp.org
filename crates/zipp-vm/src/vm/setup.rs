@@ -2964,6 +2964,66 @@ impl<'p> Vm<'p> {
                 self.globals[slot] = Value::heap(order);
                 self.bump_global_gen(slot as u32);
             }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_GEN_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let step = self.heap.alloc(HeapObj::Native(native::PY_GEN));
+                self.globals[slot] = Value::heap(step);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_JSON_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let json = self.heap.alloc(HeapObj::Native(native::PY_JSON));
+                self.globals[slot] = Value::heap(json);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_PCT_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let pct = self.heap.alloc(HeapObj::Native(native::PY_PCT));
+                self.globals[slot] = Value::heap(pct);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_STRM_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let strm = self.heap.alloc(HeapObj::Native(native::PY_STRM));
+                self.globals[slot] = Value::heap(strm);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_TKEY_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let tkey = self.heap.alloc(HeapObj::Native(native::PY_TKEY));
+                self.globals[slot] = Value::heap(tkey);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_ITER_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let step = self.heap.alloc(HeapObj::Native(native::PY_ITER));
+                self.globals[slot] = Value::heap(step);
+                self.bump_global_gen(slot as u32);
+            }
         }
         // `get [Symbol.species]` (a shared getter returning `this`) on every
         // species-aware constructor — used by slice/map/etc. and required by the

@@ -409,6 +409,8 @@
         };
         for (const [name, impl, canOverflow] of [["sin", Math.sin], ["cos", Math.cos], ["tan", Math.tan], ["asin", Math.asin], ["acos", Math.acos], ["atan", Math.atan], ["sinh", Math.sinh, true], ["cosh", Math.cosh, true], ["tanh", Math.tanh], ["asinh", Math.asinh], ["acosh", Math.acosh], ["atanh", Math.atanh], ["exp", Math.exp, true], ["expm1", Math.expm1, true], ["log1p", Math.log1p], ["fabs", Math.abs], ["cbrt", Math.cbrt], ["erf", (x) => erfExact(x)], ["erfc", (x) => 1 - erfExact(x)], ["gamma", (x) => gammaExact(x), true], ["lgamma", (x) => lgammaExact(x), true], ["exp2", (x) => Math.pow(2, x), true]]) fn(g, name, 1, (a) => { const x = f(a[0]); return unary(x, impl(x), canOverflow === true); });
         fn(g, "sqrt", 1, (a) => { const x = f(a[0]); if (x < 0) fail(E.ValueError, "math domain error"); return Math.sqrt(x); });
+        // A float's square root natively (`vm::py_str`, op 11).
+        if (rt.nativeEntry !== null) rt.nativeEntry(g.get("sqrt"), 1, 11);
         // CPython's loghelper: an int too large for a float is m * 2**e with
         // m the correctly rounded frexp mantissa, so log(m) + log(2) * e.
         const logOf = (v, impl) => {
@@ -1555,6 +1557,13 @@
             const pad = "\n" + o.indent.repeat(level + 1);
             return open + pad + parts.join(o.sep + pad) + "\n" + o.indent.repeat(level) + close;
         }
+        // The engine's native encoder and decoder (`vm::py_json`, bound only
+        // in a Python program) take the documents made of plain values and
+        // answer undefined for every other one, which the code here takes.
+        let JSON_NATIVE = null;
+        try { JSON_NATIVE = typeof __zipp_py_json === "function" ? __zipp_py_json : null; } catch (e) { JSON_NATIVE = null; }
+        // The decoder's templates: every list and dict it makes is a copy.
+        const JSON_LIST = list([]), JSON_DICT = dict();
         function dumps(v, kw) {
             const indentV = kwget(kw, "indent", null);
             // An int indent is that many spaces per level, a str is itself.
@@ -1571,6 +1580,10 @@
                 skipKeys: truth(kwget(kw, "skipkeys", false)),
                 seen: new Set(),
             };
+            if (JSON_NATIVE !== null) {
+                const r = JSON_NATIVE(0, v, o.indent, o.sep, o.kv, (o.sortKeys ? 1 : 0) | (o.ensureAscii ? 2 : 0) | (o.allowNan ? 4 : 0), T.list, T.tuple, T.dict);
+                if (r !== undefined) return r;
+            }
             return encode(v, o, 0);
         }
         // A JSON number at lastIndex (sticky: no copy of the rest of the text).
@@ -1582,6 +1595,10 @@
         function loads(s, kw) {
             const objectHook = kwget(kw, "object_hook", null), pairsHook = kwget(kw, "object_pairs_hook", null);
             const pFloat = kwget(kw, "parse_float", null), pInt = kwget(kw, "parse_int", null), pConst = kwget(kw, "parse_constant", null);
+            if (JSON_NATIVE !== null && objectHook === null && pairsHook === null && pFloat === null && pInt === null && pConst === null) {
+                const r = JSON_NATIVE(1, s, JSON_LIST, JSON_DICT);
+                if (r !== undefined) return r;
+            }
             let i = 0;
             const n = s.length;
             const err = (msg, at) => {
@@ -2402,6 +2419,8 @@
         fn(g, "heapify", 1, (a) => { const h = a[0].items; for (let i = (h.length >> 1) - 1; i >= 0; i--) down(h, i); return null; });
         fn(g, "heappushpop", 2, (a) => { const h = a[0].items; if (h.length && lt(h[0], a[1])) { const top = h[0]; h[0] = a[1]; down(h, 0); return top; } return a[1]; });
         fn(g, "heapreplace", 2, (a) => { const h = a[0].items; const top = h[0]; h[0] = a[1]; down(h, 0); return top; });
+        // Pushes and pops of plain items natively (`vm::py_str`, ops 12, 13).
+        if (rt.nativeEntry !== null) { rt.nativeEntry(g.get("heappush"), 2, 12); rt.nativeEntry(g.get("heappop"), 1, 13); }
         fnkw(g, "nlargest", (a) => { const kw = kwOf(a, ["key"]); return list(rt.sortItems(drain(a[1]), kwget(kw, "key", null), true).slice(0, Number(needInt(a[0])))); });
         fnkw(g, "nsmallest", (a) => { const kw = kwOf(a, ["key"]); return list(rt.sortItems(drain(a[1]), kwget(kw, "key", null), false).slice(0, Number(needInt(a[0])))); });
     });
@@ -2434,6 +2453,11 @@
                 else call(rt.getattr(a[0], "insert"), [BigInt(i), a[1]], null);
                 return null;
             });
+        }
+        // Plain items natively (`vm::py_str`, ops 14 to 17).
+        if (rt.nativeEntry !== null) {
+            rt.nativeEntry(g.get("bisect_left"), 2, 14); rt.nativeEntry(g.get("bisect_right"), 2, 15);
+            rt.nativeEntry(g.get("insort_left"), 2, 16); rt.nativeEntry(g.get("insort_right"), 2, 17);
         }
         g.set("bisect", g.get("bisect_right"));
         g.set("insort", g.get("insort_right"));

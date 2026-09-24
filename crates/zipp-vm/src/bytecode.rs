@@ -2180,6 +2180,253 @@ pub enum Instr {
         dict: Reg,
         slow: u32,
     },
+
+    // ---- Python frontend fast paths, round 2 (additive) --------------------
+    // Each is executed out of line by `Vm::py_step` (`vm/py_ops.rs`), always
+    // has a `slow` edge to the emitter's generic code, and never calls out
+    // to guest code: the fast path only reads (or, where stated, writes)
+    // runtime records, Maps and primitive values.
+    /// A Python global-name read: `dst = globals.get(key)` when `globals`
+    /// is a `Map` holding `key` (a string constant, constant-pool index);
+    /// otherwise `dst = rt.BUILTINS.get(key)` when `rt` (the runtime helper
+    /// record, a plain object) has an own data `BUILTINS` property that is
+    /// a `Map` holding `key` (the property read is this site's inline
+    /// cache). Anything else (both miss: a `NameError` or `__builtins__`)
+    /// jumps to `slow`, leaving `dst` untouched. The two lookups are the
+    /// ones the runtime's `gload` makes, in the same order.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyGlobal {
+        dst: Reg,
+        globals: Reg,
+        rt: Reg,
+        key: u32,
+        slow: u32,
+    },
+    /// `dst = s[k]` for a str `s` whose characters are all ASCII and an int
+    /// `k` (a fast-tier BigInt; a bool is not taken) within `-len(s) ..
+    /// len(s)`: the one-character str at `k` (from the end when negative).
+    /// Anything else (a non-ASCII str, an out-of-range index) jumps to
+    /// `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyStrItem {
+        dst: Reg,
+        s: Reg,
+        k: Reg,
+        slow: u32,
+    },
+    /// `dst = len(s)` (an int) for a str `s` with no lone surrogate: its
+    /// number of code points. Anything else jumps to `slow`, leaving `dst`
+    /// untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyStrLen {
+        dst: Reg,
+        s: Reg,
+        slow: u32,
+    },
+    /// `dst = obj.<key>` for an instance whose class says the name is a
+    /// plain instance-dict attribute: `obj` a plain object whose own data
+    /// `cls` (this site's inline cache) is a plain object, whose own data
+    /// `ga` is a plain object with the own data property `key` (a string
+    /// constant, constant-pool index) holding `true`, and whose own data
+    /// `dict` is a `Map` holding `key` (not `undefined`): that entry.
+    /// Anything else jumps to `slow` (the emitter's general sequence),
+    /// leaving `dst` untouched. Exactly the conjunction of the inline
+    /// `PyClassOf` / `cls.ga[key]` / `PyDictGet` read it replaces.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyGetAttr {
+        dst: Reg,
+        obj: Reg,
+        key: u32,
+        slow: u32,
+    },
+    /// `obj.<key> = val` for an instance whose class says the store is a
+    /// plain instance-dict store: as [`Instr::PyGetAttr`] with the class's
+    /// `sa` table, then `obj.dict.set(key, val)`. Anything else jumps to
+    /// `slow` having changed nothing.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PySetAttr {
+        obj: Reg,
+        key: u32,
+        val: Reg,
+        slow: u32,
+    },
+    /// `dst = isinstance(v, t)` (a bool) for a class `t` (a plain object
+    /// whose own data `isType` is `true`), as the runtime's `isinst` answers
+    /// it: `v`'s exact class is `null` → NoneType, a bool → bool, a Number →
+    /// float, a BigInt → int, a string → str (those five from `rt.ISTYPES`,
+    /// an Array `[NoneType, bool, int, float, str, bytes]` on the runtime
+    /// record `rt`), a plain object → its own data `cls` (this site's inline
+    /// cache); the answer is whether that class is `t` or its own data `mro`
+    /// (an Array) holds `t`. Anything else (another `t`, another `v`, `t`
+    /// being `bytes` found in the MRO) jumps to `slow`, leaving `dst`
+    /// untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyIsInstance {
+        dst: Reg,
+        v: Reg,
+        t: Reg,
+        rt: Reg,
+        slow: u32,
+    },
+    /// One step of a Python generator record: when `next` holds the
+    /// runtime's native generator step (`__zipp_py_gen`, `vm::py_gen`),
+    /// `dst = next.call(this)` performed directly (the step itself, with
+    /// its errors); anything else jumps to `slow` (the general call),
+    /// leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyGenNext {
+        dst: Reg,
+        next: Reg,
+        this: Reg,
+        slow: u32,
+    },
+    /// The method a positional call `obj.<key>(n args)` calls with `obj`
+    /// prepended, found in the runtime's per-class tables: for a plain
+    /// object `obj` whose own data `cls` (this site's inline cache) is a
+    /// plain object, `cls.gm[key]` when that own data property is a plain
+    /// object and `obj`'s own data `dict` is a `Map` without `key` (a user
+    /// class's function), else `cls.gb[gb]` when that own data property is
+    /// a plain object (a builtin type's method); for a str `obj`,
+    /// `rt.TSTR.gb[gb]` likewise. `key` is a string constant (constant-pool
+    /// index), `gb` the string-table index of `"<key>#<n>"`. Anything else
+    /// jumps to `slow` (the emitter's general resolution), leaving `dst`
+    /// untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyMethod {
+        dst: Reg,
+        obj: Reg,
+        rt: Reg,
+        key: u32,
+        gb: u32,
+        slow: u32,
+    },
+    /// A module's global for a call `module.<key>(...)`: for a plain object
+    /// `obj` whose own data `cls` (this site's inline cache) is `rt.TMODULE`
+    /// and whose own data `globals` is a `Map` holding `key` (a string
+    /// constant, constant-pool index; not `undefined`), that value.
+    /// Anything else jumps to `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyModGet {
+        dst: Reg,
+        obj: Reg,
+        rt: Reg,
+        key: u32,
+        slow: u32,
+    },
+    /// `dst = len(v)` (an int) for a str with no lone surrogate (its code
+    /// points, as [`Instr::PyStrLen`]) or a plain object whose own data `cls`
+    /// (this site's inline cache) is `rt.TLIST` or `rt.TTUPLE` (the length
+    /// of its own data `items` Array) or `rt.TDICT` or `rt.TSET` (its own
+    /// data `size`, a non-negative integral Number). Anything else jumps to
+    /// `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyLen {
+        dst: Reg,
+        v: Reg,
+        rt: Reg,
+        slow: u32,
+    },
+    /// A property's Python accessor function for `obj.<key>`: for a plain
+    /// object `obj` whose own data `cls` (this site's inline cache) is a
+    /// plain object whose own data `ga` (`set`: `sa`) table does not hold
+    /// `true` for `key` (a string constant, constant-pool index), the plain
+    /// object its own data `gp` (`set`: `sp`) table holds for `key` (the
+    /// runtime's per-class getter / setter cache). Anything else jumps to
+    /// `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyAttrFn {
+        dst: Reg,
+        obj: Reg,
+        key: u32,
+        set: bool,
+        slow: u32,
+    },
+    /// `dst = sequence(tuple ? T.tuple : T.list, items)` (`runtime/core.js`)
+    /// for an Array `items` of at most `rt.MAX_ITEMS` elements: a copy of
+    /// the record `rt.SEQTMPL` (an empty list the runtime made, never handed
+    /// out; own data `cls` and `items`, in that order) with `cls` the
+    /// runtime's `rt.TTUPLE` or `rt.TLIST` and `items` this Array (not a
+    /// copy). Anything else jumps to `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PySeq {
+        dst: Reg,
+        items: Reg,
+        rt: Reg,
+        tuple: bool,
+        slow: u32,
+    },
+    /// `raise e` for an exception instance `e`, as the runtime's `raise`
+    /// helper does it: `e` a plain object without an own `isType` of
+    /// `true`, whose own data `cls` is a plain object whose own data `mro`
+    /// (an Array) holds `rt.EBASE` (BaseException), and which has own data
+    /// `context` and `tbline`. The current exception (the last element of
+    /// the Array `rt.EXCSTACK`, if any) becomes `e.context` unless it is `e`,
+    /// `e.tbline` becomes -1, and `e` is thrown. Anything else jumps to
+    /// `slow` having changed nothing.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyRaise {
+        e: Reg,
+        rt: Reg,
+        slow: u32,
+    },
+    /// `dst = e` for an exception entering a handler, as the runtime's
+    /// `caught` helper does it: `e` a plain object with an own data `tbline`
+    /// and an own data `cls` whose own data `mro` (an Array) holds
+    /// `rt.EBASE`; a `tbline` of -1 becomes the value in `line`. Anything
+    /// else jumps to `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyCaught {
+        dst: Reg,
+        e: Reg,
+        line: Reg,
+        rt: Reg,
+        slow: u32,
+    },
+    /// `dst = obj.<key>` for an instance whose class answers the name with
+    /// a plain class attribute: `obj` a plain object whose own data `cls`
+    /// (this site's inline cache) is a plain object whose own data `ga`
+    /// table holds `true` for `key` (a string constant, constant-pool index)
+    /// and whose own data `gv` table holds a value for it (the runtime's
+    /// cache of a class attribute that is an int, float, str or bool), and
+    /// whose own data `dict` is a `Map` without `key`: that value. Anything
+    /// else jumps to `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyClassAttr {
+        dst: Reg,
+        obj: Reg,
+        key: u32,
+        slow: u32,
+    },
+    /// The lookup of `d.get(k)` for an exact dict: `d` a plain object whose
+    /// own data `cls` is `rt.TDICT` and whose own data `map` is a `Map`.
+    /// With own data `str` `true` (every key a str) and a str `k`: the
+    /// entry `map.get(k)`. With `str` `false` (bucketed) and an int `k` of
+    /// at most 2^53-1 in magnitude: the bucket `map.get(Number(k))`, which
+    /// must be an Array of one entry `[key, value, ...]` (an Array) whose
+    /// `key` is `k` (`===`), and then `value`. An entry that is found goes
+    /// to `dst`; no entry (or no bucket) jumps to `absent` (the default);
+    /// anything else jumps to `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyDictLookup {
+        dst: Reg,
+        d: Reg,
+        k: Reg,
+        rt: Reg,
+        absent: u32,
+        slow: u32,
+    },
+    /// The items to unpack `v` into `n` targets: for a plain object whose
+    /// own data `cls` is `rt.TTUPLE` or `rt.TLIST` and whose own data
+    /// `items` is an Array of exactly `n` elements, that Array (not a copy).
+    /// Anything else jumps to `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyUnpack {
+        dst: Reg,
+        v: Reg,
+        rt: Reg,
+        n: u32,
+        slow: u32,
+    },
 }
 
 /// The operators of [`Instr::PyArith`]. `Add`, `Sub` and `Mul` take every

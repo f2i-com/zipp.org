@@ -1009,5 +1009,87 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
             *seq = m(*seq);
             *dict = m(*dict);
         }
+        Instr::PyGlobal { dst, globals, rt, .. } => {
+            *dst = m(*dst);
+            *globals = m(*globals);
+            *rt = m(*rt);
+        }
+        Instr::PyStrItem { dst, s, k, .. } => {
+            *dst = m(*dst);
+            *s = m(*s);
+            *k = m(*k);
+        }
+        Instr::PyStrLen { dst, s, .. } => {
+            *dst = m(*dst);
+            *s = m(*s);
+        }
+        Instr::PyGetAttr { dst, obj, .. } => {
+            *dst = m(*dst);
+            *obj = m(*obj);
+        }
+        Instr::PySetAttr { obj, val, .. } => {
+            *obj = m(*obj);
+            *val = m(*val);
+        }
+        Instr::PyIsInstance { dst, v, t, rt, .. } => {
+            *dst = m(*dst);
+            *v = m(*v);
+            *t = m(*t);
+            *rt = m(*rt);
+        }
+        Instr::PyGenNext { dst, next, this, .. } => {
+            *dst = m(*dst);
+            *next = m(*next);
+            *this = m(*this);
+        }
+        Instr::PyMethod { dst, obj, rt, .. } => {
+            *dst = m(*dst);
+            *obj = m(*obj);
+            *rt = m(*rt);
+        }
+        Instr::PyModGet { dst, obj, rt, .. } => {
+            *dst = m(*dst);
+            *obj = m(*obj);
+            *rt = m(*rt);
+        }
+        Instr::PyLen { dst, v, rt, .. } => {
+            *dst = m(*dst);
+            *v = m(*v);
+            *rt = m(*rt);
+        }
+        Instr::PyAttrFn { dst, obj, .. } => {
+            *dst = m(*dst);
+            *obj = m(*obj);
+        }
+        Instr::PySeq { dst, items, rt, .. } => {
+            *dst = m(*dst);
+            *items = m(*items);
+            *rt = m(*rt);
+        }
+        Instr::PyRaise { e, rt, .. } => {
+            *e = m(*e);
+            *rt = m(*rt);
+        }
+        Instr::PyCaught { dst, e, line, rt, .. } => {
+            *dst = m(*dst);
+            *e = m(*e);
+            *line = m(*line);
+            *rt = m(*rt);
+        }
+        Instr::PyClassAttr { dst, obj, .. } => {
+            *dst = m(*dst);
+            *obj = m(*obj);
+        }
+        Instr::PyDictLookup { dst, d, k, rt, .. } => {
+            *dst = m(*dst);
+            *d = m(*d);
+            *k = m(*k);
+            *rt = m(*rt);
+        }
+        Instr::PyUnpack { dst, v, rt, .. } => {
+            *dst = m(*dst);
+            *v = m(*v);
+            *rt = m(*rt);
+        }
     }
 }

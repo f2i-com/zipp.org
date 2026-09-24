@@ -2965,6 +2965,14 @@ pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 pub(crate) mod prof;
 mod py_ops;
 #[cfg(feature = "python")]
+mod py_gen;
+#[cfg(feature = "python")]
+mod py_json;
+#[cfg(feature = "python")]
+mod py_key;
+#[cfg(feature = "python")]
+mod py_str;
+#[cfg(feature = "python")]
 mod py_tensor;
 pub(crate) use prof::dump as prof_stats;
 pub(crate) use temporal::tzdb_version;

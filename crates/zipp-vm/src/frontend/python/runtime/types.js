@@ -484,8 +484,14 @@
         if (ta === typeof b) { if (ta === "number") return floatFloorDiv(a, b); if (ta === "bigint") return pyFloorDiv(a, b); }
         return binop("floordiv", a, b, false);
     };
+    // `str % values`: the engine's native form for the common format
+    // strings (`vm::py_str`, bound only in a Python program), which answers
+    // undefined for every other one.
+    let PCT = null;
+    try { PCT = typeof __zipp_py_pct === "function" ? __zipp_py_pct : null; } catch (e) { PCT = null; }
     R.mod = function (a, b) {
         const ta = typeof a;
+        if (ta === "string" && PCT !== null) { const r = PCT(a, b, T.tuple); if (r !== undefined) return r; }
         if (ta === typeof b) { if (ta === "number") return floatMod(a, b); if (ta === "bigint") return pyMod(a, b); }
         return binop("mod", a, b, false);
     };
@@ -642,7 +648,7 @@
         if (op === "lt" && ta === "object" && tb === "object" && a !== null && b !== null) {
             const ca = a.cls;
             if (ca === b.cls && (ca === T.tuple || ca === T.list)) {
-                if (PYORD !== null) { const r = PYORD(0, a.items, b.items); if (r !== undefined) return r < 0; }
+                if (PYORD !== null) { const r = PYORD(3, a.items, b.items, T.tuple); if (r !== undefined) return r < 0; }
                 return compareSeq(a.items, b.items) < 0;
             }
         }
@@ -714,6 +720,12 @@
         return m;
     }
     R.richcmp = function (op, a, b) {
+        // Two exact tuples or two exact lists: no user dunder can apply while
+        // the builtin types are as the runtime made them.
+        if (a !== null && b !== null && typeof a === "object" && typeof b === "object" && rt.builtinsTouched === false) {
+            const c = a.cls;
+            if (c === b.cls && (c === T.tuple || c === T.list)) return op === "eq" ? eq(a, b) : cmp(op, a, b);
+        }
         const names = RICH[op];
         if (names !== undefined && ((a !== null && typeof a === "object") || (b !== null && typeof b === "object"))) {
             let rm = userDunder(b, names[1]);
@@ -850,6 +862,8 @@
     // then compared with __eq__.
     const NONE_KEY = { none: true };
     const SAFE = 9007199254740991;
+    let TKEY = null;
+    try { TKEY = typeof __zipp_py_tkey === "function" ? __zipp_py_tkey : null; } catch (e) { TKEY = null; }
     function keyOf(v) {
         const tv = typeof v;
         if (tv === "string") return v.charCodeAt(0) === 0 ? "\0s" + v : v;
@@ -870,7 +884,9 @@
             // change, and neither do their keys.
             const known = v.hkey;
             if (known !== undefined) return known;
-            const k = "\0" + baseKey(v);
+            // The engine builds the same text for plain items (`vm::py_key`).
+            let k = TKEY !== null ? TKEY(v, T.tuple) : undefined;
+            if (k === undefined) k = "\0" + baseKey(v);
             const items = v.items;
             let plain = true;
             for (let i = 0; i < items.length; i++) { const x = items[i]; if (x !== null && typeof x === "object") { plain = false; break; } }
@@ -1079,13 +1095,20 @@
         if (d.coll === true) out.sort((x, y) => x[2] - y[2]);
         return out;
     }
+    // The iterator keeps its state in its own fields (`a` the keys snapshot,
+    // `i` the position, `b` the dict, `size` its size then), so its step is
+    // one shared function (`keyNext`, as `jnext`) or the engine's native
+    // form of it (`vm::py_str`, `__zipp_py_iter`, kind 3).
+    function keyNext() {
+        if (this.b.size !== this.size) fail(E.RuntimeError, "dictionary changed size during iteration");
+        return this.i < this.a.length ? this.a[this.i++] : STOP;
+    }
+    let KEY_STEP = null;
+    try { KEY_STEP = typeof __zipp_py_iter === "function" ? __zipp_py_iter : null; } catch (e) { KEY_STEP = null; }
     function dictKeyIter(d) {
         const keys = d.str === true ? Array.from(d.map.keys()) : dictEntryList(d).map((e) => e[0]);
-        let i = 0; const size = d.size;
-        return { cls: T.iterator, next: () => {
-            if (d.size !== size) fail(E.RuntimeError, "dictionary changed size during iteration");
-            return i < keys.length ? keys[i++] : STOP;
-        } };
+        return { cls: T.iterator, next: KEY_STEP !== null ? KEY_STEP : keyNext, jnext: keyNext,
+            kind: 3, a: keys, i: 0, b: d, size: d.size, pick: 0, tmpl: null, ttype: null };
     }
     // `dictEntries`' own loops, without its generator (a resumption per
     // entry): the same entries in the same order, live as it is.

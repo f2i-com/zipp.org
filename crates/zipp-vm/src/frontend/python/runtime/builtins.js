@@ -112,9 +112,12 @@
     });
     method(E.BaseException, "with_traceback", 2, function (args) { return args[0]; });
     method(E.BaseException, "add_note", 2, function (args) { return null; });
+    // A constructed exception has no context until it is raised. (One
+    // allocator for all, so construction can recognize it: `excEntry`.)
+    const excAlloc = (cls) => { const e = rt.makeExc(cls, []); e.context = null; return e; };
+    rt.excAlloc = excAlloc; rt.excInit = E.BaseException.dict.get("__init__");
     for (const [name, exc] of Object.entries(E)) {
-        // A constructed exception has no context until it is raised.
-        rt.allocators.set(exc, (cls) => { const e = rt.makeExc(cls, []); e.context = null; return e; });
+        rt.allocators.set(exc, excAlloc);
         B.set(name, exc);
     }
     B.set("EnvironmentError", E.OSError); B.set("IOError", E.OSError);
@@ -530,6 +533,18 @@
         direct("lower", 1, function (s) { return typeof s === "string" ? s.toLowerCase() : this.code([s]); });
         direct("upper", 1, function (s) { return typeof s === "string" ? s.toUpperCase() : this.code([s]); });
         direct("strip", 1, function (s) { return typeof s === "string" ? s.trim() : this.code([s]); });
+        // With a str of characters (and no surrogate in either str, so each
+        // code unit is a code point): the ends cut while they are in it.
+        const stripIn = (s, chars, mode) => {
+            let i = 0, j = s.length;
+            if (mode <= 0) while (i < j && chars.indexOf(s[i]) >= 0) i++;
+            if (mode >= 0) while (j > i && chars.indexOf(s[j - 1]) >= 0) j--;
+            return i === 0 && j === s.length ? s : s.slice(i, j);
+        };
+        const plainPair = (s, chars) => typeof s === "string" && typeof chars === "string" && !rt.hasSurrogate(s) && !rt.hasSurrogate(chars);
+        direct("strip", 2, function (s, chars) { return plainPair(s, chars) ? stripIn(s, chars, 0) : this.code([s, chars]); });
+        direct("lstrip", 2, function (s, chars) { return plainPair(s, chars) ? stripIn(s, chars, -1) : this.code([s, chars]); });
+        direct("rstrip", 2, function (s, chars) { return plainPair(s, chars) ? stripIn(s, chars, 1) : this.code([s, chars]); });
         direct("startswith", 2, function (s, p) { return typeof s === "string" && typeof p === "string" ? s.startsWith(p) : this.code([s, p]); });
         direct("endswith", 2, function (s, p) { return typeof s === "string" && typeof p === "string" ? s.endsWith(p) : this.code([s, p]); });
         direct("find", 2, function (s, sub) {
@@ -564,6 +579,30 @@
             }
             return rt.checkedText(parts.join(sep));
         });
+    }
+    // The engine's native forms of some of those entries (`vm::py_str`,
+    // bound only in a Python program): each keeps the entry it replaces as
+    // `j<n>`, answers what that answers for plain strs, and calls it for
+    // anything else.
+    {
+        let STRM = null;
+        try { STRM = typeof __zipp_py_strm === "function" ? __zipp_py_strm : null; } catch (e) { STRM = null; }
+        rt.nativeEntry = null;
+        if (STRM !== null) {
+            const LT = list([]);
+            const install = (b, n, op) => {
+                b.strop = op; b.ltmpl = LT; b.ttype = T.tuple;
+                // A one-argument builtin with no entry yet: the one
+                // `builtinFast` would give it.
+                b["j" + n] = b["c" + n] !== undefined ? b["c" + n] : n === 1 ? function (a) { return this.code([a]); } : function (a, c) { return this.code([a, c]); };
+                b["c" + n] = STRM;
+            };
+            const native = (name, n, op) => install(S.dict.get(name), n, op);
+            rt.nativeEntry = install;
+            native("strip", 2, 1); native("lstrip", 2, 2); native("rstrip", 2, 3);
+            native("split", 1, 4); native("split", 2, 4); native("replace", 3, 5); native("find", 2, 6);
+            native("join", 2, 7); native("lower", 1, 8); native("upper", 1, 9);
+        }
     }
     // CPython's digit classes follow Numeric_Type: isdecimal is Decimal (Nd),
     // isdigit adds Digit (superscripts, circled and parenthesized digits,
@@ -880,7 +919,7 @@
     function sortItems(items, key, reverse) {
         // As CPython: reverse=True reverses, sorts stably and reverses back,
         // so equal items keep their order and `<` sees the same operands.
-        const keys = key === null ? items.slice() : rt.amap(items, (x) => call(key, [x], null));
+        const keys = key === null ? items.slice() : rt.amap(items, (x) => rt.call1(key, x));
         const values = key === null ? null : items.slice();
         if (reverse) { keys.reverse(); if (values !== null) values.reverse(); }
         const lt = rt.fastLt;
@@ -888,14 +927,8 @@
         // them stably, which for such keys is exactly the order (and the tie
         // order) any stable sort by `<` gives.
         if (rt.PYORD !== null && keys.length > 1) {
-            let plain = true;
-            const nk = new Array(keys.length);
-            for (let i = 0; i < keys.length; i++) {
-                const f = ordForm(keys[i], 0);
-                if (f === undefined) { plain = false; break; }
-                nk[i] = f;
-            }
-            const perm = plain ? rt.PYORD(1, nk) : undefined;
+            // (Op 2: tuple records read natively, nested at most 8 deep.)
+            const perm = rt.PYORD(2, keys, T.tuple);
             if (perm !== undefined) {
                 const ks = keys.slice(), vs = values === null ? null : values.slice();
                 for (let i = 0; i < perm.length; i++) { const j = perm[i]; keys[i] = ks[j]; if (vs !== null) values[i] = vs[j]; }
@@ -912,20 +945,6 @@
         }
         const out = values === null ? keys : values;
         if (reverse) out.reverse();
-        return out;
-    }
-    // A sort key as the engine's ordering takes it: a plain value itself, a
-    // tuple (nested ones too) as an array of its items; `undefined` for
-    // anything else (a list, an instance), which only the protocol orders.
-    function ordForm(k, depth) {
-        if (k === null || typeof k !== "object") return k;
-        if (k.cls !== T.tuple || depth > 8) return undefined;
-        const items = k.items, out = new Array(items.length);
-        for (let i = 0; i < items.length; i++) {
-            const f = ordForm(items[i], depth + 1);
-            if (f === undefined) return undefined;
-            out[i] = f;
-        }
         return out;
     }
     // CPython 3.13's sort of a short list, comparison for comparison: the
@@ -1038,18 +1057,28 @@
     methodkw(D, "update", (a) => { const kw = kwOf(a, null); fillDict(dictSelf(a), a[1], kw); return null; });
     method(D, "clear", 1, (a) => { rt.dictClear(dictSelf(a)); return null; });
     method(D, "copy", 1, (a) => rt.dictCopy(dictSelf(a)));
-    function view(type, d, pick) {
-        return { cls: type, dict: d, iter: () => {
-            const entries = dictEntryList(d); let i = 0; const size = d.size;
-            return { cls: T.iterator, next: () => {
-                if (d.size !== size) fail(E.RuntimeError, "dictionary changed size during iteration");
-                return i < entries.length ? pick(entries[i++]) : STOP;
-            } };
-        } };
+    // A view's iterator keeps its state in its own fields (`a` the entries
+    // snapshot, `i` the position, `b` the dict, `size` its size then, `pick`
+    // 0/1/2 for keys/values/items), so its step is one shared function
+    // (`viewNext`, as `jnext`) or the engine's native form of it
+    // (`vm::py_str`, `__zipp_py_iter`, bound only in a Python program).
+    function viewNext() {
+        if (this.b.size !== this.size) fail(E.RuntimeError, "dictionary changed size during iteration");
+        const entries = this.a;
+        if (this.i < entries.length) { const e = entries[this.i++]; const p = this.pick; return p === 0 ? e[0] : p === 1 ? e[1] : tuple([e[0], e[1]]); }
+        return STOP;
     }
-    method(D, "keys", 1, (a) => view(T.dict_keys, dictSelf(a), (e) => e[0]));
-    method(D, "values", 1, (a) => view(T.dict_values, dictSelf(a), (e) => e[1]));
-    method(D, "items", 1, (a) => view(T.dict_items, dictSelf(a), (e) => tuple([e[0], e[1]])));
+    let ITER_STEP = null;
+    try { ITER_STEP = typeof __zipp_py_iter === "function" ? __zipp_py_iter : null; } catch (e) { ITER_STEP = null; }
+    const ITER_TMPL = list([]);
+    function view(type, d, pick) {
+        return { cls: type, dict: d, iter: () => ({ cls: T.iterator, next: ITER_STEP !== null ? ITER_STEP : viewNext, jnext: viewNext,
+            kind: 1, a: dictEntryList(d), i: 0, b: d, size: d.size, pick: pick, tmpl: ITER_TMPL, ttype: T.tuple }) };
+    }
+    rt.iterStep = ITER_STEP; rt.iterTmpl = ITER_TMPL;
+    method(D, "keys", 1, (a) => view(T.dict_keys, dictSelf(a), 0));
+    method(D, "values", 1, (a) => view(T.dict_values, dictSelf(a), 1));
+    method(D, "items", 1, (a) => view(T.dict_items, dictSelf(a), 2));
     for (const v of [T.dict_keys, T.dict_values, T.dict_items]) {
         method(v, "__len__", 1, (a) => BigInt(a[0].dict.size));
         method(v, "__iter__", 1, (a) => a[0].iter());
@@ -1137,12 +1166,39 @@
     method(T.generator, "send", 2, (a) => a[0].send(a[1]));
     method(T.generator, "close", 1, (a) => a[0].close());
     method(T.generator, "throw", -1, (a) => { let e = a[1]; if (isType(e)) e = rt.construct(e, a[2] === undefined ? [] : [a[2]], null); return a[0].throwIn(e); });
+    // `enumerate` over an exact list or tuple keeps its state in its own
+    // fields (`a` the sequence, `i` the position, `b` the count), as the
+    // list iterator it would wrap reads the live items (see `view`).
+    function enumNext() {
+        const items = this.a.items;
+        if (this.i < items.length) { const v = items[this.i++]; const c = this.b; this.b = c + 1n; return tuple([c, v]); }
+        this.i = Infinity; return STOP;
+    }
     rt.constructors.set(T.enumerate, (args, kw) => {
         let start = kw && kw.has("start") ? needInt(kw.get("start")) : args[1] === undefined ? 0n : needInt(args[1]);
+        const src = args[0];
+        if (src !== null && typeof src === "object" && (src.cls === T.list || src.cls === T.tuple) && src.items !== undefined) {
+            return { cls: T.enumerate, next: rt.iterStep !== null ? rt.iterStep : enumNext, jnext: enumNext,
+                kind: 2, a: src, i: 0, b: start, size: 0, pick: 0, tmpl: rt.iterTmpl, ttype: T.tuple };
+        }
         const it = iter(args[0]); let i = start;
         return { cls: T.enumerate, next: () => { const v = fornext(it); if (v === STOP) return STOP; return tuple([i++, v]); } };
     });
+    // `zip` over exact lists and tuples keeps its state in its own fields
+    // (`a` the sequences, `i` the common position; see `view`): the list
+    // iterators it would wrap read the live items, and once one ends every
+    // later step ends too.
+    function zipNext() {
+        const srcs = this.a, i = this.i, out = new Array(srcs.length);
+        for (let j = 0; j < srcs.length; j++) { const items = srcs[j].items; if (!(i < items.length)) { this.i = Infinity; return STOP; } out[j] = items[i]; }
+        this.i = i + 1; return tuple(out);
+    }
     rt.constructors.set(T.zip, (args, kw) => {
+        if ((kw === null || kw === undefined || kw.size === 0) && args.length > 0
+            && rt.aevery(args, (s) => s !== null && typeof s === "object" && (s.cls === T.list || s.cls === T.tuple) && s.items !== undefined)) {
+            return { cls: T.zip, next: rt.iterStep !== null ? rt.iterStep : zipNext, jnext: zipNext,
+                kind: 4, a: args.slice(), i: 0, b: null, size: 0, pick: 0, tmpl: rt.iterTmpl, ttype: T.tuple };
+        }
         const strict = kw && kw.has("strict") ? truth(kw.get("strict")) : false;
         const its = args.map(iter);
         return { cls: T.zip, next: () => {
@@ -1154,11 +1210,11 @@
     });
     rt.constructors.set(T.map, (args) => {
         const f = args[0]; const its = args.slice(1).map(iter);
-        return { cls: T.map, next: () => { const vals = []; for (const it of its) { const v = fornext(it); if (v === STOP) return STOP; vals.push(v); } return call(f, vals, null); } };
+        return { cls: T.map, next: () => { const vals = []; for (const it of its) { const v = fornext(it); if (v === STOP) return STOP; vals.push(v); } return vals.length === 1 ? rt.call1(f, vals[0]) : call(f, vals, null); } };
     });
     rt.constructors.set(T.filter, (args) => {
         const f = args[0]; const it = iter(args[1]);
-        return { cls: T.filter, next: () => { for (;;) { const v = fornext(it); if (v === STOP) return STOP; if (f === null ? truth(v) : truth(call(f, [v], null))) return v; } } };
+        return { cls: T.filter, next: () => { for (;;) { const v = fornext(it); if (v === STOP) return STOP; if (f === null ? truth(v) : truth(rt.call1(f, v))) return v; } } };
     });
     rt.constructors.set(T.reversed, (args) => {
         const v = args[0];
@@ -1401,8 +1457,8 @@
         let items;
         if (a.length === 1) { items = drain(a[0]); if (!items.length) { if (kw && kw.has("default")) return kw.get("default"); fail(E.ValueError, name + "() iterable argument is empty"); } }
         else { if (a.length === 0) fail(E.TypeError, name + " expected at least 1 argument, got 0"); items = a; }
-        let best = items[0], bestKey = key === null ? best : call(key, [best], null);
-        for (let i = 1; i < items.length; i++) { const k = key === null ? items[i] : call(key, [items[i]], null); if (cmp(op, k, bestKey)) { best = items[i]; bestKey = k; } }
+        let best = items[0], bestKey = key === null ? best : rt.call1(key, best);
+        for (let i = 1; i < items.length; i++) { const k = key === null ? items[i] : rt.call1(key, items[i]); if (cmp(op, k, bestKey)) { best = items[i]; bestKey = k; } }
         return best;
     }
     defkw("sum", (a) => {
@@ -1461,6 +1517,8 @@
     def("delattr", 2, (a) => R.delattr(a[0], attrName(a[1])));
     def("id", 1, (a) => BigInt(rt.ident(a[0]) || (typeof a[0] === "string" ? rt.hashInt(a[0]) : 0n)));
     def("hash", 1, (a) => rt.hashInt(a[0]));
+    // A str's hash natively (`vm::py_str`, op 10).
+    if (rt.nativeEntry !== null) rt.nativeEntry(B.get("hash"), 1, 10);
     def("callable", 1, (a) => { const v = a[0]; return v !== null && typeof v === "object" && (v.cls === T.function || v.cls === T.builtin_function_or_method || v.cls === T.method || v.isType === true || typeMethod(v, "__call__") !== undefined); });
     def("chr", 1, (a) => { const n = Number(needInt(a[0])); if (n < 0 || n > 0x10FFFF) fail(E.ValueError, "chr() arg not in range(0x110000)"); return String.fromCodePoint(n); });
     def("ord", 1, (a) => { const s = needStr(a[0], "ord() expected string of length 1, but"); const cps = codepoints(s); if (cps.length !== 1) fail(E.TypeError, "ord() expected a character, but string of length " + cps.length + " found"); return BigInt(cps[0].codePointAt(0)); });
@@ -1824,7 +1882,17 @@
     // without building the super object: a plain Python function comes
     // back unbound with `R.mself` set (the call passes `self` first); any
     // other attribute comes back bound, as `superAttr` gives it.
+    // An instance's class keeps the plain functions found this way
+    // (`gs[name]`: the class searched past and the function), dropped
+    // wherever its other lookup tables are.
     R.smfind = function (cls, self, name) {
+        if (self !== null && typeof self === "object" && self.isType !== true) {
+            const t = self.cls;
+            if (t !== undefined && t.gs !== undefined) {
+                const hit = t.gs[name];
+                if (hit !== undefined && hit.cls === cls) { R.mself = true; return hit.f; }
+            }
+        }
         const objtype = rt.isType(self) && rt.isSubclass(self, cls) ? self : rt.typeOf(self);
         const mro = objtype.mro;
         const start = mro.indexOf(cls) + 1;
@@ -1832,7 +1900,12 @@
         for (let i = start; i < mro.length; i++) {
             const v = mro[i].dict.get(name);
             if (v === undefined) continue;
-            if (!onClass && v !== null && typeof v === "object" && v.cls === T.function) { R.mself = true; return v; }
+            if (!onClass && v !== null && typeof v === "object" && v.cls === T.function) {
+                if (start > 0 && objtype.gs !== undefined && self !== null && typeof self === "object" && self.cls === objtype) {
+                    objtype.gs[name] = { cls: cls, f: v }; rt.noteFlagged(objtype);
+                }
+                R.mself = true; return v;
+            }
             const r = rt.descrGet(v, onClass ? null : self, objtype);
             R.mself = false;
             return r;
@@ -1913,7 +1986,10 @@
 (function (R) {
     "use strict";
     const rt = R.__rt, T = rt.T;
-    R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict;
+    R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict; R.TSET = T.set;
+    // The emitter's native list and tuple displays (`PySeq`) copy this
+    // record, which `sequence` made and nothing else ever sees.
+    R.SEQTMPL = rt.list([]);
     // The `Number` intrinsic, for the emitter's guarded int-to-index conversions.
     R.Number = Number;
     // The text limit an inline str concatenation is checked against.
@@ -1934,6 +2010,9 @@
     R.BUILTINS = rt.builtins;
     R.BLEN = rt.builtins.get("len"); R.len1 = rt.len;
     R.BISINSTANCE = rt.builtins.get("isinstance");
+    // The exact classes of the primitive values, and bytes, for the
+    // emitter's native `isinstance` (`PyIsInstance`); never changed.
+    R.ISTYPES = [T.NoneType, T.bool, T.int, T.float, T.str, T.bytes];
     R.BHASATTR = rt.builtins.get("hasattr");
     const isinstanceCode = R.BISINSTANCE.code;
     R.isinst = function (v, t) {

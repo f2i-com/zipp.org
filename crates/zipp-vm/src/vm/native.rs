@@ -332,6 +332,43 @@ pub const PY_STR_NAME: &str = "__zipp_py_str";
 pub const PY_ORD: u16 = 1952;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_ORD_NAME: &str = "__zipp_py_ord";
+/// The Python runtime's generator step (`vm::py_gen`): a generator record's
+/// `next` member, called as `g.next()`. Bound like [`PY_TENSOR`], only in a
+/// Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_GEN: u16 = 1953;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_GEN_NAME: &str = "__zipp_py_gen";
+/// The Python runtime's `json` fast paths (`vm::py_json`). Bound like
+/// [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_JSON: u16 = 1954;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_JSON_NAME: &str = "__zipp_py_json";
+/// The Python runtime's `str % values` fast path (`vm::py_str`). Bound like
+/// [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_PCT: u16 = 1955;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_PCT_NAME: &str = "__zipp_py_pct";
+/// The Python runtime's native str-method entries (`vm::py_str`). Bound
+/// like [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_STRM: u16 = 1956;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_STRM_NAME: &str = "__zipp_py_strm";
+/// The Python runtime's dict key of a tuple (`vm::py_key`). Bound like
+/// [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_TKEY: u16 = 1957;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_TKEY_NAME: &str = "__zipp_py_tkey";
+/// The Python runtime's native iterator step (`vm::py_str`). Bound like
+/// [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_ITER: u16 = 1958;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_ITER_NAME: &str = "__zipp_py_iter";
 
 // ── decorator context closures (proposal-decorators) ────────────────────────
 // Each is a `HeapObj::NativeClosure`, not a bare `Native`: they close over the
@@ -1665,6 +1702,18 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PY_STR => ("", 1),
         #[cfg(feature = "python")]
         PY_ORD => ("", 2),
+        #[cfg(feature = "python")]
+        PY_GEN => ("next", 0),
+        #[cfg(feature = "python")]
+        PY_JSON => ("", 2),
+        #[cfg(feature = "python")]
+        PY_PCT => ("", 3),
+        #[cfg(feature = "python")]
+        PY_STRM => ("", 1),
+        #[cfg(feature = "python")]
+        PY_TKEY => ("", 2),
+        #[cfg(feature = "python")]
+        PY_ITER => ("next", 0),
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),

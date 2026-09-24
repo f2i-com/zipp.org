@@ -1,0 +1,39 @@
+NoneType 1000000000000010
+bool 0110000000000010
+bool 0110000000000010
+int 0010000000000010
+int 0010000000000010
+int 0010000000000010
+float 0001000000000010
+float 0001000000000010
+str 0000100000000010
+str 0000100000000010
+bytes 0000010000000010
+bytearray 0000001000000010
+list 0000000100000010
+tuple 0000000010000010
+dict 0000000001000010
+set 0000000000100010
+frozenset 0000000000010010
+range 0000000000001010
+complex 0000000000000110
+builtin_function_or_method 0000000000000010
+type 0000000000000011
+object 0000000000000010
+[True, False, False, False, True, False, False, False]
+[True, True, False, False, True, False, False, False]
+[True, True, True, True, True, False, False, False]
+[False, False, False, False, True, True, False, False]
+[False, False, False, False, True, True, False, False]
+[False, False, False, False, True, True, True, False]
+[False, False, False, False, True, False, False, True]
+[False, False, False, False, True, True, False, False]
+True True False True False True
+True False True False True
+True True False True False
+TypeError int
+TypeError str
+TypeError list
+9430
+shadowed
+True

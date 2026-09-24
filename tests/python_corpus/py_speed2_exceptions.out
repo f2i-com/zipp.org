@@ -1,0 +1,24 @@
+["app:('five', 0):('five', 0)", "code:code 1:1:('code 1',)", 'key:()', "key:('missing3',)", 'none', "app:('five', 5):('five', 5)", "code:code 6:6:('code 6',)", 'key:()', "key:('missing8',)", 'none']
+True ('x',) None None
+True ('x',) None None
+True ('x',) None None
+AppError('outer') ValueError('inner') False
+ValueError('inner') ValueError('inner') True
+None ValueError('inner') True
+reraised again
+class raised AppError() ()
+TypeError: exceptions must derive from BaseException
+TypeError: exceptions must derive from BaseException
+self-context True
+['ok0', 'fin0', 'fin1', 'caught1', 'ok2', 'fin2', 'fin3', 'caught3']
+None
+[1, 'gen caught from gen']
+True True ('code 4',) code 5 KeyError('k') 'k' ()
+(1, 2) (1, 2)  AppError('q') False
+[(100, 1.5, 'acct', True), (100, 1.5, 'acct', True)] [(75, 1.5, 'acct', True), (50, 1.5, 'acct', True)]
+(93, 1.5, 'acct', True) (25, 1.5, 'acct', True)
+(24, 1.5, 'acct', True) 25
+(-1, 1.5, 'acct', True)
+(-8, 1.5, 'acct', True)
+(-907, 1.5, 'acct', True) (-1008, 1.5, 'acct', True)
+(-1907, 1.5, None, True)

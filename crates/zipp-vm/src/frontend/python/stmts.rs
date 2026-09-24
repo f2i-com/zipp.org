@@ -176,6 +176,14 @@ impl<'a> Emitter<'a> {
                     Some(c) => self.expr(c, depth + 1)?,
                     None => self.undefined()?,
                 };
+                // An exception instance with no cause: thrown natively
+                // (`PyRaise`); everything else through the helper.
+                if self.fast && s.exc.is_some() && s.cause.is_none() {
+                    let rt = self.r_rt;
+                    let at = self.emit(Instr::PyRaise { e: exc, rt, slow: 0 })?;
+                    let here = self.here();
+                    self.patch_slow(at, here)?;
+                }
                 self.helper("raise", &[exc, cause])?;
             }
             ast::Stmt::Try(s) => self.try_stmt(s, depth + 1)?,
@@ -572,7 +580,10 @@ impl<'a> Emitter<'a> {
             Some(args) => self.range_stepper(args, depth + 1)?,
             None => {
                 let value = self.expr(&s.iter, depth + 1)?;
-                self.seq_stepper(value, true)?
+                // A display is already an exact list or tuple (`seqiter`
+                // would answer it unchanged).
+                let wrap = !(self.fast && super::exprs::is_sequence_display(&s.iter));
+                self.seq_stepper(value, wrap)?
             }
         };
         let head = self.here();
@@ -767,17 +778,25 @@ impl<'a> Emitter<'a> {
         let mut stepped = None;
         if let Some((direct, next)) = s.direct_next {
             let generic = self.jump_if_false(direct)?;
+            // A generator's own step, directly; any other `next` is called.
+            let at = self.emit(Instr::PyGenNext { dst: item, next, this: s.iter, slow: 0 })?;
+            let gen_stepped = self.jump()?;
+            let here = self.here();
+            self.patch_slow(at, here)?;
             let base = self.block(1)?;
             self.emit(Instr::CallWithThis { dst: item, callee: next, this_v: s.iter, arg_base: base, argc: 0, name: crate::bytecode::NO_NAME })?;
-            stepped = Some(self.jump()?);
+            let end = self.jump()?;
+            stepped = Some(vec![gen_stepped, end]);
             let here = self.here();
             self.patch(generic, here)?;
         }
         let next = self.helper("fornext", &[s.iter])?;
         self.emit(Instr::Move { dst: item, src: next })?;
-        if let Some(j) = stepped {
+        if let Some(jumps) = stepped {
             let here = self.here();
-            self.patch(j, here)?;
+            for j in jumps {
+                self.patch(j, here)?;
+            }
         }
         let done = self.alloc()?;
         self.emit(Instr::Eq {
@@ -942,7 +961,14 @@ impl<'a> Emitter<'a> {
         let items = self.alloc()?;
         // An exact tuple or list of the right length is read in place.
         let mut join = None;
+        let mut fused_join = None;
         if self.fast && star.is_none() {
+            // Natively first (`PyUnpack`); the inline reads below else.
+            let rt = self.r_rt;
+            let at = self.emit(Instr::PyUnpack { dst: items, v: value, rt, n: targets.len() as u32, slow: 0 })?;
+            fused_join = Some(self.jump()?);
+            let here = self.here();
+            self.patch_slow(at, here)?;
             let mut slow = Vec::new();
             let is_obj = self.typeof_is(value, "object")?;
             slow.push(self.jump_if_false(is_obj)?);
@@ -977,6 +1003,10 @@ impl<'a> Emitter<'a> {
         let unpacked = self.helper("unpack", &[value, count, star_index])?;
         self.emit(Instr::Move { dst: items, src: unpacked })?;
         if let Some(join) = join {
+            let here = self.here();
+            self.patch(join, here)?;
+        }
+        if let Some(join) = fused_join {
             let here = self.here();
             self.patch(join, here)?;
         }
@@ -1132,7 +1162,7 @@ impl<'a> Emitter<'a> {
         let catch_start = self.here();
         self.patch(push, catch_start)?;
         self.forget_line();
-        let exc = self.helper("caught", &[ereg, self.r_line])?;
+        let exc = self.caught(ereg)?;
         for handler in &s.handlers {
             let ast::ExceptHandler::ExceptHandler(h) = handler;
             self.stamp_line(handler)?;
@@ -1216,7 +1246,7 @@ impl<'a> Emitter<'a> {
             b: two,
         })?;
         let skip = self.jump_if_false(throwing)?;
-        let exc = self.helper("caught", &[val_reg, self.r_line])?;
+        let exc = self.caught(val_reg)?;
         self.push_exc(exc)?;
         self.emit(Instr::LoadBool {
             dst: pushed,

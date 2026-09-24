@@ -1555,6 +1555,25 @@ impl<'p> Vm<'p> {
                     | Instr::PySetItem { .. } => {
                         ip = self.py_step(func_id, base, ip, instr)?;
                     }
+                    Instr::PyGlobal { .. }
+                    | Instr::PyStrItem { .. }
+                    | Instr::PyStrLen { .. }
+                    | Instr::PyGetAttr { .. }
+                    | Instr::PySetAttr { .. }
+                    | Instr::PyIsInstance { .. }
+                    | Instr::PyGenNext { .. }
+                    | Instr::PyMethod { .. }
+                    | Instr::PyModGet { .. }
+                    | Instr::PyLen { .. }
+                    | Instr::PyAttrFn { .. }
+                    | Instr::PySeq { .. }
+                    | Instr::PyRaise { .. }
+                    | Instr::PyCaught { .. }
+                    | Instr::PyClassAttr { .. }
+                    | Instr::PyDictLookup { .. }
+                    | Instr::PyUnpack { .. } => {
+                        ip = self.py_step_ext(func_id, base, ip, instr)?;
+                    }
                     Instr::AddInt { dst, a, imm, upd } => {
                         let va = self.get(base, a);
                         let r = if va.is_int() {

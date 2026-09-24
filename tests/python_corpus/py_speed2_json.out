@@ -1,0 +1,216 @@
+[0.0, -0.0, 1.0, -1.5, 0.1, 0.3333333333333333, 2.5e-05, 0.0001, 0.0001234, 1000000000000000.0, 1e+16, 1.2345678901234568e+16, 123456789.125, 1e+22, 1.7976931348623157e+308, 5e-324, 2.2250738585072014e-308, 9007199254740992.0, 600479950316068.2, 0.3, 100.0, 1e-07, 1.23e-18]
+True
+[NaN, Infinity, -Infinity]
+ValueError: Out of range float values are not JSON compliant: inf
+[0, -1, 7, 9007199254740992, 9223372036854775808, -18446744073709551616, 1000000000000000000000000000000, 99999999999999999999999999999999999999, 10000000000000000000000000000000000000000, -999999999999999999999999999999999999999999997]
+True ['int', 'float', 'float', 'int', 'float', 'int']
+[inf, -inf, 0.0, 0, -0.0, 125.0, 0.03]
+"plain" b'"plain"'
+True True
+"" b'""'
+True True
+"quote\"back\\slash/" b'"quote\\"back\\\\slash/"'
+True True
+"tab\tnl\ncr\rbs\bff\f" b'"tab\\tnl\\ncr\\rbs\\bff\\f"'
+True True
+"\u0000\u0001\u001f\u007f" b'"\\u0000\\u0001\\u001f\x7f"'
+True True
+"caf\u00e9" b'"caf\xc3\xa9"'
+True True
+"\u2028\u2029" b'"\xe2\x80\xa8\xe2\x80\xa9"'
+True True
+"emoji \ud83d\ude00 x" b'"emoji \xf0\x9f\x98\x80 x"'
+True True
+"\u00ff\u0100\uffff" b'"\xc3\xbf\xc4\x80\xef\xbf\xbf"'
+True True
+"mixed \u00e9\ud83d\ude80\u007f" b'"mixed \xc3\xa9\xf0\x9f\x9a\x80\x7f"'
+True True
+"\ud800 lone" True
+"lone \udfff" True
+{"k\u00e9y": ["v\ud83d\ude00"]} {"kéy": ["v😀"]}
+{"b": [1, 2, {"z": null, "a": true}], "a": [false, "x"], "c": {}, "d": [], "e": {"nested": {"deep": [[], [{}]]}}, "\u00e9": 1, "Z": 2, "\ud83d\ude00": 3, "\uffff": 4}
+{"Z": 2, "a": [false, "x"], "b": [1, 2, {"a": true, "z": null}], "c": {}, "d": [], "e": {"nested": {"deep": [[], [{}]]}}, "\u00e9": 1, "\uffff": 4, "\ud83d\ude00": 3}
+{
+  "Z": 2,
+  "a": [
+    false,
+    "x"
+  ],
+  "b": [
+    1,
+    2,
+    {
+      "a": true,
+      "z": null
+    }
+  ],
+  "c": {},
+  "d": [],
+  "e": {
+    "nested": {
+      "deep": [
+        [],
+        [
+          {}
+        ]
+      ]
+    }
+  },
+  "\u00e9": 1,
+  "\uffff": 4,
+  "\ud83d\ude00": 3
+}
+{
+"b": [
+1,
+2,
+{
+"z": null,
+"a": true
+}
+],
+"a": [
+false,
+"x"
+],
+"c": {},
+"d": [],
+"e": {
+"nested": {
+"deep": [
+[],
+[
+{}
+]
+]
+}
+},
+"\u00e9": 1,
+"Z": 2,
+"\ud83d\ude00": 3,
+"\uffff": 4
+}
+{
+	"b": [
+		1,
+		2,
+		{
+			"z": null,
+			"a": true
+		}
+	],
+	"a": [
+		false,
+		"x"
+	],
+	"c": {},
+	"d": [],
+	"e": {
+		"nested": {
+			"deep": [
+				[],
+				[
+					{}
+				]
+			]
+		}
+	},
+	"\u00e9": 1,
+	"Z": 2,
+	"\ud83d\ude00": 3,
+	"\uffff": 4
+}
+{"b":[1,2,{"z":null,"a":true}],"a":[false,"x"],"c":{},"d":[],"e":{"nested":{"deep":[[],[{}]]}},"\u00e9":1,"Z":2,"\ud83d\ude00":3,"\uffff":4}
+{
+"b": [
+1,
+2,
+{
+"z": null,
+"a": true
+}
+],
+"a": [
+false,
+"x"
+],
+"c": {},
+"d": [],
+"e": {
+"nested": {
+"deep": [
+[],
+[
+{}
+]
+]
+}
+},
+"\u00e9": 1,
+"Z": 2,
+"\ud83d\ude00": 3,
+"\uffff": 4
+}
+[] {} [
+ []
+] [
+ "t"
+]
+"top" 5 null true 2.5
+{"x": [1, 2], "y": [1, 2], "z": [[1, 2], [1, 2]]}
+ValueError: Circular reference detected
+ValueError: Circular reference detected
+{"1": "bool", "2.5": "float", "null": "none", "s": "str"}
+TypeError: '<' not supported between instances of 'str' and 'int'
+{"1": "a", "2": "b", "3": "c"}
+TypeError: keys must be str, int, float, bool or None, not tuple
+{"ok": 1}
+TypeError: Object of type Point is not JSON serializable
+[{"x": 1, "y": 2}, {"p": {"x": 3, "y": 4}}]
+{"s": [1, 2]}
+[1, {"a": 2}] {"b": [[]]}
+{'a': 1, 'b': [True, False, None], 'c': {'d': 'e'}}
+{'dup': 3, 'other': 2} ['dup', 'other']
+True
+['0xd800', '0xdc00', '0xd83d'] x
+[] {} [[[]]] {'a': {}} 12 x
+True ['k0', 'k1', 'k2', 'k3', 'k4']
+{'k0': 80, 'k1': 81, 'k2': 82, 'k3': 83, 'k4': 84, 'k5': 85, 'k6': 86, 'k7': 87, 'k8': 88, 'k9': 89, 'k10': 90, 'k11': 91, 'k12': 92, 'k13': 93, 'k14': 94, 'k15': 95, 'k16': 96, 'k17': 97, 'k18': 98, 'k19': 99}
+[nan, inf, -inf]
+{'a': '1.5'} [1.0, 2.0]
+[('a', [('b', 1)])]
+[('a', 1), ('b', 2)]
+['const:NaN']
+'' JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+' ' JSONDecodeError: Expecting value: line 1 column 2 (char 1)
+'{"a" 1}' JSONDecodeError: Expecting ':' delimiter: line 1 column 6 (char 5)
+'{1: 2}' JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+'[1 2]' JSONDecodeError: Expecting ',' delimiter: line 1 column 4 (char 3)
+'"unterminated' JSONDecodeError: Unterminated string starting at: line 1 column 1 (char 0)
+'tru' JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+'nul' JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+'[1] x' JSONDecodeError: Extra data: line 1 column 5 (char 4)
+'01' JSONDecodeError: Extra data: line 1 column 2 (char 1)
+'1.' JSONDecodeError: Extra data: line 1 column 2 (char 1)
+'-' JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+'.5' JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+'1e' JSONDecodeError: Extra data: line 1 column 2 (char 1)
+'{"a":}' JSONDecodeError: Expecting value: line 1 column 6 (char 5)
+'[' JSONDecodeError: Expecting value: line 1 column 2 (char 1)
+'{' JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+'"\\x"' JSONDecodeError: Invalid \escape: line 1 column 2 (char 1)
+'"\\u12"' JSONDecodeError: Invalid \uXXXX escape: line 1 column 3 (char 2)
+'"\\u12G4"' JSONDecodeError: Invalid \uXXXX escape: line 1 column 3 (char 2)
+'[-Infinity, -]' JSONDecodeError: Expecting value: line 1 column 13 (char 12)
+True 4415 False
+{
+  "id": 3,
+  "name": "user3",
+  "none": null,
+  "ok": false,
+  "score": 0.875,
+  "tags": [
+    "t3"
+  ]
+}
+{'id': 0, 'name': 'changed', 'none': None, 'ok': True, 'score': 0.125, 'tags': ['t0']} {'id': 1, 'name': 'user1', 'none': None, 'ok': False, 'score': 0.375, 'tags': ['t1', 'more']} 51 {'new': 1}

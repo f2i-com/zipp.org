@@ -1,0 +1,63 @@
+'kamizu' 'kamizu,' 'kamizu' 'kamizu,' 'kamizu,' 'kamizu,'
+['kamizu,'] ['kamizu,'] ['kamizu,'] ['k', 'mizu,'] ['kamizu,']
+'kamizu,' 'kamizu,' 'kamizu,' 'kmizu,' '_k_a_m_i_z_u_,_'
+1 -1 -1 0 -1 -1 kamizu, KAMIZU, kamizu,
+'dor' 'dor!' '..dor' '..dor!' '..dor!' '..dor!'
+['..dor!'] ['', '', 'dor!'] ['..dor!'] ['..dor!'] ['.', 'dor!']
+'--dor!' '..dor!' '..dor!' '..dor!' '_._._d_o_r_!_'
+-1 -1 -1 0 -1 -1 ..dor! ..DOR! ..dor!
+'' '' '' '' '' ''
+[] [''] [''] [''] ['']
+'' '' '' '' '_'
+-1 -1 -1 0 -1 -1   
+'' '' '' '?' '?' '?'
+['?'] ['?'] ['?'] ['?'] ['?']
+'?' '?' '?' '?' '_?_'
+-1 -1 -1 0 -1 -1 ? ? ?
+'plain' 'plain' 'plain' 'plain' 'plain' 'plain'
+['plain'] ['plain'] ['plain'] ['pl', 'in'] ['plain']
+'plain' 'plain' 'plain' 'plin' '_p_l_a_i_n_'
+2 -1 -1 0 -1 -1 plain PLAIN plain
+'café' 'café;' 'café' 'café;' 'café;' 'café;'
+['café;'] ['café;'] ['café;'] ['c', 'fé;'] ['café;']
+'café;' 'cafE;' 'café;' 'cfé;' '_c_a_f_é_;_'
+1 -1 -1 0 -1 3 café; CAFÉ; café;
+'été' 'été.' 'été' 'été.' 'été.' 'té.'
+['été.'] ['été', ''] ['été.'] ['été.'] ['été', '']
+'été-' 'EtE.' 'été.' 'été.' '_é_t_é_._'
+-1 -1 -1 0 -1 0 été. ÉTÉ. été.
+'😀x😀' '😀x😀' '😀x😀' '😀x😀' 'x' '😀x😀'
+['😀x😀'] ['😀x😀'] ['', 'x', ''] ['😀x😀'] ['😀x😀']
+'😀x😀' '😀x😀' '😀x😀' '😀x😀' '_😀_x_😀_'
+-1 0 1 0 -1 -1 😀x😀 😀X😀 😀x😀
+'  spaced  ' '  spaced  ' '  spaced  ' '  spaced  ' '  spaced  ' '  spaced  '
+['spaced'] ['  spaced  '] ['  spaced  '] ['  sp', 'ced  '] ['  spaced  ']
+'  spaced  ' '  spaced  ' '  spaced  ' '  spced  ' '_ _ _s_p_a_c_e_d_ _ _'
+4 -1 -1 0 -1 -1   spaced     SPACED     spaced  
+'a.b.c' 'a.b.c' 'a.b.c' 'a.b.c' 'a.b.c' 'a.b.c'
+['a.b.c'] ['a', 'b', 'c'] ['a.b.c'] ['', '.b.c'] ['a.b', 'c']
+'a-b-c' 'a.b.c' 'a.b.c' '.b.c' '_a_._b_._c_'
+0 -1 -1 0 -1 -1 a.b.c A.B.C a.b.c
+['a', 'b', 'c', 'd', 'e', 'f'] ['x', 'y']
+ a a-b-c xy 😀éz 0, 1, 2
+TypeError: sequence item 1: expected str instance, int found
+ValueError: empty separator
+strip None ok
+TypeError find NoneType
+TypeError int
+TypeError find int
+'Mixed Case,.' 'Mixed Case' ['Mixed', 'Case,.']   mixed case,.     MIXED CASE,.   8   Mix3d Cas3,.   str   Mixed Case,.  +t
+mixed éé MIXED ÉÉ STRASSE True
+200000 50001 1 0 200001
+user7 r-3 a-1    42|42   |-0042|42      x|y  |None True 1.5 1e+20 100%
+1 1000000000000000000000000000000 10000000000000000000000000 é😀    é| [1, 2] 1 'q' ff 2.50
+TypeError
+TypeError
+TypeError
+'5'
+[True, True, True, True, True, True, True] 7 3
+1.4142135623730951 0.0 -0.0 2.0 1.0 inf nan 1000000000000000.0
+ValueError
+ValueError
+TypeError
+TypeError

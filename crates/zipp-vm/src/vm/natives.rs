@@ -5277,6 +5277,18 @@ impl<'p> Vm<'p> {
             PY_STR => self.py_str_has_surrogate(a0),
             #[cfg(feature = "python")]
             PY_ORD => self.py_ord(args)?,
+            #[cfg(feature = "python")]
+            PY_GEN => self.py_gen_next(this)?,
+            #[cfg(feature = "python")]
+            PY_JSON => self.py_json(args)?,
+            #[cfg(feature = "python")]
+            PY_PCT => self.py_pct(args)?,
+            #[cfg(feature = "python")]
+            PY_STRM => self.py_str_method(this, args)?,
+            #[cfg(feature = "python")]
+            PY_TKEY => self.py_tkey(args)?,
+            #[cfg(feature = "python")]
+            PY_ITER => self.py_iter_next(this)?,
             HOST_CALL => {
                 let kind = self.to_js_string(a0)?;
                 self.preflight_native_iteration_work(args.len().saturating_sub(1) as u64)?;
