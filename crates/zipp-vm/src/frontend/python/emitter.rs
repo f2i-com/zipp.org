@@ -742,12 +742,11 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         const MAX_HOISTED: usize = 32;
-        // Interned values allocate nothing, but a register read is still
-        // one instruction fewer than a load inside the loop; the ones that
-        // allocate go first.
-        let interned = crate::heap::INTERN_BIGINT_MIN..=crate::heap::INTERN_BIGINT_MAX;
+        // Small ints are immediates and allocate nothing (value.rs), but a
+        // register read is still one instruction fewer than a load inside
+        // the loop; the ones that allocate go first.
         let mut values = super::nesting::loop_int_literals(stmts);
-        values.sort_by_key(|v| interned.contains(v));
+        values.sort_by_key(|&v| crate::value::Value::small_bigint(v).is_some());
         for value in values {
             if self.hoisted.contains_key(&value) {
                 continue;

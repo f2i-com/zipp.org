@@ -5381,7 +5381,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::LoadBigInt { dst, value } => {
-                        // Small literals come from the pinned intern table.
+                        // A small literal is an immediate (value.rs).
                         let v = self.make_bigint(value);
                         self.set(base, dst, v);
                         ip += 1;

@@ -5047,25 +5047,15 @@ pub const INTERN_EMPTY: u32 = 128;
 pub const INTERN_PAD2_START: u32 = INTERN_EMPTY + 1;
 pub const INTERN_PAD2_COUNT: u32 = 100;
 pub const INTERN_PAD2_END: u32 = INTERN_PAD2_START + INTERN_PAD2_COUNT - 1;
-/// The small-BigInt table: `INTERN_BIGINT_MIN..=INTERN_BIGINT_MAX` as
-/// pre-allocated, immutable `HeapObj::BigInt` slots. BigInt-heavy guests
-/// (the Python front end represents every `int` as a BigInt) produce these
-/// values constantly — loop counters, remainders, flags, small deltas — and
-/// `Vm::make_bigint` returns the pinned slot instead of allocating.
-pub const INTERN_BIGINT_START: u32 = INTERN_PAD2_END + 1;
-pub const INTERN_BIGINT_MIN: i128 = -256;
-pub const INTERN_BIGINT_MAX: i128 = 1023;
-pub const INTERN_BIGINT_COUNT: u32 = (INTERN_BIGINT_MAX - INTERN_BIGINT_MIN + 1) as u32;
-pub const INTERN_BIGINT_END: u32 = INTERN_BIGINT_START + INTERN_BIGINT_COUNT - 1;
 /// Permanent pinned slots beyond the single-character strings and the empty
-/// string: the pad2 table plus the small-BigInt table. GC accounting treats
-/// them as OLD from birth rather than as young allocation pressure.
-pub const INTERN_PREFIX_EXTRA: u32 = INTERN_PAD2_COUNT + INTERN_BIGINT_COUNT;
+/// string: the pad2 table. GC accounting treats them as OLD from birth rather
+/// than as young allocation pressure. (Small BigInts need no table: they are
+/// immediates, see value.rs.)
+pub const INTERN_PREFIX_EXTRA: u32 = INTERN_PAD2_COUNT;
 /// Last immutable engine-interned slot. In-place string builders must accept
 /// only indices strictly above this boundary; unlike the single-character
-/// prefix, the pad2 table contains multi-character `Str`s (and the BigInt
-/// table is not a string at all).
-pub const INTERN_PINNED_END: u32 = INTERN_BIGINT_END;
+/// prefix, the pad2 table contains multi-character `Str`s.
+pub const INTERN_PINNED_END: u32 = INTERN_PAD2_END;
 
 pub struct Heap {
     objs: Vec<HeapObj>,
@@ -5655,11 +5645,6 @@ impl Heap {
         for n in 0u8..100 {
             let bytes = vec![b'0' + n / 10, b'0' + n % 10];
             objs.push(HeapObj::Str(JsStr::from_ascii(bytes)));
-            versions.push(0);
-        }
-        debug_assert_eq!(objs.len(), INTERN_BIGINT_START as usize);
-        for n in INTERN_BIGINT_MIN..=INTERN_BIGINT_MAX {
-            objs.push(HeapObj::BigInt(n));
             versions.push(0);
         }
         debug_assert_eq!(objs.len(), INTERN_PINNED_END as usize + 1);
