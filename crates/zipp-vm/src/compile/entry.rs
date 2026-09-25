@@ -182,7 +182,8 @@ pub fn compile_eval(
                     for decl in &vd.decls {
                         capture::collect_pattern_names(&decl.id, &mut names);
                     }
-                    for n in names {
+                    // Sorted, so a repeated name is reported the same way every run.
+                    for n in super::helpers::sorted_name_vec(&names) {
                         add_lexical(n, lexical)?;
                     }
                 }
@@ -207,7 +208,8 @@ pub fn compile_eval(
                     for decl in &d.decls {
                         capture::collect_pattern_names(&decl.id, &mut names);
                     }
-                    for n in names {
+                    // Sorted, as in `check_decl` above.
+                    for n in super::helpers::sorted_name_vec(&names) {
                         add_lexical(n, &mut lexical)?;
                     }
                 }

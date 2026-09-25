@@ -524,7 +524,8 @@ impl<'a> FnCompiler<'a> {
                         for dd in &d.decls {
                             capture::collect_pattern_names(&dd.id, &mut names);
                         }
-                        for n in names {
+                        // Sorted: the export list is part of the compiled Program.
+                        for n in sorted_name_vec(&names) {
                             self.cx.module_exports.push((n.clone(), n));
                         }
                     }
@@ -737,7 +738,9 @@ impl<'a> FnCompiler<'a> {
                     capture::collect_pattern_names(&decl.id, &mut leaves);
                     let undef = self.alloc_reg();
                     self.emit(Instr::LoadUndefined { dst: undef });
-                    for n in leaves {
+                    // Sorted: this emits one store per leaf (and may hand out
+                    // new global slots), in this order.
+                    for n in sorted_name_vec(&leaves) {
                         let slot = self.cx.global_slot(&n) as u32;
                         if d.kind.is_lexical() {
                             self.cx.lexical_globals.insert(slot);

@@ -1107,7 +1107,8 @@ impl<'a> FnCompiler<'a> {
             ast::ForTarget::Var(d) if d.kind.is_lexical() => {
                 let mut names = std::collections::HashSet::new();
                 capture::collect_pattern_names(&d.decls[0].id, &mut names);
-                names
+                // Sorted: each name gets a TDZ cell register below, in this order.
+                crate::compile::helpers::sorted_name_vec(&names)
                     .into_iter()
                     .filter(|n| self.param_tdz.insert(n.clone()))
                     .collect()
@@ -1602,7 +1603,8 @@ impl<'a> FnCompiler<'a> {
             ast::ForTarget::Var(d) if d.kind.is_lexical() => {
                 let mut names = std::collections::HashSet::new();
                 capture::collect_pattern_names(&d.decls[0].id, &mut names);
-                names
+                // Sorted: each name gets a TDZ cell register below, in this order.
+                crate::compile::helpers::sorted_name_vec(&names)
                     .into_iter()
                     .filter(|n| self.param_tdz.insert(n.clone()))
                     .collect()

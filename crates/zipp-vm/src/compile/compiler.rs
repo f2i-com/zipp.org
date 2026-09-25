@@ -679,7 +679,8 @@ impl Compiler {
                 for s in body {
                     collect_b33_block_fns(s, false, &script_blockers, &mut b33);
                 }
-                for name in &b33 {
+                // Sorted: global_slot() below hands out slots in this order.
+                for name in &sorted_name_vec(&b33) {
                     // CreateGlobalVarBinding(undefined) at instantiation —
                     // rides the hoisted-globals machinery (startup seed for
                     // main scripts; the own-prop step for global-varEnv
@@ -701,7 +702,8 @@ impl Compiler {
                 for s in body {
                     collect_b33_block_fns(s, false, &blockers, &mut b33);
                 }
-                for name in &b33 {
+                // Sorted: declare_local() below allocates registers in this order.
+                for name in &sorted_name_vec(&b33) {
                     if name == "arguments" && fc.arguments_reg.is_some() {
                         // FunctionDeclarationInstantiation already created this
                         // binding. Keep the arguments object until the block's
