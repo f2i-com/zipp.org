@@ -145,7 +145,7 @@ var __zipp_py = (function () {
         "frozenset", "range", "function", "builtin_function_or_method", "method", "module",
         "generator", "NotImplementedType", "ellipsis", "slice", "property", "staticmethod",
         "classmethod", "super", "cell", "bytes", "list_iterator", "dict_keys", "dict_values",
-        "dict_items", "enumerate", "zip", "map", "filter", "reversed", "iterator", "code"]) {
+        "dict_items", "enumerate", "zip", "map", "filter", "reversed", "iterator", "code", "traceback", "frame"]) {
         T[name] = newType(name, [], new Map());
     }
     T.bool.bases = [T.int]; T.bool.mro = [T.bool, T.int, ObjectType]; noteSubclass(T.bool, [T.bool, T.int]);
@@ -218,7 +218,8 @@ var __zipp_py = (function () {
     function makeExc(cls, args) {
         if (EXC_NATIVE !== null) { const e = EXC_NATIVE(cls, args, R); if (e !== undefined) return e; }
         return { cls: cls, dict: new Map(), args: sequence(T.tuple, args), cause: null,
-            context: excStack.length ? excStack[excStack.length - 1] : null, tbline: -1, suppress: false };
+            context: excStack.length ? excStack[excStack.length - 1] : null, tbline: -1, suppress: false,
+            tbfn: null, tbcl: 0 };
     }
     rt.makeExc = makeExc;
     // The innermost recorded frame holds the line its own frame was running;
@@ -264,18 +265,21 @@ var __zipp_py = (function () {
         return exc;
     };
     // Frame guards (one per function and module body) call this while an
-    // exception propagates: it records the frame, innermost first.
-    // Innermost first; a runaway recursion keeps the innermost frames and
-    // the outermost ones (the rest are counted).
+    // exception propagates: it records the frame, innermost first; a runaway
+    // recursion keeps the innermost frames and the outermost ones (the rest
+    // are counted).
+    // The frame that last caught the exception (`tbfn`, at line `tbcl`, set
+    // by the engine when the exception meets a handler of a Python frame,
+    // `vm::py_rt`) is where CPython's traceback of a caught exception
+    // begins. Leaving that frame again (a bare `raise`, the end of a
+    // `finally` or `with`) records it at the line it was caught at, as
+    // CPython keeps it; raising the exception anew (`raise e`) records it
+    // first, and then the raising frame (`commitCatch`).
     const KEEP_INNER = 1000, KEEP_OUTER = 12;
-    R.addframe = function (e, f, line) {
-        const exc = normexc(e);
+    const frameName = (f) => f !== null && typeof f === "object" && typeof f.name === "string" ? f.name : "<module>";
+    function pushFrame(exc, frame) {
         let frames = exc.frames;
         if (frames === undefined) frames = exc.frames = [];
-        const enc = typeof line === "number" ? line : 0;
-        if (exc.tbline === -1) exc.tbline = enc;
-        const name = f !== null && typeof f === "object" && typeof f.name === "string" ? f.name : "<module>";
-        const frame = { file: files[Math.floor(enc / 1000000)] || "?", line: enc % 1000000, name: name };
         if (frames.length < KEEP_INNER) frames.push(frame);
         else {
             let outer = exc.outerFrames;
@@ -283,29 +287,269 @@ var __zipp_py = (function () {
             outer.push(frame);
             if (outer.length > KEEP_OUTER) { outer.shift(); exc.dropped = (exc.dropped || 0) + 1; }
         }
+    }
+    function caughtFrame(exc) {
+        const enc = exc.tbcl;
+        return { file: files[Math.floor(enc / 1000000)] || "?", line: enc % 1000000, name: frameName(exc.tbfn), fn: exc.tbfn };
+    }
+    // A caught frame's entry keeps the line it was caught at; its frame's
+    // `f_lineno` is the line the frame was left at (`fline`), known when it
+    // is left (`open` until then: the frame raised the exception anew).
+    function commitCatch(exc, fline) {
+        if (exc.tbfn === null || exc.tbfn === undefined) return;
+        const frame = caughtFrame(exc);
+        if (fline !== undefined) frame.fline = fline; else frame.open = exc.tbfn;
+        pushFrame(exc, frame);
+        exc.tbfn = null;
+    }
+    // Every frame an exception leaves calls this: the common case (no catch
+    // pending, room left) is inline, without further calls.
+    R.addframe = function (e, f, line) {
+        const exc = normexc(e);
+        const enc = typeof line === "number" ? line : 0;
+        if (exc.tbline === -1) exc.tbline = enc;
+        let frames = exc.frames;
+        if (frames === undefined) frames = exc.frames = [];
+        else if (frames.length !== 0 && frames[frames.length - 1].open === f) {
+            const last = frames[frames.length - 1];
+            last.fline = enc % 1000000; last.open = undefined;
+        }
+        if (exc.tbfn !== null && exc.tbfn !== undefined && exc.tbfn === f) { commitCatch(exc, enc % 1000000); return exc; }
+        const frame = { file: files[Math.floor(enc / 1000000)] || "?", line: enc % 1000000,
+            name: f !== null && typeof f === "object" && typeof f.name === "string" ? f.name : "<module>", fn: f };
+        if (frames.length < KEEP_INNER) frames.push(frame); else pushFrame(exc, frame);
         return exc;
     };
-    rt.tracebackText = function (exc) {
-        const frames = exc.frames;
-        if (frames === undefined || frames.length === 0) return "";
-        const line = (fr) => "  File \"" + fr.file + "\", line " + fr.line + ", in " + fr.name + "\n";
-        let out = "Traceback (most recent call last):\n";
+    // The traceback's entries, outermost first: the frame that caught the
+    // exception, then the frames it left (a runaway recursion's middle is
+    // gone, see `pushFrame`).
+    function tbEntries(exc) {
+        const out = [];
+        if (exc === null || typeof exc !== "object") return out;
+        if (exc.tbfn !== null && exc.tbfn !== undefined) out.push(caughtFrame(exc));
         const outer = exc.outerFrames || [];
-        for (let i = outer.length - 1; i >= 0; i--) out += line(outer[i]);
-        if (exc.dropped) out += "  [" + exc.dropped + " more frame" + (exc.dropped === 1 ? "" : "s") + "]\n";
-        // A long run of one repeated frame prints once with a count.
-        let i = frames.length - 1;
-        while (i >= 0) {
-            const fr = frames[i];
-            let j = i;
-            while (j > 0 && frames[j - 1].file === fr.file && frames[j - 1].line === fr.line && frames[j - 1].name === fr.name) j--;
-            const repeats = i - j + 1;
-            out += line(fr);
-            if (repeats > 3) out += "  [Previous line repeated " + (repeats - 1) + " more times]\n";
-            else for (let k = 1; k < repeats; k++) out += line(fr);
-            i = j - 1;
+        for (let i = outer.length - 1; i >= 0; i--) out.push(outer[i]);
+        const frames = exc.frames || [];
+        for (let i = frames.length - 1; i >= 0; i--) out.push(frames[i]);
+        return out;
+    }
+    rt.tbEntries = tbEntries;
+    // `e.__traceback__` (and `sys.exc_info()[2]`): traceback records
+    // (`tb_frame`, `tb_lineno`, `tb_next`) over frame records (`f_code`,
+    // `f_lineno`, `f_globals`, `f_back`), built from those entries and kept
+    // while the entries stay the same.
+    rt.tracebackOf = function (exc) {
+        if (exc === null || typeof exc !== "object") return null;
+        const entries = tbEntries(exc);
+        if (entries.length === 0) return null;
+        const key = entries.length + ":" + (exc.tbfn === null || exc.tbfn === undefined ? "-" : exc.tbcl);
+        if (exc.tbkey === key) return exc.tbobj;
+        const frames = [];
+        for (let i = 0; i < entries.length; i++) {
+            const en = entries[i], fn = en.fn;
+            const own = fn !== null && typeof fn === "object";
+            const qual = own && typeof fn.qualname === "string" ? fn.qualname : en.name;
+            const code = { cls: T.code, name: en.name, argcount: 0, varnames: [], dict: new Map([
+                ["co_name", en.name], ["co_qualname", qual], ["co_filename", en.file]]) };
+            const g = own && fn.globals instanceof Map ? rt.namespaceView(fn.globals) : rt.dict();
+            const locals = own && frameName(fn) === "<module>" ? g : rt.dict();
+            frames.push({ cls: T.frame, dict: new Map([["f_code", code], ["f_lineno", BigInt(en.fline !== undefined ? en.fline : en.line)], ["f_globals", g],
+                ["f_locals", locals], ["f_builtins", rt.namespaceView(rt.builtins)], ["f_back", i === 0 ? null : frames[i - 1]], ["f_lasti", -1n]]) });
+        }
+        let next = null;
+        for (let i = entries.length - 1; i >= 0; i--) {
+            next = { cls: T.traceback, dict: new Map([["tb_frame", frames[i]], ["tb_lineno", BigInt(entries[i].line)], ["tb_next", next], ["tb_lasti", -1n]]) };
+        }
+        exc.tbkey = key; exc.tbobj = next;
+        return next;
+    };
+    // The lines of `file`, the program's copy of it (what CPython's
+    // `linecache` reads), each ending in a newline; `null` when there is no
+    // such file.
+    const sourceCache = new Map();
+    rt.sourceLines = function (file) {
+        const name = String(file);
+        const bytes = rt.vfs.get(name);
+        if (bytes === undefined) return null;
+        const hit = sourceCache.get(name);
+        if (hit !== undefined && hit.bytes === bytes) return hit.lines;
+        const parts = rt.decodeBytes({ items: bytes }, "utf-8", "replace").split(/\r\n|\r|\n/);
+        if (parts.length && parts[parts.length - 1] === "") parts.pop();
+        const lines = parts.map((l) => l + "\n");
+        sourceCache.set(name, { bytes: bytes, lines: lines });
+        return lines;
+    };
+    rt.sourceLine = function (file, lineno) {
+        const lines = rt.sourceLines(file);
+        return lines !== null && lineno >= 1 && lineno <= lines.length ? lines[lineno - 1] : "";
+    };
+    // The exception as CPython prints it when it leaves the program (and as
+    // lib/traceback.py's `format_exception` formats it): each exception of
+    // its `__cause__` / `__context__` chain, earliest first, with its
+    // traceback, then its type and message.
+    const RECURSIVE_CUTOFF = 3;
+    // CPython's name suggestions (Python/suggestions.c): the candidate
+    // closest to `name` by a Levenshtein distance where a case flip costs
+    // half a change, if no more than a third of the characters change.
+    const MOVE_COST = 2, CASE_COST = 1, MAX_CANDIDATE_ITEMS = 750, MAX_STRING_SIZE = 40;
+    function substitutionCost(a, b) {
+        if ((a & 31) !== (b & 31)) return MOVE_COST;
+        if (a === b) return 0;
+        if (a >= 65 && a <= 90) a += 32;
+        if (b >= 65 && b <= 90) b += 32;
+        return a === b ? CASE_COST : MOVE_COST;
+    }
+    function levenshtein(a, b, maxCost) {
+        if (a === b) return 0;
+        let s = 0, ae = a.length, be = b.length;
+        while (s < ae && s < be && a.charCodeAt(s) === b.charCodeAt(s)) s++;
+        while (ae > s && be > s && a.charCodeAt(ae - 1) === b.charCodeAt(be - 1)) { ae--; be--; }
+        a = a.slice(s, ae); b = b.slice(s, be);
+        if (a.length === 0 || b.length === 0) return (a.length + b.length) * MOVE_COST;
+        if (a.length > MAX_STRING_SIZE || b.length > MAX_STRING_SIZE) return maxCost + 1;
+        if (b.length < a.length) { const t = a; a = b; b = t; }
+        if ((b.length - a.length) * MOVE_COST > maxCost) return maxCost + 1;
+        const row = [];
+        for (let i = 0; i < a.length; i++) row.push((i + 1) * MOVE_COST);
+        let result = 0;
+        for (let bi = 0; bi < b.length; bi++) {
+            const code = b.charCodeAt(bi);
+            let distance = result = bi * MOVE_COST, minimum = Infinity;
+            for (let i = 0; i < a.length; i++) {
+                const substitute = distance + substitutionCost(code, a.charCodeAt(i));
+                distance = row[i];
+                const insertDelete = Math.min(result, distance) + MOVE_COST;
+                result = Math.min(insertDelete, substitute);
+                row[i] = result;
+                if (result < minimum) minimum = result;
+            }
+            if (minimum > maxCost) return maxCost + 1;
+        }
+        return result;
+    }
+    function generateSuggestion(candidates, name) {
+        if (candidates.length >= MAX_CANDIDATE_ITEMS) return null;
+        let best = null, bestDistance = Infinity;
+        for (const item of candidates) {
+            if (typeof item !== "string" || item === name) continue;
+            const maxDistance = Math.min(Math.floor((name.length + item.length + 3) * MOVE_COST / 6), bestDistance - 1);
+            const d = levenshtein(name, item, maxDistance);
+            if (d > maxDistance) continue;
+            if (best === null || d < bestDistance) { best = item; bestDistance = d; }
+        }
+        return best;
+    }
+    const STDLIB_NAMES = new Set("__future__ _abc _aix_support _android_support _apple_support _ast _asyncio _bisect _blake2 _bz2 _codecs _codecs_cn _codecs_hk _codecs_iso2022 _codecs_jp _codecs_kr _codecs_tw _collections _collections_abc _colorize _compat_pickle _compression _contextvars _csv _ctypes _curses _curses_panel _datetime _dbm _decimal _elementtree _frozen_importlib _frozen_importlib_external _functools _gdbm _hashlib _heapq _imp _interpchannels _interpqueues _interpreters _io _ios_support _json _locale _lsprof _lzma _markupbase _md5 _multibytecodec _multiprocessing _opcode _opcode_metadata _operator _osx_support _overlapped _pickle _posixshmem _posixsubprocess _py_abc _pydatetime _pydecimal _pyio _pylong _pyrepl _queue _random _scproxy _sha1 _sha2 _sha3 _signal _sitebuiltins _socket _sqlite3 _sre _ssl _stat _statistics _string _strptime _struct _suggestions _symtable _sysconfig _thread _threading_local _tkinter _tokenize _tracemalloc _typing _uuid _warnings _weakref _weakrefset _winapi _wmi _zoneinfo abc antigravity argparse array ast asyncio atexit base64 bdb binascii bisect builtins bz2 cProfile calendar cmath cmd code codecs codeop collections colorsys compileall concurrent configparser contextlib contextvars copy copyreg csv ctypes curses dataclasses datetime dbm decimal difflib dis doctest email encodings ensurepip enum errno faulthandler fcntl filecmp fileinput fnmatch fractions ftplib functools gc genericpath getopt getpass gettext glob graphlib grp gzip hashlib heapq hmac html http idlelib imaplib importlib inspect io ipaddress itertools json keyword linecache locale logging lzma mailbox marshal math mimetypes mmap modulefinder msvcrt multiprocessing netrc nt ntpath nturl2path numbers opcode operator optparse os pathlib pdb pickle pickletools pkgutil platform plistlib poplib posix posixpath pprint profile pstats pty pwd py_compile pyclbr pydoc pydoc_data pyexpat queue quopri random re readline reprlib resource rlcompleter runpy sched secrets select selectors shelve shlex shutil signal site smtplib socket socketserver sqlite3 sre_compile sre_constants sre_parse ssl stat statistics string stringprep struct subprocess symtable sys sysconfig syslog tabnanny tarfile tempfile termios textwrap this threading time timeit tkinter token tokenize tomllib trace traceback tracemalloc tty turtle turtledemo types typing unicodedata unittest urllib uuid venv warnings wave weakref webbrowser winreg winsound wsgiref xml xmlrpc zipapp zipfile zipimport zlib zoneinfo".split(" "));
+    rt.stdlibModuleNames = function () { return Array.from(STDLIB_NAMES); };
+    // What CPython's traceback adds to the message of a NameError,
+    // AttributeError or ImportError naming what was missing ("Did you
+    // mean"), as lib/traceback.py's `_compute_suggestion_error` computes it.
+    function suggestionText(exc, entries) {
+        const own = (k) => exc.dict instanceof Map ? exc.dict.get(k) : undefined;
+        const sortedStrs = (xs) => xs.filter((x) => typeof x === "string").sort(rt.compareStrings);
+        const dirOf = (o) => { const d = rt.call(rt.builtins.get("dir"), [o], null); return d !== null && typeof d === "object" && Array.isArray(d.items) ? d.items : []; };
+        try {
+            if (isInstance(exc, E.ImportError)) {
+                const from = own("name_from"), modName = own("name");
+                if (typeof from !== "string" || typeof modName !== "string") return "";
+                let d = sortedStrs(dirOf(R.import(modName, null)));
+                if (from.charAt(0) !== "_") d = d.filter((x) => x.charAt(0) !== "_");
+                const s = generateSuggestion(d, from);
+                return s === null ? "" : ". Did you mean: '" + s + "'?";
+            }
+            const wrong = own("name");
+            if (typeof wrong !== "string") return "";
+            if (isInstance(exc, E.AttributeError)) {
+                const obj = own("obj");
+                if (obj === undefined) return "";
+                let d = sortedStrs(dirOf(obj));
+                if (wrong.charAt(0) !== "_") d = d.filter((x) => x.charAt(0) !== "_");
+                const s = generateSuggestion(d, wrong);
+                return s === null ? "" : ". Did you mean: '" + s + "'?";
+            }
+            if (isInstance(exc, E.NameError)) {
+                if (entries.length === 0) return "";
+                const fn = entries[entries.length - 1].fn;
+                const d = [];
+                // CPython's candidates: the frame's locals (at module level
+                // its globals again), its globals, the builtins.
+                if (fn !== null && typeof fn === "object" && fn.globals instanceof Map) {
+                    if (frameName(fn) === "<module>") for (const k of fn.globals.keys()) d.push(k);
+                    for (const k of fn.globals.keys()) d.push(k);
+                }
+                for (const k of rt.builtins.keys()) d.push(k);
+                const s = generateSuggestion(d.filter((x) => typeof x === "string"), wrong);
+                let out = s === null ? "" : ". Did you mean: '" + s + "'?";
+                if (STDLIB_NAMES.has(wrong)) out += s === null ? ". Did you forget to import '" + wrong + "'?" : " Or did you forget to import '" + wrong + "'?";
+                return out;
+            }
+        } catch (e) { return ""; }
+        return "";
+    }
+    function safeStr(v, what) { try { return rt.str(v); } catch (e) { return "<" + what + " str() failed>"; } }
+    function excTypeName(t) {
+        let q, m;
+        try { q = rt.getattr(t, "__qualname__"); } catch (e) { q = t.name; }
+        try { m = rt.getattr(t, "__module__"); } catch (e) { m = null; }
+        if (typeof q !== "string") q = String(t.name);
+        if (m !== "__main__" && m !== "builtins") q = (typeof m === "string" ? m : "<unknown>") + "." + q;
+        return q;
+    }
+    function formatStack(entries) {
+        const out = [];
+        let last = null, count = 0;
+        const repeated = (n) => "  [Previous line repeated " + n + " more time" + (n > 1 ? "s" : "") + "]\n";
+        for (let i = 0; i < entries.length; i++) {
+            const en = entries[i];
+            if (last === null || last.file !== en.file || last.line !== en.line || last.name !== en.name) {
+                if (count > RECURSIVE_CUTOFF) out.push(repeated(count - RECURSIVE_CUTOFF));
+                last = en; count = 0;
+            }
+            count++;
+            if (count > RECURSIVE_CUTOFF) continue;
+            let row = "  File \"" + en.file + "\", line " + en.line + ", in " + en.name + "\n";
+            const src = rt.sourceLine(en.file, en.line).trim();
+            if (src) row += "    " + src + "\n";
+            out.push(row);
+        }
+        if (count > RECURSIVE_CUTOFF) out.push(repeated(count - RECURSIVE_CUTOFF));
+        return out;
+    }
+    function formatExcOnly(exc, entries) {
+        const s = safeStr(exc, "exception") + suggestionText(exc, entries), t = excTypeName(typeOf(exc));
+        let out = s ? t + ": " + s + "\n" : t + "\n";
+        const notes = exc.dict instanceof Map ? exc.dict.get("__notes__") : undefined;
+        if (notes !== undefined && notes !== null) {
+            if (typeof notes === "object" && (notes.cls === T.list || notes.cls === T.tuple)) {
+                for (const n of notes.items) out += safeStr(n, "note").split("\n").map((l) => l + "\n").join("");
+            } else out += safeStr(notes, "__notes__") + "\n";
         }
         return out;
+    }
+    rt.formatException = function (exc) {
+        const chain = [], seen = new Set();
+        let e = exc, msg = null;
+        while (e !== null && e !== undefined && typeof e === "object" && !seen.has(e)) {
+            seen.add(e);
+            chain.push([msg, e]);
+            if (e.cause !== null && e.cause !== undefined) { msg = "\nThe above exception was the direct cause of the following exception:\n\n"; e = e.cause; }
+            else if (e.context !== null && e.context !== undefined && !e.suppress) { msg = "\nDuring handling of the above exception, another exception occurred:\n\n"; e = e.context; }
+            else e = null;
+        }
+        let out = "";
+        for (let i = chain.length - 1; i >= 0; i--) {
+            const m = chain[i][0], x = chain[i][1];
+            const entries = tbEntries(x);
+            if (entries.length) out += "Traceback (most recent call last):\n" + formatStack(entries).join("");
+            out += formatExcOnly(x, entries);
+            if (m !== null) out += m;
+        }
+        return out;
+    };
+    rt.tracebackText = function (exc) {
+        const entries = tbEntries(exc);
+        if (entries.length === 0) return "";
+        return "Traceback (most recent call last):\n" + formatStack(entries).join("");
     };
     const excStack = [];
     R.pushexc = function (e) { excStack.push(e); return null; };
@@ -350,6 +594,7 @@ var __zipp_py = (function () {
         const cur = rt.currentExc();
         if (cur !== null && cur !== e) e.context = cur;
         e.tbline = -1;
+        commitCatch(e);
         throw e;
     };
     R.assertfail = function (msg) { throw makeExc(E.AssertionError, msg === null ? [] : [msg]); };
@@ -552,7 +797,7 @@ var __zipp_py = (function () {
         const meta = lookupType(t.cls, name);
         if (meta !== undefined) return descrGet(meta, t, t.cls);
         if (missing !== undefined) return missing;
-        fail(E.AttributeError, "type object '" + t.name + "' has no attribute '" + name + "'");
+        attrError("type object '" + t.name + "' has no attribute '" + name + "'", t, name);
     }
     // `missing` (hasattr, getattr with a default, imports): returned instead
     // of raising when the lookup itself finds nothing, so a miss allocates no
@@ -614,10 +859,18 @@ var __zipp_py = (function () {
         if (ga !== undefined) return rt.call(ga, [obj, name], null);
         if (t.userClass === true && dict !== undefined && name !== "__dict__") { t.gx[name] = true; if (t.flagged !== true) noteFlagged(t); }
         if (missing !== undefined) return missing;
-        fail(E.AttributeError, "'" + t.name + "' object has no attribute '" + name + "'");
+        attrError("'" + t.name + "' object has no attribute '" + name + "'", obj, name);
+    }
+    // An AttributeError naming the object and the attribute (`name`, `obj`),
+    // which CPython's traceback turns into a suggestion.
+    function attrError(message, obj, name) {
+        const e = makeExc(E.AttributeError, [message]);
+        e.dict.set("name", name); e.dict.set("obj", obj);
+        throw e;
     }
     function setattr(obj, name, value) {
         if (obj !== null && typeof obj === "object") {
+            if (obj.cls === T.function && (name === "__defaults__" || name === "__kwdefaults__")) { setFuncDefaults(obj, name, value); return null; }
             if (obj.isType) {
                 if (name === "__name__") { obj.name = str(value); return null; }
                 // An enum class's members are fixed.
@@ -667,6 +920,7 @@ var __zipp_py = (function () {
         return null;
     }
     function delattr(obj, name) {
+        if (obj !== null && typeof obj === "object" && obj.cls === T.function && (name === "__defaults__" || name === "__kwdefaults__")) { setFuncDefaults(obj, name, null); return null; }
         if (obj !== null && typeof obj === "object" && obj.isType) {
             if (!obj.dict.delete(name)) fail(E.AttributeError, "type object '" + obj.name + "' has no attribute '" + name + "'");
             typeChanged(obj, name);
@@ -778,6 +1032,37 @@ var __zipp_py = (function () {
         }
         return f;
     };
+    // `f.__defaults__ = ...` / `f.__kwdefaults__ = ...` (and `del`, which
+    // sets None): the fields every call binds from. A positional entry
+    // `c<n>` runs the code object, whose prologue loads a missing
+    // positional's default by its index among the defaults the signature
+    // had, so the entries below the full count stay only while the defaults
+    // have that count; the keyword entries `bindArgs` records (`k<n>:...`)
+    // are those entries and go with them. A cleared entry is set undefined
+    // in place, as `clearCtorEntries` does (its slot keeps its position for
+    // the engine's per-site caches), and a call without it binds.
+    function setFuncDefaults(f, name, value) {
+        if (name === "__kwdefaults__") {
+            if (value !== null && !isInstance(value, T.dict)) fail(TypeError, "__kwdefaults__ must be set to a dict object");
+            let m = null;
+            if (value !== null) { m = new Map(); for (const [k, v] of rt.dictEntries(value)) m.set(k, v); }
+            f.kwdefaults = m;
+            return;
+        }
+        if (value !== null && !isInstance(value, T.tuple)) fail(TypeError, "__defaults__ must be set to a tuple object");
+        if (f.ndef0 === undefined) f.ndef0 = f.defaults.length;
+        f.defaults = value === null ? [] : value.items.slice();
+        const positionalOnly = !f.varargs && !f.varkw && f.argnames.length === f.positional;
+        f.simple = positionalOnly && f.defaults.length === 0;
+        if (f.arr || !positionalOnly) return;
+        const entry = f.defaults.length === f.ndef0 ? f.code : undefined;
+        for (let n = f.positional - f.ndef0; n < f.positional; n++) f["c" + n] = entry;
+        const keys = Object.keys(f);
+        for (let i = 0; i < keys.length; i++) if (keys[i].charCodeAt(0) === 107 && keys[i].indexOf(":") > 0) f[keys[i]] = undefined;
+        // What classes cached from this function as an `__init__` or a
+        // method (their positional construction entries call `c<n>`).
+        rt.bumpEpoch();
+    }
     R.arity = function (f, args) { arityError(f, args.length); };
     R.fannotate = function (f, names, values) { const m = new Map(); for (let i = 0; i < names.length; i++) m.set(names[i], values[i]); f.annotations = m; return null; };
     // A builtin: `code(args)` with `this` unused; `arity` -1 for variadic.
@@ -1254,7 +1539,9 @@ var __zipp_py = (function () {
         const b = rt.builtins.get(name);
         if (b !== undefined) return b;
         if (name === "__builtins__") return R.import("builtins", g);
-        fail(E.NameError, "name '" + name + "' is not defined");
+        const e = makeExc(E.NameError, ["name '" + name + "' is not defined"]);
+        e.dict.set("name", name);
+        throw e;
     };
     R.gstore = function (g, name, v) { g.set(name, v); return null; };
     R.gdel = function (g, name) { if (!g.delete(name)) fail(E.NameError, "name '" + name + "' is not defined"); return null; };
@@ -1738,7 +2025,7 @@ var __zipp_py = (function () {
         if (name === "__dict__") return rt.namespaceView(m.globals);
         if (m.submodules !== undefined && m.submodules.has(name)) return m.submodules.get(name);
         if (missing !== undefined) return missing;
-        fail(E.AttributeError, "module '" + m.name + "' has no attribute '" + name + "'");
+        attrError("module '" + m.name + "' has no attribute '" + name + "'", m, name);
     };
     R.module = function (name, code, file) { inits.set(name, { code: code, file: file }); files.push(file); return null; };
     // The library modules the program may import, one name per line, at
@@ -1833,6 +2120,37 @@ var __zipp_py = (function () {
         changed: () => { const out = Array.from(vfsChanged); vfsChanged.clear(); return out; },
     };
     const dirs = new Set();
+    // `linecache` over the program's own files (`rt.sourceLines`), for
+    // lib/traceback.py: a line is `""` when the file or the line is not there.
+    builtinModules.set("linecache", () => {
+        const m = newModule("linecache", null), g = m.globals;
+        g.set("__name__", "linecache");
+        g.set("cache", rt.dict());
+        const lineno = (v) => typeof v === "bigint" ? Number(v) : typeof v === "boolean" ? Number(v) : NaN;
+        g.set("getline", builtin("getline", 3, (a) => {
+            if (typeof a[0] !== "string") return "";
+            return rt.sourceLine(a[0], lineno(a[1]));
+        }, 2));
+        g.set("getlines", builtin("getlines", 2, (a) => {
+            const lines = typeof a[0] === "string" ? rt.sourceLines(a[0]) : null;
+            return list(lines === null ? [] : lines.slice());
+        }, 1));
+        g.set("updatecache", g.get("getlines"));
+        g.set("clearcache", builtin("clearcache", 0, () => null));
+        g.set("checkcache", builtin("checkcache", 1, () => null, 0));
+        g.set("lazycache", builtin("lazycache", 2, () => false));
+        return m;
+    });
+    // `_suggestions`, as CPython's lib/traceback.py uses it.
+    builtinModules.set("_suggestions", () => {
+        const m = newModule("_suggestions", null);
+        m.globals.set("__name__", "_suggestions");
+        m.globals.set("_generate_suggestions", builtin("_generate_suggestions", 2, (a) => {
+            const items = a[0] !== null && typeof a[0] === "object" && Array.isArray(a[0].items) ? a[0].items : [];
+            return typeof a[1] === "string" ? generateSuggestion(items, a[1]) : null;
+        }));
+        return m;
+    });
     R.vfs = function (path, base64) {
         vfs.set(vfsNorm(path), Uint8Array.fromBase64(base64));
         return null;
@@ -1907,6 +2225,7 @@ var __zipp_py = (function () {
         }
         const e = makeExc(E.ImportError, ["cannot import name '" + name + "' from '" + m.name + "'"]);
         e.dict.set("name", m.name);
+        e.dict.set("name_from", name);
         throw e;
     };
     R.importstar = function (m, g) {

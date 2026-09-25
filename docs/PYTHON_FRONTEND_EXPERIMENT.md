@@ -126,6 +126,11 @@ integration date every corpus program matched.
   object-heavy code still goes through the JavaScript runtime's records;
   native dict, set and instance storage are the next step. `ZIPP_PY_PROF=1` prints fused-op hit and slow-path counts, runtime
   helper call counts and the allocation mix at exit.
+- Errors: uncaught exceptions print CPython's traceback (file paths relative
+  to the project, no caret lines) and exit with status 1; `e.__traceback__`,
+  `sys.exc_info()[2]` and the `traceback` module give CPython's frames and
+  lines, with CPython's "Did you mean" suggestions; `f.__defaults__` and
+  `f.__kwdefaults__` can be assigned.
 
 ## Language selection
 

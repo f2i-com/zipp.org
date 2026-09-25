@@ -1,0 +1,127 @@
+simple ValueError [('<module>', 68, None), ('outer', 64, 64), ('middle', 60, 60), ('inner', 54, None)]
+    68 <module>
+    64 outer
+    60 middle
+    54 inner
+  File "*", line 68, in <module>
+  File "*", line 64, in outer
+  File "*", line 60, in middle
+  File "*", line 54, in inner
+Traceback (most recent call last):
+  File "*", line 68, in <module>
+  File "*", line 64, in outer
+  File "*", line 60, in middle
+  File "*", line 54, in inner
+ValueError: too big: 6
+['ValueError: too big: 6\n']
+exc_info ValueError True True
+exception True
+Traceback (most recent call last):
+  File "*", line 68, in <module>
+  File "*", line 64, in outer
+  File "*", line 60, in middle
+  File "*", line 54, in inner
+ValueError: too big: 6
+returned ValueError [('caught_here', 84, None), ('inner', 54, None)]
+    84 caught_here
+    54 inner
+bare_reraise ValueError [('<module>', 110, None), ('bare_reraise', 94, 97), ('middle', 60, 60), ('inner', 54, None)]
+    110 <module>
+    94 bare_reraise
+    60 middle
+    54 inner
+explicit_reraise ValueError [('<module>', 110, None), ('explicit_reraise', 105, 105), ('explicit_reraise', 102, 105), ('middle', 60, 60), ('inner', 54, None)]
+    110 <module>
+    105 explicit_reraise
+    102 explicit_reraise
+    60 middle
+    54 inner
+finally ValueError [('<module>', 123, None), ('with_finally', 117, 119), ('inner', 54, None)]
+    123 <module>
+    117 with_finally
+    54 inner
+with ValueError [('<module>', 142, None), ('with_block', 138, 138), ('inner', 54, None)]
+    142 <module>
+    138 with_block
+    54 inner
+cause RuntimeError [('<module>', 170, None), ('cause', 151, None)]
+    170 <module>
+    151 cause
+Traceback (most recent call last):
+  File "*", line 149, in cause
+KeyError: 'missing'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "*", line 170, in <module>
+  File "*", line 151, in cause
+RuntimeError: lookup failed
+Traceback (most recent call last):
+  File "*", line 170, in <module>
+  File "*", line 151, in cause
+RuntimeError: lookup failed
+context TypeError [('<module>', 170, None), ('context', 158, None)]
+    170 <module>
+    158 context
+Traceback (most recent call last):
+  File "*", line 156, in context
+IndexError: list index out of range
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "*", line 170, in <module>
+  File "*", line 158, in context
+TypeError: while handling
+Traceback (most recent call last):
+  File "*", line 170, in <module>
+  File "*", line 158, in context
+TypeError: while handling
+suppressed ValueError [('<module>', 170, None), ('suppressed', 165, None)]
+    170 <module>
+    165 suppressed
+Traceback (most recent call last):
+  File "*", line 170, in <module>
+  File "*", line 165, in suppressed
+ValueError: clean
+Traceback (most recent call last):
+  File "*", line 170, in <module>
+  File "*", line 165, in suppressed
+ValueError: clean
+method AttributeError [('<module>', 189, None), ('check', 182, 182), ('helper', 185, None)]
+    189 <module>
+    182 check
+    185 helper
+generator KeyError [('<module>', 202, None), ('gen', 197, None)]
+    202 <module>
+    197 gen
+['KeyError: 2\n']
+empty MyError [('<module>', 213, None)]
+    213 <module>
+['MyError\n']
+hot 25000
+deep 12
+  File "*", line 239, in <module>
+  File "*", line 235, in deep
+  File "*", line 235, in deep
+  File "*", line 235, in deep
+  [Previous line repeated 7 more times]
+  File "*", line 234, in deep
+same object True
+frame <module> <module> __main__
+te ValueError too big: 5 4
+Traceback (most recent call last):
+  File "*", line 248, in <module>
+  File "*", line 64, in outer
+  File "*", line 60, in middle
+  File "*", line 54, in inner
+ValueError: too big: 5
+['  File "a.py", line 1, in f\n    x = 1\n']
+["NameError: name 'valeu' is not defined\n"]
+["AttributeError: 'Box' object has no attribute 'valeu'. Did you mean: 'value'?\n"]
+["AttributeError: 'Box' object has no attribute 'vlaue'. Did you mean: 'value'?\n"]
+["NameError: name 'math' is not defined. Did you forget to import 'math'?\n"]
+["AttributeError: module 'collections' has no attribute 'OrderDict'. Did you mean: 'OrderedDict'?\n"]
+["AttributeError: type object 'Box' has no attribute 'valeu'\n"]
+["NameError: name 'prnt' is not defined\n"]

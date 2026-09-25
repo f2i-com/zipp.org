@@ -1,0 +1,24 @@
+orig [11020, 10220, 10203, "TypeError: add() missing 1 required positional argument: 'a'", 11005, 10405] (10, 20) None
+same [10708, 10208, 10203, "TypeError: add() missing 1 required positional argument: 'a'", 10705, 10405] (7, 8) None
+fewer ["TypeError: add() missing 1 required positional argument: 'b'", 10203, 10203, "TypeError: add() missing 2 required positional arguments: 'a' and 'b'", "TypeError: add() missing 1 required positional argument: 'b'", 10405] (3,) None
+more [10506, 10206, 10203, 40506, 10505, 10405] (4, 5, 6) None
+none ["TypeError: add() missing 2 required positional arguments: 'b' and 'c'", "TypeError: add() missing 1 required positional argument: 'c'", 10203, "TypeError: add() missing 3 required positional arguments: 'a', 'b', and 'c'", "TypeError: add() missing 1 required positional argument: 'b'", 10405] None None
+back [10102, 10202, 10203, "TypeError: add() missing 1 required positional argument: 'a'", 10105, 10405] (1, 2) None
+deleted ["TypeError: add() missing 2 required positional arguments: 'b' and 'c'", "TypeError: add() missing 1 required positional argument: 'c'", 10203, "TypeError: add() missing 3 required positional arguments: 'a', 'b', and 'c'", "TypeError: add() missing 1 required positional argument: 'b'", 10405] None None
+TypeError __defaults__ must be set to a tuple object
+loop 621176
+kw 651 {'k': 5, 'm': 6}
+kw 211 231 {'k': 1, 'm': 2}
+TypeError kw() missing 1 required keyword-only argument: 'k'
+kw 901
+kw None
+TypeError kw() missing 2 required keyword-only arguments: 'k' and 'm'
+TypeError __kwdefaults__ must be set to a dict object
+class 3769940 56 16 156
+TypeError P.__init__() missing 1 required positional argument: 'x'
+class 17
+gen [1, 2]
+gen [1, 9]
+closure 2
+closure 51 2
+lambda 8 [0, 4, 8]

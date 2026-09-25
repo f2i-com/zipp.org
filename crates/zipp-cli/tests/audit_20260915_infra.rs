@@ -133,11 +133,14 @@ fn python_status_covers_stdin_and_writes_files_first() {
     let (code, _, err) = f.zipp(&["py", "main.py"], &[]);
     assert_eq!(code, Some(6), "{err}");
     assert_eq!(fs::read_to_string(f.0.join("out.txt")).unwrap(), "saved");
-    // Any other uncaught exception keeps the CLI's report and status 1.
+    // Any other uncaught exception prints CPython's traceback and exits 1.
     fs::write(f.0.join("main.py"), "raise ValueError('bad')\n").unwrap();
     let (code, _, err) = f.zipp(&["py", "main.py"], &[]);
     assert_eq!(code, Some(1));
-    assert!(err.contains("zipp: ValueError: bad"), "{err}");
+    assert_eq!(
+        err,
+        "Traceback (most recent call last):\n  File \"main.py\", line 1, in <module>\n    raise ValueError('bad')\nValueError: bad\n"
+    );
 }
 
 trait OutputWithStdin {

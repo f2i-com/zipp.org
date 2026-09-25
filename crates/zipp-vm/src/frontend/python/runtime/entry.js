@@ -21,12 +21,23 @@ function __zipp_py_set_input(json) {
 (function (R) {
     "use strict";
     const rt = R.__rt, T = rt.T, E = rt.E;
-    // What a SystemExit leaving the program asks of the process, for a host
-    // that owns one (the CLI reads it through `__zipp_py_exit_status`): an
-    // integer status, or, for any other code, the text CPython prints before
-    // exiting with status 1. `null` until a SystemExit leaves.
-    let exitStatus = null;
-    rt.exitStatus = function () { return exitStatus; };
+    // What the program's end asks of the process, for a host that owns one
+    // (the CLI reads it through `__zipp_py_exit_status`): for a SystemExit,
+    // an integer status, or, for any other code, the text CPython prints
+    // before exiting with status 1; for any other exception leaving the
+    // program, the traceback CPython prints before exiting with status 1
+    // (`rt.formatException`, built when asked for). `null` until either.
+    let exitStatus = null, uncaught = null;
+    rt.exitStatus = function () {
+        if (exitStatus === null && uncaught !== null) {
+            const exc = uncaught;
+            uncaught = null;
+            let text;
+            try { text = rt.formatException(exc); } catch (e) { text = rt.typeOf(exc).name + "\n"; }
+            exitStatus = text.replace(/\n$/, "");
+        }
+        return exitStatus;
+    };
     // A Python exception leaving the program: the VM reports `name: message`
     // from the exception object's own fields, formatted like a traceback tail.
     function hostError(e) {
@@ -185,6 +196,7 @@ function __zipp_py_set_input(json) {
             rt.flushOpenFiles();
             const err = hostError(e);
             if (err === null) return null;
+            if (err.pyexc !== undefined && exitStatus === null) uncaught = err.pyexc;
             throw err;
         }
     };

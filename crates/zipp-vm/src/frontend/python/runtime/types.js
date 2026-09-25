@@ -1741,7 +1741,7 @@
                 if (name === "code" && isInstance(obj, E.SystemExit)) return obj.args.items.length ? obj.args.items[0] : null;
                 if (name === "__cause__") return obj.cause;
                 if (name === "__context__") return obj.context;
-                if (name === "__traceback__") return null;
+                if (name === "__traceback__") return rt.tracebackOf(obj);
                 if (name === "__suppress_context__") return obj.suppress;
             }
         } else if (isNum(obj)) {

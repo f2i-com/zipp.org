@@ -279,7 +279,7 @@ impl PyFrame {
 /// The keys of a list or tuple record (`sequence`'s literal).
 pub(super) const SEQ_KEYS: [&str; 2] = ["cls", "items"];
 /// The keys of the record `makeExc` builds, in its literal's order.
-pub(super) const EXC_KEYS: [&str; 7] = ["cls", "dict", "args", "cause", "context", "tbline", "suppress"];
+pub(super) const EXC_KEYS: [&str; 9] = ["cls", "dict", "args", "cause", "context", "tbline", "suppress", "tbfn", "tbcl"];
 /// An instance record's keys (the construction entries' literal).
 pub(super) const INST_KEYS: [&str; 2] = ["cls", "dict"];
 
@@ -411,6 +411,9 @@ impl<'p> Vm<'p> {
         };
         if handler {
             write_line(self);
+            if let Some(l) = line {
+                self.py_note_catch(tv, base, l);
+            }
             return false;
         }
         let Some((from, start, end, ereg)) = guard else {
@@ -423,6 +426,50 @@ impl<'p> Vm<'p> {
         self.regs[base + ereg as usize] = tv;
         self.frames[top].ip = start as usize;
         true
+    }
+
+    /// An exception record `tv` meeting a handler of the Python frame at
+    /// `base` at line `line`: that frame caught it, and CPython's traceback
+    /// begins there (the frame and the line the exception passed). Recorded
+    /// as the record's `tbfn` (the frame's function) and `tbcl` (the line)
+    /// unless an earlier catch is still pending; `R.addframe` turns it into
+    /// the frame's entry when the exception leaves that frame again (a bare
+    /// `raise`, the end of a `finally` or `with`), and `rt.tracebackOf`
+    /// lists it first while it is caught.
+    fn py_note_catch(&mut self, tv: Value, base: usize, line: i32) {
+        if !tv.is_heap() || base >= self.regs.len() {
+            return;
+        }
+        let this = self.regs[base];
+        if !this.is_heap() {
+            return;
+        }
+        let exc_shape = self.py_rt.as_deref().map(|p| p.exc_shape);
+        let idx = tv.heap_index();
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return;
+        };
+        if m.is_ctor {
+            return;
+        }
+        let shape = m.shape();
+        let (fn_slot, line_slot) = if shape != crate::shape::DICT && exc_shape == Some(shape) {
+            (7, 8)
+        } else {
+            let own = |key: &str| m.pos(key).filter(|&s| !m.attr_at(s).accessor);
+            match (own("tbfn"), own("tbcl")) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return,
+            }
+        };
+        if m.val_at(fn_slot) != Value::NULL {
+            return;
+        }
+        self.heap.write_barrier_val(idx, this);
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            m.set_val_at(fn_slot, this);
+            m.set_val_at(line_slot, Value::int(line));
+        }
     }
 
     /// `__zipp_py_bind(R, pins, dict)`: take the runtime's registry (`dict`

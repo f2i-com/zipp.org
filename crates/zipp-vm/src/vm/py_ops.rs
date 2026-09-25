@@ -339,6 +339,11 @@ impl<'p> Vm<'p> {
                     return Ok(slow as usize);
                 };
                 let idx = ev.heap_index();
+                // Raising an exception some frame caught (its `tbfn` set):
+                // `R.raise` first records that frame's traceback entry.
+                if self.py_exc_caught(idx) {
+                    return Ok(slow as usize);
+                }
                 if let Some(cur) = cur {
                     if cur.bits() != ev.bits() {
                         if cur.is_heap() {
@@ -850,7 +855,7 @@ impl<'p> Vm<'p> {
         let tuple = self.py_alloc_like(seq_tmpl, seq_shape, &[ttuple, args])?;
         let map = self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
         self.adopt_native_result_realm(map, self.map_proto);
-        let vals = [cls, Value::heap(map), tuple, Value::NULL, context, Value::int(-1), Value::FALSE];
+        let vals = [cls, Value::heap(map), tuple, Value::NULL, context, Value::int(-1), Value::FALSE, Value::NULL, Value::int(0)];
         self.py_alloc_like(tmpl, exc_shape, &vals)
     }
 
@@ -916,7 +921,7 @@ impl<'p> Vm<'p> {
             let ctx_slot = if raise { own("context")? } else { 0 };
             (cls, ctx_slot, tb_slot)
         };
-        debug_assert!(EXC_KEYS[4] == "context" && EXC_KEYS[5] == "tbline");
+        debug_assert!(EXC_KEYS[4] == "context" && EXC_KEYS[5] == "tbline" && EXC_KEYS[7] == "tbfn");
         if !self.py_plain_rec(cls) {
             return None;
         }
@@ -928,6 +933,18 @@ impl<'p> Vm<'p> {
             return None;
         };
         items.iter().any(|x| x.bits() == ebase.bits()).then_some((ctx_slot, tb_slot))
+    }
+
+    /// Whether the exception record at `idx` has a catch pending (its
+    /// `tbfn`, see `Vm::py_note_catch`); `true` when that cannot be told.
+    fn py_exc_caught(&self, idx: u32) -> bool {
+        let exc_shape = self.py_rt.as_deref().map(|p| p.exc_shape);
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return true;
+        };
+        let shape = m.shape();
+        let slot = if shape != crate::shape::DICT && exc_shape == Some(shape) { Some(7) } else { m.pos("tbfn") };
+        slot.is_none_or(|s| m.val_at(s) != Value::NULL)
     }
 
     /// For [`Instr::PyRaise`]: the slots to write and the current exception

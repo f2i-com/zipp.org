@@ -1390,7 +1390,9 @@
         fn(g, "setrecursionlimit", 1, () => null);
         fn(g, "getsizeof", 1, () => 64n);
         fn(g, "intern", 1, (a) => a[0]);
-        fn(g, "exc_info", 0, () => { const e = rt.currentExc(); return e === null ? tuple([null, null, null]) : tuple([typeOf(e), e, null]); });
+        fn(g, "exc_info", 0, () => { const e = rt.currentExc(); return e === null ? tuple([null, null, null]) : tuple([typeOf(e), e, rt.tracebackOf(e)]); });
+        fn(g, "exception", 0, () => rt.currentExc());
+        g.set("stdlib_module_names", rt.call(rt.builtins.get("frozenset"), [list(rt.stdlibModuleNames())], null));
         fn(g, "getdefaultencoding", 0, () => "utf-8");
         g.set("float_info", pyClass("float_info", "sys", {}) && (() => { const o = { cls: pyClass("float_info", "sys", {}), dict: new Map([["max", Number.MAX_VALUE], ["min", 2.2250738585072014e-308], ["epsilon", Number.EPSILON], ["dig", 15n], ["mant_dig", 53n]]) }; return o; })());
     });
