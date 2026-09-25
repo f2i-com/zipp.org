@@ -48,6 +48,9 @@ use crate::value::Value;
 use crate::vm::{Thrown, Vm};
 
 /// A mirror shape at or above this is a layout (see the module comment).
+/// Mirrorless builds (meter-only without the JIT, e.g. WebAssembly) never
+/// publish one.
+#[cfg_attr(all(feature = "meter-only", not(feature = "jit")), allow(dead_code))]
 pub(crate) const LAYOUT_BASE: u32 = 0x4000_0000;
 /// The layout of no keys.
 pub(crate) const ROOT: u32 = 1;

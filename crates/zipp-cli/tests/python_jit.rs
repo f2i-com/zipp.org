@@ -440,6 +440,100 @@ print(hash(LIM - 1) == hash(LIM - 1), {LIM - 1: 1, LIM: 2}[LIM], len({LIM - 1, L
     );
 }
 
+/// Attribute reads and writes on instances' layout-mode storage, which
+/// compiled loops read and write inline (`codegen::py_attr_inline`), while
+/// the class changes under them (a class attribute of the same name, a
+/// property added and removed), an instance's storage turns into a table
+/// (`del`), an instance changes class, young and old storage takes heap
+/// values, and layouts grow.
+#[test]
+fn inline_attributes_follow_class_and_storage_changes() {
+    same_everywhere(
+        r#"class P:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+class Q(P):
+    pass
+
+class R:
+    __slots__ = ()
+
+def walk(ps, n):
+    total = 0
+    seven = property(lambda self: 7)
+    for i in range(n):
+        p = ps[i % len(ps)]
+        p.x = p.x + p.y
+        total += p.x
+        if i == n // 2:
+            # A class attribute of the same name: the instance's still wins.
+            P.x = 1000
+        if i == n // 3:
+            # A property on the class: now it wins over the instance dict.
+            P.y = seven
+        if i == (2 * n) // 3:
+            del P.y
+    return total
+
+def switch(n):
+    a, b = P(1, 2), P(3, 4)
+    got = []
+    for i in range(n):
+        o = a if i % 2 else b
+        o.x = o.x * 2 % 1000003 + i
+        if i == n // 2:
+            del a.y            # a's storage turns into a table
+            a.y = [i]          # a heap value
+        if i == (3 * n) // 4:
+            b.__class__ = Q    # another class, same layout
+        got.append(o.x + (o.y if isinstance(o.y, int) else len(o.y)))
+    return sum(got) % 1000000007, type(b).__name__
+
+def heap_values(n):
+    p = P([], {})
+    keep = []
+    for i in range(n):
+        p.x = [i]              # a young heap value into the storage
+        p.y = p.x
+        if i % 100 == 0:
+            keep.append(p.x)
+            big = [0] * 1000   # churn so the storage ages
+    return len(keep), p.x, p.y is p.x
+
+def growing(n):
+    out = 0
+    for i in range(n):
+        o = P(i, -i)
+        if i % 3 == 0:
+            o.z = i            # a longer layout
+        out += o.x + o.y + getattr(o, "z", 0)
+    return out
+
+def young(ps, n):
+    for i in range(n):
+        p = ps[i % len(ps)]
+        p.x = [i]              # heap values into storage that is still young
+        p.y = p.x
+    return sum(p.x[0] + p.y[0] for p in ps)
+
+def young_rounds():
+    s = 0
+    for r in range(30):
+        s += young([P(k, k) for k in range(10)], 3000)
+    return s
+
+print(walk([P(1, 2), P(3, 4), Q(5, 6)], 5000))
+print(switch(4000))
+print(heap_values(3000))
+print(growing(3000))
+print(young_rounds())
+"#,
+        EXPECTED_ATTRS,
+    );
+}
+
 /// CPython 3.13's output for each program above.
 const EXPECTED_ARITHMETIC: &str = r#"0 -293 -879 1180591620717411303424 True True False True
 1 -286 -1731 1180591620717411303425 True True False True
@@ -528,4 +622,10 @@ const EXPECTED_INT_EDGES: &str = r#"879134846686371138
 1407374883553270 -1407374883553290
 [70368744177663, 70368744177664, 70368744177665] [-70368744177663, -70368744177664, -70368744177665]
 True 2 2
+"#;
+const EXPECTED_ATTRS: &str = r#"20857498
+(8993745, 'Q')
+(30, [2999], True)
+1498500
+1796700
 "#;

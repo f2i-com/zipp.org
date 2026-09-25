@@ -476,8 +476,11 @@ impl<'p> Vm<'p> {
         base: usize,
     ) -> crate::codegen::TaPinPlan {
         // A Python program's own bodies take none of these plans (see
-        // `Vm::py_plans_skipped`).
+        // `Vm::py_plans_skipped`); they take the inline attribute plan
+        // instead (`codegen::py_attr_inline`).
         if self.py_plans_skipped(func_id) {
+            #[cfg(feature = "python")]
+            self.py_attr_inline_plan(func_id);
             return Default::default();
         }
         use crate::codegen::{TaPin, TaPinPlan, TaPinSrc};

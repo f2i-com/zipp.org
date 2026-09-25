@@ -106,8 +106,11 @@ integration date every corpus program matched.
   (`zipp py`/`zipp run`, no instruction budget) hot Python loops (1024
   iterations) also compile to native code: float and small-int arithmetic,
   comparisons and `range` counters run inline, and every other fused
-  instruction calls the interpreter's own step, so results are identical (a
-  139-program corpus is byte-identical JIT on/off). Loops over generators also compile (each
+  instruction calls the interpreter's own step, so results are identical.
+  Attribute reads and writes on an instance whose attributes are in
+  layout-mode storage also run inline, guarded by the class's version and the
+  storage's layout; any change runs the ordinary step (a
+  153-program corpus is byte-identical JIT on/off). Loops over generators also compile (each
   generator step runs on a nested interpreter loop, as a call from compiled
   code does), and `try`/`except`/`finally` inside a hot loop compiles with its
   normal completion inline. Loops that spend most of their time in calls, and

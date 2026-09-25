@@ -51,4 +51,6 @@ mod method_inline;
 mod modules;
 #[cfg(feature = "python")]
 mod py_jit;
+#[cfg(all(feature = "python", feature = "jit", target_arch = "x86_64"))]
+mod py_jit_attr;
 mod run;

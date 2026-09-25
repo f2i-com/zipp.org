@@ -44,6 +44,10 @@
 #![allow(unused_imports)]
 use super::*;
 
+#[path = "py_attr_inline.rs"]
+mod attr_inline;
+pub(crate) use attr_inline::*;
+
 /// `Vm::jit_py_op` outcomes.
 pub(crate) const PY_NEXT: u64 = 0;
 /// A `PyJumpCompare` took its branch.
@@ -809,6 +813,13 @@ pub(crate) fn emit_py_op(
                 }
             }
         }
+        // An attribute of layout-mode instance storage (`py_attr_inline`),
+        // when the body's plan has the site; the ordinary step otherwise.
+        Instr::PyGetAttr { .. } | Instr::PySetAttr { .. } => {
+            if !emit_py_attr_site(ops, func_id, ip, instr, labels, refetch, done) {
+                emit_py_step(ops, func_id, ip, labels, refetch);
+            }
+        }
         _ => {
             emit_py_step(ops, func_id, ip, labels, refetch);
         }
@@ -956,21 +967,26 @@ impl Jit {
         let ic_base_idx = self.reserve_ic_sites(n_sites);
         let acc_emit = self.register_ic_sites(ic_base_idx, func_id, start, code, start);
         let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
-        let compiled = compile_region_mem(
-            proto,
-            start,
-            ext_end,
-            globals_base_helper,
-            helpers,
-            const_strs,
-            &TaPinPlan::default(),
-            leaf_plan,
-            method_plan,
-            cross_plan,
-            &acc_emit,
-            self.meter,
-            Some(&members),
-        );
+        // The attribute sites the VM planned for this body
+        // (`Vm::py_attr_inline_plan`), for the duration of this compile.
+        let attr_plan = take_py_attr_plan(self as *const Self as usize, func_id);
+        let compiled = with_py_attr_plan(attr_plan, || {
+            compile_region_mem(
+                proto,
+                start,
+                ext_end,
+                globals_base_helper,
+                helpers,
+                const_strs,
+                &TaPinPlan::default(),
+                leaf_plan,
+                method_plan,
+                cross_plan,
+                &acc_emit,
+                self.meter,
+                Some(&members),
+            )
+        });
         let log = std::env::var_os("ZIPP_JITLOG").is_some();
         match compiled {
             Some(code) => {
