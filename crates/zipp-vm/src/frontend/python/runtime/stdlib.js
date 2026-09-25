@@ -1723,7 +1723,7 @@
         // deque, tuple subclasses such as OrderedDict, defaultdict, Counter).
         // Native fields (an exception's args, a deque's maxlen, a boxed
         // value) carry over; typed-array buffers are duplicated by deepcopy.
-        const SKIP = new Set(["id", "dictView", "cls", "dict", "items", "map", "size", "str", "coll"]);
+        const SKIP = new Set(["id", "dictView", "cls", "dict", "items", "map", "size"]);
         const ATOMIC = new Set([T.function, T.module, T.builtin_function_or_method, T.range, T.bytes, T.property, T.classmethod, T.staticmethod, T.complex]);
         const isAtomic = (v) => v === null || typeof v !== "object" || v.cls === undefined || isType(v) || ATOMIC.has(v.cls) || (v.cls === T.frozenset && v.dict === undefined);
         const objectReduce = rt.ObjectType.dict.get("__reduce__");
@@ -2323,7 +2323,7 @@
         OrderedDict.dict.set("move_to_end", builtin("move_to_end", -1, (a) => { const kw = kwOf(a, ["last"]); const last = a[2] !== undefined ? truth(a[2]) : truth(kwget(kw, "last", true)); const v = dictGet(a[0], a[1]); if (v === undefined) throw rt.makeExc(E.KeyError, [a[1]]); rt.dictDel(a[0], a[1]); if (last) dictSet(a[0], a[1], v); else { const entries = rt.dictEntryList(a[0]); rt.dictClear(a[0]); dictSet(a[0], a[1], v); for (const [k, x] of entries) dictSet(a[0], k, x); } return null; }));
         OrderedDict.dict.get("move_to_end").kwnames = true;
         OrderedDict.dict.set("__repr__", builtin("__repr__", 1, (a) => a[0].size ? "OrderedDict(" + rt.baseRepr(a[0]) + ")" : "OrderedDict()"));
-        OrderedDict.dict.set("popitem", (() => { const f = builtin("popitem", -1, (a) => { const kw = kwOf(a, ["last"]); const last = a[1] !== undefined ? truth(a[1]) : truth(kwget(kw, "last", true)); const entries = rt.dictEntryList(a[0]); if (!entries.length) fail(E.KeyError, "dictionary is empty"); const e = entries[last ? entries.length - 1 : 0]; const [k, v] = e; rt.dictDelEntry(a[0], e); return tuple([k, v]); }); f.kwnames = true; return f; })());
+        OrderedDict.dict.set("popitem", (() => { const f = builtin("popitem", -1, (a) => { const kw = kwOf(a, ["last"]); const last = a[1] !== undefined ? truth(a[1]) : truth(kwget(kw, "last", true)); const e = rt.dictPopItem(a[0], !last); if (e === undefined) fail(E.KeyError, "dictionary is empty"); return tuple([e[0], e[1]]); }); f.kwnames = true; return f; })());
         // Two OrderedDicts are equal only in the same order; against a plain
         // dict the order does not matter.
         OrderedDict.dict.set("__eq__", builtin("__eq__", 2, (a) => {

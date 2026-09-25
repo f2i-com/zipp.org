@@ -1,0 +1,27 @@
+one {1: 'bool'} 1 int
+zero {1: 'bool', 0: 'false'} 2
+get bool bool false false None True False
+nan-two 2 False None [1, 2]
+nan-set 3 False True
+big 8 five m+5 2m 2^64 neg minus1 minus2
+big-hash 0 0 5 -2 -2 8 -512
+big-float 2^64 True True
+big-del True False 7
+tuple a b empty c d
+tuple-hash True True True
+frozen 0 12 12 mixed
+frozen-in-set True True
+set-dedup 2 [1, 2]
+set-members True True False False
+none-and-str none empty a True
+floats inf -inf half huge 314159 -314159 1152921504606846976
+unhashable unhashable type: 'list'
+unhashable-in unhashable type: 'list'
+unhashable unhashable type: 'dict'
+unhashable-in unhashable type: 'dict'
+unhashable unhashable type: 'set'
+unhashable-in unhashable type: 'set'
+unhashable-tuple unhashable type: 'list'
+many-str 300 0 299 44850 ['k0', 'k1', 'k2'] ['k298', 'k299']
+many-int 334 -500 None
+many-int-del 167 [-3935743, -3888229, -3840715, -3793201] [3856553, 3904067, 3951581]

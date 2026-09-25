@@ -1257,15 +1257,6 @@ impl<'a> Emitter<'a> {
         });
         Ok(())
     }
-    /// `dst = Number(big)` for a BigInt in `big`, through the VM's guarded
-    /// `Number` intrinsic (the callee is the runtime's own reference).
-    pub fn bigint_to_number(&mut self, big: Reg) -> R<Reg> {
-        let callee = self.prop(self.r_rt, "Number")?;
-        let (arg_base, argc) = self.arguments(&[big])?;
-        let dst = self.alloc()?;
-        self.emit(Instr::GlobalFn { dst, op: crate::bytecode::GlobalFn::Number, callee, arg_base, argc })?;
-        Ok(dst)
-    }
     /// `o[k]` (not a slice). Inline: an exact list or tuple indexed by an
     /// int reads its items array at `Number(k)`, and an exact dict still in
     /// its all-str mode looked up by a str reads its Map; a Python value is

@@ -28,8 +28,8 @@
 //! `ensure_ascii`, every UTF-16 unit outside `\x20-\x7e` becomes `\uXXXX`;
 //! floats are `rt.floatRepr` over the engine's shortest round-trip digits;
 //! containers are wrapped as `wrap` wraps them. The decoder builds the
-//! records `dict()` and `list()` build, with `dictSet`'s semantics for a
-//! repeated key (first position, last value).
+//! records `dict()` and `list()` build (a dict's storage a `PyTable`), with
+//! `dictSet`'s semantics for a repeated key (first position, last value).
 
 use super::*;
 use crate::heap::{HeapObj, JsStr, ObjMap};
@@ -330,22 +330,14 @@ impl<'p> Vm<'p> {
             enc.stack.pop();
             return Some(());
         }
-        if cls.bits() != enc.dict.bits() || self.py_json_field(idx, "str")? != Value::TRUE {
+        if cls.bits() != enc.dict.bits() {
             return None;
         }
         let map = self.py_json_field(idx, "map")?;
-        if !map.is_heap() {
-            return None;
-        }
-        let HeapObj::Map { keys, vals } = self.heap.get(map.heap_index()) else {
-            return None;
+        let mut entries: Vec<(Value, Value)> = match map.is_heap().then(|| self.heap.get(map.heap_index())) {
+            Some(HeapObj::PyTable(t)) => t.entries().map(|(_, k, v)| (k, v)).collect(),
+            _ => return None,
         };
-        let mut entries: Vec<(Value, Value)> = keys
-            .iter()
-            .zip(vals.iter())
-            .filter(|(k, _)| !k.is_hole())
-            .map(|(k, v)| (*k, *v))
-            .collect();
         if entries.is_empty() {
             out.push_str("{}");
             return Some(());
@@ -430,7 +422,14 @@ impl<'p> Vm<'p> {
             return None;
         }
         let (list_tmpl, list_items) = self.py_json_template(list, &["cls", "items"])?;
-        let (dict_tmpl, dict_map) = self.py_json_template(dict, &["cls", "map", "size", "str"])?;
+        let (dict_tmpl, dict_map) = self.py_json_template(dict, &["cls", "map", "size"])?;
+        let kinds = match dict_tmpl.val_at(dict_map) {
+            t if t.is_heap() => match self.heap.get(t.heap_index()) {
+                HeapObj::PyTable(t) => t.kinds,
+                _ => return None,
+            },
+            _ => return None,
+        };
         let mut p = Parser {
             src: &src,
             i: 0,
@@ -438,6 +437,7 @@ impl<'p> Vm<'p> {
             list_items,
             dict: dict_tmpl,
             dict_map,
+            kinds,
             keys: std::collections::HashMap::new(),
             values: 0,
         };
@@ -463,6 +463,8 @@ struct Parser<'s> {
     list_items: usize,
     dict: ObjMap,
     dict_map: usize,
+    /// The template dict's table kinds, for every table made here.
+    kinds: super::py_table::PyKinds,
     /// Short keys already made in this document, shared (strings are
     /// immutable, and a str's identity is not observable).
     keys: std::collections::HashMap<&'s [u8], Value>,
@@ -611,9 +613,8 @@ impl<'s> Parser<'s> {
 
     fn object(&mut self, vm: &mut Vm<'_>, depth: usize) -> Option<Value> {
         self.i += 1;
-        let mut keys: Vec<Value> = Vec::new();
-        let mut vals: Vec<Value> = Vec::new();
-        let mut index: Option<std::collections::HashMap<Vec<u8>, usize>> = None;
+        let mut table = super::py_table::PyTable::with_kinds(false, self.kinds);
+        let mut steps = 0;
         self.ws();
         if self.src.get(self.i) == Some(&b'}') {
             self.i += 1;
@@ -632,36 +633,8 @@ impl<'s> Parser<'s> {
                 let v = self.value(vm, depth + 1)?;
                 // `dictSet`: a repeated key keeps its first position and
                 // takes the last value.
-                let kb = match vm.heap.get(k.heap_index()) {
-                    HeapObj::Str(s) => s.as_bytes().to_vec(),
-                    _ => return None,
-                };
-                if index.is_none() && keys.len() >= 16 {
-                    let mut ix = std::collections::HashMap::new();
-                    for (pos, key) in keys.iter().enumerate() {
-                        if let HeapObj::Str(s) = vm.heap.get(key.heap_index()) {
-                            ix.insert(s.as_bytes().to_vec(), pos);
-                        }
-                    }
-                    index = Some(ix);
-                }
-                let found = match &index {
-                    Some(ix) => ix.get(&kb).copied(),
-                    None => keys.iter().position(|key| match vm.heap.get(key.heap_index()) {
-                        HeapObj::Str(s) => s.as_bytes() == kb.as_slice(),
-                        _ => false,
-                    }),
-                };
-                match found {
-                    Some(pos) => vals[pos] = v,
-                    None => {
-                        if let Some(ix) = &mut index {
-                            ix.insert(kb, keys.len());
-                        }
-                        keys.push(k);
-                        vals.push(v);
-                    }
-                }
+                let kinds = self.kinds;
+                super::py_table::native_set_item(&vm.heap, &kinds, &mut table, k, v, &mut steps).ok()?;
                 self.ws();
                 match self.src.get(self.i) {
                     Some(b',') => self.i += 1,
@@ -673,8 +646,9 @@ impl<'s> Parser<'s> {
                 }
             }
         }
-        let size = keys.len();
-        let map = Value::heap(vm.heap.alloc(HeapObj::Map { keys, vals }));
+        let size = table.len();
+        self.values += steps / super::py_table::STEPS_PER_ENTRY;
+        let map = Value::heap(vm.heap.alloc(HeapObj::PyTable(Box::new(table))));
         let mut rec = self.dict.clone();
         rec.set_val_at(self.dict_map, map);
         rec.set_val_at(self.dict_map + 1, Value::num(size as f64));

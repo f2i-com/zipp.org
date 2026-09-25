@@ -44,10 +44,9 @@
 //! front with [`bulk_cost`] (`Vm::native_kernel_admits`). Tables hold at
 //! most [`MAX_ITEMS`] entries (the runtime's `MAX_ITEMS`).
 
-// Nothing references the module until the wiring stage (the heap variant
-// and the runtime's native family); `pytable_size_probe` is a cfg for
-// measuring the module's compiled size in the wasm build.
-#![allow(dead_code, unexpected_cfgs)]
+// `pytable_size_probe` is a cfg for measuring the module's compiled size
+// in the wasm build.
+#![allow(unexpected_cfgs)]
 
 use super::BigVal;
 use crate::heap::{wtf8_decode, Heap, HeapObj};
@@ -103,6 +102,18 @@ pub(crate) fn bulk_cost(n: usize) -> u64 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Hint {
     version: u32,
+}
+
+impl Hint {
+    /// The hint a probe of the table at `version` gave (the runtime hands
+    /// it back to an insert).
+    pub(crate) fn at(version: u32) -> Hint {
+        Hint { version }
+    }
+
+    pub(crate) fn version(self) -> u32 {
+        self.version
+    }
 }
 
 /// [`PyTable::lookup`]'s answer.
@@ -163,12 +174,14 @@ pub(crate) struct PyTable {
     /// Bumped by every insert, delete, clear and compaction (never by a
     /// value replacement).
     version: u32,
-    /// Reserved for stage S3's hidden-class layouts (0 = none).
-    pub(crate) layout: u32,
     set: bool,
+    /// The runtime's tuple and frozenset types, for the native key front
+    /// end: given at creation, carried by every table made from this one.
+    pub(crate) kinds: PyKinds,
 }
 
 impl PyTable {
+    #[cfg(test)]
     pub(crate) fn new_dict() -> PyTable {
         PyTable::default()
     }
@@ -176,6 +189,15 @@ impl PyTable {
     pub(crate) fn new_set() -> PyTable {
         PyTable {
             set: true,
+            ..PyTable::default()
+        }
+    }
+
+    /// An empty dict (`set` false) or set table for the runtime's `kinds`.
+    pub(crate) fn with_kinds(set: bool, kinds: PyKinds) -> PyTable {
+        PyTable {
+            set,
+            kinds,
             ..PyTable::default()
         }
     }
@@ -188,10 +210,7 @@ impl PyTable {
         self.len as usize
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
+    #[cfg(test)]
     pub(crate) fn version(&self) -> u32 {
         self.version
     }
@@ -213,12 +232,8 @@ impl PyTable {
         Some(self.vals.get(i).copied().unwrap_or(Value::UNDEFINED))
     }
 
-    pub(crate) fn hash_at(&self, i: usize) -> Option<i64> {
-        self.key_at(i)?;
-        self.hashes.get(i).copied()
-    }
-
     /// Key and value of live entry `i`, while the table is at `version`.
+    #[cfg(test)]
     pub(crate) fn at(&self, i: usize, version: u32) -> Option<(Value, Value)> {
         if version != self.version {
             return None;
@@ -236,6 +251,11 @@ impl PyTable {
         self.keys.iter().enumerate().filter(|(_, k)| !k.is_hole()).map(move |(i, &k)| {
             (i, k, self.vals.get(i).copied().unwrap_or(Value::UNDEFINED))
         })
+    }
+
+    /// Every value the table holds, for the collector.
+    pub(crate) fn edges(&self) -> impl Iterator<Item = Value> + '_ {
+        self.keys.iter().chain(self.vals.iter()).copied().chain([self.kinds.tuple, self.kinds.frozenset])
     }
 
     /// Bytes owned beyond the struct (for heap accounting).
@@ -347,6 +367,7 @@ impl PyTable {
     }
 
     /// Live entries with hash `h`, in insertion order.
+    #[cfg(test)]
     pub(crate) fn same_hash(&self, h: i64, steps: &mut u64) -> Vec<usize> {
         match self.probe(h, Value::UNDEFINED, steps) {
             Probe::Candidates(v, _) => v,
@@ -440,16 +461,18 @@ impl PyTable {
     }
 
     /// `dict.popitem()`: the last entry.
+    #[cfg(test)]
     pub(crate) fn pop_last(&mut self) -> Option<(Value, Value)> {
         let i = self.keys.len().checked_sub(1)?;
         self.remove_at(i)
     }
 
     pub(crate) fn clear(&mut self) {
-        let (set, version) = (self.set, self.version.wrapping_add(1));
+        let (set, version, kinds) = (self.set, self.version.wrapping_add(1), self.kinds);
         *self = PyTable {
             set,
             version,
+            kinds,
             ..PyTable::default()
         };
     }
@@ -566,6 +589,7 @@ impl PyTable {
     fn copied_in(&self, order: &[usize], steps: &mut u64) -> PyTable {
         let mut out = PyTable {
             set: self.set,
+            kinds: self.kinds,
             ..PyTable::default()
         };
         out.hashes.reserve_exact(order.len());
@@ -628,6 +652,16 @@ pub(crate) fn cpython_set_size(n: usize) -> usize {
 pub(crate) struct PyKinds {
     pub(crate) tuple: Value,
     pub(crate) frozenset: Value,
+}
+
+impl Default for PyKinds {
+    /// No kinds: every record key needs guest code.
+    fn default() -> PyKinds {
+        PyKinds {
+            tuple: Value::UNDEFINED,
+            frozenset: Value::UNDEFINED,
+        }
+    }
 }
 
 /// A native key, classified.
@@ -696,27 +730,15 @@ fn classify<'h>(heap: &'h Heap, kinds: &PyKinds, v: Value) -> Option<Kind<'h>> {
     }
 }
 
-/// A frozenset's elements, from its storage: today the runtime's bucket
-/// Map (`Map<keyOf, Array<element>>`). The wiring stage adds the PyTable
-/// storage arm.
+/// A frozenset's elements, from its storage table.
 fn members(heap: &Heap, storage: Value) -> Option<Vec<Value>> {
     if !storage.is_heap() {
         return None;
     }
-    let HeapObj::Map { vals, .. } = heap.get(storage.heap_index()) else {
-        return None;
-    };
-    let mut out = Vec::new();
-    for b in vals.iter().filter(|b| !b.is_hole()) {
-        if !b.is_heap() {
-            return None;
-        }
-        let HeapObj::Array(items) = heap.get(b.heap_index()) else {
-            return None;
-        };
-        out.extend(items.iter().copied().filter(|x| !x.is_hole()));
+    match heap.get(storage.heap_index()) {
+        HeapObj::PyTable(t) if t.set => Some(t.entries().map(|(_, k, _)| k).collect()),
+        _ => None,
     }
-    Some(out)
 }
 
 /// `-1` is reserved: it becomes `-2`.
@@ -808,6 +830,13 @@ fn units_of(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
 
 /// `strHash` of the string at `idx`.
 fn hash_str(heap: &Heap, idx: u32, steps: &mut u64) -> Option<i64> {
+    if let HeapObj::Str(s) = heap.get(idx) {
+        if s.is_ascii() {
+            let b = s.as_bytes();
+            *steps += 1 + b.len() as u64 / 16;
+            return Some(hash_str_units(b.iter().map(|&c| u16::from(c))));
+        }
+    }
     let bytes = heap.str_wtf8_cow(idx)?;
     *steps += 1 + bytes.len() as u64 / 16;
     Some(hash_str_units(units_of(&bytes)))
@@ -1175,7 +1204,7 @@ pub(crate) fn set_op(heap: &Heap, kinds: &PyKinds, op: SetOp, a: &PyTable, b: &P
     *steps += bulk_cost(a.len() + b.len());
     let mut out = match op {
         SetOp::Union => a.copy(heap, steps),
-        _ => PyTable::new_set(),
+        _ => PyTable::with_kinds(true, a.kinds),
     };
     let keep = |out: &mut PyTable, src: &PyTable, other: &PyTable, want: bool, steps: &mut u64| -> Option<()> {
         for i in src.visible_order(heap) {
@@ -1284,6 +1313,9 @@ pub(crate) fn size_probe(x: u64) -> u64 {
     b.clear();
     acc + steps + b.version() as u64
 }
+
+#[path = "py_table_ops.rs"]
+mod runtime_ops;
 
 #[cfg(test)]
 #[path = "py_table_tests.rs"]

@@ -1,0 +1,12 @@
+True
+False
+False
+True
+['b', 'a']
+[2, 1]
+[('b', 2), ('a', 1)]
+True
+{'x': 1, 'w': 0}
+TE 'int' object is not iterable
+Counter [('a', 2), ('b', 1)] True
+OrderedDict [('a', 1)] True

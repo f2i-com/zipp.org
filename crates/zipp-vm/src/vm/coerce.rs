@@ -3105,6 +3105,10 @@ impl<'p> Vm<'p> {
                 HeapObj::Map { .. } => {
                     out.push_str("[object Map]");
                 }
+                #[cfg(feature = "python")]
+                HeapObj::PyTable(_) => {
+                    out.push_str("[object Object]");
+                }
                 HeapObj::Set(_) => {
                     out.push_str("[object Set]");
                 }
@@ -3463,6 +3467,10 @@ impl<'p> Vm<'p> {
                 out.push_str("[class ");
                 out.push_str(&class.name);
                 out.push_char(']');
+            }
+            #[cfg(feature = "python")]
+            HeapObj::PyTable(t) => {
+                let _ = write!(out, "PyTable({})", t.len());
             }
             HeapObj::Map { keys, vals } => {
                 let _ = write!(out, "Map({}) {{", keys.len());

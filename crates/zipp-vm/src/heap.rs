@@ -4925,6 +4925,10 @@ pub enum HeapObj {
     /// func id. `new C(args)` builds a plain object, links it to its class for
     /// method lookup, and runs the ctor with `this` = the new object.
     Class(Box<ClassData>),
+    /// A Python dict's or set's storage (`vm::py_table`), held by the
+    /// runtime's dict and set records.
+    #[cfg(feature = "python")]
+    PyTable(Box<crate::vm::py_table::PyTable>),
 }
 
 impl HeapObj {
@@ -4998,6 +5002,8 @@ impl HeapObj {
                 .saturating_add(std::mem::size_of::<num_bigint::BigInt>()),
             HeapObj::Symbol { prop_key, .. } => prop_key.capacity(),
             HeapObj::Iterator { items, .. } => vec_capacity_bytes(items),
+            #[cfg(feature = "python")]
+            HeapObj::PyTable(t) => t.payload_bytes(),
             HeapObj::Class(class) => {
                 let mut n = std::mem::size_of::<ClassData>()
                     .saturating_add(class.name.capacity())
@@ -6986,6 +6992,8 @@ impl Heap {
             HeapObj::Object(map) => map.vals.len() <= max,
             HeapObj::Map { keys, .. } => keys.len() <= max,
             HeapObj::Set(items) => items.len() <= max,
+            #[cfg(feature = "python")]
+            HeapObj::PyTable(t) => t.slots() <= max,
             _ => false,
         }
     }

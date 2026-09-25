@@ -1,0 +1,19 @@
+insertion {5: 50, 3: 'replaced', 9: 90, 1: 10}
+reinsert {3: 'replaced', 9: 90, 1: 10, 5: 'back'} [3, 9, 1, 5] ['replaced', 90, 10, 'back']
+popitems (5, 'back') (1, 10) {3: 'replaced', 9: 90}
+churn {9: 90, 4: 95, 0: 98, 3: 94, 6: 97}
+delete-while-listing {0: 0, 2: 2, 4: 4, 6: 6, 8: 8}
+dict-grow dictionary changed size during iteration
+dict-shrink dictionary changed size during iteration
+dict-assign {1: 'same size is fine', 2: 'same size is fine'}
+values-clear dictionary changed size during iteration
+items-after {1: 1, 2: 2, 4: 4}
+set-grow Set changed size during iteration
+set-shrink Set changed size during iteration
+small-ints {1, 2, 3} {0, 2, 5, 7} {0, 1, 2, 3, 4, 5, 6, 7, 8, 9} {1, 4}
+small-ints-build {2, 4, 6} {8, 2, 6} frozenset({2, 3})
+small-ints-mut {2, 3, 5} [0, 1, 2, 3, 5] 1 {2, 3, 5}
+set-pop-drains [9] [7, 9]
+drained [0, 1, 2]
+list-order [1, 0, 2] [3, 1, 2]
+comprehension {'c': 0, 'a': 1, 'b': 2} {1: 'x', 2: 'y'}

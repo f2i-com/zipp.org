@@ -3028,16 +3028,6 @@ impl<'p> Vm<'p> {
                 .program
                 .global_names
                 .iter()
-                .position(|name| name == native::PY_TKEY_NAME);
-            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
-                let tkey = self.heap.alloc(HeapObj::Native(native::PY_TKEY));
-                self.globals[slot] = Value::heap(tkey);
-                self.bump_global_gen(slot as u32);
-            }
-            let slot = self
-                .program
-                .global_names
-                .iter()
                 .position(|name| name == native::PY_ITER_NAME);
             if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
                 let step = self.heap.alloc(HeapObj::Native(native::PY_ITER));
@@ -3072,6 +3062,16 @@ impl<'p> Vm<'p> {
             if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
                 let find = self.heap.alloc(HeapObj::Native(native::PY_SMFIND));
                 self.globals[slot] = Value::heap(find);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_TABLE_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let table = self.heap.alloc(HeapObj::Native(native::PY_TABLE));
+                self.globals[slot] = Value::heap(table);
                 self.bump_global_gen(slot as u32);
             }
         }

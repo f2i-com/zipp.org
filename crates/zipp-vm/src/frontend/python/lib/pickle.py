@@ -6,7 +6,7 @@ instantiated unless `find_class` allows them; the inert data globals a
 protocol-2 stream uses for sets, bytes and bytearrays (`builtins.set`,
 `_codecs.encode`, ...) are always resolved."""
 import struct
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 HIGHEST_PROTOCOL = 2
 DEFAULT_PROTOCOL = 2
@@ -44,7 +44,7 @@ _codecs_encode.__name__ = "encode"
 _DATA_GLOBALS = {
     ("builtins", "set"): set, ("builtins", "bytearray"): bytearray,
     ("builtins", "bytes"): bytes, ("builtins", "complex"): complex, ("_codecs", "encode"): _codecs_encode,
-    ("collections", "OrderedDict"): OrderedDict,
+    ("collections", "OrderedDict"): OrderedDict, ("collections", "Counter"): Counter,
 }
 # Python 2 module names that protocol 0-2 streams use (pickle's fix_imports).
 _PY2_MODULES = {"__builtin__": "builtins", "copy_reg": "copyreg"}
@@ -563,6 +563,12 @@ class Pickler:
                 for item in obj:
                     self._save(item)
                 self._w(b"e")
+        elif type(obj) is Counter:
+            # As CPython reduces it: `Counter(dict(self))`.
+            self._global("collections", "Counter")
+            self._save(dict(obj))
+            self._w(b"\x85R")
+            self._memoize(obj)
         elif isinstance(obj, OrderedDict):
             self._w(b"ccollections\nOrderedDict\n)\x81")
             self._memoize(obj)

@@ -883,8 +883,8 @@
     rt.constructors.set(T.list, (args, kw, cls) => { const out = cls === T.list ? list([]) : rt.allocInstance(cls); if (args.length) out.items = drain(args[0]); return out; });
     rt.allocators.set(T.list, (cls) => ({ cls: cls, items: [] }));
     rt.allocators.set(T.tuple, (cls) => ({ cls: cls, items: [] }));
-    rt.allocators.set(T.dict, (cls) => ({ cls: cls, map: new Map(), size: 0, str: true }));
-    rt.allocators.set(T.set, (cls) => ({ cls: cls, map: new Map(), size: 0 }));
+    rt.allocators.set(T.dict, (cls) => rt.dict(cls));
+    rt.allocators.set(T.set, (cls) => rt.set(cls));
     method(L, "__init__", -1, (a) => { const self = a[0]; self.items = a.length > 1 ? drain(a[1]) : []; return null; });
     method(L, "append", 2, (a) => { const l = listSelf(a); if (l.items.length >= rt.MAX_ITEMS) fail(E.MemoryError, "list limit exceeded"); l.items.push(a[1]); return null; });
     method(L, "extend", 2, (a) => { const l = listSelf(a); const items = drain(a[1]); for (const x of items) l.items.push(x); return null; });
@@ -1052,8 +1052,8 @@
     D.dict.set("__hash__", null);
     method(D, "get", 3, (a) => { const v = dictGet(dictSelf(a), a[1]); return v === undefined ? (a[2] === undefined ? null : a[2]) : v; }, 2);
     method(D, "setdefault", 3, (a) => { const d = dictSelf(a); const v = dictGet(d, a[1]); if (v !== undefined) return v; const dflt = a[2] === undefined ? null : a[2]; dictSet(d, a[1], dflt); return dflt; }, 2);
-    method(D, "pop", 3, (a) => { const d = dictSelf(a); const v = dictGet(d, a[1]); if (v === undefined) { if (a[2] === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return a[2]; } dictDel(d, a[1]); return v; }, 2);
-    method(D, "popitem", 1, (a) => { const d = dictSelf(a); const entries = dictEntryList(d); if (!entries.length) fail(E.KeyError, "popitem(): dictionary is empty"); const e = entries[entries.length - 1]; const [k, v] = e; rt.dictDelEntry(d, e); return tuple([k, v]); });
+    method(D, "pop", 3, (a) => { const v = rt.dictPop(dictSelf(a), a[1]); if (v === undefined) { if (a[2] === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return a[2]; } return v; }, 2);
+    method(D, "popitem", 1, (a) => { const e = rt.dictPopItem(dictSelf(a), false); if (e === undefined) fail(E.KeyError, "popitem(): dictionary is empty"); return tuple([e[0], e[1]]); });
     methodkw(D, "update", (a) => { const kw = kwOf(a, null); fillDict(dictSelf(a), a[1], kw); return null; });
     method(D, "clear", 1, (a) => { rt.dictClear(dictSelf(a)); return null; });
     method(D, "copy", 1, (a) => rt.dictCopy(dictSelf(a)));
@@ -1072,7 +1072,7 @@
     try { ITER_STEP = typeof __zipp_py_iter === "function" ? __zipp_py_iter : null; } catch (e) { ITER_STEP = null; }
     const ITER_TMPL = list([]);
     function view(type, d, pick) {
-        return { cls: type, dict: d, iter: () => ({ cls: T.iterator, next: ITER_STEP !== null ? ITER_STEP : viewNext, jnext: viewNext,
+        return { cls: type, of: d, iter: () => ({ cls: T.iterator, next: ITER_STEP !== null ? ITER_STEP : viewNext, jnext: viewNext,
             kind: 1, a: dictEntryList(d), i: 0, b: d, size: d.size, pick: pick, tmpl: ITER_TMPL, ttype: T.tuple }) };
     }
     rt.iterStep = ITER_STEP; rt.iterTmpl = ITER_TMPL;
@@ -1080,12 +1080,13 @@
     method(D, "values", 1, (a) => view(T.dict_values, dictSelf(a), 1));
     method(D, "items", 1, (a) => view(T.dict_items, dictSelf(a), 2));
     for (const v of [T.dict_keys, T.dict_values, T.dict_items]) {
-        method(v, "__len__", 1, (a) => BigInt(a[0].dict.size));
+        method(v, "__len__", 1, (a) => BigInt(a[0].of.size));
         method(v, "__iter__", 1, (a) => a[0].iter());
         method(v, "__repr__", 1, (a) => repr(a[0]));
+        method(v, "__reversed__", 1, (a) => { const xs = drain(a[0]); let i = xs.length; return { cls: T.reversed, next: () => i > 0 ? xs[--i] : STOP }; });
     }
-    method(T.dict_keys, "__contains__", 2, (a) => rt.dictHas(a[0].dict, a[1]));
-    method(T.dict_items, "__contains__", 2, (a) => { const p = a[1]; if (p === null || typeof p !== "object" || p.cls !== T.tuple || p.items.length !== 2) return false; const v = rt.dictGet(a[0].dict, p.items[0]); return v !== undefined && rt.eq(v, p.items[1]); });
+    method(T.dict_keys, "__contains__", 2, (a) => rt.dictHas(a[0].of, a[1]));
+    method(T.dict_items, "__contains__", 2, (a) => { const p = a[1]; if (p === null || typeof p !== "object" || p.cls !== T.tuple || p.items.length !== 2) return false; const v = rt.dictGet(a[0].of, p.items[0]); return v !== undefined && rt.eq(v, p.items[1]); });
     // Keys and items views behave as sets in the set operators.
     for (const v of [T.dict_keys, T.dict_items]) {
         for (const [name, op] of [["__sub__", "sub"], ["__and__", "and"], ["__or__", "or"], ["__xor__", "xor"]]) {
@@ -1128,14 +1129,14 @@
         method(type, "copy", 1, (a) => setFrom(a[0], type));
         if (frozen) { method(type, "__hash__", 1, (a) => rt.baseHash(a[0])); continue; }
         type.dict.set("__hash__", null);
-        method(type, "__init__", -1, (a) => { const s = a[0]; s.map.clear(); s.size = 0; if (a.length > 1) for (const x of drain(a[1])) setAdd(s, x); return null; });
+        method(type, "__init__", -1, (a) => { const s = a[0]; rt.setClear(s); if (a.length > 1) for (const x of drain(a[1])) setAdd(s, x); return null; });
         method(type, "add", 2, (a) => { setAdd(a[0], a[1]); return null; });
         method(type, "remove", 2, (a) => { if (!setDel(a[0], a[1])) throw rt.makeExc(E.KeyError, [a[1]]); return null; });
         method(type, "discard", 2, (a) => { setDel(a[0], a[1]); return null; });
-        method(type, "pop", 1, (a) => { const items = setList(a[0]); if (!items.length) fail(E.KeyError, "pop from an empty set"); rt.setDelPicked(a[0], items[0]); return items[0]; });
-        method(type, "clear", 1, (a) => { a[0].map.clear(); a[0].size = 0; return null; });
+        method(type, "pop", 1, (a) => { const v = rt.setPop(a[0]); if (v === undefined) fail(E.KeyError, "pop from an empty set"); return v; });
+        method(type, "clear", 1, (a) => { rt.setClear(a[0]); return null; });
         method(type, "update", -1, (a) => { for (let i = 1; i < a.length; i++) for (const x of drain(a[i])) setAdd(a[0], x); return null; });
-        method(type, "intersection_update", -1, (a) => { for (let i = 1; i < a.length; i++) { const out = intersectIterable(a[0], a[i]); a[0].map = out.map; a[0].size = out.size; } return null; });
+        method(type, "intersection_update", -1, (a) => { for (let i = 1; i < a.length; i++) { rt.setReplace(a[0], intersectIterable(a[0], a[i])); } return null; });
         method(type, "difference_update", -1, (a) => { for (let i = 1; i < a.length; i++) rt.setBinop("sub", a[0], setFrom(a[i], type), true); return null; });
         method(type, "symmetric_difference_update", 2, (a) => { rt.setBinop("xor", a[0], setFrom(a[1], type), true); return null; });
     }
@@ -1689,13 +1690,12 @@
         // is the instance's own attribute Map (a str-keyed dict keeps exactly
         // that shape), so isinstance, json, pickle, copy and every dict method
         // see it as CPython's do, and writes land on the object. A non-str
-        // key would convert the storage to buckets; it is refused instead.
+        // key is refused.
         const refuseKey = () => fail(E.TypeError, "attribute name must be string");
         const liveDict = (target) => ({
             cls: T.dict, liveTarget: target,
             get map() { return target.dict; }, set map(v) { refuseKey(); },
             get size() { return target.dict.size; }, set size(v) { },
-            get str() { return true; }, set str(v) { if (v !== true) refuseKey(); },
         });
         rt.instanceDict = (obj) => {
             const hide = obj.cls !== undefined && obj.cls !== null ? obj.cls.slots : undefined;
@@ -1713,11 +1713,10 @@
         rt.setInstanceDict = (obj, d) => {
             if (d === null || typeof d !== "object" || d.map === undefined || !isInstance(d, T.dict)) fail(E.TypeError, "__dict__ must be set to a dictionary, not a '" + typeOf(d).name + "'");
             if (d.liveTarget !== undefined) { obj.dict = d.liveTarget.dict; return; }
-            if (d.str !== true) { obj.dict = rt.mapFromDict(d); return; }
-            const shared = d.map;
+            const shared = rt.dictToMap(d);
+            if (shared === undefined) { obj.dict = rt.mapFromDict(d); return; }
             Object.defineProperty(d, "map", { get: () => shared, set: (v) => { refuseKey(); }, configurable: true });
             Object.defineProperty(d, "size", { get: () => shared.size, set: (v) => { }, configurable: true });
-            Object.defineProperty(d, "str", { get: () => true, set: (v) => { if (v !== true) refuseKey(); }, configurable: true });
             obj.dict = shared;
             if (d.cls === T.dict) obj.dictView = Object.defineProperty(d, "liveTarget", { value: obj, configurable: true, writable: true });
         };

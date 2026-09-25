@@ -1626,6 +1626,12 @@ impl Vm<'_> {
                     m_val!(v);
                 }
             }
+            #[cfg(feature = "python")]
+            HeapObj::PyTable(t) => {
+                for v in t.edges() {
+                    m_val!(v);
+                }
+            }
             // Weak collection keys and WeakRef targets are processed only after
             // the ordinary trace. WeakMap values are ephemerons, not ordinary
             // outgoing edges.

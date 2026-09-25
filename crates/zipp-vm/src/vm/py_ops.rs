@@ -748,59 +748,17 @@ impl<'p> Vm<'p> {
     }
 
     /// [`Instr::PyDictLookup`]: `Some(Some(value))`, `Some(None)` for no
-    /// entry, `None` for the slow edge.
+    /// entry, `None` for the slow edge (the table's own lookup, `vm::py_table`).
     fn py_dict_lookup(&mut self, d: Value, k: Value, rt: Value) -> Option<Option<Value>> {
-        if !d.is_heap() || !(k.is_heap() || k.is_small_bigint()) {
+        if !d.is_heap() {
             return None;
         }
         let tdict = self.py_rt_for(rt)?.t_dict;
         if self.py_cls_of(d)?.bits() != tdict.bits() {
             return None;
         }
-        let di = d.heap_index();
-        let (_, map) = self.py_dict_field(di, 0)?;
-        let (_, str_mode) = self.py_dict_field(di, 2)?;
-        if !map.is_heap() || !matches!(self.heap.get(map.heap_index()), HeapObj::Map { .. }) {
-            return None;
-        }
-        if str_mode == Value::TRUE {
-            if !k.is_heap() || !self.heap.is_str_like(k.heap_index()) {
-                return None;
-            }
-            return Some(self.py_map_get(map, k));
-        }
-        if str_mode != Value::FALSE {
-            return None;
-        }
-        let n = self.bigint_i128(k)?;
-        if n.unsigned_abs() > 9_007_199_254_740_991 {
-            return None;
-        }
-        let Some(bucket) = self.py_map_get(map, Value::num(n as f64)) else {
-            return Some(None);
-        };
-        if !bucket.is_heap() {
-            return None;
-        }
-        let HeapObj::Array(b) = self.heap.get(bucket.heap_index()) else {
-            return None;
-        };
-        let [entry] = b.as_slice() else {
-            return None;
-        };
-        if !entry.is_heap() {
-            return None;
-        }
-        let HeapObj::Array(e) = self.heap.get(entry.heap_index()) else {
-            return None;
-        };
-        let (Some(&stored), Some(&value)) = (e.first(), e.get(1)) else {
-            return None;
-        };
-        if self.bigint_i128(stored) != Some(n) {
-            return None;
-        }
-        (value != Value::HOLE).then_some(Some(value))
+        let (_, map) = self.py_dict_field(d.heap_index(), 0)?;
+        self.py_table_get(map, k)
     }
 
     /// For [`Instr::PyRaise`] / [`Instr::PyCaught`]: whether `e` is an
@@ -1343,19 +1301,6 @@ impl<'p> Vm<'p> {
         Some((items.heap_index(), i))
     }
 
-    /// `o.map` of a str-keyed dict record, for a str `k`.
-    fn py_str_map(&self, idx: u32, k: Value) -> Option<u32> {
-        if !k.is_heap() || !self.heap.is_str_like(k.heap_index()) {
-            return None;
-        }
-        let (_, flag) = self.py_dict_field(idx, 2)?;
-        if flag != Value::TRUE {
-            return None;
-        }
-        let (_, map) = self.py_dict_field(idx, 0)?;
-        (map.is_heap() && matches!(self.heap.get(map.heap_index()), HeapObj::Map { .. })).then(|| map.heap_index())
-    }
-
     fn py_get_item(&mut self, o: Value, k: Value, seq: Value, dict: Value) -> Result<Option<Value>, Thrown> {
         let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
             return Ok(None);
@@ -1370,11 +1315,10 @@ impl<'p> Vm<'p> {
             let v = vals[i];
             return Ok((v != Value::HOLE && !v.is_undefined()).then_some(v));
         }
-        let Some(map) = self.py_str_map(idx, k) else {
+        let Some((_, map)) = self.py_dict_field(idx, 0) else {
             return Ok(None);
         };
-        let v = self.map_method(map, "get", &[k])?.unwrap_or(Value::UNDEFINED);
-        Ok((!v.is_undefined()).then_some(v))
+        Ok(self.py_table_get(map, k).flatten())
     }
 
     fn py_set_item(&mut self, o: Value, k: Value, v: Value, seq: Value, dict: Value) -> Result<bool, Thrown> {
@@ -1388,14 +1332,13 @@ impl<'p> Vm<'p> {
             self.set_index(Value::heap(items), Value::int(i as i32), v, true)?;
             return Ok(true);
         }
-        let Some(map) = self.py_str_map(idx, k) else {
+        let (Some((_, map)), Some((size_slot, _))) = (self.py_dict_field(idx, 0), self.py_dict_field(idx, 1)) else {
             return Ok(false);
         };
-        let Some((size_slot, _)) = self.py_dict_field(idx, 1) else {
+        // A key needing guest code, or a full table: the runtime's path.
+        let Some(Ok(n)) = self.py_table_set(map, k, v) else {
             return Ok(false);
         };
-        self.map_method(map, "set", &[k, v])?;
-        let n = self.coll_live_len(map);
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
             m.set_val_at(size_slot, Value::num(n as f64));
         }

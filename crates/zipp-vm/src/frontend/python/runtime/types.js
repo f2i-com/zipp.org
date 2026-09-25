@@ -441,6 +441,8 @@
             if (op === "or" && b !== null && typeof b === "object" && b.map !== undefined && isInstance(b, T.dict)) {
                 const out = inplace ? a : rt.dictCopy(a); for (const [k, v] of rt.dictEntries(b)) rt.dictSet(out, k, v); return out;
             }
+            // `d |= x` takes what `dict.update` does (a mapping or pairs).
+            if (op === "or" && inplace) { call(T.dict.dict.get("update"), [a, b], null); return a; }
             return NOTIMPL;
         }
         if (a.map !== undefined && b !== null && typeof b === "object" && b.map !== undefined && !isInstance(b, T.dict)) return rt.setBinop(op, a, b, inplace);
@@ -844,7 +846,7 @@
         if (container !== null && typeof container === "object") {
             const c = container.cls;
             if (c === T.list || c === T.tuple || c === T.dict || c === T.set || c === T.frozenset || c === T.range || c === T.bytes) return baseContains(container, needle);
-            if (c === T.dict_keys) return rt.dictHas(container.dict, needle);
+            if (c === T.dict_keys) return rt.dictHas(container.of, needle);
             if (c === T.dict_values || c === T.dict_items) { const it = container.iter(); for (;;) { const v = it.next(); if (v === STOP) return false; if (eq(v, needle)) return true; } }
             if (container.isType) { const cc = rt.classDunder(container, "__contains__"); if (cc !== undefined) return truth(call(cc, [needle], null)); }
             const m = typeMethod(container, "__contains__");
@@ -856,8 +858,13 @@
     }
     rt.contains = contains;
 
-    // ---- hashing: the bucket key of a value in dicts and sets ----------------------------------------------
-    // The bucket key is whatever is cheapest that keeps Python's equality:
+    // ---- hashing: `hash()`, and the bucket key of a value --------------------------------------------------
+    // Dicts and sets hash natively (`vm::py_table`); `hashInt` is the hash of
+    // a key needing guest code, and equals the table's own for every other.
+    // `keyOf` is a JS Map key with Python's equality (Counter, ChainMap,
+    // match patterns), and files a set's colliding keys together as the
+    // former bucket storage did (`mateOf`). The bucket key is whatever is
+    // cheapest that keeps Python's equality:
     // strings are themselves (a NUL-led string is escaped, NUL leads every
     // composite key), integers within 2^53 (and integral floats and bools,
     // which equal them) are JS numbers, None is one sentinel object, and
@@ -868,9 +875,9 @@
     // then compared with __eq__.
     const NONE_KEY = { none: true };
     const SAFE = 9007199254740991;
-    let TKEY = null;
-    try { TKEY = typeof __zipp_py_tkey === "function" ? __zipp_py_tkey : null; } catch (e) { TKEY = null; }
-    function keyOf(v) {
+    // `hv`: `v`'s hash when known (a key with a __hash__ of its own then
+    // takes that hash's bucket without running it again).
+    function keyOf(v, hv) {
         const tv = typeof v;
         if (tv === "string") return v.charCodeAt(0) === 0 ? "\0s" + v : v;
         if (tv === "bigint") { const n = Number(v); return Number.isSafeInteger(n) ? n : intKey(hashBigInt(v)); }
@@ -885,21 +892,7 @@
         }
         if (v === null) return NONE_KEY;
         const c = v.cls;
-        if (c === T.tuple) {
-            // A tuple of plain values keeps its bucket key: its items never
-            // change, and neither do their keys.
-            const known = v.hkey;
-            if (known !== undefined) return known;
-            // The engine builds the same text for plain items (`vm::py_key`).
-            let k = TKEY !== null ? TKEY(v, T.tuple) : undefined;
-            if (k === undefined) k = "\0" + baseKey(v);
-            const items = v.items;
-            let plain = true;
-            for (let i = 0; i < items.length; i++) { const x = items[i]; if (x !== null && typeof x === "object") { plain = false; break; } }
-            if (plain) v.hkey = k;
-            return k;
-        }
-        if (c === T.frozenset || c === T.bytes || c === T.range) return "\0" + baseKey(v);
+        if (c === T.tuple || c === T.frozenset || c === T.bytes || c === T.range) return "\0" + baseKey(v);
         if (c === T.list || c === T.dict || c === T.set) fail(E.TypeError, "unhashable type: '" + c.name + "'");
         if (c === T.slice) fail(E.TypeError, "unhashable type: 'slice'");
         if (c === T.method) { const s = v.self; return "\0m" + rt.ident(v.func) + ":" + (s !== null && typeof s === "object" ? "o" + rt.ident(s) : keyStr(s)); }
@@ -917,12 +910,15 @@
         if (h.isBase) return v.pyval !== undefined ? keyOf(v.pyval) : "\0" + baseKey(v);
         // A user hash shares the bucket of the int with that hash, so an
         // instance equal to an int key (through either side's __eq__) finds it.
-        return intKey(hashBigInt(userHash(h, v, c)));
+        return intKey(hv !== undefined ? hv : userHash(h, v, c));
     }
+    // A `__hash__`'s answer as CPython takes it: itself within 64 bits (-1
+    // becoming -2), the int's own hash beyond.
     function userHash(h, v, c) {
         const r = call(descrGet(h, v, c), [], null);
         if (!isInt(r)) fail(E.TypeError, "__hash__ method should return an integer");
-        return asInt(r);
+        const i = asInt(r);
+        return i === -1n ? -2n : BigInt.asIntN(64, i) === i ? i : hashBigInt(i);
     }
     function intKey(i) { const n = Number(i); return Number.isSafeInteger(n) ? n : "\0n" + i.toString(); }
     rt.keyOf = keyOf;
@@ -1024,7 +1020,7 @@
         if (c !== undefined && c !== T.frozenset && c !== T.bytes && c !== T.range && c !== T.list && c !== T.dict && c !== T.set && c !== T.slice) {
             const h = typeMethod(v, "__hash__");
             if (h === CX_HASH && h !== null) return cxHash(v.re, v.im);
-            if (h !== undefined && h !== null && !h.isBase && h !== rt.ObjectType.dict.get("__hash__")) return hashBigInt(userHash(h, v, c));
+            if (h !== undefined && h !== null && !h.isBase && h !== rt.ObjectType.dict.get("__hash__")) return userHash(h, v, c);
         }
         const k = keyOf(v);
         if (typeof k === "string") return isInstance(v, T.tuple) ? hashTuple(v.items) : strHash(keyStr(v));
@@ -1035,84 +1031,117 @@
     rt.hashInt = hashInt;
 
     // ---- dict ---------------------------------------------------------------------------------------------
-    // {cls: T.dict, map, size, str, coll}. While every key is a str (`str`),
-    // `map` is a plain Map<str, value>. The first other key converts it to
-    // buckets, Map<bucket, Array<[key, value, seq]>>, which iterate in
-    // creation order: insertion order while every bucket holds one key. Once
-    // two unequal keys share a bucket (`coll`), iteration orders the entries
-    // by their insertion stamp instead.
-    let entrySeq = 0;
-    function dict() { return { cls: T.dict, map: new Map(), size: 0, str: true }; }
-    function toBuckets(d) {
-        const old = d.map;
-        d.map = new Map(); d.str = false;
-        for (const [k, v] of old) d.map.set(k.charCodeAt(0) === 0 ? "\0s" + k : k, [[k, v, ++entrySeq]]);
+    // {cls: T.dict, map, size}: `map` is the storage, a native table that
+    // keeps its entries in insertion order (`vm::py_table`, reached through
+    // `TB`, `__zipp_py_table`: its op codes are listed there), and `size`
+    // its length, written back after every change. A live `__dict__` view
+    // (builtins.js `liveDict`) keeps an instance's attribute Map instead, str
+    // keys only (its `size` is a getter). The table answers every op itself
+    // for keys it can hash and compare, and answers the table itself (`m`
+    // below) when guest code must run: then `hashInt` hashes the key and
+    // `find` runs `eq` on the candidates it reports. Nothing else in the
+    // runtime touches the storage.
+    const TB = __zipp_py_table, TT = T.tuple, TF = T.frozenset;
+    function dict(cls) { return { cls: cls || T.dict, map: TB(0, false, TT, TF), size: 0 }; }
+    function full(what) { fail(E.MemoryError, what + " limit exceeded"); }
+    // The split protocol's lookup of `key` (of hash `h`) in table `m`: its
+    // position, with `fKey` the stored key there, or -1, with `fHint` for an
+    // insert and `fCands` the unequal entries of hash `h` (`[hint, p, key,
+    // ...]`, or null). The position is checked again by the op that uses it:
+    // an `eq` that changed the table makes that op refuse, and the caller
+    // looks again.
+    let fKey, fHint = 0, fCands = null;
+    function find(m, h, key) {
+        const r = TB(11, m, h, key);
+        if (typeof r === "number") {
+            if (r >= 0) { fKey = key; return r; }
+            fHint = -1 - r; fCands = null; return -1;
+        }
+        for (let i = 1; i < r.length; i += 2) { const k = r[i + 1]; if (k === key || eq(k, key)) { fKey = k; return r[i]; } }
+        fHint = r[0]; fCands = r; return -1;
     }
-    function findEntry(bucket, key) {
-        if (bucket.length === 1) { const k = bucket[0][0]; return k === key || eq(k, key) ? 0 : -1; }
-        for (let i = 0; i < bucket.length; i++) { const k = bucket[i][0]; if (k === key || eq(k, key)) return i; }
-        return -1;
+    // A live view's storage: str keys only; any other hashable key is
+    // absent, and storing one is refused (the view's `map` setter raises).
+    function liveKey(d, key, store) {
+        hashInt(key);
+        if (store) { d.map = d.map; fail(E.TypeError, "attribute name must be string"); }
     }
     function dictGet(d, key) {
-        if (d.str === true) {
-            if (typeof key === "string") return d.map.get(key);
-            keyOf(key); // an unhashable key still raises
-            return undefined;
+        const m = d.map, v = TB(1, m, key);
+        return v !== m ? v : guestGet(d, m, key);
+    }
+    function guestGet(d, m, key) {
+        if (m instanceof Map) { if (typeof key === "string") return m.get(key); liveKey(d, key, false); return undefined; }
+        const h = hashInt(key);
+        for (;;) {
+            const p = find(m, h, key);
+            if (p < 0) return undefined;
+            const v = TB(12, m, p, fKey);
+            if (v !== m) return v;
         }
-        const b = d.map.get(keyOf(key));
-        if (b === undefined) return undefined;
-        const i = findEntry(b, key);
-        return i < 0 ? undefined : b[i][1];
     }
     function dictSet(d, key, value) {
-        if (d.str === true && typeof key === "string") { d.map.set(key, value); d.size = d.map.size; return; }
-        const k = keyOf(key);
-        if (d.str === true) toBuckets(d);
-        const b = d.map.get(k);
-        if (b === undefined) { d.map.set(k, [[key, value, ++entrySeq]]); d.size++; return; }
-        const i = findEntry(b, key);
-        if (i < 0) { b.push([key, value, ++entrySeq]); d.size++; d.coll = true; } else b[i][1] = value;
+        const m = d.map, r = TB(2, m, key, value);
+        if (r === m) return guestSet(d, m, key, value, -1);
+        if (r < 0) full("dict");
+        d.size = r;
     }
-    function dictDel(d, key) {
-        if (d.str === true) {
-            if (typeof key !== "string") { keyOf(key); return false; }
-            if (!d.map.delete(key)) return false;
-            d.size--; return true;
+    // A key needing guest code into a dict (`value`) or a set (`value`
+    // undefined; `-1` answers whether it was added).
+    function guestSet(d, m, key, value, isSet) {
+        if (m instanceof Map) { if (typeof key === "string") { m.set(key, value); d.size = m.size; return; } liveKey(d, key, true); }
+        const h = hashInt(key);
+        for (;;) {
+            const p = find(m, h, key);
+            let r;
+            if (p >= 0) { if (isSet >= 0) return; r = TB(13, m, p, fKey, value); }
+            else r = TB(15, m, fHint, h, key, value, isSet >= 0 ? mateOf(key, h) : -1);
+            if (r !== m) { if (r < 0) full(isSet >= 0 ? "set" : "dict"); d.size = r; return; }
         }
-        const k = keyOf(key);
-        const b = d.map.get(k);
-        if (b === undefined) return false;
-        const i = findEntry(b, key);
-        if (i < 0) return false;
-        b.splice(i, 1); d.size--;
-        if (b.length === 0) d.map.delete(k);
-        return true;
     }
-    // Remove the entry `e` a caller took from `dictEntryList(d)` (`popitem`)
-    // by the entry itself, not by re-finding its key: a NaN key equals no
-    // key, itself included, so `dictDel` would leave it in place.
-    function dictDelEntry(d, e) {
-        if (d.str === true) return dictDel(d, e[0]);
-        const k = keyOf(e[0]);
-        const b = d.map.get(k);
-        const i = b === undefined ? -1 : b.indexOf(e);
-        if (i < 0) return dictDel(d, e[0]);
-        b.splice(i, 1); d.size--;
-        if (b.length === 0) d.map.delete(k);
-        return true;
+    // The value `key` held, removed; undefined when absent.
+    function dictPop(d, key) {
+        const m = d.map, v = TB(3, m, key);
+        if (v === m) return guestPop(d, m, key);
+        if (v !== undefined) d.size--;
+        return v;
     }
-    function dictClear(d) { d.map.clear(); d.size = 0; d.str = true; d.coll = false; }
+    function guestPop(d, m, key) {
+        if (m instanceof Map) {
+            if (typeof key !== "string") { liveKey(d, key, false); return undefined; }
+            const v = m.get(key); if (v !== undefined) m.delete(key); return v;
+        }
+        const h = hashInt(key);
+        for (;;) {
+            const p = find(m, h, key);
+            if (p < 0) return undefined;
+            const v = TB(14, m, p, fKey);
+            if (v !== m) { d.size--; return v; }
+        }
+    }
+    function dictDel(d, key) { return dictPop(d, key) !== undefined; }
+    // `popitem()`: the last entry (the first with `first`), removed, as
+    // `[key, value]`; undefined when empty.
+    function dictPopItem(d, first) {
+        const m = d.map, e = TB(9, m, first);
+        if (e === m) {
+            const all = Array.from(m); if (!all.length) return undefined;
+            const pick = all[first ? 0 : all.length - 1]; m.delete(pick[0]); return pick;
+        }
+        if (e !== undefined) d.size--;
+        return e;
+    }
+    function dictClear(d) { const m = d.map; if (TB(4, m) === m) m.clear(); d.size = 0; }
     function dictHas(d, key) { return dictGet(d, key) !== undefined; }
-    function* dictEntries(d) {
-        if (d.str === true) { yield* d.map; return; }
-        if (d.coll === true) { yield* dictEntryList(d); return; }
-        for (const b of d.map.values()) for (const e of b) yield e;
-    }
+    // Every entry, `[key, value]`, in order: a snapshot.
     function dictEntryList(d) {
-        if (d.str === true) return Array.from(d.map);
-        const out = []; for (const b of d.map.values()) for (const e of b) out.push(e);
-        if (d.coll === true) out.sort((x, y) => x[2] - y[2]);
-        return out;
+        const m = d.map, r = TB(8, m);
+        return r !== m ? r : Array.from(m);
+    }
+    const dictEntries = dictEntryList;
+    function dictKeyList(d) {
+        const m = d.map, r = TB(6, m);
+        return r !== m ? r : Array.from(m.keys());
     }
     // The iterator keeps its state in its own fields (`a` the keys snapshot,
     // `i` the position, `b` the dict, `size` its size then), so its step is
@@ -1125,34 +1154,36 @@
     let KEY_STEP = null;
     try { KEY_STEP = typeof __zipp_py_iter === "function" ? __zipp_py_iter : null; } catch (e) { KEY_STEP = null; }
     function dictKeyIter(d) {
-        const keys = d.str === true ? Array.from(d.map.keys()) : dictEntryList(d).map((e) => e[0]);
         return { cls: T.iterator, next: KEY_STEP !== null ? KEY_STEP : keyNext, jnext: keyNext,
-            kind: 3, a: keys, i: 0, b: d, size: d.size, pick: 0, tmpl: null, ttype: null };
+            kind: 3, a: dictKeyList(d), i: 0, b: d, size: d.size, pick: 0, tmpl: null, ttype: null };
     }
-    // `dictEntries`' own loops, without its generator (a resumption per
-    // entry): the same entries in the same order, live as it is.
     function dictEq(a, b) {
+        const r = TB(18, a.map, b.map);
+        if (r !== undefined) return r;
         if (a.size !== b.size) return false;
-        if (a.str === true) {
-            for (const [k, v] of a.map) { const w = dictGet(b, k); if (w === undefined || !eq(v, w)) return false; }
-            return true;
-        }
-        if (a.coll === true) {
-            const entries = dictEntryList(a);
-            for (let i = 0; i < entries.length; i++) { const e = entries[i]; const w = dictGet(b, e[0]); if (w === undefined || !eq(e[1], w)) return false; }
-            return true;
-        }
-        for (const bucket of a.map.values()) for (const e of bucket) { const w = dictGet(b, e[0]); if (w === undefined || !eq(e[1], w)) return false; }
+        const entries = dictEntryList(a);
+        for (let i = 0; i < entries.length; i++) { const e = entries[i]; const w = dictGet(b, e[0]); if (w === undefined || !eq(e[1], w)) return false; }
         return true;
     }
+    // A new record of `type` over table `t`.
+    function withTable(type, t) { return { cls: type, map: t, size: TB(22, t) }; }
     function dictCopy(d) {
+        const t = TB(5, d.map);
+        if (t !== undefined) return withTable(T.dict, t);
         const out = dict();
-        if (d.str === true) { for (const [k, v] of d.map) dictSet(out, k, v); return out; }
-        for (const [k, v] of dictEntries(d)) dictSet(out, k, v);
+        for (const [k, v] of dictEntryList(d)) dictSet(out, k, v);
         return out;
     }
-    function dictFromMap(m) { const d = dict(); for (const [k, v] of m) dictSet(d, k, v); return d; }
-    function mapFromDict(d) { const m = new Map(); for (const [k, v] of dictEntries(d)) m.set(typeof k === "string" ? k : rt.str(k), v); return m; }
+    function dictFromMap(m) { const ks = [], vs = []; m.forEach((v, k) => { ks.push(k); vs.push(v); }); const d = dict(); R.dictfill(d, ks, vs); return d; }
+    function mapFromDict(d) { const m = new Map(); for (const [k, v] of dictEntryList(d)) m.set(typeof k === "string" ? k : rt.str(k), v); return m; }
+    // A str-keyed dict's storage as a Map of its own (`obj.__dict__ = d`
+    // makes that Map the object's attribute storage), or undefined.
+    function dictToMap(d) {
+        if (d.map instanceof Map) return d.map;
+        const entries = dictEntryList(d);
+        for (let i = 0; i < entries.length; i++) if (typeof entries[i][0] !== "string") return undefined;
+        return d.map = new Map(entries);
+    }
     // A dict subclass that keeps dict's own __iter__ is read from its
     // storage (CPython's dict_merge fast path ignores __getitem__/keys()).
     function isPlainDictStorage(v) {
@@ -1174,86 +1205,132 @@
         }
         fail(E.TypeError, message || "'" + typeOf(v).name + "' object is not a mapping");
     }
-    Object.assign(rt, { dict, dictGet, dictSet, dictDel, dictDelEntry, dictClear, dictHas, dictEntries, dictEntryList, dictKeyIter, dictEq, dictCopy, dictFromMap, mapFromDict, asDict });
+    // `d.update(src)` for a dict `src` (its entries, in order).
+    function dictUpdate(d, src) {
+        const r = TB(17, d.map, src.map);
+        if (r >= 0) { d.size = r; return; }
+        if (r === -1) full("dict");
+        d.size = TB(22, d.map);
+        const entries = dictEntryList(src);
+        for (let i = -2 - r; i < entries.length; i++) dictSet(d, entries[i][0], entries[i][1]);
+    }
+    Object.assign(rt, { dict, dictGet, dictSet, dictDel, dictPop, dictPopItem, dictClear, dictHas, dictEntries, dictEntryList, dictKeyIter, dictEq, dictCopy, dictFromMap, mapFromDict, dictToMap, dictUpdate, asDict });
     R.dict = function () { return dict(); };
-    R.dictfill = function (d, keys, values) { for (let i = 0; i < keys.length; i++) dictSet(d, keys[i], values[i]); return null; };
-    R.dictmerge = function (d, mapping) { for (const [k, v] of dictEntries(asDict(mapping))) dictSet(d, k, v); return d; };
+    R.dictfill = function (d, keys, values) {
+        const r = TB(21, d.map, keys, values);
+        if (r >= 0) { d.size = r; return null; }
+        if (r === -1) full("dict");
+        d.size = TB(22, d.map);
+        for (let i = -2 - r; i < keys.length; i++) dictSet(d, keys[i], values[i]);
+        return null;
+    };
+    R.dictmerge = function (d, mapping) { dictUpdate(d, asDict(mapping)); return d; };
     rt.mappingProxy = function (m) { return dictFromMap(m); };
 
     // ---- set ------------------------------------------------------------------------------------------------
-    function set(type) { return { cls: type || T.set, map: new Map(), size: 0 }; }
+    // {cls, map, size} as a dict, the table a set's. A set iterates in the
+    // order the table gives (`vm::py_table`): insertion order, where equal-
+    // hash keys the former bucket Map filed together stay together, and a
+    // set of small non-negative ints ascending, as CPython's table orders them.
+    function set(type) { return { cls: type || T.set, map: TB(0, true, TT, TF), size: 0 }; }
+    // A key needing guest code joins the entry its old bucket (`keyOf`)
+    // shared, if any, among the unequal entries of its hash (`fCands`).
+    function mateOf(key, h) {
+        const r = fCands; if (r === null) return -1;
+        const b = keyOf(key, h);
+        for (let i = 1; i < r.length; i += 2) if (keyOf(r[i + 1], h) === b) return r[i];
+        return -1;
+    }
     function setAdd(s, v) {
-        const k = keyOf(v); const b = s.map.get(k);
-        if (b === undefined) { s.map.set(k, [v]); s.size++; return; }
-        for (const x of b) if (eq(x, v)) return;
-        b.push(v); s.size++;
+        const m = s.map, r = TB(2, m, v);
+        if (r === m) return guestSet(s, m, v, undefined, 0);
+        if (r < 0) full("set");
+        s.size = r;
     }
     function setHas(s, v) {
-        const b = s.map.get(keyOf(v)); if (b === undefined) return false;
-        for (const x of b) if (eq(x, v)) return true; return false;
+        const m = s.map, r = TB(1, m, v);
+        return r !== m ? r === true : guestGet(s, m, v) !== undefined;
     }
     function setDel(s, v) {
-        const k = keyOf(v); const b = s.map.get(k); if (b === undefined) return false;
-        const i = rt.aindex(b, (x) => eq(x, v)); if (i < 0) return false;
-        b.splice(i, 1); s.size--; if (b.length === 0) s.map.delete(k); return true;
+        const m = s.map, r = TB(3, m, v);
+        if (r === m) return guestPop(s, m, v) !== undefined;
+        if (r !== undefined) s.size--;
+        return r !== undefined;
     }
-    // Remove the element `v` a caller took from `setList(s)` (`pop`): the
-    // entry holding that very value, or a NaN for a NaN (a NaN equals
-    // nothing, itself included, so `setDel` would leave it in place; NaN
-    // floats have no identity here, and any NaN entry is as good as another).
-    function setDelPicked(s, v) {
-        const k = keyOf(v); const b = s.map.get(k); if (b === undefined) return false;
-        let i = -1;
-        for (let j = 0; j < b.length; j++) { const x = b[j]; if (x === v || (x !== x && v !== v)) { i = j; break; } }
-        if (i < 0) return setDel(s, v);
-        b.splice(i, 1); s.size--; if (b.length === 0) s.map.delete(k); return true;
-    }
-    function* setValues(s) { for (const x of setList(s)) yield x; }
-    function setList(s) {
-        const out = []; for (const b of s.map.values()) for (const x of b) out.push(x);
-        // CPython iterates a set in hash-table order. Its table is sized by
-        // the element count, and small non-negative ints hash to themselves,
-        // so a set of such ints below the table size comes out ascending; the
-        // common `{3, 1, 2}` prints `{1, 2, 3}` there and here.
-        if (out.length > 1 && out.length <= 50000) {
-            let size = 8, fill = 0;
-            for (let i = 0; i < out.length; i++) { fill++; if (fill * 5 >= (size - 1) * 3) { let next = 8; while (next <= fill * 4) next *= 2; size = next; } }
-            const bound = BigInt(size);
-            let small = true;
-            for (const x of out) { if (typeof x !== "bigint" || x < 0n || x >= bound) { small = false; break; } }
-            if (small) out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-        }
-        return out;
-    }
+    // `pop()`: the first element in iteration order, removed; undefined
+    // when empty.
+    function setPop(s) { const v = TB(10, s.map); if (v !== undefined) s.size--; return v; }
+    function setList(s) { return TB(6, s.map); }
+    const setValues = setList;
     function setIter(s) {
         const items = setList(s); let i = 0; const size = s.size;
         return { cls: T.iterator, next: () => { if (s.size !== size) fail(E.RuntimeError, "Set changed size during iteration"); return i < items.length ? items[i++] : STOP; } };
     }
+    // Every `items[i]`, added in order.
+    function setFill(s, items) {
+        const r = TB(21, s.map, items, undefined);
+        if (r >= 0) { s.size = r; return; }
+        if (r === -1) full("set");
+        s.size = TB(22, s.map);
+        for (let i = -2 - r; i < items.length; i++) setAdd(s, items[i]);
+    }
     function setFrom(iterable, type) {
+        if (iterable !== null && typeof iterable === "object") {
+            const c = iterable.cls;
+            if (c === T.set || c === T.frozenset) {
+                const t = TB(5, iterable.map);
+                if (t !== undefined) return { cls: type || T.set, map: t, size: iterable.size };
+            }
+            if (c === T.list || c === T.tuple) { const s = set(type); setFill(s, iterable.items); return s; }
+        }
         const s = set(type); const it = rt.iter(iterable);
         for (;;) { const v = rt.fornext(it); if (v === STOP) break; setAdd(s, v); }
         return s;
     }
-    function setEq(a, b) { if (a.size !== b.size) return false; for (const x of setValues(a)) if (!setHas(b, x)) return false; return true; }
+    // A set emptied in place, or taking another set's storage (the
+    // in-place operators).
+    function setClear(s) { TB(4, s.map); s.size = 0; }
+    function setReplace(a, b) { a.map = b.map; a.size = b.size; }
+    function setEq(a, b) {
+        const r = TB(18, a.map, b.map);
+        if (r !== undefined) return r;
+        if (a.size !== b.size) return false; for (const x of setList(a)) if (!setHas(b, x)) return false; return true;
+    }
     function setBinop(op, a, b, inplace) {
         const type = a.cls;
-        let out;
-        switch (op) {
-            case "or": out = inplace ? a : setFrom(a, type); for (const x of setValues(b)) setAdd(out, x); return out;
-            case "and": {
-                // As CPython: walk the right operand unless it is the larger,
-                // so equal elements of different types come from that side.
-                const walk = b.size > a.size ? a : b, probe = walk === a ? b : a;
-                out = set(type); for (const x of setValues(walk)) if (setHas(probe, x)) setAdd(out, x);
-                if (inplace) { a.map = out.map; a.size = out.size; return a; } return out;
-            }
-            case "sub": out = set(type); for (const x of setValues(a)) if (!setHas(b, x)) setAdd(out, x); if (inplace) { a.map = out.map; a.size = out.size; return a; } return out;
-            case "xor": out = set(type); for (const x of setValues(a)) if (!setHas(b, x)) setAdd(out, x); for (const x of setValues(b)) if (!setHas(a, x)) setAdd(out, x); if (inplace) { a.map = out.map; a.size = out.size; return a; } return out;
+        const code = op === "or" ? 0 : op === "and" ? 1 : op === "sub" ? 2 : op === "xor" ? 3 : -1;
+        if (code < 0) return NOTIMPL;
+        if (inplace && code === 0) {
+            const r = TB(17, a.map, b.map);
+            if (r >= 0) { a.size = r; return a; }
+            if (r === -1) full("set");
+            a.size = TB(22, a.map);
+            const items = setList(b);
+            for (let i = -2 - r; i < items.length; i++) setAdd(a, items[i]);
+            return a;
         }
-        return NOTIMPL;
+        const t = TB(19, a.map, b.map, code);
+        let out;
+        if (t !== undefined) out = withTable(type, t);
+        else {
+            switch (code) {
+                case 0: out = setFrom(a, type); for (const x of setList(b)) setAdd(out, x); break;
+                case 1: {
+                    // As CPython: walk the right operand unless it is the larger,
+                    // so equal elements of different types come from that side.
+                    const walk = b.size > a.size ? a : b, probe = walk === a ? b : a;
+                    out = set(type); for (const x of setList(walk)) if (setHas(probe, x)) setAdd(out, x);
+                    break;
+                }
+                case 2: out = set(type); for (const x of setList(a)) if (!setHas(b, x)) setAdd(out, x); break;
+                default: out = set(type); for (const x of setList(a)) if (!setHas(b, x)) setAdd(out, x); for (const x of setList(b)) if (!setHas(a, x)) setAdd(out, x);
+            }
+        }
+        if (inplace) { setReplace(a, out); return a; }
+        return out;
     }
     function setCompare(op, a, b) {
-        const sub = (x, y) => { for (const v of setValues(x)) if (!setHas(y, v)) return false; return true; };
+        const sub = (x, y) => { const r = TB(20, x.map, y.map); if (r !== undefined) return r; for (const v of setList(x)) if (!setHas(y, v)) return false; return true; };
         switch (op) {
             case "le": return sub(a, b);
             case "lt": return a.size < b.size && sub(a, b);
@@ -1262,8 +1339,8 @@
         }
         return false;
     }
-    Object.assign(rt, { set, setAdd, setHas, setDel, setDelPicked, setValues, setList, setIter, setFrom, setEq, setBinop, setCompare });
-    R.set = function (items) { const s = set(); if (items !== undefined) for (const x of items) setAdd(s, x); return s; };
+    Object.assign(rt, { set, setAdd, setHas, setDel, setPop, setValues, setList, setIter, setFrom, setEq, setBinop, setCompare, setClear, setReplace });
+    R.set = function (items) { const s = set(); if (items !== undefined) setFill(s, items); return s; };
 
     // ---- range, slice, bytes ---------------------------------------------------------------------------------
     function rangeLength(r) {
@@ -1469,7 +1546,7 @@
             if (c === T.list || c === T.tuple) return BigInt(v.items.length);
             if (c === T.dict || c === T.set) return BigInt(v.size);
             if (c === T.bytes || c === T.frozenset || c === T.range) return baseLen(v);
-            if (c === T.dict_keys || c === T.dict_values || c === T.dict_items) return BigInt(v.dict.size);
+            if (c === T.dict_keys || c === T.dict_values || c === T.dict_items) return BigInt(v.of.size);
             if (v.isType) { const cl = rt.classDunder(v, "__len__"); if (cl !== undefined) return asInt(call(cl, [], null)); }
             const m = typeMethod(v, "__len__");
             if (m !== undefined) {

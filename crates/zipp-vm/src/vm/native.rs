@@ -365,12 +365,6 @@ pub const PY_PCT_NAME: &str = "__zipp_py_pct";
 pub const PY_STRM: u16 = 1956;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_STRM_NAME: &str = "__zipp_py_strm";
-/// The Python runtime's dict key of a tuple (`vm::py_key`). Bound like
-/// [`PY_TENSOR`], only in a Python program.
-#[cfg_attr(not(feature = "python"), allow(dead_code))]
-pub const PY_TKEY: u16 = 1957;
-#[cfg_attr(not(feature = "python"), allow(dead_code))]
-pub const PY_TKEY_NAME: &str = "__zipp_py_tkey";
 /// The Python runtime's native iterator step (`vm::py_str`). Bound like
 /// [`PY_TENSOR`], only in a Python program.
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
@@ -395,6 +389,13 @@ pub const PY_IN_NAME: &str = "__zipp_py_in";
 pub const PY_SMFIND: u16 = 1961;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_SMFIND_NAME: &str = "__zipp_py_smfind";
+/// The Python runtime's dict and set storage (`vm::py_table`). Bound like
+/// [`PY_TENSOR`], only in a Python program. Numbered apart from the
+/// sequence above, which other work extends.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_TABLE: u16 = 1970;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_TABLE_NAME: &str = "__zipp_py_table";
 /// The Python runtime's registration with the engine (`vm::py_rt`): called
 /// once, with the runtime's helper object. Bound like [`PY_TENSOR`], only in
 /// a Python program.
@@ -1746,8 +1747,6 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         #[cfg(feature = "python")]
         PY_STRM => ("", 1),
         #[cfg(feature = "python")]
-        PY_TKEY => ("", 2),
-        #[cfg(feature = "python")]
         PY_ITER => ("next", 0),
         #[cfg(feature = "python")]
         PY_EXC => ("", 3),
@@ -1755,6 +1754,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PY_IN => ("", 2),
         #[cfg(feature = "python")]
         PY_SMFIND => ("", 3),
+        #[cfg(feature = "python")]
+        PY_TABLE => ("", 3),
         #[cfg(feature = "python")]
         PY_BIND => ("", 3),
         U8_TO_HEX => ("toHex", 0),

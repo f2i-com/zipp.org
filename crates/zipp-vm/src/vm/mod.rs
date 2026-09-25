@@ -2984,11 +2984,9 @@ mod py_json;
 #[cfg(feature = "python")]
 mod py_lazy;
 #[cfg(feature = "python")]
-mod py_key;
-#[cfg(feature = "python")]
 mod py_str;
 #[cfg(feature = "python")]
-mod py_table;
+pub(crate) mod py_table;
 #[cfg(feature = "python")]
 mod py_tensor;
 pub(crate) use prof::dump as prof_stats;

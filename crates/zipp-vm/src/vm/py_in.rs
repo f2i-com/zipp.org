@@ -11,10 +11,8 @@
 //!   wins; `needle` a plain value (int, float, bool, str, None) and every item
 //!   looked at before the answer one too (an object item could run an
 //!   `__eq__`, so the scan gives up there);
-//! * an exact dict: its key test (`dictGet(d, needle) !== undefined`) for a
-//!   plain needle, through the dict's own `map` (every key a str, or buckets
-//!   keyed by `keyOf`, whose entries must hold plain keys);
-//! * an exact set: its bucket test (`setHas`) likewise.
+//! * an exact dict or set: its key test (`dictGet(d, needle) !== undefined`,
+//!   `setHas`) for a plain needle, through its table (`vm::py_table`).
 //!
 //! `eq` on two plain values is `===`, then an int against a float or bool by
 //! value (a float never equals another float that is not `===`, so a NaN
@@ -35,9 +33,6 @@ enum Prim {
     Str(u32),
     None,
 }
-
-/// `Number.MAX_SAFE_INTEGER`, the runtime's `SAFE`.
-const SAFE: i128 = 9_007_199_254_740_991;
 
 impl<'p> Vm<'p> {
     /// `v` as a plain value; `None` for an object (a big int beyond i128
@@ -88,27 +83,6 @@ impl<'p> Vm<'p> {
             (Prim::Int(n), Prim::Bool(b)) | (Prim::Bool(b), Prim::Int(n)) => n == b as i128,
             (Prim::Float(f), Prim::Bool(b)) | (Prim::Bool(b), Prim::Float(f)) => f == b as i32 as f64,
             _ => false,
-        }
-    }
-
-    /// `keyOf(v)` for a plain value, as a Map key the bucket maps hold;
-    /// `None` when the runtime would key it by something else (a None, a
-    /// NaN, an int beyond 2^53: its sentinel or hash string).
-    fn py_prim_key(&mut self, p: Prim) -> Option<Value> {
-        match p {
-            Prim::Str(idx) => {
-                // A NUL-led str is keyed by an escaped copy.
-                match self.heap.get(idx) {
-                    HeapObj::Str(s) if s.as_bytes().first() != Some(&0) => Some(Value::heap(idx)),
-                    _ => None,
-                }
-            }
-            Prim::Int(n) if (-SAFE..=SAFE).contains(&n) => Some(Value::num(n as f64)),
-            Prim::Bool(b) => Some(Value::num(b as i32 as f64)),
-            Prim::Float(f) if !f.is_nan() && !(f.fract() == 0.0 && (f > SAFE as f64 || f < -(SAFE as f64))) => {
-                Some(Value::num(f))
-            }
-            _ => None,
         }
     }
 
@@ -170,7 +144,7 @@ impl<'p> Vm<'p> {
         if !self.native_kernel_admits(8, 0) {
             return None;
         }
-        let found = self.py_in_keyed(ci, cls, rt, needle, p);
+        let found = self.py_in_keyed(ci, cls, rt, needle);
         if found.is_some() {
             self.charge_steps(8);
         }
@@ -197,73 +171,14 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// A dict's or set's key test for [`Vm::py_in`].
-    fn py_in_keyed(&mut self, ci: u32, cls: Value, rt: Value, needle: Value, p: Prim) -> Option<bool> {
+    /// A dict's or set's key test for [`Vm::py_in`]: its table's lookup.
+    fn py_in_keyed(&mut self, ci: u32, cls: Value, rt: Value, needle: Value) -> Option<bool> {
         let (td, ts) = self.py_rt_for(rt).map(|p| (p.t_dict.bits(), p.t_set.bits()))?;
         let dict = cls.bits() == td;
         if !dict && cls.bits() != ts {
             return None;
         }
         let map = self.py_hint_field(hint::MAP, ci, "map")?;
-        if !map.is_heap() || !matches!(self.heap.get(map.heap_index()), HeapObj::Map { .. }) {
-            return None;
-        }
-        if dict {
-            let str_mode = self.py_own_data(ci, "str")?;
-            if str_mode == Value::TRUE {
-                // Every key a str: a str is looked up, anything else (plain,
-                // so hashable) is absent.
-                return Some(match p {
-                    Prim::Str(_) => self.coll_find(map.heap_index(), needle).is_some_and(|i| {
-                        matches!(self.heap.get(map.heap_index()), HeapObj::Map { vals, .. } if vals.get(i).is_some_and(|v| !v.is_undefined()))
-                    }),
-                    _ => false,
-                });
-            }
-            if str_mode != Value::FALSE {
-                return None;
-            }
-        }
-        let key = self.py_prim_key(p)?;
-        let Some(i) = self.coll_find(map.heap_index(), key) else {
-            return Some(false);
-        };
-        let bucket = match self.heap.get(map.heap_index()) {
-            HeapObj::Map { vals, .. } => *vals.get(i)?,
-            _ => return None,
-        };
-        if !bucket.is_heap() {
-            return None;
-        }
-        let n = match self.heap.get(bucket.heap_index()) {
-            HeapObj::Array(a) => a.len(),
-            _ => return None,
-        };
-        for j in 0..n {
-            // A dict's entry is `[key, value, seq]`; a set's is the value.
-            let e = match self.heap.get(bucket.heap_index()) {
-                HeapObj::Array(a) => *a.get(j)?,
-                _ => return None,
-            };
-            let k = if dict {
-                if !e.is_heap() {
-                    return None;
-                }
-                match self.heap.get(e.heap_index()) {
-                    HeapObj::Array(entry) => *entry.first()?,
-                    _ => return None,
-                }
-            } else {
-                e
-            };
-            if k == Value::HOLE {
-                return None;
-            }
-            let q = self.py_prim(k)?;
-            if self.py_prim_eq(q, p) {
-                return Some(true);
-            }
-        }
-        Some(false)
+        Some(self.py_table_get(map, needle)?.is_some())
     }
 }

@@ -5293,8 +5293,6 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "python")]
             PY_STRM => self.py_str_method(this, args)?,
             #[cfg(feature = "python")]
-            PY_TKEY => self.py_tkey(args)?,
-            #[cfg(feature = "python")]
             PY_ITER => self.py_iter_next(this)?,
             // `makeExc(cls, args)` natively (`undefined`: the runtime's own
             // literal builds it).
@@ -5317,6 +5315,9 @@ impl<'p> Vm<'p> {
                 let (s, n) = (args.get(1).copied().unwrap_or(Value::UNDEFINED), args.get(2).copied().unwrap_or(Value::UNDEFINED));
                 self.py_smfind(a0, s, n, this)
             }
+            // The runtime's dict and set storage (`vm::py_table`).
+            #[cfg(feature = "python")]
+            PY_TABLE => self.py_table(args)?,
             HOST_CALL => {
                 let kind = self.to_js_string(a0)?;
                 self.preflight_native_iteration_work(args.len().saturating_sub(1) as u64)?;

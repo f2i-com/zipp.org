@@ -172,9 +172,9 @@ pub(crate) struct PyRt {
     pub(super) seq_shape: u32,
     pub(super) inst_shape: u32,
     pub(super) exc_shape: u32,
-    /// A dict record's shape and its `map`, `size`, `str` slots.
+    /// A dict record's shape and its `map`, `size` slots.
     pub(super) dict_shape: u32,
-    pub(super) dict_slots: [usize; 3],
+    pub(super) dict_slots: [usize; 2],
     /// A class record's field slots (`None`: the literal's keys not found).
     pub(super) ty: Option<TySlots>,
     /// `R.mself`'s slot.
@@ -216,7 +216,7 @@ impl PyRt {
             inst_shape: crate::shape::DICT,
             exc_shape: crate::shape::DICT,
             dict_shape: crate::shape::DICT,
-            dict_slots: [1, 2, 3],
+            dict_slots: [1, 2],
             ty: None,
             mself_slot: None,
             gen_shape: Cell::new(crate::shape::DICT),
@@ -298,7 +298,7 @@ impl<'p> Vm<'p> {
         rt.seq_shape = self.py_template_shape(rt.seq_tmpl, &SEQ_KEYS);
         rt.inst_shape = self.py_template_shape(rt.inst_tmpl, &INST_KEYS);
         rt.exc_shape = self.py_template_shape(rt.exc_tmpl, &EXC_KEYS);
-        rt.dict_shape = self.py_template_shape(dict, &["cls", "map", "size", "str"]);
+        rt.dict_shape = self.py_template_shape(dict, &["cls", "map", "size"]);
         if rt.t_list.is_heap() {
             rt.ty = self.py_type_slots(rt.t_list.heap_index());
         }
@@ -492,7 +492,7 @@ impl<'p> Vm<'p> {
         Some((m.val_at(c), m.val_at(i)))
     }
 
-    /// A dict record's field (`which`: 0 `map`, 1 `size`, 2 `str`) and its
+    /// A dict record's field (`which`: 0 `map`, 1 `size`) and its
     /// slot.
     #[inline]
     pub(super) fn py_dict_field(&self, idx: u32, which: usize) -> Option<(usize, Value)> {
@@ -511,7 +511,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let key = ["map", "size", "str"][which];
+        let key = ["map", "size"][which];
         let s = m.pos(key).filter(|&s| !m.is_accessor_at(s))?;
         Some((s, m.val_at(s)))
     }

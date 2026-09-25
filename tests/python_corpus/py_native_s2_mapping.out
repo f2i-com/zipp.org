@@ -1,0 +1,45 @@
+missing 1 missing:'b' None False 1
+defaultdict [('brown', [2]), ('end', [6]), ('lazy', [4]), ('quick', [1]), ('the', [0, 3, 5])] True 5
+defaultdict-int [('x', 1), ('y', 2)]
+counter [('i', 4), ('m', 1), ('p', 2), ('s', 4)] [('i', 4)] 0 4
+counter-update [('i', 5), ('m', 1), ('p', 3), ('s', -5)] [('i', 5), ('m', 1), ('p', 3)] [('s', 5)]
+counter-ops [('a', 4), ('b', 1), ('c', 2)] [('a', 2), ('b', 1)] [('a', 3), ('b', 5)] [('a', 1), ('b', 1)] 2
+ordered ['a', 'd', 'b', 'c'] ('c', 99) ('a', 97) ['d', 'b']
+ordered-eq False True
+chainmap 1 2 4 3 ['a', 'b', 'c'] [('a', 1), ('b', 2), ('c', 4)]
+chainmap-child 5 1 4
+views-live ['a', 'b', 'c', 'd'] [1, 2, 3, 4] [('a', 1), ('b', 2), ('c', 3), ('d', 4)] 4 True True False True
+keys-algebra ['a'] ['a', 'b', 'c', 'd', 'z'] ['b', 'c', 'd'] ['b', 'c', 'd', 'z']
+items-algebra [('a', 1)] [('b', 2), ('c', 3)]
+keys-eq True False True
+reversed ['d', 'c', 'b', 'a']
+or {'x': 1, 'y': 3, 'z': 4} {'y': 2, 'z': 4, 'x': 1} {'x': 1, 'y': 3, 'z': 4}
+ior {'x': 1, 'y': 3, 'z': 4}
+compare True True True True True
+lt '<' not supported between instances of 'dict' and 'dict'
+copy True False False True False
+pickle True False set [5, 6] frozenset({7})
+deepcopy-ordered OrderedDict [('z', 1), ('a', 2)]
+copy-defaultdict defaultdict True {'k': {1}}
+json {"dup": 1, "name": "x", "nested": {"a": {"b": {}}}, "vals": [1, 2.5, null, true, "s"]}
+json-roundtrip True ['dup', 'name', 'nested', 'vals'] {'a': 2, 'b': 3}
+json-indent {
+  "b": [
+    1,
+    {
+      "c": 2
+    }
+  ],
+  "a": null
+}
+json-big 200 0 199 ['k0', 'k1', 'k2'] 19900
+json-nonstr-keys {"1": "c", "2.5": "b", "null": "d"}
+fromkeys {'a': 0, 'b': 0, 'c': 0} {0: None, 1: None, 2: None}
+setdefault 1 [] {'a': 1, 'b': 2, 'c': 3, 'd': 4, 'new': []}
+pop [] dflt 4
+pop-missing KeyError('zz')
+popitem ('d', 4) {'a': 1, 'b': 2, 'c': 3}
+popitem-empty 'popitem(): dictionary is empty'
+cleared {} 0 False
+update {'q': 1, 'r': 2, 's': 3}
+dict-ctor {'a': 1, 'b': 2} {'x': 1, 'y': 2} {'a': 1}

@@ -79,16 +79,17 @@ impl Env {
         let arr = Value::heap(self.heap.alloc(HeapObj::Array(items)));
         self.record(self.kinds.tuple, "items", arr)
     }
-    /// A frozenset as the runtime stores one today: a Map of bucket arrays.
+    /// A frozenset as the runtime stores one: a set table.
     fn frozen(&mut self, items: Vec<Value>) -> Value {
-        let mut keys = Vec::new();
-        let mut vals = Vec::new();
-        for (i, x) in items.into_iter().enumerate() {
-            keys.push(Value::int(i as i32));
-            vals.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![x]))));
+        let mut t = PyTable {
+            kinds: self.kinds,
+            ..PyTable::new_set()
+        };
+        for x in items {
+            native_add(&self.heap, &self.kinds, &mut t, x, &mut 0).expect("native key");
         }
-        let map = Value::heap(self.heap.alloc(HeapObj::Map { keys, vals }));
-        self.record(self.kinds.frozenset, "map", map)
+        let storage = Value::heap(self.heap.alloc(HeapObj::PyTable(Box::new(t))));
+        self.record(self.kinds.frozenset, "map", storage)
     }
     fn hash(&self, v: Value) -> Option<i64> {
         native_hash(&self.heap, &self.kinds, v, &mut 0)
@@ -808,14 +809,9 @@ fn set_and_dict_behavior_matches_the_runtime() {
                     }
                     SetStep::Pop => match t.first_visible(h) {
                         Some(at) => {
-                            // The runtime's `set.pop()` deletes its pick by
-                            // equality (`setDel`), which never finds a NaN: the
-                            // NaN is returned and stays. (CPython removes it; the
-                            // native table's `remove_at` would too.)
-                            let key = t.key_at(at).unwrap();
-                            if !(key.is_number() && key.as_f64().is_nan()) {
-                                t.remove_at(at);
-                            }
+                            // `set.pop()` removes its pick by position (a NaN
+                            // included), as CPython does.
+                            let (key, _) = t.remove_at(at).unwrap();
                             out.push(repr_of(key));
                         }
                         None => out.push("E".into()),
@@ -1013,4 +1009,76 @@ fn bench() {
         set.len() as u64
     });
     println!("steps charged: {steps}; PyTable payload bytes (1e6 int dict): {}", t.payload_bytes());
+}
+
+/// The runtime's dict and set storage (`{cls, map, size}` records; `map` is
+/// the storage) is read and written only by the dict/set section of
+/// `runtime/types.js` (`rt.dict*` / `rt.set*`) and the live `__dict__` views
+/// in `runtime/builtins.js`, which keep a Map of their own. Everywhere else
+/// asks those helpers: a `.map` is tested for presence only, `.str` and
+/// `.coll` are not touched, and `.size` is only read.
+#[test]
+fn runtime_storage_check() {
+    const FILES: [(&str, &str); 8] = [
+        ("types.js", include_str!("../frontend/python/runtime/types.js")),
+        ("builtins.js", include_str!("../frontend/python/runtime/builtins.js")),
+        ("core.js", include_str!("../frontend/python/runtime/core.js")),
+        ("stdlib.js", include_str!("../frontend/python/runtime/stdlib.js")),
+        ("tensor.js", include_str!("../frontend/python/runtime/tensor.js")),
+        ("entry.js", include_str!("../frontend/python/runtime/entry.js")),
+        ("javascript.js", include_str!("../frontend/python/runtime/javascript.js")),
+        ("native_gpu.js", include_str!("../frontend/python/runtime/native_gpu.js")),
+    ];
+    // (file, first line containing, the line after the section containing)
+    const OWNERS: [(&str, &str, &str); 2] = [
+        ("types.js", "// ---- dict ----", "// ---- range, slice, bytes ----"),
+        ("builtins.js", "const liveDict = (target) =>", "rt.namespaceView = (map) =>"),
+    ];
+    let word_end = |rest: &str| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    let mut bad = Vec::new();
+    for (name, src) in FILES {
+        let mut owned = false;
+        for (n, line) in src.lines().enumerate() {
+            for &(f, start, end) in &OWNERS {
+                if f == name && line.contains(start) {
+                    owned = true;
+                }
+                if f == name && line.contains(end) {
+                    owned = false;
+                }
+            }
+            let code = line.trim_start();
+            if owned || code.starts_with("//") {
+                continue;
+            }
+            // A record literal building storage.
+            if line.contains("map: new Map(") {
+                bad.push(format!("{name}:{}: {}", n + 1, code));
+            }
+            for (i, _) in line.match_indices('.') {
+                let before = &line[..i];
+                let rest = &line[i + 1..];
+                let object = before.rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).next().unwrap_or("");
+                let field = |f: &str| rest.starts_with(f) && word_end(&rest[f.len()..]);
+                let after = |f: &str| rest[f.len()..].trim_start();
+                let wrong = if field("map") {
+                    let a = after("map");
+                    !(object == "T" || a.starts_with('(') || a.starts_with("!== undefined") || a.starts_with("=== undefined"))
+                } else if field("str") {
+                    !(matches!(object, "rt" | "T" | "R") || after("str").starts_with('('))
+                } else if field("coll") {
+                    true
+                } else if field("size") {
+                    let a = after("size");
+                    a.starts_with("++") || a.starts_with("--") || (a.starts_with('=') && !a.starts_with("=="))
+                } else {
+                    false
+                };
+                if wrong {
+                    bad.push(format!("{name}:{}: {}", n + 1, code));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "dict/set storage touched outside rt.dict*/rt.set*:\n{}", bad.join("\n"));
 }

@@ -1,0 +1,25 @@
+get-same k1 1 1
+get-miss None 1 0
+contains True 1 1
+int-finds-user k1 0 1
+set-existing None 1 1
+after {K(1): 'k1b', K(2): 'k2'}
+int-merges {K(1): 'int-one', K(2): 'k2'} 2
+collision-get collides 1 2
+collision 3 ['int-one', 'k2', 'collides']
+user-finds-int five 1 1
+user-finds-tuple tuple 1 1
+user-deletes-int {'s': 'str', (1, 2): 'tuple'}
+nohash unhashable type: 'NoHash'
+eqonly unhashable type: 'EqOnly'
+raises hash bad hash 1
+raises-in hash bad hash
+raises-in eq bad eq
+mutator-get b None ['junk2'] 3
+set 3 True True True False
+set-after 2 [2, 3]
+set-ops 3 1 1 2 True
+points 25 12 False 30
+point-set 12 True
+identity 50 17 True False
+identity-del 49 False

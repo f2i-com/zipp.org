@@ -2036,72 +2036,20 @@ impl<'a> Emitter<'a> {
     }
 
     /// `d.get(k[, default])` resolved (receiver first) to the builtin
-    /// `dict.get` on an exact dict: a str key while every key is a str reads
-    /// the Map; an int key within 2^53 in the bucketed form reads its bucket
-    /// when that holds exactly this key (and no bucket means no equal key);
-    /// a missing key gives the default. Anything else falls through.
+    /// `dict.get`: the engine's lookup in an exact dict's table
+    /// (`PyDictLookup`), a missing key giving the default. Anything it
+    /// declines falls through.
     fn dict_get_intrinsic(&mut self, obj: Reg, f: Reg, regs: &[Reg], dst: Reg, done: &mut Vec<usize>) -> R<()> {
         let k = regs[0];
-        let mut other = Vec::new();
         let expected = self.prop(self.r_rt, "DGET")?;
         let t = self.alloc()?;
         self.emit(Instr::Eq { dst: t, a: f, b: expected })?;
-        other.push(self.jump_if_false(t)?);
-        // The lookup natively (`PyDictLookup`); the inline reads below when
-        // it declines.
+        let other = self.jump_if_false(t)?;
         let rt = self.r_rt;
         let at_lookup = self.emit(Instr::PyDictLookup { dst, d: obj, k, rt, absent: 0, slow: 0 })?;
         done.push(self.jump()?);
-        let here = self.here();
-        self.patch_slow(at_lookup, here)?;
-        let cls = self.prop(obj, "cls")?;
-        let tdict = self.prop(self.r_rt, "TDICT")?;
-        self.emit(Instr::Eq { dst: t, a: cls, b: tdict })?;
-        other.push(self.jump_if_false(t)?);
-        let map = self.prop(obj, "map")?;
-        let str_mode = self.prop(obj, "str")?;
-        let bucketed = self.jump_if_false(str_mode)?;
-        // All-str mode: a str key reads the Map.
-        let is_str = self.typeof_is(k, "string")?;
-        other.push(self.jump_if_false(is_str)?);
-        let (arg_base, argc) = self.arguments(&[k])?;
-        let get = self.string_index("get");
-        self.emit(Instr::CallMethod { dst, obj: map, name: get, arg_base, argc })?;
-        let missing = self.typeof_is(dst, "undefined")?;
-        let absent = self.jump_if_true(missing)?;
-        done.push(self.jump()?);
-        // Bucketed: an int key of at most 2^53 in magnitude.
-        let here = self.here();
-        self.patch(bucketed, here)?;
-        let is_int = self.typeof_is(k, "bigint")?;
-        other.push(self.jump_if_false(is_int)?);
-        let key = self.bigint_to_number(k)?;
-        let hi = self.float(9007199254740991.0)?;
-        other.push(self.emit(Instr::JumpIfNotLe { a: key, b: hi, target: 0 })?);
-        let lo = self.float(-9007199254740991.0)?;
-        other.push(self.emit(Instr::JumpIfNotLe { a: lo, b: key, target: 0 })?);
-        let (arg_base, argc) = self.arguments(&[key])?;
-        let bucket = self.alloc()?;
-        self.emit(Instr::CallMethod { dst: bucket, obj: map, name: get, arg_base, argc })?;
-        let no_bucket = self.typeof_is(bucket, "undefined")?;
-        let absent2 = self.jump_if_true(no_bucket)?;
-        let len = self.prop(bucket, "length")?;
-        let one = self.small_int(1)?;
-        self.emit(Instr::Eq { dst: t, a: len, b: one })?;
-        other.push(self.jump_if_false(t)?);
-        let zero = self.small_int(0)?;
-        let entry = self.alloc()?;
-        self.emit(Instr::GetIndex { dst: entry, obj: bucket, key: zero })?;
-        let stored = self.alloc()?;
-        self.emit(Instr::GetIndex { dst: stored, obj: entry, key: zero })?;
-        self.emit(Instr::Eq { dst: t, a: stored, b: k })?;
-        other.push(self.jump_if_false(t)?);
-        self.emit(Instr::GetIndex { dst, obj: entry, key: one })?;
-        done.push(self.jump()?);
         // Absent: the default.
         let here = self.here();
-        self.patch(absent, here)?;
-        self.patch(absent2, here)?;
         self.patch_absent(at_lookup, here)?;
         match regs.get(1) {
             Some(&default) => {
@@ -2113,9 +2061,8 @@ impl<'a> Emitter<'a> {
         }
         done.push(self.jump()?);
         let here = self.here();
-        for j in other {
-            self.patch(j, here)?;
-        }
+        self.patch_slow(at_lookup, here)?;
+        self.patch(other, here)?;
         Ok(())
     }
 
