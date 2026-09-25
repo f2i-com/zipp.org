@@ -3,7 +3,7 @@ use super::emitter::{Emitter, LoopCtx, MAX_DIRECT, R};
 use super::stmts::{binop_name, inplace_binop_name};
 use super::symtable::{ScopeKind, SymKind};
 use crate::bytecode::{Instr, PyArithOp, PyCmpOp, Reg};
-use rustpython_parser::ast;
+use zipp_pyparse::tree as ast;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Operator and comparison chains longer than this reuse their registers.

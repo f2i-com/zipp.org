@@ -85,25 +85,15 @@ jobs:
           cargo +1.92.0 test --locked -p zipp-vm --no-default-features --features python-no-torch --lib --test python_packages --test python_frontend --test python_project
           cargo +1.92.0 test --locked -p zipp-cli
           cargo +1.92.0 test --locked -p zipp-gpu
-      # The hand-written Python parser against the generated LALRPOP parser it
-      # replaced (compiled only here, by the test-only `reference-parser`
-      # feature): equal ASTs, ranges included, or equal errors, over every
-      # Python source in the repository, syntax-error snippets, mutated token
-      # streams and the runner's CPython Lib. See the fork's FORK.md.
-      - name: Test the Python parser against the one it replaced
-        working-directory: crates/rustpython-parser-fork
-        run: |
-          cargo +1.92.0 test --locked --no-default-features --features location,num-bigint --lib
-          cargo +1.92.0 test --locked --release --no-default-features --features location,num-bigint,reference-parser --test differential -- --include-ignored --skip throughput
-      # ZIPP's own Python front end (crates/zipp-pyparse), which the frontend
-      # parses with, against that parser: equal RustPython ASTs, ranges
-      # included, or equal errors, over the same corpora. Programs only it
-      # accepts (PEP 701 f-strings, PEP 696 defaults) and every file of the
-      # runner's CPython Lib must give CPython's own `ast` tree. See its README.
-      - name: Test ZIPP's Python front end against the parser it replaced and CPython
+      # ZIPP's Python front end (crates/zipp-pyparse): whatever the runner's
+      # CPython (3.12+) accepts, from every Python source in the repository,
+      # mutated token streams of them and every file of the runner's own
+      # CPython Lib, it accepts with CPython's `ast` tree; syntax errors keep
+      # the messages and offsets recorded in tests/golden. See its README.
+      - name: Test ZIPP's Python front end against CPython
         working-directory: crates/zipp-pyparse
         run: |
-          cargo +1.92.0 test --locked --release --features rustpython -- --include-ignored --skip throughput
+          cargo +1.92.0 test --locked --release -- --include-ignored --skip throughput
       - name: Build the Python-enabled browser artifact
         working-directory: crates/zipp-wasm
         run: |

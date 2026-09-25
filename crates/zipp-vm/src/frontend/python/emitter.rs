@@ -24,7 +24,7 @@ use super::symtable::{Scope, ScopeKind, SymKind, SymTable};
 use super::{Project, BUILTIN_MODULES};
 use crate::bytecode::{FuncProto, Instr, Program, Reg, NO_NAME};
 use ast::Ranged;
-use rustpython_parser::ast;
+use zipp_pyparse::tree as ast;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

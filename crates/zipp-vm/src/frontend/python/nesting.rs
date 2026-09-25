@@ -2,11 +2,11 @@
 //!
 //! The parser builds arbitrarily deep trees without recursing (a million
 //! unary minus signs fit in the source and token caps), but the symbol
-//! table, the emitter and the AST's own `Drop` are recursive. [`check`] walks
-//! the tree with an explicit stack and rejects one whose nesting would carry
-//! those walks past [`NESTING_LIMIT`] levels; [`Suite`] then tears a deep tree
-//! down iteratively, so neither a rejected nor an accepted program can
-//! exhaust the native stack (or a wasm host's much smaller one).
+//! table and the emitter are recursive. [`check`] walks the tree with an
+//! explicit stack and rejects one whose nesting would carry those walks past
+//! [`NESTING_LIMIT`] levels, so no program can exhaust the native stack (or a
+//! wasm host's much smaller one). The tree lives in a bump arena and is
+//! freed at once, whatever its depth.
 //!
 //! Chains the compiler walks iteratively cost no nesting here: the left
 //! spine of an operator chain (`a + b + c ...`) and an `elif` ladder. So do
@@ -14,50 +14,35 @@
 //! emitter lowers one inside the other: those count one level per clause.
 use super::emitter::R;
 use ast::Ranged;
-use rustpython_parser::ast;
+use zipp_pyparse::tree as ast;
 
 /// Levels of effective nesting the recursive walks may reach. The emitter's
 /// own, stricter per-construct limit (`MAX_DEPTH`) still applies; this bound
 /// covers every walk, including ones the emitter's accounting does not charge.
 pub(super) const NESTING_LIMIT: usize = 512;
-/// A tree deeper than this (counting every edge) is torn down iteratively.
-const DEEP_TREE: usize = 256;
 
-/// A parsed module that frees itself without recursion when it is deep.
-pub(super) struct Suite {
-    stmts: Vec<ast::Stmt>,
-    deep: bool,
+/// A parsed module whose nesting is within bounds.
+pub(super) struct Suite<'a> {
+    stmts: ast::Seq<'a, ast::Stmt<'a>>,
 }
 
-impl std::ops::Deref for Suite {
-    type Target = [ast::Stmt];
-    fn deref(&self) -> &[ast::Stmt] {
+impl<'a> std::ops::Deref for Suite<'a> {
+    type Target = [ast::Stmt<'a>];
+    fn deref(&self) -> &[ast::Stmt<'a>] {
         &self.stmts
     }
 }
 
-impl Drop for Suite {
-    fn drop(&mut self) {
-        if self.deep {
-            teardown(std::mem::take(&mut self.stmts));
-        }
-    }
-}
-
 enum Node<'a> {
-    Stmt(&'a ast::Stmt),
-    Expr(&'a ast::Expr),
-    Pattern(&'a ast::Pattern),
+    Stmt(&'a ast::Stmt<'a>),
+    Expr(&'a ast::Expr<'a>),
+    Pattern(&'a ast::Pattern<'a>),
 }
 
-/// Take ownership of a parsed module after checking its nesting. On error
-/// the tree is still freed without recursion.
-pub(super) fn check(stmts: Vec<ast::Stmt>, file: &str, source: &str) -> R<Suite> {
-    let mut suite = Suite { stmts, deep: true };
-    let mut stack: Vec<(Node, usize, usize)> = suite.stmts.iter().map(|s| (Node::Stmt(s), 1, 1)).collect();
-    let mut deepest = 0usize;
+/// Check a parsed module's nesting.
+pub(super) fn check<'a>(stmts: ast::Seq<'a, ast::Stmt<'a>>, file: &str, source: &str) -> R<Suite<'a>> {
+    let mut stack: Vec<(Node, usize, usize)> = stmts.iter().map(|s| (Node::Stmt(s), 1, 1)).collect();
     while let Some((node, depth, raw)) = stack.pop() {
-        deepest = deepest.max(raw);
         if depth > NESTING_LIMIT {
             let at = match node {
                 Node::Stmt(s) => s.range().start(),
@@ -69,8 +54,7 @@ pub(super) fn check(stmts: Vec<ast::Stmt>, file: &str, source: &str) -> R<Suite>
         }
         children(node, depth, raw, &mut stack);
     }
-    suite.deep = deepest > DEEP_TREE;
-    Ok(suite)
+    Ok(Suite { stmts })
 }
 
 /// The int literals (negated ones included) inside the loop bodies of
@@ -401,10 +385,18 @@ fn arguments<'a>(args: &'a ast::Arguments, depth: usize, raw: usize, stack: &mut
 
 fn type_params<'a>(params: &'a [ast::TypeParam], depth: usize, raw: usize, stack: &mut Vec<(Node<'a>, usize, usize)>) {
     for p in params {
-        if let ast::TypeParam::TypeVar(v) = p {
-            if let Some(bound) = &v.bound {
-                stack.push((Node::Expr(bound), depth, raw));
+        let default = match p {
+            ast::TypeParam::TypeVar(v) => {
+                if let Some(bound) = &v.bound {
+                    stack.push((Node::Expr(bound), depth, raw));
+                }
+                &v.default
             }
+            ast::TypeParam::ParamSpec(s) => &s.default,
+            ast::TypeParam::TypeVarTuple(t) => &t.default,
+        };
+        if let Some(default) = default {
+            stack.push((Node::Expr(default), depth, raw));
         }
     }
 }
@@ -435,296 +427,5 @@ fn comprehension<'a>(generators: &'a [ast::Comprehension], depth: usize, raw: us
         stack.push((Node::Expr(&g.target), depth + i, raw));
         stack.push((Node::Expr(&g.iter), depth + i, raw));
         stack.extend(g.ifs.iter().map(|c| (Node::Expr(c), depth + i, raw)));
-    }
-}
-
-enum Owned {
-    Stmt(ast::Stmt),
-    Expr(ast::Expr),
-    Pattern(ast::Pattern),
-}
-
-fn placeholder() -> ast::Expr {
-    ast::Expr::Constant(ast::ExprConstant {
-        value: ast::Constant::None,
-        kind: None,
-        range: Default::default(),
-    })
-}
-
-/// Free a tree with an explicit stack: every node's children are moved out
-/// before the (then shallow) node is dropped.
-fn teardown(stmts: Vec<ast::Stmt>) {
-    let mut stack: Vec<Owned> = stmts.into_iter().map(Owned::Stmt).collect();
-    let boxed = |stack: &mut Vec<Owned>, e: &mut Box<ast::Expr>| {
-        stack.push(Owned::Expr(std::mem::replace(&mut **e, placeholder())));
-    };
-    let opt = |stack: &mut Vec<Owned>, e: &mut Option<Box<ast::Expr>>| {
-        if let Some(e) = e.take() {
-            stack.push(Owned::Expr(*e));
-        }
-    };
-    let exprs = |stack: &mut Vec<Owned>, v: &mut Vec<ast::Expr>| {
-        stack.extend(std::mem::take(v).into_iter().map(Owned::Expr));
-    };
-    let body = |stack: &mut Vec<Owned>, v: &mut Vec<ast::Stmt>| {
-        stack.extend(std::mem::take(v).into_iter().map(Owned::Stmt));
-    };
-    let args = |stack: &mut Vec<Owned>, a: &mut ast::Arguments| {
-        for a in a.posonlyargs.iter_mut().chain(&mut a.args).chain(&mut a.kwonlyargs) {
-            if let Some(d) = a.default.take() {
-                stack.push(Owned::Expr(*d));
-            }
-            if let Some(ann) = a.def.annotation.take() {
-                stack.push(Owned::Expr(*ann));
-            }
-        }
-        for a in [&mut a.vararg, &mut a.kwarg].into_iter().flatten() {
-            if let Some(ann) = a.annotation.take() {
-                stack.push(Owned::Expr(*ann));
-            }
-        }
-    };
-    let generators = |stack: &mut Vec<Owned>, gens: &mut Vec<ast::Comprehension>| {
-        for g in std::mem::take(gens) {
-            stack.push(Owned::Expr(g.target));
-            stack.push(Owned::Expr(g.iter));
-            stack.extend(g.ifs.into_iter().map(Owned::Expr));
-        }
-    };
-    while let Some(node) = stack.pop() {
-        match node {
-            Owned::Stmt(mut s) => match &mut s {
-                ast::Stmt::FunctionDef(f) => {
-                    exprs(&mut stack, &mut f.decorator_list);
-                    args(&mut stack, &mut f.args);
-                    opt(&mut stack, &mut f.returns);
-                    body(&mut stack, &mut f.body);
-                }
-                ast::Stmt::AsyncFunctionDef(f) => {
-                    exprs(&mut stack, &mut f.decorator_list);
-                    args(&mut stack, &mut f.args);
-                    opt(&mut stack, &mut f.returns);
-                    body(&mut stack, &mut f.body);
-                }
-                ast::Stmt::ClassDef(c) => {
-                    exprs(&mut stack, &mut c.decorator_list);
-                    exprs(&mut stack, &mut c.bases);
-                    for k in std::mem::take(&mut c.keywords) {
-                        stack.push(Owned::Expr(k.value));
-                    }
-                    body(&mut stack, &mut c.body);
-                }
-                ast::Stmt::Return(r) => opt(&mut stack, &mut r.value),
-                ast::Stmt::Delete(d) => exprs(&mut stack, &mut d.targets),
-                ast::Stmt::Assign(a) => {
-                    exprs(&mut stack, &mut a.targets);
-                    boxed(&mut stack, &mut a.value);
-                }
-                ast::Stmt::TypeAlias(a) => {
-                    boxed(&mut stack, &mut a.name);
-                    boxed(&mut stack, &mut a.value);
-                }
-                ast::Stmt::AugAssign(a) => {
-                    boxed(&mut stack, &mut a.target);
-                    boxed(&mut stack, &mut a.value);
-                }
-                ast::Stmt::AnnAssign(a) => {
-                    boxed(&mut stack, &mut a.target);
-                    boxed(&mut stack, &mut a.annotation);
-                    opt(&mut stack, &mut a.value);
-                }
-                ast::Stmt::For(f) => {
-                    boxed(&mut stack, &mut f.target);
-                    boxed(&mut stack, &mut f.iter);
-                    body(&mut stack, &mut f.body);
-                    body(&mut stack, &mut f.orelse);
-                }
-                ast::Stmt::AsyncFor(f) => {
-                    boxed(&mut stack, &mut f.target);
-                    boxed(&mut stack, &mut f.iter);
-                    body(&mut stack, &mut f.body);
-                    body(&mut stack, &mut f.orelse);
-                }
-                ast::Stmt::While(w) => {
-                    boxed(&mut stack, &mut w.test);
-                    body(&mut stack, &mut w.body);
-                    body(&mut stack, &mut w.orelse);
-                }
-                ast::Stmt::If(i) => {
-                    boxed(&mut stack, &mut i.test);
-                    body(&mut stack, &mut i.body);
-                    body(&mut stack, &mut i.orelse);
-                }
-                ast::Stmt::With(w) => {
-                    for item in std::mem::take(&mut w.items) {
-                        stack.push(Owned::Expr(item.context_expr));
-                        if let Some(v) = item.optional_vars {
-                            stack.push(Owned::Expr(*v));
-                        }
-                    }
-                    body(&mut stack, &mut w.body);
-                }
-                ast::Stmt::AsyncWith(w) => {
-                    for item in std::mem::take(&mut w.items) {
-                        stack.push(Owned::Expr(item.context_expr));
-                        if let Some(v) = item.optional_vars {
-                            stack.push(Owned::Expr(*v));
-                        }
-                    }
-                    body(&mut stack, &mut w.body);
-                }
-                ast::Stmt::Match(m) => {
-                    boxed(&mut stack, &mut m.subject);
-                    for case in std::mem::take(&mut m.cases) {
-                        stack.push(Owned::Pattern(case.pattern));
-                        if let Some(g) = case.guard {
-                            stack.push(Owned::Expr(*g));
-                        }
-                        stack.extend(case.body.into_iter().map(Owned::Stmt));
-                    }
-                }
-                ast::Stmt::Raise(r) => {
-                    opt(&mut stack, &mut r.exc);
-                    opt(&mut stack, &mut r.cause);
-                }
-                ast::Stmt::Try(t) => {
-                    body(&mut stack, &mut t.body);
-                    for h in std::mem::take(&mut t.handlers) {
-                        let ast::ExceptHandler::ExceptHandler(h) = h;
-                        if let Some(ty) = h.type_ {
-                            stack.push(Owned::Expr(*ty));
-                        }
-                        stack.extend(h.body.into_iter().map(Owned::Stmt));
-                    }
-                    body(&mut stack, &mut t.orelse);
-                    body(&mut stack, &mut t.finalbody);
-                }
-                ast::Stmt::TryStar(t) => {
-                    body(&mut stack, &mut t.body);
-                    for h in std::mem::take(&mut t.handlers) {
-                        let ast::ExceptHandler::ExceptHandler(h) = h;
-                        if let Some(ty) = h.type_ {
-                            stack.push(Owned::Expr(*ty));
-                        }
-                        stack.extend(h.body.into_iter().map(Owned::Stmt));
-                    }
-                    body(&mut stack, &mut t.orelse);
-                    body(&mut stack, &mut t.finalbody);
-                }
-                ast::Stmt::Assert(a) => {
-                    boxed(&mut stack, &mut a.test);
-                    opt(&mut stack, &mut a.msg);
-                }
-                ast::Stmt::Expr(e) => boxed(&mut stack, &mut e.value),
-                ast::Stmt::Import(_)
-                | ast::Stmt::ImportFrom(_)
-                | ast::Stmt::Global(_)
-                | ast::Stmt::Nonlocal(_)
-                | ast::Stmt::Pass(_)
-                | ast::Stmt::Break(_)
-                | ast::Stmt::Continue(_) => {}
-            },
-            Owned::Expr(mut e) => match &mut e {
-                ast::Expr::BoolOp(b) => exprs(&mut stack, &mut b.values),
-                ast::Expr::NamedExpr(n) => {
-                    boxed(&mut stack, &mut n.target);
-                    boxed(&mut stack, &mut n.value);
-                }
-                ast::Expr::BinOp(b) => {
-                    boxed(&mut stack, &mut b.left);
-                    boxed(&mut stack, &mut b.right);
-                }
-                ast::Expr::UnaryOp(u) => boxed(&mut stack, &mut u.operand),
-                ast::Expr::Lambda(l) => {
-                    args(&mut stack, &mut l.args);
-                    boxed(&mut stack, &mut l.body);
-                }
-                ast::Expr::IfExp(i) => {
-                    boxed(&mut stack, &mut i.test);
-                    boxed(&mut stack, &mut i.body);
-                    boxed(&mut stack, &mut i.orelse);
-                }
-                ast::Expr::Dict(d) => {
-                    stack.extend(std::mem::take(&mut d.keys).into_iter().flatten().map(Owned::Expr));
-                    exprs(&mut stack, &mut d.values);
-                }
-                ast::Expr::Set(s) => exprs(&mut stack, &mut s.elts),
-                ast::Expr::ListComp(c) => {
-                    generators(&mut stack, &mut c.generators);
-                    boxed(&mut stack, &mut c.elt);
-                }
-                ast::Expr::SetComp(c) => {
-                    generators(&mut stack, &mut c.generators);
-                    boxed(&mut stack, &mut c.elt);
-                }
-                ast::Expr::DictComp(c) => {
-                    generators(&mut stack, &mut c.generators);
-                    boxed(&mut stack, &mut c.key);
-                    boxed(&mut stack, &mut c.value);
-                }
-                ast::Expr::GeneratorExp(c) => {
-                    generators(&mut stack, &mut c.generators);
-                    boxed(&mut stack, &mut c.elt);
-                }
-                ast::Expr::Await(a) => boxed(&mut stack, &mut a.value),
-                ast::Expr::Yield(y) => opt(&mut stack, &mut y.value),
-                ast::Expr::YieldFrom(y) => boxed(&mut stack, &mut y.value),
-                ast::Expr::Compare(c) => {
-                    boxed(&mut stack, &mut c.left);
-                    exprs(&mut stack, &mut c.comparators);
-                }
-                ast::Expr::Call(c) => {
-                    boxed(&mut stack, &mut c.func);
-                    exprs(&mut stack, &mut c.args);
-                    for k in std::mem::take(&mut c.keywords) {
-                        stack.push(Owned::Expr(k.value));
-                    }
-                }
-                ast::Expr::FormattedValue(f) => {
-                    boxed(&mut stack, &mut f.value);
-                    opt(&mut stack, &mut f.format_spec);
-                }
-                ast::Expr::JoinedStr(j) => exprs(&mut stack, &mut j.values),
-                ast::Expr::Attribute(a) => boxed(&mut stack, &mut a.value),
-                ast::Expr::Subscript(s) => {
-                    boxed(&mut stack, &mut s.value);
-                    boxed(&mut stack, &mut s.slice);
-                }
-                ast::Expr::Starred(s) => boxed(&mut stack, &mut s.value),
-                ast::Expr::List(l) => exprs(&mut stack, &mut l.elts),
-                ast::Expr::Tuple(t) => exprs(&mut stack, &mut t.elts),
-                ast::Expr::Slice(s) => {
-                    opt(&mut stack, &mut s.lower);
-                    opt(&mut stack, &mut s.upper);
-                    opt(&mut stack, &mut s.step);
-                }
-                ast::Expr::Constant(_) | ast::Expr::Name(_) => {}
-            },
-            Owned::Pattern(mut p) => match &mut p {
-                ast::Pattern::MatchValue(v) => boxed(&mut stack, &mut v.value),
-                ast::Pattern::MatchSingleton(_) | ast::Pattern::MatchStar(_) => {}
-                ast::Pattern::MatchSequence(q) => {
-                    stack.extend(std::mem::take(&mut q.patterns).into_iter().map(Owned::Pattern));
-                }
-                ast::Pattern::MatchMapping(m) => {
-                    exprs(&mut stack, &mut m.keys);
-                    stack.extend(std::mem::take(&mut m.patterns).into_iter().map(Owned::Pattern));
-                }
-                ast::Pattern::MatchClass(c) => {
-                    boxed(&mut stack, &mut c.cls);
-                    stack.extend(std::mem::take(&mut c.patterns).into_iter().map(Owned::Pattern));
-                    stack.extend(std::mem::take(&mut c.kwd_patterns).into_iter().map(Owned::Pattern));
-                }
-                ast::Pattern::MatchAs(a) => {
-                    if let Some(inner) = a.pattern.take() {
-                        stack.push(Owned::Pattern(*inner));
-                    }
-                }
-                ast::Pattern::MatchOr(o) => {
-                    stack.extend(std::mem::take(&mut o.patterns).into_iter().map(Owned::Pattern));
-                }
-            },
-        }
     }
 }

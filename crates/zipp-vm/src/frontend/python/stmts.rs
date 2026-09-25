@@ -4,7 +4,7 @@ use super::exprs::{known, small_int_literal, Known};
 use super::symtable::{ScopeKind, SymKind};
 use crate::bytecode::{Instr, Reg};
 use ast::Ranged;
-use rustpython_parser::ast;
+use zipp_pyparse::tree as ast;
 use std::collections::BTreeSet;
 
 /// How a loop steps through its iterable (see [`Emitter::loop_header`]):
@@ -555,7 +555,7 @@ impl<'a> Emitter<'a> {
     /// `range(a[, b[, c]])` by name, with plain positional arguments: the
     /// callee value and the evaluated argument array, for the counted-loop
     /// fast path. `None` for any other iterable expression.
-    pub fn range_call<'e>(&self, iter: &'e ast::Expr) -> Option<&'e [ast::Expr]> {
+    pub fn range_call<'e>(&self, iter: &'e ast::Expr<'e>) -> Option<&'e [ast::Expr<'e>]> {
         let ast::Expr::Call(c) = iter else {
             return None;
         };

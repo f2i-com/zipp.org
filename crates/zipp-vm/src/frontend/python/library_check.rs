@@ -22,7 +22,8 @@ fn tables() -> Vec<&'static Bundled> {
 #[test]
 fn library_check_import_lists_match_the_parser() {
     for module in tables() {
-        let suite = parse_module(module.file, module.source).unwrap_or_else(|e| panic!("{}: {e}", module.name));
+        let bump = zipp_pyparse::tree::Bump::new();
+        let suite = parse_module(module.file, module.source, &bump).unwrap_or_else(|e| panic!("{}: {e}", module.name));
         let mut parsed = BTreeSet::new();
         imported_modules(&suite, module.name, &mut parsed);
         let mut listed = BTreeSet::new();

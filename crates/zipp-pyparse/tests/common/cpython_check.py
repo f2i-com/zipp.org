@@ -4,7 +4,9 @@
 
 Each line: {"label", "source", "ours"} where "ours" is the arena dump (see
 cpython.rs) or {"error": message}. Prints one line per disagreement: CPython
-rejects what ZIPP accepts, or the trees differ (positions are not compared;
+accepts what ZIPP rejects (labels ending "[if valid]" or "[where CPython
+accepts]"), CPython rejects what ZIPP accepts (not for "[where CPython
+accepts]"), or the trees differ (positions are not compared;
 number literals are evaluated from their text; adjacent string constants of
 a JoinedStr are merged and empty ones dropped on both sides, since ZIPP keeps
 the RustPython-compatible split).
@@ -123,6 +125,8 @@ def quirks(x):
             subject = fields["subject"]
             if subject[0] == "Tuple" and len(subject[1]["elts"]) == 1:
                 fields["subject"] = subject[1]["elts"][0]
+        if name in ("TypeVar", "ParamSpec", "TypeVarTuple") and fields.get("default_value") is None:
+            fields.pop("default_value", None)  # absent before Python 3.13
         if name == "Subscript":
             s = fields["slice"]
             if s[0] == "Tuple" and len(s[1]["elts"]) == 1 and s[1]["elts"][0][0] == "Starred":
@@ -130,6 +134,19 @@ def quirks(x):
         return [name, fields]
     if isinstance(x, list):
         return [quirks(v) for v in x]
+    return x
+
+
+def without_joined_text(x):
+    """The tree with the text of every f-string left out."""
+    if isinstance(x, list) and len(x) == 2 and isinstance(x[0], str) and isinstance(x[1], dict):
+        name, fields = x
+        if name == "JoinedStr":
+            values = [v for v in fields["values"] if not (v[0] == "Constant")]
+            return [name, {"values": without_joined_text(values)}]
+        return [name, {k: without_joined_text(v) for k, v in fields.items()}]
+    if isinstance(x, list):
+        return [without_joined_text(v) for v in x]
     return x
 
 
@@ -144,6 +161,23 @@ def identifiers(v):
     return quirks(v)
 
 
+def grammar_gap(tree):
+    """Syntax the RustPython grammar (which ZIPP keeps) lacks and ZIPP does
+    not compile anyway: `type` aliases after a colon (`else: type X = y`;
+    the soft keyword is a name there) and a starred operand looser than
+    `|` (`a[*b > 0]`)."""
+    loose = (ast.Compare, ast.BoolOp, ast.IfExp, ast.Lambda, ast.NamedExpr)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.TypeAlias):
+            return True
+        if isinstance(node, ast.Starred) and (
+            isinstance(node.value, loose)
+            or (isinstance(node.value, ast.UnaryOp) and isinstance(node.value.op, ast.Not))
+        ):
+            return True
+    return False
+
+
 def main():
     for line in open(sys.argv[1], encoding="utf-8"):
         try:
@@ -154,13 +188,24 @@ def main():
         ours = case["ours"]
         label = case["label"]
         if isinstance(ours, dict) and "error" in ours:
-            if label.endswith("[if valid]"):
+            if label.endswith(("[if valid]", "[where CPython accepts]")):
                 try:
-                    ast.parse(case["source"])
+                    tree = ast.parse(case["source"])
                 except (SyntaxError, ValueError, UnicodeError):
+                    continue
+                if grammar_gap(tree):
                     continue
                 if "knows common names only" in ours["error"]:
                     continue  # the compact \N{...} table, by design
+                if "Tabs not allowed as part of indentation after spaces" in ours["error"]:
+                    continue  # RustPython's stricter indentation rule, kept
+                # Checks ZIPP's parser makes (duplicate parameters, repeated
+                # keywords, as RustPython's did) where CPython's compiler
+                # makes them: both reject the program.
+                try:
+                    compile(case["source"], "<check>", "exec", dont_inherit=True)
+                except (SyntaxError, ValueError, UnicodeError):
+                    continue
                 print(f"{label}: CPython accepts what ZIPP rejects ({ours['error']})")
             continue
         try:
@@ -169,6 +214,8 @@ def main():
             msg = getattr(e, "msg", str(e))
             # Assignment targets are checked by ZIPP's compiler, as they were
             # with the RustPython parser; CPython's parser checks them itself.
+            if label.endswith("[where CPython accepts]"):
+                continue
             if ours != "reject" and not any(t in msg for t in TARGET_CHECKS):
                 print(f"{label}: CPython rejects ({msg}, line {getattr(e, 'lineno', '?')}) what ZIPP accepts")
             continue
@@ -180,6 +227,11 @@ def main():
         theirs = quirks(dump(tree))
         mine = quirks(norm(ours))
         mine[1]["type_ignores"] = []
+        if theirs != mine and sys.version_info < (3, 13) and "#" in case["source"]:
+            # Python 3.12 cuts an f-string's `=` text at a `#` inside a
+            # string (`f"{'#' = }"`); ZIPP reads it as 3.13 does.
+            if without_joined_text(theirs) == without_joined_text(mine):
+                continue
         if theirs != mine:
             a = json.dumps(theirs)
             b = json.dumps(mine)

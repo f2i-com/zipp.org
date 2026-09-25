@@ -293,4 +293,10 @@ pub const SNIPPETS: &[&str] = &[
     "f\"{[x # c\n , # d\n y] = }\"\n",
     "f\"{'#' = }\"\n",
     "f\"{x:{y # c\n} = }\"\n",
+    // PEP 696 type parameter defaults.
+    "def f[T = int](x: T): pass\n",
+    "class A[T: int = bool, *Ts = (), **P = [int]]: pass\n",
+    "type X[T = str] = list[T]\n",
+    "def f[T = ](): pass\n",
+    "def f[T = int, U](): pass\n",
 ];

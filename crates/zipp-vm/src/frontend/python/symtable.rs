@@ -10,7 +10,7 @@
 //! everything else through the enclosing function scopes or the globals;
 //! methods that use `super()` or `__class__` get the implicit `__class__` cell.
 use ast::Ranged;
-use rustpython_parser::ast;
+use zipp_pyparse::tree as ast;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

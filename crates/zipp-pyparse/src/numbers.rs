@@ -10,7 +10,6 @@ pub fn float(text: &str) -> f64 {
     digits.parse().unwrap_or(f64::NAN)
 }
 
-#[cfg_attr(not(feature = "rustpython"), allow(dead_code))]
 /// An int literal's value when it fits in a `u64` (`text` as written,
 /// prefix and underscores included).
 pub fn small_int(text: &str, radix: u8) -> Option<u64> {

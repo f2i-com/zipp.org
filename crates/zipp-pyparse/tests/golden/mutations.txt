@@ -1,0 +1,1480 @@
+0.0 "x  \\\n type\n": err "invalid syntax. Got unexpected token 'type'" at 6
+0.1 "x = == 1\n": err "invalid syntax. Got unexpected token '=='" at 4
+0.2 "\n =  x": err "unexpected indent" at 1
+0.3 "x = = ,\n": err "invalid syntax. Got unexpected token '='" at 4
+0.4 "x = u'x' 1\n\n": err "invalid syntax. Got unexpected token '1'" at 9
+1.0 "b'b' xx \n": err "invalid syntax. Got unexpected token 'xx'" at 5
+1.1 "x  try\n": err "invalid syntax. Got unexpected token 'try'" at 3
+1.2 "x = \n\n": err "invalid syntax. Got unexpected token Newline" at 4
+1.3 "classclass x \n": err "invalid syntax. Got unexpected token 'x'" at 11
+1.4 "\n  x": err "unexpected indent" at 1
+2.0 "print ;\n": ok 33005ff65782c636
+2.1 "\\\n 'hello'\n\n": ok d19f8e9e291c88aa
+2.2 " 'hello'\n": err "unexpected indent" at 0
+2.3 "return\n \n": ok 65f68725c5864d57
+2.4 "and 'hello''hello']": err "invalid syntax. Got unexpected token 'and'" at 0
+3.0 "a b\n\n": err "invalid syntax. Got unexpected token 'b'" at 2
+3.1 "a async'{x}''{x}'": err "invalid syntax. Got unexpected token 'async'" at 2
+3.2 "a bb": err "invalid syntax. Got unexpected token 'bb'" at 2
+3.3 "1.5 b2j": err "invalid syntax. Got unexpected token 'b2j'" at 4
+3.4 "from b\n": err "invalid syntax. Got unexpected token Newline" at 6
+4.0 "1 ++\n": err "invalid syntax. Got unexpected token Newline" at 4
+4.1 "+ 1\n": ok 2c50d4d8a9309418
+4.2 "\n +)": err "unexpected indent" at 1
+4.3 "while +\n": err "invalid syntax. Got unexpected token Newline" at 7
+4.4 "+ 1\n": ok 2c50d4d8a9309418
+5.0 "match": ok 200956ba4c618c0c
+5.1 "defdef\n": ok 0330291ed4bd8b33
+5.2 "1\"\"\"": err "unexpected EOF while parsing" at 4
+5.3 "==$": err "invalid syntax. Got unexpected token '=='" at 0
+5.4 "defdefdefdefand": ok 87ebff7a56238c08
+6.0 " f\n": err "unexpected indent" at 0
+6.1 " ff\n": err "unexpected indent" at 0
+6.2 "def f": err "invalid syntax. Got unexpected token Newline" at 5
+6.3 "def |\n\n": err "invalid syntax. Got unexpected token '|'" at 4
+6.4 "def globalb'": err "Got unexpected string" at 12
+7.0 "def ::(\n": err "invalid syntax. Got unexpected token ':'" at 4
+7.1 " f(def\n": err "unexpected indent" at 0
+7.2 "\n f\n]:def": err "unexpected indent" at 1
+7.3 " :\n": err "unexpected indent" at 0
+7.4 "def f\n": err "invalid syntax. Got unexpected token Newline" at 5
+8.0 "defdef f()\npass\n": err "invalid syntax. Got unexpected token 'f'" at 7
+8.1 "def f(@:pass\n\n\n": err "invalid syntax. Got unexpected token '@'" at 6
+8.2 "'\\N{DASH}' \n):\npassf": err "(unicode error) \\N{DASH}: unknown Unicode character name (this build knows common names only; spell the character or use \\u/\\U)" at 4
+8.3 "def f(lambda):\npass\n": err "invalid syntax. Got unexpected token 'lambda'" at 6
+8.4 "def ff():\npasspass\n": err "expected an indented block" at 10
+9.0 " f():\n": err "unexpected indent" at 0
+9.1 "def f(and):\n": err "invalid syntax. Got unexpected token 'and'" at 6
+9.2 "} f()global\n": err "Got unexpected nesting" at 1
+9.3 "def f(b'b'\n": err "invalid syntax. Got unexpected token b\"b\"" at 6
+9.4 "def f():": err "unindent does not match any outer indentation level" at 8
+10.0 "defdefdefdef f(): return\n\n  x\n": err "invalid syntax. Got unexpected token 'f'" at 13
+10.1 "def (): return\nb'b'0x\n": err "invalid syntax. Got unexpected token '('" at 4
+10.2 "def   (): return\nfx\n": err "invalid syntax. Got unexpected token '('" at 6
+10.3 "def ff(): return\nxx\n": ok 90f76deb88fdef55
+10.4 "1.5 f(): returnx  \n\n": err "invalid syntax. Got unexpected token 'f'" at 4
+11.0 "if \n    pass\n": err "invalid syntax. Got unexpected token Newline" at 3
+11.1 "if xbimport  pass\n": err "invalid syntax. Got unexpected token 'pass'" at 13
+11.2 "if \n$pass\n": err "invalid syntax. Got unexpected token Newline" at 3
+11.3 "if   pass\n": err "invalid syntax. Got unexpected token 'pass'" at 5
+11.4 "if x\n  pass\n\n": err "invalid syntax. Got unexpected token Newline" at 4
+12.0 "if x1.5\n\n": err "invalid syntax. Got unexpected token '0.5'" at 5
+12.1 " \ndel\n": err "invalid syntax. Got unexpected token Newline" at 5
+12.2 "if x:type": ok b8e5abab11d705d2
+12.3 "if x": err "invalid syntax. Got unexpected token Newline" at 4
+12.4 ": if\n": err "invalid syntax. Got unexpected token ':'" at 0
+13.0 "if x:\npasspasspasspass": err "expected an indented block" at 6
+13.1 "if not:\npass\n": err "invalid syntax. Got unexpected token ':'" at 6
+13.2 "'s'\" x:\npass\n": err "EOL while scanning string literal" at 8
+13.3 "ifififif x:\npass*": err "invalid syntax. Got unexpected token 'x'" at 9
+13.4 "-> x:\npass\n": err "invalid syntax. Got unexpected token '->'" at 0
+14.0 "if x: passreturnelse\\\n  passmatch": err "invalid syntax. Got unexpected token 'passmatch'" at 24
+14.1 "if xelse pass\n\nelse\n  pass\n    ": err "invalid syntax. Got unexpected token 'pass'" at 9
+14.2 "if \n: pass\n#\n  passx": err "invalid syntax. Got unexpected token Newline" at 3
+14.3 "if except: pass\nin\n  pass\n": err "invalid syntax. Got unexpected token 'except'" at 3
+14.4 "if x:: pass\nelse\n  pass\n": err "invalid syntax. Got unexpected token ':'" at 5
+15.0 "2j True print((1)\n": err "invalid syntax. Got unexpected token 'True'" at 3
+15.1 "while True print(1elif\n": err "invalid syntax. Got unexpected token 'print'" at 11
+15.2 "while True (1/\n": err "unexpected EOF while parsing" at 15
+15.3 "while True print1)\n": err "invalid syntax. Got unexpected token 'print1'" at 11
+15.4 "while _ print(1)\n": err "invalid syntax. Got unexpected token 'print'" at 8
+16.0 " @ in \" pass\n": err "unexpected indent" at 0
+16.1 "for x in := pass\n": err "invalid syntax. Got unexpected token ':='" at 9
+16.2 "for x in : \n": err "invalid syntax. Got unexpected token ':'" at 9
+16.3 ": : in for pass\n": err "invalid syntax. Got unexpected token ':'" at 0
+16.4 "forfor x in : :=:=\n": err "invalid syntax. Got unexpected token 'x'" at 7
+17.0 "for in yreturn pass\n": err "invalid syntax. Got unexpected token 'in'" at 4
+17.1 "forfor in : \npass": err "invalid syntax. Got unexpected token ':'" at 10
+17.2 "forfor  y: pass\n": err "invalid syntax. Got unexpected token 'y'" at 8
+17.3 " \ny: passin": ok da31d69947b28745
+17.4 "# in y: pass\n": ok 09612b07b5ecb5a5
+18.0 "] ] y: pass'": err "Got unexpected nesting" at 1
+18.1 "for if y pass\n": err "invalid syntax. Got unexpected token 'if'" at 4
+18.2 "for x y: passpass\n": err "invalid syntax. Got unexpected token 'y'" at 6
+18.3 "for  y| pass\n": err "invalid syntax. Got unexpected token 'pass'" at 8
+18.4 "for x : passu": err "invalid syntax. Got unexpected token ':'" at 6
+19.0 "class A    :\n  pass\n": ok caff7a8103120e5d
+19.1 "class A:\n  pass\n": ok 8cf9ee2a890cdea9
+19.2 "- 0x(:\n  \n": err "ParseBigIntError { kind: Empty }" at 2
+19.3 "await A(:\n  passpass\n": err "invalid syntax. Got unexpected token ':'" at 8
+19.4 "class Af'{':\n  ,\n": err "invalid syntax. Got unexpected token \"{\"" at 8
+20.0 "class A\n  passexcept\n": err "invalid syntax. Got unexpected token Newline" at 7
+20.1 "class A\n|pass\n": err "invalid syntax. Got unexpected token Newline" at 7
+20.2 "| A\n\n  pass\\\n": err "invalid syntax. Got unexpected token '|'" at 0
+20.3 "class AA#  \"\"\"\n": err "invalid syntax. Got unexpected token Newline" at 14
+20.4 " A\"\"\"  passpass\n": err "unexpected indent" at 0
+21.0 "x class (1 \n": err "invalid syntax. Got unexpected token 'class'" at 2
+21.1 "x = yield 2\n": ok 40609c2829cb257b
+21.2 "x = if1, with\n": err "invalid syntax. Got unexpected token 'with'" at 9
+21.3 "x = (1-> 2\n": err "invalid syntax. Got unexpected token '->'" at 6
+21.4 "x = (, 2\n": err "invalid syntax. Got unexpected token ','" at 5
+22.0 "x  for, 2\n": err "invalid syntax. Got unexpected token 'for'" at 3
+22.1 "x  [1, 2\n": err "unexpected EOF while parsing" at 9
+22.2 "except = [! 2\n": err "invalid syntax. Got unexpected token 'except'" at 0
+22.3 "x = [,, 2\n": err "invalid syntax. Got unexpected token ','" at 5
+22.4 "xx = [1, 2\n": err "unexpected EOF while parsing" at 11
+23.0 "x = {{1: 2\n": err "unexpected EOF while parsing" at 11
+23.1 "1  {x: 2\n": err "invalid syntax. Got unexpected token '{'" at 3
+23.2 " = 1: 2<": err "unexpected indent" at 0
+23.3 "= x {1: 2\n": err "invalid syntax. Got unexpected token '='" at 0
+23.4 "= = {f'{'1: 2\n": err "invalid syntax. Got unexpected token '='" at 0
+24.0 "x = )\n": err "Got unexpected nesting" at 5
+24.1 "x  ')\n": err "EOL while scanning string literal" at 6
+24.2 "1 = xx)\n": err "Got unexpected nesting" at 7
+24.3 "x = )\n": err "Got unexpected nesting" at 5
+24.4 "async x 1)\n": err "invalid syntax. Got unexpected token 'x'" at 6
+25.0 "x = 0x]\n": err "ParseBigIntError { kind: Empty }" at 4
+25.1 " == 1]\n": err "unexpected indent" at 0
+25.2 "\\\n yield 1]\n": err "Got unexpected nesting" at 11
+25.3 "xx  pass]\n": err "invalid syntax. Got unexpected token 'pass'" at 4
+25.4 "xx = ]\n": err "Got unexpected nesting" at 6
+26.0 "f(a bb)\n": err "invalid syntax. Got unexpected token 'bb'" at 4
+26.1 "a(f b)\n\n": err "invalid syntax. Got unexpected token 'b'" at 4
+26.2 "try b)": err "invalid syntax. Got unexpected token 'b'" at 4
+26.3 "fa \n    )\n": err "Got unexpected nesting" at 9
+26.4 "f(a b))\n": err "invalid syntax. Got unexpected token 'b'" at 4
+27.0 "f(a=1$ b)\n": err "Got unexpected token $" at 6
+27.1 "fa=1, b)\n": err "Got unexpected nesting" at 8
+27.2 ")(a=1) b]\n": err "Got unexpected nesting" at 1
+27.3 "f(=1, b)\n": err "invalid syntax. Got unexpected token '='" at 2
+27.4 "while(a=1, ))\n": err "invalid syntax. Got unexpected token '='" at 7
+28.0 "f(**aa, *b)'": err "iterable argument unpacking follows keyword argument unpacking" at 8
+28.1 "ff(**a, *.)\n": err "invalid syntax. Got unexpected token '.'" at 9
+28.2 "f(**a, *b)lambda": err "iterable argument unpacking follows keyword argument unpacking" at 7
+28.3 "f(****a, b)\n": err "invalid syntax. Got unexpected token '**'" at 4
+28.4 "f**a, **b\n": err "invalid syntax. Got unexpected token '**'" at 6
+29.0 "f(a=1, a=2))\n": err "keyword argument repeated: a" at 7
+29.1 "f(a=1, a=not)\n": err "invalid syntax. Got unexpected token ')'" at 12
+29.2 "f(a=1,, a\n2)==": err "invalid syntax. Got unexpected token ','" at 6
+29.3 "f(a=1 a=2)\n": err "invalid syntax. Got unexpected token 'a'" at 6
+29.4 "f(a=1, a==2def\n": err "invalid syntax. Got unexpected token 'def'" at 11
+30.0 "infa for  ( b, c)\n": err "invalid syntax. Got unexpected token 'for'" at 5
+30.1 "fxa forfor a c b, in)\n": err "invalid syntax. Got unexpected token 'forfor'" at 4
+30.2 "f(a for b in await, c)\n": err "invalid syntax. Got unexpected token ','" at 18
+30.3 "f((a for a in b, cc))\n": err "invalid syntax. Got unexpected token ','" at 15
+30.4 "f(a for aa in b, c)\n": ok eb04dadc171aa4b0
+31.0 "f\nx=)\n": err "Got unexpected nesting" at 5
+31.1 "=(xf))\n": err "invalid syntax. Got unexpected token '='" at 0
+31.2 "ftryxx=)\n": err "Got unexpected nesting" at 8
+31.3 "@)(x=f\n": err "Got unexpected nesting" at 2
+31.4 "\n$x=)f": err "Got unexpected token $" at 2
+32.0 "\n(=1)": err "invalid syntax. Got unexpected token '='" at 2
+32.1 "f(,1)))\n": err "invalid syntax. Got unexpected token ','" at 2
+32.2 "withf\"\"\"=1)\n": err "unexpected EOF while parsing" at 12
+32.3 "f(1))\n": err "Got unexpected nesting" at 5
+32.4 "(=1)))\n": err "invalid syntax. Got unexpected token '='" at 1
+33.0 "f(a.b=1))\n": err "invalid syntax. Got unexpected token '='" at 5
+33.1 "f((a.b=1)\n": err "invalid syntax. Got unexpected token '='" at 6
+33.2 "f(ab.except1)\n": ok 7ae5c68e9fb70d20
+33.3 "fba.(=1)\n": err "invalid syntax. Got unexpected token '('" at 4
+33.4 "f(aab=1)\n": ok fef7130220014300
+34.0 "lambdalambda yield\n": err "invalid syntax. Got unexpected token 'yield'" at 13
+34.1 "lambdalambda: yieldyield\n": ok f2c9a00344b6d7a6
+34.2 "lambda: if": err "invalid syntax. Got unexpected token 'if'" at 8
+34.3 "lambda: \n": err "invalid syntax. Got unexpected token Newline" at 8
+34.4 "->: 1\n": err "invalid syntax. Got unexpected token '->'" at 0
+35.0 "lambda :, xx: 0!": err "invalid syntax. Got unexpected token ','" at 8
+35.1 " 0, x: x\n": err "unexpected indent" at 0
+35.2 "lambda , x:: 0and": err "invalid syntax. Got unexpected token ','" at 7
+35.3 "lambda <, x:: 0\n": err "invalid syntax. Got unexpected token '<'" at 7
+35.4 " x, x: 0\n": err "unexpected indent" at 0
+36.0 "lambda **: raise's'": err "invalid syntax. Got unexpected token 'raise'" at 11
+36.1 "0 : lambda\n": err "invalid syntax. Got unexpected token Newline" at 10
+36.2 " **: 0\n": err "unexpected indent" at 0
+36.3 "lambda *: 0's'": err "named arguments must follow bare *" at 7
+36.4 "lambda : 0\n": ok 39f2efbc6e526f3c
+37.0 "for ,: 00\n": err "invalid syntax. Got unexpected token ','" at 4
+37.1 "lambda :, 0\n": err "invalid syntax. Got unexpected token ','" at 8
+37.2 "lambda ,: 0\n\n": err "invalid syntax. Got unexpected token ','" at 7
+37.3 "lambda :: 0": err "invalid syntax. Got unexpected token ':'" at 8
+37.4 "lambda : 0\n": ok 39f2efbc6e526f3c
+38.0 "def fisa2j a!: pass\n": err "invalid syntax. Got unexpected token 'a'" at 11
+38.1 " f(a, a): pass\n": err "unexpected indent" at 0
+38.2 "; f(a, a_: pass*": err "invalid syntax. Got unexpected token ';'" at 0
+38.3 "def f(a, aa):: pass\\\n": err "invalid syntax. Got unexpected token ':'" at 13
+38.4 "def f(a, aa)): pass\n": err "Got unexpected nesting" at 13
+39.0 "def fa(=1, rb'\\x')): pass\n": err "invalid syntax. Got unexpected token '='" at 7
+39.1 "def f(a=1, b)\\\n pass\n": err "non-default argument follows default argument" at 11
+39.2 "is )(a=1, b): pass\n": err "invalid syntax. Got unexpected token 'is'" at 0
+39.3 "def or(and=1, b): pass": err "invalid syntax. Got unexpected token 'or'" at 4
+39.4 "def f(a=1, bf\"{x!r:>{y}}\": pass\n": err "invalid syntax. Got unexpected token \"{x!r:>{y}}\"" at 13
+40.0 "defdef f*): \n": err "invalid syntax. Got unexpected token 'f'" at 7
+40.1 "def f({)): pass\n": err "invalid syntax. Got unexpected token '{'" at 6
+40.2 "def (*): pass\n": err "invalid syntax. Got unexpected token '('" at 4
+40.3 "def if(*): pass\n": err "invalid syntax. Got unexpected token 'if'" at 4
+40.4 "def f(=): pass\n": err "invalid syntax. Got unexpected token '='" at 6
+41.0 "def fglobal*, =1): pass\n": err "invalid syntax. Got unexpected token '*'" at 11
+41.1 "def f(* =u'x'): passb'b'": err "invalid syntax. Got unexpected token '='" at 8
+41.2 "def f(xcase =1) pass\n": err "invalid syntax. Got unexpected token 'pass'" at 16
+41.3 "[ ff(0x, =1): pass\n": err "ParseBigIntError { kind: Empty }" at 5
+41.4 "def f(**, =elseclass: pass\n": err "invalid syntax. Got unexpected token '='" at 10
+42.0 "def fu'x'*,): pass\n": err "invalid syntax. Got unexpected token \"x\"" at 6
+42.1 "def -(*,,) pass\n": err "invalid syntax. Got unexpected token '-'" at 4
+42.2 "def ff(*,): pass\n": err "named arguments must follow bare *" at 7
+42.3 "def ,(*f_: pass\n": err "invalid syntax. Got unexpected token ','" at 4
+42.4 "def f(*,)match pass\n": err "named arguments must follow bare *" at 6
+43.0 "def ff(a=1, b, *): passrb'\\x'": err "named arguments must follow bare *" at 15
+43.1 "def (a1, b, *):: pass\n": err "invalid syntax. Got unexpected token '('" at 4
+43.2 "def f(aasync1, ;, *: pass\n": err "invalid syntax. Got unexpected token ';'" at 15
+43.3 " f(a=1, b, *) pass!": err "unexpected indent" at 0
+43.4 "def f(ab1, =, 's'): pass\n": err "invalid syntax. Got unexpected token '='" at 11
+44.0 ": a=,, b1 *lambda 0\n": err "invalid syntax. Got unexpected token ':'" at 0
+44.1 "lambda a=, b, *: 0\n": err "invalid syntax. Got unexpected token ','" at 9
+44.2 "lambda a=1, bimport *: 0\n": err "invalid syntax. Got unexpected token '*'" at 20
+44.3 "lambda a=11 b, *: 0\n": err "invalid syntax. Got unexpected token 'b'" at 12
+44.4 "lambda a=1, b, *: 0": err "named arguments must follow bare *" at 15
+45.0 "lambda ', : 0\n": err "EOL while scanning string literal" at 14
+45.1 "lambda *, : 0\n\n": err "named arguments must follow bare *" at 7
+45.2 "lambda *,  0\n": err "invalid syntax. Got unexpected token '0'" at 11
+45.3 "lambdalambda , : 0\n": err "invalid syntax. Got unexpected token ':'" at 15
+45.4 "lambda **, : 0\n": ok b50263a874f53cd8
+46.0 "def f(, k): pass**": err "invalid syntax. Got unexpected token ','" at 6
+46.1 "def f(*f\"{x!r:>{y}}\" **k): passpass\n": err "invalid syntax. Got unexpected token f\"{x!r:>{y}}\"" at 7
+46.2 "def f(*, **k)yieldyield pass\n": err "invalid syntax. Got unexpected token 'yieldyield'" at 13
+46.3 "def f(*, **k#: pass\n": err "unexpected EOF while parsing" at 20
+46.4 "def f*, **k): pass\n": err "invalid syntax. Got unexpected token '*'" at 5
+47.0 "def f(**k: a),, pass\n": err "invalid syntax. Got unexpected token ','" at 13
+47.1 "def lambda(**k, a)): pass\n": err "invalid syntax. Got unexpected token 'lambda'" at 4
+47.2 "def \"(k, a): passpass\n": err "EOL while scanning string literal" at 22
+47.3 "return (**k, a): pass\n": err "invalid syntax. Got unexpected token ','" at 11
+47.4 "def f(**k, a): pass": err "invalid syntax. Got unexpected token 'a'" at 11
+48.0 "defdef f0x): pass\n": err "invalid syntax. Got unexpected token 'f0x'" at 7
+48.1 "def f/)( pass\n": err "invalid syntax. Got unexpected token '/'" at 5
+48.2 "def f(/): passtype": err "invalid syntax. Got unexpected token '/'" at 6
+48.3 "def )(/f: pass\n": err "Got unexpected nesting" at 5
+48.4 "def ..#/): pass\n": err "invalid syntax. Got unexpected token '.'" at 4
+49.0 "/ f(/, def, b, a): pass\n": err "invalid syntax. Got unexpected token '/'" at 0
+49.1 "' f(a, /, b, /): passnot": err "Got unexpected string" at 24
+49.2 "def *(a, /, b, /): pass\n": err "invalid syntax. Got unexpected token '*'" at 4
+49.3 "def f(a1 /, bb, //): pass\n": err "invalid syntax. Got unexpected token '/'" at 9
+49.4 "def (a, /del b, /'s': pass\n": err "invalid syntax. Got unexpected token '('" at 4
+50.0 "def f(,): '\n": err "invalid syntax. Got unexpected token ','" at 6
+50.1 "def f,): \n": err "invalid syntax. Got unexpected token ','" at 5
+50.2 "(,):  \n": err "invalid syntax. Got unexpected token ','" at 1
+50.3 "def f(,): yield\n": err "invalid syntax. Got unexpected token ','" at 6
+50.4 "def ff(,): pass\n": err "invalid syntax. Got unexpected token ','" at 7
+51.0 "def , a*): pass\n": err "invalid syntax. Got unexpected token ','" at 4
+51.1 "def f(a, *): pass\n\n": err "named arguments must follow bare *" at 9
+51.2 "def f(a, *aa):: pass\n": err "invalid syntax. Got unexpected token ':'" at 14
+51.3 "f'{x}' f(a, *a): pass\n": err "invalid syntax. Got unexpected token 'f'" at 7
+51.4 "def f(aaaa( *a): pass\n": err "invalid syntax. Got unexpected token '('" at 10
+52.0 "def f(a=rb'\\x',, /, b,: pass\n": err "invalid syntax. Got unexpected token ','" at 15
+52.1 "def f(a=1: /, b): passb'b'": err "invalid syntax. Got unexpected token ':'" at 9
+52.2 "def f(a=1 /, b pass\n": err "invalid syntax. Got unexpected token ','" at 11
+52.3 "def f(a=:, /, b)11 pass\n": err "invalid syntax. Got unexpected token ':'" at 8
+52.4 "def f(a=\n /, b): pass1": err "invalid syntax. Got unexpected token '/'" at 10
+53.0 "def in(**a, *b): pass\n": err "invalid syntax. Got unexpected token 'in'" at 4
+53.1 "defdef f(*a* ,b): pass\n": err "invalid syntax. Got unexpected token 'f'" at 7
+53.2 "def f(*a, *b's': pass\n": err "invalid syntax. Got unexpected token '*'" at 10
+53.3 "def f(**pass ab): ,\n": err "invalid syntax. Got unexpected token 'pass'" at 8
+53.4 "def f(*a,, *b): pass\n": err "invalid syntax. Got unexpected token ','" at 9
+54.0 "f def() -> : pass\n": err "invalid syntax. Got unexpected token 'def'" at 2
+54.1 "elif fpass() -> : (\n": err "invalid syntax. Got unexpected token 'elif'" at 0
+54.2 "def f()) ->  pass\n": err "Got unexpected nesting" at 8
+54.3 "def f\n) -> : pass(": err "invalid syntax. Got unexpected token Newline" at 5
+54.4 "def f) -> $ pass\n": err "Got unexpected nesting" at 6
+55.0 "def (a, a) x: pass": err "invalid syntax. Got unexpected token '('" at 4
+55.1 "while (a, a) x: pass\n": err "invalid syntax. Got unexpected token 'x'" at 13
+55.2 "def f(a, ) x: pass\n": err "invalid syntax. Got unexpected token 'x'" at 11
+55.3 "def f;a, a) x: pass\n": err "invalid syntax. Got unexpected token ';'" at 5
+55.4 "def (a, a) x: pass\n": err "invalid syntax. Got unexpected token '('" at 4
+56.0 "\n": ok 09612b07b5ecb5a5
+56.1 " x\n": err "unexpected indent" at 0
+56.2 ")\n": err "Got unexpected nesting" at 1
+56.3 "asyncasyncasyncasync \n": ok ccde6ef613d954bd
+56.4 ":= \n": err "invalid syntax. Got unexpected token ':='" at 0
+57.0 "async def ff(): awaitawait": ok cbe48375a81da9e6
+57.1 "async def f(): await1.5": err "invalid syntax. Got unexpected token '0.5'" at 21
+57.2 "async def oror(): \n": err "unindent does not match any outer indentation level" at 19
+57.3 "1.5 def f(): await\n": err "invalid syntax. Got unexpected token 'def'" at 4
+57.4 "async def f(): await\n\n": err "invalid syntax. Got unexpected token Newline" at 20
+58.0 "await await x\n\n": err "invalid syntax. Got unexpected token 'await'" at 6
+58.1 "\nawait xawait": ok 47ae2692d6c4db7b
+58.2 "xu await await'x'": err "invalid syntax. Got unexpected token 'await'" at 3
+58.3 " awaitawait x\n": err "unexpected indent" at 0
+58.4 "await x\n": ok 75c9986ae2875029
+59.0 "x  1\n": err "invalid syntax. Got unexpected token '1'" at 3
+59.1 "x match \\\n\n\n": err "invalid syntax. Got unexpected token 'match'" at 2
+59.2 "xx  11": err "invalid syntax. Got unexpected token '11'" at 4
+59.3 ":= x 1\n": err "invalid syntax. Got unexpected token ':='" at 0
+59.4 " := \n": err "unexpected indent" at 0
+60.0 "(x := 1) = '": err "Got unexpected string" at 12
+60.1 "xxxx := 1) = 2\n": err "invalid syntax. Got unexpected token ':='" at 5
+60.2 "(x := with) if \n": err "invalid syntax. Got unexpected token 'with'" at 6
+60.3 "(x := ) = 2\n": err "invalid syntax. Got unexpected token ')'" at 6
+60.4 "( := 1) = 22\n": err "invalid syntax. Got unexpected token ':='" at 2
+61.0 "[x := 1, yy]\n": ok 3dbcd7c185708a56
+61.1 "[ := 1, y]\n": err "invalid syntax. Got unexpected token ':='" at 2
+61.2 ";[x := 1, y]\n": err "invalid syntax. Got unexpected token ';'" at 0
+61.3 "[x := 1, y]except": err "invalid syntax. Got unexpected token 'except'" at 11
+61.4 "[x := 1type y]\n": err "invalid syntax. Got unexpected token 'type'" at 7
+62.0 "f(x := 1 = 2f'{*a@'\n": err "invalid syntax. Got unexpected token '='" at 9
+62.1 "f((x except 1 = 2case\n": err "invalid syntax. Got unexpected token 'except'" at 5
+62.2 "f2x := 1 = ()class\n": err "invalid syntax. Got unexpected token ':='" at 4
+62.3 "fx := 1 = 2))\n": err "invalid syntax. Got unexpected token ':='" at 3
+62.4 "f(x :=:= 1 = 2)#": err "invalid syntax. Got unexpected token ':='" at 6
+63.0 "(finallya)u'x'": err "invalid syntax. Got unexpected token u\"x\"" at 10
+63.1 "(*a))\n": err "Got unexpected nesting" at 5
+63.2 "()a)\n": err "invalid syntax. Got unexpected token 'a'" at 2
+63.3 "u'x'a)\n": err "invalid syntax. Got unexpected token 'a'" at 4
+63.4 "(*@)\n": err "invalid syntax. Got unexpected token '@'" at 2
+64.0 "(**)a)\n": err "invalid syntax. Got unexpected token ')'" at 3
+64.1 "(**2j))\n": err "Got unexpected nesting" at 7
+64.2 "(a)\n\n": ok 00806bbb83badfe6
+64.3 "(****is)\n": err "invalid syntax. Got unexpected token '**'" at 3
+64.4 "(afrom": err "unexpected EOF while parsing" at 6
+65.0 "print(*a for aa inin b}\n": err "invalid syntax. Got unexpected token 'for'" at 9
+65.1 "print(aa for ** in b)\n": err "invalid syntax. Got unexpected token '**'" at 13
+65.2 "(*a for a in b)\n": err "invalid syntax. Got unexpected token 'for'" at 4
+65.3 "print*a for a in b))\n": err "invalid syntax. Got unexpected token 'for'" at 8
+65.4 "print**a for a in b)\n": err "invalid syntax. Got unexpected token 'for'" at 9
+66.0 "\n*a 1}{": err "invalid syntax. Got unexpected token '1'" at 4
+66.1 "{a: 1\n": err "unexpected EOF while parsing" at 6
+66.2 "{*}: yielda\n": err "invalid syntax. Got unexpected token '}'" at 2
+66.3 "{*a: and}case": err "invalid syntax. Got unexpected token ':'" at 3
+66.4 "{*a: \n}1": err "invalid syntax. Got unexpected token ':'" at 3
+67.0 "{: *b}\n": err "invalid syntax. Got unexpected token ':'" at 1
+67.1 "{apass **b}\n": ok 605a9a747c4d48dc
+67.2 "{a: *b}": err "invalid syntax. Got unexpected token '*'" at 4
+67.3 "{a'\\N{DASH}' *not}\n\n": err "invalid syntax. Got unexpected token \"\\N{DASH}\"" at 2
+67.4 "{a:: *'s'}\n": err "invalid syntax. Got unexpected token ':'" at 3
+68.0 "{**a for a  b}\n": err "invalid syntax. Got unexpected token 'for'" at 5
+68.1 "{**a for  global b}else": err "invalid syntax. Got unexpected token 'for'" at 5
+68.2 "{**a # a in }\n": err "unexpected EOF while parsing" at 14
+68.3 "{**a  b in a}\n": err "invalid syntax. Got unexpected token 'b'" at 6
+68.4 "{**a \\\n a in b}\n": err "invalid syntax. Got unexpected token 'a'" at 8
+69.0 "{*a for in a b}\n": err "invalid syntax. Got unexpected token 'for'" at 4
+69.1 "{*a forfor a in b}f'{'": err "invalid syntax. Got unexpected token 'forfor'" at 4
+69.2 "*a for a inin b}\n": err "invalid syntax. Got unexpected token 'for'" at 3
+69.3 "and**a for a in b}\n": err "invalid syntax. Got unexpected token 'and'" at 0
+69.4 "{*a for a inin b}\n\n": err "invalid syntax. Got unexpected token 'for'" at 4
+70.0 "{a: b< :=\n": err "invalid syntax. Got unexpected token ':='" at 7
+70.1 "{a: b, }\n": ok cd300b6bebdb6a11
+70.2 "{a: :=, c|\n": err "invalid syntax. Got unexpected token ':='" at 4
+70.3 "asa: band c}\n": err "invalid syntax. Got unexpected token 'c'" at 10
+70.4 "a: b, c}\n": err "invalid syntax. Got unexpected token ','" at 4
+71.0 "{a0x import: <}\n": err "invalid syntax. Got unexpected token 'import'" at 5
+71.1 "{a, ::b c}}\n": err "invalid syntax. Got unexpected token ':'" at 4
+71.2 "{type, b: c}.": err "invalid syntax. Got unexpected token ':'" at 8
+71.3 "{a, \"\"\": c}\n": err "unexpected EOF while parsing" at 12
+71.4 "{a b: c}\n": err "invalid syntax. Got unexpected token 'b'" at 3
+72.0 "[**a for a in b.\n": err "invalid syntax. Got unexpected token '**'" at 1
+72.1 "[*a for a in bawait": err "unexpected EOF while parsing" at 19
+72.2 "[\na for  in b]*": err "invalid syntax. Got unexpected token 'in'" at 9
+72.3 "[*a for a , bpass\n": err "unexpected EOF while parsing" at 18
+72.4 "[*== for a if b]\n": err "invalid syntax. Got unexpected token '*='" at 1
+73.0 "(*a for  . b)\n": err "invalid syntax. Got unexpected token 'for'" at 4
+73.1 "}(*a for a in )\n": err "Got unexpected nesting" at 1
+73.2 "(*a for a in b))\n": err "invalid syntax. Got unexpected token 'for'" at 4
+73.3 "\n*a for  in )(": err "invalid syntax. Got unexpected token 'for'" at 4
+73.4 "(*a for a in b)[": err "invalid syntax. Got unexpected token 'for'" at 4
+74.0 "a1:*b]\n": err "invalid syntax. Got unexpected token '*'" at 3
+74.1 "a[1:*bpass\n": err "invalid syntax. Got unexpected token '*'" at 4
+74.2 "a1:**b]\n": err "invalid syntax. Got unexpected token '**'" at 3
+74.3 ":[1:b'b'b]\n": err "invalid syntax. Got unexpected token ':'" at 0
+74.4 "a[1*\n]bb": err "invalid syntax. Got unexpected token ']'" at 5
+75.0 "[x:=1:2]\n": err "invalid syntax. Got unexpected token ':'" at 5
+75.1 "a[x:=1:2]\n\n": err "invalid syntax. Got unexpected token ':'" at 6
+75.2 "areturn:=x1:2as\n": err "invalid syntax. Got unexpected token ':='" at 7
+75.3 "a[x:=:2]\n": err "invalid syntax. Got unexpected token ':'" at 5
+75.4 "a[x1:2\n": err "unexpected EOF while parsing" at 7
+76.0 "[if]\n": err "invalid syntax. Got unexpected token 'if'" at 1
+76.1 "a:]\n": err "Got unexpected nesting" at 3
+76.2 "a[]]\n": err "invalid syntax. Got unexpected token ']'" at 2
+76.3 "[a]\n\n": ok 0099c80dfcec86d0
+76.4 "a[]\n\n": err "invalid syntax. Got unexpected token ']'" at 2
+77.0 ".1": ok ba86e803b6790a3c
+77.1 "a.1.1\n": err "invalid syntax. Got unexpected token '0.1'" at 1
+77.2 "aas\n": ok 79a5156cba57d10a
+77.3 "*\n": err "invalid syntax. Got unexpected token Newline" at 1
+77.4 "aa.1\n": err "invalid syntax. Got unexpected token '0.1'" at 2
+78.0 "\\\n\"\"\".\n": err "unexpected EOF while parsing" at 7
+78.1 "a.\n\n": err "invalid syntax. Got unexpected token Newline" at 2
+78.2 "a.-\n": err "invalid syntax. Got unexpected token '-'" at 2
+78.3 "a.\"": err "Got unexpected string" at 3
+78.4 "globalelif.": err "invalid syntax. Got unexpected token Newline" at 11
+79.0 "\"del": err "Got unexpected string" at 4
+79.1 "except\n": err "invalid syntax. Got unexpected token 'except'" at 0
+79.2 "": ok 09612b07b5ecb5a5
+79.3 "del'": err "Got unexpected string" at 4
+79.4 "\n": ok 09612b07b5ecb5a5
+80.0 "del aa if b ] c": err "invalid syntax. Got unexpected token 'if'" at 7
+80.1 "del a if b else c\n\n": err "invalid syntax. Got unexpected token 'if'" at 6
+80.2 "del a if bb else def": err "invalid syntax. Got unexpected token 'if'" at 6
+80.3 "del aa if b else c\n": err "invalid syntax. Got unexpected token 'if'" at 7
+80.4 "del a if b else /": err "invalid syntax. Got unexpected token 'if'" at 6
+81.0 "del a not\n": err "invalid syntax. Got unexpected token 'not'" at 6
+81.1 "del import a\n": err "invalid syntax. Got unexpected token 'import'" at 4
+81.2 "del notnot a\n": err "invalid syntax. Got unexpected token 'a'" at 11
+81.3 "del  a\t\n": ok d5929b57684943df
+81.4 " notnot aa\n": err "unexpected indent" at 0
+82.0 ")\n": err "Got unexpected nesting" at 1
+82.1 "import!": err "Got unexpected token !" at 6
+82.2 "importglobalimportglobal": ok d3a9ed6abec792f5
+82.3 "pass": ok 9720484cf885d883
+82.4 "": ok 09612b07b5ecb5a5
+83.0 "import a,case\n": ok 7914bb1c18fdc937
+83.1 " import,\n": err "unexpected indent" at 0
+83.2 " a,\n\n": err "unexpected indent" at 0
+83.3 "while a:=": err "invalid syntax. Got unexpected token Newline" at 9
+83.4 "import aimport\n": ok 020d952309e7066d
+84.0 "importimport a;\n": err "invalid syntax. Got unexpected token 'a'" at 13
+84.1 " .a\"\"\"": err "unexpected indent" at 0
+84.2 "import a.": err "invalid syntax. Got unexpected token Newline" at 9
+84.3 " adef\n": err "unexpected indent" at 0
+84.4 "importimport \n.a": err "invalid syntax. Got unexpected token '.'" at 14
+85.0 "from import xx\n": err "invalid syntax. Got unexpected token 'import'" at 5
+85.1 "from import '\\N{DASH}'\n": err "invalid syntax. Got unexpected token 'import'" at 5
+85.2 " ) x\n": err "Got unexpected nesting" at 2
+85.3 "from import rb'\\x'async": err "invalid syntax. Got unexpected token 'import'" at 5
+85.4 ". . xx\n": err "invalid syntax. Got unexpected token '.'" at 0
+86.0 "from a importis": err "invalid syntax. Got unexpected token 'importis'" at 7
+86.1 "from      ": err "invalid syntax. Got unexpected token Newline" at 10
+86.2 "from yield import\n": err "invalid syntax. Got unexpected token 'yield'" at 5
+86.3 "fromfrom a importf'{*a}'\n": err "invalid syntax. Got unexpected token 'a'" at 9
+86.4 "from a \n    ": err "invalid syntax. Got unexpected token Newline" at 7
+87.0 "from aa import b,\n": err "invalid syntax. Got unexpected token Newline" at 17
+87.1 "* a import b(\n": err "invalid syntax. Got unexpected token 'import'" at 4
+87.2 " from import bb,\n": err "unexpected indent" at 0
+87.3 "fromfrom aa import b,\n": err "invalid syntax. Got unexpected token 'aa'" at 9
+87.4 "from a import whilewhile,\t": err "invalid syntax. Got unexpected token Newline" at 26
+88.0 "from a  ()\n": err "invalid syntax. Got unexpected token '('" at 8
+88.1 "from a case ()\n": err "invalid syntax. Got unexpected token 'case'" at 7
+88.2 "from elif global !)\n": err "invalid syntax. Got unexpected token 'elif'" at 5
+88.3 "from for import ()\n": err "invalid syntax. Got unexpected token 'for'" at 5
+88.4 "from a import ())\n": err "invalid syntax. Got unexpected token ')'" at 15
+89.0 "from . import (a, b,1.5\n": err "invalid syntax. Got unexpected token '1.5'" at 20
+89.1 "from .  (a, b,)\n": err "invalid syntax. Got unexpected token '('" at 8
+89.2 "from . import (a, b*)rb'\\x'": err "invalid syntax. Got unexpected token '*'" at 19
+89.3 " . import (a, b,)\n": err "unexpected indent" at 0
+89.4 "from .. import (a, b,)type": err "invalid syntax. Got unexpected token 'type'" at 22
+90.0 "from ..  *\n": err "invalid syntax. Got unexpected token '*'" at 9
+90.1 "from .. async *\n": err "invalid syntax. Got unexpected token 'async'" at 8
+90.2 "fromfrom ., import *\n": err "invalid syntax. Got unexpected token ','" at 10
+90.3 "from .0x import *\n": err "invalid syntax. Got unexpected token '0'" at 5
+90.4 "from ..  def\n": err "invalid syntax. Got unexpected token 'def'" at 9
+91.0 "<\n": err "invalid syntax. Got unexpected token '<'" at 0
+91.1 "{\n": err "unexpected EOF while parsing" at 2
+91.2 "\n": ok 09612b07b5ecb5a5
+91.3 "else": err "invalid syntax. Got unexpected token 'else'" at 0
+91.4 "global\n\n": err "invalid syntax. Got unexpected token Newline" at 6
+92.0 "nota,\n": ok 25cfe98b6fddef4e
+92.1 "global ,import\n": err "invalid syntax. Got unexpected token ','" at 7
+92.2 "global ,": err "invalid syntax. Got unexpected token ','" at 7
+92.3 "globalglobal a,\n": err "invalid syntax. Got unexpected token 'a'" at 13
+92.4 "global aelse\n": ok 16bec3bc8bfa508d
+93.0 "assertfassertf'{*a}'": err "invalid syntax. Got unexpected token \"{*a}\"" at 14
+93.1 "assertx": ok b5689e1084116e93
+93.2 "except\n": err "invalid syntax. Got unexpected token 'except'" at 0
+93.3 "\nassert": err "invalid syntax. Got unexpected token Newline" at 7
+93.4 "assertassert\n": ok 2396215aaee7e087
+94.0 "raise  x\n": ok ab85e69de9ead0c3
+94.1 "raise from #\n": err "invalid syntax. Got unexpected token 'from'" at 6
+94.2 "raise from xx\n": err "invalid syntax. Got unexpected token 'from'" at 6
+94.3 "raise fromfrom x\n": err "invalid syntax. Got unexpected token 'x'" at 15
+94.4 "raise ; xyield\n": ok 977ca034f47fdcf3
+95.0 "} *a, ]": err "Got unexpected nesting" at 1
+95.1 "return *a< b\n": err "invalid syntax. Got unexpected token '<'" at 9
+95.2 "yielda return, b": err "invalid syntax. Got unexpected token 'return'" at 7
+95.3 "return *ain b\n": err "invalid syntax. Got unexpected token 'b'" at 12
+95.4 "return *a, b\n\n": ok b9fa618a7c513449
+96.0 "case = :\n": err "invalid syntax. Got unexpected token 'case'" at 0
+96.1 "yieldyield = 1\n": ok 7f9a857993350aab
+96.2 " = 1yield": err "unexpected indent" at 0
+96.3 "= yieldyield 1\n": err "invalid syntax. Got unexpected token '='" at 0
+96.4 "yield  \\\n\n": ok 5a66e45168952b60
+97.0 "x = yield \n1=": err "invalid syntax. Got unexpected token Newline" at 13
+97.1 "x  yield = 11\n": err "invalid syntax. Got unexpected token 'yield'" at 3
+97.2 " class yield = 1\n": err "unexpected indent" at 0
+97.3 "x , yield = 1\n": err "invalid syntax. Got unexpected token 'yield'" at 4
+97.4 "x = yield = 11\n": ok 773997c305eeb1a1
+98.0 "xx: int = 1 = 2": err "invalid syntax. Got unexpected token '='" at 12
+98.1 "x2 int = 1 = :\n": err "invalid syntax. Got unexpected token 'int'" at 3
+98.2 "or: int = 1 = 2\n": err "invalid syntax. Got unexpected token 'or'" at 0
+98.3 "x::: int = 1 = 2\n": err "invalid syntax. Got unexpected token ':'" at 2
+98.4 "x: int = 1 = 2": err "invalid syntax. Got unexpected token '='" at 11
+99.0 "y, |: int\n": err "invalid syntax. Got unexpected token '|'" at 3
+99.1 ", exceptexcept: int\n": err "invalid syntax. Got unexpected token ','" at 0
+99.2 "x, y:f'{*a}' int\n": err "invalid syntax. Got unexpected token ':'" at 4
+99.3 "x, y: intint\n": err "invalid syntax. Got unexpected token ':'" at 4
+99.4 "yield, yy: int\n": err "invalid syntax. Got unexpected token ','" at 5
+100.0 "or int\n": err "invalid syntax. Got unexpected token 'or'" at 0
+100.1 "*:: int\n": err "invalid syntax. Got unexpected token ':'" at 1
+100.2 "\na: int(": err "unexpected EOF while parsing" at 8
+100.3 "*a:: int\n": err "invalid syntax. Got unexpected token ':'" at 2
+100.4 "*or: a\n\n": err "invalid syntax. Got unexpected token 'or'" at 1
+101.0 "ab , or 1\n": err "invalid syntax. Got unexpected token 'or'" at 5
+101.1 "a, \\\n += 1\n\n": ok 0b52681f0589d444
+101.2 "aa, b  1\n": err "invalid syntax. Got unexpected token '1'" at 7
+101.3 "a, \n += 1b": err "unexpected indent" at 4
+101.4 "a b += \n": err "invalid syntax. Got unexpected token 'b'" at 2
+102.0 "-> + 1  22\n": err "invalid syntax. Got unexpected token '->'" at 0
+102.1 "type ! 1 = 2\n": err "Got unexpected token !" at 5
+102.2 "a +  = 2\n": err "invalid syntax. Got unexpected token '='" at 5
+102.3 "a + = 1 2\n": err "invalid syntax. Got unexpected token '='" at 4
+102.4 "a + 1 = \n": err "invalid syntax. Got unexpected token Newline" at 8
+103.0 "() or 1\n": ok a81148038965815f
+103.1 "f( = 1's'": err "invalid syntax. Got unexpected token '='" at 3
+103.2 ")(f  1import": err "Got unexpected nesting" at 1
+103.3 "ff() == 1\n": ok 8b4eb88b1bd0d5b7
+103.4 "f#) = 1f'{x}'": ok 5777fadeb5f6f8d7
+104.0 "x y if": err "invalid syntax. Got unexpected token 'y'" at 2
+104.1 "x ifif yraise": err "invalid syntax. Got unexpected token 'ifif'" at 2
+104.2 "x ifif 1->": err "invalid syntax. Got unexpected token 'ifif'" at 2
+104.3 "x  **\n": err "invalid syntax. Got unexpected token Newline" at 5
+104.4 "x if y\n\n": err "invalid syntax. Got unexpected token Newline" at 6
+105.0 "x \n     if \n": err "unexpected indent" at 3
+105.1 "x if y :=\n": err "invalid syntax. Got unexpected token ':='" at 7
+105.2 "y else x ifelse": err "invalid syntax. Got unexpected token 'else'" at 2
+105.3 "x if y /\n": err "invalid syntax. Got unexpected token Newline" at 8
+105.4 "pass or y elseor": err "invalid syntax. Got unexpected token 'or'" at 5
+106.0 "a if b if c else d match e\n": err "invalid syntax. Got unexpected token 'if'" at 7
+106.1 "a if b ifif  else d else e\n": err "invalid syntax. Got unexpected token 'ifif'" at 7
+106.2 "a if b if  else or else e\n": err "invalid syntax. Got unexpected token 'if'" at 7
+106.3 "a if b if while else d else e**": err "invalid syntax. Got unexpected token 'if'" at 7
+106.4 "a if b if c else _ else e\n": err "invalid syntax. Got unexpected token 'if'" at 7
+107.0 "lambda or lambdalambda: b\n": err "invalid syntax. Got unexpected token 'or'" at 7
+107.1 "aa or lambda: b\n": err "invalid syntax. Got unexpected token 'lambda'" at 6
+107.2 "a or lambda: b": err "invalid syntax. Got unexpected token 'lambda'" at 5
+107.3 "a oror lambda: b\n\n": err "invalid syntax. Got unexpected token 'oror'" at 2
+107.4 " or lambda: bb\n": err "unexpected indent" at 0
+108.0 "not lambdadel xreturn": err "invalid syntax. Got unexpected token 'xreturn'" at 14
+108.1 "not lambda: xx": err "invalid syntax. Got unexpected token 'lambda'" at 4
+108.2 "x lambda:: not\n": err "invalid syntax. Got unexpected token 'lambda'" at 2
+108.3 "x :; not\n": err "invalid syntax. Got unexpected token ';'" at 3
+108.4 "not rb'\\x'< xx": ok 6fdd6e30171f1f0b
+109.0 "/ == not b\n": err "invalid syntax. Got unexpected token '/'" at 0
+109.1 "[ == not b\n": err "invalid syntax. Got unexpected token '=='" at 2
+109.2 "\n == not bba": err "unexpected indent" at 1
+109.3 "aa  not bb\n": err "invalid syntax. Got unexpected token 'bb'" at 8
+109.4 "a ==  b\n": ok 99f3648fa1db04cc
+110.0 "a from b\\\n": err "invalid syntax. Got unexpected token 'from'" at 2
+110.1 "not b\"\"\"": err "unexpected EOF while parsing" at 8
+110.2 "type not b\n": err "invalid syntax. Got unexpected token 'b'" at 9
+110.3 "aa \n b\n    ": err "unexpected indent" at 4
+110.4 "a not bffinally": err "invalid syntax. Got unexpected token 'bffinally'" at 6
+111.0 "a raiseraise not  b\n": err "invalid syntax. Got unexpected token 'raiseraise'" at 2
+111.1 "a       not b\n": err "invalid syntax. Got unexpected token 'b'" at 12
+111.2 "a not not is \t\n": err "invalid syntax. Got unexpected token 'not'" at 6
+111.3 "a is not \\\n match\n": ok 64ce28776c4e1620
+111.4 "notnot = not a b\n": err "invalid syntax. Got unexpected token 'b'" at 15
+112.0 "a << b < c\n": ok 1c90a6df2c789a13
+112.1 "a < b ; cc\n": ok 81975273050b132a
+112.2 "\n < bb < ca": err "unexpected indent" at 1
+112.3 "a < b << c\n": ok 40fae4a16304c1a8
+112.4 "a < b < c]": err "Got unexpected nesting" at 10
+113.0 "-\n anot": err "invalid syntax. Got unexpected token Newline" at 1
+113.1 "from-not a": err "invalid syntax. Got unexpected token '-'" at 4
+113.2 "xnot a!": err "invalid syntax. Got unexpected token 'a'" at 5
+113.3 "\nnotnot a--": err "invalid syntax. Got unexpected token 'a'" at 8
+113.4 "not \t\t": err "invalid syntax. Got unexpected token Newline" at 6
+114.0 "a type -b \t c\n": err "invalid syntax. Got unexpected token 'type'" at 2
+114.1 "a ** -b ** \n": err "invalid syntax. Got unexpected token Newline" at 11
+114.2 "a ** -b u'x' lambda\n": err "invalid syntax. Got unexpected token u\"x\"" at 8
+114.3 "a ** tryb ** c\n": ok 0b803acb854dd2a2
+114.4 " ** -b ** c\n": err "unexpected indent" at 0
+115.0 "[x  x in y if a else b]\n": err "invalid syntax. Got unexpected token 'x'" at 4
+115.1 "[xx  x in y if a else bb]\n": err "invalid syntax. Got unexpected token 'x'" at 5
+115.2 "[x for x in y if a f'{' b]]]\n": err "invalid syntax. Got unexpected token f\"{\"" at 19
+115.3 "[x for x in a if y  b]\n": err "invalid syntax. Got unexpected token 'b'" at 20
+115.4 "[x for x case \n if a else b]yy": err "invalid syntax. Got unexpected token 'case'" at 9
+116.0 "[x for x ) lambda: y]": err "invalid syntax. Got unexpected token ')'" at 9
+116.1 "[x for x in lambda: y]@": err "invalid syntax. Got unexpected token 'lambda'" at 12
+116.2 "[ for x in lambda: y]\n": err "invalid syntax. Got unexpected token 'for'" at 2
+116.3 "[x forfor x in lambda: y]\n": err "invalid syntax. Got unexpected token 'forfor'" at 3
+116.4 "[! for x in lambda: y]\n": err "Got unexpected token !" at 1
+117.0 "[x  c for x in y]\n": err "invalid syntax. Got unexpected token 'c'" at 4
+117.1 "[x if c for  in y]": err "invalid syntax. Got unexpected token 'for'" at 8
+117.2 "[x if c f\"{x!r:>{y}} x in y]\n": err "EOL while scanning string literal" at 29
+117.3 "[x if c for x inin y]\n": err "invalid syntax. Got unexpected token 'for'" at 8
+117.4 "[x if  for x in y]\n": err "invalid syntax. Got unexpected token 'for'" at 7
+118.0 "[x async  x is y]\n": err "invalid syntax. Got unexpected token 'x'" at 10
+118.1 "[xx async for x in y]\n": ok fa496b478e04ae3b
+118.2 "[x async for x inin y]withwith": err "invalid syntax. Got unexpected token 'inin'" at 15
+118.3 "[x async for x in y]\n    ": ok c64c8450b932f8a6
+118.4 "[x async for x  with\n": err "invalid syntax. Got unexpected token 'with'" at 16
+119.0 "[x for , in y]\n": err "invalid syntax. Got unexpected token ','" at 7
+119.1 "[x for xand in y]yield": err "invalid syntax. Got unexpected token 'yield'" at 17
+119.2 "inx for x, [ y]]\n\n": err "invalid syntax. Got unexpected token 'for'" at 4
+119.3 "lambdax for x, in #]\n": err "invalid syntax. Got unexpected token 'for'" at 8
+119.4 "[x for x,, in y]\n": err "invalid syntax. Got unexpected token ','" at 9
+120.0 "[x for x,, not { y]\n": err "invalid syntax. Got unexpected token ','" at 9
+120.1 "\nx forfor x, not in y][": err "invalid syntax. Got unexpected token 'forfor'" at 3
+120.2 "[x for x, not inin \n]\n": err "invalid syntax. Got unexpected token 'not'" at 10
+120.3 "[ for , not in \"\"\"]\n": err "invalid syntax. Got unexpected token 'for'" at 2
+120.4 "[x for xy not in ,]\n": err "invalid syntax. Got unexpected token 'not'" at 10
+121.0 "try::\n\n  in\n": err "invalid syntax. Got unexpected token ':'" at 4
+121.1 "try::\ninpass": err "invalid syntax. Got unexpected token ':'" at 4
+121.2 "trycase\n\n  passor": err "unexpected indent" at 9
+121.3 "try:\nexceptpass": err "expected an indented block" at 5
+121.4 "try:\n  except\n": err "invalid syntax. Got unexpected token 'except'" at 7
+122.0 ":\n  passpass\nexcept A, B:\n  passpass\n": err "invalid syntax. Got unexpected token ':'" at 0
+122.1 "try:  pass\nexcept A, B:\n    pass\n": err "invalid syntax. Got unexpected token ','" at 19
+122.2 "try:\n  pass\nexcept with, B:\n  pass\n": err "invalid syntax. Got unexpected token 'with'" at 19
+122.3 "try:\n  pass\n A, B:\n  pass\n": err "unindent does not match any outer indentation level" at 13
+122.4 "try:and  pass\nexcept A B:\n  passf\"{x!r:>{y}}\"": err "invalid syntax. Got unexpected token 'and'" at 4
+123.0 "try:\n  pass\nexcepttype A:\n  pass\nexcept b'b':\n  pass": err "invalid syntax. Got unexpected token 'excepttype'" at 12
+123.1 "try:pass  pass\nexcept A:\n  \n\nexcept B:\n  or\n": err "invalid syntax. Got unexpected token 'pass'" at 10
+123.2 "try:\n  pass\nexcept A:\n  pass\n B:\n  pass\n": err "unindent does not match any outer indentation level" at 30
+123.3 "try:\n  pass\nexceptexcept A:\n  pass\nexcept B::\n  pass\n": err "invalid syntax. Got unexpected token 'exceptexcept'" at 12
+123.4 ":]  pass\nexcept* A:\n    pass\nexcept B:\n  pass\n": err "invalid syntax. Got unexpected token ':'" at 0
+124.0 "try:\n  pass\nexcept A:else  \nexcept* Bwhile\n  pass\n": err "invalid syntax. Got unexpected token 'else'" at 21
+124.1 "try:\n    pass\nexcept A:\n  pass\nexcept* B:  pass\n": err "invalid syntax. Got unexpected token '*'" at 37
+124.2 "try:\n  pass\nexcept A:\n  pass\nexcept* B::\npass\n": err "invalid syntax. Got unexpected token '*'" at 35
+124.3 "try:\n  passpass\nexcept A\n  pass\nexcept* B::\n  pass\n": err "invalid syntax. Got unexpected token Newline" at 24
+124.4 "try:\n  pass\nexcept A:\n  <\nexcept* B:\n  pass\n": err "invalid syntax. Got unexpected token '<'" at 24
+125.0 "try:except  pass\n\n*:\n  pass\n": err "invalid syntax. Got unexpected token 'except'" at 4
+125.1 "try:\n  pass0xexcept*:!  pass\n": err "invalid syntax. Got unexpected token ':'" at 20
+125.2 "::\n  pass\nexceptf'{x}'try\n  pass\n": err "invalid syntax. Got unexpected token ':'" at 0
+125.3 "try:=  pass#except*:|  pass\n": err "invalid syntax. Got unexpected token ':='" at 3
+125.4 "try:  pass\nexcept*\ndelpass\n": err "invalid syntax. Got unexpected token Newline" at 18
+126.0 ":  pass\nelse:\n  \n\n": err "invalid syntax. Got unexpected token ':'" at 0
+126.1 "try:\n  pass\n\nelse:\n  pass\n": err "invalid syntax. Got unexpected token 'else'" at 13
+126.2 "try:=\n  pass\nelse:from  pass\n": err "invalid syntax. Got unexpected token ':='" at 3
+126.3 "try:\n  raise\n\nelse:\n  pass\n": err "invalid syntax. Got unexpected token 'else'" at 14
+126.4 ":\n  pass\nelse:(  \n": err "invalid syntax. Got unexpected token ':'" at 0
+127.0 "try:\n  pass\nfinally:\n\n  pass\nexcept:\n  pass\n": err "invalid syntax. Got unexpected token 'except'" at 29
+127.1 "try:\n  pass\nfinallyfinallyfinallyfinally:\n  pass\nexcept:  pass\n": err "invalid syntax. Got unexpected token 'finallyfinallyfinallyfinally'" at 12
+127.2 "try:\n  pass\nfinally:\n  pass\nexcept\n  pass\n\n": err "invalid syntax. Got unexpected token 'except'" at 28
+127.3 "try:\n  pass\nfinally:\n  pass\nexcept:==  pass\n": err "invalid syntax. Got unexpected token 'except'" at 28
+127.4 "try:\nifpass\nfinally:\n  pass\n:->  pass\n": err "expected an indented block" at 5
+128.0 "with a,  pass\n": err "invalid syntax. Got unexpected token 'pass'" at 9
+128.1 "with , \n pass:": err "invalid syntax. Got unexpected token ','" at 5
+128.2 "with (,  pass\n\n": err "invalid syntax. Got unexpected token ','" at 6
+128.3 "with aa  pass\n": err "invalid syntax. Got unexpected token 'pass'" at 9
+128.4 " a/ : pass1": err "unexpected indent" at 0
+129.0 "with (a, b) as celse pass\n": err "invalid syntax. Got unexpected token 'pass'" at 21
+129.1 " (a, b) as c: pass\n\n": err "unexpected indent" at 0
+129.2 "with (a, b) as c: f'{*a},\n": err "EOL while scanning string literal" at 26
+129.3 "with (, b) as }: pass\n\n": err "invalid syntax. Got unexpected token ','" at 6
+129.4 "; (a, b) as c: pass\n": err "invalid syntax. Got unexpected token ';'" at 0
+130.0 "with a raise b) + c: pass#": err "invalid syntax. Got unexpected token 'raise'" at 7
+130.1 "with (a as finally) + c: pass\n": err "invalid syntax. Got unexpected token 'finally'" at 11
+130.2 "with (a as b) + c, pass\n": err "invalid syntax. Got unexpected token '+'" at 14
+130.3 "with else == b) + c: (\n": err "invalid syntax. Got unexpected token 'else'" at 5
+130.4 "with (a as b: + c) pass\n": err "invalid syntax. Got unexpected token ':'" at 12
+131.0 ", (awith *elif) f'{*a}' c: pass\n": err "invalid syntax. Got unexpected token ','" at 0
+131.1 "import (a, *b)) as c: passawait": err "invalid syntax. Got unexpected token '('" at 7
+131.2 "with (a, *f'{*a}') as c: pass\n": ok 26c917885520c796
+131.3 "with (a, *1) as c: pass\n": ok 294a8e9dea60bc39
+131.4 "with (asas, **b) as c: pass\n": err "invalid syntax. Got unexpected token '**'" at 12
+132.0 "with a, *): pass\n": err "invalid syntax. Got unexpected token '*'" at 8
+132.1 "with (a, globalb): f\"{x!r:>{y}}\"\n\n": ok 4ba1d72fa21035bc
+132.2 "( withwitha, *b)): pass\n": err "Got unexpected nesting" at 17
+132.3 "with (else, *b): pass\n": err "invalid syntax. Got unexpected token 'else'" at 6
+132.4 " aa, *b): pass\n": err "unexpected indent" at 0
+133.0 "with (if x): pass1.5": err "invalid syntax. Got unexpected token 'if'" at 6
+133.1 "with (yieldyield x): pass": err "invalid syntax. Got unexpected token 'x'" at 17
+133.2 "f'{*aa}' (yield u'x'): pass\n": err "invalid syntax. Got unexpected token 'yield'" at 10
+133.3 "with (yield ): passpassor": ok 01964d7496f2cbeb
+133.4 "with (yieldyield f\"{x!r:>{y}}\"): pass\n": err "invalid syntax. Got unexpected token f\"{x!r:>{y}}\"" at 17
+134.0 "with (): pass'\\N{DASH}'": err "invalid syntax. Got unexpected token \"\\N{DASH}\"" at 13
+134.1 "with () \n": err "invalid syntax. Got unexpected token Newline" at 8
+134.2 "with :)( await\n": err "invalid syntax. Got unexpected token ':'" at 5
+134.3 "with (): passf\"{x!r:>{y}}\"": err "invalid syntax. Got unexpected token \"{x!r:>{y}}\"" at 14
+134.4 "with (): pass(": err "invalid syntax. Got unexpected token '('" at 13
+135.0 "with (a as b, c as d,,): pass\n": err "invalid syntax. Got unexpected token ','" at 21
+135.1 "  (a as b, c as d,):= pass\n": err "unexpected indent" at 0
+135.2 ": ( as b, c as def,)with pass\n": err "invalid syntax. Got unexpected token ':'" at 0
+135.3 "with (a as b, c as d,,,): pass\n": err "invalid syntax. Got unexpected token ','" at 21
+135.4 "with (a as b, c as dd,): passb'b'": err "invalid syntax. Got unexpected token \"b\"" at 30
+136.0 "with (a, return)= c: \t\n": err "invalid syntax. Got unexpected token 'return'" at 9
+136.1 "with ((a, b) c's' pass\n": err "invalid syntax. Got unexpected token 'c'" at 13
+136.2 "with dela, b), c: pass\n": err "Got unexpected nesting" at 13
+136.3 "raise (a, ) c: pass\n": err "invalid syntax. Got unexpected token 'c'" at 12
+136.4 " f\"{x!r:>{y}}\"a, bb), c: pass\n": err "unexpected indent" at 0
+137.0 "with (a) \\\n: pass\n": ok eed9b72bb5d173ac
+137.1 "with (a) cc: pass\n": err "invalid syntax. Got unexpected token 'cc'" at 9
+137.2 "with (a) c:= pass\n": err "invalid syntax. Got unexpected token 'c'" at 9
+137.3 "* (a) c pass\n\n": err "invalid syntax. Got unexpected token 'c'" at 6
+137.4 "with (a) #: pass\n": err "invalid syntax. Got unexpected token Newline" at 16
+138.0 "with 2a, f(x=1, (=)): pass\n": err "invalid syntax. Got unexpected token 'a'" at 6
+138.1 "with (a, f(x=11, x=2))): pass\n": err "keyword argument repeated: x" at 17
+138.2 "with (a, f(x=1, x==2)'s': pass\n": err "positional argument follows keyword argument" at 16
+138.3 "withwith casea, f(x=1, x=2)import: pass\n": err "invalid syntax. Got unexpected token 'casea'" at 9
+138.4 "with (a, f(x=1, x2)): pass\n": err "positional argument follows keyword argument" at 16
+139.0 "with ((a as b c): pass\n": err "invalid syntax. Got unexpected token 'as'" at 9
+139.1 "with (a as  c): pass\n": ok c506ad263c335fd2
+139.2 "with (a as b c): ": err "invalid syntax. Got unexpected token 'c'" at 13
+139.3 "with (aa as b c): not\n": err "invalid syntax. Got unexpected token 'c'" at 14
+139.4 "with (a as b ): pass\n": ok dcaaa8efeb83dab4
+140.0 "with  := b): pass\n": err "invalid syntax. Got unexpected token ':='" at 6
+140.1 "with (a := b ->\n": err "invalid syntax. Got unexpected token '->'" at 13
+140.2 "with witha := :)b pass\n": err "invalid syntax. Got unexpected token ':='" at 11
+140.3 "with (a  b): pass\n": err "invalid syntax. Got unexpected token 'b'" at 9
+140.4 "with (a := b): .": err "invalid syntax. Got unexpected token '.'" at 15
+141.0 "with elsex for x in except): pass\n": err "invalid syntax. Got unexpected token 'for'" at 11
+141.1 "\" (x for x * y): pass\n": err "EOL while scanning string literal" at 22
+141.2 "with (x for x rb'\\x' )for pass\n": err "invalid syntax. Got unexpected token rb\"\\x\"" at 14
+141.3 "with (x for x in y)elif pass\n": err "invalid syntax. Got unexpected token 'elif'" at 19
+141.4 "with (x for x in y\n: pass)": err "invalid syntax. Got unexpected token ':'" at 19
+142.0 "with a as bb, (c as d): pass\n": err "invalid syntax. Got unexpected token 'as'" at 17
+142.1 "with a as b, (c as d): \n": err "invalid syntax. Got unexpected token 'as'" at 16
+142.2 "with a  b, (c as d): pass\n": err "invalid syntax. Got unexpected token 'b'" at 8
+142.3 " a as with, (c as d): pass\n": err "unexpected indent" at 0
+142.4 "with a as bx (is as d): pass\n": err "invalid syntax. Got unexpected token 'is'" at 14
+143.0 "@\ndef ): pass\n": err "invalid syntax. Got unexpected token Newline" at 1
+143.1 "@\n f(): \n": err "invalid syntax. Got unexpected token Newline" at 1
+143.2 "@whiledef f(): pass\n": err "invalid syntax. Got unexpected token 'f'" at 10
+143.3 "@\n\ndef f(): pass\n": err "invalid syntax. Got unexpected token Newline" at 1
+143.4 "@\ndef f(): pass1.5": err "invalid syntax. Got unexpected token Newline" at 1
+144.0 "@d\nxx = 1\n": err "invalid syntax. Got unexpected token 'xx'" at 3
+144.1 "ord\nx = 11\n": ok 59b00793ecc6cc5b
+144.2 "@d\nx = 1": err "invalid syntax. Got unexpected token 'x'" at 3
+144.3 "@d\nxx = \n": err "invalid syntax. Got unexpected token 'xx'" at 3
+144.4 "@d's'x = 1\n": err "invalid syntax. Got unexpected token \"s\"" at 2
+145.0 "@d:async with x\n :=\n": err "invalid syntax. Got unexpected token ':'" at 2
+145.1 "@return\nasync with x: pass\n": err "invalid syntax. Got unexpected token 'return'" at 1
+145.2 "@d\nasync import x: pass[": err "invalid syntax. Got unexpected token 'import'" at 9
+145.3 "@drb'\\x'async with x: pass\n": err "invalid syntax. Got unexpected token \"\\x\"" at 4
+145.4 "@d\nasync with x: \npass": err "invalid syntax. Got unexpected token 'with'" at 9
+146.0 "@d def ffor): pass\n": err "invalid syntax. Got unexpected token 'def'" at 3
+146.1 "@d ; f\"\"\"): pass\n": err "invalid syntax. Got unexpected token ';'" at 3
+146.2 "@ def try(): pass\n": err "invalid syntax. Got unexpected token 'def'" at 2
+146.3 "d def f(): pass\n": err "invalid syntax. Got unexpected token 'def'" at 2
+146.4 "@d def f() pass    ": err "invalid syntax. Got unexpected token 'def'" at 3
+147.0 ", A(x=1class x=\"\"\"): pass\n": err "invalid syntax. Got unexpected token ','" at 0
+147.1 "class A(=1, x=2): pass\n": err "invalid syntax. Got unexpected token '='" at 8
+147.2 "class A(x=1, x=2)): pass\n": err "keyword argument repeated: x" at 13
+147.3 "class A(x=1, x=) pass\n": err "invalid syntax. Got unexpected token ')'" at 15
+147.4 "class A(x=1, x=2),{x!r:>{y}}\" pass\n": err "keyword argument repeated: x" at 13
+148.0 "class []: pass\n": err "invalid syntax. Got unexpected token '['" at 6
+148.1 "A_ return]: pass\n": err "invalid syntax. Got unexpected token 'return'" at 3
+148.2 "class [<: \n": err "invalid syntax. Got unexpected token '['" at 6
+148.3 "class A[]: passif": err "invalid syntax. Got unexpected token ']'" at 8
+148.4 "class A[[@: \n": err "invalid syntax. Got unexpected token '['" at 8
+149.0 " f[T,](): pass\n": err "unexpected indent" at 0
+149.1 "def ,[Tf](): pass\n": err "invalid syntax. Got unexpected token ','" at 4
+149.2 "def f[TT,,]() pass\n": err "invalid syntax. Got unexpected token ','" at 9
+149.3 "def f[\n,](): passT": err "invalid syntax. Got unexpected token ','" at 7
+149.4 ". f[T,=()if pass\n": err "invalid syntax. Got unexpected token '.'" at 0
+150.0 "def f[*T: int]]() pass\n": err "invalid syntax. Got unexpected token ':'" at 8
+150.1 "def f[*T: intin): pass\n": err "invalid syntax. Got unexpected token ':'" at 8
+150.2 "def f[*T: int](): pass\n\n": err "invalid syntax. Got unexpected token ':'" at 8
+150.3 "def f[*Tpass int](): :\n": err "invalid syntax. Got unexpected token 'int'" at 13
+150.4 "from f[*T: int](): pass\n": err "invalid syntax. Got unexpected token '['" at 6
+151.0 "type XX = \n\n": err "invalid syntax. Got unexpected token Newline" at 10
+151.1 "type X is \n": err "invalid syntax. Got unexpected token 'X'" at 5
+151.2 "type  = \n": err "invalid syntax. Got unexpected token Newline" at 8
+151.3 "type   \n": ok 5cf6503149f98ea5
+151.4 " X == del": err "unexpected indent" at 0
+152.0 "type X[] = [[T]\n": err "invalid syntax. Got unexpected token ']'" at 7
+152.1 "type XX[T] == list[T]|": err "invalid syntax. Got unexpected token 'XX'" at 5
+152.2 "type X[T] 's' list[T]\n": err "invalid syntax. Got unexpected token 'X'" at 5
+152.3 "typetype XT] = list[T]\n": err "invalid syntax. Got unexpected token 'XT'" at 9
+152.4 "type XX[T] = list[T]\n": ok 8fdc2d6c2195ca4e
+153.0 ";' = 1\n": err "invalid syntax. Got unexpected token ';'" at 0
+153.1 "type = 11\n": ok 06608f2d01ed005e
+153.2 "type = else\n": err "invalid syntax. Got unexpected token 'else'" at 7
+153.3 "type as =\n": err "invalid syntax. Got unexpected token 'as'" at 5
+153.4 "type raise 11\n": err "invalid syntax. Got unexpected token 'raise'" at 5
+154.0 "and X\n": err "invalid syntax. Got unexpected token 'and'" at 0
+154.1 "type X\n\n": err "invalid syntax. Got unexpected token 'X'" at 5
+154.2 "type X\n\n": err "invalid syntax. Got unexpected token 'X'" at 5
+154.3 "type XX\n": err "invalid syntax. Got unexpected token 'XX'" at 5
+154.4 "caseX": ok fae44cee03a99ba5
+155.0 "\n     \n:async  case 1:\n    pass\n": err "invalid syntax. Got unexpected token ':'" at 7
+155.1 "matchmatch x:\n  case 1\n:    pass\n": err "invalid syntax. Got unexpected token 'x'" at 11
+155.2 " x:\n  case 1:=\n    pass\n": err "unexpected indent" at 0
+155.3 "match x:\n  case 11:\n    pass;": ok f6571964bb2ffe7d
+155.4 "match x:\n  case 1:\n    passpass\n": ok 62f91925c9c81f14
+156.0 "match x:\ncase u'x': pass\n": err "expected an indented block" at 9
+156.1 "match x:\ncase 1:: pass": err "expected an indented block" at 9
+156.2 "\t x:\ncase try: pass\n": err "unexpected indent" at 0
+156.3 " xxxx:\ncase 1: pass\n": err "unexpected indent" at 0
+156.4 "match x:\ncase 1: }\n": err "expected an indented block" at 9
+157.0 "match x:\n  b'b'pass": err "invalid syntax. Got unexpected token b\"b\"" at 11
+157.1 "match x::for  pass\n": err "invalid syntax. Got unexpected token ':'" at 8
+157.2 "is /:\n  f'{x}'\n": err "invalid syntax. Got unexpected token 'is'" at 0
+157.3 "match x:\npass\n": err "expected an indented block" at 9
+157.4 "match x:\npass": err "expected an indented block" at 9
+158.0 "match x\n  case 1 @ 2 + 3: pass\n": err "invalid syntax. Got unexpected token 'x'" at 6
+158.1 " x:\ntypecase 1 + 2 + 3: pass\n": err "unexpected indent" at 0
+158.2 "match x:\n  case 11 + 2 f'{x}' 3: pass\n": err "invalid syntax. Got unexpected token f\"{x}\"" at 23
+158.3 "match x:\n  case try + 2 + 33$ pass\n": err "invalid syntax. Got unexpected token 'case'" at 11
+158.4 "match x:\n  case 1 + 2 + 3/ passmatch": err "invalid syntax. Got unexpected token 'case'" at 11
+159.0 "match x:  - casex:: pass\n": err "invalid syntax. Got unexpected token '-'" at 10
+159.1 "match x    \n\n  case )x: pass\n": err "invalid syntax. Got unexpected token 'x'" at 6
+159.2 "match x:\n  case -x: \n": err "invalid syntax. Got unexpected token 'x'" at 17
+159.3 "matchmatch x:in  case -x: pass\n": err "invalid syntax. Got unexpected token 'x'" at 11
+159.4 "match x:  case -x: pass\n": err "invalid syntax. Got unexpected token 'case'" at 10
+160.0 "pass x:;  case 1 - xdel match\n": err "invalid syntax. Got unexpected token 'x'" at 5
+160.1 "match xx:\n  case 1 - x: pass\n": err "invalid syntax. Got unexpected token 'x'" at 21
+160.2 "match x:\n  case 1 - f'{*a}': pass\n": err "invalid syntax. Got unexpected token f\"{*a}\"" at 20
+160.3 "match x:\n  case 1 - x: pass'\\N{DASH}'": err "invalid syntax. Got unexpected token 'x'" at 20
+160.4 "match (:\n  case 1 - x: pass\n": err "invalid syntax. Got unexpected token ':'" at 7
+161.0 "match x:\n  ; a as _:: pass\n": err "invalid syntax. Got unexpected token ';'" at 11
+161.1 "matchmatch x:\n  case a as _: pass\n": err "invalid syntax. Got unexpected token 'x'" at 11
+161.2 "match x:\n  case  as _: pass\n": err "invalid syntax. Got unexpected token 'as'" at 17
+161.3 "match x:\n  case a  _: pass\n": err "invalid syntax. Got unexpected token '_'" at 19
+161.4 " x::\n  case ] as _: pass\n": err "unexpected indent" at 0
+162.0 ") x:\n  case {a: 1}: pass\n": err "Got unexpected nesting" at 1
+162.1 "match x:\n  case {a: f'{f'{'}'}}: pass\n": err "invalid syntax. Got unexpected token 'case'" at 11
+162.2 "match x:\n  case {a: 1}: pass\n\n": err "invalid syntax. Got unexpected token ':'" at 18
+162.3 "match x:\n  casecase {a: -: pass\n": err "invalid syntax. Got unexpected token 'casecase'" at 11
+162.4 "match x:\n  case {a: 1}: passpass\n": err "invalid syntax. Got unexpected token ':'" at 18
+163.0 "match x:1  case {**r, 'a': \n}: pass\n": err "invalid syntax. Got unexpected token '1'" at 8
+163.1 "match x:\n  { case**r, \n    : 1}* pass\n": err "invalid syntax. Got unexpected token '{'" at 11
+163.2 "match x:\n  case raise**r, 'a': 1}: pass\n": err "invalid syntax. Got unexpected token 'raise'" at 16
+163.3 "match x:\nglobalcase \\\n**r, 'a': 1}: pass\n": err "expected an indented block" at 9
+163.4 "match     :\n  case {**r, 'a': 1}: pass\n": err "invalid syntax. Got unexpected token Newline" at 11
+164.0 "match try:*  $ {, }: pass\n": err "invalid syntax. Got unexpected token 'try'" at 6
+164.1 "match x:\n  case (, }:: pass\n": err "invalid syntax. Got unexpected token ','" at 17
+164.2 "match \n  case {, }: pass\n": err "unexpected indent" at 7
+164.3 " x:\n  case {, }: pass\n": err "unexpected indent" at 0
+164.4 "match x:\n  case }, {: \n": err "invalid syntax. Got unexpected token 'case'" at 11
+165.0 "match x:\n  case C(a=1,, b): pass\n": err "invalid syntax. Got unexpected token ','" at 22
+165.1 "match x:\n  case CC(aif1, b): pass\n\n": ok dbe677cd37f1e65b
+165.2 "match x:\n  case Ca=1, (): pass\n": err "invalid syntax. Got unexpected token '='" at 18
+165.3 "match =:\n  case C(ax1\n b): pass]": err "invalid syntax. Got unexpected token '='" at 6
+165.4 " x:\n  case C(a=1, b): f\"{x!r:>{y}}\"\n": err "unexpected indent" at 0
+166.0 "match x:\n  case C(a=1, 2:: \n": err "invalid syntax. Got unexpected token 'case'" at 11
+166.1 "match x\n  '\\N{DASH}' C(a=1, 2): pass\n": err "invalid syntax. Got unexpected token 'x'" at 6
+166.2 "match x:1  case C(a=\n, 2): pass\n": err "invalid syntax. Got unexpected token '1'" at 8
+166.3 "match :x\n  case C(a=1, ):: pass\n": err "unexpected indent" at 9
+166.4 "match xawait\nwhilecase C]a=1, 2): pass\n": err "invalid syntax. Got unexpected token 'xawait'" at 6
+167.0 "a x:\n  case (match b): \n": err "invalid syntax. Got unexpected token 'x'" at 2
+167.1 "match x:\n  casecase (a ): pass\n\n": err "invalid syntax. Got unexpected token 'casecase'" at 11
+167.2 "match x:\n  case (a ): pass\n": ok 699bc575c8b54a0f
+167.3 "match x:\n\ncase (a b): pass  ": err "expected an indented block" at 10
+167.4 "match x:  case (aaaa b): pass\n": err "invalid syntax. Got unexpected token 'case'" at 10
+168.0 "match x->\n  case [,]< pass\n": err "invalid syntax. Got unexpected token 'x'" at 6
+168.1 "match   :\nxcase [,while pass\n": err "invalid syntax. Got unexpected token Newline" at 9
+168.2 "match x:\n  case as,]: pass\n": err "invalid syntax. Got unexpected token 'case'" at 11
+168.3 "match x:\n  except pass,]: [\n": err "invalid syntax. Got unexpected token 'except'" at 11
+168.4 "match x:\n:as,]: pass\n": err "expected an indented block" at 9
+169.0 "match x:\n  case *a | b: pass's'": err "invalid syntax. Got unexpected token \"s\"" at 28
+169.1 "@ x:\n  case *a | bcase pass\n": err "invalid syntax. Got unexpected token ':'" at 3
+169.2 "match xis\n  case defa | b: pass\n": err "invalid syntax. Got unexpected token 'xis'" at 6
+169.3 "match x:\n  casecase *a | b passpass\n": err "invalid syntax. Got unexpected token 'casecase'" at 11
+169.4 "match x:\n  case *global | b: pass\n": err "invalid syntax. Got unexpected token 'global'" at 17
+170.0 "match x :\ncase a: pass\n\n": err "expected an indented block" at 10
+170.1 "match x, :\n  case a: pass\n": ok bb01a3ea4995e889
+170.2 "matchmatch x, :\n  case a: f'{'": err "invalid syntax. Got unexpected token 'x'" at 11
+170.3 "match x, :\n   a: pass\n": err "invalid syntax. Got unexpected token 'a'" at 14
+170.4 "match x, \n  case a: \n": err "invalid syntax. Got unexpected token 'x'" at 6
+171.0 "match x,, :\n  case a: passf'{'": err "invalid syntax. Got unexpected token ','" at 8
+171.1 "match pass,, :\n  case a: x\n": err "invalid syntax. Got unexpected token 'pass'" at 6
+171.2 "match x,, :\n a: case\n": err "invalid syntax. Got unexpected token ','" at 8
+171.3 "match _,, :\n  case a: pass\n": err "invalid syntax. Got unexpected token ','" at 8
+171.4 "x,, :\n  case a pass\n": err "invalid syntax. Got unexpected token ','" at 2
+172.0 "match x, y:case  \n ab , if a: pass\n  case _: passpass\n": err "invalid syntax. Got unexpected token 'case'" at 11
+172.1 "match x, y:\ncase a, b if a: pass\n  case _: pass\n": err "expected an indented block" at 12
+172.2 "match x, y:\n  case ,, b if a: pass\n  case _: pass\n": err "invalid syntax. Got unexpected token ','" at 19
+172.3 "rb'\\x'! x, y:\n  case a, b $ a: pass\n  case _: pass\n": err "Got unexpected token !" at 6
+172.4 "match x\n y:,  case a, b if a: pass\n  case _: pass\n": err "invalid syntax. Got unexpected token 'x'" at 6
+173.0 "match x:\n  case a.b.c(d- e=f): pass\n  case {1: a, 'b''b': c, **d}: pass\n  case [a, *_]: pass\n": err "invalid syntax. Got unexpected token '-'" at 23
+173.1 "match x:\n  case a.b.c(d, e=f): pass\n  case {1: a, 'b': c, **d}: \n  case [a, *_]: pass{": err "expected an indented block" at 67
+173.2 "matchmatch x:\n  case a.b.c(d, e=f): pass\n  case {1: a, 'b': c, **dpass: }\n  case [a, *_]: passlambda": err "invalid syntax. Got unexpected token 'x'" at 11
+173.3 " x:\n  case a.b.c(d, e=f): pass\n  case {1: a 'b': c, **d}: pass\n  case [a, *_]: pass\n": err "unexpected indent" at 0
+173.4 "match *:\n  case a.b.c(d, e=f): pass\n  case {1: a, 'b': c, **d}: pass\n  case [a, x_]: pass\n": err "invalid syntax. Got unexpected token ':'" at 7
+174.0 "match x:\n  case (a): pass\n  case (): pass\n  case (a,): pass\n  case (afrom b->->): pass\n": err "invalid syntax. Got unexpected token 'b'" at 74
+174.1 "match x:\n  case (a): while\n  case (): pass\n  case (a,): pass\n  case (a, b,): pass\n": err "invalid syntax. Got unexpected token 'while'" at 21
+174.2 "match x:\n  case (with): pass\n  case (): pass\n  case (a,with: pass\n  case (a, b,): pass\n": err "invalid syntax. Got unexpected token 'with'" at 17
+174.3 "match x:case  case (a): pass\n   case): pass\n  case (a,): pass\n  case (a, b,): pass\n": err "invalid syntax. Got unexpected token 'case'" at 8
+174.4 "match ,:  case (a): pass\n  case (): pass\n  case (ax)case pass\n  : (a, b,): pass\n": err "invalid syntax. Got unexpected token ','" at 6
+175.0 "match x:\n  case None | True | False ) -1 | 1.5 | 2j | -1 + 2j | 'a' 'b': pass\n": err "invalid syntax. Got unexpected token 'case'" at 11
+175.1 "match x:\n  case None | True | False | -1 | 1.5 | 2j | -1 + 2j ( 'a' 'b': pass\n": err "invalid syntax. Got unexpected token 'case'" at 11
+175.2 "match x:\n  case None | True | False | -1 | 1.5 | 2j | --1 + 2j | 'a' 'b': pass\n": err "invalid syntax. Got unexpected token '-'" at 55
+175.3 "match x:\nx' None | True | False | -1 | 1.5 | 2j | -1 + 2j | 'a' 'b': pass\n": err "expected an indented block" at 9
+175.4 "match x:\n  case 1.5 | True | False | -1 | None | 2j | '\\N{DASH}'1 + 2j | 'a' 'b': pass\n": err "invalid syntax. Got unexpected token '1'" at 64
+176.0 "match x:\n  ' b'a' 'b': <\n": err "invalid syntax. Got unexpected token \" b\"" at 11
+176.1 "match x:\n    case b'a' 'b': pass\n": err "cannot mix bytes and nonbytes literals" at 18
+176.2 "match xcase\n  : b'a' 'b': pass\n": err "invalid syntax. Got unexpected token 'xcase'" at 6
+176.3 "match xx:\"\"\"  case b'a' 'b': pass": err "unexpected EOF while parsing" at 33
+176.4 "match x:\n  case \n f'{' passb'a'": err "invalid syntax. Got unexpected token 'case'" at 11
+177.0 "match x:  case b'a' 'b' x: pass\n": err "invalid syntax. Got unexpected token 'case'" at 10
+177.1 "match x:\n  case b'a' 'b' : pass\n": err "cannot mix bytes and nonbytes literals" at 16
+177.2 "match x  case b'a' 'b' x: passpass\n": err "invalid syntax. Got unexpected token 'case'" at 9
+177.3 "match x:\nb'a'case b'a'   'b' xnot pass\n": err "expected an indented block" at 9
+177.4 "match :\nb'a'case    'b' x: passpass\n": err "invalid syntax. Got unexpected token Newline" at 7
+178.0 "match x:\n  case { 'b': 1}: pass\n": ok 58776ce0f954957e
+178.1 "match x:\n  case {b'a' 'b': }: pass\n": err "cannot mix bytes and nonbytes literals" at 17
+178.2 "match :\n  case {b'a' return: 1} pass\n": err "invalid syntax. Got unexpected token Newline" at 7
+178.3 "match x:\n  case {: 'b': 1}b'a' pass\n": err "invalid syntax. Got unexpected token 'case'" at 11
+178.4 "match x:\n  casecase {b'a' 'b': 1}: pass\n": err "invalid syntax. Got unexpected token 'casecase'" at 11
+179.0 "match x:\n  case b'a' 'b' 1}: pass\n": err "invalid syntax. Got unexpected token 'case'" at 11
+179.1 "matchmatch :\n  case {b'a'  1}: pass\n": err "invalid syntax. Got unexpected token Newline" at 12
+179.2 "match x:\n  case {b'a' 'b' 1elif: pass\n": err "invalid syntax. Got unexpected token 'case'" at 11
+179.3 "- x:\n  \n {b'a' 'b''b' 1}: passcase": err "invalid syntax. Got unexpected token Newline" at 4
+179.4 "match x:\n  case {b'a' 'b' 1}: pass,": err "invalid syntax. Got unexpected token '1'" at 26
+180.0 "match x:\n  case a as import b: pass\n": err "invalid syntax. Got unexpected token 'import'" at 21
+180.1 "match x:\n  case a  _ b: pass\n": err "invalid syntax. Got unexpected token '_'" at 19
+180.2 "a x:\n  case match as _ b: \n": err "invalid syntax. Got unexpected token 'x'" at 2
+180.3 "match xx:\n  case a as _ b: pass": err "invalid syntax. Got unexpected token 'b'" at 24
+180.4 "match x:\n   a as _ b: passdel": err "invalid syntax. Got unexpected token 'a'" at 12
+181.0 " await:\n  case (a as _): pass\n": err "unexpected indent" at 0
+181.1 "match x:\n  case (a as _): \n": err "cannot use '_' as a target" at 17
+181.2 "match x:\n  case (a as _):: pass\n": err "cannot use '_' as a target" at 17
+181.3 ": match:\nasynccase (a as _)x pass\n": err "invalid syntax. Got unexpected token ':'" at 0
+181.4 ") x:yield  case (a as _match): pass\n": err "Got unexpected nesting" at 1
+182.0 "with  'b': pass\n": ok 6fd03e08a28af08c
+182.1 "withwith b'a' 'b': return\n": err "invalid syntax. Got unexpected token b\"a\"" at 9
+182.2 "withwith b'a' 'b':: pass\n": err "invalid syntax. Got unexpected token b\"a\"" at 9
+182.3 "with b'a' :'b' 0x\n": err "ParseBigIntError { kind: Empty }" at 15
+182.4 "with b'a' :'b' pass\n": err "invalid syntax. Got unexpected token 'pass'" at 15
+183.0 "  [ 'b'\n": err "unexpected indent" at 0
+183.1 "withwith b'a' \n    \n\n": err "invalid syntax. Got unexpected token b\"a\"" at 9
+183.2 "with is 'b'\n": err "invalid syntax. Got unexpected token 'is'" at 5
+183.3 " ] 'b'\n": err "Got unexpected nesting" at 2
+183.4 "with is \n'b'": err "invalid syntax. Got unexpected token 'is'" at 5
+184.0 "with (*a))\n": err "Got unexpected nesting" at 10
+184.1 "with (a)1": err "invalid syntax. Got unexpected token '1'" at 8
+184.2 "from (*a)\n": err "invalid syntax. Got unexpected token '('" at 5
+184.3 "with (*f'{*a}'')\n": err "EOL while scanning string literal" at 17
+184.4 "with (**a)for": err "invalid syntax. Got unexpected token 'for'" at 10
+185.0 "with (**a)): pass\n": err "Got unexpected nesting" at 11
+185.1 "with (**a): pass": err "cannot use double starred expression here" at 6
+185.2 "\n (**: passwith": err "unexpected indent" at 1
+185.3 "with (**a)} pass\n": err "Got unexpected nesting" at 11
+185.4 "with (**a):= \npass": err "invalid syntax. Got unexpected token ':='" at 10
+186.0 "with (\na) as : passnot": err "invalid syntax. Got unexpected token ':'" at 13
+186.1 "with (*a)) asas b: pass\n": err "Got unexpected nesting" at 10
+186.2 "with (*aa))  b: pass\n": err "Got unexpected nesting" at 11
+186.3 "with (*a)  b: pass\n": err "invalid syntax. Got unexpected token 'b'" at 11
+186.4 "(*a) as b: pass\n": err "cannot use starred expression here" at 1
+187.0 " {\n": err "unexpected indent" at 0
+187.1 "case]{ax}' except\n": err "Got unexpected nesting" at 5
+187.2 "f'{except!x}' a\n": err "invalid syntax. Got unexpected token 'a'" at 14
+187.3 "f'{''{a!x} except\n": err "EOL while scanning string literal" at 18
+187.4 "f'{a!'f'{a!'}x except\n": err "Got unexpected nesting" at 13
+188.0 "(*a) f'{x}' b\n": err "invalid syntax. Got unexpected token f\"{x}\"" at 5
+188.1 "(a) as b\n": err "invalid syntax. Got unexpected token 'as'" at 4
+188.2 "(*a) while b\n": err "invalid syntax. Got unexpected token 'while'" at 5
+188.3 "(ba) \t *\n": err "invalid syntax. Got unexpected token Newline" at 8
+188.4 "(*a)  b\n\n": err "invalid syntax. Got unexpected token 'b'" at 6
+189.0 "(((**a)\n": err "unexpected EOF while parsing" at 8
+189.1 "(**a)f'{'": err "invalid syntax. Got unexpected token f\"{\"" at 5
+189.2 "(**a)return": err "invalid syntax. Got unexpected token 'return'" at 5
+189.3 "(**a\n": err "unexpected EOF while parsing" at 5
+189.4 "****\"\"\")\n": err "invalid syntax. Got unexpected token '**'" at 0
+190.0 "def f(:, a) xa pass\n": err "invalid syntax. Got unexpected token ':'" at 6
+190.1 "def f(a, \t) x pass\n": err "invalid syntax. Got unexpected token 'x'" at 12
+190.2 "def f(a, case) x: )": err "invalid syntax. Got unexpected token 'x'" at 15
+190.3 "def f(a, apass x: )\n": err "invalid syntax. Got unexpected token 'x'" at 15
+190.4 "def ff(a,, a< x: pass\n": err "invalid syntax. Got unexpected token ','" at 9
+191.0 "def (a, a) -> x:: pass\n": err "invalid syntax. Got unexpected token '('" at 4
+191.1 "def f(a, a) \" x: passpass\n": err "EOL while scanning string literal" at 26
+191.2 "def (a ) -> x: pass\n": err "invalid syntax. Got unexpected token '('" at 4
+191.3 "def f(a, a) \n -: pass->": err "invalid syntax. Got unexpected token Newline" at 12
+191.4 "def f(a, a) -> : pass\n": err "duplicate argument 'a' in function definition" at 9
+192.0 "lambda a, a{ 00 2j\n": err "invalid syntax. Got unexpected token '{'" at 11
+192.1 "lambdalambda a,, a: 0 except\n": err "invalid syntax. Got unexpected token 'a'" at 13
+192.2 "as a00 a: , except\n": err "invalid syntax. Got unexpected token 'as'" at 0
+192.3 "a lambda, a: 0 f\"{x!r:>{y}}\"\n\n": err "invalid syntax. Got unexpected token 'lambda'" at 2
+192.4 "except =, a: 0 except\n": err "invalid syntax. Got unexpected token 'except'" at 0
+193.0 "  finally = \n": err "unexpected indent" at 0
+193.1 "2jxx  1\n": err "invalid syntax. Got unexpected token 'xx'" at 2
+193.2 "=x    $": err "invalid syntax. Got unexpected token '='" at 0
+193.3 "  x # 1\n": err "unexpected indent" at 0
+193.4 "  x  1111\n": err "unexpected indent" at 0
+194.0 "x = 1\n    y ' 2\n": err "unexpected indent" at 6
+194.1 "x = 1\n    \n = 2y": err "unexpected indent" at 11
+194.2 "x = 1\n    yy = except\n": err "unexpected indent" at 6
+194.3 "      = 1\nx= 2\n\n": err "unexpected indent" at 0
+194.4 "x = 1\n        y  2\n": err "unexpected indent" at 6
+195.0 "if \n    a\n  b\n": err "invalid syntax. Got unexpected token Newline" at 3
+195.1 "if x]    \na  b\n": err "Got unexpected nesting" at 5
+195.2 "if -:\n\n    \"\"\"\n  b\n": err "invalid syntax. Got unexpected token ':'" at 4
+195.3 "if x:\n\n    '\\N{DASH}'\n  b\n": err "(unicode error) \\N{DASH}: unknown Unicode character name (this build knows common names only; spell the character or use \\u/\\U)" at 15
+195.4 "if x:else    a\n  b\n": err "invalid syntax. Got unexpected token 'else'" at 5
+196.0 "if x:\taa\n        b": err "unexpected indent" at 9
+196.1 "if x|\na\n        b\n": err "invalid syntax. Got unexpected token Newline" at 5
+196.2 "if x\n\ta\n        b\n": err "invalid syntax. Got unexpected token Newline" at 4
+196.3 "if xxa\n\t:\n        b\n": err "invalid syntax. Got unexpected token Newline" at 6
+196.4 "if x:\na\n        #": err "expected an indented block" at 6
+197.0 " = 'unterminated\n": err "unexpected indent" at 0
+197.1 "x  'unterminated\n": err "EOL while scanning string literal" at 17
+197.2 "x == 'unterminated\n": err "EOL while scanning string literal" at 19
+197.3 "xx x 'unterminated\n": err "invalid syntax. Got unexpected token 'x'" at 3
+197.4 "x f'{*a}' 'unterminated\n": err "invalid syntax. Got unexpected token f\"{*a}\"" at 2
+198.0 "x  \"\"\"never closed\n": err "unexpected EOF while parsing" at 19
+198.1 "for elifelif \"\"\"never closed\n": err "unexpected EOF while parsing" at 29
+198.2 "yield] = \"\"\"never closed\n": err "Got unexpected nesting" at 6
+198.3 "xx = \"\"\"never closed\n": err "unexpected EOF while parsing" at 21
+198.4 "xx $ \"\"\"never closed\n": err "Got unexpected token $" at 4
+199.0 " = 1 $ 2\n": err "unexpected indent" at 0
+199.1 ",= 1 $ 2\n": err "invalid syntax. Got unexpected token ','" at 0
+199.2 "== x 1 $ 2\n": err "invalid syntax. Got unexpected token '=='" at 0
+199.3 "and = 1 $ 2\n": err "invalid syntax. Got unexpected token 'and'" at 0
+199.4 "@  1 $ 2\n": err "Got unexpected token $" at 6
+200.0 "xx ] 0x\n": err "Got unexpected nesting" at 4
+200.1 "x * 0x\n": err "ParseBigIntError { kind: Empty }" at 4
+200.2 " = 0x\n": err "unexpected indent" at 0
+200.3 "( x 0x\n": err "ParseBigIntError { kind: Empty }" at 4
+200.4 "\t = 0x\n": err "unexpected indent" at 0
+201.0 "x = _.": err "invalid syntax. Got unexpected token Newline" at 6
+201.1 " = 1\n": err "unexpected indent" at 0
+201.2 " for 1try\n": err "unexpected indent" at 0
+201.3 "x = |_\n": err "invalid syntax. Got unexpected token '|'" at 4
+201.4 "x = 1\n": ok 7c900c09fc6f3cc1
+202.0 "\ndefdef": ok dfae90ead485aed3
+202.1 "\n": ok 09612b07b5ecb5a5
+202.2 "f'{'(": err "f-string: expecting '}'" at 3
+202.3 "f'{'\n\n": err "f-string: expecting '}'" at 3
+202.4 "for\n": err "invalid syntax. Got unexpected token Newline" at 3
+203.0 "f'|rb'\\x'!x}'\n": err "unexpected character after line continuation character" at 7
+203.1 "f'{ax}'\n": ok 972154e3d48b2e5b
+203.2 "f'{a!x}}'\n": err "f-string: invalid conversion character" at 6
+203.3 "f'{{a!}'\n\n": err "f-string: single '}' is not allowed" at 7
+203.4 "f'a!x}'": err "f-string: single '}' is not allowed" at 6
+204.0 "whilef\n": ok 471b3e5678b29af4
+204.1 "f'{*a}\n": err "EOL while scanning string literal" at 7
+204.2 "f'{a}'\n": ok e40e0c4b3fdbcb9b
+204.3 "={*a}'\n": err "invalid syntax. Got unexpected token '='" at 0
+204.4 "f'{*\n'}": err "EOL while scanning string literal" at 5
+205.0 "f'{aa bb'b'';": err "cannot mix bytes and nonbytes literals" at 0
+205.1 "f'{a b*'\n": err "f-string: expecting '}'" at 7
+205.2 "f'{a 'f'{a '\n": err "f-string: expecting '}'" at 5
+205.3 "f'!a b}'\n": err "f-string: single '}' is not allowed" at 7
+205.4 "asyncf'awaita b}'\n": err "invalid syntax. Got unexpected token \"awaita b}\"" at 6
+206.0 "pass'{}\n": err "EOL while scanning string literal" at 8
+206.1 "{b'b'b'b''\n": err "EOL while scanning string literal" at 11
+206.2 "}{f''\n": err "Got unexpected nesting" at 1
+206.3 "f'{'\n": err "f-string: expecting '}'" at 3
+206.4 "yieldf'{}\n": err "EOL while scanning string literal" at 10
+207.0 "f'{a:b:{c}}}'\n": err "f-string: single '}' is not allowed" at 12
+207.1 "#\n": ok 09612b07b5ecb5a5
+207.2 "['{a:{b:{c}}}.\n": err "EOL while scanning string literal" at 15
+207.3 "\n": ok 09612b07b5ecb5a5
+207.4 "f'{a:{b:{c}}}''\n": err "EOL while scanning string literal" at 16
+208.0 "f'{x=}' async{y!:r>10}'\n": err "invalid syntax. Got unexpected token 'async'" at 8
+208.1 "f'x=}' f'{y!r:>10}'\n": err "f-string: single '}' is not allowed" at 5
+208.2 "f'{x=}'' f'{y!r:>10}'\n": err "invalid syntax. Got unexpected token '{'" at 11
+208.3 "f'x=}' f'{y!not:>10}'\n": err "f-string: single '}' is not allowed" at 5
+208.4 "f'{x=}' is{y!r:>10}'\n": err "Got unexpected token !" at 12
+209.0 "{:lambda 1}'\n": err "invalid syntax. Got unexpected token ':'" at 1
+209.1 "f'{lambda:\n}' 1": err "EOL while scanning string literal" at 11
+209.2 "f'{lambda: 1}@'\n": err "f-string: invalid syntax. Got unexpected token ')'" at 3
+209.3 "f'lambda:,}'\n": err "f-string: single '}' is not allowed" at 11
+209.4 "f'{lambdalambda: 1}'\n": ok 96726f734af7dacb
+210.0 "{}'\n": err "EOL while scanning string literal" at 4
+210.1 "f'{yieldf'{x}''\n": err "invalid syntax. Got unexpected token '{'" at 10
+210.2 "f'{yield}\n": err "EOL while scanning string literal" at 10
+210.3 "\\\n\n": ok 09612b07b5ecb5a5
+210.4 "f'{yieldyield}''\n": err "EOL while scanning string literal" at 17
+211.0 "f'{(x '\\N{DASH}' 1)    '\n": err "unexpected character after line continuation character" at 8
+211.1 "f'{(x := 1)};\n": err "EOL while scanning string literal" at 14
+211.2 "\n    )f'{(x := 1)}class\n": err "Got unexpected nesting" at 6
+211.3 "f'{(x := 1)}\n": err "EOL while scanning string literal" at 13
+211.4 "f'{:} x= 1)'\n": err "f-string: empty expression not allowed" at 5
+212.0 "while\n": err "invalid syntax. Got unexpected token Newline" at 5
+212.1 "\n'\\N{NOT A REAL NAME}'": err "(unicode error) \\N{NOT A REAL NAME}: unknown Unicode character name (this build knows common names only; spell the character or use \\u/\\U)" at 5
+212.2 "**is": err "invalid syntax. Got unexpected token '**'" at 0
+212.3 "'\\N{NOT A REAL NAME}'": err "(unicode error) \\N{NOT A REAL NAME}: unknown Unicode character name (this build knows common names only; spell the character or use \\u/\\U)" at 4
+212.4 "'\\N{NOT A REAL NAME}''\\N{NOT A REAL NAME}''\\N{NOT A REAL NAME}''\\N{NOT A REAL NAME}'\n": err "(unicode error) \\N{NOT A REAL NAME}: unknown Unicode character name (this build knows common names only; spell the character or use \\u/\\U)" at 4
+213.0 "xx 0x =\n": err "ParseBigIntError { kind: Empty }" at 3
+213.1 " = type\n": err "unexpected indent" at 0
+213.2 "xx = (\n": err "unexpected EOF while parsing" at 7
+213.3 "_\\x'' = (\n": err "unexpected character after line continuation character" at 2
+213.4 "x == (\n": err "unexpected EOF while parsing" at 7
+214.0 "x , [1,\n  2=\n": err "invalid syntax. Got unexpected token '='" at 11
+214.1 "x = u'x'1,\n  def,\n": err "invalid syntax. Got unexpected token '1'" at 8
+214.2 "x == [<,\n  2,\n": err "invalid syntax. Got unexpected token '<'" at 6
+214.3 "xx = 1,\n  2import\n": err "unexpected indent" at 8
+214.4 "x = [1,\n  \t|\n": err "invalid syntax. Got unexpected token '|'" at 11
+215.0 "": ok 09612b07b5ecb5a5
+215.1 "": ok 09612b07b5ecb5a5
+215.2 "": ok 09612b07b5ecb5a5
+215.3 "f'{*a}'": ok edc245b715dca866
+215.4 "'s'(": err "unexpected EOF while parsing" at 4
+216.0 "x)": err "Got unexpected nesting" at 2
+216.1 "else)": err "invalid syntax. Got unexpected token 'else'" at 0
+216.2 "return)": err "Got unexpected nesting" at 7
+216.3 "pass)": err "Got unexpected nesting" at 5
+216.4 "or)": err "invalid syntax. Got unexpected token 'or'" at 0
+217.0 "": ok 09612b07b5ecb5a5
+217.1 "(": err "unexpected EOF while parsing" at 1
+217.2 "lambda": err "invalid syntax. Got unexpected token Newline" at 6
+217.3 "\t": ok 09612b07b5ecb5a5
+217.4 "u'x'u'x'": ok 13ca869b17ff6440
+218.0 "whilewhile": ok 190c1768143f885d
+218.1 "f\"{x!r:>{y}}\"\"\"\"": err "unexpected EOF while parsing" at 16
+218.2 "'\\N{DASH}'": err "(unicode error) \\N{DASH}: unknown Unicode character name (this build knows common names only; spell the character or use \\u/\\U)" at 4
+218.3 "": ok 09612b07b5ecb5a5
+218.4 "0x": err "ParseBigIntError { kind: Empty }" at 0
+219.0 "}\n\n\n": err "Got unexpected nesting" at 1
+219.1 "]\n\n\n": err "Got unexpected nesting" at 1
+219.2 "\nfrom\n\n": err "invalid syntax. Got unexpected token Newline" at 5
+219.3 "x\n\n\n": ok e122b0e017847121
+219.4 "\norimport\n": ok 2e552414c2153fa1
+220.0 "pass;;;\n": err "invalid syntax. Got unexpected token ';'" at 5
+220.1 "passpass;;": err "invalid syntax. Got unexpected token ';'" at 9
+220.2 "pass\n;;": err "invalid syntax. Got unexpected token ';'" at 5
+220.3 "pass;;in": err "invalid syntax. Got unexpected token ';'" at 5
+220.4 ";;;pass\n": err "invalid syntax. Got unexpected token ';'" at 0
+221.0 "pass; pass;;\n": err "invalid syntax. Got unexpected token ';'" at 11
+221.1 "pass; pass\n": ok 867359bb35556090
+221.2 "\n pass;;pass": err "unexpected indent" at 1
+221.3 "passpass; \n": ok b8e83ad4dff2c049
+221.4 "pass; pass;;\n": err "invalid syntax. Got unexpected token ';'" at 11
+222.0 "b = a = c = d\n": ok 3f339034257ae666
+222.1 "a = /  c == d\n": err "invalid syntax. Got unexpected token '/'" at 4
+222.2 " = b = c == rb'\\x'\n": err "unexpected indent" at 0
+222.3 "aa = b = c : d\n": err "invalid syntax. Got unexpected token ':'" at 11
+222.4 "a ==== b \"\"\" c = d\n": err "invalid syntax. Got unexpected token '=='" at 4
+223.0 "x = *a, **b\n": err "invalid syntax. Got unexpected token '**'" at 8
+223.1 "x , *f\"{x!r:>>{y}}\"= *b\n": ok 402c2bcaddd6b551
+223.2 "x = ,a* *-\n": err "invalid syntax. Got unexpected token ','" at 4
+223.3 "x = *\n, *[\n": err "invalid syntax. Got unexpected token Newline" at 5
+223.4 "x = *a *b\n": ok bfc49e3bd8855406
+224.0 "for *, b in c: *\n": err "invalid syntax. Got unexpected token ','" at 5
+224.1 "for *a, b ) @: passpass\n": err "Got unexpected nesting" at 11
+224.2 ", afor b < c: pass\n": err "invalid syntax. Got unexpected token ','" at 0
+224.3 "for *a, b in ccrb'\\x' \n": err "invalid syntax. Got unexpected token \"\\x\"" at 17
+224.4 "* fora, b in : passx": err "invalid syntax. Got unexpected token ':'" at 13
+225.0 "print(a, *b, c==1, **d, e=2)\n": ok c73a7e1b2088ca71
+225.1 "print(a, *, c=1, **d, e=2)\\\n": err "invalid syntax. Got unexpected token ','" at 10
+225.2 "print(a, {b, c=f\"{x!r:>*y}}\", **d, e=2)\n": err "invalid syntax. Got unexpected token '='" at 14
+225.3 "d(a, *b, c=1, **print, e=2)\n": ok a77edf2605822d09
+225.4 "(d, *b, c=1, **a, e=2)\n": err "invalid syntax. Got unexpected token '='" at 9
+226.0 "def f(a, /, bdef1, *c, d e=2, **ff): pass\n": err "invalid syntax. Got unexpected token 'e'" at 25
+226.1 "def f(a, /, b=f\"{x!r:>{y}}\", *c, d, e=2, **f): pass\n": ok 9c6f52cb64f30ece
+226.2 "def b(a, /, f=1) *c, d, e2, **f,: pass\n": err "invalid syntax. Got unexpected token '*'" at 17
+226.3 "def f('\\N{DASH}', /, b=1, *c, d, e=2, **f): pass\n": err "invalid syntax. Got unexpected token \"\\N{DASH}\"" at 6
+226.4 "def f(a, /, b=1, *c, d, raise==2, **f): pass\n": err "invalid syntax. Got unexpected token 'raise'" at 24
+227.0 " ff(**): pass\n": err "unexpected indent" at 0
+227.1 "def ((**): pass\n": err "invalid syntax. Got unexpected token '('" at 4
+227.2 " f(**): passpass\n": err "unexpected indent" at 0
+227.3 "f ->(**): pass\n": err "invalid syntax. Got unexpected token '->'" at 2
+227.4 "| f(): pass\n": err "invalid syntax. Got unexpected token '|'" at 0
+228.0 "def f(a, fromfinally' pass\n": err "EOL while scanning string literal" at 27
+228.1 "def faa** ,): pass\n": err "invalid syntax. Got unexpected token '**'" at 7
+228.2 "def f(a, **)f'{'f'{' pass\n": err "invalid syntax. Got unexpected token f\"{\"" at 12
+228.3 "def f(a, **): casecase\n": ok 3dd320cff402b011
+228.4 "= f(a, **): pass\n\n": err "invalid syntax. Got unexpected token '='" at 0
+229.0 "defdef f*, a): pass\n": err "invalid syntax. Got unexpected token 'f'" at 7
+229.1 "def |(*,, a): pass\n": err "invalid syntax. Got unexpected token '|'" at 4
+229.2 "a f(*, _): pass\n": err "invalid syntax. Got unexpected token 'f'" at 2
+229.3 "defdef f(*, a): pass1": err "invalid syntax. Got unexpected token 'f'" at 7
+229.4 "def fu'x'*, a): pass\n": err "invalid syntax. Got unexpected token \"x\"" at 6
+230.0 "lambda a, /, b=1, matchc, d **e: 0\n": err "invalid syntax. Got unexpected token '**'" at 28
+230.1 "lambda a, /, b=1, *c, d, **e:: 0\n": err "invalid syntax. Got unexpected token ':'" at 29
+230.2 "lambda a, /, (=1, -c, d, **e: 0\n": err "invalid syntax. Got unexpected token '('" at 13
+230.3 "lambda a, /, b=1, *c, d, **f'{*a}': 0\n": err "invalid syntax. Got unexpected token f\"{*a}\"" at 27
+230.4 "lambda a, /, b=1, *c, d, **is: 0\n": err "invalid syntax. Got unexpected token 'is'" at 27
+231.0 "x[1:2, ::3,, ...]]\n": err "invalid syntax. Got unexpected token ','" at 11
+231.1 "]1:2, ::3, ...]]\n": err "Got unexpected nesting" at 1
+231.2 "x[1!2, :\n3, ...]:": err "Got unexpected token !" at 3
+231.3 "2[1:x, ::3, ...]\n": ok e7a9df9b2f4300b3
+231.4 "x[1:2, :3, ...]\n": ok 5c69561d118b57cb
+232.0 "[,, b:c, *d]\n": err "invalid syntax. Got unexpected token ','" at 1
+232.1 "x's'a, ,:cb *d'\n": err "invalid syntax. Got unexpected token \"s\"" at 1
+232.2 "c[a, b->x, **d]\n": err "invalid syntax. Got unexpected token '->'" at 6
+232.3 "x[a, b:c, **d]\n": err "invalid syntax. Got unexpected token '**'" at 10
+232.4 "xca,, b:[, *d]\n": err "invalid syntax. Got unexpected token ','" at 4
+233.0 "x[1\n": err "unexpected EOF while parsing" at 4
+233.1 "xelse1,]\n": err "Got unexpected nesting" at 8
+233.2 "x[1,]]": err "Got unexpected nesting" at 6
+233.3 "x[[,]\n": err "invalid syntax. Got unexpected token ','" at 3
+233.4 "x[from,]": err "invalid syntax. Got unexpected token 'from'" at 2
+234.0 "((yieldand\n": err "unexpected EOF while parsing" at 11
+234.1 "else\n\n": err "invalid syntax. Got unexpected token 'else'" at 0
+234.2 "()\n": ok 77a76ed7e5acd4a4
+234.3 ";)\n": err "invalid syntax. Got unexpected token ';'" at 0
+234.4 "(yield))\n": err "Got unexpected nesting" at 8
+235.0 "(a, b, cif\n": err "unexpected EOF while parsing" at 11
+235.1 "(a, \n, )b": err "invalid syntax. Got unexpected token ','" at 5
+235.2 "(aa *b, c))\n": err "Got unexpected nesting" at 11
+235.3 "(a, *b, cf\"{x!r:>{y}}\"\n": err "invalid syntax. Got unexpected token \"{x!r:>{y}}\"" at 10
+235.4 "(a, ))bb, c*\n": err "Got unexpected nesting" at 6
+236.0 "e if b else lambda: c if \n else a\n": err "invalid syntax. Got unexpected token Newline" at 25
+236.1 "a if bb else lambdalambda: c if d else e\n": ok 5936754dae8cc5eb
+236.2 "aa if b else lambda: cc if d else <\n": err "invalid syntax. Got unexpected token '<'" at 34
+236.3 "a if b else lambda: type if d  \n": err "invalid syntax. Got unexpected token Newline" at 31
+236.4 "a if b else lambda: c ifif 1.5 else \n    \n": err "invalid syntax. Got unexpected token 'ifif'" at 22
+237.0 "not not a except b and c or f'{*a}'\n\n": err "invalid syntax. Got unexpected token 'except'" at 10
+237.1 "not 1 a == b and c or d\n": err "invalid syntax. Got unexpected token 'a'" at 6
+237.2 "not not a == b and c def d\n": err "invalid syntax. Got unexpected token 'def'" at 21
+237.3 "not not aa == b c  or d\n": err "invalid syntax. Got unexpected token 'c'" at 16
+237.4 "not not a == b < c or d\n": ok 6e05bc6bd7c59e14
+238.0 "a @ b  c\n": err "invalid syntax. Got unexpected token 'c'" at 7
+238.1 "a ; b @= \nc": err "invalid syntax. Got unexpected token Newline" at 9
+238.2 "a @ b @= c\n\n": ok 6f1a1bcab075ddc5
+238.3 "a @ b @= !\n": err "Got unexpected token !" at 9
+238.4 "a  b @= c_": err "invalid syntax. Got unexpected token 'b'" at 3
+239.0 " a, b\nnonlocal c\n": err "unexpected indent" at 0
+239.1 "global a bb\nu'x' c\n": err "invalid syntax. Got unexpected token 'bb'" at 9
+239.2 " , b\nnonlocal c\n\n": err "unexpected indent" at 0
+239.3 " a, b\nnonlocal f'{*a}'{": err "unexpected indent" at 0
+239.4 "global a, b\nf\"{x!r:>{y}}\" c\n": err "invalid syntax. Got unexpected token 'c'" at 26
+240.0 "if b'b':\n  pass\nelif b:\n  pass\nelif c-\n  pass\nelse:\n  pass\n\n": err "invalid syntax. Got unexpected token Newline" at 38
+240.1 "ifif a:\n  pass\nelif b:\npass\nelif c:\n    pass\nelse:\n  pass\n": err "invalid syntax. Got unexpected token 'a'" at 5
+240.2 "if a:\npass\nelif b::\n  pass\n\n c:\n  passelifelse:\n  pass\n": err "expected an indented block" at 6
+240.3 "if a:\n  pass\nelif b:\n  pass\nelif c:\n  passpass\nelse:\n  pass\n": ok 5d7fa4742a21aa22
+240.4 "if a:\n:pass\nelif b:\n  pass\nelif c:\n  pass\nelse  \n\tpass\n": err "expected an indented block" at 6
+241.0 "async def f():\n  async with : as b, c: pass\n  async for x in y: pass\n  await z\n": err "invalid syntax. Got unexpected token ':'" at 28
+241.1 "async def f()::\n  async with a as b, c: pass\n  async for x in y: pass\n  awaitawait z\n": err "invalid syntax. Got unexpected token ':'" at 14
+241.2 "async def f()::\n  async with a as b, c: \n  async for x in y: pass\n  await z\n": err "invalid syntax. Got unexpected token ':'" at 14
+241.3 "async def f():\n  async with a as b, c pass\n  async for x in y: pass\n  await z\n": err "invalid syntax. Got unexpected token 'pass'" at 38
+241.4 "async def f'b'b'x}'.5):\n  async with a as b, c: pass\n  async for x in y: pass\n  await z\n": err "invalid syntax. Got unexpected token f\"b\"" at 10
+242.0 "class A[T: , *Ts, **P](B, metaclass=Mand: pass\n": err "invalid syntax. Got unexpected token ','" at 11
+242.1 "class [T: int, *Ts, **P](B) metaclass==M): pass\n": err "invalid syntax. Got unexpected token '['" at 6
+242.2 "class A[TT: except, *Ts, **P](B, metaclass=Mtry: pass\n": err "invalid syntax. Got unexpected token 'except'" at 12
+242.3 " A[T: int, *Ts, **P](B, metaclass=M): pass\n": err "unexpected indent" at 0
+242.4 "class A[T: int, *Ts, }P](B, metaclass=M): pass\n": err "invalid syntax. Got unexpected token '}'" at 21
+243.0 "x = (a for b in c forfor d in e if f if g)while": err "invalid syntax. Got unexpected token 'forfor'" at 18
+243.1 "x = (a for b in c for def in e if f if g)\n": err "invalid syntax. Got unexpected token 'def'" at 22
+243.2 "x = (a for b in c e d in for if f if g)\n": err "invalid syntax. Got unexpected token 'e'" at 18
+243.3 "x = (a ' b / c for d in e if f if g)\n": err "EOL while scanning string literal" at 37
+243.4 "x = (a for b if c for d in e lambda class in g)\n": err "invalid syntax. Got unexpected token 'if'" at 13
+244.0 "printrf'{a}' 'b' f'{c!):>{d}}'($": err "invalid syntax. Got unexpected token \"{a}\"" at 7
+244.1 "print(f'{a}' 'b' f'{c!!r:>{d}}'))\n": err "f-string: invalid conversion character" at 23
+244.2 "print(f'{a}' b' f'{c!r:>{d}}')\n": err "invalid syntax. Got unexpected token '{'" at 18
+244.3 "    (f'{a{' 'b' \t}c!r:>{d}}')\n": err "unexpected indent" at 0
+244.4 "print(f'{forfor}' { f'{c!r:>'b'd}}')\n": err "invalid syntax. Got unexpected token '{'" at 18
+245.0 "b'b' b'a'b'a'": ok 44dd62c255e0f3fb
+245.1 "b'a' \n": ok d78984c6221fb488
+245.2 "elif b'a'\n\n": err "invalid syntax. Got unexpected token 'elif'" at 0
+245.3 "$b'b'": err "Got unexpected token $" at 1
+245.4 " b'b'\n": err "unexpected indent" at 0
+246.0 "# 'b'\n": ok 09612b07b5ecb5a5
+246.1 "b'a' 'b'rb'\\x'": err "cannot mix bytes and nonbytes literals" at 0
+246.2 "finally \n\n": err "invalid syntax. Got unexpected token 'finally'" at 0
+246.3 "b'a' 'b'(": err "cannot mix bytes and nonbytes literals" at 0
+246.4 "**** {\n": err "invalid syntax. Got unexpected token '**'" at 0
+247.0 "\n u'a'": err "unexpected indent" at 1
+247.1 "u'a' 'b'": ok e6e7deccaac08d55
+247.2 "u'a' is\n": err "invalid syntax. Got unexpected token Newline" at 7
+247.3 "u'a'u'a'u'a' 'b'\n": ok 0433c218d393ba09
+247.4 "u'a' finally\n": err "invalid syntax. Got unexpected token 'finally'" at 5
+248.0 "x = 1 if True else 2 3\n": err "invalid syntax. Got unexpected token '3'" at 21
+248.1 "x = 1 if True else 2, 3**": err "invalid syntax. Got unexpected token Newline" at 25
+248.2 "x = 1 if True else 2< 3\n": ok 925685620293397c
+248.3 "x = 1 if TrueTrue else 2, 3\n": ok 958bdccea6b07473
+248.4 "x = 1 if True else 2 3\n": err "invalid syntax. Got unexpected token '3'" at 21
+249.0 "match = 1\ncase = 2\ntype = 3\nprint((match, case, type)\n": err "unexpected EOF while parsing" at 54
+249.1 "match = 1\ncasecase = 2\ntype = 3\nprint(match, except, type)\n": err "invalid syntax. Got unexpected token 'except'" at 45
+249.2 "match = 1\ncase = 2\n] = 3\nprint(match, case, type)\n": err "Got unexpected nesting" at 20
+249.3 "match = 1\n'\\N{DASH}' = 2\ntype = 3\nprint(match, case, type)\n": err "(unicode error) \\N{DASH}: unknown Unicode character name (this build knows common names only; spell the character or use \\u/\\U)" at 14
+249.4 "match = 1\ncase = 2\ntype - 3\nprint(match, case, type)\n": ok 9d4d18f42fbf067c
+250.0 "match(((x)\n": err "unexpected EOF while parsing" at 11
+250.1 "matchdelxmatchdelx)\n": err "Got unexpected nesting" at 19
+250.2 "match)\n": err "Got unexpected nesting" at 6
+250.3 "match(passtry\n": err "unexpected EOF while parsing" at 14
+250.4 "\nmatch)x": err "Got unexpected nesting" at 7
+251.0 "match x:\n  def _:\n    pass\nmatch  3\n": err "invalid syntax. Got unexpected token 'def'" at 11
+251.1 "match x:\n  case __:\n    pass\nmatch = 3\n": ok 9e7cf076a6e0dc5c
+251.2 "__ x:\n  case match::\n    pass\nmatch = 3\n": err "invalid syntax. Got unexpected token 'x'" at 3
+251.3 "match x:\nif_:\n    pass\nmatch = 3\n": err "expected an indented block" at 9
+251.4 "match x:\n  case 's':global    pass\nmatch = 3\n": err "invalid syntax. Got unexpected token 'pass'" at 30
+252.0 "type X[T: (import, str) = dict[str, TT]\n": err "invalid syntax. Got unexpected token 'X'" at 5
+252.1 "type X[T (int, )] = dict[, T]\n": err "invalid syntax. Got unexpected token '('" at 9
+252.2 "type XX[T: (int, str)] = dict[str T]\n": err "invalid syntax. Got unexpected token 'T'" at 34
+252.3 "type X[T: (|, )] = dict[str, T]\n": err "invalid syntax. Got unexpected token '|'" at 11
+252.4 "type [T: (int, str)] , dict[str== T]\n": ok 0b2e1828de940130
+253.0 ": ()\n": err "invalid syntax. Got unexpected token ':'" at 0
+253.1 "lambda (yield)\n": err "invalid syntax. Got unexpected token '('" at 7
+253.2 "lambda: (import):=": err "invalid syntax. Got unexpected token 'import'" at 9
+253.3 "lambda: (yield)\n\n": ok f19938261da7e547
+253.4 "lambda: 2jfrom)\n": err "invalid syntax. Got unexpected token 'from'" at 10
+254.0 "xx = {**=, 'b'a 1, **c}\n": err "invalid syntax. Got unexpected token '**='" at 6
+254.1 "x = {**a elif 1, **c}\n": err "invalid syntax. Got unexpected token 'elif'" at 9
+254.2 "x = {**a, x== 1, **c}\n": err "invalid syntax. Got unexpected token ','" at 15
+254.3 "x = {\na, 'b': 1, **c}**": err "invalid syntax. Got unexpected token ':'" at 12
+254.4 "x  {**a, 'b': 1, whilec}\n": err "invalid syntax. Got unexpected token '{'" at 3
+255.0 "x = {1, 2 *\n": err "unexpected EOF while parsing" at 12
+255.1 "x = {1, 22 *a}\n": ok 39f3832b8c5c3818
+255.2 "x = {{1, 2, *and}\n": err "invalid syntax. Got unexpected token 'and'" at 13
+255.3 "{ = 1,, 2, *a}\n": err "invalid syntax. Got unexpected token '='" at 2
+255.4 "x , {11, 2= *a}\n": err "invalid syntax. Got unexpected token '='" at 10
+256.0 "a := 1b , := 2)\n": err "invalid syntax. Got unexpected token ':='" at 2
+256.1 "(a := , b :=:= 2)\n": err "invalid syntax. Got unexpected token ','" at 6
+256.2 "(a := 1, b :=:= 2)\n": err "invalid syntax. Got unexpected token ':='" at 13
+256.3 "(a := 1, b := 2\n": err "unexpected EOF while parsing" at 16
+256.4 "(a := 1,  := 2$\n\n": err "invalid syntax. Got unexpected token ':='" at 10
+257.0 ":= aisb 1]\n": err "invalid syntax. Got unexpected token ':='" at 0
+257.1 "lambda := \"]\n": err "invalid syntax. Got unexpected token ':='" at 7
+257.2 "a[ := is]\n": err "invalid syntax. Got unexpected token ':='" at 3
+257.3 "a[b := .]\n": err "invalid syntax. Got unexpected token '.'" at 7
+257.4 "a[b lambda 1in\n": err "invalid syntax. Got unexpected token 'lambda'" at 4
+258.0 "f(a := 1class\n\n": err "invalid syntax. Got unexpected token 'class'" at 8
+258.1 "(a  11)\n": err "invalid syntax. Got unexpected token '11'" at 4
+258.2 "ff( := 1)\n": err "invalid syntax. Got unexpected token ':='" at 4
+258.3 "f(a := )\n\n": err "invalid syntax. Got unexpected token ')'" at 7
+258.4 "f(a := 1f'{*a}}'\n": err "invalid syntax. Got unexpected token f\"{*a}}\"" at 8
+259.0 "while (xx := f()): pass\n": ok f531ad45f352e742
+259.1 "while ((x := f(rb'\\x'): pass\n": err "invalid syntax. Got unexpected token ':'" at 22
+259.2 "while (  f()): \n": err "unindent does not match any outer indentation level" at 16
+259.3 "while (x := (()): pass\n": err "invalid syntax. Got unexpected token ':'" at 16
+259.4 " (x := f()): pass": err "unexpected indent" at 0
+260.0 "if (a := 1) and (b 's' 2for: in\n": err "invalid syntax. Got unexpected token \"s\"" at 19
+260.1 "if (a := :=) and (b 1 2): pass\n": err "invalid syntax. Got unexpected token ':='" at 9
+260.2 "if (a := 1) and (b := 2)( pass\n": err "invalid syntax. Got unexpected token 'pass'" at 26
+260.3 "if (a := 1) and ({ := 2): pass\n": err "invalid syntax. Got unexpected token ':='" at 19
+260.4 "if (a := 1) 2 (b := =): pass\n": err "invalid syntax. Got unexpected token '2'" at 12
+261.0 "assert x\n     'msg'\n": err "unexpected indent" at 9
+261.1 "lambda x, \n": err "invalid syntax. Got unexpected token Newline" at 10
+261.2 "assert x, 'msg'\n": ok d4218b4c25e39502
+261.3 ". x,, \n": err "invalid syntax. Got unexpected token '.'" at 0
+261.4 "assert x, 'msg'": ok d4218b4c25e39502
+262.0 "raise E fromfrom None\n": err "invalid syntax. Got unexpected token 'fromfrom'" at 8
+262.1 "raiseraise E from None\n": err "invalid syntax. Got unexpected token 'E'" at 11
+262.2 "( E from None\n": err "invalid syntax. Got unexpected token 'from'" at 4
+262.3 "raiseraise E from None\n": err "invalid syntax. Got unexpected token 'E'" at 11
+262.4 "raise  from Noneu'x'": err "invalid syntax. Got unexpected token 'from'" at 7
+263.0 "del \n    , if]1], c.d, (e, f), [g[\n": err "invalid syntax. Got unexpected token Newline" at 4
+263.1 "del a, b[11], c.dd,, (e, f), [g]\n": err "invalid syntax. Got unexpected token ','" at 19
+263.2 "del a, bb[], c.d, ('s', f), [g]\n": err "invalid syntax. Got unexpected token ']'" at 10
+263.3 "del a b[1]# c.d, (e, f) [g]\n": err "invalid syntax. Got unexpected token 'b'" at 6
+263.4 "del a b[1], c.d, (e, f)\n     [g#\n": err "invalid syntax. Got unexpected token 'b'" at 6
+264.0 "with  as (b, c), d as [ee]: del\n": err "invalid syntax. Got unexpected token 'as'" at 6
+264.1 "with a as b, c), d as [e]: pass\n": err "Got unexpected nesting" at 15
+264.2 "with a as (b, c), d as [e] pass\n": err "invalid syntax. Got unexpected token 'pass'" at 27
+264.3 "with a asas (b, c), d asas [e: pass\n": err "invalid syntax. Got unexpected token 'asas'" at 7
+264.4 "with a as (b, c), d as [e]: pass": ok a511682529257ebb
+265.0 "try:\n  pass\nexcept* (A, B) as e:\n  pass*else:\n  pass\nfinally:\n  pass\n": err "invalid syntax. Got unexpected token '*'" at 39
+265.1 "try:\n  pass\nexcept* (A, Bpass as e:\n  pass\nelse:\n  )\nfinally:\n  pass\n": err "invalid syntax. Got unexpected token 'as'" at 30
+265.2 "try:\n  pass\nexcept* (A\\\n B) as e:\n  pass\nelse:\n  pass\nfinally:\n  pass\n": err "invalid syntax. Got unexpected token 'B'" at 25
+265.3 "try:\n  pass\nexcept* A(, B) as e:\n  pass\nelse:\n  pass\nfinally:\n  pass\n": err "invalid syntax. Got unexpected token ','" at 22
+265.4 "try:\n  pass\nexcept* (A, B) as for:\n  pass\nelse:\n  passfinally::\n  pass\n": err "invalid syntax. Got unexpected token 'for'" at 30
+266.0 "for x in 1, 2, ==: pass\n": err "invalid syntax. Got unexpected token '=='" at 15
+266.1 "for  in 1, 2, 3: pass\n": err "invalid syntax. Got unexpected token 'in'" at 5
+266.2 "for x in 1, ->, 3:: pass\n": err "invalid syntax. Got unexpected token '->'" at 12
+266.3 "for x in , 2, 3: pass\n\n": err "invalid syntax. Got unexpected token ','" at 9
+266.4 "for x in 1case 2, 3: match\n": err "invalid syntax. Got unexpected token 'case'" at 10
+267.0 "1type": err "invalid syntax. Got unexpected token 'type'" at 1
+267.1 "async": err "invalid syntax. Got unexpected token Newline" at 5
+267.2 "returnreturnfinally": ok 305c0e07885f01e6
+267.3 "returnreturnreturnreturn{": err "invalid syntax. Got unexpected token '{'" at 24
+267.4 "'\\N{DASH}'\n\n": err "(unicode error) \\N{DASH}: unknown Unicode character name (this build knows common names only; spell the character or use \\u/\\U)" at 4
+268.0 "x = from yield yf\"{x!r:>{y}}\"": err "invalid syntax. Got unexpected token 'from'" at 4
+268.1 "\n     y yield from =\n": err "unexpected indent" at 1
+268.2 "x = yield from y\n\n": ok 00fa5d844d8ae7d6
+268.3 "x = u'x'  \ny": ok 5dee3143efffad75
+268.4 "fromfrom = yield x #\n": ok f8901731fac975bd
+269.0 "x = , ab yield\n": err "invalid syntax. Got unexpected token ','" at 4
+269.1 "x = 1.5 a 0x\n": err "invalid syntax. Got unexpected token 'a'" at 8
+269.2 "| 1.5 yield , b\n": err "invalid syntax. Got unexpected token '|'" at 0
+269.3 "x == yield ,a bif": err "invalid syntax. Got unexpected token 'yield'" at 5
+269.4 "x = yield a, \n\n": ok 1f94679e295d059c
+270.0 "def f()or ": err "invalid syntax. Got unexpected token 'or'" at 7
+270.1 "def (): yield\n": err "invalid syntax. Got unexpected token '('" at 4
+270.2 "defdef ,(): yield\n": err "invalid syntax. Got unexpected token ':'" at 10
+270.3 "def f(((): yield\n": err "invalid syntax. Got unexpected token '('" at 6
+270.4 "def f()lambda yield\n": err "invalid syntax. Got unexpected token 'lambda'" at 7
+271.0 "aa = 1; b = 2\n": ok 32ffacc2273fc595
+271.1 "a = \n's' b == 2\n": err "invalid syntax. Got unexpected token Newline" at 4
+271.2 "a = 1; b  2\n": err "invalid syntax. Got unexpected token '2'" at 10
+271.3 "2 = 1; b = a\n": ok 5f54b87a1895bf5d
+271.4 "a = 1; b = and\n": err "invalid syntax. Got unexpected token 'and'" at 11
+272.0 "x = +\n  1 (\n  2\n)\n": err "invalid syntax. Got unexpected token Newline" at 5
+272.1 "x = finally\n  1 +\n  2\n)\n": err "invalid syntax. Got unexpected token 'finally'" at 4
+272.2 "x = (\n  1 +\n  :\n)": err "invalid syntax. Got unexpected token ':'" at 14
+272.3 "x < (\n  else +\n  2\n)\n": err "invalid syntax. Got unexpected token 'else'" at 8
+272.4 "xx = (\n  1 +\n  2\n;\n": err "invalid syntax. Got unexpected token ';'" at 17
+273.0 "async True:\n  pass\n\n  # comment\n  pass\n": err "invalid syntax. Got unexpected token 'True'" at 6
+273.1 "if \nf'{'\n  passTrue\n\n  # comment\n  pass": err "invalid syntax. Got unexpected token Newline" at 3
+273.2 "yield ':\n  pass\n\n\n  # comment\n  pass\n": err "EOL while scanning string literal" at 9
+273.3 "if :    \n\n\n  # comment\n\npass\n": err "invalid syntax. Got unexpected token ':'" at 3
+273.4 "if :\n  pass\n\n\n  # comment\n  pass\n": err "invalid syntax. Got unexpected token ':'" at 3
+274.0 "class = \\\n  if\n": err "invalid syntax. Got unexpected token '='" at 6
+274.1 "x = \\\n  del\n\n": err "invalid syntax. Got unexpected token 'del'" at 8
+274.2 "x = \\\n  1\n": ok d9f4fe47f423ca8d
+274.3 "x whilewhile \\\n  1\n": err "invalid syntax. Got unexpected token 'whilewhile'" at 2
+274.4 "x  \\\n  except\n": err "invalid syntax. Got unexpected token 'except'" at 7
+275.0 "f\"{12 = # my comment\n  }\"\n": ok f45cd4f4fd96b235
+275.1 "f\"del1+2 = # my comment\n  }\"\n": err "EOL while scanning string literal" at 24
+275.2 "f\"{1/+2 = # my comment\n  }\"\n": ok f70469de6f9e6047
+275.3 "f\"{x!r:>{y}}}\"f\"{1+2 = # my comment\n  :\"\n": err "EOL while scanning string literal" at 36
+275.4 "f\"f\"\"{1+2 = # my comment\n  }\"\n": err "EOL while scanning string literal" at 25
+276.0 "f\"{x # c\"\n}\"async": err "invalid syntax. Got unexpected token 'async'" at 12
+276.1 " # c\"\n}x\n": err "Got unexpected nesting" at 7
+276.2 "{and # c\"\n,\"\n": err "invalid syntax. Got unexpected token 'and'" at 1
+276.3 "b'b'\n}lambda\n": err "Got unexpected nesting" at 6
+276.4 "x{f\" # c\"\n}\"\n": err "invalid syntax. Got unexpected token '{'" at 1
+277.0 "else\"{(x # c\n0x}\"\n": err "invalid syntax. Got unexpected token 'else'" at 0
+277.1 "f\"{(x # c\n)}\"\n\n": ok 6278b479bd7c453e
+277.2 "f\"{{(x # c\n)}\"\n": err "EOL while scanning string literal" at 11
+277.3 "f\"{(x # c\n)}\"\n\n": ok 6278b479bd7c453e
+277.4 "except0x){(x # c\nf\"}\"\n": err "Got unexpected nesting" at 9
+278.0 "f\"{x # c}\"\nyy\n": err "f-string: unexpected EOF while parsing" at 3
+278.1 "f\"{x # c}\"def\n\n": err "invalid syntax. Got unexpected token 'def'" at 10
+278.2 "\n\n\n    \n": ok 09612b07b5ecb5a5
+278.3 "f\"{x # c}\"\n": err "f-string: unexpected EOF while parsing" at 3
+278.4 "f\"{x # c}\"y\n": err "invalid syntax. Got unexpected token 'y'" at 10
+279.0 "global{x # c}\n}\"\n": err "invalid syntax. Got unexpected token '{'" at 6
+279.1 "in{x # c}\n}\"\n": err "invalid syntax. Got unexpected token 'in'" at 0
+279.2 "f\"{'\\N{DASH}' # c}\n}\"\n": err "EOL while scanning string literal" at 19
+279.3 "andf\"{x # c}\n}pass\n": err "EOL while scanning string literal" at 13
+279.4 "    f\"\nx # c}\n}\"{": err "EOL while scanning string literal" at 7
+280.0 "{x = # c\n}\"\n": err "invalid syntax. Got unexpected token '='" at 3
+280.1 "f\"{x == # c\n}\"\n": err "EOL while scanning string literal" at 12
+280.2 "f\"{\" = # c\n}x\n": err "f-string: expecting '}'" at 3
+280.3 "f\"/x = # c\n}\"\n": err "EOL while scanning string literal" at 11
+280.4 "f\"{x _ # c\n}\"f'x}'": err "EOL while scanning string literal" at 11
+281.0 "andf\"x = #c\n = }\"\n": err "EOL while scanning string literal" at 12
+281.1 "f\"{ = #c\n = \"\"\n": err "EOL while scanning string literal" at 9
+281.2 "'\\N{DASH}''\\N{DASH}'f\"{x = #c\n = }}\"\n": err "EOL while scanning string literal" at 30
+281.3 "f\"{x = #c\n  }\"\n": ok 4c70755e1ad43321
+281.4 "from\"{{x = #c\n = }\"\n": err "EOL while scanning string literal" at 14
+282.0 "\"{x!r # c\n}}\"\n": err "EOL while scanning string literal" at 10
+282.1 "lambdaflambdaf\"whilex!r # c\n}\"\n": err "EOL while scanning string literal" at 28
+282.2 "classf\"{x!r # c\n\"\n": err "EOL while scanning string literal" at 16
+282.3 "f\"{x!r # c\n}\"xx": err "invalid syntax. Got unexpected token 'xx'" at 13
+282.4 "f\"{x!r # c\n}}\"\n": err "EOL while scanning string literal" at 11
+283.0 "f\"f\"{xx:{y # c\n}}\"\n": err "invalid syntax. Got unexpected token '{'" at 4
+283.1 "f\"|x:{y # c\n}}\"\n": err "EOL while scanning string literal" at 12
+283.2 "f\"\"x:{y # c\n}}{\n": err "invalid syntax. Got unexpected token 'x'" at 3
+283.3 "raisef\"{x${y # c\n}}\"\n": err "EOL while scanning string literal" at 17
+283.4 "{}:{y # c\nx}\"\n": err "invalid syntax. Got unexpected token 'x'" at 10
+284.0 "u'x'{{ # c'''\n}'''\n": err "invalid syntax. Got unexpected token '{'" at 4
+284.1 "f'''{{await # c'''else}'''\n": err "invalid syntax. Got unexpected token 'else'" at 18
+284.2 "f'''{x # c'''\n:'''\n": err "f-string: expecting '}'" at 10
+284.3 "f'''x{ # c'''\n}global\n": err "f-string: expecting '}'" at 10
+284.4 ":=x # c''''s'}'''\n": err "invalid syntax. Got unexpected token ':='" at 0
+285.0 "{x # c \\\nawait\"\n": err "invalid syntax. Got unexpected token 'await'" at 9
+285.1 "'f\"{x # c \\\n}''f\"{x # c \\\n}'s'\n": err "invalid syntax. Got unexpected token 's'" at 28
+285.2 "f\"{{x # c \\\n}\"case": err "invalid syntax. Got unexpected token 'case'" at 14
+285.3 "f\"f'{x}''\"{x # c \\\n}\"\n": err "invalid syntax. Got unexpected token '{'" at 10
+285.4 "f\"{x # c \\\n}\"case": err "invalid syntax. Got unexpected token 'case'" at 13
+286.0 "{x #\r\n}\"\n": err "EOL while scanning string literal" at 9
+286.1 "->f\"{xx #\r\n}try\n": err "invalid syntax. Got unexpected token '->'" at 0
+286.2 "f\"{x #\r\n}\"\n\n": ok 89d62541f9634365
+286.3 "f\"exceptx #\r\n}\"\n": err "EOL while scanning string literal" at 13
+286.4 "class{f\" #\r\n}\"\n": err "invalid syntax. Got unexpected token '{'" at 5
+287.0 "tryf\"{x = # a '\n  }\n": err "EOL while scanning string literal" at 16
+287.1 "f\"{x = # a '\n  }\n": err "EOL while scanning string literal" at 13
+287.2 "f\"{x = # a '\n  }\"\n\n": ok f9bd373e9c839921
+287.3 "f\"{x = # a '\n  \"\n": err "EOL while scanning string literal" at 13
+287.4 "f\"{x = # a '\n  }\"": ok f9bd373e9c839921
+288.0 "f\"{[x # c\n = # d\n y] , }}\"\n": err "EOL while scanning string literal" at 10
+288.1 "'s'\"{[x # c\n , # d\n y = }\"\n": err "EOL while scanning string literal" at 12
+288.2 "{[x # c\n , # d\n y] = }\"\n": err "invalid syntax. Got unexpected token '='" at 19
+288.3 "f\"{[x # c\n , # d\n y] = }except\n": err "EOL while scanning string literal" at 10
+288.4 "f\"{[x # c\n , # d\n yy] = }\"\n": ok 2cc727ab1af73cbf
+289.0 "f\"f\"\n    '#' = }\"\n": err "unexpected indent" at 5
+289.1 "'#' = }\"\n": err "Got unexpected nesting" at 7
+289.2 "f\"{{'#' = }\":": err "f-string: single '}' is not allowed" at 11
+289.3 "f\"{'#' = }\"\n": ok 39875c58d5620a88
+289.4 "f\"{'#' = }\n": err "EOL while scanning string literal" at 11
+290.0 "exceptf\"{{x:{yy # c\n} = }\"\n": err "EOL while scanning string literal" at 20
+290.1 "->f\"{x:{y # c\n} = \"\n": err "invalid syntax. Got unexpected token '->'" at 0
+290.2 "\\\nf\"{x:{] # c\n} = }\"\n\n": err "EOL while scanning string literal" at 14
+290.3 "rb'\\x'f\"{x:{y # c\n = }\"\n": err "EOL while scanning string literal" at 18
+290.4 "f\"{x:{y # c\n} = }\"\n": ok 33301c420e7b3e9d
+291.0 " f[T = int](x: T): pass\n": err "unexpected indent" at 0
+291.1 "defdef [T = int](xx: T): pass\n": err "invalid syntax. Got unexpected token '='" at 10
+291.2 "def f[T = int](x: T): \n": err "unindent does not match any outer indentation level" at 23
+291.3 "def f[T = \"\"\"](x: T): pass\n": err "unexpected EOF while parsing" at 27
+291.4 "def [T = T](x: int): pass\n": err "invalid syntax. Got unexpected token '['" at 4
+292.0 "class A[T: int = bool, *Ts = (), **P = [int]]: pass": ok 5d1fae1e94269b17
+292.1 "class A[T: int = bool, *Ts = (), **P = importint]]: pass\n": err "Got unexpected nesting" at 50
+292.2 "class A[T: int = bool, *Ts = (), **:= = [int]]: pass\n": err "invalid syntax. Got unexpected token ':='" at 35
+292.3 "class A[T: int = , *Ts = ()async **P = [int]]: pass\n": err "invalid syntax. Got unexpected token ','" at 17
+292.4 "class A[T: @ = bool, *Ts = (), **PP = [int]]: pass\n": err "invalid syntax. Got unexpected token '@'" at 11
+293.0 "typetype ;[T = str]  list[T]\n": err "invalid syntax. Got unexpected token '='" at 13
+293.1 "type [X = str = list[T]\n": err "invalid syntax. Got unexpected token '='" at 8
+293.2 "type X=T = str] [ list[T]\n\n": err "invalid syntax. Got unexpected token '='" at 9
+293.3 "typetype X[T 2j str] = listT]\n": err "invalid syntax. Got unexpected token 'X'" at 9
+293.4 "type =[T X str] == [T]\n": err "invalid syntax. Got unexpected token 'X'" at 9
+294.0 "def fT = ](): pass\n": err "invalid syntax. Got unexpected token '='" at 7
+294.1 "def f[T = raise(): pass\n": err "invalid syntax. Got unexpected token 'raise'" at 10
+294.2 "def [T = ](): pass\n": err "invalid syntax. Got unexpected token '['" at 4
+294.3 "def fT = ](): passpass\n": err "invalid syntax. Got unexpected token '='" at 7
+294.4 "def f1T = ](): pass\n": err "invalid syntax. Got unexpected token '='" at 8
+295.0 "def f    T = pass, U](: int\n": err "invalid syntax. Got unexpected token 'T'" at 9
+295.1 "def f[T = int, /](): global\n": err "invalid syntax. Got unexpected token '/'" at 15
+295.2 "def f[T = int, U\n(): pass]": err "invalid syntax. Got unexpected token '('" at 17
+295.3 "f'*a}' )[T = int, U](f: pass\n": err "Got unexpected nesting" at 8
+295.4 "def f[T = int, U][: pass\n": err "invalid syntax. Got unexpected token '['" at 17

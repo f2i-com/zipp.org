@@ -2,7 +2,7 @@
 //! build/minify.rs) are the same programs as the files they came from:
 //!
 //!   * every Python library module lexes to the same tokens, each at the
-//!     same line and column (this lexer build never emits comment or
+//!     same line and column (the lexer emits no comment or
 //!     non-logical-newline tokens);
 //!   * every runtime JavaScript file compiles to the same bytecode, line
 //!     table and constants; only `FuncProto::source` (the text
@@ -10,7 +10,7 @@
 //!     reach) loses its comments.
 //!
 //!   cargo test -p zipp-vm --features python --lib minify_check
-use rustpython_parser::{lexer, Mode, Tok};
+use zipp_pyparse::{lexer, token::T, Limits, Mode};
 use std::path::{Path, PathBuf};
 
 fn pairs(dir: &str, ext: &str) -> Vec<(PathBuf, String, String)> {
@@ -37,16 +37,23 @@ fn pairs(dir: &str, ext: &str) -> Vec<(PathBuf, String, String)> {
 
 fn python_tokens(source: &str) -> Vec<(String, usize, usize)> {
     let lines = super::emitter::line_starts(source);
-    lexer::lex(source, Mode::Module)
-        .map(|t| t.expect("bundled module lexes"))
-        .map(|(tok, range)| {
-            let at = u32::from(range.start());
+    let lexed = lexer::lex(source, Mode::Module, 0, Limits::NONE);
+    assert!(lexed.errors.is_empty(), "bundled module lexes");
+    lexed
+        .tokens
+        .iter()
+        .map(|tok| {
+            let at = tok.start;
             let line = lines.partition_point(|&s| s <= at).max(1);
             let col = (at - lines[line - 1]) as usize;
             // A NEWLINE token sits where the line's text ends, which a cut
             // trailing comment moves; it has no position the emitter uses.
-            let col = if matches!(tok, Tok::Newline) { 0 } else { col };
-            (format!("{tok:?}"), line, col)
+            let (col, text) = if tok.kind == T::Newline {
+                (0, "")
+            } else {
+                (col, &source[tok.start as usize..tok.end as usize])
+            };
+            (format!("{:?} {text}", tok.kind), line, col)
         })
         .collect()
 }

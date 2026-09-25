@@ -145,7 +145,7 @@
         "ECMAScript Test262 engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-14",
+      "dateModified": "2026-09-25",
       "priority": "0.9",
       "sections": [
         {
@@ -157,7 +157,7 @@
             },
             {
               "type": "p",
-              "text": "It is not a binding to V8, SpiderMonkey or JavaScriptCore, and it does not wrap QuickJS. Every stage from source text to native machine code is Zipp's own, with two vendored exceptions: a fork of the `regress` regular-expression engine and the RustPython parser (parser only) used by the Python frontend."
+              "text": "It is not a binding to V8, SpiderMonkey or JavaScriptCore, and it does not wrap QuickJS. Every stage from source text to native machine code is Zipp's own, with one vendored exception: a fork of the `regress` regular-expression engine. The Python frontend's lexer and parser are Zipp's own as well."
             },
             {
               "type": "stats",
@@ -368,7 +368,7 @@
                 },
                 {
                   "q": "What license is it under?",
-                  "a": "Apache-2.0 for Zipp itself. The vendored regex fork is MIT or Apache-2.0, the RustPython parser fork is MIT, and generated Unicode CLDR data carries the Unicode license."
+                  "a": "Apache-2.0 for Zipp itself, including its Python parser. The vendored regex fork is MIT or Apache-2.0, and generated Unicode data (CLDR locale data, and the character names the Python parser knows, from the Unicode Character Database) carries the Unicode license."
                 }
               ]
             }
@@ -415,7 +415,7 @@
         "generational garbage collector Rust"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-16",
+      "dateModified": "2026-09-25",
       "sections": [
         {
           "heading": "The pipeline",
@@ -426,7 +426,7 @@
             },
             {
               "type": "table",
-              "caption": "Workspace crates (version 0.0.19)",
+              "caption": "Workspace crates (line counts at version 0.0.19, except `zipp-pyparse`, added later)",
               "head": [
                 "Crate",
                 "Role",
@@ -459,9 +459,9 @@
                   "52,309"
                 ],
                 [
-                  "`rustpython-parser`",
-                  "Vendored Python parser, parser only, used by the Python frontend",
-                  "75,256"
+                  "`zipp-pyparse`",
+                  "Python lexer, parser and syntax tree used by the Python frontend",
+                  "11,571"
                 ]
               ]
             },
@@ -640,7 +640,7 @@
       "description": "Zipp compiles Python 3 to the same register bytecode as its JavaScript engine. Run Python natively or in WebAssembly, with a Torch subset and opt-in JS interop.",
       "h1": "Python on the Zipp VM",
       "breadcrumb": "Python",
-      "lede": "Zipp's Python frontend is its own implementation of Python 3, validated on 13 September 2026. Python source is parsed with the RustPython parser and lowered by Zipp's compiler straight to register bytecode, so Python and JavaScript run on one virtual machine, natively or in the browser.",
+      "lede": "Zipp's Python frontend is its own implementation of Python 3, validated on 13 September 2026. Python source is parsed by Zipp's own parser and lowered by Zipp's compiler straight to register bytecode, so Python and JavaScript run on one virtual machine, natively or in the browser.",
       "keywords": [
         "Python in WebAssembly",
         "Python interpreter in Rust",
@@ -649,14 +649,14 @@
         "Rust Python runtime"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-16",
+      "dateModified": "2026-09-25",
       "sections": [
         {
           "heading": "How Python reaches the VM",
           "blocks": [
             {
               "type": "p",
-              "text": "There is no second interpreter and no transpilation to JavaScript source. The vendored RustPython parser produces an AST; Zipp's own compiler (`symtable.rs` for CPython scoping rules, `emitter.rs` for code generation) lowers it to the same `FuncProto` bytecode the JavaScript compiler produces. Python's object model lives in a fixed JavaScript-shaped runtime that the VM compiles once per program, and guest Python never sees the host's JavaScript globals."
+              "text": "There is no second interpreter and no transpilation to JavaScript source. Zipp's own parser (`zipp-pyparse`) produces a syntax tree; Zipp's own compiler (`symtable.rs` for CPython scoping rules, `emitter.rs` for code generation) lowers it to the same `FuncProto` bytecode the JavaScript compiler produces. Python's object model lives in a fixed JavaScript-shaped runtime that the VM compiles once per program, and guest Python never sees the host's JavaScript globals."
             },
             {
               "type": "p",
@@ -3292,11 +3292,11 @@
         "multi-language virtual machine",
         "register VM Python",
         "Python compiler in Rust",
-        "RustPython parser",
+        "Python parser in Rust",
         "Python in WebAssembly"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-14",
+      "dateModified": "2026-09-25",
       "sections": [
         {
           "heading": "The VM was already language-agnostic",
@@ -3318,8 +3318,8 @@
               "type": "steps",
               "items": [
                 {
-                  "title": "Parse with the RustPython parser",
-                  "text": "A vendored fork of `rustpython-parser` 0.4.0 produces the AST. It is a parser only; none of RustPython's interpreter is involved. Compile-time caps guard it: 1 MiB per module, 2^20 tokens, 200 nested brackets, 100 indentation levels, 96 nested expressions, 8,192 functions per program."
+                  "title": "Parse with Zipp's own parser",
+                  "text": "`zipp-pyparse`, Zipp's own lexer and recursive-descent parser for Python 3.13 syntax, produces the syntax tree, laid out in one arena per module. No code from another Python implementation is involved. Compile-time caps guard it: 1 MiB per module, 2^20 tokens, 200 nested brackets, 100 indentation levels, 96 nested expressions, 32,768 functions per program."
                 },
                 {
                   "title": "Build the symbol table",

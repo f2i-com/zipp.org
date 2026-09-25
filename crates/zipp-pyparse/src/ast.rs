@@ -6,7 +6,7 @@
 //!
 //! The node set is Python's `ast` module's (with RustPython's `Arguments`
 //! shape for parameters), and the ranges are the ones the RustPython 0.4
-//! parser ZIPP used gave, so `rustpython::to_rustpython` is a mapping.
+//! parser ZIPP used gave; [`crate::tree`] lays a module out in that shape.
 
 use crate::intern::{Interner, Sym};
 use std::marker::PhantomData;

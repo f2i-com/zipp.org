@@ -6,13 +6,9 @@ license.workspace = true
 description = "ZIPP dynamic JavaScript engine v2 — explicit-frame register VM with a NaN-boxed value model, designed from the ground up so a JIT can keep unboxed values in registers across call boundaries (the property V8 wins on)."
 
 [dependencies]
-# Python parser only (NOT the RustPython interpreter/VM). Optional and off by
-# default: it backs the experimental `frontend::python` subset compiler.
-rustpython-parser = { path = "../rustpython-parser-fork", version = "=0.4.0", optional = true, default-features = false, features = ["num-bigint", "location"] }
-# ZIPP's own Python front end (lexer, arena AST, parser), converted to the
-# RustPython AST above for the emitter. The fork's parser is no longer called
-# (only its `ast` re-export, and the lexer in the `minify_check` test).
-zipp-pyparse = { path = "../zipp-pyparse", optional = true, features = ["rustpython"] }
+# ZIPP's own Python front end (lexer, parser, and the tree the emitter walks).
+# Optional and off by default: it backs the `frontend::python` compiler.
+zipp-pyparse = { path = "../zipp-pyparse", optional = true }
 # Real `ID_Start` / `ID_Continue` tables for the lexer's identifier predicates.
 # Rust's `is_alphabetic`/`is_alphanumeric` are DIFFERENT Unicode properties and
 # disagree with these in both directions — see `Lexer::is_id_start`.
@@ -42,7 +38,7 @@ self_cell = "1.3.0"
 # `zipp py`/`zipp run`, turns on its Python loop tier with
 # `ScriptState::enable_vm_jit`). Off by default so the JavaScript engine is
 # unchanged.
-python = ["dep:rustpython-parser", "dep:zipp-pyparse", "instrument"]
+python = ["dep:zipp-pyparse", "instrument"]
 # Trusted mixed-language programs sharing one VM scope; deliberately opt-in.
 python-js-interop = ["python"]
 # Artifact-internal (the zipp-wasm `python` variant): the Python frontend

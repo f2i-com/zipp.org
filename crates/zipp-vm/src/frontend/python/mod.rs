@@ -1,4 +1,4 @@
-//! Python frontend: the RustPython AST lowered to native ZIPP register bytecode.
+//! Python frontend: the parsed tree (`zipp_pyparse::tree`) lowered to native ZIPP register bytecode.
 //!
 //! The fixed runtime (`runtime/*.js`) is trusted JavaScript compiled by ZIPP
 //! and implements Python's object model — classes, exceptions, the numeric
@@ -10,7 +10,7 @@
 //! resolves project modules and the built-in modules at compile time.
 use crate::bytecode::{Instr, Program, PyLazy, PyLazyModule};
 use crate::vm::prof::{self, Phase};
-use rustpython_parser::ast;
+use zipp_pyparse::tree as ast;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -436,6 +436,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
     // Sources are borrowed from `modules`, never copied per module.
     let mut sources: Vec<(String, &str)> = Vec::new();
     let mut names: BTreeSet<String> = BTreeSet::new();
+    let bump = ast::Bump::new();
     let mut parsed = Vec::new();
     let mut queue: Vec<String> = vec![entry.to_owned()];
     let mut queued: BTreeSet<String> = BTreeSet::new();
@@ -477,7 +478,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
             Some(label) if name == entry => label.to_owned(),
             _ => format!("{}.py", name.replace('.', "/")),
         };
-        let suite = parse_module(&file, source)?;
+        let suite = parse_module(&file, source, &bump)?;
         // Bound the tree's nesting before the recursive walks below.
         let text: &str = source.strip_prefix('\u{feff}').unwrap_or(source);
         let suite = nesting::check(suite, &file, text)?;
@@ -777,7 +778,8 @@ fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::Fu
             let _phase = prof::enter(Phase::PyFrontend);
             let name = module.name.as_str();
             let file = module.file.as_str();
-            let suite = parse_module(file, module.source)?;
+            let bump = ast::Bump::new();
+            let suite = parse_module(file, module.source, &bump)?;
             let source: &str = module.source.strip_prefix('\u{feff}').unwrap_or(module.source);
             let suite = nesting::check(suite, file, source)?;
             let table = symtable::analyse(&suite, name).map_err(|e| format!("{file}: {e}"))?;
@@ -907,7 +909,7 @@ fn is_module_name(name: &str) -> bool {
 /// the conservative compiler limits (additional to host execution limits).
 /// The lexer counts them as it goes: the token stream ends as soon as a limit
 /// is crossed, before the parser sees a deeper token.
-fn parse_module(file: &str, source: &str) -> R<Vec<ast::Stmt>> {
+fn parse_module<'a>(file: &str, source: &str, bump: &'a ast::Bump) -> R<ast::Seq<'a, ast::Stmt<'a>>> {
     if source.len() > MAX_SOURCE {
         return Err(format!("Python: {file} exceeds 1 MiB"));
     }
@@ -917,17 +919,15 @@ fn parse_module(file: &str, source: &str) -> R<Vec<ast::Stmt>> {
         max_brackets: 200,
         max_indent: 100,
     };
-    zipp_pyparse::rustpython::parse_module(source, limits).map_err(|e| {
-        if e.limit {
-            format!("Python: compiler complexity limit exceeded in {file}")
-        } else {
-            format!(
-                "SyntaxError: {} ({})",
-                e.message,
-                position(file, source, e.offset.into())
-            )
-        }
-    })
+    zipp_pyparse::parse(source, zipp_pyparse::Mode::Module, 0, limits)
+        .and_then(|module| ast::build(&module, bump))
+        .map_err(|e| {
+            if e.limit {
+                format!("Python: compiler complexity limit exceeded in {file}")
+            } else {
+                format!("SyntaxError: {} ({})", e.message, position(file, source, e.offset))
+            }
+        })
 }
 
 /// The compiled runtime seed and the indices the frontend patches into it.
@@ -1059,9 +1059,9 @@ fn base64(bytes: &[u8]) -> String {
 pub(super) fn position(
     file: &str,
     source: &str,
-    offset: rustpython_parser::text_size::TextSize,
+    offset: u32,
 ) -> String {
-    let offset = u32::from(offset) as usize;
+    let offset = offset as usize;
     let prefix = source.get(..offset).unwrap_or(source);
     let line = prefix.bytes().filter(|c| *c == b'\n').count() + 1;
     let col = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;

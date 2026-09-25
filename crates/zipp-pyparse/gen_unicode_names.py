@@ -126,6 +126,8 @@ for name, cp in lines:
 out = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False)
 out.write("// Generated from CPython %s's unicodedata (Unicode %s) by gen_unicode_names.py.\n"
           % (sys.version.split()[0], unicodedata.unidata_version))
+out.write("// Character names from the Unicode Character Database, Copyright (c) Unicode, Inc.,\n"
+          "// under the Unicode License v3 (LICENSE-UNICODE at the repository root).\n")
 out.write("// %d names, %d distinct words.\n" % (len(lines), len(words)))
 out.write("pub(crate) const WORDS: &str = \"%s\";\n" % "\\n".join(words))
 out.write("pub(crate) const ENTRIES: &[u8] = &[\n")

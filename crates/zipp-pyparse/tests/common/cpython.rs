@@ -1,6 +1,5 @@
-//! Checks against CPython's own parser (for syntax the RustPython parser
-//! lacked): CPython must accept the source and build the same tree. The
-//! tree is compared as JSON: this dumps the arena AST in the shape
+//! Checks against CPython's own parser: where CPython accepts a source,
+//! ZIPP must accept it and build the same tree. The tree is compared as JSON: this dumps the arena AST in the shape
 //! `cpython_check.py` dumps CPython's `ast` (positions left out; number
 //! literals as their text, which the script evaluates).
 
@@ -34,6 +33,14 @@ fn python() -> Option<(String, Vec<String>)> {
     None
 }
 
+/// A command running the found CPython, if any.
+pub fn python_command() -> Option<Command> {
+    let (cmd, args) = python()?;
+    let mut command = Command::new(cmd);
+    command.args(args);
+    Some(command)
+}
+
 /// CPython's standard library directory.
 pub fn stdlib() -> Option<PathBuf> {
     let (cmd, args) = python()?;
@@ -64,6 +71,16 @@ pub fn check_if_valid(sources: &[(String, String)]) -> Option<Vec<String>> {
     let tagged: Vec<(String, String)> = sources
         .iter()
         .map(|(label, source)| (format!("{label} [if valid]"), source.clone()))
+        .collect();
+    run_check(&tagged, None)
+}
+
+/// Where CPython accepts a source, ours must accept it with the same tree;
+/// what only ours accepts is not checked.
+pub fn check_where_cpython_accepts(sources: &[(String, String)]) -> Option<Vec<String>> {
+    let tagged: Vec<(String, String)> = sources
+        .iter()
+        .map(|(label, source)| (format!("{label} [where CPython accepts]"), source.clone()))
         .collect();
     run_check(&tagged, None)
 }

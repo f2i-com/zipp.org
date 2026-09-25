@@ -1,6 +1,6 @@
-//! Unit checks of the front end on its own (no RustPython): tokens, trees,
-//! errors, `\N{...}` names and deep nesting. The differential tests compare
-//! whole programs with the parser this one replaced.
+//! Unit checks of the front end: tokens, trees, errors, `\N{...}` names and
+//! deep nesting. `conformance.rs` checks whole programs against CPython and
+//! the recorded goldens.
 
 use zipp_pyparse::ast::*;
 use zipp_pyparse::token::T;
@@ -161,38 +161,47 @@ fn python_3_13_syntax() {
     module("async def f():\n    async with a as b, c:\n        await d\n");
 }
 
-/// Every name of the table the fork shipped is known, as the same
-/// character, and the new table knows no other names.
+/// The `\N{...}` table: every name looks up its character (in any case),
+/// and the table is the one the RustPython fork's parser shipped (2,745
+/// names and aliases; the fingerprint of that set, sorted, was taken from
+/// the fork's table before it was retired). `conformance` checks each name
+/// against CPython's `unicodedata`.
 #[test]
-fn unicode_names_match_the_fork() {
-    let fork = include_str!("../../rustpython-parser-fork/src/unicode_names.rs");
-    let mut count = 0;
-    for line in fork.lines() {
-        let Some(entry) = line
-            .strip_suffix("\\n\\")
-            .or_else(|| line.strip_suffix("\\n\";"))
-        else {
-            continue;
-        };
-        let (hex, name) = entry.split_once(' ').unwrap();
-        let code = u32::from_str_radix(hex, 16).unwrap();
+fn unicode_names() {
+    let mut all = zipp_pyparse::unicode_names::all();
+    for (name, c) in &all {
         assert_eq!(
             zipp_pyparse::unicode_names::lookup(name),
-            char::from_u32(code),
+            Some(*c),
             "{name}"
         );
         assert_eq!(
             zipp_pyparse::unicode_names::lookup(&name.to_lowercase()),
-            char::from_u32(code)
+            Some(*c)
         );
-        count += 1;
     }
-    assert!(count > 2000, "read {count} names from the fork's table");
-    assert_eq!(zipp_pyparse::unicode_names::all().len(), count);
-    assert_eq!(
-        zipp_pyparse::unicode_names::lookup("CJK UNIFIED IDEOGRAPH-4E00"),
-        Some('\u{4E00}')
-    );
+    assert_eq!(all.len(), 2745);
+    all.sort_by(|a, b| (a.1, a.0.to_uppercase()).cmp(&(b.1, b.0.to_uppercase())));
+    let text: String = all
+        .iter()
+        .map(|(name, c)| format!("{:04X} {}\n", *c as u32, name.to_uppercase()))
+        .collect();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    assert_eq!(h, 0x65ef_6acd_9030_d50b, "the name set changed");
+    for (name, c) in [
+        ("EN SPACE", '\u{2002}'),
+        ("bel", '\u{7}'),
+        ("LATIN SMALL LETTER E WITH ACUTE", '\u{e9}'),
+        ("GREEK SMALL LETTER ALPHA", '\u{3b1}'),
+        ("SNOWMAN", '\u{2603}'),
+        ("CJK UNIFIED IDEOGRAPH-4E00", '\u{4E00}'),
+    ] {
+        assert_eq!(zipp_pyparse::unicode_names::lookup(name), Some(c), "{name}");
+    }
     assert_eq!(
         zipp_pyparse::unicode_names::lookup("NO SUCH CHARACTER"),
         None
@@ -266,4 +275,44 @@ fn fstring_nesting_is_bounded() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+/// The emitter's tree: RustPython-shaped nodes with the parser's ranges,
+/// PEP 696 defaults included.
+#[test]
+fn tree_nodes() {
+    use zipp_pyparse::tree::{self, Bump, Constant, Expr, Ranged, Stmt, TypeParam};
+    let source = "def f[T: int = str, *Ts = (), **P = []](a, b=0x_ff): return -a\n";
+    let module = module(source);
+    let bump = Bump::new();
+    let body = tree::build(&module, &bump).unwrap();
+    let Stmt::FunctionDef(f) = &body[0] else {
+        panic!("not a function")
+    };
+    assert_eq!(f.name.as_str(), "f");
+    assert_eq!(f.range().start(), 0);
+    let [TypeParam::TypeVar(t), TypeParam::TypeVarTuple(ts), TypeParam::ParamSpec(p)] =
+        f.type_params.as_slice()
+    else {
+        panic!("{:?}", f.type_params)
+    };
+    assert!(t.bound.is_some() && t.default.is_some());
+    assert!(ts.default.is_some() && p.default.is_some());
+    let Some(Expr::Constant(c)) = f.args.args[1].default else {
+        panic!("no default")
+    };
+    let Constant::Int(i) = c.value else {
+        panic!("not an int")
+    };
+    assert_eq!((i.to_string(), i.text()), ("255".to_owned(), "0x_ff"));
+    assert_eq!(
+        tree::IntLit::to_string(&i),
+        "255",
+        "decimal display of a hex literal"
+    );
+    let Stmt::Return(r) = &f.body[0] else {
+        panic!("no return")
+    };
+    let value = r.value.unwrap();
+    assert_eq!(&source[value.start() as usize..value.end() as usize], "-a");
 }
