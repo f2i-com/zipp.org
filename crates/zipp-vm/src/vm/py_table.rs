@@ -1317,6 +1317,9 @@ pub(crate) fn size_probe(x: u64) -> u64 {
 #[path = "py_table_ops.rs"]
 mod runtime_ops;
 
+#[path = "py_table_layout.rs"]
+pub(crate) mod layout;
+
 #[cfg(test)]
 #[path = "py_table_tests.rs"]
 mod tests;

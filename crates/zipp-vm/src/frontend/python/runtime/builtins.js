@@ -1687,10 +1687,10 @@
         m("__eq__", 2, (a) => rt.eq(rt.dictFromMap(shown(a)), a[1]));
         m("__or__", 2, (a) => R.binop("or", rt.dictFromMap(shown(a)), a[1]));
         // Without slots to hide, `obj.__dict__` is a real dict whose storage
-        // is the instance's own attribute Map (a str-keyed dict keeps exactly
-        // that shape), so isinstance, json, pickle, copy and every dict method
-        // see it as CPython's do, and writes land on the object. A non-str
-        // key is refused.
+        // is the instance's own attribute storage (`vm::py_table::layout`; a
+        // Map in an object made otherwise, which refuses a non-str key), so
+        // isinstance, json, pickle, copy and every dict method see it as
+        // CPython's do, and writes land on the object.
         const refuseKey = () => fail(E.TypeError, "attribute name must be string");
         const liveDict = (target) => ({
             cls: T.dict, liveTarget: target,
@@ -1705,16 +1705,14 @@
             if (view === undefined || view.liveTarget !== obj) { view = liveDict(obj); obj.dictView = view; }
             return view;
         };
-        // `obj.__dict__ = d`: a str-keyed dict becomes the object's attribute
-        // storage itself (so `self.__dict__ = self` in a dict subclass makes
-        // keys and attributes one namespace, as in CPython); its size then
-        // follows the shared Map and a non-str key is refused. A dict with
-        // other keys is copied.
+        // `obj.__dict__ = d`: the dict's own table becomes the object's
+        // attribute storage (so `self.__dict__ = self` in a dict subclass
+        // makes keys and attributes one namespace, as in CPython); its size
+        // then follows the shared table.
         rt.setInstanceDict = (obj, d) => {
             if (d === null || typeof d !== "object" || d.map === undefined || !isInstance(d, T.dict)) fail(E.TypeError, "__dict__ must be set to a dictionary, not a '" + typeOf(d).name + "'");
             if (d.liveTarget !== undefined) { obj.dict = d.liveTarget.dict; return; }
-            const shared = rt.dictToMap(d);
-            if (shared === undefined) { obj.dict = rt.mapFromDict(d); return; }
+            const shared = d.map;
             Object.defineProperty(d, "map", { get: () => shared, set: (v) => { refuseKey(); }, configurable: true });
             Object.defineProperty(d, "size", { get: () => shared.size, set: (v) => { }, configurable: true });
             obj.dict = shared;

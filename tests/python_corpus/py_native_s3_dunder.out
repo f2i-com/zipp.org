@@ -1,0 +1,17 @@
+identity True True True
+alias 3 4 ['x', 'y', 'z', 'w'] 4
+non-str five tuple 1 ['x', 'y', 'z', 'w', 5, (1, 2)]
+after ['v', 'w', 'x', 'y', 'z'] 6 6
+del-via-dict False False
+slots 1 2 {'t': 2}
+attrdict {'one': 1, 'two': 2, 'three': 3} 1 2 3 3
+adopted 1 3 {'p': 1, 'q': 2, 'r': 3} True
+before-class B b
+after-class C b C
+copy 20 2 True {'val': 3, 'nxt': None}
+dataclass DC(a=1, b='x', c=[5]) {'a': 1, 'b': 'x', 'c': [5]} (1, 'x', [5]) DC(a=1, b='y', c=[5]) {'a': 1, 'b': 'x', 'c': [5]}
+json {"x": 1, "y": 2} {"a": 1, "b": "x", "c": [5]}
+dir ['x', 'y']
+hashable a True True
+state 1 (1, 2) True ['a', 'b', 'restored']
+repr-default {'val': 1, 'nxt': None}

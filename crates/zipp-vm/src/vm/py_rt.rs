@@ -113,6 +113,20 @@ pub(super) mod ic {
     /// when absent, then `d` the table's key count). The instruction takes
     /// its slow edge while that still holds.
     pub const NOT_PLAIN: u8 = 13;
+    /// `PyGetAttr` from layout-mode storage (`vm::py_table::layout`): `a`
+    /// class, `c` its `ver`, `d` the layout, `pos` the slot.
+    pub const ATTR_GET_L: u8 = 14;
+    /// `PySetAttr` replacing a value in layout-mode storage: as
+    /// [`ATTR_GET_L`].
+    pub const ATTR_SET_L: u8 = 15;
+    /// `PySetAttr` appending to layout-mode storage of layout `d` holding
+    /// `pos` values, making layout `b`.
+    pub const ATTR_APPEND_L: u8 = 16;
+    /// `PyGetAttr` answering a class's plain attribute (`gv`, `b` the
+    /// table's bits, `pos` its slot) for an instance whose layout `d` lacks
+    /// the name. (`METHOD` and `CLASS_ATTR` entries keep in `d` a layout
+    /// proven to lack their name, 0 for none.)
+    pub const GET_CLASS_L: u8 = 17;
 }
 
 /// One per-site cache entry (see the module comment); kind 0 is empty.
@@ -188,6 +202,10 @@ pub(crate) struct PyRt {
     ics: Vec<Option<Box<FnIc>>>,
     /// Frame tables by function id, read on first use (see [`PyFrame`]).
     frames: Vec<FrameSlot>,
+    /// The `pins` array `R` holds, which keeps the values named here alive.
+    pub(super) pins: Value,
+    /// Instance attribute layouts (`vm::py_table::layout`).
+    pub(crate) layouts: super::py_table::layout::Layouts,
 }
 
 /// The first bytes of the string constant a Python code object's frame
@@ -295,6 +313,8 @@ impl PyRt {
             names: rustc_hash::FxHashMap::default(),
             ics: Vec::new(),
             frames: Vec::new(),
+            pins: Value::UNDEFINED,
+            layouts: Default::default(),
         }
     }
 }
@@ -417,6 +437,7 @@ impl<'p> Vm<'p> {
             self.py_bind_publish(r);
         }
         let mut rt = PyRt::new(r);
+        rt.pins = pins;
         let ri = r.heap_index();
         let own = |vm: &Self, key: &str| -> Value { vm.py_own_data(ri, key).unwrap_or(Value::UNDEFINED) };
         rt.t_list = own(self, "TLIST");
@@ -473,6 +494,14 @@ impl<'p> Vm<'p> {
         // Names interned before binding stay interned.
         if let Some(old) = self.py_rt.take() {
             rt.names = old.names;
+            rt.layouts = old.layouts;
+            // The layouts' keys stay alive through the new `pins`.
+            for k in rt.layouts.keys() {
+                self.heap.write_barrier_val(pi, k);
+                if let HeapObj::Array(a) = self.heap.get_mut(pi) {
+                    a.push(k);
+                }
+            }
         }
         self.py_rt = Some(Box::new(rt));
         Value::UNDEFINED

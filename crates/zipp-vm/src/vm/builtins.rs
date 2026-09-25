@@ -3131,6 +3131,12 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         // Brand check: `Map.prototype.<m>.call(x)` requires x to have [[MapData]].
         if !matches!(self.heap.get(idx), HeapObj::Map { .. }) {
+            // A Python instance's attribute (or dict) storage answers as a
+            // Map (`vm::py_table::layout`).
+            #[cfg(feature = "python")]
+            if matches!(self.heap.get(idx), HeapObj::PyAttrs { .. } | HeapObj::PyTable(_)) {
+                return self.py_store_map_method(idx, name, args);
+            }
             return Err(Thrown(format!(
                 "TypeError: Map.prototype.{name} called on incompatible receiver"
             )));

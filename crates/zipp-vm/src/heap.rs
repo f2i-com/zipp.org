@@ -4929,6 +4929,10 @@ pub enum HeapObj {
     /// runtime's dict and set records.
     #[cfg(feature = "python")]
     PyTable(Box<crate::vm::py_table::PyTable>),
+    /// A Python instance's attributes in layout mode
+    /// (`vm::py_table::layout`): the values of the layout's keys, in order.
+    #[cfg(feature = "python")]
+    PyAttrs { layout: u32, vals: Vec<Value> },
 }
 
 impl HeapObj {
@@ -5004,6 +5008,8 @@ impl HeapObj {
             HeapObj::Iterator { items, .. } => vec_capacity_bytes(items),
             #[cfg(feature = "python")]
             HeapObj::PyTable(t) => t.payload_bytes(),
+            #[cfg(feature = "python")]
+            HeapObj::PyAttrs { vals, .. } => vec_capacity_bytes(vals),
             HeapObj::Class(class) => {
                 let mut n = std::mem::size_of::<ClassData>()
                     .saturating_add(class.name.capacity())
@@ -6432,6 +6438,14 @@ impl Heap {
             // B201: a Cell's mirror is written by `alloc_cell` (the enum
             // carries no payload to copy from).
             HeapObj::Cell => HotMirror::CLEAR,
+            // Python attribute storage: its layout and values (see the JIT
+            // contract in `vm::py_table::layout`).
+            #[cfg(feature = "python")]
+            HeapObj::PyAttrs { layout, vals } => HotMirror {
+                shape: crate::vm::py_table::layout::LAYOUT_BASE | *layout,
+                fid: FID_MIRROR_NONE,
+                vals: vals.as_ptr() as u64,
+            },
             _ => HotMirror::CLEAR,
         };
         self.hot_mirror[idx as usize] = hot;
@@ -6994,6 +7008,8 @@ impl Heap {
             HeapObj::Set(items) => items.len() <= max,
             #[cfg(feature = "python")]
             HeapObj::PyTable(t) => t.slots() <= max,
+            #[cfg(feature = "python")]
+            HeapObj::PyAttrs { vals, .. } => vals.len() <= max,
             _ => false,
         }
     }

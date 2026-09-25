@@ -1035,12 +1035,12 @@
     // keeps its entries in insertion order (`vm::py_table`, reached through
     // `TB`, `__zipp_py_table`: its op codes are listed there), and `size`
     // its length, written back after every change. A live `__dict__` view
-    // (builtins.js `liveDict`) keeps an instance's attribute Map instead, str
-    // keys only (its `size` is a getter). The table answers every op itself
-    // for keys it can hash and compare, and answers the table itself (`m`
-    // below) when guest code must run: then `hashInt` hashes the key and
-    // `find` runs `eq` on the candidates it reports. Nothing else in the
-    // runtime touches the storage.
+    // (builtins.js `liveDict`) is the instance's own attribute storage (its
+    // `size` a getter): a table, or an older object's Map (str keys only).
+    // The table answers every op itself for keys it can hash and compare,
+    // and answers the table itself (`m` below) when guest code must run:
+    // then `hashInt` hashes the key and `find` runs `eq` on the candidates
+    // it reports. Nothing else in the runtime touches the storage.
     const TB = __zipp_py_table, TT = T.tuple, TF = T.frozenset;
     function dict(cls) { return { cls: cls || T.dict, map: TB(0, false, TT, TF), size: 0 }; }
     function full(what) { fail(E.MemoryError, what + " limit exceeded"); }
@@ -1174,16 +1174,11 @@
         for (const [k, v] of dictEntryList(d)) dictSet(out, k, v);
         return out;
     }
-    function dictFromMap(m) { const ks = [], vs = []; m.forEach((v, k) => { ks.push(k); vs.push(v); }); const d = dict(); R.dictfill(d, ks, vs); return d; }
-    function mapFromDict(d) { const m = new Map(); for (const [k, v] of dictEntryList(d)) m.set(typeof k === "string" ? k : rt.str(k), v); return m; }
-    // A str-keyed dict's storage as a Map of its own (`obj.__dict__ = d`
-    // makes that Map the object's attribute storage), or undefined.
-    function dictToMap(d) {
-        if (d.map instanceof Map) return d.map;
-        const entries = dictEntryList(d);
-        for (let i = 0; i < entries.length; i++) if (typeof entries[i][0] !== "string") return undefined;
-        return d.map = new Map(entries);
+    function dictFromMap(m) {
+        if (!(m instanceof Map)) { const t = TB(5, m); if (t !== undefined) return withTable(T.dict, t); }
+        const ks = [], vs = []; m.forEach((v, k) => { ks.push(k); vs.push(v); }); const d = dict(); R.dictfill(d, ks, vs); return d;
     }
+    function mapFromDict(d) { const m = new Map(); for (const [k, v] of dictEntryList(d)) m.set(typeof k === "string" ? k : rt.str(k), v); return m; }
     // A dict subclass that keeps dict's own __iter__ is read from its
     // storage (CPython's dict_merge fast path ignores __getitem__/keys()).
     function isPlainDictStorage(v) {
@@ -1214,7 +1209,7 @@
         const entries = dictEntryList(src);
         for (let i = -2 - r; i < entries.length; i++) dictSet(d, entries[i][0], entries[i][1]);
     }
-    Object.assign(rt, { dict, dictGet, dictSet, dictDel, dictPop, dictPopItem, dictClear, dictHas, dictEntries, dictEntryList, dictKeyIter, dictEq, dictCopy, dictFromMap, mapFromDict, dictToMap, dictUpdate, asDict });
+    Object.assign(rt, { dict, dictGet, dictSet, dictDel, dictPop, dictPopItem, dictClear, dictHas, dictEntries, dictEntryList, dictKeyIter, dictEq, dictCopy, dictFromMap, mapFromDict, dictUpdate, asDict });
     R.dict = function () { return dict(); };
     R.dictfill = function (d, keys, values) {
         const r = TB(21, d.map, keys, values);

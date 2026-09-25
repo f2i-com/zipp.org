@@ -1137,10 +1137,12 @@ impl<'p> Vm<'p> {
         self.py_map_find(m, k).map(|(_, v)| v)
     }
 
-    /// `o.dict` when it is a `Map` (a Python instance's attribute storage).
+    /// `o.dict` when it is a `Map` or a table (a Python instance's attribute
+    /// storage, which answers `map_method` alike: `vm::py_table::layout`).
     fn py_inst_map(&self, o: Value) -> Option<u32> {
         let (_, d) = self.py_inst_parts(o)?;
-        (d.is_heap() && matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. })).then(|| d.heap_index())
+        (d.is_heap() && matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. } | HeapObj::PyAttrs { .. } | HeapObj::PyTable(_)))
+            .then(|| d.heap_index())
     }
 
     /// `__zipp_py_str(s)`: whether `s` holds a UTF-16 surrogate unit (an

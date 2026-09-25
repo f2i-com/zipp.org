@@ -1,0 +1,20 @@
+same-layout 1225 2450 [{'x': 0, 'y': 0}, {'x': 1, 'y': -1}]
+two-orders [['b', 'a'], ['a', 'b']] 18
+grown {'x': 1, 'y': 2, 'z': 3, 'w': 4} 7
+deleted {'y': 2, 'z': 3, 'w': 4} False
+readded {'y': 2, 'z': 3, 'w': 4, 'x': 10} 10
+after-deletes ['y', 'x', 'w'] 5 2
+class-attr point point
+shadowed mine point
+unshadowed point
+class-changed changed changed
+method-shadowed instance function 15
+method-back 15
+property 300 2 {'_v': 3, 'plain': 2}
+many 40 0 39 780
+many-again ['a0', 'a1', 'a2'] ['a38', 'a39']
+setattr {'x': 0, 'y': 0, 'alpha': 'ALPHA', 'beta': 'BETA', 'gamma': 'GAMMA'} BETA None
+dict-update 4 99 ['x', 'y', 'alpha', 'beta', 'gamma', 'delta']
+dict-clear {} False changed
+after-clear {'x': 1} 1
+int-like names ['x', 'y', '1', '2', '0'] one two

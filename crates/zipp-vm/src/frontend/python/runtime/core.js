@@ -1140,9 +1140,9 @@ var __zipp_py = (function () {
         } else if (plan.alloc !== undefined) {
             // A subclass of a builtin container inherits its storage.
             obj = plan.alloc(cls);
-            if (obj.dict === undefined || obj.dict === null) obj.dict = new Map();
+            if (obj.dict === undefined || obj.dict === null) obj.dict = ATTRS(23);
         } else {
-            obj = { cls: cls, dict: new Map() };
+            obj = { cls: cls, dict: ATTRS(23) };
         }
         if (init !== undefined) {
             const withSelf = [obj]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
@@ -1158,14 +1158,16 @@ var __zipp_py = (function () {
     // Positional entries of classes (`cls.c<n>`, see `constructDefault`):
     // exactly the plain construction path, with the __init__ found then.
     function initReturned(r) { fail(TypeError, "__init__() should return None, not '" + typeOf(r).name + "'"); }
+    // An instance's attribute storage (`vm::py_table::layout`, op 23).
+    const ATTRS = __zipp_py_table;
     const CTOR_ENTRY = [
-        function () { const obj = { cls: this, dict: new Map() }; const init = this.ctorInit; if (init !== null) { const r = init.c1(obj); if (r !== null) initReturned(r); } return obj; },
-        function (a) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c2(obj, a); if (r !== null) initReturned(r); return obj; },
-        function (a, b) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c3(obj, a, b); if (r !== null) initReturned(r); return obj; },
-        function (a, b, c) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c4(obj, a, b, c); if (r !== null) initReturned(r); return obj; },
-        function (a, b, c, d) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c5(obj, a, b, c, d); if (r !== null) initReturned(r); return obj; },
-        function (a, b, c, d, e) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c6(obj, a, b, c, d, e); if (r !== null) initReturned(r); return obj; },
-        function (a, b, c, d, e, f) { const obj = { cls: this, dict: new Map() }; const r = this.ctorInit.c7(obj, a, b, c, d, e, f); if (r !== null) initReturned(r); return obj; },
+        function () { const obj = { cls: this, dict: ATTRS(23) }; const init = this.ctorInit; if (init !== null) { const r = init.c1(obj); if (r !== null) initReturned(r); } return obj; },
+        function (a) { const obj = { cls: this, dict: ATTRS(23) }; const r = this.ctorInit.c2(obj, a); if (r !== null) initReturned(r); return obj; },
+        function (a, b) { const obj = { cls: this, dict: ATTRS(23) }; const r = this.ctorInit.c3(obj, a, b); if (r !== null) initReturned(r); return obj; },
+        function (a, b, c) { const obj = { cls: this, dict: ATTRS(23) }; const r = this.ctorInit.c4(obj, a, b, c); if (r !== null) initReturned(r); return obj; },
+        function (a, b, c, d) { const obj = { cls: this, dict: ATTRS(23) }; const r = this.ctorInit.c5(obj, a, b, c, d); if (r !== null) initReturned(r); return obj; },
+        function (a, b, c, d, e) { const obj = { cls: this, dict: ATTRS(23) }; const r = this.ctorInit.c6(obj, a, b, c, d, e); if (r !== null) initReturned(r); return obj; },
+        function (a, b, c, d, e, f) { const obj = { cls: this, dict: ATTRS(23) }; const r = this.ctorInit.c7(obj, a, b, c, d, e, f); if (r !== null) initReturned(r); return obj; },
     ];
     const EXC_ENTRY = [
         function () { const e = makeExc(this, []); e.context = null; return e; },
@@ -1238,9 +1240,9 @@ var __zipp_py = (function () {
         // A subclass of a builtin container inherits its storage.
         for (const c of cls.mro) {
             const alloc = rt.allocators.get(c);
-            if (alloc !== undefined) { const o = alloc(cls); o.dict = new Map(); return o; }
+            if (alloc !== undefined) { const o = alloc(cls); o.dict = ATTRS(23); return o; }
         }
-        return { cls: cls, dict: new Map() };
+        return { cls: cls, dict: ATTRS(23) };
     };
     rt.allocators = new Map();
 

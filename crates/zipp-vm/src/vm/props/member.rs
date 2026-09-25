@@ -2157,6 +2157,15 @@ impl<'p> Vm<'p> {
             HeapObj::Set(_) if key == "size" => {
                 Ok(len_value(self.coll_live_len(obj.heap_index())))
             }
+            // A Python instance's attribute (or dict) storage answers as a
+            // Map (`vm::py_table::layout`).
+            #[cfg(feature = "python")]
+            HeapObj::PyAttrs { .. } | HeapObj::PyTable(_) => {
+                if key == "size" {
+                    return Ok(len_value(self.py_store_len(obj.heap_index()).unwrap_or(0)));
+                }
+                self.exotic_own_or_proto(obj, self.map_proto, key)
+            }
             // A method as a VALUE on a Map/Set/Date/Promise instance
             // (`new Map().set`, `d.getHours`) → the corresponding prototype.
             HeapObj::Map { .. } => self.exotic_own_or_proto(obj, self.map_proto, key),

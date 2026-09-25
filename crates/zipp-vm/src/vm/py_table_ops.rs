@@ -29,6 +29,7 @@
 //! | `SUBSET` 20 | `a, b` | `a <= b`, or `undefined` |
 //! | `FILL` 21 | `t, keys, values` | [`SET`](ops::SET) each pair (`values` `undefined` for a set): as `UPDATE` |
 //! | `SIZE` 22 | `t` | the length |
+//! | `ATTRS` 23 | | new, empty instance attribute storage (`vm::py_table::layout`) |
 //!
 //! An op that needs guest code, whether for the key (a `__hash__` or
 //! `__eq__` of the program's) or for a stored key it meets, answers the
@@ -41,8 +42,10 @@
 //! answer, once the slot no longer holds that key, when the runtime starts
 //! over), or after a miss `INSERT`s with the probe's hint (refused once the
 //! table changed since). Natives never call guest code. A storage that is
-//! not a table (a live `__dict__` view keeps the instance's attribute Map)
-//! is answered the same way.
+//! not a table (an instance's attribute Map) is answered the same way. An
+//! instance's layout-mode attribute storage (`HeapObj::PyAttrs`) answers
+//! the reads and a str key's store itself; any other op turns it into a
+//! dict-mode table first.
 
 use super::*;
 use crate::heap::HeapObj;
@@ -74,6 +77,7 @@ pub(crate) mod ops {
     pub(crate) const SUBSET: i32 = 20;
     pub(crate) const FILL: i32 = 21;
     pub(crate) const SIZE: i32 = 22;
+    pub(crate) const ATTRS: i32 = 23;
 }
 
 /// A count as a JS number.
@@ -122,7 +126,14 @@ impl<'p> Vm<'p> {
             return Ok(Value::UNDEFINED);
         }
         let t = arg(1);
-        Ok(match op.as_int() {
+        let op = op.as_int();
+        if op == ops::ATTRS {
+            return Ok(self.py_attrs_new(0));
+        }
+        if let Some(v) = self.pt_attrs_op(op, t, arg(2), arg(3)) {
+            return Ok(v);
+        }
+        Ok(match op {
             ops::GET => match self.py_table_get(t, arg(2)) {
                 Some(Some(v)) => v,
                 Some(None) => Value::UNDEFINED,
@@ -157,11 +168,11 @@ impl<'p> Vm<'p> {
             },
             ops::SIZE => table_at(&self.heap, t).map_or(Value::UNDEFINED, |b| count(b.len())),
             ops::COPY => self.pt_copy(t),
-            ops::KEYS | ops::VALUES | ops::ENTRIES => self.pt_list(t, op.as_int()),
+            ops::KEYS | ops::VALUES | ops::ENTRIES => self.pt_list(t, op),
             ops::POPITEM => self.pt_popitem(t, arg(2) == Value::TRUE),
             ops::SETPOP => self.pt_setpop(t),
             ops::PROBE => self.pt_probe(t, arg(2), arg(3)).unwrap_or(t),
-            ops::VALAT | ops::SETAT | ops::DELAT => self.pt_at(op.as_int(), t, arg(2), arg(3), arg(4)).unwrap_or(t),
+            ops::VALAT | ops::SETAT | ops::DELAT => self.pt_at(op, t, arg(2), arg(3), arg(4)).unwrap_or(t),
             ops::INSERT => self.pt_insert(t, arg(2), arg(3), arg(4), arg(5), arg(6)).unwrap_or(t),
             ops::HASH => {
                 let kinds = PyKinds {
@@ -174,11 +185,48 @@ impl<'p> Vm<'p> {
                 h.map_or(Value::UNDEFINED, |h| self.make_bigint(i128::from(h)))
             }
             ops::UPDATE => self.pt_update(t, arg(2)),
-            ops::EQ | ops::SUBSET => self.pt_compare(op.as_int(), t, arg(2)),
+            ops::EQ | ops::SUBSET => self.pt_compare(op, t, arg(2)),
             ops::SETOP => self.pt_setop(t, arg(2), arg(3)),
             ops::FILL => self.pt_fill(t, arg(2), arg(3)),
             _ => Value::UNDEFINED,
         })
+    }
+
+    /// An op on layout-mode attribute storage `t`: the reads and a store
+    /// answered from it; `None` for everything else, after turning `t` into
+    /// a table (when it is attribute storage at all).
+    fn pt_attrs_op(&mut self, op: i32, t: Value, a: Value, b: Value) -> Option<Value> {
+        self.py_attrs_of(t)?;
+        match op {
+            ops::GET => return Some(self.py_attrs_get(t, a)?.unwrap_or(Value::UNDEFINED)),
+            ops::SIZE => return Some(count(self.py_attrs_of(t)?.1)),
+            ops::SET if self.py_attrs_set(t, a, b) => return Some(count(self.py_attrs_of(t)?.1)),
+            ops::KEYS | ops::VALUES | ops::ENTRIES | ops::COPY => {
+                let entries = self.py_attrs_entries(t);
+                self.charge_steps(bulk_cost(entries.len()) as i64);
+                return Some(match op {
+                    ops::KEYS => Value::heap(self.heap.alloc(HeapObj::Array(entries.into_iter().map(|(k, _)| k).collect()))),
+                    ops::VALUES => Value::heap(self.heap.alloc(HeapObj::Array(entries.into_iter().map(|(_, v)| v).collect()))),
+                    ops::ENTRIES => {
+                        let items = entries.into_iter().map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v])))).collect();
+                        Value::heap(self.heap.alloc(HeapObj::Array(items)))
+                    }
+                    _ => {
+                        let kinds = PyKinds::default();
+                        let mut table = PyTable::with_kinds(false, kinds);
+                        let mut steps = 0;
+                        for (k, v) in entries {
+                            let _ = native_set_item(&self.heap, &kinds, &mut table, k, v, &mut steps);
+                        }
+                        self.charge_steps(steps as i64);
+                        Value::heap(self.heap.alloc(HeapObj::PyTable(Box::new(table))))
+                    }
+                });
+            }
+            _ => {}
+        }
+        self.py_attrs_materialize(t);
+        None
     }
 
     /// Detach the table at `idx` from its heap slot (an empty table stays

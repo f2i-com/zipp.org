@@ -4,7 +4,10 @@
 //!
 //! Those instructions answer from the runtime's per-class tables (`ga`, `sa`,
 //! `gm`, `gv`, `gp`, `sp`: plain objects keyed by attribute name) and an
-//! instance's `dict` (a `Map`). A site's ordinary path finds the name in each
+//! instance's `dict`: layout-mode attribute storage (`vm::py_table::layout`,
+//! where a site caches the class, its stamp, the layout and the slot, and a
+//! layout proves a name absent), a dict-mode table, or a `Map` (an object
+//! made by other code). A site's ordinary path finds the name in each
 //! and records what it found in the site's cache entry (`vm::py_rt`), keyed
 //! by the class and its version stamp; a later hit checks the stamp and the
 //! dict entry at the recorded position instead (see `vm::py_rt`).
@@ -191,11 +194,38 @@ impl<'p> Vm<'p> {
         let (cls, dict) = self.py_inst_parts(o)?;
         let ty = self.py_rt.as_deref()?.ty?;
         let e = self.py_ic(func_id, ip);
-        if e.kind == ic::ATTR_GET && cls.bits() == e.a && cls.is_heap() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
-            if let Some(v) = self.py_map_at(dict, e.pos, e.b, e.d) {
-                return Some(v);
+        if cls.bits() == e.a && cls.is_heap() {
+            match e.kind {
+                // The instance's layout puts the name at `pos`.
+                ic::ATTR_GET_L => {
+                    if let Some(v) = self.py_attrs_at(dict, e.d, e.pos as usize) {
+                        if self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                            return Some(v);
+                        }
+                    }
+                }
+                // The instance's layout lacks the name: the class's plain
+                // attribute (what `PyClassAttr` would answer next).
+                ic::GET_CLASS_L => {
+                    if self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) && self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                        if let Some(v) = self.py_table_at(cls, ty.gv, e.b, e.pos) {
+                            if !v.is_undefined() && v != Value::HOLE {
+                                return Some(v);
+                            }
+                        }
+                    }
+                }
+                ic::ATTR_GET => {
+                    if self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                        if let Some(v) = self.py_map_at(dict, e.pos, e.b, e.d) {
+                            return Some(v);
+                        }
+                    }
+                }
+                _ => {}
             }
-        } else if self.py_not_plain(&e, cls, ty.ga) {
+        }
+        if self.py_not_plain(&e, cls, ty.ga) {
             return None;
         }
         let name = self.py_const_name(func_id, key)?;
@@ -208,9 +238,37 @@ impl<'p> Vm<'p> {
             return None;
         }
         let k = self.resolve_const_slot(func_id, key);
+        if let Some((l, _)) = self.py_attrs_of(dict) {
+            if let Some(slot) = self.py_layout_find(l, k) {
+                let v = self.py_attrs_at(dict, l, slot)?;
+                self.py_attr_note_l(func_id, ip, ic::ATTR_GET_L, cls, l, slot, 0);
+                return Some(v);
+            }
+            // Not the instance's: the class's plain attribute, if it has one.
+            let (t, s, v) = self.py_table_entry(cls, ty.gv, "gv", name)?;
+            if v.is_undefined() || v == Value::HOLE {
+                return None;
+            }
+            if let (Some((hver, ver)), Ok(pos)) = (self.py_cls_stamp(cls), u32::try_from(s)) {
+                self.py_ic_put(func_id, ip, PyIc { kind: ic::GET_CLASS_L, pos, hver, a: cls.bits(), b: t.bits(), c: ver, d: l });
+            }
+            return Some(v);
+        }
+        if matches!(self.heap.get(dict.heap_index()), HeapObj::PyTable(_)) {
+            return self.py_table_get(dict, k)?;
+        }
         let (pos, v) = self.py_map_find(dict, k)?;
         self.py_attr_note(func_id, ip, ic::ATTR_GET, cls, dict, pos, key);
         Some(v)
+    }
+
+    /// Record a layout-mode entry for a `ga` / `sa` site: the name at
+    /// `slot` of layout `l` (`to`: the layout an append makes).
+    fn py_attr_note_l(&mut self, func_id: u32, ip: usize, kind: u8, cls: Value, l: u32, slot: usize, to: u32) {
+        let (Some((hver, ver)), Ok(pos)) = (self.py_cls_stamp(cls), u32::try_from(slot)) else {
+            return;
+        };
+        self.py_ic_put(func_id, ip, PyIc { kind, pos, hver, a: cls.bits(), b: u64::from(to), c: ver, d: l });
     }
 
     /// Record an instance-dict entry found at `pos` for a `ga` / `sa` site.
@@ -242,16 +300,39 @@ impl<'p> Vm<'p> {
         let Some((cls, dict)) = self.py_inst_parts(o) else {
             return Ok(false);
         };
-        if !dict.is_heap() || !matches!(self.heap.get(dict.heap_index()), HeapObj::Map { .. }) {
+        if !dict.is_heap() {
             return Ok(false);
         }
         let di = dict.heap_index();
         let e = self.py_ic(func_id, ip);
+        // Layout mode: a value replaced at its slot, or appended.
+        if cls.bits() == e.a && cls.is_heap() {
+            match e.kind {
+                ic::ATTR_SET_L => {
+                    if self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) && self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                        self.py_attrs_put(di, e.pos as usize, v);
+                        return Ok(true);
+                    }
+                }
+                ic::ATTR_APPEND_L => {
+                    if self.py_attrs_of(dict) == Some((e.d, e.pos as usize)) && self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                        self.py_attrs_push(di, e.b as u32, v);
+                        return Ok(true);
+                    }
+                }
+                _ => {}
+            }
+        }
         let Some(ty) = self.py_rt.as_deref().and_then(|p| p.ty) else {
             return Ok(false);
         };
         if self.py_not_plain(&e, cls, ty.sa) {
             return Ok(false);
+        }
+        match self.heap.get(di) {
+            HeapObj::PyAttrs { .. } | HeapObj::PyTable(_) => return self.py_attr_set_store(func_id, ip, cls, dict, key, v),
+            HeapObj::Map { .. } => {}
+            _ => return Ok(false),
         }
         if (e.kind == ic::ATTR_SET || e.kind == ic::ATTR_APPEND) && cls.bits() == e.a && self.py_cls_stamp_ok(cls, e.hver, e.c) {
             if e.kind == ic::ATTR_SET && self.py_map_at(dict, e.pos, e.b, e.d).is_some() {
@@ -309,6 +390,68 @@ impl<'p> Vm<'p> {
             self.py_attr_note(func_id, ip, ic::ATTR_SET, cls, dict, pos, key);
         }
         Ok(true)
+    }
+
+    /// [`Vm::py_attr_set`] into layout-mode or table storage, past the
+    /// site's cache.
+    fn py_attr_set_store(&mut self, func_id: u32, ip: usize, cls: Value, dict: Value, key: u32, v: Value) -> Result<bool, Thrown> {
+        let Some(ty) = self.py_rt.as_deref().and_then(|p| p.ty) else {
+            return Ok(false);
+        };
+        let Some(name) = self.py_const_name(func_id, key) else {
+            return Ok(false);
+        };
+        match self.py_table_entry(cls, ty.sa, "sa", name) {
+            Some((_, _, flag)) if flag == Value::TRUE => {}
+            _ => {
+                self.py_note_not_plain(func_id, ip, cls, ty.sa, "sa", name);
+                return Ok(false);
+            }
+        }
+        let k = self.resolve_const_slot(func_id, key);
+        let di = dict.heap_index();
+        if let Some((l, n)) = self.py_attrs_of(dict) {
+            if let Some(slot) = self.py_layout_find(l, k) {
+                self.py_attrs_put(di, slot, v);
+                self.py_attr_note_l(func_id, ip, ic::ATTR_SET_L, cls, l, slot, 0);
+                return Ok(true);
+            }
+            if let Some(to) = self.py_layout_child(l, k) {
+                self.py_attrs_push(di, to, v);
+                self.py_attr_note_l(func_id, ip, ic::ATTR_APPEND_L, cls, l, n, to);
+                if let Some(p) = self.py_rt.as_deref_mut() {
+                    p.layouts.note_size(cls, n + 1);
+                }
+                return Ok(true);
+            }
+            self.py_attrs_materialize(dict);
+        }
+        Ok(matches!(self.py_table_set(dict, k, v), Some(Ok(_))))
+    }
+
+    /// Whether instance storage `d` lacks the name `name` (`k` its
+    /// constant), `known` a layout already proven to lack it: the answer and
+    /// the layout it proves lacking (0: none). `None` when it cannot tell.
+    fn py_store_lacks(&mut self, d: Value, name: &str, k: Value, known: u32) -> Option<(bool, u32)> {
+        if let Some((l, _)) = self.py_attrs_of(d) {
+            if l == known {
+                return Some((true, l));
+            }
+            let lacks = self.py_layout_find(l, k).is_none();
+            return Some((lacks, if lacks { l } else { 0 }));
+        }
+        if d.is_heap() && matches!(self.heap.get(d.heap_index()), HeapObj::PyTable(_)) {
+            return Some((self.py_table_get(d, k)?.is_none(), 0));
+        }
+        self.py_dict_lacks(d, name, k).map(|b| (b, 0))
+    }
+
+    /// Record the layout `l` proven to lack a site's name in its entry `e`.
+    fn py_note_lacks(&mut self, func_id: u32, ip: usize, mut e: PyIc, l: u32) {
+        if l != 0 && l != e.d {
+            e.d = l;
+            self.py_ic_put(func_id, ip, e);
+        }
     }
 
     /// Whether the `Map` `idx` has exactly `len` entries (holes included),
@@ -409,9 +552,14 @@ impl<'p> Vm<'p> {
             if e.kind == ic::METHOD {
                 if let Some(f) = self.py_table_at(cls, ty.gm, e.b, e.pos) {
                     if self.py_plain_rec(f) {
+                        if e.d != 0 && self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) {
+                            return Some(f);
+                        }
                         let name = self.py_const_name(func_id, key)?;
                         let k = self.resolve_const_slot(func_id, key);
-                        return self.py_dict_lacks(dict, name, k)?.then_some(f);
+                        let (lacks, l) = self.py_store_lacks(dict, name, k, e.d)?;
+                        self.py_note_lacks(func_id, ip, e, l);
+                        return lacks.then_some(f);
                     }
                 }
             } else if e.kind == ic::BUILTIN_METHOD && dict.is_undefined() {
@@ -432,11 +580,12 @@ impl<'p> Vm<'p> {
             let name = self.py_const_name(func_id, key)?;
             if let Some((t, s, m)) = self.py_table_entry(cls, ty.gm, "gm", name) {
                 if self.py_plain_rec(m) {
-                    if let (Some((hver, ver)), Ok(pos)) = (stamp, u32::try_from(s)) {
-                        self.py_ic_put(func_id, ip, PyIc { kind: ic::METHOD, pos, hver, a: cls.bits(), b: t.bits(), c: ver, d: 0 });
-                    }
                     let k = self.resolve_const_slot(func_id, key);
-                    return self.py_dict_lacks(dict, name, k)?.then_some(m);
+                    let (lacks, l) = self.py_store_lacks(dict, name, k, 0)?;
+                    if let (Some((hver, ver)), Ok(pos)) = (stamp, u32::try_from(s)) {
+                        self.py_ic_put(func_id, ip, PyIc { kind: ic::METHOD, pos, hver, a: cls.bits(), b: t.bits(), c: ver, d: l });
+                    }
+                    return lacks.then_some(m);
                 }
             }
         }
@@ -471,8 +620,12 @@ impl<'p> Vm<'p> {
         let k = self.resolve_const_slot(func_id, key);
         if e.kind == ic::CLASS_ATTR && cls.bits() == e.a && self.py_cls_stamp_ok(cls, e.hver, e.c) {
             if let Some(v) = self.py_table_at(cls, ty.gv, e.b, e.pos) {
-                if !v.is_undefined() && v != Value::HOLE && self.py_dict_lacks(dict, name, k)? {
-                    return Some(v);
+                if !v.is_undefined() && v != Value::HOLE {
+                    let (lacks, l) = self.py_store_lacks(dict, name, k, e.d)?;
+                    self.py_note_lacks(func_id, ip, e, l);
+                    if lacks {
+                        return Some(v);
+                    }
                 }
             }
         }
@@ -481,7 +634,8 @@ impl<'p> Vm<'p> {
             self.py_note_not_plain(func_id, ip, cls, ty.ga, "ga", name);
             return None;
         }
-        if !self.py_dict_lacks(dict, name, k)? {
+        let (lacks, l) = self.py_store_lacks(dict, name, k, 0)?;
+        if !lacks {
             return None;
         }
         let (t, s, v) = self.py_table_entry(cls, ty.gv, "gv", name)?;
@@ -489,7 +643,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         if let (Some((hver, ver)), Ok(pos)) = (self.py_cls_stamp(cls), u32::try_from(s)) {
-            self.py_ic_put(func_id, ip, PyIc { kind: ic::CLASS_ATTR, pos, hver, a: cls.bits(), b: t.bits(), c: ver, d: 0 });
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::CLASS_ATTR, pos, hver, a: cls.bits(), b: t.bits(), c: ver, d: l });
         }
         Some(v)
     }
@@ -585,13 +739,14 @@ impl<'p> Vm<'p> {
             }
             (e, slot)
         };
-        // `{ cls: this, dict: new Map() }`, as the entry's literal makes it.
+        // `{ cls: this, dict: <attribute storage> }`, as the entry's literal
+        // makes it, the storage presized for the class's instances.
         if inst_shape == crate::shape::DICT || !self.py_alloc_like_ok(tmpl, inst_shape) {
             return None;
         }
-        let map = self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
-        self.adopt_native_result_realm(map, self.map_proto);
-        let obj = self.py_alloc_like(tmpl, inst_shape, &[cls, Value::heap(map)])?;
+        let cap = self.py_rt.as_deref().map_or(0, |p| p.layouts.presize(cls));
+        let map = self.py_attrs_new(cap);
+        let obj = self.py_alloc_like(tmpl, inst_shape, &[cls, map])?;
         if (entry_slot, init_slot) != (entry_hint, init_hint) {
             if let (Ok(pos), Ok(hver)) = (u32::try_from(entry_slot), u32::try_from(init_slot)) {
                 self.py_ic_put(func_id, ip, PyIc { kind: ic::NEW, pos, hver, ..PyIc::default() });
