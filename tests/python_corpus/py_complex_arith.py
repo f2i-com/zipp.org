@@ -28,11 +28,18 @@ print("-- powers")
 bases = [0j, -0j, 1j, -1j, 1 + 1j, 2 - 3j, 0.5 + 0.5j, -2 + 0j, complex(1e200, 1e200), complex(inf, 0), complex(nan, 0), 2, -2, 0, 2.5, 0.0]
 exponents = [0, 1, 2, 3, -1, -2, 10, 100, 101, -100, 0.5, -0.5, 1j, -1j, 2 + 1j, 0j, 1.0, 2.0, 100.0, 1e20, complex(2, 0), complex(2, -0.0),
              complex(inf, 0), complex(nan, 0)]
+def r12(v):
+    # Twelve significant digits: pow's transcendental paths come from the
+    # platform libm, which can differ from CPython's in the last bit.
+    if isinstance(v, complex):
+        return complex(float(f"{v.real:.12g}"), float(f"{v.imag:.12g}"))
+    return v
+
 for a in bases:
     for b in exponents:
         if not isinstance(a, complex) and not isinstance(b, complex):
             continue
-        print(repr(a), "**", repr(b), show(lambda: a ** b))
+        print(repr(a), "**", repr(b), show(lambda: r12(a ** b)))
 print(show(lambda: pow(1j, 2)), show(lambda: pow(1j, 2, 3)), show(lambda: pow(2, 1j, 3)), show(lambda: pow(2, 3, 1j)), show(lambda: pow(1j, 2, None)))
 print(show(lambda: (1 + 1j) ** 50), show(lambda: (1 + 1j) ** -50), show(lambda: (1.0000001 + 0j) ** 1e10), show(lambda: complex(1e300, 0) ** 2))
 
