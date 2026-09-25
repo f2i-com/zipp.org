@@ -172,6 +172,39 @@ pub fn set_python_runtime_memo(enabled: bool) {
     #[cfg(not(feature = "python"))]
     let _ = enabled;
 }
+/// Keep compiled Python code (the runtime every program starts from, and
+/// library modules as they are imported) in `dir` between processes, or not
+/// at all (`None`, the default). For a host that runs one program per
+/// process, such as the `zipp` command: only the first process then compiles
+/// the runtime (about 0.7 MB of JavaScript) and each library module. Entries
+/// belong to the executable and settings that wrote them, see
+/// `frontend/python/code_cache.rs`. Takes effect if called before the first
+/// Python compile; ignored on `wasm32`.
+pub fn set_python_runtime_cache(dir: Option<std::path::PathBuf>) {
+    #[cfg(feature = "python")]
+    python::set_runtime_cache(dir);
+    #[cfg(not(feature = "python"))]
+    let _ = dir;
+}
+/// Get Python ready ahead of the first program: compile the runtime every
+/// Python program starts from (about 0.7 MB of JavaScript) into the
+/// per-process memo ([`set_python_runtime_memo`], on by default), then run
+/// an empty program once, so the code that initializes a Python state has
+/// run before (on WebAssembly, the host's compiler optimizes it). A host
+/// that expects to run Python calls it while idle so the first run does not
+/// wait for either. Programs behave exactly as without it. A package added
+/// later (`crate::python_packages`) makes the next Python compile rebuild
+/// the runtime.
+pub fn prewarm_python() -> Result<(), String> {
+    #[cfg(feature = "python")]
+    {
+        python::prewarm()?;
+        let mut compiled = compile_python_project("main", &[("main".to_owned(), "pass\n".to_owned())])?;
+        compiled.state_mut().run_init().map(drop)
+    }
+    #[cfg(not(feature = "python"))]
+    Err("Python support is not built; enable the `python` Cargo feature".into())
+}
 fn compile_python_entry<S: AsRef<str>>(
     entry: &str,
     entry_file: Option<&str>,

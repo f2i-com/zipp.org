@@ -23,6 +23,8 @@ mod symtable;
 mod library_check;
 #[cfg(test)]
 mod minify_check;
+#[cfg(not(target_arch = "wasm32"))]
+mod code_cache;
 
 use emitter::{Emitter, Unit, MAX_FUNCTIONS};
 
@@ -723,7 +725,13 @@ fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::Fu
     // imports: those sharing a head with a name it imports, or with itself
     // (`Emitter::module_exists`, `package_of`). So projects that do not
     // define such modules share one compile.
-    let key = if memo {
+    // The same key names the module's compiled code on disk, for a host that
+    // keeps it there (`code_cache`).
+    #[cfg(not(target_arch = "wasm32"))]
+    let disk = code_cache::enabled();
+    #[cfg(target_arch = "wasm32")]
+    let disk = false;
+    let key = if memo || disk {
         let mut heads = BTreeSet::new();
         if let Some(bundled) = library().into_iter().find(|m| m.name == module.name) {
             bundled_imports(bundled.imports, bundled.name, &mut heads);
@@ -756,7 +764,13 @@ fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::Fu
     };
     let cached = key
         .as_ref()
+        .filter(|_| memo)
         .and_then(|key| CACHE.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.get(key).cloned())));
+    #[cfg(not(target_arch = "wasm32"))]
+    let cached = cached.or_else(|| {
+        let key = key.as_deref().filter(|_| disk)?;
+        code_cache::load_module(key, module.source).map(Arc::new)
+    });
     let functions = match cached {
         Some(functions) => functions,
         None => {
@@ -786,7 +800,11 @@ fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::Fu
             let fragment = fragment.into_inner();
             relocatable(name, &fragment, lazy.rt_slot, lazy.line_slot)?;
             let functions = Arc::new(fragment.functions);
-            if let Some(key) = key {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(key) = key.as_deref().filter(|_| disk) {
+                code_cache::store_module(key, module.source, &functions);
+            }
+            if let Some(key) = key.filter(|_| memo) {
                 if let Ok(mut cache) = CACHE.lock() {
                     let cache = cache.get_or_insert_with(HashMap::new);
                     if cache.len() >= CACHE_MAX {
@@ -924,6 +942,19 @@ struct RuntimeSeed {
 /// Whether [`runtime_seed`] keeps the compiled runtime for later programs.
 static SEED_MEMO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// See [`super::prewarm_python`].
+pub(super) fn prewarm() -> R<()> {
+    runtime_seed().map(drop)
+}
+
+/// See [`super::set_python_runtime_cache`].
+pub(super) fn set_runtime_cache(dir: Option<std::path::PathBuf>) {
+    #[cfg(not(target_arch = "wasm32"))]
+    code_cache::set_dir(dir);
+    #[cfg(target_arch = "wasm32")]
+    let _ = dir;
+}
+
 /// See [`super::set_python_runtime_memo`].
 pub(super) fn set_runtime_memo(enabled: bool) {
     SEED_MEMO.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -974,6 +1005,10 @@ fn compile_runtime_seed(packages: &[&crate::python_packages::Installed]) -> R<Ru
         }
     }
     let runtime = format!("{runtime}\n{NATIVE_GPU_RUNTIME}\n{INTEROP_RUNTIME}\n{RUNTIME_ENTRY}");
+    // Loaded instead when a host keeps compiled code on disk (`code_cache`).
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut program = code_cache::runtime(&runtime)?;
+    #[cfg(target_arch = "wasm32")]
     let mut program = crate::compile_only(&runtime, false)?;
     // Only this program — the Python runtime every Python state is built
     // from — gets the native tensor loops (`vm::py_tensor`).

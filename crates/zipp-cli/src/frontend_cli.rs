@@ -13,9 +13,27 @@ pub(super) fn try_run(args: &[String]) -> Option<Result<(), String>> {
     if first != "py" && first != "run" && first != "--lang" && !first.starts_with("--lang=") {
         return None;
     }
-    // One program per process: its compiled runtime is never reused.
+    // One program per process: its compiled runtime is never reused in the
+    // process, but compiled code is kept on disk for the next one.
     zipp_vm::frontend::set_python_runtime_memo(false);
+    zipp_vm::frontend::set_python_runtime_cache(python_cache_dir());
     Some(run(args))
+}
+
+/// Where compiled Python code is kept between runs: `ZIPP_CACHE_DIR` (set
+/// but empty: nowhere), else the platform's per-user cache folder.
+fn python_cache_dir() -> Option<PathBuf> {
+    let env = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(dir) = std::env::var_os("ZIPP_CACHE_DIR") {
+        return (!dir.is_empty()).then(|| PathBuf::from(dir));
+    }
+    Some(if cfg!(windows) {
+        env("LOCALAPPDATA")?.join("zipp").join("cache")
+    } else if cfg!(target_os = "macos") {
+        env("HOME")?.join("Library/Caches/zipp")
+    } else {
+        env("XDG_CACHE_HOME").or_else(|| Some(env("HOME")?.join(".cache")))?.join("zipp")
+    })
 }
 fn run(args: &[String]) -> Result<(), String> {
     let first = args[0].as_str();

@@ -14,6 +14,8 @@ mod pyimports;
 mod sha256;
 #[path = "build/abi.rs"]
 mod abi;
+#[path = "build/instr_codec.rs"]
+mod instr_codec;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -21,6 +23,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build/pyimports.rs");
     println!("cargo:rerun-if-changed=build/sha256.rs");
     println!("cargo:rerun-if-changed=build/abi.rs");
+    println!("cargo:rerun-if-changed=build/instr_codec.rs");
+    println!("cargo:rerun-if-changed=src/bytecode.rs");
     println!("cargo:rerun-if-changed=src/vm/py_tensor/args.rs");
     println!("cargo:rerun-if-changed=src/vm/py_tensor/wire.rs");
     let root = Path::new("src/frontend/python");
@@ -31,6 +35,9 @@ fn main() {
         mirror(&root.join(dir), &out.join(dir));
     }
     let gen = out.parent().unwrap();
+    // The bytecode codec's per-instruction code (src/bytecode_codec.rs).
+    let bytecode = std::fs::read_to_string("src/bytecode.rs").expect("read src/bytecode.rs");
+    write_if_changed(&gen.join("instr_codec.rs"), &instr_codec::generate(&bytecode));
     bundled(&root.join("lib"), "base", &gen.join("bundled.rs"));
     bundled(&root.join("lib"), "torch", &gen.join("bundled_torch.rs"));
     write_if_changed(&gen.join("package_abi.txt"), &abi::package_abi(Path::new(".")));

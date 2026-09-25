@@ -553,6 +553,8 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("\nenvironment:");
             println!("  ZIPP_NOJIT=1                    interpreter only (no native codegen)");
             println!("  ZIPP_GC_STRESS=1                collect on every allocation");
+            #[cfg(feature = "python")]
+            println!("  ZIPP_CACHE_DIR=<dir>            where `zipp py` keeps compiled Python between runs (empty: nowhere)");
             println!("\nsandbox defaults:");
             println!("  --timeout-ms 5000               hard child-process wall deadline");
             println!("  --max-steps 50000000            VM instruction budget");

@@ -72,6 +72,16 @@ pub fn add_python_package(archive: &[u8], kernels: JsValue) -> Result<String, Js
     ))
 }
 
+/// Compile the Python runtime now, while the host is idle, so the first
+/// Python engine does not wait for it (about a quarter of a second on a cold
+/// module). Every Python engine this module creates afterwards starts from
+/// the compiled copy; programs behave exactly as without it. Adding a
+/// package afterwards means one more compile, so add packages first.
+#[wasm_bindgen(js_name = prewarmPython)]
+pub fn prewarm_python() -> Result<(), JsValue> {
+    zipp_vm::frontend::prewarm_python().map_err(|e| JsValue::from_str(&e))
+}
+
 /// This engine's Python packages as JSON: the package ABI a package must be
 /// built against, whether torch is built in, and what has been added.
 #[wasm_bindgen(js_name = pythonPackages)]
