@@ -11,7 +11,8 @@
 //!
 //! * the key is the unified `(func_id, constant-slot)` pair, so main code,
 //!   loader modules and monotonically-installed eval functions cannot collide;
-//! * only short literals and a bounded number of slots/functions are retained;
+//! * only short literals and a bounded number of slots/functions are retained
+//!   (past the first few thousand slots, only name-sized ones);
 //! * any function containing a bytecode op licensed to mutate a unique string
 //!   buffer is rejected wholesale. Such an op relies on a literal load being a
 //!   fresh representation; the cache is a hidden alias, so sharing there would
@@ -24,10 +25,19 @@
 use super::*;
 
 /// At most this many primitive representations are retained per VM.
-pub(super) const CONST_STRING_CACHE_MAX_ENTRIES: usize = 4096;
+pub(super) const CONST_STRING_CACHE_MAX_ENTRIES: usize = 1 << 15;
 /// Avoid duplicating arbitrarily large source literals into a permanent cache.
-/// Together with the entry cap this bounds retained string payload to 1 MiB.
 pub(super) const CONST_STRING_CACHE_MAX_BYTES: usize = 256;
+/// Past this many entries only name-sized literals (at most
+/// [`CONST_STRING_CACHE_NAME_BYTES`]) are cached. A large program (the
+/// Python frontend's torch library executes some 8-16K string-constant
+/// slots, nearly all attribute, key and op names) keeps one representation
+/// per slot instead of allocating the name on every load past the first
+/// few thousand; the entry caps bound retained string payload to
+/// 4096 * 256 B + (32768 - 4096) * 32 B, under 2 MiB.
+pub(super) const CONST_STRING_CACHE_WIDE_ENTRIES: usize = 4096;
+/// See [`CONST_STRING_CACHE_WIDE_ENTRIES`].
+pub(super) const CONST_STRING_CACHE_NAME_BYTES: usize = 32;
 /// Dynamic code installs monotonically increasing function ids. Bound the
 /// accompanying eligibility memo too; beyond it we fail closed to fresh loads.
 const CONST_STRING_CACHE_MAX_FUNCTIONS: usize = 4096;
@@ -104,7 +114,9 @@ impl Vm<'_> {
         if let Some(&cached) = self.const_string_cache.get(&key) {
             return cached;
         }
-        if self.const_string_cache.len() >= CONST_STRING_CACHE_MAX_ENTRIES
+        let len = self.const_string_cache.len();
+        if len >= CONST_STRING_CACHE_MAX_ENTRIES
+            || (len >= CONST_STRING_CACHE_WIDE_ENTRIES && source_bytes > CONST_STRING_CACHE_NAME_BYTES)
             || !self.const_string_func_shareable(func_id)
         {
             return self.resolve_const(func_id, raw);
@@ -251,6 +263,36 @@ mod tests {
         assert!(!vm
             .const_string_cache
             .contains_key(&slot_key(short_func, short_const)));
+    }
+
+    #[test]
+    fn past_the_wide_entries_only_name_sized_literals_are_cached() {
+        let name = "n".repeat(CONST_STRING_CACHE_NAME_BYTES);
+        let wide = "w".repeat(CONST_STRING_CACHE_NAME_BYTES + 1);
+        let source = format!("function name_value() {{ return {name:?}; }}
+function wide_value() {{ return {wide:?}; }}");
+        let mut vm = vm(&source);
+        vm.const_string_cache.clear();
+        for n in 0..CONST_STRING_CACHE_WIDE_ENTRIES as u64 {
+            vm.const_string_cache
+                .insert(u64::MAX - n, Value::heap(crate::heap::INTERN_EMPTY));
+        }
+        let (wide_func, wide_const) = literal_slot(&vm, &wide);
+        let wide_a = vm.resolve_const_slot(wide_func, wide_const);
+        let wide_b = vm.resolve_const_slot(wide_func, wide_const);
+        assert_eq!(vm.display(wide_a), wide);
+        assert_ne!(wide_a, wide_b);
+        assert!(!vm
+            .const_string_cache
+            .contains_key(&slot_key(wide_func, wide_const)));
+        let (name_func, name_const) = literal_slot(&vm, &name);
+        let name_a = vm.resolve_const_slot(name_func, name_const);
+        let name_b = vm.resolve_const_slot(name_func, name_const);
+        assert_eq!(vm.display(name_a), name);
+        assert_eq!(name_a, name_b);
+        assert!(vm
+            .const_string_cache
+            .contains_key(&slot_key(name_func, name_const)));
     }
 
     #[test]
