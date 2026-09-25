@@ -2477,6 +2477,21 @@ pub enum Instr {
         n: u16,
         slow: u32,
     },
+    /// Python frontend: `f(args...)` with `argc` positional values in
+    /// `arg_base..`, for `f` a plain object whose own data `c<argc>` (the
+    /// positional entry for the count, see `R.func`) is a plain function
+    /// (not a generator, async function or anything exotic): that entry is
+    /// called with `this` = `f`, exactly as `CallWithThis` calls it, its
+    /// result to `dst`. Anything else jumps to `slow` having changed
+    /// nothing. The entry's slot is cached per site (`vm::py_rt`).
+    #[allow(dead_code)] // emitted by the Python frontend only
+    PyCall {
+        dst: Reg,
+        f: Reg,
+        arg_base: Reg,
+        argc: u16,
+        slow: u32,
+    },
 }
 
 /// The operators of [`Instr::PyArith`]. `Add`, `Sub` and `Mul` take every

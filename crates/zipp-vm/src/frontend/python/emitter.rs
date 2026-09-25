@@ -49,6 +49,24 @@ pub(super) fn py_fast_paths() -> bool {
         }
     }
 }
+/// Whether plain positional calls compile to one `PyCall` (with the entry
+/// lookup and `CallWithThis` out of line) instead of `PyCallEntry` +
+/// `CallWithThis`. Off unless `ZIPP_PY_CALL=1` (any value but `0`): the
+/// native tiers do not compile `PyCall` yet, and a loop holding an
+/// instruction they do not know stays interpreted. Read once per process.
+pub(super) fn py_call_op() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_PY_CALL").is_some_and(|v| v != "0");
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 pub(super) const MAX_DEPTH: usize = 96;
 /// Code objects with at most this many bound values take them as their own
 /// parameters (registers 1..=n); larger ones take one array. The runtime's
@@ -70,8 +88,15 @@ pub(super) struct ColdBlock<'a> {
     slow_edges: Vec<usize>,
     mark: usize,
     resume: u32,
+    /// The line in effect where the block was deferred (its code runs as
+    /// part of that statement, wherever it is laid out).
+    line: i32,
     body: Box<dyn FnOnce(&mut Emitter<'a>) -> R<()> + 'a>,
 }
+
+/// The first bytes of the string constant a Python code object ends with,
+/// its frame table (see [`Emitter::finish`] and `vm::py_rt`).
+pub(crate) const FRAME_TABLE_TAG: &str = "\u{1}pyframe:";
 
 pub(super) struct LoopCtx {
     pub head: u32,
@@ -143,12 +168,19 @@ pub(super) struct Emitter<'a> {
     pub loops: Vec<LoopCtx>,
     pub handler_depth: usize,
     pub qualname: String,
+    /// The last line [`Emitter::stamp_line`] recorded (-1: none since the
+    /// last jump target).
     last_line: i32,
-    /// The frame guard's opening line stamp, not emitted yet (see
-    /// [`Emitter::frame_guard`]): the next instruction emitted (or a jump
-    /// target taken) first puts it in the line register, unless that
-    /// instruction is itself a line stamp, which makes it dead.
-    pending_line: Option<i32>,
+    /// The ip -> line table: `(ip, line)` from each ip on, in code order,
+    /// the line being the encoded `module * 1_000_000 + line` (see
+    /// [`Emitter::stamp_line`]). Nothing is emitted for a line: the VM reads
+    /// the table when an exception meets this frame.
+    lines: Vec<(u32, i32)>,
+    /// The line in effect at the end of the code so far (the last entry's).
+    line_now: i32,
+    /// The frame guard, once laid out: `(from, start, end, exception
+    /// register)` (see [`Emitter::frame_guard`]).
+    guard: Option<(u32, u32, u32, Reg)>,
     /// [`py_fast_paths`], read once per code object.
     pub fast: bool,
     /// Set by a call whose callee is written as a class usually is (a
@@ -236,7 +268,9 @@ impl<'a> Emitter<'a> {
             handler_depth: 0,
             qualname,
             last_line: -1,
-            pending_line: None,
+            lines: Vec::new(),
+            line_now: -1,
+            guard: None,
             fast: py_fast_paths(),
             ctor_site: false,
             string_ids: HashMap::new(),
@@ -431,6 +465,28 @@ impl<'a> Emitter<'a> {
     pub fn finish(mut self) -> FuncProto {
         debug_assert!(self.cold.is_empty(), "Python emitter: unflushed slow paths");
         self.proto.reg_count = (self.high.max(self.next)) as u16;
+        // The frame table, as the code object's last string constant (no
+        // instruction refers to it): `from,start,end,exception,line` for the
+        // frame guard (`-,line` when there is none), then the ip -> line
+        // entries as deltas from the previous one.
+        if !self.lines.is_empty() || self.guard.is_some() {
+            use std::fmt::Write;
+            let mut t = String::from(FRAME_TABLE_TAG);
+            match self.guard {
+                Some((from, start, end, ereg)) => {
+                    let _ = write!(t, "{from},{start},{end},{ereg},{}", self.r_line);
+                }
+                None => {
+                    let _ = write!(t, "-,{}", self.r_line);
+                }
+            }
+            let (mut ip, mut line) = (0u32, 0i32);
+            for &(at, l) in &self.lines {
+                let _ = write!(t, ";{},{}", at - ip, l - line);
+                (ip, line) = (at, l);
+            }
+            self.proto.string_constants.push(t);
+        }
         self.proto
     }
 
@@ -442,7 +498,8 @@ impl<'a> Emitter<'a> {
     /// it does not name.
     pub fn defer_cold(&mut self, jumps: Vec<usize>, slow_edges: Vec<usize>, body: impl FnOnce(&mut Emitter<'a>) -> R<()> + 'a) {
         let resume = self.here();
-        self.cold.push(ColdBlock { jumps, slow_edges, mark: self.next, resume, body: Box::new(body) });
+        let line = self.line_now;
+        self.cold.push(ColdBlock { jumps, slow_edges, mark: self.next, resume, line, body: Box::new(body) });
     }
     /// Emit the deferred slow paths (they may defer more).
     pub fn flush_cold(&mut self) -> R<()> {
@@ -451,6 +508,7 @@ impl<'a> Emitter<'a> {
             let blocks = std::mem::take(&mut self.cold);
             for block in blocks {
                 let start = self.here();
+                self.line_at(block.line);
                 for j in block.jumps {
                     self.patch(j, start)?;
                 }
@@ -476,10 +534,12 @@ impl<'a> Emitter<'a> {
         // Lines starting at or before the offset; the table always holds 0.
         self.unit.lines.partition_point(|&start| start <= offset).max(1) as i32
     }
-    /// Stamp the current line into this frame's line register (one
-    /// `LoadInt`; skipped when the line has not changed). The frame guard
-    /// and the frame's own handlers read it (`addframe`, `caught`), which
-    /// is where an exception learns the line it was raised on.
+    /// Record that the code from here on runs `node`'s line (an entry of
+    /// the frame table, see [`Emitter::finish`]; nothing is emitted). When
+    /// an exception meets this frame, the VM puts the line of the ip it met
+    /// it at in the line register, which the frame guard and the frame's own
+    /// handlers read (`addframe`, `caught`): where an exception learns the
+    /// line it was raised on.
     pub fn stamp_line(&mut self, node: &impl Ranged) -> R<()> {
         let line = self.line_of(node);
         if line == self.last_line {
@@ -487,11 +547,24 @@ impl<'a> Emitter<'a> {
         }
         self.last_line = line;
         let val = self.unit.module_index as i32 * 1_000_000 + line;
-        self.emit(Instr::LoadInt {
-            dst: self.r_line,
-            val,
-        })?;
+        self.line_at(val);
         Ok(())
+    }
+    /// A frame-table entry: the encoded line `val` from the current ip on.
+    fn line_at(&mut self, val: i32) {
+        let ip = self.proto.code.len() as u32;
+        match self.lines.last_mut() {
+            Some(last) if last.0 == ip => last.1 = val,
+            _ if val == self.line_now => {}
+            _ => self.lines.push((ip, val)),
+        }
+        // An entry overwritten back to the line before it is redundant.
+        if let [.., (_, a), (_, b)] = self.lines.as_slice() {
+            if a == b {
+                self.lines.pop();
+            }
+        }
+        self.line_now = val;
     }
     /// After a jump target the last stamped line is unknown again.
     pub fn forget_line(&mut self) {
@@ -529,12 +602,10 @@ impl<'a> Emitter<'a> {
     }
 
     // ---- instructions ---------------------------------------------------------
+    // Out of line: it is called from hundreds of sites, which inlining it
+    // into would only grow the frontend.
+    #[inline(never)]
     pub fn emit(&mut self, instr: Instr) -> R<usize> {
-        if let Some(val) = self.pending_line.take() {
-            if !matches!(instr, Instr::LoadInt { dst, .. } if dst == self.r_line) {
-                self.emit(Instr::LoadInt { dst: self.r_line, val })?;
-            }
-        }
         if self.proto.code.len() >= MAX_INSTRUCTIONS {
             return Err("Python: per-function bytecode limit exceeded".into());
         }
@@ -543,11 +614,6 @@ impl<'a> Emitter<'a> {
         Ok(at)
     }
     pub fn here(&mut self) -> u32 {
-        // A jump target: the pending stamp goes in first, so a jump there
-        // runs everything the fall-through does.
-        if let Some(val) = self.pending_line.take() {
-            let _ = self.emit(Instr::LoadInt { dst: self.r_line, val });
-        }
         self.proto.code.len() as u32
     }
     pub fn patch(&mut self, at: usize, target: u32) -> R<()> {
@@ -591,7 +657,8 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyUnpack { slow: dst, .. })
             | Some(Instr::PyMakeExc { slow: dst, .. })
             | Some(Instr::PyExcPop { slow: dst, .. })
-            | Some(Instr::PyNew { slow: dst, .. }) => {
+            | Some(Instr::PyNew { slow: dst, .. })
+            | Some(Instr::PyCall { slow: dst, .. }) => {
                 *dst = target;
                 Ok(())
             }
@@ -640,7 +707,8 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyUnpack { slow: dst, .. })
             | Some(Instr::PyMakeExc { slow: dst, .. })
             | Some(Instr::PyExcPop { slow: dst, .. })
-            | Some(Instr::PyNew { slow: dst, .. }) => {
+            | Some(Instr::PyNew { slow: dst, .. })
+            | Some(Instr::PyCall { slow: dst, .. }) => {
                 *dst = target;
                 Ok(())
             }
@@ -902,10 +970,14 @@ impl<'a> Emitter<'a> {
         self.expr(expr, depth)
     }
 
-    /// A function or module body under a catch-all handler that records
-    /// this frame (file, line, name) on any exception passing through, then
-    /// rethrows: the traceback CPython prints, at the cost of one handler
-    /// push per call. The line register starts at the definition line so a
+    /// A function or module body under an implicit catch-all handler that
+    /// records this frame (file, line, name) on any exception passing
+    /// through, then rethrows: the traceback CPython prints. Nothing runs on
+    /// a call for it: the frame table names the guard block (after the
+    /// body), which the VM enters, with the exception and its line in
+    /// registers, when an exception would otherwise leave the frame from an
+    /// ip at or after the body's start and outside the guard block itself
+    /// (see `vm::py_rt`). The body starts at the definition line so a
     /// failure before the first statement (an argument-count error) still
     /// names the frame.
     pub fn frame_guard(
@@ -914,22 +986,15 @@ impl<'a> Emitter<'a> {
         body: impl FnOnce(&mut Emitter<'a>) -> R<()>,
     ) -> R<()> {
         let ereg = self.alloc()?;
-        let push = self.emit(Instr::PushHandler {
-            catch_target: 0,
-            catch_reg: ereg,
-        })?;
-        // The definition line, stamped lazily: the body's first statement
-        // usually stamps its own line first, and nothing runs in between
-        // that could read the register (see `pending_line`).
-        self.pending_line = Some(self.unit.module_index as i32 * 1_000_000 + line);
-        self.handler_depth += 1;
+        let from = self.here();
+        self.line_at(self.unit.module_index as i32 * 1_000_000 + line);
         body(self)?;
-        self.handler_depth -= 1;
-        let here = self.here();
-        self.patch(push, here)?;
+        let start = self.here();
         self.forget_line();
         let exc = self.helper("addframe", &[ereg, REG_FUNC, self.r_line])?;
         self.emit(Instr::Throw { src: exc })?;
+        let end = self.here();
+        self.guard = Some((from, start, end, ereg));
         self.flush_cold()
     }
     /// `call(f, args, kwargs)` through the runtime (one helper frame around
@@ -948,6 +1013,26 @@ impl<'a> Emitter<'a> {
             let args = self.array(regs)?;
             return self.call_positional(f, args);
         }
+        // One `PyCall`; the entry path below, out of line, when it declines
+        // (not at a construction site, whose out-of-line `PyNew` path the
+        // entry path keeps).
+        if !ctor_site && py_call_op() {
+            let dst = self.alloc()?;
+            let (arg_base, argc) = self.arguments(regs)?;
+            let at = self.emit(Instr::PyCall { dst, f, arg_base, argc, slow: 0 })?;
+            let regs = regs.to_vec();
+            self.defer_cold(Vec::new(), vec![at], move |e| {
+                let r = e.call_with_entry(f, &regs, false)?;
+                e.emit(Instr::Move { dst, src: r })?;
+                Ok(())
+            });
+            return Ok(dst);
+        }
+        self.call_with_entry(f, regs, ctor_site)
+    }
+    /// [`Emitter::call_with`] through the entry (`PyCallEntry`, then
+    /// `CallWithThis`), and at a construction site the inline `PyNew`.
+    fn call_with_entry(&mut self, f: Reg, regs: &[Reg], ctor_site: bool) -> R<Reg> {
         let dst = self.alloc()?;
         let entry = self.alloc()?;
         let name = self.string_index(&format!("c{}", regs.len()));

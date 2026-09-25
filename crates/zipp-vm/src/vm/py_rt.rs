@@ -68,7 +68,8 @@ pub(crate) mod hint {
     pub const MAP: usize = 17;
     pub const GS: usize = 18;
     pub const GLOBALS: usize = 19;
-    pub const COUNT: usize = 20;
+    pub const DEFAULTS: usize = 20;
+    pub const COUNT: usize = 21;
 }
 
 /// Kinds of [`PyIc`] entries.
@@ -185,6 +186,76 @@ pub(crate) struct PyRt {
     /// Interned attribute and global names (see `Vm::py_intern`).
     names: rustc_hash::FxHashMap<Box<[u8]>, Value>,
     ics: Vec<Option<Box<FnIc>>>,
+    /// Frame tables by function id, read on first use (see [`PyFrame`]).
+    frames: Vec<FrameSlot>,
+}
+
+/// The first bytes of the string constant a Python code object's frame
+/// table is (the emitter's `FRAME_TABLE_TAG`, which must agree).
+const FRAME_TABLE_TAG: &str = "\u{1}pyframe:";
+
+/// A Python code object's frame table, which the emitter leaves as the
+/// code object's last string constant (`Emitter::finish`): the frame guard
+/// and the line of each ip.
+pub(super) struct PyFrame {
+    /// `(from, start, end, exception register)`: an exception leaving the
+    /// frame from an ip in `from..` outside `start..end` enters the guard
+    /// block at `start` (the handler the emitter's `frame_guard` lays out),
+    /// the exception in the register.
+    guard: Option<(u32, u32, u32, u16)>,
+    /// The register the guard block and the handlers read the line from.
+    line_reg: u16,
+    /// `(ip, line)`: the encoded line from each ip on.
+    lines: Box<[(u32, i32)]>,
+}
+
+#[derive(Default)]
+enum FrameSlot {
+    #[default]
+    Unread,
+    None,
+    Some(Box<PyFrame>),
+}
+
+/// Where a Python code object's frame guard block starts (its main body
+/// ends just before it, its out-of-line blocks follow it), from its frame
+/// table; `None` for code without one.
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn py_frame_guard_start(proto: &crate::bytecode::FuncProto) -> Option<u32> {
+    let body = proto.string_constants.last()?.strip_prefix(FRAME_TABLE_TAG)?;
+    let head = body.split(';').next()?;
+    let mut fields = head.split(',');
+    fields.next()?.parse::<u32>().ok()?;
+    fields.next()?.parse().ok()
+}
+
+impl PyFrame {
+    #[inline(never)]
+    fn parse(text: &str) -> Option<PyFrame> {
+        let body = text.strip_prefix(FRAME_TABLE_TAG)?;
+        let mut parts = body.split(';');
+        let head: Vec<&str> = parts.next()?.split(',').collect();
+        let (guard, line_reg) = match head.as_slice() {
+            ["-", l] => (None, l.parse().ok()?),
+            [f, s, e, x, l] => (Some((f.parse().ok()?, s.parse().ok()?, e.parse().ok()?, x.parse().ok()?)), l.parse().ok()?),
+            _ => return None,
+        };
+        let (mut ip, mut line) = (0u32, 0i32);
+        let mut lines = Vec::new();
+        for entry in parts {
+            let (a, b) = entry.split_once(',')?;
+            ip = ip.checked_add(a.parse().ok()?)?;
+            line = line.checked_add(b.parse().ok()?)?;
+            lines.push((ip, line));
+        }
+        Some(PyFrame { guard, line_reg, lines: lines.into_boxed_slice() })
+    }
+
+    /// The encoded line of the instruction at `ip`.
+    fn line(&self, ip: u32) -> Option<i32> {
+        let n = self.lines.partition_point(|&(at, _)| at <= ip);
+        n.checked_sub(1).map(|i| self.lines[i].1)
+    }
 }
 
 /// The keys of a list or tuple record (`sequence`'s literal).
@@ -223,6 +294,7 @@ impl PyRt {
             hints: std::array::from_fn(|_| Cell::new(0)),
             names: rustc_hash::FxHashMap::default(),
             ics: Vec::new(),
+            frames: Vec::new(),
         }
     }
 }
@@ -248,10 +320,91 @@ fn caches(i: &crate::bytecode::Instr) -> bool {
             | Instr::PyIsInstance { .. }
             | Instr::PyNew { .. }
             | Instr::PyCallEntry { .. }
+            | Instr::PyCall { .. }
     )
 }
 
 impl<'p> Vm<'p> {
+    /// The frame table of function `func_id`, when it is a Python code
+    /// object (read once per function).
+    fn py_frame(&mut self, func_id: u32) -> Option<&PyFrame> {
+        let f = func_id as usize;
+        let proto = self.func(f);
+        let p = self.py_rt.as_deref_mut()?;
+        if p.frames.len() <= f {
+            p.frames.resize_with(f + 1, FrameSlot::default);
+        }
+        if matches!(p.frames[f], FrameSlot::Unread) {
+            p.frames[f] = match proto.string_constants.last().and_then(|t| PyFrame::parse(t)) {
+                Some(frame) => FrameSlot::Some(Box::new(frame)),
+                None => FrameSlot::None,
+            };
+        }
+        match &p.frames[f] {
+            FrameSlot::Some(frame) => Some(frame),
+            _ => None,
+        }
+    }
+
+    /// Whether frame `top` may be a Python code object's (the unwinder's
+    /// quick test before [`Vm::py_unwind_frame`]: a function whose frame
+    /// table was read and found absent is not).
+    #[inline]
+    pub(crate) fn py_unwind_candidate(&self, top: usize) -> bool {
+        match self.py_rt.as_deref() {
+            Some(p) => !matches!(p.frames.get(self.frames[top].func as usize), Some(FrameSlot::None)),
+            None => false,
+        }
+    }
+
+    /// The unwinder at the top frame (`vm::dispatch`'s `unwind_to_handler`),
+    /// when it is a Python code object's: the ip the exception met it at is
+    /// the frame's own (`exact`: it was raised by this frame's instruction)
+    /// or the one before its resume point (a call it made). Entering one of
+    /// the frame's handlers (`handler`), the line of that ip goes in the
+    /// line register (`false`). Leaving it with no handler, the frame guard,
+    /// when the ip is one it covers, is entered instead: the exception and
+    /// the line in its registers, the frame resuming at the guard block
+    /// (`true`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn py_unwind_frame(&mut self, top: usize, exact: bool, tv: Value, handler: bool) -> bool {
+        let (func, base, ip) = {
+            let f = &self.frames[top];
+            (f.func, f.base, f.ip)
+        };
+        let at = if exact { ip } else { ip.saturating_sub(1) };
+        let Ok(at) = u32::try_from(at) else {
+            return false;
+        };
+        let Some(frame) = self.py_frame(func) else {
+            return false;
+        };
+        let line = frame.line(at);
+        let (line_reg, guard) = (frame.line_reg as usize, frame.guard);
+        let write_line = |vm: &mut Self| {
+            if let Some(l) = line {
+                if base + line_reg < vm.regs.len() {
+                    vm.regs[base + line_reg] = Value::int(l);
+                }
+            }
+        };
+        if handler {
+            write_line(self);
+            return false;
+        }
+        let Some((from, start, end, ereg)) = guard else {
+            return false;
+        };
+        if at < from || (start..end).contains(&at) || base + ereg as usize >= self.regs.len() {
+            return false;
+        }
+        write_line(self);
+        self.regs[base + ereg as usize] = tv;
+        self.frames[top].ip = start as usize;
+        true
+    }
+
     /// `__zipp_py_bind(R, pins, dict)`: take the runtime's registry (`dict`
     /// a fresh dict record, for its layout). `undefined`.
     pub(crate) fn py_bind(&mut self, args: &[Value]) -> Value {

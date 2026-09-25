@@ -706,6 +706,12 @@ impl<'p> Vm<'p> {
                 }
                 GenResumeMode::Throw(e) => {
                     // Throw at the suspension point: unwind into the body's handlers.
+                    // The frame is at the suspension point for an unwinder
+                    // that reads it (a Python frame's line, `vm::py_rt`).
+                    #[cfg(feature = "python")]
+                    if resume_ip != usize::MAX {
+                        self.frames[stop].ip = resume_ip;
+                    }
                     self.pending_throw = Some(e);
                     if self.unwind_to_handler(e, stop) {
                         self.pending_throw = None;

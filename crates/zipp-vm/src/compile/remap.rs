@@ -1107,5 +1107,10 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
             *cls = m(*cls);
             *rt = m(*rt);
         }
+        Instr::PyCall { dst, f, arg_base, .. } => {
+            *dst = m(*dst);
+            *f = m(*f);
+            *arg_base = m(*arg_base);
+        }
     }
 }

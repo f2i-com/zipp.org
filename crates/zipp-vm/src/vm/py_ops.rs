@@ -61,6 +61,9 @@ impl<'p> Vm<'p> {
     #[inline(never)]
     pub(crate) fn py_step(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
         let r = self.py_step_run(func_id, base, ip, instr);
+        if r.is_err() {
+            self.py_step_failed(ip);
+        }
         if super::prof_py::on() {
             self.py_prof_step(func_id, ip, instr, &r);
         }
@@ -194,6 +197,9 @@ impl<'p> Vm<'p> {
     #[inline(never)]
     pub(crate) fn py_step_ext(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
         let r = self.py_step_ext_run(func_id, base, ip, instr);
+        if r.is_err() {
+            self.py_step_failed(ip);
+        }
         if super::prof_py::on() {
             self.py_prof_step(func_id, ip, instr, &r);
         }
@@ -417,6 +423,9 @@ impl<'p> Vm<'p> {
     #[inline(never)]
     pub(crate) fn py_step_ext2(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
         let r = self.py_step_ext2_run(func_id, base, ip, instr);
+        if r.is_err() {
+            self.py_step_failed(ip);
+        }
         if super::prof_py::on() {
             self.py_prof_step(func_id, ip, instr, &r);
         }
@@ -467,6 +476,15 @@ impl<'p> Vm<'p> {
     /// entry's slot; the value there is read afresh.
     #[inline(never)]
     fn py_call_entry(&mut self, func_id: u32, ip: usize, f: Value, name: u32) -> Option<Value> {
+        let key: &str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        let e = self.py_entry_of(func_id, ip, f, key)?;
+        self.py_callable_fn(e).then_some(e)
+    }
+
+    /// The record `f`'s own data property `key` when it is a heap value,
+    /// through this site's cache entry.
+    #[inline]
+    fn py_entry_of(&mut self, func_id: u32, ip: usize, f: Value, key: &str) -> Option<Value> {
         if !f.is_heap() {
             return None;
         }
@@ -477,14 +495,12 @@ impl<'p> Vm<'p> {
                 let pos = e.pos as usize;
                 if pos < m.len() && !m.is_accessor_at(pos) {
                     let v = m.val_at(pos);
-                    if self.py_callable_fn(v) {
+                    if v.is_heap() {
                         return Some(v);
                     }
                 }
             }
         }
-        let key: &str = self.func(func_id as usize).string_constants[name as usize].as_str();
-        // `func` borrows the program, not the VM (see `Vm::func`).
         let (v, slot) = match self.heap.get(fi) {
             HeapObj::Object(m) if !m.is_ctor => {
                 let s = m.pos(key)?;
@@ -495,7 +511,7 @@ impl<'p> Vm<'p> {
             }
             _ => return None,
         };
-        if !self.py_callable_fn(v) {
+        if !v.is_heap() {
             return None;
         }
         if let Ok(pos) = u32::try_from(slot) {
@@ -503,6 +519,98 @@ impl<'p> Vm<'p> {
             self.py_ic_put(func_id, ip, PyIc { kind: ic::CALL_ENTRY, pos, hver, a: f.bits(), b: 0, c: 0, d: 0 });
         }
         Some(v)
+    }
+
+    /// [`Instr::PyCall`]: the callee's frame pushed (`usize::MAX`, the
+    /// dispatch loop re-enters it) or the slow edge.
+    #[inline(never)]
+    pub(crate) fn py_step_call(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
+        let crate::bytecode::Instr::PyCall { dst, f, arg_base, argc, slow } = *instr else {
+            return Ok(ip + 1);
+        };
+        let fv = self.get(base, f);
+        let r = match self.py_call_target(func_id, ip, fv, argc) {
+            Some((fid, closure, entry)) => self.setup_call(fid, closure, fv, base, arg_base, argc, dst, ip + 1, entry).map(|()| {
+                if (argc as usize) < self.func(fid as usize).param_count as usize {
+                    self.py_fill_defaults(fv, fid, argc as usize);
+                }
+                usize::MAX
+            }),
+            None => Ok(slow as usize),
+        };
+        if r.is_err() {
+            self.py_step_failed(ip);
+        }
+        if super::prof_py::on() {
+            let shown = match r {
+                Ok(usize::MAX) => Ok(ip + 1),
+                Ok(n) => Ok(n),
+                Err(_) => Err(Thrown(String::new())),
+            };
+            self.py_prof_step(func_id, ip, instr, &shown);
+        }
+        r
+    }
+
+    /// The parameters a [`Instr::PyCall`] left unbound in the frame just
+    /// pushed (`argc` of the code object `fid`'s), bound to `f`'s defaults
+    /// as its prologue binds them (the last `len` positionals take
+    /// `f.defaults`, a dense Array; that prologue then finds them bound).
+    /// Anything else leaves them for the prologue.
+    fn py_fill_defaults(&mut self, f: Value, fid: u32, argc: usize) {
+        let params = self.func(fid as usize).param_count as usize;
+        let Some(d) = self.py_hint_field(super::py_rt::hint::DEFAULTS, f.heap_index(), "defaults") else {
+            return;
+        };
+        if !d.is_heap() || self.array_js_len.contains_key(&d.heap_index()) {
+            return;
+        }
+        let HeapObj::Array(items) = self.heap.get(d.heap_index()) else {
+            return;
+        };
+        let Some(first) = params.checked_sub(items.len()) else {
+            return;
+        };
+        if argc < first {
+            return;
+        }
+        let base = match self.frames.last() {
+            Some(fr) if fr.func == fid => fr.base,
+            _ => return,
+        };
+        for i in argc..params {
+            let v = items[i - first];
+            if v == Value::HOLE || v.is_undefined() || base + 1 + i >= self.regs.len() {
+                return;
+            }
+            self.regs[base + 1 + i] = v;
+        }
+    }
+
+    /// The plain function [`Instr::PyCall`] calls for `f` and `argc`: its
+    /// function id, closure and value.
+    fn py_call_target(&mut self, func_id: u32, ip: usize, f: Value, argc: u16) -> Option<(u32, u32, Value)> {
+        const ENTRIES: [&str; 13] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12"];
+        let name = ENTRIES.get(argc as usize)?;
+        let e = self.py_entry_of(func_id, ip, f, name)?;
+        let (fid, closure) = match self.heap.get(e.heap_index()) {
+            HeapObj::Func(id) => (*id, super::NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, e.heap_index()),
+            _ => return None,
+        };
+        let p = self.func(fid as usize);
+        (!p.is_generator && !p.is_async).then_some((fid, closure, e))
+    }
+
+    /// A fused step raised (its own error, or one from code it ran): the
+    /// frame's ip is the step's, for the unwinder (a Python frame's line,
+    /// `vm::py_rt`).
+    #[cold]
+    #[inline(never)]
+    fn py_step_failed(&mut self, ip: usize) {
+        if let Some(f) = self.frames.last_mut() {
+            f.ip = ip;
+        }
     }
 
     /// Whether `e` is callable (`typeof e === "function"`).

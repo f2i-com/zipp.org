@@ -205,9 +205,18 @@ impl<'p> Vm<'p> {
     /// re-throws after the finally runs. Either way execution resumes (`true`). If
     /// the boundary is reached with no handler, return `false` (propagate).
     pub(crate) fn unwind_to_handler(&mut self, tv: Value, stop_depth: usize) -> bool {
+        // A Python program's frames record where the exception met them
+        // (`vm::py_rt`): at its own instruction in the first frame, at the
+        // call it made in every frame below.
+        #[cfg(feature = "python")]
+        let mut exact = true;
         while self.frames.len() > stop_depth {
             let top = self.frames.len() - 1;
             if let Some(h) = self.frames[top].handlers.pop() {
+                #[cfg(feature = "python")]
+                if self.py_unwind_candidate(top) {
+                    self.py_unwind_frame(top, exact, tv, true);
+                }
                 let base = self.frames[top].base;
                 match h {
                     Handler::Catch { target, reg } => {
@@ -226,6 +235,14 @@ impl<'p> Vm<'p> {
                 }
                 return true;
             }
+            // A Python code object's frame guard (its implicit handler).
+            #[cfg(feature = "python")]
+            {
+                if self.py_unwind_candidate(top) && self.py_unwind_frame(top, exact, tv, false) {
+                    return true;
+                }
+                exact = false;
+            }
             // No handler in this frame: discard it and its register window.
             // Flush a MAPPED arguments object's live formal registers into its
             // dense store first, or an escaped object reads stale entry values.
@@ -242,6 +259,14 @@ impl<'p> Vm<'p> {
     /// Whether [`Self::unwind_to_handler`] with this `stop_depth` would find a
     /// handler: some frame above `stop_depth` has one.
     pub(crate) fn handler_within(&self, stop_depth: usize) -> bool {
+        // A Python program's frames have implicit handlers (their frame
+        // guards, `vm::py_rt`): answered as if one were found, which only
+        // defers building the message (`run_loop` builds it when the throw
+        // leaves uncaught).
+        #[cfg(feature = "python")]
+        if self.py_rt.is_some() {
+            return true;
+        }
         self.frames
             .get(stop_depth..)
             .is_some_and(|fs| fs.iter().rev().any(|f| !f.handlers.is_empty()))
@@ -1588,6 +1613,15 @@ impl<'p> Vm<'p> {
                     Instr::PyMakeExc { .. } | Instr::PyExcPop { .. } | Instr::PyNew { .. } => {
                         ip = self.py_step_ext2(func_id, base, ip, instr)?;
                     }
+                    // A call: a frame pushed (the callee's) re-enters the loop.
+                    #[cfg(feature = "python")]
+                    Instr::PyCall { .. } => {
+                        let next = self.py_step_call(func_id, base, ip, instr)?;
+                        if next == usize::MAX {
+                            break;
+                        }
+                        ip = next;
+                    }
                     // Only the Python frontend emits these; a build without it
                     // carries none of their code.
                     #[cfg(not(feature = "python"))]
@@ -1620,7 +1654,8 @@ impl<'p> Vm<'p> {
                     | Instr::PyUnpack { .. }
                     | Instr::PyMakeExc { .. }
                     | Instr::PyExcPop { .. }
-                    | Instr::PyNew { .. } => {
+                    | Instr::PyNew { .. }
+                    | Instr::PyCall { .. } => {
                         return Err(Thrown("InternalError: Python instruction in a build without Python".to_string()));
                     }
                     Instr::AddInt { dst, a, imm, upd } => {
@@ -10022,6 +10057,12 @@ impl<'p> Vm<'p> {
         callee_val: Value,
     ) -> Result<(), Thrown> {
         if self.frames.len() >= MAX_FRAMES {
+            // The caller's ip at the failing call, for an unwinder that
+            // reads it (a Python frame's line, `vm::py_rt`).
+            #[cfg(feature = "python")]
+            if let Some(last) = self.frames.last_mut() {
+                last.ip = caller_ip_next.saturating_sub(1);
+            }
             return Err(Thrown(
                 "RangeError: Maximum call stack size exceeded".into(),
             ));
@@ -10068,6 +10109,10 @@ impl<'p> Vm<'p> {
         // Never grow past the pinned capacity (would realloc and dangle a live
         // native window pointer) â€” throw a catchable RangeError instead.
         if self.regs_would_overflow(new_base + callee_regs) {
+            #[cfg(feature = "python")]
+            if let Some(last) = self.frames.last_mut() {
+                last.ip = caller_ip_next.saturating_sub(1);
+            }
             return Err(Thrown(
                 "RangeError: Maximum call stack size exceeded".into(),
             ));

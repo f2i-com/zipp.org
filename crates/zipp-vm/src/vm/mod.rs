@@ -2976,6 +2976,9 @@ pub(crate) mod prof_py;
 #[cfg(feature = "python")]
 mod py_rt;
 #[cfg(feature = "python")]
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(unused_imports))]
+pub(crate) use py_rt::py_frame_guard_start;
+#[cfg(feature = "python")]
 mod py_gen;
 #[cfg(feature = "python")]
 mod py_in;

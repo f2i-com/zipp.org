@@ -1053,6 +1053,13 @@ pub(crate) fn emit_py_new_array(
 /// lays out only out-of-line code (handlers and slow paths); the last ip for
 /// a body without one.
 pub(crate) fn py_main_end(proto: &FuncProto) -> usize {
+    // The frame guard block (implicit: no handler is pushed for it, see
+    // `vm::py_rt`) ends the main body.
+    if let Some(start) = crate::vm::py_frame_guard_start(proto) {
+        if start > 0 && (start as usize) <= proto.code.len() {
+            return start as usize - 1;
+        }
+    }
     proto
         .code
         .iter()
