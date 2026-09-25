@@ -14,7 +14,7 @@ resolver = "2"
 
 [package]
 name = "zipp-torch"
-version = "0.0.20"
+version = "0.0.21"
 edition = "2021"
 license = "Apache-2.0"
 description = "The torch package of ZIPP's WebAssembly Python artifact: sources as data, tensor kernels as code."

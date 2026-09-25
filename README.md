@@ -49,13 +49,16 @@ frontends use the same engine, with native and WebAssembly builds.
   dense inference and training steps for WebGPU, WebGL2, WebAssembly SIMD
   kernels or an explicit CPU fallback: relu, gelu, sigmoid or tanh layers,
   softmax, MSE or a fused cross-entropy, and SGD, momentum or Adam updates in
-  one graph. The `zipp_gpu` graph protocol (version 2) underneath also carries
-  rank-4 broadcasting and batched matmul, so an MNIST-scale step written as a
-  graph runs in one submission (7.8 ms on WebGPU, 3.9 ms on the WebAssembly
-  kernels, for 784-256-10 at batch 64) - and as a prepared session, with the
-  weights and optimizer state resident on the device and eight steps per
-  submission, 0.79 ms per step (1.8 ms per step when driven from Python
-  through `compiled.prepare`).
+  one graph. The `zipp_gpu` graph protocol underneath (version 4, with masks,
+  dropout, slicing and gathers) also carries rank-4 broadcasting and batched
+  matmul, so an MNIST-scale step written as a graph runs in one submission
+  (7.8 ms on WebGPU, 3.9 ms on the WebAssembly kernels, for 784-256-10 at
+  batch 64) - and as a prepared session, with the weights and optimizer state
+  resident on the device and eight steps per submission, 0.79 ms per step
+  (1.8 ms per step when driven from Python through `compiled.prepare`).
+  Natively, `zipp py` runs the same graphs on a hardware GPU through wgpu: on
+  an RTX 5090 that small model's prepared step takes 0.27 ms (0.12 ms at eight
+  steps per run), against about 0.78 ms for PyTorch's eager CUDA.
 - **Run a language model from its GGUF file.** Graph inputs can stay in a
   checkpoint's own Q4_K and Q6_K blocks, decoded inside the matmul on every
   backend, so Qwen3-0.6B holds at 373 MB instead of 2,274. The experimental,
@@ -283,20 +286,23 @@ Zipp does not include its PyTorch runner, models, checkpoints or native endpoint
 
 ### Run the JavaScript engine
 
-The `0.0.20` release provides x86-64 CLI binaries for Windows and Linux
-(JavaScript, plus the experimental Python frontend as `zipp py`) and two browser
-WebAssembly packages:
+The `0.0.21` release provides x86-64 CLI binaries for Windows and Linux
+(complete: JavaScript, the experimental Python frontend as `zipp py`, torch and
+the native GPU path) and four browser WebAssembly packages:
 
 | Download | Use it for |
 | --- | --- |
-| `zipp-wasm-0.0.20-web.zip` | JavaScript applications and embedding |
-| `zipp-wasm-0.0.20-web-python.zip` | JavaScript plus experimental Python projects, Torch and browser GPU adapters |
+| `zipp-wasm-0.0.21-web.zip` | JavaScript applications and embedding (about 1.33 MB Brotli) |
+| `zipp-wasm-0.0.21-web-python-base.zip` | JavaScript plus experimental Python, without torch (about 1.70 MB) |
+| `zipp-wasm-0.0.21-web-python.zip` | JavaScript plus experimental Python projects with torch built in, and the browser GPU adapters (about 2.06 MB) |
+| `zipp-wasm-0.0.21-web-torch.zip` | The torch package (`zipp_torch.wasm` and its `zipp_torch.js` loader, about 0.38 MB) that adds torch to `web-python-base` at run time through `addPythonPackage` |
 
 See [GitHub Releases](https://github.com/f2i-com/zipp.org/releases) for published
-assets and [0.0.20 release notes](docs/releases/0.0.20.md) for scope and limits.
-`0.0.20` is the latest published release; the download commands below use it.
-Both WASM archives carry the exact source revision, language profile and
-checksums.
+assets and [0.0.21 release notes](docs/releases/0.0.21.md) for scope and limits.
+`0.0.21` is the latest published release; the download commands below use it.
+Every WASM archive carries the exact source revision, language profile and
+checksums. The sizes are each module's Brotli-11 transfer size, as measured in
+[crates/zipp-wasm/README.md](crates/zipp-wasm/README.md#build-variants-javascript-only-python-and-the-torch-package).
 
 Save this as `app.js`, then choose your platform below:
 
@@ -317,7 +323,7 @@ the [browser example](#embed-zipp-webassembly-in-a-web-app), or the
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.20'
+$version = '0.0.21'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -337,7 +343,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.20
+version=0.0.21
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -346,7 +352,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.20-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.21-x86_64-unknown-linux-gnu/zipp`.
 
 </details>
 
@@ -385,10 +391,16 @@ runtime data-file dependency.
 
 ### Run Python (experimental)
 
-The CLI also runs Python: Zipp's own Python 3 implementation, with the
-source lowered straight to the engine's register bytecode (no transpilation
-to JavaScript and no second interpreter), so a `.py` file runs on the same VM.
-Save this as `fib.py`:
+The CLI also runs Python: Zipp's own Python 3 implementation, parsed by its
+own front end ([`crates/zipp-pyparse`](crates/zipp-pyparse)) and lowered
+straight to the engine's register bytecode (no transpilation to JavaScript and
+no second interpreter), so a `.py` file runs on the same VM. On the command
+line hot Python loops are JIT-compiled (x86-64), and over the 36 programs of
+the Python benchmark suite Zipp runs at about 1.75x CPython 3.13's time, with
+`range_loop`, `int_arith`, `float_arith`, `tuple_swap` and `global_read` faster
+than CPython; WebAssembly and budgeted embedders run the same code
+interpreted. Compiled code is cached per user, so a hello-world starts in
+about 20 ms. Save this as `fib.py`:
 
 ```python
 def fib(n):
@@ -414,7 +426,7 @@ statements, f-strings, the builtin types and a set of standard-library
 modules (`math`, `json`, `re`, `collections`, `itertools`, `functools`,
 `dataclasses`, `enum`, `contextlib`, `typing`, `struct`, `hashlib`, ...)
 all work; `async` does not yet. Semantics are checked
-differentially against CPython: the 99 programs of `tests/python_corpus/*.py`
+differentially against CPython: the 155 programs of `tests/python_corpus/*.py`
 must print exactly what CPython 3.13 prints, in the default, no-fast-path and
 no-JIT modes.
 
@@ -434,8 +446,10 @@ Any script name runs, extensionless shebang scripts included, and output
 appears as the program prints it. A `test_*.py`
 entry runs its tests through the bundled `pytest` subset. The bundled
 library also includes a `torch` subset (tensors over typed arrays with
-reverse-mode autograd, `nn`, `nn.functional`, `optim`, `save`/`load` in
-supported PyTorch checkpoint layouts) that runs on the engine's CPU kernels, so
+reverse-mode autograd, `nn`, `nn.functional`, `optim` and its schedulers,
+`torch.utils.data`, `linalg`, `fft`, `distributions`, half-precision, complex,
+sparse and quantized tensors, `save`/`load` in supported PyTorch checkpoint
+layouts) that runs on the engine's native CPU kernels, so
 supported ML code can train and evaluate inside Zipp. Eager execution is CPU;
 `torch.compile` records supported inference and training steps for the GPU
 (dense layers with relu, gelu, sigmoid or tanh, softmax, MSE or fused
@@ -453,7 +467,8 @@ matrix, limits and the bytecode design are in
 feature is on by default in the CLI (`--no-default-features` builds the
 JavaScript-only binary) and off by default in the `zipp-vm` library and the
 WebAssembly package, which offers it as a
-[separate build variant](crates/zipp-wasm/README.md#build-variants-javascript-only-or-javascript-and-python).
+[separate build variant](crates/zipp-wasm/README.md#build-variants-javascript-only-python-and-the-torch-package),
+with torch either built in or added at run time as a separate package.
 
 Python programs can also compute on the GPU in the browser: the bundled
 `zipp_gpu` library records a float32 graph (broadcasting arithmetic, `@`,
@@ -607,7 +622,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.20
+version=0.0.21
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"
@@ -1095,6 +1110,8 @@ Workspace map:
 | [`crates/zipp-cli`](crates/zipp-cli) | `zipp js` / `zipp mjs` / `zipp py` command line. |
 | [`crates/regress-fork`](crates/regress-fork) | ECMAScript regex engine fork and conformance fixes. |
 | [`crates/zipp-wasm`](crates/zipp-wasm/README.md) | Browser/Worker embedding. |
+| [`crates/zipp-pyparse`](crates/zipp-pyparse) | Zipp's own Python 3.13 lexer, arena syntax tree and parser, read directly by the Python compiler. |
+| [`crates/zipp-gpu`](crates/zipp-gpu) | Native GPU for `zipp py`: gpu-lab's runtime over wgpu (Vulkan, Direct3D 12, Metal). |
 | [`crates/zipp-sandbox`](crates/zipp-sandbox/README.md) | Separately resolved hardened native runner. |
 
 ## Reproduce and contribute

@@ -118,13 +118,12 @@ integration date every corpus program matched.
   call-heavy code), stay interpreted; the tier is x86-64 only; embedders with
   an instruction budget, sandbox and WebAssembly keep the JIT off. Measured
   against CPython 3.13 over the 36 programs of `tools/python_bench.py`
-  (geomean of work time): about 3.3x slower interpreted and 2.1x with the
+  (geomean of work time): about 3x slower interpreted and 1.75x with the
   JIT, from `range_loop`, `int_arith`, `float_arith`, `tuple_swap` and
   `global_read` (faster than CPython with the JIT) to instance creation and
   list comprehensions (about 5-7x). Ints within ±2^46 are unboxed
-  immediates in the value word (larger ones are heap BigInts), and
-  object-heavy code still goes through the JavaScript runtime's records;
-  native dict, set and instance storage are the next step. `ZIPP_PY_PROF=1` prints fused-op hit and slow-path counts, runtime
+  immediates in the value word (larger ones are heap BigInts), and dicts, sets and instance attributes live in native tables
+  (`vm/py_table.rs`, with hidden-class layouts in `vm/py_table_layout.rs`). `ZIPP_PY_PROF=1` prints fused-op hit and slow-path counts, runtime
   helper call counts and the allocation mix at exit.
 - Errors: uncaught exceptions print CPython's traceback (file paths relative
   to the project, no caret lines) and exit with status 1; `e.__traceback__`,

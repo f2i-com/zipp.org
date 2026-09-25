@@ -404,6 +404,13 @@ jobs:
             features: "--features python"
             stack_bytes: 16777216
             languages: '["javascript","python"]'
+          # Python without torch: torch ships separately as the web-torch
+          # package (zipp_torch.wasm), which a host adds with addPythonPackage.
+          - variant: javascript-python-base
+            suffix: web-python-base
+            features: "--features python-base"
+            stack_bytes: 16777216
+            languages: '["javascript","python"]'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     defaults:
@@ -487,11 +494,22 @@ jobs:
       # the time parsed three tokens) and the audit regression suites the
       # release lane used to omit.
       - name: Exercise the production host boundary under Node
+        if: matrix.variant != 'javascript-python-base'
         run: |
           set -euo pipefail
           wasm-bindgen --target nodejs --out-dir tests/node/pkg \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/run-boundary-suite.cjs
+
+      # The base Python artifact has no torch until a host adds the package;
+      # the torch job below proves base + package against the complete one.
+      - name: Exercise the Python frontend without torch under Node
+        if: matrix.variant == 'javascript-python-base'
+        run: |
+          set -euo pipefail
+          wasm-bindgen --target nodejs --out-dir tests/node/pkg \
+            target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node tests/node/python-frontend.cjs
 
       - name: Exercise the combined artifact's Torch and interop contracts
         if: matrix.variant == 'javascript-python'
@@ -511,6 +529,7 @@ jobs:
           STACK_BYTES: ${{ matrix.stack_bytes }}
         run: |
           set -euo pipefail
+          export WASM_VARIANT
           bundle="zipp-wasm-$RELEASE_VERSION-$WASM_SUFFIX"
           archive="$bundle.zip"
           mkdir -p "dist/$bundle"
@@ -576,7 +595,15 @@ jobs:
             throw new Error(`wrong language variant: ${JSON.stringify(profile.languages)}`);
           }
           fs.writeFileSync(path.join(bundle, "PROFILE.json"), JSON.stringify(profile, null, 2) + "\n");
-          if (profile.languages.includes("python")) {
+          if (profile.languages.includes("python") && process.env.WASM_VARIANT === "javascript-python-base") {
+            const python = new zipp.Engine();
+            try {
+              python.initSource("try:\n    import torch\nexcept ModuleNotFoundError as e:\n    print(e.name)\nprint(sum(x * x for x in range(4)))", "python");
+              if (JSON.stringify(python.takeOutput()) !== '["torch","14"]') {
+                throw new Error("packaged Python (without torch) smoke failed");
+              }
+            } finally { python.dispose(); python.free(); }
+          } else if (profile.languages.includes("python")) {
             const python = new zipp.Engine();
             try {
               python.initSource("import torch\nx = torch.tensor([1.0, 2.0, 3.0])\nprint((x * 2).tolist())", "python");
@@ -677,11 +704,103 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  torch:
+    name: Browser WebAssembly (torch package)
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: crates/zipp-wasm
+    env:
+      RUSTUP_TOOLCHAIN: "1.92.0"
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain and wasm32 target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+
+      - name: Select the Node.js smoke-test runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Install the exact matching wasm-bindgen CLI
+        run: |
+          set -euo pipefail
+          cargo install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
+          test "$(wasm-bindgen --version)" = "wasm-bindgen $WASM_BINDGEN_CLI"
+
+      # The package and the two engines it is checked against, from the same
+      # locked source: `python` (without torch) + zipp_torch.wasm must print
+      # what the complete `all` artifact prints, byte for byte.
+      - name: Build the torch package and the engines it pairs with
+        env:
+          ZIPP_SOURCE_SHA: ${{ needs.validate.outputs.commit }}
+        run: ./build-variants.sh all python torch
+
+      - name: Prove the package against the complete artifact under Node
+        run: |
+          set -euo pipefail
+          wasm-bindgen --target nodejs --out-dir /tmp/pkg-all \
+            target/variants/all/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          wasm-bindgen --target nodejs --out-dir /tmp/pkg-python \
+            target/variants/python/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node tests/node/python-plugin.cjs /tmp/pkg-all /tmp/pkg-python
+
+      - name: Package the torch module and its loader
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          bundle="zipp-wasm-$RELEASE_VERSION-web-torch"
+          archive="$bundle.zip"
+          mkdir -p "dist/$bundle"
+          install -m 0644 dist/torch/zipp_torch.wasm dist/torch/zipp_torch.js "dist/$bundle/"
+          install -m 0644 README.md ../../LICENSE-APACHE "dist/$bundle/"
+          mkdir -p "dist/$bundle/docs"
+          install -m 0644 ../../docs/TORCH_COMPATIBILITY.md "dist/$bundle/docs/"
+          node --input-type=module --check < "dist/$bundle/zipp_torch.js"
+          {
+            printf 'version=%s\n' "$RELEASE_VERSION"
+            printf 'commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'rustc=%s\n' "$(rustc --version)"
+            printf 'variant=torch\n'
+            printf 'pairs-with=zipp-wasm-%s-web-python-base\n' "$RELEASE_VERSION"
+            printf 'target=wasm32-unknown-unknown\n'
+          } > "dist/$bundle/BUILD-INFO.txt"
+          (
+            cd "dist/$bundle"
+            find . -type f ! -name SHA256SUMS -printf '%P\0' \
+              | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS
+          )
+          (
+            cd dist
+            zip -q -9 -r "$archive" "$bundle"
+          )
+
+      - name: Upload the torch package release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-wasm-web-torch
+          path: crates/zipp-wasm/dist/zipp-wasm-${{ needs.validate.outputs.version }}-web-torch.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   publish:
     name: Publish GitHub Release
     # Both reusable gates run at the validated tag commit. Publishing waits
     # for the full native, safe-profile, sandbox, Worker and Test262 matrix.
-    needs: [validate, ci, security, native, wasm]
+    needs: [validate, ci, security, native, wasm, torch]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # The one job with write access. The environment is where the repository
@@ -774,6 +893,8 @@ jobs:
             "zipp-$RELEASE_VERSION-x86_64-pc-windows-msvc.zip"
             "zipp-wasm-$RELEASE_VERSION-web.zip"
             "zipp-wasm-$RELEASE_VERSION-web-python.zip"
+            "zipp-wasm-$RELEASE_VERSION-web-python-base.zip"
+            "zipp-wasm-$RELEASE_VERSION-web-torch.zip"
           )
           for asset in "${expected[@]}"; do
             test -f "dist/$asset"
@@ -834,6 +955,8 @@ jobs:
                 "zipp-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip"
                 "zipp-wasm-${{ needs.validate.outputs.version }}-web.zip"
                 "zipp-wasm-${{ needs.validate.outputs.version }}-web-python.zip"
+                "zipp-wasm-${{ needs.validate.outputs.version }}-web-python-base.zip"
+                "zipp-wasm-${{ needs.validate.outputs.version }}-web-torch.zip"
               )
               mapfile -t actual_existing < <(
                 find existing-assets -maxdepth 1 -type f -printf '%f\n' | sort
@@ -866,7 +989,7 @@ jobs:
                    .commit == $commit and .dirty == false' \
                   <<< "$info" >/dev/null
               done
-              for suffix in web web-python; do
+              for suffix in web web-python web-python-base; do
                 wasm_bundle="zipp-wasm-$RELEASE_VERSION-$suffix"
                 wasm_info="$(unzip -p "existing-assets/$wasm_bundle.zip" "$wasm_bundle/BUILD-INFO.txt")"
                 grep -Fxq "version=$RELEASE_VERSION" <<< "$wasm_info"
@@ -876,6 +999,9 @@ jobs:
                 if [[ "$suffix" == web-python ]]; then
                   languages='["javascript","python"]'
                   variant=javascript-python
+                elif [[ "$suffix" == web-python-base ]]; then
+                  languages='["javascript","python"]'
+                  variant=javascript-python-base
                 fi
                 grep -Fxq "variant=$variant" <<< "$wasm_info"
                 grep -Fxq "languages=$languages" <<< "$wasm_info"
