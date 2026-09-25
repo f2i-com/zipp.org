@@ -621,7 +621,9 @@ export class Engine {
      * error (a program's own output ahead of the raise, a test report
      * ahead of its non-zero exit), in `takeConsole`'s tagged form. The one
      * method that answers on a disposed engine; it drains, and an engine
-     * that initialized returns an empty array.
+     * that initialized returns an empty array. Like `takeConsole` it pages:
+     * each call drains what fits one conversion, and calls continue until
+     * the array comes back empty.
      * @returns {any}
      */
     takeFailedConsole() {
@@ -861,7 +863,7 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_isArray_9f65322963e7f3f5: function() { return handleError(function (arg0) {
+        __wbg_isArray_f223cba83b7d1be6: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
@@ -869,7 +871,7 @@ function __wbg_get_imports() {
             const ret = ArrayBuffer.isView(arg0);
             return ret;
         },
-        __wbg_keys_f5cd7458a1dec764: function() { return handleError(function (arg0) {
+        __wbg_keys_dcfe5853d73c4bdd: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -889,14 +891,14 @@ function __wbg_get_imports() {
             const ret = new Array();
             return ret;
         },
-        __wbg_new_6927e0a65621cd00: function() { return handleError(function (arg0) {
-            const ret = new Float32Array(arg0);
-            return ret;
-        }, arguments); },
         __wbg_new_da52cf8fe3429cb2: function() {
             const ret = new Object();
             return ret;
         },
+        __wbg_new_f33dcd5bec55ea1d: function() { return handleError(function (arg0) {
+            const ret = new Float32Array(arg0);
+            return ret;
+        }, arguments); },
         __wbg_new_from_slice_ddf8b82c4d6af38e: function(arg0, arg1) {
             const ret = new Float32Array(getArrayF32FromWasm0(arg0, arg1));
             return ret;

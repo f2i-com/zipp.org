@@ -689,7 +689,9 @@ export class Engine {
      * error (a program's own output ahead of the raise, a test report
      * ahead of its non-zero exit), in `takeConsole`'s tagged form. The one
      * method that answers on a disposed engine; it drains, and an engine
-     * that initialized returns an empty array.
+     * that initialized returns an empty array. Like `takeConsole` it pages:
+     * each call drains what fits one conversion, and calls continue until
+     * the array comes back empty.
      * @returns {any}
      */
     takeFailedConsole() {
@@ -773,6 +775,70 @@ export function accelGuestCall(name, args) {
         throw takeFromExternrefTable0(ret[1]);
     }
     return ret[0];
+}
+
+/**
+ * Add a Python package (an archive in `zipp-python-package 1` format) to
+ * every Python engine this module creates from now on, with `kernels`
+ * (an object with `zippTorchKernel(request)`) when the package brings
+ * tensor kernels. Returns `{name, version, modules, kernels}` as JSON.
+ * Adding the same archive again does nothing; anything the engine refuses
+ * throws with the reason and registers nothing.
+ * @param {Uint8Array} archive
+ * @param {any} kernels
+ * @returns {string}
+ */
+export function addPythonPackage(archive, kernels) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passArray8ToWasm0(archive, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.addPythonPackage(ptr0, len0, kernels);
+        var ptr2 = ret[0];
+        var len2 = ret[1];
+        if (ret[3]) {
+            ptr2 = 0; len2 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * Compile the Python runtime now, while the host is idle, so the first
+ * Python engine does not wait for it (about a quarter of a second on a cold
+ * module). Every Python engine this module creates afterwards starts from
+ * the compiled copy; programs behave exactly as without it. Adding a
+ * package afterwards means one more compile, so add packages first.
+ */
+export function prewarmPython() {
+    const ret = wasm.prewarmPython();
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
+}
+
+/**
+ * This engine's Python packages as JSON: the package ABI a package must be
+ * built against, whether torch is built in, and what has been added.
+ * @returns {string}
+ */
+export function pythonPackages() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const ret = wasm.pythonPackages();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
 }
 
 /**
@@ -965,7 +1031,7 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_isArray_9f65322963e7f3f5: function() { return handleError(function (arg0) {
+        __wbg_isArray_f223cba83b7d1be6: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
@@ -973,7 +1039,7 @@ function __wbg_get_imports() {
             const ret = ArrayBuffer.isView(arg0);
             return ret;
         },
-        __wbg_keys_f5cd7458a1dec764: function() { return handleError(function (arg0) {
+        __wbg_keys_dcfe5853d73c4bdd: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -993,14 +1059,14 @@ function __wbg_get_imports() {
             const ret = new Array();
             return ret;
         },
-        __wbg_new_6927e0a65621cd00: function() { return handleError(function (arg0) {
-            const ret = new Float32Array(arg0);
-            return ret;
-        }, arguments); },
         __wbg_new_da52cf8fe3429cb2: function() {
             const ret = new Object();
             return ret;
         },
+        __wbg_new_f33dcd5bec55ea1d: function() { return handleError(function (arg0) {
+            const ret = new Float32Array(arg0);
+            return ret;
+        }, arguments); },
         __wbg_new_from_slice_ddf8b82c4d6af38e: function(arg0, arg1) {
             const ret = new Float32Array(getArrayF32FromWasm0(arg0, arg1));
             return ret;
@@ -1062,6 +1128,13 @@ function __wbg_get_imports() {
             const ret = JSON.stringify(arg0);
             return ret;
         }, arguments); },
+        __wbg_zippTorchKernel_ab8fa84c45798695: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg1.zippTorchKernel(getArrayU8FromWasm0(arg2, arg3));
+            var ptr1 = isLikeNone(ret) ? 0 : passArray8ToWasm0(ret, wasm.__wbindgen_malloc);
+            var len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0) {
             // Cast intrinsic for `F64 -> Externref`.
             const ret = arg0;
@@ -1106,6 +1179,11 @@ function getArrayF32FromWasm0(ptr, len) {
 function getArrayU16FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint16ArrayMemory0().subarray(ptr / 2, ptr / 2 + len);
+}
+
+function getArrayU8FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
 }
 
 let cachedDataViewMemory0 = null;
@@ -1163,6 +1241,13 @@ function handleError(f, args) {
 
 function isLikeNone(x) {
     return x === undefined || x === null;
+}
+
+function passArray8ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 1, 1) >>> 0;
+    getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
 }
 
 function passArrayF64ToWasm0(arg, malloc) {

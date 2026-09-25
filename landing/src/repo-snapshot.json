@@ -1,25 +1,31 @@
 {
-  "generated_at": "2026-09-18T14:11:33.462Z",
+  "generated_at": "2026-09-25T06:28:36.368Z",
   "stale": false,
   "source": {
     "repo": "f2i-com/zipp.org",
     "branch": "main",
-    "commit": "3fbc821f6587daabed6c200d909231f2d1376b5a"
+    "commit": "9df6e2fdeb27d9b931bffba84e5714c4fd3d5f50"
   },
   "repo": {
-    "stars": 2,
+    "stars": 6,
     "forks": 0,
     "open_issues": 0,
-    "pushed_at": "2026-09-18T13:57:56Z",
+    "pushed_at": "2026-09-25T05:20:28Z",
     "license": "Apache-2.0"
   },
   "release": {
-    "tag": "v0.0.20",
-    "name": "ZIPP v0.0.20",
-    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.20",
-    "published_at": "2026-09-18T14:05:32Z"
+    "tag": "v0.0.21",
+    "name": "ZIPP v0.0.21",
+    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.21",
+    "published_at": "2026-09-25T06:26:59Z"
   },
   "releases": [
+    {
+      "tag": "v0.0.21",
+      "name": "ZIPP v0.0.21",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.21",
+      "published_at": "2026-09-25T06:26:59Z"
+    },
     {
       "tag": "v0.0.20",
       "name": "ZIPP v0.0.20",
@@ -31,23 +37,17 @@
       "name": "ZIPP v0.0.19",
       "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.19",
       "published_at": "2026-09-16T15:21:23Z"
-    },
-    {
-      "tag": "v0.0.18",
-      "name": "ZIPP v0.0.18",
-      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.18",
-      "published_at": "2026-09-13T18:01:15Z"
     }
   ],
   "commits": {
     "latest": {
-      "sha": "3fbc821f6587daabed6c200d909231f2d1376b5a",
-      "message": "README: what 0.0.20 ships, and download it [skip ci]",
-      "date": "2026-09-18T13:57:37Z",
-      "url": "https://github.com/f2i-com/zipp.org/commit/3fbc821f6587daabed6c200d909231f2d1376b5a"
+      "sha": "9df6e2fdeb27d9b931bffba84e5714c4fd3d5f50",
+      "message": "Keep the complex power table independent of the platform libm [skip ci]",
+      "date": "2026-09-25T05:20:11Z",
+      "url": "https://github.com/f2i-com/zipp.org/commit/9df6e2fdeb27d9b931bffba84e5714c4fd3d5f50"
     }
   },
-  "version": "0.0.20",
+  "version": "0.0.21",
   "readme": {
     "test262_pct": 99.991,
     "test262_pass": 95671,

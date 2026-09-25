@@ -7,7 +7,7 @@
     "image": "/zipp-og-card.png",
     "imageAlt": "A luminous purple-to-cyan lightning mark moving across a dark field",
     "repo": "https://github.com/f2i-com/zipp.org",
-    "homeDateModified": "2026-09-16",
+    "homeDateModified": "2026-09-25",
     "organization": {
       "name": "f2i",
       "url": "https://f2i.com"
@@ -178,9 +178,9 @@
                   "note": "Node 30.4 ms, Bun 43.3 ms, Deno 82.6 ms on the same machine."
                 },
                 {
-                  "value": "1.24 MB",
+                  "value": "1.32 MB",
                   "label": "WebAssembly module on the wire (Brotli)",
-                  "note": "JavaScript-only build, 5.3 MB raw."
+                  "note": "JavaScript-only build, 5.7 MB raw."
                 }
               ]
             },
@@ -327,7 +327,7 @@
             },
             {
               "type": "p",
-              "text": "The JavaScript-only module is 5,308,147 bytes raw and 1,239,957 bytes after Brotli; the build that also includes Python is 7,773,932 bytes raw and 1,777,382 on the wire. That is roughly three times the size of QuickJS-NG's WebAssembly reactor, a trade-off documented plainly on the [WebAssembly page](/wasm/), which also explains the Worker-termination deadline model and the resource limits."
+              "text": "The JavaScript-only module is 5,743,065 bytes raw and 1,321,465 bytes after Brotli; the build that also includes Python with torch built in is 9,390,219 bytes raw and 2,056,613 on the wire, and Python without torch 1,701,112. The JavaScript-only module is roughly three times the size of QuickJS-NG's WebAssembly reactor, a trade-off documented plainly on the [WebAssembly page](/wasm/), which also explains the Worker-termination deadline model and the resource limits."
             }
           ]
         },
@@ -426,7 +426,7 @@
             },
             {
               "type": "table",
-              "caption": "Workspace crates (line counts at version 0.0.19, except `zipp-pyparse`, added later)",
+              "caption": "Workspace crates (line counts at version 0.0.19, except `zipp-pyparse` and `zipp-gpu`, counted at v0.0.21)",
               "head": [
                 "Crate",
                 "Role",
@@ -461,7 +461,12 @@
                 [
                   "`zipp-pyparse`",
                   "Python lexer, parser and syntax tree used by the Python frontend",
-                  "11,571"
+                  "11,573"
+                ],
+                [
+                  "`zipp-gpu`",
+                  "Native GPU for `zipp py`: gpu-lab's runtime over a WebGPU shim backed by wgpu",
+                  "4,078"
                 ]
               ]
             },
@@ -476,7 +481,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "A `Value` is a single `u64`, `Copy`, exactly eight bytes. A finite or infinite double is stored as itself. Everything else lives inside the quiet-NaN space: tag `0x7FF9` is a 32-bit integer, `0x7FFA` a boolean, `0x7FFB` null, `0x7FFC` undefined and `0x7FFD` a 32-bit heap index. Numbers that fit in an `i32` are stored as integers, which is what lets the INT JIT tier run arithmetic on raw machine integers with an overflow check instead of on doubles."
+              "text": "A `Value` is a single `u64`, `Copy`, exactly eight bytes. A finite or infinite double is stored as itself. Everything else lives inside the quiet-NaN space: tag `0x7FF9` is a 32-bit integer, `0x7FFA` a boolean, `0x7FFB` null, `0x7FFC` undefined and `0x7FFD` a 32-bit heap index. A BigInt within ±2^46 is an immediate in the null tag's bit pattern with payload bit 47 set, so small BigInts, and with them Python's `int`, allocate nothing. Numbers that fit in an `i32` are stored as integers, which is what lets the INT JIT tier run arithmetic on raw machine integers with an overflow check instead of on doubles."
             },
             {
               "type": "p",
@@ -563,6 +568,10 @@
             },
             {
               "type": "p",
+              "text": "Python has its own loop tier on x86-64, used by `zipp py` and `zipp run` when no instruction budget is set. A loop compiles after 1,024 iterations: float and small-integer arithmetic, comparisons, range counters, list building, calls through `PyCall` and attribute reads and writes on hidden-class layout storage run inline, and every other fused Python instruction calls the interpreter's own step and continues at the successor it chose, so results are identical. It is compiled out of builds without the `python` feature, and WebAssembly, the sandbox and budgeted embedders keep it off."
+            },
+            {
+              "type": "p",
               "text": "The ARM64 tier is a deliberately smaller guarded baseline: bounded call-free integer functions and numeric loops with exact-ip fallback, no helper calls and no OSR yet. Windows on ARM uses a bespoke W^X path because the generic cache-maintenance sequence is illegal at EL0."
             },
             {
@@ -637,7 +646,7 @@
     {
       "slug": "python",
       "title": "Zipp Python: Python 3 on a Rust Register VM",
-      "description": "Zipp compiles Python 3 to the same register bytecode as its JavaScript engine. Run Python natively or in WebAssembly, with a Torch subset and opt-in JS interop.",
+      "description": "Zipp compiles Python 3 to the same register bytecode as its JavaScript engine, with a Python JIT tier, a broad Torch layer and GPU compute.",
       "h1": "Python on the Zipp VM",
       "breadcrumb": "Python",
       "lede": "Zipp's Python frontend is its own implementation of Python 3, validated on 13 September 2026. Python source is parsed by Zipp's own parser and lowered by Zipp's compiler straight to register bytecode, so Python and JavaScript run on one virtual machine, natively or in the browser.",
@@ -680,11 +689,11 @@
             {
               "type": "ul",
               "items": [
-                "Arbitrary-precision `int`, `float`, `bool`, the full operator set, and the full `str` method set with `%`, `format` and f-strings.",
+                "Arbitrary-precision `int`, `float`, `bool`, `complex` with the whole of `cmath`, the full operator set, and the full `str` method set with `%`, `format` and f-strings.",
                 "`list`, `tuple`, `dict`, `set`, `frozenset`, `range`, slices and comprehensions.",
                 "Every function signature form, closures with `nonlocal` and `global`, decorators, and generators with `send`, `throw`, `close` and `yield from`.",
                 "Classes with C3 multiple inheritance, `super()`, properties, descriptors, `__slots__`, metaclasses, `__init_subclass__` and `__set_name__`.",
-                "The builtin exception hierarchy with `raise ... from`, chained `__cause__` and `__context__`, and CPython-style tracebacks.",
+                "The builtin exception hierarchy with `raise ... from`, chained `__cause__` and `__context__`, and CPython's traceback layout, traceback objects and the `traceback` module, with CPython's \"Did you mean\" suggestions.",
                 "Modules and packages by folder with CPython-like import cycles, full `match` pattern support, and `dataclasses`, `enum`, `typing`, `itertools`, `functools`, `collections`, `json`, `re`, `struct`, `hashlib`, `pathlib`, `argparse` and more from the standard library."
               ]
             },
@@ -696,7 +705,7 @@
               "type": "callout",
               "tone": "warning",
               "title": "Not yet supported",
-              "text": "`async` / `await`, type-parameter syntax, `except*` and complex numbers. Sockets, processes, threads, and any file outside the project folder. `input()` raises `EOFError`. `__getattribute__` overrides, weak references and `__del__` are absent, and set iteration order can differ from CPython for strings."
+              "text": "`async` / `await`, type-parameter syntax and `except*`. Sockets, processes, threads, and any file outside the project folder. `input()` raises `EOFError`. `__getattribute__` overrides, weak references and `__del__` are absent, and set iteration order can differ from CPython for strings."
             }
           ]
         },
@@ -705,7 +714,15 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Python on Zipp is an interpreter over a JavaScript-shaped VM with the JIT disabled, and integers are BigInts. Two passes over it in September took the `tools/python_bench.py` suite to 0.59x of its previous time and then to 0.89x of that (paired per-repetition ratios; global reads 0.67x, property reads 0.67x, calls 0.75x, integer arithmetic 0.76x). Wall clock on a release build, process start included: `fib(25)` 0.15 s against CPython 3.13's 0.12 s, a million-iteration `total += i % 7` loop 0.39 s against 0.16 s, and 200,000 dict insertions with string keys 0.45 s against 0.15 s. Still slower than CPython, by less than before; there are no published Python benchmark tables beyond that suite, and this page will not invent any."
+              "text": "On the command line Zipp compiles hot Python loops to x86-64 code. Over the 36 programs of `tools/python_bench.py` (geometric mean of work time against CPython 3.13) it runs at about 1.75× CPython's time with that JIT, from about 22× when the September speed work began; `range_loop`, `int_arith`, `float_arith`, `tuple_swap` and `global_read` are faster than CPython. Every benchmark checksum still equals CPython's."
+            },
+            {
+              "type": "p",
+              "text": "What moved it: direct calls with fixed-arity entries and per-class inline caches; fused Python-only VM instructions for globals, attributes, subscripts, exceptions and generators; native `json`, string and sort helpers; a JIT tier for hot loops; integers within ±2^46 stored in the value word instead of as heap BigInts; dicts and sets in a native compact hash table modelled on CPython 3.13's; `PyCall`, a direct call instruction with per-site caches; and hidden-class layouts for instances, whose attribute reads and writes compiled loops inline. Every fused instruction and compiled loop falls back to the interpreter's own step, so the results are always the interpreter's."
+            },
+            {
+              "type": "p",
+              "text": "Startup is cached too: the CLI keeps the compiled Python runtime and each imported library module in a per-user cache, so a warm hello-world takes about 20 ms (CPython: 15-20 ms) and `import torch` about 160 ms. The JIT tier is x86-64 and command-line only; WebAssembly, the sandbox and embedders with an instruction budget run the same code interpreted, and slower."
             }
           ]
         },
@@ -714,7 +731,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The `all` WebAssembly build variant includes the Python frontend: 8,155,619 bytes raw, 1,709,117 bytes after Brotli, about 42% more than the JavaScript-only module. A browser host calls `engine.initSource(source, \"python\")` for one file or `engine.initPythonProject(files, entry, argv)` for a folder, then drains output and host requests."
+              "text": "Two WebAssembly variants include the Python frontend. `python` leaves torch out (1,701,112 bytes after Brotli) and adds it at run time from the 380,240-byte `zipp_torch.wasm` package through `addPythonPackage`, which checks the package's format, engine ABI hash and the SHA-256 of every file first; `all` has torch built in (2,056,613 bytes after Brotli). A browser host calls `engine.initSource(source, \"python\")` for one file or `engine.initPythonProject(files, entry, argv)` for a folder, then drains output and host requests. `prewarmPython()` compiles the Python runtime ahead of use; the playground calls it when idle, so the first Python run takes about 20 ms instead of 220."
             },
             {
               "type": "code",
@@ -739,7 +756,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The bundled `zipp_gpu` module records float32 compute graphs - broadcasting arithmetic, `@`, relu/gelu/sigmoid/tanh, softmax, axis reductions, a fused cross-entropy, SGD and Adam update steps, and a toroidal Game of Life step - and submits them to the host. The graph leaves the engine as a `gpu.execute` request; the host validates it and runs it on WebGPU, WebGL2, compiled WASM kernels or a JavaScript reference backend, then delivers the named outputs to a Python callback. `Graph.prepare` turns a graph into a session (`gpu.session.*` requests) whose carried tensors stay on the device between steps. Nothing inside the engine touches a GPU; natively the same code evaluates on the tensor kernels, bit for bit the same as the reference."
+              "text": "The bundled `zipp_gpu` module records float32 compute graphs - broadcasting arithmetic, `@`, relu/gelu/sigmoid/tanh, softmax, axis reductions, a fused cross-entropy, SGD and Adam update steps, and a toroidal Game of Life step - and submits them to the host. The graph leaves the engine as a `gpu.execute` request; the host validates it and runs it on WebGPU, WebGL2, compiled WASM kernels or a JavaScript reference backend, then delivers the named outputs to a Python callback. `Graph.prepare` turns a graph into a session (`gpu.session.*` requests) whose carried tensors stay on the device between steps. Nothing inside the WebAssembly engine touches a GPU. Natively, `zipp py` runs the same graphs on a hardware GPU through wgpu (Vulkan, Direct3D 12 or Metal) when one is present, synchronously and with the same results, and on the engine's tensor kernels otherwise."
             },
             {
               "type": "figure",
@@ -758,11 +775,11 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Zipp bundles an experimental Python implementation of a Torch API subset. It is not the native PyTorch package, TorchInductor, CUDA or a pip environment. Eager CPU support is broad: tensors over typed-array storage, creation ops, indexing, shape ops, broadcasting elementwise and reduction ops, `matmul` and `einsum`, reverse-mode autograd, `nn` modules including `Linear`, `Embedding`, `Conv1d`, `Conv2d`, `GRUCell`, `LSTMCell` and `LayerNorm`, common losses, `optim.SGD`, `Adam`, `AdamW` and `RMSprop`, and `torch.save` / `torch.load` in PyTorch's zip checkpoint format."
+              "text": "Zipp bundles an experimental Python implementation of a Torch API subset. It is not the native PyTorch package, TorchInductor, CUDA or a pip environment, but it covers what ordinary training code reaches for: about 200 more tensor functions with in-place semantics and PyTorch's autograd rules, `nn` with convolutions up to 3-D, normalization, pooling, recurrent layers, attention and transformers, about 35 activations and 20 losses, 13 optimizers and 15 learning-rate schedulers, `torch.utils.data`, `torch.linalg` and `torch.fft` (both native), `torch.distributions`, float16 and bfloat16 stored in two bytes with CPU autocast, complex, sparse and quantized tensors, single-process `torch.distributed`, and `torch.save` / `torch.load` in PyTorch's checkpoint format in both directions."
             },
             {
               "type": "p",
-              "text": "The training example reproduced native PyTorch's ten rounded losses (0.085254 down to 0.010812), and the Life rules matched an independent PyTorch implementation across 1×1, 2×2, 7×7 and 96×96 grids. Those are correctness checks, not performance claims, and `device=\"cuda\"` is rejected rather than silently ignored."
+              "text": "Each area is checked against values PyTorch 2.11 generated, and eager torch's heavy loops (matmul, convolution, elementwise ops, reductions, FFT, factorizations) run as native kernels that repeat the JavaScript fallback's arithmetic in the same order, byte for byte. Hugging Face's `modeling_qwen3.py`, `modeling_qwen2.py`, `modeling_llama.py`, `modeling_mistral.py` and `modeling_gpt_neo.py` run unmodified. `device=\"cuda\"` is rejected rather than silently ignored, and the [Torch compatibility guide](https://github.com/f2i-com/zipp.org/blob/main/docs/TORCH_COMPATIBILITY.md) lists what is still missing."
             }
           ]
         },
@@ -816,7 +833,7 @@
         "wasm-bindgen Rust engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-14",
+      "dateModified": "2026-09-25",
       "sections": [
         {
           "heading": "Why a JavaScript engine inside JavaScript",
@@ -836,7 +853,7 @@
             },
             {
               "type": "table",
-              "caption": "Module sizes, source build of 13 September 2026",
+              "caption": "Module sizes in the v0.0.21 release assets (Brotli-11 computed from each module)",
               "head": [
                 "Variant",
                 "Languages",
@@ -847,14 +864,26 @@
                 [
                   "`javascript` (default)",
                   "JavaScript",
-                  "5,308,147",
-                  "1,239,957"
+                  "5,743,065",
+                  "1,321,465"
+                ],
+                [
+                  "`python`",
+                  "JavaScript + Python, torch as a package",
+                  "7,460,508",
+                  "1,701,112"
+                ],
+                [
+                  "`zipp_torch.wasm`",
+                  "The torch package for `python`",
+                  "2,054,964",
+                  "380,240"
                 ],
                 [
                   "`all`",
-                  "JavaScript + Python",
-                  "7,773,932",
-                  "1,777,382"
+                  "JavaScript + Python with torch built in",
+                  "9,390,219",
+                  "2,056,613"
                 ],
                 [
                   "QuickJS-NG v0.16.2 reactor, for scale",
@@ -866,7 +895,7 @@
             },
             {
               "type": "p",
-              "text": "Zipp's module is about 3.6× QuickJS-NG's raw and 3.0× on the wire. A Python-only variant was tried and came out 85 bytes larger than `all`, so it does not exist. The engine is compiled with `safe-sandbox`, `meter-only`, `wasm-no-fs-loader` and `wasm-single-agent`, and `overflow-checks` stay on in release."
+              "text": "Zipp's JavaScript-only module is about 3.76× QuickJS-NG's raw and 3.17× on the wire. A page that never imports torch can serve `python` and skip the package; one that does fetches it on demand, and the pair costs slightly more than `all` because the package carries its own copy of the kernels' support code. A Python-only variant was tried and came out 85 bytes larger than the combined module, so it does not exist. The engine is compiled with `safe-sandbox`, `meter-only`, `wasm-no-fs-loader` and `wasm-single-agent`, and `overflow-checks` stay on in release."
             }
           ]
         },
@@ -881,7 +910,7 @@
             },
             {
               "type": "p",
-              "text": "Beyond `initScript`, `initSource(source, language)` and `initPythonProject(files, entry, argv)`, the class exposes `callFunction`, `evalInContext` and `evalInContextRich`, batched global get and set by stable slot index, a content fingerprint of the globals so a host cannot miss a mutation made through a reference, `dispatchEvent` for a deliberately limited event facade with no DOM, and `resourceUsage` for what the guest has consumed."
+              "text": "Beyond `initScript`, `initSource(source, language)` and `initPythonProject(files, entry, argv)`, the class exposes `callFunction`, `evalInContext` and `evalInContextRich`, batched global get and set by stable slot index, a content fingerprint of the globals so a host cannot miss a mutation made through a reference, `dispatchEvent` for a deliberately limited event facade with no DOM, and `resourceUsage` for what the guest has consumed. Python builds add `prewarmPython()`, which compiles the Python runtime before the first run, and `addPythonPackage(archive, kernels)`, through which `zipp_torch.js` registers torch once per module instance."
             },
             {
               "type": "p",
@@ -989,7 +1018,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Each [release](/releases/) ships `zipp-wasm-<version>-web.zip` and `zipp-wasm-<version>-web-python.zip` with the glue, the module and its pre-compressed `.br` body. The glue and the `.wasm` are one artifact in two files, so serve them with matching cache keys; this site stamps both URLs with a content hash so a cached glue can never meet a new module."
+              "text": "Each [release](/releases/) ships `zipp-wasm-<version>-web.zip` (JavaScript) and `zipp-wasm-<version>-web-python.zip` (JavaScript and Python with torch built in); from v0.0.21 also `zipp-wasm-<version>-web-python-base.zip` (Python without torch) and `zipp-wasm-<version>-web-torch.zip`, the torch package and its loader. Each carries the wasm-bindgen glue, the module, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`; serve the module Brotli-compressed, since the sizes above are what it costs on the wire. The glue and the `.wasm` are one artifact in two files, so serve them with matching cache keys; this site stamps both URLs with a content hash so a cached glue can never meet a new module. Pin `zipp_torch.wasm` by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check."
             }
           ]
         }
@@ -1016,10 +1045,10 @@
     {
       "slug": "webgpu",
       "title": "Python and JavaScript GPU Compute with WebGPU and WebGL2",
-      "description": "Zipp's GPU Lab runs Python-authored float32 graphs on WebGPU, WebGL2, WASM kernels or JavaScript, with an experimental torch.compile path for inference and training.",
+      "description": "Zipp runs Python-authored float32 graphs on WebGPU, WebGL2, WASM kernels or natively through wgpu, with an experimental torch.compile path for inference and training.",
       "h1": "GPU compute from Python and JavaScript in the browser",
       "breadcrumb": "GPU",
-      "lede": "The GPU Lab is a bounded graph runtime: Python running on Zipp WebAssembly records a float32 graph, the browser host validates it and executes it on WebGPU or WebGL2, and the results come back to a Python callback. It is a working, limited, honest piece of infrastructure, and this page says exactly what it does and does not do.",
+      "lede": "The GPU Lab is a bounded graph runtime: Python running on Zipp records a float32 graph, a host validates it and executes it on WebGPU or WebGL2 in the browser, or on a hardware GPU through wgpu natively, and the results come back to a Python callback. It is a working, limited, honest piece of infrastructure, and this page says exactly what it does and does not do.",
       "keywords": [
         "Python WebGPU",
         "WebGPU compute from Python",
@@ -1029,18 +1058,18 @@
         "WebAssembly GPU compute"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-16",
+      "dateModified": "2026-09-25",
       "sections": [
         {
           "heading": "What the GPU Lab is",
           "blocks": [
             {
               "type": "p",
-              "text": "A vendored JavaScript package, `gpu-lab` version 0.1.0, with four interchangeable backends: `webgpu.mjs` (WGSL compute shaders with a workgroup size of 64), `webgl2.mjs` (GLSL fragment shaders over float textures), `wasm.mjs` (C kernels compiled with Clang to `kernels.wasm`) and `cpu.mjs` (a JavaScript reference). `auto` tries WebGPU, then WebGL2, then compiled WASM, then JavaScript, and records every fallback it attempted. Hardware paths reject recognized software renderers, because a missing GPU is not a successful GPU check."
+              "text": "A vendored JavaScript package, `gpu-lab` version 0.1.0, with four interchangeable backends: `webgpu.mjs` (WGSL compute shaders with a workgroup size of 64), `webgl2.mjs` (GLSL fragment shaders over float textures), `wasm.mjs` (`no_std` Rust kernels in `kernels.wasm`, which CI rebuilds to the same bytes) and `cpu.mjs` (a JavaScript reference). `auto` tries WebGPU, then WebGL2, then compiled WASM, then JavaScript, and records every fallback it attempted. Hardware paths reject recognized software renderers, because a missing GPU is not a successful GPU check."
             },
             {
               "type": "p",
-              "text": "There is no native GPU support. `zipp py` on a graph program uses the local CPU reference evaluator and reports `backend: \"cpu-python\"`; it never starts CUDA, PyTorch or a native GPU API."
+              "text": "Natively, `zipp py` runs the same graphs on a hardware GPU. The `zipp-gpu` crate runs gpu-lab's JavaScript runtime unchanged in a second, trusted Zipp state over a WebGPU API shim backed by wgpu (Vulkan, Direct3D 12 or Metal, loaded at run time), so the native GPU executes the browser's own WGSL kernels. It is synchronous like the CPU evaluator, so a program's output does not depend on whether a GPU is present; the adapter is probed on a program's first graph; a compiled call the GPU cannot run is re-evaluated on the CPU; and `--no-gpu` or `ZIPP_GPU=0` keeps the CPU evaluator. Software adapters are not used. Float results agree with the browser's to about an ulp across shader compilers, and the exact operations (masks, dropout draws, slices, gathers, accumulation order) are bit for bit everywhere."
             }
           ]
         },
@@ -1049,7 +1078,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Graphs are plain data (`version: 1` or `2`) over a fixed set of float32 operations. Version 1: `input`, `full`, scalar or shape-matched `add`, `sub` and `mul`, `relu`, `positive` masks, `transpose`, `matmul`, whole-tensor `sum`, and a toroidal Game of `life` step. Version 2 adds rank-4 NumPy broadcasting and `div`, `neg`, `exp`, `log`, `sqrt`, `tanh`, `sigmoid`, `gelu` (exact erf) and its gradient, `permute` and `reshape`, axis and whole-tensor `sum` and `mean` with `keepdim`, `softmax` and `log_softmax`, batched `matmul`, a fused `cross_entropy` with its gradient, and the `sgd_update`, `momentum_update` and `adam` update steps. The runtime does not turn arbitrary Python or JavaScript into shaders."
+              "text": "Graphs are plain data (`version: 1` or `2`) over a fixed set of float32 operations. Version 1: `input`, `full`, scalar or shape-matched `add`, `sub` and `mul`, `relu`, `positive` masks, `transpose`, `matmul`, whole-tensor `sum`, and a toroidal Game of `life` step. Version 2 adds rank-4 NumPy broadcasting and `div`, `neg`, `exp`, `log`, `sqrt`, `tanh`, `sigmoid`, `gelu` (exact erf) and its gradient, `permute` and `reshape`, axis and whole-tensor `sum` and `mean` with `keepdim`, `softmax` and `log_softmax`, batched `matmul`, a fused `cross_entropy` with its gradient, and the `sgd_update`, `momentum_update` and `adam` update steps. Version 2 also takes a checkpoint's own `q4_k` and `q6_k` blocks as `input` data, decoded inside a `transposed` matmul, and `matmul_fixed`, a product accumulated in integers that gives the same bits on every backend that runs it. Version 3 adds `maximum`, `minimum`, comparison masks, `where` and a counter-hash `uniform` for dropout; version 4 adds strided `slice`, `slice_scatter`, `index_select`, `gather` and their gradients `index_add` and `scatter_add`, with the accumulation order fixed by the protocol. A graph is labelled with the lowest version it needs, so an older host refuses it rather than misreading it. The runtime does not turn arbitrary Python or JavaScript into shaders."
             },
             {
               "type": "table",
@@ -1093,11 +1122,67 @@
               "type": "callout",
               "tone": "warning",
               "title": "What it is not",
-              "text": "No kernel fusion and no general shader compiler. Tensors persist across requests only inside a prepared session (`runtime.prepare`), which is also the only way weights stay on the device. One graph runs at a time. Timings are not claims of GPU speedup over native PyTorch."
+              "text": "No general shader compiler, and fusion only where each element's arithmetic is unchanged: WebGPU runs Adam's updates, transposed matmuls, small sums and cross-entropies and elementwise chains as single kernels with the same bits. Tensors persist across requests only inside a prepared session (`runtime.prepare`), which is also the only way weights stay on the device. One graph runs at a time. Browser timings are not claims of GPU speedup over native PyTorch."
             },
             {
               "type": "p",
               "text": "A prepared session validates and plans a graph once; `input` nodes without data are fed per step and may carry an output, so weights, momentum buffers and Adam moments never leave the device, and `session.run(steps)` executes one or many steps in a single submission with only the named outputs read back. For the 784-256-10 Adam step at batch 64 on an RTX 5090: 7.5 ms per `execute()` with everything read back, 3.6 ms per single-step run, 0.79 ms per step at eight steps per run on WebGPU (WebGL2 0.81 ms, WebAssembly 1.64 ms); five session steps equal five chained executes bit for bit on all four backends. A run that fails after device work began - a backend error, a non-finite readback, a failed map - poisons the session: `run` and `download` refuse with `STATE` and only `dispose()` remains."
+            },
+            {
+              "type": "p",
+              "text": "Natively the same prepared sessions replay: after a session's first step the host records gpu-lab's command list and replays it, one submission and one readback per run, with batches written straight from Python's buffers. Large float matmuls use a register-blocked 128x128 tile where the device has 32 KB of workgroup memory (48 TFLOP/s on a 4096³ product), else 64x64; Direct3D 12 keeps smaller tiles because its compilers take minutes over the big one."
+            },
+            {
+              "type": "table",
+              "caption": "Against PyTorch 2.11 + CUDA 12.8 on the same RTX 5090, ms per step (docs/TORCH_COMPATIBILITY.md)",
+              "head": [
+                "Case",
+                "PyTorch CUDA eager",
+                "PyTorch CUDA graph",
+                "Zipp native `prepared.step` / 8 per run",
+                "Zipp in Chrome (WebGPU) / 8 per run"
+              ],
+              "rows": [
+                [
+                  "784-256-10, batch 64, Adam",
+                  "0.78",
+                  "0.17",
+                  "0.27 / 0.12",
+                  "2.9 / 0.65"
+                ],
+                [
+                  "784-1024-1024-10, batch 256",
+                  "1.16",
+                  "0.33",
+                  "0.77 / 0.52",
+                  "3.9 / 1.5"
+                ],
+                [
+                  "784-2048-2048-10, batch 1024",
+                  "1.14",
+                  "0.94",
+                  "2.3 / 1.85",
+                  "6.5 / 8.5"
+                ],
+                [
+                  "4096² matmul x4, inference",
+                  "10.3 (TF32 5.9)",
+                  "–",
+                  "13.7 / 14.2",
+                  "23 / 20"
+                ],
+                [
+                  "Embedding 8192x128 + gather NLL",
+                  "1.14",
+                  "0.30",
+                  "0.36 / 0.24",
+                  "2.7 / 0.40"
+                ]
+              ]
+            },
+            {
+              "type": "p",
+              "text": "A single step of the small and medium models and the embedding model is faster natively than PyTorch's eager CUDA, and at eight steps per run the small model beats its CUDA graph. Large products are still slower: this is float32 without tensor cores. Losses agree with PyTorch's within 1.4e-7 (small) and 3.1e-5 (medium)."
             }
           ]
         },
@@ -1112,7 +1197,7 @@
             },
             {
               "type": "p",
-              "text": "`Graph.submit(callback, on_error=None, **outputs)` records the graph as plain data and posts it as a host request; the callback receives a dict with `backend`, the named `outputs` (each with `shape`, `dtype` and a flat `data` list) and the host's `stats`. Tensors support broadcasting `+`, `-`, `*`, `/`, `@` (batched too), `.relu()`, `.gelu()`, `.sigmoid()`, `.tanh()`, `.exp()`, `.log()`, `.sqrt()`, `.softmax()`, `.log_softmax()`, `.sum()` and `.mean()` over an axis or all, `.permute()`, `.reshape()`, `.transpose()`, `.cross_entropy()`, `.positive()` and `.life()`, and `Graph` offers `sgd`, `momentum` and `adam` update steps. `Graph.prepare(feeds=, carry=, resident=, **outputs)` returns a `Session` with `run`, `run_steps`, `download` and `dispose`, the same protocol as `runtime.prepare` above. The host adapter (`createPythonGPUAdapter(engine, compute, { allowExecute: true, maxPending: 16 })`) drains the request, validates, executes, and answers with `pythonCall(\"__zipp_py_deliver\", ...)`. Execution is granted explicitly, an explicit backend choice is never downgraded to CPU, and a late result never reaches a disposed engine. Run natively with `zipp py`, the same program evaluates on the CPU reference and reports `cpu-python`."
+              "text": "`Graph.submit(callback, on_error=None, **outputs)` records the graph as plain data and posts it as a host request; the callback receives a dict with `backend`, the named `outputs` (each with `shape`, `dtype` and a flat `data` list) and the host's `stats`. Tensors support broadcasting `+`, `-`, `*`, `/`, `@` (batched too), `.relu()`, `.gelu()`, `.sigmoid()`, `.tanh()`, `.exp()`, `.log()`, `.sqrt()`, `.softmax()`, `.log_softmax()`, `.sum()` and `.mean()` over an axis or all, `.permute()`, `.reshape()`, `.transpose()`, `.cross_entropy()`, `.positive()` and `.life()`, and `Graph` offers `sgd`, `momentum` and `adam` update steps. `Graph.prepare(feeds=, carry=, resident=, **outputs)` returns a `Session` with `run`, `run_steps`, `download` and `dispose`, the same protocol as `runtime.prepare` above. The host adapter (`createPythonGPUAdapter(engine, compute, { allowExecute: true, maxPending: 16 })`) drains the request, validates, executes, and answers with `pythonCall(\"__zipp_py_deliver\", ...)`. Execution is granted explicitly, an explicit backend choice is never downgraded to CPU, and a late result never reaches a disposed engine. Run natively with `zipp py`, the same program runs on a hardware GPU through wgpu when one is present and on the CPU evaluator (`cpu-python`) otherwise, with the same output."
             },
             {
               "type": "figure",
@@ -1146,7 +1231,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The Torch subset can route a model through the GPU Lab. `torch.compile(model)(x)` returns a pending result whose `.submit(callback, on_error=None)` delivers the tensor asynchronously; that method is a Zipp extension, because browser GPU completion is asynchronous and PyTorch's synchronous API cannot be reproduced. Supported inference ops are broadcasting add, sub, mul and div, relu, gelu, sigmoid, tanh, exp, log and neg, softmax and log_softmax over the last dimension, matmul, sum and mean over all elements or one dimension, transpose, permute and reshape, and the `nn.Linear` / activation / `nn.Sequential` combinations built from them."
+              "text": "The Torch subset can route a model through the GPU Lab. `torch.compile(model)(x)` returns a pending result whose `.submit(callback, on_error=None)` delivers the tensor asynchronously; that method is a Zipp extension, because browser GPU completion is asynchronous and PyTorch's synchronous API cannot be reproduced. Supported inference ops are broadcasting add, sub, mul and div, relu, gelu, sigmoid, tanh, exp, log and neg, softmax and log_softmax over the last dimension, matmul, sum and mean over all elements or one dimension, transpose, permute and reshape, and the `nn.Linear` / activation / `nn.Sequential` combinations built from them. Protocol versions 3 and 4 add comparisons, `where`, `masked_fill`, clamping, `maximum`/`minimum`, dropout with a fresh mask every step, basic indexing, `narrow`/`select`/`split`/`chunk`/`flip`, `cat`/`stack`, `index_select`/`gather` and `F.embedding`, with PyTorch's gradients. An eager operation on a parameter inside the step is re-recorded on the parameter or refused by name, and CPU random draws inside a prepared step become per-step feeds, so a prepared session consumes the random stream exactly as the same eager steps do."
             },
             {
               "type": "p",
@@ -2063,7 +2148,7 @@
         "sandboxed scripting"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-16",
+      "dateModified": "2026-09-25",
       "sections": [
         {
           "heading": "The embedding model",
@@ -2076,7 +2161,7 @@
               "type": "code",
               "caption": "Cargo.toml",
               "lang": "toml",
-              "code": "[dependencies]\nzipp-vm = { git = \"https://github.com/f2i-com/zipp.org\", tag = \"v0.0.19\" }"
+              "code": "[dependencies]\nzipp-vm = { git = \"https://github.com/f2i-com/zipp.org\", tag = \"v0.0.21\" }"
             },
             {
               "type": "code",
@@ -2361,7 +2446,7 @@
         "JavaScript engine written in Rust"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-14",
+      "dateModified": "2026-09-25",
       "sections": [
         {
           "heading": "At a glance",
@@ -2412,7 +2497,7 @@
                 ],
                 [
                   "WebAssembly build",
-                  "Yes, 1.24 MB on the wire (JavaScript-only)",
+                  "Yes, 1.32 MB on the wire (JavaScript-only)",
                   "Yes, about 0.42 MB on the wire (QuickJS-NG reactor)",
                   "Yes",
                   "Yes (Hermes in the browser is a niche path)",
@@ -2451,7 +2536,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "QuickJS is the engine to beat for footprint. Its WebAssembly reactor is 1,528,293 bytes raw and 417,087 after Brotli; Zipp's JavaScript-only module is 3.59× that raw and 2.96× on the wire. If your budget is under a megabyte on the wire, QuickJS wins, full stop. QuickJS also has years of production use, a C API that embeds in an afternoon, and QuickJS-NG as an actively maintained fork."
+              "text": "QuickJS is the engine to beat for footprint. Its WebAssembly reactor is 1,528,293 bytes raw and 417,087 after Brotli; Zipp's JavaScript-only module is 3.76× that raw and 3.17× on the wire. If your budget is under a megabyte on the wire, QuickJS wins, full stop. QuickJS also has years of production use, a C API that embeds in an afternoon, and QuickJS-NG as an actively maintained fork."
             },
             {
               "type": "p",
@@ -2541,11 +2626,11 @@
     },
     {
       "slug": "releases",
-      "title": "Zipp Releases: v0.0.1 to v0.0.19, Downloads and Notes",
-      "description": "Every Zipp release from v0.0.1 on 30 August 2026 to v0.0.19 on 16 September 2026, with what changed, how releases are gated, and what each download contains.",
+      "title": "Zipp Releases: v0.0.1 to v0.0.21, Downloads and Notes",
+      "description": "Every Zipp release from v0.0.1 on 30 August 2026 to v0.0.21 on 25 September 2026, with what changed, how releases are gated, and what each download contains.",
       "h1": "Zipp releases",
       "breadcrumb": "Releases",
-      "lede": "Zipp publishes GitHub Releases only: native x86-64 CLI archives for Windows and Linux, and two WebAssembly archives. Nineteen tags shipped in seventeen days between 30 August and 16 September 2026. This page lists them, explains what a release has to pass, and links the notes.",
+      "lede": "Zipp publishes GitHub Releases only: native x86-64 CLI archives for Windows and Linux, and WebAssembly archives. Twenty-one tags shipped between 30 August and 25 September 2026. This page lists them, explains what a release has to pass, and links the notes.",
       "keywords": [
         "Zipp releases",
         "Zipp download",
@@ -2554,52 +2639,61 @@
         "Zipp changelog"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-16",
+      "dateModified": "2026-09-25",
       "sections": [
         {
-          "heading": "Latest: v0.0.19, 16 September 2026",
+          "heading": "Latest: v0.0.21, 25 September 2026",
           "blocks": [
             {
               "type": "p",
-              "text": "A review of the whole project found 324 verified defects and this release fixes all of them. On the GPU, version 2 of the graph protocol carries what a neural network needs - broadcasting, activations, softmax, a fused cross-entropy, SGD-with-momentum and Adam update steps - `torch.compile(training=True)` records it from ordinary Torch code, and prepared sessions keep weights and optimizer state on the device between steps."
+              "text": "Python on the command line runs at about 1.75× CPython 3.13's time with a new JIT tier, from about 22× when the work began. The torch layer grows to what ordinary training code uses, checked against PyTorch 2.11; torch becomes an optional WebAssembly package; and `zipp py` runs `torch.compile` graphs on a hardware GPU through wgpu, a small model's training step faster than PyTorch's eager CUDA on the same card."
             },
             {
               "type": "ul",
               "items": [
-                "`torch.compile` training steps with relu, gelu, sigmoid or tanh layers, softmax, MSE or `F.cross_entropy`, and SGD (momentum, dampening, Nesterov, weight decay), Adam or AdamW - tracking PyTorch 2.11 step for step to float32 rounding.",
-                "`compiled.prepare(x, target)` records the step once and returns a session whose `step` and `steps` feed only each batch: on an RTX 5090 in Chrome, 74 ms per plain compiled call becomes 5.1 ms per step, or 1.8 ms per step at eight steps per submission (WebGPU).",
-                "`zipp_gpu.Graph.prepare` sessions for hand-built graphs: 0.79 ms per step at the runtime level, bit-identical to chained submissions on all four backends; a run that fails after device work began poisons its session rather than letting a retry run on undefined state.",
-                "Natively, `zipp py` runs version-2 graphs on the tensor kernels (939 s to 2.9 s for the compiled MNIST-scale step). The Python frontend runs at 0.59x of 0.0.18's time and then 0.89x of that after a second pass over its hot paths; the CPython differential corpus is 99 programs in three modes.",
-                "Engine fixes from the review: iterator closing, TypedArray spread, string growth ceilings, regex execution limits, the release gate's own smoke test, and dozens more."
+                "Python speed: direct calls, per-VM inline caches, fused Python instructions, small integers in the value word, native dict, set and instance storage, and a JIT tier for hot loops. `range_loop`, `int_arith`, `float_arith`, `tuple_swap` and `global_read` beat CPython; a warm hello-world starts in about 20 ms.",
+                "Python compatibility: CPython's tracebacks and `traceback` module, complex numbers and `cmath`, and Python compiled directly from Zipp's own syntax tree (`zipp-pyparse`), with the RustPython fork removed.",
+                "Torch: about 200 more tensor functions, the common layers, losses, optimizers and schedulers, `torch.utils.data`, native `torch.linalg` and `torch.fft`, `torch.distributions`, half-precision, complex, sparse and quantized tensors, and single-process `torch.distributed`; GPT-Neo's modelling file now runs unmodified.",
+                "WebAssembly: `python` without torch (1.70 MB on the wire) plus the 0.38 MB `zipp_torch.wasm` package, beside `all` with torch built in (2.06 MB); `prewarmPython()` brings the first browser run to about 20 ms.",
+                "Native GPU: wgpu over Vulkan, Direct3D 12 or Metal, native replay of prepared steps, exact kernel fusion and a 128x128 matmul tile. On an RTX 5090 a small MLP's prepared step takes 0.27 ms (0.12 ms at eight per run) against 0.78 ms for PyTorch's eager CUDA. Graph protocol version 4 carries masks, dropout, slicing and gathers.",
+                "Engine: small BigInts as immediates (JavaScript BigInt code 2-4× faster), a compiler that emits the same bytecode on every run, and fixes to a JIT wrap, a destructuring TDZ case and nested budget loans; Test262 passes as before."
               ]
             },
             {
               "type": "table",
-              "caption": "v0.0.19 assets",
+              "caption": "v0.0.21 assets",
               "head": [
                 "Asset",
                 "Contents"
               ],
               "rows": [
                 [
-                  "`zipp-0.0.19-x86_64-pc-windows-msvc.zip`",
-                  "Native CLI for Windows: JavaScript with the x86-64 JIT, plus experimental Python"
+                  "`zipp-0.0.21-x86_64-pc-windows-msvc.zip`",
+                  "Native CLI for Windows, complete: JavaScript with the x86-64 JIT, Python with its JIT tier, torch and the native GPU path"
                 ],
                 [
-                  "`zipp-0.0.19-x86_64-unknown-linux-gnu.tar.gz`",
+                  "`zipp-0.0.21-x86_64-unknown-linux-gnu.tar.gz`",
                   "Native CLI for Linux, same contents"
                 ],
                 [
-                  "`zipp-wasm-0.0.19-web.zip`",
+                  "`zipp-wasm-0.0.21-web.zip`",
                   "JavaScript-only browser engine, TypeScript bindings and the Worker host SDK"
                 ],
                 [
-                  "`zipp-wasm-0.0.19-web-python.zip`",
-                  "JavaScript + Python, the browser GPU adapter with sessions, CPU WASM kernels and the Torch compatibility guide"
+                  "`zipp-wasm-0.0.21-web-python-base.zip`",
+                  "JavaScript + Python without torch"
+                ],
+                [
+                  "`zipp-wasm-0.0.21-web-python.zip`",
+                  "JavaScript + Python with torch built in, the browser GPU adapter, CPU WASM kernels and the Torch compatibility guide"
+                ],
+                [
+                  "`zipp-wasm-0.0.21-web-torch.zip`",
+                  "The torch package: `zipp_torch.wasm` and its `zipp_torch.js` loader, for `web-python-base`"
                 ],
                 [
                   "`SHA256SUMS`",
-                  "Checksums for every asset; each WASM archive also carries `BUILD-INFO.txt` and `PROFILE.json`"
+                  "Checksums for every asset; each WASM archive also carries `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`"
                 ]
               ]
             },
@@ -2607,11 +2701,11 @@
               "type": "callout",
               "tone": "warning",
               "title": "Experimental boundaries",
-              "text": "The Python and Torch support is a subset, not CPython or a drop-in PyTorch. GPU results arrive through callbacks (`submit`, `step`, `steps`, `sync`) because browser GPU completion is asynchronous. A prepared Adam step is bounded by the protocol's 64 outputs (15 parameter tensors); GPU `Conv2d` training, RMSprop, `amsgrad`, higher-order gradients and CUDA are not provided. Same-VM Python and JavaScript interop remains a separate opt-in source build that neither archive enables."
+              "text": "The Python and Torch support is a subset, not CPython or a drop-in PyTorch. The Python JIT tier is x86-64 and command-line only; WebAssembly stays interpreted. Browser GPU results arrive through callbacks because browser GPU completion is asynchronous; natively they are synchronous. CUDA is not provided, and large float32 matmuls are still slower than CUDA's. The local-model plugins remain source only, and same-VM Python and JavaScript interop remains a separate opt-in source build that no archive enables."
             },
             {
               "type": "p",
-              "text": "[Release notes and downloads on GitHub](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.19) · [docs/releases/0.0.19.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.19.md)"
+              "text": "[Release notes and downloads on GitHub](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.21) · [docs/releases/0.0.21.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.21.md) · [v0.0.20 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.20.md)"
             }
           ]
         },
@@ -2622,7 +2716,7 @@
               "type": "code",
               "caption": "From a release archive",
               "lang": "shell",
-              "code": "# Linux\ncurl -LO https://github.com/f2i-com/zipp.org/releases/download/v0.0.19/zipp-0.0.19-x86_64-unknown-linux-gnu.tar.gz\ntar xzf zipp-0.0.19-x86_64-unknown-linux-gnu.tar.gz\necho 'console.log(\"hello\")' > hello.js\n./zipp-0.0.19-x86_64-unknown-linux-gnu/zipp js hello.js\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
+              "code": "# Linux\ncurl -LO https://github.com/f2i-com/zipp.org/releases/download/v0.0.21/zipp-0.0.21-x86_64-unknown-linux-gnu.tar.gz\ntar xzf zipp-0.0.21-x86_64-unknown-linux-gnu.tar.gz\necho 'console.log(\"hello\")' > hello.js\n./zipp-0.0.21-x86_64-unknown-linux-gnu/zipp js hello.js\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
             },
             {
               "type": "p",
@@ -2635,7 +2729,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Pushing a `vX.Y.Z` tag runs the release workflow. It refuses to publish unless the tag object matches the checkout; the root `Cargo.toml`, the WebAssembly crate and the landing page all carry the same version; and the reusable CI, the full security workflow (including the pinned Test262 corpus), the native build and the WebAssembly build all pass at that exact commit. A green `main` at some other revision is not a release gate. The job is retry-safe: it re-downloads existing assets, verifies `SHA256SUMS`, and checks that `BUILD-INFO.json` is not dirty and names the right commit before deciding to do nothing. A dispatched re-run may skip the two longest gate jobs - the native workspace suite and Test262 - only when the identical tree has been through them elsewhere; v0.0.19 was published that way, with both run locally on the tagged commit (308 test binaries, 2,453 tests; 95,680 of 95,680 corrected-core executions) and every other job in the workflow."
+              "text": "Pushing a `vX.Y.Z` tag runs the release workflow. It refuses to publish unless the tag object matches the checkout; the root `Cargo.toml`, the WebAssembly crate and the landing page all carry the same version; and the reusable CI, the full security workflow (including the pinned Test262 corpus), the native build and the WebAssembly build all pass at that exact commit. A green `main` at some other revision is not a release gate. The job is retry-safe: it re-downloads existing assets, verifies `SHA256SUMS`, and checks that `BUILD-INFO.json` is not dirty and names the right commit before deciding to do nothing. A dispatched re-run may skip the two longest gate jobs - the native workspace suite and Test262 - only when the identical tree has been through them elsewhere; v0.0.19 was published that way, with both run locally on the tagged commit (308 test binaries, 2,453 tests; 95,680 of 95,680 corrected-core executions) and every other job in the workflow, and so was v0.0.20, whose JavaScript engine source had not changed since v0.0.19 passed them. From v0.0.21 the workflow also builds the torch package with the two engines it pairs with, and refuses to publish unless `python` plus the package prints exactly what `all` prints over the torch suites."
             }
           ]
         },
@@ -2651,6 +2745,16 @@
                 "Headline"
               ],
               "rows": [
+                [
+                  "[v0.0.21](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.21)",
+                  "2026-09-25",
+                  "Python at about 1.75× CPython with a JIT tier; the torch layer checked against PyTorch 2.11; torch as a WebAssembly package; native GPU through wgpu"
+                ],
+                [
+                  "[v0.0.20](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.20)",
+                  "2026-09-18",
+                  "Quantized Q4_K and Q6_K weights on the GPU path, `matmul_fixed`, reproducible Rust kernels, and Hugging Face modelling files running unmodified"
+                ],
                 [
                   "[v0.0.19](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.19)",
                   "2026-09-16",
@@ -2750,7 +2854,7 @@
             },
             {
               "type": "p",
-              "text": "Release notes for v0.0.1 through v0.0.17 live in the annotated tag messages; v0.0.18 is the first with a notes file in `docs/releases/`. The [engineering journal](/journal/) tells the story between the tags."
+              "text": "Release notes for v0.0.1 through v0.0.17 live in the annotated tag messages; v0.0.18 is the first with a notes file in `docs/releases/`, and from v0.0.20 that file is the GitHub release body verbatim. The [engineering journal](/journal/) tells the story between the tags."
             }
           ]
         }
@@ -2776,11 +2880,11 @@
     },
     {
       "slug": "journey",
-      "title": "The Zipp Story: A JavaScript Engine in Rust in 110 Days",
-      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 14 September 2026, mistakes included.",
+      "title": "The Zipp Story: A JavaScript Engine in Rust in 119 Days",
+      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 25 September 2026, mistakes included.",
       "h1": "The Zipp story",
       "breadcrumb": "The story",
-      "lede": "Zipp's repository has 1,978 commits over 110 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in five acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
+      "lede": "Zipp's repository has 2,120 commits over 119 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in six acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
       "keywords": [
         "building a JavaScript engine",
         "JavaScript engine in Rust history",
@@ -2789,7 +2893,7 @@
         "solo compiler project"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-16",
+      "dateModified": "2026-09-25",
       "schemaType": "Article",
       "sections": [
         {
@@ -2799,19 +2903,19 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "1,978",
-                  "label": "Commits from 29 May to 16 September 2026",
-                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 209 in September"
+                  "value": "2,120",
+                  "label": "Commits from 29 May to 25 September 2026",
+                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 351 in September"
                 },
                 {
-                  "value": "19",
-                  "label": "Tagged releases in 17 days",
-                  "note": "v0.0.1 on 30 August to v0.0.19 on 16 September"
+                  "value": "21",
+                  "label": "Tagged releases in 26 days",
+                  "note": "v0.0.1 on 30 August to v0.0.21 on 25 September"
                 },
                 {
                   "value": "376,941",
                   "label": "First-party lines of Rust",
-                  "note": "504,506 including the two vendored forks"
+                  "note": "504,506 including the two vendored forks, counted at v0.0.19"
                 },
                 {
                   "value": "2",
@@ -2892,6 +2996,19 @@
           ]
         },
         {
+          "heading": "Act six: models, torch and speed (17 to 25 September)",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "On 17 September a local-model plugin overlay arrived, and the GPU path learned to keep a checkpoint's own Q4_K and Q6_K blocks and decode them inside the matmul, so Qwen3-0.6B holds at 373 MB instead of 2,274. The GGUF reader moved out to its own project, a model split into stages that reproduce the whole model's logits bit for bit across worker threads, `matmul_fixed` computed a product in integers, and the kernels became Rust that builds to the same bytes on Linux and Windows. v0.0.20 was published on 18 September."
+            },
+            {
+              "type": "p",
+              "text": "From 22 September a round of fixes preceded a torch layer checked against PyTorch 2.11 area by area: tensors and autograd, `nn`, optimizers and schedulers, half precision, `linalg`, `fft`, `distributions`, complex, sparse and quantized tensors. On 23 September `zipp py` ran `torch.compile` graphs on a hardware GPU through wgpu. Then the Python frontend went from about 22× CPython 3.13's time to about 1.75× in three days, through fused instructions, a JIT tier, small integers in the value word and native dict, set and instance storage, while a prepared GPU step fell below PyTorch's eager CUDA on the same card. The Python parser became Zipp's own and the RustPython fork was deleted, and v0.0.21 was published on 25 September."
+            }
+          ]
+        },
+        {
           "heading": "How the work was done",
           "blocks": [
             {
@@ -2968,6 +3085,21 @@
                   "date": "2026-09-16",
                   "title": "Resident GPU sessions, `torch.compile` prepare and v0.0.19",
                   "text": "`bc9ce154`, `71dab087`, `65468539`, `18961128`, `431b7177`, `2e6a39c3`."
+                },
+                {
+                  "date": "2026-09-18",
+                  "title": "Quantized weights, `matmul_fixed` and v0.0.20",
+                  "text": "`ad64fce3`, `50ec6a98`, `c4409b6f`, `fdc639c5`."
+                },
+                {
+                  "date": "2026-09-23",
+                  "title": "The torch layer against PyTorch 2.11, and native GPU through wgpu",
+                  "text": "`1f95d6f9`, `cfc8e990`, `b24c6b81`, `7e2434e5`."
+                },
+                {
+                  "date": "2026-09-25",
+                  "title": "Python at about 1.75× CPython; v0.0.21",
+                  "text": "`f9347730`, `cff586d2`, `fd18aaf7`, `50e490b0`, `f954857c`."
                 }
               ]
             }
@@ -3368,11 +3500,11 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Python on Zipp is currently an interpreter over a JavaScript-shaped VM, with the native JIT disabled for Python states because the frontend pulls in the instrumentation feature, and with every integer a BigInt. On a release build `fib(25)` takes about 0.09 s, a million-iteration `total += i % 7` loop about 0.5 s and 200,000 dict insertions with string keys about 0.7 s, against 0.005, 0.05 and 0.03 s in CPython. The stated next step is dedicated Python bytecodes: small-integer fast paths and direct dispatch for the operations the JavaScript-shaped runtime currently reaches through property access."
+              "text": "When this article was first written, Python on Zipp was an interpreter over a JavaScript-shaped VM with every integer a BigInt, many times slower than CPython. The dedicated Python bytecodes it named as the next step have since landed, together with much more: fused Python-only instructions with per-VM inline caches, `PyCall` direct calls, integers within ±2^46 held in the value word, dicts, sets and instances in native storage with hidden-class layouts, and a Python JIT tier for hot loops on the command line. Over the 36 programs of the benchmark suite Zipp now runs at about 1.75× CPython 3.13's time with that JIT, from about 22× at the start of the work, and five of the programs beat CPython. WebAssembly and budgeted embedders stay interpreted."
             },
             {
               "type": "p",
-              "text": "The feature gaps are listed rather than hidden: no `async` / `await`, no type-parameter syntax, no `except*`, no complex numbers, no threads, no sockets, and `input()` raises `EOFError`."
+              "text": "The feature gaps are listed rather than hidden: no `async` / `await`, no type-parameter syntax, no `except*`, no threads, no sockets, and `input()` raises `EOFError`."
             }
           ]
         },
@@ -3434,7 +3566,7 @@
         "torch.compile WebGPU"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-14",
+      "dateModified": "2026-09-25",
       "sections": [
         {
           "heading": "The constraint that shaped everything",
@@ -3539,7 +3671,7 @@
               "type": "callout",
               "tone": "warning",
               "title": "Not PyTorch",
-              "text": "`submit()` is a Zipp extension because browser GPU completion is asynchronous. There is no kernel fusion, no GPU convolution, and no CUDA. The documentation says this is for small experiments, and it is."
+              "text": "`submit()` is a Zipp extension because browser GPU completion is asynchronous. There is no GPU convolution and no CUDA, and fusion happens only where each element's arithmetic is unchanged. In the browser this is for small experiments. Since v0.0.21 the same graphs also run natively through wgpu, where a small model's prepared step (0.27 ms on an RTX 5090) is faster than PyTorch's eager CUDA."
             }
           ]
         },
@@ -4510,6 +4642,342 @@
           {
             "label": "The Zipp story",
             "href": "/journey/"
+          }
+        ]
+      },
+      {
+        "slug": "local-models-and-quantized-weights",
+        "date": "2026-09-17",
+        "title": "A language model from its GGUF file, and weights that stay quantized",
+        "summary": "An experimental local-model plugin overlay arrives, and the GPU protocol learns to keep a checkpoint's Q4_K and Q6_K blocks and decode them inside the matmul on every backend.",
+        "tags": [
+          "gpu",
+          "python",
+          "wasm"
+        ],
+        "commits": [
+          "277f30fa",
+          "9472d78f",
+          "90e0a9c7",
+          "379a04cc",
+          "ad64fce3",
+          "e6c33be3",
+          "6f847191",
+          "03b5c283"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "`277f30fa` applies a local-model Python plugin overlay verbatim, checked against its own `SHA256SUMS`, and says plainly that its integration gates had never run. The rest of the day made it real. `90e0a9c7` and `9472d78f` gave the Python frontend relative imports and a no-op `torch.autocast`, which with 341 lines of shim was enough for Hugging Face's Qwen3, Qwen2, Llama and Mistral modelling files to run exactly as published, within 2e-7 of transformers. The commit makes a point worth keeping: what stood in the way was never numpy, but four tensor operations, autocast, relative imports and those 341 lines."
+          },
+          {
+            "type": "p",
+            "text": "`379a04cc` reads GGUF without holding the file: a 6.8 GB checkpoint opens in 35 ms from a 16 MiB header read. `ad64fce3` is the decision that matters: a Q4_K weight is 144 bytes per 256 values and 1,024 once expanded, so an `input` may now carry `q4_k` or `q6_k` blocks and every backend decodes them inside a `transposed` matmul, held to bit-for-bit equality with the same matmul over decoded values. `e6c33be3` made the browser side Rust, `6f847191` added a Qwen3 plugin that reads the checkpoint where it lies, and by the evening `03b5c283` moved the container, block formats and tokenizer out to their own project, [gguf-wasm](https://github.com/f2i-com/gguf-wasm), keeping only what is ZIPP's: the kernels and the protocol."
+          }
+        ],
+        "related": [
+          {
+            "label": "GPU compute",
+            "href": "/webgpu/"
+          },
+          {
+            "label": "Python",
+            "href": "/python/"
+          }
+        ]
+      },
+      {
+        "slug": "stages-matmul-fixed-and-v0-0-20",
+        "date": "2026-09-18",
+        "title": "A model in stages, a product in integers, and v0.0.20",
+        "summary": "Qwen3 splits into stages that reproduce the whole model bit for bit, matmul_fixed accumulates in integers so every backend gives the same bits, the kernels build reproducibly, and v0.0.20 ships.",
+        "tags": [
+          "gpu",
+          "release",
+          "correctness"
+        ],
+        "commits": [
+          "e8053573",
+          "50ec6a98",
+          "d7fe124e",
+          "c4409b6f",
+          "9d20b25c",
+          "435ea899",
+          "fdc639c5",
+          "5dbd80c5"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Every quantized test until then compared ZIPP with ZIPP. `e8053573` compares the whole chain with transformers reading the same GGUF, an implementation that shares nothing with it: the worst of 455,808 logits differs by 7.4e-5. `50ec6a98` then ran Qwen3 as two stages with a hidden state crossing between them and got the whole model's logits bit for bit, and `d7fe124e` put the stages in worker threads and killed one, measuring that a restarted stage is not recovery: it differs in 151,936 of 151,936 logits and predicts \" the\" where the model says \" Paris\"."
+          },
+          {
+            "type": "p",
+            "text": "`c4409b6f` adds `matmul_fixed`: both sides quantized to int16 against their own row's maximum and summed as integers, so the answer is the same bits on every backend by construction rather than by agreeing on rounding order, which is what a proof system over a prime field needs. WebGPU and WebGL2 have no 64-bit integer to accumulate in, so they refuse the graph; before this, an operation a backend had no kernel for returned a buffer of zeros. `435ea899` runs a prompt 16 positions at a time into the same caches, 65 ms a token against 182, bit for bit. `fdc639c5` made `kernels.wasm` build to the same bytes on Windows and Linux and has CI rebuild and compare it, and [v0.0.20](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.20) was published with the plugins source only."
+          }
+        ],
+        "related": [
+          {
+            "label": "Releases",
+            "href": "/releases/"
+          },
+          {
+            "label": "GPU compute",
+            "href": "/webgpu/"
+          }
+        ]
+      },
+      {
+        "slug": "fixes-before-the-torch-round",
+        "date": "2026-09-22",
+        "title": "Fixes first: the model host, the host boundary and the Python frontend",
+        "summary": "Before building further, a pass over the model host, gpu-lab sessions, the WebAssembly host boundary, the dev server, the Python frontend and the JIT fixes the defects found, each with a regression test.",
+        "tags": [
+          "correctness",
+          "security",
+          "python"
+        ],
+        "commits": [
+          "7bed1582",
+          "787b73a3",
+          "dfbd51bb",
+          "4ec0f002",
+          "d80f2d91",
+          "a04da81a",
+          "f2ba827d",
+          "17cb442a"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The round began with fixes rather than features. The GPT-Neo tokenizer skipped every merge line starting with `#`, not just the header, dropping eight real merges (`787b73a3`). A gpu-lab session accepted a float feed for a quantized input and handed the floats to the backends as block bytes, and the WebAssembly arena never gave back what sessions pinned (`dfbd51bb`). `zipp run --bc a.js` executed the script it was asked only to print (`4ec0f002`). On Windows the dev server served `.git/config` through its 8.3 short name `/GIT~1/config` (`d80f2d91`). A host object key with a lone surrogate merged two keys and dropped a value without error (`a04da81a`)."
+          },
+          {
+            "type": "p",
+            "text": "`f2ba827d` fixed the Python frontend against CPython 3.11 and PyTorch 2.11: a generator suspended inside `except` leaked its exception into the caller, exact ties in `e` and `g` formats rounded away from zero, argparse hung on any `store_true` flag, and `torch.save` wrote a global PyTorch cannot load. `17cb442a` fixed a JIT wrap that changed results: once compiled, `(a + b + 0.5) | 0` at `a = 2^31-1, b = 1` gave -2147483647 instead of -2147483648."
+          }
+        ],
+        "related": [
+          {
+            "label": "Sandboxing and audits",
+            "href": "/sandbox/"
+          },
+          {
+            "label": "Python",
+            "href": "/python/"
+          }
+        ]
+      },
+      {
+        "slug": "the-torch-layer-against-pytorch",
+        "date": "2026-09-23",
+        "title": "The torch layer, checked against PyTorch 2.11",
+        "summary": "Silent errors in eager torch are fixed, the layers, optimizers, dtypes, linalg, fft and distributions ordinary training code uses are added, and eager torch's heavy loops run natively: about 4.8x faster, same bytes.",
+        "tags": [
+          "python",
+          "correctness",
+          "performance"
+        ],
+        "commits": [
+          "7aaeb16c",
+          "1f95d6f9",
+          "cfc8e990",
+          "782cc0aa",
+          "7dd1db31",
+          "14a2ef71",
+          "fb5ecc0a",
+          "b24c6b81",
+          "1234581c",
+          "61b960e5",
+          "2481bb47"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The commits lead with what was silently wrong. In-place arithmetic rebound a tensor to new storage, so the textbook `w.data.add_(w.grad, alpha=-lr)` left the weights unchanged; float32 means accumulated in float32, so the mean of a million 0.1s was 0.100958 (`1f95d6f9`). The -100 padding label indexed a real class and a reassigned BatchNorm buffer never reached `state_dict` (`cfc8e990`). A PyTorch Adam checkpoint drifted its bias correction (`782cc0aa`), and `torch.compile` training captured an eager op on a parameter as a new leaf whose gradient never reached it (`7dd1db31`). Each fix is checked against values PyTorch 2.11 generated, and each commit adds what training code reaches for: about 200 tensor functions, the common layers, 12 optimizers, 15 schedulers, `torch.utils.data`, float16 and bfloat16 (stored in two bytes by `61b960e5`), `torch.linalg` and `torch.distributions`."
+          },
+          {
+            "type": "p",
+            "text": "Speed came second and without changing a byte. `14a2ef71` turned the JIT on for `zipp py` and `fb5ecc0a` reverted it the same night, because once the tensor loops ran natively the JIT made training slower. `b24c6b81` is that change: matmul, convolution, elementwise ops and reductions run as Rust natives that repeat the JavaScript's float64 operations in the same order, and 20,828 native-against-JavaScript cases differ in no byte. `torch_matmul` went from 319 to 8.4 ms and the geometric mean to 0.21× its time. `2481bb47` did the same for `torch.linalg` (a 64x64 `eig` from 218 s to 2.6 ms) and added complex tensors and `torch.fft`."
+          }
+        ],
+        "related": [
+          {
+            "label": "Python",
+            "href": "/python/"
+          },
+          {
+            "label": "GPU compute",
+            "href": "/webgpu/"
+          }
+        ]
+      },
+      {
+        "slug": "native-gpu-through-wgpu",
+        "date": "2026-09-23",
+        "title": "torch.compile on a hardware GPU, natively",
+        "summary": "Graph protocol versions 3 and 4 add masks, dropout, slicing and gathers bit for bit on five backends, and zipp py runs the same graphs on Vulkan, Direct3D 12 or Metal through wgpu.",
+        "tags": [
+          "gpu",
+          "python"
+        ],
+        "commits": [
+          "84ccf248",
+          "eb81d583",
+          "7e2434e5",
+          "c8b60292"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "`84ccf248` added protocol version 3: `maximum`, `minimum`, comparisons as masks, `where`, and a `uniform` draw computed as a counter hash in 32-bit integers so every backend draws the same bits, which gave `torch.compile` clamping, masking and dropout. ANGLE on Direct3D 11 lost a tied zero's sign in `x < y ? y : x`, so the shaders decide ties first. `eb81d583` added version 4, slicing, `index_select`, `gather` and their gradients, with the protocol fixing the accumulation order so a repeated token's embedding gradient is the same bits everywhere. All five backends agree bit for bit: 276 of 276 cases on WebGPU, WebGL2, WebAssembly and JavaScript, and the references."
+          },
+          {
+            "type": "p",
+            "text": "`7e2434e5` runs those graphs natively. A new crate, `zipp-gpu`, runs gpu-lab's JavaScript runtime unchanged in a second, trusted Zipp state over a WebGPU shim backed by wgpu, loaded at run time, so no SDK is needed to build and the binary runs anywhere. It is synchronous like the CPU evaluator, so a program's output does not depend on whether a GPU is present. For a 784-2048-2048-10 Adam step at batch 1024 on an RTX 5090, a prepared step took 23.6 ms, against about 25 minutes per call on the CPU evaluator."
+          }
+        ],
+        "related": [
+          {
+            "label": "GPU compute",
+            "href": "/webgpu/"
+          },
+          {
+            "label": "Architecture",
+            "href": "/architecture/"
+          }
+        ]
+      },
+      {
+        "slug": "python-from-22x-to-2x-cpython",
+        "date": "2026-09-24",
+        "title": "Python from 22x CPython's time to about 2x",
+        "summary": "Direct calls, fused Python-only instructions, native helpers, a JIT tier for hot loops, per-VM caches and small integers in the value word take the Python benchmark suite from 22.3x CPython 3.13 to about 2.1x.",
+        "tags": [
+          "python",
+          "performance",
+          "jit"
+        ],
+        "commits": [
+          "f9347730",
+          "771eba6b",
+          "cff586d2",
+          "d6bf5cf0",
+          "6ff55c9f",
+          "2b5e2028",
+          "fd18aaf7"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The starting point, measured on the `tools/python_bench.py` suite against CPython 3.13: 22.3× its time. `f9347730` took it to 8.55× with a new calling convention, per-class inline caches and ten fused Python-only instructions executed out of line so the JavaScript interpreter loop is unchanged. `771eba6b` added seventeen more and native `json`, string, `heapq` and `bisect` helpers, to 5.3×. `cff586d2` gave the command line a JIT tier for hot Python loops; every fused instruction it does not inline calls the interpreter's own step and continues where that step chose, so results are identical. `d6bf5cf0`, `6ff55c9f` and `2b5e2028` made exceptions, generators and lookups cheaper, to 3.6× with the JIT."
+          },
+          {
+            "type": "p",
+            "text": "`fd18aaf7` was the big step. Python's `int` is a BigInt in the runtime, so integer code allocated on every operation. A BigInt within ±2^46 is now an immediate in the value word, reusing the null tag's bit pattern with payload bit 47 set, so no new tag was needed and every existing is-a-double check stayed valid. The geometric mean with the JIT fell from 3.6× to 2.1×, and `range_loop`, `int_arith`, `float_arith`, `tuple_swap` and `global_read` beat CPython. JavaScript BigInt code got 2-4× faster, other JavaScript is unchanged, and Test262 passes as before."
+          }
+        ],
+        "related": [
+          {
+            "label": "Python",
+            "href": "/python/"
+          },
+          {
+            "label": "Architecture",
+            "href": "/architecture/"
+          }
+        ]
+      },
+      {
+        "slug": "torch-as-a-package-and-a-gpu-step-under-cuda",
+        "date": "2026-09-24",
+        "title": "Torch as a package, and a GPU step under PyTorch's eager CUDA",
+        "summary": "Python without torch becomes a smaller WebAssembly variant with torch as a verified package, the Python parser becomes hand-written and then Zipp's own, and a prepared GPU step falls to 0.27 ms against PyTorch's 0.78.",
+        "tags": [
+          "wasm",
+          "gpu",
+          "performance",
+          "parser"
+        ],
+        "commits": [
+          "eb2baa1e",
+          "76a1f721",
+          "7ee10b51",
+          "c112164c",
+          "8e9e5d2e",
+          "c3b1c38f",
+          "8ceb6f91",
+          "f6254f56",
+          "45764899",
+          "eaeab1f3"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The torch work had made the Python module heavy, so this day took weight out. `eb2baa1e` embeds the Python library comment-stripped, token for token (57 KB smaller on the wire). `76a1f721` replaced the vendored parser's generated tables with a hand-written recursive-descent parser checked over 1.3 million mutated token streams, and `c112164c` replaced that with Zipp's own front end, `zipp-pyparse`. `7ee10b51` compiles bundled modules on first import, so a program that imports torch in the browser starts in about 300 ms instead of 560. `8e9e5d2e` split torch out: the `python` variant is 1.68 MB on the wire, below 0.0.20's 1.71 MB, and `zipp_torch.wasm` (0.38 MB) adds torch at run time after the engine checks its format, ABI hash and every file's SHA-256."
+          },
+          {
+            "type": "p",
+            "text": "On the native GPU, `c3b1c38f` replays a prepared step's recorded command list itself, one submit and one readback per run. `8ceb6f91` took a small MLP's step from 0.94 to 0.53 ms, under PyTorch's eager CUDA on the same RTX 5090. `f6254f56` fuses kernels only where each element's arithmetic is unchanged and adds a 128x128 matmul tile (48 TFLOP/s on a 4096³ product), and `45764899` sends steps in binary and cuts a small step to 12 dispatches: 0.27 ms, 0.12 ms at eight per run, against 0.78 ms for PyTorch's eager CUDA and 0.17 ms for its CUDA graph, bit for bit the same on Vulkan, Direct3D 12 and Chrome. `eaeab1f3` stopped a `dxcompiler.dll` on PATH from silently changing Direct3D 12's float results."
+          }
+        ],
+        "related": [
+          {
+            "label": "WebAssembly runtime",
+            "href": "/wasm/"
+          },
+          {
+            "label": "GPU compute",
+            "href": "/webgpu/"
+          }
+        ]
+      },
+      {
+        "slug": "python-at-1-75x-cpython-and-v0-0-21",
+        "date": "2026-09-25",
+        "title": "Python at 1.75x CPython, own parser only, and v0.0.21",
+        "summary": "Native dict, set and instance storage, direct calls and inlined attribute access take Python to about 1.75x CPython 3.13 with the JIT; a hello-world starts in 20 ms; the compiler reads Zipp's own syntax tree and emits the same bytecode every run.",
+        "tags": [
+          "python",
+          "performance",
+          "parser",
+          "release"
+        ],
+        "commits": [
+          "9ad9c7bb",
+          "50e490b0",
+          "65184f04",
+          "74a41f5a",
+          "4b068438",
+          "cb3c5bb4",
+          "f954857c",
+          "b287409c",
+          "e0af009e",
+          "8b2efca0",
+          "9df6e2fd"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Most of a `zipp py` hello-world's 85 ms went into compiling the 0.7 MB Python runtime in every process. `9ad9c7bb` caches compiled code per user, keyed on the executable, the source and every `ZIPP_*` setting, so a warm hello-world takes about 20 ms (CPython: 15-20). Embedding a precompiled snapshot in the WebAssembly module was measured and rejected, since it would more than double the runtime's share of the download; the browser calls `prewarmPython()` when idle instead, and the first run takes about 20 ms instead of 220."
+          },
+          {
+            "type": "p",
+            "text": "`50e490b0` moves dicts and sets into a native compact table modelled on CPython 3.13's, `65184f04` drops the per-call traceback handler for an ip-to-line table, `74a41f5a` adds `PyCall`, and `4b068438` gives instances hidden-class layouts, which `f954857c` lets compiled loops read and write inline: `attr_read_write` from 19.8 to 3.5 ms, and the suite from about 1.85× to 1.75× CPython's time. One regression was caught on the way: a recycled string slot could satisfy a stale attribute cache, so in torch's backward pass `p._pg` came back as another tensor's list (`444ba261`). `b287409c` prints CPython's traceback layout, and 38 of 44 traceback programs match CPython byte for byte."
+          },
+          {
+            "type": "p",
+            "text": "`cb3c5bb4` compiles Python from `zipp-pyparse`'s arena tree directly, byte-identical over 61,885 programs, and deletes the RustPython parser fork. `e0af009e` found seven compiler loops that walked a hash set in whatever order the process produced; across 53,673 files the old compiler varied on 139-151 per run and the new one on none. `9df6e2fd` kept the complex power corpus independent of the platform's libm after a last-bit difference on Linux, and [v0.0.21](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.21) shipped the same day, with torch as a separate WebAssembly package beside the complete engine."
+          }
+        ],
+        "related": [
+          {
+            "label": "Python",
+            "href": "/python/"
+          },
+          {
+            "label": "Releases",
+            "href": "/releases/"
           }
         ]
       }

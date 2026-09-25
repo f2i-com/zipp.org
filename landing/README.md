@@ -146,8 +146,8 @@ v0.0.13; the page uses the artifact's recorded v0.0.12 identity. Benchmark
 headlines, confidence intervals, row counts, and the table refer to the same
 capture, rather than silently mixing new README headlines with old table rows.
 
-The optional JavaScript story scratchpad's browser engine is v0.0.20, 5,733,132 raw bytes, SHA-256
-`dd80a631a75c387f91869764b383c2f30005663353e4d600d48e6c501aec5f60`.
+The optional JavaScript story scratchpad's browser engine is v0.0.21, 5,743,065 raw bytes, SHA-256
+`39cd47f3632b1ff443bb8ce1a1bb7e9d9fe255561bf8c9a92dc9b78f530bbed1`.
 Its file pair is fingerprinted together in Vite configuration to avoid loading
 mismatched glue and WASM files. Each run uses a disposable Worker, a 6-second
 host deadline, and the module's instruction and heap limits.
