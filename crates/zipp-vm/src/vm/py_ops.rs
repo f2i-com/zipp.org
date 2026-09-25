@@ -522,7 +522,8 @@ impl<'p> Vm<'p> {
     }
 
     /// [`Instr::PyCall`]: the callee's frame pushed (`usize::MAX`, the
-    /// dispatch loop re-enters it) or the slow edge.
+    /// dispatch loop re-enters it), a call without a frame completed (`ip +
+    /// 1`), or the slow edge.
     #[inline(never)]
     pub(crate) fn py_step_call(&mut self, func_id: u32, base: usize, ip: usize, instr: &crate::bytecode::Instr) -> Result<usize, Thrown> {
         let crate::bytecode::Instr::PyCall { dst, f, arg_base, argc, slow } = *instr else {
@@ -530,13 +531,18 @@ impl<'p> Vm<'p> {
         };
         let fv = self.get(base, f);
         let r = match self.py_call_target(func_id, ip, fv, argc) {
-            Some((fid, closure, entry)) => self.setup_call(fid, closure, fv, base, arg_base, argc, dst, ip + 1, entry).map(|()| {
+            PyCallee::Plain(fid, closure, entry) => self.setup_call(fid, closure, fv, base, arg_base, argc, dst, ip + 1, entry).map(|()| {
                 if (argc as usize) < self.func(fid as usize).param_count as usize {
                     self.py_fill_defaults(fv, fid, argc as usize);
                 }
                 usize::MAX
             }),
-            None => Ok(slow as usize),
+            // What the slow edge's `CallWithThis` does with this entry.
+            PyCallee::Other(entry) => self.with_argv(base, arg_base, argc, |vm, argv| vm.call_value(entry, fv, argv)).map(|v| {
+                self.set(base, dst, v);
+                ip + 1
+            }),
+            PyCallee::Slow => Ok(slow as usize),
         };
         if r.is_err() {
             self.py_step_failed(ip);
@@ -587,19 +593,29 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// The plain function [`Instr::PyCall`] calls for `f` and `argc`: its
-    /// function id, closure and value.
-    fn py_call_target(&mut self, func_id: u32, ip: usize, f: Value, argc: u16) -> Option<(u32, u32, Value)> {
+    /// What [`Instr::PyCall`] calls for `f` and `argc`: `f`'s own entry
+    /// `c<argc>` (the one its slow edge's `PyCallEntry` finds), as a plain
+    /// function to push a frame for or another callable (a builtin, a
+    /// generator function) to call as its slow edge's `CallWithThis` does.
+    fn py_call_target(&mut self, func_id: u32, ip: usize, f: Value, argc: u16) -> PyCallee {
         const ENTRIES: [&str; 13] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12"];
-        let name = ENTRIES.get(argc as usize)?;
-        let e = self.py_entry_of(func_id, ip, f, name)?;
+        let Some(name) = ENTRIES.get(argc as usize) else {
+            return PyCallee::Slow;
+        };
+        let Some(e) = self.py_entry_of(func_id, ip, f, name) else {
+            return PyCallee::Slow;
+        };
         let (fid, closure) = match self.heap.get(e.heap_index()) {
             HeapObj::Func(id) => (*id, super::NO_CLOSURE),
             HeapObj::Closure { func, .. } => (*func, e.heap_index()),
-            _ => return None,
+            _ if self.py_callable_fn(e) => return PyCallee::Other(e),
+            _ => return PyCallee::Slow,
         };
         let p = self.func(fid as usize);
-        (!p.is_generator && !p.is_async).then_some((fid, closure, e))
+        if p.is_generator || p.is_async {
+            return PyCallee::Other(e);
+        }
+        PyCallee::Plain(fid, closure, e)
     }
 
     /// A fused step raised (its own error, or one from code it ran): the
@@ -1725,4 +1741,14 @@ fn float_holds(op: PyCmpOp, x: f64, y: f64) -> bool {
         PyCmpOp::Eq => x == y,
         PyCmpOp::Ne => x != y,
     }
+}
+
+/// [`Vm::py_call_target`]'s answer.
+enum PyCallee {
+    /// A plain function: its id, closure and value.
+    Plain(u32, u32, Value),
+    /// Any other callable entry.
+    Other(Value),
+    /// No entry to call: the slow edge.
+    Slow,
 }

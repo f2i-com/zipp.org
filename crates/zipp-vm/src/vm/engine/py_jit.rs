@@ -57,10 +57,11 @@ impl<'p> Vm<'p> {
             return PY_BAIL;
         }
         vm.maybe_gc();
-        // `PyGenNext` runs guest code on a nested interpreter loop: bounded
-        // like a frame call from compiled code (`jit_frame_call`), and its
-        // throw is not a region-quality signal.
-        let guest = matches!(instr, Instr::PyGenNext { .. });
+        // `PyGenNext` and `PyCall` run guest code on a nested interpreter
+        // loop: bounded like a frame call from compiled code
+        // (`jit_frame_call`), and a throw from it is not a region-quality
+        // signal.
+        let guest = matches!(instr, Instr::PyGenNext { .. } | Instr::PyCall { .. });
         if guest {
             if vm.jit_call_depth >= JIT_REGION_CALL_MAX {
                 vm.osr_deopt_exempt = true;
@@ -68,7 +69,12 @@ impl<'p> Vm<'p> {
             }
             vm.jit_call_depth += 1;
         }
-        let r = vm.py_exec(func_id, base, ip, instr);
+        let mut r = vm.py_exec(func_id, base, ip, instr);
+        // `PyCall` pushed its callee's frame (the interpreter's loop would
+        // re-enter it): run it to completion here, then fall through.
+        if let (Some(Ok(usize::MAX)), &Instr::PyCall { dst, .. }) = (&r, instr) {
+            r = Some(vm.jit_py_call_run(base, dst).map(|()| ip + 1));
+        }
         if guest {
             vm.jit_call_depth -= 1;
             if matches!(r, Some(Err(_))) {
@@ -92,6 +98,25 @@ impl<'p> Vm<'p> {
                 PY_THREW
             }
         }
+    }
+
+    /// The rest of a `PyCall` from compiled code once `py_step_call` pushed
+    /// the callee's frame: run it to completion as `jit_frame_call` does
+    /// (on its compiled whole-function body when it has one, else on a
+    /// nested interpreter loop), then store its result in the caller's
+    /// `dst` (`run_loop` returns the stop frame's value without delivering
+    /// it). On a throw the callee's frames are unwound and the exception is
+    /// pending.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_py_call_run(&mut self, base: usize, dst: u16) -> Result<(), Thrown> {
+        let stop = self.frames.len() - 1;
+        let fid = self.frames[stop].func;
+        let v = match self.jit_frame_run_native(fid, stop) {
+            Some(r) => r,
+            None => self.run_loop(stop),
+        }?;
+        self.regs[base + dst as usize] = v;
+        Ok(())
     }
 
     /// `LoadBigInt` beyond the immediate range (compiled code stores an
@@ -319,6 +344,8 @@ impl<'p> Vm<'p> {
             Instr::PyMakeExc { .. } | Instr::PyExcPop { .. } | Instr::PyNew { .. } => {
                 Some(self.py_step_ext2(func_id, base, ip, instr))
             }
+            // `Ok(usize::MAX)` when it pushed the callee's frame.
+            Instr::PyCall { .. } => Some(self.py_step_call(func_id, base, ip, instr)),
             _ => None,
         }
     }

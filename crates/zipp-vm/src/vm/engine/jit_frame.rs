@@ -87,7 +87,7 @@ impl<'p> Vm<'p> {
     /// be entered here (not compiled, not eligible, a nested native
     /// recursion, or a declined entry), so the caller runs `run_loop`.
     #[cfg(all(feature = "jit", feature = "python", target_arch = "x86_64"))]
-    fn jit_frame_run_native(&mut self, fid: u32, stop: usize) -> Option<Result<Value, Thrown>> {
+    pub(crate) fn jit_frame_run_native(&mut self, fid: u32, stop: usize) -> Option<Result<Value, Thrown>> {
         // Python programs only: a JavaScript frame call keeps the interpreter
         // loop's own native entry (the path every JavaScript test exercises).
         if !self.jit.python_program()

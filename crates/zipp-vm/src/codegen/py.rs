@@ -17,9 +17,9 @@
 //! Everything here is keyed on a body that CONTAINS a fused Python
 //! instruction: only the Python emitter produces those, so JavaScript
 //! functions and loops compile exactly as before. Such a body additionally
-//! admits the few ops the Python emitter wraps every function in (the
-//! traceback handler's `PushHandler`/`PopHandler`, the re-raising `Throw`,
-//! int literals' `LoadBigInt`, list displays' `NewArray`/`ArrayAppend`), and
+//! admits the few other ops the Python emitter uses everywhere (a `try`
+//! statement's `PushHandler`/`PopHandler`, the re-raising `Throw`, int
+//! literals' `LoadBigInt`, list displays' `NewArray`/`ArrayAppend`), and
 //! it takes only the plain emission paths: the register tiers, local scalar
 //! replacement and the live-state plans whose control-flow proofs list jump
 //! targets by hand (and would not see a fused instruction's `slow` edge)
@@ -61,12 +61,14 @@ pub(crate) const PY_THREW: u64 = 4;
 /// including a fused instruction this tier does not know (an unknown one in
 /// a Python loop's out-of-line code compiles to an exit, and one in the loop
 /// itself keeps the loop interpreted). Every instruction listed here must be
-/// one `Vm::py_exec` routes to the interpreter's own step for it. One runs
+/// one `Vm::py_exec` routes to the interpreter's own step for it. Two run
 /// guest code: `PyGenNext` resumes a generator to its next yield on a nested
 /// interpreter loop (`Vm::py_gen_next`, run to completion exactly as the
 /// interpreter runs it, like a frame call from compiled code; the register
-/// file is pinned while native code runs, see `reserve_jit_regs`). `PyRaise`
-/// always ends in a throw, which the native code unwinds like any helper's.
+/// file is pinned while native code runs, see `reserve_jit_regs`), and
+/// `PyCall` pushes its callee's frame, which `Vm::jit_py_op` then runs to
+/// completion as `Vm::jit_frame_call` does. `PyRaise` always ends in a
+/// throw, which the native code unwinds like any helper's.
 #[inline]
 pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
     Some(match *i {
@@ -97,6 +99,7 @@ pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
         | Instr::PyMakeExc { slow, .. }
         | Instr::PyExcPop { slow, .. }
         | Instr::PyNew { slow, .. } => (slow, None),
+        Instr::PyCall { slow, .. } => (slow, None),
         // Its second edge: the key's absence (a `.get` default).
         Instr::PyDictLookup { slow, absent, .. } => (slow, Some(absent)),
         #[cfg(feature = "python")]
@@ -108,11 +111,17 @@ pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
 
 /// The registers a fused Python instruction reads and the ones it writes
 /// (none for a `PyJumpCompare`/`PyDictSet`/`PySetItem`/`PyRaise`/
-/// `PyExcPop`; three for `PyNew`). Exact: the operand-bounds check
+/// `PyExcPop`; three for `PyNew`; a `PyCall` reads its callee and its
+/// argument window). Exact: the operand-bounds check
 /// (`tierc_operands_in_bounds`) relies on it.
 pub(crate) fn py_op_regs(i: &Instr) -> Option<(Vec<u16>, Vec<u16>)> {
     let (uses, dst) = match *i {
         Instr::PyNew { dst, entry, this_f, cls, rt, .. } => return Some((vec![cls, rt], vec![dst, entry, this_f])),
+        Instr::PyCall { dst, f, arg_base, argc, .. } => {
+            let mut uses = vec![f];
+            uses.extend((0..argc).map(|k| arg_base + k));
+            return Some((uses, vec![dst]));
+        }
         Instr::PyMakeExc { dst, cls, args, rt, .. } => (vec![cls, args, rt], Some(dst)),
         Instr::PyExcPop { rt, .. } => (vec![rt], None),
         Instr::PyArith { dst, a, b, .. } | Instr::PyCompare { dst, a, b, .. } => (vec![a, b], Some(dst)),
@@ -162,9 +171,9 @@ pub(crate) fn control_targets(i: &Instr) -> [Option<u32>; 2] {
 }
 
 /// The extra ops a Python body admits in the memory tiers beyond the fused
-/// instructions: `LoadBigInt` (an int literal), the per-call traceback
-/// handler's `PushHandler`/`PopHandler`, `Throw` (re-raising from that
-/// handler, or raising from a statement), which compiles to a bail so the
+/// instructions: `LoadBigInt` (an int literal), a `try` statement's
+/// `PushHandler`/`PopHandler`, `Throw` (the frame guard's re-raise, or a
+/// `raise` statement's), which compiles to a bail so the
 /// interpreter performs it, a `try` statement's `EndFinally` (its normal
 /// completion falls through; an abrupt one bails to the interpreter's
 /// routing), and the list/tuple builders `NewArray` and a plain
@@ -1048,10 +1057,12 @@ pub(crate) fn emit_py_new_array(
     refetch(ops);
 }
 
-/// The last ip of a Python body's main code: the ip before its frame guard's
-/// handler (the first `PushHandler`'s catch target), after which the emitter
-/// lays out only out-of-line code (handlers and slow paths); the last ip for
-/// a body without one.
+/// The last ip of a Python body's main code: the ip before its frame guard
+/// block (named by the code object's frame table, `vm::py_rt`), after which
+/// the emitter lays out only out-of-line code (handlers and slow paths).
+/// Function and module bodies have a guard; for code without one (a class
+/// body, a lambda, a comprehension) the first `PushHandler`'s catch target
+/// stands in, else the last ip.
 pub(crate) fn py_main_end(proto: &FuncProto) -> usize {
     // The frame guard block (implicit: no handler is pushed for it, see
     // `vm::py_rt`) ends the main body.
@@ -1073,7 +1084,8 @@ pub(crate) fn py_main_end(proto: &FuncProto) -> usize {
 }
 
 /// Whether `i` calls through a frame when compiled (the region's call
-/// helpers push the callee's frame and run it on a nested interpreter loop).
+/// helpers, and `Vm::jit_py_op` for a `PyCall`, push the callee's frame and
+/// run it on a nested interpreter loop).
 pub(crate) fn py_frame_call(i: &Instr) -> bool {
     matches!(
         i,
@@ -1082,6 +1094,7 @@ pub(crate) fn py_frame_call(i: &Instr) -> bool {
             | Instr::CallMethod { .. }
             | Instr::CallMethodComputed { .. }
             | Instr::New { .. }
+            | Instr::PyCall { .. }
     )
 }
 
@@ -1271,9 +1284,9 @@ pub(crate) fn emit_py_load_const(
     refetch(ops);
 }
 
-/// A Python body's `PushHandler` (the per-call traceback handler, or a
-/// `try`): `Vm::jit_py_push_handler`, the interpreter's arm verbatim on the
-/// body's own frame.
+/// A Python body's `PushHandler` (a `try` statement's; a call pushes none,
+/// see `vm::py_rt`'s frame guard): `Vm::jit_py_push_handler`, the
+/// interpreter's arm verbatim on the body's own frame.
 pub(crate) fn emit_py_push_handler(ops: &mut dynasmrt::x64::Assembler, catch_target: u32, catch_reg: u16) {
     let packed = ((catch_target as u64) << 16) | catch_reg as u64;
     dynasm!(ops

@@ -49,11 +49,10 @@ pub(super) fn py_fast_paths() -> bool {
         }
     }
 }
-/// Whether plain positional calls compile to one `PyCall` (with the entry
-/// lookup and `CallWithThis` out of line) instead of `PyCallEntry` +
-/// `CallWithThis`. Off unless `ZIPP_PY_CALL=1` (any value but `0`): the
-/// native tiers do not compile `PyCall` yet, and a loop holding an
-/// instruction they do not know stays interpreted. Read once per process.
+/// Whether plain positional calls compile to one `PyCall` (with the
+/// positional-array call out of line) instead of `PyCallEntry` +
+/// `CallWithThis`. On unless `ZIPP_PY_CALL=0` (the same-binary A/B). Read
+/// once per process.
 pub(super) fn py_call_op() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
@@ -61,7 +60,7 @@ pub(super) fn py_call_op() -> bool {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_PY_CALL").is_some_and(|v| v != "0");
+            let on = std::env::var_os("ZIPP_PY_CALL").is_none_or(|v| v != "0");
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -1020,9 +1019,14 @@ impl<'a> Emitter<'a> {
             let dst = self.alloc()?;
             let (arg_base, argc) = self.arguments(regs)?;
             let at = self.emit(Instr::PyCall { dst, f, arg_base, argc, slow: 0 })?;
-            let regs = regs.to_vec();
+            // `PyCall` declines only when `f` has no callable entry `c<argc>`
+            // (it calls every entry the entry path would), which is when that
+            // path takes its own positional-array fallback: go there directly,
+            // over the argument window `PyCall` left untouched.
             self.defer_cold(Vec::new(), vec![at], move |e| {
-                let r = e.call_with_entry(f, &regs, false)?;
+                let args = e.alloc()?;
+                e.emit(Instr::NewArray { dst: args, arg_base, argc })?;
+                let r = e.call_positional(f, args)?;
                 e.emit(Instr::Move { dst, src: r })?;
                 Ok(())
             });
