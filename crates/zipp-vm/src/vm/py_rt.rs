@@ -27,9 +27,12 @@
 //!   it) and its `ver` (the runtime bumps it whenever its cache tables lose
 //!   an entry, see core.js `makeType`), so "the class's table said `name` is
 //!   a plain instance attribute" holds for as long as the three match;
-//! * a `Map` entry by its position and the key's bits there (a `Map`'s keys
-//!   only append; a deleted entry's key becomes a hole, so the same bits at
-//!   the same position are the same entry);
+//! * a `Map` entry by its position and its key there: the key's bits and a
+//!   stamp (`Vm::py_key_stamp`: the site's rooted constant, else the key's
+//!   slot version). A `Map`'s keys only append and a deleted entry's key
+//!   becomes a hole, but a key that is not a rooted constant can die with
+//!   its `Map` and its slot hold another `Map`'s key at the same position,
+//!   so the bits alone do not name the entry;
 //! * a name's absence from a `Map` by the Map's bits, heap version and key
 //!   count (no key appended since the lookup that missed).
 //!
@@ -70,17 +73,20 @@ pub(crate) mod hint {
 
 /// Kinds of [`PyIc`] entries.
 pub(super) mod ic {
-    /// `PyGetAttr`: `a` class, `b` dict key bits, `c` class `ver`, `pos`.
+    /// `PyGetAttr`: `a` class, `b` dict key bits, `d` its stamp (the key's
+    /// slot version, or `KEY_ROOTED`: bits alone can name a later key, see
+    /// `py_map_at`), `c` class `ver`, `pos`.
     pub const ATTR_GET: u8 = 1;
     /// `PySetAttr` replacing an entry: as [`ATTR_GET`].
     pub const ATTR_SET: u8 = 2;
     /// `PySetAttr` appending the name to a dict of `pos` entries.
     pub const ATTR_APPEND: u8 = 3;
     /// `PyGlobal` from the module globals: `a` the Map, `b` the key bits,
-    /// `pos`.
+    /// `d` the key's stamp (as [`ATTR_GET`]), `pos`.
     pub const GLOBAL: u8 = 4;
     /// `PyGlobal` from the builtins: `a` the globals Map (absent there at
-    /// `c` keys), `b` the builtins key bits, `pos` in the builtins.
+    /// `c` keys), `b` the builtins key bits, `d` its stamp, `pos` in the
+    /// builtins.
     pub const BUILTIN: u8 = 5;
     /// `PyMethod` from a class's `gm`: `a` class, `b` the table's bits,
     /// `c` class `ver`, `pos` the table slot.

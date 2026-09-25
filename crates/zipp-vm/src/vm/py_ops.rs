@@ -530,7 +530,7 @@ impl<'p> Vm<'p> {
         let e = self.py_ic(func_id, ip);
         if e.a == g.bits() && self.heap.version_of(gi) == e.hver {
             if e.kind == ic::GLOBAL {
-                if let Some(v) = self.py_map_at_bits(g, e.pos, e.b) {
+                if let Some(v) = self.py_map_at_bits(g, e.pos, e.b, e.d) {
                     return Some(v);
                 }
             } else if e.kind == ic::BUILTIN {
@@ -539,7 +539,7 @@ impl<'p> Vm<'p> {
                 let absent = matches!(self.heap.get(gi), HeapObj::Map { keys, .. } if keys.len() as u64 == e.c);
                 if absent {
                     if let Some(b) = self.py_rt_for(r).map(|p| p.builtins) {
-                        if let Some(v) = self.py_map_at_bits(b, e.pos, e.b) {
+                        if let Some(v) = self.py_map_at_bits(b, e.pos, e.b, e.d) {
                             return Some(v);
                         }
                     }
@@ -556,15 +556,16 @@ impl<'p> Vm<'p> {
         let hver = self.heap.version_of(gi);
         match self.coll_find(gi, k) {
             Some(i) => {
-                let (v, kb) = match self.heap.get(gi) {
-                    HeapObj::Map { keys, vals } => (*vals.get(i)?, keys.get(i)?.bits()),
+                let (v, kv) = match self.heap.get(gi) {
+                    HeapObj::Map { keys, vals } => (*vals.get(i)?, *keys.get(i)?),
                     _ => return None,
                 };
                 if v.is_undefined() {
                     return None;
                 }
-                if let Ok(pos) = u32::try_from(i) {
-                    self.py_ic_put(func_id, ip, PyIc { kind: ic::GLOBAL, pos, hver, a: g.bits(), b: kb, c: 0, d: 0 });
+                let (kb, stamp) = (kv.bits(), self.py_key_stamp(func_id, key, kv));
+                if let (Ok(pos), Some(kver)) = (u32::try_from(i), stamp) {
+                    self.py_ic_put(func_id, ip, PyIc { kind: ic::GLOBAL, pos, hver, a: g.bits(), b: kb, c: 0, d: kver });
                 }
                 Some(v)
             }
@@ -579,15 +580,16 @@ impl<'p> Vm<'p> {
                 }
                 let bi = b.heap_index();
                 let i = self.coll_find(bi, k)?;
-                let (v, kb) = match self.heap.get(bi) {
-                    HeapObj::Map { keys, vals } => (*vals.get(i)?, keys.get(i)?.bits()),
+                let (v, kv) = match self.heap.get(bi) {
+                    HeapObj::Map { keys, vals } => (*vals.get(i)?, *keys.get(i)?),
                     _ => return None,
                 };
                 if v.is_undefined() {
                     return None;
                 }
-                if let Ok(pos) = u32::try_from(i) {
-                    self.py_ic_put(func_id, ip, PyIc { kind: ic::BUILTIN, pos, hver, a: g.bits(), b: kb, c: glen, d: 0 });
+                let (kb, stamp) = (kv.bits(), self.py_key_stamp(func_id, key, kv));
+                if let (Ok(pos), Some(kver)) = (u32::try_from(i), stamp) {
+                    self.py_ic_put(func_id, ip, PyIc { kind: ic::BUILTIN, pos, hver, a: g.bits(), b: kb, c: glen, d: kver });
                 }
                 Some(v)
             }
@@ -595,9 +597,10 @@ impl<'p> Vm<'p> {
     }
 
     /// The value of the `Map` `m`'s entry at `pos` when its key there has
-    /// the bits `key` (and its value is not `undefined`).
+    /// the bits `key` and stamp `kver` (see `py_map_at`), and its value is
+    /// not `undefined`.
     #[inline]
-    fn py_map_at_bits(&self, m: Value, pos: u32, key: u64) -> Option<Value> {
+    fn py_map_at_bits(&self, m: Value, pos: u32, key: u64, kver: u32) -> Option<Value> {
         if !m.is_heap() {
             return None;
         }
@@ -606,7 +609,7 @@ impl<'p> Vm<'p> {
         };
         let pos = pos as usize;
         match (keys.get(pos), vals.get(pos)) {
-            (Some(k), Some(&v)) if k.bits() == key && !v.is_undefined() => Some(v),
+            (Some(&k), Some(&v)) if k.bits() == key && !v.is_undefined() && (kver == super::py_attr::KEY_ROOTED || self.py_key_ver(k) == kver) => Some(v),
             _ => None,
         }
     }

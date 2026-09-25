@@ -14,6 +14,10 @@ use super::*;
 use crate::heap::HeapObj;
 use crate::value::Value;
 
+
+/// A `PyIc` key stamp (`d` of an `ATTR_GET` / `ATTR_SET` / `GLOBAL` /
+/// `BUILTIN` entry): the key is the site's cached constant, never freed.
+pub(super) const KEY_ROOTED: u32 = u32::MAX;
 impl<'p> Vm<'p> {
     /// The name a string constant spells (`key` a constant-pool index).
     pub(super) fn py_const_name(&self, func_id: u32, key: u32) -> Option<&'p str> {
@@ -27,10 +31,16 @@ impl<'p> Vm<'p> {
             .map(|s| s.as_str())
     }
 
-    /// The value of the `Map` `d`'s entry at `pos` when its key there has
-    /// the bits `key` (and its value is not `undefined`).
+    /// The value of the `Map` `d`'s entry at `pos` when its key there is
+    /// still the entry's: the bits `key` and the stamp `kver` (the key's
+    /// slot version when the entry was made, or [`KEY_ROOTED`]: see
+    /// [`Vm::py_key_stamp`]), and its value is not `undefined`. The bits alone do not identify the key: a dict's key
+    /// string need not be the site's rooted constant (a `setattr` name, or
+    /// a constant loaded past the constant cache's bound, is a fresh
+    /// string), so it can die with its dict and its slot be reused by
+    /// another name's key at the same position of another instance's dict.
     #[inline]
-    fn py_map_at(&self, d: Value, pos: u32, key: u64) -> Option<Value> {
+    fn py_map_at(&self, d: Value, pos: u32, key: u64, kver: u32) -> Option<Value> {
         if !d.is_heap() {
             return None;
         }
@@ -39,9 +49,33 @@ impl<'p> Vm<'p> {
         };
         let pos = pos as usize;
         match (keys.get(pos), vals.get(pos)) {
-            (Some(k), Some(&v)) if k.bits() == key && !v.is_undefined() => Some(v),
+            (Some(&k), Some(&v)) if k.bits() == key && !v.is_undefined() && (kver == KEY_ROOTED || self.py_key_ver(k) == kver) => Some(v),
             _ => None,
         }
+    }
+
+    /// The slot version of a heap key (0 for an immediate): with its bits,
+    /// the key's identity for an entry that outlives it.
+    #[inline]
+    pub(super) fn py_key_ver(&self, k: Value) -> u32 {
+        if k.is_heap() {
+            self.heap.version_of(k.heap_index())
+        } else {
+            0
+        }
+    }
+
+    /// The key stamp an entry records for the dict key `k` found for the
+    /// site's constant `cidx`: [`KEY_ROOTED`] when `k` is that constant's
+    /// cached representation (alive for the VM's life, so a hit needs no
+    /// check), else `k`'s slot version; `None` (do not cache) when that
+    /// version is the sentinel.
+    pub(super) fn py_key_stamp(&self, func_id: u32, cidx: u32, k: Value) -> Option<u32> {
+        if self.const_slot_cached(func_id, cidx).is_some_and(|c| c.bits() == k.bits()) {
+            return Some(KEY_ROOTED);
+        }
+        let v = self.py_key_ver(k);
+        (v != KEY_ROOTED).then_some(v)
     }
 
     /// A class table (`slot` one of the class record's [`TySlots`]) and the
@@ -158,7 +192,7 @@ impl<'p> Vm<'p> {
         let ty = self.py_rt.as_deref()?.ty?;
         let e = self.py_ic(func_id, ip);
         if e.kind == ic::ATTR_GET && cls.bits() == e.a && cls.is_heap() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
-            if let Some(v) = self.py_map_at(dict, e.pos, e.b) {
+            if let Some(v) = self.py_map_at(dict, e.pos, e.b, e.d) {
                 return Some(v);
             }
         } else if self.py_not_plain(&e, cls, ty.ga) {
@@ -175,18 +209,18 @@ impl<'p> Vm<'p> {
         }
         let k = self.resolve_const_slot(func_id, key);
         let (pos, v) = self.py_map_find(dict, k)?;
-        self.py_attr_note(func_id, ip, ic::ATTR_GET, cls, dict, pos);
+        self.py_attr_note(func_id, ip, ic::ATTR_GET, cls, dict, pos, key);
         Some(v)
     }
 
     /// Record an instance-dict entry found at `pos` for a `ga` / `sa` site.
-    fn py_attr_note(&mut self, func_id: u32, ip: usize, kind: u8, cls: Value, dict: Value, pos: usize) {
+    fn py_attr_note(&mut self, func_id: u32, ip: usize, kind: u8, cls: Value, dict: Value, pos: usize, cidx: u32) {
         let Some((hver, ver)) = self.py_cls_stamp(cls) else {
             return;
         };
         let key = match self.heap.get(dict.heap_index()) {
             HeapObj::Map { keys, .. } => match keys.get(pos) {
-                Some(k) => k.bits(),
+                Some(&k) => k,
                 None => return,
             },
             _ => return,
@@ -194,7 +228,10 @@ impl<'p> Vm<'p> {
         let Ok(pos) = u32::try_from(pos) else {
             return;
         };
-        self.py_ic_put(func_id, ip, PyIc { kind, pos, hver, a: cls.bits(), b: key, c: ver, d: 0 });
+        let Some(kver) = self.py_key_stamp(func_id, cidx, key) else {
+            return;
+        };
+        self.py_ic_put(func_id, ip, PyIc { kind, pos, hver, a: cls.bits(), b: key.bits(), c: ver, d: kver });
     }
 
     /// [`Instr::PySetAttr`]: `obj.name = v` as a store into an instance's
@@ -217,7 +254,7 @@ impl<'p> Vm<'p> {
             return Ok(false);
         }
         if (e.kind == ic::ATTR_SET || e.kind == ic::ATTR_APPEND) && cls.bits() == e.a && self.py_cls_stamp_ok(cls, e.hver, e.c) {
-            if e.kind == ic::ATTR_SET && self.py_map_at(dict, e.pos, e.b).is_some() {
+            if e.kind == ic::ATTR_SET && self.py_map_at(dict, e.pos, e.b, e.d).is_some() {
                 // The entry's value replaced in place, as `Map.prototype.set`
                 // replaces it.
                 self.heap.write_barrier_val(di, v);
@@ -269,7 +306,7 @@ impl<'p> Vm<'p> {
                 self.py_ic_put(func_id, ip, PyIc { kind: ic::ATTR_APPEND, pos, hver, a: cls.bits(), b: k.bits(), c: ver, d: 0 });
             }
         } else if let Some(pos) = pos {
-            self.py_attr_note(func_id, ip, ic::ATTR_SET, cls, dict, pos);
+            self.py_attr_note(func_id, ip, ic::ATTR_SET, cls, dict, pos, key);
         }
         Ok(true)
     }
