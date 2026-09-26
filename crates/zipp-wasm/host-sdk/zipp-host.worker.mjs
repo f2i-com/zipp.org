@@ -72,6 +72,7 @@ async function handle(msg) {
           if (bridges.db) engine.setDbBridge(bridges.db);
           if (bridges.localStorage) engine.setLocalStorageBridge(bridges.localStorage);
           if (bridges.clipboard) engine.setClipboardBridge(bridges.clipboard);
+          if (bridges.app) engine.setAppBridge(bridges.app);
         } catch (error) {
           dead = fail("host", `bridge module failed: ${describeThrownError(error).message}`, undefined, true);
           return { error: dead };

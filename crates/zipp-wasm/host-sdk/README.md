@@ -18,7 +18,7 @@ const host = createZippHost({
   wasmUrl: "/zipp/zipp_wasm_bg.wasm",
   workerUrl: "/host-sdk/zipp-host.worker.mjs",
   capabilities: ["ls.getItem", "ls.setItem"],   // exact sync grants; default none
-  bridgeModuleUrl: "/my/bridges.mjs",           // default export builds { db, localStorage, clipboard } IN the Worker
+  bridgeModuleUrl: "/my/bridges.mjs",           // default export builds { db, localStorage, clipboard, app } IN the Worker
   instructionBudget: 200_000_000,               // optional, applied before initScript
   deadlineMs: 2000,                             // per request; expiry terminates the Worker
 });

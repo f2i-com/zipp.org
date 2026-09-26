@@ -116,6 +116,14 @@ var host = {
     if (wantsCb) { __zHostCbs[id] = cb; __zHostPending++; }
     __zHostQueue.push({ id: id, kind: k, args: flat });
   },
+  // host.callSync is SYNCHRONOUS: an application-defined operation, answered
+  // by the host's app bridge while the script waits, and denied unless the
+  // host granted "app.<kind>". The reply is the bridge's return value.
+  callSync: function (kind) {
+    var call = ["app." + String(kind)];
+    for (var i = 1; i < arguments.length; i++) call.push(String(arguments[i]));
+    return JSON.parse(__zippHostCall.apply(undefined, call));
+  },
 };
 
 // accel: the host compiles a numeric function the script generates -- with

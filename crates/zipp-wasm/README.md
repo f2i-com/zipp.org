@@ -438,6 +438,34 @@ soon as initialization starts. Every call also has an exact operation-specific
 arity. Unknown, unauthorized, wrong-arity, and malformed-JSON calls are rejected
 before a bridge method runs.
 
+### The app bridge: synchronous operations the application defines
+
+The fixed operations cover storage and the clipboard. An application that
+needs something else inline — a Worker host serving `fs.readFileSync` or a
+blocking `fetch` from the page over shared memory, say — installs an app
+bridge and grants its operations one by one:
+
+```js
+engine.setAppBridge({
+  // kind arrives without its "app." prefix; args is an array of strings.
+  call(kind, args) {
+    if (kind === "fs.read") return { ok: files.get(args[0]) ?? null };
+    return { err: `unknown operation ${kind}` };
+  },
+});
+engine.setSyncHostCapabilities(["app.fs.read"]);
+engine.initScript(`const text = host.callSync("fs.read", "notes.txt").ok;`);
+```
+
+- Guest code calls `host.callSync(kind, ...args)`, which is `__zippHostCall("app." + kind, ...args)`. It adds no new global, so a script's own `app` binding is unaffected.
+- Kinds are lowercase dotted names (`app.fs.read`, `app.net.fetch`): up to the 64-byte kind limit, starting with a letter, using `a-z 0-9 . _ -`, with no empty segments. The shape is checked before anything is looked up.
+- Each kind needs its own grant. A kind that isn't granted is refused with `SecurityError`, before the bridge is touched.
+- The bridge decides how many arguments an operation takes. The synchronous envelope ceilings still apply: `MAX_SYNC_BRIDGE_ARGS` arguments and `MAX_SYNC_BRIDGE_BYTES` in total, in both directions.
+- Whatever `call` returns crosses as JSON. A throw reaches the guest only as the opaque "host bridge call failed", so return errors as data to pass them on.
+- As with `host.call` kinds, treat every kind and argument as guest-controlled: dispatch through your own allowlist, and never turn a kind into a property name, URL or command.
+
+`tests/node/app-bridge.cjs` is the boundary check.
+
 Clipboard access uses its own `setClipboardBridge` handle; a local-storage bridge
 is never reused for it. The handle must be a synchronous host adapter with
 `writeText`/`readText` methods, not the browser's Promise-returning Clipboard API
