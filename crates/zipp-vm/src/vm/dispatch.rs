@@ -1624,7 +1624,7 @@ impl<'p> Vm<'p> {
                     }
                     // Only the Python frontend emits these; a build without it
                     // carries none of their code.
-                    #[cfg(not(feature = "python"))]
+                    #[cfg(all(not(feature = "python"), not(feature = "wasm-lite")))]
                     Instr::PyArith { .. }
                     | Instr::PyAddImm { .. }
                     | Instr::PyCompare { .. }

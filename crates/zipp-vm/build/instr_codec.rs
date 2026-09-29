@@ -24,7 +24,11 @@ fn strip_comments(body: &str) -> String {
             None => line,
         };
         let t = line.trim();
-        if t.starts_with("#[cfg") {
+        // This codec is compiled only by native Python builds, which cannot
+        // enable wasm-lite. Retain Lite-excluded variants in the full schema
+        // and its tag numbering; never generate a compact/renumbered schema.
+        // Other conditional variants still require explicit codec support.
+        if t.starts_with("#[cfg") && t != "#[cfg(not(feature = \"wasm-lite\"))]" {
             panic!("instr_codec: a `#[cfg]` inside an encoded enum is not supported: {t}");
         }
         if t.starts_with("#[") {

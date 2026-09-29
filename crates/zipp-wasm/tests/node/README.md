@@ -98,3 +98,14 @@ top of each file if you put it elsewhere).
   surviving a reload. The load-bearing assertion is the read-spread-write of
   `window` followed by a key dispatch that still reaches its handler — the shape
   that silently unregistered every listener before `host_in_over` existed.
+- **bench-compiler-modes.cjs** — compares fresh-engine compilation of 80
+  functions using register classes, optional instruction operands and argument
+  windows. Each timed lifecycle executes one function and checks its result
+  against Node. Run `node --no-liftoff bench-compiler-modes.cjs BASE_NODE_DIR
+  CANDIDATE_NODE_DIR` on an idle host, repeat with both package orders, and
+  inspect individual cases as well as the raw samples. This is a focused
+  startup screen, not a general throughput guarantee.
+- **select-smaller-wasm-policy.cjs** — verifies that full builds retain the
+  strict download-size rule and Lite's explicit raw-size preference stays
+  within its minimum saving and maximum download-growth limits. Run with Node;
+  no engine build is needed.

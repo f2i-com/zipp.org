@@ -78,7 +78,9 @@ for v in "${variants[@]}"; do
     "target/variants/$v/$TARGET/$profile/zipp_wasm.wasm"
   node tests/node/strip-target-features.cjs "$out/zipp_wasm_bg.wasm" "$out/zipp_wasm_bg.stripped.wasm"
   mv "$out/zipp_wasm_bg.stripped.wasm" "$out/zipp_wasm_bg.wasm"
-  bash optimize-wasm.sh "$out/zipp_wasm_bg.wasm"
+  opt_flags=()
+  [ "$v" = lite ] && opt_flags+=(--prefer-raw-size)
+  bash optimize-wasm.sh "$out/zipp_wasm_bg.wasm" "${opt_flags[@]}"
   node tests/node/check-wasm-memory.cjs "$out/zipp_wasm_bg.wasm"
   compress "$out/zipp_wasm_bg.wasm"
   sizes+=("$v $(wc -c < "$out/zipp_wasm_bg.wasm") $(wc -c < "$out/zipp_wasm_bg.wasm.br")")

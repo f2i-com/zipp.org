@@ -42,7 +42,7 @@ pub const FORIN_SNAPSHOT_PREFIX: usize = 6;
 /// ClassElementName, so the second instruction must reuse the first's coerced
 /// key — re-coercing would run a `toString`/`@@toPrimitive` key a second time.
 pub const KEY_WRITEBACK: u8 = 0x80;
-
+#[cfg_attr(feature = "wasm-lite", repr(u16))]
 /// One bytecode instruction. Kept as a fieldful enum (not packed bytes) for v1:
 /// the dispatch cost of a wide enum is negligible next to correctness clarity,
 /// and the JIT will consume this same structured form rather than re-decoding
@@ -2070,6 +2070,7 @@ pub enum Instr {
     /// `float(int)`: only for magnitudes below 2^127, else `slow`). See
     /// [`PyArithOp`] for which of those pairs each operator takes.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyArith {
         op: PyArithOp,
         dst: Reg,
@@ -2079,6 +2080,7 @@ pub enum Instr {
     },
     /// `dst = a + imm` for an int (BigInt) or a float (Number) `a`.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyAddImm {
         dst: Reg,
         a: Reg,
@@ -2089,6 +2091,7 @@ pub enum Instr {
     /// float (compared exactly: only ints of magnitude at most 2^53, else
     /// `slow`), and, for `Eq`/`Ne` only, two strs.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyCompare {
         op: PyCmpOp,
         dst: Reg,
@@ -2100,6 +2103,7 @@ pub enum Instr {
     /// comparison's result equals `when`, falls through when it does not,
     /// and jumps to `slow` when the operands are of no listed type pair.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyJumpCompare {
         op: PyCmpOp,
         a: Reg,
@@ -2114,6 +2118,7 @@ pub enum Instr {
     /// (a primitive, `null`, an exotic object, a getter, a non-object
     /// `cls`) jumps to `slow`.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyClassOf {
         dst: Reg,
         obj: Reg,
@@ -2127,6 +2132,7 @@ pub enum Instr {
     /// through when the Map has no such entry and jumps to `slow` otherwise
     /// (leaving `dst` untouched).
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyDictGet {
         dst: Reg,
         obj: Reg,
@@ -2136,6 +2142,7 @@ pub enum Instr {
     },
     /// `obj.dict.set(key, val)` for the same `obj.dict` Map, else `slow`.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyDictSet {
         obj: Reg,
         key: u32,
@@ -2147,6 +2154,7 @@ pub enum Instr {
     /// inline cache) is a function: a callable's positional entry for one
     /// argument count (`c<n>`). Anything else jumps to `slow`.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyCallEntry {
         dst: Reg,
         f: Reg,
@@ -2160,6 +2168,7 @@ pub enum Instr {
     /// Anything else (a negative or out-of-range index, a missing key, a
     /// hole) jumps to `slow`.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyGetItem {
         dst: Reg,
         o: Reg,
@@ -2172,6 +2181,7 @@ pub enum Instr {
     /// type's items, or a str key of a str-keyed `dict` record (whose own
     /// data `size` then follows the Map). Anything else jumps to `slow`.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PySetItem {
         o: Reg,
         k: Reg,
@@ -2195,6 +2205,7 @@ pub enum Instr {
     /// jumps to `slow`, leaving `dst` untouched. The two lookups are the
     /// ones the runtime's `gload` makes, in the same order.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyGlobal {
         dst: Reg,
         globals: Reg,
@@ -2208,6 +2219,7 @@ pub enum Instr {
     /// Anything else (a non-ASCII str, an out-of-range index) jumps to
     /// `slow`, leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyStrItem {
         dst: Reg,
         s: Reg,
@@ -2218,6 +2230,7 @@ pub enum Instr {
     /// number of code points. Anything else jumps to `slow`, leaving `dst`
     /// untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyStrLen {
         dst: Reg,
         s: Reg,
@@ -2233,6 +2246,7 @@ pub enum Instr {
     /// leaving `dst` untouched. Exactly the conjunction of the inline
     /// `PyClassOf` / `cls.ga[key]` / `PyDictGet` read it replaces.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyGetAttr {
         dst: Reg,
         obj: Reg,
@@ -2244,6 +2258,7 @@ pub enum Instr {
     /// `sa` table, then `obj.dict.set(key, val)`. Anything else jumps to
     /// `slow` having changed nothing.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PySetAttr {
         obj: Reg,
         key: u32,
@@ -2261,6 +2276,7 @@ pub enum Instr {
     /// being `bytes` found in the MRO) jumps to `slow`, leaving `dst`
     /// untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyIsInstance {
         dst: Reg,
         v: Reg,
@@ -2274,6 +2290,7 @@ pub enum Instr {
     /// its errors); anything else jumps to `slow` (the general call),
     /// leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyGenNext {
         dst: Reg,
         next: Reg,
@@ -2292,6 +2309,7 @@ pub enum Instr {
     /// jumps to `slow` (the emitter's general resolution), leaving `dst`
     /// untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyMethod {
         dst: Reg,
         obj: Reg,
@@ -2306,6 +2324,7 @@ pub enum Instr {
     /// constant, constant-pool index; not `undefined`), that value.
     /// Anything else jumps to `slow`, leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyModGet {
         dst: Reg,
         obj: Reg,
@@ -2320,6 +2339,7 @@ pub enum Instr {
     /// data `size`, a non-negative integral Number). Anything else jumps to
     /// `slow`, leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyLen {
         dst: Reg,
         v: Reg,
@@ -2334,6 +2354,7 @@ pub enum Instr {
     /// runtime's per-class getter / setter cache). Anything else jumps to
     /// `slow`, leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyAttrFn {
         dst: Reg,
         obj: Reg,
@@ -2348,6 +2369,7 @@ pub enum Instr {
     /// runtime's `rt.TTUPLE` or `rt.TLIST` and `items` this Array (not a
     /// copy). Anything else jumps to `slow`, leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PySeq {
         dst: Reg,
         items: Reg,
@@ -2364,6 +2386,7 @@ pub enum Instr {
     /// `e.tbline` becomes -1, and `e` is thrown. Anything else jumps to
     /// `slow` having changed nothing.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyRaise {
         e: Reg,
         rt: Reg,
@@ -2375,6 +2398,7 @@ pub enum Instr {
     /// `rt.EBASE`; a `tbline` of -1 becomes the value in `line`. Anything
     /// else jumps to `slow`, leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyCaught {
         dst: Reg,
         e: Reg,
@@ -2391,6 +2415,7 @@ pub enum Instr {
     /// whose own data `dict` is a `Map` without `key`: that value. Anything
     /// else jumps to `slow`, leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyClassAttr {
         dst: Reg,
         obj: Reg,
@@ -2407,6 +2432,7 @@ pub enum Instr {
     /// to `dst`; no entry (or no bucket) jumps to `absent` (the default);
     /// anything else jumps to `slow`, leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyDictLookup {
         dst: Reg,
         d: Reg,
@@ -2420,6 +2446,7 @@ pub enum Instr {
     /// `items` is an Array of exactly `n` elements, that Array (not a copy).
     /// Anything else jumps to `slow`, leaving `dst` untouched.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyUnpack {
         dst: Reg,
         v: Reg,
@@ -2438,6 +2465,7 @@ pub enum Instr {
     /// 2^24 elements. Anything else jumps to `slow`, leaving `dst`
     /// untouched. Allocates; runs no guest code.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyMakeExc {
         dst: Reg,
         cls: Reg,
@@ -2451,6 +2479,7 @@ pub enum Instr {
     /// missing: its last element removed (nothing, when it is empty).
     /// Anything else jumps to `slow` having changed nothing.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyExcPop {
         rt: Reg,
         slow: u32,
@@ -2468,6 +2497,7 @@ pub enum Instr {
     /// `__init__`) gives `entry` = `null` (nothing to call). Anything else
     /// jumps to `slow` having changed nothing. Allocates; runs no guest code.
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyNew {
         dst: Reg,
         entry: Reg,
@@ -2485,6 +2515,7 @@ pub enum Instr {
     /// result to `dst`. Anything else jumps to `slow` having changed
     /// nothing. The entry's slot is cached per site (`vm::py_rt`).
     #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
     PyCall {
         dst: Reg,
         f: Reg,
@@ -2502,6 +2533,7 @@ pub enum Instr {
 /// two ints.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(not(feature = "wasm-lite"))]
 pub enum PyArithOp {
     Add,
     Sub,
@@ -2517,6 +2549,7 @@ pub enum PyArithOp {
 /// The comparisons of [`Instr::PyCompare`] / [`Instr::PyJumpCompare`].
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(not(feature = "wasm-lite"))]
 pub enum PyCmpOp {
     Lt,
     Le,

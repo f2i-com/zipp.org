@@ -1,5 +1,5 @@
-//! Register renumbering over one instruction (GENERATED from `bytecode::Instr`
-//! by the compiler's class-register finaliser; see `FnCompiler::check_regs`).
+//! Register renumbering over one instruction for `FnCompiler::check_regs`.
+//! Variants with the same operand shape share a mapping body.
 //!
 //! Exhaustive on purpose: adding an `Instr` variant without listing it here is
 //! a compile error, so a register field can never silently escape the remap.
@@ -11,1106 +11,362 @@
 
 use crate::bytecode::{Instr, Reg};
 
+// Full builds retain a separate arm per variant: the grouped WASM candidates
+// showed repeatable slowdowns. Lite retains the measured compact grouping.
+// Both expansions use the same exhaustive operand list and mapping bodies.
+#[cfg(not(feature = "wasm-lite"))]
+macro_rules! remap_by_shape {
+    ($instr:expr; $(#[$attr:meta] $first:pat_param $(| $rest:pat_param)* => $body:block)*) => {
+        match $instr {
+            $(#[$attr] $first => $body, $(#[$attr] $rest => $body,)*)*
+        }
+    };
+}
+
+#[cfg(feature = "wasm-lite")]
+macro_rules! remap_by_shape {
+    ($instr:expr; $(#[$attr:meta] $first:pat_param $(| $rest:pat_param)* => $body:block)*) => {
+        match $instr {
+            $(#[$attr] $first $(| $rest)* => $body,)*
+        }
+    };
+}
+
 pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
-    match i {
-        Instr::LoadConst { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadInt { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadUndefined { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadNewTarget { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadCallee { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadClassValue { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadHole { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadNull { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadBool { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::Move { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::LoadGlobal { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::TypeOfIs { dst, a, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-        }
-        Instr::TypeOfSame { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::LoadGlobalOrUndefined { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadGlobalDyn { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadGlobalOrUndefinedDyn { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::StoreGlobalDyn { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::EvalScopeHas { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::EvalScopeSet { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::StoreGlobal { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::StoreGlobalStrict { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::StoreGlobalResolved { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::Now { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::Add { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Sub { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Mul { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Div { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Mod { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Neg { dst, a, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-        }
-        Instr::ToNum { dst, a, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-        }
-        Instr::Bitwise { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Pow { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::BitNot { dst, a, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-        }
-        Instr::AddInt { dst, a, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-        }
-        Instr::StrConcat { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::AddRightPair { dst, a, b, c, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-            *c = m(*c);
-        }
-        Instr::Pad2Concat { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::Pad2Conditional { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::StrAppendInPlace { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::StrAppendIndex { dst, a, obj, key, scratch, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *obj = m(*obj);
-            *key = m(*key);
-            *scratch = m(*scratch);
-        }
-        Instr::StrConcatChain { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Lt { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Le { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Gt { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Ge { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Eq { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Ne { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::LooseEq { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::LooseNe { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::Not { dst, a, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-        }
-        Instr::ToStr { dst, a, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-        }
-        Instr::TypeOf { dst, a, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-        }
-        Instr::IsArray { dst, a, callee, this_v, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-        }
-        Instr::JsonStringify { dst, val, space, callee, this_v, .. } => {
-            *dst = m(*dst);
-            *val = m(*val);
-            *space = m(*space);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-        }
-        Instr::JsonParse { dst, a, callee, this_v, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-        }
-        Instr::ArrayAppend { arr, val, .. } => {
-            *arr = m(*arr);
-            *val = m(*val);
-        }
-        Instr::ArrayRest { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::ObjectSpread { target, src, .. } => {
-            *target = m(*target);
-            *src = m(*src);
-        }
-        Instr::ObjectRest { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::ObjectRestDyn { dst, src, keys_base, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-            *keys_base = m(*keys_base);
-        }
-        Instr::DecKey { class, key, .. } => {
-            *class = m(*class);
-            *key = m(*key);
-        }
-        Instr::DecElem { class, arg_base, .. } => {
-            *class = m(*class);
-            *arg_base = m(*arg_base);
-        }
-        Instr::DecClass { class, arg_base, .. } => {
-            *class = m(*class);
-            *arg_base = m(*arg_base);
-        }
-        Instr::DecInits { recv, .. } => {
-            *recv = m(*recv);
-        }
-        Instr::DecField { val, recv, .. } => {
-            *val = m(*val);
-            *recv = m(*recv);
-        }
-        Instr::MakeClass { dst, parent, .. } => {
-            *dst = m(*dst);
-            if let Some(r) = parent.as_mut() { *r = m(*r); }
-        }
-        Instr::ThisCheck { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::Yield { dst, val, .. } => {
-            *dst = m(*dst);
-            *val = m(*val);
-        }
-        Instr::AsyncYieldDelegate { mode_dst, val_dst, val, .. } => {
-            *mode_dst = m(*mode_dst);
-            *val_dst = m(*val_dst);
-            *val = m(*val);
-        }
-        Instr::RequireObject { val, .. } => {
-            *val = m(*val);
-        }
-        Instr::AsyncIterThrowStep { dst, iter, exc, .. } => {
-            *dst = m(*dst);
-            *iter = m(*iter);
-            *exc = m(*exc);
-        }
-        Instr::AsyncIterNextStep { dst, iter, idx, sent, next_fn, .. } => {
-            *dst = m(*dst);
-            *iter = m(*iter);
-            *idx = m(*idx);
-            *sent = m(*sent);
-            *next_fn = m(*next_fn);
-        }
-        Instr::AsyncIterReturnStep { dst, has_dst, iter, ret, .. } => {
-            *dst = m(*dst);
-            *has_dst = m(*has_dst);
-            *iter = m(*iter);
-            *ret = m(*ret);
-        }
-        Instr::YieldDelegate { mode_dst, val_dst, val, .. } => {
-            *mode_dst = m(*mode_dst);
-            *val_dst = m(*val_dst);
-            *val = m(*val);
-        }
-        Instr::IterDelegate { value_dst, done_dst, ret_dst, iter, mode, sent, .. } => {
-            *value_dst = m(*value_dst);
-            *done_dst = m(*done_dst);
-            *ret_dst = m(*ret_dst);
-            *iter = m(*iter);
-            *mode = m(*mode);
-            *sent = m(*sent);
-        }
-        Instr::GenStart => {}
-        Instr::Await { dst, val, .. } => {
-            *dst = m(*dst);
-            *val = m(*val);
-        }
-        Instr::IterNext { value_dst, done_dst, iter, idx, next, .. } => {
-            *value_dst = m(*value_dst);
-            *done_dst = m(*done_dst);
-            *iter = m(*iter);
-            *idx = m(*idx);
-            *next = m(*next);
-        }
-        Instr::IterPrime { dst, iter, .. } => {
-            *dst = m(*dst);
-            *iter = m(*iter);
-        }
-        Instr::IterClose { iter, .. } => {
-            *iter = m(*iter);
-        }
-        Instr::IterCloseQuiet { iter, .. } => {
-            *iter = m(*iter);
-        }
-        Instr::IterCloseFinally { iter, kind_reg, .. } => {
-            *iter = m(*iter);
-            *kind_reg = m(*kind_reg);
-        }
-        Instr::GetAsyncIterator { dst, src, sync_dst, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-            *sync_dst = m(*sync_dst);
-        }
-        Instr::ForAwaitNext { dst, iter, idx, .. } => {
-            *dst = m(*dst);
-            *iter = m(*iter);
-            *idx = m(*idx);
-        }
-        Instr::SuperCtorFetch { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::SuperCtor { ctor, arg_base, .. } => {
-            *ctor = m(*ctor);
-            *arg_base = m(*arg_base);
-        }
-        Instr::SuperCtorSpread { ctor, args, .. } => {
-            *ctor = m(*ctor);
-            *args = m(*args);
-        }
-        Instr::SuperBase { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::SuperMethod { dst, base, arg_base, .. } => {
-            *dst = m(*dst);
-            *base = m(*base);
-            *arg_base = m(*arg_base);
-        }
-        Instr::SuperGet { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::SuperGetComputed { dst, key, .. } => {
-            *dst = m(*dst);
-            *key = m(*key);
-        }
-        Instr::SuperGetRef { dst, receiver, .. } => {
-            *dst = m(*dst);
-            *receiver = m(*receiver);
-        }
-        Instr::SuperGetRefComputed { dst, key, receiver, .. } => {
-            *dst = m(*dst);
-            *key = m(*key);
-            *receiver = m(*receiver);
-        }
-        Instr::SuperMethodComputed { dst, base, key, arg_base, .. } => {
-            *dst = m(*dst);
-            *base = m(*base);
-            *key = m(*key);
-            *arg_base = m(*arg_base);
-        }
-        Instr::SuperSet { base, val, .. } => {
-            *base = m(*base);
-            *val = m(*val);
-        }
-        Instr::SuperSetComputed { base, key, val, .. } => {
-            *base = m(*base);
-            *key = m(*key);
-            *val = m(*val);
-        }
-        Instr::SetHomeObject { method, home, .. } => {
-            *method = m(*method);
-            *home = m(*home);
-        }
-        Instr::SuperGetObj { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::SuperGetObjComputed { dst, key, .. } => {
-            *dst = m(*dst);
-            *key = m(*key);
-        }
-        Instr::SuperSetObj { val, .. } => {
-            *val = m(*val);
-        }
-        Instr::SuperSetObjComputed { key, val, .. } => {
-            *key = m(*key);
-            *val = m(*val);
-        }
-        Instr::SuperMethodObj { dst, arg_base, .. } => {
-            *dst = m(*dst);
-            *arg_base = m(*arg_base);
-        }
-        Instr::SuperMethodObjComputed { dst, key, arg_base, .. } => {
-            *dst = m(*dst);
-            *key = m(*key);
-            *arg_base = m(*arg_base);
-        }
-        Instr::New { dst, callee, arg_base, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *arg_base = m(*arg_base);
-        }
-        Instr::PushFieldKey { class, key, .. } => {
-            *class = m(*class);
-            *key = m(*key);
-        }
-        Instr::FieldInit { val, .. } => {
-            *val = m(*val);
-        }
-        Instr::AsyncFromSyncStep { dst, step, iter, .. } => {
-            *dst = m(*dst);
-            *step = m(*step);
-            *iter = m(*iter);
-        }
-        Instr::ArrayCtor { dst, arg_base, callee, .. } => {
-            *dst = m(*dst);
-            *arg_base = m(*arg_base);
-            if let Some(r) = callee.as_mut() { *r = m(*r); }
-        }
-        Instr::NewMap { dst, src, .. } => {
-            *dst = m(*dst);
-            if let Some(r) = src.as_mut() { *r = m(*r); }
-        }
-        Instr::NewSet { dst, src, .. } => {
-            *dst = m(*dst);
-            if let Some(r) = src.as_mut() { *r = m(*r); }
-        }
-        Instr::NewWeakMap { dst, src, .. } => {
-            *dst = m(*dst);
-            if let Some(r) = src.as_mut() { *r = m(*r); }
-        }
-        Instr::NewWeakSet { dst, src, .. } => {
-            *dst = m(*dst);
-            if let Some(r) = src.as_mut() { *r = m(*r); }
-        }
-        Instr::NewWeakRef { dst, target, .. } => {
-            *dst = m(*dst);
-            *target = m(*target);
-        }
-        Instr::NewBox { dst, arg, .. } => {
-            *dst = m(*dst);
-            if let Some(r) = arg.as_mut() { *r = m(*r); }
-        }
-        Instr::NewFinalizationRegistry { dst, cleanup, .. } => {
-            *dst = m(*dst);
-            *cleanup = m(*cleanup);
-        }
-        Instr::NewPromise { dst, executor, .. } => {
-            *dst = m(*dst);
-            *executor = m(*executor);
-        }
-        Instr::CallSpread { dst, callee, args, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *args = m(*args);
-        }
-        Instr::CallWithThisSpread { dst, callee, this_v, args, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-            *args = m(*args);
-        }
-        Instr::CallMethodSpread { dst, obj, args, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *args = m(*args);
-        }
-        Instr::CallMethodComputedSpread { dst, obj, key, args, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *key = m(*key);
-            *args = m(*args);
-        }
-        Instr::SuperMethodSpread { dst, args, .. } => {
-            *dst = m(*dst);
-            *args = m(*args);
-        }
-        Instr::SuperMethodComputedSpread { dst, key, args, .. } => {
-            *dst = m(*dst);
-            *key = m(*key);
-            *args = m(*args);
-        }
-        Instr::NewSpread { dst, callee, args, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *args = m(*args);
-        }
-        Instr::MathOp { dst, callee, this_v, arg_base, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-            *arg_base = m(*arg_base);
-        }
-        Instr::GlobalFn { dst, callee, arg_base, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *arg_base = m(*arg_base);
-        }
-        Instr::StaticFn { dst, callee, this_v, arg_base, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-            *arg_base = m(*arg_base);
-        }
-        Instr::ArrayFrom { dst, src, mapfn, callee, this_v, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-            *mapfn = m(*mapfn);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-        }
-        Instr::MathSpread { dst, callee, this_v, args, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-            *args = m(*args);
-        }
-        Instr::InstanceOfDyn { dst, val, ctor, .. } => {
-            *dst = m(*dst);
-            *val = m(*val);
-            *ctor = m(*ctor);
-        }
-        Instr::HasProp { dst, key, obj, .. } => {
-            *dst = m(*dst);
-            *key = m(*key);
-            *obj = m(*obj);
-        }
-        Instr::WithHas { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::WithGet { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::WithSet { obj, val, .. } => {
-            *obj = m(*obj);
-            *val = m(*val);
-        }
-        Instr::Jump { .. } => {}
-        Instr::JumpIfFalse { cond, .. } => {
-            *cond = m(*cond);
-        }
-        Instr::JumpIfTrue { cond, .. } => {
-            *cond = m(*cond);
-        }
-        Instr::JumpIfNotLt { a, b, .. } => {
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::JumpIfNotLe { a, b, .. } => {
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::MakeFunc { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::MakeClosure { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::MakeArrow { dst, this_reg, .. } => {
-            *dst = m(*dst);
-            *this_reg = m(*this_reg);
-        }
-        Instr::MakeCell { reg, .. } => {
-            *reg = m(*reg);
-        }
-        Instr::MakeCellTdz { reg, .. } => {
-            *reg = m(*reg);
-        }
-        Instr::MakeCellFnName { reg, .. } => {
-            *reg = m(*reg);
-        }
-        Instr::MarkCellConst { reg, .. } => {
-            *reg = m(*reg);
-        }
-        Instr::CellGet { dst, cell, .. } => {
-            *dst = m(*dst);
-            *cell = m(*cell);
-        }
-        Instr::CellSet { cell, src, .. } => {
-            *cell = m(*cell);
-            *src = m(*src);
-        }
-        Instr::CellSetChecked { cell, src, .. } => {
-            *cell = m(*cell);
-            *src = m(*src);
-        }
-        Instr::UpvalGet { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::UpvalSet { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::LoadUpvalDyn { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::StoreUpvalDyn { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::NewArray { dst, arg_base, .. } => {
-            *dst = m(*dst);
-            *arg_base = m(*arg_base);
-        }
-        Instr::NewObject { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::NewPlannedObject { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::ToObject { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::CheckCoercible { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::NewError { dst, arg, opts, errors, .. } => {
-            *dst = m(*dst);
-            if let Some(r) = arg.as_mut() { *r = m(*r); }
-            if let Some(r) = opts.as_mut() { *r = m(*r); }
-            if let Some(r) = errors.as_mut() { *r = m(*r); }
-        }
-        Instr::MakeSymbol { dst, desc, .. } => {
-            *dst = m(*dst);
-            if let Some(r) = desc.as_mut() { *r = m(*r); }
-        }
-        Instr::LoadBigInt { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::LoadBigIntBig { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::BigIntFrom { dst, arg, .. } => {
-            *dst = m(*dst);
-            *arg = m(*arg);
-        }
-        Instr::NewRegExp { dst, pattern, flags, .. } => {
-            *dst = m(*dst);
-            *pattern = m(*pattern);
-            *flags = m(*flags);
-        }
-        Instr::ObjectKeys { dst, obj, callee, this_v, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-        }
-        Instr::ForInKeys { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::ForInLive { dst, obj, key, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *key = m(*key);
-        }
-        Instr::ObjectValues { dst, obj, callee, this_v, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-        }
-        Instr::ObjectEntries { dst, obj, callee, this_v, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-        }
-        Instr::LenOf { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::GetIndex { dst, obj, key, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *key = m(*key);
-        }
-        Instr::SetIndex { obj, key, val, .. } => {
-            *obj = m(*obj);
-            *key = m(*key);
-            *val = m(*val);
-        }
-        Instr::GetIndexConcat { dst, obj, key, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *key = m(*key);
-        }
-        Instr::SetIndexConcat { obj, key, val, .. } => {
-            *obj = m(*obj);
-            *key = m(*key);
-            *val = m(*val);
-        }
-        Instr::ToConcatKey { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::DeleteIndexConcat { dst, obj, key, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *key = m(*key);
-        }
-        Instr::ImportCall { dst, spec, opts, .. } => {
-            *dst = m(*dst);
-            *spec = m(*spec);
-            if let Some(r) = opts.as_mut() { *r = m(*r); }
-        }
-        Instr::ClassStaticField { class, key, val, .. } => {
-            *class = m(*class);
-            *key = m(*key);
-            *val = m(*val);
-        }
-        Instr::ToPropKey { dst, obj, src, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *src = m(*src);
-        }
-        Instr::DefineAccessor { obj, key, func, .. } => {
-            *obj = m(*obj);
-            *key = m(*key);
-            *func = m(*func);
-        }
-        Instr::SetFnNameFromKey { func, key, .. } => {
-            *func = m(*func);
-            *key = m(*key);
-        }
-        Instr::GetProp { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::SetProp { obj, val, .. } => {
-            *obj = m(*obj);
-            *val = m(*val);
-        }
-        Instr::SetPrivate { obj, val, .. } => {
-            *obj = m(*obj);
-            *val = m(*val);
-        }
-        Instr::InitDataProp { obj, val, .. } => {
-            *obj = m(*obj);
-            *val = m(*val);
-        }
-        Instr::SetLiteralProto { obj, val, .. } => {
-            *obj = m(*obj);
-            *val = m(*val);
-        }
-        Instr::AppendDataProp { obj, val, .. } => {
-            *obj = m(*obj);
-            *val = m(*val);
-        }
-        Instr::FinalizeObject { dst, val_base, .. } => {
-            *dst = m(*dst);
-            *val_base = m(*val_base);
-        }
-        Instr::InitDataPropDyn { obj, key, val, .. } => {
-            *obj = m(*obj);
-            *key = m(*key);
-            *val = m(*val);
-        }
-        Instr::DeleteProp { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::DeleteIndex { dst, obj, key, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *key = m(*key);
-        }
-        Instr::DeleteGlobal { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::TailCall { callee, arg_base, .. } => {
-            *callee = m(*callee);
-            *arg_base = m(*arg_base);
-        }
-        Instr::TailCallWithThis { callee, this_v, arg_base, .. } => {
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-            *arg_base = m(*arg_base);
-        }
-        Instr::Call { dst, callee, arg_base, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *arg_base = m(*arg_base);
-        }
-        Instr::CallWithThis { dst, callee, this_v, arg_base, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-            *arg_base = m(*arg_base);
-        }
-        Instr::RegExpMethod { dst, callee, this_v, arg_base, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-            *arg_base = m(*arg_base);
-        }
-        Instr::ImportMeta { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::DirectEval { dst, callee, this_v, arg_base, this_reg, .. } => {
-            *dst = m(*dst);
-            *callee = m(*callee);
-            *this_v = m(*this_v);
-            *arg_base = m(*arg_base);
-            *this_reg = m(*this_reg);
-        }
-        Instr::CheckGlobalResolvable { .. } => {}
-        Instr::DefineField { obj, val, .. } => {
-            *obj = m(*obj);
-            *val = m(*val);
-        }
-        Instr::CallMethod { dst, obj, arg_base, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *arg_base = m(*arg_base);
-        }
-        Instr::CallMethodComputed { dst, obj, key, arg_base, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *key = m(*key);
-            *arg_base = m(*arg_base);
-        }
-        Instr::Throw { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::PushHandler { catch_reg, .. } => {
-            *catch_reg = m(*catch_reg);
-        }
-        Instr::PopHandler => {}
-        Instr::PushFinally { kind_reg, val_reg, .. } => {
-            *kind_reg = m(*kind_reg);
-            *val_reg = m(*val_reg);
-        }
-        Instr::PopFinally => {}
-        Instr::EndFinally { kind_reg, val_reg, .. } => {
-            *kind_reg = m(*kind_reg);
-            *val_reg = m(*val_reg);
-        }
-        Instr::OpenUsingScope { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::RegisterDisposable { scope, val, .. } => {
-            *scope = m(*scope);
-            *val = m(*val);
-        }
-        Instr::DisposeScope { scope, kind_reg, val_reg, .. } => {
-            *scope = m(*scope);
-            *kind_reg = m(*kind_reg);
-            *val_reg = m(*val_reg);
-        }
-        Instr::RegisterAsyncDisposable { scope, val, .. } => {
-            *scope = m(*scope);
-            *val = m(*val);
-        }
-        Instr::AsyncDisposeNext { scope, res, done, .. } => {
-            *scope = m(*scope);
-            *res = m(*res);
-            *done = m(*done);
-        }
-        Instr::MergeDispose { kind_reg, val_reg, err, .. } => {
-            *kind_reg = m(*kind_reg);
-            *val_reg = m(*val_reg);
-            *err = m(*err);
-        }
-        Instr::JumpFinally { .. } => {}
-        Instr::SetRaw { arr, raw, .. } => {
-            *arr = m(*arr);
-            *raw = m(*raw);
-        }
-        Instr::TemplateGetCached { dst, .. } => {
-            *dst = m(*dst);
-        }
-        Instr::TemplateSetCached { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::ClassAddMember { class, key, .. } => {
-            *class = m(*class);
-            *key = m(*key);
-        }
-        Instr::DateNew { dst, arg_base, .. } => {
-            *dst = m(*dst);
-            *arg_base = m(*arg_base);
-        }
-        Instr::DateUTC { dst, arg_base, .. } => {
-            *dst = m(*dst);
-            *arg_base = m(*arg_base);
-        }
-        Instr::DateParse { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::GetIterator { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::GetIteratorObj { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::IterToArray { dst, src, .. } => {
-            *dst = m(*dst);
-            *src = m(*src);
-        }
-        Instr::Return { src, .. } => {
-            *src = m(*src);
-        }
-        Instr::ReturnUndefined => {}
-        Instr::Print { arg_base, .. } => {
-            *arg_base = m(*arg_base);
-        }
-        Instr::PyArith { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::PyAddImm { dst, a, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-        }
-        Instr::PyCompare { dst, a, b, .. } => {
-            *dst = m(*dst);
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::PyJumpCompare { a, b, .. } => {
-            *a = m(*a);
-            *b = m(*b);
-        }
-        Instr::PyClassOf { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::PyDictGet { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::PyDictSet { obj, val, .. } => {
-            *obj = m(*obj);
-            *val = m(*val);
-        }
-        Instr::PyCallEntry { dst, f, .. } => {
-            *dst = m(*dst);
-            *f = m(*f);
-        }
-        Instr::PyGetItem { dst, o, k, seq, dict, .. } => {
-            *dst = m(*dst);
-            *o = m(*o);
-            *k = m(*k);
-            *seq = m(*seq);
-            *dict = m(*dict);
-        }
-        Instr::PySetItem { o, k, v, seq, dict, .. } => {
-            *o = m(*o);
-            *k = m(*k);
-            *v = m(*v);
-            *seq = m(*seq);
-            *dict = m(*dict);
-        }
-        Instr::PyGlobal { dst, globals, rt, .. } => {
-            *dst = m(*dst);
-            *globals = m(*globals);
-            *rt = m(*rt);
-        }
-        Instr::PyStrItem { dst, s, k, .. } => {
-            *dst = m(*dst);
-            *s = m(*s);
-            *k = m(*k);
-        }
-        Instr::PyStrLen { dst, s, .. } => {
-            *dst = m(*dst);
-            *s = m(*s);
-        }
-        Instr::PyGetAttr { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::PySetAttr { obj, val, .. } => {
-            *obj = m(*obj);
-            *val = m(*val);
-        }
-        Instr::PyIsInstance { dst, v, t, rt, .. } => {
-            *dst = m(*dst);
-            *v = m(*v);
-            *t = m(*t);
-            *rt = m(*rt);
-        }
-        Instr::PyGenNext { dst, next, this, .. } => {
-            *dst = m(*dst);
-            *next = m(*next);
-            *this = m(*this);
-        }
-        Instr::PyMethod { dst, obj, rt, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *rt = m(*rt);
-        }
-        Instr::PyModGet { dst, obj, rt, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-            *rt = m(*rt);
-        }
-        Instr::PyLen { dst, v, rt, .. } => {
-            *dst = m(*dst);
-            *v = m(*v);
-            *rt = m(*rt);
-        }
-        Instr::PyAttrFn { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::PySeq { dst, items, rt, .. } => {
-            *dst = m(*dst);
-            *items = m(*items);
-            *rt = m(*rt);
-        }
-        Instr::PyRaise { e, rt, .. } => {
-            *e = m(*e);
-            *rt = m(*rt);
-        }
-        Instr::PyCaught { dst, e, line, rt, .. } => {
-            *dst = m(*dst);
-            *e = m(*e);
-            *line = m(*line);
-            *rt = m(*rt);
-        }
-        Instr::PyClassAttr { dst, obj, .. } => {
-            *dst = m(*dst);
-            *obj = m(*obj);
-        }
-        Instr::PyDictLookup { dst, d, k, rt, .. } => {
-            *dst = m(*dst);
-            *d = m(*d);
-            *k = m(*k);
-            *rt = m(*rt);
-        }
-        Instr::PyUnpack { dst, v, rt, .. } => {
-            *dst = m(*dst);
-            *v = m(*v);
-            *rt = m(*rt);
-        }
-        Instr::PyMakeExc { dst, cls, args, rt, .. } => {
-            *dst = m(*dst);
-            *cls = m(*cls);
-            *args = m(*args);
-            *rt = m(*rt);
-        }
-        Instr::PyExcPop { rt, .. } => {
-            *rt = m(*rt);
-        }
-        Instr::PyNew { dst, entry, this_f, cls, rt, .. } => {
-            *dst = m(*dst);
-            *entry = m(*entry);
-            *this_f = m(*this_f);
-            *cls = m(*cls);
-            *rt = m(*rt);
-        }
-        Instr::PyCall { dst, f, arg_base, .. } => {
-            *dst = m(*dst);
-            *f = m(*f);
-            *arg_base = m(*arg_base);
-        }
-    }
+    remap_by_shape!(i;
+        #[cfg(all())]
+        Instr::LoadConst { dst: r0, .. }
+        | Instr::LoadInt { dst: r0, .. }
+        | Instr::LoadUndefined { dst: r0, .. }
+        | Instr::LoadNewTarget { dst: r0, .. }
+        | Instr::LoadCallee { dst: r0, .. }
+        | Instr::LoadClassValue { dst: r0, .. }
+        | Instr::LoadHole { dst: r0, .. }
+        | Instr::LoadNull { dst: r0, .. }
+        | Instr::LoadBool { dst: r0, .. }
+        | Instr::LoadGlobal { dst: r0, .. }
+        | Instr::LoadGlobalOrUndefined { dst: r0, .. }
+        | Instr::LoadGlobalDyn { dst: r0, .. }
+        | Instr::LoadGlobalOrUndefinedDyn { dst: r0, .. }
+        | Instr::StoreGlobalDyn { src: r0, .. }
+        | Instr::EvalScopeHas { dst: r0, .. }
+        | Instr::EvalScopeSet { src: r0, .. }
+        | Instr::StoreGlobal { src: r0, .. }
+        | Instr::StoreGlobalStrict { src: r0, .. }
+        | Instr::StoreGlobalResolved { src: r0, .. }
+        | Instr::Now { dst: r0, .. }
+        | Instr::DecInits { recv: r0, .. }
+        | Instr::ThisCheck { src: r0, .. }
+        | Instr::RequireObject { val: r0, .. }
+        | Instr::IterClose { iter: r0, .. }
+        | Instr::IterCloseQuiet { iter: r0, .. }
+        | Instr::SuperCtorFetch { dst: r0, .. }
+        | Instr::SuperBase { dst: r0, .. }
+        | Instr::SuperGet { dst: r0, .. }
+        | Instr::SuperGetObj { dst: r0, .. }
+        | Instr::SuperSetObj { val: r0, .. }
+        | Instr::FieldInit { val: r0, .. }
+        | Instr::JumpIfFalse { cond: r0, .. }
+        | Instr::JumpIfTrue { cond: r0, .. }
+        | Instr::MakeFunc { dst: r0, .. }
+        | Instr::MakeClosure { dst: r0, .. }
+        | Instr::MakeCell { reg: r0, .. }
+        | Instr::MakeCellTdz { reg: r0, .. }
+        | Instr::MakeCellFnName { reg: r0, .. }
+        | Instr::MarkCellConst { reg: r0, .. }
+        | Instr::UpvalGet { dst: r0, .. }
+        | Instr::UpvalSet { src: r0, .. }
+        | Instr::LoadUpvalDyn { dst: r0, .. }
+        | Instr::StoreUpvalDyn { src: r0, .. }
+        | Instr::NewObject { dst: r0, .. }
+        | Instr::NewPlannedObject { dst: r0, .. }
+        | Instr::CheckCoercible { src: r0, .. }
+        | Instr::LoadBigInt { dst: r0, .. }
+        | Instr::LoadBigIntBig { dst: r0, .. }
+        | Instr::DeleteGlobal { dst: r0, .. }
+        | Instr::ImportMeta { dst: r0, .. }
+        | Instr::Throw { src: r0, .. }
+        | Instr::PushHandler { catch_reg: r0, .. }
+        | Instr::OpenUsingScope { dst: r0, .. }
+        | Instr::TemplateGetCached { dst: r0, .. }
+        | Instr::TemplateSetCached { src: r0, .. }
+        | Instr::Return { src: r0, .. }
+        | Instr::Print { arg_base: r0, .. } => {
+            *r0 = m(*r0);
+        }
+        #[cfg(all())]
+        Instr::Move { dst: r0, src: r1, .. }
+        | Instr::TypeOfIs { dst: r0, a: r1, .. }
+        | Instr::Neg { dst: r0, a: r1, .. }
+        | Instr::ToNum { dst: r0, a: r1, .. }
+        | Instr::BitNot { dst: r0, a: r1, .. }
+        | Instr::AddInt { dst: r0, a: r1, .. }
+        | Instr::Pad2Concat { dst: r0, src: r1, .. }
+        | Instr::Pad2Conditional { dst: r0, src: r1, .. }
+        | Instr::Not { dst: r0, a: r1, .. }
+        | Instr::ToStr { dst: r0, a: r1, .. }
+        | Instr::TypeOf { dst: r0, a: r1, .. }
+        | Instr::ArrayAppend { arr: r0, val: r1, .. }
+        | Instr::ArrayRest { dst: r0, src: r1, .. }
+        | Instr::ObjectSpread { target: r0, src: r1, .. }
+        | Instr::ObjectRest { dst: r0, src: r1, .. }
+        | Instr::DecKey { class: r0, key: r1, .. }
+        | Instr::DecElem { class: r0, arg_base: r1, .. }
+        | Instr::DecClass { class: r0, arg_base: r1, .. }
+        | Instr::DecField { val: r0, recv: r1, .. }
+        | Instr::Yield { dst: r0, val: r1, .. }
+        | Instr::Await { dst: r0, val: r1, .. }
+        | Instr::IterPrime { dst: r0, iter: r1, .. }
+        | Instr::IterCloseFinally { iter: r0, kind_reg: r1, .. }
+        | Instr::SuperCtor { ctor: r0, arg_base: r1, .. }
+        | Instr::SuperCtorSpread { ctor: r0, args: r1, .. }
+        | Instr::SuperGetComputed { dst: r0, key: r1, .. }
+        | Instr::SuperGetRef { dst: r0, receiver: r1, .. }
+        | Instr::SuperSet { base: r0, val: r1, .. }
+        | Instr::SetHomeObject { method: r0, home: r1, .. }
+        | Instr::SuperGetObjComputed { dst: r0, key: r1, .. }
+        | Instr::SuperSetObjComputed { key: r0, val: r1, .. }
+        | Instr::SuperMethodObj { dst: r0, arg_base: r1, .. }
+        | Instr::PushFieldKey { class: r0, key: r1, .. }
+        | Instr::NewWeakRef { dst: r0, target: r1, .. }
+        | Instr::NewFinalizationRegistry { dst: r0, cleanup: r1, .. }
+        | Instr::NewPromise { dst: r0, executor: r1, .. }
+        | Instr::SuperMethodSpread { dst: r0, args: r1, .. }
+        | Instr::WithHas { dst: r0, obj: r1, .. }
+        | Instr::WithGet { dst: r0, obj: r1, .. }
+        | Instr::WithSet { obj: r0, val: r1, .. }
+        | Instr::JumpIfNotLt { a: r0, b: r1, .. }
+        | Instr::JumpIfNotLe { a: r0, b: r1, .. }
+        | Instr::MakeArrow { dst: r0, this_reg: r1, .. }
+        | Instr::CellGet { dst: r0, cell: r1, .. }
+        | Instr::CellSet { cell: r0, src: r1, .. }
+        | Instr::CellSetChecked { cell: r0, src: r1, .. }
+        | Instr::NewArray { dst: r0, arg_base: r1, .. }
+        | Instr::ToObject { dst: r0, src: r1, .. }
+        | Instr::BigIntFrom { dst: r0, arg: r1, .. }
+        | Instr::ForInKeys { dst: r0, obj: r1, .. }
+        | Instr::LenOf { dst: r0, obj: r1, .. }
+        | Instr::ToConcatKey { dst: r0, src: r1, .. }
+        | Instr::SetFnNameFromKey { func: r0, key: r1, .. }
+        | Instr::GetProp { dst: r0, obj: r1, .. }
+        | Instr::SetProp { obj: r0, val: r1, .. }
+        | Instr::SetPrivate { obj: r0, val: r1, .. }
+        | Instr::InitDataProp { obj: r0, val: r1, .. }
+        | Instr::SetLiteralProto { obj: r0, val: r1, .. }
+        | Instr::AppendDataProp { obj: r0, val: r1, .. }
+        | Instr::FinalizeObject { dst: r0, val_base: r1, .. }
+        | Instr::DeleteProp { dst: r0, obj: r1, .. }
+        | Instr::TailCall { callee: r0, arg_base: r1, .. }
+        | Instr::DefineField { obj: r0, val: r1, .. }
+        | Instr::PushFinally { kind_reg: r0, val_reg: r1, .. }
+        | Instr::EndFinally { kind_reg: r0, val_reg: r1, .. }
+        | Instr::RegisterDisposable { scope: r0, val: r1, .. }
+        | Instr::RegisterAsyncDisposable { scope: r0, val: r1, .. }
+        | Instr::SetRaw { arr: r0, raw: r1, .. }
+        | Instr::ClassAddMember { class: r0, key: r1, .. }
+        | Instr::DateNew { dst: r0, arg_base: r1, .. }
+        | Instr::DateUTC { dst: r0, arg_base: r1, .. }
+        | Instr::DateParse { dst: r0, src: r1, .. }
+        | Instr::GetIterator { dst: r0, src: r1, .. }
+        | Instr::GetIteratorObj { dst: r0, src: r1, .. }
+        | Instr::IterToArray { dst: r0, src: r1, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+        }
+        #[cfg(all())]
+        Instr::TypeOfSame { dst: r0, a: r1, b: r2, .. }
+        | Instr::Add { dst: r0, a: r1, b: r2, .. }
+        | Instr::Sub { dst: r0, a: r1, b: r2, .. }
+        | Instr::Mul { dst: r0, a: r1, b: r2, .. }
+        | Instr::Div { dst: r0, a: r1, b: r2, .. }
+        | Instr::Mod { dst: r0, a: r1, b: r2, .. }
+        | Instr::Bitwise { dst: r0, a: r1, b: r2, .. }
+        | Instr::Pow { dst: r0, a: r1, b: r2, .. }
+        | Instr::StrConcat { dst: r0, a: r1, b: r2, .. }
+        | Instr::StrAppendInPlace { dst: r0, a: r1, b: r2, .. }
+        | Instr::StrConcatChain { dst: r0, a: r1, b: r2, .. }
+        | Instr::Lt { dst: r0, a: r1, b: r2, .. }
+        | Instr::Le { dst: r0, a: r1, b: r2, .. }
+        | Instr::Gt { dst: r0, a: r1, b: r2, .. }
+        | Instr::Ge { dst: r0, a: r1, b: r2, .. }
+        | Instr::Eq { dst: r0, a: r1, b: r2, .. }
+        | Instr::Ne { dst: r0, a: r1, b: r2, .. }
+        | Instr::LooseEq { dst: r0, a: r1, b: r2, .. }
+        | Instr::LooseNe { dst: r0, a: r1, b: r2, .. }
+        | Instr::ObjectRestDyn { dst: r0, src: r1, keys_base: r2, .. }
+        | Instr::AsyncYieldDelegate { mode_dst: r0, val_dst: r1, val: r2, .. }
+        | Instr::AsyncIterThrowStep { dst: r0, iter: r1, exc: r2, .. }
+        | Instr::YieldDelegate { mode_dst: r0, val_dst: r1, val: r2, .. }
+        | Instr::GetAsyncIterator { dst: r0, src: r1, sync_dst: r2, .. }
+        | Instr::ForAwaitNext { dst: r0, iter: r1, idx: r2, .. }
+        | Instr::SuperMethod { dst: r0, base: r1, arg_base: r2, .. }
+        | Instr::SuperGetRefComputed { dst: r0, key: r1, receiver: r2, .. }
+        | Instr::SuperSetComputed { base: r0, key: r1, val: r2, .. }
+        | Instr::SuperMethodObjComputed { dst: r0, key: r1, arg_base: r2, .. }
+        | Instr::New { dst: r0, callee: r1, arg_base: r2, .. }
+        | Instr::AsyncFromSyncStep { dst: r0, step: r1, iter: r2, .. }
+        | Instr::CallSpread { dst: r0, callee: r1, args: r2, .. }
+        | Instr::CallMethodSpread { dst: r0, obj: r1, args: r2, .. }
+        | Instr::SuperMethodComputedSpread { dst: r0, key: r1, args: r2, .. }
+        | Instr::NewSpread { dst: r0, callee: r1, args: r2, .. }
+        | Instr::GlobalFn { dst: r0, callee: r1, arg_base: r2, .. }
+        | Instr::InstanceOfDyn { dst: r0, val: r1, ctor: r2, .. }
+        | Instr::HasProp { dst: r0, key: r1, obj: r2, .. }
+        | Instr::NewRegExp { dst: r0, pattern: r1, flags: r2, .. }
+        | Instr::ForInLive { dst: r0, obj: r1, key: r2, .. }
+        | Instr::GetIndex { dst: r0, obj: r1, key: r2, .. }
+        | Instr::SetIndex { obj: r0, key: r1, val: r2, .. }
+        | Instr::GetIndexConcat { dst: r0, obj: r1, key: r2, .. }
+        | Instr::SetIndexConcat { obj: r0, key: r1, val: r2, .. }
+        | Instr::DeleteIndexConcat { dst: r0, obj: r1, key: r2, .. }
+        | Instr::ClassStaticField { class: r0, key: r1, val: r2, .. }
+        | Instr::ToPropKey { dst: r0, obj: r1, src: r2, .. }
+        | Instr::DefineAccessor { obj: r0, key: r1, func: r2, .. }
+        | Instr::InitDataPropDyn { obj: r0, key: r1, val: r2, .. }
+        | Instr::DeleteIndex { dst: r0, obj: r1, key: r2, .. }
+        | Instr::TailCallWithThis { callee: r0, this_v: r1, arg_base: r2, .. }
+        | Instr::Call { dst: r0, callee: r1, arg_base: r2, .. }
+        | Instr::CallMethod { dst: r0, obj: r1, arg_base: r2, .. }
+        | Instr::DisposeScope { scope: r0, kind_reg: r1, val_reg: r2, .. }
+        | Instr::AsyncDisposeNext { scope: r0, res: r1, done: r2, .. }
+        | Instr::MergeDispose { kind_reg: r0, val_reg: r1, err: r2, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+        }
+        #[cfg(all())]
+        Instr::AddRightPair { dst: r0, a: r1, b: r2, c: r3, .. }
+        | Instr::IsArray { dst: r0, a: r1, callee: r2, this_v: r3, .. }
+        | Instr::JsonParse { dst: r0, a: r1, callee: r2, this_v: r3, .. }
+        | Instr::AsyncIterReturnStep { dst: r0, has_dst: r1, iter: r2, ret: r3, .. }
+        | Instr::SuperMethodComputed { dst: r0, base: r1, key: r2, arg_base: r3, .. }
+        | Instr::CallWithThisSpread { dst: r0, callee: r1, this_v: r2, args: r3, .. }
+        | Instr::CallMethodComputedSpread { dst: r0, obj: r1, key: r2, args: r3, .. }
+        | Instr::MathOp { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
+        | Instr::StaticFn { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
+        | Instr::MathSpread { dst: r0, callee: r1, this_v: r2, args: r3, .. }
+        | Instr::ObjectKeys { dst: r0, obj: r1, callee: r2, this_v: r3, .. }
+        | Instr::ObjectValues { dst: r0, obj: r1, callee: r2, this_v: r3, .. }
+        | Instr::ObjectEntries { dst: r0, obj: r1, callee: r2, this_v: r3, .. }
+        | Instr::CallWithThis { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
+        | Instr::RegExpMethod { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
+        | Instr::CallMethodComputed { dst: r0, obj: r1, key: r2, arg_base: r3, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
+        }
+        #[cfg(all())]
+        Instr::StrAppendIndex { dst: r0, a: r1, obj: r2, key: r3, scratch: r4, .. }
+        | Instr::JsonStringify { dst: r0, val: r1, space: r2, callee: r3, this_v: r4, .. }
+        | Instr::AsyncIterNextStep { dst: r0, iter: r1, idx: r2, sent: r3, next_fn: r4, .. }
+        | Instr::IterNext { value_dst: r0, done_dst: r1, iter: r2, idx: r3, next: r4, .. }
+        | Instr::ArrayFrom { dst: r0, src: r1, mapfn: r2, callee: r3, this_v: r4, .. }
+        | Instr::DirectEval { dst: r0, callee: r1, this_v: r2, arg_base: r3, this_reg: r4, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
+            *r4 = m(*r4);
+        }
+        #[cfg(all())]
+        Instr::MakeClass { dst: r0, parent: r1, .. }
+        | Instr::NewMap { dst: r0, src: r1, .. }
+        | Instr::NewSet { dst: r0, src: r1, .. }
+        | Instr::NewWeakMap { dst: r0, src: r1, .. }
+        | Instr::NewWeakSet { dst: r0, src: r1, .. }
+        | Instr::NewBox { dst: r0, arg: r1, .. }
+        | Instr::MakeSymbol { dst: r0, desc: r1, .. } => {
+            *r0 = m(*r0);
+            if let Some(r) = r1.as_mut() { *r = m(*r); }
+        }
+        #[cfg(all())]
+        Instr::IterDelegate { value_dst: r0, done_dst: r1, ret_dst: r2, iter: r3, mode: r4, sent: r5, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
+            *r4 = m(*r4);
+            *r5 = m(*r5);
+        }
+        #[cfg(all())]
+        Instr::GenStart
+        | Instr::Jump { .. }
+        | Instr::CheckGlobalResolvable { .. }
+        | Instr::PopHandler
+        | Instr::PopFinally
+        | Instr::JumpFinally { .. }
+        | Instr::ReturnUndefined => {
+        }
+        #[cfg(all())]
+        Instr::ArrayCtor { dst: r0, arg_base: r1, callee: r2, .. }
+        | Instr::ImportCall { dst: r0, spec: r1, opts: r2, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            if let Some(r) = r2.as_mut() { *r = m(*r); }
+        }
+        #[cfg(all())]
+        Instr::NewError { dst: r0, arg: r1, opts: r2, errors: r3, .. } => {
+            *r0 = m(*r0);
+            if let Some(r) = r1.as_mut() { *r = m(*r); }
+            if let Some(r) = r2.as_mut() { *r = m(*r); }
+            if let Some(r) = r3.as_mut() { *r = m(*r); }
+        }
+        #[cfg(not(feature = "wasm-lite"))]
+        Instr::PyArith { dst: r0, a: r1, b: r2, .. }
+        | Instr::PyCompare { dst: r0, a: r1, b: r2, .. }
+        | Instr::PyGlobal { dst: r0, globals: r1, rt: r2, .. }
+        | Instr::PyStrItem { dst: r0, s: r1, k: r2, .. }
+        | Instr::PyGenNext { dst: r0, next: r1, this: r2, .. }
+        | Instr::PyMethod { dst: r0, obj: r1, rt: r2, .. }
+        | Instr::PyModGet { dst: r0, obj: r1, rt: r2, .. }
+        | Instr::PyLen { dst: r0, v: r1, rt: r2, .. }
+        | Instr::PySeq { dst: r0, items: r1, rt: r2, .. }
+        | Instr::PyUnpack { dst: r0, v: r1, rt: r2, .. }
+        | Instr::PyCall { dst: r0, f: r1, arg_base: r2, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+        }
+        #[cfg(not(feature = "wasm-lite"))]
+        Instr::PyAddImm { dst: r0, a: r1, .. }
+        | Instr::PyJumpCompare { a: r0, b: r1, .. }
+        | Instr::PyClassOf { dst: r0, obj: r1, .. }
+        | Instr::PyDictGet { dst: r0, obj: r1, .. }
+        | Instr::PyDictSet { obj: r0, val: r1, .. }
+        | Instr::PyCallEntry { dst: r0, f: r1, .. }
+        | Instr::PyStrLen { dst: r0, s: r1, .. }
+        | Instr::PyGetAttr { dst: r0, obj: r1, .. }
+        | Instr::PySetAttr { obj: r0, val: r1, .. }
+        | Instr::PyAttrFn { dst: r0, obj: r1, .. }
+        | Instr::PyRaise { e: r0, rt: r1, .. }
+        | Instr::PyClassAttr { dst: r0, obj: r1, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+        }
+        #[cfg(not(feature = "wasm-lite"))]
+        Instr::PyGetItem { dst: r0, o: r1, k: r2, seq: r3, dict: r4, .. }
+        | Instr::PySetItem { o: r0, k: r1, v: r2, seq: r3, dict: r4, .. }
+        | Instr::PyNew { dst: r0, entry: r1, this_f: r2, cls: r3, rt: r4, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
+            *r4 = m(*r4);
+        }
+        #[cfg(not(feature = "wasm-lite"))]
+        Instr::PyIsInstance { dst: r0, v: r1, t: r2, rt: r3, .. }
+        | Instr::PyCaught { dst: r0, e: r1, line: r2, rt: r3, .. }
+        | Instr::PyDictLookup { dst: r0, d: r1, k: r2, rt: r3, .. }
+        | Instr::PyMakeExc { dst: r0, cls: r1, args: r2, rt: r3, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
+        }
+        #[cfg(not(feature = "wasm-lite"))]
+        Instr::PyExcPop { rt: r0, .. } => {
+            *r0 = m(*r0);
+        }
+    );
 }
