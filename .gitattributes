@@ -2,6 +2,7 @@
 tools/test262-corrections/** text eol=lf
 # Unified patches encode empty context lines as one space; preserve that syntax.
 tools/test262-corrections/*.patch whitespace=-blank-at-eol,-blank-at-eof
+docs/validation/*.patch text eol=lf
 bench/pgo-training/** text eol=lf
 
 # The WASM engine pairs are hash-checked against their manifests; never convert line endings.
