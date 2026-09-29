@@ -1306,7 +1306,7 @@ impl<'p> Vm<'p> {
         if !matches!(self.heap.get(oidx), HeapObj::Object(_)) {
             return Ok(false);
         }
-        let pidx = match self.prototype_of(cval) {
+        let pidx = match self::subclass_prototype!(self, cval) {
             Some(p) if p.is_heap() => p.heap_index(),
             _ => return Ok(false),
         };
@@ -1325,7 +1325,7 @@ impl<'p> Vm<'p> {
         {
             let tv = self.construct(cval, args)?;
             let tvi = tv.heap_index();
-            let cloned = self.heap.get(tvi).clone();
+            let cloned = self::copy_builtin_instance!(self.heap.get(tvi));
             self.heap.replace(oidx, cloned);
             // Carry over the length-tracking flag (a `new T(rab[, offset])` view with
             // no explicit length follows the resizable buffer): it lives in a side
@@ -1381,7 +1381,7 @@ impl<'p> Vm<'p> {
         if cval.is_heap() && cval.heap_index() == self.dataview_ctor && self.dataview_ctor != 0 {
             let tv = self.build_data_view(args)?;
             let tvi = tv.heap_index();
-            let cloned = self.heap.get(tvi).clone();
+            let cloned = self::copy_builtin_instance!(self.heap.get(tvi));
             self.heap.replace(oidx, cloned);
             if self.dv_tracking.contains(&tvi) {
                 self.dv_tracking.insert(oidx);
@@ -1411,7 +1411,7 @@ impl<'p> Vm<'p> {
                 let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let tv = self.make_intl(kind as u8, locales, options)?;
-                let cloned = self.heap.get(tv.heap_index()).clone();
+                let cloned = self::copy_builtin_instance!(self.heap.get(tv.heap_index()));
                 self.heap.replace(oidx, cloned);
                 if sub_proto.is_heap() {
                     self.proto_of.insert(oidx, sub_proto);
@@ -1435,7 +1435,7 @@ impl<'p> Vm<'p> {
             .contains(&pidx)
         {
             let tv = self.construct(cval, args)?;
-            let cloned = self.heap.get(tv.heap_index()).clone();
+            let cloned = self::copy_builtin_instance!(self.heap.get(tv.heap_index()));
             self.heap.replace(oidx, cloned);
             // Carry any named own props the build recorded (e.g. a RegExp's
             // side-table entries) from the temp object to the instance.
@@ -1464,7 +1464,7 @@ impl<'p> Vm<'p> {
         {
             let tv = self.construct(cval, args)?;
             let tvi = tv.heap_index();
-            let cloned = self.heap.get(tvi).clone();
+            let cloned = self::copy_builtin_instance!(self.heap.get(tvi));
             self.heap.replace(oidx, cloned);
             if let Some(m) = self.fn_props.remove(&tvi) {
                 self.fn_props.insert(oidx, m);
@@ -1559,7 +1559,7 @@ impl<'p> Vm<'p> {
             // and clone it into the instance. Array is exotic (length) but a plain
             // Vec<Value> with no back-references, so the clone is safe.
             let tv = self.construct(cval, args)?;
-            let cloned = self.heap.get(tv.heap_index()).clone();
+            let cloned = self::copy_builtin_instance!(self.heap.get(tv.heap_index()));
             self.heap.replace(oidx, cloned);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
@@ -1652,7 +1652,7 @@ impl<'p> Vm<'p> {
         if is_temporal_ctor {
             let tv = self.construct(cval, args)?;
             let tvi = tv.heap_index();
-            let cloned = self.heap.get(tvi).clone();
+            let cloned = self::copy_builtin_instance!(self.heap.get(tvi));
             self.heap.replace(oidx, cloned);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
@@ -1663,5 +1663,66 @@ impl<'p> Vm<'p> {
             return Ok(true);
         }
         Ok(false)
+    }
+}
+
+/// Copy only the representations produced by intrinsic subclass constructors.
+/// Calling HeapObj::clone here retained cloning machinery for every VM payload,
+/// including suspended activations and compiler-owned class metadata.
+#[cfg(feature = "wasm-lite")]
+fn clone_builtin_instance(obj: &HeapObj) -> HeapObj {
+    match obj {
+        HeapObj::Array(values) => HeapObj::Array(values.clone()),
+        HeapObj::Func(func) => HeapObj::Func(*func),
+        HeapObj::Closure { func, upvalues, this_val } => HeapObj::Closure {
+            func: *func, upvalues: upvalues.clone(), this_val: *this_val,
+        },
+        HeapObj::Boxed { kind, value } => HeapObj::Boxed { kind: *kind, value: *value },
+        HeapObj::Date(value) => HeapObj::Date(*value),
+        HeapObj::RegExp { regex, source, flags, last_index, ascii_twin } => HeapObj::RegExp {
+            regex: regex.clone(), source: source.clone(), flags: flags.clone(),
+            last_index: *last_index, ascii_twin: ascii_twin.clone(),
+        },
+        HeapObj::TypedArray { buffer, kind, byte_offset, length } => HeapObj::TypedArray {
+            buffer: *buffer, kind: *kind, byte_offset: *byte_offset, length: *length,
+        },
+        HeapObj::DataView { buffer, pristine_version, byte_offset, byte_length } => HeapObj::DataView {
+            buffer: *buffer, pristine_version: *pristine_version,
+            byte_offset: *byte_offset, byte_length: *byte_length,
+        },
+        _ => unreachable!("intrinsic subclass constructor returned an unexpected representation"),
+    }
+}
+
+// These macros leave the established full-profile expressions in place. Lite
+// specializes their representation set without changing full constructor paths.
+#[cfg(feature = "wasm-lite")]
+macro_rules! copy_builtin_instance {
+    ($obj:expr) => { clone_builtin_instance($obj) };
+}
+#[cfg(not(feature = "wasm-lite"))]
+macro_rules! copy_builtin_instance {
+    ($obj:expr) => { $obj.clone() };
+}
+use copy_builtin_instance;
+
+#[cfg(feature = "wasm-lite")]
+macro_rules! subclass_prototype {
+    ($vm:expr, $ctor:expr) => { intrinsic_subclass_prototype(&$vm.heap, $ctor) };
+}
+#[cfg(not(feature = "wasm-lite"))]
+macro_rules! subclass_prototype {
+    ($vm:expr, $ctor:expr) => { $vm.prototype_of($ctor) };
+}
+use subclass_prototype;
+
+/// User functions may share an intrinsic prototype but return arbitrary objects.
+/// They must use ordinary construction, preserving return identity and new.target.
+#[cfg(feature = "wasm-lite")]
+fn intrinsic_subclass_prototype(heap: &crate::heap::Heap, ctor: Value) -> Option<Value> {
+    if !ctor.is_heap() { return None; }
+    match heap.get(ctor.heap_index()) {
+        HeapObj::Object(m) if m.is_ctor => m.get("prototype"),
+        _ => None,
     }
 }

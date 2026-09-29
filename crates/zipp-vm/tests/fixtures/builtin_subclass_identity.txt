@@ -1,0 +1,9 @@
+user:Array:true:1:true:42
+user:Boolean:true:1:true:42
+user:Number:true:1:true:42
+user:String:true:1:true:42
+user:Date:true:1:true:42
+user:RegExp:true:1:true:42
+user:Map:true:1:true:42
+user:Set:true:1:true:42
+user:Promise:true:1:true:42

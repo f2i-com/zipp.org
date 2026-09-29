@@ -55,6 +55,7 @@ const CHECKS = [
   ["profile-matches-readme.cjs"],
   ["lite.cjs"],
   ["module-loader-contract.cjs"],
+  ["builtin-subclass-payloads.cjs"],
   ["sort-semantics.cjs"],
   ["integer-string-format.cjs"],
   ["json-object-storage.cjs"],

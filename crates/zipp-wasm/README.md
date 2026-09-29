@@ -79,7 +79,7 @@ These are deterministic core-language defaults, not locale-aware formatting.
 execution speed for size. Use `--release --features lite` for the same feature
 set with throughput-oriented optimization. Standard builds keep `--release`.
 
-See [the latest size audit](../../docs/validation/2026-09-29-engine-size-round7.md)
+See [the latest size audit](../../docs/validation/2026-09-30-engine-size-round8.md)
 for measured sizes, speed tradeoffs and the remaining gap to QuickJS. To test
 the built Lite package, generate a Node package with wasm-bindgen and run
 `tests/node/lite.cjs` using `pkg-redirect.cjs` / `ZIPP_PKG` (see the Node test README).
@@ -256,23 +256,24 @@ have identical import/export surfaces; the selected module retains the audited
 checks that the browser module is byte-identical to the tested Node module.
 
 Measured on 2026-09-30 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
-after the seventh size-reduction pass:
+after the eighth size-reduction pass (full variants retain the seventh pass's
+accepted packages):
 
 | Variant | Before post-processing, raw / Brotli | Selected, raw / Brotli |
 | --- | ---: | ---: |
-| Lite | 2,949,345 / 755,841 | 2,845,288 / 755,160 |
+| Lite | 2,940,728 / 754,792 | 2,836,723 / 754,122 |
 | JavaScript | 5,379,450 / 1,294,039 | 5,220,442 / 1,290,210 |
 | Python-base | 7,088,690 / 1,667,103 | 6,896,451 / 1,663,170 |
 | Python + Torch | 9,048,150 / 2,012,472 | 8,851,582 / 2,008,520 |
 
 These are module bytes, excluding JS glue; Brotli is the download size. See the
-[seventh size audit](../../docs/validation/2026-09-29-engine-size-round7.md)
+[eighth size audit](../../docs/validation/2026-09-30-engine-size-round8.md)
 for all variant deltas, performance measurements, validation and the QuickJS gap.
 
 Stronger optimization is not automatically better. Earlier `-O3` / `-Oz`
 measurements reduced raw size but increased Brotli size and slowed execution.
-The new Lite screen also rejected `-O2` and function merging for increasing
-Brotli size. Do not substitute stronger flags without measuring both sizes and
+Lite experiments also rejected `-O2` and function merging for larger compressed
+size or slower execution. Do not substitute stronger flags without measuring both sizes and
 runtime performance again.
 
 Full builds retain release `opt-level = 3`; only Lite uses `opt-level = "z"`.
