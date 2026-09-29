@@ -16,7 +16,7 @@ zipp-vm = { path = "../zipp-vm" }
 # loader, D3D12 from the system, Metal from the OS), so building needs no
 # system SDK and a machine without a driver simply reports no adapter.
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "dx12", "metal"] }
-pollster = "0.4"
+pollster = "1.0"
 # The bridge's request JSON (already the CLI's); `float_roundtrip` parses every
 # number to the exact f64 JavaScript printed.
 serde_json = { version = "1.0", features = ["float_roundtrip"] }

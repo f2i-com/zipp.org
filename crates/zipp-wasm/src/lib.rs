@@ -10,7 +10,10 @@
 //!
 //! - `__zippHostCall(kind, ...args)` — SYNCHRONOUS, strings in and one string
 //!   out. `db` and `localStorage` use it, because scripts call
-//!   `db.query(...)` mid-expression and cannot await.
+//!   `db.query(...)` mid-expression and cannot await. So does
+//!   `host.callSync(kind, ...args)`: application-defined operations answered
+//!   by the host's app bridge ([`Engine::set_app_bridge`]), each granted by
+//!   name as `app.<kind>`.
 //! - a queue drained by [`Engine::drainPendingHostCalls`] — ASYNCHRONOUS, for
 //!   `host.call(kind, args, cb)`, whose callback the host resolves later.
 //!
@@ -267,6 +270,9 @@ struct Bridges {
     /// host's own engine and runs them over views of the guest's typed
     /// arrays. See `accel` in the preamble and [`Engine::set_accel_bridge`].
     accel: Option<js_sys::Object>,
+    /// The application bridge: `call(kind, args)` answers `app.<kind>`
+    /// operations the host defines. See [`Engine::set_app_bridge`].
+    app: Option<js_sys::Object>,
     /// Exact synchronous operations this Engine was explicitly granted. A
     /// bridge handle and authority are deliberately separate: merely
     /// installing a host object must not expose all of its methods to a guest.
@@ -483,6 +489,27 @@ impl Engine {
     pub fn set_clipboard_bridge(&mut self, bridge: JsValue) -> Result<(), JsValue> {
         self.ensure_host_configuration_open()?;
         self.bridges.borrow_mut().clipboard = Some(require_bridge(bridge, "clipboard")?);
+        Ok(())
+    }
+
+    /// Install the object backing `host.callSync(kind, ...args)`: operations
+    /// the application defines, answered synchronously while the guest waits
+    /// (a Worker host may block on shared memory to serve them from the page).
+    /// Its `call(kind, args)` receives the kind without the `app.` prefix and
+    /// the arguments as an array of strings; whatever it returns reaches the
+    /// guest as JSON, like every other bridge reply, and a throw reaches it as
+    /// an opaque failure (return errors as data to pass them on).
+    ///
+    /// Installing the bridge grants nothing: each operation is granted by
+    /// name, `app.<kind>`, through `setSyncHostCapabilities`. Kinds are
+    /// lowercase dotted names (`app.fs.read`); the host adapter decides their
+    /// arguments, within the same argument-count and byte ceilings as every
+    /// synchronous call. Treat kinds and arguments as guest-controlled: never
+    /// turn a kind into a property name, a URL or a command.
+    #[wasm_bindgen(js_name = setAppBridge)]
+    pub fn set_app_bridge(&mut self, bridge: JsValue) -> Result<(), JsValue> {
+        self.ensure_host_configuration_open()?;
+        self.bridges.borrow_mut().app = Some(require_bridge(bridge, "app")?);
         Ok(())
     }
 
@@ -2221,7 +2248,25 @@ impl DrainWork {
 /// Service one synchronous `__zippHostCall`. Anything structured crosses as
 /// JSON; an `Err` becomes a JS throw the script can catch.
 fn is_allowed_sync_host_call(kind: &str) -> bool {
-    sync_host_call_arity(kind).is_some()
+    sync_host_call_arity(kind).is_some() || is_app_host_call(kind)
+}
+
+/// `app.<kind>`: a lowercase dotted name the host's app bridge defines —
+/// `app.fs.read`, `app.net.fetch`. Checked by shape before anything is looked
+/// up, so a planted `__proto__` or a whitespace variant never reaches a bridge.
+fn is_app_host_call(kind: &str) -> bool {
+    let Some(rest) = kind.strip_prefix("app.") else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    !bytes.is_empty()
+        && kind.len() <= MAX_SYNC_BRIDGE_KIND_BYTES
+        && bytes[0].is_ascii_lowercase()
+        && bytes[bytes.len() - 1] != b'.'
+        && !rest.contains("..")
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Exact wire arity for every synchronous operation. Guest code can call
@@ -2721,8 +2766,13 @@ fn host_dispatch(
     // directly instead of going through the preamble wrappers. Reject before
     // even selecting a bridge or looking up a property, otherwise a planted
     // getter/method outside the advertised API becomes ambient authority.
-    let Some(expected_arity) = sync_host_call_arity(kind) else {
-        return Err(format!("TypeError: unknown host call '{kind}'"));
+    let app_call = is_app_host_call(kind);
+    let expected_arity = match sync_host_call_arity(kind) {
+        Some(arity) => Some(arity),
+        // The app bridge decides its own arguments; the envelope ceilings
+        // below still bound them.
+        None if app_call => None,
+        None => return Err(format!("TypeError: unknown host call '{kind}'")),
     };
     // A host bridge invocation is one VM instruction even when the strings it
     // passes cause megabytes of JSON parsing or allocation on the host side.
@@ -2742,10 +2792,12 @@ fn host_dispatch(
             "RangeError: host bridge arguments exceed the {MAX_SYNC_BRIDGE_BYTES}-byte limit"
         ));
     }
-    if args.len() != expected_arity {
-        return Err(format!(
-            "TypeError: host bridge call '{kind}' requires exactly {expected_arity} arguments"
-        ));
+    if let Some(expected_arity) = expected_arity {
+        if args.len() != expected_arity {
+            return Err(format!(
+                "TypeError: host bridge call '{kind}' requires exactly {expected_arity} arguments"
+            ));
+        }
     }
 
     // Clone the handle out before calling: the bridge method runs arbitrary JS,
@@ -2762,6 +2814,7 @@ fn host_dispatch(
             // object rather than requiring a second bespoke nav-shaped API.
             Some(("nav", "clipboardWrite")) => (bridges.clipboard.clone(), "writeText"),
             Some(("nav", "clipboardRead")) => (bridges.clipboard.clone(), "readText"),
+            Some(("app", _)) if app_call => (bridges.app.clone(), "call"),
             _ => return Err(format!("TypeError: unknown host call '{kind}'")),
         }
     };
@@ -2785,6 +2838,13 @@ fn host_dispatch(
 
     // Per-kind argument shapes: which arguments are JSON and which are plain.
     let call = match kind {
+        _ if app_call => {
+            let list = js_sys::Array::new();
+            for arg in args {
+                list.push(&JsValue::from_str(arg));
+            }
+            f.call2(&target, &JsValue::from_str(&kind["app.".len()..]), &list)
+        }
         "db.query" | "db.create" | "db.update" => f.call2(
             &target,
             &JsValue::from_str(&args[0]),
@@ -3595,7 +3655,24 @@ mod tests {
             assert_eq!(sync_host_call_arity(kind), Some(arity), "wrong arity");
         }
 
+        for kind in ["app.fs.read", "app.net.fetch", "app.x", "app.v2.do_thing", "app.a-b"] {
+            assert!(is_allowed_sync_host_call(kind), "app kind rejected: {kind}");
+            assert_eq!(sync_host_call_arity(kind), None, "app kinds have no fixed arity");
+        }
+
         for kind in [
+            "app.",
+            "app",
+            "app.Fs.read",
+            "app.fs read",
+            "app.__proto__",
+            "app.fs..read",
+            "app.fs.",
+            "app.1fs",
+            "app.fs/read",
+            "APP.fs",
+            "app.x\u{0}",
+            &format!("app.{}", "a".repeat(64)),
             "db.secret",
             "db.__proto__",
             "db.query.extra",
@@ -3632,6 +3709,25 @@ mod tests {
         let wrong_arity = vec!["collection".into()];
         let err = host_dispatch(&bridges, "db.query", &wrong_arity).unwrap_err();
         assert!(err.contains("requires exactly 2 arguments"), "got {err:?}");
+    }
+
+    #[test]
+    fn app_host_calls_are_bounded_and_need_their_own_grant() {
+        let mut configured = Bridges::default();
+        configured.allowed_sync_operations.insert("app.fs.read".into());
+        let bridges = Rc::new(RefCell::new(configured));
+        // Any argument count within the envelope; the ceilings still hold.
+        let too_many = vec![String::new(); MAX_SYNC_BRIDGE_ARGS + 1];
+        let err = host_dispatch(&bridges, "app.fs.read", &too_many).unwrap_err();
+        assert!(err.contains("argument limit"), "got {err:?}");
+        // A granted kind with no bridge installed is refused, not a panic.
+        let err = host_dispatch(&bridges, "app.fs.read", &["a".into()]).unwrap_err();
+        assert_eq!(err, "Error: authorized host bridge is unavailable");
+        // Another app kind is not covered by that grant.
+        let err = host_dispatch(&bridges, "app.fs.write", &["a".into()]).unwrap_err();
+        assert_eq!(err, "SecurityError: synchronous host capability denied");
+        let err = host_dispatch(&bridges, "app.Fs", &[]).unwrap_err();
+        assert!(err.contains("unknown host call"), "got {err:?}");
     }
 
     #[test]

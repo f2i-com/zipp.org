@@ -28,6 +28,7 @@ const pkgWasm = path.join(here, "pkg", "zipp_wasm_bg.wasm");
 const CHECKS = [
   ["check-wasm-memory.cjs", [pkgWasm]],
   ["host-contract.cjs"],
+  ["app-bridge.cjs"],
   ["buffer-ceiling.cjs"],
   ["budget-and-seed.cjs"],
   ["large-alloc-gc.cjs"],
