@@ -1,0 +1,139 @@
+{
+  "baseline_commit": "40453bf5",
+  "baseline_raw": 2916044,
+  "baseline_brotli11": 772481,
+  "baseline_sha256": "fe4b7635c481e8f2fa97420fc1c903fa4376de12646ebd2e2e6ae7b0c009a3e5",
+  "toolchain": {
+    "rust": "1.92.0",
+    "wasm_bindgen": "0.2.126",
+    "binaryen": 125
+  },
+  "candidates": [
+    {
+      "path": "target/size-audit/lite-round5/inline-web/stripped.wasm",
+      "bytes": 2891378,
+      "sha256": "bf5f0d7dce00848928b249468377cb5726b6f44c1026c9ed0aab8c4a6772410b",
+      "gzip9": 1023594,
+      "brotli11": 778588,
+      "sections": [
+        {
+          "name": "type",
+          "bytes": 1828
+        },
+        {
+          "name": "import",
+          "bytes": 2779
+        },
+        {
+          "name": "function",
+          "bytes": 6599
+        },
+        {
+          "name": "table",
+          "bytes": 13
+        },
+        {
+          "name": "memory",
+          "bytes": 9
+        },
+        {
+          "name": "global",
+          "bytes": 27
+        },
+        {
+          "name": "export",
+          "bytes": 1264
+        },
+        {
+          "name": "element",
+          "bytes": 853
+        },
+        {
+          "name": "data_count",
+          "bytes": 4
+        },
+        {
+          "name": "code",
+          "bytes": 2338628
+        },
+        {
+          "name": "data",
+          "bytes": 539366
+        }
+      ]
+    },
+    {
+      "path": "target/size-audit/lite-round5/final-web/stripped.wasm",
+      "bytes": 2891491,
+      "sha256": "0d8c6ecc219738844e4d2a23e929fed2927cc18fd55160474fdf5077aa3860d5",
+      "gzip9": 1023534,
+      "brotli11": 778196,
+      "sections": [
+        {
+          "name": "type",
+          "bytes": 1828
+        },
+        {
+          "name": "import",
+          "bytes": 2779
+        },
+        {
+          "name": "function",
+          "bytes": 6601
+        },
+        {
+          "name": "table",
+          "bytes": 13
+        },
+        {
+          "name": "memory",
+          "bytes": 9
+        },
+        {
+          "name": "global",
+          "bytes": 27
+        },
+        {
+          "name": "export",
+          "bytes": 1264
+        },
+        {
+          "name": "element",
+          "bytes": 853
+        },
+        {
+          "name": "data_count",
+          "bytes": 4
+        },
+        {
+          "name": "code",
+          "bytes": 2338731
+        },
+        {
+          "name": "data",
+          "bytes": 539374
+        }
+      ]
+    }
+  ],
+  "change": "Lite WASM Thrown(String) replaced by Thrown(Box<str>); owned-message boundaries preserve content using Into conversions. Second candidate outlines formatted-message conversion behind Thrown::from_string.",
+  "wasm_layout_bytes": {
+    "String": 12,
+    "Box_str": 8,
+    "Result_u64_String": 16,
+    "Result_u64_Box_str": 16,
+    "Result_u32_String": 12,
+    "Result_u32_Box_str": 8,
+    "Result_unit_String": 12,
+    "Result_unit_Box_str": 8
+  },
+  "decision": "rejected: both candidates increase Brotli download size",
+  "checks": {
+    "lite_compilation": "passed",
+    "native_python_compilation": "passed",
+    "import_and_memory_audits": "passed for both",
+    "exception_performance": "not run after size rejection",
+    "general_performance": "not run after size rejection"
+  },
+  "source_restored": true
+}
