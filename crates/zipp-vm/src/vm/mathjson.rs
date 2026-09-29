@@ -2236,6 +2236,9 @@ impl<'p> Vm<'p> {
         json_check_parse_depth(depth)?;
         let b = src;
         *i += 1; // '{'
+        #[cfg(feature = "wasm-lite")]
+        let mut pairs = JsonObjectPairs::default();
+        #[cfg(not(feature = "wasm-lite"))]
         let mut pairs: Vec<(String, Value)> = Vec::new();
         json_skip_ws(b, i);
         if b.get(*i) != Some(&b'}') {
@@ -2286,15 +2289,16 @@ impl<'p> Vm<'p> {
             }
         }
         *i += 1; // '}'
-                 // `set_owned`, not `set(&k, …)`: the parser already allocated each key
-                 // (`to_lossy_string` above), and `set` cloned a SECOND copy on first
-                 // insertion only to drop the first. `with_capacity` then sizes the three
-                 // parallel vectors once instead of growing them log n times — `pairs.len()`
-                 // is exact for a duplicate-free object and a harmless over-reserve otherwise.
-        let mut map = crate::heap::ObjMap::with_capacity(pairs.len());
-        for (k, v) in pairs {
-            map.set_owned(k, v);
-        }
+        #[cfg(feature = "wasm-lite")]
+        let map = pairs.into_map();
+        #[cfg(not(feature = "wasm-lite"))]
+        let map = {
+            let mut map = crate::heap::ObjMap::with_capacity(pairs.len());
+            for (key, value) in pairs {
+                map.set_owned(key, value);
+            }
+            map
+        };
         Ok(self.alloc_object_current_realm(map))
     }
 
@@ -2579,6 +2583,9 @@ impl<'p> Vm<'p> {
         json_check_parse_depth(depth)?;
         let b = src;
         *i += 1; // '{'
+        #[cfg(feature = "wasm-lite")]
+        let mut pairs = JsonObjectPairs::default();
+        #[cfg(not(feature = "wasm-lite"))]
         let mut pairs: Vec<(String, Value)> = Vec::new();
         // Source correspondence is queried by property name during the
         // reviver walk. A Vec both made duplicate replacement and every later
@@ -2642,16 +2649,57 @@ impl<'p> Vm<'p> {
             }
         }
         *i += 1; // '}'
-                 // As in `json_parse_object`. The `key.clone()` above stays: this variant
-                 // maintains a PARALLEL source tree that needs the key too, so one of the two
-                 // must own a copy. `set_owned` still removes the third allocation — the one
-                 // `set` made inside the map.
-        let mut map = crate::heap::ObjMap::with_capacity(pairs.len());
-        for (k, v) in pairs {
-            map.set_owned(k, v);
-        }
+        #[cfg(feature = "wasm-lite")]
+        let map = pairs.into_map();
+        #[cfg(not(feature = "wasm-lite"))]
+        let map = {
+            let mut map = crate::heap::ObjMap::with_capacity(pairs.len());
+            for (key, value) in pairs {
+                map.set_owned(key, value);
+            }
+            map
+        };
         let ov = self.alloc_object_current_realm(map);
         Ok((ov, JsonSrc::Obj(srcs, ov)))
+    }
+}
+
+/// Keep small objects' temporary entries on the parser stack. The final map
+/// still reserves the exact member count (including duplicates), so retained
+/// capacity, key replacement and insertion order keep their existing behavior.
+/// Larger objects spill only their remaining entries to the usual Vec.
+/// Keep this specialization in the size-optimized Lite profile. Full builds
+/// retain their Vec path following the full-profile throughput comparison.
+#[cfg(feature = "wasm-lite")]
+#[derive(Default)]
+struct JsonObjectPairs {
+    inline: [Option<(String, Value)>; 4],
+    len: usize,
+    overflow: Vec<(String, Value)>,
+}
+
+#[cfg(feature = "wasm-lite")]
+impl JsonObjectPairs {
+    fn push(&mut self, pair: (String, Value)) {
+        if self.len < self.inline.len() {
+            self.inline[self.len] = Some(pair);
+        } else {
+            self.overflow.push(pair);
+        }
+        self.len += 1;
+    }
+
+    fn into_map(self) -> crate::heap::ObjMap {
+        let mut map = crate::heap::ObjMap::with_capacity(self.len);
+        for pair in self.inline {
+            if let Some((key, value)) = pair {
+                map.set_owned(key, value);
+            }
+        }
+        for (key, value) in self.overflow {
+            map.set_owned(key, value);
+        }
+        map
     }
 }
 

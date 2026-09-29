@@ -100,6 +100,9 @@ mod lexical_tests {
     }
 }
 
+// The standalone WASM host cannot reach filesystem or deferred-module loading.
+// Keep these helpers available to native embedders and direct loader tests.
+#[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 impl<'p> Vm<'p> {
     pub(crate) fn resolve_module_path(
         &self,

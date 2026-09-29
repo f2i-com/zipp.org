@@ -43,6 +43,22 @@ fn settled_trampoline_child() {
     // node v24.12.0: the initial call must yield, and an older queued reaction
     // must run before the await placed behind it.
     assert_eq!(out, ["start,after-call,a,queued,b,caught:x,end|3002"]);
+    let identity = run_ok(
+        r#"
+        var holder = async function retained() {
+          for (var i = 0; i < 3000; i++) {
+            await i;
+            if (retained.tag !== 17) throw new Error("callee identity changed");
+          }
+          return retained.tag;
+        };
+        holder.tag = 17;
+        var result = holder();
+        holder = function () {};
+        result.then(function (v) { console.log("callee:" + v); });
+        "#,
+    );
+    assert_eq!(identity, ["callee:17"]);
     let hits = zipp_vm::async_inline_await_stats();
     if std::env::var_os("ZIPP_NO_ASYNC_SETTLED_TRAMPOLINE").is_some() {
         assert_eq!(hits, 0, "off switch must restore one job per await");

@@ -26,6 +26,16 @@ try {
       try { new Int32Array([2, 1])[method](() => ({ valueOf() { throw marker; } })); }
       catch (e) { caught = e === marker; }
       check(caught, method + ' abrupt coercion');
+      for (const C of [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array,
+                       Uint16Array, Int32Array, Uint32Array, Float16Array,
+                       Float32Array, Float64Array]) {
+        check(Array.from(new C([12, 2, 0, 4])[method]()).join(',') === '0,2,4,12', method + ' ' + C.name);
+      }
+      // Exercise both immediate and heap BigInts in the unchanged fallback.
+      for (const C of [BigInt64Array, BigUint64Array]) {
+        const big = new C([4611686018427387904n, 4n, 2305843009213693952n, 0n])[method]();
+        check(Array.from(big, String).join(',') === '0,4,2305843009213693952,4611686018427387904', method + ' BigInt fallback');
+      }
     }
     const log = [];
     function dec(value, context) { log.push(context.name); }

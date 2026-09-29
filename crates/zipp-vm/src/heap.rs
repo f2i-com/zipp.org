@@ -3821,6 +3821,8 @@ impl DecState {
 pub struct AsyncStateData {
     pub func: u32,
     pub closure: u32,
+    /// The creating function, traced with this activation and reused on resume.
+    pub callee: Value,
     pub state: GenState,
     pub regs: Vec<Value>,
     pub result: u32,

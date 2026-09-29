@@ -153,7 +153,7 @@ pub(super) fn builtin_stats_count(_vm: &Vm<'_>, _recv: Value, _name: &str) {}
 /// fat-LTO layout confound, the thing B77 was reverted for), and so any
 /// behaviour question can be bisected against the old path without a rebuild.
 #[inline]
-fn promise_pristine_enabled() -> bool {
+pub(super) fn promise_pristine_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
@@ -210,6 +210,23 @@ impl<'p> Vm<'p> {
             // Default TypedArray sort: ascending with -0 before +0
             // (total_cmp) and ALL NaNs last regardless of their sign bit.
             snap.sort_by(|a, b| {
+                // Number TypedArrays already contain numeric primitives. In
+                // the size-oriented embedder, avoid two out-of-line general
+                // coercions per comparison. BigInt retains the existing path.
+                #[cfg(feature = "wasm-no-fs-loader")]
+                let (x, y) = (
+                    if a.is_number() {
+                        a.as_f64()
+                    } else {
+                        self.value_num(*a)
+                    },
+                    if b.is_number() {
+                        b.as_f64()
+                    } else {
+                        self.value_num(*b)
+                    },
+                );
+                #[cfg(not(feature = "wasm-no-fs-loader"))]
                 let (x, y) = (self.value_num(*a), self.value_num(*b));
                 match (x.is_nan(), y.is_nan()) {
                     (true, true) => std::cmp::Ordering::Equal,
@@ -1354,6 +1371,16 @@ impl<'p> Vm<'p> {
                 // result must then be what gets called: falling through to the
                 // caller's own `get_prop` would run the getter a second time
                 // (observable; `tests/promise_pristine_dispatch.rs` counts it).
+                // This proof covers both the method lookup and the default
+                // species constructor. Reuse it through handler registration;
+                // no guest code or mutation can run between these steps.
+                // Let the existing path fill a cold cache: overridden methods
+                // must not pay for a fresh failed species proof on every call.
+                if name == "then" && self.promise_inline_plain(idx) {
+                    let on_f = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    let on_r = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                    return Ok(Some(self.perform_plain_promise_then(idx, on_f, on_r)));
+                }
                 let mut resolved: Option<Value> = None;
                 let is_intrinsic = if let Some(want) = native::promise_proto_method_id(name) {
                     self.promise_method_is_intrinsic(idx, name, want) || {
@@ -3067,6 +3094,9 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.perform_promise_then(idx, a0, on_r)?))
             }
             "catch" => {
+                if self.promise_inline_plain(idx) {
+                    return Ok(Some(self.perform_plain_promise_then(idx, Value::UNDEFINED, a0)));
+                }
                 // Spec: Promise.prototype.catch(onRejected) is exactly
                 // Invoke(this, "then", «undefined, onRejected») — it must observably
                 // go through the receiver's own `then`, so an overridden `then` is

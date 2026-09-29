@@ -47,7 +47,7 @@ pub(crate) const SMALL_CONCAT_FLAT_UNITS: usize = 256;
 pub(crate) fn fmt_i32_buf(n: i32) -> ([u8; 12], usize) {
     let mut buf = [0u8; 12];
     let mut i = buf.len();
-    let mut m = (n as i64).unsigned_abs(); // i64: |i32::MIN| representable
+    let mut m = n.unsigned_abs(); // u32 also represents |i32::MIN|.
     loop {
         i -= 1;
         buf[i] = b'0' + (m % 10) as u8;
@@ -4744,5 +4744,33 @@ mod cmp_i128_f64_tests {
         // Magnitudes beyond 2^127 saturate the comparison.
         assert_eq!(cmp_i128_f64(i128::MAX, 1e40), Some(Less));
         assert_eq!(cmp_i128_f64(i128::MIN, -1e40), Some(Greater));
+    }
+}
+
+#[cfg(test)]
+mod integer_ascii_format_tests {
+    use super::fmt_i32_buf;
+
+    #[test]
+    fn decimal_buffer_matches_standard_format_at_boundaries_and_across_i32() {
+        let check = |n: i32| {
+            let (bytes, start) = fmt_i32_buf(n);
+            assert_eq!(&bytes[start..], n.to_string().as_bytes(), "{n}");
+        };
+        for n in -10_000..=10_000 { check(n); }
+        for n in [i32::MIN, i32::MIN + 1, i32::MAX - 1, i32::MAX] { check(n); }
+        let mut power = 10_i64;
+        while power <= 1_000_000_000 {
+            for delta in -1..=1 {
+                check((power + delta) as i32);
+                check((-power + delta) as i32);
+            }
+            power *= 10;
+        }
+        let mut sample = 0_u32;
+        for _ in 0..4096 {
+            sample = sample.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            check(sample as i32);
+        }
     }
 }

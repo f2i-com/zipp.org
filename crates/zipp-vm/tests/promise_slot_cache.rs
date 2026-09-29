@@ -290,6 +290,47 @@ fn cache_parity_restoring_the_intrinsic_then_is_seen_immediately() {
 }
 
 #[test]
+fn cache_parity_then_slot_survives_only_unchanged_layouts() {
+    let out = run_ok(
+        r#"
+        var proto = Promise.prototype;
+        var descriptor = Object.getOwnPropertyDescriptor(proto, "then");
+        var p = Promise.resolve(1);
+        for (var i = 0; i < 100; i++) p.then(function (v) { return v; });
+        delete proto.then;
+        proto.padding = function () { return "wrong-slot"; };
+        proto.then = function () { return "reinserted"; };
+        console.log(p.then());
+        Object.defineProperty(proto, "then", descriptor);
+        p.then(function (v) { console.log("restored:" + v); });
+        var reads = 0;
+        Object.defineProperty(proto, "then", {
+          configurable: true,
+          get: function () { reads++; return function () { return "accessor"; }; }
+        });
+        console.log(p.then() + "/" + reads);
+        Object.defineProperty(proto, "then", descriptor);
+        p.then = function () { return "own"; };
+        console.log(p.then());
+        delete p.then;
+        p.then(function (v) { console.log("unshadowed:" + v); });
+        delete proto.padding;
+        "#,
+    );
+    assert_eq!(out, ["reinserted", "accessor/1", "own", "restored:1", "unshadowed:1"]);
+}
+
+#[test]
+fn cache_parity_catch_finally_fallbacks_and_settlement() {
+    let out = run_ok(include_str!("fixtures/promise_method_fallbacks.js"));
+    assert_eq!(out, [
+        "catch:99:then,args:undefined:7",
+        "finally:99:constructor,species,then,args:7:7",
+        "inherited:true", "null:7", "fulfilled:5", "rejected:reason",
+    ]);
+}
+
+#[test]
 fn the_off_switch_selects_the_old_proof_with_identical_behavior() {
     // The env latch is read once per process, so the off mode needs its own
     // process: re-run every `cache_parity_*` expectation in a child with

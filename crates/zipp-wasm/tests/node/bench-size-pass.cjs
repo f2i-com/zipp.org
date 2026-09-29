@@ -90,6 +90,22 @@ if (modules.every(m => JSON.parse(m.zippProfile()).languages.includes('python'))
       finally { e.dispose(); e.free(); }
     }));
   }
+  const pythonCases = [
+    {name:'python-arithmetic-e2e', arg:50000, expected:1249975000, source:'def w(n):\n    total = 0\n    for i in range(n):\n        total += i\n    return total\n'},
+    {name:'python-list-e2e', arg:12000, expected:23999, source:'def w(n):\n    xs = []\n    for i in range(n):\n        xs.append(i)\n    return xs[0] + xs[-1] + len(xs)\n'},
+    {name:'python-dictionary-e2e', arg:4000, expected:7998000, source:'def w(n):\n    d = {}\n    for i in range(n):\n        d[str(i)] = i\n    total = 0\n    for i in range(n):\n        total += d[str(i)]\n    return total\n'},
+  ];
+  for (const w of pythonCases.filter(w => !onlyCase || w.name === onlyCase)) {
+    // The Python frontend deliberately disallows callFunction. Measure the
+    // supported complete init/compile/execute/dispose lifecycle instead.
+    measure(w.name, modules.map(m => () => {
+      const e = new m.Engine();
+      try {
+        e.initSource(w.source + `print(w(${w.arg}))\n`, 'python');
+        assert.deepEqual(e.takeOutput(), [String(w.expected)], w.name);
+      } finally { e.dispose(); e.free(); }
+    }));
+  }
 }
 if (onlyCase && !results.cases[onlyCase]) throw Error(`Unknown or unavailable case: ${onlyCase}`);
 const ratios = WORKLOADS.filter(w => results.cases[w.name]).map(w => results.cases[w.name].ratio);

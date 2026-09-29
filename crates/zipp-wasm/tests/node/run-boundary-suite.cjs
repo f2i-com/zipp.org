@@ -54,7 +54,12 @@ const CHECKS = [
   ["resource-usage.cjs"],
   ["profile-matches-readme.cjs"],
   ["lite.cjs"],
+  ["module-loader-contract.cjs"],
   ["sort-semantics.cjs"],
+  ["integer-string-format.cjs"],
+  ["json-object-storage.cjs"],
+  ["internal-error-storage.cjs"],
+  ["promise-method-cache.cjs"],
   ["syntax-corpus.cjs"],
   // The experimental Python frontend's boundary contract; adapts to the
   // artifact's `languages`, so the JavaScript-only build proves the refusal.

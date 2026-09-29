@@ -8,6 +8,14 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+const ERROR_MESSAGE_ATTR: PropAttr = PropAttr {
+    writable: true,
+    enumerable: false,
+    configurable: true,
+    accessor: false,
+    setter: Value::UNDEFINED,
+};
+
 /// Everything the RegExp constructor reads out of `pattern` BEFORE RegExpAlloc.
 /// See [`Vm::regexp_pattern_snapshot`].
 pub(crate) struct RegExpPre {
@@ -1076,6 +1084,10 @@ impl<'p> Vm<'p> {
             return Ok(false);
         }
         let idx = obj.heap_index();
+        // The standalone WASM embedder cannot create deferred namespaces.
+        // Keep this direct trigger under the same gate as defer_check; one
+        // surviving call otherwise retains the entire filesystem loader.
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         if !self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx) {
             let ks = self.key_of(key);
             if Self::defer_key_triggers(&ks) {
@@ -1477,8 +1489,7 @@ impl<'p> Vm<'p> {
             },
             None => (0, raw.to_string()),
         };
-        let msg_v = self.alloc_str(message);
-        self.make_error(kind, Some(msg_v))
+        self.make_internal_error(kind, message)
     }
 
     /// Allocate a proto-linked error instance of the given kind (0=Error … 7=
@@ -1505,12 +1516,27 @@ impl<'p> Vm<'p> {
             }
             None => (0u8, msg.to_string()),
         };
-        let m = self.alloc_str(text);
-        self.make_error(kind, Some(m))
+        self.make_internal_error(kind, text)
+    }
+
+    /// Internal throws already own their message text. Lite reserves its single
+    /// property exactly and avoids coercing the freshly allocated string again.
+    #[cfg_attr(not(feature = "wasm-lite"), inline(always))]
+    fn make_internal_error(&mut self, kind: u8, message: String) -> Value {
+        let message = self.alloc_str(message);
+        // The exact-capacity path benefits Lite. Full profiles retain their
+        // previous allocation path after repeated error-throughput regressions.
+        #[cfg(not(feature = "wasm-lite"))]
+        return self.make_error(kind, Some(message));
+        #[cfg(feature = "wasm-lite")]
+        {
+            let mut map = ObjMap::with_capacity(1);
+            map.define("message", message, ERROR_MESSAGE_ATTR);
+            self.alloc_error_map(kind, map)
+        }
     }
 
     pub(crate) fn make_error(&mut self, kind: u8, msg: Option<Value>) -> Value {
-        let k = (kind as usize).min(7);
         let msg_idx = match msg {
             Some(m) if m != Value::UNDEFINED => Some(self.to_str_idx(m)),
             _ => None,
@@ -1520,17 +1546,16 @@ impl<'p> Vm<'p> {
         // prototype, so `Error.prototype.name = …` and a newTarget prototype's
         // `name` are what `e.name` / `String(e)` see. The kind lives in the
         // prototype link and [[ErrorData]] (`error_data`).
-        let attr = PropAttr {
-            writable: true,
-            enumerable: false,
-            configurable: true,
-            accessor: false,
-            setter: Value::UNDEFINED,
-        };
         let mut map = ObjMap::new();
         if let Some(mi) = msg_idx {
-            map.define("message", Value::heap(mi), attr);
+            map.define("message", Value::heap(mi), ERROR_MESSAGE_ATTR);
         }
+        self.alloc_error_map(kind, map)
+    }
+
+    #[inline(always)]
+    fn alloc_error_map(&mut self, kind: u8, map: ObjMap) -> Value {
+        let k = (kind as usize).min(7);
         let obj = self.heap.alloc(HeapObj::Object(Box::new(map)));
         let p = self.error_protos[k];
         if p != 0 {

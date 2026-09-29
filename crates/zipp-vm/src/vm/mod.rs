@@ -2159,7 +2159,7 @@ pub struct Vm<'p> {
     /// flight (set by the call site just before alloc_generator /
     /// alloc_async / alloc_async_generator; consumed at their entry).
     pending_gen_callee: Value,
-    /// Generator / AsyncGenerator / AsyncState heap index → the function
+    /// Generator / AsyncGenerator heap index → the function
     /// value that created it. Resumes bind it as Frame.callee so LoadCallee
     /// (a named function expression's self-name) keeps the caller-visible
     /// identity across suspensions. Values are GC roots; keys pruned on sweep.

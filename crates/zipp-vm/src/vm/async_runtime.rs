@@ -1600,6 +1600,35 @@ impl<'p> Vm<'p> {
         dep
     }
 
+    /// A warm proof for skipping unobservable method/species lookups. Be
+    /// conservative once another realm exists, and require an own species
+    /// getter: an absent own property could expose an inherited accessor.
+    #[cfg_attr(feature = "wasm-lite", inline)]
+    #[cfg_attr(not(feature = "wasm-lite"), inline(always))]
+    pub(crate) fn promise_inline_plain(&mut self, idx: u32) -> bool {
+        super::builtins::promise_pristine_enabled()
+            && self.promise_pristine_slots.is_some()
+            && self.realm_global_objs.is_empty()
+            && self.active_realm.is_none()
+            && self.promise_plain_unobservable(idx)
+            && self.promise_pristine_slots.is_some_and(|c| c.species.is_some())
+    }
+
+    /// Register handlers after `promise_plain_unobservable` has proved the
+    /// default species. Keep proof and registration adjacent: no guest code
+    /// may execute between them. Callable checks do not invoke proxy traps.
+    #[inline(always)]
+    pub(crate) fn perform_plain_promise_then(
+        &mut self,
+        idx: u32,
+        on_f: Value,
+        on_r: Value,
+    ) -> Value {
+        let on_f = if self.is_callable(on_f) { on_f } else { Value::UNDEFINED };
+        let on_r = if self.is_callable(on_r) { on_r } else { Value::UNDEFINED };
+        Value::heap(self.then_internal(idx, on_f, on_r, None))
+    }
+
     /// `Promise.prototype.{then,catch}` PerformPromiseThen with SpeciesConstructor.
     /// C = SpeciesConstructor(promise, %Promise%) — a throwing/poisoned/non-object
     /// `constructor` or a throwing `@@species` propagates here (before any reaction
@@ -1622,18 +1651,7 @@ impl<'p> Vm<'p> {
         // getter call and build the plain native dependent directly
         // (tick-identical to the generic path below).
         if self.promise_plain_unobservable(idx) {
-            let on_f = if self.is_callable(on_f) {
-                on_f
-            } else {
-                Value::UNDEFINED
-            };
-            let on_r = if self.is_callable(on_r) {
-                on_r
-            } else {
-                Value::UNDEFINED
-            };
-            let dep = self.then_internal(idx, on_f, on_r, None);
-            return Ok(Value::heap(dep));
+            return Ok(self.perform_plain_promise_then(idx, on_f, on_r));
         }
         let c = self.promise_species_constructor(Value::heap(idx))?;
         // PerformPromiseThen steps 3-4: a NON-CALLABLE handler is Identity /
@@ -1729,7 +1747,8 @@ impl<'p> Vm<'p> {
                 "TypeError: Promise.prototype.finally called on a non-object",
             ));
         }
-        let ctor = self.promise_species_constructor(this)?;
+        let plain = self.promise_inline_plain(this.heap_index());
+        let ctor = if plain { self.promise_ctor_value() } else { self.promise_species_constructor(this)? };
         let (then_finally, catch_finally) = if !self.is_callable(on_finally) {
             (on_finally, on_finally)
         } else {
@@ -1749,6 +1768,11 @@ impl<'p> Vm<'p> {
         };
         // Hold the un-rooted wrapper Values across the `then` getter / invocation.
         let _gc = self.gc_lock_guard();
+        if plain {
+            // Wrapper allocation cannot execute guest code, so the entry proof
+            // still holds. The wrappers themselves re-check later effects.
+            return Ok(self.perform_plain_promise_then(this.heap_index(), then_finally, catch_finally));
+        }
         let then = self.get_prop(this, "then")?;
         self.call_value(then, this, &[then_finally, catch_finally])
     }
@@ -1826,6 +1850,7 @@ impl<'p> Vm<'p> {
             .alloc(HeapObj::AsyncState(Box::new(AsyncStateData {
                 func: func_id,
                 closure,
+                callee: gen_callee,
                 // `usize::MAX` = not-yet-started — distinct from a genuine yield/await
                 // parked at ip 0 (which previously collided with this sentinel and made
                 // the resume re-run from the top).
@@ -1837,10 +1862,6 @@ impl<'p> Vm<'p> {
         // GC roots suspended activations from this registry instead of scanning
         // the whole heap every collection; see `Vm::async_activations`.
         self.async_activations.push(idx);
-        if gen_callee != Value::UNDEFINED {
-            // Every drive/resume binds this as Frame.callee (LoadCallee identity).
-            self.gen_callee.insert(idx, gen_callee);
-        }
         if args_obj != u32::MAX {
             // Mapped arguments: every drive re-links the [[ParameterMap]] to
             // the freshly spliced window.
@@ -3361,8 +3382,8 @@ impl<'p> Vm<'p> {
     }
 
     fn drive_async_inner(&mut self, idx: u32, input: Resume, allow_trampoline: bool) {
-        let (state, fid, closure, result) = match self.heap.get(idx) {
-            HeapObj::AsyncState(a) => (a.state, a.func, a.closure, a.result),
+        let (state, fid, closure, result, callee) = match self.heap.get(idx) {
+            HeapObj::AsyncState(a) => (a.state, a.func, a.closure, a.result, a.callee),
             _ => return,
         };
         let mut resume_ip = match state {
@@ -3404,6 +3425,8 @@ impl<'p> Vm<'p> {
         } else {
             0
         };
+        // The activation owns and traces its immutable callee. Reuse the
+        // captured identity for every resumed frame, without a side-table lookup.
         let outcome = loop {
             self.frames.push(Frame {
                 super_done: false,
@@ -3421,11 +3444,7 @@ impl<'p> Vm<'p> {
                 new_target: Value::UNDEFINED,
                 // The creating call's function value (named fn-expression
                 // self-name identity survives suspension).
-                callee: self
-                    .gen_callee
-                    .get(&idx)
-                    .copied()
-                    .unwrap_or(Value::UNDEFINED),
+                callee,
             });
             // A mapped `arguments` object aliases every resumed frame window.
             self.relink_mapped_args(idx, stop, new_base);

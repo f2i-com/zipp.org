@@ -1611,6 +1611,7 @@ impl Vm<'_> {
             }
             HeapObj::AsyncState(s) => {
                 m_idx!(s.closure);
+                m_val!(s.callee);
                 for &v in &s.regs {
                     m_val!(v);
                 }
