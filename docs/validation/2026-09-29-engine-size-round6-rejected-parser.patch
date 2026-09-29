@@ -1,0 +1,54 @@
+--- a/crates/regress-fork/src/parse.rs
++++ b/crates/regress-fork/src/parse.rs
+@@ -273,10 +273 @@
+-        let mut nodes = Vec::new();
+-        for string in &self.0 {
+-            nodes.push(ir::Node::Cat(
+-                string
+-                    .iter()
+-                    .map(|cp| ir::Node::Char { c: *cp, icase })
+-                    .collect::<Vec<_>>(),
+-            ));
+-        }
+-        nodes
++        self.0.iter().map(|s| make_string_node(s, icase)).collect()
+@@ -286,7 +277,4 @@
+-fn error<S, T>(text: S) -> Result<T, Error>
+-where
+-    S: ToString,
+-{
+-    Err(Error {
+-        text: text.to_string(),
+-    })
++#[cold]
++#[inline(never)]
++fn error<T>(text: impl Into<String>) -> Result<T, Error> {
++    Err(Error { text: text.into() })
+@@ -323,0 +312,12 @@
++
++// A single character needs no concatenation vector. The optimizer would
++// remove that wrapper anyway; avoiding it also saves its allocation and walk.
++#[inline(never)]
++fn make_string_node(chars: &[u32], icase: bool) -> ir::Node {
++    match chars {
++        [c] => ir::Node::Char { c: *c, icase },
++        _ => ir::Node::Cat(
++            chars.iter().map(|&c| ir::Node::Char { c, icase }).collect(),
++        ),
++    }
++}
+@@ -1790,13 +1790 @@
+-                        strings
+-                            .iter()
+-                            .map(|s| {
+-                                ir::Node::Cat(
+-                                    s.iter()
+-                                        .map(|c| ir::Node::Char {
+-                                            c: *c,
+-                                            icase: self.flags.icase,
+-                                        })
+-                                        .collect(),
+-                                )
+-                            })
+-                            .collect(),
++                        strings.iter().map(|s| make_string_node(s, self.flags.icase)).collect(),

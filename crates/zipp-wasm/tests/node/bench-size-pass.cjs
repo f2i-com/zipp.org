@@ -1,4 +1,5 @@
 // node --no-liftoff bench-size-pass.cjs BASELINE_NODE_DIR CANDIDATE_NODE_DIR
+// Append a case name to measure it in a fresh process without earlier workloads.
 // Force V8's optimizing WASM compiler: a tier-up halfway through sequential
 // benchmarks can otherwise masquerade as a large code-size optimization win.
 'use strict';
@@ -20,15 +21,17 @@ const FOCUSED = [
   { name: 'regexp-matchall', arg: 1000, src: 'function w(n){let s=0;for(let i=0;i<n;i++){for(const m of "k12;k34;k56".matchAll(/k(\\d+)/g))s+=Number(m[1])}return s}' },
   { name: 'promise-resolve', arg: 1000, src: 'function w(n){for(let i=0;i<n;i++)Promise.resolve(i).then(x=>x+1);return n}' },
 ];
-const names = process.argv.slice(2);
-if (names.length !== 2 || !process.execArgv.includes('--no-liftoff')) {
-  throw new Error('node --no-liftoff bench-size-pass.cjs BASELINE_NODE_DIR CANDIDATE_NODE_DIR');
+const names = process.argv.slice(2, 4);
+const onlyCase = process.argv[4] || null;
+if (names.length !== 2 || process.argv.length > 5 || !process.execArgv.includes('--no-liftoff')) {
+  throw new Error('node --no-liftoff bench-size-pass.cjs BASELINE_NODE_DIR CANDIDATE_NODE_DIR [CASE]');
 }
 const modules = names.map(name => require(path.resolve(name, 'zipp_wasm.js')));
 const results = {
   node: process.version, v8: process.versions.v8, flags: process.execArgv,
   cpu: os.cpus()[0].model, packages: names,
   description: 'Optimizing WASM compiler; 10 warmup pairs, shared batches targeting >= 5 ms, and 31 alternating paired samples. Times are per call. Narrow screening, not a general performance claim.',
+  only_case: onlyCase,
   cases: {},
 };
 function measure(name, calls) {
@@ -57,7 +60,7 @@ function measure(name, calls) {
   results.cases[name] = { baseline_ms: before, candidate_ms: after, ratio: after / before, iterations, samples_ms: samples };
 }
 
-for (const w of [...WORKLOADS, ...FOCUSED]) {
+for (const w of [...WORKLOADS, ...FOCUSED].filter(w => !onlyCase || w.name === onlyCase)) {
   const engines = modules.map(m => { const e = new m.Engine(); e.initScript(w.src); return e; });
   try {
     const expected = new Function(w.src + '; return w')()(w.arg);
@@ -69,6 +72,7 @@ for (const w of [...WORKLOADS, ...FOCUSED]) {
   } finally { for (const e of engines) { e.dispose(); e.free(); } }
 }
 for (const count of [0, 200]) {
+  if (onlyCase && onlyCase !== `javascript_init_${count}_functions`) continue;
   const source = Array.from({ length: count }, (_, i) => `function f${i}(x){return x+${i}}`).join('\n');
   measure(`javascript_init_${count}_functions`, modules.map(m => () => {
     const e = new m.Engine();
@@ -78,6 +82,7 @@ for (const count of [0, 200]) {
 }
 if (modules.every(m => JSON.parse(m.zippProfile()).languages.includes('python'))) {
   for (const count of [1, 200]) {
+    if (onlyCase && onlyCase !== `python_init_${count}_functions`) continue;
     const source = Array.from({ length: count }, (_, i) => `def f${i}(x):\n    return x + ${i}\n`).join('') + 'print(f0(42))\n';
     measure(`python_init_${count}_functions`, modules.map(m => () => {
       const e = new m.Engine();
@@ -86,6 +91,7 @@ if (modules.every(m => JSON.parse(m.zippProfile()).languages.includes('python'))
     }));
   }
 }
-const ratios = WORKLOADS.map(w => results.cases[w.name].ratio);
-results.js_geomean_elapsed_ratio = Math.exp(ratios.reduce((sum, r) => sum + Math.log(r), 0) / ratios.length);
+if (onlyCase && !results.cases[onlyCase]) throw Error(`Unknown or unavailable case: ${onlyCase}`);
+const ratios = WORKLOADS.filter(w => results.cases[w.name]).map(w => results.cases[w.name].ratio);
+results.js_geomean_elapsed_ratio = ratios.length ? Math.exp(ratios.reduce((sum, r) => sum + Math.log(r), 0) / ratios.length) : null;
 console.log(JSON.stringify(results, null, 2));
