@@ -8,8 +8,9 @@
 //! the tables referenced from script_value_ranges() and complementing over
 //! U+0000..=U+10FFFF. Vendored patch; see VENDORED.md (B3).
 use crate::codepointset::Interval;
+use crate::packed_intervals::{PackedIntervals, packed_intervals};
 
-pub(crate) const SCRIPT_UNKNOWN: [Interval; 733] = [
+pub(crate) const SCRIPT_UNKNOWN: PackedIntervals = packed_intervals![
     Interval::new(888, 889),
     Interval::new(896, 899),
     Interval::new(907, 907),
@@ -744,3 +745,14 @@ pub(crate) const SCRIPT_UNKNOWN: [Interval; 733] = [
     Interval::new(917632, 917759),
     Interval::new(918000, 1114111),
 ];
+
+// ZIPP packed-table round-trip tests.
+#[cfg(test)]
+#[test]
+fn all_packed_intervals_match_generated_source() {
+    assert_eq!(
+        SCRIPT_UNKNOWN.to_vec(),
+        SCRIPT_UNKNOWN.original,
+        "SCRIPT_UNKNOWN"
+    );
+}

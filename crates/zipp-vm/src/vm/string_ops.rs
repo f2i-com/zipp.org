@@ -902,7 +902,9 @@ impl<'p> Vm<'p> {
                     );
                     Ok(Some(self.regex_replace(idx, re, repl, global)?))
                 } else {
-                    Ok(Some(self.string_replace_plain(idx, &js_recv, arg0, repl, false)?))
+                    Ok(Some(
+                        self.string_replace_plain(idx, &js_recv, arg0, repl, false)?,
+                    ))
                 }
             }
             // `replaceAll` (regexp or otherwise) funnels into `string_replace_plain`,
@@ -1126,6 +1128,15 @@ impl<'p> Vm<'p> {
                 let sub = subu(start, start + count);
                 Ok(Some(Value::heap(self.heap.alloc_js(sub))))
             }
+            // Without ECMA-402 use a deterministic, canonically equivalent
+            // ordering. Stream decomposed code points, preserving lone surrogates.
+            #[cfg(feature = "wasm-lite")]
+            "localeCompare" => {
+                let that = self.to_js_str_owned(arg0)?;
+                let ord = lite_collation_units(&js_recv).cmp(lite_collation_units(&that));
+                Ok(Some(Value::int(ord as i32)))
+            }
+            #[cfg(not(feature = "wasm-lite"))]
             "localeCompare" => {
                 // ECMA-402 defines this as `Intl.Collator(locales, options)
                 // .compare(this, that)` — so it is routed through a real
@@ -1176,7 +1187,9 @@ impl<'p> Vm<'p> {
                     let mut out_len = 0usize;
                     for run in wtf8_runs(bytes) {
                         match run {
-                            Ok(r) => for_each_normalized(&form, r, &mut |c| out_len += c.len_utf8()),
+                            Ok(r) => {
+                                for_each_normalized(&form, r, &mut |c| out_len += c.len_utf8())
+                            }
                             Err(b) => out_len += b.len(),
                         }
                         if out_len > MAX_STRING_BYTES {
@@ -1313,8 +1326,12 @@ impl<'p> Vm<'p> {
             // case mappings" — az, lt, tr. Anything else, including no argument
             // at all, is "und" and takes the locale-independent mapping.
             "toLocaleUpperCase" | "toLocaleLowerCase" => {
+                #[cfg(not(feature = "wasm-lite"))]
                 let locales = self.canonicalize_locale_list(arg0)?;
                 let upper = name == "toLocaleUpperCase";
+                #[cfg(feature = "wasm-lite")]
+                let lang = None;
+                #[cfg(not(feature = "wasm-lite"))]
                 let lang = locales
                     .first()
                     .and_then(|t| crate::vm::special_casing::special_casing_language(t));
@@ -1695,8 +1712,10 @@ impl<'p> Vm<'p> {
             let per_part = std::mem::size_of::<HeapObj>()
                 + std::mem::size_of::<Value>()
                 + std::mem::size_of::<(usize, usize)>();
-            self.instrument_preflight_heap_growth(parts.saturating_mul(per_part).saturating_add(bytes))
-                .map_err(|message| Thrown(message.into()))?;
+            self.instrument_preflight_heap_growth(
+                parts.saturating_mul(per_part).saturating_add(bytes),
+            )
+            .map_err(|message| Thrown(message.into()))?;
         }
         #[cfg(not(feature = "instrument"))]
         let _ = bytes;
@@ -1914,7 +1933,10 @@ impl<'p> Vm<'p> {
                 let gap = recv.slice_units(last, pos);
                 self.append_guest_wtf8(&mut out, gap.as_bytes())?;
                 let (pre, post) = if context {
-                    (recv.slice_units(0, pos), recv.slice_units(pos + n_units, len))
+                    (
+                        recv.slice_units(0, pos),
+                        recv.slice_units(pos + n_units, len),
+                    )
                 } else {
                     (empty.clone(), empty.clone())
                 };
@@ -1978,7 +2000,11 @@ impl<'p> Vm<'p> {
             // once per match made replaceAll's native loop an unchecked
             // O(matches * source_len) allocator despite an O(1) alias being
             // semantically identical.
-            let argv = [Value::heap(m), Value::num(position as f64), Value::heap(s_idx)];
+            let argv = [
+                Value::heap(m),
+                Value::num(position as f64),
+                Value::heap(s_idx),
+            ];
             let r = self.call_value(repl_v, Value::UNDEFINED, &argv)?;
             let r = self.to_str_value(r)?;
             let exact = self
@@ -2018,7 +2044,11 @@ impl<'p> Vm<'p> {
     /// MAX_STRING_BYTES and the heap budget, the buffer grows fallibly, and the
     /// segment joins with `wtf8_push`, so surrogate halves meeting at the seam
     /// pair up as they do in the UTF-16 string they spell.
-    pub(crate) fn append_guest_wtf8(&mut self, out: &mut Vec<u8>, seg: &[u8]) -> Result<(), Thrown> {
+    pub(crate) fn append_guest_wtf8(
+        &mut self,
+        out: &mut Vec<u8>,
+        seg: &[u8],
+    ) -> Result<(), Thrown> {
         if seg.is_empty() {
             return Ok(());
         }
@@ -2378,4 +2408,32 @@ pub(crate) fn collation_view(js: &crate::heap::JsStr) -> std::borrow::Cow<'_, st
             })
             .collect(),
     )
+}
+
+/// Locale-independent canonical ordering for the ECMA-262-only artifact.
+#[cfg(feature = "wasm-lite")]
+fn lite_collation_units(js: &crate::heap::JsStr) -> impl Iterator<Item = u32> + '_ {
+    use unicode_normalization::UnicodeNormalization;
+    let mut rest = js.as_bytes();
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        // UTF-8 error_len can split a surrogate into individual bytes. Locate
+        // whole WTF-8 surrogate encodings instead, before normalizing each run.
+        let end = rest
+            .windows(3)
+            .position(|b| b[0] == 0xed && b[1] >= 0xa0)
+            .unwrap_or(rest.len());
+        if end == 0 {
+            let cp = crate::heap::wtf8_decode(rest, 0).0;
+            rest = &rest[3..];
+            Some(("", Some(cp)))
+        } else {
+            let text = std::str::from_utf8(&rest[..end]).expect("well-formed run");
+            rest = &rest[end..];
+            Some((text, None))
+        }
+    })
+    .flat_map(|(text, surrogate)| text.nfd().map(u32::from).chain(surrogate))
 }

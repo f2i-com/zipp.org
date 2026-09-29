@@ -415,6 +415,11 @@ impl<'p> Vm<'p> {
         let mut date_methods: Vec<(&str, u16)> = Vec::new();
         let mut promise_methods: Vec<(&str, u16)> = Vec::new();
         for (i, &(name, kind, _len)) in native::PROTO_METHODS.iter().enumerate() {
+            // Preserve positional native IDs; omit only the Temporal extension.
+            #[cfg(feature = "wasm-lite")]
+            if name == "toTemporalInstant" {
+                continue;
+            }
             let id = native::PROTO_METHOD_BASE + i as u16;
             match kind {
                 0 => arr_methods.push((name, id)),
@@ -1755,573 +1760,580 @@ impl<'p> Vm<'p> {
             pm.define("revocable", revocable, method_attr);
             pm.is_ctor = true;
             self.proxy_ctor = self.heap.alloc(HeapObj::Object(Box::new(pm)));
-            // `Temporal` namespace + `Temporal.Duration`.
-            let dur_methods: Vec<(&str, u16)> = native::TEMPORAL_DURATION_METHODS
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (n, native::TEMPORAL_M_BASE + i as u16))
-                .collect();
-            let duration_proto = build(self, &dur_methods, None);
-            self.proto_of.insert(duration_proto, Value::heap(obj_proto));
-            self.duration_proto = duration_proto;
-            let dfrom = Value::heap(self.heap.alloc(HeapObj::Native(TEMPORAL_DURATION_FROM)));
-            let dcompare = Value::heap(self.heap.alloc(HeapObj::Native(TEMPORAL_DURATION_COMPARE)));
-            let dname = self.alloc_str("Duration".to_string());
-            let dtag = self.alloc_str("Temporal.Duration".to_string());
-            let mut dm = ObjMap::new();
-            dm.define("prototype", Value::heap(duration_proto), proto_attr);
-            dm.define("from", dfrom, method_attr);
-            dm.define("compare", dcompare, method_attr);
-            dm.define("name", dname, fn_attr);
-            dm.define("length", Value::num(0.0), fn_attr);
-            dm.is_ctor = true;
-            let duration_ctor = self.heap.alloc(HeapObj::Object(Box::new(dm)));
-            self.duration_ctor = duration_ctor;
-            if let HeapObj::Object(p) = self.heap.get_mut(duration_proto) {
-                p.define("constructor", Value::heap(duration_ctor), method_attr);
-                p.define("@@toStringTag", dtag, fn_attr);
-            }
-            // Temporal.PlainDate
-            let pd_methods: Vec<(&str, u16)> = native::PLAINDATE_METHODS
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (n, native::PD_M_BASE + i as u16))
-                .collect();
-            let plaindate_proto = build(self, &pd_methods, None);
-            self.proto_of
-                .insert(plaindate_proto, Value::heap(obj_proto));
-            self.plaindate_proto = plaindate_proto;
-            let pdfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATE_FROM)));
-            let pdcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATE_COMPARE)));
-            let pdname = self.alloc_str("PlainDate".to_string());
-            let pdtag = self.alloc_str("Temporal.PlainDate".to_string());
-            let mut pdm = ObjMap::new();
-            pdm.define("prototype", Value::heap(plaindate_proto), proto_attr);
-            pdm.define("from", pdfrom, method_attr);
-            pdm.define("compare", pdcompare, method_attr);
-            pdm.define("name", pdname, fn_attr);
-            pdm.define("length", Value::num(3.0), fn_attr);
-            pdm.is_ctor = true;
-            let plaindate_ctor = self.heap.alloc(HeapObj::Object(Box::new(pdm)));
-            self.plaindate_ctor = plaindate_ctor;
-            if let HeapObj::Object(p) = self.heap.get_mut(plaindate_proto) {
-                p.define("constructor", Value::heap(plaindate_ctor), method_attr);
-                p.define("@@toStringTag", pdtag, fn_attr);
-            }
-            // Temporal.PlainTime
-            let pt_methods: Vec<(&str, u16)> = native::PLAINTIME_METHODS
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (n, native::PT_M_BASE + i as u16))
-                .collect();
-            let plaintime_proto = build(self, &pt_methods, None);
-            self.proto_of
-                .insert(plaintime_proto, Value::heap(obj_proto));
-            self.plaintime_proto = plaintime_proto;
-            let ptfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINTIME_FROM)));
-            let ptcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINTIME_COMPARE)));
-            let ptname = self.alloc_str("PlainTime".to_string());
-            let pttag = self.alloc_str("Temporal.PlainTime".to_string());
-            let mut ptm = ObjMap::new();
-            ptm.define("prototype", Value::heap(plaintime_proto), proto_attr);
-            ptm.define("from", ptfrom, method_attr);
-            ptm.define("compare", ptcompare, method_attr);
-            ptm.define("name", ptname, fn_attr);
-            ptm.define("length", Value::num(0.0), fn_attr);
-            ptm.is_ctor = true;
-            let plaintime_ctor = self.heap.alloc(HeapObj::Object(Box::new(ptm)));
-            self.plaintime_ctor = plaintime_ctor;
-            if let HeapObj::Object(p) = self.heap.get_mut(plaintime_proto) {
-                p.define("constructor", Value::heap(plaintime_ctor), method_attr);
-                p.define("@@toStringTag", pttag, fn_attr);
-            }
-            // Temporal.PlainDateTime
-            let pdt_methods: Vec<(&str, u16)> = native::PLAINDATETIME_METHODS
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (n, native::PDT_M_BASE + i as u16))
-                .collect();
-            let plaindatetime_proto = build(self, &pdt_methods, None);
-            self.proto_of
-                .insert(plaindatetime_proto, Value::heap(obj_proto));
-            self.plaindatetime_proto = plaindatetime_proto;
-            let pdtfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATETIME_FROM)));
-            let pdtcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATETIME_COMPARE)));
-            let pdtname = self.alloc_str("PlainDateTime".to_string());
-            let pdttag = self.alloc_str("Temporal.PlainDateTime".to_string());
-            let mut pdtm = ObjMap::new();
-            pdtm.define("prototype", Value::heap(plaindatetime_proto), proto_attr);
-            pdtm.define("from", pdtfrom, method_attr);
-            pdtm.define("compare", pdtcompare, method_attr);
-            pdtm.define("name", pdtname, fn_attr);
-            pdtm.define("length", Value::num(3.0), fn_attr);
-            pdtm.is_ctor = true;
-            let plaindatetime_ctor = self.heap.alloc(HeapObj::Object(Box::new(pdtm)));
-            self.plaindatetime_ctor = plaindatetime_ctor;
-            if let HeapObj::Object(p) = self.heap.get_mut(plaindatetime_proto) {
-                p.define("constructor", Value::heap(plaindatetime_ctor), method_attr);
-                p.define("@@toStringTag", pdttag, fn_attr);
-            }
-            // Temporal.Instant
-            let inst_methods: Vec<(&str, u16)> = native::INSTANT_METHODS
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (n, native::INST_M_BASE + i as u16))
-                .collect();
-            let instant_proto = build(self, &inst_methods, None);
-            self.proto_of.insert(instant_proto, Value::heap(obj_proto));
-            self.instant_proto = instant_proto;
-            let iname = self.alloc_str("Instant".to_string());
-            let itag = self.alloc_str("Temporal.Instant".to_string());
-            let mut im = ObjMap::new();
-            im.define("prototype", Value::heap(instant_proto), proto_attr);
-            // `fromEpochSeconds` / `fromEpochMicroseconds` were REMOVED from the
-            // proposal in June 2024 (only the millisecond and nanosecond
-            // entry points survive); the native ids stay so the dispatch arms
-            // keep compiling, they are simply no longer exposed.
-            for (n, id) in [
-                ("from", INST_FROM),
-                ("fromEpochMilliseconds", INST_FROM_EPOCH_MS),
-                ("fromEpochNanoseconds", INST_FROM_EPOCH_NS),
-                ("compare", INST_COMPARE),
-            ] {
-                let v = Value::heap(self.heap.alloc(HeapObj::Native(id)));
-                im.define(n, v, method_attr);
-            }
-            im.define("name", iname, fn_attr);
-            im.define("length", Value::num(1.0), fn_attr);
-            im.is_ctor = true;
-            let instant_ctor = self.heap.alloc(HeapObj::Object(Box::new(im)));
-            self.instant_ctor = instant_ctor;
-            if let HeapObj::Object(p) = self.heap.get_mut(instant_proto) {
-                p.define("constructor", Value::heap(instant_ctor), method_attr);
-                p.define("@@toStringTag", itag, fn_attr);
-            }
-            // Temporal.PlainYearMonth
-            let pym_methods: Vec<(&str, u16)> = native::PLAINYEARMONTH_METHODS
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (n, native::PYM_M_BASE + i as u16))
-                .collect();
-            let plainyearmonth_proto = build(self, &pym_methods, None);
-            self.proto_of
-                .insert(plainyearmonth_proto, Value::heap(obj_proto));
-            self.plainyearmonth_proto = plainyearmonth_proto;
-            let pymfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINYEARMONTH_FROM)));
-            let pymcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINYEARMONTH_COMPARE)));
-            let pymname = self.alloc_str("PlainYearMonth".to_string());
-            let pymtag = self.alloc_str("Temporal.PlainYearMonth".to_string());
-            let mut pymm = ObjMap::new();
-            pymm.define("prototype", Value::heap(plainyearmonth_proto), proto_attr);
-            pymm.define("from", pymfrom, method_attr);
-            pymm.define("compare", pymcompare, method_attr);
-            pymm.define("name", pymname, fn_attr);
-            pymm.define("length", Value::num(2.0), fn_attr);
-            pymm.is_ctor = true;
-            let plainyearmonth_ctor = self.heap.alloc(HeapObj::Object(Box::new(pymm)));
-            self.plainyearmonth_ctor = plainyearmonth_ctor;
-            if let HeapObj::Object(p) = self.heap.get_mut(plainyearmonth_proto) {
-                p.define("constructor", Value::heap(plainyearmonth_ctor), method_attr);
-                p.define("@@toStringTag", pymtag, fn_attr);
-            }
-            // Temporal.PlainMonthDay
-            let pmd_methods: Vec<(&str, u16)> = native::PLAINMONTHDAY_METHODS
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (n, native::PMD_M_BASE + i as u16))
-                .collect();
-            let plainmonthday_proto = build(self, &pmd_methods, None);
-            self.proto_of
-                .insert(plainmonthday_proto, Value::heap(obj_proto));
-            self.plainmonthday_proto = plainmonthday_proto;
-            let pmdfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINMONTHDAY_FROM)));
-            let pmdname = self.alloc_str("PlainMonthDay".to_string());
-            let pmdtag = self.alloc_str("Temporal.PlainMonthDay".to_string());
-            let mut pmdm = ObjMap::new();
-            pmdm.define("prototype", Value::heap(plainmonthday_proto), proto_attr);
-            pmdm.define("from", pmdfrom, method_attr);
-            pmdm.define("name", pmdname, fn_attr);
-            pmdm.define("length", Value::num(2.0), fn_attr);
-            pmdm.is_ctor = true;
-            let plainmonthday_ctor = self.heap.alloc(HeapObj::Object(Box::new(pmdm)));
-            self.plainmonthday_ctor = plainmonthday_ctor;
-            if let HeapObj::Object(p) = self.heap.get_mut(plainmonthday_proto) {
-                p.define("constructor", Value::heap(plainmonthday_ctor), method_attr);
-                p.define("@@toStringTag", pmdtag, fn_attr);
-            }
-            // Temporal.ZonedDateTime
-            let zdt_methods: Vec<(&str, u16)> = native::ZONEDDATETIME_METHODS
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (n, native::ZDT_M_BASE + i as u16))
-                .collect();
-            let zoneddatetime_proto = build(self, &zdt_methods, None);
-            self.proto_of
-                .insert(zoneddatetime_proto, Value::heap(obj_proto));
-            self.zoneddatetime_proto = zoneddatetime_proto;
-            let zdtfrom = Value::heap(self.heap.alloc(HeapObj::Native(native::ZDT_FROM)));
-            let zdtcompare = Value::heap(self.heap.alloc(HeapObj::Native(native::ZDT_COMPARE)));
-            let zdtname = self.alloc_str("ZonedDateTime".to_string());
-            let zdttag = self.alloc_str("Temporal.ZonedDateTime".to_string());
-            let mut zdtm = ObjMap::new();
-            zdtm.define("prototype", Value::heap(zoneddatetime_proto), proto_attr);
-            zdtm.define("from", zdtfrom, method_attr);
-            zdtm.define("compare", zdtcompare, method_attr);
-            zdtm.define("name", zdtname, fn_attr);
-            zdtm.define("length", Value::num(2.0), fn_attr);
-            zdtm.is_ctor = true;
-            let zoneddatetime_ctor = self.heap.alloc(HeapObj::Object(Box::new(zdtm)));
-            self.zoneddatetime_ctor = zoneddatetime_ctor;
-            if let HeapObj::Object(p) = self.heap.get_mut(zoneddatetime_proto) {
-                p.define("constructor", Value::heap(zoneddatetime_ctor), method_attr);
-                p.define("@@toStringTag", zdttag, fn_attr);
-            }
-            // Temporal.Now (a namespace object, not a constructor).
-            let nowtag = self.alloc_str("Temporal.Now".to_string());
-            let mut nown = ObjMap::new();
-            for (n, id) in [
-                ("instant", NOW_INSTANT),
-                ("plainDateTimeISO", NOW_PLAINDATETIME_ISO),
-                ("plainDateISO", NOW_PLAINDATE_ISO),
-                ("plainTimeISO", NOW_PLAINTIME_ISO),
-                ("timeZoneId", NOW_TIMEZONE_ID),
-                ("zonedDateTimeISO", NOW_ZONEDDATETIME_ISO),
-            ] {
-                let v = Value::heap(self.heap.alloc(HeapObj::Native(id)));
-                nown.define(n, v, method_attr);
-            }
-            nown.define("@@toStringTag", nowtag, fn_attr);
-            let now_ns = self.heap.alloc(HeapObj::Object(Box::new(nown)));
-            let mut tn = ObjMap::new();
-            tn.define("Duration", Value::heap(duration_ctor), method_attr);
-            tn.define("PlainDate", Value::heap(plaindate_ctor), method_attr);
-            tn.define("PlainTime", Value::heap(plaintime_ctor), method_attr);
-            tn.define(
-                "PlainDateTime",
-                Value::heap(plaindatetime_ctor),
-                method_attr,
-            );
-            tn.define("Instant", Value::heap(instant_ctor), method_attr);
-            tn.define(
-                "PlainYearMonth",
-                Value::heap(plainyearmonth_ctor),
-                method_attr,
-            );
-            tn.define(
-                "PlainMonthDay",
-                Value::heap(plainmonthday_ctor),
-                method_attr,
-            );
-            tn.define(
-                "ZonedDateTime",
-                Value::heap(zoneddatetime_ctor),
-                method_attr,
-            );
-            tn.define("Now", Value::heap(now_ns), method_attr);
-            // The Temporal namespace has @@toStringTag "Temporal" (so
-            // Object.prototype.toString.call(Temporal) === "[object Temporal]"),
-            // like the Now namespace above. { w:false, e:false, c:true }.
-            let temporal_tag = self.alloc_str("Temporal".to_string());
-            tn.define("@@toStringTag", temporal_tag, fn_attr);
-            self.temporal_ns = self.heap.alloc(HeapObj::Object(Box::new(tn)));
-            // Register each Temporal type's field getters as accessor properties on
-            // its prototype (the value still resolves via get_member's fast path;
-            // this gives `getOwnPropertyDescriptor(Type.prototype, field).get` a real
-            // function and brand-checks when invoked on the wrong receiver).
-            let temporal_getter_sets: [(u32, &[&str]); 8] = [
-                (self.duration_proto, native::TEMP_G_DURATION),
-                (self.plaindate_proto, native::TEMP_G_PLAINDATE),
-                (self.plaintime_proto, native::TEMP_G_PLAINTIME),
-                (self.plaindatetime_proto, native::TEMP_G_PLAINDATETIME),
-                (self.instant_proto, native::TEMP_G_INSTANT),
-                (self.plainyearmonth_proto, native::TEMP_G_PLAINYEARMONTH),
-                (self.plainmonthday_proto, native::TEMP_G_PLAINMONTHDAY),
-                (self.zoneddatetime_proto, native::TEMP_G_ZONEDDATETIME),
-            ];
-            let getter_attr = PropAttr {
-                writable: false,
-                enumerable: false,
-                configurable: true,
-                accessor: true,
-                setter: Value::UNDEFINED,
-            };
-            for (proto, fields) in temporal_getter_sets {
-                for &name in fields {
-                    let idx = native::TEMPORAL_GETTER_FIELDS
-                        .iter()
-                        .position(|f| *f == name)
-                        .expect("getter field in union");
-                    let gid = native::TEMPORAL_GETTER_BASE + idx as u16;
-                    let gv = Value::heap(self.heap.alloc(HeapObj::Native(gid)));
-                    if let HeapObj::Object(p) = self.heap.get_mut(proto) {
-                        p.define(name, gv, getter_attr);
+            #[cfg(not(feature = "wasm-lite"))]
+            {
+                // `Temporal` namespace + `Temporal.Duration`.
+                let dur_methods: Vec<(&str, u16)> = native::TEMPORAL_DURATION_METHODS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| (n, native::TEMPORAL_M_BASE + i as u16))
+                    .collect();
+                let duration_proto = build(self, &dur_methods, None);
+                self.proto_of.insert(duration_proto, Value::heap(obj_proto));
+                self.duration_proto = duration_proto;
+                let dfrom = Value::heap(self.heap.alloc(HeapObj::Native(TEMPORAL_DURATION_FROM)));
+                let dcompare =
+                    Value::heap(self.heap.alloc(HeapObj::Native(TEMPORAL_DURATION_COMPARE)));
+                let dname = self.alloc_str("Duration".to_string());
+                let dtag = self.alloc_str("Temporal.Duration".to_string());
+                let mut dm = ObjMap::new();
+                dm.define("prototype", Value::heap(duration_proto), proto_attr);
+                dm.define("from", dfrom, method_attr);
+                dm.define("compare", dcompare, method_attr);
+                dm.define("name", dname, fn_attr);
+                dm.define("length", Value::num(0.0), fn_attr);
+                dm.is_ctor = true;
+                let duration_ctor = self.heap.alloc(HeapObj::Object(Box::new(dm)));
+                self.duration_ctor = duration_ctor;
+                if let HeapObj::Object(p) = self.heap.get_mut(duration_proto) {
+                    p.define("constructor", Value::heap(duration_ctor), method_attr);
+                    p.define("@@toStringTag", dtag, fn_attr);
+                }
+                // Temporal.PlainDate
+                let pd_methods: Vec<(&str, u16)> = native::PLAINDATE_METHODS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| (n, native::PD_M_BASE + i as u16))
+                    .collect();
+                let plaindate_proto = build(self, &pd_methods, None);
+                self.proto_of
+                    .insert(plaindate_proto, Value::heap(obj_proto));
+                self.plaindate_proto = plaindate_proto;
+                let pdfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATE_FROM)));
+                let pdcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATE_COMPARE)));
+                let pdname = self.alloc_str("PlainDate".to_string());
+                let pdtag = self.alloc_str("Temporal.PlainDate".to_string());
+                let mut pdm = ObjMap::new();
+                pdm.define("prototype", Value::heap(plaindate_proto), proto_attr);
+                pdm.define("from", pdfrom, method_attr);
+                pdm.define("compare", pdcompare, method_attr);
+                pdm.define("name", pdname, fn_attr);
+                pdm.define("length", Value::num(3.0), fn_attr);
+                pdm.is_ctor = true;
+                let plaindate_ctor = self.heap.alloc(HeapObj::Object(Box::new(pdm)));
+                self.plaindate_ctor = plaindate_ctor;
+                if let HeapObj::Object(p) = self.heap.get_mut(plaindate_proto) {
+                    p.define("constructor", Value::heap(plaindate_ctor), method_attr);
+                    p.define("@@toStringTag", pdtag, fn_attr);
+                }
+                // Temporal.PlainTime
+                let pt_methods: Vec<(&str, u16)> = native::PLAINTIME_METHODS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| (n, native::PT_M_BASE + i as u16))
+                    .collect();
+                let plaintime_proto = build(self, &pt_methods, None);
+                self.proto_of
+                    .insert(plaintime_proto, Value::heap(obj_proto));
+                self.plaintime_proto = plaintime_proto;
+                let ptfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINTIME_FROM)));
+                let ptcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINTIME_COMPARE)));
+                let ptname = self.alloc_str("PlainTime".to_string());
+                let pttag = self.alloc_str("Temporal.PlainTime".to_string());
+                let mut ptm = ObjMap::new();
+                ptm.define("prototype", Value::heap(plaintime_proto), proto_attr);
+                ptm.define("from", ptfrom, method_attr);
+                ptm.define("compare", ptcompare, method_attr);
+                ptm.define("name", ptname, fn_attr);
+                ptm.define("length", Value::num(0.0), fn_attr);
+                ptm.is_ctor = true;
+                let plaintime_ctor = self.heap.alloc(HeapObj::Object(Box::new(ptm)));
+                self.plaintime_ctor = plaintime_ctor;
+                if let HeapObj::Object(p) = self.heap.get_mut(plaintime_proto) {
+                    p.define("constructor", Value::heap(plaintime_ctor), method_attr);
+                    p.define("@@toStringTag", pttag, fn_attr);
+                }
+                // Temporal.PlainDateTime
+                let pdt_methods: Vec<(&str, u16)> = native::PLAINDATETIME_METHODS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| (n, native::PDT_M_BASE + i as u16))
+                    .collect();
+                let plaindatetime_proto = build(self, &pdt_methods, None);
+                self.proto_of
+                    .insert(plaindatetime_proto, Value::heap(obj_proto));
+                self.plaindatetime_proto = plaindatetime_proto;
+                let pdtfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATETIME_FROM)));
+                let pdtcompare =
+                    Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATETIME_COMPARE)));
+                let pdtname = self.alloc_str("PlainDateTime".to_string());
+                let pdttag = self.alloc_str("Temporal.PlainDateTime".to_string());
+                let mut pdtm = ObjMap::new();
+                pdtm.define("prototype", Value::heap(plaindatetime_proto), proto_attr);
+                pdtm.define("from", pdtfrom, method_attr);
+                pdtm.define("compare", pdtcompare, method_attr);
+                pdtm.define("name", pdtname, fn_attr);
+                pdtm.define("length", Value::num(3.0), fn_attr);
+                pdtm.is_ctor = true;
+                let plaindatetime_ctor = self.heap.alloc(HeapObj::Object(Box::new(pdtm)));
+                self.plaindatetime_ctor = plaindatetime_ctor;
+                if let HeapObj::Object(p) = self.heap.get_mut(plaindatetime_proto) {
+                    p.define("constructor", Value::heap(plaindatetime_ctor), method_attr);
+                    p.define("@@toStringTag", pdttag, fn_attr);
+                }
+                // Temporal.Instant
+                let inst_methods: Vec<(&str, u16)> = native::INSTANT_METHODS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| (n, native::INST_M_BASE + i as u16))
+                    .collect();
+                let instant_proto = build(self, &inst_methods, None);
+                self.proto_of.insert(instant_proto, Value::heap(obj_proto));
+                self.instant_proto = instant_proto;
+                let iname = self.alloc_str("Instant".to_string());
+                let itag = self.alloc_str("Temporal.Instant".to_string());
+                let mut im = ObjMap::new();
+                im.define("prototype", Value::heap(instant_proto), proto_attr);
+                // `fromEpochSeconds` / `fromEpochMicroseconds` were REMOVED from the
+                // proposal in June 2024 (only the millisecond and nanosecond
+                // entry points survive); the native ids stay so the dispatch arms
+                // keep compiling, they are simply no longer exposed.
+                for (n, id) in [
+                    ("from", INST_FROM),
+                    ("fromEpochMilliseconds", INST_FROM_EPOCH_MS),
+                    ("fromEpochNanoseconds", INST_FROM_EPOCH_NS),
+                    ("compare", INST_COMPARE),
+                ] {
+                    let v = Value::heap(self.heap.alloc(HeapObj::Native(id)));
+                    im.define(n, v, method_attr);
+                }
+                im.define("name", iname, fn_attr);
+                im.define("length", Value::num(1.0), fn_attr);
+                im.is_ctor = true;
+                let instant_ctor = self.heap.alloc(HeapObj::Object(Box::new(im)));
+                self.instant_ctor = instant_ctor;
+                if let HeapObj::Object(p) = self.heap.get_mut(instant_proto) {
+                    p.define("constructor", Value::heap(instant_ctor), method_attr);
+                    p.define("@@toStringTag", itag, fn_attr);
+                }
+                // Temporal.PlainYearMonth
+                let pym_methods: Vec<(&str, u16)> = native::PLAINYEARMONTH_METHODS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| (n, native::PYM_M_BASE + i as u16))
+                    .collect();
+                let plainyearmonth_proto = build(self, &pym_methods, None);
+                self.proto_of
+                    .insert(plainyearmonth_proto, Value::heap(obj_proto));
+                self.plainyearmonth_proto = plainyearmonth_proto;
+                let pymfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINYEARMONTH_FROM)));
+                let pymcompare =
+                    Value::heap(self.heap.alloc(HeapObj::Native(PLAINYEARMONTH_COMPARE)));
+                let pymname = self.alloc_str("PlainYearMonth".to_string());
+                let pymtag = self.alloc_str("Temporal.PlainYearMonth".to_string());
+                let mut pymm = ObjMap::new();
+                pymm.define("prototype", Value::heap(plainyearmonth_proto), proto_attr);
+                pymm.define("from", pymfrom, method_attr);
+                pymm.define("compare", pymcompare, method_attr);
+                pymm.define("name", pymname, fn_attr);
+                pymm.define("length", Value::num(2.0), fn_attr);
+                pymm.is_ctor = true;
+                let plainyearmonth_ctor = self.heap.alloc(HeapObj::Object(Box::new(pymm)));
+                self.plainyearmonth_ctor = plainyearmonth_ctor;
+                if let HeapObj::Object(p) = self.heap.get_mut(plainyearmonth_proto) {
+                    p.define("constructor", Value::heap(plainyearmonth_ctor), method_attr);
+                    p.define("@@toStringTag", pymtag, fn_attr);
+                }
+                // Temporal.PlainMonthDay
+                let pmd_methods: Vec<(&str, u16)> = native::PLAINMONTHDAY_METHODS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| (n, native::PMD_M_BASE + i as u16))
+                    .collect();
+                let plainmonthday_proto = build(self, &pmd_methods, None);
+                self.proto_of
+                    .insert(plainmonthday_proto, Value::heap(obj_proto));
+                self.plainmonthday_proto = plainmonthday_proto;
+                let pmdfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINMONTHDAY_FROM)));
+                let pmdname = self.alloc_str("PlainMonthDay".to_string());
+                let pmdtag = self.alloc_str("Temporal.PlainMonthDay".to_string());
+                let mut pmdm = ObjMap::new();
+                pmdm.define("prototype", Value::heap(plainmonthday_proto), proto_attr);
+                pmdm.define("from", pmdfrom, method_attr);
+                pmdm.define("name", pmdname, fn_attr);
+                pmdm.define("length", Value::num(2.0), fn_attr);
+                pmdm.is_ctor = true;
+                let plainmonthday_ctor = self.heap.alloc(HeapObj::Object(Box::new(pmdm)));
+                self.plainmonthday_ctor = plainmonthday_ctor;
+                if let HeapObj::Object(p) = self.heap.get_mut(plainmonthday_proto) {
+                    p.define("constructor", Value::heap(plainmonthday_ctor), method_attr);
+                    p.define("@@toStringTag", pmdtag, fn_attr);
+                }
+                // Temporal.ZonedDateTime
+                let zdt_methods: Vec<(&str, u16)> = native::ZONEDDATETIME_METHODS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| (n, native::ZDT_M_BASE + i as u16))
+                    .collect();
+                let zoneddatetime_proto = build(self, &zdt_methods, None);
+                self.proto_of
+                    .insert(zoneddatetime_proto, Value::heap(obj_proto));
+                self.zoneddatetime_proto = zoneddatetime_proto;
+                let zdtfrom = Value::heap(self.heap.alloc(HeapObj::Native(native::ZDT_FROM)));
+                let zdtcompare = Value::heap(self.heap.alloc(HeapObj::Native(native::ZDT_COMPARE)));
+                let zdtname = self.alloc_str("ZonedDateTime".to_string());
+                let zdttag = self.alloc_str("Temporal.ZonedDateTime".to_string());
+                let mut zdtm = ObjMap::new();
+                zdtm.define("prototype", Value::heap(zoneddatetime_proto), proto_attr);
+                zdtm.define("from", zdtfrom, method_attr);
+                zdtm.define("compare", zdtcompare, method_attr);
+                zdtm.define("name", zdtname, fn_attr);
+                zdtm.define("length", Value::num(2.0), fn_attr);
+                zdtm.is_ctor = true;
+                let zoneddatetime_ctor = self.heap.alloc(HeapObj::Object(Box::new(zdtm)));
+                self.zoneddatetime_ctor = zoneddatetime_ctor;
+                if let HeapObj::Object(p) = self.heap.get_mut(zoneddatetime_proto) {
+                    p.define("constructor", Value::heap(zoneddatetime_ctor), method_attr);
+                    p.define("@@toStringTag", zdttag, fn_attr);
+                }
+                // Temporal.Now (a namespace object, not a constructor).
+                let nowtag = self.alloc_str("Temporal.Now".to_string());
+                let mut nown = ObjMap::new();
+                for (n, id) in [
+                    ("instant", NOW_INSTANT),
+                    ("plainDateTimeISO", NOW_PLAINDATETIME_ISO),
+                    ("plainDateISO", NOW_PLAINDATE_ISO),
+                    ("plainTimeISO", NOW_PLAINTIME_ISO),
+                    ("timeZoneId", NOW_TIMEZONE_ID),
+                    ("zonedDateTimeISO", NOW_ZONEDDATETIME_ISO),
+                ] {
+                    let v = Value::heap(self.heap.alloc(HeapObj::Native(id)));
+                    nown.define(n, v, method_attr);
+                }
+                nown.define("@@toStringTag", nowtag, fn_attr);
+                let now_ns = self.heap.alloc(HeapObj::Object(Box::new(nown)));
+                let mut tn = ObjMap::new();
+                tn.define("Duration", Value::heap(duration_ctor), method_attr);
+                tn.define("PlainDate", Value::heap(plaindate_ctor), method_attr);
+                tn.define("PlainTime", Value::heap(plaintime_ctor), method_attr);
+                tn.define(
+                    "PlainDateTime",
+                    Value::heap(plaindatetime_ctor),
+                    method_attr,
+                );
+                tn.define("Instant", Value::heap(instant_ctor), method_attr);
+                tn.define(
+                    "PlainYearMonth",
+                    Value::heap(plainyearmonth_ctor),
+                    method_attr,
+                );
+                tn.define(
+                    "PlainMonthDay",
+                    Value::heap(plainmonthday_ctor),
+                    method_attr,
+                );
+                tn.define(
+                    "ZonedDateTime",
+                    Value::heap(zoneddatetime_ctor),
+                    method_attr,
+                );
+                tn.define("Now", Value::heap(now_ns), method_attr);
+                // The Temporal namespace has @@toStringTag "Temporal" (so
+                // Object.prototype.toString.call(Temporal) === "[object Temporal]"),
+                // like the Now namespace above. { w:false, e:false, c:true }.
+                let temporal_tag = self.alloc_str("Temporal".to_string());
+                tn.define("@@toStringTag", temporal_tag, fn_attr);
+                self.temporal_ns = self.heap.alloc(HeapObj::Object(Box::new(tn)));
+                // Register each Temporal type's field getters as accessor properties on
+                // its prototype (the value still resolves via get_member's fast path;
+                // this gives `getOwnPropertyDescriptor(Type.prototype, field).get` a real
+                // function and brand-checks when invoked on the wrong receiver).
+                let temporal_getter_sets: [(u32, &[&str]); 8] = [
+                    (self.duration_proto, native::TEMP_G_DURATION),
+                    (self.plaindate_proto, native::TEMP_G_PLAINDATE),
+                    (self.plaintime_proto, native::TEMP_G_PLAINTIME),
+                    (self.plaindatetime_proto, native::TEMP_G_PLAINDATETIME),
+                    (self.instant_proto, native::TEMP_G_INSTANT),
+                    (self.plainyearmonth_proto, native::TEMP_G_PLAINYEARMONTH),
+                    (self.plainmonthday_proto, native::TEMP_G_PLAINMONTHDAY),
+                    (self.zoneddatetime_proto, native::TEMP_G_ZONEDDATETIME),
+                ];
+                let getter_attr = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                    setter: Value::UNDEFINED,
+                };
+                for (proto, fields) in temporal_getter_sets {
+                    for &name in fields {
+                        let idx = native::TEMPORAL_GETTER_FIELDS
+                            .iter()
+                            .position(|f| *f == name)
+                            .expect("getter field in union");
+                        let gid = native::TEMPORAL_GETTER_BASE + idx as u16;
+                        let gv = Value::heap(self.heap.alloc(HeapObj::Native(gid)));
+                        if let HeapObj::Object(p) = self.heap.get_mut(proto) {
+                            p.define(name, gv, getter_attr);
+                        }
                     }
                 }
-            }
-            // Shared `toLocaleString` (routes to toString) on every Temporal proto.
-            for proto in [
-                self.duration_proto,
-                self.plaindate_proto,
-                self.plaintime_proto,
-                self.plaindatetime_proto,
-                self.instant_proto,
-                self.plainyearmonth_proto,
-                self.plainmonthday_proto,
-                self.zoneddatetime_proto,
-            ] {
-                let v = Value::heap(self.heap.alloc(HeapObj::Native(TEMPORAL_TO_LOCALE_STRING)));
-                if let HeapObj::Object(p) = self.heap.get_mut(proto) {
-                    p.define("toLocaleString", v, method_attr);
+                // Shared `toLocaleString` (routes to toString) on every Temporal proto.
+                for proto in [
+                    self.duration_proto,
+                    self.plaindate_proto,
+                    self.plaintime_proto,
+                    self.plaindatetime_proto,
+                    self.instant_proto,
+                    self.plainyearmonth_proto,
+                    self.plainmonthday_proto,
+                    self.zoneddatetime_proto,
+                ] {
+                    let v =
+                        Value::heap(self.heap.alloc(HeapObj::Native(TEMPORAL_TO_LOCALE_STRING)));
+                    if let HeapObj::Object(p) = self.heap.get_mut(proto) {
+                        p.define("toLocaleString", v, method_attr);
+                    }
                 }
-            }
-            // ZonedDateTime.prototype.getTimeZoneTransition (offset zones -> null).
-            let gtzt = Value::heap(self.heap.alloc(HeapObj::Native(ZDT_GET_TZ_TRANSITION)));
-            if let HeapObj::Object(p) = self.heap.get_mut(self.zoneddatetime_proto) {
-                p.define("getTimeZoneTransition", gtzt, method_attr);
-            }
-            // PlainDateTime.prototype.withPlainTime (standalone id; PDT block full).
-            let wpt = Value::heap(self.heap.alloc(HeapObj::Native(PDT_WITH_PLAIN_TIME)));
-            if let HeapObj::Object(p) = self.heap.get_mut(self.plaindatetime_proto) {
-                p.define("withPlainTime", wpt, method_attr);
-            }
-            // ── Intl namespace + service constructors ──
-            let intl_services: Vec<(u8, &str, f64, Vec<(&str, u16)>, bool)> = vec![
-                (
-                    native::INTL_NUMBERFORMAT,
-                    "NumberFormat",
-                    0.0,
-                    // `format` is an accessor (added below), not a data method.
-                    vec![
-                        ("formatToParts", INTL_NF_FORMAT_TO_PARTS),
-                        ("formatRange", INTL_NF_FORMAT_RANGE),
-                        ("formatRangeToParts", INTL_NF_FORMAT_RANGE_TO_PARTS),
-                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
-                    ],
-                    true,
-                ),
-                (
-                    native::INTL_DATETIMEFORMAT,
-                    "DateTimeFormat",
-                    0.0,
-                    vec![
-                        ("formatToParts", INTL_DTF_FORMAT_TO_PARTS),
-                        ("formatRange", INTL_DTF_FORMAT_RANGE),
-                        ("formatRangeToParts", INTL_DTF_FORMAT_RANGE_TO_PARTS),
-                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
-                    ],
-                    true,
-                ),
-                (
-                    native::INTL_COLLATOR,
-                    "Collator",
-                    0.0,
-                    vec![("resolvedOptions", INTL_RESOLVED_OPTIONS)],
-                    true,
-                ),
-                (
-                    native::INTL_PLURALRULES,
-                    "PluralRules",
-                    0.0,
-                    vec![
-                        ("select", INTL_PLURAL_SELECT),
-                        ("selectRange", INTL_PLURAL_SELECT_RANGE),
-                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
-                    ],
-                    true,
-                ),
-                (
-                    native::INTL_LISTFORMAT,
-                    "ListFormat",
-                    0.0,
-                    vec![
-                        ("format", INTL_LIST_FORMAT),
-                        ("formatToParts", INTL_LIST_FORMAT_TO_PARTS),
-                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
-                    ],
-                    true,
-                ),
-                (
-                    native::INTL_RELATIVETIMEFORMAT,
-                    "RelativeTimeFormat",
-                    0.0,
-                    vec![
-                        ("format", INTL_RTF_FORMAT),
-                        ("formatToParts", INTL_RTF_FORMAT_TO_PARTS),
-                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
-                    ],
-                    true,
-                ),
-                (
-                    native::INTL_SEGMENTER,
-                    "Segmenter",
-                    0.0,
-                    vec![
-                        ("segment", INTL_SEGMENTER_SEGMENT),
-                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
-                    ],
-                    true,
-                ),
-                (
-                    native::INTL_LOCALE,
-                    "Locale",
-                    1.0,
-                    vec![
-                        ("toString", INTL_LOCALE_TOSTRING),
-                        ("maximize", INTL_LOCALE_MAXIMIZE),
-                        ("minimize", INTL_LOCALE_MINIMIZE),
-                    ],
-                    false,
-                ),
-                (
-                    native::INTL_DISPLAYNAMES,
-                    "DisplayNames",
-                    2.0,
-                    vec![
-                        ("of", INTL_DISPLAYNAMES_OF),
-                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
-                    ],
-                    true,
-                ),
-                (
-                    native::INTL_DURATIONFORMAT,
-                    "DurationFormat",
-                    0.0,
-                    vec![
-                        ("format", INTL_DURATION_FORMAT),
-                        ("formatToParts", INTL_DURATION_FORMAT_TO_PARTS),
-                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
-                    ],
-                    true,
-                ),
-            ];
-            let mut intl_ns_map = ObjMap::new();
-            for (kind, name, len, methods, slo) in intl_services {
-                // Each service gets its OWN resolvedOptions function, so its
-                // brand check can name one internal slot instead of accepting
-                // any Intl instance (see INTL_RESOLVED_OPTIONS_BASE).
-                let methods: Vec<(&str, u16)> = methods
-                    .into_iter()
-                    .map(|(m, id)| {
-                        if id == INTL_RESOLVED_OPTIONS {
-                            (m, native::INTL_RESOLVED_OPTIONS_BASE + kind as u16)
-                        } else {
-                            (m, id)
-                        }
-                    })
-                    .collect();
-                let proto = build(self, &methods, None);
-                self.proto_of.insert(proto, Value::heap(obj_proto));
-                self.intl_protos[kind as usize] = proto;
-                let statics: Vec<(&str, u16)> = if slo {
-                    vec![(
-                        "supportedLocalesOf",
-                        if kind == native::INTL_DATETIMEFORMAT {
-                            INTL_DTF_SUPPORTED_LOCALES_OF
-                        } else {
-                            INTL_SUPPORTED_LOCALES_OF
-                        },
-                    )]
-                } else {
-                    vec![]
+                // ZonedDateTime.prototype.getTimeZoneTransition (offset zones -> null).
+                let gtzt = Value::heap(self.heap.alloc(HeapObj::Native(ZDT_GET_TZ_TRANSITION)));
+                if let HeapObj::Object(p) = self.heap.get_mut(self.zoneddatetime_proto) {
+                    p.define("getTimeZoneTransition", gtzt, method_attr);
+                }
+                // PlainDateTime.prototype.withPlainTime (standalone id; PDT block full).
+                let wpt = Value::heap(self.heap.alloc(HeapObj::Native(PDT_WITH_PLAIN_TIME)));
+                if let HeapObj::Object(p) = self.heap.get_mut(self.plaindatetime_proto) {
+                    p.define("withPlainTime", wpt, method_attr);
+                }
+                // ── Intl namespace + service constructors ──
+                let intl_services: Vec<(u8, &str, f64, Vec<(&str, u16)>, bool)> = vec![
+                    (
+                        native::INTL_NUMBERFORMAT,
+                        "NumberFormat",
+                        0.0,
+                        // `format` is an accessor (added below), not a data method.
+                        vec![
+                            ("formatToParts", INTL_NF_FORMAT_TO_PARTS),
+                            ("formatRange", INTL_NF_FORMAT_RANGE),
+                            ("formatRangeToParts", INTL_NF_FORMAT_RANGE_TO_PARTS),
+                            ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                        ],
+                        true,
+                    ),
+                    (
+                        native::INTL_DATETIMEFORMAT,
+                        "DateTimeFormat",
+                        0.0,
+                        vec![
+                            ("formatToParts", INTL_DTF_FORMAT_TO_PARTS),
+                            ("formatRange", INTL_DTF_FORMAT_RANGE),
+                            ("formatRangeToParts", INTL_DTF_FORMAT_RANGE_TO_PARTS),
+                            ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                        ],
+                        true,
+                    ),
+                    (
+                        native::INTL_COLLATOR,
+                        "Collator",
+                        0.0,
+                        vec![("resolvedOptions", INTL_RESOLVED_OPTIONS)],
+                        true,
+                    ),
+                    (
+                        native::INTL_PLURALRULES,
+                        "PluralRules",
+                        0.0,
+                        vec![
+                            ("select", INTL_PLURAL_SELECT),
+                            ("selectRange", INTL_PLURAL_SELECT_RANGE),
+                            ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                        ],
+                        true,
+                    ),
+                    (
+                        native::INTL_LISTFORMAT,
+                        "ListFormat",
+                        0.0,
+                        vec![
+                            ("format", INTL_LIST_FORMAT),
+                            ("formatToParts", INTL_LIST_FORMAT_TO_PARTS),
+                            ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                        ],
+                        true,
+                    ),
+                    (
+                        native::INTL_RELATIVETIMEFORMAT,
+                        "RelativeTimeFormat",
+                        0.0,
+                        vec![
+                            ("format", INTL_RTF_FORMAT),
+                            ("formatToParts", INTL_RTF_FORMAT_TO_PARTS),
+                            ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                        ],
+                        true,
+                    ),
+                    (
+                        native::INTL_SEGMENTER,
+                        "Segmenter",
+                        0.0,
+                        vec![
+                            ("segment", INTL_SEGMENTER_SEGMENT),
+                            ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                        ],
+                        true,
+                    ),
+                    (
+                        native::INTL_LOCALE,
+                        "Locale",
+                        1.0,
+                        vec![
+                            ("toString", INTL_LOCALE_TOSTRING),
+                            ("maximize", INTL_LOCALE_MAXIMIZE),
+                            ("minimize", INTL_LOCALE_MINIMIZE),
+                        ],
+                        false,
+                    ),
+                    (
+                        native::INTL_DISPLAYNAMES,
+                        "DisplayNames",
+                        2.0,
+                        vec![
+                            ("of", INTL_DISPLAYNAMES_OF),
+                            ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                        ],
+                        true,
+                    ),
+                    (
+                        native::INTL_DURATIONFORMAT,
+                        "DurationFormat",
+                        0.0,
+                        vec![
+                            ("format", INTL_DURATION_FORMAT),
+                            ("formatToParts", INTL_DURATION_FORMAT_TO_PARTS),
+                            ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                        ],
+                        true,
+                    ),
+                ];
+                let mut intl_ns_map = ObjMap::new();
+                for (kind, name, len, methods, slo) in intl_services {
+                    // Each service gets its OWN resolvedOptions function, so its
+                    // brand check can name one internal slot instead of accepting
+                    // any Intl instance (see INTL_RESOLVED_OPTIONS_BASE).
+                    let methods: Vec<(&str, u16)> = methods
+                        .into_iter()
+                        .map(|(m, id)| {
+                            if id == INTL_RESOLVED_OPTIONS {
+                                (m, native::INTL_RESOLVED_OPTIONS_BASE + kind as u16)
+                            } else {
+                                (m, id)
+                            }
+                        })
+                        .collect();
+                    let proto = build(self, &methods, None);
+                    self.proto_of.insert(proto, Value::heap(obj_proto));
+                    self.intl_protos[kind as usize] = proto;
+                    let statics: Vec<(&str, u16)> = if slo {
+                        vec![(
+                            "supportedLocalesOf",
+                            if kind == native::INTL_DATETIMEFORMAT {
+                                INTL_DTF_SUPPORTED_LOCALES_OF
+                            } else {
+                                INTL_SUPPORTED_LOCALES_OF
+                            },
+                        )]
+                    } else {
+                        vec![]
+                    };
+                    let ctor = build(self, &statics, Some(proto));
+                    self.intl_ctors[kind as usize] = ctor;
+                    let nm = self.alloc_str(name.to_string());
+                    let tag = self.alloc_str(format!("Intl.{name}"));
+                    if let HeapObj::Object(m) = self.heap.get_mut(ctor) {
+                        m.define("name", nm, fn_attr);
+                        m.define("length", Value::num(len), fn_attr);
+                    }
+                    if let HeapObj::Object(p) = self.heap.get_mut(proto) {
+                        p.define("constructor", Value::heap(ctor), method_attr);
+                        p.define("@@toStringTag", tag, fn_attr);
+                    }
+                    intl_ns_map.define(name, Value::heap(ctor), method_attr);
+                }
+                // Intl.Locale.prototype subtag getters (accessors reading the instance).
+                let accessor_attr = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                    setter: Value::UNDEFINED,
                 };
-                let ctor = build(self, &statics, Some(proto));
-                self.intl_ctors[kind as usize] = ctor;
-                let nm = self.alloc_str(name.to_string());
-                let tag = self.alloc_str(format!("Intl.{name}"));
-                if let HeapObj::Object(m) = self.heap.get_mut(ctor) {
-                    m.define("name", nm, fn_attr);
-                    m.define("length", Value::num(len), fn_attr);
+                let locale_proto = self.intl_protos[native::INTL_LOCALE as usize];
+                for (i, gname) in native::LOCALE_ACCESSORS.iter().enumerate() {
+                    let getter = Value::heap(
+                        self.heap
+                            .alloc(HeapObj::Native(INTL_LOCALE_GET_BASE + i as u16)),
+                    );
+                    if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
+                        p.define(gname, getter, accessor_attr);
+                    }
                 }
-                if let HeapObj::Object(p) = self.heap.get_mut(proto) {
-                    p.define("constructor", Value::heap(ctor), method_attr);
-                    p.define("@@toStringTag", tag, fn_attr);
+                // `variants` / `firstDayOfWeek` live outside the LOCALE_ACCESSORS id
+                // block (it is boxed in by INTL_NF_FORMAT_GET), so they wire up here.
+                for (gname, gid) in [
+                    ("variants", INTL_LOCALE_GET_VARIANTS),
+                    ("firstDayOfWeek", INTL_LOCALE_GET_FIRSTDAY),
+                ] {
+                    let getter = Value::heap(self.heap.alloc(HeapObj::Native(gid)));
+                    if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
+                        p.define(gname, getter, accessor_attr);
+                    }
                 }
-                intl_ns_map.define(name, Value::heap(ctor), method_attr);
-            }
-            // Intl.Locale.prototype subtag getters (accessors reading the instance).
-            let accessor_attr = PropAttr {
-                writable: false,
-                enumerable: false,
-                configurable: true,
-                accessor: true,
-                setter: Value::UNDEFINED,
-            };
-            let locale_proto = self.intl_protos[native::INTL_LOCALE as usize];
-            for (i, gname) in native::LOCALE_ACCESSORS.iter().enumerate() {
-                let getter = Value::heap(
-                    self.heap
-                        .alloc(HeapObj::Native(INTL_LOCALE_GET_BASE + i as u16)),
+                // The Intl.Locale-info methods (ordinary data-property built-ins).
+                for (i, mname) in native::LOCALE_INFO_METHODS.iter().enumerate() {
+                    let f = Value::heap(
+                        self.heap
+                            .alloc(HeapObj::Native(INTL_LOCALE_INFO_BASE + i as u16)),
+                    );
+                    if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
+                        p.define(mname, f, method_attr);
+                    }
+                }
+                // NumberFormat/DateTimeFormat `format` + Collator `compare`: spec says
+                // these are accessors returning a function bound to the instance.
+                for (k, name, gid) in [
+                    (native::INTL_NUMBERFORMAT, "format", INTL_NF_FORMAT_GET),
+                    (native::INTL_DATETIMEFORMAT, "format", INTL_DTF_FORMAT_GET),
+                    (native::INTL_COLLATOR, "compare", INTL_COLLATOR_COMPARE_GET),
+                ] {
+                    let getter = Value::heap(self.heap.alloc(HeapObj::Native(gid)));
+                    let p = self.intl_protos[k as usize];
+                    if let HeapObj::Object(o) = self.heap.get_mut(p) {
+                        o.define(name, getter, accessor_attr);
+                    }
+                }
+                // %Segments.prototype% and %SegmentIterator.prototype%. Neither is
+                // reachable from `Intl` — `Intl.Segmenter.prototype.segment` is the
+                // only way to get an object with either as its [[Prototype]] — but
+                // both are ordinary objects with the usual descriptors, and
+                // %SegmentIterator.prototype% inherits from %IteratorPrototype%
+                // (so `[...segments]` and the iterator helpers work) and carries the
+                // "Segmenter String Iterator" toStringTag.
+                let segments_proto = build(
+                    self,
+                    &[
+                        ("containing", INTL_SEGMENTS_CONTAINING),
+                        ("@@iterator", INTL_SEGMENTS_ITERATOR),
+                    ],
+                    None,
                 );
-                if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
-                    p.define(gname, getter, accessor_attr);
+                self.proto_of.insert(segments_proto, Value::heap(obj_proto));
+                self.intl_protos[native::INTL_SEGMENTS as usize] = segments_proto;
+                let seg_iter_proto = build(self, &[("next", INTL_SEGMENT_ITER_NEXT)], None);
+                self.proto_of
+                    .insert(seg_iter_proto, Value::heap(self.iterator_proto_root));
+                self.intl_protos[native::INTL_SEGMENT_ITERATOR as usize] = seg_iter_proto;
+                let seg_tag = self.alloc_str("Segmenter String Iterator".to_string());
+                if let HeapObj::Object(p) = self.heap.get_mut(seg_iter_proto) {
+                    p.define("@@toStringTag", seg_tag, fn_attr);
                 }
+                let gcl = Value::heap(self.heap.alloc(HeapObj::Native(INTL_GET_CANONICAL_LOCALES)));
+                intl_ns_map.define("getCanonicalLocales", gcl, method_attr);
+                let svo = Value::heap(self.heap.alloc(HeapObj::Native(INTL_SUPPORTED_VALUES_OF)));
+                intl_ns_map.define("supportedValuesOf", svo, method_attr);
+                let intltag = self.alloc_str("Intl".to_string());
+                intl_ns_map.define("@@toStringTag", intltag, fn_attr);
+                self.intl_ns = self.heap.alloc(HeapObj::Object(Box::new(intl_ns_map)));
             }
-            // `variants` / `firstDayOfWeek` live outside the LOCALE_ACCESSORS id
-            // block (it is boxed in by INTL_NF_FORMAT_GET), so they wire up here.
-            for (gname, gid) in [
-                ("variants", INTL_LOCALE_GET_VARIANTS),
-                ("firstDayOfWeek", INTL_LOCALE_GET_FIRSTDAY),
-            ] {
-                let getter = Value::heap(self.heap.alloc(HeapObj::Native(gid)));
-                if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
-                    p.define(gname, getter, accessor_attr);
-                }
-            }
-            // The Intl.Locale-info methods (ordinary data-property built-ins).
-            for (i, mname) in native::LOCALE_INFO_METHODS.iter().enumerate() {
-                let f = Value::heap(
-                    self.heap
-                        .alloc(HeapObj::Native(INTL_LOCALE_INFO_BASE + i as u16)),
-                );
-                if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
-                    p.define(mname, f, method_attr);
-                }
-            }
-            // NumberFormat/DateTimeFormat `format` + Collator `compare`: spec says
-            // these are accessors returning a function bound to the instance.
-            for (k, name, gid) in [
-                (native::INTL_NUMBERFORMAT, "format", INTL_NF_FORMAT_GET),
-                (native::INTL_DATETIMEFORMAT, "format", INTL_DTF_FORMAT_GET),
-                (native::INTL_COLLATOR, "compare", INTL_COLLATOR_COMPARE_GET),
-            ] {
-                let getter = Value::heap(self.heap.alloc(HeapObj::Native(gid)));
-                let p = self.intl_protos[k as usize];
-                if let HeapObj::Object(o) = self.heap.get_mut(p) {
-                    o.define(name, getter, accessor_attr);
-                }
-            }
-            // %Segments.prototype% and %SegmentIterator.prototype%. Neither is
-            // reachable from `Intl` — `Intl.Segmenter.prototype.segment` is the
-            // only way to get an object with either as its [[Prototype]] — but
-            // both are ordinary objects with the usual descriptors, and
-            // %SegmentIterator.prototype% inherits from %IteratorPrototype%
-            // (so `[...segments]` and the iterator helpers work) and carries the
-            // "Segmenter String Iterator" toStringTag.
-            let segments_proto = build(
-                self,
-                &[
-                    ("containing", INTL_SEGMENTS_CONTAINING),
-                    ("@@iterator", INTL_SEGMENTS_ITERATOR),
-                ],
-                None,
-            );
-            self.proto_of.insert(segments_proto, Value::heap(obj_proto));
-            self.intl_protos[native::INTL_SEGMENTS as usize] = segments_proto;
-            let seg_iter_proto = build(self, &[("next", INTL_SEGMENT_ITER_NEXT)], None);
-            self.proto_of
-                .insert(seg_iter_proto, Value::heap(self.iterator_proto_root));
-            self.intl_protos[native::INTL_SEGMENT_ITERATOR as usize] = seg_iter_proto;
-            let seg_tag = self.alloc_str("Segmenter String Iterator".to_string());
-            if let HeapObj::Object(p) = self.heap.get_mut(seg_iter_proto) {
-                p.define("@@toStringTag", seg_tag, fn_attr);
-            }
-            let gcl = Value::heap(self.heap.alloc(HeapObj::Native(INTL_GET_CANONICAL_LOCALES)));
-            intl_ns_map.define("getCanonicalLocales", gcl, method_attr);
-            let svo = Value::heap(self.heap.alloc(HeapObj::Native(INTL_SUPPORTED_VALUES_OF)));
-            intl_ns_map.define("supportedValuesOf", svo, method_attr);
-            let intltag = self.alloc_str("Intl".to_string());
-            intl_ns_map.define("@@toStringTag", intltag, fn_attr);
-            self.intl_ns = self.heap.alloc(HeapObj::Object(Box::new(intl_ns_map)));
             let dataview_ctor = build(self, &[], Some(dataview_proto));
             self.dataview_ctor = dataview_ctor;
             if let HeapObj::Object(m) = self.heap.get_mut(dataview_proto) {
@@ -2835,7 +2847,9 @@ impl<'p> Vm<'p> {
             ("DataView", self.dataview_ctor),
             ("Proxy", self.proxy_ctor),
             ("Iterator", self.iterator_ctor),
+            #[cfg(not(feature = "wasm-lite"))]
             ("Temporal", self.temporal_ns),
+            #[cfg(not(feature = "wasm-lite"))]
             ("Intl", self.intl_ns),
             ("Atomics", atomics_ns),
             ("DisposableStack", self.disposablestack_ctor),

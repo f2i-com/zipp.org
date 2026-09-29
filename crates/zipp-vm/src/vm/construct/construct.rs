@@ -195,7 +195,9 @@ impl<'p> Vm<'p> {
         // paths that allocate their result before that read park the result,
         // because the `prototype` Get and the later argument coercions are guest
         // code that runs while both are still Rust locals.
-        self.with_host_roots(&[], |vm| vm.construct_with_newtarget_rooted(cv, args, new_target))
+        self.with_host_roots(&[], |vm| {
+            vm.construct_with_newtarget_rooted(cv, args, new_target)
+        })
     }
 
     fn construct_with_newtarget_rooted(
@@ -598,122 +600,137 @@ impl<'p> Vm<'p> {
                 args.get(1).copied().unwrap_or(Value::UNDEFINED),
             );
         }
-        if ci == self.duration_ctor && ci != 0 {
-            let r = self.build_duration(args)?;
-            self.push_host_root(r);
-            let over = self.newtarget_proto_override(new_target, cv, self.duration_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
-        }
-        if ci == self.plaindate_ctor && ci != 0 {
-            let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-            let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-            let d = self.temporal_ctor_int(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
-            let cal = self
-                .validate_calendar_identifier(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
-            let r = self.make_plain_date(y, m, d)?;
-            let r = self.tag_cal(r, cal);
-            self.push_host_root(r);
-            let over = self.newtarget_proto_override(new_target, cv, self.plaindate_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
-        }
-        if ci == self.plaintime_ctor && ci != 0 {
-            let mut f = [0i64; 6];
-            for (i, slot) in f.iter_mut().enumerate() {
-                let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
-                if v != Value::UNDEFINED {
-                    *slot = self.temporal_ctor_int(v)?;
-                }
-            }
-            let r = self.make_plain_time(f)?;
-            self.push_host_root(r);
-            let over = self.newtarget_proto_override(new_target, cv, self.plaintime_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
-        }
-        if ci == self.plaindatetime_ctor && ci != 0 {
-            // year/month/day are required: an undefined coerces to NaN → RangeError.
-            // The time fields (i >= 3) default to 0 when undefined.
-            let mut f = [0i64; 9];
-            for (i, slot) in f.iter_mut().enumerate() {
-                let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
-                if i < 3 || v != Value::UNDEFINED {
-                    *slot = self.temporal_ctor_int(v)?;
-                }
-            }
-            let cal = self
-                .validate_calendar_identifier(args.get(9).copied().unwrap_or(Value::UNDEFINED))?;
-            let r = self.make_plain_date_time(f)?;
-            let r = self.tag_cal(r, cal);
-            self.push_host_root(r);
-            let over = self.newtarget_proto_override(new_target, cv, self.plaindatetime_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
-        }
-        if ci == self.instant_ctor && ci != 0 {
-            // Beyond-i128 saturates (sign preserved) — certainly outside the
-            // Instant range, which make_instant validates.
-            let ns = self
-                .to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?
-                .to_i128_sat();
-            let r = self.make_instant(ns)?;
-            self.push_host_root(r);
-            let over = self.newtarget_proto_override(new_target, cv, self.instant_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
-        }
-        if ci == self.plainyearmonth_ctor && ci != 0 {
-            // (year, month, calendar?, referenceISODay=1)
-            let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-            let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-            let cal = self
-                .validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
-            let rd = match args.get(3).copied() {
-                Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
-                _ => 1,
-            };
-            let r = self.make_plain_year_month(y, m, rd)?;
-            let r = self.tag_cal(r, cal);
-            self.push_host_root(r);
-            let over = self.newtarget_proto_override(new_target, cv, self.plainyearmonth_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
-        }
-        if ci == self.plainmonthday_ctor && ci != 0 {
-            // (month, day, calendar?, referenceISOYear=1972)
-            let m = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-            let d = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-            let cal = self
-                .validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
-            let ry = match args.get(3).copied() {
-                Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
-                _ => 1972,
-            };
-            let r = self.make_plain_month_day(m, d, ry)?;
-            let r = self.tag_cal(r, cal);
-            self.push_host_root(r);
-            let over = self.newtarget_proto_override(new_target, cv, self.plainmonthday_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
-        }
-        if ci == self.zoneddatetime_ctor && ci != 0 {
-            let cal = self
-                .validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
-            let r = self.make_zoned_date_time(args)?;
-            let r = self.tag_cal(r, cal);
-            self.push_host_root(r);
-            let over = self.newtarget_proto_override(new_target, cv, self.zoneddatetime_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
-        }
-        // Intl.<service> constructors.
-        if self.intl_ctors[0] != 0 {
-            if let Some(kind) = self.intl_ctors.iter().position(|&c| c == ci) {
-                let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                // OrdinaryCreateFromConstructor(newTarget, "%Intl.<svc>.prototype%"):
-                // a subclass / Reflect.construct newTarget supplies the instance's
-                // [[Prototype]] (`class M extends Intl.Collator {}` must produce an
-                // M, not a bare Collator). It is step 2 of every Intl constructor,
-                // BEFORE Initialize<Service> — so a newTarget whose "prototype"
-                // getter throws wins over any options/locale error.
-                let default_proto = self.intl_protos[kind];
-                let over = self.newtarget_proto_override(new_target, cv, default_proto)?;
-                let r = self.make_intl(kind as u8, locales, options)?;
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            if ci == self.duration_ctor && ci != 0 {
+                let r = self.build_duration(args)?;
+                self.push_host_root(r);
+                let over = self.newtarget_proto_override(new_target, cv, self.duration_proto)?;
                 return Ok(self.set_ctor_proto(r, over));
+            }
+            if ci == self.plaindate_ctor && ci != 0 {
+                let y =
+                    self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let d = self.temporal_ctor_int(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+                let cal = self.validate_calendar_identifier(
+                    args.get(3).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                let r = self.make_plain_date(y, m, d)?;
+                let r = self.tag_cal(r, cal);
+                self.push_host_root(r);
+                let over = self.newtarget_proto_override(new_target, cv, self.plaindate_proto)?;
+                return Ok(self.set_ctor_proto(r, over));
+            }
+            if ci == self.plaintime_ctor && ci != 0 {
+                let mut f = [0i64; 6];
+                for (i, slot) in f.iter_mut().enumerate() {
+                    let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
+                    if v != Value::UNDEFINED {
+                        *slot = self.temporal_ctor_int(v)?;
+                    }
+                }
+                let r = self.make_plain_time(f)?;
+                self.push_host_root(r);
+                let over = self.newtarget_proto_override(new_target, cv, self.plaintime_proto)?;
+                return Ok(self.set_ctor_proto(r, over));
+            }
+            if ci == self.plaindatetime_ctor && ci != 0 {
+                // year/month/day are required: an undefined coerces to NaN → RangeError.
+                // The time fields (i >= 3) default to 0 when undefined.
+                let mut f = [0i64; 9];
+                for (i, slot) in f.iter_mut().enumerate() {
+                    let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
+                    if i < 3 || v != Value::UNDEFINED {
+                        *slot = self.temporal_ctor_int(v)?;
+                    }
+                }
+                let cal = self.validate_calendar_identifier(
+                    args.get(9).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                let r = self.make_plain_date_time(f)?;
+                let r = self.tag_cal(r, cal);
+                self.push_host_root(r);
+                let over =
+                    self.newtarget_proto_override(new_target, cv, self.plaindatetime_proto)?;
+                return Ok(self.set_ctor_proto(r, over));
+            }
+            if ci == self.instant_ctor && ci != 0 {
+                // Beyond-i128 saturates (sign preserved) — certainly outside the
+                // Instant range, which make_instant validates.
+                let ns = self
+                    .to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?
+                    .to_i128_sat();
+                let r = self.make_instant(ns)?;
+                self.push_host_root(r);
+                let over = self.newtarget_proto_override(new_target, cv, self.instant_proto)?;
+                return Ok(self.set_ctor_proto(r, over));
+            }
+            if ci == self.plainyearmonth_ctor && ci != 0 {
+                // (year, month, calendar?, referenceISODay=1)
+                let y =
+                    self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let cal = self.validate_calendar_identifier(
+                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                let rd = match args.get(3).copied() {
+                    Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
+                    _ => 1,
+                };
+                let r = self.make_plain_year_month(y, m, rd)?;
+                let r = self.tag_cal(r, cal);
+                self.push_host_root(r);
+                let over =
+                    self.newtarget_proto_override(new_target, cv, self.plainyearmonth_proto)?;
+                return Ok(self.set_ctor_proto(r, over));
+            }
+            if ci == self.plainmonthday_ctor && ci != 0 {
+                // (month, day, calendar?, referenceISOYear=1972)
+                let m =
+                    self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                let d = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let cal = self.validate_calendar_identifier(
+                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                let ry = match args.get(3).copied() {
+                    Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
+                    _ => 1972,
+                };
+                let r = self.make_plain_month_day(m, d, ry)?;
+                let r = self.tag_cal(r, cal);
+                self.push_host_root(r);
+                let over =
+                    self.newtarget_proto_override(new_target, cv, self.plainmonthday_proto)?;
+                return Ok(self.set_ctor_proto(r, over));
+            }
+            if ci == self.zoneddatetime_ctor && ci != 0 {
+                let cal = self.validate_calendar_identifier(
+                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                let r = self.make_zoned_date_time(args)?;
+                let r = self.tag_cal(r, cal);
+                self.push_host_root(r);
+                let over =
+                    self.newtarget_proto_override(new_target, cv, self.zoneddatetime_proto)?;
+                return Ok(self.set_ctor_proto(r, over));
+            }
+            // Intl.<service> constructors.
+            if self.intl_ctors[0] != 0 {
+                if let Some(kind) = self.intl_ctors.iter().position(|&c| c == ci) {
+                    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                    // OrdinaryCreateFromConstructor(newTarget, "%Intl.<svc>.prototype%"):
+                    // a subclass / Reflect.construct newTarget supplies the instance's
+                    // [[Prototype]] (`class M extends Intl.Collator {}` must produce an
+                    // M, not a bare Collator). It is step 2 of every Intl constructor,
+                    // BEFORE Initialize<Service> — so a newTarget whose "prototype"
+                    // getter throws wins over any options/locale error.
+                    let default_proto = self.intl_protos[kind];
+                    let over = self.newtarget_proto_override(new_target, cv, default_proto)?;
+                    let r = self.make_intl(kind as u8, locales, options)?;
+                    return Ok(self.set_ctor_proto(r, over));
+                }
             }
         }
         // Constructing through a Proxy: `construct` trap (or construct the target).
@@ -1386,6 +1403,7 @@ impl<'p> Vm<'p> {
         // MyNF("en").format(1)` otherwise threw "incompatible receiver" — the
         // instance was still a plain Object). `Reflect.construct` already worked;
         // only the derived-`super()` path lands here.
+        #[cfg(not(feature = "wasm-lite"))]
         if cval.is_heap() && self.intl_ctors[0] != 0 {
             if let Some(kind) = self
                 .intl_ctors

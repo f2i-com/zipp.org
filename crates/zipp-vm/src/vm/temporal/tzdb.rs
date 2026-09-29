@@ -13,7 +13,83 @@
 //! split a TZif file makes between its transition array and its proleptic TZ
 //! string. Times are seconds here; the callers scale to nanoseconds.
 
-use super::tzdata::{FinalRule, FINALS, IDS, TRANS_AT, TRANS_OFF, ZONES};
+use super::tzdata::{
+    FinalRule, FINALS, IDS, TRANS_BLOCK_AT, TRANS_BLOCK_POS, TRANS_BYTES, TRANS_PALETTE, ZONES,
+};
+
+/// Random access decodes at most 32 records, with no expanded database or cache.
+fn transition(index: usize) -> (i64, i32) {
+    let block = index / 32;
+    let mut pos = TRANS_BLOCK_POS[block] as usize;
+    let mut time = TRANS_BLOCK_AT[block];
+    let mut offset = TRANS_BYTES[pos];
+    pos += 1;
+    for _ in 0..index % 32 {
+        time += read_delta(&mut pos);
+        offset = TRANS_BYTES[pos];
+        pos += 1;
+    }
+    (time, TRANS_PALETTE[offset as usize])
+}
+
+fn read_delta(pos: &mut usize) -> i64 {
+    let mut n = 0u64;
+    let mut shift = 0;
+    loop {
+        let b = TRANS_BYTES[*pos];
+        *pos += 1;
+        n |= u64::from(b & 127) << shift;
+        if b < 128 {
+            break;
+        }
+        shift += 7;
+    }
+    ((n >> 1) as i64) ^ -((n & 1) as i64)
+}
+
+struct Transitions {
+    lo: usize,
+    hi: usize,
+}
+
+impl Transitions {
+    fn len(&self) -> usize {
+        self.hi - self.lo
+    }
+    fn at(&self, i: usize) -> i64 {
+        transition(self.lo + i).0
+    }
+    // Search the absolute checkpoints, then stream just one block. A checkpoint
+    // outside this zone is excluded even when its block contains the zone edge.
+    fn partition_point(&self, pred: impl Fn(i64) -> bool) -> usize {
+        let first = self.lo.div_ceil(32);
+        let end = self.hi.div_ceil(32);
+        let checkpoints = &TRANS_BLOCK_AT[first..end];
+        let n = checkpoints.partition_point(|&t| pred(t));
+        let start = if n == 0 {
+            self.lo
+        } else {
+            (first + n - 1) * 32
+        };
+        if start == self.hi {
+            return self.len();
+        }
+        let block = start / 32;
+        let stop = ((block + 1) * 32).min(self.hi);
+        let mut pos = TRANS_BLOCK_POS[block] as usize + 1;
+        let mut time = TRANS_BLOCK_AT[block];
+        for i in block * 32..stop {
+            if i >= start && !pred(time) {
+                return i - self.lo;
+            }
+            if i + 1 < stop {
+                time += read_delta(&mut pos);
+                pos += 1; // offset index
+            }
+        }
+        stop - self.lo
+    }
+}
 
 /// A resolved time zone identifier: the canonical spelling of what the caller
 /// wrote (`"africa/cairo"` → `"Africa/Cairo"`) and the zone it denotes.
@@ -142,12 +218,7 @@ fn final_transitions(zone: u16, year: i64, out: &mut Vec<(i64, i32)>) {
     // the last rule of the preceding year (which is why a southern-hemisphere
     // zone correctly starts January already on DST).
     let mut save = if year == z.fin_year as i64 {
-        let last = if z.ntr > 0 {
-            TRANS_OFF[(z.tr + z.ntr - 1) as usize]
-        } else {
-            z.init
-        };
-        last - z.std
+        z.last_off - z.std
     } else {
         rules[rules.len() - 1].save
     };
@@ -170,14 +241,20 @@ fn final_transitions(zone: u16, year: i64, out: &mut Vec<(i64, i32)>) {
 pub(crate) fn offset_seconds(zone: u16, t: i64) -> i32 {
     let z = &ZONES[zone as usize];
     let (lo, hi) = (z.tr as usize, (z.tr + z.ntr) as usize);
-    let at = &TRANS_AT[lo..hi];
-    let i = at.partition_point(|&x| x <= t);
-    let mut off = if i > 0 { TRANS_OFF[lo + i - 1] } else { z.init };
+    let at = Transitions { lo, hi };
+    // Most real-world dates use annual rules. Avoid decoding any historical
+    // block in that case; the generated tail costs only two scalars per zone.
+    let (i, mut off) = if t >= z.last_at {
+        (at.len(), z.last_off)
+    } else {
+        let i = at.partition_point(|x| x <= t);
+        (i, if i > 0 { transition(lo + i - 1).1 } else { z.init })
+    };
     // Past the explicit list the annual rules take over. Scanning the year
     // either side covers a transition that lands in the neighbouring civil
     // year once the offset is applied.
     if i == at.len() && z.nfin > 0 {
-        let mut best = if i > 0 { at[i - 1] } else { i64::MIN };
+        let mut best = z.last_at;
         let y = civil_year(t);
         let mut buf = Vec::with_capacity(4);
         for yy in (y - 1)..=(y + 1) {
@@ -219,10 +296,10 @@ pub(crate) fn possible_instants(zone: u16, local: i64) -> Vec<i64> {
 pub(crate) fn next_transition(zone: u16, t: i64) -> Option<i64> {
     let z = &ZONES[zone as usize];
     let (lo, hi) = (z.tr as usize, (z.tr + z.ntr) as usize);
-    let at = &TRANS_AT[lo..hi];
-    let i = at.partition_point(|&x| x <= t);
+    let at = Transitions { lo, hi };
+    let i = at.partition_point(|x| x <= t);
     if i < at.len() {
-        return Some(at[i]);
+        return Some(at.at(i));
     }
     if z.nfin == 0 {
         return None;
@@ -255,7 +332,7 @@ pub(crate) fn next_transition(zone: u16, t: i64) -> Option<i64> {
 pub(crate) fn previous_transition(zone: u16, t: i64) -> Option<i64> {
     let z = &ZONES[zone as usize];
     let (lo, hi) = (z.tr as usize, (z.tr + z.ntr) as usize);
-    let at = &TRANS_AT[lo..hi];
+    let at = Transitions { lo, hi };
     if z.nfin > 0 {
         let y = civil_year(t);
         let mut buf = Vec::with_capacity(4);
@@ -265,7 +342,7 @@ pub(crate) fn previous_transition(zone: u16, t: i64) -> Option<i64> {
             for &(tt, _) in buf.iter() {
                 if tt < t
                     && best.map_or(true, |b| tt > b)
-                    && at.last().map_or(true, |&l| tt > l)
+                    && tt > z.last_at
                     && offset_seconds(zone, tt - 1) != offset_seconds(zone, tt)
                 {
                     best = Some(tt);
@@ -279,9 +356,9 @@ pub(crate) fn previous_transition(zone: u16, t: i64) -> Option<i64> {
             return best;
         }
     }
-    let i = at.partition_point(|&x| x < t);
+    let i = at.partition_point(|x| x < t);
     if i > 0 {
-        Some(at[i - 1])
+        Some(at.at(i - 1))
     } else {
         None
     }
@@ -290,6 +367,40 @@ pub(crate) fn previous_transition(zone: u16, t: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_transitions_match_original_database() {
+        use super::super::tzdata::{TRANS_AT, TRANS_OFF};
+        for (i, (&time, &offset)) in TRANS_AT.iter().zip(TRANS_OFF).enumerate() {
+            assert_eq!(transition(i), (time, offset), "record {i}");
+        }
+        for z in ZONES {
+            let lo = z.tr as usize;
+            let hi = lo + z.ntr as usize;
+            let packed = Transitions { lo, hi };
+            let original = &TRANS_AT[lo..hi];
+            assert_eq!(z.last_at, original.last().copied().unwrap_or(i64::MIN));
+            assert_eq!(z.last_off, if hi > lo { TRANS_OFF[hi - 1] } else { z.init });
+            for t in original
+                .iter()
+                .flat_map(|&t| [t - 1, t, t + 1])
+                .chain([i64::MIN, i64::MAX, 0])
+            {
+                assert_eq!(
+                    packed.partition_point(|x| x <= t),
+                    original.partition_point(|&x| x <= t),
+                    "{} at {t}",
+                    z.name
+                );
+                assert_eq!(
+                    packed.partition_point(|x| x < t),
+                    original.partition_point(|&x| x < t),
+                    "{} before {t}",
+                    z.name
+                );
+            }
+        }
+    }
 
     #[test]
     fn identifier_lookup_is_case_insensitive_and_canonicalizes() {

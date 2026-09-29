@@ -32,6 +32,10 @@ dynasmrt = { workspace = true, optional = true }
 self_cell = "1.3.0"
 
 [features]
+# Artifact-internal, subtractive profile for the standalone ZIPP Lite WASM.
+# Retains ECMAScript core; omits ECMA-402 and Temporal. Do not feature-unify
+# with full embedders. Python and JIT are deliberately incompatible.
+wasm-lite = ["safe-sandbox", "wasm-no-fs-loader", "wasm-single-agent"]
 # Experimental Python-subset frontend (see docs/PYTHON_FRONTEND_EXPERIMENT.md).
 # Pulls in the Python parser and `instrument` (a Python state starts with the
 # VM JIT off; a host without an instruction budget, such as the CLI's

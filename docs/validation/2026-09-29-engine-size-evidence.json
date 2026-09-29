@@ -1,0 +1,1645 @@
+{
+  "baseline_commit": "09862c666dc30e9d510ecd4fe85bda6a75eaea7f",
+  "toolchain": {
+    "rust": "1.92.0",
+    "wasm_bindgen": "0.2.126",
+    "twiggy": "0.8.0",
+    "binaryen": "125",
+    "environment": {
+      "node": "v24.19.0",
+      "v8": "13.6.233.17-node.51",
+      "platform": "win32",
+      "arch": "x64",
+      "cpu": "AMD Ryzen 9 9950X3D 16-Core Processor          ",
+      "cores": 32
+    }
+  },
+  "postprocess": "wasm-bindgen web; strip name, producers and target_features; gzip9/Brotli11 using Node zlib",
+  "baseline_wasm": [
+    {
+      "path": "target/size-audit/javascript/web/stripped.wasm",
+      "bytes": 5749516,
+      "sha256": "d4fba7a0a59bfcf6a8de6b613f74eb743c323e31377eca7b8873427ba4ecaba7",
+      "gzip9": 1942490,
+      "brotli11": 1326687,
+      "sections": [
+        {
+          "name": "type",
+          "bytes": 2175
+        },
+        {
+          "name": "import",
+          "bytes": 2813
+        },
+        {
+          "name": "function",
+          "bytes": 4151
+        },
+        {
+          "name": "table",
+          "bytes": 13
+        },
+        {
+          "name": "memory",
+          "bytes": 9
+        },
+        {
+          "name": "global",
+          "bytes": 27
+        },
+        {
+          "name": "export",
+          "bytes": 1264
+        },
+        {
+          "name": "element",
+          "bytes": 618
+        },
+        {
+          "name": "code",
+          "bytes": 4567602
+        },
+        {
+          "name": "data",
+          "bytes": 1170836
+        }
+      ]
+    },
+    {
+      "path": "target/size-audit/python/web/stripped.wasm",
+      "bytes": 7473393,
+      "sha256": "100425df627645b88addb9f7694f6953fbba9cf568353da1f6f0c7f29f31a6b5",
+      "gzip9": 2467231,
+      "brotli11": 1703770,
+      "sections": [
+        {
+          "name": "type",
+          "bytes": 2410
+        },
+        {
+          "name": "import",
+          "bytes": 2873
+        },
+        {
+          "name": "function",
+          "bytes": 4969
+        },
+        {
+          "name": "table",
+          "bytes": 13
+        },
+        {
+          "name": "memory",
+          "bytes": 9
+        },
+        {
+          "name": "global",
+          "bytes": 27
+        },
+        {
+          "name": "export",
+          "bytes": 1457
+        },
+        {
+          "name": "element",
+          "bytes": 740
+        },
+        {
+          "name": "code",
+          "bytes": 5452711
+        },
+        {
+          "name": "data",
+          "bytes": 2008176
+        }
+      ]
+    },
+    {
+      "path": "target/size-audit/all/web/stripped.wasm",
+      "bytes": 9432864,
+      "sha256": "958ec441f37d52fb37772dcaf15aeea93d5916b08733b64453dbe61196d6ef33",
+      "gzip9": 2915233,
+      "brotli11": 2050540,
+      "sections": [
+        {
+          "name": "type",
+          "bytes": 2577
+        },
+        {
+          "name": "import",
+          "bytes": 2873
+        },
+        {
+          "name": "function",
+          "bytes": 5295
+        },
+        {
+          "name": "table",
+          "bytes": 13
+        },
+        {
+          "name": "memory",
+          "bytes": 9
+        },
+        {
+          "name": "global",
+          "bytes": 27
+        },
+        {
+          "name": "export",
+          "bytes": 1457
+        },
+        {
+          "name": "element",
+          "bytes": 864
+        },
+        {
+          "name": "code",
+          "bytes": 5628971
+        },
+        {
+          "name": "data",
+          "bytes": 3790770
+        }
+      ]
+    }
+  ],
+  "final_wasm": [
+    {
+      "path": "target/size-audit/javascript-final/web/stripped.wasm",
+      "bytes": 5534466,
+      "sha256": "f7e0efa52a57e87f3e0625616883e1740a92ee170db6ffa4bba5514f329d3362",
+      "gzip9": 1905642,
+      "brotli11": 1325640,
+      "sections": [
+        {
+          "name": "type",
+          "bytes": 2175
+        },
+        {
+          "name": "import",
+          "bytes": 2813
+        },
+        {
+          "name": "function",
+          "bytes": 4154
+        },
+        {
+          "name": "table",
+          "bytes": 13
+        },
+        {
+          "name": "memory",
+          "bytes": 9
+        },
+        {
+          "name": "global",
+          "bytes": 27
+        },
+        {
+          "name": "export",
+          "bytes": 1264
+        },
+        {
+          "name": "element",
+          "bytes": 618
+        },
+        {
+          "name": "code",
+          "bytes": 4569581
+        },
+        {
+          "name": "data",
+          "bytes": 953804
+        }
+      ]
+    },
+    {
+      "path": "target/size-audit/python-final/web/stripped.wasm",
+      "bytes": 7258351,
+      "sha256": "b406bd76a435496994061cb716b03f45497078d4ad9722f2dae3b90d3ff053a4",
+      "gzip9": 2428781,
+      "brotli11": 1701116,
+      "sections": [
+        {
+          "name": "type",
+          "bytes": 2410
+        },
+        {
+          "name": "import",
+          "bytes": 2873
+        },
+        {
+          "name": "function",
+          "bytes": 4972
+        },
+        {
+          "name": "table",
+          "bytes": 13
+        },
+        {
+          "name": "memory",
+          "bytes": 9
+        },
+        {
+          "name": "global",
+          "bytes": 27
+        },
+        {
+          "name": "export",
+          "bytes": 1457
+        },
+        {
+          "name": "element",
+          "bytes": 740
+        },
+        {
+          "name": "code",
+          "bytes": 5454690
+        },
+        {
+          "name": "data",
+          "bytes": 1791152
+        }
+      ]
+    },
+    {
+      "path": "target/size-audit/all-final/web/stripped.wasm",
+      "bytes": 9217822,
+      "sha256": "36aae46023164d87a4ebf4d5dd2c9bb42fa23f2449860073ce43afb49d6b90dd",
+      "gzip9": 2877628,
+      "brotli11": 2048552,
+      "sections": [
+        {
+          "name": "type",
+          "bytes": 2577
+        },
+        {
+          "name": "import",
+          "bytes": 2873
+        },
+        {
+          "name": "function",
+          "bytes": 5298
+        },
+        {
+          "name": "table",
+          "bytes": 13
+        },
+        {
+          "name": "memory",
+          "bytes": 9
+        },
+        {
+          "name": "global",
+          "bytes": 27
+        },
+        {
+          "name": "export",
+          "bytes": 1457
+        },
+        {
+          "name": "element",
+          "bytes": 864
+        },
+        {
+          "name": "code",
+          "bytes": 5630950
+        },
+        {
+          "name": "data",
+          "bytes": 3573746
+        }
+      ]
+    },
+    {
+      "path": "target/size-audit/lite-final/web/stripped.wasm",
+      "bytes": 3076218,
+      "sha256": "17ab27a288673753d5aa802c8f3266fc557c206eadf8937fb6deb67e19f35c4b",
+      "gzip9": 1033749,
+      "brotli11": 780480,
+      "sections": [
+        {
+          "name": "type",
+          "bytes": 1829
+        },
+        {
+          "name": "import",
+          "bytes": 2813
+        },
+        {
+          "name": "function",
+          "bytes": 7239
+        },
+        {
+          "name": "table",
+          "bytes": 13
+        },
+        {
+          "name": "memory",
+          "bytes": 9
+        },
+        {
+          "name": "global",
+          "bytes": 27
+        },
+        {
+          "name": "export",
+          "bytes": 1264
+        },
+        {
+          "name": "element",
+          "bytes": 853
+        },
+        {
+          "name": "code",
+          "bytes": 2515843
+        },
+        {
+          "name": "data",
+          "bytes": 546320
+        }
+      ]
+    }
+  ],
+  "native_baseline": [
+    {
+      "path": "target/size-audit/native/zipp-javascript.exe",
+      "bytes": 8742400,
+      "sections": [
+        {
+          "name": ".text",
+          "virtual_bytes": 6939227,
+          "file_bytes": 6939648
+        },
+        {
+          "name": ".rdata",
+          "virtual_bytes": 1643754,
+          "file_bytes": 1644032
+        },
+        {
+          "name": ".data",
+          "virtual_bytes": 64032,
+          "file_bytes": 32768
+        },
+        {
+          "name": ".pdata",
+          "virtual_bytes": 64068,
+          "file_bytes": 64512
+        },
+        {
+          "name": ".reloc",
+          "virtual_bytes": 60280,
+          "file_bytes": 60416
+        }
+      ]
+    },
+    {
+      "path": "target/size-audit/native/release/zipp.exe",
+      "bytes": 17339904,
+      "sections": [
+        {
+          "name": ".text",
+          "virtual_bytes": 11917165,
+          "file_bytes": 11917312
+        },
+        {
+          "name": ".rdata",
+          "virtual_bytes": 5193724,
+          "file_bytes": 5193728
+        },
+        {
+          "name": ".data",
+          "virtual_bytes": 65184,
+          "file_bytes": 33280
+        },
+        {
+          "name": ".pdata",
+          "virtual_bytes": 111576,
+          "file_bytes": 111616
+        },
+        {
+          "name": ".reloc",
+          "virtual_bytes": 82524,
+          "file_bytes": 82944
+        }
+      ]
+    }
+  ],
+  "baseline_attribution": {
+    "path": "target/size-audit/javascript/symbols.json",
+    "attribution": "Shallow symbol sizes; inlining and generic symbols prevent exact subsystem totals.",
+    "groups": {
+      "Other VM": 1951208,
+      "Data segments": 1170831,
+      "Rust/dependencies/other": 662906,
+      "JS compiler": 453282,
+      "RegExp": 440307,
+      "JS parser": 345926,
+      "Metadata/sections": 302690,
+      "Temporal": 244612,
+      "Intl": 179867,
+      "Heap, shapes and GC": 174075,
+      "WASM host/glue": 71187,
+      "Other engine": 55272
+    },
+    "largest": [
+      {
+        "name": "data segment \".rodata\"",
+        "shallow_size": 1170682,
+        "shallow_size_percent": 19.343200108787553
+      },
+      {
+        "name": "\"function names\" subsection",
+        "shallow_size": 302291,
+        "shallow_size_percent": 4.994759724746343
+      },
+      {
+        "name": "zipp_vm::vm::dispatch::<impl zipp_vm::vm::Vm>::dispatch_body::h2bf256bc78df247a",
+        "shallow_size": 280051,
+        "shallow_size_percent": 4.627287797767509
+      },
+      {
+        "name": "zipp_vm::vm::natives::<impl zipp_vm::vm::Vm>::call_native::ha3db177301ee387f",
+        "shallow_size": 130471,
+        "shallow_size_percent": 2.1557747205420608
+      },
+      {
+        "name": "zipp_vm::vm::setup::<impl zipp_vm::vm::Vm>::setup_globals::h7490a9bbca7538a8",
+        "shallow_size": 81103,
+        "shallow_size_percent": 1.3400663531368868
+      },
+      {
+        "name": "zipp_vm::vm::temporal::duration::<impl zipp_vm::vm::Vm>::temporal_method::hae9f0f06d85a41da",
+        "shallow_size": 47131,
+        "shallow_size_percent": 0.7787463754693983
+      },
+      {
+        "name": "zipp_vm::compile::decls::<impl zipp_vm::compile::FnCompiler>::stmt_inner::h1cac16385c0e4195",
+        "shallow_size": 45884,
+        "shallow_size_percent": 0.7581421716500366
+      },
+      {
+        "name": "zipp_vm::vm::array_ops::<impl zipp_vm::vm::Vm>::array_method::hbcd1da8c339acf61",
+        "shallow_size": 36819,
+        "shallow_size_percent": 0.6083610107659031
+      },
+      {
+        "name": "zipp_vm::vm::natives::<impl zipp_vm::vm::Vm>::create_realm::h6056f02767ba095c",
+        "shallow_size": 36738,
+        "shallow_size_percent": 0.607022646283651
+      },
+      {
+        "name": "zipp_vm::compile::funcs::<impl zipp_vm::compile::FnCompiler>::compile_class::h9f7134667e346f82",
+        "shallow_size": 31046,
+        "shallow_size_percent": 0.5129736261234207
+      },
+      {
+        "name": "zipp_vm::vm::gc::<impl zipp_vm::vm::Vm>::prune_freed::h879de7db4b6d9def",
+        "shallow_size": 30195,
+        "shallow_size_percent": 0.4989125375506245
+      },
+      {
+        "name": "zipp_vm::vm::intl::<impl zipp_vm::vm::Vm>::make_intl_dtf::h14e128afaddf328e",
+        "shallow_size": 29464,
+        "shallow_size_percent": 0.4868342111737572
+      },
+      {
+        "name": "zipp_vm::compile::exprs::<impl zipp_vm::compile::FnCompiler>::expr_into::hba939a0840576507",
+        "shallow_size": 27170,
+        "shallow_size_percent": 0.4489304071949153
+      },
+      {
+        "name": "zipp_vm::vm::string_ops::<impl zipp_vm::vm::Vm>::string_method::h585080aaba41b062",
+        "shallow_size": 25253,
+        "shallow_size_percent": 0.4172557811149501
+      },
+      {
+        "name": "zipp_vm::vm::gc::<impl zipp_vm::vm::Vm>::gc_major_tail::hd36bcef46441e2c0",
+        "shallow_size": 25070,
+        "shallow_size_percent": 0.4142320687661584
+      },
+      {
+        "name": "zipp_vm::vm::props::member::<impl zipp_vm::vm::Vm>::get_member_slow::hc59d8a9f3caf3dbf",
+        "shallow_size": 24472,
+        "shallow_size_percent": 0.4043513038231125
+      },
+      {
+        "name": "zipp_vm::compile::compiler::<impl zipp_vm::compile::Compiler>::compile_function_body::heff03f0a4b9fb463",
+        "shallow_size": 24137,
+        "shallow_size_percent": 0.3988160926928108
+      },
+      {
+        "name": "zipp_vm::vm::construct::construct::<impl zipp_vm::vm::Vm>::construct_with_newtarget_rooted::hc77e09bd7636bf7d",
+        "shallow_size": 23841,
+        "shallow_size_percent": 0.39392527927618604
+      },
+      {
+        "name": "zipp_vm::vm::intl::number::<impl zipp_vm::vm::Vm>::nf_parts::hba3c95d8b3bbbc08",
+        "shallow_size": 22717,
+        "shallow_size_percent": 0.3753534067076515
+      },
+      {
+        "name": "zipp_vm::vm::gc::<impl zipp_vm::vm::Vm>::mark_roots::h2fbe11691cd59ba3",
+        "shallow_size": 21866,
+        "shallow_size_percent": 0.36129231813485524
+      },
+      {
+        "name": "zipp_vm::vm::engine::eval_prog::<impl zipp_vm::vm::Vm>::prepare_eval_program::h351abf5a523de5de",
+        "shallow_size": 21536,
+        "shallow_size_percent": 0.3558397220960506
+      },
+      {
+        "name": "zipp_vm::vm::proxy_regexp::<impl zipp_vm::vm::Vm>::regex_replace::heeeee6ea9cfcc1b2",
+        "shallow_size": 17898,
+        "shallow_size_percent": 0.2957289815228043
+      },
+      {
+        "name": "zipp_vm::vm::temporal::instant_zdt::<impl zipp_vm::vm::Vm>::zoned_date_time_method::he6b4f02767c46854",
+        "shallow_size": 17743,
+        "shallow_size_percent": 0.29316791368639605
+      },
+      {
+        "name": "zipp_vm::vm::builtins::<impl zipp_vm::vm::Vm>::typed_array_method::h604de49ef4a4ac26",
+        "shallow_size": 17576,
+        "shallow_size_percent": 0.29040856963039496
+      },
+      {
+        "name": "zipp_vm::compile::entry::compile_eval::h9a444cef0a3a0e35",
+        "shallow_size": 16789,
+        "shallow_size_percent": 0.2774049542287609
+      },
+      {
+        "name": "zipp_vm::parse::funcs::<impl zipp_vm::parse::parser::Parser>::parse_class_rest_dec::h641c4732990e746a",
+        "shallow_size": 16606,
+        "shallow_size_percent": 0.2743812418799692
+      },
+      {
+        "name": "zipp_vm::vm::engine::boot::<impl zipp_vm::vm::Vm>::new::h36f8bea23a3e4021",
+        "shallow_size": 16403,
+        "shallow_size_percent": 0.27102706916518937
+      },
+      {
+        "name": "zipp_vm::vm::temporal::plain_date_time::<impl zipp_vm::vm::Vm>::plain_date_time_method::hb0f3acd0cb16ddfa",
+        "shallow_size": 16127,
+        "shallow_size_percent": 0.2664667161145528
+      },
+      {
+        "name": "zipp_vm::vm::typedarray::<impl zipp_vm::vm::Vm>::atomics_op::ha78bd903bd6c6fcc",
+        "shallow_size": 14130,
+        "shallow_size_percent": 0.23347024857063498
+      },
+      {
+        "name": "regress::classicalbacktrack::MatchAttempter<Input>::try_at_pos::h4576e6e1bceeb2aa",
+        "shallow_size": 14128,
+        "shallow_size_percent": 0.23343720253403616
+      }
+    ]
+  },
+  "python_attribution": {
+    "path": "target/size-audit/python/symbols.json",
+    "attribution": "Shallow symbol sizes; inlining and generic symbols prevent exact subsystem totals.",
+    "groups": {
+      "Data segments": 2008171,
+      "Other VM": 1965183,
+      "Rust/dependencies/other": 795681,
+      "JS compiler": 453307,
+      "RegExp": 440271,
+      "Metadata/sections": 362904,
+      "JS parser": 345944,
+      "Python compiler": 310865,
+      "Temporal": 244683,
+      "Python VM helpers": 182991,
+      "Intl": 179945,
+      "Heap, shapes and GC": 176500,
+      "Python parser": 141225,
+      "Other engine": 94175,
+      "WASM host/glue": 88973,
+      "Python AST adapter": 45436
+    },
+    "largest": [
+      {
+        "name": "data segment \".rodata\"",
+        "shallow_size": 2007930,
+        "shallow_size_percent": 25.62359515145885
+      },
+      {
+        "name": "\"function names\" subsection",
+        "shallow_size": 362505,
+        "shallow_size_percent": 4.625998595757616
+      },
+      {
+        "name": "zipp_vm::vm::dispatch::<impl zipp_vm::vm::Vm>::dispatch_body::he147ee9ca591575f",
+        "shallow_size": 278735,
+        "shallow_size_percent": 3.556992920341786
+      },
+      {
+        "name": "zipp_vm::vm::natives::<impl zipp_vm::vm::Vm>::call_native::h44a9c80eb18dc464",
+        "shallow_size": 133549,
+        "shallow_size_percent": 1.704245421345454
+      },
+      {
+        "name": "zipp_vm::vm::setup::<impl zipp_vm::vm::Vm>::setup_globals::h827a986cda4d6652",
+        "shallow_size": 84737,
+        "shallow_size_percent": 1.081345755254998
+      },
+      {
+        "name": "zipp_vm::vm::temporal::duration::<impl zipp_vm::vm::Vm>::temporal_method::hb37e5a4e7897bd53",
+        "shallow_size": 47143,
+        "shallow_size_percent": 0.6016012242584275
+      },
+      {
+        "name": "zipp_vm::compile::decls::<impl zipp_vm::compile::FnCompiler>::stmt_inner::hd6a1b6cbd75f179e",
+        "shallow_size": 45884,
+        "shallow_size_percent": 0.585534874188611
+      },
+      {
+        "name": "zipp_vm::vm::array_ops::<impl zipp_vm::vm::Vm>::array_method::h7bfabe262733e339",
+        "shallow_size": 36821,
+        "shallow_size_percent": 0.4698801238448881
+      },
+      {
+        "name": "zipp_vm::vm::natives::<impl zipp_vm::vm::Vm>::create_realm::h5d224d9efd67a69f",
+        "shallow_size": 36738,
+        "shallow_size_percent": 0.46882094429302573
+      },
+      {
+        "name": "zipp_vm::compile::funcs::<impl zipp_vm::compile::FnCompiler>::compile_class::h9699fcea83e47c71",
+        "shallow_size": 31053,
+        "shallow_size_percent": 0.3962735255901608
+      },
+      {
+        "name": "zipp_vm::vm::gc::<impl zipp_vm::vm::Vm>::prune_freed::h7439bdc7d3075abe",
+        "shallow_size": 30195,
+        "shallow_size_percent": 0.3853244164877759
+      },
+      {
+        "name": "zipp_vm::frontend::python::stmts::<impl zipp_vm::frontend::python::emitter::Emitter>::suite::h29b3ac81a1be9348",
+        "shallow_size": 29689,
+        "shallow_size_percent": 0.37886724958124124
+      },
+      {
+        "name": "zipp_vm::vm::intl::<impl zipp_vm::vm::Vm>::make_intl_dtf::h267f65148db3c761",
+        "shallow_size": 29486,
+        "shallow_size_percent": 0.37627672609897533
+      },
+      {
+        "name": "zipp_vm::compile::exprs::<impl zipp_vm::compile::FnCompiler>::expr_into::h78f3995c0c36ac0d",
+        "shallow_size": 27173,
+        "shallow_size_percent": 0.34676007184044827
+      },
+      {
+        "name": "zipp_vm::vm::string_ops::<impl zipp_vm::vm::Vm>::string_method::h32c19b32203cfbbc",
+        "shallow_size": 25254,
+        "shallow_size_percent": 0.3222713301534126
+      },
+      {
+        "name": "zipp_vm::vm::gc::<impl zipp_vm::vm::Vm>::gc_major_tail::h971c166fc6609851",
+        "shallow_size": 25070,
+        "shallow_size_percent": 0.3199232694601273
+      },
+      {
+        "name": "zipp_vm::vm::props::member::<impl zipp_vm::vm::Vm>::get_member_slow::haf9730e4c48dd829",
+        "shallow_size": 24622,
+        "shallow_size_percent": 0.31420625211995423
+      },
+      {
+        "name": "zipp_vm::compile::compiler::<impl zipp_vm::compile::Compiler>::compile_function_body::he576c3cf2b1a1c5a",
+        "shallow_size": 24138,
+        "shallow_size_percent": 0.3080298316006602
+      },
+      {
+        "name": "zipp_vm::vm::construct::construct::<impl zipp_vm::vm::Vm>::construct_with_newtarget_rooted::h177625fdc1569ea5",
+        "shallow_size": 23845,
+        "shallow_size_percent": 0.30429080017059174
+      },
+      {
+        "name": "zipp_vm::vm::intl::number::<impl zipp_vm::vm::Vm>::nf_parts::h11939f62b8bac69a",
+        "shallow_size": 22727,
+        "shallow_size_percent": 0.2900237792189993
+      },
+      {
+        "name": "zipp_vm::vm::gc::<impl zipp_vm::vm::Vm>::mark_roots::h59dd6953f1901517",
+        "shallow_size": 21866,
+        "shallow_size_percent": 0.2790363865183543
+      },
+      {
+        "name": "<zipp_vm::bytecode::FuncProto as core::clone::Clone>::clone::h8690a5570ab85823",
+        "shallow_size": 21809,
+        "shallow_size_percent": 0.27830899815141263
+      },
+      {
+        "name": "zipp_vm::vm::engine::eval_prog::<impl zipp_vm::vm::Vm>::prepare_eval_program::h5c5bcc9a3536400c",
+        "shallow_size": 21542,
+        "shallow_size_percent": 0.2749017579062649
+      },
+      {
+        "name": "zipp_vm::vm::proxy_regexp::<impl zipp_vm::vm::Vm>::regex_replace::h233a9970d34de652",
+        "shallow_size": 17898,
+        "shallow_size_percent": 0.2283999472196792
+      },
+      {
+        "name": "zipp_pyparse::tree::build::Builder::expr::h79a361d1a2dbbc60",
+        "shallow_size": 17897,
+        "shallow_size_percent": 0.22838718602025918
+      },
+      {
+        "name": "zipp_vm::vm::temporal::instant_zdt::<impl zipp_vm::vm::Vm>::zoned_date_time_method::had72f51a23ce16f3",
+        "shallow_size": 17747,
+        "shallow_size_percent": 0.2264730061072548
+      },
+      {
+        "name": "zipp_vm::vm::builtins::<impl zipp_vm::vm::Vm>::typed_array_method::h698a61058d0238ec",
+        "shallow_size": 17580,
+        "shallow_size_percent": 0.22434188580410996
+      },
+      {
+        "name": "zipp_vm::compile::entry::compile_eval::h1638498f059b85ca",
+        "shallow_size": 16789,
+        "shallow_size_percent": 0.21424777706286702
+      },
+      {
+        "name": "zipp_vm::parse::funcs::<impl zipp_vm::parse::parser::Parser>::parse_class_rest_dec::hacd4d2effa901fde",
+        "shallow_size": 16607,
+        "shallow_size_percent": 0.21192523876842176
+      },
+      {
+        "name": "zipp_vm::vm::engine::boot::<impl zipp_vm::vm::Vm>::new::h7ae72fb8bcd6a8bf",
+        "shallow_size": 16403,
+        "shallow_size_percent": 0.20932195408673582
+      }
+    ]
+  },
+  "lite_attribution": {
+    "path": "target/size-audit/lite-final/symbols.json",
+    "attribution": "Shallow symbol sizes; inlining and generic symbols prevent exact subsystem totals.",
+    "groups": {
+      "Other VM": 1074969,
+      "Rust/dependencies/other": 634526,
+      "Metadata/sections": 557370,
+      "Data segments": 546315,
+      "RegExp": 249310,
+      "JS compiler": 234954,
+      "JS parser": 183726,
+      "Heap, shapes and GC": 71264,
+      "WASM host/glue": 54199,
+      "Other engine": 26789,
+      "Intl": 123
+    },
+    "largest": [
+      {
+        "name": "\"function names\" subsection",
+        "shallow_size": 556971,
+        "shallow_size_percent": 15.328584068726272
+      },
+      {
+        "name": "data segment \".rodata\"",
+        "shallow_size": 546138,
+        "shallow_size_percent": 15.03044547404807
+      },
+      {
+        "name": "zipp_vm::vm::dispatch::<impl zipp_vm::vm::Vm>::dispatch_body::h3a5bbd1896610ac6",
+        "shallow_size": 207815,
+        "shallow_size_percent": 5.719345707841791
+      },
+      {
+        "name": "zipp_vm::vm::natives::<impl zipp_vm::vm::Vm>::call_native::h46731df3ea9167ae",
+        "shallow_size": 114227,
+        "shallow_size_percent": 3.1436792443742956
+      },
+      {
+        "name": "zipp_vm::vm::array_ops::<impl zipp_vm::vm::Vm>::array_method::hfe7d37545c967400",
+        "shallow_size": 30857,
+        "shallow_size_percent": 0.849225756114208
+      },
+      {
+        "name": "zipp_vm::vm::setup::<impl zipp_vm::vm::Vm>::setup_globals::hb56b3abac20aac2c",
+        "shallow_size": 28972,
+        "shallow_size_percent": 0.7973480444029177
+      },
+      {
+        "name": "zipp_vm::compile::decls::<impl zipp_vm::compile::FnCompiler>::stmt_inner::h35fcf2b1bbb5c1f1",
+        "shallow_size": 24483,
+        "shallow_size_percent": 0.6738047829323704
+      },
+      {
+        "name": "zipp_vm::vm::string_ops::<impl zipp_vm::vm::Vm>::string_method::h1587b0961be6583c",
+        "shallow_size": 21541,
+        "shallow_size_percent": 0.5928370227972958
+      },
+      {
+        "name": "zipp_vm::compile::exprs::<impl zipp_vm::compile::FnCompiler>::expr_into::h11eff498b5ffb3de",
+        "shallow_size": 21210,
+        "shallow_size_percent": 0.583727461748788
+      },
+      {
+        "name": "zipp_vm::compile::funcs::<impl zipp_vm::compile::FnCompiler>::compile_class::hae13377a673b5e00",
+        "shallow_size": 18899,
+        "shallow_size_percent": 0.5201256624040709
+      },
+      {
+        "name": "zipp_vm::vm::engine::modules::<impl zipp_vm::vm::Vm>::import_module_inner::he3999fd2d67c184c",
+        "shallow_size": 17686,
+        "shallow_size_percent": 0.4867422861145245
+      },
+      {
+        "name": "zipp_vm::parse::parser::Parser::with_syntax_recursion::h877ab60f753e0bf8",
+        "shallow_size": 16243,
+        "shallow_size_percent": 0.4470290033562265
+      },
+      {
+        "name": "zipp_vm::vm::builtins::<impl zipp_vm::vm::Vm>::typed_array_method::haabebcdd8fc6511e",
+        "shallow_size": 16107,
+        "shallow_size_percent": 0.4432861021399212
+      },
+      {
+        "name": "zipp_vm::parse::expr::<impl zipp_vm::parse::parser::Parser>::parse_primary::h70c89328aaf8165d",
+        "shallow_size": 14652,
+        "shallow_size_percent": 0.40324256339194914
+      },
+      {
+        "name": "zipp_vm::vm::construct::construct::<impl zipp_vm::vm::Vm>::construct_with_newtarget_rooted::hc7d73c3335759f7f",
+        "shallow_size": 14020,
+        "shallow_size_percent": 0.3858490812691187
+      },
+      {
+        "name": "zipp_vm::vm::props::member::<impl zipp_vm::vm::Vm>::get_member_slow::h91f2d8ea20fe1312",
+        "shallow_size": 12978,
+        "shallow_size_percent": 0.35717185283242675
+      },
+      {
+        "name": "zipp_vm::vm::gc::<impl zipp_vm::vm::Vm>::mark_roots::hb6500bc5fce5ff36",
+        "shallow_size": 12742,
+        "shallow_size_percent": 0.35067681836883813
+      },
+      {
+        "name": "zipp_vm::vm::natives::<impl zipp_vm::vm::Vm>::create_realm::hbde52b3197b89c0b",
+        "shallow_size": 12451,
+        "shallow_size_percent": 0.34266811061924374
+      },
+      {
+        "name": "zipp_vm::compile::calls::<impl zipp_vm::compile::FnCompiler>::call::hfa649304b6a863bd",
+        "shallow_size": 11297,
+        "shallow_size_percent": 0.3109084929455945
+      },
+      {
+        "name": "zipp_vm::vm::engine::boot::<impl zipp_vm::vm::Vm>::new::h5afa39e67a15a2a7",
+        "shallow_size": 10807,
+        "shallow_size_percent": 0.2974230400339063
+      },
+      {
+        "name": "zipp_vm::vm::proxy_regexp::<impl zipp_vm::vm::Vm>::regex_replace::h9eaea38f1cb55df3",
+        "shallow_size": 10549,
+        "shallow_size_percent": 0.29032253625591536
+      },
+      {
+        "name": "zipp_vm::vm::engine::run::<impl zipp_vm::vm::Vm>::call_value_exotic::h4b7ae54e00c6bfc0",
+        "shallow_size": 10456,
+        "shallow_size_percent": 0.2877630523359419
+      },
+      {
+        "name": "zipp_vm::compile::remap::remap_regs::h26f18d405d259e72",
+        "shallow_size": 10343,
+        "shallow_size_percent": 0.28465314176651174
+      },
+      {
+        "name": "zipp_vm::vm::typedarray::<impl zipp_vm::vm::Vm>::atomics_op::h0c1cdb1932961747",
+        "shallow_size": 10060,
+        "shallow_size_percent": 0.27686460467670004
+      },
+      {
+        "name": "zipp_vm::compile::assign::<impl zipp_vm::compile::FnCompiler>::assign::h42cfde6c2055209e",
+        "shallow_size": 10052,
+        "shallow_size_percent": 0.27664443401691735
+      },
+      {
+        "name": "zipp_vm::vm::props::define::<impl zipp_vm::vm::Vm>::object_define_property::h006b305577a2e332",
+        "shallow_size": 9866,
+        "shallow_size_percent": 0.27152546617697043
+      },
+      {
+        "name": "zipp_vm::vm::access::<impl zipp_vm::vm::Vm>::set_prop::h4699c1349bf125a0",
+        "shallow_size": 9782,
+        "shallow_size_percent": 0.26921367424925247
+      },
+      {
+        "name": "zipp_vm::vm::mathjson::<impl zipp_vm::vm::Vm>::json_value_into_with_budget::hd58b33a23cf1089b",
+        "shallow_size": 9299,
+        "shallow_size_percent": 0.2559208706648741
+      },
+      {
+        "name": "zipp_vm::compile::compiler::<impl zipp_vm::compile::Compiler>::compile_function_body::hfa7d2ac7f6e91ca2",
+        "shallow_size": 9278,
+        "shallow_size_percent": 0.2553429226829446
+      },
+      {
+        "name": "zipp_vm::parse::stmt::<impl zipp_vm::parse::parser::Parser>::parse_stmt_list_item::hd7b6fbc7c0687a0b",
+        "shallow_size": 9087,
+        "shallow_size_percent": 0.2500863481806335
+      }
+    ]
+  },
+  "throughput": {
+    "env": {
+      "node": "v24.19.0",
+      "v8": "13.6.233.17-node.51",
+      "platform": "win32",
+      "arch": "x64",
+      "cpu": "AMD Ryzen 9 9950X3D 16-Core Processor          ",
+      "cores": 32
+    },
+    "host": {
+      "arith-int": {
+        "best": 0.094,
+        "median": 0.096,
+        "spread_pct": 1.7
+      },
+      "arith-mod": {
+        "best": 0.178,
+        "median": 0.178,
+        "spread_pct": 0.3
+      },
+      "arith-float": {
+        "best": 0.098,
+        "median": 0.098,
+        "spread_pct": 0.1
+      },
+      "prop-mono": {
+        "best": 0.045,
+        "median": 0.045,
+        "spread_pct": 0.2
+      },
+      "prop-poly": {
+        "best": 0.147,
+        "median": 0.147,
+        "spread_pct": 0.3
+      },
+      "alloc-object": {
+        "best": 0.037,
+        "median": 0.037,
+        "spread_pct": 0.5
+      },
+      "array-build": {
+        "best": 0.414,
+        "median": 0.459,
+        "spread_pct": 10.8
+      },
+      "array-hof": {
+        "best": 0.634,
+        "median": 0.664,
+        "spread_pct": 4.6
+      },
+      "call-deep": {
+        "best": 0.063,
+        "median": 0.063,
+        "spread_pct": 0.2
+      },
+      "string-build": {
+        "best": 0.167,
+        "median": 0.171,
+        "spread_pct": 2.2
+      },
+      "regex": {
+        "best": 0.08,
+        "median": 0.083,
+        "spread_pct": 3.4
+      },
+      "json": {
+        "best": 2.72,
+        "median": 2.753,
+        "spread_pct": 1.2
+      }
+    },
+    "builds": [
+      {
+        "dir": "target/size-audit/javascript/node",
+        "wasmBytes": 6052163,
+        "boot": {
+          "module_compile_instantiate": {
+            "once": 7.412,
+            "bytes": 6052163
+          },
+          "engine_new": {
+            "best": 0.006,
+            "median": 0.007,
+            "spread_pct": 17.2
+          },
+          "init_empty_script": {
+            "best": 1.436,
+            "median": 1.747,
+            "spread_pct": 21.7
+          }
+        },
+        "steady": {
+          "arith-int": {
+            "note": "integer add in a tight loop \u2014 raw dispatch cost",
+            "best": 7.253,
+            "median": 7.37,
+            "spread_pct": 1.6
+          },
+          "arith-mod": {
+            "note": "JS % \u2014 wasm has no float-remainder instruction, so this can hit a software fmod",
+            "best": 9.412,
+            "median": 9.512,
+            "spread_pct": 1.1
+          },
+          "arith-float": {
+            "note": "f64 math \u2014 native wasm instructions",
+            "best": 11.538,
+            "median": 11.628,
+            "spread_pct": 0.8
+          },
+          "prop-mono": {
+            "note": "monomorphic property access \u2014 inline-cache hit path",
+            "best": 4.553,
+            "median": 4.587,
+            "spread_pct": 0.7
+          },
+          "prop-poly": {
+            "note": "polymorphic shapes \u2014 inline-cache miss path",
+            "best": 4.513,
+            "median": 4.542,
+            "spread_pct": 0.6
+          },
+          "alloc-object": {
+            "note": "allocation and GC pressure",
+            "best": 8.132,
+            "median": 8.559,
+            "spread_pct": 5.3
+          },
+          "array-build": {
+            "note": "array growth and element stores",
+            "best": 6.748,
+            "median": 6.782,
+            "spread_pct": 0.5
+          },
+          "array-hof": {
+            "note": "map/filter/reduce \u2014 closure call overhead",
+            "best": 2.879,
+            "median": 2.892,
+            "spread_pct": 0.4
+          },
+          "call-deep": {
+            "note": "recursive calls \u2014 frame setup and teardown",
+            "best": 0.008,
+            "median": 0.008,
+            "spread_pct": 3.9
+          },
+          "string-build": {
+            "note": "string concatenation \u2014 watch for quadratic behaviour",
+            "best": 2.463,
+            "median": 2.49,
+            "spread_pct": 1.1
+          },
+          "regex": {
+            "note": "the regex engine under bounded-backtracking",
+            "best": 5.268,
+            "median": 5.35,
+            "spread_pct": 1.6
+          },
+          "json": {
+            "note": "JSON stringify/parse round trip",
+            "best": 8.885,
+            "median": 9.088,
+            "spread_pct": 2.3
+          }
+        }
+      },
+      {
+        "dir": "target/size-audit/javascript-final/node",
+        "wasmBytes": 5837306,
+        "boot": {
+          "module_compile_instantiate": {
+            "once": 9.029,
+            "bytes": 5837306
+          },
+          "engine_new": {
+            "best": 0.006,
+            "median": 0.007,
+            "spread_pct": 11.1
+          },
+          "init_empty_script": {
+            "best": 1.374,
+            "median": 1.424,
+            "spread_pct": 3.7
+          }
+        },
+        "steady": {
+          "arith-int": {
+            "note": "integer add in a tight loop \u2014 raw dispatch cost",
+            "best": 7.333,
+            "median": 7.472,
+            "spread_pct": 1.9
+          },
+          "arith-mod": {
+            "note": "JS % \u2014 wasm has no float-remainder instruction, so this can hit a software fmod",
+            "best": 10.003,
+            "median": 10.024,
+            "spread_pct": 0.2
+          },
+          "arith-float": {
+            "note": "f64 math \u2014 native wasm instructions",
+            "best": 11.719,
+            "median": 11.778,
+            "spread_pct": 0.5
+          },
+          "prop-mono": {
+            "note": "monomorphic property access \u2014 inline-cache hit path",
+            "best": 4.576,
+            "median": 4.607,
+            "spread_pct": 0.7
+          },
+          "prop-poly": {
+            "note": "polymorphic shapes \u2014 inline-cache miss path",
+            "best": 4.587,
+            "median": 4.653,
+            "spread_pct": 1.4
+          },
+          "alloc-object": {
+            "note": "allocation and GC pressure",
+            "best": 8.025,
+            "median": 8.505,
+            "spread_pct": 6
+          },
+          "array-build": {
+            "note": "array growth and element stores",
+            "best": 6.761,
+            "median": 6.775,
+            "spread_pct": 0.2
+          },
+          "array-hof": {
+            "note": "map/filter/reduce \u2014 closure call overhead",
+            "best": 2.851,
+            "median": 2.877,
+            "spread_pct": 0.9
+          },
+          "call-deep": {
+            "note": "recursive calls \u2014 frame setup and teardown",
+            "best": 0.008,
+            "median": 0.008,
+            "spread_pct": 2.6
+          },
+          "string-build": {
+            "note": "string concatenation \u2014 watch for quadratic behaviour",
+            "best": 2.474,
+            "median": 2.498,
+            "spread_pct": 1
+          },
+          "regex": {
+            "note": "the regex engine under bounded-backtracking",
+            "best": 5.321,
+            "median": 5.377,
+            "spread_pct": 1.1
+          },
+          "json": {
+            "note": "JSON stringify/parse round trip",
+            "best": 8.63,
+            "median": 8.916,
+            "spread_pct": 3.3
+          }
+        }
+      },
+      {
+        "dir": "target/size-audit/lite-final/node",
+        "wasmBytes": 3633545,
+        "boot": {
+          "module_compile_instantiate": {
+            "once": 5.222,
+            "bytes": 3633545
+          },
+          "engine_new": {
+            "best": 0.019,
+            "median": 0.022,
+            "spread_pct": 15.2
+          },
+          "init_empty_script": {
+            "best": 1.701,
+            "median": 1.982,
+            "spread_pct": 16.5
+          }
+        },
+        "steady": {
+          "arith-int": {
+            "note": "integer add in a tight loop \u2014 raw dispatch cost",
+            "best": 11.787,
+            "median": 11.835,
+            "spread_pct": 0.4
+          },
+          "arith-mod": {
+            "note": "JS % \u2014 wasm has no float-remainder instruction, so this can hit a software fmod",
+            "best": 13.933,
+            "median": 13.974,
+            "spread_pct": 0.3
+          },
+          "arith-float": {
+            "note": "f64 math \u2014 native wasm instructions",
+            "best": 14.974,
+            "median": 15.106,
+            "spread_pct": 0.9
+          },
+          "prop-mono": {
+            "note": "monomorphic property access \u2014 inline-cache hit path",
+            "best": 16.1,
+            "median": 16.205,
+            "spread_pct": 0.7
+          },
+          "prop-poly": {
+            "note": "polymorphic shapes \u2014 inline-cache miss path",
+            "best": 15.95,
+            "median": 16.205,
+            "spread_pct": 1.6
+          },
+          "alloc-object": {
+            "note": "allocation and GC pressure",
+            "best": 20.669,
+            "median": 21.504,
+            "spread_pct": 4
+          },
+          "array-build": {
+            "note": "array growth and element stores",
+            "best": 20.737,
+            "median": 21.794,
+            "spread_pct": 5.1
+          },
+          "array-hof": {
+            "note": "map/filter/reduce \u2014 closure call overhead",
+            "best": 7.845,
+            "median": 7.999,
+            "spread_pct": 2
+          },
+          "call-deep": {
+            "note": "recursive calls \u2014 frame setup and teardown",
+            "best": 0.011,
+            "median": 0.011,
+            "spread_pct": 1.8
+          },
+          "string-build": {
+            "note": "string concatenation \u2014 watch for quadratic behaviour",
+            "best": 5.186,
+            "median": 5.622,
+            "spread_pct": 8.4
+          },
+          "regex": {
+            "note": "the regex engine under bounded-backtracking",
+            "best": 7.934,
+            "median": 8.477,
+            "spread_pct": 6.8
+          },
+          "json": {
+            "note": "JSON stringify/parse round trip",
+            "best": 17.455,
+            "median": 22.662,
+            "spread_pct": 29.8
+          }
+        }
+      }
+    ]
+  },
+  "elapsed_geomean_ratios": {
+    "full": 1.0070294341516475,
+    "lite": 2.1646040641719395
+  },
+  "table_bench": {
+    "description": "Warm Node WASM, 5 warmups, 21 alternating paired samples; 100 operations each. Narrow screening, not a full-engine performance claim.",
+    "cases": {
+      "regex_compile": {
+        "baseline_ms": 21.56510000000003,
+        "candidate_ms": 22.96339999999998,
+        "ratio": 1.0648408771579982,
+        "samples_ms": [
+          [
+            9.326600000000013,
+            11.005900000000025,
+            11.232499999999987,
+            13.261199999999974,
+            13.509299999999996,
+            15.598500000000001,
+            15.917100000000005,
+            17.844899999999996,
+            18.171400000000006,
+            20.564400000000035,
+            21.56510000000003,
+            23.666799999999967,
+            24.230500000000006,
+            28.405700000000024,
+            25.007100000000037,
+            29.755300000000034,
+            34.42450000000008,
+            36.67500000000007,
+            35.38580000000002,
+            39.69200000000001,
+            38.663299999999936
+          ],
+          [
+            11.867899999999992,
+            10.9058,
+            12.523599999999988,
+            13.133100000000013,
+            14.790399999999977,
+            15.55880000000002,
+            17.348900000000015,
+            17.40749999999997,
+            20.100099999999998,
+            19.58050000000003,
+            23.58910000000003,
+            22.96339999999998,
+            25.719099999999912,
+            27.48930000000007,
+            25.648700000000076,
+            26.868799999999965,
+            35.912199999999984,
+            36.5172,
+            38.412299999999846,
+            36.75400000000013,
+            40.37180000000012
+          ]
+        ]
+      },
+      "named_timezone": {
+        "baseline_ms": 0.30189999999993233,
+        "candidate_ms": 0.3114999999997963,
+        "ratio": 1.031798608810421,
+        "samples_ms": [
+          [
+            0.30780000000004293,
+            0.3222000000000662,
+            0.2918000000001939,
+            0.3065999999998894,
+            0.2964000000001761,
+            0.37789999999995416,
+            0.29500000000007276,
+            0.3260999999999967,
+            0.32979999999997744,
+            0.29940000000010514,
+            0.29579999999987194,
+            0.3103000000000975,
+            0.3870999999999185,
+            0.30189999999993233,
+            0.29109999999991487,
+            0.28710000000000946,
+            0.2851999999998043,
+            0.29399999999986903,
+            0.3143999999999778,
+            0.294399999999996,
+            0.30310000000008586
+          ],
+          [
+            0.29710000000000036,
+            0.3169000000000324,
+            0.3106999999999971,
+            0.3227000000001681,
+            0.3394999999998163,
+            0.355199999999968,
+            0.3368000000000393,
+            0.320699999999988,
+            0.3966000000000349,
+            0.3043999999999869,
+            0.29189999999994143,
+            0.2976000000001022,
+            0.3874000000000706,
+            0.326799999999821,
+            0.2940000000000964,
+            0.2961999999999989,
+            0.3106999999999971,
+            0.330600000000004,
+            0.3114999999997963,
+            0.2998999999999796,
+            0.3067000000000917
+          ]
+        ]
+      }
+    }
+  },
+  "parser_size_experiment": {
+    "description": "Node 24 warm WASM initSource including parser, lowering, cached-runtime clone and execution; 3 warmups and 21 alternating paired samples.",
+    "cases": {
+      "small": {
+        "baseline_ms": 7.191000000000031,
+        "candidate_ms": 6.691299999999956,
+        "ratio": 0.9305103601724276,
+        "samples_ms": [
+          [
+            9.992000000000019,
+            8.041200000000003,
+            7.191000000000031,
+            8.157500000000027,
+            6.977499999999964,
+            8.294099999999958,
+            8.175199999999904,
+            7.564300000000003,
+            6.570699999999988,
+            9.599199999999996,
+            6.4237000000000535,
+            9.139300000000048,
+            6.442199999999957,
+            7.349000000000046,
+            6.012700000000109,
+            7.151499999999942,
+            6.8659999999999854,
+            7.068300000000022,
+            6.180600000000027,
+            7.522299999999973,
+            6.7123000000000275
+          ],
+          [
+            9.308100000000024,
+            8.197900000000004,
+            7.580499999999915,
+            7.62620000000004,
+            8.12620000000004,
+            7.448199999999929,
+            7.935600000000022,
+            7.2637999999999465,
+            7.150300000000016,
+            6.448500000000081,
+            7.46040000000005,
+            6.218899999999962,
+            6.659899999999993,
+            5.4179000000000315,
+            6.409200000000055,
+            5.36990000000003,
+            6.691299999999956,
+            5.574999999999932,
+            6.644999999999982,
+            5.713399999999979,
+            6.390899999999988
+          ]
+        ]
+      },
+      "large": {
+        "baseline_ms": 8.771600000000035,
+        "candidate_ms": 8.983299999999872,
+        "ratio": 1.024134707464982,
+        "samples_ms": [
+          [
+            8.598700000000008,
+            8.986400000000003,
+            8.416200000000003,
+            9.050100000000043,
+            8.048900000000003,
+            8.944299999999885,
+            8.334600000000137,
+            8.912599999999884,
+            8.128799999999956,
+            9.242799999999988,
+            7.999199999999973,
+            8.771600000000035,
+            8.044599999999946,
+            8.848700000000008,
+            8.080500000000029,
+            8.907600000000002,
+            8.07100000000014,
+            9.094499999999925,
+            8.374699999999848,
+            9.6570999999999,
+            9.156400000000076
+          ],
+          [
+            9.307999999999993,
+            8.140300000000025,
+            9.342100000000073,
+            8.130599999999959,
+            9.301199999999994,
+            8.204000000000065,
+            9.052200000000084,
+            7.807199999999966,
+            9.231399999999894,
+            8.528700000000072,
+            9.180699999999888,
+            7.921399999999949,
+            8.898799999999937,
+            8.060899999999947,
+            10.258399999999938,
+            8.394199999999955,
+            9.621399999999994,
+            9.110300000000052,
+            9.423700000000053,
+            8.57049999999981,
+            8.983299999999872
+          ]
+        ]
+      }
+    }
+  },
+  "prototype_data_packing": {
+    "unicode_intervals": {
+      "arrays": 359,
+      "intervals": 21380,
+      "linked_unique_bytes": 170328,
+      "absent_arrays": [],
+      "roundtrip": true,
+      "raw": 171040,
+      "packed": 54685,
+      "raw_gzip9": 37209,
+      "packed_gzip9": 22132
+    },
+    "timezone_transitions": {
+      "zones": 340,
+      "transitions": 16287,
+      "offset_palette": 122,
+      "checkpoints": 681,
+      "roundtrip": true,
+      "raw": 195444,
+      "packed": 88019,
+      "raw_gzip9": 42457,
+      "packed_gzip9": 21472
+    },
+    "python_sources_base": {
+      "files": 14,
+      "raw": 757051,
+      "gzip9": 174585,
+      "roundtrip": true,
+      "largest": [
+        [
+          "runtime/stdlib.js",
+          227498
+        ],
+        [
+          "runtime/builtins.js",
+          139615
+        ],
+        [
+          "runtime/core.js",
+          106490
+        ],
+        [
+          "lib/shared/zipp_gpu.py",
+          87560
+        ],
+        [
+          "runtime/types.js",
+          84730
+        ],
+        [
+          "lib/traceback.py",
+          24771
+        ],
+        [
+          "lib/pickle.py",
+          23009
+        ],
+        [
+          "lib/argparse.py",
+          15507
+        ]
+      ]
+    },
+    "python_sources_torch": {
+      "files": 44,
+      "raw": 1747973,
+      "gzip9": 367414,
+      "roundtrip": true,
+      "largest": [
+        [
+          "lib/torch.py",
+          278741
+        ],
+        [
+          "lib/torch_distributions.py",
+          227135
+        ],
+        [
+          "runtime/tensor.js",
+          165079
+        ],
+        [
+          "lib/torch_nn.py",
+          151857
+        ],
+        [
+          "lib/torch_gpu.py",
+          132906
+        ],
+        [
+          "lib/torch_nn_functional.py",
+          129127
+        ],
+        [
+          "lib/torch_sparse.py",
+          90987
+        ],
+        [
+          "lib/torch_ao_quantization.py",
+          88983
+        ]
+      ]
+    }
+  },
+  "note": "Prototype packing numbers are data-only, not delivered WASM savings; old Lite wasm-opt experiment uses the pre-tail-cache build. Timings are screening evidence.",
+  "validation": {
+    "vm_unit": {
+      "passed": 498,
+      "ignored": 1
+    },
+    "regex_unit_and_integration": "passed",
+    "unicode_table_roundtrips": 367,
+    "timezone_records": 16287,
+    "full_boundary_suites": 28,
+    "lite_boundary_suites": 28,
+    "python_base_frontend_checks": 57,
+    "app_bridge_checks": 16,
+    "torch_gpu_checks": 47,
+    "torch_training": "passed",
+    "generator_checks": "literal preservation, idempotence, packed payload regeneration passed"
+  }
+}

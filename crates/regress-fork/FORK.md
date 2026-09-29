@@ -242,3 +242,15 @@ Annex B paths: `/a{/v`, `/]/v`, `/(?=a)+/v`, `/\a/v`, `/\1/v`, `/\c/v`,
   identity escape `x`, and the characters after it are re-read as pattern text
   (`/\x1/` matches `"x1"`); they were consumed, so `/[\x1]/` was an
   "Unbalanced bracket" SyntaxError.
+
+## Compact Unicode property storage
+
+The property tables retain their generated Interval literals but encode them
+as gap/width varints during Rust const evaluation. Regex compilation decodes
+directly into the CodePointSet allocation that previously copied the table;
+matching still uses the same representation. ID_Start and ID_Continue stay
+directly indexed for group-name parsing. No Unicode properties are removed.
+
+After regenerating `unicodetables.rs` / `unicodetables_unknown.rs`, run
+`python tools/pack_regex_tables.py` from the repository root. The generated
+tests compare every decoded interval against its original literals.

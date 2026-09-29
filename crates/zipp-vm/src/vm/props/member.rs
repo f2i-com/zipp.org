@@ -1714,6 +1714,7 @@ impl<'p> Vm<'p> {
             });
         }
         // Temporal.Duration: field getters + sign/blank; methods via the prototype.
+        #[cfg(not(feature = "wasm-lite"))]
         if let HeapObj::Temporal { kind: 0, .. } = self.heap.get(obj.heap_index()) {
             let f = self.duration_fields(obj.heap_index()).unwrap_or([0.0; 10]);
             if let Some(i) = native::DURATION_FIELDS.iter().position(|n| *n == key) {
@@ -1739,6 +1740,7 @@ impl<'p> Vm<'p> {
             });
         }
         // Temporal.PlainDate getters; methods via the prototype.
+        #[cfg(not(feature = "wasm-lite"))]
         if let HeapObj::Temporal { kind: 1, .. } = self.heap.get(obj.heap_index()) {
             let (y, m, d) = self
                 .plain_date_fields(obj.heap_index())
@@ -1756,6 +1758,7 @@ impl<'p> Vm<'p> {
             });
         }
         // Temporal.PlainTime getters; methods via the prototype.
+        #[cfg(not(feature = "wasm-lite"))]
         if let HeapObj::Temporal { kind: 2, .. } = self.heap.get(obj.heap_index()) {
             let f = self.plain_time_fields(obj.heap_index()).unwrap_or([0; 6]);
             return Ok(match key {
@@ -1770,6 +1773,7 @@ impl<'p> Vm<'p> {
             });
         }
         // Temporal.PlainDateTime getters (date + time); methods via the prototype.
+        #[cfg(not(feature = "wasm-lite"))]
         if let HeapObj::Temporal { kind: 3, .. } = self.heap.get(obj.heap_index()) {
             let f = self.pdt_fields(obj.heap_index()).unwrap_or([0; 9]);
             let (y, m, d) = (f[0], f[1], f[2]);
@@ -1790,6 +1794,7 @@ impl<'p> Vm<'p> {
             });
         }
         // Temporal.Instant getters; methods via the prototype.
+        #[cfg(not(feature = "wasm-lite"))]
         if let HeapObj::Temporal { kind: 4, .. } = self.heap.get(obj.heap_index()) {
             let ns = self.instant_ns(obj.heap_index()).unwrap_or(0);
             return Ok(match key {
@@ -1803,6 +1808,7 @@ impl<'p> Vm<'p> {
             });
         }
         // Temporal.PlainYearMonth getters; methods via the prototype.
+        #[cfg(not(feature = "wasm-lite"))]
         if let HeapObj::Temporal { kind: 5, fields } = self.heap.get(obj.heap_index()) {
             let (y, m, rd) = (fields[0], fields[1], *fields.get(2).unwrap_or(&1));
             let cal = self.cal_of(obj.heap_index());
@@ -1814,6 +1820,7 @@ impl<'p> Vm<'p> {
             return Ok(self.proto_member(self.plainyearmonth_proto, key));
         }
         // Temporal.PlainMonthDay getters; methods via the prototype.
+        #[cfg(not(feature = "wasm-lite"))]
         if let HeapObj::Temporal { kind: 6, fields } = self.heap.get(obj.heap_index()) {
             let (y, m, d) = (fields[0], fields[1], fields[2]);
             let cal = self.cal_of(obj.heap_index());
@@ -1827,6 +1834,7 @@ impl<'p> Vm<'p> {
             return Ok(self.proto_member(self.plainmonthday_proto, key));
         }
         // Temporal.ZonedDateTime getters; methods via the prototype.
+        #[cfg(not(feature = "wasm-lite"))]
         if let HeapObj::Temporal { kind: 7, .. } = self.heap.get(obj.heap_index()) {
             let idx = obj.heap_index();
             let f = self.zdt_local(idx); // [y,mo,d,h,mi,s,ms,us,ns]
@@ -1895,6 +1903,7 @@ impl<'p> Vm<'p> {
         // Intl.* instance: resolve the key on its prototype chain (service proto →
         // Object.prototype), invoking accessor getters (Locale subtags, format/
         // compare) with this = the instance.
+        #[cfg(not(feature = "wasm-lite"))]
         if let HeapObj::Intl { kind, .. } = self.heap.get(obj.heap_index()) {
             let proto = self.intl_protos[*kind as usize];
             // An Intl instance is an ordinary object as far as property access
@@ -2154,9 +2163,7 @@ impl<'p> Vm<'p> {
             HeapObj::Map { .. } if key == "size" => {
                 Ok(len_value(self.coll_live_len(obj.heap_index())))
             }
-            HeapObj::Set(_) if key == "size" => {
-                Ok(len_value(self.coll_live_len(obj.heap_index())))
-            }
+            HeapObj::Set(_) if key == "size" => Ok(len_value(self.coll_live_len(obj.heap_index()))),
             // A Python instance's attribute (or dict) storage answers as a
             // Map (`vm::py_table::layout`).
             #[cfg(feature = "python")]

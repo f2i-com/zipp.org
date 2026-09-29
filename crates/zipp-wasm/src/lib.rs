@@ -535,26 +535,27 @@ impl Engine {
     #[wasm_bindgen(js_name = setSyncHostCapabilities)]
     pub fn set_sync_host_capabilities(&mut self, operations: JsValue) -> Result<(), JsValue> {
         self.ensure_host_configuration_open()?;
-        if !checked_is_array(&operations, "synchronous host capabilities").map_err(|error| self.to_js_error(error))? {
-            return Err(self.usage_error(
-                "TypeError: synchronous host capabilities must be an array",
-            ));
+        if !checked_is_array(&operations, "synchronous host capabilities")
+            .map_err(|error| self.to_js_error(error))?
+        {
+            return Err(
+                self.usage_error("TypeError: synchronous host capabilities must be an array")
+            );
         }
         let len = checked_array_length(&operations, "synchronous host capabilities")
             .map_err(|error| self.to_js_error(error))?;
         if len > MAX_SYNC_CAPABILITY_ENTRIES {
-            return Err(self.usage_error(
-                "RangeError: too many synchronous host capability entries",
-            ));
+            return Err(
+                self.usage_error("RangeError: too many synchronous host capability entries")
+            );
         }
         let mut allowed = HashSet::with_capacity(len as usize);
         for index in 0..len {
             let operation = checked_array_get(&operations, index, "synchronous host capabilities")
                 .map_err(|error| self.to_js_error(error))?;
             let Some(operation) = operation.as_string() else {
-                return Err(self.usage_error(
-                    "TypeError: synchronous host capability names must be strings",
-                ));
+                return Err(self
+                    .usage_error("TypeError: synchronous host capability names must be strings"));
             };
             if !is_allowed_sync_host_call(&operation) {
                 return Err(self.usage_error(&format!(
@@ -609,7 +610,12 @@ impl Engine {
     /// initial-source ceiling charged against the total of every file.
     #[cfg(feature = "python")]
     #[wasm_bindgen(js_name = initPythonProject)]
-    pub fn init_python_project(&mut self, files: JsValue, entry: &str, argv: JsValue) -> Result<JsValue, JsValue> {
+    pub fn init_python_project(
+        &mut self,
+        files: JsValue,
+        entry: &str,
+        argv: JsValue,
+    ) -> Result<JsValue, JsValue> {
         // `files` maps either module names to source (the original form:
         // `{main: "..."}`) or root-relative paths to contents: a `.py` path
         // is a module (`legacy/fast_memory.py` → `legacy.fast_memory`,
@@ -639,7 +645,9 @@ impl Engine {
             }
             _ => {
                 self.note_error_kind("usage");
-                return Err(JsValue::from_str("TypeError: argv must be an array of strings"));
+                return Err(JsValue::from_str(
+                    "TypeError: argv must be an array of strings",
+                ));
             }
         };
         let mut modules = Vec::with_capacity(files.len());
@@ -713,9 +721,7 @@ impl Engine {
         self.ensure_live()?;
         if self.state.is_some() {
             self.terminate();
-            return Err(self.usage_error(
-                "zipp: repeated initialization disposed this engine",
-            ));
+            return Err(self.usage_error("zipp: repeated initialization disposed this engine"));
         }
         // Freeze authority before compilation and before any guest top-level
         // code can invoke a synchronous host bridge.
@@ -1134,9 +1140,8 @@ impl Engine {
     #[wasm_bindgen(js_name = callFunction)]
     pub fn call_function(&mut self, name: &str, args: JsValue) -> Result<JsValue, JsValue> {
         if self.source_language == zipp_vm::frontend::LanguageId::Python {
-            return Err(self.usage_error(
-                "call_function is unavailable for the experimental Python frontend",
-            ));
+            return Err(self
+                .usage_error("call_function is unavailable for the experimental Python frontend"));
         }
         self.ensure_live()?;
         let Some(slot) = self
@@ -1157,7 +1162,7 @@ impl Engine {
                 self.note_error_kind("usage");
                 return Err(JsValue::from_str(
                     "TypeError: call arguments must be an array",
-                ))
+                ));
             }
         };
         let st = self
@@ -1588,9 +1593,7 @@ impl Engine {
         Ok(status.into())
     }
 
-    fn drain_pending_host_calls_inner(
-        &mut self,
-    ) -> Result<(js_sys::Array, DrainStop), JsValue> {
+    fn drain_pending_host_calls_inner(&mut self) -> Result<(js_sys::Array, DrainStop), JsValue> {
         self.ensure_live()?;
         if let Some(message) = self.deferred_drain_error.take() {
             self.note_error_kind("guest");
@@ -2063,9 +2066,8 @@ impl Engine {
             .as_mut()
             .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
         let mut budget = HostValueBudget::default();
-        let (result, kind) = classify_host_call_result(
-            st.call_slot_bounded_no_drain(slot, args, &mut budget),
-        );
+        let (result, kind) =
+            classify_host_call_result(st.call_slot_bounded_no_drain(slot, args, &mut budget));
         self.finish_classified_execution(result, kind)
     }
 
@@ -2264,9 +2266,9 @@ fn is_app_host_call(kind: &str) -> bool {
         && bytes[0].is_ascii_lowercase()
         && bytes[bytes.len() - 1] != b'.'
         && !rest.contains("..")
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+        && bytes.iter().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 /// Exact wire arity for every synchronous operation. Guest code can call
@@ -2566,6 +2568,8 @@ pub fn zipp_profile() -> String {
             "\"profileVersion\":2,",
             "\"source\":{{\"sha\":{source_sha},\"target\":\"wasm32-unknown-unknown\"}},",
             "\"features\":[\"safe-sandbox\",\"meter-only\",\"wasm-no-fs-loader\",\"wasm-single-agent\"],",
+            "\"variant\":\"{variant}\",",
+            "\"omittedFeatures\":[{omitted}],",
             "\"languages\":[{languages}],",
             "\"semantics\":{{",
             "\"callOrder\":\"strict\",",
@@ -2637,6 +2641,8 @@ pub fn zipp_profile() -> String {
         capability_entries = MAX_SYNC_CAPABILITY_ENTRIES,
         host_value_nodes = DEFAULT_HOST_VALUE_MAX_NODES,
         host_value_string_bytes = DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+        variant = if cfg!(feature = "lite") { "lite" } else { "full" },
+        omitted = if cfg!(feature = "lite") { "\"Intl\",\"Temporal\",\"Python\",\"Torch\"" } else { "" },
         languages = LANGUAGES.join(","),
         host_call_queue = PREAMBLE_HOST_CALL_QUEUE_MAX,
         host_call_pending = PREAMBLE_HOST_CALL_PENDING_MAX,
@@ -2945,13 +2951,15 @@ fn to_js_error(error: String) -> JsValue {
 }
 
 fn engine_js_error(kind: &std::cell::Cell<&'static str>, error: String) -> JsValue {
-    kind.set(if error.starts_with("RangeError: host value exceeds")
-        || error.ends_with("could not be inspected safely")
-    {
-        "conversion"
-    } else {
-        "usage"
-    });
+    kind.set(
+        if error.starts_with("RangeError: host value exceeds")
+            || error.ends_with("could not be inspected safely")
+        {
+            "conversion"
+        } else {
+            "usage"
+        },
+    );
     JsValue::from_str(&error)
 }
 
@@ -3110,12 +3118,9 @@ mod console_transport_tests {
             (ConsoleStream::Stdout, "three".to_string()),
         ];
         // Outer array + two (object, stream string, text string) records.
-        let (_, count) = console_output_prefix_with_budget(
-            &records,
-            true,
-            HostValueBudget::new(7, 1024),
-        )
-        .expect("a bounded prefix fits");
+        let (_, count) =
+            console_output_prefix_with_budget(&records, true, HostValueBudget::new(7, 1024))
+                .expect("a bounded prefix fits");
         assert_eq!(count, 2);
     }
 
@@ -3332,8 +3337,12 @@ fn from_js_bounded(
                 // Keys cross as Rust strings, which cannot hold a lone
                 // surrogate: decoding would turn `"\uD800"` and `"\uDC00"`
                 // into one U+FFFD key and silently drop a value. Refuse it.
-                if name.contains('\u{FFFD}') && String::from_utf16(&key.iter().collect::<Vec<u16>>()).is_err() {
-                    return Err("TypeError: a host object key with a lone surrogate cannot cross".into());
+                if name.contains('\u{FFFD}')
+                    && String::from_utf16(&key.iter().collect::<Vec<u16>>()).is_err()
+                {
+                    return Err(
+                        "TypeError: a host object key with a lone surrogate cannot cross".into(),
+                    );
                 }
                 budget.charge_string(&name)?;
                 let val = js_sys::Reflect::get(&object, &k)
@@ -3655,7 +3664,13 @@ mod tests {
             assert_eq!(sync_host_call_arity(kind), Some(arity), "wrong arity");
         }
 
-        for kind in ["app.fs.read", "app.net.fetch", "app.x", "app.v2.do_thing", "app.a-b"] {
+        for kind in [
+            "app.fs.read",
+            "app.net.fetch",
+            "app.x",
+            "app.v2.do_thing",
+            "app.a-b",
+        ] {
             assert!(is_allowed_sync_host_call(kind), "app kind rejected: {kind}");
             assert_eq!(sync_host_call_arity(kind), None, "app kinds have no fixed arity");
         }

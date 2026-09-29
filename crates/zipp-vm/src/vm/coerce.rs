@@ -3019,6 +3019,7 @@ impl<'p> Vm<'p> {
 
             match self.heap.get(idx) {
                 HeapObj::Proxy { target, .. } => self.display_value_into(out, *target, depth + 1),
+                #[cfg(not(feature = "wasm-lite"))]
                 HeapObj::Temporal { kind: 0, fields } => {
                     let mut f = [0f64; 10];
                     for (i, slot) in f.iter_mut().enumerate() {
@@ -3026,9 +3027,11 @@ impl<'p> Vm<'p> {
                     }
                     out.push_str(&duration_to_string(&f));
                 }
+                #[cfg(not(feature = "wasm-lite"))]
                 HeapObj::Temporal { kind: 1, fields } => {
                     out.push_str(&iso_date_string(fields[0], fields[1], fields[2]));
                 }
+                #[cfg(not(feature = "wasm-lite"))]
                 HeapObj::Temporal { kind: 2, fields } => {
                     let mut f = [0i64; 6];
                     for (i, slot) in f.iter_mut().enumerate() {
@@ -3036,22 +3039,27 @@ impl<'p> Vm<'p> {
                     }
                     out.push_str(&time_string(&f));
                 }
+                #[cfg(not(feature = "wasm-lite"))]
                 HeapObj::Temporal { kind: 3, fields } => {
                     let g = |i: usize| *fields.get(i).unwrap_or(&0);
                     out.push_str(&iso_date_string(g(0), g(1), g(2)));
                     out.push_str("T");
                     out.push_str(&time_string(&[g(3), g(4), g(5), g(6), g(7), g(8)]));
                 }
+                #[cfg(not(feature = "wasm-lite"))]
                 HeapObj::Temporal { kind: 4, fields } => {
                     let ns = ((fields[0] as i128) << 64) | ((fields[1] as u64) as i128);
                     out.push_str(&instant_to_string(ns));
                 }
+                #[cfg(not(feature = "wasm-lite"))]
                 HeapObj::Temporal { kind: 5, fields } => {
                     out.push_str(&year_month_string(fields[0], fields[1]));
                 }
+                #[cfg(not(feature = "wasm-lite"))]
                 HeapObj::Temporal { kind: 6, fields } => {
                     let _ = write!(out, "{:02}-{:02}", fields[1], fields[2]);
                 }
+                #[cfg(not(feature = "wasm-lite"))]
                 HeapObj::Temporal { kind: 7, .. } => {
                     out.push_str(&self.zdt_to_string(idx));
                 }
@@ -3316,6 +3324,7 @@ impl<'p> Vm<'p> {
             HeapObj::Proxy { target, .. } => {
                 self.inspect_value_into(out, *target, true, depth + 1);
             }
+            #[cfg(not(feature = "wasm-lite"))]
             HeapObj::Temporal { kind: 0, fields } => {
                 // Duration fields store f64 BITS in the i64 slots.
                 let mut f = [0f64; 10];
@@ -3324,6 +3333,7 @@ impl<'p> Vm<'p> {
                 }
                 let _ = write!(out, "Temporal.Duration <{}>", duration_to_string(&f));
             }
+            #[cfg(not(feature = "wasm-lite"))]
             HeapObj::Temporal { kind: 1, fields } => {
                 let _ = write!(
                     out,
@@ -3331,6 +3341,7 @@ impl<'p> Vm<'p> {
                     iso_date_string(fields[0], fields[1], fields[2])
                 );
             }
+            #[cfg(not(feature = "wasm-lite"))]
             HeapObj::Temporal { kind: 2, fields } => {
                 let mut f = [0i64; 6];
                 for (i, slot) in f.iter_mut().enumerate() {
@@ -3338,6 +3349,7 @@ impl<'p> Vm<'p> {
                 }
                 let _ = write!(out, "Temporal.PlainTime <{}>", time_string(&f));
             }
+            #[cfg(not(feature = "wasm-lite"))]
             HeapObj::Temporal { kind: 3, fields } => {
                 let get = |i: usize| *fields.get(i).unwrap_or(&0);
                 let _ = write!(
@@ -3347,10 +3359,12 @@ impl<'p> Vm<'p> {
                     time_string(&[get(3), get(4), get(5), get(6), get(7), get(8)])
                 );
             }
+            #[cfg(not(feature = "wasm-lite"))]
             HeapObj::Temporal { kind: 4, fields } => {
                 let ns = ((fields[0] as i128) << 64) | ((fields[1] as u64) as i128);
                 let _ = write!(out, "Temporal.Instant <{}>", instant_to_string(ns));
             }
+            #[cfg(not(feature = "wasm-lite"))]
             HeapObj::Temporal { kind: 5, fields } => {
                 let _ = write!(
                     out,
@@ -3358,6 +3372,7 @@ impl<'p> Vm<'p> {
                     year_month_string(fields[0], fields[1])
                 );
             }
+            #[cfg(not(feature = "wasm-lite"))]
             HeapObj::Temporal { kind: 6, fields } => {
                 let _ = write!(
                     out,
@@ -3365,6 +3380,7 @@ impl<'p> Vm<'p> {
                     fields[1], fields[2]
                 );
             }
+            #[cfg(not(feature = "wasm-lite"))]
             HeapObj::Temporal { kind: 7, .. } => {
                 let _ = write!(out, "Temporal.ZonedDateTime <{}>", self.zdt_to_string(idx));
             }

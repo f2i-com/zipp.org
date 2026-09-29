@@ -2,6 +2,7 @@
 # Build the zipp-wasm artifacts with the README's exact post-processing, and
 # print their raw and Brotli sizes side by side:
 #
+#   lite        JavaScript core without Intl, Temporal, Python or Torch
 #   javascript  JavaScript only (the shipped default)
 #   python      JavaScript + Python, without the torch package
 #   torch       the torch package for `python`: zipp_torch.wasm + its loader
@@ -25,6 +26,7 @@ TARGET=wasm32-unknown-unknown
 export RUSTFLAGS="${RUSTFLAGS:--C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=16777216}"
 
 declare -A FEATURES=(
+  [lite]="--features lite"
   [javascript]=""
   [python]="--features python-base"
   [all]="--features python"
@@ -35,7 +37,7 @@ variants=("$@")
 [ ${#variants[@]} -eq 0 ] && variants=(javascript all)
 
 for v in "${variants[@]}"; do
-  [ -n "${FEATURES[$v]+x}" ] || { echo "unknown variant '$v' (javascript | python | torch | all | interop)" >&2; exit 2; }
+  [ -n "${FEATURES[$v]+x}" ] || { echo "unknown variant '$v' (lite | javascript | python | torch | all | interop)" >&2; exit 2; }
 done
 
 compress() {
@@ -64,13 +66,15 @@ for v in "${variants[@]}"; do
     sizes+=("$v $(wc -c < "$out/zipp_torch.wasm") $(wc -c < "$out/zipp_torch.wasm.br")")
     continue
   fi
-  echo "=== $v: cargo build --release --target $TARGET ${FEATURES[$v]}"
+  profile=release
+  [ "$v" = lite ] && profile=lite
+  echo "=== $v: cargo build --profile $profile --target $TARGET ${FEATURES[$v]}"
   # shellcheck disable=SC2086
-  cargo +1.92.0 build --locked --release --target "$TARGET" --target-dir "target/variants/$v" ${FEATURES[$v]}
+  cargo +1.92.0 build --locked --profile "$profile" --target "$TARGET" --target-dir "target/variants/$v" ${FEATURES[$v]}
   rm -rf "$out"
   wasm-bindgen --target web --out-dir "$out" \
     --remove-name-section --remove-producers-section \
-    "target/variants/$v/$TARGET/release/zipp_wasm.wasm"
+    "target/variants/$v/$TARGET/$profile/zipp_wasm.wasm"
   node tests/node/strip-target-features.cjs "$out/zipp_wasm_bg.wasm" "$out/zipp_wasm_bg.stripped.wasm"
   mv "$out/zipp_wasm_bg.stripped.wasm" "$out/zipp_wasm_bg.wasm"
   node tests/node/check-wasm-memory.cjs "$out/zipp_wasm_bg.wasm"

@@ -1083,6 +1083,7 @@ impl<'p> Vm<'p> {
         }
         // Temporal receivers route to their own dispatch (so valueOf throws and
         // toString gives the ISO string, not the generic Object behavior).
+        #[cfg(not(feature = "wasm-lite"))]
         if matches!(self.heap.get(idx), HeapObj::Temporal { .. }) {
             return self.temporal_method(idx, name, args);
         }
@@ -1135,9 +1136,9 @@ impl<'p> Vm<'p> {
                     // An array-like list can be 2^24 entries, so the roots are
                     // admitted against the heap ceiling like any other copy.
                     self.reserve_host_roots(callargs.len())?;
-                    return Ok(Some(
-                        self.with_host_roots(&callargs, |vm| vm.call_value(recv, this, &callargs))?,
-                    ));
+                    return Ok(Some(self.with_host_roots(&callargs, |vm| {
+                        vm.call_value(recv, this, &callargs)
+                    })?));
                 }
                 // Bind snapshots target length/name and may reject a sandbox-cap
                 // overflow while composing "bound ". Keep that fallible work in

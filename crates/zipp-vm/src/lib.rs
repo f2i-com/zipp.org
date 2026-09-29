@@ -30,6 +30,9 @@
 #[cfg(all(feature = "safe-sandbox", feature = "jit"))]
 compile_error!("zipp-vm features `safe-sandbox` and `jit` are mutually exclusive");
 
+#[cfg(all(feature = "wasm-lite", feature = "python"))]
+compile_error!("ZIPP Lite omits Python; build the python variant separately");
+
 mod bytecode;
 #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
 mod bytecode_codec;
@@ -618,6 +621,8 @@ fn run_with_policy(
     let program = compile::compile_main_program(&ast, src)?;
     // Dev aid: `ZIPP_VM_DUMP=1` prints each function's bytecode to stderr before
     // running (so the JIT-able regions can be inspected).
+    // Browser WASM has no process environment or stderr bytecode dump.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
             eprintln!(
@@ -777,6 +782,8 @@ pub fn run_module_with_base(
         // or re-export into a silently skipped dependency before the body runs.
         return Err("filesystem module loader is disabled in this build".into());
     }
+    // Browser WASM has no process environment or stderr bytecode dump.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
             eprintln!(

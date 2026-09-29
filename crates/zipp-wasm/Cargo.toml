@@ -36,6 +36,12 @@ panic = "abort"
 lto = "fat"
 codegen-units = 1
 
+# Lite explicitly prioritizes download size. Full variants retain the measured
+# throughput-oriented release profile; the feature flag alone does not change it.
+[profile.lite]
+inherits = "release"
+opt-level = "z"
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -49,7 +55,7 @@ wasm-bindgen = "=0.2.126"
 js-sys = { version = "=0.3.103", default-features = false, features = ["std"] }
 console_error_panic_hook = "=0.1.7"
 
-# Two artifacts come out of this one crate. JavaScript is always present (the
+# Several artifacts come out of this one crate. JavaScript is always present (the
 # engine IS the JavaScript VM, and the Python runtime is itself JavaScript the
 # engine compiles); `python` adds the Python parser and the lowering code,
 # which is the whole size difference, so it stays off the default artifact.
@@ -57,9 +63,11 @@ console_error_panic_hook = "=0.1.7"
 #   JavaScript only (the shipped default): cargo build --release --target wasm32-unknown-unknown
 #   JavaScript + Python:                   cargo build --release --target wasm32-unknown-unknown --features python
 #
-# `build-variants.sh` builds and post-processes both and prints sizes.
+# `build-variants.sh` builds selected variants and prints sizes, including Lite.
 [features]
 default = []
+# ZIPP Lite: JavaScript core without Intl, Temporal, Python or Torch.
+lite = ["zipp-vm/wasm-lite"]
 # `Engine.initSource(source, "python")`: the experimental Python-subset
 # frontend (docs/PYTHON_FRONTEND_EXPERIMENT.md).
 python = ["zipp-vm/python"]

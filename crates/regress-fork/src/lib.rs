@@ -256,6 +256,7 @@ mod ir;
 mod linear;
 mod matchers;
 mod optimizer;
+mod packed_intervals;
 mod parse;
 mod position;
 mod possessify;

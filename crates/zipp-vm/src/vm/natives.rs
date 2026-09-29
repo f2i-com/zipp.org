@@ -1942,6 +1942,7 @@ impl<'p> Vm<'p> {
         let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         // Temporal prototype field getter: brand-check `this` is a Temporal
         // instance, then read the field (the fast get_member path computes it).
+        #[cfg(not(feature = "wasm-lite"))]
         if (native::TEMPORAL_GETTER_BASE
             ..native::TEMPORAL_GETTER_BASE + native::TEMPORAL_GETTER_FIELDS.len() as u16)
             .contains(&id)
@@ -2353,13 +2354,20 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 };
-                let nf = self.make_intl(native::INTL_NUMBERFORMAT, a0, a1)?;
-                let resolved = match self.heap.get(nf.heap_index()) {
-                    HeapObj::Intl { resolved, .. } => *resolved,
-                    _ => return Err(Thrown("TypeError: NumberFormat expected".into())),
-                };
-                let prim = self.make_bigint_val(n);
-                self.intl_number_format(resolved, prim)?
+                #[cfg(not(feature = "wasm-lite"))]
+                {
+                    let nf = self.make_intl(native::INTL_NUMBERFORMAT, a0, a1)?;
+                    let resolved = match self.heap.get(nf.heap_index()) {
+                        HeapObj::Intl { resolved, .. } => *resolved,
+                        _ => return Err(Thrown("TypeError: NumberFormat expected".into())),
+                    };
+                    let prim = self.make_bigint_val(n);
+                    self.intl_number_format(resolved, prim)?
+                }
+                #[cfg(feature = "wasm-lite")]
+                {
+                    self.alloc_str(n.to_radix_string(10))
+                }
             }
             BIGINT_VALUE_OF => match self.this_bigint_val(this) {
                 Some(n) => self.make_bigint_val(n),
@@ -5298,7 +5306,11 @@ impl<'p> Vm<'p> {
             // literal builds it).
             #[cfg(feature = "python")]
             PY_EXC => {
-                let (c, a, r) = (a0, args.get(1).copied().unwrap_or(Value::UNDEFINED), args.get(2).copied().unwrap_or(Value::UNDEFINED));
+                let (c, a, r) = (
+                    a0,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                );
                 self.py_make_exc(c, a, r).unwrap_or(Value::UNDEFINED)
             }
             // `contains(container, needle)` natively (`undefined`: the
@@ -5312,7 +5324,10 @@ impl<'p> Vm<'p> {
             // `smfind` answers).
             #[cfg(feature = "python")]
             PY_SMFIND => {
-                let (s, n) = (args.get(1).copied().unwrap_or(Value::UNDEFINED), args.get(2).copied().unwrap_or(Value::UNDEFINED));
+                let (s, n) = (
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                );
                 self.py_smfind(a0, s, n, this)
             }
             // The runtime's dict and set storage (`vm::py_table`).
@@ -6083,6 +6098,7 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (TEMPORAL_M_BASE..TEMPORAL_M_BASE + TEMPORAL_DURATION_METHODS.len() as u16)
                 .contains(&id) =>
             {
@@ -6098,18 +6114,21 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             TEMPORAL_DURATION_FROM => {
                 // The EXACT f64 record: from() must store ℝ(𝔽(field)) untouched
                 // by i64 saturation (a 4.5e21-microseconds field survives).
                 let f = self.to_duration_f64(a0)?;
                 self.make_duration(f)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             TEMPORAL_DURATION_COMPARE => {
                 let fa = self.to_duration_f64(a0)?;
                 let fb = self.to_duration_f64(a1)?;
                 let opts = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 Value::num(self.duration_compare(fa, fb, opts)?)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (PD_M_BASE..PD_M_BASE + PLAINDATE_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINDATE_METHODS[(id - PD_M_BASE) as usize];
                 if !matches!(
@@ -6123,6 +6142,7 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PLAINDATE_FROM => {
                 // Per ToTemporalDate, the item is validated before the overflow
                 // option's VALUE is observed: an object reads overflow then resolves
@@ -6140,6 +6160,7 @@ impl<'p> Vm<'p> {
                 let r = self.make_plain_date(y, m, d)?;
                 self.tag_cal(r, cal)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PLAINDATE_COMPARE => {
                 let a = self.to_plain_date(a0)?;
                 let b = self.to_plain_date(a1)?;
@@ -6153,6 +6174,7 @@ impl<'p> Vm<'p> {
                     0.0
                 })
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (PT_M_BASE..PT_M_BASE + PLAINTIME_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINTIME_METHODS[(id - PT_M_BASE) as usize];
                 if !matches!(
@@ -6166,6 +6188,7 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PLAINTIME_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
                 let f = if self.is_object_value(a0) {
@@ -6178,6 +6201,7 @@ impl<'p> Vm<'p> {
                 };
                 self.make_plain_time(f)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PLAINTIME_COMPARE => {
                 let a = self.to_plain_time(a0)?;
                 let b = self.to_plain_time(a1)?;
@@ -6190,6 +6214,7 @@ impl<'p> Vm<'p> {
                     0.0
                 })
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (PDT_M_BASE..PDT_M_BASE + PLAINDATETIME_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINDATETIME_METHODS[(id - PDT_M_BASE) as usize];
                 if !matches!(
@@ -6203,6 +6228,7 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PLAINDATETIME_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
                 let f = if self.is_object_value(a0)
@@ -6222,6 +6248,7 @@ impl<'p> Vm<'p> {
                 let r = self.make_plain_date_time(f.0)?;
                 self.tag_cal(r, f.1)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PLAINDATETIME_COMPARE => {
                 let a = self.to_plain_date_time_limited(a0)?;
                 let b = self.to_plain_date_time_limited(a1)?;
@@ -6237,6 +6264,7 @@ impl<'p> Vm<'p> {
                     0.0
                 })
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (INST_M_BASE..INST_M_BASE + INSTANT_METHODS.len() as u16).contains(&id) => {
                 let m = INSTANT_METHODS[(id - INST_M_BASE) as usize];
                 if !matches!(
@@ -6250,10 +6278,12 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INST_FROM => {
                 let ns = self.to_instant_ns(a0)?;
                 self.make_instant(ns)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INST_FROM_EPOCH_MS => {
                 // ToNumber (BigInt/Symbol → TypeError) then NumberToBigInt (a
                 // non-integral / non-finite Number → RangeError).
@@ -6265,6 +6295,7 @@ impl<'p> Vm<'p> {
                 }
                 self.make_instant((n as i128) * 1_000_000)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INST_FROM_EPOCH_SEC => {
                 let n = self.to_number_strict(a0)?;
                 if !n.is_finite() || n.fract() != 0.0 {
@@ -6272,16 +6303,19 @@ impl<'p> Vm<'p> {
                 }
                 self.make_instant((n as i128) * 1_000_000_000)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INST_FROM_EPOCH_NS => {
                 // Beyond-i128 saturates (sign preserved) — certainly outside the
                 // Instant range, which make_instant validates.
                 let ns = self.to_bigint(a0)?.to_i128_sat();
                 self.make_instant(ns)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INST_FROM_EPOCH_US => {
                 let ns = self.to_bigint(a0)?.to_i128_sat().saturating_mul(1_000);
                 self.make_instant(ns)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INST_COMPARE => {
                 let a = self.to_instant_ns(a0)?;
                 let b = self.to_instant_ns(a1)?;
@@ -6293,6 +6327,7 @@ impl<'p> Vm<'p> {
                     0.0
                 })
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (PYM_M_BASE..PYM_M_BASE + PLAINYEARMONTH_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINYEARMONTH_METHODS[(id - PYM_M_BASE) as usize];
                 if !matches!(
@@ -6306,6 +6341,7 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PLAINYEARMONTH_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
                 let ((y, m, rd), cal) = if self.is_object_value(a0) {
@@ -6319,6 +6355,7 @@ impl<'p> Vm<'p> {
                 let r = self.make_plain_year_month(y, m, rd)?;
                 self.tag_cal(r, cal)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PLAINYEARMONTH_COMPARE => {
                 let a = self.to_plain_year_month(a0)?;
                 let b = self.to_plain_year_month(a1)?;
@@ -6333,6 +6370,7 @@ impl<'p> Vm<'p> {
                     0.0
                 })
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (PMD_M_BASE..PMD_M_BASE + PLAINMONTHDAY_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINMONTHDAY_METHODS[(id - PMD_M_BASE) as usize];
                 if !matches!(
@@ -6346,6 +6384,7 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (ZDT_M_BASE..ZDT_M_BASE + ZONEDDATETIME_METHODS.len() as u16).contains(&id) => {
                 let m = ZONEDDATETIME_METHODS[(id - ZDT_M_BASE) as usize];
                 if !matches!(
@@ -6365,7 +6404,9 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             ZDT_FROM => self.zoned_date_time_from(a0, a1)?,
+            #[cfg(not(feature = "wasm-lite"))]
             ZDT_COMPARE => {
                 let za = self.zoned_date_time_from(a0, Value::UNDEFINED)?;
                 let zb = self.zoned_date_time_from(a1, Value::UNDEFINED)?;
@@ -6377,6 +6418,7 @@ impl<'p> Vm<'p> {
                     std::cmp::Ordering::Greater => 1.0,
                 })
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PLAINMONTHDAY_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
                 let ((ry, m, d), cal) = if self.is_object_value(a0) {
@@ -6393,10 +6435,12 @@ impl<'p> Vm<'p> {
             // Temporal.Now — no timezone DB, so a named zone reports UTC, but a
             // numeric-offset zone shifts the wall-clock. The time-zone arg is
             // still validated (invalid string -> RangeError, wrong type -> TypeError).
+            #[cfg(not(feature = "wasm-lite"))]
             NOW_INSTANT => {
                 let ns = Self::now_epoch_ns();
                 self.make_instant(ns)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             NOW_PLAINDATETIME_ISO => {
                 let (_, offset) = self.now_tz_id(a0)?;
                 let ns = Self::now_epoch_ns() + offset as i128;
@@ -6405,28 +6449,33 @@ impl<'p> Vm<'p> {
                 let (y, mo, d) = epoch_days_to_iso(days as i64);
                 self.make_plain_date_time([y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]])?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             NOW_PLAINDATE_ISO => {
                 let (_, offset) = self.now_tz_id(a0)?;
                 let ns = Self::now_epoch_ns() + offset as i128;
                 let (y, mo, d) = epoch_days_to_iso(ns.div_euclid(DAY_NS) as i64);
                 self.make_plain_date(y, mo, d)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             NOW_PLAINTIME_ISO => {
                 let (_, offset) = self.now_tz_id(a0)?;
                 let ns = Self::now_epoch_ns() + offset as i128;
                 self.make_plain_time(ns_to_time(ns.rem_euclid(DAY_NS)))?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             NOW_ZONEDDATETIME_ISO => {
                 let (id, offset) = self.now_tz_id(a0)?;
                 let ns = Self::now_epoch_ns();
                 self.alloc_zdt(ns, offset, id)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             NOW_TIMEZONE_ID => self.alloc_str("UTC".to_string()),
             // Shared Temporal toLocaleString. ECMA-402 replaces every one of
             // these with `CreateDateTimeFormat(%Intl.DateTimeFormat%, locales,
             // options, <required>, <defaults>)` followed by FormatDateTime — the
             // receiver's own kind supplies the required/defaults pair, so ONE
             // implementation covers all eight prototypes.
+            #[cfg(not(feature = "wasm-lite"))]
             TEMPORAL_TO_LOCALE_STRING => {
                 let kind = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::Temporal { kind, .. }) => *kind,
@@ -6438,6 +6487,7 @@ impl<'p> Vm<'p> {
                 };
                 self.temporal_to_locale_string(this, kind, a0, a1)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             ZDT_GET_TZ_TRANSITION => {
                 if !this.is_heap()
                     || !matches!(
@@ -6461,6 +6511,7 @@ impl<'p> Vm<'p> {
                     None => Value::NULL,
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             PDT_WITH_PLAIN_TIME => {
                 if !this.is_heap()
                     || !matches!(
@@ -6476,11 +6527,13 @@ impl<'p> Vm<'p> {
                     .unwrap_or(Value::UNDEFINED)
             }
             // ── Intl ──
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_GET_CANONICAL_LOCALES => {
                 let list = self.canonicalize_locale_list(a0)?;
                 let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
                 self.alloc_array_current_realm(items)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_SUPPORTED_VALUES_OF => {
                 let key = self.to_js_string(a0)?;
                 self.preflight_native_iteration_work(key.len() as u64)?;
@@ -6523,6 +6576,7 @@ impl<'p> Vm<'p> {
                 let items: Vec<Value> = sorted.into_iter().map(|s| self.alloc_str(s)).collect();
                 self.alloc_array_current_realm(items)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_SUPPORTED_LOCALES_OF | INTL_DTF_SUPPORTED_LOCALES_OF => {
                 let list = self.canonicalize_locale_list(a0)?;
                 // SupportedLocales step 1 is `? ToObject(options)`, NOT
@@ -6564,6 +6618,7 @@ impl<'p> Vm<'p> {
                 let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
                 Value::heap(self.heap.alloc(HeapObj::Array(items)))
             }
+            #[cfg(not(feature = "wasm-lite"))]
             n if n >= native::INTL_RESOLVED_OPTIONS_BASE
                 && n < native::INTL_RESOLVED_OPTIONS_BASE + 10 =>
             {
@@ -6583,10 +6638,12 @@ impl<'p> Vm<'p> {
                 let resolved = self.intl_this(this, want, "resolvedOptions")?;
                 self.clone_plain_object(resolved)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_NF_FORMAT => {
                 let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "format")?;
                 self.intl_number_format(resolved, a0)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_NF_FORMAT_TO_PARTS => {
                 let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "formatToParts")?;
                 // ToIntlMathematicalValue observes an object's
@@ -6597,6 +6654,7 @@ impl<'p> Vm<'p> {
                     parts.into_iter().map(|(t, v)| (t, v, "")).collect();
                 self.intl_parts_array(&parts)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_NF_FORMAT_RANGE | INTL_NF_FORMAT_RANGE_TO_PARTS => {
                 let name = if id == INTL_NF_FORMAT_RANGE {
                     "formatRange"
@@ -6622,6 +6680,7 @@ impl<'p> Vm<'p> {
                     self.intl_parts_array(&parts)
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_DTF_FORMAT => {
                 let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "format")?;
                 let mut fields = self.dtf_requested_fields(resolved);
@@ -6638,6 +6697,7 @@ impl<'p> Vm<'p> {
                 let s = self.dtf_format(resolved, ms, fields, absolute);
                 self.alloc_str(s)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_DTF_FORMAT_TO_PARTS => {
                 let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "formatToParts")?;
                 let mut fields = self.dtf_requested_fields(resolved);
@@ -6658,6 +6718,7 @@ impl<'p> Vm<'p> {
                     .collect();
                 self.intl_parts_array(&parts)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_DTF_FORMAT_RANGE | INTL_DTF_FORMAT_RANGE_TO_PARTS => {
                 let name = if id == INTL_DTF_FORMAT_RANGE {
                     "formatRange"
@@ -6702,6 +6763,7 @@ impl<'p> Vm<'p> {
                     self.intl_parts_array(&parts)
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_COLLATOR_COMPARE => {
                 let resolved = self.intl_this(this, INTL_COLLATOR, "compare")?;
                 // The exact strings, seen as `localeCompare` sees them, so the
@@ -6713,12 +6775,14 @@ impl<'p> Vm<'p> {
                 );
                 Value::num(self.collator_compare(resolved, &a, &b)?)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_PLURAL_SELECT => {
                 let resolved = self.intl_this(this, INTL_PLURALRULES, "select")?;
                 let n = self.to_number_strict(a0)?;
                 let cat = self.intl_plural_category(resolved, n);
                 self.alloc_str(cat.to_string())
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_PLURAL_SELECT_RANGE => {
                 let _ = self.intl_this(this, INTL_PLURALRULES, "selectRange")?;
                 // ResolvePluralRange steps 3-5: an absent endpoint is a
@@ -6738,6 +6802,7 @@ impl<'p> Vm<'p> {
                 }
                 self.alloc_str("other".to_string())
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_LIST_FORMAT | INTL_LIST_FORMAT_TO_PARTS => {
                 let to_parts = id == INTL_LIST_FORMAT_TO_PARTS;
                 let name = if to_parts { "formatToParts" } else { "format" };
@@ -6771,6 +6836,7 @@ impl<'p> Vm<'p> {
                     self.alloc_str(s)
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_RTF_FORMAT | INTL_RTF_FORMAT_TO_PARTS => {
                 let to_parts = id == INTL_RTF_FORMAT_TO_PARTS;
                 let name = if to_parts { "formatToParts" } else { "format" };
@@ -6875,6 +6941,7 @@ impl<'p> Vm<'p> {
                     self.alloc_str(s)
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_DISPLAYNAMES_OF => {
                 let resolved = self.intl_this(this, INTL_DISPLAYNAMES, "of")?;
                 let code = self.to_js_string(a0)?;
@@ -6908,11 +6975,13 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_LOCALE_TOSTRING => {
                 // [[Locale]] — the FULL canonical tag, extensions included.
                 let resolved = self.intl_this(this, INTL_LOCALE, "toString")?;
                 self.intl_slot(resolved, "@@tag")
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_LOCALE_MAXIMIZE | INTL_LOCALE_MINIMIZE => {
                 // Add/RemoveLikelySubtags (UTS #35 §4.3). A tag no likely-subtags
                 // row covers is its own maximum AND its own minimum — `xtg`
@@ -6937,14 +7006,17 @@ impl<'p> Vm<'p> {
                     None => this,
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_LOCALE_GET_VARIANTS => {
                 let resolved = self.intl_this(this, INTL_LOCALE, "variants")?;
                 self.intl_slot(resolved, "variants")
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_LOCALE_GET_FIRSTDAY => {
                 let resolved = self.intl_this(this, INTL_LOCALE, "firstDayOfWeek")?;
                 self.intl_slot(resolved, "firstDayOfWeek")
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (INTL_LOCALE_INFO_BASE
                 ..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16)
                 .contains(&id) =>
@@ -6953,6 +7025,7 @@ impl<'p> Vm<'p> {
                 let resolved = self.intl_this(this, INTL_LOCALE, which)?;
                 self.locale_info(resolved, which)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_SEGMENTER_SEGMENT => {
                 let seg = self.intl_this(this, INTL_SEGMENTER, "segment")?;
                 // CreateSegmentsObject: the Segments carries the segmenter and the
@@ -6962,6 +7035,7 @@ impl<'p> Vm<'p> {
                 let g = self.display(self.intl_slot(seg, "granularity"));
                 self.make_segments(native::INTL_SEGMENTS, a0, &g, 0)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_SEGMENTS_ITERATOR => {
                 let s = self.intl_this(this, native::INTL_SEGMENTS, "[Symbol.iterator]")?;
                 // CreateSegmentIterator: a FRESH cursor each time, so nested
@@ -6971,6 +7045,7 @@ impl<'p> Vm<'p> {
                 let input = self.intl_slot(s, "input");
                 self.make_segments(native::INTL_SEGMENT_ITERATOR, input, &g, 0)?
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_SEGMENTS_CONTAINING => {
                 let s = self.intl_this(this, native::INTL_SEGMENTS, "containing")?;
                 let g = self.display(self.intl_slot(s, "granularity"));
@@ -6995,6 +7070,7 @@ impl<'p> Vm<'p> {
                     None => Value::UNDEFINED,
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_SEGMENT_ITER_NEXT => {
                 let it = self.intl_this(this, native::INTL_SEGMENT_ITERATOR, "next")?;
                 let g = self.display(self.intl_slot(it, "granularity"));
@@ -7006,9 +7082,11 @@ impl<'p> Vm<'p> {
                 // re-segmenting it from 0 on every step made a `for…of` over
                 // the segments quadratic.
                 let step = match self.heap.get(input.heap_index()) {
-                    HeapObj::Str(js) if start < js.units() => {
-                        Some((js.unit_byte_bounds(start).0, js.as_bytes().len(), js.units()))
-                    }
+                    HeapObj::Str(js) if start < js.units() => Some((
+                        js.unit_byte_bounds(start).0,
+                        js.as_bytes().len(),
+                        js.units(),
+                    )),
                     _ => None,
                 };
                 let (value, done) = if let Some((at, bytes, len)) = step {
@@ -7033,6 +7111,7 @@ impl<'p> Vm<'p> {
                 };
                 self.iter_result(value, done)
             }
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_DURATION_FORMAT | INTL_DURATION_FORMAT_TO_PARTS => {
                 let to_parts = id == INTL_DURATION_FORMAT_TO_PARTS;
                 let name = if to_parts { "formatToParts" } else { "format" };
@@ -7051,6 +7130,7 @@ impl<'p> Vm<'p> {
                     self.alloc_str(s)
                 }
             }
+            #[cfg(not(feature = "wasm-lite"))]
             _ if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16)
                 .contains(&id) =>
             {
@@ -7060,6 +7140,7 @@ impl<'p> Vm<'p> {
             }
             // The format/compare bound-function getters: return (and cache) a
             // function bound to the instance, so `nf.format === nf.format`.
+            #[cfg(not(feature = "wasm-lite"))]
             INTL_NF_FORMAT_GET | INTL_DTF_FORMAT_GET | INTL_COLLATOR_COMPARE_GET => {
                 let (kind, target_id, svc) = match id {
                     INTL_NF_FORMAT_GET => (INTL_NUMBERFORMAT, INTL_NF_FORMAT, "format"),

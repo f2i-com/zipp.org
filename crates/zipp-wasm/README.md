@@ -24,7 +24,7 @@ node tests/node/check-wasm-memory.cjs pkg/zipp_wasm_bg.wasm
 brotli -q 11 -f -o pkg/zipp_wasm_bg.wasm.br pkg/zipp_wasm_bg.wasm
 ```
 
-## Build variants: JavaScript only, Python, and the torch package
+## Build variants: ZIPP Lite, JavaScript, Python, and the torch package
 
 The crate builds several variants. The default is JavaScript-only; the Python
 variants add the experimental Python-subset frontend
@@ -35,6 +35,7 @@ built into `all`, or added to `python` at run time from a second module,
 
 | variant | features | entry points |
 | --- | --- | --- |
+| `lite` | `--profile lite --features lite` | JavaScript core; no Intl, Temporal, Python or Torch |
 | `javascript` (default) | none | `initScript`, `initSource(src, "javascript")` |
 | `python` | `--features python-base` | the above plus `initSource(src, "python")`; torch only after `addPythonPackage` (below) |
 | `torch` | `torch/` crate | `zipp_torch.wasm` + its loader `zipp_torch.js`: the torch package for `python` |
@@ -45,6 +46,7 @@ built into `all`, or added to `python` at run time from a second module,
 cd crates/zipp-wasm
 ./build-variants.sh                   # javascript and all, into dist/<variant>/
 ./build-variants.sh python torch      # any of: javascript | python | torch | all | interop
+./build-variants.sh lite              # separate ZIPP Lite package in dist/lite/
 ```
 
 The script applies exactly the post-processing above (section strip,
@@ -55,6 +57,32 @@ tell the variants apart at runtime: `zippProfile().languages` is
 says whether torch is built in, and `initSource(src, "python")` on the
 JavaScript-only module fails with a clear message and disposes the engine like
 any failed initialization.
+
+### ZIPP Lite
+
+Lite is a separate, opt-in WASM artifact. It retains the JavaScript parser,
+Unicode regex and normalization, BigInt, eval/Function, collections, proxies,
+typed arrays, promises and the Engine host API, including resource limits.
+`Intl`, `Temporal`, and `Date.prototype.toTemporalInstant` are absent. Python
+and Torch are excluded at compile time; combining `lite` and `python` is an error.
+Full variants keep their existing language features.
+
+Without ECMA-402, locale arguments are ignored: Number and BigInt format as
+ordinary decimal strings; Date's locale methods use the corresponding UTC
+string forms; case conversion uses the default Unicode mapping; localeCompare
+uses canonical decomposition and code-point ordering, preserving lone surrogates.
+These are deterministic core-language defaults, not locale-aware formatting.
+
+`JSON.parse(zippProfile()).variant` reports `"lite"` or `"full"`, and
+`omittedFeatures` lists Lite's exclusions. The `lite` Cargo profile uses
+`opt-level = "z"` with the release profile's LTO and hardening. This explicitly trades
+execution speed for size. Use `--release --features lite` for the same feature
+set with throughput-oriented optimization. Standard builds keep `--release`.
+
+See [the size audit](../../docs/validation/2026-09-29-engine-size-audit.md)
+for measured sizes, speed tradeoffs and the remaining gap to QuickJS. To test
+the built Lite package, generate a Node package with wasm-bindgen and run
+`tests/node/lite.cjs` using `pkg-redirect.cjs` / `ZIPP_PKG` (see the Node test README).
 
 There is deliberately no Python-only variant. The engine is the JavaScript VM
 and the Python runtime's helpers are themselves JavaScript that the VM

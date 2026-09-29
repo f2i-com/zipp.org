@@ -693,6 +693,8 @@ impl<'p> Vm<'p> {
         let prog = crate::compile::compile_program(&ast, code)
             .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
         // Dev aid (same flag as the main-program dump in lib.rs).
+        // Browser WASM has no process environment or stderr bytecode dump.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if std::env::var_os("ZIPP_VM_DUMP").is_some() {
             eprintln!(
                 "── evalScript program (hoisted={:?}) ──",

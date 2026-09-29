@@ -1050,6 +1050,7 @@ impl<'p> Vm<'p> {
             "getTime" | "valueOf" => Value::num(ms),
             // `Date.prototype.toTemporalInstant()` → a Temporal.Instant at the date's
             // epoch nanoseconds (ms × 1e6); an invalid Date is a RangeError.
+            #[cfg(not(feature = "wasm-lite"))]
             "toTemporalInstant" => {
                 if ms.is_nan() {
                     return Err(Thrown("RangeError: Invalid time value".into()));
@@ -1086,6 +1087,20 @@ impl<'p> Vm<'p> {
             // `intl402/Date/prototype/returns-same-results-as-DateTimeFormat.js`,
             // and it is what makes a Temporal toLocaleString comparable to a
             // legacy Date one (the `lone-options-accepted.js` family).
+            #[cfg(feature = "wasm-lite")]
+            "toLocaleString" | "toLocaleDateString" | "toLocaleTimeString" => {
+                let s = if ms.is_nan() {
+                    "Invalid Date".to_owned()
+                } else {
+                    match name {
+                        "toLocaleDateString" => date_to_date_string(ms),
+                        "toLocaleTimeString" => date_to_time_string(ms),
+                        _ => date_to_string(ms),
+                    }
+                };
+                self.alloc_str(s)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
             "toLocaleString" | "toLocaleDateString" | "toLocaleTimeString" => {
                 // Step 4 precedes the formatter: an invalid Date answers
                 // "Invalid Date" without ever validating locales/options.

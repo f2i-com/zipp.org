@@ -17,6 +17,7 @@ two independent oracles: node's ICU, and the real zic output embedded in the
 jiff-tzdb crate.
 """
 import hashlib, os, re, sys, tarfile, tempfile
+from pack_tz_transitions import emit_packed_transitions
 
 
 
@@ -560,6 +561,9 @@ def main():
     a("    pub(crate) name: &'static str,")
     a("    pub(crate) tr: u32,")
     a("    pub(crate) ntr: u32,")
+    a("    /// Last explicit transition (or i64::MIN), cached for annual-rule lookups.")
+    a("    pub(crate) last_at: i64,")
+    a("    pub(crate) last_off: i32,")
     a("    /// UTC offset (seconds) before the first transition.")
     a("    pub(crate) init: i32,")
     a("    /// Standard offset (seconds) of the zone's last Zone line -- the base the")
@@ -587,8 +591,10 @@ def main():
     a("")
     a("pub(crate) static ZONES: &[Zone] = &[")
     for (nm, tr, ntr, init, std, fi, nfin, fy) in zone_rows:
-        a("    Zone { name: %s, tr: %d, ntr: %d, init: %d, std: %d, fin: %d, nfin: %d, fin_year: %d },"
-          % ('"%s"' % nm, tr, ntr, init, std, fi, nfin, fy))
+        last_at = trans_at[tr + ntr - 1] if ntr else -(2**63)
+        last_off = trans_off[tr + ntr - 1] if ntr else init
+        a("    Zone { name: %s, tr: %d, ntr: %d, last_at: %d, last_off: %d, init: %d, std: %d, fin: %d, nfin: %d, fin_year: %d },"
+          % ('"%s"' % nm, tr, ntr, last_at, last_off, init, std, fi, nfin, fy))
     a("];")
     a("")
     a("pub(crate) static FINALS: &[FinalRule] = &[")
@@ -599,12 +605,16 @@ def main():
     a("")
     a("/// Transition instants, seconds since the Unix epoch, ascending within each")
     a("/// zone's `[tr, tr+ntr)` slice.")
+    emit_packed_transitions(a, trans_at, trans_off)
+    a("// Original literals retained only for exhaustive decoder verification.")
+    a("#[cfg(test)]")
     a("pub(crate) static TRANS_AT: &[i64] = &[")
     for i in range(0, len(trans_at), 12):
         a("    " + " ".join("%d," % x for x in trans_at[i:i + 12]))
     a("];")
     a("")
     a("/// The UTC offset (seconds) in force AFTER the transition at the same index.")
+    a("#[cfg(test)]")
     a("pub(crate) static TRANS_OFF: &[i32] = &[")
     for i in range(0, len(trans_off), 16):
         a("    " + " ".join("%d," % x for x in trans_off[i:i + 16]))

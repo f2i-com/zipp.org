@@ -2,7 +2,7 @@
 
 use crate::{
     api, charclasses,
-    codepointset::{CodePointSet, Interval, interval_contains},
+    codepointset::{CodePointSet, Interval},
     ir,
     types::{
         BracketContents, CaptureGroupID, CaptureGroupName, CharacterClassType, MAX_CAPTURE_GROUPS,
@@ -2034,7 +2034,7 @@ where
                 }
             }
 
-            if interval_contains(id_start_ranges(), c.into()) || c == '$' || c == '_' {
+            if id_start_ranges().contains_identifier(c.into()) || c == '$' || c == '_' {
                 group_name.push(c);
             } else {
                 self.input = orig_input;
@@ -2064,7 +2064,7 @@ where
                     break;
                 }
 
-                if interval_contains(id_continue_ranges(), c.into()) || c == '$' || c == '_' || c == '\u{200C}' /* <ZWNJ> */ || c == '\u{200D}'
+                if id_continue_ranges().contains_identifier(c.into()) || c == '$' || c == '_' || c == '\u{200C}' /* <ZWNJ> */ || c == '\u{200D}'
                 /* <ZWJ> */
                 {
                     group_name.push(c);

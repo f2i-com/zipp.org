@@ -783,6 +783,7 @@ impl<'p> Vm<'p> {
         }
         // An Intl constructor invoked without `new`: NumberFormat/DateTimeFormat/
         // Collator are spec'd to construct anyway; the other Intl services throw.
+        #[cfg(not(feature = "wasm-lite"))]
         if self.intl_ctors[0] != 0 && callee.is_heap() {
             let ci = callee.heap_index();
             if let Some(kind) = self.intl_ctors.iter().position(|&c| c == ci) {

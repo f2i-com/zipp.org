@@ -20,6 +20,9 @@
 //! later make faster.
 
 #![allow(unused_imports)]
+// Lite shares internal types and Date's ISO helpers with the full engine.
+// Unreachable Intl/Temporal helpers are intentionally discarded by LTO.
+#![cfg_attr(feature = "wasm-lite", allow(dead_code))]
 use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
@@ -2965,14 +2968,14 @@ pub(crate) use proxy_regexp::rxstats::dump_scalar_exec as regexp_scalar_exec_sta
 pub(crate) use proxy_regexp::rxstats::dump_scalar_matchall as regexp_scalar_matchall_stats;
 pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_call_direct_stats;
 pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
-pub(crate) mod prof;
 mod handler_pool;
+pub(crate) mod prof;
+#[cfg(feature = "python")]
+pub(crate) mod prof_py;
 #[cfg(feature = "python")]
 mod py_attr;
 #[cfg(feature = "python")]
 mod py_ops;
-#[cfg(feature = "python")]
-pub(crate) mod prof_py;
 #[cfg(feature = "python")]
 mod py_rt;
 #[cfg(feature = "python")]

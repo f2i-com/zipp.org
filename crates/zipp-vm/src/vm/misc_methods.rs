@@ -139,6 +139,9 @@ impl<'p> Vm<'p> {
             // Intl.NumberFormat from (locales, options) and FormatNumeric through
             // it — so grouping, style and the digit options apply here too, and a
             // bad option throws exactly as the constructor would.
+            #[cfg(feature = "wasm-lite")]
+            "toLocaleString" => Ok(Some(self.alloc_str(self.display(nv)))),
+            #[cfg(not(feature = "wasm-lite"))]
             "toLocaleString" => {
                 let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -401,7 +404,9 @@ impl<'p> Vm<'p> {
         // the OS stack overflowed and the process aborted. Charge it against the
         // same re-entry cap so it throws the interpreter's catchable RangeError.
         if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         let mut bail: u32 = crate::codegen::NO_BAIL;
         self.run_loop_depth += 1;
