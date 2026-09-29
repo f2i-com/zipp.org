@@ -1397,6 +1397,7 @@ impl<'a> InputIndexer for Ucs2Input<'a> {
 
 #[cfg(all(test, feature = "compact-utf16"))]
 mod compact_utf16_tests {
+    #[cfg(not(feature = "std"))]
     use alloc::vec::Vec;
     use super::{InputIndexer, Utf16Input};
     use crate::cursor::Forward;
