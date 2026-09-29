@@ -18,7 +18,8 @@
 # a complete `wasm-bindgen --target web` package plus a `.wasm.br` for
 # `Content-Encoding: br` serving. `dist/torch/` holds zipp_torch.wasm (+ .br)
 # and zipp_torch.js. Requires the pinned wasm-bindgen CLI (see README.md);
-# `brotli` is optional (sizes fall back to node's zlib).
+# Binaryen 125 is required (`npm install -g binaryen@125.0.0`); `brotli` is
+# optional (sizes fall back to node's zlib).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -77,6 +78,7 @@ for v in "${variants[@]}"; do
     "target/variants/$v/$TARGET/$profile/zipp_wasm.wasm"
   node tests/node/strip-target-features.cjs "$out/zipp_wasm_bg.wasm" "$out/zipp_wasm_bg.stripped.wasm"
   mv "$out/zipp_wasm_bg.stripped.wasm" "$out/zipp_wasm_bg.wasm"
+  bash optimize-wasm.sh "$out/zipp_wasm_bg.wasm"
   node tests/node/check-wasm-memory.cjs "$out/zipp_wasm_bg.wasm"
   compress "$out/zipp_wasm_bg.wasm"
   sizes+=("$v $(wc -c < "$out/zipp_wasm_bg.wasm") $(wc -c < "$out/zipp_wasm_bg.wasm.br")")

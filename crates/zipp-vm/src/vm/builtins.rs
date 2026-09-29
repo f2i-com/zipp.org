@@ -183,6 +183,42 @@ fn typed_array_sort_work_bound(len: usize, callback: bool) -> u64 {
 }
 
 impl<'p> Vm<'p> {
+    /// Shared stable ordering for TypedArray.sort and TypedArray.toSorted.
+    /// Keep callback and ToNumber errors in their original comparison order.
+    fn sort_typed_array_values(&mut self, snap: &mut [Value], cmp: Value) -> Result<(), Thrown> {
+        if self.is_callable(cmp) {
+            let n = snap.len();
+            for i in 1..n {
+                let mut j = i;
+                while j > 0 {
+                    let r =
+                        self.call_value(cmp, Value::UNDEFINED, &[snap[j - 1], snap[j]])?;
+                    // ToNumber on the comparator result (observable on
+                    // objects; abrupt propagates; NaN acts as +0).
+                    if self.to_number_strict(r)? > 0.0 {
+                        snap.swap(j - 1, j);
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Default TypedArray sort: ascending with -0 before +0
+            // (total_cmp) and ALL NaNs last regardless of their sign bit.
+            snap.sort_by(|a, b| {
+                let (x, y) = (self.value_num(*a), self.value_num(*b));
+                match (x.is_nan(), y.is_nan()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => x.total_cmp(&y),
+                }
+            });
+        }
+        Ok(())
+    }
+
     /// Try a builtin method on an array or string receiver. Returns
     /// `Ok(Some(result))` when `name` is a recognised builtin, `Ok(None)` when
     /// it isn't (the caller then treats it as a user-defined method/property).
@@ -2096,36 +2132,7 @@ impl<'p> Vm<'p> {
                     self.is_callable(cmp),
                 ))?;
                 let mut snap = self.ta_snapshot(idx);
-                if self.is_callable(cmp) {
-                    let n = snap.len();
-                    for i in 1..n {
-                        let mut j = i;
-                        while j > 0 {
-                            let r =
-                                self.call_value(cmp, Value::UNDEFINED, &[snap[j - 1], snap[j]])?;
-                            // ToNumber on the comparator result (observable on
-                            // objects; abrupt propagates; NaN acts as +0).
-                            if self.to_number_strict(r)? > 0.0 {
-                                snap.swap(j - 1, j);
-                                j -= 1;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    // Default TypedArray sort: ascending with -0 before +0
-                    // (total_cmp) and ALL NaNs last regardless of their sign bit.
-                    snap.sort_by(|a, b| {
-                        let (x, y) = (self.value_num(*a), self.value_num(*b));
-                        match (x.is_nan(), y.is_nan()) {
-                            (true, true) => std::cmp::Ordering::Equal,
-                            (true, false) => std::cmp::Ordering::Greater,
-                            (false, true) => std::cmp::Ordering::Less,
-                            (false, false) => x.total_cmp(&y),
-                        }
-                    });
-                }
+                self.sort_typed_array_values(&mut snap, cmp)?;
                 Ok(Some(self.ta_build_from(kind, &snap)?))
             }
             "with" => {
@@ -2333,37 +2340,7 @@ impl<'p> Vm<'p> {
                     self.is_callable(cmp),
                 ))?;
                 let mut snap = self.ta_snapshot(idx);
-                if self.is_callable(cmp) {
-                    // Comparator sort (stable insertion to allow VM re-entry).
-                    let n = snap.len();
-                    for i in 1..n {
-                        let mut j = i;
-                        while j > 0 {
-                            let r =
-                                self.call_value(cmp, Value::UNDEFINED, &[snap[j - 1], snap[j]])?;
-                            // ToNumber on the comparator result (observable on
-                            // objects; abrupt propagates; NaN acts as +0).
-                            if self.to_number_strict(r)? > 0.0 {
-                                snap.swap(j - 1, j);
-                                j -= 1;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    // Default TypedArray sort: ascending with -0 before +0
-                    // (total_cmp) and ALL NaNs last regardless of their sign bit.
-                    snap.sort_by(|a, b| {
-                        let (x, y) = (self.value_num(*a), self.value_num(*b));
-                        match (x.is_nan(), y.is_nan()) {
-                            (true, true) => std::cmp::Ordering::Equal,
-                            (true, false) => std::cmp::Ordering::Greater,
-                            (false, true) => std::cmp::Ordering::Less,
-                            (false, false) => x.total_cmp(&y),
-                        }
-                    });
-                }
+                self.sort_typed_array_values(&mut snap, cmp)?;
                 for (i, v) in snap.into_iter().enumerate() {
                     self.ta_element_set(idx, i, v)?;
                 }

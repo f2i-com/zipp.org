@@ -473,6 +473,9 @@ jobs:
           cargo install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
           test "$(wasm-bindgen --version)" = "wasm-bindgen $WASM_BINDGEN_CLI"
 
+      - name: Install the measured WASM optimizer
+        run: npm install --global binaryen@125.0.0
+
       - name: Build the locked production WebAssembly module
         # RUSTFLAGS overrides target config, so repeat both security-critical
         # linker limits while making compiler warnings fatal. The tagged
@@ -493,12 +496,20 @@ jobs:
       # rejected two working applications because the only browser check at
       # the time parsed three tokens) and the audit regression suites the
       # release lane used to omit.
-      - name: Exercise the production host boundary under Node
-        if: matrix.variant != 'javascript-python-base'
+      - name: Prepare the production module for Node checks
         run: |
           set -euo pipefail
           wasm-bindgen --target nodejs --out-dir tests/node/pkg \
+            --remove-name-section --remove-producers-section \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node tests/node/strip-target-features.cjs \
+            tests/node/pkg/zipp_wasm_bg.wasm tests/node/pkg/stripped.wasm
+          mv tests/node/pkg/stripped.wasm tests/node/pkg/zipp_wasm_bg.wasm
+          bash optimize-wasm.sh tests/node/pkg/zipp_wasm_bg.wasm
+
+      - name: Exercise the production host boundary under Node
+        if: matrix.variant != 'javascript-python-base'
+        run: |
           node tests/node/run-boundary-suite.cjs
 
       # The base Python artifact has no torch until a host adds the package;
@@ -507,9 +518,8 @@ jobs:
         if: matrix.variant == 'javascript-python-base'
         run: |
           set -euo pipefail
-          wasm-bindgen --target nodejs --out-dir tests/node/pkg \
-            target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/python-frontend.cjs
+          node tests/node/sort-semantics.cjs
 
       - name: Exercise the combined artifact's Torch and interop contracts
         if: matrix.variant == 'javascript-python'
@@ -533,16 +543,9 @@ jobs:
           bundle="zipp-wasm-$RELEASE_VERSION-$WASM_SUFFIX"
           archive="$bundle.zip"
           mkdir -p "dist/$bundle"
-          # Drop the name and producers sections from the SHIPPED bundle: 329 KB
-          # raw and ~75 KB brotli of symbol names no browser reads. The nodejs
-          # build above keeps them, so the harnesses and any profile of this
-          # release still resolve real function names.
-          #
-          # Deliberately no `wasm-opt` step. Measured on this module it is a wire
-          # REGRESSION — -Oz is 390 KB smaller uncompressed and 22 KB larger after
-          # brotli, because binaryen trades away the regularity the compressor
-          # feeds on — and it measured 2.04% slower to execute (-O3: 1.39%). See
-          # crates/zipp-wasm/README.md.
+          # Use the same stripping and guarded Binaryen 125 -O1 pass as the
+          # Node checks above. Stronger -O3/-Oz passes increased wire size;
+          # optimize-wasm.sh accepts only a raw AND Brotli size improvement.
           wasm-bindgen --target web --out-dir "dist/$bundle" \
             --remove-name-section --remove-producers-section \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
@@ -551,6 +554,10 @@ jobs:
             "dist/$bundle/zipp_wasm_bg.stripped.wasm"
           mv "dist/$bundle/zipp_wasm_bg.stripped.wasm" \
             "dist/$bundle/zipp_wasm_bg.wasm"
+          bash optimize-wasm.sh "dist/$bundle/zipp_wasm_bg.wasm"
+          # wasm-bindgen's Node and browser glue use the same module. Prove
+          # the shipped bytes are exactly the bytes the boundary tests ran.
+          cmp tests/node/pkg/zipp_wasm_bg.wasm "dist/$bundle/zipp_wasm_bg.wasm"
           node --input-type=module --check < "dist/$bundle/zipp_wasm.js"
           # Validation on the artifact AFTER stripping: memory/import surface,
           # and that the shipped module reports the tagged revision.

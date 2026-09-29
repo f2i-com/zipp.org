@@ -221,6 +221,12 @@ const env = {
   cores: os.cpus().length,
 }
 
+// Share the exact workload corpus with the alternating size-pass benchmark.
+if (require.main !== module) {
+  module.exports = { WORKLOADS }
+  return
+}
+
 const host = measureHost()
 const builds = pkgDirs.map(measure)
 

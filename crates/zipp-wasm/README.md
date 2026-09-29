@@ -244,29 +244,40 @@ reason. `gpu-lab/README.md` describes the vendored package and its own
 standalone demo (`gpu-lab/demo/`), which stays useful as an isolated
 diagnostic for a browser's GPU support.
 
-### Why there is no `wasm-opt` step
+### Conservative WASM post-processing
 
-There used to be a `wasm-opt -Oz --strip-debug` line here, marked optional. It is
-worse than nothing on both axes it was supposed to help, measured on this module:
+`build-variants.sh` and release packaging use `optimize-wasm.sh`, with
+[Binaryen 125](https://github.com/WebAssembly/binaryen/releases/tag/version_125)
+(`npm install --global binaryen@125.0.0`). The script tries `wasm-opt -O1`
+after stripping metadata. It keeps the candidate only when it is smaller raw
+and no larger after Brotli quality 11. Both input and output must validate and
+have identical import/export surfaces; the selected module retains the audited
+1 GiB memory maximum. Release tests run on the selected bytes, and packaging
+checks that the browser module is byte-identical to the tested Node module.
 
-| post-processing | raw | brotli (the wire) |
-| --- | --- | --- |
-| none | 5,998,514 | 1,337,361 |
-| strip sections only | 5,669,892 | **1,261,091** |
-| `wasm-opt -O3` | 5,299,317 | 1,280,742 |
-| `wasm-opt -Oz` | 5,280,172 | 1,282,981 |
+Measured on 2026-09-29 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
+after the compiler/sorter reductions in this branch:
 
-`-Oz` is 390 KB smaller *raw* and **22 KB larger on the wire**. Binaryen's
-rewrites trade away the regularity brotli feeds on, and every byte of the real
-saving comes from dropping the 329 KB name section — which `wasm-bindgen` does
-by itself, without the 90-second pass. `-Oz` also measured **2.04% slower** and
-`-O3` **1.39% slower** on a paired counterbalanced benchmark against a
-strip-only control (~0.15% noise floor). Do not reintroduce it without
-re-measuring both numbers.
+| Variant | Before post-processing, raw / Brotli | Selected, raw / Brotli |
+| --- | ---: | ---: |
+| Lite | 3,069,790 / 779,930 | 2,952,989 / 776,971 |
+| JavaScript | 5,520,514 / 1,325,492 | 5,356,850 / 1,322,063 |
+| Python-base | 7,233,449 / 1,699,219 | 7,036,528 / 1,693,025 |
+| Python + Torch | 9,192,920 / 2,047,178 | 8,991,628 / 2,037,775 |
 
-Keep the release profile at `opt-level = 3`. `opt-level = "s"` and `"z"` were
-measured: `"z"` cuts the wire to 974,657 bytes and makes the interpreter
-**1.9x-2.5x slower**, which is not a trade this artifact should take.
+These are module bytes, excluding JS glue; Brotli is the download size. See the
+[second size audit](../../docs/validation/2026-09-29-engine-size-round2.md)
+for baseline deltas, performance measurements, validation and remaining gaps.
+
+Stronger optimization is not automatically better. Earlier `-O3` / `-Oz`
+measurements reduced raw size but increased Brotli size and slowed execution.
+The new Lite screen also rejected `-O2` and function merging for increasing
+Brotli size. Do not substitute stronger flags without measuring both sizes and
+runtime performance again.
+
+Full builds retain release `opt-level = 3`; only Lite uses `opt-level = "z"`.
+Lite still includes the JavaScript parser, compiler, interpreter, regular
+expressions and core builtins; its declared omissions are unchanged.
 
 ### Why release uses one codegen unit with fat LTO
 

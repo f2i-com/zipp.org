@@ -608,20 +608,22 @@ impl<'a> FnCompiler<'a> {
         //
         // The pass runs in FOUR GROUPS, not document order: static non-fields,
         // instance non-fields, static fields, instance fields — the four separate
-        // loops the spec spells out. A stable sort keeps document order inside
-        // each group. Flat document order is observably different the moment a
-        // class mixes a decorated field with a decorated method, and it is what
-        // Babel's 2023-11 transform and TypeScript's __esDecorate both produce.
-        elem_decs.sort_by_key(|&(group, ..)| group);
-        for (_, elem, dbase, dn) in elem_decs {
-            self.emit(Instr::DecElem {
-                class: cls,
-                elem,
-                arg_base: dbase,
-                argc: dn,
-                class_id,
-            });
+        // loops the spec spells out. Visit each group in document order without
+        // allocating sort scratch or embedding a general-purpose stable sorter.
+        // Flat document order is observably different when fields and methods
+        // mix (as in Babel's 2023-11 transform and TypeScript's __esDecorate).
+        for group in 0..4 {
+            for &(_, elem, dbase, dn) in elem_decs.iter().filter(|&&(g, ..)| g == group) {
+                self.emit(Instr::DecElem {
+                    class: cls,
+                    elem,
+                    arg_base: dbase,
+                    argc: dn,
+                    class_id,
+                });
+            }
         }
+        drop(elem_decs);
         // PHASE 1c — the CLASS decorators, then the static `addInitializer`
         // callbacks. Both precede the static field initializers: a class
         // decorator may REPLACE the class, and `@dec class C { static x = 1 }`

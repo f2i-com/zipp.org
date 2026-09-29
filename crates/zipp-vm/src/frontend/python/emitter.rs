@@ -812,9 +812,12 @@ impl<'a> Emitter<'a> {
         // Small ints are immediates and allocate nothing (value.rs), but a
         // register read is still one instruction fewer than a load inside
         // the loop; the ones that allocate go first.
-        let mut values = super::nesting::loop_int_literals(stmts);
-        values.sort_by_key(|&v| crate::value::Value::small_bigint(v).is_some());
-        for value in values {
+        let values = super::nesting::loop_int_literals(stmts);
+        // Two stable groups suffice: preserve the previous priority and source
+        // order without a general-purpose i128 sort or its scratch allocation.
+        let large = values.iter().filter(|&&v| crate::value::Value::small_bigint(v).is_none());
+        let small = values.iter().filter(|&&v| crate::value::Value::small_bigint(v).is_some());
+        for &value in large.chain(small) {
             if self.hoisted.contains_key(&value) {
                 continue;
             }
