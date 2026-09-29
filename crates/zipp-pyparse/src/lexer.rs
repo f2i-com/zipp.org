@@ -49,6 +49,9 @@ pub struct Error {
 }
 
 impl Error {
+    // Keep error allocation out of the successful WASM parser paths.
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), cold)]
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), inline(never))]
     pub(crate) fn new(message: impl Into<String>, offset: u32) -> Error {
         Error {
             message: message.into(),

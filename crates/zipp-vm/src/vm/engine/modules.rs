@@ -462,8 +462,8 @@ impl<'p> Vm<'p> {
                 if e.contains("only valid inside an async function")
                     || e.contains("only valid in an async function") =>
             {
-                return Err(Thrown(
-                    "TypeError: top-level await is not supported in imported modules yet".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: top-level await is not supported in imported modules yet",
                 ));
             }
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -1412,9 +1412,8 @@ impl<'p> Vm<'p> {
         // BEFORE evaluating any part of the graph.
         let mut seen = std::collections::HashSet::new();
         if !self.ready_for_sync_execution(&path, &mut seen) {
-            return Err(Thrown(
-                "TypeError: Cannot synchronously evaluate a deferred module that is currently evaluating"
-                    .into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot synchronously evaluate a deferred module that is currently evaluating",
             ));
         }
         let real = self.import_module(&path, mtype.as_deref())?;

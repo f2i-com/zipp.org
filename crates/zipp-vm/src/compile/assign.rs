@@ -15,6 +15,9 @@ use crate::parse::ast::{
 /// speculative runtime shortcut.
 #[inline]
 fn concat_pair_fuse_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {

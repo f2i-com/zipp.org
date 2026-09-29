@@ -14,6 +14,9 @@ use crate::parse::ast;
 /// the historical two-op sequence.
 #[inline]
 fn append_index_fuse_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);

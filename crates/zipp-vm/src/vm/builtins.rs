@@ -154,6 +154,9 @@ pub(super) fn builtin_stats_count(_vm: &Vm<'_>, _recv: Value, _name: &str) {}
 /// behaviour question can be bisected against the old path without a rebuild.
 #[inline]
 fn promise_pristine_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -1267,7 +1270,7 @@ impl<'p> Vm<'p> {
                         let total = tag
                             .len()
                             .checked_add(9)
-                            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                            .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
                         let mut out = self.guest_string_with_capacity(total)?;
                         out.push_str("[object ");
                         out.push_str(&tag);
@@ -1645,8 +1648,8 @@ impl<'p> Vm<'p> {
         let species = if ctor == Value::UNDEFINED {
             Value::UNDEFINED
         } else if !self.is_object_value(ctor) {
-            return Err(Thrown(
-                "TypeError: constructor property is not an object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: constructor property is not an object",
             ));
         } else {
             let s = self.get_prop(ctor, "@@species")?;
@@ -1663,8 +1666,8 @@ impl<'p> Vm<'p> {
             return Ok(self.alloc_typed_array(buf, kind, 0, count));
         }
         if !self.is_constructor(species) {
-            return Err(Thrown(
-                "TypeError: TypedArray [Symbol.species] is not a constructor".into(),
+            return Err(Thrown::from_static(
+                "TypeError: TypedArray [Symbol.species] is not a constructor",
             ));
         }
         let result = self.construct(species, &[Value::num(count as f64)])?;
@@ -1676,27 +1679,27 @@ impl<'p> Vm<'p> {
             Some(HeapObj::TypedArray { buffer, .. }) => {
                 let b = *buffer;
                 if self.immutable_buffers.contains(&b) {
-                    return Err(Thrown(
-                        "TypeError: species-created TypedArray is backed by an immutable ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: species-created TypedArray is backed by an immutable ArrayBuffer",
                     ));
                 }
                 result.heap_index()
             }
             _ => {
-                return Err(Thrown(
-                    "TypeError: TypedArray [Symbol.species] did not return a TypedArray".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: TypedArray [Symbol.species] did not return a TypedArray",
                 ))
             }
         };
         match self.ta_effective_len(ridx) {
             None => {
-                return Err(Thrown(
-                    "TypeError: species-created TypedArray is detached or out of bounds".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: species-created TypedArray is detached or out of bounds",
                 ))
             }
             Some(eff) if eff < count => {
-                return Err(Thrown(
-                    "TypeError: species-created TypedArray is shorter than required".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: species-created TypedArray is shorter than required",
                 ))
             }
             _ => {}
@@ -1706,8 +1709,8 @@ impl<'p> Vm<'p> {
         // map callbacks run before the required TypeError.
         let (_, result_kind) = self.ta_len_kind(ridx);
         if native::TA_KINDS[result_kind as usize].2 != native::TA_KINDS[kind as usize].2 {
-            return Err(Thrown(
-                "TypeError: TypedArray species has a different content type".into(),
+            return Err(Thrown::from_static(
+                "TypeError: TypedArray species has a different content type",
             ));
         }
         Ok(result)
@@ -1848,8 +1851,8 @@ impl<'p> Vm<'p> {
                     }
                     let f = self.get_prop(el, "toLocaleString")?;
                     if !self.is_callable(f) {
-                        return Err(Thrown(
-                            "TypeError: element toLocaleString is not callable".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: element toLocaleString is not callable",
                         ));
                     }
                     // ECMA-402 forwards (locales, options) to each element. The
@@ -1939,7 +1942,7 @@ impl<'p> Vm<'p> {
             }
             "map" => {
                 if !self.is_callable(a0) {
-                    return Err(Thrown("TypeError: map callback is not a function".into()));
+                    return Err(Thrown::from_static("TypeError: map callback is not a function"));
                 }
                 self.preflight_native_iteration_work(len as u64)?;
                 // TypedArraySpeciesCreate runs FIRST (its user code can resize or
@@ -2048,8 +2051,8 @@ impl<'p> Vm<'p> {
                     acc = a1;
                 } else {
                     if order.is_empty() {
-                        return Err(Thrown(
-                            "TypeError: Reduce of empty array with no initial value".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Reduce of empty array with no initial value",
                         ));
                     }
                     acc = self.ta_element_get(idx, order[0]);
@@ -2094,8 +2097,8 @@ impl<'p> Vm<'p> {
                 // valueOf / @@toPrimitive) that detached the buffer — re-check before
                 // writing (spec step: a detached buffer here is a TypeError).
                 if self.ta_effective_len(idx).is_none() {
-                    return Err(Thrown(
-                        "TypeError: Cannot fill a detached or out-of-bounds TypedArray".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot fill a detached or out-of-bounds TypedArray",
                     ));
                 }
                 self.preflight_native_iteration_work(end.saturating_sub(start) as u64)?;
@@ -2123,8 +2126,8 @@ impl<'p> Vm<'p> {
             "toSorted" => {
                 let cmp = a0;
                 if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
-                    return Err(Thrown(
-                        "TypeError: the comparator argument must be a function or undefined".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: the comparator argument must be a function or undefined",
                     ));
                 }
                 self.preflight_native_iteration_work(typed_array_sort_work_bound(
@@ -2158,9 +2161,8 @@ impl<'p> Vm<'p> {
                     // ToBigInt (strict, as ta_element_set): a Number is a TypeError
                     // (unlike the lenient BigInt(5) constructor coercion).
                     if a1.is_number() {
-                        return Err(Thrown(
-                            "TypeError: cannot convert a Number to a BigInt typed-array element"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: cannot convert a Number to a BigInt typed-array element",
                         ));
                     }
                     let big = self.to_bigint(a1)?;
@@ -2173,7 +2175,7 @@ impl<'p> Vm<'p> {
                 // CURRENT length (a coercion may have resized the buffer)...
                 let cur = self.ta_effective_len(idx).unwrap_or(0);
                 if actual < 0.0 || actual >= cur as f64 {
-                    return Err(Thrown("RangeError: invalid typed array index".into()));
+                    return Err(Thrown::from_static("RangeError: invalid typed array index"));
                 }
                 self.preflight_native_iteration_work(len as u64)?;
                 // ...but the result has exactly the ENTRY length: re-Get each
@@ -2198,8 +2200,8 @@ impl<'p> Vm<'p> {
                 // IsDetachedBuffer(O) AFTER the species create and throw TypeError.
                 // ta_effective_len returns None for a detached / out-of-bounds source.
                 if count > 0 && self.ta_effective_len(idx).is_none() {
-                    return Err(Thrown(
-                        "TypeError: Cannot slice a TypedArray backed by a detached buffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot slice a TypedArray backed by a detached buffer",
                     ));
                 }
                 // The species create may have SHRUNK the source (resizable buffer):
@@ -2239,8 +2241,8 @@ impl<'p> Vm<'p> {
                 let species = if ctor == Value::UNDEFINED {
                     Value::UNDEFINED
                 } else if !self.is_object_value(ctor) {
-                    return Err(Thrown(
-                        "TypeError: constructor property is not an object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: constructor property is not an object",
                     ));
                 } else {
                     let s = self.get_prop(ctor, "@@species")?;
@@ -2257,9 +2259,8 @@ impl<'p> Vm<'p> {
                         self.heap.get(buffer),
                         HeapObj::ArrayBuffer { detached: true, .. }
                     ) {
-                        return Err(Thrown(
-                            "TypeError: Cannot create a subarray view of a detached ArrayBuffer"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Cannot create a subarray view of a detached ArrayBuffer",
                         ));
                     }
                     let tracking = a1 == Value::UNDEFINED && self.ta_tracking.contains(&idx);
@@ -2270,8 +2271,8 @@ impl<'p> Vm<'p> {
                     if new_offset > byte_len
                         || (!tracking && new_len > (byte_len - new_offset) / size)
                     {
-                        return Err(Thrown(
-                            "RangeError: subarray view exceeds the ArrayBuffer bounds".into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: subarray view exceeds the ArrayBuffer bounds",
                         ));
                     }
                     let result = self.alloc_typed_array(buffer, kind, new_offset, new_len);
@@ -2284,8 +2285,8 @@ impl<'p> Vm<'p> {
                     return Ok(Some(result));
                 }
                 if !self.is_constructor(species) {
-                    return Err(Thrown(
-                        "TypeError: TypedArray [Symbol.species] is not a constructor".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: TypedArray [Symbol.species] is not a constructor",
                     ));
                 }
                 // TypedArraySpeciesCreate: a length-tracking source with no explicit
@@ -2307,8 +2308,8 @@ impl<'p> Vm<'p> {
                     )?
                 };
                 let Some(result_idx) = self.as_typed_array(result) else {
-                    return Err(Thrown(
-                        "TypeError: TypedArray [Symbol.species] did not return a TypedArray".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: TypedArray [Symbol.species] did not return a TypedArray",
                     ));
                 };
                 // TypedArrayCreateFromConstructor validates a species result
@@ -2316,14 +2317,14 @@ impl<'p> Vm<'p> {
                 // detached and out-of-bounds views are not. Its argument list
                 // starts with a buffer, so there is no minimum-length check.
                 if self.ta_effective_len(result_idx).is_none() {
-                    return Err(Thrown(
-                        "TypeError: species-created TypedArray is detached or out of bounds".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: species-created TypedArray is detached or out of bounds",
                     ));
                 }
                 let (_, result_kind) = self.ta_len_kind(result_idx);
                 if native::TA_KINDS[result_kind as usize].2 != native::TA_KINDS[kind as usize].2 {
-                    return Err(Thrown(
-                        "TypeError: TypedArray species has a different content type".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: TypedArray species has a different content type",
                     ));
                 }
                 Ok(Some(result))
@@ -2331,8 +2332,8 @@ impl<'p> Vm<'p> {
             "sort" => {
                 let cmp = a0;
                 if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
-                    return Err(Thrown(
-                        "TypeError: the comparator argument must be a function or undefined".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: the comparator argument must be a function or undefined",
                     ));
                 }
                 self.preflight_native_iteration_work(typed_array_sort_work_bound(
@@ -2362,9 +2363,8 @@ impl<'p> Vm<'p> {
                 // detached the buffer — re-check before copying (a detached buffer
                 // here is a TypeError, not a silent no-op).
                 if self.ta_effective_len(idx).is_none() {
-                    return Err(Thrown(
-                        "TypeError: Cannot copyWithin a detached or out-of-bounds TypedArray"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot copyWithin a detached or out-of-bounds TypedArray",
                     ));
                 }
                 // A coercion may have SHRUNK a resizable buffer: both cursors stop
@@ -2374,8 +2374,8 @@ impl<'p> Vm<'p> {
                 let bound = count.min(cur.saturating_sub(start.max(target)));
                 self.preflight_native_iteration_work(bound as u64)?;
                 if !self.ta_raw_memmove(idx, start, idx, target, bound) {
-                    return Err(Thrown(
-                        "TypeError: TypedArray buffer changed during copyWithin".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: TypedArray buffer changed during copyWithin",
                     ));
                 }
                 Ok(Some(recv))
@@ -2388,16 +2388,15 @@ impl<'p> Vm<'p> {
                 } else {
                     let n = self.to_integer_strict(a1)?;
                     if n < 0 {
-                        return Err(Thrown("RangeError: offset is out of bounds".into()));
+                        return Err(Thrown::from_static("RangeError: offset is out of bounds"));
                     }
                     n as usize
                 };
                 // ToInteger(offset)'s valueOf may have detached the TARGET buffer:
                 // re-check (SetTypedArrayFromArrayLike / FromTypedArray step).
                 let target_len = self.ta_effective_len(idx).ok_or_else(|| {
-                    Thrown(
-                        "TypeError: Cannot set values on a detached/out-of-bounds TypedArray"
-                            .into(),
+                    Thrown::from_static(
+                        "TypeError: Cannot set values on a detached/out-of-bounds TypedArray",
                     )
                 })?;
                 // A BigInt typed array only mixes with a BigInt source (checked up
@@ -2413,20 +2412,19 @@ impl<'p> Vm<'p> {
                         _ => unreachable!(),
                     };
                     if native::TA_KINDS[source_kind as usize].2 != target_big {
-                        return Err(Thrown(
-                            "TypeError: cannot mix BigInt and other types when setting a TypedArray"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: cannot mix BigInt and other types when setting a TypedArray",
                         ));
                     }
                     let source_len = self.ta_effective_len(source_idx).ok_or_else(|| {
-                        Thrown("TypeError: source TypedArray has a detached buffer".into())
+                        Thrown::from_static("TypeError: source TypedArray has a detached buffer")
                     })?;
                     let end = offset.checked_add(source_len).ok_or_else(|| {
-                        Thrown("RangeError: source array is too long for the target offset".into())
+                        Thrown::from_static("RangeError: source array is too long for the target offset")
                     })?;
                     if end > target_len {
-                        return Err(Thrown(
-                            "RangeError: source array is too long for the target offset".into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: source array is too long for the target offset",
                         ));
                     }
                     self.preflight_native_iteration_work(source_len as u64)?;
@@ -2435,8 +2433,8 @@ impl<'p> Vm<'p> {
                     // required memmove behavior without canonicalising NaNs.
                     if source_kind == kind {
                         if !self.ta_raw_memmove(source_idx, 0, idx, offset, source_len) {
-                            return Err(Thrown(
-                                "TypeError: TypedArray buffer changed during set".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: TypedArray buffer changed during set",
                             ));
                         }
                         return Ok(Some(Value::UNDEFINED));
@@ -2465,14 +2463,14 @@ impl<'p> Vm<'p> {
                 // budget.
                 self.preflight_native_iteration_work(src_len_u64)?;
                 let src_len = usize::try_from(src_len_u64).map_err(|_| {
-                    Thrown("RangeError: source array is too long for the target offset".into())
+                    Thrown::from_static("RangeError: source array is too long for the target offset")
                 })?;
                 let end = offset.checked_add(src_len).ok_or_else(|| {
-                    Thrown("RangeError: source array is too long for the target offset".into())
+                    Thrown::from_static("RangeError: source array is too long for the target offset")
                 })?;
                 if end > target_len {
-                    return Err(Thrown(
-                        "RangeError: source array is too long for the target offset".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: source array is too long for the target offset",
                     ));
                 }
                 for k in 0..src_len {
@@ -2542,9 +2540,8 @@ impl<'p> Vm<'p> {
         // ArrayBuffer is a TypeError — BEFORE the byteOffset/value coercions (their
         // valueOf must not run). (Reads are fine on an immutable buffer.)
         if op == 1 && self.immutable_buffers.contains(&buffer) {
-            return Err(Thrown(
-                "TypeError: Cannot set a value on a DataView backed by an immutable ArrayBuffer"
-                    .into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot set a value on a DataView backed by an immutable ArrayBuffer",
             ));
         }
         // requestIndex = ToIndex(arg0): runs valueOf/toString and throws RangeError
@@ -2569,13 +2566,13 @@ impl<'p> Vm<'p> {
                 _ => None,
             };
             let Some(view_len) = view_len else {
-                return Err(Thrown(
-                    "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer",
                 ));
             };
             if size > view_len || pos > view_len - size {
-                return Err(Thrown(
-                    "RangeError: Offset is outside the bounds of the DataView".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: Offset is outside the bounds of the DataView",
                 ));
             }
             let abs = byte_offset + pos;
@@ -2587,7 +2584,7 @@ impl<'p> Vm<'p> {
                     _ => return Ok(Some(Value::UNDEFINED)),
                 };
                 if size > data.len() || abs > data.len() - size {
-                    return Err(Thrown("RangeError: DataView out of bounds".into()));
+                    return Err(Thrown::from_static("RangeError: DataView out of bounds"));
                 }
                 b[..size].copy_from_slice(&data[abs..abs + size]);
             }
@@ -2638,13 +2635,13 @@ impl<'p> Vm<'p> {
                 _ => None,
             };
             let Some(view_len) = view_len else {
-                return Err(Thrown(
-                    "TypeError: Cannot perform DataView write on a detached or out-of-bounds ArrayBuffer".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform DataView write on a detached or out-of-bounds ArrayBuffer",
                 ));
             };
             if size > view_len || pos > view_len - size {
-                return Err(Thrown(
-                    "RangeError: Offset is outside the bounds of the DataView".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: Offset is outside the bounds of the DataView",
                 ));
             }
             let abs = byte_offset + pos;
@@ -2691,9 +2688,8 @@ impl<'p> Vm<'p> {
         let shared = self.shared_buffers.contains(&idx);
         match name {
             "grow" if !shared => {
-                return Err(Thrown(
-                    "TypeError: SharedArrayBuffer.prototype.grow called on incompatible receiver"
-                        .into(),
+                return Err(Thrown::from_static(
+                    "TypeError: SharedArrayBuffer.prototype.grow called on incompatible receiver",
                 ))
             }
             "resize" | "transfer" | "transferToFixedLength" | "transferToImmutable"
@@ -2714,13 +2710,13 @@ impl<'p> Vm<'p> {
                 self.require_buffer_unpinned(idx, "resize")?;
                 let max = match self.ab_max.get(&idx) {
                     Some(&m) => m,
-                    None => return Err(Thrown("TypeError: ArrayBuffer is not resizable".into())),
+                    None => return Err(Thrown::from_static("TypeError: ArrayBuffer is not resizable")),
                 };
                 let n =
                     self.to_integer_strict(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 if n < 0 {
-                    return Err(Thrown(
-                        "RangeError: ArrayBuffer resize length out of range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: ArrayBuffer resize length out of range",
                     ));
                 }
                 // The detached check runs AFTER the newLength coercion (whose
@@ -2729,13 +2725,13 @@ impl<'p> Vm<'p> {
                     self.heap.get(idx),
                     HeapObj::ArrayBuffer { detached: true, .. }
                 ) {
-                    return Err(Thrown(
-                        "TypeError: Cannot resize a detached ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot resize a detached ArrayBuffer",
                     ));
                 }
                 if n as usize > max {
-                    return Err(Thrown(
-                        "RangeError: ArrayBuffer resize length out of range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: ArrayBuffer resize length out of range",
                     ));
                 }
                 // The coercion above may have pinned it.
@@ -2753,16 +2749,16 @@ impl<'p> Vm<'p> {
                 let max = match self.ab_max.get(&idx) {
                     Some(&m) => m,
                     None => {
-                        return Err(Thrown(
-                            "TypeError: SharedArrayBuffer is not growable".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: SharedArrayBuffer is not growable",
                         ))
                     }
                 };
                 let n =
                     self.to_integer_strict(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 if n < 0 || n as usize > max {
-                    return Err(Thrown(
-                        "RangeError: SharedArrayBuffer grow length out of range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: SharedArrayBuffer grow length out of range",
                     ));
                 }
                 // The shared store re-checks the live length inside a SeqCst CAS
@@ -2770,8 +2766,8 @@ impl<'p> Vm<'p> {
                 // this request a RangeError instead of moving the length backwards.
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(idx) {
                     if !data.grow_bytes(n as usize) {
-                        return Err(Thrown(
-                            "RangeError: SharedArrayBuffer grow length out of range".into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: SharedArrayBuffer grow length out of range",
                         ));
                     }
                 }
@@ -2783,8 +2779,8 @@ impl<'p> Vm<'p> {
                     self.heap.get(idx),
                     HeapObj::ArrayBuffer { detached: true, .. }
                 ) {
-                    return Err(Thrown(
-                        "TypeError: Cannot slice a detached ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot slice a detached ArrayBuffer",
                     ));
                 }
                 let start =
@@ -2805,8 +2801,8 @@ impl<'p> Vm<'p> {
                 let species = if ctor == Value::UNDEFINED {
                     Value::UNDEFINED
                 } else if !self.is_object_value(ctor) {
-                    return Err(Thrown(
-                        "TypeError: ArrayBuffer constructor is not an object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: ArrayBuffer constructor is not an object",
                     ));
                 } else {
                     let sp = self.get_prop(ctor, "@@species")?;
@@ -2826,8 +2822,8 @@ impl<'p> Vm<'p> {
                     }
                 } else {
                     if !self.is_constructor(species) {
-                        return Err(Thrown(
-                            "TypeError: ArrayBuffer [Symbol.species] is not a constructor".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: ArrayBuffer [Symbol.species] is not a constructor",
                         ));
                     }
                     let result = self.construct(species, &[Value::num(new_len as f64)])?;
@@ -2835,38 +2831,36 @@ impl<'p> Vm<'p> {
                     // not detached, not the SAME buffer, and large enough.
                     let ridx = match result.is_heap().then(|| self.heap.get(result.heap_index())) {
                         Some(HeapObj::ArrayBuffer { .. }) => result.heap_index(),
-                        _ => return Err(Thrown(
-                            "TypeError: ArrayBuffer [Symbol.species] did not return an ArrayBuffer"
-                                .into(),
+                        _ => return Err(Thrown::from_static(
+                            "TypeError: ArrayBuffer [Symbol.species] did not return an ArrayBuffer",
                         )),
                     };
                     if self.shared_buffers.contains(&ridx) != is_shared {
-                        return Err(Thrown(
-                            "TypeError: ArrayBuffer.prototype.slice species returned the wrong buffer brand".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: ArrayBuffer.prototype.slice species returned the wrong buffer brand",
                         ));
                     }
                     if matches!(
                         self.heap.get(ridx),
                         HeapObj::ArrayBuffer { detached: true, .. }
                     ) {
-                        return Err(Thrown(
-                            "TypeError: ArrayBuffer.prototype.slice species returned a detached buffer".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: ArrayBuffer.prototype.slice species returned a detached buffer",
                         ));
                     }
                     if self.immutable_buffers.contains(&ridx) {
-                        return Err(Thrown(
-                            "TypeError: ArrayBuffer.prototype.slice species returned an immutable ArrayBuffer".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: ArrayBuffer.prototype.slice species returned an immutable ArrayBuffer",
                         ));
                     }
                     if ridx == idx {
-                        return Err(Thrown(
-                            "TypeError: ArrayBuffer.prototype.slice species returned the source buffer".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: ArrayBuffer.prototype.slice species returned the source buffer",
                         ));
                     }
                     if self.array_buffer_len(ridx) < new_len {
-                        return Err(Thrown(
-                            "TypeError: ArrayBuffer.prototype.slice species buffer is too small"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: ArrayBuffer.prototype.slice species buffer is too small",
                         ));
                     }
                     ridx
@@ -2876,8 +2870,8 @@ impl<'p> Vm<'p> {
                     self.heap.get(idx),
                     HeapObj::ArrayBuffer { detached: true, .. }
                 ) {
-                    return Err(Thrown(
-                        "TypeError: source ArrayBuffer detached during species construction".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: source ArrayBuffer detached during species construction",
                     ));
                 }
                 // A resizable source may now be shorter. Copy only the live prefix
@@ -2909,7 +2903,7 @@ impl<'p> Vm<'p> {
                     Some(&v) if v != Value::UNDEFINED => {
                         let n = self.to_index_strict(v)?;
                         if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
-                            return Err(Thrown("RangeError: invalid ArrayBuffer length".into()));
+                            return Err(Thrown::from_static("RangeError: invalid ArrayBuffer length"));
                         }
                         n
                     }
@@ -2919,13 +2913,13 @@ impl<'p> Vm<'p> {
                     self.heap.get(idx),
                     HeapObj::ArrayBuffer { detached: true, .. }
                 ) {
-                    return Err(Thrown(
-                        "TypeError: Cannot transfer a detached ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot transfer a detached ArrayBuffer",
                     ));
                 }
                 if self.immutable_buffers.contains(&idx) {
-                    return Err(Thrown(
-                        "TypeError: Cannot transfer an immutable ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot transfer an immutable ArrayBuffer",
                     ));
                 }
                 // The newLength coercion above may have pinned it.
@@ -2959,8 +2953,8 @@ impl<'p> Vm<'p> {
                     self.heap.get(idx),
                     HeapObj::ArrayBuffer { detached: true, .. }
                 ) {
-                    return Err(Thrown(
-                        "TypeError: Cannot sliceToImmutable a detached ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot sliceToImmutable a detached ArrayBuffer",
                     ));
                 }
                 let start = self.ta_rel_index_strict(
@@ -2978,16 +2972,15 @@ impl<'p> Vm<'p> {
                     self.heap.get(idx),
                     HeapObj::ArrayBuffer { detached: true, .. }
                 ) {
-                    return Err(Thrown(
-                        "TypeError: Cannot sliceToImmutable a detached ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot sliceToImmutable a detached ArrayBuffer",
                     ));
                 }
                 let slice: Vec<u8> = match self.heap.get(idx) {
                     HeapObj::ArrayBuffer { data, .. } => {
                         if data.len() < fin {
-                            return Err(Thrown(
-                                "RangeError: ArrayBuffer was resized below the resolved slice end"
-                                    .into(),
+                            return Err(Thrown::from_static(
+                                "RangeError: ArrayBuffer was resized below the resolved slice end",
                             ));
                         }
                         data[start..fin].to_vec()
@@ -3012,7 +3005,7 @@ impl<'p> Vm<'p> {
                     Some(&v) if v != Value::UNDEFINED => {
                         let n = self.to_index_strict(v)?;
                         if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
-                            return Err(Thrown("RangeError: invalid ArrayBuffer length".into()));
+                            return Err(Thrown::from_static("RangeError: invalid ArrayBuffer length"));
                         }
                         n
                     }
@@ -3022,13 +3015,13 @@ impl<'p> Vm<'p> {
                     self.heap.get(idx),
                     HeapObj::ArrayBuffer { detached: true, .. }
                 ) {
-                    return Err(Thrown(
-                        "TypeError: Cannot transfer a detached ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot transfer a detached ArrayBuffer",
                     ));
                 }
                 if self.immutable_buffers.contains(&idx) {
-                    return Err(Thrown(
-                        "TypeError: Cannot transfer an immutable ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot transfer an immutable ArrayBuffer",
                     ));
                 }
                 // The newLength coercion above may have pinned it.
@@ -3179,8 +3172,8 @@ impl<'p> Vm<'p> {
             "getOrInsertComputed" => {
                 let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_callable(cb) {
-                    return Err(Thrown(
-                        "TypeError: the callback argument must be a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: the callback argument must be a function",
                     ));
                 }
                 let key = normalize_zero(a0);
@@ -3245,8 +3238,8 @@ impl<'p> Vm<'p> {
             "forEach" => {
                 let cb = a0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown(
-                        "TypeError: Map.prototype.forEach callback is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Map.prototype.forEach callback is not a function",
                     ));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -3327,8 +3320,8 @@ impl<'p> Vm<'p> {
             "has" => Ok(Value::bool(self.coll_find(idx, a0).is_some())),
             "set" => {
                 if !self.can_be_held_weakly(a0) {
-                    return Err(Thrown(
-                        "TypeError: Invalid value used as weak map key".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Invalid value used as weak map key",
                     ));
                 }
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -3355,15 +3348,15 @@ impl<'p> Vm<'p> {
             // or the callback's result (getOrInsertComputed) and return it.
             "getOrInsert" | "getOrInsertComputed" => {
                 if !self.can_be_held_weakly(a0) {
-                    return Err(Thrown(
-                        "TypeError: Invalid value used as weak map key".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Invalid value used as weak map key",
                     ));
                 }
                 let computed = name == "getOrInsertComputed";
                 let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if computed && !self.is_callable(cb) {
-                    return Err(Thrown(
-                        "TypeError: the callback argument must be a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: the callback argument must be a function",
                     ));
                 }
                 if let Some(i) = self.coll_find(idx, a0) {
@@ -3431,7 +3424,7 @@ impl<'p> Vm<'p> {
             "has" => Ok(Value::bool(self.coll_find(idx, a0).is_some())),
             "add" => {
                 if !self.can_be_held_weakly(a0) {
-                    return Err(Thrown("TypeError: Invalid value used in weak set".into()));
+                    return Err(Thrown::from_static("TypeError: Invalid value used in weak set"));
                 }
                 if self.coll_find(idx, a0).is_none() {
                     let mut pushed = None;
@@ -3488,19 +3481,18 @@ impl<'p> Vm<'p> {
                 let token = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 // CanBeHeldWeakly: any object, or a non-registered Symbol.
                 if !self.can_be_held_weakly(a0) {
-                    return Err(Thrown(
-                        "TypeError: FinalizationRegistry.register: target cannot be held weakly"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: FinalizationRegistry.register: target cannot be held weakly",
                     ));
                 }
                 if self.same_value(a0, held) {
-                    return Err(Thrown(
-                        "TypeError: FinalizationRegistry.register: target and held value must not be the same".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: FinalizationRegistry.register: target and held value must not be the same",
                     ));
                 }
                 if token != Value::UNDEFINED && !self.can_be_held_weakly(token) {
-                    return Err(Thrown(
-                        "TypeError: FinalizationRegistry.register: unregister token cannot be held weakly".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: FinalizationRegistry.register: unregister token cannot be held weakly",
                     ));
                 }
                 // Only the holding is a strong old-to-young edge. Recording the
@@ -3517,9 +3509,8 @@ impl<'p> Vm<'p> {
             }
             "unregister" => {
                 if !self.can_be_held_weakly(a0) {
-                    return Err(Thrown(
-                        "TypeError: FinalizationRegistry.unregister: token cannot be held weakly"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: FinalizationRegistry.unregister: token cannot be held weakly",
                     ));
                 }
                 let mut removed = false;
@@ -3600,8 +3591,8 @@ impl<'p> Vm<'p> {
             "forEach" => {
                 let cb = a0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown(
-                        "TypeError: Set.prototype.forEach callback is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Set.prototype.forEach callback is not a function",
                     ));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -3666,21 +3657,20 @@ impl<'p> Vm<'p> {
                     }
                     _ => {
                         if !self.is_object_value(a0) {
-                            return Err(Thrown(
-                                "TypeError: Set.prototype set method called with a non-object"
-                                    .into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: Set.prototype set method called with a non-object",
                             ));
                         }
                         let raw_size = self.get_prop(a0, "size")?;
                         if self.is_bigint_prim(raw_size)
                         {
-                            return Err(Thrown(
-                                "TypeError: Set-like 'size' cannot be a BigInt".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: Set-like 'size' cannot be a BigInt",
                             ));
                         }
                         let num_size = self.to_number_strict(raw_size)?;
                         if num_size.is_nan() {
-                            return Err(Thrown("TypeError: Set-like 'size' is NaN".into()));
+                            return Err(Thrown::from_static("TypeError: Set-like 'size' is NaN"));
                         }
                         let int_size = if num_size.is_infinite() {
                             i64::MAX
@@ -3688,16 +3678,16 @@ impl<'p> Vm<'p> {
                             num_size.trunc() as i64
                         };
                         if int_size < 0 {
-                            return Err(Thrown("RangeError: Set-like 'size' is negative".into()));
+                            return Err(Thrown::from_static("RangeError: Set-like 'size' is negative"));
                         }
                         let has = self.get_prop(a0, "has")?;
                         if !self.is_callable(has) {
-                            return Err(Thrown("TypeError: Set-like 'has' is not callable".into()));
+                            return Err(Thrown::from_static("TypeError: Set-like 'has' is not callable"));
                         }
                         let keys = self.get_prop(a0, "keys")?;
                         if !self.is_callable(keys) {
-                            return Err(Thrown(
-                                "TypeError: Set-like 'keys' is not callable".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: Set-like 'keys' is not callable",
                             ));
                         }
                         (None, int_size, has, keys)
@@ -3938,8 +3928,8 @@ impl<'p> Vm<'p> {
                             // set-like-class-order).
                             let kiter = self.call_value(other_keys, a0, &[])?;
                             if !self.is_object_value(kiter) {
-                                return Err(Thrown(
-                                    "TypeError: Set-like keys() did not return an object".into(),
+                                return Err(Thrown::from_static(
+                                    "TypeError: Set-like keys() did not return an object",
                                 ));
                             }
                             let next = self.get_prop(kiter, "next")?;
@@ -3999,8 +3989,8 @@ impl<'p> Vm<'p> {
                             // Set-like: step keys() lazily, IteratorClose on early break.
                             let kiter = self.call_value(other_keys, a0, &[])?;
                             if !self.is_object_value(kiter) {
-                                return Err(Thrown(
-                                    "TypeError: Set-like keys() did not return an object".into(),
+                                return Err(Thrown::from_static(
+                                    "TypeError: Set-like keys() did not return an object",
                                 ));
                             }
                             let next = self.get_prop(kiter, "next")?;
@@ -4092,8 +4082,8 @@ impl<'p> Vm<'p> {
         // Proxy-wrapped set-like and is not in the algorithm.
         let next = self.get_prop(kiter, "next")?;
         if !self.is_callable(next) {
-            return Err(Thrown(
-                "TypeError: set-like keys() iterator has no next method".into(),
+            return Err(Thrown::from_static(
+                "TypeError: set-like keys() iterator has no next method",
             ));
         }
         Ok(Some((kiter, next)))
@@ -4103,7 +4093,7 @@ impl<'p> Vm<'p> {
     fn set_rec_step(&mut self, kiter: Value, next: Value) -> Result<Option<Value>, Thrown> {
         let res = self.call_value(next, kiter, &[])?;
         if !self.is_object_value(res) {
-            return Err(Thrown("TypeError: iterator result is not an object".into()));
+            return Err(Thrown::from_static("TypeError: iterator result is not an object"));
         }
         let done = self.get_prop(res, "done")?;
         if self.truthy(done) {
@@ -4141,7 +4131,7 @@ impl<'p> Vm<'p> {
             }
             out.try_reserve(1).map_err(|_| {
                 self.iterator_close_quiet(kiter);
-                Thrown("RangeError: set-like iterator allocation failed".into())
+                Thrown::from_static("RangeError: set-like iterator allocation failed")
             })?;
             out.push(v);
         }

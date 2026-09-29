@@ -88,8 +88,8 @@ impl<'p> Vm<'p> {
         } else if recv.is_heap() && recv.heap_index() == self.num_proto {
             0.0
         } else {
-            return Err(Thrown(
-                "TypeError: Number.prototype method called on a non-Number".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Number.prototype method called on a non-Number",
             ));
         };
         let nv = if recv.is_number() {
@@ -109,8 +109,8 @@ impl<'p> Vm<'p> {
             "toFixed" => {
                 let d = int_arg(self, 0)?;
                 if d < 0.0 || d > 100.0 {
-                    return Err(Thrown(
-                        "RangeError: toFixed() digits argument must be between 0 and 100".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: toFixed() digits argument must be between 0 and 100",
                     ));
                 }
                 Ok(Some(self.alloc_str(to_fixed(n, d as usize))))
@@ -124,8 +124,8 @@ impl<'p> Vm<'p> {
                 }
                 let r = int_arg(self, 0)? as i64;
                 if !(2..=36).contains(&r) {
-                    return Err(Thrown(
-                        "RangeError: toString() radix must be between 2 and 36".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: toString() radix must be between 2 and 36",
                     ));
                 }
                 if r == 10 {
@@ -164,8 +164,8 @@ impl<'p> Vm<'p> {
                         return Ok(Some(self.alloc_str(fmt_exponential(n, None))));
                     }
                     if d < 0.0 || d > 100.0 {
-                        return Err(Thrown(
-                            "RangeError: toExponential() argument must be between 0 and 100".into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: toExponential() argument must be between 0 and 100",
                         ));
                     }
                     Some(d as usize)
@@ -184,8 +184,8 @@ impl<'p> Vm<'p> {
                     return Ok(Some(self.alloc_str(self.display(nv))));
                 }
                 if p < 1.0 || p > 100.0 {
-                    return Err(Thrown(
-                        "RangeError: toPrecision() argument must be between 1 and 100".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: toPrecision() argument must be between 1 and 100",
                     ));
                 }
                 Ok(Some(self.alloc_str(fmt_precision(n, p as usize))))
@@ -404,8 +404,8 @@ impl<'p> Vm<'p> {
         // the OS stack overflowed and the process aborted. Charge it against the
         // same re-entry cap so it throws the interpreter's catchable RangeError.
         if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
-            return Err(Thrown(
-                "RangeError: Maximum call stack size exceeded".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Maximum call stack size exceeded",
             ));
         }
         let mut bail: u32 = crate::codegen::NO_BAIL;

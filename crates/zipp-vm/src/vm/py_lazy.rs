@@ -17,7 +17,7 @@ impl<'p> Vm<'p> {
     pub(super) fn py_compile_module(&mut self, name: Value) -> Result<Value, Thrown> {
         let program: &'p crate::bytecode::Program = self.program;
         let Some(lazy) = program.python_lazy.as_deref() else {
-            return Err(Thrown("ImportError: no library modules to compile".into()));
+            return Err(Thrown::from_static("ImportError: no library modules to compile"));
         };
         let name = self.to_js_string(name)?;
         let Some(k) = lazy.modules.iter().position(|m| m.name == name) else {

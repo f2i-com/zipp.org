@@ -516,8 +516,8 @@ pub(crate) fn interpret_iso_offset(
         return Ok(local_ns - offset_ns as i128);
     }
     if offset_option == "reject" {
-        return Err(Thrown(
-            "RangeError: the offset does not match the time zone".into(),
+        return Err(Thrown::from_static(
+            "RangeError: the offset does not match the time zone",
         ));
     }
     tz_local_to_instant(id, local_ns, disambiguation)
@@ -552,8 +552,8 @@ pub(crate) fn tz_local_to_instant(
     match cands.len() {
         1 => Ok(pick(&cands, false)),
         n if n >= 2 => match disambiguation {
-            "reject" => Err(Thrown(
-                "RangeError: this wall-clock time occurs twice in this time zone".into(),
+            "reject" => Err(Thrown::from_static(
+                "RangeError: this wall-clock time occurs twice in this time zone",
             )),
             "later" => Ok(pick(&cands, true)),
             // "compatible" and "earlier" both take the first instant.
@@ -565,8 +565,8 @@ pub(crate) fn tz_local_to_instant(
         // "earlier".
         _ => {
             if disambiguation == "reject" {
-                return Err(Thrown(
-                    "RangeError: this wall-clock time does not exist in this time zone".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: this wall-clock time does not exist in this time zone",
                 ));
             }
             let before = tzdb::offset_seconds(zone, sec as i64 - 86_400) as i64;
@@ -611,7 +611,7 @@ fn zoned_wall(tz: &str, ns: i128) -> [i64; 9] {
 /// an out-of-range instant surfaces, and each must be a RangeError.
 fn zoned_epoch(tz: &str, dt: [i64; 9]) -> Result<i128, Thrown> {
     let oor =
-        || Thrown("RangeError: Temporal result is outside the representable range".to_string());
+        || Thrown::from_static("RangeError: Temporal result is outside the representable range");
     if iso_to_epoch_days(dt[0], dt[1], dt[2]).abs() > 100_000_000 {
         return Err(oor());
     }
@@ -638,7 +638,7 @@ fn dur_time_only_ns(f: &[f64; 10]) -> i128 {
 /// "+1 day" across a spring-forward is 23 real hours; "+24 hours" is 24.
 pub(crate) fn add_zoned(cal: Cal, tz: &str, ns: i128, f: &[f64; 10]) -> Result<i128, Thrown> {
     let oor =
-        || Thrown("RangeError: Temporal result is outside the representable range".to_string());
+        || Thrown::from_static("RangeError: Temporal result is outside the representable range");
     let time_ns = dur_time_only_ns(f);
     let out = if f[..4].iter().all(|&x| x == 0.0) {
         ns + time_ns
@@ -1145,8 +1145,8 @@ fn check_relative_target(
         start_ok && end_ns.abs() <= NS_MAX_INSTANT + DAY_NS
     };
     if !ok {
-        return Err(Thrown(
-            "RangeError: Temporal result is outside the representable range".into(),
+        return Err(Thrown::from_static(
+            "RangeError: Temporal result is outside the representable range",
         ));
     }
     Ok(())
@@ -1285,8 +1285,8 @@ fn round_relative_datetime_diff(
     // date limits — a huge increment can push it past the range (RangeError).
     let upper = dt_add_dur(cal, dt1, mk(r2));
     if !iso_date_in_range(upper[0], upper[1], upper[2]) {
-        return Err(Thrown(
-            "RangeError: rounded date is outside the valid ISO range".into(),
+        return Err(Thrown::from_static(
+            "RangeError: rounded date is outside the valid ISO range",
         ));
     }
     let picked = if ld == ns2 {
@@ -1365,8 +1365,8 @@ fn duration_total_relative(
             for _ in 0..MAX_TEMPORAL_CALENDAR_ITERATIONS {
                 work = work.saturating_add(1);
                 if work > MAX_NATIVE_ITERATION_WORK {
-                    return Err(Thrown(
-                        "RangeError: native builtin iteration limit exceeded".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: native builtin iteration limit exceeded",
                     ));
                 }
                 if passes(whole) {
@@ -1379,8 +1379,8 @@ fn duration_total_relative(
                 }
             }
             if !bracketed {
-                return Err(Thrown(
-                    "RangeError: Temporal calendar iteration limit exceeded".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: Temporal calendar iteration limit exceeded",
                 ));
             }
             // NudgeToCalendarUnit brackets the duration between `whole` and `whole+sign`
@@ -1390,8 +1390,8 @@ fn duration_total_relative(
             // day-granular min/max date boundary itself is still accepted).
             let far = dt_add_dur(cal, start, units(whole + sign));
             if dt_epoch_ns(far).abs() > NS_MAX_INSTANT + DAY_NS {
-                return Err(Thrown(
-                    "RangeError: Temporal result is outside the representable range".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: Temporal result is outside the representable range",
                 ));
             }
             // The fraction is the signed progress over the anchor-based unit length.

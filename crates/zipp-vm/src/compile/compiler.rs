@@ -28,6 +28,9 @@ fn checked_global_slot_index(len: usize) -> Option<u32> {
 /// effect independently measurable.
 #[inline]
 fn arrow_lexical_unbox_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);

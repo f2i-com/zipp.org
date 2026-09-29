@@ -145,6 +145,9 @@ pub use asyncstats::dump_inline_awaits as async_inline_await_stats;
 /// ordering while avoiding register-window parking and heap-state churn.
 #[inline]
 fn async_settled_trampoline_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -184,6 +187,9 @@ fn async_settled_trampoline_enabled() -> bool {
 ///
 /// `ZIPP_NO_EAGER_COMB=1` restores that FIFO (the pricing comparator).
 fn eager_combinator_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -198,6 +204,9 @@ fn eager_combinator_enabled() -> bool {
 }
 
 fn promise_all_direct_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -217,6 +226,9 @@ fn promise_all_direct_enabled() -> bool {
 /// adoption, user code, reaction, or old-to-young edge can exist in that gap.
 #[inline]
 pub(super) fn promise_resolve_direct_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -280,6 +292,9 @@ pub(crate) struct PromisePristineSlots {
 /// `ZIPP_NO_PROMISE_PRISTINE` / `ZIPP_NO_ENUM_HOIST`.
 #[inline]
 fn promise_slot_cache_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -302,6 +317,9 @@ fn promise_slot_cache_enabled() -> bool {
 /// `ZIPP_NO_PROMISE_SLOT_CACHE`.
 #[inline]
 fn pristine_lean_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -410,8 +428,8 @@ impl<'p> Vm<'p> {
         // call, per spec — not at the first `.next()`. The generator is then parked
         // AT the marker; the first `.next()` resumes just past it to run the body.
         if self.regs_would_overflow(new_base + reg_count) {
-            return Err(Thrown(
-                "RangeError: Maximum call stack size exceeded".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Maximum call stack size exceeded",
             ));
         }
         self.regs.extend_from_slice(&regs);
@@ -513,7 +531,7 @@ impl<'p> Vm<'p> {
             "return" => match state {
                 // A completed generator just echoes {value, done:true}.
                 GenState::Completed => Ok(Some(self.iter_result(arg0, true))),
-                GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
+                GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
                 // Resume the suspended body with a RETURN completion so any `finally`
                 // spanning the yield runs (and a `finally { yield }` can re-suspend).
                 GenState::Suspended(ip) => {
@@ -528,7 +546,7 @@ impl<'p> Vm<'p> {
                     self.pending_throw = Some(arg0);
                     Err(Thrown(self.throw_message(arg0)))
                 }
-                GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
+                GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
                 // Resume the suspended body, injecting the throw at the yield point so
                 // an enclosing `try`/`catch` (whose handlers we parked) can catch it.
                 GenState::Suspended(ip) => {
@@ -537,7 +555,7 @@ impl<'p> Vm<'p> {
             },
             "next" => match state {
                 GenState::Completed => Ok(Some(self.iter_result(Value::UNDEFINED, true))),
-                GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
+                GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
                 GenState::Suspended(ip) => {
                     self.gen_resume(idx, fid, closure, ip, GenResumeMode::Next(arg0))
                 }
@@ -561,7 +579,7 @@ impl<'p> Vm<'p> {
         };
         match state {
             GenState::Completed => Ok(Some(GenStep::Done(Value::UNDEFINED))),
-            GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
+            GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
             GenState::Suspended(ip) => {
                 self.gen_resume_step(idx, fid, closure, ip, GenResumeMode::Next(Value::UNDEFINED))
             }
@@ -628,8 +646,8 @@ impl<'p> Vm<'p> {
                 *regs = saved;
                 *handlers = saved_handlers;
             }
-            return Err(Thrown(
-                "RangeError: Maximum call stack size exceeded".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Maximum call stack size exceeded",
             ));
         }
         self.regs.extend_from_slice(&saved);
@@ -1678,8 +1696,8 @@ impl<'p> Vm<'p> {
             return Ok(self.promise_ctor_value());
         }
         if !self.is_object_value(c) {
-            return Err(Thrown(
-                "TypeError: Promise.prototype.finally: constructor is not an object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Promise.prototype.finally: constructor is not an object",
             ));
         }
         let s = self.get_prop(c, "@@species")?;
@@ -1687,8 +1705,8 @@ impl<'p> Vm<'p> {
             return Ok(self.promise_ctor_value());
         }
         if !self.is_constructor(s) {
-            return Err(Thrown(
-                "TypeError: Promise.prototype.finally: @@species is not a constructor".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Promise.prototype.finally: @@species is not a constructor",
             ));
         }
         Ok(s)
@@ -1707,8 +1725,8 @@ impl<'p> Vm<'p> {
         on_finally: Value,
     ) -> Result<Value, Thrown> {
         if !self.is_object_value(this) {
-            return Err(Thrown(
-                "TypeError: Promise.prototype.finally called on a non-object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Promise.prototype.finally called on a non-object",
             ));
         }
         let ctor = self.promise_species_constructor(this)?;
@@ -1885,8 +1903,8 @@ impl<'p> Vm<'p> {
         // Run the parameter prologue up to `GenStart` (see `alloc_generator`).
         let new_base = self.regs.len();
         if self.regs_would_overflow(new_base + reg_count) {
-            return Err(Thrown(
-                "RangeError: Maximum call stack size exceeded".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Maximum call stack size exceeded",
             ));
         }
         self.regs.extend_from_slice(&regs);
@@ -2583,8 +2601,8 @@ impl<'p> Vm<'p> {
         c: Value,
     ) -> Result<(Value, Value, Value), Thrown> {
         if !self.is_constructor(c) {
-            return Err(Thrown(
-                "TypeError: NewPromiseCapability requires a constructor".into(),
+            return Err(Thrown::from_static(
+                "TypeError: NewPromiseCapability requires a constructor",
             ));
         }
         // Save/restore for a nested capability; clear so the executor's
@@ -2598,14 +2616,14 @@ impl<'p> Vm<'p> {
         let (resolve, reject) = match captured {
             Some(rr) => rr,
             None => {
-                return Err(Thrown(
-                    "TypeError: Promise resolve/reject were not set by the executor".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Promise resolve/reject were not set by the executor",
                 ))
             }
         };
         if !self.is_callable(resolve) || !self.is_callable(reject) {
-            return Err(Thrown(
-                "TypeError: Promise resolve or reject is not callable".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Promise resolve or reject is not callable",
             ));
         }
         Ok((promise, resolve, reject))

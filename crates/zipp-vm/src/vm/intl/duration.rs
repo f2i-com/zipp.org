@@ -139,7 +139,7 @@ impl<'p> Vm<'p> {
             let nf = self.make_intl(native::INTL_NUMBERFORMAT, locale, opts_v)?;
             let nf_resolved = match self.heap.get(nf.heap_index()) {
                 HeapObj::Intl { resolved, .. } => *resolved,
-                _ => return Err(Thrown("TypeError: NumberFormat construction failed".into())),
+                _ => return Err(Thrown::from_static("TypeError: NumberFormat construction failed")),
             };
             // The exact decimal goes through ToIntlMathematicalValue the same way
             // a caller's string would, so DurationFormat is never more (or less)

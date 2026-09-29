@@ -329,6 +329,9 @@ pub(crate) fn canonical_u32_key(k: &str) -> Option<u32> {
 /// binary.
 #[inline]
 pub(crate) fn arrkey_fast_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {

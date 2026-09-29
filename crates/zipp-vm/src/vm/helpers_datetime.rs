@@ -1336,20 +1336,20 @@ pub(crate) fn list_parts_en(
         .len()
         .checked_mul(2)
         .and_then(|n| n.checked_sub(usize::from(!items.is_empty())))
-        .ok_or_else(|| Thrown("RangeError: list result is too large".into()))?;
+        .ok_or_else(|| Thrown::from_static("RangeError: list result is too large"))?;
     let mut out: Vec<(&'static str, String)> = Vec::new();
     out.try_reserve_exact(part_count)
-        .map_err(|_| Thrown("RangeError: list allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: list allocation failed"))?;
     let mut total_bytes = 0usize;
     let mut copy_part = |text: &str| -> Result<String, Thrown> {
         total_bytes = total_bytes
             .checked_add(text.len())
             .filter(|&n| n <= MAX_STRING_BYTES)
-            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
         let mut owned = String::new();
         owned
             .try_reserve_exact(text.len())
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         owned.push_str(text);
         Ok(owned)
     };
@@ -1694,8 +1694,8 @@ pub(crate) fn balance_duration_ns(total_ns: i128, largest: &str) -> Result<[f64;
     // largest field can land exactly on the 2^53-seconds limit even when the
     // exact total was just below it.
     if !is_valid_duration(&f) {
-        return Err(Thrown(
-            "RangeError: Temporal.Duration value out of range".into(),
+        return Err(Thrown::from_static(
+            "RangeError: Temporal.Duration value out of range",
         ));
     }
     Ok(f)

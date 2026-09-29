@@ -21,8 +21,8 @@ impl<'p> Vm<'p> {
             None => return Ok(None),
         };
         if revoked {
-            return Err(Thrown(
-                "TypeError: Cannot perform 'getOwnPropertyDescriptor' on a revoked proxy".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot perform 'getOwnPropertyDescriptor' on a revoked proxy",
             ));
         }
         match self.proxy_trap(handler, "getOwnPropertyDescriptor")? {
@@ -43,8 +43,8 @@ impl<'p> Vm<'p> {
                 // BEFORE the target's [[GetOwnProperty]], which a Proxy target makes
                 // observable.
                 if !r.is_undefined() && !self.is_object_value(r) {
-                    return Err(Thrown(
-                        "TypeError: proxy 'getOwnPropertyDescriptor' trap must return an object or undefined".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: proxy 'getOwnPropertyDescriptor' trap must return an object or undefined",
                     ));
                 }
                 // Step 11: targetDesc = ? target.[[GetOwnProperty]](P). A Proxy
@@ -68,8 +68,8 @@ impl<'p> Vm<'p> {
                     // runs only once the configurable test has passed — on a Proxy
                     // target that is an observable trap.
                     if t_own && (!t_cfg || !self.is_extensible(target)?) {
-                        return Err(Thrown(
-                            "TypeError: proxy getOwnPropertyDescriptor cannot report an existing non-configurable or non-extensible-target property as undefined".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: proxy getOwnPropertyDescriptor cannot report an existing non-configurable or non-extensible-target property as undefined",
                         ));
                     }
                     return Ok(Some(Value::UNDEFINED));
@@ -82,8 +82,8 @@ impl<'p> Vm<'p> {
                 // cannot report a property the target lacks when the target is
                 // non-extensible (10.5.5 steps 20-21 with targetDesc undefined).
                 if !t_own && !t_ext {
-                    return Err(Thrown(
-                        "TypeError: proxy getOwnPropertyDescriptor reported a new property on a non-extensible target".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: proxy getOwnPropertyDescriptor reported a new property on a non-extensible target",
                     ));
                 }
                 let is_accessor = get.is_some() || set.is_some();
@@ -112,8 +112,8 @@ impl<'p> Vm<'p> {
                     )
                 };
                 if !self.is_compatible_property_descriptor(t_ext, completed, target_desc)? {
-                    return Err(Thrown(
-                        "TypeError: proxy getOwnPropertyDescriptor reported a descriptor incompatible with the target's".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: proxy getOwnPropertyDescriptor reported a descriptor incompatible with the target's",
                     ));
                 }
                 // Step 20: a non-configurable reported descriptor requires a matching
@@ -121,8 +121,8 @@ impl<'p> Vm<'p> {
                 // descriptor, a non-writable target).
                 if !cf.unwrap_or(false) {
                     if !t_own || t_cfg {
-                        return Err(Thrown(
-                            "TypeError: proxy getOwnPropertyDescriptor reported a non-configurable descriptor for a configurable or non-existent property".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: proxy getOwnPropertyDescriptor reported a non-configurable descriptor for a configurable or non-existent property",
                         ));
                     }
                     let t_wr = {
@@ -130,8 +130,8 @@ impl<'p> Vm<'p> {
                         self.truthy(v)
                     };
                     if !is_accessor && !wr.unwrap_or(false) && t_wr {
-                        return Err(Thrown(
-                            "TypeError: proxy getOwnPropertyDescriptor reported a non-writable descriptor for a writable property".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: proxy getOwnPropertyDescriptor reported a non-writable descriptor for a writable property",
                         ));
                     }
                 }
@@ -1184,9 +1184,8 @@ impl<'p> Vm<'p> {
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
                 if revoked {
-                    return Err(Thrown(
-                        "TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked",
                     ));
                 }
                 let trap = match self.proxy_trap(handler, "getPrototypeOf")? {
@@ -1198,9 +1197,8 @@ impl<'p> Vm<'p> {
                 };
                 let handler_proto = self.call_value(trap, handler, &[target])?;
                 if handler_proto != Value::NULL && !self.is_object_value(handler_proto) {
-                    return Err(Thrown(
-                        "TypeError: proxy 'getPrototypeOf' trap must return an object or null"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: proxy 'getPrototypeOf' trap must return an object or null",
                     ));
                 }
                 // Non-extensible target: the trap result must equal the target's
@@ -1224,9 +1222,8 @@ impl<'p> Vm<'p> {
                     let target_proto =
                         self.with_native_recursion_guard(|vm| vm.get_prototype_of_checked(target))?;
                     if !self.same_value(handler_proto, target_proto) {
-                        return Err(Thrown(
-                            "TypeError: proxy 'getPrototypeOf' must return the target's prototype when the target is not extensible"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: proxy 'getPrototypeOf' must return the target's prototype when the target is not extensible",
                         ));
                     }
                 }
@@ -1368,8 +1365,8 @@ impl<'p> Vm<'p> {
         // any other object) carrying value/get/set/... own props is a valid
         // descriptor, so accept any object, not just a plain HeapObj::Object.
         if !self.is_object_value(desc) {
-            return Err(Thrown(
-                "TypeError: Property description must be an object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Property description must be an object",
             ));
         }
         // Presence uses [[HasProperty]] (walks the prototype chain), so a
@@ -1418,7 +1415,7 @@ impl<'p> Vm<'p> {
         let get = if self.has_property_str_dyn(desc, "get")? {
             let g = self.get_prop(desc, "get")?;
             if g != Value::UNDEFINED && !self.is_callable(g) {
-                return Err(Thrown("TypeError: Getter must be a function".into()));
+                return Err(Thrown::from_static("TypeError: Getter must be a function"));
             }
             self.push_host_root(g);
             Some(g)
@@ -1428,7 +1425,7 @@ impl<'p> Vm<'p> {
         let set = if self.has_property_str_dyn(desc, "set")? {
             let s = self.get_prop(desc, "set")?;
             if s != Value::UNDEFINED && !self.is_callable(s) {
-                return Err(Thrown("TypeError: Setter must be a function".into()));
+                return Err(Thrown::from_static("TypeError: Setter must be a function"));
             }
             Some(s)
         } else {
@@ -1436,9 +1433,8 @@ impl<'p> Vm<'p> {
         };
         // Step 15: an accessor descriptor may not also carry data fields.
         if (get.is_some() || set.is_some()) && (value.is_some() || writable.is_some()) {
-            return Err(Thrown(
-                "TypeError: Invalid property descriptor. Cannot both specify accessors and a value or writable attribute"
-                    .into(),
+            return Err(Thrown::from_static(
+                "TypeError: Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
             ));
         }
         Ok((value, get, set, writable, enumerable, configurable))

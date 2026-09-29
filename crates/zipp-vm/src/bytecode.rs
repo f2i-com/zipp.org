@@ -2696,6 +2696,9 @@ pub(crate) const STATIC_KEY_PLAN_MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 /// metadata; runtime checking remains for precompiled Programs.
 #[inline]
 pub(crate) fn static_key_plans_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -2714,6 +2717,9 @@ pub(crate) fn static_key_plans_enabled() -> bool {
 /// [[HomeObject]] wired as before, super-free or not. Compile-time only.
 #[inline]
 pub(crate) fn home_elide_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -2733,6 +2739,9 @@ pub(crate) fn home_elide_enabled() -> bool {
 /// handling of already-compiled `FinalizeObject` bytecode is unchanged.
 #[inline]
 pub(crate) fn object_finalize_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {

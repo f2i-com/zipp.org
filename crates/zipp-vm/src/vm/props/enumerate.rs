@@ -11,6 +11,9 @@ use super::*;
 /// and bisectable on one binary.
 #[inline]
 fn enum_hoist_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {

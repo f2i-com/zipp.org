@@ -33,6 +33,17 @@ compile_error!("zipp-vm features `safe-sandbox` and `jit` are mutually exclusive
 #[cfg(all(feature = "wasm-lite", feature = "python"))]
 compile_error!("ZIPP Lite omits Python; build the python variant separately");
 
+/// Rust's bare WASM target has no process environment. Lite resolves native
+/// benchmark switches to their existing absent-variable defaults, removing
+/// cached checks and unreachable alternatives. Keep the full build's code
+/// layout: specializing its switches did not consistently preserve throughput.
+/// Native and WASI targets retain the original environment-controlled paths.
+pub(crate) const WASM_STATIC_SWITCHES: bool = cfg!(all(
+    target_arch = "wasm32",
+    target_os = "unknown",
+    feature = "wasm-lite"
+));
+
 mod bytecode;
 #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
 mod bytecode_codec;

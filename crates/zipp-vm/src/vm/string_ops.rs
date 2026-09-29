@@ -14,6 +14,9 @@ use crate::value::Value;
 /// A/B (`tools/bench.py --ab-env`). Same idiom as `ZIPP_NO_PROMISE_SLOT_CACHE`.
 #[inline]
 fn matchall_pristine_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -452,7 +455,7 @@ impl<'p> Vm<'p> {
         #[cfg(not(feature = "instrument"))]
         let _ = total;
         out.try_reserve(len)
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         if let HeapObj::Str(js) = self.heap.get(idx) {
             crate::heap::wtf8_push(out, js.as_bytes());
         }
@@ -477,14 +480,14 @@ impl<'p> Vm<'p> {
             .len()
             .checked_add(text.len())
             .filter(|&n| n <= MAX_STRING_BYTES)
-            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
         #[cfg(feature = "instrument")]
         self.instrument_preflight_heap_growth(total)
             .map_err(|message| Thrown(message.into()))?;
         #[cfg(not(feature = "instrument"))]
         let _ = total;
         out.try_reserve(text.len())
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         out.push_str(text);
         Ok(())
     }
@@ -494,7 +497,7 @@ impl<'p> Vm<'p> {
     /// size, preventing a large unmetered temporary between interpreter polls.
     pub(crate) fn preflight_guest_string_size(&mut self, total: usize) -> Result<(), Thrown> {
         if total > MAX_STRING_BYTES {
-            return Err(Thrown("RangeError: Invalid string length".into()));
+            return Err(Thrown::from_static("RangeError: Invalid string length"));
         }
         #[cfg(feature = "instrument")]
         self.instrument_preflight_heap_growth(total)
@@ -508,7 +511,7 @@ impl<'p> Vm<'p> {
         self.preflight_guest_string_size(total)?;
         let mut out = String::new();
         out.try_reserve_exact(total)
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         Ok(out)
     }
 
@@ -752,13 +755,13 @@ impl<'p> Vm<'p> {
                 let nf = self.to_number_strict(arg0)?;
                 let n_int = if nf.is_nan() { 0.0 } else { nf.trunc() };
                 if n_int < 0.0 || n_int == f64::INFINITY {
-                    return Err(Thrown("RangeError: Invalid count value".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid count value"));
                 }
                 // Bound the result (an unbounded build would hang / OOM): a too-long
                 // string is a RangeError per spec. (n_int is now finite and ≥ 0.)
                 let result_bytes = n_int * (s.len() as f64);
                 if result_bytes > MAX_STRING_BYTES as f64 {
-                    return Err(Thrown("RangeError: Invalid string length".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid string length"));
                 }
                 #[cfg(feature = "instrument")]
                 self.instrument_preflight_heap_growth(result_bytes as usize)
@@ -848,8 +851,8 @@ impl<'p> Vm<'p> {
                         let flags_v = self.get_prop(regexp, "flags")?;
                         let flags = self.to_js_string(flags_v)?;
                         if !flags.contains('g') {
-                            return Err(Thrown(
-                                "TypeError: String.prototype.matchAll called with a non-global RegExp argument".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: String.prototype.matchAll called with a non-global RegExp argument",
                             ));
                         }
                     }
@@ -936,8 +939,8 @@ impl<'p> Vm<'p> {
                     // must throw (staging/sm/String/split-GetMethod.js).
                     // undefined/null alone mean "no splitter".
                     if !m.is_nullish() {
-                        return Err(Thrown(
-                            "TypeError: Symbol.split method is not a function".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Symbol.split method is not a function",
                         ));
                     }
                 }
@@ -984,7 +987,7 @@ impl<'p> Vm<'p> {
                 let mut parts: Vec<Value> = Vec::new();
                 parts
                     .try_reserve_exact(count)
-                    .map_err(|_| Thrown("RangeError: Invalid array length".into()))?;
+                    .map_err(|_| Thrown::from_static("RangeError: Invalid array length"))?;
                 // W9 static pretenure (NURSERY_DESIGN.md §4): split's parts and
                 // result array are the markdown/regex rows' retained "builder"
                 // output — measured to survive minors wholesale, so they
@@ -1172,9 +1175,8 @@ impl<'p> Vm<'p> {
                     self.to_js_string(arg0)?
                 };
                 if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
-                    return Err(Thrown(
-                        "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD."
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.",
                     ));
                 }
                 if !js_recv.is_wellformed() {
@@ -1199,7 +1201,7 @@ impl<'p> Vm<'p> {
                     self.preflight_guest_string_size(out_len)?;
                     let mut out: Vec<u8> = Vec::new();
                     out.try_reserve_exact(out_len)
-                        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+                        .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
                     for run in wtf8_runs(bytes) {
                         match run {
                             Ok(r) => for_each_normalized(&form, r, &mut |c| {
@@ -1248,7 +1250,7 @@ impl<'p> Vm<'p> {
                 let t = self.to_integer_strict(arg0)?;
                 let target = if t > 0 { t as usize } else { 0 };
                 if target > MAX_STRING_UNITS {
-                    return Err(Thrown("RangeError: Invalid string length".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid string length"));
                 }
                 if cur >= target {
                     return Ok(Some(Value::heap(idx)));
@@ -1284,7 +1286,7 @@ impl<'p> Vm<'p> {
                 self.preflight_guest_string_size(total)?;
                 let mut out: Vec<u8> = Vec::new();
                 out.try_reserve_exact(total)
-                    .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+                    .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
                 // Joined as WTF-8: a seam may canonicalize (a filler ending in a
                 // high surrogate against a receiver starting with a low one).
                 if name == "padEnd" {
@@ -1602,7 +1604,7 @@ impl<'p> Vm<'p> {
             .map_err(|message| Thrown(message.into()))?;
         let mut out = String::new();
         out.try_reserve_exact(bytes)
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         Ok(out)
     }
 
@@ -1621,7 +1623,7 @@ impl<'p> Vm<'p> {
         sep: &crate::heap::JsStr,
         lim: usize,
     ) -> Result<(Vec<(usize, usize)>, bool), Thrown> {
-        let alloc_error = || Thrown("RangeError: Invalid array length".into());
+        let alloc_error = || Thrown::from_static("RangeError: Invalid array length");
         if sep.is_wellformed()
             && (recv.is_wellformed() || !bytes_contain_replacement_char(sep.as_bytes()))
         {
@@ -1704,7 +1706,7 @@ impl<'p> Vm<'p> {
     fn split_admit(&mut self, parts: usize, bytes: usize) -> Result<(), Thrown> {
         #[cfg(feature = "safe-sandbox")]
         if parts > MAX_DENSE_ARRAY_LEN {
-            return Err(Thrown("RangeError: Invalid array length".into()));
+            return Err(Thrown::from_static("RangeError: Invalid array length"));
         }
         self.preflight_native_iteration_work(parts as u64)?;
         #[cfg(feature = "instrument")]
@@ -1744,7 +1746,7 @@ impl<'p> Vm<'p> {
         self.preflight_guest_string_size(capacity)?;
         let mut out: Vec<u8> = Vec::new();
         out.try_reserve_exact(capacity)
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         for &v in args {
             let u = crate::vm::helpers_num2::to_uint32(self.to_number_strict(v)?) as u16;
             crate::heap::wtf8_push_cp(&mut out, u as u32);
@@ -1779,15 +1781,14 @@ impl<'p> Vm<'p> {
         {
             let flags = self.get_prop(search_v, "flags")?;
             if flags == Value::UNDEFINED || flags == Value::NULL {
-                return Err(Thrown(
-                    "TypeError: String.prototype.replaceAll called with a RegExp whose flags is not coercible"
-                        .into(),
+                return Err(Thrown::from_static(
+                    "TypeError: String.prototype.replaceAll called with a RegExp whose flags is not coercible",
                 ));
             }
             let fs = self.to_js_string(flags)?;
             if !fs.contains('g') {
-                return Err(Thrown(
-                    "TypeError: replaceAll must be called with a global RegExp".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: replaceAll must be called with a global RegExp",
                 ));
             }
         }
@@ -1801,8 +1802,8 @@ impl<'p> Vm<'p> {
             let m = self.get_prop(search_v, "@@replace")?;
             if m != Value::UNDEFINED && m != Value::NULL {
                 if !self.is_callable(m) {
-                    return Err(Thrown(
-                        "TypeError: searchValue[Symbol.replace] is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: searchValue[Symbol.replace] is not a function",
                     ));
                 }
                 let sval = Value::heap(s_idx);
@@ -2063,7 +2064,7 @@ impl<'p> Vm<'p> {
         #[cfg(not(feature = "instrument"))]
         let _ = total;
         out.try_reserve(seg.len())
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         crate::heap::wtf8_push(out, seg);
         Ok(())
     }
@@ -2100,7 +2101,7 @@ impl<'p> Vm<'p> {
 }
 
 fn invalid_string_length() -> Thrown {
-    Thrown("RangeError: Invalid string length".into())
+    Thrown::from_static("RangeError: Invalid string length")
 }
 
 /// A `split` receiver at most this long never takes the counting pass: its
@@ -2228,7 +2229,7 @@ fn case_map_exact(
 ) -> Result<crate::heap::JsStr, Thrown> {
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(mapped_len)
-        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
     if bytes.is_ascii() && bytes.len() == mapped_len {
         out.extend(bytes.iter().map(|b| {
             if upper {
@@ -2355,7 +2356,7 @@ fn special_case_exact(
 ) -> Result<crate::heap::JsStr, Thrown> {
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(mapped_len)
-        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
     for run in wtf8_runs(bytes) {
         match run {
             Ok(s) => {

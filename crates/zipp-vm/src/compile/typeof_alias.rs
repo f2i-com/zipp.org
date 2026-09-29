@@ -51,6 +51,9 @@ use crate::parse::ast;
 /// `ZIPP_NO_TYPEOF_ALIAS=1` disables the lane (compiler-side; read once).
 #[inline]
 pub(crate) fn typeof_alias_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {

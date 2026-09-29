@@ -12,6 +12,9 @@ use crate::value::Value;
 /// so the bulk-run path is A/B-able and bisectable on one binary.
 #[inline]
 fn json_quote_bulk_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -162,14 +165,14 @@ pub(crate) fn json_expect(b: &[u8], i: &mut usize, word: &str) -> Result<(), Thr
         *i += word.len();
         Ok(())
     } else {
-        Err(Thrown("SyntaxError: Unexpected token in JSON".into()))
+        Err(Thrown::from_static("SyntaxError: Unexpected token in JSON"))
     }
 }
 
 /// Read exactly 4 hex digits at `pos` as a code unit.
 pub(crate) fn json_hex4(b: &[u8], pos: usize) -> Result<u32, Thrown> {
     if pos + 4 > b.len() {
-        return Err(Thrown("SyntaxError: Bad unicode escape in JSON".into()));
+        return Err(Thrown::from_static("SyntaxError: Bad unicode escape in JSON"));
     }
     let mut v = 0u32;
     for k in 0..4 {
@@ -177,7 +180,7 @@ pub(crate) fn json_hex4(b: &[u8], pos: usize) -> Result<u32, Thrown> {
             c @ b'0'..=b'9' => (c - b'0') as u32,
             c @ b'a'..=b'f' => (c - b'a' + 10) as u32,
             c @ b'A'..=b'F' => (c - b'A' + 10) as u32,
-            _ => return Err(Thrown("SyntaxError: Bad unicode escape in JSON".into())),
+            _ => return Err(Thrown::from_static("SyntaxError: Bad unicode escape in JSON")),
         };
         v = v * 16 + d;
     }
@@ -187,6 +190,9 @@ pub(crate) fn json_hex4(b: &[u8], pos: usize) -> Result<u32, Thrown> {
 /// B233 latch: `ZIPP_NO_JSON_PLAIN_KEY=1` reads every member name through the
 /// general string parser again.
 pub(crate) fn json_plain_key_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -209,6 +215,9 @@ pub(crate) fn json_plain_key_enabled() -> bool {
 /// the parse side, and every string value on the stringify side — all bytes
 /// the scanner in front of the call had already looked at one by one.
 pub(crate) fn json_ascii_unchecked_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -243,6 +252,9 @@ pub(crate) fn ascii_bytes_as_str(bytes: &[u8]) -> Option<&str> {
 /// `ZIPP_NO_JSON_INT_FAST=1` sends every number token through
 /// `str::parse::<f64>` again (see `json_int_token_fast`).
 pub(crate) fn json_int_fast_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -340,7 +352,7 @@ pub(crate) fn json_parse_string(src: &[u8], i: &mut usize) -> Result<crate::heap
     let mut run = *i;
     loop {
         match b.get(*i).copied() {
-            None => return Err(Thrown("SyntaxError: Unterminated string in JSON".into())),
+            None => return Err(Thrown::from_static("SyntaxError: Unterminated string in JSON")),
             Some(b'"') => {
                 out.extend_from_slice(&b[run..*i]);
                 *i += 1;
@@ -363,7 +375,7 @@ pub(crate) fn json_parse_string(src: &[u8], i: &mut usize) -> Result<crate::heap
                         *i += 4; // past the 4 hex (now at the last one)
                         crate::heap::wtf8_push_cp(&mut out, cu);
                     }
-                    _ => return Err(Thrown("SyntaxError: Invalid escape in JSON string".into())),
+                    _ => return Err(Thrown::from_static("SyntaxError: Invalid escape in JSON string")),
                 }
                 *i += 1;
                 run = *i;
@@ -371,8 +383,8 @@ pub(crate) fn json_parse_string(src: &[u8], i: &mut usize) -> Result<crate::heap
             // A raw control character (< 0x20) is invalid in a JSON string — it
             // must be escaped (`\n`, `	`, …). (Matches the spec / node.)
             Some(c) if c < 0x20 => {
-                return Err(Thrown(
-                    "SyntaxError: Bad control character in string literal in JSON".into(),
+                return Err(Thrown::from_static(
+                    "SyntaxError: Bad control character in string literal in JSON",
                 ));
             }
             Some(_) => *i += 1, // plain byte (ASCII or UTF-8 continuation) — sliced later
@@ -383,7 +395,7 @@ pub(crate) fn json_parse_string(src: &[u8], i: &mut usize) -> Result<crate::heap
 /// Parse a JSON number token at `*i`.
 pub(crate) fn json_parse_number(b: &[u8], i: &mut usize) -> Result<Value, Thrown> {
     let start = *i;
-    let err = || Thrown("SyntaxError: Invalid number in JSON".into());
+    let err = || Thrown::from_static("SyntaxError: Invalid number in JSON");
     // ECMA-404 number grammar (stricter than Rust's f64 parser):
     //   number = [ '-' ] int [ frac ] [ exp ]
     //   int    = '0' | [1-9] digit*        (no leading zeros)

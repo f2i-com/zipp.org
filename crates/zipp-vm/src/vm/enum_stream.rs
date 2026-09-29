@@ -82,6 +82,9 @@ struct ArrayCopyLenPlan {
 
 #[inline]
 fn enum_loop_reduce_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -97,6 +100,9 @@ fn enum_loop_reduce_enabled() -> bool {
 
 #[inline]
 fn enum_count_reduce_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -112,6 +118,9 @@ fn enum_count_reduce_enabled() -> bool {
 
 #[inline]
 fn sparse_forin_fold_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -127,6 +136,9 @@ fn sparse_forin_fold_enabled() -> bool {
 
 #[inline]
 fn in_probe_reduce_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -142,6 +154,9 @@ fn in_probe_reduce_enabled() -> bool {
 
 #[inline]
 fn array_copy_len_reduce_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {

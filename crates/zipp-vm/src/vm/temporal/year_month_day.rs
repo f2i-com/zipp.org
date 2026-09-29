@@ -21,7 +21,7 @@ impl<'p> Vm<'p> {
             || ref_day < 1
             || ref_day > days_in_month(y, m)
         {
-            return Err(Thrown("RangeError: invalid year-month value".into()));
+            return Err(Thrown::from_static("RangeError: invalid year-month value"));
         }
         let idx = self.heap.alloc(HeapObj::Temporal {
             kind: 5,
@@ -46,7 +46,7 @@ impl<'p> Vm<'p> {
         reject: bool,
     ) -> Result<Value, Thrown> {
         let (iy, im, id) = cal_date_to_iso(cal, cy, cm, 1, reject)
-            .ok_or_else(|| Thrown("RangeError: invalid year-month value".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: invalid year-month value"))?;
         let r = self.make_plain_year_month(iy, im, id)?;
         Ok(self.tag_cal(r, cal))
     }
@@ -113,7 +113,7 @@ impl<'p> Vm<'p> {
                 }
                 let (cy, cm, _) = cal_from_iso(cal, y, m, d);
                 let iso = cal_date_to_iso(cal, cy, cm, 1, false)
-                    .ok_or_else(|| Thrown("RangeError: invalid year-month value".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid year-month value"))?;
                 return Ok((iso, cal));
             }
             if self.is_object_value(v) {
@@ -127,13 +127,13 @@ impl<'p> Vm<'p> {
                 if (yv == Value::UNDEFINED && era.is_none() && era_year.is_none())
                     || m_raw.is_none()
                 {
-                    return Err(Thrown(
-                        "TypeError: PlainYearMonth-like requires year and month".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: PlainYearMonth-like requires year and month",
                     ));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown(
-                        "TypeError: era and eraYear must be given together".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: era and eraYear must be given together",
                     ));
                 }
                 // ToIntegerWithTruncation: reject a non-finite (NaN/±Infinity) year
@@ -160,28 +160,28 @@ impl<'p> Vm<'p> {
                     )));
                 }
                 if !cal_month_fields_agree(cal, y, m_val, m_conflict) {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                    return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
                 }
                 // month < 1 always rejects; the upper bound is constrained/rejected
                 // by CalendarDateToISO below.
                 if m_val.floor() < 1 {
-                    return Err(Thrown("RangeError: month out of range".into()));
+                    return Err(Thrown::from_static("RangeError: month out of range"));
                 }
                 let m_ord = m_val
                     .ordinal(cal, y, reject)
-                    .ok_or_else(|| Thrown("RangeError: month out of range".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: month out of range"))?;
                 let (iy, im, id) = cal_date_to_iso(cal, y, m_ord, 1, reject)
-                    .ok_or_else(|| Thrown("RangeError: month out of range".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: month out of range"))?;
                 if !iso_year_month_in_range(iy, im) {
-                    return Err(Thrown(
-                        "RangeError: year-month is outside the representable range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: year-month is outside the representable range",
                     ));
                 }
                 return Ok(((iy, im, id), cal));
             }
         }
-        Err(Thrown(
-            "TypeError: cannot convert value to a Temporal.PlainYearMonth".into(),
+        Err(Thrown::from_static(
+            "TypeError: cannot convert value to a Temporal.PlainYearMonth",
         ))
     }
 
@@ -213,7 +213,7 @@ impl<'p> Vm<'p> {
             // a TypeError. Malformed syntax is a (field-prep) RangeError below.
             let prim = self.to_primitive_string(mc)?;
             if !(prim.is_heap() && self.heap.is_str_like(prim.heap_index())) {
-                return Err(Thrown("TypeError: monthCode must be a string".into()));
+                return Err(Thrown::from_static("TypeError: monthCode must be a string"));
             }
             let s = self.heap.str_cow(prim.heap_index()).unwrap().into_owned();
             let (code_month, is_leap) = parse_month_code_syntax(&s)
@@ -247,7 +247,7 @@ impl<'p> Vm<'p> {
             // Like monthCode: ToPrimitive(string) then RequireString.
             let prim = self.to_primitive_string(ev)?;
             if !(prim.is_heap() && self.heap.is_str_like(prim.heap_index())) {
-                return Err(Thrown("TypeError: era must be a string".into()));
+                return Err(Thrown::from_static("TypeError: era must be a string"));
             }
             Some(self.heap.str_cow(prim.heap_index()).unwrap().into_owned())
         };
@@ -275,13 +275,13 @@ impl<'p> Vm<'p> {
             // pair is otherwise the authority — out-of-bounds era years are
             // remapped rather than rejected).
             if year.is_some_and(|y| y != resolved) {
-                return Err(Thrown(
-                    "RangeError: year does not agree with era and eraYear".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: year does not agree with era and eraYear",
                 ));
             }
             return Ok(resolved);
         }
-        year.ok_or_else(|| Thrown("TypeError: a year (or era and eraYear) is required".into()))
+        year.ok_or_else(|| Thrown::from_static("TypeError: a year (or era and eraYear) is required"))
     }
 
     /// The calendar named by the FIRST `[u-ca=…]` annotation of a Temporal ISO
@@ -327,7 +327,7 @@ impl<'p> Vm<'p> {
                 return if matches!(kind, 1 | 3 | 5 | 6 | 7) {
                     Ok(self.cal_of(cv.heap_index()))
                 } else {
-                    Err(Thrown("TypeError: value is not a valid calendar".into()))
+                    Err(Thrown::from_static("TypeError: value is not a valid calendar"))
                 };
             }
             if self.heap.is_str_like(cv.heap_index()) {
@@ -340,11 +340,11 @@ impl<'p> Vm<'p> {
                 };
             }
             // A non-string, non-Temporal object (incl. Symbol/BigInt) is invalid.
-            return Err(Thrown("TypeError: value is not a valid calendar".into()));
+            return Err(Thrown::from_static("TypeError: value is not a valid calendar"));
         }
         // A non-string primitive (null/boolean/number) is a TypeError, not a
         // bad calendar string.
-        Err(Thrown("TypeError: value is not a valid calendar".into()))
+        Err(Thrown::from_static("TypeError: value is not a valid calendar"))
     }
 
     /// A Temporal *constructor*'s calendar argument must be a bare calendar
@@ -472,8 +472,8 @@ impl<'p> Vm<'p> {
                 };
                 Ok(Some(self.alloc_str(s)))
             }
-            "valueOf" => Err(Thrown(
-                "TypeError: Called Temporal.PlainYearMonth.prototype.valueOf".into(),
+            "valueOf" => Err(Thrown::from_static(
+                "TypeError: Called Temporal.PlainYearMonth.prototype.valueOf",
             )),
             "equals" => {
                 // PlainYearMonth equality includes the reference ISO day and the
@@ -491,13 +491,13 @@ impl<'p> Vm<'p> {
                 let mf = self.read_month_field_raw(a0, cal)?;
                 let yf = self.opt_int_field(a0, "year")?;
                 if yf.is_none() && mf.is_none() && era.is_none() && era_year.is_none() {
-                    return Err(Thrown(
-                        "TypeError: with() requires at least one recognized property".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: with() requires at least one recognized property",
                     ));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown(
-                        "TypeError: era and eraYear must be given together".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: era and eraYear must be given together",
                     ));
                 }
                 // NonIsoFieldKeysToIgnore: era+eraYear and year are mutually exclusive.
@@ -515,7 +515,7 @@ impl<'p> Vm<'p> {
                 // month uses ToPositiveIntegerWithTruncation: a value below 1 is rejected
                 // during field preparation, BEFORE the options bag is read.
                 if nm.floor() < 1 {
-                    return Err(Thrown("RangeError: invalid date fields".into()));
+                    return Err(Thrown::from_static("RangeError: invalid date fields"));
                 }
                 let reject =
                     self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
@@ -528,11 +528,11 @@ impl<'p> Vm<'p> {
                     )));
                 }
                 if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                    return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
                 }
                 let nm = nm
                     .ordinal(cal, ny, reject)
-                    .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid date fields"))?;
                 Ok(Some(self.make_plain_year_month_cal(cal, ny, nm, reject)?))
             }
             "add" | "subtract" => {
@@ -549,16 +549,16 @@ impl<'p> Vm<'p> {
                 // sign, overflow option, or whether the result would land in range.
                 // (This subsumes the old end-of-month overflow check for the maximum.)
                 if dur[2..].iter().any(|&x| x != 0) {
-                    return Err(Thrown(
-                        "RangeError: PlainYearMonth.prototype.add/subtract does not accept units smaller than months".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: PlainYearMonth.prototype.add/subtract does not accept units smaller than months",
                     ));
                 }
                 // The intermediate ISO date (Day = 1) must still be within the
                 // day-granular ISO limits, so every op on the minimum -271821-04
                 // (whose Day 1 = -271821-04-01 < the min ISO date -271821-04-19) throws.
                 if !iso_date_in_range(y, m, 1) {
-                    return Err(Thrown(
-                        "RangeError: PlainYearMonth is outside the valid ISO date range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: PlainYearMonth is outside the valid ISO date range",
                     ));
                 }
                 // Reference day per spec: start of month for non-negative ops, end of
@@ -569,7 +569,7 @@ impl<'p> Vm<'p> {
                     1
                 };
                 let anchor = cal_date_to_iso(cal, cy, cm, ref_day, false)
-                    .ok_or_else(|| Thrown("RangeError: invalid year-month value".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid year-month value"))?;
                 // A PlainYearMonth has no day, so `overflow: reject` can only bite on
                 // the MONTH — a leap month the destination year does not have (hebrew
                 // Adar I + 1 year, add/leap-months-hebrew.js). Probed with day 1 so the
@@ -578,8 +578,8 @@ impl<'p> Vm<'p> {
                     && cal_add_year_month(cal, cy, cm, 1, dur[0] * sign, dur[1] * sign, true)
                         .is_none()
                 {
-                    return Err(Thrown(
-                        "RangeError: the month does not exist in the resulting year".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: the month does not exist in the resulting year",
                     ));
                 }
                 let (ay, am, ad) = self.date_add(cal, anchor.0, anchor.1, anchor.2, &dur, sign);
@@ -589,15 +589,14 @@ impl<'p> Vm<'p> {
             "until" | "since" => {
                 let (o, ocal) = self.to_plain_year_month_overflow(a0, None)?;
                 if ocal != cal {
-                    return Err(Thrown(
-                        "RangeError: cannot compute a difference between year-months in different calendars"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: cannot compute a difference between year-months in different calendars",
                     ));
                 }
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-                    return Err(Thrown(
-                        "TypeError: options must be an object or undefined".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: options must be an object or undefined",
                     ));
                 }
                 let ym_units = &["auto", "year", "years", "month", "months"];
@@ -619,8 +618,8 @@ impl<'p> Vm<'p> {
                 };
                 let rank = |u: &str| if u == "year" { 0 } else { 1 };
                 if rank(&smallest) < rank(&largest) {
-                    return Err(Thrown(
-                        "RangeError: smallestUnit is larger than largestUnit".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: smallestUnit is larger than largestUnit",
                     ));
                 }
                 // Difference in CALENDAR months, via the global month index so that
@@ -642,9 +641,8 @@ impl<'p> Vm<'p> {
                 if total_months != 0
                     && (!iso_date_in_range(y, m, 1) || !iso_date_in_range(o.0, o.1, 1))
                 {
-                    return Err(Thrown(
-                        "RangeError: PlainYearMonth difference is outside the representable range"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: PlainYearMonth difference is outside the representable range",
                     ));
                 }
                 // NudgeToCalendarUnit: when the difference is actually rounded, the
@@ -677,9 +675,8 @@ impl<'p> Vm<'p> {
                     let (ky, km) = cal_month_from_index(cal, cand_idx);
                     let kiso = cal_date_to_iso(cal, ky, km, 1, false);
                     if kiso.is_none_or(|(a, b, c)| !iso_date_in_range(a, b, c)) {
-                        return Err(Thrown(
-                            "RangeError: rounded PlainYearMonth difference is outside the representable range"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: rounded PlainYearMonth difference is outside the representable range",
                         ));
                     }
                 }
@@ -731,10 +728,10 @@ impl<'p> Vm<'p> {
             "toPlainDate" => {
                 let day = self
                     .opt_int_field(a0, "day")?
-                    .ok_or_else(|| Thrown("TypeError: toPlainDate requires a day".into()))?;
+                    .ok_or_else(|| Thrown::from_static("TypeError: toPlainDate requires a day"))?;
                 // Default overflow is "constrain": clamp the day to the month.
                 let (iy, im, id) = cal_date_to_iso(cal, cy, cm, day, false)
-                    .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid date fields"))?;
                 let r = self.make_plain_date(iy, im, id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
@@ -769,7 +766,7 @@ impl<'p> Vm<'p> {
             || d > days_in_month(ref_year, m)
             || !iso_date_in_range(ref_year, m, d)
         {
-            return Err(Thrown("RangeError: invalid month-day value".into()));
+            return Err(Thrown::from_static("RangeError: invalid month-day value"));
         }
         let idx = self.heap.alloc(HeapObj::Temporal {
             kind: 6,
@@ -797,8 +794,8 @@ impl<'p> Vm<'p> {
             return self.make_plain_month_day(code.0, cd, 1972);
         }
         let Some(ed) = cal_month_day_reference(cal, code.0, code.1, cd) else {
-            return Err(Thrown(
-                "RangeError: month-day is not valid in this calendar".into(),
+            return Err(Thrown::from_static(
+                "RangeError: month-day is not valid in this calendar",
             ));
         };
         let (iy, im, id) = epoch_days_to_iso(ed);
@@ -884,13 +881,13 @@ impl<'p> Vm<'p> {
                 // precede a calendar-invalid monthCode's RangeError.
                 let year_field = self.opt_int_field(v, "year")?;
                 if m_raw.is_none() || d_opt.is_none() {
-                    return Err(Thrown(
-                        "TypeError: PlainMonthDay-like requires month and day".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: PlainMonthDay-like requires month and day",
                     ));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown(
-                        "TypeError: era and eraYear must be given together".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: era and eraYear must be given together",
                     ));
                 }
                 let (m_val, m_valid, m_conflict) = m_raw.unwrap();
@@ -900,9 +897,8 @@ impl<'p> Vm<'p> {
                 // RangeError (PlainMonthDay/from/fields-object.js).
                 let numeric_month = matches!(m_val, MonthRef::Ordinal(_)) || m_conflict.is_some();
                 if cal != Cal::Iso && numeric_month && year_field.is_none() && era.is_none() {
-                    return Err(Thrown(
-                        "TypeError: a non-ISO PlainMonthDay needs monthCode, or month with year"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: a non-ISO PlainMonthDay needs monthCode, or month with year",
                     ));
                 }
                 // GetTemporalOverflowOption: read + validate options.overflow AFTER the
@@ -922,7 +918,7 @@ impl<'p> Vm<'p> {
                 let mut m = m_val;
                 let mut d = d_opt.unwrap();
                 if m.floor() < 1 || d < 1 {
-                    return Err(Thrown("RangeError: month-day out of range".into()));
+                    return Err(Thrown::from_static("RangeError: month-day out of range"));
                 }
                 if cal != Cal::Iso {
                     // A supplied year (or era pair) must name a real, representable
@@ -941,8 +937,8 @@ impl<'p> Vm<'p> {
                     };
                     if let Some(y) = stated {
                         if !cal_month_fields_agree(cal, y, m, m_conflict) {
-                            return Err(Thrown(
-                                "RangeError: month and monthCode must agree".into(),
+                            return Err(Thrown::from_static(
+                                "RangeError: month and monthCode must agree",
                             ));
                         }
                         // With a year in hand the month and day are regulated
@@ -952,21 +948,21 @@ impl<'p> Vm<'p> {
                         // becomes the reference year (`reference-year-1972.js`:
                         // gregory {2021, M02, 29} is M02-28 anchored on 1972).
                         let Some(mo) = m.ordinal(cal, y, reject) else {
-                            return Err(Thrown("RangeError: month-day out of range".into()));
+                            return Err(Thrown::from_static("RangeError: month-day out of range"));
                         };
                         let miy = cal_months_in_year(cal, y);
                         if reject && !(1..=miy).contains(&mo) {
-                            return Err(Thrown("RangeError: month-day out of range".into()));
+                            return Err(Thrown::from_static("RangeError: month-day out of range"));
                         }
                         let mo = mo.clamp(1, miy);
                         let dim = cal_days_in_month(cal, y, mo);
                         if reject && d > dim {
-                            return Err(Thrown("RangeError: month-day out of range".into()));
+                            return Err(Thrown::from_static("RangeError: month-day out of range"));
                         }
                         d = d.min(dim);
                         let (iy, im, id) = epoch_days_to_iso(cal_to_epoch_days(cal, y, mo, d));
                         if !iso_date_in_range(iy, im, id) {
-                            return Err(Thrown("RangeError: month-day out of range".into()));
+                            return Err(Thrown::from_static("RangeError: month-day out of range"));
                         }
                         // Carry the month on as the CODE it names in that year, so
                         // the search below looks for the right month.
@@ -981,7 +977,7 @@ impl<'p> Vm<'p> {
                             // above), but keep the bound rather than panicking.
                             let last = cal_max_months(cal);
                             if reject && !(1..=last).contains(&n) {
-                                return Err(Thrown("RangeError: month-day out of range".into()));
+                                return Err(Thrown::from_static("RangeError: month-day out of range"));
                             }
                             (n.min(last), false)
                         }
@@ -1005,7 +1001,7 @@ impl<'p> Vm<'p> {
                 // iso8601: month and monthCode are interchangeable (no leap months),
                 // so the agreement check needs no year.
                 if !cal_month_fields_agree(cal, 1972, m, m_conflict) {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                    return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
                 }
                 let mut m = m.ordinal(cal, 1972, false).unwrap();
                 // The supplied `year` (if any) decides whether the day overflows
@@ -1015,7 +1011,7 @@ impl<'p> Vm<'p> {
                 let eff_year = year_field.unwrap_or(1972);
                 if reject {
                     if !(1..=12).contains(&m) || d > days_in_month(eff_year, m) {
-                        return Err(Thrown("RangeError: month-day out of range".into()));
+                        return Err(Thrown::from_static("RangeError: month-day out of range"));
                     }
                 } else {
                     // "constrain" clamps only the upper bound.
@@ -1025,8 +1021,8 @@ impl<'p> Vm<'p> {
                 return Ok(((1972, m, d), cal));
             }
         }
-        Err(Thrown(
-            "TypeError: cannot convert value to a Temporal.PlainMonthDay".into(),
+        Err(Thrown::from_static(
+            "TypeError: cannot convert value to a Temporal.PlainMonthDay",
         ))
     }
 
@@ -1065,8 +1061,8 @@ impl<'p> Vm<'p> {
                 };
                 Ok(Some(self.alloc_str(s)))
             }
-            "valueOf" => Err(Thrown(
-                "TypeError: Called Temporal.PlainMonthDay.prototype.valueOf".into(),
+            "valueOf" => Err(Thrown::from_static(
+                "TypeError: Called Temporal.PlainMonthDay.prototype.valueOf",
             )),
             "equals" => {
                 let (o, ocal) = self.to_plain_month_day_overflow(a0, None)?;
@@ -1080,8 +1076,8 @@ impl<'p> Vm<'p> {
                 let mf = self.read_month_field_raw(a0, cal)?;
                 let yf = self.opt_int_field(a0, "year")?;
                 if yf.is_none() && mf.is_none() && df.is_none() {
-                    return Err(Thrown(
-                        "TypeError: with() requires at least one recognized property".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: with() requires at least one recognized property",
                     ));
                 }
                 let month_valid = mf.map(|(_, v, _)| v).unwrap_or(true);
@@ -1097,7 +1093,7 @@ impl<'p> Vm<'p> {
                 // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
                 // rejected during field preparation, BEFORE the options bag is read.
                 if nm_ref.floor() < 1 || nd < 1 {
-                    return Err(Thrown("RangeError: invalid date fields".into()));
+                    return Err(Thrown::from_static("RangeError: invalid date fields"));
                 }
                 let reject =
                     self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
@@ -1112,7 +1108,7 @@ impl<'p> Vm<'p> {
                 // `with` has no year field to resolve against, so the agreement check
                 // uses the receiver's own calendar year.
                 if !cal_month_fields_agree(cal, ccy, nm_ref, month_conflict) {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                    return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
                 }
                 if cal != Cal::Iso {
                     // CalendarMergeFields drops the receiver's monthCode when the
@@ -1123,9 +1119,8 @@ impl<'p> Vm<'p> {
                     // unresolvable, not out of range
                     // (PlainMonthDay/prototype/with/fields-missing-properties.js).
                     if matches!(nm_ref, MonthRef::Ordinal(_)) && mf.is_some() && yf.is_none() {
-                        return Err(Thrown(
-                            "TypeError: a non-ISO month-day needs monthCode, or month with a year"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: a non-ISO month-day needs monthCode, or month with a year",
                         ));
                     }
                     let code = match nm_ref {
@@ -1133,7 +1128,7 @@ impl<'p> Vm<'p> {
                         MonthRef::Ordinal(n) => {
                             let last = cal_max_months(cal);
                             if reject && !(1..=last).contains(&n) {
-                                return Err(Thrown("RangeError: month-day out of range".into()));
+                                return Err(Thrown::from_static("RangeError: month-day out of range"));
                             }
                             cal_month_code(cal, ccy, n.min(last))
                         }
@@ -1147,7 +1142,7 @@ impl<'p> Vm<'p> {
                 let eff_year = yf.unwrap_or(ry);
                 if reject {
                     if !(1..=12).contains(&nm) || nd > days_in_month(eff_year, nm) {
-                        return Err(Thrown("RangeError: month-day out of range".into()));
+                        return Err(Thrown::from_static("RangeError: month-day out of range"));
                     }
                 } else {
                     // "constrain" clamps only the upper bound.
@@ -1167,11 +1162,11 @@ impl<'p> Vm<'p> {
                 let (era, era_year) = self.read_era_fields(a0, cal)?;
                 let yf = self.opt_int_field(a0, "year")?;
                 if era.is_none() && era_year.is_none() && yf.is_none() {
-                    return Err(Thrown("TypeError: toPlainDate requires a year".into()));
+                    return Err(Thrown::from_static("TypeError: toPlainDate requires a year"));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown(
-                        "TypeError: era and eraYear must be given together".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: era and eraYear must be given together",
                     ));
                 }
                 let year = Self::resolve_cal_year(cal, era.as_deref(), era_year, yf)?;
@@ -1182,7 +1177,7 @@ impl<'p> Vm<'p> {
                 let (num, leap) = cal_month_code(cal, ccy, ccm);
                 let mo = MonthRef::Code(num, leap).ordinal(cal, year, false).unwrap();
                 let (iy, im, id) = cal_date_to_iso(cal, year, mo, ccd, false)
-                    .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid date fields"))?;
                 let r = self.make_plain_date(iy, im, id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }

@@ -46,14 +46,14 @@ impl<'p> Vm<'p> {
     pub(crate) fn duration_field(&mut self, v: Value) -> Result<f64, Thrown> {
         if self.is_bigint_prim(v)
         {
-            return Err(Thrown(
-                "TypeError: Cannot convert a BigInt value to a number".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot convert a BigInt value to a number",
             ));
         }
         let n = self.to_number_strict(v)?;
         if !n.is_finite() || n.fract() != 0.0 {
-            return Err(Thrown(
-                "RangeError: Temporal.Duration fields must be integers".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Temporal.Duration fields must be integers",
             ));
         }
         Ok(n)
@@ -68,8 +68,8 @@ impl<'p> Vm<'p> {
                 if sign == 0 {
                     sign = s;
                 } else if s != sign {
-                    return Err(Thrown(
-                        "RangeError: mixed-sign values not allowed as duration fields".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: mixed-sign values not allowed as duration fields",
                     ));
                 }
             }
@@ -101,8 +101,8 @@ impl<'p> Vm<'p> {
             }
         }
         if !is_valid_duration(&ff) {
-            return Err(Thrown(
-                "RangeError: Temporal.Duration value out of range".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Temporal.Duration value out of range",
             ));
         }
         Ok(self.make_duration(ff))
@@ -126,8 +126,8 @@ impl<'p> Vm<'p> {
                 // A parsed duration must also be in range (e.g. a days/seconds value
                 // whose total exceeds 2^53 seconds is a RangeError).
                 if !is_valid_duration(&ff) {
-                    return Err(Thrown(
-                        "RangeError: Temporal.Duration value out of range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: Temporal.Duration value out of range",
                     ));
                 }
                 return Ok(ff);
@@ -145,20 +145,20 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if !any {
-                    return Err(Thrown(
-                        "TypeError: object is not a valid Temporal.Duration-like".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: object is not a valid Temporal.Duration-like",
                     ));
                 }
                 if !is_valid_duration(&ff) {
-                    return Err(Thrown(
-                        "RangeError: Temporal.Duration value out of range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: Temporal.Duration value out of range",
                     ));
                 }
                 return Ok(ff);
             }
         }
-        Err(Thrown(
-            "TypeError: cannot convert value to a Temporal.Duration".into(),
+        Err(Thrown::from_static(
+            "TypeError: cannot convert value to a Temporal.Duration",
         ))
     }
 
@@ -223,13 +223,13 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if !any {
-                    return Err(Thrown(
-                        "TypeError: with() requires a partial Duration object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: with() requires a partial Duration object",
                     ));
                 }
                 if !is_valid_duration(&nf) {
-                    return Err(Thrown(
-                        "RangeError: Temporal.Duration value out of range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: Temporal.Duration value out of range",
                     ));
                 }
                 Ok(Some(self.make_duration(nf)))
@@ -238,33 +238,32 @@ impl<'p> Vm<'p> {
             "toString" => {
                 let (_unit, digits, omit, mode) = self.time_precision(a0)?;
                 if omit {
-                    return Err(Thrown(
-                        "RangeError: smallestUnit 'minute' is not valid for Duration.toString"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: smallestUnit 'minute' is not valid for Duration.toString",
                     ));
                 }
                 match duration_to_string_opts(&f, digits, &mode) {
                     Some(s) => Ok(Some(self.alloc_str(s))),
-                    None => Err(Thrown(
-                        "RangeError: rounded duration is outside the representable range".into(),
+                    None => Err(Thrown::from_static(
+                        "RangeError: rounded duration is outside the representable range",
                     )),
                 }
             }
-            "valueOf" => Err(Thrown(
-                "TypeError: Called Temporal.Duration.prototype.valueOf".into(),
+            "valueOf" => Err(Thrown::from_static(
+                "TypeError: Called Temporal.Duration.prototype.valueOf",
             )),
             "total" => {
                 // arg: a unit string, or { unit, relativeTo }. GetTemporalRelativeToOption
                 // is read BEFORE the unit (spec order).
                 if a0 == Value::UNDEFINED {
-                    return Err(Thrown(
-                        "TypeError: total() requires an options argument".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: total() requires an options argument",
                     ));
                 }
                 let is_string = a0.is_heap() && self.heap.is_str_like(a0.heap_index());
                 if !is_string && !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: total() argument must be a string or object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: total() argument must be a string or object",
                     ));
                 }
                 let rel = if is_string {
@@ -288,7 +287,7 @@ impl<'p> Vm<'p> {
                     self.get_prop(a0, "unit")?
                 };
                 if unit_v == Value::UNDEFINED {
-                    return Err(Thrown("RangeError: unit is required".into()));
+                    return Err(Thrown::from_static("RangeError: unit is required"));
                 }
                 let unit = normalize_unit(&self.to_js_string(unit_v)?, "");
                 if !DURATION_UNITS.contains(&unit.as_str()) {
@@ -301,9 +300,8 @@ impl<'p> Vm<'p> {
                     || f[2] != 0.0
                     || matches!(unit.as_str(), "year" | "month" | "week");
                 if needs_cal && anchor.is_none() {
-                    return Err(Thrown(
-                        "RangeError: a relativeTo option is required for years, months, or weeks"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: a relativeTo option is required for years, months, or weeks",
                     ));
                 }
                 if let Some((start, tz, off, cal)) = anchor {
@@ -346,12 +344,12 @@ impl<'p> Vm<'p> {
                         Value::UNDEFINED,
                     )
                 } else if a0 == Value::UNDEFINED {
-                    return Err(Thrown(
-                        "TypeError: round() requires an options argument".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: round() requires an options argument",
                     ));
                 } else if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: round() argument must be a string or object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: round() argument must be a string or object",
                     ));
                 } else {
                     (None, a0)
@@ -426,9 +424,8 @@ impl<'p> Vm<'p> {
                 // explicit largestUnit "auto" counts (it resolves `lu` to None but is
                 // not absent), so test the resolved smallestUnit / raw largestUnit.
                 if su.is_none() && lu_v == Value::UNDEFINED {
-                    return Err(Thrown(
-                        "RangeError: at least one of smallestUnit or largestUnit is required"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: at least one of smallestUnit or largestUnit is required",
                     ));
                 }
                 let smallest = su.unwrap_or_else(|| "nanosecond".to_string());
@@ -460,8 +457,8 @@ impl<'p> Vm<'p> {
                     }
                 });
                 if urank(&smallest) < urank(&largest) {
-                    return Err(Thrown(
-                        "RangeError: smallestUnit must not be larger than largestUnit".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: smallestUnit must not be larger than largestUnit",
                     ));
                 }
                 // ValidateTemporalRoundingIncrement applies on BOTH paths (the
@@ -470,8 +467,8 @@ impl<'p> Vm<'p> {
                 // coarser largestUnit forbids an increment greater than 1.
                 if let Some(max) = max_increment(&smallest) {
                     if inc >= max || max % inc != 0 {
-                        return Err(Thrown(
-                            "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: roundingIncrement must evenly divide the next unit",
                         ));
                     }
                 }
@@ -479,9 +476,8 @@ impl<'p> Vm<'p> {
                     && urank(&smallest) > urank(&largest)
                     && inc != 1
                 {
-                    return Err(Thrown(
-                        "RangeError: roundingIncrement must be 1 when balancing a calendar unit"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: roundingIncrement must be 1 when balancing a calendar unit",
                     ));
                 }
                 if let Some((start, tz, off, cal)) = anchor {
@@ -513,9 +509,8 @@ impl<'p> Vm<'p> {
                 // No relativeTo: calendar units require one.
                 let cal = |u: &str| matches!(u, "year" | "month" | "week");
                 if f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0 || cal(&smallest) || cal(&largest) {
-                    return Err(Thrown(
-                        "RangeError: a relativeTo option is required for years, months, or weeks"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: a relativeTo option is required for years, months, or weeks",
                     ));
                 }
                 let total_ns = dur_day_time_ns(&f);
@@ -538,9 +533,8 @@ impl<'p> Vm<'p> {
                     || other[1] != 0.0
                     || other[2] != 0.0
                 {
-                    return Err(Thrown(
-                        "RangeError: a relativeTo option is required for years, months, or weeks"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: a relativeTo option is required for years, months, or weeks",
                     ));
                 }
                 let o_ns = (other[3] as i128) * DAY_NS

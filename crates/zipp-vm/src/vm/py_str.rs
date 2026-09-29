@@ -300,13 +300,13 @@ impl<'p> Vm<'p> {
             1 => "j1",
             2 => "j2",
             3 => "j3",
-            _ => return Err(Thrown("TypeError: str method entry called with a wrong count".into())),
+            _ => return Err(Thrown::from_static("TypeError: str method entry called with a wrong count")),
         };
-        let HeapObj::Object(m) = (if this.is_heap() { self.heap.get(this.heap_index()) } else { return Err(Thrown("TypeError: str method entry called on a non-builtin".into())) }) else {
-            return Err(Thrown("TypeError: str method entry called on a non-builtin".into()));
+        let HeapObj::Object(m) = (if this.is_heap() { self.heap.get(this.heap_index()) } else { return Err(Thrown::from_static("TypeError: str method entry called on a non-builtin")) }) else {
+            return Err(Thrown::from_static("TypeError: str method entry called on a non-builtin"));
         };
         let Some(slot) = m.pos(name).filter(|&s| !m.attr_at(s).accessor) else {
-            return Err(Thrown("TypeError: str method entry called on a non-builtin".into()));
+            return Err(Thrown::from_static("TypeError: str method entry called on a non-builtin"));
         };
         let f = m.val_at(slot);
         self.call_value(f, this, args)
@@ -757,7 +757,7 @@ impl<'p> Vm<'p> {
         let jnext = if this.is_heap() { self.py_strm_prop(this.heap_index(), hint::JNEXT, "jnext") } else { None };
         match jnext {
             Some(f) => self.call_value(f, this, &[]),
-            None => Err(Thrown("TypeError: iterator step on a non-iterator".into())),
+            None => Err(Thrown::from_static("TypeError: iterator step on a non-iterator")),
         }
     }
 

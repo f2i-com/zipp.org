@@ -227,6 +227,9 @@ const fn disabled() -> bool {
 #[cfg(not(feature = "meter-only"))]
 #[inline]
 fn disabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return false;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static OFF: AtomicU8 = AtomicU8::new(2);
     match OFF.load(Ordering::Relaxed) {

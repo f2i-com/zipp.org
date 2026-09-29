@@ -665,16 +665,14 @@ impl<'p> Vm<'p> {
             .is_some_and(|ns| ns.iter().any(|(_, k)| k & 8 == 0));
         if has_instance_privates {
             if is_override && self.instance_has_brand(inst, own) {
-                return Err(Thrown(
-                    "TypeError: cannot initialize the same private elements twice on an object"
-                        .into(),
+                return Err(Thrown::from_static(
+                    "TypeError: cannot initialize the same private elements twice on an object",
                 ));
             }
             if let HeapObj::Object(m) = self.heap.get(inst.heap_index()) {
                 if !m.extensible {
-                    return Err(Thrown(
-                        "TypeError: cannot define private elements on a non-extensible object"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: cannot define private elements on a non-extensible object",
                     ));
                 }
             }
@@ -1088,8 +1086,8 @@ impl<'p> Vm<'p> {
         // forward to the target's [[HasProperty]] when there is no trap.
         if let Some((target, handler, revoked)) = self.proxy_parts(idx) {
             if revoked {
-                return Err(Thrown(
-                    "TypeError: Cannot perform 'has' on a revoked proxy".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform 'has' on a revoked proxy",
                 ));
             }
             return match self.proxy_trap(handler, "has")? {
@@ -1105,8 +1103,8 @@ impl<'p> Vm<'p> {
                         if desc != Value::UNDEFINED {
                             let cfg = self.get_prop(desc, "configurable")?;
                             if !self.truthy(cfg) || !self.is_extensible(target)? {
-                                return Err(Thrown(
-                                    "TypeError: proxy 'has' returned false for a non-configurable / non-extensible-target own property".into(),
+                                return Err(Thrown::from_static(
+                                    "TypeError: proxy 'has' returned false for a non-configurable / non-extensible-target own property",
                                 ));
                             }
                         }
@@ -1948,8 +1946,8 @@ impl<'p> Vm<'p> {
         // a boxed Number and an object whose ToPrimitive yields a Number (via the
         // object branch below), not just a bare numeric literal.
         if v.is_number() {
-            return Err(Thrown(
-                "TypeError: Cannot convert a Number to a BigInt".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot convert a Number to a BigInt",
             ));
         }
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
@@ -1971,8 +1969,8 @@ impl<'p> Vm<'p> {
             let prim = self.to_primitive_number(v)?;
             return self.to_bigint(prim);
         }
-        Err(Thrown(
-            "TypeError: Cannot convert this value to a BigInt".into(),
+        Err(Thrown::from_static(
+            "TypeError: Cannot convert this value to a BigInt",
         ))
     }
 
@@ -1989,9 +1987,8 @@ impl<'p> Vm<'p> {
         if prim.is_number() {
             let d = prim.as_f64();
             if !d.is_finite() || d.fract() != 0.0 {
-                return Err(Thrown(
-                    "RangeError: The number is not a safe integer and cannot be converted to a BigInt"
-                        .into(),
+                return Err(Thrown::from_static(
+                    "RangeError: The number is not a safe integer and cannot be converted to a BigInt",
                 ));
             }
             // Safely within i128 → fast tier; near/beyond the boundary → exact
@@ -2002,7 +1999,7 @@ impl<'p> Vm<'p> {
             }
             use num_traits::FromPrimitive;
             let b = num_bigint::BigInt::from_f64(d)
-                .ok_or_else(|| Thrown("RangeError: Cannot convert to a BigInt".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: Cannot convert to a BigInt"))?;
             return Ok(BigVal::from_num(b));
         }
         self.to_bigint(prim)
@@ -2021,8 +2018,8 @@ impl<'p> Vm<'p> {
     pub(crate) fn preflight_regex_program(&mut self, regex: &regress::Regex) -> Result<(), Thrown> {
         let bytes = regex.resident_bytes();
         if bytes > MAX_REGEX_PROGRAM_BYTES {
-            return Err(Thrown(
-                "RangeError: compiled regular expression exceeds the sandbox limit".into(),
+            return Err(Thrown::from_static(
+                "RangeError: compiled regular expression exceeds the sandbox limit",
             ));
         }
         #[cfg(feature = "instrument")]
@@ -2130,8 +2127,8 @@ impl<'p> Vm<'p> {
             const MAX_SAFE_REGEX_PATTERN_BYTES: usize = 16 << 10;
             let exact_len = exact_bytes.as_ref().map_or(0, Vec::len);
             if source.len().max(exact_len) > MAX_SAFE_REGEX_PATTERN_BYTES {
-                return Err(Thrown(
-                    "RangeError: regular expression pattern exceeds the sandbox limit".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: regular expression pattern exceeds the sandbox limit",
                 ));
             }
         }

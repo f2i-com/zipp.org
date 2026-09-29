@@ -153,8 +153,8 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         let res = self.call_value(next, iter, &[])?;
         if !self.is_object_value(res) {
-            return Err(Thrown(
-                "TypeError: iterator.next() returned a non-object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: iterator.next() returned a non-object",
             ));
         }
         let done = self.get_prop(res, "done")?;
@@ -184,7 +184,7 @@ impl<'p> Vm<'p> {
         // IteratorComplete: validate `result` is an object, then read only `done`.
         let complete = |vm: &mut Self, result: Value| -> Result<bool, Thrown> {
             if !vm.is_object_value(result) {
-                return Err(Thrown("TypeError: iterator result is not an object".into()));
+                return Err(Thrown::from_static("TypeError: iterator result is not an object"));
             }
             let d = vm.get_prop(result, "done")?;
             Ok(vm.truthy(d))
@@ -208,13 +208,13 @@ impl<'p> Vm<'p> {
                 let throw_m = self.get_prop(iter, "throw")?;
                 if throw_m.is_nullish() {
                     let _ = self.iterator_close(iter);
-                    return Err(Thrown(
-                        "TypeError: The iterator does not provide a 'throw' method".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: The iterator does not provide a 'throw' method",
                     ));
                 }
                 if !self.is_callable(throw_m) {
-                    return Err(Thrown(
-                        "TypeError: iterator 'throw' is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: iterator 'throw' is not a function",
                     ));
                 }
                 let result = self.call_value(throw_m, iter, &[sent])?;
@@ -233,8 +233,8 @@ impl<'p> Vm<'p> {
                     return Ok((sent, false, true));
                 }
                 if !self.is_callable(ret_m) {
-                    return Err(Thrown(
-                        "TypeError: iterator 'return' is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: iterator 'return' is not a function",
                     ));
                 }
                 let result = self.call_value(ret_m, iter, &[sent])?;
@@ -280,14 +280,14 @@ impl<'p> Vm<'p> {
             return Ok(v);
         }
         if !self.is_callable(m) {
-            return Err(Thrown(
-                "TypeError: [Symbol.iterator] is not a function".into(),
+            return Err(Thrown::from_static(
+                "TypeError: [Symbol.iterator] is not a function",
             ));
         }
         let it = self.call_value(m, v, &[])?;
         if !self.is_object_value(it) {
-            return Err(Thrown(
-                "TypeError: [Symbol.iterator]() returned a non-object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: [Symbol.iterator]() returned a non-object",
             ));
         }
         Ok(it)
@@ -355,15 +355,15 @@ impl<'p> Vm<'p> {
         let mut pairs: Vec<Value> = Vec::with_capacity(args.len());
         for &item in args {
             if !self.is_object_value(item) {
-                return Err(Thrown(
-                    "TypeError: Iterator.concat argument is not an object".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Iterator.concat argument is not an object",
                 ));
             }
             // GetMethod(item, @@iterator): undefined/null/non-callable all reject.
             let method = self.get_prop(item, "@@iterator")?;
             if !self.is_callable(method) {
-                return Err(Thrown(
-                    "TypeError: Iterator.concat argument is not iterable".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Iterator.concat argument is not iterable",
                 ));
             }
             let pair = Value::heap(self.heap.alloc(HeapObj::Array(vec![item, method])));
@@ -695,7 +695,7 @@ impl<'p> Vm<'p> {
             self.alloc_str("Iterator.zip strict: iterators have different lengths".to_string());
         let te = self.make_error(1, Some(msg));
         self.pending_throw = Some(te);
-        Thrown("TypeError: Iterator.zip strict: iterators have different lengths".into())
+        Thrown::from_static("TypeError: Iterator.zip strict: iterators have different lengths")
     }
 
     /// Close every still-open iterator of a zip helper (for `.return()`), in REVERSE
@@ -718,12 +718,12 @@ impl<'p> Vm<'p> {
     pub(crate) fn iter_zip_next(&mut self, idx: u32) -> Result<Value, Thrown> {
         match self.heap.get(idx) {
             HeapObj::IterHelper { running: true, .. } => {
-                return Err(Thrown("TypeError: Iterator is already running".into()));
+                return Err(Thrown::from_static("TypeError: Iterator is already running"));
             }
             HeapObj::IterHelper { .. } => {}
             _ => {
-                return Err(Thrown(
-                    "TypeError: Iterator Helper next on incompatible receiver".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Iterator Helper next on incompatible receiver",
                 ))
             }
         }
@@ -759,8 +759,8 @@ impl<'p> Vm<'p> {
                 ..
             } => (*source, *arg, *inner, *n as u8, *done),
             _ => {
-                return Err(Thrown(
-                    "TypeError: Iterator Helper next on incompatible receiver".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Iterator Helper next on incompatible receiver",
                 ))
             }
         };
@@ -1018,12 +1018,12 @@ impl<'p> Vm<'p> {
         // `take(1n)` silently became 1 — the strict variant is the real ToNumber.
         let n = self.to_number_strict(v)?;
         if n.is_nan() {
-            return Err(Thrown("RangeError: take/drop limit must not be NaN".into()));
+            return Err(Thrown::from_static("RangeError: take/drop limit must not be NaN"));
         }
         if n.is_infinite() {
             return if n < 0.0 {
-                Err(Thrown(
-                    "RangeError: take/drop limit must be non-negative".into(),
+                Err(Thrown::from_static(
+                    "RangeError: take/drop limit must be non-negative",
                 ))
             } else {
                 Ok(i64::MAX)
@@ -1033,8 +1033,8 @@ impl<'p> Vm<'p> {
         // `-0.5` → -0 (allowed) but `-1` → -1 (RangeError).
         let int_limit = n.trunc();
         if int_limit < 0.0 {
-            return Err(Thrown(
-                "RangeError: take/drop limit must be non-negative".into(),
+            return Err(Thrown::from_static(
+                "RangeError: take/drop limit must be non-negative",
             ));
         }
         Ok(int_limit as i64)
@@ -1143,8 +1143,8 @@ impl<'p> Vm<'p> {
         use native::*;
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         if !self.iter_receiver_ok(this) {
-            return Err(Thrown(
-                "TypeError: Iterator helper called on a non-object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Iterator helper called on a non-object",
             ));
         }
         let needs_fn = matches!(
@@ -1162,8 +1162,8 @@ impl<'p> Vm<'p> {
         // must IteratorClose the underlying iterator before throwing.
         if needs_fn && !self.is_callable(a0) {
             let _ = self.iterator_close(this);
-            return Err(Thrown(
-                "TypeError: the callback argument is not a function".into(),
+            return Err(Thrown::from_static(
+                "TypeError: the callback argument is not a function",
             ));
         }
         match id {
@@ -1186,7 +1186,7 @@ impl<'p> Vm<'p> {
                     self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
                     out.try_reserve(1).map_err(|_| {
                         self.iterator_close_quiet(this);
-                        Thrown("RangeError: iterator result allocation failed".into())
+                        Thrown::from_static("RangeError: iterator result allocation failed")
                     })?;
                     // `out` is a Rust Vec until the final Array allocation.
                     // Its earlier elements must survive the next guest step.
@@ -1302,7 +1302,7 @@ impl<'p> Vm<'p> {
             ITER_REDUCE => {
                 if !self.is_callable(a0) {
                     let _ = self.iterator_close(this);
-                    return Err(Thrown("TypeError: reduce reducer is not a function".into()));
+                    return Err(Thrown::from_static("TypeError: reduce reducer is not a function"));
                 }
                 let next = self.iter_direct_next(this)?;
                 let has_init = args.len() >= 2;
@@ -1317,8 +1317,8 @@ impl<'p> Vm<'p> {
                             i = 1;
                         }
                         None => {
-                            return Err(Thrown(
-                                "TypeError: reduce of empty iterator with no initial value".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: reduce of empty iterator with no initial value",
                             ))
                         }
                     }
@@ -1330,7 +1330,7 @@ impl<'p> Vm<'p> {
                 }
                 Ok(acc)
             }
-            _ => Err(Thrown("TypeError: unknown iterator helper".into())),
+            _ => Err(Thrown::from_static("TypeError: unknown iterator helper")),
         }
     }
 
@@ -1341,12 +1341,12 @@ impl<'p> Vm<'p> {
     pub(crate) fn iter_helper_next(&mut self, idx: u32) -> Result<Value, Thrown> {
         match self.heap.get(idx) {
             HeapObj::IterHelper { running: true, .. } => {
-                return Err(Thrown("TypeError: Iterator is already running".into()));
+                return Err(Thrown::from_static("TypeError: Iterator is already running"));
             }
             HeapObj::IterHelper { .. } => {}
             _ => {
-                return Err(Thrown(
-                    "TypeError: Iterator Helper next called on incompatible receiver".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Iterator Helper next called on incompatible receiver",
                 ))
             }
         }
@@ -1372,8 +1372,8 @@ impl<'p> Vm<'p> {
                     ..
                 } => (*source, *kind, *arg, *n, *idx, *done, *inner, *next),
                 _ => {
-                    return Err(Thrown(
-                        "TypeError: Iterator Helper next called on incompatible receiver".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Iterator Helper next called on incompatible receiver",
                     ))
                 }
             };
@@ -1543,9 +1543,8 @@ impl<'p> Vm<'p> {
                     let it = self.call_value(method, iterable, &[])?;
                     if !self.is_object_value(it) {
                         self.ih_set_done(idx);
-                        return Err(Thrown(
-                            "TypeError: Iterator.concat: the iterator method did not return an object"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Iterator.concat: the iterator method did not return an object",
                         ));
                     }
                     self.ih_set_inner(idx, it);

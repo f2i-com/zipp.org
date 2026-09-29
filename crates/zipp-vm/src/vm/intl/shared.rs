@@ -14,7 +14,7 @@ fn account_locale_list_bytes(total: &mut usize, additional: usize) -> Result<(),
     *total = total
         .checked_add(additional)
         .filter(|&bytes| bytes <= MAX_STRING_BYTES)
-        .ok_or_else(|| Thrown("RangeError: locale list text limit exceeded".into()))?;
+        .ok_or_else(|| Thrown::from_static("RangeError: locale list text limit exceeded"))?;
     Ok(())
 }
 
@@ -29,16 +29,16 @@ fn push_unique_locale(
     }
     account_locale_list_bytes(retained_bytes, tag.len())?;
     out.try_reserve(1)
-        .map_err(|_| Thrown("RangeError: locale list allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: locale list allocation failed"))?;
     seen.try_reserve(1)
-        .map_err(|_| Thrown("RangeError: locale list allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: locale list allocation failed"))?;
 
     // Keep the ordered output and the membership index separately without an
     // infallible String::clone allocation.
     let mut membership_key = String::new();
     membership_key
         .try_reserve_exact(tag.len())
-        .map_err(|_| Thrown("RangeError: locale list allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: locale list allocation failed"))?;
     membership_key.push_str(&tag);
     seen.insert(membership_key);
     out.push(tag);
@@ -56,7 +56,7 @@ impl<'p> Vm<'p> {
         value: Value,
     ) -> Result<(), Thrown> {
         if !(value.is_heap() && self.heap.is_str_like(value.heap_index())) {
-            return Err(Thrown("TypeError: list elements must be strings".into()));
+            return Err(Thrown::from_static("TypeError: list elements must be strings"));
         }
         let idx = value.heap_index();
         self.heap.flatten(idx);
@@ -67,15 +67,15 @@ impl<'p> Vm<'p> {
         let next_total = total_bytes
             .checked_add(byte_len)
             .filter(|&n| n <= MAX_STRING_BYTES)
-            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
         self.preflight_guest_string_size(next_total)?;
         out.try_reserve(1)
-            .map_err(|_| Thrown("RangeError: list allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: list allocation failed"))?;
         let text = self.heap.str_cow(idx).expect("validated string-like value");
         let mut owned = String::new();
         owned
             .try_reserve_exact(text.len())
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         owned.push_str(&text);
         out.push(owned);
         *total_bytes = next_total;
@@ -313,8 +313,8 @@ impl<'p> Vm<'p> {
             }
             let is_string = el.is_heap() && self.heap.is_str_like(el.heap_index());
             if !is_string && !self.is_object_value(el) {
-                return Err(Thrown(
-                    "TypeError: locale list elements must be strings or objects".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: locale list elements must be strings or objects",
                 ));
             }
             let s = self.to_js_string(el)?;
@@ -512,12 +512,12 @@ impl<'p> Vm<'p> {
         let (su_string, options) = if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
             (Some(arg), Value::UNDEFINED)
         } else if arg == Value::UNDEFINED {
-            return Err(Thrown(
-                "TypeError: round() requires an options argument".into(),
+            return Err(Thrown::from_static(
+                "TypeError: round() requires an options argument",
             ));
         } else if !self.is_object_value(arg) {
-            return Err(Thrown(
-                "TypeError: round() options must be an object or a string".into(),
+            return Err(Thrown::from_static(
+                "TypeError: round() options must be an object or a string",
             ));
         } else {
             (None, arg)
@@ -536,7 +536,7 @@ impl<'p> Vm<'p> {
             None => self.get_prop(options, "smallestUnit")?,
         };
         if smallest_v == Value::UNDEFINED {
-            return Err(Thrown("RangeError: smallestUnit is required".into()));
+            return Err(Thrown::from_static("RangeError: smallestUnit is required"));
         }
         let smallest = self.to_js_string(smallest_v)?;
         self.preflight_native_iteration_work(smallest.len() as u64)?;
@@ -552,14 +552,14 @@ impl<'p> Vm<'p> {
                 // "day" rounds against a 1-day dividend (inclusive), so only an
                 // increment of exactly 1 is valid.
                 if inc != 1 {
-                    return Err(Thrown(
-                        "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: roundingIncrement must evenly divide the next unit",
                     ));
                 }
             } else if let Some(max) = max_increment(&su) {
                 if inc >= max || max % inc != 0 {
-                    return Err(Thrown(
-                        "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: roundingIncrement must evenly divide the next unit",
                     ));
                 }
             }
@@ -594,8 +594,8 @@ impl<'p> Vm<'p> {
             ));
         }
         if !self.is_object_value(options) {
-            return Err(Thrown(
-                "TypeError: options must be an object or undefined".into(),
+            return Err(Thrown::from_static(
+                "TypeError: options must be an object or undefined",
             ));
         }
         let largest_allowed = [
@@ -639,14 +639,14 @@ impl<'p> Vm<'p> {
             normalize_unit(&lu_raw, default_largest)
         };
         if rank(&lu) > rank(&su) {
-            return Err(Thrown(
-                "RangeError: largestUnit must not be smaller than smallestUnit".into(),
+            return Err(Thrown::from_static(
+                "RangeError: largestUnit must not be smaller than smallestUnit",
             ));
         }
         if let Some(max) = max_increment(&su) {
             if inc >= max || max % inc != 0 {
-                return Err(Thrown(
-                    "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: roundingIncrement must evenly divide the next unit",
                 ));
             }
         }
@@ -673,8 +673,8 @@ impl<'p> Vm<'p> {
                 if !(tag.is_heap() && self.heap.is_str_like(tag.heap_index()))
                     && !self.is_object_value(tag)
                 {
-                    return Err(Thrown(
-                        "TypeError: Locale tag must be a string or an object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Locale tag must be a string or an object",
                     ));
                 }
                 self.to_js_string(tag)?
@@ -726,10 +726,10 @@ impl<'p> Vm<'p> {
                     return Err(Thrown(format!("RangeError: invalid variants option: {v}")));
                 }
                 seen.try_reserve(1)
-                    .map_err(|_| Thrown("RangeError: locale variants allocation failed".into()))?;
+                    .map_err(|_| Thrown::from_static("RangeError: locale variants allocation failed"))?;
                 membership
                     .try_reserve(1)
-                    .map_err(|_| Thrown("RangeError: locale variants allocation failed".into()))?;
+                    .map_err(|_| Thrown::from_static("RangeError: locale variants allocation failed"))?;
                 membership.insert(lp.clone());
                 seen.push(lp);
             }
@@ -911,7 +911,7 @@ impl<'p> Vm<'p> {
             self.preflight_native_iteration_work(vals.len() as u64)?;
             let mut out = Vec::new();
             out.try_reserve_exact(vals.len())
-                .map_err(|_| Thrown("RangeError: list allocation failed".into()))?;
+                .map_err(|_| Thrown::from_static("RangeError: list allocation failed"))?;
             let mut total_bytes = 0usize;
             for v in vals {
                 self.push_string_list_value(&mut out, &mut total_bytes, v)?;
@@ -926,8 +926,8 @@ impl<'p> Vm<'p> {
             self.preflight_native_iteration_work(iterations)?;
             let res = self.call_value(next, iter, &[])?;
             if !self.is_object_value(res) {
-                return Err(Thrown(
-                    "TypeError: iterator.next() returned a non-object".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: iterator.next() returned a non-object",
                 ));
             }
             let done = self.get_prop(res, "done")?;
@@ -937,7 +937,7 @@ impl<'p> Vm<'p> {
             let v = self.get_prop(res, "value")?;
             if !(v.is_heap() && self.heap.is_str_like(v.heap_index())) {
                 self.iterator_close_quiet(iter);
-                return Err(Thrown("TypeError: list elements must be strings".into()));
+                return Err(Thrown::from_static("TypeError: list elements must be strings"));
             }
             if let Err(error) = self.push_string_list_value(&mut out, &mut total_bytes, v) {
                 self.iterator_close_quiet(iter);

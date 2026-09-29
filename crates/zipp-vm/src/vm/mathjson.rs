@@ -13,6 +13,9 @@ use crate::value::Value;
 /// each change is A/B-able and bisectable on one binary.
 #[inline]
 fn json_leaf_fast_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -34,6 +37,9 @@ fn json_leaf_fast_enabled() -> bool {
 /// `ZIPP_NO_JSON_PLAIN_FAST=1` restores the general recursive serializer.
 #[inline]
 fn json_plain_fast_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -108,14 +114,14 @@ struct JsonKeySnapshotBudget {
 fn json_check_parse_depth(depth: usize) -> Result<(), Thrown> {
     #[cfg(feature = "safe-sandbox")]
     if depth >= MAX_JSON_NESTING_DEPTH {
-        return Err(Thrown(
-            "RangeError: JSON parse nesting depth exceeds the sandbox limit".into(),
+        return Err(Thrown::from_static(
+            "RangeError: JSON parse nesting depth exceeds the sandbox limit",
         ));
     }
     #[cfg(not(feature = "safe-sandbox"))]
     if depth >= MAX_JSON_PARSE_DEPTH {
-        return Err(Thrown(
-            "RangeError: JSON parse nesting depth exceeds the engine limit".into(),
+        return Err(Thrown::from_static(
+            "RangeError: JSON parse nesting depth exceeds the engine limit",
         ));
     }
     Ok(())
@@ -217,6 +223,9 @@ fn json_quoted_wtf8_len(bytes: &[u8]) -> Result<usize, JsonOutputError> {
 /// B234 latch: `ZIPP_NO_JSON_QUOTE_FASTLEN=1` sizes every quoted string by
 /// decoding it, as before.
 fn json_quote_fastlen_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -1078,7 +1087,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     found.ok_or_else(|| {
-                        Thrown("TypeError: Cannot convert object to primitive value".into())
+                        Thrown::from_static("TypeError: Cannot convert object to primitive value")
                     })?
                 };
                 Ok(Value::num(self.to_number_strict(prim)?))
@@ -1177,8 +1186,8 @@ impl<'p> Vm<'p> {
         // as false, so check explicitly before the PropertyList branch).
         if replacer.is_heap() {
             if let HeapObj::Proxy { revoked: true, .. } = self.heap.get(replacer.heap_index()) {
-                return Err(Thrown(
-                    "TypeError: Cannot perform IsArray on a revoked Proxy".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform IsArray on a revoked Proxy",
                 ));
             }
         }
@@ -1199,8 +1208,8 @@ impl<'p> Vm<'p> {
             // cannot interrupt its billions of absent-index probes.
             #[cfg(feature = "safe-sandbox")]
             if len > MAX_EAGER_ITER_RESULT as u64 {
-                return Err(Thrown(
-                    "RangeError: JSON replacer array exceeds the sandbox iteration limit".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: JSON replacer array exceeds the sandbox iteration limit",
                 ));
             }
 
@@ -1645,8 +1654,8 @@ impl<'p> Vm<'p> {
             return Ok(true);
         }
         if v.is_small_bigint() {
-            return Err(Thrown(
-                "TypeError: Do not know how to serialize a BigInt".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Do not know how to serialize a BigInt",
             ));
         }
         if !v.is_heap() {
@@ -1671,8 +1680,8 @@ impl<'p> Vm<'p> {
             | HeapObj::NativeClosure { .. }
             | HeapObj::Symbol { .. } => return Ok(false),
             HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
-                return Err(Thrown(
-                    "TypeError: Do not know how to serialize a BigInt".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Do not know how to serialize a BigInt",
                 ))
             }
             // A boxed primitive serializes as ToString / ToNumber / its boolean —
@@ -1702,8 +1711,8 @@ impl<'p> Vm<'p> {
             HeapObj::Boxed { value, .. } => {
                 if self.is_bigint_prim(*value)
                 {
-                    return Err(Thrown(
-                        "TypeError: Do not know how to serialize a BigInt".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Do not know how to serialize a BigInt",
                     ));
                 }
             }
@@ -1732,20 +1741,20 @@ impl<'p> Vm<'p> {
         // and detect cycles via `visited`. The PropertyList allowlist is GLOBAL — it
         // filters object keys at EVERY nesting level, including objects inside arrays.
         if visited.contains(&idx) {
-            return Err(Thrown(
-                "TypeError: Converting circular structure to JSON".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Converting circular structure to JSON",
             ));
         }
         #[cfg(feature = "safe-sandbox")]
         if depth >= MAX_JSON_NESTING_DEPTH {
-            return Err(Thrown(
-                "RangeError: JSON nesting depth exceeds the sandbox limit".into(),
+            return Err(Thrown::from_static(
+                "RangeError: JSON nesting depth exceeds the sandbox limit",
             ));
         }
         #[cfg(not(feature = "safe-sandbox"))]
         if depth >= MAX_JSON_STRINGIFY_DEPTH {
-            return Err(Thrown(
-                "RangeError: Maximum call stack size exceeded".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Maximum call stack size exceeded",
             ));
         }
         visited.push(idx);
@@ -1775,8 +1784,8 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "safe-sandbox")]
             if len > MAX_EAGER_ITER_RESULT as u64 {
                 visited.pop();
-                return Err(Thrown(
-                    "RangeError: JSON array exceeds the sandbox iteration limit".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: JSON array exceeds the sandbox iteration limit",
                 ));
             }
             self.json_push_char_output(out, '[')?;
@@ -2144,8 +2153,8 @@ impl<'p> Vm<'p> {
         let v = self.json_parse_value(src, &mut i, 0)?;
         json_skip_ws(src, &mut i);
         if i != src.len() {
-            return Err(Thrown(
-                "SyntaxError: Unexpected non-whitespace character after JSON".into(),
+            return Err(Thrown::from_static(
+                "SyntaxError: Unexpected non-whitespace character after JSON",
             ));
         }
         Ok(v)
@@ -2178,7 +2187,7 @@ impl<'p> Vm<'p> {
                 Ok(Value::NULL)
             }
             Some(c) if c == b'-' || c.is_ascii_digit() => json_parse_number(b, i),
-            _ => Err(Thrown("SyntaxError: Unexpected token in JSON".into())),
+            _ => Err(Thrown::from_static("SyntaxError: Unexpected token in JSON")),
         }
     }
 
@@ -2209,8 +2218,8 @@ impl<'p> Vm<'p> {
                     break;
                 }
                 _ => {
-                    return Err(Thrown(
-                        "SyntaxError: Expected ',' or ']' in JSON array".into(),
+                    return Err(Thrown::from_static(
+                        "SyntaxError: Expected ',' or ']' in JSON array",
                     ))
                 }
             }
@@ -2233,8 +2242,8 @@ impl<'p> Vm<'p> {
             loop {
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b'"') {
-                    return Err(Thrown(
-                        "SyntaxError: Expected property name string in JSON".into(),
+                    return Err(Thrown::from_static(
+                        "SyntaxError: Expected property name string in JSON",
                     ));
                 }
                 // B233: an escape-free member name IS its source bytes, so
@@ -2258,7 +2267,7 @@ impl<'p> Vm<'p> {
                 let key = escape_guest_key(key);
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
-                    return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));
+                    return Err(Thrown::from_static("SyntaxError: Expected ':' in JSON object"));
                 }
                 *i += 1;
                 json_skip_ws(b, i);
@@ -2269,8 +2278,8 @@ impl<'p> Vm<'p> {
                     Some(b',') => *i += 1,
                     Some(b'}') => break,
                     _ => {
-                        return Err(Thrown(
-                            "SyntaxError: Expected ',' or '}' in JSON object".into(),
+                        return Err(Thrown::from_static(
+                            "SyntaxError: Expected ',' or '}' in JSON object",
                         ))
                     }
                 }
@@ -2341,7 +2350,7 @@ impl<'p> Vm<'p> {
         active
             .try_reserve_exact(MAX_JSON_NESTING_DEPTH)
             .map_err(|_| {
-                Thrown("RangeError: JSON reviver nesting depth exceeds the sandbox limit".into())
+                Thrown::from_static("RangeError: JSON reviver nesting depth exceeds the sandbox limit")
             })?;
         self.internalize_json_at(holder, key, reviver, src, 0, &mut active)
     }
@@ -2373,8 +2382,8 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "safe-sandbox")]
             {
                 if depth >= MAX_JSON_NESTING_DEPTH || active.contains(&val.heap_index()) {
-                    return Err(Thrown(
-                        "RangeError: JSON reviver nesting depth exceeds the sandbox limit".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: JSON reviver nesting depth exceeds the sandbox limit",
                     ));
                 }
                 active.push(val.heap_index());
@@ -2384,8 +2393,8 @@ impl<'p> Vm<'p> {
             // stack overflowed. The parse limit bounds any tree it produced.
             #[cfg(not(feature = "safe-sandbox"))]
             if depth >= MAX_JSON_PARSE_DEPTH {
-                return Err(Thrown(
-                    "RangeError: Maximum call stack size exceeded".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: Maximum call stack size exceeded",
                 ));
             }
 
@@ -2404,9 +2413,8 @@ impl<'p> Vm<'p> {
                     };
                     #[cfg(feature = "safe-sandbox")]
                     if len > MAX_EAGER_ITER_RESULT as u64 {
-                        return Err(Thrown(
-                            "RangeError: JSON reviver array exceeds the sandbox iteration limit"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: JSON reviver array exceeds the sandbox iteration limit",
                         ));
                     }
                     let mut i: u64 = 0;
@@ -2496,8 +2504,8 @@ impl<'p> Vm<'p> {
         let r = self.json_parse_value_src(src, &mut i, 0)?;
         json_skip_ws(src, &mut i);
         if i != src.len() {
-            return Err(Thrown(
-                "SyntaxError: Unexpected non-whitespace character after JSON".into(),
+            return Err(Thrown::from_static(
+                "SyntaxError: Unexpected non-whitespace character after JSON",
             ));
         }
         Ok(r)
@@ -2550,8 +2558,8 @@ impl<'p> Vm<'p> {
                     Some(b',') => *i += 1,
                     Some(b']') => break,
                     _ => {
-                        return Err(Thrown(
-                            "SyntaxError: Expected ',' or ']' in JSON array".into(),
+                        return Err(Thrown::from_static(
+                            "SyntaxError: Expected ',' or ']' in JSON array",
                         ))
                     }
                 }
@@ -2583,8 +2591,8 @@ impl<'p> Vm<'p> {
             loop {
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b'"') {
-                    return Err(Thrown(
-                        "SyntaxError: Expected property name string in JSON".into(),
+                    return Err(Thrown::from_static(
+                        "SyntaxError: Expected property name string in JSON",
                     ));
                 }
                 // B233: same escape-free member-name read as the ordinary
@@ -2601,7 +2609,7 @@ impl<'p> Vm<'p> {
                 let key = escape_guest_key(key);
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
-                    return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));
+                    return Err(Thrown::from_static("SyntaxError: Expected ':' in JSON object"));
                 }
                 *i += 1;
                 json_skip_ws(b, i);
@@ -2617,7 +2625,7 @@ impl<'p> Vm<'p> {
                 // `{ "b": 2, "b": 1, "b": 4 }`).
                 if !srcs.contains_key(&key) {
                     srcs.try_reserve(1).map_err(|_| {
-                        Thrown("RangeError: JSON parse source-map allocation failed".into())
+                        Thrown::from_static("RangeError: JSON parse source-map allocation failed")
                     })?;
                 }
                 srcs.insert(key, s);
@@ -2626,8 +2634,8 @@ impl<'p> Vm<'p> {
                     Some(b',') => *i += 1,
                     Some(b'}') => break,
                     _ => {
-                        return Err(Thrown(
-                            "SyntaxError: Expected ',' or '}' in JSON object".into(),
+                        return Err(Thrown::from_static(
+                            "SyntaxError: Expected ',' or '}' in JSON object",
                         ))
                     }
                 }

@@ -404,8 +404,8 @@ impl<'p> Vm<'p> {
                 }
                 match self.py_table_set(recv, a0, v) {
                     Some(Ok(_)) => Ok(Some(recv)),
-                    Some(Err(())) => Err(Thrown("MemoryError: dict limit exceeded".into())),
-                    None => Err(Thrown("TypeError: unsupported attribute storage key".into())),
+                    Some(Err(())) => Err(Thrown::from_static("MemoryError: dict limit exceeded")),
+                    None => Err(Thrown::from_static("TypeError: unsupported attribute storage key")),
                 }
             }
             "delete" => {
@@ -429,7 +429,7 @@ impl<'p> Vm<'p> {
             }
             "forEach" => {
                 if !self.is_callable(a0) {
-                    return Err(Thrown("TypeError: Map.prototype.forEach callback is not a function".into()));
+                    return Err(Thrown::from_static("TypeError: Map.prototype.forEach callback is not a function"));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 // Live, as `Map.prototype.forEach` walks: each step reads the

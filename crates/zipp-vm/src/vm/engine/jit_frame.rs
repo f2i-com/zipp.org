@@ -467,8 +467,8 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn require_external_code_enabled(&self) -> Result<(), Thrown> {
         if self.external_code_disabled {
-            Err(Thrown(
-                "EvalError: external code is disabled by the host".into(),
+            Err(Thrown::from_static(
+                "EvalError: external code is disabled by the host",
             ))
         } else {
             Ok(())

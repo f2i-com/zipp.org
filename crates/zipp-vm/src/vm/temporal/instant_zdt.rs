@@ -13,8 +13,8 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn make_instant(&mut self, ns: i128) -> Result<Value, Thrown> {
         if ns.abs() > 8_640_000_000_000_000_000_000 {
-            return Err(Thrown(
-                "RangeError: Instant outside the supported range".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Instant outside the supported range",
             ));
         }
         let hi = (ns >> 64) as i64;
@@ -65,14 +65,14 @@ impl<'p> Vm<'p> {
             .to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?
             .to_i128_sat();
         if ns.abs() > 8_640_000_000_000_000_000_000 {
-            return Err(Thrown(
-                "RangeError: ZonedDateTime outside the supported range".into(),
+            return Err(Thrown::from_static(
+                "RangeError: ZonedDateTime outside the supported range",
             ));
         }
         let tzarg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         if tzarg == Value::UNDEFINED {
-            return Err(Thrown(
-                "TypeError: Temporal.ZonedDateTime requires a time zone".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Temporal.ZonedDateTime requires a time zone",
             ));
         }
         // The CONSTRUCTOR's time zone is an IDENTIFIER (ParseTimeZoneIdentifier):
@@ -151,9 +151,8 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         let cal = self.cal_of(idx);
         match name {
-            "valueOf" => Err(Thrown(
-                "TypeError: Called Temporal.ZonedDateTime.prototype.valueOf which always throws"
-                    .into(),
+            "valueOf" => Err(Thrown::from_static(
+                "TypeError: Called Temporal.ZonedDateTime.prototype.valueOf which always throws",
             )),
             "toString" => {
                 let opts = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -228,8 +227,8 @@ impl<'p> Vm<'p> {
                 // argument is REQUIRED: undefined is a TypeError here.
                 let cv = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if cv == Value::UNDEFINED {
-                    return Err(Thrown(
-                        "TypeError: withCalendar requires a calendar argument".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: withCalendar requires a calendar argument",
                     ));
                 }
                 let ncal = self.validate_calendar_value(cv)?;
@@ -288,7 +287,7 @@ impl<'p> Vm<'p> {
                     let (ay, am, ad) =
                         cal_add_year_month(cal, cy, cm, cd, dur[0] * sign, dur[1] * sign, reject)
                             .ok_or_else(|| {
-                            Thrown("RangeError: date arithmetic overflows the month".into())
+                            Thrown::from_static("RangeError: date arithmetic overflows the month")
                         })?;
                     let ed = cal_to_epoch_days(cal, ay, am, ad) + (dur[2] * 7 + dur[3]) * sign;
                     let local = (ed as i128) * DAY_NS
@@ -298,8 +297,8 @@ impl<'p> Vm<'p> {
                 // IsValidEpochNanoseconds: the result must lie within the supported
                 // instant range (matches the ZonedDateTime/Instant constructors).
                 if result_ns.abs() > NS_MAX_INSTANT {
-                    return Err(Thrown(
-                        "RangeError: ZonedDateTime result is outside the supported range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: ZonedDateTime result is outside the supported range",
                     ));
                 }
                 let off = tz_offset_ns_at(&id, result_ns);
@@ -311,17 +310,16 @@ impl<'p> Vm<'p> {
                 let other = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let oz = self.zoned_date_time_from(other, Value::UNDEFINED)?;
                 if self.cal_of(oz.heap_index()) != cal {
-                    return Err(Thrown(
-                        "RangeError: cannot compute a difference between date-times in different calendars"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: cannot compute a difference between date-times in different calendars",
                     ));
                 }
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 // GetOptionsObject: a defined non-object options bag is a TypeError
                 // (a primitive must not be read for properties / silently ignored).
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-                    return Err(Thrown(
-                        "TypeError: options must be an object or undefined".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: options must be an object or undefined",
                     ));
                 }
                 let all_units = &[
@@ -382,16 +380,16 @@ impl<'p> Vm<'p> {
                     largest_raw
                 };
                 if rank(&smallest) < rank(&largest) {
-                    return Err(Thrown(
-                        "RangeError: smallestUnit is larger than largestUnit".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: smallestUnit is larger than largestUnit",
                     ));
                 }
                 // A time-unit increment must evenly divide its next-highest unit
                 // (day/week/month/year carry no per-unit bound here).
                 if let Some(max) = max_increment(&smallest) {
                     if inc >= max || max % inc != 0 {
-                        return Err(Thrown(
-                            "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: roundingIncrement must evenly divide the next unit",
                         ));
                     }
                 }
@@ -418,9 +416,8 @@ impl<'p> Vm<'p> {
                     // Asia/Kolkata is the SAME zone (TimeZoneEquals compares
                     // primary identifiers).
                     if self.tz_canon(idx) != self.tz_canon(oz.heap_index()) {
-                        return Err(Thrown(
-                            "RangeError: cannot compute a calendar difference between ZonedDateTimes in different time zones"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: cannot compute a calendar difference between ZonedDateTimes in different time zones",
                         ));
                     }
                     if ns1 == ns2 {
@@ -463,9 +460,8 @@ impl<'p> Vm<'p> {
                     let start_ns = tz_start_of_day(&id, day0)?;
                     let end_ns = tz_start_of_day(&id, day0 + DAY_NS)?;
                     if start_ns.abs() > NS_MAX_INSTANT || end_ns.abs() > NS_MAX_INSTANT {
-                        return Err(Thrown(
-                            "RangeError: ZonedDateTime day boundary is outside the representable range"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: ZonedDateTime day boundary is outside the representable range",
                         ));
                     }
                     // The answer is one of the two boundaries, never a multiple of
@@ -559,13 +555,13 @@ impl<'p> Vm<'p> {
                 read_slot(self, "second", 5, &mut f, &mut any, &mut date_raw)?;
                 read_slot(self, "year", 0, &mut f, &mut any, &mut date_raw)?;
                 if !any && bag_off.is_none() {
-                    return Err(Thrown(
-                        "TypeError: with() requires at least one recognized property".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: with() requires at least one recognized property",
                     ));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown(
-                        "TypeError: era and eraYear must be given together".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: era and eraYear must be given together",
                     ));
                 }
                 // Merge the date in calendar space (NonIsoFieldKeysToIgnore: an
@@ -583,7 +579,7 @@ impl<'p> Vm<'p> {
                 // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
                 // rejected during field preparation, BEFORE the options bag is read.
                 if nm.floor() < 1 || nd < 1 {
-                    return Err(Thrown("RangeError: invalid date fields".into()));
+                    return Err(Thrown::from_static("RangeError: invalid date fields"));
                 }
                 // Validate the resolution options. ZonedDateTime.with defaults the offset
                 // option to "prefer" (unlike `from`, which defaults to "reject").
@@ -598,7 +594,7 @@ impl<'p> Vm<'p> {
                     )));
                 }
                 if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                    return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
                 }
                 // InterpretTemporalDateTimeFields: apply overflow to the upper bounds of
                 // the merged date/time fields ("reject" throws, "constrain" clamps).
@@ -606,14 +602,14 @@ impl<'p> Vm<'p> {
                 let (iy, im, id2) = nm
                     .ordinal(cal, ny, reject)
                     .and_then(|m| cal_date_to_iso(cal, ny, m, nd, reject))
-                    .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid date fields"))?;
                 f[0] = iy;
                 f[1] = im;
                 f[2] = id2;
                 if reject {
                     for (i, &mx) in maxes.iter().enumerate() {
                         if f[3 + i] < 0 || f[3 + i] > mx {
-                            return Err(Thrown("RangeError: time field out of range".into()));
+                            return Err(Thrown::from_static("RangeError: time field out of range"));
                         }
                     }
                 } else {
@@ -633,8 +629,8 @@ impl<'p> Vm<'p> {
                     interpret_iso_offset(&id, local, 2, merged_off, &disamb, &off_opt, false)?;
                 // The resulting instant must be representable (the ±nsMaxInstant bound).
                 if instant.abs() > NS_MAX_INSTANT {
-                    return Err(Thrown(
-                        "RangeError: ZonedDateTime outside the supported range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: ZonedDateTime outside the supported range",
                     ));
                 }
                 let off = tz_offset_ns_at(&id, instant);
@@ -654,8 +650,8 @@ impl<'p> Vm<'p> {
         src: u32,
     ) -> Result<Value, Thrown> {
         if ns.abs() > NS_MAX_INSTANT {
-            return Err(Thrown(
-                "RangeError: ZonedDateTime is outside the representable range".into(),
+            return Err(Thrown::from_static(
+                "RangeError: ZonedDateTime is outside the representable range",
             ));
         }
         let _gc = self.gc_lock_guard();
@@ -707,9 +703,8 @@ impl<'p> Vm<'p> {
                 // InterpretTemporalDateTimeFields.
                 let bag = self.read_pdt_bag(item, true)?;
                 if bag.tz == Value::UNDEFINED {
-                    return Err(Thrown(
-                        "TypeError: Temporal.ZonedDateTime.from requires a timeZone property"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Temporal.ZonedDateTime.from requires a timeZone property",
                     ));
                 }
                 // ToTemporalTimeZoneIdentifier: a string is parsed, a wrong type
@@ -744,8 +739,8 @@ impl<'p> Vm<'p> {
         // heap value (Symbol) — is a TypeError per ToTemporalZonedDateTime, NOT a failed
         // string parse (RangeError). This also precedes reading the options bag.
         if !(item.is_heap() && self.heap.is_str_like(item.heap_index())) {
-            return Err(Thrown(
-                "TypeError: ZonedDateTime.from argument must be an object or string".into(),
+            return Err(Thrown::from_static(
+                "TypeError: ZonedDateTime.from argument must be an object or string",
             ));
         }
         let s = self.to_js_string(item)?;
@@ -770,8 +765,8 @@ impl<'p> Vm<'p> {
             && matches!(off_opt.as_str(), "prefer" | "reject")
             && iso_to_epoch_days(f[0], f[1], f[2]).abs() > 100_000_000
         {
-            return Err(Thrown(
-                "RangeError: ZonedDateTime is outside the representable range".into(),
+            return Err(Thrown::from_static(
+                "RangeError: ZonedDateTime is outside the representable range",
             ));
         }
         let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
@@ -807,8 +802,8 @@ impl<'p> Vm<'p> {
         id: String,
     ) -> Result<Value, Thrown> {
         if ns.abs() > NS_MAX_INSTANT {
-            return Err(Thrown(
-                "RangeError: ZonedDateTime is outside the representable range".into(),
+            return Err(Thrown::from_static(
+                "RangeError: ZonedDateTime is outside the representable range",
             ));
         }
         let hi = (ns >> 64) as i64;
@@ -834,7 +829,7 @@ impl<'p> Vm<'p> {
         let tz = if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
             let t = self.get_prop(v, "timeZone")?;
             if t == Value::UNDEFINED {
-                return Err(Thrown("TypeError: a timeZone is required".into()));
+                return Err(Thrown::from_static("TypeError: a timeZone is required"));
             }
             t
         } else {
@@ -857,8 +852,8 @@ impl<'p> Vm<'p> {
                     .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{s}\"")));
             }
         }
-        Err(Thrown(
-            "TypeError: timeZone is not a string or object".into(),
+        Err(Thrown::from_static(
+            "TypeError: timeZone is not a string or object",
         ))
     }
 
@@ -883,12 +878,12 @@ impl<'p> Vm<'p> {
         } else if self.is_object_value(arg) {
             self.get_prop(arg, "direction")?
         } else {
-            return Err(Thrown(
-                "TypeError: direction must be a string or an options object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: direction must be a string or an options object",
             ));
         };
         if dir_v == Value::UNDEFINED {
-            return Err(Thrown("RangeError: a direction option is required".into()));
+            return Err(Thrown::from_static("RangeError: a direction option is required"));
         }
         let s = self.to_js_string(dir_v)?;
         if s != "next" && s != "previous" {
@@ -1064,7 +1059,7 @@ impl<'p> Vm<'p> {
         // non-string (null/boolean/number/bigint/symbol) is a TypeError.
         let is_string = offv.is_heap() && self.heap.is_str_like(offv.heap_index());
         if !is_string && !self.is_object_value(offv) {
-            return Err(Thrown("TypeError: offset must be a string".into()));
+            return Err(Thrown::from_static("TypeError: offset must be a string"));
         }
         let offs = self.to_js_string(offv)?;
         if !valid_offset_string(&offs) {
@@ -1087,8 +1082,8 @@ impl<'p> Vm<'p> {
     ) -> Result<f64, Thrown> {
         // GetOptionsObject: a non-undefined options must be an object.
         if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-            return Err(Thrown(
-                "TypeError: options must be an object or undefined".into(),
+            return Err(Thrown::from_static(
+                "TypeError: options must be an object or undefined",
             ));
         }
         let rel = if opts == Value::UNDEFINED {
@@ -1143,8 +1138,8 @@ impl<'p> Vm<'p> {
             return Ok(order(e1, e2));
         }
         if fa[..3].iter().any(|&x| x != 0.0) || fb[..3].iter().any(|&x| x != 0.0) {
-            return Err(Thrown(
-                "RangeError: a relativeTo option is required for years, months, or weeks".into(),
+            return Err(Thrown::from_static(
+                "RangeError: a relativeTo option is required for years, months, or weeks",
             ));
         }
         Ok(order(dur_day_time_ns(&fa), dur_day_time_ns(&fb)))
@@ -1282,8 +1277,8 @@ impl<'p> Vm<'p> {
             )
         } else {
             if !self.is_object_value(options) {
-                return Err(Thrown(
-                    "TypeError: options must be an object or undefined".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: options must be an object or undefined",
                 ));
             }
             let cal_suf = self.calendar_name_suffix(options, self.cal_of(idx))?;
@@ -1365,8 +1360,8 @@ impl<'p> Vm<'p> {
                 return self.parse_instant_string(&s);
             }
         }
-        Err(Thrown(
-            "TypeError: cannot convert value to a Temporal.Instant".into(),
+        Err(Thrown::from_static(
+            "TypeError: cannot convert value to a Temporal.Instant",
         ))
     }
 
@@ -1408,8 +1403,8 @@ impl<'p> Vm<'p> {
                     ((1, -1, false), "trunc".to_string(), None)
                 } else {
                     if !self.is_object_value(a0) {
-                        return Err(Thrown(
-                            "TypeError: options must be an object or undefined".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: options must be an object or undefined",
                         ));
                     }
                     let fsd = self.read_fsd(a0)?;
@@ -1445,8 +1440,8 @@ impl<'p> Vm<'p> {
                 );
                 Ok(Some(self.alloc_str(s)))
             }
-            "valueOf" => Err(Thrown(
-                "TypeError: Called Temporal.Instant.prototype.valueOf".into(),
+            "valueOf" => Err(Thrown::from_static(
+                "TypeError: Called Temporal.Instant.prototype.valueOf",
             )),
             "equals" => {
                 let o = self.to_instant_ns(a0)?;
@@ -1463,9 +1458,8 @@ impl<'p> Vm<'p> {
                 // conversion is exact.
                 let dur = self.to_duration_f64(a0)?;
                 if dur[0] != 0.0 || dur[1] != 0.0 || dur[2] != 0.0 || dur[3] != 0.0 {
-                    return Err(Thrown(
-                        "RangeError: Instant arithmetic does not accept calendar (date) units"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: Instant arithmetic does not accept calendar (date) units",
                     ));
                 }
                 let sign: i128 = if name == "add" { 1 } else { -1 };
@@ -1505,8 +1499,8 @@ impl<'p> Vm<'p> {
                 let inc_ns = unit_ns(&su) * inc;
                 // Instant rounding increments must evenly divide a 24-hour day.
                 if DAY_NS % inc_ns != 0 {
-                    return Err(Thrown(
-                        "RangeError: roundingIncrement does not divide evenly into a day".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: roundingIncrement does not divide evenly into a day",
                     ));
                 }
                 let rounded = round_increment_as_if_positive(ns, inc_ns, &mode);

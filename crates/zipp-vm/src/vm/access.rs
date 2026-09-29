@@ -251,6 +251,9 @@ impl<'p> Vm<'p> {
     /// waterfall, which is what shipped before this wave.
     #[inline]
     fn delete_fastpath_enabled() -> bool {
+        if crate::WASM_STATIC_SWITCHES {
+            return true;
+        }
         use std::sync::atomic::{AtomicU8, Ordering};
         static STATE: AtomicU8 = AtomicU8::new(0);
         match STATE.load(Ordering::Relaxed) {

@@ -49,7 +49,7 @@ impl<'p> Vm<'p> {
         let work = a
             .len()
             .checked_add(b.len())
-            .ok_or_else(|| Thrown("RangeError: native builtin iteration limit exceeded".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: native builtin iteration limit exceeded"))?;
         self.preflight_native_iteration_work(work as u64)?;
         let ignore_punct = self.intl_slot(resolved, "ignorePunctuation") == Value::bool(true);
         let sens = self.display(self.intl_slot(resolved, "sensitivity"));
@@ -69,7 +69,7 @@ impl<'p> Vm<'p> {
             .and_then(|n| n.checked_add(b_lengths.1))
             .and_then(|n| n.checked_add(b_lengths.2))
             .filter(|&n| n <= MAX_STRING_BYTES)
-            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
         self.preflight_guest_string_size(key_bytes)?;
         let (ka, kb) = (
             collation_key(a, opts, a_lengths)?,
@@ -196,7 +196,7 @@ fn collation_key_lengths(s: &str, opts: KeyOptions) -> Result<(usize, usize, usi
             if !run.is_empty() {
                 primary = primary
                     .checked_add(numeric_run_len(&run))
-                    .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
                 run.clear();
             }
         }
@@ -206,28 +206,28 @@ fn collation_key_lengths(s: &str, opts: KeyOptions) -> Result<(usize, usize, usi
         if unicode_normalization::char::is_combining_mark(c) {
             secondary = secondary
                 .checked_add(c.len_utf8())
-                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
             continue;
         }
         for mapped in c.to_lowercase() {
             primary = primary
                 .checked_add(mapped.len_utf8())
-                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
         }
         case = case
             .checked_add(1)
-            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
     }
     if !run.is_empty() {
         primary = primary
             .checked_add(numeric_run_len(&run))
-            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
     }
     primary
         .checked_add(secondary)
         .and_then(|n| n.checked_add(case))
         .filter(|&n| n <= MAX_STRING_BYTES)
-        .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+        .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
     Ok((primary, secondary, case))
 }
 
@@ -240,14 +240,14 @@ fn collation_key(
     let mut primary = String::new();
     primary
         .try_reserve_exact(lengths.0)
-        .map_err(|_| Thrown("RangeError: collation allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: collation allocation failed"))?;
     let mut secondary = String::new();
     secondary
         .try_reserve_exact(lengths.1)
-        .map_err(|_| Thrown("RangeError: collation allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: collation allocation failed"))?;
     let mut case = Vec::new();
     case.try_reserve_exact(lengths.2)
-        .map_err(|_| Thrown("RangeError: collation allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: collation allocation failed"))?;
     let mut run: Vec<u8> = Vec::new();
     for c in s.nfd() {
         if opts.numeric {

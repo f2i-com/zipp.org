@@ -73,8 +73,8 @@ impl<'p> Vm<'p> {
             None => self.get_prop(c, "prototype")?,
         };
         if !self.is_object_value(p) {
-            return Err(Thrown(
-                "TypeError: Function has non-object prototype in instanceof check".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Function has non-object prototype in instanceof check",
             ));
         }
         // Walk V's prototype chain via [[GetPrototypeOf]] (proxy-trap-aware): a
@@ -289,8 +289,8 @@ impl<'p> Vm<'p> {
             self.frames.last().map(|f| f.super_done).unwrap_or(false)
         };
         if already {
-            return Err(Thrown(
-                "ReferenceError: super constructor may only be called once".into(),
+            return Err(Thrown::from_static(
+                "ReferenceError: super constructor may only be called once",
             ));
         }
         if produced.is_heap() {
@@ -477,8 +477,8 @@ impl<'p> Vm<'p> {
                     // (staging/sm/class/superCall{BaseInvoked,ProperBase}.js).
                     if self.proxy_parts(cval.heap_index()).is_some() {
                         if !self.is_constructor(cval) {
-                            return Err(Thrown(
-                                "TypeError: the superclass is not a constructor".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: the superclass is not a constructor",
                             ));
                         }
                         return self.construct_with_newtarget(cval, args, new_target);
@@ -492,8 +492,8 @@ impl<'p> Vm<'p> {
                         HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
                     ) {
                         if !self.is_constructor(cval) {
-                            return Err(Thrown(
-                                "TypeError: the superclass is not a constructor".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: the superclass is not a constructor",
                             ));
                         }
                         self.pending_new_target = new_target;

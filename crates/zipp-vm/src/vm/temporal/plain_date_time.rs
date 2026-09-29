@@ -19,7 +19,7 @@ impl<'p> Vm<'p> {
             || !(0..1000).contains(&f[8])
             || !iso_datetime_ns_in_range(f)
         {
-            return Err(Thrown("RangeError: invalid PlainDateTime value".into()));
+            return Err(Thrown::from_static("RangeError: invalid PlainDateTime value"));
         }
         let idx = self.heap.alloc(HeapObj::Temporal {
             kind: 3,
@@ -77,8 +77,8 @@ impl<'p> Vm<'p> {
                 return Ok((self.finish_pdt_fields(&bag, false)?, cal));
             }
         }
-        Err(Thrown(
-            "TypeError: cannot convert value to a Temporal.PlainDateTime".into(),
+        Err(Thrown::from_static(
+            "TypeError: cannot convert value to a Temporal.PlainDateTime",
         ))
     }
 
@@ -91,8 +91,8 @@ impl<'p> Vm<'p> {
     pub(crate) fn to_plain_date_time_limited(&mut self, v: Value) -> Result<[i64; 9], Thrown> {
         let f = self.to_plain_date_time(v)?;
         if !iso_datetime_ns_in_range(f) {
-            return Err(Thrown(
-                "RangeError: date-time is outside the representable range".into(),
+            return Err(Thrown::from_static(
+                "RangeError: date-time is outside the representable range",
             ));
         }
         Ok(f)
@@ -123,8 +123,8 @@ impl<'p> Vm<'p> {
                 return self.finish_pdt_fields(&bag, reject);
             }
         }
-        Err(Thrown(
-            "TypeError: cannot convert value to a Temporal.PlainDateTime".into(),
+        Err(Thrown::from_static(
+            "TypeError: cannot convert value to a Temporal.PlainDateTime",
         ))
     }
 
@@ -202,13 +202,13 @@ impl<'p> Vm<'p> {
         // required-field check accepts either.
         if !have_date[1] || !have_date[2] || (!have_date[0] && era.is_none() && era_year.is_none())
         {
-            return Err(Thrown(
-                "TypeError: PlainDateTime-like requires year, month, day".into(),
+            return Err(Thrown::from_static(
+                "TypeError: PlainDateTime-like requires year, month, day",
             ));
         }
         if era.is_some() != era_year.is_some() {
-            return Err(Thrown(
-                "TypeError: era and eraYear must be given together".into(),
+            return Err(Thrown::from_static(
+                "TypeError: era and eraYear must be given together",
             ));
         }
         let year = if have_date[0] { Some(f[0]) } else { None };
@@ -240,27 +240,27 @@ impl<'p> Vm<'p> {
             )));
         }
         if !cal_month_fields_agree(cal, y, bag.month, bag.month_conflict) {
-            return Err(Thrown("RangeError: month and monthCode must agree".into()));
+            return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
         }
         // date: month/day; time: hour..nanosecond (maxes 23/59/59/999/999/999).
         let maxes = [23, 59, 59, 999, 999, 999];
         // month/day below 1 is a hard floor that rejects under either overflow
         // mode (time fields legitimately clamp up from 0).
         if f[1] < 1 || f[2] < 1 {
-            return Err(Thrown("RangeError: invalid date fields".into()));
+            return Err(Thrown::from_static("RangeError: invalid date fields"));
         }
         let (iy, im, id) = bag
             .month
             .ordinal(cal, y, reject)
             .and_then(|m| cal_date_to_iso(cal, y, m, f[2], reject))
-            .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: invalid date fields"))?;
         f[0] = iy;
         f[1] = im;
         f[2] = id;
         if reject {
             for (i, &mx) in maxes.iter().enumerate() {
                 if f[3 + i] < 0 || f[3 + i] > mx {
-                    return Err(Thrown("RangeError: time field out of range".into()));
+                    return Err(Thrown::from_static("RangeError: time field out of range"));
                 }
             }
         } else {
@@ -312,9 +312,8 @@ impl<'p> Vm<'p> {
                 // ISODateTimeWithinLimits (a day carry at the boundary can push an
                 // in-range datetime exactly onto the exclusive limit).
                 if !iso_datetime_ns_in_range([ny, nm, nd, t[0], t[1], t[2], t[3], t[4], t[5]]) {
-                    return Err(Thrown(
-                        "RangeError: rounded PlainDateTime is outside the representable range"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: rounded PlainDateTime is outside the representable range",
                     ));
                 }
                 let s = format!(
@@ -325,14 +324,14 @@ impl<'p> Vm<'p> {
                 );
                 Ok(Some(self.alloc_str(s)))
             }
-            "valueOf" => Err(Thrown(
-                "TypeError: Called Temporal.PlainDateTime.prototype.valueOf".into(),
+            "valueOf" => Err(Thrown::from_static(
+                "TypeError: Called Temporal.PlainDateTime.prototype.valueOf",
             )),
             "equals" => {
                 let (o, ocal) = self.to_plain_date_time_cal(a0)?;
                 if !iso_datetime_ns_in_range(o) {
-                    return Err(Thrown(
-                        "RangeError: date-time is outside the representable range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: date-time is outside the representable range",
                     ));
                 }
                 Ok(Some(Value::bool(f == o && cal == ocal)))
@@ -354,8 +353,8 @@ impl<'p> Vm<'p> {
                 // argument is required (validate_calendar_value allows undefined for
                 // an optional field-bag calendar, so guard here, not there).
                 if a0 == Value::UNDEFINED {
-                    return Err(Thrown(
-                        "TypeError: withCalendar requires a calendar argument".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: withCalendar requires a calendar argument",
                     ));
                 }
                 let ncal = self.validate_calendar_value(a0)?;
@@ -388,8 +387,8 @@ impl<'p> Vm<'p> {
                 // reads only options.disambiguation per spec) before building.
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-                    return Err(Thrown(
-                        "TypeError: options must be an object or undefined".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: options must be an object or undefined",
                     ));
                 }
                 let disamb = self.opt_string(
@@ -456,11 +455,11 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if !any {
-                    return Err(Thrown("TypeError: with() requires a partial object".into()));
+                    return Err(Thrown::from_static("TypeError: with() requires a partial object"));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown(
-                        "TypeError: era and eraYear must be given together".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: era and eraYear must be given together",
                     ));
                 }
                 let mut nf = f;
@@ -484,7 +483,7 @@ impl<'p> Vm<'p> {
                 // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
                 // rejected during field preparation, BEFORE the options bag is read.
                 if nm.floor() < 1 || nd < 1 {
-                    return Err(Thrown("RangeError: invalid date fields".into()));
+                    return Err(Thrown::from_static("RangeError: invalid date fields"));
                 }
                 let reject =
                     self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
@@ -497,12 +496,12 @@ impl<'p> Vm<'p> {
                     )));
                 }
                 if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                    return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
                 }
                 let (iy, im, id) = nm
                     .ordinal(cal, ny, reject)
                     .and_then(|m| cal_date_to_iso(cal, ny, m, nd, reject))
-                    .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid date fields"))?;
                 nf[0] = iy;
                 nf[1] = im;
                 nf[2] = id;
@@ -537,7 +536,7 @@ impl<'p> Vm<'p> {
                 let (ay, am, ad) =
                     cal_add_year_month(cal, cy, cm, cd, dur[0] * sign, dur[1] * sign, reject)
                         .ok_or_else(|| {
-                            Thrown("RangeError: date arithmetic overflows the month".into())
+                            Thrown::from_static("RangeError: date arithmetic overflows the month")
                         })?;
                 let ed = cal_to_epoch_days(cal, ay, am, ad) + (dur[2] * 7 + dur[3]) * sign + carry;
                 let (ny, nm, nd) = epoch_days_to_iso(ed);
@@ -548,20 +547,19 @@ impl<'p> Vm<'p> {
             "until" | "since" => {
                 let (o, ocal) = self.to_plain_date_time_cal(a0)?;
                 if !iso_datetime_ns_in_range(o) {
-                    return Err(Thrown(
-                        "RangeError: date-time is outside the representable range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: date-time is outside the representable range",
                     ));
                 }
                 if ocal != cal {
-                    return Err(Thrown(
-                        "RangeError: cannot compute a difference between date-times in different calendars"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: cannot compute a difference between date-times in different calendars",
                     ));
                 }
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-                    return Err(Thrown(
-                        "TypeError: options must be an object or undefined".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: options must be an object or undefined",
                     ));
                 }
                 let all_units = &[
@@ -622,16 +620,16 @@ impl<'p> Vm<'p> {
                     largest_raw
                 };
                 if rank(&smallest) < rank(&largest) {
-                    return Err(Thrown(
-                        "RangeError: smallestUnit is larger than largestUnit".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: smallestUnit is larger than largestUnit",
                     ));
                 }
                 // A time-unit increment must evenly divide its next-highest unit
                 // (day/week/month/year carry no per-unit bound here).
                 if let Some(max) = max_increment(&smallest) {
                     if inc >= max || max % inc != 0 {
-                        return Err(Thrown(
-                            "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: roundingIncrement must evenly divide the next unit",
                         ));
                     }
                 }

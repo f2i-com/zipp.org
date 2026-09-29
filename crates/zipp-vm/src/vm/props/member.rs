@@ -1136,8 +1136,8 @@ impl<'p> Vm<'p> {
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
                 if revoked {
-                    return Err(Thrown(
-                        "TypeError: Cannot perform 'get' on a revoked proxy".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot perform 'get' on a revoked proxy",
                     ));
                 }
                 return match self.proxy_trap(handler, "get")? {
@@ -1156,10 +1156,10 @@ impl<'p> Vm<'p> {
                             self.proxy_target_desc(target, key)?
                         {
                             if is_data && !writable && !self.same_value(r, value) {
-                                return Err(Thrown("TypeError: 'get' on proxy: property is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value".into()));
+                                return Err(Thrown::from_static("TypeError: 'get' on proxy: property is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value"));
                             }
                             if !is_data && !has_get && r != Value::UNDEFINED {
-                                return Err(Thrown("TypeError: 'get' on proxy: property is a non-configurable accessor property on the proxy target and does not have a getter function".into()));
+                                return Err(Thrown::from_static("TypeError: 'get' on proxy: property is a non-configurable accessor property on the proxy target and does not have a getter function"));
                             }
                         }
                         Ok(r)
@@ -1868,9 +1868,8 @@ impl<'p> Vm<'p> {
                     // GetStartOfDay throws for BOTH boundaries: a nonzero offset can
                     // push today's local midnight itself past the instant range.
                     if today_start.abs() > NS_MAX || tomorrow_start.abs() > NS_MAX {
-                        return Err(Thrown(
-                            "RangeError: ZonedDateTime hoursInDay is outside the representable range"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: ZonedDateTime hoursInDay is outside the representable range",
                         ));
                     }
                     Value::num((tomorrow_start - today_start) as f64 / 3_600_000_000_000.0)

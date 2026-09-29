@@ -178,8 +178,8 @@ impl<'p> Vm<'p> {
                 ..
             }) => Arc::clone(m),
             _ => {
-                return Err(Thrown(
-                    "TypeError: $262.agent.broadcast requires a SharedArrayBuffer".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: $262.agent.broadcast requires a SharedArrayBuffer",
                 ))
             }
         };
@@ -253,8 +253,8 @@ impl<'p> Vm<'p> {
     /// single-agent contract. Use the existing host-policy error so callers get
     /// a catchable JS exception instead of wasm's unsupported-thread trap.
     pub(crate) fn agent_start(&mut self, _src: String) -> Result<(), Thrown> {
-        Err(Thrown(
-            "EvalError: external code is disabled by the host".into(),
+        Err(Thrown::from_static(
+            "EvalError: external code is disabled by the host",
         ))
     }
 
@@ -266,8 +266,8 @@ impl<'p> Vm<'p> {
                 data: AbData::Shared(_),
                 ..
             }) => Ok(()),
-            _ => Err(Thrown(
-                "TypeError: $262.agent.broadcast requires a SharedArrayBuffer".into(),
+            _ => Err(Thrown::from_static(
+                "TypeError: $262.agent.broadcast requires a SharedArrayBuffer",
             )),
         }
     }

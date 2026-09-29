@@ -252,11 +252,10 @@ impl<'p> Vm<'p> {
             let idx = v.heap_index();
             let day_ms = |y: i64, m: i64, d: i64| iso_to_epoch_days(y, m, d) as f64 * 86_400_000.0;
             return match kind {
-                7 => Err(Thrown(
-                    "TypeError: Intl.DateTimeFormat does not support Temporal.ZonedDateTime; use toLocaleString()"
-                        .into(),
+                7 => Err(Thrown::from_static(
+                    "TypeError: Intl.DateTimeFormat does not support Temporal.ZonedDateTime; use toLocaleString()",
                 )),
-                0 => Err(Thrown("TypeError: Temporal.Duration is not a date-time value".into())),
+                0 => Err(Thrown::from_static("TypeError: Temporal.Duration is not a date-time value")),
                 1 => {
                     let (y, m, d) = self.plain_date_fields(idx).unwrap_or((1970, 1, 1));
                     Ok(day_ms(y, m, d))
@@ -294,7 +293,7 @@ impl<'p> Vm<'p> {
         // that a NaN would otherwise produce (`argument-tonumber-throws`).
         let n = self.to_number_strict(v)?;
         if !n.is_finite() || n.abs() > 8.64e15 {
-            return Err(Thrown("RangeError: date value is not finite".into()));
+            return Err(Thrown::from_static("RangeError: date value is not finite"));
         }
         let t = n.trunc();
         Ok(if t == 0.0 { 0.0 } else { t })
@@ -1291,9 +1290,8 @@ impl<'p> Vm<'p> {
                 self.require_object_coercible(options)?;
                 let o = self.to_object(options)?;
                 if self.get_prop(o, "timeZone")? != Value::UNDEFINED {
-                    return Err(Thrown(
-                        "TypeError: ZonedDateTime.toLocaleString does not accept a timeZone option"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: ZonedDateTime.toLocaleString does not accept a timeZone option",
                     ));
                 }
             }

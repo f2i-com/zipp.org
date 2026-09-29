@@ -108,13 +108,13 @@ impl<'p> Vm<'p> {
                 // reports staleness even when handed a non-function.
                 let stale = self.dec_of(class).map(|d| d.gen != my_gen).unwrap_or(true);
                 if stale {
-                    return Err(Thrown(
-                        "TypeError: addInitializer called after decoration completed".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: addInitializer called after decoration completed",
                     ));
                 }
                 if !self.is_callable(a0) {
-                    return Err(Thrown(
-                        "TypeError: addInitializer expects a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: addInitializer expects a function",
                     ));
                 }
                 // The class can already be old after the decorator call while
@@ -144,9 +144,8 @@ impl<'p> Vm<'p> {
             // first match.
             native::REGEXP_LEGACY_GET => {
                 if !(_this.is_heap() && _this.heap_index() == self.regexp_ctor) {
-                    return Err(Thrown(
-                        "TypeError: RegExp legacy static getter called on a non-%RegExp% receiver"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp legacy static getter called on a non-%RegExp% receiver",
                     ));
                 }
                 let slot = state[0].as_f64() as usize;
@@ -162,7 +161,7 @@ impl<'p> Vm<'p> {
                     None => Ok(self.alloc_str(String::new())),
                 }
             }
-            _ => Err(Thrown("TypeError: unknown native closure".into())),
+            _ => Err(Thrown::from_static("TypeError: unknown native closure")),
         }
     }
 
@@ -186,8 +185,8 @@ impl<'p> Vm<'p> {
         // throw a TypeError" — before the key is even consulted, so
         // `access.get("str")` throws rather than reading String.prototype.
         if !self.is_object_value(target) {
-            return Err(Thrown(
-                "TypeError: decorator access expects an object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: decorator access expects an object",
             ));
         }
         if !is_private {
@@ -729,9 +728,8 @@ impl<'p> Vm<'p> {
                             d.field_inits[elem].insert(0, out);
                         }
                     } else if !out.is_undefined() {
-                        return Err(Thrown(
-                            "TypeError: a field decorator must return a function or undefined"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: a field decorator must return a function or undefined",
                         ));
                     }
                 }
@@ -743,9 +741,8 @@ impl<'p> Vm<'p> {
                         continue;
                     }
                     if !self.is_object_value(out) {
-                        return Err(Thrown(
-                            "TypeError: an accessor decorator must return an object or undefined"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: an accessor decorator must return an object or undefined",
                         ));
                     }
                     let g = self.get_prop(out, "get")?;
@@ -793,9 +790,8 @@ impl<'p> Vm<'p> {
                         continue;
                     }
                     if !self.is_callable(out) {
-                        return Err(Thrown(
-                            "TypeError: a method decorator must return a function or undefined"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: a method decorator must return a function or undefined",
                         ));
                     }
                     value = out;
@@ -845,9 +841,8 @@ impl<'p> Vm<'p> {
                     continue;
                 }
                 if !self.is_callable(out) {
-                    return Err(Thrown(
-                        "TypeError: a class decorator must return a constructor or undefined"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: a class decorator must return a constructor or undefined",
                     ));
                 }
                 cur = out;

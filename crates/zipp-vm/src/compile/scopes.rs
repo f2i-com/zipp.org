@@ -848,6 +848,9 @@ pub(crate) const KIND_NUM: u8 = 2;
 /// booleans and global receivers share the ordinary scratch stack (and
 /// tokenizer loops decline the INT tier). Read once per process.
 pub(crate) fn reg_classes_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {

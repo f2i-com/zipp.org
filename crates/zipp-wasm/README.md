@@ -79,7 +79,7 @@ These are deterministic core-language defaults, not locale-aware formatting.
 execution speed for size. Use `--release --features lite` for the same feature
 set with throughput-oriented optimization. Standard builds keep `--release`.
 
-See [the size audit](../../docs/validation/2026-09-29-engine-size-audit.md)
+See [the latest size audit](../../docs/validation/2026-09-29-engine-size-round3.md)
 for measured sizes, speed tradeoffs and the remaining gap to QuickJS. To test
 the built Lite package, generate a Node package with wasm-bindgen and run
 `tests/node/lite.cjs` using `pkg-redirect.cjs` / `ZIPP_PKG` (see the Node test README).
@@ -256,17 +256,17 @@ have identical import/export surfaces; the selected module retains the audited
 checks that the browser module is byte-identical to the tested Node module.
 
 Measured on 2026-09-29 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
-after the compiler/sorter reductions in this branch:
+after the third size-reduction pass in this branch:
 
 | Variant | Before post-processing, raw / Brotli | Selected, raw / Brotli |
 | --- | ---: | ---: |
-| Lite | 3,069,790 / 779,930 | 2,952,989 / 776,971 |
-| JavaScript | 5,520,514 / 1,325,492 | 5,356,850 / 1,322,063 |
-| Python-base | 7,233,449 / 1,699,219 | 7,036,528 / 1,693,025 |
-| Python + Torch | 9,192,920 / 2,047,178 | 8,991,628 / 2,037,775 |
+| Lite | 3,059,311 / 777,857 | 2,942,452 / 774,683 |
+| JavaScript | 5,489,924 / 1,317,137 | 5,326,416 / 1,313,817 |
+| Python-base | 7,197,923 / 1,691,625 | 7,001,211 / 1,685,440 |
+| Python + Torch | 9,157,319 / 2,037,425 | 8,956,302 / 2,030,875 |
 
 These are module bytes, excluding JS glue; Brotli is the download size. See the
-[second size audit](../../docs/validation/2026-09-29-engine-size-round2.md)
+[third size audit](../../docs/validation/2026-09-29-engine-size-round3.md)
 for baseline deltas, performance measurements, validation and remaining gaps.
 
 Stronger optimization is not automatically better. Earlier `-O3` / `-Oz`

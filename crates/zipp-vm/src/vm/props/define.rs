@@ -37,8 +37,8 @@ impl<'p> Vm<'p> {
     ) -> Result<(), Thrown> {
         self.defer_check(obj, key)?;
         if !obj.is_heap() {
-            return Err(Thrown(
-                "TypeError: Object.defineProperty called on non-object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Object.defineProperty called on non-object",
             ));
         }
         self.note_array_proto_index(obj.heap_index(), key);
@@ -132,8 +132,8 @@ impl<'p> Vm<'p> {
         // failed (Object.defineProperty throws, Reflect.defineProperty -> false).
         if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
             if revoked {
-                return Err(Thrown(
-                    "TypeError: Cannot perform 'defineProperty' on a revoked proxy".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform 'defineProperty' on a revoked proxy",
                 ));
             }
             return match self.proxy_trap(handler, "defineProperty")? {
@@ -358,8 +358,8 @@ impl<'p> Vm<'p> {
                                 && (d_wr == Some(true)
                                     || value.is_some_and(|v| !self.same_value(v, curv))));
                         if changes {
-                            return Err(Thrown(
-                                "TypeError: Cannot redefine property: length".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: Cannot redefine property: length",
                             ));
                         }
                     }
@@ -416,7 +416,7 @@ impl<'p> Vm<'p> {
                     };
                     let number_len = self.to_number_strict(v)?; // numberLen = ToNumber(value)
                     if u != number_len {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
                     Some(u as usize)
                 } else {
@@ -424,7 +424,7 @@ impl<'p> Vm<'p> {
                 };
                 // Reject making `length` configurable or enumerable, or an accessor.
                 if get.is_some() || set.is_some() || d_cf == Some(true) || d_en == Some(true) {
-                    return Err(Thrown("TypeError: Cannot redefine property: length".into()));
+                    return Err(Thrown::from_static("TypeError: Cannot redefine property: length"));
                 }
                 let cur_writable = !self.array_length_nonwritable.contains(&idx);
                 let cur_len = self.js_array_len(idx);
@@ -432,12 +432,12 @@ impl<'p> Vm<'p> {
                 // again, and its value can only be "redefined" to the SAME length.
                 if !cur_writable {
                     if d_wr == Some(true) {
-                        return Err(Thrown("TypeError: Cannot redefine property: length".into()));
+                        return Err(Thrown::from_static("TypeError: Cannot redefine property: length"));
                     }
                     if let Some(nl) = new_len {
                         if nl != cur_len {
-                            return Err(Thrown(
-                                "TypeError: Cannot redefine property: length".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: Cannot redefine property: length",
                             ));
                         }
                     }
@@ -469,7 +469,7 @@ impl<'p> Vm<'p> {
                         if d_wr == Some(false) {
                             self.array_length_nonwritable.insert(idx);
                         }
-                        return Err(Thrown("TypeError: Cannot redefine property: length".into()));
+                        return Err(Thrown::from_static("TypeError: Cannot redefine property: length"));
                     }
                 }
                 // Record a newly non-writable length (writable was true above) so
@@ -564,8 +564,8 @@ impl<'p> Vm<'p> {
             | HeapObj::Symbol { .. }
             | HeapObj::BigInt(_)
             | HeapObj::BigIntBig(_) => {
-                return Err(Thrown(
-                    "TypeError: Object.defineProperty called on non-object".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Object.defineProperty called on non-object",
                 ));
             }
             _ => 3, // Array named prop + exotic objects -> arr_props side table
@@ -588,24 +588,24 @@ impl<'p> Vm<'p> {
             // redefinition (a data-value redefine stays accepted-but-unmodelled).
             let (v, get, set, wr, d_en, d_cf) = self.read_descriptor(desc)?;
             if get.is_some() || set.is_some() || d_cf == Some(true) || d_en == Some(true) {
-                return Err(Thrown(
-                    "TypeError: Cannot redefine property: prototype".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot redefine property: prototype",
                 ));
             }
             let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
             // A class's `prototype` is also non-writable: it cannot become
             // writable, and only the same value may be restated.
             if is_class && wr == Some(true) {
-                return Err(Thrown(
-                    "TypeError: Cannot redefine property: prototype".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot redefine property: prototype",
                 ));
             }
             if let Some(v) = v {
                 if is_class {
                     let cur = self.prototype_of(obj).unwrap_or(Value::UNDEFINED);
                     if !self.same_value(v, cur) {
-                        return Err(Thrown(
-                            "TypeError: Cannot redefine property: prototype".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Cannot redefine property: prototype",
                         ));
                     }
                 } else {
@@ -921,27 +921,27 @@ impl<'p> Vm<'p> {
         let setting_config_false = cf == Some(false);
         if target_desc == Value::UNDEFINED {
             if !extensible {
-                return Err(Thrown(
-                    "TypeError: proxy can't define a property on a non-extensible target".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: proxy can't define a property on a non-extensible target",
                 ));
             }
             if setting_config_false {
-                return Err(Thrown(
-                    "TypeError: proxy can't define a non-configurable property absent from the target".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: proxy can't define a non-configurable property absent from the target",
                 ));
             }
         } else {
             let t_cfg = self.get_prop(target_desc, "configurable")?;
             let t_configurable = self.truthy(t_cfg);
             if setting_config_false && t_configurable {
-                return Err(Thrown(
-                    "TypeError: proxy can't redefine a configurable target property as non-configurable".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: proxy can't redefine a configurable target property as non-configurable",
                 ));
             }
             if !t_configurable {
                 if cf == Some(true) {
-                    return Err(Thrown(
-                        "TypeError: proxy can't redefine a non-configurable target property as configurable".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: proxy can't redefine a non-configurable target property as configurable",
                     ));
                 }
                 let t_wr = self.get_prop(target_desc, "writable")?;
@@ -950,21 +950,21 @@ impl<'p> Vm<'p> {
                 // cannot be reported non-writable by the trap.
                 let t_is_data = self.has_property_str(target_desc, "writable");
                 if t_is_data && t_writable && wr == Some(false) {
-                    return Err(Thrown(
-                        "TypeError: proxy can't report a non-configurable writable target property as non-writable".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: proxy can't report a non-configurable writable target property as non-writable",
                     ));
                 }
                 if !t_writable {
                     if wr == Some(true) {
-                        return Err(Thrown(
-                            "TypeError: proxy can't make a non-configurable non-writable target property writable".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: proxy can't make a non-configurable non-writable target property writable",
                         ));
                     }
                     if let Some(v) = value {
                         let t_val = self.get_prop(target_desc, "value")?;
                         if !self.same_value(v, t_val) {
-                            return Err(Thrown(
-                                "TypeError: proxy can't change the value of a non-configurable non-writable target property".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: proxy can't change the value of a non-configurable non-writable target property",
                             ));
                         }
                     }
@@ -980,8 +980,8 @@ impl<'p> Vm<'p> {
                 (value, get, set, wr, en, cf),
                 target_desc,
             )? {
-                return Err(Thrown(
-                    "TypeError: proxy 'defineProperty' reported a descriptor incompatible with the target's".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: proxy 'defineProperty' reported a descriptor incompatible with the target's",
                 ));
             }
         }

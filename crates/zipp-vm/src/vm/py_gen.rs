@@ -116,7 +116,7 @@ impl<'p> Vm<'p> {
     /// generator record `this` (see the module comment).
     pub(crate) fn py_gen_next(&mut self, this: Value) -> Result<Value, Thrown> {
         if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::Object(m) if !m.is_ctor) {
-            return Err(Thrown("TypeError: generator step on a non-generator".into()));
+            return Err(Thrown::from_static("TypeError: generator step on a non-generator"));
         }
         let g = this.heap_index();
         // A record of the shape already seen with every field at its usual
@@ -132,7 +132,7 @@ impl<'p> Vm<'p> {
                 .and_then(|s| self.py_gen_runtime(self.py_gen_read(g, s)))
         };
         let Some(rt) = rt else {
-            return Err(Thrown("TypeError: generator step on a non-generator".into()));
+            return Err(Thrown::from_static("TypeError: generator step on a non-generator"));
         };
         let slots = if known {
             Some((F_JS.0, F_DONE.0, F_STARTED.0, F_RUNNING.0, F_RETURNED.0, F_EXCS.0))

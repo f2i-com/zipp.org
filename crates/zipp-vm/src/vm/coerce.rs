@@ -70,6 +70,9 @@ pub(crate) fn fmt_i32_buf(n: i32) -> ([u8; 12], usize) {
 /// for same-binary A/B measurements.
 #[inline]
 fn ascii_char_append_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -90,6 +93,9 @@ fn ascii_char_append_enabled() -> bool {
 /// old first-iteration deopt is independently available for same-binary A/B.
 #[inline]
 fn str_append_index_first_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -114,6 +120,9 @@ const STR_APPEND_INDEX_FIRST_RESERVE: usize = 32;
 /// only on the first append (never on the per-character in-place hot path).
 #[inline]
 fn str_append_index_reserve_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);

@@ -60,8 +60,8 @@ impl<'p> Vm<'p> {
             None => return Ok(None),
         };
         if revoked {
-            return Err(Thrown(
-                "TypeError: Cannot perform 'setPrototypeOf' on a revoked proxy".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot perform 'setPrototypeOf' on a revoked proxy",
             ));
         }
         match self.proxy_trap(handler, "setPrototypeOf")? {
@@ -75,8 +75,8 @@ impl<'p> Vm<'p> {
                 if !self.with_native_recursion_guard(|vm| vm.is_extensible(target))? {
                     let target_proto = self.object_get_prototype_of(target);
                     if !self.same_value(proto, target_proto) {
-                        return Err(Thrown(
-                            "TypeError: 'setPrototypeOf' on proxy: trap returned truish for setting a new prototype on the non-extensible proxy target".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: 'setPrototypeOf' on proxy: trap returned truish for setting a new prototype on the non-extensible proxy target",
                         ));
                     }
                 }
@@ -105,8 +105,8 @@ impl<'p> Vm<'p> {
             None => return Ok(None),
         };
         if revoked {
-            return Err(Thrown(
-                "TypeError: Cannot perform 'isExtensible' on a revoked proxy".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot perform 'isExtensible' on a revoked proxy",
             ));
         }
         match self.proxy_trap(handler, "isExtensible")? {
@@ -115,8 +115,8 @@ impl<'p> Vm<'p> {
                 let result = self.truthy(r);
                 // Invariant: the trap result must equal IsExtensible(target).
                 if result != self.with_native_recursion_guard(|vm| vm.is_extensible(target))? {
-                    return Err(Thrown(
-                        "TypeError: 'isExtensible' on proxy: trap result does not reflect extensibility of proxy target".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: 'isExtensible' on proxy: trap result does not reflect extensibility of proxy target",
                     ));
                 }
                 Ok(Some(result))
@@ -155,8 +155,8 @@ impl<'p> Vm<'p> {
             None => return Ok(None),
         };
         if revoked {
-            return Err(Thrown(
-                "TypeError: Cannot perform 'preventExtensions' on a revoked proxy".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot perform 'preventExtensions' on a revoked proxy",
             ));
         }
         match self.proxy_trap(handler, "preventExtensions")? {
@@ -165,8 +165,8 @@ impl<'p> Vm<'p> {
                 let result = self.truthy(r);
                 // Invariant: a true result requires the target to be non-extensible.
                 if result && self.with_native_recursion_guard(|vm| vm.is_extensible(target))? {
-                    return Err(Thrown(
-                        "TypeError: 'preventExtensions' on proxy: trap returned truish but the proxy target is extensible".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: 'preventExtensions' on proxy: trap returned truish but the proxy target is extensible",
                     ));
                 }
                 Ok(Some(result))
@@ -215,8 +215,8 @@ impl<'p> Vm<'p> {
             None => return Ok(None),
         };
         if revoked {
-            return Err(Thrown(
-                "TypeError: Cannot perform 'ownKeys' on a revoked proxy".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot perform 'ownKeys' on a revoked proxy",
             ));
         }
         match self.proxy_trap(handler, "ownKeys")? {
@@ -226,9 +226,8 @@ impl<'p> Vm<'p> {
                 // (its indexed Gets — possibly getters — are observable); only a
                 // non-object trap result is a TypeError.
                 if !self.is_object_value(r) {
-                    return Err(Thrown(
-                        "TypeError: proxy [[OwnPropertyKeys]] must return an array-like object"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: proxy [[OwnPropertyKeys]] must return an array-like object",
                     ));
                 }
                 let items = self.create_list_from_array_like(r)?;
@@ -256,16 +255,15 @@ impl<'p> Vm<'p> {
         let mut seen_set: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         seen_set.try_reserve(items.len()).map_err(|_| {
-            Thrown("RangeError: proxy ownKeys validation allocation failed".into())
+            Thrown::from_static("RangeError: proxy ownKeys validation allocation failed")
         })?;
         for k in items {
             let is_str = k.is_heap() && self.heap.is_str_like(k.heap_index());
             let is_sym = k.is_heap()
                 && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. });
             if !is_str && !is_sym {
-                return Err(Thrown(
-                    "TypeError: ownKeys trap result must contain only Strings and Symbols"
-                        .into(),
+                return Err(Thrown::from_static(
+                    "TypeError: ownKeys trap result must contain only Strings and Symbols",
                 ));
             }
             let id = if is_str {
@@ -274,9 +272,8 @@ impl<'p> Vm<'p> {
                 format!("y:{}", k.heap_index())
             };
             if !seen_set.insert(id.clone()) {
-                return Err(Thrown(
-                    "TypeError: ownKeys trap result must not contain duplicate entries"
-                        .into(),
+                return Err(Thrown::from_static(
+                    "TypeError: ownKeys trap result must not contain duplicate entries",
                 ));
             }
         }
@@ -317,8 +314,8 @@ impl<'p> Vm<'p> {
             // Every non-configurable own key MUST appear in the trap result.
             for key in &nonconfig {
                 if !unchecked.remove(key) {
-                    return Err(Thrown(
-                        "TypeError: proxy [[OwnPropertyKeys]] must include all non-configurable keys of the target".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: proxy [[OwnPropertyKeys]] must include all non-configurable keys of the target",
                     ));
                 }
             }
@@ -327,14 +324,14 @@ impl<'p> Vm<'p> {
             if !extensible {
                 for key in &config {
                     if !unchecked.remove(key) {
-                        return Err(Thrown(
-                            "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must contain all of its own keys".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must contain all of its own keys",
                         ));
                     }
                 }
                 if !unchecked.is_empty() {
-                    return Err(Thrown(
-                        "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must not contain extra keys".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must not contain extra keys",
                     ));
                 }
             }

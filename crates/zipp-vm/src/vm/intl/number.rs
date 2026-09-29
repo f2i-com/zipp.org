@@ -44,7 +44,7 @@ impl<'p> Vm<'p> {
             rounding_increment,
             1 | 2 | 5 | 10 | 20 | 25 | 50 | 100 | 200 | 250 | 500 | 1000 | 2000 | 2500 | 5000
         ) {
-            return Err(Thrown("RangeError: invalid roundingIncrement".into()));
+            return Err(Thrown::from_static("RangeError: invalid roundingIncrement"));
         }
         let rounding_mode = self.opt_string(
             options,
@@ -118,9 +118,8 @@ impl<'p> Vm<'p> {
                     (Some(n), None) => (n, mxfd_default.max(n)),
                     (Some(n), Some(x)) => {
                         if n > x {
-                            return Err(Thrown(
-                                "RangeError: minimumFractionDigits is greater than maximumFractionDigits"
-                                    .into(),
+                            return Err(Thrown::from_static(
+                                "RangeError: minimumFractionDigits is greater than maximumFractionDigits",
                             ));
                         }
                         (n, x)
@@ -155,13 +154,13 @@ impl<'p> Vm<'p> {
             // it must be a TypeError rather than the min/max RangeError below.
             let rounding_type_is_fraction = out.rounding_priority == "auto" && !has_sd;
             if !rounding_type_is_fraction {
-                return Err(Thrown(
-                    "TypeError: roundingIncrement requires the fractionDigits rounding type".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: roundingIncrement requires the fractionDigits rounding type",
                 ));
             }
             if out.min_fraction != out.max_fraction {
-                return Err(Thrown(
-                    "RangeError: roundingIncrement requires equal min/max fraction digits".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: roundingIncrement requires equal min/max fraction digits",
                 ));
             }
         }

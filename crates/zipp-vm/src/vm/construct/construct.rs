@@ -112,8 +112,8 @@ impl<'p> Vm<'p> {
             let idx = cur.heap_index();
             if let Some((target, _, revoked)) = self.proxy_parts(idx) {
                 if revoked {
-                    return Err(Thrown(
-                        "TypeError: Cannot get the function realm of a revoked proxy".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot get the function realm of a revoked proxy",
                     ));
                 }
                 cur = target;
@@ -207,7 +207,7 @@ impl<'p> Vm<'p> {
         new_target: Value,
     ) -> Result<Value, Thrown> {
         if !cv.is_heap() {
-            return Err(Thrown("TypeError: value is not a constructor".into()));
+            return Err(Thrown::from_static("TypeError: value is not a constructor"));
         }
         // A constructor from a `$262.createRealm()` realm. Only the realm's
         // FACADE constructors (plain Objects) take this route — a realm-TAGGED
@@ -372,8 +372,8 @@ impl<'p> Vm<'p> {
             let (n, max) = self.validate_array_buffer_args(args)?;
             let over = self.newtarget_proto_override(new_target, cv, self.arraybuffer_proto)?;
             if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
-                return Err(Thrown(
-                    "RangeError: ArrayBuffer length exceeds the maximum".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: ArrayBuffer length exceeds the maximum",
                 ));
             }
             let buf = self.alloc_array_buffer(n)?;
@@ -386,8 +386,8 @@ impl<'p> Vm<'p> {
             let (n, max) = self.validate_array_buffer_args(args)?;
             let over = self.newtarget_proto_override(new_target, cv, self.sab_proto)?;
             if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
-                return Err(Thrown(
-                    "RangeError: ArrayBuffer length exceeds the maximum".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: ArrayBuffer length exceeds the maximum",
                 ));
             }
             // Truly-shared storage (marks shared_buffers + links sab_proto).
@@ -447,8 +447,8 @@ impl<'p> Vm<'p> {
             let t = args.first().copied().unwrap_or(Value::UNDEFINED);
             // CanBeHeldWeakly: any object, or a non-registered Symbol.
             if !self.can_be_held_weakly(t) {
-                return Err(Thrown(
-                    "TypeError: WeakRef: target cannot be held weakly".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: WeakRef: target cannot be held weakly",
                 ));
             }
             self.keep_during_job(t);
@@ -461,8 +461,8 @@ impl<'p> Vm<'p> {
         if ci == self.finreg_ctor && ci != 0 {
             let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
             if self.type_of(cb) != "function" {
-                return Err(Thrown(
-                    "TypeError: FinalizationRegistry: cleanup callback must be callable".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: FinalizationRegistry: cleanup callback must be callable",
                 ));
             }
             let over = self.newtarget_proto_override(new_target, cv, self.finreg_proto)?;
@@ -479,8 +479,8 @@ impl<'p> Vm<'p> {
         if ci == self.abstractmodulesource_ctor && ci != 0 {
             // 28.1.1.1 %AbstractModuleSource% ( ): step 1 — throw a TypeError
             // (abstract; never directly constructable, even via a subclass).
-            return Err(Thrown(
-                "TypeError: AbstractModuleSource is not constructable".into(),
+            return Err(Thrown::from_static(
+                "TypeError: AbstractModuleSource is not constructable",
             ));
         }
         if ci == self.shadowrealm_ctor && ci != 0 {
@@ -511,17 +511,17 @@ impl<'p> Vm<'p> {
                     self.heap.get(buffer),
                     HeapObj::ArrayBuffer { detached: true, .. }
                 ) {
-                    return Err(Thrown(
-                        "TypeError: Cannot construct a DataView on a detached ArrayBuffer".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot construct a DataView on a detached ArrayBuffer",
                     ));
                 }
                 let bl = self.array_buffer_len(buffer);
                 if byte_offset > bl {
-                    return Err(Thrown("RangeError: invalid DataView offset".into()));
+                    return Err(Thrown::from_static("RangeError: invalid DataView offset"));
                 }
                 let explicit = matches!(args.get(2), Some(&v) if v != Value::UNDEFINED);
                 if explicit && byte_offset + byte_length > bl {
-                    return Err(Thrown("RangeError: invalid DataView offset/length".into()));
+                    return Err(Thrown::from_static("RangeError: invalid DataView offset/length"));
                 }
             }
             let non_default = over.is_some();
@@ -565,8 +565,8 @@ impl<'p> Vm<'p> {
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.ta_base_ctor && ci != 0 {
-            return Err(Thrown(
-                "TypeError: Abstract class TypedArray not directly constructable".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Abstract class TypedArray not directly constructable",
             ));
         }
         if ci == self.iterator_ctor && ci != 0 {
@@ -578,8 +578,8 @@ impl<'p> Vm<'p> {
                 || new_target == cv
                 || new_target.heap_index() == self.iterator_ctor
             {
-                return Err(Thrown(
-                    "TypeError: Abstract class Iterator not directly constructable".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Abstract class Iterator not directly constructable",
                 ));
             }
             let proto = self.newtarget_proto(
@@ -736,8 +736,8 @@ impl<'p> Vm<'p> {
         // Constructing through a Proxy: `construct` trap (or construct the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(ci) {
             if revoked {
-                return Err(Thrown(
-                    "TypeError: Cannot perform 'construct' on a revoked proxy".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform 'construct' on a revoked proxy",
                 ));
             }
             return match self.proxy_trap(handler, "construct")? {
@@ -747,8 +747,8 @@ impl<'p> Vm<'p> {
                     let res = self.call_value(trap, handler, &[target, arr, new_target])?;
                     // ProxyConstruct: the trap result must be an Object.
                     if !self.is_object_value(res) {
-                        return Err(Thrown(
-                            "TypeError: proxy [[Construct]] must return an object".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: proxy [[Construct]] must return an object",
                         ));
                     }
                     Ok(res)
@@ -815,7 +815,7 @@ impl<'p> Vm<'p> {
                 let arr = if args.len() == 1 && a0.is_number() {
                     let n = a0.as_f64();
                     if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
                     if n as usize > super::MAX_DENSE_ARRAY_LEN {
                         // Past the eager-materialization cap: a SPARSE array — no
@@ -963,7 +963,7 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_) | HeapObj::Closure { .. }
         ) && !self.is_constructor(cv)
         {
-            return Err(Thrown("TypeError: function is not a constructor".into()));
+            return Err(Thrown::from_static("TypeError: function is not a constructor"));
         }
         // Constructor FUNCTION (`new F()`, the pre-class OOP idiom): make an object
         // whose [[Prototype]] is `F.prototype` (so its methods + `constructor`
@@ -1072,7 +1072,7 @@ impl<'p> Vm<'p> {
                     c.parent,
                     c.extends_null,
                 ),
-                _ => return Err(Thrown("TypeError: value is not a constructor".into())),
+                _ => return Err(Thrown::from_static("TypeError: value is not a constructor")),
             };
         // OrdinaryCreateFromConstructor: a `Reflect.construct(Class, args, NT)` (or
         // any newTarget other than the class) gives the instance NT.prototype as its
@@ -1181,15 +1181,14 @@ impl<'p> Vm<'p> {
                     // undefined — any other value throws (a base class silently
                     // ignores a primitive return and yields `this`).
                     if ret != Value::UNDEFINED {
-                        return Err(Thrown(
-                            "TypeError: Derived constructors may only return object or undefined"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Derived constructors may only return object or undefined",
                         ));
                     }
                     // …and `this` must have been initialised by `super(...)`.
                     if !super_called {
-                        return Err(Thrown(
-                            "ReferenceError: Must call super constructor in derived class before returning from derived constructor".into(),
+                        return Err(Thrown::from_static(
+                            "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
                         ));
                     }
                     // `super()` produced a return-override instance and the ctor
@@ -1208,9 +1207,8 @@ impl<'p> Vm<'p> {
             // `class C extends null {}` with no own ctor: the implicit
             // super(...args) calls a null parent — TypeError per spec.
             if extends_null {
-                return Err(Thrown(
-                    "TypeError: Super constructor null of anonymous class is not a constructor"
-                        .into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Super constructor null of anonymous class is not a constructor",
                 ));
             }
             if let Some(pidx) = parent {
@@ -1297,10 +1295,10 @@ impl<'p> Vm<'p> {
         if cval.is_heap() {
             let ci = cval.heap_index();
             if ci != 0 && ci == self.symbol_ctor {
-                return Err(Thrown("TypeError: Symbol is not a constructor".into()));
+                return Err(Thrown::from_static("TypeError: Symbol is not a constructor"));
             }
             if ci != 0 && ci == self.bigint_ctor {
-                return Err(Thrown("TypeError: BigInt is not a constructor".into()));
+                return Err(Thrown::from_static("TypeError: BigInt is not a constructor"));
             }
         }
         // Only re-brand a class instance that is still a plain Object (not already a
@@ -1349,8 +1347,8 @@ impl<'p> Vm<'p> {
         {
             let (n, max) = self.validate_array_buffer_args(args)?;
             if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
-                return Err(Thrown(
-                    "RangeError: ArrayBuffer length exceeds the maximum".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: ArrayBuffer length exceeds the maximum",
                 ));
             }
             #[cfg(feature = "instrument")]
@@ -1359,7 +1357,7 @@ impl<'p> Vm<'p> {
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(n)
-                .map_err(|_| Thrown("RangeError: ArrayBuffer allocation failed".into()))?;
+                .map_err(|_| Thrown::from_static("RangeError: ArrayBuffer allocation failed"))?;
             bytes.resize(n, 0u8);
             self.heap.replace(
                 oidx,

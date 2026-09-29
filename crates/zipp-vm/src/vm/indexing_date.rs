@@ -444,8 +444,8 @@ impl<'p> Vm<'p> {
         self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, obj, val);
         if !obj.is_heap() {
             if obj.is_nullish() {
-                return Err(Thrown(
-                    "TypeError: cannot set property of non-object".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: cannot set property of non-object",
                 ));
             }
             // PutValue 6: a non-nullish PRIMITIVE base (a number or a boolean —
@@ -1036,7 +1036,7 @@ impl<'p> Vm<'p> {
             // thisTimeValue brand check: every Date.prototype method requires a
             // Date receiver (reached here only via the method-as-value path with a
             // non-Date `this`; the direct dispatch already matched HeapObj::Date).
-            _ => return Err(Thrown("TypeError: this is not a Date object".into())),
+            _ => return Err(Thrown::from_static("TypeError: this is not a Date object")),
         };
         let p = date_parts(ms); // (year, month0, day, hour, min, sec, ms, weekday)
         let field = |v: i64| {
@@ -1053,7 +1053,7 @@ impl<'p> Vm<'p> {
             #[cfg(not(feature = "wasm-lite"))]
             "toTemporalInstant" => {
                 if ms.is_nan() {
-                    return Err(Thrown("RangeError: Invalid time value".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid time value"));
                 }
                 return Ok(Some(self.make_instant((ms as i128) * 1_000_000)?));
             }
@@ -1068,7 +1068,7 @@ impl<'p> Vm<'p> {
             "getTimezoneOffset" => Value::num(if ms.is_nan() { f64::NAN } else { 0.0 }),
             "toISOString" => {
                 if ms.is_nan() {
-                    return Err(Thrown("RangeError: Invalid time value".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid time value"));
                 }
                 self.alloc_str(date_to_iso(ms))
             }

@@ -96,6 +96,9 @@ pub(crate) fn lone_surrogate_markers(units: &[u16]) -> String {
 /// per process.
 #[inline]
 pub(crate) fn fused_cmp_jump_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -115,6 +118,9 @@ pub(crate) fn fused_cmp_jump_enabled() -> bool {
 /// fusion without changing any runtime layout.
 #[inline]
 pub(crate) fn typeof_same_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -153,6 +159,9 @@ fn add_spine<'e>(e: &'e ast::Expr, leaves: &mut Vec<&'e ast::Expr>) {
 /// bit-for-bit. Compiler-side gate; read once per process (memoized AtomicU8).
 #[inline]
 pub(crate) fn concat_fuse_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -171,6 +180,9 @@ pub(crate) fn concat_fuse_enabled() -> bool {
 /// exact `+` fallback; this compiler-side switch also removes its dispatch cost.
 #[inline]
 pub(crate) fn pad2_cache_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {

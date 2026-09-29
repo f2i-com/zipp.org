@@ -409,9 +409,8 @@ impl<'p> Vm<'p> {
         if self.is_callable(v) {
             return self.wrapped_function_create(v);
         }
-        Err(Thrown(
-            "TypeError: value crossing the ShadowRealm boundary is not a primitive or callable"
-                .into(),
+        Err(Thrown::from_static(
+            "TypeError: value crossing the ShadowRealm boundary is not a primitive or callable",
         ))
     }
 
@@ -434,8 +433,8 @@ impl<'p> Vm<'p> {
                     Ok(v) => v,
                     Err(_) => {
                         self.pending_throw.take();
-                        return Err(Thrown(
-                            "TypeError: WrappedFunction: copying target name/length failed".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: WrappedFunction: copying target name/length failed",
                         ));
                     }
                 }
@@ -1023,7 +1022,7 @@ impl<'p> Vm<'p> {
         }
         let it = self.call_value(m, v, &[])?;
         if !self.is_object_value(it) {
-            return Err(Thrown("TypeError: iterator is not an object".into()));
+            return Err(Thrown::from_static("TypeError: iterator is not an object"));
         }
         Ok(it)
     }
@@ -1081,7 +1080,7 @@ impl<'p> Vm<'p> {
                     if self.is_callable(m) {
                         let it = self.call_value(m, v, &[])?;
                         if !self.is_object_value(it) {
-                            return Err(Thrown("TypeError: iterator is not an object".into()));
+                            return Err(Thrown::from_static("TypeError: iterator is not an object"));
                         }
                         return Ok(it);
                     }
@@ -1110,7 +1109,7 @@ impl<'p> Vm<'p> {
                             let it = self.call_value(m, v, &[])?;
                             // GetIterator step 5: a non-object iterator is a TypeError.
                             if !self.is_object_value(it) {
-                                return Err(Thrown("TypeError: iterator is not an object".into()));
+                                return Err(Thrown::from_static("TypeError: iterator is not an object"));
                             }
                             return Ok(it);
                         }
@@ -1151,14 +1150,14 @@ impl<'p> Vm<'p> {
             let am = self.get_prop(v, "@@asyncIterator")?;
             if !am.is_nullish() {
                 if !self.is_callable(am) {
-                    return Err(Thrown(
-                        "TypeError: [Symbol.asyncIterator] is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: [Symbol.asyncIterator] is not a function",
                     ));
                 }
                 let it = self.call_value(am, v, &[])?;
                 if !self.is_object_value(it) {
-                    return Err(Thrown(
-                        "TypeError: [Symbol.asyncIterator]() returned a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: [Symbol.asyncIterator]() returned a non-object",
                     ));
                 }
                 return Ok((it, false));
@@ -1166,14 +1165,14 @@ impl<'p> Vm<'p> {
             let sm = self.get_prop(v, "@@iterator")?;
             if !sm.is_nullish() {
                 if !self.is_callable(sm) {
-                    return Err(Thrown(
-                        "TypeError: [Symbol.iterator] is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: [Symbol.iterator] is not a function",
                     ));
                 }
                 let it = self.call_value(sm, v, &[])?;
                 if !self.is_object_value(it) {
-                    return Err(Thrown(
-                        "TypeError: [Symbol.iterator]() returned a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: [Symbol.iterator]() returned a non-object",
                     ));
                 }
                 return Ok((it, true));
@@ -1212,7 +1211,7 @@ impl<'p> Vm<'p> {
             self.heap.get(v.heap_index()),
             HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
         ) {
-            return Err(Thrown("TypeError: value is not iterable".into()));
+            return Err(Thrown::from_static("TypeError: value is not iterable"));
         }
         enum DestructureIter {
             Positional,
@@ -1267,8 +1266,8 @@ impl<'p> Vm<'p> {
                     if matches!(self.heap.get(v.heap_index()), HeapObj::TypedArray { .. })
                         && self.ta_effective_len(v.heap_index()).is_none()
                     {
-                        return Err(Thrown(
-                            "TypeError: TypedArray is detached or out of bounds".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: TypedArray is detached or out of bounds",
                         ));
                     }
                     if matches!(
@@ -1347,7 +1346,7 @@ impl<'p> Vm<'p> {
             DestructureIter::Method(method) => {
                 let iter = self.call_value(method, v, &[])?;
                 if !self.is_object_value(iter) {
-                    return Err(Thrown("TypeError: iterator is not an object".into()));
+                    return Err(Thrown::from_static("TypeError: iterator is not an object"));
                 }
                 iter
             }
@@ -1374,7 +1373,7 @@ impl<'p> Vm<'p> {
             // element bound) `max` is unbounded, so the never-done loop spun until
             // it exhausted memory.
             if !self.is_object_value(res) {
-                return Err(Thrown("TypeError: iterator result is not an object".into()));
+                return Err(Thrown::from_static("TypeError: iterator result is not an object"));
             }
             let done = self.get_prop(res, "done")?;
             if self.truthy(done) {
@@ -1466,8 +1465,8 @@ impl<'p> Vm<'p> {
                 let msg = self.alloc_str("Iterator value is not an entry object".to_string());
                 let te = self.make_error(1, Some(msg));
                 self.pending_throw = Some(te);
-                close_and_throw!(Thrown(
-                    "TypeError: Iterator value is not an entry object".into()
+                close_and_throw!(Thrown::from_static(
+                    "TypeError: Iterator value is not an entry object"
                 ));
             }
             let k = match self.get_index(entry, Value::int(0)) {
@@ -1528,8 +1527,8 @@ impl<'p> Vm<'p> {
                     let msg = self.alloc_str("Iterator value is not an entry object".to_string());
                     let te = self.make_error(1, Some(msg));
                     self.pending_throw = Some(te);
-                    close_and_throw!(Thrown(
-                        "TypeError: Iterator value is not an entry object".into()
+                    close_and_throw!(Thrown::from_static(
+                        "TypeError: Iterator value is not an entry object"
                     ));
                 }
                 let k = match self.get_index(entry, Value::int(0)) {
@@ -1598,16 +1597,16 @@ impl<'p> Vm<'p> {
         }
         if !self.is_callable(ret) {
             if strict {
-                return Err(Thrown(
-                    "TypeError: iterator return() is not callable".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: iterator return() is not callable",
                 ));
             }
             return Ok(());
         }
         let r = self.call_value(ret, iter, &[])?;
         if !self.is_object_value(r) {
-            return Err(Thrown(
-                "TypeError: iterator return() result is not an object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: iterator return() result is not an object",
             ));
         }
         Ok(())
@@ -1706,8 +1705,8 @@ impl<'p> Vm<'p> {
                     let res = self.call_value(f, iter, &[])?;
                     // IteratorNext step 3: a non-object result is a TypeError.
                     if !self.is_object_value(res) {
-                        return Err(Thrown(
-                            "TypeError: iterator.next() returned a non-object".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: iterator.next() returned a non-object",
                         ));
                     }
                     res
@@ -1728,8 +1727,8 @@ impl<'p> Vm<'p> {
             self.heap.write_barrier_val(acc, value);
             n += 1;
             if n > crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
-                return Err(Thrown(
-                    "RangeError: iterator produced more values than the engine's limit".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: iterator produced more values than the engine's limit",
                 ));
             }
             self.instrument_drain_heap_check(n)?;
@@ -1758,7 +1757,7 @@ impl<'p> Vm<'p> {
         }
         let it = self.call_value(m, v, &[])?;
         if !self.is_object_value(it) {
-            return Err(Thrown("TypeError: iterator is not an object".into()));
+            return Err(Thrown::from_static("TypeError: iterator is not an object"));
         }
         if matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. }) {
             return self.iterator_to_vec(it);
@@ -1767,7 +1766,7 @@ impl<'p> Vm<'p> {
         // that happens to be an array or another built-in iterable.
         let next = self.get_prop(it, "next")?;
         if !self.is_callable(next) {
-            return Err(Thrown("TypeError: iterator.next is not a function".into()));
+            return Err(Thrown::from_static("TypeError: iterator.next is not a function"));
         }
         // The drain roots its working set instead of holding the lock (a
         // 2^20-element drain kept every step result alive with GC suspended).
@@ -1893,8 +1892,8 @@ impl<'p> Vm<'p> {
             Plan::ArrayAt(idx) => self.spread_array_elements(idx)?,
             Plan::TypedAt(ta) => {
                 let Some(n) = self.ta_effective_len(ta) else {
-                    return Err(Thrown(
-                        "TypeError: TypedArray is detached or out of bounds".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: TypedArray is detached or out of bounds",
                     ));
                 };
                 self.preflight_native_iteration_work(n as u64)?;
@@ -1921,20 +1920,20 @@ impl<'p> Vm<'p> {
         // A given (non-undefined) mapfn must be callable; null/undefined source is
         // not coercible to an object (ToObject throws).
         if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
-            return Err(Thrown(
-                "TypeError: Array.from mapfn is not a function".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Array.from mapfn is not a function",
             ));
         }
         if src.is_nullish() {
-            return Err(Thrown(
-                "TypeError: Array.from requires an array-like or iterable object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Array.from requires an array-like or iterable object",
             ));
         }
         // usingIterator = GetMethod(items, @@iterator): one observable Get; a
         // non-callable non-nullish @@iterator is a TypeError.
         let using_iter = self.get_prop(src, "@@iterator")?;
         if !using_iter.is_nullish() && !self.is_callable(using_iter) {
-            return Err(Thrown("TypeError: @@iterator is not a function".into()));
+            return Err(Thrown::from_static("TypeError: @@iterator is not a function"));
         }
         let mapping = mapfn != Value::UNDEFINED;
         // The %Array% intrinsic (or a non-constructor receiver) builds a plain
@@ -1960,7 +1959,7 @@ impl<'p> Vm<'p> {
             };
             let iter = self.call_value(using_iter, src, &[])?;
             if !self.is_object_value(iter) {
-                return Err(Thrown("TypeError: iterator is not an object".into()));
+                return Err(Thrown::from_static("TypeError: iterator is not an object"));
             }
             let next_fn = self.get_prop(iter, "next")?;
             drop(gc);
@@ -1998,7 +1997,7 @@ impl<'p> Vm<'p> {
         // wasm32 and could turn 2^32 into a zero-length operation.
         self.preflight_native_iteration_work(n)?;
         let n = usize::try_from(n)
-            .map_err(|_| Thrown("RangeError: array-like length exceeds the engine limit".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: array-like length exceeds the engine limit"))?;
         if custom_ctor {
             let a = self.construct(this_ctor, &[Value::num(n as f64)])?;
             for i in 0..n {
@@ -2090,7 +2089,7 @@ impl<'p> Vm<'p> {
         loop {
             let result = self.call_value(next_fn, iter, &[])?;
             if !self.is_object_value(result) {
-                return Err(Thrown("TypeError: iterator result is not an object".into()));
+                return Err(Thrown::from_static("TypeError: iterator result is not an object"));
             }
             self.host_result_roots[scratch] = result;
             let done = self.get_prop(result, "done")?;
@@ -2137,9 +2136,8 @@ impl<'p> Vm<'p> {
                 }
                 None => {
                     if k >= crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
-                        return Err(Thrown(
-                            "RangeError: iterator produced more values than the engine's limit"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: iterator produced more values than the engine's limit",
                         ));
                     }
                     if let HeapObj::Array(items) = self.heap.get_mut(acc) {

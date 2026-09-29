@@ -44,17 +44,21 @@ impl PackedIntervals {
 }
 
 fn read_varint(bytes: &mut impl Iterator<Item = u8>) -> u32 {
-    let mut value = 0;
-    let mut shift = 0;
-    loop {
-        // Only compile-time-validated internal tables reach this decoder.
-        let byte = bytes.next().expect("truncated Unicode table");
-        value |= u32::from(byte & 127) << shift;
-        if byte < 128 {
-            return value;
-        }
-        shift += 7;
+    // Compile-time validation bounds every gap and width to 0x10ffff, so a
+    // value occupies at most three bytes. Avoid a variable-shift loop while
+    // expanding Unicode properties; matching itself does not decode tables.
+    let first = bytes.next().expect("truncated Unicode table");
+    if first < 128 {
+        return u32::from(first);
     }
+    let second = bytes.next().expect("truncated Unicode table");
+    let value = u32::from(first & 127) | (u32::from(second & 127) << 7);
+    if second < 128 {
+        return value;
+    }
+    let third = bytes.next().expect("truncated Unicode table");
+    debug_assert!(third < 128);
+    value | (u32::from(third) << 14)
 }
 
 const fn varint_len(mut n: u32) -> usize {
@@ -136,3 +140,18 @@ macro_rules! direct_intervals {
     }};
 }
 pub(crate) use direct_intervals;
+
+#[cfg(test)]
+mod tests {
+    use super::read_varint;
+
+    #[test]
+    fn decode_width_boundaries_without_consuming_the_next_value() {
+        let encoded = [0, 127, 128, 1, 255, 127, 128, 128, 1, 255, 255, 67, 1];
+        let mut bytes = encoded.into_iter();
+        for value in [0, 127, 128, 16383, 16384, 0x10ffff, 1] {
+            assert_eq!(read_varint(&mut bytes), value);
+        }
+        assert!(bytes.next().is_none());
+    }
+}

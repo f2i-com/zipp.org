@@ -45,6 +45,9 @@ pub struct SyntaxError {
 }
 
 impl SyntaxError {
+    // Keep error allocation out of the successful WASM parser paths.
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), cold)]
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), inline(never))]
     pub(crate) fn new(msg: impl Into<String>, pos: u32) -> SyntaxError {
         SyntaxError {
             msg: msg.into(),

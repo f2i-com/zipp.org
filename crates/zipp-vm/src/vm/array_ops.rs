@@ -385,13 +385,13 @@ impl<'p> Vm<'p> {
             return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
         }
         if self.array_stringify_active.len() >= MAX_ARRAY_STRINGIFY_DEPTH {
-            return Err(Thrown(
-                "RangeError: array stringification nesting limit exceeded".into(),
+            return Err(Thrown::from_static(
+                "RangeError: array stringification nesting limit exceeded",
             ));
         }
         self.array_stringify_active
             .try_reserve(1)
-            .map_err(|_| Thrown("RangeError: array stringification allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: array stringification allocation failed"))?;
         self.array_stringify_active.push(idx);
         let result = stringify(self);
         let popped = self.array_stringify_active.pop();
@@ -411,14 +411,14 @@ impl<'p> Vm<'p> {
             .len()
             .checked_add(additional)
             .filter(|&n| n <= MAX_STRING_BYTES)
-            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
         #[cfg(feature = "instrument")]
         self.instrument_preflight_heap_growth(total)
             .map_err(|message| Thrown(message.into()))?;
         #[cfg(not(feature = "instrument"))]
         let _ = total;
         out.try_reserve(additional)
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))
     }
 
     /// ToString(v) as WTF-8 bytes, lone surrogates intact. A string is copied
@@ -826,8 +826,8 @@ impl<'p> Vm<'p> {
         } else if !self.is_object_value(ctor) {
             // A non-object, non-undefined `constructor` can never be a constructor,
             // so ArraySpeciesCreate reaches the IsConstructor(C)-false throw.
-            return Err(Thrown(
-                "TypeError: Array species constructor is not an object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Array species constructor is not an object",
             ));
         } else {
             // ArraySpeciesCreate step 6.c.i: a constructor that is ANOTHER realm's
@@ -855,8 +855,8 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         if !self.is_constructor(species) {
-            return Err(Thrown(
-                "TypeError: Array species constructor is not a constructor".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Array species constructor is not a constructor",
             ));
         }
         Ok(Some(self.construct(species, &[Value::num(len as f64)])?))
@@ -1041,7 +1041,7 @@ impl<'p> Vm<'p> {
     ) -> Result<(), Thrown> {
         *work = work
             .checked_add(source_len as u64)
-            .ok_or_else(|| Thrown("RangeError: native builtin iteration limit exceeded".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: native builtin iteration limit exceeded"))?;
         self.preflight_native_iteration_work(*work)?;
         // Hoisted out of the loop: `array_iter_get`'s per-element side-table
         // probe is the whole cost of a plain `[1,2,3].flat()`.
@@ -1102,12 +1102,12 @@ impl<'p> Vm<'p> {
                     }
                 };
                 let next_depth = active_depth.checked_add(1).ok_or_else(|| {
-                    Thrown("RangeError: array flattening nesting limit exceeded".into())
+                    Thrown::from_static("RangeError: array flattening nesting limit exceeded")
                 })?;
                 #[cfg(feature = "safe-sandbox")]
                 if next_depth > 64 {
-                    return Err(Thrown(
-                        "RangeError: array flattening nesting limit exceeded".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: array flattening nesting limit exceeded",
                     ));
                 }
                 self.flatten_into_array_at(out, v, n, depth - 1, None, next_depth, work)?;
@@ -1318,7 +1318,7 @@ impl<'p> Vm<'p> {
                 // (Infinity, via ToLength → 2^53-1) is a RangeError. It only
                 // applies when no custom species took over the allocation.
                 if target.is_none() && lenf > 4_294_967_295.0 {
-                    return Err(Thrown("RangeError: Invalid array length".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid array length"));
                 }
                 // The result is materialised DENSELY, so unlike the probe-only
                 // arms above its length is bounded by what the host can hold: a
@@ -1330,8 +1330,8 @@ impl<'p> Vm<'p> {
                 // elsewhere, so every length that `new Array(n)` accepts still
                 // maps successfully.
                 if len > MAX_EAGER_ITER_RESULT {
-                    return Err(Thrown(
-                        "RangeError: array length exceeds the engine's dense-array limit".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: array length exceeds the engine's dense-array limit",
                     ));
                 }
                 // A HOLE placeholder keeps an ABSENT source index absent in the
@@ -1463,8 +1463,8 @@ impl<'p> Vm<'p> {
                         }
                     }
                     if !started {
-                        return Err(Thrown(
-                            "TypeError: Reduce of empty array with no initial value".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Reduce of empty array with no initial value",
                         ));
                     }
                     return Ok(Some(acc));
@@ -1489,8 +1489,8 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if !started {
-                    return Err(Thrown(
-                        "TypeError: Reduce of empty array with no initial value".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reduce of empty array with no initial value",
                     ));
                 }
                 Ok(Some(acc))
@@ -1899,7 +1899,7 @@ impl<'p> Vm<'p> {
             "push" => {
                 let argc = args.len() as i64;
                 if len + argc > MAX_SAFE {
-                    return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
+                    return Err(Thrown::from_static("TypeError: Array length exceeds the maximum"));
                 }
                 let mut n = len;
                 for &item in args {
@@ -1948,7 +1948,7 @@ impl<'p> Vm<'p> {
                 if argc > 0 {
                     self.preflight_native_iteration_work(len as u64)?;
                     if len + argc > MAX_SAFE {
-                        return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
+                        return Err(Thrown::from_static("TypeError: Array length exceeds the maximum"));
                     }
                     let mut k = len;
                     while k > 0 {
@@ -2026,7 +2026,7 @@ impl<'p> Vm<'p> {
                     (args.len() as i64 - 2, dc.max(0).min(len - actual_start))
                 };
                 if len - actual_delete + insert_count > MAX_SAFE {
-                    return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
+                    return Err(Thrown::from_static("TypeError: Array length exceeds the maximum"));
                 }
                 let shifted_tail = if insert_count == actual_delete {
                     0
@@ -2034,7 +2034,7 @@ impl<'p> Vm<'p> {
                     len.saturating_sub(actual_start)
                 };
                 let work = actual_delete.checked_add(shifted_tail).ok_or_else(|| {
-                    Thrown("RangeError: native builtin iteration limit exceeded".into())
+                    Thrown::from_static("RangeError: native builtin iteration limit exceeded")
                 })?;
                 self.preflight_native_iteration_work(work as u64)?;
                 // Step 9: ArraySpeciesCreate(O, actualDeleteCount) runs BEFORE any
@@ -2043,7 +2043,7 @@ impl<'p> Vm<'p> {
                 let species_target =
                     self.array_species_create(this, actual_delete.max(0) as usize)?;
                 if species_target.is_none() && actual_delete > 4_294_967_295 {
-                    return Err(Thrown("RangeError: Invalid array length".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid array length"));
                 }
                 let a = match species_target {
                     Some(a) => {
@@ -2185,8 +2185,8 @@ impl<'p> Vm<'p> {
             // them. Refuse a long one like every other materialization.
             let overlaid = end.saturating_sub(start.max(dense).max(crate::vm::MAX_DENSE_ARRAY_LEN));
             if overlaid > crate::vm::MAX_DENSE_ARRAY_LEN {
-                return Err(Thrown(
-                    "RangeError: array length exceeds the engine's dense-array limit".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: array length exceeds the engine's dense-array limit",
                 ));
             }
             return Ok(None);
@@ -2201,7 +2201,7 @@ impl<'p> Vm<'p> {
                 if end > items.len() {
                     items
                         .try_reserve_exact(end - items.len())
-                        .map_err(|_| Thrown("RangeError: array allocation failed".into()))?;
+                        .map_err(|_| Thrown::from_static("RangeError: array allocation failed"))?;
                     items.resize(end, Value::HOLE);
                 }
                 items[start..end].fill(val);
@@ -2343,7 +2343,7 @@ impl<'p> Vm<'p> {
                 if name == "toSorted" {
                     let cmp = args.first().copied().unwrap_or(Value::UNDEFINED);
                     if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
-                        return Err(Thrown("TypeError: the comparator is not a function".into()));
+                        return Err(Thrown::from_static("TypeError: the comparator is not a function"));
                     }
                 }
                 // toReversed reads the live array-like in DESCENDING index order and
@@ -2359,7 +2359,7 @@ impl<'p> Vm<'p> {
                         lenf.trunc().min(9_007_199_254_740_991.0) as usize
                     };
                     if len as f64 > 4_294_967_295.0 {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
                     self.preflight_materialized_array(len)?;
                     let mut out = Vec::with_capacity(len);
@@ -2409,8 +2409,8 @@ impl<'p> Vm<'p> {
                     };
                     let (depth, mapper) = if name == "flatMap" {
                         if !self.is_callable(arg0) {
-                            return Err(Thrown(
-                                "TypeError: flatMap mapper is not a function".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: flatMap mapper is not a function",
                             ));
                         }
                         (
@@ -2456,7 +2456,7 @@ impl<'p> Vm<'p> {
                             && (len - 1).saturating_mul(sep.as_bytes().len())
                                 > crate::vm::MAX_STRING_BYTES
                         {
-                            return Err(Thrown("RangeError: Invalid string length".into()));
+                            return Err(Thrown::from_static("RangeError: Invalid string length"));
                         }
                         vm.preflight_native_iteration_work(len as u64)?;
                         let mut out: Vec<u8> = Vec::new();
@@ -2470,8 +2470,8 @@ impl<'p> Vm<'p> {
                             } else if name == "toLocaleString" {
                                 let f = vm.get_prop(v, "toLocaleString")?;
                                 if !vm.is_callable(f) {
-                                    return Err(Thrown(
-                                        "TypeError: toLocaleString is not callable".into(),
+                                    return Err(Thrown::from_static(
+                                        "TypeError: toLocaleString is not callable",
                                     ));
                                 }
                                 // ECMA-402 sup-array.prototype.toLocaleString:
@@ -2524,10 +2524,10 @@ impl<'p> Vm<'p> {
                     // Step 12: newLen > 2^53-1 is a TypeError; step 13 ArrayCreate
                     // rejects > 2^32-1 with a RangeError.
                     if new_len > 9_007_199_254_740_991 {
-                        return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
+                        return Err(Thrown::from_static("TypeError: Array length exceeds the maximum"));
                     }
                     if new_len > 4_294_967_295 {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
                     self.preflight_materialized_array(new_len.max(0) as usize)?;
                     let mut out = Vec::with_capacity((new_len.max(0) as usize).min(4096));
@@ -2551,7 +2551,7 @@ impl<'p> Vm<'p> {
                     // ArrayCreate(len) requires len <= 2^32-1; a larger finite length OR
                     // a non-finite one (Infinity, via ToLength → 2^53-1) is a RangeError.
                     if n > 4_294_967_295.0 {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
                 }
                 // slice runs the spec directly: length is read ONCE, start/end
@@ -2589,7 +2589,7 @@ impl<'p> Vm<'p> {
                     };
                     let count = (fin - k0).max(0.0);
                     if count > 4_294_967_295.0 {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
                     self.preflight_native_iteration_work(count as u64)?;
                     let target = self.array_species_create(Value::heap(idx), count as usize)?;
@@ -2727,8 +2727,8 @@ impl<'p> Vm<'p> {
                 .get(&idx)
                 .map_or((false, false), |m| (m.frozen, m.sealed || !m.extensible));
             if frozen || self.array_length_nonwritable.contains(&idx) {
-                return Err(Thrown(
-                    "TypeError: Cannot assign to read only property 'length' of object '[object Array]'".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot assign to read only property 'length' of object '[object Array]'",
                 ));
             }
             if constrained {
@@ -2852,8 +2852,8 @@ impl<'p> Vm<'p> {
                     if matches!(vm.heap.get(idx), HeapObj::TypedArray { .. })
                         && vm.ta_effective_len(idx).is_none()
                     {
-                        return Err(Thrown(
-                            "TypeError: TypedArray is detached or out of bounds".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: TypedArray is detached or out of bounds",
                         ));
                     }
                     // LengthOfArrayLike precedes separator coercion.
@@ -3132,8 +3132,8 @@ impl<'p> Vm<'p> {
                             // any element read (a MAX_SAFE_INTEGER-length spreadable
                             // must not loop 9e15 Gets).
                             if n as i64 + len > (1i64 << 53) - 1 {
-                                return Err(Thrown(
-                                    "TypeError: concat result length exceeds 2**53 - 1".into(),
+                                return Err(Thrown::from_static(
+                                    "TypeError: concat result length exceeds 2**53 - 1",
                                 ));
                             }
                             // NOT admitted up front: a `length` of 2^53-1 says
@@ -3352,8 +3352,8 @@ impl<'p> Vm<'p> {
             "reduce" => {
                 let cb = arg0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown(
-                        "TypeError: Reduce callback is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reduce callback is not a function",
                     ));
                 }
                 let has_init = args.len() >= 2;
@@ -3381,8 +3381,8 @@ impl<'p> Vm<'p> {
                 } else if let Some(first) = first {
                     first
                 } else {
-                    return Err(Thrown(
-                        "TypeError: Reduce of empty array with no initial value".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reduce of empty array with no initial value",
                     ));
                 };
                 #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
@@ -3516,9 +3516,8 @@ impl<'p> Vm<'p> {
                 let cmp = arg0;
                 // A non-undefined, non-callable comparator is a TypeError.
                 if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
-                    return Err(Thrown(
-                        "TypeError: The comparison function must be either a function or undefined"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: The comparison function must be either a function or undefined",
                     ));
                 }
                 let receiver = Value::heap(idx);
@@ -3625,8 +3624,8 @@ impl<'p> Vm<'p> {
             "reduceRight" => {
                 let cb = arg0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown(
-                        "TypeError: Reduce callback is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reduce callback is not a function",
                     ));
                 }
                 let snapshot = self.array_snapshot(idx);
@@ -3637,8 +3636,8 @@ impl<'p> Vm<'p> {
                     i -= 1;
                     snapshot[i]
                 } else {
-                    return Err(Thrown(
-                        "TypeError: Reduce of empty array with no initial value".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reduce of empty array with no initial value",
                     ));
                 };
                 let receiver = Value::heap(idx);
@@ -3675,7 +3674,7 @@ impl<'p> Vm<'p> {
                 };
                 let cb = arg0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown("TypeError: flatMap mapper is not a function".into()));
+                    return Err(Thrown::from_static("TypeError: flatMap mapper is not a function"));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 // ArraySpeciesCreate(O, 0) is step 4 — before the walk, and its
@@ -3720,9 +3719,8 @@ impl<'p> Vm<'p> {
                 // Like sort() but returns a NEW array; the receiver is unchanged.
                 let cmp = arg0;
                 if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
-                    return Err(Thrown(
-                        "TypeError: The comparison function must be either a function or undefined"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: The comparison function must be either a function or undefined",
                     ));
                 }
                 let mut snapshot = self.array_snapshot_get(idx)?;
@@ -3845,7 +3843,7 @@ impl<'p> Vm<'p> {
                         }
                         let f = vm.get_prop(v, "toLocaleString")?;
                         if !vm.is_callable(f) {
-                            return Err(Thrown("TypeError: toLocaleString is not callable".into()));
+                            return Err(Thrown::from_static("TypeError: toLocaleString is not callable"));
                         }
                         let r = vm.call_value(f, v, &fwd)?;
                         vm.append_guest_tostring(&mut out, r)?;
@@ -3868,7 +3866,7 @@ impl<'p> Vm<'p> {
                 let rel = if n.is_nan() { 0 } else { n.trunc() as i64 };
                 let actual = if rel >= 0 { rel } else { len + rel };
                 if actual < 0 || actual >= len {
-                    return Err(Thrown("RangeError: Invalid index".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid index"));
                 }
                 let value = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let this = Value::heap(idx);

@@ -190,7 +190,7 @@ fn regex_append_bytes(
     bytes: &[u8],
 ) -> Result<(), Thrown> {
     if bytes.len() > MAX_STRING_BYTES.saturating_sub(out.len()) {
-        return Err(Thrown("RangeError: Invalid string length".into()));
+        return Err(Thrown::from_static("RangeError: Invalid string length"));
     }
     regex_try_reserve_geometric(vm, reservation, out, bytes.len(), MAX_STRING_BYTES)?;
     out.extend_from_slice(bytes);
@@ -205,7 +205,7 @@ fn regex_append_wtf8(
     bytes: &[u8],
 ) -> Result<(), Thrown> {
     if bytes.len() > MAX_STRING_BYTES.saturating_sub(out.len()) {
-        return Err(Thrown("RangeError: Invalid string length".into()));
+        return Err(Thrown::from_static("RangeError: Invalid string length"));
     }
     regex_try_reserve_geometric(vm, reservation, out, bytes.len(), MAX_STRING_BYTES)?;
     crate::heap::wtf8_push(out, bytes);
@@ -221,7 +221,7 @@ fn regex_append_units(
 ) -> Result<(), Thrown> {
     let additional = units.len().saturating_mul(3);
     if additional > MAX_STRING_BYTES.saturating_sub(out.len()) {
-        return Err(Thrown("RangeError: Invalid string length".into()));
+        return Err(Thrown::from_static("RangeError: Invalid string length"));
     }
     regex_try_reserve_geometric(vm, reservation, out, additional, MAX_STRING_BYTES)?;
     push_units(out, units);
@@ -916,6 +916,9 @@ pub(crate) struct MatchallFastSlots {
 /// --ab-env`). Same idiom as `ZIPP_NO_PROMISE_SLOT_CACHE`.
 #[inline]
 fn fastok_memo_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -944,6 +947,9 @@ fn matchall_step_enabled() -> bool {
 #[inline]
 #[cfg(not(feature = "safe-sandbox"))]
 fn matchall_step_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -966,6 +972,9 @@ fn matchall_step_enabled() -> bool {
 /// (`tools/bench.py --ab-env`), same idiom as `ZIPP_NO_MATCHALL_STEP`.
 #[inline]
 fn slim_exec_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -988,6 +997,9 @@ fn slim_exec_enabled() -> bool {
 /// one side of a one-binary A/B, same idiom as `ZIPP_NO_SLIM_EXEC`.
 #[inline]
 pub(crate) fn twin_at_create_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -1009,6 +1021,9 @@ pub(crate) fn twin_at_create_enabled() -> bool {
 /// faithful A/B of the cached length requires `ZIPP_NO_MATCHALL_BATCH=1` too.
 #[inline]
 fn iter_subj_units_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -1029,6 +1044,9 @@ fn iter_subj_units_enabled() -> bool {
 /// side of a one-binary A/B, same idiom as `ZIPP_NO_SLIM_EXEC`.
 #[inline]
 fn matchall_batch_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -1267,8 +1285,8 @@ impl<'p> Vm<'p> {
     /// `new Proxy(target, handler)` — both must be objects.
     pub(crate) fn make_proxy(&mut self, target: Value, handler: Value) -> Result<Value, Thrown> {
         if !self.is_object_value(target) || !self.is_object_value(handler) {
-            return Err(Thrown(
-                "TypeError: Cannot create proxy with a non-object as target or handler".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot create proxy with a non-object as target or handler",
             ));
         }
         Ok(Value::heap(self.heap.alloc(HeapObj::Proxy {
@@ -1725,7 +1743,7 @@ impl<'p> Vm<'p> {
             total
                 .checked_add(additional)
                 .filter(|&n| n <= MAX_STRING_BYTES)
-                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))
+                .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))
         };
         let mut total = 0usize;
         let mut chars = source.chars().peekable();
@@ -1758,7 +1776,7 @@ impl<'p> Vm<'p> {
         }
         let mut out = String::new();
         out.try_reserve_exact(total)
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         // A `/` inside a character class needs no escape — RegularExpressionClassChar
         // admits it literally — and escaping it there made `new RegExp("[/]").source`
         // report `[\/]`. An unescaped `[` opens the class and the next unescaped `]`
@@ -1846,11 +1864,11 @@ impl<'p> Vm<'p> {
             total = total
                 .checked_add(additional)
                 .filter(|&n| n <= MAX_STRING_BYTES)
-                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
         }
         let mut out: Vec<u8> = Vec::new();
         out.try_reserve_exact(total)
-            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
         // Same character-class rule as `escaped_source`: `/` is literal inside `[…]`.
         let mut in_class = false;
         let mut cps = crate::heap::wtf8_code_points(bytes).peekable();
@@ -2027,8 +2045,8 @@ impl<'p> Vm<'p> {
             }
             #[cfg(not(feature = "safe-sandbox"))]
             if results.try_reserve(1).is_err() {
-                return Err(Thrown(
-                    "RangeError: RegExp replacement result allocation failed".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: RegExp replacement result allocation failed",
                 ));
             }
             results.push(result);
@@ -2070,7 +2088,7 @@ impl<'p> Vm<'p> {
             native_work = native_work.saturating_add(n_captures_u64);
             self.preflight_native_iteration_work(native_work)?;
             let n_captures = usize::try_from(n_captures_u64)
-                .map_err(|_| Thrown("RangeError: RegExp capture list is too large".into()))?;
+                .map_err(|_| Thrown::from_static("RangeError: RegExp capture list is too large"))?;
             let matched_v = self.get_prop(result, "0")?;
             // ToString(Get(result,"0")) — IDENTITY for a string value; its UNIT
             // length determines how far this match consumes the subject.
@@ -2087,7 +2105,7 @@ impl<'p> Vm<'p> {
                 .map_err(|message| Thrown(message.into()))?;
             let replacement: Vec<u8> = if functional {
                 let argv_len = n_captures.checked_add(4).ok_or_else(|| {
-                    Thrown("RangeError: RegExp replacement argument list is too large".into())
+                    Thrown::from_static("RangeError: RegExp replacement argument list is too large")
                 })?;
                 let mut argv: Vec<Value> = Vec::new();
                 #[cfg(feature = "safe-sandbox")]
@@ -2098,7 +2116,7 @@ impl<'p> Vm<'p> {
                 regex_try_reserve_exact(self, &mut argv_reservation, &mut argv, argv_len)?;
                 #[cfg(not(feature = "safe-sandbox"))]
                 argv.try_reserve_exact(argv_len).map_err(|_| {
-                    Thrown("RangeError: RegExp replacement argument allocation failed".into())
+                    Thrown::from_static("RangeError: RegExp replacement argument allocation failed")
                 })?;
                 argv.push(matched_val);
                 for n in 1..=n_captures {
@@ -2162,7 +2180,7 @@ impl<'p> Vm<'p> {
                 )?;
                 #[cfg(not(feature = "safe-sandbox"))]
                 captures.try_reserve_exact(n_captures).map_err(|_| {
-                    Thrown("RangeError: RegExp capture-list allocation failed".into())
+                    Thrown::from_static("RangeError: RegExp capture-list allocation failed")
                 })?;
                 for n in 1..=n_captures {
                     #[cfg(feature = "safe-sandbox")]
@@ -2278,7 +2296,7 @@ impl<'p> Vm<'p> {
                 let mut expanded: Vec<u8> = Vec::new();
                 expand_replacement_pieces(&replace_tmpl, &src, &mut |piece| {
                     if piece.wtf8_len() > limit.saturating_sub(expanded.len()) {
-                        return Err(Thrown("RangeError: Invalid string length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid string length"));
                     }
                     #[cfg(feature = "safe-sandbox")]
                     {
@@ -2325,7 +2343,7 @@ impl<'p> Vm<'p> {
                 #[cfg(not(feature = "safe-sandbox"))]
                 {
                     if replacement.len() > MAX_STRING_BYTES.saturating_sub(accumulated.len()) {
-                        return Err(Thrown("RangeError: Invalid string length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid string length"));
                     }
                     crate::heap::wtf8_push(&mut accumulated, &replacement);
                 }
@@ -2392,9 +2410,8 @@ impl<'p> Vm<'p> {
                         | HeapObj::BigIntBig(_)
                 );
             if r != Value::NULL && !is_object {
-                return Err(Thrown(
-                    "TypeError: RegExp exec method returned something other than an Object or null"
-                        .into(),
+                return Err(Thrown::from_static(
+                    "TypeError: RegExp exec method returned something other than an Object or null",
                 ));
             }
             return Ok(r);
@@ -2472,7 +2489,7 @@ impl<'p> Vm<'p> {
             #[cfg(not(feature = "safe-sandbox"))]
             {
                 elems.try_reserve(1).map_err(|_| {
-                    Thrown("RangeError: RegExp match-result allocation failed".into())
+                    Thrown::from_static("RangeError: RegExp match-result allocation failed")
                 })?;
                 elems.push(m0_val);
             }
@@ -2527,8 +2544,8 @@ impl<'p> Vm<'p> {
             } else if !self.is_object_value(ctor) {
                 // SpeciesConstructor step 5: a defined-but-non-object constructor
                 // (false / "string" / 86 / null) is a TypeError, before @@species.
-                return Err(Thrown(
-                    "TypeError: Symbol.split constructor property is not an object".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Symbol.split constructor property is not an object",
                 ));
             } else {
                 let sp = self.get_prop(ctor, "@@species")?;
@@ -2537,8 +2554,8 @@ impl<'p> Vm<'p> {
                 } else if self.is_constructor(sp) {
                     sp
                 } else {
-                    return Err(Thrown(
-                        "TypeError: Symbol.split species constructor is not a constructor".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Symbol.split species constructor is not a constructor",
                     ));
                 }
             }
@@ -2689,7 +2706,7 @@ impl<'p> Vm<'p> {
             native_work = native_work.saturating_add(n_captures_u64);
             self.preflight_native_iteration_work(native_work)?;
             let n_captures = usize::try_from(n_captures_u64)
-                .map_err(|_| Thrown("RangeError: RegExp capture list is too large".into()))?;
+                .map_err(|_| Thrown::from_static("RangeError: RegExp capture list is too large"))?;
             for i in 1..=n_captures {
                 #[cfg(feature = "safe-sandbox")]
                 let cap = {
@@ -2873,8 +2890,8 @@ impl<'p> Vm<'p> {
         let li_v = match self.heap.get(re_idx) {
             HeapObj::RegExp { last_index, .. } => *last_index,
             _ => {
-                return Err(Thrown(
-                    "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: RegExp.prototype.exec called on a non-RegExp",
                 ));
             }
         };
@@ -2927,8 +2944,8 @@ impl<'p> Vm<'p> {
                     }
                 }
                 _ => {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.exec called on a non-RegExp",
                     ));
                 }
             },
@@ -3861,6 +3878,9 @@ impl<'p> Vm<'p> {
         // (~1.8M slices/run on regex-log-scan). Non-ascii subjects keep the
         // full canonicalizing path.
         fn ascii_slice_fast() -> bool {
+            if crate::WASM_STATIC_SWITCHES {
+                return true;
+            }
             use std::sync::atomic::{AtomicU8, Ordering};
             static STATE: AtomicU8 = AtomicU8::new(0);
             match STATE.load(Ordering::Relaxed) {
@@ -5818,7 +5838,7 @@ impl<'p> Vm<'p> {
                 regex_try_reserve_exact(self, &mut argv_reservation, &mut argv, argv_len)?;
                 #[cfg(not(feature = "safe-sandbox"))]
                 argv.try_reserve_exact(argv_len).map_err(|_| {
-                    Thrown("RangeError: RegExp replacement argument allocation failed".into())
+                    Thrown::from_static("RangeError: RegExp replacement argument allocation failed")
                 })?;
                 argv.push(whole);
                 for cap in &m.captures {
@@ -5890,7 +5910,7 @@ impl<'p> Vm<'p> {
                 #[cfg(not(feature = "safe-sandbox"))]
                 {
                     if bytes.len() > MAX_STRING_BYTES.saturating_sub(out.len()) {
-                        return Err(Thrown("RangeError: Invalid string length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid string length"));
                     }
                     crate::heap::wtf8_push(&mut out, &bytes);
                 }
@@ -5910,7 +5930,7 @@ impl<'p> Vm<'p> {
                     // The template limit caps a `$1`-heavy expansion of a huge
                     // capture (staging/sm/String/replace-math.js).
                     if piece.wtf8_len() > limit.saturating_sub(rep.len()) {
-                        return Err(Thrown("RangeError: Invalid string length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid string length"));
                     }
                     #[cfg(feature = "safe-sandbox")]
                     {
@@ -6160,7 +6180,7 @@ impl<'p> Vm<'p> {
                 regex_try_reserve_exact(self, &mut argv_reservation, &mut argv, argv_len)?;
                 #[cfg(not(feature = "safe-sandbox"))]
                 argv.try_reserve_exact(argv_len).map_err(|_| {
-                    Thrown("RangeError: RegExp replacement argument allocation failed".into())
+                    Thrown::from_static("RangeError: RegExp replacement argument allocation failed")
                 })?;
                 argv.push(whole);
                 for cap in &m.captures {
@@ -6230,7 +6250,7 @@ impl<'p> Vm<'p> {
                 #[cfg(not(feature = "safe-sandbox"))]
                 {
                     if bytes.len() > MAX_STRING_BYTES.saturating_sub(out.len()) {
-                        return Err(Thrown("RangeError: Invalid string length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid string length"));
                     }
                     crate::heap::wtf8_push(&mut out, &bytes);
                 }
@@ -6250,7 +6270,7 @@ impl<'p> Vm<'p> {
                     &src,
                     &mut |piece| {
                         if piece.wtf8_len() > limit.saturating_sub(rep.len()) {
-                            return Err(Thrown("RangeError: Invalid string length".into()));
+                            return Err(Thrown::from_static("RangeError: Invalid string length"));
                         }
                         #[cfg(feature = "safe-sandbox")]
                         {
@@ -6707,6 +6727,9 @@ pub(crate) fn advance_string_index(units: &[u16], index: usize, unicode: bool) -
 /// `ZIPP_NO_ENUM_HOIST`.
 #[inline]
 pub(crate) fn match_variant_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -6757,6 +6780,9 @@ pub(crate) fn rx_scalar_matchall_enabled() -> bool {
 #[inline]
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn rx_dense_array_matchall_reduce_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     if cfg!(feature = "safe-sandbox") {
         return false;
     }
@@ -6806,6 +6832,9 @@ pub(crate) fn rx_scalar_exec_enabled() -> bool {
 /// probe on every iteration.
 #[inline]
 pub(crate) fn regexp_call_direct_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -6825,6 +6854,9 @@ pub(crate) fn regexp_call_direct_enabled() -> bool {
 /// helper probe and all five mechanism counters remain zero.
 #[inline]
 pub(crate) fn string_regexp_call_direct_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {

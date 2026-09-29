@@ -14,7 +14,7 @@ impl<'p> Vm<'p> {
             || !(0..1000).contains(&f[4])
             || !(0..1000).contains(&f[5])
         {
-            return Err(Thrown("RangeError: invalid time value".into()));
+            return Err(Thrown::from_static("RangeError: invalid time value"));
         }
         let idx = self.heap.alloc(HeapObj::Temporal {
             kind: 2,
@@ -103,8 +103,8 @@ impl<'p> Vm<'p> {
                 // (hour/minute/second/ms/us/ns) is not a valid PlainTime-like — a
                 // TypeError, not a silent default to 00:00:00.
                 if !any {
-                    return Err(Thrown(
-                        "TypeError: object has no recognized Temporal.PlainTime fields".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: object has no recognized Temporal.PlainTime fields",
                     ));
                 }
                 // GetTemporalOverflowOption AFTER the field GETs, before the range
@@ -131,8 +131,8 @@ impl<'p> Vm<'p> {
                 return Ok(f);
             }
         }
-        Err(Thrown(
-            "TypeError: cannot convert value to a Temporal.PlainTime".into(),
+        Err(Thrown::from_static(
+            "TypeError: cannot convert value to a Temporal.PlainTime",
         ))
     }
 
@@ -155,8 +155,8 @@ impl<'p> Vm<'p> {
                 let t = ns_to_time(rounded);
                 Ok(Some(self.alloc_str(format_time_part(&t, digits, omit))))
             }
-            "valueOf" => Err(Thrown(
-                "TypeError: Called Temporal.PlainTime.prototype.valueOf".into(),
+            "valueOf" => Err(Thrown::from_static(
+                "TypeError: Called Temporal.PlainTime.prototype.valueOf",
             )),
             "equals" => {
                 let o = self.to_plain_time(a0)?;
@@ -184,8 +184,8 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if !any {
-                    return Err(Thrown(
-                        "TypeError: with() requires a partial time object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: with() requires a partial time object",
                     ));
                 }
                 let reject =

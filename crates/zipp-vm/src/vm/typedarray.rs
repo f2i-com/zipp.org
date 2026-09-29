@@ -389,8 +389,8 @@ impl<'p> Vm<'p> {
                 // and ToIndex leaf. Match generic builtin dispatch even when
                 // the operation completes abruptly.
                 super::builtins::builtin_stats_count(self, Value::heap(view_idx), name);
-                return Err(Thrown(
-                    "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer",
                 ));
             }
             _ => return Ok(None),
@@ -402,13 +402,13 @@ impl<'p> Vm<'p> {
         let Some(view_len) =
             self.dv_effective_len_at(view_idx, byte_offset, byte_length, data.len())
         else {
-            return Err(Thrown(
-                "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer",
             ));
         };
         if size > view_len || pos > view_len - size {
-            return Err(Thrown(
-                "RangeError: Offset is outside the bounds of the DataView".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Offset is outside the bounds of the DataView",
             ));
         }
         let abs = byte_offset + pos;
@@ -500,7 +500,7 @@ impl<'p> Vm<'p> {
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(byte_len)
-            .map_err(|_| Thrown("RangeError: ArrayBuffer allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: ArrayBuffer allocation failed"))?;
         bytes.resize(byte_len, 0u8);
         let idx = self.heap.alloc(HeapObj::ArrayBuffer {
             data: bytes.into(),
@@ -538,7 +538,7 @@ impl<'p> Vm<'p> {
         self.instrument_preflight_heap_growth(capacity)
             .map_err(|message| Thrown(message.into()))?;
         let mem = crate::heap::SharedMem::try_new(byte_len, capacity)
-            .map_err(|_| Thrown("RangeError: SharedArrayBuffer allocation failed".into()))?;
+            .map_err(|_| Thrown::from_static("RangeError: SharedArrayBuffer allocation failed"))?;
         let idx = self.heap.alloc(HeapObj::ArrayBuffer {
             data: crate::heap::AbData::Shared(std::sync::Arc::new(mem)),
             detached: false,
@@ -589,7 +589,7 @@ impl<'p> Vm<'p> {
             return Ok((false, 0));
         }
         if !self.is_object_value(opts) {
-            return Err(Thrown("TypeError: base64 options must be an object".into()));
+            return Err(Thrown::from_static("TypeError: base64 options must be an object"));
         }
         let a = self.get_prop(opts, "alphabet")?;
         let url = if a == Value::UNDEFINED {
@@ -599,13 +599,13 @@ impl<'p> Vm<'p> {
                 "base64" => false,
                 "base64url" => true,
                 _ => {
-                    return Err(Thrown(
-                        "TypeError: base64 alphabet must be \"base64\" or \"base64url\"".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: base64 alphabet must be \"base64\" or \"base64url\"",
                     ))
                 }
             }
         } else {
-            return Err(Thrown("TypeError: base64 alphabet must be a string".into()));
+            return Err(Thrown::from_static("TypeError: base64 alphabet must be a string"));
         };
         let l = self.get_prop(opts, "lastChunkHandling")?;
         let lch = if l == Value::UNDEFINED {
@@ -616,14 +616,14 @@ impl<'p> Vm<'p> {
                 "strict" => 1,
                 "stop-before-partial" => 2,
                 _ => {
-                    return Err(Thrown(
-                        "TypeError: lastChunkHandling must be \"loose\", \"strict\", or \"stop-before-partial\"".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: lastChunkHandling must be \"loose\", \"strict\", or \"stop-before-partial\"",
                     ))
                 }
             }
         } else {
-            return Err(Thrown(
-                "TypeError: lastChunkHandling must be a string".into(),
+            return Err(Thrown::from_static(
+                "TypeError: lastChunkHandling must be a string",
             ));
         };
         Ok((url, lch))
@@ -637,8 +637,8 @@ impl<'p> Vm<'p> {
                 return Ok(this.heap_index());
             }
         }
-        Err(Thrown(
-            "TypeError: method requires a Uint8Array receiver".into(),
+        Err(Thrown::from_static(
+            "TypeError: method requires a Uint8Array receiver",
         ))
     }
 
@@ -1065,16 +1065,16 @@ impl<'p> Vm<'p> {
         };
         if native::TA_KINDS[kind as usize].2 {
             if v.is_number() {
-                return Err(Thrown(
-                    "TypeError: cannot convert a Number to a BigInt typed-array element".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: cannot convert a Number to a BigInt typed-array element",
                 ));
             }
             self.to_bigint(v)?;
         } else {
             if self.is_bigint_prim(v)
             {
-                return Err(Thrown(
-                    "TypeError: cannot convert a BigInt to a number".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: cannot convert a BigInt to a number",
                 ));
             }
             self.to_number_strict(v)?;
@@ -1101,8 +1101,8 @@ impl<'p> Vm<'p> {
             // `to_bigint` implements). undefined/null/Symbol already throw in
             // `to_bigint`; only BigInt/Boolean/String are accepted here.
             if v.is_number() {
-                return Err(Thrown(
-                    "TypeError: cannot convert a Number to a BigInt typed-array element".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: cannot convert a Number to a BigInt typed-array element",
                 ));
             }
             // NumericToRawBytes: wrap to the low 64 bits, two's complement
@@ -1114,8 +1114,8 @@ impl<'p> Vm<'p> {
             // to_number is deliberately lenient on BigInt for comparisons).
             if self.is_bigint_prim(v)
             {
-                return Err(Thrown(
-                    "TypeError: cannot convert a BigInt to a number".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: cannot convert a BigInt to a number",
                 ));
             }
             // ToNumber(value) per SetTypedArrayElement: an object element runs
@@ -1158,10 +1158,10 @@ impl<'p> Vm<'p> {
                 if mbl != Value::UNDEFINED {
                     let m = self.to_index(mbl)?;
                     if m > MAX_ARRAY_BUFFER_LEN as usize {
-                        return Err(Thrown("RangeError: invalid maxByteLength".into()));
+                        return Err(Thrown::from_static("RangeError: invalid maxByteLength"));
                     }
                     if m < n {
-                        return Err(Thrown("RangeError: maxByteLength < byteLength".into()));
+                        return Err(Thrown::from_static("RangeError: maxByteLength < byteLength"));
                     }
                     max_byte_length = Some(m);
                 }
@@ -1191,22 +1191,21 @@ impl<'p> Vm<'p> {
             Some(HeapObj::TypedArray { kind, .. }) => {
                 if waitable {
                     if !matches!(*kind, 5 | 9) {
-                        return Err(Thrown(
-                            "TypeError: Atomics operation requires an Int32Array or BigInt64Array"
-                                .into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Atomics operation requires an Int32Array or BigInt64Array",
                         ));
                     }
                 } else if matches!(*kind, 2 | 7 | 8 | 11) {
                     // Uint8Clamped(2), Float32(7), Float64(8), Float16(11) are not integer types.
-                    return Err(Thrown(
-                        "TypeError: Atomics operation requires an integer TypedArray".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Atomics operation requires an integer TypedArray",
                     ));
                 }
                 ta.heap_index()
             }
             _ => {
-                return Err(Thrown(
-                    "TypeError: Atomics operation called on a non-TypedArray".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Atomics operation called on a non-TypedArray",
                 ))
             }
         };
@@ -1221,8 +1220,8 @@ impl<'p> Vm<'p> {
                 self.heap.get(buffer),
                 HeapObj::ArrayBuffer { detached: true, .. }
             ) {
-                return Err(Thrown(
-                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer",
                 ));
             }
         }
@@ -1230,8 +1229,8 @@ impl<'p> Vm<'p> {
             let shared = matches!(self.heap.get(ti),
                 HeapObj::TypedArray { buffer, .. } if self.shared_buffers.contains(buffer));
             if !shared {
-                return Err(Thrown(
-                    "TypeError: Atomics.wait/waitAsync requires a SharedArrayBuffer".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Atomics.wait/waitAsync requires a SharedArrayBuffer",
                 ));
             }
         }
@@ -1243,8 +1242,8 @@ impl<'p> Vm<'p> {
                 _ => 0,
             };
             if self.immutable_buffers.contains(&buffer) {
-                return Err(Thrown(
-                    "TypeError: Cannot perform an Atomics write on an immutable ArrayBuffer".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform an Atomics write on an immutable ArrayBuffer",
                 ));
             }
         }
@@ -1259,7 +1258,7 @@ impl<'p> Vm<'p> {
         // ToIndex: RangeError on a negative index, TypeError on Symbol/BigInt.
         let i = self.to_index(idx)?;
         if i >= len {
-            return Err(Thrown("RangeError: Atomics index out of bounds".into()));
+            return Err(Thrown::from_static("RangeError: Atomics index out of bounds"));
         }
         // RevalidateAtomicAccess (DATA ops only — wait/waitAsync/notify never
         // touch the buffer afterward): a coercion side effect that detached
@@ -1273,13 +1272,13 @@ impl<'p> Vm<'p> {
                 self.heap.get(buffer),
                 HeapObj::ArrayBuffer { detached: true, .. }
             ) {
-                return Err(Thrown(
-                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer",
                 ));
             }
             let cur = self.ta_effective_len(ti).unwrap_or(0);
             if i >= cur {
-                return Err(Thrown("RangeError: Atomics index out of bounds".into()));
+                return Err(Thrown::from_static("RangeError: Atomics index out of bounds"));
             }
         }
         Ok((ti, i, kind))
@@ -1322,9 +1321,8 @@ impl<'p> Vm<'p> {
                     f.is_nan() || f.is_infinite() || f.fract() != 0.0
                 };
                 if bad {
-                    return Err(Thrown(
-                        "TypeError: Atomics.pause iterationNumber must be an integral Number"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Atomics.pause iterationNumber must be an integral Number",
                     ));
                 }
             }
@@ -1347,8 +1345,8 @@ impl<'p> Vm<'p> {
         // mailbox) and in the local `async_waiters` (deadline bookkeeping).
         if op == "waitAsync" {
             if !matches!(kind, 5 | 9) {
-                return Err(Thrown(
-                    "TypeError: Atomics.waitAsync requires an Int32Array or BigInt64Array".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Atomics.waitAsync requires an Int32Array or BigInt64Array",
                 ));
             }
             let cur = self.ta_element_get(ti, i);
@@ -1447,8 +1445,8 @@ impl<'p> Vm<'p> {
                 // DoWait step: a sync wait in an agent that cannot suspend is a
                 // TypeError — AFTER the value/timeout coercions, per spec order.
                 if !self.can_block {
-                    return Err(Thrown(
-                        "TypeError: Atomics.wait cannot suspend in this agent".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Atomics.wait cannot suspend in this agent",
                     ));
                 }
                 // NaN timeout -> +Infinity; clamp to >= 0.
@@ -1729,8 +1727,8 @@ impl<'p> Vm<'p> {
             // ToIndex valueOf above) precedes the byte-length RangeErrors --
             // detaching clears the data, which would otherwise mask it.
             if byte_offset % size != 0 {
-                return Err(Thrown(
-                    "RangeError: invalid TypedArray length/offset".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: invalid TypedArray length/offset",
                 ));
             }
             let explicit: Option<usize> = match args.get(2) {
@@ -1741,8 +1739,8 @@ impl<'p> Vm<'p> {
                 self.heap.get(buf),
                 HeapObj::ArrayBuffer { detached: true, .. }
             ) {
-                return Err(Thrown(
-                    "TypeError: Cannot construct a TypedArray on a detached ArrayBuffer".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot construct a TypedArray on a detached ArrayBuffer",
                 ));
             }
             let buf_len = self.array_buffer_len(buf);
@@ -1755,8 +1753,8 @@ impl<'p> Vm<'p> {
                     // follows resizes), so only a fixed auto-length view requires
                     // the remaining bytes to divide evenly.
                     if buf_len < byte_offset || (!tracking && (buf_len - byte_offset) % size != 0) {
-                        return Err(Thrown(
-                            "RangeError: byte length not a multiple of element size".into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: byte length not a multiple of element size",
                         ));
                     }
                     (buf_len - byte_offset) / size
@@ -1765,10 +1763,10 @@ impl<'p> Vm<'p> {
             let end = length
                 .checked_mul(size)
                 .and_then(|n| byte_offset.checked_add(n))
-                .ok_or_else(|| Thrown("RangeError: invalid TypedArray length/offset".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: invalid TypedArray length/offset"))?;
             if end > buf_len {
-                return Err(Thrown(
-                    "RangeError: invalid TypedArray length/offset".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: invalid TypedArray length/offset",
                 ));
             }
             let ta = self.alloc_typed_array(buf, kind, byte_offset, length);
@@ -1791,13 +1789,13 @@ impl<'p> Vm<'p> {
                 // source length is its EFFECTIVE length (a detached/out-of-bounds
                 // view rejects; a length-tracking view follows its buffer).
                 if native::TA_KINDS[src_kind as usize].2 != native::TA_KINDS[kind as usize].2 {
-                    return Err(Thrown(
-                        "TypeError: Cannot construct a TypedArray from a source of a different content type".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot construct a TypedArray from a source of a different content type",
                     ));
                 }
                 let len = self.ta_effective_len(src_ta).ok_or_else(|| {
-                    Thrown(
-                        "TypeError: Cannot construct a TypedArray from an out-of-bounds or detached source".into(),
+                    Thrown::from_static(
+                        "TypeError: Cannot construct a TypedArray from an out-of-bounds or detached source",
                     )
                 })?;
                 self.preflight_native_iteration_work(len as u64)?;
@@ -1811,9 +1809,8 @@ impl<'p> Vm<'p> {
                 // GetMethod: a defined non-callable @@iterator is a TypeError;
                 // undefined/null take the array-like path.
                 if it != Value::UNDEFINED && it != Value::NULL && !self.is_callable(it) {
-                    return Err(Thrown(
-                        "TypeError: object is not iterable ([Symbol.iterator] is not a function)"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: object is not iterable ([Symbol.iterator] is not a function)",
                     ));
                 }
                 if self.is_callable(it) {
@@ -1824,8 +1821,8 @@ impl<'p> Vm<'p> {
                     let n = if nf.is_nan() || nf <= 0.0 {
                         0
                     } else if nf > (MAX_ARRAY_BUFFER_LEN / size as i64) as f64 {
-                        return Err(Thrown(
-                            "RangeError: typed array length exceeds the maximum".into(),
+                        return Err(Thrown::from_static(
+                            "RangeError: typed array length exceeds the maximum",
                         ));
                     } else {
                         nf as usize
@@ -1854,8 +1851,8 @@ impl<'p> Vm<'p> {
             self.to_index(a0)?
         };
         if length > (MAX_ARRAY_BUFFER_LEN / size as i64) as usize {
-            return Err(Thrown(
-                "RangeError: typed array length exceeds the maximum".into(),
+            return Err(Thrown::from_static(
+                "RangeError: typed array length exceeds the maximum",
             ));
         }
         let buf = self.alloc_array_buffer(length * size)?;
@@ -1869,7 +1866,7 @@ impl<'p> Vm<'p> {
         let n = self.to_number_strict(v)?;
         let n = if n.is_nan() { 0.0 } else { n.trunc() };
         if n < 0.0 || n > 9007199254740991.0 {
-            return Err(Thrown("RangeError: index out of range".into()));
+            return Err(Thrown::from_static("RangeError: index out of range"));
         }
         Ok(n as usize)
     }
@@ -1899,7 +1896,7 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let buf = self
             .as_array_buffer(a0)
-            .ok_or_else(|| Thrown("TypeError: DataView requires an ArrayBuffer".into()))?;
+            .ok_or_else(|| Thrown::from_static("TypeError: DataView requires an ArrayBuffer"))?;
         let buf_len = self.array_buffer_len(buf);
         let byte_offset = match args.get(1) {
             Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
@@ -1911,12 +1908,12 @@ impl<'p> Vm<'p> {
             self.heap.get(buf),
             HeapObj::ArrayBuffer { detached: true, .. }
         ) {
-            return Err(Thrown(
-                "TypeError: Cannot construct a DataView on a detached ArrayBuffer".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot construct a DataView on a detached ArrayBuffer",
             ));
         }
         if byte_offset > buf_len {
-            return Err(Thrown("RangeError: invalid DataView offset".into()));
+            return Err(Thrown::from_static("RangeError: invalid DataView offset"));
         }
         let auto_length = matches!(args.get(2), None | Some(&Value::UNDEFINED));
         let byte_length = if auto_length {
@@ -1925,7 +1922,7 @@ impl<'p> Vm<'p> {
             self.to_index(args[2])?
         };
         if byte_offset + byte_length > buf_len {
-            return Err(Thrown("RangeError: invalid DataView offset/length".into()));
+            return Err(Thrown::from_static("RangeError: invalid DataView offset/length"));
         }
         let idx = self.heap.alloc(HeapObj::DataView {
             buffer: buf,

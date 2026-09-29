@@ -9,7 +9,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn make_plain_date(&mut self, y: i64, m: i64, d: i64) -> Result<Value, Thrown> {
         if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) || !iso_date_in_range(y, m, d)
         {
-            return Err(Thrown("RangeError: invalid ISO date".into()));
+            return Err(Thrown::from_static("RangeError: invalid ISO date"));
         }
         let idx = self.heap.alloc(HeapObj::Temporal {
             kind: 1,
@@ -37,8 +37,8 @@ impl<'p> Vm<'p> {
             return Ok(false);
         }
         if !self.is_object_value(options) {
-            return Err(Thrown(
-                "TypeError: options must be an object or undefined".into(),
+            return Err(Thrown::from_static(
+                "TypeError: options must be an object or undefined",
             ));
         }
         let v = self.get_prop(options, "overflow")?;
@@ -68,8 +68,8 @@ impl<'p> Vm<'p> {
         offset_default: &str,
     ) -> Result<(String, String, bool), Thrown> {
         if options != Value::UNDEFINED && !self.is_object_value(options) {
-            return Err(Thrown(
-                "TypeError: options must be an object or undefined".into(),
+            return Err(Thrown::from_static(
+                "TypeError: options must be an object or undefined",
             ));
         }
         let disamb = self.opt_string(
@@ -100,8 +100,8 @@ impl<'p> Vm<'p> {
             return Ok((1, -1, false, "trunc".to_string()));
         }
         if !self.is_object_value(options) {
-            return Err(Thrown(
-                "TypeError: options must be an object or undefined".into(),
+            return Err(Thrown::from_static(
+                "TypeError: options must be an object or undefined",
             ));
         }
         // ToSecondsStringPrecision reads options in spec order — fractionalSecondDigits,
@@ -130,20 +130,20 @@ impl<'p> Vm<'p> {
             if self.to_js_string(fsd_v)? == "auto" {
                 Ok((1, -1, false))
             } else {
-                Err(Thrown(
-                    "RangeError: fractionalSecondDigits must be 'auto' or 0..9".into(),
+                Err(Thrown::from_static(
+                    "RangeError: fractionalSecondDigits must be 'auto' or 0..9",
                 ))
             }
         } else {
             // A genuine Number is floored into 0..9 (GetStringOrNumberOption).
             let n = self.to_number(fsd_v)?;
             if n.is_nan() {
-                return Err(Thrown("RangeError: fractionalSecondDigits is NaN".into()));
+                return Err(Thrown::from_static("RangeError: fractionalSecondDigits is NaN"));
             }
             let n = n.floor() as i64;
             if !(0..=9).contains(&n) {
-                return Err(Thrown(
-                    "RangeError: fractionalSecondDigits out of range".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: fractionalSecondDigits out of range",
                 ));
             }
             Ok((10i128.pow(9 - n as u32), n as i32, false))
@@ -251,8 +251,8 @@ impl<'p> Vm<'p> {
             return Ok((suf, non_iso));
         }
         if !self.is_object_value(options) {
-            return Err(Thrown(
-                "TypeError: options must be an object or undefined".into(),
+            return Err(Thrown::from_static(
+                "TypeError: options must be an object or undefined",
             ));
         }
         let cn = self.opt_string(
@@ -358,13 +358,13 @@ impl<'p> Vm<'p> {
                     || m_raw.is_none()
                     || d_opt.is_none()
                 {
-                    return Err(Thrown(
-                        "TypeError: PlainDate-like requires year, month, day".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: PlainDate-like requires year, month, day",
                     ));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown(
-                        "TypeError: era and eraYear must be given together".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: era and eraYear must be given together",
                     ));
                 }
                 // GetTemporalOverflowOption: read + validate options.overflow AFTER
@@ -384,28 +384,28 @@ impl<'p> Vm<'p> {
                     )));
                 }
                 if !cal_month_fields_agree(cal, y, m_val, m_conflict) {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                    return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
                 }
                 let d = d_opt.unwrap();
                 // A month/day below 1 is a hard floor that always rejects
                 // (RegulateISODate is reached only after the fields are >= 1).
                 if m_val.floor() < 1 || d < 1 {
-                    return Err(Thrown("RangeError: invalid date fields".into()));
+                    return Err(Thrown::from_static("RangeError: invalid date fields"));
                 }
                 let (iy, im, id) = m_val
                     .ordinal(cal, y, reject)
                     .and_then(|m| cal_date_to_iso(cal, y, m, d, reject))
-                    .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid date fields"))?;
                 if !iso_date_in_range(iy, im, id) {
-                    return Err(Thrown(
-                        "RangeError: date is outside the representable range".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: date is outside the representable range",
                     ));
                 }
                 return Ok(((iy, im, id), cal));
             }
         }
-        Err(Thrown(
-            "TypeError: cannot convert value to a Temporal.PlainDate".into(),
+        Err(Thrown::from_static(
+            "TypeError: cannot convert value to a Temporal.PlainDate",
         ))
     }
 
@@ -476,8 +476,8 @@ impl<'p> Vm<'p> {
         // ISO date limits — a huge increment can push it past the range (RangeError).
         let upper = self.date_add(cal, d1.0, d1.1, d1.2, &mk(r2), 1);
         if !iso_date_in_range(upper.0, upper.1, upper.2) {
-            return Err(Thrown(
-                "RangeError: rounded date is outside the valid ISO range".into(),
+            return Err(Thrown::from_static(
+                "RangeError: rounded date is outside the valid ISO range",
             ));
         }
         let picked = if ld == e2 {
@@ -553,7 +553,7 @@ impl<'p> Vm<'p> {
         let (cy, cm, cd) = cal_from_iso(cal, y, m, d);
         let (ny, nm, nd) =
             cal_add_year_month(cal, cy, cm, cd, dur[0] * sign, dur[1] * sign, reject)
-                .ok_or_else(|| Thrown("RangeError: date arithmetic overflows the month".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: date arithmetic overflows the month"))?;
         let time_ns = (dur[4] as i128) * 3_600_000_000_000
             + (dur[5] as i128) * 60_000_000_000
             + (dur[6] as i128) * 1_000_000_000
@@ -596,8 +596,8 @@ impl<'p> Vm<'p> {
                     suf
                 ))))
             }
-            "valueOf" => Err(Thrown(
-                "TypeError: Called Temporal.PlainDate.prototype.valueOf".into(),
+            "valueOf" => Err(Thrown::from_static(
+                "TypeError: Called Temporal.PlainDate.prototype.valueOf",
             )),
             "equals" => {
                 // CompareISODate AND the calendar id: two dates on the same day in
@@ -610,7 +610,7 @@ impl<'p> Vm<'p> {
             "toPlainYearMonth" => {
                 let (cy, cm, _) = cal_from_iso(cal, y, m, d);
                 let (ry, rm, rd) = cal_date_to_iso(cal, cy, cm, 1, false)
-                    .ok_or_else(|| Thrown("RangeError: invalid year-month value".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid year-month value"))?;
                 let r = self.make_plain_year_month(ry, rm, rd)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
@@ -633,8 +633,8 @@ impl<'p> Vm<'p> {
                 // argument is required (validate_calendar_value allows undefined for
                 // an optional field-bag calendar, so guard here, not there).
                 if a0 == Value::UNDEFINED {
-                    return Err(Thrown(
-                        "TypeError: withCalendar requires a calendar argument".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: withCalendar requires a calendar argument",
                     ));
                 }
                 let ncal = self.validate_calendar_value(a0)?;
@@ -691,13 +691,13 @@ impl<'p> Vm<'p> {
                     && era.is_none()
                     && era_year.is_none()
                 {
-                    return Err(Thrown(
-                        "TypeError: with() requires at least one recognized property".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: with() requires at least one recognized property",
                     ));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown(
-                        "TypeError: era and eraYear must be given together".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: era and eraYear must be given together",
                     ));
                 }
                 let (cy, cm, cd) = cal_from_iso(cal, y, m, d);
@@ -718,7 +718,7 @@ impl<'p> Vm<'p> {
                 // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
                 // rejected during field preparation, BEFORE the options bag is read.
                 if nm.floor() < 1 || nd < 1 {
-                    return Err(Thrown("RangeError: invalid date fields".into()));
+                    return Err(Thrown::from_static("RangeError: invalid date fields"));
                 }
                 let reject =
                     self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
@@ -731,12 +731,12 @@ impl<'p> Vm<'p> {
                     )));
                 }
                 if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                    return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
                 }
                 let (iy, im, id) = nm
                     .ordinal(cal, ny, reject)
                     .and_then(|m| cal_date_to_iso(cal, ny, m, nd, reject))
-                    .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: invalid date fields"))?;
                 let r = self.make_plain_date(iy, im, id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
@@ -752,15 +752,14 @@ impl<'p> Vm<'p> {
             "until" | "since" => {
                 let (other, ocal) = self.to_plain_date_cal(a0, None)?;
                 if ocal != cal {
-                    return Err(Thrown(
-                        "RangeError: cannot compute a difference between dates in different calendars"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: cannot compute a difference between dates in different calendars",
                     ));
                 }
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-                    return Err(Thrown(
-                        "TypeError: options must be an object or undefined".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: options must be an object or undefined",
                     ));
                 }
                 let date_units = &[
@@ -790,8 +789,8 @@ impl<'p> Vm<'p> {
                     largest_raw
                 };
                 if rank(&smallest) < rank(&largest) {
-                    return Err(Thrown(
-                        "RangeError: smallestUnit is larger than largestUnit".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: smallestUnit is larger than largestUnit",
                     ));
                 }
                 // since = negate(until): always compute the forward (this → other)
@@ -850,20 +849,20 @@ impl<'p> Vm<'p> {
         }
         if self.is_bigint_prim(v)
         {
-            return Err(Thrown(
-                "TypeError: Cannot convert a BigInt value to a number".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot convert a BigInt value to a number",
             ));
         }
         // ToIntegerWithTruncation: a non-integer is truncated toward zero (2.5 -> 2),
         // not rejected; only non-finite or < 1 is out of range.
         let n = self.to_number_strict(v)?;
         if !n.is_finite() {
-            return Err(Thrown("RangeError: roundingIncrement out of range".into()));
+            return Err(Thrown::from_static("RangeError: roundingIncrement out of range"));
         }
         // ToTemporalRoundingIncrement: truncate(increment) must be in [1, 10^9].
         let n = n.trunc();
         if n < 1.0 || n > 1_000_000_000.0 {
-            return Err(Thrown("RangeError: roundingIncrement out of range".into()));
+            return Err(Thrown::from_static("RangeError: roundingIncrement out of range"));
         }
         Ok(n as i128)
     }
@@ -904,8 +903,8 @@ impl<'p> Vm<'p> {
         // a BigInt for relational compares, which is wrong for a constructor field).
         let n = self.to_number_strict(v)?;
         if !n.is_finite() {
-            return Err(Thrown(
-                "RangeError: Temporal field must be a finite number".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Temporal field must be a finite number",
             ));
         }
         Ok(n.trunc() as i64)
@@ -917,22 +916,22 @@ impl<'p> Vm<'p> {
     /// an object carrying a `calendar` or `timeZone` property.
     pub(crate) fn reject_temporal_like(&mut self, arg: Value) -> Result<(), Thrown> {
         if !self.is_object_value(arg) {
-            return Err(Thrown(
-                "TypeError: with() requires a property-bag object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: with() requires a property-bag object",
             ));
         }
         if arg.is_heap() {
             if let HeapObj::Temporal { .. } = self.heap.get(arg.heap_index()) {
-                return Err(Thrown(
-                    "TypeError: with() does not accept a Temporal object".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: with() does not accept a Temporal object",
                 ));
             }
         }
         if self.get_prop(arg, "calendar")? != Value::UNDEFINED
             || self.get_prop(arg, "timeZone")? != Value::UNDEFINED
         {
-            return Err(Thrown(
-                "TypeError: with() argument must not have a calendar or timeZone property".into(),
+            return Err(Thrown::from_static(
+                "TypeError: with() argument must not have a calendar or timeZone property",
             ));
         }
         Ok(())

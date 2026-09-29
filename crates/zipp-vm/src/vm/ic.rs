@@ -84,6 +84,9 @@ pub(crate) const IC_NO_FIB_GLOBAL: u32 = u32::MAX;
 /// function ranges. Cached because every hot IC probe asks this question.
 #[inline]
 fn module_ic_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_MODULE_IC").is_none())
 }
@@ -337,6 +340,9 @@ fn builtin_object_method(key: &str) -> bool {
 /// `ZIPP_NO_DYNAMIC_IC=1` keeps runtime `eval` / `new Function` code out of
 /// the interpreter inline caches (the pre-B274 behaviour) for A/B runs.
 fn dynamic_ic_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_DYNAMIC_IC").is_none())
 }

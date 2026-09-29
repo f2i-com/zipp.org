@@ -61,10 +61,10 @@ compression jobs ran alongside these measurements.
 | Python-base, executing the same JS corpus | 0.994 |
 
 Lower is better. Full JavaScript is effectively unchanged in this screen;
-individual ratios range from 0.974 to 1.024. Lite improves on all 12 rows in
+individual ratios range from 0.958 to 1.026. Lite improves on 10 of 12 rows in
 this run, but remains substantially slower than the full build. Python-base
-initialization measures 6.693 → 6.754 ms for a one-function program and
-9.043 → 8.754 ms for 200 functions. These warm measurements include parsing,
+initialization measures 6.377 → 6.249 ms for a one-function program and
+9.017 → 9.159 ms for 200 functions. These warm measurements include parsing,
 lowering, runtime seed cloning and execution; they are not cold browser startup
 or a broad application performance guarantee. Raw samples are preserved.
 

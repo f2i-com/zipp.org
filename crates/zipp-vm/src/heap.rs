@@ -71,6 +71,9 @@ const PROP_EMPTY: u32 = u32::MAX;
 /// B219 latch: `ZIPP_NO_HASH_ONCE=1` recomputes the property tag at each
 /// site instead of threading one through the probe/insert pair.
 pub(crate) fn hash_once_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -152,6 +155,9 @@ fn prop_tag(key: &str) -> u32 {
 /// variant is fixed for the life of an index, and `grow` preserves it.
 #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
 fn split_propindex_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -648,6 +654,9 @@ fn canonical_array_index_key(key: &str) -> Option<u32> {
 /// the old stack-format + string-hash lookup path in the same binary.
 #[inline]
 fn sparse_num_index_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {

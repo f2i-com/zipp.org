@@ -358,8 +358,8 @@ impl<'p> Vm<'p> {
         // ToNumeric(lval) COMPLETES (a Symbol is a TypeError) before rval's
         // observable coercion runs, per evaluation order.
         if pa.is_heap() && matches!(self.heap.get(pa.heap_index()), HeapObj::Symbol { .. }) {
-            return Err(Thrown(
-                "TypeError: Cannot convert a Symbol value to a number".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Cannot convert a Symbol value to a number",
             ));
         }
         let pb = self.numeric_prim(vb)?;
@@ -429,13 +429,13 @@ impl<'p> Vm<'p> {
     pub(crate) fn bigint_op(&mut self, op: BigOp, a: BigVal, b: BigVal) -> Result<Value, Thrown> {
         // `>>>` is not defined for BigInt regardless of values.
         if matches!(op, BigOp::Ushr) {
-            return Err(Thrown(
-                "TypeError: BigInts have no unsigned right shift, use >> instead".into(),
+            return Err(Thrown::from_static(
+                "TypeError: BigInts have no unsigned right shift, use >> instead",
             ));
         }
         // Division/remainder by zero is a RangeError regardless of tier.
         if matches!(op, BigOp::Div | BigOp::Mod) && b.is_zero() {
-            return Err(Thrown("RangeError: Division by zero".into()));
+            return Err(Thrown::from_static("RangeError: Division by zero"));
         }
         // Shifts and pow have their own count/size handling.
         match op {
@@ -545,7 +545,7 @@ impl<'p> Vm<'p> {
     /// circuit for ANY exponent; otherwise the result size is capped like V8.
     fn bigint_pow(&mut self, a: BigVal, b: BigVal) -> Result<Value, Thrown> {
         if b.is_negative() {
-            return Err(Thrown("RangeError: Exponent must be non-negative".into()));
+            return Err(Thrown::from_static("RangeError: Exponent must be non-negative"));
         }
         if b.is_zero() {
             return Ok(self.make_bigint(1));

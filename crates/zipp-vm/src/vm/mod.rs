@@ -510,6 +510,9 @@ pub(crate) const COLL_PROOF_SLOTS: usize = 16;
 /// B215 latch: `ZIPP_NO_COLL_PROOF_CACHE=1` disables the receiver-half
 /// proof cache (every lookup runs the full intrinsic proof).
 pub(crate) fn coll_proof_cache_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -524,6 +527,9 @@ pub(crate) fn coll_proof_cache_enabled() -> bool {
 }
 
 pub(crate) fn microtask_root_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -2817,6 +2823,27 @@ pub(crate) const COLL_MEMO_NAMES: usize = 6;
 /// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
 #[derive(Debug)]
 pub struct Thrown(pub String);
+
+impl Thrown {
+    /// Share allocation of fixed error messages in WASM instead of repeating
+    /// the String allocation/copy sequence in every interpreter error branch.
+    /// Native and Lite builds retain their existing inlined construction.
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm-lite")),
+        cold
+    )]
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm-lite")),
+        inline(never)
+    )]
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm-lite"))),
+        inline(always)
+    )]
+    pub(crate) fn from_static(message: &'static str) -> Self {
+        Self(message.to_owned())
+    }
+}
 
 impl<'p> Vm<'p> {
     /// Heap-ceiling re-check inside a native iterator drain; see the

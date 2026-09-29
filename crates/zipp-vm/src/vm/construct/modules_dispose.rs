@@ -115,7 +115,7 @@ impl<'p> Vm<'p> {
         self.instrument_dynamic_code_attempt(source_len.unwrap_or(usize::MAX))
             .map_err(|message| Thrown(message.into()))?;
         let source_len = source_len
-            .ok_or_else(|| Thrown("RangeError: dynamic code source length overflow".into()))?;
+            .ok_or_else(|| Thrown::from_static("RangeError: dynamic code source length overflow"))?;
 
         // CreateDynamicFunction parses the parameter STRING on its own as
         // FormalParameters (whole string consumed) before the assembled
@@ -201,7 +201,7 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<Value, Thrown> {
         if !(this.is_heap() && self.shadow_realms.contains(&this.heap_index())) {
-            return Err(Thrown("TypeError: receiver is not a ShadowRealm".into()));
+            return Err(Thrown::from_static("TypeError: receiver is not a ShadowRealm"));
         }
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match op {
@@ -212,8 +212,8 @@ impl<'p> Vm<'p> {
                         HeapObj::Str(_) | HeapObj::Cons { .. }
                     );
                 if !is_str {
-                    return Err(Thrown(
-                        "TypeError: ShadowRealm.prototype.evaluate expects a string".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: ShadowRealm.prototype.evaluate expects a string",
                     ));
                 }
                 let code = self.display(a0);
@@ -249,8 +249,8 @@ impl<'p> Vm<'p> {
                         if !runtime_throw && msg.starts_with("SyntaxError") {
                             return Err(Thrown(msg));
                         }
-                        return Err(Thrown(
-                            "TypeError: ShadowRealm evaluate threw (error wrapped at the realm boundary)".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: ShadowRealm evaluate threw (error wrapped at the realm boundary)",
                         ));
                     }
                 };
@@ -275,9 +275,8 @@ impl<'p> Vm<'p> {
                     ) {
                         return Ok(result);
                     }
-                    return Err(Thrown(
-                        "TypeError: ShadowRealm evaluate result is not a primitive or callable"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: ShadowRealm evaluate result is not a primitive or callable",
                     ));
                 }
                 Ok(result)
@@ -294,9 +293,8 @@ impl<'p> Vm<'p> {
                         HeapObj::Str(_) | HeapObj::Cons { .. }
                     );
                 if !name_is_str {
-                    return Err(Thrown(
-                        "TypeError: ShadowRealm.prototype.importValue exportName must be a string"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: ShadowRealm.prototype.importValue exportName must be a string",
                     ));
                 }
                 // ShadowRealmImportValue: load + evaluate the module through the
@@ -901,8 +899,8 @@ impl<'p> Vm<'p> {
             if op == DISPOSABLE_DISPOSE_ASYNC {
                 return Ok(self.reject_with_type_error("receiver is not an AsyncDisposableStack"));
             }
-            return Err(Thrown(
-                "TypeError: receiver is not a DisposableStack".into(),
+            return Err(Thrown::from_static(
+                "TypeError: receiver is not a DisposableStack",
             ));
         }
         let ti = this.heap_index();
@@ -913,8 +911,8 @@ impl<'p> Vm<'p> {
                         self.reject_with_type_error("receiver is not an AsyncDisposableStack")
                     );
                 }
-                return Err(Thrown(
-                    "TypeError: receiver is the wrong kind of disposable stack".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: receiver is the wrong kind of disposable stack",
                 ));
             }
         }
@@ -930,8 +928,8 @@ impl<'p> Vm<'p> {
             DISPOSABLE_USE | DISPOSABLE_ADOPT | DISPOSABLE_DEFER | DISPOSABLE_MOVE
         ) && disposed
         {
-            return Err(Thrown(
-                "ReferenceError: the DisposableStack has been disposed".into(),
+            return Err(Thrown::from_static(
+                "ReferenceError: the DisposableStack has been disposed",
             ));
         }
         match op {
@@ -965,8 +963,8 @@ impl<'p> Vm<'p> {
                     sync_fallback = is_async;
                 }
                 if !self.is_callable(method) {
-                    return Err(Thrown(
-                        "TypeError: value is not disposable (its [Symbol.dispose] is not a function)".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: value is not disposable (its [Symbol.dispose] is not a function)",
                     ));
                 }
                 let disposer = if sync_fallback {
@@ -993,7 +991,7 @@ impl<'p> Vm<'p> {
             DISPOSABLE_ADOPT => {
                 let on = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_callable(on) {
-                    return Err(Thrown("TypeError: onDispose is not callable".into()));
+                    return Err(Thrown::from_static("TypeError: onDispose is not callable"));
                 }
                 let disposer = Value::heap(self.heap.alloc(HeapObj::Bound {
                     target: on,
@@ -1007,7 +1005,7 @@ impl<'p> Vm<'p> {
             }
             DISPOSABLE_DEFER => {
                 if !self.is_callable(a0) {
-                    return Err(Thrown("TypeError: onDispose is not callable".into()));
+                    return Err(Thrown::from_static("TypeError: onDispose is not callable"));
                 }
                 if let Some((d, _)) = self.dispose_stacks.get_mut(&ti) {
                     d.push(a0);

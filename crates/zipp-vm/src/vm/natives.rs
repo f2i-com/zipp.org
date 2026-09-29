@@ -13,7 +13,7 @@ use crate::value::Value;
 /// Atomics waiter deadline path already does.
 fn host_timeout_duration(timeout_ms: f64) -> Result<std::time::Duration, Thrown> {
     if !timeout_ms.is_finite() {
-        return Err(Thrown("RangeError: timer delay must be finite".into()));
+        return Err(Thrown::from_static("RangeError: timer delay must be finite"));
     }
     let seconds = (timeout_ms.max(0.0) / 1000.0).min(86_400.0 * 365.0);
     Ok(std::time::Duration::from_secs_f64(seconds))
@@ -59,8 +59,8 @@ impl GroupByWalk {
         }
         let iter = vm.get_iterator_object(src)?;
         if !vm.is_object_value(iter) {
-            return Err(Thrown(
-                "TypeError: Result of the Symbol.iterator method is not an object".into(),
+            return Err(Thrown::from_static(
+                "TypeError: Result of the Symbol.iterator method is not an object",
             ));
         }
         Ok(GroupByWalk { array: None, iter })
@@ -106,14 +106,14 @@ impl<'p> Vm<'p> {
     ) -> Result<Vec<Value>, Thrown> {
         let iter = self.call_value(method, src, &[])?;
         if !self.is_object_value(iter) {
-            return Err(Thrown("TypeError: iterator is not an object".into()));
+            return Err(Thrown::from_static("TypeError: iterator is not an object"));
         }
         let next = self.get_prop(iter, "next")?;
         let mut out = Vec::new();
         loop {
             let res = self.call_value(next, iter, &[])?;
             if !self.is_object_value(res) {
-                return Err(Thrown("TypeError: iterator result is not an object".into()));
+                return Err(Thrown::from_static("TypeError: iterator result is not an object"));
             }
             let done = self.get_prop(res, "done")?;
             if self.truthy(done) {
@@ -127,8 +127,8 @@ impl<'p> Vm<'p> {
             let value = self.get_prop(res, "value")?;
             if out.try_reserve(1).is_err() {
                 self.iterator_close_quiet(iter);
-                return Err(Thrown(
-                    "RangeError: iterator result allocation failed".into(),
+                return Err(Thrown::from_static(
+                    "RangeError: iterator result allocation failed",
                 ));
             }
             out.push(value);
@@ -147,13 +147,13 @@ impl<'p> Vm<'p> {
     /// target is constructed (spec step 12.b runs per-k against the target).
     fn ta_from_source(&mut self, src: Value) -> Result<(usize, Option<Vec<Value>>), Thrown> {
         if src == Value::UNDEFINED || src == Value::NULL {
-            return Err(Thrown(
-                "TypeError: TypedArray.from source is null or undefined".into(),
+            return Err(Thrown::from_static(
+                "TypeError: TypedArray.from source is null or undefined",
             ));
         }
         let method = self.get_prop(src, "@@iterator")?;
         if method != Value::UNDEFINED && method != Value::NULL && !self.is_callable(method) {
-            return Err(Thrown("TypeError: source is not iterable".into()));
+            return Err(Thrown::from_static("TypeError: source is not iterable"));
         }
         if self.is_callable(method) {
             let list = self.iterator_to_list(src, method)?;
@@ -165,8 +165,8 @@ impl<'p> Vm<'p> {
         let n = if nf.is_nan() || nf <= 0.0 {
             0
         } else if nf > super::typedarray::MAX_ARRAY_BUFFER_LEN as f64 {
-            return Err(Thrown(
-                "RangeError: typed array length exceeds the maximum".into(),
+            return Err(Thrown::from_static(
+                "RangeError: typed array length exceeds the maximum",
             ));
         } else {
             nf as usize
@@ -265,7 +265,7 @@ impl<'p> Vm<'p> {
             };
             let number_len = self.to_number_strict(value)?;
             if u != number_len {
-                return Err(Thrown("RangeError: Invalid array length".into()));
+                return Err(Thrown::from_static("RangeError: Invalid array length"));
             }
             let aidx = a0.heap_index();
             if self.array_length_nonwritable.contains(&aidx)
@@ -1951,8 +1951,8 @@ impl<'p> Vm<'p> {
                 this.is_heap().then(|| self.heap.get(this.heap_index())),
                 Some(HeapObj::Temporal { .. })
             ) {
-                return Err(Thrown(
-                    "TypeError: Temporal field getter called on a non-Temporal receiver".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Temporal field getter called on a non-Temporal receiver",
                 ));
             }
             let field =
@@ -1964,8 +1964,8 @@ impl<'p> Vm<'p> {
                 // Step 1 (O must be an Object) precedes ToPropertyKey(P): a
                 // primitive target throws before the key's toString can run.
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Object.defineProperty called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Object.defineProperty called on non-object",
                     ));
                 }
                 let key = self.to_property_key(a1)?;
@@ -1980,8 +1980,8 @@ impl<'p> Vm<'p> {
                 // Object.defineProperties(O, Properties): Type(O) must be Object
                 // (a number/string/bool primitive throws, not just null/undefined).
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Object.defineProperties called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Object.defineProperties called on non-object",
                     ));
                 }
                 self.object_define_properties(a0, a1)?;
@@ -2026,8 +2026,8 @@ impl<'p> Vm<'p> {
             OBJ_CREATE => {
                 // Object.create(O, Properties): O must be Object or null.
                 if a0 != Value::NULL && !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Object prototype may only be an Object or null".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Object prototype may only be an Object or null",
                     ));
                 }
                 let o = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
@@ -2075,7 +2075,7 @@ impl<'p> Vm<'p> {
                 let total = tag
                     .len()
                     .checked_add(9)
-                    .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                    .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
                 let mut out = self.guest_string_with_capacity(total)?;
                 out.push_str("[object ");
                 out.push_str(&tag);
@@ -2085,8 +2085,8 @@ impl<'p> Vm<'p> {
             ERROR_TO_STRING => {
                 // Step 2: a non-Object receiver is a TypeError (before any Get).
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: Error.prototype.toString called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Error.prototype.toString called on a non-object",
                     ));
                 }
                 // `name` (default "Error") + ": " + `message` (default ""), dropping
@@ -2139,9 +2139,8 @@ impl<'p> Vm<'p> {
             FN_THROW_TYPE_ERROR => {
                 // %ThrowTypeError%: the restricted caller/arguments accessor — read
                 // OR write of Function.prototype.caller/arguments throws here.
-                return Err(Thrown(
-                    "TypeError: 'caller' and 'arguments' may not be accessed on this function"
-                        .into(),
+                return Err(Thrown::from_static(
+                    "TypeError: 'caller' and 'arguments' may not be accessed on this function",
                 ));
             }
             FINALLY_THEN | FINALLY_CATCH => {
@@ -2189,9 +2188,8 @@ impl<'p> Vm<'p> {
                 // (including a non-string value) is a TypeError. The hint is matched
                 // by exact string value (no coercion), per spec.
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: Date.prototype[Symbol.toPrimitive] called on a non-object"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Date.prototype[Symbol.toPrimitive] called on a non-object",
                     ));
                 }
                 let hint = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -2203,9 +2201,8 @@ impl<'p> Vm<'p> {
                 let order: [&str; 2] = match hint_s.as_str() {
                     "string" | "default" => ["toString", "valueOf"],
                     "number" => ["valueOf", "toString"],
-                    _ => return Err(Thrown(
-                        "TypeError: Date.prototype[Symbol.toPrimitive] called with an invalid hint"
-                            .into(),
+                    _ => return Err(Thrown::from_static(
+                        "TypeError: Date.prototype[Symbol.toPrimitive] called with an invalid hint",
                     )),
                 };
                 self.ordinary_to_primitive(this, order)?
@@ -2222,8 +2219,8 @@ impl<'p> Vm<'p> {
                 } else {
                     let m = self.get_prop(o, "toISOString")?;
                     if !self.is_callable(m) {
-                        return Err(Thrown(
-                            "TypeError: Date.prototype.toJSON: toISOString is not callable".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Date.prototype.toJSON: toISOString is not callable",
                         ));
                     }
                     self.call_value(m, o, &[])?
@@ -2241,9 +2238,8 @@ impl<'p> Vm<'p> {
                 // `String.prototype[Symbol.iterator]()` — RequireObjectCoercible +
                 // ToString, then a String Iterator yielding one code POINT at a time.
                 if this.is_nullish() {
-                    return Err(Thrown(
-                        "TypeError: String.prototype[Symbol.iterator] called on null or undefined"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: String.prototype[Symbol.iterator] called on null or undefined",
                     ));
                 }
                 // A string receiver iterates its EXACT code points (a lone
@@ -2260,7 +2256,7 @@ impl<'p> Vm<'p> {
                         self.preflight_native_iteration_work(byte_len as u64)?;
                         let mut list = Vec::new();
                         list.try_reserve_exact(byte_len).map_err(|_| {
-                            Thrown("RangeError: string iterator allocation failed".into())
+                            Thrown::from_static("RangeError: string iterator allocation failed")
                         })?;
                         if let HeapObj::Str(js) = self.heap.get(si) {
                             list.extend(js.code_points());
@@ -2271,14 +2267,14 @@ impl<'p> Vm<'p> {
                         self.preflight_native_iteration_work(s.len() as u64)?;
                         let mut list = Vec::new();
                         list.try_reserve_exact(s.len()).map_err(|_| {
-                            Thrown("RangeError: string iterator allocation failed".into())
+                            Thrown::from_static("RangeError: string iterator allocation failed")
                         })?;
                         list.extend(s.chars().map(u32::from));
                         list
                     };
                 let mut cps: Vec<Value> = Vec::new();
                 cps.try_reserve_exact(cp_list.len())
-                    .map_err(|_| Thrown("RangeError: string iterator allocation failed".into()))?;
+                    .map_err(|_| Thrown::from_static("RangeError: string iterator allocation failed"))?;
                 for cp in cp_list {
                     cps.push(self.str_from_cp(cp));
                 }
@@ -2305,8 +2301,8 @@ impl<'p> Vm<'p> {
                     a0.is_heap().then(|| self.heap.get(a0.heap_index())),
                     Some(HeapObj::Symbol { .. })
                 ) {
-                    return Err(Thrown(
-                        "TypeError: Symbol.keyFor requires that the argument be a Symbol".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Symbol.keyFor requires that the argument be a Symbol",
                     ));
                 }
                 let key = self
@@ -2323,9 +2319,8 @@ impl<'p> Vm<'p> {
                 let n =
                     match self.this_bigint_val(this) {
                         Some(n) => n,
-                        None => return Err(Thrown(
-                            "TypeError: BigInt.prototype.toString requires that 'this' be a BigInt"
-                                .into(),
+                        None => return Err(Thrown::from_static(
+                            "TypeError: BigInt.prototype.toString requires that 'this' be a BigInt",
                         )),
                     };
                 // radix = ToIntegerOrInfinity(arg): ToNumber first, so a BigInt or
@@ -2337,8 +2332,8 @@ impl<'p> Vm<'p> {
                     self.to_number_strict(a0)? as i64
                 };
                 if !(2..=36).contains(&radix) {
-                    return Err(Thrown(
-                        "RangeError: toString() radix must be between 2 and 36".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: toString() radix must be between 2 and 36",
                     ));
                 }
                 self.alloc_str(n.to_radix_string(radix as u32))
@@ -2349,9 +2344,8 @@ impl<'p> Vm<'p> {
                 // and format through it — so a bad locale/option throws exactly
                 // what the constructor would.
                 let Some(n) = self.this_bigint_val(this) else {
-                    return Err(Thrown(
-                        "TypeError: BigInt.prototype.toLocaleString requires that 'this' be a BigInt"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: BigInt.prototype.toLocaleString requires that 'this' be a BigInt",
                     ));
                 };
                 #[cfg(not(feature = "wasm-lite"))]
@@ -2359,7 +2353,7 @@ impl<'p> Vm<'p> {
                     let nf = self.make_intl(native::INTL_NUMBERFORMAT, a0, a1)?;
                     let resolved = match self.heap.get(nf.heap_index()) {
                         HeapObj::Intl { resolved, .. } => *resolved,
-                        _ => return Err(Thrown("TypeError: NumberFormat expected".into())),
+                        _ => return Err(Thrown::from_static("TypeError: NumberFormat expected")),
                     };
                     let prim = self.make_bigint_val(n);
                     self.intl_number_format(resolved, prim)?
@@ -2372,9 +2366,8 @@ impl<'p> Vm<'p> {
             BIGINT_VALUE_OF => match self.this_bigint_val(this) {
                 Some(n) => self.make_bigint_val(n),
                 None => {
-                    return Err(Thrown(
-                        "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt",
                     ))
                 }
             },
@@ -2384,8 +2377,8 @@ impl<'p> Vm<'p> {
                 // (unlike the lenient BigInt() ctor coercion `to_bigint` allows).
                 let bits = self.to_index(a0)?;
                 if a1.is_number() {
-                    return Err(Thrown(
-                        "TypeError: cannot convert a Number to a BigInt".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: cannot convert a Number to a BigInt",
                     ));
                 }
                 let x = self.to_bigint(a1)?;
@@ -2400,8 +2393,8 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::RegExp { .. })
                 ) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.exec called on a non-RegExp",
                     ));
                 }
                 self.regexp_exec(this.heap_index(), a0)?
@@ -2414,8 +2407,8 @@ impl<'p> Vm<'p> {
                 // `RegExp.prototype.test.call({ exec() {…} }, "")` throw, and
                 // made a patched `re.exec` invisible to `re.test`.
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype.test called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.test called on a non-object",
                     ));
                 }
                 let is_re = this.is_heap()
@@ -2439,15 +2432,15 @@ impl<'p> Vm<'p> {
                 if self.is_callable(exec) {
                     let res = self.call_value(exec, this, &[s])?;
                     if res != Value::NULL && !self.is_object_value(res) {
-                        return Err(Thrown(
-                            "TypeError: RegExp exec method returned something other than an Object or null".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: RegExp exec method returned something other than an Object or null",
                         ));
                     }
                     return Ok(Value::bool(res != Value::NULL));
                 }
                 if !is_re {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype.test called on a non-RegExp".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.test called on a non-RegExp",
                     ));
                 }
                 let r = self.regexp_exec_impl(this.heap_index(), s, false)?;
@@ -2459,8 +2452,8 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::RegExp { .. })
                 ) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype.compile called on a non-RegExp".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.compile called on a non-RegExp",
                     ));
                 }
                 // AnnexB: compile is a LEGACY feature — an instance created by a
@@ -2470,9 +2463,8 @@ impl<'p> Vm<'p> {
                 if !self.realm_global_objs.is_empty()
                     && self.get_function_realm(this) != self.native_callee_realm.unwrap_or(0)
                 {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype.compile: receiver belongs to another realm"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.compile: receiver belongs to another realm",
                     ));
                 }
                 // RegExp SUBCLASS (its [[Prototype]] is not %RegExp.prototype% —
@@ -2481,8 +2473,8 @@ impl<'p> Vm<'p> {
                 if self.proto_of.get(&this.heap_index()).map_or(false, |p| {
                     !p.is_heap() || p.heap_index() != self.native_home(self.regexp_proto)
                 }) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype.compile may not be used on a subclass instance".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.compile may not be used on a subclass instance",
                     ));
                 }
                 // AnnexB step 3: if pattern has [[RegExpMatcher]], flags must be
@@ -2492,8 +2484,8 @@ impl<'p> Vm<'p> {
                     Some(HeapObj::RegExp { .. })
                 ) && a1 != Value::UNDEFINED
                 {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype.compile: flags must be undefined when pattern is a RegExp".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.compile: flags must be undefined when pattern is a RegExp",
                     ));
                 }
                 // Reuse the constructor path (validates flags, builds and
@@ -2549,8 +2541,8 @@ impl<'p> Vm<'p> {
                 // RegExp.escape(S): escape S so it matches itself literally. Throws
                 // TypeError unless S is a String (no coercion).
                 if !(a0.is_heap() && self.heap.is_str_like(a0.heap_index())) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.escape called with a non-string argument".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.escape called with a non-string argument",
                     ));
                 }
                 // EXACT code points (the argument is a string by the check
@@ -2572,8 +2564,8 @@ impl<'p> Vm<'p> {
                 // 22.2.6.14 step 2: a non-Object receiver is a TypeError before any
                 // Get — a primitive would otherwise render as "/undefined/undefined".
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype.toString called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.toString called on a non-object",
                     ));
                 }
                 let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
@@ -2597,7 +2589,7 @@ impl<'p> Vm<'p> {
                             self.preflight_guest_string_size(total)?;
                             let mut out = Vec::new();
                             out.try_reserve_exact(total).map_err(|_| {
-                                Thrown("RangeError: string allocation failed".into())
+                                Thrown::from_static("RangeError: string allocation failed")
                             })?;
                             out.push(b'/');
                             out.extend_from_slice(&esc);
@@ -2632,8 +2624,8 @@ impl<'p> Vm<'p> {
             }
             REGEXP_GET_SOURCE => {
                 if !this.is_heap() {
-                    return Err(Thrown(
-                        "TypeError: get source called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: get source called on a non-object",
                     ));
                 }
                 let idx = this.heap_index();
@@ -2645,8 +2637,8 @@ impl<'p> Vm<'p> {
                     // bytes (lone surrogates round-trip), else lossy.
                     self.regexp_source_value(idx, &s)?
                 } else {
-                    return Err(Thrown(
-                        "TypeError: get source called on a non-RegExp object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: get source called on a non-RegExp object",
                     ));
                 }
             }
@@ -2662,7 +2654,7 @@ impl<'p> Vm<'p> {
                             | HeapObj::Symbol { .. }
                     );
                 if !is_obj {
-                    return Err(Thrown("TypeError: get flags called on a non-object".into()));
+                    return Err(Thrown::from_static("TypeError: get flags called on a non-object"));
                 }
                 let mut out = String::new();
                 for (prop, ch) in [
@@ -2686,8 +2678,8 @@ impl<'p> Vm<'p> {
                 // Spec-generic: Type(this) need only be Object (a plain object with
                 // a custom `exec`/`lastIndex` works); RegExpExec dispatches to its exec.
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.search] called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.search] called on a non-object",
                     ));
                 }
                 self.regexp_search_impl(this, a0)?
@@ -2696,8 +2688,8 @@ impl<'p> Vm<'p> {
                 // Generic over any Object `this` (the observable protocol lives in
                 // regexp_match_impl, honouring a user `exec`/`flags`/`lastIndex`).
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.match] called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.match] called on a non-object",
                     ));
                 }
                 self.regexp_match_impl(this.heap_index(), a0)?
@@ -2706,8 +2698,8 @@ impl<'p> Vm<'p> {
                 // Generic over any Object `this` (the observable protocol —
                 // SpeciesConstructor + sticky splitter — lives in regexp_split_impl).
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.split] called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.split] called on a non-object",
                     ));
                 }
                 self.regexp_split_impl(this.heap_index(), a0, a1)?
@@ -2717,8 +2709,8 @@ impl<'p> Vm<'p> {
                 // (a plain object with a custom `exec` works); the observable
                 // protocol lives in regexp_symbol_replace.
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.replace] called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.replace] called on a non-object",
                     ));
                 }
                 self.regexp_symbol_replace(this, a0, a1)?
@@ -2730,9 +2722,8 @@ impl<'p> Vm<'p> {
                 // observed), and its lastIndex copies R's via ToLength(Get(R,
                 // "lastIndex")). Eagerly computed over the (real-RegExp) clone.
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.matchAll] called on a non-object"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.matchAll] called on a non-object",
                     ));
                 }
                 // A custom @@species Construct re-enters the interpreter; hold the
@@ -2907,8 +2898,8 @@ impl<'p> Vm<'p> {
                     if ctor == Value::UNDEFINED {
                         default_ctor
                     } else if !self.is_object_value(ctor) {
-                        return Err(Thrown(
-                            "TypeError: RegExp.prototype[Symbol.matchAll]: constructor is not an object".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: RegExp.prototype[Symbol.matchAll]: constructor is not an object",
                         ));
                     } else {
                         let sp = self.get_prop(ctor, "@@species")?;
@@ -2917,8 +2908,8 @@ impl<'p> Vm<'p> {
                         } else if self.is_constructor(sp) {
                             sp
                         } else {
-                            return Err(Thrown(
-                                "TypeError: RegExp.prototype[Symbol.matchAll]: @@species is not a constructor".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: RegExp.prototype[Symbol.matchAll]: @@species is not a constructor",
                             ));
                         }
                     }
@@ -3000,8 +2991,8 @@ impl<'p> Vm<'p> {
                     _ => 'd', // REGEXP_GET_HASINDICES
                 };
                 if !this.is_heap() {
-                    return Err(Thrown(
-                        "TypeError: RegExp flag getter called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp flag getter called on a non-object",
                     ));
                 }
                 let idx = this.heap_index();
@@ -3012,8 +3003,8 @@ impl<'p> Vm<'p> {
                 } else if let HeapObj::RegExp { flags, .. } = self.heap.get(idx) {
                     Value::bool(flags.contains(ch))
                 } else {
-                    return Err(Thrown(
-                        "TypeError: RegExp flag getter called on a non-RegExp object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp flag getter called on a non-RegExp object",
                     ));
                 }
             }
@@ -3036,8 +3027,8 @@ impl<'p> Vm<'p> {
             }
             FN_BIND => {
                 if !self.is_callable(this) {
-                    return Err(Thrown(
-                        "TypeError: Function.prototype.bind called on a non-callable".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Function.prototype.bind called on a non-callable",
                     ));
                 }
                 // Spec 20.2.3.2 step 3 is BoundFunctionCreate, whose first step is
@@ -3148,9 +3139,8 @@ impl<'p> Vm<'p> {
             }
             FN_TO_STRING => {
                 if !this.is_heap() {
-                    return Err(Thrown(
-                        "TypeError: Function.prototype.toString requires that 'this' be a Function"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Function.prototype.toString requires that 'this' be a Function",
                     ));
                 }
                 // User functions carry their exact source slice; everything else
@@ -3185,9 +3175,8 @@ impl<'p> Vm<'p> {
                     HeapObj::Proxy {
                         target, revoked, ..
                     } if !*revoked && self.is_callable(*target) => None,
-                    _ => return Err(Thrown(
-                        "TypeError: Function.prototype.toString requires that 'this' be a Function"
-                            .into(),
+                    _ => return Err(Thrown::from_static(
+                        "TypeError: Function.prototype.toString requires that 'this' be a Function",
                     )),
                 };
                 let out = match stored {
@@ -3284,9 +3273,8 @@ impl<'p> Vm<'p> {
                                     args.get(2).copied().unwrap_or(Value::UNDEFINED),
                                 )?;
                             }
-                            return Err(Thrown(
-                                "TypeError: Abstract class TypedArray not directly constructable"
-                                    .into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: Abstract class TypedArray not directly constructable",
                             ));
                         }
                         // A user-defined constructor as `this`: %TypedArray%.from/of
@@ -3303,8 +3291,8 @@ impl<'p> Vm<'p> {
                             let _gc = self.gc_lock_guard();
                             let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
                             if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
-                                return Err(Thrown(
-                                    "TypeError: TypedArray.from mapfn is not a function".into(),
+                                return Err(Thrown::from_static(
+                                    "TypeError: TypedArray.from mapfn is not a function",
                                 ));
                             }
                             let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
@@ -3314,8 +3302,8 @@ impl<'p> Vm<'p> {
                                 self.preflight_native_iteration_work(args.len() as u64)?;
                                 let mut list = Vec::new();
                                 list.try_reserve_exact(args.len()).map_err(|_| {
-                                    Thrown(
-                                        "RangeError: typed array source allocation failed".into(),
+                                    Thrown::from_static(
+                                        "RangeError: typed array source allocation failed",
                                     )
                                 })?;
                                 list.extend_from_slice(args);
@@ -3334,21 +3322,21 @@ impl<'p> Vm<'p> {
                                 Some(HeapObj::TypedArray { buffer, .. }) => {
                                     let b = *buffer;
                                     if self.immutable_buffers.contains(&b) {
-                                        return Err(Thrown(
-                                            "TypeError: TypedArray.from/of constructor returned a TypedArray backed by an immutable ArrayBuffer".into(),
+                                        return Err(Thrown::from_static(
+                                            "TypeError: TypedArray.from/of constructor returned a TypedArray backed by an immutable ArrayBuffer",
                                         ));
                                     }
                                     target.heap_index()
                                 }
                                 _ => {
-                                    return Err(Thrown(
-                                        "TypeError: TypedArray.from/of constructor did not return a TypedArray".into(),
+                                    return Err(Thrown::from_static(
+                                        "TypeError: TypedArray.from/of constructor did not return a TypedArray",
                                     ))
                                 }
                             };
                             if self.ta_effective_len(tidx).unwrap_or(0) < n {
-                                return Err(Thrown(
-                                    "TypeError: TypedArray.from/of constructor returned a TypedArray shorter than the requested length".into(),
+                                return Err(Thrown::from_static(
+                                    "TypeError: TypedArray.from/of constructor returned a TypedArray shorter than the requested length",
                                 ));
                             }
                             for i in 0..n {
@@ -3367,8 +3355,8 @@ impl<'p> Vm<'p> {
                             }
                             return Ok(target);
                         }
-                        return Err(Thrown(
-                            "TypeError: this is not a TypedArray constructor".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: this is not a TypedArray constructor",
                         ));
                     }
                 };
@@ -3380,8 +3368,8 @@ impl<'p> Vm<'p> {
                 let _gc = self.gc_lock_guard();
                 let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
                 if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
-                    return Err(Thrown(
-                        "TypeError: TypedArray.from mapfn is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: TypedArray.from mapfn is not a function",
                     ));
                 }
                 let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
@@ -3391,7 +3379,7 @@ impl<'p> Vm<'p> {
                     self.preflight_native_iteration_work(args.len() as u64)?;
                     let mut list = Vec::new();
                     list.try_reserve_exact(args.len()).map_err(|_| {
-                        Thrown("RangeError: typed array source allocation failed".into())
+                        Thrown::from_static("RangeError: typed array source allocation failed")
                     })?;
                     list.extend_from_slice(args);
                     (args.len(), Some(list))
@@ -3427,8 +3415,8 @@ impl<'p> Vm<'p> {
                             length,
                         }) => (*buffer, *kind, *byte_offset, *length),
                         _ => {
-                            return Err(Thrown(
-                                "TypeError: TypedArray accessor called on a non-TypedArray".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: TypedArray accessor called on a non-TypedArray",
                             ))
                         }
                     };
@@ -3484,12 +3472,12 @@ impl<'p> Vm<'p> {
                         .timer_queue
                         .len()
                         .checked_add(1)
-                        .ok_or_else(|| Thrown("RangeError: timer queue is too large".into()))?;
+                        .ok_or_else(|| Thrown::from_static("RangeError: timer queue is too large"))?;
                     let delay = host_timeout_duration(ms)?;
                     self.preflight_native_iteration_work(timer_queue_work_bound(next_len))?;
                     self.timer_queue
                         .try_reserve(1)
-                        .map_err(|_| Thrown("RangeError: timer queue allocation failed".into()))?;
+                        .map_err(|_| Thrown::from_static("RangeError: timer queue allocation failed"))?;
                     let due = crate::vm::clock::Instant::now() + delay;
                     self.timer_queue.push((due, cb));
                 }
@@ -3552,8 +3540,8 @@ impl<'p> Vm<'p> {
             // The Annex-B call-assignment-target rewrite's deferred PutValue
             // error (see lib.rs annexb_call_target_rewrite): always throws.
             ANNEXB_REF_ERROR => {
-                return Err(Thrown(
-                    "ReferenceError: Invalid left-hand side in assignment".into(),
+                return Err(Thrown::from_static(
+                    "ReferenceError: Invalid left-hand side in assignment",
                 ))
             }
             GLOBAL_PRINT => {
@@ -3706,16 +3694,16 @@ impl<'p> Vm<'p> {
                 // RequireObjectCoercible(O); proto must be Object or null.
                 self.require_object_coercible(o)?;
                 if proto != Value::NULL && !self.is_object_value(proto) {
-                    return Err(Thrown(
-                        "TypeError: Object prototype may only be an Object or null".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Object prototype may only be an Object or null",
                     ));
                 }
                 // Object.setPrototypeOf returns O, but throws if [[SetPrototypeOf]]
                 // rejects the change (non-extensible / cycle / immutable prototype /
                 // a Proxy trap returning falsish).
                 if !self.ordinary_set_prototype_of(o, proto)? {
-                    return Err(Thrown(
-                        "TypeError: Object.setPrototypeOf failed (target is non-extensible, the change is cyclic, or it has an immutable prototype)".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Object.setPrototypeOf failed (target is non-extensible, the change is cyclic, or it has an immutable prototype)",
                     ));
                 }
                 o
@@ -3905,9 +3893,8 @@ impl<'p> Vm<'p> {
                             let has_exports = !m.is_empty();
                             self.ns_tdz_check_all(o)?;
                             if has_exports {
-                                return Err(Thrown(
-                                    "TypeError: Cannot freeze a module namespace object with exports"
-                                        .into(),
+                                return Err(Thrown::from_static(
+                                    "TypeError: Cannot freeze a module namespace object with exports",
                                 ));
                             }
                         }
@@ -3949,8 +3936,8 @@ impl<'p> Vm<'p> {
                         HeapObj::TypedArray { buffer, .. }
                             if !self.ta_is_fixed_length(idx, *buffer) =>
                         {
-                            return Err(Thrown(
-                                "TypeError: Cannot prevent extensions on a TypedArray whose length can change".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: Cannot prevent extensions on a TypedArray whose length can change",
                             ));
                         }
                         // SetIntegrityLevel then redefines every index property
@@ -4128,10 +4115,10 @@ impl<'p> Vm<'p> {
                 let src = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if !(cb.is_heap() && self.heap.as_callable(cb.heap_index()).is_some()) {
-                    return Err(Thrown("TypeError: groupBy callback is not callable".into()));
+                    return Err(Thrown::from_static("TypeError: groupBy callback is not callable"));
                 }
                 if !src.is_heap() {
-                    return Err(Thrown("TypeError: groupBy items is not iterable".into()));
+                    return Err(Thrown::from_static("TypeError: groupBy items is not iterable"));
                 }
                 // GroupBy steps one element at a time — IteratorStepValue, the
                 // callback, then (Object.groupBy) ToPropertyKey — and an abrupt
@@ -4212,8 +4199,8 @@ impl<'p> Vm<'p> {
             // Promise.withResolvers() -> { promise, resolve, reject }.
             PROMISE_WITH_RESOLVERS => {
                 if !self.is_constructor(this) {
-                    return Err(Thrown(
-                        "TypeError: Promise.withResolvers called on a non-constructor".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Promise.withResolvers called on a non-constructor",
                     ));
                 }
                 // NewPromiseCapability(C): the native Promise builds a native promise
@@ -4245,8 +4232,8 @@ impl<'p> Vm<'p> {
             }
             PROMISE_TRY => {
                 if !self.is_constructor(this) {
-                    return Err(Thrown(
-                        "TypeError: Promise.try called on a non-constructor".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Promise.try called on a non-constructor",
                     ));
                 }
                 let rest: Vec<Value> = if args.len() > 1 {
@@ -4305,8 +4292,8 @@ impl<'p> Vm<'p> {
                 // getter on the argument object surfaced instead of the
                 // TypeError the non-callable target owes.
                 if !self.is_callable(target) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.apply target is not a function".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.apply target is not a function",
                     ));
                 }
                 // Reflect.apply requires an array-like argumentsList (CreateListFromArrayLike).
@@ -4316,8 +4303,8 @@ impl<'p> Vm<'p> {
             REFLECT_CONSTRUCT => {
                 let target = a0;
                 if !self.is_constructor(target) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.construct target is not a constructor".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.construct target is not a constructor",
                     ));
                 }
                 // An explicit newTarget (3rd arg) must also be a constructor. We
@@ -4325,8 +4312,8 @@ impl<'p> Vm<'p> {
                 // what test262's isConstructor relies on.
                 if let Some(nt) = args.get(2) {
                     if !self.is_constructor(*nt) {
-                        return Err(Thrown(
-                            "TypeError: Reflect.construct newTarget is not a constructor".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Reflect.construct newTarget is not a constructor",
                         ));
                     }
                 }
@@ -4344,7 +4331,7 @@ impl<'p> Vm<'p> {
             }
             REFLECT_GET => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.get called on non-object".into()));
+                    return Err(Thrown::from_static("TypeError: Reflect.get called on non-object"));
                 }
                 // Reflect.get(target, key, receiver?): an explicit receiver is the
                 // `this` for an accessor getter (else the target). Use the index
@@ -4360,7 +4347,7 @@ impl<'p> Vm<'p> {
             }
             REFLECT_SET => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.set called on non-object".into()));
+                    return Err(Thrown::from_static("TypeError: Reflect.set called on non-object"));
                 }
                 let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 // ToPropertyKey once (an object key may have a side-effecting
@@ -4372,15 +4359,15 @@ impl<'p> Vm<'p> {
             }
             REFLECT_HAS => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.has called on non-object".into()));
+                    return Err(Thrown::from_static("TypeError: Reflect.has called on non-object"));
                 }
                 let kv = self.coerce_index_key(a1)?;
                 Value::bool(self.has_property_dyn(a0, kv)?)
             }
             REFLECT_DELETE => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.deleteProperty called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.deleteProperty called on non-object",
                     ));
                 }
                 let key = self.to_property_key(a1)?;
@@ -4390,38 +4377,37 @@ impl<'p> Vm<'p> {
             }
             REFLECT_OWN_KEYS => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.ownKeys called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.ownKeys called on non-object",
                     ));
                 }
                 self.object_own_keys(a0)?
             }
             REFLECT_GET_PROTO => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.getPrototypeOf called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.getPrototypeOf called on non-object",
                     ));
                 }
                 self.get_prototype_of_checked(a0)?
             }
             REFLECT_SET_PROTO => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.setPrototypeOf called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.setPrototypeOf called on non-object",
                     ));
                 }
                 if a1 != Value::NULL && !self.is_object_value(a1) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.setPrototypeOf prototype must be an object or null"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.setPrototypeOf prototype must be an object or null",
                     ));
                 }
                 Value::bool(self.ordinary_set_prototype_of(a0, a1)?)
             }
             REFLECT_DEFINE => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.defineProperty called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.defineProperty called on non-object",
                     ));
                 }
                 // ToPropertyKey(propertyKey) is step 2 — BEFORE ToPropertyDescriptor
@@ -4430,8 +4416,8 @@ impl<'p> Vm<'p> {
                 let key = self.to_property_key(a1)?;
                 let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_object_value(desc) {
-                    return Err(Thrown(
-                        "TypeError: Property description must be an object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Property description must be an object",
                     ));
                 }
                 // ToPropertyDescriptor(desc) is validated FIRST: an invalid
@@ -4475,8 +4461,8 @@ impl<'p> Vm<'p> {
             }
             REFLECT_GET_OWN_DESC => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.getOwnPropertyDescriptor called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.getOwnPropertyDescriptor called on non-object",
                     ));
                 }
                 let key = self.to_property_key(a1)?;
@@ -4488,8 +4474,8 @@ impl<'p> Vm<'p> {
             }
             REFLECT_IS_EXT => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.isExtensible called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.isExtensible called on non-object",
                     ));
                 }
                 if let Some(b) = self.proxy_is_extensible(a0)? {
@@ -4506,8 +4492,8 @@ impl<'p> Vm<'p> {
             }
             REFLECT_PREVENT_EXT => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Reflect.preventExtensions called on non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.preventExtensions called on non-object",
                     ));
                 }
                 if let Some(b) = self.proxy_prevent_extensions(a0)? {
@@ -4614,8 +4600,8 @@ impl<'p> Vm<'p> {
                 let bytes = s.as_bytes();
                 let ws = |c: u8| matches!(c, b'\t' | b'\n' | b'\r' | b' ');
                 if s.is_empty() || ws(bytes[0]) || ws(bytes[bytes.len() - 1]) {
-                    return Err(Thrown(
-                        "SyntaxError: JSON.rawJSON text must be non-empty without leading/trailing whitespace".into(),
+                    return Err(Thrown::from_static(
+                        "SyntaxError: JSON.rawJSON text must be non-empty without leading/trailing whitespace",
                     ));
                 }
                 // Validate it parses as one complete JSON value (checks trailing)
@@ -4624,8 +4610,8 @@ impl<'p> Vm<'p> {
                 // exactly when it starts with `{`/`[`.)
                 self.json_parse(s.as_bytes())?;
                 if matches!(bytes[0], b'{' | b'[') {
-                    return Err(Thrown(
-                        "SyntaxError: JSON.rawJSON text must be a primitive JSON value".into(),
+                    return Err(Thrown::from_static(
+                        "SyntaxError: JSON.rawJSON text must be a primitive JSON value",
                     ));
                 }
                 let _gc = self.gc_lock_guard();
@@ -4680,8 +4666,8 @@ impl<'p> Vm<'p> {
                 loop {
                     let res = self.call_value(next, iter, &[])?;
                     if !self.is_object_value(res) {
-                        return Err(Thrown(
-                            "TypeError: Math.sumPrecise: iterator result is not an object".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Math.sumPrecise: iterator result is not an object",
                         ));
                     }
                     let done = self.get_prop(res, "done")?;
@@ -4696,13 +4682,13 @@ impl<'p> Vm<'p> {
                     let v = self.get_prop(res, "value")?;
                     if !(v.is_int() || v.is_double()) {
                         let _ = self.iterator_close(iter);
-                        return Err(Thrown(
-                            "TypeError: Math.sumPrecise: each element must be a Number".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Math.sumPrecise: each element must be a Number",
                         ));
                     }
                     if nums.try_reserve(1).is_err() {
                         self.iterator_close_quiet(iter);
-                        return Err(Thrown("RangeError: precise sum allocation failed".into()));
+                        return Err(Thrown::from_static("RangeError: precise sum allocation failed"));
                     }
                     nums.push(v.as_f64());
                 }
@@ -4728,8 +4714,8 @@ impl<'p> Vm<'p> {
                 // already did and this, the extracted-getter path, did not.
                 Some(HeapObj::Set(_)) => Value::num(self.coll_live_len(this.heap_index()) as f64),
                 _ => {
-                    return Err(Thrown(
-                        "TypeError: get Set.prototype.size called on incompatible receiver".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: get Set.prototype.size called on incompatible receiver",
                     ))
                 }
             },
@@ -4738,8 +4724,8 @@ impl<'p> Vm<'p> {
                     Value::num(self.coll_live_len(this.heap_index()) as f64)
                 }
                 _ => {
-                    return Err(Thrown(
-                        "TypeError: get Map.prototype.size called on incompatible receiver".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: get Map.prototype.size called on incompatible receiver",
                     ))
                 }
             },
@@ -4755,8 +4741,8 @@ impl<'p> Vm<'p> {
                 // (re)capture, per spec.
                 if let Some((r, j)) = self.cap_capture {
                     if r != Value::UNDEFINED || j != Value::UNDEFINED {
-                        return Err(Thrown(
-                            "TypeError: Promise capability executor already invoked".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Promise capability executor already invoked",
                         ));
                     }
                 }
@@ -4770,9 +4756,8 @@ impl<'p> Vm<'p> {
                 let target =
                     match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                         Some(HeapObj::WeakRef(t)) => *t,
-                        _ => return Err(Thrown(
-                            "TypeError: WeakRef.prototype.deref called on incompatible receiver"
-                                .into(),
+                        _ => return Err(Thrown::from_static(
+                            "TypeError: WeakRef.prototype.deref called on incompatible receiver",
                         )),
                     };
                 if target != Value::UNDEFINED {
@@ -4789,9 +4774,8 @@ impl<'p> Vm<'p> {
                 let (live, mut index) =
                     match this.is_heap().then(|| self.heap.get(it_idx)) {
                         Some(HeapObj::Iterator { live, index, .. }) => (*live, *index),
-                        _ => return Err(Thrown(
-                            "TypeError: Iterator.prototype.next called on incompatible receiver"
-                                .into(),
+                        _ => return Err(Thrown::from_static(
+                            "TypeError: Iterator.prototype.next called on incompatible receiver",
                         )),
                     };
                 // A lazy %RegExpStringIterator%: one RegExpExec per next().
@@ -4817,8 +4801,8 @@ impl<'p> Vm<'p> {
                         } else {
                             match self.ta_effective_len(coll) {
                             None => {
-                                return Err(Thrown(
-                                    "TypeError: TypedArray iterator: the viewed buffer is out of bounds".into(),
+                                return Err(Thrown::from_static(
+                                    "TypeError: TypedArray iterator: the viewed buffer is out of bounds",
                                 ))
                             }
                             Some(n) if index >= n => (Value::UNDEFINED, true),
@@ -4880,8 +4864,8 @@ impl<'p> Vm<'p> {
                 let ret = self.get_prop(this, "return")?;
                 if !ret.is_nullish() {
                     if !self.is_callable(ret) {
-                        return Err(Thrown(
-                            "TypeError: iterator return is not a function".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: iterator return is not a function",
                         ));
                     }
                     self.call_value(ret, this, &[])?;
@@ -4897,9 +4881,8 @@ impl<'p> Vm<'p> {
                 let kind =
                     match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                         Some(HeapObj::IterHelper { kind, .. }) => *kind,
-                        _ => return Err(Thrown(
-                            "TypeError: Iterator Helper next called on an incompatible receiver"
-                                .into(),
+                        _ => return Err(Thrown::from_static(
+                            "TypeError: Iterator Helper next called on an incompatible receiver",
                         )),
                     };
                 // kind 7 = a zip/zipKeyed helper (multi-iterator, lockstep).
@@ -4927,8 +4910,8 @@ impl<'p> Vm<'p> {
                             // Re-entrant return() while a step is executing is a TypeError
                             // (GeneratorValidate), the same as a re-entrant next().
                             if *running {
-                                return Err(Thrown(
-                                    "TypeError: Iterator is already running".into(),
+                                return Err(Thrown::from_static(
+                                    "TypeError: Iterator is already running",
                                 ));
                             }
                             // `idx > 0` ⇒ the helper has yielded (suspended at a yield),
@@ -4937,9 +4920,8 @@ impl<'p> Vm<'p> {
                             // re-entrant next()/return() during its close does not throw.
                             (*kind, *source, *inner, *done, *idx > 0)
                         }
-                        _ => return Err(Thrown(
-                            "TypeError: Iterator Helper return called on an incompatible receiver"
-                                .into(),
+                        _ => return Err(Thrown::from_static(
+                            "TypeError: Iterator Helper return called on an incompatible receiver",
                         )),
                     };
                     // kind 5 = the WrapForValidIterator (Iterator.from): its return()
@@ -4952,8 +4934,8 @@ impl<'p> Vm<'p> {
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
                         if !self.is_callable(ret) {
-                            return Err(Thrown(
-                                "TypeError: iterator return is not a function".into(),
+                            return Err(Thrown::from_static(
+                                "TypeError: iterator return is not a function",
                             ));
                         }
                         return self.call_value(ret, source, &[]);
@@ -5063,9 +5045,8 @@ impl<'p> Vm<'p> {
                 // throws before the getter is type-checked or the key is coerced.
                 self.require_object_coercible(this)?;
                 if !self.is_callable(a1) {
-                    return Err(Thrown(
-                        "TypeError: Object.prototype.__define[GS]etter__: expecting a function"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Object.prototype.__define[GS]etter__: expecting a function",
                     ));
                 }
                 let key = self.to_property_key(a0)?;
@@ -5113,8 +5094,8 @@ impl<'p> Vm<'p> {
                     && self.is_object_value(this)
                     && !self.ordinary_set_prototype_of(this, a0)?
                 {
-                    return Err(Thrown(
-                        "TypeError: cannot set prototype (target is non-extensible, the change is cyclic, or it has an immutable prototype)".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: cannot set prototype (target is non-extensible, the change is cyclic, or it has an immutable prototype)",
                     ));
                 }
                 Value::UNDEFINED
@@ -5130,8 +5111,8 @@ impl<'p> Vm<'p> {
                 // [[ErrorData]] yields undefined; an Error instance yields an
                 // implementation-defined stack string.
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: Error.prototype.stack getter called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Error.prototype.stack getter called on a non-object",
                     ));
                 }
                 if this.is_heap() && self.error_data.contains(&this.heap_index()) {
@@ -5147,13 +5128,13 @@ impl<'p> Vm<'p> {
                 // object throws TypeError; otherwise create an own data
                 // property (none yet) or ordinary-Set the existing own one.
                 if !self.is_object_value(this) {
-                    return Err(Thrown(
-                        "TypeError: Error.prototype.stack setter called on a non-object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Error.prototype.stack setter called on a non-object",
                     ));
                 }
                 if !self.is_string_value(a0) {
-                    return Err(Thrown(
-                        "TypeError: Error.prototype.stack setter requires a string value".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Error.prototype.stack setter requires a string value",
                     ));
                 }
                 // A createRealm child's `Error.prototype` is that realm's HOME
@@ -5185,9 +5166,8 @@ impl<'p> Vm<'p> {
                 // writable legacy statics): same %RegExp%-constructor brand
                 // check; the assigned value becomes the statics' input slot.
                 if !(this.is_heap() && this.heap_index() == self.regexp_ctor) {
-                    return Err(Thrown(
-                        "TypeError: RegExp legacy static setter called on a non-%RegExp% receiver"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp legacy static setter called on a non-%RegExp% receiver",
                     ));
                 }
                 #[cfg(feature = "safe-sandbox")]
@@ -5341,7 +5321,7 @@ impl<'p> Vm<'p> {
                 let rest_len = args.len().saturating_sub(1);
                 let mut rest: Vec<String> = Vec::new();
                 rest.try_reserve_exact(rest_len)
-                    .map_err(|_| Thrown("RangeError: host argument allocation failed".into()))?;
+                    .map_err(|_| Thrown::from_static("RangeError: host argument allocation failed"))?;
                 for &a in args.iter().skip(1) {
                     let value = self.to_js_string(a)?;
                     aggregate = checked_native_output_add(aggregate, value.len())?;
@@ -5477,26 +5457,25 @@ impl<'p> Vm<'p> {
                         match self.to_js_string(a)?.as_str() {
                             "base64" => false,
                             "base64url" => true,
-                            _ => return Err(Thrown(
-                                "TypeError: toBase64 alphabet must be \"base64\" or \"base64url\""
-                                    .into(),
+                            _ => return Err(Thrown::from_static(
+                                "TypeError: toBase64 alphabet must be \"base64\" or \"base64url\"",
                             )),
                         }
                     } else {
-                        return Err(Thrown(
-                            "TypeError: toBase64 alphabet must be a string".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: toBase64 alphabet must be a string",
                         ));
                     };
                     let op = self.get_prop(opts, "omitPadding")?;
                     (url, self.truthy(op))
                 } else {
-                    return Err(Thrown(
-                        "TypeError: toBase64 options must be an object".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: toBase64 options must be an object",
                     ));
                 };
                 let bytes = self
                     .u8_bytes(idx)
-                    .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
+                    .ok_or_else(|| Thrown::from_static("TypeError: Uint8Array buffer is detached"))?;
                 self.preflight_native_iteration_work(bytes.len() as u64)?;
                 let out_len = base64_output_len(bytes.len(), omit)?;
                 let mut out = self.guest_string_with_capacity(out_len)?;
@@ -5507,8 +5486,8 @@ impl<'p> Vm<'p> {
             U8_FROM_BASE64 => {
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_string_value(arg) {
-                    return Err(Thrown(
-                        "TypeError: Uint8Array.fromBase64 argument must be a string".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Uint8Array.fromBase64 argument must be a string",
                     ));
                 }
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -5529,9 +5508,8 @@ impl<'p> Vm<'p> {
                 let idx = self.u8_brand(this)?;
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_string_value(arg) {
-                    return Err(Thrown(
-                        "TypeError: Uint8Array.prototype.setFromBase64 argument must be a string"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Uint8Array.prototype.setFromBase64 argument must be a string",
                     ));
                 }
                 // Writing into an immutable-backed view is a TypeError — verified
@@ -5539,8 +5517,8 @@ impl<'p> Vm<'p> {
                 if let HeapObj::TypedArray { buffer, .. } = self.heap.get(idx) {
                     let buffer = *buffer;
                     if self.immutable_buffers.contains(&buffer) {
-                        return Err(Thrown(
-                            "TypeError: Cannot setFromBase64 into a TypedArray backed by an immutable ArrayBuffer".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Cannot setFromBase64 into a TypedArray backed by an immutable ArrayBuffer",
                         ));
                     }
                 }
@@ -5550,7 +5528,7 @@ impl<'p> Vm<'p> {
                 self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
                 let max = self
                     .ta_effective_len(idx)
-                    .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
+                    .ok_or_else(|| Thrown::from_static("TypeError: Uint8Array buffer is detached"))?;
                 let (read, b, err) = from_base64(&s, url, lch, max);
                 let written = b.len();
                 self.u8_write(idx, &b);
@@ -5577,7 +5555,7 @@ impl<'p> Vm<'p> {
                 let idx = self.u8_brand(this)?;
                 let bytes = self
                     .u8_bytes(idx)
-                    .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
+                    .ok_or_else(|| Thrown::from_static("TypeError: Uint8Array buffer is detached"))?;
                 self.preflight_native_iteration_work(bytes.len() as u64)?;
                 let out_len = bytes
                     .len()
@@ -5595,9 +5573,8 @@ impl<'p> Vm<'p> {
                 let idx = self.u8_brand(this)?;
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_string_value(arg) {
-                    return Err(Thrown(
-                        "TypeError: Uint8Array.prototype.setFromHex argument must be a string"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Uint8Array.prototype.setFromHex argument must be a string",
                     ));
                 }
                 // Writing into a TypedArray backed by an immutable ArrayBuffer is a
@@ -5606,8 +5583,8 @@ impl<'p> Vm<'p> {
                 if let HeapObj::TypedArray { buffer, .. } = self.heap.get(idx) {
                     let buffer = *buffer;
                     if self.immutable_buffers.contains(&buffer) {
-                        return Err(Thrown(
-                            "TypeError: Cannot setFromHex into a TypedArray backed by an immutable ArrayBuffer".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Cannot setFromHex into a TypedArray backed by an immutable ArrayBuffer",
                         ));
                     }
                 }
@@ -5615,7 +5592,7 @@ impl<'p> Vm<'p> {
                 self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
                 let max = self
                     .ta_effective_len(idx)
-                    .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
+                    .ok_or_else(|| Thrown::from_static("TypeError: Uint8Array buffer is detached"))?;
                 let (read, bytes, err) = from_hex(&s, max);
                 let written = bytes.len();
                 self.u8_write(idx, &bytes);
@@ -5642,8 +5619,8 @@ impl<'p> Vm<'p> {
             U8_FROM_HEX => {
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_string_value(arg) {
-                    return Err(Thrown(
-                        "TypeError: Uint8Array.fromHex argument must be a string".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Uint8Array.fromHex argument must be a string",
                     ));
                 }
                 let s = self.to_js_string(arg)?;
@@ -5718,7 +5695,7 @@ impl<'p> Vm<'p> {
                 self.preflight_guest_string_size(capacity)?;
                 let mut out: Vec<u8> = Vec::new();
                 out.try_reserve_exact(capacity)
-                    .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+                    .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
                 for &v in args {
                     let n = self.to_number_strict(v)?;
                     if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
@@ -5779,7 +5756,7 @@ impl<'p> Vm<'p> {
                 if self.is_callable(ts) {
                     self.call_value(ts, this, &[])?
                 } else {
-                    return Err(Thrown("TypeError: toString is not callable".into()));
+                    return Err(Thrown::from_static("TypeError: toString is not callable"));
                 }
             }
             // `Math.<op>` as a value (`Math.abs`, `Math.max`, …). The direct call
@@ -5801,8 +5778,8 @@ impl<'p> Vm<'p> {
                 // result's NewPromiseCapability); a non-constructor `this` is a
                 // TypeError. (The single-offset model still builds a native Promise.)
                 if !self.is_constructor(this) {
-                    return Err(Thrown(
-                        "TypeError: Promise static method called on a non-constructor".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Promise static method called on a non-constructor",
                     ));
                 }
                 let a = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -5905,9 +5882,8 @@ impl<'p> Vm<'p> {
                         Some(HeapObj::ArrayBuffer { .. })
                     )
                 {
-                    return Err(Thrown(
-                        "TypeError: ArrayBuffer.prototype.slice called on incompatible receiver"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: ArrayBuffer.prototype.slice called on incompatible receiver",
                     ));
                 }
                 self.arraybuffer_method(this.heap_index(), "slice", args)?
@@ -5921,9 +5897,8 @@ impl<'p> Vm<'p> {
                         Some(HeapObj::ArrayBuffer { .. })
                     )
                 {
-                    return Err(Thrown(
-                        "TypeError: ArrayBuffer.prototype.resize called on incompatible receiver"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: ArrayBuffer.prototype.resize called on incompatible receiver",
                     ));
                 }
                 self.arraybuffer_method(this.heap_index(), "resize", args)?
@@ -5940,9 +5915,8 @@ impl<'p> Vm<'p> {
                         Some(HeapObj::ArrayBuffer { .. })
                     )
                 {
-                    return Err(Thrown(
-                        "TypeError: ArrayBuffer transfer method called on incompatible receiver"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: ArrayBuffer transfer method called on incompatible receiver",
                     ));
                 }
                 let name = match id {
@@ -5989,8 +5963,8 @@ impl<'p> Vm<'p> {
             SAB_GROW => {
                 let ok = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
                 if !ok {
-                    return Err(Thrown(
-                        "TypeError: SharedArrayBuffer.prototype.grow called on incompatible receiver".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: SharedArrayBuffer.prototype.grow called on incompatible receiver",
                     ));
                 }
                 self.arraybuffer_method(this.heap_index(), "grow", args)?
@@ -6000,8 +5974,8 @@ impl<'p> Vm<'p> {
                 // Brand check: a SharedArrayBuffer receiver only (a plain
                 // ArrayBuffer must NOT pass through SAB's slice).
                 if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {
-                    return Err(Thrown(
-                        "TypeError: SharedArrayBuffer.prototype.slice called on incompatible receiver".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: SharedArrayBuffer.prototype.slice called on incompatible receiver",
                     ));
                 }
                 self.arraybuffer_method(this.heap_index(), "slice", args)?
@@ -6289,8 +6263,8 @@ impl<'p> Vm<'p> {
                 // non-integral / non-finite Number → RangeError).
                 let n = self.to_number_strict(a0)?;
                 if !n.is_finite() || n.fract() != 0.0 {
-                    return Err(Thrown(
-                        "RangeError: epochMilliseconds must be an integer".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: epochMilliseconds must be an integer",
                     ));
                 }
                 self.make_instant((n as i128) * 1_000_000)?
@@ -6299,7 +6273,7 @@ impl<'p> Vm<'p> {
             INST_FROM_EPOCH_SEC => {
                 let n = self.to_number_strict(a0)?;
                 if !n.is_finite() || n.fract() != 0.0 {
-                    return Err(Thrown("RangeError: epochSeconds must be an integer".into()));
+                    return Err(Thrown::from_static("RangeError: epochSeconds must be an integer"));
                 }
                 self.make_instant((n as i128) * 1_000_000_000)?
             }
@@ -6480,8 +6454,8 @@ impl<'p> Vm<'p> {
                 let kind = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::Temporal { kind, .. }) => *kind,
                     _ => {
-                        return Err(Thrown(
-                            "TypeError: toLocaleString called on a non-Temporal object".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: toLocaleString called on a non-Temporal object",
                         ))
                     }
                 };
@@ -6495,8 +6469,8 @@ impl<'p> Vm<'p> {
                         HeapObj::Temporal { kind: 7, .. }
                     )
                 {
-                    return Err(Thrown(
-                        "TypeError: getTimeZoneTransition called on a non-ZonedDateTime".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: getTimeZoneTransition called on a non-ZonedDateTime",
                     ));
                 }
                 let dir = self.read_direction_option(a0)?;
@@ -6519,8 +6493,8 @@ impl<'p> Vm<'p> {
                         HeapObj::Temporal { kind: 3, .. }
                     )
                 {
-                    return Err(Thrown(
-                        "TypeError: withPlainTime called on a non-PlainDateTime".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: withPlainTime called on a non-PlainDateTime",
                     ));
                 }
                 self.temporal_method(this.heap_index(), "withPlainTime", args)?
@@ -6789,15 +6763,15 @@ impl<'p> Vm<'p> {
                 // TypeError and a NaN one a RangeError, both BEFORE any
                 // formatting (neither was checked at all).
                 if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
-                    return Err(Thrown(
-                        "TypeError: selectRange requires both a start and an end".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: selectRange requires both a start and an end",
                     ));
                 }
                 let x = self.to_number_strict(a0)?;
                 let y = self.to_number_strict(a1)?;
                 if x.is_nan() || y.is_nan() {
-                    return Err(Thrown(
-                        "RangeError: selectRange endpoints must not be NaN".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: selectRange endpoints must not be NaN",
                     ));
                 }
                 self.alloc_str("other".to_string())
@@ -6817,7 +6791,7 @@ impl<'p> Vm<'p> {
                 if to_parts {
                     let mut ps: Vec<(String, String, &str)> = Vec::new();
                     ps.try_reserve_exact(parts.len())
-                        .map_err(|_| Thrown("RangeError: list allocation failed".into()))?;
+                        .map_err(|_| Thrown::from_static("RangeError: list allocation failed"))?;
                     for (ty, value) in parts {
                         ps.push((ty.to_string(), value, ""));
                     }
@@ -6845,8 +6819,8 @@ impl<'p> Vm<'p> {
                 // PartitionRelativeTimePattern step 2: a non-finite value is a
                 // RangeError (it was formatted as "in NaN days" before).
                 if !v.is_finite() {
-                    return Err(Thrown(
-                        "RangeError: relative time value must be finite".into(),
+                    return Err(Thrown::from_static(
+                        "RangeError: relative time value must be finite",
                     ));
                 }
                 // SingularRelativeTimeUnit: ToString first (so a Symbol is a
@@ -7219,8 +7193,8 @@ impl<'p> Vm<'p> {
                             Some(HeapObj::Promise { .. })
                         )
                     {
-                        return Err(Thrown(
-                            "TypeError: Promise.prototype.then called on a non-Promise".into(),
+                        return Err(Thrown::from_static(
+                            "TypeError: Promise.prototype.then called on a non-Promise",
                         ));
                     }
                 }
@@ -7347,7 +7321,7 @@ impl<'p> Vm<'p> {
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
             let b = self.heap.str_wtf8_cow(v.heap_index()).unwrap();
             if !crate::heap::wtf8_is_wellformed(&b) {
-                return Err(Thrown("URIError: URI malformed".into()));
+                return Err(Thrown::from_static("URIError: URI malformed"));
             }
         }
         Ok(())
@@ -7384,7 +7358,7 @@ fn hex_lower(b: u8) -> [u8; 2] {
 }
 
 fn invalid_native_string_length() -> Thrown {
-    Thrown("RangeError: Invalid string length".into())
+    Thrown::from_static("RangeError: Invalid string length")
 }
 
 fn checked_native_output_add(current: usize, additional: usize) -> Result<usize, Thrown> {
@@ -7500,7 +7474,7 @@ fn regexp_escape_into(bytes: &[u8], out: &mut String) {
 fn from_hex(s: &str, max_len: usize) -> (usize, Vec<u8>, Option<Thrown>) {
     let chars: Vec<char> = s.chars().collect();
     let length = chars.len();
-    let err = || Some(Thrown("SyntaxError: invalid hexadecimal string".into()));
+    let err = || Some(Thrown::from_static("SyntaxError: invalid hexadecimal string"));
     if length % 2 != 0 {
         return (0, Vec::new(), err());
     }
@@ -7581,7 +7555,7 @@ fn decode_chunk(chunk: &[u8], throw_on_extra: bool) -> Option<Vec<u8>> {
 fn from_base64(s: &str, url: bool, lch: u8, max_len: usize) -> (usize, Vec<u8>, Option<Thrown>) {
     let chars: Vec<char> = s.chars().collect();
     let length = chars.len();
-    let synerr = || Some(Thrown("SyntaxError: invalid base64 string".into()));
+    let synerr = || Some(Thrown::from_static("SyntaxError: invalid base64 string"));
     let mut bytes: Vec<u8> = Vec::new();
     let mut chunk: Vec<u8> = Vec::new();
     let mut read = 0usize; // committed position (after the last full chunk)
@@ -7795,7 +7769,7 @@ fn unescape_str(s: &str) -> Result<crate::heap::JsStr, Thrown> {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(bytes.len())
-        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'%' {
@@ -7875,10 +7849,10 @@ fn uri_encode_into(s: &str, extra: &[u8], out: &mut String) {
 /// nothing). Multi-byte sequences are validated as UTF-8. Malformed → Err.
 fn uri_decode(bytes: &[u8], reserved: &[u8]) -> Result<crate::heap::JsStr, Thrown> {
     use crate::heap::{wtf8_push, wtf8_push_cp, JsStr};
-    let malformed = || Thrown("URIError: URI malformed".into());
+    let malformed = || Thrown::from_static("URIError: URI malformed");
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(bytes.len())
-        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
     let read = |at: usize| -> Result<u8, Thrown> {
         if at + 2 >= bytes.len() || bytes[at] != b'%' {
             return Err(malformed());

@@ -54,8 +54,8 @@ impl<'p> Vm<'p> {
         use native::*;
         if kind == INTL_LOCALE {
             if options != Value::UNDEFINED && !self.is_object_value(options) {
-                return Err(Thrown(
-                    "TypeError: Options must be an object or undefined".into(),
+                return Err(Thrown::from_static(
+                    "TypeError: Options must be an object or undefined",
                 ));
             }
             return self.make_locale(locales, options);
@@ -81,8 +81,8 @@ impl<'p> Vm<'p> {
             }
             _ => {
                 if options != Value::UNDEFINED && !self.is_object_value(options) {
-                    return Err(Thrown(
-                        "TypeError: Options must be an object or undefined".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: Options must be an object or undefined",
                     ));
                 }
                 options
@@ -139,8 +139,8 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if style == "currency" && currency.is_none() {
-                    return Err(Thrown(
-                        "TypeError: currency must be provided for style 'currency'".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: currency must be provided for style 'currency'",
                     ));
                 }
                 let currency_display = self.opt_string(
@@ -162,8 +162,8 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if style == "unit" && unit.is_none() {
-                    return Err(Thrown(
-                        "TypeError: unit must be provided for style 'unit'".into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: unit must be provided for style 'unit'",
                     ));
                 }
                 let unit_display = self.opt_string(
@@ -359,9 +359,8 @@ impl<'p> Vm<'p> {
                 if (date_style.is_some() || time_style.is_some())
                     && (!vals.is_empty() || frac_digits.is_some())
                 {
-                    return Err(Thrown(
-                        "TypeError: dateStyle/timeStyle may not be used with explicit date-time components"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: dateStyle/timeStyle may not be used with explicit date-time components",
                     ));
                 }
                 // CreateDateTimeFormat steps "If required is date and timeStyle
@@ -373,15 +372,13 @@ impl<'p> Vm<'p> {
                 // never fire (`PlainDate/…/datestyle-and-timestyle.js`).
                 let (req_date, req_time) = dtf_mode.required();
                 if !req_time && time_style.is_some() {
-                    return Err(Thrown(
-                        "TypeError: timeStyle is not a valid option for this date-only formatter"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: timeStyle is not a valid option for this date-only formatter",
                     ));
                 }
                 if !req_date && date_style.is_some() {
-                    return Err(Thrown(
-                        "TypeError: dateStyle is not a valid option for this time-only formatter"
-                            .into(),
+                    return Err(Thrown::from_static(
+                        "TypeError: dateStyle is not a valid option for this time-only formatter",
                     ));
                 }
                 // needDefaults is cleared only by weekday/year/month/day (the
@@ -739,7 +736,7 @@ impl<'p> Vm<'p> {
                     ],
                 )?;
                 let t = t.ok_or_else(|| {
-                    Thrown("TypeError: Intl.DisplayNames type option is required".into())
+                    Thrown::from_static("TypeError: Intl.DisplayNames type option is required")
                 })?;
                 let fb = self.opt_string(options, "fallback", "code", &["code", "none"])?;
                 let ld = self.opt_string(
