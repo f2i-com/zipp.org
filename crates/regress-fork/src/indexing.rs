@@ -878,12 +878,67 @@ impl<'a> InputIndexer for AsciiInput<'a> {
 pub struct Utf16Input<'a> {
     input: &'a [u16],
     unicode: bool,
+    #[cfg(feature = "compact-utf16")]
+    surrogate_mask: u16,
 }
 
 #[cfg(feature = "utf16")]
 impl<'a> Utf16Input<'a> {
     pub fn new(s: &'a [u16], unicode: bool) -> Self {
-        Self { input: s, unicode }
+        Self {
+            input: s,
+            unicode,
+            #[cfg(feature = "compact-utf16")]
+            surrogate_mask: 0xfc00,
+        }
+    }
+
+    /// Code-unit iteration is independent of Unicode case-folding flags.
+    #[cfg(feature = "compact-utf16")]
+    pub fn from_code_units(s: &'a [u16], unicode: bool) -> Self {
+        Self {
+            input: s,
+            unicode,
+            surrogate_mask: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn combines_surrogates(&self) -> bool {
+        #[cfg(feature = "compact-utf16")]
+        {
+            self.surrogate_mask != 0
+        }
+        #[cfg(not(feature = "compact-utf16"))]
+        {
+            true
+        }
+    }
+
+    // Folding the iteration mode into the surrogate mask avoids an extra
+    // per-character mode branch. A zero mask always reads a single code unit.
+    #[inline(always)]
+    fn combines_high_surrogate(&self, unit: u16) -> bool {
+        #[cfg(feature = "compact-utf16")]
+        {
+            unit & self.surrogate_mask == Self::SURROGATE_HIGH_START
+        }
+        #[cfg(not(feature = "compact-utf16"))]
+        {
+            Self::is_high_surrogate(unit)
+        }
+    }
+
+    #[inline(always)]
+    fn combines_low_surrogate(&self, unit: u16) -> bool {
+        #[cfg(feature = "compact-utf16")]
+        {
+            unit & self.surrogate_mask == Self::SURROGATE_LOW_START
+        }
+        #[cfg(not(feature = "compact-utf16"))]
+        {
+            Self::is_low_surrogate(unit)
+        }
     }
 
     #[inline(always)]
@@ -936,6 +991,8 @@ impl<'a> InputIndexer for Utf16Input<'a> {
                 end: self.pos_to_offset(range.end),
             }],
             unicode: self.unicode(),
+            #[cfg(feature = "compact-utf16")]
+            surrogate_mask: self.surrogate_mask,
         }
     }
 
@@ -945,7 +1002,7 @@ impl<'a> InputIndexer for Utf16Input<'a> {
         *pos += 1;
 
         // If the code unit is not a high surrogate, it is not the start of a surrogate pair.
-        if !Self::is_high_surrogate(u1) {
+        if !self.combines_high_surrogate(u1) {
             return Some(u1.into());
         }
 
@@ -973,7 +1030,7 @@ impl<'a> InputIndexer for Utf16Input<'a> {
         *pos -= 1;
 
         // If the code unit is not a low surrogate, it is not the end of a surrogate pair.
-        if *pos == left_end || !Self::is_low_surrogate(u2) {
+        if *pos == left_end || !self.combines_low_surrogate(u2) {
             return Some(u2.into());
         }
 
@@ -996,7 +1053,7 @@ impl<'a> InputIndexer for Utf16Input<'a> {
         pos += 1;
 
         // If the code unit is not a high surrogate, it is not the start of a surrogate pair.
-        if !Self::is_high_surrogate(u1) {
+        if !self.combines_high_surrogate(u1) {
             return Some(pos);
         }
 
@@ -1025,7 +1082,7 @@ impl<'a> InputIndexer for Utf16Input<'a> {
         pos -= 1;
 
         // If the code unit is not a low surrogate, it is not the end of a surrogate pair.
-        if pos == left_end || !Self::is_low_surrogate(u2) {
+        if pos == left_end || !self.combines_low_surrogate(u2) {
             return Some(pos);
         }
 
@@ -1112,7 +1169,7 @@ impl<'a> InputIndexer for Utf16Input<'a> {
         // (ES 22.2.2.9 reads characters; staging/sm/RegExp/
         // unicode-back-reference.js). Unit-wise comparison would call the
         // shared first unit equal.
-        if self.unicode {
+        if self.unicode && self.combines_surrogates() {
             let ref_input = self.subinput(range);
             let mut ref_pos = if Dir::FORWARD {
                 ref_input.left_end()
@@ -1160,16 +1217,21 @@ impl<'a> InputIndexer for Utf16Input<'a> {
     }
 }
 
-#[cfg(feature = "utf16")]
+// The compact profile shares the complete matcher for code-unit and code-point
+// iteration. ASCII keeps its separate specialized executor.
+#[cfg(feature = "compact-utf16")]
+pub type Ucs2Input<'a> = Utf16Input<'a>;
+
+#[cfg(all(feature = "utf16", not(feature = "compact-utf16")))]
 #[derive(Debug, Copy, Clone)]
 pub struct Ucs2Input<'a> {
     input: &'a [u16],
     unicode: bool,
 }
 
-#[cfg(feature = "utf16")]
+#[cfg(all(feature = "utf16", not(feature = "compact-utf16")))]
 impl<'a> Ucs2Input<'a> {
-    pub fn new(s: &'a [u16], unicode: bool) -> Self {
+    pub fn from_code_units(s: &'a [u16], unicode: bool) -> Self {
         Self { input: s, unicode }
     }
 
@@ -1180,7 +1242,7 @@ impl<'a> Ucs2Input<'a> {
     }
 }
 
-#[cfg(feature = "utf16")]
+#[cfg(all(feature = "utf16", not(feature = "compact-utf16")))]
 impl<'a> InputIndexer for Ucs2Input<'a> {
     type Position = IndexPosition<'a>;
     type Element = u32;
@@ -1330,5 +1392,89 @@ impl<'a> InputIndexer for Ucs2Input<'a> {
         _bytes: &[u8; N],
     ) -> bool {
         panic!("Should never be matching bytes for ucs2");
+    }
+}
+
+#[cfg(all(test, feature = "compact-utf16"))]
+mod compact_utf16_tests {
+    use alloc::vec::Vec;
+    use super::{InputIndexer, Utf16Input};
+    use crate::cursor::Forward;
+
+    fn check_steps(input: Utf16Input<'_>, expected: &[u32]) {
+        let mut pos = input.left_end();
+        for &value in expected {
+            let next_pos = input.next_right_pos(pos).unwrap();
+            assert_eq!(input.next_right(&mut pos), Some(value));
+            assert_eq!(pos, next_pos);
+        }
+        assert_eq!(pos, input.right_end());
+        assert_eq!(input.next_right(&mut pos), None);
+        assert_eq!(input.next_right_pos(pos), None);
+        for &value in expected.iter().rev() {
+            let next_pos = input.next_left_pos(pos).unwrap();
+            assert_eq!(input.next_left(&mut pos), Some(value));
+            assert_eq!(pos, next_pos);
+        }
+        assert_eq!(pos, input.left_end());
+        assert_eq!(input.next_left(&mut pos), None);
+        assert_eq!(input.next_left_pos(pos), None);
+    }
+
+    #[test]
+    fn every_single_unit_is_preserved_in_both_modes() {
+        for unit in 0..=u16::MAX {
+            let text = [unit];
+            let expected = [u32::from(unit)];
+            for fold_unicode in [false, true] {
+                check_steps(Utf16Input::new(&text, fold_unicode), &expected);
+                check_steps(Utf16Input::from_code_units(&text, fold_unicode), &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn surrogate_boundaries_and_subinputs_keep_their_iteration_mode() {
+        let edge = [
+            0, 0x61, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xffff,
+        ];
+        for a in edge {
+            for b in edge {
+                for c in edge {
+                    let text = [a, b, c];
+                    let units: Vec<_> = text.iter().copied().map(u32::from).collect();
+                    let points: Vec<_> = char::decode_utf16(text)
+                        .map(|r| match r {
+                            Ok(c) => u32::from(c),
+                            Err(e) => u32::from(e.unpaired_surrogate()),
+                        })
+                        .collect();
+                    for fold_unicode in [false, true] {
+                        check_steps(Utf16Input::new(&text, fold_unicode), &points);
+                        let input = Utf16Input::from_code_units(&text, fold_unicode);
+                        check_steps(input, &units);
+                        check_steps(input.subinput(input.left_end()..input.right_end()), &units);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_folding_does_not_turn_code_unit_backreferences_into_code_points() {
+        let text = [0xd800, 0xd800, 0xdc00];
+        for fold_unicode in [false, true] {
+            let input = Utf16Input::from_code_units(&text, fold_unicode);
+            let start = input.left_end();
+            let mut pos = start + 1;
+            assert!(input.subrange_eq(Forward, &mut pos, start..start + 1));
+            assert_eq!(pos, start + 2);
+            let input = Utf16Input::new(&text, fold_unicode);
+            let mut pos = start + 1;
+            assert_eq!(
+                input.subrange_eq(Forward, &mut pos, start..start + 1),
+                !fold_unicode
+            );
+        }
     }
 }

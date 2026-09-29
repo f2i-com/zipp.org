@@ -960,7 +960,7 @@ impl Regex {
         start: usize,
     ) -> exec::Matches<super::classicalbacktrack::BacktrackExecutor<'r, indexing::Ucs2Input<'t>>>
     {
-        let input = Ucs2Input::new(text, self.cr.flags.unicode_mode());
+        let input = Ucs2Input::from_code_units(text, self.cr.flags.unicode_mode());
         exec::Matches::new(
             super::classicalbacktrack::BacktrackExecutor::new(
                 input,
@@ -978,7 +978,7 @@ impl Regex {
         limits: MatchLimits,
     ) -> exec::Matches<super::classicalbacktrack::BacktrackExecutor<'r, indexing::Ucs2Input<'t>>>
     {
-        let input = Ucs2Input::new(text, self.cr.flags.unicode_mode());
+        let input = Ucs2Input::from_code_units(text, self.cr.flags.unicode_mode());
         exec::Matches::new(
             super::classicalbacktrack::BacktrackExecutor::new_with_limits(input, &self.cr, limits),
             start,
@@ -1017,7 +1017,7 @@ impl Regex {
     /// [`Self::find_from_ucs2`].
     #[cfg(feature = "utf16")]
     pub fn match_at_ucs2(&self, text: &[u16], start: usize) -> Option<Match> {
-        let input = Ucs2Input::new(text, self.cr.flags.unicode_mode());
+        let input = Ucs2Input::from_code_units(text, self.cr.flags.unicode_mode());
         classicalbacktrack::BacktrackExecutor::new(
             input,
             MatchAttempter::new(&self.cr, input.left_end()),
@@ -1032,7 +1032,7 @@ impl Regex {
         start: usize,
         limits: MatchLimits,
     ) -> (Option<Match>, MatchUsage) {
-        let input = Ucs2Input::new(text, self.cr.flags.unicode_mode());
+        let input = Ucs2Input::from_code_units(text, self.cr.flags.unicode_mode());
         let mut ex = classicalbacktrack::BacktrackExecutor::new_with_limits(input, &self.cr, limits);
         let found = ex.match_at(start);
         (found, exec::MatchProducer::match_usage(&ex))

@@ -79,7 +79,7 @@ These are deterministic core-language defaults, not locale-aware formatting.
 execution speed for size. Use `--release --features lite` for the same feature
 set with throughput-oriented optimization. Standard builds keep `--release`.
 
-See [the latest size audit](../../docs/validation/2026-09-29-engine-size-round3.md)
+See [the latest size audit](../../docs/validation/2026-09-29-engine-size-round4.md)
 for measured sizes, speed tradeoffs and the remaining gap to QuickJS. To test
 the built Lite package, generate a Node package with wasm-bindgen and run
 `tests/node/lite.cjs` using `pkg-redirect.cjs` / `ZIPP_PKG` (see the Node test README).
@@ -256,18 +256,19 @@ have identical import/export surfaces; the selected module retains the audited
 checks that the browser module is byte-identical to the tested Node module.
 
 Measured on 2026-09-29 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
-after the third size-reduction pass in this branch:
+after the fourth Lite size-reduction pass (full variants retain the third pass):
 
 | Variant | Before post-processing, raw / Brotli | Selected, raw / Brotli |
 | --- | ---: | ---: |
-| Lite | 3,059,311 / 777,857 | 2,942,452 / 774,683 |
+| Lite | 3,024,218 / 773,687 | 2,916,044 / 772,481 |
 | JavaScript | 5,489,924 / 1,317,137 | 5,326,416 / 1,313,817 |
 | Python-base | 7,197,923 / 1,691,625 | 7,001,211 / 1,685,440 |
 | Python + Torch | 9,157,319 / 2,037,425 | 8,956,302 / 2,030,875 |
 
 These are module bytes, excluding JS glue; Brotli is the download size. See the
-[third size audit](../../docs/validation/2026-09-29-engine-size-round3.md)
-for baseline deltas, performance measurements, validation and remaining gaps.
+[fourth size audit](../../docs/validation/2026-09-29-engine-size-round4.md)
+for Lite deltas, performance measurements, validation and the QuickJS gap.
+Full-variant results are in the [third audit](../../docs/validation/2026-09-29-engine-size-round3.md).
 
 Stronger optimization is not automatically better. Earlier `-O3` / `-Oz`
 measurements reduced raw size but increased Brotli size and slowed execution.

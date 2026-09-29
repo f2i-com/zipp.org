@@ -254,3 +254,29 @@ directly indexed for group-name parsing. No Unicode properties are removed.
 After regenerating `unicodetables.rs` / `unicodetables_unknown.rs`, run
 `python tools/pack_regex_tables.py` from the repository root. The generated
 tests compare every decoded interval against its original literals.
+
+## Compact UTF-16 matcher for ZIPP Lite
+
+The optional `compact-utf16` feature shares one backtracker instantiation for
+UTF-16 code-point and UCS-2 code-unit input. ASCII retains its specialized
+executor. A surrogate mask selects the iteration mode without changing Unicode
+case folding: a caller of the UTF-16 API still decodes pairs without a `u` flag,
+and the UCS-2 API still reads individual units even with Unicode folding.
+Subinputs and captured backreferences preserve that distinction.
+
+In this feature only, mandatory, greedy and lazy single-character loops share
+an outlined scanner. It bounds attempts by the remaining step allowance before
+reading input, then charges exactly the attempted characters, including a final
+mismatch. These matchers cannot re-enter the budget or allocate backtracking
+state. A loop reaching exactly zero remaining steps does not signal exhaustion
+until another attempt is requested. Used steps are derived from the initial allowance minus the remainder, removing
+a redundant per-operation counter update. Backtracking and memory limits are
+unchanged. Zero/one mandatory characters retain direct fast paths.
+
+Full/native profiles retain their original separate input types and scalar
+budgeted loops. ZIPP enables the new feature only through `wasm-lite`.
+See [the fourth size audit](../../docs/validation/2026-09-29-engine-size-round4.md)
+for sizes, paired performance measurements and the differential probe. Unit tests
+cover every individual code unit, surrogate boundaries, forward/backward stepping,
+subinputs and scalar-equivalent budget boundaries (including prior exhaustion
+and saturating usage counters).

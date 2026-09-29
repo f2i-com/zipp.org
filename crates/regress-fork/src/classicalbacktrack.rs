@@ -152,7 +152,10 @@ enum BacktrackInsn<Input: InputIndexer> {
 #[derive(Debug)]
 struct MatchBudget {
     remaining: u64,
+    #[cfg(not(feature = "compact-utf16"))]
     used: u64,
+    #[cfg(feature = "compact-utf16")]
+    initial_steps: u64,
     max_scratch_bytes: usize,
     max_memory_bytes: usize,
     reserved_scratch_bytes: usize,
@@ -165,12 +168,27 @@ impl MatchBudget {
     fn new(limits: MatchLimits) -> Self {
         Self {
             remaining: limits.max_steps,
+            #[cfg(not(feature = "compact-utf16"))]
             used: 0,
+            #[cfg(feature = "compact-utf16")]
+            initial_steps: limits.max_steps,
             max_scratch_bytes: limits.max_backtrack_bytes.min(limits.max_memory_bytes),
             max_memory_bytes: limits.max_memory_bytes,
             reserved_scratch_bytes: 0,
             reserved_memory_bytes: 0,
             exhaustion: None,
+        }
+    }
+
+    /// Safe bound for a loop whose matcher cannot consume budget or allocate
+    /// backtracking state. The caller charges only iterations actually tried.
+    #[cfg(feature = "compact-utf16")]
+    #[inline(always)]
+    fn loop_allowance(&self, requested: usize) -> usize {
+        if self.exhaustion.is_some() {
+            0
+        } else {
+            (requested as u64).min(self.remaining) as usize
         }
     }
 
@@ -185,7 +203,10 @@ impl MatchBudget {
             return false;
         }
         self.remaining -= n;
-        self.used = self.used.saturating_add(n);
+        #[cfg(not(feature = "compact-utf16"))]
+        {
+            self.used = self.used.saturating_add(n);
+        }
         true
     }
 
@@ -293,7 +314,12 @@ impl MatchBudget {
     #[inline]
     fn usage(&self) -> MatchUsage {
         MatchUsage {
+            #[cfg(not(feature = "compact-utf16"))]
             steps: self.used,
+            // remaining only decreases after n <= remaining. Its difference
+            // from the initial allowance is exactly the old accumulated usage.
+            #[cfg(feature = "compact-utf16")]
+            steps: self.initial_steps - self.remaining,
             exhaustion: self.exhaustion,
         }
     }
@@ -313,6 +339,12 @@ impl MatchBudget {
     #[inline(always)]
     fn new(_limits: MatchLimits) -> Self {
         Self
+    }
+
+    #[cfg(feature = "compact-utf16")]
+    #[inline(always)]
+    fn loop_allowance(&self, requested: usize) -> usize {
+        requested
     }
 
     #[inline(always)]
@@ -591,8 +623,98 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         }
     }
 
+    // Single-character matchers cannot re-enter the budget or allocate a
+    // backtrack frame. Bound the loop before running it and charge attempts in
+    // one operation, including a final failed match. No over-budget character
+    // is inspected; hitting the allowance is not exhaustion until another
+    // attempt would have been made by the scalar loop.
+    #[cfg(feature = "compact-utf16")]
+    #[inline(never)]
+    fn scan_scm_loop<Dir: Direction, Scm: SingleCharMatcher<Input, Dir>>(
+        input: &Input,
+        mut pos: Input::Position,
+        limit: usize,
+        dir: Dir,
+        matcher: &Scm,
+        budget: &mut MatchBudget,
+    ) -> Option<(Input::Position, bool)> {
+        if limit == 0 {
+            return Some((pos, true));
+        }
+        let allowed = budget.loop_allowance(limit);
+        for attempted in 0..allowed {
+            let saved = pos;
+            if !matcher.matches(input, dir, &mut pos) {
+                return budget.consume(attempted + 1).then_some((saved, false));
+            }
+        }
+        if !budget.consume(allowed) {
+            return None;
+        }
+        if allowed < limit {
+            // The next scalar iteration would fail its consume(1), before
+            // invoking the matcher. Preserve that exact exhaustion boundary.
+            let consumed = budget.consume(1);
+            debug_assert!(!consumed);
+            return None;
+        }
+        Some((pos, true))
+    }
+
+    // Drive the loop up to max times and return its mandatory/optional bounds.
+    #[cfg(feature = "compact-utf16")]
+    #[inline(always)]
+    fn run_scm_loop_impl<Dir: Direction, Scm: SingleCharMatcher<Input, Dir>>(
+        input: &Input,
+        mut pos: Input::Position,
+        min: usize,
+        max: usize,
+        dir: Dir,
+        matcher: Scm,
+        budget: &mut MatchBudget,
+    ) -> Option<(Input::Position, Input::Position)> {
+        debug_assert!(min <= max, "min should be <= max");
+        // Avoid scanner calls for the common zero/one mandatory characters.
+        // A zero-iteration phase must not inspect an exhausted budget.
+        let min_pos = match min {
+            0 => pos,
+            1 => {
+                if !budget.consume(1) || !matcher.matches(input, dir, &mut pos) {
+                    return None;
+                }
+                pos
+            }
+            _ => {
+                let (pos, matched) = Self::scan_scm_loop(input, pos, min, dir, &matcher, budget)?;
+                if !matched {
+                    return None;
+                }
+                pos
+            }
+        };
+        if min == max {
+            return Some((min_pos, min_pos));
+        }
+        let (max_pos, _) = Self::scan_scm_loop(input, min_pos, max - min, dir, &matcher, budget)?;
+        Some((min_pos, max_pos))
+    }
+
+    // Compute the maximum position for a non-greedy single-character loop.
+    #[cfg(feature = "compact-utf16")]
+    fn compute_max_pos<Dir: Direction, Scm: SingleCharMatcher<Input, Dir>>(
+        input: &Input,
+        pos: Input::Position,
+        limit: usize,
+        dir: Dir,
+        matcher: Scm,
+        budget: &mut MatchBudget,
+    ) -> Option<Input::Position> {
+        Self::scan_scm_loop(input, pos, limit, dir, &matcher, budget).map(|(pos, _)| pos)
+    }
+
     // Drive the loop up to \p max times.
     // \return the position (min, max), or None on failure.
+    #[cfg(not(feature = "compact-utf16"))]
     #[inline(always)]
     fn run_scm_loop_impl<Dir: Direction, Scm: SingleCharMatcher<Input, Dir>>(
         input: &Input,
@@ -633,6 +755,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
 
     // Compute the maximum position from a starting position, up to a limit.
     // This is used for lazy computation in non-greedy loops.
+    #[cfg(not(feature = "compact-utf16"))]
     fn compute_max_pos<Dir: Direction, Scm: SingleCharMatcher<Input, Dir>>(
         input: &Input,
         mut pos: Input::Position,
@@ -2511,5 +2634,144 @@ impl<'r, 't> BacktrackExecutor<'r, AsciiInput<'t>> {
             input,
             matcher: MatchAttempter::new_with_limits(re, input.left_end(), limits),
         }
+    }
+}
+
+#[cfg(all(test, feature = "bounded-backtracking", feature = "compact-utf16"))]
+mod scm_budget_tests {
+    use super::*;
+    use crate::cursor::{Backward, Forward};
+    use crate::indexing::AsciiInput;
+
+    // Deliberately retain the scalar specification here: pay before each
+    // attempted character, including a mismatch, with separate min/max phases.
+    fn scalar<'t, Dir: Direction>(
+        input: &AsciiInput<'t>,
+        mut pos: <AsciiInput<'t> as InputIndexer>::Position,
+        min: usize,
+        max: usize,
+        dir: Dir,
+        budget: &mut MatchBudget,
+    ) -> Option<(
+        <AsciiInput<'t> as InputIndexer>::Position,
+        <AsciiInput<'t> as InputIndexer>::Position,
+    )> {
+        let matcher = scm::Char { c: b'a' };
+        for _ in 0..min {
+            if !budget.consume(1) || !matcher.matches(input, dir, &mut pos) {
+                return None;
+            }
+        }
+        let min_pos = pos;
+        for _ in 0..max - min {
+            if !budget.consume(1) {
+                return None;
+            }
+            let saved = pos;
+            if !matcher.matches(input, dir, &mut pos) {
+                pos = saved;
+                break;
+            }
+        }
+        Some((min_pos, pos))
+    }
+
+    fn compare<Dir: Direction>(dir: Dir) {
+        for text in ["", "a", "aaaa", "aaab", "baaa", "abba"] {
+            let input = AsciiInput::new(text, false);
+            let pos = if Dir::FORWARD {
+                input.left_end()
+            } else {
+                input.right_end()
+            };
+            for remaining in [0u64, 1, 2, 3, 5, 8, 12, u64::MAX] {
+                for exhaustion in [
+                    None,
+                    Some(MatchLimitError::Steps),
+                    Some(MatchLimitError::BacktrackMemory),
+                ] {
+                    for preconsumed in [0u64, 2] {
+                        for (min, max) in [
+                            (0, 0),
+                            (0, 1),
+                            (0, usize::MAX),
+                            (1, 1),
+                            (2, 5),
+                            (4, 7),
+                            (7, 7),
+                            (usize::MAX, usize::MAX),
+                        ] {
+                            let make_budget = || {
+                                let mut b = MatchBudget::new(MatchLimits {
+                                    max_steps: remaining.saturating_add(preconsumed),
+                                    max_backtrack_bytes: usize::MAX,
+                                    max_memory_bytes: usize::MAX,
+                                });
+                                assert!(b.consume((b.initial_steps - remaining) as usize));
+                                b.exhaustion = exhaustion;
+                                b
+                            };
+                            let mut reference = make_budget();
+                            let mut actual = make_budget();
+                            let expected = scalar(&input, pos, min, max, dir, &mut reference);
+                            let got = MatchAttempter::<AsciiInput<'_>>::run_scm_loop_impl(
+                                &input,
+                                pos,
+                                min,
+                                max,
+                                dir,
+                                scm::Char { c: b'a' },
+                                &mut actual,
+                            );
+                            assert_eq!(got, expected);
+                            assert_eq!(actual.remaining, reference.remaining);
+                            assert_eq!(actual.usage(), reference.usage());
+                            let mut reference = make_budget();
+                            let mut actual = make_budget();
+                            let expected =
+                                scalar(&input, pos, 0, max, dir, &mut reference).map(|(_, p)| p);
+                            let got = MatchAttempter::<AsciiInput<'_>>::compute_max_pos(
+                                &input,
+                                pos,
+                                max,
+                                dir,
+                                scm::Char { c: b'a' },
+                                &mut actual,
+                            );
+                            assert_eq!(got, expected);
+                            assert_eq!(actual.remaining, reference.remaining);
+                            assert_eq!(actual.usage(), reference.usage());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn derived_usage_reaches_u64_max_without_wrapping() {
+        let mut b = MatchBudget::new(MatchLimits {
+            max_steps: u64::MAX,
+            max_backtrack_bytes: usize::MAX,
+            max_memory_bytes: usize::MAX,
+        });
+        assert!(b.consume(usize::MAX - 1));
+        assert_eq!(b.usage().steps, u64::MAX - 1);
+        assert!(!b.consume(2));
+        assert_eq!(b.usage().steps, u64::MAX - 1);
+        assert_eq!(b.remaining, 1);
+        b.exhaustion = None;
+        assert!(b.consume(1));
+        assert_eq!(b.usage().steps, u64::MAX);
+        assert!(b.consume(0));
+        assert!(!b.consume(1));
+        assert_eq!(b.usage().steps, u64::MAX);
+    }
+
+    #[test]
+    fn batched_loops_preserve_scalar_budget_boundaries_in_both_directions() {
+        compare(Forward);
+        compare(Backward);
     }
 }
