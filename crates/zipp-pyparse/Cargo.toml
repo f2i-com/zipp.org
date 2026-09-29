@@ -8,7 +8,7 @@ description = "ZIPP's Python front end: a byte-oriented lexer, an arena AST and 
 [dependencies]
 rustc-hash = { workspace = true }
 # XID_Start / XID_Continue, the same tables the RustPython-compatible lexer used.
-unicode-ident = "=1.0.24"
+unicode-ident = "=1.0.26"
 # Emoji_Presentation: a lone emoji is an identifier (RustPython's extension, kept).
 unicode-properties = { version = "=0.1.4", default-features = false, features = ["emoji"] }
 # The arena the emitter's tree (`tree`) is laid out in.
