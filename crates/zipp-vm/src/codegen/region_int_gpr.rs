@@ -436,12 +436,35 @@ fn dv_inner_additive_proof(
                     false
                 }
             }
-            Instr::CallMethod {
-                dst,
-                arg_base,
-                argc,
-                ..
-            } => {
+            // The callee half of a spec-order getter call (`GetProp;
+            // <args>; CallWithThis`): a boxed read of the pinned view's
+            // method, re-proved against the pin at the call below. It is
+            // never a numeric value and carries no accumulator.
+            Instr::GetProp { dst, .. } => {
+                let paired = dv_captured_getter(proto, ta_plan, ip)
+                    .is_some_and(|site| site.callee == dst)
+                    && ta_plan.access.get(&ip).is_some_and(|&j| j as usize == pin);
+                if paired {
+                    regs.insert(dst, DvDep::Other);
+                }
+                paired
+            }
+            Instr::CallMethod { .. } | Instr::CallWithThis { .. } => {
+                let (dst, arg_base, argc, name) = match proto.code[ip] {
+                    Instr::CallMethod {
+                        dst,
+                        arg_base,
+                        argc,
+                        name,
+                        ..
+                    } => (dst, arg_base, argc, name),
+                    // Only the exact captured pair is the pure getter; any
+                    // other captured call may run arbitrary code.
+                    _ => match dv_captured_getter(proto, ta_plan, ip) {
+                        Some(site) => (site.dst, site.arg_base, site.argc, site.name),
+                        None => return false,
+                    },
+                };
                 let Some(&j) = ta_plan.access.get(&ip) else {
                     return false;
                 };
@@ -460,10 +483,7 @@ fn dv_inner_additive_proof(
                 }
                 let Some(kind) = proto
                     .string_constants
-                    .get(match proto.code[ip] {
-                        Instr::CallMethod { name, .. } => name as usize,
-                        _ => unreachable!(),
-                    })
+                    .get(name as usize)
                     .and_then(|name| dv_get_kind(name))
                 else {
                     return false;
@@ -743,7 +763,17 @@ fn dv_nested_reduce_plan(
                 }
             }
         }
-        if let Instr::CallMethod { name, argc, .. } = proto.code[ip] {
+        let getter_call = match proto.code[ip] {
+            Instr::CallMethod { name, argc, .. } => Some((name, argc)),
+            // The spec-order lowering of the same getter call. A captured
+            // call that is not the exact pinned pair is not provably pure.
+            Instr::CallWithThis { .. } => {
+                let site = dv_captured_getter(proto, ta_plan, ip)?;
+                Some((site.name, site.argc))
+            }
+            _ => None,
+        };
+        if let Some((name, argc)) = getter_call {
             if !(body_start..=body_end).contains(&ip) || !(argc == 1 || argc == 2) {
                 return None;
             }
@@ -1037,8 +1067,9 @@ impl GprDeoptShadow {
 /// Re-check one captured DataView `GetProp; CallWithThis` pair against both
 /// bytecode instructions and the pin/access proof. The shared capture planner
 /// has already proved no overwrite or branch entry inside the prefix; keeping
-/// this exact check local makes any future shape drift a shadow decline.
-fn gpr_deopt_shadow_captured_dv(
+/// this exact check local makes any future shape drift a decline for both of
+/// its users, the deopt shadow and the nested reduction.
+fn dv_captured_getter(
     proto: &FuncProto,
     ta_plan: &TaPinPlan,
     ip: usize,
@@ -1116,7 +1147,7 @@ fn gpr_deopt_shadow_def(
         }
         | Instr::CallMethod { dst, .. } => Some(dst),
         Instr::CallWithThis { dst, .. }
-            if gpr_deopt_shadow_captured_dv(proto, ta_plan, ip)
+            if dv_captured_getter(proto, ta_plan, ip)
                 .is_some_and(|site| site.dst == dst) =>
         {
             Some(dst)
@@ -1209,7 +1240,7 @@ fn gpr_deopt_shadow_plan(
                 }
             }
             Instr::GetProp { .. } | Instr::CallWithThis { .. } => {
-                let site = gpr_deopt_shadow_captured_dv(proto, ta_plan, ip)?;
+                let site = dv_captured_getter(proto, ta_plan, ip)?;
                 if site.get_ip < s || site.call_ip > e {
                     return None;
                 }
@@ -1290,7 +1321,7 @@ fn gpr_deopt_shadow_plan(
                     recv_resets = recv_resets.saturating_add(1);
                 }
                 Instr::GetProp { dst, .. }
-                    if gpr_deopt_shadow_captured_dv(proto, ta_plan, ip).is_some_and(|site| {
+                    if dv_captured_getter(proto, ta_plan, ip).is_some_and(|site| {
                         site.callee == *dst
                             && plan.split_recvs.contains(dst)
                             && reg_ids.binary_search(dst).is_ok()

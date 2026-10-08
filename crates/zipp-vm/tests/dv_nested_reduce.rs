@@ -175,6 +175,74 @@ fn wide_accumulator_and_zero_trip_inner_loop_decline_at_runtime() {
     );
 }
 
+/// Under the strict default call order (B280) these getter calls lower to
+/// `GetProp; <args>; CallWithThis`, because their arguments read globals. The
+/// reduction must recognise that captured pair as the same pure pinned getter:
+/// while it accepted only the fused `CallMethod`, every case in this file ran
+/// the ordinary outer backedge and proved nothing about the collapse.
+#[cfg(all(target_arch = "x86_64", feature = "jit", not(feature = "safe-sandbox")))]
+#[test]
+fn default_call_order_still_collapses_the_reduction() {
+    if std::env::var_os("ZIPP_DV_NESTED_REDUCE_CHILD").is_some() {
+        return;
+    }
+    let text = zipp_vm::compile_to_text(
+        "var dv = new DataView(new ArrayBuffer(8)); var o = 0; var v = dv.getUint32(o, o === 1);",
+        false,
+    )
+    .expect("compiles");
+    assert!(
+        text.contains("CallWithThis {") && !text.contains("CallMethod {"),
+        "a global-read argument should take the captured lowering by default:
+{text}"
+    );
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args(["stable_bytes_and_pre_entry_alias_mutation_match_node", "--exact", "--nocapture"])
+        .env_remove("ZIPP_RELAXED_CALL_ORDER")
+        .env_remove("ZIPP_STRICT_CALL_ORDER")
+        .env_remove("ZIPP_NO_DV_NESTED_REDUCE")
+        .env_remove("ZIPP_NOJIT")
+        .env("ZIPP_JITLOG", "1")
+        .env("ZIPP_DV_NESTED_REDUCE_CHILD", "1")
+        .output()
+        .expect("re-run test binary");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stderr.contains("DataView nested reduction acc="),
+        "the captured getter pair did not engage the reduction:
+{stderr}"
+    );
+}
+
+/// A captured callee that is not the pinned intrinsic getter must never be
+/// collapsed: an own shadow on the view, a replaced prototype method and a
+/// subclass override each run user code on every pass.
+#[test]
+fn captured_non_intrinsic_getters_are_not_collapsed() {
+    for setup in [
+        "dv.getUint16 = function (at) { calls++; return at + 1; };",
+        "DataView.prototype.getUint16 = function (at) { calls++; return at + 2; };",
+        "class View extends DataView { getUint16(at) { calls++; return at + 3; } } dv = new View(buf);",
+        "Object.setPrototypeOf(dv, { getUint32: function (at) { calls++; return at; }, getUint16: function (at) { calls++; return 4; } });",
+    ] {
+        assert_matches_node(&format!(
+            r#"
+            "use strict";
+            var buf = new ArrayBuffer(64), bytes = new Uint8Array(buf), dv = new DataView(buf);
+            for (var fill = 0; fill < 64; fill++) bytes[fill] = fill * 31 + 5;
+            var sum = 0, r = 0, o = 0, calls = 0;
+            {setup}
+            for (r = 0; r < 320; r++) {{
+              for (o = 0; o < 64; o += 4)
+                sum = (sum + dv.getUint32(o, (o & 4) === 4) + dv.getUint16(o, (o & 4) === 0)) | 0;
+            }}
+            console.log(sum + ":" + calls + ":" + r + ":" + o);
+            "#
+        ));
+    }
+}
+
 /// The switch is process-latched, so a child runs every semantic case through
 /// the ordinary outer backedge using the same test binary.
 #[test]
