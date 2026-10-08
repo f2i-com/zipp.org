@@ -3902,6 +3902,83 @@ fn jit_proto_named_get(vm: &Vm, idx: u32, key: &str) -> Option<Value> {
     Some(Value::UNDEFINED)
 }
 
+/// `ZIPP_NO_COLL_METHOD_WAY=1` stops the property miss helper filling an
+/// inline-cache way for a Map / Set method read, so every such read takes the
+/// helper again — the same-binary A/B for that fill.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn coll_method_way_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_COLL_METHOD_WAY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Make a Map / Set receiver's METHOD read call-free: fill the site's inline
+/// cache with a one-hop chain way to the intrinsic prototype slot the
+/// collection proof just resolved. A split member call (`m.get(k + 1)` lowers
+/// to `GetProp; <args>; CallWithThis`) reads its callee once per call, and
+/// the probe never filled for a collection receiver, so each read paid the
+/// eight-way miss and this helper.
+///
+/// The way holds exactly what an ordinary prototype-chain data way holds, and
+/// the probe's guards cover every change to the resolution: the receiver's
+/// identity; its heap version, which an own-shadow add, `defineProperty`,
+/// `setPrototypeOf` and slot reuse all advance (the invariant the B215
+/// receiver-proof cache already rests on — a Map's CONTENT mutation does not
+/// touch it, so `m.set` leaves the way valid); and the prototype's version,
+/// which a key add, delete or redefinition advances. The Value is re-read
+/// from the live slot on every hit, so an in-place overwrite of the method is
+/// observed. Called only with `collection_intrinsic_bits` proven: no own
+/// shadow, the receiver's [[Prototype]] is this realm's intrinsic prototype,
+/// and the slot is a data property.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jit_fill_collection_method_way(
+    vm: &mut Vm,
+    idx: u32,
+    obj_bits: u64,
+    key: &str,
+    kind: u8,
+    site_idx: u32,
+) {
+    if !coll_method_way_enabled() || vm.jit.direct_miss_active(site_idx) {
+        return;
+    }
+    let proto = if kind == 4 {
+        vm.map_proto
+    } else {
+        vm.set_proto
+    };
+    if proto == 0 || !vm.ic_obj_ok(proto) {
+        return;
+    }
+    let (vals_ptr, slot) = match vm.heap.get(proto) {
+        HeapObj::Object(m) if !m.is_ctor && m.class.is_none() => match m.pos(key) {
+            Some(slot) if !m.attr_at(slot).accessor => (m.vals_ptr_raw() as u64, slot as u32),
+            _ => return,
+        },
+        _ => return,
+    };
+    let hop = [(proto, vm.heap.version_of(proto))];
+    let Some(entry) =
+        crate::codegen::IcEntry::chain(obj_bits, vals_ptr, vm.heap.version_of(idx), slot, &hop)
+    else {
+        return;
+    };
+    if vm.jit.ic_thrashing(site_idx) && crate::codegen::ic_refill_gate_enabled() {
+        vm.jit.ic_rot_bump(site_idx);
+    } else {
+        vm.jit.set_ic(site_idx, entry);
+    }
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_get_prop_miss(
     vm: *mut core::ffi::c_void,
@@ -4330,6 +4407,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             };
             if kind != 0 {
                 if let Some(bits) = vm.collection_intrinsic_bits(idx, key, kind) {
+                    jit_fill_collection_method_way(vm, idx, obj_bits, key, kind, site_idx);
                     return bits;
                 }
             }

@@ -15,8 +15,11 @@
 //! override installed BY the argument leaves the captured intrinsic running
 //! for that call, an own shadow, a replaced prototype, a subclass method and
 //! another kind's intrinsic under the name all decline, and an Array receiver
-//! under a string lane's name is never claimed. Expected values come from
-//! `node` (v24) running the same program.
+//! under a string lane's name is never claimed. The callee READ of a Map or
+//! Set method is itself served from an inline-cache way once warm, so the
+//! probes also redefine the prototype slot as an accessor, delete it, rotate
+//! receivers through one site and replace the receiver on every iteration.
+//! Expected values come from `node` (v24) running the same program.
 
 const PROBES: &str = r#""use strict";
 var res = "";
@@ -106,10 +109,33 @@ function setFill(set, n) { for (var q = 0; q < n; q++) set.add(q * 2 + 1); retur
 function fnCall(f, n) { var r = 0; for (var q = 0; q < n; q++) r += f.call(null, q + 1); return r; }
 function strScan(text, n) { var r = 0; for (var q = 0; q < n; q++) r += text.indexOf(text[q % 5]) + text.slice(q % 7, 9).length; return r; }
 res += ";o=" + own3 + "/" + mapSum(m, N) + "/" + setFill(new Set(), N) + "/" + fnCall(function (x) { return x * 2; }, N) + "/" + strScan(str, N);
+// 11 the method READ itself, served from an inline-cache way once warm: the
+// prototype slot redefined as an accessor, then deleted
+var m5 = new Map([[1, 2]]), r5 = "", seenFns = 0, origHas = Map.prototype.has, viaAcc = 0, f5;
+for (i = 0; i < N; i++) {
+  if (i === 1000) Object.defineProperty(Map.prototype, "has", { get: function () { viaAcc++; return origHas; }, configurable: true });
+  if (i === 2000) delete Map.prototype.has;
+  f5 = m5.has;
+  if (f5 === origHas) seenFns++;
+  if (i === 2500) r5 = typeof f5;
+}
+Object.defineProperty(Map.prototype, "has", { value: origHas, writable: true, configurable: true, enumerable: false });
+res += ";p=" + seenFns + "/" + viaAcc + "/" + r5 + "/" + m5.has(1);
+// 12 one site, several receivers, one of them carrying an own shadow
+var ma = new Map([[1, "a"]]), mb = new Map([[1, "b"]]), mc = new Map([[1, "c"]]), outp = "", cur;
+mc.get = function () { return "own"; };
+var mix = [ma, mb, mc];
+for (i = 0; i < N; i++) { cur = mix[i % 3]; v = cur.get(i - i + 1); if (i > N - 4) outp += v; }
+// 13 a Set under a site warmed by a Map, and a receiver that dies and is replaced
+var sx = new Set([1]), both = [ma, sx], hb = 0, fresh;
+for (i = 0; i < N; i++) { cur = both[i & 1]; if (cur.has(i - i + 1)) hb++; }
+for (i = 0; i < N; i++) { fresh = new Map([[i, i]]); hb += fresh.get(i + 0) === i ? 1 : 0; }
+res += ";q=" + outp + "/" + hb;
 console.log(res.slice(1));
 "#;
 
-const EXPECTED: &str = "a=13504500/6000/6000;b=5000/5000/false/true;c=2000/1000;d=2499,2500,2501,over,over,;e=22500/1500;f=1500/1500;g=337500/1500;h=168000/lo wor/0;i=112000;j=57000;k=15000;l=57;m=57/1000;n=2250/1500;o=57/4501500/3000/9003000/23406";
+const EXPECTED: &str =
+    "a=13504500/6000/6000;b=5000/5000/false/true;c=2000/1000;d=2499,2500,2501,over,over,;e=22500/1500;f=1500/1500;g=337500/1500;h=168000/lo wor/0;i=112000;j=57000;k=15000;l=57;m=57/1000;n=2250/1500;o=57/4501500/3000/9003000/23406;p=2000/1000/undefined/true;q=abown/6000";
 
 #[test]
 fn captured_method_lane_matches_node() {
@@ -127,6 +153,7 @@ fn captured_method_lane_probe_modes() {
     let exe = std::env::current_exe().expect("test exe path");
     for (label, key) in [
         ("lane-off", "ZIPP_NO_CAPTURED_METHOD_LANE"),
+        ("method-way-off", "ZIPP_NO_COLL_METHOD_WAY"),
         ("interpreter", "ZIPP_NOJIT"),
         ("forced-jit", "ZIPP_JIT_THRESHOLD"),
         ("relaxed-order", "ZIPP_RELAXED_CALL_ORDER"),
@@ -138,6 +165,7 @@ fn captured_method_lane_probe_modes() {
             .env_remove("ZIPP_RELAXED_CALL_ORDER")
             .env_remove("ZIPP_STRICT_CALL_ORDER")
             .env_remove("ZIPP_NO_CAPTURED_METHOD_LANE")
+            .env_remove("ZIPP_NO_COLL_METHOD_WAY")
             .env(key, "1")
             .output()
             .expect("spawn the probe child");
