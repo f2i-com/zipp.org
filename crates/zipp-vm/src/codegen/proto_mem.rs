@@ -5871,13 +5871,15 @@ pub(crate) fn compile_proto_mem(
                 // Split builtin call: the captured-intrinsic lane first (a
                 // bits-guarded direct helper; misses fall through) — see
                 // `emit_captured_builtin_lane`. Tier C pins no arrays.
-                let lane_done = captured_builtin_lane(proto, ip, callee, argc, &heap).map(
-                    |(bits, helper, _)| {
-                        emit_captured_builtin_lane(
+                let lane_done =
+                    captured_builtin_lane(proto, ip, callee, argc, &heap).map(|lane| match lane {
+                        CapturedLane::Direct { bits, helper, .. } => emit_captured_builtin_lane(
                             &mut ops, callee, this_v, arg_base, dst, bits, helper, None,
-                        )
-                    },
-                );
+                        ),
+                        CapturedLane::Proved { op } => emit_captured_method_lane(
+                            &mut ops, callee, this_v, arg_base, argc, dst, op, refetch,
+                        ),
+                    });
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;

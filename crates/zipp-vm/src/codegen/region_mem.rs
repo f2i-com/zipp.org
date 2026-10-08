@@ -147,7 +147,7 @@ pub(crate) fn emit_cross_refetch_ta(
 /// Same-binary A/B switch for the guarded `hasOwnProperty.call` intrinsic.
 /// Read while compiling a region, never on the generated hot path.
 #[inline]
-fn has_own_call_intrinsic_enabled() -> bool {
+pub(crate) fn has_own_call_intrinsic_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
     match ON.load(Ordering::Relaxed) {
@@ -3508,9 +3508,9 @@ pub(crate) fn compile_region_mem(
                 // captured-intrinsic lane first — a bits-guarded direct
                 // helper call; every miss is a pure prefix of the generic
                 // path below.
-                let lane_done = captured_builtin_lane(proto, ip, callee, argc, &heap).map(
-                    |(bits, helper, grows)| {
-                        emit_captured_builtin_lane(
+                let lane_done =
+                    captured_builtin_lane(proto, ip, callee, argc, &heap).map(|lane| match lane {
+                        CapturedLane::Direct { bits, helper, grows } => emit_captured_builtin_lane(
                             &mut ops,
                             callee,
                             this_v,
@@ -3519,9 +3519,18 @@ pub(crate) fn compile_region_mem(
                             bits,
                             helper,
                             if grows { ta_refetch } else { None },
-                        )
-                    },
-                );
+                        ),
+                        CapturedLane::Proved { op } => emit_captured_method_lane(
+                            &mut ops,
+                            callee,
+                            this_v,
+                            arg_base,
+                            argc,
+                            dst,
+                            op,
+                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                        ),
+                    });
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;

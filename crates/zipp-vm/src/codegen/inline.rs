@@ -118,38 +118,136 @@ pub(crate) fn emit_region_call_ic(
     emit_region_bail(ops, ip, bail, epilogue);
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_CAPTURED_METHOD_LANE=1` removes the proved captured-method
+    /// lane (`jit_captured_method`), so a split Map / Set / string /
+    /// `hasOwn.call` member call takes the generic captured-callee helper
+    /// alone — the same-binary A/B for that lane.
+    fn captured_method_lane_enabled() = "ZIPP_NO_CAPTURED_METHOD_LANE"
+}
+
+/// A split-member-call intrinsic lane for a `CallWithThis` (see
+/// [`captured_builtin_lane`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CapturedLane {
+    /// The captured callee is compared against the boot intrinsic's bits
+    /// inline and the dedicated one-argument helper is called directly
+    /// (`emit_captured_builtin_lane`); `grows` says the helper can grow a
+    /// dense Array.
+    Direct { bits: u64, helper: usize, grows: bool },
+    /// `jit_captured_method` proves the captured callee against the live
+    /// intrinsic and runs its dedicated helper
+    /// (`emit_captured_method_lane`); the payload is its `captured_op`
+    /// selector.
+    Proved { op: u32 },
+}
+
 /// The split-member-call intrinsic lane for a `CallWithThis` at `ip`, if its
-/// captured callee was (syntactically) loaded by a `GetProp` of `push` /
-/// `charCodeAt`: `(boot intrinsic bits, dedicated helper, grows_array)`. The
-/// pairing is a HINT that picks the lane; soundness rests on the emitted
-/// runtime bits compare alone (`emit_captured_builtin_lane`).
+/// captured callee was (syntactically) loaded by a `GetProp` of a name whose
+/// fused `CallMethod` lowering has a dedicated intrinsic helper. The pairing
+/// is a HINT that picks the lane; soundness rests on the runtime identity
+/// proof alone — the emitted bits compare for a `Direct` lane, the helper's
+/// own for a `Proved` one.
 pub(crate) fn captured_builtin_lane(
     proto: &FuncProto,
     ip: usize,
     callee: u16,
     argc: u16,
     heap: &HeapHelpers,
-) -> Option<(u64, usize, bool)> {
-    if argc != 1 {
+) -> Option<CapturedLane> {
+    // The call carries the member name it was captured under (B289); an
+    // unnamed one falls back to the syntactic pairing.
+    let name = match proto.code.get(ip) {
+        Some(&Instr::CallWithThis { name, .. }) if name != crate::bytecode::NO_NAME => name,
+        _ => proto.code[..ip].iter().rev().find_map(|i| match *i {
+            Instr::GetProp { dst, name, .. } if dst == callee => Some(name),
+            _ => None,
+        })?,
+    };
+    let key = proto.string_constants.get(name as usize)?.as_str();
+    match (key, argc) {
+        ("push", 1) if heap.push_intrinsic_bits != 0 => {
+            return Some(CapturedLane::Direct {
+                bits: heap.push_intrinsic_bits,
+                helper: heap.array_push,
+                grows: true,
+            });
+        }
+        ("charCodeAt", 1) if heap.char_code_at_intrinsic_bits != 0 => {
+            return Some(CapturedLane::Direct {
+                bits: heap.char_code_at_intrinsic_bits,
+                helper: heap.char_code_at,
+                grows: false,
+            });
+        }
+        _ => {}
+    }
+    if !captured_method_lane_enabled() {
         return None;
     }
-    let name = proto.code[..ip].iter().rev().find_map(|i| match *i {
-        Instr::GetProp { dst, name, .. } if dst == callee => Some(name),
-        _ => None,
-    })?;
-    match proto
-        .string_constants
-        .get(name as usize)
-        .map(|s| s.as_str())
-    {
-        Some("push") if heap.push_intrinsic_bits != 0 => {
-            Some((heap.push_intrinsic_bits, heap.array_push, true))
-        }
-        Some("charCodeAt") if heap.char_code_at_intrinsic_bits != 0 => {
-            Some((heap.char_code_at_intrinsic_bits, heap.char_code_at, false))
-        }
-        _ => None,
+    // Each selector honours the off-switch of the fused intrinsic it mirrors.
+    let op = crate::vm::captured_op::from_name(key, argc)?;
+    use crate::vm::captured_op as cop;
+    let on = match op {
+        cop::SET | cop::ADD | cop::DELETE => super::proto_mem::tierc_coll_mutate_enabled(),
+        cop::SUBSTRING | cop::SLICE => argc == 2 || substring1_intrinsic_enabled(),
+        cop::CALL => super::region_mem::has_own_call_intrinsic_enabled(),
+        _ => true,
+    };
+    if !on {
+        return None;
     }
+    if std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!("[jit] captured method lane `{key}` emitted at ip {ip}");
+    }
+    Some(CapturedLane::Proved { op })
+}
+
+/// The `Proved` twin of [`emit_captured_builtin_lane`]: hand the captured
+/// callee, the captured receiver and the argument window to
+/// `jit_captured_method`, which either serves the call through the intrinsic's
+/// dedicated helper or answers `SELF_CALL_DEOPT` before any observable action.
+/// A decline is a pure-prefix MISS that falls through to the unchanged generic
+/// call. A served string helper can allocate (the heap's version array may
+/// move), so `refetch` re-derives r13/r14 exactly as the generic call does;
+/// none of these intrinsics runs user code or grows a dense Array, so no
+/// pinned-array snapshot needs repair. Returns the join label the caller must
+/// define after its generic path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_captured_method_lane(
+    ops: &mut dynasmrt::x64::Assembler,
+    callee: u16,
+    this_v: u16,
+    arg_base: u16,
+    argc: u16,
+    dst: u16,
+    op: u32,
+    refetch: Option<(usize, usize)>,
+) -> dynasmrt::DynamicLabel {
+    let done = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    let packed = ((argc as u32) << 8) | op;
+    dynasm!(ops
+        ; mov rcx, rdi                          // vm
+        ; mov rdx, [rbx + dreg(this_v)]         // captured receiver bits
+        ; lea r8, [rbx + dreg(arg_base)]        // &args[0..argc]
+        ; mov r9, [rbx + dreg(callee)]          // captured callee bits
+        ; mov DWORD [rsp + 32], packed as i32   // 5th arg: (argc << 8) | selector
+        ; mov rax, QWORD crate::vm::jit_captured_method as usize as i64
+        ; call rax
+        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+        ; cmp rax, r10
+        ; je => miss                            // declined -> generic call
+        ; mov [rbx + dreg(dst)], rax
+    );
+    if let Some((vb, icb)) = refetch {
+        emit_refetch_pinned(ops, vb, Some(icb));
+    }
+    dynasm!(ops
+        ; jmp => done
+        ; => miss
+    );
+    done
 }
 
 /// A split member call on a builtin receiver — `arr.push(x)` / `s.charCodeAt(i)`

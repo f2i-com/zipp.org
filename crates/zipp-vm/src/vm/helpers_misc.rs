@@ -772,6 +772,167 @@ pub(crate) extern "win64" fn jit_coll_mutate(
     }
 }
 
+/// Selectors for [`jit_captured_method`]: the member name a split call's
+/// callee was captured under, for the names whose fused `CallMethod` lowering
+/// has a dedicated intrinsic helper. The receiver kind is read at run time, so
+/// one selector covers `Map.prototype.has` and `Set.prototype.has`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) mod captured_op {
+    pub(crate) const GET: u32 = 0;
+    pub(crate) const HAS: u32 = 1;
+    pub(crate) const SET: u32 = 2;
+    pub(crate) const ADD: u32 = 3;
+    pub(crate) const DELETE: u32 = 4;
+    pub(crate) const INDEX_OF: u32 = 5;
+    pub(crate) const SUBSTRING: u32 = 6;
+    pub(crate) const SLICE: u32 = 7;
+    pub(crate) const CALL: u32 = 8;
+
+    /// The selector for a `recv.name(args)` site of this arity, if any. (A
+    /// zero-argument call such as `m.clear()` is always fused: it has no
+    /// argument to order against the callee Get.)
+    pub(crate) fn from_name(name: &str, argc: u16) -> Option<u32> {
+        Some(match (name, argc) {
+            ("get", 1) => GET,
+            ("has", 1) => HAS,
+            ("set", 2) => SET,
+            ("add", 1) => ADD,
+            ("delete", 1) => DELETE,
+            ("indexOf", 1) => INDEX_OF,
+            ("substring", 1 | 2) => SUBSTRING,
+            ("slice", 1 | 2) => SLICE,
+            ("call", 2) => CALL,
+            _ => return None,
+        })
+    }
+}
+
+/// Win64 helper for the spec-order lowering of a builtin member call —
+/// `GetProp callee = recv.name; <args>; CallWithThis callee, recv` — whose
+/// fused `CallMethod` form has a dedicated intrinsic helper (`jit_coll_lookup`,
+/// `jit_coll_mutate`, `jit_str_index_of`, `jit_str_substring`,
+/// `jit_has_own_call`). The captured form reached only the generic
+/// `jit_call_with_this_ic` tail: `call_value` on a native callee, with the
+/// builtin dispatch chain behind it, where the fused form ran one helper.
+///
+/// EvaluateCall invokes the CAPTURED Value, so identity is the proof: the
+/// lane serves only when `callee_bits` is exactly what a Get of that name on
+/// this receiver resolves to right now, proven to be the boot intrinsic
+/// (`collection_intrinsic_bits`, `proto_intrinsic_bits`, `fn_call_apply_bits`).
+/// Running that intrinsic's helper on the captured receiver is then
+/// `callee.[[Call]](recv, args)`. An override installed before the capture, an
+/// own shadow, an intrinsic of another name or realm, or an override installed
+/// BY the arguments (captured intrinsic in hand, prototype slot changed) all
+/// fail the comparison.
+///
+/// Every decline returns `SELF_CALL_DEOPT` before any observable action and
+/// the emitted site falls through to the unchanged generic call — a pure
+/// prefix, never a region deopt. `packed` is `(argc << 8) | selector`; `args`
+/// points at the contiguous argument window.
+///
+/// # Safety
+/// `vm` is the live `Vm`; `args` addresses `argc` initialized Values in the
+/// running frame's pinned register window.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_captured_method(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    args: *const u64,
+    callee_bits: u64,
+    packed: u32,
+) -> u64 {
+    use crate::codegen::SELF_CALL_DEOPT;
+    let op = packed & 0xFF;
+    let argc = (packed >> 8) as usize;
+    let recv = Value::from_bits(recv_bits);
+    if vm.is_null() || args.is_null() || !recv.is_heap() {
+        return SELF_CALL_DEOPT;
+    }
+    let idx = recv.heap_index();
+    // SAFETY: `argc` initialized slots, read only when the arity admits them.
+    let arg = |i: usize| unsafe { *args.add(i) };
+    // The identity proof borrows the VM exclusively; that borrow ends before
+    // the dedicated helper re-derives its own from the raw pointer.
+    enum Lane {
+        Lookup(u64),
+        Mutate(u64),
+        IndexOf,
+        Substring(u64),
+        HasOwnCall,
+    }
+    let lane = {
+        // SAFETY: generated code passes its exclusive live VM pointer.
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        if idx as usize >= vm.heap.len() {
+            return SELF_CALL_DEOPT;
+        }
+        match op {
+            captured_op::GET
+            | captured_op::HAS
+            | captured_op::SET
+            | captured_op::ADD
+            | captured_op::DELETE => {
+                let kind: u8 = match vm.heap.get(idx) {
+                    HeapObj::Map { .. } => 4,
+                    HeapObj::Set(_) => 3,
+                    _ => return SELF_CALL_DEOPT,
+                };
+                // The dedicated helpers' op numbering (see `jit_coll_lookup`
+                // and `jit_coll_mutate`); a triple without one declines.
+                let (name, lane) = match (op, kind, argc) {
+                    (captured_op::GET, 4, 1) => ("get", Lane::Lookup(0)),
+                    (captured_op::HAS, 4, 1) => ("has", Lane::Lookup(1)),
+                    (captured_op::HAS, 3, 1) => ("has", Lane::Lookup(2)),
+                    (captured_op::SET, 4, 2) => ("set", Lane::Mutate(0)),
+                    (captured_op::ADD, 3, 1) => ("add", Lane::Mutate(2)),
+                    (captured_op::DELETE, 4, 1) => ("delete", Lane::Mutate(3)),
+                    (captured_op::DELETE, 3, 1) => ("delete", Lane::Mutate(4)),
+                    _ => return SELF_CALL_DEOPT,
+                };
+                if vm.collection_intrinsic_bits(idx, name, kind) != Some(callee_bits) {
+                    return SELF_CALL_DEOPT;
+                }
+                lane
+            }
+            captured_op::INDEX_OF | captured_op::SUBSTRING | captured_op::SLICE => {
+                if !matches!(vm.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+                    return SELF_CALL_DEOPT;
+                }
+                let (name, lane) = match (op, argc) {
+                    (captured_op::INDEX_OF, 1) => ("indexOf", Lane::IndexOf),
+                    (captured_op::SUBSTRING, 1 | 2) => {
+                        ("substring", Lane::Substring(((argc == 1) as u64) << 1))
+                    }
+                    (captured_op::SLICE, 1 | 2) => {
+                        ("slice", Lane::Substring(1 | (((argc == 1) as u64) << 1)))
+                    }
+                    _ => return SELF_CALL_DEOPT,
+                };
+                if vm.proto_intrinsic_bits(name, false) != Some(callee_bits) {
+                    return SELF_CALL_DEOPT;
+                }
+                lane
+            }
+            captured_op::CALL => {
+                if argc != 2 || vm.fn_call_apply_bits(recv, "call") != Some(callee_bits) {
+                    return SELF_CALL_DEOPT;
+                }
+                Lane::HasOwnCall
+            }
+            _ => return SELF_CALL_DEOPT,
+        }
+    };
+    match lane {
+        Lane::Lookup(o) => jit_coll_lookup(vm, recv_bits, arg(0), o),
+        Lane::Mutate(o) => {
+            jit_coll_mutate(vm, recv_bits, arg(0), if argc >= 2 { arg(1) } else { 0 }, o)
+        }
+        Lane::IndexOf => jit_str_index_of(vm, recv_bits, arg(0)),
+        Lane::Substring(mode) => jit_str_substring(vm, recv_bits, args as u64, mode),
+        Lane::HasOwnCall => jit_has_own_call(vm, recv_bits, arg(0), arg(1)),
+    }
+}
+
 /// Win64 helper for guarded primitive-string `toUpperCase()` in Tier C.
 /// Prototype replacement/accessors and child-realm prototype images decline
 /// before GC or allocation.  The existing `string_method` owns the exact
@@ -4157,8 +4318,39 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         | HeapObj::WeakSet(_)
         | HeapObj::Date(_)
         | HeapObj::Promise { .. } => {
+            // Memo first, as for Array / String above: a Map or Set whose
+            // method Get provably resolves to the boot intrinsic (the B183 /
+            // B215 collection proof) answers in a few loads instead of the
+            // chain walk — every split `m.get(k + 1)` / `s.add(a[i])` reads
+            // its callee here once per call.
+            let kind = match vm.heap.get(idx) {
+                HeapObj::Map { .. } => 4,
+                HeapObj::Set(_) => 3,
+                _ => 0,
+            };
+            if kind != 0 {
+                if let Some(bits) = vm.collection_intrinsic_bits(idx, key, kind) {
+                    return bits;
+                }
+            }
             return match jit_proto_named_get(vm, idx, key) {
                 Some(v) => v.bits(),
+                None => crate::codegen::SELF_CALL_DEOPT,
+            };
+        }
+        // `f.call` / `f.apply` / `f.bind` on an ordinary callable: the same
+        // split-member-call Get (`hasOwn.call(o, k + 1)`, `fn.apply(t, args)`).
+        // The probe never fills for a callable receiver, so without this arm
+        // the read deopted on every iteration until the region was evicted
+        // (sparse-array's `hasOwn.call(sp, i + 1)` loop: 64 deopts at the Get,
+        // then interpreted for the rest of the run). Served only from the
+        // pristine `%Function.prototype%` slot proof; an own shadow, a custom
+        // or foreign-realm prototype, or a replaced slot still deopts.
+        HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_) | HeapObj::Bound { .. }
+            if matches!(key.as_str(), "call" | "apply" | "bind") =>
+        {
+            return match vm.fn_call_apply_bits(obj, key) {
+                Some(bits) => bits,
                 None => crate::codegen::SELF_CALL_DEOPT,
             };
         }

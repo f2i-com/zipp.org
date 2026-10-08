@@ -328,6 +328,26 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The Value a real Get of `call` / `apply` / `bind` on the callable `recv`
+    /// resolves to, when that is provably the pristine `%Function.prototype%`
+    /// data slot ([`Vm::fn_call_apply_pristine`]): the captured half of a
+    /// spec-order `f.call(…)` (`GetProp; <args>; CallWithThis`) read without
+    /// the chain walk, and the identity a captured callee is compared against.
+    /// A function of another realm inherits that realm's copies, so it
+    /// declines; `None` is a pure read-only prefix.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn fn_call_apply_bits(&self, recv: Value, name: &str) -> Option<u64> {
+        if !self.fn_call_apply_pristine(recv, name)
+            || (!self.realm_global_objs.is_empty() && self.get_function_realm(recv) != 0)
+        {
+            return None;
+        }
+        match self.heap.get(self.fn_proto) {
+            HeapObj::Object(m) => m.pos(name).map(|slot| m.val_at(slot).bits()),
+            _ => None,
+        }
+    }
+
     /// Whether an Array receiver's live `slice` / `concat` method Get resolves
     /// to the matching main-realm intrinsic. These two copy methods participate
     /// in the allocation-loop reducer, so their ordinary name-dispatched path

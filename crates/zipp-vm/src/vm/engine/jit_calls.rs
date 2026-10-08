@@ -1201,6 +1201,33 @@ impl<'p> Vm<'p> {
                             if cv.is_heap()
                                 && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
                             {
+                                // A captured boot intrinsic takes the fused
+                                // `CallMethod` builtin lanes, as it does in the
+                                // interpreter's `CallWithThis` arm (B289): the
+                                // lane proves the captured Value identical to
+                                // the live prototype intrinsic and otherwise
+                                // declines before any effect.
+                                if has_explicit_this {
+                                    if let Instr::CallWithThis { name, .. } =
+                                        self.func(func_id as usize).code[ip]
+                                    {
+                                        if name != crate::bytecode::NO_NAME {
+                                            match self.captured_intrinsic_lane(
+                                                func_id,
+                                                base,
+                                                explicit_this,
+                                                cv,
+                                                name,
+                                                arg_base,
+                                                argc,
+                                            ) {
+                                                Ok(Some(v)) => return v.bits(),
+                                                Ok(None) => {}
+                                                Err(t) => return self.jit_thrown_to_sentinel(t),
+                                            }
+                                        }
+                                    }
+                                }
                                 // `with_argv`: a stack buffer for the common arity (a split
                                 // `arr.push(x)` / `s.charCodeAt(i)` lands here once per call
                                 // — a heap Vec per call was the interpreter-parity tax).
