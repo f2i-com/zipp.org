@@ -652,6 +652,11 @@ impl<'p> Vm<'p> {
     /// table, Map and Set receivers against the collection proof; every
     /// other receiver kind declines and pays the generic native call, as it
     /// did before this lane.
+    // Inlined into both callers: with the interpreter's `CallWithThis` arm as
+    // its only caller this was always folded into the dispatch loop, and a
+    // second caller (the native tiers' captured-call helper) must not turn
+    // that arm into an out-of-line call.
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn captured_intrinsic_lane(
         &mut self,
