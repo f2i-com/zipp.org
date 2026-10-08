@@ -1640,6 +1640,55 @@ pub(crate) fn compile_region_regalloc(
                 copy_clobber(&mut lc, d);
                 lc = None;
             }
+            // ── pinned TypedArray `.length` ── the prologue snapshot's effective
+            // length, converted into the dst's f64 home. The snapshot helper
+            // took it only under the live pristine-getter proof (and never for a
+            // length-tracking view of a growable shared buffer), and nothing
+            // admitted on this tier can detach or resize a buffer -- there are
+            // no calls -- so it stays exact for the whole native run. A hoisted
+            // pin's identity was checked at entry; otherwise the live receiver
+            // is compared against the snapshot and a miss resumes the
+            // interpreter AT this read. The name is re-checked: the pin planner
+            // makes a length marker only for `length`, and this keeps that an
+            // assertion rather than an assumption.
+            Instr::GetProp { dst, name, .. }
+                if double_ta_length_enabled()
+                    && ta_plan
+                        .access
+                        .get(&ip)
+                        .is_some_and(|&j| is_ta_len_pin(ta_plan.pins[j as usize].kind))
+                    && proto.string_constants.get(name as usize).is_some_and(|k| k == "length") =>
+            {
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let d = xh(&plan, dst);
+                if plan.hoist_pins.contains(&(j as u8)) {
+                    dynasm!(ops
+                        ; mov rax, [rsp + off + 16]       // snapshot length
+                        ; cvtsi2sd Rx(d), rax
+                    );
+                } else {
+                    let deopt = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]            // receiver vs snapshot obj_bits
+                        ; jne => deopt
+                        ; mov rax, [rsp + off + 16]       // snapshot length
+                        ; cvtsi2sd Rx(d), rax
+                        ; jmp => done
+                        ; => deopt
+                        ; mov DWORD [rsi], ip as i32      // resume AT this ip
+                        ; jmp => flush_exit
+                        ; => done
+                    );
+                }
+                copy_clobber(&mut lc, d);
+                lc = None;
+            }
             // ── W20 ── `o.p` on the REGISTER tier. The receiver comes from its
             // frame slot (a `box_regs` member: either the element this loop just
             // read, or a live-in the region never writes), the 8-way probe runs

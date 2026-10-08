@@ -673,6 +673,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// Default-on kill switch for the DOUBLE tier's TypedArray `.length` pin:
+    /// off, a double-typed loop that reads `ta.length` declines to the memory
+    /// tier again, as it did before the arm existed.
+    fn double_ta_length_enabled() = "ZIPP_NO_DOUBLE_TA_LENGTH"
+);
+
+env_off_switch!(
     /// Default-on kill switch for the BAKED `FinalizeObject` form (B182):
     /// a site whose plan resolves at compile time calls a slim helper with
     /// the plan address and the emit-time shape fold baked in, skipping the

@@ -1185,11 +1185,21 @@ fn plan_region_cold_inner(
     // distinct TypedArray length-only marker. Like `str.length`, the receiver
     // is read from the pin snapshot rather than a register, so its reg must be
     // excluded from typing/homing too. The marker does not admit TA elements.
+    //
+    // The DOUBLE path takes the TypedArray marker too: without it the
+    // receiver's `LoadGlobal` was typed as a number, the emitter had no arm
+    // for the read, and `for (i = 0; i < f64.length; i++) s += f64[i]` -- a
+    // double-typed loop, so never an INT candidate -- fell to the memory
+    // tier, where the bound is a helper call per iteration.
     let pinned_len = |ip: usize| -> bool {
-        admit_bitwise
-            && ta_plan.access.get(&ip).map_or(false, |&j| {
-                int_length_pin_kind(ta_plan.pins[j as usize].kind)
-            })
+        ta_plan.access.get(&ip).map_or(false, |&j| {
+            let kind = ta_plan.pins[j as usize].kind;
+            if admit_bitwise {
+                int_length_pin_kind(kind)
+            } else {
+                double_ta_length_enabled() && is_ta_len_pin(kind)
+            }
+        })
     };
     // A pinned DataView `get*` CallMethod (kind DV_PIN_KIND), DOUBLE path only.
     // The INT tier keeps declining these (B22/B32): a getUint32 result ranges
