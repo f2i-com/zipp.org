@@ -5998,6 +5998,20 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
+                        // `.length` of a string, an Array or a TypedArray is
+                        // an internal slot, not a property the shape-keyed IC
+                        // can hold, so every such read used to fall through
+                        // the IC miss and the generic member walk: ~26ns on a
+                        // string or Array and ~45ns on a TypedArray, against
+                        // ~6ns for a cached field. It is the bound of nearly
+                        // every loop, so answer it before the IC.
+                        if key.len() == 6 && key == "length" && o.is_heap() {
+                            if let Some(v) = self.length_fast(o) {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // ── interpreter property IC ── own/chain data reads
                         // resolve through the per-site cache; a cached class /
                         // own / chain GETTER frame-calls on THIS dispatch loop

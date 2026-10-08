@@ -4337,15 +4337,15 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         // OSR_DEOPT_LIMIT blacklisted the region for the life of the process:
         // the identical kernel written with a constant bound ran ~57x faster.
         HeapObj::TypedArray { .. } if key == "length" => {
-            if !vm.ta_length_is_intrinsic(idx) {
-                return crate::codegen::SELF_CALL_DEOPT;
-            }
             // Always derive the effective length. Reading the stored fixed
             // view length was wrong after a resizable buffer shrank the view
             // out of bounds (and length-tracking views need the live size).
             // This helper never caches the answer, so local resize/detach and a
             // shared grow are observed on the next source-level property read.
-            return len_value(vm.ta_effective_len(idx).unwrap_or(0)).bits();
+            return match vm.ta_length_fast(idx) {
+                Some(n) => len_value(n).bits(),
+                None => crate::codegen::SELF_CALL_DEOPT,
+            };
         }
         HeapObj::Str(s) if key == "length" => return len_value(s.units()).bits(),
         HeapObj::Cons { len, .. } if key == "length" => return len_value(*len).bits(),

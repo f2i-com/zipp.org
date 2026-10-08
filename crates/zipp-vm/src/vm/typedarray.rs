@@ -215,7 +215,6 @@ impl<'p> Vm<'p> {
     /// prototype is still its kind's intrinsic, that intrinsic does not shadow
     /// `length`, and %TypedArray%.prototype's `length` is still the built-in
     /// accessor (`Native(TA_GET_LENGTH)`).
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ta_length_is_intrinsic(&self, ta_idx: u32) -> bool {
         let kind = match self.heap.get(ta_idx) {
             HeapObj::TypedArray { kind, .. } => *kind as usize,
@@ -268,6 +267,103 @@ impl<'p> Vm<'p> {
                 _ => false,
             },
             _ => false,
+        }
+    }
+
+    /// `ta.length` answered from the internal slot: `Some(effective length)`
+    /// exactly when [`Vm::ta_length_is_intrinsic`] holds, i.e. when a real
+    /// Get would reach the pristine built-in getter, which returns that
+    /// length (0 for a detached or out-of-bounds view).
+    ///
+    /// The proof costs two side-table probes and two key lookups on the
+    /// prototype chain, which made `i < ta.length` -- the most common loop
+    /// bound in numeric code -- several times dearer than the element read it
+    /// guards. The prototype half is the same for every instance of a kind,
+    /// so it is memoized under the two prototype versions (`ta_len_memo`);
+    /// the receiver half is re-proved on every call.
+    pub(crate) fn ta_length_fast(&mut self, ta_idx: u32) -> Option<usize> {
+        let kind = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { kind, .. } => *kind as usize,
+            _ => return None,
+        };
+        let want_proto = match self.ta_protos.get(kind) {
+            Some(&p) if p != 0 => p,
+            _ => return None,
+        };
+        let base = self.ta_base_proto;
+        // The receiver half, exactly as `ta_length_is_intrinsic` states it.
+        if base == 0
+            || (!self.arr_props.is_empty()
+                && self
+                    .arr_props
+                    .get(&ta_idx)
+                    .is_some_and(|m| m.pos("length").is_some()))
+            || !matches!(
+                self.proto_of.get(&ta_idx),
+                Some(v) if v.is_heap() && v.heap_index() == want_proto
+            )
+        {
+            return None;
+        }
+        let memo_hit = match self.ta_len_memo.get(kind) {
+            Some(&(want_ver, base_ver, slot, bits)) => {
+                bits != 0
+                    && want_ver == self.heap.version_of(want_proto)
+                    && base_ver == self.heap.version_of(base)
+                    && matches!(
+                        self.heap.get(base),
+                        HeapObj::Object(m)
+                            if m.is_accessor_at(slot as usize)
+                                && m.val_get_ref(slot as usize).map(|v| v.bits()) == Some(bits)
+                    )
+            }
+            None => false,
+        };
+        if !memo_hit {
+            if !self.ta_length_is_intrinsic(ta_idx) {
+                return None;
+            }
+            let getter = match self.heap.get(base) {
+                HeapObj::Object(m) => m.pos("length").map(|s| (s as u32, m.val_at(s).bits())),
+                _ => None,
+            };
+            if let (Some((slot, bits)), Some(entry)) = (getter, self.ta_len_memo.get_mut(kind)) {
+                *entry = (
+                    self.heap.version_of(want_proto),
+                    self.heap.version_of(base),
+                    slot,
+                    bits,
+                );
+            }
+        }
+        Some(self.ta_effective_len(ta_idx).unwrap_or(0))
+    }
+
+    /// `o.length` for the receivers whose length is an internal slot rather
+    /// than an ordinary property: a primitive string (its UTF-16 units), a
+    /// dense or sparse Array (never an arguments object, whose `length` is an
+    /// ordinary writable property) and a TypedArray with its pristine getter.
+    /// `None` is a pure decline; the caller takes the generic property Get.
+    #[inline]
+    pub(crate) fn length_fast(&mut self, o: Value) -> Option<Value> {
+        use crate::vm::helpers_numeric::len_value;
+        let idx = o.heap_index();
+        match self.heap.get(idx) {
+            HeapObj::Str(s) => Some(len_value(s.units())),
+            HeapObj::Cons { len, .. } => Some(len_value(*len)),
+            HeapObj::Array(items) => {
+                let dense = items.len();
+                if !self.arguments_objs.is_empty() && self.arguments_objs.contains_key(&idx) {
+                    return None;
+                }
+                Some(len_value(if self.array_js_len.is_empty() {
+                    dense
+                } else {
+                    self.array_js_len.get(&idx).map_or(dense, |&n| n as usize)
+                }))
+            }
+            HeapObj::TypedArray { .. } => self.ta_length_fast(idx).map(len_value),
+            _ => None,
         }
     }
 

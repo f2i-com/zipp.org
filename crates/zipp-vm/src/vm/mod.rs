@@ -2762,6 +2762,17 @@ pub struct Vm<'p> {
     /// precedent), so `Function.prototype.call = g` falls back immediately.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     ci_pristine: (u32, u32, u32),
+    /// The PROTOTYPE half of the pristine `ta.length` proof
+    /// (`ta_length_is_intrinsic`), memoized per TypedArray kind: `(version of
+    /// the kind's prototype, version of %TypedArray%.prototype%, that
+    /// prototype's own "length" slot, the built-in getter's Value bits)`; zero
+    /// bits = not proven. The two versions cover everything that can re-point
+    /// or shadow the chain (a key add, delete or redefinition, and
+    /// `setPrototypeOf`, each advance one); the getter is re-read from the
+    /// slot on every use, because an in-place accessor swap advances nothing.
+    /// The receiver half (own shadow, the instance's [[Prototype]]) is not
+    /// memoized. See `Vm::ta_length_fast`.
+    ta_len_memo: [(u32, u32, u32, u64); 12],
     /// Pinned register-file capacity: `self.regs` is reserved to this at startup
     /// and NEVER allowed to grow past it (every call/recursion site checks),
     /// so the Vec never reallocates while native JIT code holds a raw pointer
