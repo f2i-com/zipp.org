@@ -871,8 +871,11 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             Insn::ByteSeq6(bytes) => {
                 Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
             }
+            // No instruction in the message: formatting one here was the only
+            // thing that kept `Insn`'s derived `Debug`, and every type it
+            // reaches, in a release module (about 22 KB of WebAssembly).
             _ => {
-                unreachable!("Missing SCM: {:?}", re.insns.iat(ip + 1));
+                unreachable!("Missing SCM");
             }
         }
     }
@@ -964,8 +967,11 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             Insn::ByteSeq6(bytes) => {
                 Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
             }
+            // No instruction in the message: formatting one here was the only
+            // thing that kept `Insn`'s derived `Debug`, and every type it
+            // reaches, in a release module (about 22 KB of WebAssembly).
             _ => {
-                unreachable!("Missing SCM: {:?}", re.insns.iat(ip + 1));
+                unreachable!("Missing SCM");
             }
         }
     }
