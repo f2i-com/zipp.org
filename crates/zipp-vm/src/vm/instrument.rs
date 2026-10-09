@@ -491,6 +491,14 @@ pub(crate) struct Recorder {
     /// VM-core/side-table baseline without another heap-slot walk. Zero before
     /// the first audit safely falls back to the historical Heap-only estimate.
     pub(crate) heap_audit_non_heap: std::cell::Cell<usize>,
+    /// Bytes of compiled RegExp programs admitted without a walk since the
+    /// latest exact audit (`[0]`) and between the two before it (`[1]`):
+    /// what `heap_audit_non_heap` may not hold yet. An audit moves `[0]` to
+    /// `[1]` rather than dropping it, so a program admitted but not yet
+    /// retained when an audit ran stays counted until the audit after. A
+    /// program freed meanwhile is still counted; the figure is an upper one,
+    /// used to decide whether to walk and never as a verdict.
+    pub(crate) external_bytes_admitted: [std::cell::Cell<usize>; 2],
 }
 
 impl Recorder {
@@ -515,6 +523,7 @@ impl Recorder {
             used_at_heap_poll: 0,
             external_heap_dirty: false,
             heap_audit_non_heap: std::cell::Cell::new(0),
+            external_bytes_admitted: [std::cell::Cell::new(0), std::cell::Cell::new(0)],
             dynamic_limits: DynamicCodeLimits::UNLIMITED,
             dynamic_calls: 0,
             dynamic_source_bytes: 0,
@@ -815,6 +824,20 @@ impl super::Vm<'_> {
         heap_now.saturating_add(rec.heap_audit_non_heap.get())
     }
 
+    /// The estimate with the RegExp programs admitted since the latest walks
+    /// added. It can exceed the exact figure (see `external_bytes_admitted`),
+    /// so it only ever decides that a walk is due; the walk gives the verdict.
+    #[inline]
+    fn instrument_heap_estimate_with_admitted(&self) -> usize {
+        let estimate = self.instrument_heap_estimate();
+        let Some(rec) = self.instr_rec.as_ref() else {
+            return estimate;
+        };
+        estimate
+            .saturating_add(rec.external_bytes_admitted[0].get())
+            .saturating_add(rec.external_bytes_admitted[1].get())
+    }
+
     /// Derive one regex search's hard ceilings. The fixed ceilings stop
     /// catastrophic backtracking even when the host left its VM budgets
     /// unlimited; finite VM budgets tighten them so transient backtrack
@@ -1098,12 +1121,25 @@ impl super::Vm<'_> {
         }
     }
 
-    /// Exact counterpart for rare allocations whose retained bytes live
-    /// outside `HeapObj` payloads and therefore cannot feed the heap's O(1)
+    /// Counterpart for allocations whose retained bytes live outside
+    /// `HeapObj` payloads and therefore cannot feed the heap's O(1)
     /// high-water estimate when admitted. Compiled RegExp programs are the
-    /// motivating case: construction is already substantially more expensive
-    /// than this walk, while auditing here makes a sequence of distinct large
-    /// programs respect the aggregate ceiling before the next one is retained.
+    /// motivating case: a sequence of distinct large programs must respect
+    /// the aggregate ceiling before the next one is retained.
+    ///
+    /// This used to walk the heap for every program, on the reasoning that
+    /// construction costs more than the walk. It does not: the walk visits
+    /// every slot and every compiled program and sorts the programs, so a
+    /// loop compiling 100 small patterns spent 60% of its time here, twice a
+    /// pattern (the program and its ASCII twin), and the share grew with the
+    /// heap. So escalate, then confirm, as the walk's other callers do. The
+    /// estimate holds the heap's high-water figure and the non-heap total of
+    /// the latest walk, and the programs admitted since are summed beside
+    /// it. While estimate, sum and this program fit under the ceiling the
+    /// program is admitted and the next poll is asked for a walk; otherwise
+    /// the walk decides here, exactly as before. The aggregate is still
+    /// enforced at every admission. What waits for the poll is what waits
+    /// everywhere else: growth in place inside objects already counted.
     pub(crate) fn instrument_preflight_external_heap_growth(&mut self, bytes: usize) -> Tick {
         let Some(rec) = self.instr_rec.as_ref() else {
             return Ok(());
@@ -1115,16 +1151,30 @@ impl super::Vm<'_> {
             return Ok(());
         }
         let heap_limit = rec.heap_limit;
-        let resident = self.audit_heap_bytes();
+        // Until the first walk has switched payload accounting on, the
+        // estimate omits object payloads and cannot acquit anything.
+        let fits = self.heap.payload_accounting_enabled()
+            && bytes <= heap_limit.saturating_sub(self.instrument_heap_estimate_with_admitted());
+        let resident = if fits {
+            None
+        } else {
+            Some(self.audit_heap_bytes())
+        };
         let rec = self
             .instr_rec
             .as_mut()
             .expect("recorder checked present above");
-        rec.preflight_bytes_since_audit = 0;
-        rec.external_heap_dirty = false;
-        if bytes > heap_limit.saturating_sub(resident) {
-            return Err(rec.exhaust(ResourceExhaustion::Heap));
+        if let Some(resident) = resident {
+            rec.preflight_bytes_since_audit = 0;
+            if bytes > heap_limit.saturating_sub(resident) {
+                rec.external_heap_dirty = false;
+                return Err(rec.exhaust(ResourceExhaustion::Heap));
+            }
         }
+        // The program is about to be retained and no walk has seen it.
+        let admitted = &rec.external_bytes_admitted[0];
+        admitted.set(admitted.get().saturating_add(bytes));
+        rec.external_heap_dirty = true;
         Ok(())
     }
 
@@ -1228,7 +1278,7 @@ impl super::Vm<'_> {
             // Convict on the cheap figure, then confirm with the exact one: the
             // estimate holds a freed-memory overshoot the audit is what settles,
             // and killing a VM is not a thing to do on an estimate.
-            if reconcile || self.instrument_heap_estimate() > ceiling {
+            if reconcile || self.instrument_heap_estimate_with_admitted() > ceiling {
                 Some(self.audit_heap_bytes())
             } else {
                 None
@@ -1912,7 +1962,8 @@ impl super::Vm<'_> {
         // charge the next growth now, so the guest is convicted while the
         // request is still affordable rather than trapped when it is not.
         let growth = self.heap.slot_table_growth_reserve();
-        let convicted = self.instrument_heap_estimate().saturating_add(growth) > ceiling;
+        let convicted =
+            self.instrument_heap_estimate_with_admitted().saturating_add(growth) > ceiling;
         // The walk costs O(slots), which is what the stride protects; a heap
         // of few slots can afford to reconcile every poll. That is exactly
         // the heap the cheap figure cannot see: one object growing its
