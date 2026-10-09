@@ -3721,7 +3721,18 @@ impl<'p> Vm<'p> {
                     return interned;
                 }
             }
-            let s = f.string_constants[si].clone();
+            // An empty or one-character ASCII literal is one of the heap's
+            // pinned strings, which is what `alloc_str` would answer with
+            // after dropping the `String` built for it. A function that
+            // appends in place gets no cached literals, so `s += "k" + i + ";"`
+            // made and freed two of those on every pass.
+            let text = &f.string_constants[si];
+            match *text.as_bytes() {
+                [] => return Value::heap(crate::heap::INTERN_EMPTY),
+                [byte] if byte < 128 => return Value::heap(u32::from(byte)),
+                _ => {}
+            }
+            let s = text.clone();
             return self.alloc_str(s);
         }
         v
