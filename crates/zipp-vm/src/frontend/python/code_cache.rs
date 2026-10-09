@@ -14,11 +14,13 @@
 //! engine never reads them; the few most recently used executables' folders
 //! are kept and older ones removed. An entry's name is a hash of what it was
 //! compiled from — the source text, the script goal, every `ZIPP_*`
-//! environment variable (several change what the compilers emit) and, for a
+//! environment variable (several change what the compilers emit; the few
+//! that only observe a run, [`OBSERVERS`], are left out) and, for a
 //! module, the program context its code depends on (the in-process memo's
 //! key in `compile_lazy`). The file carries that key and a checksum of its
 //! contents; anything that does not match (a torn write, a truncated file)
-//! is ignored and the code compiled as if there were no cache.
+//! is ignored and the code compiled as if there were no cache. A folder
+//! keeps its [`ENTRIES`] newest entries.
 //!
 //! The folder is the user's own (like CPython's `__pycache__`): its entries
 //! are trusted exactly as far as the executable they belong to.
@@ -35,6 +37,22 @@ const KEEP: usize = 3;
 /// The marker whose modification time says when an executable's folder was
 /// last used (refreshed at most hourly).
 const USED: &str = "used";
+/// Entries kept in one executable's folder. A combination of settings needs
+/// one for the runtime and one for each library module a program imports;
+/// without a bound, a caller that varies a `ZIPP_*` value from run to run
+/// left 0.76 MB behind for every run.
+const ENTRIES: usize = 32;
+/// `ZIPP_*` variables that observe a run without changing what the
+/// compilers emit, so they are not part of an entry's key: a profiled or
+/// logged run starts from the same compiled code as a plain one, and a dump
+/// path that differs every run does not miss the cache every run.
+const OBSERVERS: &[&str] = &[
+    "ZIPP_CACHE_DIR",
+    "ZIPP_JITLOG",
+    "ZIPP_PROF",
+    "ZIPP_PROF_PC",
+    "ZIPP_PROF_PC_DUMP",
+];
 
 /// Keep compiled code under `dir` (created when first written), or not at
 /// all (`None`, the default).
@@ -92,6 +110,7 @@ fn context() -> Option<&'static (PathBuf, Hash)> {
             let mut settings = Hash::new();
             let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
                 .filter(|(name, _)| name.as_encoded_bytes().starts_with(b"ZIPP_"))
+                .filter(|(name, _)| !OBSERVERS.iter().any(|o| name == std::ffi::OsStr::new(o)))
                 .collect();
             crate::cold_sort::sort(&mut vars);
             for (name, value) in vars {
@@ -161,6 +180,33 @@ fn store(dir: &Path, name: &str, key: u64, payload: &[u8]) {
     }
     if fresh {
         prune(dir);
+    } else {
+        trim(dir);
+    }
+}
+
+/// Keep the [`ENTRIES`] most recently written entries of `dir`.
+fn trim(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut written: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "bin"))
+        .map(|p| {
+            let at = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (at, p)
+        })
+        .collect();
+    if written.len() <= ENTRIES {
+        return;
+    }
+    crate::cold_sort::sort_by(&mut written, |a, b| b.0.cmp(&a.0));
+    for (_, old) in written.into_iter().skip(ENTRIES) {
+        let _ = std::fs::remove_file(old);
     }
 }
 
@@ -332,6 +378,36 @@ mod cache_check {
         }
         let left = std::fs::read_dir(&dir).unwrap().count();
         assert!(left <= super::KEEP + 1, "{left} folders left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder keeps a bounded number of entries, the newest ones.
+    #[test]
+    fn code_cache_folder_keeps_its_newest_entries() {
+        let dir = std::env::temp_dir().join(format!("zipp-code-cache-trim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let entry = dir.join("0123456789abcdef");
+        let total = super::ENTRIES + 9;
+        for i in 0..total {
+            super::store(&entry, &format!("runtime-{i:016x}.bin"), i as u64, b"payload");
+            // Entries written in one clock tick have no order to keep.
+            let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i as u64);
+            let file = std::fs::File::options()
+                .write(true)
+                .open(entry.join(format!("runtime-{i:016x}.bin")))
+                .unwrap();
+            file.set_modified(at).unwrap();
+        }
+        let kept = |i: usize| super::load(&entry, &format!("runtime-{i:016x}.bin"), i as u64).is_some();
+        let bins = std::fs::read_dir(&entry)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+            .count();
+        assert_eq!(bins, super::ENTRIES);
+        assert!(kept(total - 1) && kept(total - super::ENTRIES));
+        assert!(!kept(0) && !kept(total - super::ENTRIES - 1));
+        assert!(entry.join(super::USED).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
