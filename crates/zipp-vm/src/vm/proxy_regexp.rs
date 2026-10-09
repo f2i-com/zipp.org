@@ -289,6 +289,8 @@ fn regex_subject_units(
     vm: &mut Vm<'_>,
     value: Value,
 ) -> Result<(Vec<u16>, super::instrument::RegexTransientReservation), Thrown> {
+    // A buffer kept from an earlier exec gives its allowance back first.
+    vm.regex_subject_units = None;
     let mut reservation = vm
         .instrument_reserve_regex_transient(0)
         .map_err(|message| Thrown(message.into()))?;
@@ -1181,13 +1183,21 @@ pub(crate) struct MatchBatch {
 /// flat non-ASCII string that occupied heap slot `idx` at slot version
 /// `version` with `bytes` WTF-8 bytes. See `Vm::regex_subject_units_take` for
 /// why that triple identifies the content.
-#[cfg(not(feature = "safe-sandbox"))]
 pub(crate) struct RegexSubjectUnits {
     pub(crate) idx: u32,
     version: u32,
     bytes: usize,
     units: Vec<u16>,
+    /// The charge the buffer was copied under, held for as long as it is
+    /// kept: a metered VM's working allowance counts the buffer throughout.
+    #[cfg(feature = "safe-sandbox")]
+    reservation: super::instrument::RegexTransientReservation,
 }
+
+/// The largest subject, in UTF-16 units, whose buffer the checked profile
+/// keeps between execs: two bytes a unit of the 16 MiB working allowance.
+#[cfg(feature = "safe-sandbox")]
+const REGEX_SUBJECT_UNITS_KEPT: usize = 1 << 20;
 
 /// The first search of a RegExpBuiltinExec from `start`: a sticky regex makes
 /// ONE attempt anchored at `start` (a failure costs that attempt, not a scan
@@ -2997,10 +3007,12 @@ impl<'p> Vm<'p> {
             )
         };
         #[cfg(feature = "safe-sandbox")]
-        let (u16s, _subject_units_reservation) = if is_ascii {
+        let (u16s, mut subject_units_reservation) = if is_ascii {
+            // While an exec runs, no subject's buffer but its own is held.
+            self.regex_subject_units = None;
             (Vec::new(), None)
         } else {
-            let (units, reservation) = regex_subject_units(self, input_val)?;
+            let (units, reservation) = self.regex_subject_units_take(input_val)?;
             (units, Some(reservation))
         };
         #[cfg(not(feature = "safe-sandbox"))]
@@ -3128,6 +3140,8 @@ impl<'p> Vm<'p> {
                 if !is_ascii {
                     self.regex_subject_units_put(input_val, u16s);
                 }
+                #[cfg(feature = "safe-sandbox")]
+                self.regex_subject_units_put(input_val, u16s, subject_units_reservation.take());
                 if stateful {
                     // RegExpBuiltinExec Set(R,"lastIndex",0,true): a non-writable
                     // lastIndex makes a failed global/sticky exec throw.
@@ -3195,6 +3209,8 @@ impl<'p> Vm<'p> {
             if !is_ascii {
                 self.regex_subject_units_put(input_val, u16s);
             }
+            #[cfg(feature = "safe-sandbox")]
+            self.regex_subject_units_put(input_val, u16s, subject_units_reservation.take());
             // `test`: nothing below is reachable, and with slot 1 deferred there is
             // no longer any string to build here at all.
             return Ok(Value::TRUE);
@@ -3224,6 +3240,8 @@ impl<'p> Vm<'p> {
         if !is_ascii {
             self.regex_subject_units_put(input_val, u16s);
         }
+        #[cfg(feature = "safe-sandbox")]
+        self.regex_subject_units_put(input_val, u16s, subject_units_reservation.take());
         Ok(result)
     }
 
@@ -4288,6 +4306,65 @@ impl<'p> Vm<'p> {
             // The flat bytes are new payload in a slot already counted.
             #[cfg(feature = "instrument")]
             self.instrument_mark_external_heap_growth();
+        }
+    }
+
+    /// The checked profile's `regex_subject_units_take`: the units of a flat
+    /// exec subject and the charge they are held under, from the kept buffer
+    /// when it still describes the string at that slot.
+    ///
+    /// This profile encoded the subject for every exec, because a buffer
+    /// kept between execs is native memory outside the heap's accounting. So
+    /// `while (m = re.exec(text))` over text that is not ASCII cost the
+    /// length of the text for each match. The buffer is now kept with its
+    /// reservation: the working allowance goes on counting it, any request
+    /// the allowance cannot meet gives it back first, an exec over another
+    /// subject drops it, and only a subject of `REGEX_SUBJECT_UNITS_KEPT`
+    /// units or fewer is kept at all.
+    #[cfg(feature = "safe-sandbox")]
+    fn regex_subject_units_take(
+        &mut self,
+        subject: Value,
+    ) -> Result<(Vec<u16>, super::instrument::RegexTransientReservation), Thrown> {
+        if subject.is_heap() {
+            let idx = subject.heap_index();
+            if let HeapObj::Str(js) = self.heap.get(idx) {
+                let (version, bytes) = (self.heap.version_of(idx), js.as_bytes().len());
+                if let Some(cached) = self
+                    .regex_subject_units
+                    .take_if(|c| c.idx == idx && c.version == version && c.bytes == bytes)
+                {
+                    return Ok((cached.units, cached.reservation));
+                }
+            }
+        }
+        regex_subject_units(self, subject)
+    }
+
+    /// Keep a buffer taken by the checked `regex_subject_units_take`, with
+    /// its charge, for the next exec over the same flat string.
+    #[cfg(feature = "safe-sandbox")]
+    fn regex_subject_units_put(
+        &mut self,
+        subject: Value,
+        units: Vec<u16>,
+        reservation: Option<super::instrument::RegexTransientReservation>,
+    ) {
+        let Some(reservation) = reservation else {
+            return;
+        };
+        if units.is_empty() || units.capacity() > REGEX_SUBJECT_UNITS_KEPT || !subject.is_heap() {
+            return;
+        }
+        let idx = subject.heap_index();
+        if let HeapObj::Str(js) = self.heap.get(idx) {
+            self.regex_subject_units = Some(RegexSubjectUnits {
+                idx,
+                version: self.heap.version_of(idx),
+                bytes: js.as_bytes().len(),
+                units,
+                reservation,
+            });
         }
     }
 

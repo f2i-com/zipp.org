@@ -1616,7 +1616,6 @@ pub struct Vm<'p> {
     /// global exec/match/split/replace loop over one string encodes it once
     /// instead of once per exec (see [`proxy_regexp::RegexSubjectUnits`]).
     /// Integers only: never traced; a major GC drops it with its subject.
-    #[cfg(not(feature = "safe-sandbox"))]
     regex_subject_units: Option<proxy_regexp::RegexSubjectUnits>,
     /// Native bytes owned by completed RegExp matches that an outer operation
     /// retains while guest code can re-enter the VM (notably functional

@@ -932,7 +932,12 @@ impl super::Vm<'_> {
         }
 
         if bytes > self.instrument_regex_transient_available() {
-            return Err(self.instrument_regex_memory_exhausted());
+            // A subject buffer kept between execs holds allowance this
+            // request may need: give it back before refusing.
+            self.regex_subject_units = None;
+            if bytes > self.instrument_regex_transient_available() {
+                return Err(self.instrument_regex_memory_exhausted());
+            }
         }
 
         // `bytes <= usize::MAX - current` follows from the fixed-allowance

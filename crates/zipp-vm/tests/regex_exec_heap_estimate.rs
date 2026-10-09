@@ -117,12 +117,67 @@ fn regex_exec_over_a_concatenated_string_is_not_quadratic_in_its_length() {
     assert!(matches!(&tokens, HostValue::String(text) if text == "108000:191650"), "{tokens:?}");
     assert!(elapsed.as_secs() < 30, "sticky tokenizer over a rope took {elapsed:?}");
 
-    // A rope that is not ASCII is flattened too, and matches as before.
+    // A rope that is not ASCII is flattened too, and its UTF-16 units are
+    // kept from one exec to the next instead of being encoded for each:
+    // 40,000 execs over 280,000 units.
+    let started = Instant::now();
     let accents = number(
         state
-            .call_slot(slot(&state, "accents"), &[HostValue::Number(4000.0)])
+            .call_slot(slot(&state, "accents"), &[HostValue::Number(40000.0)])
             .expect("accent scan completes"),
     );
-    assert_eq!(accents, 4000.0);
+    let elapsed = started.elapsed();
+    assert_eq!(accents, 40000.0);
+    assert!(elapsed.as_secs() < 30, "exec loop over text that is not ASCII took {elapsed:?}");
+    assert!(state.resource_limit_error().is_none());
+}
+
+/// The kept buffer is working storage under the RegExp allowance, not a
+/// second allowance: an exec over another subject, an ASCII one included,
+/// gives it back, and a subject past the kept size is encoded each time as
+/// before. Results are Node's.
+#[test]
+fn a_kept_subject_buffer_never_outlives_its_subject_or_its_allowance() {
+    let source = r#"
+        function mixed(n) {
+            var a = '', b = '';
+            for (var i = 0; i < n; i++) { a += 'café ' + (i % 10) + ' '; b += 'naïve ' + (i % 7) + ' '; }
+            var ra = /é/g, rb = /ï/g, rc = /x/g, hits = 0, ma, mb;
+            do {
+                ma = ra.exec(a); mb = rb.exec(b);
+                if (ma) hits++;
+                if (mb) hits++;
+                rc.lastIndex = 0; rc.exec('plain ascii x');
+            } while (ma || mb);
+            a += '!';
+            ra.lastIndex = 0;
+            while (ra.exec(a)) hits++;
+            return hits;
+        }
+        function large(n) {
+            var text = 'é';
+            while (text.length < n) text += text;
+            var re = /é/g, hits = 0;
+            for (var i = 0; i < 3; i++) if (re.exec(text)) hits++;
+            return hits + ':' + text.length;
+        }
+    "#;
+    let mut state = embed::compile_script(source).expect("script compiles");
+    state.disable_vm_jit();
+    state.run_init().expect("script initializes");
+    state.set_limits(u64::MAX, None);
+    state.set_heap_limit(CEILING);
+
+    let mixed = number(
+        state
+            .call_slot(slot(&state, "mixed"), &[HostValue::Number(500.0)])
+            .expect("alternating subjects complete"),
+    );
+    assert_eq!(mixed, 1500.0);
+    // 2,097,152 units: over the kept size, under the working allowance.
+    let large = state
+        .call_slot(slot(&state, "large"), &[HostValue::Number(2_000_000.0)])
+        .expect("a subject past the kept size still matches");
+    assert!(matches!(&large, HostValue::String(text) if text == "3:2097152"), "{large:?}");
     assert!(state.resource_limit_error().is_none());
 }

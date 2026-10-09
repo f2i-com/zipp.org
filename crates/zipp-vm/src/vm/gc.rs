@@ -849,7 +849,6 @@ impl Vm<'_> {
         self.matchall_batches.retain(|&k, _| marks[k as usize]);
         // Correctness never depends on this (the cache is keyed by the slot
         // version); it only stops a dead subject's units staying resident.
-        #[cfg(not(feature = "safe-sandbox"))]
         if self
             .regex_subject_units
             .as_ref()
