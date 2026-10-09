@@ -13,19 +13,13 @@
 //! work is still `O(n log n)` comparisons, which matters where the length is
 //! the guest's to choose (the locale parser meters exactly that bound).
 //!
-//! Up to [`IN_PLACE`] elements are instead insertion-sorted where they are,
-//! with no allocation and no indirect call; that loop is a few dozen bytes
-//! per caller, and it is the whole cost for the usual two or three subtags.
-//!
-//! Not for a hot path over many elements: past that length every comparison
-//! is an indirect call and each sort allocates. `Array.prototype.sort`, the
-//! TypedArray sorts, the collector's pool sort, the integer-key orderings and
-//! the RegExp-program heap audit keep their own instantiations.
+//! Not for a hot path, and not for one that must survive an allocation
+//! failure: every comparison is an indirect call, and a sort of two or more
+//! elements allocates twice. `Array.prototype.sort`, the TypedArray sorts, the
+//! collector's pool sort, the integer-key orderings, the RegExp-program heap
+//! audit and the event loop's fired-timer batch keep their own instantiations.
 
 use core::cmp::Ordering;
-
-/// The longest vector sorted in place by insertion.
-const IN_PLACE: usize = 16;
 
 /// Sort `order` (a permutation of positions) by `cmp`, ties by position.
 #[inline(never)]
@@ -36,14 +30,7 @@ fn sort_positions(order: &mut [usize], cmp: &mut dyn FnMut(usize, usize) -> Orde
 /// `v.sort_by(cmp)`, stable, through the shared instantiation.
 pub(crate) fn sort_by<T>(v: &mut Vec<T>, mut cmp: impl FnMut(&T, &T) -> Ordering) {
     let n = v.len();
-    if n <= IN_PLACE {
-        for i in 1..n {
-            let mut j = i;
-            while j > 0 && cmp(&v[j - 1], &v[j]) == Ordering::Greater {
-                v.swap(j - 1, j);
-                j -= 1;
-            }
-        }
+    if n < 2 {
         return;
     }
     let mut order: Vec<usize> = (0..n).collect();
@@ -81,7 +68,7 @@ mod tests {
 
     #[test]
     fn agrees_with_the_standard_stable_sort() {
-        for n in [0usize, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 100, 1000] {
+        for n in [0usize, 1, 2, 3, 7, 8, 31, 32, 33, 100, 1000] {
             for seed in 1..6u64 {
                 let input = values(n, seed);
                 let mut want = input.clone();

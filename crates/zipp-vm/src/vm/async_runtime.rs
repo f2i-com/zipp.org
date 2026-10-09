@@ -3918,7 +3918,10 @@ impl<'p> Vm<'p> {
                     true
                 }
             });
-            crate::cold_sort::sort_by_key(&mut fired, |&(deadline, index, _)| (deadline, index));
+            // The standard sort, not `cold_sort`, which allocates: this path
+            // reserves fallibly above so that a host allocation failure
+            // cannot abort the sandbox.
+            fired.sort_unstable_by_key(|&(deadline, index, _)| (deadline, index));
             // B214's rule for timers: the fired callbacks just left
             // `timer_queue` (a traced root), so ROOT the batch rather than
             // suspending collection for each callback's whole run — a
