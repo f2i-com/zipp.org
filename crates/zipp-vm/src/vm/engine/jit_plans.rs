@@ -86,6 +86,24 @@ fn nested_reject(why: &str) {
     }
 }
 
+/// `ZIPP_NO_NESTED_CAPTURED_IMUL=1` makes `splice_nested_leaf` decline an inner
+/// body that holds a reference-captured `Math.imul` again, as it did before
+/// the capture was flattened to the bare form there. For a one-binary A/B.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn nested_captured_imul_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_NESTED_CAPTURED_IMUL").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// `ZIPP_NO_PROTO_METHOD_INLINE=1` drops the B78 prototype-chain arm back out of
 /// `build_method_shape`, leaving the class and own-slot arms untouched. Exists so
 /// the change can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
@@ -3710,7 +3728,76 @@ impl<'p> Vm<'p> {
                 src: arg_base + k,
             });
         }
-        for instr in &inner_body[..inner_body.len() - 1] {
+        // Spec-order lowering captures `Math.imul` ahead of its arguments:
+        // `LoadGlobal Math; GetProp imul; <args>; MathOp { callee, this_v }`.
+        // `shift_leaf_regs` has no `GetProp` (a name indexes the INNER
+        // function's string pool, and the flat body is emitted under the
+        // wrapper's id), so that one instruction declined the whole splice:
+        // every `ri(n) { return (rnd() * n) | 0 }` over a mulberry32 closure
+        // went back to two real calls (parse-large-js and regex-log-scan each
+        // lost 7% to it).
+        //
+        // A PROVEN captured site (`captured_math_site`: the call's nearest
+        // definitions are exactly that `LoadGlobal`/`GetProp imul` pair,
+        // nothing rewrites either register before the call, the global is
+        // never stored and no edge enters the gap) is flattened to the BARE
+        // form the order-transparent lowering emits: the `GetProp` is dropped
+        // and the op validates the live global and the live `Math.imul` slot
+        // where it runs. In a flat leaf body that is the same proof as the
+        // pre-argument Get, because every op `shift_leaf_regs` admits between
+        // the two either is pure or bails before any effect; none can run
+        // user code, replace `Math` or rebind its `imul`. A miss or a bail
+        // re-runs the whole wrapper call in the interpreter on the real
+        // bytecode, capture-first order included. The captured callee
+        // register must have no other reader, since nothing defines it here.
+        let captured_imul: Vec<(usize, usize, u16)> = if nested_captured_imul_enabled() {
+            crate::codegen::captured_math_sites(inner, 0, inner_body.len() - 1)
+                .into_iter()
+                .filter_map(|site| {
+                    let global = u16::try_from(site.global)
+                        .ok()
+                        .filter(|&g| g != crate::bytecode::NO_REG)?;
+                    for (at, ins) in inner_body.iter().enumerate().skip(site.get_ip + 1) {
+                        if at != site.call_ip
+                            && crate::codegen::instr_uses(ins).contains(&site.callee)
+                        {
+                            return None;
+                        }
+                        if crate::codegen::writes_reg(ins) == Some(site.callee) {
+                            break;
+                        }
+                    }
+                    Some((site.get_ip, site.call_ip, global))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (at, instr) in inner_body[..inner_body.len() - 1].iter().enumerate() {
+            if captured_imul.iter().any(|&(get_ip, ..)| get_ip == at) {
+                continue;
+            }
+            if let Some(&(_, _, global)) = captured_imul.iter().find(|site| site.1 == at) {
+                let Instr::MathOp {
+                    dst,
+                    op,
+                    arg_base,
+                    argc,
+                    ..
+                } = *instr
+                else {
+                    return None;
+                };
+                flat.push(Instr::MathOp {
+                    dst: dst + off,
+                    op,
+                    callee: crate::bytecode::NO_REG,
+                    this_v: global,
+                    arg_base: arg_base + off,
+                    argc,
+                });
+                continue;
+            }
             if let Instr::LoadConst { idx, .. } = *instr {
                 let c = inner.constants.get(idx as usize)?;
                 if !c.is_number() {
