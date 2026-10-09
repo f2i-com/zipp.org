@@ -5426,7 +5426,7 @@ pub(crate) fn grapheme_extend_ranges() -> &'static PackedIntervals {
     &GRAPHEME_EXTEND
 }
 
-const ID_CONTINUE: PackedIntervals = direct_intervals![
+static ID_CONTINUE: PackedIntervals = direct_intervals![
     Interval::new(48, 57),
     Interval::new(65, 90),
     Interval::new(95, 95),
@@ -6233,7 +6233,7 @@ pub(crate) fn id_continue_ranges() -> &'static PackedIntervals {
     &ID_CONTINUE
 }
 
-const ID_START: PackedIntervals = direct_intervals![
+static ID_START: PackedIntervals = direct_intervals![
     Interval::new(65, 90),
     Interval::new(97, 122),
     Interval::new(170, 170),

@@ -95,7 +95,7 @@ def pack_string_sets(source):
     return source, test
 
 ROOT = Path(__file__).resolve().parents[1] / "crates/regress-fork/src"
-PATTERN = re.compile(r"((?:pub\(crate\) )?const (\w+)): (?:\[Interval; \d+\]\s*=\s*\[|PackedIntervals\s*=\s*(?:packed|direct)_intervals!\[)(.*?)\];", re.S)
+PATTERN = re.compile(r"((?:pub\(crate\) )?(?:const|static) (\w+)): (?:\[Interval; \d+\]\s*=\s*\[|PackedIntervals\s*=\s*(?:packed|direct)_intervals!\[)(.*?)\];", re.S)
 
 for name in ("unicodetables.rs", "unicodetables_unknown.rs"):
     path = ROOT / name
@@ -106,6 +106,10 @@ for name in ("unicodetables.rs", "unicodetables_unknown.rs"):
         decl, ident, body = match.groups()
         tests.append(f"    assert_eq!({ident}.to_vec(), {ident}.original, \"{ident}\");")
         encoding = "direct" if ident in ("ID_START", "ID_CONTINUE") else "packed"
+        if encoding == "direct":
+            # One copy: a `const` is instantiated again in every crate its
+            # accessor is inlined into, and these two were in the engine too.
+            decl = decl.replace("const ", "static ")
         return f"{decl}: PackedIntervals = {encoding}_intervals![{body}];"
     source, count = PATTERN.subn(replace, source)
     assert count, name
