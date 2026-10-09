@@ -1463,10 +1463,21 @@ impl<'p> Vm<'p> {
 
     // ── arithmetic / coercion helpers ──
 
-    #[inline]
+    /// The `+` of two registers. Two Numbers are added here, in the caller.
+    /// `add_values` owns every case and tests for these first, but it is a
+    /// call into a function whose frame is sized for the string and BigInt
+    /// paths: on the WebAssembly build that call was 13% of an integer loop.
+    #[inline(always)]
     pub(crate) fn add(&mut self, base: usize, a: u16, b: u16) -> Result<Value, Thrown> {
         let va = self.get(base, a);
         let vb = self.get(base, b);
+        if va.is_int() && vb.is_int() {
+            if let Some(sum) = va.as_int().checked_add(vb.as_int()) {
+                return Ok(Value::int(sum));
+            }
+        } else if va.is_number() && vb.is_number() {
+            return Ok(Value::num(va.as_f64() + vb.as_f64()));
+        }
         self.add_values(va, vb)
     }
 
@@ -2311,7 +2322,11 @@ impl<'p> Vm<'p> {
         self.to_primitive_number(v)
     }
 
-    #[inline]
+    /// `a < b` on two registers. Two Numbers compare here, in the caller,
+    /// for the reason `add` gives: every loop bound is one of these, and the
+    /// call into `cmp_lt_values` was 5% of an integer loop on WebAssembly.
+    /// Neither operand is coerced, so the order of coercion does not arise.
+    #[inline(always)]
     pub(crate) fn cmp_lt(
         &mut self,
         base: usize,
@@ -2321,6 +2336,12 @@ impl<'p> Vm<'p> {
     ) -> Result<bool, Thrown> {
         let va = self.get(base, a);
         let vb = self.get(base, b);
+        if va.is_int() && vb.is_int() {
+            return Ok(va.as_int() < vb.as_int());
+        }
+        if va.is_number() && vb.is_number() {
+            return Ok(va.as_f64() < vb.as_f64());
+        }
         self.cmp_lt_values(va, vb, left_first)
     }
 
@@ -2362,7 +2383,9 @@ impl<'p> Vm<'p> {
         }
         Ok(self.to_number(va)? < self.to_number(vb)?)
     }
-    #[inline]
+    /// `a <= b` on two registers; two Numbers compare in the caller (see
+    /// `cmp_lt`).
+    #[inline(always)]
     pub(crate) fn cmp_le(
         &mut self,
         base: usize,
@@ -2372,6 +2395,18 @@ impl<'p> Vm<'p> {
     ) -> Result<bool, Thrown> {
         let va = self.get(base, a);
         let vb = self.get(base, b);
+        if va.is_int() && vb.is_int() {
+            return Ok(va.as_int() <= vb.as_int());
+        }
+        if va.is_number() && vb.is_number() {
+            return Ok(va.as_f64() <= vb.as_f64());
+        }
+        self.cmp_le_values(va, vb, left_first)
+    }
+
+    /// `va <= vb` for every pair of operands: the abstract relational
+    /// comparison, with the coercion order `left_first` names.
+    fn cmp_le_values(&mut self, va: Value, vb: Value, left_first: bool) -> Result<bool, Thrown> {
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() <= vb.as_int());
         }

@@ -1272,7 +1272,9 @@ impl<'p> Vm<'p> {
                     }
                     // Identical to `Add` â€” a JIT routing hint only (see bytecode).
                     Instr::StrConcat { dst, a, b } => {
-                        let r = self.add(base, a, b)?;
+                        let va = self.get(base, a);
+                        let vb = self.get(base, b);
+                        let r = self.add_values(va, vb)?;
                         self.set(base, dst, r);
                         ip += 1;
                     }
@@ -1330,7 +1332,7 @@ impl<'p> Vm<'p> {
                         // generic `+`, exactly as the unfused op would.
                         let r = match self.str_append_inplace(av, bv) {
                             Some(r) => r,
-                            None => self.add(base, a, b)?,
+                            None => self.add_values(av, bv)?,
                         };
                         self.set(base, dst, r);
                         ip += 1;
