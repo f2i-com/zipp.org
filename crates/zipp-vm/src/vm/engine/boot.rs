@@ -518,7 +518,9 @@ impl<'p> Vm<'p> {
             // use recomputes against the real `%Function.prototype%`.
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ci_pristine: (u32::MAX, u32::MAX, u32::MAX),
-            ta_len_memo: [(0, 0, 0, 0); 12],
+            ta_len_base: (0, 0, 0),
+            ta_len_kind_ver: [0; 12],
+            ta_len_kinds: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             reg_capacity: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

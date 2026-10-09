@@ -279,8 +279,8 @@ impl<'p> Vm<'p> {
     /// prototype chain, which made `i < ta.length` -- the most common loop
     /// bound in numeric code -- several times dearer than the element read it
     /// guards. The prototype half is the same for every instance of a kind,
-    /// so it is memoized under the two prototype versions (`ta_len_memo`);
-    /// the receiver half is re-proved on every call.
+    /// so it is memoized under the two prototype versions (`ta_len_base`,
+    /// `ta_len_kind_ver`); the receiver half is re-proved on every call.
     pub(crate) fn ta_length_fast(&mut self, ta_idx: u32) -> Option<usize> {
         let kind = match self.heap.get(ta_idx) {
             HeapObj::TypedArray { kind, .. } => *kind as usize,
@@ -305,20 +305,18 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let memo_hit = match self.ta_len_memo.get(kind) {
-            Some(&(want_ver, base_ver, slot, bits)) => {
-                bits != 0
-                    && want_ver == self.heap.version_of(want_proto)
-                    && base_ver == self.heap.version_of(base)
-                    && matches!(
-                        self.heap.get(base),
-                        HeapObj::Object(m)
-                            if m.is_accessor_at(slot as usize)
-                                && m.val_get_ref(slot as usize).map(|v| v.bits()) == Some(bits)
-                    )
-            }
-            None => false,
-        };
+        let (base_ver, slot, bits) = self.ta_len_base;
+        let memo_hit = kind < self.ta_len_kind_ver.len()
+            && self.ta_len_kinds & (1 << kind) != 0
+            && self.ta_len_kind_ver[kind] == self.heap.version_of(want_proto)
+            && bits != 0
+            && base_ver == self.heap.version_of(base)
+            && matches!(
+                self.heap.get(base),
+                HeapObj::Object(m)
+                    if m.is_accessor_at(slot as usize)
+                        && m.val_get_ref(slot as usize).map(|v| v.bits()) == Some(bits)
+            );
         if !memo_hit {
             if !self.ta_length_is_intrinsic(ta_idx) {
                 return None;
@@ -327,13 +325,10 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(m) => m.pos("length").map(|s| (s as u32, m.val_at(s).bits())),
                 _ => None,
             };
-            if let (Some((slot, bits)), Some(entry)) = (getter, self.ta_len_memo.get_mut(kind)) {
-                *entry = (
-                    self.heap.version_of(want_proto),
-                    self.heap.version_of(base),
-                    slot,
-                    bits,
-                );
+            if let (Some((slot, bits)), true) = (getter, kind < self.ta_len_kind_ver.len()) {
+                self.ta_len_base = (self.heap.version_of(base), slot, bits);
+                self.ta_len_kind_ver[kind] = self.heap.version_of(want_proto);
+                self.ta_len_kinds |= 1 << kind;
             }
         }
         Some(self.ta_effective_len(ta_idx).unwrap_or(0))
@@ -344,7 +339,11 @@ impl<'p> Vm<'p> {
     /// dense or sparse Array (never an arguments object, whose `length` is an
     /// ordinary writable property) and a TypedArray with its pristine getter.
     /// `None` is a pure decline; the caller takes the generic property Get.
-    #[inline]
+    ///
+    /// Deliberately out of line: its one interpreter caller is the `GetProp`
+    /// arm of the dispatch loop, and folding this body in there grew that
+    /// function by about 3 KB in the WebAssembly builds for no measured gain.
+    #[inline(never)]
     pub(crate) fn length_fast(&mut self, o: Value) -> Option<Value> {
         use crate::vm::helpers_numeric::len_value;
         let idx = o.heap_index();

@@ -2763,16 +2763,21 @@ pub struct Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     ci_pristine: (u32, u32, u32),
     /// The PROTOTYPE half of the pristine `ta.length` proof
-    /// (`ta_length_is_intrinsic`), memoized per TypedArray kind: `(version of
-    /// the kind's prototype, version of %TypedArray%.prototype%, that
-    /// prototype's own "length" slot, the built-in getter's Value bits)`; zero
-    /// bits = not proven. The two versions cover everything that can re-point
-    /// or shadow the chain (a key add, delete or redefinition, and
-    /// `setPrototypeOf`, each advance one); the getter is re-read from the
-    /// slot on every use, because an in-place accessor swap advances nothing.
-    /// The receiver half (own shadow, the instance's [[Prototype]]) is not
-    /// memoized. See `Vm::ta_length_fast`.
-    ta_len_memo: [(u32, u32, u32, u64); 12],
+    /// (`ta_length_is_intrinsic`), memoized in two parts. The shared part,
+    /// `ta_len_base`, is `(version of %TypedArray%.prototype%, its own
+    /// "length" slot, the built-in getter's Value bits)`; zero bits = not
+    /// proven. The per-kind part is the version of that kind's prototype
+    /// when it was last proved to carry no own `length` and to inherit from
+    /// %TypedArray%.prototype%, valid while its bit in `ta_len_kinds` is
+    /// set. The versions cover everything that can re-point or shadow the
+    /// chain (a key add, delete or redefinition, and `setPrototypeOf`, each
+    /// advance one); the getter is re-read from its slot on every use,
+    /// because an in-place accessor swap advances nothing. The receiver half
+    /// (own shadow, the instance's [[Prototype]]) is not memoized. See
+    /// `Vm::ta_length_fast`.
+    ta_len_base: (u32, u32, u64),
+    ta_len_kind_ver: [u32; 12],
+    ta_len_kinds: u16,
     /// Pinned register-file capacity: `self.regs` is reserved to this at startup
     /// and NEVER allowed to grow past it (every call/recursion site checks),
     /// so the Vec never reallocates while native JIT code holds a raw pointer
