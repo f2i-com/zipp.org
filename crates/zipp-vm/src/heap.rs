@@ -2813,8 +2813,12 @@ impl StrBytes {
     /// Append bytes the caller holds to be ASCII. A short run (an integer's
     /// digits, a separator) goes byte by byte, which costs less than the
     /// call that checks a slice; a long one is checked as `push_utf8` does.
+    /// Lite is built for size, where each of those pushes is a call of its
+    /// own (`s += "ab" + i` ran 6% slower that way), so there every run is
+    /// checked as a slice.
     #[inline]
     fn push_ascii_bytes(&mut self, add: &[u8]) {
+        #[cfg(not(feature = "wasm-lite"))]
         if add.len() <= 16 {
             if let StrBytes::Utf8(text) = self {
                 text.reserve(add.len());
@@ -3387,9 +3391,13 @@ impl JsStr {
         debug_assert!(head.is_ascii() && tail.is_ascii());
         let mut bytes =
             StrBytes::with_capacity(head.len() + self.bytes.len() + tail.len(), self.wellformed);
-        bytes.push_ascii_bytes(head);
+        if !head.is_empty() {
+            bytes.push_ascii_bytes(head);
+        }
         bytes.push_all(&self.bytes);
-        bytes.push_ascii_bytes(tail);
+        if !tail.is_empty() {
+            bytes.push_ascii_bytes(tail);
+        }
         JsStr {
             units: (head.len() + self.units() + tail.len()) as u32,
             ascii: self.ascii,
