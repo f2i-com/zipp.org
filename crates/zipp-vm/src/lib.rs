@@ -176,6 +176,7 @@ pub mod safe_native_limits {
 }
 mod shape;
 mod slot_table;
+mod unorm;
 
 /// Transition-tree diagnostics: `(nodes, max fan-out, total edges)`. Behind
 /// `ZIPP_SHAPESTATS=1` in the CLI — fan-out is what decides whether a linear

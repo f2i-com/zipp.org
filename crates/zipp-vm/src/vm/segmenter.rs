@@ -8,7 +8,7 @@
 //! ships; word breaking for Thai/Lao/Khmer/Japanese/Chinese additionally needs a
 //! dictionary. What is implemented here is the part that follows from Unicode
 //! properties zipp ALREADY has — general category, via `char::is_alphanumeric`
-//! and `unicode_normalization`'s combining-mark predicate — and nothing is
+//! and `unorm`'s combining-mark predicate — and nothing is
 //! invented to paper over the rest.
 //!
 //! Concretely:
@@ -52,7 +52,7 @@ pub(crate) fn segment_work_bound(byte_len: usize) -> u64 {
 }
 
 fn is_mark(c: char) -> bool {
-    unicode_normalization::char::is_combining_mark(c)
+    crate::unorm::is_combining_mark(c)
 }
 
 /// A word-like scalar: what a `Word_Break` table would classify ALetter,

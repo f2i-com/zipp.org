@@ -1214,19 +1214,19 @@ impl<'p> Vm<'p> {
                     let js = crate::heap::JsStr::from_wtf8(out);
                     return Ok(Some(Value::heap(self.heap.alloc_js(js))));
                 }
-                use unicode_normalization::UnicodeNormalization;
+                use crate::unorm::{nfc, nfd, nfkc, nfkd};
                 let out_len = match form.as_str() {
-                    "NFC" => checked_char_output_len(s.nfc())?,
-                    "NFD" => checked_char_output_len(s.nfd())?,
-                    "NFKC" => checked_char_output_len(s.nfkc())?,
-                    _ => checked_char_output_len(s.nfkd())?,
+                    "NFC" => checked_char_output_len(nfc(s))?,
+                    "NFD" => checked_char_output_len(nfd(s))?,
+                    "NFKC" => checked_char_output_len(nfkc(s))?,
+                    _ => checked_char_output_len(nfkd(s))?,
                 };
                 let mut out = self.guest_string_with_capacity(out_len)?;
                 match form.as_str() {
-                    "NFC" => extend_chars(&mut out, s.nfc()),
-                    "NFD" => extend_chars(&mut out, s.nfd()),
-                    "NFKC" => extend_chars(&mut out, s.nfkc()),
-                    _ => extend_chars(&mut out, s.nfkd()),
+                    "NFC" => extend_chars(&mut out, nfc(s)),
+                    "NFD" => extend_chars(&mut out, nfd(s)),
+                    "NFKC" => extend_chars(&mut out, nfkc(s)),
+                    _ => extend_chars(&mut out, nfkd(s)),
                 }
                 debug_assert_eq!(out.len(), out_len);
                 Ok(Some(self.alloc_str(out)))
@@ -2377,12 +2377,12 @@ fn special_case_exact(
 /// Emit the `form` normalization of the well-formed run `s` (`form` is one of
 /// the four validated names; anything else is NFKD).
 fn for_each_normalized(form: &str, s: &str, emit: &mut impl FnMut(char)) {
-    use unicode_normalization::UnicodeNormalization;
+    use crate::unorm::{nfc, nfd, nfkc, nfkd};
     match form {
-        "NFC" => s.nfc().for_each(emit),
-        "NFD" => s.nfd().for_each(emit),
-        "NFKC" => s.nfkc().for_each(emit),
-        _ => s.nfkd().for_each(emit),
+        "NFC" => nfc(s).for_each(emit),
+        "NFD" => nfd(s).for_each(emit),
+        "NFKC" => nfkc(s).for_each(emit),
+        _ => nfkd(s).for_each(emit),
     }
 }
 
@@ -2414,7 +2414,6 @@ pub(crate) fn collation_view(js: &crate::heap::JsStr) -> std::borrow::Cow<'_, st
 /// Locale-independent canonical ordering for the ECMA-262-only artifact.
 #[cfg(feature = "wasm-lite")]
 fn lite_collation_units(js: &crate::heap::JsStr) -> impl Iterator<Item = u32> + '_ {
-    use unicode_normalization::UnicodeNormalization;
     let mut rest = js.as_bytes();
     std::iter::from_fn(move || {
         if rest.is_empty() {
@@ -2436,5 +2435,5 @@ fn lite_collation_units(js: &crate::heap::JsStr) -> impl Iterator<Item = u32> + 
             Some((text, None))
         }
     })
-    .flat_map(|(text, surrogate)| text.nfd().map(u32::from).chain(surrogate))
+    .flat_map(|(text, surrogate)| crate::unorm::nfd(text).map(u32::from).chain(surrogate))
 }

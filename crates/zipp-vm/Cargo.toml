@@ -21,7 +21,6 @@ rustc-hash = { workspace = true }
 # `utf16`: find_from_utf16/find_from_ucs2 — regex execution directly over
 # UTF-16 code units (ES semantics; ranges/positions are unit indices).
 regress = { package = "zipp-regress", path = "../regress-fork", features = ["utf16"] }
-unicode-normalization = "0.1"
 # Arbitrary-precision BigInt (pure Rust). The common path stays `i128`
 # (`HeapObj::BigInt`); `num-bigint` only backs values outside i128 range
 # (`HeapObj::BigIntBig`) — see vm/bigint.rs for the canonical-form invariant.
@@ -30,6 +29,11 @@ num-traits = "0.2"
 dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
 self_cell = "1.3.0"
+
+[dev-dependencies]
+# The reference `src/unorm.rs` is generated from and checked against, code
+# point by code point. Not linked into the engine.
+unicode-normalization = "0.1"
 
 [features]
 # Artifact-internal, subtractive profile for the standalone ZIPP Lite WASM.

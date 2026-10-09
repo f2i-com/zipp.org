@@ -115,7 +115,7 @@ impl<'p> Vm<'p> {
 /// UCA only above variable-top; without weight tables the distinction is not
 /// observable through a code-point comparison.)
 pub(crate) fn is_variable_collation_char(c: char) -> bool {
-    !c.is_alphanumeric() && !unicode_normalization::char::is_combining_mark(c)
+    !c.is_alphanumeric() && !crate::unorm::is_combining_mark(c)
 }
 
 /// The resolved options that shape a sort key.
@@ -182,12 +182,11 @@ fn numeric_run_len(digits: &[u8]) -> usize {
 /// (U+0130 lowercases to two scalars) and the two levels must stay independent.
 /// Under `numeric` a digit run is one primary element with no case flag.
 fn collation_key_lengths(s: &str, opts: KeyOptions) -> Result<(usize, usize, usize), Thrown> {
-    use unicode_normalization::UnicodeNormalization;
     let mut primary = 0usize;
     let mut secondary = 0usize;
     let mut case = 0usize;
     let mut run: Vec<u8> = Vec::new();
-    for c in s.nfd() {
+    for c in crate::unorm::nfd(s) {
         if opts.numeric {
             if let Some(d) = numeric_digit(c) {
                 run.push(d);
@@ -203,7 +202,7 @@ fn collation_key_lengths(s: &str, opts: KeyOptions) -> Result<(usize, usize, usi
         if opts.ignore_punct && is_variable_collation_char(c) {
             continue;
         }
-        if unicode_normalization::char::is_combining_mark(c) {
+        if crate::unorm::is_combining_mark(c) {
             secondary = secondary
                 .checked_add(c.len_utf8())
                 .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
@@ -236,7 +235,6 @@ fn collation_key(
     opts: KeyOptions,
     lengths: (usize, usize, usize),
 ) -> Result<(String, String, Vec<u8>), Thrown> {
-    use unicode_normalization::UnicodeNormalization;
     let mut primary = String::new();
     primary
         .try_reserve_exact(lengths.0)
@@ -249,7 +247,7 @@ fn collation_key(
     case.try_reserve_exact(lengths.2)
         .map_err(|_| Thrown::from_static("RangeError: collation allocation failed"))?;
     let mut run: Vec<u8> = Vec::new();
-    for c in s.nfd() {
+    for c in crate::unorm::nfd(s) {
         if opts.numeric {
             if let Some(d) = numeric_digit(c) {
                 run.push(d);
@@ -263,7 +261,7 @@ fn collation_key(
         if opts.ignore_punct && is_variable_collation_char(c) {
             continue;
         }
-        if unicode_normalization::char::is_combining_mark(c) {
+        if crate::unorm::is_combining_mark(c) {
             secondary.push(c);
             continue;
         }

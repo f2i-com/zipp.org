@@ -34,11 +34,11 @@
 //!
 //! The four conditions are the definitions from the same file's header, and all
 //! of them are stated in terms of the Canonical_Combining_Class of the
-//! surrounding characters, which `unicode_normalization` already provides — no
+//! surrounding characters, which `unorm` already provides — no
 //! new table is needed for them. `After_Soft_Dotted` additionally needs the
 //! `Soft_Dotted` property, which is [`SOFT_DOTTED`] below.
 
-use unicode_normalization::char::canonical_combining_class as ccc;
+use crate::unorm::canonical_combining_class as ccc;
 
 /// The `Soft_Dotted` code points, from `PropList.txt` (Unicode 16.0.0):
 /// 34 ranges, 50 code points. Only `After_Soft_Dotted` (Lithuanian uppercasing)
