@@ -24,7 +24,10 @@ Open:
   string-build and json in Lite, promise-resolve in JavaScript and
   error-typedarray in Python + Torch. Lite's string-build (1% to 15%
   slower) is a real cost: the checked profile validates the digits it
-  appends to a text-backed string.
+  appends to a text-backed string, and `c913b447` did not recover it on the
+  screen. The other three rows were not profiled in their final modules.
+  Native regex-log-scan reads +2.5% [+1.3%, +5.3%] with the string type on
+  its path; it was not isolated.
 - Code under `#[cfg(feature = "safe-sandbox")]` is built by neither Test262
   nor the default-feature suite. Gate it with
   `cargo test -p zipp-vm --no-default-features --features safe-sandbox`
@@ -37,8 +40,10 @@ Open:
   trade-off.
 - The Python modules clone the runtime seed (2,300 function prototypes) for
   each program: 10% to 12% of the `python-*-e2e` rows.
-- Lite runs integer loops three times slower than the JavaScript module;
-  `opt-level = "z"` decides that, not the source.
+- Lite runs integer loops three times slower than the JavaScript module
+  and gained little from the inlined fast paths. Whether that is
+  `opt-level = "z"`, its feature set or its folded switches was not
+  measured.
 - The eleventh pass's open items below still stand.
 
 ### 9 October: Python start, compact Unicode tables and eleventh size pass (local)

@@ -20,8 +20,9 @@ so the published table is unchanged.
   module (promise-resolve, 4% to 10% slower), one in Python + Torch
   (error-typedarray, 5% to 10%), two in Lite (string-build, 1% to 15%, and
   json) and none in Python-base, where promise-resolve is 5% to 10% faster.
-  Lite's string-build is a cost of this pass. The other three have no
-  changed code that a profile attributes them to.
+  Lite's string-build is a cost of this pass. The other three were not
+  profiled in their own modules, so whether they are costs or layout is
+  not known.
 - **Cliffs.** Four workloads whose cost in the WebAssembly modules grew with
   the square of a string's length now grow with its length
   ([the table](#string-and-regexp-cliffs)): a script holding 300 KB of
@@ -160,7 +161,9 @@ calls:
 | regex literal, 600 calls of 1000 | 12MiB 12MiB 12MiB 12MiB 12MiB | 12MiB 12MiB 12MiB 12MiB 12MiB |
 | objects, 600 calls of 1000 | 14MiB 14MiB 14MiB 14MiB 14MiB | 14MiB 14MiB 14MiB 14MiB 14MiB |
 
-Lite reads the same on both sides to within 1 MiB.
+The accepted Lite module fails the same two loops at the same 264 and
+442 MiB, and this pass's Lite reads as this pass's JavaScript module does,
+to within 1 MiB.
 
 The regexp-unicode-compile row of the screen is this bug. Without the
 collection trigger its time per call grows for as long as the run lasts
@@ -221,18 +224,22 @@ agrees on all of them):
   `s += "ab" + i`. A text-backed string can only take the digits as text, so
   the checked profile validates them, where the byte vector it replaced
   copied them. In the full modules that is an inlined loop and the row is
-  0% to 2% faster; in Lite, built for size, it was a call a digit, and after
-  `c913b447` it is one check of the slice. The builds that keep function
-  names run the row in 6.09 ms against 6.14 for accepted.
+  0% to 2% faster. In Lite, built for size, it was a call a digit;
+  `c913b447` made it one check of the slice, and the screen does not show
+  that as a gain: the module before that commit read 1.059, 1.088, 1.041
+  and 1.071. Only the profiling builds, which keep function names and are
+  not the shipped module, run the row level (6.09 ms against 6.14).
 - **Lite json** (1.049, 0.944, 1.050, 1.033) and **JavaScript
-  promise-resolve** (1.052, 1.045, 1.039, 1.096) have no changed code that a
-  profile attributes the difference to. The same promise-resolve source
-  reads 0.948, 0.954, 0.916, 0.899 in Python-base and 0.974, 0.995, 0.992,
-  1.002 in Python + Torch.
+  promise-resolve** (1.052, 1.045, 1.039, 1.096) were not profiled in the
+  final modules. The same promise-resolve source reads 0.948, 0.954, 0.916,
+  0.899 in Python-base and 0.974, 0.995, 0.992, 1.002 in Python + Torch,
+  which is how the tenth and eleventh passes saw that row move with layout;
+  that is a likeness, not a finding.
 - **Python + Torch error-typedarray** (1.088, 1.076, 1.100, 1.048) reads
   1.022, 1.023, 1.061, 1.034 in Python-base, 1.057, 1.022, 1.003, 1.001 in
-  JavaScript and 0.990, 0.989, 1.005, 1.004 in Lite. In the JavaScript
-  builds that keep names it takes 0.529 ms against 0.525.
+  JavaScript and 0.990, 0.989, 1.005, 1.004 in Lite. It was profiled only in
+  an earlier JavaScript build of this pass, where it took 0.529 ms against
+  0.525; the Python + Torch module was not.
 
 regexp-unicode-compile reads 0.008 to 0.010 in the full modules and 0.024
 to 0.025 in Lite, for the reason given above; the geomeans in the second
@@ -246,10 +253,13 @@ for the three full modules and 0.99 to 1.00 for Lite.
 - `9df8019c` to `c913b447`, 12 paired repetitions: geomean +0.31%
   [-0.16%, +0.77%] over the 13 rows; start 6.5 and 6.4 ms. One row's
   interval excludes zero: regex-log-scan +2.5% [+1.3%, +5.3%] (448 to
-  468 ms). Nothing on that row's path changed for the unchecked profile
-  beyond a counter at RegExp construction, and the eleventh pass measured
-  single native rows moving by more than this between two links of one
-  commit; it is recorded, not explained. The others: markdown-render +1.2%
+  468 ms). This pass is on that row's path in the unchecked profile too:
+  the string type's constructors, its ASCII slice and its appends
+  (`4e8cb084`; the row takes about 1.8 million ASCII slices) and the
+  inlined `+`, `<` and cache guard in the interpreter. The eleventh pass
+  measured single native rows moving by more than this between two links
+  of one commit, so the row may be either; it was not isolated. The
+  others: markdown-render +1.2%
   [+0.0%, +2.7%], map-set-heavy +1.2% [-1.9%, +2.9%], polymorphic-objects-v2
   -2.6% [-4.4%, +1.6%], the rest within 0.7%.
 - `c913b447` against Node 24.19.0, 10 paired repetitions: headline ten
@@ -258,8 +268,7 @@ for the three full modules and 0.99 to 1.00 for Lite.
   [1.22, 1.27], json-large 1.17x [1.09, 1.19], map-set-heavy 1.04x
   [0.95, 1.23].
 
-This pass did not look for native speed. The inlined `+` and `<` are in the
-native interpreter too, but compiled code never reaches them.
+This pass did not look for native speed.
 
 ## Python suite
 
@@ -348,11 +357,13 @@ identically at `9df8019c`, before this pass, and is not addressed here.
   (`<FuncProto as Clone>::clone` under `runtime_seed`). Sharing it means
   putting the prototypes' code behind a shared pointer across the compiler.
 - Lite runs an integer loop three times slower than the JavaScript module
-  (arith-int 9.2 ms against 3.1 ms in the accepted modules) and gained 0% to
-  3% on those rows from the inlined fast paths: `opt-level = "z"` decides
-  that row, not the source.
-- The three error rows and promise-resolve read 1% to 5% slower in some
-  runs and level in the named profiling build; they are the rows the tenth
-  and eleventh passes found to move with layout.
+  (arith-int 9.2 ms against 3.1 ms in the accepted modules), and that row
+  reads 0.90 to 1.00 here where the full modules read 0.74 to 0.81. Lite
+  is built with `opt-level = "z"`, a different feature set and its
+  experiment switches folded to constants; which of those holds the row
+  back was not measured.
+- Why promise-resolve in the JavaScript module, json in Lite and
+  error-typedarray in Python + Torch read slower. None was profiled in its
+  final module.
 - A subject past 1,048,576 units that is not ASCII, and a rope past
   1.4 million units, still cost their length on every exec.
