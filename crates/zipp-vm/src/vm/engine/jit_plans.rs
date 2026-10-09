@@ -3734,8 +3734,7 @@ impl<'p> Vm<'p> {
         // function's string pool, and the flat body is emitted under the
         // wrapper's id), so that one instruction declined the whole splice:
         // every `ri(n) { return (rnd() * n) | 0 }` over a mulberry32 closure
-        // went back to two real calls (parse-large-js and regex-log-scan each
-        // lost 7% to it).
+        // went back to two real calls (regex-log-scan lost 7% to it).
         //
         // A PROVEN captured site (`captured_math_site`: the call's nearest
         // definitions are exactly that `LoadGlobal`/`GetProp imul` pair,
