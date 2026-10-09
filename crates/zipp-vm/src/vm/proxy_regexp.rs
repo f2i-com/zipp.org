@@ -4301,16 +4301,22 @@ impl<'p> Vm<'p> {
     /// whole string before any ceiling is consulted; every exec walked it
     /// into a fresh UTF-16 copy instead. A string built by `+=` is a rope, so
     /// a sticky-regex tokenizer over 190 KB of ASCII made 108,000 such copies
-    /// and took 17 s (5 ms in Node). The walk needs two bytes a unit under
-    /// the allowance; the flat string needs at most three, and is asked for
-    /// under the same allowance first.
+    /// and took 17 s (5 ms in Node).
+    ///
+    /// Flattening is asked for under the same allowance, at its worst case:
+    /// twelve bytes a unit. The string needs at most three and its buffer,
+    /// reserved at one, may double past them to four; the walk keeps one
+    /// pending child for each level of a left-leaning rope, which can be a
+    /// level a unit, in a stack that doubles as it grows: eight. A rope that
+    /// cannot afford that takes the metered walk, whose own stack is charged
+    /// (`regex_execution_limits.rs` holds a left-deep rope to it).
     #[cfg(feature = "safe-sandbox")]
     fn regex_flatten_subject(&mut self, index: u32) {
         let units = match self.heap.get(index) {
             HeapObj::Cons { len, .. } => *len,
             _ => return,
         };
-        if units.saturating_mul(3) <= self.instrument_regex_transient_available() {
+        if units.saturating_mul(12) <= self.instrument_regex_transient_available() {
             self.heap.flatten(index);
             // The flat bytes are new payload in a slot already counted.
             #[cfg(feature = "instrument")]
