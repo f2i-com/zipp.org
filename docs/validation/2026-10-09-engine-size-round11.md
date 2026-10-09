@@ -18,8 +18,9 @@ features, not profile-guided), so the published table is unchanged.
   to 11% slower) and two in Python + Torch, and run alone the JavaScript
   module has a string loop 11% slower. The code on those rows' paths is
   unchanged; they move with whatever else was moved, differently in each
-  module ([the screen](#webassembly-speed-screen)). The modules are reported
-  as measured, not as accepted packages.
+  module ([the screen](#webassembly-speed-screen)). The user accepted these
+  modules on 10 October with that screen in front of them; they are the
+  packages the next pass is measured against.
 - **Python start.** A script run from inside a large folder no longer reads
   the folder first: the dict_get benchmark run from this repository's root
   takes 62 ms instead of 460. The code cache no longer
@@ -387,6 +388,8 @@ building:
 - Nothing was measured on Linux, macOS or in a browser.
 - CPython parity is not reached, and this pass did not move in-script time.
 - The cause of the layout sensitivity of compiled Python loops.
-- The modules are reported as measured. Whether they replace the accepted
-  ninth-pass packages is the open decision from the tenth pass, now over
-  these builds.
+- Whether these modules replace the accepted ninth-pass packages was the
+  open decision from the tenth pass. The user accepted them on 10 October,
+  flagged rows included. A rebuild of the JavaScript and Python-base
+  modules at `9df8019c` that day reproduced the recorded files byte for
+  byte.

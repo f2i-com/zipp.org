@@ -16,12 +16,14 @@ Measurements, gates and the evidence file are in
 
 Open:
 
-- The modules are not accepted packages. By the ninth pass's rule only
-  JavaScript passes its screen; Lite, Python-base and Python + Torch each
-  have rows flagged, a different set in each, on code that did not change.
-  Python-base promise-resolve is 8% to 11% slower in the paired screen and
-  1.5% slower run alone, and the string-set packing (`ba63d8a0`) accounts
-  for 6% of it there while speeding a JavaScript string loop by 6%.
+- The user accepted these modules on 10 October, and they are the packages
+  to measure the next pass against (`crates/zipp-wasm/dist` holds them; it
+  is not tracked). By the ninth pass's rule only JavaScript passes its
+  screen; Lite, Python-base and Python + Torch each have rows flagged, a
+  different set in each, on code that did not change. Python-base
+  promise-resolve is 8% to 11% slower in the paired screen and 1.5% slower
+  run alone, and the string-set packing (`ba63d8a0`) accounts for 6% of it
+  there while speeding a JavaScript string loop by 6%.
 - A single row of the WebAssembly screen, or of the Python suite, can move by
   10% (dict_get: 42%) between two builds whose hot code is identical. Why a
   compiled Python loop's helper calls, or a module's promise path, depend on
