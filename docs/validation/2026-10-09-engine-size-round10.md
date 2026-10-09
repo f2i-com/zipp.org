@@ -139,15 +139,21 @@ math_sqrt 1.10x, super_call 1.06x and property_read 1.05x slower. One engine
 commit earlier, at `436116b6`, the slower four read 1.07x, 1.01x, 1.04x and
 1.01x, so three of them move between builds.
 
-generator_iter is a regression that was located but not explained. It reads
-0.99x, 0.99x, 1.00x and 0.99x on the builds of `0fb24b41`, `10a033df`,
-`f08a9b5d` and `131aa66c`, 1.07x at `436116b6` and 1.11x at `c48fc4d2`. The
-behaviour `436116b6` adds is not the cause: with
+generator_iter reads 0.99x, 0.99x, 1.00x and 0.99x on the builds of
+`0fb24b41`, `10a033df`, `f08a9b5d` and `131aa66c`, 1.07x at `436116b6` and
+1.11x at `c48fc4d2`. The behaviour `436116b6` adds is not the cause: with
 `ZIPP_NO_NESTED_CAPTURED_IMUL=1` the final binary takes the same 65 ms, and
 both builds log the same single compiled Python region. With `ZIPP_PY_JIT=0`
 the build before the step and the final build both take 65 ms; with the JIT
-on the earlier one takes 59 ms. From `436116b6` on, the compiled loop no
-longer beats the interpreter on this row.
+on the earlier one takes 59 ms.
+
+This note first called that a regression located at `436116b6`. It is not one
+of the source. [The eleventh pass](2026-10-09-engine-size-round11.md#link-layout)
+linked `c48fc4d2` a second time and that binary runs the row in 59.8 ms where
+the one measured here took 67.7 ms; the same second link runs dict_get in
+24.0 ms where this one took 16.9 ms. Whether a compiled Python loop beats the
+interpreter depends on where the linker put the code, and the steps above
+are that.
 
 The largest remaining ratios to CPython are str_methods 6.3x, try_raise_catch
 5.0x, instance_new 4.6x, generator_iter 4.5x and fstring 4.3x. CPython is

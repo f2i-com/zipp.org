@@ -79,7 +79,7 @@ These are deterministic core-language defaults, not locale-aware formatting.
 execution speed for size. Use `--release --features lite` for the same feature
 set with throughput-oriented optimization. Standard builds keep `--release`.
 
-See [the latest size audit](../../docs/validation/2026-10-09-engine-size-round10.md)
+See [the latest size audit](../../docs/validation/2026-10-09-engine-size-round11.md)
 for measured sizes, speed tradeoffs and the remaining gap to QuickJS. To test
 the built Lite package, generate a Node package with wasm-bindgen and run
 `tests/node/lite.cjs` using `pkg-redirect.cjs` / `ZIPP_PKG` (see the Node test README).
@@ -261,20 +261,22 @@ have identical import/export surfaces; the selected module retains the audited
 checks that the browser module is byte-identical to the tested Node module.
 
 Measured on 2026-10-09 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
-after the tenth size-reduction pass, on a Windows build of `c48fc4d2`:
+after the eleventh size-reduction pass, on a Windows build of `9df8019c`:
 
 | Variant | Before post-processing, raw / Brotli | Selected, raw / Brotli |
 | --- | ---: | ---: |
-| Lite | 2,917,089 / 752,754 | 2,808,464 / 750,138 |
-| JavaScript | 5,305,343 / 1,283,338 | 5,145,953 / 1,279,443 |
-| Python-base | 7,001,058 / 1,655,780 | 6,808,551 / 1,651,669 |
-| Python + Torch | 8,930,470 / 2,000,182 | 8,733,543 / 1,995,301 |
+| Lite | 2,766,136 / 718,427 | 2,654,515 / 716,795 |
+| JavaScript | 5,141,733 / 1,244,683 | 4,977,978 / 1,239,416 |
+| Python-base | 6,841,147 / 1,618,208 | 6,644,132 / 1,612,708 |
+| Python + Torch | 8,769,750 / 1,969,371 | 8,568,374 / 1,963,702 |
 
 These are module bytes, excluding JS glue; Brotli is the download size. See the
-[tenth size audit](../../docs/validation/2026-10-09-engine-size-round10.md)
+[eleventh size audit](../../docs/validation/2026-10-09-engine-size-round11.md)
 for the variant deltas, the speed screen and the rows it flags, validation and
 the QuickJS gap. The accepted ninth-pass packages were 2,827,053 / 753,477,
-5,220,442 / 1,290,210, 6,896,451 / 1,663,170 and 8,851,582 / 2,008,520.
+5,220,442 / 1,290,210, 6,896,451 / 1,663,170 and 8,851,582 / 2,008,520, and
+the tenth pass's modules 2,808,464 / 750,138, 5,145,953 / 1,279,443,
+6,808,551 / 1,651,669 and 8,733,543 / 1,995,301.
 
 Stronger optimization is not automatically better. Earlier `-O3` / `-Oz`
 measurements reduced raw size but increased Brotli size and slowed execution.

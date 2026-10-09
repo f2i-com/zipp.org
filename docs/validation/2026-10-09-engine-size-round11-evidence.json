@@ -1,0 +1,3820 @@
+{
+ "schema": "zipp-engine-size-round11-evidence-v1",
+ "date": "2026-10-09",
+ "branch": "codex/engine-size-reduction",
+ "base_commit": "baf077c3d98d153726aff6b668dc882fa034b3e5",
+ "measured_commit": "9df8019ce4285025648a8cfb52cb1029347881c6",
+ "commits": [
+  {
+   "commit": "ee34f2cbb3d4f75afd7f78eeb272ae40a2fdbbd5",
+   "subject": "Read a Python project's files when the program opens them [skip ci]"
+  },
+  {
+   "commit": "8d90959822e0a8f448626c9fbf1a6eec63a227f1",
+   "subject": "Bound the Python code cache and key it on what changes the code [skip ci]"
+  },
+  {
+   "commit": "ba63d8a070fdb951a5e1ff6124d37f5c758c2312",
+   "subject": "Pack the regex properties of strings into one pool [skip ci]"
+  },
+  {
+   "commit": "482bb8c3bc05f1b6490ae9e6624322b769e75986",
+   "subject": "Build the string-set counts only where they are read [skip ci]"
+  },
+  {
+   "commit": "88b060ed3cb632b52ebd45cae066bdcef3fa5386",
+   "subject": "Normalize from compact sorted tables, not hashed ones [skip ci]"
+  },
+  {
+   "commit": "867badd1afdf7886b89c7d58b78f926b01c45ec1",
+   "subject": "Hold the regex identifier tables once [skip ci]"
+  },
+  {
+   "commit": "67b078384c67ef9d50d6a70914a1705eb1ec9705",
+   "subject": "Report a trimmed mean beside the median in the size-pass screen [skip ci]"
+  },
+  {
+   "commit": "5253e4e002bc765d99148235d36d9d7fcf7d9c90",
+   "subject": "Leave a finished program's heap to the process's exit [skip ci]"
+  },
+  {
+   "commit": "7bde65ac78810fde72e0499f051597f2cb69a26f",
+   "subject": "Keep the code cache by size and by last use [skip ci]"
+  },
+  {
+   "commit": "9df8019ce4285025648a8cfb52cb1029347881c6",
+   "subject": "Find a normalization entry by its rank in a bitmap [skip ci]"
+  }
+ ],
+ "host": "AMD Ryzen 9 9950X3D, Windows 11 x64; a timing run starts only after total CPU load stays under 4% for two samples",
+ "wasm_modules": {
+  "toolchain": "Rust 1.92.0, wasm-bindgen 0.2.126, Binaryen 125 -O1 -O1, Node 24.19.0",
+  "brotli": "node zlib, quality 11, size hint = input length",
+  "columns": "accepted = ninth-pass packages; tenth = the tenth pass (c48fc4d2); eleventh = this pass (9df8019c)",
+  "variants": {
+   "lite": {
+    "accepted": {
+     "raw": 2827053,
+     "brotli11": 753477,
+     "sha256": "9d56c9b0bc63d1699b1523ff929d71605cc07489ddbf8e05610701c580d249e8"
+    },
+    "tenth": {
+     "raw": 2808464,
+     "brotli11": 750138,
+     "sha256": "8c48af6a4f568f24ddaffa29f5317260951e0e907d41bdf2f458772a127c2ee6"
+    },
+    "eleventh": {
+     "raw": 2654515,
+     "brotli11": 716795,
+     "sha256": "6c5f10056cf85e1d0efcfc0bc0671a612c8a94cf787fc20af9ea2aea5a008ee3"
+    }
+   },
+   "javascript": {
+    "accepted": {
+     "raw": 5220442,
+     "brotli11": 1290210,
+     "sha256": "305b93bdcd9fb738d842e9faffe4a687aad34f57def1aad513463cfb47e69512"
+    },
+    "tenth": {
+     "raw": 5145953,
+     "brotli11": 1279443,
+     "sha256": "8f38a052e25c4cc4be58541e93b2c4964d8ccf7d2f0c460f742ead369911bdb3"
+    },
+    "eleventh": {
+     "raw": 4977978,
+     "brotli11": 1239416,
+     "sha256": "747ed619b772862894822330cccc068b8b7bde78efdf3b93e974ca1d052da2f7"
+    }
+   },
+   "python": {
+    "accepted": {
+     "raw": 6896451,
+     "brotli11": 1663170,
+     "sha256": "21f2d39f9f968969a90396f23132bcf1b1a2c85abd8feff6552e0a89b4d2306c"
+    },
+    "tenth": {
+     "raw": 6808551,
+     "brotli11": 1651669,
+     "sha256": "1b73234f763a350e1485829b422c7540339eb3030b2e85e748a78c444035e587"
+    },
+    "eleventh": {
+     "raw": 6644132,
+     "brotli11": 1612708,
+     "sha256": "1bbf5fa803836a2a21d36635655b51971a7c49b0039f5eddc7c9de609f69eace"
+    }
+   },
+   "all": {
+    "accepted": {
+     "raw": 8851582,
+     "brotli11": 2008520,
+     "sha256": "0c97240148887d992002d68e8679622ef03643bb78e1d6bbeb06fcae5e3e842b"
+    },
+    "tenth": {
+     "raw": 8733543,
+     "brotli11": 1995301,
+     "sha256": "88303dd8c855682008e72636c2a3382813328488afdc5b27fa39a59e5caeb1c2"
+    },
+    "eleventh": {
+     "raw": 8568374,
+     "brotli11": 1963702,
+     "sha256": "9adc9c8f8ad8a3323f48cd98f6f1e0bf2145a4ce9c360baee57bdfe26171ba15"
+    }
+   }
+  },
+  "before_post_processing": {
+   "lite": {
+    "raw": 2766136,
+    "brotli11": 718427
+   },
+   "javascript": {
+    "raw": 5141733,
+    "brotli11": 1244683
+   },
+   "python": {
+    "raw": 6841147,
+    "brotli11": 1618208
+   },
+   "all": {
+    "raw": 8769750,
+    "brotli11": 1969371
+   }
+  },
+  "javascript_by_step": {
+   "tenth pass": {
+    "raw": 5145953,
+    "brotli11": 1279443
+   },
+   "properties of strings packed (ba63d8a0)": {
+    "raw": 5075272,
+    "brotli11": 1274609
+   },
+   "normalization from sorted tables (88b060ed)": {
+    "raw": 5010946,
+    "brotli11": 1245280
+   },
+   "identifier tables held once (867badd1)": {
+    "raw": 4999042,
+    "brotli11": 1246814
+   },
+   "normalization from ranked bitmaps (9df8019c)": {
+    "raw": 4977978,
+    "brotli11": 1239416
+   },
+   "9df8019c without the string-set packing": {
+    "raw": 5048931,
+    "brotli11": 1243795
+   }
+  }
+ },
+ "wasm_speed": {
+  "harness": "crates/zipp-wasm/tests/node/bench-size-pass.cjs, node --no-liftoff, one pinned logical processor; ten warmup pairs and 31 alternating paired samples",
+  "ratio": "this pass over the accepted ninth-pass module",
+  "paired_one_process_per_case": {
+   "lite": {
+    "median_of_batches": {
+     "configurations": [
+      "fwd-a4",
+      "rev-a4",
+      "fwd-a16",
+      "rev-a16"
+     ],
+     "statistic": "median of the batches",
+     "candidate_over_previous": {
+      "alloc-object": [
+       0.9945,
+       1.0086,
+       1.0328,
+       0.9983
+      ],
+      "arith-float": [
+       1.0194,
+       1.0249,
+       1.0151,
+       1.0315
+      ],
+      "arith-int": [
+       1.0036,
+       1.0059,
+       0.9983,
+       0.9927
+      ],
+      "arith-mod": [
+       1.0097,
+       1.0019,
+       0.9941,
+       0.9719
+      ],
+      "array-build": [
+       0.666,
+       0.6714,
+       0.6803,
+       0.6734
+      ],
+      "array-hof": [
+       0.987,
+       1.0085,
+       1.0076,
+       0.9929
+      ],
+      "call-deep": [
+       0.9856,
+       1.0017,
+       0.9985,
+       0.9974
+      ],
+      "enumeration": [
+       0.9997,
+       1.0196,
+       0.9266,
+       1.0212
+      ],
+      "error-range": [
+       1.0228,
+       1.0421,
+       0.9988,
+       0.9623
+      ],
+      "error-type": [
+       0.9808,
+       0.9952,
+       1.0515,
+       1.0137
+      ],
+      "error-typedarray": [
+       1.0175,
+       0.9616,
+       0.9956,
+       0.999
+      ],
+      "javascript_init_0_functions": [
+       0.9977,
+       0.9864,
+       0.9959,
+       0.9914
+      ],
+      "javascript_init_200_functions": [
+       0.995,
+       0.9975,
+       0.9973,
+       0.9928
+      ],
+      "json": [
+       1.0036,
+       1.0095,
+       1.0104,
+       0.9673
+      ],
+      "promise-resolve": [
+       0.9913,
+       1.0031,
+       1.0054,
+       0.9977
+      ],
+      "prop-mono": [
+       0.9961,
+       0.989,
+       0.9922,
+       1.1313
+      ],
+      "prop-poly": [
+       0.9812,
+       0.9965,
+       1.0275,
+       1.0015
+      ],
+      "property-delete": [
+       1.0036,
+       0.9503,
+       1.0198,
+       0.9793
+      ],
+      "recursive-calls": [
+       1.0057,
+       0.9932,
+       0.9996,
+       0.9976
+      ],
+      "regex": [
+       0.9095,
+       0.8825,
+       0.9099,
+       0.894
+      ],
+      "regexp-matchall": [
+       1.0455,
+       0.946,
+       0.9724,
+       0.9486
+      ],
+      "regexp-unicode-compile": [
+       0.95,
+       0.9611,
+       1.0007,
+       0.976
+      ],
+      "string-append-index": [
+       1.0366,
+       1.0252,
+       1.0405,
+       1.0052
+      ],
+      "string-build": [
+       0.9567,
+       1.031,
+       0.9858,
+       0.9876
+      ]
+     },
+     "geomean": [
+      0.9785,
+      0.9765,
+      0.9827,
+      0.9768
+     ],
+     "more_than_2_5_percent_slower_in_three_of_four": [
+      "string-append-index"
+     ],
+     "more_than_2_5_percent_faster_in_three_of_four": [
+      "array-build",
+      "regex",
+      "regexp-matchall"
+     ]
+    },
+    "trimmed_mean": {
+     "configurations": [
+      "fwd-a4",
+      "rev-a4",
+      "fwd-a16",
+      "rev-a16"
+     ],
+     "statistic": "mean of the batches without the three slowest",
+     "candidate_over_previous": {
+      "alloc-object": [
+       0.9974,
+       1.0168,
+       1.0314,
+       0.996
+      ],
+      "arith-float": [
+       1.0197,
+       1.0249,
+       1.0142,
+       1.0321
+      ],
+      "arith-int": [
+       1.0029,
+       1.006,
+       0.9974,
+       0.9919
+      ],
+      "arith-mod": [
+       1.0063,
+       1.0017,
+       0.9944,
+       0.9721
+      ],
+      "array-build": [
+       0.6625,
+       0.6729,
+       0.6782,
+       0.6804
+      ],
+      "array-hof": [
+       0.9872,
+       1.0075,
+       1.0093,
+       0.9885
+      ],
+      "call-deep": [
+       1.0021,
+       0.99,
+       1.0002,
+       0.9828
+      ],
+      "enumeration": [
+       1.0066,
+       1.0227,
+       0.9496,
+       0.9974
+      ],
+      "error-range": [
+       1.0409,
+       1.0353,
+       1.0053,
+       0.9614
+      ],
+      "error-type": [
+       0.9806,
+       0.9955,
+       1.0502,
+       1.0122
+      ],
+      "error-typedarray": [
+       1.0134,
+       0.9627,
+       0.984,
+       1.0048
+      ],
+      "javascript_init_0_functions": [
+       0.9976,
+       0.9892,
+       0.9981,
+       0.9892
+      ],
+      "javascript_init_200_functions": [
+       0.997,
+       1.0011,
+       0.9979,
+       0.9947
+      ],
+      "json": [
+       0.9971,
+       1.0168,
+       1.0083,
+       0.9857
+      ],
+      "promise-resolve": [
+       0.9935,
+       0.999,
+       1.0095,
+       0.9963
+      ],
+      "prop-mono": [
+       0.9962,
+       0.9884,
+       0.9927,
+       1.1341
+      ],
+      "prop-poly": [
+       0.9825,
+       0.9972,
+       1.0268,
+       1.0011
+      ],
+      "property-delete": [
+       1.0065,
+       0.9504,
+       1.0277,
+       0.9633
+      ],
+      "recursive-calls": [
+       1.0047,
+       0.993,
+       1.0001,
+       0.9988
+      ],
+      "regex": [
+       0.9138,
+       0.8797,
+       0.9191,
+       0.8864
+      ],
+      "regexp-matchall": [
+       1.0146,
+       0.964,
+       0.9904,
+       0.9548
+      ],
+      "regexp-unicode-compile": [
+       0.9795,
+       1.0022,
+       0.9985,
+       1.0025
+      ],
+      "string-append-index": [
+       1.0349,
+       1.0257,
+       1.0356,
+       1.0045
+      ],
+      "string-build": [
+       0.9928,
+       0.9952,
+       0.9943,
+       0.9705
+      ]
+     },
+     "geomean": [
+      0.9814,
+      0.9776,
+      0.985,
+      0.976
+     ],
+     "more_than_2_5_percent_slower_in_three_of_four": [
+      "string-append-index"
+     ],
+     "more_than_2_5_percent_faster_in_three_of_four": [
+      "array-build",
+      "regex"
+     ]
+    }
+   },
+   "javascript": {
+    "median_of_batches": {
+     "configurations": [
+      "fwd-a4",
+      "rev-a4",
+      "fwd-a16",
+      "rev-a16"
+     ],
+     "statistic": "median of the batches",
+     "candidate_over_previous": {
+      "alloc-object": [
+       0.9848,
+       0.9852,
+       1.0376,
+       0.9494
+      ],
+      "arith-float": [
+       1.011,
+       0.9888,
+       0.9956,
+       1.7398
+      ],
+      "arith-int": [
+       1.0571,
+       0.9684,
+       1.0216,
+       0.9916
+      ],
+      "arith-mod": [
+       0.9954,
+       1.0224,
+       0.9923,
+       0.9958
+      ],
+      "array-build": [
+       0.6011,
+       0.6101,
+       0.6033,
+       0.5961
+      ],
+      "array-hof": [
+       1.0371,
+       1.0072,
+       1.0013,
+       1.0003
+      ],
+      "call-deep": [
+       1.0157,
+       0.9966,
+       1.0146,
+       1.0016
+      ],
+      "enumeration": [
+       1.0023,
+       0.9906,
+       1.0056,
+       1.0001
+      ],
+      "error-range": [
+       0.9928,
+       1.0043,
+       0.9933,
+       1.0012
+      ],
+      "error-type": [
+       0.9941,
+       0.9982,
+       1.0173,
+       0.9836
+      ],
+      "error-typedarray": [
+       0.9627,
+       0.9813,
+       0.9975,
+       0.9774
+      ],
+      "javascript_init_0_functions": [
+       1.0064,
+       0.9939,
+       0.9954,
+       0.9903
+      ],
+      "javascript_init_200_functions": [
+       0.9966,
+       1.0145,
+       1.0055,
+       1.0155
+      ],
+      "json": [
+       0.9972,
+       1.0344,
+       0.9907,
+       0.8625
+      ],
+      "promise-resolve": [
+       1.0444,
+       1.0215,
+       1.0222,
+       1.0562
+      ],
+      "prop-mono": [
+       0.999,
+       0.9522,
+       1.0397,
+       1.0293
+      ],
+      "prop-poly": [
+       1.012,
+       1.0333,
+       1.1886,
+       0.9665
+      ],
+      "property-delete": [
+       1.0166,
+       1.0179,
+       1.0737,
+       1.0293
+      ],
+      "recursive-calls": [
+       0.9481,
+       0.989,
+       1.0073,
+       1.029
+      ],
+      "regex": [
+       0.9594,
+       0.9536,
+       0.9672,
+       0.9608
+      ],
+      "regexp-matchall": [
+       1.0192,
+       1.0153,
+       0.9971,
+       1.0085
+      ],
+      "regexp-unicode-compile": [
+       1.0186,
+       1.001,
+       0.992,
+       1.0039
+      ],
+      "string-append-index": [
+       1.0101,
+       0.9945,
+       1.0216,
+       0.9954
+      ],
+      "string-build": [
+       0.9907,
+       0.9825,
+       0.9976,
+       0.9789
+      ]
+     },
+     "geomean": [
+      0.9816,
+      0.9772,
+      0.9937,
+      0.9936
+     ],
+     "more_than_2_5_percent_slower_in_three_of_four": [],
+     "more_than_2_5_percent_faster_in_three_of_four": [
+      "array-build",
+      "regex"
+     ]
+    },
+    "trimmed_mean": {
+     "configurations": [
+      "fwd-a4",
+      "rev-a4",
+      "fwd-a16",
+      "rev-a16"
+     ],
+     "statistic": "mean of the batches without the three slowest",
+     "candidate_over_previous": {
+      "alloc-object": [
+       0.9893,
+       0.9865,
+       1.0373,
+       0.9501
+      ],
+      "arith-float": [
+       1.0104,
+       0.989,
+       0.9952,
+       1.7467
+      ],
+      "arith-int": [
+       1.0565,
+       0.9687,
+       1.0213,
+       0.9921
+      ],
+      "arith-mod": [
+       0.9952,
+       1.0267,
+       0.9905,
+       0.9955
+      ],
+      "array-build": [
+       0.6171,
+       0.6232,
+       0.6221,
+       0.6167
+      ],
+      "array-hof": [
+       1.0418,
+       1.0036,
+       1.0013,
+       1.0017
+      ],
+      "call-deep": [
+       1.0442,
+       0.9663,
+       1.0202,
+       0.9804
+      ],
+      "enumeration": [
+       1.0044,
+       0.9871,
+       1.0184,
+       0.9933
+      ],
+      "error-range": [
+       0.9744,
+       1.0084,
+       0.9936,
+       1.0005
+      ],
+      "error-type": [
+       0.9862,
+       1.0023,
+       1.022,
+       0.9892
+      ],
+      "error-typedarray": [
+       0.9722,
+       0.9843,
+       1.0084,
+       0.9805
+      ],
+      "javascript_init_0_functions": [
+       1.0186,
+       0.9898,
+       0.998,
+       0.9891
+      ],
+      "javascript_init_200_functions": [
+       1.0008,
+       1.0184,
+       1.0078,
+       1.0131
+      ],
+      "json": [
+       0.9944,
+       1.0313,
+       0.906,
+       0.9696
+      ],
+      "promise-resolve": [
+       1.0391,
+       1.0586,
+       1.0156,
+       1.0508
+      ],
+      "prop-mono": [
+       0.9972,
+       0.9527,
+       1.0393,
+       1.03
+      ],
+      "prop-poly": [
+       1.0137,
+       1.0344,
+       1.1891,
+       0.9668
+      ],
+      "property-delete": [
+       1.0127,
+       1.021,
+       1.0693,
+       1.0222
+      ],
+      "recursive-calls": [
+       0.951,
+       1.0122,
+       1.0023,
+       1.0283
+      ],
+      "regex": [
+       0.9621,
+       0.9582,
+       0.966,
+       0.958
+      ],
+      "regexp-matchall": [
+       1.022,
+       1.0083,
+       1.0002,
+       1.0
+      ],
+      "regexp-unicode-compile": [
+       0.9971,
+       0.9966,
+       1.0162,
+       0.9924
+      ],
+      "string-append-index": [
+       1.0095,
+       1.0094,
+       1.0181,
+       0.9895
+      ],
+      "string-build": [
+       0.9905,
+       0.9821,
+       1.0027,
+       0.9788
+      ]
+     },
+     "geomean": [
+      0.9832,
+      0.98,
+      0.9933,
+      0.9975
+     ],
+     "more_than_2_5_percent_slower_in_three_of_four": [
+      "promise-resolve"
+     ],
+     "more_than_2_5_percent_faster_in_three_of_four": [
+      "array-build",
+      "regex"
+     ]
+    }
+   },
+   "python": {
+    "median_of_batches": {
+     "configurations": [
+      "fwd-a4",
+      "rev-a4",
+      "fwd-a16",
+      "rev-a16"
+     ],
+     "statistic": "median of the batches",
+     "candidate_over_previous": {
+      "alloc-object": [
+       1.0108,
+       1.0177,
+       1.0129,
+       1.004
+      ],
+      "arith-float": [
+       0.971,
+       0.9979,
+       0.9789,
+       0.9541
+      ],
+      "arith-int": [
+       1.0197,
+       0.9872,
+       1.0166,
+       0.9865
+      ],
+      "arith-mod": [
+       1.006,
+       0.9904,
+       0.9597,
+       1.0632
+      ],
+      "array-build": [
+       0.6456,
+       0.6203,
+       0.692,
+       0.6207
+      ],
+      "array-hof": [
+       0.9786,
+       0.9885,
+       0.9924,
+       1.007
+      ],
+      "call-deep": [
+       0.9935,
+       0.9786,
+       0.9868,
+       1.0071
+      ],
+      "enumeration": [
+       1.0273,
+       1.0063,
+       1.0229,
+       1.0083
+      ],
+      "error-range": [
+       0.9932,
+       1.0006,
+       1.0124,
+       0.9983
+      ],
+      "error-type": [
+       0.9992,
+       1.0109,
+       1.0377,
+       1.0095
+      ],
+      "error-typedarray": [
+       1.026,
+       0.9873,
+       0.9778,
+       0.9752
+      ],
+      "javascript_init_0_functions": [
+       1.0075,
+       1.0129,
+       0.9961,
+       1.0009
+      ],
+      "javascript_init_200_functions": [
+       1.006,
+       1.0048,
+       1.0131,
+       0.9974
+      ],
+      "json": [
+       1.0617,
+       1.0033,
+       1.0028,
+       1.0193
+      ],
+      "promise-resolve": [
+       1.1082,
+       1.1022,
+       1.0813,
+       1.0991
+      ],
+      "prop-mono": [
+       1.012,
+       0.9885,
+       1.0221,
+       1.0192
+      ],
+      "prop-poly": [
+       1.0253,
+       1.0304,
+       1.0218,
+       1.0305
+      ],
+      "property-delete": [
+       1.0114,
+       0.9989,
+       1.014,
+       1.0035
+      ],
+      "python-arithmetic-e2e": [
+       0.9715,
+       0.9922,
+       0.9884,
+       0.9903
+      ],
+      "python-dictionary-e2e": [
+       0.9684,
+       0.9703,
+       0.9771,
+       0.9453
+      ],
+      "python-list-e2e": [
+       0.9231,
+       0.9252,
+       0.9325,
+       0.9216
+      ],
+      "python_init_1_functions": [
+       0.9851,
+       0.9817,
+       0.9674,
+       0.984
+      ],
+      "python_init_200_functions": [
+       0.9863,
+       0.9922,
+       0.9791,
+       0.9847
+      ],
+      "recursive-calls": [
+       0.9662,
+       1.0085,
+       0.9981,
+       0.9763
+      ],
+      "regex": [
+       0.9372,
+       0.9425,
+       0.9334,
+       0.926
+      ],
+      "regexp-matchall": [
+       1.0205,
+       1.01,
+       0.9974,
+       0.9934
+      ],
+      "regexp-unicode-compile": [
+       1.0224,
+       1.0173,
+       0.9903,
+       1.0478
+      ],
+      "string-append-index": [
+       0.9884,
+       1.014,
+       0.9979,
+       1.0044
+      ],
+      "string-build": [
+       1.0024,
+       0.9945,
+       1.0158,
+       0.9982
+      ]
+     },
+     "geomean": [
+      0.9854,
+      0.9817,
+      0.9845,
+      0.9815
+     ],
+     "more_than_2_5_percent_slower_in_three_of_four": [
+      "promise-resolve",
+      "prop-poly"
+     ],
+     "more_than_2_5_percent_faster_in_three_of_four": [
+      "array-build",
+      "python-dictionary-e2e",
+      "python-list-e2e",
+      "regex"
+     ]
+    },
+    "trimmed_mean": {
+     "configurations": [
+      "fwd-a4",
+      "rev-a4",
+      "fwd-a16",
+      "rev-a16"
+     ],
+     "statistic": "mean of the batches without the three slowest",
+     "candidate_over_previous": {
+      "alloc-object": [
+       1.0113,
+       1.0159,
+       1.0115,
+       1.0053
+      ],
+      "arith-float": [
+       0.9744,
+       0.9973,
+       0.9799,
+       0.9546
+      ],
+      "arith-int": [
+       1.0189,
+       0.9857,
+       1.0162,
+       0.986
+      ],
+      "arith-mod": [
+       1.0059,
+       0.99,
+       0.9596,
+       1.0638
+      ],
+      "array-build": [
+       0.6494,
+       0.6415,
+       0.6627,
+       0.634
+      ],
+      "array-hof": [
+       0.9792,
+       0.9917,
+       0.9938,
+       1.0075
+      ],
+      "call-deep": [
+       1.0166,
+       0.9262,
+       0.9883,
+       0.9658
+      ],
+      "enumeration": [
+       1.028,
+       1.0105,
+       1.0095,
+       1.0101
+      ],
+      "error-range": [
+       0.9838,
+       1.0079,
+       1.0087,
+       0.9989
+      ],
+      "error-type": [
+       0.9904,
+       1.0146,
+       1.0165,
+       1.0182
+      ],
+      "error-typedarray": [
+       0.9966,
+       0.9872,
+       0.9672,
+       0.9704
+      ],
+      "javascript_init_0_functions": [
+       1.0109,
+       1.0195,
+       0.9979,
+       1.0086
+      ],
+      "javascript_init_200_functions": [
+       1.0084,
+       1.0029,
+       1.0096,
+       1.0031
+      ],
+      "json": [
+       1.0649,
+       1.0022,
+       1.0178,
+       1.0237
+      ],
+      "promise-resolve": [
+       1.1005,
+       1.0913,
+       1.0918,
+       1.0924
+      ],
+      "prop-mono": [
+       1.0115,
+       0.9886,
+       1.0224,
+       1.0181
+      ],
+      "prop-poly": [
+       1.0249,
+       1.0292,
+       1.0222,
+       1.0304
+      ],
+      "property-delete": [
+       1.0095,
+       1.0409,
+       1.01,
+       1.0045
+      ],
+      "python-arithmetic-e2e": [
+       0.9706,
+       0.9931,
+       0.9937,
+       0.9919
+      ],
+      "python-dictionary-e2e": [
+       0.9773,
+       0.9718,
+       0.9752,
+       0.9412
+      ],
+      "python-list-e2e": [
+       0.9252,
+       0.9398,
+       0.9292,
+       0.9243
+      ],
+      "python_init_1_functions": [
+       0.9774,
+       0.9858,
+       0.9883,
+       0.9769
+      ],
+      "python_init_200_functions": [
+       0.9859,
+       0.986,
+       0.995,
+       0.9924
+      ],
+      "recursive-calls": [
+       0.976,
+       1.0094,
+       0.9926,
+       0.9868
+      ],
+      "regex": [
+       0.9419,
+       0.9429,
+       0.9339,
+       0.925
+      ],
+      "regexp-matchall": [
+       1.0303,
+       1.0066,
+       1.0051,
+       0.991
+      ],
+      "regexp-unicode-compile": [
+       1.0046,
+       1.0037,
+       0.9921,
+       1.0043
+      ],
+      "string-append-index": [
+       0.9902,
+       1.0109,
+       0.9998,
+       1.0043
+      ],
+      "string-build": [
+       1.003,
+       0.9916,
+       1.0132,
+       0.9965
+      ]
+     },
+     "geomean": [
+      0.9853,
+      0.9824,
+      0.9835,
+      0.9803
+     ],
+     "more_than_2_5_percent_slower_in_three_of_four": [
+      "promise-resolve"
+     ],
+     "more_than_2_5_percent_faster_in_three_of_four": [
+      "array-build",
+      "python-list-e2e",
+      "regex"
+     ]
+    }
+   },
+   "all": {
+    "median_of_batches": {
+     "configurations": [
+      "fwd-a4",
+      "rev-a4",
+      "fwd-a16",
+      "rev-a16"
+     ],
+     "statistic": "median of the batches",
+     "candidate_over_previous": {
+      "alloc-object": [
+       1.0044,
+       0.9979,
+       1.0062,
+       1.0015
+      ],
+      "arith-float": [
+       0.99,
+       0.9897,
+       0.9866,
+       0.9811
+      ],
+      "arith-int": [
+       1.0093,
+       1.0081,
+       1.0007,
+       1.0187
+      ],
+      "arith-mod": [
+       1.0011,
+       1.0057,
+       1.0069,
+       0.9882
+      ],
+      "array-build": [
+       0.5954,
+       0.7367,
+       0.6012,
+       0.7121
+      ],
+      "array-hof": [
+       0.9921,
+       0.9925,
+       1.02,
+       0.9966
+      ],
+      "call-deep": [
+       1.0037,
+       0.9995,
+       1.0053,
+       0.9961
+      ],
+      "enumeration": [
+       0.9175,
+       1.0286,
+       0.9974,
+       1.0217
+      ],
+      "error-range": [
+       0.9762,
+       0.9521,
+       1.0169,
+       0.9857
+      ],
+      "error-type": [
+       1.0347,
+       1.0327,
+       1.0273,
+       1.0617
+      ],
+      "error-typedarray": [
+       0.9739,
+       0.9423,
+       0.9188,
+       1.0283
+      ],
+      "javascript_init_0_functions": [
+       1.0079,
+       1.0046,
+       0.9974,
+       0.9994
+      ],
+      "javascript_init_200_functions": [
+       1.0231,
+       1.0181,
+       1.012,
+       1.0103
+      ],
+      "json": [
+       1.0057,
+       1.0077,
+       0.9666,
+       0.9536
+      ],
+      "promise-resolve": [
+       1.0242,
+       1.0001,
+       0.9974,
+       1.0174
+      ],
+      "prop-mono": [
+       1.0275,
+       1.0323,
+       0.5699,
+       0.809
+      ],
+      "prop-poly": [
+       1.0419,
+       1.0179,
+       1.0197,
+       1.0117
+      ],
+      "property-delete": [
+       1.0309,
+       1.0196,
+       1.0306,
+       1.0325
+      ],
+      "python-arithmetic-e2e": [
+       0.9915,
+       1.0015,
+       0.9716,
+       0.9977
+      ],
+      "python-dictionary-e2e": [
+       0.941,
+       0.9656,
+       0.9766,
+       0.9589
+      ],
+      "python-list-e2e": [
+       0.9371,
+       0.9351,
+       0.9288,
+       0.9302
+      ],
+      "python_init_1_functions": [
+       0.9946,
+       0.9905,
+       0.9794,
+       0.9836
+      ],
+      "python_init_200_functions": [
+       0.9762,
+       0.9897,
+       0.9817,
+       0.9765
+      ],
+      "recursive-calls": [
+       0.9817,
+       1.0037,
+       1.0156,
+       1.0033
+      ],
+      "regex": [
+       0.9378,
+       0.9359,
+       0.9441,
+       0.9417
+      ],
+      "regexp-matchall": [
+       0.9661,
+       0.978,
+       0.9985,
+       0.9714
+      ],
+      "regexp-unicode-compile": [
+       1.0061,
+       0.9927,
+       1.0237,
+       1.0298
+      ],
+      "string-append-index": [
+       1.0012,
+       1.016,
+       1.0061,
+       1.0195
+      ],
+      "string-build": [
+       0.984,
+       0.9908,
+       0.9852,
+       0.9901
+      ]
+     },
+     "geomean": [
+      0.9744,
+      0.984,
+      0.9574,
+      0.9776
+     ],
+     "more_than_2_5_percent_slower_in_three_of_four": [
+      "error-type",
+      "property-delete"
+     ],
+     "more_than_2_5_percent_faster_in_three_of_four": [
+      "array-build",
+      "error-typedarray",
+      "python-dictionary-e2e",
+      "python-list-e2e",
+      "regex"
+     ]
+    },
+    "trimmed_mean": {
+     "configurations": [
+      "fwd-a4",
+      "rev-a4",
+      "fwd-a16",
+      "rev-a16"
+     ],
+     "statistic": "mean of the batches without the three slowest",
+     "candidate_over_previous": {
+      "alloc-object": [
+       1.0142,
+       0.9994,
+       1.0055,
+       1.0049
+      ],
+      "arith-float": [
+       0.9898,
+       0.9888,
+       0.9876,
+       0.9806
+      ],
+      "arith-int": [
+       1.0072,
+       1.0085,
+       1.0017,
+       1.0197
+      ],
+      "arith-mod": [
+       1.0003,
+       1.0064,
+       1.0068,
+       0.988
+      ],
+      "array-build": [
+       0.6369,
+       0.6653,
+       0.6446,
+       0.6609
+      ],
+      "array-hof": [
+       0.9953,
+       0.9912,
+       1.02,
+       0.9986
+      ],
+      "call-deep": [
+       1.0186,
+       1.0004,
+       1.027,
+       0.998
+      ],
+      "enumeration": [
+       0.913,
+       1.0316,
+       0.996,
+       1.032
+      ],
+      "error-range": [
+       0.9771,
+       0.9456,
+       1.014,
+       0.9883
+      ],
+      "error-type": [
+       1.022,
+       1.0257,
+       1.0093,
+       1.0562
+      ],
+      "error-typedarray": [
+       0.9759,
+       0.9469,
+       0.9225,
+       1.0335
+      ],
+      "javascript_init_0_functions": [
+       1.0104,
+       1.0134,
+       0.9919,
+       0.996
+      ],
+      "javascript_init_200_functions": [
+       1.0182,
+       1.0154,
+       1.0133,
+       1.0104
+      ],
+      "json": [
+       1.0033,
+       1.0077,
+       0.9725,
+       0.9551
+      ],
+      "promise-resolve": [
+       1.0296,
+       0.9875,
+       1.003,
+       1.0117
+      ],
+      "prop-mono": [
+       1.0274,
+       1.0322,
+       0.569,
+       0.7917
+      ],
+      "prop-poly": [
+       1.0426,
+       1.0181,
+       1.018,
+       1.0102
+      ],
+      "property-delete": [
+       1.0214,
+       1.0175,
+       1.025,
+       1.0268
+      ],
+      "python-arithmetic-e2e": [
+       0.9938,
+       1.0001,
+       0.9634,
+       0.9986
+      ],
+      "python-dictionary-e2e": [
+       0.9508,
+       0.9818,
+       0.9823,
+       0.9401
+      ],
+      "python-list-e2e": [
+       0.93,
+       0.9304,
+       0.908,
+       0.9275
+      ],
+      "python_init_1_functions": [
+       1.0029,
+       0.995,
+       0.9828,
+       0.991
+      ],
+      "python_init_200_functions": [
+       0.9722,
+       0.9914,
+       0.9814,
+       1.0057
+      ],
+      "recursive-calls": [
+       0.9862,
+       1.0043,
+       1.0141,
+       1.0025
+      ],
+      "regex": [
+       0.9374,
+       0.9422,
+       0.9386,
+       0.9419
+      ],
+      "regexp-matchall": [
+       0.9833,
+       0.9917,
+       1.0029,
+       0.9606
+      ],
+      "regexp-unicode-compile": [
+       0.9934,
+       1.0023,
+       1.0012,
+       0.993
+      ],
+      "string-append-index": [
+       1.0039,
+       1.0157,
+       1.0043,
+       1.0153
+      ],
+      "string-build": [
+       0.9874,
+       0.9943,
+       0.9879,
+       0.9975
+      ]
+     },
+     "geomean": [
+      0.9776,
+      0.9818,
+      0.9583,
+      0.9736
+     ],
+     "more_than_2_5_percent_slower_in_three_of_four": [],
+     "more_than_2_5_percent_faster_in_three_of_four": [
+      "array-build",
+      "python-list-e2e",
+      "regex"
+     ]
+    }
+   }
+  },
+  "whole_corpus_in_one_process": {
+   "lite": {
+    "configurations": [
+     "fwd-a4",
+     "rev-a4",
+     "fwd-a10",
+     "rev-a10"
+    ],
+    "candidate_over_previous_median": {
+     "arith-int": [
+      1.0,
+      0.9726,
+      0.9982,
+      1.0095
+     ],
+     "arith-mod": [
+      1.0032,
+      0.99,
+      0.9867,
+      0.9986
+     ],
+     "arith-float": [
+      1.0084,
+      0.999,
+      1.0091,
+      0.9879
+     ],
+     "prop-mono": [
+      0.9929,
+      1.0021,
+      0.9992,
+      0.9884
+     ],
+     "prop-poly": [
+      1.0292,
+      0.9915,
+      1.0134,
+      0.9607
+     ],
+     "alloc-object": [
+      1.0206,
+      0.9923,
+      1.0088,
+      1.0111
+     ],
+     "array-build": [
+      0.6527,
+      0.6655,
+      0.6743,
+      0.6444
+     ],
+     "array-hof": [
+      1.0077,
+      1.0114,
+      0.9978,
+      0.9907
+     ],
+     "call-deep": [
+      0.9986,
+      0.9835,
+      0.9943,
+      1.1221
+     ],
+     "string-build": [
+      0.9811,
+      0.9298,
+      1.0659,
+      1.0479
+     ],
+     "regex": [
+      0.9154,
+      0.9106,
+      0.9081,
+      0.9222
+     ],
+     "json": [
+      0.9746,
+      1.0163,
+      1.0043,
+      0.9509
+     ],
+     "recursive-calls": [
+      0.9864,
+      1.0119,
+      1.0024,
+      0.9792
+     ],
+     "error-range": [
+      0.9976,
+      0.9986,
+      1.0493,
+      0.9704
+     ],
+     "error-type": [
+      0.9742,
+      0.9958,
+      1.0275,
+      0.9833
+     ],
+     "error-typedarray": [
+      0.9801,
+      0.9975,
+      0.9982,
+      0.9772
+     ],
+     "property-delete": [
+      0.9779,
+      1.0087,
+      0.9774,
+      0.9775
+     ],
+     "enumeration": [
+      0.9717,
+      1.0228,
+      1.0132,
+      1.0024
+     ],
+     "string-append-index": [
+      0.9674,
+      0.941,
+      1.018,
+      1.0283
+     ],
+     "regexp-unicode-compile": [
+      1.0292,
+      1.0096,
+      0.9666,
+      1.0058
+     ],
+     "regexp-matchall": [
+      0.9652,
+      1.011,
+      0.954,
+      0.9524
+     ],
+     "promise-resolve": [
+      0.9997,
+      0.9876,
+      1.0093,
+      0.9947
+     ],
+     "javascript_init_0_functions": [
+      0.9862,
+      0.9961,
+      0.9896,
+      0.993
+     ],
+     "javascript_init_200_functions": [
+      0.9959,
+      1.004,
+      1.0025,
+      0.9915
+     ]
+    },
+    "candidate_over_previous_trimmed_mean": {
+     "arith-int": [
+      0.9997,
+      0.9726,
+      0.9977,
+      1.01
+     ],
+     "arith-mod": [
+      1.0044,
+      0.9902,
+      0.9865,
+      0.9986
+     ],
+     "arith-float": [
+      1.0083,
+      1.0015,
+      1.0003,
+      0.9885
+     ],
+     "prop-mono": [
+      0.9939,
+      0.9977,
+      1.0034,
+      0.9888
+     ],
+     "prop-poly": [
+      1.0312,
+      0.9821,
+      1.0163,
+      0.9576
+     ],
+     "alloc-object": [
+      1.0187,
+      0.9893,
+      1.0109,
+      1.0208
+     ],
+     "array-build": [
+      0.6506,
+      0.6631,
+      0.6786,
+      0.6465
+     ],
+     "array-hof": [
+      1.0151,
+      1.0104,
+      1.0014,
+      0.99
+     ],
+     "call-deep": [
+      0.991,
+      1.0129,
+      0.9958,
+      1.1218
+     ],
+     "string-build": [
+      0.9616,
+      0.9294,
+      1.0473,
+      1.0391
+     ],
+     "regex": [
+      0.9205,
+      0.905,
+      0.8977,
+      0.9334
+     ],
+     "json": [
+      1.0019,
+      1.0085,
+      0.9975,
+      0.9478
+     ],
+     "recursive-calls": [
+      0.9873,
+      1.0122,
+      1.0018,
+      0.9821
+     ],
+     "error-range": [
+      0.9893,
+      0.9971,
+      1.0552,
+      0.9468
+     ],
+     "error-type": [
+      0.9723,
+      0.9923,
+      1.0382,
+      0.9951
+     ],
+     "error-typedarray": [
+      0.9836,
+      0.9852,
+      1.0013,
+      0.9972
+     ],
+     "property-delete": [
+      0.9559,
+      1.0098,
+      0.9833,
+      0.9728
+     ],
+     "enumeration": [
+      0.9958,
+      1.0221,
+      1.0007,
+      1.0168
+     ],
+     "string-append-index": [
+      0.9599,
+      0.94,
+      1.0162,
+      1.0305
+     ],
+     "regexp-unicode-compile": [
+      0.9897,
+      1.002,
+      0.9793,
+      1.0013
+     ],
+     "regexp-matchall": [
+      0.9685,
+      0.9418,
+      0.9512,
+      0.959
+     ],
+     "promise-resolve": [
+      1.0041,
+      0.9898,
+      1.0165,
+      1.0017
+     ],
+     "javascript_init_0_functions": [
+      0.987,
+      0.9944,
+      0.971,
+      0.9893
+     ],
+     "javascript_init_200_functions": [
+      0.9914,
+      1.0033,
+      0.9966,
+      1.0061
+     ]
+    },
+    "geomean": [
+     0.9724,
+     0.9739,
+     0.983,
+     0.9749
+    ],
+    "more_than_2_5_percent_slower_in_three_of_four": [],
+    "more_than_2_5_percent_faster_in_three_of_four": [
+     "array-build",
+     "regex",
+     "regexp-matchall"
+    ]
+   },
+   "javascript": {
+    "configurations": [
+     "fwd-a4",
+     "rev-a4",
+     "fwd-a10",
+     "rev-a10"
+    ],
+    "candidate_over_previous_median": {
+     "arith-int": [
+      1.0309,
+      0.9715,
+      1.015,
+      1.0019
+     ],
+     "arith-mod": [
+      1.0399,
+      0.9978,
+      0.9891,
+      1.003
+     ],
+     "arith-float": [
+      1.039,
+      1.0011,
+      0.9994,
+      1.0011
+     ],
+     "prop-mono": [
+      1.0243,
+      0.9724,
+      1.0105,
+      1.0051
+     ],
+     "prop-poly": [
+      1.0056,
+      0.9856,
+      1.1807,
+      0.9967
+     ],
+     "alloc-object": [
+      0.984,
+      1.0465,
+      0.9818,
+      0.9864
+     ],
+     "array-build": [
+      0.6033,
+      0.7011,
+      0.6097,
+      0.6827
+     ],
+     "array-hof": [
+      1.0452,
+      1.0018,
+      1.0113,
+      1.0004
+     ],
+     "call-deep": [
+      1.0326,
+      0.9931,
+      0.9961,
+      0.9935
+     ],
+     "string-build": [
+      1.0436,
+      1.1159,
+      1.0694,
+      1.0585
+     ],
+     "regex": [
+      0.968,
+      0.9551,
+      0.9618,
+      0.9756
+     ],
+     "json": [
+      1.026,
+      0.982,
+      0.9899,
+      0.9784
+     ],
+     "recursive-calls": [
+      1.0071,
+      0.9731,
+      1.0188,
+      1.0316
+     ],
+     "error-range": [
+      1.0311,
+      1.0148,
+      0.9994,
+      0.9809
+     ],
+     "error-type": [
+      1.005,
+      1.0043,
+      1.0005,
+      0.9937
+     ],
+     "error-typedarray": [
+      0.9941,
+      0.9757,
+      0.9283,
+      1.002
+     ],
+     "property-delete": [
+      1.001,
+      1.0154,
+      1.0131,
+      0.9902
+     ],
+     "enumeration": [
+      0.9916,
+      1.0311,
+      1.0328,
+      1.0292
+     ],
+     "string-append-index": [
+      1.0511,
+      1.1156,
+      1.0576,
+      1.0476
+     ],
+     "regexp-unicode-compile": [
+      0.9732,
+      0.9645,
+      0.9732,
+      1.0853
+     ],
+     "regexp-matchall": [
+      1.0234,
+      0.9929,
+      0.9762,
+      1.0197
+     ],
+     "promise-resolve": [
+      0.9987,
+      1.0018,
+      0.986,
+      1.0118
+     ],
+     "javascript_init_0_functions": [
+      1.006,
+      0.9988,
+      1.0002,
+      0.9979
+     ],
+     "javascript_init_200_functions": [
+      1.0085,
+      0.9995,
+      0.9989,
+      1.0054
+     ]
+    },
+    "candidate_over_previous_trimmed_mean": {
+     "arith-int": [
+      1.032,
+      0.9709,
+      1.0138,
+      1.0016
+     ],
+     "arith-mod": [
+      1.0379,
+      0.9979,
+      0.9905,
+      1.0028
+     ],
+     "arith-float": [
+      1.0401,
+      0.9988,
+      0.9951,
+      1.0006
+     ],
+     "prop-mono": [
+      1.0294,
+      0.9687,
+      1.0162,
+      1.0003
+     ],
+     "prop-poly": [
+      1.0042,
+      0.9824,
+      1.0359,
+      0.9947
+     ],
+     "alloc-object": [
+      0.9869,
+      1.0541,
+      0.992,
+      1.0031
+     ],
+     "array-build": [
+      0.6484,
+      0.6617,
+      0.6313,
+      0.6619
+     ],
+     "array-hof": [
+      1.0484,
+      1.0044,
+      0.9949,
+      0.9979
+     ],
+     "call-deep": [
+      1.0248,
+      0.9941,
+      0.9885,
+      1.0138
+     ],
+     "string-build": [
+      1.0523,
+      1.1185,
+      1.1134,
+      1.0601
+     ],
+     "regex": [
+      0.9704,
+      0.9572,
+      0.9575,
+      0.9693
+     ],
+     "json": [
+      1.0351,
+      0.9739,
+      0.9925,
+      0.9876
+     ],
+     "recursive-calls": [
+      1.0133,
+      0.9572,
+      1.0192,
+      1.0109
+     ],
+     "error-range": [
+      1.0219,
+      1.0028,
+      0.9986,
+      0.9802
+     ],
+     "error-type": [
+      1.0118,
+      1.0274,
+      1.0001,
+      0.9751
+     ],
+     "error-typedarray": [
+      1.0184,
+      0.9896,
+      0.972,
+      1.0297
+     ],
+     "property-delete": [
+      0.9918,
+      1.0245,
+      1.0128,
+      0.9999
+     ],
+     "enumeration": [
+      0.9917,
+      1.02,
+      1.0288,
+      1.0337
+     ],
+     "string-append-index": [
+      1.0513,
+      1.1187,
+      1.0591,
+      1.0526
+     ],
+     "regexp-unicode-compile": [
+      0.9839,
+      0.9782,
+      0.9963,
+      1.0416
+     ],
+     "regexp-matchall": [
+      1.0364,
+      0.9858,
+      0.977,
+      1.0224
+     ],
+     "promise-resolve": [
+      1.0029,
+      1.0003,
+      0.9885,
+      1.0102
+     ],
+     "javascript_init_0_functions": [
+      1.0156,
+      0.9995,
+      0.9964,
+      0.9864
+     ],
+     "javascript_init_200_functions": [
+      1.0031,
+      1.0033,
+      0.9903,
+      1.0033
+     ]
+    },
+    "geomean": [
+     0.9924,
+     0.9891,
+     0.9864,
+     0.9919
+    ],
+    "more_than_2_5_percent_slower_in_three_of_four": [
+     "string-build",
+     "enumeration",
+     "string-append-index"
+    ],
+    "more_than_2_5_percent_faster_in_three_of_four": [
+     "array-build",
+     "regex",
+     "regexp-unicode-compile"
+    ]
+   },
+   "python": {
+    "configurations": [
+     "fwd-a4",
+     "rev-a4",
+     "fwd-a10",
+     "rev-a10"
+    ],
+    "candidate_over_previous_median": {
+     "arith-int": [
+      1.0092,
+      1.0036,
+      0.9958,
+      1.0154
+     ],
+     "arith-mod": [
+      0.9965,
+      0.9439,
+      1.0269,
+      1.0306
+     ],
+     "arith-float": [
+      0.9983,
+      0.9574,
+      1.028,
+      1.0244
+     ],
+     "prop-mono": [
+      1.0143,
+      0.9905,
+      1.0217,
+      1.0458
+     ],
+     "prop-poly": [
+      0.995,
+      1.0101,
+      1.0252,
+      0.9902
+     ],
+     "alloc-object": [
+      0.9953,
+      1.0112,
+      0.9945,
+      0.9929
+     ],
+     "array-build": [
+      0.6252,
+      0.6672,
+      0.6337,
+      0.6867
+     ],
+     "array-hof": [
+      1.0109,
+      1.0199,
+      1.0019,
+      0.9835
+     ],
+     "call-deep": [
+      0.9693,
+      0.9991,
+      1.0206,
+      1.0004
+     ],
+     "string-build": [
+      0.9972,
+      1.0237,
+      1.0131,
+      1.0126
+     ],
+     "regex": [
+      0.9404,
+      0.9474,
+      0.9486,
+      0.946
+     ],
+     "json": [
+      1.0003,
+      1.0289,
+      1.0675,
+      1.0187
+     ],
+     "recursive-calls": [
+      0.9951,
+      0.9733,
+      0.9837,
+      1.009
+     ],
+     "error-range": [
+      0.9407,
+      0.959,
+      0.9796,
+      0.962
+     ],
+     "error-type": [
+      0.9753,
+      1.0152,
+      1.0267,
+      1.0202
+     ],
+     "error-typedarray": [
+      1.0386,
+      0.9642,
+      0.9085,
+      1.0876
+     ],
+     "property-delete": [
+      0.8964,
+      0.9969,
+      1.0195,
+      1.0017
+     ],
+     "enumeration": [
+      1.0083,
+      1.0132,
+      1.0044,
+      0.9911
+     ],
+     "string-append-index": [
+      1.0711,
+      0.9708,
+      1.0026,
+      1.003
+     ],
+     "regexp-unicode-compile": [
+      1.068,
+      1.036,
+      0.9762,
+      1.0174
+     ],
+     "regexp-matchall": [
+      0.9944,
+      1.0158,
+      0.9901,
+      1.0313
+     ],
+     "promise-resolve": [
+      0.9906,
+      1.0138,
+      1.0158,
+      1.017
+     ],
+     "javascript_init_0_functions": [
+      1.012,
+      0.9975,
+      1.0123,
+      0.9824
+     ],
+     "javascript_init_200_functions": [
+      1.0157,
+      1.0031,
+      1.0093,
+      1.0009
+     ],
+     "python_init_1_functions": [
+      0.9713,
+      0.9826,
+      0.9881,
+      0.9916
+     ],
+     "python_init_200_functions": [
+      0.9704,
+      0.9829,
+      0.9832,
+      0.9825
+     ],
+     "python-arithmetic-e2e": [
+      0.9755,
+      0.9912,
+      0.9886,
+      0.9984
+     ],
+     "python-list-e2e": [
+      0.9024,
+      0.898,
+      0.8958,
+      0.9077
+     ],
+     "python-dictionary-e2e": [
+      0.9541,
+      0.9632,
+      0.9776,
+      0.9797
+     ]
+    },
+    "candidate_over_previous_trimmed_mean": {
+     "arith-int": [
+      1.008,
+      1.0034,
+      0.9971,
+      1.0151
+     ],
+     "arith-mod": [
+      1.0021,
+      0.9446,
+      1.0284,
+      1.0315
+     ],
+     "arith-float": [
+      1.0022,
+      0.9808,
+      1.0328,
+      1.0261
+     ],
+     "prop-mono": [
+      1.0461,
+      0.9889,
+      1.0201,
+      1.036
+     ],
+     "prop-poly": [
+      1.0144,
+      0.9591,
+      1.026,
+      0.9999
+     ],
+     "alloc-object": [
+      0.9944,
+      0.9978,
+      0.9949,
+      0.9877
+     ],
+     "array-build": [
+      0.6539,
+      0.6597,
+      0.6546,
+      0.6738
+     ],
+     "array-hof": [
+      1.0052,
+      1.0229,
+      0.9997,
+      0.9831
+     ],
+     "call-deep": [
+      0.9494,
+      1.0174,
+      1.0243,
+      1.0063
+     ],
+     "string-build": [
+      0.9809,
+      1.0231,
+      0.9954,
+      1.0136
+     ],
+     "regex": [
+      0.9368,
+      0.946,
+      0.946,
+      0.9459
+     ],
+     "json": [
+      0.9924,
+      1.016,
+      1.0669,
+      1.0017
+     ],
+     "recursive-calls": [
+      0.9556,
+      0.9714,
+      0.9857,
+      1.0024
+     ],
+     "error-range": [
+      0.9417,
+      0.941,
+      0.9793,
+      0.9552
+     ],
+     "error-type": [
+      0.981,
+      1.0041,
+      1.0316,
+      1.0313
+     ],
+     "error-typedarray": [
+      0.9939,
+      0.9855,
+      0.9849,
+      1.0118
+     ],
+     "property-delete": [
+      0.8958,
+      0.9949,
+      1.016,
+      1.0198
+     ],
+     "enumeration": [
+      1.0089,
+      1.0133,
+      1.0108,
+      0.9906
+     ],
+     "string-append-index": [
+      1.0689,
+      0.9549,
+      1.0054,
+      1.0069
+     ],
+     "regexp-unicode-compile": [
+      1.0074,
+      0.9918,
+      0.9951,
+      1.0225
+     ],
+     "regexp-matchall": [
+      1.0062,
+      1.0064,
+      0.9912,
+      1.0365
+     ],
+     "promise-resolve": [
+      0.9831,
+      1.0171,
+      1.0216,
+      1.0132
+     ],
+     "javascript_init_0_functions": [
+      1.0183,
+      1.005,
+      1.0216,
+      0.9871
+     ],
+     "javascript_init_200_functions": [
+      1.0172,
+      1.0026,
+      1.0103,
+      1.0019
+     ],
+     "python_init_1_functions": [
+      0.9724,
+      0.9782,
+      1.0092,
+      0.9942
+     ],
+     "python_init_200_functions": [
+      0.9708,
+      0.9914,
+      0.9757,
+      0.9921
+     ],
+     "python-arithmetic-e2e": [
+      0.9823,
+      0.9954,
+      0.9902,
+      0.9911
+     ],
+     "python-list-e2e": [
+      0.8988,
+      0.9067,
+      0.8884,
+      0.9035
+     ],
+     "python-dictionary-e2e": [
+      0.9596,
+      0.9635,
+      0.9747,
+      0.9788
+     ]
+    },
+    "geomean": [
+     0.9732,
+     0.9759,
+     0.9806,
+     0.9881
+    ],
+    "more_than_2_5_percent_slower_in_three_of_four": [],
+    "more_than_2_5_percent_faster_in_three_of_four": [
+     "array-build",
+     "regex",
+     "error-range",
+     "python-list-e2e"
+    ]
+   },
+   "all": {
+    "configurations": [
+     "fwd-a4",
+     "rev-a4",
+     "fwd-a10",
+     "rev-a10"
+    ],
+    "candidate_over_previous_median": {
+     "arith-int": [
+      1.0071,
+      1.0,
+      1.0051,
+      0.9966
+     ],
+     "arith-mod": [
+      1.0063,
+      1.0045,
+      1.0056,
+      1.0146
+     ],
+     "arith-float": [
+      1.0018,
+      0.9885,
+      1.0003,
+      0.9992
+     ],
+     "prop-mono": [
+      1.019,
+      1.0222,
+      1.0132,
+      1.0216
+     ],
+     "prop-poly": [
+      1.0131,
+      1.0122,
+      1.0019,
+      0.9646
+     ],
+     "alloc-object": [
+      0.9963,
+      0.993,
+      1.0029,
+      0.9809
+     ],
+     "array-build": [
+      0.6877,
+      0.6913,
+      0.6999,
+      0.6447
+     ],
+     "array-hof": [
+      1.0121,
+      0.9945,
+      1.04,
+      0.9982
+     ],
+     "call-deep": [
+      1.0033,
+      0.9804,
+      1.0036,
+      1.0227
+     ],
+     "string-build": [
+      1.0145,
+      1.0191,
+      1.0216,
+      1.0133
+     ],
+     "regex": [
+      0.9611,
+      0.9485,
+      0.9457,
+      0.9569
+     ],
+     "json": [
+      0.9918,
+      0.9997,
+      1.005,
+      0.9646
+     ],
+     "recursive-calls": [
+      1.0126,
+      1.016,
+      1.0069,
+      0.9629
+     ],
+     "error-range": [
+      0.9969,
+      1.0135,
+      0.978,
+      0.9988
+     ],
+     "error-type": [
+      1.0155,
+      1.0209,
+      1.0222,
+      1.0122
+     ],
+     "error-typedarray": [
+      0.9654,
+      0.9951,
+      0.9885,
+      0.9145
+     ],
+     "property-delete": [
+      1.0058,
+      0.9963,
+      1.0069,
+      0.9829
+     ],
+     "enumeration": [
+      1.0088,
+      1.0086,
+      1.0094,
+      1.0132
+     ],
+     "string-append-index": [
+      1.0327,
+      0.9968,
+      1.0189,
+      1.0129
+     ],
+     "regexp-unicode-compile": [
+      0.9757,
+      0.9556,
+      0.9892,
+      1.0583
+     ],
+     "regexp-matchall": [
+      1.0208,
+      1.0116,
+      1.0006,
+      0.9812
+     ],
+     "promise-resolve": [
+      1.044,
+      0.9895,
+      1.024,
+      1.0277
+     ],
+     "javascript_init_0_functions": [
+      1.0137,
+      1.0073,
+      1.006,
+      1.0064
+     ],
+     "javascript_init_200_functions": [
+      1.0003,
+      0.9931,
+      1.0164,
+      1.007
+     ],
+     "python_init_1_functions": [
+      0.9922,
+      0.9811,
+      0.9839,
+      0.968
+     ],
+     "python_init_200_functions": [
+      0.9939,
+      0.9779,
+      0.9774,
+      0.9779
+     ],
+     "python-arithmetic-e2e": [
+      0.991,
+      0.9843,
+      0.9819,
+      0.9682
+     ],
+     "python-list-e2e": [
+      0.904,
+      0.9039,
+      0.921,
+      0.8877
+     ],
+     "python-dictionary-e2e": [
+      0.9854,
+      0.9611,
+      0.9801,
+      0.9683
+     ]
+    },
+    "candidate_over_previous_trimmed_mean": {
+     "arith-int": [
+      1.0092,
+      0.9997,
+      1.0059,
+      0.9967
+     ],
+     "arith-mod": [
+      1.0058,
+      1.0038,
+      1.0067,
+      1.0145
+     ],
+     "arith-float": [
+      1.0032,
+      0.9859,
+      1.0034,
+      0.9998
+     ],
+     "prop-mono": [
+      1.0125,
+      1.0287,
+      1.0159,
+      1.0223
+     ],
+     "prop-poly": [
+      1.0158,
+      1.0127,
+      1.0057,
+      0.9656
+     ],
+     "alloc-object": [
+      1.0021,
+      0.9827,
+      1.0025,
+      0.9794
+     ],
+     "array-build": [
+      0.6853,
+      0.6484,
+      0.6715,
+      0.6407
+     ],
+     "array-hof": [
+      1.0199,
+      0.991,
+      1.0497,
+      0.9954
+     ],
+     "call-deep": [
+      0.9935,
+      0.9889,
+      1.0048,
+      1.0182
+     ],
+     "string-build": [
+      1.0084,
+      1.0135,
+      1.0177,
+      1.011
+     ],
+     "regex": [
+      0.959,
+      0.9449,
+      0.9441,
+      0.959
+     ],
+     "json": [
+      0.9491,
+      0.9805,
+      0.9868,
+      0.9658
+     ],
+     "recursive-calls": [
+      1.0151,
+      1.0217,
+      1.0026,
+      0.9622
+     ],
+     "error-range": [
+      1.0137,
+      1.0027,
+      0.9738,
+      0.9868
+     ],
+     "error-type": [
+      1.0143,
+      1.0328,
+      1.0215,
+      1.0161
+     ],
+     "error-typedarray": [
+      0.979,
+      0.9863,
+      0.9849,
+      0.9618
+     ],
+     "property-delete": [
+      1.0086,
+      1.0033,
+      1.0084,
+      0.9685
+     ],
+     "enumeration": [
+      1.0055,
+      1.0079,
+      1.0095,
+      1.0103
+     ],
+     "string-append-index": [
+      1.0748,
+      1.0,
+      1.0143,
+      1.0106
+     ],
+     "regexp-unicode-compile": [
+      0.9766,
+      1.0063,
+      1.0082,
+      1.0201
+     ],
+     "regexp-matchall": [
+      1.0185,
+      1.0012,
+      1.0062,
+      0.9837
+     ],
+     "promise-resolve": [
+      1.0456,
+      0.9831,
+      1.0252,
+      1.0289
+     ],
+     "javascript_init_0_functions": [
+      1.0135,
+      1.0072,
+      1.0062,
+      1.0072
+     ],
+     "javascript_init_200_functions": [
+      0.9954,
+      1.0026,
+      1.0117,
+      1.0141
+     ],
+     "python_init_1_functions": [
+      0.9929,
+      0.9853,
+      0.9884,
+      0.9626
+     ],
+     "python_init_200_functions": [
+      0.9942,
+      0.9761,
+      0.9774,
+      0.977
+     ],
+     "python-arithmetic-e2e": [
+      0.9926,
+      0.9901,
+      0.9811,
+      0.9656
+     ],
+     "python-list-e2e": [
+      0.9062,
+      0.9051,
+      0.9205,
+      0.8893
+     ],
+     "python-dictionary-e2e": [
+      0.9997,
+      0.9593,
+      0.9775,
+      0.9729
+     ]
+    },
+    "geomean": [
+     0.9863,
+     0.9794,
+     0.986,
+     0.9736
+    ],
+    "more_than_2_5_percent_slower_in_three_of_four": [],
+    "more_than_2_5_percent_faster_in_three_of_four": [
+     "array-build",
+     "regex",
+     "python-list-e2e"
+    ]
+   }
+  },
+  "string_property_compile": {
+   "lite": {
+    "Basic_Emoji": 1.0692,
+    "Emoji_Keycap_Sequence": 1.0142,
+    "RGI_Emoji_Flag_Sequence": 1.0466,
+    "RGI_Emoji_Modifier_Sequence": 1.054,
+    "RGI_Emoji_Tag_Sequence": 1.006,
+    "RGI_Emoji_ZWJ_Sequence": 1.1138,
+    "RGI_Emoji": 1.097
+   },
+   "javascript": {
+    "Basic_Emoji": 1.0054,
+    "Emoji_Keycap_Sequence": 0.9591,
+    "RGI_Emoji_Flag_Sequence": 1.0125,
+    "RGI_Emoji_Modifier_Sequence": 1.0207,
+    "RGI_Emoji_Tag_Sequence": 1.0133,
+    "RGI_Emoji_ZWJ_Sequence": 1.0092,
+    "RGI_Emoji": 1.0026
+   },
+   "python": {
+    "Basic_Emoji": 1.0092,
+    "Emoji_Keycap_Sequence": 1.0012,
+    "RGI_Emoji_Flag_Sequence": 1.0115,
+    "RGI_Emoji_Modifier_Sequence": 1.0411,
+    "RGI_Emoji_Tag_Sequence": 1.0019,
+    "RGI_Emoji_ZWJ_Sequence": 1.0024,
+    "RGI_Emoji": 1.0064
+   },
+   "all": {
+    "Basic_Emoji": 1.0097,
+    "Emoji_Keycap_Sequence": 0.9902,
+    "RGI_Emoji_Flag_Sequence": 1.0039,
+    "RGI_Emoji_Modifier_Sequence": 1.0078,
+    "RGI_Emoji_Tag_Sequence": 1.0022,
+    "RGI_Emoji_ZWJ_Sequence": 1.0058,
+    "RGI_Emoji": 1.0116
+   }
+  },
+  "one_module_per_process": {
+   "javascript-string-append-loop": {
+    "case": "string-build",
+    "processes_each": 6,
+    "unit": "median per-call ms of one process",
+    "modules": {
+     "acc": {
+      "dir": "target/size-audit/javascript-round7/final-node",
+      "medians_ms": [
+       1.018293749999998,
+       1.0191499999999962,
+       1.0074937499999947,
+       1.0121687500000007,
+       1.0156687500000032,
+       1.0305874999999958
+      ]
+     },
+     "s13": {
+      "dir": "target/size-audit/javascript-s13/final-node",
+      "medians_ms": [
+       1.0186624999999907,
+       1.0171624999999977,
+       1.029943750000001,
+       1.031374999999997,
+       1.0240124999999978,
+       1.2132500000000022
+      ]
+     },
+     "r11a": {
+      "dir": "target/size-audit/javascript-r11a/final-node",
+      "medians_ms": [
+       1.207743750000006,
+       1.1939125000000104,
+       1.2026874999999961,
+       1.1771187500000053,
+       1.1998562499999963,
+       1.2034312499999942
+      ]
+     },
+     "r11b": {
+      "dir": "target/size-audit/javascript-r11b/final-node",
+      "medians_ms": [
+       1.1375312500000092,
+       1.1538499999999914,
+       1.1338187500000032,
+       1.1106750000000005,
+       1.2387500000000102,
+       1.128356249999996
+      ]
+     },
+     "r11c": {
+      "dir": "target/size-audit/javascript-r11c/final-node",
+      "medians_ms": [
+       1.137531249999995,
+       1.158875000000009,
+       1.136125000000007,
+       1.1241250000000065,
+       1.113500000000002,
+       1.1343562499999962
+      ]
+     },
+     "r11d": {
+      "dir": "target/size-audit/javascript-r11d/final-node",
+      "medians_ms": [
+       1.117974999999987,
+       1.1417812500000082,
+       1.1430062499999991,
+       1.1231625000000065,
+       1.1076812499999988,
+       1.1420437499999991
+      ]
+     },
+     "r11x": {
+      "dir": "target/size-audit/javascript-r11x/final-node",
+      "medians_ms": [
+       1.2020312500000045,
+       1.1875,
+       1.1854187499999966,
+       1.2528437499999967,
+       1.2041187499999921,
+       1.2096250000000026
+      ]
+     }
+    }
+   },
+   "lite-promise-resolve": {
+    "case": "promise-resolve",
+    "processes_each": 8,
+    "unit": "median per-call ms of one process",
+    "modules": {
+     "acc": {
+      "dir": "target/size-audit/lite-wide-round9/final-node",
+      "medians_ms": [
+       0.6543562499999993,
+       0.6566124999999943,
+       0.6478312499999959,
+       0.6691562500000003,
+       0.6613625000000027,
+       0.6579750000000075,
+       0.6805312499999943,
+       0.6630312500000031
+      ]
+     },
+     "s13": {
+      "dir": "target/size-audit/lite-s13/final-node",
+      "medians_ms": [
+       0.665437500000003,
+       0.6817062499999977,
+       0.6677874999999958,
+       0.669124999999994,
+       0.670899999999996,
+       0.6769874999999956,
+       0.6825562500000046,
+       0.6736187499999957
+      ]
+     },
+     "r11d": {
+      "dir": "target/size-audit/lite-r11d/final-node",
+      "medians_ms": [
+       0.664475000000003,
+       0.6753624999999985,
+       0.6534125000000017,
+       0.6491625000000028,
+       0.6570625000000021,
+       0.6556187500000021,
+       0.6779187500000035,
+       0.6659312499999999
+      ]
+     }
+    }
+   },
+   "lite-string-append-loop": {
+    "case": "string-build",
+    "processes_each": 6,
+    "unit": "median per-call ms of one process",
+    "modules": {
+     "acc": {
+      "dir": "target/size-audit/lite-wide-round9/final-node",
+      "medians_ms": [
+       1.9222312499999958,
+       1.804837500000005,
+       1.765062499999999,
+       1.7991187500000052,
+       1.9563187500000012,
+       1.8151375000000058
+      ]
+     },
+     "r11d": {
+      "dir": "target/size-audit/lite-r11d/final-node",
+      "medians_ms": [
+       1.871287500000001,
+       1.8836999999999975,
+       1.7619749999999925,
+       1.751168750000005,
+       1.759149999999991,
+       1.855456249999989
+      ]
+     }
+    }
+   },
+   "python-promise-resolve-paired-without-packing": {
+    "what": "bench-size-pass.cjs promise-resolve, one process per run: Python-base 9df8019c without the string-set packing over the accepted module",
+    "runs": {
+     "fwd-a10": {
+      "median_ratio": 1.0349,
+      "trimmed_ratio": 1.0325
+     },
+     "fwd-a4": {
+      "median_ratio": 1.0219,
+      "trimmed_ratio": 1.0195
+     },
+     "rev-a10": {
+      "median_ratio": 1.045,
+      "trimmed_ratio": 1.0389
+     },
+     "rev-a4": {
+      "median_ratio": 1.0487,
+      "trimmed_ratio": 1.0401
+     }
+    }
+   },
+   "python-promise-resolve": {
+    "case": "promise-resolve",
+    "processes_each": 8,
+    "unit": "median per-call ms of one process",
+    "modules": {
+     "acc": {
+      "dir": "target/size-audit/python-round7/final-node",
+      "medians_ms": [
+       0.2710937499999915,
+       0.27205000000000723,
+       0.26725625000000264,
+       0.27588124999999764,
+       0.27818125000000293,
+       0.27866875000000846,
+       0.2677125000000018,
+       0.267756250000005
+      ]
+     },
+     "s13": {
+      "dir": "target/size-audit/python-s13/final-node",
+      "medians_ms": [
+       0.265431250000006,
+       0.2679625000000101,
+       0.26965624999999704,
+       0.27389374999999916,
+       0.2685062500000015,
+       0.2661312500000008,
+       0.2661812500000025,
+       0.2798812499999883
+      ]
+     },
+     "r11d": {
+      "dir": "target/size-audit/python-r11d/final-node",
+      "medians_ms": [
+       0.2782499999999999,
+       0.27488125000000707,
+       0.27652499999999236,
+       0.27694999999999936,
+       0.2764749999999907,
+       0.27385625000000857,
+       0.274825000000007,
+       0.2743249999999904
+      ]
+     },
+     "r11x": {
+      "dir": "target/size-audit/python-r11x/final-node",
+      "medians_ms": [
+       0.2620875000000069,
+       0.2601312500000006,
+       0.2753937499999921,
+       0.2592250000000007,
+       0.26252499999999657,
+       0.2610812499999895,
+       0.2608312499999954,
+       0.2605374999999981
+      ]
+     }
+    }
+   },
+   "python-string-append-loop": {
+    "case": "string-build",
+    "processes_each": 6,
+    "unit": "median per-call ms of one process",
+    "modules": {
+     "acc": {
+      "dir": "target/size-audit/python-round7/final-node",
+      "medians_ms": [
+       1.2326812499999988,
+       1.2368499999999898,
+       1.2202874999999977,
+       1.2847875000000073,
+       1.7945875000000058,
+       1.2653875000000028
+      ]
+     },
+     "r11d": {
+      "dir": "target/size-audit/python-r11d/final-node",
+      "medians_ms": [
+       1.2283000000000044,
+       1.2335874999999987,
+       1.241912499999998,
+       1.2700499999999977,
+       1.2476125000000025,
+       1.2484437499999927
+      ]
+     }
+    }
+   }
+  }
+ },
+ "normalization_and_collation": {
+  "workload": "target/collate_bench.js: 5 sorts of 4,000 words with localeCompare, 5 with Intl.Collator, 60 passes of NFC and NFKD; milliseconds",
+  "native": [
+   "== target/bench-binaries/head-c48fc4d2.exe",
+   "ascii    localeCompare sort   334  Intl.Collator sort    89  normalize    38",
+   "latin    localeCompare sort   362  Intl.Collator sort   121  normalize    95",
+   "kana     localeCompare sort   392  Intl.Collator sort   154  normalize    90",
+   "hangul   localeCompare sort   471  Intl.Collator sort   222  normalize   104",
+   "cjk      localeCompare sort   360  Intl.Collator sort   116  normalize    56",
+   "check 18703880",
+   "== target/bench-binaries/head-9df8019c.exe",
+   "ascii    localeCompare sort   336  Intl.Collator sort    82  normalize    28",
+   "latin    localeCompare sort   356  Intl.Collator sort   130  normalize   127",
+   "kana     localeCompare sort   402  Intl.Collator sort   158  normalize    96",
+   "hangul   localeCompare sort   447  Intl.Collator sort   209  normalize    90",
+   "cjk      localeCompare sort   348  Intl.Collator sort   116  normalize    51",
+   "check 18703880"
+  ],
+  "modules": {
+   "lite": [
+    "== target/size-audit/lite-wide-round9/final-node",
+    "ascii    localeCompare sort   131  Intl.Collator sort    -1  normalize   107",
+    "latin    localeCompare sort   165  Intl.Collator sort    -1  normalize   256",
+    "kana     localeCompare sort   160  Intl.Collator sort    -1  normalize   247",
+    "hangul   localeCompare sort   165  Intl.Collator sort    -1  normalize   282",
+    "cjk      localeCompare sort   144  Intl.Collator sort    -1  normalize   160",
+    "check 18603880",
+    "== target/size-audit/lite-r11d/final-node",
+    "ascii    localeCompare sort   129  Intl.Collator sort    -1  normalize    77",
+    "latin    localeCompare sort   180  Intl.Collator sort    -1  normalize   330",
+    "kana     localeCompare sort   167  Intl.Collator sort    -1  normalize   269",
+    "hangul   localeCompare sort   157  Intl.Collator sort    -1  normalize   228",
+    "cjk      localeCompare sort   141  Intl.Collator sort    -1  normalize   127",
+    "check 18603880"
+   ],
+   "javascript": [
+    "== target/size-audit/javascript-round7/final-node",
+    "ascii    localeCompare sort   389  Intl.Collator sort   143  normalize    57",
+    "latin    localeCompare sort   459  Intl.Collator sort   214  normalize   149",
+    "kana     localeCompare sort   498  Intl.Collator sort   259  normalize   141",
+    "hangul   localeCompare sort   648  Intl.Collator sort   394  normalize   173",
+    "cjk      localeCompare sort   470  Intl.Collator sort   220  normalize    89",
+    "check 18703880",
+    "== target/size-audit/javascript-r11d/final-node",
+    "ascii    localeCompare sort   390  Intl.Collator sort   148  normalize    42",
+    "latin    localeCompare sort   460  Intl.Collator sort   226  normalize   157",
+    "kana     localeCompare sort   511  Intl.Collator sort   265  normalize   145",
+    "hangul   localeCompare sort   603  Intl.Collator sort   361  normalize   151",
+    "cjk      localeCompare sort   466  Intl.Collator sort   209  normalize    77",
+    "check 18703880"
+   ],
+   "python": [
+    "== target/size-audit/python-round7/final-node",
+    "ascii    localeCompare sort   396  Intl.Collator sort   147  normalize    59",
+    "latin    localeCompare sort   476  Intl.Collator sort   221  normalize   140",
+    "kana     localeCompare sort   517  Intl.Collator sort   260  normalize   139",
+    "hangul   localeCompare sort   647  Intl.Collator sort   390  normalize   174",
+    "cjk      localeCompare sort   484  Intl.Collator sort   221  normalize    92",
+    "check 18703880",
+    "== target/size-audit/python-r11d/final-node",
+    "ascii    localeCompare sort   390  Intl.Collator sort   151  normalize    44",
+    "latin    localeCompare sort   467  Intl.Collator sort   221  normalize   158",
+    "kana     localeCompare sort   529  Intl.Collator sort   270  normalize   144",
+    "hangul   localeCompare sort   622  Intl.Collator sort   363  normalize   144",
+    "cjk      localeCompare sort   473  Intl.Collator sort   213  normalize    76",
+    "check 18703880"
+   ],
+   "all": [
+    "== target/size-audit/all-round7/final-node",
+    "ascii    localeCompare sort   388  Intl.Collator sort   164  normalize    59",
+    "latin    localeCompare sort   453  Intl.Collator sort   243  normalize   142",
+    "kana     localeCompare sort   501  Intl.Collator sort   280  normalize   140",
+    "hangul   localeCompare sort   625  Intl.Collator sort   415  normalize   175",
+    "cjk      localeCompare sort   463  Intl.Collator sort   236  normalize    89",
+    "check 18703880",
+    "== target/size-audit/all-r11d/final-node",
+    "ascii    localeCompare sort   398  Intl.Collator sort   156  normalize    42",
+    "latin    localeCompare sort   457  Intl.Collator sort   235  normalize   156",
+    "kana     localeCompare sort   509  Intl.Collator sort   278  normalize   143",
+    "hangul   localeCompare sort   607  Intl.Collator sort   393  normalize   137",
+    "cjk      localeCompare sort   463  Intl.Collator sort   231  normalize    76",
+    "check 18703880"
+   ]
+  }
+ },
+ "native_javascript": {
+  "build": "cargo build --locked --release -p zipp-cli: default features, fat LTO, not profile-guided; tools/bench.py, cold metric",
+  "previous_to_final": {
+   "what": "c48fc4d2 -> 9df8019c, 12 paired repetitions",
+   "rows": {
+    "async-promise-chain": {
+     "old_ms": 476,
+     "new_ms": 470,
+     "paired_pct": -0.7,
+     "ci95": [
+      -1.6,
+      0.6
+     ]
+    },
+    "class-prototype-hot": {
+     "old_ms": 227,
+     "new_ms": 228,
+     "paired_pct": 0.8,
+     "ci95": [
+      -0.6,
+      1.5
+     ]
+    },
+    "json-large": {
+     "old_ms": 305,
+     "new_ms": 298,
+     "paired_pct": -2.8,
+     "ci95": [
+      -3.6,
+      -0.8
+     ]
+    },
+    "map-set-heavy": {
+     "old_ms": 817,
+     "new_ms": 791,
+     "paired_pct": -3.3,
+     "ci95": [
+      -6.6,
+      -1.3
+     ]
+    },
+    "markdown-render": {
+     "old_ms": 224,
+     "new_ms": 219,
+     "paired_pct": -2.3,
+     "ci95": [
+      -5.7,
+      2.0
+     ]
+    },
+    "parse-large-js": {
+     "old_ms": 251,
+     "new_ms": 244,
+     "paired_pct": -3.0,
+     "ci95": [
+      -3.7,
+      -2.4
+     ]
+    },
+    "polymorphic-objects": {
+     "old_ms": 413,
+     "new_ms": 413,
+     "paired_pct": 0.5,
+     "ci95": [
+      -1.1,
+      1.9
+     ]
+    },
+    "polymorphic-objects-v2": {
+     "old_ms": 28,
+     "new_ms": 28,
+     "paired_pct": -1.9,
+     "ci95": [
+      -3.6,
+      1.5
+     ]
+    },
+    "property-ic-shapes": {
+     "old_ms": 10,
+     "new_ms": 10,
+     "paired_pct": -0.6,
+     "ci95": [
+      -4.8,
+      5.3
+     ]
+    },
+    "regex-log-scan": {
+     "old_ms": 465,
+     "new_ms": 453,
+     "paired_pct": -2.6,
+     "ci95": [
+      -4.7,
+      -0.3
+     ]
+    },
+    "sparse-array": {
+     "old_ms": 76,
+     "new_ms": 76,
+     "paired_pct": -0.4,
+     "ci95": [
+      -1.4,
+      1.0
+     ]
+    },
+    "sparse-array-v2": {
+     "old_ms": 105,
+     "new_ms": 106,
+     "paired_pct": 0.6,
+     "ci95": [
+      0.1,
+      1.1
+     ]
+    },
+    "typedarray-math": {
+     "old_ms": 141,
+     "new_ms": 138,
+     "paired_pct": -2.6,
+     "ci95": [
+      -3.2,
+      -1.9
+     ]
+    }
+   },
+   "summary": [
+    "geomean paired ratio: 0.9858x (-1.42%), descriptive bootstrap 95% CI [-1.95%, -0.62%]",
+    "startup(ms, paired launches): old=6.6  new=6.5",
+    "ALL_CORRECT=1  (exact bytes, no normalisation)",
+    "geomean[headline] 0.9835x [0.977, 0.990]  (10 rows)",
+    "geomean[diagnostic] 0.9937x [0.977, 1.017]  (3 rows)",
+    "geomean[all_measured] 0.9858x [0.981, 0.993]  (13 rows)"
+   ]
+  },
+  "final_against_node": {
+   "what": "9df8019c against Node 24.19.0, 10 paired repetitions",
+   "rows": {
+    "async-promise-chain": {
+     "node_ms": 330,
+     "zipp_ms": 469,
+     "ratio": 1.42,
+     "ci95": [
+      1.4,
+      1.45
+     ]
+    },
+    "class-prototype-hot": {
+     "node_ms": 298,
+     "zipp_ms": 227,
+     "ratio": 0.77,
+     "ci95": [
+      0.73,
+      0.78
+     ]
+    },
+    "json-large": {
+     "node_ms": 261,
+     "zipp_ms": 300,
+     "ratio": 1.15,
+     "ci95": [
+      1.05,
+      1.17
+     ]
+    },
+    "map-set-heavy": {
+     "node_ms": 867,
+     "zipp_ms": 792,
+     "ratio": 0.93,
+     "ci95": [
+      0.87,
+      0.95
+     ]
+    },
+    "markdown-render": {
+     "node_ms": 262,
+     "zipp_ms": 219,
+     "ratio": 0.84,
+     "ci95": [
+      0.82,
+      0.86
+     ]
+    },
+    "parse-large-js": {
+     "node_ms": 271,
+     "zipp_ms": 246,
+     "ratio": 0.9,
+     "ci95": [
+      0.89,
+      0.93
+     ]
+    },
+    "polymorphic-objects": {
+     "node_ms": 326,
+     "zipp_ms": 413,
+     "ratio": 1.28,
+     "ci95": [
+      1.26,
+      1.28
+     ]
+    },
+    "polymorphic-objects-v2": {
+     "node_ms": 80,
+     "zipp_ms": 28,
+     "ratio": 0.35,
+     "ci95": [
+      0.34,
+      0.37
+     ]
+    },
+    "property-ic-shapes": {
+     "node_ms": 255,
+     "zipp_ms": 10,
+     "ratio": 0.04,
+     "ci95": [
+      0.04,
+      0.04
+     ]
+    },
+    "regex-log-scan": {
+     "node_ms": 467,
+     "zipp_ms": 462,
+     "ratio": 0.98,
+     "ci95": [
+      0.97,
+      1.02
+     ]
+    },
+    "sparse-array": {
+     "node_ms": 79,
+     "zipp_ms": 78,
+     "ratio": 0.99,
+     "ci95": [
+      0.97,
+      1.03
+     ]
+    },
+    "sparse-array-v2": {
+     "node_ms": 169,
+     "zipp_ms": 106,
+     "ratio": 0.63,
+     "ci95": [
+      0.62,
+      0.63
+     ]
+    },
+    "typedarray-math": {
+     "node_ms": 201,
+     "zipp_ms": 139,
+     "ratio": 0.69,
+     "ci95": [
+      0.68,
+      0.71
+     ]
+    }
+   },
+   "summary": [
+    "geomean paired ratio: 0.68x zipp/node, descriptive bootstrap 95% CI [0.67x, 0.68x]",
+    "startup(ms, paired launches): node=29.2  zipp=6.6",
+    "ALL_CORRECT=1  (exact bytes, no normalisation)",
+    "geomean[headline] 0.9722x [0.958, 0.980]  (10 rows)",
+    "geomean[diagnostic] 0.2038x [0.200, 0.209]  (3 rows)",
+    "geomean[all_measured] 0.6779x [0.672, 0.682]  (13 rows)"
+   ]
+  },
+  "start_and_exit": [
+   "wall ms, c48fc4d2 then 9df8019c; walltime.py N CWD CMD (unpinned, machine waited quiet)",
+   "== head-c48fc4d2.exe",
+   "zipp py tools/python_bench/micro/dict_get.py from the repository root, 9 runs: wall min   442.3 median   459.5 ms  rc=0",
+   "zipp py dict_get.py from its own folder, 9 runs: wall min    35.7 median    36.4 ms  rc=0",
+   "zipp py empty.py (a one-line program in a folder of its own), 15 runs: wall min    17.7 median    18.5 ms  rc=0",
+   "== head-9df8019c.exe",
+   "zipp py tools/python_bench/micro/dict_get.py from the repository root, 9 runs: wall min    61.0 median    62.2 ms  rc=0",
+   "zipp py dict_get.py from its own folder, 9 runs: wall min    36.0 median    36.8 ms  rc=0",
+   "zipp py empty.py (a one-line program in a folder of its own), 15 runs: wall min    17.7 median    18.8 ms  rc=0",
+   "== target/teardown.js: 1.5 million objects, arrays and strings and a 300,000-entry Map alive at the end; median of 9",
+   "target\\bench-binaries\\head-c48fc4d2.exe    wall   647.4  in-script  515.0  outside the script  132.4 ms",
+   "target\\bench-binaries\\head-9df8019c.exe    wall   578.2  in-script  523.0  outside the script   55.2 ms",
+   "node                                       wall   272.6  in-script  218.0  outside the script   54.6 ms"
+  ]
+ },
+ "python": {
+  "what": "tools/python_bench.py, 7 repetitions; zipp = c48fc4d2, zipp-b = 9df8019c, cpython = py -3.13",
+  "table": [
+   "benchmark                     zipp med    zipp min  zipp-b med  zipp-b min  cpython med  cpython min  zipp/cpython  zipp-b/zipp  zipp-b/cpython",
+   "-----------------------------------------------------------------------------------------------------------------------------------------------",
+   "micro/attr_read_write              3.3         3.1         3.4         3.3          7.8          7.7         0.42x        1.03x           0.43x",
+   "micro/builtin_isinstance          20.0        19.7        20.1        19.8          9.2          9.0         2.18x        1.00x           2.19x",
+   "micro/builtin_len                 17.8        17.5        17.8        17.6         11.8         11.5         1.50x        1.00x           1.50x",
+   "micro/call_defaults               24.7        24.5        24.6        24.4         12.5         12.3         1.98x        1.00x           1.97x",
+   "micro/call_keywords               13.1        13.0        13.1        13.0          7.8          7.4         1.68x        1.00x           1.68x",
+   "micro/call_simple                 64.1        63.6        64.7        63.1         36.3         34.5         1.77x        1.01x           1.78x",
+   "micro/dict_get                    16.6        16.0        16.2        16.0         11.2         11.2         1.48x        0.98x           1.44x",
+   "micro/dict_str_key                38.2        37.7        38.0        37.7         20.1         19.7         1.90x        1.00x           1.89x",
+   "micro/float_arith                  2.4         2.3         2.3         2.3          9.3          9.2         0.25x        0.99x           0.25x",
+   "micro/for_list                    16.2        16.2        16.3        16.1         16.8         16.6         0.96x        1.00x           0.97x",
+   "micro/fstring                     15.4        15.0        15.1        15.0          3.5          3.4         4.44x        0.98x           4.33x",
+   "micro/generator_iter              65.6        64.9        59.3        59.0         14.6         14.4         4.51x        0.90x           4.07x",
+   "micro/global_read                 39.0        38.9        39.3        39.0         51.6         50.0         0.76x        1.01x           0.76x",
+   "micro/hasattr_miss                 5.0         5.0         5.1         5.0          2.8          2.8         1.81x        1.01x           1.83x",
+   "micro/hash_str                    26.0        25.5        25.2        25.0          7.9          7.5         3.31x        0.97x           3.21x",
+   "micro/instance_new                26.8        26.5        26.3        26.1          5.8          5.7         4.61x        0.98x           4.54x",
+   "micro/int_arith                   70.7        69.6        70.2        69.5        144.8        144.3         0.49x        0.99x           0.49x",
+   "micro/list_append                 12.8        12.6        12.7        12.6          5.2          5.2         2.45x        0.99x           2.43x",
+   "micro/list_index                  35.4        34.9        35.3        35.0         26.6         26.0         1.33x        1.00x           1.33x",
+   "micro/listcomp_small              23.1        23.0        23.2        22.8          7.1          7.0         3.27x        1.00x           3.28x",
+   "micro/math_sqrt                   32.1        31.8        29.0        28.7          9.9          9.8         3.24x        0.90x           2.92x",
+   "micro/method_call                 25.2        24.8        24.9        24.7          8.6          8.4         2.93x        0.99x           2.89x",
+   "micro/property_read               33.0        32.4        32.6        32.4          8.7          8.7         3.78x        0.99x           3.73x",
+   "micro/range_loop                  19.4        19.2        19.3        19.0        101.2         99.2         0.19x        1.00x           0.19x",
+   "micro/str_long_len_index           7.7         7.5         7.6         7.5          7.0          6.9         1.10x        0.99x           1.08x",
+   "micro/str_methods                 50.4        45.0        49.7        44.5          7.2          7.0         7.04x        0.99x           6.94x",
+   "micro/super_call                  25.9        25.8        25.2        25.0          8.4          8.3         3.10x        0.97x           3.01x",
+   "micro/try_raise_catch             46.7        46.5        47.0        46.5          8.9          8.6         5.26x        1.01x           5.29x",
+   "micro/tuple_swap                   0.8         0.8         0.8         0.8          2.9          2.9         0.26x        1.00x           0.26x",
+   "micro/tuple_unpack                12.0        12.0        12.1        12.0          9.2          9.1         1.31x        1.01x           1.32x",
+   "macro/fib_recursive               59.4        58.0        58.5        57.9         22.4         22.2         2.65x        0.98x           2.61x",
+   "macro/json_roundtrip              13.1        12.8        13.0        12.7          7.9          7.7         1.67x        0.99x           1.65x",
+   "macro/nbody                       28.7        28.4        28.5        27.9          9.0          9.0         3.18x        0.99x           3.15x",
+   "macro/oo_simulation               54.9        54.0        54.0        53.1         13.0         12.8         4.21x        0.98x           4.14x",
+   "macro/sort_heapq                  23.9        23.5        23.9        23.7          5.9          5.8         4.04x        1.00x           4.04x",
+   "macro/torch_cnn                   44.6        43.4        44.6        44.0            -            -             -        1.00x               -  zipp-only",
+   "macro/torch_dataloader            75.2        73.9        76.2        73.8            -            -             -        1.01x               -  zipp-only",
+   "macro/torch_matmul                 4.6         4.5         4.6         4.6            -            -             -        1.00x               -  zipp-only",
+   "macro/torch_matmul_big            19.7        19.6        20.2        20.0            -            -             -        1.02x               -  zipp-only",
+   "macro/torch_mlp                   94.8        93.5        95.9        94.2            -            -             -        1.01x               -  zipp-only",
+   "macro/torch_rnn                  207.0       200.3       204.6       199.0            -            -             -        0.99x               -  zipp-only",
+   "macro/torch_small_ops            118.1       113.4       119.7       113.6            -            -             -        1.01x               -  zipp-only",
+   "macro/torch_transformer          110.9       106.7       110.1       108.1            -            -             -        0.99x               -  zipp-only",
+   "macro/word_count                  36.1        32.9        33.2        31.4         10.1         10.0         3.58x        0.92x           3.29x",
+   "geomean zipp/cpython (work_s): micro 1.65x (n=30), macro 3.08x (n=6), all 1.83x (n=36)",
+   "geomean zipp-b/zipp (work_s): micro 0.99x (n=30), macro 0.99x (n=14), all 0.99x (n=44)",
+   "geomean zipp-b/cpython (work_s): micro 1.63x (n=30), macro 3.01x (n=6), all 1.81x (n=36)",
+   "zipp process overhead (wall - work), median over programs: 21.0 ms",
+   "report -> target\\bench-results\\py-c48fc4d2-vs-9df8019c.json"
+  ],
+  "process_overhead_ms_median": {
+   "zipp": 21.6,
+   "zipp-b": 21.5,
+   "cpython": 51.9
+  },
+  "link_layout": [
+   "Transcribed from this session's run (9 October, about 20:45, machine quiet): the relinked c48fc4d2 binary was overwritten by later builds and the run was not written to a file.",
+   "pysuite.py 5 - : in-script ms, median of 5, one pinned processor, the four configurations interleaved. new-saved = target/bench-binaries/head-c48fc4d2.exe; new-relink = c48fc4d2 linked again with -C link-arg=/MAP (16,999,424 bytes against 16,990,720); old-saved / old-relink = the same pair for 131aa66c.",
+   "program           new-saved  new-relink  old-saved  old-relink",
+   "generator_iter        67.69       59.82      60.74       60.69",
+   "dict_get              16.89       24.01      17.00       16.89",
+   "math_sqrt             33.02       30.00      30.15       30.46",
+   "word_count            35.86       32.65      32.88       32.93",
+   "try_raise_catch       43.19       45.05      47.28       47.49",
+   "geomean over the 36 programs CPython also runs, relative to new-saved: new-relink 1.004, old-saved 0.997, old-relink 0.997",
+   "pyab.py 7 dict_get: saved 16.62, relink 23.98, saved with ZIPP_PY_JIT=0 25.41, relink with ZIPP_PY_JIT=0 25.43",
+   "pyab.py 15 generator_iter: 131aa66c 60.88, 131aa66c with ZIPP_PY_JIT=0 67.33, c48fc4d2 67.28, c48fc4d2 with ZIPP_PY_JIT=0 66.99",
+   "Both binaries log one compiled region for each row: \"[jit] PY region fn2330 [79,158] compiled through 246 (139 ips)\" for dict_get."
+  ],
+  "jit_policy_switches": [
+   "pysuite.py 5 - : in-script time of the 36 programs CPython also runs, 9df8019c, median of 5, ratio of geomeans to the plain run",
+   "geomean                                                                   1.007     1.059"
+  ],
+  "code_cache_check": [
+   "ZIPP_CACHE_DIR set to an empty folder; tools/python_bench.py --no-cpython --reps 1 over the whole suite (torch programs included), twice, on 7bde65ac",
+   "after pass 1: 24 entries, 12968634 bytes",
+   "after pass 2: 24 entries, 12968634 bytes",
+   "names, sizes and modification times identical after the second pass: it wrote nothing"
+  ]
+ },
+ "test262": {
+  "files": 49952,
+  "executions": 95680,
+  "counts": {
+   "pass": 95671,
+   "fail": 9,
+   "skip": 0
+  },
+  "unexpected_failures": [],
+  "stale_expectations": [],
+  "gate_passed": true,
+  "corpus_note": "the local corpus is an exported tree under target/, so the runner reports the engine repository commit as its revision; tools/test262-expected-failures.txt pins corpus 4249661388e5d3f92a85186213da140a6481490f"
+ },
+ "gates_log": [
+  "[23:37:55] tree: 0 changed files; binary 9df8019c dirty= False",
+  "[23:37:55] test262 start",
+  "[23:47:50] test262 rc=0 : PASS 95671  FAIL 9  SKIP 0   pass-rate 99.991% of 95680 executions gate: PASS (0 unexpected failures, 0 stale expectations, 0 skips)",
+  "[23:47:50] full zipp-vm suite start",
+  "[00:33:50] full suite rc=0 : 307 binaries ok, 0 failed; 2179 passed, 0 failed, 22 ignored",
+  "[00:33:50] zipp-cli suite start",
+  "[00:37:45] zipp-cli rc=0 : 80 passed, 0 failed, 1 ignored",
+  "[00:37:45] python-feature library tests start",
+  "[00:38:33] python lib rc=0 : test result: ok. 619 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 18.16s",
+  "[00:38:33] regex crate tests start",
+  "[00:38:51] regress rc=0 : 108 passed, 0 failed, 1 ignored",
+  "[00:38:52] check -D warnings [] rc=0",
+  "[00:39:03] check -D warnings [--no-default-features --features safe-sandbox] rc=0",
+  "[00:39:19] check -D warnings [--features python] rc=0",
+  "[00:39:19] check -D warnings [--no-default-features --features wasm-lite] rc=0",
+  "[00:39:29] sandbox workspace check --locked rc=0",
+  "[00:40:10] boundary javascript rc=0 : 35 of 35 boundary checks passed",
+  "[00:41:15] boundary lite rc=0 : 35 of 35 boundary checks passed",
+  "[00:41:56] boundary python rc=1 : 33 of 35 boundary checks passed === audit-2026-09-15-ml-transport.cjs: FAILED (exit 1) === python-gpu.cjs: FAILED (exit 1)",
+  "[00:42:41] boundary all rc=0 : 35 of 35 boundary checks passed",
+  "[00:42:41] pkg restored; ALL GATES DONE"
+ ]
+}

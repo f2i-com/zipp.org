@@ -1,5 +1,39 @@
 # Zipp performance handoff
 
+### 9 October: Python start, compact Unicode tables and eleventh size pass (local)
+
+`codex/engine-size-reduction` is 11 commits past the tenth pass (`baf077c3`),
+unpushed, every commit `[skip ci]`. The four WebAssembly modules are 1.9% to
+5.5% smaller raw and 1.6% to 4.4% smaller after Brotli than the tenth pass's:
+Unicode normalization moved from the `unicode-normalization` crate's hashed
+tables to ranked bitmaps in `src/unorm.rs`, and the regex properties of
+strings share one pool. `zipp py` reads a project's data files when the
+program opens them (a script run from this repository's root takes 62 ms
+instead of 460) and its code cache is bounded; `zipp js` and `zipp py` leave
+the heap to the process's exit, which takes 1.4% off the 13 native rows.
+Measurements, gates and the evidence file are in
+[the eleventh-pass note](docs/validation/2026-10-09-engine-size-round11.md).
+
+Open:
+
+- The modules are not accepted packages. By the ninth pass's rule only
+  JavaScript passes its screen; Lite, Python-base and Python + Torch each
+  have rows flagged, a different set in each, on code that did not change.
+  Python-base promise-resolve is 8% to 11% slower in the paired screen and
+  1.5% slower run alone, and the string-set packing (`ba63d8a0`) accounts
+  for 6% of it there while speeding a JavaScript string loop by 6%.
+- A single row of the WebAssembly screen, or of the Python suite, can move by
+  10% (dict_get: 42%) between two builds whose hot code is identical. Why a
+  compiled Python loop's helper calls, or a module's promise path, depend on
+  placement is not known. An untested place to start is the alignment of
+  the statics those paths read.
+- `normalize()` is 34% slower natively on accented Latin (29% in Lite) and
+  faster on ASCII, Hangul and CJK. A quick check for text already in the
+  requested form is the usual remedy and is not implemented.
+- A cached Python start spends about 30% of its 18 ms decoding the runtime:
+  2,300 functions, each with its own vectors, strings and source text.
+- The tenth pass's open items below still stand, except generator_iter.
+
 ### 9 October: call-order speed recovery and tenth size pass (local)
 
 `codex/engine-size-reduction` is 20 commits past `ec0839ce`, unpushed, every
@@ -22,9 +56,9 @@ Open:
 - parse-large-js is still 7% behind the relaxed diagnostic order: its scanner
   regions engage six GPR homes with captured `charCodeAt` pairs and nine with
   fused calls.
-- Python generator_iter is 7% to 11% slower from `436116b6` on. That commit's
-  behaviour is not the cause (its off switch changes nothing); the compiled
-  loop stopped beating the interpreter and the reason was not found.
+- Python generator_iter read 11% slower from `436116b6` on. That is link
+  layout, not the source: `c48fc4d2` linked a second time runs it at the
+  earlier speed (see the 9 October eleventh-pass entry above).
 - CI has not run the `remap-paths.sh` workflow steps, nor the default-feature
   MSVC link with `/DELAYLOAD` and `delayimp.lib`.
 - Python is at 1.80x of CPython 3.13 on in-script time.
@@ -1361,11 +1395,9 @@ node tests/node/bench-density.cjs
    still convert `from` and the result through `unit_byte_bounds` on the
    `&str` view. (b) The preflight audit stride is proportional (B275);
    dirty-holder accounting at `Heap::get_mut` is the exact successor.
-   (c) `embed::compile_script` leaks its `Program` under `safe-sandbox`
-   (the `Drop` reclaim is `cfg(not(safe-sandbox))`), so a host that
-   creates many `Engine`s in one wasm instance never gets that memory back;
-   a safe self-referential holder or a program arena is the fix, and a
-   repeated create/dispose test should track allocator live bytes.
+   (c) Done: `embed::compile_script` no longer leaks its `Program` under
+   `safe-sandbox`; `OwnedVm` holds the program and the VM in one allocation
+   (the 11 September audit's ZIPP-06).
 
 ## Commands for the next session
 
