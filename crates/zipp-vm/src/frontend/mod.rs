@@ -205,11 +205,44 @@ pub fn prewarm_python() -> Result<(), String> {
     #[cfg(not(feature = "python"))]
     Err("Python support is not built; enable the `python` Cargo feature".into())
 }
+/// A file of a Python program's virtual filesystem: its bytes, or a reader
+/// the host is asked for them with when the program first reads the file.
+pub use crate::bytecode::PyFile as PythonFile;
+
+/// [`compile_python_script`] with each file given as a [`PythonFile`], so a
+/// host that runs a script inside a large folder can leave a file on disk
+/// until the program opens it.
+pub fn compile_python_script_files(
+    entry: &str,
+    entry_file: &str,
+    modules: &[(String, &str)],
+    files: Vec<(String, PythonFile)>,
+    argv: &[String],
+    hosted: bool,
+) -> Result<CompiledSource, String> {
+    compile_python_entry_files(entry, Some(entry_file), modules, files, argv, hosted)
+}
+
 fn compile_python_entry<S: AsRef<str>>(
     entry: &str,
     entry_file: Option<&str>,
     modules: &[(String, S)],
     files: &[(String, Vec<u8>)],
+    argv: &[String],
+    hosted: bool,
+) -> Result<CompiledSource, String> {
+    let files = files
+        .iter()
+        .map(|(path, bytes)| (path.clone(), PythonFile::Bytes(bytes.as_slice().into())))
+        .collect();
+    compile_python_entry_files(entry, entry_file, modules, files, argv, hosted)
+}
+
+fn compile_python_entry_files<S: AsRef<str>>(
+    entry: &str,
+    entry_file: Option<&str>,
+    modules: &[(String, S)],
+    files: Vec<(String, PythonFile)>,
     argv: &[String],
     hosted: bool,
 ) -> Result<CompiledSource, String> {

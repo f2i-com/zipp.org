@@ -555,3 +555,73 @@ fn a_relative_import_with_no_parent_package_is_refused() {
         .expect_err("should refuse");
     assert!(error.contains("no known parent package"), "{error}");
 }
+
+/// `compile_python_script_files`: a deferred file is read when the program
+/// first reads it, once, and never when the program does not. A reader that
+/// answers nothing, or more than the per-file limit, reads as a missing file.
+#[test]
+fn deferred_files_are_read_on_first_use() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use zipp_vm::frontend::{compile_python_script_files, PythonFile};
+    let main = "import os\n\
+                print(os.path.exists('a.txt'), os.path.exists('gone.txt'), os.path.exists('nope.txt'))\n\
+                print(sorted(os.listdir('.')))\n\
+                print(open('a.txt').read(), open('a.txt').read())\n\
+                print(os.path.getsize('b.bin'), open('b.bin', 'rb').read()[:3])\n\
+                for name in ('gone.txt', 'big.bin'):\n    \
+                    try:\n        open(name, 'rb')\n    \
+                    except FileNotFoundError:\n        print('missing', name)\n\
+                with open('a.txt', 'w') as f:\n    f.write('new')\n\
+                print(open('a.txt').read())\n";
+    let counts: Vec<Arc<AtomicUsize>> = (0..5).map(|_| Arc::default()).collect();
+    let deferred = |k: usize, size: usize, answer: Option<Vec<u8>>| {
+        let count = Arc::clone(&counts[k]);
+        PythonFile::Deferred {
+            size,
+            read: Arc::new(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+                answer.clone()
+            }),
+        }
+    };
+    let files = vec![
+        ("a.txt".to_owned(), deferred(0, 3, Some(b"old".to_vec()))),
+        ("b.bin".to_owned(), deferred(1, 4, Some(vec![1, 2, 3, 4]))),
+        ("never.txt".to_owned(), deferred(2, 5, Some(b"never".to_vec()))),
+        ("gone.txt".to_owned(), deferred(3, 1, None)),
+        ("big.bin".to_owned(), deferred(4, 1, Some(vec![0; 8 * 1024 * 1024 + 1]))),
+        ("main.py".to_owned(), PythonFile::Bytes(main.as_bytes().into())),
+    ];
+    let out = big_stack(move || {
+        let mut compiled = compile_python_script_files(
+            "main",
+            "main.py",
+            &[("main".to_owned(), main)],
+            files,
+            &[],
+            false,
+        )?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        Ok::<_, String>(state.take_output())
+    })
+    .unwrap();
+    assert_eq!(
+        out,
+        vec![
+            "True True False",
+            "['a.txt', 'b.bin', 'big.bin', 'gone.txt', 'main.py', 'never.txt']",
+            "old old",
+            "4 b'\\x01\\x02\\x03'",
+            "missing gone.txt",
+            "missing big.bin",
+            "new",
+        ]
+    );
+    let reads: Vec<usize> = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    // Read once however often the program opens them; never when it does not.
+    assert_eq!(reads[..3], [1, 1, 0], "{reads:?}");
+    assert!(reads[3] >= 1 && reads[4] >= 1, "{reads:?}");
+}

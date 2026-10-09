@@ -3,9 +3,11 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use zipp_vm::embed::{ConsoleStream, ScriptGoal, ScriptState};
 use zipp_vm::frontend::{
-    compile_python_script, compile_source, detect_language, Frontend, LanguageId, PythonMode,
+    compile_python_script_files, compile_source, detect_language, Frontend, LanguageId,
+    PythonFile, PythonMode,
 };
 
 pub(super) fn try_run(args: &[String]) -> Option<Result<(), String>> {
@@ -613,6 +615,32 @@ fn collect_tree(root: &Path, first: Option<&Path>) -> Tree {
     tree
 }
 
+/// The reader of a project file left on disk: its bytes when the program
+/// first reads it, under the checks the walk applied (a regular file below
+/// the root with no link in its path, within the per-file limit). A file
+/// that fails them now is recorded in `unread` and reads as missing.
+fn deferred_read(
+    root: &Path,
+    relative: &str,
+    unread: &Arc<Mutex<Vec<String>>>,
+) -> Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync> {
+    let (root, relative, unread) = (root.to_path_buf(), relative.to_owned(), Arc::clone(unread));
+    Arc::new(move || {
+        let read = checked_project_path(&root, &relative, false).ok().and_then(|target| {
+            let mut bytes = Vec::new();
+            std::fs::File::open(&target)
+                .and_then(|f| f.take(VFS_FILE_LIMIT + 1).read_to_end(&mut bytes))
+                .ok()
+                .filter(|_| bytes.len() as u64 <= VFS_FILE_LIMIT)
+                .map(|_| bytes)
+        });
+        if read.is_none() {
+            unread.lock().unwrap_or_else(|e| e.into_inner()).push(relative.clone());
+        }
+        read
+    })
+}
+
 /// The dotted module name of a root-relative `.py` path.
 fn module_name_of(relative: &str) -> Option<String> {
     let path = Path::new(relative);
@@ -711,7 +739,14 @@ fn run_project(
         };
         (!in_entry_folder, !is_python_path(Path::new(relative)))
     });
-    let mut files = Vec::new();
+    // Python files are read now: any of them may be imported, and a module
+    // is compiled from its text. Every other file stays on disk until the
+    // program reads it, so a script run inside a large checkout does not
+    // read the checkout first; the size the walk saw is what the limits
+    // count, and a file that cannot be read when the program gets to it
+    // reads as missing and is reported when the run ends.
+    let mut files: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+    let mut deferred_sizes: Vec<u64> = Vec::new();
     let mut loaded = HashSet::new();
     // Indices into `files` of the other `.py` files that are UTF-8 text.
     let mut python_files: Vec<usize> = Vec::new();
@@ -728,6 +763,13 @@ fn run_project(
             over_limits.push(relative);
             continue;
         }
+        if !is_py {
+            total += size;
+            loaded.insert(disk_key(&relative));
+            files.push((relative, None));
+            deferred_sizes.push(size);
+            continue;
+        }
         // A file that cannot be read (gone, locked, unreadable) is left out.
         let mut bytes = Vec::new();
         let readable = std::fs::File::open(&path)
@@ -737,19 +779,17 @@ fn run_project(
             tree.unreadable.push(relative);
             continue;
         }
-        if bytes.len() as u64 > VFS_FILE_LIMIT
-            || total + bytes.len() as u64 > VFS_TOTAL_LIMIT
-            || (is_py && bytes.len() as u64 > MODULE_LIMIT)
-        {
+        if total + bytes.len() as u64 > VFS_TOTAL_LIMIT || bytes.len() as u64 > MODULE_LIMIT {
             over_limits.push(relative);
             continue;
         }
         total += bytes.len() as u64;
-        if is_py && relative != entry_file && std::str::from_utf8(&bytes).is_ok() {
+        if relative != entry_file && std::str::from_utf8(&bytes).is_ok() {
             python_files.push(files.len());
         }
         loaded.insert(disk_key(&relative));
-        files.push((relative, bytes));
+        files.push((relative, Some(bytes)));
+        deferred_sizes.push(0);
     }
     // Module names: the entry, then the script folder's files by their bare
     // names (the script's folder comes first, as `sys.path[0]` does), then
@@ -781,7 +821,11 @@ fn run_project(
         }
         let source = match index {
             // Checked to be UTF-8 when the file was loaded.
-            Some(i) => std::str::from_utf8(&files[i].1).unwrap_or_default(),
+            Some(i) => files[i]
+                .1
+                .as_deref()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .unwrap_or_default(),
             None => entry_source.as_str(),
         };
         taken.insert(name.clone());
@@ -807,8 +851,24 @@ fn run_project(
         &format!("Python file(s) past the {MODULE_COUNT_LIMIT}-module limit cannot be imported"),
         &unimportable,
     );
+    // Files that could not be read when the program got to them.
+    let unread: Arc<Mutex<Vec<String>>> = Arc::default();
+    let vfs: Vec<(String, PythonFile)> = files
+        .iter()
+        .zip(&deferred_sizes)
+        .map(|((relative, bytes), &size)| {
+            let file = match bytes {
+                Some(bytes) => PythonFile::Bytes(bytes.as_slice().into()),
+                None => PythonFile::Deferred {
+                    size: size as usize,
+                    read: deferred_read(root, relative, &unread),
+                },
+            };
+            (relative.clone(), file)
+        })
+        .collect();
     let mut compiled =
-        compile_python_script(&entry, &entry_file, &modules, &files, argv, false)?;
+        compile_python_script_files(&entry, &entry_file, &modules, vfs, argv, false)?;
     drop(modules);
     drop(files);
     let state = compiled.state_mut();
@@ -820,6 +880,19 @@ fn run_project(
     // program's own failure (and its traceback) is the run's result even
     // when some of its changes could not be written, and it is reported
     // first.
+    // A file the program could not read was never loaded into it: like one
+    // left out at the start, the program saw it as missing and may not
+    // replace contents it never read.
+    let mut unread = std::mem::take(&mut *unread.lock().unwrap_or_else(|e| e.into_inner()));
+    unread.sort();
+    unread.dedup();
+    for relative in &unread {
+        loaded.remove(&disk_key(relative));
+    }
+    note_left_out(
+        "file(s) could not be read when the program opened them (it saw them as missing)",
+        &unread,
+    );
     let refused = match state.call_global("__zipp_py_vfs_changed", &[]) {
         Ok(zipp_vm::embed::JsValue::String(listing)) => {
             write_project_changes(root, &listing, &loaded)?

@@ -2091,8 +2091,19 @@ var __zipp_py = (function () {
     // ---- the virtual filesystem ------------------------------------------------------------
     // Files the host gave the program (root-relative paths, bytes) plus
     // whatever it writes. Nothing here touches a real disk; the host reads
-    // the changes back through `__zipp_py_vfs_changed`.
+    // the changes back through `__zipp_py_vfs_changed`. A host file is held
+    // as its index until the program first reads it (`__zipp_py_vfs_read`):
+    // a project folder's files cost nothing unless they are opened. One the
+    // host can no longer read reads as missing.
     const vfs = new Map(), vfsChanged = new Set();
+    const vfsRead = function (n) {
+        let bytes = vfs.get(n);
+        if (typeof bytes === "number") {
+            bytes = __zipp_py_vfs_read(bytes);
+            if (bytes !== undefined) vfs.set(n, bytes);
+        }
+        return bytes;
+    };
     const vfsNorm = function (p) {
         p = String(p).replace(/\\/g, "/");
         const parts = [], segs = p.split("/");
@@ -2102,7 +2113,7 @@ var __zipp_py = (function () {
     rt.vfs = {
         norm: vfsNorm,
         has: (p) => vfs.has(vfsNorm(p)),
-        get: (p) => vfs.get(vfsNorm(p)),
+        get: (p) => vfsRead(vfsNorm(p)),
         set: (p, bytes) => { const n = vfsNorm(p); vfs.set(n, bytes); vfsChanged.add(n); return n; },
         remove: (p) => { const n = vfsNorm(p); const had = vfs.delete(n); if (had) vfsChanged.add(n); return had; },
         isDir: (p) => { const n = vfsNorm(p); if (n === "") return true; const prefix = n + "/"; for (const k of vfs.keys()) if (k.startsWith(prefix)) return true; return dirs.has(n); },
@@ -2151,8 +2162,8 @@ var __zipp_py = (function () {
         }));
         return m;
     });
-    R.vfs = function (path, base64) {
-        vfs.set(vfsNorm(path), Uint8Array.fromBase64(base64));
+    R.vfs = function (path, index) {
+        vfs.set(vfsNorm(path), index);
         return null;
     };
     rt.argv = [];

@@ -473,3 +473,103 @@ fn stdout_and_stderr_keep_production_order() {
         "one\ntwo\nthree\nfour\nfive\n"
     );
 }
+
+/// Makes `path` unreadable for the test's duration where the platform and
+/// the account allow it; `unreadable` says whether a read really fails (an
+/// administrator and root read through the denial).
+struct Unreadable {
+    path: PathBuf,
+    unreadable: bool,
+}
+impl Unreadable {
+    fn new(path: PathBuf) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let user = std::env::var("USERNAME").unwrap();
+            let _ = Command::new("icacls")
+                .arg(&path)
+                .args(["/deny", &format!("{user}:(R)")])
+                .output();
+        }
+        let unreadable = fs::read(&path).is_err();
+        Self { path, unreadable }
+    }
+}
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o644));
+        }
+        #[cfg(windows)]
+        if let Ok(user) = std::env::var("USERNAME") {
+            let _ = Command::new("icacls")
+                .arg(&self.path)
+                .args(["/remove:d", &user])
+                .output();
+        }
+    }
+}
+
+/// A data file stays on disk until the program opens it, so one the program
+/// never opens is not read at all: an unreadable one costs nothing and is
+/// not mentioned.
+#[test]
+fn a_data_file_the_program_never_opens_is_not_read() {
+    let f = Fixture::new("lazy-unopened");
+    f.write(
+        "main.py",
+        "import os\nprint(open('data.txt').read(), os.path.exists('secret.dat'))\n",
+    );
+    f.write("data.txt", "data");
+    f.write("secret.dat", "secret");
+    let secret = Unreadable::new(f.0.join("secret.dat"));
+    let output = f.zipp(&["py", "main.py"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "data True\n");
+    if secret.unreadable {
+        assert_eq!(stderr(&output), "");
+    }
+}
+
+/// A data file that cannot be read when the program opens it reads as
+/// missing, is reported when the run ends, and is not replaced by what the
+/// program then writes to that name: the program never saw its contents.
+#[test]
+fn a_data_file_that_cannot_be_read_when_opened_is_missing_and_kept() {
+    let f = Fixture::new("lazy-unreadable");
+    f.write(
+        "main.py",
+        "try:\n    open('secret.dat')\nexcept FileNotFoundError:\n    print('missing')\n\
+         with open('secret.dat', 'w') as out:\n    out.write('replaced')\n\
+         with open('other.txt', 'w') as out:\n    out.write('written')\n",
+    );
+    f.write("secret.dat", "secret");
+    let secret = Unreadable::new(f.0.join("secret.dat"));
+    let output = f.zipp(&["py", "main.py"]);
+    let unreadable = secret.unreadable;
+    drop(secret);
+    if !unreadable {
+        // The account reads through the denial: the file is an ordinary one.
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(f.read("secret.dat"), "replaced");
+        return;
+    }
+    assert_eq!(stdout(&output), "missing\n");
+    let errors = stderr(&output);
+    assert!(
+        errors.contains("could not be read when the program opened them (it saw them as missing): secret.dat"),
+        "{errors}"
+    );
+    assert!(errors.contains("not written back: secret.dat"), "{errors}");
+    assert!(!output.status.success());
+    assert_eq!(f.read("secret.dat"), "secret");
+    // The refusal does not stop the program's other changes.
+    assert_eq!(f.read("other.txt"), "written");
+}

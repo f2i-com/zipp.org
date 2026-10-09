@@ -11,6 +11,12 @@
 //! they live as long as the program does and are freed with it. The native
 //! is bound by slot only in the program the Python frontend built, like the
 //! other `__zipp_py_*` natives.
+//!
+//! `__zipp_py_vfs_read(index)`: the bytes of a file the host gave the
+//! program (`PyLazy::files`), asked for when the program first reads it.
+//! The entry code names every path with its index and nothing else, so a
+//! project's files are neither copied into the heap nor decoded until one
+//! is opened.
 use super::*;
 
 impl<'p> Vm<'p> {
@@ -54,5 +60,38 @@ impl<'p> Vm<'p> {
         let code = Value::heap(self.heap.alloc(HeapObj::Func(top)));
         self.realm_tag_new(code.heap_index());
         Ok(code)
+    }
+
+    /// File `index` of the program's virtual filesystem as a fresh
+    /// `Uint8Array`, or `undefined` when there is no such file or the host
+    /// can no longer read it.
+    pub(super) fn py_vfs_read(&mut self, index: Value) -> Result<Value, Thrown> {
+        let program: &'p crate::bytecode::Program = self.program;
+        let index = self.to_number(index)?;
+        let file = program
+            .python_lazy
+            .as_deref()
+            .filter(|_| index >= 0.0 && index.fract() == 0.0)
+            .and_then(|lazy| lazy.files.get(index as usize));
+        let read;
+        let bytes: &[u8] = match file {
+            Some(crate::bytecode::PyFile::Bytes(bytes)) => bytes,
+            Some(crate::bytecode::PyFile::Deferred { read: source, .. }) => match source() {
+                // A file that grew past the limit since the host listed it
+                // is refused, as it would have been when listed.
+                Some(bytes) if bytes.len() <= crate::bytecode::PY_VFS_FILE_LIMIT => {
+                    read = bytes;
+                    &read
+                }
+                _ => return Ok(Value::UNDEFINED),
+            },
+            None => return Ok(Value::UNDEFINED),
+        };
+        self.preflight_native_iteration_work(bytes.len() as u64)?;
+        let buffer = self.alloc_array_buffer(bytes.len())?;
+        if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
+            data.copy_from_slice(bytes);
+        }
+        Ok(self.alloc_typed_array(buffer, 1, 0, bytes.len()))
     }
 }

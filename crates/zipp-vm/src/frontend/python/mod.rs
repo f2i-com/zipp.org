@@ -184,11 +184,11 @@ fn library() -> Vec<LibModule> {
 
 /// A single-file program: the source is the `main` module.
 pub(super) fn compile(source: &str) -> R<Program> {
-    compile_project("main", None, &[("main".to_owned(), source)], &[], &[], false)
+    compile_project("main", None, &[("main".to_owned(), source)], Vec::new(), &[], false)
 }
 
 /// Bounds on the virtual filesystem a program is compiled with.
-const MAX_VFS_FILE: usize = 8 * 1024 * 1024;
+const MAX_VFS_FILE: usize = crate::bytecode::PY_VFS_FILE_LIMIT;
 const MAX_VFS_TOTAL: usize = 64 * 1024 * 1024;
 
 /// The head (first segment) of a dotted module name.
@@ -390,7 +390,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
     entry: &str,
     entry_file: Option<&str>,
     modules: &[(String, S)],
-    files: &[(String, Vec<u8>)],
+    files: Vec<(String, crate::bytecode::PyFile)>,
     argv: &[String],
     hosted: bool,
 ) -> R<Program> {
@@ -418,7 +418,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
         ));
     }
     let mut total = 0usize;
-    for (path, bytes) in files {
+    for (path, bytes) in &files {
         if bytes.len() > MAX_VFS_FILE {
             return Err(format!("Python project: file {path:?} exceeds 8 MiB"));
         }
@@ -596,16 +596,21 @@ pub(super) fn compile_project<S: AsRef<str>>(
     out.helper("entry", &[name])?;
     let hosted_r = out.boolean(hosted)?;
     out.helper("hosted", &[hosted_r])?;
-    // The virtual filesystem: each file's bytes as a base64 string constant,
-    // which the runtime decodes natively (`Uint8Array.fromBase64`) rather
-    // than copying byte by byte in interpreted code. Paths and contents are
-    // distinct constants, never searched for a duplicate.
-    for (path, bytes) in files {
+    // The virtual filesystem: each path with its index in `PyLazy::files`.
+    // The bytes stay with the program, and the runtime asks for a file's
+    // when the program first reads it (`__zipp_py_vfs_read`): a project
+    // folder's files used to be base64 string constants decoded at start,
+    // which cost a script run from a large checkout most of its run time.
+    // Paths are distinct constants, never searched for a duplicate.
+    let mut file_bytes = Vec::with_capacity(files.len());
+    for (index, (path, bytes)) in files.into_iter().enumerate() {
         let mark = out.mark();
-        let path_r = out.unique_string(path.clone())?;
-        let data_r = out.unique_string(base64(bytes))?;
-        out.helper("vfs", &[path_r, data_r])?;
+        let path_r = out.unique_string(path)?;
+        let index = i32::try_from(index).map_err(|_| "Python project: too many files")?;
+        let index_r = out.small_int(index)?;
+        out.helper("vfs", &[path_r, index_r])?;
         out.release(mark);
+        file_bytes.push(bytes);
     }
     let mut argv_regs = Vec::with_capacity(argv.len());
     for arg in argv {
@@ -636,6 +641,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
                 installed: std::sync::OnceLock::new(),
             })
             .collect(),
+        files: file_bytes,
     }));
     Ok(program)
 }
@@ -1034,25 +1040,6 @@ fn compile_runtime_seed(packages: &[&crate::python_packages::Installed]) -> R<Ru
         rt_slot,
         line_slot,
     })
-}
-
-/// Standard padded base64, the form `Uint8Array.fromBase64` decodes.
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (chunk[0] as u32) << 16
-            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
-            | *chunk.get(2).unwrap_or(&0) as u32;
-        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
-            out.push(if i <= chunk.len() {
-                TABLE[(n >> shift) as usize & 63] as char
-            } else {
-                '='
-            });
-        }
-    }
-    out
 }
 
 /// `file:line:col` (1-based, columns in characters) of a byte offset in `source`.

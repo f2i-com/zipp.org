@@ -324,6 +324,13 @@ pub const PY_TENSOR_NAME: &str = "__zipp_py_native";
 pub const PY_COMPILE: u16 = 1990;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_COMPILE_NAME: &str = "__zipp_py_compile";
+/// The Python runtime's first read of a file the host gave the program
+/// (`vm::py_lazy`): its bytes, by the file's index in `PyLazy::files`.
+/// Bound like [`PY_TENSOR`], only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_VFS_READ: u16 = 1991;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_VFS_READ_NAME: &str = "__zipp_py_vfs_read";
 /// The Python runtime's string query (`vm::py_ops`): whether a string holds
 /// any UTF-16 surrogate unit, answered from the heap string's ASCII flag
 /// when it can be. Bound like [`PY_TENSOR`], only in a Python program.
@@ -1734,6 +1741,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PY_TENSOR => ("", 0),
         #[cfg(feature = "python")]
         PY_COMPILE => ("", 1),
+        #[cfg(feature = "python")]
+        PY_VFS_READ => ("", 1),
         #[cfg(feature = "python")]
         PY_STR => ("", 1),
         #[cfg(feature = "python")]

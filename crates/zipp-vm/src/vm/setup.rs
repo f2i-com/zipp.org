@@ -2972,6 +2972,16 @@ impl<'p> Vm<'p> {
                 .program
                 .global_names
                 .iter()
+                .position(|name| name == native::PY_VFS_READ_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let read = self.heap.alloc(HeapObj::Native(native::PY_VFS_READ));
+                self.globals[slot] = Value::heap(read);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
                 .position(|name| name == native::PY_BIND_NAME);
             if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
                 let bind = self.heap.alloc(HeapObj::Native(native::PY_BIND));

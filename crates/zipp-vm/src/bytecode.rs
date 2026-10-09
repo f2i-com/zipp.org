@@ -3252,6 +3252,56 @@ pub struct PyLazy {
     pub rt_slot: u32,
     pub line_slot: u32,
     pub modules: Vec<PyLazyModule>,
+    /// The program's virtual filesystem, by the index its entry code names
+    /// each path with. The runtime asks for a file's bytes when the program
+    /// first reads it (the hidden native `__zipp_py_vfs_read`), so a file
+    /// the program never opens costs it nothing.
+    pub files: Vec<PyFile>,
+}
+
+/// One file of a [`PyLazy`]'s virtual filesystem.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub enum PyFile {
+    /// The bytes, as the host gave them.
+    Bytes(std::sync::Arc<[u8]>),
+    /// Read by the host when the program first reads the file.
+    Deferred {
+        /// The file's size when the host listed it, which is what the
+        /// filesystem's limits count.
+        size: usize,
+        /// The bytes now. `None`: the file is no longer there, or can no
+        /// longer be read. A result over [`PY_VFS_FILE_LIMIT`] is refused.
+        read: std::sync::Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>,
+    },
+}
+
+/// The largest file a Python program's virtual filesystem holds.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_VFS_FILE_LIMIT: usize = 8 * 1024 * 1024;
+
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+impl PyFile {
+    /// The size the filesystem's limits count the file as.
+    pub fn len(&self) -> usize {
+        match self {
+            PyFile::Bytes(bytes) => bytes.len(),
+            PyFile::Deferred { size, .. } => *size,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::fmt::Debug for PyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PyFile::Bytes(bytes) => write!(f, "PyFile::Bytes({} bytes)", bytes.len()),
+            PyFile::Deferred { size, .. } => write!(f, "PyFile::Deferred({size} bytes)"),
+        }
+    }
 }
 
 /// One module of a [`PyLazy`].
