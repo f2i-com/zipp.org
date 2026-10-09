@@ -271,9 +271,12 @@ impl<'p> Vm<'p> {
         self.py_hint_field(h, idx, key)
     }
 
-    /// A primitive str with no lone surrogate: its bytes and whether it is
-    /// ASCII.
-    fn py_strm_str(&mut self, v: Value) -> Option<(Vec<u8>, bool)> {
+    /// A primitive str with no lone surrogate, flattened in place: its heap
+    /// slot and whether it is ASCII. The bytes are then read where they
+    /// live ([`Vm::py_strm_bytes`]) once every operand has been flattened --
+    /// each method used to copy its receiver and every str argument into a
+    /// fresh buffer before doing any work.
+    fn py_strm_flat(&mut self, v: Value) -> Option<(u32, bool)> {
         if !v.is_heap() || !self.heap.is_str_like(v.heap_index()) {
             return None;
         }
@@ -283,7 +286,15 @@ impl<'p> Vm<'p> {
             return None;
         };
         let ascii = s.is_ascii();
-        (ascii || s.is_wellformed()).then(|| (s.as_bytes().to_vec(), ascii))
+        (ascii || s.is_wellformed()).then_some((idx, ascii))
+    }
+
+    /// The bytes of a str [`Vm::py_strm_flat`] admitted.
+    fn py_strm_bytes(&self, idx: u32) -> &[u8] {
+        match self.heap.get(idx) {
+            HeapObj::Str(s) => s.as_bytes(),
+            _ => &[],
+        }
     }
 
     fn py_strm_new(&mut self, bytes: Vec<u8>) -> Value {
@@ -353,98 +364,127 @@ impl<'p> Vm<'p> {
             }
             _ => {}
         }
-        let (s, ascii) = self.py_strm_str(*args.first()?)?;
+        let (s_idx, ascii) = self.py_strm_flat(*args.first()?)?;
+        let n = self.py_strm_bytes(s_idx).len() as u64;
         let out = match (op, args.len()) {
             (1..=3, 2) => {
-                let (chars, _) = self.py_strm_str(args[1])?;
-                let set = String::from_utf8(chars).ok()?;
-                let text = std::str::from_utf8(&s).ok()?;
-                let cut = |c: char| set.contains(c);
-                let r = match op {
-                    1 => text.trim_matches(cut),
-                    2 => text.trim_start_matches(cut),
-                    _ => text.trim_end_matches(cut),
+                let (chars_idx, _) = self.py_strm_flat(args[1])?;
+                let trimmed = {
+                    let set = std::str::from_utf8(self.py_strm_bytes(chars_idx)).ok()?;
+                    let text = std::str::from_utf8(self.py_strm_bytes(s_idx)).ok()?;
+                    let cut = |c: char| set.contains(c);
+                    let r = match op {
+                        1 => text.trim_matches(cut),
+                        2 => text.trim_start_matches(cut),
+                        _ => text.trim_end_matches(cut),
+                    };
+                    (r.len() != text.len()).then(|| r.as_bytes().to_vec())
                 };
-                if r.len() == text.len() {
-                    return Some(args[0]);
+                match trimmed {
+                    None => return Some(args[0]),
+                    Some(bytes) => self.py_strm_new(bytes),
                 }
-                self.py_strm_new(r.as_bytes().to_vec())
             }
             (4, 1) => {
                 if !ascii {
                     return None;
                 }
-                let parts: Vec<&[u8]> = s.split(|&b| js_space(b)).filter(|p| !p.is_empty()).collect();
-                let parts: Vec<Vec<u8>> = parts.into_iter().map(|p| p.to_vec()).collect();
+                let parts: Vec<Vec<u8>> = self
+                    .py_strm_bytes(s_idx)
+                    .split(|&b| js_space(b))
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_vec())
+                    .collect();
                 return self.py_strm_list(this, parts);
             }
             (4, 2) => {
-                let (sep, _) = self.py_strm_str(args[1])?;
-                if sep.is_empty() {
-                    return None;
-                }
-                let mut parts = Vec::new();
-                let mut start = 0;
-                let mut i = 0;
-                while i + sep.len() <= s.len() {
-                    if s[i..i + sep.len()] == sep[..] {
-                        parts.push(s[start..i].to_vec());
-                        i += sep.len();
-                        start = i;
-                    } else {
-                        i += 1;
+                let (sep_idx, _) = self.py_strm_flat(args[1])?;
+                let parts = {
+                    let s = self.py_strm_bytes(s_idx);
+                    let sep = self.py_strm_bytes(sep_idx);
+                    if sep.is_empty() {
+                        return None;
                     }
-                }
-                parts.push(s[start..].to_vec());
+                    let mut parts = Vec::new();
+                    let mut start = 0;
+                    let mut i = 0;
+                    while i + sep.len() <= s.len() {
+                        if s[i..i + sep.len()] == sep[..] {
+                            parts.push(s[start..i].to_vec());
+                            i += sep.len();
+                            start = i;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    parts.push(s[start..].to_vec());
+                    parts
+                };
                 return self.py_strm_list(this, parts);
             }
             (5, 3) => {
-                let (old, _) = self.py_strm_str(args[1])?;
-                let (new, _) = self.py_strm_str(args[2])?;
-                if old.is_empty() {
-                    return None;
-                }
-                let mut out = Vec::with_capacity(s.len());
-                let mut i = 0;
-                let mut last = 0;
-                let mut changed = false;
-                while i + old.len() <= s.len() {
-                    if s[i..i + old.len()] == old[..] {
-                        out.extend_from_slice(&s[last..i]);
-                        out.extend_from_slice(&new);
-                        i += old.len();
-                        last = i;
-                        changed = true;
-                    } else {
-                        i += 1;
+                let (old_idx, _) = self.py_strm_flat(args[1])?;
+                let (new_idx, _) = self.py_strm_flat(args[2])?;
+                let replaced = {
+                    let s = self.py_strm_bytes(s_idx);
+                    let old = self.py_strm_bytes(old_idx);
+                    let new = self.py_strm_bytes(new_idx);
+                    if old.is_empty() {
+                        return None;
                     }
+                    let mut out = Vec::new();
+                    let mut i = 0;
+                    let mut last = 0;
+                    let mut changed = false;
+                    while i + old.len() <= s.len() {
+                        if s[i..i + old.len()] == old[..] {
+                            if !changed {
+                                out.reserve(s.len());
+                            }
+                            out.extend_from_slice(&s[last..i]);
+                            out.extend_from_slice(new);
+                            i += old.len();
+                            last = i;
+                            changed = true;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    changed.then(|| {
+                        out.extend_from_slice(&s[last..]);
+                        out
+                    })
+                };
+                match replaced {
+                    None => {
+                        // Still `rt.checkedText`'s limit, as the copy was checked.
+                        let units = match self.heap.get(s_idx) {
+                            HeapObj::Str(st) => st.units(),
+                            _ => return None,
+                        };
+                        return (units <= STRM_MAX_TEXT).then_some(args[0]);
+                    }
+                    Some(out) => self.py_strm_new(out),
                 }
-                if !changed {
-                    // Still `rt.checkedText`'s limit, as the copy was checked.
-                    let units = match self.heap.get(args[0].heap_index()) {
-                        HeapObj::Str(st) => st.units(),
-                        _ => return None,
-                    };
-                    return (units <= STRM_MAX_TEXT).then_some(args[0]);
-                }
-                out.extend_from_slice(&s[last..]);
-                self.py_strm_new(out)
             }
             (6, 2) => {
-                let (sub, _) = self.py_strm_str(args[1])?;
-                let found = if sub.is_empty() {
-                    Some(0)
-                } else if sub.len() > s.len() {
-                    None
-                } else {
-                    (0..=s.len() - sub.len()).find(|&i| s[i..i + sub.len()] == sub[..])
+                let (sub_idx, _) = self.py_strm_flat(args[1])?;
+                // The match position, as a count of code points before it.
+                let found = {
+                    let s = self.py_strm_bytes(s_idx);
+                    let sub = self.py_strm_bytes(sub_idx);
+                    let at = if sub.is_empty() {
+                        Some(0)
+                    } else if sub.len() > s.len() {
+                        None
+                    } else {
+                        (0..=s.len() - sub.len()).find(|&i| s[i..i + sub.len()] == sub[..])
+                    };
+                    at.map(|i| s[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count())
                 };
                 return Some(match found {
                     None => self.make_bigint(-1),
-                    Some(i) => {
-                        let cps = s[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count();
-                        self.make_bigint(cps as i128)
-                    }
+                    Some(cps) => self.make_bigint(cps as i128),
                 });
             }
             (7, 2) => {
@@ -466,19 +506,38 @@ impl<'p> Vm<'p> {
                 if !arr.is_heap() {
                     return None;
                 }
-                let HeapObj::Array(parts) = self.heap.get(arr.heap_index()) else {
-                    return None;
+                let arr_idx = arr.heap_index();
+                let count = match self.heap.get(arr_idx) {
+                    HeapObj::Array(parts) => parts.len(),
+                    _ => return None,
                 };
-                let parts = parts.clone();
-                let mut out = Vec::new();
-                for (i, p) in parts.into_iter().enumerate() {
-                    let (b, _) = self.py_strm_str(p)?;
-                    if i > 0 {
-                        out.extend_from_slice(&s);
-                    }
-                    out.extend_from_slice(&b);
-                    if out.len() > STRM_MAX_TEXT * 3 {
+                // First every part is proved a str and flattened where it
+                // lives, and the joined size is known; then one buffer takes
+                // them all. (A flatten rewrites only that part's own slot.)
+                let sep_len = self.py_strm_bytes(s_idx).len();
+                let mut total = 0usize;
+                for i in 0..count {
+                    let part = match self.heap.get(arr_idx) {
+                        HeapObj::Array(parts) => *parts.get(i)?,
+                        _ => return None,
+                    };
+                    let (part_idx, _) = self.py_strm_flat(part)?;
+                    total += self.py_strm_bytes(part_idx).len() + if i > 0 { sep_len } else { 0 };
+                    if total > STRM_MAX_TEXT * 3 {
                         return None;
+                    }
+                }
+                let mut out = Vec::with_capacity(total);
+                {
+                    let sep = self.py_strm_bytes(s_idx);
+                    let HeapObj::Array(parts) = self.heap.get(arr_idx) else {
+                        return None;
+                    };
+                    for (i, part) in parts.iter().enumerate() {
+                        if i > 0 {
+                            out.extend_from_slice(sep);
+                        }
+                        out.extend_from_slice(self.py_strm_bytes(part.heap_index()));
                     }
                 }
                 self.py_strm_new(out)
@@ -488,12 +547,25 @@ impl<'p> Vm<'p> {
                     return None;
                 }
                 let lower = op == 8;
-                let changes = s.iter().any(|b| if lower { b.is_ascii_uppercase() } else { b.is_ascii_lowercase() });
-                if !changes {
-                    return Some(args[0]);
+                let cased = {
+                    let s = self.py_strm_bytes(s_idx);
+                    let changes = if lower {
+                        s.iter().any(u8::is_ascii_uppercase)
+                    } else {
+                        s.iter().any(u8::is_ascii_lowercase)
+                    };
+                    changes.then(|| {
+                        if lower {
+                            s.to_ascii_lowercase()
+                        } else {
+                            s.to_ascii_uppercase()
+                        }
+                    })
+                };
+                match cased {
+                    None => return Some(args[0]),
+                    Some(bytes) => self.py_strm_new(bytes),
                 }
-                let out: Vec<u8> = s.iter().map(|b| if lower { b.to_ascii_lowercase() } else { b.to_ascii_uppercase() }).collect();
-                self.py_strm_new(out)
             }
             _ => return None,
         };
@@ -503,7 +575,6 @@ impl<'p> Vm<'p> {
                 return None;
             }
         }
-        let n = s.len() as u64;
         self.charge_steps(i64::try_from(n).unwrap_or(i64::MAX));
         Some(out)
     }
