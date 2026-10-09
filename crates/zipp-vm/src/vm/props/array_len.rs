@@ -493,7 +493,7 @@ impl<'p> Vm<'p> {
         }
         if let Some(m) = self.module_namespaces.get(&obj.heap_index()) {
             let mut keys: Vec<&String> = m.keys().collect();
-            keys.sort();
+            crate::cold_sort::sort(&mut keys);
             for k in keys {
                 let live = self
                     .globals

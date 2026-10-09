@@ -882,7 +882,7 @@ impl<'p> Vm<'p> {
             }
             push(s, SymbolScope::Variable, &mut out);
         }
-        out.sort_by_key(|s| s.index);
+        crate::cold_sort::sort_by_key(&mut out, |s| s.index);
         out.dedup_by_key(|s| s.index);
         out
     }

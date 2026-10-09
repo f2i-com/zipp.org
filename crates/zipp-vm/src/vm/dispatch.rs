@@ -71,7 +71,7 @@ pub(crate) mod interp_stats {
             .flat_map(|table| table.iter())
             .map(|(&(f, e, r), &n)| (f, e, r, n))
             .collect();
-        rows.sort_by(|a, b| b.3.cmp(&a.3));
+        crate::cold_sort::sort_by(&mut rows, |a, b| b.3.cmp(&a.3));
         rows
     }
 
@@ -83,7 +83,7 @@ pub(crate) mod interp_stats {
             .flat_map(|table| table.iter())
             .map(|(&id, (name, entries, resumes))| (id, name.clone(), *entries, *resumes))
             .collect();
-        rows.sort_by(|a, b| (b.2 + b.3).cmp(&(a.2 + a.3)));
+        crate::cold_sort::sort_by(&mut rows, |a, b| (b.2 + b.3).cmp(&(a.2 + a.3)));
         rows
     }
 }

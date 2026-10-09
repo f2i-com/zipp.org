@@ -387,7 +387,7 @@ fn best_half(
     // in canonical order, which is what `appendItems` would build up to anyway.
     let Some((dist, sk, pat)) = best else {
         let mut w = want.to_vec();
-        w.sort_by_key(|(k, ..)| *k);
+        crate::cold_sort::sort_by_key(&mut w, |(k, ..)| *k);
         let s: Vec<String> = w.iter().map(|(_, c, n)| c.to_string().repeat(*n)).collect();
         return Some((s.join(" "), ""));
     };
@@ -400,7 +400,7 @@ fn best_half(
             .iter()
             .filter(|(k, ..)| !pattern_fields(&out).iter().any(|(pk, ..)| pk == k))
             .collect();
-        missing.sort_by_key(|(k, ..)| *k);
+        crate::cold_sort::sort_by_key(&mut missing, |(k, ..)| *k);
         for (k, c, n) in missing {
             let Some((_, glue, name)) = data
                 .append_items

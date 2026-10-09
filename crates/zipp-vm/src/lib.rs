@@ -48,6 +48,7 @@ mod bytecode;
 #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
 mod bytecode_codec;
 mod capture;
+mod cold_sort;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod codegen;
 #[cfg(all(feature = "jit", target_arch = "aarch64"))]

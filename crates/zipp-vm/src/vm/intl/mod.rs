@@ -443,7 +443,7 @@ impl<'p> Vm<'p> {
                             .position(|(c, _)| *c == n)
                             .unwrap_or(usize::MAX)
                     };
-                    vals.sort_by_key(|(n, _)| order(n));
+                    crate::cold_sort::sort_by_key(&mut vals, |(n, _)| order(n));
                 }
                 // The -u-ca / -u-nu extension keywords lose to an explicit option.
                 let ext = |k: &str| unicode_ext_value(&locale, k);

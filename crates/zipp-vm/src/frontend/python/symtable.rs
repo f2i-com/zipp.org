@@ -901,7 +901,7 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             .filter(|(_, k)| **k == SymKind::Free)
             .map(|(name, _)| name.strip_prefix(PASS_THROUGH).unwrap_or(name).to_owned())
             .collect();
-        free_order.sort();
+        crate::cold_sort::sort(&mut free_order);
         free_order.dedup();
         if raw.kind != ScopeKind::Module && by_offset.insert(raw.offset, id).is_some() {
             return Err(format!(

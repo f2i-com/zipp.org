@@ -829,7 +829,7 @@ impl<'p> Vm<'p> {
                 .unwrap_or(Value::UNDEFINED);
             pairs.push((exported.clone(), val, *slot));
         }
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        crate::cold_sort::sort_by(&mut pairs, |a, b| a.0.cmp(&b.0));
         let tag = self.alloc_str("Module".to_string());
         let mut m = ObjMap::new();
         let data_attr = PropAttr {

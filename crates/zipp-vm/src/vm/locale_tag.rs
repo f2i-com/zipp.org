@@ -181,7 +181,7 @@ impl LangTag {
         if !u.is_empty() {
             exts.push(('u', u[2..].to_string()));
         }
-        exts.sort_by_key(|(c, _)| *c);
+        crate::cold_sort::sort_by_key(&mut exts, |(c, _)| *c);
         for (c, body) in exts {
             out.push('-');
             out.push(c);
@@ -212,7 +212,7 @@ impl LangTag {
         self.u_keywords.retain(|(k, _)| k != key);
         if let Some(v) = value {
             self.u_keywords.push((key.to_string(), v));
-            self.u_keywords.sort_by(|a, b| a.0.cmp(&b.0));
+            crate::cold_sort::sort_by(&mut self.u_keywords, |a, b| a.0.cmp(&b.0));
             self.has_u = true;
         } else if self.u_keywords.is_empty() && self.u_attributes.is_empty() {
             self.has_u = false;
@@ -299,7 +299,7 @@ fn parse_lang_tag_with_work(tag: &str, work: &mut u64) -> Option<LangTag> {
             i += 1;
         }
         add_locale_sort_work(work, t.variants.len())?;
-        t.variants.sort();
+        crate::cold_sort::sort(&mut t.variants);
     }
     // ── extensions ──
     // There are only 128 ASCII singleton values; a direct membership table
@@ -373,7 +373,7 @@ fn parse_lang_tag_with_work(tag: &str, work: &mut u64) -> Option<LangTag> {
         }
     }
     add_locale_sort_work(work, t.other.len())?;
-    t.other.sort_by_key(|(c, _)| *c);
+    crate::cold_sort::sort_by_key(&mut t.other, |(c, _)| *c);
     Some(t)
 }
 
@@ -420,8 +420,8 @@ fn parse_unicode_ext(body: &[&str], t: &mut LangTag, work: &mut u64) -> Option<(
     }
     add_locale_sort_work(work, t.u_attributes.len())?;
     add_locale_sort_work(work, t.u_keywords.len())?;
-    t.u_attributes.sort();
-    t.u_keywords.sort_by(|a, b| a.0.cmp(&b.0));
+    crate::cold_sort::sort(&mut t.u_attributes);
+    crate::cold_sort::sort_by(&mut t.u_keywords, |a, b| a.0.cmp(&b.0));
     Some(())
 }
 
@@ -487,7 +487,7 @@ fn parse_transform_ext(body: &[&str], work: &mut u64) -> Option<String> {
         return None;
     }
     add_locale_sort_work(work, fields.len())?;
-    fields.sort_by(|a, b| a.0.cmp(&b.0));
+    crate::cold_sort::sort_by(&mut fields, |a, b| a.0.cmp(&b.0));
     for (k, v) in fields {
         out.push(k);
         out.push(v);

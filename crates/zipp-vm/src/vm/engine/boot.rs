@@ -744,7 +744,7 @@ impl<'p> Vm<'p> {
                 program.resident_bytes(),
             ));
         }
-        programs.sort_unstable_by_key(|&(identity, _)| identity);
+        crate::cold_sort::sort_by_key(&mut programs, |&(identity, _)| identity);
         programs.dedup_by_key(|entry| entry.0);
         programs.iter().fold(0usize, |bytes, &(_, program_bytes)| {
             bytes.saturating_add(program_bytes)

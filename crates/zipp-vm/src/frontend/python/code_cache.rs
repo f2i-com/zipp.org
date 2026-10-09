@@ -93,7 +93,7 @@ fn context() -> Option<&'static (PathBuf, Hash)> {
             let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
                 .filter(|(name, _)| name.as_encoded_bytes().starts_with(b"ZIPP_"))
                 .collect();
-            vars.sort();
+            crate::cold_sort::sort(&mut vars);
             for (name, value) in vars {
                 settings.bytes(name.as_encoded_bytes());
                 settings.bytes(value.as_encoded_bytes());
@@ -203,7 +203,7 @@ fn prune(current: &Path) {
             (used, p)
         })
         .collect();
-    others.sort_by(|a, b| b.0.cmp(&a.0));
+    crate::cold_sort::sort_by(&mut others, |a, b| b.0.cmp(&a.0));
     for (_, old) in others.into_iter().skip(KEEP) {
         let _ = std::fs::remove_dir_all(old);
     }

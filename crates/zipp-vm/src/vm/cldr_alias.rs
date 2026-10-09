@@ -146,7 +146,7 @@ fn parse_ids(s: &str) -> Option<Ids> {
     if i != parts.len() {
         return None;
     }
-    out.variants.sort();
+    crate::cold_sort::sort(&mut out.variants);
     Some(out)
 }
 
@@ -170,7 +170,7 @@ fn lang_rules() -> &'static [LangRule] {
                 })
             })
             .collect();
-        v.sort_by_key(|r| {
+        crate::cold_sort::sort_by_key(&mut v, |r| {
             (
                 r.from.variants.is_empty(),
                 std::cmp::Reverse(r.from.variants.len()),
@@ -273,7 +273,7 @@ fn apply_rule(r: &LangRule, t: &mut LangTag) -> bool {
             changed = true;
         }
     }
-    t.variants.sort();
+    crate::cold_sort::sort(&mut t.variants);
     changed
 }
 
@@ -394,7 +394,7 @@ fn canonicalize_language_id(t: &mut LangTag) {
                 }
             }
             if changed {
-                t.variants.sort();
+                crate::cold_sort::sort(&mut t.variants);
             }
         }
         if !changed {

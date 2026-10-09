@@ -735,7 +735,7 @@ impl<'p> Vm<'p> {
             }
             let total_work = base_work.saturating_add(lt::locale_sort_work_bound(seen.len()));
             self.preflight_native_iteration_work(total_work)?;
-            seen.sort();
+            crate::cold_sort::sort(&mut seen);
             t.variants = seen;
         }
         // ApplyOptionsToTag step 13 — a region supplied as an option is itself
