@@ -1195,9 +1195,18 @@ pub(crate) struct RegexSubjectUnits {
 }
 
 /// The largest subject, in UTF-16 units, whose buffer the checked profile
-/// keeps between execs: two bytes a unit of the 16 MiB working allowance.
+/// keeps between execs: two bytes a unit, beside the 16 MiB working
+/// allowance and inside the embedder's heap ceiling.
 #[cfg(feature = "safe-sandbox")]
 const REGEX_SUBJECT_UNITS_KEPT: usize = 1 << 20;
+
+#[cfg(feature = "safe-sandbox")]
+impl RegexSubjectUnits {
+    /// Bytes the kept buffer holds reserved.
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reservation.bytes()
+    }
+}
 
 /// The first search of a RegExpBuiltinExec from `start`: a sticky regex makes
 /// ONE attempt anchored at `start` (a failure costs that attempt, not a scan
@@ -4317,10 +4326,13 @@ impl<'p> Vm<'p> {
     /// kept between execs is native memory outside the heap's accounting. So
     /// `while (m = re.exec(text))` over text that is not ASCII cost the
     /// length of the text for each match. The buffer is now kept with its
-    /// reservation: the working allowance goes on counting it, any request
-    /// the allowance cannot meet gives it back first, an exec over another
-    /// subject drops it, and only a subject of `REGEX_SUBJECT_UNITS_KEPT`
-    /// units or fewer is kept at all.
+    /// reservation, so the headroom under the embedder's heap ceiling goes
+    /// on counting it; the fixed working allowance is reckoned without it,
+    /// so another operation's allowance is not shrunk. A request the
+    /// headroom cannot meet gives the buffer back first, an exec over
+    /// another subject drops it, the check at every return to the host
+    /// drops it, and only a subject of `REGEX_SUBJECT_UNITS_KEPT` units or
+    /// fewer is kept at all.
     #[cfg(feature = "safe-sandbox")]
     fn regex_subject_units_take(
         &mut self,

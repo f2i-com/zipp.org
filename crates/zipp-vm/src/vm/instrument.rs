@@ -800,6 +800,13 @@ pub(crate) struct RegexTransientReservation {
 }
 
 #[cfg(feature = "safe-sandbox")]
+impl RegexTransientReservation {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+#[cfg(feature = "safe-sandbox")]
 impl Drop for RegexTransientReservation {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
@@ -853,7 +860,11 @@ impl super::Vm<'_> {
         // reservation independently from the fixed regex ceiling so nesting is
         // bounded even when the embedder left its heap limit unlimited.
         let transient = self.regex_transient_bytes.load(Ordering::Relaxed);
-        limits.max_memory_bytes = limits.max_memory_bytes.saturating_sub(transient);
+        // A subject buffer kept between execs is not this search's storage:
+        // it counts against the heap headroom below, not the fixed allowance.
+        limits.max_memory_bytes = limits
+            .max_memory_bytes
+            .saturating_sub(transient.saturating_sub(self.regex_kept_subject_bytes()));
         limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
         let Some(rec) = self.instr_rec.as_ref() else {
             return limits;
@@ -894,6 +905,14 @@ impl super::Vm<'_> {
         (limits, output_bytes)
     }
 
+    /// Bytes reserved by the subject buffer kept between execs, if any.
+    #[cfg(feature = "safe-sandbox")]
+    fn regex_kept_subject_bytes(&self) -> usize {
+        self.regex_subject_units
+            .as_ref()
+            .map_or(0, |kept| kept.reserved_bytes())
+    }
+
     /// Bytes of RegExp working storage that could be reserved now: what is
     /// left of the fixed allowance and of the embedder's heap ceiling.
     #[cfg(feature = "safe-sandbox")]
@@ -903,7 +922,7 @@ impl super::Vm<'_> {
         let current = self.regex_transient_bytes.load(Ordering::Relaxed);
         let fixed_available = regress::MatchLimits::SANDBOX
             .max_memory_bytes
-            .saturating_sub(current);
+            .saturating_sub(current.saturating_sub(self.regex_kept_subject_bytes()));
         let heap_limit = self
             .instr_rec
             .as_ref()
@@ -1266,6 +1285,13 @@ impl super::Vm<'_> {
     /// the walk still happens, on a stride, and immediately whenever the cheap
     /// figure alone is enough to convict.
     pub(crate) fn instrument_resource_limit_error(&mut self) -> Option<&'static str> {
+        // Working storage does not cross the host boundary: the subject
+        // buffer a RegExp exec keeps for the next one is outside the heap
+        // figure this check and the host read.
+        #[cfg(feature = "safe-sandbox")]
+        {
+            self.regex_subject_units = None;
+        }
         let ceiling = match self.instr_rec.as_ref() {
             Some(rec) if rec.exhaustion.is_none() => rec.heap_limit,
             // No recorder, or already exhausted: nothing compares against a heap
