@@ -744,7 +744,11 @@ impl<'p> Vm<'p> {
                 program.resident_bytes(),
             ));
         }
-        crate::cold_sort::sort_by_key(&mut programs, |&(identity, _)| identity);
+        // The standard sort, not `cold_sort`: the periodic heap audit runs
+        // this over every compiled program into a reused scratch buffer, and
+        // the shared sort's two allocations and indirect comparisons made
+        // RegExp compilation 1.6-2.7x slower in the WebAssembly screen.
+        programs.sort_unstable_by_key(|&(identity, _)| identity);
         programs.dedup_by_key(|entry| entry.0);
         programs.iter().fold(0usize, |bytes, &(_, program_bytes)| {
             bytes.saturating_add(program_bytes)
