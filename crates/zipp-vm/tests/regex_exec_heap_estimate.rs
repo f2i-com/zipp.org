@@ -77,3 +77,52 @@ fn regex_exec_under_a_heap_ceiling_is_not_quadratic_in_the_heap() {
         "regex exec under a heap ceiling is too slow: split {split_elapsed:?}, sticky loop {sticky_elapsed:?}"
     );
 }
+
+// Node v24.19.0 answers "108000:191650" and 4000 for these.
+const ROPE_SOURCE: &str = r#"
+function tokens(n) {
+  var src = '';
+  for (var i = 0; i < n; i++) src += 'let x' + (i % 97) + ' = ' + i + ';\n';
+  var re = /\s+|[A-Za-z_]\w*|\d+|[=;]/y, count = 0;
+  re.lastIndex = 0;
+  while (re.lastIndex < src.length) { if (!re.exec(src)) break; count++; }
+  return count + ':' + src.length;
+}
+function accents(n) {
+  var text = '';
+  for (var i = 0; i < n; i++) text += 'café ' + (i % 10) + ' ';
+  var re = /é/g, count = 0;
+  while (re.exec(text)) count++;
+  return count;
+}
+"#;
+
+/// A string built by `+=` is a rope, and an exec used to walk a rope into a
+/// fresh UTF-16 copy every time instead of flattening it once: the tokenizer
+/// below made 108,000 copies of 190 KB (17 s in the WebAssembly build). The
+/// exec now flattens a rope that fits the RegExp working allowance.
+#[test]
+fn regex_exec_over_a_concatenated_string_is_not_quadratic_in_its_length() {
+    let mut state = embed::compile_script(ROPE_SOURCE).expect("script compiles");
+    state.disable_vm_jit();
+    state.run_init().expect("script initializes");
+    state.set_limits(u64::MAX, None);
+    state.set_heap_limit(CEILING);
+
+    let started = Instant::now();
+    let tokens = state
+        .call_slot(slot(&state, "tokens"), &[HostValue::Number(12000.0)])
+        .expect("tokenizer completes");
+    let elapsed = started.elapsed();
+    assert!(matches!(&tokens, HostValue::String(text) if text == "108000:191650"), "{tokens:?}");
+    assert!(elapsed.as_secs() < 30, "sticky tokenizer over a rope took {elapsed:?}");
+
+    // A rope that is not ASCII is flattened too, and matches as before.
+    let accents = number(
+        state
+            .call_slot(slot(&state, "accents"), &[HostValue::Number(4000.0)])
+            .expect("accent scan completes"),
+    );
+    assert_eq!(accents, 4000.0);
+    assert!(state.resource_limit_error().is_none());
+}

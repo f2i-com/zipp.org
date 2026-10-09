@@ -894,17 +894,11 @@ impl super::Vm<'_> {
         (limits, output_bytes)
     }
 
+    /// Bytes of RegExp working storage that could be reserved now: what is
+    /// left of the fixed allowance and of the embedder's heap ceiling.
     #[cfg(feature = "safe-sandbox")]
-    fn instrument_charge_regex_transient(&mut self, bytes: usize) -> Tick {
+    pub(crate) fn instrument_regex_transient_available(&self) -> usize {
         use std::sync::atomic::Ordering;
-
-        if let Some(message) = self
-            .instr_rec
-            .as_ref()
-            .and_then(|rec| rec.terminal_message())
-        {
-            return Err(message);
-        }
 
         let current = self.regex_transient_bytes.load(Ordering::Relaxed);
         let fixed_available = regress::MatchLimits::SANDBOX
@@ -922,7 +916,22 @@ impl super::Vm<'_> {
                 .saturating_sub(self.heap_bytes_estimate())
                 .saturating_sub(current)
         };
-        if bytes > fixed_available.min(heap_available) {
+        fixed_available.min(heap_available)
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    fn instrument_charge_regex_transient(&mut self, bytes: usize) -> Tick {
+        use std::sync::atomic::Ordering;
+
+        if let Some(message) = self
+            .instr_rec
+            .as_ref()
+            .and_then(|rec| rec.terminal_message())
+        {
+            return Err(message);
+        }
+
+        if bytes > self.instrument_regex_transient_available() {
             return Err(self.instrument_regex_memory_exhausted());
         }
 

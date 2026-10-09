@@ -2968,10 +2968,12 @@ impl<'p> Vm<'p> {
         // after it is a `Str` by construction. `ZIPP_NO_SLIM_EXEC=1` restores
         // the split reads; both compute identical values on every input.
         #[cfg(feature = "safe-sandbox")]
+        self.regex_flatten_subject(s_idx);
+        #[cfg(feature = "safe-sandbox")]
         let (is_ascii, ascii_units) = match self.heap.get(s_idx) {
-            // Keep the allocation-free byte backend for an already-flat ASCII
-            // subject. A rope is deliberately sent through the metered UTF-16
-            // walker below instead of being flattened before its reservation.
+            // Keep the allocation-free byte backend for a flat ASCII subject.
+            // A rope too large to flatten under the RegExp allowance goes
+            // through the metered UTF-16 walker below, as every rope did.
             HeapObj::Str(js) => (js.is_ascii(), js.as_bytes().len()),
             _ => (false, 0),
         };
@@ -4265,6 +4267,30 @@ impl<'p> Vm<'p> {
     /// appends to a flat string IN PLACE without a version bump, but always
     /// grows its byte length, so the length completes the proof. A flatten
     /// keeps both and the content.
+    /// Flatten a rope subject in place when its copy fits the RegExp working
+    /// allowance, so that the next exec over it finds a flat string.
+    ///
+    /// A rope was never flattened here, because `Heap::flatten` allocates the
+    /// whole string before any ceiling is consulted; every exec walked it
+    /// into a fresh UTF-16 copy instead. A string built by `+=` is a rope, so
+    /// a sticky-regex tokenizer over 190 KB of ASCII made 108,000 such copies
+    /// and took 17 s (5 ms in Node). The walk needs two bytes a unit under
+    /// the allowance; the flat string needs at most three, and is asked for
+    /// under the same allowance first.
+    #[cfg(feature = "safe-sandbox")]
+    fn regex_flatten_subject(&mut self, index: u32) {
+        let units = match self.heap.get(index) {
+            HeapObj::Cons { len, .. } => *len,
+            _ => return,
+        };
+        if units.saturating_mul(3) <= self.instrument_regex_transient_available() {
+            self.heap.flatten(index);
+            // The flat bytes are new payload in a slot already counted.
+            #[cfg(feature = "instrument")]
+            self.instrument_mark_external_heap_growth();
+        }
+    }
+
     #[cfg(not(feature = "safe-sandbox"))]
     fn regex_subject_units_take(&mut self, subject: Value) -> Vec<u16> {
         if subject.is_heap() {
