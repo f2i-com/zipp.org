@@ -58,7 +58,8 @@ extern "C" {
 #[cfg(feature = "python")]
 mod packages;
 
-const PREAMBLE: &str = include_str!("preamble.js");
+/// `src/preamble.js` as `build.rs` writes it: without comment lines.
+const PREAMBLE: &str = include_str!(concat!(env!("OUT_DIR"), "/preamble.js"));
 const EVAL_PREFIX: &str = "JSON.stringify((function () { return (";
 const EVAL_SUFFIX: &str = "); })())";
 // `evalInContextRich` marshals the value itself; only the expression wrapper
