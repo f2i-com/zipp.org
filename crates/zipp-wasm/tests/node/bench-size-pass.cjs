@@ -30,7 +30,7 @@ const modules = names.map(name => require(path.resolve(name, 'zipp_wasm.js')));
 const results = {
   node: process.version, v8: process.versions.v8, flags: process.execArgv,
   cpu: os.cpus()[0].model, packages: names,
-  description: 'Optimizing WASM compiler; 10 warmup pairs, shared batches targeting >= 5 ms, and 31 alternating paired samples. Times are per call. Narrow screening, not a general performance claim.',
+  description: 'Optimizing WASM compiler; 10 warmup pairs, shared batches targeting >= 5 ms, and 31 alternating paired samples. Times are per call: the median of the batches (ratio) and their mean without the three slowest (trimmed_ratio). Narrow screening, not a general performance claim.',
   only_case: onlyCase,
   cases: {},
 };
@@ -57,7 +57,23 @@ function measure(name, calls) {
     }
   }
   const before = median(samples[0]), after = median(samples[1]);
-  results.cases[name] = { baseline_ms: before, candidate_ms: after, ratio: after / before, iterations, samples_ms: samples };
+  // The median of the batches has an edge for a workload that collects every
+  // few calls: it reads one of two levels, by whether most batches hold one
+  // collection or two. promise-resolve collects on about every fifth call of
+  // batches of eight or nine, and its median differed by 6% between windows
+  // of one module's own run. The mean over every call has no such edge, but
+  // one long pause decides it, so it is taken without each side's three
+  // slowest batches: read `trimmed_ratio` for an allocating row.
+  const trimmed = values => {
+    const kept = [...values].sort((a, b) => a - b).slice(0, values.length - 3);
+    return kept.reduce((sum, value) => sum + value, 0) / kept.length;
+  };
+  const beforeMean = trimmed(samples[0]), afterMean = trimmed(samples[1]);
+  results.cases[name] = {
+    baseline_ms: before, candidate_ms: after, ratio: after / before,
+    baseline_trimmed_ms: beforeMean, candidate_trimmed_ms: afterMean, trimmed_ratio: afterMean / beforeMean,
+    iterations, samples_ms: samples,
+  };
 }
 
 for (const w of [...WORKLOADS, ...FOCUSED].filter(w => !onlyCase || w.name === onlyCase)) {
