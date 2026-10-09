@@ -40,6 +40,9 @@ unicode-normalization = "0.1"
 # Retains ECMAScript core; omits ECMA-402 and Temporal. Do not feature-unify
 # with full embedders. Python and JIT are deliberately incompatible.
 wasm-lite = ["safe-sandbox", "wasm-no-fs-loader", "wasm-single-agent", "regress/compact-utf16"]
+# The full WebAssembly artifacts share the UTF-16 and UCS-2 matcher bodies
+# too. The ASCII matcher, which serves every ASCII subject, stays its own.
+wasm-compact-regex = ["regress/compact-utf16"]
 # Experimental Python-subset frontend (see docs/PYTHON_FRONTEND_EXPERIMENT.md).
 # Pulls in the Python parser and `instrument` (a Python state starts with the
 # VM JIT off; a host without an instruction budget, such as the CLI's

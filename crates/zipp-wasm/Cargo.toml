@@ -48,7 +48,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # The engine, interpreter-only: the JIT tiers emit x86-64/ARM64 native code and
 # have no meaning on wasm (see zipp-vm's `jit` feature).
-zipp-vm = { path = "../zipp-vm", default-features = false, features = ["safe-sandbox", "meter-only", "wasm-no-fs-loader", "wasm-single-agent"] }
+zipp-vm = { path = "../zipp-vm", default-features = false, features = ["safe-sandbox", "meter-only", "wasm-no-fs-loader", "wasm-single-agent", "wasm-compact-regex"] }
 wasm-bindgen = "=0.2.126"
 # Keep the Function type/call bindings, but do not compile js-sys's
 # `unsafe-eval` constructors into the trusted host surface.
