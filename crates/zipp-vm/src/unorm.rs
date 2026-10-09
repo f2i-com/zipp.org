@@ -5,9 +5,12 @@
 //! are minimal perfect hashes: 111 KB in a 32-bit module, of which 42 KB was
 //! left after Brotli, since a hashed table has no order for a compressor to
 //! find. They were the largest block of compressed data in every WebAssembly
-//! module. The same mappings are held here as sorted keys over UTF-8 text
+//! module. The same mappings are held here in code point order
 //! (`unorm_tables.rs`, generated from that crate by the test at the end of
-//! this file) and found by binary search.
+//! this file). A table's keys are a bitmap for each 256-code-point page that
+//! has any, and a member's rank among them, counted from its page's bits,
+//! is its index into the table's values: a lookup is a few loads and a
+//! population count, as the hashed lookup was.
 //!
 //! The iterators follow that crate's: a decomposition keeps a buffer in which
 //! each run of combining marks is put in canonical order before any of it is
@@ -15,6 +18,7 @@
 //! blocked character or the next starter. Every code point and a few hundred
 //! thousand generated strings are checked against the crate, which stays a
 //! development dependency for exactly that.
+
 // Generated, and compared with what the generator writes: not reformatted.
 #[rustfmt::skip]
 #[path = "unorm_tables.rs"]
@@ -30,79 +34,69 @@ const T_COUNT: u32 = 28;
 const N_COUNT: u32 = V_COUNT * T_COUNT;
 const S_COUNT: u32 = L_COUNT * N_COUNT;
 
-/// Entry `i` of a table of three-byte little-endian code points.
-#[inline]
-fn code_point(table: &[u8], i: usize) -> u32 {
-    u32::from(table[i * 3]) | u32::from(table[i * 3 + 1]) << 8 | u32::from(table[i * 3 + 2]) << 16
+/// A set of code points in which each member has a rank, its position in
+/// code point order.
+struct Ranked {
+    /// For each 256-code-point page up to the last with a member: 0, or one
+    /// more than the page's place in `bits` and `below`.
+    pages: &'static [u8],
+    /// 32 bytes a page: a bit a code point, lowest first.
+    bits: &'static [u8],
+    /// The number of members before each 64 code points of each page.
+    below: &'static [u16],
 }
 
-/// The number of entries of the sorted three-byte table `keys` that are at
-/// most `c`. `index[p]` is the number of entries below page `p` (256 code
-/// points) for the BMP's pages and one past them, so a search stays inside
-/// one page, and a page with no entry, as most are, is not searched.
-fn rank(keys: &[u8], index: &[u16], c: u32) -> usize {
-    let page = (c >> 8) as usize;
-    let (mut low, mut high) = if page < 256 {
-        (usize::from(index[page]), usize::from(index[page + 1]))
-    } else {
-        (usize::from(index[256]), keys.len() / 3)
-    };
-    while low < high {
-        let middle = low + (high - low) / 2;
-        if code_point(keys, middle) <= c {
-            low = middle + 1;
-        } else {
-            high = middle;
+impl Ranked {
+    /// The rank of `c`, if it is a member.
+    #[inline]
+    fn rank(&self, c: u32) -> Option<usize> {
+        let slot = usize::from(*self.pages.get((c >> 8) as usize)?).checked_sub(1)?;
+        // The 64 code points around `c`: their bits, and the members before them.
+        let at = slot * 4 + ((c as usize & 255) >> 6);
+        let bits = u64::from_le_bytes(self.bits[at * 8..at * 8 + 8].try_into().ok()?);
+        let bit = c & 63;
+        if bits >> bit & 1 == 0 {
+            return None;
         }
+        let before = (bits & ((1u64 << bit) - 1)).count_ones();
+        Some(usize::from(self.below[at]) + before as usize)
     }
-    low
 }
 
-/// Whether the 256 code points around `c` hold any entry of the table that
-/// `pages` (a bit a page) was made from.
-#[inline]
-fn in_page(pages: &[u8], c: u32) -> bool {
-    let page = (c >> 8) as usize;
-    pages
-        .get(page >> 3)
-        .is_some_and(|bits| bits >> (page & 7) & 1 != 0)
-}
-
-/// Whether `c` is in one of the runs `starts[i] ..= starts[i] + lengths[i]`,
-/// and which.
-fn run_of(starts: &[u8], index: &[u16], lengths: &[u8], c: u32) -> Option<usize> {
-    // A run may reach into `c`'s page from the one before.
-    let at = rank(starts, index, c).checked_sub(1)?;
-    (c - code_point(starts, at) <= u32::from(lengths[at])).then_some(at)
-}
-
-/// The text `c` maps to in a decomposition table.
-fn mapped(
-    keys: &'static [u8],
-    index: &'static [u16],
-    offsets: &'static [u16],
-    text: &'static str,
-    c: u32,
-) -> Option<&'static str> {
-    let at = rank(keys, index, c).checked_sub(1)?;
-    if code_point(keys, at) != c {
-        return None;
-    }
-    Some(&text[usize::from(offsets[at])..usize::from(offsets[at + 1])])
-}
+const CANONICAL: Ranked = Ranked {
+    pages: tables::CANONICAL_PAGES,
+    bits: tables::CANONICAL_BITS,
+    below: tables::CANONICAL_BELOW,
+};
+const COMPATIBLE: Ranked = Ranked {
+    pages: tables::COMPATIBLE_PAGES,
+    bits: tables::COMPATIBLE_BITS,
+    below: tables::COMPATIBLE_BELOW,
+};
+const CLASSED: Ranked = Ranked {
+    pages: tables::CLASS_PAGES,
+    bits: tables::CLASS_BITS,
+    below: tables::CLASS_BELOW,
+};
+const MARKS: Ranked = Ranked {
+    pages: tables::MARK_PAGES,
+    bits: tables::MARK_BITS,
+    below: tables::MARK_BELOW,
+};
+const FIRSTS: Ranked = Ranked {
+    pages: tables::FIRST_PAGES,
+    bits: tables::FIRST_BITS,
+    below: tables::FIRST_BELOW,
+};
 
 /// The canonical combining class of `c` (0 for a starter).
+#[inline]
 pub(crate) fn canonical_combining_class(c: char) -> u8 {
     let c = c as u32;
     if c < 0x300 {
         return 0;
     }
-    match run_of(
-        tables::CLASS_STARTS,
-        tables::CLASS_INDEX,
-        tables::CLASS_LENGTHS,
-        c,
-    ) {
+    match CLASSED.rank(c) {
         Some(at) => tables::CLASS_VALUES[at],
         None => 0,
     }
@@ -111,18 +105,34 @@ pub(crate) fn canonical_combining_class(c: char) -> u8 {
 /// Whether `c` has General_Category Mark (Mn, Mc or Me).
 pub(crate) fn is_combining_mark(c: char) -> bool {
     let c = c as u32;
-    c >= 0x300
-        && run_of(
-            tables::MARK_STARTS,
-            tables::MARK_INDEX,
-            tables::MARK_LENGTHS,
-            c,
-        )
-        .is_some()
+    if c < 0x300 {
+        return false;
+    }
+    // The pages cover the planes with scripts; beyond them the marks are a
+    // few runs (the variation selectors of plane 14).
+    if (c >> 8) as usize >= tables::MARK_PAGES.len() {
+        return tables::MARK_BEYOND
+            .iter()
+            .any(|&(first, last)| (first..=last).contains(&c));
+    }
+    MARKS.rank(c).is_some()
+}
+
+/// The text `c` maps to in a decomposition table.
+#[inline]
+fn mapped(
+    keys: &Ranked,
+    offsets: &'static [u16],
+    text: &'static str,
+    c: u32,
+) -> Option<&'static str> {
+    let at = keys.rank(c)?;
+    Some(&text[usize::from(offsets[at])..usize::from(offsets[at + 1])])
 }
 
 /// The full decomposition of `c`, canonical or compatibility, a character at
 /// a time. A character with none is given back as it is.
+#[inline]
 fn decompose(c: char, compatible: bool, mut emit: impl FnMut(char)) {
     let code = c as u32;
     if code < 0xC0 && !(compatible && code >= 0xA0) {
@@ -141,8 +151,7 @@ fn decompose(c: char, compatible: bool, mut emit: impl FnMut(char)) {
     let text = compatible
         .then(|| {
             mapped(
-                tables::COMPATIBLE_KEYS,
-                tables::COMPATIBLE_INDEX,
+                &COMPATIBLE,
                 tables::COMPATIBLE_OFFSETS,
                 tables::COMPATIBLE_TEXT,
                 code,
@@ -151,8 +160,7 @@ fn decompose(c: char, compatible: bool, mut emit: impl FnMut(char)) {
         .flatten()
         .or_else(|| {
             mapped(
-                tables::CANONICAL_KEYS,
-                tables::CANONICAL_INDEX,
+                &CANONICAL,
                 tables::CANONICAL_OFFSETS,
                 tables::CANONICAL_TEXT,
                 code,
@@ -165,6 +173,7 @@ fn decompose(c: char, compatible: bool, mut emit: impl FnMut(char)) {
 }
 
 /// The primary composite of `a` followed by `b`, if there is one.
+#[inline]
 fn compose(a: char, b: char) -> Option<char> {
     let (a, b) = (a as u32, b as u32);
     // Hangul: a leading and a vowel jamo, then that syllable and a trailing one.
@@ -177,31 +186,26 @@ fn compose(a: char, b: char) -> Option<char> {
     {
         return char::from_u32(a + (b - T_BASE));
     }
-    // Few characters are ever the second of a pair.
-    if !in_page(tables::SECOND_PAGES, b) {
+    // Every second character is a mark or a vowel sign, none below U+0300:
+    // a letter after a letter is answered here.
+    if b < 0x300 {
         return None;
     }
-    if a < 0x10000 && b < 0x10000 {
-        let pairs = tables::COMPOSITION_PAIRS;
-        let key = a << 16 | b;
-        let (mut low, mut high) = (0, pairs.len() / 3);
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let entry = u32::from(pairs[middle * 3]) << 16 | u32::from(pairs[middle * 3 + 1]);
-            match entry.cmp(&key) {
-                std::cmp::Ordering::Less => low = middle + 1,
-                std::cmp::Ordering::Greater => high = middle,
-                std::cmp::Ordering::Equal => {
-                    return char::from_u32(u32::from(pairs[middle * 3 + 2]))
-                }
-            }
-        }
-        return None;
+    if a >= 0x10000 || b >= 0x10000 {
+        return tables::COMPOSITION_BEYOND
+            .iter()
+            .find(|entry| entry.0 == a && entry.1 == b)
+            .and_then(|entry| char::from_u32(entry.2));
     }
-    tables::COMPOSITION_ASTRAL
-        .iter()
-        .find(|entry| entry.0 == a && entry.1 == b)
-        .and_then(|entry| char::from_u32(entry.2))
+    // The pairs of one first character are together, a few each, in the
+    // order of their seconds.
+    let first = FIRSTS.rank(a)?;
+    let pairs =
+        usize::from(tables::FIRST_PAIRS[first])..usize::from(tables::FIRST_PAIRS[first + 1]);
+    tables::COMPOSITION_PAIRS[pairs.start * 2..pairs.end * 2]
+        .chunks_exact(2)
+        .find(|pair| u32::from(pair[0]) == b)
+        .and_then(|pair| char::from_u32(u32::from(pair[1])))
 }
 
 /// The characters of a string in NFD or NFKD.
@@ -217,6 +221,15 @@ pub(crate) struct Decompositions<'a> {
     ready: usize,
 }
 
+/// Put a run of marks in canonical order. The sort is stable, so marks of
+/// one class keep their order; most runs are of one mark or none.
+#[inline]
+fn order(run: &mut [(u8, char)]) {
+    if run.len() > 1 {
+        run.sort_by_key(|entry| entry.0);
+    }
+}
+
 impl<'a> Decompositions<'a> {
     fn new(s: &'a str, compatible: bool) -> Self {
         Decompositions {
@@ -227,17 +240,16 @@ impl<'a> Decompositions<'a> {
             ready: 0,
         }
     }
-}
 
-impl Decompositions<'_> {
     /// The next character with its canonical combining class.
+    #[inline]
     fn next_classed(&mut self) -> Option<(u8, char)> {
         while self.ready == 0 {
             let Some(c) = self.source.next() else {
                 if self.buffer.is_empty() {
                     return None;
                 }
-                self.buffer.sort_by_key(|entry| entry.0);
+                order(&mut self.buffer);
                 self.ready = self.buffer.len();
                 break;
             };
@@ -245,9 +257,8 @@ impl Decompositions<'_> {
             decompose(c, self.compatible, |d| {
                 let class = canonical_combining_class(d);
                 if class == 0 {
-                    // A starter closes the run before it. The sort is stable,
-                    // so marks of one class keep their order.
-                    buffer[*ready..].sort_by_key(|entry| entry.0);
+                    // A starter closes the run before it.
+                    order(&mut buffer[*ready..]);
                     buffer.push((0, d));
                     *ready = buffer.len();
                 } else {
@@ -259,7 +270,11 @@ impl Decompositions<'_> {
         self.next += 1;
         if self.next == self.ready {
             // Keep only the open run.
-            self.buffer.drain(..self.ready);
+            if self.ready == self.buffer.len() {
+                self.buffer.clear();
+            } else {
+                self.buffer.drain(..self.ready);
+            }
             self.next = 0;
             self.ready = 0;
         }
@@ -270,6 +285,7 @@ impl Decompositions<'_> {
 impl Iterator for Decompositions<'_> {
     type Item = char;
 
+    #[inline]
     fn next(&mut self) -> Option<char> {
         self.next_classed().map(|entry| entry.1)
     }
@@ -431,10 +447,6 @@ mod tests {
         out
     }
 
-    fn three(out: &mut Vec<u8>, c: u32) {
-        out.extend_from_slice(&c.to_le_bytes()[..3]);
-    }
-
     fn bytes(name: &str, data: &[u8]) -> String {
         let mut text = format!("pub(super) static {name}: &[u8] = b\"\\\n");
         for line in data.chunks(24) {
@@ -472,81 +484,45 @@ mod tests {
         text
     }
 
-    /// One bit for each 256 code points, set where any of `members` is.
-    fn pages(members: impl Iterator<Item = u32>) -> Vec<u8> {
-        let mut bits = Vec::new();
-        for c in members {
+    /// The three tables of a [`Ranked`] over the sorted `members`.
+    fn ranked(prefix: &str, members: &[u32]) -> String {
+        let last = members.last().map_or(0, |&c| (c >> 8) as usize + 1);
+        let (mut pages, mut bits) = (vec![0u8; last], Vec::new());
+        for &c in members {
             let page = (c >> 8) as usize;
-            if bits.len() <= page >> 3 {
-                bits.resize((page >> 3) + 1, 0u8);
+            if pages[page] == 0 {
+                bits.extend([0u8; 32]);
+                pages[page] =
+                    u8::try_from(bits.len() / 32).expect("at most 255 pages have members");
             }
-            bits[page >> 3] |= 1 << (page & 7);
+            let slot = usize::from(pages[page]) - 1;
+            bits[slot * 32 + ((c as usize & 255) >> 3)] |= 1 << (c & 7);
         }
-        bits
+        let (mut below, mut count) = (Vec::new(), 0u32);
+        for word in bits.chunks_exact(8) {
+            below.push(u16::try_from(count).expect("ranks fit 16 bits"));
+            count += word.iter().map(|byte| byte.count_ones()).sum::<u32>();
+        }
+        numbers(&format!("{prefix}_PAGES"), "u8", &pages)
+            + &bytes(&format!("{prefix}_BITS"), &bits)
+            + &numbers(&format!("{prefix}_BELOW"), "u16", &below)
     }
 
-    /// For each page of the BMP and one past them, how many of the sorted
-    /// `members` are below it.
-    fn page_index(members: &[u32]) -> Vec<u16> {
-        (0..=256u32)
-            .map(|page| {
-                let below = members.iter().filter(|&&c| c < page << 8).count();
-                u16::try_from(below).expect("the table fits a 16-bit index")
-            })
-            .collect()
-    }
-
-    fn three_byte_values(table: &[u8]) -> Vec<u32> {
-        (0..table.len() / 3).map(|i| code_point(table, i)).collect()
-    }
-
-    /// A decomposition table: sorted keys, the text each maps to, and where.
+    /// A decomposition table: its keys, the text each maps to, and where.
     fn decomposition_table(prefix: &str, entries: &[(char, String)]) -> String {
-        let (mut keys, mut offsets, mut text) = (Vec::new(), Vec::new(), String::new());
-        for (c, mapping) in entries {
-            three(&mut keys, *c as u32);
+        let keys: Vec<u32> = entries.iter().map(|entry| entry.0 as u32).collect();
+        let (mut offsets, mut text) = (Vec::new(), String::new());
+        for (_, mapping) in entries {
             offsets.push(u16::try_from(text.len()).expect("the text fits 16-bit offsets"));
             text.push_str(mapping);
         }
         offsets.push(u16::try_from(text.len()).expect("the text fits 16-bit offsets"));
-        numbers(
-            &format!("{prefix}_INDEX"),
-            "u16",
-            &page_index(&three_byte_values(&keys)),
-        ) + &bytes(&format!("{prefix}_KEYS"), &keys)
+        ranked(prefix, &keys)
             + &numbers(&format!("{prefix}_OFFSETS"), "u16", &offsets)
             + &string(&format!("{prefix}_TEXT"), &text)
     }
 
-    /// Runs of consecutive code points with one value, each at most 256 long.
-    fn runs(values: impl Iterator<Item = (char, u8)>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let (mut starts, mut lengths, mut kinds) = (Vec::new(), Vec::new(), Vec::new());
-        let mut open: Option<(u32, u32, u8)> = None;
-        for (c, value) in values {
-            let c = c as u32;
-            match open {
-                Some((start, end, kind)) if end + 1 == c && kind == value && c - start <= 255 => {
-                    open = Some((start, c, kind));
-                }
-                _ => {
-                    if let Some((start, end, kind)) = open {
-                        three(&mut starts, start);
-                        lengths.push((end - start) as u8);
-                        kinds.push(kind);
-                    }
-                    open = Some((c, c, value));
-                }
-            }
-        }
-        if let Some((start, end, kind)) = open {
-            three(&mut starts, start);
-            lengths.push((end - start) as u8);
-            kinds.push(kind);
-        }
-        (starts, lengths, kinds)
-    }
-
-    /// Every pair the crate composes, as (first, second, composite).
+    /// Every pair the crate composes, as (first, second, composite), sorted.
     fn composition_pairs() -> Vec<(u32, u32, u32)> {
         // A composing pair is a composite's own two-part decomposition, so
         // its first part is a composite or the first character of some
@@ -593,73 +569,95 @@ mod tests {
             .filter(|(c, full)| *full != canonical(*c))
             .collect();
         let pairs = composition_pairs();
-        let mut bmp: Vec<u16> = Vec::new();
-        let mut astral: Vec<String> = Vec::new();
+        assert!(
+            pairs.iter().all(|pair| pair.1 >= 0x300),
+            "`compose` takes no second character to be below U+0300"
+        );
+        let (mut firsts, mut starts, mut bmp, mut beyond) =
+            (Vec::new(), Vec::new(), Vec::<u16>::new(), Vec::new());
         for &(a, b, c) in &pairs {
             if a < 0x10000 && b < 0x10000 {
+                if firsts.last() != Some(&a) {
+                    firsts.push(a);
+                    starts.push(u16::try_from(bmp.len() / 2).expect("pairs fit 16 bits"));
+                }
                 bmp.extend([
-                    a as u16,
                     b as u16,
                     u16::try_from(c).expect("a BMP pair composes in the BMP"),
                 ]);
             } else {
-                astral.push(format!("({a:#x}, {b:#x}, {c:#x})"));
+                beyond.push(format!("({a:#x}, {b:#x}, {c:#x})"));
             }
         }
-        let (class_starts, class_lengths, class_values) = runs(
-            chars()
-                .map(|c| (c, unicode_normalization::char::canonical_combining_class(c)))
-                .filter(|&(_, class)| class != 0),
-        );
-        let (mark_starts, mark_lengths, _) = runs(
-            chars()
-                .filter(|&c| unicode_normalization::char::is_combining_mark(c))
-                .map(|c| (c, 0)),
-        );
+        starts.push(u16::try_from(bmp.len() / 2).expect("pairs fit 16 bits"));
+        let classed: Vec<(u32, u8)> = chars()
+            .map(|c| {
+                (
+                    c as u32,
+                    unicode_normalization::char::canonical_combining_class(c),
+                )
+            })
+            .filter(|&(_, class)| class != 0)
+            .collect();
+        // Marks up to the supplementary planes that hold scripts; the few
+        // runs beyond (plane 14) are listed.
+        let marks: Vec<u32> = chars()
+            .filter(|&c| unicode_normalization::char::is_combining_mark(c))
+            .map(|c| c as u32)
+            .collect();
+        let near: Vec<u32> = marks.iter().copied().filter(|&c| c < 0x20000).collect();
+        let mut far: Vec<(u32, u32)> = Vec::new();
+        for &c in marks.iter().filter(|&&c| c >= 0x20000) {
+            match far.last_mut() {
+                Some(run) if run.1 + 1 == c => run.1 = c,
+                _ => far.push((c, c)),
+            }
+        }
         let version = unicode_normalization::UNICODE_VERSION;
         let mut text = format!(
             "// Generated from the unicode-normalization crate (Unicode {}.{}.{}) by the\n\
              // test `unorm::tests::tables_are_generated_from_the_crate`; do not edit.\n\
-             // ZIPP_REGENERATE_UNORM=1 cargo test -p zipp-vm --lib unorm::tests\n\n",
+             // ZIPP_REGENERATE_UNORM=1 cargo test -p zipp-vm --lib unorm::tests\n\
+             //\n\
+             // A set of code points is three tables: for each 256-code-point page, 0 or\n\
+             // one more than its place in the next two; 32 bytes of membership bits a\n\
+             // page; and the number of members before each 64 code points of each page.\n\n",
             version.0, version.1, version.2
         );
-        text += "// Canonical decompositions, fully decomposed: sorted three-byte keys, and\n// each key's text from its offset to the next.\n";
+        text += "// Canonical decompositions, fully decomposed: the characters that have one,\n// and each one's text from its offset to the next.\n";
         text += &decomposition_table("CANONICAL", &canonical_entries);
         text += "\n// Compatibility decompositions that differ from the canonical one.\n";
         text += &decomposition_table("COMPATIBLE", &compatible_entries);
-        text += "\n// The pages that hold the second character of any composing pair.\n";
-        text += &numbers(
-            "SECOND_PAGES",
-            "u8",
-            &pages(pairs.iter().map(|pair| pair.1)),
-        );
-        text += "\n// Primary composites in the BMP as (first, second, composite), sorted.\n";
+        text += "\n// Primary composites in the BMP: the first characters of the pairs, where\n// each one's pairs start, and the pairs as (second, composite).\n";
+        text += &ranked("FIRST", &firsts);
+        text += &numbers("FIRST_PAIRS", "u16", &starts);
         text += &numbers("COMPOSITION_PAIRS", "u16", &bmp);
-        text += "\n// And beyond it.\n";
+        text += "\n// And beyond it, as (first, second, composite).\n";
         text += &format!(
-            "pub(super) static COMPOSITION_ASTRAL: &[(u32, u32, u32)] = &[\n{}];\n",
-            astral
+            "pub(super) static COMPOSITION_BEYOND: &[(u32, u32, u32)] = &[\n{}];\n",
+            beyond
                 .iter()
                 .map(|entry| format!("    {entry},\n"))
                 .collect::<String>()
         );
-        text += "\n// Runs of one non-zero canonical combining class: three-byte starts, each\n// run's length less one, and its class.\n";
-        text += &numbers(
-            "CLASS_INDEX",
-            "u16",
-            &page_index(&three_byte_values(&class_starts)),
+        text += "\n// The characters with a non-zero canonical combining class, and the classes.\n";
+        text += &ranked(
+            "CLASS",
+            &classed.iter().map(|entry| entry.0).collect::<Vec<_>>(),
         );
-        text += &bytes("CLASS_STARTS", &class_starts);
-        text += &numbers("CLASS_LENGTHS", "u8", &class_lengths);
-        text += &numbers("CLASS_VALUES", "u8", &class_values);
-        text += "\n// Runs of combining marks (General_Category M).\n";
         text += &numbers(
-            "MARK_INDEX",
-            "u16",
-            &page_index(&three_byte_values(&mark_starts)),
+            "CLASS_VALUES",
+            "u8",
+            &classed.iter().map(|entry| entry.1).collect::<Vec<_>>(),
         );
-        text += &bytes("MARK_STARTS", &mark_starts);
-        text += &numbers("MARK_LENGTHS", "u8", &mark_lengths);
+        text += "\n// Combining marks (General_Category M) below U+20000, and the runs beyond.\n";
+        text += &ranked("MARK", &near);
+        text += &format!(
+            "pub(super) static MARK_BEYOND: &[(u32, u32)] = &[\n{}];\n",
+            far.iter()
+                .map(|run| format!("    ({:#x}, {:#x}),\n", run.0, run.1))
+                .collect::<String>()
+        );
         text
     }
 
@@ -710,6 +708,7 @@ mod tests {
         let seconds: std::collections::BTreeSet<u32> = pairs.iter().map(|p| p.1).collect();
         let jamo = [
             0x1100, 0x1112, 0x1161, 0x1175, 0x11A7, 0x11A8, 0x11C2, 0xAC00, 0xAC01, 0xD7A3, 0xC8E0,
+            0x61, 0x1F600,
         ];
         for &a in firsts.iter().chain(&jamo) {
             for &b in seconds.iter().chain(&jamo) {
