@@ -260,23 +260,24 @@ have identical import/export surfaces; the selected module retains the audited
 1 GiB memory maximum. Release tests run on the selected bytes, and packaging
 checks that the browser module is byte-identical to the tested Node module.
 
-Measured on 2026-10-09 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
-after the eleventh size-reduction pass, on a Windows build of `9df8019c`:
+Measured on 2026-10-10 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
+after the twelfth size-reduction pass, on a Windows build of `c913b447`:
 
 | Variant | Before post-processing, raw / Brotli | Selected, raw / Brotli |
 | --- | ---: | ---: |
-| Lite | 2,766,136 / 718,427 | 2,654,515 / 716,795 |
-| JavaScript | 5,141,733 / 1,244,683 | 4,977,978 / 1,239,416 |
-| Python-base | 6,841,147 / 1,618,208 | 6,644,132 / 1,612,708 |
-| Python + Torch | 8,769,750 / 1,969,371 | 8,568,374 / 1,963,702 |
+| Lite | 2,768,128 / 717,330 | 2,655,190 / 715,896 |
+| JavaScript | 5,059,943 / 1,234,620 | 4,898,060 / 1,228,986 |
+| Python-base | 6,759,818 / 1,609,261 | 6,564,659 / 1,601,071 |
+| Python + Torch | 8,688,206 / 1,959,541 | 8,488,699 / 1,952,907 |
 
 These are module bytes, excluding JS glue; Brotli is the download size. See the
-[eleventh size audit](../../docs/validation/2026-10-09-engine-size-round11.md)
-for the variant deltas, the speed screen and the rows it flags, validation and
-the QuickJS gap. The accepted ninth-pass packages were 2,827,053 / 753,477,
-5,220,442 / 1,290,210, 6,896,451 / 1,663,170 and 8,851,582 / 2,008,520, and
-the tenth pass's modules 2,808,464 / 750,138, 5,145,953 / 1,279,443,
-6,808,551 / 1,651,669 and 8,733,543 / 1,995,301.
+[twelfth size audit](../../docs/validation/2026-10-10-engine-size-round12.md)
+for the variant deltas, the speed screen and the rows it flags, and
+validation. The eleventh pass's modules, the last accepted, were
+2,654,515 / 716,795, 4,977,978 / 1,239,416, 6,644,132 / 1,612,708 and
+8,568,374 / 1,963,702 ([its audit](../../docs/validation/2026-10-09-engine-size-round11.md)
+has the QuickJS gap); the ninth pass's 2,827,053 / 753,477,
+5,220,442 / 1,290,210, 6,896,451 / 1,663,170 and 8,851,582 / 2,008,520.
 
 Stronger optimization is not automatically better. Earlier `-O3` / `-Oz`
 measurements reduced raw size but increased Brotli size and slowed execution.

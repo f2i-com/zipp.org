@@ -1,5 +1,46 @@
 # Zipp performance handoff
 
+### 10 October: WebAssembly interpreter speed, string and RegExp cliffs, twelfth size pass (local)
+
+`codex/engine-size-reduction` is 15 commits past the eleventh pass's note
+(`ea517745`) at `c913b447`, unpushed, every commit `[skip ci]`. The user
+accepted the eleventh-pass modules on 10 October; this pass is measured
+against them. A profile of the modules, the first any pass took, found five
+costs in the checked (`safe-sandbox`) profile and the interpreter: against
+the accepted modules the JavaScript corpus takes 0.90 of the time, the two
+Python modules 0.90 to 0.92 and Lite 0.97 to 0.98. Four workloads that were
+quadratic in a string's length are linear (a sticky-regex tokenizer over
+190 KB: 17.8 s to 164 ms), and a loop that built and dropped large RegExps
+no longer dies of uncollected programs. The three full modules are 80 KB
+smaller raw. Native speed and the Python suite are unchanged. Measurements,
+gates and the evidence file are in
+[the twelfth-pass note](docs/validation/2026-10-10-engine-size-round12.md).
+
+Open:
+
+- The modules are not accepted yet: `crates/zipp-wasm/dist` still holds the
+  eleventh pass's, and this pass's are in
+  `target/size-audit/<variant>-r12l/final-node`. The screen flags
+  string-build and json in Lite, promise-resolve in JavaScript and
+  error-typedarray in Python + Torch. Lite's string-build (1% to 15%
+  slower) is a real cost: the checked profile validates the digits it
+  appends to a text-backed string.
+- Code under `#[cfg(feature = "safe-sandbox")]` is built by neither Test262
+  nor the default-feature suite. Gate it with
+  `cargo test -p zipp-vm --no-default-features --features safe-sandbox`
+  (and `wasm-lite`); that suite caught a metering hole in this pass that
+  every default gate passed. It also fails
+  `audit_20260915_props::props_modes_match_node` on a stack limit, and did
+  at `9df8019c`.
+- The audit walk at every poll of a realm-sized heap is 2% to 3% of every
+  WebAssembly row (`heap_walk_stride_for`); widening it is a sandbox
+  trade-off.
+- The Python modules clone the runtime seed (2,300 function prototypes) for
+  each program: 10% to 12% of the `python-*-e2e` rows.
+- Lite runs integer loops three times slower than the JavaScript module;
+  `opt-level = "z"` decides that, not the source.
+- The eleventh pass's open items below still stand.
+
 ### 9 October: Python start, compact Unicode tables and eleventh size pass (local)
 
 `codex/engine-size-reduction` is 11 commits past the tenth pass (`baf077c3`),
