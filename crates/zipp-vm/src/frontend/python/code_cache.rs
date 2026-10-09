@@ -20,7 +20,7 @@
 //! key in `compile_lazy`). The file carries that key and a checksum of its
 //! contents; anything that does not match (a torn write, a truncated file)
 //! is ignored and the code compiled as if there were no cache. A folder
-//! keeps its [`ENTRIES`] newest entries.
+//! keeps [`FOLDER_BYTES`] of entries, those used most recently.
 //!
 //! The folder is the user's own (like CPython's `__pycache__`): its entries
 //! are trusted exactly as far as the executable they belong to.
@@ -37,11 +37,15 @@ const KEEP: usize = 3;
 /// The marker whose modification time says when an executable's folder was
 /// last used (refreshed at most hourly).
 const USED: &str = "used";
-/// Entries kept in one executable's folder. A combination of settings needs
-/// one for the runtime and one for each library module a program imports;
-/// without a bound, a caller that varies a `ZIPP_*` value from run to run
-/// left 0.76 MB behind for every run.
-const ENTRIES: usize = 32;
+/// Bytes of entries kept in one executable's folder. A combination of
+/// settings needs the runtime (0.76 MB) and each library module a program
+/// imports (the bundled library has about fifty); without a bound, a caller
+/// that varies a `ZIPP_*` value from run to run left the runtime behind
+/// again for every run.
+const FOLDER_BYTES: u64 = 64 * 1024 * 1024;
+/// How long an entry's modification time, which says when it was last used,
+/// may go without being brought up to date by a load.
+const REFRESH_SECS: u64 = 3600;
 /// `ZIPP_*` variables that observe a run without changing what the
 /// compilers emit, so they are not part of an entry's key: a profiled or
 /// logged run starts from the same compiled code as a plain one, and a dump
@@ -141,7 +145,13 @@ fn checksum(bytes: &[u8]) -> u64 {
 /// The payload of the entry `name` of `dir`, if it is there, intact and
 /// written for `key`.
 fn load(dir: &Path, name: &str, key: u64) -> Option<Vec<u8>> {
-    let mut bytes = std::fs::read(dir.join(name)).ok()?;
+    use std::io::Read;
+    let path = dir.join(name);
+    let mut file = std::fs::File::open(&path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    drop(file);
     let header = bytes.get(..32)?;
     if &header[..8] != MAGIC || u64::from_le_bytes(header[8..16].try_into().ok()?) != key {
         return None;
@@ -151,6 +161,20 @@ fn load(dir: &Path, name: &str, key: u64) -> Option<Vec<u8>> {
     let payload = bytes.get(32..)?;
     if payload.len() != len || checksum(payload) != sum {
         return None;
+    }
+    // An entry's modification time is when it was last used, which is what
+    // `trim` keeps entries by: the runtime is written once and loaded by
+    // every run, and must not be the first to go. Brought up to date at most
+    // hourly, so a run seldom writes.
+    let stale = metadata
+        .modified()
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .is_none_or(|age| age.as_secs() > REFRESH_SECS);
+    if stale {
+        if let Ok(file) = std::fs::File::options().write(true).open(&path) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
     }
     bytes.drain(..32);
     Some(bytes)
@@ -181,32 +205,34 @@ fn store(dir: &Path, name: &str, key: u64, payload: &[u8]) {
     if fresh {
         prune(dir);
     } else {
-        trim(dir);
+        trim(dir, FOLDER_BYTES);
     }
 }
 
-/// Keep the [`ENTRIES`] most recently written entries of `dir`.
-fn trim(dir: &Path) {
+/// Keep the most recently used entries of `dir` that fit in `limit` bytes.
+fn trim(dir: &Path, limit: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut written: Vec<(std::time::SystemTime, PathBuf)> = entries
+    let mut used: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "bin"))
-        .map(|p| {
-            let at = std::fs::metadata(&p)
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            (at, p)
+        .filter_map(|p| {
+            let metadata = std::fs::metadata(&p).ok()?;
+            Some((metadata.modified().unwrap_or(std::time::UNIX_EPOCH), metadata.len(), p))
         })
         .collect();
-    if written.len() <= ENTRIES {
+    if used.iter().map(|entry| entry.1).sum::<u64>() <= limit {
         return;
     }
-    crate::cold_sort::sort_by(&mut written, |a, b| b.0.cmp(&a.0));
-    for (_, old) in written.into_iter().skip(ENTRIES) {
-        let _ = std::fs::remove_file(old);
+    crate::cold_sort::sort_by(&mut used, |a, b| b.0.cmp(&a.0));
+    let mut kept = 0u64;
+    for (_, size, path) in used {
+        kept += size;
+        if kept > limit {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -381,32 +407,33 @@ mod cache_check {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A folder keeps a bounded number of entries, the newest ones.
+    /// A folder keeps a bounded size of entries: those used most recently,
+    /// where loading an entry is using it.
     #[test]
-    fn code_cache_folder_keeps_its_newest_entries() {
+    fn code_cache_folder_keeps_what_was_used_last() {
         let dir = std::env::temp_dir().join(format!("zipp-code-cache-trim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let entry = dir.join("0123456789abcdef");
-        let total = super::ENTRIES + 9;
-        for i in 0..total {
-            super::store(&entry, &format!("runtime-{i:016x}.bin"), i as u64, b"payload");
-            // Entries written in one clock tick have no order to keep.
-            let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i as u64);
-            let file = std::fs::File::options()
-                .write(true)
-                .open(entry.join(format!("runtime-{i:016x}.bin")))
-                .unwrap();
+        let name = |i: u64| format!("runtime-{i:016x}.bin");
+        let payload = [7u8; 68];
+        // Ten entries of 100 bytes, written a day apart long ago, the first
+        // of them the oldest.
+        for i in 0..10u64 {
+            super::store(&entry, &name(i), i, &payload);
+            let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + 86_400 * i);
+            let file = std::fs::File::options().write(true).open(entry.join(name(i))).unwrap();
             file.set_modified(at).unwrap();
         }
-        let kept = |i: usize| super::load(&entry, &format!("runtime-{i:016x}.bin"), i as u64).is_some();
-        let bins = std::fs::read_dir(&entry)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
-            .count();
-        assert_eq!(bins, super::ENTRIES);
-        assert!(kept(total - 1) && kept(total - super::ENTRIES));
-        assert!(!kept(0) && !kept(total - super::ENTRIES - 1));
+        let present = |i: u64| entry.join(name(i)).exists();
+        // Everything fits: nothing goes.
+        super::trim(&entry, 1000);
+        assert!((0..10).all(present));
+        // The oldest entry is loaded, as the runtime is by every run: that
+        // is its use, so it outlives entries written after it.
+        assert_eq!(super::load(&entry, &name(0), 0).as_deref(), Some(&payload[..]));
+        super::trim(&entry, 450);
+        let kept: Vec<u64> = (0..10).filter(|&i| present(i)).collect();
+        assert_eq!(kept, [0, 7, 8, 9]);
         assert!(entry.join(super::USED).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
