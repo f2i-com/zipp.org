@@ -154,8 +154,20 @@ impl<'s> Lexer<'s> {
 
     /// Decode the char at `pos` (which must be a UTF-8 boundary), and its width.
     fn char_at(&self, pos: usize) -> (char, usize) {
+        // Only the character at `pos` is wanted, so check the four bytes that
+        // can hold it. Checking the rest of the source instead made every
+        // non-ASCII character cost the length of what followed it: a 300 KB
+        // script of CJK string literals took seconds to tokenize. A window
+        // that ends inside the next character is valid up to that character.
         #[cfg(feature = "safe-sandbox")]
-        let s = std::str::from_utf8(&self.src[pos..]).expect("lexer source is valid UTF-8");
+        let s = {
+            let window = &self.src[pos..self.src.len().min(pos.saturating_add(4))];
+            match std::str::from_utf8(window) {
+                Ok(s) => s,
+                Err(error) => std::str::from_utf8(&window[..error.valid_up_to()])
+                    .expect("lexer source is valid UTF-8"),
+            }
+        };
         #[cfg(not(feature = "safe-sandbox"))]
         let s = unsafe { std::str::from_utf8_unchecked(&self.src[pos..]) };
         match s.chars().next() {
