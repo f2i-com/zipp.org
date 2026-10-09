@@ -274,7 +274,15 @@ jobs:
           # name the revision it was built from: the CHECKED-OUT revision,
           # not the event's (ZA-13).
           ZIPP_SOURCE_SHA: ${{ steps.source.outputs.sha }}
-        run: cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
+        # remap-paths.sh adds the --remap-path-prefix flags that keep the
+        # runner's checkout, registry and toolchain directories out of the
+        # module's panic locations. cargo reads the encoded variable in
+        # preference to RUSTFLAGS, so the flags above are passed through it.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          CARGO_ENCODED_RUSTFLAGS="$(bash ./remap-paths.sh +1.92.0 $RUSTFLAGS)" \
+            cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
       # One list of checks, shared with release.yml and security.yml, so the
       # lanes cannot drift apart.
       - name: Exercise the production host boundary under Node

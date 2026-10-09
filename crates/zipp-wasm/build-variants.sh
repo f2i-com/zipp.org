@@ -24,7 +24,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 TARGET=wasm32-unknown-unknown
-export RUSTFLAGS="${RUSTFLAGS:--C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=16777216}"
+RUSTFLAGS="${RUSTFLAGS:--C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=16777216}"
+# The same flags, plus the source-path remapping that keeps this machine's
+# directories out of the module (see remap-paths.sh). cargo reads the encoded
+# variable in preference to RUSTFLAGS.
+# shellcheck disable=SC2086
+ENGINE_RUSTFLAGS="$(bash ./remap-paths.sh +1.92.0 $RUSTFLAGS)"
+TORCH_RUSTFLAGS="$(bash ./remap-paths.sh +1.92.0 -C link-arg=--strip-all)"
+unset RUSTFLAGS
 
 declare -A FEATURES=(
   [lite]="--features lite"
@@ -57,7 +64,7 @@ for v in "${variants[@]}"; do
     # The package module: no wasm-bindgen (it has no imports); the linker
     # strips every custom section (names, producers, target_features).
     echo "=== torch: cargo build --release --target $TARGET (torch/)"
-    RUSTFLAGS="-C link-arg=--strip-all" \
+    CARGO_ENCODED_RUSTFLAGS="$TORCH_RUSTFLAGS" \
       cargo +1.92.0 build --locked --release --target "$TARGET" --manifest-path torch/Cargo.toml --target-dir torch/target
     rm -rf "$out"
     mkdir -p "$out"
@@ -71,7 +78,8 @@ for v in "${variants[@]}"; do
   [ "$v" = lite ] && profile=lite
   echo "=== $v: cargo build --profile $profile --target $TARGET ${FEATURES[$v]}"
   # shellcheck disable=SC2086
-  cargo +1.92.0 build --locked --profile "$profile" --target "$TARGET" --target-dir "target/variants/$v" ${FEATURES[$v]}
+  CARGO_ENCODED_RUSTFLAGS="$ENGINE_RUSTFLAGS" \
+    cargo +1.92.0 build --locked --profile "$profile" --target "$TARGET" --target-dir "target/variants/$v" ${FEATURES[$v]}
   rm -rf "$out"
   wasm-bindgen --target web --out-dir "$out" \
     --remove-name-section --remove-producers-section \

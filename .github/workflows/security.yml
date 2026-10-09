@@ -332,7 +332,15 @@ jobs:
             -C link-arg=--max-memory=1073741824
             -C link-arg=-zstack-size=1048576
           ZIPP_SOURCE_SHA: ${{ inputs.ref || github.sha }}
-        run: cargo +${{ env.TOOLCHAIN }} build --locked --release --target wasm32-unknown-unknown
+        # remap-paths.sh adds the --remap-path-prefix flags that keep the
+        # runner's checkout, registry and toolchain directories out of the
+        # module's panic locations. cargo reads the encoded variable in
+        # preference to RUSTFLAGS, so the flags above are passed through it.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          CARGO_ENCODED_RUSTFLAGS="$(bash ./remap-paths.sh +${{ env.TOOLCHAIN }} $RUSTFLAGS)" \
+            cargo +${{ env.TOOLCHAIN }} build --locked --release --target wasm32-unknown-unknown
       # The same list CI and release run; see tests/node/run-boundary-suite.cjs.
       - name: Test the production host boundary under Node
         run: |

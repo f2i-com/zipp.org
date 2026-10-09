@@ -488,7 +488,15 @@ jobs:
             -C link-arg=--max-memory=1073741824
             -C link-arg=-zstack-size=${{ matrix.stack_bytes }}
           ZIPP_SOURCE_SHA: ${{ needs.validate.outputs.commit }}
-        run: cargo build --locked --release --target wasm32-unknown-unknown ${{ matrix.features }}
+        # remap-paths.sh adds the --remap-path-prefix flags that keep the
+        # runner's checkout, registry and toolchain directories out of the
+        # module's panic locations. cargo reads the encoded variable in
+        # preference to RUSTFLAGS, so the flags above are passed through it.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          CARGO_ENCODED_RUSTFLAGS="$(bash ./remap-paths.sh $RUSTFLAGS)" \
+            cargo build --locked --release --target wasm32-unknown-unknown ${{ matrix.features }}
 
       # The one shared list (tests/node/run-boundary-suite.cjs): the same
       # checks CI runs, including the parse-shape limits calibrated against
@@ -543,7 +551,7 @@ jobs:
           bundle="zipp-wasm-$RELEASE_VERSION-$WASM_SUFFIX"
           archive="$bundle.zip"
           mkdir -p "dist/$bundle"
-          # Use the same stripping and guarded Binaryen 125 -O1 pass as the
+          # Use the same stripping and guarded Binaryen 125 -O1 -O1 pass as the
           # Node checks above. Stronger -O3/-Oz passes increased wire size;
           # optimize-wasm.sh accepts only a raw AND Brotli size improvement.
           wasm-bindgen --target web --out-dir "dist/$bundle" \

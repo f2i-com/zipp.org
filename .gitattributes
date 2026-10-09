@@ -5,6 +5,15 @@ tools/test262-corrections/*.patch whitespace=-blank-at-eol,-blank-at-eof
 docs/validation/*.patch text eol=lf
 bench/pgo-training/** text eol=lf
 
+# The Python frontend's library and runtime, and the embedding's JavaScript
+# preamble, are compiled into the engine as text. A CRLF checkout puts one
+# carriage return per source line into every artifact built from it (60 KB in
+# the complete WebAssembly module), so a Windows build was larger than the
+# Linux release build of the same commit and embedded different text.
+crates/zipp-vm/src/frontend/python/lib/** text eol=lf
+crates/zipp-vm/src/frontend/python/runtime/** text eol=lf
+crates/zipp-wasm/src/preamble.js text eol=lf
+
 # The WASM engine pairs are hash-checked against their manifests; never convert line endings.
 landing/public/playground-runtime/** -text
 landing/public/wasm/** -text
