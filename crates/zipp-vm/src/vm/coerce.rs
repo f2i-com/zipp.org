@@ -1834,7 +1834,7 @@ impl<'p> Vm<'p> {
                 let ai = a.heap_index();
                 let taken = std::mem::replace(
                     self.heap.get_mut(ai),
-                    HeapObj::Str(crate::heap::JsStr::from_ascii(Vec::new())),
+                    HeapObj::Str(crate::heap::JsStr::empty()),
                 );
                 let mut out = match taken {
                     HeapObj::Str(s) => s,
@@ -1843,23 +1843,25 @@ impl<'p> Vm<'p> {
                         return self.add_values_right_pair(a, b, c);
                     }
                 };
-                let bb = match self.heap.get(b.heap_index()) {
-                    HeapObj::Str(s) => s.as_bytes(),
-                    _ => &[],
+                // `b` and a string `c` were found flat and ASCII above.
+                let empty = crate::heap::JsStr::empty();
+                let bs = match self.heap.get(b.heap_index()) {
+                    HeapObj::Str(s) => s,
+                    _ => &empty,
                 };
                 if c.is_int() {
                     let (digits, start) = fmt_i32_buf(c.as_int());
-                    out.reserve_bytes(bb.len() + digits.len() - start);
-                    out.push_wtf8(bb);
+                    out.reserve_bytes(bs.as_bytes().len() + digits.len() - start);
+                    out.push_js(bs);
                     out.push_wtf8(&digits[start..]);
                 } else {
-                    let cb = match self.heap.get(c.heap_index()) {
-                        HeapObj::Str(s) => s.as_bytes(),
-                        _ => &[],
+                    let cs = match self.heap.get(c.heap_index()) {
+                        HeapObj::Str(s) => s,
+                        _ => &empty,
                     };
-                    out.reserve_bytes(bb.len() + cb.len());
-                    out.push_wtf8(bb);
-                    out.push_wtf8(cb);
+                    out.reserve_bytes(bs.as_bytes().len() + cs.as_bytes().len());
+                    out.push_js(bs);
+                    out.push_js(cs);
                 }
                 *self.heap.get_mut(ai) = HeapObj::Str(out);
                 pairstats::in_place();
@@ -2006,16 +2008,13 @@ impl<'p> Vm<'p> {
             }
             let slot = self.heap.get_mut(ai);
             if matches!(slot, HeapObj::Str(_)) {
-                let taken = std::mem::replace(
-                    slot,
-                    HeapObj::Str(crate::heap::JsStr::from_wtf8(Vec::new())),
-                );
+                let taken = std::mem::replace(slot, HeapObj::Str(crate::heap::JsStr::empty()));
                 let mut js = match taken {
                     HeapObj::Str(js) => js,
                     _ => unreachable!("checked Str above"),
                 };
                 if let HeapObj::Str(vs) = self.heap.get(val.heap_index()) {
-                    js.push_wtf8(vs.as_bytes());
+                    js.push_js(vs);
                     *self.heap.get_mut(ai) = HeapObj::Str(js);
                     return Some(acc);
                 }

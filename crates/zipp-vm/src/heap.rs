@@ -2711,7 +2711,7 @@ impl ObjMap {
 /// helpers and the `&Heap` accessors require.
 #[derive(Clone, Debug)]
 pub struct JsStr {
-    bytes: Vec<u8>,
+    bytes: StrBytes,
     /// `u32` (every string is bounded by `MAX_STRING_UNITS`, 1 << 28) so the
     /// memo fits the same 40-byte layout the former `usize` field used.
     units: u32,
@@ -2723,6 +2723,268 @@ pub struct JsStr {
     /// keeps the one-byte constructor initialization.
     memo_state: u8,
     cursor: Cell<u64>,
+}
+
+/// The bytes of a [`JsStr`].
+///
+/// Under `safe-sandbox` a well-formed string keeps them as a `String`. That
+/// profile forbids `from_utf8_unchecked`, so viewing a `Vec<u8>` as `&str`
+/// went through the checked conversion, which validates the whole buffer on
+/// every view: a RegExp `exec` views its subject once per match, and
+/// `s.match(/\d+/g)` over 23 KB spent 55% of its time re-validating text that
+/// was validated when it was built. Here the type carries that proof, and
+/// only a string holding a lone surrogate, which is not UTF-8, is plain
+/// bytes. `JsStr::wellformed` is true exactly when the bytes are `Utf8`.
+#[cfg(feature = "safe-sandbox")]
+#[derive(Clone, Debug)]
+enum StrBytes {
+    Utf8(String),
+    Wtf8(Vec<u8>),
+}
+
+/// The bytes of a [`JsStr`]: WTF-8, and UTF-8 whenever `JsStr::wellformed`.
+#[cfg(not(feature = "safe-sandbox"))]
+#[derive(Clone, Debug)]
+struct StrBytes(Vec<u8>);
+
+#[cfg(feature = "safe-sandbox")]
+impl StrBytes {
+    #[inline]
+    fn from_text(text: String) -> StrBytes {
+        StrBytes::Utf8(text)
+    }
+
+    /// Bytes the caller holds to be UTF-8. They are checked once, here; a
+    /// buffer that fails stays plain bytes and `is_text_or` reports it.
+    #[inline]
+    fn from_utf8(bytes: Vec<u8>) -> StrBytes {
+        match String::from_utf8(bytes) {
+            Ok(text) => StrBytes::Utf8(text),
+            Err(error) => StrBytes::Wtf8(error.into_bytes()),
+        }
+    }
+
+    #[inline]
+    fn from_wtf8(bytes: Vec<u8>) -> StrBytes {
+        StrBytes::Wtf8(bytes)
+    }
+
+    #[inline]
+    fn with_capacity(capacity: usize, text: bool) -> StrBytes {
+        if text {
+            StrBytes::Utf8(String::with_capacity(capacity))
+        } else {
+            StrBytes::Wtf8(Vec::with_capacity(capacity))
+        }
+    }
+
+    /// Whether the bytes are known UTF-8. `claimed` is what the caller's own
+    /// scan found; the unchecked profile has nothing else to go by.
+    #[inline]
+    fn is_text_or(&self, _claimed: bool) -> bool {
+        matches!(self, StrBytes::Utf8(_))
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        match self {
+            StrBytes::Utf8(text) => text.capacity(),
+            StrBytes::Wtf8(bytes) => bytes.capacity(),
+        }
+    }
+
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        match self {
+            StrBytes::Utf8(text) => text.reserve(additional),
+            StrBytes::Wtf8(bytes) => bytes.reserve(additional),
+        }
+    }
+
+    #[inline]
+    fn push_ascii(&mut self, byte: u8) {
+        match self {
+            // Masked, so the push is known to be of one byte.
+            StrBytes::Utf8(text) => text.push(char::from(byte & 0x7F)),
+            StrBytes::Wtf8(bytes) => bytes.push(byte),
+        }
+    }
+
+    /// Append bytes the caller holds to be ASCII. A short run (an integer's
+    /// digits, a separator) goes byte by byte, which costs less than the
+    /// call that checks a slice; a long one is checked as `push_utf8` does.
+    #[inline]
+    fn push_ascii_bytes(&mut self, add: &[u8]) {
+        if add.len() <= 16 {
+            if let StrBytes::Utf8(text) = self {
+                text.reserve(add.len());
+                for &byte in add {
+                    text.push(char::from(byte & 0x7F));
+                }
+                return;
+            }
+        }
+        self.push_utf8(add);
+    }
+
+    #[inline]
+    fn push_text(&mut self, add: &str) {
+        match self {
+            StrBytes::Utf8(text) => text.push_str(add),
+            StrBytes::Wtf8(bytes) => bytes.extend_from_slice(add.as_bytes()),
+        }
+    }
+
+    /// Append bytes the caller holds to be UTF-8 (checked, as `from_utf8`).
+    #[inline]
+    fn push_utf8(&mut self, add: &[u8]) {
+        if let StrBytes::Utf8(text) = self {
+            if let Ok(add) = std::str::from_utf8(add) {
+                text.push_str(add);
+                return;
+            }
+        }
+        self.wtf8_mut().extend_from_slice(add);
+    }
+
+    /// Append another string's bytes; text onto text stays text unchecked.
+    #[inline]
+    fn push_all(&mut self, add: &StrBytes) {
+        match (self, add) {
+            (StrBytes::Utf8(text), StrBytes::Utf8(add)) => text.push_str(add),
+            (this, add) => this.wtf8_mut().extend_from_slice(add),
+        }
+    }
+
+    /// The bytes `a..b`, which the caller holds to lie on character
+    /// boundaries of a well-formed string (any range of an ASCII one).
+    #[inline]
+    fn slice(&self, a: usize, b: usize) -> StrBytes {
+        match self {
+            StrBytes::Utf8(text) => match text.get(a..b) {
+                Some(part) => StrBytes::Utf8(part.to_owned()),
+                None => StrBytes::from_utf8(text.as_bytes()[a..b].to_vec()),
+            },
+            StrBytes::Wtf8(bytes) => StrBytes::from_utf8(bytes[a..b].to_vec()),
+        }
+    }
+
+    /// The buffer, for an edit that can leave it not UTF-8. The caller
+    /// follows with `settle`.
+    fn wtf8_mut(&mut self) -> &mut Vec<u8> {
+        if let StrBytes::Utf8(text) = self {
+            let bytes = std::mem::take(text).into_bytes();
+            *self = StrBytes::Wtf8(bytes);
+        }
+        match self {
+            StrBytes::Wtf8(bytes) => bytes,
+            StrBytes::Utf8(_) => unreachable!("made plain bytes above"),
+        }
+    }
+
+    /// After `wtf8_mut`: hold the bytes as text again if the caller found
+    /// them well formed. Returns whether they are.
+    fn settle(&mut self, wellformed: bool) -> bool {
+        if wellformed {
+            if let StrBytes::Wtf8(bytes) = self {
+                *self = StrBytes::from_utf8(std::mem::take(bytes));
+            }
+        }
+        matches!(self, StrBytes::Utf8(_))
+    }
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl StrBytes {
+    #[inline]
+    fn from_text(text: String) -> StrBytes {
+        StrBytes(text.into_bytes())
+    }
+
+    #[inline]
+    fn from_utf8(bytes: Vec<u8>) -> StrBytes {
+        StrBytes(bytes)
+    }
+
+    #[inline]
+    fn from_wtf8(bytes: Vec<u8>) -> StrBytes {
+        StrBytes(bytes)
+    }
+
+    #[inline]
+    fn with_capacity(capacity: usize, _text: bool) -> StrBytes {
+        StrBytes(Vec::with_capacity(capacity))
+    }
+
+    #[inline]
+    fn is_text_or(&self, claimed: bool) -> bool {
+        claimed
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        self.0.reserve(additional);
+    }
+
+    #[inline]
+    fn push_ascii(&mut self, byte: u8) {
+        self.0.push(byte);
+    }
+
+    #[inline]
+    fn push_ascii_bytes(&mut self, add: &[u8]) {
+        self.0.extend_from_slice(add);
+    }
+
+    #[inline]
+    fn push_text(&mut self, add: &str) {
+        self.0.extend_from_slice(add.as_bytes());
+    }
+
+    #[inline]
+    fn push_utf8(&mut self, add: &[u8]) {
+        self.0.extend_from_slice(add);
+    }
+
+    #[inline]
+    fn push_all(&mut self, add: &StrBytes) {
+        self.0.extend_from_slice(&add.0);
+    }
+
+    #[inline]
+    fn slice(&self, a: usize, b: usize) -> StrBytes {
+        StrBytes(self.0[a..b].to_vec())
+    }
+
+    #[inline]
+    fn wtf8_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.0
+    }
+
+    #[inline]
+    fn settle(&mut self, wellformed: bool) -> bool {
+        wellformed
+    }
+}
+
+impl std::ops::Deref for StrBytes {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        #[cfg(feature = "safe-sandbox")]
+        return match self {
+            StrBytes::Utf8(text) => text.as_bytes(),
+            StrBytes::Wtf8(bytes) => bytes,
+        };
+        #[cfg(not(feature = "safe-sandbox"))]
+        return &self.0;
+    }
 }
 
 const STR_MEMO_FROZEN: u8 = 1;
@@ -3016,7 +3278,7 @@ impl JsStr {
             str_units(&bytes)
         };
         JsStr {
-            bytes: bytes.into_bytes(),
+            bytes: StrBytes::from_text(bytes),
             units: units as u32,
             ascii,
             wellformed: true,
@@ -3036,9 +3298,25 @@ impl JsStr {
     /// regex-log-scan takes ~1.8M such slices per run.
     pub fn from_ascii(bytes: Vec<u8>) -> JsStr {
         debug_assert!(bytes.is_ascii(), "from_ascii: caller's ascii proof failed");
+        let units = bytes.len() as u32;
+        let bytes = StrBytes::from_utf8(bytes);
         JsStr {
-            units: bytes.len() as u32,
+            units,
+            wellformed: bytes.is_text_or(true),
             bytes,
+            ascii: true,
+            memo_state: 0,
+            cursor: Cell::new(0),
+        }
+    }
+
+    /// The empty string, without an allocation or a scan: what an in-place
+    /// append leaves in a slot while it holds the accumulator.
+    #[inline]
+    pub fn empty() -> JsStr {
+        JsStr {
+            bytes: StrBytes::from_text(String::new()),
+            units: 0,
             ascii: true,
             wellformed: true,
             memo_state: 0,
@@ -3048,14 +3326,7 @@ impl JsStr {
 
     pub fn from_wtf8(bytes: Vec<u8>) -> JsStr {
         if bytes.is_ascii() {
-            return JsStr {
-                units: bytes.len() as u32,
-                bytes,
-                ascii: true,
-                wellformed: true,
-                memo_state: 0,
-                cursor: Cell::new(0),
-            };
+            return JsStr::from_ascii(bytes);
         }
         let wellformed = wtf8_is_wellformed(&bytes);
         debug_assert!(
@@ -3076,11 +3347,54 @@ impl JsStr {
             "from_wtf8: non-canonical surrogate pair encoding"
         );
         let units = wtf8_units(&bytes);
+        let bytes = if wellformed {
+            StrBytes::from_utf8(bytes)
+        } else {
+            StrBytes::from_wtf8(bytes)
+        };
         JsStr {
-            bytes,
             units: units as u32,
             ascii: false,
-            wellformed,
+            wellformed: bytes.is_text_or(wellformed),
+            bytes,
+            memo_state: 0,
+            cursor: Cell::new(0),
+        }
+    }
+
+    /// `left + right` for two well-formed strings: no seam can need
+    /// canonicalizing, and the cached metadata composes, so nothing is
+    /// scanned.
+    fn concat_wellformed(left: &JsStr, right: &JsStr, units: usize) -> JsStr {
+        debug_assert!(left.wellformed && right.wellformed);
+        let mut bytes = StrBytes::with_capacity(left.bytes.len() + right.bytes.len(), true);
+        bytes.push_all(&left.bytes);
+        bytes.push_all(&right.bytes);
+        JsStr {
+            units: units as u32,
+            ascii: left.ascii && right.ascii,
+            wellformed: bytes.is_text_or(true),
+            bytes,
+            memo_state: 0,
+            cursor: Cell::new(0),
+        }
+    }
+
+    /// `head + self + tail`, where the raw sides are ASCII (an int's decimal
+    /// form). An ASCII seam can never canonicalize, so the bytes join as they
+    /// are even when `self` holds lone surrogates.
+    fn with_ascii_affixes(&self, head: &[u8], tail: &[u8]) -> JsStr {
+        debug_assert!(head.is_ascii() && tail.is_ascii());
+        let mut bytes =
+            StrBytes::with_capacity(head.len() + self.bytes.len() + tail.len(), self.wellformed);
+        bytes.push_ascii_bytes(head);
+        bytes.push_all(&self.bytes);
+        bytes.push_ascii_bytes(tail);
+        JsStr {
+            units: (head.len() + self.units() + tail.len()) as u32,
+            ascii: self.ascii,
+            wellformed: bytes.is_text_or(self.wellformed),
+            bytes,
             memo_state: 0,
             cursor: Cell::new(0),
         }
@@ -3106,12 +3420,16 @@ impl JsStr {
             self.wellformed,
             "as_str_wf on a string containing lone surrogates"
         );
+        // A well-formed string's bytes are held as text (see `StrBytes`).
+        #[cfg(feature = "safe-sandbox")]
+        return match &self.bytes {
+            StrBytes::Utf8(text) => text,
+            StrBytes::Wtf8(_) => panic!("well-formed JsStr invariant"),
+        };
         // SAFETY: `wellformed` records that `bytes` holds no surrogate
         // encodings; the bytes otherwise originate from safe `String`s or the
         // engine's WTF-8 encoders, so they are valid UTF-8 (checked by
         // `from_wtf8`'s debug assertion).
-        #[cfg(feature = "safe-sandbox")]
-        return std::str::from_utf8(&self.bytes).expect("well-formed JsStr invariant");
         #[cfg(not(feature = "safe-sandbox"))]
         return unsafe { std::str::from_utf8_unchecked(&self.bytes) };
     }
@@ -3122,14 +3440,15 @@ impl JsStr {
     /// well-formed strings — the overwhelmingly common case.
     #[inline]
     pub fn as_str_lossy(&self) -> Cow<'_, str> {
+        #[cfg(feature = "safe-sandbox")]
+        return match &self.bytes {
+            StrBytes::Utf8(text) => Cow::Borrowed(text),
+            StrBytes::Wtf8(bytes) => Cow::Owned(wtf8_to_lossy_string(bytes)),
+        };
+        #[cfg(not(feature = "safe-sandbox"))]
         if self.wellformed {
             // SAFETY: as in `as_str_wf` — `wellformed` ⇒ valid UTF-8.
-            #[cfg(feature = "safe-sandbox")]
-            return Cow::Borrowed(
-                std::str::from_utf8(&self.bytes).expect("well-formed JsStr invariant"),
-            );
-            #[cfg(not(feature = "safe-sandbox"))]
-            return Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&self.bytes) });
+            Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&self.bytes) })
         } else {
             Cow::Owned(wtf8_to_lossy_string(&self.bytes))
         }
@@ -3201,7 +3520,7 @@ impl JsStr {
     pub fn push_ascii(&mut self, b: u8) {
         debug_assert!(b < 128);
         debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
-        self.bytes.push(b);
+        self.bytes.push_ascii(b);
         self.units += 1;
     }
 
@@ -3227,15 +3546,11 @@ impl JsStr {
         if !self.ascii || self.frozen() {
             return None;
         }
-        if self.bytes.capacity() < target_capacity {
-            self.bytes
-                .reserve(target_capacity.saturating_sub(self.bytes.len()));
+        let bytes = self.bytes.wtf8_mut();
+        if bytes.capacity() < target_capacity {
+            bytes.reserve(target_capacity.saturating_sub(bytes.len()));
         }
-        Some((
-            self.bytes.as_mut_ptr(),
-            self.bytes.len(),
-            self.bytes.capacity(),
-        ))
+        Some((bytes.as_mut_ptr(), bytes.len(), bytes.capacity()))
     }
 
     /// Publish bytes written by [`Self::prepare_ascii_append_cursor`].
@@ -3256,7 +3571,7 @@ impl JsStr {
         let old_len = self.bytes.len();
         if !self.ascii
             || self.frozen()
-            || self.bytes.as_mut_ptr() != allocation
+            || self.bytes.wtf8_mut().as_mut_ptr() != allocation
             || new_len < old_len
             || new_len > self.bytes.capacity()
         {
@@ -3264,7 +3579,7 @@ impl JsStr {
         }
         // SAFETY: the caller's contract proves the newly exposed range was
         // initialized in-bounds through this exact allocation.
-        unsafe { self.bytes.set_len(new_len) };
+        unsafe { self.bytes.wtf8_mut().set_len(new_len) };
         self.units += (new_len - old_len) as u32;
         true
     }
@@ -3279,27 +3594,47 @@ impl JsStr {
         debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
         self.units += str_units(add) as u32;
         self.ascii &= add.is_ascii();
-        self.bytes.extend_from_slice(add.as_bytes());
+        self.bytes.push_text(add);
+    }
+
+    /// Append another string (`acc += other`). Two well-formed strings join
+    /// on their cached metadata: no seam is possible and nothing is scanned.
+    pub fn push_js(&mut self, add: &JsStr) {
+        if self.wellformed && add.wellformed {
+            debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
+            self.units += add.units;
+            self.ascii &= add.ascii;
+            self.bytes.push_all(&add.bytes);
+            self.wellformed = self.bytes.is_text_or(true);
+        } else {
+            self.push_wtf8(&add.bytes);
+        }
     }
 
     /// Append WTF-8 bytes (an exact `+=` of another string's content),
     /// canonicalizing the seam. Unit length stays additive across the merge.
     pub fn push_wtf8(&mut self, add: &[u8]) {
         debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
-        let add_ascii = add.is_ascii();
-        self.units += if add_ascii {
-            add.len()
-        } else {
-            wtf8_units(add)
-        } as u32;
-        if self.wellformed && (add_ascii || wtf8_is_wellformed(add)) {
+        if add.is_ascii() {
+            // ASCII joins no seam and changes neither flag, whatever it is
+            // appended to. (Onto a string with a lone surrogate this used to
+            // take the branch below and rescan the whole buffer.)
+            self.units += add.len() as u32;
+            self.bytes.push_ascii_bytes(add);
+            self.wellformed = self.bytes.is_text_or(self.wellformed);
+            return;
+        }
+        self.units += wtf8_units(add) as u32;
+        if self.wellformed && wtf8_is_wellformed(add) {
             // Surrogate-free on both sides: plain append, no seam possible.
-            self.ascii &= add_ascii;
-            self.bytes.extend_from_slice(add);
+            self.ascii = false;
+            self.bytes.push_utf8(add);
+            self.wellformed = self.bytes.is_text_or(true);
         } else {
             self.ascii = false;
-            wtf8_push(&mut self.bytes, add);
-            self.wellformed = wtf8_is_wellformed(&self.bytes);
+            wtf8_push(self.bytes.wtf8_mut(), add);
+            let wellformed = wtf8_is_wellformed(&self.bytes);
+            self.wellformed = self.bytes.settle(wellformed);
             // A seam merge rewrites the tail, and the memo may name a
             // boundary at the old end that now falls inside the merged
             // scalar: start over from byte zero.
@@ -3398,12 +3733,18 @@ impl JsStr {
     /// a high half can only END the slice.
     pub fn slice_units(&self, a: usize, b: usize) -> JsStr {
         if self.ascii {
-            let (a, b) = (a.min(self.bytes.len()), b.min(self.bytes.len()));
-            return JsStr::from_wtf8(if a >= b {
-                Vec::new()
-            } else {
-                self.bytes[a..b].to_vec()
-            });
+            // A range of an ASCII string is ASCII: nothing is scanned again.
+            let b = b.min(self.bytes.len());
+            let a = a.min(b);
+            let bytes = self.bytes.slice(a, b);
+            return JsStr {
+                units: (b - a) as u32,
+                ascii: true,
+                wellformed: bytes.is_text_or(true),
+                bytes,
+                memo_state: 0,
+                cursor: Cell::new(0),
+            };
         }
         let units = self.units as usize;
         let (a, b) = (a.min(units), b.min(units));
@@ -4952,7 +5293,7 @@ impl HeapObj {
     /// its reserved address space back to the host allocator.
     fn resident_payload_bytes(&self) -> usize {
         match self {
-            HeapObj::Str(s) => s.bytes.capacity(),
+            HeapObj::Str(s) => s.byte_capacity(),
             HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),
             HeapObj::EvalScope(bindings) => bindings
                 .capacity()
@@ -8011,18 +8352,8 @@ impl Heap {
         {
             if l.wellformed && r.wellformed {
                 debug_assert_eq!(l.units() + r.units(), units);
-                let mut bytes = Vec::with_capacity(l.bytes.len() + r.bytes.len());
-                bytes.extend_from_slice(&l.bytes);
-                bytes.extend_from_slice(&r.bytes);
-                let ascii = l.ascii && r.ascii;
-                return self.alloc(HeapObj::Str(JsStr {
-                    bytes,
-                    units: units as u32,
-                    ascii,
-                    wellformed: true,
-                    memo_state: 0,
-                    cursor: Cell::new(0),
-                }));
+                let joined = JsStr::concat_wellformed(l, r, units);
+                return self.alloc(HeapObj::Str(joined));
             }
         }
         let mut out = Vec::with_capacity(units * 3); // ≤ 3 WTF-8 bytes per UTF-16 unit
@@ -8041,19 +8372,7 @@ impl Heap {
     pub fn alloc_concat_str_ascii(&mut self, left: u32, tail: &[u8]) -> Option<u32> {
         debug_assert!(tail.is_ascii());
         let js = match &self.objs[left as usize] {
-            HeapObj::Str(l) => {
-                let mut bytes = Vec::with_capacity(l.bytes.len() + tail.len());
-                bytes.extend_from_slice(&l.bytes);
-                bytes.extend_from_slice(tail);
-                JsStr {
-                    bytes,
-                    units: (l.units() + tail.len()) as u32,
-                    ascii: l.ascii,
-                    wellformed: l.wellformed,
-                    memo_state: 0,
-                    cursor: Cell::new(0),
-                }
-            }
+            HeapObj::Str(l) => l.with_ascii_affixes(&[], tail),
             _ => return None,
         };
         Some(self.alloc(HeapObj::Str(js)))
@@ -8238,19 +8557,7 @@ impl Heap {
     pub fn alloc_concat_ascii_str(&mut self, head: &[u8], right: u32) -> Option<u32> {
         debug_assert!(head.is_ascii());
         let js = match &self.objs[right as usize] {
-            HeapObj::Str(r) => {
-                let mut bytes = Vec::with_capacity(head.len() + r.bytes.len());
-                bytes.extend_from_slice(head);
-                bytes.extend_from_slice(&r.bytes);
-                JsStr {
-                    bytes,
-                    units: (head.len() + r.units()) as u32,
-                    ascii: r.ascii,
-                    wellformed: r.wellformed,
-                    memo_state: 0,
-                    cursor: Cell::new(0),
-                }
-            }
+            HeapObj::Str(r) => r.with_ascii_affixes(head, &[]),
             _ => return None,
         };
         Some(self.alloc(HeapObj::Str(js)))
@@ -8783,11 +9090,105 @@ mod tests {
         assert_eq!(heap.concat_suffix_memo_get(head, colon), None);
     }
 
+    #[test]
+    fn a_string_is_viewed_as_text_exactly_when_it_is_well_formed() {
+        let high = JsStr::from_code_point(0xD83D);
+        let low = JsStr::from_code_point(0xDE00);
+        assert!(!high.is_wellformed());
+        assert_eq!(high.as_str_lossy(), "\u{FFFD}");
+
+        // Text, then a lone surrogate, then its other half: the seam merges
+        // into one scalar and the whole string is text again.
+        let mut s = JsStr::new("a\u{e9}".into());
+        assert_eq!(s.as_str_wf(), "a\u{e9}");
+        s.push_wtf8(high.as_bytes());
+        assert!(!s.is_wellformed());
+        assert_eq!(s.as_str_lossy(), "a\u{e9}\u{FFFD}");
+        assert_eq!(s.units(), 3);
+        s.push_wtf8(low.as_bytes());
+        assert!(s.is_wellformed());
+        assert_eq!(s.as_str_wf(), "a\u{e9}\u{1F600}");
+        assert_eq!(s.units(), 4);
+        s.push_ascii(b'!');
+        s.push_wtf8("\u{4e2d}".as_bytes());
+        s.push_str("z");
+        assert_eq!(s.as_str_wf(), "a\u{e9}\u{1F600}!\u{4e2d}z");
+        assert_eq!(s.as_bytes(), "a\u{e9}\u{1F600}!\u{4e2d}z".as_bytes());
+        assert_eq!(s.units(), 7);
+        assert!(!s.is_ascii());
+
+        // Slices: of ASCII, of text on scalar boundaries, and through a pair.
+        let ascii = JsStr::from_ascii(b"hello world".to_vec());
+        let part = ascii.slice_units(6, 99);
+        assert_eq!(part.as_str_wf(), "world");
+        assert!(part.is_ascii() && part.is_wellformed());
+        assert_eq!(part.units(), 5);
+        assert_eq!(ascii.slice_units(5, 2).as_str_wf(), "");
+        assert_eq!(s.slice_units(1, 2).as_str_wf(), "\u{e9}");
+        let half = s.slice_units(2, 3);
+        assert!(!half.is_wellformed());
+        assert_eq!(half.as_bytes(), high.as_bytes());
+
+        // The concatenations that compose metadata instead of scanning.
+        let joined = JsStr::concat_wellformed(&ascii, &part, 16);
+        assert_eq!(joined.as_str_wf(), "hello worldworld");
+        assert!(joined.is_ascii());
+        let framed = half.with_ascii_affixes(b"<", b">");
+        assert!(!framed.is_wellformed());
+        assert_eq!(framed.as_str_lossy(), "<\u{FFFD}>");
+        assert_eq!(framed.units(), 3);
+        let numbered = s.with_ascii_affixes(b"", b"42");
+        assert_eq!(numbered.as_str_wf(), "a\u{e9}\u{1F600}!\u{4e2d}z42");
+        assert_eq!(numbered.units(), 9);
+        assert_eq!(numbered.clone().as_str_wf(), numbered.as_str_wf());
+
+        // Appending a whole string: text onto text, and through a seam.
+        let mut built = JsStr::empty();
+        assert_eq!(built.as_str_wf(), "");
+        built.push_js(&ascii);
+        built.push_js(&s);
+        assert_eq!(built.as_str_wf(), "hello worlda\u{e9}\u{1F600}!\u{4e2d}z");
+        assert_eq!(built.units(), 18);
+        assert!(!built.is_ascii() && built.is_wellformed());
+        built.push_js(&high);
+        assert!(!built.is_wellformed());
+        // ASCII onto a lone surrogate leaves it lone, and a long run of ASCII
+        // takes the checked append rather than the byte-by-byte one.
+        built.push_wtf8(b"0123456789abcdefghijklmnopqrstuvwxyz");
+        assert!(!built.is_wellformed());
+        assert_eq!(built.units(), 55);
+        built.push_js(&low);
+        assert!(!built.is_wellformed());
+        let mut pair = JsStr::from_ascii(b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec());
+        pair.push_wtf8(b"0123456789abcdefghijklmnopqrstuvwxyz");
+        pair.push_js(&high);
+        pair.push_js(&low);
+        assert!(pair.is_wellformed());
+        assert_eq!(pair.units(), 74);
+        assert!(pair.as_str_wf().ends_with("yz\u{1F600}"));
+
+        // Bytes that only claim to be text are never viewed as text.
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let mut bytes = StrBytes::from_utf8(vec![b'a', 0xFF]);
+            assert!(!bytes.is_text_or(true));
+            assert!(!bytes.settle(true));
+            assert_eq!(&*bytes, &[b'a', 0xFF]);
+        }
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn static_key_plan_keeps_hot_layout_sizes_exact() {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
+        // `safe-sandbox` keeps a string's bytes behind a tag (see `StrBytes`).
+        // On a 64-bit host that is one word more; on wasm32, the target that
+        // profile ships for, the tag fits the padding and the size is 32
+        // either way.
+        #[cfg(not(feature = "safe-sandbox"))]
         assert_eq!(std::mem::size_of::<JsStr>(), 40);
+        #[cfg(feature = "safe-sandbox")]
+        assert_eq!(std::mem::size_of::<JsStr>(), 48);
         assert_eq!(std::mem::size_of::<PropKeys>(), 24);
         assert_eq!(std::mem::size_of::<ValStore>(), 24);
         assert_eq!(std::mem::size_of::<ObjMap>(), 112);
