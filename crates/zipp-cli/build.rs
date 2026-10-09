@@ -44,6 +44,36 @@ pub(crate) fn windows_stack_link_arg(target: &str) -> Option<String> {
     }
 }
 
+// The `gpu` feature links gpu-lab's runtime over wgpu, and with it imports of
+// these four system DLLs. As ordinary imports the Windows loader maps and
+// initialises all of them, and what user32 brings with it, before `main`:
+// measured, 7.0 ms to start instead of 4.9 ms, on EVERY launch, including
+// `zipp --version`, `zipp js` and a Python program that never builds a graph.
+// Delay-loaded, each is bound by its first call instead, so only a program
+// that starts the GPU bridge loads them, which is what `src/gpu.rs` promises
+// ("a program that never submits one pays nothing").
+//
+// The search order is unchanged: user32, oleaut32 and setupapi are KnownDLLs
+// either way, and dxgi was already resolved application-directory-first.
+pub(crate) const WINDOWS_GPU_DELAY_LOAD_DLLS: [&str; 4] =
+    ["dxgi.dll", "oleaut32.dll", "setupapi.dll", "user32.dll"];
+
+pub(crate) fn windows_delay_load_link_args(target: &str, gpu: bool) -> Vec<String> {
+    // `/DELAYLOAD` belongs to the MSVC linker flavour (link.exe and lld-link).
+    // The GNU flavours can only delay-load through a specially built import
+    // library, so those targets keep the ordinary imports.
+    if !gpu || !target.ends_with("-windows-msvc") {
+        return Vec::new();
+    }
+    let mut args: Vec<String> = WINDOWS_GPU_DELAY_LOAD_DLLS
+        .iter()
+        .map(|dll| format!("/DELAYLOAD:{dll}"))
+        .collect();
+    // `__delayLoadHelper2`, which the generated thunks call to bind a DLL.
+    args.push("delayimp.lib".to_string());
+    args
+}
+
 fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     if target.contains("-windows-") {
@@ -52,6 +82,10 @@ fn main() {
         // Scope the setting to the shipped CLI binary: build-script helpers,
         // unit tests and unrelated workspace binaries keep their normal stack.
         println!("cargo:rustc-link-arg-bin=zipp={link_arg}");
+        let gpu = std::env::var_os("CARGO_FEATURE_GPU").is_some();
+        for link_arg in windows_delay_load_link_args(&target, gpu) {
+            println!("cargo:rustc-link-arg-bin=zipp={link_arg}");
+        }
     }
 
     let git = |args: &[&str]| -> Option<String> {

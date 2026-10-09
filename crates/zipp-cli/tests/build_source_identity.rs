@@ -28,6 +28,30 @@ fn windows_stack_link_arguments_cover_supported_linker_flavours() {
     );
 }
 
+#[test]
+fn windows_gpu_dlls_are_delay_loaded_only_where_the_linker_can() {
+    assert_eq!(
+        build_script::windows_delay_load_link_args("x86_64-pc-windows-msvc", true),
+        [
+            "/DELAYLOAD:dxgi.dll",
+            "/DELAYLOAD:oleaut32.dll",
+            "/DELAYLOAD:setupapi.dll",
+            "/DELAYLOAD:user32.dll",
+            "delayimp.lib"
+        ]
+    );
+    // Without the feature nothing imports them, and the option would only
+    // draw a linker warning.
+    assert!(build_script::windows_delay_load_link_args("x86_64-pc-windows-msvc", false).is_empty());
+    for target in [
+        "x86_64-pc-windows-gnu",
+        "aarch64-pc-windows-gnullvm",
+        "x86_64-unknown-linux-gnu",
+    ] {
+        assert!(build_script::windows_delay_load_link_args(target, true).is_empty());
+    }
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {
