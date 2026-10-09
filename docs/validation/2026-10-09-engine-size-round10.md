@@ -56,14 +56,14 @@ process start, described below.
 | `436116b6` | The nested leaf splice takes a wrapper over a closure that captures `Math.imul`, the shape of `ri(n) { return (rnd() * n) \| 0 }` over mulberry32. |
 | `131aa66c` | The GPU runtime's `dxgi`, `user32`, `setupapi` and `oleaut32` imports are delay-loaded. |
 
-Every lane is guarded by the identity of the live intrinsic and has a
+Every native lane is guarded by the identity of the live intrinsic and has a
 same-binary off switch (`ZIPP_NO_CAPTURED_METHOD_LANE`,
 `ZIPP_NO_COLL_METHOD_WAY`, `ZIPP_NO_DOUBLE_TA_LENGTH`,
-`ZIPP_NO_NESTED_CAPTURED_IMUL`). Each has a test file whose expected values
-come from Node 24 and that runs in the interpreter and in the native tiers,
-and with its switch off where it has one: `captured_method_lane`,
-`dv_nested_reduce`, `length_fast`, `double_ta_length`,
-`nested_captured_imul`.
+`ZIPP_NO_NESTED_CAPTURED_IMUL`); the interpreter's `.length` shortcut has
+none. Each change has a test file whose expected values come from Node 24 and
+that runs in the interpreter and in the native tiers, and with its switch off
+where it has one: `captured_method_lane`, `dv_nested_reduce`, `length_fast`,
+`double_ta_length`, `nested_captured_imul`.
 
 ## Native measurements
 
@@ -135,13 +135,19 @@ live instead of copying them. `tools/python_bench.py`, 7 repetitions,
 
 Rows that moved by more than 5%: fstring 0.76x, json_roundtrip 0.91x,
 sort_heapq 0.91x and torch_dataloader 0.92x faster; generator_iter 1.12x,
-math_sqrt 1.10x, super_call 1.06x and property_read 1.05x slower. The slower
-rows move from build to build: one engine commit earlier, at `436116b6`, the
-same four read 1.07x, 1.01x, 1.04x and 1.01x, and generator_iter read 0.98x,
-1.05x, 1.03x, 1.00x, 1.09x and 1.12x on the builds of `628e8a4a`, `18614d3d`,
-`66217a9b`, `0fb24b41`, `436116b6` and `c48fc4d2`. As with
-async-promise-chain the readings do not step at one commit, and the rows are
-reported, not explained.
+math_sqrt 1.10x, super_call 1.06x and property_read 1.05x slower. One engine
+commit earlier, at `436116b6`, the slower four read 1.07x, 1.01x, 1.04x and
+1.01x, so three of them move between builds.
+
+generator_iter is a regression that was located but not explained. It reads
+0.99x, 0.99x, 1.00x and 0.99x on the builds of `0fb24b41`, `10a033df`,
+`f08a9b5d` and `131aa66c`, 1.07x at `436116b6` and 1.11x at `c48fc4d2`. The
+behaviour `436116b6` adds is not the cause: with
+`ZIPP_NO_NESTED_CAPTURED_IMUL=1` the final binary takes the same 65 ms, and
+both builds log the same single compiled Python region. With `ZIPP_PY_JIT=0`
+the build before the step and the final build both take 65 ms; with the JIT
+on the earlier one takes 59 ms. From `436116b6` on, the compiled loop no
+longer beats the interpreter on this row.
 
 The largest remaining ratios to CPython are str_methods 6.3x, try_raise_catch
 5.0x, instance_new 4.6x, generator_iter 4.5x and fstring 4.3x. CPython is
@@ -239,9 +245,10 @@ it was not adopted. The final source was chosen on other grounds: the timer
 batch is sorted after a fallible reserve so that a host allocation failure
 cannot abort the sandbox, and the shared sort allocates.
 
-Two builds of the final source from different checkouts agree with each other
-(geomean 0.992 to 0.999, no row flagged), so the movement comes with changes
-to the code, not from rebuilding.
+Two builds of the final code from different checkouts, differing only in
+comments, a dead constant and line numbers, agree with each other (geomean
+0.992 to 0.999, no row flagged), so the movement comes with changes to the
+code, not from rebuilding.
 
 The screen did find two real regressions, both fixed before these builds:
 

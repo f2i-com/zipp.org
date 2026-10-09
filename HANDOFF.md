@@ -1,5 +1,34 @@
 # Zipp performance handoff
 
+### 9 October: call-order speed recovery and tenth size pass (local)
+
+`codex/engine-size-reduction` is 20 commits past `ec0839ce`, unpushed, every
+commit `[skip ci]`. The native tiers again serve the member calls that B280's
+strict order split into `GetProp; <args>; CallWithThis`: the 13 real rows
+take 10.95% less time than at `ec0839ce`, and the headline ten are at 0.982x
+of Node 24 in an ordinary release build. No profile-guided capture was taken,
+so the published table is unchanged. The default Windows CLI delay-loads the
+GPU runtime's system DLLs and starts in 6.3 ms instead of 8.9. The four
+WebAssembly modules are 0.7% to 1.4% smaller. Measurements, gates and the
+evidence file are in
+[the tenth-pass note](docs/validation/2026-10-09-engine-size-round10.md).
+
+Open:
+
+- WebAssembly promise-resolve is 4% to 9% slower in the Lite and Python-base
+  modules, which fails the ninth pass's rule. It moved with edits to code it
+  never runs and was measured on Windows only; the modules are not accepted
+  packages until someone decides.
+- parse-large-js is still 7% behind the relaxed diagnostic order: its scanner
+  regions engage six GPR homes with captured `charCodeAt` pairs and nine with
+  fused calls.
+- Python generator_iter is 7% to 11% slower from `436116b6` on. That commit's
+  behaviour is not the cause (its off switch changes nothing); the compiled
+  loop stopped beating the interpreter and the reason was not found.
+- CI has not run the `remap-paths.sh` workflow steps, nor the default-feature
+  MSVC link with `/DELAYLOAD` and `delayimp.lib`.
+- Python is at 1.80x of CPython 3.13 on in-script time.
+
 ### 14 September: canonical promotion approved
 
 The user approved preparing a promotion PR in `f2i-com/zipp.org` and running

@@ -882,7 +882,7 @@
    }
   },
   "same_source_control": {
-   "what": "JavaScript module built from the final source in a second checkout (baseline) against the main-tree build (candidate); the two differ by four bytes",
+   "what": "JavaScript module built in a second checkout from the final code, differing only in comments, a dead constant and line numbers (baseline), against the main-tree build (candidate); the modules differ by four bytes in size",
    "configurations": [
     "fwd-a4",
     "rev-a4",
@@ -1534,7 +1534,39 @@
    "== base -> head-c48fc4d2",
    "micro/generator_iter          58.8        58.5        65.6        65.1        1.12x",
    "geomean zipp-b/zipp (work_s): micro 1.12x (n=1), all 1.12x (n=1)"
-  ]
+  ],
+  "generator_iter_by_build_second_run": {
+   "0fb24b41": {
+    "ec0839ce_ms": 58.5,
+    "build_ms": 58.0,
+    "ratio": 0.991
+   },
+   "10a033df": {
+    "ec0839ce_ms": 59.7,
+    "build_ms": 58.9,
+    "ratio": 0.986
+   },
+   "f08a9b5d": {
+    "ec0839ce_ms": 58.5,
+    "build_ms": 58.7,
+    "ratio": 1.004
+   },
+   "131aa66c": {
+    "ec0839ce_ms": 59.0,
+    "build_ms": 58.6,
+    "ratio": 0.993
+   },
+   "436116b6": {
+    "ec0839ce_ms": 58.7,
+    "build_ms": 63.1,
+    "ratio": 1.075
+   },
+   "c48fc4d2": {
+    "ec0839ce_ms": 58.7,
+    "build_ms": 65.4,
+    "ratio": 1.113
+   }
+  }
  },
  "test262": {
   "files": 49952,
