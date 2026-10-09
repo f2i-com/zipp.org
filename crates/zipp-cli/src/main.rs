@@ -359,7 +359,9 @@ fn run(args: &[String]) -> Result<(), String> {
             });
             match harness {
                 None if pgo_training => emit(zipp_vm::run_for_pgo_training(&src, base_dir)?),
-                None => emit(zipp_vm::run_with_base(&src, base_dir)?),
+                // The process exits when the program has ended, so its heap
+                // is left for that exit instead of being freed first.
+                None => emit(zipp_vm::run_then_exit(&src, base_dir)?),
                 Some(_) if pgo_training => {
                     Err("--pgo-training does not accept a harness prelude".into())
                 }

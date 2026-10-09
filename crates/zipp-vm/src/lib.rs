@@ -606,7 +606,18 @@ pub(crate) fn compile_only(src: &str, module: bool) -> Result<bytecode::Program,
 /// to resolve a dynamic `import(specifier)` against the filesystem. `None` (the
 /// `run` default) means no host module loader, so `import()` rejects.
 pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
-    run_with_policy(src, base_dir, false)
+    run_with_policy(src, base_dir, false, false)
+}
+
+/// [`run_with_base`] for a host that exits as soon as the program has ended,
+/// such as the `zipp` command. The VM, the compiled program and the syntax
+/// tree are left as they are for the process's exit to reclaim at once,
+/// instead of being freed object by object first: a program that ended with
+/// 1.8 million objects alive spent 100 ms on that after its last statement.
+/// A host that goes on to run anything else must not use it: nothing this
+/// run allocated is ever freed.
+pub fn run_then_exit(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
+    run_with_policy(src, base_dir, false, true)
 }
 
 /// Run one release-PGO training program while denying every secondary source
@@ -619,13 +630,14 @@ pub fn run_for_pgo_training(
     src: &str,
     base_dir: Option<std::path::PathBuf>,
 ) -> Result<Outcome, String> {
-    run_with_policy(src, base_dir, true)
+    run_with_policy(src, base_dir, true, false)
 }
 
 fn run_with_policy(
     src: &str,
     base_dir: Option<std::path::PathBuf>,
     disable_external_code: bool,
+    leave_heap: bool,
 ) -> Result<Outcome, String> {
     // Annex B call assignment targets (`f() = 1` in sloppy code) need no
     // source-rewrite-and-reparse any more: the parser produces `Target::Call`
@@ -654,18 +666,18 @@ fn run_with_policy(
     }
     let result = vm.run();
     vm.report_unhandled_errors();
-    match result {
-        Ok(_) => Ok(Outcome {
-            output: vm.output,
-            errput: vm.errput,
-            error: None,
-        }),
-        Err(thrown) => Ok(Outcome {
-            output: std::mem::take(&mut vm.output),
-            errput: std::mem::take(&mut vm.errput),
-            error: Some(thrown.0),
-        }),
+    let outcome = Outcome {
+        output: std::mem::take(&mut vm.output),
+        errput: std::mem::take(&mut vm.errput),
+        error: result.err().map(|thrown| thrown.0),
+    };
+    if leave_heap {
+        // See `run_then_exit`: the process's exit reclaims all three.
+        std::mem::forget(vm);
+        std::mem::forget(program);
+        std::mem::forget(ast);
     }
+    Ok(outcome)
 }
 
 /// Run `harness` and then `src` as TWO SEPARATE SCRIPTS in one realm — the

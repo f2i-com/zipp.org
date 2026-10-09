@@ -910,7 +910,7 @@ fn run_project(
     // A SystemExit is the program choosing a process status, not a failure:
     // `python_exit` turns it into that status and prints nothing, and leaves a
     // real traceback to be reported as the run's error.
-    match outcome {
+    let result = match outcome {
         Err(error) if refused.is_empty() => python_exit(state, Err(error)),
         Err(error) => match python_exit(state, Err(error)) {
             // The program chose its status and keeps it, but a result is never
@@ -931,7 +931,11 @@ fn run_project(
             }
             Err(summary)
         }
-    }
+    };
+    // The process exits now: its exit reclaims the program's heap at once,
+    // which freeing it object by object first only delays.
+    std::mem::forget(compiled);
+    result
 }
 
 fn decode_base64(text: &str) -> Option<Vec<u8>> {
