@@ -127,11 +127,13 @@ impl StringSet {
     }
 
     /// The number of strings.
+    #[cfg(any(test, feature = "prohibit-unsafe"))]
     pub(crate) fn len(&self) -> usize {
         self.lengths.len()
     }
 
     /// The number of code points in all the strings.
+    #[cfg(any(test, feature = "prohibit-unsafe"))]
     pub(crate) fn code_point_count(&self) -> usize {
         self.code_points.len() / 3
     }
