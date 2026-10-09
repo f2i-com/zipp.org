@@ -641,7 +641,10 @@ impl<'p> Vm<'p> {
     /// Validate the receiver-side guards shared by every `Own*`/`Class*`/
     /// `Proto*` hit: a plain Object receiver outside the exotic set. Returns
     /// its map.
-    #[inline]
+    ///
+    /// Forced inline: it is a handful of compares, and as a call it held
+    /// 10% of a property-read loop's samples on the WebAssembly build.
+    #[inline(always)]
     fn ic_recv_map(&self, recv: Value) -> Option<(u32, &ObjMap)> {
         if !recv.is_heap() || !self.deferred_ns_state.is_empty() {
             return None;
