@@ -2048,12 +2048,10 @@ impl<'p> Vm<'p> {
             ));
         }
         #[cfg(feature = "instrument")]
-        {
-            return self
-                .instrument_preflight_external_heap_growth(bytes)
-                .map_err(|message| Thrown(message.into()));
-        }
-        #[cfg(not(feature = "instrument"))]
+        self.instrument_preflight_external_heap_growth(bytes)
+            .map_err(|message| Thrown(message.into()))?;
+        // The program is about to be retained: let it ask for a collection.
+        self.heap.note_external_bytes(bytes);
         Ok(())
     }
 

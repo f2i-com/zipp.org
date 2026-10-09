@@ -170,3 +170,45 @@ fn regexp_compile_reuses_the_program_that_passed_preflight() {
         "compile must retain one shared program, not a duplicate; growth was {growth}"
     );
 }
+
+/// A RegExp object owns its compiled program outside its payload, so the
+/// count-based collection schedule saw a loop of dropped `/\p{Letter}+/u`
+/// objects as a trickle of small allocations. Nothing was collected until the
+/// embedder's ceiling ended the script: 20,000 of them held 460 MB. A program
+/// now counts toward the byte-based trigger, as a large payload does.
+#[test]
+fn dropped_programs_are_collected_before_the_heap_limit() {
+    let mut state = embed::compile_script(
+        r#"
+        var serial = 0;
+        function churn(n) {
+            var hits = 0;
+            for (var i = 0; i < n; i++) {
+                hits += new RegExp("\\p{Letter}+|" + (serial++), "u").test("abc") ? 1 : 0;
+            }
+            return hits;
+        }
+        "#,
+    )
+    .expect("script compiles");
+    state.set_limits(u64::MAX, None);
+    state.run_init().expect("script initializes");
+    let churn = slot(&state, "churn");
+    let baseline = state.heap_bytes();
+    state.set_heap_limit(baseline + 48 * 1024 * 1024);
+
+    // Each pattern is a program and an ASCII twin of about 23 KiB each:
+    // these 8,000 are over 300 MiB if none is collected.
+    for _ in 0..8 {
+        call_number(&mut state, churn, 1000.0);
+        assert!(
+            state.resource_limit_error().is_none(),
+            "dropped programs must not exhaust the heap"
+        );
+    }
+    let growth = state.heap_bytes().saturating_sub(baseline);
+    assert!(
+        growth < 48 * 1024 * 1024,
+        "dropped programs stayed resident; growth was {growth}"
+    );
+}

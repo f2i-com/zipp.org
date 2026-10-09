@@ -6849,6 +6849,24 @@ impl Heap {
     /// +0.73%) — and forcing it grew the binary by 664KB, which is I-cache
     /// pressure charged to every row. Passing the mirror instead keeps one
     /// body and one copy: `alloc` is a wrapper LLVM folds away.
+    /// Weigh memory an object will own outside its payload against the
+    /// byte-based collection trigger, as `alloc_settled` weighs a large
+    /// payload. A compiled RegExp program is the case: the object that owns
+    /// one has almost no payload, so the count-based schedule saw 20,000
+    /// dropped `/\p{Letter}+/u` objects as 20,000 small allocations while
+    /// they held 460 MB, and the embedder's ceiling ended the script before
+    /// any collection ran.
+    pub(crate) fn note_external_bytes(&mut self, bytes: usize) {
+        if bytes >= BIG_PAYLOAD_BYTES {
+            self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(bytes);
+            if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
+                self.big_bytes_since_gc = 0;
+                self.gc_requested = true;
+                self.major_due = true;
+            }
+        }
+    }
+
     fn alloc_settled(&mut self, obj: HeapObj, hot: HotMirrorHint) -> u32 {
         #[cfg(all(feature = "meter-only", not(feature = "jit")))]
         let _ = hot;
