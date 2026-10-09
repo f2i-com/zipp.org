@@ -373,7 +373,7 @@ pub fn add_icase_code_points(mut input: CodePointSet, unicode: bool) -> CodePoin
 
 pub(crate) enum PropertyEscapeKind {
     CharacterClass(&'static crate::packed_intervals::PackedIntervals),
-    StringSet(&'static [&'static [u32]]),
+    StringSet(crate::packed_strings::StringSet),
 }
 
 #[derive(Debug, Copy, Clone)]

@@ -1793,7 +1793,7 @@ where
                                 ir::Node::Cat(
                                     s.iter()
                                         .map(|c| ir::Node::Char {
-                                            c: *c,
+                                            c,
                                             icase: self.flags.icase,
                                         })
                                         .collect(),
@@ -2277,12 +2277,7 @@ where
                 }
             }
             PropertyEscapeKind::StringSet(strings) => {
-                let codepoints = strings.iter().try_fold(0usize, |n, s| {
-                    n.checked_add(s.len()).ok_or_else(|| Error {
-                        text: "Regular expression Unicode string-property expansion exceeds the sandbox limit"
-                            .to_string(),
-                    })
-                })?;
+                let codepoints = strings.code_point_count();
                 self.string_property_alternatives = self
                     .string_property_alternatives
                     .checked_add(strings.len())
