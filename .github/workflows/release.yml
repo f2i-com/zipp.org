@@ -397,11 +397,25 @@ jobs:
           - variant: javascript
             suffix: web
             features: ""
+            profile: release
+            optimize_flags: ""
+            stack_bytes: 1048576
+            languages: '["javascript"]'
+          # ZIPP Lite: the JavaScript core without Intl, Temporal, Python or
+          # torch, in the size-first `lite` Cargo profile. optimize-wasm.sh
+          # takes the smaller raw module for it, as build-variants.sh does.
+          - variant: lite
+            suffix: web-lite
+            features: "--features lite"
+            profile: lite
+            optimize_flags: "--prefer-raw-size"
             stack_bytes: 1048576
             languages: '["javascript"]'
           - variant: javascript-python
             suffix: web-python
             features: "--features python"
+            profile: release
+            optimize_flags: ""
             stack_bytes: 16777216
             languages: '["javascript","python"]'
           # Python without torch: torch ships separately as the web-torch
@@ -409,6 +423,8 @@ jobs:
           - variant: javascript-python-base
             suffix: web-python-base
             features: "--features python-base"
+            profile: release
+            optimize_flags: ""
             stack_bytes: 16777216
             languages: '["javascript","python"]'
     runs-on: ubuntu-24.04
@@ -496,7 +512,7 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC2086
           CARGO_ENCODED_RUSTFLAGS="$(bash ./remap-paths.sh $RUSTFLAGS)" \
-            cargo build --locked --release --target wasm32-unknown-unknown ${{ matrix.features }}
+            cargo build --locked --profile ${{ matrix.profile }} --target wasm32-unknown-unknown ${{ matrix.features }}
 
       # The one shared list (tests/node/run-boundary-suite.cjs): the same
       # checks CI runs, including the parse-shape limits calibrated against
@@ -509,16 +525,22 @@ jobs:
           set -euo pipefail
           wasm-bindgen --target nodejs --out-dir tests/node/pkg \
             --remove-name-section --remove-producers-section \
-            target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+            target/wasm32-unknown-unknown/${{ matrix.profile }}/zipp_wasm.wasm
           node tests/node/strip-target-features.cjs \
             tests/node/pkg/zipp_wasm_bg.wasm tests/node/pkg/stripped.wasm
           mv tests/node/pkg/stripped.wasm tests/node/pkg/zipp_wasm_bg.wasm
-          bash optimize-wasm.sh tests/node/pkg/zipp_wasm_bg.wasm
+          bash optimize-wasm.sh tests/node/pkg/zipp_wasm_bg.wasm ${{ matrix.optimize_flags }}
 
       - name: Exercise the production host boundary under Node
         if: matrix.variant != 'javascript-python-base'
         run: |
           node tests/node/run-boundary-suite.cjs
+
+      # Lite's own contract: the profile names the variant and what it
+      # omits, Intl and Temporal are absent, and the JavaScript core is whole.
+      - name: Exercise the Lite feature contract under Node
+        if: matrix.variant == 'lite'
+        run: node tests/node/lite.cjs
 
       # The base Python artifact has no torch until a host adds the package;
       # the torch job below proves base + package against the complete one.
@@ -556,13 +578,13 @@ jobs:
           # optimize-wasm.sh accepts only a raw AND Brotli size improvement.
           wasm-bindgen --target web --out-dir "dist/$bundle" \
             --remove-name-section --remove-producers-section \
-            target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+            target/wasm32-unknown-unknown/${{ matrix.profile }}/zipp_wasm.wasm
           node tests/node/strip-target-features.cjs \
             "dist/$bundle/zipp_wasm_bg.wasm" \
             "dist/$bundle/zipp_wasm_bg.stripped.wasm"
           mv "dist/$bundle/zipp_wasm_bg.stripped.wasm" \
             "dist/$bundle/zipp_wasm_bg.wasm"
-          bash optimize-wasm.sh "dist/$bundle/zipp_wasm_bg.wasm"
+          bash optimize-wasm.sh "dist/$bundle/zipp_wasm_bg.wasm" ${{ matrix.optimize_flags }}
           # wasm-bindgen's Node and browser glue use the same module. Prove
           # the shipped bytes are exactly the bytes the boundary tests ran.
           cmp tests/node/pkg/zipp_wasm_bg.wasm "dist/$bundle/zipp_wasm_bg.wasm"
@@ -608,6 +630,10 @@ jobs:
           }
           if (JSON.stringify(profile.languages) !== process.env.EXPECTED_LANGUAGES) {
             throw new Error(`wrong language variant: ${JSON.stringify(profile.languages)}`);
+          }
+          const wantLite = process.env.WASM_VARIANT === "lite";
+          if ((profile.variant === "lite") !== wantLite) {
+            throw new Error(`wrong build variant: ${profile.variant}`);
           }
           fs.writeFileSync(path.join(bundle, "PROFILE.json"), JSON.stringify(profile, null, 2) + "\n");
           if (profile.languages.includes("python") && process.env.WASM_VARIANT === "javascript-python-base") {
@@ -912,6 +938,7 @@ jobs:
             "zipp-$RELEASE_VERSION-x86_64-unknown-linux-gnu.tar.gz"
             "zipp-$RELEASE_VERSION-x86_64-pc-windows-msvc.zip"
             "zipp-wasm-$RELEASE_VERSION-web.zip"
+            "zipp-wasm-$RELEASE_VERSION-web-lite.zip"
             "zipp-wasm-$RELEASE_VERSION-web-python.zip"
             "zipp-wasm-$RELEASE_VERSION-web-python-base.zip"
             "zipp-wasm-$RELEASE_VERSION-web-torch.zip"
@@ -969,11 +996,13 @@ jobs:
               fi
               mkdir existing-assets
               gh release download "$RELEASE_TAG" --dir existing-assets
+              lite_asset="zipp-wasm-${{ needs.validate.outputs.version }}-web-lite.zip"
               expected_existing=(
                 "SHA256SUMS"
                 "zipp-${{ needs.validate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz"
                 "zipp-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip"
                 "zipp-wasm-${{ needs.validate.outputs.version }}-web.zip"
+                "$lite_asset"
                 "zipp-wasm-${{ needs.validate.outputs.version }}-web-python.zip"
                 "zipp-wasm-${{ needs.validate.outputs.version }}-web-python-base.zip"
                 "zipp-wasm-${{ needs.validate.outputs.version }}-web-torch.zip"
@@ -984,12 +1013,32 @@ jobs:
               mapfile -t wanted_existing < <(
                 printf '%s\n' "${expected_existing[@]}" | sort
               )
-              if [[ "${actual_existing[*]}" != "${wanted_existing[*]}" ]]; then
+              # A release published before this workflow built ZIPP Lite has
+              # every asset but that one. It is the only asset this job ever
+              # adds to a published release, and only when it is absent: the
+              # archives already there are checked and never replaced, and the
+              # checksum list gains one line and keeps the others as they are
+              # (decided below, once every archive has been checked).
+              mapfile -t wanted_before_lite < <(
+                printf '%s\n' "${expected_existing[@]}" | grep -Fxv "$lite_asset" | sort
+              )
+              add_lite=false
+              if [[ "${actual_existing[*]}" == "${wanted_before_lite[*]}" ]]; then
+                add_lite=true
+              elif [[ "${actual_existing[*]}" != "${wanted_existing[*]}" ]]; then
                 printf 'existing release has an unexpected asset set:\n%s\n' \
                   "${actual_existing[*]}" >&2
                 exit 1
               fi
               (cd existing-assets && sha256sum --check SHA256SUMS)
+              cp existing-assets/SHA256SUMS published-SHA256SUMS
+              if [[ "$add_lite" == "true" ]]; then
+                if [[ "$(jq -r .isImmutable existing-release.json)" == "true" ]]; then
+                  echo "existing $RELEASE_TAG is immutable; $lite_asset cannot be added to it" >&2
+                  exit 1
+                fi
+                cp "dist/$lite_asset" existing-assets/
+              fi
 
               linux_bundle="zipp-$RELEASE_VERSION-x86_64-unknown-linux-gnu"
               windows_bundle="zipp-$RELEASE_VERSION-x86_64-pc-windows-msvc"
@@ -1009,7 +1058,7 @@ jobs:
                    .commit == $commit and .dirty == false' \
                   <<< "$info" >/dev/null
               done
-              for suffix in web web-python web-python-base; do
+              for suffix in web web-lite web-python web-python-base; do
                 wasm_bundle="zipp-wasm-$RELEASE_VERSION-$suffix"
                 wasm_info="$(unzip -p "existing-assets/$wasm_bundle.zip" "$wasm_bundle/BUILD-INFO.txt")"
                 grep -Fxq "version=$RELEASE_VERSION" <<< "$wasm_info"
@@ -1022,6 +1071,10 @@ jobs:
                 elif [[ "$suffix" == web-python-base ]]; then
                   languages='["javascript","python"]'
                   variant=javascript-python-base
+                elif [[ "$suffix" == web-lite ]]; then
+                  variant=lite
+                  unzip -p "existing-assets/$wasm_bundle.zip" "$wasm_bundle/PROFILE.json" \
+                    | jq -e '.variant == "lite"' >/dev/null
                 fi
                 grep -Fxq "variant=$variant" <<< "$wasm_info"
                 grep -Fxq "languages=$languages" <<< "$wasm_info"
@@ -1033,8 +1086,35 @@ jobs:
               verify_remote_tag
 
               release_url="$(jq -r .url existing-release.json)"
-              printf 'Existing [%s](%s) is complete and checksum-valid; no changes made.\n' \
-                "$RELEASE_TAG" "$release_url" >> "$GITHUB_STEP_SUMMARY"
+              # The checksum list this asset set should carry, in this
+              # workflow's order. The published list is either that one, and
+              # nothing changes, or that one without the Lite line: the
+              # release predates Lite, or a run stopped between uploading the
+              # archive and its checksum. Any other difference is refused.
+              mkdir lite-upload
+              (
+                cd existing-assets
+                sha256sum "${expected_existing[@]:1}" > ../lite-upload/SHA256SUMS
+              )
+              if [[ "$add_lite" != "true" ]] \
+                  && cmp -s <(sort published-SHA256SUMS) <(sort lite-upload/SHA256SUMS); then
+                printf 'Existing [%s](%s) is complete and checksum-valid; no changes made.\n' \
+                  "$RELEASE_TAG" "$release_url" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              lite_line="$(grep -F -- "  $lite_asset" lite-upload/SHA256SUMS)"
+              if ! cmp -s <(sort published-SHA256SUMS) \
+                  <(grep -Fxv -- "$lite_line" lite-upload/SHA256SUMS | sort); then
+                echo "existing $RELEASE_TAG has a checksum list that does not match its assets" >&2
+                exit 1
+              fi
+              if [[ "$add_lite" == "true" ]]; then
+                gh release upload "$RELEASE_TAG" "existing-assets/$lite_asset"
+              fi
+              gh release upload "$RELEASE_TAG" lite-upload/SHA256SUMS --clobber
+              verify_remote_tag
+              printf 'Existing [%s](%s) now carries %s and its checksum; its other assets are unchanged and checksum-valid.\n' \
+                "$RELEASE_TAG" "$release_url" "$lite_asset" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
           fi
