@@ -2911,7 +2911,7 @@ impl<'a> FnCompiler<'a> {
         }
         let binding = self.resolve(&name);
         if let Binding::Local(r) = binding {
-            if !self.const_regs.contains(&r) {
+            if !self.const_regs.contains(&r) && !self.is_self_name_reg(r) {
                 // Plain mutable register local: mutate in place.
                 if prefix {
                     self.emit(Instr::AddInt {
@@ -2963,7 +2963,42 @@ impl<'a> FnCompiler<'a> {
         }
         // Cell / upvalue / global / const-local: read into `dst`, compute, store
         // back (store_binding throws for a const after the read + increment).
-        let cur = self.load_binding(&binding, dst); // == dst
+        let cur = self.load_binding(&binding, dst);
+        if cur != dst {
+            // A local read from its own register, not into `dst`: a `const`,
+            // or a function expression's own name. Neither may change. The
+            // store below throws for a const, and for the name in strict
+            // code, and is otherwise ignored; so work on a copy in a temp and
+            // write `dst` only after the store. Computing in place left
+            // `const k = 1` holding 2 after `try { k++ } catch {}`, and made
+            // `f++` inside `function f` replace the function with NaN.
+            // `dst` waits because it is a live local when the update is the
+            // right-hand side of `r = k++`.
+            let work = self.temp();
+            self.emit(Instr::Move { dst: work, src: cur });
+            self.emit(Instr::AddInt {
+                dst: work,
+                a: work,
+                imm: if prefix { delta } else { 0 },
+                upd: true,
+            });
+            if prefix {
+                self.store_binding_read_first(&binding, work);
+            } else {
+                let next = self.temp();
+                self.emit(Instr::AddInt {
+                    dst: next,
+                    a: work,
+                    imm: delta,
+                    upd: true,
+                });
+                self.store_binding_read_first(&binding, next);
+                self.dec_next_reg(1); // reclaim `next`
+            }
+            self.emit(Instr::Move { dst, src: work });
+            self.dec_next_reg(1); // reclaim `work`
+            return Ok(dst);
+        }
         if prefix {
             self.emit(Instr::AddInt {
                 dst: cur,
