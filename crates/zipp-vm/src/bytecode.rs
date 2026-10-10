@@ -3177,8 +3177,15 @@ pub enum UpvalSource {
 ///
 /// A prototype reached through `&mut` is copied first if another table still
 /// holds it, so no program can change what another runs.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct FuncTable(Vec<std::sync::Arc<FuncProto>>);
+
+/// Prints as the list of prototypes it stands for (`zipp bc`).
+impl std::fmt::Debug for FuncTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
 
 impl FuncTable {
     #[inline]
@@ -3371,6 +3378,14 @@ mod func_table_tests {
         assert_eq!(copied.len(), 2);
         assert_eq!(seed.len(), 2);
         assert_eq!(seed[1].name, "b");
+    }
+
+    #[test]
+    fn a_table_prints_as_the_list_of_its_prototypes() {
+        let names = ["a", "b"];
+        let plain: Vec<FuncProto> = names.iter().map(|name| placeholder(name)).collect();
+        assert_eq!(format!("{:?}", table(&names)), format!("{plain:?}"));
+        assert_eq!(format!("{:#?}", table(&names)), format!("{plain:#?}"));
     }
 }
 

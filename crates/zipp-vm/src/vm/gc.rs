@@ -1899,7 +1899,13 @@ mod closure_side_table_gc_tests {
         vm.regs[0] = Value::heap(live);
         vm.regs[1] = Value::heap(stale);
         vm.regs.truncate(1);
+        // The emitted-code file keeps slot 1 initialized past the live
+        // length; the checked profile's file ends at it. Either way the slot
+        // is no longer a root.
+        #[cfg(not(feature = "safe-sandbox"))]
         assert!(vm.regs.initialized_len() >= 2);
+        #[cfg(feature = "safe-sandbox")]
+        assert_eq!(vm.regs.initialized_len(), 1);
 
         vm.gc();
         assert!(!vm.heap.free_indices().contains(&live));
