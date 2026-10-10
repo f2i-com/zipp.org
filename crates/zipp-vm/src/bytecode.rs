@@ -2813,10 +2813,12 @@ pub(crate) fn static_key_plan_retained_charge(keys: &[String]) -> Option<usize> 
 /// entries supplied by a hand-built Program. Invalid metadata declines before
 /// walking key payloads, so an oversize hand-built plan cannot amplify the VM
 /// admission pass.
-pub(crate) fn static_key_plan_usage(functions: &[FuncProto]) -> Option<(usize, usize)> {
+pub(crate) fn static_key_plan_usage<'a>(
+    functions: impl IntoIterator<Item = &'a FuncProto>,
+) -> Option<(usize, usize)> {
     let mut sites = 0usize;
     let mut bytes = 0usize;
-    for plan in functions.iter().flat_map(|func| &func.static_key_plans) {
+    for plan in functions.into_iter().flat_map(|func| &func.static_key_plans) {
         if !plan.runtime_valid() {
             return None;
         }
@@ -3163,11 +3165,220 @@ pub enum UpvalSource {
     ParentUpval(u16),
 }
 
+/// A program's functions, by id.
+///
+/// Each prototype is behind a shared pointer, so copying a table copies
+/// pointers. The Python frontend builds every program on a copy of the
+/// compiled runtime: 2,300 functions, 5 MB of code and source text in 29,000
+/// allocations, which a host that runs many programs copied and freed for
+/// each (a fifth of a short program's whole run in the WebAssembly modules).
+/// A program built on the runtime now shares its prototypes and owns only
+/// the functions it adds.
+///
+/// A prototype reached through `&mut` is copied first if another table still
+/// holds it, so no program can change what another runs.
+#[derive(Clone, Debug, Default)]
+pub struct FuncTable(Vec<std::sync::Arc<FuncProto>>);
+
+impl FuncTable {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn get(&self, id: usize) -> Option<&FuncProto> {
+        self.0.get(id).map(|f| &**f)
+    }
+
+    #[inline]
+    pub fn first(&self) -> Option<&FuncProto> {
+        self.0.first().map(|f| &**f)
+    }
+
+    #[inline]
+    pub fn last(&self) -> Option<&FuncProto> {
+        self.0.last().map(|f| &**f)
+    }
+
+    #[inline]
+    pub fn iter(&self) -> FuncIter<'_> {
+        FuncIter(self.0.iter())
+    }
+
+    /// Every prototype, each copied first if it is shared.
+    pub fn iter_mut(&mut self) -> FuncIterMut<'_> {
+        self.0.iter_mut().map(std::sync::Arc::make_mut)
+    }
+
+    pub fn push(&mut self, f: FuncProto) {
+        self.0.push(std::sync::Arc::new(f));
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Put `f` at `id` without copying the prototype it replaces.
+    pub fn replace(&mut self, id: usize, f: FuncProto) {
+        self.0[id] = std::sync::Arc::new(f);
+    }
+}
+
+/// [`FuncTable::iter_mut`].
+pub type FuncIterMut<'a> = std::iter::Map<
+    std::slice::IterMut<'a, std::sync::Arc<FuncProto>>,
+    fn(&'a mut std::sync::Arc<FuncProto>) -> &'a mut FuncProto,
+>;
+
+/// [`FuncTable::iter`].
+#[derive(Clone)]
+pub struct FuncIter<'a>(std::slice::Iter<'a, std::sync::Arc<FuncProto>>);
+
+impl<'a> Iterator for FuncIter<'a> {
+    type Item = &'a FuncProto;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a FuncProto> {
+        self.0.next().map(|f| &**f)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for FuncIter<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(|f| &**f)
+    }
+}
+
+impl ExactSizeIterator for FuncIter<'_> {}
+
+impl std::ops::Index<usize> for FuncTable {
+    type Output = FuncProto;
+
+    #[inline(always)]
+    fn index(&self, id: usize) -> &FuncProto {
+        &self.0[id]
+    }
+}
+
+impl std::ops::IndexMut<usize> for FuncTable {
+    fn index_mut(&mut self, id: usize) -> &mut FuncProto {
+        std::sync::Arc::make_mut(&mut self.0[id])
+    }
+}
+
+impl From<Vec<FuncProto>> for FuncTable {
+    fn from(functions: Vec<FuncProto>) -> Self {
+        functions.into_iter().collect()
+    }
+}
+
+impl FromIterator<FuncProto> for FuncTable {
+    fn from_iter<I: IntoIterator<Item = FuncProto>>(functions: I) -> Self {
+        FuncTable(functions.into_iter().map(std::sync::Arc::new).collect())
+    }
+}
+
+impl<'a> IntoIterator for &'a FuncTable {
+    type Item = &'a FuncProto;
+    type IntoIter = FuncIter<'a>;
+
+    #[inline]
+    fn into_iter(self) -> FuncIter<'a> {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut FuncTable {
+    type Item = &'a mut FuncProto;
+    type IntoIter = FuncIterMut<'a>;
+
+    fn into_iter(self) -> FuncIterMut<'a> {
+        self.iter_mut()
+    }
+}
+
+/// The prototypes by value: a shared one is copied, an unshared one moved.
+impl IntoIterator for FuncTable {
+    type Item = FuncProto;
+    type IntoIter = std::iter::Map<
+        std::vec::IntoIter<std::sync::Arc<FuncProto>>,
+        fn(std::sync::Arc<FuncProto>) -> FuncProto,
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter().map(std::sync::Arc::unwrap_or_clone)
+    }
+}
+
+#[cfg(test)]
+mod func_table_tests {
+    use super::*;
+    use crate::compile::placeholder;
+
+    fn table(names: &[&str]) -> FuncTable {
+        names.iter().map(|name| placeholder(name)).collect()
+    }
+
+    #[test]
+    fn a_copy_shares_every_prototype_and_a_write_separates_only_the_one_written() {
+        let seed = table(&["a", "b", "c"]);
+        let mut program = seed.clone();
+        for id in 0..3 {
+            assert!(std::ptr::eq(&seed[id], &program[id]), "prototype {id} is shared");
+        }
+        program[1].reg_count = 7;
+        assert_eq!((seed[1].reg_count, program[1].reg_count), (0, 7));
+        assert!(!std::ptr::eq(&seed[1], &program[1]));
+        assert!(std::ptr::eq(&seed[0], &program[0]));
+        assert!(std::ptr::eq(&seed[2], &program[2]));
+
+        program.replace(0, placeholder("entry"));
+        program.push(placeholder("d"));
+        assert_eq!(seed.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(
+            program.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["entry", "b", "c", "d"]
+        );
+        assert_eq!(program.first().map(|f| f.name.as_str()), Some("entry"));
+        assert_eq!(program.last().map(|f| f.name.as_str()), Some("d"));
+        assert_eq!(program.get(4).map(|f| f.name.as_str()), None);
+    }
+
+    #[test]
+    fn writing_through_every_prototype_leaves_the_other_table_as_it_was() {
+        let seed = table(&["a", "b"]);
+        let mut program = seed.clone();
+        for f in &mut program {
+            f.name.push('!');
+        }
+        assert_eq!(seed.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        let owned: Vec<FuncProto> = program.into_iter().collect();
+        assert_eq!(owned.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["a!", "b!"]);
+        // Taking a shared table apart copies; the other still has its own.
+        let copied: Vec<FuncProto> = seed.clone().into_iter().collect();
+        assert_eq!(copied.len(), 2);
+        assert_eq!(seed.len(), 2);
+        assert_eq!(seed[1].name, "b");
+    }
+}
+
 /// A whole program: the top-level function plus every nested function, indexed
 /// by id. Function id `0` is the top-level script body.
 #[derive(Clone, Debug)]
 pub struct Program {
-    pub functions: Vec<FuncProto>,
+    pub functions: FuncTable,
     pub global_count: u32,
     pub classes: Vec<ClassDef>,
     /// Global slot names, indexed by slot. Lets the VM populate slots for free

@@ -65,7 +65,7 @@ pub(crate) fn compile_program_inner(
     }
     let module_decl_globals = c.collect_module_decl_globals();
     Ok(Program {
-        functions: c.functions,
+        functions: c.functions.into(),
         global_count: c.globals.len() as u32,
         classes: c.classes,
         global_names: c.globals,
@@ -376,7 +376,7 @@ pub fn compile_eval(
     }
     let module_decl_globals = c.collect_module_decl_globals();
     Ok(Program {
-        functions: c.functions,
+        functions: c.functions.into(),
         global_count: c.globals.len() as u32,
         classes: c.classes,
         global_names: c.globals,

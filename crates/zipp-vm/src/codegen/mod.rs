@@ -3666,7 +3666,11 @@ impl Jit {
     /// on short runs, helper-bound bodies on long ones), while the Python
     /// program's own bodies (those holding fused Python instructions) still
     /// compile. `ZIPP_PY_JIT_RUNTIME=1` compiles the runtime too.
-    pub fn set_python_program(&mut self, python: bool, functions: &[FuncProto]) {
+    pub fn set_python_program<'a>(
+        &mut self,
+        python: bool,
+        functions: impl IntoIterator<Item = &'a FuncProto>,
+    ) {
         self.python_program = python;
         self.python_only = python && std::env::var_os("ZIPP_PY_JIT_RUNTIME").is_none();
         // Mark what never compiles up front (the runtime's functions: every
@@ -3675,7 +3679,7 @@ impl Jit {
         // even counts toward a compile (which would intern and root its
         // string constants and build its plans before declining).
         if python {
-            self.interp_only = functions.iter().map(|f| self.python_interp_flags(f)).collect();
+            self.interp_only = functions.into_iter().map(|f| self.python_interp_flags(f)).collect();
         }
     }
 

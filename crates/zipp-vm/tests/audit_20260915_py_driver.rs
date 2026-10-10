@@ -188,6 +188,38 @@ fn programs_from_the_memoized_seed_share_nothing() {
     assert_eq!(second, ["False False", "ModuleNotFoundError"]);
 }
 
+/// Two programs built from the seed and alive together share the runtime's
+/// compiled functions, not each other's: each runs its own entry and its own
+/// functions, whichever runs first.
+#[cfg(feature = "python")]
+#[test]
+fn programs_alive_together_run_their_own_code() {
+    let out = big_stack(|| -> Result<Vec<Vec<String>>, String> {
+        let program = |source: &str| {
+            zipp_vm::frontend::compile_python_program(
+                "main",
+                &[("main".to_owned(), source.to_owned())],
+                &[],
+                &[],
+                false,
+            )
+        };
+        let mut first = program("def who():\n    return 'first'\nprint(who(), len([n for n in range(5)]))\n")?;
+        let mut second = program("def who():\n    return 'second'\ndef more():\n    return 3\nprint(who(), more())\n")?;
+        let mut third = program("print('third')\n")?;
+        let mut outputs = Vec::new();
+        for compiled in [&mut second, &mut first, &mut third] {
+            let state = compiled.state_mut();
+            state.set_limits(50_000_000, None);
+            state.run_init()?;
+            outputs.push(state.take_output());
+        }
+        Ok(outputs)
+    })
+    .expect("programs");
+    assert_eq!(out, [vec!["second 3"], vec!["first 5"], vec!["third"]]);
+}
+
 /// Every byte value, and every base64 padding length, arrives intact.
 #[cfg(feature = "python")]
 #[test]

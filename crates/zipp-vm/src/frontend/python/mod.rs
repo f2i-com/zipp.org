@@ -625,7 +625,7 @@ pub(super) fn compile_project<S: AsRef<str>>(
     let mut proto = out.finish();
     proto.name_global = name_global;
     let mut program = program.into_inner();
-    program.functions[entry_fn] = proto;
+    program.functions.replace(entry_fn, proto);
     program.python_lazy = Some(Box::new(PyLazy {
         compile: compile_lazy,
         names: project.module_names.iter().map(|n| (*n).to_owned()).collect(),
@@ -807,7 +807,7 @@ fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::Fu
             emit_module(name, unit, &suite, &table, &project, &fragment, lazy.rt_slot, lazy.line_slot)?;
             let fragment = fragment.into_inner();
             relocatable(name, &fragment, lazy.rt_slot, lazy.line_slot)?;
-            let functions = Arc::new(fragment.functions);
+            let functions: Arc<Vec<FuncProto>> = Arc::new(fragment.functions.into_iter().collect());
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(key) = key.as_deref().filter(|_| disk) {
                 code_cache::store_module(key, module.source, &functions);

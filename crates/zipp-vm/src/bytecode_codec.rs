@@ -830,7 +830,7 @@ pub(crate) fn decode(bytes: &[u8], source: Option<&str>) -> R<Program> {
         return Err("trailing bytes after the program".into());
     }
     Ok(Program {
-        functions,
+        functions: functions.into(),
         global_count,
         classes,
         global_names,
