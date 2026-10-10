@@ -282,7 +282,32 @@ impl<'a> FnCompiler<'a> {
     /// Float64Array read loop: `for (i = 0; i < n; i++)` 27ms against 7ms for
     /// the byte-identical `while (i < n) { …; ++i; }` — 3.9x, for the choice of
     /// `i++` over `++i` in a position where the two cannot be told apart.
+    ///
+    /// The other, in builds without the JIT: an update or an assignment of a
+    /// plain register local computes in the local's own register, and what it
+    /// then hands back is a copy of that register into the result. Nobody
+    /// reads a discarded result, so the local is named as the result and the
+    /// copy is never emitted. `s += i` and `i++` as statements were two dead
+    /// `Move`s in a six-instruction loop: a third of what the interpreter
+    /// dispatched. The JIT's planners and stream recognisers match the
+    /// compiler's exact output, copies included, so builds with it keep it.
     pub(crate) fn expr_discarded(&mut self, e: &ast::Expr) -> R<Reg> {
+        #[cfg(not(feature = "jit"))]
+        match e {
+            ast::Expr::Update { op, target, .. } => {
+                if let Some(r) = self.discarded_in_place_reg(target) {
+                    return self.update(*op, true, target, r);
+                }
+            }
+            ast::Expr::Assign {
+                op, target, value, ..
+            } if !op.is_logical() => {
+                if let Some(r) = self.discarded_in_place_reg(target) {
+                    return self.assign(*op, target, value, r);
+                }
+            }
+            _ => {}
+        }
         if let ast::Expr::Update {
             op,
             prefix: false,
@@ -293,6 +318,37 @@ impl<'a> FnCompiler<'a> {
             return self.update(*op, true, target, dst);
         }
         self.expr(e)
+    }
+
+    /// The register of `target` when `update` and `assign` would compute it
+    /// in place: a mutable local held in a plain register, with no `with`
+    /// object that could shadow it and no parameter dead zone over it. Those
+    /// are exactly the branches whose only use of the result register is the
+    /// final copy out, so naming the local as the result changes nothing else.
+    ///
+    /// Reads the scopes only. `resolve` threads upvalues and mints globals,
+    /// and `with_obj_regs` emits code; neither may run for a question.
+    #[cfg(not(feature = "jit"))]
+    fn discarded_in_place_reg(&self, target: &ast::Target) -> Option<Reg> {
+        let ast::Target::Ident { name, .. } = target else {
+            return None;
+        };
+        let name: &str = name;
+        if name == "arguments"
+            || self.heritage_class.as_ref().is_some_and(|(n, _)| n == name)
+            || self.param_tdz.contains(name)
+            || !self.with_objs_for(name).is_empty()
+        {
+            return None;
+        }
+        let r = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.iter().rev().find(|(n, _)| n == name))
+            .map(|(_, r)| *r)?;
+        (!self.cell_regs.contains(&r) && !self.const_regs.contains(&r) && !self.is_self_name_reg(r))
+            .then_some(r)
     }
 
     /// Intern a string LITERAL's value and return its CONSTANT-POOL index,
@@ -3029,6 +3085,78 @@ impl<'a> FnCompiler<'a> {
             self.dec_next_reg(1); // reclaim tmp
             Ok(dst) // dst still holds the (coerced) old value
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "jit")))]
+mod discarded_value_tests {
+    use crate::bytecode::Instr;
+
+    fn code_of(source: &str, name: &str) -> Vec<Instr> {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let func = program.functions.iter().find(|f| f.name == name).expect("function");
+        func.code.clone()
+    }
+
+    fn moves(code: &[Instr]) -> usize {
+        code.iter().filter(|i| matches!(i, Instr::Move { .. })).count()
+    }
+
+    #[test]
+    fn a_statement_on_a_plain_local_leaves_no_copy_of_its_value() {
+        let code = code_of(
+            "function w(n) { let s = 0; for (let i = 0; i < n; i++) s += i; return s; }",
+            "w",
+        );
+        assert_eq!(moves(&code), 0, "{code:?}");
+        // Test, add, step, back-edge: four instructions an iteration.
+        let head = code
+            .iter()
+            .position(|i| matches!(i, Instr::JumpIfNotLt { .. }))
+            .expect("loop head");
+        assert!(
+            matches!(code[head + 1], Instr::Add { dst, a, .. } if dst == a)
+                && matches!(code[head + 2], Instr::AddInt { dst, a, imm: 1, upd: true } if dst == a)
+                && matches!(code[head + 3], Instr::Jump { target } if target as usize == head),
+            "{code:?}"
+        );
+        // Each statement here is one instruction, after the load of any
+        // constant it names; the copies that remain are the stores themselves
+        // (`let a = n`, `b = a`, `a = b`).
+        for (body, copies, len) in [
+            ("let a = 1; a += n; a -= 1; a *= 2; a = a + n; a++; --a; return a;", 0, 11),
+            ("let a = n; let b = 0; b = a; a = b; return a;", 3, 6),
+        ] {
+            let code = code_of(&format!("function w(n) {{ {body} }}"), "w");
+            assert_eq!((moves(&code), code.len()), (copies, len), "{body}: {code:?}");
+        }
+    }
+
+    /// The accumulator pass proved the copy of `s += x` unobservable before
+    /// it rewrote the append in place. With no copy to prove away it must
+    /// still find the loop.
+    #[test]
+    fn a_string_accumulator_still_appends_in_place() {
+        let code = code_of(
+            "function w(n) { let s = ''; for (let i = 0; i < n; i++) s += 'ab' + i; return s.length; }",
+            "w",
+        );
+        assert!(
+            code.iter().any(|i| matches!(i, Instr::StrAppendInPlace { dst, a, .. } if dst == a)),
+            "{code:?}"
+        );
+        assert_eq!(moves(&code), 0, "{code:?}");
+    }
+
+    #[test]
+    fn a_value_that_is_read_is_still_copied_out() {
+        // `y = (x += 2)`: x computes in place and y is a copy of it.
+        let code = code_of("function w(n) { let x = 1; let y = (x += 2); x += n; return x + y; }", "w");
+        assert_eq!(moves(&code), 1, "{code:?}");
+        // A captured local is a cell, never updated in place.
+        let code = code_of("function w(n) { let c = 0; const f = () => c; c += n; c++; return f(); }", "w");
+        assert!(code.iter().any(|i| matches!(i, Instr::CellSet { .. })), "{code:?}");
     }
 }
 

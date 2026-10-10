@@ -4781,7 +4781,7 @@ impl<'p> Vm<'p> {
                         } else {
                             #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                             if ip >= 6
-                                && ip.checked_add(17) == Some(target as usize)
+                                && ip.checked_add(15) == Some(target as usize)
                                 && self.get(base, a) == Value::int(1)
                             {
                                 // Run the first iteration normally so its
@@ -4801,7 +4801,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfNotLe { a, b, target } => {
                         #[cfg(all(feature = "meter-only", not(feature = "jit")))]
-                        if ip.checked_add(7) == Some(target as usize)
+                        if ip.checked_add(5) == Some(target as usize)
                             && self.get(base, a) == Value::int(1)
                             && self.try_metered_counted_sum_loop(func_id, base, ip, a, b, target)
                         {

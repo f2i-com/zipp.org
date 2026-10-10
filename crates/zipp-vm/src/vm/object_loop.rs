@@ -3,15 +3,18 @@
 //!
 //! This is intentionally a bytecode-slice recognizer, not a source/name
 //! heuristic.  The focused benchmark and the comparison wrapper have different
-//! prologues and tails, but lower the loop itself to the same 17-instruction
-//! cycle.  Every immutable operand relationship, live register type, object
+//! prologues and tails, but lower the loop itself to the same 15-instruction
+//! cycle (17 while the compiler copied the discarded values of `s += o.c` and
+//! `i++` into scratch registers; a build without the JIT, the only kind this
+//! module is compiled into, no longer emits those copies).  Every immutable
+//! operand relationship, live register type, object
 //! layout, descriptor and meter balance is checked before any state is changed;
 //! every miss leaves the ordinary interpreter path untouched.
 
 use super::*;
 
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
-const LOOP_BODY_AND_NEXT_HEADER_STEPS: i64 = 17;
+const LOOP_BODY_AND_NEXT_HEADER_STEPS: i64 = 15;
 
 #[cfg(test)]
 static FAST_FORWARD_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -31,8 +34,6 @@ struct ObjectLoop {
     two: u16,
     value_c: u16,
     read_c: u16,
-    sum_copy: u16,
-    index_copy: u16,
     plan: u16,
     names: [u32; 6],
 }
@@ -51,7 +52,7 @@ struct ObjectLoopValues {
 /// the bytecode rather than hard-coded: the comparison wrapper has two extra
 /// prologue temporaries, while the focused `w(n)` case does not.
 fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLoop> {
-    if head < 6 || head.checked_add(17)? >= proto.code.len() {
+    if head < 6 || head.checked_add(15)? >= proto.code.len() {
         return None;
     }
     let c = &proto.code;
@@ -90,7 +91,7 @@ fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLo
         _ => return None,
     };
     let (limit, exit) = match c[head] {
-        Instr::JumpIfNotLt { a, b, target } if a == index && target as usize == head + 17 => {
+        Instr::JumpIfNotLt { a, b, target } if a == index && target as usize == head + 15 => {
             (b, target as usize)
         }
         _ => return None,
@@ -160,21 +161,13 @@ fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLo
     ) {
         return None;
     }
-    let sum_copy = match c[head + 13] {
-        Instr::Move { dst, src } if src == sum => dst,
-        _ => return None,
-    };
     if !matches!(
-        c[head + 14],
+        c[head + 13],
         Instr::AddInt { dst, a, imm: 1, upd: true } if dst == index && a == index
     ) {
         return None;
     }
-    let index_copy = match c[head + 15] {
-        Instr::Move { dst, src } if src == index => dst,
-        _ => return None,
-    };
-    if !matches!(c[head + 16], Instr::Jump { target } if target as usize == head) {
+    if !matches!(c[head + 14], Instr::Jump { target } if target as usize == head) {
         return None;
     }
 
@@ -182,7 +175,6 @@ fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLo
     // not try to model adversarial aliasing in a hand-built Program.
     let registers = [
         object, limit, sum, index, value_a, read_a, one, value_b, read_b, two, value_c, read_c,
-        sum_copy, index_copy,
     ];
     if registers
         .iter()
@@ -206,8 +198,6 @@ fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLo
         two,
         value_c,
         read_c,
-        sum_copy,
-        index_copy,
         plan,
         names: [
             name_a_set, name_a_get, name_b_set, name_b_get, name_c_set, name_c_get,
@@ -386,9 +376,7 @@ impl<'p> Vm<'p> {
         self.set(base, plan.value_c, values.c);
         self.set(base, plan.read_c, values.c);
         self.set(base, plan.sum, values.sum);
-        self.set(base, plan.sum_copy, values.sum);
         self.set(base, plan.index, values.index);
-        self.set(base, plan.index_copy, values.index);
 
         self.charge_steps(values.charge);
         #[cfg(test)]
@@ -472,7 +460,7 @@ mod tests {
         assert_eq!(got.c, Value::int(1_000_000));
         assert_eq!(got.sum, Value::num(250_000_500_000.0));
         assert_eq!(got.index, Value::int(500_000));
-        assert_eq!(got.charge, 8_500_000);
+        assert_eq!(got.charge, 7_500_000);
 
         // Exercise the largest intermediate product admitted by tagged-int
         // limits. One final iteration remains, so the projected state itself
@@ -488,7 +476,7 @@ mod tests {
         assert_eq!(max.c, Value::num(4_294_967_294.0));
         assert_eq!(max.sum, Value::num(4_294_967_294.0));
         assert_eq!(max.index, Value::int(i32::MAX));
-        assert_eq!(max.charge, 17);
+        assert_eq!(max.charge, 15);
 
         assert!(project(Value::int(0), Value::int(100_000_000), Value::int(0)).is_none());
         assert!(project(Value::int(-1), Value::int(10), Value::int(0)).is_none());
@@ -534,7 +522,7 @@ mod tests {
             }
         "#;
         const N: i32 = 8;
-        const STEPS: i64 = 17 * N as i64 + 11;
+        const STEPS: i64 = 15 * N as i64 + 11;
 
         fn ready(remaining: i64) -> (crate::vm::Vm<'static>, u32) {
             let program = Box::leak(Box::new(compile(SRC)));
@@ -594,7 +582,7 @@ mod tests {
                 return String(s);
             }
         "#;
-        const EXPECTED_STEPS: u64 = 17 * 500_000 + 16;
+        const EXPECTED_STEPS: u64 = 15 * 500_000 + 16;
 
         let program = Box::leak(Box::new(compile(SRC)));
         let mut vm = crate::vm::Vm::new(program);

@@ -1,5 +1,10 @@
 //! Assignments and updates of local bindings: the value they yield, the
 //! value nobody reads, and the bindings that refuse the store.
+//!
+//! A build without the JIT lowers a discarded assignment or update of a
+//! plain register local without the copy of its result; everything else
+//! keeps the ordinary lowering. These programs give the same output either
+//! way.
 
 use zipp_vm::embed;
 
