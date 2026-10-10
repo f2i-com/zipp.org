@@ -20,9 +20,12 @@ are in
 
 Open:
 
-- The modules are not accepted yet: `crates/zipp-wasm/dist` holds the
-  twelfth pass's, and this pass's are in
-  `target/size-audit/<variant>-r13y/final-node`.
+- The user asked for 0.0.22 to be cut from this source on 10 October, so
+  these are the modules it ships and the ones to measure the next pass
+  against. `crates/zipp-wasm/dist` holds them (it is not tracked), with a
+  copy and the Node packages in `target/size-audit/dist-round13-released`.
+  The release's own archives are built by the release workflow on Linux
+  from the tag.
 - A build without the JIT (every WebAssembly module, the `safe-sandbox`
   suite) omits the copy of a discarded assignment or update of a plain
   local; a build with the JIT keeps it, because the region planner and the
