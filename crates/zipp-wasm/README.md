@@ -261,19 +261,20 @@ have identical import/export surfaces; the selected module retains the audited
 checks that the browser module is byte-identical to the tested Node module.
 
 Measured on 2026-10-10 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
-after the twelfth size-reduction pass, on a Windows build of `c913b447`:
+after the thirteenth size-reduction pass, on a Windows build of `8485c9e5`:
 
 | Variant | Before post-processing, raw / Brotli | Selected, raw / Brotli |
 | --- | ---: | ---: |
-| Lite | 2,768,128 / 717,330 | 2,655,190 / 715,896 |
-| JavaScript | 5,059,943 / 1,234,620 | 4,898,060 / 1,228,986 |
-| Python-base | 6,759,818 / 1,609,261 | 6,564,659 / 1,601,071 |
-| Python + Torch | 8,688,206 / 1,959,541 | 8,488,699 / 1,952,907 |
+| Lite | 2,747,542 / 713,274 | 2,634,413 / 710,436 |
+| JavaScript | 5,037,794 / 1,231,836 | 4,876,583 / 1,227,452 |
+| Python-base | 6,713,904 / 1,604,884 | 6,519,418 / 1,597,418 |
+| Python + Torch | 8,642,288 / 1,956,948 | 8,443,452 / 1,950,080 |
 
 These are module bytes, excluding JS glue; Brotli is the download size. See the
-[twelfth size audit](../../docs/validation/2026-10-10-engine-size-round12.md)
-for the variant deltas, the speed screen and the rows it flags, and
-validation. The eleventh pass's modules, the last accepted, were
+[thirteenth size audit](../../docs/validation/2026-10-10-engine-size-round13.md)
+for the variant deltas, the speed screen and validation. The twelfth pass's
+modules, the last accepted, were 2,655,190 / 715,896, 4,898,060 / 1,228,986,
+6,564,659 / 1,601,071 and 8,488,699 / 1,952,907; the eleventh pass's
 2,654,515 / 716,795, 4,977,978 / 1,239,416, 6,644,132 / 1,612,708 and
 8,568,374 / 1,963,702 ([its audit](../../docs/validation/2026-10-09-engine-size-round11.md)
 has the QuickJS gap); the ninth pass's 2,827,053 / 753,477,

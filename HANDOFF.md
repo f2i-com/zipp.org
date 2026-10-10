@@ -1,5 +1,59 @@
 # Zipp performance handoff
 
+### 10 October: Lite's register access, a shared Python runtime, dead copies, thirteenth size pass (local)
+
+`codex/engine-size-reduction` is 14 commits past the record that the
+twelfth pass's modules were accepted (`56efa661`) at `1c119bc8`, unpushed,
+every commit `[skip ci]`. Against those modules, one process a case, Lite's
+corpus takes 0.61 of the time, the JavaScript module's 0.89 to 0.90,
+Python-base's 0.85 to 0.87 and Python + Torch's 0.85, with no row flagged
+slower in any of them; all four modules are smaller (Lite 20.8 KB, JavaScript
+21.5 KB, the two Python modules 45.2 KB raw). Lite ran every interpreter
+register access as a call, 38% of an integer loop; the Python modules copied
+the whole compiled runtime for each program; and the compiler copied the
+value of every `s += i` and `i++` statement into a register nothing reads.
+Two bindings an update expression could change, a `const` local and a
+function expression's own name, are fixed in every build. Native speed and
+the Python suite are unchanged. Measurements, gates and the evidence file
+are in
+[the thirteenth-pass note](docs/validation/2026-10-10-engine-size-round13.md).
+
+Open:
+
+- The modules are not accepted yet: `crates/zipp-wasm/dist` holds the
+  twelfth pass's, and this pass's are in
+  `target/size-audit/<variant>-r13y/final-node`.
+- A build without the JIT (every WebAssembly module, the `safe-sandbox`
+  suite) omits the copy of a discarded assignment or update of a plain
+  local; a build with the JIT keeps it, because the region planner and the
+  stream recognisers match the compiler's exact output. The WebAssembly
+  interpreter's two loop kernels (`vm/counted_loop.rs`, `vm/object_loop.rs`)
+  match the shorter output and charge its step counts. A program charges
+  fewer steps than it did (an integer loop 800,004 where it charged
+  1,200,004), so a host budget tuned to the old count buys more work.
+  Test262 covers the shorter output only on a CLI built without `zipp-vm`'s
+  default features, which is not a gate; it passed there, 95,671 of 95,680,
+  identically before and after.
+- `opt-level = "s"` takes 13.0% off the JavaScript module's raw size and
+  11.6% off its Brotli size for 1.16x the corpus time. Not adopted; it is a
+  different product, and the numbers are in the note.
+- The audit walk at each poll of a small heap is 4% of an integer loop in
+  the JavaScript module and 6% in Lite, more than it was because the loop
+  around it is shorter. Skipping it soundly needs a signal that nothing was
+  allocated since the last walk.
+- A Python engine start is 3.5 ms of a short program's 4.6 to 5.2 ms in
+  the Python-base module (5.1 of 6.5 to 7.1 before). What it spends now was
+  not profiled.
+- Native Python's call-heavy programs (call_simple, call_defaults,
+  method_call, fib_recursive) read 1.02x to 1.04x of the previous build in
+  two runs while the suite reads 1.00x. Not isolated; some JIT call paths
+  still index the program's function table directly.
+- The checked profiles' suites found four tests this pass had made stale
+  or broken that every default gate passed; one was a real change in what
+  the heap figure counts. Run both suites whole for any change there.
+- The twelfth pass's open items below still stand, except the two this pass
+  closes: Lite's slow integer loop and the copy of the runtime seed.
+
 ### 10 October: WebAssembly interpreter speed, string and RegExp cliffs, twelfth size pass (local)
 
 `codex/engine-size-reduction` is 15 commits past the eleventh pass's note
@@ -40,12 +94,9 @@ Open:
 - The audit walk at every poll of a realm-sized heap is 2% to 3% of every
   WebAssembly row (`heap_walk_stride_for`); widening it is a sandbox
   trade-off.
-- The Python modules clone the runtime seed (2,300 function prototypes) for
-  each program: 10% to 12% of the `python-*-e2e` rows.
-- Lite runs integer loops three times slower than the JavaScript module
-  and gained little from the inlined fast paths. Whether that is
-  `opt-level = "z"`, its feature set or its folded switches was not
-  measured.
+- Closed by the thirteenth pass: the Python modules cloned the runtime seed
+  for each program, and Lite ran integer loops three times slower than the
+  JavaScript module (every register access was a call at `opt-level = "z"`).
 - The eleventh pass's open items below still stand.
 
 ### 9 October: Python start, compact Unicode tables and eleventh size pass (local)
