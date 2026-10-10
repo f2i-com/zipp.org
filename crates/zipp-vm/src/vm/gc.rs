@@ -122,7 +122,12 @@ impl Vm<'_> {
     }
 
     /// Run a collection if one is due (or always, under stress) and it is safe.
-    #[inline]
+    ///
+    /// Every loop back-edge and frame transition polls this. The checked
+    /// profile's size-first build would not inline it on a hint, and the call
+    /// was 4% of an integer loop there.
+    #[cfg_attr(feature = "safe-sandbox", inline(always))]
+    #[cfg_attr(not(feature = "safe-sandbox"), inline)]
     pub(crate) fn maybe_gc(&mut self) {
         // The overwhelmingly common poll has no pending collection.  Reject it
         // before touching the lock/floor fields so allocation-free call paths

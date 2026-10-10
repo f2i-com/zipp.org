@@ -7087,13 +7087,17 @@ pub(crate) fn norm_index(i: i32, len: i32) -> i32 {
 /// 2^31 (cheap to reach now that ropes concatenate lazily without flattening)
 /// reports its true magnitude instead of wrapping negative through `as i32`.
 /// Integers up to 2^53 are exact in f64, matching JS.
-#[inline]
 /// A class private name is stored internally as the property "#name". Such keys
 /// are NOT reflectable own properties (hidden from getOwnPropertyNames, keys,
 /// for-in, hasOwnProperty, getOwnPropertyDescriptor) even though field/method
 /// access reads them directly.
+///
+/// Every method call asks this of its name, so it is the first byte and
+/// nothing else: `starts_with` on a `char` encodes the pattern and compares
+/// slices, and a size-first build makes that two calls.
+#[inline(always)]
 pub(crate) fn is_private_key(k: &str) -> bool {
-    k.starts_with('#')
+    k.as_bytes().first() == Some(&b'#')
 }
 
 /// The numeric binary operators (see `numeric_binop` / `bigint_op` in
