@@ -5104,7 +5104,7 @@ impl<'p> Vm<'p> {
                 // Error.isError(arg) (ES2024): true iff arg is an object carrying
                 // the [[ErrorData]] internal slot (a genuine Error instance — NOT a
                 // fake with Error.prototype but no slot, nor a primitive).
-                Value::bool(a0.is_heap() && self.error_data.contains(&a0.heap_index()))
+                Value::bool(a0.is_heap() && self.error_data.contains_key(&a0.heap_index()))
             }
             ERROR_STACK_GET => {
                 // get stack: a non-Object receiver throws; an object without
@@ -5115,7 +5115,7 @@ impl<'p> Vm<'p> {
                         "TypeError: Error.prototype.stack getter called on a non-object",
                     ));
                 }
-                if this.is_heap() && self.error_data.contains(&this.heap_index()) {
+                if this.is_heap() && self.error_data.contains_key(&this.heap_index()) {
                     self.alloc_str(String::new())
                 } else {
                     Value::UNDEFINED

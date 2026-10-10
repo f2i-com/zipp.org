@@ -376,7 +376,7 @@ impl<'p> Vm<'p> {
             shared_buffers: std::collections::HashSet::new(),
             immutable_buffers: std::collections::HashSet::new(),
             pinned_buffers: std::collections::HashSet::new(),
-            error_data: std::collections::HashSet::new(),
+            error_data: crate::slot_table::SlotTable::default(),
             fn_name_cells: std::collections::HashSet::new(),
             const_cells: std::collections::HashSet::new(),
             const_cells_nonempty: 0,
@@ -800,6 +800,7 @@ impl<'p> Vm<'p> {
         }
         n = n
             .saturating_add(self.proto_of.resident_bytes())
+            .saturating_add(self.error_data.resident_bytes())
             .saturating_add(self.regexp_result_props.resident_bytes())
             .saturating_add(self.array_js_len.resident_bytes())
             .saturating_add(self.arguments_objs.resident_bytes());

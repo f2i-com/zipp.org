@@ -432,7 +432,7 @@ impl<'p> Vm<'p> {
             self.proto_of
                 .insert(idx, Value::heap(self.suppressederror_proto));
         }
-        self.error_data.insert(idx); // [[ErrorData]] internal slot
+        self.error_data.insert(idx, ()); // [[ErrorData]] internal slot
         Ok(Value::heap(idx))
     }
 

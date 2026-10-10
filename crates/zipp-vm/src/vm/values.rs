@@ -1561,7 +1561,7 @@ impl<'p> Vm<'p> {
         if p != 0 {
             self.proto_of.insert(obj, Value::heap(p));
         }
-        self.error_data.insert(obj); // [[ErrorData]] internal slot
+        self.error_data.insert(obj, ()); // [[ErrorData]] internal slot
         Value::heap(obj)
     }
 
