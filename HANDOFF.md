@@ -1,5 +1,40 @@
 # Zipp performance handoff
 
+### 10 October: 0.0.22 published
+
+`v0.0.22` is an annotated tag on `4a9a9124`, published with its six assets
+and `SHA256SUMS` by the release workflow, dispatched from the tag
+([run 38038964821](https://github.com/f2i-com/zipp.org/actions/runs/38038964821)):
+CI and the full security matrix passed at the tagged commit, the Linux
+workspace suite and Test262 among them. `main` was fast-forwarded to that
+commit at the user's request, so `main`, the tag and
+`codex/engine-size-reduction` name the same commit; everything below that
+says "local" or "unpushed" is pushed. The published modules are 4,877,605 /
+1,227,720 bytes raw / Brotli (web), 6,520,811 / 1,597,732 (web-python-base)
+and 8,444,898 / 1,949,586 (web-python), built on Linux; the sizes in the
+notes below are Windows builds of the same source.
+
+Two gates failed on the way for reasons outside the engine, and are fixed
+in the two commits after `Prepare 0.0.22`:
+
+- The dependency audit: two advisories published since it last ran, both in
+  the landing site's build tooling (`sharp` through miniflare,
+  `source-map-js`). `npm audit fix --package-lock-only` (`f3f0dc18`).
+- CI's Python job and the release's torch job ran `build-variants.sh`
+  without installing Binaryen 125, which the script has required since the
+  size passes; neither job had run since (`4a9a9124`).
+
+Open:
+
+- The site still serves the 0.0.21 engines. The commit the release notes
+  prescribe (`zippEngineRelease`, `sync-playground.mjs --refresh-engine`
+  from the published `web-python` and `web` archives, the version, size and
+  SHA-256 in `landing/src/App.tsx` and `landing/README.md`) has not been
+  made.
+- ZIPP Lite is not a release asset; it is built from the source.
+- `security.yml` cancels a run in progress on the same branch when it is
+  dispatched again without `-f ref=<sha>`.
+
 ### 10 October: Lite's register access, a shared Python runtime, dead copies, thirteenth size pass (local)
 
 `codex/engine-size-reduction` is 14 commits past the record that the
