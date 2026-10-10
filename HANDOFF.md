@@ -2,6 +2,22 @@
 
 ### 10 October: 0.0.22 published
 
+ZIPP Lite was added to the release the same day, at the user's request, as a
+seventh asset: `zipp-wasm-0.0.22-web-lite.zip` (983,575 bytes; its module is
+2,633,126 / 711,417 bytes raw / Brotli). The release workflow built it from
+the tagged commit when dispatched from `main` for the existing tag
+([run 38046352623](https://github.com/f2i-com/zipp.org/actions/runs/38046352623)),
+after CI and the full security matrix at the tag once more. The six assets
+published earlier were downloaded and checked, not replaced, and
+`SHA256SUMS` gained one line. The workflow change is `18a8d935`: the browser
+matrix has a `lite` entry, and the publish job adds that one archive to a
+release published without it and refuses any other difference. Dispatch from
+`main` for this: a run dispatched from the tag uses the tag's copy of the
+workflow, which has no Lite entry and reports the release complete. The
+release body and `docs/releases/0.0.22.md` on `main` name the archive; the
+tag's copy of the notes and the tag message still say six assets, since the
+tag does not move.
+
 `v0.0.22` is an annotated tag on `4a9a9124`, published with its six assets
 and `SHA256SUMS` by the release workflow, dispatched from the tag
 ([run 38038964821](https://github.com/f2i-com/zipp.org/actions/runs/38038964821)):
@@ -31,7 +47,6 @@ Open:
   from the published `web-python` and `web` archives, the version, size and
   SHA-256 in `landing/src/App.tsx` and `landing/README.md`) has not been
   made.
-- ZIPP Lite is not a release asset; it is built from the source.
 - `security.yml` cancels a run in progress on the same branch when it is
   dispatched again without `-f ref=<sha>`.
 

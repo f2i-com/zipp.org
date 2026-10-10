@@ -65,7 +65,10 @@ Unicode regex and normalization, BigInt, eval/Function, collections, proxies,
 typed arrays, promises and the Engine host API, including resource limits.
 `Intl`, `Temporal`, and `Date.prototype.toTemporalInstant` are absent. Python
 and Torch are excluded at compile time; combining `lite` and `python` is an error.
-Full variants keep their existing language features.
+Full variants keep their existing language features. Releases from 0.0.22
+carry it as `zipp-wasm-<version>-web-lite.zip`, with the bindings,
+`BUILD-INFO.txt`, `PROFILE.json` and host SDK the other browser archives have;
+`./build-variants.sh lite` builds it from the source.
 
 Without ECMA-402, locale arguments are ignored: Number and BigInt format as
 ordinary decimal strings; Date's locale methods use the corresponding UTC

@@ -288,11 +288,12 @@ Zipp does not include its PyTorch runner, models, checkpoints or native endpoint
 
 The `0.0.22` release provides x86-64 CLI binaries for Windows and Linux
 (complete: JavaScript, the experimental Python frontend as `zipp py`, torch and
-the native GPU path) and four browser WebAssembly packages:
+the native GPU path) and five browser WebAssembly packages:
 
 | Download | Use it for |
 | --- | --- |
 | `zipp-wasm-0.0.22-web.zip` | JavaScript applications and embedding (about 1.23 MB Brotli) |
+| `zipp-wasm-0.0.22-web-lite.zip` | ZIPP Lite: the JavaScript core without `Intl` and `Temporal`, built for size rather than speed (about 0.71 MB) |
 | `zipp-wasm-0.0.22-web-python-base.zip` | JavaScript plus experimental Python, without torch (about 1.60 MB) |
 | `zipp-wasm-0.0.22-web-python.zip` | JavaScript plus experimental Python projects with torch built in, and the browser GPU adapters (about 1.95 MB) |
 | `zipp-wasm-0.0.22-web-torch.zip` | The torch package (`zipp_torch.wasm` and its `zipp_torch.js` loader, about 0.38 MB) that adds torch to `web-python-base` at run time through `addPythonPackage` |
@@ -303,8 +304,8 @@ assets and [0.0.22 release notes](docs/releases/0.0.22.md) for scope and limits.
 Every WASM archive carries the exact source revision, language profile and
 checksums. The sizes are each module's Brotli-11 transfer size, as measured in
 [crates/zipp-wasm/README.md](crates/zipp-wasm/README.md#build-variants-zipp-lite-javascript-python-and-the-torch-package),
-which also describes ZIPP Lite, a smaller JavaScript-only variant built from
-the source (about 0.71 MB).
+which also describes what ZIPP Lite leaves out and the speed it trades for
+its size.
 
 Save this as `app.js`, then choose your platform below:
 
