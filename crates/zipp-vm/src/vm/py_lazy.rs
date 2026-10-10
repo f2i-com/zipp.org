@@ -46,7 +46,7 @@ impl<'p> Vm<'p> {
             return Err(Thrown(format!("ImportError: {name} is already installed")));
         }
         for f in functions.iter() {
-            self.eval_funcs.push(f);
+            self.install_func(f);
         }
         // Immutable code at stable addresses, exactly as a loader-installed
         // ES module's: its exact id range makes it eligible for the inline

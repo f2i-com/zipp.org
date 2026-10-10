@@ -303,7 +303,7 @@ impl<'p> Vm<'p> {
                     _ => {}
                 }
             }
-            self.eval_funcs.push(r);
+            self.install_func(r);
         }
         // EvalDeclarationInstantiation step 5.a: a sloppy eval may not
         // var/function-declare a name that is a GLOBAL lexical (let/const) —

@@ -1447,6 +1447,14 @@ pub struct Vm<'p> {
     /// unified `func_id` addresses `program.functions` for `id < main_func_count`
     /// and `eval_funcs[id - main_func_count]` beyond it.
     eval_funcs: Vec<&'p crate::bytecode::FuncProto>,
+    /// Every function by its unified id: the program's, then `eval_funcs`.
+    /// `func` reads this one table, so a lookup is one bounds-checked load
+    /// whichever kind the id names. The program's prototypes are behind
+    /// shared pointers (`FuncTable`), which would cost a second load on every
+    /// lookup, and the two-table form cost a compare before that.
+    /// `main_func_count` and `eval_funcs` remain the boundary other code asks
+    /// about. Appended to only by `install_func`.
+    funcs: Vec<&'p crate::bytecode::FuncProto>,
     /// Aggregate retained static-key plans across the main Program and every
     /// successfully/partially prepared eval/module Program. Incoming programs
     /// beyond either ceiling are rewritten to legacy NewObject before leaking.

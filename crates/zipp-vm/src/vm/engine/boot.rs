@@ -32,11 +32,14 @@ impl<'p> Vm<'p> {
     /// string constant (e.g. an interned method-name key) is needed.
     #[inline]
     pub(crate) fn func(&self, id: usize) -> &'p crate::bytecode::FuncProto {
-        if id < self.main_func_count {
-            &self.program.functions[id]
-        } else {
-            self.eval_funcs[id - self.main_func_count]
-        }
+        self.funcs[id]
+    }
+
+    /// Give a runtime-installed function the next unified id.
+    pub(crate) fn install_func(&mut self, f: &'p crate::bytecode::FuncProto) {
+        debug_assert_eq!(self.funcs.len(), self.main_func_count + self.eval_funcs.len());
+        self.eval_funcs.push(f);
+        self.funcs.push(f);
     }
 
     /// Whether `func_id` belongs to a loader-installed ES module rather than
@@ -144,6 +147,7 @@ impl<'p> Vm<'p> {
         Vm {
             program,
             eval_funcs: Vec::new(),
+            funcs: program.functions.iter().collect(),
             static_key_plan_sites,
             static_key_plan_retained_bytes,
             main_func_count: program.functions.len(),
@@ -597,6 +601,7 @@ impl<'p> Vm<'p> {
             .saturating_add(
                 self.eval_funcs
                     .capacity()
+                    .saturating_add(self.funcs.capacity())
                     .saturating_mul(std::mem::size_of::<&crate::bytecode::FuncProto>()),
             )
             .saturating_add(
