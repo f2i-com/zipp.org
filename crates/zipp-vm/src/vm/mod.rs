@@ -961,6 +961,10 @@ impl std::ops::Deref for JitGuardedMap {
 /// * `ptr_mirror == storage.as_ptr().expose_provenance()`;
 /// * every element in `storage` is an initialized `Value`, while only
 ///   `storage[..logical_len]` is live or traced.
+///
+/// The checked profile has its own definition below: it emits no code, so it
+/// has no window to revive and no layout to keep.
+#[cfg(not(feature = "safe-sandbox"))]
 #[repr(C)]
 pub(crate) struct RegisterFile {
     /// Exposed allocation address for emitted machine code. This is an integer
@@ -973,10 +977,22 @@ pub(crate) struct RegisterFile {
     storage: Vec<Value>,
 }
 
+#[cfg(not(feature = "safe-sandbox"))]
 impl RegisterFile {
     #[inline]
     pub(crate) fn new() -> Self {
         Self::from_vec(Vec::new())
+    }
+
+    /// The live prefix.
+    #[inline(always)]
+    fn live(&self) -> &[Value] {
+        &self.storage[..self.logical_len]
+    }
+
+    #[inline(always)]
+    fn live_mut(&mut self) -> &mut [Value] {
+        &mut self.storage[..self.logical_len]
     }
 
     #[inline]
@@ -1144,6 +1160,109 @@ impl RegisterFile {
     }
 }
 
+/// The checked profile's register file: the `Vec` itself, its length the
+/// live length.
+///
+/// The interpreter reads and writes a register two or three times an
+/// instruction, and in this profile each access is bounds-checked. Against a
+/// live prefix of a longer backing store that is two checks, the prefix
+/// within the store and the index within the prefix, and the first is a
+/// range index: a call into `Vec`'s `Index` that a size-first build does not
+/// inline. It was 38% of an integer loop in the Lite module. With no emitted
+/// code there is no window to revive without writing it, so the backing
+/// store need not outlive the live length, and an access is one check
+/// against the `Vec`'s own length through the slice the compiler indexes
+/// itself.
+///
+/// The surface and what it does are the other definition's: growing writes
+/// `fill` into every slot it exposes, and shrinking keeps the allocation.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) struct RegisterFile {
+    storage: Vec<Value>,
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl RegisterFile {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self::from_vec(Vec::new())
+    }
+
+    #[inline]
+    pub(crate) fn from_vec(storage: Vec<Value>) -> Self {
+        Self { storage }
+    }
+
+    /// The live registers. `as_slice` and an index by `usize` are all an
+    /// access costs; nothing here goes through `Vec`'s `Index`.
+    #[inline(always)]
+    fn live(&self) -> &[Value] {
+        self.storage.as_slice()
+    }
+
+    #[inline(always)]
+    fn live_mut(&mut self) -> &mut [Value] {
+        self.storage.as_mut_slice()
+    }
+
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Vec-compatible surface; used by feature-specific paths.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.storage.is_empty()
+    }
+
+    #[inline(always)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.storage.capacity()
+    }
+
+    #[inline(always)]
+    // Read by the full instrument tracer only (the meter-only profile
+    // compiles no trace consumer).
+    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+    pub(crate) fn get(&self, index: usize) -> Option<&Value> {
+        self.storage.get(index)
+    }
+
+    pub(crate) fn resize(&mut self, new_len: usize, fill: Value) {
+        self.storage.resize(new_len, fill);
+    }
+
+    #[inline]
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        self.storage.truncate(new_len);
+    }
+
+    #[inline]
+    #[allow(dead_code)] // Vec-compatible surface; used by feature-specific paths.
+    pub(crate) fn clear(&mut self) {
+        self.storage.clear();
+    }
+
+    pub(crate) fn extend_from_slice(&mut self, values: &[Value]) {
+        self.storage.extend_from_slice(values);
+    }
+
+    /// Detach a copy of the tail, keeping this file's allocation.
+    pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
+        assert!(at <= self.storage.len(), "split index out of bounds");
+        let tail = self.storage.as_slice()[at..].to_vec();
+        self.storage.truncate(at);
+        tail
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Focused invariant tests.
+    pub(crate) fn initialized_len(&self) -> usize {
+        self.storage.len()
+    }
+}
+
 impl Default for RegisterFile {
     fn default() -> Self {
         Self::new()
@@ -1161,14 +1280,14 @@ impl std::ops::Deref for RegisterFile {
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
-        &self.storage[..self.logical_len]
+        self.live()
     }
 }
 
 impl std::ops::DerefMut for RegisterFile {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.storage[..self.logical_len]
+        self.live_mut()
     }
 }
 
@@ -1177,7 +1296,7 @@ impl<'a> IntoIterator for &'a RegisterFile {
     type IntoIter = std::slice::Iter<'a, Value>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.storage[..self.logical_len].iter()
+        self.live().iter()
     }
 }
 
@@ -1186,11 +1305,65 @@ impl<'a> IntoIterator for &'a mut RegisterFile {
     type IntoIter = std::slice::IterMut<'a, Value>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.storage[..self.logical_len].iter_mut()
+        self.live_mut().iter_mut()
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "safe-sandbox"))]
+mod checked_register_file_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_then_resize_overwrites_every_revived_slot() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1), Value::int(2), Value::int(3)]);
+        let capacity = regs.capacity();
+        regs.truncate(1);
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs.initialized_len(), 1);
+        regs.resize(3, Value::int(9));
+        assert_eq!(&*regs, &[Value::int(1), Value::int(9), Value::int(9)]);
+        assert_eq!(regs.capacity(), capacity, "shrinking keeps the allocation");
+    }
+
+    #[test]
+    fn split_off_detaches_the_tail_and_keeps_the_allocation() {
+        let mut regs = RegisterFile::from_vec(vec![
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+        ]);
+        let capacity = regs.capacity();
+        let tail = regs.split_off(2);
+        assert_eq!(tail, vec![Value::int(3), Value::int(4)]);
+        assert_eq!(&*regs, &[Value::int(1), Value::int(2)]);
+        assert_eq!(regs.capacity(), capacity);
+
+        regs.extend_from_slice(&[Value::int(7), Value::int(8)]);
+        assert_eq!(
+            &*regs,
+            &[Value::int(1), Value::int(2), Value::int(7), Value::int(8)]
+        );
+        assert_eq!((&regs).into_iter().count(), 4);
+    }
+
+    #[test]
+    fn an_access_past_the_live_length_is_refused() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1), Value::int(2), Value::int(3)]);
+        regs.truncate(2);
+        assert_eq!(regs[1], Value::int(2));
+        // Slot 2 is still inside the allocation; it is not a register.
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regs[2]));
+        assert!(read.is_err());
+        let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut regs = RegisterFile::from_vec(vec![Value::int(1)]);
+            regs[1] = Value::int(5);
+        }));
+        assert!(write.is_err());
+    }
+}
+
+#[cfg(all(test, not(feature = "safe-sandbox")))]
 mod register_file_tests {
     use super::*;
 
