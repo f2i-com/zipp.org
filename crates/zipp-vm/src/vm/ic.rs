@@ -404,7 +404,11 @@ impl<'p> Vm<'p> {
 
     /// The site cache for `(func_id, ip)`, if this function is IC-eligible.
     /// Loader-recorded modules cache; ordinary eval/new-Function code does not.
-    #[inline]
+    ///
+    /// Three loads on every cached property access. The checked profile's
+    /// size-first build left it a call on a hint: 5% of a property loop.
+    #[cfg_attr(feature = "safe-sandbox", inline(always))]
+    #[cfg_attr(not(feature = "safe-sandbox"), inline)]
     fn ic_site(&self, func_id: u32, ip: usize) -> Option<&SiteIc> {
         let f = func_id as usize;
         if !self.ic_func_eligible(func_id) {

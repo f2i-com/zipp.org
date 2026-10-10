@@ -357,6 +357,12 @@ impl<'p> Vm<'p> {
             // loop; we never mutate program functions during execution.
             #[cfg(not(feature = "safe-sandbox"))]
             let code: &Vec<Instr> = unsafe { &*code };
+            // The running function's string constants, kept for the same
+            // reason: a property read, a property write and a method call
+            // each name their key through them, and each used to find the
+            // function again first (a bounds-checked double index, and in a
+            // size-first build a call).
+            let strs: &'p [String] = self.func(func_id as usize).string_constants.as_slice();
             // â”€â”€ JIT tier â”€â”€
             // On fresh frame entry (ip == 0), if this function has compiled
             // native code, run it over the frame's register window. The native
@@ -5927,8 +5933,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::GetProp { dst, obj, name } => {
                         let o = self.get(base, obj);
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
+                        let key = strs[name as usize].as_str();
                         // PrivateFieldGet brand check: reading a private member
                         // (`obj.#x`) from an object whose class did not declare it
                         // is a TypeError (has_property_str walks instance own fields
@@ -6071,8 +6076,7 @@ impl<'p> Vm<'p> {
                     Instr::DefineField { obj, name, val } => {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
+                        let key = strs[name as usize].as_str();
                         self.define_field(o, &key, v)?;
                         ip += 1;
                     }
@@ -6084,8 +6088,7 @@ impl<'p> Vm<'p> {
                     } => {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
+                        let key = strs[name as usize].as_str();
                         // Private stores route to the side table / accessors
                         // (field-init emission, compound/update writes). One
                         // byte-compare on the hot path.
@@ -6258,8 +6261,7 @@ impl<'p> Vm<'p> {
                         // are always strict.
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
+                        let key = strs[name as usize].as_str();
                         if let Some((b, kind, owner)) = self.resolve_private(&key) {
                             // Declaring-class-resolved, KIND-aware write (spec
                             // PrivateSet).
@@ -7319,8 +7321,7 @@ impl<'p> Vm<'p> {
                         // alloc per `a.push(i)` / `a.map(cb)` etc.).
                         // `func()` returns `&'p`, so the interned name key outlives
                         // any `&mut self` below â€” and resolves eval functions too.
-                        let key: &'p str =
-                            &self.func(func_id as usize).string_constants[name as usize];
+                        let key: &'p str = &strs[name as usize];
                         // `charCodeAt` dominates the parser/tokenizer-shaped
                         // interpreter workload. Its exact flat-string + Int
                         // leaf bypasses the method IC, argument stack buffer,
