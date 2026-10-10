@@ -18,9 +18,11 @@ gates and the evidence file are in
 
 Open:
 
-- The modules are not accepted yet: `crates/zipp-wasm/dist` still holds the
-  eleventh pass's, and this pass's are in
-  `target/size-audit/<variant>-r12l/final-node`. The screen flags
+- The user accepted these modules on 10 October, flagged rows and Lite's
+  string-build cost included, and they are the packages to measure the
+  next pass against. `crates/zipp-wasm/dist` holds them (it is not
+  tracked), with a copy and the Node packages in
+  `target/size-audit/dist-round12-accepted`. The screen flags
   string-build and json in Lite, promise-resolve in JavaScript and
   error-typedarray in Python + Torch. Lite's string-build (1% to 15%
   slower) is a real cost: the checked profile validates the digits it

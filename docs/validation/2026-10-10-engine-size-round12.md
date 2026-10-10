@@ -4,7 +4,10 @@ Continues `codex/engine-size-reduction` from `ea517745` (the eleventh pass's
 note) to `c913b447`. Nothing is pushed and CI has not run. The user accepted
 the eleventh-pass modules on 10 October (`d5ab3f95`); they are the modules
 every WebAssembly figure here is measured against, and "accepted" below means
-them. Native figures are from an ordinary release build
+them. The user accepted this pass's modules later the same day, with the
+four flagged rows and Lite's string-build cost in front of them; they are
+the packages the next pass is measured against. Native figures are from an
+ordinary release build
 (`cargo build --release -p zipp-cli`, default features, not profile-guided),
 so the published table is unchanged.
 
