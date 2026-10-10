@@ -349,10 +349,11 @@ impl<'p> Vm<'p> {
             // so the hardened interpreter can cache the current function's
             // bytecode once per frame transition without extending a borrow of
             // the VM across any mutating instruction arm.
+            let running: &'p crate::bytecode::FuncProto = self.func(func_id as usize);
             #[cfg(feature = "safe-sandbox")]
-            let code: &'p [Instr] = self.func(func_id as usize).code.as_slice();
+            let code: &'p [Instr] = running.code.as_slice();
             #[cfg(not(feature = "safe-sandbox"))]
-            let code: *const Vec<Instr> = &self.func(func_id as usize).code;
+            let code: *const Vec<Instr> = &running.code;
             // SAFETY: `code` borrows immutable program data that outlives the
             // loop; we never mutate program functions during execution.
             #[cfg(not(feature = "safe-sandbox"))]
@@ -362,7 +363,7 @@ impl<'p> Vm<'p> {
             // each name their key through them, and each used to find the
             // function again first (a bounds-checked double index, and in a
             // size-first build a call).
-            let strs: &'p [String] = self.func(func_id as usize).string_constants.as_slice();
+            let strs: &'p [String] = running.string_constants.as_slice();
             // â”€â”€ JIT tier â”€â”€
             // On fresh frame entry (ip == 0), if this function has compiled
             // native code, run it over the frame's register window. The native
