@@ -47,7 +47,7 @@ pub const KEY_WRITEBACK: u8 = 0x80;
 /// the dispatch cost of a wide enum is negligible next to correctness clarity,
 /// and the JIT will consume this same structured form rather than re-decoding
 /// bytes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Instr {
     /// `dst = <constant pool[idx]>`
     LoadConst {
