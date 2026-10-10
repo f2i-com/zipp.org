@@ -129,11 +129,19 @@ fn bytecode_shape_uses_the_local_directly_only_when_safe() {
         }
         resultOverlap();
     "#;
+    // The staging copy is the one this guards. A build with the JIT also
+    // copies the statement's discarded value out of `index`; a build without
+    // it does not emit that second copy.
     assert_eq!(
         move_count(result_overlap),
-        2,
+        if cfg!(feature = "jit") { 2 } else { 1 },
         "a result-overlapping local must remain staged:\n{}",
         text_of(result_overlap)
+    );
+    assert_eq!(
+        run_ok(&format!("{result_overlap}\nconsole.log(resultOverlap());")),
+        ["98"],
+        "the staged argument is read before the result overwrites the local"
     );
 
     // Captured and direct-eval-visible locals are cells, never direct windows.

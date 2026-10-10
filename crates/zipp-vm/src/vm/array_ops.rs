@@ -4460,7 +4460,7 @@ mod array_copy_elision_tests {
             )
             .is_some());
         assert_eq!(admitted.regs.len(), caller_len);
-        assert!(admitted.regs.storage.len() >= needed);
+        assert!(admitted.regs.capacity() >= needed); // the growth is kept as the allocation
     }
 
     #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]

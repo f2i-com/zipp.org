@@ -595,14 +595,14 @@ impl<'p> Vm<'p> {
                 // it therefore extends no borrow of the VM across the arms below,
                 // and the clone this replaces bought nothing.
                 //
-                // It cost a great deal. `Instr` has 228 fieldful variants and
-                // derives `Clone` without `Copy`, so `.clone()` lowered to a
+                // It cost a great deal. `Instr` had 228 fieldful variants and
+                // derived `Clone` without `Copy` then, so `.clone()` lowered to a
                 // second 229-target `br_table` plus a 32-byte copy — the hardened
                 // interpreter dispatched TWICE per bytecode instruction, once to
                 // copy the instruction and once to execute it, with two
                 // unpredictable indirect branches where an interpreter should have
-                // one. Two of them are visible 19 KB apart in the shipped
-                // `dispatch_body`.
+                // one. Two of them were visible 19 KB apart in `dispatch_body`.
+                // (`Instr` is `Copy` now; borrowing it is still the right thing.)
                 #[cfg(feature = "safe-sandbox")]
                 let instr: &crate::bytecode::Instr = &code[ip];
                 #[cfg(not(feature = "safe-sandbox"))]
