@@ -94,6 +94,10 @@ jobs:
         working-directory: crates/zipp-pyparse
         run: |
           cargo +1.92.0 test --locked --release -- --include-ignored --skip throughput
+      # build-variants.sh post-processes every module with optimize-wasm.sh,
+      # which refuses any Binaryen but the one the sizes were measured with.
+      - name: Install the measured WASM optimizer
+        run: npm install --global binaryen@125.0.0
       - name: Build the Python-enabled browser artifact
         working-directory: crates/zipp-wasm
         run: |

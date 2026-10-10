@@ -752,6 +752,11 @@ jobs:
           cargo install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
           test "$(wasm-bindgen --version)" = "wasm-bindgen $WASM_BINDGEN_CLI"
 
+      # build-variants.sh post-processes each engine with optimize-wasm.sh,
+      # which refuses any Binaryen but the one the sizes were measured with.
+      - name: Install the measured WASM optimizer
+        run: npm install --global binaryen@125.0.0
+
       # The package and the two engines it is checked against, from the same
       # locked source: `python` (without torch) + zipp_torch.wasm must print
       # what the complete `all` artifact prints, byte for byte.
