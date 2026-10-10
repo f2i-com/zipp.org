@@ -6894,22 +6894,22 @@ impl Heap {
         // is precisely the collection that cannot reclaim them — that is why
         // the existing schedule, which reaches a major only after 64 minors,
         // never arrived in time.
-        {
-            let big = obj.resident_payload_bytes();
-            if big >= BIG_PAYLOAD_BYTES {
-                self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(big);
-                if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
-                    self.big_bytes_since_gc = 0;
-                    self.gc_requested = true;
-                    self.major_due = true;
-                }
+        let big = obj.resident_payload_bytes();
+        if big >= BIG_PAYLOAD_BYTES {
+            self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(big);
+            if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
+                self.big_bytes_since_gc = 0;
+                self.gc_requested = true;
+                self.major_due = true;
             }
         }
         // Sizing every allocation is only worth paying once something reads
         // the figure; `audit_resident_bytes` turns accounting on and backfills
-        // (see `payload_accounting`), so lazily-enabled totals stay exact.
+        // (see `payload_accounting`), so lazily-enabled totals stay exact. The
+        // size is the one just read for the byte schedule: a host with a heap
+        // ceiling used to size every object it allocated twice.
         let payload = if self.payload_accounting.get() {
-            let payload = obj.resident_payload_bytes();
+            let payload = big;
             let current = self.resident_payload_current.get().saturating_add(payload);
             self.resident_payload_current.set(current);
             self.resident_payload_high_water
