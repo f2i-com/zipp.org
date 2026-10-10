@@ -2300,9 +2300,9 @@ pub struct Vm<'p> {
     /// plain object that merely inherits Error.prototype (which `is_error_instance`
     /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
     /// getter. Pruned on GC sweep. Written once for every error made and
-    /// removed once for every error collected, so it is indexed by slot: as
-    /// a hashed set of slots those two were 7% of a throw-and-catch loop.
-    error_data: crate::slot_table::SlotTable<()>,
+    /// removed once for every error collected, so it is a bit a slot: as a
+    /// hashed set of slots those two were 7% of a throw-and-catch loop.
+    error_data: crate::slot_table::SlotSet,
     /// Set by the module loader just before executing a MODULE BODY: the
     /// next alloc_async (the body's own activation) marks its result promise
     /// in module_body_results. Consumed (mem::take) at alloc_async entry.

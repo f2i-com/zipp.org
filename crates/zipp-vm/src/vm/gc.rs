@@ -884,7 +884,7 @@ impl Vm<'_> {
         self.shared_buffers.retain(|&k| marks[k as usize]);
         self.immutable_buffers.retain(|&k| marks[k as usize]);
         self.pinned_buffers.retain(|&k| marks[k as usize]);
-        self.error_data.retain(|&k, _| marks[k as usize]);
+        self.error_data.retain(|&k| marks[k as usize]);
         self.arguments_objs.retain(|&k, _| marks[k as usize]);
         self.gen_args_obj
             .retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
@@ -1225,7 +1225,13 @@ impl Vm<'_> {
         prune_set!(self.shared_buffers);
         prune_set!(self.immutable_buffers);
         prune_set!(self.pinned_buffers);
-        prune_slots!(self.error_data);
+        // A bit set: every removal is one word, so the freed side is always
+        // the smaller walk.
+        if !self.error_data.is_empty() {
+            for i in freed {
+                self.error_data.remove(i);
+            }
+        }
         prune_slots!(self.arguments_objs);
         // Dies with EITHER endpoint: the generator (key) or its arguments
         // object (value).

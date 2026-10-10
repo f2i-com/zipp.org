@@ -376,7 +376,7 @@ impl<'p> Vm<'p> {
             shared_buffers: std::collections::HashSet::new(),
             immutable_buffers: std::collections::HashSet::new(),
             pinned_buffers: std::collections::HashSet::new(),
-            error_data: crate::slot_table::SlotTable::default(),
+            error_data: crate::slot_table::SlotSet::default(),
             fn_name_cells: std::collections::HashSet::new(),
             const_cells: std::collections::HashSet::new(),
             const_cells_nonempty: 0,

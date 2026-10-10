@@ -297,6 +297,156 @@ impl<'a, V: Default> Entry<'a, V> {
     }
 }
 
+/// A set of heap slots: one bit a slot.
+///
+/// For a side table that only records membership. Slots are small and dense,
+/// so the set costs an eighth of a byte for each slot up to the highest it
+/// has held, a test is one load, and nothing is hashed. Unlike a
+/// [`SlotTable`] it has no index pages, so its first entry costs a few
+/// hundred bytes rather than a page. The surface is the subset of
+/// `HashSet<u32>`'s that the VM uses.
+#[derive(Default)]
+pub(crate) struct SlotSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl SlotSet {
+    /// Reserved bytes owned by the set.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.words
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>())
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, k: &u32) -> bool {
+        self.words
+            .get((*k >> 6) as usize)
+            .is_some_and(|word| word >> (*k & 63) & 1 != 0)
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[allow(dead_code)] // `HashSet`-compatible surface; read by the tests.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Add `k`; whether it was absent.
+    pub(crate) fn insert(&mut self, k: u32) -> bool {
+        let at = (k >> 6) as usize;
+        if at >= self.words.len() {
+            self.words.resize(at + 1, 0);
+        }
+        let bit = 1u64 << (k & 63);
+        let added = self.words[at] & bit == 0;
+        self.words[at] |= bit;
+        self.len += usize::from(added);
+        added
+    }
+
+    /// Remove `k`; whether it was present.
+    pub(crate) fn remove(&mut self, k: &u32) -> bool {
+        let bit = 1u64 << (*k & 63);
+        match self.words.get_mut((*k >> 6) as usize) {
+            Some(word) if *word & bit != 0 => {
+                *word &= !bit;
+                self.len -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Keep the slots `keep` answers true for.
+    pub(crate) fn retain<F: FnMut(&u32) -> bool>(&mut self, mut keep: F) {
+        if self.len == 0 {
+            return;
+        }
+        for (at, word) in self.words.iter_mut().enumerate() {
+            let mut left = *word;
+            while left != 0 {
+                let low = left.trailing_zeros();
+                left &= left - 1;
+                if !keep(&((at as u32) << 6 | low)) {
+                    *word &= !(1u64 << low);
+                    self.len -= 1;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod slot_set_tests {
+    use super::SlotSet;
+    use std::collections::HashSet;
+
+    #[test]
+    fn a_slot_set_is_a_set() {
+        let mut set = SlotSet::default();
+        assert!(set.is_empty());
+        assert!(!set.contains(&0));
+        assert!(!set.contains(&4_000_000_000));
+        assert!(!set.remove(&7));
+        assert!(set.insert(7));
+        assert!(!set.insert(7));
+        assert!(set.insert(0));
+        assert!(set.insert(63));
+        assert!(set.insert(64));
+        assert!(set.insert(100_000));
+        assert_eq!(set.len(), 5);
+        for k in [0, 7, 63, 64, 100_000] {
+            assert!(set.contains(&k), "{k}");
+        }
+        for k in [1, 6, 8, 62, 65, 99_999, 100_001] {
+            assert!(!set.contains(&k), "{k}");
+        }
+        assert!(set.remove(&63));
+        assert!(!set.remove(&63));
+        assert!(!set.contains(&63));
+        set.retain(|&k| k != 0 && k != 100_000);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&7) && set.contains(&64));
+        set.retain(|_| false);
+        assert!(set.is_empty());
+        assert!(!set.contains(&7));
+    }
+
+    #[test]
+    fn a_slot_set_agrees_with_a_hash_set_and_stays_small() {
+        let mut set = SlotSet::default();
+        let mut model = HashSet::new();
+        let mut state = 0x9E37_79B9u32;
+        for round in 0..20_000u32 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let k = (state >> 8) % 5_000;
+            match round % 3 {
+                0 | 1 => assert_eq!(set.insert(k), model.insert(k)),
+                _ => assert_eq!(set.remove(&k), model.remove(&k)),
+            }
+            if round % 997 == 0 {
+                set.retain(|k| k % 7 != 3);
+                model.retain(|k| k % 7 != 3);
+            }
+            assert_eq!(set.len(), model.len());
+        }
+        for k in 0..5_100 {
+            assert_eq!(set.contains(&k), model.contains(&k), "{k}");
+        }
+        // A bit a slot: five thousand slots are well under a kilobyte, where
+        // one page of a paged index is four.
+        assert!(set.resident_bytes() <= 1024, "{}", set.resident_bytes());
+        let mut one = SlotSet::default();
+        one.insert(3_000);
+        assert!(one.resident_bytes() <= 1024, "{}", one.resident_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

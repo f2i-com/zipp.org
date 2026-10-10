@@ -1596,7 +1596,7 @@ impl<'p> Vm<'p> {
                 // constructors (and `super()` from a subclass) set, the same one
                 // `Error.isError` reads. Not the `name` string — a renamed error
                 // is still an Error, and `{name: "TypeError"}` is not one.
-                _ if self.error_data.contains_key(&this.heap_index()) => "Error",
+                _ if self.error_data.contains(&this.heap_index()) => "Error",
                 _ => "Object",
             }
         } else if this.is_number() {

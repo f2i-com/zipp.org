@@ -420,7 +420,7 @@ impl<'p> Vm<'p> {
                             map.define("error", error, attr);
                             map.define("suppressed", suppressed, attr);
                         }
-                        self.error_data.insert(obj.heap_index(), ());
+                        self.error_data.insert(obj.heap_index());
                         return Ok(obj);
                     }
                     if let Some(k) = self
@@ -429,7 +429,7 @@ impl<'p> Vm<'p> {
                         .position(|&c| c == cval.heap_index())
                     {
                         // `class X extends Error` instance: it has the [[ErrorData]] slot.
-                        self.error_data.insert(obj.heap_index(), ());
+                        self.error_data.insert(obj.heap_index());
                         let msg = if k == 7 {
                             args.get(1).copied()
                         } else {
