@@ -938,7 +938,18 @@
     function sortItems(items, key, reverse) {
         // As CPython: reverse=True reverses, sorts stably and reverses back,
         // so equal items keep their order and `<` sees the same operands.
-        const keys = key === null ? items.slice() : rt.amap(items, (x) => rt.call1(key, x));
+        // Each key through the key function's one-argument entry when it
+        // has one (as `rt.call1`, with no frame of its own per item).
+        let keys;
+        if (key === null) keys = items.slice();
+        else {
+            keys = [];
+            const keyObj = key !== null && typeof key === "object";
+            for (let i = 0; i < items.length; i++) {
+                const c1 = keyObj ? key.c1 : undefined;
+                keys.push(typeof c1 === "function" ? key.c1(items[i]) : rt.call(key, [items[i]], null));
+            }
+        }
         const values = key === null ? null : items.slice();
         if (reverse) { keys.reverse(); if (values !== null) values.reverse(); }
         const lt = rt.fastLt;

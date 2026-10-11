@@ -242,7 +242,7 @@ var __zipp_py = (function () {
     // Loop forms of map/filter/findIndex/every for callbacks that may run
     // guest code: a native array builtin would run each callback in a nested
     // interpreter loop, and the hardened wasm profile caps that nesting.
-    function amap(arr, fn) { const out = new Array(arr.length); for (let i = 0; i < arr.length; i++) out[i] = fn(arr[i], i); return out; }
+    function amap(arr, fn) { const out = []; for (let i = 0; i < arr.length; i++) out.push(fn(arr[i], i)); return out; }
     function afilter(arr, fn) { const out = []; for (let i = 0; i < arr.length; i++) if (fn(arr[i], i)) out.push(arr[i]); return out; }
     function aindex(arr, fn) { for (let i = 0; i < arr.length; i++) if (fn(arr[i], i)) return i; return -1; }
     function aevery(arr, fn) { for (let i = 0; i < arr.length; i++) if (!fn(arr[i], i)) return false; return true; }
