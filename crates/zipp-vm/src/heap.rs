@@ -7244,6 +7244,29 @@ impl Heap {
         }
     }
 
+    /// The allocator's figure now, to hand back to
+    /// [`Heap::exclude_footprint_since`].
+    #[cfg(all(feature = "python", not(feature = "safe-sandbox")))]
+    pub(crate) fn footprint_mark(&self) -> usize {
+        footprint_bytes()
+    }
+
+    /// Leave what the figure has grown by since `before` out of the step
+    /// being measured and out of the major step: memory that is in the
+    /// allocator's figure and that no collection could answer, such as code
+    /// compiled at run time.
+    #[cfg(all(feature = "python", not(feature = "safe-sandbox")))]
+    pub(crate) fn exclude_footprint_since(&mut self, before: usize) {
+        let bytes = footprint_bytes().saturating_sub(before);
+        self.footprint_at_look = self.footprint_at_look.saturating_add(bytes);
+        self.footprint_at_major = self.footprint_at_major.saturating_add(bytes);
+        // While a collection's level is awaited the next look starts from
+        // the figure as it then stands, which has these bytes in it.
+        if !self.footprint_settling {
+            self.footprint_gc_at = self.footprint_gc_at.saturating_add(bytes);
+        }
+    }
+
     /// Freeze the string at `idx` as one the engine shares by handle (see
     /// `JsStr::freeze_shared`). Anything else there is left alone.
     pub(crate) fn freeze_shared_str(&mut self, idx: u32) {

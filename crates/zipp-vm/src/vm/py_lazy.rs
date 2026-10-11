@@ -31,6 +31,16 @@ impl<'p> Vm<'p> {
         };
         let module = &lazy.modules[k];
         let base = (self.main_func_count + self.eval_funcs.len()) as u32;
+        // What compiling the module reserves (bytecode, constants, the
+        // compiler's own tables) is in the allocator's figure and is nothing
+        // a collection could answer, like the program compiled before its
+        // first statement ran. Importing a package compiles tens of megabytes
+        // this way, and each 16 MiB of it asked for a collection that freed
+        // nothing: six in a program that ran one before. Measured here and
+        // left out of the step. (The checked profile's step belongs to its
+        // heap ceiling and is not touched.)
+        #[cfg(not(feature = "safe-sandbox"))]
+        let footprint_before = self.heap.footprint_mark();
         let (first, functions) = match module.installed.get() {
             Some(installed) => installed,
             None => {
@@ -48,6 +58,8 @@ impl<'p> Vm<'p> {
         for f in functions.iter() {
             self.install_func(f);
         }
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.heap.exclude_footprint_since(footprint_before);
         // Immutable code at stable addresses, exactly as a loader-installed
         // ES module's: its exact id range makes it eligible for the inline
         // caches and native tiers the program's own functions get. (No module
