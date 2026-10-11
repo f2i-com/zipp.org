@@ -138,6 +138,7 @@ pub mod bench_support {
 mod front;
 pub use front::set_pure_script_goal;
 mod heap;
+pub use heap::{note_block, note_large_block, LARGE_BLOCK_BYTES};
 /// Hand-written front end (lexer/AST/parser) being built to replace
 /// `oxc_parser` — see the module docs for why. Not yet wired in.
 mod parse;

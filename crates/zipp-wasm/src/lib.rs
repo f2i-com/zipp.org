@@ -26,6 +26,61 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
+
+/// The platform allocator, reporting what it has outstanding to the engine
+/// (`zipp_vm::note_block`).
+///
+/// An array pushed to a megabyte, an object with twenty thousand keys and a
+/// filling Map grow in place: no object is allocated, so the collector's
+/// schedule saw nothing, the heap ceiling ended scripts whose live set was a
+/// megabyte, and growth fast enough reached the end of the linear memory
+/// before any poll and trapped the instance. What is outstanding is the one
+/// figure that covers every such route.
+struct ReportingAlloc;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: ReportingAlloc = ReportingAlloc;
+
+// SAFETY: every method forwards its arguments unchanged to the platform
+// allocator, whose `GlobalAlloc` implementation carries the contract; the
+// reports only add to and subtract from a counter.
+//
+// Kept out of line: inlined, the release's report went into every drop in the
+// module (10 KB), for a call the allocator behind it dwarfs.
+unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
+    #[inline(never)]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            zipp_vm::note_block(0, layout.size());
+        }
+        p
+    }
+
+    #[inline(never)]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            zipp_vm::note_block(0, layout.size());
+        }
+        p
+    }
+
+    #[inline(never)]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        zipp_vm::note_block(layout.size(), 0);
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    #[inline(never)]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let p = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            zipp_vm::note_block(layout.size(), new_size);
+        }
+        p
+    }
+}
 use zipp_vm::embed::{
     compile_script_with_preamble, CompileOptions, ConsoleStream, FingerprintBudget, HostCallError,
     HostCtx, HostValue, HostValueBudget, ScriptGoal, ScriptState, SymbolScope,

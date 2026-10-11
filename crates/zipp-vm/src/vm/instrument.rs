@@ -1964,6 +1964,11 @@ impl super::Vm<'_> {
     #[cold]
     #[inline(never)]
     pub(crate) fn instrument_heap_poll_after_gc(&mut self) -> Tick {
+        // A collection the footprint asked for: what grew may have grown in
+        // place, which only the walk can add to the figure.
+        if self.heap.take_growth_walk_due() {
+            self.instrument_mark_external_heap_growth();
+        }
         let force = !self.heap.payload_accounting_enabled();
         self.instrument_heap_poll_inner(u32::from(force))
     }

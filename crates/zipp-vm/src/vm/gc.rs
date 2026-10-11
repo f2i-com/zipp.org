@@ -100,6 +100,7 @@ impl Vm<'_> {
         // The boot allocations just pinned are also all over the young log;
         // drop them so the first minor doesn't walk them to find them marked.
         self.heap.young_reset();
+        self.heap.rebase_footprint();
     }
 
     /// Suspend GC for the returned guard's scope (see [`GcGuard`]).
@@ -129,6 +130,10 @@ impl Vm<'_> {
     #[cfg_attr(feature = "safe-sandbox", inline(always))]
     #[cfg_attr(not(feature = "safe-sandbox"), inline)]
     pub(crate) fn maybe_gc(&mut self) {
+        #[cfg(feature = "safe-sandbox")]
+        if self.heap.footprint_due() {
+            self.heap.note_footprint_growth();
+        }
         // The overwhelmingly common poll has no pending collection.  Reject it
         // before touching the lock/floor fields so allocation-free call paths
         // pay one heap flag load instead of all three VM-state loads.

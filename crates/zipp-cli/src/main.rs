@@ -18,8 +18,58 @@ mod gpu;
 /// Measured against the platform allocator that was ~290ns for the first
 /// property alone — roughly 72ns per malloc, which is the allocator, not the
 /// data structure.
+///
+/// The wrapper reports the large blocks it has outstanding to the engine
+/// (`zipp_vm::note_large_block`). An array pushed to a megabyte, an object
+/// with twenty thousand keys and a filling Map grow in place, which is no
+/// allocation the collector's schedule counts; the blocks under them are
+/// what it can see. Blocks under `LARGE_BLOCK_BYTES` cost one compare.
+struct ReportingAlloc;
+
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: ReportingAlloc = ReportingAlloc;
+
+// SAFETY: every method forwards its arguments unchanged to mimalloc, whose
+// `GlobalAlloc` implementation carries the contract; the reports only add to
+// and subtract from an atomic counter.
+unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        if layout.size() >= zipp_vm::LARGE_BLOCK_BYTES && !p.is_null() {
+            zipp_vm::note_large_block(0, layout.size());
+        }
+        p
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) };
+        if layout.size() >= zipp_vm::LARGE_BLOCK_BYTES && !p.is_null() {
+            zipp_vm::note_large_block(0, layout.size());
+        }
+        p
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        if layout.size() >= zipp_vm::LARGE_BLOCK_BYTES {
+            zipp_vm::note_large_block(layout.size(), 0);
+        }
+        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let p = unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) };
+        if (layout.size() >= zipp_vm::LARGE_BLOCK_BYTES || new_size >= zipp_vm::LARGE_BLOCK_BYTES)
+            && !p.is_null()
+        {
+            zipp_vm::note_large_block(layout.size(), new_size);
+        }
+        p
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

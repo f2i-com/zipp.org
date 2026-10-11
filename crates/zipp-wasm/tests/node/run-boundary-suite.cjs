@@ -32,6 +32,7 @@ const CHECKS = [
   ["buffer-ceiling.cjs"],
   ["budget-and-seed.cjs"],
   ["large-alloc-gc.cjs"],
+  ["in-place-growth.cjs"],
   ["output-budget.cjs"],
   ["host-writeback-identity.cjs"],
   ["worker-deadline.cjs"],

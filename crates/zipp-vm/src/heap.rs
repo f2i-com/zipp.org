@@ -4605,6 +4605,7 @@ mod gc_courier {
                 .spawn(move || {
                     while let Ok(batch) = rx.recv() {
                         drop(batch);
+                        IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Release);
                     }
                 })
                 .ok()
@@ -4617,8 +4618,22 @@ mod gc_courier {
     /// which is exactly the pre-courier behavior.
     pub(super) fn ship(batch: Vec<Item>) {
         if let Some(tx) = sender() {
-            let _ = tx.send(batch);
+            IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Release);
+            if tx.send(batch).is_err() {
+                // The batch came back in the error and has dropped here.
+                IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            }
         }
+    }
+
+    /// Batches shipped and not yet dropped, over the process. While it is not
+    /// zero the allocator still holds memory a sweep has given up, so a
+    /// reading of what is outstanding is not yet the level a collection left.
+    static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[inline]
+    pub(super) fn in_flight() -> bool {
+        IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) != 0
     }
 
     /// Whether batches are worth BUILDING at all (the latch only). The
@@ -5792,6 +5807,23 @@ pub struct Heap {
     /// Latched by [`Heap::note_minor_done`] when the post-minor occupied
     /// count crossed `major_at`: the next collection runs as a major.
     major_due: bool,
+    /// The footprint ([`footprint_bytes`]) at or past which the heap looks at
+    /// what grew, and the footprint and allocation sequence it last looked at.
+    footprint_gc_at: usize,
+    footprint_at_look: usize,
+    allocs_at_look: usize,
+    /// Objects every collection so far has swept; with `live` it numbers the
+    /// allocations ([`Heap::alloc_seq`]) without a counter on that path.
+    swept_total: usize,
+    /// The footprint grew a step under a ceiling: the collection this asked
+    /// for must be followed by a payload walk before the ceiling is judged,
+    /// since growth in place is in no cheap figure.
+    #[cfg_attr(not(feature = "instrument"), allow(dead_code))]
+    growth_walk_due: bool,
+    /// A major has finished and its level has not been read yet: the sweep's
+    /// payloads may still be with the courier. `footprint_gc_at` is zero
+    /// meanwhile, so the next allocation or change looks.
+    footprint_settling: bool,
     /// Bytes of large payload allocated since the last collection.
     ///
     /// The rest of the schedule counts ALLOCATIONS: a minor is due every
@@ -5968,6 +6000,87 @@ const BIG_PAYLOAD_BYTES: usize = 4096;
 /// exists to prevent — and large enough that a program allocating big buffers
 /// steadily is not collecting on every frame.
 const BIG_PAYLOAD_GC_AT: usize = 8 * 1024 * 1024;
+
+/// Net bytes the process's allocator has outstanding, for a binary whose
+/// global allocator reports them: every block through [`note_block`] (the
+/// WebAssembly modules, where there is one thread and the report is an add)
+/// or the large ones through [`note_large_block`] (`zipp`, where the report
+/// is atomic and an allocation costs twenty instructions). It stays zero,
+/// and is read to no effect, in any other.
+pub static ALLOCATOR_NET_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// The size from which an allocator reports a block.
+pub const LARGE_BLOCK_BYTES: usize = 4096;
+
+/// Report one block's size change to [`ALLOCATOR_NET_BYTES`]: an allocation
+/// (`old_size` 0), a release (`new_size` 0) or a reallocation. Blocks under
+/// [`LARGE_BLOCK_BYTES`] count as nothing on either side, so the total is
+/// exact for the blocks that are counted.
+#[inline]
+pub fn note_large_block(old_size: usize, new_size: usize) {
+    let old = if old_size >= LARGE_BLOCK_BYTES { old_size } else { 0 };
+    let new = if new_size >= LARGE_BLOCK_BYTES { new_size } else { 0 };
+    note_block(old, new);
+}
+
+/// Report one block's size change, whatever its size. A binary uses this or
+/// [`note_large_block`] for all of its reports, not both.
+///
+/// What the checked profile's Map keeps for 8,192 numbers is two megabytes,
+/// of which 128 KiB is in blocks of 4 KiB or more; counted by its large
+/// blocks alone, a loop of dropped Maps held a hundred megabytes before the
+/// collector heard of eight.
+#[inline]
+pub fn note_block(old_size: usize, new_size: usize) {
+    if new_size > old_size {
+        ALLOCATOR_NET_BYTES.fetch_add(new_size - old_size, Ordering::Relaxed);
+    } else if old_size > new_size {
+        ALLOCATOR_NET_BYTES.fetch_sub(old_size - new_size, Ordering::Relaxed);
+    }
+}
+
+/// What the allocator has outstanding: what tells the collector about memory
+/// that grows IN PLACE. An array is born empty and pushed to a
+/// megabyte; an object gathers twenty thousand keys; a Map fills. None of
+/// that is an allocation, so neither the count of objects nor the size at
+/// birth (`BIG_PAYLOAD_BYTES`) moves, and a loop that built and dropped such
+/// things ran no collection at all: 1.2 GB resident natively where Node
+/// peaked at 121 MB, and in the WebAssembly modules the heap ceiling ended a
+/// script whose live set was a megabyte, or the linear memory ran out first
+/// and the instance trapped.
+///
+/// It has to be what is IN USE. WebAssembly's linear memory size can be read
+/// for nothing, but it only grows: after a collection the allocator reuses
+/// what was freed, garbage fills that before the memory grows again, and
+/// each cycle ends a step higher than the last, up to the ceiling.
+#[inline(always)]
+fn footprint_bytes() -> usize {
+    ALLOCATOR_NET_BYTES.load(Ordering::Relaxed)
+}
+
+/// Footprint growth between looks. Under a heap ceiling the step is the byte
+/// schedule's own. Without one a major costs what the heap holds whatever it
+/// frees, so the step is wider: at 32 MiB a tokenizer filling its (live)
+/// integer arrays paid one major of 2.6 ms for nothing, and at 64 MiB the
+/// loop of dropped megabyte arrays still peaks under half of Node's resident
+/// size.
+#[cfg(feature = "safe-sandbox")]
+const FOOTPRINT_STEP: usize = BIG_PAYLOAD_GC_AT;
+#[cfg(not(feature = "safe-sandbox"))]
+const FOOTPRINT_STEP: usize = 64 * 1024 * 1024;
+
+/// Growth a major is asked for: at least this many bytes for each object
+/// allocated meanwhile. Below it the heap is growing by its objects, which the
+/// count schedule already paces (and a major there costs what the heap holds,
+/// for nothing: a Map filling with strings is live). Above it the bytes are in
+/// few objects, which that schedule cannot see and a major walks quickly.
+const FOOTPRINT_BYTES_PER_ALLOC: usize = 1024;
+
+/// Growth a payload walk is asked for under a ceiling, by the same measure.
+/// An object is charged what it holds when it is born, so a heap growing by
+/// its objects (a few hundred bytes each, counting every block) needs no
+/// walk; what grew in place is in no figure until one runs.
+const FOOTPRINT_WALK_BYTES_PER_ALLOC: usize = 256;
 
 const NURSERY_MAX_MINORS_DEFAULT: u32 = 64;
 const NURSERY_MAX_MINORS_LIMIT: u32 = 4096;
@@ -6167,6 +6280,12 @@ impl Heap {
             // terms of collectable survivors rather than total prefix size.
             major_at: GC_MIN_THRESHOLD + INTERN_PREFIX_EXTRA as usize,
             big_bytes_since_gc: 0,
+            footprint_gc_at: footprint_bytes().saturating_add(FOOTPRINT_STEP),
+            footprint_at_look: footprint_bytes(),
+            allocs_at_look: live,
+            swept_total: 0,
+            growth_walk_due: false,
+            footprint_settling: false,
             major_due: false,
             minors_since_major: 0,
             nursery_max_minors,
@@ -6553,6 +6672,12 @@ impl Heap {
         if self.live >= self.gc_threshold {
             self.gc_requested = true;
         }
+        // The same look `alloc_settled` takes: these lanes are how compiled
+        // code allocates, and a loop that pushes an array to a megabyte and
+        // drops it allocates nothing else.
+        if footprint_bytes() >= self.footprint_gc_at {
+            self.note_footprint_growth();
+        }
     }
 
     /// B257: install `obj` into a slot just popped from `free` WITHOUT the
@@ -6875,6 +7000,91 @@ impl Heap {
         }
     }
 
+    /// Allocations so far, less a constant: what the sweeps took plus what is
+    /// occupied now.
+    #[inline]
+    fn alloc_seq(&self) -> usize {
+        self.swept_total.wrapping_add(self.live)
+    }
+
+    /// Whether the footprint has passed its next look. The checked profile
+    /// asks at every collector poll, which is every loop back-edge and frame
+    /// transition: under a heap ceiling the growth has to be judged while it
+    /// is a step, and objects that are live and grown in place allocate
+    /// nothing, so the allocation path would let them reach the end of a
+    /// WebAssembly module's linear memory, which is a trap and not an error.
+    #[cfg(feature = "safe-sandbox")]
+    #[inline(always)]
+    pub(crate) fn footprint_due(&self) -> bool {
+        footprint_bytes() >= self.footprint_gc_at
+    }
+
+    /// The footprint passed `footprint_gc_at`: decide what the growth asks
+    /// for, and look again a step on.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn note_footprint_growth(&mut self) {
+        let now = footprint_bytes();
+        if self.footprint_settling {
+            // The level a major left is what the next step is measured from,
+            // and it is only that once the courier has dropped what the
+            // sweep handed it.
+            if !gc_courier::in_flight() {
+                self.footprint_settling = false;
+                self.look_at_footprint(now);
+            }
+            return;
+        }
+        let grown = now.saturating_sub(self.footprint_at_look);
+        let allocs = self.alloc_seq().wrapping_sub(self.allocs_at_look);
+        self.look_at_footprint(now);
+        let in_few_objects = grown / FOOTPRINT_BYTES_PER_ALLOC >= allocs;
+        // Under a ceiling, growth that is not the objects' own has to be
+        // judged on a walk while it is still a step (in WebAssembly, before
+        // it is the linear memory), and the poll that walks runs behind a
+        // collection. That collection is a minor unless the bytes are in few
+        // objects.
+        if self.resident_ceiling != usize::MAX
+            && grown / FOOTPRINT_WALK_BYTES_PER_ALLOC >= allocs
+        {
+            self.growth_walk_due = true;
+            self.gc_requested = true;
+        }
+        if in_few_objects {
+            self.gc_requested = true;
+            self.major_due = true;
+        }
+    }
+
+    #[inline]
+    fn look_at_footprint(&mut self, now: usize) {
+        self.footprint_at_look = now;
+        self.allocs_at_look = self.alloc_seq();
+        // Without a ceiling the next look is also a quarter of what is held
+        // away, so a program that keeps a gigabyte in a few objects is not
+        // collected every 64 MiB of the way there.
+        #[cfg(not(feature = "safe-sandbox"))]
+        let step = FOOTPRINT_STEP.max(now / 4);
+        #[cfg(feature = "safe-sandbox")]
+        let step = FOOTPRINT_STEP;
+        self.footprint_gc_at = now.saturating_add(step);
+    }
+
+    /// Measure footprint growth from the level in force now, read at the next
+    /// allocation or change: what setup and the compiler reserved is not
+    /// growth a collection could answer.
+    pub(crate) fn rebase_footprint(&mut self) {
+        self.footprint_settling = true;
+        self.footprint_gc_at = 0;
+    }
+
+    /// Whether footprint growth asked for a payload walk, clearing the ask.
+    #[cfg(feature = "instrument")]
+    #[inline]
+    pub(crate) fn take_growth_walk_due(&mut self) -> bool {
+        std::mem::take(&mut self.growth_walk_due)
+    }
+
     fn alloc_settled(&mut self, obj: HeapObj, hot: HotMirrorHint) -> u32 {
         #[cfg(all(feature = "meter-only", not(feature = "jit")))]
         let _ = hot;
@@ -6902,6 +7112,15 @@ impl Heap {
                 self.gc_requested = true;
                 self.major_due = true;
             }
+        }
+        // Memory that grew in place since the last look (see
+        // `footprint_bytes`). The garbage this is for cannot pile up without
+        // an allocation between, so the allocation is where it is read: one
+        // load and a compare. The checked profile reads it at the collector's
+        // poll instead (`Heap::footprint_due`).
+        #[cfg(not(feature = "safe-sandbox"))]
+        if footprint_bytes() >= self.footprint_gc_at {
+            self.note_footprint_growth();
         }
         // Sizing every allocation is only worth paying once something reads
         // the figure; `audit_resident_bytes` turns accounting on and backfills
@@ -8085,7 +8304,9 @@ impl Heap {
             self.obj_pool_addr_order = true;
         }
         self.courier_flush();
+        self.swept_total = self.swept_total.wrapping_add(self.live.saturating_sub(live));
         self.live = live;
+        self.rebase_footprint();
         // A MAJOR completed: nothing unreachable survived it, so `live` is
         // the TRUE live count — the anchor both schedules grow from. Floats
         // never enter this math (B120's float-discount fix): a minor reports
@@ -8132,6 +8353,7 @@ impl Heap {
     #[inline]
     pub fn note_minor_done(&mut self, live: usize) {
         self.courier_flush();
+        self.swept_total = self.swept_total.wrapping_add(self.live.saturating_sub(live));
         self.live = live;
         // Refresh the sweep-amortisation floor: the slot vector may have
         // grown since the last major, and a major sweep walks all of it.
