@@ -2419,7 +2419,21 @@ pub(crate) extern "win64" fn jit_array_push_pinned(
     // SAFETY: exclusive view; pins only the register file, not the array's Vec.
     let vm = unsafe { &mut *(vm as *mut Vm) };
     let idx = arr.heap_index();
-    let snap_flags = dense_array_snap_flags(vm, idx);
+    // The pin's flags are the ones its snapshot was taken with. They are
+    // made of what the gate below hoists and of the two prototype anchors'
+    // own state, none of which an admitted INT op can change, so they are
+    // read back from the slot this call rewrites: computing them again was
+    // five table lookups on every append. The caller has just compared the
+    // receiver with the slot's `obj_bits`; a slot that is not this
+    // receiver's is not trusted.
+    // SAFETY: `out` is the caller's own 32-byte pin slot, initialized by the
+    // region prologue's snapshot.
+    let pinned = unsafe { core::ptr::read(out) };
+    let snap_flags = if pinned.obj_bits == arr_bits {
+        pinned.flags
+    } else {
+        dense_array_snap_flags(vm, idx)
+    };
     // NOTE: the seven eligibility conditions are NOT re-tested here. They are
     // hoisted to `jit_array_push_gate`, which the region prologue runs once per
     // pushed pin -- see that function for why once is enough. Re-testing them
