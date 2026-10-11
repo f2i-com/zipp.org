@@ -791,7 +791,9 @@ pub(crate) fn hash_f64(x: f64) -> i64 {
 }
 
 /// The runtime's `strHashOf` over UTF-16 code units: two 32-bit lanes,
-/// mixed into a non-negative 53-bit value.
+/// mixed into a non-negative 46-bit value (the second lane's top 14 bits
+/// above the first's 32), which is the widest an int kept in the value
+/// itself goes (`Value::small_bigint`): `hash(s)` allocates nothing.
 pub(crate) fn hash_str_units(units: impl Iterator<Item = u16>) -> i64 {
     let (mut h1, mut h2): (i32, i32) = (5381, 0x6a09_e667);
     for c in units {
@@ -801,7 +803,7 @@ pub(crate) fn hash_str_units(units: impl Iterator<Item = u16>) -> i64 {
     }
     h1 = (h1 ^ ((h1 as u32) >> 15) as i32).wrapping_mul(0x2c1b_3c6d);
     h2 = (h2 ^ ((h2 as u32) >> 13) as i32).wrapping_mul(0x297a_2d39);
-    let hi = ((h2 as u32) >> 11) as i64;
+    let hi = ((h2 as u32) >> 18) as i64;
     let lo = (h1 ^ ((h1 as u32) >> 16) as i32) as u32 as i64;
     hi * 4_294_967_296 + lo
 }
@@ -826,6 +828,18 @@ fn units_of(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
         low = Some(0xDC00 | (v & 0x3FF) as u16);
         Some(0xD800 | (v >> 10) as u16)
     })
+}
+
+/// `strHash` of the flattened str at `idx`, for the `hash()` builtin
+/// (`vm::py_str`): [`hash_str_units`] over its units, an ASCII str's bytes
+/// being its units. Beside [`hash_str`] rather than through it, so the
+/// tables' key hashing stays that function's one caller.
+pub(crate) fn str_hash_value(heap: &Heap, idx: u32) -> Option<i64> {
+    match heap.get(idx) {
+        HeapObj::Str(s) if s.is_ascii() => Some(hash_str_units(s.as_bytes().iter().map(|&c| u16::from(c)))),
+        HeapObj::Str(s) => Some(hash_str_units(units_of(s.as_bytes()))),
+        _ => None,
+    }
 }
 
 /// `strHash` of the string at `idx`.

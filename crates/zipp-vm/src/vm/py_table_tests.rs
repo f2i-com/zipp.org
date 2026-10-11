@@ -256,16 +256,19 @@ fn str_hash_matches_runtime_values() {
     let mut env = Env::new();
     // Printed by ZIPP's `hash()` (runtime `strHash`).
     for (units, want) in [
-        ("abc".encode_utf16().collect::<Vec<_>>(), 4828709191810278i64),
-        (vec![], 6384804303800156),
-        ("\u{e9}\u{1F600}".encode_utf16().collect(), 5848404964838959),
+        ("abc".encode_utf16().collect::<Vec<_>>(), 37724712729830i64),
+        (vec![], 49877866055516),
+        ("\u{e9}\u{1F600}".encode_utf16().collect(), 45693694545455),
     ] {
         let v = env.str_units(&units);
         assert_eq!(env.hash(v), Some(want));
+        // An int the engine keeps in the value itself (`hash()` allocates
+        // nothing for a str).
+        assert!(Value::small_bigint(want as i128).is_some());
     }
     let items = vec![env.int("1"), env.int("2"), env.str_units(&[b'a' as u16])];
     let f = env.frozen(items);
-    assert_eq!(env.hash(f), Some(7057156128390738));
+    assert_eq!(env.hash(f), Some(55131075264082));
 }
 
 /// A wide spread of values: hash parity with the runtime's `hash()`.

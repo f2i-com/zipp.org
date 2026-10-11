@@ -241,27 +241,6 @@ use super::py_rt::hint;
 /// `rt.MAX_TEXT` (UTF-16 units).
 const STRM_MAX_TEXT: usize = 1 << 26;
 
-/// The runtime's str hash (`strHashOf` in `runtime/types.js`) over the
-/// string's UTF-16 code units: two 32-bit shift-add lanes, mixed, combined
-/// into a non-negative 53-bit value.
-fn js_str_hash(units: impl Iterator<Item = u16>) -> u64 {
-    let mut h1: i32 = 5381;
-    let mut h2: i32 = 0x6a09e667;
-    for c in units {
-        let c = c as i32;
-        h1 = h1.wrapping_shl(5).wrapping_add(h1).wrapping_add(c);
-        // `((h2 << 7) - h2) ^ c`: the difference is exact in a double, and
-        // `^` takes it modulo 2^32.
-        let d = (h2.wrapping_shl(7) as i64) - (h2 as i64);
-        h2 = (d as i32) ^ c;
-    }
-    h1 = (h1 ^ ((h1 as u32) >> 15) as i32).wrapping_mul(0x2c1b3c6d);
-    h2 = (h2 ^ ((h2 as u32) >> 13) as i32).wrapping_mul(0x297a2d39);
-    let hi = ((h2 as u32) >> 11) as u64;
-    let lo = ((h1 ^ ((h1 as u32) >> 16) as i32) as u32) as u64;
-    hi * 4_294_967_296 + lo
-}
-
 /// Python's whitespace among the ASCII characters: what `str.isspace` is
 /// true for, which `strip()` and `split()` without an argument go by. It has
 /// the four separators U+001C to U+001F, which JavaScript's `\s` and `trim`
@@ -372,7 +351,9 @@ impl<'p> Vm<'p> {
             (12, 2) => return self.py_heap_op(this, args, true, at),
             (14..=17, 2) => return self.py_bisect_op(this, args, op, at),
             (13, 1) => return self.py_heap_op(this, args, false, at),
-            // `hash(s)` of a str: `strHash` (`runtime/types.js`).
+            // `hash(s)` of a str: `strHash` (`runtime/types.js`), computed
+            // by the function the engine's own tables hash a str key with,
+            // so the two cannot differ. It fits the int kept in the value.
             (10, 1) => {
                 let v = args[0];
                 if !v.is_heap() || !self.heap.is_str_like(v.heap_index()) {
@@ -380,10 +361,7 @@ impl<'p> Vm<'p> {
                 }
                 let idx = v.heap_index();
                 self.heap.flatten(idx);
-                let HeapObj::Str(st) = self.heap.get(idx) else {
-                    return None;
-                };
-                let h = js_str_hash(st.units_iter());
+                let h = super::py_table::str_hash_value(&self.heap, idx)?;
                 return Some(self.make_bigint(h as i128));
             }
             // `math.sqrt(x)` of a float that is not below zero (a NaN too).

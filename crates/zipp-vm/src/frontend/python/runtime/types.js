@@ -944,8 +944,12 @@
     rt.baseKey = baseKey;
     // A deterministic string hash from two 32-bit shift-add lanes (str
     // hashes are randomized in CPython, so only stability matters), mixed
-    // and combined into a non-negative 53-bit value. The per-character step
-    // is plain int arithmetic, which the interpreter runs without calls.
+    // and combined into a non-negative 46-bit value: the second lane's top
+    // 14 bits above the first's 32, the widest int the engine keeps in the
+    // value itself, so a hash is never a heap BigInt. The engine computes
+    // the same number (`hash_str_units` in vm/py_table.rs, which must
+    // agree). The per-character step is plain int arithmetic, which the
+    // interpreter runs without calls.
     // Recent str hashes (a str is immutable, so its hash never changes; the
     // Map hashes the key natively instead of this loop running per call).
     const strHashes = new Map();
@@ -965,7 +969,7 @@
             h2 = ((h2 << 7) - h2) ^ c;
         }
         h1 = Math.imul(h1 ^ (h1 >>> 15), 0x2c1b3c6d); h2 = Math.imul(h2 ^ (h2 >>> 13), 0x297a2d39);
-        return BigInt((h2 >>> 11) * 4294967296 + ((h1 ^ (h1 >>> 16)) >>> 0));
+        return BigInt((h2 >>> 18) * 4294967296 + ((h1 ^ (h1 >>> 16)) >>> 0));
     }
     // CPython's numeric hash: the value modulo the Mersenne prime 2^61 - 1
     // with the sign kept, and -1 reserved (it becomes -2).
