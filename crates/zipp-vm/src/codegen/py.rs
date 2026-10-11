@@ -73,8 +73,10 @@ pub(crate) const PY_THREW: u64 = 4;
 /// `PyCall` pushes its callee's frame, which `Vm::jit_py_op` then runs to
 /// completion as `Vm::jit_frame_call` does. So does a `PyGetAttr` /
 /// `PySetAttr` at a site whose cache holds a property's Python accessor:
-/// compiled code sees it fall through like any other. `PyRaise` always ends
-/// in a throw, which the native code unwinds like any helper's.
+/// compiled code sees it fall through like any other. `PyRaise` ends in a
+/// throw, which the native code unwinds like any helper's, unless the
+/// frame's own innermost handler catches it, when it continues at that
+/// handler's catch target (its second edge).
 #[inline]
 pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
     Some(match *i {
@@ -97,7 +99,6 @@ pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
         | Instr::PyModGet { slow, .. }
         | Instr::PyLen { slow, .. }
         | Instr::PyAttrFn { slow, .. }
-        | Instr::PyRaise { slow, .. }
         | Instr::PyCaught { slow, .. }
         | Instr::PyClassAttr { slow, .. }
         | Instr::PyUnpack { slow, .. }
@@ -108,6 +109,10 @@ pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
         Instr::PyCall { slow, .. } => (slow, None),
         // Its second edge: the key's absence (a `.get` default).
         Instr::PyDictLookup { slow, absent, .. } => (slow, Some(absent)),
+        // Its second edge: the catch target of the frame's own innermost
+        // handler, when that is the one the emitter saw (the raise caught
+        // there and then).
+        Instr::PyRaise { slow, catch, .. } => (slow, (catch != u32::MAX).then_some(catch)),
         #[cfg(feature = "python")]
         Instr::PySeq { slow, .. } => (slow, None),
         Instr::PyJumpCompare { slow, target, .. } => (slow, Some(target)),

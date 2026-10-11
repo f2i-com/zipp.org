@@ -197,7 +197,7 @@ impl<'a> Emitter<'a> {
                 // (`PyRaise`); everything else through the helper.
                 if self.fast && s.exc.is_some() && s.cause.is_none() {
                     let rt = self.r_rt;
-                    let at = self.emit(Instr::PyRaise { e: exc, rt, slow: 0 })?;
+                    let at = self.py_raise(exc, rt)?;
                     let here = self.here();
                     self.patch_slow(at, here)?;
                 }
@@ -1207,7 +1207,7 @@ impl<'a> Emitter<'a> {
                 kind_reg,
                 val_reg,
             })?;
-            self.handler_depth += 1;
+            self.enter_handler(None);
             Some(at)
         } else {
             None
@@ -1219,10 +1219,10 @@ impl<'a> Emitter<'a> {
             catch_target: 0,
             catch_reg: ereg,
         })?;
-        self.handler_depth += 1;
+        self.enter_handler(Some(push));
         self.block_suite(&s.body, depth)?;
         self.emit(Instr::PopHandler)?;
-        self.handler_depth -= 1;
+        self.leave_handler();
         // `else` runs only when nothing was raised, outside the handler.
         self.block_suite(&s.orelse, depth)?;
         to_finally.push(self.leave_normally(has_finally, kind_reg)?);
@@ -1257,11 +1257,11 @@ impl<'a> Emitter<'a> {
                 kind_reg: k2,
                 val_reg: v2,
             })?;
-            self.handler_depth += 1;
+            self.enter_handler(None);
             self.block_suite(&h.body, depth)?;
             self.emit(Instr::LoadInt { dst: k2, val: 0 })?;
             self.emit(Instr::PopFinally)?;
-            self.handler_depth -= 1;
+            self.leave_handler();
             let fin2 = self.here();
             self.patch(body_fin, fin2)?;
             self.forget_line();
@@ -1282,7 +1282,7 @@ impl<'a> Emitter<'a> {
         // No handler matched: re-raise (through the finally, if any).
         self.emit(Instr::Throw { src: ereg })?;
         if let Some(fin_push) = fin_push {
-            self.handler_depth -= 1;
+            self.leave_handler();
             let fin = self.here();
             self.patch(fin_push, fin)?;
             for j in &to_finally {
@@ -1328,11 +1328,11 @@ impl<'a> Emitter<'a> {
             kind_reg: k2,
             val_reg: v2,
         })?;
-        self.handler_depth += 1;
+        self.enter_handler(None);
         self.block_suite(body, depth)?;
         self.emit(Instr::LoadInt { dst: k2, val: 0 })?;
         self.emit(Instr::PopFinally)?;
-        self.handler_depth -= 1;
+        self.leave_handler();
         let here = self.here();
         self.patch(body_fin, here)?;
         self.forget_line();
@@ -1387,13 +1387,13 @@ impl<'a> Emitter<'a> {
             kind_reg,
             val_reg,
         })?;
-        self.handler_depth += 1;
+        self.enter_handler(None);
         let ereg = self.alloc()?;
         let push = self.emit(Instr::PushHandler {
             catch_target: 0,
             catch_reg: ereg,
         })?;
-        self.handler_depth += 1;
+        self.enter_handler(Some(push));
         // The `as` target is bound inside the protected region: when binding
         // it fails, `__exit__` still sees the exception (and may suppress it,
         // leaving the target unbound afterwards).
@@ -1408,7 +1408,7 @@ impl<'a> Emitter<'a> {
         }
         self.definite = saved;
         self.emit(Instr::PopHandler)?;
-        self.handler_depth -= 1;
+        self.leave_handler();
         let j1 = self.leave_normally(true, kind_reg)?;
         let catch = self.here();
         self.patch(push, catch)?;
@@ -1419,7 +1419,7 @@ impl<'a> Emitter<'a> {
         // Calls __exit__(type, value, tb); rethrows `ereg` unless it returned true.
         self.helper("withexit", &[exit, ereg, self.r_line])?;
         let j2 = self.leave_normally(true, kind_reg)?;
-        self.handler_depth -= 1;
+        self.leave_handler();
         let fin = self.here();
         self.patch(fin_push, fin)?;
         self.patch(j1, fin)?;

@@ -1,0 +1,16 @@
+raise_in_try ValueError ('a',) [('raise_in_try', 24)] None
+miss_in_try KeyError ('absent',) [('miss_in_try', 32)] None
+finally ran
+finally_then_raise ValueError ('e',) [('finally_then_raise', 54)] None
+raise_in_finally_body IndexError ('f',) [('raise_in_finally_body', 66)] None
+nested_try ValueError ('g',) [('nested_try', 74)] None
+exit sees ValueError
+with swallowed it
+handler_raises_again KeyError ('j',) [('handler_raises_again', 103)] ValueError
+bare_reraise TypeError ('b',) [('<module>', 120), ('bare_reraise', 39)] None
+raise_in_except KeyError ('d',) [('<module>', 120), ('raise_in_except', 48)] ValueError
+no_match_propagates ValueError ('k',) [('<module>', 120), ('no_match_propagates', 110)] None
+(None, None, None)
+(205030, [('hot', 132)], ('absent',), (4998,), [('hot', 138)])
+(8000, [('hot_reraise', 155)])
+outer KeyError: 'x' ['<module>']

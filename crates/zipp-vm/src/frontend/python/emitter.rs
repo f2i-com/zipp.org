@@ -90,6 +90,9 @@ pub(super) struct ColdBlock<'a> {
     /// The line in effect where the block was deferred (its code runs as
     /// part of that statement, wherever it is laid out).
     line: i32,
+    /// The handler innermost where the block was deferred (see
+    /// [`Emitter::innermost_catch`]): its code runs under that handler.
+    catch: Option<usize>,
     body: Box<dyn FnOnce(&mut Emitter<'a>) -> R<()> + 'a>,
 }
 
@@ -166,6 +169,14 @@ pub(super) struct Emitter<'a> {
     pub control_depth: usize,
     pub loops: Vec<LoopCtx>,
     pub handler_depth: usize,
+    /// The handlers open at this point of the code, innermost last, one per
+    /// `handler_depth`: the ip of a `PushHandler` (a catch handler), `None`
+    /// for a `PushFinally`.
+    handlers: Vec<Option<usize>>,
+    /// Each `PyRaise` emitted under a catch handler, with that handler's
+    /// `PushHandler` ip: [`Emitter::finish`] gives the raise the handler's
+    /// catch target (see `Instr::PyRaise`).
+    raises: Vec<(usize, usize)>,
     pub qualname: String,
     /// The last line [`Emitter::stamp_line`] recorded (-1: none since the
     /// last jump target).
@@ -265,6 +276,8 @@ impl<'a> Emitter<'a> {
             control_depth: 0,
             loops: Vec::new(),
             handler_depth: 0,
+            handlers: Vec::new(),
+            raises: Vec::new(),
             qualname,
             last_line: -1,
             lines: Vec::new(),
@@ -464,6 +477,17 @@ impl<'a> Emitter<'a> {
     pub fn finish(mut self) -> FuncProto {
         debug_assert!(self.cold.is_empty(), "Python emitter: unflushed slow paths");
         self.proto.reg_count = (self.high.max(self.next)) as u16;
+        // A raise under a catch handler names the handler's catch target,
+        // patched in by now.
+        for &(at, push) in &self.raises {
+            let target = match self.proto.code.get(push) {
+                Some(&Instr::PushHandler { catch_target, .. }) => catch_target,
+                _ => continue,
+            };
+            if let Some(Instr::PyRaise { catch, .. }) = self.proto.code.get_mut(at) {
+                *catch = target;
+            }
+        }
         // The frame table, as the code object's last string constant (no
         // instruction refers to it): `from,start,end,exception,line` for the
         // frame guard (`-,line` when there is none), then the ip -> line
@@ -498,11 +522,13 @@ impl<'a> Emitter<'a> {
     pub fn defer_cold(&mut self, jumps: Vec<usize>, slow_edges: Vec<usize>, body: impl FnOnce(&mut Emitter<'a>) -> R<()> + 'a) {
         let resume = self.here();
         let line = self.line_now;
-        self.cold.push(ColdBlock { jumps, slow_edges, mark: self.next, resume, line, body: Box::new(body) });
+        let catch = self.innermost_catch();
+        self.cold.push(ColdBlock { jumps, slow_edges, mark: self.next, resume, line, catch, body: Box::new(body) });
     }
     /// Emit the deferred slow paths (they may defer more).
     pub fn flush_cold(&mut self) -> R<()> {
         let saved = self.next;
+        let saved_handlers = std::mem::take(&mut self.handlers);
         while !self.cold.is_empty() {
             let blocks = std::mem::take(&mut self.cold);
             for block in blocks {
@@ -515,12 +541,43 @@ impl<'a> Emitter<'a> {
                     self.patch_slow(j, start)?;
                 }
                 self.next = block.mark;
+                // The block runs under the handlers open where it was
+                // deferred; only the innermost matters to what it emits.
+                self.handlers = vec![block.catch];
                 (block.body)(self)?;
                 self.emit(Instr::Jump { target: block.resume })?;
             }
         }
+        self.handlers = saved_handlers;
         self.next = saved;
         Ok(())
+    }
+    /// A handler opens: `push` the ip of its `PushHandler` (a catch
+    /// handler), `None` for a `PushFinally`.
+    pub fn enter_handler(&mut self, push: Option<usize>) {
+        self.handler_depth += 1;
+        self.handlers.push(push);
+    }
+    /// The innermost open handler closes.
+    pub fn leave_handler(&mut self) {
+        self.handler_depth -= 1;
+        self.handlers.pop();
+    }
+    /// The `PushHandler` ip of the innermost open handler when it is a catch
+    /// handler (`None` when it is a finally, or there is none).
+    pub fn innermost_catch(&self) -> Option<usize> {
+        self.handlers.last().copied().flatten()
+    }
+    /// `raise e` natively (`PyRaise`, its slow edge left for the caller to
+    /// patch): under a catch handler, the raise is caught there directly
+    /// when that handler is still the frame's innermost (see
+    /// `Instr::PyRaise`).
+    pub fn py_raise(&mut self, e: Reg, rt: Reg) -> R<usize> {
+        let at = self.emit(Instr::PyRaise { e, rt, slow: 0, catch: u32::MAX })?;
+        if let Some(push) = self.innermost_catch() {
+            self.raises.push((at, push));
+        }
+        Ok(at)
     }
 
     // ---- diagnostics ----------------------------------------------------------
@@ -1387,7 +1444,7 @@ impl<'a> Emitter<'a> {
             let cls = e.prop(rt, "KEYERROR")?;
             let exc = e.alloc()?;
             let at_make = e.emit(Instr::PyMakeExc { dst: exc, cls, args, rt, slow: 0 })?;
-            let at_raise = e.emit(Instr::PyRaise { e: exc, rt, slow: 0 })?;
+            let at_raise = e.py_raise(exc, rt)?;
             let here = e.here();
             e.patch_slow(at_look, here)?;
             e.patch_slow(at_make, here)?;

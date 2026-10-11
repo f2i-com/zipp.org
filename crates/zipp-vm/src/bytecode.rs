@@ -2392,13 +2392,18 @@ pub enum Instr {
     /// `context` and `tbline`. The current exception (the last element of
     /// the Array `rt.EXCSTACK`, if any) becomes `e.context` unless it is `e`,
     /// `e.tbline` becomes -1, and `e` is thrown. Anything else jumps to
-    /// `slow` having changed nothing.
+    /// `slow` having changed nothing. `catch` is the catch target of the
+    /// handler the emitter saw innermost here (`u32::MAX`: none, or a
+    /// `finally`): when the frame's own innermost handler is that catch
+    /// handler, the throw is caught there and then, as the unwinder would
+    /// catch it, and execution goes on at `catch` (a third successor).
     #[allow(dead_code)] // emitted by the Python frontend only
     #[cfg(not(feature = "wasm-lite"))]
     PyRaise {
         e: Reg,
         rt: Reg,
         slow: u32,
+        catch: u32,
     },
     /// `dst = e` for an exception entering a handler, as the runtime's
     /// `caught` helper does it: `e` a plain object with an own data `tbline`

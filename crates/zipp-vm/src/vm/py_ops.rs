@@ -366,7 +366,7 @@ impl<'p> Vm<'p> {
                     None => slow as usize,
                 }
             }
-            Instr::PyRaise { e, rt, slow } => {
+            Instr::PyRaise { e, rt, slow, catch } => {
                 let (ev, rv) = (self.get(base, e), self.get(base, rt));
                 let Some((ctx_slot, tb_slot, cur)) = self.py_raise_plan(ev, rv) else {
                     return Ok(slow as usize);
@@ -396,6 +396,23 @@ impl<'p> Vm<'p> {
                 // throw leaves the loop uncaught (a caught one never reads it).
                 let top = self.frames.len() - 1;
                 self.frames[top].ip = ip;
+                // The frame's own innermost handler is the catch handler the
+                // instruction names: caught here, as `unwind_to_handler`
+                // catches a throw in the frame that raised it (the handler
+                // popped, the frame's line noted, the exception in the
+                // handler's register), without leaving the dispatch loop.
+                if let Some(&Handler::Catch { target, reg }) = self.frames[top].handlers.last() {
+                    if target == catch {
+                        self.frames[top].handlers.pop();
+                        if self.py_unwind_candidate(top) {
+                            self.py_unwind_frame(top, true, ev, true);
+                        }
+                        let fbase = self.frames[top].base;
+                        self.regs[fbase + reg as usize] = ev;
+                        self.frames[top].ip = target as usize;
+                        return Ok(target as usize);
+                    }
+                }
                 self.pending_throw = Some(ev);
                 return Err(Thrown(String::new()));
             }
