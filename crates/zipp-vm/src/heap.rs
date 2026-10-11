@@ -5046,6 +5046,17 @@ fn no_hot_mirror() -> HotMirrorHint {
     None
 }
 
+/// The hint for an occupant whose hot mirror is CLEAR (see `Heap::alloc`).
+#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[inline(always)]
+fn clear_hot_mirror() -> HotMirrorHint {
+    Some(HotMirror::CLEAR)
+}
+
+#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+#[inline(always)]
+fn clear_hot_mirror() -> HotMirrorHint {}
+
 #[cfg(all(feature = "meter-only", not(feature = "jit")))]
 #[inline(always)]
 fn no_hot_mirror() -> HotMirrorHint {}
@@ -5415,6 +5426,37 @@ pub enum HeapObj {
 }
 
 impl HeapObj {
+    /// [`HeapObj::resident_payload_bytes`] for an object about to be
+    /// allocated, inline for the variants a program allocates by the million
+    /// and the call for the rest. Every allocation sized its payload through
+    /// that function's forty-arm match, out of line, for a figure that is
+    /// zero for most of what is allocated (a rope, a cell, a function, a
+    /// resolver, a promise with no reactions yet). Equal to it for every
+    /// object; a test holds the two together.
+    #[inline(always)]
+    fn birth_payload_bytes(&self) -> usize {
+        match self {
+            HeapObj::Cons { .. }
+            | HeapObj::Func(_)
+            | HeapObj::Cell
+            | HeapObj::Native(_)
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. }
+            | HeapObj::Date(_)
+            | HeapObj::Boxed { .. }
+            | HeapObj::BigInt(_)
+            | HeapObj::WeakRef(_) => 0,
+            HeapObj::Str(s) => s.byte_capacity(),
+            HeapObj::Array(items) => vec_capacity_bytes(items),
+            HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),
+            HeapObj::Promise { reactions, .. } => match reactions {
+                Reactions::Many(v) => vec_capacity_bytes(v),
+                _ => 0,
+            },
+            _ => self.resident_payload_bytes(),
+        }
+    }
+
     /// Heap allocations owned directly by this slot. This deliberately uses
     /// capacities rather than lengths: shrinking a JS aggregate does not give
     /// its reserved address space back to the host allocator.
@@ -7154,7 +7196,19 @@ impl Heap {
 
     #[inline]
     pub fn alloc(&mut self, obj: HeapObj) -> u32 {
-        self.alloc_settled(obj, no_hot_mirror())
+        // Only objects, functions, closures and Python attribute records
+        // carry a hot mirror (`refresh_mirror`); for every other occupant the
+        // mirror is CLEAR, which is settled here from the value in hand
+        // instead of by re-reading the 80-byte slot just written and
+        // matching it. Strings, ropes, promises, arrays and cells are most of
+        // what a program allocates.
+        let hot = match &obj {
+            HeapObj::Object(_) | HeapObj::Func(_) | HeapObj::Closure { .. } => no_hot_mirror(),
+            #[cfg(feature = "python")]
+            HeapObj::PyAttrs { .. } => no_hot_mirror(),
+            _ => clear_hot_mirror(),
+        };
+        self.alloc_settled(obj, hot)
     }
 
     /// B238/B240: the one allocation body, which settles the occupant's hot
@@ -7361,7 +7415,8 @@ impl Heap {
         // is precisely the collection that cannot reclaim them — that is why
         // the existing schedule, which reaches a major only after 64 minors,
         // never arrived in time.
-        let big = obj.resident_payload_bytes();
+        let big = obj.birth_payload_bytes();
+        debug_assert_eq!(big, obj.resident_payload_bytes());
         if big >= BIG_PAYLOAD_BYTES {
             self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(big);
             if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
@@ -11530,5 +11585,40 @@ mod seeded_bytes_hash_tests {
         assert!(deepest <= 8, "a bucket holds {deepest} keys");
         let used = buckets.iter().filter(|&&n| n > 0).count();
         assert!(used > 14_000, "{used} buckets used");
+    }
+}
+
+#[cfg(test)]
+mod birth_payload_tests {
+    use super::*;
+
+    #[test]
+    fn the_inline_birth_size_is_the_payload_size() {
+        let mut objs = vec![
+            HeapObj::Cons { left: 1, right: 2, len: 3 },
+            HeapObj::Func(7),
+            HeapObj::Cell,
+            HeapObj::Native(3),
+            HeapObj::Date(1.5),
+            HeapObj::Boxed { kind: 1, value: Value::int(4) },
+            HeapObj::BigInt(1 << 90),
+            HeapObj::WeakRef(Value::UNDEFINED),
+            HeapObj::Str(JsStr::from_wtf8(b"a string of some length".to_vec())),
+            HeapObj::Array(Vec::new()),
+            HeapObj::Array(Vec::with_capacity(9)),
+            HeapObj::Array(vec![Value::int(1); 700]),
+            HeapObj::Set(Vec::with_capacity(5)),
+            HeapObj::Map { keys: Vec::with_capacity(3), vals: Vec::with_capacity(4) },
+            HeapObj::Object(Box::new(ObjMap::new())),
+            HeapObj::Temporal { kind: 1, fields: vec![1, 2, 3] },
+            HeapObj::Symbol { desc: Value::UNDEFINED, prop_key: String::from("@@sym") },
+        ];
+        let mut o = ObjMap::new();
+        o.set("a", Value::int(1));
+        o.set("bb", Value::int(2));
+        objs.push(HeapObj::Object(Box::new(o)));
+        for (i, obj) in objs.iter().enumerate() {
+            assert_eq!(obj.birth_payload_bytes(), obj.resident_payload_bytes(), "object {i}");
+        }
     }
 }
