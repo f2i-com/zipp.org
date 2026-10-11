@@ -429,7 +429,7 @@ statements, f-strings, the builtin types and a set of standard-library
 modules (`math`, `json`, `re`, `collections`, `itertools`, `functools`,
 `dataclasses`, `enum`, `contextlib`, `typing`, `struct`, `hashlib`, ...)
 all work; `async` does not yet. Semantics are checked
-differentially against CPython: the 156 programs of `tests/python_corpus/*.py`
+differentially against CPython: the 161 programs of `tests/python_corpus/*.py`
 must print exactly what CPython 3.13 prints, in the default, no-fast-path and
 no-JIT modes.
 

@@ -1,5 +1,85 @@
 # Zipp performance handoff
 
+### 12 October: fourteenth pass, local and unpushed
+
+`codex/engine-size-reduction` is 35 commits past `887d2149` (0.0.22) at
+`726ddfbf`, plus the commit that records them. Nothing is pushed, CI has
+not run on any of it and no release has been cut. The record is
+[docs/validation/2026-10-12-engine-size-round14.md](docs/validation/2026-10-12-engine-size-round14.md),
+with its numbers in the `-evidence.json` beside it.
+
+**0.0.22 has three defects that this branch fixes.** Memory that grows in
+place (a pushed array, a filling Map, an object gathering keys) never
+reached the collector: a WebAssembly instance trapped, or a script was ended
+at its heap ceiling with a megabyte live, and natively 2,000 calls building
+an array held 1.2 GB. `var s = "number"; s += x` in a loop rewrote the
+string `typeof` returns. Garbage in blocks under 4 KiB was never collected
+natively. A release that carries the fixes should say so.
+
+What the pass did, against 0.0.22:
+
+- Modules, raw / Brotli: Lite 2,573,185 / 694,745 (-2.3% / -2.2%),
+  JavaScript 4,703,604 / 1,189,469 (-3.5% / -3.1%), Python-base
+  6,379,257 / 1,578,173 (-2.2% / -1.2%), Python + Torch
+  8,303,296 / 1,929,593 (-1.7% / -1.1%).
+- WebAssembly time over each corpus: Lite 0.83 to 0.86, JavaScript 0.90 to
+  0.91, the two Python modules 0.92 to 0.93. Rows are flagged slower in
+  every module; the audit lists them.
+- Native: -3.59% over the 13 rows, the headline ten at 0.914x of Node.
+- Python: 1.79x to 1.69x of CPython in-script.
+
+**Decisions that are the user's.**
+
+- Whether and when to release.
+- The heap ceiling still convicts on the payload high-water mark, as the
+  README states. Collecting before convicting, or judging the live figure,
+  would end fewer scripts falsely and changes that contract.
+- `JsonWalkPlan`, an exact-shape recogniser for `json-large`'s walk
+  function, appears to have matched nothing since 2 September, when the
+  bytecode it pins changed (a workflow finding: `ZIPP_NO_JSON_WALK_REDUCE=1`
+  makes no difference on one binary; not re-verified in this pass). Re-pin
+  it, or delete about 500 lines; a general `for-in` fast path would serve
+  the same code without pinning a benchmark's bytecode.
+
+**Leads for the next pass, each with a probe under `target/r14-scratch`.**
+
+- A string-keyed `o[k]` in compiled code costs a helper call of about 14 ns;
+  Node's keyed inline cache costs 3 to 4. Word count is 2.9 times Node's
+  time, `o[k] = o[k] + 1` 3.7 times. An inline cache keyed on the key
+  string's identity (verified against the slot's key) is the step.
+- The WebAssembly interpreter builds a `String` for every computed read that
+  misses (`key_of`); the compiled-code fix does not reach the modules.
+- A compiled `push` still calls (3.3 times Node); `Map.set` on a fresh Map
+  is 4.8 times Node, a string appended in a called function 6.4 times.
+- `promise-resolve` is 3 to 9% slower a call in the two Python modules and
+  the cause is not known; `alloc-object` pays 1 to 4% for the reporting
+  allocator in the full modules.
+- Under the checked profile, a buffer that is large at birth is counted by
+  the birth schedule and by the footprint schedule, and code compiled at run
+  time (a Python import) counts as growth: both ask for collections that the
+  native build no longer asks for. Engine start with 200 functions is 3 to
+  4% slower in Python + Torch.
+- `zipp-pyparse` still links core's float parser into the two Python
+  modules: about 12 KB after Brotli each.
+- Python, found by the agent that built the seven changes and not fixed:
+  `heapq` pops equal items in a different order from CPython (it sifts down
+  the textbook way); a `str` subclass instance does not hash as its value;
+  tuple `<` calls a user `__lt__` more often than CPython; `endswith` with
+  a lone low surrogate answers True; a `"\ud800"` literal becomes U+FFFD;
+  `textwrap` uses JavaScript's whitespace. The `super()` cache was not
+  built.
+- `cargo check --tests` with `safe-sandbox,meter-only,python` does not
+  compile `python_torch_native.rs`; it did not before the pass.
+
+Carried over, unchanged by this pass: the landing site still serves the
+0.0.21 engines, and the Linux workspace suite runs within a few minutes of
+its 120-minute job limit.
+
+Local state not in the branch: worktrees under `target/wt/` and
+`.claude/worktrees/` (two agent worktrees, locked), probes and logs under
+`target/r14-scratch`, the built modules under `target/size-audit/*-r14*`,
+and the workflow's findings in `target/r14-findings.json`.
+
 ### 10 October: 0.0.22 published
 
 ZIPP Lite was added to the release the same day, at the user's request, as a
