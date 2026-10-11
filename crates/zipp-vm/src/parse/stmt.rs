@@ -150,10 +150,15 @@ impl<'s> Parser<'s> {
     /// already consumed the DecoratorList and now asks whether an `export`
     /// follows. Returns `None` (leaving the list with the caller) when it does
     /// not, so a plain `@dec class C {}` still takes the caller's own path.
+    ///
+    /// The list is taken, not copied: past this point the function returns the
+    /// export or an error, never `None`, so the caller does not see it empty.
+    /// The copy was the engine's one clone of a syntax node, and kept the
+    /// derived `Clone` of every node type linked for it (27 KB of a module).
     fn parse_module_decl_decorated(
         &mut self,
         start: u32,
-        decorators: &[Expr],
+        decorators: &mut Vec<Expr>,
     ) -> PResult<Option<Stmt>> {
         if self.goal != Goal::Module
             || !self.scopes.at_module_top_level()
@@ -161,7 +166,7 @@ impl<'s> Parser<'s> {
         {
             return Ok(None);
         }
-        self.pending_class_decorators = Some((start, decorators.to_vec()));
+        self.pending_class_decorators = Some((start, std::mem::take(decorators)));
         let pos = self.cur().span.start;
         self.bump_after_operand()?;
         let r = self.parse_export_rest(pos)?;
@@ -632,8 +637,8 @@ impl<'s> Parser<'s> {
         // `parse_module_decl` once the list is parsed).
         if self.at(Punct::At) {
             let start = self.cur().span.start;
-            let decorators = self.parse_decorators()?;
-            if let Some(m) = self.parse_module_decl_decorated(start, &decorators)? {
+            let mut decorators = self.parse_decorators()?;
+            if let Some(m) = self.parse_module_decl_decorated(start, &mut decorators)? {
                 return Ok(m);
             }
             if !self.at_kw(Keyword::Class) {
