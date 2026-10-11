@@ -46,7 +46,8 @@ const F_GRT: (usize, &str) = (13, "grt");
 /// The runtime values the step needs (`grt`, one array shared by every
 /// generator record): the JavaScript `genNext`, the current-exception
 /// stack, the STOP sentinel and `genEscape`.
-struct GenRuntime {
+#[derive(Clone, Copy)]
+pub(super) struct GenRuntime {
     gen_next: Value,
     exc_stack: u32,
     stop: Value,
@@ -68,6 +69,7 @@ impl<'p> Vm<'p> {
         (!m.attr_at(slot).accessor).then_some(slot)
     }
 
+    #[inline]
     fn py_gen_read(&self, idx: u32, slot: usize) -> Value {
         match self.heap.get(idx) {
             HeapObj::Object(m) => m.val_at(slot),
@@ -75,6 +77,7 @@ impl<'p> Vm<'p> {
         }
     }
 
+    #[inline]
     fn py_gen_write(&mut self, idx: u32, slot: usize, v: Value) {
         if v.is_heap() {
             self.heap.write_barrier_val(idx, v);
@@ -105,6 +108,7 @@ impl<'p> Vm<'p> {
         })
     }
 
+    #[inline]
     fn py_exc_depth(&self, stack: u32) -> Option<usize> {
         match self.heap.get(stack) {
             HeapObj::Array(items) => Some(items.len()),
@@ -112,9 +116,74 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The runtime array `grt` of a record of the known shape: the one
+    /// validated last (kept in `pins`, so its slot is never another array's
+    /// while the registry lives), or validated now and kept.
+    #[inline]
+    fn py_gen_runtime_cached(&mut self, grt: Value) -> Option<GenRuntime> {
+        let p = self.py_rt.as_deref()?;
+        if let Some((bits, rt)) = p.gen_rt.get() {
+            if bits == grt.bits() {
+                return Some(rt);
+            }
+        }
+        let rt = self.py_gen_runtime(grt)?;
+        let p = self.py_rt.as_deref()?;
+        let pins = p.pins;
+        p.gen_rt.set(Some((grt.bits(), rt)));
+        if pins.is_heap() {
+            let pi = pins.heap_index();
+            self.heap.write_barrier_val(pi, grt);
+            if let HeapObj::Array(a) = self.heap.get_mut(pi) {
+                a.push(grt);
+            }
+        }
+        Some(rt)
+    }
+
+    /// [`Vm::py_gen_next`] for the state that matters for speed: a record of
+    /// the shape already seen with every field at its usual slot (so read
+    /// together), not done, not running, holding no exceptions, around an
+    /// engine generator. `None` for anything else, with nothing done.
+    #[inline]
+    fn py_gen_next_plain(&mut self, this: Value) -> Option<Result<Value, Thrown>> {
+        if !this.is_heap() {
+            return None;
+        }
+        let g = this.heap_index();
+        let shape = self.py_rt.as_deref()?.gen_shape.get();
+        let HeapObj::Object(m) = self.heap.get(g) else {
+            return None;
+        };
+        if m.is_ctor || shape == crate::shape::DICT || m.shape() != shape {
+            return None;
+        }
+        let (js, done, started, running, excs, grt) =
+            (m.val_at(F_JS.0), m.val_at(F_DONE.0), m.val_at(F_STARTED.0), m.val_at(F_RUNNING.0), m.val_at(F_EXCS.0), m.val_at(F_GRT.0));
+        if done != Value::FALSE || running != Value::FALSE || excs != Value::NULL || !js.is_heap() {
+            return None;
+        }
+        if !matches!(self.heap.get(js.heap_index()), HeapObj::Generator { .. }) {
+            return None;
+        }
+        let rt = self.py_gen_runtime_cached(grt)?;
+        let depth = self.py_exc_depth(rt.exc_stack)?;
+        // `running = true`, `started = true` (no barrier: not heap values).
+        if let HeapObj::Object(m) = self.heap.get_mut(g) {
+            m.set_val_at(F_RUNNING.0, Value::TRUE);
+            if started != Value::TRUE {
+                m.set_val_at(F_STARTED.0, Value::TRUE);
+            }
+        }
+        Some(self.py_gen_step(this, js.heap_index(), &rt, depth, (F_DONE.0, F_RUNNING.0, F_RETURNED.0, F_EXCS.0)))
+    }
+
     /// `__zipp_py_gen`, called as `g.next()`: one step of the Python
     /// generator record `this` (see the module comment).
     pub(crate) fn py_gen_next(&mut self, this: Value) -> Result<Value, Thrown> {
+        if let Some(r) = self.py_gen_next_plain(this) {
+            return r;
+        }
         if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::Object(m) if !m.is_ctor) {
             return Err(Thrown::from_static("TypeError: generator step on a non-generator"));
         }
@@ -180,8 +249,18 @@ impl<'p> Vm<'p> {
         if self.py_gen_read(g, s_started) != Value::TRUE {
             self.py_gen_write(g, s_started, Value::TRUE);
         }
+        self.py_gen_step(this, js.heap_index(), &rt, depth, (s_done, s_running, s_returned, s_excs))
+    }
+
+    /// The rest of a plain step of the record `this` once `running` is set:
+    /// the engine generator `js` resumed, then `genNext`'s bookkeeping
+    /// (see the module comment). `slots`: the record's `done`, `running`,
+    /// `returned` and `excs`.
+    fn py_gen_step(&mut self, this: Value, js: u32, rt: &GenRuntime, depth: usize, slots: (usize, usize, usize, usize)) -> Result<Value, Thrown> {
+        let g = this.heap_index();
+        let (s_done, s_running, s_returned, s_excs) = slots;
         // The engine's `next` step, its iterator result not built.
-        let step = self.generator_next_step(js.heap_index());
+        let step = self.generator_next_step(js);
         let res = match step {
             Ok(Some(super::async_runtime::GenStep::Yield(v))) => Ok((v, false)),
             Ok(Some(super::async_runtime::GenStep::Done(v))) => Ok((v, true)),

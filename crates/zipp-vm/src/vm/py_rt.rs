@@ -209,6 +209,9 @@ pub(crate) struct PyRt {
     pub(super) mself_slot: Option<usize>,
     /// The generator record shape `vm::py_gen` found plain.
     pub(super) gen_shape: Cell<u32>,
+    /// The generator records' runtime array (`grt`) `vm::py_gen` last
+    /// validated, by bits, and what it holds (the array is in `pins`).
+    pub(super) gen_rt: Cell<Option<(u64, super::py_gen::GenRuntime)>>,
     pub(super) hints: [Cell<u16>; hint::COUNT],
     /// Interned attribute and global names (see `Vm::py_intern`).
     names: rustc_hash::FxHashMap<Box<[u8]>, Value>,
@@ -322,6 +325,7 @@ impl PyRt {
             ty: None,
             mself_slot: None,
             gen_shape: Cell::new(crate::shape::DICT),
+            gen_rt: Cell::new(None),
             hints: std::array::from_fn(|_| Cell::new(0)),
             names: rustc_hash::FxHashMap::default(),
             ics: Vec::new(),
