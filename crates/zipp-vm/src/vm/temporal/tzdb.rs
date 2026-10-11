@@ -14,37 +14,93 @@
 //! string. Times are seconds here; the callers scale to nanoseconds.
 
 use super::tzdata::{
-    FinalRule, FINALS, IDS, TRANS_BLOCK_AT, TRANS_BLOCK_POS, TRANS_BYTES, TRANS_PALETTE, ZONES,
+    FinalRule, FINALS, IDS, TRANS_BLOCK_DAY, TRANS_BLOCK_POS, TRANS_BLOCK_TOD, TRANS_BYTES,
+    TRANS_OFFSET, TRANS_PALETTE, TRANS_TOD, ZONES,
 };
 
-/// Random access decodes at most 32 records, with no expanded database or cache.
-fn transition(index: usize) -> (i64, i32) {
-    let block = index / 32;
-    let mut pos = TRANS_BLOCK_POS[block] as usize;
-    let mut time = TRANS_BLOCK_AT[block];
-    let mut offset = TRANS_BYTES[pos];
-    pos += 1;
-    for _ in 0..index % 32 {
-        time += read_delta(&mut pos);
-        offset = TRANS_BYTES[pos];
-        pos += 1;
-    }
-    (time, TRANS_PALETTE[offset as usize])
+/// The transitions of all zones form one list, stored in blocks of this many
+/// (see `tools/pack_tz_transitions.py`): an instant is read by decoding at
+/// most one block, with no expanded database or cache.
+const BLOCK: usize = 32;
+const DAY: i64 = 86400;
+
+/// The instant of a block's first transition.
+fn block_start(block: usize) -> i64 {
+    i64::from(TRANS_BLOCK_DAY[block]) * DAY + i64::from(TRANS_TOD[TRANS_BLOCK_TOD[block] as usize])
 }
 
-fn read_delta(pos: &mut usize) -> i64 {
-    let mut n = 0u64;
-    let mut shift = 0;
-    loop {
-        let b = TRANS_BYTES[*pos];
-        *pos += 1;
-        n |= u64::from(b & 127) << shift;
-        if b < 128 {
-            break;
+/// Reads a block's transitions in order, from its first.
+struct Cursor {
+    pos: usize,
+    day: i64,
+    /// The time of day of the current transition and of the one before it.
+    tod: u32,
+    prev_tod: u32,
+}
+
+impl Cursor {
+    fn new(block: usize) -> Self {
+        let tod = TRANS_TOD[TRANS_BLOCK_TOD[block] as usize];
+        Cursor {
+            pos: TRANS_BLOCK_POS[block] as usize,
+            day: i64::from(TRANS_BLOCK_DAY[block]),
+            tod,
+            prev_tod: tod,
         }
-        shift += 7;
     }
-    ((n >> 1) as i64) ^ -((n & 1) as i64)
+
+    fn instant(&self) -> i64 {
+        self.day * DAY + i64::from(self.tod)
+    }
+
+    /// Step to the block's next transition (the caller knows there is one):
+    /// the days since this one, then its time of day.
+    fn advance(&mut self) {
+        let days = TRANS_BYTES[self.pos];
+        self.pos += 1;
+        self.day += if days < 255 {
+            i64::from(days)
+        } else {
+            let n = self.varint();
+            ((n >> 1) as i64) ^ -((n & 1) as i64)
+        };
+        // 0 is the time of the transition two before (never written for a
+        // block's second transition, which has none in its block).
+        let tod = match self.varint() {
+            0 => self.prev_tod,
+            n => TRANS_TOD[n as usize - 1],
+        };
+        self.prev_tod = self.tod;
+        self.tod = tod;
+    }
+
+    fn varint(&mut self) -> u64 {
+        let mut n = 0u64;
+        let mut shift = 0;
+        loop {
+            let b = TRANS_BYTES[self.pos];
+            self.pos += 1;
+            n |= u64::from(b & 127) << shift;
+            if b < 128 {
+                return n;
+            }
+            shift += 7;
+        }
+    }
+}
+
+/// The instant of transition `index`.
+fn transition_at(index: usize) -> i64 {
+    let mut cursor = Cursor::new(index / BLOCK);
+    for _ in 0..index % BLOCK {
+        cursor.advance();
+    }
+    cursor.instant()
+}
+
+/// The UTC offset (seconds) in force after transition `index`.
+fn offset_after(index: usize) -> i32 {
+    TRANS_PALETTE[TRANS_OFFSET[index] as usize]
 }
 
 struct Transitions {
@@ -57,34 +113,39 @@ impl Transitions {
         self.hi - self.lo
     }
     fn at(&self, i: usize) -> i64 {
-        transition(self.lo + i).0
+        transition_at(self.lo + i)
     }
-    // Search the absolute checkpoints, then stream just one block. A checkpoint
-    // outside this zone is excluded even when its block contains the zone edge.
+    // Bisect the blocks' first instants, then stream just one block. A block
+    // that starts outside this zone is excluded even when it holds the zone's
+    // first transitions.
     fn partition_point(&self, pred: impl Fn(i64) -> bool) -> usize {
-        let first = self.lo.div_ceil(32);
-        let end = self.hi.div_ceil(32);
-        let checkpoints = &TRANS_BLOCK_AT[first..end];
-        let n = checkpoints.partition_point(|&t| pred(t));
-        let start = if n == 0 {
+        let first = self.lo.div_ceil(BLOCK);
+        let (mut low, mut high) = (first, self.hi.div_ceil(BLOCK));
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if pred(block_start(mid)) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let start = if low == first {
             self.lo
         } else {
-            (first + n - 1) * 32
+            (low - 1) * BLOCK
         };
         if start == self.hi {
             return self.len();
         }
-        let block = start / 32;
-        let stop = ((block + 1) * 32).min(self.hi);
-        let mut pos = TRANS_BLOCK_POS[block] as usize + 1;
-        let mut time = TRANS_BLOCK_AT[block];
-        for i in block * 32..stop {
-            if i >= start && !pred(time) {
+        let block = start / BLOCK;
+        let stop = ((block + 1) * BLOCK).min(self.hi);
+        let mut cursor = Cursor::new(block);
+        for i in block * BLOCK..stop {
+            if i >= start && !pred(cursor.instant()) {
                 return i - self.lo;
             }
             if i + 1 < stop {
-                time += read_delta(&mut pos);
-                pos += 1; // offset index
+                cursor.advance();
             }
         }
         stop - self.lo
@@ -248,7 +309,7 @@ pub(crate) fn offset_seconds(zone: u16, t: i64) -> i32 {
         (at.len(), z.last_off)
     } else {
         let i = at.partition_point(|x| x <= t);
-        (i, if i > 0 { transition(lo + i - 1).1 } else { z.init })
+        (i, if i > 0 { offset_after(lo + i - 1) } else { z.init })
     };
     // Past the explicit list the annual rules take over. Scanning the year
     // either side covers a transition that lands in the neighbouring civil
@@ -372,7 +433,10 @@ mod tests {
     fn packed_transitions_match_original_database() {
         use super::super::tzdata::{TRANS_AT, TRANS_OFF};
         for (i, (&time, &offset)) in TRANS_AT.iter().zip(TRANS_OFF).enumerate() {
-            assert_eq!(transition(i), (time, offset), "record {i}");
+            assert_eq!((transition_at(i), offset_after(i)), (time, offset), "record {i}");
+        }
+        for block in 0..TRANS_AT.len().div_ceil(BLOCK) {
+            assert_eq!(block_start(block), TRANS_AT[block * BLOCK], "block {block}");
         }
         for z in ZONES {
             let lo = z.tr as usize;
