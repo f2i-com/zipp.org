@@ -4411,6 +4411,15 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                     return bits;
                 }
             }
+            // `p.then` on a plain promise: the read half of the split
+            // `p.then(f)`, once per call. The same proof as the interpreter's
+            // read (`proto_intrinsic_read`) answers it without the walk.
+            if key == "then"
+                && matches!(vm.heap.get(idx), HeapObj::Promise { .. })
+                && vm.promise_plain_unobservable(idx)
+            {
+                return Value::heap(vm.promise_then_intrinsic).bits();
+            }
             return match jit_proto_named_get(vm, idx, key) {
                 Some(v) => v.bits(),
                 None => crate::codegen::SELF_CALL_DEOPT,

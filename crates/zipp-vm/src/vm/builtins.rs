@@ -736,6 +736,32 @@ impl<'p> Vm<'p> {
                 }
                 return self.try_builtin_method(recv, key, base, arg_base, argc);
             }
+            // `p.then(f)` and `p.then(f, g)` on a plain promise, with the
+            // captured callee the intrinsic `then`. The generic tail reached
+            // the same PerformPromiseThen through `call_value`'s cascade for
+            // callees that are not plain functions, the native dispatcher and
+            // a match on the method's name: more than half of what building
+            // a chain of `then`s cost. `promise_inline_plain` is the proof
+            // the fused call form already serves this with (default
+            // prototype, no own `then` or `constructor`, a pristine
+            // prototype and constructor with the species getter, one realm),
+            // and the routine is tick-identical to the generic one.
+            HeapObj::Promise { .. } => {
+                if (argc == 1 || argc == 2)
+                    && key == "then"
+                    && callee.bits() == Value::heap(self.promise_then_intrinsic).bits()
+                    && self.promise_inline_plain(idx)
+                {
+                    let on_fulfilled = self.regs[base + arg_base as usize];
+                    let on_rejected = if argc == 2 {
+                        self.regs[base + arg_base as usize + 1]
+                    } else {
+                        Value::UNDEFINED
+                    };
+                    return Ok(Some(self.perform_plain_promise_then(idx, on_fulfilled, on_rejected)));
+                }
+                return Ok(None);
+            }
             _ => return Ok(None),
         };
         if self.proto_intrinsic_bits(key, is_arr) != Some(callee.bits()) {
