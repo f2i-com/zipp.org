@@ -65,10 +65,39 @@ impl<'p> Vm<'p> {
     /// module namespace, not a constructor's map, and not in dictionary mode.
     #[inline]
     fn shaped_plain_object(&self, idx: u32) -> bool {
-        matches!(self.heap.get(idx), HeapObj::Object(m) if m.shape_guardable() && !m.is_ctor)
+        matches!(self.heap.get(idx), HeapObj::Object(m) if m.shape_guardable())
+            && self.plain_enum_object(idx)
+    }
+
+    /// [`Vm::shaped_plain_object`] without the shape: an ordinary object whose
+    /// keys live in its `ObjMap` alone, in dictionary mode or not.
+    #[inline]
+    fn plain_enum_object(&self, idx: u32) -> bool {
+        matches!(self.heap.get(idx), HeapObj::Object(m) if !m.is_ctor)
             && !(idx == self.global_this && self.global_this != 0)
             && (self.module_namespaces.is_empty() || !self.module_namespaces.contains_key(&idx))
             && (self.deferred_ns_state.is_empty() || !self.deferred_ns_state.contains_key(&idx))
+    }
+
+    /// Append to `out` the own enumerable string keys of the plain object
+    /// `idx`, in spec order, as key strings (shared ones where
+    /// `key_str_cache` holds them): what a for-in snapshot's own level
+    /// yields. The list of an object in dictionary mode, which no cache can
+    /// key.
+    fn own_enum_keys_uncached(&mut self, idx: u32, out: &mut Vec<Value>) {
+        let texts: Vec<String> = match self.heap.get(idx) {
+            HeapObj::Object(m) => spec_key_order(&m.keys)
+                .into_iter()
+                .filter(|&i| !is_hidden_key(&m.keys[i]) && m.attr_at(i).enumerable)
+                .map(|i| m.keys[i].clone())
+                .collect(),
+            _ => return,
+        };
+        out.reserve(texts.len());
+        for k in texts {
+            let v = self.alloc_key_str(k);
+            out.push(v);
+        }
     }
 
     /// Append to `out` the own enumerable string keys of the shaped plain
@@ -708,13 +737,24 @@ impl<'p> Vm<'p> {
                 && !self.proto_of.contains_key(&idx)
                 && matches!(self.heap.get(idx), HeapObj::Object(m) if m.class.is_none());
             if default_chain
-                && self.shaped_plain_object(idx)
+                && self.plain_enum_object(idx)
                 && self.for_in_level_barren(self.obj_proto)
             {
                 let mut out: Vec<Value> =
                     vec![Value::UNDEFINED; crate::bytecode::FORIN_SNAPSHOT_PREFIX];
                 out[0] = obj;
-                if self.shaped_own_enum_keys(idx, &mut out) {
+                // A dictionary-mode object (one that had a key deleted) has
+                // no shape to cache its list under: it is built here, and the
+                // snapshot still takes the version licence. A for-in over a
+                // sixty-key dictionary probed every key again on every visit.
+                let shaped = matches!(self.heap.get(idx), HeapObj::Object(m) if m.shape_guardable());
+                let listed = if shaped {
+                    self.shaped_own_enum_keys(idx, &mut out)
+                } else {
+                    self.own_enum_keys_uncached(idx, &mut out);
+                    true
+                };
+                if listed {
                     if crate::codegen::forin_version_fast_enabled() {
                         let anchor = Value::heap(self.obj_proto);
                         let anchor_version = Value::int(self.heap.version_of(self.obj_proto) as i32);

@@ -10,7 +10,9 @@
 //! `Object.prototype` gaining an enumerable key part way through, other
 //! prototypes, class instances and null-prototype objects, objects that
 //! leave their shape, more shapes than the cache holds, and arrays, strings
-//! and functions in the same loops. The loops run past the tier-up count.
+//! and functions in the same loops, and objects in dictionary mode (a key
+//! deleted before the loop) with keys deleted, re-added and added during it.
+//! The loops run past the tier-up count.
 //! The expected lines are Node 24's output for the same program.
 
 use zipp_vm::embed;
@@ -135,6 +137,27 @@ function keysOf(o) { var ks = []; for (var k in o) ks.push(k); return ks.join(",
   show("others", r);
 })();
 
+// 9. dictionary-mode objects (a key deleted before the loop): deletes,
+// re-adds and adds during the loop, sixty keys, integer-like keys
+(function () {
+  var r = [], h = 0;
+  for (var i = 0; i < N; i++) {
+    var o = {};
+    for (var p = 0; p < 60; p++) o["prop_" + p] = p;
+    o[7] = "seven"; o[2] = "two";
+    delete o.prop_0;
+    var ks = [];
+    for (var k in o) {
+      ks.push(k);
+      if (k === "prop_1") { delete o.prop_5; delete o.prop_2; o.prop_2 = "back"; o.added = 1; }
+      if (k === "prop_10" && i % 2) delete o.prop_59;
+    }
+    h = (h * 31 + ks.length) | 0;
+    if (i < 2) r.push(ks.slice(0, 8).join(",") + "..." + ks.slice(-3).join(",") + "#" + ks.length);
+  }
+  show("dict-mode", h + " " + r.join(" | "));
+})();
+
 console.log(out.join("\n"));
 "####;
 
@@ -149,6 +172,7 @@ fn shaped_enumeration_matches_node() {
         r####"shapes: 3702592"####,
         r####"values: 4504500"####,
         r####"others: 0,1,x|0,1|y|0,1,x|y"####,
+        r####"dict-mode: -420091228 2,7,prop_1,prop_2,prop_3,prop_4,prop_6,prop_7...prop_57,prop_58,prop_59#60 | 2,7,prop_1,prop_2,prop_3,prop_4,prop_6,prop_7...prop_56,prop_57,prop_58#59"####,
     ];
     let out = run(PROGRAM);
     let got: Vec<&str> = out.iter().flat_map(|chunk| chunk.lines()).collect();

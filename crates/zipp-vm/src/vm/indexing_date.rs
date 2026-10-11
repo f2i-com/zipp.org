@@ -462,6 +462,15 @@ impl<'p> Vm<'p> {
     /// global, a namespace, a constructor object — answers `false` and the
     /// caller falls back to the generic set_prop. `&self` only: no traps run.
     pub(super) fn plain_add_chain_clear(&self, start: u32, key: &str) -> bool {
+        self.plain_add_chain_clear_tagged(start, key, None)
+    }
+
+    /// [`Vm::plain_add_chain_clear`] with the key's property tag when the
+    /// caller has it (`prop_tag_of`), so the probe of each level's index
+    /// does not hash the key again: every new key a fused `o["p" + i] = v`
+    /// appends was hashed for the receiver and again for
+    /// `Object.prototype`.
+    pub(super) fn plain_add_chain_clear_tagged(&self, start: u32, key: &str, tag: Option<u32>) -> bool {
         let mut lidx = start;
         for _ in 0..1000 {
             let proto = match self.proto_of.get(&lidx) {
@@ -487,7 +496,11 @@ impl<'p> Vm<'p> {
                     if pm.class.is_some() || pm.is_ctor {
                         return false; // class accessors / constructor exotica
                     }
-                    if let Some(j) = pm.pos(key) {
+                    let found = match tag {
+                        Some(tag) => pm.pos_tagged(key, tag),
+                        None => pm.pos(key),
+                    };
+                    if let Some(j) = found {
                         // A writable data property on the chain is merely
                         // shadowed; an accessor or non-writable data blocks.
                         return !pm.attr_at(j).accessor && pm.attr_at(j).writable;
@@ -908,7 +921,7 @@ impl<'p> Vm<'p> {
                         && m.extensible
                         && m.class.is_none()
                         && !m.is_ctor
-                        && self.plain_add_chain_clear(idx, key),
+                        && self.plain_add_chain_clear_tagged(idx, key, once.then_some(tag)),
                 ),
             },
             _ => (None, false),
