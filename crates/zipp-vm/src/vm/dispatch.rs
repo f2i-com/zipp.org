@@ -1598,12 +1598,20 @@ impl<'p> Vm<'p> {
                     | Instr::PySetItem { .. } => {
                         ip = self.py_step(func_id, base, ip, instr)?;
                     }
+                    // An attribute that is a property with a Python getter or
+                    // setter: the accessor's frame pushed, as a call's is.
+                    #[cfg(feature = "python")]
+                    Instr::PyGetAttr { .. } | Instr::PySetAttr { .. } => {
+                        let next = self.py_step_ext(func_id, base, ip, instr)?;
+                        if next == usize::MAX {
+                            break;
+                        }
+                        ip = next;
+                    }
                     #[cfg(feature = "python")]
                     Instr::PyGlobal { .. }
                     | Instr::PyStrItem { .. }
                     | Instr::PyStrLen { .. }
-                    | Instr::PyGetAttr { .. }
-                    | Instr::PySetAttr { .. }
                     | Instr::PyIsInstance { .. }
                     | Instr::PyGenNext { .. }
                     | Instr::PyMethod { .. }

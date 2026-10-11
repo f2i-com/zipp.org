@@ -71,8 +71,10 @@ pub(crate) const PY_THREW: u64 = 4;
 /// interpreter runs it, like a frame call from compiled code; the register
 /// file is pinned while native code runs, see `reserve_jit_regs`), and
 /// `PyCall` pushes its callee's frame, which `Vm::jit_py_op` then runs to
-/// completion as `Vm::jit_frame_call` does. `PyRaise` always ends in a
-/// throw, which the native code unwinds like any helper's.
+/// completion as `Vm::jit_frame_call` does. So does a `PyGetAttr` /
+/// `PySetAttr` at a site whose cache holds a property's Python accessor:
+/// compiled code sees it fall through like any other. `PyRaise` always ends
+/// in a throw, which the native code unwinds like any helper's.
 #[inline]
 pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
     Some(match *i {

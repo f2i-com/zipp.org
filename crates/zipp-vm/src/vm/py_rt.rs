@@ -129,6 +129,17 @@ pub(super) mod ic {
     /// the name. (`METHOD` and `CLASS_ATTR` entries keep in `d` a layout
     /// proven to lack their name, 0 for none.)
     pub const GET_CLASS_L: u8 = 17;
+    /// `PyGetAttr` / `PySetAttr` of a property whose getter / setter is a
+    /// Python function the class's `gp` / `sp` names: `a` class, `c` its
+    /// `ver`, `b` that table's bits, `pos` the name's slot in it, `d` the
+    /// slot of the function record's entry (`c1` / `c2`). The instruction
+    /// pushes the accessor's frame while that still holds.
+    pub const ATTR_PROP: u8 = 18;
+    /// [`NOT_PLAIN`] at a `PyGetAttr` / `PySetAttr` whose class had no such
+    /// accessor for the name when the site asked (it asks once per entry:
+    /// the runtime fills `gp` / `sp` on its own first read or write, after
+    /// the site's first decline).
+    pub const NOT_PLAIN_ASKED: u8 = 19;
 }
 
 /// One per-site cache entry (see the module comment); kind 0 is empty.

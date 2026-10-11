@@ -258,21 +258,39 @@ impl<'p> Vm<'p> {
             }
             Instr::PyGetAttr { dst, obj, key, slow } => {
                 let o = self.get(base, obj);
-                match self.py_attr_get(func_id, ip, o, key) {
+                let mut call = None;
+                match self.py_attr_get(func_id, ip, o, key, &mut call) {
                     Some(v) => {
                         self.set(base, dst, v);
                         ip + 1
                     }
-                    None => slow as usize,
+                    None => match call {
+                        // A property: its getter's frame, as `PyCall` pushes
+                        // a callee's (`usize::MAX`), the result for `dst`.
+                        Some(a) => {
+                            self.py_push_accessor(a, base, obj, None, dst, ip)?;
+                            usize::MAX
+                        }
+                        None => slow as usize,
+                    },
                 }
             }
             Instr::PySetAttr { obj, key, val, slow } => {
                 let o = self.get(base, obj);
                 let v = self.get(base, val);
-                if self.py_attr_set(func_id, ip, o, key, v)? {
+                let mut call = None;
+                if self.py_attr_set(func_id, ip, o, key, v, &mut call)? {
                     ip + 1
                 } else {
-                    slow as usize
+                    match call {
+                        // A property: its setter's frame, whose result is
+                        // dropped.
+                        Some(a) => {
+                            self.py_push_accessor(a, base, obj, Some(v), super::ic::RET_DISCARD, ip)?;
+                            usize::MAX
+                        }
+                        None => slow as usize,
+                    }
                 }
             }
             Instr::PyIsInstance { dst, v, t, rt, slow } => {
@@ -589,6 +607,29 @@ impl<'p> Vm<'p> {
             self.py_prof_step(func_id, ip, instr, &shown);
         }
         r
+    }
+
+    /// Push the frame of a property's accessor for the `PyGetAttr` /
+    /// `PySetAttr` at `ip` (the dispatch loop then enters it, as it enters a
+    /// `PyCall`'s callee): the function record its `this`, the instance (in
+    /// the caller's register `obj`) its first parameter, and for a setter
+    /// `value` its second, which is in a register of its own and so is
+    /// written into the new frame. The result goes to the caller's `dst`
+    /// (`RET_DISCARD` for a setter's). Parameters beyond those take their
+    /// defaults, as a `PyCall`'s do.
+    fn py_push_accessor(&mut self, a: super::py_attr::PyAccessor, base: usize, obj: u16, value: Option<Value>, dst: u16, ip: usize) -> Result<(), Thrown> {
+        self.setup_call(a.fid, a.closure, a.f, base, obj, 1, dst, ip + 1, a.entry)?;
+        let mut argc = 1;
+        if let Some(v) = value {
+            if let Some(slot) = self.frames.last().map(|f| f.base + 2).filter(|&s| s < self.regs.len()) {
+                self.regs[slot] = v;
+            }
+            argc = 2;
+        }
+        if argc < self.func(a.fid as usize).param_count as usize {
+            self.py_fill_defaults(a.f, a.fid, argc);
+        }
+        Ok(())
     }
 
     /// Whether `entry` is the `__zipp_py_strm` native in a program with no

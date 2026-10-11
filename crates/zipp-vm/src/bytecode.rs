@@ -2244,7 +2244,12 @@ pub enum Instr {
     /// `dict` is a `Map` holding `key` (not `undefined`): that entry.
     /// Anything else jumps to `slow` (the emitter's general sequence),
     /// leaving `dst` untouched. Exactly the conjunction of the inline
-    /// `PyClassOf` / `cls.ga[key]` / `PyDictGet` read it replaces.
+    /// `PyClassOf` / `cls.ga[key]` / `PyDictGet` read it replaces. One more
+    /// case is answered here, once the site's cache has seen it: a property
+    /// whose getter is a Python function the class's `gp` names. Its frame
+    /// is pushed with `obj` as its argument, as a `PyCall`'s callee's is,
+    /// and `dst` takes what it returns (the `slow` sequence would call the
+    /// same function).
     #[allow(dead_code)] // emitted by the Python frontend only
     #[cfg(not(feature = "wasm-lite"))]
     PyGetAttr {
@@ -2256,7 +2261,10 @@ pub enum Instr {
     /// `obj.<key> = val` for an instance whose class says the store is a
     /// plain instance-dict store: as [`Instr::PyGetAttr`] with the class's
     /// `sa` table, then `obj.dict.set(key, val)`. Anything else jumps to
-    /// `slow` having changed nothing.
+    /// `slow` having changed nothing, but for a property whose setter is a
+    /// Python function the class's `sp` names, once the site's cache has
+    /// seen it: that function's frame is pushed with `obj` and `val`, and
+    /// its result dropped.
     #[allow(dead_code)] // emitted by the Python frontend only
     #[cfg(not(feature = "wasm-lite"))]
     PySetAttr {

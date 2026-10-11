@@ -21,6 +21,17 @@ use crate::value::Value;
 /// A `PyIc` key stamp (`d` of an `ATTR_GET` / `ATTR_SET` / `GLOBAL` /
 /// `BUILTIN` entry): the key is the site's cached constant, never freed.
 pub(super) const KEY_ROOTED: u32 = u32::MAX;
+
+/// A property's Python getter or setter as `PyGetAttr` / `PySetAttr` calls
+/// it: the function record `f` (the callee's `this`), its positional entry
+/// `entry` (`f.c1` / `f.c2`), and that entry's code object and closure.
+#[derive(Clone, Copy)]
+pub(super) struct PyAccessor {
+    pub fid: u32,
+    pub closure: u32,
+    pub f: Value,
+    pub entry: Value,
+}
 impl<'p> Vm<'p> {
     /// The name a string constant spells (`key` a constant-pool index).
     pub(super) fn py_const_name(&self, func_id: u32, key: u32) -> Option<&'p str> {
@@ -124,11 +135,12 @@ impl<'p> Vm<'p> {
         (pos < m.len() && !m.is_accessor_at(pos)).then(|| m.val_at(pos))
     }
 
-    /// Whether this site's [`ic::NOT_PLAIN`] entry `e` still proves the
-    /// class table at `slot` holds no `true` for the site's name.
+    /// Whether this site's [`ic::NOT_PLAIN`] (or [`ic::NOT_PLAIN_ASKED`])
+    /// entry `e` still proves the class table at `slot` holds no `true` for
+    /// the site's name.
     #[inline]
     fn py_not_plain(&self, e: &PyIc, cls: Value, slot: usize) -> bool {
-        if e.kind != ic::NOT_PLAIN || cls.bits() != e.a || !cls.is_heap() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
+        if (e.kind != ic::NOT_PLAIN && e.kind != ic::NOT_PLAIN_ASKED) || cls.bits() != e.a || !cls.is_heap() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
             return false;
         }
         let HeapObj::Object(c) = self.heap.get(cls.heap_index()) else {
@@ -187,10 +199,100 @@ impl<'p> Vm<'p> {
         (e.kind == kind && cls.bits() == e.a && cls.is_heap() && self.py_cls_stamp_ok(cls, e.hver, e.c)).then_some(e)
     }
 
-    /// [`Instr::PyGetAttr`]: `obj.name` from an instance's own dict when its
-    /// class's `ga[name]` is `true`; `None` for the slow edge.
+    /// The accessor an [`ic::ATTR_PROP`] entry `e` names, read afresh: the
+    /// function record at the entry's slot of the class's table (`table`:
+    /// the class record's `gp` or `sp` slot) and its own entry `entry_key`
+    /// (`c1` / `c2`, taking `argc` values) when that is a plain function to
+    /// push a frame for: one with a parameter for each value, and not a
+    /// generator's or a coroutine's (whose call makes an object). `cls` has
+    /// the entry's stamp.
+    #[inline]
+    fn py_accessor(&self, cls: Value, table: usize, e: &PyIc, entry_key: &str, argc: usize) -> Option<PyAccessor> {
+        let f = self.py_table_at(cls, table, e.b, e.pos)?;
+        if !f.is_heap() {
+            return None;
+        }
+        let entry = match self.heap.get(f.heap_index()) {
+            HeapObj::Object(m) if !m.is_ctor => {
+                let s = e.d as usize;
+                if s >= m.len() || !super::py_rt::key_eq(m.key_at(s), entry_key) || m.is_accessor_at(s) {
+                    return None;
+                }
+                m.val_at(s)
+            }
+            _ => return None,
+        };
+        if !entry.is_heap() {
+            return None;
+        }
+        let (fid, closure) = match self.heap.get(entry.heap_index()) {
+            HeapObj::Func(id) => (*id, super::NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, entry.heap_index()),
+            _ => return None,
+        };
+        let p = self.func(fid as usize);
+        (!p.is_generator && !p.is_async && p.rest_reg.is_none() && p.param_count as usize >= argc).then_some(PyAccessor { fid, closure, f, entry })
+    }
+
+    /// Whether `name` is, for `cls`, a property with a Python accessor a
+    /// frame is pushed for (`table` / `table_key`: the class's `gp` or
+    /// `sp`; `entry_key`: `c1` or `c2`, taking `argc` values): this site's
+    /// entry becomes the [`ic::ATTR_PROP`] one for it, and it is returned.
+    /// The class's own table of plain names (`ga` / `sa`) does not say
+    /// `true` for the name, which is when the emitter's slow sequence
+    /// (`PyAttrFn`) takes the same accessor from the same table.
     #[inline(never)]
-    pub(super) fn py_attr_get(&mut self, func_id: u32, ip: usize, o: Value, key: u32) -> Option<Value> {
+    #[allow(clippy::too_many_arguments)]
+    fn py_learn_accessor(&mut self, func_id: u32, ip: usize, cls: Value, table: usize, table_key: &str, name: &str, entry_key: &str, argc: usize) -> Option<PyAccessor> {
+        let (hver, ver) = self.py_cls_stamp(cls)?;
+        let (t, s, f) = self.py_table_entry(cls, table, table_key, name)?;
+        if !f.is_heap() {
+            return None;
+        }
+        let es = match self.heap.get(f.heap_index()) {
+            HeapObj::Object(m) if !m.is_ctor => m.pos(entry_key)?,
+            _ => return None,
+        };
+        let prop = PyIc { kind: ic::ATTR_PROP, pos: u32::try_from(s).ok()?, hver, a: cls.bits(), b: t.bits(), c: ver, d: u32::try_from(es).ok()? };
+        let a = self.py_accessor(cls, table, &prop, entry_key, argc)?;
+        self.py_ic_put(func_id, ip, prop);
+        Some(a)
+    }
+
+    /// A site whose [`ic::NOT_PLAIN`] entry `e` holds for `cls` asks, once,
+    /// whether the name is such a property ([`Vm::py_learn_accessor`]); the
+    /// entry becomes [`ic::NOT_PLAIN_ASKED`] when it is not. The read or
+    /// write that asks takes its slow edge either way: an attribute
+    /// instruction pushes a frame only at a site that came to it holding an
+    /// [`ic::ATTR_PROP`] entry ([`Vm::py_attr_site_calls`]).
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn py_ask_accessor(&mut self, func_id: u32, ip: usize, e: PyIc, cls: Value, table: usize, table_key: &str, key: u32, entry_key: &str, argc: usize) {
+        let learned = self
+            .py_const_name(func_id, key)
+            .and_then(|name| self.py_learn_accessor(func_id, ip, cls, table, table_key, name, entry_key, argc));
+        if learned.is_none() {
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::NOT_PLAIN_ASKED, ..e });
+        }
+    }
+
+    /// Whether the `PyGetAttr` / `PySetAttr` at `ip` may push an accessor's
+    /// frame: its entry is an [`ic::ATTR_PROP`] one (only such an entry
+    /// makes it push one). For the native tiers, which bound the depth of
+    /// calls made from compiled code before running such an instruction.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline]
+    pub(crate) fn py_attr_site_calls(&self, func_id: u32, ip: usize) -> bool {
+        self.py_ic(func_id, ip).kind == ic::ATTR_PROP
+    }
+
+    /// [`Instr::PyGetAttr`]: `obj.name` from an instance's own dict when its
+    /// class's `ga[name]` is `true`; `None` for the slow edge, or, with
+    /// `call` set, for a property whose Python getter is to be called with
+    /// the instance (its frame pushed, see `Vm::py_push_accessor`).
+    #[inline(never)]
+    pub(super) fn py_attr_get(&mut self, func_id: u32, ip: usize, o: Value, key: u32, call: &mut Option<PyAccessor>) -> Option<Value> {
         let (cls, dict) = self.py_inst_parts(o)?;
         let ty = self.py_rt.as_deref()?.ty?;
         let e = self.py_ic(func_id, ip);
@@ -222,15 +324,37 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                // A property (a data descriptor: the instance's own
+                // storage is not asked) whose getter is a Python function.
+                ic::ATTR_PROP => {
+                    if self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                        if let Some(a) = self.py_accessor(cls, ty.gp, &e, "c1", 1) {
+                            *call = Some(a);
+                            return None;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         if self.py_not_plain(&e, cls, ty.ga) {
+            if e.kind == ic::NOT_PLAIN {
+                self.py_ask_accessor(func_id, ip, e, cls, ty.gp, "gp", key, "c1", 1);
+            }
             return None;
         }
         let name = self.py_const_name(func_id, key)?;
         let flag = self.py_table_entry(cls, ty.ga, "ga", name).map(|(_, _, f)| f);
         if flag != Some(Value::TRUE) {
+            // The site held another class's accessor for the name (one
+            // property read through several classes): this class's, when
+            // it has one too, without relearning from the slow edge.
+            if e.kind == ic::ATTR_PROP {
+                if let Some(a) = self.py_learn_accessor(func_id, ip, cls, ty.gp, "gp", name, "c1", 1) {
+                    *call = Some(a);
+                    return None;
+                }
+            }
             self.py_note_not_plain(func_id, ip, cls, ty.ga, "ga", name);
             return None;
         }
@@ -294,9 +418,11 @@ impl<'p> Vm<'p> {
 
     /// [`Instr::PySetAttr`]: `obj.name = v` as a store into an instance's
     /// own dict when its class's `sa[name]` is `true`; `false` for the slow
-    /// edge.
+    /// edge, or, with `call` set, for a property whose Python setter is to
+    /// be called with the instance and the value (its frame pushed, see
+    /// `Vm::py_push_accessor`).
     #[inline(never)]
-    pub(super) fn py_attr_set(&mut self, func_id: u32, ip: usize, o: Value, key: u32, v: Value) -> Result<bool, Thrown> {
+    pub(super) fn py_attr_set(&mut self, func_id: u32, ip: usize, o: Value, key: u32, v: Value, call: &mut Option<PyAccessor>) -> Result<bool, Thrown> {
         let Some((cls, dict)) = self.py_inst_parts(o) else {
             return Ok(false);
         };
@@ -326,7 +452,31 @@ impl<'p> Vm<'p> {
         let Some(ty) = self.py_rt.as_deref().and_then(|p| p.ty) else {
             return Ok(false);
         };
+        // A property whose setter is a Python function.
+        if e.kind == ic::ATTR_PROP {
+            if cls.bits() == e.a && cls.is_heap() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                if let Some(a) = self.py_accessor(cls, ty.sp, &e, "c2", 2) {
+                    *call = Some(a);
+                    return Ok(false);
+                }
+            }
+            // Another class at this site (one property written through
+            // several classes), or this one changed: its setter, when its
+            // `sa` does not say the store is a plain one and it has one.
+            if let Some(name) = self.py_const_name(func_id, key) {
+                let plain = matches!(self.py_table_entry(cls, ty.sa, "sa", name), Some((_, _, flag)) if flag == Value::TRUE);
+                if !plain {
+                    if let Some(a) = self.py_learn_accessor(func_id, ip, cls, ty.sp, "sp", name, "c2", 2) {
+                        *call = Some(a);
+                        return Ok(false);
+                    }
+                }
+            }
+        }
         if self.py_not_plain(&e, cls, ty.sa) {
+            if e.kind == ic::NOT_PLAIN {
+                self.py_ask_accessor(func_id, ip, e, cls, ty.sp, "sp", key, "c2", 2);
+            }
             return Ok(false);
         }
         match self.heap.get(di) {

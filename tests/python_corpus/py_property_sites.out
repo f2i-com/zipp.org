@@ -1,0 +1,48 @@
+== hot reads and writes
+7800 [199, 199] 200
+499 [495, 497, 499]
+== the getter is replaced
+2118
+== the property becomes a plain class attribute
+42
+321 100
+== and a property again: the instance value is shadowed
+24 -1
+== deleted from the class
+AttributeError 'Shape' object has no attribute 'size'
+-1
+== back 4984
+== the setter is replaced, removed, restored
+[20, 20] ('loud', 2)
+AttributeError property 'width' of 'Shape' object has no setter
+[3, 3] 15
+== a subclass overrides the property; one site sees both classes
+400 [50, 'sq149', 50, 'sq149']
+5200
+2690
+1791.0
+== accessors of other kinds
+(15, (5, ()), [5, 6], ('b', 5), '6', 42)
+('b', 8) 8 8
+== an accessor that raises, at a hot site
+15100 ['call 50', 'call 100', 'call 150']
+ValueError negative
+7
+== accessors that read and write other properties, and recurse
+21 42 [42, 42, 42]
+14 2
+== a generator reading a property between yields
+[6, 6, 20, 10]
+== the getter changes the class while its site is hot
+['first', 'second'] 150
+== a class attribute and a method at sites that also see properties
+['tag', 'computed2', 'tag', 'computed4'] ['n1', 'n2', 'n3', 'n4']
+[None, 4, None, 8]
+== accessors that are hot loops calling the same accessor, 180 deep
+180 180 1
+259 438 179
+260
+== one read and one write site, three classes, the class changing mid-loop
+AttributeError: the replaced property has no setter
+[203, 203, -7499044206541954619195823097592092145103613970986366564739754, 205, -13926796383577915721363671466956742555192425946117537905945258, 207]
+-1810698645630654298905285056363891698712416349925276667232124843870561155345188183274085750 -8600818566745607919800104017728485568883977662145064169352593008385165487889643870552122450
