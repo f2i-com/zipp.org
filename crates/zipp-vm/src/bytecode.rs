@@ -2165,8 +2165,10 @@ pub enum Instr {
     /// object whose own data `cls` is the value in `seq` (a list or tuple
     /// type: `o.items` an Array, `k` an int within it) or in `dict` (the
     /// dict type: `o.str` true, `o.map` a Map, `k` a str present in it).
-    /// Anything else (a negative or out-of-range index, a missing key, a
-    /// hole) jumps to `slow`.
+    /// A key such a dict's table finds missing (its own lookup, with no
+    /// guest code run) jumps to `absent`. Anything else (a negative or
+    /// out-of-range index, a key needing guest code, a hole) jumps to
+    /// `slow`.
     #[allow(dead_code)] // emitted by the Python frontend only
     #[cfg(not(feature = "wasm-lite"))]
     PyGetItem {
@@ -2176,6 +2178,7 @@ pub enum Instr {
         seq: Reg,
         dict: Reg,
         slow: u32,
+        absent: u32,
     },
     /// `o[k] = v` for the same records: an in-range element of the `seq`
     /// type's items, or a str key of a str-keyed `dict` record (whose own

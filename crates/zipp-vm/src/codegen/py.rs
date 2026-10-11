@@ -87,7 +87,6 @@ pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
         | Instr::PyDictGet { slow, .. }
         | Instr::PyDictSet { slow, .. }
         | Instr::PyCallEntry { slow, .. }
-        | Instr::PyGetItem { slow, .. }
         | Instr::PySetItem { slow, .. }
         | Instr::PyGlobal { slow, .. }
         | Instr::PyStrItem { slow, .. }
@@ -107,8 +106,9 @@ pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
         | Instr::PyExcPop { slow, .. }
         | Instr::PyNew { slow, .. } => (slow, None),
         Instr::PyCall { slow, .. } => (slow, None),
-        // Its second edge: the key's absence (a `.get` default).
-        Instr::PyDictLookup { slow, absent, .. } => (slow, Some(absent)),
+        // Its second edge: the key's absence (a `.get` default; for
+        // `PyGetItem`, the `KeyError`).
+        Instr::PyDictLookup { slow, absent, .. } | Instr::PyGetItem { slow, absent, .. } => (slow, Some(absent)),
         // Its second edge: the catch target of the frame's own innermost
         // handler, when that is the one the emitter saw (the raise caught
         // there and then).

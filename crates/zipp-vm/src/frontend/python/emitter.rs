@@ -724,7 +724,7 @@ impl<'a> Emitter<'a> {
     /// Patch the `absent` edge of a [`Instr::PyDictLookup`].
     pub fn patch_absent(&mut self, at: usize, target: u32) -> R<()> {
         match self.proto.code.get_mut(at) {
-            Some(Instr::PyDictLookup { absent, .. }) => {
+            Some(Instr::PyDictLookup { absent, .. }) | Some(Instr::PyGetItem { absent, .. }) => {
                 *absent = target;
                 Ok(())
             }
@@ -1410,8 +1410,9 @@ impl<'a> Emitter<'a> {
     /// int reads its items array at `Number(k)`, and an exact dict still in
     /// its all-str mode looked up by a str reads its Map; a Python value is
     /// never `undefined`, so an `undefined` read (a negative or out-of-range
-    /// index, a missing key) is left to the `getitem` helper, which answers
-    /// or raises exactly as before.
+    /// index) is left to the `getitem` helper, which answers or raises
+    /// exactly as before. A key an exact dict's table finds missing raises
+    /// the helper's `KeyError(k)` natively, out of line.
     pub fn subscript_get(&mut self, o: Reg, k: Reg) -> R<Reg> {
         if !self.fast {
             return self.helper("getitem", &[o, k]);
@@ -1419,27 +1420,30 @@ impl<'a> Emitter<'a> {
         let dst = self.alloc()?;
         let seq = self.prop(self.r_rt, "TLIST")?;
         let dict = self.prop(self.r_rt, "TDICT")?;
-        let at = self.emit(Instr::PyGetItem { dst, o, k, seq, dict, slow: 0 })?;
+        let at_get = self.emit(Instr::PyGetItem { dst, o, k, seq, dict, slow: 0, absent: 0 })?;
         // An ASCII str, a tuple, else the helper (which also answers every
         // miss).
-        self.defer_cold(Vec::new(), vec![at], move |e| {
+        self.defer_cold(Vec::new(), vec![at_get], move |e| {
             let at_str = e.emit(Instr::PyStrItem { dst, s: o, k, slow: 0 })?;
             let str_done = e.jump()?;
             let here = e.here();
             e.patch_slow(at_str, here)?;
             let tuple = e.prop(e.r_rt, "TTUPLE")?;
-            let at = e.emit(Instr::PyGetItem { dst, o, k, seq: tuple, dict, slow: 0 })?;
+            let at = e.emit(Instr::PyGetItem { dst, o, k, seq: tuple, dict, slow: 0, absent: 0 })?;
             let done = e.jump()?;
             let here = e.here();
             e.patch_slow(at, here)?;
             // An exact dict: its entry (`PyDictLookup`), or for no entry the
             // `KeyError(k)` the helper would raise, made and raised natively
-            // (`PyMakeExc`, `PyRaise`) as its `makeExc` and `throw` do.
+            // (`PyMakeExc`, `PyRaise`) as its `makeExc` and `throw` do. Both
+            // `PyGetItem`s go there directly for a key the dict lacks.
             let rt = e.r_rt;
             let at_look = e.emit(Instr::PyDictLookup { dst, d: o, k, rt, absent: 0, slow: 0 })?;
             let look_done = e.jump()?;
             let here = e.here();
             e.patch_absent(at_look, here)?;
+            e.patch_absent(at_get, here)?;
+            e.patch_absent(at, here)?;
             let args = e.array(&[k])?;
             let cls = e.prop(rt, "KEYERROR")?;
             let exc = e.alloc()?;

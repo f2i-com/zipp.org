@@ -125,14 +125,15 @@ impl<'p> Vm<'p> {
                     None => slow as usize,
                 }
             }
-            Instr::PyGetItem { dst, o, k, seq, dict, slow } => {
+            Instr::PyGetItem { dst, o, k, seq, dict, slow, absent } => {
                 let (ov, kv) = (self.get(base, o), self.get(base, k));
                 let (sc, dc) = (self.get(base, seq), self.get(base, dict));
                 match self.py_get_item(ov, kv, sc, dc)? {
-                    Some(v) => {
+                    Some(Some(v)) => {
                         self.set(base, dst, v);
                         ip + 1
                     }
+                    Some(None) => absent as usize,
                     None => slow as usize,
                 }
             }
@@ -1803,7 +1804,9 @@ impl<'p> Vm<'p> {
         Some((items.heap_index(), i))
     }
 
-    fn py_get_item(&mut self, o: Value, k: Value, seq: Value, dict: Value) -> Result<Option<Value>, Thrown> {
+    /// [`Instr::PyGetItem`]: `Some(Some(value))`, `Some(None)` for a key
+    /// the dict's table finds missing, `None` for the slow edge.
+    fn py_get_item(&mut self, o: Value, k: Value, seq: Value, dict: Value) -> Result<Option<Option<Value>>, Thrown> {
         let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
             return Ok(None);
         };
@@ -1815,12 +1818,12 @@ impl<'p> Vm<'p> {
                 return Ok(None);
             };
             let v = vals[i];
-            return Ok((v != Value::HOLE && !v.is_undefined()).then_some(v));
+            return Ok((v != Value::HOLE && !v.is_undefined()).then_some(Some(v)));
         }
         let Some((_, map)) = self.py_dict_field(idx, 0) else {
             return Ok(None);
         };
-        Ok(self.py_table_get(map, k).flatten())
+        Ok(self.py_table_get(map, k))
     }
 
     fn py_set_item(&mut self, o: Value, k: Value, v: Value, seq: Value, dict: Value) -> Result<bool, Thrown> {
