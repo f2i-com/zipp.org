@@ -270,7 +270,7 @@ impl<'p> Vm<'p> {
             global_route_epoch: 0,
             jit_global_route_ok: rustc_hash::FxHashMap::default(),
             strict_unresolvable_globals: Vec::new(),
-            array_length_nonwritable: std::collections::HashSet::new(),
+            array_length_nonwritable: rustc_hash::FxHashSet::default(),
             array_js_len: crate::slot_table::SlotTable::default(),
             array_proto_has_index: false,
             super_called: std::collections::HashSet::new(),

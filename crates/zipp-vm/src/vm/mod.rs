@@ -2088,7 +2088,7 @@ pub struct Vm<'p> {
     /// length lives in the dense Vec with no per-array attribute state, so the
     /// (rare) non-writable flag is recorded here — read by the length descriptor,
     /// `arr.length = n`, and the push/pop/shift/unshift mutators.
-    array_length_nonwritable: std::collections::HashSet<u32>,
+    array_length_nonwritable: rustc_hash::FxHashSet<u32>,
     /// SPARSE arrays: heap idx → the JS `length` when it EXCEEDS the dense
     /// element count (`new Array(4e9)`, `a[3e9] = v`, `a.length = 2**32-1`).
     /// Sparse elements themselves live in `arr_props` under canonical index

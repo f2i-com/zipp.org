@@ -6923,19 +6923,27 @@ impl<'p> Vm<'p> {
         // lookup — was measured at tens of percent on a `Math.floor`-dense
         // loop, once per interpreted `MathOp` and per emitted-guard bail.
         let intrinsic_receiver = match builtin_ns_index(namespace) {
-            Some(i) => {
-                let slot = self.builtin_ns_slots[i];
-                if slot == u32::MAX {
-                    return false;
-                }
-                slot
-            }
+            Some(i) => self.builtin_ns_slots[i],
             None => match self.builtin_globals.get(namespace) {
                 Some(&slot) => slot,
                 None => return false,
             },
         };
-        this_v == Value::heap(intrinsic_receiver)
+        self.native_on_intrinsic_receiver(intrinsic_receiver, native_id, callee, this_v)
+    }
+
+    /// The tail of [`Vm::static_builtin_is_intrinsic`] once the namespace's
+    /// receiver slot is known (`u32::MAX` for an absent one).
+    #[inline]
+    fn native_on_intrinsic_receiver(
+        &self,
+        intrinsic_receiver: u32,
+        native_id: u16,
+        callee: Value,
+        this_v: Value,
+    ) -> bool {
+        intrinsic_receiver != u32::MAX
+            && this_v == Value::heap(intrinsic_receiver)
             && callee.is_heap()
             && matches!(self.heap.get(callee.heap_index()), HeapObj::Native(id) if *id == native_id)
             && (self.obj_realm.is_empty() || self.get_function_realm(callee) == 0)
@@ -6957,7 +6965,27 @@ impl<'p> Vm<'p> {
         this_v: Value,
     ) -> bool {
         let (namespace, native_id) = static_fn_intrinsic(op);
-        self.static_builtin_is_intrinsic(namespace, native_id, callee, this_v)
+        // The Promise and Number statics' namespaces have slots of their own:
+        // resolved from the op, not by comparing the namespace's name, which
+        // `Promise.resolve` in a loop paid on every call.
+        use crate::bytecode::StaticFn as S;
+        let ns = match op {
+            S::PromiseResolve
+            | S::PromiseReject
+            | S::PromiseAll
+            | S::PromiseAllSettled
+            | S::PromiseRace
+            | S::PromiseAny => Some(5),
+            S::NumberIsInteger | S::NumberIsNaN | S::NumberIsFinite | S::NumberIsSafeInteger => Some(4),
+            _ => None,
+        };
+        match ns {
+            Some(i) => {
+                debug_assert_eq!(builtin_ns_index(namespace), Some(i));
+                self.native_on_intrinsic_receiver(self.builtin_ns_slots[i], native_id, callee, this_v)
+            }
+            None => self.static_builtin_is_intrinsic(namespace, native_id, callee, this_v),
+        }
     }
 }
 
