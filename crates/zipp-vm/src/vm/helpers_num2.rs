@@ -1400,6 +1400,71 @@ fn shortest_tie_neighbour(abs: f64, digits: &str, e: i32) -> Option<String> {
     (back == abs).then_some(text)
 }
 
+/// Print `abs` when it is `n / 2^d` for an odd `n` and `1 <= d <= 7`: a half,
+/// a quarter, down to a 128th. Returns false, writing nothing, for anything
+/// else.
+///
+/// Such a value is its own shortest decimal. `n * 5^d / 10^d` is the value
+/// exactly, in `d` fraction digits of which the last is a 5. A decimal with
+/// fewer digits is at least `10^-d` away, and with `n * 5^d < 2^52` that is
+/// more than half the spacing of doubles at `abs`, so no shorter decimal
+/// reads back as it; the exact one does, and is closest. It lies between
+/// 1/128 and 2^52, inside the range Number::toString prints without an
+/// exponent.
+///
+/// The general path reaches the same digits by running the shortest-digits
+/// search through the formatting machinery into one `String`, collecting the
+/// digits into another and probing the neighbours for a tie: 83 ns for every
+/// `x.5` a document holds, where this is a multiply and a digit loop.
+fn fmt_binary_fraction_into(out: &mut String, neg: bool, abs: f64) -> bool {
+    const POW5: [u64; 8] = [1, 5, 25, 125, 625, 3125, 15_625, 78_125];
+    const POW10: [u64; 8] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+    // Scaling by a power of two is exact, so this is an integer exactly when
+    // `abs` has at most seven fraction bits.
+    let scaled = abs * 128.0;
+    if !(scaled < 4_503_599_627_370_496.0) || scaled.fract() != 0.0 {
+        return false;
+    }
+    let scaled = scaled as u64;
+    let spare = scaled.trailing_zeros();
+    if spare >= 7 {
+        // An integer (or zero): the caller's integer branch prints those.
+        return false;
+    }
+    let d = (7 - spare) as usize;
+    let n = scaled >> spare;
+    if n > ((1u64 << 52) - 1) / POW5[d] {
+        return false;
+    }
+    let m = n * POW5[d];
+    let (whole, mut frac) = (m / POW10[d], m % POW10[d]);
+    // At most 16 digits of whole part, a point and seven of fraction.
+    let mut buf = [0u8; 25];
+    let mut p = buf.len();
+    for _ in 0..d {
+        p -= 1;
+        buf[p] = b'0' + (frac % 10) as u8;
+        frac /= 10;
+    }
+    p -= 1;
+    buf[p] = b'.';
+    let mut whole = whole;
+    loop {
+        p -= 1;
+        buf[p] = b'0' + (whole % 10) as u8;
+        whole /= 10;
+        if whole == 0 {
+            break;
+        }
+    }
+    if neg {
+        p -= 1;
+        buf[p] = b'-';
+    }
+    out.push_str(std::str::from_utf8(&buf[p..]).unwrap());
+    true
+}
+
 /// `fmt_f64` appending into an existing buffer — the JSON.stringify fast path,
 /// which otherwise paid a fresh `String` per serialized number. The allocating
 /// wrapper above stays for every other caller.
@@ -1457,6 +1522,15 @@ pub(crate) fn fmt_f64_into(out: &mut String, n: f64) {
         let _ = write!(out, "{abs}");
         return;
     }
+    if fmt_binary_fraction_into(out, neg, abs) {
+        return;
+    }
+    fmt_f64_general_into(out, neg, abs);
+}
+
+/// The general case of [`fmt_f64_into`]: a finite, non-zero, non-integral
+/// magnitude (or an integral one at or past 1e21).
+fn fmt_f64_general_into(out: &mut String, neg: bool, abs: f64) {
     // General case: ECMAScript Number::toString (7.1.12.1). Extract the shortest
     // round-trip significant digits `s` (k of them) and the decimal point position
     // `n` such that the value is `s × 10^(n-k)`, via Rust's `{:e}` (also shortest
@@ -1544,6 +1618,97 @@ mod fmt_f64_int_fast_path_tests {
                 }
                 assert_eq!(fmt_f64(signed), reference(signed), "mismatch at {signed}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod binary_fraction_tests {
+    use super::{fmt_binary_fraction_into, fmt_f64_general_into, fmt_f64_into};
+
+    fn general(neg: bool, abs: f64) -> String {
+        let mut s = String::new();
+        fmt_f64_general_into(&mut s, neg, abs);
+        s
+    }
+
+    fn fast(neg: bool, abs: f64) -> Option<String> {
+        let mut s = String::new();
+        fmt_binary_fraction_into(&mut s, neg, abs).then_some(s)
+    }
+
+    #[test]
+    fn every_128th_below_2048_prints_as_the_general_path_prints_it() {
+        let mut taken = 0u32;
+        for k in 1u32..2048 * 128 {
+            let abs = f64::from(k) / 128.0;
+            if abs.fract() == 0.0 {
+                assert_eq!(fast(false, abs), None, "{abs} is an integer");
+                continue;
+            }
+            taken += 1;
+            assert_eq!(fast(false, abs).as_deref(), Some(general(false, abs).as_str()), "{abs}");
+            if k % 97 == 0 {
+                assert_eq!(fast(true, abs).as_deref(), Some(general(true, abs).as_str()), "-{abs}");
+            }
+        }
+        assert_eq!(taken, 2048 * 127);
+    }
+
+    #[test]
+    fn large_magnitudes_agree_up_to_the_bound_and_decline_past_it() {
+        // A deterministic walk over whole parts across the range, with every
+        // fraction of each denominator.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut taken, mut declined) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            let bits = next() % 53;
+            let whole = (next() >> 11) & ((1u64 << bits) - 1);
+            for d in 1..=7u32 {
+                let numer = (next() % (1 << d)) | 1;
+                let abs = whole as f64 + numer as f64 / f64::from(1u32 << d);
+                if abs.fract() == 0.0 {
+                    continue;
+                }
+                match fast(false, abs) {
+                    Some(text) => {
+                        taken += 1;
+                        assert_eq!(text, general(false, abs), "{abs:?}");
+                        assert_eq!(text.parse::<f64>().unwrap(), abs);
+                    }
+                    None => declined += 1,
+                }
+            }
+        }
+        assert!(taken > 50_000 && declined > 1_000, "{taken} taken, {declined} declined");
+    }
+
+    #[test]
+    fn values_that_are_not_short_binary_fractions_are_left_to_the_general_path() {
+        for abs in [0.1, 0.2, 0.3, 1.1, 2.675, 0.000123, 1.0 / 256.0, 3.0 / 256.0, 1e15 + 0.5, 1e21, 5e-324, 123.0] {
+            assert_eq!(fast(false, abs), None, "{abs}");
+        }
+        for (n, text) in [
+            (0.5, "0.5"),
+            (-0.5, "-0.5"),
+            (1.25, "1.25"),
+            (0.0078125, "0.0078125"),
+            (1999.5, "1999.5"),
+            (-12345.875, "-12345.875"),
+            (0.1, "0.1"),
+            (1e21, "1e+21"),
+            (-0.000001, "-0.000001"),
+            (1e-7, "1e-7"),
+        ] {
+            let mut s = String::new();
+            fmt_f64_into(&mut s, n);
+            assert_eq!(s, text);
         }
     }
 }
