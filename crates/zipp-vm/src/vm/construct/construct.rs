@@ -1668,8 +1668,8 @@ impl<'p> Vm<'p> {
 
 /// Copy only the representations produced by intrinsic subclass constructors.
 /// Calling HeapObj::clone here retained cloning machinery for every VM payload,
-/// including suspended activations and compiler-owned class metadata.
-#[cfg(feature = "wasm-lite")]
+/// including suspended activations and compiler-owned class metadata: it was
+/// that derive's one caller, 13 KB of a full module.
 fn clone_builtin_instance(obj: &HeapObj) -> HeapObj {
     match obj {
         HeapObj::Array(values) => HeapObj::Array(values.clone()),
@@ -1690,19 +1690,18 @@ fn clone_builtin_instance(obj: &HeapObj) -> HeapObj {
             buffer: *buffer, pristine_version: *pristine_version,
             byte_offset: *byte_offset, byte_length: *byte_length,
         },
+        // The two the full profile's guarded constructors add: the eight
+        // Temporal types and the ten Intl services.
+        #[cfg(not(feature = "wasm-lite"))]
+        HeapObj::Temporal { kind, fields } => HeapObj::Temporal { kind: *kind, fields: fields.clone() },
+        #[cfg(not(feature = "wasm-lite"))]
+        HeapObj::Intl { kind, resolved } => HeapObj::Intl { kind: *kind, resolved: *resolved },
         _ => unreachable!("intrinsic subclass constructor returned an unexpected representation"),
     }
 }
 
-// These macros leave the established full-profile expressions in place. Lite
-// specializes their representation set without changing full constructor paths.
-#[cfg(feature = "wasm-lite")]
 macro_rules! copy_builtin_instance {
     ($obj:expr) => { clone_builtin_instance($obj) };
-}
-#[cfg(not(feature = "wasm-lite"))]
-macro_rules! copy_builtin_instance {
-    ($obj:expr) => { $obj.clone() };
 }
 use copy_builtin_instance;
 
