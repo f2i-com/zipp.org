@@ -6002,7 +6002,7 @@ const BIG_PAYLOAD_BYTES: usize = 4096;
 const BIG_PAYLOAD_GC_AT: usize = 8 * 1024 * 1024;
 
 /// Net bytes the process's allocator has outstanding, for a binary whose
-/// global allocator reports them: every block through [`note_block`] (the
+/// global allocator reports them: every block through [`note_every_block`] (the
 /// WebAssembly modules, where there is one thread and the report is an add)
 /// or the large ones through [`note_large_block`] (`zipp`, where the report
 /// is atomic and an allocation costs twenty instructions). It stays zero,
@@ -6031,7 +6031,28 @@ pub fn note_large_block(old_size: usize, new_size: usize) {
 /// blocks alone, a loop of dropped Maps held a hundred megabytes before the
 /// collector heard of eight.
 #[inline]
-pub fn note_block(old_size: usize, new_size: usize) {
+pub fn note_every_block(old_size: usize, new_size: usize) {
+    EVERY_BLOCK_REPORTED.store(true, Ordering::Relaxed);
+    note_block(old_size, new_size);
+}
+
+/// Whether the reports cover every block ([`note_every_block`]): then the
+/// figure is all the memory there is, and its not having risen means nothing
+/// grew.
+static EVERY_BLOCK_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What the allocator has outstanding, when its reports cover every block.
+#[cfg(feature = "instrument")]
+#[inline]
+pub(crate) fn every_block_footprint() -> Option<usize> {
+    EVERY_BLOCK_REPORTED
+        .load(Ordering::Relaxed)
+        .then(footprint_bytes)
+}
+
+#[inline]
+fn note_block(old_size: usize, new_size: usize) {
     if new_size > old_size {
         ALLOCATOR_NET_BYTES.fetch_add(new_size - old_size, Ordering::Relaxed);
     } else if old_size > new_size {

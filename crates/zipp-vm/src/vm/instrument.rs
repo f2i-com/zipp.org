@@ -372,6 +372,20 @@ const HEAP_WALK_STRIDE: u32 = 64;
 /// already counted waits for the walk, bounded by what the interpreter can
 /// push in slots * 64 instructions, with the linear-memory maximum as the
 /// backstop.
+/// How far the allocator's outstanding bytes may stand above their lowest
+/// since the last walk before the stride's next walk runs.
+///
+/// The walk exists to find capacity that grew inside objects and tables
+/// already counted, and capacity grows through the allocator. Where the
+/// allocator reports every block, its figure not having risen means there is
+/// nothing for the walk to find, and the walk was most of what a small heap
+/// paid for a poll: 3.6% of an integer loop in the JavaScript module, 7% in
+/// Lite, and five of the six microseconds of a call from the host whose
+/// guest code is one closed-form kernel. The floor is lowered at every poll
+/// and behind every collection, so what a sweep freed cannot hide growth
+/// that followed it; the slack is what a poll may leave unreconciled.
+const HEAP_WALK_FOOTPRINT_SLACK: usize = 64 * 1024;
+
 fn heap_walk_stride_for(slots: usize) -> u32 {
     if slots < 4_096 {
         1
@@ -475,6 +489,11 @@ pub(crate) struct Recorder {
     /// Starts at the stride so the first poll reconciles, which is also what
     /// switches payload accounting on.
     ticks_since_heap_walk: u32,
+    /// The least the allocator has had outstanding at any poll since the last
+    /// full walk, that walk included (`heap::every_block_footprint`). A walk
+    /// on the stride is skipped while the figure is within
+    /// `HEAP_WALK_FOOTPRINT_SLACK` of this.
+    walk_footprint_floor: usize,
     /// `used` as of the last native entry's heap poll, rounded down to whole
     /// polls. Compiled code never reaches the dispatch loop's tick stride, so
     /// `Vm::meter_lend` advances the walk stride by the work done since —
@@ -519,6 +538,7 @@ impl Recorder {
             postflight_since_audit: 0,
             preflight_bytes_since_audit: PREFLIGHT_AUDIT_BYTES,
             ticks_since_heap_walk: HEAP_WALK_STRIDE,
+            walk_footprint_floor: 0,
             #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
             used_at_heap_poll: 0,
             external_heap_dirty: false,
@@ -2016,8 +2036,23 @@ impl super::Vm<'_> {
         // at birth, and before this it reached the WebAssembly build's
         // linked memory between two walks.
         let walk_stride = heap_walk_stride_for(self.heap.len());
+        // The first walk is what switches payload accounting on: never skip it.
+        let footprint = if self.heap.payload_accounting_enabled() {
+            crate::heap::every_block_footprint()
+        } else {
+            None
+        };
         let reconcile = match self.instr_rec.as_mut() {
             Some(rec) => {
+                let grew = match footprint {
+                    Some(now) => {
+                        rec.walk_footprint_floor = rec.walk_footprint_floor.min(now);
+                        now > rec
+                            .walk_footprint_floor
+                            .saturating_add(HEAP_WALK_FOOTPRINT_SLACK)
+                    }
+                    None => true,
+                };
                 let stride = if advance_walk_stride != 0 {
                     rec.ticks_since_heap_walk =
                         rec.ticks_since_heap_walk.saturating_add(advance_walk_stride);
@@ -2025,7 +2060,7 @@ impl super::Vm<'_> {
                     if due {
                         rec.ticks_since_heap_walk = 0;
                     }
-                    due
+                    due && grew
                 } else {
                     false
                 };
@@ -2035,9 +2070,15 @@ impl super::Vm<'_> {
             }
             None => false,
         };
-        if (convicted || reconcile) && self.audit_heap_bytes().saturating_add(growth) > ceiling {
+        if convicted || reconcile {
+            let total = self.audit_heap_bytes();
             let rec = self.instr_rec.as_mut().expect("recorder checked above");
-            return Err(rec.exhaust(ResourceExhaustion::Heap));
+            if let Some(now) = crate::heap::every_block_footprint() {
+                rec.walk_footprint_floor = now;
+            }
+            if total.saturating_add(growth) > ceiling {
+                return Err(rec.exhaust(ResourceExhaustion::Heap));
+            }
         }
         Ok(())
     }

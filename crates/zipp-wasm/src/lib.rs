@@ -28,7 +28,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 /// The platform allocator, reporting what it has outstanding to the engine
-/// (`zipp_vm::note_block`).
+/// (`zipp_vm::note_every_block`).
 ///
 /// An array pushed to a megabyte, an object with twenty thousand keys and a
 /// filling Map grow in place: no object is allocated, so the collector's
@@ -52,7 +52,7 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         let p = unsafe { std::alloc::System.alloc(layout) };
         if !p.is_null() {
-            zipp_vm::note_block(0, layout.size());
+            zipp_vm::note_every_block(0, layout.size());
         }
         p
     }
@@ -61,14 +61,14 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
         if !p.is_null() {
-            zipp_vm::note_block(0, layout.size());
+            zipp_vm::note_every_block(0, layout.size());
         }
         p
     }
 
     #[inline(never)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        zipp_vm::note_block(layout.size(), 0);
+        zipp_vm::note_every_block(layout.size(), 0);
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
 
@@ -76,7 +76,7 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         let p = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
         if !p.is_null() {
-            zipp_vm::note_block(layout.size(), new_size);
+            zipp_vm::note_every_block(layout.size(), new_size);
         }
         p
     }

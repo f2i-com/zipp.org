@@ -11,7 +11,7 @@
 //!
 //! The engine reads what its allocator has outstanding, which `zipp`
 //! (`zipp_vm::note_large_block`) and the WebAssembly modules
-//! (`zipp_vm::note_block`) report. This binary installs the same kind of
+//! (`zipp_vm::note_every_block`) report. This binary installs the same kind of
 //! allocator, so the tests see what those builds see; it also keeps the peak
 //! of the large blocks, which is what they assert.
 //! One test function: the figure is process-wide, and tests of one binary
@@ -29,7 +29,7 @@ fn note(old: usize, new: usize) {
     // As the builds do: every block in the checked profile (the WebAssembly
     // modules), the large ones otherwise (`zipp`).
     #[cfg(feature = "safe-sandbox")]
-    zipp_vm::note_block(old, new);
+    zipp_vm::note_every_block(old, new);
     #[cfg(not(feature = "safe-sandbox"))]
     zipp_vm::note_large_block(old, new);
     let old = if old >= zipp_vm::LARGE_BLOCK_BYTES { old } else { 0 };
