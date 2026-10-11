@@ -40,6 +40,23 @@ pub(super) enum Step {
     /// A step known only at run time, with `positive` = step > 0.
     Dynamic { step: Reg, positive: Reg },
 }
+/// A loop over a list or tuple display written as its iterable (`for x in
+/// (a, b):`, a comprehension's `in [a, b]`): the Array of its elements,
+/// indexed from `index` up to `len`. No name binds the list or tuple the
+/// display would make, so nothing can observe it or append to it: the loop
+/// needs neither the record nor a look at what kind of iterable it has, and
+/// the Array's length is fixed before the first step.
+#[derive(Clone, Copy)]
+pub(super) struct Display {
+    pub arr: Reg,
+    pub index: Reg,
+    pub len: Reg,
+}
+/// How a loop steps: over a display's own elements, or by a [`Stepper`].
+pub(super) enum Steps {
+    Display(Display),
+    Iter(Stepper),
+}
 
 impl<'a> Emitter<'a> {
     pub fn suite(&mut self, suite: &[ast::Stmt], depth: usize) -> R<()> {
@@ -574,24 +591,69 @@ impl<'a> Emitter<'a> {
         Some(&c.args)
     }
 
+    /// The steps of a loop over `iter` when it is a list or tuple display
+    /// and fast paths are on (see [`Display`]): its elements evaluated, in
+    /// order, into an Array, as the display itself would first. `None` for
+    /// any other iterable, with nothing emitted.
+    pub fn display_steps(&mut self, iter: &ast::Expr, depth: usize) -> R<Option<Display>> {
+        if !self.fast {
+            return Ok(None);
+        }
+        let elts = match iter {
+            ast::Expr::List(l) => &l.elts,
+            ast::Expr::Tuple(t) => &t.elts,
+            _ => return Ok(None),
+        };
+        self.depth(iter, depth)?;
+        let arr = self.sequence_array(elts, depth + 1)?;
+        let index = self.small_int(0)?;
+        // The count of elements written, unless a `*iterable` among them
+        // spliced in as many as it had.
+        let len = if elts.iter().any(|e| matches!(e, ast::Expr::Starred(_))) {
+            self.prop(arr, "length")?
+        } else {
+            self.small_int(i32::try_from(elts.len()).map_err(|_| "Python emitter: display too long")?)?
+        };
+        Ok(Some(Display { arr, index, len }))
+    }
+
+    /// The head of a [`Display`] loop: the next element bound to `target`,
+    /// or the returned exit taken once every element has been.
+    pub fn display_header(&mut self, d: &Display, target: &ast::Expr, depth: usize) -> R<Vec<usize>> {
+        let exit = self.emit(Instr::JumpIfNotLt { a: d.index, b: d.len, target: 0 })?;
+        let value = self.alloc()?;
+        self.emit(Instr::GetIndex { dst: value, obj: d.arr, key: d.index })?;
+        self.emit(Instr::AddInt { dst: d.index, a: d.index, imm: 1, upd: false })?;
+        self.assign(target, value, depth)?;
+        Ok(vec![exit])
+    }
+
+    /// The loop head for either kind of steps (see [`Emitter::loop_header`]).
+    pub fn steps_header(&mut self, steps: &Steps, target: &ast::Expr, depth: usize) -> R<Vec<usize>> {
+        match steps {
+            Steps::Display(d) => self.display_header(d, target, depth),
+            Steps::Iter(s) => self.loop_header(s, target, depth),
+        }
+    }
+
     /// `for target in iter: body [else: orelse]`.
     fn for_stmt(&mut self, s: &ast::StmtFor, depth: usize) -> R<()> {
-        let stepper = match self.range_call(&s.iter) {
-            Some(args) => self.range_stepper(args, depth + 1)?,
-            None => {
-                let value = self.expr(&s.iter, depth + 1)?;
-                // A display is already an exact list or tuple (`seqiter`
-                // would answer it unchanged).
-                let wrap = !(self.fast && super::exprs::is_sequence_display(&s.iter));
-                self.seq_stepper(value, wrap)?
-            }
+        let steps = match self.range_call(&s.iter) {
+            Some(args) => Steps::Iter(self.range_stepper(args, depth + 1)?),
+            None => match self.display_steps(&s.iter, depth + 1)? {
+                Some(d) => Steps::Display(d),
+                None => {
+                    let value = self.expr(&s.iter, depth + 1)?;
+                    Steps::Iter(self.seq_stepper(value, true)?)
+                }
+            },
         };
         let head = self.here();
         self.forget_line();
         // The target is bound before every iteration of the body, but not
         // necessarily after the loop (the iterable may be empty).
         let saved = self.definite.clone();
-        let exhausted = self.loop_header(&stepper, &s.target, depth + 1)?;
+        let exhausted = self.steps_header(&steps, &s.target, depth + 1)?;
         self.loops.push(LoopCtx {
             head,
             breaks: Vec::new(),

@@ -1,6 +1,6 @@
 //! Expression lowering for the Python emitter.
 use super::emitter::{Emitter, LoopCtx, MAX_DIRECT, R};
-use super::stmts::{binop_name, inplace_binop_name};
+use super::stmts::{binop_name, inplace_binop_name, Display, Steps};
 use super::symtable::{ScopeKind, SymKind};
 use crate::bytecode::{Instr, PyArithOp, PyCmpOp, Reg};
 use zipp_pyparse::tree as ast;
@@ -2093,6 +2093,17 @@ impl<'a> Emitter<'a> {
         elts: &[&ast::Expr],
         depth: usize,
     ) -> R<Reg> {
+        // An inline comprehension over a display steps through the
+        // display's own elements (`Display`): the loop is in this code, so
+        // nothing else ever holds the list or tuple it would have made. (A
+        // comprehension that is its own function takes its iterable as an
+        // argument, a record its loop asks the class of.)
+        let inline = self.inlinable(node, kind);
+        if let Some(scope) = inline {
+            if let Some(display) = self.display_steps(&generators[0].iter, depth)? {
+                return self.inline_comprehension(scope, kind, generators, elts, Outer::Display(display), depth);
+            }
+        }
         let outer = self.expr(&generators[0].iter, depth)?;
         // With fast paths on, an exact list, tuple or range is passed as
         // itself for the comprehension to index or count in place (a list
@@ -2103,8 +2114,8 @@ impl<'a> Emitter<'a> {
         } else {
             self.helper(if self.fast { "seqiter" } else { "iter" }, &[outer])?
         };
-        if let Some(scope) = self.inlinable(node, kind) {
-            return self.inline_comprehension(scope, kind, generators, elts, outer_iter, depth);
+        if let Some(scope) = inline {
+            return self.inline_comprehension(scope, kind, generators, elts, Outer::Iter(outer_iter), depth);
         }
         let qualname = if self.kind() == ScopeKind::Module {
             kind.to_owned()
@@ -2126,7 +2137,7 @@ impl<'a> Emitter<'a> {
                 ("<listcomp>", Some(acc)) if e.fast => Some(e.prop(acc, "items")?),
                 _ => None,
             };
-            e.comp_loop(generators, 0, elts, acc, items, depth + 1)?;
+            e.comp_loop(generators, 0, elts, acc, items, None, depth + 1)?;
             let result = match acc {
                 Some(acc) => acc,
                 None => e.none()?,
@@ -2160,14 +2171,14 @@ impl<'a> Emitter<'a> {
 
     /// Lower an [`inlinable`](Emitter::inlinable) comprehension in place:
     /// the current emitter compiles its loops against the comprehension's
-    /// scope, with the outermost iterable in `outer`.
+    /// scope, with the outermost iterable as `outer` has it.
     fn inline_comprehension(
         &mut self,
         scope: usize,
         kind: &str,
         generators: &[ast::Comprehension],
         elts: &[&ast::Expr],
-        outer: Reg,
+        outer: Outer,
         depth: usize,
     ) -> R<Reg> {
         let acc = match kind {
@@ -2211,7 +2222,7 @@ impl<'a> Emitter<'a> {
         elts: &[&ast::Expr],
         acc: Reg,
         items: Option<Reg>,
-        outer: Reg,
+        outer: Outer,
         enclosing: (&BTreeMap<String, Reg>, &BTreeSet<String>, &BTreeSet<String>),
         depth: usize,
     ) -> R<()> {
@@ -2238,7 +2249,12 @@ impl<'a> Emitter<'a> {
             }
             let reg = self.alloc()?;
             if name == ".0" {
-                self.emit(Instr::Move { dst: reg, src: outer })?;
+                // (A display's loop never reads `.0`; it holds the Array.)
+                let src = match outer {
+                    Outer::Iter(iter) => iter,
+                    Outer::Display(d) => d.arr,
+                };
+                self.emit(Instr::Move { dst: reg, src })?;
                 self.definite.insert(name.clone());
             } else {
                 let unbound = self.unbound()?;
@@ -2246,9 +2262,16 @@ impl<'a> Emitter<'a> {
             }
             self.locals.insert(name.clone(), reg);
         }
-        self.comp_loop(generators, 0, elts, Some(acc), items, depth + 1)
+        let first = match outer {
+            Outer::Iter(_) => None,
+            Outer::Display(d) => Some(d),
+        };
+        self.comp_loop(generators, 0, elts, Some(acc), items, first, depth + 1)
     }
 
+    /// The loops of a comprehension from its clause `index` on. `first`:
+    /// the outermost iterable when it is a display stepped through in place
+    /// (see [`Outer`]); otherwise that iterable arrives as `.0`.
     fn comp_loop(
         &mut self,
         generators: &[ast::Comprehension],
@@ -2256,25 +2279,36 @@ impl<'a> Emitter<'a> {
         elts: &[&ast::Expr],
         acc: Option<Reg>,
         items: Option<Reg>,
+        first: Option<Display>,
         depth: usize,
     ) -> R<()> {
         let g = &generators[index];
-        let stepper = if index == 0 {
-            // The outermost iterable arrives as `.0`, already through
-            // `seqiter` (or `iter`).
-            let outer = self.load_name(".0")?;
-            self.seq_stepper(outer, false)?
-        } else {
-            match self.range_call(&g.iter) {
-                Some(args) => self.range_stepper(args, depth)?,
+        let steps = if index == 0 {
+            match first {
+                Some(d) => Steps::Display(d),
                 None => {
-                    let value = self.expr(&g.iter, depth)?;
-                    self.seq_stepper(value, true)?
+                    // The outermost iterable arrives as `.0`, already
+                    // through `seqiter` (or `iter`).
+                    let outer = self.load_name(".0")?;
+                    Steps::Iter(self.seq_stepper(outer, false)?)
                 }
+            }
+        } else {
+            // An inner clause's iterable is evaluated here, in the loop's
+            // own code, each time the clauses outside it step.
+            match self.range_call(&g.iter) {
+                Some(args) => Steps::Iter(self.range_stepper(args, depth)?),
+                None => match self.display_steps(&g.iter, depth)? {
+                    Some(d) => Steps::Display(d),
+                    None => {
+                        let value = self.expr(&g.iter, depth)?;
+                        Steps::Iter(self.seq_stepper(value, true)?)
+                    }
+                },
             }
         };
         let head = self.here();
-        let exits = self.loop_header(&stepper, &g.target, depth)?;
+        let exits = self.steps_header(&steps, &g.target, depth)?;
         let mut skips = Vec::new();
         for cond in &g.ifs {
             skips.extend(self.branch(cond, false, depth)?);
@@ -2286,7 +2320,7 @@ impl<'a> Emitter<'a> {
             handler_depth: self.handler_depth,
         });
         if index + 1 < generators.len() {
-            self.comp_loop(generators, index + 1, elts, acc, items, depth)?;
+            self.comp_loop(generators, index + 1, elts, acc, items, None, depth)?;
         } else {
             match (acc, items) {
                 (Some(acc), _) if elts.len() == 2 => {
@@ -2339,6 +2373,15 @@ pub(super) fn cmpop_name(op: &ast::CmpOp) -> &'static str {
         ast::CmpOp::Is => "is",
         ast::CmpOp::IsNot => "isnot",
     }
+}
+
+/// An inline comprehension's outermost iterable, as its first loop takes it.
+#[derive(Clone, Copy)]
+enum Outer {
+    /// Already through `seqiter` (or `iter`): the value of `.0`.
+    Iter(Reg),
+    /// A display, stepped through in place.
+    Display(Display),
 }
 
 /// A list or tuple display: its value is always an exact list or tuple.

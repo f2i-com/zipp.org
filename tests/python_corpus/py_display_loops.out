@@ -1,0 +1,74 @@
+== for statements
+tuple 1
+tuple 2
+tuple 3
+list 4
+list 5
+empty list: else ran
+single 7
+pair 1 2
+pair 3 4
+star target 1 [2, 3]
+star target 4 []
+nested target 0 x y
+nested target 1 z w
+== evaluation order
+['a', 'b', 'c', 1, 2, 3]
+1 10
+2 20
+3 30
+== break, continue, else
+kept 1
+kept 3
+else after 2
+2140
+== starred elements
+spliced 1
+spliced 2
+spliced 3
+spliced 4
+only 2
+only 3
+mixed a
+mixed b
+mixed 0
+mixed 1
+mixed k
+[0, 4, 6, 18] [] {2, 3}
+== targets that are not names
+2 8 [7, 'b']
+== the loop variable outlives the loop; an empty one leaves it alone
+before
+y
+== comprehensions
+[1, 4, 9]
+[3, 2]
+True {1: 2, 2: 3}
+[(1, 'a'), (1, 'b'), (2, 'a'), (2, 'b')]
+[(0, 0), (0, 10), (1, 1), (1, 11)]
+[1, 2, 0, 3, 0]
+[1, 2] ['p', 'q']
+[[3, 6], [4, 8]]
+[3, 10]
+[1, 2, 3]
+[14] 14
+[] [] {}
+[3, 7] [[2, 3]]
+== a comprehension that is its own function
+[2, 4, 6] 9 (1, -1, 2, -2)
+[(1, [1, 2]), (2, [2, 3])]
+[2, 4, 6] ['a', 'a', 'b', 'b'] second ['int', 'str', 'float', 'NoneType']
+== generators
+1 2 500 [3, 'a', 'b']
+[1, 4, 9] [1, 4, 9]
+== exceptions and finally
+[10, 'f', 5, 'f', 'f', 'zero']
+NameError before the first step
+ZeroDivisionError before the first step
+== nothing else can change what the loop sees
+[1, 2, 3] [1, 2, 3, 10, 20, 30]
+[2]
+== a long display
+300 44850 [255, 256, 257] 299
+33935
+[48, 48, 48] 48031997
