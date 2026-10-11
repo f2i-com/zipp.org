@@ -86,6 +86,64 @@ impl<'p> Vm<'p> {
         (!value.is_hole()).then_some(value)
     }
 
+    /// `o[k]` where the flat string `key` is not among the plain object
+    /// `idx`'s own keys (`map` is its map): what the prototype chain answers,
+    /// when that is a data property or nothing. `None` leaves it to the
+    /// general path, which builds the key as a `String` and runs `get_prop`.
+    ///
+    /// The walk is `jit_get_prop_miss`'s for a named key, link for link and
+    /// guard for guard (a class instance, a constructor's map, an exotic or
+    /// live-slot link and an accessor all decline; an explicit null prototype
+    /// and the end of the default chain are a miss). What only a computed key
+    /// can spell is declined before it: `__proto__`, a `#` name, the empty
+    /// string, and anything that begins like an index (a digit or `-`).
+    /// Compiled code takes the same answer (`jit_get_index`).
+    pub(crate) fn plain_string_key_miss(&self, idx: u32, map: &ObjMap, key: &str) -> Option<Value> {
+        if key == "__proto__"
+            || !key
+                .as_bytes()
+                .first()
+                .is_some_and(|b| !(b.is_ascii_digit() || *b == b'-' || *b == b'#'))
+            || !self.deferred_ns_state.is_empty()
+            || !self.ic_obj_ok(idx)
+            || map.class.is_some()
+            || map.is_ctor
+        {
+            return None;
+        }
+        let mut cur = idx;
+        for _ in 0..64 {
+            let next = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                // Explicit null prototype: a true chain miss.
+                Some(_) => return Some(Value::UNDEFINED),
+                None => {
+                    if self.obj_proto == 0 || cur == self.obj_proto {
+                        return Some(Value::UNDEFINED);
+                    }
+                    self.obj_proto
+                }
+            };
+            if !self.ic_obj_ok(next) {
+                return None;
+            }
+            match self.heap.get(next) {
+                HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
+                    if let Some(i) = m2.pos(key) {
+                        if m2.attr_at(i).accessor {
+                            return None; // the getter is user code
+                        }
+                        let v = m2.val_at(i);
+                        return (!v.is_uninitialized()).then_some(v);
+                    }
+                }
+                _ => return None, // exotic link
+            }
+            cur = next;
+        }
+        None
+    }
+
     pub(crate) fn get_index(&mut self, obj: Value, key: Value) -> Result<Value, Thrown> {
         // RequireObjectCoercible(base) precedes ToPropertyKey(key): `null[k]` must
         // throw TypeError BEFORE evaluating k's toString (sec-evaluate-property-
@@ -124,6 +182,12 @@ impl<'p> Vm<'p> {
         // generic, as do accessor hits and misses (proto/class chain).
         if key.is_heap() {
             let oidx = obj.heap_index();
+            // A key built by concatenation is a rope until read: flattened in
+            // place, so the view below sees its bytes (it is read as a key
+            // whatever path the read takes).
+            if matches!(self.heap.get(oidx), HeapObj::Object(_)) {
+                self.heap.flatten(key.heap_index());
+            }
             if !(oidx == self.global_this && self.global_this != 0)
                 && !(!self.module_namespaces.is_empty()
                     && self.module_namespaces.contains_key(&oidx))
@@ -146,6 +210,10 @@ impl<'p> Vm<'p> {
                                     return Ok(v);
                                 }
                             }
+                        } else if let Some(v) = self.plain_string_key_miss(oidx, m, k) {
+                            // `counts[w] || 0` for a word not seen yet: the
+                            // general path built `w` as a `String` first.
+                            return Ok(v);
                         }
                     }
                 }
@@ -489,6 +557,11 @@ impl<'p> Vm<'p> {
         }
         let key = self.coerce_index_key(key)?;
         let idx = obj.heap_index();
+        // A rope key is flattened in place first, as `get_index` does: the
+        // fast path below views the key's bytes.
+        if key.is_heap() && matches!(self.heap.get(idx), HeapObj::Object(_)) {
+            self.heap.flatten(key.heap_index());
+        }
         // FAST PATH: a plain-object computed write whose flat string key hits an
         // own WRITABLE DATA property stores straight into the ObjMap slot — the
         // twin of get_index's fast read (no key String materialization, no shape

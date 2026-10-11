@@ -1265,50 +1265,10 @@ fn jit_strkey_lane_enabled() -> bool {
 /// helper's store side declines them.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn jit_string_key_miss(vm: &Vm<'_>, idx: u32, map: &ObjMap, key: &str) -> Option<Value> {
-    if !jit_strkey_lane_enabled()
-        || key == "__proto__"
-        || !key
-            .as_bytes()
-            .first()
-            .is_some_and(|b| !(b.is_ascii_digit() || *b == b'-' || *b == b'#'))
-        || !vm.deferred_ns_state.is_empty()
-        || !vm.ic_obj_ok(idx)
-        || map.class.is_some()
-        || map.is_ctor
-    {
+    if !jit_strkey_lane_enabled() {
         return None;
     }
-    let mut cur = idx;
-    for _ in 0..64 {
-        let next = match vm.proto_of.get(&cur) {
-            Some(p) if p.is_heap() => p.heap_index(),
-            // Explicit null prototype: a true chain miss.
-            Some(_) => return Some(Value::UNDEFINED),
-            None => {
-                if vm.obj_proto == 0 || cur == vm.obj_proto {
-                    return Some(Value::UNDEFINED);
-                }
-                vm.obj_proto
-            }
-        };
-        if !vm.ic_obj_ok(next) {
-            return None;
-        }
-        match vm.heap.get(next) {
-            HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
-                if let Some(i) = m2.pos(key) {
-                    if m2.attr_at(i).accessor {
-                        return None; // the getter is user code
-                    }
-                    let v = m2.val_at(i);
-                    return (!v.is_uninitialized()).then_some(v);
-                }
-            }
-            _ => return None, // exotic link
-        }
-        cur = next;
-    }
-    None
+    vm.plain_string_key_miss(idx, map, key)
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
