@@ -7443,7 +7443,7 @@ impl<'p> Vm<'p> {
                         // must throw â€” skip the fast path so it routes through
                         // array_method's guard. The side tables are empty for an
                         // ordinary array, so this is a no-op in the build-a-list case.
-                        if argc == 1 && key == "push" {
+                        if argc == 1 && super::builtins::is_push_name(key) {
                             let v = self.get(base, arg_base);
                             if let Some(len) = self.interp_array_push_fast(recv, v) {
                                 self.set(base, dst, len);

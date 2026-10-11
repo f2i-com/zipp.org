@@ -93,10 +93,21 @@ fn str_memo_id(name: &str) -> Option<usize> {
     })
 }
 
+/// `push`'s index in the B191 memo (`arr_memo_id`).
+const ARR_MEMO_PUSH: usize = 0;
+
+/// Whether a method name is `push`, by its bytes: `key == "push"` is a call
+/// to the slice comparison in a size-first build, on every method call with
+/// one argument.
+#[inline(always)]
+pub(crate) fn is_push_name(key: &str) -> bool {
+    matches!(key.as_bytes(), [b'p', b'u', b's', b'h'])
+}
+
 /// B191 memo indices for the hot array names (see `ARR_MEMO_NAMES`).
 fn arr_memo_id(name: &str) -> Option<usize> {
     Some(match name {
-        "push" => 0,
+        "push" => ARR_MEMO_PUSH,
         "pop" => 1,
         "join" => 2,
         "indexOf" => 3,
@@ -441,6 +452,28 @@ impl<'p> Vm<'p> {
         self.proto_method_is_baseline(self.arr_proto, name, memo_id, true)
     }
 
+    /// `array_method_is_intrinsic("push")` with the memo's hit inlined: the
+    /// same three facts `proto_method_is_baseline` reads on a hit (no child
+    /// realm is running, the prototype's version is the proof's, the slot
+    /// still holds the intrinsic's bits), without the name match and the
+    /// call. Anything else takes the full proof, which also fills the memo.
+    #[inline(always)]
+    fn array_push_is_intrinsic(&mut self) -> bool {
+        if self.realm_global_objs.is_empty() {
+            if let Some((ver, slot, fn_bits)) = self.arr_intrinsic_memo[ARR_MEMO_PUSH] {
+                let proto = self.arr_proto;
+                if self.heap.version_of(proto) == ver {
+                    if let HeapObj::Object(map) = self.heap.get_for_ic(proto) {
+                        if map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == fn_bits) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        self.array_method_is_intrinsic("push")
+    }
+
     /// B289: `recv.name` for an Array or String receiver answered from the
     /// B191 baseline proof (see [`Vm::proto_intrinsic_bits`]) — `Some(bits)`
     /// only when a real Get would resolve to exactly that boot intrinsic:
@@ -477,6 +510,19 @@ impl<'p> Vm<'p> {
                     3
                 };
                 return self.collection_intrinsic_bits(idx, name, kind);
+            }
+            // `p.then` on a plain promise. A Promise has no shape either, so
+            // the read walked to %Promise.prototype% and hashed the name
+            // (14% of a loop of `Promise.resolve(i).then(f)`), although the
+            // promise fast lanes already keep exactly this proof warm:
+            // `promise_plain_unobservable` is the default prototype, no own
+            // `then`, and the prototype's `then` still the intrinsic data
+            // property, which is everything a Get of it can observe.
+            HeapObj::Promise { .. } => {
+                if name == "then" && self.promise_plain_unobservable(idx) {
+                    return Some(Value::heap(self.promise_then_intrinsic).bits());
+                }
+                return None;
             }
             _ => return None,
         };
@@ -544,7 +590,7 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn interp_array_push_fast(&mut self, recv: Value, v: Value) -> Option<Value> {
         if !recv.is_heap()
-            || !self.array_method_is_intrinsic("push")
+            || !self.array_push_is_intrinsic()
             || self.array_proto_has_index
             // Non-extensible (a push always adds an index, so frozen, sealed
             // and preventExtensions'd arrays all reject it — `is_frozen()` let
@@ -557,16 +603,16 @@ impl<'p> Vm<'p> {
                     .get(&recv.heap_index())
                     .map_or(false, |m| !m.extensible || m.pos("push").is_some()))
             // A subclass instance or a replaced/null [[Prototype]] does not
-            // inherit %Array.prototype%'s push (B289).
-            || (!self.proto_of.is_empty()
+            // inherit %Array.prototype%'s push (B289). The table has entries
+            // from boot on, so the probe is the inline one.
+            || (self.proto_of.has(recv.heap_index())
                 && self
                     .proto_of
                     .get(&recv.heap_index())
                     .is_some_and(|&actual| actual != Value::heap(self.arr_proto)))
             || (!self.array_length_nonwritable.is_empty()
                 && self.array_length_nonwritable.contains(&recv.heap_index()))
-            || (!self.array_js_len.is_empty()
-                && self.array_js_len.contains_key(&recv.heap_index()))
+            || (!self.array_js_len.is_empty() && self.array_js_len.has(recv.heap_index()))
         {
             return None;
         }
@@ -698,7 +744,7 @@ impl<'p> Vm<'p> {
         if argc == 1 {
             let arg = self.regs[base + arg_base as usize];
             if is_arr {
-                if key == "push" {
+                if is_push_name(key) {
                     if let Some(len) = self.interp_array_push_fast(recv, arg) {
                         return Ok(Some(len));
                     }

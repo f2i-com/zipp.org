@@ -197,6 +197,18 @@ impl<V> SlotTable<V> {
         }
     }
 
+    /// [`Self::contains_key`] for a probe on a hot path that almost always
+    /// misses: forced inline, where a size-first build leaves the hinted one
+    /// as a call (6% of a loop of `push` in Lite, for a table no array of the
+    /// loop is in).
+    #[inline(always)]
+    pub(crate) fn has(&self, k: u32) -> bool {
+        match self.pages.get((k >> PAGE_BITS) as usize) {
+            Some(Some(page)) => page.pos[(k & PAGE_MASK) as usize] != EMPTY,
+            _ => false,
+        }
+    }
+
     #[inline]
     pub(crate) fn contains_key(&self, k: &u32) -> bool {
         self.pos(*k).is_some()
