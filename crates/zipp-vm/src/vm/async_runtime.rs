@@ -333,6 +333,10 @@ fn pristine_lean_enabled() -> bool {
     }
 }
 
+/// The most entries a combinator reserves ahead of stepping a dense array
+/// (see `promise_combine_rooted`): 4,096 results and flags are 36 KiB.
+const COMBINATOR_PRESIZE_MAX: usize = 4096;
+
 impl<'p> Vm<'p> {
     /// Park the live register window `[new_base..]` back onto a suspended
     /// activation, REUSING `buf` -- the buffer this resume detached from that
@@ -1390,6 +1394,15 @@ impl<'p> Vm<'p> {
     /// resolve-adoption skip, the fast lanes gated on THIS predicate perform
     /// the same number of ticks as the generic paths.
     pub(crate) fn promise_plain_unobservable(&mut self, idx: u32) -> bool {
+        self.promise_instance_plain(idx) && self.promise_proto_pristine()
+    }
+
+    /// The instance half of [`Vm::promise_plain_unobservable`]: a native
+    /// promise whose [[Prototype]] is %Promise.prototype% and that has no own
+    /// `then` or `constructor`. A caller that already holds
+    /// `promise_proto_pristine()` for a stretch in which no user code runs
+    /// needs only this for each promise of the stretch.
+    pub(crate) fn promise_instance_plain(&self, idx: u32) -> bool {
         if !matches!(self.heap.get(idx), HeapObj::Promise { .. }) {
             return false;
         }
@@ -1399,14 +1412,10 @@ impl<'p> Vm<'p> {
             Some(p) if p.is_heap() && p.heap_index() == self.promise_proto => {}
             _ => return false,
         }
-        if self
+        !self
             .arr_props
             .get(&idx)
             .is_some_and(|m| m.pos("then").is_some() || m.pos("constructor").is_some())
-        {
-            return false;
-        }
-        self.promise_proto_pristine()
     }
 
     /// JS `[[Resolve]]`: a thenable/Promise value is ADOPTED (p forwards when it
@@ -2545,18 +2554,20 @@ impl<'p> Vm<'p> {
         result: u32,
     ) -> bool {
         debug_assert!(index <= i32::MAX as u32);
-        self.store_barrier(
-            crate::heap::gcoracle::PROMISE_REACT,
-            p,
-            Value::heap(combinator),
-        );
-        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, cap_reject);
         let (state, value) = match self.heap.get(p) {
             HeapObj::Promise { state, result, .. } => (*state, *result),
             _ => return false,
         };
         match state {
             PromiseState::Pending => {
+                // The one arm that stores the combinator and the reject
+                // capability into `p`; a settled promise is only read.
+                self.store_barrier(
+                    crate::heap::gcoracle::PROMISE_REACT,
+                    p,
+                    Value::heap(combinator),
+                );
+                self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, cap_reject);
                 if let HeapObj::Promise {
                     reactions, handled, ..
                 } = self.heap.get_mut(p)
@@ -2886,14 +2897,25 @@ impl<'p> Vm<'p> {
         // iteration decrements it — when it hits 0 the combinator resolves/rejects.
         // results/settled grow as the iterator is stepped (LAZY, so an abrupt
         // Call(promiseResolve)/Invoke(.then) can IteratorClose the live iterator).
+        //
+        // Their CAPACITY is the array's length when the inline lane is
+        // stepping a dense array: both otherwise start empty and reallocate
+        // eight times each on the way to a hundred elements, a tenth of a
+        // `Promise.all` of that width. The length is a hint and the entries
+        // are still pushed one step at a time; it is bounded, so a huge array
+        // does not reserve before the lane has looked at an element.
+        let expected = match (fast_pos, self.heap.get(iterable.heap_index())) {
+            (Some(_), HeapObj::Array(items)) => items.len().min(COMBINATOR_PRESIZE_MAX),
+            _ => 0,
+        };
         let comb = self
             .heap
             .alloc(HeapObj::Combinator(Box::new(crate::heap::CombinatorData {
                 kind,
-                results: Vec::new(),
+                results: Vec::with_capacity(expected),
                 remaining: 1,
                 result,
-                settled: Vec::new(),
+                settled: Vec::with_capacity(expected),
                 cap_resolve,
                 cap_reject,
                 keys: comb_keys,
@@ -2974,10 +2996,19 @@ impl<'p> Vm<'p> {
             // code that patches the iterator protocol from here on is
             // honoured by the generic loop.
             if let Some(pos) = fast_pos {
+                // `intrinsic_resolve` holds the prototype-and-constructor
+                // proof, taken once above. Nothing between two elements of
+                // this lane can run user code (whatever could demotes first),
+                // so that half cannot have changed; what differs from element
+                // to element is the instance half.
                 let inert = !val.is_heap()
                     || !self.is_object_value(val)
                     || (matches!(self.heap.get(val.heap_index()), HeapObj::Promise { .. })
-                        && self.promise_plain_unobservable(val.heap_index()));
+                        && if intrinsic_resolve {
+                            self.promise_instance_plain(val.heap_index())
+                        } else {
+                            self.promise_plain_unobservable(val.heap_index())
+                        });
                 if !intrinsic_resolve || !inert {
                     iter = Value::heap(self.heap.alloc(HeapObj::Iterator {
                         items: Vec::new(),
