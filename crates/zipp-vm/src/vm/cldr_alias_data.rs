@@ -1410,7204 +1410,944 @@ pub(crate) static BCP47_TYPE_ALIAS: &str = "\
 /// `<likelySubtag from="und" to="en_Latn_US"/>` — the root of §4.3.
 pub(crate) static LIKELY_UND: (&str, &str, &str) = ("en", "Latn", "US");
 
-/// `<likelySubtag from="L" to="L_S_R"/>` as `L S R`. The target
-/// language always repeats the source, so it is not stored twice.
-pub(crate) static LIKELY_LANG: &str = "\
-    aa Latn ET\n\
-    ab Cyrl GE\n\
-    abr Latn GH\n\
-    ace Latn ID\n\
-    ach Latn UG\n\
-    ada Latn GH\n\
-    ady Cyrl RU\n\
-    ae Avst IR\n\
-    aeb Arab TN\n\
-    af Latn ZA\n\
-    agq Latn CM\n\
-    aho Ahom IN\n\
-    ak Latn GH\n\
-    akk Xsux IQ\n\
-    aln Latn XK\n\
-    alt Cyrl RU\n\
-    am Ethi ET\n\
-    amo Latn NG\n\
-    an Latn ES\n\
-    ann Latn NG\n\
-    aoz Latn ID\n\
-    apc Arab SY\n\
-    apd Arab SD\n\
-    ar Arab EG\n\
-    arc Armi IR\n\
-    arn Latn CL\n\
-    aro Latn BO\n\
-    arq Arab DZ\n\
-    ars Arab SA\n\
-    ary Arab MA\n\
-    arz Arab EG\n\
-    as Beng IN\n\
-    asa Latn TZ\n\
-    ase Sgnw US\n\
-    ast Latn ES\n\
-    atj Latn CA\n\
-    av Cyrl RU\n\
-    awa Deva IN\n\
-    ay Latn BO\n\
-    az Latn AZ\n\
-    ba Cyrl RU\n\
-    bal Arab PK\n\
-    ban Latn ID\n\
-    bap Deva NP\n\
-    bar Latn AT\n\
-    bas Latn CM\n\
-    bax Bamu CM\n\
-    bbc Latn ID\n\
-    bbj Latn CM\n\
-    bci Latn CI\n\
-    be Cyrl BY\n\
-    bej Arab SD\n\
-    bem Latn ZM\n\
-    bew Latn ID\n\
-    bez Latn TZ\n\
-    bfd Latn CM\n\
-    bfq Taml IN\n\
-    bft Arab PK\n\
-    bfy Deva IN\n\
-    bg Cyrl BG\n\
-    bgc Deva IN\n\
-    bgn Arab PK\n\
-    bgx Grek TR\n\
-    bhb Deva IN\n\
-    bhi Deva IN\n\
-    bho Deva IN\n\
-    bi Latn VU\n\
-    bik Latn PH\n\
-    bin Latn NG\n\
-    bjj Deva IN\n\
-    bjn Latn ID\n\
-    bjt Latn SN\n\
-    bkm Latn CM\n\
-    bku Latn PH\n\
-    bla Latn CA\n\
-    blo Latn BJ\n\
-    blt Tavt VN\n\
-    bm Latn ML\n\
-    bmq Latn ML\n\
-    bn Beng BD\n\
-    bo Tibt CN\n\
-    bpy Beng IN\n\
-    bqi Arab IR\n\
-    bqv Latn CI\n\
-    br Latn FR\n\
-    bra Deva IN\n\
-    brh Arab PK\n\
-    brx Deva IN\n\
-    bs Latn BA\n\
-    bsc Latn SN\n\
-    bsq Bass LR\n\
-    bss Latn CM\n\
-    bto Latn PH\n\
-    btv Deva PK\n\
-    bua Cyrl RU\n\
-    buc Latn YT\n\
-    bug Latn ID\n\
-    bum Latn CM\n\
-    bvb Latn GQ\n\
-    byn Ethi ER\n\
-    byv Latn CM\n\
-    bze Latn ML\n\
-    ca Latn ES\n\
-    cad Latn US\n\
-    cch Latn NG\n\
-    ccp Cakm BD\n\
-    ccr Latn SV\n\
-    ce Cyrl RU\n\
-    ceb Latn PH\n\
-    cgg Latn UG\n\
-    ch Latn GU\n\
-    chk Latn FM\n\
-    chm Cyrl RU\n\
-    cho Latn US\n\
-    chp Latn CA\n\
-    chr Cher US\n\
-    cic Latn US\n\
-    cja Arab KH\n\
-    cjm Cham VN\n\
-    ckb Arab IQ\n\
-    clc Latn CA\n\
-    cmg Soyo MN\n\
-    co Latn FR\n\
-    cop Copt EG\n\
-    cps Latn PH\n\
-    cr Cans CA\n\
-    crg Latn CA\n\
-    crh Cyrl UA\n\
-    crk Cans CA\n\
-    crl Cans CA\n\
-    crs Latn SC\n\
-    cs Latn CZ\n\
-    csb Latn PL\n\
-    csw Cans CA\n\
-    ctd Pauc MM\n\
-    cu Cyrl RU\n\
-    cv Cyrl RU\n\
-    cy Latn GB\n\
-    da Latn DK\n\
-    dak Latn US\n\
-    dar Cyrl RU\n\
-    dav Latn KE\n\
-    dcc Arab IN\n\
-    de Latn DE\n\
-    den Latn CA\n\
-    dgr Latn CA\n\
-    dje Latn NE\n\
-    dmf Medf NG\n\
-    dnj Latn CI\n\
-    doi Deva IN\n\
-    dsb Latn DE\n\
-    dtm Latn ML\n\
-    dtp Latn MY\n\
-    dty Deva NP\n\
-    dua Latn CM\n\
-    dv Thaa MV\n\
-    dyo Latn SN\n\
-    dyu Latn BF\n\
-    dz Tibt BT\n\
-    ebu Latn KE\n\
-    ecy Cprt CY\n\
-    ee Latn GH\n\
-    efi Latn NG\n\
-    egl Latn IT\n\
-    egy Egyp EG\n\
-    eky Kali MM\n\
-    el Grek GR\n\
-    en Latn US\n\
-    eo Latn 001\n\
-    es Latn ES\n\
-    esg Gonm IN\n\
-    esu Latn US\n\
-    et Latn EE\n\
-    ett Ital IT\n\
-    eu Latn ES\n\
-    ewo Latn CM\n\
-    ext Latn ES\n\
-    fa Arab IR\n\
-    fan Latn GQ\n\
-    fbl Latn PH\n\
-    ff Latn SN\n\
-    ffm Latn ML\n\
-    fi Latn FI\n\
-    fia Arab SD\n\
-    fil Latn PH\n\
-    fit Latn SE\n\
-    fj Latn FJ\n\
-    fo Latn FO\n\
-    fon Latn BJ\n\
-    fr Latn FR\n\
-    frc Latn US\n\
-    frp Latn FR\n\
-    frr Latn DE\n\
-    frs Latn DE\n\
-    fub Arab CM\n\
-    fud Latn WF\n\
-    fuf Latn GN\n\
-    fuq Latn NE\n\
-    fur Latn IT\n\
-    fuv Latn NG\n\
-    fvr Latn SD\n\
-    fy Latn NL\n\
-    ga Latn IE\n\
-    gaa Latn GH\n\
-    gag Latn MD\n\
-    gan Hans CN\n\
-    gay Latn ID\n\
-    gbm Deva IN\n\
-    gbz Arab IR\n\
-    gcr Latn GF\n\
-    gd Latn GB\n\
-    gez Ethi ET\n\
-    gil Latn KI\n\
-    gjk Arab PK\n\
-    gju Arab PK\n\
-    gl Latn ES\n\
-    glk Arab IR\n\
-    gmy Linb GR\n\
-    gn Latn PY\n\
-    gon Deva IN\n\
-    gor Latn ID\n\
-    gos Latn NL\n\
-    got Goth UA\n\
-    grc Grek GR\n\
-    grt Beng IN\n\
-    gsw Latn CH\n\
-    gu Gujr IN\n\
-    gub Latn BR\n\
-    guc Latn CO\n\
-    gur Latn GH\n\
-    guz Latn KE\n\
-    gv Latn IM\n\
-    gvr Deva NP\n\
-    gwi Latn CA\n\
-    ha Latn NG\n\
-    hak Hans CN\n\
-    haw Latn US\n\
-    haz Arab AF\n\
-    he Hebr IL\n\
-    hi Deva IN\n\
-    hif Deva FJ\n\
-    hil Latn PH\n\
-    hlu Hluw TR\n\
-    hmd Plrd CN\n\
-    hnd Arab PK\n\
-    hne Deva IN\n\
-    hnj Hmnp US\n\
-    hnn Latn PH\n\
-    hno Arab PK\n\
-    ho Latn PG\n\
-    hoc Deva IN\n\
-    hoj Deva IN\n\
-    hr Latn HR\n\
-    hsb Latn DE\n\
-    hsn Hans CN\n\
-    ht Latn HT\n\
-    hu Latn HU\n\
-    hur Latn CA\n\
-    hy Armn AM\n\
-    hz Latn NA\n\
-    ia Latn 001\n\
-    iba Latn MY\n\
-    ibb Latn NG\n\
-    id Latn ID\n\
-    ie Latn EE\n\
-    ife Latn TG\n\
-    ig Latn NG\n\
-    ii Yiii CN\n\
-    ik Latn US\n\
-    ilo Latn PH\n\
-    in Latn ID\n\
-    inh Cyrl RU\n\
-    io Latn 001\n\
-    is Latn IS\n\
-    it Latn IT\n\
-    iu Cans CA\n\
-    iw Hebr IL\n\
-    izh Latn RU\n\
-    ja Jpan JP\n\
-    jam Latn JM\n\
-    jbo Latn 001\n\
-    jgo Latn CM\n\
-    ji Hebr UA\n\
-    jmc Latn TZ\n\
-    jml Deva NP\n\
-    jut Latn DK\n\
-    jv Latn ID\n\
-    jw Latn ID\n\
-    ka Geor GE\n\
-    kaa Cyrl UZ\n\
-    kab Latn DZ\n\
-    kac Latn MM\n\
-    kaj Latn NG\n\
-    kam Latn KE\n\
-    kao Latn ML\n\
-    kaw Bali ID\n\
-    kbd Cyrl RU\n\
-    kby Arab NE\n\
-    kcg Latn NG\n\
-    kck Latn ZW\n\
-    kde Latn TZ\n\
-    kdh Latn TG\n\
-    kdt Thai TH\n\
-    kea Latn CV\n\
-    ken Latn CM\n\
-    kfo Latn CI\n\
-    kfr Deva IN\n\
-    kfy Deva IN\n\
-    kg Latn CD\n\
-    kge Latn ID\n\
-    kgp Latn BR\n\
-    kha Latn IN\n\
-    khb Talu CN\n\
-    khn Deva IN\n\
-    khq Latn ML\n\
-    kht Mymr IN\n\
-    khw Arab PK\n\
-    ki Latn KE\n\
-    kiu Latn TR\n\
-    kj Latn NA\n\
-    kjg Laoo LA\n\
-    kk Cyrl KZ\n\
-    kkj Latn CM\n\
-    kl Latn GL\n\
-    kln Latn KE\n\
-    km Khmr KH\n\
-    kmb Latn AO\n\
-    kn Knda IN\n\
-    knf Latn GW\n\
-    knn Deva IN\n\
-    ko Kore KR\n\
-    koi Cyrl RU\n\
-    kok Deva IN\n\
-    kos Latn FM\n\
-    kpe Latn LR\n\
-    kqn Latn ZM\n\
-    krc Cyrl RU\n\
-    kri Latn SL\n\
-    krj Latn PH\n\
-    krl Latn RU\n\
-    kru Deva IN\n\
-    ks Arab IN\n\
-    ksb Latn TZ\n\
-    ksf Latn CM\n\
-    ksh Latn DE\n\
-    ku Latn TR\n\
-    kum Cyrl RU\n\
-    kv Cyrl RU\n\
-    kvr Latn ID\n\
-    kvx Arab PK\n\
-    kw Latn GB\n\
-    kwk Latn CA\n\
-    kxm Thai TH\n\
-    kxp Arab PK\n\
-    kxv Latn IN\n\
-    ky Cyrl KG\n\
-    la Latn VA\n\
-    lab Lina GR\n\
-    lad Hebr IL\n\
-    lag Latn TZ\n\
-    lah Arab PK\n\
-    laj Latn UG\n\
-    lb Latn LU\n\
-    lbe Cyrl RU\n\
-    lbw Latn ID\n\
-    lcp Thai CN\n\
-    leb Latn ZM\n\
-    len Latn SV\n\
-    lep Lepc IN\n\
-    lez Cyrl RU\n\
-    lg Latn UG\n\
-    li Latn NL\n\
-    lif Deva NP\n\
-    lij Latn IT\n\
-    lil Latn CA\n\
-    lis Lisu CN\n\
-    ljp Latn ID\n\
-    lki Arab IR\n\
-    lkt Latn US\n\
-    lld Latn IT\n\
-    lmn Telu IN\n\
-    lmo Latn IT\n\
-    ln Latn CD\n\
-    lo Laoo LA\n\
-    lol Latn CD\n\
-    loz Latn ZM\n\
-    lrc Arab IR\n\
-    lt Latn LT\n\
-    ltg Latn LV\n\
-    lu Latn CD\n\
-    lua Latn CD\n\
-    lue Latn ZM\n\
-    lun Latn ZM\n\
-    luo Latn KE\n\
-    luy Latn KE\n\
-    luz Arab IR\n\
-    lv Latn LV\n\
-    lwl Thai TH\n\
-    lzh Hans CN\n\
-    lzz Latn TR\n\
-    mad Latn ID\n\
-    maf Latn CM\n\
-    mag Deva IN\n\
-    mai Deva IN\n\
-    mak Latn ID\n\
-    man Latn GM\n\
-    mas Latn KE\n\
-    maz Latn MX\n\
-    mdf Cyrl RU\n\
-    mdh Latn PH\n\
-    mdr Latn ID\n\
-    men Latn SL\n\
-    mer Latn KE\n\
-    mey Latn SN\n\
-    mfa Arab TH\n\
-    mfe Latn MU\n\
-    mfv Latn SN\n\
-    mg Latn MG\n\
-    mgh Latn MZ\n\
-    mgo Latn CM\n\
-    mgp Deva NP\n\
-    mgy Latn TZ\n\
-    mh Latn MH\n\
-    mhn Latn IT\n\
-    mi Latn NZ\n\
-    mic Latn CA\n\
-    min Latn ID\n\
-    mk Cyrl MK\n\
-    ml Mlym IN\n\
-    mls Latn SD\n\
-    mn Cyrl MN\n\
-    mni Beng IN\n\
-    mnw Mymr MM\n\
-    mo Latn RO\n\
-    moe Latn CA\n\
-    moh Latn CA\n\
-    mos Latn BF\n\
-    mr Deva IN\n\
-    mrd Deva NP\n\
-    mrj Cyrl RU\n\
-    mro Mroo BD\n\
-    ms Latn MY\n\
-    mt Latn MT\n\
-    mtr Deva IN\n\
-    mua Latn CM\n\
-    mus Latn US\n\
-    mvy Arab PK\n\
-    mwk Latn ML\n\
-    mwr Deva IN\n\
-    mwv Latn ID\n\
-    mww Hmnp US\n\
-    mxc Latn ZW\n\
-    my Mymr MM\n\
-    myv Cyrl RU\n\
-    myx Latn UG\n\
-    myz Mand IR\n\
-    mzn Arab IR\n\
-    na Latn NR\n\
-    nan Hans CN\n\
-    nap Latn IT\n\
-    naq Latn NA\n\
-    nb Latn NO\n\
-    nch Latn MX\n\
-    nd Latn ZW\n\
-    ndc Latn MZ\n\
-    nds Latn DE\n\
-    ne Deva NP\n\
-    new Deva NP\n\
-    ng Latn NA\n\
-    ngl Latn MZ\n\
-    nhe Latn MX\n\
-    nhw Latn MX\n\
-    nij Latn ID\n\
-    niu Latn NU\n\
-    njo Latn IN\n\
-    nl Latn NL\n\
-    nmg Latn CM\n\
-    nn Latn NO\n\
-    nnh Latn CM\n\
-    nnp Wcho IN\n\
-    no Latn NO\n\
-    nod Lana TH\n\
-    noe Deva IN\n\
-    non Runr SE\n\
-    nqo Nkoo GN\n\
-    nr Latn ZA\n\
-    nse Latn ZM\n\
-    nsk Cans CA\n\
-    nso Latn ZA\n\
-    nst Tnsa IN\n\
-    nus Latn SS\n\
-    nv Latn US\n\
-    nxq Latn CN\n\
-    ny Latn MW\n\
-    nym Latn TZ\n\
-    nyn Latn UG\n\
-    nzi Latn GH\n\
-    oc Latn FR\n\
-    oj Cans CA\n\
-    ojs Cans CA\n\
-    ojw Latn CA\n\
-    oka Latn CA\n\
-    om Latn ET\n\
-    or Orya IN\n\
-    os Cyrl GE\n\
-    osa Osge US\n\
-    otk Orkh MN\n\
-    oui Ougr CN\n\
-    pa Guru IN\n\
-    pag Latn PH\n\
-    pal Phli IR\n\
-    pam Latn PH\n\
-    pap Latn CW\n\
-    pau Latn PW\n\
-    pcd Latn FR\n\
-    pcm Latn NG\n\
-    pdc Latn US\n\
-    pdt Latn CA\n\
-    peo Xpeo IR\n\
-    pfl Latn DE\n\
-    phn Phnx LB\n\
-    pis Latn SB\n\
-    pka Brah IN\n\
-    pko Latn KE\n\
-    pl Latn PL\n\
-    pms Latn IT\n\
-    pnt Grek GR\n\
-    pon Latn FM\n\
-    ppl Latn SV\n\
-    pqm Latn CA\n\
-    pra Khar PK\n\
-    prd Arab IR\n\
-    prg Latn PL\n\
-    ps Arab AF\n\
-    pt Latn BR\n\
-    puu Latn GA\n\
-    qu Latn PE\n\
-    quc Latn GT\n\
-    qug Latn EC\n\
-    raj Deva IN\n\
-    rcf Latn RE\n\
-    rej Latn ID\n\
-    rgn Latn IT\n\
-    rhg Rohg MM\n\
-    ria Latn IN\n\
-    rif Latn MA\n\
-    rjs Deva NP\n\
-    rkt Beng BD\n\
-    rm Latn CH\n\
-    rmf Latn FI\n\
-    rmo Latn CH\n\
-    rmt Arab IR\n\
-    rmu Latn SE\n\
-    rn Latn BI\n\
-    rng Latn MZ\n\
-    ro Latn RO\n\
-    rob Latn ID\n\
-    rof Latn TZ\n\
-    rtm Latn FJ\n\
-    ru Cyrl RU\n\
-    rue Cyrl UA\n\
-    rug Latn SB\n\
-    rw Latn RW\n\
-    rwk Latn TZ\n\
-    ryu Kana JP\n\
-    sa Deva IN\n\
-    saf Latn GH\n\
-    sah Cyrl RU\n\
-    saq Latn KE\n\
-    sas Latn ID\n\
-    sat Olck IN\n\
-    sav Latn SN\n\
-    saz Saur IN\n\
-    sbp Latn TZ\n\
-    sc Latn IT\n\
-    sck Deva IN\n\
-    scn Latn IT\n\
-    sco Latn GB\n\
-    sd Arab PK\n\
-    sdc Latn IT\n\
-    sdh Arab IR\n\
-    se Latn NO\n\
-    sef Latn CI\n\
-    seh Latn MZ\n\
-    sei Latn MX\n\
-    ses Latn ML\n\
-    sg Latn CF\n\
-    sga Latn IE\n\
-    sgs Latn LT\n\
-    shi Tfng MA\n\
-    shn Mymr MM\n\
-    si Sinh LK\n\
-    sid Latn ET\n\
-    sk Latn SK\n\
-    skr Arab PK\n\
-    sl Latn SI\n\
-    sli Latn PL\n\
-    sly Latn ID\n\
-    sm Latn WS\n\
-    sma Latn SE\n\
-    smj Latn SE\n\
-    smn Latn FI\n\
-    smp Samr IL\n\
-    sms Latn FI\n\
-    sn Latn ZW\n\
-    snf Latn SN\n\
-    snk Latn ML\n\
-    so Latn SO\n\
-    sog Sogd UZ\n\
-    sou Thai TH\n\
-    sq Latn AL\n\
-    sr Cyrl RS\n\
-    srb Sora IN\n\
-    srn Latn SR\n\
-    srr Latn SN\n\
-    srx Deva IN\n\
-    ss Latn ZA\n\
-    ssy Latn ER\n\
-    st Latn ZA\n\
-    stq Latn DE\n\
-    su Latn ID\n\
-    suk Latn TZ\n\
-    sus Latn GN\n\
-    suz Sunu NP\n\
-    sv Latn SE\n\
-    sw Latn TZ\n\
-    swb Arab YT\n\
-    swg Latn DE\n\
-    swv Deva IN\n\
-    sxn Latn ID\n\
-    syl Beng BD\n\
-    syr Syrc IQ\n\
-    szl Latn PL\n\
-    ta Taml IN\n\
-    taj Deva NP\n\
-    tbw Latn PH\n\
-    tcy Knda IN\n\
-    tdd Tale CN\n\
-    tdg Deva NP\n\
-    tdh Deva NP\n\
-    te Telu IN\n\
-    tem Latn SL\n\
-    teo Latn UG\n\
-    tet Latn TL\n\
-    tg Cyrl TJ\n\
-    th Thai TH\n\
-    thl Deva NP\n\
-    thq Deva NP\n\
-    thr Deva NP\n\
-    ti Ethi ET\n\
-    tig Ethi ER\n\
-    tiv Latn NG\n\
-    tk Latn TM\n\
-    tkl Latn TK\n\
-    tkr Latn AZ\n\
-    tkt Deva NP\n\
-    tl Latn PH\n\
-    tly Latn AZ\n\
-    tmh Latn NE\n\
-    tn Latn ZA\n\
-    tnr Latn SN\n\
-    to Latn TO\n\
-    tog Latn MW\n\
-    toi Latn ZM\n\
-    tok Latn 001\n\
-    tpi Latn PG\n\
-    tr Latn TR\n\
-    tru Latn TR\n\
-    trv Latn TW\n\
-    trw Arab PK\n\
-    ts Latn ZA\n\
-    tsd Grek GR\n\
-    tsg Latn PH\n\
-    tsj Tibt BT\n\
-    tt Cyrl RU\n\
-    ttj Latn UG\n\
-    tts Thai TH\n\
-    ttt Latn AZ\n\
-    tum Latn MW\n\
-    tvl Latn TV\n\
-    twq Latn NE\n\
-    txg Tang CN\n\
-    txo Toto IN\n\
-    ty Latn PF\n\
-    tyv Cyrl RU\n\
-    tzm Latn MA\n\
-    udm Cyrl RU\n\
-    ug Arab CN\n\
-    uga Ugar SY\n\
-    uk Cyrl UA\n\
-    uli Latn FM\n\
-    umb Latn AO\n\
-    unr Beng IN\n\
-    unx Beng IN\n\
-    ur Arab PK\n\
-    uz Latn UZ\n\
-    vai Vaii LR\n\
-    ve Latn ZA\n\
-    vec Latn IT\n\
-    vep Latn RU\n\
-    vi Latn VN\n\
-    vic Latn SX\n\
-    vls Latn BE\n\
-    vmf Latn DE\n\
-    vmw Latn MZ\n\
-    vo Latn 001\n\
-    vot Latn RU\n\
-    vro Latn EE\n\
-    vun Latn TZ\n\
-    wa Latn BE\n\
-    wae Latn CH\n\
-    wal Ethi ET\n\
-    war Latn PH\n\
-    wbp Latn AU\n\
-    wbq Telu IN\n\
-    wbr Deva IN\n\
-    wls Latn WF\n\
-    wni Arab KM\n\
-    wo Latn SN\n\
-    wsg Gong IN\n\
-    wtm Deva IN\n\
-    wuu Hans CN\n\
-    xag Aghb AZ\n\
-    xav Latn BR\n\
-    xco Chrs UZ\n\
-    xcr Cari TR\n\
-    xh Latn ZA\n\
-    xlc Lyci TR\n\
-    xld Lydi TR\n\
-    xmf Geor GE\n\
-    xmn Mani CN\n\
-    xmr Merc SD\n\
-    xna Narb SA\n\
-    xnr Deva IN\n\
-    xog Latn UG\n\
-    xpr Prti IR\n\
-    xsa Sarb YE\n\
-    xsr Deva NP\n\
-    yao Latn MZ\n\
-    yap Latn FM\n\
-    yav Latn CM\n\
-    ybb Latn CM\n\
-    yi Hebr UA\n\
-    yo Latn NG\n\
-    yrl Latn BR\n\
-    yua Latn MX\n\
-    yue Hant HK\n\
-    za Latn CN\n\
-    zag Latn SD\n\
-    zdj Arab KM\n\
-    zea Latn NL\n\
-    zgh Tfng MA\n\
-    zh Hans CN\n\
-    zhx Nshu CN\n\
-    zkt Kits CN\n\
-    zlm Latn MY\n\
-    zmi Latn MY\n\
-    zu Latn ZA\n\
-    zza Latn TR\n\
-    aaa Latn NG\n\
-    aab Latn NG\n\
-    aac Latn PG\n\
-    aad Latn PG\n\
-    aae Latn IT\n\
-    aaf Mlym IN\n\
-    aag Latn PG\n\
-    aah Latn PG\n\
-    aai Latn PG\n\
-    aak Latn PG\n\
-    aal Latn CM\n\
-    aan Latn BR\n\
-    aao Arab DZ\n\
-    aap Latn BR\n\
-    aaq Latn US\n\
-    aas Latn TZ\n\
-    aat Grek GR\n\
-    aau Latn PG\n\
-    aaw Latn PG\n\
-    aax Latn ID\n\
-    aaz Latn ID\n\
-    aba Latn CI\n\
-    abb Latn CM\n\
-    abc Latn PH\n\
-    abd Latn PH\n\
-    abe Latn CA\n\
-    abf Latn MY\n\
-    abg Latn PG\n\
-    abh Arab TJ\n\
-    abi Latn CI\n\
-    abl Rjng ID\n\
-    abm Latn NG\n\
-    abn Latn NG\n\
-    abo Latn NG\n\
-    abp Latn PH\n\
-    abs Latn ID\n\
-    abt Latn PG\n\
-    abu Latn CI\n\
-    abv Arab BH\n\
-    abw Latn PG\n\
-    abx Latn PH\n\
-    aby Latn PG\n\
-    abz Latn ID\n\
-    aca Latn CO\n\
-    acb Latn NG\n\
-    acd Latn GH\n\
-    acf Latn LC\n\
-    acm Arab IQ\n\
-    acn Latn CN\n\
-    acp Latn NG\n\
-    acq Arab YE\n\
-    acr Latn GT\n\
-    acs Latn BR\n\
-    act Latn NL\n\
-    acu Latn EC\n\
-    acv Latn US\n\
-    acw Arab SA\n\
-    acx Arab OM\n\
-    acy Latn CY\n\
-    acz Latn SD\n\
-    adb Latn TL\n\
-    add Latn CM\n\
-    ade Latn TG\n\
-    adf Arab OM\n\
-    adg Latn AU\n\
-    adh Latn UG\n\
-    adi Latn IN\n\
-    adj Latn CI\n\
-    adl Latn IN\n\
-    adn Latn ID\n\
-    ado Latn PG\n\
-    adq Latn GH\n\
-    adr Latn ID\n\
-    adt Latn AU\n\
-    adu Latn NG\n\
-    adw Latn BR\n\
-    adx Tibt CN\n\
-    adz Latn PG\n\
-    aea Latn AU\n\
-    aec Arab EG\n\
-    aee Arab AF\n\
-    aek Latn NC\n\
-    ael Latn CM\n\
-    aem Latn VN\n\
-    aeq Arab PK\n\
-    aer Latn AU\n\
-    aeu Latn CN\n\
-    aew Latn PG\n\
-    aey Latn PG\n\
-    aez Latn PG\n\
-    afb Arab KW\n\
-    afd Latn PG\n\
-    afe Latn NG\n\
-    afh Latn GH\n\
-    afi Latn PG\n\
-    afk Latn PG\n\
-    afn Latn NG\n\
-    afo Latn NG\n\
-    afp Latn PG\n\
-    afs Latn MX\n\
-    afu Latn GH\n\
-    afz Latn ID\n\
-    aga Latn PE\n\
-    agb Latn NG\n\
-    agc Latn NG\n\
-    agd Latn PG\n\
-    age Latn PG\n\
-    agf Latn ID\n\
-    agg Latn PG\n\
-    agh Latn CD\n\
-    agi Deva IN\n\
-    agj Ethi ET\n\
-    agk Latn PH\n\
-    agl Latn PG\n\
-    agm Latn PG\n\
-    agn Latn PH\n\
-    ago Latn PG\n\
-    agr Latn PE\n\
-    ags Latn CM\n\
-    agt Latn PH\n\
-    agu Latn GT\n\
-    agv Latn PH\n\
-    agw Latn SB\n\
-    agx Cyrl RU\n\
-    agy Latn PH\n\
-    agz Latn PH\n\
-    aha Latn GH\n\
-    ahb Latn VU\n\
-    ahg Ethi ET\n\
-    ahh Latn ID\n\
-    ahi Latn CI\n\
-    ahk Latn MM\n\
-    ahl Latn TG\n\
-    ahm Latn CI\n\
-    ahn Latn NG\n\
-    ahp Latn CI\n\
-    ahr Deva IN\n\
-    ahs Latn NG\n\
-    aht Latn US\n\
-    aia Latn SB\n\
-    aib Arab CN\n\
-    aic Latn PG\n\
-    aid Latn AU\n\
-    aie Latn PG\n\
-    aif Latn PG\n\
-    aig Latn AG\n\
-    aii Syrc IQ\n\
-    aij Hebr IL\n\
-    aik Latn NG\n\
-    ail Latn PG\n\
-    aim Latn IN\n\
-    ain Kana JP\n\
-    aio Mymr IN\n\
-    aip Latn ID\n\
-    aiq Arab AF\n\
-    air Latn ID\n\
-    ait Latn BR\n\
-    aiw Latn ET\n\
-    aix Latn PG\n\
-    aiy Latn CF\n\
-    aja Latn SS\n\
-    ajg Latn BJ\n\
-    aji Latn NC\n\
-    ajn Latn AU\n\
-    ajw Latn NG\n\
-    ajz Latn IN\n\
-    akb Latn ID\n\
-    akc Latn ID\n\
-    akd Latn NG\n\
-    ake Latn GY\n\
-    akf Latn NG\n\
-    akg Latn ID\n\
-    akh Latn PG\n\
-    aki Latn PG\n\
-    akl Latn PH\n\
-    ako Latn SR\n\
-    akp Latn GH\n\
-    akq Latn PG\n\
-    akr Latn VU\n\
-    aks Latn TG\n\
-    akt Latn PG\n\
-    aku Latn CM\n\
-    akv Cyrl RU\n\
-    akw Latn CG\n\
-    akz Latn US\n\
-    ala Latn NG\n\
-    alc Latn CL\n\
-    ald Latn CI\n\
-    ale Latn US\n\
-    alf Latn NG\n\
-    alh Latn AU\n\
-    ali Latn PG\n\
-    alj Latn PH\n\
-    alk Laoo LA\n\
-    all Mlym IN\n\
-    alm Latn VU\n\
-    alo Latn ID\n\
-    alp Latn ID\n\
-    alq Latn CA\n\
-    alr Cyrl RU\n\
-    alu Latn SB\n\
-    alw Ethi ET\n\
-    alx Latn PG\n\
-    aly Latn AU\n\
-    alz Latn CD\n\
-    ama Latn BR\n\
-    amb Latn NG\n\
-    amc Latn PE\n\
-    ame Latn PE\n\
-    amf Latn ET\n\
-    amg Latn AU\n\
-    ami Latn TW\n\
-    amj Latn TD\n\
-    amk Latn ID\n\
-    amm Latn PG\n\
-    amn Latn PG\n\
-    amp Latn PG\n\
-    amq Latn ID\n\
-    amr Latn PE\n\
-    ams Jpan JP\n\
-    amt Latn PG\n\
-    amu Latn MX\n\
-    amv Latn ID\n\
-    amw Syrc SY\n\
-    amx Latn AU\n\
-    amy Latn AU\n\
-    amz Latn AU\n\
-    ana Latn CO\n\
-    anb Latn PE\n\
-    anc Latn NG\n\
-    and Latn ID\n\
-    ane Latn NC\n\
-    anf Latn GH\n\
-    ang Latn GB\n\
-    anh Latn PG\n\
-    ani Cyrl RU\n\
-    anj Latn PG\n\
-    ank Latn NG\n\
-    anl Latn MM\n\
-    anm Latn IN\n\
-    ano Latn CO\n\
-    anp Deva IN\n\
-    anq Deva IN\n\
-    anr Deva IN\n\
-    ans Latn CO\n\
-    ant Latn AU\n\
-    anu Ethi ET\n\
-    anv Latn CM\n\
-    anw Latn NG\n\
-    anx Latn PG\n\
-    any Latn CI\n\
-    anz Latn PG\n\
-    aoa Latn ST\n\
-    aob Latn PG\n\
-    aoc Latn VE\n\
-    aod Latn PG\n\
-    aoe Latn PG\n\
-    aof Latn PG\n\
-    aog Latn PG\n\
-    aoi Latn AU\n\
-    aoj Latn PG\n\
-    aok Latn NC\n\
-    aol Latn ID\n\
-    aom Latn PG\n\
-    aon Latn PG\n\
-    aor Latn VU\n\
-    aos Latn ID\n\
-    aot Beng BD\n\
-    aox Latn GY\n\
-    apb Latn SB\n\
-    ape Latn PG\n\
-    apf Latn PH\n\
-    apg Latn ID\n\
-    aph Deva NP\n\
-    api Latn BR\n\
-    apj Latn US\n\
-    apk Latn US\n\
-    apl Latn US\n\
-    apm Latn US\n\
-    apn Latn BR\n\
-    apo Latn PG\n\
-    app Latn VU\n\
-    apr Latn PG\n\
-    aps Latn PG\n\
-    apt Latn IN\n\
-    apu Latn BR\n\
-    apv Latn BR\n\
-    apw Latn US\n\
-    apx Latn ID\n\
-    apy Latn BR\n\
-    apz Latn PG\n\
-    aqc Cyrl RU\n\
-    aqd Latn ML\n\
-    aqg Latn NG\n\
-    aqk Latn NG\n\
-    aqm Latn ID\n\
-    aqn Latn PH\n\
-    aqr Latn NC\n\
-    aqt Latn PY\n\
-    aqz Latn BR\n\
-    ard Latn AU\n\
-    are Latn AU\n\
-    arh Latn CO\n\
-    ari Latn US\n\
-    arj Latn BR\n\
-    ark Latn BR\n\
-    arl Latn PE\n\
-    arp Latn US\n\
-    arr Latn BR\n\
-    aru Latn BR\n\
-    arw Latn SR\n\
-    arx Latn BR\n\
-    asb Latn CA\n\
-    asc Latn ID\n\
-    asg Latn NG\n\
-    ash Latn PE\n\
-    asi Latn ID\n\
-    asj Latn CM\n\
-    ask Arab AF\n\
-    asl Latn ID\n\
-    asn Latn BR\n\
-    aso Latn PG\n\
-    asr Deva IN\n\
-    ass Latn CM\n\
-    asu Latn BR\n\
-    asv Latn CD\n\
-    asx Latn PG\n\
-    asy Latn ID\n\
-    asz Latn ID\n\
-    ata Latn PG\n\
-    atb Latn CN\n\
-    atc Latn PE\n\
-    atd Latn PH\n\
-    ate Latn PG\n\
-    atg Latn NG\n\
-    ati Latn CI\n\
-    atk Latn PH\n\
-    atl Latn PH\n\
-    atm Latn PH\n\
-    atn Arab IR\n\
-    ato Latn CM\n\
-    atp Latn PH\n\
-    atq Latn ID\n\
-    atr Latn BR\n\
-    ats Latn US\n\
-    att Latn PH\n\
-    atu Latn SS\n\
-    atv Cyrl RU\n\
-    atw Latn US\n\
-    atx Latn BR\n\
-    aty Latn VU\n\
-    atz Latn PH\n\
-    aua Latn SB\n\
-    auc Latn EC\n\
-    aud Latn SB\n\
-    aug Latn BJ\n\
-    auh Latn ZM\n\
-    aui Latn PG\n\
-    auj Arab LY\n\
-    auk Latn PG\n\
-    aul Latn VU\n\
-    aum Latn NG\n\
-    aun Latn PG\n\
-    auo Latn NG\n\
-    aup Latn PG\n\
-    auq Latn ID\n\
-    aur Latn PG\n\
-    aut Latn PF\n\
-    auu Latn ID\n\
-    auw Latn ID\n\
-    auy Latn PG\n\
-    auz Arab UZ\n\
-    avb Latn PG\n\
-    avd Arab IR\n\
-    avi Latn CI\n\
-    avk Latn 001\n\
-    avl Arab EG\n\
-    avm Latn AU\n\
-    avn Latn GH\n\
-    avo Latn BR\n\
-    avs Latn PE\n\
-    avt Latn PG\n\
-    avu Latn SS\n\
-    avv Latn BR\n\
-    awb Latn PG\n\
-    awc Latn NG\n\
-    awe Latn BR\n\
-    awg Latn AU\n\
-    awh Latn ID\n\
-    awi Latn PG\n\
-    awk Latn AU\n\
-    awm Latn PG\n\
-    awn Ethi ET\n\
-    awo Latn NG\n\
-    awr Latn ID\n\
-    aws Latn ID\n\
-    awt Latn BR\n\
-    awu Latn ID\n\
-    awv Latn ID\n\
-    aww Latn PG\n\
-    awx Latn PG\n\
-    awy Latn ID\n\
-    axb Latn AR\n\
-    axe Latn AU\n\
-    axg Latn BR\n\
-    axk Latn CF\n\
-    axl Latn AU\n\
-    axm Armn AM\n\
-    axx Latn NC\n\
-    aya Latn PG\n\
-    ayb Latn BJ\n\
-    ayc Latn PE\n\
-    ayd Latn AU\n\
-    aye Latn NG\n\
-    ayg Latn TG\n\
-    ayh Arab YE\n\
-    ayi Latn NG\n\
-    ayk Latn NG\n\
-    ayl Arab LY\n\
-    ayn Arab YE\n\
-    ayo Latn PY\n\
-    ayp Arab IQ\n\
-    ayq Latn PG\n\
-    ays Latn PH\n\
-    ayt Latn PH\n\
-    ayu Latn NG\n\
-    ayz Latn ID\n\
-    azb Arab IR\n\
-    azd Latn MX\n\
-    azg Latn MX\n\
-    azm Latn MX\n\
-    azn Latn MX\n\
-    azo Latn CM\n\
-    azt Latn PH\n\
-    azz Latn MX\n\
-    baa Latn SB\n\
-    bab Latn GW\n\
-    bac Latn ID\n\
-    bae Latn VE\n\
-    baf Latn CM\n\
-    bag Latn CM\n\
-    bah Latn BS\n\
-    baj Latn ID\n\
-    bao Latn CO\n\
-    bau Latn NG\n\
-    bav Latn CM\n\
-    baw Latn CM\n\
-    bay Latn ID\n\
-    bba Latn BJ\n\
-    bbb Latn PG\n\
-    bbd Latn PG\n\
-    bbe Latn CD\n\
-    bbf Latn PG\n\
-    bbg Latn GA\n\
-    bbi Latn CM\n\
-    bbk Latn CM\n\
-    bbl Geor GE\n\
-    bbm Latn CD\n\
-    bbn Latn PG\n\
-    bbo Latn BF\n\
-    bbp Latn CF\n\
-    bbq Latn CM\n\
-    bbr Latn PG\n\
-    bbs Latn NG\n\
-    bbt Latn NG\n\
-    bbu Latn NG\n\
-    bbv Latn PG\n\
-    bbw Latn CM\n\
-    bbx Latn CM\n\
-    bby Latn CM\n\
-    bca Latn CN\n\
-    bcb Latn SN\n\
-    bcd Latn ID\n\
-    bce Latn CM\n\
-    bcf Latn PG\n\
-    bcg Latn GN\n\
-    bch Latn PG\n\
-    bcj Latn AU\n\
-    bck Latn AU\n\
-    bcm Latn PG\n\
-    bcn Latn NG\n\
-    bco Latn PG\n\
-    bcp Latn CD\n\
-    bcq Ethi ET\n\
-    bcr Latn CA\n\
-    bcs Latn NG\n\
-    bct Latn CD\n\
-    bcu Latn PG\n\
-    bcv Latn NG\n\
-    bcw Latn CM\n\
-    bcy Latn NG\n\
-    bcz Latn SN\n\
-    bda Latn SN\n\
-    bdb Latn ID\n\
-    bdc Latn CO\n\
-    bdd Latn PG\n\
-    bde Latn NG\n\
-    bdf Latn PG\n\
-    bdg Latn MY\n\
-    bdh Latn SS\n\
-    bdi Latn SD\n\
-    bdj Latn SS\n\
-    bdk Latn AZ\n\
-    bdl Latn ID\n\
-    bdm Latn TD\n\
-    bdn Latn CM\n\
-    bdo Latn TD\n\
-    bdp Latn TZ\n\
-    bdq Latn VN\n\
-    bdr Latn MY\n\
-    bds Latn TZ\n\
-    bdt Latn CF\n\
-    bdu Latn CM\n\
-    bdv Orya IN\n\
-    bdw Latn ID\n\
-    bdx Latn ID\n\
-    bdy Latn AU\n\
-    bdz Arab PK\n\
-    bea Latn CA\n\
-    beb Latn CM\n\
-    bec Latn CM\n\
-    bed Latn ID\n\
-    bee Deva IN\n\
-    bef Latn PG\n\
-    beh Latn BJ\n\
-    bei Latn ID\n\
-    bek Latn PG\n\
-    beo Latn PG\n\
-    bep Latn ID\n\
-    beq Latn CG\n\
-    bes Latn TD\n\
-    bet Latn CI\n\
-    beu Latn ID\n\
-    bev Latn CI\n\
-    bex Latn SS\n\
-    bey Latn PG\n\
-    bfa Latn SS\n\
-    bfb Deva IN\n\
-    bfc Latn CN\n\
-    bfe Latn ID\n\
-    bff Latn CF\n\
-    bfg Latn ID\n\
-    bfh Latn PG\n\
-    bfj Latn CM\n\
-    bfl Latn CF\n\
-    bfm Latn CM\n\
-    bfn Latn TL\n\
-    bfo Latn BF\n\
-    bfp Latn CM\n\
-    bfs Latn CN\n\
-    bfu Tibt IN\n\
-    bfw Orya IN\n\
-    bfx Latn PH\n\
-    bfz Deva IN\n\
-    bga Latn NG\n\
-    bgb Latn ID\n\
-    bgd Deva IN\n\
-    bgf Latn CM\n\
-    bgg Latn IN\n\
-    bgi Latn PH\n\
-    bgj Latn CM\n\
-    bgo Latn GN\n\
-    bgp Arab PK\n\
-    bgq Deva IN\n\
-    bgr Latn IN\n\
-    bgs Latn PH\n\
-    bgt Latn SB\n\
-    bgu Latn NG\n\
-    bgv Latn ID\n\
-    bgw Deva IN\n\
-    bgy Latn ID\n\
-    bgz Latn ID\n\
-    bha Deva IN\n\
-    bhc Latn ID\n\
-    bhd Deva IN\n\
-    bhe Arab PK\n\
-    bhf Latn PG\n\
-    bhg Latn PG\n\
-    bhh Cyrl IL\n\
-    bhj Deva NP\n\
-    bhl Latn PG\n\
-    bhm Arab OM\n\
-    bhn Syrc GE\n\
-    bhp Latn ID\n\
-    bhq Latn ID\n\
-    bhr Latn MG\n\
-    bhs Latn CM\n\
-    bht Deva IN\n\
-    bhu Deva IN\n\
-    bhv Latn ID\n\
-    bhw Latn ID\n\
-    bhy Latn CD\n\
-    bhz Latn ID\n\
-    bia Latn AU\n\
-    bib Latn BF\n\
-    bid Latn TD\n\
-    bie Latn PG\n\
-    bif Latn GW\n\
-    big Latn PG\n\
-    bil Latn NG\n\
-    bim Latn GH\n\
-    bio Latn PG\n\
-    bip Latn CD\n\
-    biq Latn PG\n\
-    bir Latn PG\n\
-    bit Latn PG\n\
-    biu Latn IN\n\
-    biv Latn GH\n\
-    biw Latn CM\n\
-    biy Deva IN\n\
-    biz Latn CD\n\
-    bja Latn CD\n\
-    bjb Latn AU\n\
-    bjc Latn PG\n\
-    bjf Syrc IL\n\
-    bjg Latn GW\n\
-    bjh Latn PG\n\
-    bji Latn ET\n\
-    bjk Latn PG\n\
-    bjl Latn PG\n\
-    bjm Arab IQ\n\
-    bjo Latn CF\n\
-    bjp Latn PG\n\
-    bjr Latn PG\n\
-    bjs Latn BB\n\
-    bju Latn CM\n\
-    bjv Latn TD\n\
-    bjw Latn CI\n\
-    bjx Latn PH\n\
-    bjy Latn AU\n\
-    bjz Latn PG\n\
-    bka Latn NG\n\
-    bkc Latn CM\n\
-    bkd Latn PH\n\
-    bkf Latn CD\n\
-    bkg Latn CF\n\
-    bkh Latn CM\n\
-    bki Latn VU\n\
-    bkj Latn CF\n\
-    bkk Tibt IN\n\
-    bkl Latn ID\n\
-    bkn Latn ID\n\
-    bko Latn CM\n\
-    bkp Latn CD\n\
-    bkq Latn BR\n\
-    bkr Latn ID\n\
-    bks Latn PH\n\
-    bkt Latn CD\n\
-    bkv Latn NG\n\
-    bkw Latn CG\n\
-    bkx Latn TL\n\
-    bky Latn NG\n\
-    bkz Latn ID\n\
-    blb Latn SB\n\
-    blc Latn CA\n\
-    bld Latn ID\n\
-    ble Latn GW\n\
-    blf Latn ID\n\
-    blh Latn LR\n\
-    bli Latn CD\n\
-    blj Latn ID\n\
-    blk Mymr MM\n\
-    blm Latn SS\n\
-    bln Latn PH\n\
-    blp Latn SB\n\
-    blq Latn PG\n\
-    blr Latn CN\n\
-    bls Latn ID\n\
-    blv Latn AO\n\
-    blw Latn PH\n\
-    blx Latn PH\n\
-    bly Latn BJ\n\
-    blz Latn ID\n\
-    bma Latn NG\n\
-    bmb Latn CD\n\
-    bmc Latn PG\n\
-    bmd Latn GN\n\
-    bme Latn CF\n\
-    bmf Latn SL\n\
-    bmg Latn CD\n\
-    bmh Latn PG\n\
-    bmi Latn TD\n\
-    bmj Deva NP\n\
-    bmk Latn PG\n\
-    bml Latn CD\n\
-    bmm Latn MG\n\
-    bmn Latn PG\n\
-    bmo Latn CM\n\
-    bmp Latn PG\n\
-    bmr Latn CO\n\
-    bms Latn NE\n\
-    bmu Latn PG\n\
-    bmv Latn CM\n\
-    bmw Latn CG\n\
-    bmx Latn PG\n\
-    bmz Latn PG\n\
-    bna Latn ID\n\
-    bnb Latn MY\n\
-    bnc Latn PH\n\
-    bnd Latn ID\n\
-    bne Latn ID\n\
-    bnf Latn ID\n\
-    bng Latn GQ\n\
-    bni Latn CD\n\
-    bnj Latn PH\n\
-    bnk Latn VU\n\
-    bnm Latn GQ\n\
-    bnn Latn TW\n\
-    bno Latn PH\n\
-    bnp Latn PG\n\
-    bnq Latn ID\n\
-    bnr Latn VU\n\
-    bns Deva IN\n\
-    bnu Latn ID\n\
-    bnv Latn ID\n\
-    bnw Latn PG\n\
-    bnx Latn CD\n\
-    bny Latn MY\n\
-    bnz Latn CM\n\
-    boa Latn PE\n\
-    bob Latn KE\n\
-    boe Latn CM\n\
-    bof Latn BF\n\
-    boh Latn CD\n\
-    boj Latn PG\n\
-    bok Latn CG\n\
-    bol Latn NG\n\
-    bom Latn NG\n\
-    bon Latn PG\n\
-    boo Latn ML\n\
-    bop Latn PG\n\
-    boq Latn PG\n\
-    bor Latn BR\n\
-    bot Latn SS\n\
-    bou Latn TZ\n\
-    bov Latn GH\n\
-    bow Latn PG\n\
-    box Latn BF\n\
-    boy Latn CF\n\
-    boz Latn ML\n\
-    bpa Latn VU\n\
-    bpc Latn CM\n\
-    bpd Latn CF\n\
-    bpe Latn PG\n\
-    bpg Latn ID\n\
-    bph Cyrl RU\n\
-    bpi Latn PG\n\
-    bpj Latn CD\n\
-    bpk Latn NC\n\
-    bpl Latn AU\n\
-    bpm Latn PG\n\
-    bpo Latn ID\n\
-    bpp Latn ID\n\
-    bpq Latn ID\n\
-    bpr Latn PH\n\
-    bps Latn PH\n\
-    bpt Latn AU\n\
-    bpu Latn PG\n\
-    bpv Latn ID\n\
-    bpw Latn PG\n\
-    bpx Deva IN\n\
-    bpz Latn ID\n\
-    bqa Latn BJ\n\
-    bqb Latn ID\n\
-    bqc Latn BJ\n\
-    bqd Latn CM\n\
-    bqf Latn GN\n\
-    bqg Latn TG\n\
-    bqj Latn SN\n\
-    bqk Latn CF\n\
-    bql Latn PG\n\
-    bqm Latn CM\n\
-    bqo Latn CM\n\
-    bqp Latn NG\n\
-    bqq Latn ID\n\
-    bqr Latn ID\n\
-    bqs Latn PG\n\
-    bqt Latn CM\n\
-    bqu Latn CD\n\
-    bqw Latn NG\n\
-    bqx Latn NG\n\
-    bqz Latn CM\n\
-    brb Khmr KH\n\
-    brc Latn GY\n\
-    brd Deva NP\n\
-    brf Latn CD\n\
-    brg Latn BO\n\
-    bri Latn CM\n\
-    brj Latn VU\n\
-    brk Arab SD\n\
-    brl Latn BW\n\
-    brm Latn CD\n\
-    brn Latn CR\n\
-    bro Tibt BT\n\
-    brp Latn ID\n\
-    brq Latn PG\n\
-    brr Latn SB\n\
-    brs Latn ID\n\
-    brt Latn NG\n\
-    bru Latn VN\n\
-    brv Laoo LA\n\
-    brw Knda IN\n\
-    bry Latn PG\n\
-    brz Latn PG\n\
-    bsa Latn ID\n\
-    bsb Latn BN\n\
-    bse Latn CM\n\
-    bsf Latn NG\n\
-    bsh Arab AF\n\
-    bsi Latn CM\n\
-    bsj Latn NG\n\
-    bsk Arab PK\n\
-    bsl Latn NG\n\
-    bsm Latn ID\n\
-    bsn Latn CO\n\
-    bso Latn TD\n\
-    bsp Latn GN\n\
-    bsr Latn NG\n\
-    bst Ethi ET\n\
-    bsu Latn ID\n\
-    bsv Latn GN\n\
-    bsw Latn ET\n\
-    bsx Latn NG\n\
-    bsy Latn MY\n\
-    bta Latn NG\n\
-    btc Latn CM\n\
-    btd Batk ID\n\
-    bte Latn NG\n\
-    btf Latn TD\n\
-    btg Latn CI\n\
-    bth Latn MY\n\
-    bti Latn ID\n\
-    btj Latn ID\n\
-    btm Batk ID\n\
-    btn Latn PH\n\
-    btp Latn PG\n\
-    btq Latn MY\n\
-    btr Latn VU\n\
-    bts Latn ID\n\
-    btt Latn NG\n\
-    btu Latn NG\n\
-    btw Latn PH\n\
-    btx Latn ID\n\
-    bty Latn ID\n\
-    btz Latn ID\n\
-    bub Latn TD\n\
-    bud Latn TG\n\
-    bue Latn CA\n\
-    buf Latn CD\n\
-    buh Latn CN\n\
-    bui Latn CG\n\
-    buj Latn NG\n\
-    buk Latn PG\n\
-    bun Latn SL\n\
-    buo Latn PG\n\
-    bup Latn ID\n\
-    buq Latn PG\n\
-    bus Latn NG\n\
-    but Latn PG\n\
-    buu Latn CD\n\
-    buv Latn PG\n\
-    buw Latn GA\n\
-    bux Latn NG\n\
-    buy Latn SL\n\
-    buz Latn NG\n\
-    bva Latn TD\n\
-    bvc Latn SB\n\
-    bvd Latn SB\n\
-    bve Latn ID\n\
-    bvf Latn TD\n\
-    bvg Latn CM\n\
-    bvh Latn NG\n\
-    bvi Latn SS\n\
-    bvj Latn NG\n\
-    bvk Latn ID\n\
-    bvm Latn CM\n\
-    bvn Latn PG\n\
-    bvo Latn TD\n\
-    bvq Latn CF\n\
-    bvr Latn AU\n\
-    bvt Latn ID\n\
-    bvu Latn ID\n\
-    bvv Latn VE\n\
-    bvw Latn NG\n\
-    bvx Latn CG\n\
-    bvy Latn PH\n\
-    bvz Latn ID\n\
-    bwa Latn NC\n\
-    bwb Latn FJ\n\
-    bwc Latn ZM\n\
-    bwd Latn PG\n\
-    bwe Mymr MM\n\
-    bwf Latn PG\n\
-    bwg Latn MZ\n\
-    bwh Latn CM\n\
-    bwi Latn VE\n\
-    bwj Latn BF\n\
-    bwk Latn PG\n\
-    bwl Latn CD\n\
-    bwm Latn PG\n\
-    bwo Latn ET\n\
-    bwp Latn ID\n\
-    bwq Latn BF\n\
-    bwr Latn NG\n\
-    bws Latn CD\n\
-    bwt Latn CM\n\
-    bwu Latn GH\n\
-    bww Latn CD\n\
-    bwx Latn CN\n\
-    bwy Latn BF\n\
-    bwz Latn CG\n\
-    bxa Latn SB\n\
-    bxb Latn SS\n\
-    bxc Latn GQ\n\
-    bxf Latn PG\n\
-    bxg Latn CD\n\
-    bxh Latn PG\n\
-    bxi Latn AU\n\
-    bxj Latn AU\n\
-    bxl Latn BF\n\
-    bxm Cyrl MN\n\
-    bxn Latn AU\n\
-    bxo Latn NG\n\
-    bxp Latn CM\n\
-    bxq Latn NG\n\
-    bxs Latn CM\n\
-    bxu Mong CN\n\
-    bxv Latn TD\n\
-    bxw Latn ML\n\
-    bxz Latn PG\n\
-    bya Latn PH\n\
-    byb Latn CM\n\
-    byc Latn NG\n\
-    byd Latn ID\n\
-    bye Latn PG\n\
-    byf Latn NG\n\
-    byh Deva NP\n\
-    byi Latn CD\n\
-    byj Latn NG\n\
-    byk Latn CN\n\
-    byl Latn ID\n\
-    bym Latn AU\n\
-    byp Latn NG\n\
-    byr Latn PG\n\
-    bys Latn NG\n\
-    byw Deva NP\n\
-    byx Latn PG\n\
-    byz Latn PG\n\
-    bza Latn LR\n\
-    bzb Latn ID\n\
-    bzc Latn MG\n\
-    bzd Latn CR\n\
-    bzf Latn PG\n\
-    bzh Latn PG\n\
-    bzi Thai TH\n\
-    bzj Latn BZ\n\
-    bzk Latn NI\n\
-    bzl Latn ID\n\
-    bzm Latn CD\n\
-    bzn Latn ID\n\
-    bzo Latn CD\n\
-    bzp Latn ID\n\
-    bzq Latn ID\n\
-    bzr Latn AU\n\
-    bzt Latn 001\n\
-    bzu Latn ID\n\
-    bzv Latn CM\n\
-    bzw Latn NG\n\
-    bzx Latn ML\n\
-    bzy Latn NG\n\
-    bzz Latn NG\n\
-    caa Latn GT\n\
-    cab Latn HN\n\
-    cac Latn GT\n\
-    cae Latn SN\n\
-    caf Latn CA\n\
-    cag Latn PY\n\
-    cah Latn PE\n\
-    caj Latn BO\n\
-    cak Latn GT\n\
-    cal Latn MP\n\
-    cam Latn NC\n\
-    can Latn PG\n\
-    cao Latn BO\n\
-    cap Latn BO\n\
-    caq Latn IN\n\
-    car Latn VE\n\
-    cas Latn BO\n\
-    cav Latn BO\n\
-    caw Latn BO\n\
-    cax Latn BO\n\
-    cay Latn CA\n\
-    caz Latn BO\n\
-    cbb Latn CO\n\
-    cbc Latn CO\n\
-    cbd Latn CO\n\
-    cbg Latn CO\n\
-    cbi Latn EC\n\
-    cbj Latn BJ\n\
-    cbk Latn PH\n\
-    cbl Latn MM\n\
-    cbn Thai TH\n\
-    cbo Latn NG\n\
-    cbq Latn NG\n\
-    cbr Latn PE\n\
-    cbs Latn PE\n\
-    cbt Latn PE\n\
-    cbu Latn PE\n\
-    cbv Latn CO\n\
-    cbw Latn PH\n\
-    cby Latn CO\n\
-    ccc Latn PE\n\
-    ccd Latn BR\n\
-    cce Latn MZ\n\
-    ccg Latn NG\n\
-    ccj Latn GW\n\
-    ccl Latn TZ\n\
-    ccm Latn MY\n\
-    cco Latn MX\n\
-    cde Telu IN\n\
-    cdf Latn IN\n\
-    cdh Deva IN\n\
-    cdi Gujr IN\n\
-    cdj Deva IN\n\
-    cdm Deva NP\n\
-    cdo Hans CN\n\
-    cdr Latn NG\n\
-    cdz Beng IN\n\
-    cea Latn US\n\
-    ceg Latn PY\n\
-    cek Latn MM\n\
-    cen Latn NG\n\
-    cet Latn NG\n\
-    cey Latn MM\n\
-    cfa Latn NG\n\
-    cfd Latn NG\n\
-    cfg Latn NG\n\
-    cfm Latn MM\n\
-    cga Latn PG\n\
-    cgc Latn PH\n\
-    cgk Tibt BT\n\
-    chb Latn CO\n\
-    chd Latn MX\n\
-    chf Latn MX\n\
-    chg Arab TM\n\
-    chh Latn US\n\
-    chj Latn MX\n\
-    chl Latn US\n\
-    chn Latn US\n\
-    chq Latn MX\n\
-    cht Latn PE\n\
-    chw Latn MZ\n\
-    chx Deva NP\n\
-    chy Latn US\n\
-    chz Latn MX\n\
-    cia Latn ID\n\
-    cib Latn BJ\n\
-    cie Latn NG\n\
-    cih Deva IN\n\
-    cim Latn IT\n\
-    cin Latn BR\n\
-    cip Latn MX\n\
-    cir Latn NC\n\
-    ciw Latn US\n\
-    ciy Latn VE\n\
-    cje Latn VN\n\
-    cjh Latn US\n\
-    cji Cyrl RU\n\
-    cjk Latn AO\n\
-    cjn Latn PG\n\
-    cjo Latn PE\n\
-    cjp Latn CR\n\
-    cjs Latn RU\n\
-    cjv Latn PG\n\
-    cjy Hans CN\n\
-    ckl Latn NG\n\
-    ckm Latn HR\n\
-    ckn Latn MM\n\
-    cko Latn GH\n\
-    ckq Latn TD\n\
-    ckr Latn PG\n\
-    cks Latn NC\n\
-    ckt Cyrl RU\n\
-    cku Latn US\n\
-    ckv Latn TW\n\
-    ckx Latn CM\n\
-    cky Latn NG\n\
-    ckz Latn GT\n\
-    cla Latn NG\n\
-    cle Latn MX\n\
-    clh Arab PK\n\
-    cli Latn GH\n\
-    clj Latn MM\n\
-    clk Latn IN\n\
-    cll Latn GH\n\
-    clm Latn US\n\
-    clo Latn MX\n\
-    clt Latn MM\n\
-    clu Latn PH\n\
-    clw Cyrl RU\n\
-    cly Latn MX\n\
-    cma Latn VN\n\
-    cme Latn BF\n\
-    cmi Latn CO\n\
-    cml Latn ID\n\
-    cmo Latn VN\n\
-    cmr Latn MM\n\
-    cms Latn IT\n\
-    cmt Latn ZA\n\
-    cna Tibt IN\n\
-    cnb Latn MM\n\
-    cnc Latn VN\n\
-    cng Latn CN\n\
-    cnh Latn MM\n\
-    cni Latn PE\n\
-    cnk Latn MM\n\
-    cnl Latn MX\n\
-    cnp Hans CN\n\
-    cnq Latn CM\n\
-    cns Latn ID\n\
-    cnt Latn MX\n\
-    cnw Latn MM\n\
-    cnx Latn GB\n\
-    coa Latn AU\n\
-    cob Latn MX\n\
-    coc Latn MX\n\
-    cod Latn PE\n\
-    coe Latn CO\n\
-    cof Latn EC\n\
-    cog Thai TH\n\
-    coh Latn KE\n\
-    coj Latn MX\n\
-    cok Latn MX\n\
-    col Latn US\n\
-    com Latn US\n\
-    coo Latn CA\n\
-    coq Latn US\n\
-    cot Latn PE\n\
-    cou Latn SN\n\
-    cox Latn PE\n\
-    coz Latn MX\n\
-    cpa Latn MX\n\
-    cpb Latn PE\n\
-    cpc Latn PE\n\
-    cpg Grek GR\n\
-    cpi Latn NR\n\
-    cpn Latn GH\n\
-    cpo Latn BF\n\
-    cpu Latn PE\n\
-    cpx Latn CN\n\
-    cpy Latn PE\n\
-    cqd Latn CN\n\
-    cra Latn ET\n\
-    crb Latn VC\n\
-    crc Latn VU\n\
-    crd Latn US\n\
-    crf Latn CO\n\
-    cri Latn ST\n\
-    crj Cans CA\n\
-    crm Cans CA\n\
-    crn Latn MX\n\
-    cro Latn US\n\
-    crq Latn AR\n\
-    crt Latn AR\n\
-    crv Latn IN\n\
-    crw Latn VN\n\
-    crx Latn CA\n\
-    cry Latn NG\n\
-    crz Latn US\n\
-    csa Latn MX\n\
-    csh Mymr MM\n\
-    csj Latn MM\n\
-    csk Latn SN\n\
-    csm Latn US\n\
-    cso Latn MX\n\
-    csp Hans CN\n\
-    css Latn US\n\
-    cst Latn US\n\
-    csv Latn MM\n\
-    csy Latn MM\n\
-    csz Latn US\n\
-    cta Latn MX\n\
-    ctc Latn US\n\
-    cte Latn MX\n\
-    ctg Beng BD\n\
-    cth Latn MM\n\
-    ctl Latn MX\n\
-    ctm Latn US\n\
-    ctn Deva NP\n\
-    cto Latn CO\n\
-    ctp Latn MX\n\
-    cts Latn PH\n\
-    ctt Taml IN\n\
-    ctu Latn MX\n\
-    cty Taml IN\n\
-    ctz Latn MX\n\
-    cua Latn VN\n\
-    cub Latn CO\n\
-    cuc Latn MX\n\
-    cuh Latn KE\n\
-    cui Latn CO\n\
-    cuj Latn PE\n\
-    cuk Latn PA\n\
-    cul Latn BR\n\
-    cuo Latn VE\n\
-    cup Latn US\n\
-    cut Latn MX\n\
-    cuu Lana CN\n\
-    cuv Latn CM\n\
-    cux Latn MX\n\
-    cuy Latn MX\n\
-    cvg Latn IN\n\
-    cvn Latn MX\n\
-    cwa Latn TZ\n\
-    cwb Latn MZ\n\
-    cwe Latn TZ\n\
-    cwg Latn MY\n\
-    cwt Latn SN\n\
-    cxh Latn NG\n\
-    cya Latn MX\n\
-    cyb Latn BO\n\
-    cyo Latn PH\n\
-    czh Hans CN\n\
-    czk Hebr CZ\n\
-    czn Latn MX\n\
-    czt Latn MM\n\
-    daa Latn TD\n\
-    dac Latn PG\n\
-    dad Latn PG\n\
-    dae Latn CM\n\
-    dag Latn GH\n\
-    dah Latn PG\n\
-    dai Latn TD\n\
-    daj Latn SD\n\
-    dal Latn KE\n\
-    dam Latn NG\n\
-    dao Latn MM\n\
-    daq Deva IN\n\
-    das Latn CI\n\
-    dau Latn TD\n\
-    daw Latn PH\n\
-    dax Latn AU\n\
-    daz Latn ID\n\
-    dba Latn ML\n\
-    dbb Latn NG\n\
-    dbd Latn NG\n\
-    dbe Latn ID\n\
-    dbf Latn ID\n\
-    dbg Latn ML\n\
-    dbi Latn NG\n\
-    dbj Latn MY\n\
-    dbl Latn AU\n\
-    dbm Latn NG\n\
-    dbn Latn ID\n\
-    dbo Latn NG\n\
-    dbp Latn NG\n\
-    dbq Latn CM\n\
-    dbt Latn ML\n\
-    dbu Latn ML\n\
-    dbv Latn NG\n\
-    dbw Latn ML\n\
-    dby Latn PG\n\
-    dcr Latn VI\n\
-    dda Latn AU\n\
-    ddd Latn SS\n\
-    dde Latn CG\n\
-    ddg Latn TL\n\
-    ddi Latn PG\n\
-    ddj Latn AU\n\
-    ddn Latn BJ\n\
-    ddo Cyrl RU\n\
-    ddr Latn AU\n\
-    dds Latn ML\n\
-    ddw Latn ID\n\
-    dec Latn SD\n\
-    ded Latn PG\n\
-    dee Latn LR\n\
-    def Arab IR\n\
-    deg Latn NG\n\
-    deh Arab PK\n\
-    dei Latn ID\n\
-    dek Latn CM\n\
-    del Latn US\n\
-    dem Latn ID\n\
-    deq Latn CF\n\
-    der Beng IN\n\
-    des Latn BR\n\
-    dev Latn PG\n\
-    dez Latn CD\n\
-    dga Latn GH\n\
-    dgb Latn ML\n\
-    dgc Latn PH\n\
-    dgd Latn BF\n\
-    dge Latn PG\n\
-    dgg Latn PG\n\
-    dgh Latn NG\n\
-    dgi Latn BF\n\
-    dgk Latn CF\n\
-    dgl Arab SD\n\
-    dgn Latn AU\n\
-    dgs Latn BF\n\
-    dgt Latn AU\n\
-    dgw Latn AU\n\
-    dgx Latn PG\n\
-    dgz Latn PG\n\
-    dhg Latn AU\n\
-    dhi Deva NP\n\
-    dhl Latn AU\n\
-    dhm Latn AO\n\
-    dhn Gujr IN\n\
-    dho Deva IN\n\
-    dhr Latn AU\n\
-    dhs Latn TZ\n\
-    dhu Latn AU\n\
-    dhv Latn NC\n\
-    dhw Deva NP\n\
-    dhx Latn AU\n\
-    dia Latn PG\n\
-    dib Latn SS\n\
-    dic Latn CI\n\
-    did Latn SS\n\
-    dif Latn AU\n\
-    dig Latn KE\n\
-    dih Latn MX\n\
-    dii Latn CM\n\
-    dij Latn ID\n\
-    dil Latn SD\n\
-    din Latn SS\n\
-    dio Latn NG\n\
-    dip Latn SS\n\
-    dir Latn NG\n\
-    dis Latn IN\n\
-    diu Latn NA\n\
-    diw Latn SS\n\
-    dix Latn VU\n\
-    diy Latn ID\n\
-    diz Latn CD\n\
-    dja Latn AU\n\
-    djb Latn AU\n\
-    djc Latn TD\n\
-    djd Latn AU\n\
-    djf Latn AU\n\
-    dji Latn AU\n\
-    djj Latn AU\n\
-    djk Latn SR\n\
-    djm Latn ML\n\
-    djn Latn AU\n\
-    djo Latn ID\n\
-    djr Latn AU\n\
-    dju Latn PG\n\
-    djw Latn AU\n\
-    dka Tibt BT\n\
-    dkg Latn NG\n\
-    dkk Latn ID\n\
-    dkr Latn MY\n\
-    dks Latn SS\n\
-    dkx Latn CM\n\
-    dlg Cyrl RU\n\
-    dlm Latn HR\n\
-    dln Latn IN\n\
-    dma Latn GA\n\
-    dmb Latn ML\n\
-    dmc Latn PG\n\
-    dmd Latn AU\n\
-    dme Latn CM\n\
-    dmg Latn MY\n\
-    dmk Arab PK\n\
-    dml Arab PK\n\
-    dmm Latn CM\n\
-    dmo Latn CM\n\
-    dmr Latn ID\n\
-    dms Latn ID\n\
-    dmu Latn ID\n\
-    dmv Latn MY\n\
-    dmw Latn AU\n\
-    dmx Latn MZ\n\
-    dmy Latn ID\n\
-    dna Latn ID\n\
-    dnd Latn PG\n\
-    dne Latn TZ\n\
-    dng Cyrl KG\n\
-    dni Latn ID\n\
-    dnk Latn ID\n\
-    dnn Latn BF\n\
-    dno Latn CD\n\
-    dnr Latn PG\n\
-    dnt Latn ID\n\
-    dnu Mymr MM\n\
-    dnv Mymr MM\n\
-    dnw Latn ID\n\
-    dny Latn BR\n\
-    doa Latn PG\n\
-    dob Latn PG\n\
-    doc Latn CN\n\
-    doe Latn TZ\n\
-    dof Latn PG\n\
-    doh Latn NG\n\
-    dok Latn ID\n\
-    dol Latn PG\n\
-    don Latn PG\n\
-    doo Latn CD\n\
-    dop Latn BJ\n\
-    dor Latn SB\n\
-    dos Latn BF\n\
-    dot Latn NG\n\
-    dov Latn ZW\n\
-    dow Latn CM\n\
-    dox Ethi ET\n\
-    doy Latn GH\n\
-    dpp Latn MY\n\
-    drc Latn PT\n\
-    dre Tibt NP\n\
-    drg Latn MY\n\
-    dri Latn NG\n\
-    drl Latn AU\n\
-    drn Latn ID\n\
-    dro Latn MY\n\
-    drq Deva NP\n\
-    drs Ethi ET\n\
-    drt Latn NL\n\
-    dru Latn TW\n\
-    dry Deva NP\n\
-    dsh Latn KE\n\
-    dsi Latn TD\n\
-    dsk Latn NG\n\
-    dsn Latn ID\n\
-    dso Orya IN\n\
-    dsq Latn ML\n\
-    dta Latn CN\n\
-    dtb Latn MY\n\
-    dtd Latn CA\n\
-    dth Latn AU\n\
-    dti Latn ML\n\
-    dtk Latn ML\n\
-    dto Latn ML\n\
-    dtr Latn MY\n\
-    dts Latn ML\n\
-    dtt Latn ML\n\
-    dtu Latn ML\n\
-    dub Gujr IN\n\
-    duc Latn PG\n\
-    due Latn PH\n\
-    duf Latn NC\n\
-    dug Latn KE\n\
-    duh Deva IN\n\
-    dui Latn PG\n\
-    duk Latn PG\n\
-    dul Latn PH\n\
-    dum Latn NL\n\
-    dun Latn ID\n\
-    duo Latn PH\n\
-    dup Latn ID\n\
-    duq Latn ID\n\
-    dur Latn CM\n\
-    dus Deva NP\n\
-    duu Latn CN\n\
-    duv Latn ID\n\
-    duw Latn ID\n\
-    dux Latn ML\n\
-    duy Latn PH\n\
-    duz Latn CM\n\
-    dva Latn PG\n\
-    dwa Latn NG\n\
-    dwk Orya IN\n\
-    dwr Latn ET\n\
-    dws Latn 001\n\
-    dwu Latn AU\n\
-    dww Latn PG\n\
-    dwy Latn AU\n\
-    dwz Deva NP\n\
-    dya Latn BF\n\
-    dyb Latn AU\n\
-    dyd Latn AU\n\
-    dyg Latn PH\n\
-    dyi Latn CI\n\
-    dym Latn ML\n\
-    dyn Latn AU\n\
-    dyr Latn NG\n\
-    dyy Latn AU\n\
-    dza Latn NG\n\
-    dzd Latn NG\n\
-    dze Latn AU\n\
-    dzg Latn TD\n\
-    dzl Tibt BT\n\
-    dzn Latn CD\n\
-    eaa Latn AU\n\
-    ebc Latn ID\n\
-    ebg Latn NG\n\
-    ebk Latn PH\n\
-    ebo Latn CG\n\
-    ebr Latn CI\n\
-    ecr Grek GR\n\
-    efa Latn NG\n\
-    efe Latn CD\n\
-    ega Latn CI\n\
-    egm Latn TZ\n\
-    ego Latn NG\n\
-    ehu Latn NG\n\
-    eip Latn ID\n\
-    eit Latn PG\n\
-    eiv Latn PG\n\
-    eja Latn GW\n\
-    eka Latn NG\n\
-    eke Latn NG\n\
-    ekg Latn ID\n\
-    eki Latn NG\n\
-    ekl Latn BD\n\
-    ekm Latn CM\n\
-    eko Latn MZ\n\
-    ekp Latn NG\n\
-    ekr Latn NG\n\
-    ele Latn PG\n\
-    elk Latn PG\n\
-    elm Latn NG\n\
-    elo Latn KE\n\
-    elu Latn PG\n\
-    ema Latn NG\n\
-    emb Latn ID\n\
-    eme Latn GF\n\
-    emg Deva NP\n\
-    emi Latn PG\n\
-    emm Latn MX\n\
-    emn Latn CM\n\
-    emp Latn PA\n\
-    ems Latn US\n\
-    emu Deva IN\n\
-    emw Latn ID\n\
-    emx Latn FR\n\
-    emz Latn CM\n\
-    ena Latn PG\n\
-    enb Latn KE\n\
-    enc Latn VN\n\
-    end Latn ID\n\
-    enf Cyrl RU\n\
-    enh Cyrl RU\n\
-    enl Latn PY\n\
-    enm Latn GB\n\
-    enn Latn NG\n\
-    eno Latn ID\n\
-    enq Latn PG\n\
-    enr Latn ID\n\
-    env Latn NG\n\
-    enw Latn NG\n\
-    enx Latn PY\n\
-    eot Latn CI\n\
-    epi Latn NG\n\
-    era Taml IN\n\
-    erg Latn VU\n\
-    erh Latn NG\n\
-    eri Latn PG\n\
-    erk Latn VU\n\
-    err Latn AU\n\
-    ers Latn CN\n\
-    ert Latn ID\n\
-    erw Latn ID\n\
-    ese Latn BO\n\
-    esh Arab IR\n\
-    esi Latn US\n\
-    esm Latn CI\n\
-    ess Latn US\n\
-    esy Latn PH\n\
-    etb Latn NG\n\
-    etn Latn VU\n\
-    eto Latn CM\n\
-    etr Latn PG\n\
-    ets Latn NG\n\
-    etu Latn NG\n\
-    etx Latn NG\n\
-    etz Latn ID\n\
-    eud Latn MX\n\
-    eve Cyrl RU\n\
-    evh Latn NG\n\
-    evn Cyrl RU\n\
-    eya Latn US\n\
-    eyo Latn KE\n\
-    eza Latn NG\n\
-    eze Latn NG\n\
-    faa Latn PG\n\
-    fab Latn GQ\n\
-    fad Latn PG\n\
-    faf Latn SB\n\
-    fag Latn PG\n\
-    fah Latn NG\n\
-    fai Latn PG\n\
-    faj Latn PG\n\
-    fak Latn CM\n\
-    fal Latn CM\n\
-    fam Latn NG\n\
-    fap Latn SN\n\
-    far Latn SB\n\
-    fau Latn ID\n\
-    fax Latn ES\n\
-    fay Arab IR\n\
-    faz Arab IR\n\
-    fer Latn SS\n\
-    ffi Latn PG\n\
-    fgr Latn TD\n\
-    fie Latn NG\n\
-    fif Latn SA\n\
-    fip Latn TZ\n\
-    fir Latn NG\n\
-    fiw Latn PG\n\
-    fkk Latn NG\n\
-    fkv Latn NO\n\
-    fla Latn US\n\
-    flh Latn ID\n\
-    fli Latn NG\n\
-    fll Latn CM\n\
-    fln Latn AU\n\
-    flr Latn CD\n\
-    fly Latn ZA\n\
-    fmp Latn CM\n\
-    fmu Deva IN\n\
-    fnb Latn VU\n\
-    fng Latn ZA\n\
-    fni Latn TD\n\
-    fod Latn BJ\n\
-    foi Latn PG\n\
-    fom Latn CD\n\
-    for Latn PG\n\
-    fos Latn TW\n\
-    fpe Latn GQ\n\
-    fqs Latn PG\n\
-    frd Latn ID\n\
-    frk Latn DE\n\
-    frm Latn FR\n\
-    fro Latn FR\n\
-    frq Latn PG\n\
-    frt Latn VU\n\
-    fue Latn BJ\n\
-    fuh Latn NE\n\
-    fui Latn TD\n\
-    fum Latn NG\n\
-    fun Latn BR\n\
-    fut Latn VU\n\
-    fuu Latn CD\n\
-    fuy Latn PG\n\
-    fwa Latn NC\n\
-    fwe Latn NA\n\
-    gab Latn TD\n\
-    gac Latn IN\n\
-    gad Latn PH\n\
-    gae Latn VE\n\
-    gaf Latn PG\n\
-    gah Latn PG\n\
-    gai Latn PG\n\
-    gaj Latn PG\n\
-    gak Latn ID\n\
-    gal Latn TL\n\
-    gam Latn PG\n\
-    gao Latn PG\n\
-    gap Latn PG\n\
-    gaq Orya IN\n\
-    gar Latn PG\n\
-    gas Gujr IN\n\
-    gat Latn PG\n\
-    gau Telu IN\n\
-    gaw Latn PG\n\
-    gax Latn ET\n\
-    gba Latn CF\n\
-    gbb Latn AU\n\
-    gbd Latn AU\n\
-    gbe Latn PG\n\
-    gbf Latn PG\n\
-    gbg Latn CF\n\
-    gbh Latn BJ\n\
-    gbi Latn ID\n\
-    gbj Orya IN\n\
-    gbk Deva IN\n\
-    gbl Gujr IN\n\
-    gbn Latn SS\n\
-    gbp Latn CF\n\
-    gbq Latn CF\n\
-    gbr Latn NG\n\
-    gbs Latn BJ\n\
-    gbu Latn AU\n\
-    gbv Latn CF\n\
-    gbw Latn AU\n\
-    gbx Latn BJ\n\
-    gby Latn NG\n\
-    gcc Latn PG\n\
-    gcd Latn AU\n\
-    gcf Latn GP\n\
-    gcl Latn GD\n\
-    gcn Latn PG\n\
-    gct Latn VE\n\
-    gdb Orya IN\n\
-    gdc Latn AU\n\
-    gdd Latn PG\n\
-    gde Latn NG\n\
-    gdf Latn NG\n\
-    gdg Latn PH\n\
-    gdh Latn AU\n\
-    gdi Latn CF\n\
-    gdj Latn AU\n\
-    gdk Latn TD\n\
-    gdl Latn ET\n\
-    gdm Latn TD\n\
-    gdn Latn PG\n\
-    gdo Cyrl RU\n\
-    gdq Latn YE\n\
-    gdr Latn PG\n\
-    gdt Latn AU\n\
-    gdu Latn NG\n\
-    gdx Deva IN\n\
-    gea Latn NG\n\
-    geb Latn PG\n\
-    gec Latn LR\n\
-    ged Latn NG\n\
-    gef Latn ID\n\
-    geg Latn NG\n\
-    geh Latn CA\n\
-    gei Latn ID\n\
-    gej Latn TG\n\
-    gek Latn NG\n\
-    gel Latn NG\n\
-    geq Latn CF\n\
-    ges Latn ID\n\
-    gev Latn GA\n\
-    gew Latn NG\n\
-    gex Latn SO\n\
-    gey Latn CD\n\
-    gfk Latn PG\n\
-    gga Latn SB\n\
-    ggb Latn LR\n\
-    ggd Latn AU\n\
-    gge Latn AU\n\
-    ggg Arab PK\n\
-    ggk Latn AU\n\
-    ggl Latn PG\n\
-    ggt Latn PG\n\
-    ggu Latn CI\n\
-    ggw Latn PG\n\
-    gha Arab LY\n\
-    ghc Latn GB\n\
-    ghe Deva NP\n\
-    ghk Latn MM\n\
-    ghn Latn SB\n\
-    gho Tfng MA\n\
-    ghr Arab PK\n\
-    ghs Latn PG\n\
-    ght Tibt NP\n\
-    gia Latn AU\n\
-    gib Latn NG\n\
-    gic Latn ZA\n\
-    gid Latn CM\n\
-    gie Latn CI\n\
-    gig Arab PK\n\
-    gih Latn AU\n\
-    gim Latn PG\n\
-    gin Cyrl RU\n\
-    gip Latn PG\n\
-    giq Latn VN\n\
-    gir Latn VN\n\
-    gis Latn CM\n\
-    git Latn CA\n\
-    gix Latn CD\n\
-    giy Latn AU\n\
-    giz Latn CM\n\
-    gjm Latn AU\n\
-    gjn Latn GH\n\
-    gjr Latn AU\n\
-    gka Latn PG\n\
-    gkd Latn PG\n\
-    gke Latn CM\n\
-    gkn Latn NG\n\
-    gko Latn AU\n\
-    gkp Latn GN\n\
-    gku Latn ZA\n\
-    glb Latn NG\n\
-    glc Latn TD\n\
-    gld Cyrl RU\n\
-    glh Arab AF\n\
-    glj Latn TD\n\
-    gll Latn AU\n\
-    glo Latn NG\n\
-    glr Latn LR\n\
-    glu Latn TD\n\
-    glw Latn NG\n\
-    gma Latn AU\n\
-    gmb Latn SB\n\
-    gmd Latn NG\n\
-    gmg Latn PG\n\
-    gmh Latn DE\n\
-    gml Latf DE\n\
-    gmm Latn CM\n\
-    gmn Latn CM\n\
-    gmr Latn AU\n\
-    gmu Latn PG\n\
-    gmv Ethi ET\n\
-    gmx Latn TZ\n\
-    gmz Latn NG\n\
-    gna Latn BF\n\
-    gnb Latn IN\n\
-    gnc Latn ES\n\
-    gnd Latn CM\n\
-    gne Latn NG\n\
-    gng Latn TG\n\
-    gnh Latn NG\n\
-    gni Latn AU\n\
-    gnj Latn CI\n\
-    gnk Latn BW\n\
-    gnl Latn AU\n\
-    gnm Latn PG\n\
-    gnn Latn AU\n\
-    gnq Latn MY\n\
-    gnr Latn AU\n\
-    gnt Latn PG\n\
-    gnu Latn PG\n\
-    gnw Latn BO\n\
-    gnz Latn CF\n\
-    goa Latn CI\n\
-    gob Latn CO\n\
-    goc Latn PG\n\
-    god Latn CI\n\
-    goe Tibt BT\n\
-    gof Ethi ET\n\
-    gog Latn TZ\n\
-    goh Latn DE\n\
-    goi Latn PG\n\
-    goj Deva IN\n\
-    gok Deva IN\n\
-    gol Latn LR\n\
-    goo Latn FJ\n\
-    gop Latn ID\n\
-    goq Latn ID\n\
-    gou Latn CM\n\
-    gov Latn CI\n\
-    gow Latn TZ\n\
-    gox Latn CD\n\
-    goy Latn TD\n\
-    gpa Latn NG\n\
-    gpe Latn GH\n\
-    gpn Latn PG\n\
-    gqa Latn NG\n\
-    gqn Latn BR\n\
-    gqr Latn TD\n\
-    gra Deva IN\n\
-    grb Latn LR\n\
-    grd Latn NG\n\
-    grg Latn PG\n\
-    grh Latn NG\n\
-    gri Latn SB\n\
-    grj Latn LR\n\
-    grm Latn MY\n\
-    grq Latn PG\n\
-    grs Latn ID\n\
-    gru Ethi ET\n\
-    grv Latn LR\n\
-    grw Latn PG\n\
-    grx Latn PG\n\
-    gry Latn LR\n\
-    grz Latn PG\n\
-    gsl Latn SN\n\
-    gsn Latn PG\n\
-    gso Latn CF\n\
-    gsp Latn PG\n\
-    gta Latn BR\n\
-    gtu Latn AU\n\
-    gua Latn NG\n\
-    gud Latn CI\n\
-    gue Latn AU\n\
-    guf Latn AU\n\
-    guh Latn CO\n\
-    gui Latn BO\n\
-    guk Latn ET\n\
-    gul Latn US\n\
-    gum Latn CO\n\
-    gun Latn BR\n\
-    guo Latn CO\n\
-    gup Latn AU\n\
-    guq Latn PY\n\
-    gut Latn CR\n\
-    guu Latn VE\n\
-    guw Latn BJ\n\
-    gux Latn BF\n\
-    gva Latn PY\n\
-    gvc Latn BR\n\
-    gve Latn PG\n\
-    gvf Latn PG\n\
-    gvj Latn BR\n\
-    gvl Latn TD\n\
-    gvm Latn NG\n\
-    gvn Latn AU\n\
-    gvo Latn BR\n\
-    gvp Latn BR\n\
-    gvs Latn PG\n\
-    gvy Latn AU\n\
-    gwa Latn CI\n\
-    gwb Latn NG\n\
-    gwc Arab PK\n\
-    gwd Latn ET\n\
-    gwe Latn TZ\n\
-    gwf Arab PK\n\
-    gwg Latn NG\n\
-    gwj Latn BW\n\
-    gwm Latn AU\n\
-    gwn Latn NG\n\
-    gwr Latn UG\n\
-    gwt Arab AF\n\
-    gwu Latn AU\n\
-    gww Latn AU\n\
-    gwx Latn GH\n\
-    gxx Latn CI\n\
-    gyb Latn PG\n\
-    gyd Latn AU\n\
-    gye Latn NG\n\
-    gyf Latn AU\n\
-    gyg Latn CF\n\
-    gyi Latn CM\n\
-    gyl Latn ET\n\
-    gym Latn PA\n\
-    gyn Latn GY\n\
-    gyo Deva NP\n\
-    gyr Latn BO\n\
-    gyy Latn AU\n\
-    gyz Latn NG\n\
-    gza Latn SD\n\
-    gzi Arab IR\n\
-    gzn Latn ID\n\
-    haa Latn US\n\
-    hac Arab IR\n\
-    had Latn ID\n\
-    hae Latn ET\n\
-    hag Latn GH\n\
-    hah Latn PG\n\
-    hai Latn CA\n\
-    haj Latn IN\n\
-    hal Latn VN\n\
-    ham Latn PG\n\
-    han Latn TZ\n\
-    hao Latn PG\n\
-    hap Latn ID\n\
-    haq Latn TZ\n\
-    har Ethi ET\n\
-    has Latn CA\n\
-    hav Latn CD\n\
-    hax Latn CA\n\
-    hay Latn TZ\n\
-    hba Latn CD\n\
-    hbb Latn NG\n\
-    hbn Latn SD\n\
-    hbo Hebr IL\n\
-    hbu Latn TL\n\
-    hch Latn MX\n\
-    hdy Ethi ET\n\
-    hed Latn TD\n\
-    heg Latn ID\n\
-    heh Latn TZ\n\
-    hei Latn CA\n\
-    hem Latn CD\n\
-    hgm Latn NA\n\
-    hgw Latn PG\n\
-    hhi Latn PG\n\
-    hhr Latn SN\n\
-    hhy Latn PG\n\
-    hia Latn NG\n\
-    hib Latn PE\n\
-    hid Latn US\n\
-    hig Latn NG\n\
-    hih Latn PG\n\
-    hii Takr IN\n\
-    hij Latn CM\n\
-    hik Latn ID\n\
-    hio Latn BW\n\
-    hir Latn BR\n\
-    hit Xsux TR\n\
-    hiw Latn VU\n\
-    hix Latn BR\n\
-    hji Latn ID\n\
-    hka Latn TZ\n\
-    hke Latn CD\n\
-    hkh Arab IN\n\
-    hkk Latn PG\n\
-    hla Latn PG\n\
-    hlb Deva IN\n\
-    hld Latn VN\n\
-    hlt Latn MM\n\
-    hma Latn CN\n\
-    hmb Latn ML\n\
-    hmf Latn VN\n\
-    hmj Bopo CN\n\
-    hmm Latn CN\n\
-    hmn Latn CN\n\
-    hmp Latn CN\n\
-    hmq Bopo CN\n\
-    hmr Latn IN\n\
-    hms Latn CN\n\
-    hmt Latn PG\n\
-    hmu Latn ID\n\
-    hmv Latn VN\n\
-    hmw Latn CN\n\
-    hmy Latn CN\n\
-    hmz Latn CN\n\
-    hna Latn CM\n\
-    hng Latn AO\n\
-    hnh Latn BW\n\
-    hni Latn CN\n\
-    hns Latn SR\n\
-    hoa Latn SB\n\
-    hob Latn PG\n\
-    hod Latn NG\n\
-    hoe Latn NG\n\
-    hoh Arab OM\n\
-    hoi Latn US\n\
-    hol Latn AO\n\
-    hom Latn SS\n\
-    hoo Latn CD\n\
-    hop Latn US\n\
-    hor Latn TD\n\
-    hot Latn PG\n\
-    hov Latn ID\n\
-    how Hani CN\n\
-    hoy Deva IN\n\
-    hpo Mymr MM\n\
-    hra Latn IN\n\
-    hrc Latn PG\n\
-    hre Latn VN\n\
-    hrk Latn ID\n\
-    hrm Latn CN\n\
-    hro Latn VN\n\
-    hrp Latn AU\n\
-    hrt Syrc TR\n\
-    hru Latn IN\n\
-    hrw Latn PG\n\
-    hrx Latn BR\n\
-    hrz Arab IR\n\
-    hss Arab OM\n\
-    hti Latn ID\n\
-    hto Latn CO\n\
-    hts Latn TZ\n\
-    htu Latn ID\n\
-    htx Xsux TR\n\
-    hub Latn PE\n\
-    huc Latn BW\n\
-    hud Latn ID\n\
-    hue Latn MX\n\
-    huf Latn PG\n\
-    hug Latn PE\n\
-    huh Latn CL\n\
-    hui Latn PG\n\
-    huk Latn ID\n\
-    hul Latn PG\n\
-    hum Latn CD\n\
-    hup Latn US\n\
-    hus Latn MX\n\
-    hut Deva NP\n\
-    huu Latn PE\n\
-    huv Latn MX\n\
-    huw Latn ID\n\
-    hux Latn PE\n\
-    huy Hebr IL\n\
-    huz Cyrl RU\n\
-    hvc Latn HT\n\
-    hve Latn MX\n\
-    hvk Latn NC\n\
-    hvn Latn ID\n\
-    hvv Latn MX\n\
-    hwa Latn CI\n\
-    hwc Latn US\n\
-    hwo Latn NG\n\
-    hya Latn CM\n\
-    hyw Armn AM\n\
-    iai Latn NC\n\
-    ian Latn PG\n\
-    iar Latn PG\n\
-    ibd Latn AU\n\
-    ibe Latn NG\n\
-    ibg Latn PH\n\
-    ibh Latn VN\n\
-    ibl Latn PH\n\
-    ibm Latn NG\n\
-    ibn Latn NG\n\
-    ibr Latn NG\n\
-    ibu Latn ID\n\
-    iby Latn NG\n\
-    ica Latn BJ\n\
-    ich Latn NG\n\
-    icr Latn CO\n\
-    ida Latn KE\n\
-    idb Latn IN\n\
-    idc Latn NG\n\
-    idd Latn BJ\n\
-    ide Latn NG\n\
-    idi Latn PG\n\
-    idr Latn SS\n\
-    ids Latn NG\n\
-    idt Latn TL\n\
-    idu Latn NG\n\
-    ifa Latn PH\n\
-    ifb Latn PH\n\
-    iff Latn VU\n\
-    ifk Latn PH\n\
-    ifm Latn CG\n\
-    ifu Latn PH\n\
-    ify Latn PH\n\
-    igb Latn NG\n\
-    ige Latn NG\n\
-    igg Latn PG\n\
-    igl Latn NG\n\
-    igm Latn PG\n\
-    ign Latn BO\n\
-    igo Latn PG\n\
-    igs Latn 001\n\
-    igw Latn NG\n\
-    ihb Latn ID\n\
-    ihi Latn NG\n\
-    ihp Latn ID\n\
-    ihw Latn AU\n\
-    iin Latn AU\n\
-    ijc Latn NG\n\
-    ije Latn NG\n\
-    ijj Latn BJ\n\
-    ijn Latn NG\n\
-    ijs Latn NG\n\
-    ikh Latn NG\n\
-    iki Latn NG\n\
-    ikk Latn NG\n\
-    ikl Latn NG\n\
-    iko Latn NG\n\
-    ikp Latn NG\n\
-    ikr Latn AU\n\
-    ikt Latn CA\n\
-    ikv Latn NG\n\
-    ikw Latn NG\n\
-    ikx Latn UG\n\
-    ikz Latn TZ\n\
-    ila Latn ID\n\
-    ilb Latn ZM\n\
-    ilg Latn AU\n\
-    ili Latn CN\n\
-    ilk Latn PH\n\
-    ilm Latn MY\n\
-    ilp Latn PH\n\
-    ilu Latn ID\n\
-    ilv Latn NG\n\
-    imi Latn PG\n\
-    iml Latn US\n\
-    imn Latn PG\n\
-    imo Latn PG\n\
-    imr Latn ID\n\
-    ims Latn IT\n\
-    imt Latn SS\n\
-    imy Lyci TR\n\
-    inb Latn CO\n\
-    ing Latn US\n\
-    inj Latn CO\n\
-    inn Latn PH\n\
-    ino Latn PG\n\
-    inp Latn PE\n\
-    int Mymr MM\n\
-    ior Ethi ET\n\
-    iou Latn PG\n\
-    iow Latn US\n\
-    ipi Latn PG\n\
-    ipo Latn PG\n\
-    iqu Latn PE\n\
-    iqw Latn NG\n\
-    ire Latn ID\n\
-    irh Latn ID\n\
-    iri Latn NG\n\
-    irk Latn TZ\n\
-    irn Latn BR\n\
-    iru Taml IN\n\
-    irx Latn ID\n\
-    iry Latn PH\n\
-    isa Latn PG\n\
-    isc Latn PE\n\
-    isd Latn PH\n\
-    ish Latn NG\n\
-    isi Latn NG\n\
-    isk Arab AF\n\
-    ism Latn ID\n\
-    isn Latn TZ\n\
-    iso Latn NG\n\
-    ist Latn HR\n\
-    isu Latn CM\n\
-    itb Latn PH\n\
-    itd Latn ID\n\
-    ite Latn BO\n\
-    iti Latn PH\n\
-    itk Hebr IT\n\
-    itl Cyrl RU\n\
-    itm Latn NG\n\
-    ito Latn BO\n\
-    itr Latn PG\n\
-    its Latn NG\n\
-    itt Latn PH\n\
-    itv Latn PH\n\
-    itw Latn NG\n\
-    itx Latn ID\n\
-    ity Latn PH\n\
-    itz Latn GT\n\
-    ium Latn CN\n\
-    ivb Latn PH\n\
-    ivv Latn PH\n\
-    iwk Latn PH\n\
-    iwm Latn PG\n\
-    iwo Latn ID\n\
-    iws Latn PG\n\
-    ixc Latn MX\n\
-    ixl Latn GT\n\
-    iya Latn NG\n\
-    iyo Latn CM\n\
-    iyx Latn CG\n\
-    izm Latn NG\n\
-    izr Latn NG\n\
-    izz Latn NG\n\
-    jaa Latn BR\n\
-    jab Latn NG\n\
-    jac Latn GT\n\
-    jad Arab GN\n\
-    jae Latn PG\n\
-    jaf Latn NG\n\
-    jah Latn MY\n\
-    jaj Latn SB\n\
-    jak Latn MY\n\
-    jal Latn ID\n\
-    jan Latn AU\n\
-    jao Latn AU\n\
-    jaq Latn ID\n\
-    jas Latn NC\n\
-    jat Arab AF\n\
-    jau Latn ID\n\
-    jax Latn ID\n\
-    jay Latn AU\n\
-    jaz Latn NC\n\
-    jbe Hebr IL\n\
-    jbi Latn AU\n\
-    jbj Latn ID\n\
-    jbk Latn PG\n\
-    jbm Latn NG\n\
-    jbn Arab LY\n\
-    jbr Latn ID\n\
-    jbt Latn BR\n\
-    jbu Latn CM\n\
-    jbw Latn AU\n\
-    jct Cyrl UA\n\
-    jda Tibt IN\n\
-    jdg Arab PK\n\
-    jdt Cyrl RU\n\
-    jeb Latn PE\n\
-    jee Deva NP\n\
-    jeh Latn VN\n\
-    jei Latn ID\n\
-    jek Latn CI\n\
-    jel Latn ID\n\
-    jen Latn NG\n\
-    jer Latn NG\n\
-    jet Latn PG\n\
-    jeu Latn TD\n\
-    jgb Latn CD\n\
-    jge Geor GE\n\
-    jgk Latn NG\n\
-    jhi Latn MY\n\
-    jia Latn CM\n\
-    jib Latn NG\n\
-    jic Latn HN\n\
-    jid Latn NG\n\
-    jie Latn NG\n\
-    jig Latn AU\n\
-    jil Latn PG\n\
-    jim Latn CM\n\
-    jit Latn TZ\n\
-    jiu Latn CN\n\
-    jiv Latn EC\n\
-    jiy Latn CN\n\
-    jje Hang KR\n\
-    jjr Latn NG\n\
-    jka Latn ID\n\
-    jkm Mymr MM\n\
-    jko Latn PG\n\
-    jku Latn NG\n\
-    jle Latn SD\n\
-    jma Latn PG\n\
-    jmb Latn NG\n\
-    jmd Latn ID\n\
-    jmi Latn NG\n\
-    jmn Latn MM\n\
-    jmr Latn GH\n\
-    jms Latn NG\n\
-    jmw Latn PG\n\
-    jmx Latn MX\n\
-    jna Takr IN\n\
-    jnd Arab PK\n\
-    jng Latn AU\n\
-    jni Latn NG\n\
-    jnj Latn ET\n\
-    jnl Deva IN\n\
-    jns Deva IN\n\
-    job Latn CD\n\
-    jod Latn CI\n\
-    jog Arab PK\n\
-    jor Latn BO\n\
-    jow Latn ML\n\
-    jpa Hebr PS\n\
-    jpr Hebr IL\n\
-    jqr Latn PE\n\
-    jra Latn VN\n\
-    jrb Hebr IL\n\
-    jrr Latn NG\n\
-    jrt Latn NG\n\
-    jru Latn VE\n\
-    jua Latn BR\n\
-    jub Latn NG\n\
-    jud Latn CI\n\
-    juh Latn NG\n\
-    jui Latn AU\n\
-    juk Latn NG\n\
-    jul Deva NP\n\
-    jum Latn SD\n\
-    jun Orya IN\n\
-    juo Latn NG\n\
-    jup Latn BR\n\
-    jur Latn BR\n\
-    juu Latn NG\n\
-    juw Latn NG\n\
-    juy Orya IN\n\
-    jvd Latn ID\n\
-    jvn Latn SR\n\
-    jwi Latn GH\n\
-    jya Tibt CN\n\
-    jye Hebr IL\n\
-    jyy Latn TD\n\
-    kad Latn NG\n\
-    kag Latn MY\n\
-    kah Latn CF\n\
-    kai Latn NG\n\
-    kak Latn PH\n\
-    kap Cyrl RU\n\
-    kaq Latn PE\n\
-    kav Latn BR\n\
-    kax Latn ID\n\
-    kay Latn BR\n\
-    kba Latn AU\n\
-    kbb Latn BR\n\
-    kbc Latn BR\n\
-    kbe Latn AU\n\
-    kbg Tibt IN\n\
-    kbh Latn CO\n\
-    kbi Latn ID\n\
-    kbj Latn CD\n\
-    kbk Latn PG\n\
-    kbl Latn TD\n\
-    kbm Latn PG\n\
-    kbn Latn CF\n\
-    kbo Latn SS\n\
-    kbp Latn TG\n\
-    kbq Latn PG\n\
-    kbr Latn ET\n\
-    kbs Latn GA\n\
-    kbt Latn PG\n\
-    kbu Arab PK\n\
-    kbv Latn ID\n\
-    kbw Latn PG\n\
-    kbx Latn PG\n\
-    kbz Latn NG\n\
-    kca Cyrl RU\n\
-    kcb Latn PG\n\
-    kcc Latn NG\n\
-    kcd Latn ID\n\
-    kce Latn NG\n\
-    kcf Latn NG\n\
-    kch Latn NG\n\
-    kci Latn NG\n\
-    kcj Latn GW\n\
-    kcl Latn PG\n\
-    kcm Latn CF\n\
-    kcn Latn UG\n\
-    kco Latn PG\n\
-    kcp Latn SD\n\
-    kcq Latn NG\n\
-    kcs Latn NG\n\
-    kct Latn PG\n\
-    kcu Latn TZ\n\
-    kcv Latn CD\n\
-    kcw Latn CD\n\
-    kcy Arab DZ\n\
-    kcz Latn TZ\n\
-    kda Latn AU\n\
-    kdc Latn TZ\n\
-    kdd Latn AU\n\
-    kdf Latn PG\n\
-    kdg Latn CD\n\
-    kdi Latn UG\n\
-    kdj Latn UG\n\
-    kdk Latn NC\n\
-    kdl Latn NG\n\
-    kdm Latn NG\n\
-    kdn Latn ZW\n\
-    kdp Latn NG\n\
-    kdq Beng IN\n\
-    kdr Latn LT\n\
-    kdw Latn ID\n\
-    kdx Latn NG\n\
-    kdy Latn ID\n\
-    kdz Latn CM\n\
-    keb Latn GA\n\
-    kec Latn SD\n\
-    ked Latn TZ\n\
-    kee Latn US\n\
-    kef Latn TG\n\
-    keg Latn SD\n\
-    keh Latn PG\n\
-    kei Latn ID\n\
-    kek Latn GT\n\
-    kel Latn CD\n\
-    kem Latn TL\n\
-    keo Latn UG\n\
-    ker Latn TD\n\
-    kes Latn NG\n\
-    ket Cyrl RU\n\
-    keu Latn TG\n\
-    kev Mlym IN\n\
-    kew Latn PG\n\
-    kex Deva IN\n\
-    key Telu IN\n\
-    kez Latn NG\n\
-    kfa Knda IN\n\
-    kfb Deva IN\n\
-    kfc Telu IN\n\
-    kfd Knda IN\n\
-    kfe Taml IN\n\
-    kff Latn IN\n\
-    kfg Knda IN\n\
-    kfh Mlym IN\n\
-    kfi Taml IN\n\
-    kfk Deva IN\n\
-    kfl Latn CM\n\
-    kfm Arab IR\n\
-    kfn Latn CM\n\
-    kfp Deva IN\n\
-    kfq Deva IN\n\
-    kfs Deva IN\n\
-    kfu Deva IN\n\
-    kfv Latn IN\n\
-    kfw Latn IN\n\
-    kfx Deva IN\n\
-    kfz Latn BF\n\
-    kga Latn CI\n\
-    kgb Latn ID\n\
-    kgf Latn PG\n\
-    kgj Deva NP\n\
-    kgk Latn BR\n\
-    kgl Latn AU\n\
-    kgo Latn SD\n\
-    kgq Latn ID\n\
-    kgr Latn ID\n\
-    kgs Latn AU\n\
-    kgt Latn NG\n\
-    kgu Latn PG\n\
-    kgv Latn ID\n\
-    kgw Latn ID\n\
-    kgx Latn ID\n\
-    kgy Deva NP\n\
-    khc Latn ID\n\
-    khd Latn ID\n\
-    khe Latn ID\n\
-    khf Thai LA\n\
-    khg Tibt CN\n\
-    khh Latn ID\n\
-    khj Latn NG\n\
-    khl Latn PG\n\
-    kho Brah IR\n\
-    khp Latn ID\n\
-    khr Latn IN\n\
-    khs Latn PG\n\
-    khu Latn AO\n\
-    khv Cyrl RU\n\
-    khx Latn CD\n\
-    khy Latn CD\n\
-    khz Latn PG\n\
-    kia Latn TD\n\
-    kib Latn SD\n\
-    kic Latn US\n\
-    kid Latn CM\n\
-    kie Latn TD\n\
-    kif Deva NP\n\
-    kig Latn ID\n\
-    kih Latn PG\n\
-    kij Latn PG\n\
-    kil Latn NG\n\
-    kim Cyrl RU\n\
-    kio Latn US\n\
-    kip Deva NP\n\
-    kiq Latn ID\n\
-    kis Latn PG\n\
-    kit Latn PG\n\
-    kiv Latn TZ\n\
-    kiw Latn PG\n\
-    kix Latn IN\n\
-    kiy Latn ID\n\
-    kiz Latn TZ\n\
-    kja Latn ID\n\
-    kjb Latn GT\n\
-    kjc Latn ID\n\
-    kjd Latn PG\n\
-    kje Latn ID\n\
-    kjh Cyrl RU\n\
-    kji Latn SB\n\
-    kjj Latn AZ\n\
-    kjk Latn ID\n\
-    kjl Deva NP\n\
-    kjm Latn VN\n\
-    kjn Latn AU\n\
-    kjo Deva IN\n\
-    kjp Mymr MM\n\
-    kjq Latn US\n\
-    kjr Latn ID\n\
-    kjs Latn PG\n\
-    kjt Thai TH\n\
-    kju Latn US\n\
-    kjx Latn PG\n\
-    kjy Latn PG\n\
-    kjz Tibt BT\n\
-    kka Latn NG\n\
-    kkb Latn ID\n\
-    kkc Latn PG\n\
-    kkd Latn NG\n\
-    kke Latn GN\n\
-    kkf Tibt IN\n\
-    kkg Latn PH\n\
-    kkh Lana MM\n\
-    kki Latn TZ\n\
-    kkk Latn SB\n\
-    kkl Latn ID\n\
-    kkm Latn NG\n\
-    kko Latn SD\n\
-    kkp Latn AU\n\
-    kkq Latn CD\n\
-    kkr Latn NG\n\
-    kks Latn NG\n\
-    kkt Deva NP\n\
-    kku Latn NG\n\
-    kkv Latn ID\n\
-    kkw Latn CG\n\
-    kkx Latn ID\n\
-    kky Latn AU\n\
-    kkz Latn CA\n\
-    kla Latn US\n\
-    klb Latn MX\n\
-    klc Latn CM\n\
-    kld Latn AU\n\
-    kle Deva NP\n\
-    klf Latn TD\n\
-    klg Latn PH\n\
-    klh Latn PG\n\
-    kli Latn ID\n\
-    klj Arab IR\n\
-    klk Latn NG\n\
-    kll Latn PH\n\
-    klm Latn PG\n\
-    klo Latn NG\n\
-    klp Latn PG\n\
-    klq Latn PG\n\
-    klr Deva NP\n\
-    kls Latn PK\n\
-    klt Latn PG\n\
-    klu Latn LR\n\
-    klv Latn VU\n\
-    klw Latn ID\n\
-    klx Latn PG\n\
-    kly Latn ID\n\
-    klz Latn ID\n\
-    kma Latn GH\n\
-    kmc Latn CN\n\
-    kmd Latn PH\n\
-    kme Latn CM\n\
-    kmf Latn PG\n\
-    kmg Latn PG\n\
-    kmh Latn PG\n\
-    kmi Latn NG\n\
-    kmj Deva IN\n\
-    kmk Latn PH\n\
-    kml Latn PH\n\
-    kmm Latn IN\n\
-    kmn Latn PG\n\
-    kmo Latn PG\n\
-    kmp Latn CM\n\
-    kmq Latn ET\n\
-    kms Latn PG\n\
-    kmt Latn ID\n\
-    kmu Latn PG\n\
-    kmv Latn BR\n\
-    kmw Latn CD\n\
-    kmx Latn PG\n\
-    kmy Latn NG\n\
-    kmz Arab IR\n\
-    kna Latn NG\n\
-    knb Latn PH\n\
-    knd Latn ID\n\
-    kne Latn PH\n\
-    kni Latn NG\n\
-    knj Latn GT\n\
-    knk Latn SL\n\
-    knl Latn ID\n\
-    knm Latn BR\n\
-    kno Latn SL\n\
-    knp Latn CM\n\
-    knq Latn MY\n\
-    knr Latn PG\n\
-    kns Latn MY\n\
-    knt Latn BR\n\
-    knu Latn GN\n\
-    knv Latn PG\n\
-    knw Latn NA\n\
-    knx Latn ID\n\
-    kny Latn CD\n\
-    knz Latn BF\n\
-    koa Latn PG\n\
-    koc Latn NG\n\
-    kod Latn ID\n\
-    koe Latn SS\n\
-    kof Latn NG\n\
-    kog Latn CO\n\
-    koh Latn CG\n\
-    kol Latn PG\n\
-    koo Latn UG\n\
-    kop Latn PG\n\
-    koq Latn GA\n\
-    kot Latn CM\n\
-    kou Latn TD\n\
-    kov Latn NG\n\
-    kow Latn NG\n\
-    koy Latn US\n\
-    koz Latn PG\n\
-    kpa Latn NG\n\
-    kpc Latn CO\n\
-    kpd Latn ID\n\
-    kpf Latn PG\n\
-    kpg Latn FM\n\
-    kph Latn GH\n\
-    kpi Latn ID\n\
-    kpj Latn BR\n\
-    kpk Latn NG\n\
-    kpl Latn CD\n\
-    kpm Latn VN\n\
-    kpn Latn BR\n\
-    kpo Latn TG\n\
-    kpq Latn ID\n\
-    kpr Latn PG\n\
-    kps Latn ID\n\
-    kpt Cyrl RU\n\
-    kpu Latn ID\n\
-    kpw Latn PG\n\
-    kpx Latn PG\n\
-    kpy Cyrl RU\n\
-    kpz Latn UG\n\
-    kqa Latn PG\n\
-    kqb Latn PG\n\
-    kqc Latn PG\n\
-    kqd Syrc IQ\n\
-    kqe Latn PH\n\
-    kqf Latn PG\n\
-    kqg Latn BF\n\
-    kqh Latn TZ\n\
-    kqi Latn PG\n\
-    kqj Latn PG\n\
-    kqk Latn BJ\n\
-    kql Latn PG\n\
-    kqm Latn CI\n\
-    kqo Latn LR\n\
-    kqp Latn TD\n\
-    kqq Latn BR\n\
-    kqr Latn MY\n\
-    kqs Latn GN\n\
-    kqt Latn MY\n\
-    kqu Latn ZA\n\
-    kqv Latn ID\n\
-    kqw Latn PG\n\
-    kqx Latn CM\n\
-    kqy Ethi ET\n\
-    kqz Latn ZA\n\
-    kr Latn NG\n\
-    kra Deva NP\n\
-    krb Latn US\n\
-    krd Latn TL\n\
-    kre Latn BR\n\
-    krf Latn VU\n\
-    krh Latn NG\n\
-    krk Cyrl RU\n\
-    krn Latn LR\n\
-    krp Latn NG\n\
-    krr Khmr KH\n\
-    krs Latn SS\n\
-    krt Latn NE\n\
-    krv Khmr KH\n\
-    krw Latn LR\n\
-    krx Latn SN\n\
-    kry Latn AZ\n\
-    krz Latn ID\n\
-    ksc Latn PH\n\
-    ksd Latn PG\n\
-    kse Latn PG\n\
-    ksg Latn SB\n\
-    ksi Latn PG\n\
-    ksj Latn PG\n\
-    ksk Latn US\n\
-    ksl Latn PG\n\
-    ksm Latn NG\n\
-    ksn Latn PH\n\
-    kso Latn NG\n\
-    ksp Latn CF\n\
-    ksq Latn NG\n\
-    ksr Latn PG\n\
-    kss Latn LR\n\
-    kst Latn BF\n\
-    ksu Mymr IN\n\
-    ksv Latn CD\n\
-    ksw Mymr MM\n\
-    ksx Latn ID\n\
-    ksz Deva IN\n\
-    kta Latn VN\n\
-    ktb Ethi ET\n\
-    ktc Latn NG\n\
-    ktd Latn AU\n\
-    kte Deva NP\n\
-    ktf Latn CD\n\
-    ktg Latn AU\n\
-    kth Latn TD\n\
-    kti Latn ID\n\
-    ktj Latn CI\n\
-    ktk Latn PG\n\
-    ktl Arab IR\n\
-    ktm Latn PG\n\
-    ktn Latn BR\n\
-    kto Latn PG\n\
-    ktp Plrd CN\n\
-    ktq Latn PH\n\
-    kts Latn ID\n\
-    ktt Latn ID\n\
-    ktu Latn CD\n\
-    ktv Latn VN\n\
-    ktw Latn US\n\
-    ktx Latn BR\n\
-    kty Latn CD\n\
-    ktz Latn NA\n\
-    kub Latn NG\n\
-    kuc Latn ID\n\
-    kud Latn PG\n\
-    kue Latn PG\n\
-    kuf Laoo LA\n\
-    kug Latn NG\n\
-    kuh Latn NG\n\
-    kui Latn BR\n\
-    kuj Latn TZ\n\
-    kuk Latn ID\n\
-    kul Latn NG\n\
-    kun Latn ER\n\
-    kuo Latn PG\n\
-    kup Latn PG\n\
-    kuq Latn BR\n\
-    kus Latn GH\n\
-    kut Latn CA\n\
-    kuu Latn US\n\
-    kuv Latn ID\n\
-    kuw Latn CF\n\
-    kux Latn AU\n\
-    kuy Latn AU\n\
-    kuz Latn CL\n\
-    kva Cyrl RU\n\
-    kvb Latn ID\n\
-    kvc Latn PG\n\
-    kvd Latn ID\n\
-    kve Latn MY\n\
-    kvf Latn TD\n\
-    kvg Latn PG\n\
-    kvh Latn ID\n\
-    kvi Latn TD\n\
-    kvj Latn CM\n\
-    kvl Latn MM\n\
-    kvm Latn CM\n\
-    kvn Latn CO\n\
-    kvo Latn ID\n\
-    kvp Latn ID\n\
-    kvq Mymr MM\n\
-    kvt Mymr MM\n\
-    kvv Latn ID\n\
-    kvw Latn ID\n\
-    kvy Kali MM\n\
-    kvz Latn ID\n\
-    kwa Latn BR\n\
-    kwb Latn NG\n\
-    kwc Latn CG\n\
-    kwd Latn SB\n\
-    kwe Latn ID\n\
-    kwf Latn SB\n\
-    kwg Latn TD\n\
-    kwh Latn ID\n\
-    kwi Latn CO\n\
-    kwj Latn PG\n\
-    kwl Latn NG\n\
-    kwm Latn NA\n\
-    kwn Latn NA\n\
-    kwo Latn PG\n\
-    kwp Latn CI\n\
-    kwr Latn ID\n\
-    kws Latn CD\n\
-    kwt Latn ID\n\
-    kwu Latn CM\n\
-    kwv Latn TD\n\
-    kww Latn SR\n\
-    kwy Latn AO\n\
-    kwz Latn AO\n\
-    kxa Latn PG\n\
-    kxb Latn CI\n\
-    kxc Latn ET\n\
-    kxd Latn BN\n\
-    kxf Mymr MM\n\
-    kxi Latn MY\n\
-    kxj Latn TD\n\
-    kxk Mymr MM\n\
-    kxn Latn MY\n\
-    kxo Latn BR\n\
-    kxq Latn ID\n\
-    kxr Latn PG\n\
-    kxt Latn PG\n\
-    kxw Latn PG\n\
-    kxx Latn CG\n\
-    kxy Latn VN\n\
-    kxz Latn PG\n\
-    kya Latn TZ\n\
-    kyb Latn PH\n\
-    kyc Latn PG\n\
-    kyd Latn ID\n\
-    kye Latn GH\n\
-    kyf Latn CI\n\
-    kyg Latn PG\n\
-    kyh Latn US\n\
-    kyi Latn MY\n\
-    kyj Latn PH\n\
-    kyk Latn PH\n\
-    kyl Latn US\n\
-    kym Latn CF\n\
-    kyn Latn PH\n\
-    kyo Latn ID\n\
-    kyq Latn TD\n\
-    kyr Latn BR\n\
-    kys Latn MY\n\
-    kyt Latn ID\n\
-    kyu Kali MM\n\
-    kyv Deva NP\n\
-    kyw Deva IN\n\
-    kyx Latn PG\n\
-    kyy Latn PG\n\
-    kyz Latn BR\n\
-    kza Latn BF\n\
-    kzb Latn ID\n\
-    kzc Latn CI\n\
-    kzd Latn ID\n\
-    kze Latn PG\n\
-    kzf Latn ID\n\
-    kzi Latn MY\n\
-    kzk Latn SB\n\
-    kzl Latn ID\n\
-    kzm Latn ID\n\
-    kzn Latn MW\n\
-    kzo Latn GA\n\
-    kzp Latn ID\n\
-    kzr Latn CM\n\
-    kzs Latn MY\n\
-    kzu Latn ID\n\
-    kzv Latn ID\n\
-    kzw Latn BR\n\
-    kzx Latn ID\n\
-    kzy Latn CD\n\
-    kzz Latn ID\n\
-    laa Latn PH\n\
-    lac Latn MX\n\
-    lae Deva IN\n\
-    lai Latn MW\n\
-    lal Latn CD\n\
-    lam Latn ZM\n\
-    lan Latn NG\n\
-    lap Latn TD\n\
-    laq Latn VN\n\
-    lar Latn GH\n\
-    las Latn TG\n\
-    lau Latn ID\n\
-    law Latn ID\n\
-    lax Latn IN\n\
-    laz Latn PG\n\
-    lbb Latn PG\n\
-    lbf Deva IN\n\
-    lbi Latn CM\n\
-    lbj Tibt IN\n\
-    lbl Latn PH\n\
-    lbm Deva IN\n\
-    lbn Latn LA\n\
-    lbo Laoo LA\n\
-    lbq Latn PG\n\
-    lbr Deva NP\n\
-    lbt Latn VN\n\
-    lbu Latn PG\n\
-    lbv Latn PG\n\
-    lbx Latn ID\n\
-    lby Latn AU\n\
-    lbz Latn AU\n\
-    lcc Latn ID\n\
-    lcd Latn ID\n\
-    lce Latn ID\n\
-    lcf Latn ID\n\
-    lch Latn AO\n\
-    lcl Latn ID\n\
-    lcm Latn PG\n\
-    lcq Latn ID\n\
-    lcs Latn ID\n\
-    lda Latn CI\n\
-    ldb Latn NG\n\
-    ldd Latn NG\n\
-    ldg Latn NG\n\
-    ldh Latn NG\n\
-    ldi Latn CG\n\
-    ldj Latn NG\n\
-    ldk Latn NG\n\
-    ldl Latn NG\n\
-    ldm Latn GN\n\
-    ldn Latn 001\n\
-    ldo Latn NG\n\
-    ldp Latn NG\n\
-    ldq Latn NG\n\
-    lea Latn CD\n\
-    lec Latn BO\n\
-    led Latn CD\n\
-    lee Latn BF\n\
-    lef Latn GH\n\
-    leh Latn ZM\n\
-    lei Latn PG\n\
-    lej Latn CD\n\
-    lek Latn PG\n\
-    lel Latn CD\n\
-    lem Latn CM\n\
-    leo Latn CM\n\
-    leq Latn PG\n\
-    ler Latn PG\n\
-    les Latn CD\n\
-    let Latn PG\n\
-    leu Latn PG\n\
-    lev Latn ID\n\
-    lew Latn ID\n\
-    lex Latn ID\n\
-    ley Latn ID\n\
-    lfa Latn CM\n\
-    lfn Latn 001\n\
-    lga Latn SB\n\
-    lgb Latn SB\n\
-    lgg Latn UG\n\
-    lgh Latn VN\n\
-    lgi Latn ID\n\
-    lgk Latn VU\n\
-    lgl Latn SB\n\
-    lgm Latn CD\n\
-    lgn Latn ET\n\
-    lgo Latn SS\n\
-    lgq Latn GH\n\
-    lgr Latn SB\n\
-    lgt Latn PG\n\
-    lgu Latn SB\n\
-    lgz Latn CD\n\
-    lha Latn VN\n\
-    lhh Latn ID\n\
-    lhi Latn CN\n\
-    lhm Deva NP\n\
-    lhn Latn MY\n\
-    lhs Syrc SY\n\
-    lht Latn VU\n\
-    lhu Latn CN\n\
-    lia Latn SL\n\
-    lib Latn PG\n\
-    lic Latn CN\n\
-    lid Latn PG\n\
-    lie Latn CD\n\
-    lig Latn GH\n\
-    lih Latn PG\n\
-    lik Latn CD\n\
-    lio Latn ID\n\
-    lip Latn GH\n\
-    liq Latn ET\n\
-    lir Latn LR\n\
-    liu Latn SD\n\
-    liv Latn LV\n\
-    liw Latn ID\n\
-    lix Latn ID\n\
-    liy Latn CF\n\
-    liz Latn CD\n\
-    lja Latn AU\n\
-    lje Latn ID\n\
-    lji Latn ID\n\
-    ljl Latn ID\n\
-    ljw Latn AU\n\
-    ljx Latn AU\n\
-    lka Latn TL\n\
-    lkb Latn KE\n\
-    lkc Latn VN\n\
-    lkd Latn BR\n\
-    lke Latn UG\n\
-    lkh Tibt BT\n\
-    lkj Latn MY\n\
-    lkl Latn PG\n\
-    lkm Latn AU\n\
-    lkn Latn VU\n\
-    lko Latn KE\n\
-    lkr Latn SS\n\
-    lks Latn KE\n\
-    lku Latn AU\n\
-    lky Latn SS\n\
-    lla Latn NG\n\
-    llb Latn MZ\n\
-    llc Latn GN\n\
-    lle Latn PG\n\
-    llf Latn PG\n\
-    llg Latn ID\n\
-    lli Latn CG\n\
-    llj Latn AU\n\
-    llk Latn MY\n\
-    lll Latn PG\n\
-    llm Latn ID\n\
-    lln Latn TD\n\
-    llp Latn VU\n\
-    llq Latn ID\n\
-    llu Latn SB\n\
-    llx Latn FJ\n\
-    lma Latn GN\n\
-    lmb Latn VU\n\
-    lmc Latn AU\n\
-    lmd Latn SD\n\
-    lme Latn TD\n\
-    lmf Latn ID\n\
-    lmg Latn PG\n\
-    lmh Deva NP\n\
-    lmi Latn CD\n\
-    lmj Latn ID\n\
-    lmk Latn IN\n\
-    lml Latn VU\n\
-    lmp Latn CM\n\
-    lmq Latn ID\n\
-    lmr Latn ID\n\
-    lmu Latn VU\n\
-    lmv Latn FJ\n\
-    lmw Latn US\n\
-    lmx Latn CM\n\
-    lmy Latn ID\n\
-    lna Latn CF\n\
-    lnb Latn NA\n\
-    lnd Latn ID\n\
-    lng Latn HU\n\
-    lnh Latn MY\n\
-    lni Latn PG\n\
-    lnj Latn AU\n\
-    lnl Latn CF\n\
-    lnm Latn PG\n\
-    lnn Latn VU\n\
-    lns Latn CM\n\
-    lnu Latn NG\n\
-    lnw Latn AU\n\
-    lnz Latn CD\n\
-    loa Latn ID\n\
-    lob Latn BF\n\
-    loc Latn PH\n\
-    loe Latn ID\n\
-    log Latn CD\n\
-    loh Latn SS\n\
-    loi Latn CI\n\
-    loj Latn PG\n\
-    lok Latn SL\n\
-    lom Latn LR\n\
-    lon Latn MW\n\
-    loo Latn CD\n\
-    lop Latn NG\n\
-    loq Latn CD\n\
-    lor Latn CI\n\
-    los Latn PG\n\
-    lot Latn SS\n\
-    lou Latn US\n\
-    low Latn MY\n\
-    lox Latn ID\n\
-    loy Deva NP\n\
-    lpa Latn VU\n\
-    lpe Latn ID\n\
-    lpn Latn MM\n\
-    lpo Plrd CN\n\
-    lpx Latn SS\n\
-    lqr Latn SS\n\
-    lra Latn MY\n\
-    lrg Latn AU\n\
-    lri Latn KE\n\
-    lrk Arab PK\n\
-    lrl Arab IR\n\
-    lrm Latn KE\n\
-    lrn Latn ID\n\
-    lro Latn SD\n\
-    lrt Latn ID\n\
-    lrv Latn VU\n\
-    lrz Latn VU\n\
-    lsa Arab IR\n\
-    lsd Hebr IL\n\
-    lse Latn CD\n\
-    lsi Latn MM\n\
-    lsm Latn UG\n\
-    lsr Latn PG\n\
-    lss Arab PK\n\
-    ltc Hant CN\n\
-    lth Latn UG\n\
-    lti Latn ID\n\
-    ltn Latn BR\n\
-    lto Latn KE\n\
-    lts Latn KE\n\
-    ltu Latn ID\n\
-    luc Latn UG\n\
-    lud Latn RU\n\
-    luf Latn PG\n\
-    lui Latn US\n\
-    luj Latn CD\n\
-    luk Tibt BT\n\
-    lul Latn SS\n\
-    lum Latn AO\n\
-    lup Latn GA\n\
-    luq Latn CU\n\
-    lur Latn ID\n\
-    lus Latn IN\n\
-    lut Latn US\n\
-    luu Deva NP\n\
-    luv Arab OM\n\
-    luw Latn CM\n\
-    lva Latn TL\n\
-    lvi Latn LA\n\
-    lvk Latn SB\n\
-    lvl Latn CD\n\
-    lvu Latn ID\n\
-    lwa Latn CD\n\
-    lwe Latn ID\n\
-    lwg Latn KE\n\
-    lwh Latn VN\n\
-    lwm Thai CN\n\
-    lwo Latn SS\n\
-    lwt Latn ID\n\
-    lww Latn VU\n\
-    lxm Latn PG\n\
-    lya Tibt BT\n\
-    lyn Latn ZM\n\
-    lzl Latn VU\n\
-    lzn Latn MM\n\
-    maa Latn MX\n\
-    mab Latn MX\n\
-    mae Latn NG\n\
-    maj Latn MX\n\
-    mam Latn GT\n\
-    maq Latn MX\n\
-    mat Latn MX\n\
-    mau Latn MX\n\
-    mav Latn BR\n\
-    maw Latn GH\n\
-    max Latn ID\n\
-    mba Latn PH\n\
-    mbb Latn PH\n\
-    mbc Latn BR\n\
-    mbd Latn PH\n\
-    mbf Latn SG\n\
-    mbh Latn PG\n\
-    mbi Latn PH\n\
-    mbj Latn BR\n\
-    mbk Latn PG\n\
-    mbl Latn BR\n\
-    mbm Latn CG\n\
-    mbn Latn CO\n\
-    mbo Latn CM\n\
-    mbp Latn CO\n\
-    mbq Latn PG\n\
-    mbr Latn CO\n\
-    mbs Latn PH\n\
-    mbt Latn PH\n\
-    mbu Latn NG\n\
-    mbv Latn GN\n\
-    mbw Latn PG\n\
-    mbx Latn PG\n\
-    mby Arab PK\n\
-    mbz Latn MX\n\
-    mca Latn PY\n\
-    mcb Latn PE\n\
-    mcc Latn PG\n\
-    mcd Latn PE\n\
-    mce Latn MX\n\
-    mcf Latn PE\n\
-    mcg Latn VE\n\
-    mch Latn VE\n\
-    mci Latn PG\n\
-    mcj Latn NG\n\
-    mck Latn AO\n\
-    mcl Latn CO\n\
-    mcm Latn MY\n\
-    mcn Latn TD\n\
-    mco Latn MX\n\
-    mcp Latn CM\n\
-    mcq Latn PG\n\
-    mcr Latn PG\n\
-    mcs Latn CM\n\
-    mct Latn CM\n\
-    mcu Latn CM\n\
-    mcv Latn PG\n\
-    mcw Latn TD\n\
-    mcx Latn CF\n\
-    mcy Latn PG\n\
-    mcz Latn PG\n\
-    mda Latn NG\n\
-    mdb Latn PG\n\
-    mdc Latn PG\n\
-    mdd Latn CM\n\
-    mde Arab TD\n\
-    mdg Latn TD\n\
-    mdi Latn CD\n\
-    mdj Latn CD\n\
-    mdk Latn CD\n\
-    mdm Latn CD\n\
-    mdn Latn CF\n\
-    mdp Latn CD\n\
-    mdq Latn CD\n\
-    mds Latn PG\n\
-    mdt Latn CG\n\
-    mdu Latn CG\n\
-    mdv Latn MX\n\
-    mdw Latn CG\n\
-    mdx Ethi ET\n\
-    mdy Ethi ET\n\
-    mdz Latn BR\n\
-    mea Latn CM\n\
-    meb Latn PG\n\
-    mec Latn AU\n\
-    med Latn PG\n\
-    mee Latn PG\n\
-    meh Latn MX\n\
-    mej Latn ID\n\
-    mek Latn PG\n\
-    mel Latn MY\n\
-    mem Latn AU\n\
-    meo Latn MY\n\
-    mep Latn AU\n\
-    meq Latn CM\n\
-    mes Latn TD\n\
-    met Latn PG\n\
-    meu Latn PG\n\
-    mev Latn LR\n\
-    mew Latn NG\n\
-    mez Latn US\n\
-    mfb Latn ID\n\
-    mfc Latn CD\n\
-    mfd Latn CM\n\
-    mff Latn CM\n\
-    mfg Latn GN\n\
-    mfh Latn CM\n\
-    mfi Arab CM\n\
-    mfj Latn CM\n\
-    mfk Latn CM\n\
-    mfl Latn NG\n\
-    mfm Latn NG\n\
-    mfn Latn NG\n\
-    mfo Latn NG\n\
-    mfp Latn ID\n\
-    mfq Latn TG\n\
-    mfr Latn AU\n\
-    mft Latn PG\n\
-    mfu Latn AO\n\
-    mfw Latn PG\n\
-    mfx Latn ET\n\
-    mfy Latn MX\n\
-    mfz Latn SS\n\
-    mga Latg IE\n\
-    mgb Latn TD\n\
-    mgc Latn SS\n\
-    mgd Latn SS\n\
-    mge Latn TD\n\
-    mgf Latn ID\n\
-    mgg Latn CM\n\
-    mgi Latn NG\n\
-    mgj Latn NG\n\
-    mgk Latn ID\n\
-    mgl Latn PG\n\
-    mgm Latn TL\n\
-    mgn Latn CF\n\
-    mgq Latn TZ\n\
-    mgr Latn ZM\n\
-    mgs Latn TZ\n\
-    mgt Latn PG\n\
-    mgu Latn PG\n\
-    mgv Latn TZ\n\
-    mgw Latn TZ\n\
-    mgz Latn TZ\n\
-    mhb Latn GA\n\
-    mhc Latn MX\n\
-    mhd Latn TZ\n\
-    mhe Latn MY\n\
-    mhf Latn PG\n\
-    mhg Latn AU\n\
-    mhi Latn UG\n\
-    mhj Arab AF\n\
-    mhk Latn CM\n\
-    mhl Latn PG\n\
-    mhm Latn MZ\n\
-    mho Latn ZM\n\
-    mhp Latn ID\n\
-    mhq Latn US\n\
-    mhs Latn ID\n\
-    mht Latn VE\n\
-    mhu Latn IN\n\
-    mhw Latn BW\n\
-    mhx Latn MM\n\
-    mhy Latn ID\n\
-    mhz Latn ID\n\
-    mia Latn US\n\
-    mib Latn MX\n\
-    mid Mand IQ\n\
-    mie Latn MX\n\
-    mif Latn CM\n\
-    mig Latn MX\n\
-    mih Latn MX\n\
-    mii Latn MX\n\
-    mij Latn CM\n\
-    mik Latn US\n\
-    mil Latn MX\n\
-    mim Latn MX\n\
-    mio Latn MX\n\
-    mip Latn MX\n\
-    miq Latn NI\n\
-    mir Latn MX\n\
-    mit Latn MX\n\
-    miu Latn MX\n\
-    miw Latn PG\n\
-    mix Latn MX\n\
-    miy Latn MX\n\
-    miz Latn MX\n\
-    mjb Latn TL\n\
-    mjc Latn MX\n\
-    mjd Latn US\n\
-    mje Latn TD\n\
-    mjg Latn CN\n\
-    mjh Latn TZ\n\
-    mji Latn CN\n\
-    mjj Latn PG\n\
-    mjk Latn PG\n\
-    mjl Deva IN\n\
-    mjm Latn PG\n\
-    mjn Latn PG\n\
-    mjq Mlym IN\n\
-    mjr Mlym IN\n\
-    mjs Latn NG\n\
-    mjt Deva IN\n\
-    mju Telu IN\n\
-    mjv Mlym IN\n\
-    mjw Latn IN\n\
-    mjx Latn BD\n\
-    mjy Latn US\n\
-    mjz Deva NP\n\
-    mka Latn CI\n\
-    mkb Deva IN\n\
-    mkc Latn PG\n\
-    mke Deva IN\n\
-    mkf Latn NG\n\
-    mki Arab PK\n\
-    mkj Latn FM\n\
-    mkk Latn CM\n\
-    mkl Latn BJ\n\
-    mkm Thai TH\n\
-    mkn Latn ID\n\
-    mko Latn NG\n\
-    mkp Latn PG\n\
-    mkr Latn PG\n\
-    mks Latn MX\n\
-    mkt Latn NC\n\
-    mku Latn GN\n\
-    mkv Latn VU\n\
-    mkw Latn CG\n\
-    mkx Latn PH\n\
-    mky Latn ID\n\
-    mkz Latn TL\n\
-    mla Latn VU\n\
-    mlb Latn CM\n\
-    mlc Latn VN\n\
-    mle Latn PG\n\
-    mlf Thai LA\n\
-    mlh Latn PG\n\
-    mli Latn ID\n\
-    mlj Latn TD\n\
-    mlk Latn KE\n\
-    mll Latn VU\n\
-    mln Latn SB\n\
-    mlo Latn SN\n\
-    mlp Latn PG\n\
-    mlq Latn SN\n\
-    mlr Latn CM\n\
-    mlu Latn SB\n\
-    mlv Latn VU\n\
-    mlw Latn CM\n\
-    mlx Latn VU\n\
-    mlz Latn PH\n\
-    mma Latn NG\n\
-    mmb Latn ID\n\
-    mmc Latn MX\n\
-    mmd Latn CN\n\
-    mme Latn VU\n\
-    mmf Latn NG\n\
-    mmg Latn VU\n\
-    mmh Latn BR\n\
-    mmi Latn PG\n\
-    mmm Latn VU\n\
-    mmn Latn PH\n\
-    mmo Latn PG\n\
-    mmp Latn PG\n\
-    mmq Latn PG\n\
-    mmr Latn CN\n\
-    mmt Latn PG\n\
-    mmu Latn CM\n\
-    mmv Latn BR\n\
-    mmw Latn VU\n\
-    mmx Latn PG\n\
-    mmy Latn TD\n\
-    mmz Latn CD\n\
-    mna Latn PG\n\
-    mnb Latn ID\n\
-    mnc Mong CN\n\
-    mnd Latn BR\n\
-    mne Latn TD\n\
-    mnf Latn CM\n\
-    mng Latn VN\n\
-    mnh Latn CD\n\
-    mnj Arab AF\n\
-    mnl Latn VU\n\
-    mnm Latn PG\n\
-    mnn Latn VN\n\
-    mnp Latn CN\n\
-    mnq Latn MY\n\
-    mnr Latn US\n\
-    mns Cyrl RU\n\
-    mnu Latn ID\n\
-    mnv Latn SB\n\
-    mnx Latn ID\n\
-    mny Latn MZ\n\
-    mnz Latn ID\n\
-    moa Latn CI\n\
-    moc Latn AR\n\
-    mod Latn US\n\
-    mog Latn ID\n\
-    moi Latn NG\n\
-    moj Latn CG\n\
-    mok Latn ID\n\
-    mom Latn NI\n\
-    moo Latn VN\n\
-    mop Latn BZ\n\
-    moq Latn ID\n\
-    mor Latn SD\n\
-    mot Latn CO\n\
-    mou Latn TD\n\
-    mov Latn US\n\
-    mow Latn CG\n\
-    mox Latn PG\n\
-    moy Latn ET\n\
-    moz Latn TD\n\
-    mpa Latn TZ\n\
-    mpb Latn AU\n\
-    mpc Latn AU\n\
-    mpd Latn BR\n\
-    mpe Latn ET\n\
-    mpg Latn TD\n\
-    mph Latn AU\n\
-    mpi Latn CM\n\
-    mpj Latn AU\n\
-    mpk Latn TD\n\
-    mpl Latn PG\n\
-    mpm Latn MX\n\
-    mpn Latn PG\n\
-    mpo Latn PG\n\
-    mpp Latn PG\n\
-    mpq Latn BR\n\
-    mpr Latn SB\n\
-    mps Latn PG\n\
-    mpt Latn PG\n\
-    mpu Latn BR\n\
-    mpv Latn PG\n\
-    mpw Latn BR\n\
-    mpx Latn PG\n\
-    mpy Latn ID\n\
-    mpz Thai TH\n\
-    mqa Latn ID\n\
-    mqb Latn CM\n\
-    mqc Latn ID\n\
-    mqe Latn PG\n\
-    mqf Latn ID\n\
-    mqg Latn ID\n\
-    mqh Latn MX\n\
-    mqi Latn ID\n\
-    mqj Latn ID\n\
-    mqk Latn PH\n\
-    mql Latn BJ\n\
-    mqm Latn PF\n\
-    mqn Latn ID\n\
-    mqo Latn ID\n\
-    mqp Latn ID\n\
-    mqq Latn MY\n\
-    mqr Latn ID\n\
-    mqs Latn ID\n\
-    mqu Latn SS\n\
-    mqv Latn PG\n\
-    mqw Latn PG\n\
-    mqx Latn ID\n\
-    mqy Latn ID\n\
-    mqz Latn PG\n\
-    mra Thai TH\n\
-    mrb Latn VU\n\
-    mrc Latn US\n\
-    mrf Latn ID\n\
-    mrg Latn IN\n\
-    mrh Latn IN\n\
-    mrk Latn NC\n\
-    mrl Latn FM\n\
-    mrm Latn VU\n\
-    mrn Latn SB\n\
-    mrp Latn VU\n\
-    mrq Latn PF\n\
-    mrr Deva IN\n\
-    mrs Latn VU\n\
-    mrt Latn NG\n\
-    mru Latn CM\n\
-    mrv Latn PF\n\
-    mrw Latn PH\n\
-    mrx Latn ID\n\
-    mry Latn PH\n\
-    mrz Latn ID\n\
-    msb Latn PH\n\
-    msc Latn GN\n\
-    mse Latn TD\n\
-    msf Latn ID\n\
-    msg Latn ID\n\
-    msh Latn MG\n\
-    msi Latn MY\n\
-    msj Latn CD\n\
-    msk Latn PH\n\
-    msl Latn ID\n\
-    msm Latn PH\n\
-    msn Latn VU\n\
-    mso Latn ID\n\
-    msp Latn BR\n\
-    msq Latn NC\n\
-    mss Latn ID\n\
-    msu Latn PG\n\
-    msv Latn CM\n\
-    msw Latn GW\n\
-    msx Latn PG\n\
-    msy Latn PG\n\
-    msz Latn PG\n\
-    mta Latn PH\n\
-    mtb Latn CI\n\
-    mtc Latn PG\n\
-    mtd Latn ID\n\
-    mte Latn SB\n\
-    mtf Latn PG\n\
-    mtg Latn ID\n\
-    mth Latn ID\n\
-    mti Latn PG\n\
-    mtj Latn ID\n\
-    mtk Latn CM\n\
-    mtl Latn NG\n\
-    mtm Cyrl RU\n\
-    mtn Latn NI\n\
-    mto Latn MX\n\
-    mtp Latn BO\n\
-    mtq Latn VN\n\
-    mts Latn PE\n\
-    mtt Latn VU\n\
-    mtu Latn MX\n\
-    mtv Latn PG\n\
-    mtw Latn PH\n\
-    mtx Latn MX\n\
-    mty Latn PG\n\
-    mub Latn TD\n\
-    muc Latn CM\n\
-    mud Cyrl RU\n\
-    mue Latn EC\n\
-    mug Latn CM\n\
-    muh Latn SS\n\
-    mui Latn ID\n\
-    muj Latn TD\n\
-    muk Tibt NP\n\
-    mum Latn PG\n\
-    muo Latn CM\n\
-    muq Latn CN\n\
-    mur Latn SS\n\
-    mut Deva IN\n\
-    muu Latn KE\n\
-    muv Taml IN\n\
-    mux Latn PG\n\
-    muy Latn CM\n\
-    muz Ethi ET\n\
-    mva Latn PG\n\
-    mvd Latn ID\n\
-    mve Arab PK\n\
-    mvf Mong CN\n\
-    mvg Latn MX\n\
-    mvh Latn TD\n\
-    mvk Latn PG\n\
-    mvl Latn AU\n\
-    mvn Latn PG\n\
-    mvo Latn SB\n\
-    mvp Latn ID\n\
-    mvq Latn PG\n\
-    mvr Latn ID\n\
-    mvs Latn ID\n\
-    mvt Latn VU\n\
-    mvu Latn TD\n\
-    mvv Latn MY\n\
-    mvw Latn TZ\n\
-    mvx Latn ID\n\
-    mvz Ethi ET\n\
-    mwa Latn PG\n\
-    mwb Latn PG\n\
-    mwc Latn PG\n\
-    mwe Latn TZ\n\
-    mwf Latn AU\n\
-    mwg Latn PG\n\
-    mwh Latn PG\n\
-    mwi Latn VU\n\
-    mwl Latn PT\n\
-    mwm Latn TD\n\
-    mwn Latn ZM\n\
-    mwo Latn VU\n\
-    mwp Latn AU\n\
-    mwq Latn MM\n\
-    mws Latn KE\n\
-    mwt Mymr MM\n\
-    mwu Latn SS\n\
-    mwz Latn CD\n\
-    mxa Latn MX\n\
-    mxb Latn MX\n\
-    mxd Latn ID\n\
-    mxe Latn VU\n\
-    mxf Latn CM\n\
-    mxg Latn AO\n\
-    mxh Latn CD\n\
-    mxi Latn ES\n\
-    mxj Latn IN\n\
-    mxk Latn PG\n\
-    mxl Latn BJ\n\
-    mxm Latn PG\n\
-    mxn Latn ID\n\
-    mxo Latn ZM\n\
-    mxp Latn MX\n\
-    mxq Latn MX\n\
-    mxr Latn MY\n\
-    mxs Latn MX\n\
-    mxt Latn MX\n\
-    mxu Latn CM\n\
-    mxv Latn MX\n\
-    mxw Latn PG\n\
-    mxx Latn CI\n\
-    mxy Latn MX\n\
-    mxz Latn ID\n\
-    myb Latn TD\n\
-    myc Latn CD\n\
-    mye Latn GA\n\
-    myf Latn ET\n\
-    myg Latn CM\n\
-    myh Latn US\n\
-    myj Latn SS\n\
-    myk Latn ML\n\
-    myl Latn ID\n\
-    mym Ethi ET\n\
-    myp Latn BR\n\
-    myr Latn PE\n\
-    myu Latn BR\n\
-    myw Latn PG\n\
-    myy Latn CO\n\
-    mza Latn MX\n\
-    mzd Latn CM\n\
-    mze Latn PG\n\
-    mzh Latn AR\n\
-    mzi Latn MX\n\
-    mzj Latn LR\n\
-    mzk Latn NG\n\
-    mzl Latn MX\n\
-    mzm Latn NG\n\
-    mzo Latn BR\n\
-    mzp Latn BO\n\
-    mzq Latn ID\n\
-    mzr Latn BR\n\
-    mzt Latn MY\n\
-    mzu Latn PG\n\
-    mzv Latn CF\n\
-    mzw Latn GH\n\
-    mzx Latn GY\n\
-    mzz Latn PG\n\
-    naa Latn ID\n\
-    nab Latn BR\n\
-    nac Latn PG\n\
-    nae Latn ID\n\
-    naf Latn PG\n\
-    nag Latn IN\n\
-    naj Latn GN\n\
-    nak Latn PG\n\
-    nal Latn PG\n\
-    nam Latn AU\n\
-    nao Deva NP\n\
-    nar Latn NG\n\
-    nas Latn PG\n\
-    nat Latn NG\n\
-    naw Latn GH\n\
-    nax Latn PG\n\
-    nay Latn AU\n\
-    naz Latn MX\n\
-    nba Latn AO\n\
-    nbb Latn NG\n\
-    nbc Latn IN\n\
-    nbd Latn CD\n\
-    nbe Latn IN\n\
-    nbh Latn NG\n\
-    nbi Latn IN\n\
-    nbj Latn AU\n\
-    nbk Latn PG\n\
-    nbm Latn CF\n\
-    nbn Latn ID\n\
-    nbo Latn NG\n\
-    nbp Latn NG\n\
-    nbq Latn ID\n\
-    nbr Latn NG\n\
-    nbt Latn IN\n\
-    nbu Latn IN\n\
-    nbv Latn CM\n\
-    nbw Latn CD\n\
-    nby Latn PG\n\
-    nca Latn PG\n\
-    ncb Latn IN\n\
-    ncc Latn PG\n\
-    ncd Deva NP\n\
-    nce Latn PG\n\
-    ncf Latn PG\n\
-    ncg Latn CA\n\
-    nci Latn MX\n\
-    ncj Latn MX\n\
-    nck Latn AU\n\
-    ncl Latn MX\n\
-    ncm Latn PG\n\
-    ncn Latn PG\n\
-    nco Latn PG\n\
-    ncq Laoo LA\n\
-    ncr Latn CM\n\
-    nct Latn IN\n\
-    ncu Latn GH\n\
-    ncx Latn MX\n\
-    ncz Latn US\n\
-    nda Latn CG\n\
-    ndb Latn CM\n\
-    ndd Latn NG\n\
-    ndf Cyrl RU\n\
-    ndg Latn TZ\n\
-    ndh Latn TZ\n\
-    ndi Latn NG\n\
-    ndj Latn TZ\n\
-    ndk Latn CD\n\
-    ndl Latn CD\n\
-    ndm Latn TD\n\
-    ndn Latn CG\n\
-    ndp Latn UG\n\
-    ndq Latn AO\n\
-    ndr Latn NG\n\
-    ndt Latn CD\n\
-    ndu Latn CM\n\
-    ndv Latn SN\n\
-    ndw Latn CD\n\
-    ndx Latn ID\n\
-    ndy Latn CF\n\
-    ndz Latn SS\n\
-    nea Latn ID\n\
-    neb Latn CI\n\
-    nec Latn ID\n\
-    ned Latn NG\n\
-    nee Latn NC\n\
-    neg Cyrl RU\n\
-    neh Tibt BT\n\
-    nei Xsux TR\n\
-    nej Latn PG\n\
-    nek Latn NC\n\
-    nem Latn NC\n\
-    nen Latn NC\n\
-    neo Latn VN\n\
-    neq Latn MX\n\
-    ner Latn ID\n\
-    net Latn PG\n\
-    neu Latn 001\n\
-    nex Latn PG\n\
-    ney Latn CI\n\
-    nez Latn US\n\
-    nfa Latn ID\n\
-    nfd Latn NG\n\
-    nfl Latn SB\n\
-    nfr Latn GH\n\
-    nfu Latn CM\n\
-    nga Latn CD\n\
-    ngb Latn CD\n\
-    ngc Latn CD\n\
-    ngd Latn CF\n\
-    nge Latn CM\n\
-    ngg Latn CF\n\
-    ngh Latn ZA\n\
-    ngi Latn NG\n\
-    ngj Latn CM\n\
-    ngk Latn AU\n\
-    ngm Latn FM\n\
-    ngn Latn CM\n\
-    ngp Latn TZ\n\
-    ngq Latn TZ\n\
-    ngr Latn SB\n\
-    ngs Latn NG\n\
-    ngt Laoo LA\n\
-    ngu Latn MX\n\
-    ngv Latn CM\n\
-    ngw Latn NG\n\
-    ngx Latn NG\n\
-    ngy Latn CM\n\
-    ngz Latn CG\n\
-    nha Latn AU\n\
-    nhb Latn CI\n\
-    nhc Latn MX\n\
-    nhd Latn PY\n\
-    nhf Latn AU\n\
-    nhg Latn MX\n\
-    nhi Latn MX\n\
-    nhk Latn MX\n\
-    nhm Latn MX\n\
-    nhn Latn MX\n\
-    nho Latn PG\n\
-    nhp Latn MX\n\
-    nhq Latn MX\n\
-    nhr Latn BW\n\
-    nht Latn MX\n\
-    nhu Latn CM\n\
-    nhv Latn MX\n\
-    nhx Latn MX\n\
-    nhy Latn MX\n\
-    nhz Latn MX\n\
-    nia Latn ID\n\
-    nib Latn PG\n\
-    nid Latn AU\n\
-    nie Latn TD\n\
-    nif Latn PG\n\
-    nig Latn AU\n\
-    nih Latn TZ\n\
-    nii Latn PG\n\
-    nil Latn ID\n\
-    nim Latn TZ\n\
-    nin Latn NG\n\
-    nio Cyrl RU\n\
-    niq Latn KE\n\
-    nir Latn ID\n\
-    nis Latn PG\n\
-    nit Telu IN\n\
-    niv Cyrl RU\n\
-    niw Latn PG\n\
-    nix Latn CD\n\
-    niy Latn CD\n\
-    niz Latn PG\n\
-    nja Latn NG\n\
-    njb Latn IN\n\
-    njd Latn TZ\n\
-    njh Latn IN\n\
-    nji Latn AU\n\
-    njj Latn CM\n\
-    njl Latn SS\n\
-    njm Latn IN\n\
-    njn Latn IN\n\
-    njr Latn NG\n\
-    njs Latn ID\n\
-    njt Latn SR\n\
-    nju Latn AU\n\
-    njx Latn CG\n\
-    njy Latn CM\n\
-    njz Latn IN\n\
-    nka Latn ZM\n\
-    nkb Latn IN\n\
-    nkc Latn CM\n\
-    nkd Latn IN\n\
-    nke Latn SB\n\
-    nkf Latn IN\n\
-    nkg Latn PG\n\
-    nkh Latn IN\n\
-    nki Latn IN\n\
-    nkj Latn ID\n\
-    nkk Latn VU\n\
-    nkm Latn PG\n\
-    nkn Latn AO\n\
-    nko Latn GH\n\
-    nkq Latn GH\n\
-    nkr Latn FM\n\
-    nks Latn ID\n\
-    nkt Latn TZ\n\
-    nku Latn CI\n\
-    nkv Latn MW\n\
-    nkw Latn CD\n\
-    nkx Latn NG\n\
-    nkz Latn NG\n\
-    nla Latn CM\n\
-    nlc Latn ID\n\
-    nle Latn KE\n\
-    nlg Latn SB\n\
-    nli Arab AF\n\
-    nlj Latn CD\n\
-    nlk Latn ID\n\
-    nlm Arab PK\n\
-    nlo Latn CD\n\
-    nlq Latn MM\n\
-    nlu Latn GH\n\
-    nlv Latn MX\n\
-    nlw Latn AU\n\
-    nlx Deva IN\n\
-    nly Latn AU\n\
-    nlz Latn SB\n\
-    nma Latn IN\n\
-    nmb Latn VU\n\
-    nmc Latn TD\n\
-    nmd Latn GA\n\
-    nme Latn IN\n\
-    nmf Latn IN\n\
-    nmh Latn IN\n\
-    nmi Latn NG\n\
-    nmj Latn CF\n\
-    nmk Latn VU\n\
-    nml Latn CM\n\
-    nmm Deva NP\n\
-    nmn Latn BW\n\
-    nmo Latn IN\n\
-    nmp Latn AU\n\
-    nmq Latn ZW\n\
-    nmr Latn CM\n\
-    nms Latn VU\n\
-    nmt Latn FM\n\
-    nmu Latn US\n\
-    nmv Latn AU\n\
-    nmw Latn PG\n\
-    nmx Latn PG\n\
-    nmz Latn TG\n\
-    nna Latn AU\n\
-    nnb Latn CD\n\
-    nnc Latn TD\n\
-    nnd Latn VU\n\
-    nne Latn AO\n\
-    nnf Latn PG\n\
-    nng Latn IN\n\
-    nni Latn ID\n\
-    nnj Latn ET\n\
-    nnk Latn PG\n\
-    nnl Latn IN\n\
-    nnm Latn PG\n\
-    nnn Latn TD\n\
-    nnq Latn TZ\n\
-    nnr Latn AU\n\
-    nnt Latn US\n\
-    nnu Latn GH\n\
-    nnv Latn AU\n\
-    nnw Latn BF\n\
-    nny Latn AU\n\
-    nnz Latn CM\n\
-    noa Latn CO\n\
-    noc Latn PG\n\
-    nof Latn PG\n\
-    nog Cyrl RU\n\
-    noh Latn PG\n\
-    noi Deva IN\n\
-    noj Latn CO\n\
-    nok Latn US\n\
-    nop Latn PG\n\
-    noq Latn CD\n\
-    nos Yiii CN\n\
-    not Latn PE\n\
-    nou Latn PG\n\
-    nov Latn 001\n\
-    now Latn TZ\n\
-    noy Latn TD\n\
-    npb Tibt BT\n\
-    npg Latn MM\n\
-    nph Latn IN\n\
-    npl Latn MX\n\
-    npn Latn PG\n\
-    npo Latn IN\n\
-    nps Latn ID\n\
-    npu Latn IN\n\
-    npx Latn SB\n\
-    npy Latn ID\n\
-    nqg Latn BJ\n\
-    nqk Latn BJ\n\
-    nql Latn AO\n\
-    nqm Latn ID\n\
-    nqn Latn PG\n\
-    nqq Latn MM\n\
-    nqt Latn NG\n\
-    nqy Latn MM\n\
-    nra Latn GA\n\
-    nrb Latn ER\n\
-    nre Latn IN\n\
-    nrf Latn JE\n\
-    nrg Latn VU\n\
-    nri Latn IN\n\
-    nrk Latn AU\n\
-    nrl Latn AU\n\
-    nrm Latn MY\n\
-    nrn Runr GB\n\
-    nrp Latn IT\n\
-    nru Latn CN\n\
-    nrx Latn AU\n\
-    nrz Latn PG\n\
-    nsa Latn IN\n\
-    nsb Latn ZA\n\
-    nsc Latn NG\n\
-    nsd Yiii CN\n\
-    nsf Yiii CN\n\
-    nsg Latn TZ\n\
-    nsh Latn CM\n\
-    nsm Latn IN\n\
-    nsn Latn PG\n\
-    nsq Latn US\n\
-    nss Latn PG\n\
-    nsu Latn MX\n\
-    nsv Yiii CN\n\
-    nsw Latn VU\n\
-    nsx Latn AO\n\
-    nsy Latn ID\n\
-    nsz Latn US\n\
-    ntd Latn MY\n\
-    nte Latn MZ\n\
-    ntg Latn AU\n\
-    nti Latn BF\n\
-    ntj Latn AU\n\
-    ntk Latn TZ\n\
-    ntm Latn BJ\n\
-    nto Latn CD\n\
-    ntp Latn MX\n\
-    ntr Latn GH\n\
-    ntu Latn SB\n\
-    ntx Latn MM\n\
-    nty Yiii VN\n\
-    ntz Arab IR\n\
-    nua Latn NC\n\
-    nuc Latn BR\n\
-    nud Latn PG\n\
-    nue Latn CD\n\
-    nuf Latn CN\n\
-    nug Latn AU\n\
-    nuh Latn NG\n\
-    nui Latn GQ\n\
-    nuj Latn UG\n\
-    nuk Latn CA\n\
-    num Latn TO\n\
-    nun Latn MM\n\
-    nuo Latn VN\n\
-    nup Latn NG\n\
-    nuq Latn PG\n\
-    nur Latn PG\n\
-    nut Latn VN\n\
-    nuu Latn CD\n\
-    nuv Latn BF\n\
-    nuw Latn FM\n\
-    nux Latn PG\n\
-    nuy Latn AU\n\
-    nuz Latn MX\n\
-    nvh Latn VU\n\
-    nvm Latn PG\n\
-    nvo Latn CM\n\
-    nwb Latn CI\n\
-    nwc Newa NP\n\
-    nwe Latn CM\n\
-    nwg Latn AU\n\
-    nwi Latn VU\n\
-    nwm Latn SS\n\
-    nwo Latn AU\n\
-    nwr Latn PG\n\
-    nww Latn TZ\n\
-    nwx Deva NP\n\
-    nxa Latn TL\n\
-    nxd Latn CD\n\
-    nxe Latn ID\n\
-    nxg Latn ID\n\
-    nxi Latn TZ\n\
-    nxl Latn ID\n\
-    nxn Latn AU\n\
-    nxo Latn GA\n\
-    nxr Latn PG\n\
-    nxx Latn ID\n\
-    nyb Latn GH\n\
-    nyc Latn CD\n\
-    nyd Latn KE\n\
-    nye Latn AO\n\
-    nyf Latn KE\n\
-    nyg Latn CD\n\
-    nyh Latn AU\n\
-    nyi Latn SD\n\
-    nyj Latn CD\n\
-    nyk Latn AO\n\
-    nyl Thai TH\n\
-    nyo Latn UG\n\
-    nyp Latn UG\n\
-    nyq Arab IR\n\
-    nyr Latn MW\n\
-    nys Latn AU\n\
-    nyt Latn AU\n\
-    nyu Latn MZ\n\
-    nyv Latn AU\n\
-    nyw Thai TH\n\
-    nyx Latn AU\n\
-    nyy Latn TZ\n\
-    nza Latn CM\n\
-    nzb Latn GA\n\
-    nzd Latn CD\n\
-    nzk Latn CF\n\
-    nzm Latn IN\n\
-    nzr Latn NG\n\
-    nzu Latn CG\n\
-    nzy Latn TD\n\
-    nzz Latn ML\n\
-    oaa Cyrl RU\n\
-    oac Cyrl RU\n\
-    oar Syrc SY\n\
-    oav Geor GE\n\
-    obi Latn US\n\
-    obk Latn PH\n\
-    obl Latn CM\n\
-    obm Phnx JO\n\
-    obo Latn PH\n\
-    obr Mymr MM\n\
-    obt Latn FR\n\
-    obu Latn NG\n\
-    oca Latn PE\n\
-    oco Latn GB\n\
-    ocu Latn MX\n\
-    oda Latn NG\n\
-    odk Arab PK\n\
-    odt Latn NL\n\
-    odu Latn NG\n\
-    ofs Latn NL\n\
-    ofu Latn NG\n\
-    ogb Latn NG\n\
-    ogc Latn NG\n\
-    ogg Latn NG\n\
-    ogo Latn NG\n\
-    ogu Latn NG\n\
-    oht Xsux TR\n\
-    ohu Latn HU\n\
-    oia Latn ID\n\
-    oie Latn SS\n\
-    oin Latn PG\n\
-    ojb Latn CA\n\
-    ojc Latn CA\n\
-    ojv Latn SB\n\
-    okb Latn NG\n\
-    okc Latn CD\n\
-    okd Latn NG\n\
-    oke Latn NG\n\
-    okg Latn AU\n\
-    oki Latn KE\n\
-    okk Latn PG\n\
-    okm Hang KR\n\
-    oko Hani KR\n\
-    okr Latn NG\n\
-    oks Latn NG\n\
-    oku Latn CM\n\
-    okv Latn PG\n\
-    okx Latn NG\n\
-    okz Khmr KH\n\
-    ola Deva NP\n\
-    old Latn TZ\n\
-    ole Tibt BT\n\
-    olk Latn AU\n\
-    olm Latn NG\n\
-    olo Latn RU\n\
-    olr Latn VU\n\
-    olt Latn LT\n\
-    olu Latn AO\n\
-    oma Latn US\n\
-    omb Latn VU\n\
-    omc Latn PE\n\
-    omg Latn PE\n\
-    omi Latn CD\n\
-    omk Cyrl RU\n\
-    oml Latn CD\n\
-    omo Latn PG\n\
-    omp Mtei IN\n\
-    omr Modi IN\n\
-    omt Latn KE\n\
-    omu Latn PE\n\
-    omw Latn PG\n\
-    omx Mymr MM\n\
-    ona Latn AR\n\
-    one Latn CA\n\
-    ong Latn PG\n\
-    oni Latn ID\n\
-    onj Latn PG\n\
-    onk Latn PG\n\
-    onn Latn PG\n\
-    ono Latn CA\n\
-    onp Latn IN\n\
-    onr Latn PG\n\
-    ons Latn PG\n\
-    ont Latn PG\n\
-    onu Latn VU\n\
-    onx Latn ID\n\
-    ood Latn US\n\
-    oon Deva IN\n\
-    oor Latn ZA\n\
-    opa Latn NG\n\
-    opk Latn ID\n\
-    opm Latn PG\n\
-    opo Latn PG\n\
-    opt Latn MX\n\
-    opy Latn BR\n\
-    ora Latn SB\n\
-    orc Latn KE\n\
-    ore Latn PE\n\
-    org Latn NG\n\
-    orn Latn MY\n\
-    oro Latn PG\n\
-    orr Latn NG\n\
-    ors Latn MY\n\
-    ort Telu IN\n\
-    oru Arab PK\n\
-    orv Cyrl RU\n\
-    orw Latn BR\n\
-    orx Latn NG\n\
-    orz Latn ID\n\
-    osc Ital IT\n\
-    osi Java ID\n\
-    oso Latn NG\n\
-    osp Latn ES\n\
-    ost Latn CM\n\
-    osu Latn PG\n\
-    osx Latn DE\n\
-    ota Arab TR\n\
-    otb Tibt CN\n\
-    otd Latn ID\n\
-    ote Latn MX\n\
-    oti Latn BR\n\
-    otl Latn MX\n\
-    otm Latn MX\n\
-    otn Latn MX\n\
-    otq Latn MX\n\
-    otr Latn SD\n\
-    ots Latn MX\n\
-    ott Latn MX\n\
-    otu Latn BR\n\
-    otw Latn CA\n\
-    otx Latn MX\n\
-    oty Gran IN\n\
-    otz Latn MX\n\
-    oub Latn LR\n\
-    oue Latn PG\n\
-    oum Latn PG\n\
-    ovd Latn SE\n\
-    owi Latn PG\n\
-    owl Latn GB\n\
-    oyd Latn ET\n\
-    oym Latn BR\n\
-    oyy Latn PG\n\
-    ozm Latn CM\n\
-    pab Latn BR\n\
-    pac Latn VN\n\
-    pad Latn BR\n\
-    pae Latn CD\n\
-    paf Latn BR\n\
-    pah Latn BR\n\
-    pai Latn NG\n\
-    pak Latn BR\n\
-    pao Latn US\n\
-    paq Cyrl TJ\n\
-    par Latn US\n\
-    pas Latn ID\n\
-    pav Latn BR\n\
-    paw Latn US\n\
-    pax Latn BR\n\
-    pay Latn HN\n\
-    paz Latn BR\n\
-    pbb Latn CO\n\
-    pbc Latn GY\n\
-    pbe Latn MX\n\
-    pbf Latn MX\n\
-    pbg Latn VE\n\
-    pbh Latn VE\n\
-    pbi Latn CM\n\
-    pbl Latn NG\n\
-    pbm Latn MX\n\
-    pbn Latn NG\n\
-    pbo Latn GW\n\
-    pbp Latn GN\n\
-    pbr Latn TZ\n\
-    pbs Latn MX\n\
-    pbt Arab AF\n\
-    pbv Latn IN\n\
-    pby Latn PG\n\
-    pca Latn MX\n\
-    pcb Khmr KH\n\
-    pcc Latn CN\n\
-    pce Mymr MM\n\
-    pcf Mlym IN\n\
-    pcg Mlym IN\n\
-    pch Deva IN\n\
-    pci Deva IN\n\
-    pcj Telu IN\n\
-    pck Latn IN\n\
-    pcn Latn NG\n\
-    pcp Latn BO\n\
-    pcw Latn NG\n\
-    pda Latn PG\n\
-    pdn Latn ID\n\
-    pdo Latn ID\n\
-    pdu Latn MM\n\
-    pea Latn ID\n\
-    peb Latn US\n\
-    ped Latn PG\n\
-    pee Latn ID\n\
-    peg Orya IN\n\
-    pei Latn MX\n\
-    pek Latn PG\n\
-    pel Latn ID\n\
-    pem Latn CD\n\
-    pep Latn PG\n\
-    peq Latn US\n\
-    pev Latn VE\n\
-    pex Latn PG\n\
-    pey Latn ID\n\
-    pez Latn MY\n\
-    pfa Latn FM\n\
-    pfe Latn CM\n\
-    pga Latn SS\n\
-    pgd Khar PK\n\
-    pgg Deva IN\n\
-    pgi Latn PG\n\
-    pgk Latn VU\n\
-    pgl Ogam IE\n\
-    pgn Ital IT\n\
-    pgs Latn NG\n\
-    pgu Latn ID\n\
-    phd Deva IN\n\
-    phg Latn VN\n\
-    phh Latn VN\n\
-    phk Mymr IN\n\
-    phl Arab PK\n\
-    phm Latn MZ\n\
-    pho Laoo LA\n\
-    phr Arab PK\n\
-    pht Thai TH\n\
-    phu Thai TH\n\
-    phv Arab AF\n\
-    phw Deva NP\n\
-    pi Sinh IN\n\
-    pia Latn MX\n\
-    pib Latn PE\n\
-    pic Latn GA\n\
-    pid Latn VE\n\
-    pif Latn FM\n\
-    pig Latn PE\n\
-    pih Latn NF\n\
-    pij Latn CO\n\
-    pil Latn BJ\n\
-    pim Latn US\n\
-    pin Latn PG\n\
-    pio Latn CO\n\
-    pip Latn NG\n\
-    pir Latn BR\n\
-    pit Latn AU\n\
-    piu Latn AU\n\
-    piv Latn SB\n\
-    piw Latn TZ\n\
-    pix Latn PG\n\
-    piy Latn NG\n\
-    piz Latn NC\n\
-    pjt Latn AU\n\
-    pkb Latn KE\n\
-    pkg Latn PG\n\
-    pkh Latn BD\n\
-    pkn Latn AU\n\
-    pkp Latn CK\n\
-    pkr Mlym IN\n\
-    pku Latn ID\n\
-    pla Latn PG\n\
-    plb Latn VU\n\
-    plc Latn PH\n\
-    pld Latn GB\n\
-    ple Latn ID\n\
-    plg Latn AR\n\
-    plh Latn ID\n\
-    plk Arab PK\n\
-    pll Mymr MM\n\
-    pln Latn CO\n\
-    plo Latn MX\n\
-    plr Latn CI\n\
-    pls Latn MX\n\
-    plu Latn BR\n\
-    plv Latn PH\n\
-    plw Latn PH\n\
-    plz Latn MY\n\
-    pma Latn VU\n\
-    pmb Latn CD\n\
-    pmd Latn AU\n\
-    pme Latn NC\n\
-    pmf Latn ID\n\
-    pmh Brah IN\n\
-    pmi Latn CN\n\
-    pmj Latn CN\n\
-    pml Latn TN\n\
-    pmm Latn CM\n\
-    pmn Latn CM\n\
-    pmo Latn ID\n\
-    pmq Latn MX\n\
-    pmr Latn PG\n\
-    pmt Latn PF\n\
-    pmw Latn US\n\
-    pmx Latn IN\n\
-    pmy Latn ID\n\
-    pmz Latn MX\n\
-    pna Latn MY\n\
-    pnc Latn ID\n\
-    pnd Latn AO\n\
-    pne Latn MY\n\
-    png Latn NG\n\
-    pnh Latn CK\n\
-    pni Latn ID\n\
-    pnj Latn AU\n\
-    pnk Latn BO\n\
-    pnl Latn BF\n\
-    pnm Latn MY\n\
-    pnn Latn PG\n\
-    pno Latn PE\n\
-    pnp Latn ID\n\
-    pnq Latn BF\n\
-    pnr Latn PG\n\
-    pns Latn ID\n\
-    pnv Latn AU\n\
-    pnw Latn AU\n\
-    pny Latn CM\n\
-    pnz Latn CF\n\
-    poc Latn GT\n\
-    poe Latn MX\n\
-    pof Latn CD\n\
-    pog Latn BR\n\
-    poh Latn GT\n\
-    poi Latn MX\n\
-    pok Latn BR\n\
-    pom Latn US\n\
-    poo Latn US\n\
-    pop Latn NC\n\
-    poq Latn MX\n\
-    pos Latn MX\n\
-    pot Latn US\n\
-    pov Latn GW\n\
-    pow Latn MX\n\
-    poy Latn TZ\n\
-    ppe Latn PG\n\
-    ppi Latn MX\n\
-    ppk Latn ID\n\
-    ppm Latn ID\n\
-    ppn Latn PG\n\
-    ppo Latn PG\n\
-    ppp Latn CD\n\
-    ppq Latn PG\n\
-    pps Latn MX\n\
-    ppt Latn PG\n\
-    pqa Latn NG\n\
-    prc Arab AF\n\
-    pre Latn ST\n\
-    prf Latn PH\n\
-    prh Latn PH\n\
-    pri Latn NC\n\
-    prk Latn MM\n\
-    prm Latn PG\n\
-    pro Latn FR\n\
-    prq Latn PE\n\
-    prr Latn BR\n\
-    prt Thai TH\n\
-    pru Latn ID\n\
-    prw Latn PG\n\
-    prx Arab IN\n\
-    psa Latn ID\n\
-    pse Latn ID\n\
-    psh Arab AF\n\
-    psi Arab AF\n\
-    psm Latn BO\n\
-    psn Latn ID\n\
-    psq Latn PG\n\
-    pss Latn PG\n\
-    pst Arab PK\n\
-    psu Brah IN\n\
-    psw Latn VU\n\
-    pta Latn PY\n\
-    pth Latn BR\n\
-    pti Latn AU\n\
-    ptn Latn ID\n\
-    pto Latn BR\n\
-    ptp Latn PG\n\
-    ptr Latn VU\n\
-    ptt Latn ID\n\
-    ptu Latn ID\n\
-    ptv Latn VU\n\
-    pua Latn MX\n\
-    pub Latn IN\n\
-    puc Latn ID\n\
-    pud Latn ID\n\
-    pue Latn AR\n\
-    puf Latn ID\n\
-    pug Latn BF\n\
-    pui Latn CO\n\
-    puj Latn ID\n\
-    pum Deva NP\n\
-    puo Latn VN\n\
-    pup Latn PG\n\
-    puq Latn BO\n\
-    pur Latn BR\n\
-    put Latn ID\n\
-    puw Latn FM\n\
-    pux Latn PG\n\
-    puy Latn US\n\
-    pwa Latn PG\n\
-    pwb Latn NG\n\
-    pwg Latn PG\n\
-    pwm Latn PH\n\
-    pwn Latn TW\n\
-    pwo Mymr MM\n\
-    pwr Deva IN\n\
-    pww Thai TH\n\
-    pxm Latn MX\n\
-    pye Latn CI\n\
-    pym Latn NG\n\
-    pyn Latn BR\n\
-    pyu Latn TW\n\
-    pyx Mymr MM\n\
-    pyy Latn MM\n\
-    pze Latn NG\n\
-    pzh Latn TW\n\
-    pzn Latn MM\n\
-    qua Latn US\n\
-    qub Latn PE\n\
-    qud Latn EC\n\
-    quf Latn PE\n\
-    qui Latn US\n\
-    quk Latn PE\n\
-    qul Latn BO\n\
-    qum Latn GT\n\
-    qun Latn US\n\
-    qup Latn PE\n\
-    quq Latn ES\n\
-    qur Latn PE\n\
-    qus Latn AR\n\
-    quv Latn GT\n\
-    quw Latn EC\n\
-    qux Latn PE\n\
-    quy Latn PE\n\
-    qva Latn PE\n\
-    qvc Latn PE\n\
-    qve Latn PE\n\
-    qvh Latn PE\n\
-    qvi Latn EC\n\
-    qvj Latn EC\n\
-    qvl Latn PE\n\
-    qvm Latn PE\n\
-    qvn Latn PE\n\
-    qvo Latn PE\n\
-    qvp Latn PE\n\
-    qvs Latn PE\n\
-    qvw Latn PE\n\
-    qvz Latn EC\n\
-    qwa Latn PE\n\
-    qwc Latn PE\n\
-    qwh Latn PE\n\
-    qwm Latn HU\n\
-    qws Latn PE\n\
-    qwt Latn US\n\
-    qxa Latn PE\n\
-    qxc Latn PE\n\
-    qxh Latn PE\n\
-    qxl Latn EC\n\
-    qxn Latn PE\n\
-    qxo Latn PE\n\
-    qxp Latn PE\n\
-    qxq Arab IR\n\
-    qxr Latn EC\n\
-    qxt Latn PE\n\
-    qxu Latn PE\n\
-    qxw Latn PE\n\
-    qya Latn 001\n\
-    qyp Latn US\n\
-    raa Deva NP\n\
-    rab Deva NP\n\
-    rac Latn ID\n\
-    rad Latn VN\n\
-    raf Deva NP\n\
-    rag Latn KE\n\
-    rah Beng IN\n\
-    rai Latn PG\n\
-    rak Latn PG\n\
-    ram Latn BR\n\
-    ran Latn ID\n\
-    rao Latn PG\n\
-    rap Latn CL\n\
-    rar Latn CK\n\
-    rav Deva NP\n\
-    raw Latn MM\n\
-    rax Latn NG\n\
-    ray Latn PF\n\
-    raz Latn ID\n\
-    rbb Mymr MM\n\
-    rbk Latn PH\n\
-    rbl Latn PH\n\
-    rbp Latn AU\n\
-    rdb Arab IR\n\
-    rea Latn PG\n\
-    reb Latn ID\n\
-    ree Latn MY\n\
-    reg Latn TZ\n\
-    rei Orya IN\n\
-    rel Latn KE\n\
-    rem Latn PE\n\
-    ren Latn VN\n\
-    res Latn NG\n\
-    ret Latn ID\n\
-    rey Latn BO\n\
-    rga Latn VU\n\
-    rgr Latn PE\n\
-    rgs Latn VN\n\
-    rgu Latn ID\n\
-    rhp Latn PG\n\
-    ril Latn MM\n\
-    rim Latn TZ\n\
-    rin Latn NG\n\
-    rir Latn ID\n\
-    rit Latn AU\n\
-    riu Latn ID\n\
-    rjg Latn ID\n\
-    rji Deva NP\n\
-    rka Khmr KH\n\
-    rkb Latn BR\n\
-    rkh Latn CK\n\
-    rki Mymr MM\n\
-    rkm Latn BF\n\
-    rkw Latn AU\n\
-    rma Latn NI\n\
-    rmb Latn AU\n\
-    rmc Latn SK\n\
-    rmd Latn DK\n\
-    rme Latn GB\n\
-    rmg Latn NO\n\
-    rmh Latn ID\n\
-    rmi Armn AM\n\
-    rmk Latn PG\n\
-    rml Latn PL\n\
-    rmm Latn ID\n\
-    rmn Latn RS\n\
-    rmp Latn PG\n\
-    rmq Latn ES\n\
-    rmw Latn GB\n\
-    rmx Latn VN\n\
-    rmz Mymr IN\n\
-    rnd Latn CD\n\
-    rnl Latn IN\n\
-    rnn Latn ID\n\
-    rnr Latn AU\n\
-    rnw Latn TZ\n\
-    roc Latn VN\n\
-    rod Latn NG\n\
-    roe Latn PG\n\
-    rog Latn VN\n\
-    rol Latn PH\n\
-    rom Latn RO\n\
-    roo Latn PG\n\
-    rop Latn AU\n\
-    ror Latn ID\n\
-    rou Latn TD\n\
-    row Latn ID\n\
-    rpn Latn VU\n\
-    rpt Latn PG\n\
-    rri Latn SB\n\
-    rrm Latn NZ\n\
-    rro Latn PG\n\
-    rrt Latn AU\n\
-    rsk Cyrl RS\n\
-    rsw Latn NG\n\
-    rtc Latn MM\n\
-    rth Latn ID\n\
-    rtw Deva IN\n\
-    rub Latn UG\n\
-    ruc Latn UG\n\
-    ruf Latn TZ\n\
-    rui Latn TZ\n\
-    ruk Latn NG\n\
-    ruo Latn HR\n\
-    rup Latn RO\n\
-    ruq Latn GR\n\
-    rut Cyrl RU\n\
-    ruu Latn MY\n\
-    ruy Latn NG\n\
-    ruz Latn NG\n\
-    rwa Latn PG\n\
-    rwl Latn TZ\n\
-    rwm Latn UG\n\
-    rwo Latn PG\n\
-    rwr Deva IN\n\
-    rxd Latn AU\n\
-    rxw Latn AU\n\
-    saa Latn TD\n\
-    sab Latn PA\n\
-    sac Latn US\n\
-    sad Latn TZ\n\
-    sae Latn BR\n\
-    saj Latn ID\n\
-    sak Latn GA\n\
-    sam Samr PS\n\
-    sao Latn ID\n\
-    sar Latn BO\n\
-    sau Latn ID\n\
-    saw Latn ID\n\
-    sax Latn VU\n\
-    say Latn NG\n\
-    sba Latn TD\n\
-    sbb Latn SB\n\
-    sbc Latn PG\n\
-    sbd Latn BF\n\
-    sbe Latn PG\n\
-    sbg Latn ID\n\
-    sbh Latn PG\n\
-    sbi Latn PG\n\
-    sbj Latn TD\n\
-    sbk Latn TZ\n\
-    sbl Latn PH\n\
-    sbm Latn TZ\n\
-    sbn Arab PK\n\
-    sbo Latn MY\n\
-    sbq Latn PG\n\
-    sbr Latn ID\n\
-    sbs Latn NA\n\
-    sbt Latn ID\n\
-    sbu Tibt IN\n\
-    sbv Latn IT\n\
-    sbw Latn GA\n\
-    sbx Latn ID\n\
-    sby Latn ZM\n\
-    sbz Latn CF\n\
-    scb Latn VN\n\
-    sce Latn CN\n\
-    scf Latn PA\n\
-    scg Latn ID\n\
-    sch Latn IN\n\
-    sci Latn LK\n\
-    scl Arab PK\n\
-    scp Deva NP\n\
-    scs Latn CA\n\
-    sct Laoo LA\n\
-    scu Takr IN\n\
-    scv Latn NG\n\
-    scw Latn NG\n\
-    scx Grek IT\n\
-    sda Latn ID\n\
-    sdb Arab IQ\n\
-    sde Latn NG\n\
-    sdf Arab IQ\n\
-    sdg Arab AF\n\
-    sdj Latn CG\n\
-    sdk Latn PG\n\
-    sdn Latn IT\n\
-    sdo Latn MY\n\
-    sdq Latn ID\n\
-    sdr Beng BD\n\
-    sds Arab TN\n\
-    sdu Latn ID\n\
-    sdx Latn MY\n\
-    sea Latn MY\n\
-    seb Latn CI\n\
-    sec Latn CA\n\
-    sed Latn VN\n\
-    see Latn US\n\
-    seg Latn TZ\n\
-    sej Latn PG\n\
-    sek Latn CA\n\
-    sel Cyrl RU\n\
-    sen Latn BF\n\
-    seo Latn PG\n\
-    sep Latn BF\n\
-    seq Latn BF\n\
-    ser Latn US\n\
-    set Latn ID\n\
-    seu Latn ID\n\
-    sev Latn CI\n\
-    sew Latn PG\n\
-    sey Latn EC\n\
-    sez Latn MM\n\
-    sfe Latn PH\n\
-    sfm Plrd CN\n\
-    sfw Latn GH\n\
-    sgb Latn PH\n\
-    sgc Latn KE\n\
-    sgd Latn PH\n\
-    sge Latn ID\n\
-    sgh Cyrl TJ\n\
-    sgi Latn CM\n\
-    sgj Deva IN\n\
-    sgm Latn KE\n\
-    sgp Latn IN\n\
-    sgr Arab IR\n\
-    sgt Tibt BT\n\
-    sgu Latn ID\n\
-    sgw Ethi ET\n\
-    sgy Arab AF\n\
-    sgz Latn PG\n\
-    sha Latn NG\n\
-    shb Latn BR\n\
-    shc Latn CD\n\
-    shd Arab PK\n\
-    she Latn ET\n\
-    shg Latn BW\n\
-    shh Latn US\n\
-    shj Latn SD\n\
-    shk Latn SS\n\
-    shm Arab IR\n\
-    sho Latn NG\n\
-    shp Latn PE\n\
-    shq Latn ZM\n\
-    shr Latn CD\n\
-    shs Latn CA\n\
-    sht Latn US\n\
-    shu Arab TD\n\
-    shv Arab OM\n\
-    shw Latn SD\n\
-    shy Latn DZ\n\
-    shz Latn ML\n\
-    sia Cyrl RU\n\
-    sib Latn MY\n\
-    sie Latn ZM\n\
-    sif Latn BF\n\
-    sig Latn GH\n\
-    sih Latn NC\n\
-    sii Latn IN\n\
-    sij Latn PG\n\
-    sik Latn BR\n\
-    sil Latn GH\n\
-    sim Latn PG\n\
-    sip Tibt IN\n\
-    siq Latn PG\n\
-    sir Latn NG\n\
-    sis Latn US\n\
-    siu Latn PG\n\
-    siv Latn PG\n\
-    siw Latn PG\n\
-    six Latn PG\n\
-    siy Arab IR\n\
-    siz Arab EG\n\
-    sja Latn CO\n\
-    sjb Latn ID\n\
-    sjd Cyrl RU\n\
-    sje Latn SE\n\
-    sjg Latn TD\n\
-    sjl Latn IN\n\
-    sjm Latn PH\n\
-    sjp Deva IN\n\
-    sjr Latn PG\n\
-    sjt Cyrl RU\n\
-    sju Latn SE\n\
-    sjw Latn US\n\
-    ska Latn US\n\
-    skb Thai TH\n\
-    skc Latn PG\n\
-    skd Latn US\n\
-    ske Latn VU\n\
-    skf Latn BR\n\
-    skg Latn MG\n\
-    skh Latn ID\n\
-    ski Latn ID\n\
-    skj Deva NP\n\
-    skm Latn PG\n\
-    skn Latn PH\n\
-    sko Latn ID\n\
-    skp Latn MY\n\
-    skq Latn BF\n\
-    sks Latn PG\n\
-    skt Latn CD\n\
-    sku Latn VU\n\
-    skv Latn ID\n\
-    skw Latn GY\n\
-    skx Latn ID\n\
-    sky Latn SB\n\
-    skz Latn ID\n\
-    slc Latn CO\n\
-    sld Latn BF\n\
-    slg Latn ID\n\
-    slh Latn US\n\
-    slj Latn BR\n\
-    sll Latn PG\n\
-    slm Latn PH\n\
-    sln Latn US\n\
-    slp Latn ID\n\
-    slr Latn CN\n\
-    slu Latn ID\n\
-    slw Latn PG\n\
-    slx Latn CD\n\
-    slz Latn ID\n\
-    smb Latn PG\n\
-    smc Latn PG\n\
-    smf Latn PG\n\
-    smg Latn PG\n\
-    smh Yiii CN\n\
-    smk Latn PH\n\
-    sml Latn PH\n\
-    smq Latn PG\n\
-    smr Latn ID\n\
-    smt Latn IN\n\
-    smu Khmr KH\n\
-    smw Latn ID\n\
-    smx Latn CD\n\
-    smy Arab IR\n\
-    smz Latn PG\n\
-    snc Latn PG\n\
-    sne Latn MY\n\
-    sng Latn CD\n\
-    sni Latn PE\n\
-    snj Latn CF\n\
-    snl Latn PH\n\
-    snm Latn UG\n\
-    snn Latn CO\n\
-    sno Latn US\n\
-    snp Latn PG\n\
-    snq Latn GA\n\
-    snr Latn PG\n\
-    sns Latn VU\n\
-    snu Latn ID\n\
-    snv Latn MY\n\
-    snw Latn GH\n\
-    snx Latn PG\n\
-    sny Latn PG\n\
-    snz Latn PG\n\
-    soa Tavt TH\n\
-    sob Latn ID\n\
-    soc Latn CD\n\
-    sod Latn CD\n\
-    soe Latn CD\n\
-    soi Deva NP\n\
-    sok Latn TD\n\
-    sol Latn PG\n\
-    soo Latn CD\n\
-    sop Latn CD\n\
-    soq Latn PG\n\
-    sor Latn TD\n\
-    sos Latn BF\n\
-    sov Latn PW\n\
-    sow Latn PG\n\
-    sox Latn CM\n\
-    soy Latn BJ\n\
-    soz Latn TZ\n\
-    spb Latn ID\n\
-    spc Latn VE\n\
-    spd Latn PG\n\
-    spe Latn PG\n\
-    spg Latn MY\n\
-    spi Latn ID\n\
-    spk Latn PG\n\
-    spl Latn PG\n\
-    spm Latn PG\n\
-    spn Latn PY\n\
-    spo Latn US\n\
-    spp Latn ML\n\
-    spq Latn PE\n\
-    spr Latn ID\n\
-    sps Latn PG\n\
-    spt Tibt IN\n\
-    spv Orya IN\n\
-    sqa Latn NG\n\
-    sqh Latn NG\n\
-    sqm Latn CF\n\
-    sqo Arab IR\n\
-    sqq Laoo LA\n\
-    sqt Arab YE\n\
-    squ Latn CA\n\
-    sra Latn PG\n\
-    sre Latn ID\n\
-    srf Latn PG\n\
-    srg Latn PH\n\
-    srh Arab CN\n\
-    sri Latn CO\n\
-    srk Latn MY\n\
-    srl Latn ID\n\
-    srm Latn SR\n\
-    sro Latn IT\n\
-    srq Latn BO\n\
-    srs Latn CA\n\
-    srt Latn ID\n\
-    sru Latn BR\n\
-    srv Latn PH\n\
-    srw Latn ID\n\
-    sry Latn PG\n\
-    srz Arab IR\n\
-    ssb Latn PH\n\
-    ssc Latn TZ\n\
-    ssd Latn PG\n\
-    sse Latn PH\n\
-    ssf Latn TW\n\
-    ssg Latn PG\n\
-    ssh Arab AE\n\
-    ssj Latn PG\n\
-    ssl Latn GH\n\
-    ssm Latn MY\n\
-    ssn Latn KE\n\
-    sso Latn PG\n\
-    ssq Latn ID\n\
-    sss Laoo LA\n\
-    sst Latn PG\n\
-    ssu Latn PG\n\
-    ssv Latn VU\n\
-    ssx Latn PG\n\
-    ssz Latn PG\n\
-    sta Latn ZM\n\
-    stb Latn PH\n\
-    ste Latn ID\n\
-    stf Latn PG\n\
-    stg Latn VN\n\
-    sth Latn IE\n\
-    sti Latn VN\n\
-    stj Latn BF\n\
-    stk Latn PG\n\
-    stl Latn NL\n\
-    stm Latn PG\n\
-    stn Latn SB\n\
-    sto Latn CA\n\
-    stp Latn MX\n\
-    str Latn CA\n\
-    sts Arab AF\n\
-    stt Latn VN\n\
-    stv Ethi ET\n\
-    stw Latn FM\n\
-    sty Cyrl RU\n\
-    sua Latn PG\n\
-    sub Latn CD\n\
-    suc Latn PH\n\
-    sue Latn PG\n\
-    sug Latn PG\n\
-    sui Latn PG\n\
-    suj Latn TZ\n\
-    suo Latn PG\n\
-    suq Latn ET\n\
-    sur Latn NG\n\
-    sut Latn NI\n\
-    suv Latn IN\n\
-    suw Latn TZ\n\
-    suy Latn BR\n\
-    sva Geor GE\n\
-    svb Latn PG\n\
-    svc Latn VC\n\
-    sve Latn ID\n\
-    svm Latn IT\n\
-    svs Latn SB\n\
-    swf Latn CD\n\
-    swi Hani CN\n\
-    swj Latn GA\n\
-    swk Latn MW\n\
-    swm Latn PG\n\
-    swo Latn BR\n\
-    swp Latn PG\n\
-    swq Latn CM\n\
-    swr Latn ID\n\
-    sws Latn ID\n\
-    swt Latn ID\n\
-    swu Latn ID\n\
-    sww Latn VU\n\
-    swx Latn BR\n\
-    swy Latn TD\n\
-    sxb Latn KE\n\
-    sxe Latn GA\n\
-    sxr Latn TW\n\
-    sxs Latn NG\n\
-    sxu Runr DE\n\
-    sxw Latn BJ\n\
-    sya Latn ID\n\
-    syb Latn PH\n\
-    syc Syrc TR\n\
-    syi Latn GA\n\
-    syk Latn NG\n\
-    sym Latn BF\n\
-    syn Syrc IR\n\
-    syo Latn KH\n\
-    sys Latn TD\n\
-    syw Deva NP\n\
-    syx Latn GA\n\
-    sza Latn MY\n\
-    szb Latn ID\n\
-    szc Latn MY\n\
-    szg Latn CD\n\
-    szn Latn ID\n\
-    szp Latn ID\n\
-    szv Latn CM\n\
-    szw Latn ID\n\
-    szy Latn TW\n\
-    taa Latn US\n\
-    tab Cyrl RU\n\
-    tac Latn MX\n\
-    tad Latn ID\n\
-    tae Latn BR\n\
-    taf Latn BR\n\
-    tag Latn SD\n\
-    tak Latn NG\n\
-    tal Latn NG\n\
-    tan Latn NG\n\
-    tao Latn TW\n\
-    tap Latn CD\n\
-    taq Latn ML\n\
-    tar Latn MX\n\
-    tas Latn VN\n\
-    tau Latn US\n\
-    tav Latn CO\n\
-    taw Latn PG\n\
-    tax Latn TD\n\
-    tay Latn TW\n\
-    taz Latn SD\n\
-    tba Latn BR\n\
-    tbc Latn PG\n\
-    tbd Latn PG\n\
-    tbe Latn SB\n\
-    tbf Latn PG\n\
-    tbg Latn PG\n\
-    tbh Latn AU\n\
-    tbi Latn SD\n\
-    tbj Latn PG\n\
-    tbk Tagb PH\n\
-    tbl Latn PH\n\
-    tbm Latn CD\n\
-    tbn Latn CO\n\
-    tbo Latn PG\n\
-    tbp Latn ID\n\
-    tbs Latn PG\n\
-    tbt Latn CD\n\
-    tbu Latn MX\n\
-    tbv Latn PG\n\
-    tbx Latn PG\n\
-    tby Latn ID\n\
-    tbz Latn BJ\n\
-    tca Latn BR\n\
-    tcb Latn US\n\
-    tcc Latn TZ\n\
-    tcd Latn GH\n\
-    tce Latn CA\n\
-    tcf Latn MX\n\
-    tcg Latn ID\n\
-    tch Latn TC\n\
-    tci Latn PG\n\
-    tck Latn GA\n\
-    tcm Latn ID\n\
-    tcn Tibt NP\n\
-    tco Mymr MM\n\
-    tcp Latn MM\n\
-    tcq Latn ID\n\
-    tcs Latn AU\n\
-    tcu Latn MX\n\
-    tcw Latn MX\n\
-    tcx Taml IN\n\
-    tcz Latn IN\n\
-    tda Tfng NE\n\
-    tdb Deva IN\n\
-    tdc Latn CO\n\
-    tde Latn ML\n\
-    tdi Latn ID\n\
-    tdj Latn ID\n\
-    tdk Latn NG\n\
-    tdl Latn NG\n\
-    tdm Latn GY\n\
-    tdn Latn ID\n\
-    tdo Latn NG\n\
-    tdq Latn NG\n\
-    tdr Latn VN\n\
-    tds Latn ID\n\
-    tdt Latn TL\n\
-    tdv Latn NG\n\
-    tdx Latn MG\n\
-    tdy Latn PH\n\
-    tea Latn MY\n\
-    teb Latn EC\n\
-    tec Latn KE\n\
-    ted Latn CI\n\
-    tee Latn MX\n\
-    teg Latn GA\n\
-    teh Latn AR\n\
-    tei Latn PG\n\
-    tek Latn CD\n\
-    ten Latn CO\n\
-    tep Latn MX\n\
-    teq Latn SD\n\
-    ter Latn BR\n\
-    tes Java ID\n\
-    teu Latn UG\n\
-    tev Latn ID\n\
-    tew Latn US\n\
-    tex Latn SS\n\
-    tey Latn SD\n\
-    tez Latn NE\n\
-    tfi Latn BJ\n\
-    tfn Latn US\n\
-    tfo Latn ID\n\
-    tfr Latn PA\n\
-    tft Latn ID\n\
-    tga Latn KE\n\
-    tgb Latn MY\n\
-    tgc Latn PG\n\
-    tgd Latn NG\n\
-    tge Deva NP\n\
-    tgf Tibt BT\n\
-    tgh Latn TT\n\
-    tgi Latn PG\n\
-    tgj Latn IN\n\
-    tgn Latn PH\n\
-    tgo Latn PG\n\
-    tgp Latn VU\n\
-    tgq Latn MY\n\
-    tgs Latn VU\n\
-    tgt Latn PH\n\
-    tgu Latn PG\n\
-    tgv Latn BR\n\
-    tgw Latn CI\n\
-    tgx Latn CA\n\
-    tgy Latn SS\n\
-    tgz Latn AU\n\
-    thd Latn AU\n\
-    the Deva NP\n\
-    thf Deva NP\n\
-    thh Latn MX\n\
-    thi Tale LA\n\
-    thk Latn KE\n\
-    thm Thai TH\n\
-    thp Latn CA\n\
-    ths Deva NP\n\
-    tht Latn CA\n\
-    thu Latn SS\n\
-    thv Latn DZ\n\
-    thy Latn NG\n\
-    thz Latn NE\n\
-    tic Latn SD\n\
-    tif Latn PG\n\
-    tih Latn MY\n\
-    tii Latn CD\n\
-    tij Deva NP\n\
-    tik Latn CM\n\
-    til Latn US\n\
-    tim Latn PG\n\
-    tin Cyrl RU\n\
-    tio Latn PG\n\
-    tip Latn ID\n\
-    tiq Latn BF\n\
-    tis Latn PH\n\
-    tit Latn CO\n\
-    tiu Latn PH\n\
-    tiw Latn AU\n\
-    tix Latn US\n\
-    tiy Latn PH\n\
-    tja Latn LR\n\
-    tjg Latn ID\n\
-    tji Latn CN\n\
-    tjj Latn AU\n\
-    tjl Mymr MM\n\
-    tjn Latn CI\n\
-    tjo Arab DZ\n\
-    tjp Latn AU\n\
-    tjs Latn CN\n\
-    tju Latn AU\n\
-    tjw Latn AU\n\
-    tka Latn BR\n\
-    tkb Deva IN\n\
-    tkd Latn TL\n\
-    tke Latn MZ\n\
-    tkf Latn BR\n\
-    tkg Latn MG\n\
-    tkp Latn SB\n\
-    tkq Latn NG\n\
-    tks Arab IR\n\
-    tku Latn MX\n\
-    tkv Latn PG\n\
-    tkw Latn SB\n\
-    tkx Latn ID\n\
-    tkz Latn VN\n\
-    tla Latn MX\n\
-    tlb Latn ID\n\
-    tlc Latn MX\n\
-    tld Latn ID\n\
-    tlf Latn PG\n\
-    tlg Latn ID\n\
-    tli Latn US\n\
-    tlj Latn UG\n\
-    tlk Latn ID\n\
-    tll Latn CD\n\
-    tlm Latn VU\n\
-    tln Latn ID\n\
-    tlp Latn MX\n\
-    tlq Latn MM\n\
-    tlr Latn SB\n\
-    tls Latn VU\n\
-    tlt Latn ID\n\
-    tlu Latn ID\n\
-    tlv Latn ID\n\
-    tlx Latn PG\n\
-    tma Latn TD\n\
-    tmb Latn VU\n\
-    tmc Latn TD\n\
-    tmd Latn PG\n\
-    tme Latn BR\n\
-    tmf Latn PY\n\
-    tmg Latn ID\n\
-    tmi Latn VU\n\
-    tmj Latn ID\n\
-    tml Latn ID\n\
-    tmm Latn VN\n\
-    tmn Latn ID\n\
-    tmo Latn MY\n\
-    tmq Latn PG\n\
-    tmr Syrc IL\n\
-    tmt Latn VU\n\
-    tmu Latn ID\n\
-    tmv Latn CD\n\
-    tmw Latn MY\n\
-    tmy Latn PG\n\
-    tmz Latn VE\n\
-    tna Latn BO\n\
-    tnb Latn CO\n\
-    tnc Latn CO\n\
-    tnd Latn CO\n\
-    tng Latn TD\n\
-    tnh Latn PG\n\
-    tni Latn ID\n\
-    tnk Latn VU\n\
-    tnl Latn VU\n\
-    tnm Latn ID\n\
-    tnn Latn VU\n\
-    tno Latn BO\n\
-    tnp Latn VU\n\
-    tnq Latn PR\n\
-    tns Latn PG\n\
-    tnt Latn ID\n\
-    tnv Cakm BD\n\
-    tnw Latn ID\n\
-    tnx Latn SB\n\
-    tny Latn TZ\n\
-    tob Latn AR\n\
-    toc Latn MX\n\
-    tod Latn GN\n\
-    tof Latn PG\n\
-    toh Latn MZ\n\
-    toj Latn MX\n\
-    tol Latn US\n\
-    tom Latn ID\n\
-    too Latn MX\n\
-    top Latn MX\n\
-    toq Latn SS\n\
-    tor Latn CD\n\
-    tos Latn MX\n\
-    tou Latn VN\n\
-    tov Arab IR\n\
-    tow Latn US\n\
-    tox Latn PW\n\
-    toy Latn ID\n\
-    toz Latn CM\n\
-    tpa Latn PG\n\
-    tpc Latn MX\n\
-    tpe Latn BD\n\
-    tpf Latn ID\n\
-    tpg Latn ID\n\
-    tpj Latn PY\n\
-    tpk Latn BR\n\
-    tpl Latn MX\n\
-    tpm Latn GH\n\
-    tpn Latn BR\n\
-    tpp Latn MX\n\
-    tpr Latn BR\n\
-    tpt Latn MX\n\
-    tpu Khmr KH\n\
-    tpv Latn MP\n\
-    tpx Latn MX\n\
-    tpy Latn BR\n\
-    tpz Latn PG\n\
-    tqb Latn BR\n\
-    tql Latn VU\n\
-    tqm Latn PG\n\
-    tqn Latn US\n\
-    tqo Latn PG\n\
-    tqp Latn PG\n\
-    tqt Latn MX\n\
-    tqu Latn SB\n\
-    tqw Latn US\n\
-    tra Arab AF\n\
-    trb Latn PG\n\
-    trc Latn MX\n\
-    tre Latn ID\n\
-    trf Latn TT\n\
-    trg Hebr IL\n\
-    trh Latn PG\n\
-    tri Latn SR\n\
-    trj Latn TD\n\
-    trl Latn GB\n\
-    trm Arab AF\n\
-    trn Latn BO\n\
-    tro Latn IN\n\
-    trp Latn IN\n\
-    trq Latn MX\n\
-    trr Latn PE\n\
-    trs Latn MX\n\
-    trt Latn ID\n\
-    trx Latn MY\n\
-    try Latn IN\n\
-    trz Latn BR\n\
-    tsa Latn CG\n\
-    tsb Latn ET\n\
-    tsc Latn MZ\n\
-    tsh Latn CM\n\
-    tsi Latn CA\n\
-    tsl Latn VN\n\
-    tsp Latn BF\n\
-    tsr Latn VU\n\
-    tst Latn ML\n\
-    tsu Latn TW\n\
-    tsv Latn GA\n\
-    tsw Latn NG\n\
-    tsx Latn PG\n\
-    tsz Latn MX\n\
-    ttb Latn NG\n\
-    ttc Latn GT\n\
-    ttd Latn PG\n\
-    tte Latn PG\n\
-    ttf Latn CM\n\
-    tth Laoo LA\n\
-    tti Latn ID\n\
-    ttk Latn CO\n\
-    ttl Latn ZM\n\
-    ttm Latn CA\n\
-    ttn Latn ID\n\
-    tto Laoo LA\n\
-    ttp Latn ID\n\
-    ttr Latn NG\n\
-    ttu Latn PG\n\
-    ttv Latn PG\n\
-    ttw Latn MY\n\
-    tty Latn ID\n\
-    ttz Deva NP\n\
-    tua Latn PG\n\
-    tub Latn US\n\
-    tuc Latn PG\n\
-    tud Latn BR\n\
-    tue Latn CO\n\
-    tuf Latn CO\n\
-    tug Latn TD\n\
-    tuh Latn PG\n\
-    tui Latn CM\n\
-    tuj Latn ID\n\
-    tul Latn NG\n\
-    tun Latn US\n\
-    tuo Latn BR\n\
-    tuq Latn TD\n\
-    tus Latn CA\n\
-    tuu Latn US\n\
-    tuv Latn KE\n\
-    tux Latn BR\n\
-    tuy Latn KE\n\
-    tuz Latn BF\n\
-    tva Latn SB\n\
-    tvd Latn NG\n\
-    tve Latn ID\n\
-    tvi Latn NG\n\
-    tvk Latn VU\n\
-    tvm Latn ID\n\
-    tvn Mymr MM\n\
-    tvo Latn ID\n\
-    tvs Latn KE\n\
-    tvt Latn IN\n\
-    tvu Latn CM\n\
-    tvw Latn ID\n\
-    tvx Latn TW\n\
-    twa Latn US\n\
-    twb Latn PH\n\
-    twd Latn NL\n\
-    twe Latn ID\n\
-    twf Latn US\n\
-    twg Latn ID\n\
-    twh Latn VN\n\
-    twl Latn MZ\n\
-    twm Deva IN\n\
-    twn Latn CM\n\
-    two Latn BW\n\
-    twp Latn PG\n\
-    twr Latn MX\n\
-    twt Latn BR\n\
-    twu Latn ID\n\
-    tww Latn PG\n\
-    twx Latn MZ\n\
-    twy Latn ID\n\
-    txa Latn MY\n\
-    txe Latn ID\n\
-    txi Latn BR\n\
-    txj Latn NG\n\
-    txm Latn ID\n\
-    txn Latn ID\n\
-    txq Latn ID\n\
-    txs Latn ID\n\
-    txt Latn ID\n\
-    txu Latn BR\n\
-    txx Latn MY\n\
-    txy Latn MG\n\
-    tya Latn PG\n\
-    tye Latn NG\n\
-    tyh Latn VN\n\
-    tyi Latn CG\n\
-    tyj Latn VN\n\
-    tyl Latn VN\n\
-    tyn Latn ID\n\
-    typ Latn AU\n\
-    tyr Tavt VN\n\
-    tys Latn VN\n\
-    tyt Latn VN\n\
-    tyu Latn BW\n\
-    tyx Latn CG\n\
-    tyy Latn NG\n\
-    tyz Latn VN\n\
-    tzh Latn MX\n\
-    tzj Latn GT\n\
-    tzl Latn 001\n\
-    tzn Latn ID\n\
-    tzo Latn MX\n\
-    tzx Latn PG\n\
-    uam Latn BR\n\
-    uar Latn PG\n\
-    uba Latn NG\n\
-    ubi Latn TD\n\
-    ubl Latn PH\n\
-    ubr Latn PG\n\
-    ubu Latn PG\n\
-    uby Latn TR\n\
-    uda Latn NG\n\
-    ude Cyrl RU\n\
-    udg Mlym IN\n\
-    udi Cyrl RU\n\
-    udj Latn ID\n\
-    udl Latn CM\n\
-    udu Latn SD\n\
-    ues Latn ID\n\
-    ufi Latn PG\n\
-    ugb Latn AU\n\
-    uge Latn SB\n\
-    ugh Cyrl RU\n\
-    ugo Thai TH\n\
-    uha Latn NG\n\
-    uhn Latn ID\n\
-    uis Latn PG\n\
-    uiv Latn CM\n\
-    uji Latn NG\n\
-    uka Latn ID\n\
-    ukg Latn PG\n\
-    ukh Latn CF\n\
-    uki Orya IN\n\
-    ukk Latn MM\n\
-    ukp Latn NG\n\
-    ukq Latn NG\n\
-    uku Latn NG\n\
-    ukv Latn SS\n\
-    ukw Latn NG\n\
-    uky Latn AU\n\
-    ula Latn NG\n\
-    ulb Latn NG\n\
-    ulc Cyrl RU\n\
-    ule Latn AR\n\
-    ulf Latn ID\n\
-    ulk Latn AU\n\
-    ulm Latn ID\n\
-    uln Latn PG\n\
-    ulu Latn ID\n\
-    ulw Latn NI\n\
-    uly Latn NG\n\
-    uma Latn US\n\
-    umd Latn AU\n\
-    umg Latn AU\n\
-    umi Latn MY\n\
-    umm Latn NG\n\
-    umn Latn MM\n\
-    umo Latn BR\n\
-    ump Latn AU\n\
-    umr Latn AU\n\
-    ums Latn ID\n\
-    una Latn PG\n\
-    une Latn NG\n\
-    ung Latn AU\n\
-    uni Latn PG\n\
-    unk Latn BR\n\
-    unm Latn US\n\
-    unn Latn AU\n\
-    unu Latn PG\n\
-    unz Latn ID\n\
-    uon Latn TW\n\
-    upi Latn PG\n\
-    upv Latn VU\n\
-    ura Latn PE\n\
-    urb Latn BR\n\
-    urc Latn AU\n\
-    ure Latn BO\n\
-    urf Latn AU\n\
-    urg Latn PG\n\
-    urh Latn NG\n\
-    uri Latn PG\n\
-    urk Thai TH\n\
-    urm Latn PG\n\
-    urn Latn ID\n\
-    uro Latn PG\n\
-    urp Latn BR\n\
-    urr Latn VU\n\
-    urt Latn PG\n\
-    uru Latn BR\n\
-    urv Latn PG\n\
-    urw Latn PG\n\
-    urx Latn PG\n\
-    ury Latn ID\n\
-    urz Latn BR\n\
-    usa Latn PG\n\
-    ush Arab PK\n\
-    usi Latn BD\n\
-    usk Latn CM\n\
-    usp Latn GT\n\
-    uss Latn NG\n\
-    usu Latn PG\n\
-    uta Latn NG\n\
-    ute Latn US\n\
-    uth Latn NG\n\
-    utp Latn SB\n\
-    utr Latn NG\n\
-    utu Latn PG\n\
-    uum Grek GE\n\
-    uur Latn VU\n\
-    uve Latn NC\n\
-    uvh Latn PG\n\
-    uvl Latn PG\n\
-    uwa Latn AU\n\
-    uya Latn NG\n\
-    uzs Arab AF\n\
-    vaa Taml IN\n\
-    vae Latn CF\n\
-    vaf Arab IR\n\
-    vag Latn GH\n\
-    vah Deva IN\n\
-    vaj Latn NA\n\
-    val Latn PG\n\
-    vam Latn PG\n\
-    van Latn PG\n\
-    vao Latn VU\n\
-    vap Latn IN\n\
-    var Latn MX\n\
-    vas Deva IN\n\
-    vau Latn CD\n\
-    vav Deva IN\n\
-    vay Deva NP\n\
-    vbb Latn ID\n\
-    vbk Latn PH\n\
-    vem Latn NG\n\
-    veo Latn US\n\
-    ver Latn NG\n\
-    vgr Arab PK\n\
-    vid Latn TZ\n\
-    vif Latn CG\n\
-    vig Latn BF\n\
-    vil Latn AR\n\
-    vin Latn TZ\n\
-    vit Latn NG\n\
-    viv Latn PG\n\
-    vjk Deva IN\n\
-    vka Latn AU\n\
-    vkj Latn TD\n\
-    vkk Latn ID\n\
-    vkl Latn ID\n\
-    vkm Latn BR\n\
-    vkn Latn NG\n\
-    vko Latn ID\n\
-    vkp Latn IN\n\
-    vkt Latn ID\n\
-    vku Latn AU\n\
-    vkz Latn NG\n\
-    vlp Latn VU\n\
-    vma Latn AU\n\
-    vmb Latn AU\n\
-    vmc Latn MX\n\
-    vmd Knda IN\n\
-    vme Latn ID\n\
-    vmg Latn PG\n\
-    vmh Arab IR\n\
-    vmi Latn AU\n\
-    vmj Latn MX\n\
-    vmk Latn MZ\n\
-    vml Latn AU\n\
-    vmm Latn MX\n\
-    vmp Latn MX\n\
-    vmq Latn MX\n\
-    vmr Latn MZ\n\
-    vms Latn ID\n\
-    vmu Latn AU\n\
-    vmx Latn MX\n\
-    vmy Latn MX\n\
-    vmz Latn MX\n\
-    vnk Latn SB\n\
-    vnm Latn VU\n\
-    vnp Latn VU\n\
-    vor Latn NG\n\
-    vra Latn VU\n\
-    vrs Latn SB\n\
-    vrt Latn VU\n\
-    vto Latn ID\n\
-    vum Latn GA\n\
-    vut Latn CM\n\
-    vwa Latn CN\n\
-    waa Latn US\n\
-    wab Latn PG\n\
-    wac Latn US\n\
-    wad Latn ID\n\
-    waf Latn BR\n\
-    wag Latn PG\n\
-    wah Latn ID\n\
-    wai Latn ID\n\
-    waj Latn PG\n\
-    wam Latn US\n\
-    wan Latn CI\n\
-    wap Latn GY\n\
-    waq Latn AU\n\
-    was Latn US\n\
-    wat Latn PG\n\
-    wau Latn BR\n\
-    wav Latn NG\n\
-    waw Latn BR\n\
-    wax Latn PG\n\
-    way Latn SR\n\
-    waz Latn PG\n\
-    wba Latn VE\n\
-    wbb Latn ID\n\
-    wbe Latn ID\n\
-    wbf Latn BF\n\
-    wbh Latn TZ\n\
-    wbi Latn TZ\n\
-    wbj Latn TZ\n\
-    wbk Arab AF\n\
-    wbl Latn PK\n\
-    wbm Latn CN\n\
-    wbt Latn AU\n\
-    wbv Latn AU\n\
-    wbw Latn ID\n\
-    wca Latn BR\n\
-    wci Latn TG\n\
-    wdd Latn GA\n\
-    wdg Latn PG\n\
-    wdj Latn AU\n\
-    wdk Latn AU\n\
-    wdt Latn CA\n\
-    wdu Latn AU\n\
-    wdy Latn AU\n\
-    wec Latn CI\n\
-    wed Latn PG\n\
-    weg Latn AU\n\
-    weh Latn CM\n\
-    wei Latn PG\n\
-    wem Latn BJ\n\
-    weo Latn ID\n\
-    wep Latn DE\n\
-    wer Latn PG\n\
-    wes Latn CM\n\
-    wet Latn ID\n\
-    weu Latn MM\n\
-    wew Latn ID\n\
-    wfg Latn ID\n\
-    wga Latn AU\n\
-    wgb Latn PG\n\
-    wgg Latn AU\n\
-    wgi Latn PG\n\
-    wgo Latn ID\n\
-    wgu Latn AU\n\
-    wgy Latn AU\n\
-    wha Latn ID\n\
-    whg Latn PG\n\
-    whk Latn ID\n\
-    whu Latn ID\n\
-    wib Latn BF\n\
-    wic Latn US\n\
-    wie Latn AU\n\
-    wif Latn AU\n\
-    wig Latn AU\n\
-    wih Latn AU\n\
-    wii Latn PG\n\
-    wij Latn AU\n\
-    wik Latn AU\n\
-    wil Latn AU\n\
-    wim Latn AU\n\
-    win Latn US\n\
-    wir Latn BR\n\
-    wiu Latn PG\n\
-    wiv Latn PG\n\
-    wiy Latn US\n\
-    wja Latn NG\n\
-    wji Latn NG\n\
-    wka Latn TZ\n\
-    wkd Latn ID\n\
-    wkr Latn AU\n\
-    wkw Latn AU\n\
-    wky Latn AU\n\
-    wla Latn PG\n\
-    wle Ethi ET\n\
-    wlg Latn AU\n\
-    wlh Latn TL\n\
-    wli Latn ID\n\
-    wlm Latn GB\n\
-    wlo Arab ID\n\
-    wlr Latn VU\n\
-    wlu Latn AU\n\
-    wlv Latn AR\n\
-    wlw Latn ID\n\
-    wlx Latn GH\n\
-    wma Latn NG\n\
-    wmb Latn AU\n\
-    wmc Latn PG\n\
-    wmd Latn BR\n\
-    wme Deva NP\n\
-    wmh Latn TL\n\
-    wmi Latn AU\n\
-    wmm Latn ID\n\
-    wmn Latn NC\n\
-    wmo Latn PG\n\
-    wms Latn ID\n\
-    wmt Latn AU\n\
-    wmw Latn MZ\n\
-    wmx Latn PG\n\
-    wnb Latn PG\n\
-    wnc Latn PG\n\
-    wnd Latn AU\n\
-    wne Arab PK\n\
-    wng Latn ID\n\
-    wnk Latn ID\n\
-    wnm Latn AU\n\
-    wnn Latn AU\n\
-    wno Latn ID\n\
-    wnp Latn PG\n\
-    wnu Latn PG\n\
-    wnw Latn US\n\
-    wny Latn AU\n\
-    woa Latn AU\n\
-    wob Latn CI\n\
-    woc Latn PG\n\
-    wod Latn ID\n\
-    woe Latn FM\n\
-    wof Latn GM\n\
-    wog Latn PG\n\
-    woi Latn ID\n\
-    wok Latn CM\n\
-    wom Latn NG\n\
-    won Latn CD\n\
-    woo Latn ID\n\
-    wor Latn ID\n\
-    wos Latn PG\n\
-    wow Latn ID\n\
-    wpc Latn VE\n\
-    wrb Latn AU\n\
-    wrg Latn AU\n\
-    wrh Latn AU\n\
-    wri Latn AU\n\
-    wrk Latn AU\n\
-    wrl Latn AU\n\
-    wrm Latn AU\n\
-    wro Latn AU\n\
-    wrp Latn ID\n\
-    wrr Latn AU\n\
-    wrs Latn PG\n\
-    wru Latn ID\n\
-    wrv Latn PG\n\
-    wrw Latn AU\n\
-    wrx Latn ID\n\
-    wrz Latn AU\n\
-    wsa Latn ID\n\
-    wsi Latn VU\n\
-    wsk Latn PG\n\
-    wsr Latn PG\n\
-    wss Latn GH\n\
-    wsu Latn BR\n\
-    wsv Arab AF\n\
-    wtb Latn TZ\n\
-    wtf Latn PG\n\
-    wth Latn AU\n\
-    wti Latn ET\n\
-    wtk Latn PG\n\
-    wtw Latn ID\n\
-    wua Latn AU\n\
-    wub Latn AU\n\
-    wud Latn TG\n\
-    wul Latn ID\n\
-    wum Latn GA\n\
-    wun Latn TZ\n\
-    wur Latn AU\n\
-    wut Latn PG\n\
-    wuv Latn PG\n\
-    wux Latn AU\n\
-    wuy Latn ID\n\
-    wwa Latn BJ\n\
-    wwb Latn AU\n\
-    wwo Latn VU\n\
-    wwr Latn AU\n\
-    www Latn CM\n\
-    wxw Latn AU\n\
-    wyb Latn AU\n\
-    wyi Latn AU\n\
-    wym Latn PL\n\
-    wyn Latn US\n\
-    wyr Latn BR\n\
-    wyy Latn FJ\n\
-    xaa Latn ES\n\
-    xab Latn NG\n\
-    xai Latn BR\n\
-    xaj Latn BR\n\
-    xak Latn VE\n\
-    xal Cyrl RU\n\
-    xam Latn ZA\n\
-    xan Ethi ET\n\
-    xao Latn VN\n\
-    xar Latn PG\n\
-    xas Cyrl RU\n\
-    xat Latn BR\n\
-    xau Latn ID\n\
-    xaw Latn US\n\
-    xay Latn ID\n\
-    xbb Latn AU\n\
-    xbd Latn AU\n\
-    xbe Latn AU\n\
-    xbg Latn AU\n\
-    xbi Latn PG\n\
-    xbj Latn AU\n\
-    xbm Latn FR\n\
-    xbn Latn MY\n\
-    xbp Latn AU\n\
-    xbr Latn ID\n\
-    xbw Latn BR\n\
-    xby Latn AU\n\
-    xch Latn US\n\
-    xda Latn AU\n\
-    xdk Latn AU\n\
-    xdo Latn AO\n\
-    xdq Cyrl RU\n\
-    xdy Latn ID\n\
-    xed Latn CM\n\
-    xeg Latn ZA\n\
-    xem Latn ID\n\
-    xer Latn BR\n\
-    xes Latn PG\n\
-    xet Latn BR\n\
-    xeu Latn PG\n\
-    xgb Latn CI\n\
-    xgd Latn AU\n\
-    xgg Latn AU\n\
-    xgi Latn AU\n\
-    xgm Latn AU\n\
-    xgu Latn AU\n\
-    xgw Latn AU\n\
-    xhe Arab PK\n\
-    xhm Khmr KH\n\
-    xhv Latn VN\n\
-    xii Latn ZA\n\
-    xin Latn GT\n\
-    xir Latn BR\n\
-    xis Orya IN\n\
-    xiy Latn BR\n\
-    xjb Latn AU\n\
-    xjt Latn AU\n\
-    xka Arab PK\n\
-    xkb Latn BJ\n\
-    xkc Arab IR\n\
-    xkd Latn ID\n\
-    xke Latn ID\n\
-    xkf Tibt BT\n\
-    xkg Latn ML\n\
-    xkj Arab IR\n\
-    xkl Latn ID\n\
-    xkn Latn ID\n\
-    xkp Arab IR\n\
-    xkq Latn ID\n\
-    xkr Latn BR\n\
-    xks Latn ID\n\
-    xkt Latn GH\n\
-    xku Latn CG\n\
-    xkv Latn BW\n\
-    xkw Latn ID\n\
-    xkx Latn PG\n\
-    xky Latn MY\n\
-    xkz Latn BT\n\
-    xla Latn PG\n\
-    xly Elym IR\n\
-    xma Latn SO\n\
-    xmb Latn CM\n\
-    xmc Latn MZ\n\
-    xmd Latn CM\n\
-    xmg Latn CM\n\
-    xmh Latn AU\n\
-    xmj Latn CM\n\
-    xmm Latn ID\n\
-    xmo Latn BR\n\
-    xmp Latn AU\n\
-    xmq Latn AU\n\
-    xmt Latn ID\n\
-    xmu Latn AU\n\
-    xmv Latn MG\n\
-    xmw Latn MG\n\
-    xmx Latn ID\n\
-    xmy Latn AU\n\
-    xmz Latn ID\n\
-    xnb Latn TW\n\
-    xni Latn AU\n\
-    xnj Latn TZ\n\
-    xnk Latn AU\n\
-    xnm Latn AU\n\
-    xnn Latn PH\n\
-    xnq Latn MZ\n\
-    xnt Latn US\n\
-    xnu Latn AU\n\
-    xny Latn AU\n\
-    xnz Latn EG\n\
-    xoc Latn NG\n\
-    xod Latn ID\n\
-    xoi Latn PG\n\
-    xok Latn BR\n\
-    xom Latn SD\n\
-    xon Latn GH\n\
-    xoo Latn BR\n\
-    xop Latn PG\n\
-    xor Latn BR\n\
-    xow Latn PG\n\
-    xpa Latn AU\n\
-    xpb Latn AU\n\
-    xpd Latn AU\n\
-    xpf Latn AU\n\
-    xpg Grek TR\n\
-    xph Latn AU\n\
-    xpi Ogam GB\n\
-    xpj Latn AU\n\
-    xpk Latn BR\n\
-    xpl Latn AU\n\
-    xpm Cyrl RU\n\
-    xpn Latn BR\n\
-    xpo Latn MX\n\
-    xpq Latn US\n\
-    xpt Latn AU\n\
-    xpv Latn AU\n\
-    xpw Latn AU\n\
-    xpx Latn AU\n\
-    xpz Latn AU\n\
-    xra Latn BR\n\
-    xrb Latn BF\n\
-    xrd Latn AU\n\
-    xre Latn BR\n\
-    xrg Latn AU\n\
-    xri Latn BR\n\
-    xrm Cyrl RU\n\
-    xrn Cyrl RU\n\
-    xrr Latn IT\n\
-    xru Latn AU\n\
-    xrw Latn PG\n\
-    xsb Latn PH\n\
-    xse Latn ID\n\
-    xsh Latn NG\n\
-    xsi Latn PG\n\
-    xsm Latn GH\n\
-    xsn Latn NG\n\
-    xsp Latn PG\n\
-    xsq Latn MZ\n\
-    xsu Latn VE\n\
-    xsy Latn TW\n\
-    xta Latn MX\n\
-    xtb Latn MX\n\
-    xtc Latn SD\n\
-    xtd Latn MX\n\
-    xte Latn ID\n\
-    xth Latn AU\n\
-    xti Latn MX\n\
-    xtj Latn MX\n\
-    xtl Latn MX\n\
-    xtm Latn MX\n\
-    xtn Latn MX\n\
-    xtp Latn MX\n\
-    xtq Brah IR\n\
-    xts Latn MX\n\
-    xtt Latn MX\n\
-    xtu Latn MX\n\
-    xtv Latn AU\n\
-    xtw Latn BR\n\
-    xty Latn MX\n\
-    xub Taml IN\n\
-    xud Latn AU\n\
-    xuj Taml IN\n\
-    xul Latn AU\n\
-    xum Latn IT\n\
-    xun Latn AU\n\
-    xuo Latn TD\n\
-    xut Latn AU\n\
-    xuu Latn NA\n\
-    xve Ital IT\n\
-    xvi Arab AF\n\
-    xvn Latn ES\n\
-    xvo Latn IT\n\
-    xvs Latn IT\n\
-    xwa Latn BR\n\
-    xwd Latn AU\n\
-    xwe Latn BJ\n\
-    xwj Latn AU\n\
-    xwk Latn AU\n\
-    xwl Latn BJ\n\
-    xwo Cyrl RU\n\
-    xwr Latn ID\n\
-    xwt Latn AU\n\
-    xww Latn AU\n\
-    xxb Latn GH\n\
-    xxk Latn ID\n\
-    xxm Latn AU\n\
-    xxr Latn BR\n\
-    xxt Latn ID\n\
-    xya Latn AU\n\
-    xyb Latn AU\n\
-    xyj Latn AU\n\
-    xyk Latn AU\n\
-    xyl Latn BR\n\
-    xyt Latn AU\n\
-    xyy Latn AU\n\
-    xzh Marc CN\n\
-    xzp Latn MX\n\
-    yaa Latn PE\n\
-    yab Latn BR\n\
-    yac Latn ID\n\
-    yad Latn PE\n\
-    yae Latn VE\n\
-    yaf Latn CD\n\
-    yag Latn CL\n\
-    yah Latn TJ\n\
-    yai Cyrl TJ\n\
-    yaj Latn CF\n\
-    yak Latn US\n\
-    yal Latn GN\n\
-    yam Latn CM\n\
-    yan Latn NI\n\
-    yaq Latn MX\n\
-    yar Latn VE\n\
-    yas Latn CM\n\
-    yat Latn CM\n\
-    yau Latn VE\n\
-    yaw Latn BR\n\
-    yax Latn AO\n\
-    yay Latn NG\n\
-    yaz Latn NG\n\
-    yba Latn NG\n\
-    ybe Latn CN\n\
-    ybh Deva NP\n\
-    ybi Deva NP\n\
-    ybj Latn NG\n\
-    ybl Latn NG\n\
-    ybm Latn PG\n\
-    ybn Latn BR\n\
-    ybo Latn PG\n\
-    ybx Latn PG\n\
-    yby Latn PG\n\
-    ycl Latn CN\n\
-    ycn Latn CO\n\
-    ycr Latn TW\n\
-    yda Latn AU\n\
-    yde Latn PG\n\
-    ydg Arab PK\n\
-    ydk Latn PG\n\
-    yea Mlym IN\n\
-    yec Latn DE\n\
-    yee Latn PG\n\
-    yei Latn CM\n\
-    yej Grek GR\n\
-    yel Latn CD\n\
-    yer Latn NG\n\
-    yes Latn NG\n\
-    yet Latn ID\n\
-    yeu Telu IN\n\
-    yev Latn PG\n\
-    yey Latn BW\n\
-    yga Latn AU\n\
-    ygi Latn AU\n\
-    ygl Latn PG\n\
-    ygm Latn PG\n\
-    ygp Plrd CN\n\
-    ygr Latn PG\n\
-    ygu Latn AU\n\
-    ygw Latn PG\n\
-    yhd Hebr IL\n\
-    yia Latn AU\n\
-    yig Yiii CN\n\
-    yih Hebr DE\n\
-    yii Latn AU\n\
-    yij Latn AU\n\
-    yil Latn AU\n\
-    yim Latn IN\n\
-    yir Latn ID\n\
-    yis Latn PG\n\
-    yiv Yiii CN\n\
-    yka Latn PH\n\
-    ykg Cyrl RU\n\
-    ykh Cyrl MN\n\
-    yki Latn ID\n\
-    ykk Latn PG\n\
-    ykm Latn PG\n\
-    yko Latn CM\n\
-    ykr Latn PG\n\
-    yky Latn CF\n\
-    yla Latn PG\n\
-    ylb Latn PG\n\
-    yle Latn PG\n\
-    ylg Latn PG\n\
-    yli Latn ID\n\
-    yll Latn PG\n\
-    ylr Latn AU\n\
-    ylu Latn PG\n\
-    yly Latn NC\n\
-    ymb Latn PG\n\
-    yme Latn PE\n\
-    ymg Latn CD\n\
-    ymk Latn MZ\n\
-    yml Latn PG\n\
-    ymm Latn SO\n\
-    ymn Latn ID\n\
-    ymo Latn PG\n\
-    ymp Latn PG\n\
-    yna Plrd CN\n\
-    ynd Latn AU\n\
-    yng Latn CD\n\
-    ynk Cyrl RU\n\
-    ynl Latn PG\n\
-    ynq Latn NG\n\
-    yns Latn CD\n\
-    ynu Latn CO\n\
-    yob Latn PG\n\
-    yog Latn PH\n\
-    yoi Jpan JP\n\
-    yok Latn US\n\
-    yol Latn IE\n\
-    yom Latn CD\n\
-    yon Latn PG\n\
-    yot Latn NG\n\
-    yoy Thai TH\n\
-    yra Latn PG\n\
-    yrb Latn PG\n\
-    yre Latn CI\n\
-    yrk Cyrl RU\n\
-    yrm Latn AU\n\
-    yro Latn BR\n\
-    yrs Latn ID\n\
-    yrw Latn PG\n\
-    yry Latn AU\n\
-    ysd Yiii CN\n\
-    ysn Yiii CN\n\
-    ysp Yiii CN\n\
-    ysr Cyrl RU\n\
-    yss Latn PG\n\
-    ysy Plrd CN\n\
-    ytw Latn PG\n\
-    yty Latn AU\n\
-    yub Latn AU\n\
-    yuc Latn US\n\
-    yud Hebr IL\n\
-    yuf Latn US\n\
-    yug Cyrl RU\n\
-    yui Latn CO\n\
-    yuj Latn PG\n\
-    yul Latn CF\n\
-    yum Latn US\n\
-    yun Latn NG\n\
-    yup Latn CO\n\
-    yuq Latn BO\n\
-    yur Latn US\n\
-    yut Latn PG\n\
-    yuw Latn PG\n\
-    yux Cyrl RU\n\
-    yuz Latn BO\n\
-    yva Latn ID\n\
-    yvt Latn VE\n\
-    ywa Latn PG\n\
-    ywg Latn AU\n\
-    ywn Latn BR\n\
-    ywq Plrd CN\n\
-    ywr Latn AU\n\
-    ywu Plrd CN\n\
-    yww Latn AU\n\
-    yxa Latn AU\n\
-    yxg Latn AU\n\
-    yxl Latn AU\n\
-    yxm Latn AU\n\
-    yxu Latn AU\n\
-    yxy Latn AU\n\
-    yyr Latn AU\n\
-    yyu Latn PG\n\
-    zaa Latn MX\n\
-    zab Latn MX\n\
-    zac Latn MX\n\
-    zad Latn MX\n\
-    zae Latn MX\n\
-    zaf Latn MX\n\
-    zah Latn NG\n\
-    zaj Latn TZ\n\
-    zak Latn TZ\n\
-    zam Latn MX\n\
-    zao Latn MX\n\
-    zap Latn MX\n\
-    zaq Latn MX\n\
-    zar Latn MX\n\
-    zas Latn MX\n\
-    zat Latn MX\n\
-    zau Tibt IN\n\
-    zav Latn MX\n\
-    zaw Latn MX\n\
-    zax Latn MX\n\
-    zay Latn ET\n\
-    zaz Latn NG\n\
-    zba Arab 001\n\
-    zbc Latn MY\n\
-    zbe Latn MY\n\
-    zbt Latn ID\n\
-    zbu Latn NG\n\
-    zbw Latn MY\n\
-    zca Latn MX\n\
-    zch Hani CN\n\
-    zeg Latn PG\n\
-    zeh Hani CN\n\
-    zem Latn NG\n\
-    zen Tfng MR\n\
-    zga Latn TZ\n\
-    zgb Hani CN\n\
-    zgm Hani CN\n\
-    zgn Hani CN\n\
-    zgr Latn PG\n\
-    zhd Hani CN\n\
-    zhi Latn NG\n\
-    zhn Latn CN\n\
-    zhw Latn CM\n\
-    zia Latn PG\n\
-    zik Latn PG\n\
-    zil Latn GN\n\
-    zim Latn TD\n\
-    zin Latn TZ\n\
-    ziw Latn TZ\n\
-    ziz Latn NG\n\
-    zka Latn ID\n\
-    zkd Latn MM\n\
-    zko Cyrl RU\n\
-    zkp Latn BR\n\
-    zku Latn AU\n\
-    zkz Cyrl RU\n\
-    zla Latn CD\n\
-    zlj Hani CN\n\
-    zln Hani CN\n\
-    zlq Hani CN\n\
-    zlu Latn NG\n\
-    zma Latn AU\n\
-    zmb Latn CD\n\
-    zmc Latn AU\n\
-    zmd Latn AU\n\
-    zme Latn AU\n\
-    zmf Latn CD\n\
-    zmg Latn AU\n\
-    zmh Latn PG\n\
-    zmj Latn AU\n\
-    zmk Latn AU\n\
-    zml Latn AU\n\
-    zmm Latn AU\n\
-    zmn Latn GA\n\
-    zmo Latn SD\n\
-    zmp Latn CD\n\
-    zmq Latn CD\n\
-    zmr Latn AU\n\
-    zms Latn CD\n\
-    zmt Latn AU\n\
-    zmu Latn AU\n\
-    zmv Latn AU\n\
-    zmw Latn CD\n\
-    zmx Latn CG\n\
-    zmy Latn AU\n\
-    zmz Latn CD\n\
-    zna Latn TD\n\
-    zne Latn CD\n\
-    zng Latn VN\n\
-    znk Latn AU\n\
-    zns Latn NG\n\
-    zoc Latn MX\n\
-    zoh Latn MX\n\
-    zom Latn IN\n\
-    zoo Latn MX\n\
-    zoq Latn MX\n\
-    zor Latn MX\n\
-    zos Latn MX\n\
-    zpa Latn MX\n\
-    zpb Latn MX\n\
-    zpc Latn MX\n\
-    zpd Latn MX\n\
-    zpe Latn MX\n\
-    zpf Latn MX\n\
-    zpg Latn MX\n\
-    zph Latn MX\n\
-    zpi Latn MX\n\
-    zpj Latn MX\n\
-    zpk Latn MX\n\
-    zpl Latn MX\n\
-    zpm Latn MX\n\
-    zpn Latn MX\n\
-    zpo Latn MX\n\
-    zpp Latn MX\n\
-    zpq Latn MX\n\
-    zpr Latn MX\n\
-    zps Latn MX\n\
-    zpt Latn MX\n\
-    zpu Latn MX\n\
-    zpv Latn MX\n\
-    zpw Latn MX\n\
-    zpx Latn MX\n\
-    zpy Latn MX\n\
-    zpz Latn MX\n\
-    zqe Hani CN\n\
-    zrg Orya IN\n\
-    zrn Latn TD\n\
-    zro Latn EC\n\
-    zrp Hebr FR\n\
-    zrs Latn ID\n\
-    zsa Latn PG\n\
-    zsr Latn MX\n\
-    zsu Latn PG\n\
-    zte Latn MX\n\
-    ztg Latn MX\n\
-    ztl Latn MX\n\
-    ztm Latn MX\n\
-    ztn Latn MX\n\
-    ztp Latn MX\n\
-    ztq Latn MX\n\
-    zts Latn MX\n\
-    ztt Latn MX\n\
-    ztu Latn MX\n\
-    ztx Latn MX\n\
-    zty Latn MX\n\
-    zuh Latn PG\n\
-    zum Arab OM\n\
-    zun Latn US\n\
-    zuy Latn CM\n\
-    zwa Ethi ET\n\
-    zyg Hani CN\n\
-    zyj Latn CN\n\
-    zyn Hani CN\n\
-    zyp Latn MM\n\
-    zzj Hani CN\n\
+/// `<likelySubtag from="L" to="L_S_R"/>`, packed. The languages: three
+/// bytes each, space-padded, sorted bytewise. Entry `i`'s script and region
+/// are `LIKELY_LANG_SCRIPTS_AT[i]` and `LIKELY_LANG_REGIONS_AT[i]`, indices
+/// into the two name lists below. The target language always repeats the
+/// source, so it is not stored. See `cldr_alias::likely_lang`.
+pub(crate) static LIKELY_LANG_KEYS: &str = "\
+    aa aaaaabaacaadaaeaafaagaahaaiaakaalaanaaoaapaaqaasaataauaawaaxaazab aba\
+    abbabcabdabeabfabgabhabiablabmabnaboabpabrabsabtabuabvabwabxabyabzacaacb\
+    acdaceacfachacmacnacpacqacracsactacuacvacwacxacyaczadaadbaddadeadfadgadh\
+    adiadjadladnadoadqadradtaduadwadxadyadzae aeaaebaecaeeaekaelaemaeqaeraeu\
+    aewaeyaezaf afbafdafeafhafiafkafnafoafpafsafuafzagaagbagcagdageagfaggagh\
+    agiagjagkaglagmagnagoagqagragsagtaguagvagwagxagyagzahaahbahgahhahiahkahl\
+    ahmahnahoahpahrahsahtaiaaibaicaidaieaifaigaiiaijaikailaimainaioaipaiqair\
+    aitaiwaixaiyajaajgajiajnajwajzak akbakcakdakeakfakgakhakiakkaklakoakpakq\
+    akraksaktakuakvakwakzalaalcaldalealfalhalialjalkallalmalnaloalpalqalralt\
+    alualwalxalyalzam amaambamcameamfamgamiamjamkammamnamoampamqamramsamtamu\
+    amvamwamxamyamzan anaanbancandaneanfanganhanianjankanlanmannanoanpanqanr\
+    ansantanuanvanwanxanyanzaoaaobaocaodaoeaofaogaoiaojaokaolaomaonaoraosaot\
+    aoxaozapbapcapdapeapfapgaphapiapjapkaplapmapnapoappaprapsaptapuapvapwapx\
+    apyapzaqcaqdaqgaqkaqmaqnaqraqtaqzar arcardarearhariarjarkarlarnaroarparq\
+    arrarsaruarwarxaryarzas asaasbascaseasgashasiasjaskaslasnasoasrassastasu\
+    asvasxasyaszataatbatcatdateatgatiatjatkatlatmatnatoatpatqatratsattatuatv\
+    atwatxatyatzauaaucaudaugauhauiaujaukaulaumaunauoaupauqaurautauuauwauyauz\
+    av avbavdaviavkavlavmavnavoavsavtavuavvawaawbawcaweawgawhawiawkawmawnawo\
+    awrawsawtawuawvawwawxawyaxbaxeaxgaxkaxlaxmaxxay ayaaybaycaydayeaygayhayi\
+    aykaylaynayoaypayqaysaytayuayzaz azbazdazgazmaznazoaztazzba baababbacbae\
+    bafbagbahbajbalbanbaobapbarbasbaubavbawbaxbaybbabbbbbcbbdbbebbfbbgbbibbj\
+    bbkbblbbmbbnbbobbpbbqbbrbbsbbtbbubbvbbwbbxbbybcabcbbcdbcebcfbcgbchbcibcj\
+    bckbcmbcnbcobcpbcqbcrbcsbctbcubcvbcwbcybczbdabdbbdcbddbdebdfbdgbdhbdibdj\
+    bdkbdlbdmbdnbdobdpbdqbdrbdsbdtbdubdvbdwbdxbdybdzbe beabebbecbedbeebefbeh\
+    beibejbekbembeobepbeqbesbetbeubevbewbexbeybezbfabfbbfcbfdbfebffbfgbfhbfj\
+    bflbfmbfnbfobfpbfqbfsbftbfubfwbfxbfybfzbg bgabgbbgcbgdbgfbggbgibgjbgnbgo\
+    bgpbgqbgrbgsbgtbgubgvbgwbgxbgybgzbhabhbbhcbhdbhebhfbhgbhhbhibhjbhlbhmbhn\
+    bhobhpbhqbhrbhsbhtbhubhvbhwbhybhzbi biabibbidbiebifbigbikbilbimbinbiobip\
+    biqbirbitbiubivbiwbiybizbjabjbbjcbjfbjgbjhbjibjjbjkbjlbjmbjnbjobjpbjrbjs\
+    bjtbjubjvbjwbjxbjybjzbkabkcbkdbkfbkgbkhbkibkjbkkbklbkmbknbkobkpbkqbkrbks\
+    bktbkubkvbkwbkxbkybkzblablbblcbldbleblfblhblibljblkblmblnbloblpblqblrbls\
+    bltblvblwblxblyblzbm bmabmbbmcbmdbmebmfbmgbmhbmibmjbmkbmlbmmbmnbmobmpbmq\
+    bmrbmsbmubmvbmwbmxbmzbn bnabnbbncbndbnebnfbngbnibnjbnkbnmbnnbnobnpbnqbnr\
+    bnsbnubnvbnwbnxbnybnzbo boabobboebofbohbojbokbolbombonboobopboqborbotbou\
+    bovbowboxboybozbpabpcbpdbpebpgbphbpibpjbpkbplbpmbpobppbpqbprbpsbptbpubpv\
+    bpwbpxbpybpzbqabqbbqcbqdbqfbqgbqibqjbqkbqlbqmbqobqpbqqbqrbqsbqtbqubqvbqw\
+    bqxbqzbr brabrbbrcbrdbrfbrgbrhbribrjbrkbrlbrmbrnbrobrpbrqbrrbrsbrtbrubrv\
+    brwbrxbrybrzbs bsabsbbscbsebsfbshbsibsjbskbslbsmbsnbsobspbsqbsrbssbstbsu\
+    bsvbswbsxbsybtabtcbtdbtebtfbtgbthbtibtjbtmbtnbtobtpbtqbtrbtsbttbtubtvbtw\
+    btxbtybtzbuabubbucbudbuebufbugbuhbuibujbukbumbunbuobupbuqbusbutbuubuvbuw\
+    buxbuybuzbvabvbbvcbvdbvebvfbvgbvhbvibvjbvkbvmbvnbvobvqbvrbvtbvubvvbvwbvx\
+    bvybvzbwabwbbwcbwdbwebwfbwgbwhbwibwjbwkbwlbwmbwobwpbwqbwrbwsbwtbwubwwbwx\
+    bwybwzbxabxbbxcbxfbxgbxhbxibxjbxlbxmbxnbxobxpbxqbxsbxubxvbxwbxzbyabybbyc\
+    bydbyebyfbyhbyibyjbykbylbymbynbypbyrbysbyvbywbyxbyzbzabzbbzcbzdbzebzfbzh\
+    bzibzjbzkbzlbzmbznbzobzpbzqbzrbztbzubzvbzwbzxbzybzzca caacabcaccadcaecaf\
+    cagcahcajcakcalcamcancaocapcaqcarcascavcawcaxcaycazcbbcbccbdcbgcbicbjcbk\
+    cblcbncbocbqcbrcbscbtcbucbvcbwcbycccccdcceccgcchccjcclccmccoccpccrcdecdf\
+    cdhcdicdjcdmcdocdrcdzce ceacebcegcekcencetceycfacfdcfgcfmcgacgccggcgkch \
+    chbchdchfchgchhchjchkchlchmchnchochpchqchrchtchwchxchychzciacibcicciecih\
+    cimcincipcirciwciycjacjecjhcjicjkcjmcjncjocjpcjscjvcjyckbcklckmcknckockq\
+    ckrckscktckuckvckxckyckzclaclccleclhclicljclkcllclmclocltcluclwclycmacme\
+    cmgcmicmlcmocmrcmscmtcnacnbcnccngcnhcnicnkcnlcnpcnqcnscntcnwcnxco coacob\
+    coccodcoecofcogcohcojcokcolcomcoocopcoqcotcoucoxcozcpacpbcpccpgcpicpncpo\
+    cpscpucpxcpycqdcr cracrbcrccrdcrfcrgcrhcricrjcrkcrlcrmcrncrocrqcrscrtcrv\
+    crwcrxcrycrzcs csacsbcshcsjcskcsmcsocspcsscstcsvcswcsycszctactcctdctectg\
+    cthctlctmctnctoctpctscttctuctyctzcu cuacubcuccuhcuicujcukculcuocupcutcuu\
+    cuvcuxcuycv cvgcvncwacwbcwecwgcwtcxhcy cyacybcyoczhczkczncztda daadacdad\
+    daedagdahdaidajdakdaldamdaodaqdardasdaudavdawdaxdazdbadbbdbddbedbfdbgdbi\
+    dbjdbldbmdbndbodbpdbqdbtdbudbvdbwdbydccdcrddadddddeddgddiddjddnddoddrdds\
+    ddwde decdeddeedefdegdehdeidekdeldemdendeqderdesdevdezdgadgbdgcdgddgedgg\
+    dghdgidgkdgldgndgrdgsdgtdgwdgxdgzdhgdhidhldhmdhndhodhrdhsdhudhvdhwdhxdia\
+    dibdicdiddifdigdihdiidijdildindiodipdirdisdiudiwdixdiydizdjadjbdjcdjddje\
+    djfdjidjjdjkdjmdjndjodjrdjudjwdkadkgdkkdkrdksdkxdlgdlmdlndmadmbdmcdmddme\
+    dmfdmgdmkdmldmmdmodmrdmsdmudmvdmwdmxdmydnadnddnedngdnidnjdnkdnndnodnrdnt\
+    dnudnvdnwdnydoadobdocdoedofdohdoidokdoldondoodopdordosdotdovdowdoxdoydpp\
+    drcdredrgdridrldrndrodrqdrsdrtdrudrydsbdshdsidskdsndsodsqdtadtbdtddthdti\
+    dtkdtmdtodtpdtrdtsdttdtudtyduadubducduedufdugduhduidukduldumdunduodupduq\
+    durdusduuduvduwduxduyduzdv dvadwadwkdwrdwsdwudwwdwydwzdyadybdyddygdyidym\
+    dyndyodyrdyudyydz dzadzddzedzgdzldzneaaebcebgebkeboebrebuecrecyee efaefe\
+    efiegaeglegmegoegyehueipeiteivejaekaekeekgekieklekmekoekpekrekyel eleelk\
+    elmeloeluemaembemeemgemiemmemnempemsemuemwemxemzen enaenbencendenfenhenl\
+    enmennenoenqenrenvenwenxeo eotepieraergerherierkerrerserterwes eseesgesh\
+    esiesmessesuesyet etbetnetoetretsettetuetxetzeu eudeveevhevnewoexteyaeyo\
+    ezaezefa faafabfadfaffagfahfaifajfakfalfamfanfapfarfaufaxfayfazfblferff \
+    ffiffmfgrfi fiafiefiffilfipfirfitfiwfj fkkfkvflaflhflifllflnflrflyfmpfmu\
+    fnbfngfnifo fodfoifomfonforfosfpefqsfr frcfrdfrkfrmfrofrpfrqfrrfrsfrtfub\
+    fudfuefuffuhfuifumfunfuqfurfutfuufuvfuyfvrfwafwefy ga gaagabgacgadgaegaf\
+    gaggahgaigajgakgalgamgangaogapgaqgargasgatgaugawgaxgaygbagbbgbdgbegbfgbg\
+    gbhgbigbjgbkgblgbmgbngbpgbqgbrgbsgbugbvgbwgbxgbygbzgccgcdgcfgclgcngcrgct\
+    gd gdbgdcgddgdegdfgdggdhgdigdjgdkgdlgdmgdngdogdqgdrgdtgdugdxgeagebgecged\
+    gefgeggehgeigejgekgelgeqgesgevgewgexgeygezgfkggaggbggdggegggggkgglggtggu\
+    ggwghaghcgheghkghnghoghrghsghtgiagibgicgidgiegiggihgilgimgingipgiqgirgis\
+    gitgixgiygizgjkgjmgjngjrgjugkagkdgkegkngkogkpgkugl glbglcgldglhgljglkgll\
+    gloglrgluglwgmagmbgmdgmggmhgmlgmmgmngmrgmugmvgmxgmygmzgn gnagnbgncgndgne\
+    gnggnhgnignjgnkgnlgnmgnngnqgnrgntgnugnwgnzgoagobgocgodgoegofgoggohgoigoj\
+    gokgolgongoogopgoqgorgosgotgougovgowgoxgoygpagpegpngqagqngqrgragrbgrcgrd\
+    grggrhgrigrjgrmgrqgrsgrtgrugrvgrwgrxgrygrzgslgsngsogspgswgtagtugu guagub\
+    gucgudguegufguhguigukgulgumgunguogupguqgurgutguuguwguxguzgv gvagvcgvegvf\
+    gvjgvlgvmgvngvogvpgvrgvsgvygwagwbgwcgwdgwegwfgwggwigwjgwmgwngwrgwtgwugww\
+    gwxgxxgybgydgyegyfgyggyigylgymgyngyogyrgyygyzgzagzigznha haahachadhaehag\
+    hahhaihajhakhalhamhanhaohaphaqharhashavhawhaxhayhazhbahbbhbnhbohbuhchhdy\
+    he hedheghehheihemhgmhgwhhihhrhhyhi hiahibhidhifhighihhiihijhikhilhiohir\
+    hithiwhixhjihkahkehkhhkkhlahlbhldhlthluhmahmbhmdhmfhmjhmmhmnhmphmqhmrhms\
+    hmthmuhmvhmwhmyhmzhnahndhnehnghnhhnihnjhnnhnohnsho hoahobhochodhoehohhoi\
+    hojholhomhoohophorhothovhowhoyhpohr hrahrchrehrkhrmhrohrphrthruhrwhrxhrz\
+    hsbhsnhssht htihtohtshtuhtxhu hubhuchudhuehufhughuhhuihukhulhumhuphurhus\
+    huthuuhuvhuwhuxhuyhuzhvchvehvkhvnhvvhwahwchwohy hyahywhz ia iaiianiariba\
+    ibbibdibeibgibhiblibmibnibribuibyicaichicrid idaidbidciddideidiidridsidt\
+    iduie ifaifbifeiffifkifmifuifyig igbigeiggigligmignigoigsigwihbihiihpihw\
+    ii iinijcijeijjijnijsik ikhikiikkiklikoikpikriktikvikwikxikzilailbilgili\
+    ilkilmiloilpiluilvimiimlimnimoimrimsimtimyin inbinginhinjinninoinpintio \
+    ioriouiowipiipoiquiqwireirhiriirkirniruirxiryis isaiscisdishisiiskismisn\
+    isoistisuit itbitditeitiitkitlitmitoitritsittitvitwitxityitziu iumivbivv\
+    iw iwkiwmiwoiwsixcixliyaiyoiyxizhizmizrizzja jaajabjacjadjaejafjahjajjak\
+    jaljamjanjaojaqjasjatjaujaxjayjazjbejbijbjjbkjbmjbnjbojbrjbtjbujbwjctjda\
+    jdgjdtjebjeejehjeijekjeljenjerjetjeujgbjgejgkjgojhiji jiajibjicjidjiejig\
+    jiljimjitjiujivjiyjjejjrjkajkmjkojkujlejmajmbjmcjmdjmijmljmnjmrjmsjmwjmx\
+    jnajndjngjnijnjjnljnsjobjodjogjorjowjpajprjqrjrajrbjrrjrtjrujuajubjudjuh\
+    juijukjuljumjunjuojupjurjutjuujuwjuyjv jvdjvnjw jwijyajyejyyka kaakabkac\
+    kadkagkahkaikajkakkamkaokapkaqkavkawkaxkaykbakbbkbckbdkbekbgkbhkbikbjkbk\
+    kblkbmkbnkbokbpkbqkbrkbskbtkbukbvkbwkbxkbykbzkcakcbkcckcdkcekcfkcgkchkci\
+    kcjkckkclkcmkcnkcokcpkcqkcskctkcukcvkcwkcykczkdakdckddkdekdfkdgkdhkdikdj\
+    kdkkdlkdmkdnkdpkdqkdrkdtkdwkdxkdykdzkeakebkeckedkeekefkegkehkeikekkelkem\
+    kenkeokerkesketkeukevkewkexkeykezkfakfbkfckfdkfekffkfgkfhkfikfkkflkfmkfn\
+    kfokfpkfqkfrkfskfukfvkfwkfxkfykfzkg kgakgbkgekgfkgjkgkkglkgokgpkgqkgrkgs\
+    kgtkgukgvkgwkgxkgykhakhbkhckhdkhekhfkhgkhhkhjkhlkhnkhokhpkhqkhrkhskhtkhu\
+    khvkhwkhxkhykhzki kiakibkickidkiekifkigkihkijkilkimkiokipkiqkiskitkiukiv\
+    kiwkixkiykizkj kjakjbkjckjdkjekjgkjhkjikjjkjkkjlkjmkjnkjokjpkjqkjrkjskjt\
+    kjukjxkjykjzkk kkakkbkkckkdkkekkfkkgkkhkkikkjkkkkklkkmkkokkpkkqkkrkkskkt\
+    kkukkvkkwkkxkkykkzkl klaklbklckldkleklfklgklhklikljklkkllklmklnkloklpklq\
+    klrklskltkluklvklwklxklyklzkm kmakmbkmckmdkmekmfkmgkmhkmikmjkmkkmlkmmkmn\
+    kmokmpkmqkmskmtkmukmvkmwkmxkmykmzkn knaknbkndkneknfkniknjknkknlknmknnkno\
+    knpknqknrknskntknuknvknwknxknyknzko koakockodkoekofkogkohkoikokkolkookop\
+    koqkoskotkoukovkowkoykozkpakpckpdkpekpfkpgkphkpikpjkpkkplkpmkpnkpokpqkpr\
+    kpskptkpukpwkpxkpykpzkqakqbkqckqdkqekqfkqgkqhkqikqjkqkkqlkqmkqnkqokqpkqq\
+    kqrkqskqtkqukqvkqwkqxkqykqzkr krakrbkrckrdkrekrfkrhkrikrjkrkkrlkrnkrpkrr\
+    krskrtkrukrvkrwkrxkrykrzks ksbkscksdkseksfksgkshksiksjkskkslksmksnksoksp\
+    ksqksrksskstksuksvkswksxkszktaktbktcktdktektfktgkthktiktjktkktlktmktnkto\
+    ktpktqktskttktuktvktwktxktyktzku kubkuckudkuekufkugkuhkuikujkukkulkumkun\
+    kuokupkuqkuskutkuukuvkuwkuxkuykuzkv kvakvbkvckvdkvekvfkvgkvhkvikvjkvlkvm\
+    kvnkvokvpkvqkvrkvtkvvkvwkvxkvykvzkw kwakwbkwckwdkwekwfkwgkwhkwikwjkwkkwl\
+    kwmkwnkwokwpkwrkwskwtkwukwvkwwkwykwzkxakxbkxckxdkxfkxikxjkxkkxmkxnkxokxp\
+    kxqkxrkxtkxvkxwkxxkxykxzky kyakybkyckydkyekyfkygkyhkyikyjkykkylkymkynkyo\
+    kyqkyrkyskytkyukyvkywkyxkyykyzkzakzbkzckzdkzekzfkzikzkkzlkzmkznkzokzpkzr\
+    kzskzukzvkzwkzxkzykzzla laalablacladlaelaglahlailajlallamlanlaplaqlarlas\
+    laulawlaxlazlb lbblbelbflbilbjlbllbmlbnlbolbqlbrlbtlbulbvlbwlbxlbylbzlcc\
+    lcdlcelcflchlcllcmlcplcqlcsldaldblddldgldhldildjldkldlldmldnldoldpldqlea\
+    leblecledleeleflehleilejleklellemlenleolepleqlerlesletleulevlewlexleylez\
+    lfalfnlg lgalgblgglghlgilgklgllgmlgnlgolgqlgrlgtlgulgzlhalhhlhilhmlhnlhs\
+    lhtlhuli lialibliclidlielifliglihlijliklilliolipliqlirlisliulivliwlixliy\
+    lizljaljeljiljlljpljwljxlkalkblkclkdlkelkhlkilkjlkllkmlknlkolkrlkslktlku\
+    lkyllallbllclldllellfllgllilljllklllllmllnllpllqllullxlmalmblmclmdlmelmf\
+    lmglmhlmilmjlmklmllmnlmolmplmqlmrlmulmvlmwlmxlmyln lnalnblndlnglnhlnilnj\
+    lnllnmlnnlnslnulnwlnzlo loaloblocloeloglohloilojloklollomlonlooloploqlor\
+    loslotloulowloxloylozlpalpelpnlpolpxlqrlralrclrglrilrklrllrmlrnlrolrtlrv\
+    lrzlsalsdlselsilsmlsrlsslt ltcltglthltiltnltoltsltulu lualucludlueluflui\
+    lujluklullumlunluolupluqlurluslutluuluvluwluyluzlv lvalvilvklvllvulwalwe\
+    lwglwhlwllwmlwolwtlwwlxmlyalynlzhlzllznlzzmaamabmadmaemafmagmaimajmakmam\
+    manmaqmasmatmaumavmawmaxmazmbambbmbcmbdmbfmbhmbimbjmbkmblmbmmbnmbombpmbq\
+    mbrmbsmbtmbumbvmbwmbxmbymbzmcamcbmccmcdmcemcfmcgmchmcimcjmckmclmcmmcnmco\
+    mcpmcqmcrmcsmctmcumcvmcwmcxmcymczmdamdbmdcmddmdemdfmdgmdhmdimdjmdkmdmmdn\
+    mdpmdqmdrmdsmdtmdumdvmdwmdxmdymdzmeamebmecmedmeemehmejmekmelmemmenmeomep\
+    meqmermesmetmeumevmewmeymezmfamfbmfcmfdmfemffmfgmfhmfimfjmfkmflmfmmfnmfo\
+    mfpmfqmfrmftmfumfvmfwmfxmfymfzmg mgamgbmgcmgdmgemgfmggmghmgimgjmgkmglmgm\
+    mgnmgomgpmgqmgrmgsmgtmgumgvmgwmgymgzmh mhbmhcmhdmhemhfmhgmhimhjmhkmhlmhm\
+    mhnmhomhpmhqmhsmhtmhumhwmhxmhymhzmi miamibmicmidmiemifmigmihmiimijmikmil\
+    mimminmiomipmiqmirmitmiumiwmixmiymizmjbmjcmjdmjemjgmjhmjimjjmjkmjlmjmmjn\
+    mjqmjrmjsmjtmjumjvmjwmjxmjymjzmk mkamkbmkcmkemkfmkimkjmkkmklmkmmknmkomkp\
+    mkrmksmktmkumkvmkwmkxmkymkzml mlamlbmlcmlemlfmlhmlimljmlkmllmlnmlomlpmlq\
+    mlrmlsmlumlvmlwmlxmlzmmammbmmcmmdmmemmfmmgmmhmmimmmmmnmmommpmmqmmrmmtmmu\
+    mmvmmwmmxmmymmzmn mnamnbmncmndmnemnfmngmnhmnimnjmnlmnmmnnmnpmnqmnrmnsmnu\
+    mnvmnwmnxmnymnzmo moamocmodmoemogmohmoimojmokmommoomopmoqmormosmotmoumov\
+    mowmoxmoymozmpampbmpcmpdmpempgmphmpimpjmpkmplmpmmpnmpomppmpqmprmpsmptmpu\
+    mpvmpwmpxmpympzmqamqbmqcmqemqfmqgmqhmqimqjmqkmqlmqmmqnmqomqpmqqmqrmqsmqu\
+    mqvmqwmqxmqymqzmr mramrbmrcmrdmrfmrgmrhmrjmrkmrlmrmmrnmromrpmrqmrrmrsmrt\
+    mrumrvmrwmrxmrymrzms msbmscmsemsfmsgmshmsimsjmskmslmsmmsnmsomspmsqmssmsu\
+    msvmswmsxmsymszmt mtamtbmtcmtdmtemtfmtgmthmtimtjmtkmtlmtmmtnmtomtpmtqmtr\
+    mtsmttmtumtvmtwmtxmtymuamubmucmudmuemugmuhmuimujmukmummuomuqmurmusmutmuu\
+    muvmuxmuymuzmvamvdmvemvfmvgmvhmvkmvlmvnmvomvpmvqmvrmvsmvtmvumvvmvwmvxmvy\
+    mvzmwamwbmwcmwemwfmwgmwhmwimwkmwlmwmmwnmwomwpmwqmwrmwsmwtmwumwvmwwmwzmxa\
+    mxbmxcmxdmxemxfmxgmxhmximxjmxkmxlmxmmxnmxomxpmxqmxrmxsmxtmxumxvmxwmxxmxy\
+    mxzmy mybmycmyemyfmygmyhmyjmykmylmymmypmyrmyumyvmywmyxmyymyzmzamzdmzemzh\
+    mzimzjmzkmzlmzmmznmzomzpmzqmzrmztmzumzvmzwmzxmzzna naanabnacnaenafnagnaj\
+    naknalnamnannaonapnaqnarnasnatnawnaxnaynaznb nbanbbnbcnbdnbenbhnbinbjnbk\
+    nbmnbnnbonbpnbqnbrnbtnbunbvnbwnbyncancbnccncdncencfncgnchncincjncknclncm\
+    ncnnconcqncrnctncuncxncznd ndandbndcnddndfndgndhndindjndkndlndmndnndpndq\
+    ndrndsndtndundvndwndxndyndzne neanebnecnedneenegnehneinejneknemnenneoneq\
+    nernetneunewnexneyneznfanfdnflnfrnfung ngangbngcngdngenggnghngingjngkngl\
+    ngmngnngpngqngrngsngtngungvngwngxngyngznhanhbnhcnhdnhenhfnhgnhinhknhmnhn\
+    nhonhpnhqnhrnhtnhunhvnhwnhxnhynhznianibnidnienifnignihniinijnilnimninnio\
+    niqnirnisnitniunivniwnixniyniznjanjbnjdnjhnjinjjnjlnjmnjnnjonjrnjsnjtnju\
+    njxnjynjznkankbnkcnkdnkenkfnkgnkhnkinkjnkknkmnknnkonkqnkrnksnktnkunkvnkw\
+    nkxnkznl nlanlcnlenlgnlinljnlknlmnlonlqnlunlvnlwnlxnlynlznmanmbnmcnmdnme\
+    nmfnmgnmhnminmjnmknmlnmmnmnnmonmpnmqnmrnmsnmtnmunmvnmwnmxnmznn nnannbnnc\
+    nndnnennfnngnnhnninnjnnknnlnnmnnnnnpnnqnnrnntnnunnvnnwnnynnzno noanocnod\
+    noenofnognohnoinojnoknonnopnoqnosnotnounovnownoynpbnpgnphnplnpnnponpsnpu\
+    npxnpynqgnqknqlnqmnqnnqonqqnqtnqynr nranrbnrenrfnrgnrinrknrlnrmnrnnrpnru\
+    nrxnrznsansbnscnsdnsensfnsgnshnsknsmnsnnsonsqnssnstnsunsvnswnsxnsynszntd\
+    ntentgntintjntkntmntontpntrntuntxntyntznuanucnudnuenufnugnuhnuinujnuknum\
+    nunnuonupnuqnurnusnutnuunuvnuwnuxnuynuznv nvhnvmnvonwbnwcnwenwgnwinwmnwo\
+    nwrnwwnwxnxanxdnxenxgnxinxlnxnnxonxqnxrnxxny nybnycnydnyenyfnygnyhnyinyj\
+    nyknylnymnynnyonypnyqnyrnysnytnyunyvnywnyxnyynzanzbnzdnzinzknzmnzrnzunzy\
+    nzzoaaoacoaroavobiobkoblobmoboobrobtobuoc ocaocoocuodaodkodtoduofsofuogb\
+    ogcoggogooguohtohuoiaoieoinoj ojbojcojsojvojwokaokbokcokdokeokgokiokkokm\
+    okookroksokuokvokxokzolaoldoleolkolmoloolroltoluom omaombomcomgomiomkoml\
+    omoompomromtomuomwomxonaoneongonionjonkonnonoonponronsontonuonxoodoonoor\
+    opaopkopmopooptopyor oraorcoreorgornoroorrorsortoruorvorworxorzos osaosc\
+    osiosoospostosuosxotaotbotdoteotiotkotlotmotnotqotrotsottotuotwotxotyotz\
+    ouboueouioumovdowiowloydoymoyyozmpa pabpacpadpaepafpagpahpaipakpalpampao\
+    pappaqparpaspaupavpawpaxpaypazpbbpbcpbepbfpbgpbhpbipblpbmpbnpbopbppbrpbs\
+    pbtpbvpbypcapcbpccpcdpcepcfpcgpchpcipcjpckpcmpcnpcppcwpdapdcpdnpdopdtpdu\
+    peapebpedpeepegpeipekpelpempeopeppeqpevpexpeypezpfapfepflpgapgdpggpgipgk\
+    pglpgnpgspguphdphgphhphkphlphmphnphophrphtphuphvphwpi piapibpicpidpifpig\
+    pihpijpilpimpinpiopippirpispitpiupivpiwpixpiypizpjtpkapkbpkgpkhpknpkopkp\
+    pkrpkupl plaplbplcpldpleplgplhplkpllplnploplrplspluplvplwplzpmapmbpmdpme\
+    pmfpmhpmipmjpmlpmmpmnpmopmqpmrpmspmtpmwpmxpmypmzpnapncpndpnepngpnhpnipnj\
+    pnkpnlpnmpnnpnopnppnqpnrpnspntpnvpnwpnypnzpocpoepofpogpohpoipokpomponpoo\
+    poppoqpospotpovpowpoyppeppippkpplppmppnppopppppqppspptpqapqmpraprcprdpre\
+    prfprgprhpriprkprmproprqprrprtpruprwprxps psapsepshpsipsmpsnpsqpsspstpsu\
+    pswpt ptapthptiptnptoptpptrpttptuptvpuapubpucpudpuepufpugpuipujpumpuopup\
+    puqpurputpuupuwpuxpuypwapwbpwgpwmpwnpwopwrpwwpxmpyepympynpyupyxpyypzepzh\
+    pznqu quaqubqucqudqufqugquiqukqulqumqunqupquqqurqusquvquwquxquyqvaqvcqve\
+    qvhqviqvjqvlqvmqvnqvoqvpqvsqvwqvzqwaqwcqwhqwmqwsqwtqxaqxcqxhqxlqxnqxoqxp\
+    qxqqxrqxtqxuqxwqyaqypraarabracradrafragrahrairajrakramranraoraprarravraw\
+    raxrayrazrbbrbkrblrbprcfrdbrearebreeregreirejrelremrenresretreyrgargnrgr\
+    rgsrgurhgrhpriarifrilrimrinrirritriurjgrjirjsrkarkbrkhrkirkmrktrkwrm rma\
+    rmbrmcrmdrmermfrmgrmhrmirmkrmlrmmrmnrmormprmqrmtrmurmwrmxrmzrn rndrngrnl\
+    rnnrnrrnwro robrocrodroerofrogrolromrooroprorrourowrpnrptrrirrmrrorrtrsk\
+    rswrtcrthrtmrtwru rubrucruerufrugruirukruorupruqrutruuruyruzrw rwarwkrwl\
+    rwmrworwrrxdrxwryusa saasabsacsadsaesafsahsajsaksamsaosaqsarsassatsausav\
+    sawsaxsaysazsbasbbsbcsbdsbesbgsbhsbisbjsbksblsbmsbnsbosbpsbqsbrsbssbtsbu\
+    sbvsbwsbxsbysbzsc scbscescfscgschsciscksclscnscoscpscssctscuscvscwscxsd \
+    sdasdbsdcsdesdfsdgsdhsdjsdksdnsdosdqsdrsdssdusdxse seasebsecsedseesefseg\
+    sehseisejsekselsenseosepseqsersessetseusevsewseysezsfesfmsfwsg sgasgbsgc\
+    sgdsgesghsgisgjsgmsgpsgrsgssgtsgusgwsgysgzshashbshcshdsheshgshhshishjshk\
+    shmshnshoshpshqshrshsshtshushvshwshyshzsi siasibsidsiesifsigsihsiisijsik\
+    silsimsipsiqsirsissiusivsiwsixsiysizsjasjbsjdsjesjgsjlsjmsjpsjrsjtsjusjw\
+    sk skaskbskcskdskeskfskgskhskiskjskmsknskoskpskqskrskssktskuskvskwskxsky\
+    skzsl slcsldslgslhslisljsllslmslnslpslrsluslwslxslyslzsm smasmbsmcsmfsmg\
+    smhsmjsmksmlsmnsmpsmqsmrsmssmtsmusmwsmxsmysmzsn sncsnesnfsngsnisnjsnksnl\
+    snmsnnsnosnpsnqsnrsnssnusnvsnwsnxsnysnzso soasobsocsodsoesogsoisoksolsoo\
+    sopsoqsorsossousovsowsoxsoysozspbspcspdspespgspispksplspmspnsposppspqspr\
+    spssptspvsq sqasqhsqmsqosqqsqtsqusr srasrbsresrfsrgsrhsrisrksrlsrmsrnsro\
+    srqsrrsrssrtsrusrvsrwsrxsrysrzss ssbsscssdssessfssgsshssjsslssmssnssossq\
+    ssssstssussvssxssysszst stastbstestfstgsthstistjstkstlstmstnstostpstqstr\
+    stssttstvstwstysu suasubsucsuesugsuisujsuksuosuqsursussutsuvsuwsuysuzsv \
+    svasvbsvcsvesvmsvssw swbswfswgswiswjswkswmswoswpswqswrswsswtswuswvswwswx\
+    swysxbsxesxnsxrsxssxusxwsyasybsycsyisyksylsymsynsyosyrsyssywsyxszaszbszc\
+    szgszlsznszpszvszwszyta taatabtactadtaetaftagtajtaktaltantaotaptaqtartas\
+    tautavtawtaxtaytaztbatbctbdtbetbftbgtbhtbitbjtbktbltbmtbntbotbptbstbttbu\
+    tbvtbwtbxtbytbztcatcbtcctcdtcetcftcgtchtcitcktcmtcntcotcptcqtcstcutcwtcx\
+    tcytcztdatdbtdctddtdetdgtdhtditdjtdktdltdmtdntdotdqtdrtdstdttdvtdxtdyte \
+    teatebtectedteetegtehteitektemtenteotepteqtertestetteutevtewtexteyteztfi\
+    tfntfotfrtfttg tgatgbtgctgdtgetgftghtgitgjtgntgotgptgqtgstgttgutgvtgwtgx\
+    tgytgzth thdthethfthhthithkthlthmthpthqthrthsthtthuthvthythzti tictiftig\
+    tihtiitijtiktiltimtintiotiptiqtistittiutivtiwtixtiytjatjgtjitjjtjltjntjo\
+    tjptjstjutjwtk tkatkbtkdtketkftkgtkltkptkqtkrtkstkttkutkvtkwtkxtkztl tla\
+    tlbtlctldtlftlgtlitljtlktlltlmtlntlptlqtlrtlstlttlutlvtlxtlytmatmbtmctmd\
+    tmetmftmgtmhtmitmjtmltmmtmntmotmqtmrtmttmutmvtmwtmytmztn tnatnbtnctndtng\
+    tnhtnitnktnltnmtnntnotnptnqtnrtnstnttnvtnwtnxtnyto tobtoctodtoftogtohtoi\
+    tojtoktoltomtootoptoqtortostoutovtowtoxtoytoztpatpctpetpftpgtpitpjtpktpl\
+    tpmtpntpptprtpttputpvtpxtpytpztqbtqltqmtqntqotqptqttqutqwtr tratrbtrctre\
+    trftrgtrhtritrjtrltrmtrntrotrptrqtrrtrstrttrutrvtrwtrxtrytrzts tsatsbtsc\
+    tsdtsgtshtsitsjtsltsptsrtsttsutsvtswtsxtsztt ttbttcttdttettftthttittjttk\
+    ttlttmttnttottpttrttstttttuttvttwttyttztuatubtuctudtuetuftugtuhtuitujtul\
+    tumtuntuotuqtustuutuvtuxtuytuztvatvdtvetvitvktvltvmtvntvotvstvttvutvwtvx\
+    twatwbtwdtwetwftwgtwhtwltwmtwntwotwptwqtwrtwttwutwwtwxtwytxatxetxgtxitxj\
+    txmtxntxotxqtxstxttxutxxtxyty tyatyetyhtyityjtyltyntyptyrtystyttyutyvtyx\
+    tyytyztzhtzjtzltzmtzntzotzxuamuarubaubiublubrubuubyudaudeudgudiudjudludm\
+    uduuesufiug ugaugbugeughugouhauhnuisuivujiuk ukaukgukhukiukkukpukqukuukv\
+    ukwukyulaulbulculeulfuliulkulmulnuluulwulyumaumbumdumgumiummumnumoumpumr\
+    umsunauneunguniunkunmunnunrunuunxunzuonupiupvur uraurburcureurfurgurhuri\
+    urkurmurnurourpurrurturuurvurwurxuryurzusaushusiuskuspussusuutauteuthutp\
+    utrutuuumuuruveuvhuvluwauyauz uzsvaavaevafvagvahvaivajvalvamvanvaovapvar\
+    vasvauvavvayvbbvbkve vecvemveovepvervgrvi vicvidvifvigvilvinvitvivvjkvka\
+    vkjvkkvklvkmvknvkovkpvktvkuvkzvlpvlsvmavmbvmcvmdvmevmfvmgvmhvmivmjvmkvml\
+    vmmvmpvmqvmrvmsvmuvmwvmxvmyvmzvnkvnmvnpvo vorvotvravrovrsvrtvtovumvunvut\
+    vwawa waawabwacwadwaewafwagwahwaiwajwalwamwanwapwaqwarwaswatwauwavwawwax\
+    waywazwbawbbwbewbfwbhwbiwbjwbkwblwbmwbpwbqwbrwbtwbvwbwwcawciwddwdgwdjwdk\
+    wdtwduwdywecwedwegwehweiwemweowepwerweswetweuwewwfgwgawgbwggwgiwgowguwgy\
+    whawhgwhkwhuwibwicwiewifwigwihwiiwijwikwilwimwinwirwiuwivwiywjawjiwkawkd\
+    wkrwkwwkywlawlewlgwlhwliwlmwlowlrwlswluwlvwlwwlxwmawmbwmcwmdwmewmhwmiwmm\
+    wmnwmowmswmtwmwwmxwnbwncwndwnewngwniwnkwnmwnnwnownpwnuwnwwnywo woawobwoc\
+    wodwoewofwogwoiwokwomwonwooworwoswowwpcwrbwrgwrhwriwrkwrlwrmwrowrpwrrwrs\
+    wruwrvwrwwrxwrzwsawsgwsiwskwsrwsswsuwsvwtbwtfwthwtiwtkwtmwtwwuawubwudwul\
+    wumwunwurwutwuuwuvwuxwuywwawwbwwowwrwwwwxwwybwyiwymwynwyrwyyxaaxabxagxai\
+    xajxakxalxamxanxaoxarxasxatxauxavxawxayxbbxbdxbexbgxbixbjxbmxbnxbpxbrxbw\
+    xbyxchxcoxcrxdaxdkxdoxdqxdyxedxegxemxerxesxetxeuxgbxgdxggxgixgmxguxgwxh \
+    xhexhmxhvxiixinxirxisxiyxjbxjtxkaxkbxkcxkdxkexkfxkgxkjxklxknxkpxkqxkrxks\
+    xktxkuxkvxkwxkxxkyxkzxlaxlcxldxlyxmaxmbxmcxmdxmfxmgxmhxmjxmmxmnxmoxmpxmq\
+    xmrxmtxmuxmvxmwxmxxmyxmzxnaxnbxnixnjxnkxnmxnnxnqxnrxntxnuxnyxnzxocxodxog\
+    xoixokxomxonxooxopxorxowxpaxpbxpdxpfxpgxphxpixpjxpkxplxpmxpnxpoxpqxprxpt\
+    xpvxpwxpxxpzxraxrbxrdxrexrgxrixrmxrnxrrxruxrwxsaxsbxsexshxsixsmxsnxspxsq\
+    xsrxsuxsyxtaxtbxtcxtdxtexthxtixtjxtlxtmxtnxtpxtqxtsxttxtuxtvxtwxtyxubxud\
+    xujxulxumxunxuoxutxuuxvexvixvnxvoxvsxwaxwdxwexwjxwkxwlxwoxwrxwtxwwxxbxxk\
+    xxmxxrxxtxyaxybxyjxykxylxytxyyxzhxzpyaayabyacyadyaeyafyagyahyaiyajyakyal\
+    yamyanyaoyapyaqyaryasyatyauyavyawyaxyayyazybaybbybeybhybiybjyblybmybnybo\
+    ybxybyyclycnycrydaydeydgydkyeayecyeeyeiyejyelyeryesyetyeuyevyeyygaygiygl\
+    ygmygpygryguygwyhdyi yiayigyihyiiyijyilyimyiryisyivykaykgykhykiykkykmyko\
+    ykrykyylaylbyleylgyliyllylryluylyymbymeymgymkymlymmymnymoympynayndyngynk\
+    ynlynqynsynuyo yobyogyoiyokyolyomyonyotyoyyrayrbyreyrkyrlyrmyroyrsyrwyry\
+    ysdysnyspysryssysyytwytyyuayubyucyudyueyufyugyuiyujyulyumyunyupyuqyuryut\
+    yuwyuxyuzyvayvtywaywgywnywqywrywuywwyxayxgyxlyxmyxuyxyyyryyuza zaazabzac\
+    zadzaezafzagzahzajzakzamzaozapzaqzarzaszatzauzavzawzaxzayzazzbazbczbezbt\
+    zbuzbwzcazchzdjzeazegzehzemzenzgazgbzghzgmzgnzgrzh zhdzhizhnzhwzhxziazik\
+    zilzimzinziwzizzkazkdzkozkpzktzkuzkzzlazljzlmzlnzlqzluzmazmbzmczmdzmezmf\
+    zmgzmhzmizmjzmkzmlzmmzmnzmozmpzmqzmrzmszmtzmuzmvzmwzmxzmyzmzznaznezngznk\
+    znszoczohzomzoozoqzorzoszpazpbzpczpdzpezpfzpgzphzpizpjzpkzplzpmzpnzpozpp\
+    zpqzprzpszptzpuzpvzpwzpxzpyzpzzqezrgzrnzrozrpzrszsazsrzsuzteztgztlztmztn\
+    ztpztqztszttztuztxztyzu zuhzumzunzuyzwazygzyjzynzypzzazzj\
+    ";
+
+/// For each language of `LIKELY_LANG_KEYS`, its script in `LIKELY_SCRIPT_NAMES`.
+pub(crate) static LIKELY_LANG_SCRIPTS_AT: &[u8] = &[
+    55, 55, 55, 55, 55, 55, 67, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 31, 55, 55, 55, 55, 21, 55,
+    55, 55, 55, 55, 55, 55, 2, 55, 88, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 2, 55, 55, 2, 55, 55, 55, 55, 55, 2, 2, 55, 55, 55, 55, 55, 55, 2, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 112, 21, 55, 5, 55, 2, 2, 2, 55, 55, 55, 2, 55, 55,
+    55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    22, 25, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 25, 55, 55, 55, 55,
+    55, 55, 1, 55, 22, 55, 55, 55, 2, 55, 55, 55, 55, 55, 100, 38, 55, 55, 55, 45, 72, 55, 2, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 119, 55, 55, 55, 55,
+    55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 52, 67, 55, 55, 55, 55, 55, 21, 21,
+    55, 25, 55, 55, 55, 25, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 43, 55, 55,
+    55, 100, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 22, 22, 22,
+    55, 55, 25, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 10,
+    55, 55, 55, 2, 2, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 2, 3, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2,
+    55, 2, 55, 55, 55, 2, 2, 10, 55, 55, 55, 94, 55, 55, 55, 55, 2, 55, 55, 55, 22, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 21,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2,
+    21, 55, 2, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 25, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 4, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55,
+    55, 2, 2, 55, 2, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55,
+    55, 55, 55, 55, 2, 55, 55, 22, 55, 55, 55, 55, 55, 7, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 26, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 25, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 80, 55, 55, 55, 2, 21, 55, 55, 55, 55, 22, 55, 55,
+    55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 105, 55, 2, 112, 80, 55, 22, 22, 21, 55, 55, 22, 22, 55, 55, 55, 55, 2, 55,
+    2, 22, 55, 55, 55, 55, 55, 22, 31, 55, 55, 22, 22, 55, 22, 2, 55, 55, 21, 22, 22, 55, 2, 100,
+    22, 55, 55, 55, 55, 22, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 100, 55, 55, 55, 22, 55, 55, 2, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 112, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 72, 55, 55, 55, 55, 55, 55, 55,
+    107, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 10, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    22, 55, 55, 55, 55, 55, 55, 112, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 22, 10, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 22, 47, 55, 22, 55, 55, 2, 55, 55, 2, 55, 55, 55, 112, 55, 55, 55, 55, 55, 55, 52,
+    49, 22, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 2, 55, 55, 55, 55, 55, 8, 55, 55, 25, 55,
+    55, 55, 55, 55, 55, 55, 9, 55, 55, 55, 55, 55, 55, 9, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55,
+    55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 72, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 69, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 22, 55, 55, 55, 55, 55, 25, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    111, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 111, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 13, 55, 108, 55,
+    22, 32, 22, 22, 36, 55, 10, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 112, 55,
+    55, 55, 55, 2, 55, 55, 55, 55, 21, 55, 55, 55, 55, 17, 55, 55, 22, 55, 55, 55, 55, 55, 55, 22,
+    55, 55, 55, 55, 55, 55, 2, 55, 55, 21, 55, 16, 55, 55, 55, 55, 55, 36, 2, 55, 55, 55, 55, 55,
+    55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55,
+    98, 55, 55, 55, 55, 55, 55, 112, 55, 55, 55, 55, 55, 55, 55, 36, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 111, 55, 55, 55, 55, 55, 55, 19, 55, 55, 55, 55, 55, 55, 55, 55, 31, 55, 55, 55,
+    55, 55, 55, 55, 55, 14, 55, 55, 55, 55, 55, 55, 21, 55, 14, 14, 14, 14, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 72, 55, 55, 55, 55, 36, 55, 55, 55, 14, 55, 55, 55, 55, 83, 55, 10,
+    55, 55, 55, 22, 55, 55, 55, 105, 55, 105, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 51,
+    55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 36, 38, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55,
+    55, 55, 55, 55, 55, 2, 55, 2, 55, 55, 55, 55, 55, 55, 10, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 32, 22, 55, 55, 55, 55, 22, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 112, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55,
+    65, 55, 2, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55,
+    72, 72, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 25, 55, 55,
+    55, 112, 55, 55, 55, 55, 55, 22, 25, 55, 55, 22, 55, 55, 55, 55, 55, 80, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 32, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 22, 55, 55, 55, 55, 55, 55, 110, 55, 55, 80, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 112, 55, 55, 55, 55, 112, 55, 55, 55, 55, 55, 55, 55, 55, 31, 20, 55, 55, 55,
+    55, 55, 55, 55, 55, 23, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 44, 31, 55, 55,
+    55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 21, 21, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 105, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 28, 2,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 41, 55, 55, 55, 55, 55, 21, 55, 21, 55, 55, 55, 55,
+    55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 2, 55, 55, 55,
+    55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 36, 55, 55, 80, 55, 32, 55, 108, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 80, 22, 32, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55,
+    55, 80, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 22, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 25, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55,
+    55, 2, 55, 22, 55, 55, 109, 2, 55, 112, 55, 55, 55, 55, 55, 2, 55, 55, 55, 21, 55, 55, 55, 55,
+    55, 55, 55, 55, 2, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 2, 55, 2, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 53, 55, 55, 55, 55, 25, 55, 58, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 112, 25, 55, 55, 55, 22,
+    22, 55, 22, 55, 55, 55, 55, 55, 29, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 31, 55,
+    55, 55, 55, 55, 55, 55, 55, 10, 25, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 32, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 2, 55, 55, 2, 55, 55, 55, 55, 55, 55, 2, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 2, 55, 55, 55, 2, 55, 55, 55,
+    55, 55, 55, 36, 55, 55, 55, 55, 55, 55, 25, 55, 55, 55, 55, 55, 2, 55, 55, 55, 38, 55, 55, 25,
+    38, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 22, 55, 55, 102, 55, 55, 55, 55, 55,
+    119, 55, 55, 55, 55, 55, 2, 55, 55, 22, 55, 55, 39, 55, 55, 86, 55, 11, 55, 55, 55, 11, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 2, 22, 55, 55, 55, 40, 55, 2, 55, 55, 55, 55, 22, 55, 55, 2, 55,
+    22, 55, 55, 55, 55, 55, 55, 55, 35, 22, 72, 55, 55, 55, 55, 55, 55, 55, 55, 100, 55, 55, 55, 2,
+    55, 36, 2, 55, 55, 55, 55, 55, 119, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    22, 55, 55, 55, 55, 38, 21, 55, 55, 55, 55, 55, 55, 55, 55, 4, 55, 4, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    120, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 60, 55, 55, 55, 21, 55, 55, 55, 55, 72, 55,
+    25, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 105, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 38, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 14, 55, 55, 55,
+    38, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 43, 55, 55, 55, 2, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 38, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 21, 112,
+    2, 21, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 26, 55, 55, 55, 38, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 34, 55, 55, 72, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55,
+    102, 2, 55, 55, 55, 22, 22, 55, 55, 2, 55, 55, 38, 38, 55, 55, 38, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 22, 55, 80, 55, 55, 55, 55, 55, 55, 80, 55, 55, 55, 55, 55, 112, 38, 55, 26, 21, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 6, 55, 55, 55, 55, 55, 21, 55, 112, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 2, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 10, 55, 111, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 21, 55, 67, 55, 22, 108, 55, 49, 22, 108, 49, 105, 55, 49, 67, 105, 22, 55, 2, 55,
+    55, 22, 22, 22, 22, 22, 55, 55, 22, 22, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 22, 55, 104, 55, 55, 55, 111, 112, 55, 55, 55, 22, 12, 55, 55, 55, 55, 72, 55,
+    21, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 21, 55, 22, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 52, 21, 55, 55, 55, 22, 55, 55, 22, 72, 55, 55, 55, 111,
+    55, 55, 55, 112, 21, 55, 55, 55, 55, 55, 112, 55, 51, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55,
+    22, 55, 55, 55, 55, 55, 55, 55, 55, 47, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 49, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 50, 55, 55, 55, 55, 55, 55, 55, 21, 22, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 21, 55, 55, 55, 21, 55, 55, 55, 55, 100, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 25, 55, 55, 22, 55, 21, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 47,
+    55, 55, 22, 47, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 72, 55, 72, 55, 22, 55, 25, 55, 55, 22, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55,
+    86, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 52, 55, 55, 55, 55, 55, 55, 21, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 72, 55, 72, 55, 55, 2, 44, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 72, 55, 55, 72, 111, 55, 55, 2,
+    55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 44, 22, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 57, 55, 38, 22, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 21, 22, 55, 112, 55, 22, 55, 52, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 111, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 56, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 100,
+    55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 59, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 112, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 22, 55, 55, 55, 55, 108, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 52, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 86, 55, 55, 55, 2, 55, 55, 2, 2, 55, 55, 55, 55, 55,
+    55, 2, 38, 55, 55, 55, 55, 2, 55, 37, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 112, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 2, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 111, 111, 55, 55, 55, 55, 112, 55, 36, 55, 55, 55, 55, 55, 55, 55, 55, 22, 22, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 21, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 25, 25, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 54, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 62, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55,
+    67, 67, 55, 22, 108, 67, 55, 55, 55, 22, 21, 55, 22, 55, 22, 55, 2, 55, 55, 55, 111, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 67, 55, 55, 55, 55, 111, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 21, 55, 55, 69, 55, 55, 55, 55, 55, 10, 2, 55, 55, 55, 55, 55, 55, 21, 55,
+    55, 72, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 111, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 22, 111, 55, 55, 22, 55, 55, 55, 21, 55, 55, 55, 55, 70, 55, 55, 22, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 22,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 112, 55, 55, 55, 55, 55, 22, 55,
+    105, 55, 55, 25, 55, 55, 2, 69, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2,
+    25, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 72, 55, 55, 40, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 72, 55, 55, 55, 55, 55, 55, 55, 55, 55, 25, 55, 55, 55, 21, 55, 55, 55, 62, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 36, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 52, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 21, 112, 119, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 52, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21,
+    55, 55, 55, 108, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 2, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 117, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 51,
+    22, 55, 21, 55, 22, 55, 55, 90, 55, 55, 120, 55, 55, 55, 55, 55, 112, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 75, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 90, 55, 55,
+    55, 55, 55, 55, 55, 120, 55, 120, 55, 55, 14, 55, 55, 55, 55, 55, 113, 55, 120, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 120, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 74, 55, 55, 55, 55, 55,
+    55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 111, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 111, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 21, 21, 100, 26, 55, 55, 55, 85, 55, 72, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 119, 55, 55, 55, 55, 14, 55, 55, 14, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 34,
+    35, 55, 55, 55, 55, 55, 47, 22, 55, 112, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55,
+    55, 71, 68, 55, 55, 55, 72, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55,
+    55, 55, 55, 55, 55, 55, 80, 55, 55, 55, 55, 55, 55, 55, 55, 108, 2, 21, 55, 55, 55, 21, 81, 41,
+    42, 55, 55, 55, 55, 55, 2, 112, 55, 55, 55, 79, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 30, 55,
+    55, 55, 82, 55, 55, 55, 55, 55, 55, 55, 55, 33, 55, 55, 55, 55, 55, 55, 55, 55, 55, 84, 55, 55,
+    55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    2, 55, 55, 55, 47, 55, 55, 72, 67, 67, 22, 22, 108, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 80, 55, 55, 55, 55, 118, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 46, 22, 55, 55,
+    77, 41, 55, 55, 22, 55, 55, 72, 2, 55, 85, 52, 2, 111, 111, 2, 22, 95, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 12, 55, 55, 55, 55, 55, 55,
+    67, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 72, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 12, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 31, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 46, 2, 2, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 111, 55, 55, 2, 2, 55, 55, 2, 2, 55, 55, 55, 55, 2, 12,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 72, 22, 111, 55, 55, 55, 55, 55, 72, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    2, 55, 55, 55, 55, 55, 55, 22, 22, 55, 55, 22, 55, 10, 55, 22, 55, 55, 55, 55, 55, 55, 22, 55,
+    55, 55, 55, 72, 55, 55, 55, 55, 2, 55, 55, 55, 55, 80, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 89, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 22, 47, 55, 55, 72, 55, 10, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 4, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 72, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21,
+    55, 55, 55, 55, 22, 21, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 22, 55, 55, 45, 22, 55, 55, 55, 55, 55, 55, 21, 55, 55, 91, 55, 55, 55, 55, 78, 55, 55,
+    55, 55, 55, 93, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 112,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 2, 55, 55, 22, 55, 52, 102, 55, 55, 31, 2,
+    55, 2, 55, 55, 2, 2, 2, 55, 55, 55, 55, 55, 10, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 86, 55, 55, 55, 55, 55,
+    55, 55, 21, 55, 22, 55, 55, 2, 55, 112, 55, 25, 2, 55, 55, 55, 55, 2, 55, 55, 55, 109, 55, 55,
+    2, 72, 55, 55, 55, 55, 55, 55, 2, 2, 55, 55, 55, 95, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 112, 55, 55, 55, 55, 55, 55, 55, 2, 2, 55, 55, 21, 55, 55, 55, 55, 22, 55, 21, 55, 55,
+    55, 55, 111, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    120, 55, 55, 55, 55, 91, 55, 55, 55, 55, 47, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 107, 55, 55, 55, 55, 96, 22, 55, 55, 55,
+    55, 55, 55, 55, 111, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 112, 80, 55, 55, 55, 55, 2, 52, 2, 55, 21, 55, 97, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 22, 55, 2, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55,
+    52, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    2, 55, 25, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 99, 55,
+    26, 55, 55, 55, 55, 55, 55, 2, 55, 55, 35, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55,
+    55, 55, 55, 55, 55, 55, 90, 55, 55, 55, 100, 55, 55, 10, 55, 100, 55, 100, 55, 22, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 105, 55, 21, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 101, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 112, 72, 55, 55, 55, 55, 55, 105,
+    49, 55, 109, 22, 55, 103, 55, 22, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 108,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 42, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 21, 55, 55, 55, 55, 22, 112, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 111, 55, 22, 22, 55, 103, 55, 22, 111, 55, 22, 22, 22, 55, 55, 55, 55, 55, 25, 55, 55, 25,
+    55, 55, 22, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 72, 55, 2,
+    55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 2, 22, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 100, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 13, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 47, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55,
+    55, 38, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55,
+    31, 55, 55, 55, 112, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 52, 55, 55, 55,
+    55, 55, 55, 52, 55, 55, 111, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 72, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 106, 55, 55,
+    55, 55, 114, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 107, 55, 55, 55, 21, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 67, 21, 55, 55, 21,
+    55, 55, 55, 2, 115, 55, 55, 21, 111, 55, 55, 55, 55, 55, 21, 55, 55, 55, 80, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 10, 55, 10, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55,
+    111, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 31, 55, 55, 55, 55, 55, 55, 55, 2, 105, 55, 2, 55, 22, 116, 55, 55, 55, 55, 55, 55, 55,
+    22, 55, 22, 22, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 49, 55, 55, 55, 2, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 25, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 55, 108, 22, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 25, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 27, 55, 55, 55, 55, 55, 2, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 36, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 0, 55,
+    55, 55, 21, 55, 25, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 18, 15, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    2, 47, 55, 55, 55, 55, 80, 55, 55, 55, 2, 55, 2, 55, 55, 112, 55, 2, 55, 55, 2, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 60, 61, 24, 55, 55, 55, 55, 26, 55, 55, 55, 55, 63, 55, 55, 55,
+    66, 55, 55, 55, 55, 55, 55, 55, 73, 55, 55, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 31, 55, 77, 55, 55, 55, 21, 55, 55, 55, 87, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 21, 55, 55, 55, 92, 55, 55, 55, 55, 55, 55, 55, 55,
+    22, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 12, 55, 55, 55, 55, 55, 55, 105, 55,
+    105, 55, 55, 55, 55, 55, 55, 41, 2, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 64, 55, 55, 55, 55, 55, 55, 55, 55, 55, 21, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 22, 22, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 2, 55, 67, 55, 55, 55, 31, 55, 55, 55, 55, 108, 55, 55, 55, 55, 55,
+    55, 86, 55, 55, 55, 38, 38, 55, 120, 38, 55, 55, 55, 55, 55, 55, 120, 55, 21, 21, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 86, 55, 55, 21,
+    55, 55, 55, 55, 55, 55, 55, 43, 55, 55, 55, 55, 55, 111, 55, 55, 55, 21, 55, 55, 55, 55, 55, 55,
+    120, 120, 120, 21, 55, 86, 55, 55, 55, 55, 55, 38, 37, 55, 21, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 21, 55, 55, 55, 55, 55, 55, 86, 55, 86, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 112, 55, 55, 55, 55, 55, 2, 55, 55, 55,
+    55, 55, 55, 35, 2, 55, 55, 35, 55, 109, 55, 35, 109, 35, 35, 55, 36, 35, 55, 55, 55, 76, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 21, 55, 48, 55, 21, 55, 35, 55, 35, 35, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 35, 80, 55, 55, 38, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+    55, 55, 55, 55, 55, 55, 55, 55, 55, 2, 55, 55, 25, 35, 55, 35, 55, 55, 35,
+];
+
+/// For each language of `LIKELY_LANG_KEYS`, its region in `LIKELY_REGION_NAMES`.
+pub(crate) static LIKELY_LANG_REGIONS_AT: &[u8] = &[
+    53, 131, 131, 143, 143, 88, 84, 143, 143, 143, 143, 36, 22, 47, 22, 191, 188, 70, 143, 143, 80, 80, 62, 33,
+    36, 144, 144, 28, 125, 143, 178, 33, 80, 131, 131, 131, 144, 64, 80, 143, 33, 17, 143, 144, 143, 80, 38, 131,
+    64, 80, 103, 190, 85, 37, 131, 202, 71, 22, 133, 48, 191, 157, 139, 43, 160, 64, 180, 36, 176, 139, 9, 190,
+    84, 33, 84, 80, 143, 64, 80, 9, 131, 22, 37, 155, 143, 86, 9, 182, 50, 2, 128, 36, 197, 145, 9, 37,
+    143, 143, 143, 204, 99, 143, 131, 64, 143, 143, 131, 131, 143, 124, 64, 80, 141, 131, 131, 143, 143, 80, 143, 29,
+    84, 53, 144, 143, 143, 144, 143, 36, 141, 36, 144, 71, 144, 158, 155, 144, 144, 64, 198, 53, 80, 33, 116, 176,
+    33, 131, 84, 33, 84, 131, 191, 158, 37, 143, 9, 143, 143, 3, 85, 82, 131, 143, 84, 92, 84, 80, 2, 80,
+    22, 53, 143, 30, 169, 19, 128, 9, 131, 84, 64, 80, 80, 131, 74, 131, 80, 143, 143, 85, 144, 168, 64, 143,
+    198, 176, 143, 36, 155, 31, 191, 131, 35, 33, 191, 131, 9, 143, 144, 101, 84, 198, 201, 80, 80, 28, 155, 155,
+    158, 53, 143, 9, 29, 53, 22, 131, 141, 141, 53, 9, 187, 175, 80, 143, 143, 131, 143, 80, 141, 92, 143, 124,
+    80, 173, 9, 9, 9, 52, 38, 141, 131, 80, 128, 64, 60, 143, 155, 143, 131, 116, 84, 131, 38, 84, 84, 84,
+    38, 9, 53, 36, 131, 143, 33, 143, 170, 143, 195, 143, 143, 143, 143, 9, 143, 128, 80, 143, 143, 198, 80, 13,
+    74, 80, 158, 173, 160, 143, 144, 80, 135, 22, 191, 191, 191, 191, 22, 143, 198, 143, 143, 84, 22, 22, 191, 80,
+    22, 143, 155, 115, 131, 131, 80, 144, 128, 151, 22, 50, 86, 9, 9, 38, 191, 22, 22, 141, 35, 21, 191, 47,
+    22, 157, 22, 168, 22, 110, 50, 84, 188, 28, 80, 191, 131, 141, 80, 36, 2, 80, 22, 143, 84, 36, 52, 22,
+    29, 143, 80, 80, 143, 37, 141, 144, 143, 131, 33, 28, 144, 144, 144, 86, 36, 144, 80, 22, 191, 144, 169, 155,
+    191, 22, 198, 144, 158, 48, 158, 19, 205, 143, 109, 143, 198, 131, 143, 131, 143, 80, 143, 142, 80, 80, 143, 192,
+    155, 143, 86, 33, 0, 50, 9, 64, 22, 141, 143, 169, 22, 84, 143, 131, 22, 9, 80, 143, 9, 143, 53, 131,
+    80, 80, 22, 80, 80, 143, 143, 80, 7, 9, 22, 30, 9, 5, 128, 21, 143, 19, 141, 9, 131, 176, 202, 131,
+    131, 109, 202, 151, 85, 143, 144, 144, 131, 80, 10, 86, 124, 124, 124, 124, 36, 144, 124, 155, 158, 73, 80, 195,
+    36, 36, 23, 80, 145, 80, 38, 135, 8, 36, 131, 36, 36, 36, 80, 19, 143, 80, 143, 29, 143, 59, 36, 36,
+    36, 62, 29, 143, 15, 30, 36, 143, 131, 131, 131, 143, 36, 36, 36, 37, 166, 80, 36, 143, 67, 143, 33, 9,
+    9, 143, 131, 143, 29, 53, 28, 131, 29, 143, 131, 36, 131, 166, 166, 80, 38, 143, 131, 143, 125, 169, 160, 169,
+    10, 80, 175, 36, 175, 188, 197, 125, 188, 30, 36, 84, 80, 80, 9, 145, 26, 28, 36, 36, 80, 84, 143, 19,
+    80, 160, 143, 205, 143, 80, 31, 175, 33, 80, 33, 80, 169, 143, 188, 169, 84, 37, 36, 80, 30, 80, 143, 36,
+    30, 36, 180, 15, 36, 84, 37, 145, 84, 84, 144, 84, 84, 16, 131, 80, 84, 84, 36, 84, 144, 36, 145, 67,
+    145, 84, 84, 144, 158, 131, 80, 84, 184, 80, 80, 84, 84, 80, 84, 145, 143, 143, 82, 84, 135, 143, 139, 62,
+    84, 80, 80, 112, 36, 84, 84, 80, 80, 29, 80, 198, 9, 15, 175, 143, 73, 143, 144, 131, 64, 131, 143, 29,
+    143, 143, 143, 84, 64, 36, 84, 29, 29, 9, 143, 82, 73, 143, 53, 84, 143, 143, 85, 80, 30, 143, 143, 12,
+    166, 36, 175, 33, 144, 9, 143, 131, 36, 144, 29, 30, 36, 198, 30, 84, 80, 36, 80, 36, 29, 22, 80, 144,
+    29, 144, 131, 31, 180, 131, 80, 28, 158, 28, 80, 73, 80, 105, 29, 80, 116, 169, 144, 19, 158, 143, 37, 80,
+    197, 6, 144, 144, 19, 80, 115, 131, 29, 143, 67, 30, 165, 29, 143, 175, 135, 143, 29, 112, 143, 36, 143, 115,
+    38, 129, 143, 36, 31, 143, 143, 13, 80, 125, 144, 80, 80, 80, 69, 29, 144, 198, 69, 187, 144, 143, 80, 198,
+    84, 80, 80, 143, 29, 125, 36, 37, 141, 93, 36, 15, 29, 143, 31, 131, 131, 143, 115, 143, 143, 22, 169, 188,
+    64, 143, 15, 30, 115, 198, 36, 30, 143, 80, 155, 143, 29, 128, 9, 143, 80, 80, 80, 144, 144, 9, 143, 80,
+    143, 84, 84, 80, 19, 80, 19, 36, 67, 176, 86, 166, 30, 143, 36, 36, 131, 80, 80, 143, 36, 29, 33, 131,
+    131, 36, 58, 84, 95, 74, 135, 29, 21, 145, 36, 198, 160, 25, 29, 39, 24, 80, 143, 158, 80, 131, 197, 101,
+    84, 84, 143, 143, 11, 80, 20, 166, 36, 131, 2, 36, 131, 145, 131, 80, 38, 175, 67, 105, 131, 36, 53, 80,
+    67, 53, 131, 125, 131, 36, 80, 131, 175, 33, 125, 80, 80, 80, 144, 144, 143, 125, 198, 80, 131, 131, 145, 144,
+    80, 80, 80, 155, 175, 203, 176, 28, 29, 80, 37, 31, 131, 143, 36, 165, 143, 80, 143, 131, 143, 29, 143, 59,
+    131, 165, 131, 175, 69, 158, 158, 80, 175, 36, 131, 169, 131, 80, 36, 143, 175, 30, 9, 80, 80, 195, 131, 31,
+    144, 80, 128, 55, 205, 143, 116, 143, 126, 36, 195, 15, 143, 29, 143, 53, 80, 15, 131, 29, 36, 64, 29, 37,
+    15, 31, 158, 169, 69, 143, 29, 143, 9, 9, 15, 117, 9, 131, 36, 131, 36, 37, 175, 115, 143, 144, 36, 131,
+    80, 143, 131, 135, 29, 131, 37, 80, 9, 51, 131, 143, 131, 36, 135, 143, 143, 105, 80, 112, 39, 115, 143, 143,
+    177, 27, 132, 80, 29, 80, 29, 80, 80, 9, 0, 80, 36, 131, 115, 131, 131, 52, 71, 76, 71, 191, 166, 28,
+    151, 141, 21, 71, 118, 128, 143, 21, 21, 84, 195, 21, 21, 21, 21, 28, 21, 38, 38, 38, 38, 48, 19, 144,
+    116, 177, 131, 131, 141, 141, 141, 141, 38, 144, 38, 141, 22, 126, 131, 131, 73, 188, 125, 124, 13, 171, 84, 84,
+    84, 84, 84, 135, 37, 131, 84, 155, 191, 144, 151, 116, 131, 131, 116, 131, 131, 131, 116, 143, 144, 190, 24, 72,
+    38, 124, 124, 181, 191, 124, 56, 191, 155, 191, 191, 28, 124, 191, 141, 126, 135, 191, 124, 80, 19, 191, 131, 84,
+    88, 22, 124, 128, 191, 195, 95, 197, 191, 155, 6, 197, 143, 141, 39, 155, 143, 37, 85, 131, 77, 116, 64, 175,
+    143, 128, 155, 191, 187, 36, 131, 71, 131, 28, 124, 145, 64, 116, 84, 64, 191, 124, 116, 144, 155, 124, 197, 15,
+    117, 38, 80, 197, 116, 88, 204, 84, 116, 197, 37, 116, 141, 116, 124, 37, 36, 80, 124, 116, 60, 58, 9, 124,
+    124, 141, 38, 48, 177, 93, 124, 124, 191, 191, 28, 50, 191, 141, 166, 141, 124, 124, 141, 141, 70, 136, 64, 15,
+    144, 141, 37, 141, 37, 28, 53, 194, 198, 191, 38, 28, 189, 170, 28, 28, 28, 28, 124, 191, 7, 159, 7, 84,
+    197, 28, 131, 191, 44, 124, 146, 116, 116, 166, 191, 124, 37, 191, 191, 116, 28, 116, 191, 124, 191, 116, 124, 13,
+    116, 124, 191, 135, 38, 124, 144, 84, 124, 84, 124, 155, 197, 38, 124, 93, 38, 141, 140, 22, 195, 191, 124, 37,
+    36, 124, 124, 155, 84, 124, 188, 126, 188, 125, 166, 131, 60, 124, 21, 144, 37, 44, 124, 116, 46, 175, 143, 143,
+    36, 64, 143, 175, 160, 191, 93, 131, 116, 84, 155, 33, 175, 93, 144, 9, 80, 115, 131, 131, 80, 80, 115, 131,
+    125, 9, 131, 80, 131, 131, 36, 115, 115, 131, 115, 143, 84, 196, 9, 169, 31, 180, 143, 9, 19, 155, 9, 115,
+    80, 45, 160, 143, 105, 86, 131, 145, 80, 36, 191, 80, 28, 30, 84, 22, 143, 29, 64, 115, 144, 15, 143, 143,
+    131, 15, 30, 160, 9, 28, 15, 9, 9, 143, 143, 9, 135, 9, 6, 84, 84, 9, 188, 9, 128, 135, 9, 143,
+    169, 33, 169, 9, 93, 124, 36, 80, 160, 169, 131, 169, 131, 84, 127, 169, 198, 80, 29, 9, 9, 175, 9, 129,
+    9, 9, 9, 168, 115, 9, 80, 9, 143, 9, 24, 131, 80, 125, 169, 36, 155, 77, 84, 59, 115, 143, 9, 36,
+    131, 125, 145, 145, 36, 36, 80, 80, 80, 125, 9, 126, 80, 80, 143, 188, 94, 80, 33, 80, 15, 29, 143, 80,
+    116, 116, 80, 22, 143, 143, 37, 188, 143, 131, 84, 80, 143, 143, 29, 19, 158, 15, 131, 206, 36, 53, 64, 125,
+    149, 135, 125, 131, 9, 80, 125, 135, 53, 133, 187, 135, 45, 93, 175, 131, 80, 84, 115, 37, 125, 28, 9, 115,
+    115, 115, 115, 125, 125, 115, 115, 115, 135, 36, 84, 143, 144, 128, 93, 84, 143, 143, 144, 133, 80, 144, 80, 80,
+    36, 135, 37, 80, 80, 115, 144, 36, 122, 143, 131, 84, 53, 0, 9, 143, 9, 135, 15, 9, 9, 144, 33, 115,
+    9, 166, 131, 15, 9, 24, 131, 131, 9, 175, 24, 29, 9, 80, 131, 144, 31, 33, 93, 70, 43, 64, 131, 29,
+    131, 33, 88, 188, 131, 50, 131, 80, 143, 143, 73, 131, 131, 80, 131, 13, 36, 126, 131, 131, 116, 70, 143, 143,
+    131, 93, 143, 131, 80, 63, 135, 143, 124, 36, 140, 191, 84, 80, 58, 36, 191, 143, 93, 197, 80, 155, 155, 151,
+    60, 131, 80, 143, 80, 131, 131, 151, 0, 33, 131, 84, 198, 131, 143, 198, 9, 37, 80, 80, 52, 21, 84, 86,
+    191, 33, 191, 191, 144, 49, 131, 198, 36, 143, 131, 88, 131, 131, 80, 52, 124, 155, 131, 155, 36, 52, 191, 93,
+    131, 131, 86, 143, 69, 143, 158, 143, 131, 143, 143, 36, 36, 131, 69, 166, 158, 80, 52, 86, 86, 144, 169, 166,
+    143, 115, 175, 54, 160, 131, 157, 144, 188, 131, 161, 143, 55, 131, 134, 191, 80, 131, 36, 9, 29, 204, 36, 84,
+    198, 204, 175, 57, 19, 143, 29, 19, 143, 187, 69, 143, 58, 191, 80, 45, 58, 58, 58, 143, 45, 45, 198, 36,
+    199, 19, 67, 129, 175, 131, 22, 129, 88, 198, 29, 131, 143, 160, 128, 127, 133, 81, 64, 175, 84, 144, 195, 143,
+    111, 143, 143, 143, 80, 180, 143, 37, 143, 143, 84, 143, 84, 143, 84, 143, 53, 80, 30, 9, 9, 143, 143, 30,
+    19, 80, 84, 84, 84, 84, 169, 30, 30, 131, 19, 9, 30, 9, 19, 131, 86, 143, 9, 68, 61, 143, 63, 195,
+    60, 84, 9, 143, 131, 131, 144, 9, 30, 9, 175, 53, 175, 143, 155, 202, 143, 9, 131, 84, 131, 143, 105, 131,
+    80, 131, 28, 80, 176, 131, 131, 30, 80, 59, 131, 167, 29, 53, 143, 158, 105, 9, 9, 145, 9, 143, 143, 33,
+    143, 109, 60, 135, 116, 158, 110, 145, 143, 135, 9, 131, 204, 36, 33, 145, 9, 96, 143, 155, 143, 197, 197, 36,
+    28, 29, 9, 36, 145, 9, 64, 9, 145, 143, 143, 36, 131, 9, 67, 204, 52, 131, 175, 155, 2, 175, 86, 9,
+    131, 105, 175, 131, 9, 158, 131, 143, 45, 45, 36, 36, 9, 143, 53, 188, 70, 131, 151, 15, 84, 52, 36, 131,
+    176, 131, 9, 33, 25, 9, 143, 9, 125, 9, 143, 143, 21, 30, 33, 38, 143, 33, 24, 53, 188, 45, 143, 84,
+    84, 105, 84, 55, 80, 80, 80, 133, 189, 36, 33, 188, 29, 175, 131, 64, 143, 131, 22, 175, 84, 105, 70, 131,
+    143, 131, 158, 105, 125, 143, 80, 84, 53, 105, 143, 143, 105, 143, 166, 143, 30, 143, 32, 22, 9, 84, 131, 22,
+    38, 33, 9, 9, 38, 21, 53, 191, 38, 22, 38, 9, 151, 64, 39, 195, 19, 15, 93, 83, 151, 22, 143, 143,
+    22, 175, 131, 9, 22, 22, 135, 143, 9, 33, 131, 145, 53, 188, 145, 131, 28, 25, 9, 131, 190, 2, 9, 9,
+    64, 33, 143, 9, 131, 9, 30, 36, 53, 140, 74, 135, 21, 9, 131, 160, 86, 80, 131, 191, 86, 80, 53, 64,
+    143, 28, 84, 37, 197, 143, 188, 143, 80, 188, 53, 28, 29, 191, 28, 188, 2, 29, 131, 160, 82, 180, 124, 53,
+    82, 175, 80, 188, 28, 29, 127, 143, 143, 166, 143, 84, 131, 141, 191, 55, 131, 143, 84, 36, 80, 144, 25, 22,
+    184, 198, 22, 80, 188, 29, 84, 143, 143, 84, 197, 116, 184, 37, 115, 37, 197, 37, 37, 37, 37, 37, 84, 37,
+    143, 80, 197, 37, 37, 37, 36, 145, 84, 6, 25, 37, 191, 144, 145, 168, 143, 158, 143, 84, 131, 131, 139, 191,
+    84, 6, 169, 29, 191, 175, 143, 80, 37, 84, 116, 77, 84, 143, 197, 80, 37, 197, 9, 184, 84, 143, 22, 86,
+    45, 37, 139, 78, 80, 38, 188, 80, 184, 79, 141, 25, 80, 124, 143, 141, 35, 143, 80, 143, 29, 191, 28, 124,
+    135, 141, 124, 80, 141, 82, 155, 78, 124, 128, 80, 124, 33, 191, 131, 5, 36, 5, 127, 0, 128, 143, 143, 125,
+    131, 9, 131, 144, 197, 144, 131, 131, 131, 80, 131, 19, 131, 38, 80, 93, 84, 131, 19, 131, 143, 169, 131, 180,
+    131, 49, 144, 144, 176, 198, 144, 31, 144, 144, 131, 131, 131, 143, 131, 143, 21, 143, 0, 131, 80, 131, 80, 9,
+    37, 9, 131, 131, 19, 131, 131, 191, 131, 131, 131, 131, 131, 131, 9, 28, 131, 131, 190, 188, 80, 205, 9, 37,
+    144, 125, 144, 144, 80, 131, 143, 191, 143, 143, 80, 88, 169, 184, 80, 38, 191, 155, 38, 144, 143, 141, 116, 0,
+    53, 143, 191, 143, 143, 141, 131, 80, 80, 131, 188, 22, 84, 80, 144, 87, 143, 141, 144, 131, 131, 2, 80, 188,
+    131, 77, 36, 88, 144, 80, 21, 144, 88, 155, 131, 21, 143, 131, 144, 144, 131, 80, 144, 71, 28, 37, 144, 144,
+    82, 144, 143, 80, 143, 124, 71, 131, 36, 31, 155, 131, 131, 131, 92, 22, 131, 71, 67, 143, 131, 125, 158, 125,
+    80, 90, 9, 9, 80, 128, 2, 80, 80, 9, 128, 82, 9, 80, 143, 131, 109, 0, 80, 22, 36, 9, 189, 84,
+    145, 155, 141, 135, 197, 80, 33, 80, 131, 131, 143, 175, 29, 62, 131, 36, 125, 189, 36, 131, 76, 131, 131, 9,
+    143, 36, 188, 37, 48, 37, 98, 131, 80, 116, 143, 131, 160, 143, 131, 188, 80, 131, 135, 116, 64, 131, 143, 124,
+    84, 145, 9, 131, 53, 84, 84, 29, 33, 145, 21, 115, 148, 82, 141, 197, 82, 131, 131, 195, 22, 131, 33, 131,
+    9, 131, 135, 160, 84, 131, 22, 22, 46, 131, 131, 84, 80, 80, 168, 80, 64, 37, 82, 175, 62, 192, 47, 116,
+    131, 125, 30, 131, 131, 144, 93, 115, 155, 141, 22, 80, 80, 22, 9, 22, 22, 155, 9, 84, 38, 80, 29, 143,
+    175, 143, 30, 169, 176, 143, 53, 59, 143, 145, 80, 143, 143, 129, 131, 155, 143, 131, 80, 131, 131, 131, 131, 131,
+    73, 206, 143, 30, 190, 143, 160, 131, 131, 143, 188, 29, 29, 47, 188, 9, 188, 9, 188, 143, 29, 176, 190, 190,
+    128, 131, 131, 206, 131, 84, 106, 177, 80, 131, 80, 36, 41, 59, 160, 188, 191, 176, 160, 143, 80, 71, 29, 180,
+    36, 190, 175, 131, 155, 176, 84, 143, 84, 84, 131, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 36, 86, 36,
+    33, 84, 84, 84, 84, 84, 84, 84, 84, 84, 15, 29, 33, 80, 80, 143, 135, 22, 9, 160, 22, 80, 80, 9,
+    131, 143, 80, 80, 80, 135, 84, 37, 80, 80, 80, 101, 37, 80, 131, 143, 84, 86, 80, 115, 84, 143, 84, 6,
+    155, 145, 29, 29, 143, 93, 175, 160, 191, 36, 175, 135, 80, 143, 143, 131, 155, 191, 135, 80, 143, 143, 184, 188,
+    143, 84, 80, 188, 127, 80, 71, 80, 143, 80, 101, 155, 158, 10, 80, 135, 197, 9, 84, 116, 191, 80, 143, 177,
+    191, 143, 143, 24, 100, 131, 80, 143, 131, 67, 84, 144, 116, 188, 36, 158, 80, 131, 160, 9, 29, 131, 131, 135,
+    131, 80, 31, 80, 9, 28, 65, 191, 124, 36, 9, 135, 175, 144, 143, 80, 86, 131, 144, 143, 93, 131, 143, 143,
+    135, 145, 143, 105, 198, 80, 143, 80, 80, 95, 64, 6, 37, 144, 36, 143, 143, 143, 131, 84, 144, 144, 84, 143,
+    143, 36, 53, 143, 80, 143, 22, 29, 143, 131, 86, 84, 131, 144, 80, 144, 73, 131, 71, 165, 80, 22, 84, 165,
+    36, 125, 143, 125, 22, 67, 143, 127, 80, 29, 15, 98, 143, 131, 80, 169, 131, 38, 31, 155, 84, 143, 190, 143,
+    59, 56, 36, 175, 131, 131, 191, 143, 131, 38, 80, 105, 143, 56, 64, 80, 22, 131, 29, 197, 22, 176, 80, 143,
+    80, 155, 80, 143, 143, 155, 190, 143, 143, 143, 85, 144, 143, 15, 188, 143, 143, 19, 143, 33, 205, 105, 175, 22,
+    125, 67, 125, 204, 80, 143, 36, 53, 204, 131, 135, 191, 155, 180, 22, 198, 131, 165, 144, 155, 155, 105, 131, 95,
+    169, 129, 84, 95, 105, 166, 10, 80, 84, 188, 144, 143, 143, 36, 158, 45, 143, 143, 191, 143, 131, 144, 131, 30,
+    131, 143, 105, 15, 84, 29, 116, 80, 84, 197, 53, 131, 9, 135, 29, 9, 175, 80, 33, 143, 86, 143, 22, 143,
+    37, 144, 80, 80, 29, 197, 191, 22, 29, 127, 184, 131, 80, 143, 143, 101, 131, 131, 22, 188, 80, 131, 155, 51,
+    143, 143, 22, 64, 28, 191, 80, 30, 9, 9, 35, 155, 155, 80, 143, 80, 125, 175, 143, 80, 175, 36, 116, 36,
+    38, 80, 80, 116, 80, 116, 80, 80, 145, 116, 80, 60, 22, 131, 31, 158, 80, 158, 175, 80, 38, 143, 28, 131,
+    127, 127, 143, 33, 80, 29, 80, 36, 175, 168, 6, 6, 143, 33, 53, 20, 116, 125, 175, 116, 177, 125, 22, 145,
+    80, 143, 143, 84, 143, 31, 197, 143, 94, 188, 144, 143, 80, 64, 33, 143, 191, 125, 144, 144, 191, 30, 144, 80,
+    175, 22, 125, 80, 116, 135, 84, 143, 143, 22, 15, 80, 33, 80, 143, 80, 125, 158, 80, 80, 123, 59, 80, 36,
+    125, 80, 80, 22, 80, 29, 80, 193, 144, 70, 124, 82, 84, 188, 145, 123, 190, 29, 205, 131, 175, 197, 64, 176,
+    80, 80, 84, 143, 107, 143, 155, 84, 36, 84, 144, 84, 101, 101, 143, 135, 197, 143, 143, 80, 80, 9, 9, 80,
+    80, 80, 80, 6, 80, 143, 37, 80, 80, 33, 131, 131, 131, 131, 31, 131, 131, 131, 67, 0, 131, 131, 131, 29,
+    205, 21, 29, 15, 64, 205, 143, 29, 143, 29, 36, 171, 36, 84, 143, 143, 29, 143, 143, 80, 80, 80, 80, 155,
+    36, 0, 190, 158, 158, 190, 197, 80, 198, 158, 29, 53, 169, 64, 158, 143, 158, 29, 197, 80, 37, 135, 125, 173,
+    198, 37, 133, 165, 143, 37, 143, 29, 135, 64, 143, 88, 29, 28, 80, 64, 53, 105, 37, 160, 108, 80, 80, 30,
+    29, 9, 80, 80, 80, 80, 9, 9, 180, 93, 197, 22, 190, 24, 86, 125, 143, 9, 198, 93, 169, 93, 191, 9,
+    169, 131, 126, 67, 88, 143, 143, 80, 31, 9, 125, 143, 80, 175, 198, 80, 158, 55, 67, 198, 9, 160, 175, 80,
+    143, 135, 29, 80, 84, 198, 84, 88, 36, 80, 80, 198, 55, 191, 36, 80, 29, 30, 127, 80, 79, 125, 143, 9,
+    30, 143, 198, 36, 131, 9, 29, 101, 80, 15, 144, 80, 29, 169, 33, 143, 165, 29, 105, 123, 29, 131, 29, 33,
+    143, 169, 191, 125, 80, 135, 205, 198, 80, 116, 37, 169, 169, 125, 86, 9, 93, 145, 86, 93, 80, 160, 80, 198,
+    198, 86, 82, 29, 116, 190, 143, 145, 106, 37, 108, 190, 80, 22, 93, 93, 80, 29, 29, 190, 155, 205, 143, 191,
+    29, 24, 169, 6, 205, 93, 59, 40, 80, 84, 191, 135, 139, 36, 93, 86, 108, 180, 101, 158, 29, 80, 29, 80,
+    93, 197, 177, 37, 169, 80, 198, 143, 24, 205, 37, 198, 116, 184, 124, 124, 80, 131, 36, 84, 84, 124, 80, 71,
+    66, 124, 93, 124, 124, 22, 64, 80, 124, 144, 144, 22, 144, 162, 143, 144, 22, 143, 22, 31, 38, 36, 38, 143,
+    38, 144, 144, 131, 67, 143, 143, 145, 124, 151, 141, 143, 141, 124, 141, 195, 195, 143, 131, 6, 38, 125, 175, 124,
+    36, 143, 143, 36, 36, 36, 143, 175, 30, 143, 143, 131, 143, 143, 36, 175, 155, 175, 144, 29, 29, 29, 29, 30,
+    29, 29, 80, 143, 31, 31, 124, 31, 53, 53, 22, 36, 143, 9, 143, 143, 124, 80, 143, 125, 9, 165, 125, 9,
+    36, 93, 175, 143, 143, 105, 131, 166, 191, 177, 80, 29, 36, 121, 36, 67, 36, 36, 36, 36, 131, 131, 131, 131,
+    80, 176, 9, 143, 6, 166, 143, 53, 124, 169, 112, 81, 175, 169, 169, 175, 80, 36, 126, 131, 131, 80, 143, 180,
+    30, 36, 135, 188, 205, 188, 143, 143, 188, 188, 188, 188, 113, 59, 124, 188, 125, 143, 9, 190, 2, 36, 143, 126,
+    88, 205, 80, 191, 80, 195, 84, 25, 116, 80, 80, 138, 191, 124, 28, 85, 124, 36, 124, 124, 124, 36, 191, 124,
+    124, 80, 124, 124, 132, 124, 124, 124, 143, 124, 124, 124, 180, 124, 191, 175, 37, 188, 37, 143, 143, 84, 143, 143,
+    84, 84, 131, 84, 84, 84, 84, 13, 191, 135, 114, 33, 84, 143, 84, 131, 145, 56, 36, 19, 177, 80, 131, 143,
+    143, 124, 128, 67, 198, 31, 144, 80, 180, 84, 198, 36, 197, 143, 101, 143, 80, 175, 93, 198, 158, 166, 143, 166,
+    36, 160, 158, 198, 36, 198, 144, 131, 80, 124, 37, 198, 131, 198, 22, 143, 198, 144, 143, 143, 143, 37, 143, 36,
+    22, 198, 143, 175, 29, 117, 143, 80, 37, 22, 175, 36, 197, 29, 84, 2, 198, 143, 197, 37, 125, 191, 155, 80,
+    158, 116, 80, 126, 80, 153, 33, 7, 191, 28, 80, 28, 131, 31, 80, 132, 197, 27, 80, 160, 15, 38, 175, 191,
+    31, 143, 53, 175, 188, 9, 9, 22, 53, 175, 9, 36, 9, 175, 143, 124, 143, 143, 143, 22, 158, 143, 143, 22,
+    143, 22, 143, 80, 177, 80, 36, 80, 143, 80, 80, 124, 80, 80, 144, 19, 142, 80, 80, 80, 125, 80, 80, 169,
+    143, 143, 80, 80, 143, 84, 177, 198, 191, 135, 80, 84, 84, 155, 128, 56, 198, 158, 13, 198, 142, 84, 198, 131,
+    36, 142, 144, 80, 144, 80, 125, 144, 67, 175, 80, 80, 112, 125, 29, 144, 80, 144, 198, 80, 22, 128, 80, 143,
+    36, 73, 143, 143, 143, 120, 144, 33, 143, 80, 158, 143, 80, 80, 143, 80, 36, 131, 155, 132, 124, 21, 197, 84,
+    141, 198, 124, 143, 144, 124, 143, 36, 175, 36, 155, 48, 36, 169, 80, 175, 135, 143, 36, 37, 169, 191, 84, 93,
+    84, 143, 36, 53, 143, 80, 145, 37, 124, 175, 143, 9, 143, 158, 80, 143, 80, 80, 198, 175, 125, 188, 80, 145,
+    53, 143, 143, 143, 188, 9, 143, 143, 198, 115, 149, 175, 205, 198, 9, 116, 84, 93, 116, 169, 80, 191, 29, 124,
+    124, 206, 80, 198, 36, 6, 29, 52, 84, 143, 19, 143, 80, 205, 124, 124, 125, 124, 124, 36, 124, 143, 33, 124,
+    80, 116, 175, 29, 59, 53, 36, 191, 169, 115, 80, 53, 22, 141, 22, 155, 143, 190, 38, 86, 124, 36, 143, 7,
+    124, 105, 131, 124, 131, 86, 22, 21, 80, 22, 125, 143, 30, 64, 74, 143, 136, 80, 22, 143, 80, 143, 84, 67,
+    143, 143, 9, 37, 135, 88, 127, 131, 143, 131, 64, 143, 9, 124, 134, 6, 131, 84, 29, 84, 131, 84, 9, 143,
+    30, 80, 131, 131, 80, 131, 84, 84, 36, 29, 143, 143, 84, 143, 135, 143, 143, 28, 124, 124, 124, 9, 124, 143,
+    143, 143, 101, 36, 84, 64, 124, 191, 206, 31, 36, 126, 131, 155, 188, 188, 131, 188, 29, 29, 175, 31, 190, 6,
+    131, 45, 29, 36, 166, 29, 80, 30, 169, 135, 80, 33, 80, 131, 128, 155, 24, 184, 143, 128, 128, 128, 197, 124,
+    80, 143, 0, 135, 143, 33, 191, 80, 131, 158, 64, 36, 127, 29, 29, 29, 30, 36, 30, 204, 131, 36, 9, 126,
+    56, 36, 188, 188, 158, 131, 101, 124, 36, 131, 131, 36, 31, 9, 33, 124, 151, 124, 9, 124, 124, 124, 124, 124,
+    143, 124, 124, 25, 124, 36, 124, 124, 124, 124, 124, 80, 143, 9, 175, 143, 9, 188, 143, 80, 80, 188, 131, 155,
+    93, 80, 143, 84, 137, 155, 143, 29, 29, 143, 131, 84, 188, 84, 9, 36, 169, 84, 84, 84, 131, 80, 168, 9,
+    31, 36, 84, 205, 84, 36, 84, 158, 84, 143, 84, 84, 80, 198, 143, 6, 64, 64, 56, 80, 188, 33, 123, 29,
+    131, 131, 133, 36, 80, 93, 158, 2, 29, 80, 145, 29, 116, 64, 124, 9, 84, 9, 158, 84, 198, 175, 59, 84,
+    84, 36, 84, 131, 30, 198, 36, 135, 25, 84, 9, 206, 36, 198, 56, 191, 9, 143, 143, 176, 134, 9, 29, 175,
+    198, 6, 143, 84, 36, 80, 53, 143, 84, 143, 175, 84, 188, 9, 191, 64, 9, 15, 9, 36, 134, 38, 143, 177,
+    84, 143, 155, 143, 84, 38, 191, 161, 143, 29, 37, 141, 143, 0, 188, 175, 24, 116, 84, 124, 143, 84, 80, 84,
+    158, 80, 19, 19, 6, 80, 143, 67, 116, 131, 116, 204, 59, 51, 84, 89, 198, 84, 9, 9, 125, 60, 88, 37,
+    9, 143, 84, 204, 131, 37, 205, 37, 188, 36, 28, 84, 143, 204, 191, 143, 84, 124, 37, 198, 6, 80, 191, 125,
+    126, 9, 15, 9, 188, 19, 29, 124, 64, 158, 116, 197, 86, 128, 22, 143, 29, 37, 9, 131, 69, 190, 28, 183,
+    116, 197, 131, 143, 143, 169, 197, 29, 15, 56, 143, 9, 124, 191, 198, 143, 36, 33, 135, 36, 9, 198, 169, 9,
+    143, 188, 135, 180, 29, 80, 80, 188, 80, 9, 59, 37, 143, 80, 123, 64, 29, 93, 6, 93, 29, 9, 160, 29,
+    6, 177, 188, 190, 190, 190, 86, 123, 9, 9, 126, 9, 177, 9, 188, 36, 59, 29, 64, 30, 84, 131, 31, 175,
+    115, 155, 155, 173, 62, 191, 144, 36, 91, 144, 116, 58, 131, 58, 141, 60, 124, 131, 145, 133, 131, 133, 131, 131,
+    131, 131, 131, 131, 184, 79, 80, 169, 143, 28, 28, 28, 28, 158, 28, 28, 131, 29, 131, 131, 9, 93, 143, 98,
+    98, 131, 131, 36, 143, 131, 95, 135, 188, 24, 9, 131, 155, 198, 106, 6, 53, 191, 198, 141, 141, 29, 155, 29,
+    143, 84, 84, 93, 141, 143, 116, 7, 28, 143, 80, 143, 143, 143, 28, 84, 143, 143, 143, 198, 80, 191, 84, 204,
+    131, 80, 143, 143, 124, 22, 84, 158, 93, 141, 131, 125, 143, 131, 125, 84, 145, 155, 22, 131, 80, 62, 191, 88,
+    80, 131, 52, 36, 143, 45, 184, 37, 80, 124, 22, 117, 124, 124, 124, 124, 160, 124, 124, 22, 28, 124, 84, 124,
+    105, 143, 37, 143, 161, 143, 60, 53, 22, 143, 36, 84, 22, 197, 22, 29, 22, 144, 22, 131, 22, 86, 144, 191,
+    42, 178, 191, 80, 150, 22, 191, 22, 76, 22, 38, 74, 124, 124, 195, 195, 36, 131, 124, 131, 73, 67, 188, 124,
+    2, 84, 143, 124, 95, 37, 58, 116, 84, 84, 84, 84, 84, 84, 131, 131, 21, 131, 143, 191, 80, 80, 28, 116,
+    80, 191, 143, 80, 84, 124, 143, 80, 29, 86, 143, 191, 195, 143, 80, 125, 56, 36, 45, 169, 145, 84, 143, 198,
+    81, 88, 131, 80, 84, 197, 197, 84, 145, 126, 102, 101, 145, 177, 177, 2, 135, 84, 124, 141, 59, 195, 56, 141,
+    130, 38, 19, 191, 143, 38, 131, 22, 158, 9, 9, 158, 188, 143, 131, 128, 9, 84, 93, 143, 13, 9, 93, 34,
+    84, 80, 146, 143, 198, 144, 60, 80, 7, 80, 145, 116, 38, 124, 33, 124, 22, 144, 144, 125, 198, 29, 9, 128,
+    80, 84, 37, 37, 182, 36, 36, 80, 124, 143, 88, 142, 191, 84, 80, 124, 125, 80, 6, 125, 131, 34, 80, 9,
+    21, 15, 125, 143, 141, 80, 15, 143, 80, 70, 9, 9, 36, 30, 71, 124, 29, 22, 71, 124, 22, 191, 56, 191,
+    128, 124, 124, 191, 73, 124, 188, 143, 124, 80, 171, 80, 143, 143, 29, 143, 124, 143, 131, 28, 145, 2, 86, 170,
+    144, 146, 144, 128, 116, 143, 58, 141, 22, 177, 80, 143, 84, 2, 80, 80, 2, 2, 21, 80, 143, 143, 145, 84,
+    198, 22, 151, 22, 9, 80, 22, 143, 198, 80, 80, 198, 124, 84, 80, 80, 7, 80, 15, 38, 80, 135, 197, 143,
+    21, 22, 80, 59, 56, 143, 191, 143, 131, 143, 144, 187, 116, 84, 177, 124, 33, 131, 22, 187, 116, 116, 131, 187,
+    116, 141, 191, 141, 71, 48, 141, 48, 191, 141, 21, 71, 191, 141, 52, 141, 7, 71, 48, 141, 141, 141, 141, 141,
+    141, 48, 48, 141, 141, 141, 141, 141, 141, 141, 48, 141, 141, 141, 79, 141, 191, 141, 141, 141, 48, 141, 141, 141,
+    86, 48, 141, 141, 141, 0, 191, 135, 135, 80, 197, 135, 93, 84, 143, 84, 143, 22, 80, 143, 35, 34, 135, 116,
+    131, 142, 80, 116, 144, 144, 9, 152, 86, 143, 80, 125, 188, 84, 80, 93, 141, 197, 131, 80, 21, 198, 88, 141,
+    197, 80, 116, 143, 84, 110, 116, 188, 131, 80, 9, 80, 80, 135, 135, 95, 22, 34, 116, 15, 13, 9, 32, 132,
+    9, 164, 46, 60, 54, 134, 80, 5, 143, 146, 80, 154, 32, 143, 52, 86, 161, 60, 197, 84, 18, 29, 126, 84,
+    80, 9, 188, 153, 80, 197, 131, 143, 188, 197, 144, 153, 143, 9, 80, 175, 80, 198, 143, 158, 138, 143, 9, 154,
+    131, 116, 80, 55, 84, 155, 190, 190, 189, 188, 158, 188, 131, 77, 153, 70, 155, 125, 131, 131, 156, 143, 188, 188,
+    190, 143, 84, 9, 9, 92, 84, 175, 140, 191, 188, 22, 64, 155, 80, 59, 148, 80, 93, 21, 80, 84, 80, 166,
+    80, 198, 131, 84, 175, 158, 143, 15, 143, 80, 143, 143, 175, 188, 144, 188, 145, 125, 188, 143, 80, 127, 80, 84,
+    88, 59, 80, 205, 30, 88, 197, 37, 140, 80, 84, 104, 84, 145, 88, 60, 135, 28, 101, 84, 131, 131, 88, 145,
+    80, 85, 88, 131, 85, 2, 86, 31, 143, 88, 125, 80, 13, 182, 80, 125, 134, 125, 33, 28, 197, 191, 33, 188,
+    126, 124, 143, 28, 155, 15, 143, 15, 15, 191, 115, 80, 80, 33, 143, 48, 116, 144, 37, 64, 30, 81, 144, 93,
+    144, 80, 178, 36, 84, 93, 84, 86, 106, 24, 80, 53, 2, 143, 131, 22, 29, 145, 53, 25, 191, 110, 160, 169,
+    86, 116, 131, 141, 205, 29, 28, 191, 175, 139, 160, 47, 115, 104, 155, 125, 53, 205, 15, 64, 128, 84, 143, 22,
+    64, 143, 84, 143, 131, 191, 143, 143, 143, 143, 86, 50, 38, 80, 155, 161, 175, 84, 144, 84, 143, 155, 161, 191,
+    164, 191, 177, 143, 191, 198, 22, 112, 80, 80, 135, 143, 144, 80, 125, 15, 145, 143, 29, 198, 80, 74, 80, 158,
+    80, 163, 38, 15, 80, 191, 146, 22, 143, 144, 191, 80, 37, 80, 143, 29, 80, 80, 200, 161, 143, 143, 143, 143,
+    37, 161, 144, 144, 54, 82, 143, 80, 54, 84, 95, 80, 29, 86, 143, 206, 143, 125, 166, 29, 141, 30, 115, 144,
+    190, 38, 191, 143, 59, 143, 198, 80, 125, 64, 143, 143, 143, 167, 177, 80, 29, 29, 29, 192, 135, 175, 143, 29,
+    29, 143, 175, 15, 177, 150, 143, 36, 19, 188, 80, 195, 143, 143, 125, 80, 143, 143, 143, 151, 191, 115, 141, 80,
+    143, 84, 84, 4, 131, 131, 30, 86, 101, 202, 28, 154, 143, 84, 80, 143, 144, 37, 38, 125, 80, 168, 168, 88,
+    21, 166, 28, 80, 22, 144, 80, 84, 143, 86, 204, 144, 188, 143, 144, 187, 143, 1, 143, 64, 125, 93, 143, 80,
+    101, 143, 143, 198, 143, 51, 143, 204, 205, 144, 80, 143, 197, 81, 197, 15, 143, 133, 143, 158, 28, 124, 45, 28,
+    2, 197, 53, 56, 155, 80, 143, 29, 144, 143, 143, 143, 188, 188, 143, 53, 131, 67, 132, 84, 188, 22, 135, 161,
+    62, 143, 194, 80, 88, 158, 188, 203, 29, 45, 37, 59, 123, 143, 22, 143, 36, 80, 80, 80, 80, 84, 198, 22,
+    175, 93, 59, 80, 187, 131, 45, 19, 80, 144, 184, 59, 131, 13, 15, 86, 95, 85, 175, 135, 59, 125, 80, 125,
+    29, 146, 80, 80, 36, 80, 187, 84, 191, 155, 124, 80, 22, 22, 160, 135, 131, 131, 131, 187, 29, 115, 124, 197,
+    191, 38, 143, 175, 187, 160, 22, 143, 143, 158, 143, 143, 9, 160, 143, 144, 144, 29, 38, 143, 80, 143, 29, 124,
+    143, 144, 143, 80, 19, 22, 191, 188, 64, 28, 124, 80, 174, 143, 59, 80, 135, 116, 116, 80, 9, 124, 124, 84,
+    84, 84, 129, 84, 38, 37, 115, 135, 135, 80, 80, 131, 131, 74, 80, 131, 131, 197, 80, 180, 131, 112, 144, 84,
+    125, 48, 93, 33, 124, 59, 7, 143, 29, 165, 38, 190, 124, 160, 22, 80, 180, 190, 80, 191, 169, 160, 129, 19,
+    191, 80, 140, 80, 178, 93, 125, 143, 131, 135, 24, 185, 143, 84, 144, 143, 198, 125, 198, 144, 143, 22, 33, 28,
+    169, 9, 177, 9, 135, 135, 124, 101, 93, 135, 177, 28, 135, 135, 135, 28, 169, 47, 131, 129, 53, 160, 143, 51,
+    125, 29, 135, 36, 191, 143, 155, 143, 80, 15, 144, 38, 144, 131, 9, 191, 144, 105, 80, 37, 9, 116, 33, 47,
+    9, 37, 9, 9, 181, 22, 84, 180, 126, 22, 112, 179, 158, 131, 10, 86, 135, 124, 143, 158, 80, 197, 144, 124,
+    80, 124, 80, 143, 80, 191, 190, 80, 29, 198, 80, 124, 116, 158, 198, 80, 80, 80, 143, 10, 175, 198, 175, 143,
+    22, 151, 80, 129, 198, 80, 80, 197, 80, 125, 143, 82, 198, 80, 29, 125, 143, 195, 204, 21, 38, 38, 38, 175,
+    143, 80, 198, 198, 80, 198, 21, 198, 147, 166, 143, 80, 13, 80, 158, 188, 183, 7, 124, 67, 143, 123, 126, 205,
+    124, 0, 191, 80, 124, 124, 169, 29, 124, 197, 86, 191, 150, 80, 36, 143, 124, 13, 80, 80, 143, 151, 22, 124,
+    64, 22, 124, 22, 124, 95, 118, 124, 22, 143, 22, 198, 143, 191, 143, 143, 124, 158, 191, 184, 2, 143, 124, 80,
+    185, 82, 143, 168, 175, 60, 2, 21, 84, 84, 124, 141, 124, 80, 184, 187, 145, 125, 84, 22, 204, 31, 53, 126,
+    70, 144, 36, 28, 24, 197, 15, 198, 115, 187, 59, 131, 143, 124, 155, 131, 71, 143, 143, 36, 101, 80, 190, 38,
+    205, 28, 80, 101, 80, 131, 177, 10, 143, 143, 125, 80, 135, 143, 191, 143, 22, 38, 38, 175, 143, 36, 80, 131,
+    123, 191, 22, 175, 28, 191, 93, 22, 93, 15, 158, 131, 80, 131, 198, 186, 80, 116, 80, 93, 84, 36, 80, 187,
+    191, 144, 133, 80, 191, 80, 197, 126, 84, 36, 25, 143, 129, 124, 22, 80, 143, 126, 80, 125, 80, 37, 22, 131,
+    80, 80, 84, 80, 80, 80, 22, 125, 112, 142, 143, 131, 197, 31, 197, 197, 80, 9, 197, 197, 197, 25, 155, 31,
+    131, 197, 124, 71, 0, 110, 80, 124, 143, 22, 143, 131, 175, 144, 143, 143, 184, 131, 155, 84, 155, 80, 36, 155,
+    160, 80, 143, 37, 173, 9, 158, 155, 177, 131, 80, 143, 36, 131, 189, 80, 143, 30, 84, 116, 131, 131, 131, 169,
+    131, 9, 131, 131, 155, 7, 80, 56, 9, 80, 143, 80, 132, 131, 191, 6, 9, 9, 125, 131, 116, 22, 9, 9,
+    80, 143, 131, 9, 143, 22, 191, 9, 84, 143, 84, 80, 187, 143, 198, 145, 141, 22, 9, 21, 9, 143, 131, 143,
+    177, 143, 80, 143, 22, 198, 143, 22, 143, 143, 143, 80, 22, 143, 145, 13, 36, 71, 131, 143, 131, 191, 131, 158,
+    131, 143, 62, 198, 128, 143, 143, 9, 131, 192, 2, 84, 30, 86, 64, 84, 105, 127, 143, 143, 143, 198, 84, 124,
+    84, 29, 84, 135, 80, 144, 204, 88, 131, 191, 155, 131, 145, 197, 172, 188, 31, 15, 7, 188, 131, 143, 84, 9,
+    175, 80, 80, 22, 131, 80, 84, 80, 9, 131, 198, 14, 9, 9, 124, 84, 80, 45, 143, 86, 9, 124, 126, 9,
+    124, 124, 124, 126, 80, 9, 126, 124, 124, 124, 158, 198, 198, 0, 131, 155, 198, 49, 158, 198, 80, 59, 188, 36,
+    37, 14, 191, 143, 191, 80, 32, 22, 143, 80, 80, 143, 53, 191, 33, 74, 9, 144, 191, 143, 22, 131, 22, 143,
+    168, 143, 195, 80, 80, 15, 188, 188, 188, 2, 145, 37, 9, 84, 84, 9, 9, 80, 22, 176, 59, 143, 9, 9,
+    28, 9, 9, 33, 143, 9, 36, 143, 19, 80, 45, 143, 36, 80, 116, 80, 80, 9, 143, 9, 143, 80, 9, 9,
+    80, 143, 80, 80, 15, 191, 9, 9, 9, 9, 143, 9, 9, 9, 9, 191, 22, 143, 143, 191, 131, 131, 188, 80,
+    9, 9, 9, 143, 53, 9, 180, 80, 60, 80, 198, 199, 9, 7, 80, 64, 131, 9, 143, 22, 135, 180, 9, 80,
+    128, 143, 80, 9, 126, 143, 143, 143, 9, 145, 80, 97, 80, 9, 9, 80, 143, 143, 191, 9, 166, 9, 33, 143,
+    80, 56, 66, 143, 80, 36, 131, 29, 80, 80, 143, 80, 195, 9, 9, 9, 9, 9, 9, 9, 9, 80, 9, 143,
+    80, 143, 9, 80, 9, 80, 84, 198, 143, 143, 64, 22, 2, 188, 143, 9, 53, 143, 84, 80, 9, 9, 176, 80,
+    59, 188, 9, 143, 37, 143, 9, 80, 19, 9, 198, 9, 36, 9, 9, 9, 146, 191, 22, 55, 52, 131, 10, 22,
+    22, 195, 155, 204, 53, 197, 143, 155, 22, 80, 22, 191, 80, 9, 9, 9, 9, 143, 9, 58, 125, 9, 80, 22,
+    9, 191, 192, 184, 9, 9, 6, 155, 80, 36, 204, 80, 22, 143, 22, 143, 33, 9, 9, 9, 9, 9, 9, 204,
+    145, 95, 197, 204, 71, 22, 84, 22, 9, 9, 145, 19, 86, 80, 80, 24, 115, 86, 80, 80, 86, 80, 22, 80,
+    64, 31, 25, 80, 143, 125, 24, 143, 184, 184, 86, 167, 36, 126, 36, 62, 36, 9, 36, 80, 37, 22, 9, 9,
+    160, 80, 9, 112, 112, 80, 9, 80, 157, 187, 9, 188, 9, 9, 144, 126, 84, 191, 9, 9, 50, 131, 80, 190,
+    143, 22, 160, 64, 22, 143, 22, 143, 9, 9, 9, 9, 184, 9, 60, 9, 22, 9, 155, 22, 124, 191, 86, 9,
+    9, 9, 9, 9, 22, 15, 9, 22, 9, 22, 155, 155, 88, 9, 143, 202, 144, 80, 131, 143, 64, 131, 143, 126,
+    135, 195, 187, 124, 124, 160, 124, 80, 9, 124, 124, 124, 124, 124, 124, 86, 124, 124, 124, 9, 22, 124, 84, 9,
+    84, 9, 88, 9, 175, 9, 127, 88, 2, 52, 88, 88, 22, 9, 19, 9, 9, 19, 155, 80, 9, 9, 64, 80,
+    9, 22, 80, 9, 9, 9, 9, 22, 9, 9, 37, 124, 141, 22, 80, 141, 195, 29, 35, 178, 178, 30, 191, 67,
+    36, 132, 126, 56, 124, 195, 36, 36, 195, 36, 22, 6, 131, 131, 131, 36, 37, 135, 135, 131, 131, 143, 22, 143,
+    143, 143, 37, 38, 187, 9, 143, 145, 143, 84, 45, 143, 36, 70, 29, 131, 131, 80, 84, 143, 25, 9, 9, 143,
+    143, 37, 143, 9, 143, 82, 189, 9, 37, 45, 9, 9, 9, 84, 80, 143, 37, 144, 155, 117, 80, 143, 143, 36,
+    143, 30, 143, 143, 143, 143, 80, 143, 9, 143, 128, 143, 141, 29, 126, 143, 167, 80, 143, 143, 37, 9, 29, 155,
+    143, 131, 29, 38, 131, 143, 144, 92, 191, 81, 29, 143, 131, 177, 143, 143, 33, 155, 22, 9, 22, 80, 143, 9,
+    37, 37, 37, 155, 143, 37, 143, 9, 124, 9, 191, 82, 75, 191, 155, 38, 143, 30, 191, 131, 38, 21, 191, 143,
+    143, 155, 21, 80, 195, 143, 9, 22, 37, 9, 37, 9, 9, 9, 9, 9, 9, 9, 9, 143, 37, 124, 124, 124,
+    124, 124, 124, 160, 131, 188, 188, 124, 124, 124, 124, 124, 124, 124, 84, 124, 124, 124, 53, 131, 0, 125, 125, 80,
+    131, 125, 124, 37, 97, 133, 143, 37, 131, 119, 188, 37, 110, 37, 37, 143, 37, 37, 131, 37, 36, 37, 143, 143,
+    67, 175, 188, 188, 131, 80, 116, 155, 22, 37, 9, 155, 29, 37, 125, 37, 37, 131, 9, 29, 9, 9, 9, 29,
+    9, 143, 125, 9, 9, 9, 9, 59, 160, 29, 29, 9, 29, 9, 9, 9, 29, 31, 9, 29, 175, 29, 197, 9,
+    131, 124, 124, 84, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 124,
+    124, 124, 124, 124, 124, 124, 124, 124, 124, 124, 37, 84, 175, 48, 58, 80, 143, 124, 143, 124, 124, 124, 124, 124,
+    124, 124, 124, 124, 124, 124, 124, 204, 143, 139, 191, 36, 53, 37, 37, 37, 116, 184, 37,
+];
+
+/// The scripts `LIKELY_LANG_SCRIPTS_AT` indexes: four bytes each.
+pub(crate) static LIKELY_SCRIPT_NAMES: &str = "\
+    AghbAhomArabArmiArmnAvstBaliBamuBassBatkBengBopoBrahCakmCansCariChamCher\
+    ChrsCoptCprtCyrlDevaEgypElymEthiGeorGongGonmGothGranGrekGujrGuruHangHani\
+    HansHantHebrHluwHmnpItalJavaJpanKaliKanaKharKhmrKitsKndaKoreLanaLaooLatf\
+    LatgLatnLepcLinaLinbLisuLyciLydiMandManiMarcMedfMercMlymModiMongMrooMtei\
+    MymrNarbNewaNkooNshuOgamOlckOrkhOryaOsgeOugrPaucPhliPhnxPlrdPrtiRjngRohg\
+    RunrSamrSarbSaurSgnwSinhSogdSoraSoyoSunuSyrcTagbTakrTaleTaluTamlTangTavt\
+    TeluTfngThaaThaiTibtTnsaTotoUgarVaiiWchoXpeoXsuxYiii\
+    ";
+
+/// The regions `LIKELY_LANG_REGIONS_AT` indexes: three bytes each, space-padded.
+pub(crate) static LIKELY_REGION_NAMES: &str = "\
+    001AE AF AG AL AM AO AR AT AU AZ BA BB BD BE BF BG BH BI BJ BN BO BR BS \
+    BT BW BY BZ CA CD CF CG CH CI CK CL CM CN CO CR CU CV CW CY CZ DE DK DZ \
+    EC EE EG ER ES ET FI FJ FM FO FR GA GB GD GE GF GH GL GM GN GP GQ GR GT \
+    GU GW GY HK HN HR HT HU ID IE IL IM IN IQ IR IS IT JE JM JO JP KE KG KH \
+    KI KM KR KW KZ LA LB LC LK LR LT LU LV LY MA MD MG MH MK ML MM MN MP MR \
+    MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG \
+    PH PK PL PR PS PT PW PY RE RO RS RU RW SA SB SC SD SE SG SI SK SL SN SO \
+    SR SS ST SV SX SY TC TD TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG US \
+    UZ VA VC VE VI VN VU WF WS XK YE YT ZA ZM ZW \
     ";
 
 /// `<likelySubtag from="L_S" to="L_S_R"/>` as `L S R`.

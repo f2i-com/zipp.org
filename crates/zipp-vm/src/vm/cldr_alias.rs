@@ -208,8 +208,37 @@ fn bcp47_alias() -> &'static HashMap<(&'static str, &'static str), &'static str>
     CELL.get_or_init(|| triples(data::BCP47_TYPE_ALIAS))
 }
 
+/// A language's likely script and region, from the packed table: a binary
+/// search over three-byte keys, where there was a 7,195-entry hash map built
+/// from 86 KB of text at the first `Intl.Locale` maximize or minimize.
+fn likely_lang(lang: &str) -> Option<(&'static str, &'static str)> {
+    let lang = lang.as_bytes();
+    if lang.is_empty() || lang.len() > 3 || lang.contains(&b' ') {
+        return None;
+    }
+    let mut key = [b' '; 3];
+    key[..lang.len()].copy_from_slice(lang);
+    let keys = data::LIKELY_LANG_KEYS.as_bytes();
+    let (mut lo, mut hi) = (0usize, keys.len() / 3);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match keys[3 * mid..3 * mid + 3].cmp(&key[..]) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => {
+                let script = 4 * data::LIKELY_LANG_SCRIPTS_AT[mid] as usize;
+                let region = 3 * data::LIKELY_LANG_REGIONS_AT[mid] as usize;
+                return Some((
+                    &data::LIKELY_SCRIPT_NAMES[script..script + 4],
+                    data::LIKELY_REGION_NAMES[region..region + 3].trim_end(),
+                ));
+            }
+        }
+    }
+    None
+}
+
 struct Likely {
-    lang: HashMap<&'static str, (&'static str, &'static str)>,
     lang_script: HashMap<(&'static str, &'static str), &'static str>,
     lang_region: HashMap<(&'static str, &'static str), &'static str>,
     und_script: HashMap<&'static str, (&'static str, &'static str)>,
@@ -220,7 +249,6 @@ struct Likely {
 fn likely() -> &'static Likely {
     static CELL: OnceLock<Likely> = OnceLock::new();
     CELL.get_or_init(|| Likely {
-        lang: likely1(data::LIKELY_LANG),
         lang_script: likely2(data::LIKELY_LANG_SCRIPT),
         lang_region: likely2(data::LIKELY_LANG_REGION),
         und_script: likely1(data::LIKELY_UND_SCRIPT),
@@ -483,8 +511,7 @@ pub(crate) fn add_likely_subtags(t: &LangTag) -> Option<LangTag> {
         .or_else(|| {
             (!und)
                 .then(|| {
-                    l.lang
-                        .get(lang)
+                    likely_lang(lang)
                         .map(|(s, r)| (lang.to_string(), s.to_string(), r.to_string()))
                 })
                 .flatten()
@@ -649,6 +676,40 @@ mod tests {
         }
         for k in ["ka", "kf", "kr", "ks", "kv"] {
             assert_eq!(canon(&format!("und-u-{k}-yes")), format!("und-u-{k}-yes"));
+        }
+    }
+
+    #[test]
+    fn the_packed_language_table_is_sorted_and_answers_its_rows() {
+        let keys = data::LIKELY_LANG_KEYS.as_bytes();
+        let n = keys.len() / 3;
+        assert_eq!(keys.len(), 3 * n);
+        assert_eq!(data::LIKELY_LANG_SCRIPTS_AT.len(), n);
+        assert_eq!(data::LIKELY_LANG_REGIONS_AT.len(), n);
+        assert_eq!(data::LIKELY_SCRIPT_NAMES.len() % 4, 0);
+        assert_eq!(data::LIKELY_REGION_NAMES.len() % 3, 0);
+        assert!(n > 7_000, "{n} languages");
+        for i in 0..n {
+            let key = &keys[3 * i..3 * i + 3];
+            if i > 0 {
+                assert!(&keys[3 * i - 3..3 * i] < key, "keys not strictly ascending at {i}");
+            }
+            assert!((data::LIKELY_LANG_SCRIPTS_AT[i] as usize) < data::LIKELY_SCRIPT_NAMES.len() / 4);
+            assert!((data::LIKELY_LANG_REGIONS_AT[i] as usize) < data::LIKELY_REGION_NAMES.len() / 3);
+            // Every stored language is found, and as a well-formed pair.
+            let lang = std::str::from_utf8(key).unwrap().trim_end();
+            let (script, region) = likely_lang(lang).unwrap_or_else(|| panic!("{lang} not found"));
+            assert_eq!(script.len(), 4, "{lang}");
+            assert!((2..=3).contains(&region.len()) && !region.contains(' '), "{lang} {region:?}");
+        }
+        assert_eq!(likely_lang("en"), Some(("Latn", "US")));
+        assert_eq!(likely_lang("zh"), Some(("Hans", "CN")));
+        assert_eq!(likely_lang("sr"), Some(("Cyrl", "RS")));
+        assert_eq!(likely_lang("aa"), Some(("Latn", "ET")));
+        assert_eq!(likely_lang("yue"), Some(("Hant", "HK")));
+        assert_eq!(likely_lang("zzj"), Some(("Hani", "CN")));
+        for absent in ["", "a", "xx", "zzzz", "en ", " en", "EN", "e n"] {
+            assert_eq!(likely_lang(absent), None, "{absent:?}");
         }
     }
 

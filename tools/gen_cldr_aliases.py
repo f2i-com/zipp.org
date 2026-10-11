@@ -144,6 +144,61 @@ def blob(name, doc, rows):
     return "\n".join(out)
 
 
+def packed_likely_lang(rows):
+    """The `L -> (S, R)` table as five statics instead of one text blob.
+
+    `rows` are `(language, script, region)`. A row of the text form spends
+    twelve bytes on about five of information: the script is one of some 120
+    names (six rows in seven are `Latn`) and the region one of some 200. Here a
+    key is three space-padded bytes, sorted bytewise for a binary search, and
+    the script and region are a byte each into two name lists: 37 KB where the
+    text was 86 KB, and no table to build at first use.
+    """
+    rows = sorted(rows, key=lambda r: r[0].ljust(3).encode())
+    scripts = sorted({r[1] for r in rows})
+    regions = sorted({r[2] for r in rows})
+    assert all(1 <= len(r[0]) <= 3 and r[0].isascii() and ' ' not in r[0] for r in rows)
+    assert len({r[0] for r in rows}) == len(rows), "a language appears twice"
+    assert all(len(s) == 4 and s.isascii() for s in scripts) and len(scripts) <= 256
+    assert all(2 <= len(r) <= 3 and r.isascii() for r in regions) and len(regions) <= 256
+
+    def text(name, doc, cells, per_line):
+        out = ["%s\npub(crate) static %s: &str = \"\\" % (doc, name)]
+        for i in range(0, len(cells), per_line):
+            out.append("    %s\\" % "".join(cells[i:i + per_line]))
+        out.append('    ";')
+        return "\n".join(out)
+
+    def table(name, doc, values):
+        out = ["%s\npub(crate) static %s: &[u8] = &[" % (doc, name)]
+        for i in range(0, len(values), 24):
+            out.append("    %s," % ", ".join(str(v) for v in values[i:i + 24]))
+        out.append("];")
+        return "\n".join(out)
+
+    return "\n\n".join([
+        text("LIKELY_LANG_KEYS",
+             "/// `<likelySubtag from=\"L\" to=\"L_S_R\"/>`, packed. The languages: three\n"
+             "/// bytes each, space-padded, sorted bytewise. Entry `i`'s script and region\n"
+             "/// are `LIKELY_LANG_SCRIPTS_AT[i]` and `LIKELY_LANG_REGIONS_AT[i]`, indices\n"
+             "/// into the two name lists below. The target language always repeats the\n"
+             "/// source, so it is not stored. See `cldr_alias::likely_lang`.",
+             [r[0].ljust(3) for r in rows], 24),
+        table("LIKELY_LANG_SCRIPTS_AT",
+              "/// For each language of `LIKELY_LANG_KEYS`, its script in `LIKELY_SCRIPT_NAMES`.",
+              [scripts.index(r[1]) for r in rows]),
+        table("LIKELY_LANG_REGIONS_AT",
+              "/// For each language of `LIKELY_LANG_KEYS`, its region in `LIKELY_REGION_NAMES`.",
+              [regions.index(r[2]) for r in rows]),
+        text("LIKELY_SCRIPT_NAMES",
+             "/// The scripts `LIKELY_LANG_SCRIPTS_AT` indexes: four bytes each.",
+             scripts, 18),
+        text("LIKELY_REGION_NAMES",
+             "/// The regions `LIKELY_LANG_REGIONS_AT` indexes: three bytes each, space-padded.",
+             [r.ljust(3) for r in regions], 24),
+    ])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cldr_root")
@@ -271,11 +326,8 @@ def main():
         "pub(crate) static LIKELY_UND: (&str, &str, &str) = (\"%s\", \"%s\", \"%s\");"
         % ("_".join(ls), ls[0], ls[1], ls[2]))
     parts.append("")
-    parts.append(blob(
-        "LIKELY_LANG",
-        "/// `<likelySubtag from=\"L\" to=\"L_S_R\"/>` as `L S R`. The target\n"
-        "/// language always repeats the source, so it is not stored twice.",
-        ["%s %s %s" % (fp[0], tp[1], tp[2]) for fp, tp in by_shape["lang"]]))
+    parts.append(packed_likely_lang(
+        [(fp[0], tp[1], tp[2]) for fp, tp in by_shape["lang"]]))
     parts.append("")
     parts.append(blob(
         "LIKELY_LANG_SCRIPT",
