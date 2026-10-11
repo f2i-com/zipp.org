@@ -1706,14 +1706,16 @@
         g.set("ascii_letters", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"); g.set("digits", "0123456789");
         g.set("hexdigits", "0123456789abcdefABCDEF"); g.set("octdigits", "01234567"); g.set("punctuation", "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~");
         g.set("whitespace", " \t\n\r\x0b\x0c"); g.set("printable", "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ \t\n\r\x0b\x0c");
-        fn(g, "capwords", 1, (a) => needStr(a[0]).split(/\s+/).filter((x) => x).map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(" "));
+        // The words str.split() finds: between runs of Python's whitespace.
+        fn(g, "capwords", 1, (a) => needStr(a[0]).split(rt.WS_RUN).filter((x) => x).map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(" "));
     });
     mod("textwrap", (g) => {
         fn(g, "dedent", 1, (a) => { const lines = needStr(a[0]).split("\n"); let margin = null; for (const l of lines) { if (!l.trim()) continue; const m = /^[ \t]*/.exec(l)[0]; margin = margin === null ? m : m.startsWith(margin) ? margin : margin.startsWith(m) ? m : ""; } return lines.map((l) => l.trim() ? l.slice(margin.length) : l.trim()).join("\n"); });
         fn(g, "indent", 2, (a) => needStr(a[0]).split("\n").map((l) => l.trim() ? a[1] + l : l).join("\n"));
         fnkw(g, "wrap", (a) => { const kw = kwOf(a, ["width"]); const width = Number(a[1] !== undefined ? needInt(a[1]) : kwget(kw, "width", 70n)); const words = needStr(a[0]).split(/\s+/).filter((x) => x); const out = []; let cur = ""; for (const w of words) { if (cur.length + w.length + (cur ? 1 : 0) > width && cur) { out.push(cur); cur = w; } else cur = cur ? cur + " " + w : w; } if (cur) out.push(cur); return list(out); });
         fnkw(g, "fill", (a) => { const kw = kwOf(a, ["width"]); const width = Number(a[1] !== undefined ? needInt(a[1]) : kwget(kw, "width", 70n)); return call(rt.modules.get("textwrap").globals.get("wrap"), [a[0], BigInt(width)], null).items.join("\n"); });
-        fn(g, "shorten", 2, (a) => { const s = needStr(a[0]).split(/\s+/).join(" "); const w = Number(needInt(a[1])); return s.length <= w ? s : s.slice(0, Math.max(0, w - 6)).replace(/\s+\S*$/, "") + " [...]"; });
+        // CPython collapses the text first with `" ".join(text.strip().split())`.
+        fn(g, "shorten", 2, (a) => { const s = needStr(a[0]).split(rt.WS_RUN).filter((x) => x).join(" "); const w = Number(needInt(a[1])); return s.length <= w ? s : s.slice(0, Math.max(0, w - 6)).replace(/\s+\S*$/, "") + " [...]"; });
     });
     mod("copy", (g) => {
         // CPython's copy protocol: the builtin containers directly, then
@@ -2485,7 +2487,7 @@
         const INLINE = { a: 256n, i: 2n, L: 4n, m: 8n, s: 16n, u: 32n, x: 64n };
         // Python's str-pattern classes: \w is [\p{L}\p{N}_], \d is \p{Nd},
         // \s is str.isspace(); under ASCII they are the [A-Za-z0-9_] forms.
-        const WORD = "\\p{L}\\p{N}_", SPACE = " \\t\\n\\r\\x0b\\x0c\\x1c-\\x1f\\x85\\xa0\\u{1680}\\u{2000}-\\u{200a}\\u{2028}\\u{2029}\\u{202f}\\u{205f}\\u{3000}";
+        const WORD = "\\p{L}\\p{N}_", SPACE = rt.PY_WS;
         const ASCII_SPACE = " \\t\\n\\r\\x0b\\x0c";
         const SYNTAX = "^$\\.*+?()[]{}|/";
         // Python pattern syntax -> a JavaScript `u` pattern. `.`, `^`, `$`,

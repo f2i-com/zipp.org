@@ -215,8 +215,9 @@ impl<'p> Vm<'p> {
 // case-mapping methods ASCII.
 //
 // * 1 / 2 / 3 `strip` / `lstrip` / `rstrip(s, chars)`: the code points of
-//   `chars` cut from both / the left / the right end.
-// * 4 `split(s)`: the runs between JavaScript whitespace, ASCII `s` only;
+//   `chars` cut from both / the left / the right end; `strip` / `lstrip` /
+//   `rstrip(s)`: Python's whitespace cut from them ([`py_space`]).
+// * 4 `split(s)`: the runs between Python's whitespace, ASCII `s` only;
 //   `split(s, sep)`, `sep` not empty: the pieces between the occurrences of
 //   `sep`; a list made from the record's `ltmpl` (an empty list).
 // * 5 `replace(s, old, new)`, `old` not empty: every occurrence replaced.
@@ -229,6 +230,8 @@ impl<'p> Vm<'p> {
 // * 12 / 13 `heapq.heappush` / `heappop` (see below).
 // * 14 / 15 `bisect.bisect_left` / `bisect_right(a, x)`, 16 / 17
 //   `insort_left` / `insort_right(a, x)` (see below).
+// * 18 / 19 `startswith` / `endswith(s, affix)`, `affix` a str (a tuple of
+//   them, and the forms with bounds, are `j<n>`'s).
 //
 // Results longer than the runtime's text limit (`MAX_TEXT` UTF-16 units)
 // take the `j<n>` path, which raises as it always did.
@@ -259,9 +262,18 @@ fn js_str_hash(units: impl Iterator<Item = u16>) -> u64 {
     hi * 4_294_967_296 + lo
 }
 
-/// JavaScript's `\s` among the ASCII characters.
-fn js_space(b: u8) -> bool {
-    matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ')
+/// Python's whitespace among the ASCII characters: what `str.isspace` is
+/// true for, which `strip()` and `split()` without an argument go by. It has
+/// the four separators U+001C to U+001F, which JavaScript's `\s` and `trim`
+/// lack. Beyond ASCII it is Unicode's White_Space ([`py_white`]): U+0085 is
+/// in it and U+FEFF is not, the other way round from JavaScript's.
+fn py_space(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0x1c..=0x1f | b' ')
+}
+
+/// Python's whitespace (see [`py_space`]).
+fn py_white(c: char) -> bool {
+    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
 }
 
 impl<'p> Vm<'p> {
@@ -391,6 +403,53 @@ impl<'p> Vm<'p> {
         let (s_idx, ascii) = self.py_strm_flat(*args.first()?)?;
         let n = self.py_strm_bytes(s_idx).len() as u64;
         let out = match (op, args.len()) {
+            // Whitespace cut from the ends: an ASCII str's by its bytes, any
+            // other's by its code points.
+            (1..=3, 1) => {
+                let trimmed = {
+                    let s = self.py_strm_bytes(s_idx);
+                    let kept = if ascii {
+                        let (mut i, mut j) = (0, s.len());
+                        if op != 3 {
+                            while i < j && py_space(s[i]) {
+                                i += 1;
+                            }
+                        }
+                        if op != 2 {
+                            while j > i && py_space(s[j - 1]) {
+                                j -= 1;
+                            }
+                        }
+                        &s[i..j]
+                    } else {
+                        let text = std::str::from_utf8(s).ok()?;
+                        let r = match op {
+                            1 => text.trim_matches(py_white),
+                            2 => text.trim_start_matches(py_white),
+                            _ => text.trim_end_matches(py_white),
+                        };
+                        r.as_bytes()
+                    };
+                    (kept.len() != s.len()).then(|| kept.to_vec())
+                };
+                match trimmed {
+                    None => return Some(args[0]),
+                    Some(bytes) => self.py_strm_new(bytes),
+                }
+            }
+            // Both strs are well formed, so equal bytes at an end are equal
+            // code points there (an affix starts on a code point's first
+            // byte, and so does the text it matches).
+            (18, 2) | (19, 2) => {
+                let (affix_idx, _) = self.py_strm_flat(args[1])?;
+                let (found, compared) = {
+                    let s = self.py_strm_bytes(s_idx);
+                    let affix = self.py_strm_bytes(affix_idx);
+                    (if op == 18 { s.starts_with(affix) } else { s.ends_with(affix) }, affix.len().min(s.len()))
+                };
+                self.charge_steps(i64::try_from(compared).unwrap_or(i64::MAX));
+                return Some(Value::bool(found));
+            }
             (1..=3, 2) => {
                 let (chars_idx, _) = self.py_strm_flat(args[1])?;
                 let trimmed = {
@@ -415,7 +474,7 @@ impl<'p> Vm<'p> {
                 }
                 let parts: Vec<Vec<u8>> = self
                     .py_strm_bytes(s_idx)
-                    .split(|&b| js_space(b))
+                    .split(|&b| py_space(b))
                     .filter(|p| !p.is_empty())
                     .map(|p| p.to_vec())
                     .collect();

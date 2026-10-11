@@ -422,8 +422,21 @@
         for (const ch of s) { out += prevCased ? ch.toLowerCase() : titleChar(ch); prevCased = CASED_CHAR.test(ch); }
         return out;
     });
+    // Python's whitespace (`rt.PY_WS`): one character of it, a run of it, a
+    // str of nothing else, and the first and the last word with the run
+    // beside it.
+    const WS_CHAR = new RegExp("[" + rt.PY_WS + "]"), WS_RUN = rt.WS_RUN, WS_ONLY = new RegExp("^[" + rt.PY_WS + "]+$");
+    const WS_FIRST = new RegExp("^([^" + rt.PY_WS + "]+)[" + rt.PY_WS + "]+"), WS_LAST = new RegExp("[" + rt.PY_WS + "]+([^" + rt.PY_WS + "]+)$");
+    // `s` without the whitespace at its left end (mode < 0), its right end
+    // (mode > 0) or both (0); `s` itself when there is none.
+    function stripWs(s, mode) {
+        let i = 0, j = s.length;
+        if (mode <= 0) while (i < j && WS_CHAR.test(s[i])) i++;
+        if (mode >= 0) while (j > i && WS_CHAR.test(s[j - 1])) j--;
+        return i === 0 && j === s.length ? s : s.slice(i, j);
+    }
     function stripChars(s, chars, mode) {
-        if (chars === undefined || chars === null) { if (mode === 0) return s.trim(); return mode < 0 ? s.replace(/^\s+/, "") : s.replace(/\s+$/, ""); }
+        if (chars === undefined || chars === null) return stripWs(s, mode);
         const set = new Set(Array.from(needStr(chars)));
         let cps = Array.from(s), i = 0, j = cps.length;
         if (mode <= 0) while (i < j && set.has(cps[i])) i++;
@@ -439,12 +452,14 @@
         const s = strSelf(a); const sep = a[1] !== undefined ? a[1] : kwget(kw, "sep", null);
         let maxsplit = Number(needInt(a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", -1n)));
         if (sep === null) {
-            const parts = s.split(/\s+/).filter((x) => x.length);
-            if (maxsplit < 0 || parts.length <= maxsplit + 1) return list(parts);
-            // Re-split preserving the remainder verbatim.
-            const out = []; let rest = s.replace(/^\s+/, "");
-            for (let i = 0; i < maxsplit; i++) { const m = /^(\S+)\s+/.exec(rest); if (!m) break; out.push(m[1]); rest = rest.slice(m[0].length); }
-            if (rest.length) out.push(rest.replace(/\s+$/, ""));
+            const parts = s.split(WS_RUN).filter((x) => x.length);
+            if (maxsplit < 0 || parts.length <= maxsplit) return list(parts);
+            // More words than splits: the first `maxsplit` of them, then the
+            // rest of the text from its next word on, verbatim (CPython keeps
+            // the whitespace that ends it).
+            const out = []; let rest = stripWs(s, -1);
+            for (let i = 0; i < maxsplit; i++) { const m = WS_FIRST.exec(rest); if (!m) break; out.push(m[1]); rest = rest.slice(m[0].length); }
+            if (rest.length) out.push(rest);
             return list(out);
         }
         if (needStr(sep) === "") fail(E.ValueError, "empty separator");
@@ -457,11 +472,13 @@
         const s = strSelf(a); const sep = a[1] !== undefined ? a[1] : kwget(kw, "sep", null);
         const maxsplit = Number(needInt(a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", -1n)));
         if (sep === null) {
-            const parts = s.split(/\s+/).filter((x) => x.length);
-            if (maxsplit < 0 || parts.length <= maxsplit + 1) return list(parts);
-            const out = []; let rest = s.replace(/\s+$/, "");
-            for (let i = 0; i < maxsplit; i++) { const m = /\s+(\S+)$/.exec(rest); if (!m) break; out.unshift(m[1]); rest = rest.slice(0, rest.length - m[0].length); }
-            if (rest.length) out.unshift(rest.replace(/^\s+/, ""));
+            const parts = s.split(WS_RUN).filter((x) => x.length);
+            if (maxsplit < 0 || parts.length <= maxsplit) return list(parts);
+            // As `split`, from the right: the text before the last
+            // `maxsplit` words is kept with the whitespace that starts it.
+            const out = []; let rest = stripWs(s, 1);
+            for (let i = 0; i < maxsplit; i++) { const m = WS_LAST.exec(rest); if (!m) break; out.unshift(m[1]); rest = rest.slice(0, rest.length - m[0].length); }
+            if (rest.length) out.unshift(rest);
             return list(out);
         }
         const parts = s.split(needStr(sep));
@@ -532,7 +549,7 @@
         const direct = (name, n, fn) => { S.dict.get(name)["c" + n] = fn; };
         direct("lower", 1, function (s) { return typeof s === "string" ? s.toLowerCase() : this.code([s]); });
         direct("upper", 1, function (s) { return typeof s === "string" ? s.toUpperCase() : this.code([s]); });
-        direct("strip", 1, function (s) { return typeof s === "string" ? s.trim() : this.code([s]); });
+        direct("strip", 1, function (s) { return typeof s === "string" ? stripWs(s, 0) : this.code([s]); });
         // With a str of characters (and no surrogate in either str, so each
         // code unit is a code point): the ends cut while they are in it.
         const stripIn = (s, chars, mode) => {
@@ -561,9 +578,9 @@
         });
         direct("split", 1, function (s) {
             if (typeof s !== "string") return this.code([s]);
-            // `split(/\s+/)` without its empty ends (a loop: `filter` would
-            // run its callback on a nested interpreter).
-            const raw = s.split(/\s+/), parts = [];
+            // The split at whitespace runs without its empty ends (a loop:
+            // `filter` would run its callback on a nested interpreter).
+            const raw = s.split(WS_RUN), parts = [];
             for (let i = 0; i < raw.length; i++) if (raw[i].length) parts.push(raw[i]);
             return list(parts);
         });
@@ -600,8 +617,10 @@
             const native = (name, n, op) => install(S.dict.get(name), n, op);
             rt.nativeEntry = install;
             native("strip", 2, 1); native("lstrip", 2, 2); native("rstrip", 2, 3);
+            native("strip", 1, 1); native("lstrip", 1, 2); native("rstrip", 1, 3);
             native("split", 1, 4); native("split", 2, 4); native("replace", 3, 5); native("find", 2, 6);
             native("join", 2, 7); native("lower", 1, 8); native("upper", 1, 9);
+            native("startswith", 2, 18); native("endswith", 2, 19);
         }
     }
     // CPython's digit classes follow Numeric_Type: isdecimal is Decimal (Nd),
@@ -613,7 +632,7 @@
     method(S, "isnumeric", 1, (a) => /^[\p{Nd}\p{Nl}\p{No}㐅㒃㠪㭍一七万三九二五亖亿-什仟仨伍佰億兆兩八六十千-卅卌叁-叄四壱壹幺廾-廿弌-弎弐拾捌柒漆玖百肆萬貮貳贰阡陆陌陸零參拾兩零六陸什\u{20001}\u{20064}\u{200e2}\u{20121}\u{2092a}\u{20983}\u{2098c}\u{2099c}\u{20aea}\u{20afd}\u{20b19}\u{22390}\u{22998}\u{23b1b}\u{2626d}\u{2f890}]+$/u.test(strSelf(a)));
     method(S, "isalpha", 1, (a) => /^[\p{L}]+$/u.test(strSelf(a)));
     method(S, "isalnum", 1, (a) => /^[\p{L}\p{N}]+$/u.test(strSelf(a)));
-    method(S, "isspace", 1, (a) => /^\s+$/.test(strSelf(a)));
+    method(S, "isspace", 1, (a) => WS_ONLY.test(strSelf(a)));
     // Cased characters are those with the Lowercase or Uppercase property or
     // the titlecase category, as in CPython's unicode ctype table.
     method(S, "isupper", 1, (a) => { const s = strSelf(a); return /\p{Uppercase}/u.test(s) && !/[\p{Lowercase}\p{Lt}]/u.test(s); });

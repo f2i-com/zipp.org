@@ -1,0 +1,162 @@
+== every whitespace character, one at a time
+'\t' True 'x' 'x\t' '\tx' ['x'] ['a', 'b'] 'x' '' []
+'\n' True 'x' 'x\n' '\nx' ['x'] ['a', 'b'] 'x' '' []
+'\x0b' True 'x' 'x\x0b' '\x0bx' ['x'] ['a', 'b'] 'x' '' []
+'\x0c' True 'x' 'x\x0c' '\x0cx' ['x'] ['a', 'b'] 'x' '' []
+'\r' True 'x' 'x\r' '\rx' ['x'] ['a', 'b'] 'x' '' []
+'\x1c' True 'x' 'x\x1c' '\x1cx' ['x'] ['a', 'b'] 'x' '' []
+'\x1d' True 'x' 'x\x1d' '\x1dx' ['x'] ['a', 'b'] 'x' '' []
+'\x1e' True 'x' 'x\x1e' '\x1ex' ['x'] ['a', 'b'] 'x' '' []
+'\x1f' True 'x' 'x\x1f' '\x1fx' ['x'] ['a', 'b'] 'x' '' []
+' ' True 'x' 'x ' ' x' ['x'] ['a', 'b'] 'x' '' []
+'\x85' True 'x' 'x\x85' '\x85x' ['x'] ['a', 'b'] 'x' '' []
+'\xa0' True 'x' 'x\xa0' '\xa0x' ['x'] ['a', 'b'] 'x' '' []
+'\u1680' True 'x' 'x\u1680' '\u1680x' ['x'] ['a', 'b'] 'x' '' []
+'\u2000' True 'x' 'x\u2000' '\u2000x' ['x'] ['a', 'b'] 'x' '' []
+'\u2001' True 'x' 'x\u2001' '\u2001x' ['x'] ['a', 'b'] 'x' '' []
+'\u2002' True 'x' 'x\u2002' '\u2002x' ['x'] ['a', 'b'] 'x' '' []
+'\u2003' True 'x' 'x\u2003' '\u2003x' ['x'] ['a', 'b'] 'x' '' []
+'\u2004' True 'x' 'x\u2004' '\u2004x' ['x'] ['a', 'b'] 'x' '' []
+'\u2005' True 'x' 'x\u2005' '\u2005x' ['x'] ['a', 'b'] 'x' '' []
+'\u2006' True 'x' 'x\u2006' '\u2006x' ['x'] ['a', 'b'] 'x' '' []
+'\u2007' True 'x' 'x\u2007' '\u2007x' ['x'] ['a', 'b'] 'x' '' []
+'\u2008' True 'x' 'x\u2008' '\u2008x' ['x'] ['a', 'b'] 'x' '' []
+'\u2009' True 'x' 'x\u2009' '\u2009x' ['x'] ['a', 'b'] 'x' '' []
+'\u200a' True 'x' 'x\u200a' '\u200ax' ['x'] ['a', 'b'] 'x' '' []
+'\u2028' True 'x' 'x\u2028' '\u2028x' ['x'] ['a', 'b'] 'x' '' []
+'\u2029' True 'x' 'x\u2029' '\u2029x' ['x'] ['a', 'b'] 'x' '' []
+'\u202f' True 'x' 'x\u202f' '\u202fx' ['x'] ['a', 'b'] 'x' '' []
+'\u205f' True 'x' 'x\u205f' '\u205fx' ['x'] ['a', 'b'] 'x' '' []
+'\u3000' True 'x' 'x\u3000' '\u3000x' ['x'] ['a', 'b'] 'x' '' []
+== characters that are not whitespace
+'\x00' False '\x00x\x00' '\x00x\x00' '\x00x\x00' ['\x00x\x00'] ['a\x00b'] '\x00x\x00'
+'\x1b' False '\x1bx\x1b' '\x1bx\x1b' '\x1bx\x1b' ['\x1bx\x1b'] ['a\x1bb'] '\x1bx\x1b'
+'!' False '!x!' '!x!' '!x!' ['!x!'] ['a!b'] '!x!'
+'\x7f' False '\x7fx\x7f' '\x7fx\x7f' '\x7fx\x7f' ['\x7fx\x7f'] ['a\x7fb'] '\x7fx\x7f'
+'\x84' False '\x84x\x84' '\x84x\x84' '\x84x\x84' ['\x84x\x84'] ['a\x84b'] '\x84x\x84'
+'\x86' False '\x86x\x86' '\x86x\x86' '\x86x\x86' ['\x86x\x86'] ['a\x86b'] '\x86x\x86'
+'\u180e' False '\u180ex\u180e' '\u180ex\u180e' '\u180ex\u180e' ['\u180ex\u180e'] ['a\u180eb'] '\u180ex\u180e'
+'\u200b' False '\u200bx\u200b' '\u200bx\u200b' '\u200bx\u200b' ['\u200bx\u200b'] ['a\u200bb'] '\u200bx\u200b'
+'\u200c' False '\u200cx\u200c' '\u200cx\u200c' '\u200cx\u200c' ['\u200cx\u200c'] ['a\u200cb'] '\u200cx\u200c'
+'\u200d' False '\u200dx\u200d' '\u200dx\u200d' '\u200dx\u200d' ['\u200dx\u200d'] ['a\u200db'] '\u200dx\u200d'
+'\u2060' False '\u2060x\u2060' '\u2060x\u2060' '\u2060x\u2060' ['\u2060x\u2060'] ['a\u2060b'] '\u2060x\u2060'
+'\ufeff' False '\ufeffx\ufeff' '\ufeffx\ufeff' '\ufeffx\ufeff' ['\ufeffx\ufeff'] ['a\ufeffb'] '\ufeffx\ufeff'
+'a' False 'axa' 'axa' 'axa' ['axa'] ['aab'] 'axa'
+== ASCII receivers
+strip 'Alpha beta\x1dGAMMA'
+lstrip 'Alpha beta\x1dGAMMA \x1e\x1f\n'
+rstrip '\x1c\t  Alpha beta\x1dGAMMA'
+split ['Alpha', 'beta', 'GAMMA']
+unchanged ('abc', 'abc', 'abc')
+all white ''
+all white l ''
+all white r ''
+empty ('', '', '')
+empty split []
+white split []
+inner kept 'a \x1c b'
+one side '\x1fabc'
+other side 'abc\x1f'
+one char ('', '', 'a', 'a', 'a')
+== receivers beyond ASCII
+strip 'caf\xe9 \u2028na\xefve\ufeff'
+lstrip 'caf\xe9 \u2028na\xefve\ufeff\u2003\x85'
+rstrip '\x85\u3000\xa0caf\xe9 \u2028na\xefve\ufeff'
+split ['caf\xe9', 'na\xefve\ufeff']
+bom kept '\ufeffx\ufeff'
+bom split ['a\ufeffb', 'c']
+nel 'x'
+nel split ['a', 'b']
+astral '\U0001f600 \U0001f601'
+astral split ['\U0001f600', '\U0001f601']
+unchanged ('caf\xe9', 'caf\xe9', 'caf\xe9')
+all white ('', [])
+== a lone surrogate in the receiver
+strip '\ud800 x'
+lstrip '\ud800 x\x85\x1f'
+rstrip '\x1c \ud800 x'
+split ['\ud800', 'x']
+isspace (False, False)
+== explicit None, and character sets
+strip(None) 'a'
+lstrip(None) 'a \x1f'
+rstrip(None) '\x1c a'
+strip(chars) '\x1c a \x1f'
+strip(sep) ' a '
+lstrip(chars) 'abcxx'
+rstrip(chars) 'xxabc'
+strip(wide) 'abc'
+== split with a count, and rsplit
+-1 ['a', 'b', 'c', 'd'] ['a', 'b', 'c', 'd'] ['a', 'b', 'c', 'd'] ['a', 'b', 'c', 'd']
+0 ['a\x1db \x85 c\x1ed\x1f'] ['\x1ca\x1db \x85 c\x1ed'] ['a\x1db \x85 c\x1ed\x1f'] ['\x1ca\x1db \x85 c\x1ed']
+1 ['a', 'b \x85 c\x1ed\x1f'] ['\x1ca\x1db \x85 c', 'd'] ['a', 'b \x85 c\x1ed\x1f'] ['\x1ca\x1db \x85 c', 'd']
+2 ['a', 'b', 'c\x1ed\x1f'] ['\x1ca\x1db', 'c', 'd'] ['a', 'b', 'c\x1ed\x1f'] ['\x1ca\x1db', 'c', 'd']
+3 ['a', 'b', 'c', 'd\x1f'] ['\x1ca', 'b', 'c', 'd'] ['a', 'b', 'c', 'd\x1f'] ['\x1ca', 'b', 'c', 'd']
+4 ['a', 'b', 'c', 'd'] ['a', 'b', 'c', 'd'] ['a', 'b', 'c', 'd'] ['a', 'b', 'c', 'd']
+5 ['a', 'b', 'c', 'd'] ['a', 'b', 'c', 'd'] ['a', 'b', 'c', 'd'] ['a', 'b', 'c', 'd']
+rsplit ['a', 'b']
+rsplit bom ['a\ufeffb', 'c']
+split sep ['a', 'b', 'c']
+split space ['a\x1cb', 'c']
+bom count ['\ufeff', 'a \ufeff b']
+bom rcount ['\ufeff a \ufeff', 'b']
+' a b ' [['a b '], ['a', 'b '], ['a', 'b'], ['a', 'b']] [[' a b'], [' a', 'b'], ['a', 'b'], ['a', 'b']]
+'a b' [['a b'], ['a', 'b'], ['a', 'b'], ['a', 'b']] [['a b'], ['a', 'b'], ['a', 'b'], ['a', 'b']]
+' a ' [['a '], ['a'], ['a'], ['a']] [[' a'], ['a'], ['a'], ['a']]
+'a  ' [['a  '], ['a'], ['a'], ['a']] [['a'], ['a'], ['a'], ['a']]
+'  a' [['a'], ['a'], ['a'], ['a']] [['  a'], ['a'], ['a'], ['a']]
+'   ' [[], [], [], []] [[], [], [], []]
+'' [[], [], [], []] [[], [], [], []]
+'  a  b  c  ' [['a  b  c  '], ['a', 'b  c  '], ['a', 'b', 'c  '], ['a', 'b', 'c']] [['  a  b  c'], ['  a  b', 'c'], ['  a', 'b', 'c'], ['a', 'b', 'c']]
+'a b c' [['a b c'], ['a', 'b c'], ['a', 'b', 'c'], ['a', 'b', 'c']] [['a b c'], ['a b', 'c'], ['a', 'b', 'c'], ['a', 'b', 'c']]
+'\x1c a\x85b \x1f' [['a\x85b \x1f'], ['a', 'b \x1f'], ['a', 'b'], ['a', 'b']] [['\x1c a\x85b'], ['\x1c a', 'b'], ['a', 'b'], ['a', 'b']]
+' a b ' [['a b '], ['a', 'b '], ['a', 'b'], ['a', 'b']] [[' a b'], [' a', 'b'], ['a', 'b'], ['a', 'b']]
+== isspace
+mixed True
+with bom False
+empty False
+letters False
+all True
+== a str subclass, the type's method, a bound method
+strip 'sub'
+lstrip 'sub \x1f'
+rstrip '\x1c\x85 sub'
+split ['sub']
+isspace True
+type 'str'
+str.strip 'a'
+str.lstrip 'a \x1f'
+str.rstrip '\x1c a'
+str.split ['a', 'b']
+bound 'bound'
+map ['a', 'b', 'c']
+getattr 'dyn'
+== startswith and endswith
+starts (True, False, True, True, False)
+ends (True, False, True, True, False)
+tuple (True, False, False, True, False)
+bounds (True, False, False, False, True, True, False)
+none bounds (True, True, True)
+empty (True, True, False, False)
+wide (True, False, True, True, True, True)
+wide in ascii (False, False, True, True)
+lone (True, True, False, True)
+subclass (True, True, True)
+str.startswith (True, True)
+startswith TypeError
+startswith TypeError
+endswith TypeError
+endswith TypeError
+startswith TypeError
+startswith TypeError
+endswith TypeError
+endswith TypeError
+startswith TypeError
+startswith TypeError
+endswith TypeError
+endswith TypeError
+startswith TypeError
+startswith TypeError
+endswith TypeError
+endswith TypeError
+hot [95, 95, 95, 95, 95] 38000

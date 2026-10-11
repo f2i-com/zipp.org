@@ -37,6 +37,15 @@ var __zipp_py = (function () {
     let nextId = 1;
     rt.STOP = STOP; rt.UNBOUND = UNBOUND; rt.NOTIMPL = NOTIMPL; rt.ELLIPSIS = ELLIPSIS;
     rt.MAX_ITEMS = MAX_ITEMS; rt.MAX_TEXT = MAX_TEXT;
+    // Python's whitespace, as the body of a RegExp class: the characters
+    // str.isspace() is true for. strip() and split() without an argument go
+    // by it, and so does `\s` in the `re` module. JavaScript's own `\s` and
+    // trim() are another set: they have U+FEFF, and they lack U+001C to
+    // U+001F and U+0085. Every member is one UTF-16 unit, so the class reads
+    // the same with and without the `u` flag. `rt.WS_RUN` is a run of it,
+    // which is where str.split() without a separator splits.
+    rt.PY_WS = "\\t\\n\\x0b\\x0c\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+    rt.WS_RUN = new RegExp("[" + rt.PY_WS + "]+");
 
     // ---- type objects -----------------------------------------------------------------------
     // A class is `{cls: TypeType, name, qualname, module, bases, mro, dict: Map, id}`.
