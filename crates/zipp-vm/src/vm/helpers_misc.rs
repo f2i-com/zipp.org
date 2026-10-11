@@ -1229,6 +1229,88 @@ fn jit_default_array_proto_index(vm: &Vm<'_>, i: usize) -> Option<Value> {
     Some(Value::UNDEFINED)
 }
 
+/// Same-binary switch: `ZIPP_NO_JIT_STRKEY_LANE=1` makes compiled `o[k]`
+/// with a string key leave the region again on an own miss, on a key that is
+/// new, and on a key that is still a rope.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_strkey_lane_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JIT_STRKEY_LANE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// `o[k]` where the flat string `key` is not among the plain object `idx`'s
+/// own keys (`map` is its map): what the prototype chain answers, when that
+/// is a data property or nothing. `None` leaves it to the interpreter.
+///
+/// `counts[w] || 0` misses for every word it has not seen. Each miss left the
+/// compiled region, 32 of them evicted it and the function ran interpreted
+/// from then on: a word count was 4.4 times Node's time.
+///
+/// The walk is `jit_get_prop_miss`'s for a named key, link for link and guard
+/// for guard (a class instance, a constructor's map, an exotic or live-slot
+/// link and an accessor all decline; an explicit null prototype and the end
+/// of the default chain are a miss). What only a computed key can spell is
+/// declined before it: `__proto__`, a private-looking `#` name, the empty
+/// string, and anything that begins like an index (a digit or `-`), as that
+/// helper's store side declines them.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jit_string_key_miss(vm: &Vm<'_>, idx: u32, map: &ObjMap, key: &str) -> Option<Value> {
+    if !jit_strkey_lane_enabled()
+        || key == "__proto__"
+        || !key
+            .as_bytes()
+            .first()
+            .is_some_and(|b| !(b.is_ascii_digit() || *b == b'-' || *b == b'#'))
+        || !vm.deferred_ns_state.is_empty()
+        || !vm.ic_obj_ok(idx)
+        || map.class.is_some()
+        || map.is_ctor
+    {
+        return None;
+    }
+    let mut cur = idx;
+    for _ in 0..64 {
+        let next = match vm.proto_of.get(&cur) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            // Explicit null prototype: a true chain miss.
+            Some(_) => return Some(Value::UNDEFINED),
+            None => {
+                if vm.obj_proto == 0 || cur == vm.obj_proto {
+                    return Some(Value::UNDEFINED);
+                }
+                vm.obj_proto
+            }
+        };
+        if !vm.ic_obj_ok(next) {
+            return None;
+        }
+        match vm.heap.get(next) {
+            HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
+                if let Some(i) = m2.pos(key) {
+                    if m2.attr_at(i).accessor {
+                        return None; // the getter is user code
+                    }
+                    let v = m2.val_at(i);
+                    return (!v.is_uninitialized()).then_some(v);
+                }
+            }
+            _ => return None, // exotic link
+        }
+        cur = next;
+    }
+    None
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_get_index(
     vm: *mut core::ffi::c_void,
@@ -1239,6 +1321,20 @@ pub(crate) extern "win64" fn jit_get_index(
     let key = Value::from_bits(key_bits);
     if !arr.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // A key built by concatenation is a rope until something reads it. The
+    // arm below wants its bytes in place, and a loop over more than 32 fresh
+    // keys left the region once a key and was evicted. Flattened where it is,
+    // as the string helpers above flatten their operands: the slot keeps its
+    // identity and no heap object is allocated.
+    if key.is_heap() && jit_strkey_lane_enabled() {
+        // SAFETY: exclusive view for this statement only; the running region
+        // holds no conflicting borrow, and a rope is pinned by nothing (a
+        // region pins the bytes of flat strings).
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        if matches!(vm.heap.get(arr.heap_index()), HeapObj::Object(_)) {
+            vm.heap.flatten(key.heap_index());
+        }
     }
     // SAFETY: read-only view; the running region holds no conflicting borrow.
     let vm = unsafe { &*(vm as *const Vm) };
@@ -1277,6 +1373,8 @@ pub(crate) extern "win64" fn jit_get_index(
                                     return v.bits();
                                 }
                             }
+                        } else if let Some(v) = jit_string_key_miss(vm, oidx, m, k) {
+                            return v.bits();
                         }
                     }
                 }
@@ -1439,24 +1537,39 @@ pub(crate) extern "win64" fn jit_set_index(
     );
     // ── plain-object computed write: `o[k] = v` overwriting an EXISTING own
     // writable data slot ────────────────────────────────────────────────────
-    // Deliberately narrower than the read arm. Only an in-place value store on a
-    // slot that already exists is handled, so nothing observable happens: no
-    // shape change, no `vals` reallocation (the JIT inline caches address values
-    // through `vals_ptr + slot`, so an existing-slot store cannot invalidate
-    // them), no prototype involvement (an own data property shadows any
-    // inherited setter), and no length/index bookkeeping.
+    // An in-place value store on a slot that already exists: nothing
+    // observable happens, no shape change, no `vals` reallocation (the JIT
+    // inline caches address values through `vals_ptr + slot`, so an
+    // existing-slot store cannot invalidate them), no prototype involvement
+    // (an own data property shadows any inherited setter), and no
+    // length/index bookkeeping.
     //
-    // Everything else keeps deopting — a new key (shape change), an accessor
-    // (runs user code), a non-writable slot, an uninitialised TDZ slot, the
-    // slot-backed global, and module/deferred namespaces (live bindings).
+    // ── and appending a NEW key, where the interpreter's own fast path would
+    // (`Vm::plain_string_key_add_clear`, which is that path's predicate): an
+    // extensible class-less object whose chain holds no accessor and no
+    // non-writable data property of that name. `counts[w] = 1` for a word not
+    // seen yet, and every `o[k] = v` that builds a dictionary, left the
+    // region; 32 of those evicted it. The append is the interpreter's
+    // (`push_data`, then the version bump that retires every inline-cache way
+    // and mirror of the receiver, as `jit_set_prop_miss` bumps for a named
+    // add). It allocates no heap object, so nothing a region pins moves.
+    //
+    // Everything else keeps deopting — an accessor (runs user code), a
+    // non-writable slot, an uninitialised TDZ slot, the slot-backed global,
+    // and module/deferred namespaces (live bindings).
     if key.is_heap() {
         let oidx = arr.heap_index();
+        // A rope key is flattened where it is (see `jit_get_index`).
+        if jit_strkey_lane_enabled() && matches!(vm.heap.get(oidx), HeapObj::Object(_)) {
+            vm.heap.flatten(key.heap_index());
+        }
         if !(oidx == vm.global_this && vm.global_this != 0)
             && !(!vm.module_namespaces.is_empty() && vm.module_namespaces.contains_key(&oidx))
             && !(!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx))
             && !vm.arr_props.contains_key(&oidx)
         {
             let mut writable_slot = None;
+            let mut new_key: Option<String> = None;
             // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
             if let Some(std::borrow::Cow::Borrowed(bytes)) = vm
                 .heap
@@ -1471,6 +1584,10 @@ pub(crate) extern "win64" fn jit_set_index(
                             if !a.accessor && a.writable && !m.val_at(i).is_uninitialized() {
                                 writable_slot = Some(i);
                             }
+                        } else if jit_strkey_lane_enabled()
+                            && vm.plain_string_key_add_clear(oidx, k)
+                        {
+                            new_key = Some(k.to_string());
                         }
                     }
                 }
@@ -1479,6 +1596,13 @@ pub(crate) extern "win64" fn jit_set_index(
             if let Some(i) = writable_slot {
                 if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
                     m.set_val_at(i, Value::from_bits(val_bits));
+                    return 0;
+                }
+            }
+            if let Some(k) = new_key {
+                if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
+                    m.push_data(k, Value::from_bits(val_bits));
+                    vm.heap.bump_version(oidx); // a key add reallocs `vals`
                     return 0;
                 }
             }

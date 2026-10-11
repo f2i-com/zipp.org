@@ -393,7 +393,7 @@ impl<'p> Vm<'p> {
     /// resolution for them); anything exotic — Proxy, class chain, the
     /// global, a namespace, a constructor object — answers `false` and the
     /// caller falls back to the generic set_prop. `&self` only: no traps run.
-    fn plain_add_chain_clear(&self, start: u32, key: &str) -> bool {
+    pub(super) fn plain_add_chain_clear(&self, start: u32, key: &str) -> bool {
         let mut lidx = start;
         for _ in 0..1000 {
             let proto = match self.proto_of.get(&lidx) {
@@ -430,6 +430,33 @@ impl<'p> Vm<'p> {
             lidx = pidx;
         }
         false
+    }
+
+    /// Whether `obj[k] = v` appends `k` to the plain object `idx` as a new
+    /// own data property with nothing else observable: the ADD half of
+    /// [`Vm::set_index`]'s fast path, as one predicate, for compiled code
+    /// (`jit_set_index`). `k` is the bytes of a flat string key that is not
+    /// `@@`-escaped. The two must change together: what this answers `true`
+    /// for, the interpreter appends with `push_data` and a version bump, and
+    /// so does the helper.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(super) fn plain_string_key_add_clear(&self, idx: u32, k: &str) -> bool {
+        !(idx == self.global_this && self.global_this != 0)
+            && !self.is_indexed_proto_anchor(idx)
+            && self.realm_global_objs.is_empty()
+            && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
+            && k != "__proto__"
+            && matches!(
+                self.heap.get(idx),
+                HeapObj::Object(m)
+                    if !m.class_proto
+                        && m.pos(k).is_none()
+                        && m.extensible
+                        && m.class.is_none()
+                        && !m.is_ctor
+            )
+            && self.plain_add_chain_clear(idx, k)
     }
 
     pub(crate) fn set_index(
