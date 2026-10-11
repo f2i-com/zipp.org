@@ -124,6 +124,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "zipp-numparse"
+version = "0.0.22"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+]
+
+[[package]]
 name = "zipp-regress"
 version = "0.11.1"
 dependencies = [
@@ -147,5 +155,6 @@ dependencies = [
  "num-traits",
  "rustc-hash",
  "self_cell",
+ "zipp-numparse",
  "zipp-regress",
 ]

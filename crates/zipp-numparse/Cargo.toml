@@ -1,0 +1,16 @@
+[package]
+name = "zipp-numparse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Decimal text to f64, bit for bit what str::parse::<f64>() returns, without core's 10 KB power-of-five table."
+
+# Its own crate so that both zipp-vm and zipp-pyparse (which cannot depend on
+# zipp-vm) parse floats with it: one str::parse::<f64>() anywhere in a
+# WebAssembly module links core's table back in.
+[dependencies]
+# The table is built at first use, and the rare exact case divided, with the
+# big integers the engine links anyway for BigInt. Keep these requirements the
+# same as zipp-vm's so a build resolves one copy of each.
+num-bigint = "0.5"
+num-traits = "0.2"

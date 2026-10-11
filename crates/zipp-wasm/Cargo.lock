@@ -251,6 +251,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zipp-numparse"
+version = "0.0.22"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+]
+
+[[package]]
 name = "zipp-pyparse"
 version = "0.0.22"
 dependencies = [
@@ -258,6 +266,7 @@ dependencies = [
  "rustc-hash",
  "unicode-ident",
  "unicode-properties",
+ "zipp-numparse",
 ]
 
 [[package]]
@@ -276,6 +285,7 @@ dependencies = [
  "num-traits",
  "rustc-hash",
  "self_cell",
+ "zipp-numparse",
  "zipp-pyparse",
  "zipp-regress",
 ]

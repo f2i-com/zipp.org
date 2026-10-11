@@ -2,12 +2,16 @@
 //! lexer has already checked the syntax).
 
 /// A float literal's (or an imaginary literal's part's) value.
+///
+/// Read by `zipp_numparse`, which returns what `str::parse::<f64>` returns
+/// without linking core's parser and its power-of-five table into the
+/// WebAssembly modules (the engine reads its numbers with it too).
 pub fn float(text: &str) -> f64 {
     if !text.contains('_') {
-        return text.parse().unwrap_or(f64::NAN);
+        return zipp_numparse::parse_f64(text).unwrap_or(f64::NAN);
     }
-    let digits: String = text.chars().filter(|&c| c != '_').collect();
-    digits.parse().unwrap_or(f64::NAN)
+    let digits: Vec<u8> = text.bytes().filter(|&c| c != b'_').collect();
+    zipp_numparse::parse_f64_bytes(&digits).unwrap_or(f64::NAN)
 }
 
 /// An int literal's value when it fits in a `u64` (`text` as written,
