@@ -2486,8 +2486,10 @@ pub(crate) fn markdown_escape_html_proto(proto: &FuncProto) -> bool {
 /// slot number. As with the helper proof, register count is intentionally not a
 /// semantic gate. `ZIPP_NO_MARKDOWN_INLINE_REDUCE=1` omits the plan entirely.
 pub(crate) fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePlan> {
-    if std::env::var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some()
-        || proto.name != "renderInline"
+    // The name first: it rejects every function but one, and the switch is a
+    // read of the process environment.
+    if proto.name != "renderInline"
+        || std::env::var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some()
         || proto.param_count != 1
         || proto.length != 1
         || !proto.is_strict
@@ -2513,7 +2515,7 @@ pub(crate) fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePl
     if loads.next() != Some(escape_html_global) || loads.next().is_some() {
         return None;
     }
-    if std::env::var_os("ZIPP_JITLOG").is_some() {
+    if crate::jitlog_enabled() {
         eprintln!("[jit] markdown-inline plan installed (escape_global={escape_html_global})");
     }
     Some(MarkdownInlinePlan { escape_html_global })
@@ -2532,9 +2534,9 @@ pub(crate) fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePl
 /// hide getters, coercions, a different visit order, or observable work between
 /// recursive calls. `ZIPP_NO_JSON_WALK_REDUCE=1` omits the plan entirely.
 fn json_walk_plan(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> Option<JsonWalkPlan> {
-    if std::env::var_os("ZIPP_NO_JSON_WALK_REDUCE").is_some()
-        || proto.param_count != 1
+    if proto.param_count != 1
         || proto.reg_count != 43
+        || std::env::var_os("ZIPP_NO_JSON_WALK_REDUCE").is_some()
         || !proto.is_strict
         || !proto.simple_params
         || proto.rest_reg.is_some()
@@ -4064,7 +4066,7 @@ impl Jit {
             .copied()
             .collect();
         for key in keys {
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 eprintln!(
                     "[cross] region fn{} [{}] evicted for cross-entry retry",
                     key.0, key.1
@@ -4077,7 +4079,7 @@ impl Jit {
             self.region_counts.remove(&key);
         }
         if let Some(f) = self.compiled.remove(&fid) {
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 eprintln!("[cross] Tier C fn{fid} evicted for cross-entry retry");
             }
             self.retired_fns.push(f);
@@ -4210,7 +4212,7 @@ impl Jit {
                 // Said here rather than inside `compile_proto` so it sits beside
                 // the Tier C line below and reports the same fact: this func_id
                 // now has a compiled whole-function body, on this tier.
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] Tier A fn{func_id} compiled (self-recursive int path, {} ops, self_call={})",
                         proto.code.len(),
@@ -4232,7 +4234,7 @@ impl Jit {
         // path before blacklisting. Gated behind ZIPP_FNJIT_MEM (default-ON;
         // opt out with ZIPP_NO_FNJIT_MEM).
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if std::env::var_os("ZIPP_JITLOG").is_some() && !mem_can_compile(proto, const_strs) {
+        if crate::jitlog_enabled() && !mem_can_compile(proto, const_strs) {
             eprintln!(
                 "[jit] fn{func_id} mem_can_compile=false ({} ops)",
                 proto.code.len()
@@ -4274,7 +4276,7 @@ impl Jit {
                 random_fuse,
                 plain_makefunc,
             ) {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] Tier C fn{func_id} compiled (whole-function mem path, leaf_inlines={}, acc_arms={}/{}, direct_miss={})",
                         leaf_plan.len(),
@@ -4306,7 +4308,7 @@ impl Jit {
                     (u64::MAX, None)
                 };
                 if let Some(mask) = &wide_uninit_mask {
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         let marked: u32 = mask.iter().map(|word| word.count_ones()).sum();
                         eprintln!(
                             "[jit] fn{func_id} wide cross-uninit mask regs={} words={} marked={marked}",
@@ -4368,7 +4370,7 @@ impl Jit {
                 return;
             }
         }
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!("[jit] fn{func_id} BLACKLISTED (neither Tier A nor Tier C compiled)");
         }
         self.blacklist.insert(func_id);
@@ -4502,7 +4504,7 @@ impl Jit {
 
     pub fn should_yield_to_region(&mut self, func_id: u32) -> bool {
         let y = tierc_yield_enabled() && self.has_reg_region(func_id);
-        if y && std::env::var_os("ZIPP_JITLOG").is_some() && self.yield_logged.insert(func_id) {
+        if y && crate::jitlog_enabled() && self.yield_logged.insert(func_id) {
             eprintln!("[jit] Tier C fn{func_id} DECLINED (yield: live reg-homed region)");
         }
         y
@@ -4568,7 +4570,7 @@ impl Jit {
             return;
         }
         if let Some(f) = self.compiled.remove(&func_id) {
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 eprintln!("[jit] Tier C fn{func_id} EVICTED (yield: reg-homed region landed)");
             }
             self.retired_fns.push(f);
@@ -4602,7 +4604,7 @@ impl Jit {
     /// call-mix gate found it would lose to the interpreter — e.g. dominated by
     /// always-fallback native-callee sites).
     pub fn blacklist_region(&mut self, func_id: u32, entry_ip: u32) {
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!("[jit] region fn{func_id} [{entry_ip}] DECLINED (call-mix gate)");
         }
         self.region_blacklist.insert((func_id, entry_ip));
@@ -4738,7 +4740,7 @@ impl Jit {
                     false,
                     meter,
                 ) {
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         eprintln!(
                             "[jit] LOCAL-SROA region fn{func_id} [{start},{end}] objects={} arrays={} finalized={} concat_lens={} tier={}",
                             local.runtime.objects.len(),
@@ -4804,7 +4806,7 @@ impl Jit {
                         fp.obj_global,
                         meter,
                     );
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         eprintln!(
                             "[jit] SROA region fn{func_id} [{start},{end}] fields={} -> {}",
                             fp.fields.len(),
@@ -4891,7 +4893,7 @@ impl Jit {
                 None,
                 meter,
             ) {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
                 }
                 {
@@ -4957,7 +4959,7 @@ impl Jit {
             meter,
         ) {
             Some((code, is_mem, is_boxref)) => {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     let tier = if is_mem { "MEM" } else { "DOUBLE" };
                     eprintln!(
                         "[jit] {tier} region fn{func_id} [{start},{end}] compiled (acc_arms={}/{}, direct_miss={})",
@@ -4996,7 +4998,7 @@ impl Jit {
                 }
             }
             None => {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!("[jit] region fn{func_id} [{start},{end}] DECLINED (blacklisted)");
                 }
                 self.region_blacklist.insert(key);
@@ -5015,7 +5017,7 @@ impl Jit {
         let (evict, retry) = if let Some(r) = self.regions.get_mut(&key) {
             if resume_ip >= r.start && resume_ip <= r.end {
                 r.deopts += 1;
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] region fn{} [{}] deopt at ip {}",
                         key.0, key.1, resume_ip
@@ -5052,7 +5054,7 @@ impl Jit {
             (false, false)
         };
         if evict {
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 eprintln!(
                     "[jit] region fn{} [{}] EVICTED (retry={retry})",
                     key.0, key.1
@@ -5198,7 +5200,7 @@ impl Jit {
             // Tier C whole-function body: park + reset to cold so the call
             // counter re-offers it (the blacklist is untouched).
             if let Some(f) = self.compiled.remove(&m.func_id) {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] Tier C fn{} EVICTED (accessor site gate, ip {})",
                         m.func_id, m.op_ip
@@ -5217,7 +5219,7 @@ impl Jit {
             // int-retry eviction's exact recipe, minus the int blacklist).
             let key = (m.func_id, m.region_entry);
             if let Some(r) = self.regions.remove(&key) {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] region fn{} [{}] EVICTED (accessor site gate, ip {})",
                         key.0, key.1, m.op_ip
@@ -5307,7 +5309,7 @@ impl Jit {
 
         if m.region_entry == u32::MAX {
             if let Some(f) = self.compiled.remove(&m.func_id) {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] Tier C fn{} EVICTED (direct-miss site gate, ip {}, batched {})",
                         m.func_id, m.op_ip, marked
@@ -5324,7 +5326,7 @@ impl Jit {
         } else {
             let key = (m.func_id, m.region_entry);
             if let Some(r) = self.regions.remove(&key) {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] region fn{} [{}] EVICTED (direct-miss site gate, ip {}, batched {})",
                         key.0, key.1, m.op_ip, marked

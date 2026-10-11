@@ -931,7 +931,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                             true,
                             sroa_obj_global,
                         ) {
-                            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                            if crate::jitlog_enabled() {
                                 eprintln!(
                                     "[jit] INT-GPR DV retry [{start},{end}]: shared-home re-plan"
                                 );
@@ -961,12 +961,12 @@ pub(crate) fn compile_region_int_maybe_cold(
                 }
             }
         }
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!("[jit] INT decline [{start},{end}]: region_is_int=false");
         }
         // B74 discipline: a decline count without the disqualifying opcode makes
         // the next admit candidate a guess. Name every unadmitted ip.
-        if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+        if crate::jitdecline_enabled() {
             for &ip in &unadmitted {
                 eprintln!("[int-reject] @{ip} {:?}", proto.code[ip]);
             }
@@ -1014,7 +1014,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         // The header's block and the back-edge's block must run natively, or the
         // region exits every iteration and is worse than not compiling at all.
         if cold_blocks.contains(&block_of[0]) || cold_blocks.contains(&block_of[e_ - s_]) {
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 eprintln!("[jit] INT-cold decline [{start},{end}]: header/back-edge block is cold");
             }
             return None;
@@ -1084,7 +1084,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     sroa_obj_global,
                     18,
                 ) {
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         eprintln!(
                             "[jit] INT-GPR computed retry [{start},{end}]: shared-home re-plan"
                         );
@@ -1172,7 +1172,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                                     false,
                                     sroa_obj_global,
                                 ) {
-                                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                                    if crate::jitlog_enabled() {
                                         eprintln!(
                                             "[jit] INT-GPR nest retry [{start},{end}]: shared-home re-plan"
                                         );
@@ -1213,7 +1213,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             match split_plan.filter(|_| !entry.resume.is_empty()) {
                 Some(p2) => p2,
                 None => {
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         eprintln!("[jit] INT decline [{start},{end}]: plan_region=None");
                     }
                     return None;
@@ -1221,7 +1221,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             }
         }
     };
-    if !plan.split_recvs.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if !plan.split_recvs.is_empty() && crate::jitlog_enabled() {
         let mut srs: Vec<u16> = plan.split_recvs.iter().copied().collect();
         srs.sort_unstable();
         for sr in srs {
@@ -1280,7 +1280,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     false,
                     sroa_obj_global,
                 ) {
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         eprintln!("[jit] INT-GPR nest retry [{start},{end}]: shared-home re-plan");
                     }
                     if let GprAttempt::Emitted(f) = compile_region_int_gpr(
@@ -1371,7 +1371,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         int_push3_enabled() && entry.resume.is_empty() && meter.is_none(),
     );
     let has_push3 = !push3.is_empty();
-    if has_push3 && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if has_push3 && crate::jitlog_enabled() {
         eprintln!(
             "[jit] INT region [{start},{end}] array-push3 groups={}",
             push3.len() / 3
@@ -2750,7 +2750,7 @@ pub(crate) fn compile_region_int_maybe_cold(
     };
     // W7 attribution: code-byte length with pins, so the hoist's size delta is
     // one grep away (run again under ZIPP_NO_GUARD_HOIST=1 and diff the line).
-    if !ta_plan.pins.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if !ta_plan.pins.is_empty() && crate::jitlog_enabled() {
         eprintln!(
             "[jit] INT region [{start},{end}] guard-hoist pins={}/{} len-fills={} code={}b",
             plan.hoist_pins.len(),

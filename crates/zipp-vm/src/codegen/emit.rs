@@ -961,7 +961,7 @@ pub(crate) fn log_pinned_recvs(
     proto: &FuncProto,
     plan: &RegionPlan,
 ) {
-    if plan.ta_recv_regs.is_empty() || std::env::var_os("ZIPP_JITLOG").is_none() {
+    if plan.ta_recv_regs.is_empty() || !crate::jitlog_enabled() {
         return;
     }
     let mut rs: Vec<u16> = plan.ta_recv_regs.iter().copied().collect();

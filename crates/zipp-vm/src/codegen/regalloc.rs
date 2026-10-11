@@ -652,7 +652,7 @@ pub(crate) fn compile_region_regalloc(
         decline_emit("regalloc-emit: GetProp arm planned without heap helpers");
         return None;
     }
-    if !plan.split_recvs.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if !plan.split_recvs.is_empty() && crate::jitlog_enabled() {
         let mut srs: Vec<u16> = plan.split_recvs.iter().copied().collect();
         srs.sort_unstable();
         for sr in srs {
@@ -769,7 +769,7 @@ pub(crate) fn compile_region_regalloc(
         if let Some((h, packed)) =
             heap.and_then(|h| pack_field_stream_region(h.func_id, s, e).map(|packed| (h, packed)))
         {
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 eprintln!(
                     "[jit] DOUBLE region fn{} [{start},{end}] field-read-stream prefix",
                     h.func_id
@@ -1874,7 +1874,7 @@ pub(crate) fn compile_region_regalloc(
     };
     // W7 attribution: code-byte length with pins, so the hoist's size delta is
     // one grep away (run again under ZIPP_NO_GUARD_HOIST=1 and diff the line).
-    if !ta_plan.pins.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if !ta_plan.pins.is_empty() && crate::jitlog_enabled() {
         eprintln!(
             "[jit] DOUBLE region [{start},{end}] guard-hoist pins={}/{} code={}b",
             plan.hoist_pins.len(),
@@ -1883,7 +1883,7 @@ pub(crate) fn compile_region_regalloc(
         );
         log_pinned_recvs("DOUBLE", start, end, proto, &plan);
     }
-    if needs_ic && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if needs_ic && crate::jitlog_enabled() {
         let mut gps: Vec<usize> = plan.getprop_ips.iter().copied().collect();
         gps.sort_unstable();
         eprintln!(

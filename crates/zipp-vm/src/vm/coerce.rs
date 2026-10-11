@@ -480,7 +480,7 @@ impl<'p> Vm<'p> {
             }
             out
         };
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
@@ -564,7 +564,7 @@ mod pairstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let v = crate::icstats_enabled() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -633,7 +633,7 @@ mod pad2stats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let v = crate::icstats_enabled() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }

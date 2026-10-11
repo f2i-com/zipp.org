@@ -307,7 +307,7 @@ impl Jit {
                 self.code_bytes += code.code_bytes;
                 self.compiled.insert(func_id, code);
                 self.set_fn_state(func_id, FN_COMPILED);
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] ARM64 fn{func_id} compiled (call-free whole-function baseline, {} ops)",
                         proto.code.len()
@@ -317,7 +317,7 @@ impl Jit {
             _ => {
                 self.blacklist.insert(func_id);
                 self.set_fn_state(func_id, FN_DEAD);
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!("[jit] ARM64 fn{func_id} DECLINED (unsupported or code-cache limit)");
                 }
             }
@@ -344,7 +344,7 @@ impl Jit {
         }
         self.blacklist.insert(func_id);
         self.set_fn_state(func_id, FN_DEAD);
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!("[jit] ARM64 fn{func_id} EVICTED (chronic guard exits)");
         }
     }

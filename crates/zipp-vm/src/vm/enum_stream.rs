@@ -1366,7 +1366,7 @@ impl<'p> Vm<'p> {
         }
         self.globals[plan.count_global as usize] = Value::int(final_count);
         self.globals[plan.fold_global as usize] = Value::num(final_fold);
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!("[jit] sparse-forin-fold committed {} keys", key_count);
         }
         Some(plan.exit)
@@ -1454,7 +1454,7 @@ impl<'p> Vm<'p> {
             (sum.as_int() as u32).wrapping_add((result_len as u32).wrapping_mul(iterations));
         self.globals[plan.sum_global as usize] = Value::int(final_sum as i32);
         self.globals[plan.i_global as usize] = limit;
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] array-copy-length committed {} {} iterations",
                 method, iterations
@@ -1551,7 +1551,7 @@ impl<'p> Vm<'p> {
             self.globals[global as usize] = Value::int(value);
         }
         self.globals[plan.i_global as usize] = limit;
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] periodic-in-probes committed {} iterations / {} probes",
                 iterations,
@@ -1648,7 +1648,7 @@ impl<'p> Vm<'p> {
         }
         self.globals[plan.count_global as usize] = Value::int(final_count);
         self.globals[plan.i_global as usize] = limit;
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] enum-forin-count committed {} x {} keys",
                 iterations, per_iteration
@@ -1740,7 +1740,7 @@ impl<'p> Vm<'p> {
         }
         self.globals[plan.sum_global as usize] = Value::int(result as i32);
         self.globals[plan.i_global as usize] = limit;
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!("[jit] enum-forin-sum committed {} iterations", remaining);
         }
         Some(plan.exit)
@@ -1792,7 +1792,7 @@ impl<'p> Vm<'p> {
         let result = (sum.as_int() as u32).wrapping_add(count.wrapping_mul(remaining));
         self.globals[plan.sum_global as usize] = Value::int(result as i32);
         self.globals[plan.i_global as usize] = limit;
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!("[jit] enum-object-keys committed {} iterations", remaining);
         }
         Some(plan.exit)

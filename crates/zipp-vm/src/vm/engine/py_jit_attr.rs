@@ -113,7 +113,7 @@ impl<'p> Vm<'p> {
                 },
             );
         }
-        if !plan.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+        if !plan.is_empty() && crate::jitlog_enabled() {
             eprintln!("[jit] PY attr plan fn{func_id}: {} inline site(s)", plan.len());
         }
         crate::codegen::set_py_attr_plan(&self.jit as *const crate::codegen::Jit as usize, func_id, plan);

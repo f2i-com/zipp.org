@@ -100,7 +100,7 @@ pub(crate) fn tierc_loose_null_inline_enabled() -> bool {
         2 => false,
         _ => {
             let on = std::env::var_os("ZIPP_NO_TIERC_LOOSE_NULL_INLINE").is_none()
-                && std::env::var_os("ZIPP_ICSTATS").is_none();
+                && !crate::icstats_enabled();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

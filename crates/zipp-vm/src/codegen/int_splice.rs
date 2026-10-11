@@ -121,7 +121,7 @@ struct Site<'a> {
 const MAX_SPLICE_WINDOW_TOP: u64 = 512;
 
 fn log_decline(args: std::fmt::Arguments<'_>) {
-    if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+    if crate::jitdecline_enabled() {
         eprintln!("[int-splice] {args}");
     }
 }
@@ -557,7 +557,7 @@ pub(crate) fn plan_int_splice(
         }
         decline!("[{start},{end}] flattened body is not INT-admissible");
     }
-    if std::env::var_os("ZIPP_JITLOG").is_some() {
+    if crate::jitlog_enabled() {
         eprintln!(
             "[jit] INT splice [{start},{end}]: {} call(s) flattened, {} entry guard(s), {} ops",
             sites.len(),
@@ -847,7 +847,7 @@ fn plan_int_computed_splice(
             .collect(),
         helper: cp.guard_helper,
     };
-    if std::env::var_os("ZIPP_JITLOG").is_some() {
+    if crate::jitlog_enabled() {
         eprintln!(
             "[jit] INT computed splice [{start},{end}] @{}: {} dense arms, fallback @{}, {} ops",
             call_ip,

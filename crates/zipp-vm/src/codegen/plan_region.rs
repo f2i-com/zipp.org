@@ -14,7 +14,7 @@ pub(crate) fn jitdecline_on() -> bool {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_JITDECLINE").is_some();
+            let on = crate::jitdecline_enabled();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -1792,7 +1792,7 @@ fn plan_region_cold_inner(
                 if !admit_split {
                     decline!("dead LoadGlobal range requires receiver splitting");
                 }
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     let mut ips: Vec<usize> = loads.iter().copied().collect();
                     ips.sort_unstable();
                     eprintln!("[jit] region [{s},{e}] dead-global split receiver r{r} lg={ips:?}");
@@ -2081,7 +2081,7 @@ fn plan_region_cold_inner(
         } else {
             FxHashMap::default()
         };
-    if !ty_splits.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if !ty_splits.is_empty() && crate::jitlog_enabled() {
         let mut v: Vec<(u16, TySplit)> = ty_splits.iter().map(|(&r, &sp)| (r, sp)).collect();
         v.sort_unstable_by_key(|x| x.0);
         for (r, sp) in v {
@@ -3653,7 +3653,7 @@ fn plan_region_cold_inner(
             // ip where the two mechanisms disagree — every consumer tests the
             // two sets with OR, so emptying the overlap changes nothing else.
             if split_recvs.contains(&r) {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] region [{s},{e}] B97 write-through excludes B94 split receiver r{r}"
                     );
@@ -3998,7 +3998,7 @@ fn plan_region_cold_inner(
                     top += 1;
                 }
                 first_free_xmm = top;
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     let mut ng: Vec<u32> = narrow_globs.iter().copied().collect();
                     ng.sort_unstable();
                     eprintln!(
@@ -4023,7 +4023,7 @@ fn plan_region_cold_inner(
                 if allow_hoist && gated_hoists && dv_double_enabled() {
                     return PlanOutcome::RetryNoHoist;
                 }
-                if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+                if crate::jitdecline_enabled() {
                     let nregs = reg_order.iter().filter(|r| ty[r] == VTy::Num).count();
                     let perm = reg_order
                         .iter()
@@ -4101,7 +4101,7 @@ fn plan_region_cold_inner(
                     if allow_hoist && !hoisted.is_empty() && dv_double_enabled() {
                         return PlanOutcome::RetryNoHoist;
                     }
-                    if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+                    if crate::jitdecline_enabled() {
                         let nregs = reg_order.iter().filter(|r| ty[r] == VTy::Num).count();
                         let perm = reg_order
                             .iter()
@@ -4259,7 +4259,7 @@ fn plan_region_cold_inner(
                 bool_shared.insert(r);
             }
         }
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] region [{s},{e}] bool reuse: {n_bools} bools -> {next_bool} gpr(s), shared={}",
                 bool_shared.len()

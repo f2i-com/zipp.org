@@ -1017,7 +1017,7 @@ impl<'p> Vm<'p> {
             *regs.add(p.k as usize) = Value::int(k).bits();
             *regs.add(p.i as usize) = Value::int(limit).bits();
         }
-        if matches!(p.limit, FieldLoopLimit::Upval(_)) && std::env::var_os("ZIPP_JITLOG").is_some()
+        if matches!(p.limit, FieldLoopLimit::Upval(_)) && crate::jitlog_enabled()
         {
             eprintln!(
                 "[jit] upvalue-field-read-stream committed {} iterations",
@@ -1099,7 +1099,7 @@ impl<'p> Vm<'p> {
         }
         self.globals[p.sum_global as usize] = Value::int(sum as i32);
         self.globals[p.i_global as usize] = Value::int(limit);
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] field-mask-read-stream committed {} iterations",
                 remaining
@@ -1152,7 +1152,7 @@ impl<'p> Vm<'p> {
         // run the original loop again and add the complete reduction twice.
         test_panic_after_first_global_commit();
         self.globals[p.i_global as usize] = Value::int(limit);
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] global-field-sum-stream committed {} iterations ({} terms)",
                 remaining,
@@ -1261,7 +1261,7 @@ impl<'p> Vm<'p> {
         self.globals[p.receiver_global as usize] = receivers[final_lane];
         self.globals[p.sum_global as usize] = Value::int(sum as i32);
         self.globals[p.i_global as usize] = Value::int(limit);
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] mixed-field-stream committed {} iterations ({} lanes)",
                 remaining, n
@@ -1363,7 +1363,7 @@ impl<'p> Vm<'p> {
             *regs.add(p.k as usize) = Value::int(final_k).bits();
             *regs.add(p.i as usize) = Value::int(limit).bits();
         }
-        if matches!(p.limit, FieldLoopLimit::Upval(_)) && std::env::var_os("ZIPP_JITLOG").is_some()
+        if matches!(p.limit, FieldLoopLimit::Upval(_)) && crate::jitlog_enabled()
         {
             eprintln!(
                 "[jit] upvalue-field-write-stream committed {} iterations",

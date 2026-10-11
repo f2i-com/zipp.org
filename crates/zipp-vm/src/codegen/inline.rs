@@ -197,7 +197,7 @@ pub(crate) fn captured_builtin_lane(
     if !on {
         return None;
     }
-    if std::env::var_os("ZIPP_JITLOG").is_some() {
+    if crate::jitlog_enabled() {
         eprintln!("[jit] captured method lane `{key}` emitted at ip {ip}");
     }
     Some(CapturedLane::Proved { op })
@@ -377,7 +377,7 @@ pub(crate) fn emit_inline_leaf_call(
                 JIT_HOT_MIRROR_RAW_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
                 JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_UPVALS_MIRROR_RAW_OFFSET,
             };
-            let jitlog = std::env::var_os("ZIPP_JITLOG").is_some();
+            let jitlog = crate::jitlog_enabled();
             if jitlog {
                 eprintln!("[leaf] call@{call_ip} INLINE-SAME-PROTO-GUARD fid={fid}");
             }

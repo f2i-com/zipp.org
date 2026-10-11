@@ -81,7 +81,7 @@ mod computed_drop_liveness_tests {
 /// inlinable") cannot choose between the possible generalisations.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn nested_reject(why: &str) {
-    if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+    if crate::jitdecline_enabled() {
         eprintln!("[nested-reject] {why}");
     }
 }
@@ -502,7 +502,7 @@ impl<'p> Vm<'p> {
             return Default::default();
         }
         use crate::codegen::{TaPin, TaPinPlan, TaPinSrc};
-        let b192_log = std::env::var_os("ZIPP_JITLOG").is_some();
+        let b192_log = crate::jitlog_enabled();
         // Conservative "does this instruction write register r" cover. An op
         // missing here only weakens the hint (see above) — never soundness.
         fn writes(i: &Instr, r: u16) -> bool {
@@ -711,7 +711,7 @@ impl<'p> Vm<'p> {
             let call_written = call_result_candidate
                 && call_result_reaches_lookup_on_all_paths(&proto.code, s, e, lookup_ip, obj);
             if call_result_candidate && !call_written {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[pin] fn{func_id}@{aip} decline: call result not defined on every path"
                     );
@@ -719,7 +719,7 @@ impl<'p> Vm<'p> {
                 continue;
             }
             let src = if call_written {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!("[pin] fn{func_id}@{aip} call-result reaching-def all-paths");
                 }
                 TaPinSrc::Reg(obj)
@@ -729,7 +729,7 @@ impl<'p> Vm<'p> {
                         TaPinSrc::Global(idx)
                     }
                     Some(other) => {
-                        if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        if crate::jitlog_enabled() {
                             eprintln!("[pin] fn{func_id}@{aip} decline: writer {other:?}");
                         }
                         continue;
@@ -739,7 +739,7 @@ impl<'p> Vm<'p> {
                         // writes it (so the prologue/refetch reg read stays the
                         // value the accesses see).
                         if proto.code[s..=e].iter().any(|i| writes(i, obj)) {
-                            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                            if crate::jitlog_enabled() {
                                 eprintln!(
                                 "[pin] fn{func_id}@{aip} decline: live-in reg written in-region"
                             );
@@ -759,7 +759,7 @@ impl<'p> Vm<'p> {
                 TaPinSrc::Reg(r) => self.get(base, r),
             };
             if !live.is_heap() {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!("[pin] fn{func_id}@{aip} decline: live value not heap");
                 }
                 continue;
@@ -1111,7 +1111,7 @@ impl<'p> Vm<'p> {
         if e <= s || e >= caller.code.len() {
             return plans;
         }
-        let log = std::env::var_os("ZIPP_JITLOG").is_some();
+        let log = crate::jitlog_enabled();
         let stored_globals: rustc_hash::FxHashSet<u32> = caller.code[s..=e]
             .iter()
             .filter_map(|ins| match *ins {
@@ -1658,7 +1658,7 @@ impl<'p> Vm<'p> {
                     upval_alph: None,
                 },
             );
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 eprintln!(
                     "[fuse] fn{func_id}@{ip} RANDOM*{k}|0 fused (state g{state_slot}, callee fn{fid})"
                 );
@@ -1852,7 +1852,7 @@ impl<'p> Vm<'p> {
                     }),
                 },
             );
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 eprintln!(
                     "[fuse] fn{func_id}@{} RANDOM*len({k})|0 fused (upval alphabet, state g{state_slot}, callee fn{fid})",
                     ip + 1
@@ -1931,7 +1931,7 @@ impl<'p> Vm<'p> {
                 } else {
                     u64::MAX
                 };
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[cross] fn{caller_fid}@{call_ip} CROSS3 self arm against the entry this compile installs (mask={mask:#x})"
                     );
@@ -1939,7 +1939,7 @@ impl<'p> Vm<'p> {
                 (mask, None, None, self.jit.cross_mask_gen_after_set(fid, mask))
             }
             None => {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[cross] fn{caller_fid}@{call_ip} CROSS3 decline: no entry yet for callee fn{fid} (regs={}, params={}, argc={argc})",
                         callee.reg_count, callee.param_count
@@ -1963,7 +1963,7 @@ impl<'p> Vm<'p> {
             || uninit_mask == u64::MAX
             || (reg_count > 64 && !wide_empty)
         {
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 eprintln!(
                     "[cross] fn{caller_fid}@{call_ip} CROSS3 decline: plans={} mask_max={} regs={}",
                     json_walk.is_some() || markdown_inline.is_some(),
@@ -2045,7 +2045,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let (fid, closure) = self.ic_plain_fn(value)?;
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[cross] fn{func_id}@{ip} callee resolved from its definition: fn{fid} (IC empty)"
             );
@@ -2159,13 +2159,13 @@ impl<'p> Vm<'p> {
                     fid,
                     callee_regs: callee.reg_count.max(1),
                 });
-            if same_proto2.is_some() && std::env::var_os("ZIPP_JITLOG").is_some() {
+            if same_proto2.is_some() && crate::jitlog_enabled() {
                 eprintln!(
                     "[cross] fn{func_id}@{ip} SAME-PROTO-ARROW2 fn{fid} callee_regs={}",
                     callee.reg_count.max(1)
                 );
             }
-            if poly_fid && std::env::var_os("ZIPP_JITLOG").is_some() {
+            if poly_fid && crate::jitlog_enabled() {
                 eprintln!("[cross] fn{func_id}@{ip} POLY-FID generic live-resolution");
             }
             // B189b: the fully-emitted lane. Admitted only for the exactly
@@ -2178,7 +2178,7 @@ impl<'p> Vm<'p> {
             let cross3_unmetered = self.instr_rec.is_none();
             #[cfg(not(feature = "instrument"))]
             let cross3_unmetered = true;
-            if same_proto && std::env::var_os("ZIPP_JITLOG").is_some() {
+            if same_proto && crate::jitlog_enabled() {
                 eprintln!(
                     "[cross] fn{func_id}@{ip} CROSS3 gate: en={} unmet={} params={} argc={} lex={} strict={}",
                     crate::codegen::cross3_enabled(),
@@ -2207,7 +2207,7 @@ impl<'p> Vm<'p> {
                 {
                     let inserted = cross3.push(arm);
                     debug_assert!(inserted);
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         eprintln!("[cross] fn{func_id}@{ip} CROSS3 fn{fid} native-emitted lane");
                     }
                 }
@@ -2237,7 +2237,7 @@ impl<'p> Vm<'p> {
                         debug_assert!(inserted, "poly-FID CROSS3 exceeded IC ways");
                     }
                 }
-                if !cross3.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+                if !cross3.is_empty() && crate::jitlog_enabled() {
                     eprintln!(
                         "[cross] fn{func_id}@{ip} CROSS3-POLY-FID arms={} native-emitted lane",
                         cross3.len()
@@ -2354,7 +2354,7 @@ impl<'p> Vm<'p> {
                         mask_gen: self.jit.cross_mask_gen(fid),
                         uninit_mask,
                     };
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         eprintln!(
                             "[cross] fn{func_id}@{ip} CROSS3M fn{fid} shape={sh} slot={slot}"
                         );
@@ -2626,7 +2626,7 @@ impl<'p> Vm<'p> {
         }
         let caller = self.func(func_id as usize);
         let reg_window = caller.reg_count;
-        let log = std::env::var_os("ZIPP_JITLOG").is_some();
+        let log = crate::jitlog_enabled();
         for ip in start as usize..=end as usize {
             let Instr::Call {
                 argc,
@@ -3311,7 +3311,7 @@ impl<'p> Vm<'p> {
             // the real CallMethod activation.
             return plan;
         }
-        let log = std::env::var_os("ZIPP_JITLOG").is_some();
+        let log = crate::jitlog_enabled();
         let caller = self.func(func_id as usize);
         let reg_window = caller.reg_count;
         // The op at `ip` selects how the receiver's resolved member is inlined:
@@ -4185,7 +4185,7 @@ impl<'p> Vm<'p> {
         if !crate::codegen::mi_lane_enabled() {
             return None;
         }
-        let log = std::env::var_os("ZIPP_JITLOG").is_some();
+        let log = crate::jitlog_enabled();
         let fields = match self.mi_field_kinds(ridx, field_slots) {
             Some(f) => f,
             None => {

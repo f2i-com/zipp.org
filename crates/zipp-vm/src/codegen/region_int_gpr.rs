@@ -1570,7 +1570,7 @@ fn gpr_home_map(
     // When that alone doesn't fit but two more would, take r13/r14 anyway and
     // pay for each remaining guard with inline (movabs) constants — a few
     // bytes per guard against keeping the whole loop in registers.
-    if needs_guard && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if needs_guard && crate::jitlog_enabled() {
         // Which op keeps r13/r14 out of the pool: the first guarded
         // add/sub/neg/addint/mul. Two homes ride on this proof, so a region
         // that misses the pool by one or two is usually one missed elision.
@@ -1656,7 +1656,7 @@ fn gpr_home_map(
         }
         n_spill = used.len() - pool.len();
         if forced.len() > pool.len() || n_spill > spill_cap {
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
+            if crate::jitlog_enabled() {
                 // base_pool_len, not pool.len(): the spill path forcibly
                 // added r13/r14 above, and the ablation discipline diffs
                 // these lines against the pre-wave form (review fix, B123).
@@ -1692,7 +1692,7 @@ fn gpr_home_map(
         }
         m
     } else {
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] INT-GPR decline [{s},{e}]: {} homes > {} gprs",
                 used.len(),
@@ -2707,7 +2707,7 @@ pub(crate) fn compile_region_int_gpr(
             && plan.globs.iter().filter(|&&(_, x)| x == ax).count() == 1
             && plan.globs.iter().filter(|&&(_, x)| x == ox).count() == 1
     });
-    if std::env::var_os("ZIPP_JITLOG").is_some()
+    if crate::jitlog_enabled()
         && dv_reduce_candidate.is_some()
         && dv_reduce.is_none()
     {
@@ -2737,7 +2737,7 @@ pub(crate) fn compile_region_int_gpr(
             None => loc_src(g(r)),
         }
     };
-    if std::env::var_os("ZIPP_JITLOG").is_some() {
+    if crate::jitlog_enabled() {
         if n_spill > 0 {
             eprintln!(
                 "[jit] INT region [{start},{end}] GPR homes engaged ({} homes, {} lazy-sx, {} spilled)",
@@ -4430,7 +4430,7 @@ pub(crate) fn compile_region_int_gpr(
     };
     // W7 attribution: code-byte length with pins, so the hoist's size delta is
     // one grep away (run again under ZIPP_NO_GUARD_HOIST=1 and diff the line).
-    if !ta_plan.pins.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if !ta_plan.pins.is_empty() && crate::jitlog_enabled() {
         eprintln!(
             "[jit] INT-GPR region [{start},{end}] guard-hoist pins={}/{} len-fills={} code={}b",
             plan.hoist_pins.len(),
@@ -4494,7 +4494,7 @@ fn emit_gpr_region_restore(ops: &mut dynasmrt::x64::Assembler, frame: i32) {
 
 /// `ZIPP_JITLOG` note for the GPR sub-mode's otherwise silent declines.
 pub(crate) fn gpr_decline_note(tag: &str) {
-    if std::env::var_os("ZIPP_JITLOG").is_some() {
+    if crate::jitlog_enabled() {
         eprintln!("[jit] INT-GPR decline: {tag}");
     }
 }

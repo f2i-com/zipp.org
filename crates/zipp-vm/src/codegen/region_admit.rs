@@ -1227,7 +1227,7 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             // constraint, because "Call" alone (B75) cannot choose between the two
             // possible generalisations — N splices vs branch-target remapping.
             Instr::Call { .. } => {
-                if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+                if crate::jitdecline_enabled() {
                     let why = if !allow_one_call {
                         "outer-context-disallows-call"
                     } else if call_at.is_some() {
@@ -1334,7 +1334,7 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             // opcode makes the next whitelist candidate a guess, and guessing is
             // exactly what the flag exists to prevent.
             _ => {
-                if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+                if crate::jitdecline_enabled() {
                     eprintln!("[leaf-reject] {instr:?}");
                 }
                 return None;
@@ -1856,7 +1856,7 @@ pub(crate) fn compile_region(
     let filtered_plan;
     let fallback_plan = if push_pin_filter_enabled() {
         let (plan, stats) = filter_push_only_pins(proto, ta_plan);
-        if std::env::var_os("ZIPP_JITLOG").is_some() && stats.push_accesses != 0 {
+        if crate::jitlog_enabled() && stats.push_accesses != 0 {
             eprintln!(
                 "[jit] fallback push-pin filter fn{} [{start},{end}] pins={}->{} accesses={}->{} push_accesses={} dropped_push_only={} retained_shared={} remaining_push_only=0",
                 heap.func_id,

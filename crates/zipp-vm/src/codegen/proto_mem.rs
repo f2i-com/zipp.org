@@ -974,7 +974,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         return false;
     }
     if proto.is_generator || proto.is_async {
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!("[tierC-reject] generator/async");
         }
         return false;
@@ -983,7 +983,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
     // interpreter's call setup, not by emitted code — the native entry would skip
     // them. Stay interpreted.
     if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!("[tierC-reject] rest/arguments");
         }
         return false;
@@ -1017,7 +1017,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                 eprintln!($($arg)*);
                 ok = false;
             } else {
-                if std::env::var_os("ZIPP_JITLOG").is_some() { eprintln!($($arg)*); }
+                if crate::jitlog_enabled() { eprintln!($($arg)*); }
                 return false;
             }
         }};
@@ -2828,7 +2828,7 @@ pub(crate) fn compile_proto_mem(
     let py = has_py_ops(&proto.code);
     let protected_returns = tierc_protected_return_map(&proto.code);
     let method_own_slot_direct = meter.is_none() && tierc_method_own_slot_direct_enabled();
-    if method_own_slot_direct && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if method_own_slot_direct && crate::jitlog_enabled() {
         let sites = proto
             .code
             .iter()
@@ -2881,7 +2881,7 @@ pub(crate) fn compile_proto_mem(
     // `ZIPP_NO_INT32_TRUNC_ADD=1` the exact old emission.
     let trunc_arith = trunc_only_arith_ips(proto);
     let n_trunc_arith = trunc_arith.iter().filter(|&&t| t).count();
-    if n_trunc_arith != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if n_trunc_arith != 0 && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C int32-trunc arith sites={n_trunc_arith}");
     }
     let block_sroa = if meter.is_none() && tierc_block_sroa_enabled() {
@@ -2889,7 +2889,7 @@ pub(crate) fn compile_proto_mem(
     } else {
         TiercBlockSroaPlan::default()
     };
-    if !block_sroa.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if !block_sroa.is_empty() && crate::jitlog_enabled() {
         eprintln!(
             "[jit] fn{func_id} Tier-C block-SROA finalized={} arrays={} reads={}",
             block_sroa.finalized_sites, block_sroa.array_sites, block_sroa.reads
@@ -2915,7 +2915,7 @@ pub(crate) fn compile_proto_mem(
         }
     }
     let n_upval_forwards = upval_forward.iter().flatten().count();
-    if n_upval_forwards != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if n_upval_forwards != 0 && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C upval-forward sites={n_upval_forwards}");
     }
     let mut upval_inc = vec![None; n];
@@ -2933,7 +2933,7 @@ pub(crate) fn compile_proto_mem(
         }
     }
     let n_upval_incs = upval_inc.iter().flatten().count();
-    if n_upval_incs != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if n_upval_incs != 0 && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C upval-inc-i32 sites={n_upval_incs}");
     }
     let mut upval_xorshift = vec![None; n];
@@ -2957,7 +2957,7 @@ pub(crate) fn compile_proto_mem(
         .flatten()
         .map(|plan| usize::from(plan.count))
         .sum();
-    if n_upval_xorshift_chains != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if n_upval_xorshift_chains != 0 && crate::jitlog_enabled() {
         eprintln!(
             "[jit] fn{func_id} Tier-C upval-xorshift chains={n_upval_xorshift_chains} steps={n_upval_xorshift_steps}"
         );
@@ -2995,7 +2995,7 @@ pub(crate) fn compile_proto_mem(
     let str_append_cursor =
         tierc_str_append_cursor_plan(proto, random_fuse, &random_fuse_covered, meter);
     if let Some(plan) = str_append_cursor {
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] fn{func_id} Tier-C str-append-cursor ip={} acc=r{} source=r{} key=r{}",
                 plan.append_ip, plan.acc, plan.obj, plan.key
@@ -3008,7 +3008,7 @@ pub(crate) fn compile_proto_mem(
         .flatten()
         .map(|plan| usize::from(plan.count))
         .sum();
-    if n_global_xorshift_chains != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if n_global_xorshift_chains != 0 && crate::jitlog_enabled() {
         eprintln!(
             "[jit] fn{func_id} Tier-C global-xorshift chains={n_global_xorshift_chains} steps={n_global_xorshift_steps}"
         );
@@ -3136,7 +3136,7 @@ pub(crate) fn compile_proto_mem(
     // helper round-trips on every tiny Tier-C entry. The off-switch restores
     // the historical helper prologue for a same-binary process A/B.
     let direct_entry_bases = std::env::var_os("ZIPP_NO_TIERC_DIRECT_BASES").is_none();
-    if precise_entry_pins && std::env::var_os("ZIPP_JITLOG").is_some() {
+    if precise_entry_pins && crate::jitlog_enabled() {
         eprintln!(
             "[jit] fn{func_id} Tier-C entry-pins globals={} version-ic={} headroom={} method-global={} bases={}",
             needs_globals as u8,

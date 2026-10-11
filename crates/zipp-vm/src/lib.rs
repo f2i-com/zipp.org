@@ -137,6 +137,45 @@ pub mod bench_support {
 }
 mod front;
 pub use front::set_pure_script_goal;
+/// A diagnostic switch that is set or not for the life of the process, read
+/// from the environment once.
+///
+/// `std::env::var_os` is not a load: on Windows it encodes the name, takes the
+/// process environment's lock and scans the block, twice, and allocates the
+/// answer. `ZIPP_JITLOG` alone was asked at 114 sites, on every compile,
+/// region, inlined call and declined splice (2,231 times in one run of a
+/// markdown renderer, 1% of it).
+macro_rules! env_set_once {
+    ($(#[$attr:meta])* fn $name:ident() = $var:literal) => {
+        $(#[$attr])*
+        #[allow(dead_code)]
+        pub(crate) fn $name() -> bool {
+            use std::sync::atomic::{AtomicU8, Ordering};
+            static STATE: AtomicU8 = AtomicU8::new(0);
+            match STATE.load(Ordering::Relaxed) {
+                1 => true,
+                2 => false,
+                _ => {
+                    let on = std::env::var_os($var).is_some();
+                    STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                    on
+                }
+            }
+        }
+    };
+}
+env_set_once!(
+    /// Whether `ZIPP_JITLOG` is set.
+    fn jitlog_enabled() = "ZIPP_JITLOG"
+);
+env_set_once!(
+    /// Whether `ZIPP_JITDECLINE` is set.
+    fn jitdecline_enabled() = "ZIPP_JITDECLINE"
+);
+env_set_once!(
+    /// Whether `ZIPP_ICSTATS` is set.
+    fn icstats_enabled() = "ZIPP_ICSTATS"
+);
 mod heap;
 pub use heap::{note_every_block, note_large_block, LARGE_BLOCK_BYTES};
 /// Hand-written front end (lexer/AST/parser) being built to replace

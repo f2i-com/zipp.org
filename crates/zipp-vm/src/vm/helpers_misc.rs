@@ -1723,7 +1723,7 @@ mod tasnapshotstats {
             0 => false,
             1 => true,
             _ => {
-                let on = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let on = crate::icstats_enabled() as u8;
                 ON.store(on, Ordering::Relaxed);
                 on == 1
             }
@@ -1765,7 +1765,7 @@ pub(crate) mod haspropabsentstats {
             0 => false,
             1 => true,
             _ => {
-                let on = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let on = crate::icstats_enabled() as u8;
                 ON.store(on, Ordering::Relaxed);
                 on == 1
             }
@@ -3145,7 +3145,7 @@ mod icstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let v = crate::icstats_enabled() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -3353,7 +3353,7 @@ pub(crate) mod crossstats {
 
     #[cold]
     fn init() -> bool {
-        let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+        let v = crate::icstats_enabled() as u8;
         ON.store(v, Ordering::Relaxed);
         v == 1
     }
@@ -3447,7 +3447,7 @@ pub(crate) mod activationrootstats {
             0 => false,
             1 => true,
             _ => {
-                let on = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let on = crate::icstats_enabled() as u8;
                 ON.store(on, Ordering::Relaxed);
                 on == 1
             }
@@ -3512,7 +3512,7 @@ pub(crate) mod chainstats {
 
     #[cold]
     fn init() -> bool {
-        let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+        let v = crate::icstats_enabled() as u8;
         ON.store(v, Ordering::Relaxed);
         v == 1
     }
@@ -3605,7 +3605,7 @@ pub(crate) mod callstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let v = crate::icstats_enabled() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -3666,7 +3666,7 @@ pub(crate) mod computedcallstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let v = crate::icstats_enabled() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -5166,7 +5166,7 @@ mod concatsetstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let v = crate::icstats_enabled() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -5605,7 +5605,7 @@ impl<'p> Vm<'p> {
             // already rooted by its still-live interpreter Frame. B243: the
             // stack is a fixed array; a full stack declines before entry.
             if !self.jit_tierc_activation_stack.push(prior) {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] Tier-C activation-root stack full depth={} frame_free={frame_free}",
                         self.jit_tierc_activation_stack.len()
@@ -6174,7 +6174,7 @@ pub(crate) mod iterstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                let v = crate::icstats_enabled() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }

@@ -459,7 +459,7 @@ pub(crate) fn compile_region_mem(
     // frame's registers to the interpreter). `ZIPP_NO_INT32_TRUNC_ADD=1`
     // restores the overflow branch.
     let trunc_arith = trunc_only_arith_ips(proto);
-    if std::env::var_os("ZIPP_JITLOG").is_some() {
+    if crate::jitlog_enabled() {
         let sites = (s..=e).filter(|&ip| trunc_arith[ip]).count();
         if sites != 0 {
             eprintln!(
@@ -524,7 +524,7 @@ pub(crate) fn compile_region_mem(
         .flatten()
         .filter(|_| field_read_stream_enabled() && field_read_stream_shape(proto, s, e));
     if let Some(packed) = field_read_prefix {
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] MEM region fn{} [{start},{end}] field-read-stream prefix",
                 heap.func_id
@@ -559,7 +559,7 @@ pub(crate) fn compile_region_mem(
                 || (field_mixed_stream_enabled() && field_mixed_stream_shape(proto, s, e))
         });
     if let Some(packed) = field_write_prefix {
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+        if crate::jitlog_enabled() {
             eprintln!(
                 "[jit] MEM region fn{} [{start},{end}] field-write-stream prefix",
                 heap.func_id
@@ -1282,7 +1282,7 @@ pub(crate) fn compile_region_mem(
                 // bumps the live version word. It cannot allocate/re-enter or
                 // reallocate the Vec, so r13/r14 and every pin's identity/base/len
                 // remain valid and no post-call refetch is owed.
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!("[jit] MEM array DeleteIndex helper emitted at ip {ip}");
                 }
                 dynasm!(ops
@@ -1742,7 +1742,7 @@ pub(crate) fn compile_region_mem(
                             }
                             None => dynasm!(ops ; jmp => hp_done),
                         }
-                        if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        if crate::jitlog_enabled() {
                             eprintln!("[jit] MEM pinned HasProp absent lane emitted at ip {ip}");
                         }
                     }
@@ -1981,7 +1981,7 @@ pub(crate) fn compile_region_mem(
                     let off = ta_slot_off(slot);
                     let ql_generic = ops.new_dynamic_label();
                     let ql_no_probe = ql_no_probe.expect("string pin bypass label");
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         eprintln!(
                             "[jit] MEM region fn{} [{start},{end}] pinned-str-length ip={ip} slot={slot}",
                             heap.func_id
@@ -2504,7 +2504,7 @@ pub(crate) fn compile_region_mem(
                 let (ta_slow, ta_done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
                 if let Some((slot, _)) = arr_pinned {
                     use crate::vm::host_api::JIT_GEN_RAW_OFFSET;
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    if crate::jitlog_enabled() {
                         eprintln!("[jit] MEM region [{s},{e}] inline dense store at ip {ip}");
                     }
                     let off = ta_slot_off(slot);
@@ -2668,7 +2668,7 @@ pub(crate) fn compile_region_mem(
                 // with the receiver as `this`. A miss is a PURE prefix, so the
                 // interpreter can replay the complete computed lookup (getters,
                 // prototypes, proxies, natives, non-callables) unchanged.
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!("[jit] MEM dense CallMethodComputed helper emitted at ip {ip}");
                 }
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;

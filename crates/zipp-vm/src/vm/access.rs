@@ -23,7 +23,7 @@ mod htmlddastats {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("ZIPP_ICSTATS").is_some();
+                let on = crate::icstats_enabled();
                 ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }

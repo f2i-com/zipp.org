@@ -941,7 +941,7 @@ impl Jit {
         let plan = match py_region_plan(proto, start, end) {
             Ok(plan) => plan,
             Err(why) => {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                if crate::jitlog_enabled() {
                     eprintln!("[jit] PY region fn{func_id} [{start},{end}] DECLINED ({why})");
                 }
                 self.region_blacklist.insert(key);
@@ -987,7 +987,7 @@ impl Jit {
                 Some(&members),
             )
         });
-        let log = std::env::var_os("ZIPP_JITLOG").is_some();
+        let log = crate::jitlog_enabled();
         match compiled {
             Some(code) => {
                 if log {
