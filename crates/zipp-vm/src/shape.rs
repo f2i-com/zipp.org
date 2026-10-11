@@ -278,7 +278,7 @@ pub fn add(from: u32, key: &str, bits: u8) -> u32 {
                             // Verify: a hash collision must be a MISS, never a
                             // wrong shape.
                             let (k, b, id) = &n.next[pos as usize];
-                            if *b == bits && &**k == key {
+                            if *b == bits && crate::heap::key_eq(k, key) {
                                 return *id;
                             }
                             // A colliding edge overwrote the entry: the scan
@@ -297,7 +297,7 @@ pub fn add(from: u32, key: &str, bits: u8) -> u32 {
                 #[cfg(test)]
                 SCANNED.with(|c| c.set(c.get() + n.next.len()));
                 if let Some(&(_, _, id)) =
-                    n.next.iter().find(|(k, b, _)| *b == bits && &**k == key)
+                    n.next.iter().find(|(k, b, _)| *b == bits && crate::heap::key_eq(k, key))
                 {
                     return id;
                 }

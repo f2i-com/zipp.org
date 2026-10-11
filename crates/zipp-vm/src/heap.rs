@@ -22,6 +22,41 @@ use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
+/// Whether two property keys are the same text, compared here.
+///
+/// `a == b` on two strings is a length compare and a call to `memcmp`, and a
+/// property key is six or seven bytes: the call was the cost (4.6% of a loop
+/// that fills and empties sixty-key objects, on the index's confirm, the
+/// linear scan under twelve keys and the shape tree's edge). Up to sixteen
+/// bytes are compared as two overlapping words, or two half-words, or byte
+/// by byte under four; longer keys take the call.
+#[inline(always)]
+pub(crate) fn key_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let n = a.len();
+    if n != b.len() {
+        return false;
+    }
+    let word = |s: &[u8], at: usize| u64::from_le_bytes(s[at..at + 8].try_into().unwrap());
+    let half = |s: &[u8], at: usize| u32::from_le_bytes(s[at..at + 4].try_into().unwrap());
+    match n {
+        0 => true,
+        1..=3 => {
+            let mut i = 0;
+            while i < n {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        4..=7 => half(a, 0) == half(b, 0) && half(a, n - 4) == half(b, n - 4),
+        8..=16 => word(a, 0) == word(b, 0) && word(a, n - 8) == word(b, n - 8),
+        _ => a == b,
+    }
+}
+
 #[inline]
 fn vec_capacity_bytes<T>(v: &Vec<T>) -> usize {
     v.capacity().saturating_mul(std::mem::size_of::<T>())
@@ -295,7 +330,7 @@ impl PropIndex {
                     if ss == PROP_EMPTY {
                         return None;
                     }
-                    if st == tag && keys[ss as usize] == key {
+                    if st == tag && key_eq(&keys[ss as usize], key) {
                         return Some(ss as usize);
                     }
                     i = (i + 1) & mask;
@@ -310,7 +345,7 @@ impl PropIndex {
                     if ss == PROP_EMPTY {
                         return None;
                     }
-                    if tags[i] == tag && keys[ss as usize] == key {
+                    if tags[i] == tag && key_eq(&keys[ss as usize], key) {
                         return Some(ss as usize);
                     }
                     i = (i + 1) & mask;
@@ -2402,7 +2437,7 @@ impl ObjMap {
     pub fn pos(&self, key: &str) -> Option<usize> {
         match &self.index {
             Some(ix) => ix.find(&self.keys, key),
-            None => self.keys.iter().position(|k| k == key),
+            None => self.keys.iter().position(|k| key_eq(k, key)),
         }
     }
 
@@ -2413,7 +2448,7 @@ impl ObjMap {
     pub(crate) fn pos_tagged(&self, key: &str, tag: u32) -> Option<usize> {
         match &self.index {
             Some(ix) => ix.find_tagged(&self.keys, key, tag),
-            None => self.keys.iter().position(|k| k == key),
+            None => self.keys.iter().position(|k| key_eq(k, key)),
         }
     }
 
@@ -11222,4 +11257,32 @@ pub fn bench_floor_decompose(
         keep & 1
     ));
     lines
+}
+
+#[cfg(test)]
+mod key_eq_tests {
+    use super::key_eq;
+
+    #[test]
+    fn agrees_with_string_equality_at_every_length_and_position() {
+        let base: String = ('a'..='z').chain('A'..='Z').collect();
+        for n in 0..=40usize {
+            let a = &base[..n];
+            assert!(key_eq(a, a), "{a:?}");
+            assert!(key_eq(a, &a.to_string()), "{a:?} and its copy");
+            if n < 40 {
+                assert!(!key_eq(a, &base[..n + 1]), "{a:?} and one longer");
+            }
+            // One differing byte, at each position in turn.
+            for at in 0..n {
+                let mut other = a.as_bytes().to_vec();
+                other[at] = b'#';
+                let other = String::from_utf8(other).unwrap();
+                assert!(!key_eq(a, &other), "{a:?} vs {other:?}");
+                assert_eq!(key_eq(a, &other), a == other);
+            }
+        }
+        assert!(key_eq("caf\u{e9}", "caf\u{e9}"));
+        assert!(!key_eq("caf\u{e9}", "caf\u{e8}"));
+    }
 }
