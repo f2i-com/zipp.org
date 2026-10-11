@@ -855,24 +855,47 @@ impl<'p> Vm<'p> {
     #[inline(never)]
     pub(super) fn py_new(&mut self, func_id: u32, ip: usize, cls: Value, rt: Value, n: usize) -> Option<(Value, Value, Value)> {
         let (&entry_name, &init_name) = (ENTRY_NAMES.get(n)?, ENTRY_NAMES.get(n + 1)?);
-        if !cls.is_heap() || !self.py_plain_rec(cls) {
+        if !cls.is_heap() {
+            return None;
+        }
+        let ci = cls.heap_index();
+        // A callee this site found not plainly constructed (an exception
+        // class, a factory function, a class with `__new__`, or one not
+        // constructed yet, whose entry the runtime writes on its first
+        // construction), with the same entry still there: declined at once.
+        let e = self.py_ic(func_id, ip);
+        if e.kind == ic::NEW_NO && e.a == cls.bits() && self.heap.version_of(ci) == e.hver {
+            let same = e.pos == u32::MAX
+                || matches!(self.heap.get(ci), HeapObj::Object(m) if (e.pos as usize) < m.len() && m.val_at(e.pos as usize).bits() == e.b);
+            if same {
+                return None;
+            }
+        }
+        if !self.py_plain_rec(cls) {
             return None;
         }
         let p = self.py_rt_for(rt)?;
         let (ctors, tmpl, inst_shape) = (p.ctors, p.inst_tmpl, p.inst_shape);
-        let ci = cls.heap_index();
         // The class's entry for the count is the runtime's plain one.
         let want = match ctors.is_heap().then(|| self.heap.get(ctors.heap_index())) {
             Some(HeapObj::Array(items)) => *items.get(n)?,
             _ => return None,
         };
         // Where this site found the two entries last time (hints only).
-        let e = self.py_ic(func_id, ip);
         let (entry_hint, init_hint) = if e.kind == ic::NEW { (e.pos as usize, e.hver as usize) } else { (0, 0) };
-        let (have, entry_slot) = self.py_own_hinted(ci, entry_name, entry_hint)?;
-        if !want.is_heap() || have.bits() != want.bits() {
+        let found = self.py_own_hinted(ci, entry_name, entry_hint);
+        let Some((_, entry_slot)) = found.filter(|&(have, _)| want.is_heap() && have.bits() == want.bits()) else {
+            // Keys unchanged and the entry (or its absence) the same: the
+            // same answer (see the check above).
+            let hver = self.heap.version_of(ci);
+            let (pos, b) = match found.map(|(have, slot)| (u32::try_from(slot), have)) {
+                Some((Ok(slot), have)) => (slot, have.bits()),
+                Some((Err(_), _)) => return None,
+                None => (u32::MAX, 0),
+            };
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::NEW_NO, pos, hver, a: cls.bits(), b, ..PyIc::default() });
             return None;
-        }
+        };
         let init = self.py_hint_field(hint::CTOR_INIT, ci, "ctorInit")?;
         let (entry, init_slot) = if init == Value::NULL {
             if n != 0 {

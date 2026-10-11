@@ -1072,6 +1072,9 @@ impl<'a> Emitter<'a> {
             let args = self.array(regs)?;
             return self.call_positional(f, args);
         }
+        if ctor_site && py_call_op() {
+            return self.construct(f, regs);
+        }
         // One `PyCall`; the entry path below, out of line, when it declines
         // (not at a construction site, whose out-of-line `PyNew` path the
         // entry path keeps).
@@ -1093,6 +1096,66 @@ impl<'a> Emitter<'a> {
             return Ok(dst);
         }
         self.call_with_entry(f, regs, ctor_site)
+    }
+    /// [`Emitter::call_with`] at a site that likely constructs
+    /// (`ctor_site`): a class whose entry for the count is the runtime's
+    /// plain construction (`R.CTOR<n>`) is constructed inline as that entry
+    /// does it, the instance made (`PyNew`) into the first slot of a window
+    /// holding the arguments after it and its `__init__` entered with that
+    /// window (`PyCall`, which pushes its frame); `PyNew` declines anything
+    /// else having done nothing, and out of line the callee is then called
+    /// as at any other site (`PyCall`, then the positional path).
+    fn construct(&mut self, f: Reg, regs: &[Reg]) -> R<Reg> {
+        let n = regs.len();
+        let count = u16::try_from(n).map_err(|_| "too many call arguments")?;
+        let dst = self.alloc()?;
+        let win = self.block(n + 1)?;
+        for (i, &src) in regs.iter().enumerate() {
+            self.emit(Instr::Move { dst: win + 1 + i as Reg, src })?;
+        }
+        let (init, init_this) = (self.alloc()?, self.alloc()?);
+        let rt = self.r_rt;
+        let at_new = self.emit(Instr::PyNew { dst: win, entry: init, this_f: init_this, cls: f, rt, n: count, slow: 0 })?;
+        let mut built = Vec::new();
+        if n == 0 {
+            // No `__init__` at all: nothing to call.
+            let null = self.none()?;
+            let absent = self.alloc()?;
+            self.emit(Instr::Eq { dst: absent, a: init, b: null })?;
+            built.push(self.jump_if_true(absent)?);
+        }
+        let r = self.alloc()?;
+        let at_init = self.emit(Instr::PyCall { dst: r, f: init_this, arg_base: win, argc: count + 1, slow: 0 })?;
+        // `PyNew` found the `__init__`'s entry for the count, callable:
+        // called as the construction entry calls it if `PyCall` declines.
+        self.defer_cold(Vec::new(), vec![at_init], move |e| {
+            e.emit(Instr::CallWithThis { dst: r, callee: init, this_v: init_this, arg_base: win, argc: count + 1, name: NO_NAME })?;
+            Ok(())
+        });
+        let none = self.none()?;
+        let is_none = self.alloc()?;
+        self.emit(Instr::Eq { dst: is_none, a: r, b: none })?;
+        built.push(self.jump_if_true(is_none)?);
+        self.helper("initret", &[r])?;
+        let here = self.here();
+        for j in built {
+            self.patch(j, here)?;
+        }
+        self.emit(Instr::Move { dst, src: win })?;
+        // Any other callee: the call every other site makes, over the
+        // arguments in the window.
+        self.defer_cold(Vec::new(), vec![at_new], move |e| {
+            let at = e.emit(Instr::PyCall { dst, f, arg_base: win + 1, argc: count, slow: 0 })?;
+            e.defer_cold(Vec::new(), vec![at], move |e| {
+                let args = e.alloc()?;
+                e.emit(Instr::NewArray { dst: args, arg_base: win + 1, argc: count })?;
+                let r = e.call_positional(f, args)?;
+                e.emit(Instr::Move { dst, src: r })?;
+                Ok(())
+            });
+            Ok(())
+        });
+        Ok(dst)
     }
     /// [`Emitter::call_with`] through the entry (`PyCallEntry`, then
     /// `CallWithThis`), and at a construction site the inline `PyNew`.

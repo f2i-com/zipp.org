@@ -140,6 +140,10 @@ pub(super) mod ic {
     /// the runtime fills `gp` / `sp` on its own first read or write, after
     /// the site's first decline).
     pub const NOT_PLAIN_ASKED: u8 = 19;
+    /// `PyNew` at a site whose callee `a` (heap version `hver`) had an
+    /// entry for the count that is not the runtime's plain construction:
+    /// the instruction takes its slow edge while that record is unchanged.
+    pub const NEW_NO: u8 = 20;
 }
 
 /// One per-site cache entry (see the module comment); kind 0 is empty.

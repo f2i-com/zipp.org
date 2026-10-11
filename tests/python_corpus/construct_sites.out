@@ -1,0 +1,13 @@
+('NoInit', 0, (0, 10, 100), (0, -1, 100), 0, 0, 0, 0, Pt(x=0, y=0), ('made', 0), (0, 'v'), (0,), 0, 'Other')
+('NoInit', 100, (100, 10, 100), (100, -1, 100), 100, -100, 100, 200, Pt(x=100, y=-100), ('made', 100), (100, 'v'), (100,), 100, 'Other')
+('NoInit', 200, (200, 10, 100), (200, -1, 100), 200, -200, 200, 400, Pt(x=200, y=-200), ('made', 200), (200, 'v'), (200,), 200, 'Other')
+('NoInit', 300, (300, 10, 100), (300, -1, 100), 300, -300, 300, 600, Pt(x=300, y=-300), ('made', 300), (300, 'v'), (300,), -300, 'Other')
+('NoInit', 399, (399, 10, 100), (399, -1, 100), 399, -399, 399, 798, Pt(x=399, y=-399), ('made', 399), (399, 'v'), (399,), ('a', 399), 'Other')
+('TypeError', 'NoInit() takes no arguments')
+('TypeError', "One.__init__() missing 1 required positional argument: 'x'")
+('TypeError', 'One.__init__() takes 2 positional arguments but 3 were given')
+('TypeError', "Defaults.__init__() missing 1 required positional argument: 'x'")
+(1, 10, 2)
+[0, 1, 2, ('TypeError', "__init__() should return None, not 'int'"), 4]
+('TypeError', 'Base.__init__() takes 2 positional arguments but 3 were given')
+50 [48, 49, 50]
