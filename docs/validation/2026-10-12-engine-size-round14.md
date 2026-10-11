@@ -13,14 +13,13 @@ profile-guided) of `726ddfbf`, where the native gates also ran.
 
 ## Outcome
 
-- **Three defects in the released build are fixed.** Memory that grows in
+- **Two defects in the released build are fixed.** Memory that grows in
   place (a pushed array, a filling Map, an object gathering keys) never
   reached the collector: a WebAssembly instance trapped or a script was
   ended at its heap ceiling with a megabyte live, and `zipp` held 1.2 GB
   where Node peaks at 169 MB. An appending loop that started from the text
-  `"number"` rewrote the string `typeof` returns. Garbage held in blocks
-  under 4 KiB was never collected natively
-  ([below](#three-defects-in-the-released-build)).
+  `"number"` rewrote the string `typeof` returns
+  ([below](#two-defects-in-the-released-build)).
 - **WebAssembly size.** All four modules are smaller: Lite 61,228 bytes raw
   (2.3%) and 15,691 after Brotli (2.2%), JavaScript 172,979 (3.5%) and
   37,983 (3.1%), Python-base 140,161 (2.2%) and 19,245 (1.2%), Python +
@@ -59,9 +58,9 @@ profile-guided) of `726ddfbf`, where the native gates also ran.
   identifiers follow Unicode 17, Python's `strip` and `split` use Python's
   whitespace, Python step counts drop, and collections run where none did.
 
-## Three defects in the released build
+## Two defects in the released build
 
-All three are in 0.0.22 and in every release before it that has the code
+Both are in 0.0.22 and in every release before it that has the code
 concerned. They are fixed on this branch; no release has been cut.
 
 **Memory that grows in place never reached the collector** (`d24fe3e8`).
@@ -92,11 +91,12 @@ string `typeof` hands out, so `typeof 1` printed `number012...`
 afterwards. Present since 2 August. The engine's shared strings are now
 frozen against in-place appends (`JsStr::freeze_shared`).
 
-**Garbage in blocks under a page was never collected natively**
-(`04a31728`). An object given sixty properties keeps some 4 KB in blocks
-of half a kilobyte to a kilobyte and a half, and `zipp` reported blocks of
-4 KiB and more. 60,000 such objects, made and dropped by a loop that
-allocates nothing else, peaked at 232 MB in 0.0.22 (Node: 39 to 56 MB).
+**The first fix was not the whole of it** (`04a31728`). `d24fe3e8` had
+`zipp` report blocks of 4 KiB and more. An object given sixty properties
+keeps some 4 KB in blocks of half a kilobyte to a kilobyte and a half, so
+such objects, made and dropped by a loop that allocates nothing else, were
+as invisible as before: 60,000 of them peaked at 232 MB, as they do in
+0.0.22 (Node: 39 to 56 MB).
 `bench/real/polymorphic-objects` only looked well because each object's
 sixty key strings were allocations; when this pass's enumeration cache
 (`f8f5fe81`) took those away, the row ran no collection at all and its peak
@@ -498,14 +498,14 @@ CPython 3.13 beside:
 | `macro/nbody` | 28.0 | 27.3 | 9.2 | 0.97x | 2.97x |
 | `macro/oo_simulation` | 54.1 | 49.4 | 12.8 | 0.91x | 3.85x |
 | `macro/sort_heapq` | 23.4 | 18.9 | 5.9 | 0.81x | 3.23x |
-| `macro/torch_cnn` | 43.8 | 43.4 | | - | |
-| `macro/torch_dataloader` | 73.6 | 74.5 | | - | |
-| `macro/torch_matmul` | 4.5 | 4.4 | | - | |
-| `macro/torch_matmul_big` | 19.3 | 19.3 | | - | |
-| `macro/torch_mlp` | 92.6 | 93.3 | | - | |
-| `macro/torch_rnn` | 199.1 | 195.2 | | - | |
-| `macro/torch_small_ops` | 113.2 | 114.1 | | - | |
-| `macro/torch_transformer` | 108.7 | 107.8 | | - | |
+| `macro/torch_cnn` | 43.8 | 43.4 | | 0.99x | |
+| `macro/torch_dataloader` | 73.6 | 74.5 | | 1.01x | |
+| `macro/torch_matmul` | 4.5 | 4.4 | | 0.98x | |
+| `macro/torch_matmul_big` | 19.3 | 19.3 | | 1.00x | |
+| `macro/torch_mlp` | 92.6 | 93.3 | | 1.01x | |
+| `macro/torch_rnn` | 199.1 | 195.2 | | 0.98x | |
+| `macro/torch_small_ops` | 113.2 | 114.1 | | 1.01x | |
+| `macro/torch_transformer` | 108.7 | 107.8 | | 0.99x | |
 | `macro/word_count` | 31.8 | 30.9 | 10.0 | 0.97x | 3.09x |
 
 Median in-script work, ms. Geomeans as the tool prints them:

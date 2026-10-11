@@ -8,13 +8,13 @@ not run on any of it and no release has been cut. The record is
 [docs/validation/2026-10-12-engine-size-round14.md](docs/validation/2026-10-12-engine-size-round14.md),
 with its numbers in the `-evidence.json` beside it.
 
-**0.0.22 has three defects that this branch fixes.** Memory that grows in
+**0.0.22 has two defects that this branch fixes.** Memory that grows in
 place (a pushed array, a filling Map, an object gathering keys) never
 reached the collector: a WebAssembly instance trapped, or a script was ended
 at its heap ceiling with a megabyte live, and natively 2,000 calls building
-an array held 1.2 GB. `var s = "number"; s += x` in a loop rewrote the
-string `typeof` returns. Garbage in blocks under 4 KiB was never collected
-natively. A release that carries the fixes should say so.
+an array held 1.2 GB and 60,000 dropped sixty-key objects 232 MB.
+`var s = "number"; s += x` in a loop rewrote the string `typeof` returns.
+A release that carries the fixes should say so.
 
 What the pass did, against 0.0.22:
 
@@ -61,6 +61,11 @@ What the pass did, against 0.0.22:
   4% slower in Python + Torch.
 - `zipp-pyparse` still links core's float parser into the two Python
   modules: about 12 KB after Brotli each.
+- Code compiled by `eval` and `new Function` still counts as footprint
+  growth natively (only a Python import's is left out): 3,000 functions
+  made in a loop run 59 collections that free nothing, 1.2 ms in all. Their
+  bytecode is never freed, as before the pass: that loop holds 654 MB
+  (Node: 249).
 - Python, found by the agent that built the seven changes and not fixed:
   `heapq` pops equal items in a different order from CPython (it sifts down
   the textbook way); a `str` subclass instance does not hash as its value;
