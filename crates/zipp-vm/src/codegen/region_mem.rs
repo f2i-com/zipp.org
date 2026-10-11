@@ -2509,6 +2509,7 @@ pub(crate) fn compile_region_mem(
                     }
                     let off = ta_slot_off(slot);
                     let store = ops.new_dynamic_label();
+                    let barrier_free = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rax, [rbx + dreg(obj)]      // receiver bits
                         ; cmp rax, [rsp + off]            // identity vs snapshot
@@ -2518,11 +2519,22 @@ pub(crate) fn compile_region_mem(
                     dynasm!(ops
                         ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
                         ; jae => ta_slow                  // append/sparse/negative → helper
-                        // ── barrier fast path: the holder must be YOUNG ──
+                        // ── barrier fast path: a YOUNG holder, or a value
+                        // that is no heap value ── a number stored into an
+                        // array that has survived a collection needs no
+                        // barrier either (`write_barrier_val` does nothing
+                        // for it in both modes), and sending it to the helper
+                        // made every fill of a long-lived array three times
+                        // the cost of a fresh one's.
                         ; mov r10d, eax                   // holder heap index (low 32 bits)
                         ; mov r11, [rdi + JIT_GEN_RAW_OFFSET as i32]
                         ; test BYTE [r11 + r10], crate::heap::JIT_GEN_STATE_MASK as i8
-                        ; jnz => ta_slow                  // OLD/DIRTY holder → helper barrier
+                        ; jz => barrier_free
+                        ; mov r10, [rbx + dreg(val)]      // OLD/DIRTY holder:
+                        ; shr r10, 48
+                        ; cmp r10d, TAG_HEAP_HI as i32
+                        ; je => ta_slow                   // a heap value → helper barrier
+                        ; => barrier_free
                         // ── present element, or a licensed hole-fill ──
                         ; mov rdx, [rsp + off + 8]        // pinned items base
                         ; mov r11, [rdx + rcx * 8]        // items[i]
