@@ -34,6 +34,11 @@ fn enum_hoist_enabled() -> bool {
 const KEY_STR_CACHE_MAX_BYTES: usize = 64;
 const KEY_STR_CACHE_MAX_ENTRIES: usize = 8192;
 
+/// `Vm::enum_key_cache`'s bound, in shapes. Shapes themselves are bounded
+/// (`shape.rs`); a program past this many enumerated layouts builds each
+/// list as before.
+const ENUM_KEY_CACHE_MAX_SHAPES: usize = 4096;
+
 impl<'p> Vm<'p> {
     /// EnumerableOwnProperties (Object.keys / values / entries).
     ///
@@ -44,7 +49,71 @@ impl<'p> Vm<'p> {
     /// parked on the host-root stack for the whole walk; `obj` itself may be a
     /// fresh ToObject wrapper.
     pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
+        // `Object.keys` of a shaped plain object: its shape's cached list.
+        // (No getter, trap or namespace check can apply to such an object.)
+        if matches!(what, EnumWhat::Keys) && obj.is_heap() && self.shaped_plain_object(obj.heap_index()) {
+            let mut out = Vec::new();
+            if self.shaped_own_enum_keys(obj.heap_index(), &mut out) {
+                return Ok(self.alloc_array_current_realm(out));
+            }
+        }
         self.with_host_roots(&[obj], |vm| vm.object_enum_own_inner(obj, what))
+    }
+
+    /// Whether `idx` is an ordinary object whose keys live in its `ObjMap`
+    /// alone and whose shape names them: not the slot-backed global, not a
+    /// module namespace, not a constructor's map, and not in dictionary mode.
+    #[inline]
+    fn shaped_plain_object(&self, idx: u32) -> bool {
+        matches!(self.heap.get(idx), HeapObj::Object(m) if m.shape_guardable() && !m.is_ctor)
+            && !(idx == self.global_this && self.global_this != 0)
+            && (self.module_namespaces.is_empty() || !self.module_namespaces.contains_key(&idx))
+            && (self.deferred_ns_state.is_empty() || !self.deferred_ns_state.contains_key(&idx))
+    }
+
+    /// Append to `out` the own enumerable string keys of the shaped plain
+    /// object `idx` (see `shaped_plain_object`), in spec order, as the shared
+    /// key strings, from `Vm::enum_key_cache`; build the shape's entry the
+    /// first time. `false`, with `out` as it was, when the list cannot be
+    /// cached (a key too long for `key_str_cache`, or either cache full).
+    ///
+    /// A for-in snapshot or an `Object.keys` of such an object sorted its key
+    /// indices, filtered hidden and non-enumerable keys and looked each key's
+    /// string up by its text, every time: 130 to 150 ns an object of three
+    /// keys, where V8's enum cache answers in five.
+    pub(crate) fn shaped_own_enum_keys(&mut self, idx: u32, out: &mut Vec<Value>) -> bool {
+        let shape = match self.heap.get(idx) {
+            HeapObj::Object(m) => m.shape(),
+            _ => return false,
+        };
+        if let Some(keys) = self.enum_key_cache.get(&shape) {
+            out.extend_from_slice(keys);
+            return true;
+        }
+        if self.enum_key_cache.len() >= ENUM_KEY_CACHE_MAX_SHAPES {
+            return false;
+        }
+        let texts: Vec<String> = match self.heap.get(idx) {
+            HeapObj::Object(m) => spec_key_order(&m.keys)
+                .into_iter()
+                .filter(|&i| !is_hidden_key(&m.keys[i]) && m.attr_at(i).enumerable)
+                .map(|i| m.keys[i].clone())
+                .collect(),
+            _ => return false,
+        };
+        let mut keys = Vec::with_capacity(texts.len());
+        for k in texts {
+            let v = self.alloc_key_str(k.clone());
+            // Only strings `key_str_cache` holds may be cached here: it is
+            // what keeps them alive.
+            if self.cached_key_str(&k) != Some(v) {
+                return false;
+            }
+            keys.push(v);
+        }
+        out.extend_from_slice(&keys);
+        self.enum_key_cache.insert(shape, keys.into_boxed_slice());
+        true
     }
 
     /// Is `k` (the canonical index `n`, when it is one below 2^32-1) still an
@@ -624,6 +693,41 @@ impl<'p> Vm<'p> {
         // `out` holds heap key strings while object_enum_own / object_own_property_names
         // re-enter and allocate — suspend GC for the scope.
         let _gc = self.gc_lock_guard();
+        // A shaped plain object on the default chain, whose only farther
+        // level is a barren %Object.prototype%: its own keys are the whole
+        // list, and its shape's cached list is them. The version licence the
+        // Array arm below takes is taken here too (receiver and
+        // %Object.prototype%, the latter in both anchor pairs): a key can
+        // leave this receiver only by a delete or a redefinition, both of
+        // which bump its version, so `ForInLive` answers from the versions
+        // instead of probing the key again on every visit.
+        if obj.is_heap() {
+            let idx = obj.heap_index();
+            let default_chain = self.obj_proto != 0
+                && idx != self.obj_proto
+                && !self.proto_of.contains_key(&idx)
+                && matches!(self.heap.get(idx), HeapObj::Object(m) if m.class.is_none());
+            if default_chain
+                && self.shaped_plain_object(idx)
+                && self.for_in_level_barren(self.obj_proto)
+            {
+                let mut out: Vec<Value> =
+                    vec![Value::UNDEFINED; crate::bytecode::FORIN_SNAPSHOT_PREFIX];
+                out[0] = obj;
+                if self.shaped_own_enum_keys(idx, &mut out) {
+                    if crate::codegen::forin_version_fast_enabled() {
+                        let anchor = Value::heap(self.obj_proto);
+                        let anchor_version = Value::int(self.heap.version_of(self.obj_proto) as i32);
+                        out[1] = Value::int(self.heap.version_of(idx) as i32);
+                        out[2] = anchor;
+                        out[3] = anchor_version;
+                        out[4] = anchor;
+                        out[5] = anchor_version;
+                    }
+                    return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+                }
+            }
+        }
         // The key Array is engine-private. Prefix it with receiver/version and
         // the two default-prototype anchor/version pairs so `ForInLive` can prove
         // that THIS snapshot's keyset is still live without re-parsing/probing

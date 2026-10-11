@@ -1569,6 +1569,11 @@ pub struct Vm<'p> {
     /// values are roots (`Vm::mark_roots`) and frozen, since many holders
     /// name each one.
     pub(crate) key_str_cache: rustc_hash::FxHashMap<Box<str>, Value>,
+    /// The own enumerable string keys an object of a given shape has, in
+    /// spec order, as `key_str_cache`'s strings (which root them): a shape
+    /// names a key sequence with its attributes, so every object of the
+    /// shape enumerates the same list. Filled by `shaped_own_enum_keys`.
+    pub(crate) enum_key_cache: rustc_hash::FxHashMap<u32, Box<[Value]>>,
     /// Per-function result of the conservative in-place-string-op scan. A
     /// function that can mutate a compiler-proved-unique string buffer must keep
     /// receiving a fresh literal representation, so none of its literals enter
