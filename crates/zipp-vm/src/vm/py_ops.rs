@@ -569,6 +569,12 @@ impl<'p> Vm<'p> {
         };
         let fv = self.get(base, f);
         let r = match self.py_call_target(func_id, ip, fv, argc) {
+            PyCallee::Lean(lean) => self.py_push_frame(&lean, fv, base, arg_base, argc, dst, ip + 1).map(|()| {
+                if argc < lean.params {
+                    self.py_fill_defaults(fv, lean.fid, argc as usize);
+                }
+                usize::MAX
+            }),
             PyCallee::Plain(fid, closure, entry) => self.setup_call(fid, closure, fv, base, arg_base, argc, dst, ip + 1, entry).map(|()| {
                 if (argc as usize) < self.func(fid as usize).param_count as usize {
                     self.py_fill_defaults(fv, fid, argc as usize);
@@ -706,8 +712,26 @@ impl<'p> Vm<'p> {
     /// `c<argc>` (the one its slow edge's `PyCallEntry` finds), as a plain
     /// function to push a frame for or another callable (a builtin, a
     /// generator function) to call as its slow edge's `CallWithThis` does.
+    ///
+    /// A site whose entry is a plain Python code object keeps it in its
+    /// cache entry (`b` the entry's bits, `c` its code object's id, register
+    /// count and parameter count, `d` its closure): while the record's entry
+    /// slot still holds those bits, the call is pushed from them
+    /// ([`Vm::py_push_frame`]) with neither the entry nor its code object
+    /// read. The slot is read on every call, as before, because the runtime
+    /// rewrites a record's entries in place (new defaults) without changing
+    /// its keys.
     fn py_call_target(&mut self, func_id: u32, ip: usize, f: Value, argc: u16) -> PyCallee {
         const ENTRIES: [&str; 13] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12"];
+        let cached = self.py_ic(func_id, ip);
+        if cached.kind == ic::CALL_ENTRY && cached.c != 0 && cached.a == f.bits() {
+            if let Some(lean) = self.py_lean_hit(&cached, f) {
+                return PyCallee::Lean(lean);
+            }
+            // The entry changed: forget the callee (the rest of the entry
+            // still names the record's slot).
+            self.py_ic_put(func_id, ip, PyIc { b: 0, c: 0, d: 0, ..cached });
+        }
         let Some(name) = ENTRIES.get(argc as usize) else {
             return PyCallee::Slow;
         };
@@ -724,7 +748,81 @@ impl<'p> Vm<'p> {
         if p.is_generator || p.is_async {
             return PyCallee::Other(e);
         }
+        // What `setup_call` binds as it is given for this callee: strict,
+        // so `this` as passed; no rest parameter; no `arguments`.
+        if p.is_strict && !p.lexical_this && p.rest_reg.is_none() && p.arguments_reg.is_none() {
+            let now = self.py_ic(func_id, ip);
+            if now.kind == ic::CALL_ENTRY && now.a == f.bits() {
+                let c = fid as u64 | ((p.reg_count.max(1) as u64) << 32) | ((p.param_count as u64) << 48);
+                self.py_ic_put(func_id, ip, PyIc { b: e.bits(), c, d: closure, ..now });
+            }
+        }
         PyCallee::Plain(fid, closure, e)
+    }
+
+    /// The plain callee a [`Instr::PyCall`] site's entry `e` records (see
+    /// [`Vm::py_call_target`]) when the record `f` still holds it.
+    #[inline]
+    fn py_lean_hit(&self, e: &PyIc, f: Value) -> Option<PyLean> {
+        if !f.is_heap() {
+            return None;
+        }
+        let fi = f.heap_index();
+        if self.heap.version_of(fi) != e.hver {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(fi) else {
+            return None;
+        };
+        let pos = e.pos as usize;
+        if pos >= m.len() || m.is_accessor_at(pos) || m.val_at(pos).bits() != e.b {
+            return None;
+        }
+        Some(PyLean { fid: e.c as u32, regs: (e.c >> 32) as u16, params: (e.c >> 48) as u16, closure: e.d, entry: Value::from_bits(e.b) })
+    }
+
+    /// Push the frame of the plain Python callee `lean` for a `PyCall`:
+    /// exactly what `setup_call` does for it (its code object is strict,
+    /// with no rest parameter, no `arguments` and no lexical `this`, so
+    /// `this` is bound as given and nothing else is built), from the numbers
+    /// the site's entry keeps. The frame limit, a register file that would
+    /// outgrow its pinned capacity, and a profiling run take `setup_call`
+    /// itself.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn py_push_frame(&mut self, lean: &PyLean, this_val: Value, caller_base: usize, arg_base: u16, argc: u16, dst: u16, caller_ip_next: usize) -> Result<(), Thrown> {
+        let new_base = self.regs.len();
+        let regs = (lean.regs as usize).max(1);
+        if self.frames.len() >= MAX_FRAMES || super::prof_py::on() || self.regs_would_overflow(new_base + regs) {
+            return self.setup_call(lean.fid, lean.closure, this_val, caller_base, arg_base, argc, dst, caller_ip_next, lean.entry);
+        }
+        self.regs.resize(new_base + regs, Value::UNDEFINED);
+        self.regs[new_base] = this_val;
+        let args = caller_base + arg_base as usize;
+        for i in 0..(argc as usize).min(lean.params as usize) {
+            let v = self.regs[args + i];
+            self.regs[new_base + 1 + i] = v;
+        }
+        let last = self.frames.len() - 1;
+        self.frames[last].ip = caller_ip_next;
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: args as u32,
+            argc,
+            is_eval: false,
+            func: lean.fid,
+            base: new_base,
+            ip: 0,
+            ret_dst: dst,
+            closure: lean.closure,
+            handlers: Vec::new(),
+            new_target,
+            callee: lean.entry,
+        });
+        Ok(())
     }
 
     /// A fused step raised (its own error, or one from code it ran): the
@@ -2008,10 +2106,23 @@ fn float_holds(op: PyCmpOp, x: f64, y: f64) -> bool {
 
 /// [`Vm::py_call_target`]'s answer.
 enum PyCallee {
+    /// A plain Python code object the site's entry records.
+    Lean(PyLean),
     /// A plain function: its id, closure and value.
     Plain(u32, u32, Value),
     /// Any other callable entry.
     Other(Value),
     /// No entry to call: the slow edge.
     Slow,
+}
+
+/// A `PyCall` site's plain Python callee, from its cache entry (see
+/// [`Vm::py_call_target`]): the code object's id, its closure, register
+/// count and parameter count, and the entry value.
+struct PyLean {
+    fid: u32,
+    closure: u32,
+    regs: u16,
+    params: u16,
+    entry: Value,
 }
