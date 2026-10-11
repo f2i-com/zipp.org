@@ -1,10 +1,11 @@
 # Zipp performance handoff
 
-### 12 October: fourteenth pass, local and unpushed
+### 12 October: fourteenth pass, on `main`
 
-`codex/engine-size-reduction` is 35 commits past `887d2149` (0.0.22) at
-`726ddfbf`, plus the commit that records them. Nothing is pushed, CI has
-not run on any of it and no release has been cut. The record is
+`main` was fast-forwarded to the fourteenth pass on 12 October, at the
+user's request: 35 commits past `887d2149` (0.0.22) to `726ddfbf`, plus the
+commits that record them. Every commit carries `[skip ci]`, so CI has not
+run on any of it, and no release has been cut. The record is
 [docs/validation/2026-10-12-engine-size-round14.md](docs/validation/2026-10-12-engine-size-round14.md),
 with its numbers in the `-evidence.json` beside it.
 

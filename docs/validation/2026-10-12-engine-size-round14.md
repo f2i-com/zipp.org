@@ -2,7 +2,9 @@
 
 Continues `codex/engine-size-reduction` from `887d2149`, the commit release
 0.0.22 and its Lite archive were cut from, through 35 commits to `726ddfbf`.
-Nothing is pushed, CI has not run and no release has been cut. The
+It was measured and gated locally and then pushed to `main` at the user's
+request with CI skipped: CI has not run on it and no release has been cut.
+The
 WebAssembly figures are measured against the released modules (the
 thirteenth pass's), and "released" below means them. The speed screen ran
 on the modules built at `aa76bf5d`; the two commits after it leave their
