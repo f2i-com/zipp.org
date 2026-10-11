@@ -429,7 +429,15 @@ impl<'a> FnCompiler<'a> {
                 // Annex B / modern valid ones (lone `]`, `a{,2}`, `[a-\d]`,
                 // `(?=a)*`, `\c1`, `\08`, lookbehind, `\p{L}` under `u`,
                 // `[\q{abc}]` under `v`).
-                if let Err(err) = regress::Regex::with_flags(&text, &**flags) {
+                //
+                // Through the iterator type the VM compiles with (a slice of
+                // code points): the regex parser is generic over it, and a
+                // `&str` here was a second copy of the whole parser, 31 KB of
+                // a module.
+                let code_points: Vec<u32> = text.chars().map(u32::from).collect();
+                if let Err(err) =
+                    regress::Regex::from_unicode(code_points.iter().copied(), &**flags)
+                {
                     return Err(format!(
                         "SyntaxError: invalid regular expression /{text}/{flags}: {err}"
                     ));
