@@ -171,6 +171,7 @@ impl<'p> Vm<'p> {
             py_rt: None,
             dynamic_ic_bytes: 0,
             const_string_cache: rustc_hash::FxHashMap::default(),
+            key_str_cache: rustc_hash::FxHashMap::default(),
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),
             const_string_cache_enabled: std::env::var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
             #[cfg(not(target_arch = "wasm32"))]

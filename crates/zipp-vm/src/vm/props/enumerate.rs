@@ -27,6 +27,13 @@ fn enum_hoist_enabled() -> bool {
     }
 }
 
+/// `Vm::key_str_cache`'s bounds: keys longer than this are not kept (a
+/// property named by a long computed string is rarely enumerated twice), and
+/// past this many entries new keys get fresh strings as before. 8,192 keys
+/// of at most 64 bytes with their heap strings are under 2 MiB.
+const KEY_STR_CACHE_MAX_BYTES: usize = 64;
+const KEY_STR_CACHE_MAX_ENTRIES: usize = 8192;
+
 impl<'p> Vm<'p> {
     /// EnumerableOwnProperties (Object.keys / values / entries).
     ///
@@ -673,6 +680,21 @@ impl<'p> Vm<'p> {
                     seen = Some(self.shadow_set_of(&plain_levels));
                 }
                 for i in emit {
+                    // A key enumerated before has its string already: no
+                    // copy of the key, no allocation. (The shadow set needs
+                    // the text, so a walk that has one takes the long way.)
+                    if seen.is_none() {
+                        let cached = match self.heap.get(idx) {
+                            HeapObj::Object(m) => {
+                                m.keys.get(i).and_then(|k| self.cached_key_str(k))
+                            }
+                            _ => None,
+                        };
+                        if let Some(kv) = cached {
+                            out.push(kv);
+                            continue;
+                        }
+                    }
                     let k = match self.heap.get(idx) {
                         HeapObj::Object(m) => match m.keys.get(i) {
                             Some(k) => k.clone(),
@@ -796,14 +818,39 @@ impl<'p> Vm<'p> {
         s
     }
 
-    /// Allocate property key `k` as the guest STRING it spells: an escaped
-    /// "@@…" key (`escape_guest_key`) reads back without its extra '@'.
+    /// Property key `k` as the guest STRING it spells: an escaped "@@…" key
+    /// (`escape_guest_key`) reads back without its extra '@'.
+    ///
+    /// One heap string per key text, from `Vm::key_str_cache`, when the key
+    /// is short and the cache has room; a fresh one otherwise, as before.
+    /// JavaScript strings have no identity, so which is not observable.
     pub(crate) fn alloc_key_str(&mut self, k: String) -> Value {
-        if k.as_bytes().starts_with(b"@@@") {
-            self.alloc_str(k[1..].to_string())
-        } else {
-            self.alloc_str(k)
+        if let Some(&cached) = self.key_str_cache.get(k.as_str()) {
+            return cached;
         }
+        let cacheable = k.len() <= KEY_STR_CACHE_MAX_BYTES
+            && self.key_str_cache.len() < KEY_STR_CACHE_MAX_ENTRIES;
+        let value = if k.as_bytes().starts_with(b"@@@") {
+            self.alloc_str(k[1..].to_string())
+        } else if cacheable {
+            self.alloc_str(k.clone())
+        } else {
+            return self.alloc_str(k);
+        };
+        if cacheable {
+            // Held here and by every enumeration it serves: no in-place
+            // append's own, so no grower may take it for an accumulator.
+            self.heap.freeze_shared_str(value.heap_index());
+            self.key_str_cache.insert(k.into_boxed_str(), value);
+        }
+        value
+    }
+
+    /// The cached string for a key, without building anything: the for-in
+    /// snapshot asks this first, so a key seen before costs one lookup.
+    #[inline]
+    pub(crate) fn cached_key_str(&self, k: &str) -> Option<Value> {
+        self.key_str_cache.get(k).copied()
     }
 
     /// Build a data property descriptor object `{value, writable, enumerable,

@@ -365,6 +365,10 @@ impl Vm<'_> {
         for &v in self.const_string_cache.values() {
             root_val!(v);
         }
+        // Enumeration's key strings: one per distinct key text, bounded.
+        for &v in self.key_str_cache.values() {
+            root_val!(v);
+        }
         // Strings interned at region-compile time whose bits are embedded in
         // native code (LoadConst immediates) — see `jit_const_strings`.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]

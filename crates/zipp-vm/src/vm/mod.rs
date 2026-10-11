@@ -1560,6 +1560,15 @@ pub struct Vm<'p> {
     /// are explicit GC roots because the map is VM-internal. See
     /// `const_cache.rs` for the mutation exclusion and resource bounds.
     const_string_cache: rustc_hash::FxHashMap<u64, Value>,
+    /// The heap string enumeration hands out for a property key, by the key's
+    /// stored text (`Vm::alloc_key_str`). `for (k in o)`, `Object.keys` and
+    /// their kin made a fresh string for every key of every object on every
+    /// pass: 77 ns a key against V8's 1.3, and every one of them young
+    /// garbage (485,000 of the 485,000 a walk of a 150,000-node tree
+    /// allocated). Bounded by `KEY_STR_CACHE_MAX_ENTRIES` short keys; the
+    /// values are roots (`Vm::mark_roots`) and frozen, since many holders
+    /// name each one.
+    pub(crate) key_str_cache: rustc_hash::FxHashMap<Box<str>, Value>,
     /// Per-function result of the conservative in-place-string-op scan. A
     /// function that can mutate a compiler-proved-unique string buffer must keep
     /// receiving a fresh literal representation, so none of its literals enter
