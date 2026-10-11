@@ -161,6 +161,18 @@ extern crate alloc;
 
 pub use crate::api::*;
 
+/// PATCH (see FORK.md): whether `c` has the Unicode property `ID_Start`, from
+/// the table behind `\p{ID_Start}` and a named group's first character. The
+/// engine's lexer asks here, so a module carries the property once.
+pub fn is_id_start(c: char) -> bool {
+    unicodetables::id_start_ranges().contains_identifier(c.into())
+}
+
+/// PATCH (see FORK.md): whether `c` has the Unicode property `ID_Continue`.
+pub fn is_id_continue(c: char) -> bool {
+    unicodetables::id_continue_ranges().contains_identifier(c.into())
+}
+
 /// PATCH (see VENDORED.md): `ZIPP_RXSTATS=1` classical-backtrack counters —
 /// (attempts, greedy 1-char backtrack pushes, retry iterations, possessive
 /// pushes elided, failed-run skips). See possessify.rs for the mechanism.

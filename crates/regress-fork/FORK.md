@@ -280,3 +280,11 @@ for sizes, paired performance measurements and the differential probe. Unit test
 cover every individual code unit, surrogate boundaries, forward/backward stepping,
 subinputs and scalar-equivalent budget boundaries (including prior exhaustion
 and saturating usage counters).
+
+## `ID_Start` / `ID_Continue` for the host's lexer
+
+`regress::is_id_start` and `regress::is_id_continue` (lib.rs) answer from the
+tables behind `\p{ID_Start}`, `\p{ID_Continue}` and a named group's name.
+ZIPP's JavaScript lexer calls them instead of linking a crate of its own for
+the same two properties, so a module carries each property once and the
+lexer, the regex properties and group names are on one Unicode version.

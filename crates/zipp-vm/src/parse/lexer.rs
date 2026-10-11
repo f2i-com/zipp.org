@@ -201,15 +201,21 @@ impl<'s> Lexer<'s> {
     ///   are Alphabetic but NOT `ID_Start` and were accepted, as was U+2E2F,
     ///   which is `Lm` but excluded from `ID_Start` by `Pattern_Syntax`.
     ///
-    /// The ASCII arm stays explicit rather than deferring to the crate: its
-    /// `ASCII_START` table excludes both `$` and `_`, so bailing out here first
-    /// and calling the `_unicode` variant is both correct and one lookup cheaper
-    /// on the hot path.
+    /// The ASCII arm is explicit: it is the hot path, and the table has
+    /// neither `$` nor `_`.
+    ///
+    /// The table is the regex engine's, the one behind `\p{ID_Start}` and a
+    /// named group's name. A crate of its own for the lexer was the same
+    /// property a second time in every module (10 KB), and not the same
+    /// Unicode: it took 12,823 code points that are unassigned in the
+    /// version the regex tables, Node 24 and the pinned Test262 are on
+    /// (17.0), so `var \u{558}` declared a variable that `/\p{ID_Start}/u`
+    /// did not match.
     fn is_id_start(c: char) -> bool {
         if c.is_ascii() {
             return c.is_ascii_alphabetic() || c == '$' || c == '_';
         }
-        unicode_id_start::is_id_start_unicode(c)
+        regress::is_id_start(c)
     }
 
     /// IdentifierPart — `ID_Continue`, plus ZWNJ/ZWJ which the spec adds
@@ -225,7 +231,7 @@ impl<'s> Lexer<'s> {
         if c.is_ascii() {
             return c.is_ascii_alphanumeric() || c == '$' || c == '_';
         }
-        c == '\u{200C}' || c == '\u{200D}' || unicode_id_start::is_id_continue_unicode(c)
+        c == '\u{200C}' || c == '\u{200D}' || regress::is_id_continue(c)
     }
 
     /// Whether `s` is exactly one IdentifierName as this lexer classifies

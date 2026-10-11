@@ -194,12 +194,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "unicode-id-start"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0825d2e09dcae814a4273c1e1435979d414ede25b2ee235b1545da6682483765"
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -282,7 +276,6 @@ dependencies = [
  "num-traits",
  "rustc-hash",
  "self_cell",
- "unicode-id-start",
  "zipp-pyparse",
  "zipp-regress",
 ]
