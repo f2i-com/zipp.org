@@ -349,7 +349,7 @@ impl<'a> Emitter<'a> {
             }
             ast::Expr::JoinedStr(j) => self.fstring(&j.values, depth + 1),
             ast::Expr::FormattedValue(f) => {
-                let part = self.fvalue(f, depth + 1)?;
+                let part = self.fvalue(f, false, depth + 1)?;
                 let arr = self.array(&[part])?;
                 self.helper("strjoin", &[arr])
             }
@@ -1250,14 +1250,33 @@ impl<'a> Emitter<'a> {
     }
 
     fn fstring(&mut self, values: &[ast::Expr], depth: usize) -> R<Reg> {
+        // A part that is a str whatever its value: a literal piece, or a
+        // value with a spec or a conversion (formatted by the runtime).
+        let known = |v: &ast::Expr| match v {
+            ast::Expr::Constant(_) => true,
+            ast::Expr::FormattedValue(f) => f.format_spec.is_some() || f.conversion.to_byte().is_some(),
+            _ => false,
+        };
+        // An int part may stay an int when the `Add` that joins it has a str
+        // on its other side (`"item" + 5n` is "item5", as `str(5)` would
+        // make it): the first part when the second is a known str, the
+        // second when the first is a str, and every later one, since the
+        // text joined so far is a str by then. Anything else (`f"{i}"`, the
+        // first of `f"{a}{b}"`) still becomes a str of its own.
+        let first_raw = self.fast && values.len() > 1 && known(&values[1]);
         let mut parts = Vec::new();
-        for v in values {
+        for (k, v) in values.iter().enumerate() {
+            let raw_int = match k {
+                0 => first_raw,
+                1 => self.fast && (known(&values[0]) || !first_raw),
+                _ => self.fast,
+            };
             match v {
                 ast::Expr::Constant(c) => match &c.value {
                     ast::Constant::Str(s) => parts.push(self.string(s)?),
                     _ => return Err(self.error(v, "unexpected f-string part")),
                 },
-                ast::Expr::FormattedValue(f) => parts.push(self.fvalue(f, depth)?),
+                ast::Expr::FormattedValue(f) => parts.push(self.fvalue(f, raw_int, depth)?),
                 other => parts.push(self.expr(other, depth)?),
             }
         }
@@ -1291,7 +1310,11 @@ impl<'a> Emitter<'a> {
         self.patch(fine, here)?;
         Ok(acc)
     }
-    fn fvalue(&mut self, f: &ast::ExprFormattedValue, depth: usize) -> R<Reg> {
+    /// One `{x}` of an f-string. `raw_int`: the `Add` joining it has a str
+    /// on its other side (see [`Self::fstring`]), so an int may stay an int
+    /// (one string made, not two, and no `ToStr`, which a compiled loop does
+    /// not admit).
+    fn fvalue(&mut self, f: &ast::ExprFormattedValue, raw_int: bool, depth: usize) -> R<Reg> {
         let value = self.expr(&f.value, depth)?;
         if self.fast && f.format_spec.is_none() && f.conversion.to_byte().is_none() {
             // `{x}` with no spec or conversion: a str is itself and an int
@@ -1306,7 +1329,11 @@ impl<'a> Emitter<'a> {
             self.patch(not_str, here)?;
             let is_int = self.typeof_is(value, "bigint")?;
             let slow = self.jump_if_false(is_int)?;
-            self.emit(Instr::ToStr { dst, a: value })?;
+            if raw_int {
+                self.emit(Instr::Move { dst, src: value })?;
+            } else {
+                self.emit(Instr::ToStr { dst, a: value })?;
+            }
             let done2 = self.jump()?;
             let here = self.here();
             self.patch(slow, here)?;
