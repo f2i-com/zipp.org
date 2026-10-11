@@ -93,6 +93,87 @@ impl Drop for GcGuard {
     }
 }
 
+/// A side table keyed by heap slot, as the collector prunes it.
+///
+/// Each sweep drops, from some fifty such tables, the entries whose slot it
+/// freed. Written at each table that was a closure a site, and so a copy of
+/// the table's retain loop a site: 29 KB of the minor's prune and 24 KB of the
+/// major's in a full module, and in Lite 82 copies of `retain` where there are
+/// 22 table types. The bodies below are out of line, one a type.
+trait SlotKeyed {
+    /// Keep the entries whose slot a major marked.
+    fn retain_marked(&mut self, marks: &[bool]);
+    /// Drop the entries of the slots a minor freed. `live` is false for
+    /// exactly those. Walks whichever is smaller, the table or the freed
+    /// list: the std tables' `retain` walks bucket capacity, which never
+    /// shrinks after a burst, so they compare `capacity()`; a `SlotTable`
+    /// walks its live entries and compares `len()`.
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]);
+}
+
+impl<V, S: std::hash::BuildHasher> SlotKeyed for std::collections::HashMap<u32, V, S> {
+    #[inline(never)]
+    fn retain_marked(&mut self, marks: &[bool]) {
+        self.retain(|&k, _| marks[k as usize]);
+    }
+
+    #[inline(never)]
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        if self.is_empty() {
+            return;
+        }
+        if self.capacity() <= freed.len() {
+            self.retain(|&k, _| live[k as usize]);
+        } else {
+            for i in freed {
+                self.remove(i);
+            }
+        }
+    }
+}
+
+impl<S: std::hash::BuildHasher> SlotKeyed for std::collections::HashSet<u32, S> {
+    #[inline(never)]
+    fn retain_marked(&mut self, marks: &[bool]) {
+        self.retain(|&k| marks[k as usize]);
+    }
+
+    #[inline(never)]
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        if self.is_empty() {
+            return;
+        }
+        if self.capacity() <= freed.len() {
+            self.retain(|&k| live[k as usize]);
+        } else {
+            for i in freed {
+                self.remove(i);
+            }
+        }
+    }
+}
+
+impl<V> SlotKeyed for crate::slot_table::SlotTable<V> {
+    #[inline(never)]
+    fn retain_marked(&mut self, marks: &[bool]) {
+        self.retain(|&k, _| marks[k as usize]);
+    }
+
+    #[inline(never)]
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        if self.is_empty() {
+            return;
+        }
+        if self.len() <= freed.len() {
+            self.retain(|&k, _| live[k as usize]);
+        } else {
+            for i in freed {
+                self.remove(i);
+            }
+        }
+    }
+}
+
 impl Vm<'_> {
     /// Pin everything allocated so far (called once, after setup + hoisting).
     pub(crate) fn set_gc_floor(&mut self) {
@@ -830,37 +911,37 @@ impl Vm<'_> {
         self.heap.obj_pool_refill_scope(false);
         let t_sweep = gcstats::now(stats);
         // Drop side-table entries whose keyed object was reclaimed.
-        self.proto_of.retain(|&k, _| marks[k as usize]);
+        self.proto_of.retain_marked(&marks);
         // Derived-ctor `this` state: a thrown-off constructor leaves these
         // entries behind deliberately (an escaped arrow may still complete the
         // super() later); once the placeholder itself is dead the entries must
         // go, or a recycled heap slot would inherit a TDZ mark / super() flag.
-        self.this_tdz.retain(|&k| marks[k as usize]);
-        self.super_called.retain(|&k| marks[k as usize]);
-        self.super_this.retain(|&k, _| marks[k as usize]);
-        self.prototypes.retain(|&k, _| marks[k as usize]);
-        self.class_proto_owner.retain(|&k, _| marks[k as usize]);
-        self.ctor_initial_name.retain(|&k, _| marks[k as usize]);
-        self.fn_props.retain(|&k, _| marks[k as usize]);
-        self.arr_props.retain(|&k, _| marks[k as usize]);
-        self.regexp_result_props.retain(|&k, _| marks[k as usize]);
-        self.zdt_tz.retain(|&k, _| marks[k as usize]);
-        self.temporal_cal.retain(|&k, _| marks[k as usize]);
+        self.this_tdz.retain_marked(&marks);
+        self.super_called.retain_marked(&marks);
+        self.super_this.retain_marked(&marks);
+        self.prototypes.retain_marked(&marks);
+        self.class_proto_owner.retain_marked(&marks);
+        self.ctor_initial_name.retain_marked(&marks);
+        self.fn_props.retain_marked(&marks);
+        self.arr_props.retain_marked(&marks);
+        self.regexp_result_props.retain_marked(&marks);
+        self.zdt_tz.retain_marked(&marks);
+        self.temporal_cal.retain_marked(&marks);
         // Idx-keyed FLAG sets must drop dead keys too, or a recycled slot
         // inherits the previous occupant's state (a fresh function would
         // report its name/length intrinsic deleted; a fresh array a frozen
         // length).
         self.deleted_callable_intrinsics
             .retain(|&(k, _)| marks[k as usize]);
-        self.array_length_nonwritable.retain(|&k| marks[k as usize]);
+        self.array_length_nonwritable.retain_marked(&marks);
         // Virtual lengths of sparse arrays (u32 values — nothing to trace; the
         // sparse ELEMENTS live in arr_props, rooted above).
-        self.array_js_len.retain(|&k, _| marks[k as usize]);
-        self.ab_max.retain(|&k, _| marks[k as usize]);
-        self.ta_tracking.retain(|&k| marks[k as usize]);
-        self.dv_tracking.retain(|&k| marks[k as usize]);
-        self.regexp_string_iters.retain(|&k, _| marks[k as usize]);
-        self.matchall_batches.retain(|&k, _| marks[k as usize]);
+        self.array_js_len.retain_marked(&marks);
+        self.ab_max.retain_marked(&marks);
+        self.ta_tracking.retain_marked(&marks);
+        self.dv_tracking.retain_marked(&marks);
+        self.regexp_string_iters.retain_marked(&marks);
+        self.matchall_batches.retain_marked(&marks);
         // Correctness never depends on this (the cache is keyed by the slot
         // version); it only stops a dead subject's units staying resident.
         if self
@@ -870,13 +951,13 @@ impl Vm<'_> {
         {
             self.regex_subject_units = None;
         }
-        self.method_brand.retain(|&k, _| marks[k as usize]);
-        self.instance_brand.retain(|&k, _| marks[k as usize]);
+        self.method_brand.retain_marked(&marks);
+        self.instance_brand.retain_marked(&marks);
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
         self.closure_eval_scope.retain(|&k, _| marks[k as usize]);
-        self.eval_scope_parent.retain(|&k, _| marks[k as usize]);
-        self.shadow_fn_realm.retain(|&k, _| marks[k as usize]);
-        self.private_fields.retain(|&k, _| marks[k as usize]);
+        self.eval_scope_parent.retain_marked(&marks);
+        self.shadow_fn_realm.retain_marked(&marks);
+        self.private_fields.retain_marked(&marks);
         // Keep declared-name records only for brands still referenced by a live
         // lexical chain or instance brand (these maps were just pruned by marks).
         if !self.brand_private_names.is_empty() {
@@ -890,30 +971,30 @@ impl Vm<'_> {
             self.brand_private_names
                 .retain(|b, _| live_brands.contains(b));
         }
-        self.shared_buffers.retain(|&k| marks[k as usize]);
-        self.immutable_buffers.retain(|&k| marks[k as usize]);
-        self.pinned_buffers.retain(|&k| marks[k as usize]);
+        self.shared_buffers.retain_marked(&marks);
+        self.immutable_buffers.retain_marked(&marks);
+        self.pinned_buffers.retain_marked(&marks);
         self.error_data.retain(|&k| marks[k as usize]);
-        self.arguments_objs.retain(|&k, _| marks[k as usize]);
+        self.arguments_objs.retain_marked(&marks);
         self.gen_args_obj
             .retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
-        self.fn_name_cells.retain(|&k| marks[k as usize]);
-        self.const_cells.retain(|&k| marks[k as usize]);
-        self.gen_callee.retain(|&k, _| marks[k as usize]);
-        self.module_body_results.retain(|&k| marks[k as usize]);
-        self.module_namespaces.retain(|&k, _| marks[k as usize]);
+        self.fn_name_cells.retain_marked(&marks);
+        self.const_cells.retain_marked(&marks);
+        self.gen_callee.retain_marked(&marks);
+        self.module_body_results.retain_marked(&marks);
+        self.module_namespaces.retain_marked(&marks);
         self.closure_home.retain(|&k, _| marks[k as usize]);
-        self.closure_new_target.retain(|&k, _| marks[k as usize]);
-        self.dispose_stacks.retain(|&k, _| marks[k as usize]);
+        self.closure_new_target.retain_marked(&marks);
+        self.dispose_stacks.retain_marked(&marks);
         // Pure-bytes side table (no Values to trace): hygiene-retain only, so a
         // recycled RegExp slot can't inherit a dead pattern's exact source.
-        self.regexp_exact_source.retain(|&k, _| marks[k as usize]);
+        self.regexp_exact_source.retain_marked(&marks);
         // Collection hash index (u32 hash tags -> u32 slots, no Values): drop
         // a dead Map/Set's index so a recycled slot can't inherit a stale one.
-        self.collection_index.retain(|&k, _| marks[k as usize]);
-        self.async_stacks.retain(|&k| marks[k as usize]);
-        self.shadow_realms.retain(|&k| marks[k as usize]);
-        self.realm_globals.retain(|&k, _| marks[k as usize]);
+        self.collection_index.retain_marked(&marks);
+        self.async_stacks.retain_marked(&marks);
+        self.shadow_realms.retain_marked(&marks);
+        self.realm_globals.retain_marked(&marks);
 
         let free_after = self.heap.free_indices().len();
         gcstats::record(
@@ -1134,43 +1215,19 @@ impl Vm<'_> {
         // walk is cheaper.
         macro_rules! prune_map {
             ($t:expr) => {
-                if !$t.is_empty() {
-                    if $t.capacity() <= freed.len() {
-                        $t.retain(|&k, _| live_bits[k as usize]);
-                    } else {
-                        for i in freed {
-                            $t.remove(i);
-                        }
-                    }
-                }
+                $t.prune_freed(freed, live_bits)
             };
         }
         // Same, for slot-keyed std HashSet (one-argument retain closure).
         macro_rules! prune_set {
             ($t:expr) => {
-                if !$t.is_empty() {
-                    if $t.capacity() <= freed.len() {
-                        $t.retain(|&k| live_bits[k as usize]);
-                    } else {
-                        for i in freed {
-                            $t.remove(i);
-                        }
-                    }
-                }
+                $t.prune_freed(freed, live_bits)
             };
         }
         // Same, for `SlotTable` (dense retain walk, O(1) removes).
         macro_rules! prune_slots {
             ($t:expr) => {
-                if !$t.is_empty() {
-                    if $t.len() <= freed.len() {
-                        $t.retain(|&k, _| live_bits[k as usize]);
-                    } else {
-                        for i in freed {
-                            $t.remove(i);
-                        }
-                    }
-                }
+                $t.prune_freed(freed, live_bits)
             };
         }
         // One entry per retain in the major block above, same order, so the
@@ -1208,7 +1265,17 @@ impl Vm<'_> {
         if !self.brand_owner.is_empty() {
             self.brand_owner.retain(|_, &mut c| live_bits[c as usize]);
         }
-        prune_map!(self.closure_eval_scope);
+        // A guarded wrapper with its own `retain` and `remove`, not a std
+        // map: pruned here as the macro used to prune every table.
+        if !self.closure_eval_scope.is_empty() {
+            if self.closure_eval_scope.capacity() <= freed.len() {
+                self.closure_eval_scope.retain(|&k, _| live_bits[k as usize]);
+            } else {
+                for i in freed {
+                    self.closure_eval_scope.remove(i);
+                }
+            }
+        }
         prune_map!(self.eval_scope_parent);
         prune_map!(self.shadow_fn_realm);
         prune_map!(self.private_fields);
