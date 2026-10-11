@@ -3508,6 +3508,14 @@ impl JsStr {
         self.memo_state & STR_MEMO_FROZEN != 0
     }
 
+    /// Mark a string the engine hands out by handle to many holders, so that
+    /// no in-place grower takes it for its own: every one of them declines a
+    /// frozen accumulator and builds a fresh string.
+    #[inline]
+    fn freeze_shared(&mut self) {
+        self.memo_state |= STR_MEMO_FROZEN;
+    }
+
     /// True only for a size-bounded B212 `const + int` result. B253 may use
     /// this stable head once; its own frozen results deliberately clear the
     /// provenance so suffix chaining remains bounded to one link.
@@ -7097,6 +7105,14 @@ impl Heap {
     pub(crate) fn rebase_footprint(&mut self) {
         self.footprint_settling = true;
         self.footprint_gc_at = 0;
+    }
+
+    /// Freeze the string at `idx` as one the engine shares by handle (see
+    /// `JsStr::freeze_shared`). Anything else there is left alone.
+    pub(crate) fn freeze_shared_str(&mut self, idx: u32) {
+        if let HeapObj::Str(s) = &mut self.objs[idx as usize] {
+            s.freeze_shared();
+        }
     }
 
     /// Whether footprint growth asked for a payload walk, clearing the ask.

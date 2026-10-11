@@ -308,8 +308,17 @@ impl<'p> Vm<'p> {
         // `Vm::typeof_value`: the unfused `TypeOf` op previously allocated a
         // fresh string per evaluation (65ns) and made the `t === "number"` that
         // follows a content compare.
+        //
+        // Frozen: `resolve_const` answers a LITERAL that spells one of these
+        // with the same handle, and a literal can open a string accumulator.
+        // `var s = "number"; for (...) s += i` appended in place to the one
+        // "number" the engine has, and `typeof 1` printed `number012` from
+        // then on, in every tier and every release since the handles were
+        // shared.
         for (i, name) in crate::bytecode::TYPEOF_NAMES.iter().enumerate() {
-            self.typeof_strs[i] = self.alloc_str((*name).to_string());
+            let interned = self.alloc_str((*name).to_string());
+            self.heap.freeze_shared_str(interned.heap_index());
+            self.typeof_strs[i] = interned;
         }
         // A built-in method property: a native function, non-enumerable but
         // writable + configurable (matching built-in method descriptors).
