@@ -5863,6 +5863,12 @@ pub struct Heap {
     footprint_gc_at: usize,
     footprint_at_look: usize,
     allocs_at_look: usize,
+    /// The level the last major left (or setup, before any), and whether
+    /// the level being waited for (`footprint_settling`) is to become it.
+    #[cfg(not(feature = "safe-sandbox"))]
+    footprint_at_major: usize,
+    #[cfg(not(feature = "safe-sandbox"))]
+    footprint_settling_major: bool,
     /// Objects every collection so far has swept; with `live` it numbers the
     /// allocations ([`Heap::alloc_seq`]) without a counter on that path.
     swept_total: usize,
@@ -5871,9 +5877,9 @@ pub struct Heap {
     /// since growth in place is in no cheap figure.
     #[cfg_attr(not(feature = "instrument"), allow(dead_code))]
     growth_walk_due: bool,
-    /// A major has finished and its level has not been read yet: the sweep's
-    /// payloads may still be with the courier. `footprint_gc_at` is zero
-    /// meanwhile, so the next allocation or change looks.
+    /// A collection has finished and its level has not been read yet: the
+    /// sweep's payloads may still be with the courier. `footprint_gc_at` is
+    /// zero meanwhile, so the next allocation or change looks.
     footprint_settling: bool,
     /// Bytes of large payload allocated since the last collection.
     ///
@@ -6060,8 +6066,15 @@ const BIG_PAYLOAD_GC_AT: usize = 8 * 1024 * 1024;
 /// and is read to no effect, in any other.
 pub static ALLOCATOR_NET_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-/// The size from which an allocator reports a block.
-pub const LARGE_BLOCK_BYTES: usize = 4096;
+/// The size from which an allocator that reports large blocks reports one.
+///
+/// Not a page: an object of sixty properties keeps its keys, values and
+/// index in blocks of half a kilobyte to a kilobyte and a half, 4 KB in all,
+/// and a loop that makes and drops such objects holds megabytes the count
+/// schedule cannot see while every block is under 4 KiB. Most allocations
+/// (a string, a small object's vectors, a box) are under this and cost the
+/// reporter one compare.
+pub const LARGE_BLOCK_BYTES: usize = 256;
 
 /// Report one block's size change to [`ALLOCATOR_NET_BYTES`]: an allocation
 /// (`old_size` 0), a release (`new_size` 0) or a reallocation. Blocks under
@@ -6131,21 +6144,29 @@ fn footprint_bytes() -> usize {
 }
 
 /// Footprint growth between looks. Under a heap ceiling the step is the byte
-/// schedule's own. Without one a major costs what the heap holds whatever it
-/// frees, so the step is wider: at 32 MiB a tokenizer filling its (live)
-/// integer arrays paid one major of 2.6 ms for nothing, and at 64 MiB the
-/// loop of dropped megabyte arrays still peaks under half of Node's resident
-/// size.
+/// schedule's own, and growth in few objects asks for a major at each.
+///
+/// Without a ceiling a step in few objects asks for a MINOR: what such a loop
+/// drops is young, a minor frees it and costs what is young. A major costs
+/// what the heap holds whatever it frees (at 32 MiB a tokenizer filling its
+/// live integer arrays paid one of 2.6 ms for nothing), so one is asked for
+/// only from what a minor could not free: when the level a minor leaves,
+/// whichever schedule asked for that minor, is `FOOTPRINT_MAJOR_STEP` over
+/// the level the last major left, or a quarter of that level if that is
+/// more. That is the old generation's growth, live or not, and the quarter
+/// keeps a program that holds a gigabyte from a major every step of the way.
 #[cfg(feature = "safe-sandbox")]
 const FOOTPRINT_STEP: usize = BIG_PAYLOAD_GC_AT;
 #[cfg(not(feature = "safe-sandbox"))]
-const FOOTPRINT_STEP: usize = 64 * 1024 * 1024;
+const FOOTPRINT_STEP: usize = 16 * 1024 * 1024;
+#[cfg(not(feature = "safe-sandbox"))]
+const FOOTPRINT_MAJOR_STEP: usize = 64 * 1024 * 1024;
 
-/// Growth a major is asked for: at least this many bytes for each object
-/// allocated meanwhile. Below it the heap is growing by its objects, which the
-/// count schedule already paces (and a major there costs what the heap holds,
-/// for nothing: a Map filling with strings is live). Above it the bytes are in
-/// few objects, which that schedule cannot see and a major walks quickly.
+/// Growth a collection is asked for: at least this many bytes for each
+/// object allocated meanwhile. Below it the heap is growing by its objects,
+/// which the count schedule already paces (and a major there costs what the
+/// heap holds, for nothing: a Map filling with strings is live). Above it the
+/// bytes are in few objects, which that schedule cannot see.
 const FOOTPRINT_BYTES_PER_ALLOC: usize = 1024;
 
 /// Growth a payload walk is asked for under a ceiling, by the same measure.
@@ -6355,6 +6376,10 @@ impl Heap {
             footprint_gc_at: footprint_bytes().saturating_add(FOOTPRINT_STEP),
             footprint_at_look: footprint_bytes(),
             allocs_at_look: live,
+            #[cfg(not(feature = "safe-sandbox"))]
+            footprint_at_major: footprint_bytes(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            footprint_settling_major: false,
             swept_total: 0,
             growth_walk_due: false,
             footprint_settling: false,
@@ -7098,12 +7123,25 @@ impl Heap {
     pub(crate) fn note_footprint_growth(&mut self) {
         let now = footprint_bytes();
         if self.footprint_settling {
-            // The level a major left is what the next step is measured from,
-            // and it is only that once the courier has dropped what the
-            // sweep handed it.
+            // The level a collection left is what the next step is measured
+            // from, and it is only that once the courier has dropped what
+            // the sweep handed it.
             if !gc_courier::in_flight() {
                 self.footprint_settling = false;
                 self.look_at_footprint(now);
+                #[cfg(not(feature = "safe-sandbox"))]
+                if std::mem::take(&mut self.footprint_settling_major) {
+                    self.footprint_at_major = now;
+                } else if now.saturating_sub(self.footprint_at_major)
+                    >= FOOTPRINT_MAJOR_STEP.max(self.footprint_at_major / 4)
+                {
+                    // What a minor left: the old generation has grown a
+                    // major step, and only a major can say how much of it
+                    // is garbage (objects that were promoted and then
+                    // dropped, with what they hold).
+                    self.gc_requested = true;
+                    self.major_due = true;
+                }
             }
             return;
         }
@@ -7123,8 +7161,13 @@ impl Heap {
             self.gc_requested = true;
         }
         if in_few_objects {
+            // A minor without a ceiling (see `FOOTPRINT_STEP`): whether a
+            // major follows is decided from the level that minor leaves.
             self.gc_requested = true;
-            self.major_due = true;
+            #[cfg(feature = "safe-sandbox")]
+            {
+                self.major_due = true;
+            }
         }
     }
 
@@ -7132,22 +7175,20 @@ impl Heap {
     fn look_at_footprint(&mut self, now: usize) {
         self.footprint_at_look = now;
         self.allocs_at_look = self.alloc_seq();
-        // Without a ceiling the next look is also a quarter of what is held
-        // away, so a program that keeps a gigabyte in a few objects is not
-        // collected every 64 MiB of the way there.
-        #[cfg(not(feature = "safe-sandbox"))]
-        let step = FOOTPRINT_STEP.max(now / 4);
-        #[cfg(feature = "safe-sandbox")]
-        let step = FOOTPRINT_STEP;
-        self.footprint_gc_at = now.saturating_add(step);
+        self.footprint_gc_at = now.saturating_add(FOOTPRINT_STEP);
     }
 
     /// Measure footprint growth from the level in force now, read at the next
     /// allocation or change: what setup and the compiler reserved is not
-    /// growth a collection could answer.
+    /// growth a collection could answer. The level is also the one a major
+    /// step is measured from.
     pub(crate) fn rebase_footprint(&mut self) {
         self.footprint_settling = true;
         self.footprint_gc_at = 0;
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            self.footprint_settling_major = true;
+        }
     }
 
     /// Freeze the string at `idx` as one the engine shares by handle (see
@@ -8435,6 +8476,14 @@ impl Heap {
         self.courier_flush();
         self.swept_total = self.swept_total.wrapping_add(self.live.saturating_sub(live));
         self.live = live;
+        // What a minor freed is off the footprint too: the next step is
+        // measured from the level it left, once that is read. The major's
+        // level is not moved; the level read is compared with it.
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            self.footprint_settling = true;
+            self.footprint_gc_at = 0;
+        }
         // Refresh the sweep-amortisation floor: the slot vector may have
         // grown since the last major, and a major sweep walks all of it.
         self.major_at = self.major_at.max(self.objs.len() / 2);

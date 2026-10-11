@@ -24,6 +24,9 @@ struct Reporting;
 
 static NET: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Every block, whatever the engine is told of: what a process holds.
+static ALL_NET: AtomicUsize = AtomicUsize::new(0);
+static ALL_PEAK: AtomicUsize = AtomicUsize::new(0);
 
 fn note(old: usize, new: usize) {
     // As the builds do: every block in the checked profile (the WebAssembly
@@ -32,6 +35,12 @@ fn note(old: usize, new: usize) {
     zipp_vm::note_every_block(old, new);
     #[cfg(not(feature = "safe-sandbox"))]
     zipp_vm::note_large_block(old, new);
+    let all = if new >= old {
+        ALL_NET.fetch_add(new - old, Ordering::Relaxed) + (new - old)
+    } else {
+        ALL_NET.fetch_sub(old - new, Ordering::Relaxed) - (old - new)
+    };
+    ALL_PEAK.fetch_max(all, Ordering::Relaxed);
     let old = if old >= zipp_vm::LARGE_BLOCK_BYTES { old } else { 0 };
     let new = if new >= zipp_vm::LARGE_BLOCK_BYTES { new } else { 0 };
     let now = if new >= old {
@@ -86,6 +95,15 @@ fn peak_growth<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (value, PEAK.load(Ordering::Relaxed).saturating_sub(start))
 }
 
+/// As [`peak_growth`], over every block the allocator handed out.
+#[cfg(not(feature = "safe-sandbox"))]
+fn peak_growth_of_all<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let start = ALL_NET.load(Ordering::Relaxed);
+    ALL_PEAK.store(start, Ordering::Relaxed);
+    let value = f();
+    (value, ALL_PEAK.load(Ordering::Relaxed).saturating_sub(start))
+}
+
 /// Each iteration makes one array and stores at index 131,071, which fills a
 /// megabyte in place, then drops it. Nothing else is allocated.
 const DROPPED_ARRAYS: &str = r#"
@@ -124,6 +142,37 @@ console.log(t);
     assert!(
         grew < 256 * MIB,
         "300 dropped pushed arrays left {} MiB outstanding at the peak",
+        grew / MIB
+    );
+
+    // Garbage in blocks under a page. An object given sixty properties
+    // keeps some 4 KB in blocks of half a kilobyte to a kilobyte and a half,
+    // and the loop allocates nothing but the object: the count schedule sees
+    // 30,000 small allocations where there are 120 MB. While only blocks of
+    // a page were reported no collection ran (bench/real/polymorphic-objects
+    // peaked at 150 MB, Node at 47). Measured over every block, so the bound
+    // does not move with what the engine is told of.
+    let src = r#"
+var keys = [];
+for (var j = 0; j < 60; j++) keys.push("k" + j);
+function fill(n) {
+  var s = 0;
+  for (var d = 0; d < n; d++) {
+    var o = {};
+    for (var j = 0; j < 60; j++) o[keys[j]] = d + j;
+    s = (s + o.k59) | 0;
+  }
+  return s;
+}
+console.log(fill(30000));
+"#;
+    let (out, grew) = peak_growth_of_all(|| zipp_vm::run(src).expect("source compiles"));
+    assert!(out.error.is_none(), "unexpected error: {:?}", out.error);
+    assert_eq!(out.output, vec!["451755000".to_string()]);
+    // 38 MiB with the collections; 112 MiB without them.
+    assert!(
+        grew < 80 * MIB,
+        "30,000 dropped sixty-key objects left {} MiB outstanding at the peak",
         grew / MIB
     );
 
