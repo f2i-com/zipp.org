@@ -208,24 +208,49 @@ impl Vm<'_> {
     /// Every loop back-edge and frame transition polls this. The checked
     /// profile's size-first build would not inline it on a hint, and the call
     /// was 4% of an integer loop there.
-    #[cfg_attr(feature = "safe-sandbox", inline(always))]
-    #[cfg_attr(not(feature = "safe-sandbox"), inline)]
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
     pub(crate) fn maybe_gc(&mut self) {
-        #[cfg(feature = "safe-sandbox")]
-        if self.heap.footprint_due() {
-            self.heap.note_footprint_growth();
-        }
         // The overwhelmingly common poll has no pending collection.  Reject it
         // before touching the lock/floor fields so allocation-free call paths
         // pay one heap flag load instead of all three VM-state loads.
         if !self.heap.gc_requested() && !self.gc_stress {
             return;
         }
-        #[cfg(feature = "safe-sandbox")]
-        let unlocked = self.gc_lock.get() == 0;
-        #[cfg(not(feature = "safe-sandbox"))]
-        let unlocked = self.gc_lock == 0;
-        if unlocked && self.gc_floor != 0 {
+        if self.gc_lock == 0 && self.gc_floor != 0 {
+            self.gc_from_poll();
+        }
+    }
+
+    /// The checked profile's poll: three flags, and everything else out of
+    /// line. Inlined at every back-edge and frame transition of the
+    /// interpreter, it was the flags, the footprint compare with a call
+    /// behind it, the lock and floor tests and the collector's call; the
+    /// footprint compare alone cost 2% of an integer loop in the JavaScript
+    /// module and 7% in the Python ones, more than its loads, through what it
+    /// did to the code around it.
+    #[cfg(feature = "safe-sandbox")]
+    #[inline(always)]
+    pub(crate) fn maybe_gc(&mut self) {
+        if !crate::heap::footprint_tripped() && !self.heap.gc_requested() && !self.gc_stress {
+            return;
+        }
+        self.poll_slow();
+    }
+
+    /// [`Vm::maybe_gc`]'s rest in the checked profile: look at the footprint
+    /// if a report tripped it, then collect if one is due and it is safe.
+    #[cfg(feature = "safe-sandbox")]
+    #[cold]
+    #[inline(never)]
+    fn poll_slow(&mut self) {
+        if crate::heap::footprint_tripped() {
+            self.heap.footprint_poll();
+        }
+        if !self.heap.gc_requested() && !self.gc_stress {
+            return;
+        }
+        if self.gc_lock.get() == 0 && self.gc_floor != 0 {
             self.gc_from_poll();
         }
     }

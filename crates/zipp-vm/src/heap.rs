@@ -6119,6 +6119,35 @@ const BIG_PAYLOAD_GC_AT: usize = 8 * 1024 * 1024;
 /// and is read to no effect, in any other.
 pub static ALLOCATOR_NET_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// The checked profile's footprint trip: the figure at or past which a report
+/// that grows [`ALLOCATOR_NET_BYTES`] raises [`FOOTPRINT_TRIPPED`].
+///
+/// The collector's poll runs at every loop back-edge and frame transition,
+/// and it read the figure and the heap's next look and compared them every
+/// time: two loads and a compare in the tightest loop there is, 2% of an
+/// integer loop in the JavaScript module and 8% in the Python ones. Memory
+/// cannot grow without an allocator report, so the report does the compare
+/// (one more load beside the add it makes anyway, on a path that is a call
+/// into the allocator) and the poll reads one flag. The heap arms the trip
+/// with its next look (`Heap::look_at_footprint`). The figure is the
+/// process's, as before; with several heaps the trip holds the last look
+/// armed, and a heap whose own look is lower sees its growth at the next
+/// trip, a step late at most.
+#[cfg(feature = "safe-sandbox")]
+static FOOTPRINT_TRIP_AT: AtomicUsize = AtomicUsize::new(0);
+
+/// Raised by a growing report at or past [`FOOTPRINT_TRIP_AT`], and by a
+/// collection whose level has to be read; cleared by the poll that looks.
+#[cfg(feature = "safe-sandbox")]
+static FOOTPRINT_TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the footprint has to be looked at: the poll's one read.
+#[cfg(feature = "safe-sandbox")]
+#[inline(always)]
+pub(crate) fn footprint_tripped() -> bool {
+    FOOTPRINT_TRIPPED.load(Ordering::Relaxed)
+}
+
 /// The size from which an allocator that reports large blocks reports one.
 ///
 /// Not a page: an object of sixty properties keeps its keys, values and
@@ -6171,7 +6200,14 @@ pub(crate) fn every_block_footprint() -> Option<usize> {
 #[inline]
 fn note_block(old_size: usize, new_size: usize) {
     if new_size > old_size {
-        ALLOCATOR_NET_BYTES.fetch_add(new_size - old_size, Ordering::Relaxed);
+        let grown = new_size - old_size;
+        let now = ALLOCATOR_NET_BYTES.fetch_add(grown, Ordering::Relaxed) + grown;
+        #[cfg(feature = "safe-sandbox")]
+        if now >= FOOTPRINT_TRIP_AT.load(Ordering::Relaxed) {
+            FOOTPRINT_TRIPPED.store(true, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        let _ = now;
     } else if old_size > new_size {
         ALLOCATOR_NET_BYTES.fetch_sub(old_size - new_size, Ordering::Relaxed);
     }
@@ -7169,6 +7205,26 @@ impl Heap {
         footprint_bytes() >= self.footprint_gc_at
     }
 
+    /// The checked profile's poll found the footprint tripped
+    /// (`footprint_tripped`): look, if this heap's own step is due, and arm
+    /// the trip again either way. A level still to be read after a
+    /// collection keeps it raised, as the zero `footprint_gc_at` it waits
+    /// with made every poll look.
+    #[cfg(feature = "safe-sandbox")]
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn footprint_poll(&mut self) {
+        FOOTPRINT_TRIPPED.store(false, Ordering::Relaxed);
+        if self.footprint_due() {
+            self.note_footprint_growth();
+        }
+        if self.footprint_settling {
+            FOOTPRINT_TRIPPED.store(true, Ordering::Relaxed);
+        } else {
+            FOOTPRINT_TRIP_AT.store(self.footprint_gc_at, Ordering::Relaxed);
+        }
+    }
+
     /// The footprint passed `footprint_gc_at`: decide what the growth asks
     /// for, and look again a step on.
     #[cold]
@@ -7229,6 +7285,8 @@ impl Heap {
         self.footprint_at_look = now;
         self.allocs_at_look = self.alloc_seq();
         self.footprint_gc_at = now.saturating_add(FOOTPRINT_STEP);
+        #[cfg(feature = "safe-sandbox")]
+        FOOTPRINT_TRIP_AT.store(self.footprint_gc_at, Ordering::Relaxed);
     }
 
     /// Measure footprint growth from the level in force now, read at the next
@@ -7242,6 +7300,8 @@ impl Heap {
         {
             self.footprint_settling_major = true;
         }
+        #[cfg(feature = "safe-sandbox")]
+        FOOTPRINT_TRIPPED.store(true, Ordering::Relaxed);
     }
 
     /// The allocator's figure now, to hand back to
