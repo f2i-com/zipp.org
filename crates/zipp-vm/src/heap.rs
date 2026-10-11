@@ -1275,7 +1275,8 @@ impl ValStore {
         }
     }
 
-    #[inline]
+    #[cfg_attr(feature = "wasm-lite", inline(always))]
+    #[cfg_attr(not(feature = "wasm-lite"), inline)]
     fn as_slice(&self) -> &[Value] {
         match self {
             ValStore::Vec(v) => v,
@@ -1295,7 +1296,8 @@ impl ValStore {
         }
     }
 
-    #[inline]
+    #[cfg_attr(feature = "wasm-lite", inline(always))]
+    #[cfg_attr(not(feature = "wasm-lite"), inline)]
     fn as_mut_slice(&mut self) -> &mut [Value] {
         match self {
             ValStore::Vec(v) => v,
@@ -1413,14 +1415,18 @@ impl ValStore {
 
 impl std::ops::Index<usize> for ValStore {
     type Output = Value;
-    #[inline]
+    // A size-first build leaves an `#[inline]` hint as a call, and these two
+    // are every read and write of an object's value slot.
+    #[cfg_attr(feature = "wasm-lite", inline(always))]
+    #[cfg_attr(not(feature = "wasm-lite"), inline)]
     fn index(&self, i: usize) -> &Value {
         &self.as_slice()[i]
     }
 }
 
 impl std::ops::IndexMut<usize> for ValStore {
-    #[inline]
+    #[cfg_attr(feature = "wasm-lite", inline(always))]
+    #[cfg_attr(not(feature = "wasm-lite"), inline)]
     fn index_mut(&mut self, i: usize) -> &mut Value {
         &mut self.as_mut_slice()[i]
     }
@@ -1620,7 +1626,8 @@ impl PropAttrs {
 
     /// The slot's attributes; panics out of range in BOTH representations,
     /// preserving the parallel-vector indexing this replaced.
-    #[inline]
+    #[cfg_attr(feature = "wasm-lite", inline(always))]
+    #[cfg_attr(not(feature = "wasm-lite"), inline)]
     fn at(&self, i: usize) -> PropAttr {
         match self {
             PropAttrs::AllData { len } => {
@@ -1780,7 +1787,8 @@ impl ObjMap {
     }
 
     /// The stored value at `i` — the data value, or the GETTER for an accessor.
-    #[inline]
+    #[cfg_attr(feature = "wasm-lite", inline(always))]
+    #[cfg_attr(not(feature = "wasm-lite"), inline)]
     pub fn val_at(&self, i: usize) -> Value {
         self.vals[i]
     }
@@ -8520,6 +8528,14 @@ impl Heap {
 
     #[inline]
     pub fn get(&self, idx: u32) -> &HeapObj {
+        &self.objs[idx as usize]
+    }
+
+    /// [`Heap::get`] for the inline cache's receiver lookup, which is on
+    /// every cached property read: a size-first build leaves `get` as a call
+    /// at its 1,458 sites, and this one is worth its dozen bytes.
+    #[inline(always)]
+    pub(crate) fn get_for_ic(&self, idx: u32) -> &HeapObj {
         &self.objs[idx as usize]
     }
 

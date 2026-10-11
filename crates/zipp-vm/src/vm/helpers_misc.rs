@@ -4007,7 +4007,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // A private ('#') name needs brand checks. Deferred namespace state can
     // still be materialising exports. In both cases replay in the interpreter.
-    if key.as_bytes().first() == Some(&b'#') || !vm.deferred_ns_state.is_empty() {
+    if matches!(key.as_bytes().first(), Some(b'#')) || !vm.deferred_ns_state.is_empty() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
 
@@ -4512,7 +4512,7 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // Same exclusions as the interpreter IC: a private name needs brand checks, and
     // an exotic receiver has live semantics layered over its ObjMap.
-    if key.as_bytes().first() == Some(&b'#')
+    if matches!(key.as_bytes().first(), Some(b'#'))
         || !vm.deferred_ns_state.is_empty()
         || !vm.ic_obj_ok(idx)
     {
@@ -7094,10 +7094,12 @@ pub(crate) fn norm_index(i: i32, len: i32) -> i32 {
 ///
 /// Every method call asks this of its name, so it is the first byte and
 /// nothing else: `starts_with` on a `char` encodes the pattern and compares
-/// slices, and a size-first build makes that two calls.
+/// slices, and a size-first build makes that two calls. A `match`, not `==`:
+/// that build also leaves `Option`'s `PartialEq` as a call (4% of a property
+/// loop in Lite, with the two loop probes in the dispatch loop).
 #[inline(always)]
 pub(crate) fn is_private_key(k: &str) -> bool {
-    k.as_bytes().first() == Some(&b'#')
+    matches!(k.as_bytes().first(), Some(b'#'))
 }
 
 /// The numeric binary operators (see `numeric_binop` / `bigint_op` in

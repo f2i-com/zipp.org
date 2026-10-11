@@ -4782,7 +4782,8 @@ impl<'p> Vm<'p> {
                         } else {
                             #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                             if ip >= 6
-                                && ip.checked_add(15) == Some(target as usize)
+                                && target as usize >= 15
+                                && target as usize - 15 == ip
                                 && self.get(base, a) == Value::int(1)
                             {
                                 // Run the first iteration normally so its
@@ -4802,7 +4803,8 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfNotLe { a, b, target } => {
                         #[cfg(all(feature = "meter-only", not(feature = "jit")))]
-                        if ip.checked_add(5) == Some(target as usize)
+                        if target as usize >= 5
+                            && target as usize - 5 == ip
                             && self.get(base, a) == Value::int(1)
                             && self.try_metered_counted_sum_loop(func_id, base, ip, a, b, target)
                         {
@@ -6093,7 +6095,7 @@ impl<'p> Vm<'p> {
                         // Private stores route to the side table / accessors
                         // (field-init emission, compound/update writes). One
                         // byte-compare on the hot path.
-                        if key.as_bytes().first() == Some(&b'#') {
+                        if matches!(key.as_bytes().first(), Some(b'#')) {
                             if let Some((b2, kind, owner)) = self.resolve_private(&key) {
                                 if !self.private_receiver_ok(o, b2, kind, owner) {
                                     return Err(Thrown(format!(

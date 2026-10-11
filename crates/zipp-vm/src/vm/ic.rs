@@ -531,7 +531,7 @@ impl<'p> Vm<'p> {
             return Walked::No;
         }
         // Private members live in side tables with brand semantics — never IC.
-        if key.as_bytes().first() == Some(&b'#') {
+        if matches!(key.as_bytes().first(), Some(b'#')) {
             return Walked::No;
         }
         let idx = recv.heap_index();
@@ -657,7 +657,7 @@ impl<'p> Vm<'p> {
         if !self.ic_obj_ok(idx) {
             return None;
         }
-        match self.heap.get(idx) {
+        match self.heap.get_for_ic(idx) {
             HeapObj::Object(m) if !m.is_ctor => Some((idx, m)),
             _ => None,
         }
@@ -2579,7 +2579,7 @@ impl<'p> Vm<'p> {
         is_static: bool,
         key: &str,
     ) -> Option<(IcHops, u32, bool)> {
-        if !self.deferred_ns_state.is_empty() || key.as_bytes().first() == Some(&b'#') {
+        if !self.deferred_ns_state.is_empty() || matches!(key.as_bytes().first(), Some(b'#')) {
             return None;
         }
         // Anchor: what `super_base` derives FROM — the synthesized prototype

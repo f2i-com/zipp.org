@@ -738,7 +738,7 @@ impl<'p> Vm<'p> {
             if let Some((ver, slot, fn_bits)) = memo {
                 if self.active_realm_proto(proto) == proto && self.heap.version_of(proto) == ver {
                     if let HeapObj::Object(map) = self.heap.get(proto) {
-                        if map.val_get_ref(slot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                        if map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == fn_bits) {
                             return Some(fn_bits);
                         }
                     }
@@ -774,7 +774,7 @@ impl<'p> Vm<'p> {
             if let Some((ver, slot, fn_bits)) = memo {
                 if self.heap.version_of(proto) == ver {
                     if let HeapObj::Object(map) = self.heap.get(proto) {
-                        if map.val_get_ref(slot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                        if map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == fn_bits) {
                             return true;
                         }
                     }
@@ -911,7 +911,7 @@ impl<'p> Vm<'p> {
             if let Some((ver, slot, fn_bits)) = self.coll_intrinsic_memo[kind_idx][nid] {
                 if self.heap.version_of(proto) == ver {
                     if let HeapObj::Object(map) = self.heap.get(proto) {
-                        if map.val_get_ref(slot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                        if map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == fn_bits) {
                             return true;
                         }
                     }

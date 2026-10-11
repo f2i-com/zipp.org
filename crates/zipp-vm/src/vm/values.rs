@@ -1418,7 +1418,7 @@ impl<'p> Vm<'p> {
             let is_private = self
                 .heap
                 .str_wtf8_cow(key.heap_index())
-                .is_some_and(|b| b.first() == Some(&b'#'));
+                .is_some_and(|b| matches!(b.first(), Some(b'#')));
             if is_private {
                 return None;
             }
