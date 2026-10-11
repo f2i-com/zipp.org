@@ -160,3 +160,11 @@ startswith TypeError
 endswith TypeError
 endswith TypeError
 hot [95, 95, 95, 95, 95] 38000
+== the library functions that split as str.split() does
+'Hello World' 'hello world' 'hello world'
+'A B C' 'a b c' 'a b c'
+'Hello World' 'hello world' 'hello world'
+'X' 'x' 'x'
+'' '' ''
+'\ufeffone Two' '\ufeffone two' '\ufeffone two'
+'One Two Three Four Five Six Seven' 'one two three [...]' 'one [...]'

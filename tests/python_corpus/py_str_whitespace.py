@@ -169,3 +169,10 @@ def hot(lines):
 lines = ["\x1c key=v \x1f", " k\x85v ", BOM + "kv" + BOM, "plain", "", "  ", "\x1e\x1e", "k v", " kv" + HI + " ", Text(" kv "),
          IDEO + "k" + EM + "v\x85"]
 print("hot", [hot(lines) for _ in range(5)], hot(lines * 400))
+
+print("== the library functions that split as str.split() does")
+import string
+import textwrap
+
+for text in ("  hello  world  ", "a\x1cb \x85 c", "hello world", " x ", "", BOM + "one two", "one two three four five six seven"):
+    print(ascii(string.capwords(text)), ascii(textwrap.shorten(text, 20)), ascii(textwrap.shorten(text, 12)))
