@@ -40,6 +40,7 @@ pub(super) const CONST_STRING_CACHE_WIDE_ENTRIES: usize = 4096;
 pub(super) const CONST_STRING_CACHE_NAME_BYTES: usize = 32;
 /// Dynamic code installs monotonically increasing function ids. Bound the
 /// accompanying eligibility memo too; beyond it we fail closed to fresh loads.
+#[cfg(feature = "jit")]
 const CONST_STRING_CACHE_MAX_FUNCTIONS: usize = 4096;
 
 #[inline]
@@ -52,6 +53,15 @@ fn slot_key(func_id: u32, const_idx: u32) -> u64 {
 /// place. `StrConcatChain` is intentionally absent: its bytecode contract makes
 /// the first link a plain `Add` and mutates only that fresh result, never a
 /// `LoadConst` operand.
+///
+/// That is the rule where compiled code appends through a native cursor,
+/// which a frozen accumulator sends back to the interpreter. A build without
+/// the JIT freezes each literal it caches instead (`resolve_const_slot`):
+/// every in-place grower declines a frozen accumulator and builds a fresh
+/// string, so `let out = "seed"` copies once at the loop's first append,
+/// where it was copied at the load, and `s += "ab" + i` stops making and
+/// freeing an "ab" on every pass (a fifth of that loop).
+#[cfg(feature = "jit")]
 #[inline]
 fn function_literals_shareable(f: &crate::bytecode::FuncProto) -> bool {
     !f.code.iter().any(|instr| {
@@ -65,6 +75,13 @@ fn function_literals_shareable(f: &crate::bytecode::FuncProto) -> bool {
 }
 
 impl Vm<'_> {
+    #[cfg(not(feature = "jit"))]
+    #[inline(always)]
+    fn const_string_func_shareable(&mut self, _func_id: u32) -> bool {
+        true
+    }
+
+    #[cfg(feature = "jit")]
     #[inline]
     fn const_string_func_shareable(&mut self, func_id: u32) -> bool {
         if let Some(&safe) = self.const_string_cache_funcs.get(&func_id) {
@@ -97,10 +114,13 @@ impl Vm<'_> {
     #[inline]
     pub(crate) fn resolve_const_slot(&mut self, func_id: u32, const_idx: u32) -> Value {
         let raw = self.func(func_id as usize).constants[const_idx as usize];
-        if !raw.is_heap()
-            || (raw.heap_index() & crate::vm::helpers_misc::STRING_CONST_BIT) == 0
-            || !self.const_string_cache_enabled
-        {
+        // A constant that is not a string is its own value. Answer it here:
+        // `resolve_const` makes the same test and returns the same bits, but
+        // it is a call, and it was 4% of a loop that adds a float constant.
+        if !raw.is_heap() || (raw.heap_index() & crate::vm::helpers_misc::STRING_CONST_BIT) == 0 {
+            return raw;
+        }
+        if !self.const_string_cache_enabled {
             return self.resolve_const(func_id, raw);
         }
 
@@ -133,6 +153,10 @@ impl Vm<'_> {
             let text = self.func(func_id as usize).string_constants[string_idx].as_str();
             self.py_intern(text, resolved)
         };
+        // Held by this cache and by every load it serves: no accumulator's
+        // own (see `function_literals_shareable`).
+        #[cfg(not(feature = "jit"))]
+        self.heap.freeze_shared_str(resolved.heap_index());
         self.const_string_cache.insert(key, resolved);
         resolved
     }
@@ -211,6 +235,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "jit")]
     #[test]
     fn unique_buffer_functions_keep_fresh_literals_across_calls() {
         let vm = vm(r#"
@@ -235,6 +260,36 @@ mod tests {
         assert!(!vm
             .const_string_cache
             .contains_key(&slot_key(func_id, const_idx)));
+    }
+
+    #[cfg(not(feature = "jit"))]
+    #[test]
+    fn an_appending_function_shares_frozen_literals_and_grows_none_of_them() {
+        let mut vm = vm(r#"
+            function build(n) {
+                let out = "seed";
+                for (let i = 0; i < n; i++) out += "ab" + i;
+                return out;
+            }
+            console.log(build(2));
+            console.log(build(1));
+            console.log(build(3));
+            "#);
+        assert_eq!(vm.output, ["seedab0ab1", "seedab0", "seedab0ab1ab2"]);
+
+        for text in ["seed", "ab"] {
+            let (func_id, const_idx) = literal_slot(&vm, text);
+            let cached = *vm
+                .const_string_cache
+                .get(&slot_key(func_id, const_idx))
+                .unwrap_or_else(|| panic!("{text:?} is cached"));
+            assert!(
+                matches!(vm.heap.get(cached.heap_index()), crate::heap::HeapObj::Str(s) if s.frozen()),
+                "{text:?} is frozen"
+            );
+            assert_eq!(vm.display(cached), text, "the literal is what it was");
+            assert_eq!(vm.resolve_const_slot(func_id, const_idx), cached);
+        }
     }
 
     #[test]

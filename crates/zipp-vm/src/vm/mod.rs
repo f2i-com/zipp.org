@@ -1564,6 +1564,7 @@ pub struct Vm<'p> {
     /// function that can mutate a compiler-proved-unique string buffer must keep
     /// receiving a fresh literal representation, so none of its literals enter
     /// the shared cache.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     const_string_cache_funcs: rustc_hash::FxHashMap<u32, bool>,
     /// Latched at VM construction so `ZIPP_NO_CONST_STRING_CACHE=1` is a
     /// same-binary ablation with no environment lookup in the dispatch loop.
