@@ -239,6 +239,38 @@ fn json_quote_fastlen_enabled() -> bool {
     }
 }
 
+/// One object member's prefix, `"key":` with a comma before it when it is not
+/// the first.
+///
+/// A key of printable ASCII with no quote or backslash, which is nearly every
+/// key, needs no escaping: it is scanned once, the five pieces get one
+/// reservation and are appended back to back. The general path scanned such
+/// a key to size it, scanned it again to find the escapes it does not have,
+/// and reserved for the comma, the quoted key and the colon separately
+/// (35 ns a key where V8 takes 17). Any other key takes that path unchanged.
+#[inline]
+fn json_member_prefix_bounded(
+    out: &mut String,
+    any: bool,
+    key: &str,
+) -> Result<(), JsonOutputError> {
+    if json_quote_fastlen_enabled() && json_quote_len_is_plain(key.as_bytes()) {
+        json_reserve_bounded(out, key.len() + 4)?;
+        if any {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(key);
+        out.push_str("\":");
+        return Ok(());
+    }
+    if any {
+        json_push_char_bounded(out, ',')?;
+    }
+    json_quote_bounded(out, key)?;
+    json_push_char_bounded(out, ':')
+}
+
 fn json_quote_bounded(out: &mut String, text: &str) -> Result<(), JsonOutputError> {
     json_reserve_bounded(out, json_quoted_str_len(text)?)?;
     // `json_quote_into`'s own reserve is now a no-op: the exact escaped size is
@@ -743,13 +775,7 @@ impl<'p> Vm<'p> {
                         active.pop();
                         return false;
                     }
-                    if any && json_push_char_bounded(out, ',').is_err() {
-                        active.pop();
-                        return false;
-                    }
-                    if json_quote_bounded(out, guest_key_text(key)).is_err()
-                        || json_push_char_bounded(out, ':').is_err()
-                    {
+                    if json_member_prefix_bounded(out, any, guest_key_text(key)).is_err() {
                         active.pop();
                         return false;
                     }
