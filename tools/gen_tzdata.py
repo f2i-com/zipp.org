@@ -555,12 +555,13 @@ def main():
     a("/// The tzdb release this table was generated from.")
     a("pub(crate) const TZDB_VERSION: &str = \"%s\";" % VERSION)
     a("")
-    a("/// One IANA Zone: its primary identifier, its transition slice, and the")
-    a("/// annual rule that governs every year from `fin_year` on.")
+    a("/// One IANA Zone: its transition slice and the annual rule that governs")
+    a("/// every year from `fin_year` on. Stored by field, one `ZONE_*` column each")
+    a("/// (`ZONE_ID` is the primary identifier's index in the identifier list),")
+    a("/// and put together by `tzdb::zone_at`.")
     a("pub(crate) struct Zone {")
-    a("    pub(crate) name: &'static str,")
-    a("    pub(crate) tr: u32,")
-    a("    pub(crate) ntr: u32,")
+    a("    pub(crate) tr: u16,")
+    a("    pub(crate) ntr: u16,")
     a("    /// Last explicit transition (or i64::MIN), cached for annual-rule lookups.")
     a("    pub(crate) last_at: i64,")
     a("    pub(crate) last_off: i32,")
@@ -569,9 +570,9 @@ def main():
     a("    /// Standard offset (seconds) of the zone's last Zone line -- the base the")
     a("    /// annual rules' `save` is added to.")
     a("    pub(crate) std: i32,")
-    a("    pub(crate) fin: u16,")
+    a("    pub(crate) fin: u8,")
     a("    pub(crate) nfin: u8,")
-    a("    pub(crate) fin_year: i32,")
+    a("    pub(crate) fin_year: i16,")
     a("}")
     a("")
     a("/// One `Rule ... max ...` line: an annually recurring transition.")
@@ -589,11 +590,56 @@ def main():
     a("    pub(crate) save: i32,")
     a("}")
     a("")
-    a("pub(crate) static ZONES: &[Zone] = &[")
+    id_order = sorted(ids, key=lambda s: (s.lower(), s))
+    id_index = {k: i for i, k in enumerate(id_order)}
+    rows = []
     for (nm, tr, ntr, init, std, fi, nfin, fy) in zone_rows:
         last_at = trans_at[tr + ntr - 1] if ntr else -(2**63)
         last_off = trans_off[tr + ntr - 1] if ntr else init
-        a("    Zone { name: %s, tr: %d, ntr: %d, last_at: %d, last_off: %d, init: %d, std: %d, fin: %d, nfin: %d, fin_year: %d },"
+        rows.append((nm, tr, ntr, last_at, last_off, init, std, fi, nfin, fy))
+    columns = [
+        ("ZONE_ID", "u16", [id_index[r[0]] for r in rows]),
+        ("ZONE_TR", "u16", [r[1] for r in rows]),
+        ("ZONE_NTR", "u16", [r[2] for r in rows]),
+        ("ZONE_LAST_AT", "i64", [r[3] for r in rows]),
+        ("ZONE_LAST_OFF", "i32", [r[4] for r in rows]),
+        ("ZONE_INIT", "i32", [r[5] for r in rows]),
+        ("ZONE_STD", "i32", [r[6] for r in rows]),
+        ("ZONE_FIN", "u8", [r[7] for r in rows]),
+        ("ZONE_NFIN", "u8", [r[8] for r in rows]),
+        ("ZONE_FIN_YEAR", "i16", [r[9] for r in rows]),
+    ]
+    LIMITS = {"u8": (0, 255), "u16": (0, 65535), "i16": (-32768, 32767),
+              "i32": (-2**31, 2**31 - 1), "i64": (-2**63, 2**63 - 1)}
+    a("// The zones, one column per field of `Zone`, in tzdb Zone-name order.")
+    for name, ty, values in columns:
+        low, high = LIMITS[ty]
+        assert all(low <= v <= high for v in values), name + " needs a wider type"
+        a("pub(crate) static %s: &[%s] = &[" % (name, ty))
+        for i in range(0, len(values), 16):
+            a("    " + " ".join("%d," % x for x in values[i:i + 16]))
+        a("];")
+    a("")
+    a("/// The zones as one row each, as the table held them before it was stored")
+    a("/// by column; retained only to check the columns against.")
+    a("#[cfg(test)]")
+    a("pub(crate) struct ZoneRow {")
+    a("    pub(crate) name: &'static str,")
+    a("    pub(crate) tr: u32,")
+    a("    pub(crate) ntr: u32,")
+    a("    pub(crate) last_at: i64,")
+    a("    pub(crate) last_off: i32,")
+    a("    pub(crate) init: i32,")
+    a("    pub(crate) std: i32,")
+    a("    pub(crate) fin: u16,")
+    a("    pub(crate) nfin: u8,")
+    a("    pub(crate) fin_year: i32,")
+    a("}")
+    a("")
+    a("#[cfg(test)]")
+    a("pub(crate) static ZONE_ROWS: &[ZoneRow] = &[")
+    for (nm, tr, ntr, last_at, last_off, init, std, fi, nfin, fy) in rows:
+        a("    ZoneRow { name: %s, tr: %d, ntr: %d, last_at: %d, last_off: %d, init: %d, std: %d, fin: %d, nfin: %d, fin_year: %d },"
           % ('"%s"' % nm, tr, ntr, last_at, last_off, init, std, fi, nfin, fy))
     a("];")
     a("")
@@ -620,11 +666,41 @@ def main():
         a("    " + " ".join("%d," % x for x in trans_off[i:i + 16]))
     a("];")
     a("")
-    a("/// Every Zone and Link name, in ASCII-case-insensitive order, paired with the")
-    a("/// `ZONES` index it denotes. The string is the canonical spelling, which is")
-    a("/// what `timeZoneId` reports for a case-insensitive match.")
-    a("pub(crate) static IDS: &[(&str, u16)] = &[")
-    for k in sorted(ids, key=lambda s: (s.lower(), s)):
+    a("/// Every Zone and Link name, in ASCII-case-insensitive order, one after the")
+    a("/// other: name `i` ends at `ID_END[i]` and starts where name `i - 1` ends")
+    a("/// (the first at 0). The spelling is the canonical one, which is what")
+    a("/// `timeZoneId` reports for a case-insensitive match.")
+    a("pub(crate) static ID_NAMES: &str = concat!(")
+    line = []
+    for k in id_order:
+        line.append('"%s",' % k)
+        if sum(len(x) + 1 for x in line) > 90:
+            a("    " + " ".join(line))
+            line = []
+    if line:
+        a("    " + " ".join(line))
+    a(");")
+    ends, end = [], 0
+    for k in id_order:
+        end += len(k.encode())
+        ends.append(end)
+    assert end <= 65535, "widen ID_END before updating tzdb"
+    a("pub(crate) static ID_END: &[u16] = &[")
+    for i in range(0, len(ends), 16):
+        a("    " + " ".join("%d," % x for x in ends[i:i + 16]))
+    a("];")
+    a("/// The `ZONE_*` index each name denotes.")
+    a("pub(crate) static ID_ZONE: &[u16] = &[")
+    zone_of = [ids[k] for k in id_order]
+    for i in range(0, len(zone_of), 16):
+        a("    " + " ".join("%d," % x for x in zone_of[i:i + 16]))
+    a("];")
+    a("")
+    a("/// The names and zones as the table held them before, as pairs; retained")
+    a("/// only to check `ID_NAMES`, `ID_END` and `ID_ZONE` against.")
+    a("#[cfg(test)]")
+    a("pub(crate) static ID_ROWS: &[(&str, u16)] = &[")
+    for k in id_order:
         a('    ("%s", %d),' % (k, ids[k]))
     a("];")
     a("")

@@ -14,8 +14,10 @@
 //! string. Times are seconds here; the callers scale to nanoseconds.
 
 use super::tzdata::{
-    FinalRule, FINALS, IDS, TRANS_BLOCK_DAY, TRANS_BLOCK_POS, TRANS_BLOCK_TOD, TRANS_BYTES,
-    TRANS_OFFSET, TRANS_PALETTE, TRANS_TOD, ZONES,
+    FinalRule, Zone, FINALS, ID_END, ID_NAMES, ID_ZONE, TRANS_BLOCK_DAY, TRANS_BLOCK_POS,
+    TRANS_BLOCK_TOD, TRANS_BYTES, TRANS_OFFSET, TRANS_PALETTE, TRANS_TOD, ZONE_FIN,
+    ZONE_FIN_YEAR, ZONE_ID, ZONE_INIT, ZONE_LAST_AT, ZONE_LAST_OFF, ZONE_NFIN, ZONE_NTR, ZONE_STD,
+    ZONE_TR,
 };
 
 /// The transitions of all zones form one list, stored in blocks of this many
@@ -166,14 +168,57 @@ pub(crate) struct TzId {
 /// shipping the table is that an unknown name fails loudly instead of
 /// silently formatting as UTC.
 pub(crate) fn lookup(id: &str) -> Option<TzId> {
-    let i = IDS
-        .binary_search_by(|(name, _)| cmp_ascii_ci(name, id))
-        .ok()?;
-    let (canonical, zone) = IDS[i];
-    Some(TzId { canonical, zone })
+    let (mut low, mut high) = (0, ID_END.len());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match cmp_ascii_ci(id_name(mid), id) {
+            core::cmp::Ordering::Less => low = mid + 1,
+            core::cmp::Ordering::Greater => high = mid,
+            core::cmp::Ordering::Equal => {
+                return Some(TzId {
+                    canonical: id_name(mid),
+                    zone: ID_ZONE[mid],
+                })
+            }
+        }
+    }
+    None
 }
 
-/// `str::cmp` over ASCII-lowercased bytes — the order `IDS` is generated in.
+/// Zone or Link name `i` of the identifier list.
+fn id_name(i: usize) -> &'static str {
+    let start = if i == 0 { 0 } else { ID_END[i - 1] as usize };
+    &ID_NAMES[start..ID_END[i] as usize]
+}
+
+/// Zone `zone`, from its columns.
+fn zone_at(zone: u16) -> Zone {
+    let z = zone as usize;
+    Zone {
+        tr: ZONE_TR[z],
+        ntr: ZONE_NTR[z],
+        last_at: ZONE_LAST_AT[z],
+        last_off: ZONE_LAST_OFF[z],
+        init: ZONE_INIT[z],
+        std: ZONE_STD[z],
+        fin: ZONE_FIN[z],
+        nfin: ZONE_NFIN[z],
+        fin_year: ZONE_FIN_YEAR[z],
+    }
+}
+
+impl Zone {
+    /// Where its transitions are in the transition list.
+    fn transitions(&self) -> Transitions {
+        let lo = usize::from(self.tr);
+        Transitions {
+            lo,
+            hi: lo + usize::from(self.ntr),
+        }
+    }
+}
+
+/// `str::cmp` over ASCII-lowercased bytes — the order `ID_NAMES` is generated in.
 fn cmp_ascii_ci(a: &str, b: &str) -> core::cmp::Ordering {
     let (x, y) = (a.as_bytes(), b.as_bytes());
     let n = x.len().min(y.len());
@@ -189,7 +234,7 @@ fn cmp_ascii_ci(a: &str, b: &str) -> core::cmp::Ordering {
 /// The [[PrimaryIdentifier]] of a zone — what `TimeZoneEquals` compares, so
 /// that `Asia/Calcutta` and `Asia/Kolkata` are the same zone.
 pub(crate) fn primary(zone: u16) -> &'static str {
-    ZONES[zone as usize].name
+    id_name(usize::from(ZONE_ID[zone as usize]))
 }
 
 /// AvailableCanonicalTimeZones: the primary identifiers, sorted and unique.
@@ -197,7 +242,7 @@ pub(crate) fn primary(zone: u16) -> &'static str {
 /// dedupe below is what keeps them out of the list (test262's
 /// `isCanonicalizedStructurallyValidTimeZoneName` rejects both spellings).
 pub(crate) fn primary_ids() -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = ZONES.iter().map(|z| z.name).collect();
+    let mut v: Vec<&'static str> = ZONE_ID.iter().map(|&id| id_name(usize::from(id))).collect();
     v.sort_unstable();
     v.dedup();
     v
@@ -268,7 +313,7 @@ fn on_day(y: i64, r: &FinalRule) -> i64 {
 /// The transitions the annual rules produce in `year`, in order, as
 /// (instant, UTC offset after it). At most `nfin` of them (2 in practice).
 fn final_transitions(zone: u16, year: i64, out: &mut Vec<(i64, i32)>) {
-    let z = &ZONES[zone as usize];
+    let z = zone_at(zone);
     out.clear();
     if z.nfin == 0 || year < z.fin_year as i64 {
         return;
@@ -300,9 +345,9 @@ fn final_transitions(zone: u16, year: i64, out: &mut Vec<(i64, i32)>) {
 /// GetNamedTimeZoneOffsetNanoseconds, in seconds: the UTC offset of `zone` at
 /// the instant `t`.
 pub(crate) fn offset_seconds(zone: u16, t: i64) -> i32 {
-    let z = &ZONES[zone as usize];
-    let (lo, hi) = (z.tr as usize, (z.tr + z.ntr) as usize);
-    let at = Transitions { lo, hi };
+    let z = zone_at(zone);
+    let at = z.transitions();
+    let lo = at.lo;
     // Most real-world dates use annual rules. Avoid decoding any historical
     // block in that case; the generated tail costs only two scalars per zone.
     let (i, mut off) = if t >= z.last_at {
@@ -355,9 +400,8 @@ pub(crate) fn possible_instants(zone: u16, local: i64) -> Vec<i64> {
 /// The first transition strictly after `t`, or `None` when the zone has no
 /// later one (a zone with no annual rule eventually runs out).
 pub(crate) fn next_transition(zone: u16, t: i64) -> Option<i64> {
-    let z = &ZONES[zone as usize];
-    let (lo, hi) = (z.tr as usize, (z.tr + z.ntr) as usize);
-    let at = Transitions { lo, hi };
+    let z = zone_at(zone);
+    let at = z.transitions();
     let i = at.partition_point(|x| x <= t);
     if i < at.len() {
         return Some(at.at(i));
@@ -391,9 +435,8 @@ pub(crate) fn next_transition(zone: u16, t: i64) -> Option<i64> {
 
 /// The last transition strictly before `t`, or `None` when the zone has none.
 pub(crate) fn previous_transition(zone: u16, t: i64) -> Option<i64> {
-    let z = &ZONES[zone as usize];
-    let (lo, hi) = (z.tr as usize, (z.tr + z.ntr) as usize);
-    let at = Transitions { lo, hi };
+    let z = zone_at(zone);
+    let at = z.transitions();
     if z.nfin > 0 {
         let y = civil_year(t);
         let mut buf = Vec::with_capacity(4);
@@ -438,10 +481,11 @@ mod tests {
         for block in 0..TRANS_AT.len().div_ceil(BLOCK) {
             assert_eq!(block_start(block), TRANS_AT[block * BLOCK], "block {block}");
         }
-        for z in ZONES {
-            let lo = z.tr as usize;
-            let hi = lo + z.ntr as usize;
-            let packed = Transitions { lo, hi };
+        for zone in 0..ZONE_ID.len() as u16 {
+            let z = zone_at(zone);
+            let name = primary(zone);
+            let packed = z.transitions();
+            let (lo, hi) = (packed.lo, packed.hi);
             let original = &TRANS_AT[lo..hi];
             assert_eq!(z.last_at, original.last().copied().unwrap_or(i64::MIN));
             assert_eq!(z.last_off, if hi > lo { TRANS_OFF[hi - 1] } else { z.init });
@@ -453,17 +497,50 @@ mod tests {
                 assert_eq!(
                     packed.partition_point(|x| x <= t),
                     original.partition_point(|&x| x <= t),
-                    "{} at {t}",
-                    z.name
+                    "{name} at {t}"
                 );
                 assert_eq!(
                     packed.partition_point(|x| x < t),
                     original.partition_point(|&x| x < t),
-                    "{} before {t}",
-                    z.name
+                    "{name} before {t}"
                 );
             }
         }
+    }
+
+    /// The zone columns and the identifier list hold, entry for entry, what
+    /// the row tables they were packed from held (`ZONE_ROWS` and `ID_ROWS`,
+    /// the table's earlier form, kept for this test).
+    #[test]
+    fn zone_columns_and_identifiers_match_the_rows() {
+        use super::super::tzdata::{ID_ROWS, ZONE_ROWS};
+        assert_eq!(ZONE_ROWS.len(), ZONE_ID.len());
+        for (zone, row) in ZONE_ROWS.iter().enumerate() {
+            let z = zone_at(zone as u16);
+            assert_eq!(primary(zone as u16), row.name, "zone {zone}");
+            assert_eq!(
+                (u32::from(z.tr), u32::from(z.ntr), z.last_at, z.last_off),
+                (row.tr, row.ntr, row.last_at, row.last_off),
+                "{}",
+                row.name
+            );
+            assert_eq!(
+                (z.init, z.std, u16::from(z.fin), z.nfin, i32::from(z.fin_year)),
+                (row.init, row.std, row.fin, row.nfin, row.fin_year),
+                "{}",
+                row.name
+            );
+        }
+        assert_eq!(ID_ROWS.len(), ID_END.len());
+        for (i, &(name, zone)) in ID_ROWS.iter().enumerate() {
+            assert_eq!((id_name(i), ID_ZONE[i]), (name, zone), "identifier {i}");
+            // Every name, in any case, finds itself and its zone.
+            for spelling in [name.to_string(), name.to_ascii_lowercase(), name.to_ascii_uppercase()] {
+                let found = lookup(&spelling).unwrap_or_else(|| panic!("{spelling}"));
+                assert_eq!((found.canonical, found.zone), (name, zone), "{spelling}");
+            }
+        }
+        assert_eq!(ID_END.last().map(|&end| end as usize), Some(ID_NAMES.len()));
     }
 
     #[test]
