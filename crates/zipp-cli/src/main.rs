@@ -29,13 +29,29 @@ struct ReportingAlloc;
 #[global_allocator]
 static GLOBAL: ReportingAlloc = ReportingAlloc;
 
-// SAFETY: every method forwards its arguments unchanged to mimalloc, whose
-// `GlobalAlloc` implementation carries the contract; the reports only add to
-// and subtract from an atomic counter.
+/// The largest alignment mimalloc's plain entries guarantee: every block it
+/// hands out is aligned to a word. `mimalloc::MiMalloc` sends every request to
+/// the aligned entries, which test the size, find the page and test the free
+/// block's address before the free-list pop that `mi_malloc` makes directly;
+/// nearly every request the engine makes is aligned to 8 or less, so those
+/// take the plain entries and the rest keep the aligned ones.
+const PLAIN_ALIGN: usize = 8;
+
+// SAFETY: requests aligned to `PLAIN_ALIGN` or less go to mimalloc's plain
+// entries, which return blocks aligned to at least that (or null) and accept
+// any block mimalloc returned; everything else goes unchanged to
+// `mimalloc::MiMalloc`, whose `GlobalAlloc` implementation carries the
+// contract. A block is reallocated through the same entry family it was
+// allocated with, since both choices depend on the layout's alignment alone.
+// The reports only add to and subtract from an atomic counter.
 unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
     #[inline]
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let p = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        let p = if layout.align() <= PLAIN_ALIGN {
+            unsafe { libmimalloc_sys::mi_malloc(layout.size()) as *mut u8 }
+        } else {
+            unsafe { mimalloc::MiMalloc.alloc(layout) }
+        };
         if layout.size() >= zipp_vm::LARGE_BLOCK_BYTES && !p.is_null() {
             zipp_vm::note_large_block(0, layout.size());
         }
@@ -44,7 +60,11 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let p = unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) };
+        let p = if layout.align() <= PLAIN_ALIGN {
+            unsafe { libmimalloc_sys::mi_zalloc(layout.size()) as *mut u8 }
+        } else {
+            unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        };
         if layout.size() >= zipp_vm::LARGE_BLOCK_BYTES && !p.is_null() {
             zipp_vm::note_large_block(0, layout.size());
         }
@@ -61,7 +81,11 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        let p = unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) };
+        let p = if layout.align() <= PLAIN_ALIGN {
+            unsafe { libmimalloc_sys::mi_realloc(ptr.cast(), new_size) as *mut u8 }
+        } else {
+            unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        };
         if (layout.size() >= zipp_vm::LARGE_BLOCK_BYTES || new_size >= zipp_vm::LARGE_BLOCK_BYTES)
             && !p.is_null()
         {

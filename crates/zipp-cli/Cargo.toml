@@ -15,6 +15,10 @@ path = "src/main.rs"
 # which enables mimalloc/secure and excludes unsafe/JIT engine features. Keep an
 # opt-in hardened allocator here for deployments that accept its measured cost.
 mimalloc = { version = "0.1.52", default-features = false }
+# mimalloc's own plain entries (`mi_malloc` and kin), for requests aligned to
+# 8 or less: see `ReportingAlloc` in main.rs. The crate `mimalloc` already
+# depends on this one; naming it adds no code and no second copy.
+libmimalloc-sys = { version = "0.1.49", default-features = false }
 serde_json = "1.0"
 # The CLI's explicit `sandbox` command uses the VM's instruction/heap meter.
 # Ordinary `zipp js` does not attach a recorder, preserving its semantics; the

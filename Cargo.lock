@@ -1346,6 +1346,7 @@ dependencies = [
 name = "zipp-cli"
 version = "0.0.22"
 dependencies = [
+ "libmimalloc-sys",
  "mimalloc",
  "serde_json",
  "sha2",
