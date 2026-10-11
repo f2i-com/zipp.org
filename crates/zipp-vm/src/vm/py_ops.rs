@@ -36,8 +36,23 @@ enum OrdKey {
     Seq(Vec<OrdKey>),
 }
 
-/// An [`OrdKey`] for another module.
-pub(super) struct OrdKeyBox(OrdKey);
+/// A value as [`OrdKey`] reads one, with no key built: what it is and where
+/// it lives, for two values compared once (`Vm::py_ord_lt_values`). A sort
+/// builds each key once and compares it many times; a heap operation
+/// compares a few pairs, and a key per pair cost two allocations for every
+/// tuple in it.
+#[derive(Clone, Copy)]
+enum OrdRef {
+    Int(i128),
+    /// A slow-tier int (beyond i128): its heap slot.
+    Big(u32),
+    Float(f64),
+    /// A flattened heap string.
+    Str(u32),
+    None,
+    /// A tuple record's `items` Array.
+    Seq(u32),
+}
 
 /// Instruction steps charged per key and per comparison of a native sort.
 const ORD_STEPS_PER_UNIT: u64 = 8;
@@ -1366,8 +1381,9 @@ impl<'p> Vm<'p> {
             return self.py_ord_key(v, depth);
         }
         let idx = v.heap_index();
-        let items = match self.heap.get(idx) {
-            HeapObj::Array(items) if top => items.clone(),
+        // The Array holding the items.
+        let arr = match self.heap.get(idx) {
+            HeapObj::Array(_) if top => idx,
             HeapObj::Array(_) => return None,
             HeapObj::Object(m) if !m.is_ctor => {
                 if depth > 8 {
@@ -1380,28 +1396,167 @@ impl<'p> Vm<'p> {
                 if !items.is_heap() {
                     return None;
                 }
-                match self.heap.get(items.heap_index()) {
-                    HeapObj::Array(items) => items.clone(),
-                    _ => return None,
-                }
+                items.heap_index()
             }
             _ => return self.py_ord_key(v, depth),
         };
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
+        let n = match self.heap.get(arr) {
+            HeapObj::Array(items) => items.len(),
+            _ => return None,
+        };
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            // Read where it lives, each time: building a key allocates no
+            // heap object and runs no code (it may flatten a str, in that
+            // str's own slot), so the Array is as it was.
+            let item = match self.heap.get(arr) {
+                HeapObj::Array(items) => *items.get(i)?,
+                _ => return None,
+            };
             out.push(self.py_ord_key_rec(item, depth + 1, tuple, false)?);
         }
         Some(OrdKey::Seq(out))
     }
 
-    /// A value's key as op 2 reads it, for `vm::py_str`'s heap operations.
-    pub(super) fn py_ord_key_boxed(&mut self, v: Value, tuple: Value) -> Option<OrdKeyBox> {
-        self.py_ord_key_rec(v, 0, tuple, false).map(OrdKeyBox)
+    /// What `v` is as [`Vm::py_ord_key_rec`] reads one below the top level
+    /// (a tuple is a record whose class is `tuple`, nested at most 8 deep),
+    /// without its items; `None` for a value it gives no key.
+    fn py_ord_ref(&mut self, v: Value, depth: u32, tuple: Value) -> Option<OrdRef> {
+        if v.is_number() {
+            return Some(OrdRef::Float(v.as_f64()));
+        }
+        if v == Value::TRUE {
+            return Some(OrdRef::Int(1));
+        }
+        if v == Value::FALSE {
+            return Some(OrdRef::Int(0));
+        }
+        if v == Value::NULL {
+            return Some(OrdRef::None);
+        }
+        if let Some(n) = v.small_bigint_val() {
+            return Some(OrdRef::Int(n as i128));
+        }
+        if !v.is_heap() {
+            return None;
+        }
+        let idx = v.heap_index();
+        match self.heap.get(idx) {
+            HeapObj::Array(_) => return None,
+            HeapObj::Object(m) if !m.is_ctor => {
+                if depth > 8 {
+                    return None;
+                }
+                let (cls, items) = self.py_seq_parts(v)?;
+                if cls.bits() != tuple.bits() || !items.is_heap() {
+                    return None;
+                }
+                let arr = items.heap_index();
+                return matches!(self.heap.get(arr), HeapObj::Array(_)).then_some(OrdRef::Seq(arr));
+            }
+            HeapObj::BigInt(n) => return Some(OrdRef::Int(*n)),
+            HeapObj::BigIntBig(_) => return Some(OrdRef::Big(idx)),
+            _ => {}
+        }
+        if self.heap.is_str_like(idx) {
+            self.heap.flatten(idx);
+            return matches!(self.heap.get(idx), HeapObj::Str(_)).then_some(OrdRef::Str(idx));
+        }
+        None
     }
 
-    /// Python's `a < b` on two keys, when they are ordered.
-    pub(super) fn py_ord_lt_boxed(&self, a: &OrdKeyBox, b: &OrdKeyBox) -> Option<bool> {
-        self.py_ord_cmp(&a.0, &b.0).map(|o| o == std::cmp::Ordering::Less)
+    /// Python's `a < b` on two values as op 2 orders them (ints, floats,
+    /// strs, bools, None and tuple records of those), when they are
+    /// ordered: what [`Vm::py_ord_cmp`] answers for their two keys, read
+    /// from the values where they live. A tuple's items are compared in
+    /// turn and only as far as the first pair that differs, as Python's
+    /// own `<` compares them, so an item past that pair is never read (and
+    /// one this cannot order there does not make the answer `None`).
+    pub(super) fn py_ord_lt_values(&mut self, a: Value, b: Value, tuple: Value) -> Option<bool> {
+        let lt = self.py_ord_lt_in_place(a, b, tuple);
+        // Whenever both keys can be built, comparing them answers the same.
+        #[cfg(debug_assertions)]
+        if let (Some(ka), Some(kb)) = (self.py_ord_key_rec(a, 0, tuple, false), self.py_ord_key_rec(b, 0, tuple, false)) {
+            let by_key = self.py_ord_cmp(&ka, &kb).map(|o| o == std::cmp::Ordering::Less);
+            debug_assert!(by_key == lt, "in-place `<` {lt:?} differs from the keys' {by_key:?}");
+        }
+        lt
+    }
+
+    fn py_ord_lt_in_place(&mut self, a: Value, b: Value, tuple: Value) -> Option<bool> {
+        let x = self.py_ord_ref(a, 0, tuple)?;
+        let y = self.py_ord_ref(b, 0, tuple)?;
+        self.py_ord_cmp_refs(x, y, tuple, 0).map(|o| o == std::cmp::Ordering::Less)
+    }
+
+    /// [`Vm::py_ord_cmp`], arm for arm, on two values read where they live
+    /// (`depth`: how deep the two are nested in tuples).
+    fn py_ord_cmp_refs(&mut self, x: OrdRef, y: OrdRef, tuple: Value, depth: u32) -> Option<std::cmp::Ordering> {
+        use num_bigint::Sign::Minus;
+        use std::cmp::Ordering;
+        match (x, y) {
+            (OrdRef::Int(a), OrdRef::Int(b)) => Some(a.cmp(&b)),
+            // A slow-tier value is beyond i128: its sign decides.
+            (OrdRef::Int(_), OrdRef::Big(b)) => match self.heap.get(b) {
+                HeapObj::BigIntBig(q) => Some(if q.sign() == Minus { Ordering::Greater } else { Ordering::Less }),
+                _ => None,
+            },
+            (OrdRef::Big(a), OrdRef::Int(_)) => match self.heap.get(a) {
+                HeapObj::BigIntBig(p) => Some(if p.sign() == Minus { Ordering::Less } else { Ordering::Greater }),
+                _ => None,
+            },
+            (OrdRef::Big(a), OrdRef::Big(b)) => match (self.heap.get(a), self.heap.get(b)) {
+                (HeapObj::BigIntBig(p), HeapObj::BigIntBig(q)) => Some(p.cmp(q)),
+                _ => None,
+            },
+            (OrdRef::Int(a), OrdRef::Float(f)) => crate::vm::coerce::cmp_i128_f64(a, f),
+            (OrdRef::Float(f), OrdRef::Int(a)) => crate::vm::coerce::cmp_i128_f64(a, f).map(Ordering::reverse),
+            (OrdRef::Big(a), OrdRef::Float(f)) => match self.heap.get(a) {
+                HeapObj::BigIntBig(p) => super::bigint::cmp_big_f64(p, f),
+                _ => None,
+            },
+            (OrdRef::Float(f), OrdRef::Big(a)) => match self.heap.get(a) {
+                HeapObj::BigIntBig(p) => super::bigint::cmp_big_f64(p, f).map(Ordering::reverse),
+                _ => None,
+            },
+            (OrdRef::Float(a), OrdRef::Float(b)) => a.partial_cmp(&b),
+            (OrdRef::Str(a), OrdRef::Str(b)) => match (self.heap.get(a), self.heap.get(b)) {
+                (HeapObj::Str(p), HeapObj::Str(q)) => Some(p.as_bytes().cmp(q.as_bytes())),
+                _ => None,
+            },
+            (OrdRef::Seq(a), OrdRef::Seq(b)) => {
+                let mut i = 0usize;
+                loop {
+                    // The two items at `i`, read afresh: comparing the pair
+                    // before may have flattened a str (in its own slot), and
+                    // nothing here moves or resizes an Array.
+                    let (xv, yv) = match (self.heap.get(a), self.heap.get(b)) {
+                        (HeapObj::Array(xs), HeapObj::Array(ys)) => match (xs.get(i), ys.get(i)) {
+                            (Some(&xv), Some(&yv)) => (xv, yv),
+                            // Equal as far as the shorter goes.
+                            _ => return Some(xs.len().cmp(&ys.len())),
+                        },
+                        _ => return None,
+                    };
+                    let ex = self.py_ord_ref(xv, depth + 1, tuple)?;
+                    let ey = self.py_ord_ref(yv, depth + 1, tuple)?;
+                    // The first unequal pair decides, by `<`. None equals
+                    // None (and orders against nothing: a pair of them at
+                    // the top level is not ordered); a tuple never equals a
+                    // number or a str, nor a str a number, and `<` between
+                    // them is the general protocol's.
+                    let o = match (ex, ey) {
+                        (OrdRef::None, OrdRef::None) => Ordering::Equal,
+                        _ => self.py_ord_cmp_refs(ex, ey, tuple, depth + 1)?,
+                    };
+                    if o != Ordering::Equal {
+                        return Some(o);
+                    }
+                    i += 1;
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Python's `<` as an ordering (`None`: not ordered, or a NaN).

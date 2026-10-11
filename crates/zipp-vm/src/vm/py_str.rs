@@ -21,7 +21,6 @@
 use super::*;
 use crate::heap::{HeapObj, JsStr};
 use crate::value::Value;
-use super::py_ops::OrdKeyBox;
 
 /// Largest result made here; longer ones take the runtime's path.
 const MAX_OUT: usize = 1 << 24;
@@ -685,8 +684,11 @@ impl<'p> Vm<'p> {
 // floats, strs, bools, None and tuples of those, as `__zipp_py_ord` op 2
 // reads them): the runtime's sift, comparison for comparison (`lt` is
 // Python's `<`), with the list changed only once every comparison has been
-// answered. Anything else (an unordered pair, another item, an empty heap
-// for a pop) takes the runtime's own entry (`j<n>`).
+// answered. Each pair is compared where it lives (`Vm::py_ord_lt_values`),
+// two tuples item by item up to the first pair that differs, which is all
+// Python's `<` reads of them; no key is built. Anything else (a pair the
+// engine does not order, an empty heap for a pop) takes the runtime's own
+// entry (`j<n>`).
 //
 // ---- bisect (`__zipp_py_strm` ops 14 to 17) ------------------------------
 //
@@ -715,38 +717,28 @@ impl<'p> Vm<'p> {
             return None;
         }
         let (tmpl, ttype) = self.py_strm_seq_types(this, at)?;
-        if !tmpl.is_heap() {
-            return None;
-        }
-        let list_cls = self.py_json_field(tmpl.heap_index(), "cls")?;
-        let cls = self.py_json_field(seq.heap_index(), "cls")?;
+        // The two records' `cls` and `items` at their slots (one shape
+        // compare each for records of the usual layout).
+        let (list_cls, _) = self.py_seq_parts(tmpl)?;
+        let (cls, arr) = self.py_seq_parts(seq)?;
         if cls.bits() != list_cls.bits() && !(tuple_too && cls.bits() == ttype.bits()) {
             return None;
         }
-        let arr = self.py_json_field(seq.heap_index(), "items")?;
         if !arr.is_heap() || !matches!(self.heap.get(arr.heap_index()), HeapObj::Array(_)) {
             return None;
         }
         Some((arr.heap_index(), ttype))
     }
 
-    /// The key of `a[i]` (of `moving` for [`MOVING`]), made once.
-    fn py_heap_key(&mut self, keys: &mut Vec<(usize, OrdKeyBox)>, arr: u32, moving: Value, i: usize, tuple: Value) -> Option<usize> {
-        if let Some(pos) = keys.iter().position(|(j, _)| *j == i) {
-            return Some(pos);
-        }
-        let v = if i == MOVING { moving } else { self.py_arr_at(arr, i)? };
-        let k = self.py_ord_key_boxed(v, tuple)?;
-        keys.push((i, k));
-        Some(keys.len() - 1)
-    }
-
-    /// `a[x] < a[y]`, when the two are ordered.
-    fn py_heap_lt(&mut self, keys: &mut Vec<(usize, OrdKeyBox)>, arr: u32, moving: Value, x: usize, y: usize, tuple: Value) -> Option<bool> {
-        let kx = self.py_heap_key(keys, arr, moving, x, tuple)?;
-        let ky = self.py_heap_key(keys, arr, moving, y, tuple)?;
+    /// `a[x] < a[y]` (`moving` standing for [`MOVING`]), when the two are
+    /// ordered: compared where they live, as far as Python's `<` reads
+    /// them (`Vm::py_ord_lt_values`).
+    fn py_heap_lt(&mut self, arr: u32, moving: Value, x: usize, y: usize, tuple: Value) -> Option<bool> {
+        let a = if x == MOVING { moving } else { self.py_arr_at(arr, x)? };
+        let b = if y == MOVING { moving } else { self.py_arr_at(arr, y)? };
+        let lt = self.py_ord_lt_values(a, b, tuple)?;
         self.charge_steps(8);
-        self.py_ord_lt_boxed(&keys[kx].1, &keys[ky].1)
+        Some(lt)
     }
 
     /// The Array changed in place (moves within it need no barrier; a new
@@ -770,7 +762,6 @@ impl<'p> Vm<'p> {
             HeapObj::Array(a) => a.len(),
             _ => return None,
         };
-        let mut keys: Vec<(usize, OrdKeyBox)> = Vec::new();
         if push {
             let item = *args.get(1)?;
             if n >= (1 << 24) {
@@ -781,7 +772,7 @@ impl<'p> Vm<'p> {
             let mut path = Vec::new();
             while pos > 0 {
                 let parent = (pos - 1) >> 1;
-                if !self.py_heap_lt(&mut keys, arr, item, MOVING, parent, tuple)? {
+                if !self.py_heap_lt(arr, item, MOVING, parent, tuple)? {
                     break;
                 }
                 path.push(parent);
@@ -813,10 +804,10 @@ impl<'p> Vm<'p> {
                 let l = 2 * i + 1;
                 let r = l + 1;
                 let mut best = MOVING;
-                if l < m && self.py_heap_lt(&mut keys, arr, last, l, best, tuple)? {
+                if l < m && self.py_heap_lt(arr, last, l, best, tuple)? {
                     best = l;
                 }
-                if r < m && self.py_heap_lt(&mut keys, arr, last, r, best, tuple)? {
+                if r < m && self.py_heap_lt(arr, last, r, best, tuple)? {
                     best = r;
                 }
                 if best == MOVING {
@@ -850,14 +841,13 @@ impl<'p> Vm<'p> {
             HeapObj::Array(a) => a.len(),
             _ => return None,
         };
-        let mut keys: Vec<(usize, OrdKeyBox)> = Vec::new();
         let (mut lo, mut hi) = (0usize, n);
         while lo < hi {
             let mid = (lo + hi) / 2;
             let go_left = if right {
-                self.py_heap_lt(&mut keys, arr, x, MOVING, mid, tuple)?
+                self.py_heap_lt(arr, x, MOVING, mid, tuple)?
             } else {
-                !self.py_heap_lt(&mut keys, arr, x, mid, MOVING, tuple)?
+                !self.py_heap_lt(arr, x, mid, MOVING, tuple)?
             };
             if go_left {
                 hi = mid;
