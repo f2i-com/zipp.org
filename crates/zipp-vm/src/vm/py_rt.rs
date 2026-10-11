@@ -653,9 +653,13 @@ impl<'p> Vm<'p> {
         (!m.is_accessor_at(slot)).then(|| (m.val_at(slot), slot))
     }
 
-    /// An instance record's `cls` and `dict` (its first two slots when it
-    /// has the instance template's shape; found by name otherwise, `dict`
-    /// `undefined` when it has none).
+    /// A record's `cls` and `dict` (`undefined` when it has none), read at
+    /// their slots when the record has one of the runtime's layouts: an
+    /// instance's or an exception's (`cls`, `dict`, ...), or a list's,
+    /// tuple's, dict's or set's (`cls` first and no `dict`: `{cls, items}`,
+    /// `{cls, map, size}`). Found by name in a record of any other layout
+    /// (an instance of a class that subclasses a builtin container carries
+    /// its `dict` after the container's fields).
     #[inline]
     pub(super) fn py_inst_parts(&self, o: Value) -> Option<(Value, Value)> {
         if !o.is_heap() {
@@ -667,13 +671,30 @@ impl<'p> Vm<'p> {
         if m.is_ctor {
             return None;
         }
+        let by_name = || {
+            let c = m.pos("cls").filter(|&s| !m.is_accessor_at(s))?;
+            let d = m.pos("dict").filter(|&s| !m.is_accessor_at(s));
+            Some((m.val_at(c), d.map_or(Value::UNDEFINED, |s| m.val_at(s))))
+        };
+        // `shape::DICT` is also what the registry holds for a template it
+        // did not find plain, and what every dictionary-mode record has.
         let shape = m.shape();
-        if shape != crate::shape::DICT && self.py_rt.as_deref().is_some_and(|p| p.inst_shape == shape) {
-            return Some((m.val_at(0), m.val_at(1)));
+        if shape != crate::shape::DICT {
+            if let Some(p) = self.py_rt.as_deref() {
+                let parts = if shape == p.inst_shape || shape == p.exc_shape {
+                    Some((m.val_at(0), m.val_at(1)))
+                } else if shape == p.seq_shape || shape == p.dict_shape {
+                    Some((m.val_at(0), Value::UNDEFINED))
+                } else {
+                    None
+                };
+                if parts.is_some() {
+                    debug_assert!(parts == by_name(), "a template-shaped record's cls/dict are not at the template's slots");
+                    return parts;
+                }
+            }
         }
-        let c = m.pos("cls").filter(|&s| !m.is_accessor_at(s))?;
-        let d = m.pos("dict").filter(|&s| !m.is_accessor_at(s));
-        Some((m.val_at(c), d.map_or(Value::UNDEFINED, |s| m.val_at(s))))
+        by_name()
     }
 
     /// A record's own data `cls` (the first slot of a list, tuple, instance,
