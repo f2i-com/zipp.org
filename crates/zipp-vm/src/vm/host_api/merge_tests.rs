@@ -56,7 +56,7 @@ fn write_back_key_matching_is_linear_at_every_size() {
         let incoming: Vec<(String, HostValue)> = shuffled(old.clone())
             .into_iter()
             .map(|k| {
-                let i: f64 = k[1..].parse().unwrap();
+                let i = crate::num_parse::parse_f64(&k[1..]).unwrap();
                 (k, HostValue::Number(i + 1.0))
             })
             .collect();

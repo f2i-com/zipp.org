@@ -1059,7 +1059,7 @@ impl<'s> Lexer<'s> {
             text.push_str(&digits);
         }
         self.reject_ident_after(start)?;
-        let value: f64 = text.parse().unwrap_or(f64::NAN);
+        let value = crate::num_parse::parse_f64(&text).unwrap_or(f64::NAN);
         Ok(TokenKind::Num(NumLit { value, kind }))
     }
 

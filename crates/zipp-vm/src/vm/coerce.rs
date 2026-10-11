@@ -532,8 +532,9 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
         "-Infinity" => return f64::NEG_INFINITY,
         _ => {}
     }
-    // Rust's parser also accepts word forms JS rejects. A valid decimal or
-    // scientific literal begins (after an optional sign) with a digit or `.`.
+    // `parse_f64` keeps the grammar of Rust's parser, which also accepts word
+    // forms JS rejects. A valid decimal or scientific literal begins (after an
+    // optional sign) with a digit or `.`.
     let body = t.strip_prefix(['+', '-']).unwrap_or(t);
     if body
         .as_bytes()
@@ -542,7 +543,7 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
     {
         return f64::NAN;
     }
-    t.parse::<f64>().unwrap_or(f64::NAN)
+    crate::num_parse::parse_f64(t).unwrap_or(f64::NAN)
 }
 
 /// `ZIPP_ICSTATS=1` engagement census for `AddRightPair`.  `fast_str` and

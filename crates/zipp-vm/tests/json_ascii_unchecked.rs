@@ -1,9 +1,10 @@
 //! `JSON.parse`/`JSON.stringify` build `&str` views of bytes the scanner has
 //! already proved ASCII without a second `core::str::from_utf8` pass — an
-//! escape-free member name whose scan saw no byte >= 0x80, a number token
-//! (ASCII by grammar), and a flat heap string whose `JsStr::ascii` flag is set
+//! escape-free member name whose scan saw no byte >= 0x80 and a flat heap
+//! string whose `JsStr::ascii` flag is set (a number token, ASCII by grammar,
+//! was the third; the decimal parser now reads its bytes and needs no view)
 //! — and a plain integer token of at most 15 digits is read directly instead
-//! of through `str::parse::<f64>`.
+//! of through the general decimal parser.
 //!
 //! Both shortcuts must be INVISIBLE: the same bytes out of `stringify`, the
 //! same values out of `parse`, the same errors. The JS file attacks exactly

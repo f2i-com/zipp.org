@@ -81,9 +81,12 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
         p
     }
 }
+// `parse_f64` is the engine's decimal parser. Use it for every number read
+// here: one `str::parse::<f64>()` in this crate links core's 10 KB
+// power-of-five table back into every module.
 use zipp_vm::embed::{
-    compile_script_with_preamble, CompileOptions, ConsoleStream, FingerprintBudget, HostCallError,
-    HostCtx, HostValue, HostValueBudget, ScriptGoal, ScriptState, SymbolScope,
+    compile_script_with_preamble, parse_f64, CompileOptions, ConsoleStream, FingerprintBudget,
+    HostCallError, HostCtx, HostValue, HostValueBudget, ScriptGoal, ScriptState, SymbolScope,
     DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
     DEFAULT_HOST_VALUE_WORK_PER_NODE,
 };
@@ -2502,7 +2505,7 @@ fn resolve_accel_spec(ctx: &mut dyn HostCtx, spec: &str) -> Result<String, Strin
             ("g", Some(global)) if is_identifier(global) => Binding::Region(global),
             ("c", Some(global)) if is_identifier(global) => Binding::Verbatim,
             ("a", Some(id)) if is_accel_id_text(id) => Binding::Verbatim,
-            ("n", Some(number)) if number.parse::<f64>().is_ok_and(f64::is_finite) => {
+            ("n", Some(number)) if parse_f64(number).is_some_and(f64::is_finite) => {
                 Binding::Verbatim
             }
             ("t", None) => Binding::Verbatim,
@@ -2554,7 +2557,7 @@ fn is_accel_id_text(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 16
         && id.bytes().all(|b| b.is_ascii_digit())
-        && id.parse::<f64>().is_ok_and(|n| n <= MAX_ACCEL_ID)
+        && parse_f64(id).is_some_and(|n| n <= MAX_ACCEL_ID)
 }
 
 /// A function or trace-slot identifier as the guest passes it to the
@@ -2566,9 +2569,7 @@ fn accel_identifier(kind: &str, text: &str) -> Result<JsValue, String> {
 }
 
 fn parse_accel_identifier(kind: &str, text: &str) -> Result<f64, String> {
-    text.trim()
-        .parse::<f64>()
-        .ok()
+    parse_f64(text.trim())
         .filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0 && *n <= MAX_ACCEL_ID)
         .ok_or_else(|| {
             format!(
@@ -2760,10 +2761,9 @@ fn host_dispatch_ctx(
         .map(JsValue::unchecked_into::<js_sys::Function>)
         .ok_or_else(|| "Error: authorized host bridge is unavailable".to_owned())?;
     let number = |s: &str| -> Result<JsValue, String> {
-        s.trim()
-            .parse::<f64>()
+        parse_f64(s.trim())
             .map(JsValue::from_f64)
-            .map_err(|_| format!("TypeError: host bridge call '{kind}' expects a number"))
+            .ok_or_else(|| format!("TypeError: host bridge call '{kind}' expects a number"))
     };
     let call = match method {
         "compile" => f.call2(

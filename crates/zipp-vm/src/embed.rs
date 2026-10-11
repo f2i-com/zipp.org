@@ -45,6 +45,15 @@ pub use crate::vm::host_api::{HostCallCtx, HostCtx};
 pub use crate::vm::instrument::{op, TraceStep};
 pub use crate::vm::ConsoleStream;
 
+/// Decimal text to `f64`, exactly as `text.parse::<f64>().ok()` reads it (the
+/// same grammar, the same correctly rounded value), by the engine's own
+/// converter. An embedder that is counted in bytes parses numbers with this:
+/// one `parse::<f64>()` anywhere in the artifact links core's 10 KB
+/// power-of-five table back in (see `num_parse`).
+pub fn parse_f64(text: &str) -> Option<f64> {
+    crate::num_parse::parse_f64(text)
+}
+
 /// The embedder's side of `__zippHostCall(kind, ...args)`. Arguments arrive
 /// already stringified and the reply is a string, so anything structured
 /// crosses as JSON — both sides have a JSON implementation and neither needs to

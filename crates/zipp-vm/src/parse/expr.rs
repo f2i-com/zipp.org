@@ -1834,7 +1834,7 @@ impl<'s> Parser<'s> {
                 // longer carries its own digits (the lexer has already
                 // normalised `0x`/`0o`/`0b`/`_` to decimal).
                 if digits.len() <= 15 {
-                    let n: f64 = digits.parse().unwrap_or(f64::NAN);
+                    let n = crate::num_parse::parse_f64(&digits).unwrap_or(f64::NAN);
                     Ok(PropKey::Num(n))
                 } else {
                     Ok(PropKey::Str(StrVal::Utf8(digits)))

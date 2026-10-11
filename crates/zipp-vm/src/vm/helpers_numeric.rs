@@ -236,11 +236,8 @@ pub(crate) fn parse_int(s: &str, radix: i32) -> f64 {
     if pow2 && (i - start) as u64 * (radix as u32).trailing_zeros() as u64 > 53 {
         val = crate::parse::lexer::non_decimal_digits_to_f64(&b[start..i], radix as u32);
     } else if radix == 10 && i - start > 15 {
-        // Every run of ASCII digits is a valid Rust float literal.
-        val = std::str::from_utf8(&b[start..i])
-            .ok()
-            .and_then(|d| d.parse::<f64>().ok())
-            .unwrap_or(val);
+        // Every run of ASCII digits is a valid decimal literal.
+        val = crate::num_parse::parse_f64_bytes(&b[start..i]).unwrap_or(val);
     }
     sign * val
 }
@@ -291,7 +288,7 @@ pub(crate) fn parse_float(s: &str) -> f64 {
             end = e;
         }
     }
-    t[..end].parse::<f64>().unwrap_or(f64::NAN)
+    crate::num_parse::parse_f64_bytes(&b[..end]).unwrap_or(f64::NAN)
 }
 
 /// The array-index value of a canonical integer key -- `"0"`, `"1"`, `"10"`,

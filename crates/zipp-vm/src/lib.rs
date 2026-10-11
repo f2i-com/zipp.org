@@ -178,6 +178,9 @@ env_set_once!(
 );
 mod heap;
 pub use heap::{note_every_block, note_large_block, LARGE_BLOCK_BYTES};
+/// Decimal text to `f64` without core's 10 KB power-of-five table (see the
+/// module docs). Every string-to-number path in the engine goes through it.
+mod num_parse;
 /// Hand-written front end (lexer/AST/parser) being built to replace
 /// `oxc_parser` — see the module docs for why. Not yet wired in.
 mod parse;

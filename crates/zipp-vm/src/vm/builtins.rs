@@ -1735,9 +1735,9 @@ impl<'p> Vm<'p> {
         if key == "-0" {
             return true;
         }
-        match key.parse::<f64>() {
-            Ok(n) => crate::vm::helpers_num2::fmt_f64(n) == key,
-            Err(_) => false,
+        match crate::num_parse::parse_f64(key) {
+            Some(n) => crate::vm::helpers_num2::fmt_f64(n) == key,
+            None => false,
         }
     }
     /// Snapshot a TypedArray's elements as Values (numbers / BigInts).

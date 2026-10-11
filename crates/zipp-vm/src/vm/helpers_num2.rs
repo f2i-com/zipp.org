@@ -1396,7 +1396,7 @@ fn shortest_tie_neighbour(abs: f64, digits: &str, e: i32) -> Option<String> {
     if text.len() != digits.len() {
         return None;
     }
-    let back: f64 = format!("{text}e{}", s + 1).parse().ok()?;
+    let back = crate::num_parse::parse_f64(&format!("{text}e{}", s + 1))?;
     (back == abs).then_some(text)
 }
 

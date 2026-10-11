@@ -207,8 +207,10 @@ pub(crate) fn json_plain_key_enabled() -> bool {
 }
 
 /// Latch for the parser-proved ASCII views: `ZIPP_NO_JSON_ASCII_UNCHECKED=1`
-/// re-validates every escape-free member name, every number token and every
-/// ASCII string value through `core::str::from_utf8`, exactly as before.
+/// re-validates every escape-free member name and every ASCII string value
+/// through `core::str::from_utf8`, exactly as before. Number tokens were the
+/// third such view; `num_parse::parse_f64_bytes` now reads them from their
+/// bytes, so they need no `&str` under either setting.
 ///
 /// Those three sites were the whole `from_utf8` share of json-large (3.4% of
 /// PC samples): ~440,000 member names and ~225,000 number tokens per run on
@@ -249,8 +251,8 @@ pub(crate) fn ascii_bytes_as_str(bytes: &[u8]) -> Option<&str> {
     return Some(unsafe { std::str::from_utf8_unchecked(bytes) });
 }
 
-/// `ZIPP_NO_JSON_INT_FAST=1` sends every number token through
-/// `str::parse::<f64>` again (see `json_int_token_fast`).
+/// `ZIPP_NO_JSON_INT_FAST=1` sends every number token through the general
+/// parser, `num_parse::parse_f64_bytes`, again (see `json_int_token_fast`).
 pub(crate) fn json_int_fast_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
@@ -270,11 +272,11 @@ pub(crate) fn json_int_fast_enabled() -> bool {
 
 /// A plain integer token — `-?digits`, at most 15 digits, no fraction and no
 /// exponent — read directly. Below 10^15 every integer is exactly
-/// representable, so `u64 as f64` IS the correctly rounded value
-/// `parse::<f64>` returns; `-0` stays the negative zero `parse` gives (and
-/// `Value::num` keeps it a double). Anything else → `None`, the general
-/// parser. The caller has already validated the token against the JSON
-/// number grammar, so a leading zero can only be the lone `0`.
+/// representable, so `u64 as f64` IS the correctly rounded value the general
+/// parser returns; `-0` stays the negative zero it gives (and `Value::num`
+/// keeps it a double). Anything else → `None`, the general parser. The
+/// caller has already validated the token against the JSON number grammar,
+/// so a leading zero can only be the lone `0`.
 fn json_int_token_fast(tok: &[u8]) -> Option<f64> {
     if !json_int_fast_enabled() {
         return None;
@@ -435,21 +437,15 @@ pub(crate) fn json_parse_number(b: &[u8], i: &mut usize) -> Result<Value, Thrown
             *i += 1;
         }
     }
-    // Every byte the grammar above accepted is ASCII (`-`, digits, `.`, `e`,
-    // `E`, `+`), so the token is `&str` material without a UTF-8 pass.
+    // The decimal parser reads bytes, so the token needs no `&str` view (and
+    // no UTF-8 pass: the grammar above accepted only `-`, digits, `.`, `e`,
+    // `E` and `+`).
     let tok = &b[start..*i];
     if let Some(n) = json_int_token_fast(tok) {
         return Ok(Value::num(n));
     }
-    let text = match json_ascii_unchecked_enabled()
-        .then(|| ascii_bytes_as_str(tok))
-        .flatten()
-    {
-        Some(s) => s,
-        None => std::str::from_utf8(tok).unwrap_or(""),
-    };
-    match text.parse::<f64>() {
-        Ok(n) => Ok(Value::num(n)),
-        Err(_) => Err(err()),
+    match crate::num_parse::parse_f64_bytes(tok) {
+        Some(n) => Ok(Value::num(n)),
+        None => Err(err()),
     }
 }

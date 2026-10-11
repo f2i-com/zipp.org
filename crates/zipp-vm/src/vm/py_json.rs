@@ -546,7 +546,7 @@ impl<'s> Parser<'s> {
         self.i = i;
         let tok = std::str::from_utf8(&b[start..i]).ok()?;
         if float {
-            return tok.parse::<f64>().ok().map(Value::num);
+            return crate::num_parse::parse_f64(tok).map(Value::num);
         }
         // At most 38 digits always fits an i128.
         if tok.trim_start_matches('-').len() > 38 {
