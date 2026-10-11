@@ -98,11 +98,6 @@ pub(crate) const FID_MIRROR_NONE: u32 = u32::MAX;
 /// position, far below `u32::MAX`).
 const PROP_EMPTY: u32 = u32::MAX;
 
-/// The table hash of a property key: FNV-1a over the bytes, finished with a
-/// splitmix64-style avalanche; the HIGH half is the stored tag and also picks
-/// the bucket (`tag & mask`), so growth rehashes straight from stored tags —
-/// no key re-reads (same scheme as vm/collections.rs' CollIndex).
-#[inline]
 /// B219 latch: `ZIPP_NO_HASH_ONCE=1` recomputes the property tag at each
 /// site instead of threading one through the probe/insert pair.
 pub(crate) fn hash_once_enabled() -> bool {
@@ -158,11 +153,69 @@ pub(crate) fn hash_seed() -> u64 {
     }
 }
 
-fn prop_tag(key: &str) -> u32 {
-    let mut h: u64 = 0xCBF2_9CE4_8422_2325 ^ hash_seed();
-    for &b in key.as_bytes() {
-        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3);
+/// The hash of a string's bytes that the table hashes start from (this
+/// property tag, and the Map/Set index's string hash), keyed by
+/// [`hash_seed`]. Eight bytes a step.
+///
+/// It was FNV-1a: a multiply a byte, each waiting on the one before, so a
+/// seven-byte property name was seven multiplies in a row before the
+/// avalanche's two, and `o[k]` with a string key spent more on hashing `k`
+/// than on finding it. A key of up to eight bytes is now one step.
+///
+/// Keys of one length never collide here unless they are equal: the bytes
+/// map to the words injectively (whole words, then the last eight bytes,
+/// which overlap the word before unless the length is a multiple of eight;
+/// under eight bytes two overlapping halves, under four the first, middle
+/// and last byte), and a step is a bijection of the state for a given word.
+/// The length is in the basis, so a key and its prefix start apart. The
+/// shift comes BEFORE the multiply in a step: a word's top bit would
+/// otherwise pass through the multiply as the top bit alone, whatever the
+/// seed, and a second word could cancel it, which is a family of collisions
+/// computed offline; folded down first, it changes the product by carries
+/// that depend on the state.
+#[inline]
+pub(crate) fn seeded_bytes_hash(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    #[inline(always)]
+    fn step(h: u64, word: u64) -> u64 {
+        let h = h ^ word;
+        (h ^ (h >> 32)).wrapping_mul(K)
     }
+    #[inline(always)]
+    fn word(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+    #[inline(always)]
+    fn half(bytes: &[u8], at: usize) -> u64 {
+        u64::from(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
+    }
+    let n = bytes.len();
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325 ^ hash_seed() ^ (n as u64).wrapping_mul(K);
+    if n >= 8 {
+        let mut at = 0;
+        while at + 8 <= n {
+            h = step(h, word(bytes, at));
+            at += 8;
+        }
+        if at < n {
+            h = step(h, word(bytes, n - 8));
+        }
+    } else if n >= 4 {
+        h = step(h, half(bytes, 0) | half(bytes, n - 4) << 32);
+    } else if n > 0 {
+        let w = u64::from(bytes[0]) | u64::from(bytes[n / 2]) << 8 | u64::from(bytes[n - 1]) << 16;
+        h = step(h, w);
+    }
+    h
+}
+
+/// The table hash of a property key: [`seeded_bytes_hash`], finished with a
+/// splitmix64-style avalanche; the HIGH half is the stored tag and also picks
+/// the bucket (`tag & mask`), so growth rehashes straight from stored tags —
+/// no key re-reads (same scheme as vm/collections.rs' CollIndex).
+#[inline]
+fn prop_tag(key: &str) -> u32 {
+    let mut h = seeded_bytes_hash(key.as_bytes());
     h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     ((h ^ (h >> 31)) >> 32) as u32
@@ -11333,5 +11386,66 @@ mod key_eq_tests {
         }
         assert!(key_eq("caf\u{e9}", "caf\u{e9}"));
         assert!(!key_eq("caf\u{e9}", "caf\u{e8}"));
+    }
+}
+
+#[cfg(test)]
+mod seeded_bytes_hash_tests {
+    use super::{prop_tag, seeded_bytes_hash};
+    use std::collections::HashSet;
+
+    #[test]
+    fn every_byte_and_the_length_reach_the_hash() {
+        let base: Vec<u8> = (0u8..40).map(|i| b'a' + i % 26).collect();
+        for n in 0..=40usize {
+            let key = &base[..n];
+            let h = seeded_bytes_hash(key);
+            assert_eq!(h, seeded_bytes_hash(&key.to_vec()), "length {n}: not a function of the bytes");
+            // One byte changed, at each position in turn, in each of its bits.
+            for at in 0..n {
+                for bit in 0..8 {
+                    let mut other = key.to_vec();
+                    other[at] ^= 1 << bit;
+                    assert_ne!(h, seeded_bytes_hash(&other), "length {n}, byte {at}, bit {bit}");
+                }
+            }
+            // A key and the key one byte longer, whatever that byte is.
+            for extra in [0u8, b'a', 0xff] {
+                let mut longer = key.to_vec();
+                longer.push(extra);
+                assert_ne!(h, seeded_bytes_hash(&longer), "length {n} and one more ({extra})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_top_bit_in_one_word_is_not_cancelled_by_the_next() {
+        // Under a step that only multiplies, these pairs collide for every seed.
+        for len in [16usize, 24, 32] {
+            let a = vec![b'q'; len];
+            let mut b = a.clone();
+            b[7] ^= 0x80;
+            b[15] ^= 0x80;
+            assert_ne!(seeded_bytes_hash(&a), seeded_bytes_hash(&b), "length {len}");
+        }
+    }
+
+    #[test]
+    fn short_keys_spread_over_a_table() {
+        // 20,000 identifier-like keys into 32,768 buckets: a fair hash leaves
+        // about 46% of the keys sharing a bucket, and none deep.
+        let keys: Vec<String> = (0..20_000).map(|i| format!("key{i}")).collect();
+        let mut buckets = vec![0u32; 32_768];
+        let mut tags = HashSet::new();
+        for k in &keys {
+            let tag = prop_tag(k);
+            tags.insert(tag);
+            buckets[(tag & 32_767) as usize] += 1;
+        }
+        assert!(tags.len() > 19_990, "{} distinct tags of 20,000", tags.len());
+        let deepest = buckets.iter().copied().max().unwrap();
+        assert!(deepest <= 8, "a bucket holds {deepest} keys");
+        let used = buckets.iter().filter(|&&n| n > 0).count();
+        assert!(used > 14_000, "{used} buckets used");
     }
 }

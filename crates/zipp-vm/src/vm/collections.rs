@@ -95,15 +95,12 @@ fn mix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// FNV-1a over a byte string (the string-content repr), from a basis keyed by
-/// the per-process [`crate::heap::hash_seed`].
+/// The hash of a byte string (the string-content repr), from a basis keyed by
+/// the per-process [`crate::heap::hash_seed`]: the one a property tag starts
+/// from, eight bytes a step where it was FNV-1a's one.
 #[inline]
 fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xCBF2_9CE4_8422_2325 ^ crate::heap::hash_seed();
-    for &b in bytes {
-        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3);
-    }
-    h
+    crate::heap::seeded_bytes_hash(bytes)
 }
 
 /// Per-collection acceleration index. Ordinary builds retain the measured flat
