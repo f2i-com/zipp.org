@@ -271,6 +271,23 @@ impl<'p> Vm<'p> {
         self.py_hint_field(h, idx, key)
     }
 
+    /// [`Vm::py_strm_prop`] of a builtin record, tried first at `at`: the
+    /// slot the calling site remembers for this record (`usize::MAX`: none).
+    /// The VM's hint `h` is one cell for every builtin record, and their
+    /// slots for a key differ (the runtime's `install` appends `strop`,
+    /// `ltmpl` and `ttype` after however many entries a record already
+    /// had), so that hint alone misses at every call of a program that
+    /// alternates between two str methods, and the key is found by name.
+    #[inline]
+    fn py_strm_prop_at(&self, idx: u32, at: usize, h: usize, key: &str) -> Option<Value> {
+        if let HeapObj::Object(m) = self.heap.get(idx) {
+            if !m.is_ctor && at < m.len() && super::py_rt::key_eq(m.key_at(at), key) && !m.is_accessor_at(at) {
+                return Some(m.val_at(at));
+            }
+        }
+        self.py_hint_field(h, idx, key)
+    }
+
     /// A primitive str with no lone surrogate, flattened in place: its heap
     /// slot and whether it is ASCII. The bytes are then read where they
     /// live ([`Vm::py_strm_bytes`]) once every operand has been flattened --
@@ -303,7 +320,14 @@ impl<'p> Vm<'p> {
 
     /// `__zipp_py_strm`, called as `builtin.c<n>(...args)`.
     pub(crate) fn py_str_method(&mut self, this: Value, args: &[Value]) -> Result<Value, Thrown> {
-        if let Some(v) = self.py_strm_fast(this, args) {
+        self.py_str_method_at(this, args, usize::MAX)
+    }
+
+    /// [`Vm::py_str_method`] from a call site that remembers the slot of
+    /// the record's `strop` (`at`, `usize::MAX` for none; the runtime adds
+    /// `ltmpl` and `ttype` with it, so they are looked for after it).
+    pub(crate) fn py_str_method_at(&mut self, this: Value, args: &[Value], at: usize) -> Result<Value, Thrown> {
+        if let Some(v) = self.py_strm_fast(this, args, at) {
             return Ok(v);
         }
         // The entry this one stands in for, with the same arguments.
@@ -323,19 +347,19 @@ impl<'p> Vm<'p> {
         self.call_value(f, this, args)
     }
 
-    fn py_strm_fast(&mut self, this: Value, args: &[Value]) -> Option<Value> {
+    fn py_strm_fast(&mut self, this: Value, args: &[Value], at: usize) -> Option<Value> {
         if !this.is_heap() {
             return None;
         }
-        let op = self.py_strm_prop(this.heap_index(), hint::STROP, "strop")?;
+        let op = self.py_strm_prop_at(this.heap_index(), at, hint::STROP, "strop")?;
         if !op.is_int() {
             return None;
         }
         let op = op.as_int();
         match (op, args.len()) {
-            (12, 2) => return self.py_heap_op(this, args, true),
-            (14..=17, 2) => return self.py_bisect_op(this, args, op),
-            (13, 1) => return self.py_heap_op(this, args, false),
+            (12, 2) => return self.py_heap_op(this, args, true, at),
+            (14..=17, 2) => return self.py_bisect_op(this, args, op, at),
+            (13, 1) => return self.py_heap_op(this, args, false, at),
             // `hash(s)` of a str: `strHash` (`runtime/types.js`).
             (10, 1) => {
                 let v = args[0];
@@ -395,7 +419,7 @@ impl<'p> Vm<'p> {
                     .filter(|p| !p.is_empty())
                     .map(|p| p.to_vec())
                     .collect();
-                return self.py_strm_list(this, parts);
+                return self.py_strm_list(this, parts, at);
             }
             (4, 2) => {
                 let (sep_idx, _) = self.py_strm_flat(args[1])?;
@@ -420,7 +444,7 @@ impl<'p> Vm<'p> {
                     parts.push(s[start..].to_vec());
                     parts
                 };
-                return self.py_strm_list(this, parts);
+                return self.py_strm_list(this, parts, at);
             }
             (5, 3) => {
                 let (old_idx, _) = self.py_strm_flat(args[1])?;
@@ -492,17 +516,14 @@ impl<'p> Vm<'p> {
                 if !items.is_heap() {
                     return None;
                 }
-                let tmpl = self.py_strm_prop(this.heap_index(), hint::LTMPL, "ltmpl")?;
-                let ttype = self.py_strm_prop(this.heap_index(), hint::TTYPE, "ttype")?;
-                if !tmpl.is_heap() {
-                    return None;
-                }
-                let list_cls = self.py_json_field(tmpl.heap_index(), "cls")?;
-                let cls = self.py_json_field(items.heap_index(), "cls")?;
+                let (tmpl, ttype) = self.py_strm_seq_types(this, at)?;
+                // The two records' `cls` and `items` at their slots (one
+                // shape compare each for records of the usual layout).
+                let (list_cls, _) = self.py_seq_parts(tmpl)?;
+                let (cls, arr) = self.py_seq_parts(items)?;
                 if cls.bits() != list_cls.bits() && cls.bits() != ttype.bits() {
                     return None;
                 }
-                let arr = self.py_json_field(items.heap_index(), "items")?;
                 if !arr.is_heap() {
                     return None;
                 }
@@ -579,20 +600,44 @@ impl<'p> Vm<'p> {
         Some(out)
     }
 
+    /// The builtin record `this`'s `ltmpl` (an empty list) and `ttype` (the
+    /// tuple type), looked for right after its `strop` at `at`.
+    #[inline]
+    fn py_strm_seq_types(&self, this: Value, at: usize) -> Option<(Value, Value)> {
+        let idx = this.heap_index();
+        let tmpl = self.py_strm_prop_at(idx, at.saturating_add(1), hint::LTMPL, "ltmpl")?;
+        let ttype = self.py_strm_prop_at(idx, at.saturating_add(2), hint::TTYPE, "ttype")?;
+        Some((tmpl, ttype))
+    }
+
     /// A list of these strs, made from the record's `ltmpl` (an empty list).
-    fn py_strm_list(&mut self, this: Value, parts: Vec<Vec<u8>>) -> Option<Value> {
+    fn py_strm_list(&mut self, this: Value, parts: Vec<Vec<u8>>, at: usize) -> Option<Value> {
         if parts.len() > (1 << 24) {
             return None;
         }
-        let tmpl = self.py_strm_prop(this.heap_index(), hint::LTMPL, "ltmpl")?;
-        let (rec, slot) = self.py_json_template(tmpl, &["cls", "items"])?;
+        let tmpl = self.py_strm_prop_at(this.heap_index(), at.saturating_add(1), hint::LTMPL, "ltmpl")?;
+        // A list record as a list display's `PySeq` allocates one: laid out
+        // like the template (the same `sequence` literal made both), its
+        // class the template's own. A template of another layout is copied
+        // whole instead.
+        let seq_shape = self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape);
+        let like = if self.py_alloc_like_ok(tmpl, seq_shape) { self.py_seq_parts(tmpl).map(|(cls, _)| cls) } else { None };        let copy = match like {
+            Some(_) => None,
+            None => Some(self.py_json_template(tmpl, &["cls", "items"])?),
+        };
         let total: u64 = parts.iter().map(|p| p.len() as u64).sum();
         let items: Vec<Value> = parts.into_iter().map(|p| self.py_strm_new(p)).collect();
         let arr = Value::heap(self.heap.alloc(HeapObj::Array(items)));
-        let mut rec = rec;
-        rec.set_val_at(slot, arr);
+        let list = match (like, copy) {
+            (Some(cls), _) => self.py_alloc_like(tmpl, seq_shape, &[cls, arr])?,
+            (None, Some((mut rec, slot))) => {
+                rec.set_val_at(slot, arr);
+                self.alloc_object_current_realm(rec)
+            }
+            (None, None) => return None,
+        };
         self.charge_steps(i64::try_from(total).unwrap_or(i64::MAX));
-        Some(self.alloc_object_current_realm(rec))
+        Some(list)
     }
 }
 
@@ -628,12 +673,11 @@ impl<'p> Vm<'p> {
 
     /// The Array of an exact list (or, with `tuple_too`, tuple) `seq`, and
     /// the tuple type (for the keys).
-    fn py_seq_array(&self, this: Value, seq: Value, tuple_too: bool) -> Option<(u32, Value)> {
+    fn py_seq_array(&self, this: Value, seq: Value, tuple_too: bool, at: usize) -> Option<(u32, Value)> {
         if !seq.is_heap() || !this.is_heap() {
             return None;
         }
-        let tmpl = self.py_strm_prop(this.heap_index(), hint::LTMPL, "ltmpl")?;
-        let ttype = self.py_strm_prop(this.heap_index(), hint::TTYPE, "ttype")?;
+        let (tmpl, ttype) = self.py_strm_seq_types(this, at)?;
         if !tmpl.is_heap() {
             return None;
         }
@@ -683,8 +727,8 @@ impl<'p> Vm<'p> {
     }
 
     /// Ops 12 / 13; `None` sends the call to the runtime's entry.
-    fn py_heap_op(&mut self, this: Value, args: &[Value], push: bool) -> Option<Value> {
-        let (arr, tuple) = self.py_seq_array(this, *args.first()?, false)?;
+    fn py_heap_op(&mut self, this: Value, args: &[Value], push: bool, at: usize) -> Option<Value> {
+        let (arr, tuple) = self.py_seq_array(this, *args.first()?, false, at)?;
         let n = match self.heap.get(arr) {
             HeapObj::Array(a) => a.len(),
             _ => return None,
@@ -760,10 +804,10 @@ impl<'p> Vm<'p> {
     }
 
     /// Ops 14 to 17; `None` sends the call to the runtime's entry.
-    fn py_bisect_op(&mut self, this: Value, args: &[Value], op: i32) -> Option<Value> {
+    fn py_bisect_op(&mut self, this: Value, args: &[Value], op: i32, at: usize) -> Option<Value> {
         let insort = op >= 16;
         let right = op == 15 || op == 17;
-        let (arr, tuple) = self.py_seq_array(this, args[0], !insort)?;
+        let (arr, tuple) = self.py_seq_array(this, args[0], !insort, at)?;
         let x = args[1];
         let n = match self.heap.get(arr) {
             HeapObj::Array(a) => a.len(),

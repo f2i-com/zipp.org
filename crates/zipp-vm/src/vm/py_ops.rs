@@ -542,11 +542,24 @@ impl<'p> Vm<'p> {
                 }
                 usize::MAX
             }),
-            // What the slow edge's `CallWithThis` does with this entry.
-            PyCallee::Other(entry) => self.with_argv(base, arg_base, argc, |vm, argv| vm.call_value(entry, fv, argv)).map(|v| {
-                self.set(base, dst, v);
-                ip + 1
-            }),
+            // What the slow edge's `CallWithThis` does with this entry. The
+            // runtime's `__zipp_py_strm` (the entry of its native str
+            // methods, `hash`, `heapq`, `bisect`, `math.sqrt`) is called
+            // where it is: `call_value` reaches a native through its
+            // cascade of rarer callees and `call_native`'s match, to run
+            // this same function with these same arguments.
+            PyCallee::Other(entry) => {
+                let r = if self.py_strm_entry(entry) {
+                    let at = self.py_strm_site(func_id, ip, fv);
+                    self.with_argv(base, arg_base, argc, |vm, argv| vm.py_str_method_at(fv, argv, at))
+                } else {
+                    self.with_argv(base, arg_base, argc, |vm, argv| vm.call_value(entry, fv, argv))
+                };
+                r.map(|v| {
+                    self.set(base, dst, v);
+                    ip + 1
+                })
+            }
             PyCallee::Slow => Ok(slow as usize),
         };
         if r.is_err() {
@@ -561,6 +574,41 @@ impl<'p> Vm<'p> {
             self.py_prof_step(func_id, ip, instr, &shown);
         }
         r
+    }
+
+    /// Whether `entry` is the `__zipp_py_strm` native in a program with no
+    /// other realm (`call_value` runs a native of a realm's copy of the
+    /// builtins in that realm, and probes a realm's `eval` first: with
+    /// neither table in use it calls `call_native` with nothing around it).
+    #[inline]
+    fn py_strm_entry(&self, entry: Value) -> bool {
+        matches!(self.heap.get(entry.heap_index()), HeapObj::Native(id) if *id == super::native::PY_STRM)
+            && self.realm_global_objs.is_empty()
+            && self.realm_fns.is_empty()
+    }
+
+    /// The slot of the builtin record `f`'s `strop` for the [`Instr::PyCall`]
+    /// at `ip`, kept in the site's entry (`d`, plus one; 0 for not looked up
+    /// yet): the record a site calls is the same one call after call, where
+    /// the VM's one hint for `strop` is shared by every builtin record and
+    /// their slots differ. A hint, as that one is: its user checks the key.
+    /// `usize::MAX` when there is none.
+    #[inline]
+    fn py_strm_site(&mut self, func_id: u32, ip: usize, f: Value) -> usize {
+        let e = self.py_ic(func_id, ip);
+        if e.kind != ic::CALL_ENTRY || e.a != f.bits() {
+            return usize::MAX;
+        }
+        if e.d != 0 {
+            return (e.d - 1) as usize;
+        }
+        let Some((_, slot)) = self.py_hint_slot(super::py_rt::hint::STROP, f.heap_index(), "strop") else {
+            return usize::MAX;
+        };
+        if let Ok(d) = u32::try_from(slot + 1) {
+            self.py_ic_put(func_id, ip, PyIc { d, ..e });
+        }
+        slot
     }
 
     /// The parameters a [`Instr::PyCall`] left unbound in the frame just

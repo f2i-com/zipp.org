@@ -104,8 +104,10 @@ pub(super) mod ic {
     /// `PyNew`: slot hints only, `pos` the class's entry, `hver` the
     /// `__init__`'s.
     pub const NEW: u8 = 11;
-    /// `PyCallEntry`: `a` the function record, `hver` its heap version,
-    /// `pos` the entry's slot.
+    /// `PyCallEntry` / `PyCall`: `a` the function record, `hver` its heap
+    /// version, `pos` the entry's slot; `d`, for a `PyCall` whose entry is
+    /// `__zipp_py_strm`, the slot of the record's `strop` plus one (0: not
+    /// looked up; a hint, see `Vm::py_strm_site`).
     pub const CALL_ENTRY: u8 = 12;
     /// `PyGetAttr` / `PyClassAttr` (`ga`) or `PySetAttr` (`sa`) where the
     /// class's table did not say `true` for the name: `a` class, `c` its
