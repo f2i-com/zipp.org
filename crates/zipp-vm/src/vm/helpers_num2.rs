@@ -1680,7 +1680,7 @@ mod binary_fraction_tests {
                     Some(text) => {
                         taken += 1;
                         assert_eq!(text, general(false, abs), "{abs:?}");
-                        assert_eq!(text.parse::<f64>().unwrap(), abs);
+                        assert_eq!(crate::num_parse::parse_f64(&text), Some(abs));
                     }
                     None => declined += 1,
                 }
