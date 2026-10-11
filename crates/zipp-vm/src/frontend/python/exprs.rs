@@ -1388,8 +1388,16 @@ impl<'a> Emitter<'a> {
             if let Some(r) = self.super_method_call(a, c, depth)? {
                 return Ok(r);
             }
+            // A module-level name an `import` of this module binds.
+            let module = match a.value.as_ref() {
+                ast::Expr::Name(n) => {
+                    let name = n.id.as_str();
+                    self.sym_kind(name) == SymKind::Global && self.table.scopes.first().is_some_and(|s| s.imports.contains(name))
+                }
+                _ => false,
+            };
             let obj = self.expr(&a.value, depth)?;
-            return self.method_call(obj, a.attr.as_str(), c, depth);
+            return self.method_call(obj, a.attr.as_str(), c, depth, module);
         }
         let f = self.expr(&c.func, depth)?;
         if c.keywords.is_empty() && c.args.len() <= MAX_DIRECT && !c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_))) {
@@ -1668,14 +1676,14 @@ impl<'a> Emitter<'a> {
     /// Otherwise `mlookup` resolves the attribute first: a function found on
     /// the type comes back unbound (with `mself` set) and is called with the
     /// receiver prepended, so no bound method is allocated either way.
-    fn method_call(&mut self, obj: Reg, name: &str, c: &ast::ExprCall, depth: usize) -> R<Reg> {
+    fn method_call(&mut self, obj: Reg, name: &str, c: &ast::ExprCall, depth: usize, module: bool) -> R<Reg> {
         if self.fast
             && c.keywords.is_empty()
             && c.args.len() < MAX_DIRECT
             && !c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_)))
             && !matches!(name, "__proto__")
         {
-            return self.method_call_positional(obj, name, &c.args, depth);
+            return self.method_call_positional(obj, name, &c.args, depth, module);
         }
         let name = self.string(name)?;
         let transparent = c.args.iter().chain(c.keywords.iter().map(|k| &k.value)).all(|e| self.order_transparent(e));
@@ -1742,9 +1750,9 @@ impl<'a> Emitter<'a> {
     /// receiver first. Otherwise `mfind` resolves it (and fills those caches)
     /// and says whether the receiver goes first. The call then takes the
     /// callee's positional entry for the count when it has one.
-    fn method_call_positional(&mut self, obj: Reg, name: &str, args: &[ast::Expr], depth: usize) -> R<Reg> {
+    fn method_call_positional(&mut self, obj: Reg, name: &str, args: &[ast::Expr], depth: usize, module: bool) -> R<Reg> {
         if args.iter().all(|e| self.order_transparent(e)) {
-            return self.method_call_transparent(obj, name, args, depth);
+            return self.method_call_transparent(obj, name, args, depth, module);
         }
         let n = args.len();
         let f = self.alloc()?;
@@ -1752,21 +1760,24 @@ impl<'a> Emitter<'a> {
         let mut slow = Vec::new();
         let mut found = Vec::new();
         let gb_key = format!("{name}#{n}");
-        // A user class's method or a builtin type's, found natively (every
-        // other case resolves below).
+        // A user class's method or a builtin type's, found natively, or a
+        // module's function (every other case resolves below). A receiver
+        // an `import` binds (`module`) is asked as a module first.
         let rt = self.r_rt;
         let key = self.string_const(name);
         let gb = self.string_index(&gb_key);
-        let at_m = self.emit(Instr::PyMethod { dst: f, obj, rt, key, gb, slow: 0 })?;
-        self.emit(Instr::LoadBool { dst: prepend, val: true })?;
-        let fused = self.jump()?;
-        let here = self.here();
-        self.patch_slow(at_m, here)?;
-        let at_mod = self.emit(Instr::PyModGet { dst: f, obj, rt, key, slow: 0 })?;
-        self.emit(Instr::LoadBool { dst: prepend, val: false })?;
-        let fused_mod = self.jump()?;
-        let here = self.here();
-        self.patch_slow(at_mod, here)?;
+        let mut fused = Vec::new();
+        for as_module in if module { [true, false] } else { [false, true] } {
+            let at = if as_module {
+                self.emit(Instr::PyModGet { dst: f, obj, rt, key, slow: 0 })?
+            } else {
+                self.emit(Instr::PyMethod { dst: f, obj, rt, key, gb, slow: 0 })?
+            };
+            self.emit(Instr::LoadBool { dst: prepend, val: !as_module })?;
+            fused.push(self.jump()?);
+            let here = self.here();
+            self.patch_slow(at, here)?;
+        }
         // An object receiver: a user class's method, or a builtin's.
         let cls = self.alloc()?;
         let not_obj = self.emit(Instr::PyClassOf { dst: cls, obj, slow: 0 })?;
@@ -1834,8 +1845,9 @@ impl<'a> Emitter<'a> {
         let here = self.here();
         self.patch(resolved, here)?;
         self.patch(module_found, here)?;
-        self.patch(fused, here)?;
-        self.patch(fused_mod, here)?;
+        for j in fused {
+            self.patch(j, here)?;
+        }
         let mut regs = Vec::with_capacity(n);
         for a in args {
             regs.push(self.expr(a, depth)?);
@@ -1871,13 +1883,37 @@ impl<'a> Emitter<'a> {
     /// is called straight away with the receiver first. Every other case
     /// (a module function, a builtin container's or str's method, and the
     /// general `mfind` resolution) is laid out of line.
-    fn method_call_transparent(&mut self, obj: Reg, name: &str, args: &[ast::Expr], depth: usize) -> R<Reg> {
+    fn method_call_transparent(&mut self, obj: Reg, name: &str, args: &[ast::Expr], depth: usize, module: bool) -> R<Reg> {
         let n = args.len();
         let mut regs = Vec::with_capacity(n);
         for a in args {
             regs.push(self.expr(a, depth)?);
         }
         let dst = self.alloc()?;
+        if module {
+            // A name an `import` binds: most likely a module, whose function
+            // is its global, called as it is (`PyModGet` first, where a
+            // receiver of any other kind takes it second); the receiver's
+            // method otherwise, out of line.
+            let g = self.alloc()?;
+            let rt = self.r_rt;
+            let key = self.string_const(name);
+            let at_mod = self.emit(Instr::PyModGet { dst: g, obj, rt, key, slow: 0 })?;
+            let r = self.call_with(g, &regs)?;
+            self.emit(Instr::Move { dst, src: r })?;
+            let name = name.to_owned();
+            self.defer_cold(Vec::new(), vec![at_mod], move |e| e.method_call_found(obj, &name, &regs, dst));
+            return Ok(dst);
+        }
+        self.method_call_found(obj, name, &regs, dst)?;
+        Ok(dst)
+    }
+
+    /// [`Emitter::method_call_transparent`] once its arguments are in
+    /// `regs`: the result in `dst`.
+    fn method_call_found(&mut self, obj: Reg, name: &str, regs: &[Reg], dst: Reg) -> R<()> {
+        let n = regs.len();
+        let regs = regs.to_vec();
         // A user class's method or a builtin type's, found natively, then
         // called with the receiver first; the general resolution out of
         // line.
@@ -1903,7 +1939,7 @@ impl<'a> Emitter<'a> {
         }
         let name = name.to_owned();
         self.defer_cold(Vec::new(), vec![at_m], move |e| e.method_call_resolved(obj, &name, &regs, dst));
-        Ok(dst)
+        Ok(())
     }
 
     /// [`Emitter::method_call_transparent`]'s general form, for evaluated

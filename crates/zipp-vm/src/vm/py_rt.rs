@@ -144,6 +144,8 @@ pub(super) mod ic {
     /// entry for the count that is not the runtime's plain construction:
     /// the instruction takes its slow edge while that record is unchanged.
     pub const NEW_NO: u8 = 20;
+    /// `PyModGet`: as [`GLOBAL`], over the module's globals Map.
+    pub const MOD_GET: u8 = 21;
 }
 
 /// One per-site cache entry (see the module comment); kind 0 is empty.
@@ -356,6 +358,7 @@ fn caches(i: &crate::bytecode::Instr) -> bool {
             | Instr::PySetAttr { .. }
             | Instr::PyGlobal { .. }
             | Instr::PyMethod { .. }
+            | Instr::PyModGet { .. }
             | Instr::PyClassAttr { .. }
             | Instr::PyAttrFn { .. }
             | Instr::PyIsInstance { .. }

@@ -59,6 +59,9 @@ pub(super) struct Scope {
     /// is copied out of its register, so an operand already evaluated keeps
     /// its value when a later operand of the same expression rebinds it.
     pub walrus_targets: BTreeSet<String>,
+    /// Names an `import` statement of this scope's own code binds (to a
+    /// module, unless something else rebinds them).
+    pub imports: BTreeSet<String>,
     /// A list, set or dict comprehension the emitter compiles inline in
     /// the enclosing function or module code (PEP 709) rather than as a
     /// code object of its own: not a generator expression, not in a class
@@ -97,6 +100,7 @@ struct Raw {
     deleted: BTreeSet<String>,
     uses_class_cell: bool,
     walrus_targets: BTreeSet<String>,
+    imports: BTreeSet<String>,
     children: Vec<usize>,
 }
 
@@ -138,6 +142,7 @@ impl Raw {
             deleted: BTreeSet::new(),
             uses_class_cell: false,
             walrus_targets: BTreeSet::new(),
+            imports: BTreeSet::new(),
             children: Vec::new(),
         }
     }
@@ -330,6 +335,7 @@ impl Builder {
                     // `import a.b` binds `a`.
                     let first = bound.as_str().split('.').next().unwrap_or("");
                     self.bind(first);
+                    self.raws[self.current].imports.insert(first.to_owned());
                 }
             }
             ast::Stmt::ImportFrom(i) => {
@@ -919,6 +925,7 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             deleted: std::mem::take(&mut deleted[id]),
             uses_class_cell: raw.uses_class_cell,
             walrus_targets: raw.walrus_targets,
+            imports: raw.imports,
             inline: inline[id],
             offset: raw.offset,
             parent: raw.parent,

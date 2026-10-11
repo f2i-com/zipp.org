@@ -328,7 +328,7 @@ impl<'p> Vm<'p> {
             }
             Instr::PyModGet { dst, obj, rt, key, slow } => {
                 let (o, r) = (self.get(base, obj), self.get(base, rt));
-                match self.py_mod_get(func_id, o, r, key) {
+                match self.py_mod_get(func_id, ip, o, r, key) {
                     Some(v) => {
                         self.set(base, dst, v);
                         ip + 1
@@ -1229,15 +1229,38 @@ impl<'p> Vm<'p> {
     }
 
     /// The module global for [`Instr::PyModGet`].
-    fn py_mod_get(&mut self, func_id: u32, o: Value, rt: Value, key: u32) -> Option<Value> {
+    ///
+    /// The site's entry names the globals Map and the name's entry in it,
+    /// as `PyGlobal`'s does (the Map's keys as they were, the key there by
+    /// its bits and stamp), so a hit reads that entry with no hashing.
+    fn py_mod_get(&mut self, func_id: u32, ip: usize, o: Value, rt: Value, key: u32) -> Option<Value> {
         let tmodule = self.py_rt_for(rt)?.t_module;
         let cls = self.py_cls_of(o)?;
         if tmodule.bits() != cls.bits() {
             return None;
         }
         let g = self.py_hint_field(super::py_rt::hint::GLOBALS, o.heap_index(), "globals")?;
+        if !g.is_heap() {
+            return None;
+        }
+        let gi = g.heap_index();
+        let e = self.py_ic(func_id, ip);
+        if e.kind == ic::MOD_GET && e.a == g.bits() && self.heap.version_of(gi) == e.hver {
+            if let Some(v) = self.py_map_at_bits(g, e.pos, e.b, e.d) {
+                return Some(v);
+            }
+        }
         let k = self.resolve_const_slot(func_id, key);
-        self.py_map_get(g, k)
+        let hver = self.heap.version_of(gi);
+        let (i, v) = self.py_map_find(g, k)?;
+        let kv = match self.heap.get(gi) {
+            HeapObj::Map { keys, .. } => *keys.get(i)?,
+            _ => return None,
+        };
+        if let (Ok(pos), Some(kver)) = (u32::try_from(i), self.py_key_stamp(func_id, key, kv)) {
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::MOD_GET, pos, hver, a: g.bits(), b: kv.bits(), c: 0, d: kver });
+        }
+        Some(v)
     }
 
     /// `isinstance(v, t)` for [`Instr::PyIsInstance`].

@@ -1,0 +1,7 @@
+([12.0, 4.0, 7.0], 500)
+([(9, "module 'math' has no attribute 'hypot2'"), (10, 10001), (10, 10202)], [(14, 39602), (-200, 40001), (-201, 40402)], [(-299, 89402), (17, "module 'math' has no attribute 'hypot2'"), (17, "module 'math' has no attribute 'hypot2'")], (19, "module 'math' has no attribute 'hypot2'"))
+[4.0, 4.0, 4.0, 4.0, 4.0, ('fake', 16), ('fake', 16), ('fake', 16), ('fake', 16), ('fake', 16), "'str' object has no attribute 'sqrt'", "'str' object has no attribute 'sqrt'", "'str' object has no attribute 'sqrt'", "'str' object has no attribute 'sqrt'", "'str' object has no attribute 'sqrt'", 4.0, 4.0, 4.0, 4.0, 4.0]
+[('b1', '[0]', 'Ab Cd', -1.0), ('b2', '[1]', 'Ab Cd', -1.0)]
+[('fake', 0), ('fake', 1), ('fake', 2)]
+module 'math' has no attribute 'nosuch'
+math domain error
