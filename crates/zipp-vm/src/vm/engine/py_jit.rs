@@ -296,6 +296,37 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `PySetItem` from compiled code: `py_set_item` over the registers the
+    /// instruction names in the window at `regs` (`packed` = `o | k << 16 |
+    /// v << 32 | seq << 48`, then `dict`), the step's own answer without
+    /// finding the instruction again: 0 done, `PY_SLOW_BITS` for the `slow`
+    /// edge, `CALL_THREW` when it threw (`SELF_CALL_DEOPT`, nothing done,
+    /// for a window that is not this VM's). A GC safe point, as `jit_py_op`
+    /// is.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_set_item(vm: *mut core::ffi::c_void, regs: *const u64, packed: u64, dict: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let start = vm.regs.as_ptr() as usize;
+        let addr = regs as usize;
+        if addr < start || (addr - start) % 8 != 0 {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let base = (addr - start) / 8;
+        let reg = |shift: u32| (packed >> shift) as u16;
+        let (o, k, v, seq, dict) = (reg(0), reg(16), reg(32), reg(48), dict as u16);
+        if [o, k, v, seq, dict].iter().any(|&r| base + r as usize >= vm.regs.len()) {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        vm.maybe_gc();
+        let (ov, kv, vv) = (vm.get(base, o), vm.get(base, k), vm.get(base, v));
+        let (sc, dc) = (vm.get(base, seq), vm.get(base, dict));
+        match vm.py_set_item(ov, kv, vv, sc, dc) {
+            Ok(true) => 0,
+            Ok(false) => crate::codegen::PY_SLOW_BITS,
+            Err(t) => vm.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// `PyCompare`/`PyJumpCompare` beyond the inline paths: `py_compare`.
     /// 0 or 1 for the comparison's result, `PY_SLOW` (2) for the `slow` edge
     /// (nothing ran), `PY_BAIL` (3) when it threw (the exception is pending).

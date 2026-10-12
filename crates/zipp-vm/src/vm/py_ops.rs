@@ -1893,7 +1893,7 @@ impl<'p> Vm<'p> {
         Ok(self.py_table_get(map, k))
     }
 
-    fn py_set_item(&mut self, o: Value, k: Value, v: Value, seq: Value, dict: Value) -> Result<bool, Thrown> {
+    pub(super) fn py_set_item(&mut self, o: Value, k: Value, v: Value, seq: Value, dict: Value) -> Result<bool, Thrown> {
         let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
             return Ok(false);
         };

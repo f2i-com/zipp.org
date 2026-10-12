@@ -857,6 +857,32 @@ pub(crate) fn emit_py_op(
                 ; mov [rbx + dreg(dst)], rax
             );
         }
+        // A subscript store: likewise through `Vm::jit_py_set_item`, which
+        // reads the operands from the window (`rbx`) by the registers packed
+        // here; 0 is done, anything but the slow edge's answer bails (a throw
+        // pending, or nothing done).
+        Instr::PySetItem { o, k, v, seq, dict, .. } if !crate::vm::prof_py::on() => {
+            let packed = o as u64 | (k as u64) << 16 | (v as u64) << 32 | (seq as u64) << 48;
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, rbx
+                ; mov r8, QWORD packed as i64
+                ; mov r9d, dict as i32
+                ; mov rax, QWORD crate::vm::Vm::jit_py_set_item as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; test rax, rax
+                ; jz => done
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; jmp => labels.bail
+            );
+        }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
         // when the body's plan has the site; the ordinary step otherwise.
         Instr::PyGetAttr { .. } | Instr::PySetAttr { .. } => {
