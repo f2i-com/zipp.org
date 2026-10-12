@@ -3403,24 +3403,35 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // A compiled callback runs over one reused window, as the
+                // array builtins run theirs (`native_cb_entry`).
+                let (native, win) = self.open_cb_window(cb, this_arg);
                 // Walk the LIVE entries by index so a key the callback `set`s during
                 // iteration is visited (sec-map.prototype.foreach).
                 let mut i = 0;
+                let mut outcome = Ok(Some(Value::UNDEFINED));
                 loop {
                     let (k, v) = match self.heap.get(idx) {
                         HeapObj::Map { keys, vals } if i < keys.len() => (keys[i], vals[i]),
                         _ => break,
                     };
                     i += 1;
-                    self.preflight_native_iteration_work(i as u64)?;
+                    if let Err(e) = self.preflight_native_iteration_work(i as u64) {
+                        outcome = Err(e);
+                        break;
+                    }
                     // A tombstoned (deleted) entry is skipped.
                     if k.is_hole() {
                         continue;
                     }
                     // callback(value, key, map)
-                    self.call_value(cb, this_arg, &[v, k, recv])?;
+                    if let Err(e) = self.run_cb_elem(&native, win, cb, &[v, k, recv], this_arg) {
+                        outcome = Err(e);
+                        break;
+                    }
                 }
-                Ok(Some(Value::UNDEFINED))
+                self.regs.truncate(win);
+                outcome
             }
             // LIVE iterators over %MapIteratorPrototype% (step the backing store, so a
             // delete/add after the iterator is created is observed).
@@ -3756,25 +3767,36 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // A compiled callback runs over one reused window, as the
+                // array builtins run theirs (`native_cb_entry`).
+                let (native, win) = self.open_cb_window(cb, this_arg);
                 // Iterate the LIVE backing store by index (not a frozen clone) so a
                 // value the callback `add`s during iteration is still visited
                 // (sec-set.prototype.foreach walks the live entries list).
                 let mut i = 0;
+                let mut outcome = Ok(Some(Value::UNDEFINED));
                 loop {
                     let v = match self.heap.get(idx) {
                         HeapObj::Set(items) if i < items.len() => items[i],
                         _ => break,
                     };
                     i += 1;
-                    self.preflight_native_iteration_work(i as u64)?;
+                    if let Err(e) = self.preflight_native_iteration_work(i as u64) {
+                        outcome = Err(e);
+                        break;
+                    }
                     // A tombstoned (deleted) slot is skipped.
                     if v.is_hole() {
                         continue;
                     }
                     // callback(value, value, set) — value passed twice, mirroring Map.
-                    self.call_value(cb, this_arg, &[v, v, recv])?;
+                    if let Err(e) = self.run_cb_elem(&native, win, cb, &[v, v, recv], this_arg) {
+                        outcome = Err(e);
+                        break;
+                    }
                 }
-                Ok(Some(Value::UNDEFINED))
+                self.regs.truncate(win);
+                outcome
             }
             // keys() === values() for a Set; both yield the values. A LIVE iterator
             // (steps the backing store) so a delete/add after creation is observed.

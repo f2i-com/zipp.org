@@ -562,6 +562,24 @@ impl<'p> Vm<'p> {
         self.resume_frame_window(cb, fid, closure, win, bail as usize)
     }
 
+    /// The callback handle and reused window for a builtin about to call
+    /// `cb` once per element: `native_cb_entry`'s handle with its window made
+    /// at the top of the register file, or `None` (and no window) when `cb`
+    /// goes through `call_value` or the window would not fit. The caller runs
+    /// each element with [`Vm::run_cb_elem`] and truncates the register file
+    /// back to the returned length on every exit.
+    pub(crate) fn open_cb_window(&mut self, cb: Value, this_arg: Value) -> (Option<NativeCb>, usize) {
+        let win = self.regs.len();
+        let native = self.native_cb_entry(cb, this_arg).filter(|native| {
+            let top = win + native.callee_regs;
+            !self.regs_would_overflow(top) && {
+                self.regs.resize(top, Value::UNDEFINED);
+                true
+            }
+        });
+        (native, win)
+    }
+
     /// One per-element callback invocation: native fast path when `native` is
     /// set (with the `this` it bound), else the interpreter `call_value` with
     /// the raw `this_val`.
