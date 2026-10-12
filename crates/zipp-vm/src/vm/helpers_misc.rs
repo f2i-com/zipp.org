@@ -7386,11 +7386,41 @@ mod array_snapshot_epoch_tests {
         println!("ARRSNAP all={all} arrays={arrays}");
     }
 
+    /// A loop with a pinned Array and a helper call, but no native
+    /// cross-call: the region has none of the cross-call scratch the epoch
+    /// cache used to live in, and keeps the cache in a slot of its own.
+    const HELPER_SRC: &str = r#"
+        function fill(arr, b) {
+          for (var j = 0; j < 100; j++) arr[j] = Promise.resolve(((b & 1023) + j) | 0);
+        }
+        var keep = 0;
+        for (var b = 0; b < 3000; b++) {
+          var arr = new Array(100);
+          fill(arr, b);
+          keep = (keep + arr.length) | 0;
+        }
+        console.log(keep);
+    "#;
+
+    /// The child of the helper-call comparison.
+    #[test]
+    fn array_snapshot_epoch_helper_counter_child() {
+        let out = crate::run(HELPER_SRC).expect("helper source compiles");
+        assert!(out.error.is_none(), "helper source error: {:?}", out.error);
+        assert_eq!(out.output, vec!["300000".to_string()]);
+        let (all, arrays) = tasnapshotstats::dump();
+        println!("ARRSNAP all={all} arrays={arrays}");
+    }
+
     fn child_count(disabled: bool) -> u64 {
+        child_count_of("array_snapshot_epoch_counter_child", disabled)
+    }
+
+    fn child_count_of(child: &str, disabled: bool) -> u64 {
         let exe = std::env::current_exe().expect("test exe path");
         let mut command = std::process::Command::new(exe);
         command
-            .arg("array_snapshot_epoch_counter_child")
+            .arg(child)
             .arg("--nocapture")
             .env("ZIPP_ICSTATS", "1")
             .env_remove("ZIPP_NO_CROSS_ARRAY_SNAPSHOT_EPOCH");
@@ -7427,6 +7457,24 @@ mod array_snapshot_epoch_tests {
         assert!(
             enabled * 20 < disabled,
             "epoch did not collapse stable snapshots: enabled={enabled} disabled={disabled}"
+        );
+    }
+
+    /// 300,000 `Promise.resolve` calls, each followed by a pin refresh: one
+    /// snapshot per call without the cache, about one per region entry (and
+    /// per collection, which frees dead Arrays) with it.
+    #[test]
+    fn array_snapshot_epoch_collapses_helper_call_refreshes() {
+        let enabled = child_count_of("array_snapshot_epoch_helper_counter_child", false);
+        let disabled = child_count_of("array_snapshot_epoch_helper_counter_child", true);
+        println!("ARRSNAP_COMPARE enabled={enabled} disabled={disabled}");
+        assert!(
+            disabled > 100_000,
+            "ablation did not exercise per-call Array snapshots: {disabled}"
+        );
+        assert!(
+            enabled * 10 < disabled,
+            "epoch did not collapse helper-call snapshots: enabled={enabled} disabled={disabled}"
         );
     }
 }

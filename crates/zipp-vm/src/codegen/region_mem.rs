@@ -405,15 +405,23 @@ pub(crate) fn compile_region_mem(
         .values()
         .any(|site| !site.cross3.is_empty() || site.cross3m.is_some());
     let c3_off = 40 + 32 * n_ta as i32;
+    // A region without that scratch keeps its Array-epoch cache in a 16-byte
+    // slot of its own at the same base. The cache used to come only with the
+    // scratch, so a loop such as `arr[j] = Promise.resolve(j)`, whose helper
+    // call is followed by a pin refresh, called the snapshot helper on every
+    // iteration: a tenth of the loop.
+    let own_epoch_slot = !do_cross3 && cross_array_epoch_cache_off(c3_off, ta_plan).is_some();
     // The exec scalar helper computes four capture numbers at the call site,
     // but their bytecode destinations can be recycled as live accumulator
     // registers before each corresponding ToNum executes.  Keep those values
     // in native-frame scratch and publish them to the register file only at
     // their original ToNum positions.
-    let scalar_exec_scratch_off = c3_off + if do_cross3 { 64 } else { 0 };
+    let scalar_exec_scratch_off =
+        c3_off + if do_cross3 { 64 } else { 0 } + if own_epoch_slot { 16 } else { 0 };
     let frame = 40
         + 32 * n_ta as i32
         + if do_cross3 { 64 } else { 0 }
+        + if own_epoch_slot { 16 } else { 0 }
         + if scalar_exec.is_some() { 32 } else { 0 }
         + if do_leaf || do_method { 16 } else { 0 };
     // Byte offset (from post-prologue rsp) of the headroom flag slot (1 = the
@@ -424,9 +432,11 @@ pub(crate) fn compile_region_mem(
     // tuple so EVERY post-helper pin refresh (not only the cross-call one)
     // can skip the snapshot helper while the epoch and the pin's live source
     // identity both still match.
-    let array_epoch_cache = do_cross3
-        .then(|| cross_array_epoch_cache_off(c3_off, ta_plan))
-        .flatten();
+    let array_epoch_cache = if do_cross3 {
+        cross_array_epoch_cache_off(c3_off, ta_plan)
+    } else {
+        own_epoch_slot.then_some(c3_off)
+    };
     let ta_refetch = (n_ta > 0).then_some((heap.ta_snapshot, ta_plan, array_epoch_cache));
     // A SetProp data-way hit runs no user code, but it can still replace a
     // prototype method whose live identity licensed a raw method lane.  Only
