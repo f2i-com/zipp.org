@@ -432,6 +432,7 @@ impl<'p> Vm<'p> {
             closure_home: ClosureHomeTable::default(),
             closure_new_target: crate::slot_table::SlotTable::default(),
             finalize_shapes: rustc_hash::FxHashMap::default(),
+            iter_result_plan: None,
             from_async_fn: None,
             async_dispose_fn: None,
             sync_dispose_shim_fn: None,

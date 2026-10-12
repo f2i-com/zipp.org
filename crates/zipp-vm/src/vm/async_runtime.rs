@@ -878,10 +878,31 @@ impl<'p> Vm<'p> {
         Some((m.val_at(0), m.val_at(1)))
     }
 
+    /// CreateIterResultObject: `{value, done}`, an ordinary object with two
+    /// data properties in that order.
+    ///
+    /// Built from one key plan the VM keeps (`iter_result_plan`, with the
+    /// shape the two appends reach), as an object literal is: each result
+    /// used to own its two key strings and take two shape transitions, three
+    /// allocations and two table walks for every `next()` of every iterator.
     pub(crate) fn iter_result(&mut self, value: Value, done: bool) -> Value {
-        let mut map = ObjMap::new();
-        map.set("value", value);
-        map.set("done", Value::bool(done));
+        if !crate::bytecode::static_key_plans_enabled() {
+            let mut map = ObjMap::new();
+            map.set("value", value);
+            map.set("done", Value::bool(done));
+            return self.alloc_object_current_realm(map);
+        }
+        let (plan, shape) = match &self.iter_result_plan {
+            Some((plan, shape)) => (plan.clone(), *shape),
+            None => {
+                let plan = crate::bytecode::StaticKeyPlan::new(vec!["value".into(), "done".into()]);
+                let data = crate::shape::attr_bits(true, true, true, false);
+                let shape = crate::shape::add(crate::shape::add(crate::shape::EMPTY, "value", data), "done", data);
+                self.iter_result_plan = Some((plan.clone(), shape));
+                (plan, shape)
+            }
+        };
+        let map = ObjMap::finalized_from_plan(plan, vec![value, Value::bool(done)], shape);
         self.alloc_object_current_realm(map)
     }
 
