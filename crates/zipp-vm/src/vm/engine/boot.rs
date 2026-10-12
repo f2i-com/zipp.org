@@ -5,6 +5,38 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// The global slots that the program's bytecode stores can reach: the
+/// fail-closed set `slot_guard_key` keys on (eval and Function registration
+/// extend it at run time, in `eval_prog`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn bytecode_stored_slots(program: &Program) -> rustc_hash::FxHashSet<u32> {
+    let mut slots = rustc_hash::FxHashSet::default();
+    for f in &program.functions {
+        for ins in &f.code {
+            match *ins {
+                crate::bytecode::Instr::StoreGlobal { idx, .. }
+                | crate::bytecode::Instr::StoreGlobalStrict { idx, .. }
+                | crate::bytecode::Instr::StoreGlobalResolved { idx, .. }
+                | crate::bytecode::Instr::StoreGlobalDyn { idx, .. }
+                | crate::bytecode::Instr::EvalScopeSet { idx, .. } => {
+                    slots.insert(idx);
+                }
+                _ => {}
+            }
+        }
+    }
+    slots
+}
+
+/// Without the x86-64 JIT nothing reads the set (`slot_guard_key` is its one
+/// reader), so the walk over every instruction of the program is skipped and
+/// the set stays empty. For a Python engine that walk was the whole compiled
+/// runtime, about 85,000 instructions, at every start.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+fn bytecode_stored_slots(_: &Program) -> rustc_hash::FxHashSet<u32> {
+    rustc_hash::FxHashSet::default()
+}
+
 #[inline]
 fn module_func_range_contains(ranges: &[(u32, u32, u32)], func_id: u32) -> bool {
     ranges
@@ -123,21 +155,7 @@ impl<'p> Vm<'p> {
         // Eval/Function registration extends the set at runtime (`eval_prog`).
         let mut global_gens = Vec::with_capacity(pool_reserve);
         global_gens.resize(globals.len(), 0u32);
-        let mut bytecode_stored_slots = rustc_hash::FxHashSet::default();
-        for f in &program.functions {
-            for ins in &f.code {
-                match *ins {
-                    crate::bytecode::Instr::StoreGlobal { idx, .. }
-                    | crate::bytecode::Instr::StoreGlobalStrict { idx, .. }
-                    | crate::bytecode::Instr::StoreGlobalResolved { idx, .. }
-                    | crate::bytecode::Instr::StoreGlobalDyn { idx, .. }
-                    | crate::bytecode::Instr::EvalScopeSet { idx, .. } => {
-                        bytecode_stored_slots.insert(idx);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let bytecode_stored_slots = bytecode_stored_slots(program);
         let _ = &mut heap;
         let (static_key_plan_sites, static_key_plan_retained_bytes) =
             crate::bytecode::static_key_plan_usage(&program.functions).unwrap_or((
