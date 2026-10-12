@@ -1114,7 +1114,7 @@ impl<'p> Vm<'p> {
     /// exception record (own data `cls` a plain object whose own data `mro`
     /// Array holds `rt.EBASE`; for a raise, no own `isType` of `true`), and
     /// the slots of its own data `context` (a raise only) and `tbline`.
-    fn py_exc_record(&self, e: Value, rt: Value, raise: bool) -> Option<(usize, usize)> {
+    pub(super) fn py_exc_record(&self, e: Value, rt: Value, raise: bool) -> Option<(usize, usize)> {
         if !e.is_heap() {
             return None;
         }

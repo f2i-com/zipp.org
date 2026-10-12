@@ -285,6 +285,12 @@ var __zipp_py = (function () {
     // CPython keeps it; raising the exception anew (`raise e`) records it
     // first, and then the raising frame (`commitCatch`).
     const KEEP_INNER = 1000, KEEP_OUTER = 12;
+    // What the engine needs to record a frame as `R.addframe` does, when it
+    // does that natively while it unwinds (`vm::py_rt`): the file names, a
+    // frame entry's literal (its keys in this order) and the limit.
+    R.FILES = files;
+    R.FRAMETMPL = { file: null, line: null, name: null, fn: null };
+    R.TBKEEP = KEEP_INNER;
     const frameName = (f) => f !== null && typeof f === "object" && typeof f.name === "string" ? f.name : "<module>";
     function pushFrame(exc, frame) {
         let frames = exc.frames;
@@ -312,7 +318,9 @@ var __zipp_py = (function () {
         exc.tbfn = null;
     }
     // Every frame an exception leaves calls this: the common case (no catch
-    // pending, room left) is inline, without further calls.
+    // pending, room left) is inline, without further calls. (The engine
+    // does that case itself while unwinding, without entering the frame's
+    // guard; it must record exactly what this does.)
     R.addframe = function (e, f, line) {
         const exc = normexc(e);
         const enc = typeof line === "number" ? line : 0;

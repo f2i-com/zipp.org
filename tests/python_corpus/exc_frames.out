@@ -1,0 +1,16 @@
+top ValueError (-1,) [('top', 37), ('mid', 32), ('leaf', 27)] [('top', 37), ('mid', 32), ('leaf', 27)]
+property ArithmeticError ('neg',) [('via_property', 67), ('take', 61), ('bal', 57)] [('via_property', 67), ('take', 61), ('bal', 57)]
+generator ValueError (-3,) [('via_gen', 83), ('gen', 77), ('leaf', 27)] [('via_gen', 83), ('gen', 77), ('leaf', 27)]
+finally ValueError (-4,) [('via_finally', 101), ('with_finally', 94), ('mid', 32), ('leaf', 27)] [('via_finally', 101), ('with_finally', 94), ('mid', 32), ('leaf', 27)]
+with ValueError (-5,) [('via_with', 124), ('with_block', 119), ('mid', 32), ('leaf', 27)] [('via_with', 124), ('with_block', 119), ('mid', 32), ('leaf', 27)]
+reraise ValueError (-6,) [('via_reraise', 141), ('catch_and_reraise', 134), ('mid', 32), ('leaf', 27)] [('via_reraise', 141), ('catch_and_reraise', 134), ('mid', 32), ('leaf', 27)]
+raise anew ValueError (-7,) [('via_raise_anew', 159), ('catch_and_raise_anew', 154), ('catch_and_raise_anew', 151), ('mid', 32), ('leaf', 27)] [('via_raise_anew', 159), ('catch_and_raise_anew', 154), ('catch_and_raise_anew', 151), ('mid', 32), ('leaf', 27)]
+chained KeyError ('k',) [('via_chain', 176), ('chained', 171)] [('via_chain', 176), ('chained', 171)]
+cause ValueError (-8,) [('chained', 169), ('mid', 32), ('leaf', 27)] [('chained', 169), ('mid', 32), ('leaf', 27)]
+deep 32 [('<module>', 192), ('deep', 188)] [('deep', 188), ('deep', 187)]
+recursion RecursionError True [('<module>', 203), ('recurse', 199)] ('recurse', 199)
+library JSONDecodeError <module>
+(2000, [('hot', 220), ('mid', 32), ('leaf', 27)], (-3999,))
+(85, 31, [('hot_property', 236), ('take', 61), ('bal', 57)])
+top ValueError (-1,) [('top', 37), ('mid', 32), ('leaf', 27)] [('top', 37), ('mid', 32), ('leaf', 27)]
+3

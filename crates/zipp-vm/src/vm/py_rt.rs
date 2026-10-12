@@ -213,6 +213,14 @@ pub(crate) struct PyRt {
     pub(super) ty: Option<TySlots>,
     /// `R.mself`'s slot.
     pub(super) mself_slot: Option<usize>,
+    /// For recording a frame as `R.addframe` does (see
+    /// [`Vm::py_addframe`]): `R.FILES` (file names by module index), the
+    /// frame entry template `R.FRAMETMPL` and its shape (`shape::DICT`:
+    /// none), and `R.TBKEEP` (0: unknown).
+    pub(super) files: Value,
+    pub(super) frame_tmpl: Value,
+    pub(super) frame_shape: u32,
+    pub(super) tb_keep: usize,
     /// The generator record shape `vm::py_gen` found plain.
     pub(super) gen_shape: Cell<u32>,
     /// The generator records' runtime array (`grt`) `vm::py_gen` last
@@ -304,6 +312,8 @@ pub(super) const SEQ_KEYS: [&str; 2] = ["cls", "items"];
 pub(super) const EXC_KEYS: [&str; 9] = ["cls", "dict", "args", "cause", "context", "tbline", "suppress", "tbfn", "tbcl"];
 /// An instance record's keys (the construction entries' literal).
 pub(super) const INST_KEYS: [&str; 2] = ["cls", "dict"];
+/// A traceback frame entry's keys (`R.addframe`'s literal, `R.FRAMETMPL`).
+pub(super) const FRAME_KEYS: [&str; 4] = ["file", "line", "name", "fn"];
 
 impl PyRt {
     fn new(r: Value) -> PyRt {
@@ -330,6 +340,10 @@ impl PyRt {
             dict_slots: [1, 2],
             ty: None,
             mself_slot: None,
+            files: Value::UNDEFINED,
+            frame_tmpl: Value::UNDEFINED,
+            frame_shape: crate::shape::DICT,
+            tb_keep: 0,
             gen_shape: Cell::new(crate::shape::DICT),
             gen_rt: Cell::new(None),
             hints: std::array::from_fn(|_| Cell::new(0)),
@@ -446,9 +460,136 @@ impl<'p> Vm<'p> {
         if at < from || (start..end).contains(&at) || base + ereg as usize >= self.regs.len() {
             return false;
         }
+        // The guard block records the frame (`R.addframe`) and throws the
+        // exception on: done here instead when that is the common case, and
+        // the frame is left as the guard's own throw leaves it.
+        if let Some(l) = line {
+            let f = self.regs[base];
+            if self.py_addframe(tv, f, l) {
+                return false;
+            }
+        }
         write_line(self);
         self.regs[base + ereg as usize] = tv;
         self.frames[top].ip = start as usize;
+        true
+    }
+
+    /// `R.addframe(e, f, line)` for the frame of function record `f` that
+    /// the exception `e` leaves at the encoded line `line`, natively, in the
+    /// case that runtime function handles inline: `e` a Python exception
+    /// record (extensible, its `tbline`, `tbfn` and any `frames` plain data
+    /// properties) whose pending catch is not in this frame (`tbfn` is not
+    /// `f`), whose `frames`, when it has them, is a plain Array with room
+    /// left (`R.TBKEEP`) and does not end with an entry left open by `f`,
+    /// the line's module having a file name and `f` an own string `name`.
+    /// It then does what that case does: `tbline` set when pending (-1), a
+    /// `frames` Array made when there is none, and the entry `{file, line,
+    /// name, fn}` pushed onto it. `false` for anything else, with nothing
+    /// changed (the guard block runs `R.addframe` itself).
+    fn py_addframe(&mut self, e: Value, f: Value, line: i32) -> bool {
+        let Some(p) = self.py_rt.as_deref() else {
+            return false;
+        };
+        let (r, files, tmpl, shape, keep) = (p.r, p.files, p.frame_tmpl, p.frame_shape, p.tb_keep);
+        if shape == crate::shape::DICT || keep == 0 || !files.is_heap() || !f.is_heap() || line < 0 {
+            return false;
+        }
+        let Some((_, tb_slot)) = self.py_exc_record(e, r, false) else {
+            return false;
+        };
+        if !self.py_alloc_like_ok(tmpl, shape) {
+            return false;
+        }
+        let ei = e.heap_index();
+        let HeapObj::Object(m) = self.heap.get(ei) else {
+            return false;
+        };
+        if !m.extensible || m.sealed || m.frozen {
+            return false;
+        }
+        let own = |key: &str| -> Result<Option<Value>, ()> {
+            match m.pos(key) {
+                None => Ok(None),
+                Some(s) if m.is_accessor_at(s) => Err(()),
+                Some(s) => Ok(Some(m.val_at(s))),
+            }
+        };
+        let (Ok(tbfn), Ok(frames)) = (own("tbfn"), own("frames")) else {
+            return false;
+        };
+        let tbline = m.val_at(tb_slot);
+        // A catch pending in this very frame: `commitCatch` (the runtime's).
+        if tbfn.is_some_and(|t| t.bits() == f.bits()) {
+            return false;
+        }
+        // `frames`: none yet, or an Array with room whose last entry was not
+        // left open by `f` (else the runtime closes that entry).
+        if let Some(fr) = frames {
+            if !fr.is_heap() || self.array_js_len.contains_key(&fr.heap_index()) || self.arr_props.contains_key(&fr.heap_index()) {
+                return false;
+            }
+            let HeapObj::Array(items) = self.heap.get(fr.heap_index()) else {
+                return false;
+            };
+            if items.len() >= keep {
+                return false;
+            }
+            if let Some(&last) = items.last() {
+                if !self.py_plain_rec(last) {
+                    return false;
+                }
+                let HeapObj::Object(lm) = self.heap.get(last.heap_index()) else {
+                    return false;
+                };
+                match lm.pos("open") {
+                    None => {}
+                    Some(s) if lm.is_accessor_at(s) => return false,
+                    Some(s) if lm.val_at(s).bits() == f.bits() => return false,
+                    Some(_) => {}
+                }
+            }
+        }
+        // The entry's fields: the module's file name and `f.name`.
+        let module = (line / 1_000_000) as usize;
+        let file = match self.heap.get(files.heap_index()) {
+            HeapObj::Array(items) if !self.array_js_len.contains_key(&files.heap_index()) => match items.get(module) {
+                Some(&v) if v.is_heap() && self.heap.is_str_like(v.heap_index()) => v,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if !self.py_plain_rec(f) {
+            return false;
+        }
+        let name = match self.py_own_data(f.heap_index(), "name") {
+            Some(v) if v.is_heap() && self.heap.is_str_like(v.heap_index()) => v,
+            _ => return false,
+        };
+        // As the runtime: `tbline`, then `frames`, then the entry.
+        if tbline.is_number() && tbline.as_f64() == -1.0 {
+            if let HeapObj::Object(m) = self.heap.get_mut(ei) {
+                m.set_val_at(tb_slot, Value::int(line));
+            }
+        }
+        let frames = match frames {
+            Some(fr) => fr,
+            None => {
+                let arr = Value::heap(self.heap.alloc(HeapObj::Array(Vec::new())));
+                if self.set_prop(e, "frames", arr, true).is_err() {
+                    return false;
+                }
+                arr
+            }
+        };
+        let Some(entry) = self.py_alloc_like(tmpl, shape, &[file, Value::int(line % 1_000_000), name, f]) else {
+            return false;
+        };
+        let fi = frames.heap_index();
+        self.heap.write_barrier_val(fi, entry);
+        if let HeapObj::Array(items) = self.heap.get_mut(fi) {
+            items.push(entry);
+        }
         true
     }
 
@@ -544,13 +685,20 @@ impl<'p> Vm<'p> {
         rt.inst_shape = self.py_template_shape(rt.inst_tmpl, &INST_KEYS);
         rt.exc_shape = self.py_template_shape(rt.exc_tmpl, &EXC_KEYS);
         rt.dict_shape = self.py_template_shape(dict, &["cls", "map", "size"]);
+        rt.files = own(self, "FILES");
+        rt.frame_tmpl = own(self, "FRAMETMPL");
+        rt.frame_shape = self.py_template_shape(rt.frame_tmpl, &FRAME_KEYS);
+        let keep = own(self, "TBKEEP");
+        if keep.is_number() && keep.as_f64() >= 1.0 && keep.as_f64() <= 1e9 && keep.as_f64().fract() == 0.0 {
+            rt.tb_keep = keep.as_f64() as usize;
+        }
         if rt.t_list.is_heap() {
             rt.ty = self.py_type_slots(rt.t_list.heap_index());
         }
         // The values above stay reachable through `pins` (held by `R`).
         let mut keep = vec![
             rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_str, rt.t_module, rt.ebase, rt.builtins, rt.excstack,
-            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl,
+            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl,
         ];
         keep.extend_from_slice(&rt.istypes);
         let pi = pins.heap_index();
