@@ -10,6 +10,27 @@ the tag, as the release requires. The record is
 with its numbers in the `-evidence.json` beside it; the release notes are
 [docs/releases/0.0.23.md](docs/releases/0.0.23.md).
 
+**Published** on 12 October at 18:44 UTC by release run 38290851253,
+dispatched from `main` for the existing tag. The run from the tag
+(38250145368) passed every gate and build but its publish step failed
+three times with HTTP 403: `gh release create --target <commit>` makes
+GitHub compare that commit with the default branch's head and demand the
+`workflows` permission when workflow files changed in between, and main
+had moved past the tag with CI changes. `52313142` drops `--target` (the
+tag pins the commit), and `bbd65d5a` lets main's sharded workflows gate a
+tag from before the shard tool. The eight assets were downloaded and
+checked against `SHA256SUMS`; the CLI and the web and web-lite modules
+report 0.0.23 at `407b81cd` and run.
+
+**CI after the release** (all `[skip ci]`, on `main`): security's native
+workspace suite compiles at opt-level 1 and runs in three shards
+(`tools/ci_test_shard.py`, 86 minutes to 8.5), the browser Worker smoke
+test runs in Playwright's pinned image (24 minutes to 5.7 for its job),
+the Windows job and the stable canary compile at opt-level 1, and CI's
+Python lanes are six parallel jobs (49 minutes to 11). Test262 (18
+minutes, two corpora one after the other) is now the security workflow's
+longest job; four workers were no faster than two.
+
 **What 0.0.23 fixes in 0.0.22**, besides the fourteenth pass's two (memory
 grown in place, the `typeof` strings): three wrong answers in the native
 JIT's array-builtin callback window (a stale local, a deleted global still
