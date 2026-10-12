@@ -1577,7 +1577,12 @@ pub struct Vm<'p> {
     /// spec order, as `key_str_cache`'s strings (which root them): a shape
     /// names a key sequence with its attributes, so every object of the
     /// shape enumerates the same list. Filled by `shaped_own_enum_keys`.
-    pub(crate) enum_key_cache: rustc_hash::FxHashMap<u32, Box<[Value]>>,
+    ///
+    /// Indexed by the shape id: ids are small and dense (`shape.rs` issues
+    /// at most 4,096 and never reuses one), so the list is one bounds check
+    /// away, and the modules do not carry a hash table instantiated for this
+    /// one map (1.5 KB of each).
+    pub(crate) enum_key_cache: Vec<Option<Box<[Value]>>>,
     /// Per-function result of the conservative in-place-string-op scan. A
     /// function that can mutate a compiler-proved-unique string buffer must keep
     /// receiving a fresh literal representation, so none of its literals enter
@@ -2092,7 +2097,11 @@ pub struct Vm<'p> {
     /// length lives in the dense Vec with no per-array attribute state, so the
     /// (rare) non-writable flag is recorded here — read by the length descriptor,
     /// `arr.length = n`, and the push/pop/shift/unshift mutators.
-    array_length_nonwritable: rustc_hash::FxHashSet<u32>,
+    ///
+    /// A bit a slot (`SlotSet`): every dense-array pin snapshot and compiled
+    /// append tests it, and the test is one load. It was a hash set of its
+    /// own kind, which each WebAssembly module carried a table for.
+    array_length_nonwritable: crate::slot_table::SlotSet,
     /// SPARSE arrays: heap idx → the JS `length` when it EXCEEDS the dense
     /// element count (`new Array(4e9)`, `a[3e9] = v`, `a.length = 2**32-1`).
     /// Sparse elements themselves live in `arr_props` under canonical index

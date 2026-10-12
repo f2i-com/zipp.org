@@ -34,10 +34,10 @@ fn enum_hoist_enabled() -> bool {
 const KEY_STR_CACHE_MAX_BYTES: usize = 64;
 const KEY_STR_CACHE_MAX_ENTRIES: usize = 8192;
 
-/// `Vm::enum_key_cache`'s bound, in shapes. Shapes themselves are bounded
-/// (`shape.rs`); a program past this many enumerated layouts builds each
-/// list as before.
-const ENUM_KEY_CACHE_MAX_SHAPES: usize = 4096;
+/// `Vm::enum_key_cache`'s bound: the shape ids it has a slot for. Shapes
+/// themselves are bounded (`shape.rs` issues ids up to 4,096); an id past
+/// this would build its list each time as before.
+const ENUM_KEY_CACHE_MAX_SHAPES: usize = 4097;
 
 impl<'p> Vm<'p> {
     /// EnumerableOwnProperties (Object.keys / values / entries).
@@ -115,11 +115,12 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => m.shape(),
             _ => return false,
         };
-        if let Some(keys) = self.enum_key_cache.get(&shape) {
+        let slot = shape as usize;
+        if let Some(Some(keys)) = self.enum_key_cache.get(slot) {
             out.extend_from_slice(keys);
             return true;
         }
-        if self.enum_key_cache.len() >= ENUM_KEY_CACHE_MAX_SHAPES {
+        if slot >= ENUM_KEY_CACHE_MAX_SHAPES {
             return false;
         }
         let texts: Vec<String> = match self.heap.get(idx) {
@@ -141,7 +142,10 @@ impl<'p> Vm<'p> {
             keys.push(v);
         }
         out.extend_from_slice(&keys);
-        self.enum_key_cache.insert(shape, keys.into_boxed_slice());
+        if self.enum_key_cache.len() <= slot {
+            self.enum_key_cache.resize_with(slot + 1, || None);
+        }
+        self.enum_key_cache[slot] = Some(keys.into_boxed_slice());
         true
     }
 

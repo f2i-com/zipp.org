@@ -958,7 +958,7 @@ impl Vm<'_> {
         // length).
         self.deleted_callable_intrinsics
             .retain(|&(k, _)| marks[k as usize]);
-        self.array_length_nonwritable.retain_marked(&marks);
+        self.array_length_nonwritable.retain(|&k| marks[k as usize]);
         // Virtual lengths of sparse arrays (u32 values — nothing to trace; the
         // sparse ELEMENTS live in arr_props, rooted above).
         self.array_js_len.retain_marked(&marks);
@@ -1276,7 +1276,12 @@ impl Vm<'_> {
             self.deleted_callable_intrinsics
                 .retain(|&(k, _)| live_bits[k as usize]);
         }
-        prune_set!(self.array_length_nonwritable);
+        // A bit set, as `error_data` below: the freed side is the walk.
+        if !self.array_length_nonwritable.is_empty() {
+            for i in freed {
+                self.array_length_nonwritable.remove(i);
+            }
+        }
         prune_slots!(self.array_js_len);
         prune_map!(self.ab_max);
         prune_set!(self.ta_tracking);

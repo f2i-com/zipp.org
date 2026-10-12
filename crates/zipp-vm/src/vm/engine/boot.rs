@@ -195,7 +195,7 @@ impl<'p> Vm<'p> {
             dynamic_ic_bytes: 0,
             const_string_cache: rustc_hash::FxHashMap::default(),
             key_str_cache: rustc_hash::FxHashMap::default(),
-            enum_key_cache: rustc_hash::FxHashMap::default(),
+            enum_key_cache: Vec::new(),
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),
             const_string_cache_enabled: std::env::var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -293,7 +293,7 @@ impl<'p> Vm<'p> {
             global_route_epoch: 0,
             jit_global_route_ok: rustc_hash::FxHashMap::default(),
             strict_unresolvable_globals: Vec::new(),
-            array_length_nonwritable: rustc_hash::FxHashSet::default(),
+            array_length_nonwritable: crate::slot_table::SlotSet::default(),
             array_js_len: crate::slot_table::SlotTable::default(),
             array_proto_has_index: false,
             super_called: std::collections::HashSet::new(),
@@ -831,6 +831,7 @@ impl<'p> Vm<'p> {
         n = n
             .saturating_add(self.proto_of.resident_bytes())
             .saturating_add(self.error_data.resident_bytes())
+            .saturating_add(self.array_length_nonwritable.resident_bytes())
             .saturating_add(self.regexp_result_props.resident_bytes())
             .saturating_add(self.array_js_len.resident_bytes())
             .saturating_add(self.arguments_objs.resident_bytes());
