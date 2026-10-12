@@ -451,23 +451,22 @@ jobs:
           PY
       - name: Test conformance scoring and corpus provenance checks
         run: python3 -m unittest discover -s tools -p 'test_run_test262*.py'
-      # Four jobs on the runner's four processors. At two, the run of both
-      # corpora (the upstream one and the corrected one, 95,680 executions
-      # each) took 13.8 of the job's 17 minutes; the 120-second timeout per
-      # test is unchanged.
+      # Two workers. Four were tried (3856993d): each corpus (95,680
+      # executions) still took 6.5 minutes, as at two, so the runner's
+      # throughput here is not the worker count.
       - name: Report upstream and require all documented corrected tests to pass
         run: >-
           python3 tools/run_test262_dual.py
           --t262 target/test262
           --corrected-tree target/test262-corrected
           --zipp target/release/zipp
-          --jobs 4 --timeout 120
+          --jobs 2 --timeout 120
           --output-dir target/test262-evidence
       - name: Require the original DateTimeFormat ECMA-402 tests to pass
         run: >-
           python3 tools/run_test262.py --t262 target/test262
           --sub test/intl402/DateTimeFormat --include-intl402
-          --zipp target/release/zipp --jobs 4 --timeout 120
+          --zipp target/release/zipp --jobs 2 --timeout 120
           --dump-fails target/test262-evidence/datetimeformat-failures.txt
           --json target/test262-evidence/datetimeformat.json
       - name: Upload the conformance evidence
