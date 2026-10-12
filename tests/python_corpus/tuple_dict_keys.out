@@ -1,0 +1,6 @@
+([("(0, ('s0', None), frozenset({0}))", 100), ("(0, ('s0', None), frozenset({1}))", 100), ("(0, ('s1', None), frozenset({0}))", 100), ("(0, ('s1', None), frozenset({1}))", 100)], 30)
+int int nested True False
+21 True True False
+p p skip
+TypeError unhashable type: 'list'
+True True True

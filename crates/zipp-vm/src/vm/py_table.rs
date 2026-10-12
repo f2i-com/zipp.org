@@ -652,6 +652,10 @@ pub(crate) fn cpython_set_size(n: usize) -> usize {
 pub(crate) struct PyKinds {
     pub(crate) tuple: Value,
     pub(crate) frozenset: Value,
+    /// The shape of a list or tuple record laid out as the runtime's
+    /// sequence literal (`cls` at slot 0, `items` at slot 1; `shape::DICT`:
+    /// none known), whose fields are then read at their slots.
+    pub(crate) seq_shape: u32,
 }
 
 impl Default for PyKinds {
@@ -660,6 +664,7 @@ impl Default for PyKinds {
         PyKinds {
             tuple: Value::UNDEFINED,
             frozenset: Value::UNDEFINED,
+            seq_shape: crate::shape::DICT,
         }
     }
 }
@@ -709,10 +714,13 @@ fn classify<'h>(heap: &'h Heap, kinds: &PyKinds, v: Value) -> Option<Kind<'h>> {
         HeapObj::Str(_) | HeapObj::Cons { .. } => Some(Kind::Str(idx)),
         HeapObj::BigInt(n) => Some(Kind::Int(*n)),
         HeapObj::BigIntBig(b) => Some(Kind::Big(b)),
-        HeapObj::Object(_) => {
-            let cls = rec_field(heap, idx, "cls")?;
+        HeapObj::Object(m) => {
+            // A record of the sequence literal's shape has its fields at
+            // their slots (a shape fixes keys, order and kinds).
+            let seq = kinds.seq_shape != crate::shape::DICT && m.shape() == kinds.seq_shape && !m.is_ctor;
+            let cls = if seq { m.val_at(0) } else { rec_field(heap, idx, "cls")? };
             if cls == kinds.tuple {
-                let items = rec_field(heap, idx, "items")?;
+                let items = if seq { m.val_at(1) } else { rec_field(heap, idx, "items")? };
                 if !items.is_heap() {
                     return None;
                 }
@@ -1293,6 +1301,7 @@ pub(crate) fn size_probe(x: u64) -> u64 {
     let kinds = PyKinds {
         tuple: Value::from_bits(x),
         frozenset: Value::from_bits(x ^ 1),
+        seq_shape: x as u32,
     };
     let mut steps = 0;
     let (mut a, mut b) = (PyTable::new_set(), PyTable::new_dict());

@@ -153,6 +153,7 @@ impl<'p> Vm<'p> {
                 let kinds = PyKinds {
                     tuple: arg(2),
                     frozenset: arg(3),
+                    seq_shape: self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape),
                 };
                 let table = PyTable::with_kinds(t == Value::TRUE, kinds);
                 Value::heap(self.heap.alloc(HeapObj::PyTable(Box::new(table))))
@@ -178,6 +179,7 @@ impl<'p> Vm<'p> {
                 let kinds = PyKinds {
                     tuple: arg(2),
                     frozenset: arg(3),
+                    seq_shape: self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape),
                 };
                 let mut steps = 0;
                 let h = native_hash(&self.heap, &kinds, t, &mut steps);
