@@ -1289,7 +1289,9 @@ impl<'a> Emitter<'a> {
         Ok(dst)
     }
     /// Python truth of `value`: a JS boolean is its own truth (the common
-    /// result of a comparison); anything else asks the runtime.
+    /// result of a comparison); an int or a str has the truth JavaScript
+    /// gives it (`0n` and `""` are false, as in Python); anything else asks
+    /// the runtime.
     pub fn truth(&mut self, value: Reg) -> R<Reg> {
         let dst = self.alloc()?;
         let is_bool = self.typeof_is(value, "boolean")?;
@@ -1298,10 +1300,23 @@ impl<'a> Emitter<'a> {
         let end = self.jump()?;
         let here = self.here();
         self.patch(slow, here)?;
+        let is_int = self.typeof_is(value, "bigint")?;
+        let own_int = self.jump_if_true(is_int)?;
+        let is_str = self.typeof_is(value, "string")?;
+        let helper = self.jump_if_false(is_str)?;
+        let here = self.here();
+        self.patch(own_int, here)?;
+        let not = self.alloc()?;
+        self.emit(Instr::Not { dst: not, a: value })?;
+        self.emit(Instr::Not { dst, a: not })?;
+        let end2 = self.jump()?;
+        let here = self.here();
+        self.patch(helper, here)?;
         let r = self.helper("truth", &[value])?;
         self.emit(Instr::Move { dst, src: r })?;
         let here = self.here();
         self.patch(end, here)?;
+        self.patch(end2, here)?;
         Ok(dst)
     }
     /// Whether `obj.<name>` may take the inline instance-attribute paths.

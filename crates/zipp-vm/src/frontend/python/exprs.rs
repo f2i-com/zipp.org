@@ -1078,12 +1078,20 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Jumps taken when `value`'s truth equals `when`: a bool is its own
-    /// truth, anything else asks the runtime.
+    /// Jumps taken when `value`'s truth equals `when`: a bool, an int or a
+    /// str has the truth JavaScript gives it (`0n` and `""` are false, as
+    /// in Python), tested where it is; anything else asks the runtime.
     pub fn jump_on_truth(&mut self, value: Reg, when: bool) -> R<Vec<usize>> {
         let jump = |e: &mut Self, cond: Reg| if when { e.jump_if_true(cond) } else { e.jump_if_false(cond) };
         let is_bool = self.typeof_is(value, "boolean")?;
-        let slow = self.jump_if_false(is_bool)?;
+        let own_bool = self.jump_if_true(is_bool)?;
+        let is_int = self.typeof_is(value, "bigint")?;
+        let own_int = self.jump_if_true(is_int)?;
+        let is_str = self.typeof_is(value, "string")?;
+        let slow = self.jump_if_false(is_str)?;
+        let here = self.here();
+        self.patch(own_bool, here)?;
+        self.patch(own_int, here)?;
         let taken = jump(self, value)?;
         let over = self.jump()?;
         let here = self.here();
