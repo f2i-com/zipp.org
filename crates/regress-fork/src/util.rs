@@ -109,20 +109,33 @@ pub fn utf8_first_byte(cp: u32) -> u8 {
 
 /// Add all of the first bytes of a code point interval to a byte bitmap.
 pub fn add_utf8_first_bytes_to_bitmap(interval: Interval, bitmap: &mut ByteBitmap) {
-    // Note this is an inclusive interval.
-    let Interval { first, last } = interval;
-    let ranges = [
-        (first, last.min(0x7F)),              // 1 byte range
-        (first.max(0x80), last.min(0x7FF)),   // 2 byte range
-        (first.max(0x800), last.min(0xFFFF)), // 3 byte range
-        (first.max(0x10000), last),           // 4 byte range
-    ];
-    for (first, last) in ranges.into_iter() {
-        if first <= last {
-            for byte in utf8_first_byte(first)..=utf8_first_byte(last) {
-                bitmap.set(byte);
-            }
+    // Note this is an inclusive interval. It is cut where the encoded length
+    // changes (most intervals lie within one length) and each piece's first
+    // bytes are one run, set a word at a time: a class such as `\p{Letter}`
+    // has hundreds of intervals, and the per-byte loop this replaces went
+    // through `RangeInclusive::next`, which the size-first (Lite) build
+    // inlines or not by whole-program accident (17% of a Unicode RegExp's
+    // compile when it did not).
+    let Interval { mut first, last } = interval;
+    if first > last {
+        return;
+    }
+    loop {
+        let length_last = if first < 0x80 {
+            0x7F
+        } else if first < 0x800 {
+            0x7FF
+        } else if first < 0x10000 {
+            0xFFFF
+        } else {
+            CODE_POINT_MAX
+        };
+        let piece_last = last.min(length_last);
+        bitmap.set_range(utf8_first_byte(first), utf8_first_byte(piece_last));
+        if piece_last == last {
+            return;
         }
+        first = piece_last + 1;
     }
 }
 

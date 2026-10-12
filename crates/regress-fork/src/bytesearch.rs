@@ -226,6 +226,22 @@ impl ByteBitmap {
         self.0[byte as usize] |= 1 << bit;
     }
 
+    /// Set every byte in `lo..=hi`, a word at a time.
+    pub fn set_range(&mut self, lo: u8, hi: u8) {
+        debug_assert!(lo <= hi);
+        let (lo, hi) = (lo as usize, hi as usize);
+        let last_word = hi >> 4;
+        let mut word = lo >> 4;
+        let mut from = lo & 0xF;
+        while word <= last_word {
+            let to = if word == last_word { hi & 0xF } else { 0xF };
+            // Bits `from..=to` of the word.
+            self.0[word] |= ((0xFFFF_u32 << from) & (0xFFFF_u32 >> (15 - to))) as u16;
+            from = 0;
+            word += 1;
+        }
+    }
+
     /// Update ourselves from another bitmap, in place.
     pub fn bitor(&mut self, rhs: &ByteBitmap) {
         for idx in 0..self.0.len() {
@@ -352,6 +368,21 @@ mod tests {
             bm.set(b)
         }
         bm
+    }
+
+    #[test]
+    fn set_range_sets_exactly_the_range() {
+        for lo in 0..=255u8 {
+            for hi in lo..=255u8 {
+                let mut expected = ByteBitmap::default();
+                for b in lo..=hi {
+                    expected.set(b);
+                }
+                let mut bm = ByteBitmap::default();
+                bm.set_range(lo, hi);
+                assert_eq!(bm, expected, "{lo}..={hi}");
+            }
+        }
     }
 
     #[test]
