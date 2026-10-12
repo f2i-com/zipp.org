@@ -7049,6 +7049,12 @@ pub(crate) extern "win64" fn jit_static_fn(
     a0_bits: u64,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // The loop's safe point, as in `jit_concat`: `Promise.resolve(i)` in a
+    // compiled loop with no call made 1.5 million promises and no
+    // collection. The one call site (a MEM region) loads the callee,
+    // receiver and argument from the frame window and refetches its pinned
+    // bases and snapshots after the call.
+    vm.maybe_gc();
     use crate::bytecode::StaticFn as S;
     let op = match code {
         0 => S::PromiseResolve,
