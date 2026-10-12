@@ -1058,6 +1058,11 @@ impl<'p> Vm<'p> {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
+        // A safe point by the contract above. A user callee polls again at its
+        // frame push, but a native one (`"abc".replace("b", "x")`, `parseInt`)
+        // had none, so a compiled loop calling one ran a single collection in
+        // a million and a half calls.
+        self.maybe_gc();
         let func_id = (packed_fip >> 32) as u32;
         let ip = (packed_fip as u32) as usize;
         let arg_base = (packed_args & 0xFFFF) as u16;

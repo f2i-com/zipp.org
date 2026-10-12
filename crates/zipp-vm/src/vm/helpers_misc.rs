@@ -605,6 +605,13 @@ pub(crate) extern "win64" fn jit_str_substring(
         };
         Some(bx)
     };
+    // The loop's safe point, as in `jit_concat`: `"abc".substring(i)` in a
+    // compiled loop that makes no call ran one collection in a million and a
+    // half results. The receiver and arguments sit in the caller's register
+    // window, which the collector traces, and the call sites re-derive r13
+    // afterwards for the result's allocation; a collection moves nothing
+    // else they hold.
+    vm.maybe_gc();
     vm.heap.flatten(r.heap_index());
     let len = match vm.heap.get(r.heap_index()) {
         crate::heap::HeapObj::Str(js) if js.is_ascii() => js.units() as i64,
