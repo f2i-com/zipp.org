@@ -308,6 +308,17 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc_js(JsStr::from_wtf8(bytes)))
     }
 
+    /// [`Vm::py_strm_new`] of bytes known to be ASCII when `ascii` (cut from
+    /// or joined of ASCII strs only): made without the scan `from_wtf8`
+    /// runs over every result to find that out again.
+    fn py_strm_new_as(&mut self, bytes: Vec<u8>, ascii: bool) -> Value {
+        if ascii {
+            Value::heap(self.heap.alloc_js(JsStr::from_ascii(bytes)))
+        } else {
+            self.py_strm_new(bytes)
+        }
+    }
+
     /// `__zipp_py_strm`, called as `builtin.c<n>(...args)`.
     pub(crate) fn py_str_method(&mut self, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         self.py_str_method_at(this, args, usize::MAX)
@@ -411,7 +422,7 @@ impl<'p> Vm<'p> {
                 };
                 match trimmed {
                     None => return Some(args[0]),
-                    Some(bytes) => self.py_strm_new(bytes),
+                    Some(bytes) => self.py_strm_new_as(bytes, ascii),
                 }
             }
             // Both strs are well formed, so equal bytes at an end are equal
@@ -442,7 +453,7 @@ impl<'p> Vm<'p> {
                 };
                 match trimmed {
                     None => return Some(args[0]),
-                    Some(bytes) => self.py_strm_new(bytes),
+                    Some(bytes) => self.py_strm_new_as(bytes, ascii),
                 }
             }
             (4, 1) => {
@@ -455,7 +466,7 @@ impl<'p> Vm<'p> {
                     .filter(|p| !p.is_empty())
                     .map(|p| p.to_vec())
                     .collect();
-                return self.py_strm_list(this, parts, at);
+                return self.py_strm_list(this, parts, at, ascii);
             }
             (4, 2) => {
                 let (sep_idx, _) = self.py_strm_flat(args[1])?;
@@ -480,11 +491,11 @@ impl<'p> Vm<'p> {
                     parts.push(s[start..].to_vec());
                     parts
                 };
-                return self.py_strm_list(this, parts, at);
+                return self.py_strm_list(this, parts, at, ascii);
             }
             (5, 3) => {
                 let (old_idx, _) = self.py_strm_flat(args[1])?;
-                let (new_idx, _) = self.py_strm_flat(args[2])?;
+                let (new_idx, new_ascii) = self.py_strm_flat(args[2])?;
                 let replaced = {
                     let s = self.py_strm_bytes(s_idx);
                     let old = self.py_strm_bytes(old_idx);
@@ -524,7 +535,7 @@ impl<'p> Vm<'p> {
                         };
                         return (units <= STRM_MAX_TEXT).then_some(args[0]);
                     }
-                    Some(out) => self.py_strm_new(out),
+                    Some(out) => self.py_strm_new_as(out, ascii && new_ascii),
                 }
             }
             (6, 2) => {
@@ -573,12 +584,14 @@ impl<'p> Vm<'p> {
                 // them all. (A flatten rewrites only that part's own slot.)
                 let sep_len = self.py_strm_bytes(s_idx).len();
                 let mut total = 0usize;
+                let mut all_ascii = ascii;
                 for i in 0..count {
                     let part = match self.heap.get(arr_idx) {
                         HeapObj::Array(parts) => *parts.get(i)?,
                         _ => return None,
                     };
-                    let (part_idx, _) = self.py_strm_flat(part)?;
+                    let (part_idx, part_ascii) = self.py_strm_flat(part)?;
+                    all_ascii &= part_ascii;
                     total += self.py_strm_bytes(part_idx).len() + if i > 0 { sep_len } else { 0 };
                     if total > STRM_MAX_TEXT * 3 {
                         return None;
@@ -597,7 +610,7 @@ impl<'p> Vm<'p> {
                         out.extend_from_slice(self.py_strm_bytes(part.heap_index()));
                     }
                 }
-                self.py_strm_new(out)
+                self.py_strm_new_as(out, all_ascii)
             }
             (8, 1) | (9, 1) => {
                 if !ascii {
@@ -621,7 +634,7 @@ impl<'p> Vm<'p> {
                 };
                 match cased {
                     None => return Some(args[0]),
-                    Some(bytes) => self.py_strm_new(bytes),
+                    Some(bytes) => self.py_strm_new_as(bytes, true),
                 }
             }
             _ => return None,
@@ -646,8 +659,9 @@ impl<'p> Vm<'p> {
         Some((tmpl, ttype))
     }
 
-    /// A list of these strs, made from the record's `ltmpl` (an empty list).
-    fn py_strm_list(&mut self, this: Value, parts: Vec<Vec<u8>>, at: usize) -> Option<Value> {
+    /// A list of these strs (pieces of an ASCII str when `ascii`), made from
+    /// the record's `ltmpl` (an empty list).
+    fn py_strm_list(&mut self, this: Value, parts: Vec<Vec<u8>>, at: usize, ascii: bool) -> Option<Value> {
         if parts.len() > (1 << 24) {
             return None;
         }
@@ -662,7 +676,7 @@ impl<'p> Vm<'p> {
             None => Some(self.py_json_template(tmpl, &["cls", "items"])?),
         };
         let total: u64 = parts.iter().map(|p| p.len() as u64).sum();
-        let items: Vec<Value> = parts.into_iter().map(|p| self.py_strm_new(p)).collect();
+        let items: Vec<Value> = parts.into_iter().map(|p| self.py_strm_new_as(p, ascii)).collect();
         let arr = Value::heap(self.heap.alloc(HeapObj::Array(items)));
         let list = match (like, copy) {
             (Some(cls), _) => self.py_alloc_like(tmpl, seq_shape, &[cls, arr])?,
