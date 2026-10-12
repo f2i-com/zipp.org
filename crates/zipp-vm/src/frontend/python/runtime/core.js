@@ -1480,6 +1480,9 @@ var __zipp_py = (function () {
         function (a, b) { const e = makeExc(this, [a, b]); e.context = null; return e; },
         function (a, b, c) { const e = makeExc(this, [a, b, c]); e.context = null; return e; },
     ];
+    // The engine runs these itself for a call it would make of one (a
+    // `PyCall` of an exception class: `vm::py_ops`), as `makeExc` would.
+    R.EXCENTRY = EXC_ENTRY;
     function setExcEntry(cls, n) {
         if (cls.ctorInit !== rt.excInit) { clearCtorEntries(cls); cls.ctorInit = rt.excInit; }
         if (cls.ctorEntries === undefined || cls.ctorEntries === null) cls.ctorEntries = [];

@@ -218,6 +218,9 @@ pub(crate) struct PyRt {
     /// frame entry template `R.FRAMETMPL` and its shape (`shape::DICT`:
     /// none), and `R.TBKEEP` (0: unknown).
     pub(super) files: Value,
+    /// `R.EXCENTRY`: the exception classes' positional entries (an Array,
+    /// by count; see [`Vm::py_exc_entry`]).
+    pub(super) exc_entries: Value,
     pub(super) frame_tmpl: Value,
     pub(super) frame_shape: u32,
     pub(super) tb_keep: usize,
@@ -341,6 +344,7 @@ impl PyRt {
             ty: None,
             mself_slot: None,
             files: Value::UNDEFINED,
+            exc_entries: Value::UNDEFINED,
             frame_tmpl: Value::UNDEFINED,
             frame_shape: crate::shape::DICT,
             tb_keep: 0,
@@ -693,6 +697,7 @@ impl<'p> Vm<'p> {
         rt.exc_shape = self.py_template_shape(rt.exc_tmpl, &EXC_KEYS);
         rt.dict_shape = self.py_template_shape(dict, &["cls", "map", "size"]);
         rt.files = own(self, "FILES");
+        rt.exc_entries = own(self, "EXCENTRY");
         rt.frame_tmpl = own(self, "FRAMETMPL");
         rt.frame_shape = self.py_template_shape(rt.frame_tmpl, &FRAME_KEYS);
         let keep = own(self, "TBKEEP");
@@ -705,7 +710,7 @@ impl<'p> Vm<'p> {
         // The values above stay reachable through `pins` (held by `R`).
         let mut keep = vec![
             rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_str, rt.t_module, rt.ebase, rt.builtins, rt.excstack,
-            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl,
+            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl, rt.exc_entries,
         ];
         keep.extend_from_slice(&rt.istypes);
         let pi = pins.heap_index();

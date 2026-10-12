@@ -1,0 +1,13 @@
+Exception () Exception()  None None None None
+ValueError (5,) ValueError(5) 5 None None None None
+KeyError (5, 6) KeyError(5, 6) (5, 6) None None None None
+Plain (5, 'a', None) Plain(5, 'a', None) (5, 'a', None) None None None None
+Plain (1, 2, 3, 4) Plain(1, 2, 3, 4) (1, 2, 3, 4) None None None None
+Leaf () Leaf()  None None None None
+WithInit (5, 2) WithInit(5, 2) (5, 2) None None None 10
+WithInit (5, 3) WithInit(5, 3) (5, 3) None None None 15
+RuntimeError ('x', 5, 2.5, None, True) RuntimeError('x', 5, 2.5, None, True) ('x', 5, 2.5, None, True) None None None None
+made in handler None
+raised in handler KeyError('first')
+(3000, [2997, 2998, 2999], 4498500)
+() 1 True True

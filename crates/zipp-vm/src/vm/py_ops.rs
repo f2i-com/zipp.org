@@ -599,6 +599,17 @@ impl<'p> Vm<'p> {
                 }
                 usize::MAX
             }),
+            // An exception class's entry for the count (`R.EXCENTRY`):
+            // `const e = makeExc(this, [args]); e.context = null; return e;`
+            // run here, natively as `makeExc` itself runs (`py_make_exc`),
+            // when that builds the record; the entry's frame otherwise.
+            PyCallee::Exc(fid, closure, entry) => match self.py_new_exc(fv, base, arg_base, argc) {
+                Some(e) => {
+                    self.set(base, dst, e);
+                    Ok(ip + 1)
+                }
+                None => self.setup_call(fid, closure, fv, base, arg_base, argc, dst, ip + 1, entry).map(|()| usize::MAX),
+            },
             // What the slow edge's `CallWithThis` does with this entry. The
             // runtime's `__zipp_py_strm` (the entry of its native str
             // methods, `hash`, `heapq`, `bisect`, `math.sqrt`) is called
@@ -766,6 +777,9 @@ impl<'p> Vm<'p> {
         if p.is_generator || p.is_async {
             return PyCallee::Other(e);
         }
+        if self.py_exc_entry(e, argc) {
+            return PyCallee::Exc(fid, closure, e);
+        }
         // What `setup_call` binds as it is given for this callee: strict,
         // so `this` as passed; no rest parameter; no `arguments`.
         if p.is_strict && !p.lexical_this && p.rest_reg.is_none() && p.arguments_reg.is_none() {
@@ -776,6 +790,36 @@ impl<'p> Vm<'p> {
             }
         }
         PyCallee::Plain(fid, closure, e)
+    }
+
+    /// Whether `e` is the runtime's positional entry of exception classes
+    /// for `argc` arguments (`R.EXCENTRY[argc]`).
+    #[inline]
+    fn py_exc_entry(&self, e: Value, argc: u16) -> bool {
+        let Some(entries) = self.py_rt.as_deref().map(|p| p.exc_entries) else {
+            return false;
+        };
+        if !entries.is_heap() || self.array_js_len.contains_key(&entries.heap_index()) {
+            return false;
+        }
+        matches!(self.heap.get(entries.heap_index()), HeapObj::Array(items) if items.get(argc as usize).is_some_and(|v| v.bits() == e.bits()))
+    }
+
+    /// An exception class `cls` called with the `argc` arguments in the
+    /// caller's window at `arg_base`, as its positional entry does it: the
+    /// record `makeExc` builds natively (`py_make_exc`, over an Array of the
+    /// arguments) with `context` then `null`. `None` (nothing to undo: the
+    /// Array is garbage) when that declines.
+    fn py_new_exc(&mut self, cls: Value, base: usize, arg_base: u16, argc: u16) -> Option<Value> {
+        let rt = self.py_rt.as_deref()?.r;
+        let args: Vec<Value> = (0..argc as usize).map(|i| self.get(base, arg_base + i as u16)).collect();
+        let arr = Value::heap(self.heap.alloc(HeapObj::Array(args)));
+        let e = self.py_make_exc(cls, arr, rt)?;
+        // `e.context = null` (the record `py_make_exc` builds: slot 4).
+        if let HeapObj::Object(m) = self.heap.get_mut(e.heap_index()) {
+            m.set_val_at(4, Value::NULL);
+        }
+        Some(e)
     }
 
     /// The plain callee a [`Instr::PyCall`] site's entry `e` records (see
@@ -2153,6 +2197,8 @@ enum PyCallee {
     Lean(PyLean),
     /// A plain function: its id, closure and value.
     Plain(u32, u32, Value),
+    /// An exception class's positional entry (`R.EXCENTRY`), as `Plain`.
+    Exc(u32, u32, Value),
     /// Any other callable entry.
     Other(Value),
     /// No entry to call: the slow edge.
