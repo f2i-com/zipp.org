@@ -2828,6 +2828,15 @@ pub(crate) extern "win64" fn jit_concat(
     // no conflicting borrow (it touches only the reg file / globals base, and the
     // heap grows in a separate field).
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // The loop's safe point (B117). A compiled loop that builds strings and
+    // makes no call has no other: `var x = "k" + i` three million times ran
+    // one collection and held 675 MB where Node holds 30, and objects and
+    // arrays made in the same loop were collected by their own helpers'
+    // polls. Both operands sit in the caller's frame window, which the
+    // collector traces, and every call site re-derives its pinned bases and
+    // snapshots after this helper, as it must after any allocation or user
+    // coercion `add_values` can run.
+    vm.maybe_gc();
     match vm.add_values(a, b) {
         Ok(v) => v.bits(),
         // `add_values` can run user coercion code (an object operand's
@@ -2855,6 +2864,9 @@ pub(crate) extern "win64" fn jit_add_right_pair(
     c_bits: u64,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // The loop's safe point; see `jit_concat`. The three operands are in the
+    // caller's frame window and both call sites refetch afterwards.
+    vm.maybe_gc();
     match vm.add_values_right_pair(
         Value::from_bits(a_bits),
         Value::from_bits(b_bits),
@@ -2876,6 +2888,8 @@ pub(crate) extern "win64" fn jit_append_right_pair(
     c_bits: u64,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // The loop's safe point; see `jit_concat`.
+    vm.maybe_gc();
     match vm.add_values_right_pair_inplace(
         Value::from_bits(a_bits),
         Value::from_bits(b_bits),
