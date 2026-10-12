@@ -1923,24 +1923,24 @@ pub struct Vm<'p> {
     /// CHAIN of its class body: own brand first, then each lexically ENCLOSING
     /// class's brand. A private access threaded with lexical DEPTH d checks the
     /// receiver against `chain[d]` — the SPECIFIC declaring class's brand. Pruned by GC.
-    method_brand: std::collections::HashMap<u32, Vec<u64>>,
+    method_brand: crate::slot_table::SlotTable<Vec<u64>>,
     /// Extra private brands installed on a specific INSTANCE that its `map.class`
     /// chain does not cover — namely a constructor RETURN-OVERRIDE object, which
     /// receives a class's private fields/brand without becoming an instanceof that
     /// class. Checked by `instance_has_brand` alongside the class chain. Pruned by GC.
-    instance_brand: std::collections::HashMap<u32, Vec<u64>>,
+    instance_brand: crate::slot_table::SlotTable<Vec<u64>>,
     /// Private NAMES (with the "#" prefix) declared by the class owning each brand.
     /// Lets a private access resolve "#x" to the innermost brand in the lexical
     /// chain whose class actually declares it (precise + shadow-aware) instead of
     /// accepting ANY chain brand. A name absent here falls back to the lenient
     /// any-brand check. Keyed by brand; pruned by GC to brands still referenced.
-    brand_private_names: std::collections::HashMap<u64, Vec<(String, u8)>>,
+    brand_private_names: rustc_hash::FxHashMap<u64, Vec<(String, u8)>>,
     /// Brand -> heap index of the class VALUE that minted it (the DECLARING
     /// class), so a private access resolves members from the declaring class
     /// rather than the receiver's chain (kind-aware: shadowed/missing
     /// getter/setter errors). NOT a GC root: pruned when the class dies (no
     /// live accessor can then need it).
-    brand_owner: std::collections::HashMap<u64, u32>,
+    brand_owner: rustc_hash::FxHashMap<u64, u32>,
     /// Lazily-created `.prototype` object for a function/class value, keyed by the
     /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on
@@ -2149,7 +2149,7 @@ pub struct Vm<'p> {
     /// value as the construction result (reg 0 was rebound, but the original
     /// instance is what `construct` holds). Read+cleared by `construct` /
     /// `run_class_ctor`; transient like `super_called`.
-    super_this: std::collections::HashMap<u32, Value>,
+    super_this: crate::slot_table::SlotTable<Value>,
     /// Private FIELD storage — spec [[PrivateElements]] of kind "field":
     /// instance heap idx -> ((brand, name) -> value). Keyed by the
     /// per-evaluation brand so same-named fields of sibling classes or other

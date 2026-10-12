@@ -1842,6 +1842,10 @@ impl Vm<'_> {
                 for &u in &c.field_thunk_upvalues {
                     m_idx!(u);
                 }
+                // The constructor and field-thunk function values the class
+                // keeps (`Vm::class_body_fn`): nothing else holds them.
+                m_val!(c.ctor_fn);
+                m_val!(c.thunk_fn);
                 // Decoration state: every entry is a user-supplied Value the
                 // class still owes work to (field-initializer chains that run at
                 // the next `new`, addInitializer callbacks, the resolved keys and

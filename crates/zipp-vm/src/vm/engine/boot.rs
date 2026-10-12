@@ -272,10 +272,10 @@ impl<'p> Vm<'p> {
             regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),
             collection_index: rustc_hash::FxHashMap::default(),
             next_private_brand: 1,
-            method_brand: std::collections::HashMap::new(),
-            instance_brand: std::collections::HashMap::new(),
-            brand_private_names: std::collections::HashMap::new(),
-            brand_owner: std::collections::HashMap::new(),
+            method_brand: crate::slot_table::SlotTable::default(),
+            instance_brand: crate::slot_table::SlotTable::default(),
+            brand_private_names: rustc_hash::FxHashMap::default(),
+            brand_owner: rustc_hash::FxHashMap::default(),
             prototypes: std::collections::HashMap::new(),
             class_proto_owner: rustc_hash::FxHashMap::default(),
             ctor_initial_name: rustc_hash::FxHashMap::default(),
@@ -298,7 +298,7 @@ impl<'p> Vm<'p> {
             array_proto_has_index: false,
             super_called: crate::slot_table::SlotSet::default(),
             this_tdz: crate::slot_table::SlotSet::default(),
-            super_this: std::collections::HashMap::new(),
+            super_this: crate::slot_table::SlotTable::default(),
             private_fields: std::collections::HashMap::new(),
             eval_fn_idx: 0,
             closure_eval_scope: crate::vm::JitGuardedMap::new(),
@@ -714,8 +714,8 @@ impl<'p> Vm<'p> {
     /// unmetered allocation per constructed object.
     fn private_side_table_resident_bytes(&self) -> usize {
         let mut n = Self::hash_map_resident_bytes(&self.private_fields)
-            .saturating_add(Self::hash_map_resident_bytes(&self.method_brand))
-            .saturating_add(Self::hash_map_resident_bytes(&self.instance_brand))
+            .saturating_add(self.method_brand.resident_bytes())
+            .saturating_add(self.instance_brand.resident_bytes())
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_private_names))
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_owner));
 

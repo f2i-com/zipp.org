@@ -4169,6 +4169,13 @@ pub struct ClassData {
     /// Upvalue cells for `field_thunk`, captured at MakeClass like
     /// `ctor_upvalues` (field initializers may close over enclosing locals).
     pub field_thunk_upvalues: Vec<u32>,
+    /// The function value `new` calls `ctor` through (`ctor` over
+    /// `ctor_upvalues`, with the class's brand chain), made at the first
+    /// construction and kept (`Vm::class_body_fn`); `UNDEFINED` before. It is
+    /// never handed to guest code: it is only a frame's callee.
+    pub ctor_fn: crate::value::Value,
+    /// The same for `field_thunk`.
+    pub thunk_fn: crate::value::Value,
     /// A fresh per-EVALUATION private brand id, minted at MakeClass, giving each
     /// class evaluation a distinct private-name identity (so two classes that both
     /// declare `#m` don't collide). 0 = unbranded.

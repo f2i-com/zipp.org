@@ -9,6 +9,46 @@ impl<'p> Vm<'p> {
     /// Build the callable for a class constructor: a plain `Func`, or a `Closure`
     /// over the cells the ctor captured (at class-definition time) when it closes
     /// over an enclosing-function local.
+    /// The function value `new` runs the class `cv`'s constructor through
+    /// (`thunk`: its instance-field thunk), made the first time and kept on
+    /// the class; `None` when the class has none.
+    ///
+    /// Every construction used to make it again: a function object, a copy
+    /// of the upvalue list and of the class's brand chain, and a brand-table
+    /// entry for the new object, at each level of the chain and again for
+    /// each field thunk. Nothing can tell two of them apart: the value is
+    /// only ever a frame's callee (a class constructor cannot be reached
+    /// through `arguments.callee` or a caller property, both strict-mode
+    /// errors), `ctor` and its upvalue cells are fixed when the class is
+    /// made, and so is the class's brand chain.
+    pub(crate) fn class_body_fn(&mut self, cv: Value, thunk: bool) -> Option<Value> {
+        let ci = cv.heap_index();
+        let (fid, ups, kept) = match self.heap.get(ci) {
+            HeapObj::Class(c) if thunk => (c.field_thunk?, &c.field_thunk_upvalues, c.thunk_fn),
+            HeapObj::Class(c) => (c.ctor?, &c.ctor_upvalues, c.ctor_fn),
+            _ => return None,
+        };
+        if kept.is_heap() {
+            return Some(kept);
+        }
+        let ups = ups.clone();
+        let f = self.ctor_value(fid, &ups);
+        // The class body's private scope: the class's lexical brand chain.
+        if let Some(brands) = self.method_brand.get(&ci).cloned() {
+            self.method_brand.insert(f.heap_index(), brands);
+        }
+        // An old class may now hold a young function.
+        self.heap.write_barrier_val(ci, f);
+        if let HeapObj::Class(c) = self.heap.get_mut(ci) {
+            if thunk {
+                c.thunk_fn = f;
+            } else {
+                c.ctor_fn = f;
+            }
+        }
+        Some(f)
+    }
+
     pub(crate) fn ctor_value(&mut self, fid: u32, ups: &[u32]) -> Value {
         if ups.is_empty() {
             Value::heap(self.heap.alloc(HeapObj::Func(fid)))
@@ -343,19 +383,9 @@ impl<'p> Vm<'p> {
         if !cv.is_heap() {
             return Ok(());
         }
-        let (tfid, tups) = match self.heap.get(cv.heap_index()) {
-            HeapObj::Class(c) => (c.field_thunk, c.field_thunk_upvalues.clone()),
-            _ => (None, Vec::new()),
-        };
-        let Some(fid) = tfid else { return Ok(()) };
-        let f = self.ctor_value(fid, &tups);
         // The thunk runs in the class body's private scope (same brand chain
         // handed to the ctor in `construct`).
-        if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
-            if f.is_heap() {
-                self.method_brand.insert(f.heap_index(), brands);
-            }
-        }
+        let Some(f) = self.class_body_fn(cv, true) else { return Ok(()) };
         self.call_value(f, inst, &[])?;
         Ok(())
     }
@@ -370,11 +400,10 @@ impl<'p> Vm<'p> {
         if !cval.is_heap() {
             return Ok(obj);
         }
-        let (ctor, ctor_ups, has_explicit, parent, extends_null) =
+        let (ctor, has_explicit, parent, extends_null) =
             match self.heap.get(cval.heap_index()) {
                 HeapObj::Class(c) => (
                     c.ctor,
-                    c.ctor_upvalues.clone(),
                     c.has_explicit_ctor,
                     c.parent,
                     c.extends_null,
@@ -508,7 +537,7 @@ impl<'p> Vm<'p> {
         if has_explicit {
             // An explicit ctor produces `this`: its object-return (return-override)
             // becomes the effective instance; a non-object/undefined return keeps obj.
-            if let Some(fid) = ctor {
+            if ctor.is_some() {
                 // A BASE parent's InitializeInstanceElements runs at entry —
                 // brand, then fields, both before the parent ctor's parameter
                 // prologue.
@@ -521,12 +550,8 @@ impl<'p> Vm<'p> {
                 // initializers are guest code, and a function Value held only in
                 // a Rust local across them was swept, so super() called whatever
                 // object reused its slot ("Invalid Date is not a function").
-                let f = self.ctor_value(fid, &ctor_ups);
-                if let Some(brands) = self.method_brand.get(&cval.heap_index()).cloned() {
-                    if f.is_heap() {
-                        self.method_brand.insert(f.heap_index(), brands);
-                    }
-                }
+                // (It is kept on the class now, rooted by it.)
+                let f = self.class_body_fn(cval, false).unwrap_or(Value::UNDEFINED);
                 // A derived parent ctor begins with `this` back in TDZ (until
                 // ITS OWN super() completes). No removal here: if the parent
                 // throws pre-super, the caller's binding is still uninitialized
@@ -580,13 +605,8 @@ impl<'p> Vm<'p> {
             }
             // PrivateBrandAdd before this class's field initializers run.
             self.brand_instance(eff, cval);
-            if let Some(fid) = ctor {
-                let f = self.ctor_value(fid, &ctor_ups);
-                if let Some(brands) = self.method_brand.get(&cval.heap_index()).cloned() {
-                    if f.is_heap() {
-                        self.method_brand.insert(f.heap_index(), brands);
-                    }
-                }
+            if ctor.is_some() {
+                let f = self.class_body_fn(cval, false).unwrap_or(Value::UNDEFINED);
                 self.pending_new_target = new_target;
                 let r = self.call_value(f, eff, &[])?;
                 if self.is_object_value(r) {

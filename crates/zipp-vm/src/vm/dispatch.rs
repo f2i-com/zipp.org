@@ -2572,6 +2572,8 @@ impl<'p> Vm<'p> {
                             ctor_upvalues,
                             field_thunk: cd.field_thunk,
                             field_thunk_upvalues,
+                            ctor_fn: Value::UNDEFINED,
+                            thunk_fn: Value::UNDEFINED,
                             private_brand,
                             class_id,
                             dec: None,

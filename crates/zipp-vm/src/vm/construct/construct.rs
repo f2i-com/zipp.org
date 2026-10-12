@@ -1063,11 +1063,10 @@ impl<'p> Vm<'p> {
                 vm.construct_with_newtarget(target, &combined, nt)
             });
         }
-        let (ctor, ctor_ups, has_explicit, parent, extends_null) =
+        let (ctor, has_explicit, parent, extends_null) =
             match self.heap.get(cv.heap_index()) {
                 HeapObj::Class(c) => (
                     c.ctor,
-                    c.ctor_upvalues.clone(),
                     c.has_explicit_ctor,
                     c.parent,
                     c.extends_null,
@@ -1115,7 +1114,7 @@ impl<'p> Vm<'p> {
         if has_explicit {
             // The explicit constructor runs its own `super(...)`; a ctor that
             // returns an object/array replaces the instance.
-            if let Some(fid) = ctor {
+            if ctor.is_some() {
                 // A BASE class's InitializeInstanceElements runs at
                 // [[Construct]] entry (a DERIVED class's at super() completion) —
                 // brand first, then the field initializers, and BOTH before the
@@ -1132,15 +1131,11 @@ impl<'p> Vm<'p> {
                 // constructor(){} }` under ZIPP_GC_STRESS=1 swept this very
                 // function and called whatever object reused its slot
                 // ("[object Object] is not a function").
-                let f = self.ctor_value(fid, &ctor_ups);
-                // The ctor (incl. field initializers) runs in the class body's private
-                // scope: give its function value the class's lexical brand chain so
+                // (It is kept on the class now, rooted by it.) The ctor (incl.
+                // field initializers) runs in the class body's private scope:
+                // its function value carries the class's lexical brand chain so
                 // `this.#x` + classes defined in field initializers resolve.
-                if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
-                    if f.is_heap() {
-                        self.method_brand.insert(f.heap_index(), brands);
-                    }
-                }
+                let f = self.class_body_fn(cv, false).unwrap_or(Value::UNDEFINED);
                 // A DERIVED ctor's `this` is in TDZ until its `super(...)`
                 // completes (the SuperCtor ops remove the mark).
                 if parent.is_some() || extends_null {
@@ -1242,13 +1237,8 @@ impl<'p> Vm<'p> {
             // (even when the checked init throws).
             self.super_called.remove(&inst.heap_index());
             r?;
-            if let Some(fid) = ctor {
-                let f = self.ctor_value(fid, &ctor_ups);
-                if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
-                    if f.is_heap() {
-                        self.method_brand.insert(f.heap_index(), brands);
-                    }
-                }
+            if ctor.is_some() {
+                let f = self.class_body_fn(cv, false).unwrap_or(Value::UNDEFINED);
                 self.call_value(f, inst, &[])?;
             }
             return Ok(inst);
