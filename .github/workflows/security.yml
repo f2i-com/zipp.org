@@ -471,10 +471,17 @@ jobs:
     if: ${{ inputs.canary }}
     continue-on-error: true
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 60
+    # Optimized at level 1, as the native workspace job above is: the drift
+    # this looks for (a new error, lint or behaviour) does not depend on the
+    # level. Unoptimized it took 46 minutes; the same change took the
+    # workspace job from 86 to 16. Debug assertions and overflow checks stay
+    # on.
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
       CARGO_BUILD_JOBS: "2"
     steps:
       - name: Check out source
