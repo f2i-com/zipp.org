@@ -1063,7 +1063,67 @@ impl<'p> Vm<'p> {
             new_target,
             callee,
         });
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(r) = self.frame_run_compiled(func_id, stop_depth) {
+            return r;
+        }
         self.run_loop(stop_depth)
+    }
+
+    /// Run the frame `call_value_plain_body` just pushed for `fid` (at
+    /// `stop`) on its compiled whole-function body, as the interpreter loop
+    /// does at a frame's first instruction but without entering the loop: a
+    /// return pops the frame as `Return` does, a bail resumes the interpreter
+    /// at the bail instruction in that frame, and a throw unwinds from it as
+    /// `run_loop` does. `None`, with nothing done, when the loop's own
+    /// conditions for entering the body do not hold or the body is not
+    /// compiled yet (the loop counts the call and compiles it).
+    ///
+    /// A builtin that calls a compiled function (a promise reaction, a sort
+    /// comparator, an array callback that captures) paid for `run_loop` and
+    /// the dispatch function's entry around every call only to reach this
+    /// same native entry: a fifth of a reaction job.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn frame_run_compiled(&mut self, fid: u32, stop: usize) -> Option<Result<Value, Thrown>> {
+        if !self.jit_enabled
+            || self.jit_recurse_depth != 0
+            || self.jit.get(fid).is_none()
+            || !self.jit_func_eligible(fid)
+            // The cap on native re-entry is `run_loop`'s to raise.
+            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+        {
+            return None;
+        }
+        // The loop's safe point at a frame transition: the arguments are in
+        // the new frame's window.
+        self.maybe_gc();
+        let base = self.frames[stop].base;
+        // A Rust-stack re-entry like a nested `run_loop`, charged like one.
+        self.run_loop_depth += 1;
+        let ran = self.try_run_jit(fid, base);
+        self.run_loop_depth -= 1;
+        let (v, bail) = ran?;
+        if bail == crate::codegen::NO_BAIL {
+            let _ = self.pop_frame_with(v, stop);
+            return Some(Ok(v));
+        }
+        let top = self.frames.len() - 1;
+        self.frames[top].ip = bail as usize;
+        if let Some(tv) = self.pending_throw {
+            // A callee of the native body threw: `run_loop`'s own unwind for
+            // a throw out of its frame.
+            if self.unwind_to_handler(tv, stop) {
+                self.pending_throw = None;
+                return Some(self.run_loop(stop));
+            }
+            return Some(Err(Thrown(self.throw_message(tv))));
+        }
+        if bail == 0 {
+            // Nothing ran: the loop's first instruction is this frame's.
+            return None;
+        }
+        Some(self.run_loop(stop))
     }
 
     /// Resume `callee`'s activation on the interpreter at bytecode `ip`, over
