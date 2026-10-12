@@ -1957,6 +1957,10 @@ impl<'p> Vm<'p> {
             } else {
                 None
             };
+            if dest.is_none() && self.array_from_steps_itself(src, using_iter) {
+                drop(gc);
+                return self.array_from_dense(src.heap_index(), mapfn, this_arg);
+            }
             let iter = self.call_value(using_iter, src, &[])?;
             if !self.is_object_value(iter) {
                 return Err(Thrown::from_static("TypeError: iterator is not an object"));
@@ -2014,16 +2018,172 @@ impl<'p> Vm<'p> {
         }
         self.preflight_materialized_array(n)?;
         let mut out = Vec::with_capacity(n.min(4096));
+        // A compiled mapping function runs over one reused window, as an
+        // array builtin's callback does (`Array.from({ length: n }, f)`).
+        let (native, win) = if mapping {
+            self.open_cb_window(mapfn, this_arg)
+        } else {
+            (None, self.regs.len())
+        };
+        let mut failed = None;
         for i in 0..n {
-            let v = self.get_index(obj, Value::num(i as f64))?;
-            let mapped = if mapping {
-                self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
-            } else {
-                v
-            };
-            out.push(mapped);
+            let step = self.get_index(obj, Value::num(i as f64)).and_then(|v| {
+                if mapping {
+                    self.run_cb_elem(&native, win, mapfn, &[v, Value::num(i as f64)], this_arg)
+                } else {
+                    Ok(v)
+                }
+            });
+            match step {
+                Ok(mapped) => out.push(mapped),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
         }
-        Ok(self.alloc_array_current_realm(out))
+        self.regs.truncate(win);
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(self.alloc_array_current_realm(out)),
+        }
+    }
+
+    /// Whether `Array.from(src)` can step `src` itself instead of driving an
+    /// iterator object: a real Array with no element overlay, no mapped
+    /// `arguments` and no virtual length, whose `@@iterator` Get yielded the
+    /// intrinsic and whose iterator prototype still has the intrinsic `next`
+    /// (read once, when the iterator would be made). The same proof
+    /// `Promise.all` steps an array under.
+    fn array_from_steps_itself(&self, src: Value, using_iter: Value) -> bool {
+        src.is_heap()
+            && matches!(self.heap.get(src.heap_index()), HeapObj::Array(_))
+            && self.array_steps_dense(src.heap_index())
+            && using_iter.bits() == self.default_array_iter.bits()
+            && match self.heap.get(self.array_iter_proto) {
+                HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
+                _ => false,
+            }
+    }
+
+    /// Whether the Array at `idx` answers an index read from its dense store
+    /// alone, right now.
+    #[inline]
+    fn array_steps_dense(&self, idx: u32) -> bool {
+        !self.array_elements_overlaid(idx)
+            && !self.arguments_objs.contains_key(&idx)
+            && !self.array_js_len.contains_key(&idx)
+    }
+
+    /// `Array.from(array[, mapfn])` for a source [`Self::array_from_steps_itself`]
+    /// admits, building a plain Array: the intrinsic array iterator's steps
+    /// taken here, on the live array, with no iterator object, no result
+    /// object per step and no `next` call.
+    ///
+    /// Each step is the iterator's: past the live length it is done;
+    /// otherwise the element is read with [[Get]] (a hole, or an array the
+    /// mapping function has since given an accessor or a virtual length,
+    /// takes the generic read). The iterator object is unobservable until
+    /// the mapping function throws, when `IteratorClose` looks `return` up
+    /// on it: a real one is made then and closed, so a `return` someone put
+    /// on the iterator prototypes is still found and called.
+    ///
+    /// The driven protocol cost a `next` call, a result object and two
+    /// property reads per element: eight times what Node pays for
+    /// `Array.from(arr, f)`.
+    fn array_from_dense(&mut self, src: u32, mapfn: Value, this_arg: Value) -> Result<Value, Thrown> {
+        let mapping = mapfn != Value::UNDEFINED;
+        let acc = self.heap.alloc(HeapObj::Array(Vec::new()));
+        // Collection runs: the source, the function and its `this`, the
+        // accumulator and the current element are roots.
+        let base = self.host_result_roots.len();
+        self.host_result_roots.extend_from_slice(&[
+            Value::heap(src),
+            mapfn,
+            this_arg,
+            Value::heap(acc),
+            Value::UNDEFINED,
+        ]);
+        let (native, win) = if mapping {
+            self.open_cb_window(mapfn, this_arg)
+        } else {
+            (None, self.regs.len())
+        };
+        let mut k: usize = 0;
+        let outcome = loop {
+            let direct = match self.heap.get(src) {
+                HeapObj::Array(items) if self.array_steps_dense(src) => {
+                    if k >= items.len() {
+                        break Ok(());
+                    }
+                    Some(items[k]).filter(|v| !v.is_hole())
+                }
+                _ => None,
+            };
+            let value = match direct {
+                Some(v) => v,
+                None => {
+                    if k >= self.js_array_len(src) {
+                        break Ok(());
+                    }
+                    // The iterator's own Get: its throw is `next`'s, which
+                    // leaves the iterator done, so nothing is closed.
+                    match self.get_index(Value::heap(src), Value::num(k as f64)) {
+                        Ok(v) => v,
+                        Err(e) => break Err(e),
+                    }
+                }
+            };
+            self.host_result_roots[base + 4] = value;
+            // An abrupt step after the element was produced closes the
+            // iterator: made now, since nothing could see it before.
+            macro_rules! close_and_throw {
+                ($e:expr) => {{
+                    let saved = self.pending_throw;
+                    let iter = Value::heap(self.heap.alloc(HeapObj::Iterator {
+                        items: Vec::new(),
+                        index: k + 1,
+                        proto: self.array_iter_proto,
+                        live: Some((src, 1)),
+                    }));
+                    self.host_result_roots[base + 4] = iter;
+                    let _ = self.iterator_close(iter);
+                    self.pending_throw = saved;
+                    break Err($e);
+                }};
+            }
+            let mapped = if mapping {
+                match self.run_cb_elem(&native, win, mapfn, &[value, Value::num(k as f64)], this_arg) {
+                    Ok(v) => v,
+                    Err(e) => close_and_throw!(e),
+                }
+            } else {
+                value
+            };
+            if k >= crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
+                break Err(Thrown::from_static(
+                    "RangeError: iterator produced more values than the engine's limit",
+                ));
+            }
+            if let HeapObj::Array(items) = self.heap.get_mut(acc) {
+                items.push(mapped);
+            }
+            self.heap.write_barrier_val(acc, mapped);
+            if let Err(e) = self.instrument_drain_heap_check(k + 1) {
+                close_and_throw!(e);
+            }
+            k += 1;
+        };
+        self.regs.truncate(win);
+        let result = outcome.map(|()| {
+            let out = match self.heap.get_mut(acc) {
+                HeapObj::Array(items) => std::mem::take(items),
+                _ => Vec::new(),
+            };
+            self.alloc_array_current_realm(out)
+        });
+        self.host_result_roots.truncate(base);
+        result
     }
 
     /// `Array.from`'s iterator loop, with collection running: the

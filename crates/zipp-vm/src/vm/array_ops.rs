@@ -3326,31 +3326,54 @@ impl<'p> Vm<'p> {
                 // length: `find`/`findIndex` still visit it with `undefined` (they do
                 // not HasProperty-skip), while `some`/`every` skip it.
                 let len = self.array_snapshot(idx).len();
+                // A compiled predicate runs over one reused window, as the
+                // all-elements driver's callback does; every exit releases it.
+                let (native, win) = self.open_cb_window(cb, this_arg);
+                let mut found: Result<Option<Value>, Thrown> = Ok(None);
                 for i in 0..len {
-                    let v = match self.array_dense_or_proto_get(idx, i)? {
-                        Some(v) => v,
-                        None => {
+                    let v = match self.array_dense_or_proto_get(idx, i) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => {
                             if name == "some" || name == "every" {
                                 continue;
                             }
                             Value::UNDEFINED
                         }
+                        Err(e) => {
+                            found = Err(e);
+                            break;
+                        }
                     };
-                    let r = self.call_value(cb, this_arg, &[v, Value::int(i as i32), receiver])?;
+                    let args = [v, Value::int(i as i32), receiver];
+                    let r = match self.run_cb_elem(&native, win, cb, &args, this_arg) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            found = Err(e);
+                            break;
+                        }
+                    };
                     let t = self.truthy(r);
-                    match name {
-                        "find" if t => return Ok(Some(v)),
-                        "findIndex" if t => return Ok(Some(Value::int(i as i32))),
-                        "some" if t => return Ok(Some(Value::bool(true))),
-                        "every" if !t => return Ok(Some(Value::bool(false))),
-                        _ => {}
+                    let hit = match name {
+                        "find" if t => Some(v),
+                        "findIndex" if t => Some(Value::int(i as i32)),
+                        "some" if t => Some(Value::bool(true)),
+                        "every" if !t => Some(Value::bool(false)),
+                        _ => None,
+                    };
+                    if hit.is_some() {
+                        found = Ok(hit);
+                        break;
                     }
                 }
-                Ok(Some(match name {
-                    "find" => Value::UNDEFINED,
-                    "findIndex" => Value::int(-1),
-                    "some" => Value::bool(false),
-                    _ => Value::bool(true), // every: all matched (or empty)
+                self.regs.truncate(win);
+                Ok(Some(match found? {
+                    Some(v) => v,
+                    None => match name {
+                        "find" => Value::UNDEFINED,
+                        "findIndex" => Value::int(-1),
+                        "some" => Value::bool(false),
+                        _ => Value::bool(true), // every: all matched (or empty)
+                    },
                 }))
             }
             "reduce" => {
