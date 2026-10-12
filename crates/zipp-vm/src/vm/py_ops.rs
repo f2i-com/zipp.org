@@ -915,7 +915,7 @@ impl<'p> Vm<'p> {
     /// [`Instr::PyGlobal`]: a module global, else a builtin; `None` for the
     /// slow edge (see `vm::py_rt` for the site cache's entries).
     #[inline(never)]
-    fn py_global(&mut self, func_id: u32, ip: usize, g: Value, r: Value, key: u32) -> Option<Value> {
+    pub(super) fn py_global(&mut self, func_id: u32, ip: usize, g: Value, r: Value, key: u32) -> Option<Value> {
         if !g.is_heap() {
             return None;
         }
@@ -1124,7 +1124,7 @@ impl<'p> Vm<'p> {
     }
 
     /// The Array for [`Instr::PyUnpack`].
-    fn py_unpack(&self, v: Value, rt: Value, n: u32) -> Option<Value> {
+    pub(super) fn py_unpack(&self, v: Value, rt: Value, n: u32) -> Option<Value> {
         let p = self.py_rt_for(rt)?;
         let (tl, tt) = (p.t_list.bits(), p.t_tuple.bits());
         let (cls, items) = self.py_seq_parts(v)?;
@@ -1226,7 +1226,7 @@ impl<'p> Vm<'p> {
     }
 
     /// The record for [`Instr::PySeq`].
-    fn py_seq(&mut self, items: Value, rt: Value, tuple: bool) -> Option<Value> {
+    pub(super) fn py_seq(&mut self, items: Value, rt: Value, tuple: bool) -> Option<Value> {
         if !items.is_heap() {
             return None;
         }
@@ -1241,7 +1241,7 @@ impl<'p> Vm<'p> {
     }
 
     /// `len(v)` for [`Instr::PyLen`].
-    fn py_len(&mut self, v: Value, rt: Value) -> Option<usize> {
+    pub(super) fn py_len(&mut self, v: Value, rt: Value) -> Option<usize> {
         if !v.is_heap() {
             return None;
         }
@@ -1277,7 +1277,7 @@ impl<'p> Vm<'p> {
     /// The site's entry names the globals Map and the name's entry in it,
     /// as `PyGlobal`'s does (the Map's keys as they were, the key there by
     /// its bits and stamp), so a hit reads that entry with no hashing.
-    fn py_mod_get(&mut self, func_id: u32, ip: usize, o: Value, rt: Value, key: u32) -> Option<Value> {
+    pub(super) fn py_mod_get(&mut self, func_id: u32, ip: usize, o: Value, rt: Value, key: u32) -> Option<Value> {
         let tmodule = self.py_rt_for(rt)?.t_module;
         let cls = self.py_cls_of(o)?;
         if tmodule.bits() != cls.bits() {
@@ -1309,7 +1309,7 @@ impl<'p> Vm<'p> {
 
     /// `isinstance(v, t)` for [`Instr::PyIsInstance`].
     #[inline(never)]
-    fn py_isinstance(&mut self, func_id: u32, ip: usize, v: Value, t: Value, rt: Value) -> Option<bool> {
+    pub(super) fn py_isinstance(&mut self, func_id: u32, ip: usize, v: Value, t: Value, rt: Value) -> Option<bool> {
         if !t.is_heap() {
             return None;
         }

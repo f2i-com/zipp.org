@@ -1,0 +1,13 @@
+name name 'LIMIT' is not defined
+globals -426847 7 -3
+shadow 20100 4
+attr 'Box' object has no attribute 'pi'
+module 731556.097073
+method (2000, ['ABC', 'shadow', 'BOX', 'XYZ', 'ABC', 'shadow'], ['ABC', 'BOX', 'BOX', 'XYZ', 'ABC', 'shadow'], ['ABC', 'BOX', 'XYZ', 'shadow'])
+isinstance TypeError
+isinstance (366, '1000100000100010000000000000100000000000000100000000000001000000000000010000000000000100000000000001100000000000010001111111111111000000000001010101000001000001000000000')
+len object of type 'int' has no len()
+len 49275
+unpack too many values to unpack (expected 2)
+seq 14016602
+exc (2667, ('missing3',))

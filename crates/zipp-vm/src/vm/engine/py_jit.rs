@@ -296,6 +296,109 @@ impl<'p> Vm<'p> {
         }
     }
 
+    // The fused instructions that only answer a value or take their slow
+    // edge (they run no guest code, raise nothing and change nothing when
+    // they decline), from compiled code: each helper below is the step's own
+    // function for one of them over the operands' bits, with the site
+    // (`packed = (func_id << 32) | ip`, for its cache entry) where that
+    // function takes one, and answers the value's bits or `PY_SLOW_BITS`
+    // for the `slow` edge. `jit_py_op` reaches the same function after
+    // finding the code object and the instruction again, decoding its
+    // edges, checking the window and routing it through `py_exec` and the
+    // step's match. Each is a GC safe point, as `jit_py_op` is (the
+    // operands are also in the frame's registers).
+
+    /// `PyGlobal` from compiled code: `py_global` (see above).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_global(vm: *mut core::ffi::c_void, g: u64, rt: u64, packed: u64, key: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_global((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(g), Value::from_bits(rt), key as u32) {
+            Some(v) => v.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyModGet` from compiled code: `py_mod_get` (see above).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_mod_get(vm: *mut core::ffi::c_void, o: u64, rt: u64, packed: u64, key: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_mod_get((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(o), Value::from_bits(rt), key as u32) {
+            Some(v) => v.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyMethod` from compiled code: `py_method` (see above); `keys` is
+    /// `key | gb << 32`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_method(vm: *mut core::ffi::c_void, o: u64, rt: u64, packed: u64, keys: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_method((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(o), Value::from_bits(rt), keys as u32, (keys >> 32) as u32) {
+            Some(f) => f.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyIsInstance` from compiled code: `py_isinstance` (see above), its
+    /// answer as the bool the step stores.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_isinstance(vm: *mut core::ffi::c_void, v: u64, t: u64, rt: u64, packed: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_isinstance((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(v), Value::from_bits(t), Value::from_bits(rt)) {
+            Some(r) => Value::bool(r).bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyLen` from compiled code: `py_len` (see above), its answer as the
+    /// int the step stores.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_len(vm: *mut core::ffi::c_void, v: u64, rt: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_len(Value::from_bits(v), Value::from_bits(rt)) {
+            Some(n) => vm.make_bigint(n as i128).bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PySeq` from compiled code: `py_seq` (see above); `tuple` is 0 or 1.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_seq(vm: *mut core::ffi::c_void, items: u64, rt: u64, tuple: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_seq(Value::from_bits(items), Value::from_bits(rt), tuple != 0) {
+            Some(v) => v.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyUnpack` from compiled code: `py_unpack` (see above).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_unpack(vm: *mut core::ffi::c_void, v: u64, rt: u64, n: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_unpack(Value::from_bits(v), Value::from_bits(rt), n as u32) {
+            Some(items) => items.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyMakeExc` from compiled code: `py_make_exc` (see above).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_make_exc(vm: *mut core::ffi::c_void, cls: u64, args: u64, rt: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_make_exc(Value::from_bits(cls), Value::from_bits(args), Value::from_bits(rt)) {
+            Some(e) => e.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
     /// `PySetItem` from compiled code: `py_set_item` over the registers the
     /// instruction names in the window at `regs` (`packed` = `o | k << 16 |
     /// v << 32 | seq << 48`, then `dict`), the step's own answer without

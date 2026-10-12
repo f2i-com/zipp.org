@@ -883,6 +883,45 @@ pub(crate) fn emit_py_op(
                 ; jmp => labels.bail
             );
         }
+        // The instructions that only answer a value or take their slow edge:
+        // each through its own helper (`vm/engine/py_jit.rs`), the step's
+        // function over the operands with the site for its cache entry,
+        // instead of through `Vm::jit_py_op`, which finds and decodes the
+        // instruction again first. (A `ZIPP_PY_PROF` run takes the ordinary
+        // step, which counts.)
+        Instr::PyGlobal { dst, globals, rt, key, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_global as usize;
+            emit_py_value_call(ops, h, [V::Reg(globals), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(key as u64)], dst, labels, refetch);
+        }
+        Instr::PyModGet { dst, obj, rt, key, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_mod_get as usize;
+            emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(key as u64)], dst, labels, refetch);
+        }
+        Instr::PyMethod { dst, obj, rt, key, gb, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_method as usize;
+            let keys = key as u64 | (gb as u64) << 32;
+            emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(keys)], dst, labels, refetch);
+        }
+        Instr::PyIsInstance { dst, v, t, rt, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_isinstance as usize;
+            emit_py_value_call(ops, h, [V::Reg(v), V::Reg(t), V::Reg(rt), V::Imm(site(func_id, ip))], dst, labels, refetch);
+        }
+        Instr::PyLen { dst, v, rt, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_len as usize;
+            emit_py_value_call(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels, refetch);
+        }
+        Instr::PySeq { dst, items, rt, tuple, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_seq as usize;
+            emit_py_value_call(ops, h, [V::Reg(items), V::Reg(rt), V::Imm(tuple as u64), V::None], dst, labels, refetch);
+        }
+        Instr::PyUnpack { dst, v, rt, n, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_unpack as usize;
+            emit_py_value_call(ops, h, [V::Reg(v), V::Reg(rt), V::Imm(n as u64), V::None], dst, labels, refetch);
+        }
+        Instr::PyMakeExc { dst, cls, args, rt, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_make_exc as usize;
+            emit_py_value_call(ops, h, [V::Reg(cls), V::Reg(args), V::Reg(rt), V::None], dst, labels, refetch);
+        }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
         // when the body's plan has the site; the ordinary step otherwise.
         Instr::PyGetAttr { .. } | Instr::PySetAttr { .. } => {
@@ -895,6 +934,61 @@ pub(crate) fn emit_py_op(
         }
     }
     dynasm!(ops ; => done);
+}
+
+/// One argument of a value helper (see [`emit_py_value_call`]): a register
+/// of the frame's window, a constant, or nothing.
+#[derive(Clone, Copy)]
+enum V {
+    Reg(u16),
+    Imm(u64),
+    None,
+}
+
+/// A site as the value helpers take it: `(func_id << 32) | ip`.
+fn site(func_id: u32, ip: usize) -> u64 {
+    ((func_id as u64) << 32) | ip as u64
+}
+
+/// Call the value helper `helper(vm, args...)` (a `Vm::jit_py_*` that
+/// answers a value's bits or `PY_SLOW_BITS`) and store its answer in `dst`
+/// or take the `slow` edge ([`emit_value_outcome`]). The first three
+/// arguments go in `rdx`, `r8` and `r9`, a fourth in the 5th-argument slot
+/// (`[rsp + 32]`, as `PyGetItem`'s is).
+fn emit_py_value_call(
+    ops: &mut dynasmrt::x64::Assembler,
+    helper: usize,
+    args: [V; 4],
+    dst: u16,
+    labels: &PyLabels,
+    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+) {
+    match args[3] {
+        V::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)] ; mov [rsp + 32], rax),
+        V::Imm(v) => dynasm!(ops ; mov rax, QWORD v as i64 ; mov [rsp + 32], rax),
+        V::None => {}
+    }
+    match args[0] {
+        V::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+        V::Imm(v) => dynasm!(ops ; mov rdx, QWORD v as i64),
+        V::None => {}
+    }
+    match args[1] {
+        V::Reg(r) => dynasm!(ops ; mov r8, [rbx + dreg(r)]),
+        V::Imm(v) => dynasm!(ops ; mov r8, QWORD v as i64),
+        V::None => {}
+    }
+    match args[2] {
+        V::Reg(r) => dynasm!(ops ; mov r9, [rbx + dreg(r)]),
+        V::Imm(v) => dynasm!(ops ; mov r9, QWORD v as i64),
+        V::None => {}
+    }
+    dynasm!(ops
+        ; mov rcx, rdi
+        ; mov rax, QWORD helper as i64
+        ; call rax
+    );
+    emit_value_outcome(ops, dst, labels, refetch);
 }
 
 /// After a `jit_py_arith`/`jit_py_add_imm` call: `PY_SLOW_BITS` takes the
