@@ -1,0 +1,1124 @@
+{
+ "pass": 15,
+ "date": "2026-10-12",
+ "release": "0.0.23",
+ "start": "726ddfbf (the fourteenth pass; its modules are r14y)",
+ "released": "0.0.22 (887d2149; the thirteenth pass modules)",
+ "measured_commit": "649595f8",
+ "module_commit": "20123116",
+ "toolchain": {
+  "rust": "1.92.0",
+  "wasm_bindgen": "0.2.126",
+  "binaryen": 125,
+  "node": "24.19.0"
+ },
+ "wasm_sizes_vs_start": {
+  "lite.start": {
+   "raw": 2573185,
+   "gzip9": 907908,
+   "brotli11": 694745,
+   "sha256": "c706d0b7f40afc553ab5904a649b44fae2650523c55ee04f6b022cc61b5e60c7"
+  },
+  "lite.final": {
+   "raw": 2573530,
+   "gzip9": 911294,
+   "brotli11": 697741,
+   "sha256": "471afbac447c28cb0feb36313705696ef662bbb7cac16e5d47f5bf883e8d8583"
+  },
+  "javascript.start": {
+   "raw": 4703604,
+   "gzip9": 1682495,
+   "brotli11": 1189469,
+   "sha256": "ede34f35d72f97fd32ace87b89a36b5923798febc0ad9aebbb3d5a401adb4d7b"
+  },
+  "javascript.final": {
+   "raw": 4636144,
+   "gzip9": 1668422,
+   "brotli11": 1180609,
+   "sha256": "572c1ebc1f34f4d2401299b0aeae2f13b603a88579ec9aa2a92195338bfa3543"
+  },
+  "python.start": {
+   "raw": 6379257,
+   "gzip9": 2216472,
+   "brotli11": 1578173,
+   "sha256": "4cbf01336179ef963c54382dbeb9e09bc45e40a5fcf4cb7146283ba81df7af98"
+  },
+  "python.final": {
+   "raw": 6331117,
+   "gzip9": 2204938,
+   "brotli11": 1566620,
+   "sha256": "974db20bdbc635b0c8b45b6c1e6d3caf2c7d0e2c339e45a37aff56170d3b5396"
+  },
+  "all.start": {
+   "raw": 8303296,
+   "gzip9": 2663579,
+   "brotli11": 1929593,
+   "sha256": "ba21c84f88f5e33b50b6c47728bef56f9c2cb5cb72a5baf117a591416891ef98"
+  },
+  "all.final": {
+   "raw": 8254998,
+   "gzip9": 2649559,
+   "brotli11": 1918013,
+   "sha256": "9e94d146e3eb688655c4caaf62afe602efc02aad65b4ada5dd5ca2bf64d48f4f"
+  }
+ },
+ "wasm_sizes_vs_released": {
+  "lite.accepted": {
+   "raw": 2634413,
+   "gzip9": 928651,
+   "brotli11": 710436,
+   "sha256": "7f886bccc1699a3642182fb52fd7a6335cf1bc4c2d6b65abfb8324f3d8fcd469"
+  },
+  "lite.fourteenth": {
+   "raw": 2573530,
+   "gzip9": 911294,
+   "brotli11": 697741,
+   "sha256": "471afbac447c28cb0feb36313705696ef662bbb7cac16e5d47f5bf883e8d8583"
+  },
+  "javascript.accepted": {
+   "raw": 4876583,
+   "gzip9": 1734170,
+   "brotli11": 1227452,
+   "sha256": "76d830f27c4a520e648c242fb0058f324e0e9232414d07d1d991391c12da2037"
+  },
+  "javascript.fourteenth": {
+   "raw": 4636144,
+   "gzip9": 1668422,
+   "brotli11": 1180609,
+   "sha256": "572c1ebc1f34f4d2401299b0aeae2f13b603a88579ec9aa2a92195338bfa3543"
+  },
+  "python.accepted": {
+   "raw": 6519418,
+   "gzip9": 2247014,
+   "brotli11": 1597418,
+   "sha256": "bd67dfdecbbe89b081594cd57f8f8ad7a1fc52fc531f8b7469e0a1c9d2de4b06"
+  },
+  "python.fourteenth": {
+   "raw": 6331117,
+   "gzip9": 2204938,
+   "brotli11": 1566620,
+   "sha256": "974db20bdbc635b0c8b45b6c1e6d3caf2c7d0e2c339e45a37aff56170d3b5396"
+  },
+  "all.accepted": {
+   "raw": 8443452,
+   "gzip9": 2691098,
+   "brotli11": 1950080,
+   "sha256": "77eaf4c9c31ad7bef864e4e64a459a24330401fc8e3e1dda516464a82eb837f1"
+  },
+  "all.fourteenth": {
+   "raw": 8254998,
+   "gzip9": 2649559,
+   "brotli11": 1918013,
+   "sha256": "9e94d146e3eb688655c4caaf62afe602efc02aad65b4ada5dd5ca2bf64d48f4f"
+  }
+ },
+ "wasm_sizes_before_post_processing": {
+  "lite": {
+   "raw": 2678584,
+   "gzip9": 919880,
+   "brotli11": 700429,
+   "sha256": "1b3473008b2b3e6a49be4061fe7a9170cbe43d4b65eef64a2cf7f50d3463b173"
+  },
+  "javascript": {
+   "raw": 4790112,
+   "gzip9": 1687799,
+   "brotli11": 1186115,
+   "sha256": "73469f3bd5469f3b3654efa044650af8c5ca969e7a9ad81cc2bef30a9e541205"
+  },
+  "python": {
+   "raw": 6519475,
+   "gzip9": 2224563,
+   "brotli11": 1574300,
+   "sha256": "ccb5c0c279cf094ee0ad4c99f01a14af513e448a87b8e605bf6d4d4dc7e1a0c7"
+  },
+  "all": {
+   "raw": 8447665,
+   "gzip9": 2670007,
+   "brotli11": 1925027,
+   "sha256": "61743de6418591c564994840b2df635ecbe006d1d598edcd682a329ad2529193"
+  }
+ },
+ "wasm_post_processing_log": {
+  "lite": {
+   "optimizer": "Binaryen 125 -O1 -O1",
+   "preferRawSize": true,
+   "accepted": true,
+   "before": {
+    "raw": 2678584,
+    "brotli11": 700429
+   },
+   "candidate": {
+    "raw": 2573530,
+    "brotli11": 697741
+   }
+  },
+  "javascript": {
+   "optimizer": "Binaryen 125 -O1 -O1",
+   "preferRawSize": false,
+   "accepted": true,
+   "before": {
+    "raw": 4790112,
+    "brotli11": 1186115
+   },
+   "candidate": {
+    "raw": 4636144,
+    "brotli11": 1180609
+   }
+  },
+  "python": {
+   "optimizer": "Binaryen 125 -O1 -O1",
+   "preferRawSize": false,
+   "accepted": true,
+   "before": {
+    "raw": 6519475,
+    "brotli11": 1574300
+   },
+   "candidate": {
+    "raw": 6331117,
+    "brotli11": 1566620
+   }
+  },
+  "all": {
+   "optimizer": "Binaryen 125 -O1 -O1",
+   "preferRawSize": false,
+   "accepted": true,
+   "before": {
+    "raw": 8447665,
+    "brotli11": 1925027
+   },
+   "candidate": {
+    "raw": 8254998,
+    "brotli11": 1918013
+   }
+  }
+ },
+ "wasm_sizes_649595f8_vs_start": {
+  "lite.start": {
+   "raw": 2573185,
+   "gzip9": 907908,
+   "brotli11": 694745,
+   "sha256": "c706d0b7f40afc553ab5904a649b44fae2650523c55ee04f6b022cc61b5e60c7"
+  },
+  "lite.fifteenth": {
+   "raw": 2573627,
+   "gzip9": 911407,
+   "brotli11": 698196,
+   "sha256": "831f90f6c1b6312755e8a9905ea52429fcb24d709f60c57257ef7e5f27fa5031"
+  },
+  "javascript.start": {
+   "raw": 4703604,
+   "gzip9": 1682495,
+   "brotli11": 1189469,
+   "sha256": "ede34f35d72f97fd32ace87b89a36b5923798febc0ad9aebbb3d5a401adb4d7b"
+  },
+  "javascript.fifteenth": {
+   "raw": 4636202,
+   "gzip9": 1668468,
+   "brotli11": 1180985,
+   "sha256": "7d52ffbab2cb4d0518eaff8b2d4218c794d8fd8ed8911b24637ddaba26048a80"
+  },
+  "python.start": {
+   "raw": 6379257,
+   "gzip9": 2216472,
+   "brotli11": 1578173,
+   "sha256": "4cbf01336179ef963c54382dbeb9e09bc45e40a5fcf4cb7146283ba81df7af98"
+  },
+  "python.fifteenth": {
+   "raw": 6331175,
+   "gzip9": 2205140,
+   "brotli11": 1565358,
+   "sha256": "32ccffb8e15e01d371da5fcacd1d195af447e20e905304551d1a0dfebb250f1d"
+  },
+  "all.start": {
+   "raw": 8303296,
+   "gzip9": 2663579,
+   "brotli11": 1929593,
+   "sha256": "ba21c84f88f5e33b50b6c47728bef56f9c2cb5cb72a5baf117a591416891ef98"
+  },
+  "all.fifteenth": {
+   "raw": 8255152,
+   "gzip9": 2649776,
+   "brotli11": 1918268,
+   "sha256": "62beb2fd34e75cb2b1667e5ba5bb08609d1a6f7cfa871d881a2a817819b3e81a"
+  }
+ },
+ "wasm_screen_20123116_vs_released": {
+  "lite": {
+   "configurations": [
+    "fwd-a4",
+    "rev-a4",
+    "fwd-a16",
+    "rev-a16"
+   ],
+   "statistic": "median of the batches",
+   "candidate_over_previous": {
+    "alloc-object": [
+     1.0315,
+     1.0247,
+     1.0476,
+     1.0191
+    ],
+    "arith-float": [
+     0.8089,
+     0.8451,
+     0.8169,
+     0.8179
+    ],
+    "arith-int": [
+     0.7874,
+     0.9178,
+     0.8618,
+     0.9002
+    ],
+    "arith-mod": [
+     0.9568,
+     0.9439,
+     0.9432,
+     0.9148
+    ],
+    "array-build": [
+     0.7821,
+     0.7871,
+     0.7823,
+     0.8023
+    ],
+    "array-hof": [
+     0.8896,
+     0.8867,
+     0.9036,
+     0.9002
+    ],
+    "call-deep": [
+     0.1163,
+     0.1137,
+     0.1154,
+     0.1118
+    ],
+    "enumeration": [
+     0.5805,
+     0.5705,
+     0.5802,
+     0.5594
+    ],
+    "error-range": [
+     1.0935,
+     1.0511,
+     1.0456,
+     1.046
+    ],
+    "error-type": [
+     1.0561,
+     0.9744,
+     1.0274,
+     1.0292
+    ],
+    "error-typedarray": [
+     1.0483,
+     1.0386,
+     1.0359,
+     1.0499
+    ],
+    "javascript_init_0_functions": [
+     1.0389,
+     1.0276,
+     1.0317,
+     1.028
+    ],
+    "javascript_init_200_functions": [
+     1.035,
+     1.0316,
+     1.0502,
+     1.0266
+    ],
+    "json": [
+     1.0146,
+     0.9921,
+     0.983,
+     0.9977
+    ],
+    "promise-resolve": [
+     0.9619,
+     0.9517,
+     0.9592,
+     0.9589
+    ],
+    "prop-mono": [
+     0.8064,
+     0.7968,
+     0.8081,
+     0.8137
+    ],
+    "prop-poly": [
+     0.8392,
+     0.8464,
+     0.8469,
+     0.8504
+    ],
+    "property-delete": [
+     1.0529,
+     1.0539,
+     1.0833,
+     1.046
+    ],
+    "recursive-calls": [
+     0.9961,
+     0.977,
+     0.9779,
+     0.9735
+    ],
+    "regex": [
+     0.9896,
+     0.9903,
+     0.966,
+     0.9835
+    ],
+    "regexp-matchall": [
+     1.0648,
+     1.0524,
+     1.0379,
+     1.0817
+    ],
+    "regexp-unicode-compile": [
+     1.1752,
+     1.1696,
+     1.1789,
+     1.1687
+    ],
+    "string-append-index": [
+     0.815,
+     0.8291,
+     0.831,
+     0.8176
+    ],
+    "string-build": [
+     0.5601,
+     0.6407,
+     0.5982,
+     0.6313
+    ]
+   },
+   "geomean": [
+    0.8396,
+    0.8423,
+    0.8416,
+    0.8417
+   ],
+   "more_than_2_5_percent_slower_in_three_of_four": [
+    "error-range",
+    "error-type",
+    "error-typedarray",
+    "javascript_init_0_functions",
+    "javascript_init_200_functions",
+    "property-delete",
+    "regexp-matchall",
+    "regexp-unicode-compile"
+   ],
+   "more_than_2_5_percent_faster_in_three_of_four": [
+    "arith-float",
+    "arith-int",
+    "arith-mod",
+    "array-build",
+    "array-hof",
+    "call-deep",
+    "enumeration",
+    "promise-resolve",
+    "prop-mono",
+    "prop-poly",
+    "string-append-index",
+    "string-build"
+   ]
+  },
+  "js": {
+   "configurations": [
+    "fwd-a4",
+    "rev-a4",
+    "fwd-a16",
+    "rev-a16"
+   ],
+   "statistic": "median of the batches",
+   "candidate_over_previous": {
+    "alloc-object": [
+     1.0611,
+     1.0734,
+     1.0561,
+     1.0151
+    ],
+    "arith-float": [
+     0.9132,
+     0.8635,
+     0.8325,
+     0.8973
+    ],
+    "arith-int": [
+     0.8891,
+     0.8729,
+     1.0019,
+     0.9982
+    ],
+    "arith-mod": [
+     0.9617,
+     0.8897,
+     0.9529,
+     1.0104
+    ],
+    "array-build": [
+     0.793,
+     0.8174,
+     0.8254,
+     0.8256
+    ],
+    "array-hof": [
+     0.9735,
+     1.0859,
+     0.9521,
+     0.9926
+    ],
+    "call-deep": [
+     0.1773,
+     0.1616,
+     0.1783,
+     0.1663
+    ],
+    "enumeration": [
+     0.5076,
+     0.6024,
+     0.5308,
+     0.5237
+    ],
+    "error-range": [
+     0.927,
+     0.9204,
+     0.9265,
+     0.9483
+    ],
+    "error-type": [
+     0.9812,
+     1.0479,
+     1.0145,
+     0.9985
+    ],
+    "error-typedarray": [
+     1.0232,
+     1.0135,
+     1.0079,
+     1.0148
+    ],
+    "javascript_init_0_functions": [
+     0.9964,
+     0.9716,
+     1.002,
+     0.9829
+    ],
+    "javascript_init_200_functions": [
+     1.0022,
+     1.0005,
+     1.0037,
+     1.0122
+    ],
+    "json": [
+     1.0039,
+     0.9757,
+     0.9737,
+     0.9635
+    ],
+    "promise-resolve": [
+     0.9646,
+     1.0006,
+     0.9868,
+     0.9679
+    ],
+    "prop-mono": [
+     0.9943,
+     0.9923,
+     0.9939,
+     1.0089
+    ],
+    "prop-poly": [
+     0.9749,
+     0.9466,
+     0.5696,
+     0.9608
+    ],
+    "property-delete": [
+     1.0188,
+     1.0086,
+     1.0287,
+     0.9908
+    ],
+    "recursive-calls": [
+     0.9968,
+     0.9797,
+     0.9756,
+     1.0649
+    ],
+    "regex": [
+     0.9709,
+     1.0068,
+     0.9659,
+     0.9555
+    ],
+    "regexp-matchall": [
+     1.0125,
+     1.0195,
+     1.0094,
+     1.0193
+    ],
+    "regexp-unicode-compile": [
+     0.9971,
+     0.9967,
+     0.9976,
+     0.9998
+    ],
+    "string-append-index": [
+     0.839,
+     0.8364,
+     0.8528,
+     0.8192
+    ],
+    "string-build": [
+     0.6046,
+     0.6089,
+     0.6007,
+     0.5973
+    ]
+   },
+   "geomean": [
+    0.858,
+    0.8615,
+    0.8421,
+    0.8622
+   ],
+   "more_than_2_5_percent_slower_in_three_of_four": [
+    "alloc-object"
+   ],
+   "more_than_2_5_percent_faster_in_three_of_four": [
+    "arith-float",
+    "arith-mod",
+    "array-build",
+    "call-deep",
+    "enumeration",
+    "error-range",
+    "prop-poly",
+    "regex",
+    "string-append-index",
+    "string-build"
+   ]
+  }
+ },
+ "native_ab_726ddfbf_to_649595f8": {
+  "rows": {
+   "async-promise-chain": {
+    "old_ms": 439,
+    "new_ms": 394,
+    "paired_pct": -10.1,
+    "ci95_pct": [
+     -12.0,
+     -8.8
+    ]
+   },
+   "class-prototype-hot": {
+    "old_ms": 240,
+    "new_ms": 247,
+    "paired_pct": 3.2,
+    "ci95_pct": [
+     2.5,
+     3.7
+    ]
+   },
+   "json-large": {
+    "old_ms": 290,
+    "new_ms": 282,
+    "paired_pct": -1.8,
+    "ci95_pct": [
+     -4.4,
+     2.4
+    ]
+   },
+   "map-set-heavy": {
+    "old_ms": 925,
+    "new_ms": 906,
+    "paired_pct": 2.0,
+    "ci95_pct": [
+     -4.5,
+     8.5
+    ]
+   },
+   "markdown-render": {
+    "old_ms": 238,
+    "new_ms": 239,
+    "paired_pct": -0.8,
+    "ci95_pct": [
+     -2.2,
+     1.6
+    ]
+   },
+   "parse-large-js": {
+    "old_ms": 265,
+    "new_ms": 262,
+    "paired_pct": -1.0,
+    "ci95_pct": [
+     -3.2,
+     1.2
+    ]
+   },
+   "polymorphic-objects": {
+    "old_ms": 386,
+    "new_ms": 354,
+    "paired_pct": -8.1,
+    "ci95_pct": [
+     -8.8,
+     -7.0
+    ]
+   },
+   "polymorphic-objects-v2": {
+    "old_ms": 30,
+    "new_ms": 29,
+    "paired_pct": -3.7,
+    "ci95_pct": [
+     -5.3,
+     -0.3
+    ]
+   },
+   "property-ic-shapes": {
+    "old_ms": 12,
+    "new_ms": 12,
+    "paired_pct": -2.8,
+    "ci95_pct": [
+     -6.5,
+     0.4
+    ]
+   },
+   "regex-log-scan": {
+    "old_ms": 506,
+    "new_ms": 486,
+    "paired_pct": -3.0,
+    "ci95_pct": [
+     -4.7,
+     -1.1
+    ]
+   },
+   "sparse-array": {
+    "old_ms": 82,
+    "new_ms": 79,
+    "paired_pct": -3.5,
+    "ci95_pct": [
+     -4.2,
+     -0.6
+    ]
+   },
+   "sparse-array-v2": {
+    "old_ms": 113,
+    "new_ms": 110,
+    "paired_pct": -2.3,
+    "ci95_pct": [
+     -2.9,
+     0.4
+    ]
+   },
+   "typedarray-math": {
+    "old_ms": 153,
+    "new_ms": 149,
+    "paired_pct": -1.4,
+    "ci95_pct": [
+     -5.7,
+     0.6
+    ]
+   }
+  },
+  "geomean": {
+   "headline": {
+    "ratio": 0.9748,
+    "ci95": [
+     0.967,
+     0.981
+    ],
+    "rows": 10
+   },
+   "diagnostic": {
+    "ratio": 0.9709,
+    "ci95": [
+     0.955,
+     0.993
+    ],
+    "rows": 3
+   },
+   "all_measured": {
+    "ratio": 0.9739,
+    "ci95": [
+     0.966,
+     0.981
+    ],
+    "rows": 13
+   }
+  }
+ },
+ "native_ab_0022_to_20123116": {
+  "rows": {
+   "async-promise-chain": {
+    "old_ms": 496,
+    "new_ms": 406,
+    "paired_pct": -18.2,
+    "ci95_pct": [
+     -20.3,
+     -16.9
+    ]
+   },
+   "class-prototype-hot": {
+    "old_ms": 240,
+    "new_ms": 248,
+    "paired_pct": 3.2,
+    "ci95_pct": [
+     2.2,
+     5.0
+    ]
+   },
+   "json-large": {
+    "old_ms": 345,
+    "new_ms": 296,
+    "paired_pct": -15.0,
+    "ci95_pct": [
+     -17.1,
+     -13.3
+    ]
+   },
+   "map-set-heavy": {
+    "old_ms": 986,
+    "new_ms": 987,
+    "paired_pct": -1.3,
+    "ci95_pct": [
+     -6.8,
+     3.9
+    ]
+   },
+   "markdown-render": {
+    "old_ms": 245,
+    "new_ms": 243,
+    "paired_pct": -1.3,
+    "ci95_pct": [
+     -3.6,
+     -0.2
+    ]
+   },
+   "parse-large-js": {
+    "old_ms": 267,
+    "new_ms": 267,
+    "paired_pct": 1.3,
+    "ci95_pct": [
+     -0.9,
+     3.0
+    ]
+   },
+   "polymorphic-objects": {
+    "old_ms": 430,
+    "new_ms": 352,
+    "paired_pct": -18.3,
+    "ci95_pct": [
+     -20.1,
+     -17.3
+    ]
+   },
+   "polymorphic-objects-v2": {
+    "old_ms": 30,
+    "new_ms": 30,
+    "paired_pct": -3.5,
+    "ci95_pct": [
+     -6.0,
+     -1.7
+    ]
+   },
+   "property-ic-shapes": {
+    "old_ms": 12,
+    "new_ms": 12,
+    "paired_pct": 0.7,
+    "ci95_pct": [
+     -3.8,
+     2.2
+    ]
+   },
+   "regex-log-scan": {
+    "old_ms": 515,
+    "new_ms": 507,
+    "paired_pct": -1.3,
+    "ci95_pct": [
+     -3.8,
+     0.2
+    ]
+   },
+   "sparse-array": {
+    "old_ms": 82,
+    "new_ms": 80,
+    "paired_pct": -3.0,
+    "ci95_pct": [
+     -4.8,
+     -0.6
+    ]
+   },
+   "sparse-array-v2": {
+    "old_ms": 113,
+    "new_ms": 111,
+    "paired_pct": -2.0,
+    "ci95_pct": [
+     -3.1,
+     -1.1
+    ]
+   },
+   "typedarray-math": {
+    "old_ms": 150,
+    "new_ms": 149,
+    "paired_pct": -1.3,
+    "ci95_pct": [
+     -3.5,
+     1.2
+    ]
+   }
+  },
+  "geomean": {
+   "headline": {
+    "ratio": 0.9413,
+    "ci95": [
+     0.934,
+     0.948
+    ],
+    "rows": 10
+   },
+   "diagnostic": {
+    "ratio": 0.9841,
+    "ci95": [
+     0.963,
+     0.995
+    ],
+    "rows": 3
+   },
+   "all_measured": {
+    "ratio": 0.951,
+    "ci95": [
+     0.943,
+     0.957
+    ],
+    "rows": 13
+   }
+  }
+ },
+ "native_vs_node_649595f8": {
+  "rows": {
+   "async-promise-chain": {
+    "node_ms": 346,
+    "zipp_ms": 385,
+    "zipp_over_node": 1.12,
+    "ci95": [
+     1.09,
+     1.14
+    ]
+   },
+   "class-prototype-hot": {
+    "node_ms": 305,
+    "zipp_ms": 242,
+    "zipp_over_node": 0.8,
+    "ci95": [
+     0.78,
+     0.8
+    ]
+   },
+   "json-large": {
+    "node_ms": 261,
+    "zipp_ms": 258,
+    "zipp_over_node": 0.98,
+    "ci95": [
+     0.94,
+     1.0
+    ]
+   },
+   "map-set-heavy": {
+    "node_ms": 784,
+    "zipp_ms": 688,
+    "zipp_over_node": 0.89,
+    "ci95": [
+     0.85,
+     0.94
+    ]
+   },
+   "markdown-render": {
+    "node_ms": 279,
+    "zipp_ms": 217,
+    "zipp_over_node": 0.78,
+    "ci95": [
+     0.77,
+     0.79
+    ]
+   },
+   "parse-large-js": {
+    "node_ms": 278,
+    "zipp_ms": 254,
+    "zipp_over_node": 0.92,
+    "ci95": [
+     0.91,
+     0.94
+    ]
+   },
+   "polymorphic-objects": {
+    "node_ms": 336,
+    "zipp_ms": 342,
+    "zipp_over_node": 1.02,
+    "ci95": [
+     1.01,
+     1.03
+    ]
+   },
+   "polymorphic-objects-v2": {
+    "node_ms": 84,
+    "zipp_ms": 28,
+    "zipp_over_node": 0.33,
+    "ci95": [
+     0.33,
+     0.34
+    ]
+   },
+   "property-ic-shapes": {
+    "node_ms": 264,
+    "zipp_ms": 10,
+    "zipp_over_node": 0.04,
+    "ci95": [
+     0.04,
+     0.04
+    ]
+   },
+   "regex-log-scan": {
+    "node_ms": 483,
+    "zipp_ms": 451,
+    "zipp_over_node": 0.92,
+    "ci95": [
+     0.9,
+     0.98
+    ]
+   },
+   "sparse-array": {
+    "node_ms": 81,
+    "zipp_ms": 76,
+    "zipp_over_node": 0.93,
+    "ci95": [
+     0.9,
+     0.95
+    ]
+   },
+   "sparse-array-v2": {
+    "node_ms": 174,
+    "zipp_ms": 108,
+    "zipp_over_node": 0.62,
+    "ci95": [
+     0.61,
+     0.63
+    ]
+   },
+   "typedarray-math": {
+    "node_ms": 211,
+    "zipp_ms": 144,
+    "zipp_over_node": 0.68,
+    "ci95": [
+     0.67,
+     0.7
+    ]
+   }
+  },
+  "geomean": {
+   "headline": {
+    "ratio": 0.8958,
+    "ci95": [
+     0.89,
+     0.903
+    ],
+    "rows": 10
+   },
+   "diagnostic": {
+    "ratio": 0.201,
+    "ci95": [
+     0.198,
+     0.203
+    ],
+    "rows": 3
+   },
+   "all_measured": {
+    "ratio": 0.6345,
+    "ci95": [
+     0.631,
+     0.638
+    ],
+    "rows": 13
+   }
+  }
+ },
+ "python_suite_726ddfbf_to_649595f8": [
+  "geomean zipp/cpython (work_s): micro 1.52x (n=30), macro 2.82x (n=6), all 1.69x (n=36)",
+  "geomean zipp-b/zipp (work_s): micro 0.77x (n=30), macro 0.88x (n=14), all 0.80x (n=44)",
+  "geomean zipp-b/cpython (work_s): micro 1.17x (n=30), macro 2.18x (n=6), all 1.30x (n=36)"
+ ],
+ "python_suite_0022_to_20123116": [
+  "geomean zipp/cpython (work_s): micro 1.61x (n=30), macro 2.98x (n=6), all 1.79x (n=36)",
+  "geomean zipp-b/zipp (work_s): micro 0.73x (n=30), macro 0.88x (n=14), all 0.77x (n=44)",
+  "geomean zipp-b/cpython (work_s): micro 1.17x (n=30), macro 2.21x (n=6), all 1.30x (n=36)"
+ ],
+ "gates_at_649595f8": [
+  "tree: 0 changed files; HEAD 649595f8; binary 649595f8 dirty= False",
+  "modules rc=0 : lite-r15fin: lite                2573627         698196 javascript-r15fin: javascript          4636202        1179939 python-r15fin: python              6331175        1565696 all-r15fin: all                 8255152        1918117 ",
+  "checked-profile gates: see target/gates-wasm-649595f8.log",
+  "test262 start",
+  "test262 rc=0 : PASS 95671  FAIL 9  SKIP 0   pass-rate 99.991% of 95680 executions gate: PASS (0 unexpected failures, 0 stale expectations, 0 skips) ",
+  "full zipp-vm suite start",
+  "full suite rc=0 : 326 binaries ok, 0 failed; 2228 passed, 0 failed, 22 ignored",
+  "zipp-cli rc=0 : 80 passed, 0 failed, 1 ignored",
+  "python lib rc=0 : 641 passed, 0 failed, 5 ignored",
+  "python integration rc=0 : 33 binaries ok, 0 failed; 238 passed, 0 failed, 0 ignored",
+  "python corpus: default  174/179 match; mismatches: gpu_graph ml_gpu_ops ml_gpu_prepared ml_gpu_session ml_transport_graph_reference",
+  ";nofast   174/179 match; mismatches: gpu_graph ml_gpu_ops ml_gpu_prepared ml_gpu_session ml_transport_graph_reference",
+  ";nojit    174/179 match; mismatches: gpu_graph ml_gpu_ops ml_gpu_prepared ml_gpu_session ml_transport_graph_reference",
+  ";pyjit0   174/179 match; mismatches: gpu_graph ml_gpu_ops ml_gpu_prepared ml_gpu_session ml_transport_graph_reference",
+  ";",
+  "ALL GATES DONE"
+ ],
+ "checked_profile_gates_at_649595f8": [
+  "tree: 0 changed files; HEAD 649595f8; modules r15fin",
+  "sizes rc=0",
+  "boundary javascript rc=0 : 36 of 36 boundary checks passed ",
+  "boundary lite rc=0 : 36 of 36 boundary checks passed ",
+  "boundary python rc=1 : 34 of 36 boundary checks passed === audit-2026-09-15-ml-transport.cjs: FAILED (exit 1) === python-gpu.cjs: FAILED (exit 1) ",
+  "boundary all rc=0 : 36 of 36 boundary checks passed ",
+  "pkg restored",
+  "safe-sandbox suite rc=101 : 326 binaries ok, 2 failed; 1728 passed, 2 failed, 19 ignored; failing: test props_child ... FAILED test props_modes_match_node ... FAILED ",
+  "wasm-lite suite rc=101 : 309 binaries ok, 22 failed; 1695 passed, 45 failed, 19 ignored",
+  "sandbox workspace tests rc=0 : 8 passed, 0 failed, 0 ignored",
+  "zipp-wasm unit tests rc=0 : 11 passed, 0 failed, 0 ignored",
+  "regress rc=0 : 108 passed, 0 failed, 1 ignored",
+  "regress, compact-utf16 with bounded backtracking rc=0 : 124 passed, 0 failed, 1 ignored",
+  "WASM GATES DONE"
+ ],
+ "test262_at_907851c4": [
+  "PASS 95671  FAIL 9  SKIP 0   pass-rate 99.991% of 95680 executions",
+  "gate: PASS (0 unexpected failures, 0 stale expectations, 0 skips)"
+ ],
+ "probes_min_of_5_ms": {
+  "class with two fields, 1M constructions": {
+   "0.0.22": 2059,
+   "this pass": 274,
+   "node": 34
+  },
+  "derived class, 1M constructions": {
+   "0.0.22": 864,
+   "this pass": 537,
+   "node": 38
+  },
+  "generator for-of, 3M steps": {
+   "0.0.22": 538,
+   "this pass": 170,
+   "node": 65
+  },
+  "word count": {
+   "0.0.22": 640,
+   "this pass": 377,
+   "node": 140
+  },
+  "capturing map and forEach callbacks, 6M calls": {
+   "0.0.22": 232,
+   "this pass": 79,
+   "node": 64
+  }
+ }
+}

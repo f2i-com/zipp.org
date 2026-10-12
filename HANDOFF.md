@@ -1,5 +1,79 @@
 # Zipp performance handoff
 
+### 12 October: fifteenth pass, released as 0.0.23
+
+`main` carries the fifteenth pass: 68 commits past `6f5d8819` to
+`41f40eba`, then `Prepare 0.0.23`. Every commit carries `[skip ci]`; CI
+and the full security workflow were dispatched by hand on `main` before
+the tag, as the release requires. The record is
+[docs/validation/2026-10-12-engine-size-round15.md](docs/validation/2026-10-12-engine-size-round15.md),
+with its numbers in the `-evidence.json` beside it; the release notes are
+[docs/releases/0.0.23.md](docs/releases/0.0.23.md).
+
+**What 0.0.23 fixes in 0.0.22**, besides the fourteenth pass's two (memory
+grown in place, the `typeof` strings): three wrong answers in the native
+JIT's array-builtin callback window (a stale local, a deleted global still
+read, a panic when a builtin runs as a promise job), a deep bind chain
+that threw in the checked profile, and BigInt typed-array sorts compared
+as doubles.
+
+What the pass did, against `726ddfbf`:
+
+- Native: -2.61% over the 13 rows (0.0.22 to the release: -4.90%); the
+  headline ten at 0.896x of Node.
+  Builtins call compiled callbacks frame-free; class construction,
+  generator `for-of`, iterator results and keyed access are cheaper.
+- Python: 1.69x to 1.30x of CPython in-script (twenty-two changes from two
+  agents).
+- Modules, raw / Brotli: JavaScript 4,636,144 / 1,180,609, Python-base
+  6,331,117 / 1,566,620, Python + Torch 8,254,998 / 1,918,013 (each 9 to
+  12 KB smaller after Brotli); Lite 2,573,530 / 697,741, 2,996 bytes larger
+  after Brotli.
+
+**The security workflow's native workspace suite** compiles its tests at
+opt-level 1 since `41f40eba` (it took 86 minutes unoptimized, 84 of them
+running tests, a third in three GC-stress files).
+
+**Leads for the next pass, each with a probe under `target/r14-scratch`.**
+
+- Construction is still 7 to 14 times Node's time: each new object adds
+  its properties one transition at a time through a helper. An inline
+  cache for the add transition is the step. A per-constructor key plan was
+  tried and was slower.
+- Generators: `for-of` is 2.6 times Node, a `g.next()` loop 7.8 times.
+- `async-promise-chain` (1.12x) and `polymorphic-objects` (1.02x) are the
+  real-set rows behind Node. The first's promise jobs run with no frame
+  under them, so they cannot take the frame-free call.
+- Typed-array iteration methods, `flatMap` and `Object.entries().forEach`
+  still make a full call per element instead of using the callback window.
+- Lite grew 3 KB after Brotli; the time zone and number-parser savings do
+  not reach it.
+- `class-prototype-hot` is 3.2% slower: the step is between `c5eee651`
+  and `0b8994c3`, likely `44a4795e`'s collector poll on entry to every
+  compiled region call (only a native callee needs it). Not confirmed.
+- Lite's allocation-heavy rows are 3% to 5% slower from `a4208408`'s
+  compare in every allocation report. At `opt-level = "z"` small code
+  changes move LLVM's inlining: `907851c4` fixed one such case (a 17%
+  RegExp compile step) by writing the loop so nothing needs inlining.
+  Screen Lite against the previous pass's module after any heap change.
+- Python, from the agents and not fixed: `heapq` pop order of equal items,
+  a `str` subclass's hash, tuple `<` calling `__lt__` more often than
+  CPython, `endswith` with a lone low surrogate, a `"\ud800"` literal,
+  `textwrap`'s whitespace (all carried from the fourteenth pass).
+- The new crate `zipp-numparse` is tested in CI only through the
+  `--workspace` lanes, and `tools/pgo.sh`'s build-definition list names
+  neither it nor `zipp-pyparse` (a source-tree hash also enters the
+  recipe).
+
+Carried over: the landing site still serves the 0.0.21 engines (the
+0.0.22 refresh commit was never made; 0.0.23's notes list the same
+steps), and the Linux workspace suite runs within a few minutes of its
+120-minute job limit.
+
+Local state not in the branch: worktrees under `target/wt/`, probes under
+`target/r14-scratch` and `target/r15-scratch`, the modules under
+`target/size-audit/*-r15*`.
+
 ### 12 October: fourteenth pass, on `main`
 
 `main` was fast-forwarded to the fourteenth pass on 12 October, at the
