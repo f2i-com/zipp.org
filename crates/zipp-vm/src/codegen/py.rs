@@ -463,6 +463,9 @@ pub(crate) fn emit_py_add_int(
 /// `Vm::jit_py_arith`/`jit_py_add_imm`'s "take the `slow` edge" answer (not a
 /// `Value`: the tag is outside the value encoding, like `SELF_CALL_DEOPT`).
 pub(crate) const PY_SLOW_BITS: u64 = 0x7FFE_DEAD_BEEF_0002;
+/// `Vm::jit_py_get_item`'s "take the `absent` edge" answer (as
+/// [`PY_SLOW_BITS`]).
+pub(crate) const PY_ABSENT_BITS: u64 = 0x7FFE_DEAD_BEEF_0004;
 
 const ARITH_OPS: [crate::bytecode::PyArithOp; 9] = {
     use crate::bytecode::PyArithOp as A;
@@ -819,6 +822,40 @@ pub(crate) fn emit_py_op(
                     );
                 }
             }
+        }
+        // A subscript: the step's own answer through `Vm::jit_py_get_item`
+        // over the operands (the instruction not looked up again), its fifth
+        // argument in the 5th-argument slot. (A `ZIPP_PY_PROF` run takes the
+        // ordinary step, which counts.)
+        Instr::PyGetItem { dst, o, k, seq, dict, .. } if labels.target.is_some() && !crate::vm::prof_py::on() => {
+            let Some(absent) = labels.target else {
+                unreachable!("PyGetItem carries an absent label");
+            };
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(o)]
+                ; mov r8, [rbx + dreg(k)]
+                ; mov r9, [rbx + dreg(seq)]
+                ; mov rax, [rbx + dreg(dict)]
+                ; mov [rsp + 32], rax
+                ; mov rax, QWORD crate::vm::Vm::jit_py_get_item as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; mov r10, QWORD PY_ABSENT_BITS as i64
+                ; cmp rax, r10
+                ; je => absent
+                ; mov r10, QWORD CALL_THREW as i64
+                ; cmp rax, r10
+                ; je => labels.bail
+                ; mov [rbx + dreg(dst)], rax
+            );
         }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
         // when the body's plan has the site; the ordinary step otherwise.

@@ -279,6 +279,23 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `PyGetItem` from compiled code: `py_get_item` over the operands' bits,
+    /// the step's own answer without finding the instruction again: the
+    /// item's bits, `PY_SLOW_BITS` for the `slow` edge, `PY_ABSENT_BITS`
+    /// for the `absent` edge (a key the dict lacks), `CALL_THREW` when it
+    /// threw. A GC safe point, as `jit_py_op` is.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_get_item(vm: *mut core::ffi::c_void, o: u64, k: u64, seq: u64, dict: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_get_item(Value::from_bits(o), Value::from_bits(k), Value::from_bits(seq), Value::from_bits(dict)) {
+            Ok(Some(Some(v))) => v.bits(),
+            Ok(Some(None)) => crate::codegen::PY_ABSENT_BITS,
+            Ok(None) => crate::codegen::PY_SLOW_BITS,
+            Err(t) => vm.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// `PyCompare`/`PyJumpCompare` beyond the inline paths: `py_compare`.
     /// 0 or 1 for the comparison's result, `PY_SLOW` (2) for the `slow` edge
     /// (nothing ran), `PY_BAIL` (3) when it threw (the exception is pending).

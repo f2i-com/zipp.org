@@ -1873,7 +1873,7 @@ impl<'p> Vm<'p> {
 
     /// [`Instr::PyGetItem`]: `Some(Some(value))`, `Some(None)` for a key
     /// the dict's table finds missing, `None` for the slow edge.
-    fn py_get_item(&mut self, o: Value, k: Value, seq: Value, dict: Value) -> Result<Option<Option<Value>>, Thrown> {
+    pub(super) fn py_get_item(&mut self, o: Value, k: Value, seq: Value, dict: Value) -> Result<Option<Option<Value>>, Thrown> {
         let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
             return Ok(None);
         };
