@@ -986,6 +986,10 @@ impl<'p> Vm<'p> {
                 "RangeError: Maximum call stack size exceeded".into(),
             ));
         }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(r) = self.call_compiled_windowed(callee, this, args, func_id, closure) {
+            return r;
+        }
         // Copy the scalar layout fields out so the FuncProto borrow (which now
         // spans the whole `&self` via `func()`) ends before the `self.regs` /
         // `self.heap` mutations below.
@@ -1068,6 +1072,117 @@ impl<'p> Vm<'p> {
             return r;
         }
         self.run_loop(stop_depth)
+    }
+
+    /// Call the compiled function `callee` frame-free: its body run over a
+    /// fresh register window at the top of the file, under an activation
+    /// that names its closure, exactly as a compiled caller's native
+    /// cross-call runs it (`jit_cross_call_impl`), with `this` already bound
+    /// by the caller. `None`, with nothing done, unless every condition of
+    /// that call holds here: a body with a frame-free entry (Tier C, no
+    /// handler ops), no `arguments` object or rest array to build, not a
+    /// construction or an eval frame, no direct-eval scope and no second
+    /// realm alive, its direct global routes intact. A bail past the entry
+    /// finishes the activation on the interpreter over the same window.
+    ///
+    /// Without this a promise reaction, a `Map.prototype.forEach` callback, a
+    /// `replace` function, a getter read by a builtin, and every other call
+    /// a builtin makes paid a `Frame` push and pop and `try_run_jit`'s
+    /// frame-backed entry around a body that needs none of it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn call_compiled_windowed(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+        fid: u32,
+        closure: u32,
+    ) -> Option<Result<Value, Thrown>> {
+        if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
+            || !self.jit_fused_ok()
+            || self.jit_recurse_depth != 0
+            || !self.pending_new_target.is_undefined()
+            || self.pending_eval_frame
+            || !self.closure_eval_scope.is_empty()
+            || !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            // The cap on native re-entry is `run_loop`'s to raise.
+            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+        {
+            return None;
+        }
+        let (entry, _, _, _) = self.jit.cross_entry(fid)?;
+        let (callee_regs, params) = {
+            let proto = self.func(fid as usize);
+            if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
+                return None;
+            }
+            ((proto.reg_count as usize).max(1), proto.param_count as usize)
+        };
+        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
+            return None;
+        }
+        let win = self.regs.len();
+        if self.regs_would_overflow(win + callee_regs) {
+            return None;
+        }
+        let upvals_raw = self.resolve_upvals_raw(closure);
+        // A full activation stack declines before any effect.
+        let token = self.enter_tierc_activation(closure, callee.heap_index(), true, upvals_raw)?;
+        // The whole window `undefined`, as a frame push leaves it.
+        self.regs.resize(win + callee_regs, Value::UNDEFINED);
+        self.bump_regs_hw(win + callee_regs);
+        self.regs[win] = this;
+        let n = args.len().min(params);
+        for (i, &arg) in args[..n].iter().enumerate() {
+            self.regs[win + 1 + i] = arg;
+        }
+        // The loop's safe point at a frame transition. The arguments are in
+        // the window and the callee and its closure are the activation's
+        // roots; the collector moves nothing, so `upvals_raw` stays good.
+        self.maybe_gc();
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        // SAFETY: `entry` is `fid`'s Tier C win64 code `(regs, bail, vm) ->
+        // bits` (mapped once, and parked rather than freed if the body is
+        // evicted); the window has `callee_regs` valid slots in the pinned
+        // register file; `vm_ptr` is valid for the call.
+        let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            unsafe { core::mem::transmute(entry) };
+        let mut bail: u32 = crate::codegen::NO_BAIL;
+        // A Rust-stack re-entry like a nested `run_loop`, charged like one.
+        self.run_loop_depth += 1;
+        let bits = {
+            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            f(regs_ptr, &mut bail as *mut u32, vm_ptr)
+        };
+        self.run_loop_depth -= 1;
+        self.leave_tierc_activation(token);
+        if bail == crate::codegen::NO_BAIL {
+            self.regs.truncate(win);
+            return Some(Ok(Value::from_bits(bits)));
+        }
+        if let Some(tv) = self.pending_throw {
+            // A callee of the native body threw: unwind, never resume. The
+            // activation had no frame, so no handler of its own.
+            self.regs.truncate(win);
+            return Some(Err(Thrown(self.throw_message(tv))));
+        }
+        if bail == 0 {
+            // Nothing ran: the ordinary call starts this activation again.
+            self.regs.truncate(win);
+            return None;
+        }
+        // A guard bail past the entry: native code already ran `[0, bail)`,
+        // so the activation resumes there over the same window.
+        let resumed = self.resume_frame_window(callee, fid, closure, win, bail as usize);
+        // The resumed frame's pop releases the window; a resume refused at
+        // the frame limit never pushed one.
+        if self.regs.len() > win {
+            self.regs.truncate(win);
+        }
+        Some(resumed)
     }
 
     /// Run the frame `call_value_plain_body` just pushed for `fid` (at
