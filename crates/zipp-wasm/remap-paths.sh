@@ -12,9 +12,10 @@
 # home directory, and (where rust-src is installed) the toolchain's standard
 # library sources. A JavaScript module carried 157 of them, 11 KB, and the
 # same commit built in a longer directory came out 2 KB larger. Remapped, a
-# panic still names its file and line -- `zipp-vm/src/heap.rs`,
-# `num-bigint-0.5.1/src/biguint.rs`, `library/core/src/slice/index.rs` -- and
-# the module no longer depends on where, or as whom, it was built.
+# panic still names its file and line -- `heap.rs`, `vm/dispatch.rs`,
+# `regress-fork/parse.rs`, `num-bigint-0.5.1/src/biguint.rs`,
+# `library/core/src/slice/index.rs` -- and the module no longer depends on
+# where, or as whom, it was built.
 #
 # The value is separated with 0x1F, cargo's CARGO_ENCODED_RUSTFLAGS encoding,
 # so a path containing spaces stays one argument. cargo prefers that variable
@@ -43,9 +44,25 @@ esac
 
 flags=("$@")
 
-# The workspace crates: zipp-vm, zipp-wasm, regress-fork, zipp-pyparse.
+# The workspace crates: zipp-vm, zipp-wasm, regress-fork, zipp-pyparse,
+# zipp-numparse. rustc applies the last prefix that matches, so the
+# per-crate ones below win over this one for the files they cover.
 repo="$(native "$(cd ../.. && pwd)")"
 flags+=("--remap-path-prefix=${repo}${sep}crates${sep}=")
+# Each crate's `src` directory loses the `src`, and the engine's loses its
+# crate name too: its files are most of the panicking ones (about 170 of a
+# module's 190), and each one's path is kept in the module once for its
+# panic records. `vm/dispatch.rs` names the engine's file as well as
+# `zipp-vm/src/vm/dispatch.rs` did, in 2 KB less of every module.
+for crate in ../*/; do
+  crate="$(basename "$crate")"
+  [ -d "../$crate/src" ] || continue
+  if [ "$crate" = zipp-vm ]; then
+    flags+=("--remap-path-prefix=${repo}${sep}crates${sep}${crate}${sep}src${sep}=")
+  else
+    flags+=("--remap-path-prefix=${repo}${sep}crates${sep}${crate}${sep}src${sep}=${crate}${sep}")
+  fi
+done
 
 # Registry sources. The index directory's name is a hash cargo derives from
 # the registry, so it is read from disk; fetch first, or a cold cache would
