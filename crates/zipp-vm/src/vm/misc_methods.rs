@@ -7,6 +7,29 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// A compiled callback an array builtin calls over one reused register
+/// window (see `Vm::native_cb_entry`), with what each call rechecks.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+pub(crate) struct NativeCb {
+    /// The body's native entry when the builtin started.
+    entry: *const u8,
+    /// The window's size: the callee's register count.
+    pub(crate) callee_regs: usize,
+    param_count: usize,
+    /// The `this` OrdinaryCallBindThis gives the callee, the same each call.
+    this: Value,
+    fid: u32,
+    /// The registers reset to `undefined` before each call: the body's
+    /// may-read-before-write set (a Tier C body's, as the native cross-call
+    /// fills it), or `u64::MAX` for every register past the arguments.
+    uninit_mask: u64,
+    /// The global slot and value a self-calling body assumed (`try_run_jit`).
+    self_binding: Option<(u32, u64)>,
+    /// A closure with captures: its cells are installed around each call.
+    capturing: bool,
+}
+
 impl<'p> Vm<'p> {
     /// Whether `idx`'s prototype chain reaches one of the error prototypes — i.e.
     /// it's a real error instance (created via `new TypeError` or an internal
@@ -230,13 +253,20 @@ impl<'p> Vm<'p> {
 
     /// Resolve `cb` to the native entry of a COMPILED, non-capturing JIT function
     /// for the array-builtin fast path (`map`/`filter`/`forEach`/`reduce`).
-    /// Returns `(entry, callee_reg_count, param_count, this)` or `None` if `cb`
-    /// must go through the interpreter `call_value` (not a plain function, a
-    /// capturing closure, JIT disabled, inside a deopted self-call continuation,
-    /// a `this` that must be bound per call, or not JIT-compilable). Compiles
-    /// `cb` on first use if eligible — array builtins call the same callback
-    /// many times, so we don't wait for the call-count threshold; an ineligible
-    /// proto is blacklisted by `compile` and returns `None` cheaply thereafter.
+    /// Returns the callback's [`NativeCb`] handle or `None` if `cb`
+    /// must go through the interpreter `call_value` (not a plain function,
+    /// JIT disabled, inside a deopted self-call continuation, a `this` that
+    /// must be bound per call, or not JIT-compilable). Compiles a
+    /// non-capturing `cb` on first use if eligible — array builtins call the
+    /// same callback many times, so we don't wait for the call-count
+    /// threshold; an ineligible proto is blacklisted by `compile` and returns
+    /// `None` cheaply thereafter.
+    ///
+    /// A capturing closure is taken once its body has a frame-free native
+    /// entry of its own (compiled by its own heat, with the entry the native
+    /// cross-call uses): `invoke_cb_windowed` installs its captures as that
+    /// call does. Until then, and for a closure made under direct `eval` or
+    /// while another realm exists, it goes through `call_value`.
     ///
     /// `this` is what OrdinaryCallBindThis gives the callee for `this_arg`, the
     /// same for every element: an arrow's lexical `this`, a strict callee's
@@ -247,19 +277,24 @@ impl<'p> Vm<'p> {
     /// Resolved here once, not per element: a sort comparator runs n·log n
     /// times, and a per-call binding measured ~2ns on each.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn native_cb_entry(
-        &mut self,
-        cb: Value,
-        this_arg: Value,
-    ) -> Option<(*const u8, usize, usize, Value)> {
+    pub(crate) fn native_cb_entry(&mut self, cb: Value, this_arg: Value) -> Option<NativeCb> {
         // Mirror the interpreter's JIT-entry guard: respect ZIPP_NOJIT and never
         // enter native code from a deopted self-call continuation (livelock).
         if !self.jit_fused_ok() || self.jit_recurse_depth != 0 || !cb.is_heap() {
             return None;
         }
         let (fid, ups) = self.heap.as_callable(cb.heap_index())?;
-        // A capturing closure reads upvalue cells (heap) — outside the leaf-int JIT.
-        if !ups.is_empty() {
+        // A capturing closure reads upvalue cells (heap) — outside the
+        // leaf-int JIT this function compiles with. It needs the body its own
+        // calls compiled, and the conditions of a frame-free native call (the
+        // ones an emitted cross-call site tests before it enters one).
+        let capturing = !ups.is_empty();
+        if capturing
+            && (self.jit.cross_entry(fid).is_none()
+                || !self.closure_eval_scope.is_empty()
+                || !self.obj_realm.is_empty()
+                || !self.realm_global_objs.is_empty())
+        {
             return None;
         }
         // A callback that materialises `arguments` needs the interpreter's call
@@ -345,22 +380,33 @@ impl<'p> Vm<'p> {
                 &plain_makefunc,
             );
         }
-        let entry = self.jit.get(fid)?.entry();
+        // The direct global routes the body was compiled with, as
+        // `try_run_jit` rechecks them at an entry (and each call below
+        // rechecks them again: the callback can change them itself).
+        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
+            return None;
+        }
+        let body = self.jit.get(fid)?;
+        let (entry, self_binding) = (body.entry(), body.self_binding());
+        let uninit_mask = match self.jit.cross_entry(fid) {
+            Some((_, mask, _, _)) => mask,
+            None => u64::MAX,
+        };
         let proto = self.func(fid as usize);
-        Some((
+        Some(NativeCb {
             entry,
-            (proto.reg_count as usize).max(1),
-            proto.param_count as usize,
+            callee_regs: (proto.reg_count as usize).max(1),
+            param_count: proto.param_count as usize,
             this,
-        ))
+            fid,
+            uninit_mask,
+            self_binding,
+            capturing,
+        })
     }
 
     #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
-    pub(crate) fn native_cb_entry(
-        &mut self,
-        _cb: Value,
-        _this_arg: Value,
-    ) -> Option<(*const u8, usize, usize, Value)> {
+    pub(crate) fn native_cb_entry(&mut self, _cb: Value, _this_arg: Value) -> Option<NativeCb> {
         None
     }
 
@@ -372,23 +418,86 @@ impl<'p> Vm<'p> {
     /// intact for the next element. This is the fast path that skips the
     /// per-element frame push + `run_loop` re-entry + callee re-resolution that
     /// `call_value` incurs.
+    ///
+    /// Each call is a fresh activation, and the window is not: what a frame
+    /// push and `try_run_jit` establish per call is established here per
+    /// call.
+    ///
+    /// * The registers the body can read before it writes them hold
+    ///   `undefined`. The window used to keep the previous element's values,
+    ///   so `function (x) { var t; if (x > 2) t = 1; return t; }` mapped over
+    ///   `[5, 1]` returned `[1, 1]`.
+    /// * The body's direct global routes are still valid, and the entry is
+    ///   still the body's (with its self-binding intact). A callback compiled
+    ///   while `g` was a plain global kept reading the slot after
+    ///   `delete globalThis.g`, and returned NaN where it must throw.
+    /// * A capturing closure's cells are installed as its activation, as the
+    ///   native cross-call installs them.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn invoke_cb_windowed(
         &mut self,
-        entry: *const u8,
+        native: &NativeCb,
         win: usize,
-        param_count: usize,
         cb: Value,
         args: &[Value],
-        this_val: Value,
     ) -> Result<Value, Thrown> {
         // `this_val` is the bound `this` from `native_cb_entry` (an arrow's
         // lexical one included); `call_value` below rebinds it identically.
-        self.regs[win] = this_val; // reg 0 = this
+        let NativeCb {
+            entry,
+            callee_regs,
+            param_count,
+            this: this_val,
+            fid,
+            ..
+        } = *native;
+        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
+            return self.call_value(cb, this_val, args);
+        }
+        // Still compiled (an evicted body is parked, never freed, so `entry`
+        // stays callable; a function sent back to the interpreter must not be
+        // entered again), under the binding its self-calls assumed.
+        let live = self.jit.fn_state(fid) == crate::codegen::FN_COMPILED
+            && native.self_binding.is_none_or(|(slot, expect)| {
+                self.globals.get(slot as usize).map(|v| v.bits()) == Some(expect)
+            });
+        if !live {
+            return self.call_value(cb, this_val, args);
+        }
         let n = args.len().min(param_count);
+        if native.uninit_mask != u64::MAX {
+            let mut m = native.uninit_mask;
+            while m != 0 {
+                let r = m.trailing_zeros() as usize;
+                if r < callee_regs {
+                    self.regs[win + r] = Value::UNDEFINED;
+                }
+                m &= m - 1;
+            }
+            for r in (1 + n)..(1 + param_count).min(callee_regs) {
+                self.regs[win + r] = Value::UNDEFINED;
+            }
+        } else {
+            for r in (1 + n)..callee_regs {
+                self.regs[win + r] = Value::UNDEFINED;
+            }
+        }
+        self.regs[win] = this_val; // reg 0 = this
         for i in 0..n {
             self.regs[win + 1 + i] = args[i];
         }
+        // A capturing closure's cells, read from the closure each call (its
+        // list never changes, but this is the pointer native code follows).
+        let upvals_raw = if native.capturing {
+            match self.heap.get(cb.heap_index()) {
+                HeapObj::Closure { upvalues, .. } if !upvalues.is_empty() => {
+                    upvalues.as_ptr() as u64
+                }
+                _ => return self.call_value(cb, this_val, args),
+            }
+        } else {
+            0u64
+        };
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         // SAFETY: `entry` is a valid compiled win64 fn (regs, bail_out, vm)->bits
@@ -408,10 +517,22 @@ impl<'p> Vm<'p> {
                 "RangeError: Maximum call stack size exceeded",
             ));
         }
+        // A full activation stack declines before native entry.
+        let activation = if upvals_raw != 0 {
+            match self.enter_tierc_activation(cb.heap_index(), cb.heap_index(), true, upvals_raw) {
+                Some(token) => Some(token),
+                None => return self.call_value(cb, this_val, args),
+            }
+        } else {
+            None
+        };
         let mut bail: u32 = crate::codegen::NO_BAIL;
         self.run_loop_depth += 1;
         let bits = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
         self.run_loop_depth -= 1;
+        if let Some(token) = activation {
+            self.leave_tierc_activation(token);
+        }
         if bail == crate::codegen::NO_BAIL {
             return Ok(Value::from_bits(bits));
         }
@@ -434,13 +555,11 @@ impl<'p> Vm<'p> {
         if bail == 0 {
             return self.call_value(cb, this_val, args);
         }
-        let (func_id, closure) = match self.heap.get(cb.heap_index()) {
-            HeapObj::Func(id) => (*id, crate::vm::NO_CLOSURE),
-            HeapObj::Closure { func, .. } => (*func, cb.heap_index()),
-            // `native_cb_entry` only compiles Func/Closure callees.
-            _ => return self.call_value(cb, this_val, args),
+        let closure = match self.heap.get(cb.heap_index()) {
+            HeapObj::Closure { .. } => cb.heap_index(),
+            _ => crate::vm::NO_CLOSURE,
         };
-        self.resume_frame_window(cb, func_id, closure, win, bail as usize)
+        self.resume_frame_window(cb, fid, closure, win, bail as usize)
     }
 
     /// One per-element callback invocation: native fast path when `native` is
@@ -449,19 +568,19 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn run_cb_elem(
         &mut self,
-        native: Option<(*const u8, usize, usize, Value)>,
+        native: &Option<NativeCb>,
         win: usize,
         cb: Value,
         args: &[Value],
         this_val: Value,
     ) -> Result<Value, Thrown> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if let Some((entry, callee_regs, param_count, bound_this)) = native {
-            let result = self.invoke_cb_windowed(entry, win, param_count, cb, args, bound_this);
+        if let Some(native) = native {
+            let result = self.invoke_cb_windowed(native, win, cb, args);
             // A resumed interpreter frame releases the window when it pops;
             // the next element expects it to be there again.
-            if self.regs.len() < win + callee_regs {
-                self.regs.resize(win + callee_regs, Value::UNDEFINED);
+            if self.regs.len() < win + native.callee_regs {
+                self.regs.resize(win + native.callee_regs, Value::UNDEFINED);
             }
             return result;
         }

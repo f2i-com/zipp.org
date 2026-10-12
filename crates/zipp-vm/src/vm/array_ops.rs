@@ -665,7 +665,7 @@ impl<'p> Vm<'p> {
             None
         };
         let win = self.regs.len();
-        if let Some((_, callee_regs, _, _)) = native {
+        if let Some(super::misc_methods::NativeCb { callee_regs, .. }) = native {
             if self.regs_would_overflow(win + callee_regs) {
                 native = None; // can't fit a window → interpreter path
             } else {
@@ -709,7 +709,7 @@ impl<'p> Vm<'p> {
                 Some(value) => Ok(value),
                 None => {
                     let args = [v, Value::int(i as i32), receiver];
-                    self.run_cb_elem(native, win, cb, &args, this_arg)
+                    self.run_cb_elem(&native, win, cb, &args, this_arg)
                 }
             };
             match callback_result {
@@ -3466,7 +3466,7 @@ impl<'p> Vm<'p> {
                     None
                 };
                 let win = self.regs.len();
-                if let Some((_, callee_regs, _, _)) = native {
+                if let Some(super::misc_methods::NativeCb { callee_regs, .. }) = native {
                     if self.regs_would_overflow(win + callee_regs) {
                         native = None;
                     } else {
@@ -3497,7 +3497,7 @@ impl<'p> Vm<'p> {
                         Some(value) => Ok(value),
                         None => {
                             let cbargs = [acc, v, Value::int(i as i32), receiver];
-                            self.run_cb_elem(native, win, cb, &cbargs, Value::UNDEFINED)
+                            self.run_cb_elem(&native, win, cb, &cbargs, Value::UNDEFINED)
                         }
                     };
                     match callback_result {
@@ -4163,7 +4163,7 @@ impl<'p> Vm<'p> {
         // build + run_loop re-entry). `native = None` falls back to call_value.
         let mut native = self.native_cb_entry(cmp, Value::UNDEFINED);
         let win = self.regs.len();
-        if let Some((_, callee_regs, _, _)) = native {
+        if let Some(super::misc_methods::NativeCb { callee_regs, .. }) = native {
             if self.regs_would_overflow(win + callee_regs) {
                 native = None;
             } else {
@@ -4214,7 +4214,7 @@ impl<'p> Vm<'p> {
                         }
                         None => {
                             let c = match self.run_cb_elem(
-                                native,
+                                &native,
                                 win,
                                 cmp,
                                 &[a[l], a[r]],
