@@ -695,6 +695,16 @@ def main():
     for i in range(0, len(zone_of), 16):
         a("    " + " ".join("%d," % x for x in zone_of[i:i + 16]))
     a("];")
+    # Code-point order is code-unit order here: every name is ASCII.
+    primaries = sorted(set(r[0] for r in rows))
+    assert all(p.isascii() for p in primaries)
+    a("/// AvailableCanonicalTimeZones: the primary identifiers, each once, in code")
+    a("/// unit order, as indices into the identifier list.")
+    a("pub(crate) static PRIMARY_IDS: &[u16] = &[")
+    prim_index = [id_index[p] for p in primaries]
+    for i in range(0, len(prim_index), 16):
+        a("    " + " ".join("%d," % x for x in prim_index[i:i + 16]))
+    a("];")
     a("")
     a("/// The names and zones as the table held them before, as pairs; retained")
     a("/// only to check `ID_NAMES`, `ID_END` and `ID_ZONE` against.")

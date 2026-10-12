@@ -14,7 +14,8 @@
 //! string. Times are seconds here; the callers scale to nanoseconds.
 
 use super::tzdata::{
-    FinalRule, Zone, FINALS, ID_END, ID_NAMES, ID_ZONE, TRANS_BLOCK_DAY, TRANS_BLOCK_POS,
+    FinalRule, Zone, FINALS, ID_END, ID_NAMES, ID_ZONE, PRIMARY_IDS, TRANS_BLOCK_DAY,
+    TRANS_BLOCK_POS,
     TRANS_BLOCK_TOD, TRANS_BYTES, TRANS_OFFSET, TRANS_PALETTE, TRANS_TOD, ZONE_FIN,
     ZONE_FIN_YEAR, ZONE_ID, ZONE_INIT, ZONE_LAST_AT, ZONE_LAST_OFF, ZONE_NFIN, ZONE_NTR, ZONE_STD,
     ZONE_TR,
@@ -241,13 +242,13 @@ pub(crate) fn primary(zone: u16) -> &'static str {
 /// `Etc/UTC` and `Etc/GMT` both carry the primary identifier "UTC", so the
 /// dedupe below is what keeps them out of the list (test262's
 /// `isCanonicalizedStructurallyValidTimeZoneName` rejects both spellings).
-/// Sorted through the shared cold sort: `Intl.supportedValuesOf` is the one
-/// caller, and a sort of `&str` of its own was 9 KB of every full module.
+/// The generator writes that list, sorted and unique, so nothing is sorted
+/// here.
 pub(crate) fn primary_ids() -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = ZONE_ID.iter().map(|&id| id_name(usize::from(id))).collect();
-    crate::cold_sort::sort(&mut v);
-    v.dedup();
-    v
+    PRIMARY_IDS
+        .iter()
+        .map(|&id| id_name(usize::from(id)))
+        .collect()
 }
 
 // ── civil date arithmetic (proleptic Gregorian, days since 1970-01-01) ──
@@ -543,6 +544,17 @@ mod tests {
             }
         }
         assert_eq!(ID_END.last().map(|&end| end as usize), Some(ID_NAMES.len()));
+    }
+
+    /// The generated primary identifier list is every zone's primary
+    /// identifier, sorted by code unit, each once.
+    #[test]
+    fn primary_ids_are_the_zones_primaries_sorted_and_unique() {
+        let mut want: Vec<&str> = (0..ZONE_ID.len() as u16).map(primary).collect();
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(primary_ids(), want);
+        assert!(want.contains(&"UTC") && !want.contains(&"Etc/UTC"));
     }
 
     #[test]
