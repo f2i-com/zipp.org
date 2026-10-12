@@ -2136,13 +2136,13 @@ pub struct Vm<'p> {
     /// derived constructor that returns `undefined` without `super()` having run
     /// throws a ReferenceError. Transient — entries live only across one
     /// in-flight `construct`.
-    super_called: std::collections::HashSet<u32>,
+    super_called: crate::slot_table::SlotSet,
     /// Heap indices of derived-class instances whose `this` is still in the
     /// constructor TDZ (between derived-ctor entry and its `super()`
     /// completing). The `ThisCheck` op throws a ReferenceError while the
     /// instance is here. Transient — inserted by `construct`/`run_class_ctor`,
     /// removed on `super()` completion and cleared on every `construct` exit.
-    this_tdz: std::collections::HashSet<u32>,
+    this_tdz: crate::slot_table::SlotSet,
     /// The produced `this` of a completed `super(...)` whose parent ctor
     /// RETURN-OVERRODE the instance, keyed by the pre-allocated instance's heap
     /// index. A derived ctor that then returns `undefined` must yield THIS
@@ -2373,18 +2373,18 @@ pub struct Vm<'p> {
     /// value that created it. Resumes bind it as Frame.callee so LoadCallee
     /// (a named function expression's self-name) keeps the caller-visible
     /// identity across suspensions. Values are GC roots; keys pruned on sweep.
-    gen_callee: std::collections::HashMap<u32, Value>,
+    gen_callee: crate::slot_table::SlotTable<Value>,
     /// Heap indices of IMMUTABLE cells — named function expressions' own-name
     /// bindings (MakeCellFnName). UpvalSet/StoreUpvalDyn writes through one
     /// no-op in sloppy code and throw TypeError in strict code. Pruned on GC
     /// sweep (the cells themselves are ordinary traced heap objects).
-    fn_name_cells: std::collections::HashSet<u32>,
+    fn_name_cells: crate::slot_table::SlotSet,
     /// Heap indices of `const`/`using` cells (MarkCellConst). A write through a
     /// closure or a direct eval (UpvalSet/StoreUpvalDyn) is a TypeError in BOTH
     /// modes — the compiler can only reject the declaring function's own
     /// assignments, since `Binding::Upvalue` carries no const-ness. Pruned on GC
     /// sweep like `fn_name_cells`.
-    const_cells: std::collections::HashSet<u32>,
+    const_cells: crate::slot_table::SlotSet,
     /// B201: sticky "a const cell exists" byte for the emitted inline cell
     /// ops (set at the single insert site, never cleared — GC pruning may
     /// empty the set but the sticky byte just keeps the inline lane

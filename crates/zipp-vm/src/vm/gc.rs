@@ -153,6 +153,25 @@ impl<S: std::hash::BuildHasher> SlotKeyed for std::collections::HashSet<u32, S> 
     }
 }
 
+/// A bit a slot: a removal is one word, so the freed list is always the
+/// smaller walk.
+impl SlotKeyed for crate::slot_table::SlotSet {
+    #[inline(never)]
+    fn retain_marked(&mut self, marks: &[bool]) {
+        self.retain(|&k| marks[k as usize]);
+    }
+
+    #[inline(never)]
+    fn prune_freed(&mut self, freed: &[u32], _live: &[bool]) {
+        if self.is_empty() {
+            return;
+        }
+        for i in freed {
+            self.remove(i);
+        }
+    }
+}
+
 impl<V> SlotKeyed for crate::slot_table::SlotTable<V> {
     #[inline(never)]
     fn retain_marked(&mut self, marks: &[bool]) {
