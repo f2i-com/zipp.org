@@ -17,6 +17,9 @@ impl<'p> Vm<'p> {
         value: Value,
     ) -> Result<(), Thrown> {
         self.defer_check(target, key)?; // CreateDataProperty = [[DefineOwnProperty]]
+        if self.define_field_append(target, key, value) {
+            return Ok(());
+        }
         let mut m = ObjMap::new();
         m.set("value", value);
         m.set("writable", Value::TRUE);
@@ -24,6 +27,58 @@ impl<'p> Vm<'p> {
         m.set("configurable", Value::TRUE);
         let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
         self.object_define_property(target, key, desc)
+    }
+
+    /// CreateDataPropertyOrThrow where it is an append: an ordinary
+    /// extensible object without an own `key` gets a writable, enumerable,
+    /// configurable data property at the end of its keys, which is what
+    /// `ObjMap::set` appends. `false`, with nothing done, for anything else
+    /// (an existing key, an exotic or special object, a private, symbol or
+    /// index-like key), which takes the full definition.
+    ///
+    /// Every class field (`x = 0`) is defined this way on every instance, and
+    /// the full definition built a four-property descriptor object and read
+    /// it back through `Object.defineProperty`'s machinery: a class with two
+    /// fields constructed at 1.9 microseconds an instance, 47 times Node.
+    fn define_field_append(&mut self, target: Value, key: &str, value: Value) -> bool {
+        if !target.is_heap() {
+            return false;
+        }
+        let oi = target.heap_index();
+        let b0 = match key.as_bytes().first() {
+            Some(&b) => b,
+            None => return false,
+        };
+        if b0 == b'#'
+            || b0 == b'@'
+            || b0 == b'-'
+            || b0.is_ascii_digit()
+            || key == "__proto__"
+            || key == "length"
+            || oi == self.global_this
+            || oi == self.arr_proto
+            || oi == self.obj_proto
+            || (!self.realm_global_objs.is_empty() && self.realm_global_objs.contains_key(&oi))
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oi))
+            || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&oi))
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&oi))
+        {
+            return false;
+        }
+        let plain = matches!(
+            self.heap.get(oi),
+            HeapObj::Object(m) if m.extensible && !m.is_ctor && !m.class_proto && m.pos(key).is_none()
+        );
+        if !plain {
+            return false;
+        }
+        self.store_barrier_v(crate::heap::gcoracle::SET_PROP, target, value);
+        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+            m.set(key, value);
+        }
+        // A key add can move `vals` (inline caches address it).
+        self.heap.bump_version(oi);
+        true
     }
 
     /// `Object.defineProperty(obj, key, descriptor)` — define/redefine an own
