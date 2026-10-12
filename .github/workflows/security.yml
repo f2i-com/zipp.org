@@ -119,11 +119,22 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     # Hundreds of debug test executables otherwise duplicate full VM/parser
-    # symbols and can exhaust the hosted runner during linking. Keep debug
-    # assertions and optimization unchanged; omit only debugging metadata.
+    # symbols and can exhaust the hosted runner during linking: omit
+    # debugging metadata.
+    #
+    # Optimize at level 1. Unoptimized, the suite spent 84 of its 86 minutes
+    # running tests, a third of it in three files that rerun their programs
+    # under ZIPP_GC_STRESS (a collection at every safe point) and the other
+    # collector and tier modes: nursery_minor took 20 minutes,
+    # proto_method_shadow 12, audit_20260915_gc_heap 8.5. At level 1 the
+    # same three took 19, 7 and 16 seconds on a workstation (628, 65 and 359
+    # unoptimized) for about three times the compile. Debug assertions and
+    # overflow checks are independent of the level and stay on.
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
       CARGO_BUILD_JOBS: "2"
     steps:
       - name: Check out source
