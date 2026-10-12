@@ -246,7 +246,8 @@ impl<'p> Vm<'p> {
     }
 
     /// Guarded captured `RegExpMethod` for the two hot primitive-string /
-    /// RegExp combinations: `s.matchAll(re)` and `s.replace(re, string)`.
+    /// RegExp combinations: `s.matchAll(re)` and `s.replace(re, string)` (or
+    /// `s.replace(re, function)`).
     ///
     /// `Ok(None)` is a PURE decline.  Every type, realm, live method-slot and
     /// RegExp-protocol proof is complete before coercion, getters, writes,
@@ -310,14 +311,19 @@ impl<'p> Vm<'p> {
             return result.map(Some);
         }
 
-        // A replacement object can run ToString (or be callable) at a spec point
-        // that precedes the live `exec`/flags reads.  It could invalidate proofs
-        // made above, so this lane accepts only already-primitive heap strings.
-        if !replacement.is_heap()
-            || !matches!(
+        // A replacement object runs ToString at a spec point that precedes
+        // the live `exec`/flags reads.  It could invalidate proofs made above,
+        // so of the non-callable replacements this lane accepts only
+        // already-primitive heap strings.  A callable one is not coerced, and
+        // is first called after the protocol's exec loop has collected every
+        // match, so it is accepted too (see the `"replace"` arm of
+        // `string_method`).
+        let primitive_string = replacement.is_heap()
+            && matches!(
                 self.heap.get(replacement.heap_index()),
                 HeapObj::Str(_) | HeapObj::Cons { .. }
-            )
+            );
+        if !(primitive_string || self.is_callable(replacement))
             // Conservative exact-instance proof: even an unrelated expando
             // sends the call to the fully observable protocol.
             || self.arr_props.get(&re).is_some()
@@ -898,7 +904,16 @@ impl<'p> Vm<'p> {
                         self.heap.get(repl.heap_index()),
                         HeapObj::Str(_) | HeapObj::Cons { .. }
                     );
-                if primitive_string && self.regexp_replace_fast_ok(re) {
+                // A callable replacement is not coerced at all, and the
+                // protocol first calls it after its exec loop has collected
+                // every match (the legacy statics then name the last one), so
+                // nothing it does can reach the matcher either: the internal
+                // matcher's `(match, ...captures, position, input[, groups])`
+                // calls are the protocol's. Through the protocol each match
+                // cost an exec result array and five property reads on it,
+                // four times what Node pays for `s.replace(/\d/g, f)`.
+                let direct = primitive_string || self.is_callable(repl);
+                if direct && self.regexp_replace_fast_ok(re) {
                     let global = matches!(
                         self.heap.get(re),
                         HeapObj::RegExp { flags, .. } if flags.contains('g')

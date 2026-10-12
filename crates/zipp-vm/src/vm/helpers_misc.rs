@@ -336,7 +336,7 @@ pub(crate) extern "win64" fn jit_regexp_call_direct(
 }
 
 /// Guarded direct primitive-string `matchAll(RegExp)` / `replace(RegExp,
-/// string)` captured-method helper. `op = 0` selects matchAll (one argument),
+/// string or function)` captured-method helper. `op = 0` selects matchAll (one argument),
 /// `op = 1` selects replace (two arguments).
 ///
 /// `SELF_CALL_DEOPT` is a pure guard decline and generated code falls through
