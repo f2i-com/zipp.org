@@ -1999,13 +1999,11 @@ impl<'p> Vm<'p> {
         // W11 (B124): flat-Str RHS at a DIFFERENT slot — append its bytes
         // directly instead of round-tripping through `str_wtf8_cow(..)
         // .into_owned()` (a Rust malloc + copy + free per link; string leaves
-        // dominate the fused chains alongside ints). Split-borrow safely by
-        // TAKING the accumulator's `JsStr` out of its slot for the append:
-        // nothing in between allocates on the VM heap, so no GC safepoint can
-        // observe the placeholder. Same-index RHS (`a += a` shapes reaching
-        // the legacy `StrAppendInPlace` path) and ropes keep the general path
-        // below — byte-identical results either way (`push_wtf8` is the same
-        // append the cow path fed).
+        // dominate the fused chains alongside ints), borrowing both slots at
+        // once (`Heap::append_str_slot`). Same-index RHS (`a += a` shapes
+        // reaching the legacy `StrAppendInPlace` path) and ropes keep the
+        // general path below — byte-identical results either way
+        // (`push_wtf8` is the same append the cow path fed).
         if mutable && val.is_heap() && val.heap_index() != acc.heap_index() {
             let ai = acc.heap_index();
             let (add_units, add_bytes) = match self.heap.get(val.heap_index()) {
@@ -2018,20 +2016,8 @@ impl<'p> Vm<'p> {
                     return None;
                 }
             }
-            let slot = self.heap.get_mut(ai);
-            if matches!(slot, HeapObj::Str(_)) {
-                let taken = std::mem::replace(slot, HeapObj::Str(crate::heap::JsStr::empty()));
-                let mut js = match taken {
-                    HeapObj::Str(js) => js,
-                    _ => unreachable!("checked Str above"),
-                };
-                if let HeapObj::Str(vs) = self.heap.get(val.heap_index()) {
-                    js.push_js(vs);
-                    *self.heap.get_mut(ai) = HeapObj::Str(js);
-                    return Some(acc);
-                }
-                // Rope RHS: restore the accumulator and take the general path.
-                *self.heap.get_mut(ai) = HeapObj::Str(js);
+            if self.heap.append_str_slot(ai, val.heap_index()) {
+                return Some(acc);
             }
         }
         // General: materialise `val`'s EXACT (WTF-8) string form (same coercion

@@ -7387,6 +7387,37 @@ impl Heap {
         }
     }
 
+    /// Append the flat string at `from` to the flat string at `to`, in place,
+    /// borrowing the two slots at once: `false`, with nothing changed, unless
+    /// both are flat strings at different slots. `JsStr::push_js` keeps the
+    /// cached length and flags right. The caller has checked that `to` may
+    /// grow in place (not frozen, not pinned) and by how much.
+    ///
+    /// The in-place append used to take the accumulator out of its slot, put
+    /// an empty string there, append, and put it back: two 80-byte moves and
+    /// a drop of the placeholder on every `s += t`, half of what a loop of
+    /// appends cost.
+    pub(crate) fn append_str_slot(&mut self, to: u32, from: u32) -> bool {
+        let (to, from) = (to as usize, from as usize);
+        if to == from || to >= self.objs.len() || from >= self.objs.len() {
+            return false;
+        }
+        let (dst, src) = if to < from {
+            let (lo, hi) = self.objs.split_at_mut(from);
+            (&mut lo[to], &hi[0])
+        } else {
+            let (lo, hi) = self.objs.split_at_mut(to);
+            (&mut hi[0], &lo[from])
+        };
+        match (dst, src) {
+            (HeapObj::Str(js), HeapObj::Str(vs)) => {
+                js.push_js(vs);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Freeze the string at `idx` as one the engine shares by handle (see
     /// `JsStr::freeze_shared`). Anything else there is left alone.
     pub(crate) fn freeze_shared_str(&mut self, idx: u32) {
