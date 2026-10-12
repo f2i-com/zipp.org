@@ -941,6 +941,33 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// What [`Vm::py_global`] answers at once for a site whose cache entry
+    /// holds (its own first tests, with nothing hashed and nothing
+    /// recorded): the module global at its entry's position, or the builtin
+    /// while the globals have had no key appended. For the dispatch loop,
+    /// which asks this first and takes the step when it declines. Out of
+    /// line, as the three in `py_attr` are: inlined into the dispatch loop
+    /// they measured slower than this one small call.
+    #[inline(never)]
+    pub(super) fn py_global_hit(&self, func_id: u32, ip: usize, g: Value, r: Value) -> Option<Value> {
+        if !g.is_heap() {
+            return None;
+        }
+        let gi = g.heap_index();
+        let e = self.py_ic(func_id, ip);
+        if e.a != g.bits() || self.heap.version_of(gi) != e.hver {
+            return None;
+        }
+        if e.kind == ic::GLOBAL {
+            return self.py_map_at_bits(g, e.pos, e.b, e.d);
+        }
+        if e.kind == ic::BUILTIN && matches!(self.heap.get(gi), HeapObj::Map { keys, .. } if keys.len() as u64 == e.c) {
+            let b = self.py_rt_for(r)?.builtins;
+            return self.py_map_at_bits(b, e.pos, e.b, e.d);
+        }
+        None
+    }
+
     /// [`Instr::PyGlobal`]: a module global, else a builtin; `None` for the
     /// slow edge (see `vm::py_rt` for the site cache's entries).
     #[inline(never)]

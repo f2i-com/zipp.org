@@ -1649,23 +1649,82 @@ impl<'p> Vm<'p> {
                     | Instr::PySetItem { .. } => {
                         ip = self.py_step(func_id, base, ip, instr)?;
                     }
-                    // An attribute that is a property with a Python getter or
-                    // setter: the accessor's frame pushed, as a call's is.
+                    // The four instructions below ask their site's cache
+                    // entry first (`py_ops` / `py_attr`'s hit forms: what
+                    // the step's function answers at once for an entry that
+                    // holds, in one small call) and take the step when it
+                    // declines, as every one does under `ZIPP_PY_PROF`,
+                    // which counts in the step.
+                    //
+                    // An attribute read. In the step, a property with a
+                    // Python getter gets the accessor's frame pushed, as a
+                    // call's is.
                     #[cfg(feature = "python")]
-                    Instr::PyGetAttr { .. } | Instr::PySetAttr { .. } => {
-                        let next = self.py_step_ext(func_id, base, ip, instr)?;
-                        if next == usize::MAX {
-                            break;
+                    Instr::PyGetAttr { dst, obj, .. } => {
+                        match self.py_attr_get_hit(func_id, ip, self.get(base, obj)) {
+                            Some(v) if !super::prof_py::on() => {
+                                self.set(base, dst, v);
+                                ip += 1;
+                            }
+                            _ => {
+                                let next = self.py_step_ext(func_id, base, ip, instr)?;
+                                if next == usize::MAX {
+                                    break;
+                                }
+                                ip = next;
+                            }
                         }
-                        ip = next;
+                    }
+                    // An attribute store (a property's setter likewise).
+                    #[cfg(feature = "python")]
+                    Instr::PySetAttr { obj, val, .. } => {
+                        if !super::prof_py::on() && self.py_attr_set_hit(func_id, ip, self.get(base, obj), self.get(base, val)) {
+                            ip += 1;
+                        } else {
+                            let next = self.py_step_ext(func_id, base, ip, instr)?;
+                            if next == usize::MAX {
+                                break;
+                            }
+                            ip = next;
+                        }
                     }
                     #[cfg(feature = "python")]
-                    Instr::PyGlobal { .. }
-                    | Instr::PyStrItem { .. }
+                    Instr::PyGlobal { dst, globals, rt, .. } => {
+                        match self.py_global_hit(func_id, ip, self.get(base, globals), self.get(base, rt)) {
+                            Some(v) if !super::prof_py::on() => {
+                                self.set(base, dst, v);
+                                ip += 1;
+                            }
+                            _ => ip = self.py_step_ext(func_id, base, ip, instr)?,
+                        }
+                    }
+                    // A method lookup: a site whose receivers are of several
+                    // classes misses its one entry often, so a miss asks the
+                    // step's function itself (its answer is the whole step).
+                    #[cfg(feature = "python")]
+                    Instr::PyMethod { dst, obj, rt, key, gb, slow } => {
+                        if super::prof_py::on() {
+                            ip = self.py_step_ext(func_id, base, ip, instr)?;
+                        } else {
+                            let (o, r) = (self.get(base, obj), self.get(base, rt));
+                            let f = match self.py_method_hit(func_id, ip, o, r) {
+                                Some(f) => Some(f),
+                                None => self.py_method(func_id, ip, o, r, key, gb),
+                            };
+                            match f {
+                                Some(f) => {
+                                    self.set(base, dst, f);
+                                    ip += 1;
+                                }
+                                None => ip = slow as usize,
+                            }
+                        }
+                    }
+                    #[cfg(feature = "python")]
+                    Instr::PyStrItem { .. }
                     | Instr::PyStrLen { .. }
                     | Instr::PyIsInstance { .. }
                     | Instr::PyGenNext { .. }
-                    | Instr::PyMethod { .. }
                     | Instr::PyModGet { .. }
                     | Instr::PyLen { .. }
                     | Instr::PyAttrFn { .. }

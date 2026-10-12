@@ -287,6 +287,97 @@ impl<'p> Vm<'p> {
         self.py_ic(func_id, ip).kind == ic::ATTR_PROP
     }
 
+    // ---- the interpreter's cache hits --------------------------------
+    //
+    // What `py_attr_get`, `py_attr_set` and `py_method` answer at once for
+    // a site whose cache entry holds: the same tests in the same order,
+    // with nothing looked up by name and nothing recorded. The dispatch
+    // loop asks these first, in one small call each, and takes the step
+    // (which asks the full function, whose own first tests these are) when
+    // one declines.
+
+    /// [`Vm::py_attr_get`] at a site holding a layout-mode entry
+    /// ([`ic::ATTR_GET_L`]) for the instance's class and layout.
+    #[inline(never)]
+    pub(super) fn py_attr_get_hit(&self, func_id: u32, ip: usize, o: Value) -> Option<Value> {
+        // The entry's kind first: a site of another kind (a property, a
+        // class attribute) declines before the instance is looked at.
+        let e = self.py_ic(func_id, ip);
+        if e.kind != ic::ATTR_GET_L {
+            return None;
+        }
+        let (cls, dict) = self.py_inst_parts(o)?;
+        if cls.bits() != e.a || !cls.is_heap() || !dict.is_heap() {
+            return None;
+        }
+        let v = self.py_attrs_at(dict, e.d, e.pos as usize)?;
+        self.py_cls_stamp_ok(cls, e.hver, e.c).then_some(v)
+    }
+
+    /// [`Vm::py_attr_set`] at a site holding a layout-mode entry: a value
+    /// replaced at its slot ([`ic::ATTR_SET_L`]) or appended to a fresh
+    /// instance's storage ([`ic::ATTR_APPEND_L`]). Whether it stored.
+    #[inline(never)]
+    pub(super) fn py_attr_set_hit(&mut self, func_id: u32, ip: usize, o: Value, v: Value) -> bool {
+        // The entry's kind first, as `py_attr_get_hit`.
+        let e = self.py_ic(func_id, ip);
+        if e.kind != ic::ATTR_SET_L && e.kind != ic::ATTR_APPEND_L {
+            return false;
+        }
+        let Some((cls, dict)) = self.py_inst_parts(o) else {
+            return false;
+        };
+        if cls.bits() != e.a || !cls.is_heap() || !dict.is_heap() {
+            return false;
+        }
+        let di = dict.heap_index();
+        match e.kind {
+            ic::ATTR_SET_L if self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) && self.py_cls_stamp_ok(cls, e.hver, e.c) => {
+                self.py_attrs_put(di, e.pos as usize, v);
+                true
+            }
+            ic::ATTR_APPEND_L if self.py_attrs_of(dict) == Some((e.d, e.pos as usize)) && self.py_cls_stamp_ok(cls, e.hver, e.c) => {
+                self.py_attrs_push(di, e.b as u32, v);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// [`Vm::py_method`] at a site holding an entry for the receiver's
+    /// class: a user class's function its instance's layout lacks
+    /// ([`ic::METHOD`]), or a builtin method of a dict-less receiver
+    /// ([`ic::BUILTIN_METHOD`]).
+    #[inline(never)]
+    pub(super) fn py_method_hit(&self, func_id: u32, ip: usize, o: Value, rt: Value) -> Option<Value> {
+        if !o.is_heap() {
+            return None;
+        }
+        let p = self.py_rt_for(rt)?;
+        let (ty, t_str) = (p.ty?, p.t_str);
+        let (cls, dict) = if self.heap.is_str_like(o.heap_index()) {
+            (t_str, Value::UNDEFINED)
+        } else {
+            self.py_inst_parts(o)?
+        };
+        if !cls.is_heap() {
+            return None;
+        }
+        let e = self.py_ic(func_id, ip);
+        if e.a != cls.bits() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
+            return None;
+        }
+        if e.kind == ic::METHOD {
+            let f = self.py_table_at(cls, ty.gm, e.b, e.pos)?;
+            (self.py_plain_rec(f) && e.d != 0 && self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d)).then_some(f)
+        } else if e.kind == ic::BUILTIN_METHOD && dict.is_undefined() {
+            let b = self.py_table_at(cls, ty.gb, e.b, e.pos)?;
+            self.py_plain_rec(b).then_some(b)
+        } else {
+            None
+        }
+    }
+
     /// [`Instr::PyGetAttr`]: `obj.name` from an instance's own dict when its
     /// class's `ga[name]` is `true`; `None` for the slow edge, or, with
     /// `call` set, for a property whose Python getter is to be called with

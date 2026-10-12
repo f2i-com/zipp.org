@@ -1,0 +1,5 @@
+reads [3000, 11000, "'Point' object has no attribute 'x'", 'class value', 27500, 1047500]
+writes [(2999, -2999), 8997000, (2999, [1500, 1501, 1502]), (10, 4, 5), 'AttributeError']
+methods [22500, 107250, "'Point' object has no attribute 'norm1'", "type object 'Point' has no attribute 'norm1'", 7000, (4519944, 3001, -428)]
+globals [91453, "name 'LIMIT' is not defined", (197453, True)]
+calls [18016491, 15501366, 'TypeError', 15501375, 'TypeError', (200, 50)]
