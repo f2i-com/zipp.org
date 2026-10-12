@@ -3009,7 +3009,11 @@ impl<'p> Vm<'p> {
         }
 
         if v.is_int() {
-            let _ = write!(out, "{}", v.as_int());
+            // The digits straight into the buffer: `write!` went through the
+            // formatting machinery (a fifth of joining an array of integers).
+            let (digits, start) = fmt_i32_buf(v.as_int());
+            // An optional sign and ASCII digits.
+            out.push_str(std::str::from_utf8(&digits[start..]).unwrap_or_default());
         } else if v.is_double() {
             out.push_str(&fmt_f64(v.as_f64()));
         } else if v.is_bool() {
