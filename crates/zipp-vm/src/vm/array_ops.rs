@@ -1618,16 +1618,20 @@ impl<'p> Vm<'p> {
     /// prototype), not an arguments object, and no accessor in the overlay, so
     /// reading the present elements has no side effect that could add or
     /// remove one. `None` when any of that does not hold.
-    fn virtual_array_present(&self, idx: u32, lo: usize, hi: usize) -> Option<Vec<usize>> {
+    ///
+    /// The indices are `u32` (an array index is below 2^32 - 1) so that their
+    /// sort is the one the other `u32` sorts use, not a copy of its own.
+    fn virtual_array_present(&self, idx: u32, lo: usize, hi: usize) -> Option<Vec<u32>> {
         if self.array_proto_has_index
             || self.proto_of.contains_key(&idx)
             || self.arguments_objs.contains_key(&idx)
         {
             return None;
         }
-        let mut present: Vec<usize> = match self.heap.get(idx) {
+        let mut present: Vec<u32> = match self.heap.get(idx) {
             HeapObj::Array(items) => (lo.min(items.len())..hi.min(items.len()))
                 .filter(|&i| !items[i].is_hole())
+                .map(|i| i as u32)
                 .collect(),
             _ => return None,
         };
@@ -1643,7 +1647,7 @@ impl<'p> Vm<'p> {
                     return None;
                 }
                 if ki >= lo && ki < hi {
-                    present.push(ki);
+                    present.push(ki as u32);
                 }
             }
         }

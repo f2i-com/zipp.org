@@ -561,13 +561,14 @@ impl<'p> Vm<'p> {
                         // SPARSE-overlay index keys (>= the dense prefix) continue
                         // the ascending index run before "length"/named keys.
                         // ("4294967295"+ are NOT array indices — named below.)
-                        let mut sparse: Vec<usize> = m
+                        let mut sparse: Vec<u32> = m
                             .keys
                             .iter()
                             .filter(|k| !is_hidden_key(k))
                             .filter_map(|k| {
                                 canonical_index_str(k)
                                     .filter(|n| *n < 4_294_967_295 && *n >= dense_len)
+                                    .map(|n| n as u32)
                             })
                             .collect();
                         sparse.sort_unstable();
@@ -622,7 +623,10 @@ impl<'p> Vm<'p> {
                                 || c.static_getters.iter().any(|(n, _)| n == k)
                                 || c.static_setters.iter().any(|(n, _)| n == k))
                     };
-                    let mut ints: Vec<usize> = Vec::new();
+                    // An array index is below 2^32 - 1 ("4294967295" and up
+                    // are string keys, as for arrays above); `u32` also keeps
+                    // this sort the one the other index sorts use.
+                    let mut ints: Vec<u32> = Vec::new();
                     let mut named: Vec<String> = Vec::new();
                     {
                         let mut push_key = |k: &str| {
@@ -632,7 +636,10 @@ impl<'p> Vm<'p> {
                             {
                                 return;
                             }
-                            if let Some(i) = canonical_index_str(k) {
+                            if let Some(i) =
+                                canonical_index_str(k).filter(|n| *n < 4_294_967_295)
+                            {
+                                let i = i as u32;
                                 if !ints.contains(&i) {
                                     ints.push(i);
                                 }
@@ -742,13 +749,14 @@ impl<'p> Vm<'p> {
                             keys.push(i.to_string());
                         }
                         if let Some(m) = self.arr_props.get(&idx) {
-                            let mut extra: Vec<usize> = m
+                            let mut extra: Vec<u32> = m
                                 .keys
                                 .iter()
                                 .filter(|k| !is_hidden_key(k))
                                 .filter_map(|k| {
                                     canonical_index_str(k)
                                         .filter(|n| *n < 4_294_967_295 && *n >= len)
+                                        .map(|n| n as u32)
                                 })
                                 .collect();
                             extra.sort_unstable();
@@ -1514,5 +1522,30 @@ impl<'p> Vm<'p> {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod class_static_key_order_tests {
+    /// A class's own keys: array indices (below 2^32 - 1) ascending, then
+    /// `length`, `name`, `prototype` and the other string keys in creation
+    /// order. "4294967295" and up are string keys, as on an array.
+    #[test]
+    fn integer_statics_first_and_only_array_indices() {
+        let outcome = crate::run(
+            r#"
+                class C {
+                    static 9() {} static b() {} static 2() {} static 4294967294() {}
+                    static 4294967295() {} static 4294967296() {} static 0() {}
+                }
+                console.log(Object.getOwnPropertyNames(C).join(","));
+            "#,
+        )
+        .expect("script compiles");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.output,
+            vec!["0,2,9,4294967294,length,name,prototype,b,4294967295,4294967296"]
+        );
     }
 }

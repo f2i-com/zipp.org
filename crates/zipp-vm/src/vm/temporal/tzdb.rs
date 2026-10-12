@@ -241,9 +241,11 @@ pub(crate) fn primary(zone: u16) -> &'static str {
 /// `Etc/UTC` and `Etc/GMT` both carry the primary identifier "UTC", so the
 /// dedupe below is what keeps them out of the list (test262's
 /// `isCanonicalizedStructurallyValidTimeZoneName` rejects both spellings).
+/// Sorted through the shared cold sort: `Intl.supportedValuesOf` is the one
+/// caller, and a sort of `&str` of its own was 9 KB of every full module.
 pub(crate) fn primary_ids() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = ZONE_ID.iter().map(|&id| id_name(usize::from(id))).collect();
-    v.sort_unstable();
+    crate::cold_sort::sort(&mut v);
     v.dedup();
     v
 }

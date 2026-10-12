@@ -318,7 +318,9 @@ impl<'p> Vm<'p> {
                 // ascending index run BEFORE any named key — integer indices sort
                 // first in spec own-key order. ("4294967295" and beyond are NOT
                 // array indices; they stay named, in insertion order.)
-                let mut sparse: Vec<usize> = Vec::new();
+                // `u32` (an index is below 2^32 - 1): its sort is the one the
+                // other index sorts use.
+                let mut sparse: Vec<u32> = Vec::new();
                 for (j, k) in m.keys.iter().enumerate() {
                     if !m.attr_at(j).enumerable || is_hidden_key(k) {
                         continue;
@@ -327,12 +329,12 @@ impl<'p> Vm<'p> {
                         // An index key < the dense length is already covered by
                         // the dense range above.
                         if n >= len {
-                            sparse.push(n);
+                            sparse.push(n as u32);
                         }
                     }
                 }
                 sparse.sort_unstable();
-                ks.extend(sparse.into_iter().map(|n| (Some(n), n.to_string())));
+                ks.extend(sparse.into_iter().map(|n| (Some(n as usize), n.to_string())));
                 for (j, k) in m.keys.iter().enumerate() {
                     if !m.attr_at(j).enumerable || is_hidden_key(k) {
                         continue;

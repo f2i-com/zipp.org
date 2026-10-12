@@ -218,34 +218,67 @@ impl<'p> Vm<'p> {
                 }
             }
         } else {
-            // Default TypedArray sort: ascending with -0 before +0
-            // (total_cmp) and ALL NaNs last regardless of their sign bit.
-            snap.sort_by(|a, b| {
-                // Number TypedArrays already contain numeric primitives. In
-                // the size-oriented embedder, avoid two out-of-line general
-                // coercions per comparison. BigInt retains the existing path.
-                #[cfg(feature = "wasm-no-fs-loader")]
-                let (x, y) = (
-                    if a.is_number() {
-                        a.as_f64()
+            // Default TypedArray sort: ascending with -0 before +0 and ALL
+            // NaNs last regardless of their sign bit; BigInts by exact value.
+            // Each element becomes a u64 whose unsigned order is that order,
+            // the keys go through the integer sort the engine already has
+            // (a sort of Values with its own comparison was a further 10 KB
+            // copy of the standard library's sort in every module), and the
+            // elements are rebuilt from their keys. Elements with equal keys
+            // are the same value (there is one NaN), so an unstable sort
+            // gives what a stable one does.
+            const SIGN: u64 = 1 << 63;
+            // A BigInt64Array with a negative element is ordered as signed;
+            // without one (and in a BigUint64Array) the values are in u64.
+            let signed = snap
+                .iter()
+                .any(|&v| self.bigint_i128(v).is_some_and(|n| n < 0));
+            let mut bigint = false;
+            let mut keys: Vec<u64> = Vec::with_capacity(snap.len());
+            for &v in snap.iter() {
+                keys.push(if let Some(n) = self.bigint_i128(v) {
+                    bigint = true;
+                    if signed {
+                        n as i64 as u64 ^ SIGN
                     } else {
-                        self.value_num(*a)
-                    },
-                    if b.is_number() {
-                        b.as_f64()
+                        n as u64
+                    }
+                } else {
+                    let x = if v.is_number() {
+                        v.as_f64()
                     } else {
-                        self.value_num(*b)
-                    },
-                );
-                #[cfg(not(feature = "wasm-no-fs-loader"))]
-                let (x, y) = (self.value_num(*a), self.value_num(*b));
-                match (x.is_nan(), y.is_nan()) {
-                    (true, true) => std::cmp::Ordering::Equal,
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (false, true) => std::cmp::Ordering::Less,
-                    (false, false) => x.total_cmp(&y),
-                }
-            });
+                        self.value_num(v)
+                    };
+                    if x.is_nan() {
+                        u64::MAX
+                    } else {
+                        // total_cmp's order: negatives (bits inverted) below
+                        // positives (sign bit set).
+                        let bits = x.to_bits();
+                        if bits & SIGN != 0 {
+                            !bits
+                        } else {
+                            bits | SIGN
+                        }
+                    }
+                });
+            }
+            keys.sort_unstable();
+            for (slot, key) in snap.iter_mut().zip(keys) {
+                *slot = if bigint {
+                    self.make_bigint(if signed {
+                        i128::from((key ^ SIGN) as i64)
+                    } else {
+                        i128::from(key)
+                    })
+                } else if key == u64::MAX {
+                    Value::num(f64::NAN)
+                } else if key & SIGN != 0 {
+                    Value::num(f64::from_bits(key ^ SIGN))
+                } else {
+                    Value::num(f64::from_bits(!key))
+                };
+            }
         }
         Ok(())
     }
@@ -4263,5 +4296,50 @@ impl<'p> Vm<'p> {
             out.push(v);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod typed_array_default_sort_tests {
+    /// The default order of `%TypedArray%.prototype.sort` and `toSorted`:
+    /// ascending, -0 before +0, every NaN last, and BigInts by exact value
+    /// (two BigInts one `f64` apart used to compare equal and keep their
+    /// order).
+    #[test]
+    fn default_order_is_numeric_and_exact() {
+        let outcome = crate::run(
+            r#"
+                function show(ta) {
+                    var parts = [];
+                    for (var i = 0; i < ta.length; i++) {
+                        var v = ta[i];
+                        parts.push(typeof v === "number" && v === 0 && 1 / v < 0 ? "-0" : String(v));
+                    }
+                    console.log(parts.join(","));
+                }
+                show(new Float64Array([NaN, 1, -0, 0, -Infinity, Infinity, -NaN, -1.5,
+                    2 ** -1074, -(2 ** -1074), 0, -0]).sort());
+                show(new Float32Array([NaN, 3, -0, 0, -1, 1e30, -1e30]).toSorted());
+                show(new Int8Array([5, -128, 127, 0, -1]).sort());
+                show(new Uint32Array([4294967295, 0, 2147483648, 1]).sort());
+                show(new BigInt64Array([2n ** 60n + 1n, 2n ** 60n, -(2n ** 62n) - 1n,
+                    -(2n ** 62n), 0n, -1n]).sort());
+                show(new BigUint64Array([2n ** 63n + 1n, 2n ** 63n, 1n, 0n,
+                    2n ** 64n - 1n, 2n ** 64n - 2n]).toSorted());
+            "#,
+        )
+        .expect("script compiles");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.output,
+            vec![
+                "-Infinity,-1.5,-5e-324,-0,-0,0,0,5e-324,1,Infinity,NaN,NaN",
+                "-1.0000000150474662e+30,-1,-0,0,3,1.0000000150474662e+30,NaN",
+                "-128,-1,0,5,127",
+                "0,1,2147483648,4294967295",
+                "-4611686018427387905,-4611686018427387904,-1,0,1152921504606846976,1152921504606846977",
+                "0,1,9223372036854775808,9223372036854775809,18446744073709551614,18446744073709551615",
+            ]
+        );
     }
 }
