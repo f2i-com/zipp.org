@@ -1102,7 +1102,8 @@ impl Jit {
         cross_plan: &CrossCallPlan,
     ) {
         let key = (func_id, start);
-        let plan = match py_region_plan(proto, start, end) {
+        let native = take_py_native_calls(self as *const Self as usize, func_id);
+        let plan = match py_region_plan(proto, start, end, &native) {
             Ok(plan) => plan,
             Err(why) => {
                 if crate::jitlog_enabled() {
@@ -1297,11 +1298,49 @@ env_off_switch! {
     fn py_region_ext_enabled() = "ZIPP_NO_PY_REGION_EXT"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_PY_NATIVE_CALLS=1` counts every `PyCall` as a frame call in
+    /// the call-bound gate, as before the sites' cache entries were asked
+    /// (the same-binary A/B for [`set_py_native_calls`]).
+    fn py_native_calls_enabled() = "ZIPP_NO_PY_NATIVE_CALLS"
+}
+
+thread_local! {
+    /// The `PyCall` sites of the function about to compile whose cache
+    /// entries name a native callee (`Vm::py_native_call_sites`): the
+    /// planning JIT's address, the function and the sites' ips. Handed over
+    /// as the inline attribute plan is (`py_attr_inline`): any compile takes
+    /// it, and only the same JIT's compile of the same function uses it.
+    static NATIVE_CALLS: std::cell::RefCell<Option<(usize, u32, Vec<u32>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Hand the compile that follows the `PyCall` sites of `func_id` (of the
+/// JIT at `jit`) that call a native: such a call runs where it is, with no
+/// frame and no nested interpreter loop, so the call-bound gate
+/// ([`py_region_plan`]) counts it as work, not as a call. A hint: a site
+/// whose callee later becomes a Python function still runs correctly (the
+/// step pushes its frame), only slower than the gate would have allowed.
+pub(crate) fn set_py_native_calls(jit: usize, func_id: u32, sites: Vec<u32>) {
+    NATIVE_CALLS.with(|p| *p.borrow_mut() = (!sites.is_empty()).then_some((jit, func_id, sites)));
+}
+
+/// Take the pending native call sites when they are for `func_id` of the
+/// JIT at `jit` (none otherwise, and none under `ZIPP_NO_PY_NATIVE_CALLS`).
+fn take_py_native_calls(jit: usize, func_id: u32) -> Vec<u32> {
+    NATIVE_CALLS
+        .with(|p| p.borrow_mut().take())
+        .filter(|&(j, f, _)| j == jit && f == func_id && py_native_calls_enabled())
+        .map(|(_, _, sites)| sites)
+        .unwrap_or_default()
+}
+
 /// The loop proper `[start, end]`'s per-iteration shape: the frame calls
 /// every iteration makes (on every path from the header to the back-edge
 /// `end`), and the other ops every iteration runs. Edges out of the loop
-/// (slow paths, exits) are ignored: they are the rare case.
-pub(crate) fn py_loop_profile(code: &[Instr], start: usize, end: usize) -> (usize, usize) {
+/// (slow paths, exits) are ignored: they are the rare case. A `PyCall` at
+/// one of the ips in `native` (a native callee's site, see
+/// [`set_py_native_calls`]) is one of the other ops.
+pub(crate) fn py_loop_profile(code: &[Instr], start: usize, end: usize, native: &[u32]) -> (usize, usize) {
     let n = end - start + 1;
     let succ = |ip: usize| -> Vec<usize> {
         let mut out: Vec<usize> = control_targets(&code[ip])
@@ -1348,7 +1387,7 @@ pub(crate) fn py_loop_profile(code: &[Instr], start: usize, end: usize) -> (usiz
     let (mut calls, mut work) = (0, 0);
     for ip in start..=end {
         if !reaches_latch_avoiding(ip) {
-            if py_frame_call(&code[ip]) {
+            if py_frame_call(&code[ip]) && !native.contains(&(ip as u32)) {
                 calls += 1;
             } else {
                 work += 1;
@@ -1385,8 +1424,9 @@ pub(crate) struct PyRegionPlan {
 /// region `[start, end]`) compiles, and as what. Pure: it reads only the
 /// bytecode. A string-constant load counts as compilable here: the
 /// dispatcher interns the loop's, and the region resolves the rest at run
-/// time.
-pub(crate) fn py_region_plan(proto: &FuncProto, start: u32, end: u32) -> Result<PyRegionPlan, String> {
+/// time. `native`: the function's `PyCall` sites known to call a native
+/// ([`set_py_native_calls`]), which the call-bound gate does not count.
+pub(crate) fn py_region_plan(proto: &FuncProto, start: u32, end: u32, native: &[u32]) -> Result<PyRegionPlan, String> {
     if !py_regions_enabled() {
         return Err("ZIPP_NO_PY_REGIONS".into());
     }
@@ -1426,8 +1466,9 @@ pub(crate) fn py_region_plan(proto: &FuncProto, start: u32, end: u32) -> Result<
     // loop that mostly calls loses more there than the rest of its body
     // gains. Measured on the Python suite: a loop making every iteration's
     // call among fewer than `PY_WORK_PER_CALL` other per-iteration ops ran
-    // slower compiled.
-    let (calls, work) = py_loop_profile(&proto.code, start as usize, end as usize);
+    // slower compiled. A call of a native (a builtin, a str method) pushes
+    // no frame and is not such a call: a loop of those runs faster compiled.
+    let (calls, work) = py_loop_profile(&proto.code, start as usize, end as usize, native);
     if calls > 0 && work < PY_WORK_PER_CALL * calls {
         return Err(format!("call-bound: calls={calls} work={work}"));
     }

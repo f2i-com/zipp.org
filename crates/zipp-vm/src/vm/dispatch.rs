@@ -4787,6 +4787,11 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                                 self.jit.note_cross_pending(func_id, &cross_pending);
+                                // A Python loop: which of its `PyCall` sites
+                                // call a native, for the call-bound gate
+                                // (`codegen::py`).
+                                #[cfg(feature = "python")]
+                                self.py_native_call_sites(func_id);
                                 self.jit.compile_region(
                                     func_id,
                                     proto_ref,

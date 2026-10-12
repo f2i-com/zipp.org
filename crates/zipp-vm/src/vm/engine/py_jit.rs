@@ -111,6 +111,27 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Before a loop of `func_id` compiles: hand the JIT the function's
+    /// `PyCall` sites whose cache entries name a native callee
+    /// (`Vm::py_call_site_native`), for the call-bound gate
+    /// (`codegen::set_py_native_calls`). Nothing for a body with no fused
+    /// Python instruction, or outside a Python program.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn py_native_call_sites(&self, func_id: u32) {
+        if self.py_rt.is_none() || func_id as usize >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return;
+        }
+        let sites: Vec<u32> = self
+            .func(func_id as usize)
+            .code
+            .iter()
+            .enumerate()
+            .filter(|&(ip, i)| matches!(i, Instr::PyCall { .. }) && self.py_call_site_native(func_id, ip))
+            .filter_map(|(ip, _)| u32::try_from(ip).ok())
+            .collect();
+        crate::codegen::set_py_native_calls(&self.jit as *const crate::codegen::Jit as usize, func_id, sites);
+    }
+
     /// The rest of a `PyCall` from compiled code once `py_step_call` pushed
     /// the callee's frame (or of a `PyGetAttr` / `PySetAttr` that pushed a
     /// property's accessor's): run it to completion as `jit_frame_call`

@@ -1,0 +1,9 @@
+str (15000, 'BETA-ganna')
+mixed [('PAD', 'str'), ('hey!', 'Shout'), ('ÉTÉ', 'str'), ('yo!', 'Shout'), ('X,Y', 'str'), ('PAD', 'str'), ('hey!', 'Shout'), ('ÉTÉ', 'str'), ('yo!', 'Shout'), ('X,Y', 'str')]
+hash 3000
+rebound 3000 True
+heap (167751, 2000, [310, 336, 337, 337, 337], 310)
+bisect (10292780, [0, 0, 0, 0, 0, 0, 0, 0], [256, 256, 256])
+sqrt math domain error
+sqrt (109516.075075, 1)
+wrong ['TypeError', 'TypeError', 'TypeError', 'TypeError']

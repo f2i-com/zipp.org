@@ -702,6 +702,35 @@ impl<'p> Vm<'p> {
         slot
     }
 
+    /// Whether the cache entry of the [`Instr::PyCall`] at `ip` names a
+    /// record whose entry for the count is a native right now (a builtin, a
+    /// str method: [`PyCallee::Other`], called where it is with no frame).
+    /// A site that has not run, one holding a plain Python callee (`c` set,
+    /// see [`Vm::py_call_target`]) and one whose record has changed answer
+    /// `false`. For the native tiers' call-bound gate, which reads it as a
+    /// hint (`codegen::set_py_native_calls`).
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn py_call_site_native(&self, func_id: u32, ip: usize) -> bool {
+        let e = self.py_ic(func_id, ip);
+        let f = Value::from_bits(e.a);
+        if e.kind != ic::CALL_ENTRY || e.c != 0 || !f.is_heap() {
+            return false;
+        }
+        let fi = f.heap_index();
+        if self.heap.version_of(fi) != e.hver {
+            return false;
+        }
+        let HeapObj::Object(m) = self.heap.get(fi) else {
+            return false;
+        };
+        let pos = e.pos as usize;
+        if pos >= m.len() || m.is_accessor_at(pos) {
+            return false;
+        }
+        let entry = m.val_at(pos);
+        entry.is_heap() && matches!(self.heap.get(entry.heap_index()), HeapObj::Native(_))
+    }
+
     /// The parameters a [`Instr::PyCall`] left unbound in the frame just
     /// pushed (`argc` of the code object `fid`'s), bound to `f`'s defaults
     /// as its prologue binds them (the last `len` positionals take
