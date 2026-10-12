@@ -722,6 +722,8 @@ pub(crate) fn region_op_admitted(
         // receiver/reference — same completion/deopt protocol via their
         // respective exact-call helpers.
         Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
+        // `new F(…)`: the construct helper, with the call protocol.
+        Instr::New { .. } => {}
         // Logical `!` — MEM path (Bool flips natively; anything else goes
         // through the `jit_truthy` helper).
         Instr::Not { .. } => {}

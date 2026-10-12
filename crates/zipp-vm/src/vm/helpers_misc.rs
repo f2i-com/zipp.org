@@ -1007,6 +1007,28 @@ pub(crate) extern "win64" fn jit_call_ic(
     })
 }
 
+/// Win64 helper for `new F(args…)` (`New`) in a compiled region or Tier C
+/// body: `construct` on the callee and the arguments in the caller's window,
+/// exactly as the interpreter's `New` runs it. r9 = (callee_reg<<16)|arg_base;
+/// the result/deopt/throw protocol is [`jit_call_ic`]'s, and so is the call
+/// site's refetch (a constructor runs user code).
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_new_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_new_impl(caller_base_ptr, packed_args, argc as u16)
+    })
+}
+
 /// Win64 helper for a captured-reference `CallWithThis`: resolve the exact
 /// callable held in `callee_reg` through the ordinary call IC, and invoke it
 /// with the exact value held in `this_reg`. No property name or receiver shape

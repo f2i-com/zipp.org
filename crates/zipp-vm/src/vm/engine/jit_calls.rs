@@ -1009,6 +1009,39 @@ impl<'p> Vm<'p> {
         self.jit_frame_call(fid, closure, recv, base, arg_base, argc, ip, callee)
     }
 
+    /// The implementation behind `jit_new_ic`: the interpreter's `New` for a
+    /// compiled caller. The callee and arguments are read from the caller's
+    /// window, which stays the GC root for them (the argument `Vec` is a copy,
+    /// as the interpreter's is). `SELF_CALL_DEOPT` only at the region call
+    /// depth cap, before anything ran; a throw is `CALL_THREW`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_new_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+        argc: u16,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;
+        let arg_base = (packed_args & 0xFFFF) as u16;
+        let cv = self.get(base, callee_reg);
+        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        self.jit_call_depth += 1;
+        let r = self.construct(cv, &args);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// The implementation behind the region call helpers `jit_call_method_ic` /
     /// `jit_call_ic` / `jit_call_with_this_ic` (`call_kind`: 0 plain, 1 legacy
     /// method lookup, 2 captured callee + explicit receiver). A compiled OSR

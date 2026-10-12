@@ -3391,6 +3391,32 @@ pub(crate) fn compile_region_mem(
                     dynasm!(ops ; => cross_done);
                 }
             }
+            Instr::New {
+                dst,
+                callee,
+                arg_base,
+                argc,
+            } => {
+                // `new F(args…)`: the interpreter's construction through
+                // `jit_new_ic`, with the call protocol (a throw bails, the
+                // constructor ran user code so everything is refetched).
+                // Without it a loop that constructed was not compiled at all.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let packed_args = ((callee as u64) << 16) | arg_base as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_new_ic as usize,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
             Instr::RegExpMethod {
                 dst,
                 op,

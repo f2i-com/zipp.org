@@ -2143,6 +2143,8 @@ fn plan_region_cold_inner(
         // element is a VTy::Num xmm home; receiver/index handled specially below).
         match *instr {
             Instr::Call { .. } => decline!("Call"),
+            // A constructor runs arbitrary user code, as a call does.
+            Instr::New { .. } => decline!("New"),
             // The computed-call helper can run arbitrary user code after its
             // pure dense-slot guard succeeds. Keep it off every register tier;
             // the boxed MEMORY emitter owns the helper/refetch protocol.

@@ -1280,6 +1280,8 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // carries its receiver explicitly and never re-resolves a member
             // name in native code.
             Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
+            // `new F(…)`: the construct helper, with the call protocol.
+            Instr::New { .. } => {}
             // Proper-tail-call PREFIX: the compiler always emits `TailCall`
             // immediately before an ordinary `Call`+`Return` of the same site
             // (compile/bindings.rs, compile/exprs.rs), and the interpreter's
@@ -1692,6 +1694,12 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 ..
             } => (Uses::range(arg_base, argc).plus(callee), Some(dst)),
             Instr::Call {
+                dst,
+                callee,
+                arg_base,
+                argc,
+            }
+            | Instr::New {
                 dst,
                 callee,
                 arg_base,
@@ -5774,6 +5782,30 @@ pub(crate) fn compile_proto_mem(
                 if cross {
                     dynasm!(ops ; => cross_done);
                 }
+            }
+            Instr::New {
+                dst,
+                callee,
+                arg_base,
+                argc,
+            } => {
+                // `new F(args…)` through `jit_new_ic`, with the call
+                // protocol; see the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed_args = ((callee as u64) << 16) | arg_base as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_new_ic as usize,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    dst,
+                    refetch,
+                    None,
+                );
             }
             Instr::RegExpMethod {
                 dst,
