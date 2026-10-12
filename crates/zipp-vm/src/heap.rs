@@ -3416,8 +3416,10 @@ impl JsStr {
         }
     }
 
-    /// The empty string, without an allocation or a scan: what an in-place
-    /// append leaves in a slot while it holds the accumulator.
+    /// The empty string, without an allocation or a scan. (The in-place
+    /// appends that used it as a placeholder borrow two slots at once now:
+    /// `Heap::append_str_slot`.)
+    #[cfg(test)]
     #[inline]
     pub fn empty() -> JsStr {
         JsStr {

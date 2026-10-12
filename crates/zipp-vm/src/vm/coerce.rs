@@ -1844,38 +1844,24 @@ impl<'p> Vm<'p> {
                     return self.add_values_right_pair(a, b, c);
                 }
                 let ai = a.heap_index();
-                let taken = std::mem::replace(
-                    self.heap.get_mut(ai),
-                    HeapObj::Str(crate::heap::JsStr::empty()),
-                );
-                let mut out = match taken {
-                    HeapObj::Str(s) => s,
-                    other => {
-                        *self.heap.get_mut(ai) = other;
-                        return self.add_values_right_pair(a, b, c);
-                    }
-                };
-                // `b` and a string `c` were found flat and ASCII above.
-                let empty = crate::heap::JsStr::empty();
-                let bs = match self.heap.get(b.heap_index()) {
-                    HeapObj::Str(s) => s,
-                    _ => &empty,
-                };
+                // Both pieces were found flat and ASCII above, at slots other
+                // than the accumulator's (`distinct`), so each append below
+                // borrows two slots at once (`Heap::append_str_slot`) instead
+                // of moving the accumulator out of its slot and back.
+                if let HeapObj::Str(out) = self.heap.get_mut(ai) {
+                    out.reserve_bytes(add_len);
+                }
+                let appended_b = self.heap.append_str_slot(ai, b.heap_index());
+                debug_assert!(appended_b, "b was checked to be a flat string");
                 if c.is_int() {
                     let (digits, start) = fmt_i32_buf(c.as_int());
-                    out.reserve_bytes(bs.as_bytes().len() + digits.len() - start);
-                    out.push_js(bs);
-                    out.push_wtf8(&digits[start..]);
+                    if let HeapObj::Str(out) = self.heap.get_mut(ai) {
+                        out.push_wtf8(&digits[start..]);
+                    }
                 } else {
-                    let cs = match self.heap.get(c.heap_index()) {
-                        HeapObj::Str(s) => s,
-                        _ => &empty,
-                    };
-                    out.reserve_bytes(bs.as_bytes().len() + cs.as_bytes().len());
-                    out.push_js(bs);
-                    out.push_js(cs);
+                    let appended_c = self.heap.append_str_slot(ai, c.heap_index());
+                    debug_assert!(appended_c, "c was checked to be a flat string");
                 }
-                *self.heap.get_mut(ai) = HeapObj::Str(out);
                 pairstats::in_place();
                 return Ok(a);
             }
