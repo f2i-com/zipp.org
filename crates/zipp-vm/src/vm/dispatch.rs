@@ -1585,12 +1585,63 @@ impl<'p> Vm<'p> {
                     }
                     // The Python frontend's fused fast paths: one out-of-line
                     // step (see `py_ops`), so this loop's own code is unchanged.
+                    //
+                    // The arithmetic and comparison instructions on two small
+                    // ints (the operands of nearly every one a program runs)
+                    // are settled here, with what the step answers for them
+                    // (`py_ops`' inline forms); anything else takes the step,
+                    // and so does every one under `ZIPP_PY_PROF`, which
+                    // counts in the step.
                     #[cfg(feature = "python")]
-                    Instr::PyArith { .. }
-                    | Instr::PyAddImm { .. }
-                    | Instr::PyCompare { .. }
-                    | Instr::PyJumpCompare { .. }
-                    | Instr::PyClassOf { .. }
+                    Instr::PyArith { op, dst, a, b, .. } => {
+                        match super::py_ops::py_small_int_arith(op, self.get(base, a), self.get(base, b)) {
+                            Some(v) if !super::prof_py::on() => {
+                                self.set(base, dst, v);
+                                ip += 1;
+                            }
+                            _ => ip = self.py_step(func_id, base, ip, instr)?,
+                        }
+                    }
+                    #[cfg(feature = "python")]
+                    Instr::PyAddImm { dst, a, imm, .. } => {
+                        match super::py_ops::py_small_int_add_imm(self.get(base, a), imm) {
+                            Some(v) if !super::prof_py::on() => {
+                                self.set(base, dst, v);
+                                ip += 1;
+                            }
+                            _ => ip = self.py_step(func_id, base, ip, instr)?,
+                        }
+                    }
+                    #[cfg(feature = "python")]
+                    Instr::PyCompare { op, dst, a, b, .. } => {
+                        match super::py_ops::py_small_int_compare(op, self.get(base, a), self.get(base, b)) {
+                            Some(r) if !super::prof_py::on() => {
+                                self.set(base, dst, Value::bool(r));
+                                ip += 1;
+                            }
+                            _ => ip = self.py_step(func_id, base, ip, instr)?,
+                        }
+                    }
+                    #[cfg(feature = "python")]
+                    Instr::PyJumpCompare { op, a, b, when, target, .. } => {
+                        match super::py_ops::py_small_int_compare(op, self.get(base, a), self.get(base, b)) {
+                            Some(r) if !super::prof_py::on() => {
+                                if r == when {
+                                    // A loop back-edge polls the GC, as the
+                                    // step does (and as `Jump` does).
+                                    if (target as usize) < ip {
+                                        self.maybe_gc();
+                                    }
+                                    ip = target as usize;
+                                } else {
+                                    ip += 1;
+                                }
+                            }
+                            _ => ip = self.py_step(func_id, base, ip, instr)?,
+                        }
+                    }
+                    #[cfg(feature = "python")]
+                    Instr::PyClassOf { .. }
                     | Instr::PyDictGet { .. }
                     | Instr::PyDictSet { .. }
                     | Instr::PyCallEntry { .. }
@@ -1685,6 +1736,18 @@ impl<'p> Vm<'p> {
                         } else if va.is_double() {
                             Value::num(va.as_f64() + imm as f64)
                         } else {
+                            // A small (immediate) BigInt under `upd` whose sum
+                            // is one too: the counter of a Python `for` over
+                            // a range, every iteration. What `bigint_op`
+                            // answers below, without ToNumeric and the call.
+                            #[cfg(feature = "python")]
+                            if upd {
+                                if let Some(v) = va.small_bigint_val().and_then(|n| Value::small_bigint(n as i128 + imm as i128)) {
+                                    self.set(base, dst, v);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                             // ToNumeric the operand once, then branch on its type.
                             let p = self.numeric_prim(va)?;
                             if let Some(b) = self.bigint_val(p) {
@@ -4784,6 +4847,21 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Instr::JumpIfNotLt { a, b, target } => {
+                        // Two small (immediate) BigInts: the bound test of a
+                        // Python `for` over a range, every iteration. What
+                        // `cmp_lt` answers for them, without the call.
+                        #[cfg(feature = "python")]
+                        {
+                            let (va, vb) = (self.get(base, a), self.get(base, b));
+                            if va.is_small_bigint() && vb.is_small_bigint() {
+                                if va.as_small_bigint() < vb.as_small_bigint() {
+                                    ip += 1;
+                                } else {
+                                    ip = target as usize;
+                                }
+                                continue;
+                            }
+                        }
                         let r = self.cmp_lt(base, a, b, true)?;
                         if !r {
                             ip = target as usize;

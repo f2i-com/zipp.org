@@ -2135,6 +2135,7 @@ impl<'p> Vm<'p> {
 /// it for ints, in i64 (none of these can overflow i64 except a product,
 /// which is checked); `None` for true division, a zero divisor and an
 /// overflowing product, which take `py_arith`'s general path.
+#[inline(always)]
 fn py_small_arith(op: PyArithOp, x: i64, y: i64) -> Option<i64> {
     Some(match op {
         PyArithOp::Add => x + y,
@@ -2153,6 +2154,35 @@ fn py_small_arith(op: PyArithOp, x: i64, y: i64) -> Option<i64> {
         }
         _ => return None,
     })
+}
+
+// ---- the interpreter's inline forms -------------------------------------
+//
+// The dispatch loop settles the three commonest operand shapes of the
+// arithmetic and comparison instructions itself, without the call into
+// `Vm::py_step`: two small (immediate) ints whose result is one too. Each
+// answers exactly what the step's own helper answers for those operands
+// (`py_arith`, `py_add_imm`, `py_compare`), and `None` for everything else,
+// which then takes the step.
+
+/// [`Vm::py_arith`] for two small ints with a small result.
+#[inline(always)]
+pub(super) fn py_small_int_arith(op: PyArithOp, va: Value, vb: Value) -> Option<Value> {
+    let (x, y) = (va.small_bigint_val()?, vb.small_bigint_val()?);
+    Value::small_bigint(py_small_arith(op, x, y)? as i128)
+}
+
+/// [`Vm::py_add_imm`] for a small int with a small result.
+#[inline(always)]
+pub(super) fn py_small_int_add_imm(va: Value, imm: i32) -> Option<Value> {
+    Value::small_bigint(va.small_bigint_val()? as i128 + imm as i128)
+}
+
+/// [`Vm::py_compare`] for two small ints.
+#[inline(always)]
+pub(super) fn py_small_int_compare(op: PyCmpOp, va: Value, vb: Value) -> Option<bool> {
+    let (x, y) = (va.small_bigint_val()?, vb.small_bigint_val()?);
+    Some(order_holds(op, x.cmp(&y)))
 }
 
 fn big_op(op: PyArithOp) -> BigOp {
