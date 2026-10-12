@@ -165,13 +165,24 @@ jobs:
         run: node -e 'if (Number(process.versions.node.split(".")[0]) !== 24 || typeof Float16Array !== "function") throw Error("Native parity tests require Node 24 with Float16Array"); console.log(process.version)'
       - name: Validate and print the test quarantine
         run: python3 tools/ci_quarantine.py --check --print
+      # A release dispatched from main gates its tag with this file, and a tag
+      # from before the split has no shard tool: there shard 0 runs the whole
+      # suite unsharded, as this job did, and the other shards pass empty.
       - name: Test the root native workspace (this shard)
         env:
           RUSTUP_TOOLCHAIN: ${{ env.TOOLCHAIN }}
         run: |
           set -euo pipefail
-          python3 tools/ci_test_shard.py --check 3
-          targets="$(python3 tools/ci_test_shard.py ${{ matrix.shard }} 3)"
+          if [[ -f tools/ci_test_shard.py ]]; then
+            python3 tools/ci_test_shard.py --check 3
+            targets="$(python3 tools/ci_test_shard.py ${{ matrix.shard }} 3)"
+          elif [[ "${{ matrix.shard }}" == 0 ]]; then
+            echo "no tools/ci_test_shard.py at this revision: shard 0 runs the whole workspace"
+            targets=""
+          else
+            echo "no tools/ci_test_shard.py at this revision: shard 0 runs the whole workspace"
+            exit 0
+          fi
           skips="$(python3 tools/ci_quarantine.py --emit-skips)"
           # shellcheck disable=SC2086
           cargo test --locked --workspace --no-fail-fast $targets -- $skips

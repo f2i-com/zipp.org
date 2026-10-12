@@ -260,11 +260,14 @@ jobs:
         run: python3 tools/ci_quarantine.py --check --print
       # The quarantine tool's own tests belong here too: the step above trusts
       # `--check`, and `--emit-skips` decides what the broad suite skips.
+      # The shard tool's tests where the revision has it: a release dispatched
+      # from main gates a tag with this file, and an older tag has no tool.
       - name: Test Test262 scoring, the failure gate and the quarantine tool
-        run: >-
-          python3 -B -m unittest
-          tools.test_run_test262 tools.test_run_test262_dual tools.test_ci_quarantine
-          tools.test_ci_test_shard
+        run: |
+          shard_tests=""
+          if [[ -f tools/test_ci_test_shard.py ]]; then shard_tests="tools.test_ci_test_shard"; fi
+          # shellcheck disable=SC2086
+          python3 -B -m unittest tools.test_run_test262 tools.test_run_test262_dual tools.test_ci_quarantine $shard_tests
       - name: Unit tests and the audit-day regressions (default profile)
         run: >-
           cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast
