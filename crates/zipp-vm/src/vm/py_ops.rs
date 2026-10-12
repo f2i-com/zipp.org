@@ -921,7 +921,7 @@ impl<'p> Vm<'p> {
     /// `vm::py_rt`).
     #[cold]
     #[inline(never)]
-    fn py_step_failed(&mut self, ip: usize) {
+    pub(super) fn py_step_failed(&mut self, ip: usize) {
         if let Some(f) = self.frames.last_mut() {
             f.ip = ip;
         }

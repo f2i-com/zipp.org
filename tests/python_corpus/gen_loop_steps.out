@@ -1,0 +1,9 @@
+plain 2997000
+inside (106200, 60, 'at 60')
+outside outside at 5997
+broken (4501500, 13495500, 0)
+finals (35994000, ['closed 6000', 'closed 5'])
+reenter [1, 'generator already executing', 3]
+walk 1830 [0, 1, 2, 3, 4] 151
+mixed (11342, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [7, 8, 'a', 'b'])
+genexp 35994000 5999 [0, 0, 0, 0, 0, 0, 0, 0]

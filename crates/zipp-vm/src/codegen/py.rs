@@ -922,6 +922,13 @@ pub(crate) fn emit_py_op(
             let h = crate::vm::Vm::jit_py_make_exc as usize;
             emit_py_value_call(ops, h, [V::Reg(cls), V::Reg(args), V::Reg(rt), V::None], dst, labels, refetch);
         }
+        // A generator's step (a `for` over a generator, every iteration):
+        // through `Vm::jit_py_gen_next`, which resumes it as the step does.
+        // Its bail answer covers a raise in the body and a nesting too deep.
+        Instr::PyGenNext { dst, next, this, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_gen_next as usize;
+            emit_py_value_call(ops, h, [V::Reg(next), V::Reg(this), V::Imm(ip as u64), V::None], dst, labels, refetch);
+        }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
         // when the body's plan has the site; the ordinary step otherwise.
         Instr::PyGetAttr { .. } | Instr::PySetAttr { .. } => {

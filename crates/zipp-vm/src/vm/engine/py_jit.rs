@@ -420,6 +420,43 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `PyGenNext` from compiled code: the step's arm over the operands'
+    /// bits (`next`, the generator's step function, and `this`, its
+    /// record), for the instruction at `ip` of the running frame. The
+    /// yielded value's bits (the STOP sentinel when it finished);
+    /// `PY_SLOW_BITS` for the `slow` edge (`next` is not the native step);
+    /// `CALL_THREW` when the body raised (the exception pending, the frame's
+    /// ip the instruction's, as the step leaves it), and also, with nothing
+    /// pending and nothing run, when compiled code's calls are nested too
+    /// deep: the emitted code bails on it either way, and a bail with
+    /// nothing pending resumes the interpreter at the instruction. The
+    /// resume runs guest code on a nested interpreter loop, so it is bounded
+    /// and exempted exactly as `jit_py_op` bounds a guest instruction.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_gen_next(vm: *mut core::ffi::c_void, next: u64, this: u64, ip: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        if vm.jit_call_depth >= JIT_REGION_CALL_MAX {
+            vm.osr_deopt_exempt = true;
+            return crate::codegen::CALL_THREW;
+        }
+        let nv = Value::from_bits(next);
+        if !nv.is_heap() || !matches!(vm.heap.get(nv.heap_index()), HeapObj::Native(id) if *id == crate::vm::native::PY_GEN) {
+            return crate::codegen::PY_SLOW_BITS;
+        }
+        vm.jit_call_depth += 1;
+        let r = vm.py_gen_next(Value::from_bits(this));
+        vm.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => {
+                vm.py_step_failed(ip as usize);
+                vm.osr_deopt_exempt = true;
+                vm.jit_thrown_to_sentinel(t)
+            }
+        }
+    }
+
     /// `PySetItem` from compiled code: `py_set_item` over the registers the
     /// instruction names in the window at `regs` (`packed` = `o | k << 16 |
     /// v << 32 | seq << 48`, then `dict`), the step's own answer without
