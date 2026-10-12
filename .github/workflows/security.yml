@@ -112,12 +112,23 @@ jobs:
           node --no-warnings --test bench/comparison/test_run_wasm_suites.mjs
 
   native-workspace:
-    name: Native workspace tests
+    name: Native workspace tests (shard ${{ matrix.shard }} of 3)
     if: ${{ !inputs.skip_heavy }}
     # The full native workspace is the expensive lane: on demand and at
     # release (there is no schedule while automatic CI is paused).
+    #
+    # Three shards side by side (tools/ci_test_shard.py): together they build
+    # and run exactly the test executables `cargo test --workspace` does
+    # (checked locally, 359 of 359), each keeping `--workspace` so features
+    # unify as they did, and `--check` fails a shard if the split ever misses
+    # a target. As one job at level 1 the suite took 16 minutes, 5 compiling
+    # and 10.5 running 365 binaries one after another.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 60
     # Hundreds of debug test executables otherwise duplicate full VM/parser
     # symbols and can exhaust the hosted runner during linking: omit
     # debugging metadata.
@@ -154,13 +165,25 @@ jobs:
         run: node -e 'if (Number(process.versions.node.split(".")[0]) !== 24 || typeof Float16Array !== "function") throw Error("Native parity tests require Node 24 with Float16Array"); console.log(process.version)'
       - name: Validate and print the test quarantine
         run: python3 tools/ci_quarantine.py --check --print
-      - name: Test the root native workspace
+      - name: Test the root native workspace (this shard)
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.TOOLCHAIN }}
+        run: |
+          set -euo pipefail
+          python3 tools/ci_test_shard.py --check 3
+          targets="$(python3 tools/ci_test_shard.py ${{ matrix.shard }} 3)"
+          skips="$(python3 tools/ci_quarantine.py --emit-skips)"
+          # shellcheck disable=SC2086
+          cargo test --locked --workspace --no-fail-fast $targets -- $skips
+      - name: Test the root workspace's doc tests
+        if: ${{ matrix.shard == 0 }}
         run: |
           set -euo pipefail
           skips="$(python3 tools/ci_quarantine.py --emit-skips)"
           # shellcheck disable=SC2086
-          cargo +${{ env.TOOLCHAIN }} test --locked --workspace --no-fail-fast -- $skips
+          cargo +${{ env.TOOLCHAIN }} test --locked --workspace --no-fail-fast --doc -- $skips
       - name: Test bounded backtracking executor limits
+        if: ${{ matrix.shard == 1 }}
         run: >-
           cargo +${{ env.TOOLCHAIN }} test --locked -p zipp-regress
           --features bounded-backtracking
@@ -179,9 +202,15 @@ jobs:
     defaults:
       run:
         shell: bash
+    # Optimized at level 1, as the native workspace job is: the CLI tests
+    # (10 of its 13 minutes) run scripts through the CLI, which is slow
+    # unoptimized. Debug assertions and overflow checks stay on; these tests
+    # pass at level 1 on Windows locally.
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -361,15 +390,21 @@ jobs:
       # The exact stripped web package inside real Workers, through the
       # reference host adapter (ZIPP-17): here on demand and at release,
       # locally before a push.
+      #
+      # The browsers run in Playwright's own image, pinned by digest, which
+      # carries them and the system libraries they load. On the runner,
+      # `npx playwright install --with-deps` fetched about 116 MB of packages
+      # from the Ubuntu mirrors on every run: a minute on a good day, and
+      # 17m43s at 109 kB/s on 12 October.
       - name: Run the Worker smoke test in Chromium, Firefox and WebKit
         run: |
           set -euo pipefail
           wasm-bindgen --target web --out-dir tests/browser/pkg \
             --remove-name-section --remove-producers-section \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
-          npm install --no-save --no-audit --no-fund playwright@1.63.0
-          npx playwright install --with-deps chromium firefox webkit
-          node tests/browser/worker-smoke.mjs --browsers chromium,firefox,webkit
+          docker run --rm --ipc=host -v "$PWD:/crate" -w /crate \
+            mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27 \
+            sh -c 'npm install --no-save --no-audit --no-fund playwright@1.63.0 && node tests/browser/worker-smoke.mjs --browsers chromium,firefox,webkit'
 
   test262:
     name: Pinned Test262 conformance
@@ -405,19 +440,23 @@ jobs:
           PY
       - name: Test conformance scoring and corpus provenance checks
         run: python3 -m unittest discover -s tools -p 'test_run_test262*.py'
+      # Four jobs on the runner's four processors. At two, the run of both
+      # corpora (the upstream one and the corrected one, 95,680 executions
+      # each) took 13.8 of the job's 17 minutes; the 120-second timeout per
+      # test is unchanged.
       - name: Report upstream and require all documented corrected tests to pass
         run: >-
           python3 tools/run_test262_dual.py
           --t262 target/test262
           --corrected-tree target/test262-corrected
           --zipp target/release/zipp
-          --jobs 2 --timeout 120
+          --jobs 4 --timeout 120
           --output-dir target/test262-evidence
       - name: Require the original DateTimeFormat ECMA-402 tests to pass
         run: >-
           python3 tools/run_test262.py --t262 target/test262
           --sub test/intl402/DateTimeFormat --include-intl402
-          --zipp target/release/zipp --jobs 2 --timeout 120
+          --zipp target/release/zipp --jobs 4 --timeout 120
           --dump-fails target/test262-evidence/datetimeformat-failures.txt
           --json target/test262-evidence/datetimeformat.json
       - name: Upload the conformance evidence

@@ -60,14 +60,27 @@ env:
   WASM_BINDGEN_CLI: "0.2.126"
 
 jobs:
-  # The Python lanes are two jobs that run side by side: the native tests here,
-  # the browser artifact and what loads it in `python-wasm`. As one job they
-  # took 49 minutes, 34 of them in the native tests and 14 building the
-  # artifact.
+  # The Python lanes run side by side: the native tests in three groups
+  # (`python`), and the browser artifacts in three (`python-wasm`). As one
+  # job they took 49 minutes, 34 in the native tests and 14 building the four
+  # browser modules one after another; as two, 15.
   python:
-    name: Python frontend and project files
+    name: Python native tests (${{ matrix.group }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # One group a build of zipp-vm: each feature set compiles it again.
+        group: [vm, feature-variants, cli-gpu-parser]
+    # Optimized at level 1, as security.yml's native workspace job is: the
+    # torch and JIT tests are slow unoptimized, and the level changes no
+    # result. Debug assertions and overflow checks stay on; no debug info.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,21 +91,20 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      # Optimized at level 1, as security.yml's native workspace job is: the
-      # torch and JIT tests are slow unoptimized, and the level changes no
-      # result. Debug assertions and overflow checks stay on; no debug info.
-      - name: Test the Python-enabled VM and CLI (including filesystem policy)
-        env:
-          CARGO_PROFILE_TEST_DEBUG: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_OPT_LEVEL: "1"
-          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      - name: Test the Python-enabled VM (including filesystem policy)
+        if: ${{ matrix.group == 'vm' }}
         run: |
           cargo +1.92.0 test --locked -p zipp-vm --features python --test python_frontend --test python_project --test python_corpus --test python_torch --test python_javascript --test python_torch_core --test python_torch_nn --test python_torch_optim --test python_torch_gpu --test python_torch_native --test python_torch_gpu2 --test python_torch_nn2 --test python_torch_dtypes --test python_torch_linalg --test python_torch_distributions --test python_torch_amp --test python_torch_nn3 --test python_torch_gpu3 --test python_torch_complex --test python_torch_fft --test python_torch_sparse --test python_torch_quant --test python_torch_distributed --test python_lazy_import --test python_native_s1 --test python_ic_key_reuse
-          cargo +1.92.0 test --locked -p zipp-vm --features python-js-interop --test python_javascript
           cargo +1.92.0 test --locked -p zipp-vm --features python --lib _check
           cargo +1.92.0 test --locked -p zipp-vm --features python --test python_packages
+      - name: Test the JavaScript interop and torch-free builds
+        if: ${{ matrix.group == 'feature-variants' }}
+        run: |
+          cargo +1.92.0 test --locked -p zipp-vm --features python-js-interop --test python_javascript
           cargo +1.92.0 test --locked -p zipp-vm --no-default-features --features python-no-torch --lib --test python_packages --test python_frontend --test python_project
+      - name: Test the CLI and the native GPU host
+        if: ${{ matrix.group == 'cli-gpu-parser' }}
+        run: |
           cargo +1.92.0 test --locked -p zipp-cli
           cargo +1.92.0 test --locked -p zipp-gpu
       # ZIPP's Python front end (crates/zipp-pyparse): whatever the runner's
@@ -101,14 +113,25 @@ jobs:
       # CPython Lib, it accepts with CPython's `ast` tree; syntax errors keep
       # the messages and offsets recorded in tests/golden. See its README.
       - name: Test ZIPP's Python front end against CPython
+        if: ${{ matrix.group == 'cli-gpu-parser' }}
         working-directory: crates/zipp-pyparse
         run: |
           cargo +1.92.0 test --locked --release -- --include-ignored --skip throughput
 
+  # The browser modules, a build of about three and a half minutes each (a
+  # release build and Binaryen's post-processing), in three jobs:
+  #   all      the complete module, its Node tests, then everything that loads
+  #            `dist/all`: the numeric kernels, the GPU contracts, the plugins
+  #   plugin   Python without torch plus the torch package, against `all`
+  #   interop  the JavaScript-interop build and its test
   python-wasm:
-    name: Python browser artifact, GPU contracts and plugins
+    name: Python browser artifact (${{ matrix.part }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [all, plugin, interop]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,12 +146,14 @@ jobs:
           node-version: 24
       # build-variants.sh post-processes every module with optimize-wasm.sh,
       # which refuses any Binaryen but the one the sizes were measured with.
-      - name: Install the measured WASM optimizer
-        run: npm install --global binaryen@125.0.0
-      - name: Build the Python-enabled browser artifact
+      - name: Install the measured WASM optimizer and wasm-bindgen
+        run: |
+          npm install --global binaryen@125.0.0
+          cargo +1.92.0 install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
+      - name: Build the complete Python browser artifact and test it under Node
+        if: ${{ matrix.part == 'all' }}
         working-directory: crates/zipp-wasm
         run: |
-          cargo +1.92.0 install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
           export ZIPP_SOURCE_SHA="$(git rev-parse HEAD)"
           ./build-variants.sh all
           wasm-bindgen --target nodejs --out-dir tests/node/pkg target/variants/all/wasm32-unknown-unknown/release/zipp_wasm.wasm
@@ -138,12 +163,22 @@ jobs:
           node tests/node/python-conv2d.cjs
           node tests/node/python-training.cjs
           node tests/node/python-javascript.cjs
-          # Python without torch, plus torch as a separately loaded package
-          # (zipp_torch.wasm): identical output to the prebundled `all` build.
-          ./build-variants.sh python torch
+      # Python without torch, plus torch as a separately loaded package
+      # (zipp_torch.wasm): identical output to the prebundled `all` build.
+      - name: Test Python plus the torch package against the complete build
+        if: ${{ matrix.part == 'plugin' }}
+        working-directory: crates/zipp-wasm
+        run: |
+          export ZIPP_SOURCE_SHA="$(git rev-parse HEAD)"
+          ./build-variants.sh all python torch
           wasm-bindgen --target nodejs --out-dir /tmp/pkg-all target/variants/all/wasm32-unknown-unknown/release/zipp_wasm.wasm
           wasm-bindgen --target nodejs --out-dir /tmp/pkg-python target/variants/python/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/python-plugin.cjs /tmp/pkg-all /tmp/pkg-python
+      - name: Build the JavaScript-interop artifact and test it
+        if: ${{ matrix.part == 'interop' }}
+        working-directory: crates/zipp-wasm
+        run: |
+          export ZIPP_SOURCE_SHA="$(git rev-parse HEAD)"
           ./build-variants.sh interop
           wasm-bindgen --target nodejs --out-dir tests/node/pkg target/variants/interop/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/python-javascript.cjs --enabled
@@ -154,19 +189,21 @@ jobs:
       # and on which OS it was built are not part of it; what is left is the
       # source, the lock file and the toolchain.
       - name: Rebuild the numeric kernels and check the committed binary is theirs
+        if: ${{ matrix.part == 'all' }}
         working-directory: crates/zipp-wasm
         run: |
           RUSTUP_TOOLCHAIN=1.92.0 sh gpu-lab/scripts/build_wasm.sh
           git diff --exit-code --stat -- gpu-lab/wasm/kernels.wasm
       - name: Test portable GPU contracts and Python graph authoring
+        if: ${{ matrix.part == 'all' }}
         working-directory: crates/zipp-wasm/gpu-lab
         run: |
           npm test
           python3 tests/test_python.py
-      # The local-model plugins, against the `dist/all` artifact the step above
-      # built. ZIPP_REQUIRE_INTEGRATION=1 turns the full-checkout gates from
-      # skips into failures: without it a missing engine reads as a pass, which
-      # is exactly the shape of "it was green and nothing ran".
+      # The local-model plugins, against the `dist/all` artifact the build
+      # step built. ZIPP_REQUIRE_INTEGRATION=1 turns the full-checkout gates
+      # from skips into failures: without it a missing engine reads as a pass,
+      # which is exactly the shape of "it was green and nothing ran".
       #
       # What this makes mandatory before a release: the plugin ABI and its
       # source-digest manifests, the Graph v2 graphs each plugin emits, the
@@ -177,6 +214,7 @@ jobs:
       # The suites that need a checkpoint on disk still skip: no weights are
       # redistributed here, and downloading a model per run buys little.
       - name: Test the local-model plugins against that engine
+        if: ${{ matrix.part == 'all' }}
         working-directory: crates/zipp-wasm/model-plugins
         run: ZIPP_REQUIRE_INTEGRATION=1 npm test
       # numpy to evaluate a plugin's graphs independently of ZIPP, safetensors
@@ -185,8 +223,10 @@ jobs:
       # and skip, so a reference comparison is a local exercise rather than a
       # dependency on a large download here.
       - name: Install what the plugin's Python tests evaluate graphs with
+        if: ${{ matrix.part == 'all' }}
         run: python3 -m pip install --break-system-packages numpy safetensors
       - name: Test the plugin architectures against NumPy
+        if: ${{ matrix.part == 'all' }}
         working-directory: crates/zipp-wasm/model-plugins
         run: npm run test:python
 
@@ -224,6 +264,7 @@ jobs:
         run: >-
           python3 -B -m unittest
           tools.test_run_test262 tools.test_run_test262_dual tools.test_ci_quarantine
+          tools.test_ci_test_shard
       - name: Unit tests and the audit-day regressions (default profile)
         run: >-
           cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast
