@@ -904,6 +904,7 @@ pub(crate) fn compile_proto(
         _buf: buf,
         entry: entry_ptr,
         self_binding,
+        int_tier: true,
     })
 }
 

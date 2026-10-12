@@ -1898,6 +1898,7 @@ pub(crate) fn compile_region_regalloc(
             _buf: buf,
             entry: entry_ptr,
             self_binding: None,
+            int_tier: false,
         },
         needs_ic,
     ))

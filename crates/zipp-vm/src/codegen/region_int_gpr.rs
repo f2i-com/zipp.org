@@ -4445,6 +4445,7 @@ pub(crate) fn compile_region_int_gpr(
         _buf: buf,
         entry: entry_ptr,
         self_binding: None,
+        int_tier: false,
     })
 }
 

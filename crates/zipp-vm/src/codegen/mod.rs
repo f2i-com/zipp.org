@@ -2898,6 +2898,12 @@ pub struct JitFn {
     /// `None` for a body with no self-call and for every Tier C / region / kernel
     /// compile, which resolve callees the ordinary way.
     self_binding: Option<(u32, u64)>,
+    /// The int tier (Tier A) compiled this whole-function body. Such a body
+    /// reads no captures and touches no frame's handler stack, so it can be
+    /// entered over a bare register window with no `Frame` and no activation
+    /// (the array builtins' callback window always has been); a Tier C body
+    /// says the same through its cross entry instead.
+    int_tier: bool,
 }
 
 impl JitFn {
@@ -2917,6 +2923,12 @@ impl JitFn {
     #[inline]
     pub fn self_binding(&self) -> Option<(u32, u64)> {
         self.self_binding
+    }
+
+    /// Whether the int tier compiled this whole-function body (see the field).
+    #[inline]
+    pub fn int_tier(&self) -> bool {
+        self.int_tier
     }
 
     /// Run the native code over `regs`. ABI: `(regs, bail_ip, vm) -> result`.

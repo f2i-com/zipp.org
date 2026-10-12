@@ -1079,8 +1079,9 @@ impl<'p> Vm<'p> {
     /// that names its closure, exactly as a compiled caller's native
     /// cross-call runs it (`jit_cross_call_impl`), with `this` already bound
     /// by the caller. `None`, with nothing done, unless every condition of
-    /// that call holds here: a body with a frame-free entry (Tier C, no
-    /// handler ops), no `arguments` object or rest array to build, not a
+    /// that call holds here: a body with a frame-free entry (Tier C with no
+    /// handler ops, or the int tier's), no `arguments` object or rest array
+    /// to build, not a
     /// construction or an eval frame, no direct-eval scope and no second
     /// realm alive, its direct global routes intact. A bail past the entry
     /// finishes the activation on the interpreter over the same window.
@@ -1119,7 +1120,22 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let (entry, _, _, _) = self.jit.cross_entry(fid)?;
+        // A Tier C body's frame-free entry, run under an activation; or an
+        // int-tier body, which needs neither a frame nor an activation and
+        // only its self-binding rechecked (`try_run_jit`).
+        let (entry, activate) = match self.jit.cross_entry(fid) {
+            Some((entry, _, _, _)) => (entry, true),
+            None => {
+                let body = self.jit.get(fid).filter(|body| body.int_tier())?;
+                let rebound = body.self_binding().is_some_and(|(slot, expect)| {
+                    self.globals.get(slot as usize).map(|v| v.bits()) != Some(expect)
+                });
+                if rebound {
+                    return None;
+                }
+                (body.entry(), false)
+            }
+        };
         let (callee_regs, params) = {
             let proto = self.func(fid as usize);
             if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
@@ -1134,9 +1150,18 @@ impl<'p> Vm<'p> {
         if self.regs_would_overflow(win + callee_regs) {
             return None;
         }
-        let upvals_raw = self.resolve_upvals_raw(closure);
-        // A full activation stack declines before any effect.
-        let token = self.enter_tierc_activation(closure, callee.heap_index(), true, upvals_raw)?;
+        // A full activation stack declines before any effect. An int-tier
+        // body has no activation to name its callee, and no frame: the
+        // callee is kept on the host root stack while its body runs (a
+        // getter can delete the property that was the only reference to it).
+        let rooted = self.host_result_roots.len();
+        let token = if activate {
+            let upvals_raw = self.resolve_upvals_raw(closure);
+            Some(self.enter_tierc_activation(closure, callee.heap_index(), true, upvals_raw)?)
+        } else {
+            self.host_result_roots.push(callee);
+            None
+        };
         // The whole window `undefined`, as a frame push leaves it.
         self.regs.resize(win + callee_regs, Value::UNDEFINED);
         self.bump_regs_hw(win + callee_regs);
@@ -1147,7 +1172,8 @@ impl<'p> Vm<'p> {
         }
         // The loop's safe point at a frame transition. The arguments are in
         // the window and the callee and its closure are the activation's
-        // roots; the collector moves nothing, so `upvals_raw` stays good.
+        // roots (an int-tier body's callee is on the host root stack); the
+        // collector moves nothing, so `upvals_raw` stays good.
         self.maybe_gc();
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
@@ -1165,7 +1191,10 @@ impl<'p> Vm<'p> {
             f(regs_ptr, &mut bail as *mut u32, vm_ptr)
         };
         self.run_loop_depth -= 1;
-        self.leave_tierc_activation(token);
+        if let Some(token) = token {
+            self.leave_tierc_activation(token);
+        }
+        self.host_result_roots.truncate(rooted);
         if bail == crate::codegen::NO_BAIL {
             self.regs.truncate(win);
             return Some(Ok(Value::from_bits(bits)));

@@ -6389,5 +6389,6 @@ pub(crate) fn compile_proto_mem(
         _buf: buf,
         entry: entry_ptr,
         self_binding: None,
+        int_tier: false,
     })
 }
