@@ -8249,6 +8249,43 @@ impl Heap {
     /// live reference remains. Never call on a pinned built-in slot.
     #[inline]
     pub fn free_slot(&mut self, idx: u32) {
+        // A dead promise whose subscriber list never reached the heap, and
+        // the resolver records beside it, own nothing: no buffer to pool or
+        // ship, no cold mirror, nothing to drop. The general path below
+        // still moved each one's 80 bytes out of its slot and called the
+        // enum's drop glue on the copy, a third of what it cost to sweep the
+        // three million promises of a `Promise.all` benchmark.
+        if matches!(
+            &self.objs[idx as usize],
+            HeapObj::Promise {
+                reactions: Reactions::None | Reactions::One(_),
+                ..
+            } | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. }
+        ) {
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            {
+                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+            }
+            if self.payload_accounting.get() {
+                let payload = self.resident_payload_charged[idx as usize].replace(0);
+                self.resident_payload_current
+                    .set(self.resident_payload_current.get().saturating_sub(payload));
+            }
+            // Nothing in the matched variants has a destructor, so forgetting
+            // the old occupant leaks nothing and the write is the tombstone's
+            // tag and payload alone.
+            std::mem::forget(std::mem::replace(
+                &mut self.objs[idx as usize],
+                HeapObj::Date(f64::NAN),
+            ));
+            self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+            if self.nursery {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+            self.free.push(idx);
+            return;
+        }
         // B187 stage 3: capture the recycle signal BEFORE the mirror clears.
         // A settled (non-DICT) shape mirror means the occupant was born
         // finalized/appended and never structurally bumped without repair —
