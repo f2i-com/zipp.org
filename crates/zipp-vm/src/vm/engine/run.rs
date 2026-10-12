@@ -1100,6 +1100,13 @@ impl<'p> Vm<'p> {
         closure: u32,
     ) -> Option<Result<Value, Thrown>> {
         if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
+            // A frame-free activation always has a frame under it: the
+            // compiled caller's, or the frame of the code that called the
+            // builtin. The helpers a native body calls rely on that (a frame
+            // call records the caller's resume point in the top frame). A job
+            // or a timer callback the host runs has none, and takes a frame
+            // of its own.
+            || self.frames.is_empty()
             || !self.jit_fused_ok()
             || self.jit_recurse_depth != 0
             || !self.pending_new_target.is_undefined()

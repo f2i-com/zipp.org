@@ -117,7 +117,22 @@ heat(function () { hooks(4); });
 log("hooks", hooks(4) + " # " + hooks(9));
 
 // 7. Promise reactions: chains of compiled callbacks, capturing and not, with throws.
-var pending = 2;
+var pending = 3;
+// A hot callback the host runs as a job, with no caller frame under it,
+// that calls a cold function, a native and a method late in its life.
+var hotCalls = 0, coldSeen = [];
+function cold(x) { coldSeen.push(x); return x * 2 + 1; }
+function hot(x) {
+  hotCalls++;
+  if (hotCalls === 900) return cold(x) + Math.max(x, 3) + [x, 1].indexOf(1);
+  if (hotCalls === 950) return cold(-x) + String(x).length;
+  return x + 1;
+}
+(function () {
+  var p = Promise.resolve(0);
+  for (var i = 0; i < 1000; i++) p = p.then(hot);
+  p.then(function (v) { log("host job calls out", v + " " + hotCalls + " " + coldSeen.join(",")); done(); });
+}());
 function done() { if (--pending === 0) console.log(out.join("\n")); }
 function chain(k) {
   var p = Promise.resolve(1), seen = [];
@@ -152,6 +167,7 @@ fn builtins_calling_compiled_functions_match_node() {
         r####"hooks: 4|{"g":-4}|9|o4|o4-o4|true|4 # 9|{"g":-9}|14|o9|o9-o9|true|4"####,
         r####"promise chain: -2,r-2,u,fin,9"####,
         r####"async: 1440 2240"####,
+        r####"host job calls out: -5441 1000 899,-2748"####,
         r####"promise chain 2: 2,r2,u,fin,9"####,
     ];
     let out = run(PROGRAM);
