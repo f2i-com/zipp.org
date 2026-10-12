@@ -1946,7 +1946,7 @@ pub struct Vm<'p> {
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on
     /// first access and cached here. For a class it carries the own methods +
     /// `constructor`; for a plain function just `constructor`.
-    prototypes: std::collections::HashMap<u32, u32>,
+    prototypes: crate::slot_table::SlotTable<u32>,
     /// Reverse of `prototypes` for CLASS values only: materialized prototype
     /// object → its class. Consulted (behind `ObjMap::class_proto`) when such a
     /// prototype is mutated; an entry is trusted only while `prototypes` still
@@ -2658,7 +2658,7 @@ pub struct Vm<'p> {
     /// `new.target` inside it must observe the enclosing function's. Only
     /// non-undefined values are recorded. GC traces the value from a reachable
     /// keyed closure; dead keys are pruned on sweep (mirrors `closure_home`).
-    closure_new_target: std::collections::HashMap<u32, Value>,
+    closure_new_target: crate::slot_table::SlotTable<Value>,
     /// Memoized final shape per `FinalizeObject` plan, keyed by (unified
     /// func id, plan index). The value is the exact fold of `shape::add` over
     /// the plan's keys with data attributes — what per-field appends would

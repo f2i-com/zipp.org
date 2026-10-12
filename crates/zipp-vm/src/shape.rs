@@ -152,7 +152,11 @@ struct Node {
     /// no edge matches; only a verified mismatch (an entry a colliding edge
     /// overwrote) falls back to the scan.
     next: Vec<(Box<str>, u8, u32)>,
-    index: Option<Box<std::collections::HashMap<u64, u32>>>,
+    /// Keyed by `edge_hash`, which is already a mixed 64-bit hash: an Fx
+    /// table, not the standard library's SipHash, which hashed it again on
+    /// every property add through a wide node (the root's first keys, a
+    /// class instance's first field) and was 3% of constructing objects.
+    index: Option<Box<rustc_hash::FxHashMap<u64, u32>>>,
 }
 
 struct Table {
@@ -325,7 +329,10 @@ pub fn add(from: u32, key: &str, bits: u8) -> u32 {
                 ix.insert(hash.unwrap_or_else(|| edge_hash(key, bits)), pos);
             }
             None if n.next.len() >= FANOUT_INDEX_AT => {
-                let mut ix = std::collections::HashMap::with_capacity(n.next.len() * 2);
+                let mut ix = rustc_hash::FxHashMap::with_capacity_and_hasher(
+                    n.next.len() * 2,
+                    Default::default(),
+                );
                 for (p, (k, b, _)) in n.next.iter().enumerate() {
                     ix.insert(edge_hash(k, *b), p as u32);
                 }
