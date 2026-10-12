@@ -185,8 +185,9 @@ impl CollIndex {
     fn with_capacity(n: usize) -> CollIndex {
         #[cfg(not(feature = "safe-sandbox"))]
         {
-            // Capacity for `n` entries at < 3/4 load, minimum 128, power of two.
-            let cap = (n * 4 / 3 + 1).next_power_of_two().max(128);
+            // Capacity for `n` entries below half load, minimum 128, power of
+            // two (see `insert`).
+            let cap = (n * 2 + 1).next_power_of_two().max(128);
             return CollIndex {
                 table: vec![(0, META_EMPTY); cap],
                 mask: cap - 1,
@@ -338,7 +339,13 @@ impl CollIndex {
         }
         #[cfg(not(feature = "safe-sandbox"))]
         {
-            if (self.used + 1) * 4 >= self.table.len() * 3 {
+            // Linear probing stays short only well below full: at three
+            // quarters an absent key (what every `set` of a new key and
+            // every miss looks for first) walks eight and a half slots on
+            // average, and a Map filled with `set` spends half its life
+            // between a half and three quarters. Grown at half, a miss
+            // walks two and a half.
+            if (self.used + 1) * 2 >= self.table.len() {
                 self.grow();
             }
             let tag = self.key_tag(heap, key);
@@ -425,7 +432,9 @@ impl CollIndex {
     /// stored tags re-index directly (bucket = `tag & mask`) — no key reads.
     #[cfg(not(feature = "safe-sandbox"))]
     fn grow(&mut self) {
-        let cap = if self.live * 2 >= self.table.len() {
+        // Double when live entries fill a quarter; otherwise the slots are
+        // mostly tombstones and a same-size rehash leaves room until half.
+        let cap = if self.live * 4 >= self.table.len() {
             self.table.len() * 2
         } else {
             self.table.len()
@@ -827,7 +836,7 @@ mod seeded_index_tests {
             .iter()
             .map(|k| Value::heap(heap.alloc_str(k.clone())))
             .collect();
-        let mut index = CollIndex::with_capacity(700);
+        let mut index = CollIndex::with_capacity(500);
         assert_eq!(index.mask, 1_023);
         let buckets: HashSet<usize> = vals
             .iter()
