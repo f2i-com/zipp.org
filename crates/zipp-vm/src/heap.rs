@@ -32,7 +32,13 @@ use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 /// by byte under four; longer keys take the call.
 #[inline(always)]
 pub(crate) fn key_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
+    key_bytes_eq(a.as_bytes(), b.as_bytes())
+}
+
+/// [`key_eq`] on bytes: a property key against a string's WTF-8 bytes, with
+/// no UTF-8 view made of the latter.
+#[inline(always)]
+pub(crate) fn key_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     let n = a.len();
     if n != b.len() {
         return false;

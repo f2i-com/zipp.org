@@ -1535,6 +1535,10 @@ pub struct Vm<'p> {
     /// throwaway heap string per access. Taken via `mem::take` for the duration
     /// of a single op (no aliasing) and returned; grows once, then reused.
     idx_key_scratch: String,
+    /// Where `o[k]` last found the flat string key `k` among the plain object
+    /// `o`'s own properties: a direct-mapped table of (receiver, key, slot)
+    /// that predicts the slot, which every use verifies (`keyed_memo_slot`).
+    pub(crate) keyed_slot_memo: Box<[indexing_date::KeyedSlotMemo]>,
     /// JSON.stringify fast-path cache: `(obj_proto version, arr_proto version,
     /// either default prototype has a callable `toJSON`)`. Keyed on the two proto
     /// shape versions so any mutation that adds/removes `toJSON` on the default

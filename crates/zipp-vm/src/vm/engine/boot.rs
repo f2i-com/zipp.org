@@ -165,6 +165,11 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
+            keyed_slot_memo: vec![
+                crate::vm::indexing_date::KeyedSlotMemo::EMPTY;
+                crate::vm::indexing_date::KEYED_SLOT_MEMO_SLOTS
+            ]
+            .into_boxed_slice(),
             json_default_tj: None,
             site_ics: Vec::new(),
             #[cfg(feature = "python")]

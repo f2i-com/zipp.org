@@ -19,6 +19,42 @@ pub(crate) enum ConcatSetFast {
     Slow,
 }
 
+/// `Vm::keyed_slot_memo`'s size, a power of two.
+pub(crate) const KEYED_SLOT_MEMO_SLOTS: usize = 1024;
+
+/// One prediction of `Vm::keyed_slot_memo`: an object of shape `owner`
+/// (or, with `by_object`, the dictionary-mode object `owner`) had the flat
+/// string key `key` at `slot`.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyedSlotMemo {
+    owner: u32,
+    key: u32,
+    slot: u32,
+    by_object: bool,
+}
+
+impl KeyedSlotMemo {
+    pub(crate) const EMPTY: KeyedSlotMemo = KeyedSlotMemo { owner: u32::MAX, key: u32::MAX, slot: 0, by_object: true };
+}
+
+/// What a prediction is filed under: the receiver's shape when it has one
+/// (every object of a shape has a key at the same slot, so one entry serves
+/// them all), the receiver itself in dictionary mode.
+#[inline(always)]
+fn keyed_memo_owner(oidx: u32, map: &ObjMap) -> (u32, bool) {
+    if map.shape_guardable() {
+        (map.shape(), false)
+    } else {
+        (oidx, true)
+    }
+}
+
+#[inline(always)]
+fn keyed_memo_index(owner: u32, kidx: u32) -> usize {
+    ((owner.wrapping_mul(0x9E37_79B1) ^ kidx.wrapping_mul(0x85EB_CA77)).wrapping_mul(0x27D4_EB2F) >> 22) as usize
+        & (KEYED_SLOT_MEMO_SLOTS - 1)
+}
+
 impl<'p> Vm<'p> {
     /// ToPropertyKey for a computed index: a Symbol or already-flat string keys
     /// as-is and primitives (numbers/bool/null) fall through unchanged, but an
@@ -84,6 +120,61 @@ impl<'p> Vm<'p> {
         }
         let value = *items.get(i as usize)?;
         (!value.is_hole()).then_some(value)
+    }
+
+    /// The own data slot that the flat string key `kidx` names on the plain
+    /// object `oidx`, as `Vm::keyed_slot_memo` predicts it (by the object's
+    /// shape, or by the object in dictionary mode), when the
+    /// prediction holds: the slot exists, its key is the key string's bytes,
+    /// it is a data property (writable too, `for_write`, and not on a class
+    /// prototype) and it is initialised. The caller has excluded the receivers
+    /// with live slots (the global object, namespaces).
+    ///
+    /// `o[k]` with a string key viewed the key's bytes, validated them as
+    /// UTF-8, hashed them and probed the receiver's index on every access:
+    /// three quarters of a loop of keyed reads. A word count reads and writes
+    /// the same keys of the same object over and over; a prediction checked
+    /// by one key compare answers it. A heap slot reused by another object or
+    /// string, or a string appended to in place, fails the compare and is
+    /// looked up again; nothing here is trusted.
+    #[inline]
+    pub(crate) fn keyed_memo_slot(&self, oidx: u32, kidx: u32, for_write: bool) -> Option<usize> {
+        let HeapObj::Object(m) = self.heap.get(oidx) else {
+            return None;
+        };
+        let (owner, by_object) = keyed_memo_owner(oidx, m);
+        let e = self.keyed_slot_memo[keyed_memo_index(owner, kidx)];
+        if e.owner != owner || e.key != kidx || e.by_object != by_object {
+            return None;
+        }
+        let s = e.slot as usize;
+        let HeapObj::Str(js) = self.heap.get(kidx) else {
+            return None;
+        };
+        let kb = js.as_bytes();
+        // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
+        if kb.starts_with(b"@@") {
+            return None;
+        }
+        if s >= m.len() || !crate::heap::key_bytes_eq(m.keys[s].as_bytes(), kb) {
+            return None;
+        }
+        let a = m.attr_at(s);
+        if a.accessor || (for_write && (!a.writable || m.class_proto)) || m.val_at(s).is_uninitialized() {
+            return None;
+        }
+        Some(s)
+    }
+
+    /// Record that `oidx` has the key `kidx` at `slot` (see `keyed_memo_slot`).
+    #[inline]
+    pub(crate) fn keyed_memo_put(&mut self, oidx: u32, kidx: u32, slot: usize) {
+        let HeapObj::Object(m) = self.heap.get(oidx) else {
+            return;
+        };
+        let (owner, by_object) = keyed_memo_owner(oidx, m);
+        self.keyed_slot_memo[keyed_memo_index(owner, kidx)] =
+            KeyedSlotMemo { owner, key: kidx, slot: slot as u32, by_object };
     }
 
     /// `o[k]` where the flat string `key` is not among the plain object
@@ -194,10 +285,17 @@ impl<'p> Vm<'p> {
                 && !(!self.deferred_ns_state.is_empty()
                     && self.deferred_ns_state.contains_key(&oidx))
             {
+                let kidx = key.heap_index();
+                if let Some(i) = self.keyed_memo_slot(oidx, kidx, false) {
+                    if let HeapObj::Object(m) = self.heap.get(oidx) {
+                        return Ok(m.val_at(i));
+                    }
+                }
+                let mut own_hit = None;
                 // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
                 if let Some(std::borrow::Cow::Borrowed(b)) = self
                     .heap
-                    .str_wtf8_cow(key.heap_index())
+                    .str_wtf8_cow(kidx)
                     .filter(|b| !b.starts_with(b"@@"))
                 {
                     if let (Ok(k), HeapObj::Object(m)) =
@@ -207,7 +305,7 @@ impl<'p> Vm<'p> {
                             if !m.attr_at(i).accessor {
                                 let v = m.val_at(i);
                                 if !v.is_uninitialized() {
-                                    return Ok(v);
+                                    own_hit = Some((i, v));
                                 }
                             }
                         } else if let Some(v) = self.plain_string_key_miss(oidx, m, k) {
@@ -216,6 +314,10 @@ impl<'p> Vm<'p> {
                             return Ok(v);
                         }
                     }
+                }
+                if let Some((i, v)) = own_hit {
+                    self.keyed_memo_put(oidx, kidx, i);
+                    return Ok(v);
                 }
             }
         }
@@ -593,6 +695,12 @@ impl<'p> Vm<'p> {
             && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
             && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
         {
+            if let Some(i) = self.keyed_memo_slot(idx, key.heap_index(), true) {
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    m.set_val_at(i, val);
+                    return Ok(());
+                }
+            }
             // hit: own writable data slot; add: proven-clean new key.
             let (hit, add) = match self.heap.str_wtf8_cow(key.heap_index()) {
                 // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
@@ -621,6 +729,7 @@ impl<'p> Vm<'p> {
                 _ => (None, false),
             };
             if let Some(i) = hit {
+                self.keyed_memo_put(idx, key.heap_index(), i);
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                     m.set_val_at(i, val);
                     return Ok(());

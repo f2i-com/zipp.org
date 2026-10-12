@@ -1297,6 +1297,7 @@ pub(crate) extern "win64" fn jit_get_index(
         }
     }
     // SAFETY: read-only view; the running region holds no conflicting borrow.
+    let vm_raw = vm as *mut Vm;
     let vm = unsafe { &*(vm as *const Vm) };
     // ── plain-object computed read: `o[k]` with a flat string key ───────────
     // Mirrors the interpreter's fast path in `vm/indexing_date.rs` EXACTLY.
@@ -1312,24 +1313,36 @@ pub(crate) extern "win64" fn jit_get_index(
     // user code, and parity with the interpreter is what makes this sound.
     if key.is_heap() {
         let oidx = arr.heap_index();
+        let kidx = key.heap_index();
+        let plain_receiver = !(oidx == vm.global_this && vm.global_this != 0)
+            && !(!vm.module_namespaces.is_empty() && vm.module_namespaces.contains_key(&oidx))
+            && !(!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx));
+        // The slot this key had on this receiver last time, verified
+        // (`Vm::keyed_memo_slot`).
+        if plain_receiver {
+            if let Some(i) = vm.keyed_memo_slot(oidx, kidx, false) {
+                if let HeapObj::Object(m) = vm.heap.get(oidx) {
+                    return m.val_at(i).bits();
+                }
+            }
+        }
         // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
         if let Some(std::borrow::Cow::Borrowed(b)) = vm
             .heap
-            .str_wtf8_cow(key.heap_index())
+            .str_wtf8_cow(kidx)
             .filter(|b| !b.starts_with(b"@@"))
         {
             if let Ok(k) = std::str::from_utf8(b) {
-                if !(oidx == vm.global_this && vm.global_this != 0)
-                    && !(!vm.module_namespaces.is_empty()
-                        && vm.module_namespaces.contains_key(&oidx))
-                    && !(!vm.deferred_ns_state.is_empty()
-                        && vm.deferred_ns_state.contains_key(&oidx))
-                {
+                if plain_receiver {
                     if let HeapObj::Object(m) = vm.heap.get(oidx) {
                         if let Some(i) = m.pos(k) {
                             if !m.attr_at(i).accessor {
                                 let v = m.val_at(i);
                                 if !v.is_uninitialized() {
+                                    // SAFETY: the helper's own pointer, as for
+                                    // the flatten above; the shared view is
+                                    // not used again on this path.
+                                    unsafe { (*vm_raw).keyed_memo_put(oidx, kidx, i) };
                                     return v.bits();
                                 }
                             }
@@ -1528,6 +1541,12 @@ pub(crate) extern "win64" fn jit_set_index(
             && !(!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx))
             && !vm.arr_props.contains_key(&oidx)
         {
+            if let Some(i) = vm.keyed_memo_slot(oidx, key.heap_index(), true) {
+                if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
+                    m.set_val_at(i, Value::from_bits(val_bits));
+                    return 0;
+                }
+            }
             let mut writable_slot = None;
             let mut new_key: Option<String> = None;
             // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
@@ -1554,6 +1573,7 @@ pub(crate) extern "win64" fn jit_set_index(
             }
             // End the immutable key/object borrows before updating the slot.
             if let Some(i) = writable_slot {
+                vm.keyed_memo_put(oidx, key.heap_index(), i);
                 if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
                     m.set_val_at(i, Value::from_bits(val_bits));
                     return 0;
