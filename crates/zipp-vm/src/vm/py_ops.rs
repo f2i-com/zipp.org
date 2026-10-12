@@ -1901,6 +1901,19 @@ impl<'p> Vm<'p> {
             let Some((items, i)) = self.py_seq_slot(o, k) else {
                 return Ok(false);
             };
+            // An element present in a plain Array (no side table: nothing
+            // frozen, overridden or mapped to an `arguments` object): stored
+            // in place, which is all `set_index` does for one after its barrier.
+            let plain = !self.arr_props.contains_key(&items)
+                && !self.arguments_objs.contains_key(&items)
+                && matches!(self.heap.get(items), HeapObj::Array(vals) if vals.get(i).is_some_and(|x| !x.is_hole()));
+            if plain {
+                self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, Value::heap(items), v);
+                if let HeapObj::Array(vals) = self.heap.get_mut(items) {
+                    vals[i] = v;
+                }
+                return Ok(true);
+            }
             self.set_index(Value::heap(items), Value::int(i as i32), v, true)?;
             return Ok(true);
         }

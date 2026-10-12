@@ -1,0 +1,5 @@
+([[667332, 664668, 2664], [666333, 667666, -1330], [665334, 666666, -1332], [668334, 665667, 2667]], 7997)
+(704371, 353684)
+(57, 88680, [3000])
+([('IndexError', 'list assignment index out of range'), ('IndexError', 'list assignment index out of range'), ('IndexError', 'list assignment index out of range'), ('IndexError', 'list assignment index out of range'), "'tuple' object does not support item assignment"], [1, 2, 9])
+([999, 998, 998], True, True)
