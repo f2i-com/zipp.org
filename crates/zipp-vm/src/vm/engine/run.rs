@@ -680,18 +680,15 @@ impl<'p> Vm<'p> {
             }
         }
         // A bound function: invoke its target with the fixed `this` and the bound
-        // arguments prepended (handles bind-of-bind by recursing).
+        // arguments prepended. A bind-of-bind chain is unwrapped here, in a
+        // loop: the innermost level's `this` is the one the target sees, and
+        // each level's bound arguments go in front of the outer ones'. It used
+        // to recurse once a level, and the checked profile's native recursion
+        // cap (32) made calling a 300-deep chain a RangeError where Node
+        // calls it.
         if callee.is_heap() {
-            if let HeapObj::Bound {
-                target,
-                this: bthis,
-                args: bargs,
-            } = self.heap.get(callee.heap_index())
-            {
-                let (t, th) = (*target, *bthis);
-                let mut all = Vec::with_capacity(bargs.len() + args.len());
-                all.extend_from_slice(bargs);
-                all.extend_from_slice(args);
+            if matches!(self.heap.get(callee.heap_index()), HeapObj::Bound { .. }) {
+                let (t, th, all) = self.unwrap_bound_call(callee, args);
                 return self.with_native_recursion_guard(|vm| vm.call_value(t, th, &all));
             }
             // A createRealm child's `eval` / `evalScript`: run the code against
@@ -1275,6 +1272,35 @@ impl<'p> Vm<'p> {
             return None;
         }
         Some(self.run_loop(stop))
+    }
+
+    /// The target, `this` and arguments a call of the bound function `f` with
+    /// `args` reaches, through every level of a bind-of-bind chain (see the
+    /// call in `call_value`).
+    pub(crate) fn unwrap_bound_call(&self, f: Value, args: &[Value]) -> (Value, Value, Vec<Value>) {
+        let mut levels: Vec<&[Value]> = Vec::new();
+        let (mut target, mut this) = (f, Value::UNDEFINED);
+        while target.is_heap() {
+            match self.heap.get(target.heap_index()) {
+                HeapObj::Bound {
+                    target: t,
+                    this: th,
+                    args: bargs,
+                } => {
+                    levels.push(bargs);
+                    this = *th;
+                    target = *t;
+                }
+                _ => break,
+            }
+        }
+        let n = levels.iter().map(|b| b.len()).sum::<usize>() + args.len();
+        let mut all = Vec::with_capacity(n);
+        for bargs in levels.iter().rev() {
+            all.extend_from_slice(bargs);
+        }
+        all.extend_from_slice(args);
+        (target, this, all)
     }
 
     /// Resume `callee`'s activation on the interpreter at bytecode `ip`, over

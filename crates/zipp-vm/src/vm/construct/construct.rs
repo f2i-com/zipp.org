@@ -1045,20 +1045,31 @@ impl<'p> Vm<'p> {
         }
         // `new (boundFn)(...)`: [[Construct]] forwards to the bound target with the
         // bound arguments prepended (the bound `this` is ignored for construction).
-        let bound_parts = match self.heap.get(cv.heap_index()) {
-            HeapObj::Bound {
-                target,
-                args: bargs,
-                ..
-            } => Some((*target, bargs.clone())),
-            _ => None,
-        };
-        if let Some((target, bargs)) = bound_parts {
-            let combined: Vec<Value> = bargs.into_iter().chain(args.iter().copied()).collect();
-            // Bound [[Construct]]: substitute the target for newTarget only when
-            // newTarget is the bound function itself; otherwise keep the caller's
-            // newTarget so OrdinaryCreateFromConstructor uses its prototype.
-            let nt = if new_target == cv { target } else { new_target };
+        if matches!(self.heap.get(cv.heap_index()), HeapObj::Bound { .. }) {
+            // Bound [[Construct]], every level of a bind-of-bind chain in one
+            // loop (it recursed once a level, past the checked profile's
+            // native recursion cap): each level's bound arguments go in front
+            // of the outer ones', and newTarget becomes the level's target only
+            // while it is the level itself, otherwise the caller's newTarget is
+            // kept so OrdinaryCreateFromConstructor uses its prototype.
+            let mut levels: Vec<Vec<Value>> = Vec::new();
+            let (mut target, mut nt) = (cv, new_target);
+            while target.is_heap() {
+                let (t, bargs) = match self.heap.get(target.heap_index()) {
+                    HeapObj::Bound { target: t, args: bargs, .. } => (*t, bargs.clone()),
+                    _ => break,
+                };
+                levels.push(bargs);
+                if nt == target {
+                    nt = t;
+                }
+                target = t;
+            }
+            let mut combined: Vec<Value> = Vec::new();
+            for bargs in levels.iter().rev() {
+                combined.extend_from_slice(bargs);
+            }
+            combined.extend_from_slice(args);
             return self.with_native_recursion_guard(|vm| {
                 vm.construct_with_newtarget(target, &combined, nt)
             });
