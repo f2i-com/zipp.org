@@ -8795,10 +8795,28 @@ impl<'p> Vm<'p> {
                             }
                         }
                         // A generator is driven by `.next()`; the cursor is unused.
+                        // The step is taken without its `{value, done}` result
+                        // object, which nothing could see: built, read back and
+                        // dropped, it was a third of a generator-driven loop.
+                        // A `yield*` step still hands over the inner result
+                        // object itself, which is read below as before.
                         if matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. }) {
-                            let res = self
-                                .generator_method(it.heap_index(), "next", &[])?
-                                .unwrap_or(Value::UNDEFINED);
+                            let res = match self.generator_next_step(it.heap_index())? {
+                                Some(super::async_runtime::GenStep::Yield(v)) => {
+                                    self.set(base, value_dst, v);
+                                    self.set(base, done_dst, Value::FALSE);
+                                    ip += 1;
+                                    continue;
+                                }
+                                Some(super::async_runtime::GenStep::Done(v)) => {
+                                    self.set(base, value_dst, v);
+                                    self.set(base, done_dst, Value::TRUE);
+                                    ip += 1;
+                                    continue;
+                                }
+                                Some(super::async_runtime::GenStep::Raw(r)) => r,
+                                None => Value::UNDEFINED,
+                            };
                             // `iter_result` builds `{value, done}` in that order
                             // and nothing else, so when the result is exactly
                             // that shape its slots can be read directly instead

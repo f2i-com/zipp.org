@@ -570,7 +570,6 @@ impl<'p> Vm<'p> {
 
     /// `generator_method(idx, "next", [undefined])` as a [`GenStep`], without
     /// the iterator-result object (`None`: `idx` is not a sync generator).
-    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn generator_next_step(&mut self, idx: u32) -> Result<Option<GenStep>, Thrown> {
         let (state, fid, closure) = match self.heap.get(idx) {
             HeapObj::Generator {
