@@ -1075,7 +1075,7 @@ impl<'p> Vm<'p> {
         let tuple = self.py_alloc_like(seq_tmpl, seq_shape, &[ttuple, args])?;
         let map = self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
         self.adopt_native_result_realm(map, self.map_proto);
-        let vals = [cls, Value::heap(map), tuple, Value::NULL, context, Value::int(-1), Value::FALSE, Value::NULL, Value::int(0)];
+        let vals = [cls, Value::heap(map), tuple, Value::NULL, context, Value::int(-1), Value::FALSE, Value::NULL, Value::int(0), Value::UNDEFINED];
         self.py_alloc_like(tmpl, exc_shape, &vals)
     }
 
@@ -1141,7 +1141,7 @@ impl<'p> Vm<'p> {
             let ctx_slot = if raise { own("context")? } else { 0 };
             (cls, ctx_slot, tb_slot)
         };
-        debug_assert!(EXC_KEYS[4] == "context" && EXC_KEYS[5] == "tbline" && EXC_KEYS[7] == "tbfn");
+        debug_assert!(EXC_KEYS[4] == "context" && EXC_KEYS[5] == "tbline" && EXC_KEYS[7] == "tbfn" && EXC_KEYS[9] == "frames");
         if !self.py_plain_rec(cls) {
             return None;
         }

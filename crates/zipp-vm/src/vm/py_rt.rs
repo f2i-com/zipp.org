@@ -309,7 +309,7 @@ impl PyFrame {
 /// The keys of a list or tuple record (`sequence`'s literal).
 pub(super) const SEQ_KEYS: [&str; 2] = ["cls", "items"];
 /// The keys of the record `makeExc` builds, in its literal's order.
-pub(super) const EXC_KEYS: [&str; 9] = ["cls", "dict", "args", "cause", "context", "tbline", "suppress", "tbfn", "tbcl"];
+pub(super) const EXC_KEYS: [&str; 10] = ["cls", "dict", "args", "cause", "context", "tbline", "suppress", "tbfn", "tbcl", "frames"];
 /// An instance record's keys (the construction entries' literal).
 pub(super) const INST_KEYS: [&str; 2] = ["cls", "dict"];
 /// A traceback frame entry's keys (`R.addframe`'s literal, `R.FRAMETMPL`).
@@ -491,7 +491,7 @@ impl<'p> Vm<'p> {
         let Some(p) = self.py_rt.as_deref() else {
             return false;
         };
-        let (r, files, tmpl, shape, keep) = (p.r, p.files, p.frame_tmpl, p.frame_shape, p.tb_keep);
+        let (r, files, tmpl, shape, keep, exc_shape) = (p.r, p.files, p.frame_tmpl, p.frame_shape, p.tb_keep, p.exc_shape);
         if shape == crate::shape::DICT || keep == 0 || !files.is_heap() || !f.is_heap() || line < 0 {
             return false;
         }
@@ -508,16 +508,23 @@ impl<'p> Vm<'p> {
         if !m.extensible || m.sealed || m.frozen {
             return false;
         }
-        let own = |key: &str| -> Result<Option<Value>, ()> {
+        // The record `makeExc` builds has them at known slots (its shape);
+        // `frames` is `undefined` there until the first frame.
+        let exc_layout = m.shape() == exc_shape && exc_shape != crate::shape::DICT;
+        let own = |key: &str, slot: usize| -> Result<Option<Value>, ()> {
+            if exc_layout {
+                return Ok(Some(m.val_at(slot)));
+            }
             match m.pos(key) {
                 None => Ok(None),
                 Some(s) if m.is_accessor_at(s) => Err(()),
                 Some(s) => Ok(Some(m.val_at(s))),
             }
         };
-        let (Ok(tbfn), Ok(frames)) = (own("tbfn"), own("frames")) else {
+        let (Ok(tbfn), Ok(frames)) = (own("tbfn", 7), own("frames", 9)) else {
             return false;
         };
+        let frames = frames.filter(|v| !v.is_undefined());
         let tbline = m.val_at(tb_slot);
         // A catch pending in this very frame: `commitCatch` (the runtime's).
         if tbfn.is_some_and(|t| t.bits() == f.bits()) {

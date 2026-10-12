@@ -226,9 +226,12 @@ var __zipp_py = (function () {
     let EXC_NATIVE = null;
     function makeExc(cls, args) {
         if (EXC_NATIVE !== null) { const e = EXC_NATIVE(cls, args, R); if (e !== undefined) return e; }
+        // `frames` (the traceback `R.addframe` records) is in the literal,
+        // `undefined` until the exception first leaves a frame: setting it
+        // then keeps the record's layout.
         return { cls: cls, dict: new Map(), args: sequence(T.tuple, args), cause: null,
             context: excStack.length ? excStack[excStack.length - 1] : null, tbline: -1, suppress: false,
-            tbfn: null, tbcl: 0 };
+            tbfn: null, tbcl: 0, frames: undefined };
     }
     rt.makeExc = makeExc;
     // The innermost recorded frame holds the line its own frame was running;
