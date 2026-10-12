@@ -60,8 +60,12 @@ env:
   WASM_BINDGEN_CLI: "0.2.126"
 
 jobs:
+  # The Python lanes are two jobs that run side by side: the native tests here,
+  # the browser artifact and what loads it in `python-wasm`. As one job they
+  # took 49 minutes, 34 of them in the native tests and 14 building the
+  # artifact.
   python:
-    name: Python frontend, project files and GPU contracts
+    name: Python frontend and project files
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -69,14 +73,20 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - name: Install Rust and wasm32 target
-        run: |
-          rustup toolchain install 1.92.0 --profile minimal --no-self-update
-          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+      - name: Install Rust
+        run: rustup toolchain install 1.92.0 --profile minimal --no-self-update
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
+      # Optimized at level 1, as security.yml's native workspace job is: the
+      # torch and JIT tests are slow unoptimized, and the level changes no
+      # result. Debug assertions and overflow checks stay on; no debug info.
       - name: Test the Python-enabled VM and CLI (including filesystem policy)
+        env:
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
         run: |
           cargo +1.92.0 test --locked -p zipp-vm --features python --test python_frontend --test python_project --test python_corpus --test python_torch --test python_javascript --test python_torch_core --test python_torch_nn --test python_torch_optim --test python_torch_gpu --test python_torch_native --test python_torch_gpu2 --test python_torch_nn2 --test python_torch_dtypes --test python_torch_linalg --test python_torch_distributions --test python_torch_amp --test python_torch_nn3 --test python_torch_gpu3 --test python_torch_complex --test python_torch_fft --test python_torch_sparse --test python_torch_quant --test python_torch_distributed --test python_lazy_import --test python_native_s1 --test python_ic_key_reuse
           cargo +1.92.0 test --locked -p zipp-vm --features python-js-interop --test python_javascript
@@ -94,6 +104,23 @@ jobs:
         working-directory: crates/zipp-pyparse
         run: |
           cargo +1.92.0 test --locked --release -- --include-ignored --skip throughput
+
+  python-wasm:
+    name: Python browser artifact, GPU contracts and plugins
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - name: Install Rust and wasm32 target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
       # build-variants.sh post-processes every module with optimize-wasm.sh,
       # which refuses any Binaryen but the one the sizes were measured with.
       - name: Install the measured WASM optimizer
