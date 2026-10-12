@@ -146,7 +146,28 @@ function shrink(arr) { var c = arr.slice(0, 10); return c.map(function (x, i) { 
 heat(function () { shrink(big); });
 log("shrink during", shrink(big));
 
-console.log(out.join("\n"));
+// 13. A builtin run directly as a host job (a bound builtin is the reaction):
+// no frame lies under its callback, which calls a cold function when hot.
+var hostCalls = 0, hostSeen = [];
+function hostCold(x) { hostSeen.push(x); return x * 2; }
+function hostHot(x) { hostCalls++; if (hostCalls > 4000) return hostCold(x); return x + 1; }
+var hostHotC = (function (k) { var n = 0; return function (x) { n++; if (n > 4000) return hostCold(x + k); return x + k; }; }(100));
+var harr = [1, 2, 3, 4];
+for (var i = 0; i < 1000; i++) { harr.forEach(hostHot); harr.forEach(hostHotC); }
+Promise.resolve().then(Array.prototype.forEach.bind(harr, hostHot)).then(function () {
+  log("job forEach", hostCalls + " " + hostSeen.join(","));
+  return Promise.resolve().then(Array.prototype.map.bind([7, 8], hostHot));
+}).then(function (r) {
+  log("job map", String(r) + " " + hostSeen.join(","));
+  return Promise.resolve().then(Array.prototype.map.bind([5, 6], hostHotC));
+}).then(function (r) {
+  log("job map closure", String(r) + " " + hostSeen.join(","));
+  var m = new Map([[1, 2], [3, 4]]);
+  return Promise.resolve().then(Map.prototype.forEach.bind(m, hostHotC));
+}).then(function () {
+  log("job Map.forEach closure", hostSeen.join(","));
+  console.log(out.join("\n"));
+});
 "####;
 
 #[test]
@@ -177,6 +198,10 @@ fn callbacks_over_a_reused_window_match_node() {
         r####"self call rebound: 4,5,6"####,
         r####"holes: 2,,6,,10 3"####,
         r####"shrink during: 0,7,3,10,6,,,,,"####,
+        r####"job forEach: 4004 1,2,3,4"####,
+        r####"job map: 14,16 1,2,3,4,7,8"####,
+        r####"job map closure: 210,212 1,2,3,4,7,8,105,106"####,
+        r####"job Map.forEach closure: 1,2,3,4,7,8,105,106,102,104"####,
     ];
     let out = run(PROGRAM);
     let got: Vec<&str> = out.iter().flat_map(|chunk| chunk.lines()).collect();
