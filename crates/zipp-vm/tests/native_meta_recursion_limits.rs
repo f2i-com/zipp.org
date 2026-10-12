@@ -162,7 +162,7 @@ fn transparent_callable_and_constructor_wrappers_cannot_recurse_the_host_stack()
             console.log(typeof proxyCall, typeof boundCall);
             try { proxyCall(); console.log("proxy-call-unexpected"); }
             catch (error) { console.log(error instanceof RangeError ? "proxy-call-range" : "proxy-call-other"); }
-            try { boundCall(); console.log("bound-call-unexpected"); }
+            try { console.log("bound-call", boundCall()); }
             catch (error) { console.log(error instanceof RangeError ? "bound-call-range" : "bound-call-other"); }
 
             var proxyCtor = F;
@@ -173,7 +173,7 @@ fn transparent_callable_and_constructor_wrappers_cannot_recurse_the_host_stack()
             }
             try { new proxyCtor(); console.log("proxy-ctor-unexpected"); }
             catch (error) { console.log(error instanceof RangeError ? "proxy-ctor-range" : "proxy-ctor-other"); }
-            try { new boundCtor(); console.log("bound-ctor-unexpected"); }
+            try { console.log("bound-ctor", new boundCtor() instanceof F); }
             catch (error) { console.log(error instanceof RangeError ? "bound-ctor-range" : "bound-ctor-other"); }
 
             var shallow = new Proxy(F.bind(null), {});
@@ -183,9 +183,9 @@ fn transparent_callable_and_constructor_wrappers_cannot_recurse_the_host_stack()
         [
             "function function",
             "proxy-call-range",
-            "bound-call-range",
+            "bound-call 7",
             "proxy-ctor-range",
-            "bound-ctor-range",
+            "bound-ctor true",
             "7",
         ]
     );
