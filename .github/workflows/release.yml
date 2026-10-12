@@ -1124,17 +1124,23 @@ jobs:
           if [[ -f "$notes_file" ]]; then
             notes_args=(--notes-file "$notes_file")
           fi
+          # No --target: the tag exists (--verify-tag), so the API would not
+          # use it, and verify_remote_tag pins the tag to the built commit
+          # before and after. With a target, GitHub compares that commit with
+          # the default branch's head and, when workflow files changed between
+          # them, requires the `workflows` permission, which an Actions token
+          # cannot hold: v0.0.23's first three publish attempts failed with
+          # HTTP 403 "Resource not accessible by integration" because main had
+          # moved past the tag with workflow changes (cli/cli#9514).
           gh release create "$RELEASE_TAG" dist/* "${notes_args[@]}" \
             --draft \
             --verify-tag \
-            --target "$EXPECTED_COMMIT" \
             --title "ZIPP $RELEASE_TAG" \
             --generate-notes
           verify_remote_tag
           gh release edit "$RELEASE_TAG" \
             --draft=false \
             --latest \
-            --target "$EXPECTED_COMMIT" \
             --verify-tag
           verify_remote_tag
           gh release view "$RELEASE_TAG" \
