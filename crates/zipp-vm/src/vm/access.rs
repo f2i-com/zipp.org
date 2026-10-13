@@ -1024,7 +1024,7 @@ impl<'p> Vm<'p> {
     /// Receiver half of the test — checked FIRST so a non-qualifying receiver
     /// (a class instance above all) costs one heap load and nothing else.
     #[inline]
-    fn ordinary_set_recv_ok(&self, oi: u32) -> bool {
+    pub(crate) fn ordinary_set_recv_ok(&self, oi: u32) -> bool {
         // `m.class.is_some()` is load-bearing: a class instance resolves
         // accessors through its ClassData, which `proto_chain_blocks_set` does
         // not walk, so `class C { set x(v){…} }` would be appended over.
@@ -1037,7 +1037,7 @@ impl<'p> Vm<'p> {
     }
 
     #[inline]
-    fn ordinary_set_ok(&self, oi: u32, key: &str) -> bool {
+    pub(crate) fn ordinary_set_ok(&self, oi: u32, key: &str) -> bool {
         if key.is_empty() {
             return false;
         }

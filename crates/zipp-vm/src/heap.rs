@@ -2646,7 +2646,6 @@ impl ObjMap {
     /// (`shape::keys_of`): the keys this object has are exactly its prefix,
     /// because they are what `self.shape()` names, so the object takes the
     /// shared list instead of a new `String` per key.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn append_data_shaped(
         &mut self,
         key: &str,

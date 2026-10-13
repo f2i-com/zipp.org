@@ -4866,58 +4866,9 @@ fn shape_key_plan(vm: &mut Vm, shape: u32) -> Option<crate::bytecode::StaticKeyP
 /// class fields and hops.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn class_add_proof(vm: &Vm, idx: u32, class: u32, key: &str, w: &mut AddWay) -> bool {
-    if vm.proto_of.get(&idx).is_some() {
+    let Some(n) = vm.class_add_chain(idx, class, key, &mut w.hops) else {
         return false;
-    }
-    let mut cur = class;
-    loop {
-        let HeapObj::Class(c) = vm.heap.get(cur) else {
-            return false;
-        };
-        if c.extends_null || (cur == class && c.reproto_instances) {
-            return false;
-        }
-        match c.parent {
-            None => break,
-            Some(p) if matches!(vm.heap.get(p), HeapObj::Class(_)) => cur = p,
-            Some(_) => return false,
-        }
-    }
-    if !matches!(
-        vm.class_member_lookup(idx, class, key),
-        crate::vm::props::ClassLookup::Miss
-    ) {
-        return false;
-    }
-    let mut next = vm.class_instance_live_proto(idx, class);
-    let mut n = 0usize;
-    while next.is_heap() {
-        let h = next.heap_index();
-        if n == ADD_WAY_HOPS || !vm.ic_obj_ok(h) {
-            return false;
-        }
-        let HeapObj::Object(m) = vm.heap.get(h) else {
-            return false;
-        };
-        if m.is_ctor || m.class.is_some() {
-            return false;
-        }
-        w.hops[n] = (h, vm.heap.version_of(h));
-        n += 1;
-        if let Some(i) = m.pos(key) {
-            // A writable data property is shadowed by the append; anything
-            // else governs the write.
-            if m.attr_at(i).accessor || !m.attr_at(i).writable {
-                return false;
-            }
-            break;
-        }
-        next = match vm.proto_of.get(&h) {
-            Some(p) => *p,
-            None if vm.obj_proto == 0 || h == vm.obj_proto => Value::NULL,
-            None => Value::heap(vm.obj_proto),
-        };
-    }
+    };
     w.nhops = n as u32;
     w.class = class;
     w.class_ver = vm.heap.version_of(class);

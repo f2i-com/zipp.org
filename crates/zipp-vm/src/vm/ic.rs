@@ -172,6 +172,33 @@ pub(crate) enum IcEntry {
         hops: IcHops,
         slot: u32,
     },
+    /// `SetProp` that APPENDS the site's key: a plain extensible object of
+    /// shape `before` takes it as a new data property and reaches `after`,
+    /// and the chain (`first`/`hops`, exactly as a `ProtoData` miss or
+    /// inherited-writable-data entry guards it) holds no setter and no
+    /// read-only property of the name. A constructor's `this.x = v` adds to a
+    /// new object every time: no own-data entry can serve it, and every one
+    /// took `set_prop`'s whole walk.
+    AddData {
+        before: u32,
+        after: u32,
+        first: u8,
+        hops: IcHops,
+    },
+    /// The class-instance form of `AddData`: no member table of `class`'s
+    /// chain declares the key (the class's version and `class_proto_epoch`
+    /// guard the tables, as `ClassSetter` guards them), and the ordinary
+    /// chain where the tables end (`hops`, at most two objects: a
+    /// materialized class prototype and `%Object.prototype%`) is clean.
+    AddClass {
+        before: u32,
+        after: u32,
+        class: u32,
+        ver: u32,
+        epoch: u32,
+        nhops: u8,
+        hops: [(u32, u32); 2],
+    },
     /// Plain `Call` site: callee identity (bits) + slot version → resolved
     /// (fid, closure) for a plain (non-generator, non-async) Func/Closure.
     Callee {
@@ -281,6 +308,10 @@ enum SetPlan {
     WriteOwn {
         idx: u32,
         slot: u32,
+    },
+    Append {
+        idx: u32,
+        after: u32,
     },
     Setter {
         fid: u32,
@@ -1239,6 +1270,12 @@ impl<'p> Vm<'p> {
                                 // complete guard for the monomorphic first way.
                                 plan = Some(SetPlan::WriteOwn { idx, slot });
                             }
+                        } else if let IcEntry::AddData { before, .. }
+                        | IcEntry::AddClass { before, .. } = site.entries[0]
+                        {
+                            if before == shape {
+                                plan = self.ic_validate_add(&site.entries[0], idx, m);
+                            }
                         }
                     }
 
@@ -1257,7 +1294,7 @@ impl<'p> Vm<'p> {
             }
         }
         if let Some(p) = plan {
-            return self.ic_apply_set(p, val);
+            return self.ic_apply_set(p, key, val);
         }
         if disabled {
             return SetAct::None;
@@ -1293,7 +1330,7 @@ impl<'p> Vm<'p> {
                                 slot: slot as u32,
                             },
                         );
-                        self.ic_apply_set(p, val)
+                        self.ic_apply_set(p, key, val)
                     }
                     None => SetAct::None,
                 }
@@ -1352,7 +1389,30 @@ impl<'p> Vm<'p> {
             // route through proto_chain_set — both stay on the slow path.
             // But a class instance with NO method/getter hit may still have a
             // chain SETTER; resolve it directly.
-            Walked::No | Walked::ChainData { .. } | Walked::ChainMiss { .. } => {
+            Walked::ChainMiss { first, hops } => {
+                if let Some(p) = self.ic_add_fill(func_id, ip, recv, key, first, hops) {
+                    return self.ic_apply_set(p, key, val);
+                }
+                self.ic_note_miss(func_id, ip);
+                SetAct::None
+            }
+            Walked::ChainData { first, hops, slot }
+                if matches!(self.heap.get(hops.0[hops.1 as usize - 1].0), HeapObj::Object(hm)
+                    if (slot as usize) < hm.vals_len()
+                        && !hm.attr_at(slot as usize).accessor
+                        && hm.attr_at(slot as usize).writable) =>
+            {
+                // A writable inherited data property is shadowed by the add.
+                if let Some(p) = self.ic_add_fill(func_id, ip, recv, key, first, hops) {
+                    return self.ic_apply_set(p, key, val);
+                }
+                self.ic_note_miss(func_id, ip);
+                SetAct::None
+            }
+            Walked::No | Walked::ChainData { .. } => {
+                if let Some(p) = self.ic_add_class_fill(func_id, ip, recv, key) {
+                    return self.ic_apply_set(p, key, val);
+                }
                 if let Some((ridx, m)) = self.ic_recv_map(recv) {
                     if let Some(class) = m.class {
                         if m.pos(key).is_none() {
@@ -1394,6 +1454,196 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The proof a class instance's append of `key` needs, shared by the
+    /// JIT's add ways and the interpreter's `AddClass` entries: the instance
+    /// has no [[Prototype]] of its own, its class chain is classes down to a
+    /// base class (a function or built-in parent, or `extends null`, keeps the
+    /// general path), no member table on it declares `key`, and the ordinary
+    /// chain from where the tables end holds no setter and no read-only
+    /// `key`. Records that chain's objects with their versions in `hops` and
+    /// returns how many; `None` when the proof fails or needs more hops.
+    pub(crate) fn class_add_chain(
+        &self,
+        idx: u32,
+        class: u32,
+        key: &str,
+        hops: &mut [(u32, u32)],
+    ) -> Option<usize> {
+        if self.proto_of.get(&idx).is_some() {
+            return None;
+        }
+        let mut cur = class;
+        loop {
+            let HeapObj::Class(c) = self.heap.get(cur) else {
+                return None;
+            };
+            if c.extends_null || (cur == class && c.reproto_instances) {
+                return None;
+            }
+            match c.parent {
+                None => break,
+                Some(p) if matches!(self.heap.get(p), HeapObj::Class(_)) => cur = p,
+                Some(_) => return None,
+            }
+        }
+        if !matches!(self.class_member_lookup(idx, class, key), ClassLookup::Miss) {
+            return None;
+        }
+        let mut next = self.class_instance_live_proto(idx, class);
+        let mut n = 0usize;
+        while next.is_heap() {
+            let h = next.heap_index();
+            if n == hops.len() || !self.ic_obj_ok(h) {
+                return None;
+            }
+            let HeapObj::Object(m) = self.heap.get(h) else {
+                return None;
+            };
+            if m.is_ctor || m.class.is_some() {
+                return None;
+            }
+            hops[n] = (h, self.heap.version_of(h));
+            n += 1;
+            if let Some(i) = m.pos(key) {
+                // A writable data property is shadowed by the append; anything
+                // else governs the write.
+                if m.attr_at(i).accessor || !m.attr_at(i).writable {
+                    return None;
+                }
+                break;
+            }
+            next = match self.proto_of.get(&h) {
+                Some(p) => *p,
+                None if self.obj_proto == 0 || h == self.obj_proto => Value::NULL,
+                None => Value::heap(self.obj_proto),
+            };
+        }
+        Some(n)
+    }
+
+    /// An `AddData` hit: `m` (heap `idx`) is a plain extensible object of the
+    /// entry's `before` shape the ordinary add path would take, and the chain
+    /// still stands.
+    #[inline]
+    fn ic_validate_add(&self, e: &IcEntry, idx: u32, m: &ObjMap) -> Option<SetPlan> {
+        if let IcEntry::AddClass {
+            after,
+            class,
+            ver,
+            epoch,
+            nhops,
+            hops,
+            ..
+        } = *e
+        {
+            if !m.extensible
+                || m.class != Some(class)
+                || m.is_ctor
+                || self.heap.version_of(class) != ver
+                || self.class_proto_epoch != epoch
+                || self.proto_of.get(&idx).is_some()
+                || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+                || hops[..nhops as usize]
+                    .iter()
+                    .any(|&(h, v)| self.heap.version_of(h) != v)
+            {
+                return None;
+            }
+            return Some(SetPlan::Append { idx, after });
+        }
+        let IcEntry::AddData {
+            after, first, hops, ..
+        } = *e
+        else {
+            return None;
+        };
+        if !m.extensible
+            || m.class.is_some()
+            || m.class_proto
+            || idx == self.obj_proto
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+        {
+            return None;
+        }
+        self.ic_chain_ok(idx, first, &hops)?;
+        Some(SetPlan::Append { idx, after })
+    }
+
+    /// Prove the append a `SetProp` miss is about to make and install the
+    /// site's `AddData` entry: the receiver and key are ones `set_prop`'s
+    /// ordinary add would take (`ordinary_set_recv_ok`/`ordinary_set_ok`),
+    /// the receiver has a shape, and the walk that found the chain clear
+    /// guards it. Returns the plan that makes the append.
+    fn ic_add_fill(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        key: &str,
+        first: u8,
+        hops: IcHops,
+    ) -> Option<SetPlan> {
+        let (idx, m) = self.ic_recv_map(recv)?;
+        if !m.shape_guardable() || !self.ordinary_set_recv_ok(idx) || !self.ordinary_set_ok(idx, key) {
+            return None;
+        }
+        let before = m.shape();
+        let after = crate::shape::add(before, key, crate::shape::attr_bits(true, true, true, false));
+        if after == crate::shape::DICT {
+            return None;
+        }
+        self.ic_install(
+            func_id,
+            ip,
+            IcEntry::AddData {
+                before,
+                after,
+                first,
+                hops,
+            },
+        );
+        Some(SetPlan::Append { idx, after })
+    }
+
+    /// The class-instance twin of [`Vm::ic_add_fill`]: a class instance
+    /// missing `key` whose append `class_add_chain` proves, with a key the
+    /// ordinary add would take. Installs the site's `AddClass` entry.
+    fn ic_add_class_fill(&mut self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<SetPlan> {
+        let (idx, m) = self.ic_recv_map(recv)?;
+        let class = m.class?;
+        if !m.shape_guardable()
+            || !m.extensible
+            || m.class_proto
+            || m.pos(key).is_some()
+            || !self.ordinary_set_ok(idx, key)
+        {
+            return None;
+        }
+        let before = m.shape();
+        let mut hops = [(0u32, 0u32); 2];
+        let nhops = self.class_add_chain(idx, class, key, &mut hops)?;
+        let after = crate::shape::add(before, key, crate::shape::attr_bits(true, true, true, false));
+        if after == crate::shape::DICT {
+            return None;
+        }
+        let ver = self.heap.version_of(class);
+        let epoch = self.class_proto_epoch;
+        self.ic_install(
+            func_id,
+            ip,
+            IcEntry::AddClass {
+                before,
+                after,
+                class,
+                ver,
+                epoch,
+                nhops: nhops as u8,
+                hops,
+            },
+        );
+        Some(SetPlan::Append { idx, after })
+    }
+
     /// Pure validation of one entry against a `SetProp` access; the returned
     /// plan is applied by [`Vm::ic_apply_set`] once all borrows end. `idx`/`m`
     /// are the already-guarded receiver; `own` its `pos(key)`.
@@ -1405,6 +1655,13 @@ impl<'p> Vm<'p> {
         own: Option<usize>,
     ) -> Option<SetPlan> {
         match *e {
+            IcEntry::AddData { before, .. } | IcEntry::AddClass { before, .. } => {
+                if own.is_none() && m.shape_guardable() && m.shape() == before {
+                    self.ic_validate_add(e, idx, m)
+                } else {
+                    None
+                }
+            }
             IcEntry::OwnData { slot, .. } => {
                 let s = slot as usize;
                 // A class prototype's writes must reach `set_prop`, which
@@ -1478,8 +1735,18 @@ impl<'p> Vm<'p> {
 
     /// Apply a validated set plan (the write, or hand back the setter).
     #[inline]
-    fn ic_apply_set(&mut self, p: SetPlan, val: Value) -> SetAct {
+    fn ic_apply_set(&mut self, p: SetPlan, key: &str, val: Value) -> SetAct {
         match p {
+            SetPlan::Append { idx, after } => {
+                // What `set_prop`'s ordinary add does: its barrier, the
+                // append, and the version bump the JIT's caches need.
+                self.store_barrier_v(crate::heap::gcoracle::SET_PROP, Value::heap(idx), val);
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    m.append_data_shaped(key, val, after, None);
+                }
+                self.heap.bump_version(idx);
+                SetAct::Done
+            }
             SetPlan::WriteOwn { idx, slot } => {
                 // Nursery barrier: the interpreter IC's direct own-data store
                 // bypasses `set_prop` (whose entry barrier covers every slow
