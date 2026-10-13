@@ -6,7 +6,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use std::sync::Arc;
 
 use crate::api;
-use crate::bytesearch::{AsciiBitmap, ByteArraySet, ByteBitmap};
+use crate::bytesearch::{AsciiBitmap, ByteArraySet, ByteBitmap, ByteSearcher};
 use crate::types::{BracketContents, CaptureGroupID, LoopID};
 extern crate memchr;
 use memchr::memmem;
@@ -259,6 +259,25 @@ pub enum StartPredicate {
     /// The regex is anchored to the start of the line/string.
     /// This avoids string searching entirely and only tries matching at the beginning.
     StartAnchored,
+}
+
+/// The search for a match's first byte, whichever form it takes. A search
+/// asks once per attempt, so deciding the form there costs next to nothing,
+/// and the search loop exists once per input type instead of once per form.
+impl ByteSearcher for StartPredicate {
+    #[inline(always)]
+    fn find_in(&self, bytes: &[u8]) -> Option<usize> {
+        match self {
+            StartPredicate::Arbitrary => Some(0),
+            StartPredicate::ByteSet1(set) => set.find_in(bytes),
+            StartPredicate::ByteSet2(set) => set.find_in(bytes),
+            StartPredicate::ByteSet3(set) => set.find_in(bytes),
+            StartPredicate::ByteSeq(finder) => finder.find_in(bytes),
+            StartPredicate::ByteBracket(bitmap) => bitmap.find_in(bytes),
+            // An anchored search makes one attempt and never searches.
+            StartPredicate::StartAnchored => Some(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

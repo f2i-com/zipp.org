@@ -347,17 +347,6 @@ impl fmt::Debug for ByteBitmap {
     }
 }
 
-/// A trivial ByteSearcher corresponding to the empty string.
-#[derive(Debug, Copy, Clone)]
-pub struct EmptyString {}
-
-impl ByteSearcher for EmptyString {
-    #[inline(always)]
-    fn find_in(&self, _bytes: &[u8]) -> Option<usize> {
-        Some(0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,8 +376,9 @@ mod tests {
 
     #[test]
     fn empty_search() {
-        assert_eq!(EmptyString {}.find_in(&[1, 2, 3]), Some(0));
-        assert_eq!(EmptyString {}.find_in(&[]), Some(0));
+        use crate::insn::StartPredicate;
+        assert_eq!(StartPredicate::Arbitrary.find_in(&[1, 2, 3]), Some(0));
+        assert_eq!(StartPredicate::Arbitrary.find_in(&[]), Some(0));
     }
 
     #[test]

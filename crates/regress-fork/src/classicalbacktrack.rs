@@ -2360,31 +2360,10 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
 
         let re: &CompiledRegex = self.matcher.re;
         let exhausted = match &re.start_pred {
-            StartPredicate::Arbitrary => self.scan_drain_with_prefix_search(
-                start,
-                cap,
-                sink,
-                &bytesearch::EmptyString {},
-                &mut caps_buf,
-            ),
             StartPredicate::StartAnchored => {
                 self.scan_drain_anchored(start, cap, sink, &mut caps_buf)
             }
-            StartPredicate::ByteSet1(bytes) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bytes, &mut caps_buf)
-            }
-            StartPredicate::ByteSet2(bytes) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bytes, &mut caps_buf)
-            }
-            StartPredicate::ByteSet3(bytes) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bytes, &mut caps_buf)
-            }
-            StartPredicate::ByteSeq(bytes) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bytes.as_ref(), &mut caps_buf)
-            }
-            StartPredicate::ByteBracket(bitmap) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bitmap, &mut caps_buf)
-            }
+            search => self.scan_drain_with_prefix_search(start, cap, sink, search, &mut caps_buf),
         };
         #[cfg(feature = "bounded-backtracking")]
         {
@@ -2675,26 +2654,10 @@ impl<Input: InputIndexer> exec::MatchProducer for BacktrackExecutor<'_, Input> {
         // dispatch under `utf16` is purely an optimization: without it every
         // `find_from`/`find_from_ascii` degraded to a try-at-every-position
         // scan whenever the feature was compiled in.
-        match &self.matcher.re.start_pred {
-            StartPredicate::Arbitrary => {
-                self.next_match_with_prefix_search(pos, next_start, &bytesearch::EmptyString {})
-            }
+        let re: &CompiledRegex = self.matcher.re;
+        match &re.start_pred {
             StartPredicate::StartAnchored => self.next_match_anchored(pos, next_start),
-            StartPredicate::ByteSet1(bytes) => {
-                self.next_match_with_prefix_search(pos, next_start, bytes)
-            }
-            StartPredicate::ByteSet2(bytes) => {
-                self.next_match_with_prefix_search(pos, next_start, bytes)
-            }
-            StartPredicate::ByteSet3(bytes) => {
-                self.next_match_with_prefix_search(pos, next_start, bytes)
-            }
-            StartPredicate::ByteSeq(bytes) => {
-                self.next_match_with_prefix_search(pos, next_start, bytes.as_ref())
-            }
-            StartPredicate::ByteBracket(bitmap) => {
-                self.next_match_with_prefix_search(pos, next_start, bitmap)
-            }
+            search => self.next_match_with_prefix_search(pos, next_start, search),
         }
     }
 
