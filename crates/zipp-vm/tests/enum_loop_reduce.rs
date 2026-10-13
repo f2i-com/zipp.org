@@ -283,7 +283,8 @@ fn count_reduction_fails_closed_for_observable_or_non_int_cases() {
     );
     assert_eq!(
         out,
-        ["2048:1024:b:2048:2048", "2048:1024:1", "2147549136:1024:63"]
+        // One `ownKeys` per for-in, as Node runs it.
+        ["2048:1024:b:1024:2048", "2048:1024:1", "2147549136:1024:63"]
     );
 }
 
@@ -335,7 +336,8 @@ fn proxy_enumeration_stays_on_the_observable_path() {
         console.log(count + ":" + own + ":" + desc + ":" + reads + ":" + j);
         "#,
     );
-    assert_eq!(out, ["10000:4000:4000:4000:b", "4000:6000:8000:4000:2000"]);
+    // One `ownKeys` per for-in, as Node runs it.
+    assert_eq!(out, ["10000:2000:4000:4000:b", "4000:4000:8000:4000:2000"]);
 }
 
 #[test]

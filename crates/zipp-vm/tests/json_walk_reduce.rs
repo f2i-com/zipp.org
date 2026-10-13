@@ -137,7 +137,8 @@ fn proxy_counter_coercion_and_live_self_binding_are_observed() {
     assert_eq!(
         out,
         [
-            "proxy=3,6,0,0,0,0:2,2,2",
+            // One `ownKeys` per for-in, as Node runs it.
+            "proxy=3,6,0,0,0,0:1,2,2",
             "coerce=12,2,0,0,0,0:1",
             "rebind=1001,0,0,0,0,0",
         ]

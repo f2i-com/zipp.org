@@ -901,6 +901,34 @@ impl<'p> Vm<'p> {
             if seen.is_none() {
                 seen = Some(self.shadow_set_of(&plain_levels));
             }
+            // A Proxy level: one [[OwnPropertyKeys]] (its `ownKeys` trap)
+            // serves both the enumerable keys and the shadow set, then one
+            // [[GetOwnProperty]] per string key, as V8 does. The two calls
+            // below each ran the trap. (GC is locked for this whole walk.)
+            if let Some(keys) = self.proxy_own_keys(cur)? {
+                for k in keys {
+                    if !(k.is_heap() && self.heap.is_str_like(k.heap_index())) {
+                        continue;
+                    }
+                    let ks = self.key_of(k);
+                    let desc = self.proxy_gopd(cur, &ks)?.unwrap_or(Value::UNDEFINED);
+                    let enumerable = if desc.is_undefined() {
+                        false
+                    } else {
+                        let en = self.get_prop(desc, "enumerable")?;
+                        self.truthy(en)
+                    };
+                    let text = self.display(k);
+                    if seen.as_mut().is_some_and(|s| s.insert(text)) && enumerable {
+                        out.push(k);
+                    }
+                }
+                cur = self.object_get_prototype_of(cur);
+                if cur == Value::NULL {
+                    break;
+                }
+                continue;
+            }
             let enum_keys = self.object_enum_own(cur, EnumWhat::Keys)?;
             let enum_snap = self.array_snapshot(enum_keys.heap_index());
             for k in &enum_snap {
