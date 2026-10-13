@@ -682,7 +682,7 @@ impl<'p> Vm<'p> {
         let items: Vec<Value> = parts.into_iter().map(|p| self.py_strm_new_as(p, ascii)).collect();
         let arr = Value::heap(self.heap.alloc(HeapObj::Array(items)));
         let list = match (like, copy) {
-            (Some(cls), _) => self.py_alloc_like(tmpl, seq_shape, &[cls, arr])?,
+            (Some(cls), _) => self.py_alloc_like_ready(tmpl, seq_shape, &[cls, arr])?,
             (None, Some((mut rec, slot))) => {
                 rec.set_val_at(slot, arr);
                 self.alloc_object_current_realm(rec)

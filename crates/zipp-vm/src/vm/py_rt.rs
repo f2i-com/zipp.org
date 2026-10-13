@@ -239,6 +239,12 @@ pub(crate) struct PyRt {
     pub(super) pins: Value,
     /// Instance attribute layouts (`vm::py_table::layout`).
     pub(crate) layouts: super::py_table::layout::Layouts,
+    /// The static key plans of the templates `Vm::py_alloc_like` has
+    /// copied (a few), matched to a template's own plan by pointer: a
+    /// record is then allocated from this reference, where a clone of the
+    /// template's `Arc` changed its count twice per record.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(super) plans: Vec<crate::bytecode::StaticKeyPlan>,
 }
 
 /// The first bytes of the string constant a Python code object's frame
@@ -356,6 +362,8 @@ impl PyRt {
             frames: Vec::new(),
             pins: Value::UNDEFINED,
             layouts: Default::default(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            plans: Vec::new(),
         }
     }
 }

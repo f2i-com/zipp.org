@@ -1156,6 +1156,17 @@ impl<'p> Vm<'p> {
         if !self.py_alloc_like_ok(tmpl, shape) {
             return None;
         }
+        self.py_alloc_like_ready(tmpl, shape, vals)
+    }
+
+    /// [`Vm::py_alloc_like`] of a template its caller has just found
+    /// [`Vm::py_alloc_like_ok`] for `shape` (nothing that could change the
+    /// template has run since). The record is allocated from the template's
+    /// own key plan, borrowed from the registry's copy of it (`PyRt::plans`,
+    /// the same `Arc` by pointer) rather than cloned, which changed the
+    /// plan's count twice per record.
+    #[inline(never)]
+    pub(super) fn py_alloc_like_ready(&mut self, tmpl: Value, shape: u32, vals: &[Value]) -> Option<Value> {
         let HeapObj::Object(m) = self.heap.get(tmpl.heap_index()) else {
             return None;
         };
@@ -1165,8 +1176,30 @@ impl<'p> Vm<'p> {
         let crate::heap::PropKeys::Planned { all, .. } = &m.keys else {
             return None;
         };
-        let plan = all.clone();
-        let idx = self.heap.alloc_finalized(&plan, vals, shape);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let idx = {
+            let kept = self.py_rt.as_deref().and_then(|p| p.plans.iter().position(|k| crate::bytecode::StaticKeyPlan::ptr_eq(k, all)));
+            match kept {
+                Some(i) => {
+                    let p = self.py_rt.as_deref()?;
+                    self.heap.alloc_finalized(&p.plans[i], vals, shape)
+                }
+                None => {
+                    let plan = all.clone();
+                    if let Some(p) = self.py_rt.as_deref_mut() {
+                        if p.plans.len() < 8 {
+                            p.plans.push(plan.clone());
+                        }
+                    }
+                    self.heap.alloc_finalized(&plan, vals, shape)
+                }
+            }
+        };
+        #[cfg(feature = "safe-sandbox")]
+        let idx = {
+            let plan = all.clone();
+            self.heap.alloc_finalized(&plan, vals, shape)
+        };
         self.realm_born(idx, self.obj_proto);
         Some(Value::heap(idx))
     }
@@ -1205,11 +1238,11 @@ impl<'p> Vm<'p> {
         if !self.py_alloc_like_ok(tmpl, exc_shape) || !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
             return None;
         }
-        let tuple = self.py_alloc_like(seq_tmpl, seq_shape, &[ttuple, args])?;
+        let tuple = self.py_alloc_like_ready(seq_tmpl, seq_shape, &[ttuple, args])?;
         let map = self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
         self.adopt_native_result_realm(map, self.map_proto);
         let vals = [cls, Value::heap(map), tuple, Value::NULL, context, Value::int(-1), Value::FALSE, Value::NULL, Value::int(0), Value::UNDEFINED];
-        self.py_alloc_like(tmpl, exc_shape, &vals)
+        self.py_alloc_like_ready(tmpl, exc_shape, &vals)
     }
 
     /// The Array for [`Instr::PyUnpack`].

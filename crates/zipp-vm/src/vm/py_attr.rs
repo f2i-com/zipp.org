@@ -1010,7 +1010,7 @@ impl<'p> Vm<'p> {
         }
         let cap = self.py_rt.as_deref().map_or(0, |p| p.layouts.presize(cls));
         let map = self.py_attrs_new(cap);
-        let obj = self.py_alloc_like(tmpl, inst_shape, &[cls, map])?;
+        let obj = self.py_alloc_like_ready(tmpl, inst_shape, &[cls, map])?;
         if (entry_slot, init_slot) != (entry_hint, init_hint) {
             if let (Ok(pos), Ok(hver)) = (u32::try_from(entry_slot), u32::try_from(init_slot)) {
                 self.py_ic_put(func_id, ip, PyIc { kind: ic::NEW, pos, hver, ..PyIc::default() });
