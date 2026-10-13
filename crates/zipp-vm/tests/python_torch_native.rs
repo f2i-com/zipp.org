@@ -814,3 +814,79 @@ fn fused_recurrent_cells_give_the_composites_bytes() {
     let cases: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
     assert_eq!(cases, 120, "{}", out[0]);
 }
+
+/// The native MT19937 draws (`pt_rng`) against tensor.js's loops: the same
+/// generator from the same seed, native loops off then on, must draw the
+/// same bytes for rand / randn / normal_ / uniform_ in float32 and float64
+/// at every size (the blocks of 16, a size no multiple of 16, the twist
+/// every 624 words), leave the same generator state, and continue a stream
+/// restored with set_rng_state or drawn through another Generator.
+const DRAWS: &str = r#"
+import torch
+import _zipp_tensor as _k
+
+SIZES = list(range(1, 41)) + [47, 63, 64, 100, 255, 623, 624, 625, 1000, 1249]
+
+
+def draws(native):
+    _k._native(native)
+    out = []
+    for seed in (0, 12345):
+        torch.manual_seed(seed)
+        for n in SIZES:
+            out.append(torch.rand(n))
+            out.append(torch.randn(n))
+            out.append(torch.rand(n, dtype=torch.float64))
+            out.append(torch.randn(n, dtype=torch.float64))
+            t = torch.empty(n)
+            t.normal_(0.5, 2.0)
+            out.append(t)
+            t = torch.empty(n, dtype=torch.float64)
+            t.normal_(-1.25, 0.3)
+            out.append(t)
+            t.uniform_(-0.5, 0.25)
+            out.append(t)
+            out.append(torch.randn(n, dtype=torch.float16))
+        out.append(torch.get_rng_state())
+        st = torch.get_rng_state()
+        a = torch.randn(40)
+        torch.set_rng_state(st)
+        out.append(a)
+        out.append(torch.randn(40))
+        g = torch.Generator().manual_seed(seed + 1)
+        out.append(torch.rand(700, generator=g))
+        out.append(torch.randn(33, generator=g))
+        out.append(g.get_state())
+    return [_k.tobytes(t._s) for t in out]
+
+
+ref = draws(False)
+got = draws(True)
+bad = [i for i in range(len(ref)) if ref[i] != got[i]]
+print("draws", len(ref), "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn native_random_draws_give_the_javascript_loops_bytes() {
+    let run = run(DRAWS, 20_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("mismatches 0 []"), "{}", out[0]);
+    let draws: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(draws, 2 * (50 * 8 + 6), "{}", out[0]);
+}
+
+/// A native draw is charged, below what the interpreted loop spends.
+#[test]
+fn native_random_draws_are_charged() {
+    let program = |native: bool| {
+        format!(
+            "import torch\nimport _zipp_tensor as _k\n_k._native({})\ntorch.manual_seed(1)\nprint(float(torch.randn(4096).sum()), float(torch.rand(4096).sum()))\n",
+            if native { "True" } else { "False" }
+        )
+    };
+    let native = run(&program(true), 2_000_000_000, false);
+    let interpreted = run(&program(false), 2_000_000_000, false);
+    assert_eq!(native.output.clone().unwrap(), interpreted.output.clone().unwrap());
+    assert!(native.steps + 100_000 < interpreted.steps, "{} vs {}", native.steps, interpreted.steps);
+}

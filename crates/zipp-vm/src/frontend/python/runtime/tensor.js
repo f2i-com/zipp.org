@@ -39,7 +39,7 @@
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
         N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23,
-        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32;
+        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32, N_RNG = 33;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -2300,9 +2300,27 @@
         // `nd`: the second value of the last Box-Muller pair of PyTorch's
         // scalar normal path (CPUGeneratorImpl's next_double_normal_sample),
         // null when there is none.
-        const s = { mt: new Uint32Array(624), i: 625, nd: null };
+        const s = mtStateNew();
         seedMt(s, seed >>> 0);
         return s;
+    }
+    // A state record: the words, a byte view of them (`m8`, what the native
+    // draws read and advance), the position and the cached normal.
+    function mtStateNew() {
+        const m = new Uint32Array(624);
+        return { mt: m, m8: new Uint8Array(m.buffer), i: 624, nd: null };
+    }
+    // The native draws (`vm::py_tensor`, `pt_rng`): `mode` 0 rand float32,
+    // 1 nextDouble, 2 randn float32 and 3 randn float64 (16 or more), the
+    // same words and values as the loops below; they advance the state in
+    // place. False when they decline (the loops then run).
+    const RNG_POS = new Float64Array(1);
+    function rngNative(s, mode, O, mean, std) {
+        if (NATIVE === null) return false;
+        RNG_POS[0] = s.i;
+        if (!NATIVE(N_RNG, mode, s.m8, RNG_POS, O, mean, std)) return false;
+        s.i = RNG_POS[0];
+        return true;
     }
     function seedMt(s, seed) {
         const m = s.mt; m[0] = seed >>> 0;
@@ -2356,7 +2374,7 @@
         needGen(g); needS(st);
         const len = st.data.length;
         if (len !== STATE_BYTES && len !== STATE_BYTES_NORMAL) fail(E.RuntimeError, "Expected a generator state of " + STATE_BYTES_NORMAL + " bytes, got " + len);
-        const bytes = Uint8Array.from(st.data), v = new DataView(bytes.buffer), mtState = { mt: new Uint32Array(624), i: 0, nd: null };
+        const bytes = Uint8Array.from(st.data), v = new DataView(bytes.buffer), mtState = mtStateNew();
         for (let i = 0; i < 624; i++) mtState.mt[i] = v.getUint32(i * 4, true);
         mtState.i = v.getUint32(624 * 4, true);
         if (mtState.i > 624) fail(E.RuntimeError, "invalid generator state");
@@ -2372,7 +2390,9 @@
     function rand(g, n, dtype) {
         // float32 uniform from 24 random bits, as torch's uniform_ for float;
         // float16 from 11 and bfloat16 from 8 (their mantissa digits).
-        const s = needGen(g), out = work(dtype, n), O = out.data, W = new Uint32Array(n);
+        const s = needGen(g), out = work(dtype, n), O = out.data;
+        if (dtype === "float32" && n >= 16 && rngNative(s, 0, O, 0, 0)) return out;
+        const W = new Uint32Array(n);
         next32Into(s, W, n);
         if (dtype === "float16") for (let i = 0; i < n; i++) O[i] = (W[i] & 0x7ff) * 0.00048828125;
         else if (dtype === "bfloat16") for (let i = 0; i < n; i++) O[i] = (W[i] & 0xff) * 0.00390625;
@@ -2381,6 +2401,7 @@
     }
     function randDouble(g, n) {
         const s = needGen(g), out = alloc("float64", n), O = out.data;
+        if (n >= 16 && rngNative(s, 1, O, 0, 0)) return out;
         for (let i = 0; i < n; i++) O[i] = nextDouble(s);
         return out;
     }
@@ -2514,6 +2535,10 @@
         const s = needGen(g), out = work(dtype, n), O = out.data;
         if (n < 16) {
             for (let i = 0; i < n; i++) O[i] = normalDouble(s) * std + mean;
+        } else if (dtype === "float32" && rngNative(s, 2, O, mean, std)) {
+            // (the native draws wrote O)
+        } else if (dtype === "float64" && rngNative(s, 3, O, mean, std)) {
+            // (the native draws wrote O)
         } else if (dtype === "float32") {
             const D = new Float64Array(n), mn = fr(mean), sd = fr(std);
             for (let i = 0; i < n; i++) D[i] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
