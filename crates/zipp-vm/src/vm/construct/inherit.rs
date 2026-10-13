@@ -66,6 +66,173 @@ impl<'p> Vm<'p> {
     /// operator's non-overridden path. A bound function resolves to its target; a
     /// throwing `prototype` getter / non-object prototype propagates per spec
     /// (unlike the operator's cached-prototype fast path).
+    /// `v instanceof c`: GetMethod(c, @@hasInstance) and its call, or
+    /// OrdinaryHasInstance; `instanceof_fast` first. The interpreter's
+    /// `InstanceOfDyn` and the compiled tiers' helper (`jit_instanceof_ic`)
+    /// both run it.
+    pub(crate) fn instance_of_op(&mut self, c: Value, v: Value) -> Result<bool, Thrown> {
+        if let Some(b) = self.instanceof_fast(c, v) {
+            return Ok(b);
+        }
+        // GetMethod(RHS, @@hasInstance): an inherited or own callable
+        // handler fully governs `instanceof`; invoke it with the LHS
+        // and coerce the result to boolean. If the method is absent,
+        // the checked OrdinaryHasInstance path below is the only
+        // fallback.
+        if c.is_heap() {
+            let hi = self.get_prop(c, "@@hasInstance")?;
+            // The built-in Function.prototype[@@hasInstance] is
+            // OrdinaryHasInstance.  Invoke that algorithm directly
+            // (rather than skipping the method by native-function
+            // identity): users may deliberately install the same
+            // intrinsic method on an otherwise non-callable object,
+            // where it must return false instead of falling through
+            // to the operator's "RHS not callable" TypeError.
+            let is_builtin = hi.is_heap()
+                && matches!(self.heap.get(hi.heap_index()),
+                    HeapObj::Native(n) if *n == native::FN_HAS_INSTANCE);
+            if self.is_callable(hi) {
+                let b = if is_builtin {
+                    self.ordinary_has_instance(c, v)?
+                } else {
+                    let res = self.call_value(hi, c, &[v])?;
+                    self.truthy(res)
+                };
+                return Ok(b);
+            }
+            // GetMethod step 3: a @@hasInstance that is PRESENT but
+            // not callable is a TypeError — it never falls back to
+            // OrdinaryHasInstance. Only undefined/null count as
+            // absent. A plain-object RHS reached the same TypeError
+            // by accident (kind 0 below), but a callable RHS — a
+            // Proxy over a function, say — silently answered `false`.
+            if hi != Value::UNDEFINED && hi != Value::NULL && !self.is_callable(hi)
+            {
+                return Err(Thrown(
+                    "TypeError: Symbol.hasInstance handler is not callable".into(),
+                ));
+            }
+        }
+        // With no @@hasInstance method, the RHS must be callable and
+        // OrdinaryHasInstance is authoritative. In particular, do
+        // not consult ObjMap.class: Object.setPrototypeOf can unlink
+        // an instance while that allocation-time lineage remains.
+        // `Symbol`/`BigInt` are callable globals (typeof "function")
+        // but not constructors (is_ctor false), so `is_callable` skips
+        // them; for `instanceof` they ARE valid right operands â€”
+        // OrdinaryHasInstance reads their .prototype and yields false
+        // for a non-wrapper LHS (e.g. `x instanceof Symbol`), never a
+        // "not callable" TypeError. (deepEqual.js guards these with
+        // `typeof X === 'function'`, then does `v instanceof X`.)
+        let c_callable = c.is_heap()
+            && (self.is_callable(c)
+                || (self.symbol_ctor != 0 && c.heap_index() == self.symbol_ctor)
+                || (self.bigint_ctor != 0 && c.heap_index() == self.bigint_ctor));
+        if !c_callable {
+            return Err(Thrown(
+                "TypeError: Right-hand side of 'instanceof' is not callable".into(),
+            ));
+        }
+        self.ordinary_has_instance(c, v)
+    }
+
+    /// `v instanceof c` for a plain function or class `c`, when nothing can
+    /// observe the difference from the full operator: no `@@hasInstance` on
+    /// `c`, on a parent class or on a replaced [[Prototype]] can shadow
+    /// %Function.prototype%'s (which is non-writable and non-configurable, so
+    /// it is the intrinsic OrdinaryHasInstance), `c.prototype` is read without
+    /// a getter, and no Proxy is on `v`'s chain (its trap would be observable).
+    /// `None`, with nothing observable done, sends the caller to the full
+    /// operator. The general path paid a property lookup of `@@hasInstance` up
+    /// the class's statics and %Function.prototype% for every test.
+    pub(crate) fn instanceof_fast(&mut self, c: Value, v: Value) -> Option<bool> {
+        if !c.is_heap() {
+            return None;
+        }
+        let ci = c.heap_index();
+        let mut cur = ci;
+        let mut chain_ok = false;
+        for _ in 0..64 {
+            match self.heap.get(cur) {
+                HeapObj::Func(_) | HeapObj::Closure { .. } => {
+                    if self
+                        .fn_props
+                        .get(&cur)
+                        .is_some_and(|m| m.pos("@@hasInstance").is_some())
+                        || self.proto_of.get(&cur).is_some()
+                    {
+                        return None;
+                    }
+                    chain_ok = true;
+                    break;
+                }
+                HeapObj::Class(cc) => {
+                    if cc.statics.pos("@@hasInstance").is_some()
+                        || cc.static_getters.iter().any(|(k, _)| k == "@@hasInstance")
+                        || cc.static_setters.iter().any(|(k, _)| k == "@@hasInstance")
+                        || self.proto_of.get(&cur).is_some()
+                    {
+                        return None;
+                    }
+                    match cc.parent {
+                        // A base class (and `extends null`) inherits from
+                        // %Function.prototype% itself.
+                        None => {
+                            chain_ok = true;
+                            break;
+                        }
+                        Some(p) => cur = p,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if !chain_ok {
+            return None;
+        }
+        // C.prototype: a function that has none of its own (an arrow, a
+        // method; the general path throws), a generator or async function
+        // (their own prototype objects), or an own `prototype` in the side
+        // table (an accessor, or a non-object reassignment) keeps the full
+        // path.
+        if matches!(self.heap.get(ci), HeapObj::Func(_) | HeapObj::Closure { .. }) {
+            let Some((fid, _)) = self.ic_plain_fn(c) else {
+                return None;
+            };
+            let f = self.func(fid as usize);
+            if f.non_constructable
+                || f.lexical_this
+                || self
+                    .fn_props
+                    .get(&ci)
+                    .is_some_and(|m| m.pos("prototype").is_some())
+            {
+                return None;
+            }
+        }
+        let p = self.prototype_of(c)?;
+        if !self.is_object_value(p) {
+            return None;
+        }
+        if !self.is_object_value(v) {
+            return Some(false);
+        }
+        let mut cur = v;
+        for _ in 0..10_000 {
+            if self.proxy_parts(cur.heap_index()).is_some() {
+                return None;
+            }
+            cur = self.object_get_prototype_of(cur);
+            if !cur.is_heap() {
+                return Some(false);
+            }
+            if cur == p {
+                return Some(true);
+            }
+        }
+        None
+    }
+
     pub(crate) fn ordinary_has_instance(&mut self, mut c: Value, v: Value) -> Result<bool, Thrown> {
         // Bound functions are guest-chainable. OrdinaryHasInstance delegates to
         // [[BoundTargetFunction]], but doing that with a Rust self-call lets one
@@ -113,9 +280,11 @@ impl<'p> Vm<'p> {
             None => self.get_prop(c, "prototype")?,
         };
         if !self.is_object_value(p) {
-            return Err(Thrown::from_static(
-                "TypeError: Function has non-object prototype in instanceof check",
-            ));
+            // Node's wording, which names the value.
+            return Err(Thrown(format!(
+                "TypeError: Function has non-object prototype '{}' in instanceof check",
+                self.display(p)
+            )));
         }
         // Walk V's prototype chain via [[GetPrototypeOf]] (proxy-trap-aware): a
         // throwing getPrototypeOf trap propagates per OrdinaryHasInstance step 7.b.

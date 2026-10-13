@@ -1029,6 +1029,50 @@ pub(crate) extern "win64" fn jit_new_ic(
     })
 }
 
+/// Win64 helper for `ToStr` (a template literal's `${v}`) in a compiled region
+/// or Tier C body: `Vm::to_str_value` on register `packed_args & 0xFFFF`. An
+/// object's `toString`/`valueOf` (or `@@toPrimitive`) is user code, so the
+/// call protocol applies: a throw bails, the call site refetches afterwards
+/// (a number's string is also an allocation).
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_to_str_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_to_str_impl(caller_base_ptr, packed_args)
+    })
+}
+
+/// Win64 helper for `InstanceOfDyn` (`v instanceof c`) in a compiled region
+/// or Tier C body: `Vm::instance_of_op` on the two registers r9 names,
+/// `(ctor_reg<<16)|val_reg`. A `@@hasInstance` method, a prototype getter or
+/// a Proxy trap can run user code, so the call protocol applies: a throw
+/// bails, and the call site refetches afterwards.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_instanceof_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_instanceof_impl(caller_base_ptr, packed_args)
+    })
+}
+
 /// Win64 helper for a captured-reference `CallWithThis`: resolve the exact
 /// callable held in `callee_reg` through the ordinary call IC, and invoke it
 /// with the exact value held in `this_reg`. No property name or receiver shape

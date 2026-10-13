@@ -1050,6 +1050,65 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind [`jit_to_str_ic`]: `to_str_value` on the
+    /// caller's register, the result's bits.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_to_str_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let v = self.get(base, (packed_args & 0xFFFF) as u16);
+        // A string is its own result: no user code, nothing to count.
+        if v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
+        {
+            return v.bits();
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        self.jit_call_depth += 1;
+        let r = self.to_str_value(v);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(s) => s.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind [`jit_instanceof_ic`]: `instance_of_op` on the
+    /// caller's two registers, its result as a boolean's bits.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_instanceof_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let c = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
+        let v = self.get(base, (packed_args & 0xFFFF) as u16);
+        self.jit_call_depth += 1;
+        let r = self.instance_of_op(c, v);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(b) => Value::bool(b).bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// `new F(args…)` from a compiled region or Tier C body when `F` is a plain
     /// constructor function: what `construct` does for one (the instance's
     /// [[Prototype]] from `F.prototype`, the body run with `this` bound to the

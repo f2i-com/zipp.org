@@ -724,6 +724,19 @@ pub(crate) fn region_op_admitted(
         Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
         // `new F(…)`: the construct helper, with the call protocol.
         Instr::New { .. } => {}
+        // `v instanceof c`: the operator's helper, with the call protocol (a
+        // `@@hasInstance` method or a Proxy trap is user code).
+        Instr::InstanceOfDyn { .. } => {}
+        // A template literal's `${v}`: `jit_to_str_ic`, with the call protocol
+        // (an object's `toString` is user code).
+        Instr::ToStr { .. } => {}
+        // Array and object literals: the helpers Tier C calls (allocation is
+        // a safe point; the emitter refetches after it).
+        Instr::NewArray { .. }
+        | Instr::NewObject { .. }
+        | Instr::NewPlannedObject { .. }
+        | Instr::AppendDataProp { .. }
+        | Instr::FinalizeObject { .. } => {}
         // Logical `!` — MEM path (Bool flips natively; anything else goes
         // through the `jit_truthy` helper).
         Instr::Not { .. } => {}
@@ -760,11 +773,13 @@ pub(crate) fn region_op_admitted(
         Instr::LoadUndefined { .. } | Instr::LoadNull { .. } => {}
         // Fused `typeof` comparisons — MEM paths via PURE classifier
         // helpers. They allocate nothing, run no user code and are total.
-        // helper (no alloc, no user code, total). The UNFUSED `TypeOf` is
-        // still not admitted here: it allocates its result string, and after
-        // this fusion the bare form is rare enough not to be worth the
-        // refetch plumbing.
-        Instr::TypeOfIs { .. } | Instr::TypeOfSame { .. } => {}
+        // helper (no alloc, no user code, total).
+        Instr::TypeOfIs { .. } | Instr::TypeOfSame { .. } | Instr::TypeOf { .. } => {}
+        // The unfused `typeof v` (a `switch (typeof v)`, a stored result):
+        // the canonical result string through `jit_typeof`, which runs no
+        // user code; the emitter refetches after it, as after an allocating
+        // helper, though the canonical strings are made once at setup. A
+        // single one declined the whole region before.
         // `Promise.resolve(x)` / `Number.is*(x)` at exactly one argument —
         // MEM path via `jit_static_fn`. `Promise.resolve` was async-
         // promise-chain's fill-loop's ONLY blocker (`a[j] =

@@ -38,6 +38,9 @@ pub(super) const CONST_STRING_CACHE_MAX_BYTES: usize = 256;
 pub(super) const CONST_STRING_CACHE_WIDE_ENTRIES: usize = 4096;
 /// See [`CONST_STRING_CACHE_WIDE_ENTRIES`].
 pub(super) const CONST_STRING_CACHE_NAME_BYTES: usize = 32;
+/// Functions whose cached slots are also kept in the dense mirror
+/// (`Vm::const_string_dense`); a function past it keeps the map alone.
+pub(super) const CONST_DENSE_FUNCS: usize = 4096;
 /// Dynamic code installs monotonically increasing function ids. Bound the
 /// accompanying eligibility memo too; beyond it we fail closed to fresh loads.
 #[cfg(feature = "jit")]
@@ -123,6 +126,15 @@ impl Vm<'_> {
         if !self.const_string_cache_enabled {
             return self.resolve_const(func_id, raw);
         }
+        if let Some(&v) = self
+            .const_string_dense
+            .get(func_id as usize)
+            .and_then(|f| f.get(const_idx as usize))
+        {
+            if !v.is_undefined() {
+                return v;
+            }
+        }
 
         let string_idx = (raw.heap_index() & !crate::vm::helpers_misc::STRING_CONST_BIT) as usize;
         let source_bytes = self.func(func_id as usize).string_constants[string_idx].len();
@@ -158,6 +170,20 @@ impl Vm<'_> {
         #[cfg(not(feature = "jit"))]
         self.heap.freeze_shared_str(resolved.heap_index());
         self.const_string_cache.insert(key, resolved);
+        let f = func_id as usize;
+        if f < CONST_DENSE_FUNCS {
+            if self.const_string_dense.len() <= f {
+                self.const_string_dense.resize(f + 1, Vec::new());
+            }
+            let n = self.func(f).constants.len();
+            let slots = &mut self.const_string_dense[f];
+            if slots.len() < n {
+                slots.resize(n, Value::UNDEFINED);
+            }
+            if let Some(slot) = slots.get_mut(const_idx as usize) {
+                *slot = resolved;
+            }
+        }
         resolved
     }
 }
@@ -200,6 +226,7 @@ mod tests {
         let mut vm = vm(r#"function value() { return "cache-me-please"; }"#);
         let (func_id, const_idx) = literal_slot(&vm, "cache-me-please");
         vm.const_string_cache.clear();
+        vm.const_string_dense.clear();
 
         let first = vm.resolve_const_slot(func_id, const_idx);
         let second = vm.resolve_const_slot(func_id, const_idx);
@@ -207,6 +234,7 @@ mod tests {
         assert_eq!(vm.const_string_cache.len(), 1);
 
         vm.const_string_cache.clear();
+        vm.const_string_dense.clear();
         vm.const_string_cache_enabled = false;
         let fresh_a = vm.resolve_const_slot(func_id, const_idx);
         let fresh_b = vm.resolve_const_slot(func_id, const_idx);
@@ -219,6 +247,7 @@ mod tests {
         let mut vm = vm(r#"function value() { return "cache-root-check"; }"#);
         let (func_id, const_idx) = literal_slot(&vm, "cache-root-check");
         vm.const_string_cache.clear();
+        vm.const_string_dense.clear();
         vm.regs.clear();
 
         let cached = vm.resolve_const_slot(func_id, const_idx);
@@ -306,6 +335,7 @@ mod tests {
             .contains_key(&slot_key(long_func, long_const)));
 
         vm.const_string_cache.clear();
+        vm.const_string_dense.clear();
         for n in 0..CONST_STRING_CACHE_MAX_ENTRIES as u64 {
             vm.const_string_cache
                 .insert(u64::MAX - n, Value::heap(crate::heap::INTERN_EMPTY));
@@ -328,6 +358,7 @@ mod tests {
 function wide_value() {{ return {wide:?}; }}");
         let mut vm = vm(&source);
         vm.const_string_cache.clear();
+        vm.const_string_dense.clear();
         for n in 0..CONST_STRING_CACHE_WIDE_ENTRIES as u64 {
             vm.const_string_cache
                 .insert(u64::MAX - n, Value::heap(crate::heap::INTERN_EMPTY));
@@ -357,6 +388,7 @@ function wide_value() {{ return {wide:?}; }}");
             function right() { return "right-function-literal"; }
             "#);
         vm.const_string_cache.clear();
+        vm.const_string_dense.clear();
         let (left_func, left_const) = literal_slot(&vm, "left-function-literal");
         let (right_func, right_const) = literal_slot(&vm, "right-function-literal");
         assert_ne!(left_func, right_func);

@@ -4192,69 +4192,8 @@ impl<'p> Vm<'p> {
                     Instr::InstanceOfDyn { dst, val, ctor } => {
                         let v = self.get(base, val);
                         let c = self.get(base, ctor);
-                        // GetMethod(RHS, @@hasInstance): an inherited or own callable
-                        // handler fully governs `instanceof`; invoke it with the LHS
-                        // and coerce the result to boolean. If the method is absent,
-                        // the checked OrdinaryHasInstance path below is the only
-                        // fallback.
-                        if c.is_heap() {
-                            let hi = self.get_prop(c, "@@hasInstance")?;
-                            // The built-in Function.prototype[@@hasInstance] is
-                            // OrdinaryHasInstance.  Invoke that algorithm directly
-                            // (rather than skipping the method by native-function
-                            // identity): users may deliberately install the same
-                            // intrinsic method on an otherwise non-callable object,
-                            // where it must return false instead of falling through
-                            // to the operator's "RHS not callable" TypeError.
-                            let is_builtin = hi.is_heap()
-                                && matches!(self.heap.get(hi.heap_index()),
-                                    HeapObj::Native(n) if *n == native::FN_HAS_INSTANCE);
-                            if self.is_callable(hi) {
-                                let b = if is_builtin {
-                                    self.ordinary_has_instance(c, v)?
-                                } else {
-                                    let res = self.call_value(hi, c, &[v])?;
-                                    self.truthy(res)
-                                };
-                                self.set(base, dst, Value::bool(b));
-                                ip += 1;
-                                continue;
-                            }
-                            // GetMethod step 3: a @@hasInstance that is PRESENT but
-                            // not callable is a TypeError — it never falls back to
-                            // OrdinaryHasInstance. Only undefined/null count as
-                            // absent. A plain-object RHS reached the same TypeError
-                            // by accident (kind 0 below), but a callable RHS — a
-                            // Proxy over a function, say — silently answered `false`.
-                            if hi != Value::UNDEFINED && hi != Value::NULL && !self.is_callable(hi)
-                            {
-                                return Err(Thrown(
-                                    "TypeError: Symbol.hasInstance handler is not callable".into(),
-                                ));
-                            }
-                        }
-                        // With no @@hasInstance method, the RHS must be callable and
-                        // OrdinaryHasInstance is authoritative. In particular, do
-                        // not consult ObjMap.class: Object.setPrototypeOf can unlink
-                        // an instance while that allocation-time lineage remains.
-                        // `Symbol`/`BigInt` are callable globals (typeof "function")
-                        // but not constructors (is_ctor false), so `is_callable` skips
-                        // them; for `instanceof` they ARE valid right operands â€”
-                        // OrdinaryHasInstance reads their .prototype and yields false
-                        // for a non-wrapper LHS (e.g. `x instanceof Symbol`), never a
-                        // "not callable" TypeError. (deepEqual.js guards these with
-                        // `typeof X === 'function'`, then does `v instanceof X`.)
-                        let c_callable = c.is_heap()
-                            && (self.is_callable(c)
-                                || (self.symbol_ctor != 0 && c.heap_index() == self.symbol_ctor)
-                                || (self.bigint_ctor != 0 && c.heap_index() == self.bigint_ctor));
-                        if !c_callable {
-                            return Err(Thrown(
-                                "TypeError: Right-hand side of 'instanceof' is not callable".into(),
-                            ));
-                        }
-                        let r = self.ordinary_has_instance(c, v)?;
-                        self.set(base, dst, Value::bool(r));
+                        let b = self.instance_of_op(c, v)?;
+                        self.set(base, dst, Value::bool(b));
                         ip += 1;
                     }
                     Instr::StaticFn {

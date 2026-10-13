@@ -1569,6 +1569,11 @@ pub struct Vm<'p> {
     /// are explicit GC roots because the map is VM-internal. See
     /// `const_cache.rs` for the mutation exclusion and resource bounds.
     const_string_cache: rustc_hash::FxHashMap<u64, Value>,
+    /// The same entries by function and slot (`const_cache::CONST_DENSE_FUNCS`
+    /// functions at most), `UNDEFINED` where none: a loaded literal is two
+    /// indexed reads instead of a hash probe, which was 14% of an interpreted
+    /// `switch (typeof x)` loop. The map stays the owner (and the GC root).
+    const_string_dense: Vec<Vec<Value>>,
     /// The heap string enumeration hands out for a property key, by the key's
     /// stored text (`Vm::alloc_key_str`). `for (k in o)`, `Object.keys` and
     /// their kin made a fresh string for every key of every object on every

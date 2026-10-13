@@ -1282,6 +1282,10 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
             // `new F(…)`: the construct helper, with the call protocol.
             Instr::New { .. } => {}
+            // `v instanceof c`: the operator's helper, with the call protocol.
+            Instr::InstanceOfDyn { .. } => {}
+            // `${v}`: the conversion's helper, with the call protocol.
+            Instr::ToStr { .. } => {}
             // Proper-tail-call PREFIX: the compiler always emits `TailCall`
             // immediately before an ordinary `Call`+`Return` of the same site
             // (compile/bindings.rs, compile/exprs.rs), and the interpreter's
@@ -1705,6 +1709,8 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 arg_base,
                 argc,
             } => (Uses::range(arg_base, argc).plus(callee), Some(dst)),
+            Instr::InstanceOfDyn { dst, val, ctor } => (u2(val, ctor), Some(dst)),
+            Instr::ToStr { dst, a } => (u1(a), Some(dst)),
             Instr::CallWithThis {
                 dst,
                 callee,
@@ -5782,6 +5788,42 @@ pub(crate) fn compile_proto_mem(
                 if cross {
                     dynasm!(ops ; => cross_done);
                 }
+            }
+            Instr::ToStr { dst, a } => {
+                // `${a}` through `jit_to_str_ic`; see the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_to_str_ic as usize,
+                    packed_fip,
+                    a as u64,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::InstanceOfDyn { dst, val, ctor } => {
+                // `v instanceof c` through `jit_instanceof_ic`; see the
+                // region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed_args = ((ctor as u64) << 16) | val as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_instanceof_ic as usize,
+                    packed_fip,
+                    packed_args,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
             }
             Instr::New {
                 dst,
