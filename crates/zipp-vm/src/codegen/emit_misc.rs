@@ -865,7 +865,6 @@ pub(crate) fn region_poly_eq(
     let definitely_ne = ops.new_dynamic_label();
     let a_is_dbl = ops.new_dynamic_label();
     let b_is_dbl = ops.new_dynamic_label();
-    let a_not_heap = ops.new_dynamic_label();
     let do_bits = ops.new_dynamic_label();
     let store = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
@@ -886,24 +885,29 @@ pub(crate) fn region_poly_eq(
         ; sub edx, TAG_LO as i32
         ; cmp edx, (TAG_HI - TAG_LO) as i32
         ; ja => b_is_dbl                      // b is a double, a is tagged
-        // Neither is a double. Bail if EITHER is a heap value outside the
-        // immutable prefix (a dynamic string / object — needs full strict_eq).
+        // Neither is a double. Identical bits are `===` (the same Int, Bool,
+        // null, undefined, or the same heap value). A heap value (string,
+        // object, symbol, BigInt) against a tagged non-heap value is never
+        // `===`, so differing bits answer it too: `x === null`, `o?.a`, `??`
+        // with an object operand. Only two DIFFERENT heap values, one of
+        // them outside the immutable prefix (a dynamic string: equal
+        // content; a BigInt), need the full `strict_eq` helper.
+        ; cmp rax, rcx
+        ; je => do_bits
         ; mov rdx, rax
         ; shr rdx, 48
         ; cmp edx, TAG_HEAP_HI as i32
-        ; jne => a_not_heap
-        ; mov rdx, rax
+        ; jne => do_bits                       // a not heap: bits differ
+        ; mov rdx, rcx
+        ; shr rdx, 48
+        ; cmp edx, TAG_HEAP_HI as i32
+        ; jne => do_bits                       // b not heap: bits differ
         ; mov r9, QWORD PAYLOAD_MASK as i64
+        ; mov rdx, rax
         ; and rdx, r9
         ; cmp rdx, USER_OBJ_START as i32
         ; jae => slow                          // a: non-interned heap → helper
-        ; => a_not_heap
         ; mov rdx, rcx
-        ; shr rdx, 48
-        ; cmp edx, TAG_HEAP_HI as i32
-        ; jne => do_bits
-        ; mov rdx, rcx
-        ; mov r9, QWORD PAYLOAD_MASK as i64
         ; and rdx, r9
         ; cmp rdx, USER_OBJ_START as i32
         ; jae => slow                          // b: non-interned heap → helper
