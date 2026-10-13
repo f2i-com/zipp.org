@@ -95,6 +95,28 @@ for i in range(3000):
     out.append(uses_len("abc"))
 print(out[999], out[1000], out[1999], out[2000], sum(out))
 
+# A generator with no loop reads its globals lazily, across a suspension.
+def steps():
+    yield SCALE
+    yield len(names)
+    yield SCALE * 2
+
+
+g2 = steps()
+first = next(g2)
+SCALE = 7
+rest = [next(g2), next(g2)]
+print(first, rest)
+SCALE = 3
+acc = 0
+for i in range(3000):
+    if i == 1500:
+        SCALE = 4
+    for v in steps():
+        acc += v
+print(acc)
+SCALE = 3
+
 counts = [counter() for _ in range(5)]
 print(counts, SCALE)
 print([scaled(i) for i in range(3)], outer(1), K().m(2), lam(1))
