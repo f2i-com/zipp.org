@@ -636,6 +636,18 @@ impl<'p> Vm<'p> {
                     None => Value::UNDEFINED,
                 }));
             }
+            // No-clone `replace`/`replaceAll` of a plain string by a plain
+            // string with no `$` pattern: no user code can run (neither
+            // operand is an object, so no `@@replace`, `toString` or RegExp
+            // check), so the result is built from the three strings in place
+            // instead of after the receiver copy below. Anything else falls
+            // through to the general path.
+            "replace" | "replaceAll" => {
+                let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if let Some(v) = self.replace_plain_strings_fast(idx, arg0, repl, name == "replaceAll")? {
+                    return Ok(Some(v));
+                }
+            }
             // No-clone substring/slice: produce the O(slice) result by borrowing
             // the receiver and slicing its WTF-8 directly — skipping the two
             // full-receiver copies (`js.clone()` + `to_lossy_string()`) the generic
@@ -1775,6 +1787,87 @@ impl<'p> Vm<'p> {
     /// Delegates to a custom `searchValue[Symbol.replace]` if present, else does a
     /// plain substring replacement with full GetSubstitution ($-pattern) support
     /// and functional replacers.
+    /// `replace` (`all` false) or `replaceAll` of the string `idx` when the
+    /// search value and the replacement are both primitive, well-formed
+    /// strings, the search value is not empty and the replacement names no
+    /// `$` pattern: the matches are found and the result built in place,
+    /// with its exact length checked against the string cap first. `None`
+    /// for anything else (the general path then runs from the start; nothing
+    /// observable has happened). No match gives back the receiver itself.
+    fn replace_plain_strings_fast(
+        &mut self,
+        idx: u32,
+        search_v: Value,
+        repl_v: Value,
+        all: bool,
+    ) -> Result<Option<Value>, Thrown> {
+        if !search_v.is_heap() || !repl_v.is_heap() {
+            return Ok(None);
+        }
+        let plain = |h: &HeapObj| matches!(h, HeapObj::Str(js) if js.is_wellformed());
+        if !plain(self.heap.get(idx))
+            || !plain(self.heap.get(search_v.heap_index()))
+            || !plain(self.heap.get(repl_v.heap_index()))
+        {
+            return Ok(None);
+        }
+        let (positions, total) = {
+            let (HeapObj::Str(hay), HeapObj::Str(needle), HeapObj::Str(rep)) = (
+                self.heap.get(idx),
+                self.heap.get(search_v.heap_index()),
+                self.heap.get(repl_v.heap_index()),
+            ) else {
+                return Ok(None);
+            };
+            let (hay, needle, rep) = (hay.as_bytes(), needle.as_bytes(), rep.as_bytes());
+            if needle.is_empty() || rep.contains(&b'$') {
+                return Ok(None);
+            }
+            let mut positions: Vec<usize> = Vec::new();
+            let mut from = 0usize;
+            while let Some(off) = find_plain_bytes(&hay[from..], needle) {
+                positions.push(from + off);
+                from += off + needle.len();
+                if !all {
+                    break;
+                }
+            }
+            if positions.is_empty() {
+                return Ok(Some(Value::heap(idx)));
+            }
+            // The result's exact length: each match trades the needle for the
+            // replacement (well-formed UTF-8 pieces join without a seam).
+            let total = (hay.len() - positions.len() * needle.len())
+                .checked_add(positions.len().checked_mul(rep.len()).ok_or_else(invalid_string_length)?)
+                .ok_or_else(invalid_string_length)?;
+            (positions, total)
+        };
+        self.preflight_guest_string_size(total)?;
+        let out = {
+            let (HeapObj::Str(hay), HeapObj::Str(needle), HeapObj::Str(rep)) = (
+                self.heap.get(idx),
+                self.heap.get(search_v.heap_index()),
+                self.heap.get(repl_v.heap_index()),
+            ) else {
+                return Ok(None);
+            };
+            let (hay, n, rep) = (hay.as_bytes(), needle.as_bytes().len(), rep.as_bytes());
+            let mut out: Vec<u8> = Vec::new();
+            out.try_reserve_exact(total)
+                .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
+            let mut last = 0usize;
+            for &pos in &positions {
+                out.extend_from_slice(&hay[last..pos]);
+                out.extend_from_slice(rep);
+                last = pos + n;
+            }
+            out.extend_from_slice(&hay[last..]);
+            out
+        };
+        let js = crate::heap::JsStr::from_wtf8(out);
+        Ok(Some(Value::heap(self.heap.alloc_js(js))))
+    }
+
     pub(crate) fn string_replace_plain(
         &mut self,
         s_idx: u32,
@@ -2451,4 +2544,26 @@ fn lite_collation_units(js: &crate::heap::JsStr) -> impl Iterator<Item = u32> + 
         }
     })
     .flat_map(|(text, surrogate)| crate::unorm::nfd(text).map(u32::from).chain(surrogate))
+}
+
+/// The first position of `needle` (not empty) in `hay`: a scan for its first
+/// byte, then a compare of the rest. Byte positions of a well-formed needle
+/// in a well-formed haystack always fall on character boundaries.
+fn find_plain_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    let n = needle.len();
+    if n == 0 || n > hay.len() {
+        return if n == 0 { Some(0) } else { None };
+    }
+    let first = needle[0];
+    let last_start = hay.len() - n;
+    let mut i = 0usize;
+    while i <= last_start {
+        let off = hay[i..=last_start].iter().position(|&b| b == first)?;
+        let p = i + off;
+        if &hay[p..p + n] == needle {
+            return Some(p);
+        }
+        i = p + 1;
+    }
+    None
 }
