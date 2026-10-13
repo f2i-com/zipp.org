@@ -10,6 +10,11 @@ import math
 import sys
 import torch
 
+# (module attributes read once: a step reads them per parameter)
+_Tensor = torch.Tensor
+_float32 = torch.float32
+_float64 = torch.float64
+
 
 class _RequiredParameter:
     """Singleton marking a default that every parameter group must supply."""
@@ -121,6 +126,16 @@ def _with_step_hooks(step):
     def step_with_hooks(*args, **kwargs):
         # As in PyTorch, hooks see the call's full args, the optimizer first.
         self = args[0]
+        if not self._optimizer_step_pre_hooks and not self._optimizer_step_post_hooks:
+            # (no hooks: the usual call, `step()` or `step(closure)`,
+            # without re-packing its arguments)
+            if not kwargs:
+                n = len(args)
+                if n == 1:
+                    return step(self)
+                if n == 2:
+                    return step(self, args[1])
+            return step(*args, **kwargs)
         for hook in list(self._optimizer_step_pre_hooks.values()):
             result = hook(self, args, kwargs)
             if result is not None:
@@ -182,6 +197,21 @@ def _write_param(p, value):
         p.data = value
 
 
+def _state_of(state, entries, p):
+    """`state[p]` for a step loop: `entries` is the `_ParamState`'s table
+    (None when `state` is some other mapping), read directly; the indexing
+    call takes the operator dispatch, several microseconds here."""
+    if entries is not None:
+        entry = entries.get(id(p))
+        if entry is not None:
+            return entry[1]
+    return state[p]
+
+
+def _table(state):
+    return state._entries if state.__class__ is _ParamState else None
+
+
 def _plain(v):
     """Whether an option is a Python number: the fused updates take those
     as floats (a tensor option keeps the composite)."""
@@ -199,18 +229,18 @@ def _fused_sgd(st, p, grad, flags, scalars):
     composite's were. False, with nothing changed, for a parameter the
     kernel does not take (the composite then runs)."""
     dt = p.dtype
-    if (dt is not torch.float32 and dt is not torch.float64) or grad.__class__ is not torch.Tensor or grad.dtype is not dt or not _same_shape(grad, p):
+    if (dt is not _float32 and dt is not _float64) or grad.__class__ is not _Tensor or grad.dtype is not dt or not _same_shape(grad, p):
         return False
     buf = None
     if flags & 4:
         buf = st.get("momentum_buffer")
-        if buf is not None and (buf.__class__ is not torch.Tensor or not _same_shape(buf, p)):
+        if buf is not None and (buf.__class__ is not _Tensor or not _same_shape(buf, p)):
             return False
     new = torch._k.optim_step(0, flags, p._s, grad._s, None if buf is None else buf._s, None, None, scalars)
     if new is None:
         return False
     if flags & 4:
-        st["momentum_buffer"] = torch.Tensor(new[0], p.shape, dt)
+        st["momentum_buffer"] = _Tensor(new[0], p.shape, dt)
     if p._untracked:
         torch._k.untrack(p._s)
     return True
@@ -221,22 +251,22 @@ def _fused_adam(p, grad, st, flags, scalars, amsgrad):
     kernel call, as `_fused_sgd`: exp_avg, exp_avg_sq and max_exp_avg_sq
     become new tensors."""
     dt = p.dtype
-    if (dt is not torch.float32 and dt is not torch.float64) or grad.__class__ is not torch.Tensor or grad.dtype is not dt or not _same_shape(grad, p):
+    if (dt is not _float32 and dt is not _float64) or grad.__class__ is not _Tensor or grad.dtype is not dt or not _same_shape(grad, p):
         return False
     m, v = st["exp_avg"], st["exp_avg_sq"]
     w = st.get("max_exp_avg_sq") if amsgrad else None
-    if m.__class__ is not torch.Tensor or v.__class__ is not torch.Tensor or not _same_shape(m, p) or not _same_shape(v, p):
+    if m.__class__ is not _Tensor or v.__class__ is not _Tensor or not _same_shape(m, p) or not _same_shape(v, p):
         return False
-    if amsgrad and (w.__class__ is not torch.Tensor or not _same_shape(w, p)):
+    if amsgrad and (w.__class__ is not _Tensor or not _same_shape(w, p)):
         return False
     new = torch._k.optim_step(1, flags, p._s, grad._s, m._s, v._s, None if w is None else w._s, scalars)
     if new is None:
         return False
     shape = p.shape
-    st["exp_avg"] = torch.Tensor(new[0], shape, dt)
-    st["exp_avg_sq"] = torch.Tensor(new[1], shape, dt)
+    st["exp_avg"] = _Tensor(new[0], shape, dt)
+    st["exp_avg_sq"] = _Tensor(new[1], shape, dt)
     if amsgrad:
-        st["max_exp_avg_sq"] = torch.Tensor(new[2], shape, dt)
+        st["max_exp_avg_sq"] = _Tensor(new[2], shape, dt)
     if p._untracked:
         torch._k.untrack(p._s)
     return True
@@ -459,6 +489,8 @@ class SGD(Optimizer):
             return capture.sgd(self, closure)
         self._eager()
         loss = _closure_loss(closure)
+        state = self.state
+        entries = _table(state)
         for g in self.param_groups:
             lr, momentum, dampening, wd = g["lr"], g["momentum"], g["dampening"], g["weight_decay"]
             maximize, nesterov = g["maximize"], g["nesterov"]
@@ -473,7 +505,7 @@ class SGD(Optimizer):
                 if p.dtype._reduced:
                     _half_sgd(self, g, p)
                     continue
-                st = self.state[p] if momentum else None
+                st = _state_of(state, entries, p) if momentum else None
                 if scalars is not None and _fused_sgd(st, p, grad, flags, scalars):
                     continue
                 if maximize:
@@ -520,6 +552,8 @@ class Adam(Optimizer):
         self._eager()
         loss = _closure_loss(closure)
         refuse = self._sparse_error
+        state = self.state
+        entries = _table(state)
         for g in self.param_groups:
             b1, b2 = g["betas"]
             lr, wd, eps = g["lr"], g["weight_decay"], g["eps"]
@@ -528,6 +562,14 @@ class Adam(Optimizer):
             fuse = _plain(b1) and _plain(b2) and _plain(lr) and _plain(wd) and _plain(eps)
             if fuse:
                 flags = (1 if maximize else 0) | ((6 if decoupled else 2) if wd else 0) | (8 if amsgrad else 0)
+                # The fused update's scalars: the group's, and per step count
+                # the bias corrections (the parameters of a group usually
+                # share one step count).
+                head = (float(b1), float(1 - b1), float(b2), float(1 - b2))
+                feps = float(eps)
+                last = float(1 - lr * wd) if decoupled else float(wd)
+                at = None
+                scalars = None
             for p in g["params"]:
                 grad = p.grad
                 if grad is None:
@@ -537,18 +579,22 @@ class Adam(Optimizer):
                 if p.dtype._reduced:
                     _half_adam(self, g, p)
                     continue
-                st = self.state[p]
+                st = _state_of(state, entries, p)
                 if not st:
                     st.update({"step": 0, "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)})
                     if amsgrad:
                         st["max_exp_avg_sq"] = torch.zeros_like(p)
-                st["step"] += 1
-                bias1 = 1 - b1 ** st["step"]
-                bias2 = 1 - b2 ** st["step"]
+                step = st["step"] + 1
+                st["step"] = step
+                if fuse:
+                    if at is None or step != at:
+                        scalars = head + (math.sqrt(1 - b2 ** step), feps, float(lr / (1 - b1 ** step)), last)
+                        at = step
+                    if _fused_adam(p, grad, st, flags, scalars, amsgrad):
+                        continue
+                bias1 = 1 - b1 ** step
+                bias2 = 1 - b2 ** step
                 step_size = lr / bias1
-                if fuse and _fused_adam(p, grad, st, flags, (float(b1), float(1 - b1), float(b2), float(1 - b2), math.sqrt(bias2), float(eps),
-                                                               float(step_size), float(1 - lr * wd) if decoupled else float(wd)), amsgrad):
-                    continue
                 if maximize:
                     grad = -grad
                 value = p.detach()

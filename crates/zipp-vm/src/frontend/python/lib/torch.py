@@ -348,9 +348,31 @@ class autocast:
 
 def _decorate(make, fn):
     """`fn` running inside the context `make()` returns."""
-    def wrapper(*a, **kw):
-        with make():
-            return fn(*a, **kw)
+    if make is no_grad or make is enable_grad:
+        # What `with make():` does for these two, spelled out: no context
+        # object, and no re-packed call for one or two positional
+        # arguments (on this runtime each of those costs microseconds, and
+        # an optimizer's step runs through this wrapper).
+        mode = make._mode
+
+        def wrapper(*a, **kw):
+            global _grad_enabled
+            prev = _grad_enabled
+            _grad_enabled = mode
+            try:
+                if not kw:
+                    n = len(a)
+                    if n == 1:
+                        return fn(a[0])
+                    if n == 2:
+                        return fn(a[0], a[1])
+                return fn(*a, **kw)
+            finally:
+                _grad_enabled = prev
+    else:
+        def wrapper(*a, **kw):
+            with make():
+                return fn(*a, **kw)
     wrapper.__name__ = getattr(fn, "__name__", "wrapper")
     wrapper.__doc__ = getattr(fn, "__doc__", None)
     wrapper.__wrapped__ = fn
