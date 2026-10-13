@@ -167,6 +167,19 @@ def _value(v):
     return v.item() if isinstance(v, torch.Tensor) else v
 
 
+def _write_param(p, value):
+    """A step's result written into the parameter, as PyTorch's in-place
+    update does: every alias of `p` (`.data`, `detach()`, views, the
+    tensors `state_dict()` returned) sees the new values, and its version
+    moves on. A result of another dtype or shape rebinds instead."""
+    if value.dtype is p.dtype and torch._shape_eq(value.shape, p.shape):
+        torch._k.copy_into(p._s, value._s)
+        if p._untracked:
+            torch._k.untrack(p._s)
+    else:
+        p.data = value
+
+
 class Optimizer:
     def __init__(self, params, defaults):
         self.defaults = defaults
@@ -399,7 +412,7 @@ class SGD(Optimizer):
                 buf = grad.clone() if buf is None else buf * g["momentum"] + grad * (1 - g["dampening"])
                 st["momentum_buffer"] = buf
                 grad = grad + buf * g["momentum"] if g["nesterov"] else buf
-            p.data = p.detach() - grad * g["lr"]
+            _write_param(p, p.detach() - grad * g["lr"])
         return loss
 
 
@@ -465,7 +478,7 @@ class Adam(Optimizer):
             bias2 = 1 - b2 ** st["step"]
             step_size = lr / bias1
             denom = torch.sqrt(denom_sq) / math.sqrt(bias2) + g["eps"]
-            p.data = value - st["exp_avg"] / denom * step_size
+            _write_param(p, value - st["exp_avg"] / denom * step_size)
         return loss
 
 
@@ -528,9 +541,9 @@ class RMSprop(Optimizer):
                 buf = st.get("momentum_buffer")
                 buf = grad / avg if buf is None else buf * g["momentum"] + grad / avg
                 st["momentum_buffer"] = buf
-                p.data = value - buf * g["lr"]
+                _write_param(p, value - buf * g["lr"])
             else:
-                p.data = value - grad / avg * g["lr"]
+                _write_param(p, value - grad / avg * g["lr"])
         return loss
 
 
@@ -589,7 +602,7 @@ class Adagrad(Optimizer):
                 continue
             st["sum"] = st["sum"] + grad * grad
             std = torch.sqrt(st["sum"]) + g["eps"]
-            p.data = value - grad / std * clr
+            _write_param(p, value - grad / std * clr)
         return loss
 
 
@@ -702,7 +715,7 @@ class Adamax(Optimizer):
             st["exp_avg"] = st["exp_avg"] + (grad - st["exp_avg"]) * (1 - b1)
             st["exp_inf"] = torch.maximum(st["exp_inf"] * b2, torch.abs(grad) + g["eps"])
             clr = g["lr"] / (1 - b1 ** st["step"])
-            p.data = value - st["exp_avg"] / st["exp_inf"] * clr
+            _write_param(p, value - st["exp_avg"] / st["exp_inf"] * clr)
         return loss
 
 
@@ -759,7 +772,7 @@ class NAdam(Optimizer):
             st["exp_avg_sq"] = st["exp_avg_sq"] * b2 + grad * grad * (1 - b2)
             denom = torch.sqrt(st["exp_avg_sq"] / bias2) + g["eps"]
             value = value - grad / denom * (lr * (1.0 - mu) / (1.0 - mu_product))
-            p.data = value - st["exp_avg"] / denom * (lr * mu_next / (1.0 - mu_product * mu_next))
+            _write_param(p, value - st["exp_avg"] / denom * (lr * mu_next / (1.0 - mu_product * mu_next)))
         return loss
 
 
@@ -810,9 +823,9 @@ class RAdam(Optimizer):
             if rho_t > 5.0:
                 rect = ((rho_t - 4) * (rho_t - 2) * rho_inf / ((rho_inf - 4) * (rho_inf - 2) * rho_t)) ** 0.5
                 adaptive = (bias2 ** 0.5) / (torch.sqrt(st["exp_avg_sq"]) + g["eps"])
-                p.data = value - corrected * lr * adaptive * rect
+                _write_param(p, value - corrected * lr * adaptive * rect)
             else:
-                p.data = value - corrected * lr
+                _write_param(p, value - corrected * lr)
         return loss
 
 
@@ -852,7 +865,7 @@ class Adadelta(Optimizer):
             std = torch.sqrt(st["square_avg"] + eps)
             delta = torch.sqrt(st["acc_delta"] + eps) / std * grad
             st["acc_delta"] = st["acc_delta"] * rho + delta * delta * (1 - rho)
-            p.data = value - delta * g["lr"]
+            _write_param(p, value - delta * g["lr"])
         return loss
 
 
@@ -893,7 +906,7 @@ class ASGD(Optimizer):
                 grad = grad + value * g["weight_decay"]
             eta = st["eta"]
             value = value * (1 - g["lambd"] * eta) - grad * eta
-            p.data = value
+            _write_param(p, value)
             if st["mu"] != 1:
                 st["ax"] = st["ax"] + (value - st["ax"]) * st["mu"]
             else:
@@ -936,7 +949,7 @@ class Rprop(Optimizer):
             sign = torch.where(product > 0, etaplus, torch.where(product < 0, etaminus, 1.0)).to(grad.dtype)
             st["step_size"] = torch.clamp(st["step_size"] * sign, step_size_min, step_size_max)
             grad = torch.where(product < 0, 0.0, grad).to(grad.dtype)
-            p.data = p.detach() - torch.sign(grad) * st["step_size"]
+            _write_param(p, p.detach() - torch.sign(grad) * st["step_size"])
             st["prev"] = grad.clone()
         return loss
 
@@ -1319,7 +1332,7 @@ class LBFGS(Optimizer):
         offset = 0
         for p in self._params:
             numel = p.numel()
-            p.data = p.detach() + update[offset:offset + numel].view_as(p) * step_size
+            _write_param(p, p.detach() + update[offset:offset + numel].view_as(p) * step_size)
             offset += numel
 
     def _clone_param(self):
@@ -1327,7 +1340,7 @@ class LBFGS(Optimizer):
 
     def _set_param(self, params_data):
         for p, data in zip(self._params, params_data):
-            p.data = data.clone()
+            _write_param(p, data.clone())
 
     def _directional_evaluate(self, closure, x, t, d):
         self._add_grad(t, d)
