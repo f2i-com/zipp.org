@@ -51,9 +51,9 @@ function runEngine(spec, file, casesFile) {
     argv = [spec.slice(4), ['js', file]];
     env = { ...process.env, ZIPP_RX_JIT_THRESHOLD: '1' };
   } else argv = [spec, ['js', file]];
-  // Node gets 20 s and a ZIPP build 120 s for the rest of a batch: a case
+  // Node gets 20 s and a ZIPP build 30 s for the rest of a batch: a case
   // that runs longer (exponential backtracking) is recorded as TIMEOUT.
-  const timeout = spec === 'node' ? 20000 : 120000;
+  const timeout = spec === 'node' ? 20000 : 30000;
   const p = spawnSync(argv[0], argv[1], { encoding: 'utf8', maxBuffer: 1 << 30, timeout, env });
   const timedOut = !!(p.error && p.error.code === 'ETIMEDOUT');
   return { out: p.stdout || '', err: (p.stderr || '') + (p.error ? String(p.error) : ''), status: p.status, timedOut };
