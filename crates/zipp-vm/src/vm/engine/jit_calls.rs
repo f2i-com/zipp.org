@@ -1072,6 +1072,144 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind [`jit_iter_op_ic`]: the interpreter's arms
+    /// for `GetIterator`, `IterPrime`, `IterClose`, `IterCloseQuiet` and
+    /// `IterCloseFinally`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_iter_op_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let op = (packed_args >> 56) as u8;
+        if op > 4 {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let a = (packed_args & 0xFFFF) as u16;
+        if op == 0 {
+            // An iterator object may be allocated: the safe point precedes
+            // the operand read (the window's Values are roots).
+            self.maybe_gc();
+        }
+        self.jit_call_depth += 1;
+        let v = self.get(base, a);
+        let r: Result<Value, Thrown> = match op {
+            0 => self.get_iterator(v),
+            1 => {
+                // As the interpreter's `IterPrime`: a user-object iterator's
+                // `next` is read once; a generator's only when replaced.
+                let read = v.is_heap()
+                    && (matches!(
+                        self.heap.get(v.heap_index()),
+                        HeapObj::Object(_)
+                            | HeapObj::Proxy { .. }
+                            | HeapObj::Iterator { .. }
+                            | HeapObj::IterHelper { .. }
+                            | HeapObj::Intl { .. }
+                    ) || (matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. })
+                        && !self.gen_method_pristine(v.heap_index(), "next")));
+                if read {
+                    self.get_prop(v, "next")
+                } else {
+                    Ok(Value::UNDEFINED)
+                }
+            }
+            2 => self.iterator_close(v).map(|_| v),
+            3 => {
+                let _ = self.iterator_close(v);
+                Ok(v)
+            }
+            _ => {
+                let kind_reg = ((packed_args >> 16) & 0xFFFF) as u16;
+                match self.get(base, kind_reg).as_int() & 3 {
+                    1 => self.iterator_close(v).map(|_| v),
+                    2 => {
+                        let _ = self.iterator_close(v);
+                        Ok(v)
+                    }
+                    _ => Ok(v),
+                }
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind [`jit_array_ctor_ic`]: the interpreter's
+    /// `ArrayCtor` arm (a replaced `Array` is called or constructed through
+    /// the ordinary value paths).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_array_ctor_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+        argc: u16,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let callee = (packed_args & 0xFFFF) as u16;
+        let arg_base = ((packed_args >> 16) & 0xFFFF) as u16;
+        let is_construct = (packed_args >> 32) & 1 != 0;
+        self.maybe_gc();
+        self.jit_call_depth += 1;
+        let r: Result<Value, Thrown> = (|| {
+            if callee != 0xFFFF {
+                let live = self.get(base, callee);
+                if !self.bare_builtin_is_intrinsic(self.array_ctor, live) {
+                    let argv: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                    return if is_construct {
+                        self.construct(live, &argv)
+                    } else {
+                        self.call_value(live, Value::UNDEFINED, &argv)
+                    };
+                }
+            }
+            let mut virtual_len: Option<u32> = None;
+            let arr = if argc == 1 && self.get(base, arg_base).is_number() {
+                // `Array(n)` → n HOLES (absent elements), not n undefineds.
+                let n = self.get(base, arg_base).as_f64();
+                if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
+                    return Err(Thrown("RangeError: Invalid array length".into()));
+                }
+                if n as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
+                    virtual_len = Some(n as u32);
+                    Vec::new()
+                } else {
+                    vec![Value::HOLE; n as usize]
+                }
+            } else {
+                (0..argc).map(|i| self.get(base, arg_base + i)).collect()
+            };
+            let v = Value::heap(self.heap.alloc(HeapObj::Array(arr)));
+            if let Some(n) = virtual_len {
+                self.array_js_len.insert(v.heap_index(), n);
+            }
+            Ok(v)
+        })();
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// The implementation behind [`jit_obj_init_ic`]: the interpreter's
     /// `ObjectSpread` and `InitDataProp` arms.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]

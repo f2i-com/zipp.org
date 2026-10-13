@@ -1201,6 +1201,51 @@ pub(crate) extern "win64" fn jit_load_class_value_ic(
     })
 }
 
+/// Win64 helper for the iterator-protocol instructions in a compiled region,
+/// outside the scalar matchAll plan: `GetIterator` (op 0, `packed_args` =
+/// `src`), `IterPrime` (1, `iter`), `IterClose` (2, `iter`), `IterCloseQuiet`
+/// (3, `iter`) and `IterCloseFinally` (4, `iter | kind_reg << 16`), the op in
+/// bits 56..64. Each runs the interpreter's arm: `@@iterator`, a user
+/// iterator's `next` getter and its `return()` are user code, so the call
+/// protocol applies. The close forms hand back the iterator's own bits.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_iter_op_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_iter_op_impl(caller_base_ptr, packed_args)
+    })
+}
+
+/// Win64 helper for `ArrayCtor` (`Array(...)`, `new Array(...)`, and the
+/// engine's own array creation) in a compiled region: the interpreter's arm
+/// (`packed_args` = `callee | arg_base << 16 | is_construct << 32`, callee
+/// `0xFFFF` for none). A replaced `Array` is user code: the call protocol.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_array_ctor_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_array_ctor_impl(caller_base_ptr, packed_args, argc as u16)
+    })
+}
+
 /// Win64 helper for `ToStr` (a template literal's `${v}`) in a compiled region
 /// or Tier C body: `Vm::to_str_value` on register `packed_args & 0xFFFF`. An
 /// object's `toString`/`valueOf` (or `@@toPrimitive`) is user code, so the

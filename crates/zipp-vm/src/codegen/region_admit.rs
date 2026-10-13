@@ -18,6 +18,12 @@ env_off_switch! {
     fn iter_region_enabled() = "ZIPP_NO_ITER_REGION"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_GENERAL_ITER_REGION=1` declines a memory region holding the
+    /// general iterator protocol or `ArrayCtor` again (the same-binary A/B).
+    fn general_iter_region_enabled() = "ZIPP_NO_GENERAL_ITER_REGION"
+}
+
 /// Proof token for the deliberately tiny matchAll scalarization V1. The
 /// detector accepts only the compiler's exact 36-op outer-loop shape used by
 /// regex-log-scan; every skipped publication/consumer is named here so the
@@ -943,6 +949,20 @@ pub(crate) fn region_op_admitted(
             if scalar_matchall.is_some_and(|p| p.close_ip == ip) => {}
         Instr::EndFinally { .. }
             if scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) => {}
+        // The general iterator protocol (a for-of nested in the loop, array
+        // destructuring with a default or a rest element) and array
+        // creation: the interpreter's arms through `jit_iter_op_ic` /
+        // `jit_array_ctor_ic`, with the call protocol. A normal completion
+        // falls through `EndFinally`; any other leaves the region at it for
+        // the interpreter's routing. MEM path only.
+        Instr::GetIterator { .. }
+        | Instr::IterPrime { .. }
+        | Instr::IterClose { .. }
+        | Instr::IterCloseQuiet { .. }
+        | Instr::IterCloseFinally { .. }
+        | Instr::EndFinally { .. }
+        | Instr::ArrayCtor { .. }
+            if const_strs.is_some() && general_iter_region_enabled() => {}
         // The for-of close-handler bracket around each iteration. Both
         // are ONE Vec push/pop on the current frame's handler stack via
         // helpers that mirror the interpreter arms exactly, keeping the

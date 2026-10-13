@@ -4520,6 +4520,95 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::GetIterator { dst, src }
+                if !py && !scalar_matchall.is_some_and(|p| p.get_iterator_ip == ip) =>
+            {
+                // The general protocol: `jit_iter_op_ic` op 0.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as usize,
+                    packed_fip,
+                    src as u64,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::IterPrime { dst, iter }
+                if !py && !scalar_matchall.is_some_and(|p| p.iter_prime_ip == ip) =>
+            {
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as usize,
+                    packed_fip,
+                    iter as u64 | 1u64 << 56,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } if !py => {
+                let op: u64 = if matches!(proto.code[ip], Instr::IterClose { .. }) { 2 } else { 3 };
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as usize,
+                    packed_fip,
+                    iter as u64 | op << 56,
+                    0,
+                    iter,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::IterCloseFinally { iter, kind_reg }
+                if !py && !scalar_matchall.is_some_and(|p| p.close_ip == ip) =>
+            {
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as usize,
+                    packed_fip,
+                    iter as u64 | (kind_reg as u64) << 16 | 4u64 << 56,
+                    0,
+                    iter,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::ArrayCtor { dst, callee, arg_base, argc, is_construct } if !py => {
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let callee = callee.unwrap_or(0xFFFF);
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_array_ctor_ic as usize,
+                    packed_fip,
+                    callee as u64 | (arg_base as u64) << 16 | (is_construct as u64) << 32,
+                    argc,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
             Instr::GetIterator { dst, src } => {
                 let Some(_plan) = scalar_matchall.filter(|p| p.get_iterator_ip == ip) else {
                     return None;
@@ -4681,11 +4770,14 @@ pub(crate) fn compile_region_mem(
                     ; jmp => epilogue
                 );
             }
-            Instr::EndFinally { kind_reg, .. } if py => {
-                // A Python `try`/`finally` (or `except` clause) completing
-                // normally falls through; any abrupt completion leaves the
-                // region at the instruction for the interpreter's routing
-                // (Tier C's arm, `proto_mem`).
+            Instr::EndFinally { kind_reg, .. }
+                if py || !scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) =>
+            {
+                // A `finally` (a Python `try`/`finally` or `except` clause, a
+                // JavaScript `finally`, a for-of's or a destructuring's close
+                // handler) completing normally falls through; any abrupt
+                // completion leaves the region at the instruction for the
+                // interpreter's routing (Tier C's arm, `proto_mem`).
                 let helper = crate::vm::jit_end_finally as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
