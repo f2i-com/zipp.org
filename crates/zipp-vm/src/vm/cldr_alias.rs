@@ -208,34 +208,93 @@ fn bcp47_alias() -> &'static HashMap<(&'static str, &'static str), &'static str>
     CELL.get_or_init(|| triples(data::BCP47_TYPE_ALIAS))
 }
 
-/// A language's likely script and region, from the packed table: a binary
-/// search over three-byte keys, where there was a 7,195-entry hash map built
-/// from 86 KB of text at the first `Intl.Locale` maximize or minimize.
-fn likely_lang(lang: &str) -> Option<(&'static str, &'static str)> {
-    let lang = lang.as_bytes();
-    if lang.is_empty() || lang.len() > 3 || lang.contains(&b' ') {
+/// Every language of `LIKELY_LANG_KEYS` as one bit of the space of two- and
+/// three-letter lowercase codes, with the number of languages before each
+/// 64 of them: a language's rank among the bits set is its row. Built at
+/// compile time from the generated keys, which are then not kept: 21,585
+/// bytes of key text became 2,288 bytes of bits and 572 of counts, and the
+/// JavaScript module 4.3 KB smaller after Brotli.
+struct LangKeys {
+    bits: [u64; LANG_WORDS],
+    below: [u16; LANG_WORDS],
+}
+
+/// Two letters and a third that is a letter or absent, in key order (an
+/// absent letter sorts first, as the generated keys' padding space does).
+const LANG_SPACE: usize = 26 * 26 * 27;
+const LANG_WORDS: usize = LANG_SPACE.div_ceil(64);
+
+/// The bit of a two- or three-letter lowercase code, or None for any other.
+const fn lang_slot(lang: &[u8]) -> Option<usize> {
+    if lang.len() < 2 || lang.len() > 3 {
         return None;
     }
-    let mut key = [b' '; 3];
-    key[..lang.len()].copy_from_slice(lang);
-    let keys = data::LIKELY_LANG_KEYS.as_bytes();
-    let (mut lo, mut hi) = (0usize, keys.len() / 3);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        match keys[3 * mid..3 * mid + 3].cmp(&key[..]) {
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Greater => hi = mid,
-            std::cmp::Ordering::Equal => {
-                let script = 4 * data::LIKELY_LANG_SCRIPTS_AT[mid] as usize;
-                let region = 3 * data::LIKELY_LANG_REGIONS_AT[mid] as usize;
-                return Some((
-                    &data::LIKELY_SCRIPT_NAMES[script..script + 4],
-                    data::LIKELY_REGION_NAMES[region..region + 3].trim_end(),
-                ));
-            }
+    let mut digits = [0usize; 3];
+    let mut i = 0;
+    while i < lang.len() {
+        if !lang[i].is_ascii_lowercase() {
+            return None;
         }
+        digits[i] = (lang[i] - b'a') as usize;
+        i += 1;
     }
-    None
+    let third = if lang.len() == 3 { digits[2] + 1 } else { 0 };
+    Some((digits[0] * 26 + digits[1]) * 27 + third)
+}
+
+const fn pack_lang_keys(keys: &str) -> LangKeys {
+    let keys = keys.as_bytes();
+    assert!(keys.len() % 3 == 0);
+    let mut out = LangKeys { bits: [0; LANG_WORDS], below: [0; LANG_WORDS] };
+    let mut last: Option<usize> = None;
+    let mut i = 0;
+    while i < keys.len() {
+        let (key, _) = keys.split_at(i + 3);
+        let (_, key) = key.split_at(i);
+        let len = if key[2] == b' ' { 2 } else { 3 };
+        let (code, _) = key.split_at(len);
+        let Some(slot) = lang_slot(code) else {
+            panic!("a likely-subtags language is not two or three lowercase letters");
+        };
+        // Strictly ascending, so a key's rank among the bits is its row.
+        if let Some(previous) = last {
+            assert!(previous < slot);
+        }
+        last = Some(slot);
+        out.bits[slot / 64] |= 1 << (slot % 64);
+        i += 3;
+    }
+    let (mut count, mut w) = (0u32, 0);
+    while w < LANG_WORDS {
+        assert!(count <= u16::MAX as u32);
+        out.below[w] = count as u16;
+        count += out.bits[w].count_ones();
+        w += 1;
+    }
+    out
+}
+
+static LANG_KEYS: LangKeys = pack_lang_keys(data::LIKELY_LANG_KEYS);
+
+/// A language's likely script and region, from the packed table: its bit
+/// and the count of the bits before it give its row, where there was a
+/// 7,195-entry hash map built from 86 KB of text at the first
+/// `Intl.Locale` maximize or minimize, and then a binary search over the
+/// three-byte keys.
+fn likely_lang(lang: &str) -> Option<(&'static str, &'static str)> {
+    let slot = lang_slot(lang.as_bytes())?;
+    let word = LANG_KEYS.bits[slot / 64];
+    let bit = 1u64 << (slot % 64);
+    if word & bit == 0 {
+        return None;
+    }
+    let row = usize::from(LANG_KEYS.below[slot / 64]) + (word & (bit - 1)).count_ones() as usize;
+    let script = 4 * usize::from(*data::LIKELY_LANG_SCRIPTS_AT.get(row)?);
+    let region = 3 * usize::from(*data::LIKELY_LANG_REGIONS_AT.get(row)?);
+    Some((
+        data::LIKELY_SCRIPT_NAMES.get(script..script + 4)?,
+        data::LIKELY_REGION_NAMES.get(region..region + 3)?.trim_end(),
+    ))
 }
 
 struct Likely {
@@ -710,6 +769,61 @@ mod tests {
         assert_eq!(likely_lang("zzj"), Some(("Hani", "CN")));
         for absent in ["", "a", "xx", "zzzz", "en ", " en", "EN", "e n"] {
             assert_eq!(likely_lang(absent), None, "{absent:?}");
+        }
+    }
+
+    /// `likely_lang` as it was: a binary search over the three-byte keys.
+    fn likely_lang_by_search(lang: &str) -> Option<(&'static str, &'static str)> {
+        let lang = lang.as_bytes();
+        if lang.is_empty() || lang.len() > 3 || lang.contains(&b' ') {
+            return None;
+        }
+        let mut key = [b' '; 3];
+        key[..lang.len()].copy_from_slice(lang);
+        let keys = data::LIKELY_LANG_KEYS.as_bytes();
+        let (mut lo, mut hi) = (0usize, keys.len() / 3);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match keys[3 * mid..3 * mid + 3].cmp(&key[..]) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let script = 4 * data::LIKELY_LANG_SCRIPTS_AT[mid] as usize;
+                    let region = 3 * data::LIKELY_LANG_REGIONS_AT[mid] as usize;
+                    return Some((
+                        &data::LIKELY_SCRIPT_NAMES[script..script + 4],
+                        data::LIKELY_REGION_NAMES[region..region + 3].trim_end(),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// The bit table answers exactly as the search over the keys did, for
+    /// every code of one to three letters and for malformed ones.
+    #[test]
+    fn the_language_bits_answer_as_the_key_search() {
+        let letters: Vec<char> = ('a'..='z').chain(['A', 'Z', ' ', '-', '0', 'é']).collect();
+        let mut found = 0;
+        for a in &letters {
+            for b in std::iter::once(None).chain(letters.iter().map(Some)) {
+                for c in std::iter::once(None).chain(letters.iter().map(Some)) {
+                    if b.is_none() && c.is_some() {
+                        continue;
+                    }
+                    let mut code = a.to_string();
+                    code.extend(b);
+                    code.extend(c);
+                    let want = likely_lang_by_search(&code);
+                    assert_eq!(likely_lang(&code), want, "{code:?}");
+                    found += usize::from(want.is_some());
+                }
+            }
+        }
+        assert_eq!(found, data::LIKELY_LANG_KEYS.len() / 3);
+        for odd in ["", "abcd", "en-", "\u{0}\u{0}", "zz\u{0}"] {
+            assert_eq!(likely_lang(odd), likely_lang_by_search(odd), "{odd:?}");
         }
     }
 
