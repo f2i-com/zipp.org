@@ -298,3 +298,17 @@ every artifact. Its one use was the crate's own tests, which ran each case
 on both executors. It is gone, with its feature; the differential fuzzer
 against Node (`fuzz/`) is the independent check now, and the patches above
 that mention `src/pikevm.rs` changed a file that no longer exists.
+
+## Right-to-left instructions: one matcher per input type
+
+Upstream instantiates the backtracking matcher for each input type AND each
+direction (`try_at_pos<Dir>`, `run_lookaround<Dir>`, every one-character
+loop and matcher type under it), because a lookbehind's body runs right to
+left. Here the direction is part of the instruction instead: inside a
+lookbehind the emitter wraps every instruction whose effect depends on the
+direction (consuming ones, backreferences, capture-group ends, one-character
+loops) in `Insn::Back`. `try_at_pos` runs left to right and hands a wrapped
+instruction to `back_step`, which runs it right to left; a right-to-left
+one-character loop tests its body through `scm::Dyn`, one matcher for every
+body type. Each instruction still costs one step: the step counts in
+`tests/step_counts.rs` are those of the per-direction matcher.

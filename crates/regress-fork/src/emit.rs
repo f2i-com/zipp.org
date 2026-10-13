@@ -101,9 +101,14 @@ impl Emitter {
         self.emit_insn(insn);
     }
 
-    /// Emit an instruction.
-    /// Return the "instruction" as an index.
+    /// Emit an instruction. Inside a lookbehind, an instruction whose effect
+    /// depends on the direction is wrapped to run right to left.
     fn emit_insn(&mut self, insn: Insn) {
+        let insn = if self.in_lookbehind && insn.runs_backward_wrapped() {
+            Insn::Back(Box::new(insn))
+        } else {
+            insn
+        };
         self.result.insns.push(insn);
     }
 

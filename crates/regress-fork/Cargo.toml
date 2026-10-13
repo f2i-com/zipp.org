@@ -104,6 +104,11 @@ name = "scan_drain"
 path = "tests/scan_drain.rs"
 
 [[test]]
+name = "step_counts"
+path = "tests/step_counts.rs"
+required-features = ["bounded-backtracking", "utf16"]
+
+[[test]]
 name = "suffix_start"
 path = "tests/suffix_start.rs"
 

@@ -186,6 +186,56 @@ pub enum Insn {
     /// An instruction that always fails, which may be produced in weird cases
     /// like an inverted bracket which matches everything.
     JustFail,
+
+    /// The wrapped instruction, run right to left: what a lookbehind's body
+    /// is made of. Only instructions whose effect depends on the direction
+    /// are wrapped (see [`Insn::runs_backward_wrapped`]); anchors, word
+    /// boundaries, jumps, loops and lookarounds read the same either way. The
+    /// matcher runs every other instruction forward, so it exists once per
+    /// input type rather than once per input type and direction.
+    Back(Box<Insn>),
+}
+
+impl Insn {
+    /// Whether this instruction must be wrapped in [`Insn::Back`] inside a
+    /// lookbehind: it consumes input, compares with a capture, or records
+    /// where a capture starts or ends.
+    pub fn runs_backward_wrapped(&self) -> bool {
+        matches!(
+            self,
+            Insn::Char(_)
+                | Insn::CharICase(_)
+                | Insn::MatchAny
+                | Insn::MatchAnyExceptLineTerminator
+                | Insn::Loop1CharBody { .. }
+                | Insn::BeginCaptureGroup(_)
+                | Insn::EndCaptureGroup(_)
+                | Insn::BackRef { .. }
+                | Insn::BackRefMulti { .. }
+                | Insn::Bracket(_)
+                | Insn::AsciiBracket(_)
+                | Insn::CharSet(_)
+                | Insn::ByteSet2(_)
+                | Insn::ByteSet3(_)
+                | Insn::ByteSet4(_)
+                | Insn::ByteSeq1(_)
+                | Insn::ByteSeq2(_)
+                | Insn::ByteSeq3(_)
+                | Insn::ByteSeq4(_)
+                | Insn::ByteSeq5(_)
+                | Insn::ByteSeq6(_)
+                | Insn::ByteSeq7(_)
+                | Insn::ByteSeq8(_)
+                | Insn::ByteSeq9(_)
+                | Insn::ByteSeq10(_)
+                | Insn::ByteSeq11(_)
+                | Insn::ByteSeq12(_)
+                | Insn::ByteSeq13(_)
+                | Insn::ByteSeq14(_)
+                | Insn::ByteSeq15(_)
+                | Insn::ByteSeq16(_)
+        )
+    }
 }
 
 /// The peeled prefix start predicate.
@@ -279,6 +329,13 @@ impl CompiledRegex {
             }));
 
         for insn in &self.insns {
+            let insn = match insn {
+                Insn::Back(inner) => {
+                    bytes = bytes.saturating_add(core::mem::size_of::<Insn>());
+                    &**inner
+                }
+                insn => insn,
+            };
             if let Insn::BackRefMulti { groups, .. } = insn {
                 bytes =
                     bytes.saturating_add(groups.len().saturating_mul(core::mem::size_of::<u32>()));
