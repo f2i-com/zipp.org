@@ -144,16 +144,18 @@ impl<Input: InputIndexer, Dir: Direction, ArraySet: SmallArraySet> SingleCharMat
     }
 }
 
-/// A ByteSeq of length <= 4 may match a single char.
-pub struct MatchByteSeq<'a, const N: usize>(pub &'a [u8; N]);
+/// A byte sequence instruction may be the body of a one-character loop: the
+/// UTF-8 encoding of one character (at most four bytes).
+pub struct MatchByteSeq<'a>(pub &'a [u8]);
 
-impl<const N: usize, Input: InputIndexer, Dir: Direction> SingleCharMatcher<Input, Dir>
-    for MatchByteSeq<'_, N>
-{
+impl<Input: InputIndexer, Dir: Direction> SingleCharMatcher<Input, Dir> for MatchByteSeq<'_> {
     #[inline(always)]
     fn matches(&self, input: &Input, dir: Dir, pos: &mut Input::Position) -> bool {
-        debug_assert!(N <= 4, "This looks like it could match more than one char");
-        cursor::try_match_lit(input, dir, pos, self.0)
+        debug_assert!(
+            self.0.len() <= 4,
+            "This looks like it could match more than one char"
+        );
+        input.match_bytes(dir, pos, self.0)
     }
 }
 
@@ -191,12 +193,7 @@ impl<Input: InputIndexer, Dir: Direction> SingleCharMatcher<Input, Dir> for Dyn<
             &Insn::ByteSet2(bytes) => MatchByteArraySet(bytes).matches(input, dir, pos),
             &Insn::ByteSet3(bytes) => MatchByteArraySet(bytes).matches(input, dir, pos),
             &Insn::ByteSet4(bytes) => MatchByteArraySet(bytes).matches(input, dir, pos),
-            Insn::ByteSeq1(bytes) => MatchByteSeq(bytes).matches(input, dir, pos),
-            Insn::ByteSeq2(bytes) => MatchByteSeq(bytes).matches(input, dir, pos),
-            Insn::ByteSeq3(bytes) => MatchByteSeq(bytes).matches(input, dir, pos),
-            Insn::ByteSeq4(bytes) => MatchByteSeq(bytes).matches(input, dir, pos),
-            Insn::ByteSeq5(bytes) => MatchByteSeq(bytes).matches(input, dir, pos),
-            Insn::ByteSeq6(bytes) => MatchByteSeq(bytes).matches(input, dir, pos),
+            Insn::ByteSeq(seq) => MatchByteSeq(seq.bytes()).matches(input, dir, pos),
             _ => unreachable!("Missing SCM"),
         }
     }

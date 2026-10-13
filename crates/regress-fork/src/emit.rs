@@ -1,7 +1,9 @@
 //! Regex compiler back-end: transforms IR into a CompiledRegex
 
 use crate::bytesearch::{AsciiBitmap, ByteArraySet};
-use crate::insn::{CompiledRegex, Insn, LoopFields, MAX_BYTE_SEQ_LENGTH, MAX_CHAR_SET_LENGTH};
+use crate::insn::{
+    ByteSeq, CompiledRegex, Insn, LoopFields, MAX_BYTE_SEQ_LENGTH, MAX_CHAR_SET_LENGTH,
+};
 use crate::ir;
 use crate::ir::Node;
 use crate::startpredicate;
@@ -62,7 +64,7 @@ impl Emitter {
     fn emit_byte_set_insn(&mut self, bytes: &[u8]) {
         let insn = match bytes.len() {
             0 => Insn::JustFail,
-            1 => Insn::ByteSeq1(bytes.try_into().unwrap()),
+            1 => Insn::ByteSeq(ByteSeq::new(bytes)),
             2 => Insn::ByteSet2(ByteArraySet(bytes.try_into().unwrap())),
             3 => Insn::ByteSet3(ByteArraySet(bytes.try_into().unwrap())),
             4 => Insn::ByteSet4(ByteArraySet(bytes.try_into().unwrap())),
@@ -73,32 +75,7 @@ impl Emitter {
 
     // Emit a nonempty byte sequence instruction. The sequence must be at most MAX_BYTE_SEQ_LENGTH bytes.
     fn emit_byte_sequence_insn(&mut self, seq: &[u8]) {
-        const {
-            assert!(
-                MAX_BYTE_SEQ_LENGTH == 16,
-                "Need to update our emitting logic"
-            );
-        };
-        let insn = match seq.len() {
-            1 => Insn::ByteSeq1(seq.try_into().unwrap()),
-            2 => Insn::ByteSeq2(seq.try_into().unwrap()),
-            3 => Insn::ByteSeq3(seq.try_into().unwrap()),
-            4 => Insn::ByteSeq4(seq.try_into().unwrap()),
-            5 => Insn::ByteSeq5(seq.try_into().unwrap()),
-            6 => Insn::ByteSeq6(seq.try_into().unwrap()),
-            7 => Insn::ByteSeq7(seq.try_into().unwrap()),
-            8 => Insn::ByteSeq8(seq.try_into().unwrap()),
-            9 => Insn::ByteSeq9(seq.try_into().unwrap()),
-            10 => Insn::ByteSeq10(seq.try_into().unwrap()),
-            11 => Insn::ByteSeq11(seq.try_into().unwrap()),
-            12 => Insn::ByteSeq12(seq.try_into().unwrap()),
-            13 => Insn::ByteSeq13(seq.try_into().unwrap()),
-            14 => Insn::ByteSeq14(seq.try_into().unwrap()),
-            15 => Insn::ByteSeq15(seq.try_into().unwrap()),
-            16 => Insn::ByteSeq16(seq.try_into().unwrap()),
-            _ => panic!("Unexpected chunk size"),
-        };
-        self.emit_insn(insn);
+        self.emit_insn(Insn::ByteSeq(ByteSeq::new(seq)));
     }
 
     /// Emit an instruction. Inside a lookbehind, an instruction whose effect

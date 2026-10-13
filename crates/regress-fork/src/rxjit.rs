@@ -704,8 +704,8 @@ fn table_for(re: &CompiledRegex, insn: &Insn, tables: &mut Vec<[u8; 256]>) -> Op
             build_table(tables, |b| !ASCIICharProperties::is_line_terminator(b))
         }
         // A 1-byte literal consumes exactly one byte, so it is loop-safe.
-        Insn::ByteSeq1(v) => {
-            let b0 = v[0];
+        Insn::ByteSeq(seq) if seq.bytes().len() == 1 => {
+            let b0 = seq.bytes()[0];
             build_table(tables, |b| b == b0)
         }
         _ => return None,
@@ -765,11 +765,6 @@ fn plan(re: &CompiledRegex) -> Option<Plan> {
             i += 1;
             continue;
         }
-        macro_rules! seq {
-            ($v:expr) => {{
-                nodes.push(Node::Seq($v.to_vec()));
-            }};
-        }
         match insn {
             Insn::Goal => nodes.push(Node::Goal),
             Insn::JustFail => nodes.push(Node::JustFail),
@@ -796,21 +791,7 @@ fn plan(re: &CompiledRegex) -> Option<Plan> {
                 });
                 nodes.push(Node::Wb { invert, w });
             }
-            Insn::ByteSeq2(v) => seq!(v),
-            Insn::ByteSeq3(v) => seq!(v),
-            Insn::ByteSeq4(v) => seq!(v),
-            Insn::ByteSeq5(v) => seq!(v),
-            Insn::ByteSeq6(v) => seq!(v),
-            Insn::ByteSeq7(v) => seq!(v),
-            Insn::ByteSeq8(v) => seq!(v),
-            Insn::ByteSeq9(v) => seq!(v),
-            Insn::ByteSeq10(v) => seq!(v),
-            Insn::ByteSeq11(v) => seq!(v),
-            Insn::ByteSeq12(v) => seq!(v),
-            Insn::ByteSeq13(v) => seq!(v),
-            Insn::ByteSeq14(v) => seq!(v),
-            Insn::ByteSeq15(v) => seq!(v),
-            Insn::ByteSeq16(v) => seq!(v),
+            Insn::ByteSeq(v) => nodes.push(Node::Seq(v.bytes().to_vec())),
             // Everything else — EnterLoop/LoopAgain (general loops with
             // loop-data bookkeeping and the ES empty-loop rule), BackRef,
             // BackRefMulti, Lookahead, Lookbehind — stays interpreted.

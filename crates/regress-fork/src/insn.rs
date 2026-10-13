@@ -33,6 +33,33 @@ pub struct LoopFields {
     pub exit: JumpTarget,
 }
 
+/// The bytes of a literal byte sequence instruction: one to
+/// MAX_BYTE_SEQ_LENGTH of them, held inline.
+#[derive(Debug, Clone, Copy)]
+pub struct ByteSeq {
+    len: u8,
+    bytes: [u8; MAX_BYTE_SEQ_LENGTH],
+}
+
+impl ByteSeq {
+    /// \return the sequence of `bytes`, which must hold one to
+    /// MAX_BYTE_SEQ_LENGTH bytes.
+    pub fn new(bytes: &[u8]) -> Self {
+        assert!(!bytes.is_empty() && bytes.len() <= MAX_BYTE_SEQ_LENGTH);
+        let mut seq = ByteSeq {
+            len: bytes.len() as u8,
+            bytes: [0; MAX_BYTE_SEQ_LENGTH],
+        };
+        seq.bytes[..bytes.len()].copy_from_slice(bytes);
+        seq
+    }
+
+    #[inline(always)]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 #[derive(Debug, Clone)]
 /// The list of bytecode instructions.
 pub enum Insn {
@@ -166,22 +193,7 @@ pub enum Insn {
     ByteSet4(ByteArraySet<[u8; 4]>),
 
     /// Match a sequence of literal bytes.
-    ByteSeq1([u8; 1]),
-    ByteSeq2([u8; 2]),
-    ByteSeq3([u8; 3]),
-    ByteSeq4([u8; 4]),
-    ByteSeq5([u8; 5]),
-    ByteSeq6([u8; 6]),
-    ByteSeq7([u8; 7]),
-    ByteSeq8([u8; 8]),
-    ByteSeq9([u8; 9]),
-    ByteSeq10([u8; 10]),
-    ByteSeq11([u8; 11]),
-    ByteSeq12([u8; 12]),
-    ByteSeq13([u8; 13]),
-    ByteSeq14([u8; 14]),
-    ByteSeq15([u8; 15]),
-    ByteSeq16([u8; 16]),
+    ByteSeq(ByteSeq),
 
     /// An instruction that always fails, which may be produced in weird cases
     /// like an inverted bracket which matches everything.
@@ -218,22 +230,7 @@ impl Insn {
                 | Insn::ByteSet2(_)
                 | Insn::ByteSet3(_)
                 | Insn::ByteSet4(_)
-                | Insn::ByteSeq1(_)
-                | Insn::ByteSeq2(_)
-                | Insn::ByteSeq3(_)
-                | Insn::ByteSeq4(_)
-                | Insn::ByteSeq5(_)
-                | Insn::ByteSeq6(_)
-                | Insn::ByteSeq7(_)
-                | Insn::ByteSeq8(_)
-                | Insn::ByteSeq9(_)
-                | Insn::ByteSeq10(_)
-                | Insn::ByteSeq11(_)
-                | Insn::ByteSeq12(_)
-                | Insn::ByteSeq13(_)
-                | Insn::ByteSeq14(_)
-                | Insn::ByteSeq15(_)
-                | Insn::ByteSeq16(_)
+                | Insn::ByteSeq(_)
         )
     }
 }

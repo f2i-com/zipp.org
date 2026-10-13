@@ -119,22 +119,7 @@ fn first_set(re: &CompiledRegex, insn: &Insn) -> Option<CodePointSet> {
         &Insn::ByteSet3(bytes) => add_ascii_bytes(&mut set, &bytes.0)?,
         &Insn::ByteSet4(bytes) => add_ascii_bytes(&mut set, &bytes.0)?,
         // Only the first byte matters: if it cannot match, the sequence fails.
-        Insn::ByteSeq1(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq2(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq3(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq4(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq5(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq6(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq7(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq8(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq9(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq10(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq11(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq12(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq13(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq14(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq15(b) => add_ascii_bytes(&mut set, &b[..1])?,
-        Insn::ByteSeq16(b) => add_ascii_bytes(&mut set, &b[..1])?,
+        Insn::ByteSeq(seq) => add_ascii_bytes(&mut set, &seq.bytes()[..1])?,
         // Everything else (CharICase, MatchAny, anchors, word boundaries,
         // Alt, loops, ...) is either not a plain consuming instruction or not
         // worth modelling: be conservative.
@@ -291,8 +276,7 @@ fn consumes_exactly_one_element(insn: &Insn) -> bool {
             | Insn::ByteSet2(_)
             | Insn::ByteSet3(_)
             | Insn::ByteSet4(_)
-            | Insn::ByteSeq1(_)
-    )
+    ) || matches!(insn, Insn::ByteSeq(seq) if seq.bytes().len() == 1)
 }
 
 #[cfg(all(test, feature = "std"))]

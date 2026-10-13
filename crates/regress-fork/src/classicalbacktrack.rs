@@ -845,24 +845,15 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                 scm::MatchByteArraySet(bytes),
                 budget,
             ),
-            Insn::ByteSeq1(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq2(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq3(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq4(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq5(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq6(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
-            }
+            Insn::ByteSeq(seq) => Self::run_scm_loop_impl(
+                input,
+                pos,
+                min,
+                max,
+                dir,
+                scm::MatchByteSeq(seq.bytes()),
+                budget,
+            ),
             // No instruction in the message: formatting one here was the only
             // thing that kept `Insn`'s derived `Debug`, and every type it
             // reaches, in a release module (about 22 KB of WebAssembly).
@@ -1398,16 +1389,6 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         Some(true)
     }
 
-    /// Compare `bytes` with the input ending at `pos`, moving `pos` to their
-    /// start: a byte sequence instruction running right to left. One function
-    /// for every length; going forward each length keeps its own.
-    fn match_bytes_back(input: &Input, pos: &mut Input::Position, bytes: &[u8]) -> bool {
-        bytes
-            .iter()
-            .rev()
-            .all(|&b| cursor::next_byte(input, Backward, pos) == Some(b))
-    }
-
     /// Run the right-to-left instruction `insn` (the content of `Insn::Back`
     /// at `ip`): a lookbehind's body. Kept out of `try_at_pos` so the forward
     /// loop stays as tight as it was; each instruction still counts as one
@@ -1438,22 +1419,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             &Insn::ByteSet2(bytes) => scm::MatchByteArraySet(bytes).matches(input, dir, pos),
             &Insn::ByteSet3(bytes) => scm::MatchByteArraySet(bytes).matches(input, dir, pos),
             &Insn::ByteSet4(bytes) => scm::MatchByteArraySet(bytes).matches(input, dir, pos),
-            Insn::ByteSeq1(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq2(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq3(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq4(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq5(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq6(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq7(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq8(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq9(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq10(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq11(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq12(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq13(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq14(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq15(v) => Self::match_bytes_back(input, pos, v),
-            Insn::ByteSeq16(v) => Self::match_bytes_back(input, pos, v),
+            Insn::ByteSeq(seq) => input.match_bytes(dir, pos, seq.bytes()),
             Insn::AsciiBracket(bitmap) => {
                 scm::MatchByteSet { bytes: bitmap }.matches(input, dir, pos)
             }
@@ -1573,53 +1539,8 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         next_or_bt!(scm::MatchByteArraySet(bytes).matches(input, dir, &mut pos))
                     }
 
-                    Insn::ByteSeq1(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq2(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq3(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq4(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq5(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq6(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq7(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq8(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq9(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq10(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq11(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq12(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq13(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq14(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq15(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
-                    }
-                    Insn::ByteSeq16(v) => {
-                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, v))
+                    Insn::ByteSeq(seq) => {
+                        next_or_bt!(cursor::try_match_lit(input, dir, &mut pos, seq.bytes()))
                     }
 
                     &Insn::CharICase(c) => {
