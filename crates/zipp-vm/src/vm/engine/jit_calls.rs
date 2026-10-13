@@ -1059,6 +1059,9 @@ impl<'p> Vm<'p> {
         if let Some(bits) = self.jit_new_plain_fn(cv, base, arg_base, argc, packed_fip) {
             return bits;
         }
+        if let Some(bits) = self.jit_new_base_class(cv, base, arg_base, argc, packed_fip) {
+            return bits;
+        }
         let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
         self.jit_call_depth += 1;
         let r = self.construct(cv, &args);
@@ -1342,6 +1345,83 @@ impl<'p> Vm<'p> {
             Ok(b) => Value::bool(b).bits(),
             Err(t) => self.jit_thrown_to_sentinel(t),
         }
+    }
+
+    /// `new C(...)` of a base class with an explicit constructor, from
+    /// compiled code: the interpreter's flat path (`flat_new_class_instance`
+    /// makes the instance and runs its field initializers), then the
+    /// constructor's body with `this` the instance and `new.target` the
+    /// class, frame-free when nothing in it can see `new.target`, else on a
+    /// frame. `None` (nothing done) for every other kind of class.
+    ///
+    /// Once the field initializers have run nothing may replay them, so a
+    /// frame that cannot be set up (only the stack's depth can refuse one)
+    /// throws its RangeError here instead of declining, as the interpreter's
+    /// own flat `new` does.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_new_base_class(
+        &mut self,
+        cv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        packed_fip: u64,
+    ) -> Option<u64> {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        if !cv.is_heap() || !matches!(self.heap.get(cv.heap_index()), HeapObj::Class(_)) {
+            return None;
+        }
+        self.jit_call_depth += 1;
+        let made = self.flat_new_class_instance(cv);
+        self.jit_call_depth -= 1;
+        let (fid, closure, obj, f) = match made {
+            Ok(Some(made)) => made,
+            Ok(None) => return None,
+            Err(t) => {
+                self.osr_deopt_exempt = true;
+                return Some(self.jit_thrown_to_sentinel(t));
+            }
+        };
+        let rooted = self.host_result_roots.len();
+        self.host_result_roots.push(obj);
+        if self.ctor_body_framefree(fid) {
+            let at = base + arg_base as usize;
+            self.jit_call_depth += 1;
+            let r = self.call_compiled_windowed(f, obj, WinArgs::Regs { at, argc }, fid, closure);
+            self.jit_call_depth -= 1;
+            if let Some(r) = r {
+                self.host_result_roots.truncate(rooted);
+                return Some(match r {
+                    Ok(ret) => {
+                        if self.is_object_value(ret) {
+                            ret.bits()
+                        } else {
+                            obj.bits()
+                        }
+                    }
+                    Err(t) => {
+                        self.osr_deopt_exempt = true;
+                        self.jit_thrown_to_sentinel(t)
+                    }
+                });
+            }
+        }
+        self.pending_new_target = cv;
+        let ip = (packed_fip as u32) as usize;
+        let bits = self.jit_frame_call(fid, closure, obj, base, arg_base, argc, ip, f);
+        self.pending_new_target = Value::UNDEFINED;
+        self.host_result_roots.truncate(rooted);
+        if bits == SELF_CALL_DEOPT {
+            self.osr_deopt_exempt = true;
+            return Some(self.jit_thrown_to_sentinel(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            )));
+        }
+        if bits == CALL_THREW {
+            return Some(bits);
+        }
+        let ret = Value::from_bits(bits);
+        Some(if self.is_object_value(ret) { bits } else { obj.bits() })
     }
 
     /// `new F(args…)` from a compiled region or Tier C body when `F` is a plain
