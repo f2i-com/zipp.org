@@ -1,0 +1,33 @@
+27000 ['a,b,0', 'a,b', '  a|b|0  ', '', 'True', 'False', '  a;b,0  ', '4', 'a,b,0'] ['a,b,2999', 'a,b', '  a|b|2999  ', 'g0-g1-g2', 'True', 'False', '  a;b,2999  ', '4', 'a,b,2999']
+['ABC', "['abc']", 'UP', "['custom', None]", 'T-UPPER', "['t']", 'ÉLÈVE', "['élève']", 'XXX', "['xxx']"] ['ABC', "['abc']", 'UP', "['custom', None]", 'T-UPPER', "['t']", 'ÉLÈVE', "['élève']", 'XXX', "['xxx']"]
+0 ValueError: gen failed at 0
+1 TypeError: sequence item 1: expected str instance, int found
+2 ValueError: empty separator
+3 ValueError: math domain error
+4 TypeError: unhashable type: 'list'
+5 TypeError: '<' not supported between instances of 'NoneType' and 'int'
+6 TypeError: -
+7 ValueError: gen failed at 2
+8 TypeError: sequence item 1: expected str instance, int found
+9 ValueError: empty separator
+10 ValueError: math domain error
+11 TypeError: unhashable type: 'list'
+12 TypeError: '<' not supported between instances of 'NoneType' and 'int'
+13 TypeError: -
+1991 ValueError: math domain error
+1992 TypeError: unhashable type: 'list'
+1993 TypeError: '<' not supported between instances of 'NoneType' and 'int'
+1994 TypeError: -
+1995 ValueError: gen failed at 0
+1996 TypeError: sequence item 1: expected str instance, int found
+1997 ValueError: empty separator
+1998 ValueError: math domain error
+1999 TypeError: unhashable type: 'list'
+<module> 92
+runs 87
+gen 16
+2000 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] [134, True, True, True, 296, True, True, True, 243, True, True, True] 3000
+999 True False
+1000 False True
+1999 False True
+True

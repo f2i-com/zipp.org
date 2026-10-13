@@ -66,6 +66,23 @@ pub(super) fn py_call_op() -> bool {
         }
     }
 }
+/// Whether a function that only reads globals hands `PyGlobal` its own
+/// record instead of loading its globals in its prologue (see
+/// `Emitter::lazy_globals`). On unless `ZIPP_NO_PY_LAZY_GLOBALS` is set (the
+/// same-binary A/B). Read once per process.
+pub(super) fn py_lazy_globals() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PY_LAZY_GLOBALS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 pub(super) const MAX_DEPTH: usize = 96;
 /// Code objects with at most this many bound values take them as their own
 /// parameters (registers 1..=n); larger ones take one array. The runtime's
@@ -150,6 +167,11 @@ pub(super) struct Emitter<'a> {
     pub r_rt: Reg,
     r_unb: Option<Reg>,
     r_globals: Option<Reg>,
+    /// A function whose only use of the globals is reading global names
+    /// (`PyGlobal`): its prologue does not read them, and each read hands
+    /// `PyGlobal` the function's own record, whose `globals` the
+    /// instruction reads itself (see [`Emitter::global_read`]).
+    lazy_globals: bool,
     pub r_ns: Option<Reg>,
     pub r_line: Reg,
     /// Local (value) registers by name.
@@ -266,6 +288,7 @@ impl<'a> Emitter<'a> {
             r_rt: 0,
             r_unb: None,
             r_globals: None,
+            lazy_globals: false,
             r_ns: None,
             r_line: 0,
             locals: BTreeMap::new(),
@@ -357,7 +380,23 @@ impl<'a> Emitter<'a> {
                 .values()
                 .any(|k| matches!(k, SymKind::Global | SymKind::ClassLocal))
         {
-            self.r_globals = Some(self.prop(REG_FUNC, "globals")?);
+            // A function with no nested scope and no `global` statement
+            // only reads globals (its code can store or delete one only
+            // through such a statement): each read hands `PyGlobal` the
+            // function's record, and any other use reads the field where it
+            // is (`globals`). A function with a loop, which may read globals
+            // many times a call, loads them once here instead.
+            if self.fast
+                && py_lazy_globals()
+                && self.kind() == ScopeKind::Function
+                && scope.children.is_empty()
+                && !scope.declares_global
+                && !scope.has_loop
+            {
+                self.lazy_globals = true;
+            } else {
+                self.r_globals = Some(self.prop(REG_FUNC, "globals")?);
+            }
         }
         self.r_line = self.alloc()?;
         if self.kind() == ScopeKind::Class {
@@ -1290,8 +1329,9 @@ impl<'a> Emitter<'a> {
     }
     /// Python truth of `value`: a JS boolean is its own truth (the common
     /// result of a comparison); an int or a str has the truth JavaScript
-    /// gives it (`0n` and `""` are false, as in Python); anything else asks
-    /// the runtime.
+    /// gives it (`0n` and `""` are false, as in Python); an exact list,
+    /// tuple, dict or set has a nonzero length (`PyLen`, whose slow edge is
+    /// the runtime's test); anything else asks the runtime.
     pub fn truth(&mut self, value: Reg) -> R<Reg> {
         let dst = self.alloc()?;
         let is_bool = self.typeof_is(value, "boolean")?;
@@ -1312,11 +1352,25 @@ impl<'a> Emitter<'a> {
         let end2 = self.jump()?;
         let here = self.here();
         self.patch(helper, here)?;
+        let mut ends = vec![end, end2];
+        if self.fast {
+            // A container's length: `0n` is false, any other int true.
+            let n = self.alloc()?;
+            let rt = self.r_rt;
+            let at = self.emit(Instr::PyLen { dst: n, v: value, rt, slow: 0 })?;
+            let not = self.alloc()?;
+            self.emit(Instr::Not { dst: not, a: n })?;
+            self.emit(Instr::Not { dst, a: not })?;
+            ends.push(self.jump()?);
+            let here = self.here();
+            self.patch_slow(at, here)?;
+        }
         let r = self.helper("truth", &[value])?;
         self.emit(Instr::Move { dst, src: r })?;
         let here = self.here();
-        self.patch(end, here)?;
-        self.patch(end2, here)?;
+        for j in ends {
+            self.patch(j, here)?;
+        }
         Ok(dst)
     }
     /// Whether `obj.<name>` may take the inline instance-attribute paths.
@@ -1686,6 +1740,9 @@ impl<'a> Emitter<'a> {
                 self.helper("nsload", &[ns, globals, key])
             }
             SymKind::Global => {
+                if self.lazy_globals {
+                    return self.global_read(REG_FUNC, name);
+                }
                 let globals = self.globals()?;
                 if !self.fast {
                     let key = self.string(name)?;
@@ -1708,6 +1765,8 @@ impl<'a> Emitter<'a> {
         let at = self.emit(Instr::PyGlobal { dst, globals, rt, key, slow: 0 })?;
         let name = name.to_owned();
         self.defer_cold(Vec::new(), vec![at], move |e| {
+            // A function's record (lazy globals): its `globals` here.
+            let globals = if globals == REG_FUNC { e.prop(REG_FUNC, "globals")? } else { globals };
             let key = e.string(&name)?;
             let r = e.helper("gload", &[globals, key])?;
             e.emit(Instr::Move { dst, src: r })?;

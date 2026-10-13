@@ -91,28 +91,23 @@ impl<'p> Vm<'p> {
         Ok(match *instr {
             Instr::PyClassOf { dst, obj, slow } => {
                 let o = self.get(base, obj);
-                match self.py_cls_of(o) {
-                    Some(c) if self.py_plain_rec(c) => {
+                match self.py_class_of(o) {
+                    Some(c) => {
                         self.set(base, dst, c);
                         ip + 1
                     }
-                    _ => slow as usize,
+                    None => slow as usize,
                 }
             }
             Instr::PyDictGet { dst, obj, key, absent, slow } => {
                 let o = self.get(base, obj);
-                let Some(map) = self.py_inst_map(o) else {
-                    return Ok(slow as usize);
-                };
-                let k = self.resolve_const_slot(func_id, key);
-                let v = self.map_method(map, "get", &[k])?.unwrap_or(Value::UNDEFINED);
-                match (v.is_undefined(), absent) {
-                    (false, false) => {
+                match self.py_dict_get(func_id, o, key, absent)? {
+                    PyDictGot::Value(v) => {
                         self.set(base, dst, v);
                         ip + 1
                     }
-                    (true, true) => ip + 1,
-                    _ => slow as usize,
+                    PyDictGot::Absent => ip + 1,
+                    PyDictGot::Slow => slow as usize,
                 }
             }
             Instr::PyCallEntry { dst, f, name, slow } => {
@@ -267,11 +262,19 @@ impl<'p> Vm<'p> {
                     }
                     None => match call {
                         // A property: its getter's frame, as `PyCall` pushes
-                        // a callee's (`usize::MAX`), the result for `dst`.
-                        Some(a) => {
-                            self.py_push_accessor(a, base, obj, None, dst, ip)?;
-                            usize::MAX
-                        }
+                        // a callee's (`usize::MAX`), the result for `dst`;
+                        // a getter that only reads an attribute its own
+                        // site's entry holds, without the frame.
+                        Some(a) => match self.py_accessor_inline(&a, o, None) {
+                            Some(v) => {
+                                self.set(base, dst, v);
+                                ip + 1
+                            }
+                            None => {
+                                self.py_push_accessor(a, base, obj, None, dst, ip)?;
+                                usize::MAX
+                            }
+                        },
                         None => slow as usize,
                     },
                 }
@@ -285,10 +288,15 @@ impl<'p> Vm<'p> {
                 } else {
                     match call {
                         // A property: its setter's frame, whose result is
-                        // dropped.
+                        // dropped; a setter that only stores an attribute
+                        // its own site's entry holds, without the frame.
                         Some(a) => {
-                            self.py_push_accessor(a, base, obj, Some(v), super::ic::RET_DISCARD, ip)?;
-                            usize::MAX
+                            if self.py_accessor_inline(&a, o, Some(v)).is_some() {
+                                ip + 1
+                            } else {
+                                self.py_push_accessor(a, base, obj, Some(v), super::ic::RET_DISCARD, ip)?;
+                                usize::MAX
+                            }
                         }
                         None => slow as usize,
                     }
@@ -418,23 +426,9 @@ impl<'p> Vm<'p> {
                 return Err(Thrown(String::new()));
             }
             Instr::PyCaught { dst, e, line, rt, slow } => {
-                let (ev, rv) = (self.get(base, e), self.get(base, rt));
-                let Some(tb_slot) = self.py_exc_record(ev, rv, false).map(|(_, tb)| tb) else {
+                let (ev, lv, rv) = (self.get(base, e), self.get(base, line), self.get(base, rt));
+                if !self.py_caught(ev, lv, rv) {
                     return Ok(slow as usize);
-                };
-                let idx = ev.heap_index();
-                let tb = match self.heap.get(idx) {
-                    HeapObj::Object(m) => m.val_at(tb_slot),
-                    _ => return Ok(slow as usize),
-                };
-                if tb.is_number() && tb.as_f64() == -1.0 {
-                    let lv = self.get(base, line);
-                    if lv.is_heap() {
-                        self.heap.write_barrier_val(idx, lv);
-                    }
-                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                        m.set_val_at(tb_slot, lv);
-                    }
                 }
                 self.set(base, dst, ev);
                 ip + 1
@@ -821,6 +815,37 @@ impl<'p> Vm<'p> {
         PyCallee::Plain(fid, closure, e)
     }
 
+    /// The slot of the builtin record `f`'s `strop` when the site's entry
+    /// `e` names `f` with that slot recorded ([`Vm::py_strm_site`]: `d`, with
+    /// no plain callee in `c`) and the record's entry for the count, read
+    /// afresh at the entry's slot (the record's keys as they were), is the
+    /// `__zipp_py_strm` native right now: what [`Vm::py_call_target`] would
+    /// find through [`Vm::py_entry_of`] and the native's tests, without the
+    /// entry's second read and the callee's kind tested by elimination. For
+    /// compiled code's `jit_py_call` only: asked in the interpreter's step
+    /// (`py_call_target`) it made every plain Python call 3 to 4% slower
+    /// (call_simple, call_defaults), for 4% on str_methods there.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline]
+    pub(super) fn py_strm_hit(&self, e: &PyIc, f: Value) -> Option<usize> {
+        if e.kind != ic::CALL_ENTRY || e.c != 0 || e.d == 0 || e.a != f.bits() || !f.is_heap() {
+            return None;
+        }
+        let fi = f.heap_index();
+        if self.heap.version_of(fi) != e.hver {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(fi) else {
+            return None;
+        };
+        let pos = e.pos as usize;
+        if pos >= m.len() || m.is_accessor_at(pos) {
+            return None;
+        }
+        let entry = m.val_at(pos);
+        (entry.is_heap() && self.py_strm_entry(entry)).then_some((e.d - 1) as usize)
+    }
+
     /// Whether `e` is the runtime's positional entry of exception classes
     /// for `argc` arguments (`R.EXCENTRY[argc]`).
     #[inline]
@@ -956,7 +981,17 @@ impl<'p> Vm<'p> {
         }
         let gi = g.heap_index();
         let e = self.py_ic(func_id, ip);
-        if e.a != g.bits() || self.heap.version_of(gi) != e.hver {
+        if e.a != g.bits() {
+            // A function's record (lazy globals) stands for its globals.
+            return self.py_global_hit_lazy(&e, g, r);
+        }
+        self.py_global_hit_at(&e, g, gi, r)
+    }
+
+    /// [`Vm::py_global_hit`] past its entry's globals test.
+    #[inline(always)]
+    fn py_global_hit_at(&self, e: &PyIc, g: Value, gi: u32, r: Value) -> Option<Value> {
+        if self.heap.version_of(gi) != e.hver {
             return None;
         }
         if e.kind == ic::GLOBAL {
@@ -967,6 +1002,78 @@ impl<'p> Vm<'p> {
             return self.py_map_at_bits(b, e.pos, e.b, e.d);
         }
         None
+    }
+
+    /// [`Vm::py_global_hit`] handed a function's record (lazy globals): the
+    /// same answer for the record's globals.
+    #[inline(never)]
+    fn py_global_hit_lazy(&self, e: &PyIc, f: Value, r: Value) -> Option<Value> {
+        let g = self.py_globals_of(f)?;
+        if e.a != g.bits() {
+            return None;
+        }
+        self.py_global_hit_at(e, g, g.heap_index(), r)
+    }
+
+    /// [`Instr::PyGlobal`]'s `globals` operand as the module's globals: a
+    /// `Map` is itself; a plain record is a function's (the emitter's lazy
+    /// globals: a function that only reads globals hands its own record,
+    /// `this`, instead of reading its `globals` field on every call), whose
+    /// own data `globals` is read here: at its slot for a record of a shape
+    /// seen with it there (a shape fixes keys, order and kinds), else by
+    /// name ([`Vm::py_globals_learn`]). `None` (the slow edge) for anything
+    /// else. Out of line: a site handed the Map its entry names (every site
+    /// outside such a function) never calls it.
+    #[inline(never)]
+    pub(super) fn py_globals_of(&self, g: Value) -> Option<Value> {
+        if !g.is_heap() {
+            return None;
+        }
+        match self.heap.get(g.heap_index()) {
+            HeapObj::Map { .. } => Some(g),
+            HeapObj::Object(m) => {
+                if let Some(p) = self.py_rt.as_deref() {
+                    let (shape, slot) = (m.shape(), p.func_globals_slot.get() as usize);
+                    if shape != crate::shape::DICT && slot < m.len() && p.func_shapes.get().contains(&shape) {
+                        debug_assert!(
+                            m.key_at(slot) == "globals" && !m.is_accessor_at(slot),
+                            "a function record of a seen shape has no data `globals` at the seen slot"
+                        );
+                        let v = m.val_at(slot);
+                        return v.is_heap().then_some(v);
+                    }
+                }
+                self.py_globals_learn(g)
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Vm::py_globals_of`] of a function record of a shape not seen yet:
+    /// its `globals` by name (through the VM's hint), the record's shape
+    /// then noted with the slot (the shapes kept are those of one slot).
+    #[cold]
+    #[inline(never)]
+    fn py_globals_learn(&self, g: Value) -> Option<Value> {
+        let gi = g.heap_index();
+        let (v, slot) = self.py_hint_slot(super::py_rt::hint::GLOBALS, gi, "globals")?;
+        if !v.is_heap() {
+            return None;
+        }
+        if let (HeapObj::Object(m), Some(p), Ok(slot)) = (self.heap.get(gi), self.py_rt.as_deref(), u16::try_from(slot)) {
+            if m.shape_guardable() {
+                let mut shapes = p.func_shapes.get();
+                if p.func_globals_slot.get() != slot {
+                    shapes = [crate::shape::DICT; 4];
+                    p.func_globals_slot.set(slot);
+                }
+                // The first empty place, else the last place over again.
+                let at = shapes.iter().position(|&s| s == crate::shape::DICT).unwrap_or(3);
+                shapes[at] = m.shape();
+                p.func_shapes.set(shapes);
+            }
+        }
+        Some(v)
     }
 
     /// [`Instr::PyGlobal`]: a module global, else a builtin; `None` for the
@@ -997,7 +1104,12 @@ impl<'p> Vm<'p> {
             }
         }
         if !matches!(self.heap.get(gi), HeapObj::Map { .. }) {
-            return None;
+            // A function's record (lazy globals): the same for its globals.
+            let m = self.py_globals_of(g)?;
+            if !matches!(self.heap.get(m.heap_index()), HeapObj::Map { .. }) {
+                return None;
+            }
+            return self.py_global(func_id, ip, m, r, key);
         }
         let k = self.resolve_const_slot(func_id, key);
         // Module globals are asked for every builtin name they lack: through
@@ -1064,9 +1176,61 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// [`Instr::PyClassOf`]: the record `o`'s class when it is a plain
+    /// record; `None` for the slow edge.
+    #[inline]
+    pub(super) fn py_class_of(&self, o: Value) -> Option<Value> {
+        self.py_cls_of(o).filter(|&c| self.py_plain_rec(c))
+    }
+
+    /// [`Instr::PyDictGet`] of the string constant `key` (of `func_id`) in
+    /// the instance `o`'s attribute storage: what `map_method`'s `get`
+    /// answers for it, asked of layout-mode storage directly (the step went
+    /// through the method's name), sorted as the instruction's `absent`
+    /// flag sorts it.
+    pub(super) fn py_dict_get(&mut self, func_id: u32, o: Value, key: u32, absent: bool) -> Result<PyDictGot, Thrown> {
+        let Some(map) = self.py_inst_map(o) else {
+            return Ok(PyDictGot::Slow);
+        };
+        let k = self.resolve_const_slot(func_id, key);
+        let v = if matches!(self.heap.get(map), HeapObj::PyAttrs { .. }) {
+            self.py_attrs_get(Value::heap(map), k).flatten().unwrap_or(Value::UNDEFINED)
+        } else {
+            self.map_method(map, "get", &[k])?.unwrap_or(Value::UNDEFINED)
+        };
+        Ok(match (v.is_undefined(), absent) {
+            (false, false) => PyDictGot::Value(v),
+            (true, true) => PyDictGot::Absent,
+            _ => PyDictGot::Slow,
+        })
+    }
+
+    /// [`Instr::PyCaught`] for the exception `e` (the handler's `line`):
+    /// whether it is an exception record, its `tbline` then set to `line`
+    /// if it was -1; `false` (nothing done) for the slow edge.
+    pub(super) fn py_caught(&mut self, e: Value, line: Value, rt: Value) -> bool {
+        let Some(tb_slot) = self.py_exc_record(e, rt, false).map(|(_, tb)| tb) else {
+            return false;
+        };
+        let idx = e.heap_index();
+        let tb = match self.heap.get(idx) {
+            HeapObj::Object(m) => m.val_at(tb_slot),
+            _ => return false,
+        };
+        if tb.is_number() && tb.as_f64() == -1.0 {
+            if line.is_heap() {
+                self.heap.write_barrier_val(idx, line);
+            }
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.set_val_at(tb_slot, line);
+            }
+        }
+        true
+    }
+
     /// [`Instr::PyExcPop`]: `Some` when it popped (see the instruction).
     #[inline(never)]
-    fn py_exc_pop(&mut self, rt: Value) -> Option<()> {
+    pub(super) fn py_exc_pop(&mut self, rt: Value) -> Option<()> {
         let stack = self.py_rt_for(rt)?.excstack;
         if !stack.is_heap() {
             return None;
@@ -1124,6 +1288,17 @@ impl<'p> Vm<'p> {
         if !self.py_alloc_like_ok(tmpl, shape) {
             return None;
         }
+        self.py_alloc_like_ready(tmpl, shape, vals)
+    }
+
+    /// [`Vm::py_alloc_like`] of a template its caller has just found
+    /// [`Vm::py_alloc_like_ok`] for `shape` (nothing that could change the
+    /// template has run since). The record is allocated from the template's
+    /// own key plan, borrowed from the registry's copy of it (`PyRt::plans`,
+    /// the same `Arc` by pointer) rather than cloned, which changed the
+    /// plan's count twice per record.
+    #[inline(never)]
+    pub(super) fn py_alloc_like_ready(&mut self, tmpl: Value, shape: u32, vals: &[Value]) -> Option<Value> {
         let HeapObj::Object(m) = self.heap.get(tmpl.heap_index()) else {
             return None;
         };
@@ -1133,8 +1308,30 @@ impl<'p> Vm<'p> {
         let crate::heap::PropKeys::Planned { all, .. } = &m.keys else {
             return None;
         };
-        let plan = all.clone();
-        let idx = self.heap.alloc_finalized(&plan, vals, shape);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let idx = {
+            let kept = self.py_rt.as_deref().and_then(|p| p.plans.iter().position(|k| crate::bytecode::StaticKeyPlan::ptr_eq(k, all)));
+            match kept {
+                Some(i) => {
+                    let p = self.py_rt.as_deref()?;
+                    self.heap.alloc_finalized(&p.plans[i], vals, shape)
+                }
+                None => {
+                    let plan = all.clone();
+                    if let Some(p) = self.py_rt.as_deref_mut() {
+                        if p.plans.len() < 8 {
+                            p.plans.push(plan.clone());
+                        }
+                    }
+                    self.heap.alloc_finalized(&plan, vals, shape)
+                }
+            }
+        };
+        #[cfg(feature = "safe-sandbox")]
+        let idx = {
+            let plan = all.clone();
+            self.heap.alloc_finalized(&plan, vals, shape)
+        };
         self.realm_born(idx, self.obj_proto);
         Some(Value::heap(idx))
     }
@@ -1173,11 +1370,11 @@ impl<'p> Vm<'p> {
         if !self.py_alloc_like_ok(tmpl, exc_shape) || !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
             return None;
         }
-        let tuple = self.py_alloc_like(seq_tmpl, seq_shape, &[ttuple, args])?;
+        let tuple = self.py_alloc_like_ready(seq_tmpl, seq_shape, &[ttuple, args])?;
         let map = self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
         self.adopt_native_result_realm(map, self.map_proto);
         let vals = [cls, Value::heap(map), tuple, Value::NULL, context, Value::int(-1), Value::FALSE, Value::NULL, Value::int(0), Value::UNDEFINED];
-        self.py_alloc_like(tmpl, exc_shape, &vals)
+        self.py_alloc_like_ready(tmpl, exc_shape, &vals)
     }
 
     /// The Array for [`Instr::PyUnpack`].
@@ -1199,7 +1396,7 @@ impl<'p> Vm<'p> {
 
     /// [`Instr::PyDictLookup`]: `Some(Some(value))`, `Some(None)` for no
     /// entry, `None` for the slow edge (the table's own lookup, `vm::py_table`).
-    fn py_dict_lookup(&mut self, d: Value, k: Value, rt: Value) -> Option<Option<Value>> {
+    pub(super) fn py_dict_lookup(&mut self, d: Value, k: Value, rt: Value) -> Option<Option<Value>> {
         if !d.is_heap() {
             return None;
         }
@@ -2009,6 +2206,17 @@ impl<'p> Vm<'p> {
     /// its slow path.
     #[inline(always)] // one copy in the step, one in its JIT helper (`engine/py_jit.rs`)
     pub(crate) fn py_arith(&mut self, op: PyArithOp, va: Value, vb: Value) -> Result<Option<Value>, Thrown> {
+        // `str % values`: the runtime's `R.mod` asks `__zipp_py_pct` first
+        // (`py_pct_format`, which answers only what the runtime's
+        // `percentFormat` answers, and declines anything else); asked here,
+        // its call is not made.
+        if op == PyArithOp::Mod && va.is_heap() && self.heap.is_str_like(va.heap_index()) {
+            let tuple = match self.py_rt.as_deref() {
+                Some(p) => p.t_tuple,
+                None => return Ok(None),
+            };
+            return Ok(self.py_pct_format(&[va, vb, tuple]));
+        }
         // Two floats: exactly the VM's own Number arithmetic (the int-tagged
         // fast forms included), as the inline code this replaces used.
         if va.is_number() && vb.is_number() {
@@ -2179,6 +2387,9 @@ impl<'p> Vm<'p> {
                 {
                     let eq = self.values_strict_eq(va, vb);
                     Ok(Some(if op == PyCmpOp::Eq { eq } else { !eq }))
+                } else if let Some(eq) = self.py_deep_eq(va, vb) {
+                    // Two exact lists or dicts (`vm::py_table`).
+                    Ok(Some(if op == PyCmpOp::Eq { eq } else { !eq }))
                 } else {
                     Ok(None)
                 }
@@ -2289,6 +2500,15 @@ fn float_holds(op: PyCmpOp, x: f64, y: f64) -> bool {
         PyCmpOp::Eq => x == y,
         PyCmpOp::Ne => x != y,
     }
+}
+
+/// [`Vm::py_dict_get`]'s answer: the value for `dst`, the fall-through with
+/// `dst` untouched (an absent key the instruction expects absent), or the
+/// slow edge.
+pub(super) enum PyDictGot {
+    Value(Value),
+    Absent,
+    Slow,
 }
 
 /// [`Vm::py_call_target`]'s answer.

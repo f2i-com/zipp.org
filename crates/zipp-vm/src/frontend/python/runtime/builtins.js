@@ -622,6 +622,14 @@
             native("join", 2, 7); native("lower", 1, 8); native("upper", 1, 9);
             native("startswith", 2, 18); native("endswith", 2, 19);
         }
+        // An f-string's parts (strs, and ints left as ints: `"" + 5n` is
+        // "5", as `str(5)`) are joined by `R.FJOIN.c<n>(...parts)`, a call
+        // the emitter makes with the record as `this`; the native (op 20)
+        // joins them in one allocation and calls `j<n>` for anything else.
+        const FJ = { strop: 20, ltmpl: null, ttype: null };
+        const fjoin = function (...parts) { let out = ""; for (let i = 0; i < parts.length; i++) out += parts[i]; return rt.checkedText(out); };
+        for (let n = 1; n <= 12; n++) { FJ["j" + n] = fjoin; FJ["c" + n] = STRM !== null ? STRM : fjoin; }
+        R.FJOIN = FJ;
     }
     // CPython's digit classes follow Numeric_Type: isdecimal is Decimal (Nd),
     // isdigit adds Digit (superscripts, circled and parenthesized digits,

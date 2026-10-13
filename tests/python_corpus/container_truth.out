@@ -1,0 +1,5 @@
+[(0, 0, 'f', False), (1, 1, 't', True), (0, 0, 'f', False), (1, 1, 't', True), (0, 0, 'f', False), (1, 1, 't', True), (0, 0, 'f', False), (1, 1, 't', True), (0, 0, 'f', False), (1, 1, 't', True), (1, 1, 't', True), (1, 1, 't', True), (0, 0, 'f', False), (0, 0, 'f', False), (0, 0, 'f', False), (1, 1, 't', True), (1, 1, 't', True), (1, 1, 't', True), (0, 0, 'f', False), (1, 1, 't', True), (0, 0, 'f', False), (1, 1, 't', True), (0, 0, 'f', False), (1, 1, 't', True), (0, 0, 'f', False), (1, 1, 't', True), (0, 0, 'f', False), (0, 0, 'f', False), (0, 0, 'f', False), (1, 1, 't', True)]
+2500 [] False
+2000 2000
+2400 [2, 0, 1, 0, 1, 2, 0, 1, 0, 1]
+1005 []

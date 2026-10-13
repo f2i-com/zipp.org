@@ -236,9 +236,25 @@ pub(crate) fn emit_py_step(
     labels: &PyLabels,
     refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
 ) {
+    emit_py_step_with(ops, crate::vm::Vm::jit_py_op as usize, func_id, ip, None, labels, refetch);
+}
+
+/// [`emit_py_step`] through `helper`, which answers as `Vm::jit_py_op`
+/// does; `arg4`, when given, is its fourth argument (in `r9`).
+fn emit_py_step_with(
+    ops: &mut dynasmrt::x64::Assembler,
+    helper: usize,
+    func_id: u32,
+    ip: usize,
+    arg4: Option<u64>,
+    labels: &PyLabels,
+    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+) {
     let packed = ((func_id as u64) << 32) | ip as u64;
-    let helper = crate::vm::Vm::jit_py_op as usize;
     let cont = ops.new_dynamic_label();
+    if let Some(a) = arg4 {
+        dynasm!(ops ; mov r9, QWORD a as i64);
+    }
     dynasm!(ops
         ; mov rcx, rdi
         ; mov rdx, rbx
@@ -883,6 +899,35 @@ pub(crate) fn emit_py_op(
                 ; jmp => labels.bail
             );
         }
+        // A plain class's construction: likewise through `Vm::jit_py_new`,
+        // which reads the class and the runtime from the window and stores
+        // the instance, the `__init__` entry and its `this` there; 0 is
+        // done, anything but the slow edge's answer bails (nothing done).
+        Instr::PyNew { dst, entry, this_f, cls, rt, n, .. } if !crate::vm::prof_py::on() => {
+            let outs = dst as u64 | (entry as u64) << 16 | (this_f as u64) << 32;
+            let ins = cls as u64 | (rt as u64) << 16 | (n as u64) << 32;
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, rbx
+                ; mov r8, QWORD site(func_id, ip) as i64
+                ; mov r9, QWORD outs as i64
+                ; mov rax, QWORD ins as i64
+                ; mov [rsp + 32], rax
+                ; mov rax, QWORD crate::vm::Vm::jit_py_new as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; test rax, rax
+                ; jz => done
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; jmp => labels.bail
+            );
+        }
         // The instructions that only answer a value or take their slow edge:
         // each through its own helper (`vm/engine/py_jit.rs`), the step's
         // function over the operands with the site for its cache entry,
@@ -901,6 +946,89 @@ pub(crate) fn emit_py_op(
             let h = crate::vm::Vm::jit_py_method as usize;
             let keys = key as u64 | (gb as u64) << 32;
             emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(keys)], dst, labels, refetch);
+        }
+        Instr::PyClassOf { dst, obj, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_class_of as usize;
+            emit_py_value_call(ops, h, [V::Reg(obj), V::None, V::None, V::None], dst, labels, refetch);
+        }
+        Instr::PyCaught { dst, e, line, rt, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_caught as usize;
+            emit_py_value_call(ops, h, [V::Reg(e), V::Reg(line), V::Reg(rt), V::None], dst, labels, refetch);
+        }
+        // An instance dict's entry (`PyDictGet`): as a value helper, with
+        // `PY_ABSENT_BITS` the fall-through that leaves `dst` untouched.
+        Instr::PyDictGet { dst, obj, key, absent, .. } if !crate::vm::prof_py::on() => {
+            let keys = key as u64 | (absent as u64) << 32;
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(obj)]
+                ; mov r8, QWORD site(func_id, ip) as i64
+                ; mov r9, QWORD keys as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_get as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; mov r10, QWORD PY_ABSENT_BITS as i64
+                ; cmp rax, r10
+                ; je => done
+                ; mov r10, QWORD CALL_THREW as i64
+                ; cmp rax, r10
+                ; je => labels.bail
+                ; mov [rbx + dreg(dst)], rax
+            );
+        }
+        // A dict's `.get` (`PyDictLookup`): as `PyGetItem`'s helper, its
+        // `absent` edge the second.
+        Instr::PyDictLookup { dst, d, k, rt, .. } if labels.target.is_some() && !crate::vm::prof_py::on() => {
+            let Some(absent) = labels.target else {
+                unreachable!("PyDictLookup carries an absent label");
+            };
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(d)]
+                ; mov r8, [rbx + dreg(k)]
+                ; mov r9, [rbx + dreg(rt)]
+                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_lookup as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; mov r10, QWORD PY_ABSENT_BITS as i64
+                ; cmp rax, r10
+                ; je => absent
+                ; mov [rbx + dreg(dst)], rax
+            );
+        }
+        // An exception stack's pop (`PyExcPop`): 0 is done.
+        Instr::PyExcPop { rt, .. } if !crate::vm::prof_py::on() => {
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(rt)]
+                ; mov rax, QWORD crate::vm::Vm::jit_py_exc_pop as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; test rax, rax
+                ; jz => done
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; jmp => labels.bail
+            );
         }
         Instr::PyIsInstance { dst, v, t, rt, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_isinstance as usize;
@@ -928,6 +1056,13 @@ pub(crate) fn emit_py_op(
         Instr::PyGenNext { dst, next, this, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_gen_next as usize;
             emit_py_value_call(ops, h, [V::Reg(next), V::Reg(this), V::Imm(ip as u64), V::None], dst, labels, refetch);
+        }
+        // A call: through `Vm::jit_py_call` with the operands packed, which
+        // calls a str method's native where it is and hands any other
+        // callee to `Vm::jit_py_op`; the same outcomes as the step's.
+        Instr::PyCall { dst, f, arg_base, argc, .. } if !crate::vm::prof_py::on() => {
+            let regs = f as u64 | (arg_base as u64) << 16 | (argc as u64) << 32 | (dst as u64) << 48;
+            emit_py_step_with(ops, crate::vm::Vm::jit_py_call as usize, func_id, ip, Some(regs), labels, refetch);
         }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
         // when the body's plan has the site; the ordinary step otherwise.
