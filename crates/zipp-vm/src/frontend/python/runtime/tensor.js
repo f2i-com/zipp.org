@@ -186,7 +186,9 @@
     }
     // Indexed loops, not for...of: these run on every kernel call, and the
     // iterator protocol is several interpreter calls per element.
-    function shapeOf(v) { if (v === null || typeof v !== "object" || v.items === undefined) fail(E.TypeError, "shape must be a tuple"); const items = v.items, out = new Array(items.length); for (let i = 0; i < items.length; i++) out[i] = Number(rt.asInt(items[i])); return out; }
+    // (`Number(rt.asInt(v))` is `Number(v)` for every v: a bool reads as 0
+    // or 1 either way, and anything else passes through `asInt` unchanged.)
+    function shapeOf(v) { if (v === null || typeof v !== "object" || v.items === undefined) fail(E.TypeError, "shape must be a tuple"); const items = v.items, out = new Array(items.length); for (let i = 0; i < items.length; i++) out[i] = Number(items[i]); return out; }
     function ints(v) { return shapeOf(v); }
     // Result shapes are torch.Size values once torch registers the type
     // (`_set_size_type`): a Tensor keeps a Size as it is, where a tuple
@@ -357,7 +359,7 @@
     }
     // A shape tuple the caller passed in, when the result has exactly that
     // shape: the kernel hands it back instead of building an equal one.
-    function tupleShape(v) { return v !== undefined && (v.cls === T.tuple || rt.isSubclass(v.cls, T.tuple)); }
+    function tupleShape(v) { return v !== undefined && (v.cls === SIZE || v.cls === T.tuple || rt.isSubclass(v.cls, T.tuple)); }
     // `want`: the result dtype Python's type promotion chose (null: promote
     // the operands' dtypes). The kernel computes in double precision and
     // rounds on store.
@@ -2873,6 +2875,35 @@
         // total `version` above still is.
         fn("aversion", 1, (a) => { const s = root(needSC(a[0])); return BigInt(s.version - s.untracked); });
         fn("untrack", 1, (a) => { root(needSC(a[0])).untracked++; return null; });
+        // aversions_ok(saved): whether every (storage, version, tensor) entry
+        // of an autograd node's saved list still has that version (what
+        // `aversion` would answer), in one call; false for anything else,
+        // and the caller then checks entry by entry.
+        fn("aversions_ok", 1, (a) => {
+            const list = a[0];
+            if (list === null || typeof list !== "object" || list.items === undefined) return false;
+            const items = list.items;
+            for (let i = 0; i < items.length; i++) {
+                const e = items[i];
+                if (e === null || typeof e !== "object" || e.items === undefined || e.items.length < 2) return false;
+                let s = e.items[0];
+                if (s === null || typeof s !== "object" || (s.cls !== Storage && s.cls !== CStorage)) return false;
+                if (s.base !== undefined) s = s.base;
+                const v = e.items[1];
+                if (typeof v !== "bigint" || BigInt(s.version - s.untracked) !== v) return false;
+            }
+            return true;
+        });
+        // _numel(shape): the product of a tuple's or list's ints (Python
+        // ints, exact), or null for anything else (the caller multiplies).
+        fn("_numel", 1, (a) => {
+            const v = a[0];
+            if (v === null || typeof v !== "object" || v.items === undefined) return null;
+            const items = v.items;
+            let n = 1n;
+            for (let i = 0; i < items.length; i++) { const d = items[i]; if (typeof d !== "bigint") return null; n *= d; }
+            return n;
+        });
         fn("all_finite", 1, (a) => { const s = a[0]; return isStorage(s) ? allFinite(s) : allFinite(realOf(needC(s))); });
         // _native(on): switch the native loops (`vm::py_tensor`) on or off,
         // returning whether they were on; for comparing the two paths.

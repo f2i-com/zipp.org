@@ -104,22 +104,22 @@ def _layout(shape, axis):
 
 
 def _check_qdtype(dt):
-    if not _isinstance(dt, torch.dtype) or dt.name not in _INFO:
-        if _isinstance(dt, torch.dtype) and dt.name == "quint4x2":
+    if not isinstance(dt, torch.dtype) or dt.name not in _INFO:
+        if isinstance(dt, torch.dtype) and dt.name == "quint4x2":
             raise NotImplementedError("torch.quint4x2 tensors are not supported on Zipp (quint8, qint8 and qint32 are)")
-        raise RuntimeError("ScalarType %s is not supported in new_qtensor." % (_scalar_name(dt) if _isinstance(dt, torch.dtype) else dt))
+        raise RuntimeError("ScalarType %s is not supported in new_qtensor." % (_scalar_name(dt) if isinstance(dt, torch.dtype) else dt))
     return _INFO[dt.name]
 
 
 def _check_float_input(x):
-    if not _isinstance(x, _T) or x.__class__ is _Q:
+    if not isinstance(x, _T) or x.__class__ is _Q:
         raise TypeError("quantize: expected a float Tensor")
     if x.dtype is not torch.float32:
         raise RuntimeError("Quantize only works on Float Tensor, got %s" % _scalar_name(x.dtype))
 
 
 def _scalar(v, conv):
-    if _isinstance(v, _T):
+    if isinstance(v, _T):
         return conv(v.item())
     return conv(v)
 
@@ -136,15 +136,15 @@ def _quantize_pt(x, scale, zp, dt):
 
 
 def quantize_per_tensor(input, scale, zero_point, dtype):
-    if _isinstance(input, (_list, _tuple)):
+    if isinstance(input, (_list, _tuple)):
         # The list form: one scale and zero point (tensors) per input.
-        scales = scale.tolist() if _isinstance(scale, _T) else _list(scale)
-        zps = zero_point.tolist() if _isinstance(zero_point, _T) else _list(zero_point)
-        return _tuple(quantize_per_tensor(t, torch.tensor(s, dtype=torch.float32) if _isinstance(scale, _T) else s, z, dtype) for t, s, z in zip(input, scales, zps))
+        scales = scale.tolist() if isinstance(scale, _T) else _list(scale)
+        zps = zero_point.tolist() if isinstance(zero_point, _T) else _list(zero_point)
+        return _tuple(quantize_per_tensor(t, torch.tensor(s, dtype=torch.float32) if isinstance(scale, _T) else s, z, dtype) for t, s, z in zip(input, scales, zps))
     _check_float_input(input)
     s = _scalar(scale, _float)
     z = _scalar(zero_point, _int)
-    if _isinstance(scale, _T):
+    if isinstance(scale, _T):
         s = _float(_fround(s)) if scale.dtype is not torch.float64 else s
     return _quantize_pt(input, s, z, dtype)
 
@@ -152,11 +152,11 @@ def quantize_per_tensor(input, scale, zero_point, dtype):
 def quantize_per_channel(input, scales, zero_points, axis, dtype):
     _check_float_input(input)
     under, qmin, qmax = _check_qdtype(dtype)
-    rank = _len(input.shape)
+    rank = len(input.shape)
     axis = _int(axis)
     if axis < 0 or axis >= rank:
         raise RuntimeError("Expected axis to be in the range [0, %d) but got %d" % (rank, axis))
-    if not (_isinstance(scales, _T) and _isinstance(zero_points, _T)):
+    if not (isinstance(scales, _T) and isinstance(zero_points, _T)):
         raise TypeError("quantize_per_channel(): scales and zero_points must be tensors")
     C = input.shape[axis]
     if scales.numel() != C:
@@ -251,7 +251,7 @@ def quantize_per_tensor_dynamic(input, dtype, reduce_range):
 
 
 def dequantize(tensor):
-    if _isinstance(tensor, (_list, _tuple)):
+    if isinstance(tensor, (_list, _tuple)):
         return _tuple(dequantize(t) for t in tensor)
     if tensor.__class__ is not _Q:
         return tensor
@@ -266,7 +266,7 @@ def dequantize(tensor):
 
 
 def _int_input(t, what):
-    if not _isinstance(t, _T) or t.dtype.name not in _OF_INT:
+    if not isinstance(t, _T) or t.dtype.name not in _OF_INT:
         raise RuntimeError("%s: expected a uint8, int8 or int32 tensor of integers" % what)
     return _plain(t.detach()).contiguous()
 
@@ -328,9 +328,9 @@ def _fake_quant(x, scales, zps, outer, C, inner, qmin, qmax, name):
 
 
 def fake_quantize_per_tensor_affine(input, scale, zero_point, quant_min, quant_max):
-    tensor_qparams = _isinstance(scale, _T) or _isinstance(zero_point, _T)
+    tensor_qparams = isinstance(scale, _T) or isinstance(zero_point, _T)
     s = _scalar(scale, _float)
-    z = _scalar(zero_point, _int) if not (_isinstance(zero_point, _T) and zero_point.dtype.is_floating_point) else _int(round(zero_point.item()))
+    z = _scalar(zero_point, _int) if not (isinstance(zero_point, _T) and zero_point.dtype.is_floating_point) else _int(round(zero_point.item()))
     qmin, qmax = _int(quant_min), _int(quant_max)
     _fq_check(qmin, qmax, [z])
     name = "FakeQuantizePerTensorAffineCachemaskTensorQparams" if tensor_qparams else "FakeQuantizePerTensorAffineCachemask"
@@ -342,7 +342,7 @@ def fake_quantize_per_channel_affine(input, scale, zero_point, axis, quant_min, 
         raise RuntimeError("Zero-point must be Int32, Float or Half, found %s" % _scalar_name(zero_point.dtype))
     if zero_point.dtype.is_floating_point:
         raise NotImplementedError("fake_quantize_per_channel_affine with floating point zero points is not supported on Zipp")
-    rank = _len(input.shape)
+    rank = len(input.shape)
     axis = _int(axis)
     if axis < 0:
         axis += rank
@@ -372,7 +372,7 @@ def fused_moving_avg_obs_fake_quant(input, observer_on, fake_quant_on, running_m
         x = _plain(input.detach())
         if per_row_fake_quant:
             axis = _int(ch_axis)
-            order = _list(_range(_len(x.shape)))
+            order = _list(_range(len(x.shape)))
             order[axis], order[0] = 0, axis
             y = torch.flatten(x.permute(*order), 1)
             cur_min, cur_max = torch.aminmax(y, dim=1)
@@ -390,7 +390,7 @@ def fused_moving_avg_obs_fake_quant(input, observer_on, fake_quant_on, running_m
             mins = cur_min.reshape(-1).tolist()
             maxs = cur_max.reshape(-1).tolist()
             new_min, new_max, scales, zps = [], [], [], []
-            for i in _range(_len(mins)):
+            for i in _range(len(mins)):
                 a = mins[i] if rmin[i] in (_float("inf"), _float("-inf")) else _fround(rmin[i] + _fround(c * _fround(mins[i] - rmin[i])))
                 b = maxs[i] if rmax[i] in (_float("inf"), _float("-inf")) else _fround(rmax[i] + _fround(c * _fround(maxs[i] - rmax[i])))
                 new_min.append(a)
@@ -400,9 +400,9 @@ def fused_moving_avg_obs_fake_quant(input, observer_on, fake_quant_on, running_m
                 zps.append(z)
             running_min.copy_(torch.tensor(new_min, dtype=running_min.dtype).reshape(running_min.shape))
             running_max.copy_(torch.tensor(new_max, dtype=running_max.dtype).reshape(running_max.shape))
-            if scale.numel() != _len(scales):
-                scale.resize_((_len(scales),))
-                zero_point.resize_((_len(scales),))
+            if scale.numel() != len(scales):
+                scale.resize_((len(scales),))
+                zero_point.resize_((len(scales),))
             scale.copy_(torch.tensor(scales, dtype=torch.float64).to(scale.dtype).reshape(scale.shape))
             zero_point.copy_(torch.tensor(zps, dtype=torch.int64).to(zero_point.dtype).reshape(zero_point.shape))
     if _int(fake_quant_on.reshape(-1)[0].item()) == 1:
@@ -504,7 +504,7 @@ def linear_dynamic(x, w, b, reduce_range=True, relu=False):
 def conv2d(x, w, b, stride, padding, dilation, groups, scale, zero_point, relu=False):
     """quantized::conv2d (and conv2d_relu) on a quint8 NCHW input."""
     _check_act(x, "quantized::conv2d")
-    if _len(x.shape) != 4:
+    if len(x.shape) != 4:
         raise ValueError("Input shape must be `(N, C, H, W)`!")
     O = w.shape[0]
     wz, ws = _weight_params(w, O)
@@ -521,7 +521,7 @@ def conv2d(x, w, b, stride, padding, dilation, groups, scale, zero_point, relu=F
 
 def conv1d(x, w, b, stride, padding, dilation, groups, scale, zero_point, relu=False):
     """quantized::conv1d: conv2d over a height of one."""
-    if _len(x.shape) != 3:
+    if len(x.shape) != 3:
         raise ValueError("Input shape must be `(N, C, L)`!")
     x4 = _same_params(x, x._q.unsqueeze(2))
     w4 = _same_params(w, w._q.unsqueeze(2))
@@ -558,7 +558,7 @@ def _max_pool(x, fn, *args):
     order is the same), with its parameters."""
     q = x._q
     out = fn(q.to(torch.float32), *args)
-    if _isinstance(out, _tuple):
+    if isinstance(out, _tuple):
         return (_same_params(x, out[0].to(q.dtype)), out[1])
     return _same_params(x, out.to(q.dtype))
 
@@ -587,7 +587,7 @@ def _cat(tensors, dim=0):
 
 
 def _stack(tensors, dim=0):
-    rank = _len(tensors[0].shape) + 1
+    rank = len(tensors[0].shape) + 1
     d = dim + rank if dim < 0 else dim
     return _cat([_same_params(t, t._q.unsqueeze(d)) for t in tensors], d)
 
@@ -609,8 +609,8 @@ def _reshape_q(x, q):
     if _per_channel(x):
         C = x._scales.numel()
         axis = x._axis
-        if axis >= _len(q.shape) or q.shape[axis] != C:
-            raise RuntimeError("length of scales must equal to channel, expected %d got, %d" % (q.shape[axis] if axis < _len(q.shape) else 1, C))
+        if axis >= len(q.shape) or q.shape[axis] != C:
+            raise RuntimeError("length of scales must equal to channel, expected %d got, %d" % (q.shape[axis] if axis < len(q.shape) else 1, C))
     return _same_params(x, q)
 
 
@@ -621,7 +621,7 @@ def _no_strides(x):
 
 # ---- Tensor methods ----------------------------------------------------------------------
 def _m_repr(self, *, tensor_contents=None):
-    indent = _len("tensor(")
+    indent = len("tensor(")
     suffixes = ["size=" + str(_tuple(self.shape))]
     suffixes.append("dtype=" + repr(self.dtype))
     suffixes.append("quantization_scheme=" + repr(self._qs))
@@ -713,7 +713,7 @@ def _m_squeeze(self, *dim):
 
 def _m_unsqueeze(self, dim):
     if _per_channel(self):
-        rank = _len(self.shape) + 1
+        rank = len(self.shape) + 1
         d = dim + rank if dim < 0 else dim
         out = _same_params(self, self._q.unsqueeze(dim))
         if d <= self._axis:
@@ -745,21 +745,21 @@ def _m_expand(self, *sizes):
 def _m_getitem(self, key):
     if not _per_channel(self):
         return _same_params(self, self._q[key])
-    keys = key if _isinstance(key, _tuple) else (key,)
+    keys = key if isinstance(key, _tuple) else (key,)
     for k in keys:
-        if not (_isinstance(k, (_int, slice)) and not _isinstance(k, _bool)):
+        if not (isinstance(k, (_int, slice)) and not isinstance(k, _bool)):
             raise NotImplementedError("indexing a per-channel quantized tensor supports ints and slices on Zipp")
     axis = self._axis
-    if axis < _len(keys) and _isinstance(keys[axis], _int):
+    if axis < len(keys) and isinstance(keys[axis], _int):
         # Selecting one channel leaves a per-tensor tensor with its parameters.
         c = keys[axis]
         return _make_pt(self._q[key], self.dtype, self._scales[c].item(), _int(self._zps[c].item()))
     removed = 0
     for k in keys[:axis]:
-        if _isinstance(k, _int):
+        if isinstance(k, _int):
             removed += 1
     q = self._q[key]
-    if axis < _len(keys):
+    if axis < len(keys):
         sl = keys[axis]
         return _make_pc(q, self.dtype, self._scales[sl].clone(), self._zps[sl].clone(), axis - removed)
     return _make_pc(q, self.dtype, self._scales, self._zps, axis - removed)
@@ -779,7 +779,7 @@ def _m_numpy(self, force=False):
 
 def _m_to(self, *args, **kwargs):
     for a in _list(args) + _list(kwargs.values()):
-        if _isinstance(a, torch.dtype) and a is not self.dtype:
+        if isinstance(a, torch.dtype) and a is not self.dtype:
             raise RuntimeError("Creation of quantized tensor requires quantized dtype like torch.quint8")
     return self
 
@@ -830,7 +830,7 @@ def _m_requires_grad_(self, requires_grad=True):
 
 def _m_stride(self, dim=None):
     s = _T.stride(self._q)
-    return s if dim is None else s[torch._norm_dim(dim, _len(self.shape))]
+    return s if dim is None else s[torch._norm_dim(dim, len(self.shape))]
 
 
 def _m_data(self):
@@ -1003,14 +1003,14 @@ def _adaptive_avg_pool(x, output_size, nd):
     if _per_channel(x):
         raise RuntimeError("quantized adaptive average pooling expects a per-tensor quantized input")
     q = x._q
-    unbatched = _len(q.shape) == nd + 1
+    unbatched = len(q.shape) == nd + 1
     if unbatched:
         q = q.unsqueeze(0)
     if nd == 1:
         q = q.unsqueeze(2)
-        output_size = (1, output_size[0] if _isinstance(output_size, (_tuple, _list)) else output_size)
+        output_size = (1, output_size[0] if isinstance(output_size, (_tuple, _list)) else output_size)
     B, C, H, W = q.shape
-    if not _isinstance(output_size, (_tuple, _list)):
+    if not isinstance(output_size, (_tuple, _list)):
         output_size = (output_size, output_size)
     oh = H if output_size[0] is None else output_size[0]
     ow = W if output_size[1] is None else output_size[1]
@@ -1039,7 +1039,7 @@ def _avg_pool2d(x, kernel_size, stride, padding, ceil_mode, count_include_pad, d
     if _per_channel(x):
         raise RuntimeError("quantized average pooling expects a per-tensor quantized input")
     q = x._q
-    unbatched = _len(q.shape) == 3
+    unbatched = len(q.shape) == 3
     if unbatched:
         q = q.unsqueeze(0)
     B, C, H, W = q.shape
