@@ -16,9 +16,8 @@
 use super::tzdata::{
     FinalRule, Zone, FINALS, ID_END, ID_NAMES, ID_ZONE, PRIMARY_IDS, TRANS_BLOCK_DAY,
     TRANS_BLOCK_POS,
-    TRANS_BLOCK_TOD, TRANS_BYTES, TRANS_OFFSET, TRANS_PALETTE, TRANS_TOD, ZONE_FIN,
-    ZONE_FIN_YEAR, ZONE_ID, ZONE_INIT, ZONE_LAST_AT, ZONE_LAST_OFF, ZONE_NFIN, ZONE_NTR, ZONE_STD,
-    ZONE_TR,
+    TRANS_BLOCK_TOD, TRANS_BYTES, TRANS_OFFSET, TRANS_PALETTE, TRANS_TOD, ZONE_FIN_YEAR, ZONE_ID,
+    ZONE_INIT, ZONE_LAST_AT, ZONE_LAST_OFF, ZONE_NFIN, ZONE_NTR, ZONE_STD,
 };
 
 /// The transitions of all zones form one list, stored in blocks of this many
@@ -192,17 +191,58 @@ fn id_name(i: usize) -> &'static str {
     &ID_NAMES[start..ID_END[i] as usize]
 }
 
+/// Where each zone's transitions and final rules start. Zones keep both
+/// back to back in zone order, so these are the running sums of the counts
+/// (`ZONE_NTR`, `ZONE_NFIN`), taken at the first lookup rather than stored:
+/// as columns they were 0.8 KB of each module after Brotli.
+type ZoneStarts = (Vec<u16>, Vec<u8>);
+
+static ZONE_STARTS: std::sync::OnceLock<ZoneStarts> = std::sync::OnceLock::new();
+
+fn zone_starts() -> &'static ZoneStarts {
+    match ZONE_STARTS.get() {
+        Some(starts) => starts,
+        None => sum_zone_starts(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn sum_zone_starts() -> &'static ZoneStarts {
+    ZONE_STARTS.get_or_init(|| {
+        let (mut tr, mut fin) = (0u16, 0u8);
+        let trs = ZONE_NTR
+            .iter()
+            .map(|&n| {
+                let at = tr;
+                tr += n;
+                at
+            })
+            .collect();
+        let fins = ZONE_NFIN
+            .iter()
+            .map(|&n| {
+                let at = fin;
+                fin += n;
+                at
+            })
+            .collect();
+        (trs, fins)
+    })
+}
+
 /// Zone `zone`, from its columns.
 fn zone_at(zone: u16) -> Zone {
     let z = zone as usize;
+    let (trs, fins) = zone_starts();
     Zone {
-        tr: ZONE_TR[z],
+        tr: trs[z],
         ntr: ZONE_NTR[z],
         last_at: ZONE_LAST_AT[z],
         last_off: ZONE_LAST_OFF[z],
         init: ZONE_INIT[z],
         std: ZONE_STD[z],
-        fin: ZONE_FIN[z],
+        fin: fins[z],
         nfin: ZONE_NFIN[z],
         fin_year: ZONE_FIN_YEAR[z],
     }

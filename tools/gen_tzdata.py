@@ -597,21 +597,29 @@ def main():
         last_at = trans_at[tr + ntr - 1] if ntr else -(2**63)
         last_off = trans_off[tr + ntr - 1] if ntr else init
         rows.append((nm, tr, ntr, last_at, last_off, init, std, fi, nfin, fy))
+    # A zone's first transition and first final rule are not stored: zones
+    # keep both back to back in zone order, so tzdb.rs takes them as the
+    # running sums of ZONE_NTR and ZONE_NFIN.
+    tr_sum = fin_sum = 0
+    for r in rows:
+        assert r[1] == tr_sum and r[7] == fin_sum, r[0] + ": not back to back"
+        tr_sum += r[2]
+        fin_sum += r[8]
+    assert tr_sum <= 65535 and fin_sum <= 255, "the starts' sums need a wider type"
     columns = [
         ("ZONE_ID", "u16", [id_index[r[0]] for r in rows]),
-        ("ZONE_TR", "u16", [r[1] for r in rows]),
         ("ZONE_NTR", "u16", [r[2] for r in rows]),
         ("ZONE_LAST_AT", "i64", [r[3] for r in rows]),
         ("ZONE_LAST_OFF", "i32", [r[4] for r in rows]),
         ("ZONE_INIT", "i32", [r[5] for r in rows]),
         ("ZONE_STD", "i32", [r[6] for r in rows]),
-        ("ZONE_FIN", "u8", [r[7] for r in rows]),
         ("ZONE_NFIN", "u8", [r[8] for r in rows]),
         ("ZONE_FIN_YEAR", "i16", [r[9] for r in rows]),
     ]
     LIMITS = {"u8": (0, 255), "u16": (0, 65535), "i16": (-32768, 32767),
               "i32": (-2**31, 2**31 - 1), "i64": (-2**63, 2**63 - 1)}
-    a("// The zones, one column per field of `Zone`, in tzdb Zone-name order.")
+    a("// The zones, one column per field of `Zone`, in tzdb Zone-name order, but")
+    a("// `tr` and `fin`: the running sums of `ZONE_NTR` and `ZONE_NFIN` (tzdb.rs).")
     for name, ty, values in columns:
         low, high = LIMITS[ty]
         assert all(low <= v <= high for v in values), name + " needs a wider type"
