@@ -1,0 +1,6 @@
+8544 [[1, 2, 3], [4, 5], [0, 1, 2], [10, 7, 4, 1], [3, 2, 1], ['custom'], ['a', 'b'], ['x', 'y', 'z'], [7], [0, 1], [], [], []]
+50 50
+492000
+TypeError 'NoneType' object is not iterable
+TypeError 'int' object is not iterable
+TypeError 'float' object is not iterable
