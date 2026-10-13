@@ -610,10 +610,6 @@ impl<'p> Vm<'p> {
             // where it is: `call_value` reaches a native through its
             // cascade of rarer callees and `call_native`'s match, to run
             // this same function with these same arguments.
-            PyCallee::Strm(at) => self.with_argv(base, arg_base, argc, |vm, argv| vm.py_str_method_at(fv, argv, at)).map(|v| {
-                self.set(base, dst, v);
-                ip + 1
-            }),
             PyCallee::Other(entry) => {
                 let r = if self.py_strm_entry(entry) {
                     let at = self.py_strm_site(func_id, ip, fv);
@@ -787,8 +783,6 @@ impl<'p> Vm<'p> {
             // The entry changed: forget the callee (the rest of the entry
             // still names the record's slot).
             self.py_ic_put(func_id, ip, PyIc { b: 0, c: 0, d: 0, ..cached });
-        } else if let Some(at) = self.py_strm_hit(&cached, f) {
-            return PyCallee::Strm(at);
         }
         let Some(name) = ENTRIES.get(argc as usize) else {
             return PyCallee::Slow;
@@ -827,7 +821,11 @@ impl<'p> Vm<'p> {
     /// afresh at the entry's slot (the record's keys as they were), is the
     /// `__zipp_py_strm` native right now: what [`Vm::py_call_target`] would
     /// find through [`Vm::py_entry_of`] and the native's tests, without the
-    /// entry's second read and the callee's kind tested by elimination.
+    /// entry's second read and the callee's kind tested by elimination. For
+    /// compiled code's `jit_py_call` only: asked in the interpreter's step
+    /// (`py_call_target`) it made every plain Python call 3 to 4% slower
+    /// (call_simple, call_defaults), for 4% on str_methods there.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     #[inline]
     pub(super) fn py_strm_hit(&self, e: &PyIc, f: Value) -> Option<usize> {
         if e.kind != ic::CALL_ENTRY || e.c != 0 || e.d == 0 || e.a != f.bits() || !f.is_heap() {
@@ -2520,10 +2518,6 @@ enum PyCallee {
     Plain(u32, u32, Value),
     /// An exception class's positional entry (`R.EXCENTRY`), as `Plain`.
     Exc(u32, u32, Value),
-    /// The `__zipp_py_strm` native (a str method, `hash`, `heapq`, ...) of a
-    /// builtin record whose `strop` is at this slot (see
-    /// [`Vm::py_strm_hit`]).
-    Strm(usize),
     /// Any other callable entry.
     Other(Value),
     /// No entry to call: the slow edge.
