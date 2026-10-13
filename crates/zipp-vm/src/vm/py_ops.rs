@@ -904,6 +904,7 @@ impl<'p> Vm<'p> {
             arg_win: args as u32,
             argc,
             is_eval: false,
+            construct_this: false,
             func: lean.fid,
             base: new_base,
             ip: 0,

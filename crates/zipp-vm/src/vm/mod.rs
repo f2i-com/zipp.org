@@ -408,6 +408,11 @@ struct Frame {
     /// so `function nest(){ return eval("innermost();"); }` must report `nest`
     /// as `innermost`'s caller, not the eval script.
     is_eval: bool,
+    /// Pushed by the interpreter's flat `new F(...)` (`Vm::flat_new_instance`):
+    /// its `this` is the instance under construction, so `pop_frame_with`
+    /// hands the caller that instance unless the body returned an object, as
+    /// [[Construct]] does, and a tail call may not reuse the frame.
+    construct_this: bool,
 }
 
 /// [[ParameterMap]] bookkeeping for a MAPPED arguments object (sloppy callee

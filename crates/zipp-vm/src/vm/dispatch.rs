@@ -2865,6 +2865,28 @@ impl<'p> Vm<'p> {
                         argc,
                     } => {
                         let cv = self.get(base, callee);
+                        // A plain constructor function: its frame is pushed
+                        // here, in this loop, as a call's is, and its pop
+                        // hands back the instance (`construct_this`).
+                        let flat = match self.flat_new_instance(cv) {
+                            Some((fid, closure, obj)) => Some((fid, closure, obj, cv)),
+                            None => self.flat_new_class_instance(cv)?,
+                        };
+                        if let Some((fid, closure, obj, callee_v)) = flat {
+                            let rooted = self.host_result_roots.len();
+                            self.host_result_roots.push(obj);
+                            self.pending_new_target = cv;
+                            let pushed = self.setup_call(
+                                fid, closure, obj, base, arg_base, argc, dst, ip + 1, callee_v,
+                            );
+                            self.pending_new_target = Value::UNDEFINED;
+                            self.host_result_roots.truncate(rooted);
+                            pushed?;
+                            if let Some(f) = self.frames.last_mut() {
+                                f.construct_this = true;
+                            }
+                            break;
+                        }
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
                             args.push(self.get(base, arg_base + i));
@@ -9180,6 +9202,10 @@ impl<'p> Vm<'p> {
         let Some((fid, closure)) = plain else {
             return Ok(false);
         };
+        // A constructing frame's `this` is the instance its pop returns.
+        if self.frames.last().is_some_and(|f| f.construct_this) {
+            return Ok(false);
+        }
         // Tail reuse never grows `frames`, so runaway tail recursion (strict
         // `return f()` forever) is invisible to MAX_FRAMES — bound the streak
         // of pop-free reuses instead so it throws the SAME catchable
@@ -9889,7 +9915,7 @@ impl<'p> Vm<'p> {
     /// returns `ret`. Otherwise deliver `ret` into the caller's `ret_dst` and
     /// report `false` to keep executing the caller.
     #[inline]
-    pub(crate) fn pop_frame_with(&mut self, ret: Value, stop_depth: usize) -> bool {
+    pub(crate) fn pop_frame_with(&mut self, mut ret: Value, stop_depth: usize) -> bool {
         // A MAPPED arguments object that escapes this frame answers from its
         // dense store once the frame is gone: flush the live formal registers
         // into it BEFORE the window dies, or post-return reads see stale
@@ -9901,6 +9927,11 @@ impl<'p> Vm<'p> {
             }
         }
         let mut finished = self.frames.pop().expect("frame underflow");
+        // A flat `new`: an object result replaces the instance, anything else
+        // returns it ([[Construct]] step 10-12 for an ordinary function).
+        if finished.construct_this && !self.is_object_value(ret) {
+            ret = self.regs[finished.base];
+        }
         // Its handler buffer's storage, for another frame's first push.
         if finished.handlers.capacity() != 0 {
             super::handler_pool::give(std::mem::take(&mut finished.handlers));
@@ -10396,6 +10427,7 @@ impl<'p> Vm<'p> {
             arg_win,
             argc,
             is_eval: false,
+            construct_this: false,
             func: func_id,
             base: new_base,
             ip: 0,

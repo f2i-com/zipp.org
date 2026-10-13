@@ -39,6 +39,103 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The instance `new F(...)` makes for `cv` when it is a plain
+    /// constructor function the interpreter can run flat (its frame pushed in
+    /// the running loop, `Frame::construct_this`): a non-generator,
+    /// non-async, constructable function that is not an arrow, with no
+    /// second realm alive. Allocated and given its [[Prototype]] exactly as
+    /// the Func arm of `construct_with_newtarget_rooted` does. `None`, with
+    /// nothing done, for anything else.
+    pub(crate) fn flat_new_instance(&mut self, cv: Value) -> Option<(u32, u32, Value)> {
+        if !cv.is_heap() || matches!(self.heap.get(cv.heap_index()), HeapObj::Class(_)) {
+            return None;
+        }
+        let (fid, closure) = self.ic_plain_fn(cv)?;
+        {
+            let p = self.func(fid as usize);
+            if p.non_constructable || p.lexical_this {
+                return None;
+            }
+        }
+        if !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.get_function_realm(cv) != 0
+        {
+            return None;
+        }
+        let mut proto = self.prototype_of(cv).unwrap_or(Value::UNDEFINED);
+        if !self.is_object_value(proto) {
+            if let Some(rp) = self.realm_proto_fallback(cv, self.obj_proto) {
+                proto = Value::heap(rp);
+            }
+        }
+        let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
+        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
+            ObjMap::with_capacity(hint as usize),
+        ))));
+        if proto.is_heap() {
+            self.proto_of.insert(obj.heap_index(), proto);
+        }
+        Some((fid, closure, obj))
+    }
+
+    /// The flat `new C(...)` of a BASE class with a constructor of its own,
+    /// no decorators and no private brand to stamp: the instance made as
+    /// `construct`'s class arm makes it, its field initializers run on it
+    /// (fallible: guest code), and the constructor function the caller pushes
+    /// a frame for, `Frame::construct_this` then giving the instance back
+    /// unless an object is returned — what that arm does for such a class
+    /// (a base class ignores a primitive return). `Ok(None)`, with nothing
+    /// done, for any other class or value.
+    pub(crate) fn flat_new_class_instance(
+        &mut self,
+        cv: Value,
+    ) -> Result<Option<(u32, u32, Value, Value)>, Thrown> {
+        if !cv.is_heap() {
+            return Ok(None);
+        }
+        let ci = cv.heap_index();
+        let simple = match self.heap.get(ci) {
+            HeapObj::Class(c) => {
+                c.ctor.is_some()
+                    && c.has_explicit_ctor
+                    && c.parent.is_none()
+                    && !c.extends_null
+                    && c.dec.is_none()
+            }
+            _ => false,
+        };
+        if !simple
+            || !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.get_function_realm(cv) != 0
+        {
+            return Ok(None);
+        }
+        // `brand_instance` would stamp nothing.
+        if let Some(own) = self.method_brand.get(&ci).and_then(|b| b.first()) {
+            if self.brand_private_names.contains_key(own) {
+                return Ok(None);
+            }
+        }
+        let Some(f) = self.class_body_fn(cv, false) else {
+            return Ok(None);
+        };
+        let Some((fid, closure)) = self.ic_plain_fn(f) else {
+            return Ok(None);
+        };
+        let mut map = ObjMap::new();
+        map.class = Some(ci);
+        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
+        // The base class's InitializeInstanceElements, before its body.
+        let rooted = self.host_result_roots.len();
+        self.host_result_roots.push(obj);
+        let thunk = self.run_field_thunk(obj, cv);
+        self.host_result_roots.truncate(rooted);
+        thunk?;
+        Ok(Some((fid, closure, obj, f)))
+    }
+
     /// `new cv(args)` with newTarget defaulting to the constructor itself (the
     /// common case for `new` / a plain `Reflect.construct(cv, args)`).
     pub(crate) fn construct(&mut self, cv: Value, args: &[Value]) -> Result<Value, Thrown> {
