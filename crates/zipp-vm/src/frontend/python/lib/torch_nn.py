@@ -212,7 +212,7 @@ class _BackwardHooks:
             for hook in list(state.module._backward_hooks.values()):
                 res = hook(state.module, grad_inputs, state.grad_outputs)
                 if res is not None:
-                    res = tuple(res) if isinstance(res, (tuple, list)) else (res,)
+                    res = tuple(res) if (isinstance(res, tuple) or isinstance(res, list)) else (res,)
                     if len(res) != len(grad_inputs):
                         raise RuntimeError("Backward hook returned an invalid number of grad_input, got %d, but expected %d" % (len(res), len(grad_inputs)))
                     grad_inputs = res
@@ -226,7 +226,7 @@ class _BackwardHooks:
 
     def setup_outputs(self, result):
         single = isinstance(result, Tensor)
-        items = [result] if single else list(result) if isinstance(result, (tuple, list)) else None
+        items = [result] if single else list(result) if (isinstance(result, tuple) or isinstance(result, list)) else None
         if items is None:
             return result
         live = [i for i, r in enumerate(items) if isinstance(r, Tensor) and r.requires_grad]
@@ -244,7 +244,7 @@ class _BackwardHooks:
             for hook in list(state.module._backward_pre_hooks.values()):
                 res = hook(state.module, grad_outputs)
                 if res is not None:
-                    grad_outputs = tuple(res) if isinstance(res, (tuple, list)) else (res,)
+                    grad_outputs = tuple(res) if (isinstance(res, tuple) or isinstance(res, list)) else (res,)
             state.grad_outputs = grad_outputs
             if state.input_positions is None:
                 grad_inputs = (None,) * state.n_inputs
@@ -272,10 +272,11 @@ class Module:
             raise TypeError("%s.__init__() takes 1 positional argument but %d were given" % (type(self).__name__, len(args) + 1) if args else "%s.__init__() got an unexpected keyword argument '%s'" % (type(self).__name__, next(iter(kwargs))))
         d = self.__dict__
         d["training"] = True
-        d["_parameters"] = OrderedDict()
-        d["_buffers"] = OrderedDict()
+        # Plain dicts, as PyTorch keeps them (its hooks stay OrderedDicts).
+        d["_parameters"] = {}
+        d["_buffers"] = {}
         d["_non_persistent_buffers_set"] = set()
-        d["_modules"] = OrderedDict()
+        d["_modules"] = {}
         d["_forward_hooks"] = OrderedDict()
         d["_forward_hooks_with_kwargs"] = OrderedDict()
         d["_forward_pre_hooks"] = OrderedDict()
@@ -334,18 +335,27 @@ class Module:
                     object.__setattr__(self, name, value)
 
     def __getattr__(self, name):
-        d = self.__dict__
-        if "_parameters" in d:
-            p = d["_parameters"]
-            if name in p:
+        # The registries are read as attributes (reading `self.__dict__`
+        # costs more than the rest); one Module.__init__ never ran for has
+        # none, and asking for it lands here again, answered at once.
+        if name != "_parameters" and name != "_buffers" and name != "_modules":
+            try:
+                p = self._parameters
+            except AttributeError:
+                p = None
+            if p is not None and name in p:
                 return p[name]
-        if "_buffers" in d:
-            b = d["_buffers"]
-            if name in b:
+            try:
+                b = self._buffers
+            except AttributeError:
+                b = None
+            if b is not None and name in b:
                 return b[name]
-        if "_modules" in d:
-            m = d["_modules"]
-            if name in m:
+            try:
+                m = self._modules
+            except AttributeError:
+                m = None
+            if m is not None and name in m:
                 return m[name]
         raise AttributeError("'%s' object has no attribute '%s'" % (type(self).__name__, name))
 
@@ -461,8 +471,19 @@ class Module:
         raise NotImplementedError("Module [%s] is missing the required \"forward\" function" % type(self).__name__)
 
     def __call__(self, *args, **kwargs):
-        d = self.__dict__
-        if not (d.get("_forward_hooks") or d.get("_forward_pre_hooks") or d.get("_backward_hooks") or d.get("_backward_pre_hooks")):
+        # Whether the module has hooks: one kernel call answers for the four
+        # hook dicts (an OrderedDict's truth costs several microseconds
+        # here), None when one is missing or not a dict.
+        try:
+            quiet = torch._k._dicts_empty(self._forward_hooks, self._forward_pre_hooks, self._backward_hooks, self._backward_pre_hooks)
+        except AttributeError:
+            quiet = None
+        if quiet is None:
+            d = self.__dict__
+            quiet = not (d.get("_forward_hooks") or d.get("_forward_pre_hooks") or d.get("_backward_hooks") or d.get("_backward_pre_hooks"))
+        if quiet:
+            if len(kwargs) == 0 and len(args) == 1:
+                return self.forward(args[0])
             return self.forward(*args, **kwargs)
         return self._call_with_hooks(args, kwargs)
 
@@ -686,7 +707,7 @@ class Module:
         torch._check_cpu_device(kwargs.get("device"))
         target = kwargs.get("dtype")
         for a in args:
-            if isinstance(a, (str, torch.device)):
+            if (isinstance(a, str) or isinstance(a, torch.device)):
                 torch._check_cpu_device(a)
             elif isinstance(a, torch.dtype):
                 target = a
@@ -924,7 +945,7 @@ class Sequential(Module):
                 delattr(self, key)
         else:
             delattr(self, list(self._modules.keys())[_index(idx, len(self._modules))])
-        self._modules = OrderedDict((str(i), m) for i, m in enumerate(self._modules.values()))
+        self._modules = dict((str(i), m) for i, m in enumerate(self._modules.values()))
 
     def __len__(self):
         return len(self._modules)
@@ -1016,7 +1037,7 @@ class ModuleList(Module):
                 delattr(self, str(k))
         else:
             delattr(self, self._abs(idx))
-        self._modules = OrderedDict((str(i), m) for i, m in enumerate(self._modules.values()))
+        self._modules = dict((str(i), m) for i, m in enumerate(self._modules.values()))
 
     def __len__(self):
         return len(self._modules)
@@ -1122,7 +1143,7 @@ class ModuleDict(Module):
                 self[key] = module
         else:
             for j, m in enumerate(modules):
-                if not isinstance(m, (list, tuple)):
+                if not (isinstance(m, list) or isinstance(m, tuple)):
                     raise TypeError("ModuleDict update sequence element #%d should be Iterable; is %s" % (j, type(m).__name__))
                 if len(m) != 2:
                     raise ValueError("ModuleDict update sequence element #%d has length %d; 2 is required" % (j, len(m)))
@@ -1326,7 +1347,7 @@ class Unflatten(Module):
     def __init__(self, dim, unflattened_size):
         super().__init__()
         if isinstance(dim, int):
-            if not isinstance(unflattened_size, (tuple, list)) or not all(isinstance(v, int) for v in unflattened_size):
+            if not (isinstance(unflattened_size, tuple) or isinstance(unflattened_size, list)) or not all(isinstance(v, int) for v in unflattened_size):
                 raise TypeError("unflattened_size must be tuple of ints, but found type %s" % type(unflattened_size).__name__)
         self.dim = dim
         self.unflattened_size = unflattened_size
@@ -2543,7 +2564,7 @@ class Upsample(Module):
         super().__init__()
         self.name = type(self).__name__
         self.size = size
-        self.scale_factor = float(scale_factor) if isinstance(scale_factor, (int, float)) else tuple(float(f) for f in scale_factor) if scale_factor else None
+        self.scale_factor = float(scale_factor) if (isinstance(scale_factor, int) or isinstance(scale_factor, float)) else tuple(float(f) for f in scale_factor) if scale_factor else None
         self.mode = mode
         self.align_corners = align_corners
         self.recompute_scale_factor = recompute_scale_factor
@@ -2617,7 +2638,7 @@ class _PadNd(Module):
         return F.pad(input, self.padding, self._mode)
 
     def extra_repr(self):
-        if self._mode == "constant" and not isinstance(self, (ZeroPad1d, ZeroPad2d, ZeroPad3d)):
+        if self._mode == "constant" and not (isinstance(self, ZeroPad1d) or isinstance(self, ZeroPad2d) or isinstance(self, ZeroPad3d)):
             return "padding=%s, value=%s" % (self.padding, self.value)
         return "%s" % (self.padding,)
 
@@ -2731,22 +2752,188 @@ class RNNCellBase(Module):
 
 def _gru_step(gi, h, w_hh, b_hh):
     gh = F.linear(h, w_hh, b_hh)
-    i_r, i_z, i_n = gi.chunk(3, -1)
-    h_r, h_z, h_n = gh.chunk(3, -1)
-    r = torch.sigmoid(i_r + h_r)
-    z = torch.sigmoid(i_z + h_z)
-    n = torch.tanh(i_n + r * h_n)
-    return (1 - z) * n + z * h
+    zn = _gru_fused(gi, gh)
+    if zn is None:
+        i_r, i_z, i_n = gi.chunk(3, -1)
+        h_r, h_z, h_n = gh.chunk(3, -1)
+        r = torch.sigmoid(i_r + h_r)
+        z = torch.sigmoid(i_z + h_z)
+        n = torch.tanh(i_n + r * h_n)
+    else:
+        z, n = zn
+    # PyTorch's CPU GRUCell: (hidden - new_gate) * input_gate + new_gate.
+    # Equal to (1 - z) * n + z * h in exact arithmetic, but rounded
+    # differently: this form gives PyTorch's float32 values.
+    return (h - n) * z + n
 
 
 def _lstm_step(gi, h, c, w_hh, b_hh, w_hr=None):
     gates = gi + F.linear(h, w_hh, b_hh)
-    i, f, g, o = gates.chunk(4, -1)
-    c2 = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
-    h2 = torch.sigmoid(o) * torch.tanh(c2)
+    hc = _lstm_fused(gates, c)
+    if hc is None:
+        i, f, g, o = gates.chunk(4, -1)
+        c2 = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+        h2 = torch.sigmoid(o) * torch.tanh(c2)
+    else:
+        h2, c2 = hc
     if w_hr is not None:
         h2 = F.linear(h2, w_hr)
     return h2, c2
+
+
+# ---- fused cells ---------------------------------------------------------------------------
+# The elementwise part of an LSTM or GRU step (chunk, sigmoid, tanh, mul,
+# add: about a dozen ops, each a tensor and an autograd node, forward and
+# backward) as one kernel call each way (tensor.js `lstm_cell`,
+# `gru_cell`). The values are the composite's, element for element, in
+# both directions: each kernel runs the composite's operations and
+# backward formulas in their order, rounded where they round. The graph
+# has two nodes per cell where the composite had a dozen, consuming the
+# same tensors (the gates and the state), so every gradient reaches them
+# from the same producers: the gates' gradient arrives as two blocks that
+# are zero outside their own part (the composite's four slices did the
+# same), and the state's from the same two places. With create_graph the
+# nodes run the composite's backward as recorded ops instead, so it stays
+# differentiable. Anything other than plain float32/float64 [B, k*H]
+# operands (autocast, a recorded graph, another layout) takes the
+# composite.
+_float32, _float64 = torch.float32, torch.float64
+
+
+def _cell_operands(a, b, k):
+    """(B, H) when `a` [B, k*H] and `b` ([B, H], or [B, k*H] for k == 3)
+    are plain float32/float64 tensors of one dtype the fused cells take,
+    else None."""
+    dt = a.dtype
+    if torch._graph_recording or torch._autocast_cpu is not None or a.__class__ is not Tensor or b.__class__ is not Tensor:
+        return None
+    if (dt is not _float32 and dt is not _float64) or b.dtype is not dt:
+        return None
+    sa, sb = a.shape, b.shape
+    if len(sa) != 2 or len(sb) != 2 or sa[0] != sb[0]:
+        return None
+    hd = sa[1] // k
+    if hd <= 0 or sa[1] != k * hd or sb[1] != (hd if k == 4 else k * hd):
+        return None
+    return sa[0], hd
+
+
+def _cell_spec(rows, start, stop):
+    # The slice spec of a gate block along the last of two dims.
+    return [(None, None, None), (start, stop, None)]
+
+
+def _lstm_fused(gates, c):
+    dims = _cell_operands(gates, c, 4)
+    if dims is None:
+        return None
+    r = torch._k.lstm_cell(gates._s, c._s, dims[1])
+    if r is None:
+        return None
+    shape = c.shape
+    dt = c.dtype
+    c2 = Tensor(r[0], shape, dt)
+    h2 = Tensor(r[1], shape, dt)
+    if torch._grad_enabled and (gates.requires_grad or c.requires_grad):
+        # (named as the composite's last ops, whose grad_fn they stand in for)
+        c2.requires_grad = True
+        node = c2._node = torch._Node(_lstm_c2_bw, (gates, c), "Add", [c], (r[2], gates, gates._s, c, c._s, dims[1]))
+        node.diff = True
+        h2.requires_grad = True
+        node = h2._node = torch._Node(_lstm_h2_bw, (gates, c2), "Mul", None, (r[2], r[3], gates, gates._s, c2, c2._s, dims[1]))
+        node.diff = True
+    return h2, c2
+
+
+def _lstm_c2_bw(g, args):
+    act, gates, gs, c, cs, hd = args
+    if not torch._grad_enabled and g.__class__ is Tensor and g.dtype is gates.dtype:
+        r = torch._k.lstm_cell_bw(1, g._s, act, cs, hd, c.requires_grad)
+        if r is not None:
+            dt = gates.dtype
+            return (Tensor(r[0], gates.shape, dt), None if r[1] is None else Tensor(r[1], c.shape, dt))
+    # The composite's backward, as its nodes run it (recorded under create_graph).
+    gates, c = torch._frozen(gates, gs), torch._frozen(c, cs)
+    hd4 = 4 * hd
+    i, f, gg = (torch._slice(gates, _cell_spec(2, k * hd, (k + 1) * hd)) for k in range(3))
+    sf, si, tg = torch.sigmoid(f), torch.sigmoid(i), torch.tanh(gg)
+    di = torch._bw_sigmoid(torch.mul(g, tg), i, si)
+    df = torch._bw_sigmoid(torch.mul(g, c), f, sf)
+    dg = torch._bw_tanh(torch.mul(g, si), gg, tg)
+    shape = gates.shape
+    dgates = torch.add(torch.add(torch._slice_scatter(di, shape, _cell_spec(2, 0, hd)), torch._slice_scatter(df, shape, _cell_spec(2, hd, 2 * hd))),
+                       torch._slice_scatter(dg, shape, _cell_spec(2, 2 * hd, 3 * hd)))
+    return (dgates, torch.mul(g, sf) if c.requires_grad else None)
+
+
+def _lstm_h2_bw(g, args):
+    act, tc, gates, gs, c2, c2s, hd = args
+    if not torch._grad_enabled and g.__class__ is Tensor and g.dtype is gates.dtype:
+        r = torch._k.lstm_cell_bw(2, g._s, act, tc, hd, True)
+        if r is not None:
+            dt = gates.dtype
+            return (Tensor(r[0], gates.shape, dt), Tensor(r[1], c2.shape, dt))
+    gates, c2 = torch._frozen(gates, gs), torch._frozen(c2, c2s)
+    o = torch._slice(gates, _cell_spec(2, 3 * hd, 4 * hd))
+    so, t = torch.sigmoid(o), torch.tanh(c2)
+    do = torch._bw_sigmoid(torch.mul(g, t), o, so)
+    return (torch._slice_scatter(do, gates.shape, _cell_spec(2, 3 * hd, 4 * hd)), torch._bw_tanh(torch.mul(g, so), c2, t))
+
+
+def _gru_fused(gi, gh):
+    dims = _cell_operands(gi, gh, 3)
+    if dims is None:
+        return None
+    r = torch._k.gru_cell(gi._s, gh._s, dims[1])
+    if r is None:
+        return None
+    shape = (dims[0], dims[1])
+    dt = gi.dtype
+    z = Tensor(r[0], shape, dt)
+    n = Tensor(r[1], shape, dt)
+    if torch._grad_enabled and (gi.requires_grad or gh.requires_grad):
+        z.requires_grad = True
+        node = z._node = torch._Node(_gru_z_bw, (gi, gh), "Sigmoid", None, (r[0], gi, gi._s, gh, gh._s, dims[1]))
+        node.diff = True
+        n.requires_grad = True
+        node = n._node = torch._Node(_gru_n_bw, (gi, gh), "Tanh", None, (r[2], r[1], gi, gi._s, gh, gh._s, dims[1]))
+        node.diff = True
+    return z, n
+
+
+def _gru_z_bw(g, args):
+    zs, gi, gis, gh, ghs, hd = args
+    if not torch._grad_enabled and g.__class__ is Tensor and g.dtype is gi.dtype:
+        r = torch._k.gru_cell_bw(4, g._s, zs, None, ghs, hd)
+        if r is not None:
+            dt = gi.dtype
+            return (Tensor(r[0], gi.shape, dt), Tensor(r[1], gh.shape, dt))
+    gi, gh = torch._frozen(gi, gis), torch._frozen(gh, ghs)
+    spec = _cell_spec(2, hd, 2 * hd)
+    iz, hz = torch._slice(gi, spec), torch._slice(gh, spec)
+    az = torch.add(iz, hz)
+    daz = torch._bw_sigmoid(g, az, torch.sigmoid(az))
+    return (torch._slice_scatter(daz, gi.shape, spec), torch._slice_scatter(daz, gh.shape, spec))
+
+
+def _gru_n_bw(g, args):
+    rs, ns, gi, gis, gh, ghs, hd = args
+    if not torch._grad_enabled and g.__class__ is Tensor and g.dtype is gi.dtype:
+        r = torch._k.gru_cell_bw(5, g._s, rs, ns, ghs, hd)
+        if r is not None:
+            dt = gi.dtype
+            return (Tensor(r[0], gi.shape, dt), Tensor(r[1], gh.shape, dt))
+    gi, gh = torch._frozen(gi, gis), torch._frozen(gh, ghs)
+    sr, sn = _cell_spec(2, 0, hd), _cell_spec(2, 2 * hd, 3 * hd)
+    ir, hr, i_n, h_n = torch._slice(gi, sr), torch._slice(gh, sr), torch._slice(gi, sn), torch._slice(gh, sn)
+    ar = torch.add(ir, hr)
+    r = torch.sigmoid(ar)
+    an = torch.add(i_n, torch.mul(r, h_n))
+    dan = torch._bw_tanh(g, an, torch.tanh(an))
+    dar = torch._bw_sigmoid(torch.mul(dan, h_n), ar, r)
+    gshape, hshape = gi.shape, gh.shape
+    return (torch.add(torch._slice_scatter(dar, gshape, sr), torch._slice_scatter(dan, gshape, sn)),
+            torch.add(torch._slice_scatter(dar, hshape, sr), torch._slice_scatter(torch.mul(dan, r), hshape, sn)))
 
 
 def _rnn_step(gi, h, w_hh, b_hh, nonlinearity):
@@ -2828,7 +3015,7 @@ class RNNBase(Module):
         self.dropout = float(dropout)
         self.bidirectional = bidirectional
         self.proj_size = proj_size
-        if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not 0 <= dropout <= 1:
+        if isinstance(dropout, bool) or not (isinstance(dropout, int) or isinstance(dropout, float)) or not 0 <= dropout <= 1:
             raise ValueError("dropout should be a number in range [0, 1] representing the probability of an element being zeroed")
         if not isinstance(hidden_size, int):
             raise TypeError("hidden_size should be of type int, got: %s" % type(hidden_size).__name__)
@@ -3578,7 +3765,7 @@ class LazyInstanceNorm3d(_LazyNormBase, _InstanceNorm):
 
 # ---- fractional max pooling, CTC and SyncBatchNorm -----------------------------------------
 def _float_tuple(value, n):
-    if isinstance(value, (tuple, list)):
+    if (isinstance(value, tuple) or isinstance(value, list)):
         return tuple(value)
     return (value,) * n
 
@@ -3590,7 +3777,7 @@ class _FractionalMaxPoolNd(Module):
         super().__init__()
         nd = self._nd
         name = type(self).__name__
-        if nd == 3 and ((isinstance(kernel_size, int) and kernel_size <= 0) or (isinstance(kernel_size, (tuple, list)) and not all(k > 0 for k in kernel_size))):
+        if nd == 3 and ((isinstance(kernel_size, int) and kernel_size <= 0) or ((isinstance(kernel_size, tuple) or isinstance(kernel_size, list)) and not all(k > 0 for k in kernel_size))):
             raise ValueError("kernel_size must greater than 0, but got %s" % (kernel_size,))
         self.kernel_size = F._ntuple(kernel_size, nd, "kernel_size")
         self.return_indices = return_indices

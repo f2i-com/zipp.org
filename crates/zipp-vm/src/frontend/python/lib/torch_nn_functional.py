@@ -18,7 +18,7 @@ _inf = float("inf")
 
 # ---- argument helpers ----------------------------------------------------------------------
 def _ntuple(value, n, name="argument"):
-    if isinstance(value, (tuple, list)):
+    if (isinstance(value, tuple) or isinstance(value, list)):
         if len(value) == 1 and n > 1:
             return tuple(int(value[0]) for _ in range(n))
         if len(value) != n:
@@ -354,7 +354,7 @@ def _pad_mode_dim(x, dim, left, right, mode):
 
 # ---- convolution ---------------------------------------------------------------------------
 def _conv_pair(value, name, minimum=1):
-    pair = (value, value) if isinstance(value, int) else tuple(value) if isinstance(value, (tuple, list)) else ()
+    pair = (value, value) if isinstance(value, int) else tuple(value) if (isinstance(value, tuple) or isinstance(value, list)) else ()
     if len(pair) != 2 or any(isinstance(v, bool) or not isinstance(v, int) or v < minimum for v in pair):
         raise ValueError(name + " must be an integer or pair of integers >= " + str(minimum))
     return pair
@@ -764,7 +764,7 @@ def _max_pool(x, nd, kernel_size, stride, padding, dilation, ceil_mode, return_i
         return torch._quant._max_pool(x, _max_pool, nd, kernel_size, stride, padding, dilation, ceil_mode, return_indices, name)
     x, unbatched = _pool_input(x, nd, name)
     k = _ntuple(kernel_size, nd, "kernel_size")
-    s = k if stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0) else _ntuple(stride, nd, "stride")
+    s = k if stride is None or ((isinstance(stride, list) or isinstance(stride, tuple)) and len(stride) == 0) else _ntuple(stride, nd, "stride")
     p = _ntuple(padding, nd, "padding")
     d = _ntuple(dilation, nd, "dilation")
     for i in range(nd):
@@ -845,7 +845,7 @@ def max_pool2d_with_indices(input, kernel_size, stride=None, padding=0, dilation
 def _avg_pool(x, nd, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override, name):
     x, unbatched = _pool_input(x, nd, name)
     k = _ntuple(kernel_size, nd, "kernel_size")
-    s = k if stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0) else _ntuple(stride, nd, "stride")
+    s = k if stride is None or ((isinstance(stride, list) or isinstance(stride, tuple)) and len(stride) == 0) else _ntuple(stride, nd, "stride")
     p = _ntuple(padding, nd, "padding")
     for i in range(nd):
         if p[i] > k[i] // 2:
@@ -904,7 +904,7 @@ def avg_pool1d(input, kernel_size, stride=None, padding=0, ceil_mode=False, coun
 def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True, divisor_override=None):
     if input.__class__ is torch._QTensor:
         k = _ntuple(kernel_size, 2, "kernel_size")
-        st = k if stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0) else _ntuple(stride, 2, "stride")
+        st = k if stride is None or ((isinstance(stride, list) or isinstance(stride, tuple)) and len(stride) == 0) else _ntuple(stride, 2, "stride")
         return torch._quant._avg_pool2d(input, k, st, _ntuple(padding, 2, "padding"), ceil_mode, count_include_pad, divisor_override)
     return _avg_pool(input, 2, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override, "avg_pool2d")
 
@@ -932,7 +932,7 @@ def lp_pool3d(input, norm_type, kernel_size, stride=None, ceil_mode=False):
 
 
 def _adaptive_sizes(x, nd, output_size):
-    out = _ntuple(output_size, nd, "output_size") if not isinstance(output_size, (tuple, list)) or None not in output_size else tuple(x.shape[-nd + i] if v is None else int(v) for i, v in enumerate(output_size))
+    out = _ntuple(output_size, nd, "output_size") if not (isinstance(output_size, tuple) or isinstance(output_size, list)) or None not in output_size else tuple(x.shape[-nd + i] if v is None else int(v) for i, v in enumerate(output_size))
     return out
 
 
@@ -1029,7 +1029,7 @@ def _max_unpool(input, indices, nd, kernel_size, stride, padding, output_size, n
     """Scatters each value to its flat index in a zero output plane; the
     gradient gathers from the same indices."""
     k = _ntuple(kernel_size, nd, "kernel_size")
-    s = k if stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0) else _ntuple(stride, nd, "stride")
+    s = k if stride is None or ((isinstance(stride, list) or isinstance(stride, tuple)) and len(stride) == 0) else _ntuple(stride, nd, "stride")
     p = _ntuple(padding, nd, "padding")
     unbatched = len(input.shape) == nd + 1
     x = input.unsqueeze(0) if unbatched else input
@@ -1121,13 +1121,13 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
     if size is not None and scale_factor is not None:
         raise ValueError("only one of size or scale_factor should be defined")
     if size is not None:
-        out_sizes = list(size) if isinstance(size, (list, tuple)) else [size] * nd
+        out_sizes = list(size) if (isinstance(size, list) or isinstance(size, tuple)) else [size] * nd
         if len(out_sizes) != nd:
             raise ValueError("Input and output must have the same number of spatial dimensions, but got input with spatial dimensions of %s and output size of %s. Please provide input tensor in (N, C, d1, d2, ...,dK) format and output size in (o1, o2, ...,oK) format." % (list(x.shape[2:]), out_sizes))
         out_sizes = [int(v) for v in out_sizes]
         scales = [None] * nd
     elif scale_factor is not None:
-        scales = [float(v) for v in scale_factor] if isinstance(scale_factor, (list, tuple)) else [float(scale_factor)] * nd
+        scales = [float(v) for v in scale_factor] if (isinstance(scale_factor, list) or isinstance(scale_factor, tuple)) else [float(scale_factor)] * nd
         if len(scales) != nd:
             raise ValueError("Input and scale_factor must have the same number of spatial dimensions")
         out_sizes = [int(math.floor(float(x.shape[2 + i]) * scales[i])) for i in range(nd)]
@@ -2047,6 +2047,14 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
             terms = terms * class_weight
         loss = -terms.sum(class_dim)
         return loss.mean() if reduction == "mean" else loss.sum() if reduction == "sum" else loss
+    if (weight is None and label_smoothing == 0 and logits.__class__ is torch.Tensor and target.__class__ is torch.Tensor
+            and target.dtype is torch.int64 and len(logits.shape) == 2 and len(target.shape) == 1):
+        # [N, C] logits and N class indices, none ignored or out of range:
+        # the rows' picks in one kernel (`torch._nll_rows`), the values and
+        # gradient of the general path below.
+        loss = torch._nll_rows(log_softmax(logits, -1), target, ignore_index)
+        if loss is not None:
+            return loss.reshape(*target.shape) if reduction == "none" else _reduce(loss, reduction)
     _check_targets(logits, target)
     target_shape = tuple(target.shape)
     rows, flat = _flatten_classes(logits, target)
@@ -2819,10 +2827,10 @@ def _fractional_max_pool(input, nd, kernel_size, output_size, output_ratio, retu
     if output_size is None and output_ratio is None:
         raise ValueError("%s requires specifying either an output_size or an output_ratio" % name)
     if output_size is None:
-        if nd == 2 and not isinstance(output_ratio, (tuple, list)):
+        if nd == 2 and not (isinstance(output_ratio, tuple) or isinstance(output_ratio, list)):
             # PyTorch 2.11's F.fractional_max_pool2d takes len() of the ratio.
             raise TypeError("object of type '%s' has no len()" % type(output_ratio).__name__)
-        ratio = tuple(output_ratio) if isinstance(output_ratio, (tuple, list)) else (output_ratio,)
+        ratio = tuple(output_ratio) if (isinstance(output_ratio, tuple) or isinstance(output_ratio, list)) else (output_ratio,)
         if len(ratio) == 1:
             ratio = ratio * nd
         if len(ratio) != nd:

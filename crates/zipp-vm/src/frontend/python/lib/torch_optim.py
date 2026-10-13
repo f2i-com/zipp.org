@@ -10,6 +10,11 @@ import math
 import sys
 import torch
 
+# (module attributes read once: a step reads them per parameter)
+_Tensor = torch.Tensor
+_float32 = torch.float32
+_float64 = torch.float64
+
 
 class _RequiredParameter:
     """Singleton marking a default that every parameter group must supply."""
@@ -45,12 +50,14 @@ class _ParamState:
         return p if type(p) is int else id(p)
 
     def __getitem__(self, p):
-        k = self._key(p)
-        if k not in self._entries:
-            if type(p) is int:
+        # (`_key`, inline: a state lookup is made per parameter per step)
+        k = p if p.__class__ is int else id(p)
+        entry = self._entries.get(k)
+        if entry is None:
+            if p.__class__ is int:
                 raise KeyError(p)
-            self._entries[k] = (p, {})
-        return self._entries[k][1]
+            entry = self._entries[k] = (p, {})
+        return entry[1]
 
     def __setitem__(self, p, value):
         k = self._key(p)
@@ -119,6 +126,16 @@ def _with_step_hooks(step):
     def step_with_hooks(*args, **kwargs):
         # As in PyTorch, hooks see the call's full args, the optimizer first.
         self = args[0]
+        if not self._optimizer_step_pre_hooks and not self._optimizer_step_post_hooks:
+            # (no hooks: the usual call, `step()` or `step(closure)`,
+            # without re-packing its arguments)
+            if not kwargs:
+                n = len(args)
+                if n == 1:
+                    return step(self)
+                if n == 2:
+                    return step(self, args[1])
+            return step(*args, **kwargs)
         for hook in list(self._optimizer_step_pre_hooks.values()):
             result = hook(self, args, kwargs)
             if result is not None:
@@ -165,6 +182,94 @@ def _check_flags(foreach, fused, differentiable):
 
 def _value(v):
     return v.item() if isinstance(v, torch.Tensor) else v
+
+
+def _write_param(p, value):
+    """A step's result written into the parameter, as PyTorch's in-place
+    update does: every alias of `p` (`.data`, `detach()`, views, the
+    tensors `state_dict()` returned) sees the new values, and its version
+    moves on. A result of another dtype or shape rebinds instead."""
+    if value.dtype is p.dtype and torch._shape_eq(value.shape, p.shape):
+        torch._k.copy_into(p._s, value._s)
+        if p._untracked:
+            torch._k.untrack(p._s)
+    else:
+        p.data = value
+
+
+def _state_of(state, entries, p):
+    """`state[p]` for a step loop: `entries` is the `_ParamState`'s table
+    (None when `state` is some other mapping), read directly; the indexing
+    call takes the operator dispatch, several microseconds here."""
+    if entries is not None:
+        entry = entries.get(id(p))
+        if entry is not None:
+            return entry[1]
+    return state[p]
+
+
+def _table(state):
+    return state._entries if state.__class__ is _ParamState else None
+
+
+def _plain(v):
+    """Whether an option is a Python number: the fused updates take those
+    as floats (a tensor option keeps the composite)."""
+    return isinstance(v, float) or isinstance(v, int)
+
+
+def _same_shape(t, p):
+    return t.shape is p.shape or torch._shape_eq(t.shape, p.shape)
+
+
+def _fused_sgd(st, p, grad, flags, scalars):
+    """SGD's update of a float32/float64 parameter as one kernel call
+    (`optim_step`): the composite's values (see SGD.step), the parameter
+    written in place and the momentum buffer a new tensor, as the
+    composite's were. False, with nothing changed, for a parameter the
+    kernel does not take (the composite then runs)."""
+    dt = p.dtype
+    if (dt is not _float32 and dt is not _float64) or grad.__class__ is not _Tensor or grad.dtype is not dt or not _same_shape(grad, p):
+        return False
+    buf = None
+    if flags & 4:
+        buf = st.get("momentum_buffer")
+        if buf is not None and (buf.__class__ is not _Tensor or not _same_shape(buf, p)):
+            return False
+    new = torch._k.optim_step(0, flags, p._s, grad._s, None if buf is None else buf._s, None, None, scalars)
+    if new is None:
+        return False
+    if flags & 4:
+        st["momentum_buffer"] = _Tensor(new[0], p.shape, dt)
+    if p._untracked:
+        torch._k.untrack(p._s)
+    return True
+
+
+def _fused_adam(p, grad, st, flags, scalars, amsgrad):
+    """Adam's update (AdamW's too) of a float32/float64 parameter as one
+    kernel call, as `_fused_sgd`: exp_avg, exp_avg_sq and max_exp_avg_sq
+    become new tensors."""
+    dt = p.dtype
+    if (dt is not _float32 and dt is not _float64) or grad.__class__ is not _Tensor or grad.dtype is not dt or not _same_shape(grad, p):
+        return False
+    m, v = st["exp_avg"], st["exp_avg_sq"]
+    w = st.get("max_exp_avg_sq") if amsgrad else None
+    if m.__class__ is not _Tensor or v.__class__ is not _Tensor or not _same_shape(m, p) or not _same_shape(v, p):
+        return False
+    if amsgrad and (w.__class__ is not _Tensor or not _same_shape(w, p)):
+        return False
+    new = torch._k.optim_step(1, flags, p._s, grad._s, m._s, v._s, None if w is None else w._s, scalars)
+    if new is None:
+        return False
+    shape = p.shape
+    st["exp_avg"] = _Tensor(new[0], shape, dt)
+    st["exp_avg_sq"] = _Tensor(new[1], shape, dt)
+    if amsgrad:
+        st["max_exp_avg_sq"] = _Tensor(new[2], shape, dt)
+    if p._untracked:
+        torch._k.untrack(p._s)
+    return True
 
 
 class Optimizer:
@@ -292,7 +397,7 @@ class Optimizer:
         params = param_group["params"]
         if isinstance(params, torch.Tensor):
             params = [params]
-        elif isinstance(params, (set, frozenset)):
+        elif (isinstance(params, set) or isinstance(params, frozenset)):
             raise TypeError("optimizer parameters need to be organized in ordered collections, but the ordering of tensors in sets will change between runs. Please use a list instead.")
         else:
             params = list(params)
@@ -384,22 +489,35 @@ class SGD(Optimizer):
             return capture.sgd(self, closure)
         self._eager()
         loss = _closure_loss(closure)
-        for g, p in self._params():
-            if p.dtype._reduced:
-                _half_sgd(self, g, p)
-                continue
-            grad = p.grad
-            if g["maximize"]:
-                grad = -grad
-            if g["weight_decay"]:
-                grad = grad + p.detach() * g["weight_decay"]
-            if g["momentum"]:
-                st = self.state[p]
-                buf = st.get("momentum_buffer")
-                buf = grad.clone() if buf is None else buf * g["momentum"] + grad * (1 - g["dampening"])
-                st["momentum_buffer"] = buf
-                grad = grad + buf * g["momentum"] if g["nesterov"] else buf
-            p.data = p.detach() - grad * g["lr"]
+        state = self.state
+        entries = _table(state)
+        for g in self.param_groups:
+            lr, momentum, dampening, wd = g["lr"], g["momentum"], g["dampening"], g["weight_decay"]
+            maximize, nesterov = g["maximize"], g["nesterov"]
+            scalars = None
+            if _plain(lr) and _plain(momentum) and _plain(dampening) and _plain(wd):
+                scalars = (float(lr), float(momentum), float(1 - dampening), float(wd))
+                flags = (1 if maximize else 0) | (2 if wd else 0) | ((20 if nesterov else 4) if momentum else 0)
+            for p in g["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue
+                if p.dtype._reduced:
+                    _half_sgd(self, g, p)
+                    continue
+                st = _state_of(state, entries, p) if momentum else None
+                if scalars is not None and _fused_sgd(st, p, grad, flags, scalars):
+                    continue
+                if maximize:
+                    grad = -grad
+                if wd:
+                    grad = grad + p.detach() * wd
+                if momentum:
+                    buf = st.get("momentum_buffer")
+                    buf = grad.clone() if buf is None else buf * momentum + grad * (1 - dampening)
+                    st["momentum_buffer"] = buf
+                    grad = grad + buf * momentum if nesterov else buf
+                _write_param(p, p.detach() - grad * lr)
         return loss
 
 
@@ -433,39 +551,67 @@ class Adam(Optimizer):
             return capture.adam(self, closure)
         self._eager()
         loss = _closure_loss(closure)
-        for g, p in self._params():
-            if p.dtype._reduced:
-                _half_adam(self, g, p)
-                continue
-            grad = p.grad
-            if g["maximize"]:
-                grad = -grad
-            st = self.state[p]
-            if not st:
-                st.update({"step": 0, "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)})
-                if g["amsgrad"]:
-                    st["max_exp_avg_sq"] = torch.zeros_like(p)
-            st["step"] += 1
+        refuse = self._sparse_error
+        state = self.state
+        entries = _table(state)
+        for g in self.param_groups:
             b1, b2 = g["betas"]
-            lr, wd = g["lr"], g["weight_decay"]
-            value = p.detach()
-            if wd:
-                if g.get("decoupled_weight_decay", self._decoupled):
-                    value = value * (1 - lr * wd)
+            lr, wd, eps = g["lr"], g["weight_decay"], g["eps"]
+            amsgrad, maximize = g["amsgrad"], g["maximize"]
+            decoupled = g.get("decoupled_weight_decay", self._decoupled) if wd else False
+            fuse = _plain(b1) and _plain(b2) and _plain(lr) and _plain(wd) and _plain(eps)
+            if fuse:
+                flags = (1 if maximize else 0) | ((6 if decoupled else 2) if wd else 0) | (8 if amsgrad else 0)
+                # The fused update's scalars: the group's, and per step count
+                # the bias corrections (the parameters of a group usually
+                # share one step count).
+                head = (float(b1), float(1 - b1), float(b2), float(1 - b2))
+                feps = float(eps)
+                last = float(1 - lr * wd) if decoupled else float(wd)
+                at = None
+                scalars = None
+            for p in g["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue
+                if refuse is not None and grad.is_sparse:
+                    raise RuntimeError(refuse)
+                if p.dtype._reduced:
+                    _half_adam(self, g, p)
+                    continue
+                st = _state_of(state, entries, p)
+                if not st:
+                    st.update({"step": 0, "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)})
+                    if amsgrad:
+                        st["max_exp_avg_sq"] = torch.zeros_like(p)
+                step = st["step"] + 1
+                st["step"] = step
+                if fuse:
+                    if at is None or step != at:
+                        scalars = head + (math.sqrt(1 - b2 ** step), feps, float(lr / (1 - b1 ** step)), last)
+                        at = step
+                    if _fused_adam(p, grad, st, flags, scalars, amsgrad):
+                        continue
+                bias1 = 1 - b1 ** step
+                bias2 = 1 - b2 ** step
+                step_size = lr / bias1
+                if maximize:
+                    grad = -grad
+                value = p.detach()
+                if wd:
+                    if decoupled:
+                        value = value * (1 - lr * wd)
+                    else:
+                        grad = grad + value * wd
+                st["exp_avg"] = st["exp_avg"] * b1 + grad * (1 - b1)
+                st["exp_avg_sq"] = st["exp_avg_sq"] * b2 + grad * grad * (1 - b2)
+                if amsgrad:
+                    st["max_exp_avg_sq"] = torch.maximum(st.get("max_exp_avg_sq", st["exp_avg_sq"]), st["exp_avg_sq"])
+                    denom_sq = st["max_exp_avg_sq"]
                 else:
-                    grad = grad + value * wd
-            st["exp_avg"] = st["exp_avg"] * b1 + grad * (1 - b1)
-            st["exp_avg_sq"] = st["exp_avg_sq"] * b2 + grad * grad * (1 - b2)
-            if g["amsgrad"]:
-                st["max_exp_avg_sq"] = torch.maximum(st.get("max_exp_avg_sq", st["exp_avg_sq"]), st["exp_avg_sq"])
-                denom_sq = st["max_exp_avg_sq"]
-            else:
-                denom_sq = st["exp_avg_sq"]
-            bias1 = 1 - b1 ** st["step"]
-            bias2 = 1 - b2 ** st["step"]
-            step_size = lr / bias1
-            denom = torch.sqrt(denom_sq) / math.sqrt(bias2) + g["eps"]
-            p.data = value - st["exp_avg"] / denom * step_size
+                    denom_sq = st["exp_avg_sq"]
+                denom = torch.sqrt(denom_sq) / math.sqrt(bias2) + eps
+                _write_param(p, value - st["exp_avg"] / denom * step_size)
         return loss
 
 
@@ -528,9 +674,9 @@ class RMSprop(Optimizer):
                 buf = st.get("momentum_buffer")
                 buf = grad / avg if buf is None else buf * g["momentum"] + grad / avg
                 st["momentum_buffer"] = buf
-                p.data = value - buf * g["lr"]
+                _write_param(p, value - buf * g["lr"])
             else:
-                p.data = value - grad / avg * g["lr"]
+                _write_param(p, value - grad / avg * g["lr"])
         return loss
 
 
@@ -589,7 +735,7 @@ class Adagrad(Optimizer):
                 continue
             st["sum"] = st["sum"] + grad * grad
             std = torch.sqrt(st["sum"]) + g["eps"]
-            p.data = value - grad / std * clr
+            _write_param(p, value - grad / std * clr)
         return loss
 
 
@@ -702,7 +848,7 @@ class Adamax(Optimizer):
             st["exp_avg"] = st["exp_avg"] + (grad - st["exp_avg"]) * (1 - b1)
             st["exp_inf"] = torch.maximum(st["exp_inf"] * b2, torch.abs(grad) + g["eps"])
             clr = g["lr"] / (1 - b1 ** st["step"])
-            p.data = value - st["exp_avg"] / st["exp_inf"] * clr
+            _write_param(p, value - st["exp_avg"] / st["exp_inf"] * clr)
         return loss
 
 
@@ -759,7 +905,7 @@ class NAdam(Optimizer):
             st["exp_avg_sq"] = st["exp_avg_sq"] * b2 + grad * grad * (1 - b2)
             denom = torch.sqrt(st["exp_avg_sq"] / bias2) + g["eps"]
             value = value - grad / denom * (lr * (1.0 - mu) / (1.0 - mu_product))
-            p.data = value - st["exp_avg"] / denom * (lr * mu_next / (1.0 - mu_product * mu_next))
+            _write_param(p, value - st["exp_avg"] / denom * (lr * mu_next / (1.0 - mu_product * mu_next)))
         return loss
 
 
@@ -810,9 +956,9 @@ class RAdam(Optimizer):
             if rho_t > 5.0:
                 rect = ((rho_t - 4) * (rho_t - 2) * rho_inf / ((rho_inf - 4) * (rho_inf - 2) * rho_t)) ** 0.5
                 adaptive = (bias2 ** 0.5) / (torch.sqrt(st["exp_avg_sq"]) + g["eps"])
-                p.data = value - corrected * lr * adaptive * rect
+                _write_param(p, value - corrected * lr * adaptive * rect)
             else:
-                p.data = value - corrected * lr
+                _write_param(p, value - corrected * lr)
         return loss
 
 
@@ -852,7 +998,7 @@ class Adadelta(Optimizer):
             std = torch.sqrt(st["square_avg"] + eps)
             delta = torch.sqrt(st["acc_delta"] + eps) / std * grad
             st["acc_delta"] = st["acc_delta"] * rho + delta * delta * (1 - rho)
-            p.data = value - delta * g["lr"]
+            _write_param(p, value - delta * g["lr"])
         return loss
 
 
@@ -893,7 +1039,7 @@ class ASGD(Optimizer):
                 grad = grad + value * g["weight_decay"]
             eta = st["eta"]
             value = value * (1 - g["lambd"] * eta) - grad * eta
-            p.data = value
+            _write_param(p, value)
             if st["mu"] != 1:
                 st["ax"] = st["ax"] + (value - st["ax"]) * st["mu"]
             else:
@@ -936,7 +1082,7 @@ class Rprop(Optimizer):
             sign = torch.where(product > 0, etaplus, torch.where(product < 0, etaminus, 1.0)).to(grad.dtype)
             st["step_size"] = torch.clamp(st["step_size"] * sign, step_size_min, step_size_max)
             grad = torch.where(product < 0, 0.0, grad).to(grad.dtype)
-            p.data = p.detach() - torch.sign(grad) * st["step_size"]
+            _write_param(p, p.detach() - torch.sign(grad) * st["step_size"])
             st["prev"] = grad.clone()
         return loss
 
@@ -1319,7 +1465,7 @@ class LBFGS(Optimizer):
         offset = 0
         for p in self._params:
             numel = p.numel()
-            p.data = p.detach() + update[offset:offset + numel].view_as(p) * step_size
+            _write_param(p, p.detach() + update[offset:offset + numel].view_as(p) * step_size)
             offset += numel
 
     def _clone_param(self):
@@ -1327,7 +1473,7 @@ class LBFGS(Optimizer):
 
     def _set_param(self, params_data):
         for p, data in zip(self._params, params_data):
-            p.data = data.clone()
+            _write_param(p, data.clone())
 
     def _directional_evaluate(self, closure, x, t, d):
         self._add_grad(t, d)

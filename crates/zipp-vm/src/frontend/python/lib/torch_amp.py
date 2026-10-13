@@ -606,6 +606,17 @@ def _autocast_wrapper(fn, policy):
     def autocast_op(*args, **kwargs):
         fast = torch._autocast_cpu
         if fast is None:
+            # (outside autocast: the call as it was made; one to three
+            # positional arguments without re-packing them, which costs
+            # microseconds on this runtime)
+            if not kwargs:
+                n = len(args)
+                if n == 2:
+                    return fn(args[0], args[1])
+                if n == 1:
+                    return fn(args[0])
+                if n == 3:
+                    return fn(args[0], args[1], args[2])
             return fn(*args, **kwargs)
         chosen = policy(args, kwargs) if callable(policy) else policy
         if chosen == "pass":

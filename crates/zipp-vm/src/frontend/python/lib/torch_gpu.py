@@ -470,7 +470,7 @@ class _Capture:
             raise NotImplementedError("torch.compile cannot record an eager operation this large on a parameter")
         with torch.no_grad():
             probe = torch.arange(1, count + 1, dtype=torch.float32).reshape(shape)
-            return probe, node.backward(probe)[0]
+            return probe, node.run(probe)[0]
 
     def _replay_reduction(self, node, parent, operand, shape, name):
         probe, spread = self._probe(node, shape)

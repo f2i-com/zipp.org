@@ -28,6 +28,7 @@ py -3.13 tools/python_bench.py --zipp target/release/zipp.exe                  #
 py -3.13 tools/python_bench.py --zipp old.exe --zipp-b new.exe --reps 7        # A/B plus CPython
 py -3.13 tools/python_bench.py --zipp zipp.exe --zipp-b new.exe --no-cpython   # A/B only
 py -3.13 tools/python_bench.py --zipp zipp.exe --group micro --only call_ --reps 3
+py -3.13 tools/python_bench.py --zipp zipp.exe --no-cpython --only torch --torch-cpython "py -3.11" --warm 5
 py -3.13 -m unittest tools.test_python_bench                                   # harness unit tests
 ```
 
@@ -37,6 +38,9 @@ py -3.13 -m unittest tools.test_python_bench                                   #
 | `--timeout S` | Per-run limit. A timed-out run's process tree is killed. |
 | `--metric wall` | Shows wall time in the table instead of work time. |
 | `--json PATH` | Moves the report. By default it goes to `target/bench-results/python-bench-<utc>.json`, which is ignored by git. |
+| `--torch-cpython CMD` | Adds the engine `torch`: the zipp-only programs that import torch also run under `CMD`, a CPython with real PyTorch installed (`py -3.11` on the development host). The table gains `zipp/torch` and `zipp-b/torch` ratios. |
+| `--torch-threads N` | `torch.set_num_threads(N)` before the torch engine's run. The default is 1, which compares one core against Zipp's one core; 0 leaves PyTorch's default. |
+| `--warm N` | Runs each program's timed tail N times in one process, for every engine, and times the fastest of runs 2..N. The first run's time is reported separately as the cold time. |
 
 The exit status is 1 in any of these cases:
 - a run fails or times out
@@ -102,6 +106,29 @@ torch; Zipp has its bundled subset.
 - Their inputs come from `arange` formulas, not the RNG.
 - Their printed values are rounded, so a kernel change that only reorders
   float32 accumulation still validates, while a wrong result does not.
+
+**Against real PyTorch.** `--torch-cpython` runs the zipp-only torch programs
+under PyTorch's CPU backend as a timing reference.
+- **Warm and cold.** PyTorch's first operation in a process initialises its
+  kernels: a torch row's first run takes about 0.7 s more than its later ones,
+  where Zipp's first run is close to its warm one. Use `--warm 5` and read
+  both tables. The ratio table uses the warm times, and the cold table shows
+  the first run of each process.
+- **Copies of the programs.** The torch engine runs a copy of the program
+  that sets the thread count first. With `--warm`, every engine runs a copy
+  that repeats the timed tail, from the `t0 = time.perf_counter()` line on.
+  Each copy runs from a temporary folder of its own.
+- **Checksums.** The torch engine's output is compared with Zipp's, but a
+  difference is only recorded (`torch_mismatches` in the report, `torch-differs`
+  in the table). It never fails the run. PyTorch accumulates float32 in its own
+  order, where Zipp's kernels compute in double and round once.
+  `torch_transformer` shows how that can grow:
+  - at step 0 every gradient except the head's is at rounding-noise level,
+    about 1e-8;
+  - AdamW divides by the root of its second moment, so those noise-level
+    gradients become full-size steps;
+  - the printed loss after four steps then differs in the fourth decimal.
+  With SGD in its place, both agree to seven digits.
 
 **Provenance.** Each report records:
 - the harness sha256

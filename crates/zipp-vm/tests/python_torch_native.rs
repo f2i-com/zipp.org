@@ -328,6 +328,43 @@ for dt in ["float16", "bfloat16"]:
     both("half where mixed %s" % dt, lambda: _k.where(C, (6, 1, 7), A, (6, 5, 7), Fv, (5, 1)))
     both("half all_finite %s" % dt, lambda: _k.all_finite(A))
     both("half all_finite finite %s" % dt, lambda: _k.all_finite(_k.from_flat(dt, [i / 8.0 for i in range(100)])))
+# arange's native loop (N_ARANGE) against its inline JavaScript loop.
+for dt in ["float32", "float64", "int64", "int32"]:
+    for st, step, n in ((0, 1, 100), (3, -2, 70), (0.5, 0.1, 90), (-1e8, 3.7, 128), (1e7, 1e-3, 65), (0, 1, 63)):
+        if dt in ("int64", "int32") and (st != int(st) or step != int(step)):
+            continue
+        both("arange %s %s %s %d" % (dt, st, step, n), lambda: _k.arange(dt, st, step, n))
+# The small add/sub/mul/div loop (fewer than 64 elements, no helper calls)
+# against the same values in operands long enough for the native loop:
+# element i of the long result is element i % n of the short one.
+def tiled(dt, shape, seed, k):
+    return _k.from_flat(dt, values(numel(shape), seed, dt) * k)
+for op in ["add", "sub", "mul", "div"]:
+    for dt in FLOATS:
+        for sa, sb in [((5,), (5,)), ((3, 4), (3, 4)), ((3, 4), ()), ((3, 4), (1, 1)), ((), (2, 3)), ((1,), (2, 3)), ((7,), (1,)), ((), ())]:
+            seed += 1
+            A = storage(dt, sa, seed)
+            B = storage(dt, sb, seed + 1)
+            short = _k.binary(op, A, sa, B, sb)
+            n = numel(short[1])
+            k = 70
+            if sa == sb:
+                la, lsa, lb, lsb = tiled(dt, sa, seed, k), (numel(sa) * k,), tiled(dt, sb, seed + 1, k), (numel(sb) * k,)
+            elif numel(sb) == 1 and len(sb) <= len(sa):
+                la, lsa, lb, lsb = tiled(dt, sa, seed, k), (numel(sa) * k,), B, sb
+            else:
+                la, lsa, lb, lsb = A, sa, tiled(dt, sb, seed + 1, k), (numel(sb) * k,)
+            long = _k.binary(op, la, lsa, lb, lsb)
+            CASES[0] += 1
+            if _k.dtype(short[0]) != _k.dtype(long[0]) or _k.tobytes(short[0]) != _k.tobytes(long[0])[:len(_k.tobytes(short[0]))]:
+                BAD.append("small binary %s %s %s %s" % (op, dt, sa, sb))
+            for v in (2.5, -3, 0.1, 1e30):
+                for flip in (False, True):
+                    short = _k.binary_scalar(op, A, sa, v, dt, dt, flip)
+                    long = _k.binary_scalar(op, tiled(dt, sa, seed, k), (numel(sa) * k,), v, dt, dt, flip)
+                    CASES[0] += 1
+                    if _k.tobytes(short[0]) != _k.tobytes(long[0])[:len(_k.tobytes(short[0]))]:
+                        BAD.append("small binary_scalar %s %s %s %s %s" % (op, dt, sa, v, flip))
 # torch.fft's transforms (`vm::py_tensor::fft`): mode 0 complex -> complex,
 # 1 real -> onesided, 2 onesided -> real, 3 real -> all bins; lengths of
 # 2, 3 and 5, odd primes to 31 and Bluestein, inputs shorter and longer
@@ -499,4 +536,281 @@ print(round(float(torch.linalg.inv(a).sum()), 9), round(float(torch.linalg.eigva
     // replace. (The margin was 4x until Python's own fused instructions made
     // the interpreted fallback itself about 4x cheaper to meter.)
     assert!(native.steps * 2 < interpreted.steps, "{} vs {}", native.steps, interpreted.steps);
+}
+
+/// SGD's and Adam's fused update (`optim_step`, one kernel call per
+/// parameter) gives the bytes of the per-tensor composite it replaced, for
+/// every option, both float dtypes, sizes on both sides of the native
+/// threshold and special values, with its native loop on and off: the
+/// parameters and every state tensor, step by step.
+const OPTIM: &str = r#"
+import torch
+import _zipp_tensor as _k
+
+INF = float("inf")
+NAN = float("nan")
+SPECIAL = [0.0, -0.0, 1.0, -1.0, 1e-45, 3e38, 1e-8, INF, -INF, NAN, 0.5, -2.5]
+
+
+def vals(n, seed, special):
+    out = []
+    for i in range(n):
+        j = (i * 7 + seed * 13) % 31
+        if special and j < len(SPECIAL) and (i + seed) % 3 == 0:
+            out.append(SPECIAL[j])
+        else:
+            out.append(((i * 37 + seed * 11) % 23 - 11) / 8.0 + (seed % 5) * 0.137)
+    return out
+
+
+def image(opt, params):
+    out = []
+    for t in params:
+        out.append(_k.tobytes(t._s))
+        st = opt.state[t]
+        for k in sorted(st):
+            v = st[k]
+            out.append((k, (_k.dtype(v._s), tuple(v.shape), _k.tobytes(v._s)) if isinstance(v, torch.Tensor) else repr(v)))
+    return out
+
+
+def run(make, dt, shape, seed, special, fused, native):
+    _k._native(native)
+    saved = _k.optim_step
+    if not fused:
+        # (declined: every parameter takes the composite)
+        _k.optim_step = lambda *a: None
+    try:
+        n = 1
+        for d in shape:
+            n *= d
+        p = torch.nn.Parameter(torch.tensor(vals(n, seed, special), dtype=dt).reshape(shape))
+        q = torch.nn.Parameter(torch.tensor(vals(7, seed + 1, False), dtype=dt))
+        opt = make([p, q])
+        out = []
+        for step in range(3):
+            p.grad = torch.tensor(vals(n, seed + 10 + step, special), dtype=dt).reshape(shape)
+            q.grad = torch.tensor(vals(7, seed + 20 + step, False), dtype=dt)
+            opt.step()
+            out.append(image(opt, [p, q]))
+        return out
+    finally:
+        _k.optim_step = saved
+
+
+O = torch.optim
+CONFIGS = [
+    ("sgd", lambda ps: O.SGD(ps, lr=0.05)),
+    ("sgd momentum", lambda ps: O.SGD(ps, lr=0.05, momentum=0.9)),
+    ("sgd dampening wd", lambda ps: O.SGD(ps, lr=0.05, momentum=0.9, dampening=0.1, weight_decay=0.01)),
+    ("sgd nesterov", lambda ps: O.SGD(ps, lr=0.03, momentum=0.9, nesterov=True, weight_decay=0.001)),
+    ("sgd maximize ints", lambda ps: O.SGD(ps, lr=1, momentum=1, dampening=0, weight_decay=2, maximize=True)),
+    ("adam", lambda ps: O.Adam(ps, lr=0.01)),
+    ("adam amsgrad", lambda ps: O.Adam(ps, lr=0.01, amsgrad=True)),
+    ("adam wd maximize", lambda ps: O.Adam(ps, lr=0.02, weight_decay=0.01, maximize=True, betas=(0.5, 0.9), eps=1e-3)),
+    ("adam decoupled", lambda ps: O.Adam(ps, lr=0.01, weight_decay=0.1, decoupled_weight_decay=True)),
+    ("adamw", lambda ps: O.AdamW(ps, lr=0.01)),
+    ("adamw amsgrad maximize", lambda ps: O.AdamW(ps, lr=0.003, amsgrad=True, maximize=True, weight_decay=0.05)),
+]
+cases = 0
+bad = []
+seed = 0
+for name, make in CONFIGS:
+    for dt in (torch.float32, torch.float64):
+        for shape in ((5,), (63,), (64,), (10, 7), (100,)):
+            for special in (False, True):
+                seed += 1
+                ref = run(make, dt, shape, seed, special, False, True)
+                for native in (False, True):
+                    cases += 1
+                    if run(make, dt, shape, seed, special, True, native) != ref:
+                        bad.append("%s %s %s special=%s native=%s" % (name, dt, shape, special, native))
+print("cases", cases, "mismatches", len(bad), bad[:5])
+"#;
+
+#[test]
+fn fused_optimizer_steps_give_the_composites_bytes() {
+    let run = run(OPTIM, 20_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("mismatches 0 []"), "{}", out[0]);
+    let cases: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(cases, 11 * 2 * 5 * 2 * 2, "{}", out[0]);
+}
+
+/// The fused LSTM and GRU cells (`lstm_cell`, `gru_cell` and their
+/// backward kernels) give the bytes of the composite they replace, with
+/// their native loops on and off: outputs, final states and every
+/// gradient of nn.LSTM / nn.GRU (layers, bidirectional, batch_first,
+/// proj_size, given initial states, losses reading h_n / c_n, inf / nan /
+/// -0 / saturating inputs) and of LSTMCell / GRUCell, float32 and float64.
+/// Under create_graph the first derivatives are the composite's bytes and
+/// the second derivatives agree to rounding (their sums run in another
+/// order).
+const CELLS: &str = r#"
+import struct
+
+import torch
+import _zipp_tensor as _k
+from torch import nn
+
+SPECIAL = [0.0, -0.0, 30.0, -30.0, 1e-45, 1e-8, 0.5, -2.5, 89.0, -89.0, float("inf"), float("nan")]
+
+
+def vals(n, seed, special):
+    out = []
+    for i in range(n):
+        j = (i * 7 + seed * 13) % 37
+        if special and j < len(SPECIAL) and (i + seed) % 3 == 0:
+            out.append(SPECIAL[j])
+        else:
+            out.append(((i * 37 + seed * 11) % 23 - 11) / 16.0 + (seed % 5) * 0.037)
+    return out
+
+
+def tensor(shape, seed, dt, special=False, grad=False):
+    n = 1
+    for d in shape:
+        n *= d
+    t = torch.tensor(vals(n, seed, special), dtype=dt).reshape(shape)
+    return t.requires_grad_(True) if grad else t
+
+
+def fill(module, dt, seed):
+    with torch.no_grad():
+        for k, p in enumerate(module.parameters()):
+            p.copy_(tensor(tuple(p.shape), seed + k, dt) * 0.5)
+
+
+def image(ts):
+    return [None if t is None else (str(t.dtype), tuple(t.shape), _k.tobytes(t.detach()._s)) for t in ts]
+
+
+SAVED = {}
+
+
+def mode(fused, native):
+    # fused False: the kernels decline, so every step takes the composite
+    for name in ("lstm_cell", "gru_cell"):
+        if name not in SAVED:
+            SAVED[name] = getattr(_k, name)
+        setattr(_k, name, SAVED[name] if fused else (lambda *a: None))
+    _k._native(native)
+
+
+def run_rnn(kind, dt, cfg, seed, special):
+    I, H, L, bf, bi, proj, B, T, h0g, use_hn = cfg
+    kw = dict(num_layers=L, batch_first=bf, bidirectional=bi)
+    if proj:
+        kw["proj_size"] = proj
+    m = getattr(nn, kind)(I, H, **kw).to(dt)
+    fill(m, dt, seed)
+    x = tensor((B, T, I) if bf else (T, B, I), seed + 50, dt, special, True)
+    D = 2 if bi else 1
+    args, extra = [x], []
+    if h0g:
+        h0 = tensor((L * D, B, proj or H), seed + 60, dt, False, True)
+        extra.append(h0)
+        if kind == "LSTM":
+            c0 = tensor((L * D, B, H), seed + 61, dt, False, True)
+            extra.append(c0)
+            args.append((h0, c0))
+        else:
+            args.append(h0)
+    out, st = m(*args)
+    st = list(st) if kind == "LSTM" else [st]
+    loss = (out * out).sum() + out.sum()
+    if use_hn:
+        loss = loss + (st[0] * 3.0).sum() + (st[-1] * st[-1]).sum()
+    loss.backward()
+    return image([out, loss, x.grad] + st + [p.grad for p in m.parameters()] + [t.grad for t in extra])
+
+
+def run_cell(kind, dt, H, B, seed, special, double):
+    m = getattr(nn, kind)(5, H).to(dt)
+    fill(m, dt, seed)
+    x = tensor((B, 5), seed + 40, dt, special, True)
+    h = tensor((B, H), seed + 41, dt, False, True)
+    ps = list(m.parameters())
+    if kind == "LSTMCell":
+        c = tensor((B, H), seed + 42, dt, special, True)
+        h2, c2 = m(x, (h, c))
+        h3, c3 = m(x, (h2, c2))
+        outs, loss, leaves = [h2, c2, h3, c3], (h3 * c3).sum() + h2.sum(), ps + [x, h, c]
+    else:
+        h2 = m(x, h)
+        h3 = m(x * 0.5, h2)
+        outs, loss, leaves = [h2, h3], (h3 * h3).sum() + h2.sum(), ps + [x, h]
+    if not double:
+        loss.backward()
+        return image(outs + [loss] + [t.grad for t in leaves]), None
+    grads = torch.autograd.grad(loss, leaves, create_graph=True)
+    second = torch.autograd.grad(sum((g * g).sum() for g in grads), [x] + ps)
+    return image(outs + [loss] + list(grads)), [t.detach().reshape(-1).tolist() for t in second]
+
+
+def close(a, b, rel):
+    # each tensor's elements within rel of its largest magnitude
+    for x, y in zip(a, b):
+        scale = max(abs(p) for p in x + y)
+        for p, q in zip(x, y):
+            if p != q and abs(p - q) > rel * scale:
+                return False
+    return True
+
+
+cases = 0
+bad = []
+seed = 0
+CFGS = [
+    # I, H, layers, batch_first, bidirectional, proj_size, B, T, h0/c0 given (requiring grad), loss reads h_n/c_n
+    (3, 4, 1, True, False, 0, 2, 3, False, False),
+    (6, 12, 1, True, False, 0, 4, 10, False, False),
+    (5, 7, 2, False, True, 0, 3, 4, True, True),
+    (4, 20, 1, False, False, 0, 5, 3, True, True),
+    (3, 6, 2, True, False, 3, 2, 3, True, True),
+]
+for kind in ("LSTM", "GRU"):
+    for dt in (torch.float32, torch.float64):
+        for cfg in CFGS:
+            if kind == "GRU" and cfg[5]:
+                continue
+            for special in (False, True):
+                seed += 1
+                mode(False, True)
+                ref = run_rnn(kind, dt, cfg, seed, special)
+                for native in (False, True):
+                    cases += 1
+                    mode(True, native)
+                    if run_rnn(kind, dt, cfg, seed, special) != ref:
+                        bad.append("%s %s %s special=%s native=%s" % (kind, dt, cfg, special, native))
+for kind in ("LSTMCell", "GRUCell"):
+    for dt in (torch.float32, torch.float64):
+        for H, B in ((4, 3), (16, 8)):
+            for special in (False, True):
+                for double in ((False, True) if not special else (False,)):
+                    seed += 1
+                    mode(False, True)
+                    ref, ref2 = run_cell(kind, dt, H, B, seed, special, double)
+                    for native in (False, True):
+                        cases += 1
+                        mode(True, native)
+                        got, got2 = run_cell(kind, dt, H, B, seed, special, double)
+                        # second derivatives: the same up to the order of
+                        # their sums (create_graph records the composite's
+                        # backward over fresh activations)
+                        if got != ref or (double and not close(got2, ref2, 1e-5 if dt is torch.float32 else 1e-13)):
+                            bad.append("%s %s %d %d special=%s double=%s native=%s" % (kind, dt, H, B, special, double, native))
+mode(True, True)
+print("cases", cases, "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn fused_recurrent_cells_give_the_composites_bytes() {
+    let run = run(CELLS, 20_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("mismatches 0 []"), "{}", out[0]);
+    let cases: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(cases, 120, "{}", out[0]);
 }

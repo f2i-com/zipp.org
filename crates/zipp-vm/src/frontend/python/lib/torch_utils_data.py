@@ -330,9 +330,9 @@ def _is_mapping(value):
 
 
 def _is_sequence(value):
-    if isinstance(value, (str, bytes, bytearray, dict, torch.Tensor)):
+    if (isinstance(value, str) or isinstance(value, bytes) or isinstance(value, bytearray) or isinstance(value, dict) or isinstance(value, torch.Tensor)):
         return False
-    return isinstance(value, (list, tuple, range)) or isinstance(value, _abc.Sequence)
+    return (isinstance(value, list) or isinstance(value, tuple) or isinstance(value, range)) or isinstance(value, _abc.Sequence)
 
 
 def _is_namedtuple(value):
@@ -351,7 +351,7 @@ def default_collate(batch):
         return torch.tensor(list(batch), dtype=torch.float64)
     if isinstance(elem, int):
         return torch.tensor(list(batch))
-    if isinstance(elem, (str, bytes)):
+    if (isinstance(elem, str) or isinstance(elem, bytes)):
         return batch
     if _is_mapping(elem):
         collated = [(key, default_collate([d[key] for d in batch])) for key in elem]
@@ -384,10 +384,30 @@ def default_collate(batch):
     raise TypeError(default_collate_err_msg_format.format(type(elem)))
 
 
+def _tensor_dataset_batch(dataset, index, collate_fn):
+    """`default_collate([dataset[i] for i in index])` for a TensorDataset of
+    plain tensors that need no grad: each tensor indexed once by the batch's
+    indices, which copies the same elements stacking the samples copies, in
+    the same order. None for anything else (the general path)."""
+    if type(dataset) is not TensorDataset or collate_fn is not default_collate or not index:
+        return None
+    for i in index:
+        if i.__class__ is not int:
+            return None
+    tensors = dataset.tensors
+    for t in tensors:
+        if t.__class__ is not torch.Tensor or t.requires_grad or t.dim() == 0:
+            return None
+    # (`torch.tensor(index)`'s values, and `t[idx]`'s rows for an [n] index
+    # into dim 0, as index_select gathers them)
+    idx = torch.Tensor(torch._k.from_flat("int64", index), (len(index),), torch.int64)
+    return [torch.index_select(t, 0, idx) for t in tensors]
+
+
 def default_convert(data):
     """The collate_fn when automatic batching is off (`batch_size=None`):
     samples pass through; plain tuples become lists, as in PyTorch."""
-    if isinstance(data, (torch.Tensor, str, bytes)):
+    if (isinstance(data, torch.Tensor) or isinstance(data, str) or isinstance(data, bytes)):
         return data
     if _is_mapping(data):
         converted = [(key, default_convert(data[key])) for key in data]
@@ -535,6 +555,9 @@ class _DataLoaderIter:
                 data = next(self._dataset_iter)
             return self._collate_fn(data)
         if self._auto_collation:
+            batch = _tensor_dataset_batch(self._dataset, index, self._collate_fn)
+            if batch is not None:
+                return batch
             getitems = getattr(self._dataset, "__getitems__", None)
             if callable(getitems):
                 data = getitems(index)

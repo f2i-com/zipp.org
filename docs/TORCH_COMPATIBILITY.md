@@ -377,8 +377,9 @@ compilation bit for bit (VAE reparameterisation with `randn_like`, input noise,
 embedding, a `bernoulli` mask and `randint` class targets). A float32 draw
 becomes a graph input, so arithmetic on it records on the device
 (`mu + eps * std`); an integer draw stays a CPU tensor and is fed wherever the
-step reads it as class targets, an index or a mask. (Zipp's `randn` is its own,
-not PyTorch's bit stream; `rand`/`randint` follow PyTorch's.)
+step reads it as class targets, an index or a mask. (`randn`, `rand` and
+`randint` follow PyTorch's CPU stream: see *Random numbers* under *Eager CPU
+coverage*.)
 
 Refused, naming why: an in-place draw (`normal_`, `uniform_`, `random_`,
 `bernoulli_`, `exponential_`, ...), `torch.poisson` or `nn.init` inside the step;
@@ -637,8 +638,16 @@ third-party ML packages is not supported; within the bundled `torch`:
   closure required), with PyTorch's option validation, `step(closure)`,
   parameter groups, `add_param_group`, step hooks and PyTorch's `state_dict`
   layout (a checkpoint's `step` is an int after loading; PyTorch resumes
-  Zipp-written optimizer states). `foreach`, `fused`, `capturable` and
-  `differentiable` are accepted and have no effect. `torch.optim.lr_scheduler`
+  Zipp-written optimizer states). A step writes into each parameter's
+  storage, as PyTorch's in-place updates do, so `.data`, `detach()` aliases,
+  views and earlier `state_dict()` tensors see the new values; the state
+  tensors (`exp_avg`, momentum buffers, ...) are new tensors after each step,
+  where PyTorch updates them in place, so a `state_dict()` taken earlier keeps
+  the old moments. SGD's and Adam's updates round after every operation, where
+  PyTorch's CPU kernels fuse some multiply-adds (`add_(alpha=)`, `lerp_`), so
+  updated weights can differ from PyTorch's in the last bit. `foreach`,
+  `fused`, `capturable` and `differentiable` are accepted and have no
+  effect. `torch.optim.lr_scheduler`
   provides LambdaLR, MultiplicativeLR, StepLR, MultiStepLR, ConstantLR,
   LinearLR, ExponentialLR, PolynomialLR, CosineAnnealingLR,
   CosineAnnealingWarmRestarts, CyclicLR, OneCycleLR, ReduceLROnPlateau,
@@ -650,8 +659,15 @@ third-party ML packages is not supported; within the bundled `torch`:
   `num_workers`, `pin_memory` and `persistent_workers` are accepted and
   ignored.
 - **Random numbers.** `manual_seed` and `Generator` streams are deterministic,
-  and `randperm`/`randint` follow PyTorch's CPU stream (a range of exactly
-  2**32 draws one 32-bit word per element where PyTorch draws 64 bits).
+  and `rand`, `randperm`/`randint` follow PyTorch's CPU stream (a range of
+  exactly 2**32 draws one 32-bit word per element where PyTorch draws 64
+  bits). `randn`, `normal_` and `torch.normal` (so also `nn.init.normal_`
+  and `nn.Embedding`'s initial weights) give PyTorch's float32 and float64
+  values bit for bit: Box-Muller with the cached second value below 16
+  elements, and from 16 elements the vectorised fill PyTorch's x86 builds use (float16/bfloat16 tensors of 16 or
+  more elements can differ by an ulp, and a PyTorch build without AVX2 draws
+  differently). `bernoulli` and dropout masks come from Zipp's stream (PyTorch
+  draws them through MKL), so they do not match PyTorch's masks.
   `get_state`/`set_state` and `torch.get_rng_state`/`set_rng_state` capture the
   full generator state in Zipp's own layout, not interchangeable with PyTorch's.
   `torch.poisson` draws with `torch.distributions.Poisson`'s sampler (inversion
@@ -1030,7 +1046,12 @@ int64 do not wrap.
 
 Eager float32 `matmul`/`@` accumulates each dot product in float64 and rounds
 once when storing the float32 result, so results can differ from PyTorch's
-float32 kernels (and from earlier Zipp builds) in the last bits. The GPU graph
+float32 kernels (and from earlier Zipp builds) in the last bits. Elementwise
+float32 functions likewise compute in float64 and round once, so `sqrt` is
+correctly rounded and `exp`, `tanh`, `sigmoid` are within one rounding of the
+exact value, where PyTorch's vectorised float32 kernels (SLEEF, MKL) can land
+one ulp away. Formulas follow PyTorch's where the rounding depends on them (a
+GRU's update is `(h - n) * z + n`, as PyTorch's CPU cell computes it). The GPU graph
 reference (`zipp_gpu`) keeps float32 rounding after every step, matching the
 WebGPU/WebGL2 backends. Eager float32 `sum`, `mean`, `prod` (whole and per
 dimension) and `var`/`std` likewise accumulate in float64 and round once, so

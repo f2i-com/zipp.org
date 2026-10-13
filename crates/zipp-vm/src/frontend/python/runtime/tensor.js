@@ -14,8 +14,9 @@
  *
  * A storage carries a version, bumped by every kernel that writes into an
  * existing storage (`fill`, `setitem`, `copy_into`, `setslice`, `scatter`,
- * `scatter_add`, `axpy`), so a compiled GPU result can tell whether the
- * tensors it was recorded from changed without keeping a copy to compare.
+ * `scatter_add`, `axpy`, `optim_step`), so a compiled GPU result can tell
+ * whether the tensors it was recorded from changed without keeping a copy
+ * to compare.
  */
 (function (R) {
     "use strict";
@@ -38,7 +39,7 @@
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
         N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23,
-        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29;
+        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -186,7 +187,9 @@
     }
     // Indexed loops, not for...of: these run on every kernel call, and the
     // iterator protocol is several interpreter calls per element.
-    function shapeOf(v) { if (v === null || typeof v !== "object" || v.items === undefined) fail(E.TypeError, "shape must be a tuple"); const items = v.items, out = new Array(items.length); for (let i = 0; i < items.length; i++) out[i] = Number(rt.asInt(items[i])); return out; }
+    // (`Number(rt.asInt(v))` is `Number(v)` for every v: a bool reads as 0
+    // or 1 either way, and anything else passes through `asInt` unchanged.)
+    function shapeOf(v) { if (v === null || typeof v !== "object" || v.items === undefined) fail(E.TypeError, "shape must be a tuple"); const items = v.items, out = new Array(items.length); for (let i = 0; i < items.length; i++) out[i] = Number(items[i]); return out; }
     function ints(v) { return shapeOf(v); }
     // Result shapes are torch.Size values once torch registers the type
     // (`_set_size_type`): a Tensor keeps a Size as it is, where a tuple
@@ -355,9 +358,382 @@
         }
         return false;
     }
+    // The float32/float64 add/sub/mul/div that most eager ops are, without
+    // the generic path's helper calls (each an interpreted frame): operands
+    // of one dtype (`want` null or that dtype), with equal shapes, or one
+    // of them a single element of rank no higher than the other's, or one
+    // of them the other's trailing dims (a bias). The loops are binaryTile's
+    // and binaryScalar's, element for element; from NATIVE_MIN elements the
+    // native loop runs instead, over the same pairs laid out flat (a [n]
+    // walk, or [n / k, k] for a bias of k), as `binary` would have called
+    // it. The result's shape is the operand's own shape object, as `binary`
+    // hands back. `undefined` when the case is not one of these (the caller
+    // takes `binary`).
+    const FAST_BIN = { add: 1, sub: 2, mul: 3, div: 4 };
+    function smallShape(py) {
+        // The element count of a tuple/Size of ints, or -1.
+        if (py === null || typeof py !== "object" || (py.cls !== SIZE && py.cls !== T.tuple)) return -1;
+        const it = py.items;
+        let n = 1;
+        for (let k = 0; k < it.length; k++) { const d = it[k]; if (typeof d !== "bigint") return -1; n *= Number(d); }
+        return n;
+    }
+    function onesOver(small, big) {
+        // Whether every dim of `small` is 1 and it has no more dims than `big`.
+        const it = small.items;
+        if (it.length > big.items.length) return false;
+        for (let k = 0; k < it.length; k++) if (it[k] !== 1n) return false;
+        return true;
+    }
+    function suffixOf(small, big) {
+        // Whether `small`, its leading 1s dropped, is `big`'s trailing dims
+        // and it has no more dims than `big` (suffixTile's form, with the
+        // result shaped as `big`).
+        const p = small.items, q = big.items;
+        if (p.length > q.length) return false;
+        let lead = 0;
+        while (lead < p.length && p[lead] === 1n) lead++;
+        const off = q.length - (p.length - lead);
+        for (let k = lead; k < p.length; k++) if (p[k] !== q[off + k - lead]) return false;
+        return true;
+    }
+    // binaryFast's pairs for the native loop (FAST_BIN's codes are
+    // BIN_CODE's): mode 0 equal shapes, 1 / 2 a single element on the
+    // right / left, 3 / 4 a bias of nb / na elements on the right / left.
+    function binaryFlat(code, A, B, O, mode, n, na, nb) {
+        switch (mode) {
+            case 0: return NATIVE(N_BINARY, code, A, B, O, [n], [1], [1]);
+            case 1: return NATIVE(N_BINARY, code, A, B, O, [n], [1], [0]);
+            case 2: return NATIVE(N_BINARY, code, A, B, O, [n], [0], [1]);
+            case 3: return NATIVE(N_BINARY, code, A, B, O, [n / nb, nb], [nb, 1], [0, 1]);
+            default: return NATIVE(N_BINARY, code, A, B, O, [n / na, na], [0, 1], [na, 1]);
+        }
+    }
+    function binaryFast(op, x, xpy, y, ypy, want) {
+        const code = FAST_BIN[op];
+        if (code === undefined || x === null || y === null || typeof x !== "object" || typeof y !== "object" || x.cls !== Storage || y.cls !== Storage) return undefined;
+        const dt = x.dtype;
+        if (y.dtype !== dt || (dt !== "float32" && dt !== "float64") || (want !== null && want !== dt)) return undefined;
+        if (xpy === null || ypy === null || typeof xpy !== "object" || typeof ypy !== "object" || (xpy.cls !== SIZE && xpy.cls !== T.tuple) || (ypy.cls !== SIZE && ypy.cls !== T.tuple)) return undefined;
+        const p = xpy.items, q = ypy.items;
+        let na = 1, nb = 1;
+        for (let k = 0; k < p.length; k++) { const d = p[k]; if (typeof d !== "bigint") return undefined; na *= Number(d); }
+        for (let k = 0; k < q.length; k++) { const d = q[k]; if (typeof d !== "bigint") return undefined; nb *= Number(d); }
+        if (na <= 0 || nb <= 0) return undefined;
+        const A = x.data, B = y.data;
+        if (A.length !== na || B.length !== nb) return undefined;
+        let mode = -1;
+        if (na === nb && p.length === q.length) {
+            mode = 0;
+            for (let k = 0; k < p.length; k++) if (p[k] !== q[k]) { mode = -1; break; }
+        }
+        if (mode < 0) {
+            if (nb === 1 && onesOver(ypy, xpy)) mode = 1;
+            else if (na === 1 && onesOver(xpy, ypy)) mode = 2;
+            else if (nb < na && suffixOf(ypy, xpy)) mode = 3;
+            else if (na < nb && suffixOf(xpy, ypy)) mode = 4;
+            else return undefined;
+        }
+        const n = mode === 2 || mode === 4 ? nb : na, O = dt === "float32" ? new Float32Array(n) : new Float64Array(n);
+        if (n >= NATIVE_MIN && NATIVE !== null && binaryFlat(code, A, B, O, mode, n, na, nb)) {
+            // (the native loop wrote O)
+        } else if (mode === 0) {
+            switch (code) {
+                case 1: for (let i = 0; i < n; i++) O[i] = A[i] + B[i]; break;
+                case 2: for (let i = 0; i < n; i++) O[i] = A[i] - B[i]; break;
+                case 3: for (let i = 0; i < n; i++) O[i] = A[i] * B[i]; break;
+                default: for (let i = 0; i < n; i++) O[i] = A[i] / B[i];
+            }
+        } else if (mode === 1) {
+            const v = B[0];
+            switch (code) {
+                case 1: for (let i = 0; i < n; i++) O[i] = A[i] + v; break;
+                case 2: for (let i = 0; i < n; i++) O[i] = A[i] - v; break;
+                case 3: for (let i = 0; i < n; i++) O[i] = A[i] * v; break;
+                default: for (let i = 0; i < n; i++) O[i] = A[i] / v;
+            }
+        } else if (mode === 2) {
+            const v = A[0];
+            switch (code) {
+                case 1: for (let i = 0; i < n; i++) O[i] = B[i] + v; break;
+                case 2: for (let i = 0; i < n; i++) O[i] = v - B[i]; break;
+                case 3: for (let i = 0; i < n; i++) O[i] = B[i] * v; break;
+                default: for (let i = 0; i < n; i++) O[i] = v / B[i];
+            }
+        } else if (mode === 3) {
+            switch (code) {
+                case 1: for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] + B[j]; break;
+                case 2: for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] - B[j]; break;
+                case 3: for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] * B[j]; break;
+                default: for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] / B[j];
+            }
+        } else {
+            switch (code) {
+                case 1: for (let i = 0; i < n;) for (let j = 0; j < na; j++, i++) O[i] = B[i] + A[j]; break;
+                case 2: for (let i = 0; i < n;) for (let j = 0; j < na; j++, i++) O[i] = A[j] - B[i]; break;
+                case 3: for (let i = 0; i < n;) for (let j = 0; j < na; j++, i++) O[i] = B[i] * A[j]; break;
+                default: for (let i = 0; i < n;) for (let j = 0; j < na; j++, i++) O[i] = A[j] / B[i];
+            }
+        }
+        return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, mode === 2 || mode === 4 ? ypy : xpy] };
+    }
+    // binary_scalar's small case: `t` (a float32/float64 storage of fewer
+    // than NATIVE_MIN elements, the scalar's dtype and `want` its own) op the
+    // number stored as `full` would store it, or that number op `t` (`flip`).
+    function binaryScalarFast(op, t, tpy, v, flip, sd, want) {
+        const code = FAST_BIN[op];
+        if (code === undefined || t === null || typeof t !== "object" || t.cls !== Storage) return undefined;
+        const dt = t.dtype;
+        if (sd !== dt || (dt !== "float32" && dt !== "float64") || (want !== null && want !== dt) || (typeof v !== "number" && typeof v !== "bigint")) return undefined;
+        const n = smallShape(tpy), A = t.data;
+        if (n <= 0 || A.length !== n) return undefined;
+        // (jsNumber's value of a Python float or int)
+        const v0 = typeof v === "number" ? v : Number(v), y = dt === "float32" ? Math.fround(v0) : v0, O = dt === "float32" ? new Float32Array(n) : new Float64Array(n);
+        // From NATIVE_MIN elements the native loop, with the number in a
+        // one-element array of the dtype (the storage `binary_scalar`
+        // builds for it) broadcast over a flat [n] walk.
+        if (n >= NATIVE_MIN && NATIVE !== null) {
+            const Y = dt === "float32" ? new Float32Array(1) : new Float64Array(1);
+            Y[0] = y;
+            if (flip ? NATIVE(N_BINARY, code, Y, A, O, [n], [0], [1]) : NATIVE(N_BINARY, code, A, Y, O, [n], [1], [0]))
+                return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, tpy] };
+        }
+        switch (code) {
+            case 1: for (let i = 0; i < n; i++) O[i] = flip ? y + A[i] : A[i] + y; break;
+            case 2: if (flip) for (let i = 0; i < n; i++) O[i] = y - A[i]; else for (let i = 0; i < n; i++) O[i] = A[i] - y; break;
+            case 3: for (let i = 0; i < n; i++) O[i] = flip ? y * A[i] : A[i] * y; break;
+            default: if (flip) for (let i = 0; i < n; i++) O[i] = y / A[i]; else for (let i = 0; i < n; i++) O[i] = A[i] / y;
+        }
+        return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, tpy] };
+    }
+    // One torch.optim SGD (kind 0) or Adam/AdamW (kind 1) update of a
+    // float32/float64 parameter `P` from its gradient `G`. Element by
+    // element it computes what the per-tensor composite it replaces
+    // computed (`p - grad * lr`, `exp_avg * b1 + grad * (1 - b1)`, ...):
+    // the same operations in the same order, each result rounded to the
+    // dtype as that operation's own kernel stored it, every scalar rounded
+    // to the dtype first as `binary_scalar` stores a Python number. The
+    // parameter is written in place (as `copy_into`, its version moves on);
+    // its new state comes back in new storages, as the composite's results
+    // were, the old ones untouched. `S`: the scalars, as floats.
+    //   SGD:  S = (lr, momentum, 1 - dampening, weight_decay); M the
+    //         momentum buffer (null on the first step or without
+    //         momentum); flags 1 maximize, 2 weight decay, 4 momentum,
+    //         16 nesterov. Returns (new buffer or null, null, null).
+    //   Adam: S = (b1, 1 - b1, b2, 1 - b2, sqrt(bias2), eps, step_size,
+    //         weight_decay, or 1 - lr * weight_decay when decoupled); M, V
+    //         exp_avg and exp_avg_sq, W max_exp_avg_sq (null without
+    //         amsgrad); flags 1 maximize, 2 weight decay, 4 decoupled
+    //         weight decay, 8 amsgrad. Returns (exp_avg, exp_avg_sq,
+    //         max_exp_avg_sq or null).
+    // null, with nothing written, for anything else (the caller then runs
+    // the composite).
+    function optStorage(s, dt, n) {
+        return s !== null && typeof s === "object" && s.cls === Storage && s.dtype === dt && s.base === undefined && s.data.length === n;
+    }
+    function optimStep(kind, flags, P, G, M, V, W, S) {
+        if (P === null || typeof P !== "object" || P.cls !== Storage || (P.dtype !== "float32" && P.dtype !== "float64") || P.base !== undefined) return null;
+        if ((kind !== 0n && kind !== 1n) || typeof flags !== "bigint") return null;
+        const dt = P.dtype, n = P.data.length, adam = kind === 1n, fl = Number(flags);
+        const useM = adam || (fl & 4) !== 0, useW = adam && (fl & 8) !== 0, first = useM && !adam && M === null;
+        if (!optStorage(G, dt, n) || (useM && !first ? !optStorage(M, dt, n) : M !== null) || (adam ? !optStorage(V, dt, n) : V !== null)
+            || (useW ? !optStorage(W, dt, n) : W !== null) || G === P || G.data === P.data) return null;
+        if (S === null || typeof S !== "object" || S.cls !== T.tuple || S.items.length !== (adam ? 8 : 4)) return null;
+        const f32 = dt === "float32", q = f32 ? fr : same, s = [0, 0, 0, 0, 0, 0, 0, 0];
+        for (let k = 0; k < S.items.length; k++) { const v = S.items[k]; if (typeof v !== "number") return null; s[k] = q(v); }
+        const M2 = useM ? alloc(dt, n) : null, V2 = adam ? alloc(dt, n) : null, W2 = useW ? alloc(dt, n) : null;
+        const Pd = P.data, Gd = G.data, Md = M === null ? null : M.data, Vd = adam ? V.data : null, Wd = useW ? W.data : null;
+        const Nm = M2 === null ? null : M2.data, Nv = V2 === null ? null : V2.data, Nw = W2 === null ? null : W2.data;
+        if (!(n >= NATIVE_MIN && NATIVE !== null && NATIVE(N_OPTIM, Number(kind), fl, Pd, Gd, Md, Vd, Wd, Nm, Nv, Nw, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))) {
+            const neg = (fl & 1) !== 0;
+            if (!adam) {
+                const lr = s[0], mom = s[1], damp1 = s[2], wd = s[3], decay = (fl & 2) !== 0, nest = (fl & 16) !== 0;
+                for (let i = 0; i < n; i++) {
+                    const p = Pd[i];
+                    let g = neg ? -Gd[i] : Gd[i];
+                    if (decay) g = q(g + q(p * wd));
+                    if (Nm !== null) {
+                        // (the first step's buffer is the gradient's clone)
+                        const b = first ? g : q(q(Md[i] * mom) + q(g * damp1));
+                        Nm[i] = b;
+                        g = nest ? q(g + q(b * mom)) : b;
+                    }
+                    Pd[i] = p - q(g * lr);
+                }
+            } else {
+                const b1 = s[0], ob1 = s[1], b2 = s[2], ob2 = s[3], bc2 = s[4], eps = s[5], ss = s[6], wd = s[7];
+                const coupled = (fl & 2) !== 0 && (fl & 4) === 0, decoupled = (fl & 2) !== 0 && (fl & 4) !== 0;
+                for (let i = 0; i < n; i++) {
+                    const p = Pd[i];
+                    let g = neg ? -Gd[i] : Gd[i], value = p;
+                    if (coupled) g = q(g + q(p * wd));
+                    else if (decoupled) value = q(p * wd);
+                    const m = q(q(Md[i] * b1) + q(g * ob1)), v = q(q(Vd[i] * b2) + q(q(g * g) * ob2));
+                    Nm[i] = m;
+                    Nv[i] = v;
+                    let d = v;
+                    if (Nw !== null) { const w = Wd[i]; d = (w !== w || v !== v) ? NaN : Math.max(w, v); Nw[i] = d; }
+                    Pd[i] = value - q(q(m / q(q(q(Math.sqrt(d)) / bc2) + eps)) * ss);
+                }
+            }
+        }
+        written(P);
+        return tuple([M2, V2, W2]);
+    }
+    // torch.nn's LSTM and GRU cells: the elementwise part of `_lstm_step`
+    // and `_gru_step` (chunk, sigmoid, tanh, mul, add) and of its backward,
+    // element by element as the composite's ops and their backward
+    // functions compute it: each operation in its order, with its operands
+    // in their places, rounded to the dtype (`q`) where its own kernel's
+    // store rounded it. sigmoid is `1 / (1 + Math.exp(-x))` and tanh
+    // `Math.tanh`, as `unary` computes them; a sigmoid's backward is
+    // g * (o * (1 - o)), a tanh's g * (1 - o * o), a product's the other
+    // factor times g. All storages are one float32/float64 dtype, row-major
+    // [B, k * H] gate blocks or [B, H] states; anything else answers null
+    // and the caller runs the composite. These loops are heavier per element
+    // than one op, so they go native at any size.
+    function cellOk(s, dt, n) {
+        return s !== null && typeof s === "object" && s.cls === Storage && s.dtype === dt && s.base === undefined && s.data.length === n;
+    }
+    function cellDims(G, k, Hv) {
+        // [B, k * H] gates of a float dtype: (B, H), or null.
+        if (G === null || typeof G !== "object" || G.cls !== Storage || (G.dtype !== "float32" && G.dtype !== "float64") || G.base !== undefined || typeof Hv !== "bigint") return null;
+        const H = Number(Hv), n = G.data.length;
+        if (!(H > 0) || n % (k * H) !== 0) return null;
+        return [n / (k * H), H];
+    }
+    // lstm_cell(G, C, H): G the gates [B, 4H] (i, f, g, o), C the cell state
+    // [B, H]: (c2, h2, A, T), where c2 = sigmoid(f) * c + sigmoid(i) * tanh(g),
+    // h2 = sigmoid(o) * tanh(c2), A [B, 4H] holds (sigmoid(i), sigmoid(f),
+    // tanh(g), sigmoid(o)) and T = tanh(c2).
+    function lstmCell(G, C, Hv) {
+        const dims = cellDims(G, 4, Hv);
+        if (dims === null) return null;
+        const B = dims[0], H = dims[1], dt = G.dtype, n = B * H;
+        if (!cellOk(C, dt, n)) return null;
+        const C2 = alloc(dt, n), H2 = alloc(dt, n), A = alloc(dt, 4 * n), T2 = alloc(dt, n);
+        const Gd = G.data, Cd = C.data, c2d = C2.data, h2d = H2.data, Ad = A.data, Td = T2.data, q = dt === "float32" ? fr : same;
+        if (!(NATIVE !== null && NATIVE(N_CELL, 0, H, Gd, Cd, null, null, c2d, h2d, Ad, Td))) {
+            for (let b = 0, k = 0; b < B; b++) {
+                const g0 = 4 * H * b;
+                for (let j = 0; j < H; j++, k++) {
+                    const sf = q(1 / (1 + Math.exp(-Gd[g0 + H + j])));
+                    const t1 = q(sf * Cd[k]);
+                    const si = q(1 / (1 + Math.exp(-Gd[g0 + j])));
+                    const tg = q(Math.tanh(Gd[g0 + 2 * H + j]));
+                    const c2 = q(t1 + q(si * tg));
+                    const so = q(1 / (1 + Math.exp(-Gd[g0 + 3 * H + j])));
+                    const tc = q(Math.tanh(c2));
+                    c2d[k] = c2;
+                    h2d[k] = so * tc;
+                    Ad[g0 + j] = si;
+                    Ad[g0 + H + j] = sf;
+                    Ad[g0 + 2 * H + j] = tg;
+                    Ad[g0 + 3 * H + j] = so;
+                    Td[k] = tc;
+                }
+            }
+        }
+        return tuple([C2, H2, A, T2]);
+    }
+    // lstm_cell_bw(kind, D, A, X, H, want): the gradients the composite's
+    // backward gives the gates [B, 4H] and one state. kind 1: D the
+    // gradient of c2, X the old cell state c; (dG with zeros in the o
+    // block, dc or null unless `want`). kind 2: D the gradient of h2, X the
+    // T of the forward; (dG with zeros outside the o block, dc2).
+    function lstmCellBw(kind, D, A, X, Hv, want) {
+        const dims = cellDims(A, 4, Hv);
+        if (dims === null || (kind !== 1n && kind !== 2n)) return null;
+        const B = dims[0], H = dims[1], dt = A.dtype, n = B * H;
+        if (!cellOk(D, dt, n) || !cellOk(X, dt, n)) return null;
+        const wantX = kind === 2n || want === true;
+        const DG = alloc(dt, 4 * n), DX = wantX ? alloc(dt, n) : null;
+        const Dd = D.data, Ad = A.data, Xd = X.data, dg = DG.data, dx = wantX ? DX.data : null, q = dt === "float32" ? fr : same;
+        if (!(NATIVE !== null && NATIVE(N_CELL, Number(kind), H, Dd, Ad, Xd, null, dg, dx, null, null))) {
+            for (let b = 0, k = 0; b < B; b++) {
+                const g0 = 4 * H * b;
+                for (let j = 0; j < H; j++, k++) {
+                    const g = Dd[k];
+                    if (kind === 1n) {
+                        const si = Ad[g0 + j], sf = Ad[g0 + H + j], tg = Ad[g0 + 2 * H + j];
+                        const dsf = q(g * Xd[k]), dsi = q(g * tg), dtg = q(g * si);
+                        dg[g0 + j] = q(dsi * q(si * q(1 - si)));
+                        dg[g0 + H + j] = q(dsf * q(sf * q(1 - sf)));
+                        dg[g0 + 2 * H + j] = q(dtg * q(1 - q(tg * tg)));
+                        if (dx !== null) dx[k] = g * sf;
+                    } else {
+                        const so = Ad[g0 + 3 * H + j], tc = Xd[k];
+                        const dso = q(g * tc), dtc = q(g * so);
+                        dg[g0 + 3 * H + j] = q(dso * q(so * q(1 - so)));
+                        dx[k] = q(dtc * q(1 - q(tc * tc)));
+                    }
+                }
+            }
+        }
+        return tuple([DG, DX]);
+    }
+    // gru_cell(GI, GH, H): the input and hidden gates [B, 3H] (r, z, n):
+    // (z, n, r), with r = sigmoid(i_r + h_r), z = sigmoid(i_z + h_z) and
+    // n = tanh(i_n + r * h_n).
+    function gruCell(GI, GH, Hv) {
+        const dims = cellDims(GI, 3, Hv);
+        if (dims === null) return null;
+        const B = dims[0], H = dims[1], dt = GI.dtype, n = B * H;
+        if (!cellOk(GH, dt, 3 * n) || GH === GI) return null;
+        const Z = alloc(dt, n), N = alloc(dt, n), R = alloc(dt, n);
+        const a = GI.data, h = GH.data, zd = Z.data, nd = N.data, rd = R.data, q = dt === "float32" ? fr : same;
+        if (!(NATIVE !== null && NATIVE(N_CELL, 3, H, a, h, null, null, zd, nd, rd, null))) {
+            for (let b = 0, k = 0; b < B; b++) {
+                const g0 = 3 * H * b;
+                for (let j = 0; j < H; j++, k++) {
+                    const r = q(1 / (1 + Math.exp(-q(a[g0 + j] + h[g0 + j]))));
+                    zd[k] = 1 / (1 + Math.exp(-q(a[g0 + H + j] + h[g0 + H + j])));
+                    nd[k] = Math.tanh(q(a[g0 + 2 * H + j] + q(r * h[g0 + 2 * H + j])));
+                    rd[k] = r;
+                }
+            }
+        }
+        return tuple([Z, N, R]);
+    }
+    // gru_cell_bw(kind, D, X, Y, GH, H): the gradients the composite's
+    // backward gives the input and hidden gates [B, 3H]: (dGI, dGH). kind 4:
+    // D the gradient of z, X = z (zeros outside the z blocks). kind 5: D the
+    // gradient of n, X = r, Y = n, GH the hidden gates (zeros in the z
+    // blocks).
+    function gruCellBw(kind, D, X, Y, GH, Hv) {
+        const dims = cellDims(GH, 3, Hv);
+        if (dims === null || (kind !== 4n && kind !== 5n)) return null;
+        const B = dims[0], H = dims[1], dt = GH.dtype, n = B * H;
+        if (!cellOk(D, dt, n) || !cellOk(X, dt, n) || (kind === 5n && !cellOk(Y, dt, n))) return null;
+        const DI = alloc(dt, 3 * n), DH = alloc(dt, 3 * n);
+        const Dd = D.data, Xd = X.data, Yd = kind === 5n ? Y.data : null, hd = GH.data, di = DI.data, dh = DH.data, q = dt === "float32" ? fr : same;
+        if (!(NATIVE !== null && NATIVE(N_CELL, Number(kind), H, Dd, Xd, Yd, hd, di, dh, null, null))) {
+            for (let b = 0, k = 0; b < B; b++) {
+                const g0 = 3 * H * b;
+                for (let j = 0; j < H; j++, k++) {
+                    const g = Dd[k];
+                    if (kind === 4n) {
+                        const z = Xd[k], daz = q(g * q(z * q(1 - z)));
+                        di[g0 + H + j] = daz;
+                        dh[g0 + H + j] = daz;
+                    } else {
+                        const r = Xd[k], nn = Yd[k];
+                        const dan = q(g * q(1 - q(nn * nn)));
+                        const dr = q(dan * hd[g0 + 2 * H + j]);
+                        const dar = q(dr * q(r * q(1 - r)));
+                        di[g0 + j] = dar;
+                        dh[g0 + j] = dar;
+                        di[g0 + 2 * H + j] = dan;
+                        dh[g0 + 2 * H + j] = dan * r;
+                    }
+                }
+            }
+        }
+        return tuple([DI, DH]);
+    }
     // A shape tuple the caller passed in, when the result has exactly that
     // shape: the kernel hands it back instead of building an equal one.
-    function tupleShape(v) { return v !== undefined && (v.cls === T.tuple || rt.isSubclass(v.cls, T.tuple)); }
+    function tupleShape(v) { return v !== undefined && (v.cls === SIZE || v.cls === T.tuple || rt.isSubclass(v.cls, T.tuple)); }
     // `want`: the result dtype Python's type promotion chose (null: promote
     // the operands' dtypes). The kernel computes in double precision and
     // rounds on store.
@@ -770,7 +1146,7 @@
     function unary(op, a, p1, p2) {
         let f = UN[op], lo = 0, hi = 0;
         if (op === "clamp") { lo = p1 === null ? -Infinity : jsNumber(p1); hi = p2 === null ? Infinity : jsNumber(p2); f = (x) => (x < lo ? lo : x > hi ? hi : x); }
-        const dtype = BOOL_UNARY.has(op) ? "bool" : (FLOAT_UNARY.has(op) && !isFloatDtype(a.dtype) ? "float32" : a.dtype);
+        const dtype = BOOL_UNARY.has(op) ? "bool" : (FLOAT_UNARY.has(op) && FLOAT[a.dtype] !== 1 ? "float32" : a.dtype);
         if (op === "polygamma") { const k = jsNumber(p1); f = (x) => polygamma(k, x); }
         else if (op === "sinc") { const r = dtype === "float64" ? same : Math.fround; f = (x) => sinc(x, r); }
         else if (op === "logit") {
@@ -781,7 +1157,9 @@
             else { const e = r(jsNumber(p1)), top = r(1 - e); f = (x) => { const c = x < e ? e : x > top ? top : x; return Math.log(c / r(1 - c)); }; }
         }
         if (f === undefined) fail(E.ValueError, "unknown op " + op);
-        const out = work(dtype, a.data.length), A = a.dtype === "bfloat16" ? wide(a) : a.data, O = out.data, n = O.length;
+        // (`work`, inline for a dtype that needs no scratch)
+        const out = HALF[dtype] === 1 ? work(dtype, a.data.length) : { cls: Storage, dtype: dtype, data: new ARRAY[dtype](a.data.length), version: 0, untracked: 0 };
+        const A = a.dtype === "bfloat16" ? wide(a) : a.data, O = out.data, n = O.length;
         if (n >= NATIVE_MIN && NATIVE !== null && UN_CODE[op] !== undefined && NATIVE(N_UNARY, UN_CODE[op], A, O, lo, hi)) { if (HALF[out.dtype] === 1) finish(out); return out; }
         // The hot activations and their gradients inline; the expressions
         // are the table's own.
@@ -949,6 +1327,19 @@
             if (d < 0) break;
         }
     }
+    // A[base + offset of o] = V[o]: gatherStrided's walk, storing.
+    function scatterStrided(A, V, shape, sa, base) {
+        const rank = shape.length, n = V.length;
+        if (rank === 0) { if (n) A[base] = V[0]; return; }
+        const lastN = shape[rank - 1], lastS = sa[rank - 1], idx = new Array(rank).fill(0);
+        let x = base, o = 0;
+        while (o < n) {
+            for (let k = 0, p = x; k < lastN; k++, p += lastS) A[p] = V[o++];
+            let d = rank - 2;
+            for (; d >= 0; d--) { idx[d]++; x += sa[d]; if (idx[d] < shape[d]) break; x -= sa[d] * shape[d]; idx[d] = 0; }
+            if (d < 0) break;
+        }
+    }
     // A contiguous copy of the elements a (storage offset, strides) view
     // reads: PyTorch checkpoints store non-contiguous tensors that way.
     function strided(a, shape, st, offset) {
@@ -991,15 +1382,16 @@
         for (let d = 0; d < shape.length; d++) {
             const it = d < items.length ? items[d] : null;
             if (it === null) { starts.push(0); counts.push(shape[d]); steps.push(1); keep.push(true); continue; }
-            if (rt.isInt(it)) {
-                let i = Number(rt.asInt(it)); if (i < 0) i += shape[d];
+            if (typeof it === "bigint" || typeof it === "boolean") {
+                let i = Number(it); if (i < 0) i += shape[d];
                 if (i < 0 || i >= shape[d]) fail(E.IndexError, "index " + rt.asInt(it) + " is out of bounds for dimension " + d + " with size " + shape[d]);
                 starts.push(i); counts.push(1); steps.push(1); keep.push(false); continue;
             }
+            // (`Number(rt.asInt(v))` is `Number(v)`, as in `shapeOf`)
             const parts = it.items;
-            const step = parts[2] === null ? 1 : Number(rt.asInt(parts[2]));
+            const step = parts[2] === null ? 1 : Number(parts[2]);
             if (step <= 0) fail(E.ValueError, "step must be greater than zero");
-            let start = parts[0] === null ? 0 : Number(rt.asInt(parts[0])), stop = parts[1] === null ? shape[d] : Number(rt.asInt(parts[1]));
+            let start = parts[0] === null ? 0 : Number(parts[0]), stop = parts[1] === null ? shape[d] : Number(parts[1]);
             if (start < 0) start += shape[d]; if (stop < 0) stop += shape[d];
             start = Math.min(Math.max(start, 0), shape[d]); stop = Math.min(Math.max(stop, 0), shape[d]);
             const count = Math.max(0, Math.ceil((stop - start) / step));
@@ -1022,6 +1414,14 @@
         let base = 0;
         for (let d = 0; d < shape.length; d++) { base += s.starts[d] * inS[d]; if (s.keep[d]) { outShape.push(s.counts[d]); sa.push(inS[d] * s.steps[d]); } }
         const sv = bstrides(vshape, outShape), A = a.data, V = vals(v), dt = a.dtype;
+        if (v.dtype === dt && dt !== "bfloat16" && numel(vshape) === numel(outShape) && V.length === numel(outShape)) {
+            // The values are already of the storage's dtype (castValue keeps
+            // them as they are) and not broadcast: the strided store
+            // gatherStrided's walk makes, the last dim as an inline loop.
+            scatterStrided(A, V, outShape, sa, base);
+            written(a);
+            return null;
+        }
         const cv = encoder(dt);
         forEachBroadcast(outShape, sa, sv, (o, x, y) => { A[base + x] = cv(dt, V[y]); });
         written(a);
@@ -1065,6 +1465,20 @@
         const restN = numel(rest), target = ish.concat(rest);
         const sv = bstrides(vshape, target), A = a.data, V = vals(v), dt = a.dtype, bf = dt === "bfloat16";
         const I = idx.items.map((s) => s.data);
+        if ((dt === "float32" || dt === "float64" || dt === "int64" || dt === "int32") && v.dtype === dt && numel(vshape) === numel(target) && V.length === numel(target)) {
+            // Values of the storage's dtype, not broadcast: the walk below
+            // in the same order, without its closure per element. castValue
+            // of the sum is what the typed-array store keeps for these
+            // dtypes (an int64/int32 sum of integers is one).
+            const nIdx = numel(ish);
+            for (let i = 0, y = 0; i < nIdx; i++) {
+                let base = 0;
+                for (let d = 0; d < k; d++) { let j = I[d][i]; if (j < 0) j += shape[d]; if (j < 0 || j >= shape[d]) fail(E.IndexError, "index out of bounds"); base += j * inS[d]; }
+                for (let r = 0; r < restN; r++, y++) A[base + r] = A[base + r] + V[y];
+            }
+            written(a);
+            return null;
+        }
         forEachBroadcast(target, new Array(target.length).fill(0), sv, (o, x, y) => {
             const i = Math.floor(o / restN), r = o - i * restN;
             let base = 0;
@@ -1883,7 +2297,10 @@
     }
     // ---- random: MT19937, with PyTorch's CPU transforms ------------------------------------------
     function mt(seed) {
-        const s = { mt: new Uint32Array(624), i: 625 };
+        // `nd`: the second value of the last Box-Muller pair of PyTorch's
+        // scalar normal path (CPUGeneratorImpl's next_double_normal_sample),
+        // null when there is none.
+        const s = { mt: new Uint32Array(624), i: 625, nd: null };
         seedMt(s, seed >>> 0);
         return s;
     }
@@ -1892,39 +2309,62 @@
         for (let i = 1; i < 624; i++) { const prev = m[i - 1] ^ (m[i - 1] >>> 30); m[i] = (Math.imul(1812433253, prev) + i) >>> 0; }
         s.i = 624;
     }
-    function next32(s) {
+    function mtTwist(s) {
         const m = s.mt;
-        if (s.i >= 624) {
-            for (let k = 0; k < 624; k++) {
-                const y = (m[k] & 0x80000000) | (m[(k + 1) % 624] & 0x7fffffff);
-                m[k] = (m[(k + 397) % 624] ^ (y >>> 1) ^ ((y & 1) ? 0x9908b0df : 0)) >>> 0;
-            }
-            s.i = 0;
+        for (let k = 0; k < 624; k++) {
+            const y = (m[k] & 0x80000000) | (m[(k + 1) % 624] & 0x7fffffff);
+            m[k] = (m[(k + 397) % 624] ^ (y >>> 1) ^ ((y & 1) ? 0x9908b0df : 0)) >>> 0;
         }
-        let y = m[s.i++];
+        s.i = 0;
+    }
+    function next32(s) {
+        if (s.i >= 624) mtTwist(s);
+        let y = s.mt[s.i++];
         y ^= y >>> 11; y ^= (y << 7) & 0x9d2c5680; y ^= (y << 15) & 0xefc60000; y ^= y >>> 18;
         return y >>> 0;
     }
+    // `n` words of next32 into W (a Uint32Array), the generator inline.
+    function next32Into(s, W, n) {
+        const m = s.mt;
+        for (let i = 0; i < n; i++) {
+            if (s.i >= 624) mtTwist(s);
+            let y = m[s.i++];
+            y ^= y >>> 11; y ^= (y << 7) & 0x9d2c5680; y ^= (y << 15) & 0xefc60000; y ^= y >>> 18;
+            W[i] = y;
+        }
+    }
     // A uniform double in [0, 1) from 53 bits, as torch's random64 path.
-    function nextDouble(s) { const hi = next32(s), lo = next32(s); const v = (hi * 4294967296 + lo) % 9007199254740992; return v / 9007199254740992; }
+    // (hi * 2**32 + lo) % 2**53, exactly: the low 21 bits of `hi` (the sum
+    // with all of `hi` passes 2**53 and would round before the remainder).
+    function nextDouble(s) { const hi = next32(s), lo = next32(s); return ((hi & 0x1fffff) * 4294967296 + lo) / 9007199254740992; }
     const Gen = rt.newType("Generator", [rt.ObjectType], new Map(), "_zipp_tensor");
     function genNew(seed) { return { cls: Gen, dict: new Map(), state: mt(Number(BigInt.asUintN(32, BigInt(seed)))), seed: BigInt(seed) }; }
     // A generator's whole state as a uint8 storage: the 624 MT words, the
-    // position (little-endian uint32 each) and the 64-bit seed.
+    // position (little-endian uint32 each), the 64-bit seed, then a flag
+    // byte and the cached normal (a float64) when the flag is 1. A state
+    // without the last nine bytes (an earlier build's) has no cached normal.
+    const STATE_BYTES = 624 * 4 + 4 + 8, STATE_BYTES_NORMAL = STATE_BYTES + 1 + 8;
     function genGetState(g) {
-        const s = needGen(g), out = alloc("uint8", 624 * 4 + 4 + 8), v = new DataView(out.data.buffer);
+        const s = needGen(g), out = alloc("uint8", STATE_BYTES_NORMAL), v = new DataView(out.data.buffer);
         for (let i = 0; i < 624; i++) v.setUint32(i * 4, s.mt[i], true);
         v.setUint32(624 * 4, s.i, true);
         v.setBigUint64(624 * 4 + 4, BigInt.asUintN(64, g.seed), true);
+        if (s.nd !== null && s.nd !== undefined) { v.setUint8(STATE_BYTES, 1); v.setFloat64(STATE_BYTES + 1, s.nd, true); }
         return out;
     }
     function genSetState(g, st) {
         needGen(g); needS(st);
-        if (st.data.length !== 624 * 4 + 4 + 8) fail(E.RuntimeError, "Expected a generator state of " + (624 * 4 + 4 + 8) + " bytes, got " + st.data.length);
-        const bytes = Uint8Array.from(st.data), v = new DataView(bytes.buffer), mtState = { mt: new Uint32Array(624), i: 0 };
+        const len = st.data.length;
+        if (len !== STATE_BYTES && len !== STATE_BYTES_NORMAL) fail(E.RuntimeError, "Expected a generator state of " + STATE_BYTES_NORMAL + " bytes, got " + len);
+        const bytes = Uint8Array.from(st.data), v = new DataView(bytes.buffer), mtState = { mt: new Uint32Array(624), i: 0, nd: null };
         for (let i = 0; i < 624; i++) mtState.mt[i] = v.getUint32(i * 4, true);
         mtState.i = v.getUint32(624 * 4, true);
         if (mtState.i > 624) fail(E.RuntimeError, "invalid generator state");
+        if (len === STATE_BYTES_NORMAL) {
+            const flag = v.getUint8(STATE_BYTES);
+            if (flag > 1) fail(E.RuntimeError, "invalid generator state");
+            if (flag === 1) mtState.nd = v.getFloat64(STATE_BYTES + 1, true);
+        }
         g.state = mtState; g.seed = v.getBigUint64(624 * 4 + 4, true);
         return null;
     }
@@ -1932,10 +2372,11 @@
     function rand(g, n, dtype) {
         // float32 uniform from 24 random bits, as torch's uniform_ for float;
         // float16 from 11 and bfloat16 from 8 (their mantissa digits).
-        const s = needGen(g), out = work(dtype, n), O = out.data;
-        if (dtype === "float16") for (let i = 0; i < n; i++) O[i] = (next32(s) & 0x7ff) * 0.00048828125;
-        else if (dtype === "bfloat16") for (let i = 0; i < n; i++) O[i] = (next32(s) & 0xff) * 0.00390625;
-        else for (let i = 0; i < n; i++) O[i] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
+        const s = needGen(g), out = work(dtype, n), O = out.data, W = new Uint32Array(n);
+        next32Into(s, W, n);
+        if (dtype === "float16") for (let i = 0; i < n; i++) O[i] = (W[i] & 0x7ff) * 0.00048828125;
+        else if (dtype === "bfloat16") for (let i = 0; i < n; i++) O[i] = (W[i] & 0xff) * 0.00390625;
+        else for (let i = 0; i < n; i++) O[i] = (W[i] & 0xffffff) * 5.9604644775390625e-8;
         return finish(out);
     }
     function randDouble(g, n) {
@@ -1943,14 +2384,159 @@
         for (let i = 0; i < n; i++) O[i] = nextDouble(s);
         return out;
     }
-    function randn(g, n, dtype) {
-        // Box-Muller on doubles; pairs, as torch's normal_ (scalar path).
+    // PyTorch's CPU normal_ (aten/src/ATen/native/cpu/DistributionTemplates.h,
+    // normal_kernel), mean and std included:
+    // - fewer than 16 elements: at::normal_distribution<double> per
+    //   element, a Box-Muller pair from two 53-bit uniforms whose second
+    //   value the generator keeps for the next draw (`nd`), then
+    //   value * std + mean in double;
+    // - 16 or more: normal_fill, which first fills the tensor with uniforms
+    //   of its own dtype (24 bits for float32, 53 for float64, 11 and 8 for
+    //   float16 and bfloat16), turns each block of 16 into normals in that
+    //   dtype's arithmetic (u1 = 1 - x[j], u2 = x[j + 8]) and, when the size
+    //   is no multiple of 16, draws the last 16 again and redoes them.
+    // The block arithmetic rounds where PyTorch's scalar_t would; its
+    // log/cos/sin are this engine's, so a value can differ from a given
+    // PyTorch build's vectorised ones in the last bit or two (the scalar
+    // path agrees exactly).
+    function normalDouble(s) {
+        const c = s.nd;
+        if (c !== null && c !== undefined) { s.nd = null; return c; }
+        const u1 = nextDouble(s), u2 = nextDouble(s);
+        const r = Math.sqrt(-2 * Math.log1p(-u2)), theta = 2 * Math.PI * u1;
+        s.nd = r * Math.sin(theta);
+        return r * Math.cos(theta);
+    }
+    // How a value is stored in the dtype (`rs`, scalar_t) and how an
+    // arithmetic result in it is rounded (`ro`): float16/bfloat16 compute in
+    // float32 and round to the format on assignment.
+    function storeRound(dtype) {
+        return dtype === "float32" ? Math.fround : dtype === "float16" ? (x) => f16(Math.fround(x)) : dtype === "bfloat16" ? (x) => bf16(Math.fround(x)) : (x) => x;
+    }
+    function normalBlock(D, b, rs, ro, mean, std) {
+        for (let j = 0; j < 8; j++) {
+            const u1 = rs(1 - D[b + j]), u2 = D[b + j + 8];
+            const radius = rs(ro(Math.sqrt(ro(-2 * ro(Math.log(u1))))));
+            const theta = rs(2 * Math.PI * u2);
+            D[b + j] = rs(ro(ro(ro(radius * ro(Math.cos(theta))) * std) + mean));
+            D[b + j + 8] = rs(ro(ro(ro(radius * ro(Math.sin(theta))) * std) + mean));
+        }
+    }
+    // A float32 normal_ of 16 or more elements is PyTorch's normal_fill_AVX2
+    // (aten/src/ATen/native/cpu/DistributionKernels.cpp), which x86-64 builds
+    // run: 2*pi rounded to float32, log and sincos by the Cephes polynomials
+    // of avx_mathfun.h, every operation in float32 (Math.fround after each),
+    // and value * std + mean as one fused multiply-add. Its results agree
+    // with PyTorch 2.11's bit for bit (checked on 5360 draws); a build
+    // without AVX2 (or not on x86-64) uses the plain float loop instead.
+    const fr = Math.fround;
+    const AVX = {
+        SQRTHF: fr(0.707106781186547524), MIN_NORM: fr(1.17549435e-38),
+        P: [7.0376836292E-2, -1.1514610310E-1, 1.1676998740E-1, -1.2420140846E-1, 1.4249322787E-1, -1.6668057665E-1, 2.0000714765E-1, -2.4999993993E-1, 3.3333331174E-1].map(fr),
+        Q1: fr(-2.12194440e-4), Q2: fr(0.693359375),
+        DP1: fr(-0.78515625), DP2: fr(-2.4187564849853515625e-4), DP3: fr(-3.77489497744594108e-8),
+        S0: fr(-1.9515295891E-4), S1: fr(8.3321608736E-3), S2: fr(-1.6666654611E-1),
+        C0: fr(2.443315711809948E-005), C1: fr(-1.388731625493765E-003), C2: fr(4.166664568298827E-002),
+        FOPI: fr(1.27323954473516), TWO_PI: fr(2 * Math.PI),
+    };
+    // log256_ps for one positive float32 lane.
+    function avxLog(x) {
+        if (x < AVX.MIN_NORM) x = AVX.MIN_NORM;
+        BF_F[0] = x;
+        const u = BF_U[0];
+        let e = (u >>> 23) - 0x7f;
+        BF_U[0] = (u & 0x807fffff) | 0x3f000000;
+        let v = BF_F[0];
+        e = fr(e + 1);
+        const below = v < AVX.SQRTHF, tmp = below ? v : 0;
+        v = fr(v - 1);
+        e = fr(e - (below ? 1 : 0));
+        v = fr(v + tmp);
+        const z = fr(v * v), P = AVX.P;
+        let y = P[0];
+        for (let k = 1; k < 9; k++) { y = fr(y * v); y = fr(y + P[k]); }
+        y = fr(y * v);
+        y = fr(y * z);
+        y = fr(y + fr(e * AVX.Q1));
+        y = fr(y - fr(z * 0.5));
+        v = fr(v + y);
+        return fr(v + fr(e * AVX.Q2));
+    }
+    // sincos256_ps for one float32 lane: [sin, cos].
+    const SINCOS = [0, 0];
+    function avxSincos(x) {
+        let negSin = x < 0;
+        x = Math.abs(x);
+        let j = Math.trunc(fr(x * AVX.FOPI)) | 0;
+        j = (j + 1) & ~1;
+        const y = j, swapSin = (j & 4) !== 0, firstPoly = (j & 2) === 0;
+        x = fr(x + fr(y * AVX.DP1));
+        x = fr(x + fr(y * AVX.DP2));
+        x = fr(x + fr(y * AVX.DP3));
+        const negCos = (~(j - 2) & 4) !== 0;
+        negSin = negSin !== swapSin;
+        const z = fr(x * x);
+        let yc = fr(AVX.C0 * z);
+        yc = fr(yc + AVX.C1); yc = fr(yc * z); yc = fr(yc + AVX.C2); yc = fr(yc * z); yc = fr(yc * z);
+        yc = fr(yc - fr(z * 0.5));
+        yc = fr(yc + 1);
+        let ys = fr(AVX.S0 * z);
+        ys = fr(ys + AVX.S1); ys = fr(ys * z); ys = fr(ys + AVX.S2); ys = fr(ys * z); ys = fr(ys * x);
+        ys = fr(ys + x);
+        const sin2 = firstPoly ? ys : 0, sin1 = firstPoly ? 0 : yc;
+        const s = fr(sin1 + sin2), c = fr(fr(yc - sin1) + fr(ys - sin2));
+        SINCOS[0] = negSin ? -s : s;
+        SINCOS[1] = negCos ? -c : c;
+        return SINCOS;
+    }
+    // fround(a * b + c) rounded once (the fused multiply-add), for float32
+    // a, b, c: the product is exact in a double, and the sum's rounding
+    // error decides an exact half-way case.
+    function fmaF(a, b, c) {
+        const p = a * b, t = p + c, r = fr(t), d = t - r;
+        if (d === 0) return r;
+        const other = r + 2 * d;
+        if (fr(other) !== other) return r;
+        const bb = t - p, e = (p - (t - bb)) + (c - bb);
+        return e === 0 || (e > 0) !== (d > 0) ? r : other;
+    }
+    function avxBlock(D, b, mean, std) {
+        for (let j = 0; j < 8; j++) {
+            const u1 = fr(1 - D[b + j]), u2 = D[b + j + 8];
+            const radius = fr(Math.sqrt(fr(-2 * avxLog(u1))));
+            const sc = avxSincos(fr(AVX.TWO_PI * u2));
+            const n1 = fr(radius * sc[1]), n2 = fr(radius * sc[0]);
+            D[b + j] = fmaF(n1, std, mean);
+            D[b + j + 8] = fmaF(n2, std, mean);
+        }
+    }
+    function randn(g, n, dtype, mean, std) {
         const s = needGen(g), out = work(dtype, n), O = out.data;
-        for (let i = 0; i < n; i += 2) {
-            const u1 = 1 - nextDouble(s), u2 = nextDouble(s);
-            const r = Math.sqrt(-2 * Math.log(u1)), t = 2 * Math.PI * u2;
-            O[i] = r * Math.cos(t);
-            if (i + 1 < n) O[i + 1] = r * Math.sin(t);
+        if (n < 16) {
+            for (let i = 0; i < n; i++) O[i] = normalDouble(s) * std + mean;
+        } else if (dtype === "float32") {
+            const D = new Float64Array(n), mn = fr(mean), sd = fr(std);
+            for (let i = 0; i < n; i++) D[i] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
+            for (let b = 0; b + 16 <= n; b += 16) avxBlock(D, b, mn, sd);
+            if (n % 16 !== 0) {
+                const b = n - 16;
+                for (let k = 0; k < 16; k++) D[b + k] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
+                avxBlock(D, b, mn, sd);
+            }
+            for (let i = 0; i < n; i++) O[i] = D[i];
+        } else {
+            const rs = storeRound(dtype), ro = dtype === "float64" ? (x) => x : Math.fround, D = dtype === "float64" ? O : new Float64Array(n);
+            const bits = dtype === "float16" ? 0x7ff : dtype === "bfloat16" ? 0xff : 0xffffff, scale = dtype === "float16" ? 0.00048828125 : dtype === "bfloat16" ? 0.00390625 : 5.9604644775390625e-8;
+            const uniform = dtype === "float64" ? () => nextDouble(s) : () => (next32(s) & bits) * scale;
+            const mn = rs(mean), sd = rs(std);
+            for (let i = 0; i < n; i++) D[i] = uniform();
+            for (let b = 0; b + 16 <= n; b += 16) normalBlock(D, b, rs, ro, mn, sd);
+            if (n % 16 !== 0) {
+                const b = n - 16;
+                for (let k = 0; k < 16; k++) D[b + k] = uniform();
+                normalBlock(D, b, rs, ro, mn, sd);
+            }
+            if (D !== O) for (let i = 0; i < n; i++) O[i] = D[i];
         }
         { if (HALF[out.dtype] === 1) finish(out); return out; }
     }
@@ -2811,7 +3397,20 @@
         // arange(dtype, start, step, n): element i is castValue(start + i * step),
         // what from_flat gives for the list torch builds (torch.arange checks
         // that the double arithmetic is exact or is Python's float arithmetic).
-        fn("arange", 4, (a) => { const s = alloc(rt.needStr(a[0]), num(a[3])), O = s.data, d = s.dtype, st = num(a[1]), step = num(a[2]), n = O.length, cv = encoder(d); for (let i = 0; i < n; i++) O[i] = cv(d, st + i * step); return s; });
+        fn("arange", 4, (a) => {
+            const s = alloc(rt.needStr(a[0]), num(a[3])), O = s.data, d = s.dtype, st = num(a[1]), step = num(a[2]), n = O.length;
+            // float32/float64 store what castValue returns (a Float32Array
+            // store is Math.fround); int64/int32 with integer start and step
+            // hold integers Math.trunc keeps (torch.arange checks they are exact).
+            if (d === "float32" || d === "float64" || ((d === "int64" || d === "int32") && Number.isInteger(st) && Number.isInteger(step))) {
+                if (n >= NATIVE_MIN && NATIVE !== null && NATIVE(N_ARANGE, O, st, step)) return s;
+                for (let i = 0; i < n; i++) O[i] = st + i * step;
+                return s;
+            }
+            const cv = encoder(d);
+            for (let i = 0; i < n; i++) O[i] = cv(d, st + i * step);
+            return s;
+        });
         fn("_set_size_type", 1, (a) => { SIZE = a[0]; return null; });
         // _shape_eq(a, b): tuple equality of two shapes (tuples or Sizes of
         // ints), without the rich-comparison dispatch of a tuple subclass.
@@ -2873,6 +3472,111 @@
         // total `version` above still is.
         fn("aversion", 1, (a) => { const s = root(needSC(a[0])); return BigInt(s.version - s.untracked); });
         fn("untrack", 1, (a) => { root(needSC(a[0])).untracked++; return null; });
+        // aversions_ok(saved): whether every (storage, version, tensor) entry
+        // of an autograd node's saved list still has that version (what
+        // `aversion` would answer), in one call; false for anything else,
+        // and the caller then checks entry by entry.
+        fn("aversions_ok", 1, (a) => {
+            const list = a[0];
+            if (list === null || typeof list !== "object" || list.items === undefined) return false;
+            const items = list.items;
+            for (let i = 0; i < items.length; i++) {
+                const e = items[i];
+                if (e === null || typeof e !== "object" || e.items === undefined || e.items.length < 2) return false;
+                let s = e.items[0];
+                if (s === null || typeof s !== "object" || (s.cls !== Storage && s.cls !== CStorage)) return false;
+                if (s.base !== undefined) s = s.base;
+                const v = e.items[1];
+                if (typeof v !== "bigint" || BigInt(s.version - s.untracked) !== v) return false;
+            }
+            return true;
+        });
+        // nll_pick(lp, shape, target, ignore_index): -lp[i, target[i]] for
+        // each row of a float32/float64 [n, c] storage and an int64 [n]
+        // target (the advanced index and negation cross_entropy's general
+        // path builds, element for element), or null when a target is
+        // ignore_index or outside [0, c), or anything else is unusual: the
+        // caller's general path then masks, raises or handles it.
+        fn("nll_pick", 4, (a) => {
+            const lp = a[0], t = a[2];
+            if (!isStorage(lp) || !isStorage(t) || (lp.dtype !== "float32" && lp.dtype !== "float64") || t.dtype !== "int64") return null;
+            const sh = shapeOf(a[1]);
+            if (sh.length !== 2) return null;
+            const n = sh[0], c = sh[1], ig = a[3];
+            if (typeof ig !== "bigint" || t.data.length !== n || lp.data.length !== n * c || n === 0) return null;
+            const igv = Number(ig), out = alloc(lp.dtype, n), O = out.data, L = lp.data, Td = t.data;
+            for (let i = 0; i < n; i++) {
+                const k = Td[i];
+                if (k === igv || !(k >= 0 && k < c)) return null;
+                O[i] = -L[i * c + k];
+            }
+            return out;
+        });
+        // _unbroadcast_dims(gshape, shape): for two tuples/Sizes of ints, the
+        // dims `_unbroadcast` sums (the leading ones, then each dim `shape`
+        // has as 1 where `gshape` has not) as a list; null for anything else.
+        fn("_unbroadcast_dims", 2, (a) => {
+            const g = a[0], t = a[1];
+            if (g === null || t === null || typeof g !== "object" || typeof t !== "object" || g.items === undefined || t.items === undefined) return null;
+            if ((g.cls !== SIZE && g.cls !== T.tuple) || (t.cls !== SIZE && t.cls !== T.tuple)) return null;
+            const p = g.items, q = t.items, extra = p.length - q.length;
+            if (extra < 0) return null;
+            const out = [];
+            for (let i = 0; i < p.length; i++) if (typeof p[i] !== "bigint") return null;
+            for (let i = 0; i < q.length; i++) if (typeof q[i] !== "bigint") return null;
+            for (let i = 0; i < extra; i++) out.push(BigInt(i));
+            for (let i = 0; i < q.length; i++) if (q[i] === 1n && p[extra + i] !== 1n) out.push(BigInt(extra + i));
+            return list(out);
+        });
+        // _shape_args(args): torch's `_shape_args` for its common forms, a
+        // tuple of plain ints or one tuple/list/Size of them (as a tuple, the
+        // argument itself when it already is one); null for anything else.
+        fn("_shape_args", 1, (a) => {
+            let v = a[0];
+            if (v === null || typeof v !== "object" || v.items === undefined || v.cls !== T.tuple) return null;
+            if (v.items.length === 1) {
+                const s0 = v.items[0];
+                if (s0 !== null && typeof s0 === "object") {
+                    if (s0.cls !== T.tuple && s0.cls !== T.list && s0.cls !== SIZE) return null;
+                    v = s0;
+                }
+            }
+            const it = v.items;
+            for (let i = 0; i < it.length; i++) if (typeof it[i] !== "bigint") return null;
+            return v.cls === T.tuple ? v : tuple(it.slice());
+        });
+        // _dicts_empty(a, b, c, d): whether all four dicts (or dict-subclass
+        // instances, OrderedDict among them, whose classes define no
+        // __len__ or __bool__ of their own) are empty, as their truth says;
+        // null when one is anything else.
+        fn("_dicts_empty", 4, (a) => {
+            let empty = true;
+            for (let i = 0; i < 4; i++) {
+                const d = a[i];
+                if (d === null || typeof d !== "object" || typeof d.size !== "number" || d.map === undefined) return null;
+                const c = d.cls;
+                if (c !== T.dict) {
+                    const m = c === undefined || c === null ? undefined : c.mro;
+                    if (!Array.isArray(m)) return null;
+                    for (let j = 0; j < m.length; j++) {
+                        const k = m[j];
+                        if (k !== T.dict && k !== rt.ObjectType && (k.dict.has("__len__") || k.dict.has("__bool__"))) return null;
+                    }
+                }
+                if (d.size !== 0) empty = false;
+            }
+            return empty;
+        });
+        // _numel(shape): the product of a tuple's or list's ints (Python
+        // ints, exact), or null for anything else (the caller multiplies).
+        fn("_numel", 1, (a) => {
+            const v = a[0];
+            if (v === null || typeof v !== "object" || v.items === undefined) return null;
+            const items = v.items;
+            let n = 1n;
+            for (let i = 0; i < items.length; i++) { const d = items[i]; if (typeof d !== "bigint") return null; n *= d; }
+            return n;
+        });
         fn("all_finite", 1, (a) => { const s = a[0]; return isStorage(s) ? allFinite(s) : allFinite(realOf(needC(s))); });
         // _native(on): switch the native loops (`vm::py_tensor`) on or off,
         // returning whether they were on; for comparing the two paths.
@@ -2926,6 +3630,9 @@
         // storage exactly as `full` stores it (`flip`: the number is the
         // left operand), so no 0-d tensor has to be built for it.
         fn("binary_scalar", 7, (a) => {
+            const fast = typeof a[0] === "string" && typeof a[4] === "string" && (a[5] === null || typeof a[5] === "string")
+                && typeof a[6] === "boolean" ? binaryScalarFast(a[0], a[1], a[2], a[3], a[6], a[4], a[5]) : undefined;
+            if (fast !== undefined) return fast;
             const sd = rt.needStr(a[4]), t = a[1], want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
             if (sd.length <= 8 && isStorage(t)) {
                 const s = alloc(sd, 1);
@@ -2939,11 +3646,18 @@
             return rt.truth(a[6]) ? cbinary(rt.needStr(a[0]), s, [], t, shapeOf(a[2]), want) : cbinary(rt.needStr(a[0]), t, shapeOf(a[2]), s, [], want);
         });
         fn("binary", 6, (a) => {
+            const fast = typeof a[0] === "string" && (a[5] === undefined || a[5] === null || typeof a[5] === "string")
+                ? binaryFast(a[0], a[1], a[2], a[3], a[4], a[5] === undefined ? null : a[5]) : undefined;
+            if (fast !== undefined) return fast;
             const x = a[1], y = a[3], want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
             if (isStorage(x) && isStorage(y) && (want === null || want.length <= 8)) return binary(rt.needStr(a[0]), x, shapeOf(a[2]), y, shapeOf(a[4]), a[2], a[4], want);
             return cbinary(rt.needStr(a[0]), needC(x), shapeOf(a[2]), needC(y), shapeOf(a[4]), want);
         }, 5);
-        fn("unary", 4, (a) => { const x = a[1]; return isStorage(x) ? unary(rt.needStr(a[0]), x, a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]) : cunary(rt.needStr(a[0]), needC(x)); }, 2);
+        fn("unary", 4, (a) => {
+            const x = a[1], op = a[0];
+            if (typeof op === "string" && x !== null && typeof x === "object" && x.cls === Storage) return unary(op, x, a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]);
+            return isStorage(x) ? unary(rt.needStr(a[0]), x, a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]) : cunary(rt.needStr(a[0]), needC(x));
+        }, 2);
         fn("reduce", 6, (a) => { const x = a[1]; return isStorage(x) ? reduce(rt.needStr(a[0]), x, shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])) : creduce(rt.needStr(a[0]), needC(x), shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])); }, 5);
         // The copying kernels on a complex storage: the same kernel over
         // its real memory with a trailing dimension of 2.
@@ -3064,7 +3778,8 @@
         fn("gen_initial_seed", 1, (a) => a[0].seed);
         fn("rand", 3, (a) => rand(a[0], num(a[1]), a[2] === undefined ? "float32" : rt.needStr(a[2])), 2);
         fn("rand_double", 2, (a) => randDouble(a[0], num(a[1])));
-        fn("randn", 3, (a) => randn(a[0], num(a[1]), rt.needStr(a[2])));
+        // randn(gen, n, dtype, mean=0, std=1)
+        fn("randn", 5, (a) => randn(a[0], num(a[1]), rt.needStr(a[2]), a[3] === undefined ? 0 : num(a[3]), a[4] === undefined ? 1 : num(a[4])), 3);
         fn("randint", 4, (a) => randint(a[0], num(a[1]), num(a[2]), num(a[3])));
         fn("multinomial", 5, (a) => multinomial(a[0], needS(a[1]), shapeOf(a[2]), num(a[3]), rt.truth(a[4])));
         fn("randperm", 2, (a) => randperm(a[0], num(a[1])));
@@ -3074,6 +3789,15 @@
         // zlib's CRC-32 of a bytes object, for zipfile (torch.save checkpoints).
         fn("crc32", 2, (a) => BigInt(rt.crc32(a[0].items, a[1] === undefined ? 0 : num(a[1]))), 1);
         fn("dot_sum", 2, (a) => { const x = vals(needS(a[0])), y = vals(needS(a[1])); let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; });
+        // optim_step(kind, flags, P, G, M, V, W, scalars): `optimStep`; the
+        // new state storages, or None when it did not run (nothing written).
+        fn("optim_step", 8, (a) => optimStep(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]));
+        // The fused recurrent cells (`lstmCell`, `gruCell` and their backward):
+        // each answers its storages, or None (the caller runs the composite).
+        fn("lstm_cell", 3, (a) => lstmCell(a[0], a[1], a[2]));
+        fn("lstm_cell_bw", 6, (a) => lstmCellBw(a[0], a[1], a[2], a[3], a[4], a[5]));
+        fn("gru_cell", 3, (a) => gruCell(a[0], a[1], a[2]));
+        fn("gru_cell_bw", 6, (a) => gruCellBw(a[0], a[1], a[2], a[3], a[4], a[5]));
         fn("axpy", 3, (a) => {
             const alpha = num(a[0]), xs = a[1], ys = a[2];
             if (!isStorage(xs) || !isStorage(ys)) {

@@ -246,17 +246,17 @@ def _dims_and_sizes(x, s, dim, default_all):
         if s is None:
             dims = list(_range(x.ndim)) if default_all else [x.ndim - 2, x.ndim - 1]
         else:
-            dims = list(_range(x.ndim - _len(s), x.ndim))
+            dims = list(_range(x.ndim - len(s), x.ndim))
     elif isinstance(dim, _int):
         dims = [dim]
     else:
         dims = list(dim)
     dims = [_dim(x, d) for d in dims]
-    if _len(set(dims)) != _len(dims):
+    if len(set(dims)) != len(dims):
         raise RuntimeError("FFT dims must be unique")
     if s is not None:
         s = list(s)
-        if _len(s) != _len(dims):
+        if len(s) != len(dims):
             raise RuntimeError("When given, dim and shape arguments must have the same length")
         sizes = [x.shape[d] if v == -1 else _int(v) for d, v in zip(dims, s)]
     else:
@@ -354,7 +354,7 @@ def _dims_and_sizes_c2r(x, s, dim, default_all):
         if s is None:
             dims = list(_range(x.ndim)) if default_all else [x.ndim - 2, x.ndim - 1]
         else:
-            dims = list(_range(x.ndim - _len(s), x.ndim))
+            dims = list(_range(x.ndim - len(s), x.ndim))
     elif isinstance(dim, _int):
         dims = [dim]
     else:
@@ -362,16 +362,16 @@ def _dims_and_sizes_c2r(x, s, dim, default_all):
     dims = [_dim(x, d) for d in dims]
     if not dims:
         raise RuntimeError("irfftn must transform at least one axis")
-    if _len(set(dims)) != _len(dims):
+    if len(set(dims)) != len(dims):
         raise RuntimeError("FFT dims must be unique")
     if s is not None:
         s = list(s)
-        if _len(s) != _len(dims):
+        if len(s) != len(dims):
             raise RuntimeError("When given, dim and shape arguments must have the same length")
         sizes = [_int(v) for v in s]
         for i, d in enumerate(dims):
             if sizes[i] == -1:
-                sizes[i] = 2 * (x.shape[d] - 1) if i == _len(dims) - 1 else x.shape[d]
+                sizes[i] = 2 * (x.shape[d] - 1) if i == len(dims) - 1 else x.shape[d]
     else:
         sizes = [x.shape[d] for d in dims]
         sizes[-1] = 2 * (x.shape[dims[-1]] - 1)

@@ -12,6 +12,14 @@ baseline Zipp's) on every run.
     py -3.13 tools/python_bench.py --zipp old.exe --zipp-b new.exe --reps 7
     py -3.13 tools/python_bench.py --zipp zipp.exe --no-cpython --group macro
     py -3.13 tools/python_bench.py --zipp zipp.exe --only dict --reps 3
+    py -3.13 tools/python_bench.py --zipp zipp.exe --no-cpython --only torch --torch-cpython "py -3.11" --warm 5
+
+`--torch-cpython CMD` adds a reference engine, `torch`: the zipp-only programs
+that import torch run under a CPython with real PyTorch (one thread unless
+`--torch-threads` says otherwise). `--warm N` runs each program's timed tail N
+times in one process, for every engine, and times the warm runs (PyTorch's
+first call in a process pays for its kernel initialisation); the first run's
+time is kept as the cold one.
 
 Ratios and geometric means use the in-process work time by default
 (`--metric work`); wall time, which adds process start and Zipp's runtime
@@ -34,10 +42,12 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,12 +70,22 @@ STDERR_TAIL_CHARS = 2000
 ENGINE_ZIPP = "zipp"
 ENGINE_ZIPP_B = "zipp-b"
 ENGINE_CPYTHON = "cpython"
+# A CPython with PyTorch, timing the zipp-only torch programs (--torch-cpython).
+ENGINE_TORCH = "torch"
 # (label, numerator engine, denominator engine)
 RATIO_PAIRS = (
     ("zipp/cpython", ENGINE_ZIPP, ENGINE_CPYTHON),
     ("zipp-b/zipp", ENGINE_ZIPP_B, ENGINE_ZIPP),
     ("zipp-b/cpython", ENGINE_ZIPP_B, ENGINE_CPYTHON),
+    ("zipp/torch", ENGINE_ZIPP, ENGINE_TORCH),
+    ("zipp-b/torch", ENGINE_ZIPP_B, ENGINE_TORCH),
 )
+DEFAULT_TORCH_THREADS = 1
+# The line every benchmark's timed tail starts with (`--warm` repeats the
+# program from there on).
+TIMED_TAIL_MARKER = "\nt0 = time.perf_counter()\n"
+IMPORTS_TORCH_RE = re.compile(r"^\s*(?:import\s+torch\b|from\s+torch\b)", re.MULTILINE)
+TORCH_PROBE = "import json, torch; print(json.dumps({'torch': torch.__version__, 'threads': torch.get_num_threads()}))"
 
 CPYTHON_PROBE = (
     "import json, platform, sys; print(json.dumps({"
@@ -87,12 +107,13 @@ class Benchmark:
     path: Path
     zipp_only: bool
     sha256: str
+    uses_torch: bool = False
 
 
 @dataclass(frozen=True)
 class Engine:
     name: str
-    kind: str  # "zipp" or "cpython"
+    kind: str  # "zipp", "cpython" or "torch" (a CPython with PyTorch)
     prefix: tuple[str, ...]
 
     def argv(self, script: str) -> list[str]:
@@ -150,6 +171,7 @@ def discover(suite_dir: Path, group: str = "all", only: str = "") -> list[Benchm
                     path=path,
                     zipp_only="zipp-only" in directives,
                     sha256=sha256_bytes(data),
+                    uses_torch=bool(IMPORTS_TORCH_RE.search(data.decode("utf-8"))),
                 )
             )
     return found
@@ -169,7 +191,36 @@ def split_command(command: str, posix: bool | None = None) -> list[str]:
 
 
 def applicable_engines(bench: Benchmark, engines: Sequence[Engine]) -> list[Engine]:
-    return [e for e in engines if not (bench.zipp_only and e.kind == ENGINE_CPYTHON)]
+    """CPython runs the ordinary programs; the torch reference runs only the
+    zipp-only programs that import torch; Zipp runs everything."""
+    usable = []
+    for e in engines:
+        if e.kind == ENGINE_CPYTHON and bench.zipp_only:
+            continue
+        if e.kind == ENGINE_TORCH and not (bench.zipp_only and bench.uses_torch):
+            continue
+        usable.append(e)
+    return usable
+
+
+def derived_source(source: str, warm: int, torch_threads: int | None) -> str:
+    """The program with its timed tail (from `t0 = time.perf_counter()` on)
+    repeated `warm` times in one process and, for the torch reference,
+    `torch.set_num_threads` called first (`torch_threads` None: not at all;
+    0: PyTorch's default left as it is). Each repetition prints its own
+    checksum and `@bench-time` line."""
+    text = source.replace("\r\n", "\n")
+    index = text.rfind(TIMED_TAIL_MARKER)
+    if index < 0:
+        raise ValueError("no timed tail: the program has no line `t0 = time.perf_counter()`")
+    head, tail = text[: index + 1], text[index + 1 :]
+    setup = ""
+    if torch_threads:
+        setup = f"import torch as _zipp_bench_torch\n_zipp_bench_torch.set_num_threads({int(torch_threads)})\n"
+    if warm <= 1:
+        return head + setup + tail
+    body = "".join("    " + line + "\n" if line.strip() else "\n" for line in tail.splitlines())
+    return head + setup + f"for _zipp_bench_rep in range({int(warm)}):\n" + body
 
 
 def build_schedule(
@@ -215,6 +266,22 @@ def parse_work_time(stderr: str) -> float | None:
     if not matches:
         return None
     return float(matches[-1])
+
+
+def parse_work_times(stderr: str) -> list[float]:
+    return [float(m) for m in WORK_TIME_RE.findall(stderr.replace("\r\n", "\n"))]
+
+
+def warm_and_cold(times: Sequence[float], warm: int) -> tuple[float | None, float | None]:
+    """(work, cold) of one run: with `warm` > 1 the fastest of the runs after
+    the first, and the first; otherwise the last line, and None."""
+    if not times:
+        return None, None
+    if warm > 1:
+        if len(times) < warm:
+            return None, times[0]
+        return min(times[1:]), times[0]
+    return times[-1], None
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -271,15 +338,18 @@ def run_one(
     env: dict[str, str],
     timeout: float,
     spawn_fn: Callable[..., dict[str, Any]] | None = None,
+    warm: int = 1,
 ) -> dict[str, Any]:
-    """One observation: wall time around the process, work time from its stderr."""
+    """One observation: wall time around the process, work time from its
+    stderr (with `warm` > 1, the fastest warm run; `cold_s` the first)."""
     spawn_fn = spawn_fn or spawn
     start = time.perf_counter()
     result = spawn_fn(argv, cwd, env, timeout)
     wall = time.perf_counter() - start
     stdout = normalize_output(result.get("stdout"))
     stderr = normalize_output(result.get("stderr"))
-    work = parse_work_time(stderr)
+    times = parse_work_times(stderr)
+    work, cold = warm_and_cold(times, warm)
     error = None
     if result.get("start_error"):
         error = f"could not start: {result['start_error']}"
@@ -287,13 +357,17 @@ def run_one(
         error = f"timed out after {timeout:g} s"
     elif result.get("returncode") != 0:
         error = f"exit code {result.get('returncode')}"
-    elif work is None:
+    elif not times:
         error = "no @bench-time line on stderr"
+    elif work is None:
+        error = f"{len(times)} @bench-time lines for --warm {warm}"
     return {
         "exit_code": result.get("returncode"),
         "timed_out": bool(result.get("timed_out")),
         "wall_s": wall,
         "work_s": work if error is None else None,
+        "cold_s": cold if error is None else None,
+        "work_times_s": times,
         "stdout": stdout,
         "stdout_sha256": sha256_bytes(stdout.encode("utf-8")),
         "stderr_tail": stderr[-STDERR_TAIL_CHARS:] if error else None,
@@ -373,6 +447,24 @@ def cpython_metadata(engine: Engine, probe_fn: Callable[..., tuple[int | None, s
     }
 
 
+def torch_metadata(engine: Engine, probe_fn: Callable[..., tuple[int | None, str, str]]) -> dict[str, Any]:
+    """CPython's metadata plus the PyTorch version and default thread count."""
+    meta = cpython_metadata(engine, probe_fn)
+    code, out, err = probe_fn([*engine.prefix, "-c", TORCH_PROBE], timeout=120.0)
+    info: dict[str, Any] | None = None
+    if code == 0:
+        try:
+            parsed = json.loads(out.strip().splitlines()[-1])
+            info = parsed if isinstance(parsed, dict) else None
+        except (ValueError, IndexError):
+            info = None
+    meta["torch_version"] = info.get("torch") if info else None
+    meta["torch_default_threads"] = info.get("threads") if info else None
+    if meta["probe_error"] is None and info is None:
+        meta["probe_error"] = (err.strip().splitlines() or [f"torch probe exited {code}"])[-1]
+    return meta
+
+
 def host_metadata() -> dict[str, Any]:
     return {
         "platform": platform.platform(),
@@ -444,6 +536,11 @@ def validate(
     The reference is CPython for ordinary programs and the baseline Zipp for
     zipp-only programs (or for everything under --no-cpython): its earliest
     successful run in schedule order. Failed runs are failures too.
+
+    The torch reference engine (--torch-cpython) is compared too, but a
+    difference there is recorded (`torch_mismatches`), not failed: it times
+    the real PyTorch, whose float32 accumulation order differs from Zipp's,
+    and a program can amplify that (see the README).
     """
     per_bench: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
@@ -460,6 +557,7 @@ def validate(
             (o for o in rows if o["engine"] == reference_engine and o["error"] is None), None
         )
         mismatches: list[dict[str, Any]] = []
+        torch_mismatches: list[dict[str, Any]] = []
         reference_problem = None
         if reference is None:
             reference_problem = f"no successful {reference_engine} run to validate against"
@@ -471,9 +569,11 @@ def validate(
             for row in rows:
                 if row["error"] is None and row["stdout"] != reference["stdout"]:
                     detail = first_difference(reference["stdout"], row["stdout"])
-                    mismatches.append(
-                        {"seq": row["seq"], "engine": row["engine"], "rep": row["rep"], "detail": detail}
-                    )
+                    entry = {"seq": row["seq"], "engine": row["engine"], "rep": row["rep"], "detail": detail}
+                    if row["engine"] == ENGINE_TORCH:
+                        torch_mismatches.append(entry)
+                        continue
+                    mismatches.append(entry)
                     failures.append(
                         f"{bench.id} [{row['engine']} rep {row['rep'] + 1}]: checksum differs from "
                         f"{reference_engine} rep {reference['rep'] + 1}: {detail}"
@@ -483,6 +583,7 @@ def validate(
             "reference_seq": reference["seq"] if reference else None,
             "reference_stdout": reference["stdout"] if reference else None,
             "mismatches": mismatches,
+            "torch_mismatches": torch_mismatches,
             "run_failures": run_failures,
             "reference_problem": reference_problem,
             "valid": reference_problem is None and not mismatches and not run_failures,
@@ -513,6 +614,9 @@ def summarize(
                     "min": minimum(values),
                     "values": values,
                 }
+            colds = [o.get("cold_s") for o in rows if o.get("cold_s") is not None]
+            if colds:
+                item["cold_s"] = {"n": len(colds), "median": median(colds), "min": minimum(colds), "values": colds}
             item["overhead_s_median"] = median([o["wall_s"] - o["work_s"] for o in rows])
             engine_stats[engine.name] = item
         valid = validation[bench.id]["valid"]
@@ -529,6 +633,7 @@ def summarize(
             "zipp_only": bench.zipp_only,
             "valid": valid,
             "validated_against": validation[bench.id]["validated_against"],
+            "torch_differs": bool(validation[bench.id].get("torch_mismatches")),
             "engines": engine_stats,
             "ratios": ratios,
         }
@@ -605,6 +710,8 @@ def render_table(
             flags.append("zipp-only")
         if not row["valid"]:
             flags.append("INVALID")
+        if row.get("torch_differs"):
+            flags.append("torch-differs")
         lines.append(bench.id.ljust(width) + cells + ("  " + ",".join(flags) if flags else ""))
     lines.append("")
     for label, num, den in RATIO_PAIRS:
@@ -621,6 +728,23 @@ def render_table(
             parts.append(text + ")")
         if parts:
             lines.append(f"geomean {label} ({metric}): " + ", ".join(parts))
+    return "\n".join(lines)
+
+
+def render_cold_table(
+    benchmarks: Sequence[Benchmark], engines: Sequence[Engine], summary: dict[str, dict[str, Any]]
+) -> str:
+    """The first run of each process (`--warm`): what a program pays once."""
+    names = [e.name for e in engines]
+    width = max([len("benchmark")] + [len(b.id) for b in benchmarks]) + 2
+    header = "benchmark".ljust(width) + "".join(f"{n} cold min".rjust(max(14, len(n) + 11)) for n in names)
+    lines = ["first run in the process, ms (min over reps)", header, "-" * len(header)]
+    for bench in benchmarks:
+        stats = summary[bench.id]["engines"]
+        cells = "".join(
+            _ms(stats.get(n, {}).get("cold_s", {}).get("min")).rjust(max(14, len(n) + 11)) for n in names
+        )
+        lines.append(bench.id.ljust(width) + cells)
     return "\n".join(lines)
 
 
@@ -675,8 +799,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--timeout", type=positive_float, default=DEFAULT_TIMEOUT_S, help="per-run timeout in seconds")
     ap.add_argument("--metric", choices=tuple(METRICS), default="work", help="metric for the table (JSON has both)")
     ap.add_argument("--json", default=None, help="report path (default target/bench-results/python-bench-<utc>.json)")
+    ap.add_argument("--torch-cpython", default=None, metavar="CMD",
+                    help="a CPython with PyTorch (e.g. 'py -3.11') timing the zipp-only torch programs as engine 'torch'")
+    ap.add_argument("--torch-threads", type=non_negative_int, default=DEFAULT_TORCH_THREADS,
+                    help=f"torch.set_num_threads for the torch engine (default {DEFAULT_TORCH_THREADS}; 0: PyTorch's default)")
+    ap.add_argument("--warm", type=positive_int, default=1,
+                    help="run each program's timed tail N times in one process and time the warm runs (default 1: off)")
     ap.add_argument("--suite-dir", default=str(SUITE_DIR), help=argparse.SUPPRESS)
     return ap.parse_args(argv)
+
+
+def non_negative_int(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
 
 
 def build_engines(args: argparse.Namespace) -> list[Engine]:
@@ -685,7 +822,34 @@ def build_engines(args: argparse.Namespace) -> list[Engine]:
         engines.append(Engine(ENGINE_ZIPP_B, ENGINE_ZIPP, (str(Path(args.zipp_b).resolve()), "py")))
     if not args.no_cpython:
         engines.append(Engine(ENGINE_CPYTHON, ENGINE_CPYTHON, tuple(split_command(args.cpython))))
+    if getattr(args, "torch_cpython", None):
+        engines.append(Engine(ENGINE_TORCH, ENGINE_TORCH, tuple(split_command(args.torch_cpython))))
     return engines
+
+
+def prepare_scripts(
+    benchmarks: Sequence[Benchmark], engines: Sequence[Engine], warm: int, torch_threads: int, workdir: Path
+) -> dict[tuple[str, str], tuple[Path, Path]]:
+    """(bench id, engine) -> (script, cwd). A program runs as checked in from
+    its group directory unless it needs a derived copy (`--warm`, or the
+    torch engine's thread setting); a copy goes to a folder of its own under
+    `workdir`, which then is that run's working directory."""
+    out: dict[tuple[str, str], tuple[Path, Path]] = {}
+    for bench in benchmarks:
+        source = None
+        for engine in applicable_engines(bench, engines):
+            threads = torch_threads if engine.kind == ENGINE_TORCH else None
+            if warm <= 1 and not threads:
+                out[(bench.id, engine.name)] = (bench.path, bench.path.parent)
+                continue
+            if source is None:
+                source = bench.path.read_text(encoding="utf-8")
+            folder = workdir / f"{bench.group}-{bench.name}-{engine.kind}"
+            folder.mkdir(parents=True, exist_ok=True)
+            script = folder / bench.path.name
+            script.write_text(derived_source(source, warm, threads), encoding="utf-8", newline="\n")
+            out[(bench.id, engine.name)] = (script, folder)
+    return out
 
 
 def child_environment() -> dict[str, str]:
@@ -724,6 +888,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
+        elif engine.kind == ENGINE_TORCH:
+            meta = torch_metadata(engine, probe)
+            if meta["probe_error"]:
+                print(f"cannot run torch command {args.torch_cpython!r}: {meta['probe_error']}", file=sys.stderr)
+                return 2
         else:
             meta = zipp_metadata(engine, probe)
         engine_meta_before.append(meta)
@@ -734,19 +903,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     by_engine = {e.name: e for e in engines}
     env = child_environment()
     observations: list[dict[str, Any]] = []
+    workdir = Path(tempfile.mkdtemp(prefix="python-bench-"))
+    try:
+        scripts = prepare_scripts(benchmarks, engines, args.warm, args.torch_threads, workdir)
+    except (OSError, ValueError) as exc:
+        print(f"cannot prepare the programs: {exc}", file=sys.stderr)
+        shutil.rmtree(workdir, ignore_errors=True)
+        return 2
     print(
         f"python bench: {len(benchmarks)} programs x {args.reps} reps, engines "
         + ", ".join(e.name for e in engines)
-        + f", {len(schedule)} runs",
+        + f", {len(schedule)} runs"
+        + (f", warm {args.warm}" if args.warm > 1 else ""),
         flush=True,
     )
     pending: list[str] = []
     for index, entry in enumerate(schedule):
         bench = by_id[entry["bench"]]
         engine = by_engine[entry["engine"]]
-        argv_run = engine.argv(bench.path.name)
-        row = run_one(argv_run, bench.path.parent, env, args.timeout)
-        observation = {**entry, "argv": argv_run, "cwd": str(bench.path.parent), **row}
+        script, cwd = scripts[(bench.id, engine.name)]
+        argv_run = engine.argv(script.name)
+        row = run_one(argv_run, cwd, env, args.timeout, warm=args.warm)
+        observation = {**entry, "argv": argv_run, "cwd": str(cwd), **row}
         observations.append(observation)
         shown = row[METRICS[args.metric]]
         pending.append(f"{engine.name} {_ms(shown)}" if row["error"] is None else f"{engine.name} FAILED ({row['error']})")
@@ -755,6 +933,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"  rep {entry['rep'] + 1}/{args.reps}  {bench.id:<28} " + "  ".join(pending), flush=True)
             pending = []
     finished = utc_now()
+    shutil.rmtree(workdir, ignore_errors=True)
 
     health_failures: list[str] = []
     engine_meta_after = [
@@ -789,6 +968,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "timeout_s": args.timeout,
             "table_metric": METRICS[args.metric],
             "cpython_command": None if args.no_cpython else args.cpython,
+            "torch_command": args.torch_cpython,
+            "torch_threads": args.torch_threads if args.torch_cpython else None,
+            "warm": args.warm,
+            "warm_policy": "work_s is the fastest of runs 2..N in one process, cold_s the first" if args.warm > 1 else None,
             "suite_dir": str(suite_dir),
             "schedule_policy": "per rep: benchmark order rotated by rep; engine order per benchmark rotated by rep+index",
             "cwd_policy": "each run starts in its benchmark's group directory, so zipp's project VFS holds only that group",
@@ -821,8 +1004,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if ENGINE_ZIPP in summary[b.id]["engines"]
     ]
     overhead = median(zipp_overheads)
-    if overhead is not None:
+    if overhead is not None and args.warm <= 1:
         print(f"zipp process overhead (wall - work), median over programs: {_ms(overhead)} ms")
+    if args.warm > 1:
+        print(render_cold_table(benchmarks, engines, summary))
+    differing = [b.id for b in benchmarks if summary[b.id].get("torch_differs")]
+    if differing:
+        print("torch printed other values than zipp for: " + ", ".join(differing) + " (recorded, not failed)")
     path = Path(args.json) if args.json else default_report_path(started)
     written = write_report(path, report)
     print(f"report -> {written}")

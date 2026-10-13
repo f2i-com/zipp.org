@@ -98,7 +98,7 @@ def _grad_on(*ts):
     if not torch._grad_enabled:
         return False
     for t in ts:
-        if _isinstance(t, _T) and t.requires_grad:
+        if isinstance(t, _T) and t.requires_grad:
             return True
     return False
 
@@ -121,7 +121,7 @@ def _sparse_dim(t):
 
 
 def _dense_dim(t):
-    return _len(t._val.shape) - 1
+    return len(t._val.shape) - 1
 
 
 def _nnz_of(t):
@@ -184,7 +184,7 @@ def _expand_compressed(c, n):
 
 
 def _compressed_to_coo_raw(t):
-    if _len(t.shape) != 2 + _dense_dim(t):
+    if len(t.shape) != 2 + _dense_dim(t):
         raise _unsupported_layout("a batched compressed tensor")
     n = t.shape[0] if t.layout is _csr else t.shape[1]
     major = _expand_compressed(_plain(t._crow), n)
@@ -312,7 +312,7 @@ def _grad_values(g, s):
     picked = torch.index_select(gc._val, 0, torch.clamp(pos, 0))
     if not tail:
         return torch.where(found, picked, torch.zeros((), dtype=g.dtype))
-    return torch.where(found.reshape((n,) + (1,) * _len(tail)), picked, torch.zeros((), dtype=g.dtype))
+    return torch.where(found.reshape((n,) + (1,) * len(tail)), picked, torch.zeros((), dtype=g.dtype))
 
 
 def _with_values(s, vals, name="SparseCooTensorWithDimsAndTensors", coalesced=None, vnc=False):
@@ -340,7 +340,7 @@ def sparse_mask(dense, mask):
 
 
 def _dense_to_coo(x, sparse_dim=None):
-    rank = _len(x.shape)
+    rank = len(x.shape)
     sd = rank if sparse_dim is None else _int(sparse_dim)
     if sd < 0 or sd > rank:
         raise RuntimeError("sparse_dim must be in [0, %d], but got %d" % (rank, sd))
@@ -366,7 +366,7 @@ def _dense_to_coo(x, sparse_dim=None):
 
 def to_sparse(t, sparse_dim=None, layout=None, blocksize=None, dense_dim=None):
     """Tensor.to_sparse(sparseDims) / to_sparse(layout=, blocksize=, dense_dim=)."""
-    if _isinstance(sparse_dim, torch._Layout):
+    if isinstance(sparse_dim, torch._Layout):
         sparse_dim, layout = None, sparse_dim
     if layout is None or layout is _coo:
         if t.__class__ is _S:
@@ -390,7 +390,7 @@ def _to_compressed(t, layout, dense_dim=None):
         if t.layout is _coo:
             return _as_layout(t, layout)
         return _as_layout(_as_coo(t), layout)
-    rank = _len(t.shape)
+    rank = len(t.shape)
     dd = 0 if dense_dim is None else _int(dense_dim)
     if rank - dd < 2:
         raise RuntimeError("to_sparse_%s: expected at least 2 sparse dimensions, but got %d" % ("csr" if layout is _csr else "csc", rank - dd))
@@ -456,7 +456,7 @@ class check_sparse_tensor_invariants:
 
 
 def _index_tensor(x):
-    if _isinstance(x, _T):
+    if isinstance(x, _T):
         if x.__class__ is _S:
             raise TypeError("indices must be a strided tensor")
         return _plain(x)
@@ -465,7 +465,7 @@ def _index_tensor(x):
 
 
 def _values_tensor(x, dtype):
-    if _isinstance(x, _T):
+    if isinstance(x, _T):
         if dtype is not None and x.dtype is not dtype:
             return x.to(dtype)
         return x
@@ -482,7 +482,7 @@ def _sparse_coo_tensor(indices=None, values=None, size=None, dtype=None, device=
     device=None, requires_grad=False, check_invariants=None,
     is_coalesced=None)."""
     torch._check_cpu_device(device)
-    if values is None and size is None and indices is not None and not _isinstance(indices, _T):
+    if values is None and size is None and indices is not None and not isinstance(indices, _T):
         # sparse_coo_tensor(size): an empty tensor of that size.
         size, indices = indices, None
     if indices is None:
@@ -490,7 +490,7 @@ def _sparse_coo_tensor(indices=None, values=None, size=None, dtype=None, device=
             raise TypeError("sparse_coo_tensor() missing required argument 'values'")
         shape = _Size(_tuple(_int(d) for d in size))
         dt = torch.get_default_dtype() if dtype is None else dtype
-        out = _make_coo(torch.zeros((_len(shape), 0), dtype=_int64), torch.zeros(0, dtype=dt), shape, True)
+        out = _make_coo(torch.zeros((len(shape), 0), dtype=_int64), torch.zeros(0, dtype=dt), shape, True)
         if requires_grad:
             _check_leaf_dtype(out)
             out.requires_grad = True
@@ -499,20 +499,20 @@ def _sparse_coo_tensor(indices=None, values=None, size=None, dtype=None, device=
     if ind.dtype is not _int64:
         ind = ind.to(_int64)
     vals = _values_tensor(values, dtype)
-    if _len(ind.shape) == 1:
+    if len(ind.shape) == 1:
         sd, nnz = ind.shape[0], 1
         ind = ind.reshape(sd, 1)
-    elif _len(ind.shape) == 2:
+    elif len(ind.shape) == 2:
         sd, nnz = ind.shape
     else:
         raise RuntimeError("indices must be sparse_dim x nnz, but got: %s" % (_list(ind.shape),))
-    if _len(vals.shape) == 0:
+    if len(vals.shape) == 0:
         vals = vals.reshape(1)
-    dd = _len(vals.shape) - 1
+    dd = len(vals.shape) - 1
     if size is not None:
         shape = _Size(_tuple(_int(d) for d in size))
-        if _len(shape) != sd + dd:
-            raise RuntimeError("'len(size) == sparse_dim + dense_dim' is not satisfied: len(size) = %d, sparse_dim = %d, dense_dim = %d" % (_len(shape), sd, dd))
+        if len(shape) != sd + dd:
+            raise RuntimeError("'len(size) == sparse_dim + dense_dim' is not satisfied: len(size) = %d, sparse_dim = %d, dense_dim = %d" % (len(shape), sd, dd))
     if vals.shape[0] != nnz:
         raise RuntimeError("indices and values must have same nnz, but got nnz from indices: %d, nnz from values: %d" % (nnz, vals.shape[0]))
     if size is None:
@@ -556,7 +556,7 @@ def _sparse_compressed(layout, cidx, pidx, values, size, dtype, device, requires
     if p.dtype not in (torch.int32, _int64):
         p = p.to(_int64)
     vals = _values_tensor(values, dtype)
-    if _len(c.shape) != 1 or _len(p.shape) != 1:
+    if len(c.shape) != 1 or len(p.shape) != 1:
         raise _unsupported_layout("a batched compressed tensor")
     if size is None:
         major = c.shape[0] - 1
@@ -565,7 +565,7 @@ def _sparse_compressed(layout, cidx, pidx, values, size, dtype, device, requires
         shape = _Size(shape + _tuple(vals.shape[1:]))
     else:
         shape = _Size(_tuple(_int(d) for d in size))
-        if _len(shape) != 2 + _len(vals.shape) - 1:
+        if len(shape) != 2 + len(vals.shape) - 1:
             raise _unsupported_layout("a batched compressed tensor")
     if (check_invariants if check_invariants is not None else check_sparse_tensor_invariants._enabled):
         _check_compressed(layout, c, p, vals, shape)
@@ -590,8 +590,8 @@ def _check_compressed(layout, c, p, vals, shape):
     rows = shape[0] if layout is _csr else shape[1]
     cname, pname = ("crow_indices", "col_indices") if layout is _csr else ("ccol_indices", "row_indices")
     cl = c.tolist()
-    if _len(cl) != rows + 1:
-        raise RuntimeError("%s.shape[-1] must be equal to the number of %s + 1 (=%d), but got %d" % (cname, "rows" if layout is _csr else "columns", rows + 1, _len(cl)))
+    if len(cl) != rows + 1:
+        raise RuntimeError("%s.shape[-1] must be equal to the number of %s + 1 (=%d), but got %d" % (cname, "rows" if layout is _csr else "columns", rows + 1, len(cl)))
     if cl[0] != 0:
         raise RuntimeError("`%s[..., 0] == 0` is not satisfied." % cname)
     if cl[-1] != p.shape[0]:
@@ -641,13 +641,13 @@ def _part(name, t, indent):
     if t.numel() == 0:
         body = "[], size=" + str(_tuple(t.shape))
     else:
-        body = torch._tensor_str(t, indent + _len(prefix))
+        body = torch._tensor_str(t, indent + len(prefix))
     return prefix + body + ")"
 
 
 def _repr(s):
     prefix = "tensor("
-    indent = _len(prefix)
+    indent = len(prefix)
     suffixes = ["size=" + str(_tuple(s.shape)), "nnz=" + str(_nnz_of(s))]
     dt = s.dtype
     if not (dt in (torch.get_default_dtype(), _int64, torch.bool) or dt is torch._default_complex()):
@@ -674,7 +674,7 @@ def _reduce_args(t):
 
 def _rebuild(layout, data):
     if layout is _coo:
-        if _len(data) == 3:
+        if len(data) == 3:
             indices, values, size = data
             coalesced = None
         else:
@@ -695,7 +695,7 @@ _ATEN = {"add": "aten::add.Tensor", "sub": "aten::sub.Tensor", "mul": "aten::mul
 
 
 def _is_number(v):
-    return _isinstance(v, (_int, _float, _bool)) or type(v) is _b.complex
+    return isinstance(v, (_int, _float, _bool)) or type(v) is _b.complex
 
 
 def _binary(op, a, b):
@@ -716,10 +716,10 @@ def _binary(op, a, b):
             return _mul_ss(a, b)
         return _mul_sd(a, b) if sa else _mul_sd(b, a)
     if op == "div" and sa:
-        if sb or (_isinstance(b, _T) and b.shape):
+        if sb or (isinstance(b, _T) and b.shape):
             raise RuntimeError("Sparse division requires a scalar or zero-dim dense tensor divisor (got shape %s for divisor)" % (_list(b.shape),))
         return _div_s(a, b)
-    if op == "pow" and sa and not sb and not _isinstance(b, _T):
+    if op == "pow" and sa and not sb and not isinstance(b, _T):
         return _pow_s(a, b)
     t = a if sa else b
     if op == "div":
@@ -774,7 +774,7 @@ def _add_ss(a, b, alpha, name):
 def _add_ds(d, s, alpha, name):
     """dense + alpha * sparse: a copy of the dense tensor with each nonzero
     added in turn (PyTorch's add_out_dense_sparse_cpu)."""
-    if not _isinstance(d, _T):
+    if not isinstance(d, _T):
         d = torch.tensor(d)
     if s.layout in _BLOCKED:
         raise _unsupported_layout(repr(s.layout))
@@ -835,7 +835,7 @@ def _mul_ss(a, b):
         keep = _compact(found)
         out = _make_coo(torch.index_select(_plain(probe._ind), 1, keep), torch.index_select(prod, 0, keep), a.shape, True)
     else:
-        mask = found if not tail else found.reshape((n,) + (1,) * _len(tail))
+        mask = found if not tail else found.reshape((n,) + (1,) * len(tail))
         out = _make_coo(_plain(probe._ind), torch.where(mask, prod, torch.zeros((), dtype=dt)), a.shape, False)
     if _grad_on(a, b):
         ad, bd = _detached(a), _detached(b)
@@ -860,8 +860,8 @@ def _mul_sd(s, o):
     if layout is not _coo:
         return _as_layout(_mul_sd(_as_coo(s), o), layout)
     vals = _plain(s._val)
-    if _is_number(o) or (_isinstance(o, _T) and not o.shape):
-        k = o if not _isinstance(o, _T) else _plain(o)
+    if _is_number(o) or (isinstance(o, _T) and not o.shape):
+        k = o if not isinstance(o, _T) else _plain(o)
         out = _make_coo(s._ind, torch.mul(vals, k), s.shape, s._coal)
         if _grad_on(s, o):
             sd = _detached(s)
@@ -869,16 +869,16 @@ def _mul_sd(s, o):
             def backward(g):
                 gs = torch.mul(g, k) if s.requires_grad else None
                 go = None
-                if _isinstance(o, _T) and o.requires_grad:
+                if isinstance(o, _T) and o.requires_grad:
                     go = torch.sum(torch.mul(_grad_values(g, sd), vals))
                 return (gs, go)
-            _record(out, (s, o if _isinstance(o, _T) else None), backward, "Mul")
+            _record(out, (s, o if isinstance(o, _T) else None), backward, "Mul")
         return out
-    if not _isinstance(o, _T):
+    if not isinstance(o, _T):
         o = torch.tensor(o)
     os_, ss_ = _list(o.shape), _list(s.shape)
-    n = _b.max(_len(os_), _len(ss_))
-    os_, ss_ = [1] * (n - _len(os_)) + os_, [1] * (n - _len(ss_)) + ss_
+    n = _b.max(len(os_), len(ss_))
+    os_, ss_ = [1] * (n - len(os_)) + os_, [1] * (n - len(ss_)) + ss_
     for i in _range(n):
         if os_[i] != ss_[i] and os_[i] != 1 and ss_[i] != 1:
             raise RuntimeError("The size of tensor a (%d) must match the size of tensor b (%d) at non-singleton dimension %d" % (os_[i], ss_[i], i))
@@ -906,7 +906,7 @@ def _div_s(s, o):
     layout = s.layout
     if layout is not _coo:
         raise RuntimeError("unsupported tensor layout: %s" % _layout_name(s))
-    k = o if not _isinstance(o, _T) else _plain(o)
+    k = o if not isinstance(o, _T) else _plain(o)
     vals = _plain(s._val)
     out = _make_coo(s._ind, torch.div(vals, k), s.shape, s._coal)
     if _grad_on(s, o):
@@ -915,10 +915,10 @@ def _div_s(s, o):
         def backward(g):
             gs = torch.div(g, k) if s.requires_grad else None
             go = None
-            if _isinstance(o, _T) and o.requires_grad:
+            if isinstance(o, _T) and o.requires_grad:
                 go = torch.neg(torch.sum(torch.mul(_grad_values(g, sd), vals))) / (k * k)
             return (gs, go)
-        _record(out, (s, o if _isinstance(o, _T) else None), backward, "Div")
+        _record(out, (s, o if isinstance(o, _T) else None), backward, "Div")
     return out
 
 
@@ -986,7 +986,7 @@ def _unary_nograd(op, a, p1, p2):
 
 # ---- reductions --------------------------------------------------------------------------
 def _dims_list(dim, rank):
-    if _isinstance(dim, (_list, _tuple)):
+    if isinstance(dim, (_list, _tuple)):
         dims = [torch._norm_dim(d, rank) for d in dim]
     else:
         dims = [torch._norm_dim(dim, rank)]
@@ -1018,12 +1018,12 @@ def sum(input, dim=None, dtype=None):
         if _grad_on(s):
             _record(out, (s,), lambda g: (_make_coo(c._ind, g.expand(*vals.shape), s.shape, True, True),), "Sum")
         return out
-    dims = _dims_list(dim, _len(s.shape))
+    dims = _dims_list(dim, len(s.shape))
     sdims = [d for d in dims if d < sd]
     ddims = [d - sd + 1 for d in dims if d >= sd]
     v = torch.sum(vals, ddims) if ddims else vals
     keep = [d for d in _range(sd) if d not in sdims]
-    rest = [s.shape[d] for d in _range(sd, _len(s.shape)) if d not in dims]
+    rest = [s.shape[d] for d in _range(sd, len(s.shape)) if d not in dims]
     if not keep:
         out = torch.sum(v, 0)
     elif not sdims:
@@ -1049,7 +1049,7 @@ def sum(input, dim=None, dtype=None):
 
 def _tensor_sum(a, dim, keepdim, dtype):
     """torch.sum / Tensor.sum of a sparse tensor."""
-    if dim is None or (_isinstance(dim, (_list, _tuple)) and not dim):
+    if dim is None or (isinstance(dim, (_list, _tuple)) and not dim):
         return sum(a, None, dtype)
     if a.layout is not _coo:
         if not keepdim:
@@ -1058,7 +1058,7 @@ def _tensor_sum(a, dim, keepdim, dtype):
     out = sum(a, dim, dtype)
     if not keepdim:
         return out
-    dims = _dims_list(dim, _len(a.shape))
+    dims = _dims_list(dim, len(a.shape))
     sd = a._ind.shape[0]
     if out.__class__ is not _S:
         raise _unsupported_layout("keepdim=True over every sparse dimension")
@@ -1073,7 +1073,7 @@ def _tensor_sum(a, dim, keepdim, dtype):
     for d in dims:
         if d >= sd:
             vals = vals.unsqueeze(d - sd + 1)
-    shape = [1 if d in dims else a.shape[d] for d in _range(_len(a.shape))]
+    shape = [1 if d in dims else a.shape[d] for d in _range(len(a.shape))]
     res = _make_coo(torch.stack(rows) if rows else out._ind, _plain(vals), shape, False)
     if _grad_on(out):
         res_shape = out.shape
@@ -1102,7 +1102,7 @@ def _softmax(s, dim, dtype, log):
         raise NotImplementedError("\"%s\" not implemented for '%s'" % ("log_softmax" if log else "softmax", torch._CAST_NAME[s.dtype.name]))
     c = _coalesce_raw(s)
     sd = c._ind.shape[0]
-    rank = _len(s.shape)
+    rank = len(s.shape)
     d = torch._norm_dim(dim, rank)
     vals = _plain(c._val)
     block = _block(c)
@@ -1173,15 +1173,15 @@ def _spmm_raw(rows, cols, vals, m, d):
 def _check_matrix(s):
     if s.layout in _BLOCKED:
         raise _unsupported_layout(repr(s.layout))
-    if s.layout is _coo and (s._ind.shape[0] != 2 or _len(s.shape) != 2):
+    if s.layout is _coo and (s._ind.shape[0] != 2 or len(s.shape) != 2):
         raise RuntimeError("addmm: matrices expected, got %dD tensor" % s._ind.shape[0])
-    if _len(s.shape) != 2:
+    if len(s.shape) != 2:
         raise _unsupported_layout("a batched compressed tensor")
 
 
 def _check_dense_operand(s, d, k):
-    if _len(d.shape) != 2:
-        raise RuntimeError("addmm: matrices expected, got %dD tensor" % _len(d.shape))
+    if len(d.shape) != 2:
+        raise RuntimeError("addmm: matrices expected, got %dD tensor" % len(d.shape))
     if d.shape[0] != k:
         raise RuntimeError("addmm: Argument #3 (dense): Expected dim 0 size %d, got %d" % (k, d.shape[0]))
     if s.dtype is not d.dtype:
@@ -1197,7 +1197,7 @@ def _conj(t):
 def _spmm(s, d, name, sparse_grad, beta=0, mat=None, alpha=1):
     """beta * mat + alpha * (s @ d) for a sparse s and a dense 2-D d."""
     _check_matrix(s)
-    if not _isinstance(d, _T):
+    if not isinstance(d, _T):
         d = torch.tensor(d)
     m, k = s.shape[0], s.shape[1]
     _check_dense_operand(s, d, k)
@@ -1240,11 +1240,11 @@ def _spmm(s, d, name, sparse_grad, beta=0, mat=None, alpha=1):
 def _dsmm(d, s, name, sparse_grad):
     """d @ s for a dense 2-D d and a sparse s, as (s^T @ d^T)^T."""
     _check_matrix(s)
-    if not _isinstance(d, _T):
+    if not isinstance(d, _T):
         d = torch.tensor(d)
     k, n = s.shape[0], s.shape[1]
-    if _len(d.shape) != 2:
-        raise RuntimeError("addmm: matrices expected, got %dD tensor" % _len(d.shape))
+    if len(d.shape) != 2:
+        raise RuntimeError("addmm: matrices expected, got %dD tensor" % len(d.shape))
     if d.shape[1] != k:
         raise RuntimeError("mat1 and mat2 shapes cannot be multiplied (%dx%d and %dx%d)" % (d.shape[0], d.shape[1], k, n))
     if s.dtype is not d.dtype:
@@ -1389,12 +1389,12 @@ def _matmul(a, b):
     if sa and sb:
         return _ssmm(a, b)
     if sa:
-        if not _isinstance(b, _T):
+        if not isinstance(b, _T):
             b = torch.tensor(b)
-        if _len(b.shape) == 1:
+        if len(b.shape) == 1:
             return torch.squeeze(_spmm(a, torch.unsqueeze(b, 1), "Mm", False), 1)
         return _spmm(a, b, "Mm", False)
-    if _len(a.shape) == 1:
+    if len(a.shape) == 1:
         return torch.squeeze(_dsmm(torch.unsqueeze(a, 0), b, "Mm", False), 0)
     return _dsmm(a, b, "Mm", False)
 
@@ -1462,7 +1462,7 @@ def spdiags(diagonals, offsets, shape, layout=None):
     SciPy's spdiags), in offset order. As PyTorch 2.11 does, a positive
     offset takes elements up to the column count and a non-positive one up
     to the row count plus the offset, each ignoring the other bound."""
-    if _len(diagonals.shape) != 2 or _len(offsets.shape) != 1 or diagonals.shape[0] != offsets.shape[0]:
+    if len(diagonals.shape) != 2 or len(offsets.shape) != 1 or diagonals.shape[0] != offsets.shape[0]:
         raise RuntimeError("Number of diagonals (%d) does not match the number of offsets (%d)" % (diagonals.shape[0] if diagonals.shape else 0, offsets.shape[0] if offsets.shape else 0))
     rows_n, cols_n = _int(shape[0]), _int(shape[1])
     rows, cols, picks = [], [], []
@@ -1473,7 +1473,7 @@ def spdiags(diagonals, offsets, shape, layout=None):
             cols.append(j)
             picks.append(k * diagonals.shape[1] + j)
     vals = torch.index_select(_plain(diagonals).reshape(-1), 0, torch.tensor(picks, dtype=_int64))
-    out = _make_coo(torch.tensor([rows, cols], dtype=_int64).reshape(2, _len(rows)), vals, (rows_n, cols_n), False)
+    out = _make_coo(torch.tensor([rows, cols], dtype=_int64).reshape(2, len(rows)), vals, (rows_n, cols_n), False)
     if layout is None or layout is _coo:
         return out
     if layout in _COMPRESSED:
@@ -1498,12 +1498,12 @@ def sampled_addmm(input, mat1, mat2, beta=1.0, alpha=1.0):
 def _legacy(dtype_name):
     def build(*args, **kwargs):
         dt = getattr(torch, dtype_name)
-        if _len(args) >= 2 and _isinstance(args[0], _T) and _isinstance(args[1], _T):
-            return _sparse_coo_tensor(args[0], args[1], args[2] if _len(args) > 2 else None, dtype=dt)
-        if _len(args) == 1 and _isinstance(args[0], (_tuple, _list, _Size)):
+        if len(args) >= 2 and isinstance(args[0], _T) and isinstance(args[1], _T):
+            return _sparse_coo_tensor(args[0], args[1], args[2] if len(args) > 2 else None, dtype=dt)
+        if len(args) == 1 and isinstance(args[0], (_tuple, _list, _Size)):
             args = _tuple(args[0])
         shape = _tuple(_int(a) for a in args) if args else (0,)
-        return _make_coo(torch.zeros((_len(shape), 0), dtype=_int64), torch.zeros(0, dtype=dt), shape, True)
+        return _make_coo(torch.zeros((len(shape), 0), dtype=_int64), torch.zeros(0, dtype=dt), shape, True)
     build.__name__ = build.__qualname__ = torch._CAST_NAME[dtype_name] + "Tensor"
     return build
 
@@ -1521,7 +1521,7 @@ ByteTensor = _legacy("uint8")
 
 # ---- shape ops ---------------------------------------------------------------------------
 def _transpose(s, dim0, dim1, name="Transpose"):
-    rank = _len(s.shape)
+    rank = len(s.shape)
     d0, d1 = torch._norm_dim(dim0, rank), torch._norm_dim(dim1, rank)
     layout = s.layout
     if layout in _BLOCKED:
@@ -1565,7 +1565,7 @@ def _index_select(s, dim, index):
         raise _unsupported_layout(repr(layout))
     if layout is not _coo:
         return _as_layout(_index_select(_as_coo(s), dim, index), layout)
-    rank = _len(s.shape)
+    rank = len(s.shape)
     d = torch._norm_dim(dim, rank)
     idx = _to_int64(_plain(index)).reshape(-1)
     size = s.shape[d]
@@ -1632,12 +1632,12 @@ def _select0(s, i):
 
 
 def _getitem(s, key):
-    keys = key if _isinstance(key, _tuple) else (key,)
+    keys = key if isinstance(key, _tuple) else (key,)
     out = s
     for k in keys:
-        if _isinstance(k, _T) and not k.shape and not k.dtype._inexact:
+        if isinstance(k, _T) and not k.shape and not k.dtype._inexact:
             k = _int(k.item())
-        if not _isinstance(k, _int) or _isinstance(k, _bool):
+        if not isinstance(k, _int) or isinstance(k, _bool):
             raise _no_kernel("aten::as_strided", s)
         if out.__class__ is not _S:
             out = out[k]
@@ -1651,7 +1651,7 @@ def _cat(tensors, dim):
     for t in tensors:
         if t.__class__ is not _S or t.layout is not _coo:
             raise _unsupported_layout("torch.cat of sparse tensors that are not all sparse COO")
-    rank = _len(first.shape)
+    rank = len(first.shape)
     d = torch._norm_dim(dim, rank)
     sd = first._ind.shape[0]
     if d >= sd:
@@ -1663,7 +1663,7 @@ def _cat(tensors, dim):
         dt = torch._promote_types(dt, t.dtype)
     inds, vals, offset = [], [], 0
     for t in tensors:
-        if t._ind.shape[0] != sd or _len(t.shape) != rank:
+        if t._ind.shape[0] != sd or len(t.shape) != rank:
             raise RuntimeError("concatenating sparse tensors, but at least one tensor has a different shape")
         for j in _range(rank):
             if j != d and t.shape[j] != first.shape[j]:
@@ -1683,7 +1683,7 @@ def _cat(tensors, dim):
 
 def _stack(tensors, dim):
     first = tensors[0]
-    rank = _len(first.shape) + 1
+    rank = len(first.shape) + 1
     d = torch._norm_dim(dim, rank)
     parts = []
     for j, t in enumerate(tensors):
@@ -1901,7 +1901,7 @@ def _m_sparse_dim(self):
 
 
 def _m_dense_dim(self):
-    return _dense_dim(self) if self.__class__ is _S else _len(self.shape)
+    return _dense_dim(self) if self.__class__ is _S else len(self.shape)
 
 
 def _m_is_coalesced(self):
@@ -1919,11 +1919,11 @@ def _m_to(self, *args, **kwargs):
     torch._check_cpu_device(kwargs.get("device"))
     target = kwargs.get("dtype")
     for a in args:
-        if _isinstance(a, (_b.str, torch.device)):
+        if isinstance(a, (_b.str, torch.device)):
             torch._check_cpu_device(a)
-        elif _isinstance(a, torch.dtype):
+        elif isinstance(a, torch.dtype):
             target = a
-        elif _isinstance(a, _T):
+        elif isinstance(a, _T):
             target = a.dtype
     if target is None or target is self.dtype:
         return _m_clone(self) if kwargs.get("copy", False) else self
@@ -1935,7 +1935,7 @@ def _m_type(self, dtype=None, non_blocking=False):
         raise RuntimeError("Unimplemented backend %sCPU" % _layout_name(self))
     if dtype is None:
         return "torch.sparse." + torch._CAST_NAME[self.dtype.name] + "Tensor"
-    if _isinstance(dtype, _b.str):
+    if isinstance(dtype, _b.str):
         name = dtype.rsplit(".", 1)[-1]
         if name not in torch._LEGACY_TYPES:
             raise RuntimeError("invalid type: '%s'" % dtype)
@@ -1981,7 +1981,7 @@ def _m_deepcopy(self, memo):
 
 
 def _m_radd(self, other):
-    if _isinstance(other, _T):
+    if isinstance(other, _T):
         return torch.add(other, self)
     return torch.add(self, other)
 
@@ -2047,13 +2047,13 @@ def _m_copy_(self, src, non_blocking=False):
 
 def _m_new(self, *args, **kwargs):
     dt = kwargs.get("dtype", self.dtype)
-    if _len(args) >= 2 and _isinstance(args[0], _T) and _isinstance(args[1], _T):
-        size = args[2] if _len(args) > 2 else kwargs.get("size")
+    if len(args) >= 2 and isinstance(args[0], _T) and isinstance(args[1], _T):
+        size = args[2] if len(args) > 2 else kwargs.get("size")
         return _sparse_coo_tensor(args[0], args[1], size)
-    if _len(args) == 1 and _isinstance(args[0], (_tuple, _list, _Size)):
+    if len(args) == 1 and isinstance(args[0], (_tuple, _list, _Size)):
         args = _tuple(args[0])
     shape = _tuple(_int(a) for a in args) if args else (0,)
-    return _make_coo(torch.zeros((_len(shape), 0), dtype=_int64), torch.zeros(0, dtype=dt), shape, True)
+    return _make_coo(torch.zeros((len(shape), 0), dtype=_int64), torch.zeros(0, dtype=dt), shape, True)
 
 
 def _m_resize_as_(self, other, memory_format=None):
@@ -2102,8 +2102,8 @@ def _m_item(self):
 def _m_stride(self, dim=None):
     if self.layout is not _coo:
         raise RuntimeError("Sparse %s tensors do not have strides" % ("CSR" if self.layout is _csr else "CSC"))
-    s = (0,) * _len(self.shape)
-    return s if dim is None else s[torch._norm_dim(dim, _len(self.shape))]
+    s = (0,) * len(self.shape)
+    return s if dim is None else s[torch._norm_dim(dim, len(self.shape))]
 
 
 def _m_is_contiguous(self, memory_format=None):
