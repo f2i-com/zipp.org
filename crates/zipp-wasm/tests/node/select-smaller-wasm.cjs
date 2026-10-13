@@ -37,5 +37,5 @@ if (require.main === module) {
   const after = size(candidate);
   const accepted = chooseCandidate(before, after, preferRawSize);
   if (accepted) fs.writeFileSync(originalPath, candidate);
-  console.log(JSON.stringify({ optimizer: 'Binaryen 125 -O1 -O1', preferRawSize, accepted, before, candidate: after }));
+  console.log(JSON.stringify({ optimizer: 'Binaryen 125 precompute + RSE, -O1 -O1, ordered by signature and body', preferRawSize, accepted, before, candidate: after }));
 }

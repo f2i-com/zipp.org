@@ -105,6 +105,9 @@ top of each file if you put it elsewhere).
   CANDIDATE_NODE_DIR` on an idle host, repeat with both package orders, and
   inspect individual cases as well as the raw samples. This is a focused
   startup screen, not a general throughput guarantee.
+- **order-functions.cjs** — not a test: `optimize-wasm.sh` uses it to name
+  each function by its place in a signature-then-body order, which
+  `wasm-opt --reorder-functions-by-name` then applies (and drops the names).
 - **select-smaller-wasm-policy.cjs** — verifies that full builds retain the
   strict download-size rule and Lite's explicit raw-size preference stays
   within its minimum saving and maximum download-growth limits. Run with Node;
