@@ -262,11 +262,19 @@ impl<'p> Vm<'p> {
                     }
                     None => match call {
                         // A property: its getter's frame, as `PyCall` pushes
-                        // a callee's (`usize::MAX`), the result for `dst`.
-                        Some(a) => {
-                            self.py_push_accessor(a, base, obj, None, dst, ip)?;
-                            usize::MAX
-                        }
+                        // a callee's (`usize::MAX`), the result for `dst`;
+                        // a getter that only reads an attribute its own
+                        // site's entry holds, without the frame.
+                        Some(a) => match self.py_accessor_inline(&a, o, None) {
+                            Some(v) => {
+                                self.set(base, dst, v);
+                                ip + 1
+                            }
+                            None => {
+                                self.py_push_accessor(a, base, obj, None, dst, ip)?;
+                                usize::MAX
+                            }
+                        },
                         None => slow as usize,
                     },
                 }
@@ -280,10 +288,15 @@ impl<'p> Vm<'p> {
                 } else {
                     match call {
                         // A property: its setter's frame, whose result is
-                        // dropped.
+                        // dropped; a setter that only stores an attribute
+                        // its own site's entry holds, without the frame.
                         Some(a) => {
-                            self.py_push_accessor(a, base, obj, Some(v), super::ic::RET_DISCARD, ip)?;
-                            usize::MAX
+                            if self.py_accessor_inline(&a, o, Some(v)).is_some() {
+                                ip + 1
+                            } else {
+                                self.py_push_accessor(a, base, obj, Some(v), super::ic::RET_DISCARD, ip)?;
+                                usize::MAX
+                            }
                         }
                         None => slow as usize,
                     }

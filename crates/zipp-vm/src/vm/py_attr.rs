@@ -234,6 +234,46 @@ impl<'p> Vm<'p> {
         (!p.is_generator && !p.is_async && p.rest_reg.is_none() && p.param_count as usize >= argc).then_some(PyAccessor { fid, closure, f, entry })
     }
 
+    /// What the frame of the property accessor `a` would answer for the
+    /// instance `o`, without the frame, when the accessor's code is only
+    /// `return self.<name>` (a getter, `value` `None`) or `self.<name> =
+    /// value` (a setter) and that one attribute instruction's own cache
+    /// entry holds for `o` ([`Vm::py_attr_get_hit`] /
+    /// [`Vm::py_attr_set_hit`] at the accessor's own site): the read's value,
+    /// or `undefined` for a store made. The code is checked exactly: a
+    /// parameter for each value and no defaults, the runtime's load (which
+    /// changes nothing but its register), the instruction on the first
+    /// parameter, then the return of what it read (or of `None`). `None`,
+    /// with nothing done, for anything else, whereupon the frame is pushed as
+    /// before; and under `ZIPP_PY_PROF`, which counts the frame's call.
+    pub(super) fn py_accessor_inline(&mut self, a: &PyAccessor, o: Value, value: Option<Value>) -> Option<Value> {
+        use crate::bytecode::Instr;
+        if super::prof_py::on() {
+            return None;
+        }
+        let p = self.func(a.fid as usize);
+        match value {
+            None => {
+                let simple = p.param_count == 1
+                    && matches!(*p.code.as_slice(),
+                        [Instr::LoadGlobal { .. }, Instr::PyGetAttr { dst, obj: 1, .. }, Instr::Return { src }, ..] if src == dst && dst > 1);
+                if !simple {
+                    return None;
+                }
+                self.py_attr_get_hit(a.fid, 1, o)
+            }
+            Some(v) => {
+                let simple = p.param_count == 2
+                    && matches!(*p.code.as_slice(),
+                        [Instr::LoadGlobal { .. }, Instr::PySetAttr { obj: 1, val: 2, .. }, Instr::LoadNull { dst }, Instr::Return { src }, ..] if src == dst);
+                if !simple {
+                    return None;
+                }
+                self.py_attr_set_hit(a.fid, 1, o, v).then_some(Value::UNDEFINED)
+            }
+        }
+    }
+
     /// Whether `name` is, for `cls`, a property with a Python accessor a
     /// frame is pushed for (`table` / `table_key`: the class's `gp` or
     /// `sp`; `entry_key`: `c1` or `c2`, taking `argc` values): this site's
