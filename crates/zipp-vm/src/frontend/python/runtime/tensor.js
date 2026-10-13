@@ -39,7 +39,14 @@
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
         N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23,
-        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32, N_RNG = 33;
+        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32, N_RNG = 33, N_LOCAL = 34;
+    // The engine's own loops (`N_LOCAL` answers true) cost less per call
+    // than an interpreted loop of 16 elements, so the elementwise kernels,
+    // reductions and copies take them from there. A torch package in its own
+    // module (`wire`) pays an encode and a copy of every buffer per call and
+    // keeps NATIVE_MIN.
+    let NATIVE_SMALL = NATIVE_MIN;
+    try { if (NATIVE_FN !== null && NATIVE_FN(N_LOCAL) === true) NATIVE_SMALL = 16; } catch (e) { NATIVE_SMALL = NATIVE_MIN; }
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -435,7 +442,7 @@
             else return undefined;
         }
         const n = mode === 2 || mode === 4 ? nb : na, O = dt === "float32" ? new Float32Array(n) : new Float64Array(n);
-        if (n >= NATIVE_MIN && NATIVE !== null && binaryFlat(code, A, B, O, mode, n, na, nb)) {
+        if (n >= NATIVE_SMALL && NATIVE !== null && binaryFlat(code, A, B, O, mode, n, na, nb)) {
             // (the native loop wrote O)
         } else if (mode === 0) {
             switch (code) {
@@ -492,7 +499,7 @@
         // From NATIVE_MIN elements the native loop, with the number in a
         // one-element array of the dtype (the storage `binary_scalar`
         // builds for it) broadcast over a flat [n] walk.
-        if (n >= NATIVE_MIN && NATIVE !== null) {
+        if (n >= NATIVE_SMALL && NATIVE !== null) {
             const Y = dt === "float32" ? new Float32Array(1) : new Float64Array(1);
             Y[0] = y;
             if (flip ? NATIVE(N_BINARY, code, Y, A, O, [n], [0], [1]) : NATIVE(N_BINARY, code, A, Y, O, [n], [1], [0]))
@@ -754,7 +761,7 @@
         // Same rank and (nonzero) size as an operand means the same shape.
         const outShape = n !== 0 && na === n && ashape.length === shape.length && tupleShape(apy) ? apy
             : n !== 0 && nb === n && bshape.length === shape.length && tupleShape(bpy) ? bpy : null;
-        if (n >= NATIVE_MIN && NATIVE !== null && BIN_CODE[op] !== undefined
+        if (n >= NATIVE_SMALL && NATIVE !== null && BIN_CODE[op] !== undefined
             && NATIVE(N_BINARY, BIN_CODE[op], A, Bd, O, shape, bstrides(ashape, shape), bstrides(bshape, shape)))
             { if (HALF[out.dtype] === 1) finish(out); return tuple([out, outShape === null ? pyShape(shape) : outShape]); }
         if (na === n && ashape.length === shape.length) {
@@ -1160,7 +1167,7 @@
         // (`work`, inline for a dtype that needs no scratch)
         const out = HALF[dtype] === 1 ? work(dtype, a.data.length) : { cls: Storage, dtype: dtype, data: new ARRAY[dtype](a.data.length), version: 0, untracked: 0 };
         const A = a.dtype === "bfloat16" ? wide(a) : a.data, O = out.data, n = O.length;
-        if (n >= NATIVE_MIN && NATIVE !== null && UN_CODE[op] !== undefined && NATIVE(N_UNARY, UN_CODE[op], A, O, lo, hi)) { if (HALF[out.dtype] === 1) finish(out); return out; }
+        if (n >= NATIVE_SMALL && NATIVE !== null && UN_CODE[op] !== undefined && NATIVE(N_UNARY, UN_CODE[op], A, O, lo, hi)) { if (HALF[out.dtype] === 1) finish(out); return out; }
         // The hot activations and their gradients inline; the expressions
         // are the table's own.
         switch (op) {
@@ -1223,7 +1230,7 @@
             const outer = first < 0 ? nIn : numel(shape.slice(0, first)), block = first < 0 ? 1 : numel(shape.slice(first, last + 1)), inner = first < 0 ? 1 : numel(shape.slice(last + 1));
             // The native loop accumulates as O does: rounding every update
             // when O is the float32 result itself, once on store otherwise.
-            if (nIn >= NATIVE_MIN && NATIVE !== null && NATIVE(N_REDUCE, RED_CODE[op], A, out.data, outer, block, inner, count, O === out.data))
+            if (nIn >= NATIVE_SMALL && NATIVE !== null && NATIVE(N_REDUCE, RED_CODE[op], A, out.data, outer, block, inner, count, O === out.data))
                 { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(finalShape)]); }
             let i = 0;
             switch (op) {
@@ -1316,7 +1323,7 @@
     // dim as an inline loop and no callback.
     function gatherStrided(O, A, shape, sa, base) {
         const rank = shape.length, n = O.length;
-        if (n >= NATIVE_MIN && NATIVE !== null && NATIVE(N_GATHER, A, O, shape, sa, base)) return;
+        if (n >= NATIVE_SMALL && NATIVE !== null && NATIVE(N_GATHER, A, O, shape, sa, base)) return;
         if (rank === 0) { if (n) O[0] = A[base]; return; }
         const lastN = shape[rank - 1], lastS = sa[rank - 1], idx = new Array(rank).fill(0);
         let x = base, o = 0;
@@ -1358,7 +1365,7 @@
         const outShape = p.map((d) => shape[d]);
         const inS = strides(shape), sa = p.map((d) => inS[d]);
         const out = alloc(a.dtype, a.data.length), O = out.data, A = a.data;
-        if (O.length >= NATIVE_MIN && NATIVE !== null && NATIVE(N_GATHER, A, O, outShape, sa, 0)) {
+        if (O.length >= NATIVE_SMALL && NATIVE !== null && NATIVE(N_GATHER, A, O, outShape, sa, 0)) {
             // The strided walk, run natively.
         } else if (rank === 2 && p[0] === 1 && p[1] === 0) {
             // A matrix transpose (every Linear's weight.T): column by column.
@@ -1493,7 +1500,7 @@
         const outShape = shape.slice(); outShape[d] = I.length;
         const inner = numel(shape.slice(d + 1)), outer = numel(shape.slice(0, d));
         const out = alloc(a.dtype, numel(outShape)), O = out.data, A = a.data;
-        if (NATIVE !== null && O.length >= NATIVE_MIN && NATIVE(N_INDEX_SELECT, A, I, O, outer, shape[d], inner)) return tuple([out, pyShape(outShape)]);
+        if (NATIVE !== null && O.length >= NATIVE_SMALL && NATIVE(N_INDEX_SELECT, A, I, O, outer, shape[d], inner)) return tuple([out, pyShape(outShape)]);
         let o = 0;
         for (let x = 0; x < outer; x++) for (let i = 0; i < I.length; i++) {
             let j = I[i]; if (j < 0) j += shape[d]; if (j < 0 || j >= shape[d]) fail(E.IndexError, "index out of range");
@@ -1812,7 +1819,7 @@
         const out = work(dtype, numel(shape)), O = out.data;
         const sc = bstrides(cs, shape), sa = bstrides(as_, shape), sb = bstrides(bs, shape);
         const Cd = c.data, Ad = vals(a), Bd = vals(b);
-        if (O.length >= NATIVE_MIN && NATIVE !== null && NATIVE(N_WHERE, Cd, Ad, Bd, O, shape, sc, sa, sb)) { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(shape)]); }
+        if (O.length >= NATIVE_SMALL && NATIVE !== null && NATIVE(N_WHERE, Cd, Ad, Bd, O, shape, sc, sa, sb)) { if (HALF[out.dtype] === 1) finish(out); return tuple([out, pyShape(shape)]); }
         const rank = shape.length, idx = new Array(rank).fill(0);
         let oc = 0, oa = 0, ob = 0;
         for (let flat = 0; flat < O.length; flat++) {

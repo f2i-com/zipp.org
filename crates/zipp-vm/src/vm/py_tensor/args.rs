@@ -5,6 +5,10 @@
 
 /// `all_finite`: answers a bool, or null when it declines.
 pub(crate) const OP_ALL_FINITE: u32 = 11;
+/// Whether the kernels run in the engine's own process (true) or across
+/// modules (`wire`, false): tensor.js takes the native loops for smaller
+/// operands when a call costs no request.
+pub(crate) const OP_LOCAL: u32 = 34;
 
 // TypedArray kinds (`native::TA_KINDS`) a tensor storage can be. An int8
 // storage (Int8Array) reaches only the quantization kernels

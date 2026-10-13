@@ -111,7 +111,7 @@ impl Vm<'_> {
         #[cfg(not(feature = "python-no-torch"))]
         let outcome = kernels::run(self, op, &a);
         #[cfg(feature = "python-no-torch")]
-        let outcome = self.pt_bridge(op, &a);
+        let outcome = if op == args::OP_LOCAL { Outcome::Answer(false) } else { self.pt_bridge(op, &a) };
         Ok(match outcome {
             Outcome::Done => Value::bool(true),
             Outcome::Declined => Value::bool(false),

@@ -334,6 +334,44 @@ for dt in ["float32", "float64", "int64", "int32"]:
         if dt in ("int64", "int32") and (st != int(st) or step != int(step)):
             continue
         both("arange %s %s %s %d" % (dt, st, step, n), lambda: _k.arange(dt, st, step, n))
+# Operands of 16 to 63 elements, which the engine's own native loops take
+# (NATIVE_SMALL) where the JavaScript loops ran before.
+for op in ["add", "sub", "mul", "div", "pow", "max", "lt", "floordiv"]:
+    for dt in ["float32", "float64", "int64"]:
+        for sa, sb in [((16,), (16,)), ((4, 12), (4, 12)), ((4, 12), (12,)), ((12,), (4, 12)), ((63,), ()), ((), (17,)), ((3, 1, 6), (1, 5, 6)), ((5, 7), (5, 1))]:
+            seed += 1
+            A = storage(dt, sa, seed)
+            B = storage(dt, sb, seed + 1)
+            both("small binary %s %s %s %s" % (op, dt, sa, sb), lambda: _k.binary(op, A, sa, B, sb))
+        for flip in (False, True):
+            seed += 1
+            A = storage(dt, (4, 12), seed)
+            v = 3 if dt == "int64" else 2.5
+            both("small binary_scalar %s %s %s" % (op, dt, flip), lambda: _k.binary_scalar(op, A, (4, 12), v, dt, dt, flip))
+for op in ["neg", "relu", "exp", "log", "tanh", "sigmoid", "sqrt", "square", "abs", "gelu", "gelu_grad", "silu", "reciprocal"]:
+    for dt in ["float32", "float64"]:
+        for n in (16, 48, 63):
+            seed += 1
+            A = storage(dt, (n,), seed)
+            both("small unary %s %s %d" % (op, dt, n), lambda: _k.unary(op, A))
+for op in ["sum", "mean", "prod", "max", "argmax", "all"]:
+    for dt in ["float32", "float64", "int64"]:
+        for shape, dims in [((48,), None), ((4, 12), (0,)), ((4, 12), (1,)), ((2, 3, 8), (0, 1)), ((2, 3, 8), (1,))]:
+            for precise in (False, True):
+                seed += 1
+                A = storage(dt, shape, seed)
+                both("small reduce %s %s %s %s %s" % (op, dt, shape, dims, precise), lambda: _k.reduce(op, A, shape, dims, True, precise))
+for dt in ["float32", "float64", "int64", "bool"]:
+    seed += 1
+    A = storage(dt, (3, 4, 5), seed)
+    C = storage("bool", (3, 1, 5), seed + 1)
+    Bv = storage(dt, (4, 1), seed + 2)
+    I = _k.from_flat("int64", [2, 0, 1, 1, 0, 2])
+    both("small where %s" % dt, lambda: _k.where(C, (3, 1, 5), A, (3, 4, 5), Bv, (4, 1)))
+    both("small slice %s" % dt, lambda: _k.slice(A, (3, 4, 5), [None, (1, None, 1), (0, 5, 2)]))
+    both("small permute %s" % dt, lambda: _k.permute(A, (3, 4, 5), (2, 0, 1)))
+    both("small expand %s" % dt, lambda: _k.expand(Bv, (4, 1), (5, 4, 3)))
+    both("small index_select %s" % dt, lambda: _k.index_select(A, (3, 4, 5), 0, I))
 # The small add/sub/mul/div loop (fewer than 64 elements, no helper calls)
 # against the same values in operands long enough for the native loop:
 # element i of the long result is element i % n of the short one.

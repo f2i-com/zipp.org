@@ -711,6 +711,7 @@ match op {
         OP_OPTIM => Outcome::ran(h.pt_optim(a).is_some()),
         OP_CELL => Outcome::ran(h.pt_cell(a).is_some()),
         OP_RNG => Outcome::ran(h.pt_rng(a).is_some()),
+        OP_LOCAL => Outcome::Answer(true),
         _ => Outcome::Declined,
 }
 }
