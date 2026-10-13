@@ -62,6 +62,12 @@ pub(super) struct Scope {
     /// Names an `import` statement of this scope's own code binds (to a
     /// module, unless something else rebinds them).
     pub imports: BTreeSet<String>,
+    /// Whether a `global` statement of this scope's own code names a
+    /// global (in a function, the only way its code can store or delete
+    /// one: an undeclared name it binds is local).
+    pub declares_global: bool,
+    /// Whether this scope's own code has a `for` or `while` statement.
+    pub has_loop: bool,
     /// A list, set or dict comprehension the emitter compiles inline in
     /// the enclosing function or module code (PEP 709) rather than as a
     /// code object of its own: not a generator expression, not in a class
@@ -101,6 +107,7 @@ struct Raw {
     uses_class_cell: bool,
     walrus_targets: BTreeSet<String>,
     imports: BTreeSet<String>,
+    has_loop: bool,
     children: Vec<usize>,
 }
 
@@ -142,6 +149,7 @@ impl Raw {
             deleted: BTreeSet::new(),
             uses_class_cell: false,
             walrus_targets: BTreeSet::new(),
+            has_loop: false,
             imports: BTreeSet::new(),
             children: Vec::new(),
         }
@@ -265,12 +273,14 @@ impl Builder {
                 self.target(&a.target)?;
             }
             ast::Stmt::For(f) => {
+                self.raws[self.current].has_loop = true;
                 self.expr(&f.iter)?;
                 self.target(&f.target)?;
                 self.stmts(&f.body)?;
                 self.stmts(&f.orelse)?;
             }
             ast::Stmt::While(w) => {
+                self.raws[self.current].has_loop = true;
                 self.expr(&w.test)?;
                 self.stmts(&w.body)?;
                 self.stmts(&w.orelse)?;
@@ -925,6 +935,8 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             deleted: std::mem::take(&mut deleted[id]),
             uses_class_cell: raw.uses_class_cell,
             walrus_targets: raw.walrus_targets,
+            declares_global: !raw.globals.is_empty(),
+            has_loop: raw.has_loop,
             imports: raw.imports,
             inline: inline[id],
             offset: raw.offset,

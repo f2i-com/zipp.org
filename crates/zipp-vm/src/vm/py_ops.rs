@@ -982,7 +982,17 @@ impl<'p> Vm<'p> {
         }
         let gi = g.heap_index();
         let e = self.py_ic(func_id, ip);
-        if e.a != g.bits() || self.heap.version_of(gi) != e.hver {
+        if e.a != g.bits() {
+            // A function's record (lazy globals) stands for its globals.
+            return self.py_global_hit_lazy(&e, g, r);
+        }
+        self.py_global_hit_at(&e, g, gi, r)
+    }
+
+    /// [`Vm::py_global_hit`] past its entry's globals test.
+    #[inline(always)]
+    fn py_global_hit_at(&self, e: &PyIc, g: Value, gi: u32, r: Value) -> Option<Value> {
+        if self.heap.version_of(gi) != e.hver {
             return None;
         }
         if e.kind == ic::GLOBAL {
@@ -993,6 +1003,78 @@ impl<'p> Vm<'p> {
             return self.py_map_at_bits(b, e.pos, e.b, e.d);
         }
         None
+    }
+
+    /// [`Vm::py_global_hit`] handed a function's record (lazy globals): the
+    /// same answer for the record's globals.
+    #[inline(never)]
+    fn py_global_hit_lazy(&self, e: &PyIc, f: Value, r: Value) -> Option<Value> {
+        let g = self.py_globals_of(f)?;
+        if e.a != g.bits() {
+            return None;
+        }
+        self.py_global_hit_at(e, g, g.heap_index(), r)
+    }
+
+    /// [`Instr::PyGlobal`]'s `globals` operand as the module's globals: a
+    /// `Map` is itself; a plain record is a function's (the emitter's lazy
+    /// globals: a function that only reads globals hands its own record,
+    /// `this`, instead of reading its `globals` field on every call), whose
+    /// own data `globals` is read here: at its slot for a record of a shape
+    /// seen with it there (a shape fixes keys, order and kinds), else by
+    /// name ([`Vm::py_globals_learn`]). `None` (the slow edge) for anything
+    /// else. Out of line: a site handed the Map its entry names (every site
+    /// outside such a function) never calls it.
+    #[inline(never)]
+    pub(super) fn py_globals_of(&self, g: Value) -> Option<Value> {
+        if !g.is_heap() {
+            return None;
+        }
+        match self.heap.get(g.heap_index()) {
+            HeapObj::Map { .. } => Some(g),
+            HeapObj::Object(m) => {
+                if let Some(p) = self.py_rt.as_deref() {
+                    let (shape, slot) = (m.shape(), p.func_globals_slot.get() as usize);
+                    if shape != crate::shape::DICT && slot < m.len() && p.func_shapes.get().contains(&shape) {
+                        debug_assert!(
+                            m.key_at(slot) == "globals" && !m.is_accessor_at(slot),
+                            "a function record of a seen shape has no data `globals` at the seen slot"
+                        );
+                        let v = m.val_at(slot);
+                        return v.is_heap().then_some(v);
+                    }
+                }
+                self.py_globals_learn(g)
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Vm::py_globals_of`] of a function record of a shape not seen yet:
+    /// its `globals` by name (through the VM's hint), the record's shape
+    /// then noted with the slot (the shapes kept are those of one slot).
+    #[cold]
+    #[inline(never)]
+    fn py_globals_learn(&self, g: Value) -> Option<Value> {
+        let gi = g.heap_index();
+        let (v, slot) = self.py_hint_slot(super::py_rt::hint::GLOBALS, gi, "globals")?;
+        if !v.is_heap() {
+            return None;
+        }
+        if let (HeapObj::Object(m), Some(p), Ok(slot)) = (self.heap.get(gi), self.py_rt.as_deref(), u16::try_from(slot)) {
+            if m.shape_guardable() {
+                let mut shapes = p.func_shapes.get();
+                if p.func_globals_slot.get() != slot {
+                    shapes = [crate::shape::DICT; 4];
+                    p.func_globals_slot.set(slot);
+                }
+                // The first empty place, else the last place over again.
+                let at = shapes.iter().position(|&s| s == crate::shape::DICT).unwrap_or(3);
+                shapes[at] = m.shape();
+                p.func_shapes.set(shapes);
+            }
+        }
+        Some(v)
     }
 
     /// [`Instr::PyGlobal`]: a module global, else a builtin; `None` for the
@@ -1023,7 +1105,12 @@ impl<'p> Vm<'p> {
             }
         }
         if !matches!(self.heap.get(gi), HeapObj::Map { .. }) {
-            return None;
+            // A function's record (lazy globals): the same for its globals.
+            let m = self.py_globals_of(g)?;
+            if !matches!(self.heap.get(m.heap_index()), HeapObj::Map { .. }) {
+                return None;
+            }
+            return self.py_global(func_id, ip, m, r, key);
         }
         let k = self.resolve_const_slot(func_id, key);
         // Module globals are asked for every builtin name they lack: through

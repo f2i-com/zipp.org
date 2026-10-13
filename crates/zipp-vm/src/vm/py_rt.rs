@@ -226,6 +226,11 @@ pub(crate) struct PyRt {
     pub(super) tb_keep: usize,
     /// The generator record shape `vm::py_gen` found plain.
     pub(super) gen_shape: Cell<u32>,
+    /// Shapes of function records (`R.func`'s literal, and the shapes its
+    /// appends lead to) seen with their `globals` at `func_globals_slot`
+    /// (`shape::DICT`: an empty place), for `Vm::py_globals_of`.
+    pub(super) func_shapes: Cell<[u32; 4]>,
+    pub(super) func_globals_slot: Cell<u16>,
     /// The generator records' runtime array (`grt`) `vm::py_gen` last
     /// validated, by bits, and what it holds (the array is in `pins`).
     pub(super) gen_rt: Cell<Option<(u64, super::py_gen::GenRuntime)>>,
@@ -355,6 +360,8 @@ impl PyRt {
             frame_shape: crate::shape::DICT,
             tb_keep: 0,
             gen_shape: Cell::new(crate::shape::DICT),
+            func_shapes: Cell::new([crate::shape::DICT; 4]),
+            func_globals_slot: Cell::new(0),
             gen_rt: Cell::new(None),
             hints: std::array::from_fn(|_| Cell::new(0)),
             names: rustc_hash::FxHashMap::default(),
