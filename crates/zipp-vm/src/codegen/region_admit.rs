@@ -736,6 +736,16 @@ pub(crate) fn region_op_admitted(
         // protocol (an iterator or the callee is user code). MEM path only.
         Instr::IterToArray { count, .. } if const_strs.is_some() && count <= 0xFFFF => {}
         Instr::ArrayAppend { .. } | Instr::CallSpread { .. } if const_strs.is_some() => {}
+        // `Object.keys/values/entries(o)`, a for-in's key snapshot and its
+        // length: the interpreter's code through `jit_obj_enum_ic`, with the
+        // call protocol (a replaced builtin, a Proxy trap or a getter is
+        // user code). MEM path only.
+        Instr::ObjectKeys { .. }
+        | Instr::ObjectValues { .. }
+        | Instr::ObjectEntries { .. }
+        | Instr::ForInKeys { .. }
+        | Instr::LenOf { .. }
+            if const_strs.is_some() => {}
         // Array and object literals: the helpers Tier C calls (allocation is
         // a safe point; the emitter refetches after it).
         Instr::NewArray { .. }

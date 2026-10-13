@@ -1120,6 +1120,30 @@ pub(crate) extern "win64" fn jit_call_spread_ic(
     })
 }
 
+/// Win64 helper for the key-list instructions in a compiled region:
+/// `ObjectKeys` / `ObjectValues` / `ObjectEntries` (`Object.keys(o)` and
+/// friends, ops 0-2, `packed_args` = `obj | callee << 16 | this << 32`),
+/// `ForInKeys` (op 3, the for-in key snapshot, `obj`) and `LenOf` (op 4,
+/// `obj`), the op in bits 56..64. Each runs the interpreter's code for the
+/// instruction; a replaced `Object.keys`, a Proxy trap or a getter is user
+/// code, so the call protocol applies.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_obj_enum_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_obj_enum_impl(caller_base_ptr, packed_args)
+    })
+}
+
 /// Win64 helper for `ToStr` (a template literal's `${v}`) in a compiled region
 /// or Tier C body: `Vm::to_str_value` on register `packed_args & 0xFFFF`. An
 /// object's `toString`/`valueOf` (or `@@toPrimitive`) is user code, so the

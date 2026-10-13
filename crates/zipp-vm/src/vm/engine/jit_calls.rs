@@ -1050,6 +1050,87 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind [`jit_obj_enum_ic`]: the interpreter's arms
+    /// for `ObjectKeys`/`ObjectValues`/`ObjectEntries` (without the
+    /// interpreter-only whole-loop reductions), `ForInKeys` and `LenOf`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_obj_enum_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        use crate::vm::EnumWhat;
+        let op = (packed_args >> 56) as u8;
+        if op > 4 {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let obj = (packed_args & 0xFFFF) as u16;
+        if op == 4 {
+            // `LenOf`: no user code, no allocation.
+            let o = self.get(base, obj);
+            let v = if o.is_heap() {
+                match self.heap.get(o.heap_index()) {
+                    HeapObj::Array(items) => crate::vm::len_value(
+                        self.array_js_len
+                            .get(&o.heap_index())
+                            .map_or(items.len(), |&n| n as usize),
+                    ),
+                    HeapObj::Str(s) => crate::vm::len_value(s.units()),
+                    HeapObj::Cons { len, .. } => crate::vm::len_value(*len),
+                    HeapObj::Map { .. } | HeapObj::Set(_) => {
+                        crate::vm::len_value(self.coll_live_len(o.heap_index()))
+                    }
+                    _ => Value::int(0),
+                }
+            } else {
+                Value::int(0)
+            };
+            return v.bits();
+        }
+        // Each of the others allocates its list: the window's Values are
+        // roots, so the safe point precedes the operand reads.
+        self.maybe_gc();
+        self.jit_call_depth += 1;
+        let o = self.get(base, obj);
+        let r = if op == 3 {
+            // ForIn/OfHeadEvaluation: a null/undefined receiver iterates
+            // nothing (no ToObject error).
+            if o.is_nullish() {
+                Ok(Value::heap(self.heap.alloc(HeapObj::Array(Vec::new()))))
+            } else {
+                self.to_object(o).and_then(|o| self.for_in_keys(o))
+            }
+        } else {
+            let callee = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
+            let this_v = self.get(base, ((packed_args >> 32) & 0xFFFF) as u16);
+            let (native_id, what) = match op {
+                0 => (crate::vm::native::OBJ_KEYS, EnumWhat::Keys),
+                1 => (crate::vm::native::OBJ_VALUES, EnumWhat::Values),
+                _ => (crate::vm::native::OBJ_ENTRIES, EnumWhat::Entries),
+            };
+            if !self.static_builtin_is_intrinsic("Object", native_id, callee, this_v) {
+                self.call_value(callee, this_v, &[o])
+            } else {
+                self.require_object_coercible(o)
+                    .and_then(|()| self.to_object(o))
+                    .and_then(|o| self.object_enum_own(o, what))
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// The implementation behind [`jit_iter_to_array_ic`] (`op` 0),
     /// [`jit_array_append_ic`] (1) and [`jit_call_spread_ic`] (2). Every
     /// decline precedes the first effect.

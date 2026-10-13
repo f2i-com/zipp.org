@@ -3791,6 +3791,55 @@ pub(crate) fn compile_region_mem(
                     ta_refetch,
                 );
             }
+            Instr::ObjectKeys { dst, obj, callee, this_v }
+            | Instr::ObjectValues { dst, obj, callee, this_v }
+            | Instr::ObjectEntries { dst, obj, callee, this_v }
+                if !py =>
+            {
+                // `Object.keys(o)` and friends: `jit_obj_enum_ic`, with the
+                // call protocol.
+                let op: u64 = match proto.code[ip] {
+                    Instr::ObjectKeys { .. } => 0,
+                    Instr::ObjectValues { .. } => 1,
+                    _ => 2,
+                };
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_enum_ic as usize,
+                    packed_fip,
+                    obj as u64 | (callee as u64) << 16 | (this_v as u64) << 32 | op << 56,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::ForInKeys { dst, obj } | Instr::LenOf { dst, obj } if !py => {
+                // A for-in's key snapshot (op 3) and its length (op 4).
+                let op: u64 = if matches!(proto.code[ip], Instr::ForInKeys { .. }) {
+                    3
+                } else {
+                    4
+                };
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_enum_ic as usize,
+                    packed_fip,
+                    obj as u64 | op << 56,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
             Instr::ToStr { dst, a } if !py => {
                 // `${a}`: `jit_to_str_ic`, with the call protocol.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
