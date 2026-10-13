@@ -1,5 +1,81 @@
 # Zipp performance handoff
 
+### 14 October: sixteenth pass, local (`perf-round16`)
+
+The local branch `perf-round16` carries the sixteenth pass: 63 commits
+and 4 merges past `5cffc37a` to `1df54024`, plus the commit that records
+them. Nothing is pushed, `main` is unchanged and no release is cut; every
+commit carries `[skip ci]`. The record is
+[docs/validation/2026-10-14-engine-size-round16.md](docs/validation/2026-10-14-engine-size-round16.md).
+
+Four agents worked beside the main thread (Python speed, WebAssembly
+size, torch, and a regex engine of ZIPP's own, added at the user's
+request); their branches `worktree-agent-*` were merged whole and the
+merged tip was gated as one: full Test262 with the manifest, the
+default (328 binaries), Python and safe-sandbox suites, the `-D warnings`
+profiles, the Python corpus in four modes, `cargo test -p zipp-cli`, and
+the Node boundary suite on all four modules.
+
+**0.0.23 has six defects this branch fixes** (iterators' own properties
+and replaced generator methods, object spread running setters and
+replacing the prototype, a Proxy's `ownKeys` twice per `for-in`, linear
+`pop`, torch's optimizer steps and random streams). A release that
+carries them should say so.
+
+What the pass did, against 0.0.23:
+
+- JavaScript: loops that build literals, create closures, test
+  `instanceof`, switch on `typeof`, fill templates, pop, destructure,
+  spread, list keys or run a `for-in` now compile, and so do functions
+  with a rest parameter: those patterns 1.2 to 6 times faster.
+  Construction 2x. The 13 real rows are level with 0.0.23; the headline
+  ten are at 0.905x of Node 24 (`async-promise-chain` 1.14x and
+  `polymorphic-objects` 1.05x still behind).
+- Python: 1.31x to 1.21x CPython 3.13 over the 36-program suite.
+- torch: 16.7 to 5.2 times PyTorch's warm one-thread time.
+- Modules, Brotli: Lite -2.86%, JavaScript -3.27%, Python-base -2.58%,
+  Python + Torch -1.17%; WebAssembly speed level (Lite 1.003, JavaScript
+  0.990).
+- The regex crate a third smaller, a differential fuzzer against Node
+  with a 306-entry corpus, lazy-scan and backref patterns 4 to 30 times
+  faster.
+
+**Decisions that are the user's.**
+
+- Whether to push `perf-round16` to `main`, and whether and when to
+  release.
+- `b13da1e5` (torch's native elementwise loops over the typed arrays)
+  adds about 16 KB raw to Python + Torch and gains nothing in the
+  modules, only natively on large tensors.
+- Python docstrings (about 28 KB of Brotli in Python + Torch) and the
+  Unicode character-name table (16.8 KB) could be dropped; both are
+  visible to programs.
+
+**Leads for the next pass** (the record's "Leads" and "Not claimed"
+have the detail):
+
+- `arguments` functions are still interpreted (8x Node); a function that
+  only reads `arguments.length` and `arguments[i]` could compile as one
+  with a hidden rest array, now that rest functions compile.
+- A closure's capture list is its own allocation; closure factories are
+  4.4x Node, object spread 3.3x, spread calls 3.2x, Map/Set 2.9x.
+- `closure_make` and `regexp_test` probes read about 6% slower than
+  0.0.23; `polymorphic-objects` 2.1% (not the new outer-loop compile).
+  The modules' `regexp-matchall` and `regexp-unicode-compile` read 2 to
+  3.5% slower. None was run down.
+- Python rows still above 2x CPython: `instance_new`, `str_methods`,
+  `try_raise_catch`, `generator_iter`, `word_count`, `fstring`,
+  `oo_simulation`, `super_call`, `sort_heapq`, `method_call`,
+  `listcomp_small`.
+- The agents' unfixed findings are listed in the record.
+
+Local state not in the branch: worktrees under `target/wt/` and
+`.claude/worktrees/` (four agent worktrees, locked), probes and matrices
+under `target/r16-scratch` (each `*_matrix.js` with its Node output),
+gate scripts `target/r16-gate-{a,b}.sh` and `target/r16-measure.sh`, the
+modules under `target/size-audit/*-r16g`, builds under
+`target/bench-binaries` (`r16g.exe` is `1df54024`).
+
 ### 12 October: fifteenth pass, released as 0.0.23
 
 `main` carries the fifteenth pass: 68 commits past `6f5d8819` to
