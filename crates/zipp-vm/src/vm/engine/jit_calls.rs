@@ -1069,6 +1069,72 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind [`jit_obj_init_ic`]: the interpreter's
+    /// `ObjectSpread` and `InitDataProp` arms.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_obj_init_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let op = (packed_args >> 56) as u8;
+        let func_id = (packed_fip >> 32) as usize;
+        if op > 1 || func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let a = (packed_args & 0xFFFF) as u16;
+        let b = ((packed_args >> 16) & 0xFFFF) as u16;
+        if op == 0 {
+            // The spread allocates its keys and values: the window's Values
+            // are roots, so the safe point precedes the operand reads.
+            self.maybe_gc();
+        }
+        self.jit_call_depth += 1;
+        let o = self.get(base, a);
+        let r = if op == 0 {
+            let s = self.get(base, b);
+            self.object_spread(o, s)
+        } else {
+            let v = self.get(base, b);
+            let name = ((packed_args >> 32) & 0xFF_FFFF) as usize;
+            let func: &'p crate::bytecode::FuncProto = self.func(func_id);
+            match func.string_constants.get(name) {
+                None => Err(Thrown("InternalError: invalid static property name".to_string())),
+                Some(key) => {
+                    if o.is_heap() && matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+                        let oi = o.heap_index();
+                        // As the interpreter's arm: the holder -> value edge
+                        // is published before the direct ObjMap mutation.
+                        self.heap.write_barrier_val(oi, v);
+                        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                            m.define(key, v, crate::heap::PropAttr::data());
+                        }
+                        Ok(())
+                    } else if o.is_heap() {
+                        let k = key.to_string();
+                        self.set_prop(o, &k, v, false).map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(()) => o.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// The implementation behind [`jit_obj_enum_ic`]: the interpreter's arms
     /// for `ObjectKeys`/`ObjectValues`/`ObjectEntries` (without the
     /// interpreter-only whole-loop reductions), `ForInKeys` and `LenOf`.

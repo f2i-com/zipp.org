@@ -746,6 +746,11 @@ pub(crate) fn region_op_admitted(
         | Instr::ForInKeys { .. }
         | Instr::LenOf { .. }
             if const_strs.is_some() => {}
+        // `{ ...src, k: v }`: the spread and the literal's later named
+        // properties, through `jit_obj_init_ic` with the call protocol (the
+        // spread's getters are user code). MEM path only.
+        Instr::ObjectSpread { .. } if const_strs.is_some() => {}
+        Instr::InitDataProp { name, .. } if const_strs.is_some() && name <= 0xFF_FFFF => {}
         // Array and object literals: the helpers Tier C calls (allocation is
         // a safe point; the emitter refetches after it).
         Instr::NewArray { .. }

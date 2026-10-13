@@ -3840,6 +3840,41 @@ pub(crate) fn compile_region_mem(
                     ta_refetch,
                 );
             }
+            Instr::ObjectSpread { target, src } if !py => {
+                // `{ ...src }`: `jit_obj_init_ic` op 0, with the call protocol;
+                // the literal's own bits come back into its register.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_init_ic as usize,
+                    packed_fip,
+                    target as u64 | (src as u64) << 16,
+                    0,
+                    target,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::InitDataProp { obj, name, val } if !py => {
+                // A literal's named data property (`jit_obj_init_ic` op 1).
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_init_ic as usize,
+                    packed_fip,
+                    obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 1u64 << 56,
+                    0,
+                    obj,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
             Instr::ToStr { dst, a } if !py => {
                 // `${a}`: `jit_to_str_ic`, with the call protocol.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;

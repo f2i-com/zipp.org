@@ -1144,6 +1144,30 @@ pub(crate) extern "win64" fn jit_obj_enum_ic(
     })
 }
 
+/// Win64 helper for two object-literal instructions in a compiled region:
+/// `ObjectSpread` (`{ ...src }`, op 0, `packed_args` = `target | src << 16`)
+/// and `InitDataProp` (a literal's named data property after a spread or a
+/// computed key, op 1, `obj | val << 16 | name << 32`), the op in bits
+/// 56..64. Each runs the interpreter's code; the spread's getters (and a
+/// Proxy's traps) are user code, so the call protocol applies. The
+/// literal's own bits come back, stored over its register unchanged.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_obj_init_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_obj_init_impl(caller_base_ptr, packed_fip, packed_args)
+    })
+}
+
 /// Win64 helper for `ToStr` (a template literal's `${v}`) in a compiled region
 /// or Tier C body: `Vm::to_str_value` on register `packed_args & 0xFFFF`. An
 /// object's `toString`/`valueOf` (or `@@toPrimitive`) is user code, so the
