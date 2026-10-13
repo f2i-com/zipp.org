@@ -35,8 +35,12 @@ def argv_for(engine, path):
 
 def run_once(engine, path):
     env = dict(os.environ)
+    # On Windows the engine runs at high priority, so builds and other work on
+    # the machine disturb the timing less.
+    flags = 0x00000080 if os.name == "nt" else 0
     p = subprocess.run(argv_for(engine, path), cwd=HERE, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", env=env, timeout=1200)
+                       encoding="utf-8", errors="replace", env=env, timeout=1200,
+                       creationflags=flags)
     for line in p.stdout.splitlines():
         parts = line.split(" ", 3)
         if len(parts) == 4 and parts[2] == "ms":
