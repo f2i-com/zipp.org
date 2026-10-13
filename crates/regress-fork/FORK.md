@@ -312,3 +312,15 @@ instruction to `back_step`, which runs it right to left; a right-to-left
 one-character loop tests its body through `scm::Dyn`, one matcher for every
 body type. Each instruction still costs one step: the step counts in
 `tests/step_counts.rs` are those of the per-direction matcher.
+
+## Lazy one-character loops read ahead only as far as the match needs
+
+Upstream ran a lazy one-character loop (`.*?`, `\w+?`) by scanning its
+whole run to the maximum on entry and backtracking through it one position
+at a time. The scan made `/<b>(.*?)<\/b>/g` quadratic over text without a
+line terminator: each match read the rest of the subject. The loop now
+takes its minimum, and each backtrack into it (`NonGreedyLoop1Char`,
+holding the position reached and the iterations left) tests the body at
+one more position. The regex JIT's lazy loops do the same. The positions
+tried, and so every result, are unchanged; the steps charged are not (see
+`tests/step_counts.rs`).

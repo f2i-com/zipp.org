@@ -138,10 +138,13 @@ enum BacktrackInsn<Input: InputIndexer> {
         max: Input::Position,
     },
 
+    /// A lazy one-character loop at `loop_ip` stopped at `pos`: backtracking
+    /// into it takes one more iteration there, if `remaining` allows one and
+    /// the body matches, and resumes after the loop.
     NonGreedyLoop1Char {
-        continuation: IP,
-        min: Input::Position,
-        max: Input::Position,
+        loop_ip: IP,
+        pos: Input::Position,
+        remaining: usize,
     },
 
     /// The two above for a loop that runs right to left (in a lookbehind):
@@ -154,9 +157,9 @@ enum BacktrackInsn<Input: InputIndexer> {
     },
 
     NonGreedyLoop1CharBack {
-        continuation: IP,
-        min: Input::Position,
-        max: Input::Position,
+        loop_ip: IP,
+        pos: Input::Position,
+        remaining: usize,
     },
 }
 
@@ -725,18 +728,6 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         Some((min_pos, max_pos))
     }
 
-    // Compute the maximum position for a non-greedy single-character loop.
-    #[cfg(feature = "compact-utf16")]
-    fn compute_max_pos<Dir: Direction, Scm: SingleCharMatcher<Input, Dir>>(
-        input: &Input,
-        pos: Input::Position,
-        limit: usize,
-        dir: Dir,
-        matcher: Scm,
-        budget: &mut MatchBudget,
-    ) -> Option<Input::Position> {
-        Self::scan_scm_loop(input, pos, limit, dir, &matcher, budget).map(|(pos, _)| pos)
-    }
 
     // Drive the loop up to \p max times.
     // \return the position (min, max), or None on failure.
@@ -779,29 +770,6 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         Some((min_pos, max_pos))
     }
 
-    // Compute the maximum position from a starting position, up to a limit.
-    // This is used for lazy computation in non-greedy loops.
-    #[cfg(not(feature = "compact-utf16"))]
-    fn compute_max_pos<Dir: Direction, Scm: SingleCharMatcher<Input, Dir>>(
-        input: &Input,
-        mut pos: Input::Position,
-        limit: usize,
-        dir: Dir,
-        matcher: Scm,
-        budget: &mut MatchBudget,
-    ) -> Option<Input::Position> {
-        for _ in 0..limit {
-            if !budget.consume(1) {
-                return None;
-            }
-            let saved = pos;
-            if !matcher.matches(input, dir, &mut pos) {
-                pos = saved;
-                break;
-            }
-        }
-        Some(pos)
-    }
 
     // Helper function to extract the duplicated match blocks that handle different instruction types
     // with different matcher functions. This significantly reduces code duplication and compile times.
@@ -906,148 +874,46 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         }
     }
 
-    // Helper function for compute_max_pos to avoid duplication
-    fn with_scm_compute_max<Dir: Direction>(
-        re: &CompiledRegex,
-        input: &Input,
-        pos: Input::Position,
-        limit: usize,
-        dir: Dir,
-        ip: IP,
-        budget: &mut MatchBudget,
-    ) -> Option<Input::Position> {
-        match re.insns.iat(ip + 1) {
-            &Insn::Char(c) => {
-                let c = <<Input as InputIndexer>::Element as ElementType>::try_from(c)?;
-                Self::compute_max_pos(input, pos, limit, dir, scm::Char { c }, budget)
-            }
-            &Insn::CharICase(c) => {
-                let c = <<Input as InputIndexer>::Element as ElementType>::try_from(c)?;
-                Self::compute_max_pos(input, pos, limit, dir, scm::CharICase { c }, budget)
-            }
-            &Insn::Bracket(idx) => {
-                let bc = &re.brackets[idx];
-                Self::compute_max_pos(input, pos, limit, dir, scm::Bracket { bc }, budget)
-            }
-            Insn::AsciiBracket(bitmap) => Self::compute_max_pos(
-                input,
-                pos,
-                limit,
-                dir,
-                scm::MatchByteSet { bytes: bitmap },
-                budget,
-            ),
-            Insn::MatchAny => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchAny::new(), budget)
-            }
-            Insn::MatchAnyExceptLineTerminator => Self::compute_max_pos(
-                input,
-                pos,
-                limit,
-                dir,
-                scm::MatchAnyExceptLineTerminator::new(),
-                budget,
-            ),
-            Insn::CharSet(chars) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::CharSet { chars }, budget)
-            }
-            &Insn::ByteSet2(bytes) => Self::compute_max_pos(
-                input,
-                pos,
-                limit,
-                dir,
-                scm::MatchByteArraySet(bytes),
-                budget,
-            ),
-            &Insn::ByteSet3(bytes) => Self::compute_max_pos(
-                input,
-                pos,
-                limit,
-                dir,
-                scm::MatchByteArraySet(bytes),
-                budget,
-            ),
-            &Insn::ByteSet4(bytes) => Self::compute_max_pos(
-                input,
-                pos,
-                limit,
-                dir,
-                scm::MatchByteArraySet(bytes),
-                budget,
-            ),
-            Insn::ByteSeq1(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq2(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq3(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq4(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq5(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            Insn::ByteSeq6(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
-            }
-            // No instruction in the message: formatting one here was the only
-            // thing that kept `Insn`'s derived `Debug`, and every type it
-            // reaches, in a release module (about 22 KB of WebAssembly).
-            _ => {
-                unreachable!("Missing SCM");
-            }
+
+
+    /// The body of the right-to-left one-character loop at `ip`, tested
+    /// through `scm::Dyn`: one instance of the loop machinery serves every
+    /// body type, where the forward direction keeps one per type. A body
+    /// character the input's element type cannot hold fails the loop before
+    /// it runs, as `with_scm_loop_impl` does going forward.
+    fn back_loop_body(&self, ip: IP) -> Option<scm::Dyn<'a>> {
+        let re: &'a CompiledRegex = self.re;
+        let body = match re.insns.iat(ip + 1) {
+            Insn::Back(inner) => &**inner,
+            body => body,
+        };
+        if let &Insn::Char(c) | &Insn::CharICase(c) = body {
+            <<Input as InputIndexer>::Element as ElementType>::try_from(c)?;
         }
+        Some(scm::Dyn { re, insn: body })
     }
 
-    // The [min, max] positions of a forward one-character loop, with the body
-    // matcher chosen by the body instruction's type.
-    #[inline(always)]
-    fn forward_scm_loop_bounds<Dir: Direction>(
+    /// One more iteration of the lazy one-character loop at `ip`, from `at`:
+    /// one step, and its body tested there, through the same loop machinery
+    /// as the loop's minimum. \return the position after it, or Some(None) if
+    /// the body does not match; None when the budget is spent.
+    fn lazy_step<Dir: Direction>(
         &mut self,
         input: &Input,
-        pos: Input::Position,
-        (min, max): (usize, usize),
         dir: Dir,
         ip: IP,
-        greedy: bool,
-    ) -> Option<(Input::Position, Input::Position)> {
-        // For non-greedy loops, we can avoid computing the maximum match eagerly.
-        // We'll only compute it when we need to set up backtracking.
-        if greedy {
-            // For greedy loops, compute both min and max positions
-            Self::with_scm_loop_impl(self.re, input, pos, (min, max), dir, ip, &mut self.budget)
+        at: Input::Position,
+    ) -> Option<Option<Input::Position>> {
+        let one = if Dir::FORWARD {
+            Self::with_scm_loop_impl(self.re, input, at, (1, 1), dir, ip, &mut self.budget)
         } else {
-            // For non-greedy loops, initially only compute the minimum position
-            let (min_pos, _) = Self::with_scm_loop_impl(
-                self.re,
-                input,
-                pos,
-                (min, min),
-                dir,
-                ip,
-                &mut self.budget,
-            )?;
-
-            // For non-greedy loops, we only compute the max position if we need to set up backtracking
-            let max_pos = if min < max {
-                // We need to compute the max for backtracking purposes
-                Self::with_scm_compute_max(
-                    self.re,
-                    input,
-                    min_pos,
-                    max - min,
-                    dir,
-                    ip,
-                    &mut self.budget,
-                )?
-            } else {
-                min_pos
-            };
-            Some((min_pos, max_pos))
+            let body = self.back_loop_body(ip)?;
+            Self::run_scm_loop_impl(input, at, 1, 1, dir, body, &mut self.budget)
+        };
+        if self.budget.exhausted() {
+            return None;
         }
+        Some(one.map(|(next, _)| next))
     }
 
     // Given that ip points at a loop whose body matches exactly one character, run
@@ -1067,34 +933,40 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         greedy: bool,
         possessive: bool,
     ) -> Option<IP> {
-        let (min_pos, max_pos) = if Dir::FORWARD {
-            self.forward_scm_loop_bounds(input, *pos, (min, max), dir, ip, greedy)?
-        } else {
-            // A loop running right to left (in a lookbehind) tests its body
-            // through `scm::Dyn`: one instance of the loop machinery serves
-            // every body type, where the forward direction keeps one per
-            // type. A body character the input's element type cannot hold
-            // fails the loop before it runs, as `with_scm_loop_impl` does.
-            let body = match self.re.insns.iat(ip + 1) {
-                Insn::Back(inner) => &**inner,
-                body => body,
-            };
-            if let &Insn::Char(c) | &Insn::CharICase(c) = body {
-                <<Input as InputIndexer>::Element as ElementType>::try_from(c)?;
-            }
-            let body = scm::Dyn { re: self.re, insn: body };
-            let budget = &mut self.budget;
-            if greedy {
-                Self::run_scm_loop_impl(input, *pos, min, max, dir, body, budget)?
+        let continuation = ip + 2;
+        if !greedy {
+            // A lazy loop takes its minimum now, and one more iteration each
+            // time the matcher backtracks into it (NonGreedyLoop1Char): the
+            // run beyond the minimum is read only as far as the match needs,
+            // where it used to be scanned to its end on every entry, which
+            // made `(.*?)` quadratic in the distance to a line terminator.
+            let min_pos = if Dir::FORWARD {
+                Self::with_scm_loop_impl(self.re, input, *pos, (min, min), dir, ip, &mut self.budget)?
+                    .0
             } else {
-                let (min_pos, _) = Self::run_scm_loop_impl(input, *pos, min, min, dir, body, budget)?;
-                let max_pos = if min < max {
-                    Self::compute_max_pos(input, min_pos, max - min, dir, body, budget)?
+                let body = self.back_loop_body(ip)?;
+                Self::run_scm_loop_impl(input, *pos, min, min, dir, body, &mut self.budget)?.0
+            };
+            // No entry if the loop cannot take another iteration here.
+            if min < max && self.lazy_step(input, dir, ip, min_pos)?.is_some() {
+                let (loop_ip, pos, remaining) = (ip, min_pos, max - min);
+                let bti = if Dir::FORWARD {
+                    BacktrackInsn::NonGreedyLoop1Char { loop_ip, pos, remaining }
                 } else {
-                    min_pos
+                    BacktrackInsn::NonGreedyLoop1CharBack { loop_ip, pos, remaining }
                 };
-                (min_pos, max_pos)
+                if !self.push_backtrack(bti) {
+                    return None;
+                }
             }
+            *pos = min_pos;
+            return Some(continuation);
+        }
+        let (min_pos, max_pos) = if Dir::FORWARD {
+            Self::with_scm_loop_impl(self.re, input, *pos, (min, max), dir, ip, &mut self.budget)?
+        } else {
+            let body = self.back_loop_body(ip)?;
+            Self::run_scm_loop_impl(input, *pos, min, max, dir, body, &mut self.budget)?
         };
 
         debug_assert!(
@@ -1106,9 +978,6 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             "min should be <= (>=) max if cursor is tracking forwards (backwards)"
         );
 
-        // Oh no where is the continuation? It's one past the loop body, which is one
-        // past the loop. Strap in!
-        let continuation = ip + 2;
         // PATCH (see possessify.rs): a possessive greedy loop's backtrack
         // entry is provably dead — every retry re-tests a disjoint follow at
         // a position holding a loop-class character — so skip the push. If
@@ -1127,26 +996,19 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         }
         if min_pos != max_pos {
             // Backtracking is possible.
+            rxstat!(GREEDY1_PUSHES);
             let (min, max) = (min_pos, max_pos);
-            let bti = match (greedy, Dir::FORWARD) {
-                (true, true) => {
-                    rxstat!(GREEDY1_PUSHES);
-                    BacktrackInsn::GreedyLoop1Char { continuation, min, max }
-                }
-                (true, false) => {
-                    rxstat!(GREEDY1_PUSHES);
-                    BacktrackInsn::GreedyLoop1CharBack { continuation, min, max }
-                }
-                (false, true) => BacktrackInsn::NonGreedyLoop1Char { continuation, min, max },
-                (false, false) => BacktrackInsn::NonGreedyLoop1CharBack { continuation, min, max },
+            let bti = if Dir::FORWARD {
+                BacktrackInsn::GreedyLoop1Char { continuation, min, max }
+            } else {
+                BacktrackInsn::GreedyLoop1CharBack { continuation, min, max }
             };
             if !self.push_backtrack(bti) {
                 return None;
             }
         }
 
-        // Start at the max (min) if greedy (nongreedy).
-        *pos = if greedy { max_pos } else { min_pos };
+        *pos = max_pos;
         Some(continuation)
     }
 
@@ -1246,6 +1108,46 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             self.budget.release_scratch_capacity(saved_group_bytes);
             restoration_ok && matched != negate
         }
+    }
+
+    /// Backtrack into the lazy loop entry on top of the stack (`loop_ip`,
+    /// stopped at `at` with `remaining` iterations allowed). \return
+    /// Some(true) after moving into its next iteration, Some(false) after
+    /// popping it, None when the budget is spent.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn lazy_retry<Dir: Direction>(
+        &mut self,
+        input: &Input,
+        dir: Dir,
+        loop_ip: IP,
+        at: Input::Position,
+        remaining: usize,
+        ip: &mut IP,
+        pos: &mut Input::Position,
+    ) -> Option<bool> {
+        let next = if remaining == 0 {
+            None
+        } else {
+            self.lazy_step(input, dir, loop_ip, at)?
+        };
+        let Some(next) = next else {
+            self.pop_backtrack();
+            return Some(false);
+        };
+        match self.bts.last_mut() {
+            Some(
+                BacktrackInsn::NonGreedyLoop1Char { pos, remaining, .. }
+                | BacktrackInsn::NonGreedyLoop1CharBack { pos, remaining, .. },
+            ) => {
+                *pos = next;
+                *remaining -= 1;
+            }
+            _ => rs_unreachable!("lazy loop entry on top of the stack"),
+        }
+        *pos = next;
+        *ip = loop_ip + 2;
+        Some(true)
     }
 
     /// Attempt to backtrack.
@@ -1375,47 +1277,30 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     return true;
                 }
 
-                // The match failed at the min location: move in the direction
-                // of the cursor. PATCH (FORK.md B8): ordered comparison and a
-                // clamp to `max`, mirroring the greedy arms above.
-                BacktrackInsn::NonGreedyLoop1Char {
-                    continuation,
-                    min,
-                    max,
+                // The continuation of a lazy loop failed: take one more
+                // iteration where it stopped, if it may and the body matches
+                // there, or give the loop up.
+                &mut BacktrackInsn::NonGreedyLoop1Char {
+                    loop_ip,
+                    pos: at,
+                    remaining,
                 } => {
-                    debug_assert!(max >= min, "max should be >= min");
-                    if *max <= *min {
-                        // We have backtracked this loop as far as possible.
-                        self.pop_backtrack();
-                        continue;
+                    match self.lazy_retry(input, Forward, loop_ip, at, remaining, ip, pos) {
+                        Some(true) => return true,
+                        Some(false) => continue,
+                        None => return false,
                     }
-                    let newmin = input
-                        .next_right_pos(*min)
-                        .filter(|p| *p < *max)
-                        .unwrap_or(*max);
-                    *pos = newmin;
-                    *min = newmin;
-                    *ip = *continuation;
-                    return true;
                 }
-                BacktrackInsn::NonGreedyLoop1CharBack {
-                    continuation,
-                    min,
-                    max,
+                &mut BacktrackInsn::NonGreedyLoop1CharBack {
+                    loop_ip,
+                    pos: at,
+                    remaining,
                 } => {
-                    debug_assert!(max <= min, "max should be <= min tracking backwards");
-                    if *max >= *min {
-                        self.pop_backtrack();
-                        continue;
+                    match self.lazy_retry(input, Backward, loop_ip, at, remaining, ip, pos) {
+                        Some(true) => return true,
+                        Some(false) => continue,
+                        None => return false,
                     }
-                    let newmin = input
-                        .next_left_pos(*min)
-                        .filter(|p| *p > *max)
-                        .unwrap_or(*max);
-                    *pos = newmin;
-                    *min = newmin;
-                    *ip = *continuation;
-                    return true;
                 }
             }
         }
@@ -2939,21 +2824,6 @@ mod scm_budget_tests {
                                 &input,
                                 pos,
                                 min,
-                                max,
-                                dir,
-                                scm::Char { c: b'a' },
-                                &mut actual,
-                            );
-                            assert_eq!(got, expected);
-                            assert_eq!(actual.remaining, reference.remaining);
-                            assert_eq!(actual.usage(), reference.usage());
-                            let mut reference = make_budget();
-                            let mut actual = make_budget();
-                            let expected =
-                                scalar(&input, pos, 0, max, dir, &mut reference).map(|(_, p)| p);
-                            let got = MatchAttempter::<AsciiInput<'_>>::compute_max_pos(
-                                &input,
-                                pos,
                                 max,
                                 dir,
                                 scm::Char { c: b'a' },
