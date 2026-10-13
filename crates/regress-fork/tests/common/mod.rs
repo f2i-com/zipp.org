@@ -80,7 +80,6 @@ impl TestCompiledRegex {
         use regress::backends as rbe;
         #[cfg(feature = "utf16")]
         {
-            // We don't test the PikeVM backend with UTF16 or UCS2.
             if self.tc.encoding == Encoding::Utf16 {
                 return self.match_utf16(input, start);
             } else if self.tc.encoding == Encoding::Ucs2 {
@@ -93,22 +92,10 @@ impl TestCompiledRegex {
                 return self.match_ucs2(input, start);
             }
         }
-        match (self.tc.use_ascii(input), self.tc.backend) {
-            (true, Backend::PikeVM) => {
-                rbe::find::<rbe::PikeVMExecutor>(&self.re, input, start).collect()
-            }
-
-            (false, Backend::PikeVM) => {
-                rbe::find::<rbe::PikeVMExecutor>(&self.re, input, start).collect()
-            }
-
-            (true, Backend::Backtracking) => {
-                rbe::find_ascii::<rbe::BacktrackExecutor>(&self.re, input, start).collect()
-            }
-
-            (false, Backend::Backtracking) => {
-                rbe::find::<rbe::BacktrackExecutor>(&self.re, input, start).collect()
-            }
+        if self.tc.use_ascii(input) {
+            rbe::find_ascii::<rbe::BacktrackExecutor>(&self.re, input, start).collect()
+        } else {
+            rbe::find::<rbe::BacktrackExecutor>(&self.re, input, start).collect()
         }
     }
 
@@ -240,13 +227,6 @@ impl TestCompiledRegex {
     }
 }
 
-/// Our backend types.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum Backend {
-    PikeVM,
-    Backtracking,
-}
-
 /// Our encoding types.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Encoding {
@@ -263,9 +243,6 @@ pub struct TestConfig {
 
     // Whether to optimize.
     optimize: bool,
-
-    // Which backend to use.
-    backend: Backend,
 
     // Which encoding to use. Only used if utf16 is enabled.
     #[allow(dead_code)]
@@ -326,42 +303,24 @@ where
 {
     let encoding = Encoding::Utf8;
     // Note we wish to be able to determine the TestConfig from the line number.
-    // Also note that optimizations are not supported for PikeVM backend, as it
-    // doesn't implement Loop1CharBody.
     func(TestConfig {
         ascii: true,
         optimize: false,
-        backend: Backend::PikeVM,
         encoding,
     });
     func(TestConfig {
         ascii: false,
         optimize: false,
-        backend: Backend::PikeVM,
-        encoding,
-    });
-    func(TestConfig {
-        ascii: true,
-        optimize: false,
-        backend: Backend::Backtracking,
-        encoding,
-    });
-    func(TestConfig {
-        ascii: false,
-        optimize: false,
-        backend: Backend::Backtracking,
         encoding,
     });
     func(TestConfig {
         ascii: true,
         optimize: true,
-        backend: Backend::Backtracking,
         encoding,
     });
     func(TestConfig {
         ascii: false,
         optimize: true,
-        backend: Backend::Backtracking,
         encoding,
     });
 
@@ -370,29 +329,25 @@ where
         func(TestConfig {
             ascii: false,
             optimize: false,
-            backend: Backend::Backtracking,
-            encoding: Encoding::Utf16,
+                encoding: Encoding::Utf16,
         });
 
         func(TestConfig {
             ascii: false,
             optimize: true,
-            backend: Backend::Backtracking,
-            encoding: Encoding::Utf16,
+                encoding: Encoding::Utf16,
         });
 
         func(TestConfig {
             ascii: false,
             optimize: false,
-            backend: Backend::Backtracking,
-            encoding: Encoding::Ucs2,
+                encoding: Encoding::Ucs2,
         });
 
         func(TestConfig {
             ascii: false,
             optimize: true,
-            backend: Backend::Backtracking,
-            encoding: Encoding::Ucs2,
+                encoding: Encoding::Ucs2,
         });
     }
 }
@@ -404,24 +359,14 @@ where
     F: Fn(TestConfig),
 {
     // Note we wish to be able to determine the TestConfig from the line number.
-    // Also note that optimizations are not supported for PikeVM backend, as it
-    // doesn't implement Loop1CharBody.
     func(TestConfig {
         ascii: false,
         optimize: false,
-        backend: Backend::PikeVM,
-        encoding: Encoding::Utf8,
-    });
-    func(TestConfig {
-        ascii: false,
-        optimize: false,
-        backend: Backend::Backtracking,
         encoding: Encoding::Utf8,
     });
     func(TestConfig {
         ascii: false,
         optimize: true,
-        backend: Backend::Backtracking,
         encoding: Encoding::Utf8,
     });
 
@@ -430,29 +375,25 @@ where
         func(TestConfig {
             ascii: false,
             optimize: false,
-            backend: Backend::Backtracking,
-            encoding: Encoding::Utf16,
+                encoding: Encoding::Utf16,
         });
 
         func(TestConfig {
             ascii: false,
             optimize: true,
-            backend: Backend::Backtracking,
-            encoding: Encoding::Utf16,
+                encoding: Encoding::Utf16,
         });
 
         func(TestConfig {
             ascii: false,
             optimize: false,
-            backend: Backend::Backtracking,
-            encoding: Encoding::Ucs2,
+                encoding: Encoding::Ucs2,
         });
 
         func(TestConfig {
             ascii: false,
             optimize: true,
-            backend: Backend::Backtracking,
-            encoding: Encoding::Ucs2,
+                encoding: Encoding::Ucs2,
         });
     }
 }

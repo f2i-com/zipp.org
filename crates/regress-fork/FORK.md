@@ -288,3 +288,13 @@ tables behind `\p{ID_Start}`, `\p{ID_Continue}` and a named group's name.
 ZIPP's JavaScript lexer calls them instead of linking a crate of its own for
 the same two properties, so a module carries each property once and the
 lexer, the regex properties and group names are on one Unicode version.
+
+## Removed: the PikeVM backend
+
+Upstream ships a second, PikeVM-style executor (`src/pikevm.rs`, feature
+`backend-pikevm`, on by default). Nothing in ZIPP ran it: the engine calls
+the backtracking executor only, and LTO already dropped the PikeVM from
+every artifact. Its one use was the crate's own tests, which ran each case
+on both executors. It is gone, with its feature; the differential fuzzer
+against Node (`fuzz/`) is the independent check now, and the patches above
+that mention `src/pikevm.rs` changed a file that no longer exists.
