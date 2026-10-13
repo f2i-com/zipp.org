@@ -68,7 +68,7 @@ impl<'p> Vm<'p> {
         Ok(self.py_pct_format(args).unwrap_or(Value::UNDEFINED))
     }
 
-    fn py_pct_format(&mut self, args: &[Value]) -> Option<Value> {
+    pub(super) fn py_pct_format(&mut self, args: &[Value]) -> Option<Value> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(Value::UNDEFINED);
         let fmt = self.py_pct_str(arg(0))?;
         let (values, tuple) = (arg(1), arg(2));

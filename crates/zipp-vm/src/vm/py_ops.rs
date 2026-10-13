@@ -2207,6 +2207,17 @@ impl<'p> Vm<'p> {
     /// its slow path.
     #[inline(always)] // one copy in the step, one in its JIT helper (`engine/py_jit.rs`)
     pub(crate) fn py_arith(&mut self, op: PyArithOp, va: Value, vb: Value) -> Result<Option<Value>, Thrown> {
+        // `str % values`: the runtime's `R.mod` asks `__zipp_py_pct` first
+        // (`py_pct_format`, which answers only what the runtime's
+        // `percentFormat` answers, and declines anything else); asked here,
+        // its call is not made.
+        if op == PyArithOp::Mod && va.is_heap() && self.heap.is_str_like(va.heap_index()) {
+            let tuple = match self.py_rt.as_deref() {
+                Some(p) => p.t_tuple,
+                None => return Ok(None),
+            };
+            return Ok(self.py_pct_format(&[va, vb, tuple]));
+        }
         // Two floats: exactly the VM's own Number arithmetic (the int-tagged
         // fast forms included), as the inline code this replaces used.
         if va.is_number() && vb.is_number() {

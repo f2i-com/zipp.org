@@ -646,7 +646,11 @@ impl<'a> Emitter<'a> {
             _ => None,
         };
         let numeric = |k: Known| matches!(k, Known::Int | Known::Float | Known::Unknown);
-        if let (true, Some(pyop)) = (self.fast && numeric(ka) && numeric(kb), fused) {
+        // A str's `%` (`"r%d" % v`) is the fused instruction's too: it
+        // formats what the runtime's `R.mod` formats natively, and takes the
+        // helper for anything else.
+        let pct = matches!(op, ast::Operator::Mod) && ka == Known::Str;
+        if let (true, Some(pyop)) = (self.fast && ((numeric(ka) && numeric(kb)) || pct), fused) {
             // One fused instruction for ints and floats; a str + str tier
             // (for `+`) and the helper out of line.
             let dst = self.alloc()?;
