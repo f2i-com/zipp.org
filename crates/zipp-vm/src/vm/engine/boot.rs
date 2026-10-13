@@ -305,7 +305,8 @@ impl<'p> Vm<'p> {
             super_called: crate::slot_table::SlotSet::default(),
             this_tdz: crate::slot_table::SlotSet::default(),
             super_this: crate::slot_table::SlotTable::default(),
-            private_fields: std::collections::HashMap::new(),
+            private_fields: crate::slot_table::SlotTable::default(),
+            private_name_ids: rustc_hash::FxHashMap::default(),
             eval_fn_idx: 0,
             closure_eval_scope: crate::vm::JitGuardedMap::new(),
             eval_scope_parent: std::collections::HashMap::new(),
@@ -721,18 +722,26 @@ impl<'p> Vm<'p> {
     /// name, so one long source identifier can otherwise amplify into an
     /// unmetered allocation per constructed object.
     fn private_side_table_resident_bytes(&self) -> usize {
-        let mut n = Self::hash_map_resident_bytes(&self.private_fields)
+        let mut n = self
+            .private_fields
+            .resident_bytes()
+            .saturating_add(Self::hash_map_resident_bytes(&self.private_name_ids))
             .saturating_add(self.method_brand.resident_bytes())
             .saturating_add(self.instance_brand.resident_bytes())
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_private_names))
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_owner));
 
         for fields in self.private_fields.values() {
-            n = n.saturating_add(Self::hash_map_resident_bytes(fields));
-            n = fields
-                .keys()
-                .fold(n, |n, (_, name)| n.saturating_add(name.capacity()));
+            n = n.saturating_add(
+                fields
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u64, u32, Value)>()),
+            );
         }
+        n = self
+            .private_name_ids
+            .keys()
+            .fold(n, |n, name| n.saturating_add(name.len()));
         for brands in self.method_brand.values() {
             n = n.saturating_add(brands.capacity().saturating_mul(std::mem::size_of::<u64>()));
         }

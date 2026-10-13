@@ -738,8 +738,8 @@ impl Vm<'_> {
         // Private field values: an entry keyed by a live instance must keep its
         // payload alive (over-approximate; dead-instance entries pruned below).
         for m in self.private_fields.values() {
-            for v in m.values() {
-                root_val!(*v);
+            for &(_, _, v) in m {
+                root_val!(v);
             }
         }
         for &p in self.prototypes.values() {
@@ -1327,7 +1327,7 @@ impl Vm<'_> {
         }
         prune_map!(self.eval_scope_parent);
         prune_map!(self.shadow_fn_realm);
-        prune_map!(self.private_fields);
+        prune_slots!(self.private_fields);
         // The declared-name recompute (the major runs it whenever the table
         // is non-empty) only shrinks when its source maps did; when no brand
         // entry died this minor it is the identity and is skipped. Deferring it further is safe regardless:

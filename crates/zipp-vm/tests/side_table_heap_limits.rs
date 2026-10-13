@@ -46,11 +46,14 @@ fn assert_memory_stop(
 }
 
 #[test]
-fn cloned_private_name_churn_is_reported_and_rejected() {
-    // PrivateFieldAdd owns `(brand, key.to_string())` per instance.  Rotating
-    // only 32 guest references makes this an amplification/churn case rather
-    // than a deliberately retained public object graph: the VM still owns the
-    // not-yet-collected instances and all of their cloned 4 KiB field names.
+fn private_names_are_interned_not_cloned_per_instance() {
+    // PrivateFieldAdd used to own `(brand, key.to_string())` per instance, so
+    // rotating 32 references to instances of a class with a 4 KiB private
+    // name amplified into about 4 MiB of cloned names the meter had to catch.
+    // The name is now interned once (`Vm::private_name_ids`) and an instance
+    // keeps only `(brand, name id, value)`: the same churn stays far inside
+    // the budget that used to be crossed, while the field values themselves
+    // are still reported.
     let private_name = "p".repeat(4 * 1024);
     let source = format!(
         "var hold = [];\
@@ -61,13 +64,20 @@ fn cloned_private_name_churn_is_reported_and_rejected() {
          }}"
     );
     let mut state = ready(&source);
-
-    // Heap slots plus the rotating dense array stay well below this.  The
-    // per-instance cloned names (about 4 MiB) are what must cross the ceiling.
-    let growth = assert_memory_stop(&mut state, "churn", 1024.0, 700 * 1024);
+    state.set_limits(100_000_000, None);
+    let baseline = state.heap_bytes();
+    state.set_heap_limit(baseline.saturating_add(700 * 1024));
+    let r = state.call_global("churn", &[JsValue::Number(1024.0)]);
+    assert!(r.is_ok(), "churn must complete within the budget: {r:?}");
     assert!(
-        growth > 3 * 1024 * 1024,
-        "the cloned private-name buffers must appear in the public report; growth was {growth}"
+        state.resource_limit_error().is_none(),
+        "no memory stop expected: {:?}",
+        state.resource_limit_error()
+    );
+    let growth = state.heap_bytes().saturating_sub(baseline);
+    assert!(
+        growth < 1024 * 1024,
+        "1,024 instances must not carry a copy of the name each; growth was {growth}"
     );
 }
 

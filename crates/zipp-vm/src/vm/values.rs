@@ -815,10 +815,27 @@ impl<'p> Vm<'p> {
         if !inst.is_heap() {
             return None;
         }
-        self.private_fields
-            .get(&inst.heap_index())?
-            .get(&(brand, key.to_string()))
-            .copied()
+        let fields = self.private_fields.get(&inst.heap_index())?;
+        let id = *self.private_name_ids.get(key)?;
+        fields
+            .iter()
+            .find(|&&(b, n, _)| b == brand && n == id)
+            .map(|&(_, _, v)| v)
+    }
+
+    /// Whether the instance has the private field `(brand, key)`.
+    pub(crate) fn private_field_has(&self, inst: Value, brand: u64, key: &str) -> bool {
+        self.private_field_get(inst, brand, key).is_some()
+    }
+
+    /// The interned id of the private name `key`, made on first use.
+    fn private_name_id(&mut self, key: &str) -> u32 {
+        if let Some(&id) = self.private_name_ids.get(key) {
+            return id;
+        }
+        let id = self.private_name_ids.len() as u32;
+        self.private_name_ids.insert(key.into(), id);
+        id
     }
 
     /// PrivateFieldAdd (`add=true`: upsert — field-init stores) or
@@ -835,16 +852,32 @@ impl<'p> Vm<'p> {
         if !inst.is_heap() {
             return false;
         }
-        let m = self.private_fields.entry(inst.heap_index()).or_default();
-        let k = (brand, key.to_string());
-        if !add && !m.contains_key(&k) {
+        let id = if add {
+            self.private_name_id(key)
+        } else {
+            match self.private_name_ids.get(key) {
+                Some(&id) => id,
+                None => return false,
+            }
+        };
+        let m = if add {
+            self.private_fields.entry(inst.heap_index()).or_default()
+        } else {
+            match self.private_fields.get_mut(&inst.heap_index()) {
+                Some(m) => m,
+                None => return false,
+            }
+        };
+        if let Some(e) = m.iter_mut().find(|e| e.0 == brand && e.1 == id) {
+            e.2 = v;
+            return true;
+        }
+        if !add {
             return false;
         }
-        let _retained_new_key = m.insert(k, v).is_none();
+        m.push((brand, id, v));
         #[cfg(feature = "instrument")]
-        if _retained_new_key {
-            self.instrument_mark_external_heap_growth();
-        }
+        self.instrument_mark_external_heap_growth();
         true
     }
 
@@ -855,7 +888,8 @@ impl<'p> Vm<'p> {
             return None;
         }
         let m = self.private_fields.get(&inst.heap_index())?;
-        m.iter().find(|((_, n), _)| n == key).map(|(_, &v)| v)
+        let id = *self.private_name_ids.get(key)?;
+        m.iter().find(|&&(_, n, _)| n == id).map(|&(_, _, v)| v)
     }
 
     pub(crate) fn private_field_scan_has(&self, inst: Value, key: &str) -> bool {
@@ -867,13 +901,16 @@ impl<'p> Vm<'p> {
         if !inst.is_heap() {
             return false;
         }
+        let Some(&id) = self.private_name_ids.get(key) else {
+            return false;
+        };
         let Some(m) = self.private_fields.get_mut(&inst.heap_index()) else {
             return false;
         };
-        let Some(k) = m.keys().find(|(_, n)| n == key).cloned() else {
+        let Some(e) = m.iter_mut().find(|e| e.1 == id) else {
             return false;
         };
-        m.insert(k, v);
+        e.2 = v;
         true
     }
 

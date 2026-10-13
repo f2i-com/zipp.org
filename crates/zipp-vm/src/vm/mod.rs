@@ -2173,12 +2173,19 @@ pub struct Vm<'p> {
     /// `run_class_ctor`; transient like `super_called`.
     super_this: crate::slot_table::SlotTable<Value>,
     /// Private FIELD storage — spec [[PrivateElements]] of kind "field":
-    /// instance heap idx -> ((brand, name) -> value). Keyed by the
-    /// per-evaluation brand so same-named fields of sibling classes or other
-    /// evaluations never collide; invisible to reflection, proxy traps and
-    /// property enumeration by construction. Values are GC roots; entries
-    /// pruned when the instance dies.
-    private_fields: std::collections::HashMap<u32, std::collections::HashMap<(u64, String), Value>>,
+    /// instance heap idx -> its `(brand, name id, value)` list, in definition
+    /// order. Keyed by the per-evaluation brand so same-named fields of
+    /// sibling classes or other evaluations never collide; invisible to
+    /// reflection, proxy traps and property enumeration by construction.
+    /// Values are GC roots; entries pruned when the instance dies.
+    ///
+    /// It was a SipHash map per instance from `(brand, String)`: every
+    /// construction of a class with a private field allocated a map and a
+    /// String per field, and every access hashed the name.
+    private_fields: crate::slot_table::SlotTable<Vec<(u64, u32, Value)>>,
+    /// Private names, interned once (`Vm::private_name_id`): the `u32` the
+    /// field lists store.
+    private_name_ids: rustc_hash::FxHashMap<Box<str>, u32>,
     /// Heap index of the canonical %eval% native — the DirectEval op's runtime
     /// identity check (a REBOUND global `eval` gets an ordinary call).
     eval_fn_idx: u32,

@@ -6299,9 +6299,7 @@ impl<'p> Vm<'p> {
                                     // an existing entry is PrivateFieldSet and
                                     // unaffected.
                                     if o.is_heap()
-                                        && !self.private_fields.get(&o.heap_index()).is_some_and(
-                                            |m| m.keys().any(|(b, n)| *b == b2 && n == &key),
-                                        )
+                                        && !self.private_field_has(o, b2, &key)
                                         && !self.target_is_extensible(o)
                                     {
                                         return Err(Thrown(
@@ -6347,9 +6345,8 @@ impl<'p> Vm<'p> {
                                         // PrivateFieldAdd on the class object:
                                         // the initializer may have sealed it
                                         // (preventExtensions(C) before the add).
-                                        if !self.private_fields.get(&o.heap_index()).is_some_and(
-                                            |m| m.keys().any(|(b, n)| *b == own && n == &key),
-                                        ) && !self.target_is_extensible(o)
+                                        if !self.private_field_has(o, own, &key)
+                                            && !self.target_is_extensible(o)
                                         {
                                             return Err(Thrown(
                                                 "TypeError: cannot define private elements on a non-extensible object".into(),
