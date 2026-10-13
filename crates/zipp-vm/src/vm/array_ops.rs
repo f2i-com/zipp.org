@@ -2767,10 +2767,14 @@ impl<'p> Vm<'p> {
         // gating as the callback and search families above): a `Vec::remove`/
         // `Vec::splice`/`Vec::pop` cannot see a non-writable element (its Set must
         // throw) nor a non-configurable one (its DeletePropertyOrThrow must throw).
+        // The hole scan is a walk of the whole array: it runs only when an
+        // inherited index could cover a hole. Asked first, it made every
+        // `pop` on a large array linear in its length (a stack of 160,000
+        // popped 80,000 times took 2.3 s).
         if matches!(name, "shift" | "reverse" | "pop" | "unshift" | "splice")
             && (self.arr_props.contains_key(&idx)
-                || (self.array_has_holes(idx)
-                    && (self.array_proto_has_index || self.proto_of.contains_key(&idx))))
+                || ((self.array_proto_has_index || self.proto_of.contains_key(&idx))
+                    && self.array_has_holes(idx)))
         {
             return self.array_like_mutate(Value::heap(idx), name, args);
         }
