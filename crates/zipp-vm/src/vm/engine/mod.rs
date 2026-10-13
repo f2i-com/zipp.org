@@ -7,6 +7,16 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Where a frame-free call's arguments come from (`Vm::call_compiled_windowed`):
+/// a slice a builtin holds, or `argc` registers of the caller's window from
+/// absolute register `at` (a compiled `new`, which reads them in place).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) enum WinArgs<'a> {
+    Slice(&'a [Value]),
+    Regs { at: usize, argc: u16 },
+}
+
 /// Cached `ZIPP_CALLLOG` flag (an env read per call-site miss would dominate
 /// the miss path — Windows scans the whole environment block per query).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

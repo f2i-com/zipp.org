@@ -984,7 +984,9 @@ impl<'p> Vm<'p> {
             ));
         }
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if let Some(r) = self.call_compiled_windowed(callee, this, args, func_id, closure) {
+        if let Some(r) =
+            self.call_compiled_windowed(callee, this, WinArgs::Slice(args), func_id, closure)
+        {
             return r;
         }
         // Copy the scalar layout fields out so the FuncProto borrow (which now
@@ -1071,6 +1073,31 @@ impl<'p> Vm<'p> {
         self.run_loop(stop_depth)
     }
 
+    /// Whether a constructor function's body can be run frame-free by `new`:
+    /// nothing in it can observe the frame's `new.target` (a `new.target`
+    /// read, an arrow that captures it, a direct `eval`). Scanned once per
+    /// function (`ctor_framefree`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ctor_body_framefree(&mut self, fid: u32) -> bool {
+        let f = fid as usize;
+        if let Some(&s) = self.ctor_framefree.get(f) {
+            if s != 0 {
+                return s == 1;
+            }
+        }
+        let ok = !self.func(f).code.iter().any(|op| {
+            matches!(
+                op,
+                Instr::LoadNewTarget { .. } | Instr::MakeArrow { .. } | Instr::DirectEval { .. }
+            )
+        });
+        if self.ctor_framefree.len() <= f {
+            self.ctor_framefree.resize(f + 1, 0);
+        }
+        self.ctor_framefree[f] = if ok { 1 } else { 2 };
+        ok
+    }
+
     /// Call the compiled function `callee` frame-free: its body run over a
     /// fresh register window at the top of the file, under an activation
     /// that names its closure, exactly as a compiled caller's native
@@ -1089,11 +1116,11 @@ impl<'p> Vm<'p> {
     /// frame-backed entry around a body that needs none of it.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
-    fn call_compiled_windowed(
+    pub(crate) fn call_compiled_windowed(
         &mut self,
         callee: Value,
         this: Value,
-        args: &[Value],
+        args: WinArgs<'_>,
         fid: u32,
         closure: u32,
     ) -> Option<Result<Value, Thrown>> {
@@ -1163,9 +1190,19 @@ impl<'p> Vm<'p> {
         self.regs.resize(win + callee_regs, Value::UNDEFINED);
         self.bump_regs_hw(win + callee_regs);
         self.regs[win] = this;
-        let n = args.len().min(params);
-        for (i, &arg) in args[..n].iter().enumerate() {
-            self.regs[win + 1 + i] = arg;
+        match args {
+            WinArgs::Slice(args) => {
+                let n = args.len().min(params);
+                for (i, &arg) in args[..n].iter().enumerate() {
+                    self.regs[win + 1 + i] = arg;
+                }
+            }
+            // The caller's window is below `win`, in the same pinned file.
+            WinArgs::Regs { at, argc } => {
+                for i in 0..(argc as usize).min(params) {
+                    self.regs[win + 1 + i] = self.regs[at + i];
+                }
+            }
         }
         // The loop's safe point at a frame transition. The arguments are in
         // the window and the callee and its closure are the activation's

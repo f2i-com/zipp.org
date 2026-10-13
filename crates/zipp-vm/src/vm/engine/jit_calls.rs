@@ -1018,6 +1018,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn jit_region_new_impl(
         &mut self,
         caller_base_ptr: *const u64,
+        packed_fip: u64,
         packed_args: u64,
         argc: u16,
     ) -> u64 {
@@ -1032,6 +1033,9 @@ impl<'p> Vm<'p> {
         let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;
         let arg_base = (packed_args & 0xFFFF) as u16;
         let cv = self.get(base, callee_reg);
+        if let Some(bits) = self.jit_new_plain_fn(cv, base, arg_base, argc, packed_fip) {
+            return bits;
+        }
         let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
         self.jit_call_depth += 1;
         let r = self.construct(cv, &args);
@@ -1040,6 +1044,95 @@ impl<'p> Vm<'p> {
             Ok(v) => v.bits(),
             Err(t) => self.jit_thrown_to_sentinel(t),
         }
+    }
+
+    /// `new F(args…)` from a compiled region or Tier C body when `F` is a plain
+    /// constructor function: what `construct` does for one (the instance's
+    /// [[Prototype]] from `F.prototype`, the body run with `this` bound to the
+    /// new object and `new.target` to `F`, an object result replacing the
+    /// instance), with the arguments read from the caller's window and the
+    /// frame pushed as a region call pushes one (`jit_frame_call`). A million
+    /// constructions paid an argument vector, a host-root scope, `construct`'s
+    /// built-in arms and `call_value` around each body. `None`, with nothing
+    /// done, for anything else (a class, a bound function, a proxy, a
+    /// built-in, a function that cannot construct, a second realm alive).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_new_plain_fn(
+        &mut self,
+        cv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        packed_fip: u64,
+    ) -> Option<u64> {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        let (fid, closure) = self.ic_plain_fn(cv)?;
+        {
+            let p = self.func(fid as usize);
+            if p.non_constructable || p.lexical_this {
+                return None;
+            }
+        }
+        if !self.obj_realm.is_empty() || !self.realm_global_objs.is_empty() || self.get_function_realm(cv) != 0
+        {
+            return None;
+        }
+        // OrdinaryCreateFromConstructor with newTarget = F, as the Func arm of
+        // `construct_with_newtarget_rooted` does it.
+        let mut proto = self.prototype_of(cv).unwrap_or(Value::UNDEFINED);
+        if !self.is_object_value(proto) {
+            if let Some(rp) = self.realm_proto_fallback(cv, self.obj_proto) {
+                proto = Value::heap(rp);
+            }
+        }
+        let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
+        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
+            crate::heap::ObjMap::with_val_capacity(hint as usize),
+        ))));
+        if proto.is_heap() {
+            self.proto_of.insert(obj.heap_index(), proto);
+        }
+        // The instance is a Rust local until the frame's window holds it as
+        // `this`: keep it rooted across the frame setup.
+        let rooted = self.host_result_roots.len();
+        self.host_result_roots.push(obj);
+        // A body nothing in which can see `new.target` runs frame-free, as a
+        // compiled caller's call of it would: no frame for it to read.
+        if self.ctor_body_framefree(fid) {
+            let at = base + arg_base as usize;
+            self.jit_call_depth += 1;
+            let r = self.call_compiled_windowed(cv, obj, WinArgs::Regs { at, argc }, fid, closure);
+            self.jit_call_depth -= 1;
+            if let Some(r) = r {
+                self.host_result_roots.truncate(rooted);
+                return Some(match r {
+                    Ok(ret) => {
+                        self.learn_ctor_field_hint(fid, obj);
+                        if self.is_object_value(ret) {
+                            ret.bits()
+                        } else {
+                            obj.bits()
+                        }
+                    }
+                    Err(t) => {
+                        self.osr_deopt_exempt = true;
+                        self.jit_thrown_to_sentinel(t)
+                    }
+                });
+            }
+        }
+        self.pending_new_target = cv;
+        let ip = (packed_fip as u32) as usize;
+        let bits = self.jit_frame_call(fid, closure, obj, base, arg_base, argc, ip, cv);
+        // A declined frame setup leaves it unconsumed; nothing else may see it.
+        self.pending_new_target = Value::UNDEFINED;
+        self.host_result_roots.truncate(rooted);
+        if bits == SELF_CALL_DEOPT || bits == CALL_THREW {
+            return Some(bits);
+        }
+        self.learn_ctor_field_hint(fid, obj);
+        let ret = Value::from_bits(bits);
+        Some(if self.is_object_value(ret) { bits } else { obj.bits() })
     }
 
     /// The implementation behind the region call helpers `jit_call_method_ic` /

@@ -2168,6 +2168,27 @@ impl ObjMap {
         m
     }
 
+    /// [`ObjMap::with_capacity`] without the key vector: for an instance a
+    /// compiled constructor fills through the JIT's add ways, whose keys come
+    /// from the shape's shared list (`append_data_shaped`), so a reserved key
+    /// vector would be allocated only to be dropped.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn with_val_capacity(n: usize) -> ObjMap {
+        let mut m = ObjMap::new();
+        if n > 0 {
+            {
+                #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
+                let ValStore::Vec(v) = &mut m.vals
+                else {
+                    unreachable!("ctor stores are Vec-born")
+                };
+                v.reserve_exact(n);
+            }
+            m.attrs.reserve_exact(n);
+        }
+        m
+    }
+
     /// Empty object storage backed by a compiler-prepared immutable key list.
     /// The explicit mode seam lets tests compare both representations without
     /// racing the process-wide environment latch.
@@ -2560,8 +2581,12 @@ impl ObjMap {
     /// threshold. Every structural append (set/define) funnels through here.
     #[inline]
     fn index_appended(&mut self) {
-        let slot = self.keys.len() - 1;
-        let tag = prop_tag(&self.keys[slot]);
+        // The tag is for an existing index only; below the threshold no
+        // index is kept and the key's hash went unused on every append.
+        let tag = match &self.index {
+            Some(_) => prop_tag(&self.keys[self.keys.len() - 1]),
+            None => 0,
+        };
         self.index_appended_tagged(tag);
     }
 
@@ -2607,6 +2632,56 @@ impl ObjMap {
             self.index_appended();
             true
         }
+    }
+
+    /// The append branch of [`ObjMap::set`] for a caller that has proved `key`
+    /// absent and knows the shape the append reaches: `shape_after` is what
+    /// `crate::shape::add(self.shape(), key, <data bits>)` returned for the same
+    /// shape and key before. The JIT's add ways (`helpers_misc::AddWay`) take
+    /// it, skipping the key scan and the transition lookup; the shape tree is
+    /// never pruned, so a transition once taken names the same node for the
+    /// life of the process.
+    ///
+    /// `plan`, when given, is the key list of `shape_after` itself
+    /// (`shape::keys_of`): the keys this object has are exactly its prefix,
+    /// because they are what `self.shape()` names, so the object takes the
+    /// shared list instead of a new `String` per key.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn append_data_shaped(
+        &mut self,
+        key: &str,
+        val: Value,
+        shape_after: u32,
+        plan: Option<StaticKeyPlan>,
+    ) {
+        debug_assert!(self.pos(key).is_none());
+        debug_assert_eq!(
+            crate::shape::add(
+                self.shape,
+                key,
+                crate::shape::attr_bits(true, true, true, false)
+            ),
+            shape_after
+        );
+        let n = self.keys.len();
+        match plan {
+            Some(all) if all.len() == n + 1 => {
+                debug_assert!(all.keys()[..n] == *self.keys.as_ref() && all.keys()[n] == key);
+                self.keys = PropKeys::Planned {
+                    all,
+                    visible_len: n + 1,
+                };
+            }
+            _ => {
+                self.planned_append_failed |= self.keys.is_planned();
+                self.keys.push(key.to_string());
+            }
+        }
+        self.vals.push(val);
+        self.attrs.push(PropAttr::data());
+        self.shape = shape_after;
+        self.has_element_key |= key_names_element(key);
+        self.index_appended();
     }
 
     /// [`ObjMap::set`] for a caller that already OWNS the key string: on the

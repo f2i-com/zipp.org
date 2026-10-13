@@ -401,9 +401,10 @@ pub fn describe(shape: u32) -> Vec<(Box<str>, u8)> {
     })
 }
 
-/// Own property names of `shape`, in insertion order. Diagnostics and debug
-/// assertions only — the hot paths read the object's own `keys`.
-#[cfg(test)]
+/// Own property names of `shape`, in insertion order: diagnostics, debug
+/// assertions, and the shared key lists the JIT's add ways give the objects
+/// they append to (`Vm::shape_key_plan`), built once per shape.
+#[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
 pub fn keys_of(shape: u32) -> Vec<String> {
     if shape == DICT {
         return Vec::new();

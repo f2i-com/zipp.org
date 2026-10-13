@@ -1019,13 +1019,13 @@ pub(crate) extern "win64" fn jit_call_ic(
 pub(crate) extern "win64" fn jit_new_ic(
     vm: *mut core::ffi::c_void,
     caller_base_ptr: *const u64,
-    _packed_fip: u64,
+    packed_fip: u64,
     packed_args: u64,
     argc: u32,
 ) -> u64 {
     catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
-        vm.jit_region_new_impl(caller_base_ptr, packed_args, argc as u16)
+        vm.jit_region_new_impl(caller_base_ptr, packed_fip, packed_args, argc as u16)
     })
 }
 
@@ -4775,6 +4775,229 @@ pub(crate) extern "win64" fn jit_shape_set_barrier(
         .write_barrier_val(holder_idx, Value::from_bits(val_bits));
 }
 
+/// Prototype hops an [`AddWay`] can hold (a constructor's instance has two:
+/// its prototype and `%Object.prototype%`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const ADD_WAY_HOPS: usize = 4;
+
+/// Sites an add way is kept for; past it a site takes the miss path as before.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const ADD_WAY_SITES_MAX: usize = 1 << 20;
+
+/// One JIT `SetProp` site's last proved append (`Vm::jit_add_ways`): adding
+/// the site's key to a plain, extensible, classless object of shape `before`
+/// reached shape `after`, and the receiver's prototype chain (`proto`, then
+/// `hops` with the versions they had) held no setter and no read-only data
+/// property of that name. A constructor's `this.x = v` appends to a new object
+/// on every call: no identity or shape way can serve it, and each one walked
+/// the chain, scanned the keys, looked the transition up and refilled the
+/// site's caches again.
+///
+/// A hit rechecks everything live: the receiver's kind, shape, flags and
+/// [[Prototype]] identity, and every hop's version. A hop's version moves when
+/// a key is added to it or redefined, when its own [[Prototype]] is replaced,
+/// and when its slot is freed, which is what the interpreter's chain caches
+/// and the JIT's hop ways already rely on.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AddWay {
+    func: u32,
+    name: u32,
+    /// `shape::DICT` (0) marks an empty way.
+    before: u32,
+    after: u32,
+    /// The receiver's [[Prototype]] as a heap index, `u32::MAX` for null.
+    /// Unused for a class instance, whose prototype is its class's.
+    proto: u32,
+    /// The receiver's class, `u32::MAX` for a plain object; for a class
+    /// instance, the class's version and `class_proto_epoch` when no member of
+    /// its chain declared the key (`class_add_proof`).
+    class: u32,
+    class_ver: u32,
+    epoch: u32,
+    /// `after` has a shared key list (`shape_key_plan`) for the append to take.
+    planned: bool,
+    nhops: u32,
+    hops: [(u32, u32); ADD_WAY_HOPS],
+}
+
+/// Longest key list a shape gets a shared plan for, and the most key bytes it
+/// may hold: plans live outside the heap, one per shape reached by an add way
+/// (shapes are capped at 4,096), so a long or wide one stays on owned keys.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const SHAPE_PLAN_MAX_KEYS: u32 = 16;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const SHAPE_PLAN_MAX_BYTES: usize = 512;
+
+/// `shape`'s key list as a shared plan, built the first time an add way
+/// reaches the shape; `None` for a dictionary shape or a list past the caps.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn shape_key_plan(vm: &mut Vm, shape: u32) -> Option<crate::bytecode::StaticKeyPlan> {
+    let s = shape as usize;
+    if shape == crate::shape::DICT || s >= 1 << 14 {
+        return None;
+    }
+    if let Some(Some(p)) = vm.shape_key_plans.get(s) {
+        return Some(p.clone());
+    }
+    if crate::shape::len(shape) > SHAPE_PLAN_MAX_KEYS {
+        return None;
+    }
+    let keys = crate::shape::keys_of(shape);
+    if keys.iter().map(String::len).sum::<usize>() > SHAPE_PLAN_MAX_BYTES {
+        return None;
+    }
+    let plan = crate::bytecode::StaticKeyPlan::new(keys);
+    if !plan.runtime_valid() || plan.has_element_key() {
+        return None;
+    }
+    if vm.shape_key_plans.len() <= s {
+        vm.shape_key_plans.resize(s + 1, None);
+    }
+    vm.shape_key_plans[s] = Some(plan.clone());
+    Some(plan)
+}
+
+/// The proof a class instance's append needs: the instance has no
+/// [[Prototype]] of its own, its class chain is classes down to a base class
+/// (a function or built-in parent, or `extends null`, keeps the interpreter's
+/// path), no member table on it declares `key`, and the ordinary chain from
+/// where the tables end holds no setter and no read-only `key`. Fills `w`'s
+/// class fields and hops.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn class_add_proof(vm: &Vm, idx: u32, class: u32, key: &str, w: &mut AddWay) -> bool {
+    if vm.proto_of.get(&idx).is_some() {
+        return false;
+    }
+    let mut cur = class;
+    loop {
+        let HeapObj::Class(c) = vm.heap.get(cur) else {
+            return false;
+        };
+        if c.extends_null || (cur == class && c.reproto_instances) {
+            return false;
+        }
+        match c.parent {
+            None => break,
+            Some(p) if matches!(vm.heap.get(p), HeapObj::Class(_)) => cur = p,
+            Some(_) => return false,
+        }
+    }
+    if !matches!(
+        vm.class_member_lookup(idx, class, key),
+        crate::vm::props::ClassLookup::Miss
+    ) {
+        return false;
+    }
+    let mut next = vm.class_instance_live_proto(idx, class);
+    let mut n = 0usize;
+    while next.is_heap() {
+        let h = next.heap_index();
+        if n == ADD_WAY_HOPS || !vm.ic_obj_ok(h) {
+            return false;
+        }
+        let HeapObj::Object(m) = vm.heap.get(h) else {
+            return false;
+        };
+        if m.is_ctor || m.class.is_some() {
+            return false;
+        }
+        w.hops[n] = (h, vm.heap.version_of(h));
+        n += 1;
+        if let Some(i) = m.pos(key) {
+            // A writable data property is shadowed by the append; anything
+            // else governs the write.
+            if m.attr_at(i).accessor || !m.attr_at(i).writable {
+                return false;
+            }
+            break;
+        }
+        next = match vm.proto_of.get(&h) {
+            Some(p) => *p,
+            None if vm.obj_proto == 0 || h == vm.obj_proto => Value::NULL,
+            None => Value::heap(vm.obj_proto),
+        };
+    }
+    w.nhops = n as u32;
+    w.class = class;
+    w.class_ver = vm.heap.version_of(class);
+    w.epoch = vm.class_proto_epoch;
+    true
+}
+
+/// The receiver's [[Prototype]] the way the store miss walk reads it:
+/// `proto_of`, else `%Object.prototype%`, as a heap index or `u32::MAX`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn add_way_proto(vm: &Vm, idx: u32) -> u32 {
+    match vm.proto_of.get(&idx) {
+        Some(p) if p.is_heap() => p.heap_index(),
+        Some(_) => u32::MAX,
+        None if vm.obj_proto == 0 => u32::MAX,
+        None => vm.obj_proto,
+    }
+}
+
+/// Serve a `SetProp` miss from the site's add way: append the value at the
+/// transition the way proved, or return false having changed nothing.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_add_way_hit(
+    vm: &mut Vm,
+    site_idx: u32,
+    func_id: u32,
+    name_idx: u32,
+    idx: u32,
+    val_bits: u64,
+) -> bool {
+    let Some(&w) = vm.jit_add_ways.get(site_idx as usize) else {
+        return false;
+    };
+    if w.before == crate::shape::DICT || w.func != func_id || w.name != name_idx {
+        return false;
+    }
+    match vm.heap.get(idx) {
+        HeapObj::Object(m)
+            if m.shape() == w.before
+                && m.extensible
+                && m.class.unwrap_or(u32::MAX) == w.class
+                && !m.is_ctor => {}
+        _ => return false,
+    }
+    if idx == vm.obj_proto || !vm.deferred_ns_state.is_empty() || !vm.ic_obj_ok(idx) {
+        return false;
+    }
+    if w.class == u32::MAX {
+        if add_way_proto(vm, idx) != w.proto {
+            return false;
+        }
+    } else if vm.proto_of.get(&idx).is_some()
+        || vm.heap.version_of(w.class) != w.class_ver
+        || vm.class_proto_epoch != w.epoch
+    {
+        return false;
+    }
+    for &(h, ver) in &w.hops[..w.nhops as usize] {
+        if vm.heap.version_of(h) != ver {
+            return false;
+        }
+    }
+    let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
+    let plan = if w.planned {
+        vm.shape_key_plans.get(w.after as usize).cloned().flatten()
+    } else {
+        None
+    };
+    match vm.heap.get_mut(idx) {
+        HeapObj::Object(map) => {
+            map.append_data_shaped(key, Value::from_bits(val_bits), w.after, plan)
+        }
+        _ => return false,
+    }
+    vm.heap.bump_version(idx);
+    true
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_set_prop_miss(
     vm: *mut core::ffi::c_void,
@@ -4804,6 +5027,9 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         idx,
         Value::from_bits(val_bits),
     );
+    if jit_add_way_hit(vm, site_idx, func_id, name_idx, idx, val_bits) {
+        return 0;
+    }
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // Keys with exotic write interception (the inherited `__proto__` setter,
     // restricted names, private names, canonical-index-ish keys) and exotic
@@ -4889,6 +5115,16 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         }
         return 0;
     }
+    // What an append below proves, for the site's add way: the receiver's
+    // shape before it, its [[Prototype]], and the hops the chain walk read.
+    let mut add_way = AddWay {
+        func: func_id,
+        name: name_idx,
+        proto: u32::MAX,
+        class: u32::MAX,
+        ..AddWay::default()
+    };
+    let mut add_way_ok = idx != vm.obj_proto;
     // Pre-checks against a shared borrow (the write below re-borrows mutably).
     let own = match vm.heap.get(idx) {
         // A class's prototype object: every write must reach `set_prop`, which
@@ -4930,15 +5166,25 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             // the interpreter applies the right one.
             Some(s) if !map.attr_at(s).writable => return crate::codegen::SELF_CALL_DEOPT,
             Some(s) => Some(s),
-            None => {
+            None => 'own_miss: {
                 // Own miss. A class-instance receiver may resolve a chain
                 // SETTER — the interpreter-IC slow helper serves it (or
                 // deopts). A non-extensible object must reject the add; an
                 // inherited accessor / non-writable data prop on the proto
                 // chain governs the write (OrdinarySet) — interpreter cases.
                 // Only a provably-clean chain lets us append the key.
-                if map.class.is_some() {
-                    return crate::codegen::PROP_VIA_IC;
+                if let Some(class) = map.class {
+                    // Unless no member of its class chain declares the key and
+                    // the rest of the chain is clean: then the append is the
+                    // plain one below.
+                    if !map.extensible
+                        || map.is_ctor
+                        || !class_add_proof(vm, idx, class, key, &mut add_way)
+                    {
+                        return crate::codegen::PROP_VIA_IC;
+                    }
+                    add_way.before = map.shape();
+                    break 'own_miss None;
                 }
                 if map.is_ctor {
                     // Ctor maps do not default to %Object.prototype% (see the
@@ -4950,6 +5196,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                 if !map.extensible {
                     return crate::codegen::SELF_CALL_DEOPT;
                 }
+                add_way.before = map.shape();
                 let mut cur = idx;
                 let mut hops = 0;
                 loop {
@@ -4966,6 +5213,15 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                     hops += 1;
                     if hops > 64 || !vm.ic_obj_ok(next) {
                         return crate::codegen::SELF_CALL_DEOPT;
+                    }
+                    if hops == 1 {
+                        add_way.proto = next;
+                    }
+                    if hops <= ADD_WAY_HOPS {
+                        add_way.hops[hops - 1] = (next, vm.heap.version_of(next));
+                        add_way.nhops = hops as u32;
+                    } else {
+                        add_way_ok = false;
                     }
                     match vm.heap.get(next) {
                         HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
@@ -5018,6 +5274,23 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     };
     if added {
         vm.heap.bump_version(idx);
+        // The append is proved: the site's next one onto an object of the same
+        // shape and chain takes the add way. Its identity way is useless for
+        // the new objects a constructor appends to, so it fills none.
+        if add_way_ok && add_way.before != crate::shape::DICT {
+            if let HeapObj::Object(map) = vm.heap.get(idx) {
+                add_way.after = map.shape();
+            }
+            let s = site_idx as usize;
+            if add_way.after != crate::shape::DICT && s < ADD_WAY_SITES_MAX {
+                add_way.planned = shape_key_plan(vm, add_way.after).is_some();
+                if vm.jit_add_ways.len() <= s {
+                    vm.jit_add_ways.resize(s + 1, AddWay::default());
+                }
+                vm.jit_add_ways[s] = add_way;
+                return 0;
+            }
+        }
     }
     let version = vm.heap.version_of(idx);
     // SetProp sites only ever hold OWN ways (the region's write fast path
