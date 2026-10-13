@@ -3641,6 +3641,66 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::MakeFunc { dst, .. }
+            | Instr::MakeClosure { dst, .. }
+            | Instr::MakeArrow { dst, .. }
+                if !py =>
+            {
+                // `jit_region_make_fn` runs the interpreter's code in this
+                // frame and returns the callable's bits; a decline precedes
+                // every effect and resumes the interpreter at this op.
+                let helper = crate::vm::jit_region_make_fn as usize;
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let window = proto.reg_count.max(1) as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed_fip as i64
+                    ; mov r9, QWORD window as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, tplan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::MakeCell { .. }
+            | Instr::MakeCellTdz { .. }
+            | Instr::MakeCellFnName { .. }
+            | Instr::MarkCellConst { .. }
+                if !py =>
+            {
+                // The same helper writes the fresh cell into the window.
+                let helper = crate::vm::jit_region_make_fn as usize;
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let window = proto.reg_count.max(1) as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed_fip as i64
+                    ; mov r9, QWORD window as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, tplan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::ToStr { dst, a } if !py => {
                 // `${a}`: `jit_to_str_ic`, with the call protocol.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;

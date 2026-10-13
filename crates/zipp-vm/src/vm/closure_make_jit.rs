@@ -182,6 +182,19 @@ pub(crate) extern "win64" fn jit_make_cell(
         if make_site_preflight(vm, regs, reg_count, caller).is_none() {
             return crate::codegen::SELF_CALL_DEOPT;
         }
+        make_cell_commit(vm, regs, reg_count, instr)
+    })) {
+        Ok(bits) => bits,
+        // A panic past the allocation/side-table commit must never replay.
+        Err(_) => std::process::abort(),
+    }
+}
+
+/// The commit half of [`jit_make_cell`] and [`jit_region_make_fn`]'s cell ops,
+/// once the activation is verified.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn make_cell_commit(vm: &mut Vm<'_>, regs: *mut u64, reg_count: usize, instr: Instr) -> u64 {
+    {
         match instr {
             Instr::MakeCell { reg } | Instr::MakeCellFnName { reg }
                 if (reg as usize) < reg_count =>
@@ -220,9 +233,93 @@ pub(crate) extern "win64" fn jit_make_cell(
             }
             _ => crate::codegen::SELF_CALL_DEOPT,
         }
+    }
+}
+
+/// The loop-region form of [`jit_make_func`](crate::vm::jit_make_func),
+/// [`jit_make_cell`] and [`jit_make_closure`]: `MakeFunc`, `MakeCell*`,
+/// `MarkCellConst`, `MakeClosure` and `MakeArrow` inside a compiled loop. A
+/// region runs in place in the TOP interpreter frame (every helper returns
+/// before the next region op), so that frame is the activation: the helper
+/// checks it is `caller`'s and that `regs` is its window, validates every
+/// capture source, and then runs the interpreter's own code. Each decline
+/// precedes the first effect, so the interpreter replays the op. A function
+/// or closure returns its bits; a cell op writes the window and returns 0.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_region_make_fn(
+    vm: *mut core::ffi::c_void,
+    regs: *mut u64,
+    packed_fip: u64,
+    reg_count: u64,
+) -> u64 {
+    if vm.is_null() || regs.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let reg_count = reg_count as usize;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let Some((caller, instr)) = site_instr(vm, packed_fip) else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        let Some(frame) = vm.frames.last() else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        let (frame_idx, base, closure) = (vm.frames.len() - 1, frame.base, frame.closure);
+        if frame.func as usize != caller
+            || reg_count < vm.func(caller).reg_count.max(1) as usize
+            || !crate::vm::regs_window_valid(vm, regs, reg_count)
+            || vm.regs.as_ptr().wrapping_add(base) as *const u64 != regs as *const u64
+        {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let func_count = vm.main_func_count.saturating_add(vm.eval_funcs.len());
+        match instr {
+            Instr::MakeFunc { func_id, .. } if (func_id as usize) < func_count => {
+                vm.maybe_gc();
+                let idx = vm.heap.alloc_func_settled(func_id);
+                if let Some(sc) = vm.ensure_frame_eval_scope(frame_idx) {
+                    vm.closure_eval_scope.insert(idx, sc);
+                }
+                vm.realm_tag_new(idx);
+                Value::heap(idx).bits()
+            }
+            Instr::MakeClosure { func_id, .. } | Instr::MakeArrow { func_id, .. }
+                if (func_id as usize) < func_count =>
+            {
+                let this_reg = match instr {
+                    Instr::MakeArrow { this_reg, .. } => {
+                        if this_reg as usize >= reg_count {
+                            return crate::codegen::SELF_CALL_DEOPT;
+                        }
+                        Some(this_reg)
+                    }
+                    _ => None,
+                };
+                // The safe point precedes resolution: the cells sit in window
+                // slots or the frame's closure (roots), and the collector is
+                // non-moving. Resolution checks everything the interpreter
+                // trusts about compiled bytecode.
+                vm.maybe_gc();
+                let site = MakeSite {
+                    active: NO_CLOSURE,
+                    closure,
+                    frame_backed: true,
+                };
+                let Some(cells) = resolve_upvalues(vm, regs, reg_count, site, func_id as usize)
+                else {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                };
+                vm.make_closure_with_cells(frame_idx, base, func_id, this_reg, cells)
+                    .bits()
+            }
+            Instr::MakeCell { .. }
+            | Instr::MakeCellFnName { .. }
+            | Instr::MakeCellTdz { .. }
+            | Instr::MarkCellConst { .. } => make_cell_commit(vm, regs, reg_count, instr),
+            _ => crate::codegen::SELF_CALL_DEOPT,
+        }
     })) {
         Ok(bits) => bits,
-        // A panic past the allocation/side-table commit must never replay.
         Err(_) => std::process::abort(),
     }
 }

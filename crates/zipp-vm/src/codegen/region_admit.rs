@@ -823,6 +823,18 @@ pub(crate) fn region_op_admitted(
         // interpreter replays the op and applies PutValue's throw/no-op
         // semantics. Both hit paths are allocation- and user-code-free.
         Instr::CellSet { .. } | Instr::UpvalSet { .. } => {}
+        // Function, closure and cell creation (`arr.map(x => x + k)`, a
+        // per-iteration `let` a closure captures): `jit_region_make_fn` runs
+        // the interpreter's own code in the region's frame. Allocation is a
+        // safe point; the emitter refetches after it. MEM path only.
+        Instr::MakeFunc { .. }
+        | Instr::MakeClosure { .. }
+        | Instr::MakeArrow { .. }
+        | Instr::MakeCell { .. }
+        | Instr::MakeCellTdz { .. }
+        | Instr::MakeCellFnName { .. }
+        | Instr::MarkCellConst { .. }
+            if const_strs.is_some() && crate::vm::tierc_closure_make_enabled() => {}
         // `+x` — a NUMBER passes straight through (the interpreter returns
         // the Value verbatim); anything else needs observable ToNumber
         // coercion and bails. It was simply absent from this list, which

@@ -5112,35 +5112,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::MakeClosure { dst, func_id } => {
-                        // Capture each upvalue's cell index, resolved in THIS
-                        // (defining) frame: a ParentLocal source reads the cell
-                        // index from a local register (the local was boxed via
-                        // MakeCell); a ParentUpval source forwards one of this
-                        // frame's own captured cells.
-                        let sources = &self.func(func_id as usize).upvalues;
-                        let mut cells = Vec::with_capacity(sources.len());
-                        for src in sources {
-                            let cell = match *src {
-                                UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
-                                UpvalSource::ParentUpval(idx) => {
-                                    self.closure_upvalue(cur_closure, idx)
-                                }
-                            };
-                            cells.push(cell);
-                        }
-                        let v = Value::heap(self.heap.alloc(HeapObj::Closure {
-                            func: func_id,
-                            upvalues: cells,
-                            this_val: Value::UNDEFINED,
-                        }));
-                        if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
-                            self.closure_eval_scope.insert(v.heap_index(), sc);
-                        }
-                        // A function declared inside a class body keeps that
-                        // body private scope.
-                        let defining = self.frames[frame_idx].callee;
-                        self.inherit_private_brands(defining, v.heap_index());
-                        self.realm_tag_new(v.heap_index());
+                        let v = self.make_closure_in_frame(frame_idx, base, func_id, None);
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -5149,63 +5121,7 @@ impl<'p> Vm<'p> {
                         func_id,
                         this_reg,
                     } => {
-                        // Like MakeClosure, but the resulting closure also captures the
-                        // defining frame's effective `this` (register `this_reg` =
-                        // `this_override.unwrap_or(0)` at the definition site â€” usually
-                        // reg 0, but the class value inside a static field initializer)
-                        // so a later call binds it lexically (FuncProto::lexical_this).
-                        let sources = &self.func(func_id as usize).upvalues;
-                        let mut cells = Vec::with_capacity(sources.len());
-                        for src in sources {
-                            let cell = match *src {
-                                UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
-                                UpvalSource::ParentUpval(idx) => {
-                                    self.closure_upvalue(cur_closure, idx)
-                                }
-                            };
-                            cells.push(cell);
-                        }
-                        let this_val = self.get(base, this_reg);
-                        let v = Value::heap(self.heap.alloc(HeapObj::Closure {
-                            func: func_id,
-                            upvalues: cells,
-                            this_val,
-                        }));
-                        // An arrow inside an object method inherits that method's
-                        // [[HomeObject]] lexically (so `super.x` in the arrow resolves).
-                        let callee = self.frames[frame_idx].callee;
-                        if callee.is_heap() {
-                            if let Some(&home) = self.closure_home.get(&callee.heap_index()) {
-                                self.record_closure_home(v.heap_index(), home);
-                            }
-                        }
-                        // ... and the defining activation's `new.target` (an arrow
-                        // has none of its own; `(_ => new.target)()` inside `new F()`
-                        // must see F). A nested arrow chains through the enclosing
-                        // arrow's captured value.
-                        let nt = {
-                            let fnt = self.frames[frame_idx].new_target;
-                            if fnt != Value::UNDEFINED {
-                                fnt
-                            } else if callee.is_heap() {
-                                self.closure_new_target
-                                    .get(&callee.heap_index())
-                                    .copied()
-                                    .unwrap_or(Value::UNDEFINED)
-                            } else {
-                                Value::UNDEFINED
-                            }
-                        };
-                        if nt != Value::UNDEFINED {
-                            self.record_closure_new_target(v.heap_index(), nt);
-                        }
-                        // ... the enclosing class body private scope ...
-                        self.inherit_private_brands(callee, v.heap_index());
-                        // ... and any dynamic EvalScope of the defining frame.
-                        if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
-                            self.closure_eval_scope.insert(v.heap_index(), sc);
-                        }
-                        self.realm_tag_new(v.heap_index());
+                        let v = self.make_closure_in_frame(frame_idx, base, func_id, Some(this_reg));
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -9963,6 +9879,89 @@ impl<'p> Vm<'p> {
     // â”€â”€ call setup â”€â”€
 
     /// Resolve a value to a callable function id, or throw a TypeError.
+    /// `MakeClosure` (`this_reg` `None`) / `MakeArrow` in activation
+    /// `frame_idx`, whose window starts at `base`. Each upvalue's cell is
+    /// resolved in that (defining) activation: a ParentLocal source reads the
+    /// cell from a local register (the local was boxed via MakeCell); a
+    /// ParentUpval source forwards one of the activation's own captured
+    /// cells. An arrow also captures the effective `this` (register
+    /// `this_reg`: usually reg 0, but the class value inside a static field
+    /// initializer) and inherits the activation's `[[HomeObject]]` and
+    /// `new.target` lexically. Both inherit a class body's private scope, any
+    /// dynamic EvalScope and the realm. The interpreter arms and the loop
+    /// region's helper share this.
+    pub(crate) fn make_closure_in_frame(
+        &mut self,
+        frame_idx: usize,
+        base: usize,
+        func_id: u32,
+        this_reg: Option<u16>,
+    ) -> Value {
+        let cur_closure = self.frames[frame_idx].closure;
+        let sources = &self.func(func_id as usize).upvalues;
+        let mut cells = Vec::with_capacity(sources.len());
+        for src in sources {
+            let cell = match *src {
+                UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
+                UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+            };
+            cells.push(cell);
+        }
+        self.make_closure_with_cells(frame_idx, base, func_id, this_reg, cells)
+    }
+
+    /// [`Vm::make_closure_in_frame`] once the capture cells are resolved.
+    pub(crate) fn make_closure_with_cells(
+        &mut self,
+        frame_idx: usize,
+        base: usize,
+        func_id: u32,
+        this_reg: Option<u16>,
+        cells: Vec<u32>,
+    ) -> Value {
+        let this_val = match this_reg {
+            Some(r) => self.get(base, r),
+            None => Value::UNDEFINED,
+        };
+        let v = Value::heap(self.heap.alloc_closure_settled(func_id, cells, this_val));
+        let callee = self.frames[frame_idx].callee;
+        if this_reg.is_some() {
+            // An arrow inside an object method inherits that method's
+            // [[HomeObject]] lexically (so `super.x` in the arrow resolves).
+            if callee.is_heap() {
+                if let Some(&home) = self.closure_home.get(&callee.heap_index()) {
+                    self.record_closure_home(v.heap_index(), home);
+                }
+            }
+            // ... and the defining activation's `new.target` (an arrow has
+            // none of its own; `(_ => new.target)()` inside `new F()` must see
+            // F). A nested arrow chains through the enclosing arrow's
+            // captured value.
+            let fnt = self.frames[frame_idx].new_target;
+            let nt = if fnt != Value::UNDEFINED {
+                fnt
+            } else if callee.is_heap() {
+                self.closure_new_target
+                    .get(&callee.heap_index())
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED)
+            } else {
+                Value::UNDEFINED
+            };
+            if nt != Value::UNDEFINED {
+                self.record_closure_new_target(v.heap_index(), nt);
+            }
+        }
+        // A function declared inside a class body keeps that body's private
+        // scope.
+        self.inherit_private_brands(callee, v.heap_index());
+        if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
+            self.closure_eval_scope.insert(v.heap_index(), sc);
+        }
+        self.realm_tag_new(v.heap_index());
+        v
+    }
+
     /// The cell heap-index captured at upvalue slot `idx` of the closure heap
     /// object `closure`. Panics only on a miscompiled program (an UpvalGet in a
     /// frame with no closure, or an out-of-range slot), which the compiler must
