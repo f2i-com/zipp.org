@@ -27,6 +27,31 @@ def bench(bench_id, zipp_only=False):
 ZIPP = pb.Engine("zipp", "zipp", ("/bin/zipp-a", "py"))
 ZIPP_B = pb.Engine("zipp-b", "zipp", ("/bin/zipp-b", "py"))
 CPYTHON = pb.Engine("cpython", "cpython", ("py", "-3.13"))
+TORCH = pb.Engine("torch", "torch", ("py", "-3.11"))
+
+TORCH_PROGRAM = '''# zipp-bench: zipp-only
+"""doc"""
+import sys
+import time
+
+import torch
+
+
+def bench():
+    return torch.ones(2).sum().item()
+
+
+t0 = time.perf_counter()
+result = bench()
+elapsed = time.perf_counter() - t0
+print("tiny", "%.1f" % result)
+print("@bench-time %.6f" % elapsed, file=sys.stderr)
+'''
+
+
+def torch_bench(bench_id="macro/t"):
+    group, name = bench_id.split("/")
+    return pb.Benchmark(bench_id, group, name, Path(f"/suite/{bench_id}.py"), True, "0" * 64, uses_torch=True)
 
 
 def observation(seq, bench_id, engine, rep, stdout="ok 1\n", work=0.5, wall=0.6, error=None):
@@ -59,6 +84,20 @@ class ArgumentParsingTests(unittest.TestCase):
         self.assertEqual(args.metric, "work")
         self.assertGreater(args.timeout, 0)
         self.assertIsNone(args.json)
+        self.assertIsNone(args.torch_cpython)
+        self.assertEqual(args.torch_threads, 1)
+        self.assertEqual(args.warm, 1)
+        self.assertNotIn("torch", [e.name for e in pb.build_engines(args)])
+
+    def test_torch_reference_and_warm_options(self):
+        args = pb.parse_args(["--zipp", "a", "--no-cpython", "--torch-cpython", "py -3.11", "--torch-threads", "0", "--warm", "5"])
+        engines = pb.build_engines(args)
+        self.assertEqual([(e.name, e.kind) for e in engines], [("zipp", "zipp"), ("torch", "torch")])
+        self.assertEqual(engines[1].prefix, ("py", "-3.11"))
+        self.assertEqual((args.torch_threads, args.warm), (0, 5))
+        for bad in (["--warm", "0"], ["--torch-threads", "-1"]):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                pb.parse_args(["--zipp", "a", *bad])
 
     def test_ab_and_filters(self):
         args = pb.parse_args(
@@ -119,6 +158,14 @@ class StatisticsTests(unittest.TestCase):
         self.assertIsNone(pb.parse_work_time("Traceback ...\n"))
         self.assertIsNone(pb.parse_work_time("x @bench-time 0.5\n"))
 
+    def test_warm_runs_time_the_fastest_after_the_first(self):
+        times = pb.parse_work_times("@bench-time 0.9\r\n@bench-time 0.3\n@bench-time 0.2\n@bench-time 0.25\n")
+        self.assertEqual(times, [0.9, 0.3, 0.2, 0.25])
+        self.assertEqual(pb.warm_and_cold(times, 4), (0.2, 0.9))
+        self.assertEqual(pb.warm_and_cold(times, 1), (0.25, None))
+        self.assertEqual(pb.warm_and_cold([0.9], 3), (None, 0.9))
+        self.assertEqual(pb.warm_and_cold([], 3), (None, None))
+
 
 class DiscoveryTests(unittest.TestCase):
     def test_directives(self):
@@ -136,8 +183,10 @@ class DiscoveryTests(unittest.TestCase):
         macro = [b for b in benches if b.group == "macro"]
         self.assertGreaterEqual(len(micro), 25)
         self.assertGreaterEqual(len(macro), 8)
+        torch_rows = {"macro/torch_" + n for n in ("cnn", "dataloader", "matmul", "matmul_big", "mlp", "rnn", "small_ops", "transformer")}
         zipp_only = {b.id for b in benches if b.zipp_only}
-        self.assertEqual(zipp_only, {"macro/torch_matmul", "macro/torch_mlp"})
+        self.assertEqual(zipp_only, torch_rows)
+        self.assertEqual({b.id for b in benches if b.uses_torch}, torch_rows)
         for b in benches:
             source = b.path.read_text(encoding="utf-8")
             with self.subTest(bench=b.id):
@@ -145,6 +194,9 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertIn(f'print("{b.name}"', source)
                 self.assertNotIn("import random", source)
                 self.assertEqual(source.encode("utf-8"), source.encode("ascii", errors="replace"))
+                # --warm repeats the program from this line on.
+                self.assertIn(pb.TIMED_TAIL_MARKER, source.replace("\r\n", "\n"))
+                pb.derived_source(source, 3, 1)
         for group in pb.GROUPS:
             with self.subTest(group=group):
                 strays = [p.name for p in (pb.SUITE_DIR / group).iterdir() if p.suffix != ".py" and p.name != "__pycache__"]
@@ -154,6 +206,56 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(all(b.group == "macro" for b in pb.discover(pb.SUITE_DIR, "macro")))
         only = pb.discover(pb.SUITE_DIR, "all", "dict_")
         self.assertEqual([b.id for b in only], ["micro/dict_get", "micro/dict_str_key"])
+
+
+class DerivedProgramTests(unittest.TestCase):
+    def test_warm_repeats_the_timed_tail_and_threads_are_set_first(self):
+        text = pb.derived_source(TORCH_PROGRAM.replace("\n", "\r\n"), 3, 1)
+        head, _, loop = text.partition("for _zipp_bench_rep in range(3):\n")
+        self.assertTrue(loop, text)
+        self.assertIn("def bench():", head)
+        self.assertTrue(head.endswith("import torch as _zipp_bench_torch\n_zipp_bench_torch.set_num_threads(1)\n"))
+        self.assertIn("    t0 = time.perf_counter()\n    result = bench()\n", loop)
+        self.assertIn('    print("@bench-time %.6f" % elapsed, file=sys.stderr)\n', loop)
+        self.assertNotIn("\r", text)
+        namespace = {}
+        out = io.StringIO()
+        with contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(out):
+            fake_torch = mock.MagicMock()
+            fake_torch.ones.return_value.sum.return_value.item.return_value = 2.0
+            with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+                exec(compile(text, "derived", "exec"), namespace)
+        self.assertEqual(out.getvalue(), "tiny 2.0\n" * 3)
+        self.assertEqual(len(pb.parse_work_times(err.getvalue())), 3)
+        fake_torch.set_num_threads.assert_called_once_with(1)
+
+    def test_single_run_without_threads_is_the_program_itself(self):
+        self.assertEqual(pb.derived_source(TORCH_PROGRAM, 1, None), TORCH_PROGRAM)
+        self.assertEqual(pb.derived_source(TORCH_PROGRAM, 1, 0), TORCH_PROGRAM)
+        with self.assertRaises(ValueError):
+            pb.derived_source("print(1)\n", 2, None)
+
+    def test_prepare_scripts_copies_only_what_must_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "macro").mkdir()
+            path = root / "macro" / "t.py"
+            path.write_text(TORCH_PROGRAM, encoding="utf-8")
+            b = pb.Benchmark("macro/t", "macro", "t", path, True, "0" * 64, uses_torch=True)
+            plain = pb.prepare_scripts([b], [ZIPP, TORCH], 1, 1, root / "work")
+            self.assertEqual(plain[("macro/t", "zipp")], (path, path.parent))
+            script, cwd = plain[("macro/t", "torch")]
+            self.assertNotEqual(cwd, path.parent)
+            self.assertEqual(script.parent, cwd)
+            self.assertEqual(script.name, "t.py")
+            self.assertIn("set_num_threads(1)", script.read_text(encoding="utf-8"))
+            warm = pb.prepare_scripts([b], [ZIPP, TORCH], 4, 0, root / "work2")
+            zscript, zcwd = warm[("macro/t", "zipp")]
+            self.assertNotEqual(zcwd, path.parent)
+            ztext = zscript.read_text(encoding="utf-8")
+            self.assertIn("range(4)", ztext)
+            self.assertNotIn("set_num_threads", ztext)
+            self.assertNotIn("set_num_threads", warm[("macro/t", "torch")][0].read_text(encoding="utf-8"))
 
 
 class ScheduleTests(unittest.TestCase):
@@ -172,6 +274,16 @@ class ScheduleTests(unittest.TestCase):
             )
         reps_in_order = [e["rep"] for e in schedule]
         self.assertEqual(reps_in_order, sorted(reps_in_order), "repetitions are not interleaved across each other")
+
+    def test_torch_reference_runs_only_the_zipp_only_torch_programs(self):
+        plain_zipp_only = bench("macro/z", zipp_only=True)
+        benches = [bench("micro/a"), plain_zipp_only, torch_bench()]
+        engines = [ZIPP, CPYTHON, TORCH]
+        self.assertEqual([e.name for e in pb.applicable_engines(benches[0], engines)], ["zipp", "cpython"])
+        self.assertEqual([e.name for e in pb.applicable_engines(plain_zipp_only, engines)], ["zipp"])
+        self.assertEqual([e.name for e in pb.applicable_engines(benches[2], engines)], ["zipp", "torch"])
+        pairs = {(e["bench"], e["engine"]) for e in pb.build_schedule(benches, engines, 2)}
+        self.assertEqual({p for p in pairs if p[1] == "torch"}, {("macro/t", "torch")})
 
     def test_engine_order_rotates_so_each_engine_leads_equally(self):
         benches = [bench("micro/a"), bench("micro/b")]
@@ -245,6 +357,31 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(any("exit code 1" in f for f in failures))
         self.assertTrue(any("no successful cpython run" in f for f in failures))
 
+    def test_torch_reference_difference_is_recorded_not_failed(self):
+        benches = [torch_bench()]
+        obs = [
+            observation(0, "macro/t", "zipp", 0, stdout="t 1.0\n"),
+            observation(1, "macro/t", "torch", 0, stdout="t 1.1\n"),
+            observation(2, "macro/t", "zipp-b", 0, stdout="t 1.0\n"),
+        ]
+        per, failures = pb.validate(benches, obs, cpython_enabled=False)
+        self.assertEqual(failures, [])
+        self.assertTrue(per["macro/t"]["valid"])
+        self.assertEqual([m["engine"] for m in per["macro/t"]["torch_mismatches"]], ["torch"])
+        summary = pb.summarize(benches, [ZIPP, ZIPP_B, TORCH], obs, per)
+        self.assertTrue(summary["macro/t"]["torch_differs"])
+        self.assertAlmostEqual(summary["macro/t"]["ratios"]["work_s"]["zipp/torch"], 1.0)
+        table = pb.render_table(benches, [ZIPP, ZIPP_B, TORCH], summary, pb.group_geomeans(benches, summary), "work_s")
+        self.assertIn("torch-differs", table)
+        self.assertIn("geomean zipp/torch (work_s): macro 1.00x (n=1)", table)
+
+    def test_a_failed_torch_run_is_a_failure(self):
+        benches = [torch_bench()]
+        obs = [observation(0, "macro/t", "zipp", 0), observation(1, "macro/t", "torch", 0, stdout="", error="exit code 1")]
+        per, failures = pb.validate(benches, obs, cpython_enabled=False)
+        self.assertFalse(per["macro/t"]["valid"])
+        self.assertTrue(any("torch rep 1" in f for f in failures))
+
     def test_empty_reference_output_is_not_a_checksum(self):
         benches = [bench("micro/a")]
         obs = [observation(0, "micro/a", "zipp", 0, stdout=""), observation(1, "micro/a", "cpython", 0, stdout="\n")]
@@ -317,6 +454,21 @@ class RunOneTests(unittest.TestCase):
         self.assertEqual(row["work_s"], 0.125)
         self.assertGreaterEqual(row["wall_s"], 0.0)
         self.assertIsNone(row["stderr_tail"])
+
+    def test_warm_run_keeps_the_fastest_warm_time_and_the_cold_one(self):
+        fake = mock.Mock(return_value={
+            "returncode": 0, "stdout": b"t 1\nt 1\nt 1\n", "stderr": b"@bench-time 0.8\n@bench-time 0.12\n@bench-time 0.1\n",
+            "timed_out": False, "start_error": None,
+        })
+        row = pb.run_one(["py", "t.py"], Path("."), {}, 10.0, spawn_fn=fake, warm=3)
+        self.assertIsNone(row["error"])
+        self.assertEqual((row["work_s"], row["cold_s"]), (0.1, 0.8))
+        self.assertEqual(row["work_times_s"], [0.8, 0.12, 0.1])
+        short = mock.Mock(return_value={"returncode": 0, "stdout": b"t 1\n", "stderr": b"@bench-time 0.8\n",
+                                        "timed_out": False, "start_error": None})
+        row = pb.run_one(["py", "t.py"], Path("."), {}, 10.0, spawn_fn=short, warm=3)
+        self.assertIn("1 @bench-time lines for --warm 3", row["error"])
+        self.assertIsNone(row["work_s"])
 
     def test_failures(self):
         cases = [
@@ -432,6 +584,62 @@ class MainTests(unittest.TestCase):
         self.assertIn("checksum differs", err)
         self.assertFalse(report["summary"]["micro/loop"]["valid"])
         self.assertIsNone(report["summary"]["micro/loop"]["ratios"]["work_s"]["zipp/cpython"])
+
+    def test_torch_reference_with_warm_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suite = self.make_suite(root)
+            (suite / "macro" / "torch_tiny.py").write_text(TORCH_PROGRAM, encoding="utf-8")
+            zipp = root / "zipp.exe"
+            zipp.write_bytes(b"fake zipp binary")
+
+            def fake_probe(argv_probe, timeout=30.0):
+                if argv_probe[-1] in ("--version", "--json"):
+                    return 0, json.dumps({"name": "zipp"}) if argv_probe[-1] == "--json" else "zipp 0.0.23\n", ""
+                if "-c" in argv_probe and "torch" in argv_probe[-1]:
+                    return 0, json.dumps({"torch": "2.11.0", "threads": 16}), ""
+                if "-c" in argv_probe:
+                    return 0, json.dumps({"version": "3.11.9", "version_info": [3, 11, 9], "implementation": "cpython",
+                                          "executable": None}), ""
+                if argv_probe[0] == "git":
+                    return 0, "abc\n", ""
+                raise AssertionError(argv_probe)
+
+            calls = []
+
+            def fake_spawn(argv_run, cwd, env, timeout):
+                script = Path(cwd) / argv_run[-1]
+                calls.append((argv_run[0], argv_run[-1], script.read_text(encoding="utf-8")))
+                torch_run = argv_run[0] == "py"
+                name = Path(argv_run[-1]).stem
+                stdout = ("%s 1\n" % name) * 2 if name != "torch_tiny" else ("tiny 2.0\n" * 2)
+                stderr = b"@bench-time 0.900000\n@bench-time 0.100000\n" if torch_run else b"@bench-time 0.400000\n@bench-time 0.300000\n"
+                return {"returncode": 0, "stdout": stdout.encode(), "stderr": stderr, "timed_out": False, "start_error": None}
+
+            report_path = root / "out" / "r.json"
+            argv = ["--zipp", str(zipp), "--no-cpython", "--torch-cpython", "py -3.11", "--warm", "2",
+                    "--suite-dir", str(suite), "--json", str(report_path), "--reps", "1", "--only", "torch"]
+            with mock.patch.object(pb, "probe", side_effect=fake_probe), \
+                    mock.patch.object(pb, "spawn", side_effect=fake_spawn), \
+                    contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                code = pb.main(argv)
+            self.assertEqual(code, 0, err.getvalue())
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        torch_calls = [c for c in calls if c[0] == "py"]
+        self.assertEqual([c[1] for c in torch_calls], ["torch_tiny.py"])
+        self.assertIn("set_num_threads(1)", torch_calls[0][2])
+        self.assertTrue(all("range(2)" in c[2] for c in calls if c[1] == "torch_tiny.py"))
+        tiny = report["summary"]["macro/torch_tiny"]
+        self.assertAlmostEqual(tiny["engines"]["torch"]["work_s"]["min"], 0.1)
+        self.assertAlmostEqual(tiny["engines"]["torch"]["cold_s"]["min"], 0.9)
+        self.assertAlmostEqual(tiny["engines"]["zipp"]["work_s"]["min"], 0.3)
+        self.assertAlmostEqual(tiny["ratios"]["work_s"]["zipp/torch"], 3.0)
+        self.assertEqual(report["configuration"]["torch_threads"], 1)
+        self.assertEqual(report["configuration"]["warm"], 2)
+        self.assertEqual(report["engines"][-1]["torch_version"], "2.11.0")
+        self.assertIn("first run in the process", out.getvalue())
+        self.assertNotIn("macro/tensor", {o["bench"] for o in report["observations"] if o["engine"] == "torch"})
 
     def test_missing_binary_and_empty_selection_are_usage_errors(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):
