@@ -1727,6 +1727,19 @@ pub struct Vm<'p> {
     /// activation, mirroring `pending_yield`. Unlike generators, async activations
     /// PRESERVE handlers across a suspension so `try { await p } catch` works.
     pending_await: Option<(Value, usize, Vec<Handler>)>,
+    /// The frame index of the async activation `drive_async_inner` is running
+    /// as its own `AsyncResume` job with the settled-await trampoline on
+    /// (`usize::MAX`: none). An `Await` in exactly that frame of an
+    /// already-fulfilled promise or a primitive, with the microtask queue
+    /// empty, continues in place instead of suspending (see
+    /// `Vm::await_settled_inline`). Saved and restored around every drive.
+    async_inline_frame: usize,
+    /// Settled awaits that activation may still continue without a round
+    /// trip through the queue, shared by the `Await` arm and the trampoline
+    /// in `drive_async_inner`: at zero the next await suspends for real, and
+    /// the job boundary it reaches is the drain's collector and WeakRef
+    /// checkpoint.
+    async_inline_budget: u32,
     /// Scratch slot for NewPromiseCapability: the capturing executor (CAP_EXECUTOR)
     /// writes its (resolve, reject) arguments here during `new C(executor)`, which
     /// `new_promise_capability` `.take()`s immediately after construction. `Some`

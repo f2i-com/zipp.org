@@ -3436,7 +3436,69 @@ impl<'p> Vm<'p> {
         self.drive_async_inner(idx, input, true);
     }
 
+    /// Every drive installs its own settled-await state (`async_inline_frame`,
+    /// `async_inline_budget`) and puts back the one it found: an activation
+    /// driven from inside another's run (an async call, a nested drain) must
+    /// neither inherit nor consume the outer one's.
     fn drive_async_inner(&mut self, idx: u32, input: Resume, allow_trampoline: bool) {
+        let saved = (self.async_inline_frame, self.async_inline_budget);
+        self.async_inline_frame = usize::MAX;
+        self.async_inline_budget = 0;
+        self.drive_async_body(idx, input, allow_trampoline);
+        self.async_inline_frame = saved.0;
+        self.async_inline_budget = saved.1;
+    }
+
+    /// The value an `Await` at frame `frame_idx` continues with in place, or
+    /// `None` to suspend. `v` is what PromiseResolve gave the `Await` arm. Only
+    /// the activation `drive_async_inner` marked (`async_inline_frame`), with
+    /// budget left and the microtask queue empty, continues.
+    ///
+    /// Await(v) is PerformPromiseThen on PromiseResolve(%Promise%, v) and a
+    /// return to the job that resumed the activation. For a promise already
+    /// fulfilled, or a primitive (which PromiseResolve wraps in a promise
+    /// fulfilled with it, with no `then` lookup), that enqueues the
+    /// activation's resume job at once and nothing else; with the queue empty
+    /// the job is the next one the drain runs, and the drain does nothing
+    /// observable between two jobs. So running the job's work here, at the
+    /// await, is the same execution: the trampoline in `drive_async_body`
+    /// already ran it one step later, after popping and re-pushing the frame.
+    /// A rejected promise, a pending one and any object (a thenable's `then`
+    /// is a Get) suspend as before.
+    #[inline]
+    pub(crate) fn await_continue_in_place(&mut self, frame_idx: usize, v: Value) -> Option<Value> {
+        if frame_idx != self.async_inline_frame
+            || self.async_inline_budget == 0
+            || !self.microtasks.is_empty()
+        {
+            return None;
+        }
+        let r = self.await_settled_inline(v)?;
+        self.async_inline_budget -= 1;
+        asyncstats::inline_await();
+        Some(r)
+    }
+
+    /// The settled value of `v` for [`Self::await_continue_in_place`].
+    #[inline]
+    fn await_settled_inline(&self, v: Value) -> Option<Value> {
+        if !v.is_heap() {
+            return Some(v);
+        }
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Promise {
+                state: PromiseState::Fulfilled,
+                result,
+                ..
+            } => Some(*result),
+            HeapObj::Promise { .. } => None,
+            // A heap primitive (a string, symbol or BigInt) as a number is.
+            _ if !self.is_object_value(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn drive_async_body(&mut self, idx: u32, input: Resume, allow_trampoline: bool) {
         let (state, fid, closure, result, callee) = match self.heap.get(idx) {
             HeapObj::AsyncState(a) => (a.state, a.func, a.closure, a.result, a.callee),
             _ => return,
@@ -3474,12 +3536,16 @@ impl<'p> Vm<'p> {
         let mut resume_handlers = saved_handlers;
         // Periodically re-queue even when the queue stays empty. This restores a
         // GC checkpoint for allocation-heavy loops without giving up the common
-        // settled-promise fast path.
-        let mut inline_budget = if allow_trampoline && async_settled_trampoline_enabled() {
-            1024usize
-        } else {
-            0
-        };
+        // settled-promise fast path. The `Await` arm continues a settled await
+        // in place while the activation's frame is `stop` (see
+        // `await_continue_in_place`); the loop below catches the ones it
+        // leaves. The mark is set only while that frame runs: once it is
+        // popped, `to_promise` and `resolve` can run a `then` getter whose
+        // own frames (an async generator's body) start at `stop` again.
+        let armed = allow_trampoline && async_settled_trampoline_enabled();
+        if armed {
+            self.async_inline_budget = 1024;
+        }
         // The activation owns and traces its immutable callee. Reuse the
         // captured identity for every resumed frame, without a side-table lookup.
         let outcome = loop {
@@ -3504,6 +3570,9 @@ impl<'p> Vm<'p> {
             });
             // A mapped `arguments` object aliases every resumed frame window.
             self.relink_mapped_args(idx, stop, new_base);
+            if armed {
+                self.async_inline_frame = stop;
+            }
             // Position the resume point and deliver the awaited value/rejection.
             let outcome = if resume_ip == usize::MAX {
                 self.run_loop(stop)
@@ -3530,11 +3599,15 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            self.async_inline_frame = usize::MAX;
             let Some((awaited, await_ip, handlers)) = self.pending_await.take() else {
                 break outcome;
             };
 
-            let settled = if inline_budget != 0 && self.microtasks.is_empty() && awaited.is_heap() {
+            let settled = if self.async_inline_budget != 0
+                && self.microtasks.is_empty()
+                && awaited.is_heap()
+            {
                 match self.heap.get(awaited.heap_index()) {
                     HeapObj::Promise {
                         state: PromiseState::Fulfilled,
@@ -3559,7 +3632,7 @@ impl<'p> Vm<'p> {
                         *handled = true;
                     }
                 }
-                inline_budget -= 1;
+                self.async_inline_budget -= 1;
                 asyncstats::inline_await();
                 resume_ip = await_ip;
                 resume_input = next_input;

@@ -231,6 +231,8 @@ impl<'p> Vm<'p> {
             pending_yield_eval_scope: u32::MAX,
             pending_yield_raw: false,
             pending_await: None,
+            async_inline_frame: usize::MAX,
+            async_inline_budget: 0,
             cap_capture: None,
             microtasks: std::collections::VecDeque::new(),
             current_microtask: None,
