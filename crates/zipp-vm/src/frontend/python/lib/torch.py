@@ -1421,7 +1421,12 @@ class Tensor:
         return self._overwrite(rand(*self.shape, generator=generator, dtype=self.dtype if self.dtype.is_floating_point else None) * (b - a) + a)
 
     def normal_(self, mean=0.0, std=1.0, generator=None):
-        return self._overwrite(randn(*self.shape, generator=generator, dtype=self.dtype if self.dtype._inexact else None) * std + mean)
+        dt = self.dtype
+        if dt.is_floating_point and type(mean) in (_float, _int) and type(std) in (_float, _int):
+            # PyTorch's normal_ kernel applies mean and std itself (in
+            # double on its scalar path, in the dtype on its blocked one).
+            return self._overwrite(Tensor(_k.randn(_gen(generator), _numel(self.shape), dt.name, _float(mean), _float(std)), self.shape, dt))
+        return self._overwrite(randn(*self.shape, generator=generator, dtype=dt if dt._inexact else None) * std + mean)
 
     def bernoulli_(self, p=0.5, generator=None):
         probs = p if isinstance(p, Tensor) else full(self.shape, _float(p), dtype=float64)
@@ -3129,7 +3134,8 @@ def randn(*size, generator=None, dtype=None, layout=None, device=None, requires_
         # Real and imaginary parts each N(0, 1/2), as PyTorch's complex
         # normal: 2n standard normals scaled by sqrt(1/2).
         rdt = dt.to_real()
-        parts = _k.binary_scalar("mul", _k.randn(_gen(generator), _numel(shape) * 2, rdt.name), (_numel(shape) * 2,), 0.7071067811865476, rdt.name, rdt.name, False)[0]
+        # PyTorch's normal_ on a complex tensor: its real view, std / sqrt(2).
+        parts = _k.randn(_gen(generator), _numel(shape) * 2, rdt.name, 0.0, 1.0 / _math.sqrt(2.0))
         return Tensor(_k.as_complex(parts), shape, dt, requires_grad)
     return Tensor(_k.randn(_gen(generator), _numel(shape), dt.name), shape, dt, requires_grad)
 
@@ -3189,9 +3195,15 @@ def normal(mean=0.0, std=1.0, size=None, generator=None, dtype=None, layout=None
         return add(mul(z, std), mean).detach()
     if size is None:
         raise TypeError("normal() missing the size argument for float mean and std")
-    out = randn(*_shape_args((size,)), generator=generator, dtype=dtype)
-    out = mul(out, _float(std)) if std != 1 else out
-    out = add(out, _float(mean)) if mean != 0 else out
+    shape = _shape_args((size,))
+    dt = _dtype_of(dtype) or _default_dtype
+    if dt.is_floating_point:
+        # empty(size).normal_(mean, std), as PyTorch computes it.
+        out = Tensor(_k.randn(_gen(generator), _numel(shape), dt.name, _float(mean), _float(std)), shape, dt)
+    else:
+        out = randn(*shape, generator=generator, dtype=dtype)
+        out = mul(out, _float(std)) if std != 1 else out
+        out = add(out, _float(mean)) if mean != 0 else out
     return out.requires_grad_(requires_grad) if requires_grad else out
 
 

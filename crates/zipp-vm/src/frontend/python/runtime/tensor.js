@@ -2001,7 +2001,10 @@
     }
     // ---- random: MT19937, with PyTorch's CPU transforms ------------------------------------------
     function mt(seed) {
-        const s = { mt: new Uint32Array(624), i: 625 };
+        // `nd`: the second value of the last Box-Muller pair of PyTorch's
+        // scalar normal path (CPUGeneratorImpl's next_double_normal_sample),
+        // null when there is none.
+        const s = { mt: new Uint32Array(624), i: 625, nd: null };
         seedMt(s, seed >>> 0);
         return s;
     }
@@ -2024,25 +2027,37 @@
         return y >>> 0;
     }
     // A uniform double in [0, 1) from 53 bits, as torch's random64 path.
-    function nextDouble(s) { const hi = next32(s), lo = next32(s); const v = (hi * 4294967296 + lo) % 9007199254740992; return v / 9007199254740992; }
+    // (hi * 2**32 + lo) % 2**53, exactly: the low 21 bits of `hi` (the sum
+    // with all of `hi` passes 2**53 and would round before the remainder).
+    function nextDouble(s) { const hi = next32(s), lo = next32(s); return ((hi & 0x1fffff) * 4294967296 + lo) / 9007199254740992; }
     const Gen = rt.newType("Generator", [rt.ObjectType], new Map(), "_zipp_tensor");
     function genNew(seed) { return { cls: Gen, dict: new Map(), state: mt(Number(BigInt.asUintN(32, BigInt(seed)))), seed: BigInt(seed) }; }
     // A generator's whole state as a uint8 storage: the 624 MT words, the
-    // position (little-endian uint32 each) and the 64-bit seed.
+    // position (little-endian uint32 each), the 64-bit seed, then a flag
+    // byte and the cached normal (a float64) when the flag is 1. A state
+    // without the last nine bytes (an earlier build's) has no cached normal.
+    const STATE_BYTES = 624 * 4 + 4 + 8, STATE_BYTES_NORMAL = STATE_BYTES + 1 + 8;
     function genGetState(g) {
-        const s = needGen(g), out = alloc("uint8", 624 * 4 + 4 + 8), v = new DataView(out.data.buffer);
+        const s = needGen(g), out = alloc("uint8", STATE_BYTES_NORMAL), v = new DataView(out.data.buffer);
         for (let i = 0; i < 624; i++) v.setUint32(i * 4, s.mt[i], true);
         v.setUint32(624 * 4, s.i, true);
         v.setBigUint64(624 * 4 + 4, BigInt.asUintN(64, g.seed), true);
+        if (s.nd !== null && s.nd !== undefined) { v.setUint8(STATE_BYTES, 1); v.setFloat64(STATE_BYTES + 1, s.nd, true); }
         return out;
     }
     function genSetState(g, st) {
         needGen(g); needS(st);
-        if (st.data.length !== 624 * 4 + 4 + 8) fail(E.RuntimeError, "Expected a generator state of " + (624 * 4 + 4 + 8) + " bytes, got " + st.data.length);
-        const bytes = Uint8Array.from(st.data), v = new DataView(bytes.buffer), mtState = { mt: new Uint32Array(624), i: 0 };
+        const len = st.data.length;
+        if (len !== STATE_BYTES && len !== STATE_BYTES_NORMAL) fail(E.RuntimeError, "Expected a generator state of " + STATE_BYTES_NORMAL + " bytes, got " + len);
+        const bytes = Uint8Array.from(st.data), v = new DataView(bytes.buffer), mtState = { mt: new Uint32Array(624), i: 0, nd: null };
         for (let i = 0; i < 624; i++) mtState.mt[i] = v.getUint32(i * 4, true);
         mtState.i = v.getUint32(624 * 4, true);
         if (mtState.i > 624) fail(E.RuntimeError, "invalid generator state");
+        if (len === STATE_BYTES_NORMAL) {
+            const flag = v.getUint8(STATE_BYTES);
+            if (flag > 1) fail(E.RuntimeError, "invalid generator state");
+            if (flag === 1) mtState.nd = v.getFloat64(STATE_BYTES + 1, true);
+        }
         g.state = mtState; g.seed = v.getBigUint64(624 * 4 + 4, true);
         return null;
     }
@@ -2061,14 +2076,159 @@
         for (let i = 0; i < n; i++) O[i] = nextDouble(s);
         return out;
     }
-    function randn(g, n, dtype) {
-        // Box-Muller on doubles; pairs, as torch's normal_ (scalar path).
+    // PyTorch's CPU normal_ (aten/src/ATen/native/cpu/DistributionTemplates.h,
+    // normal_kernel), mean and std included:
+    // - fewer than 16 elements: at::normal_distribution<double> per
+    //   element, a Box-Muller pair from two 53-bit uniforms whose second
+    //   value the generator keeps for the next draw (`nd`), then
+    //   value * std + mean in double;
+    // - 16 or more: normal_fill, which first fills the tensor with uniforms
+    //   of its own dtype (24 bits for float32, 53 for float64, 11 and 8 for
+    //   float16 and bfloat16), turns each block of 16 into normals in that
+    //   dtype's arithmetic (u1 = 1 - x[j], u2 = x[j + 8]) and, when the size
+    //   is no multiple of 16, draws the last 16 again and redoes them.
+    // The block arithmetic rounds where PyTorch's scalar_t would; its
+    // log/cos/sin are this engine's, so a value can differ from a given
+    // PyTorch build's vectorised ones in the last bit or two (the scalar
+    // path agrees exactly).
+    function normalDouble(s) {
+        const c = s.nd;
+        if (c !== null && c !== undefined) { s.nd = null; return c; }
+        const u1 = nextDouble(s), u2 = nextDouble(s);
+        const r = Math.sqrt(-2 * Math.log1p(-u2)), theta = 2 * Math.PI * u1;
+        s.nd = r * Math.sin(theta);
+        return r * Math.cos(theta);
+    }
+    // How a value is stored in the dtype (`rs`, scalar_t) and how an
+    // arithmetic result in it is rounded (`ro`): float16/bfloat16 compute in
+    // float32 and round to the format on assignment.
+    function storeRound(dtype) {
+        return dtype === "float32" ? Math.fround : dtype === "float16" ? (x) => f16(Math.fround(x)) : dtype === "bfloat16" ? (x) => bf16(Math.fround(x)) : (x) => x;
+    }
+    function normalBlock(D, b, rs, ro, mean, std) {
+        for (let j = 0; j < 8; j++) {
+            const u1 = rs(1 - D[b + j]), u2 = D[b + j + 8];
+            const radius = rs(ro(Math.sqrt(ro(-2 * ro(Math.log(u1))))));
+            const theta = rs(2 * Math.PI * u2);
+            D[b + j] = rs(ro(ro(ro(radius * ro(Math.cos(theta))) * std) + mean));
+            D[b + j + 8] = rs(ro(ro(ro(radius * ro(Math.sin(theta))) * std) + mean));
+        }
+    }
+    // A float32 normal_ of 16 or more elements is PyTorch's normal_fill_AVX2
+    // (aten/src/ATen/native/cpu/DistributionKernels.cpp), which x86-64 builds
+    // run: 2*pi rounded to float32, log and sincos by the Cephes polynomials
+    // of avx_mathfun.h, every operation in float32 (Math.fround after each),
+    // and value * std + mean as one fused multiply-add. Its results agree
+    // with PyTorch 2.11's bit for bit (checked on 5360 draws); a build
+    // without AVX2 (or not on x86-64) uses the plain float loop instead.
+    const fr = Math.fround;
+    const AVX = {
+        SQRTHF: fr(0.707106781186547524), MIN_NORM: fr(1.17549435e-38),
+        P: [7.0376836292E-2, -1.1514610310E-1, 1.1676998740E-1, -1.2420140846E-1, 1.4249322787E-1, -1.6668057665E-1, 2.0000714765E-1, -2.4999993993E-1, 3.3333331174E-1].map(fr),
+        Q1: fr(-2.12194440e-4), Q2: fr(0.693359375),
+        DP1: fr(-0.78515625), DP2: fr(-2.4187564849853515625e-4), DP3: fr(-3.77489497744594108e-8),
+        S0: fr(-1.9515295891E-4), S1: fr(8.3321608736E-3), S2: fr(-1.6666654611E-1),
+        C0: fr(2.443315711809948E-005), C1: fr(-1.388731625493765E-003), C2: fr(4.166664568298827E-002),
+        FOPI: fr(1.27323954473516), TWO_PI: fr(2 * Math.PI),
+    };
+    // log256_ps for one positive float32 lane.
+    function avxLog(x) {
+        if (x < AVX.MIN_NORM) x = AVX.MIN_NORM;
+        BF_F[0] = x;
+        const u = BF_U[0];
+        let e = (u >>> 23) - 0x7f;
+        BF_U[0] = (u & 0x807fffff) | 0x3f000000;
+        let v = BF_F[0];
+        e = fr(e + 1);
+        const below = v < AVX.SQRTHF, tmp = below ? v : 0;
+        v = fr(v - 1);
+        e = fr(e - (below ? 1 : 0));
+        v = fr(v + tmp);
+        const z = fr(v * v), P = AVX.P;
+        let y = P[0];
+        for (let k = 1; k < 9; k++) { y = fr(y * v); y = fr(y + P[k]); }
+        y = fr(y * v);
+        y = fr(y * z);
+        y = fr(y + fr(e * AVX.Q1));
+        y = fr(y - fr(z * 0.5));
+        v = fr(v + y);
+        return fr(v + fr(e * AVX.Q2));
+    }
+    // sincos256_ps for one float32 lane: [sin, cos].
+    const SINCOS = [0, 0];
+    function avxSincos(x) {
+        let negSin = x < 0;
+        x = Math.abs(x);
+        let j = Math.trunc(fr(x * AVX.FOPI)) | 0;
+        j = (j + 1) & ~1;
+        const y = j, swapSin = (j & 4) !== 0, firstPoly = (j & 2) === 0;
+        x = fr(x + fr(y * AVX.DP1));
+        x = fr(x + fr(y * AVX.DP2));
+        x = fr(x + fr(y * AVX.DP3));
+        const negCos = (~(j - 2) & 4) !== 0;
+        negSin = negSin !== swapSin;
+        const z = fr(x * x);
+        let yc = fr(AVX.C0 * z);
+        yc = fr(yc + AVX.C1); yc = fr(yc * z); yc = fr(yc + AVX.C2); yc = fr(yc * z); yc = fr(yc * z);
+        yc = fr(yc - fr(z * 0.5));
+        yc = fr(yc + 1);
+        let ys = fr(AVX.S0 * z);
+        ys = fr(ys + AVX.S1); ys = fr(ys * z); ys = fr(ys + AVX.S2); ys = fr(ys * z); ys = fr(ys * x);
+        ys = fr(ys + x);
+        const sin2 = firstPoly ? ys : 0, sin1 = firstPoly ? 0 : yc;
+        const s = fr(sin1 + sin2), c = fr(fr(yc - sin1) + fr(ys - sin2));
+        SINCOS[0] = negSin ? -s : s;
+        SINCOS[1] = negCos ? -c : c;
+        return SINCOS;
+    }
+    // fround(a * b + c) rounded once (the fused multiply-add), for float32
+    // a, b, c: the product is exact in a double, and the sum's rounding
+    // error decides an exact half-way case.
+    function fmaF(a, b, c) {
+        const p = a * b, t = p + c, r = fr(t), d = t - r;
+        if (d === 0) return r;
+        const other = r + 2 * d;
+        if (fr(other) !== other) return r;
+        const bb = t - p, e = (p - (t - bb)) + (c - bb);
+        return e === 0 || (e > 0) !== (d > 0) ? r : other;
+    }
+    function avxBlock(D, b, mean, std) {
+        for (let j = 0; j < 8; j++) {
+            const u1 = fr(1 - D[b + j]), u2 = D[b + j + 8];
+            const radius = fr(Math.sqrt(fr(-2 * avxLog(u1))));
+            const sc = avxSincos(fr(AVX.TWO_PI * u2));
+            const n1 = fr(radius * sc[1]), n2 = fr(radius * sc[0]);
+            D[b + j] = fmaF(n1, std, mean);
+            D[b + j + 8] = fmaF(n2, std, mean);
+        }
+    }
+    function randn(g, n, dtype, mean, std) {
         const s = needGen(g), out = work(dtype, n), O = out.data;
-        for (let i = 0; i < n; i += 2) {
-            const u1 = 1 - nextDouble(s), u2 = nextDouble(s);
-            const r = Math.sqrt(-2 * Math.log(u1)), t = 2 * Math.PI * u2;
-            O[i] = r * Math.cos(t);
-            if (i + 1 < n) O[i + 1] = r * Math.sin(t);
+        if (n < 16) {
+            for (let i = 0; i < n; i++) O[i] = normalDouble(s) * std + mean;
+        } else if (dtype === "float32") {
+            const D = new Float64Array(n), mn = fr(mean), sd = fr(std);
+            for (let i = 0; i < n; i++) D[i] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
+            for (let b = 0; b + 16 <= n; b += 16) avxBlock(D, b, mn, sd);
+            if (n % 16 !== 0) {
+                const b = n - 16;
+                for (let k = 0; k < 16; k++) D[b + k] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
+                avxBlock(D, b, mn, sd);
+            }
+            for (let i = 0; i < n; i++) O[i] = D[i];
+        } else {
+            const rs = storeRound(dtype), ro = dtype === "float64" ? (x) => x : Math.fround, D = dtype === "float64" ? O : new Float64Array(n);
+            const bits = dtype === "float16" ? 0x7ff : dtype === "bfloat16" ? 0xff : 0xffffff, scale = dtype === "float16" ? 0.00048828125 : dtype === "bfloat16" ? 0.00390625 : 5.9604644775390625e-8;
+            const uniform = dtype === "float64" ? () => nextDouble(s) : () => (next32(s) & bits) * scale;
+            const mn = rs(mean), sd = rs(std);
+            for (let i = 0; i < n; i++) D[i] = uniform();
+            for (let b = 0; b + 16 <= n; b += 16) normalBlock(D, b, rs, ro, mn, sd);
+            if (n % 16 !== 0) {
+                const b = n - 16;
+                for (let k = 0; k < 16; k++) D[b + k] = uniform();
+                normalBlock(D, b, rs, ro, mn, sd);
+            }
+            if (D !== O) for (let i = 0; i < n; i++) O[i] = D[i];
         }
         { if (HALF[out.dtype] === 1) finish(out); return out; }
     }
@@ -3309,7 +3469,8 @@
         fn("gen_initial_seed", 1, (a) => a[0].seed);
         fn("rand", 3, (a) => rand(a[0], num(a[1]), a[2] === undefined ? "float32" : rt.needStr(a[2])), 2);
         fn("rand_double", 2, (a) => randDouble(a[0], num(a[1])));
-        fn("randn", 3, (a) => randn(a[0], num(a[1]), rt.needStr(a[2])));
+        // randn(gen, n, dtype, mean=0, std=1)
+        fn("randn", 5, (a) => randn(a[0], num(a[1]), rt.needStr(a[2]), a[3] === undefined ? 0 : num(a[3]), a[4] === undefined ? 1 : num(a[4])), 3);
         fn("randint", 4, (a) => randint(a[0], num(a[1]), num(a[2]), num(a[3])));
         fn("multinomial", 5, (a) => multinomial(a[0], needS(a[1]), shapeOf(a[2]), num(a[3]), rt.truth(a[4])));
         fn("randperm", 2, (a) => randperm(a[0], num(a[1])));
