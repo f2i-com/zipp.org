@@ -236,9 +236,25 @@ pub(crate) fn emit_py_step(
     labels: &PyLabels,
     refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
 ) {
+    emit_py_step_with(ops, crate::vm::Vm::jit_py_op as usize, func_id, ip, None, labels, refetch);
+}
+
+/// [`emit_py_step`] through `helper`, which answers as `Vm::jit_py_op`
+/// does; `arg4`, when given, is its fourth argument (in `r9`).
+fn emit_py_step_with(
+    ops: &mut dynasmrt::x64::Assembler,
+    helper: usize,
+    func_id: u32,
+    ip: usize,
+    arg4: Option<u64>,
+    labels: &PyLabels,
+    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+) {
     let packed = ((func_id as u64) << 32) | ip as u64;
-    let helper = crate::vm::Vm::jit_py_op as usize;
     let cont = ops.new_dynamic_label();
+    if let Some(a) = arg4 {
+        dynasm!(ops ; mov r9, QWORD a as i64);
+    }
     dynasm!(ops
         ; mov rcx, rdi
         ; mov rdx, rbx
@@ -928,6 +944,13 @@ pub(crate) fn emit_py_op(
         Instr::PyGenNext { dst, next, this, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_gen_next as usize;
             emit_py_value_call(ops, h, [V::Reg(next), V::Reg(this), V::Imm(ip as u64), V::None], dst, labels, refetch);
+        }
+        // A call: through `Vm::jit_py_call` with the operands packed, which
+        // calls a str method's native where it is and hands any other
+        // callee to `Vm::jit_py_op`; the same outcomes as the step's.
+        Instr::PyCall { dst, f, arg_base, argc, .. } if !crate::vm::prof_py::on() => {
+            let regs = f as u64 | (arg_base as u64) << 16 | (argc as u64) << 32 | (dst as u64) << 48;
+            emit_py_step_with(ops, crate::vm::Vm::jit_py_call as usize, func_id, ip, Some(regs), labels, refetch);
         }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
         // when the body's plan has the site; the ordinary step otherwise.

@@ -111,6 +111,62 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `PyCall` from compiled code: `jit_py_op(vm, regs, packed)` for the
+    /// instruction at `packed = (func_id << 32) | ip`, whose operands come
+    /// packed in `ops` (`f | arg_base << 16 | argc << 32 | dst << 48`), with
+    /// the same answers. A site whose cache entry holds the runtime's
+    /// `__zipp_py_strm` native (a str method, `hash`, `heapq`, `bisect`,
+    /// `math.sqrt`: [`Vm::py_strm_hit`]) calls it here, as the step's arm
+    /// for it does, without the instruction found and decoded again, the
+    /// step's match and the callee's kind found by elimination; any other
+    /// call is `jit_py_op`'s. Bounded and exempted as `jit_py_op` bounds a
+    /// `PyCall` (the native's fallback `j<n>` is guest code), a GC safe
+    /// point as it is, and a raise leaves the frame's ip at the instruction
+    /// as the step does.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_call(vm: *mut core::ffi::c_void, regs: *const u64, packed: u64, ops: u64) -> u64 {
+        use crate::codegen::{PY_BAIL, PY_NEXT, PY_THREW};
+        if vm.is_null() {
+            return PY_BAIL;
+        }
+        let v = unsafe { &mut *(vm as *mut Vm) };
+        let (f, arg_base, argc, dst) = (ops as u16, (ops >> 16) as u16, (ops >> 32) as u16, (ops >> 48) as u16);
+        let start = v.regs.as_ptr() as usize;
+        let addr = regs as usize;
+        if addr >= start && (addr - start) % 8 == 0 {
+            let base = (addr - start) / 8;
+            let len = v.regs.len();
+            if base + (f.max(dst) as usize) < len && base + arg_base as usize + argc as usize <= len {
+                v.maybe_gc();
+                let ip = packed as u32 as usize;
+                let fv = v.get(base, f);
+                let e = v.py_ic((packed >> 32) as u32, ip);
+                if let Some(at) = v.py_strm_hit(&e, fv) {
+                    if v.jit_call_depth >= JIT_REGION_CALL_MAX {
+                        v.osr_deopt_exempt = true;
+                        return PY_BAIL;
+                    }
+                    v.jit_call_depth += 1;
+                    let r = v.with_argv(base, arg_base, argc, |vm, argv| vm.py_str_method_at(fv, argv, at));
+                    v.jit_call_depth -= 1;
+                    return match r {
+                        Ok(x) => {
+                            v.set(base, dst, x);
+                            PY_NEXT
+                        }
+                        Err(t) => {
+                            v.py_step_failed(ip);
+                            v.osr_deopt_exempt = true;
+                            v.jit_thrown_to_sentinel(t);
+                            PY_THREW
+                        }
+                    };
+                }
+            }
+        }
+        Self::jit_py_op(vm, regs, packed)
+    }
+
     /// Before a loop of `func_id` compiles: hand the JIT the function's
     /// `PyCall` sites whose cache entries name a native callee
     /// (`Vm::py_call_site_native`), for the call-bound gate
