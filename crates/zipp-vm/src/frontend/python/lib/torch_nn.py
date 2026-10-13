@@ -272,10 +272,11 @@ class Module:
             raise TypeError("%s.__init__() takes 1 positional argument but %d were given" % (type(self).__name__, len(args) + 1) if args else "%s.__init__() got an unexpected keyword argument '%s'" % (type(self).__name__, next(iter(kwargs))))
         d = self.__dict__
         d["training"] = True
-        d["_parameters"] = OrderedDict()
-        d["_buffers"] = OrderedDict()
+        # Plain dicts, as PyTorch keeps them (its hooks stay OrderedDicts).
+        d["_parameters"] = {}
+        d["_buffers"] = {}
         d["_non_persistent_buffers_set"] = set()
-        d["_modules"] = OrderedDict()
+        d["_modules"] = {}
         d["_forward_hooks"] = OrderedDict()
         d["_forward_hooks_with_kwargs"] = OrderedDict()
         d["_forward_pre_hooks"] = OrderedDict()
@@ -334,18 +335,27 @@ class Module:
                     object.__setattr__(self, name, value)
 
     def __getattr__(self, name):
-        d = self.__dict__
-        if "_parameters" in d:
-            p = d["_parameters"]
-            if name in p:
+        # The registries are read as attributes (reading `self.__dict__`
+        # costs more than the rest); one Module.__init__ never ran for has
+        # none, and asking for it lands here again, answered at once.
+        if name != "_parameters" and name != "_buffers" and name != "_modules":
+            try:
+                p = self._parameters
+            except AttributeError:
+                p = None
+            if p is not None and name in p:
                 return p[name]
-        if "_buffers" in d:
-            b = d["_buffers"]
-            if name in b:
+            try:
+                b = self._buffers
+            except AttributeError:
+                b = None
+            if b is not None and name in b:
                 return b[name]
-        if "_modules" in d:
-            m = d["_modules"]
-            if name in m:
+            try:
+                m = self._modules
+            except AttributeError:
+                m = None
+            if m is not None and name in m:
                 return m[name]
         raise AttributeError("'%s' object has no attribute '%s'" % (type(self).__name__, name))
 
@@ -461,8 +471,19 @@ class Module:
         raise NotImplementedError("Module [%s] is missing the required \"forward\" function" % type(self).__name__)
 
     def __call__(self, *args, **kwargs):
-        d = self.__dict__
-        if not (d.get("_forward_hooks") or d.get("_forward_pre_hooks") or d.get("_backward_hooks") or d.get("_backward_pre_hooks")):
+        # Whether the module has hooks: one kernel call answers for the four
+        # hook dicts (an OrderedDict's truth costs several microseconds
+        # here), None when one is missing or not a dict.
+        try:
+            quiet = torch._k._dicts_empty(self._forward_hooks, self._forward_pre_hooks, self._backward_hooks, self._backward_pre_hooks)
+        except AttributeError:
+            quiet = None
+        if quiet is None:
+            d = self.__dict__
+            quiet = not (d.get("_forward_hooks") or d.get("_forward_pre_hooks") or d.get("_backward_hooks") or d.get("_backward_pre_hooks"))
+        if quiet:
+            if len(kwargs) == 0 and len(args) == 1:
+                return self.forward(args[0])
             return self.forward(*args, **kwargs)
         return self._call_with_hooks(args, kwargs)
 
@@ -924,7 +945,7 @@ class Sequential(Module):
                 delattr(self, key)
         else:
             delattr(self, list(self._modules.keys())[_index(idx, len(self._modules))])
-        self._modules = OrderedDict((str(i), m) for i, m in enumerate(self._modules.values()))
+        self._modules = dict((str(i), m) for i, m in enumerate(self._modules.values()))
 
     def __len__(self):
         return len(self._modules)
@@ -1016,7 +1037,7 @@ class ModuleList(Module):
                 delattr(self, str(k))
         else:
             delattr(self, self._abs(idx))
-        self._modules = OrderedDict((str(i), m) for i, m in enumerate(self._modules.values()))
+        self._modules = dict((str(i), m) for i, m in enumerate(self._modules.values()))
 
     def __len__(self):
         return len(self._modules)

@@ -800,13 +800,19 @@ def _needs_grad(*tensors):
 def _unbroadcast(grad, shape):
     """Sum `grad` down to `shape` (the reverse of broadcasting)."""
     gshape = grad.shape
-    if gshape is shape or _shape_eq(gshape, shape) or _tuple(gshape) == _tuple(shape):
+    if gshape is shape or _shape_eq(gshape, shape):
         return grad
-    extra = len(grad.shape) - len(shape)
-    dims = _list(_range(extra))
-    for i, d in enumerate(shape):
-        if d == 1 and grad.shape[extra + i] != 1:
-            dims.append(extra + i)
+    # The leading dims and the dims `shape` broadcast from 1, worked out in
+    # one kernel call for two shapes of ints (None for anything else).
+    dims = _k._unbroadcast_dims(gshape, shape)
+    if dims is None:
+        if _tuple(gshape) == _tuple(shape):
+            return grad
+        extra = len(grad.shape) - len(shape)
+        dims = _list(_range(extra))
+        for i, d in enumerate(shape):
+            if d == 1 and grad.shape[extra + i] != 1:
+                dims.append(extra + i)
     if dims:
         grad = grad.sum(dims, keepdim=True)
     return grad.reshape(shape)
@@ -2727,6 +2733,11 @@ def _as_tensor(v, like=None, dtype=None):
 
 
 def _shape_args(shape):
+    # A tuple of plain ints, or one such tuple, list or Size, in one kernel
+    # call; anything else below.
+    out = _k._shape_args(shape)
+    if out is not None:
+        return out
     if len(shape) == 1:
         s0 = shape[0]
         if type(s0) is not _int and isinstance(s0, (_list, _tuple, Size)):
@@ -2740,7 +2751,7 @@ def _shape_args(shape):
 
 
 # Tensors the kernels return are built without the class call: with
-# `Tensor.__init__` as defined here, `_new3(storage, shape, dt)` is exactly
+# `Tensor.__init__` as defined here, `Tensor(storage, shape, dt)` is exactly
 # `Tensor(storage, shape, dt)` for a Size `shape` (a kernel result's; any
 # other shape takes the class call).
 # A replaced `__init__` (a wrapper installed on the class) is still called.
@@ -3248,7 +3259,7 @@ def _binary_nograd(op, a, b):
             if not dt._inexact:
                 dt = _default_dtype if cb is _float else (int64 if dt is _bool_dtype else dt)
             storage, shape = _k.binary_scalar(op, a._s, a.shape, b, dt.name, dt.name, False)
-            return _new3(storage, shape, _DTYPES[_k.dtype(storage)])
+            return Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
     if a.__class__ is _SparseTensor or b.__class__ is _SparseTensor:
         return _sp._binary(op, a, b)
     try:
@@ -3257,7 +3268,7 @@ def _binary_nograd(op, a, b):
     except RuntimeError as e:
         _lazy_reraise(e, op, a, b)
     storage, shape = _k.binary(op, ta._s, ta.shape, tb._s, tb.shape, None if dt is None else dt.name)
-    return _new3(storage, shape, _DTYPES[_k.dtype(storage)])
+    return Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
 
 
 def _unary_nograd(op, a, p1=None, p2=None):
@@ -3298,7 +3309,7 @@ def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=Fals
         if not (_grad_enabled and a.requires_grad):
             # Nothing records: the kernel takes the number itself.
             storage, shape = _k.binary_scalar(op, a._s, a.shape, b, sdt.name, dt.name, False)
-            return _new3(storage, shape, dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)])
+            return Tensor(storage, shape, dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)])
         ta, tb = a, _scalar_operand(b, sdt)
     elif cb is Tensor and (ca is _float or ca is _int) and not _graph_recording:
         dt = b.dtype
@@ -3309,7 +3320,7 @@ def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=Fals
             dt = want
         if not (_grad_enabled and b.requires_grad):
             storage, shape = _k.binary_scalar(op, b._s, b.shape, a, sdt.name, dt.name, True)
-            return _new3(storage, shape, dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)])
+            return Tensor(storage, shape, dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)])
         ta, tb = _scalar_operand(a, sdt), b
     else:
         if ca is _SparseTensor or cb is _SparseTensor:
@@ -3330,7 +3341,7 @@ def _binary(op, a, b, name, backward, saves=("xy", "xy"), want=None, opmath=Fals
     else:
         storage, shape = _k.binary(op, ta._s, ta.shape, tb._s, tb.shape, dt.name)
         rdt = dt if dt.is_floating_point else _DTYPES[_k.dtype(storage)]
-    out = _new3(storage, shape, rdt)
+    out = Tensor(storage, shape, rdt)
     ra = ta.requires_grad
     rb = tb.requires_grad
     if _grad_enabled and (ra or rb):
@@ -3641,7 +3652,8 @@ def _scalar_operand(v, dt):
 
 # The unary kernels whose result is not the (floating) input's dtype
 # (tensor.js's BOOL_UNARY).
-_BOOL_UNARY = frozenset(["isfinite", "isnan", "not", "isinf", "isposinf", "isneginf", "signbit"])
+# (a set: membership in a frozenset takes a slow path on this runtime)
+_BOOL_UNARY = set(["isfinite", "isnan", "not", "isinf", "isposinf", "isneginf", "signbit"])
 
 
 def _unary(op, a, name, backward, p1=None, p2=None, saves="x"):
@@ -3655,12 +3667,12 @@ def _unary(op, a, name, backward, p1=None, p2=None, saves="x"):
             shape = a.shape
         except RuntimeError as e:
             _lazy_reraise(e, name.lower(), a)
-        out = _new3(storage, shape, dt if op not in _BOOL_UNARY else _DTYPES[_k.dtype(storage)])
+        out = Tensor(storage, shape, dt if op not in _BOOL_UNARY else _DTYPES[_k.dtype(storage)])
     elif dt.is_complex:
         return _cx_unary(op, a, name)
     else:
         storage = _k.unary(op, a._s, p1, p2)
-        out = _new3(storage, a.shape, _DTYPES[_k.dtype(storage)])
+        out = Tensor(storage, a.shape, _DTYPES[_k.dtype(storage)])
     if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         saved = None if not saves else ([a] if saves == "x" else [out])
@@ -4399,7 +4411,7 @@ def where(condition, input=None, other=None):
         condition = condition.to(_bool_dtype)
     ta, tb, dt = _operands(input, other)
     storage, shape = _k.where(condition._s, condition.shape, ta._s, ta.shape, tb._s, tb.shape, None if dt is None else dt.name)
-    out = _new3(storage, shape, _DTYPES[_k.dtype(storage)])
+    out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
     if _needs_grad(ta, tb):
         out.requires_grad = True
         out._node = _Node(_where_bw, (ta, tb), "Where", None, (condition, ta, tb))
@@ -4520,7 +4532,7 @@ def _all_if_empty(dim):
 def _reduce_nograd(op, a, dim, keepdim):
     dims = _dims_arg(dim, len(a.shape))
     storage, shape = _k.reduce(op, a._s, a.shape, dims, keepdim, True)
-    return _new3(storage, shape, _DTYPES[_k.dtype(storage)])
+    return Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
 
 
 def _expand_back(g, a_shape, dims, keepdim):
@@ -4564,7 +4576,7 @@ def sum(input, dim=None, keepdim=False, dtype=None):
         storage, shape = _k.reduce("sum", a._s, a.shape, dims, keepdim, True)
     except RuntimeError as e:
         _lazy_reraise(e, "sum", a)
-    out = _new3(storage, shape, a.dtype)
+    out = Tensor(storage, shape, a.dtype)
     if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(_sum_bw, (a,), "Sum", None, (a, dims, keepdim))
@@ -4596,7 +4608,7 @@ def mean(input, dim=None, keepdim=False, dtype=None):
         storage, shape = _k.reduce("mean", a._s, a.shape, dims, keepdim, True)
     except RuntimeError as e:
         _lazy_reraise(e, "mean", a)
-    out = _new3(storage, shape, a.dtype)
+    out = Tensor(storage, shape, a.dtype)
     if _grad_enabled and a.requires_grad:
         count = _numel(a.shape) / _b.max(1, _numel(shape))
         out.requires_grad = True
@@ -5408,7 +5420,7 @@ def _permute(a, dims, rank):
     """`permute(a, *dims)` for `dims`, a list, already a permutation of
     range(rank)."""
     storage, shape = _k.permute(a._s, a.shape, dims)
-    out = _new3(storage, shape, a.dtype)
+    out = Tensor(storage, shape, a.dtype)
     if _grad_enabled and a.requires_grad:
         inverse = [0] * rank
         i = 0
@@ -5594,7 +5606,7 @@ def cat(tensors, dim=0):
         raise RuntimeError("zero-dimensional tensor (at position 0) cannot be concatenated")
     d = _norm_dim(dim, rank)
     storage, shape = _k.cat([(t._s, t.shape) for t in tensors], d)
-    out = _new3(storage, shape, _DTYPES[_k.dtype(storage)])
+    out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
     if _needs_grad(*tensors):
         sizes = [t.shape[d] for t in tensors]
 
@@ -5690,18 +5702,32 @@ def split(tensor, split_size_or_sections, dim=0):
     if isinstance(size, _int):
         if size <= 0 and n:
             raise RuntimeError("split_size can only be 0 if dimension size is 0, but got dimension size of %d" % n)
-        sizes = [size] * (n // size) + ([n % size] if n % size else []) if size else [0]
+        if size:
+            sizes = []
+            k = n // size
+            while k:
+                sizes.append(size)
+                k -= 1
+            if n % size:
+                sizes.append(n % size)
+        else:
+            sizes = [0]
     else:
         sizes = _list(size)
         if _b.sum(sizes) != n:
             raise RuntimeError("split_with_sizes expects split_sizes to sum exactly to %d (input tensor's size at dimension %d), but got split_sizes=%s" % (n, d, sizes))
     out, start = [], 0
-    if isinstance(size, _int) and type(a).__getitem__ is _tensor_getitem:
+    if isinstance(size, _int) and (a.__class__ is Tensor or type(a).__getitem__ is _tensor_getitem):
         # `narrow(a, d, start, s)` for pieces that are in range by
         # construction: the slice spec it builds, every other dim whole.
         rank = len(a.shape)
+        whole = (None, None, None)
         for s in sizes:
-            spec = [(None, None, None)] * rank
+            spec = []
+            i = 0
+            while i < rank:
+                spec.append(whole)
+                i += 1
             spec[d] = (start, start + s, None)
             out.append(_slice(a, spec))
             start += s
@@ -6078,7 +6104,7 @@ def _getitem(a, key):
 
 def _slice(a, spec):
     storage, shape = _k.slice(a._s, a.shape, spec)
-    out = _new3(storage, shape, a.dtype)
+    out = Tensor(storage, shape, a.dtype)
     if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(_slice_bw, (a,), "Slice", None, (a, spec))
@@ -6093,7 +6119,7 @@ def _slice_bw(g, args):
 def _slice_scatter(g, shape, spec):
     """Zeros of `shape` with `g` at the sliced positions: the slice's
     gradient, itself differentiable (for create_graph)."""
-    base = _new3(_k.zeros(g.dtype.name, _numel(shape)), shape, g.dtype) if shape.__class__ is Size else Tensor(_k.zeros(g.dtype.name, _numel(shape)), _shape_args(shape), g.dtype)
+    base = Tensor(_k.zeros(g.dtype.name, _numel(shape)), shape, g.dtype) if shape.__class__ is Size else Tensor(_k.zeros(g.dtype.name, _numel(shape)), _shape_args(shape), g.dtype)
     _k.setslice(base._s, base.shape, spec, g._s, g.shape)
     if _grad_enabled and g.requires_grad:
         base.requires_grad = True
@@ -6104,6 +6130,28 @@ def _slice_scatter(g, shape, spec):
 def _slice_scatter_bw(gg, args):
     spec, = args
     return (_slice(gg, spec),)
+
+
+def _nll_rows(lp, target, ignore_index):
+    """-lp[i, target[i]] for the rows of a 2-d floating `lp` and an int64
+    target: cross_entropy's pick (`-lp[arange(n), target]`) in one kernel,
+    with the same values and gradient; None when a target is ignore_index
+    or out of range (the general path masks or raises)."""
+    storage = _k.nll_pick(lp._s, lp.shape, target._s, ignore_index)
+    if storage is None:
+        return None
+    out = Tensor(storage, target.shape, lp.dtype)
+    if _grad_enabled and lp.requires_grad:
+        out.requires_grad = True
+        out._node = _Node(_nll_rows_bw, (lp,), "Neg", None, (lp, target))
+    return out
+
+
+def _nll_rows_bw(g, args):
+    # What the advanced index's and the negation's backwards give.
+    lp, target = args
+    indices, ishape = _broadcast_indices([arange(lp.shape[0]), target])
+    return (_index_put_add(lp.shape, indices, ishape, neg(g)),)
 
 
 def _broadcast_indices(indices):
@@ -6143,7 +6191,7 @@ def _advanced_get(a, dims, indices):
     order = dims + [i for i in _range(rank) if i not in dims]
     x = permute(a, *order) if order != _list(_range(rank)) else a
     storage, shape = _k.gather(x._s, x.shape, [t_._s for t_ in indices], ishape)
-    out = _new3(storage, shape, a.dtype)
+    out = Tensor(storage, shape, a.dtype)
     if _grad_enabled and x.requires_grad:
         out.requires_grad = True
         out._node = _Node(_advanced_get_bw, (x,), "Index", None, (indices, ishape, x))
@@ -6281,7 +6329,7 @@ def index_select(input, dim, index):
         return a.clone()
     index = index.reshape(-1) if index.shape != (index.numel(),) else index
     storage, shape = _k.index_select(a._s, a.shape, d, index._s)
-    out = _new3(storage, shape, a.dtype)
+    out = Tensor(storage, shape, a.dtype)
     if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(_index_select_bw, (a,), "IndexSelect", None, (a, d, index))
@@ -6559,7 +6607,7 @@ def matmul(input, other):
         storage, shape = _k.matmul(ta._s, ta.shape, tb._s, tb.shape)
     except RuntimeError as e:
         _lazy_reraise(e, "matmul", ta, tb)
-    out = _new3(storage, shape, _DTYPES[_k.dtype(storage)])
+    out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
     ra = ta.requires_grad
     rb = tb.requires_grad
     if _grad_enabled and (ra or rb):
@@ -6657,7 +6705,7 @@ def _linear(x, weight, bias=None):
 
 def _linear_mm(x, w):
     storage, shape = _k.matmul(x._s, x.shape, w._s, w.shape, True)
-    out = _new3(storage, shape, _DTYPES[_k.dtype(storage)])
+    out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
     rx = x.requires_grad
     rw = w.requires_grad
     if _grad_enabled and (rx or rw):
@@ -7269,7 +7317,10 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
                 if create_graph and not (node.diff or node.name in _DIFFERENTIABLE):
                     raise NotImplementedError("backward with create_graph=True through %s is not supported on Zipp" % _grad_fn_name(node.name))
                 bargs = node.args
-                parent_grads = node.backward(g) if bargs is None else node.backward(g, bargs)
+                # (read, then called: a method call on an instance
+                # attribute takes the slow method path)
+                bw = node.backward
+                parent_grads = bw(g) if bargs is None else bw(g, bargs)
                 tp = parent_grads.__class__
                 if tp is not _tuple and tp is not _list:
                     parent_grads = _tuple(parent_grads)
@@ -7291,7 +7342,7 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
                         continue
                     pshape = p.shape
                     gshape = pg.shape
-                    if gshape is not pshape and not _shape_eq(gshape, pshape) and _tuple(gshape) != _tuple(pshape):
+                    if gshape is not pshape and not _shape_eq(gshape, pshape) and ((gshape.__class__ is Size and pshape.__class__ is Size) or _tuple(gshape) != _tuple(pshape)):
                         pg = _unbroadcast(pg, pshape) if _numel(gshape) >= _numel(pshape) else expand(pg, *pshape)
                     pdt = p.dtype
                     if pg.dtype is not pdt and pg.dtype != pdt and pdt._inexact:

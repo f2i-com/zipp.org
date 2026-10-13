@@ -357,6 +357,99 @@
         }
         return false;
     }
+    // The small float32/float64 add/sub/mul/div that most eager ops are,
+    // without the generic path's helper calls (each an interpreted frame):
+    // operands of one dtype (`want` null or that dtype) with equal shapes,
+    // or one of them a single element of rank no higher than the other's,
+    // and fewer than NATIVE_MIN elements. The loops are binaryTile's and
+    // binaryScalar's, element for element, and the result's shape is the
+    // operand's own shape object, as `binary` hands back. `undefined` when
+    // the case is not one of these (the caller takes `binary`).
+    const FAST_BIN = { add: 1, sub: 2, mul: 3, div: 4 };
+    function smallShape(py) {
+        // The element count of a tuple/Size of ints, or -1.
+        if (py === null || typeof py !== "object" || (py.cls !== SIZE && py.cls !== T.tuple)) return -1;
+        const it = py.items;
+        let n = 1;
+        for (let k = 0; k < it.length; k++) { const d = it[k]; if (typeof d !== "bigint") return -1; n *= Number(d); }
+        return n;
+    }
+    function onesOver(small, big) {
+        // Whether every dim of `small` is 1 and it has no more dims than `big`.
+        const it = small.items;
+        if (it.length > big.items.length) return false;
+        for (let k = 0; k < it.length; k++) if (it[k] !== 1n) return false;
+        return true;
+    }
+    function binaryFast(op, x, xpy, y, ypy, want) {
+        const code = FAST_BIN[op];
+        if (code === undefined || x === null || y === null || typeof x !== "object" || typeof y !== "object" || x.cls !== Storage || y.cls !== Storage) return undefined;
+        const dt = x.dtype;
+        if (y.dtype !== dt || (dt !== "float32" && dt !== "float64") || (want !== null && want !== dt)) return undefined;
+        const na = smallShape(xpy), nb = smallShape(ypy);
+        if (na <= 0 || nb <= 0 || na >= NATIVE_MIN || nb >= NATIVE_MIN) return undefined;
+        const A = x.data, B = y.data;
+        if (A.length !== na || B.length !== nb) return undefined;
+        let mode = -1;
+        if (na === nb) {
+            const p = xpy.items, q = ypy.items;
+            if (p.length === q.length) {
+                mode = 0;
+                for (let k = 0; k < p.length; k++) if (p[k] !== q[k]) { mode = -1; break; }
+            }
+        }
+        if (mode < 0) {
+            if (nb === 1 && onesOver(ypy, xpy)) mode = 1;
+            else if (na === 1 && onesOver(xpy, ypy)) mode = 2;
+            else return undefined;
+        }
+        const n = mode === 2 ? nb : na, O = dt === "float32" ? new Float32Array(n) : new Float64Array(n);
+        if (mode === 0) {
+            switch (code) {
+                case 1: for (let i = 0; i < n; i++) O[i] = A[i] + B[i]; break;
+                case 2: for (let i = 0; i < n; i++) O[i] = A[i] - B[i]; break;
+                case 3: for (let i = 0; i < n; i++) O[i] = A[i] * B[i]; break;
+                default: for (let i = 0; i < n; i++) O[i] = A[i] / B[i];
+            }
+        } else if (mode === 1) {
+            const v = B[0];
+            switch (code) {
+                case 1: for (let i = 0; i < n; i++) O[i] = A[i] + v; break;
+                case 2: for (let i = 0; i < n; i++) O[i] = A[i] - v; break;
+                case 3: for (let i = 0; i < n; i++) O[i] = A[i] * v; break;
+                default: for (let i = 0; i < n; i++) O[i] = A[i] / v;
+            }
+        } else {
+            const v = A[0];
+            switch (code) {
+                case 1: for (let i = 0; i < n; i++) O[i] = B[i] + v; break;
+                case 2: for (let i = 0; i < n; i++) O[i] = v - B[i]; break;
+                case 3: for (let i = 0; i < n; i++) O[i] = B[i] * v; break;
+                default: for (let i = 0; i < n; i++) O[i] = v / B[i];
+            }
+        }
+        return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, mode === 2 ? ypy : xpy] };
+    }
+    // binary_scalar's small case: `t` (a float32/float64 storage of fewer
+    // than NATIVE_MIN elements, the scalar's dtype and `want` its own) op the
+    // number stored as `full` would store it, or that number op `t` (`flip`).
+    function binaryScalarFast(op, t, tpy, v, flip, sd, want) {
+        const code = FAST_BIN[op];
+        if (code === undefined || t === null || typeof t !== "object" || t.cls !== Storage) return undefined;
+        const dt = t.dtype;
+        if (sd !== dt || (dt !== "float32" && dt !== "float64") || (want !== null && want !== dt) || (typeof v !== "number" && typeof v !== "bigint")) return undefined;
+        const n = smallShape(tpy), A = t.data;
+        if (n <= 0 || n >= NATIVE_MIN || A.length !== n) return undefined;
+        // (jsNumber's value of a Python float or int)
+        const v0 = typeof v === "number" ? v : Number(v), y = dt === "float32" ? Math.fround(v0) : v0, O = dt === "float32" ? new Float32Array(n) : new Float64Array(n);
+        switch (code) {
+            case 1: for (let i = 0; i < n; i++) O[i] = flip ? y + A[i] : A[i] + y; break;
+            case 2: if (flip) for (let i = 0; i < n; i++) O[i] = y - A[i]; else for (let i = 0; i < n; i++) O[i] = A[i] - y; break;
+            case 3: for (let i = 0; i < n; i++) O[i] = flip ? y * A[i] : A[i] * y; break;
+            default: if (flip) for (let i = 0; i < n; i++) O[i] = y / A[i]; else for (let i = 0; i < n; i++) O[i] = A[i] / y;
+        }
+        return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, tpy] };
+    }
     // A shape tuple the caller passed in, when the result has exactly that
     // shape: the kernel hands it back instead of building an equal one.
     function tupleShape(v) { return v !== undefined && (v.cls === SIZE || v.cls === T.tuple || rt.isSubclass(v.cls, T.tuple)); }
@@ -772,7 +865,7 @@
     function unary(op, a, p1, p2) {
         let f = UN[op], lo = 0, hi = 0;
         if (op === "clamp") { lo = p1 === null ? -Infinity : jsNumber(p1); hi = p2 === null ? Infinity : jsNumber(p2); f = (x) => (x < lo ? lo : x > hi ? hi : x); }
-        const dtype = BOOL_UNARY.has(op) ? "bool" : (FLOAT_UNARY.has(op) && !isFloatDtype(a.dtype) ? "float32" : a.dtype);
+        const dtype = BOOL_UNARY.has(op) ? "bool" : (FLOAT_UNARY.has(op) && FLOAT[a.dtype] !== 1 ? "float32" : a.dtype);
         if (op === "polygamma") { const k = jsNumber(p1); f = (x) => polygamma(k, x); }
         else if (op === "sinc") { const r = dtype === "float64" ? same : Math.fround; f = (x) => sinc(x, r); }
         else if (op === "logit") {
@@ -783,7 +876,9 @@
             else { const e = r(jsNumber(p1)), top = r(1 - e); f = (x) => { const c = x < e ? e : x > top ? top : x; return Math.log(c / r(1 - c)); }; }
         }
         if (f === undefined) fail(E.ValueError, "unknown op " + op);
-        const out = work(dtype, a.data.length), A = a.dtype === "bfloat16" ? wide(a) : a.data, O = out.data, n = O.length;
+        // (`work`, inline for a dtype that needs no scratch)
+        const out = HALF[dtype] === 1 ? work(dtype, a.data.length) : { cls: Storage, dtype: dtype, data: new ARRAY[dtype](a.data.length), version: 0, untracked: 0 };
+        const A = a.dtype === "bfloat16" ? wide(a) : a.data, O = out.data, n = O.length;
         if (n >= NATIVE_MIN && NATIVE !== null && UN_CODE[op] !== undefined && NATIVE(N_UNARY, UN_CODE[op], A, O, lo, hi)) { if (HALF[out.dtype] === 1) finish(out); return out; }
         // The hot activations and their gradients inline; the expressions
         // are the table's own.
@@ -951,6 +1046,19 @@
             if (d < 0) break;
         }
     }
+    // A[base + offset of o] = V[o]: gatherStrided's walk, storing.
+    function scatterStrided(A, V, shape, sa, base) {
+        const rank = shape.length, n = V.length;
+        if (rank === 0) { if (n) A[base] = V[0]; return; }
+        const lastN = shape[rank - 1], lastS = sa[rank - 1], idx = new Array(rank).fill(0);
+        let x = base, o = 0;
+        while (o < n) {
+            for (let k = 0, p = x; k < lastN; k++, p += lastS) A[p] = V[o++];
+            let d = rank - 2;
+            for (; d >= 0; d--) { idx[d]++; x += sa[d]; if (idx[d] < shape[d]) break; x -= sa[d] * shape[d]; idx[d] = 0; }
+            if (d < 0) break;
+        }
+    }
     // A contiguous copy of the elements a (storage offset, strides) view
     // reads: PyTorch checkpoints store non-contiguous tensors that way.
     function strided(a, shape, st, offset) {
@@ -1024,6 +1132,14 @@
         let base = 0;
         for (let d = 0; d < shape.length; d++) { base += s.starts[d] * inS[d]; if (s.keep[d]) { outShape.push(s.counts[d]); sa.push(inS[d] * s.steps[d]); } }
         const sv = bstrides(vshape, outShape), A = a.data, V = vals(v), dt = a.dtype;
+        if (v.dtype === dt && dt !== "bfloat16" && numel(vshape) === numel(outShape) && V.length === numel(outShape)) {
+            // The values are already of the storage's dtype (castValue keeps
+            // them as they are) and not broadcast: the strided store
+            // gatherStrided's walk makes, the last dim as an inline loop.
+            scatterStrided(A, V, outShape, sa, base);
+            written(a);
+            return null;
+        }
         const cv = encoder(dt);
         forEachBroadcast(outShape, sa, sv, (o, x, y) => { A[base + x] = cv(dt, V[y]); });
         written(a);
@@ -2813,7 +2929,19 @@
         // arange(dtype, start, step, n): element i is castValue(start + i * step),
         // what from_flat gives for the list torch builds (torch.arange checks
         // that the double arithmetic is exact or is Python's float arithmetic).
-        fn("arange", 4, (a) => { const s = alloc(rt.needStr(a[0]), num(a[3])), O = s.data, d = s.dtype, st = num(a[1]), step = num(a[2]), n = O.length, cv = encoder(d); for (let i = 0; i < n; i++) O[i] = cv(d, st + i * step); return s; });
+        fn("arange", 4, (a) => {
+            const s = alloc(rt.needStr(a[0]), num(a[3])), O = s.data, d = s.dtype, st = num(a[1]), step = num(a[2]), n = O.length;
+            // float32/float64 store what castValue returns (a Float32Array
+            // store is Math.fround); int64/int32 with integer start and step
+            // hold integers Math.trunc keeps (torch.arange checks they are exact).
+            if (d === "float32" || d === "float64" || ((d === "int64" || d === "int32") && Number.isInteger(st) && Number.isInteger(step))) {
+                for (let i = 0; i < n; i++) O[i] = st + i * step;
+                return s;
+            }
+            const cv = encoder(d);
+            for (let i = 0; i < n; i++) O[i] = cv(d, st + i * step);
+            return s;
+        });
         fn("_set_size_type", 1, (a) => { SIZE = a[0]; return null; });
         // _shape_eq(a, b): tuple equality of two shapes (tuples or Sizes of
         // ints), without the rich-comparison dispatch of a tuple subclass.
@@ -2894,6 +3022,82 @@
             }
             return true;
         });
+        // nll_pick(lp, shape, target, ignore_index): -lp[i, target[i]] for
+        // each row of a float32/float64 [n, c] storage and an int64 [n]
+        // target (the advanced index and negation cross_entropy's general
+        // path builds, element for element), or null when a target is
+        // ignore_index or outside [0, c), or anything else is unusual: the
+        // caller's general path then masks, raises or handles it.
+        fn("nll_pick", 4, (a) => {
+            const lp = a[0], t = a[2];
+            if (!isStorage(lp) || !isStorage(t) || (lp.dtype !== "float32" && lp.dtype !== "float64") || t.dtype !== "int64") return null;
+            const sh = shapeOf(a[1]);
+            if (sh.length !== 2) return null;
+            const n = sh[0], c = sh[1], ig = a[3];
+            if (typeof ig !== "bigint" || t.data.length !== n || lp.data.length !== n * c || n === 0) return null;
+            const igv = Number(ig), out = alloc(lp.dtype, n), O = out.data, L = lp.data, Td = t.data;
+            for (let i = 0; i < n; i++) {
+                const k = Td[i];
+                if (k === igv || !(k >= 0 && k < c)) return null;
+                O[i] = -L[i * c + k];
+            }
+            return out;
+        });
+        // _unbroadcast_dims(gshape, shape): for two tuples/Sizes of ints, the
+        // dims `_unbroadcast` sums (the leading ones, then each dim `shape`
+        // has as 1 where `gshape` has not) as a list; null for anything else.
+        fn("_unbroadcast_dims", 2, (a) => {
+            const g = a[0], t = a[1];
+            if (g === null || t === null || typeof g !== "object" || typeof t !== "object" || g.items === undefined || t.items === undefined) return null;
+            if ((g.cls !== SIZE && g.cls !== T.tuple) || (t.cls !== SIZE && t.cls !== T.tuple)) return null;
+            const p = g.items, q = t.items, extra = p.length - q.length;
+            if (extra < 0) return null;
+            const out = [];
+            for (let i = 0; i < p.length; i++) if (typeof p[i] !== "bigint") return null;
+            for (let i = 0; i < q.length; i++) if (typeof q[i] !== "bigint") return null;
+            for (let i = 0; i < extra; i++) out.push(BigInt(i));
+            for (let i = 0; i < q.length; i++) if (q[i] === 1n && p[extra + i] !== 1n) out.push(BigInt(extra + i));
+            return list(out);
+        });
+        // _shape_args(args): torch's `_shape_args` for its common forms, a
+        // tuple of plain ints or one tuple/list/Size of them (as a tuple, the
+        // argument itself when it already is one); null for anything else.
+        fn("_shape_args", 1, (a) => {
+            let v = a[0];
+            if (v === null || typeof v !== "object" || v.items === undefined || v.cls !== T.tuple) return null;
+            if (v.items.length === 1) {
+                const s0 = v.items[0];
+                if (s0 !== null && typeof s0 === "object") {
+                    if (s0.cls !== T.tuple && s0.cls !== T.list && s0.cls !== SIZE) return null;
+                    v = s0;
+                }
+            }
+            const it = v.items;
+            for (let i = 0; i < it.length; i++) if (typeof it[i] !== "bigint") return null;
+            return v.cls === T.tuple ? v : tuple(it.slice());
+        });
+        // _dicts_empty(a, b, c, d): whether all four dicts (or dict-subclass
+        // instances, OrderedDict among them, whose classes define no
+        // __len__ or __bool__ of their own) are empty, as their truth says;
+        // null when one is anything else.
+        fn("_dicts_empty", 4, (a) => {
+            let empty = true;
+            for (let i = 0; i < 4; i++) {
+                const d = a[i];
+                if (d === null || typeof d !== "object" || typeof d.size !== "number" || d.map === undefined) return null;
+                const c = d.cls;
+                if (c !== T.dict) {
+                    const m = c === undefined || c === null ? undefined : c.mro;
+                    if (!Array.isArray(m)) return null;
+                    for (let j = 0; j < m.length; j++) {
+                        const k = m[j];
+                        if (k !== T.dict && k !== rt.ObjectType && (k.dict.has("__len__") || k.dict.has("__bool__"))) return null;
+                    }
+                }
+                if (d.size !== 0) empty = false;
+            }
+            return empty;
+        });
         // _numel(shape): the product of a tuple's or list's ints (Python
         // ints, exact), or null for anything else (the caller multiplies).
         fn("_numel", 1, (a) => {
@@ -2957,6 +3161,9 @@
         // storage exactly as `full` stores it (`flip`: the number is the
         // left operand), so no 0-d tensor has to be built for it.
         fn("binary_scalar", 7, (a) => {
+            const fast = typeof a[0] === "string" && typeof a[4] === "string" && (a[5] === null || typeof a[5] === "string")
+                && typeof a[6] === "boolean" ? binaryScalarFast(a[0], a[1], a[2], a[3], a[6], a[4], a[5]) : undefined;
+            if (fast !== undefined) return fast;
             const sd = rt.needStr(a[4]), t = a[1], want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
             if (sd.length <= 8 && isStorage(t)) {
                 const s = alloc(sd, 1);
@@ -2970,11 +3177,18 @@
             return rt.truth(a[6]) ? cbinary(rt.needStr(a[0]), s, [], t, shapeOf(a[2]), want) : cbinary(rt.needStr(a[0]), t, shapeOf(a[2]), s, [], want);
         });
         fn("binary", 6, (a) => {
+            const fast = typeof a[0] === "string" && (a[5] === undefined || a[5] === null || typeof a[5] === "string")
+                ? binaryFast(a[0], a[1], a[2], a[3], a[4], a[5] === undefined ? null : a[5]) : undefined;
+            if (fast !== undefined) return fast;
             const x = a[1], y = a[3], want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
             if (isStorage(x) && isStorage(y) && (want === null || want.length <= 8)) return binary(rt.needStr(a[0]), x, shapeOf(a[2]), y, shapeOf(a[4]), a[2], a[4], want);
             return cbinary(rt.needStr(a[0]), needC(x), shapeOf(a[2]), needC(y), shapeOf(a[4]), want);
         }, 5);
-        fn("unary", 4, (a) => { const x = a[1]; return isStorage(x) ? unary(rt.needStr(a[0]), x, a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]) : cunary(rt.needStr(a[0]), needC(x)); }, 2);
+        fn("unary", 4, (a) => {
+            const x = a[1], op = a[0];
+            if (typeof op === "string" && x !== null && typeof x === "object" && x.cls === Storage) return unary(op, x, a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]);
+            return isStorage(x) ? unary(rt.needStr(a[0]), x, a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]) : cunary(rt.needStr(a[0]), needC(x));
+        }, 2);
         fn("reduce", 6, (a) => { const x = a[1]; return isStorage(x) ? reduce(rt.needStr(a[0]), x, shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])) : creduce(rt.needStr(a[0]), needC(x), shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])); }, 5);
         // The copying kernels on a complex storage: the same kernel over
         // its real memory with a trailing dimension of 2.

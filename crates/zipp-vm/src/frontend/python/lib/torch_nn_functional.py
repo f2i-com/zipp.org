@@ -2047,6 +2047,14 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
             terms = terms * class_weight
         loss = -terms.sum(class_dim)
         return loss.mean() if reduction == "mean" else loss.sum() if reduction == "sum" else loss
+    if (weight is None and label_smoothing == 0 and logits.__class__ is torch.Tensor and target.__class__ is torch.Tensor
+            and target.dtype is torch.int64 and len(logits.shape) == 2 and len(target.shape) == 1):
+        # [N, C] logits and N class indices, none ignored or out of range:
+        # the rows' picks in one kernel (`torch._nll_rows`), the values and
+        # gradient of the general path below.
+        loss = torch._nll_rows(log_softmax(logits, -1), target, ignore_index)
+        if loss is not None:
+            return loss.reshape(*target.shape) if reduction == "none" else _reduce(loss, reduction)
     _check_targets(logits, target)
     target_shape = tuple(target.shape)
     rows, flat = _flatten_classes(logits, target)
