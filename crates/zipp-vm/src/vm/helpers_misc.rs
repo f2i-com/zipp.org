@@ -4394,6 +4394,17 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         return crate::codegen::SELF_CALL_DEOPT;
     }
 
+    // `s.slice` / `s.indexOf` / ... on a primitive string: the method a
+    // loop calls is read here on every iteration (string receivers are not
+    // in the object IC). A memoised `String.prototype` method that is still
+    // its intrinsic is answered from the memo, ahead of the general walk
+    // below; anything else continues to it.
+    if matches!(vm.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+        if let Some(bits) = vm.str_proto_method_memo_bits(key) {
+            return bits;
+        }
+    }
+
     // RegExp/String direct calls are lowered as an exact Get before argument
     // evaluation plus RegExpMethod afterwards. These receiver kinds are
     // intentionally excluded from the ordinary object IC, but their pristine

@@ -817,6 +817,19 @@ impl<'p> Vm<'p> {
         self.try_builtin_method(recv, key, base, arg_base, argc)
     }
 
+    /// What `Get(s, name)` finds on a primitive string `s` when `name` is one
+    /// of the memoised `String.prototype` methods and that slot still holds
+    /// its intrinsic: the function's bits, from the memo. `None` for any
+    /// other name or state (the caller takes its ordinary lookup). A
+    /// primitive string's own properties are its indices and `length`, so a
+    /// method name always resolves on `String.prototype`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn str_proto_method_memo_bits(&mut self, name: &str) -> Option<u64> {
+        str_memo_id(name)?;
+        self.proto_intrinsic_bits(name, false)
+    }
+
     /// The VALUE of `name` on %Array.prototype% (`is_arr`) / %String.prototype%
     /// when it is provably still the boot intrinsic, else `None` — the same
     /// proof as the two predicates above, returning the callable's bits so a
