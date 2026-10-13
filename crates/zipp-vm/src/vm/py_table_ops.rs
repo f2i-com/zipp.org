@@ -530,6 +530,107 @@ impl<'p> Vm<'p> {
     }
 
     /// `EQ` or `SUBSET` of two tables of one kind.
+    /// `a == b` for two exact lists or two exact dicts, as the runtime's
+    /// `eq` answers it (what `==` comes to for them: their `__eq__` is the
+    /// builtin one, and Python lets no program change a builtin type's):
+    /// identity first; two lists of one length whose items are equal in
+    /// turn; two dicts of one size where each of `a`'s keys is found in
+    /// `b` (natively, by `b`'s own hashing) with an equal value. Items and
+    /// values are compared the same way when they are lists or dicts, and
+    /// otherwise as the tables compare keys ([`native_eq`]: numbers, strs,
+    /// None, bools, tuples of those; a NaN equals nothing, as in the
+    /// runtime). `None` (the runtime's own comparison then runs) for
+    /// anything else met at any depth (an object, a subclass, a set, a list
+    /// beside a non-list), past [`MAX_DEPTH`] or past `MAX_EQ_STEPS`.
+    pub(crate) fn py_deep_eq(&mut self, a: Value, b: Value) -> Option<bool> {
+        const MAX_EQ_STEPS: u64 = 1 << 20;
+        let p = self.py_rt.as_deref()?;
+        let kinds = PyKinds {
+            tuple: p.t_tuple,
+            frozenset: Value::UNDEFINED,
+            seq_shape: p.seq_shape,
+        };
+        let (tl, td) = (p.t_list, p.t_dict);
+        if !tl.is_heap() || !td.is_heap() {
+            return None;
+        }
+        // Only two lists or two dicts here: `==` of anything else (a complex
+        // number, a user object) asks its `__eq__` before any identity test,
+        // which only the containers' item comparisons make.
+        match (self.py_cls_of(a), self.py_cls_of(b)) {
+            (Some(x), Some(y)) if x.bits() == y.bits() && (x.bits() == tl.bits() || x.bits() == td.bits()) => {}
+            _ => return None,
+        }
+        let mut steps = 0;
+        let r = self.deep_eq_in(&kinds, tl, td, a, b, 0, &mut steps);
+        self.charge_steps(steps as i64);
+        r.filter(|_| steps <= MAX_EQ_STEPS)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deep_eq_in(&self, kinds: &PyKinds, tl: Value, td: Value, a: Value, b: Value, depth: u32, steps: &mut u64) -> Option<bool> {
+        *steps += 1;
+        if a == b && !a.is_number() {
+            return Some(true);
+        }
+        if depth > MAX_DEPTH || *steps > (1 << 20) {
+            return None;
+        }
+        let ca = self.py_cls_of(a).filter(|c| c.bits() == tl.bits() || c.bits() == td.bits());
+        let cb = self.py_cls_of(b).filter(|c| c.bits() == tl.bits() || c.bits() == td.bits());
+        match (ca, cb) {
+            (None, None) => native_eq(&self.heap, kinds, a, b, steps),
+            (Some(x), Some(y)) if x.bits() == y.bits() && x.bits() == tl.bits() => {
+                let (_, xi) = self.py_seq_parts(a)?;
+                let (_, yi) = self.py_seq_parts(b)?;
+                if !xi.is_heap() || !yi.is_heap() {
+                    return None;
+                }
+                let (HeapObj::Array(xs), HeapObj::Array(ys)) = (self.heap.get(xi.heap_index()), self.heap.get(yi.heap_index())) else {
+                    return None;
+                };
+                if xs.len() != ys.len() {
+                    return Some(false);
+                }
+                for (&s, &t) in xs.iter().zip(ys.iter()) {
+                    if s.is_hole() || t.is_hole() {
+                        return None;
+                    }
+                    if !self.deep_eq_in(kinds, tl, td, s, t, depth + 1, steps)? {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            }
+            (Some(x), Some(y)) if x.bits() == y.bits() => {
+                let (_, xm) = self.py_dict_field(a.heap_index(), 0)?;
+                let (_, ym) = self.py_dict_field(b.heap_index(), 0)?;
+                let (Some(xt), Some(yt)) = (table_at(&self.heap, xm), table_at(&self.heap, ym)) else {
+                    return None;
+                };
+                if xt.is_set() || yt.is_set() {
+                    return None;
+                }
+                if xt.len() != yt.len() {
+                    return Some(false);
+                }
+                for (i, k, v) in xt.entries() {
+                    let mut work = 0;
+                    let found = yt.lookup(xt.hashes[i], &mut |s| native_eq(&self.heap, &yt.kinds, s, k, &mut work), steps)?;
+                    *steps += work;
+                    let Lookup::Found(j) = found else {
+                        return Some(false);
+                    };
+                    if !self.deep_eq_in(kinds, tl, td, v, yt.vals[j], depth + 1, steps)? {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
     fn pt_compare(&mut self, op: i32, a: Value, b: Value) -> Value {
         let (Some(x), Some(y)) = (table_at(&self.heap, a), table_at(&self.heap, b)) else {
             return Value::UNDEFINED;

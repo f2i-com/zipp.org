@@ -2377,6 +2377,9 @@ impl<'p> Vm<'p> {
                 {
                     let eq = self.values_strict_eq(va, vb);
                     Ok(Some(if op == PyCmpOp::Eq { eq } else { !eq }))
+                } else if let Some(eq) = self.py_deep_eq(va, vb) {
+                    // Two exact lists or dicts (`vm::py_table`).
+                    Ok(Some(if op == PyCmpOp::Eq { eq } else { !eq }))
                 } else {
                     Ok(None)
                 }
