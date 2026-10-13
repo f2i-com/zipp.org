@@ -67,6 +67,7 @@ const OP_Q_CONV2D: u32 = 27;
 const OP_Q_REQUANT: u32 = 28;
 const OP_Q_FAKE: u32 = 29;
 const OP_ARANGE: u32 = 30;
+const OP_OPTIM: u32 = 31;
 
 /// `x` as a store into an element of `kind` leaves it: the typed-array
 /// conversion (`helpers_numeric::ta_encode`), read back.
@@ -447,6 +448,7 @@ match op {
         OP_Q_REQUANT => Outcome::ran(h.pt_q_requant(a).is_some()),
         OP_Q_FAKE => Outcome::ran(h.pt_q_fake(a).is_some()),
         OP_ARANGE => Outcome::ran(h.pt_arange(a).is_some()),
+        OP_OPTIM => Outcome::ran(h.pt_optim(a).is_some()),
         _ => Outcome::Declined,
 }
 }
@@ -965,8 +967,6 @@ pub(crate) trait Kernels: Host {
         Some(())
     }
 
-    /// `(op, A, O, lo, hi)`: `O[i] = op(A[i])` (tensor.js's `unary`); op 27
-    /// is `clamp` to `[lo, hi]`.
     /// `(O, start, step)`: tensor.js's `arange` loop for a float32 or
     /// float64 storage (the int64/int32 ones are float64 too): element i is
     /// `start + i * step`, stored as the typed array stores it.
@@ -988,6 +988,122 @@ pub(crate) trait Kernels: Host {
         Some(())
     }
 
+    /// `(kind, flags, P, G, M, V, W, M2, V2, W2, s0..s7)`: one SGD (kind 0)
+    /// or Adam (kind 1) step of a float32/float64 parameter `P` from its
+    /// gradient `G`: tensor.js's `optimStep` loop, element for element,
+    /// every operation in its order and rounded where it rounds there. `P`
+    /// is written in place; the state is read from `M`, `V`, `W` and the new
+    /// state written to `M2`, `V2`, `W2` (each null where the update has
+    /// none; `M` also on SGD's first step). The scalars arrive rounded to
+    /// the dtype.
+    fn pt_optim(&mut self, a: &[Arg]) -> Option<()> {
+        let (kind, flags) = (int_arg(a, 0)?, int_arg(a, 1)?);
+        let (vp, vg) = (self.pt_view(arg(a, 2))?, self.pt_view(arg(a, 3))?);
+        if kind > 1 || !matches!(vp.kind, KIND_F32 | KIND_F64) || vg.kind != vp.kind || vg.len != vp.len {
+            return None;
+        }
+        let adam = kind == 1;
+        let (use_m, use_w) = (adam || flags & 4 != 0, adam && flags & 8 != 0);
+        // A storage of the parameter's kind and length (`Some`), or null.
+        let state = |i: usize| -> Option<Option<View>> {
+            if arg(a, i).is_null() {
+                return Some(None);
+            }
+            let v = self.pt_view(arg(a, i))?;
+            (v.kind == vp.kind && v.len == vp.len).then_some(Some(v))
+        };
+        let (vm, vv, vw) = (state(4)?, state(5)?, state(6)?);
+        let (vm2, vv2, vw2) = (state(7)?, state(8)?, state(9)?);
+        // (SGD's old buffer is null on its first step)
+        let m_ok = if adam { vm.is_some() } else { use_m || vm.is_none() };
+        if !m_ok || vv.is_some() != adam || vw.is_some() != use_w || vm2.is_some() != use_m || vv2.is_some() != adam || vw2.is_some() != use_w {
+            return None;
+        }
+        let first = use_m && !adam && vm.is_none();
+        let views = [Some(vp), Some(vg), vm, vv, vw, vm2, vv2, vw2];
+        for (i, x) in views.iter().enumerate() {
+            for y in &views[i + 1..] {
+                if let (Some(x), Some(y)) = (x, y) {
+                    if x.buffer == y.buffer {
+                        return None;
+                    }
+                }
+            }
+        }
+        let mut s = [0.0f64; 8];
+        for (k, v) in s.iter_mut().enumerate() {
+            *v = num_arg(a, 10 + k)?;
+        }
+        let n = vp.len;
+        let cost = self.pt_admit(n.saturating_mul(if adam { 4 } else { 2 }), n.saturating_mul(8))?;
+        let mut p = self.pt_read_all(vp)?;
+        let g = self.pt_read_all(vg)?;
+        let read = |v: Option<View>| -> Option<Vec<f64>> {
+            match v {
+                Some(v) => self.pt_read_all(v),
+                None => Some(Vec::new()),
+            }
+        };
+        let (m, v, w) = (read(vm)?, read(vv)?, read(vw)?);
+        let (mut m2, mut v2, mut w2) = (zeroed(if use_m { n } else { 0 })?, zeroed(if adam { n } else { 0 })?, zeroed(if use_w { n } else { 0 })?);
+        let kd = vp.kind;
+        let q = |x: f64| stored(kd, x);
+        let neg = flags & 1 != 0;
+        if !adam {
+            let (lr, mom, damp1, wd) = (s[0], s[1], s[2], s[3]);
+            let (decay, nest) = (flags & 2 != 0, flags & 16 != 0);
+            for i in 0..n {
+                let pv = p[i];
+                let mut gv = if neg { -g[i] } else { g[i] };
+                if decay {
+                    gv = q(gv + q(pv * wd));
+                }
+                if use_m {
+                    // (the first step's buffer is the gradient's clone)
+                    let b = if first { gv } else { q(q(m[i] * mom) + q(gv * damp1)) };
+                    m2[i] = b;
+                    gv = if nest { q(gv + q(b * mom)) } else { b };
+                }
+                p[i] = pv - q(gv * lr);
+            }
+        } else {
+            let (b1, ob1, b2, ob2, bc2, eps, ss, wd) = (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+            let decay = flags & 2 != 0;
+            let (coupled, decoupled) = (decay && flags & 4 == 0, decay && flags & 4 != 0);
+            for i in 0..n {
+                let pv = p[i];
+                let mut gv = if neg { -g[i] } else { g[i] };
+                let mut value = pv;
+                if coupled {
+                    gv = q(gv + q(pv * wd));
+                } else if decoupled {
+                    value = q(pv * wd);
+                }
+                let mv = q(q(m[i] * b1) + q(gv * ob1));
+                let vq = q(q(v[i] * b2) + q(q(gv * gv) * ob2));
+                m2[i] = mv;
+                v2[i] = vq;
+                let mut d = vq;
+                if use_w {
+                    let wv = w[i];
+                    d = if wv.is_nan() || vq.is_nan() { f64::NAN } else { js_max(wv, vq) };
+                    w2[i] = d;
+                }
+                p[i] = value - q(q(mv / q(q(q(math_unary(M::Sqrt, d)) / bc2) + eps)) * ss);
+            }
+        }
+        self.pt_write(vp, 0, &p)?;
+        for (view, vals) in [(vm2, &m2), (vv2, &v2), (vw2, &w2)] {
+            if let Some(view) = view {
+                self.pt_write(view, 0, vals)?;
+            }
+        }
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(op, A, O, lo, hi)`: `O[i] = op(A[i])` (tensor.js's `unary`); op 27
+    /// is `clamp` to `[lo, hi]`.
     fn pt_unary(&mut self, a: &[Arg]) -> Option<()> {
         let op = u32::try_from(int_arg(a, 0)?).ok()?;
         let (va, vo) = (self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?);

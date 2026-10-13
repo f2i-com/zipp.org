@@ -537,3 +537,103 @@ print(round(float(torch.linalg.inv(a).sum()), 9), round(float(torch.linalg.eigva
     // the interpreted fallback itself about 4x cheaper to meter.)
     assert!(native.steps * 2 < interpreted.steps, "{} vs {}", native.steps, interpreted.steps);
 }
+
+/// SGD's and Adam's fused update (`optim_step`, one kernel call per
+/// parameter) gives the bytes of the per-tensor composite it replaced, for
+/// every option, both float dtypes, sizes on both sides of the native
+/// threshold and special values, with its native loop on and off: the
+/// parameters and every state tensor, step by step.
+const OPTIM: &str = r#"
+import torch
+import _zipp_tensor as _k
+
+INF = float("inf")
+NAN = float("nan")
+SPECIAL = [0.0, -0.0, 1.0, -1.0, 1e-45, 3e38, 1e-8, INF, -INF, NAN, 0.5, -2.5]
+
+
+def vals(n, seed, special):
+    out = []
+    for i in range(n):
+        j = (i * 7 + seed * 13) % 31
+        if special and j < len(SPECIAL) and (i + seed) % 3 == 0:
+            out.append(SPECIAL[j])
+        else:
+            out.append(((i * 37 + seed * 11) % 23 - 11) / 8.0 + (seed % 5) * 0.137)
+    return out
+
+
+def image(opt, params):
+    out = []
+    for t in params:
+        out.append(_k.tobytes(t._s))
+        st = opt.state[t]
+        for k in sorted(st):
+            v = st[k]
+            out.append((k, (_k.dtype(v._s), tuple(v.shape), _k.tobytes(v._s)) if isinstance(v, torch.Tensor) else repr(v)))
+    return out
+
+
+def run(make, dt, shape, seed, special, fused, native):
+    _k._native(native)
+    saved = _k.optim_step
+    if not fused:
+        # (declined: every parameter takes the composite)
+        _k.optim_step = lambda *a: None
+    try:
+        n = 1
+        for d in shape:
+            n *= d
+        p = torch.nn.Parameter(torch.tensor(vals(n, seed, special), dtype=dt).reshape(shape))
+        q = torch.nn.Parameter(torch.tensor(vals(7, seed + 1, False), dtype=dt))
+        opt = make([p, q])
+        out = []
+        for step in range(3):
+            p.grad = torch.tensor(vals(n, seed + 10 + step, special), dtype=dt).reshape(shape)
+            q.grad = torch.tensor(vals(7, seed + 20 + step, False), dtype=dt)
+            opt.step()
+            out.append(image(opt, [p, q]))
+        return out
+    finally:
+        _k.optim_step = saved
+
+
+O = torch.optim
+CONFIGS = [
+    ("sgd", lambda ps: O.SGD(ps, lr=0.05)),
+    ("sgd momentum", lambda ps: O.SGD(ps, lr=0.05, momentum=0.9)),
+    ("sgd dampening wd", lambda ps: O.SGD(ps, lr=0.05, momentum=0.9, dampening=0.1, weight_decay=0.01)),
+    ("sgd nesterov", lambda ps: O.SGD(ps, lr=0.03, momentum=0.9, nesterov=True, weight_decay=0.001)),
+    ("sgd maximize ints", lambda ps: O.SGD(ps, lr=1, momentum=1, dampening=0, weight_decay=2, maximize=True)),
+    ("adam", lambda ps: O.Adam(ps, lr=0.01)),
+    ("adam amsgrad", lambda ps: O.Adam(ps, lr=0.01, amsgrad=True)),
+    ("adam wd maximize", lambda ps: O.Adam(ps, lr=0.02, weight_decay=0.01, maximize=True, betas=(0.5, 0.9), eps=1e-3)),
+    ("adam decoupled", lambda ps: O.Adam(ps, lr=0.01, weight_decay=0.1, decoupled_weight_decay=True)),
+    ("adamw", lambda ps: O.AdamW(ps, lr=0.01)),
+    ("adamw amsgrad maximize", lambda ps: O.AdamW(ps, lr=0.003, amsgrad=True, maximize=True, weight_decay=0.05)),
+]
+cases = 0
+bad = []
+seed = 0
+for name, make in CONFIGS:
+    for dt in (torch.float32, torch.float64):
+        for shape in ((5,), (63,), (64,), (10, 7), (100,)):
+            for special in (False, True):
+                seed += 1
+                ref = run(make, dt, shape, seed, special, False, True)
+                for native in (False, True):
+                    cases += 1
+                    if run(make, dt, shape, seed, special, True, native) != ref:
+                        bad.append("%s %s %s special=%s native=%s" % (name, dt, shape, special, native))
+print("cases", cases, "mismatches", len(bad), bad[:5])
+"#;
+
+#[test]
+fn fused_optimizer_steps_give_the_composites_bytes() {
+    let run = run(OPTIM, 20_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("mismatches 0 []"), "{}", out[0]);
+    let cases: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(cases, 11 * 2 * 5 * 2 * 2, "{}", out[0]);
+}

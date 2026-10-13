@@ -14,8 +14,9 @@
  *
  * A storage carries a version, bumped by every kernel that writes into an
  * existing storage (`fill`, `setitem`, `copy_into`, `setslice`, `scatter`,
- * `scatter_add`, `axpy`), so a compiled GPU result can tell whether the
- * tensors it was recorded from changed without keeping a copy to compare.
+ * `scatter_add`, `axpy`, `optim_step`), so a compiled GPU result can tell
+ * whether the tensors it was recorded from changed without keeping a copy
+ * to compare.
  */
 (function (R) {
     "use strict";
@@ -38,7 +39,7 @@
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
         N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23,
-        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30;
+        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -479,6 +480,80 @@
             default: if (flip) for (let i = 0; i < n; i++) O[i] = y / A[i]; else for (let i = 0; i < n; i++) O[i] = A[i] / y;
         }
         return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, tpy] };
+    }
+    // One torch.optim SGD (kind 0) or Adam/AdamW (kind 1) update of a
+    // float32/float64 parameter `P` from its gradient `G`. Element by
+    // element it computes what the per-tensor composite it replaces
+    // computed (`p - grad * lr`, `exp_avg * b1 + grad * (1 - b1)`, ...):
+    // the same operations in the same order, each result rounded to the
+    // dtype as that operation's own kernel stored it, every scalar rounded
+    // to the dtype first as `binary_scalar` stores a Python number. The
+    // parameter is written in place (as `copy_into`, its version moves on);
+    // its new state comes back in new storages, as the composite's results
+    // were, the old ones untouched. `S`: the scalars, as floats.
+    //   SGD:  S = (lr, momentum, 1 - dampening, weight_decay); M the
+    //         momentum buffer (null on the first step or without
+    //         momentum); flags 1 maximize, 2 weight decay, 4 momentum,
+    //         16 nesterov. Returns (new buffer or null, null, null).
+    //   Adam: S = (b1, 1 - b1, b2, 1 - b2, sqrt(bias2), eps, step_size,
+    //         weight_decay, or 1 - lr * weight_decay when decoupled); M, V
+    //         exp_avg and exp_avg_sq, W max_exp_avg_sq (null without
+    //         amsgrad); flags 1 maximize, 2 weight decay, 4 decoupled
+    //         weight decay, 8 amsgrad. Returns (exp_avg, exp_avg_sq,
+    //         max_exp_avg_sq or null).
+    // null, with nothing written, for anything else (the caller then runs
+    // the composite).
+    function optStorage(s, dt, n) {
+        return s !== null && typeof s === "object" && s.cls === Storage && s.dtype === dt && s.base === undefined && s.data.length === n;
+    }
+    function optimStep(kind, flags, P, G, M, V, W, S) {
+        if (P === null || typeof P !== "object" || P.cls !== Storage || (P.dtype !== "float32" && P.dtype !== "float64") || P.base !== undefined) return null;
+        if ((kind !== 0n && kind !== 1n) || typeof flags !== "bigint") return null;
+        const dt = P.dtype, n = P.data.length, adam = kind === 1n, fl = Number(flags);
+        const useM = adam || (fl & 4) !== 0, useW = adam && (fl & 8) !== 0, first = useM && !adam && M === null;
+        if (!optStorage(G, dt, n) || (useM && !first ? !optStorage(M, dt, n) : M !== null) || (adam ? !optStorage(V, dt, n) : V !== null)
+            || (useW ? !optStorage(W, dt, n) : W !== null) || G === P || G.data === P.data) return null;
+        if (S === null || typeof S !== "object" || S.cls !== T.tuple || S.items.length !== (adam ? 8 : 4)) return null;
+        const f32 = dt === "float32", q = f32 ? fr : same, s = [0, 0, 0, 0, 0, 0, 0, 0];
+        for (let k = 0; k < S.items.length; k++) { const v = S.items[k]; if (typeof v !== "number") return null; s[k] = q(v); }
+        const M2 = useM ? alloc(dt, n) : null, V2 = adam ? alloc(dt, n) : null, W2 = useW ? alloc(dt, n) : null;
+        const Pd = P.data, Gd = G.data, Md = M === null ? null : M.data, Vd = adam ? V.data : null, Wd = useW ? W.data : null;
+        const Nm = M2 === null ? null : M2.data, Nv = V2 === null ? null : V2.data, Nw = W2 === null ? null : W2.data;
+        if (!(n >= NATIVE_MIN && NATIVE !== null && NATIVE(N_OPTIM, Number(kind), fl, Pd, Gd, Md, Vd, Wd, Nm, Nv, Nw, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))) {
+            const neg = (fl & 1) !== 0;
+            if (!adam) {
+                const lr = s[0], mom = s[1], damp1 = s[2], wd = s[3], decay = (fl & 2) !== 0, nest = (fl & 16) !== 0;
+                for (let i = 0; i < n; i++) {
+                    const p = Pd[i];
+                    let g = neg ? -Gd[i] : Gd[i];
+                    if (decay) g = q(g + q(p * wd));
+                    if (Nm !== null) {
+                        // (the first step's buffer is the gradient's clone)
+                        const b = first ? g : q(q(Md[i] * mom) + q(g * damp1));
+                        Nm[i] = b;
+                        g = nest ? q(g + q(b * mom)) : b;
+                    }
+                    Pd[i] = p - q(g * lr);
+                }
+            } else {
+                const b1 = s[0], ob1 = s[1], b2 = s[2], ob2 = s[3], bc2 = s[4], eps = s[5], ss = s[6], wd = s[7];
+                const coupled = (fl & 2) !== 0 && (fl & 4) === 0, decoupled = (fl & 2) !== 0 && (fl & 4) !== 0;
+                for (let i = 0; i < n; i++) {
+                    const p = Pd[i];
+                    let g = neg ? -Gd[i] : Gd[i], value = p;
+                    if (coupled) g = q(g + q(p * wd));
+                    else if (decoupled) value = q(p * wd);
+                    const m = q(q(Md[i] * b1) + q(g * ob1)), v = q(q(Vd[i] * b2) + q(q(g * g) * ob2));
+                    Nm[i] = m;
+                    Nv[i] = v;
+                    let d = v;
+                    if (Nw !== null) { const w = Wd[i]; d = (w !== w || v !== v) ? NaN : Math.max(w, v); Nw[i] = d; }
+                    Pd[i] = value - q(q(m / q(q(q(Math.sqrt(d)) / bc2) + eps)) * ss);
+                }
+            }
+        }
+        written(P);
+        return tuple([M2, V2, W2]);
     }
     // A shape tuple the caller passed in, when the result has exactly that
     // shape: the kernel hands it back instead of building an equal one.
@@ -3538,6 +3613,9 @@
         // zlib's CRC-32 of a bytes object, for zipfile (torch.save checkpoints).
         fn("crc32", 2, (a) => BigInt(rt.crc32(a[0].items, a[1] === undefined ? 0 : num(a[1]))), 1);
         fn("dot_sum", 2, (a) => { const x = vals(needS(a[0])), y = vals(needS(a[1])); let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; });
+        // optim_step(kind, flags, P, G, M, V, W, scalars): `optimStep`; the
+        // new state storages, or None when it did not run (nothing written).
+        fn("optim_step", 8, (a) => optimStep(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]));
         fn("axpy", 3, (a) => {
             const alpha = num(a[0]), xs = a[1], ys = a[2];
             if (!isStorage(xs) || !isStorage(ys)) {
