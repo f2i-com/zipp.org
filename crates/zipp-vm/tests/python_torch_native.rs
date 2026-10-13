@@ -637,3 +637,180 @@ fn fused_optimizer_steps_give_the_composites_bytes() {
     let cases: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
     assert_eq!(cases, 11 * 2 * 5 * 2 * 2, "{}", out[0]);
 }
+
+/// The fused LSTM and GRU cells (`lstm_cell`, `gru_cell` and their
+/// backward kernels) give the bytes of the composite they replace, with
+/// their native loops on and off: outputs, final states and every
+/// gradient of nn.LSTM / nn.GRU (layers, bidirectional, batch_first,
+/// proj_size, given initial states, losses reading h_n / c_n, inf / nan /
+/// -0 / saturating inputs) and of LSTMCell / GRUCell, float32 and float64.
+/// Under create_graph the first derivatives are the composite's bytes and
+/// the second derivatives agree to rounding (their sums run in another
+/// order).
+const CELLS: &str = r#"
+import struct
+
+import torch
+import _zipp_tensor as _k
+from torch import nn
+
+SPECIAL = [0.0, -0.0, 30.0, -30.0, 1e-45, 1e-8, 0.5, -2.5, 89.0, -89.0, float("inf"), float("nan")]
+
+
+def vals(n, seed, special):
+    out = []
+    for i in range(n):
+        j = (i * 7 + seed * 13) % 37
+        if special and j < len(SPECIAL) and (i + seed) % 3 == 0:
+            out.append(SPECIAL[j])
+        else:
+            out.append(((i * 37 + seed * 11) % 23 - 11) / 16.0 + (seed % 5) * 0.037)
+    return out
+
+
+def tensor(shape, seed, dt, special=False, grad=False):
+    n = 1
+    for d in shape:
+        n *= d
+    t = torch.tensor(vals(n, seed, special), dtype=dt).reshape(shape)
+    return t.requires_grad_(True) if grad else t
+
+
+def fill(module, dt, seed):
+    with torch.no_grad():
+        for k, p in enumerate(module.parameters()):
+            p.copy_(tensor(tuple(p.shape), seed + k, dt) * 0.5)
+
+
+def image(ts):
+    return [None if t is None else (str(t.dtype), tuple(t.shape), _k.tobytes(t.detach()._s)) for t in ts]
+
+
+SAVED = {}
+
+
+def mode(fused, native):
+    # fused False: the kernels decline, so every step takes the composite
+    for name in ("lstm_cell", "gru_cell"):
+        if name not in SAVED:
+            SAVED[name] = getattr(_k, name)
+        setattr(_k, name, SAVED[name] if fused else (lambda *a: None))
+    _k._native(native)
+
+
+def run_rnn(kind, dt, cfg, seed, special):
+    I, H, L, bf, bi, proj, B, T, h0g, use_hn = cfg
+    kw = dict(num_layers=L, batch_first=bf, bidirectional=bi)
+    if proj:
+        kw["proj_size"] = proj
+    m = getattr(nn, kind)(I, H, **kw).to(dt)
+    fill(m, dt, seed)
+    x = tensor((B, T, I) if bf else (T, B, I), seed + 50, dt, special, True)
+    D = 2 if bi else 1
+    args, extra = [x], []
+    if h0g:
+        h0 = tensor((L * D, B, proj or H), seed + 60, dt, False, True)
+        extra.append(h0)
+        if kind == "LSTM":
+            c0 = tensor((L * D, B, H), seed + 61, dt, False, True)
+            extra.append(c0)
+            args.append((h0, c0))
+        else:
+            args.append(h0)
+    out, st = m(*args)
+    st = list(st) if kind == "LSTM" else [st]
+    loss = (out * out).sum() + out.sum()
+    if use_hn:
+        loss = loss + (st[0] * 3.0).sum() + (st[-1] * st[-1]).sum()
+    loss.backward()
+    return image([out, loss, x.grad] + st + [p.grad for p in m.parameters()] + [t.grad for t in extra])
+
+
+def run_cell(kind, dt, H, B, seed, special, double):
+    m = getattr(nn, kind)(5, H).to(dt)
+    fill(m, dt, seed)
+    x = tensor((B, 5), seed + 40, dt, special, True)
+    h = tensor((B, H), seed + 41, dt, False, True)
+    ps = list(m.parameters())
+    if kind == "LSTMCell":
+        c = tensor((B, H), seed + 42, dt, special, True)
+        h2, c2 = m(x, (h, c))
+        h3, c3 = m(x, (h2, c2))
+        outs, loss, leaves = [h2, c2, h3, c3], (h3 * c3).sum() + h2.sum(), ps + [x, h, c]
+    else:
+        h2 = m(x, h)
+        h3 = m(x * 0.5, h2)
+        outs, loss, leaves = [h2, h3], (h3 * h3).sum() + h2.sum(), ps + [x, h]
+    if not double:
+        loss.backward()
+        return image(outs + [loss] + [t.grad for t in leaves]), None
+    grads = torch.autograd.grad(loss, leaves, create_graph=True)
+    second = torch.autograd.grad(sum((g * g).sum() for g in grads), [x] + ps)
+    return image(outs + [loss] + list(grads)), [t.detach().reshape(-1).tolist() for t in second]
+
+
+def close(a, b, rel):
+    # each tensor's elements within rel of its largest magnitude
+    for x, y in zip(a, b):
+        scale = max(abs(p) for p in x + y)
+        for p, q in zip(x, y):
+            if p != q and abs(p - q) > rel * scale:
+                return False
+    return True
+
+
+cases = 0
+bad = []
+seed = 0
+CFGS = [
+    # I, H, layers, batch_first, bidirectional, proj_size, B, T, h0/c0 given (requiring grad), loss reads h_n/c_n
+    (3, 4, 1, True, False, 0, 2, 3, False, False),
+    (6, 12, 1, True, False, 0, 4, 10, False, False),
+    (5, 7, 2, False, True, 0, 3, 4, True, True),
+    (4, 20, 1, False, False, 0, 5, 3, True, True),
+    (3, 6, 2, True, False, 3, 2, 3, True, True),
+]
+for kind in ("LSTM", "GRU"):
+    for dt in (torch.float32, torch.float64):
+        for cfg in CFGS:
+            if kind == "GRU" and cfg[5]:
+                continue
+            for special in (False, True):
+                seed += 1
+                mode(False, True)
+                ref = run_rnn(kind, dt, cfg, seed, special)
+                for native in (False, True):
+                    cases += 1
+                    mode(True, native)
+                    if run_rnn(kind, dt, cfg, seed, special) != ref:
+                        bad.append("%s %s %s special=%s native=%s" % (kind, dt, cfg, special, native))
+for kind in ("LSTMCell", "GRUCell"):
+    for dt in (torch.float32, torch.float64):
+        for H, B in ((4, 3), (16, 8)):
+            for special in (False, True):
+                for double in ((False, True) if not special else (False,)):
+                    seed += 1
+                    mode(False, True)
+                    ref, ref2 = run_cell(kind, dt, H, B, seed, special, double)
+                    for native in (False, True):
+                        cases += 1
+                        mode(True, native)
+                        got, got2 = run_cell(kind, dt, H, B, seed, special, double)
+                        # second derivatives: the same up to the order of
+                        # their sums (create_graph records the composite's
+                        # backward over fresh activations)
+                        if got != ref or (double and not close(got2, ref2, 1e-5 if dt is torch.float32 else 1e-13)):
+                            bad.append("%s %s %d %d special=%s double=%s native=%s" % (kind, dt, H, B, special, double, native))
+mode(True, True)
+print("cases", cases, "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn fused_recurrent_cells_give_the_composites_bytes() {
+    let run = run(CELLS, 20_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("mismatches 0 []"), "{}", out[0]);
+    let cases: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(cases, 120, "{}", out[0]);
+}

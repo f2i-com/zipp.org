@@ -2752,11 +2752,15 @@ class RNNCellBase(Module):
 
 def _gru_step(gi, h, w_hh, b_hh):
     gh = F.linear(h, w_hh, b_hh)
-    i_r, i_z, i_n = gi.chunk(3, -1)
-    h_r, h_z, h_n = gh.chunk(3, -1)
-    r = torch.sigmoid(i_r + h_r)
-    z = torch.sigmoid(i_z + h_z)
-    n = torch.tanh(i_n + r * h_n)
+    zn = _gru_fused(gi, gh)
+    if zn is None:
+        i_r, i_z, i_n = gi.chunk(3, -1)
+        h_r, h_z, h_n = gh.chunk(3, -1)
+        r = torch.sigmoid(i_r + h_r)
+        z = torch.sigmoid(i_z + h_z)
+        n = torch.tanh(i_n + r * h_n)
+    else:
+        z, n = zn
     # PyTorch's CPU GRUCell: (hidden - new_gate) * input_gate + new_gate.
     # Equal to (1 - z) * n + z * h in exact arithmetic, but rounded
     # differently: this form gives PyTorch's float32 values.
@@ -2765,12 +2769,171 @@ def _gru_step(gi, h, w_hh, b_hh):
 
 def _lstm_step(gi, h, c, w_hh, b_hh, w_hr=None):
     gates = gi + F.linear(h, w_hh, b_hh)
-    i, f, g, o = gates.chunk(4, -1)
-    c2 = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
-    h2 = torch.sigmoid(o) * torch.tanh(c2)
+    hc = _lstm_fused(gates, c)
+    if hc is None:
+        i, f, g, o = gates.chunk(4, -1)
+        c2 = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+        h2 = torch.sigmoid(o) * torch.tanh(c2)
+    else:
+        h2, c2 = hc
     if w_hr is not None:
         h2 = F.linear(h2, w_hr)
     return h2, c2
+
+
+# ---- fused cells ---------------------------------------------------------------------------
+# The elementwise part of an LSTM or GRU step (chunk, sigmoid, tanh, mul,
+# add: about a dozen ops, each a tensor and an autograd node, forward and
+# backward) as one kernel call each way (tensor.js `lstm_cell`,
+# `gru_cell`). The values are the composite's, element for element, in
+# both directions: each kernel runs the composite's operations and
+# backward formulas in their order, rounded where they round. The graph
+# has two nodes per cell where the composite had a dozen, consuming the
+# same tensors (the gates and the state), so every gradient reaches them
+# from the same producers: the gates' gradient arrives as two blocks that
+# are zero outside their own part (the composite's four slices did the
+# same), and the state's from the same two places. With create_graph the
+# nodes run the composite's backward as recorded ops instead, so it stays
+# differentiable. Anything other than plain float32/float64 [B, k*H]
+# operands (autocast, a recorded graph, another layout) takes the
+# composite.
+_float32, _float64 = torch.float32, torch.float64
+
+
+def _cell_operands(a, b, k):
+    """(B, H) when `a` [B, k*H] and `b` ([B, H], or [B, k*H] for k == 3)
+    are plain float32/float64 tensors of one dtype the fused cells take,
+    else None."""
+    dt = a.dtype
+    if torch._graph_recording or torch._autocast_cpu is not None or a.__class__ is not Tensor or b.__class__ is not Tensor:
+        return None
+    if (dt is not _float32 and dt is not _float64) or b.dtype is not dt:
+        return None
+    sa, sb = a.shape, b.shape
+    if len(sa) != 2 or len(sb) != 2 or sa[0] != sb[0]:
+        return None
+    hd = sa[1] // k
+    if hd <= 0 or sa[1] != k * hd or sb[1] != (hd if k == 4 else k * hd):
+        return None
+    return sa[0], hd
+
+
+def _cell_spec(rows, start, stop):
+    # The slice spec of a gate block along the last of two dims.
+    return [(None, None, None), (start, stop, None)]
+
+
+def _lstm_fused(gates, c):
+    dims = _cell_operands(gates, c, 4)
+    if dims is None:
+        return None
+    r = torch._k.lstm_cell(gates._s, c._s, dims[1])
+    if r is None:
+        return None
+    shape = c.shape
+    dt = c.dtype
+    c2 = Tensor(r[0], shape, dt)
+    h2 = Tensor(r[1], shape, dt)
+    if torch._grad_enabled and (gates.requires_grad or c.requires_grad):
+        # (named as the composite's last ops, whose grad_fn they stand in for)
+        c2.requires_grad = True
+        node = c2._node = torch._Node(_lstm_c2_bw, (gates, c), "Add", [c], (r[2], gates, gates._s, c, c._s, dims[1]))
+        node.diff = True
+        h2.requires_grad = True
+        node = h2._node = torch._Node(_lstm_h2_bw, (gates, c2), "Mul", None, (r[2], r[3], gates, gates._s, c2, c2._s, dims[1]))
+        node.diff = True
+    return h2, c2
+
+
+def _lstm_c2_bw(g, args):
+    act, gates, gs, c, cs, hd = args
+    if not torch._grad_enabled and g.__class__ is Tensor and g.dtype is gates.dtype:
+        r = torch._k.lstm_cell_bw(1, g._s, act, cs, hd, c.requires_grad)
+        if r is not None:
+            dt = gates.dtype
+            return (Tensor(r[0], gates.shape, dt), None if r[1] is None else Tensor(r[1], c.shape, dt))
+    # The composite's backward, as its nodes run it (recorded under create_graph).
+    gates, c = torch._frozen(gates, gs), torch._frozen(c, cs)
+    hd4 = 4 * hd
+    i, f, gg = (torch._slice(gates, _cell_spec(2, k * hd, (k + 1) * hd)) for k in range(3))
+    sf, si, tg = torch.sigmoid(f), torch.sigmoid(i), torch.tanh(gg)
+    di = torch._bw_sigmoid(torch.mul(g, tg), i, si)
+    df = torch._bw_sigmoid(torch.mul(g, c), f, sf)
+    dg = torch._bw_tanh(torch.mul(g, si), gg, tg)
+    shape = gates.shape
+    dgates = torch.add(torch.add(torch._slice_scatter(di, shape, _cell_spec(2, 0, hd)), torch._slice_scatter(df, shape, _cell_spec(2, hd, 2 * hd))),
+                       torch._slice_scatter(dg, shape, _cell_spec(2, 2 * hd, 3 * hd)))
+    return (dgates, torch.mul(g, sf) if c.requires_grad else None)
+
+
+def _lstm_h2_bw(g, args):
+    act, tc, gates, gs, c2, c2s, hd = args
+    if not torch._grad_enabled and g.__class__ is Tensor and g.dtype is gates.dtype:
+        r = torch._k.lstm_cell_bw(2, g._s, act, tc, hd, True)
+        if r is not None:
+            dt = gates.dtype
+            return (Tensor(r[0], gates.shape, dt), Tensor(r[1], c2.shape, dt))
+    gates, c2 = torch._frozen(gates, gs), torch._frozen(c2, c2s)
+    o = torch._slice(gates, _cell_spec(2, 3 * hd, 4 * hd))
+    so, t = torch.sigmoid(o), torch.tanh(c2)
+    do = torch._bw_sigmoid(torch.mul(g, t), o, so)
+    return (torch._slice_scatter(do, gates.shape, _cell_spec(2, 3 * hd, 4 * hd)), torch._bw_tanh(torch.mul(g, so), c2, t))
+
+
+def _gru_fused(gi, gh):
+    dims = _cell_operands(gi, gh, 3)
+    if dims is None:
+        return None
+    r = torch._k.gru_cell(gi._s, gh._s, dims[1])
+    if r is None:
+        return None
+    shape = (dims[0], dims[1])
+    dt = gi.dtype
+    z = Tensor(r[0], shape, dt)
+    n = Tensor(r[1], shape, dt)
+    if torch._grad_enabled and (gi.requires_grad or gh.requires_grad):
+        z.requires_grad = True
+        node = z._node = torch._Node(_gru_z_bw, (gi, gh), "Sigmoid", None, (r[0], gi, gi._s, gh, gh._s, dims[1]))
+        node.diff = True
+        n.requires_grad = True
+        node = n._node = torch._Node(_gru_n_bw, (gi, gh), "Tanh", None, (r[2], r[1], gi, gi._s, gh, gh._s, dims[1]))
+        node.diff = True
+    return z, n
+
+
+def _gru_z_bw(g, args):
+    zs, gi, gis, gh, ghs, hd = args
+    if not torch._grad_enabled and g.__class__ is Tensor and g.dtype is gi.dtype:
+        r = torch._k.gru_cell_bw(4, g._s, zs, None, ghs, hd)
+        if r is not None:
+            dt = gi.dtype
+            return (Tensor(r[0], gi.shape, dt), Tensor(r[1], gh.shape, dt))
+    gi, gh = torch._frozen(gi, gis), torch._frozen(gh, ghs)
+    spec = _cell_spec(2, hd, 2 * hd)
+    iz, hz = torch._slice(gi, spec), torch._slice(gh, spec)
+    az = torch.add(iz, hz)
+    daz = torch._bw_sigmoid(g, az, torch.sigmoid(az))
+    return (torch._slice_scatter(daz, gi.shape, spec), torch._slice_scatter(daz, gh.shape, spec))
+
+
+def _gru_n_bw(g, args):
+    rs, ns, gi, gis, gh, ghs, hd = args
+    if not torch._grad_enabled and g.__class__ is Tensor and g.dtype is gi.dtype:
+        r = torch._k.gru_cell_bw(5, g._s, rs, ns, ghs, hd)
+        if r is not None:
+            dt = gi.dtype
+            return (Tensor(r[0], gi.shape, dt), Tensor(r[1], gh.shape, dt))
+    gi, gh = torch._frozen(gi, gis), torch._frozen(gh, ghs)
+    sr, sn = _cell_spec(2, 0, hd), _cell_spec(2, 2 * hd, 3 * hd)
+    ir, hr, i_n, h_n = torch._slice(gi, sr), torch._slice(gh, sr), torch._slice(gi, sn), torch._slice(gh, sn)
+    ar = torch.add(ir, hr)
+    r = torch.sigmoid(ar)
+    an = torch.add(i_n, torch.mul(r, h_n))
+    dan = torch._bw_tanh(g, an, torch.tanh(an))
+    dar = torch._bw_sigmoid(torch.mul(dan, h_n), ar, r)
+    gshape, hshape = gi.shape, gh.shape
+    return (torch.add(torch._slice_scatter(dar, gshape, sr), torch._slice_scatter(dan, gshape, sn)),
+            torch.add(torch._slice_scatter(dar, hshape, sr), torch._slice_scatter(torch.mul(dan, r), hshape, sn)))
 
 
 def _rnn_step(gi, h, w_hh, b_hh, nonlinearity):

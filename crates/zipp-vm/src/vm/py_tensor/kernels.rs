@@ -68,6 +68,7 @@ const OP_Q_REQUANT: u32 = 28;
 const OP_Q_FAKE: u32 = 29;
 const OP_ARANGE: u32 = 30;
 const OP_OPTIM: u32 = 31;
+const OP_CELL: u32 = 32;
 
 /// `x` as a store into an element of `kind` leaves it: the typed-array
 /// conversion (`helpers_numeric::ta_encode`), read back.
@@ -449,6 +450,7 @@ match op {
         OP_Q_FAKE => Outcome::ran(h.pt_q_fake(a).is_some()),
         OP_ARANGE => Outcome::ran(h.pt_arange(a).is_some()),
         OP_OPTIM => Outcome::ran(h.pt_optim(a).is_some()),
+        OP_CELL => Outcome::ran(h.pt_cell(a).is_some()),
         _ => Outcome::Declined,
 }
 }
@@ -1096,6 +1098,156 @@ pub(crate) trait Kernels: Host {
         for (view, vals) in [(vm2, &m2), (vv2, &v2), (vw2, &w2)] {
             if let Some(view) = view {
                 self.pt_write(view, 0, vals)?;
+            }
+        }
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(kind, H, in0..in3, out0..out3)`: one of tensor.js's fused
+    /// recurrent-cell loops, element for element (each operation in its
+    /// order, rounded where it rounds there; sigmoid `1 / (1 + exp(-x))`).
+    /// Storages are one float32/float64 kind, `[B, k * H]` gate blocks or
+    /// `[B, H]` states; an unused slot is null.
+    /// - 0 `lstmCell`: (G, C) -> (c2, h2, A, T).
+    /// - 1, 2 `lstmCellBw`: (D, A, X) -> (dG, dX); kind 1's dX may be null.
+    /// - 3 `gruCell`: (GI, GH) -> (z, n, r).
+    /// - 4, 5 `gruCellBw`: (D, X, Y, GH) -> (dGI, dGH); kind 4 has no Y.
+    fn pt_cell(&mut self, a: &[Arg]) -> Option<()> {
+        let (kind, h) = (int_arg(a, 0)?, int_arg(a, 1)?);
+        if kind > 5 || h == 0 {
+            return None;
+        }
+        let slot = |i: usize| -> Option<Option<View>> {
+            if arg(a, i).is_null() {
+                return Some(None);
+            }
+            self.pt_view(arg(a, i)).map(Some)
+        };
+        let ins = [slot(2)?, slot(3)?, slot(4)?, slot(5)?];
+        let outs = [slot(6)?, slot(7)?, slot(8)?, slot(9)?];
+        // The gate block width (4H or 3H) and the slot each kind reads its
+        // batch from.
+        let (k, gates) = match kind {
+            0 => (4, ins[0]?),
+            1 | 2 => (4, ins[1]?),
+            3 => (3, ins[0]?),
+            _ => (3, ins[3]?),
+        };
+        let kd = gates.kind;
+        if !matches!(kd, KIND_F32 | KIND_F64) || gates.len % (k * h) != 0 {
+            return None;
+        }
+        let b = gates.len / (k * h);
+        let n = b * h;
+        // Every slot's expected length (0: null); any other storage declines.
+        let (want_in, want_out): ([usize; 4], [usize; 4]) = match kind {
+            0 => ([4 * n, n, 0, 0], [n, n, 4 * n, n]),
+            1 => ([n, 4 * n, n, 0], [4 * n, if outs[1].is_some() { n } else { 0 }, 0, 0]),
+            2 => ([n, 4 * n, n, 0], [4 * n, n, 0, 0]),
+            3 => ([3 * n, 3 * n, 0, 0], [n, n, n, 0]),
+            4 => ([n, n, 0, 3 * n], [3 * n, 3 * n, 0, 0]),
+            _ => ([n, n, n, 3 * n], [3 * n, 3 * n, 0, 0]),
+        };
+        let mut views = Vec::new();
+        for (slots, want) in [(&ins, &want_in), (&outs, &want_out)] {
+            for (v, &len) in slots.iter().zip(want.iter()) {
+                match (v, len) {
+                    (None, 0) => {}
+                    (Some(v), len) if len > 0 && v.kind == kd && v.len == len => views.push(*v),
+                    _ => return None,
+                }
+            }
+        }
+        for (i, x) in views.iter().enumerate() {
+            if views[i + 1..].iter().any(|y| y.buffer == x.buffer) {
+                return None;
+            }
+        }
+        let cost = self.pt_admit(n.saturating_mul(4), n.saturating_mul(24))?;
+        let read = |v: Option<View>| -> Option<Vec<f64>> {
+            match v {
+                Some(v) => self.pt_read_all(v),
+                None => Some(Vec::new()),
+            }
+        };
+        let (i0, i1, i2, i3) = (read(ins[0])?, read(ins[1])?, read(ins[2])?, read(ins[3])?);
+        let mut o: [Vec<f64>; 4] = [zeroed(want_out[0])?, zeroed(want_out[1])?, zeroed(want_out[2])?, zeroed(want_out[3])?];
+        let q = |x: f64| stored(kd, x);
+        let sig = |x: f64| 1.0 / (1.0 + math_unary(M::Exp, -x));
+        let tanh = |x: f64| math_unary(M::Tanh, x);
+        for bi in 0..b {
+            for j in 0..h {
+                let kk = bi * h + j;
+                match kind {
+                    0 => {
+                        let g0 = 4 * h * bi;
+                        let sf = q(sig(i0[g0 + h + j]));
+                        let t1 = q(sf * i1[kk]);
+                        let si = q(sig(i0[g0 + j]));
+                        let tg = q(tanh(i0[g0 + 2 * h + j]));
+                        let c2 = q(t1 + q(si * tg));
+                        let so = q(sig(i0[g0 + 3 * h + j]));
+                        let tc = q(tanh(c2));
+                        o[0][kk] = c2;
+                        o[1][kk] = so * tc;
+                        o[2][g0 + j] = si;
+                        o[2][g0 + h + j] = sf;
+                        o[2][g0 + 2 * h + j] = tg;
+                        o[2][g0 + 3 * h + j] = so;
+                        o[3][kk] = tc;
+                    }
+                    1 => {
+                        let g0 = 4 * h * bi;
+                        let g = i0[kk];
+                        let (si, sf, tg) = (i1[g0 + j], i1[g0 + h + j], i1[g0 + 2 * h + j]);
+                        let (dsf, dsi, dtg) = (q(g * i2[kk]), q(g * tg), q(g * si));
+                        o[0][g0 + j] = q(dsi * q(si * q(1.0 - si)));
+                        o[0][g0 + h + j] = q(dsf * q(sf * q(1.0 - sf)));
+                        o[0][g0 + 2 * h + j] = q(dtg * q(1.0 - q(tg * tg)));
+                        if !o[1].is_empty() {
+                            o[1][kk] = g * sf;
+                        }
+                    }
+                    2 => {
+                        let g0 = 4 * h * bi;
+                        let g = i0[kk];
+                        let (so, tc) = (i1[g0 + 3 * h + j], i2[kk]);
+                        let (dso, dtc) = (q(g * tc), q(g * so));
+                        o[0][g0 + 3 * h + j] = q(dso * q(so * q(1.0 - so)));
+                        o[1][kk] = q(dtc * q(1.0 - q(tc * tc)));
+                    }
+                    3 => {
+                        let g0 = 3 * h * bi;
+                        let r = q(sig(q(i0[g0 + j] + i1[g0 + j])));
+                        o[0][kk] = sig(q(i0[g0 + h + j] + i1[g0 + h + j]));
+                        o[1][kk] = tanh(q(i0[g0 + 2 * h + j] + q(r * i1[g0 + 2 * h + j])));
+                        o[2][kk] = r;
+                    }
+                    4 => {
+                        let g0 = 3 * h * bi;
+                        let z = i1[kk];
+                        let daz = q(i0[kk] * q(z * q(1.0 - z)));
+                        o[0][g0 + h + j] = daz;
+                        o[1][g0 + h + j] = daz;
+                    }
+                    _ => {
+                        let g0 = 3 * h * bi;
+                        let (r, nn) = (i1[kk], i2[kk]);
+                        let dan = q(i0[kk] * q(1.0 - q(nn * nn)));
+                        let dr = q(dan * i3[g0 + 2 * h + j]);
+                        let dar = q(dr * q(r * q(1.0 - r)));
+                        o[0][g0 + j] = dar;
+                        o[1][g0 + j] = dar;
+                        o[0][g0 + 2 * h + j] = dan;
+                        o[1][g0 + 2 * h + j] = dan * r;
+                    }
+                }
+            }
+        }
+        for (view, vals) in outs.iter().zip(o.iter()) {
+            if let Some(view) = view {
+                self.pt_write(*view, 0, vals)?;
             }
         }
         self.pt_charge(cost);

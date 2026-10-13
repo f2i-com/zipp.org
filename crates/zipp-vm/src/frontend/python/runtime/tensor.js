@@ -39,7 +39,7 @@
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
         N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23,
-        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31;
+        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -554,6 +554,157 @@
         }
         written(P);
         return tuple([M2, V2, W2]);
+    }
+    // torch.nn's LSTM and GRU cells: the elementwise part of `_lstm_step`
+    // and `_gru_step` (chunk, sigmoid, tanh, mul, add) and of its backward,
+    // element by element as the composite's ops and their backward
+    // functions compute it: each operation in its order, with its operands
+    // in their places, rounded to the dtype (`q`) where its own kernel's
+    // store rounded it. sigmoid is `1 / (1 + Math.exp(-x))` and tanh
+    // `Math.tanh`, as `unary` computes them; a sigmoid's backward is
+    // g * (o * (1 - o)), a tanh's g * (1 - o * o), a product's the other
+    // factor times g. All storages are one float32/float64 dtype, row-major
+    // [B, k * H] gate blocks or [B, H] states; anything else answers null
+    // and the caller runs the composite. These loops are heavier per element
+    // than one op, so they go native at any size.
+    function cellOk(s, dt, n) {
+        return s !== null && typeof s === "object" && s.cls === Storage && s.dtype === dt && s.base === undefined && s.data.length === n;
+    }
+    function cellDims(G, k, Hv) {
+        // [B, k * H] gates of a float dtype: (B, H), or null.
+        if (G === null || typeof G !== "object" || G.cls !== Storage || (G.dtype !== "float32" && G.dtype !== "float64") || G.base !== undefined || typeof Hv !== "bigint") return null;
+        const H = Number(Hv), n = G.data.length;
+        if (!(H > 0) || n % (k * H) !== 0) return null;
+        return [n / (k * H), H];
+    }
+    // lstm_cell(G, C, H): G the gates [B, 4H] (i, f, g, o), C the cell state
+    // [B, H]: (c2, h2, A, T), where c2 = sigmoid(f) * c + sigmoid(i) * tanh(g),
+    // h2 = sigmoid(o) * tanh(c2), A [B, 4H] holds (sigmoid(i), sigmoid(f),
+    // tanh(g), sigmoid(o)) and T = tanh(c2).
+    function lstmCell(G, C, Hv) {
+        const dims = cellDims(G, 4, Hv);
+        if (dims === null) return null;
+        const B = dims[0], H = dims[1], dt = G.dtype, n = B * H;
+        if (!cellOk(C, dt, n)) return null;
+        const C2 = alloc(dt, n), H2 = alloc(dt, n), A = alloc(dt, 4 * n), T2 = alloc(dt, n);
+        const Gd = G.data, Cd = C.data, c2d = C2.data, h2d = H2.data, Ad = A.data, Td = T2.data, q = dt === "float32" ? fr : same;
+        if (!(NATIVE !== null && NATIVE(N_CELL, 0, H, Gd, Cd, null, null, c2d, h2d, Ad, Td))) {
+            for (let b = 0, k = 0; b < B; b++) {
+                const g0 = 4 * H * b;
+                for (let j = 0; j < H; j++, k++) {
+                    const sf = q(1 / (1 + Math.exp(-Gd[g0 + H + j])));
+                    const t1 = q(sf * Cd[k]);
+                    const si = q(1 / (1 + Math.exp(-Gd[g0 + j])));
+                    const tg = q(Math.tanh(Gd[g0 + 2 * H + j]));
+                    const c2 = q(t1 + q(si * tg));
+                    const so = q(1 / (1 + Math.exp(-Gd[g0 + 3 * H + j])));
+                    const tc = q(Math.tanh(c2));
+                    c2d[k] = c2;
+                    h2d[k] = so * tc;
+                    Ad[g0 + j] = si;
+                    Ad[g0 + H + j] = sf;
+                    Ad[g0 + 2 * H + j] = tg;
+                    Ad[g0 + 3 * H + j] = so;
+                    Td[k] = tc;
+                }
+            }
+        }
+        return tuple([C2, H2, A, T2]);
+    }
+    // lstm_cell_bw(kind, D, A, X, H, want): the gradients the composite's
+    // backward gives the gates [B, 4H] and one state. kind 1: D the
+    // gradient of c2, X the old cell state c; (dG with zeros in the o
+    // block, dc or null unless `want`). kind 2: D the gradient of h2, X the
+    // T of the forward; (dG with zeros outside the o block, dc2).
+    function lstmCellBw(kind, D, A, X, Hv, want) {
+        const dims = cellDims(A, 4, Hv);
+        if (dims === null || (kind !== 1n && kind !== 2n)) return null;
+        const B = dims[0], H = dims[1], dt = A.dtype, n = B * H;
+        if (!cellOk(D, dt, n) || !cellOk(X, dt, n)) return null;
+        const wantX = kind === 2n || want === true;
+        const DG = alloc(dt, 4 * n), DX = wantX ? alloc(dt, n) : null;
+        const Dd = D.data, Ad = A.data, Xd = X.data, dg = DG.data, dx = wantX ? DX.data : null, q = dt === "float32" ? fr : same;
+        if (!(NATIVE !== null && NATIVE(N_CELL, Number(kind), H, Dd, Ad, Xd, null, dg, dx, null, null))) {
+            for (let b = 0, k = 0; b < B; b++) {
+                const g0 = 4 * H * b;
+                for (let j = 0; j < H; j++, k++) {
+                    const g = Dd[k];
+                    if (kind === 1n) {
+                        const si = Ad[g0 + j], sf = Ad[g0 + H + j], tg = Ad[g0 + 2 * H + j];
+                        const dsf = q(g * Xd[k]), dsi = q(g * tg), dtg = q(g * si);
+                        dg[g0 + j] = q(dsi * q(si * q(1 - si)));
+                        dg[g0 + H + j] = q(dsf * q(sf * q(1 - sf)));
+                        dg[g0 + 2 * H + j] = q(dtg * q(1 - q(tg * tg)));
+                        if (dx !== null) dx[k] = g * sf;
+                    } else {
+                        const so = Ad[g0 + 3 * H + j], tc = Xd[k];
+                        const dso = q(g * tc), dtc = q(g * so);
+                        dg[g0 + 3 * H + j] = q(dso * q(so * q(1 - so)));
+                        dx[k] = q(dtc * q(1 - q(tc * tc)));
+                    }
+                }
+            }
+        }
+        return tuple([DG, DX]);
+    }
+    // gru_cell(GI, GH, H): the input and hidden gates [B, 3H] (r, z, n):
+    // (z, n, r), with r = sigmoid(i_r + h_r), z = sigmoid(i_z + h_z) and
+    // n = tanh(i_n + r * h_n).
+    function gruCell(GI, GH, Hv) {
+        const dims = cellDims(GI, 3, Hv);
+        if (dims === null) return null;
+        const B = dims[0], H = dims[1], dt = GI.dtype, n = B * H;
+        if (!cellOk(GH, dt, 3 * n) || GH === GI) return null;
+        const Z = alloc(dt, n), N = alloc(dt, n), R = alloc(dt, n);
+        const a = GI.data, h = GH.data, zd = Z.data, nd = N.data, rd = R.data, q = dt === "float32" ? fr : same;
+        if (!(NATIVE !== null && NATIVE(N_CELL, 3, H, a, h, null, null, zd, nd, rd, null))) {
+            for (let b = 0, k = 0; b < B; b++) {
+                const g0 = 3 * H * b;
+                for (let j = 0; j < H; j++, k++) {
+                    const r = q(1 / (1 + Math.exp(-q(a[g0 + j] + h[g0 + j]))));
+                    zd[k] = 1 / (1 + Math.exp(-q(a[g0 + H + j] + h[g0 + H + j])));
+                    nd[k] = Math.tanh(q(a[g0 + 2 * H + j] + q(r * h[g0 + 2 * H + j])));
+                    rd[k] = r;
+                }
+            }
+        }
+        return tuple([Z, N, R]);
+    }
+    // gru_cell_bw(kind, D, X, Y, GH, H): the gradients the composite's
+    // backward gives the input and hidden gates [B, 3H]: (dGI, dGH). kind 4:
+    // D the gradient of z, X = z (zeros outside the z blocks). kind 5: D the
+    // gradient of n, X = r, Y = n, GH the hidden gates (zeros in the z
+    // blocks).
+    function gruCellBw(kind, D, X, Y, GH, Hv) {
+        const dims = cellDims(GH, 3, Hv);
+        if (dims === null || (kind !== 4n && kind !== 5n)) return null;
+        const B = dims[0], H = dims[1], dt = GH.dtype, n = B * H;
+        if (!cellOk(D, dt, n) || !cellOk(X, dt, n) || (kind === 5n && !cellOk(Y, dt, n))) return null;
+        const DI = alloc(dt, 3 * n), DH = alloc(dt, 3 * n);
+        const Dd = D.data, Xd = X.data, Yd = kind === 5n ? Y.data : null, hd = GH.data, di = DI.data, dh = DH.data, q = dt === "float32" ? fr : same;
+        if (!(NATIVE !== null && NATIVE(N_CELL, Number(kind), H, Dd, Xd, Yd, hd, di, dh, null, null))) {
+            for (let b = 0, k = 0; b < B; b++) {
+                const g0 = 3 * H * b;
+                for (let j = 0; j < H; j++, k++) {
+                    const g = Dd[k];
+                    if (kind === 4n) {
+                        const z = Xd[k], daz = q(g * q(z * q(1 - z)));
+                        di[g0 + H + j] = daz;
+                        dh[g0 + H + j] = daz;
+                    } else {
+                        const r = Xd[k], nn = Yd[k];
+                        const dan = q(g * q(1 - q(nn * nn)));
+                        const dr = q(dan * hd[g0 + 2 * H + j]);
+                        const dar = q(dr * q(r * q(1 - r)));
+                        di[g0 + j] = dar;
+                        dh[g0 + j] = dar;
+                        di[g0 + 2 * H + j] = dan;
+                        dh[g0 + 2 * H + j] = dan * r;
+                    }
+                }
+            }
+        }
+        return tuple([DI, DH]);
     }
     // A shape tuple the caller passed in, when the result has exactly that
     // shape: the kernel hands it back instead of building an equal one.
@@ -3616,6 +3767,12 @@
         // optim_step(kind, flags, P, G, M, V, W, scalars): `optimStep`; the
         // new state storages, or None when it did not run (nothing written).
         fn("optim_step", 8, (a) => optimStep(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]));
+        // The fused recurrent cells (`lstmCell`, `gruCell` and their backward):
+        // each answers its storages, or None (the caller runs the composite).
+        fn("lstm_cell", 3, (a) => lstmCell(a[0], a[1], a[2]));
+        fn("lstm_cell_bw", 6, (a) => lstmCellBw(a[0], a[1], a[2], a[3], a[4], a[5]));
+        fn("gru_cell", 3, (a) => gruCell(a[0], a[1], a[2]));
+        fn("gru_cell_bw", 6, (a) => gruCellBw(a[0], a[1], a[2], a[3], a[4], a[5]));
         fn("axpy", 3, (a) => {
             const alpha = num(a[0]), xs = a[1], ys = a[2];
             if (!isStorage(xs) || !isStorage(ys)) {
