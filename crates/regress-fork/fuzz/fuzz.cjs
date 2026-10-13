@@ -85,7 +85,10 @@ function runAll(spec, cases, dir, tag) {
     if (done) break;
     const abortAt = start + last + 1;
     if (abortAt < cases.length) {
-      const why = (r.out.split(/\r?\n/).filter(l => l && !/^\d+:/.test(l)).join(' ') + ' ' + r.err).trim().replace(/\s+/g, ' ').slice(0, 300);
+      // The batch file's name is the engine's own: leave it out, so two
+      // engines that abort the same way print the same.
+      const why = (r.out.split(/\r?\n/).filter(l => l && !/^\d+:/.test(l)).join(' ') + ' ' + r.err)
+        .split(file).join('<batch>').trim().replace(/\s+/g, ' ').slice(0, 300);
       results[abortAt] = r.timedOut ? ' TIMEOUT' : ' ABORT ' + why;
     }
     start = abortAt + 1;
