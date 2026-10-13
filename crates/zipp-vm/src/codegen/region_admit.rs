@@ -750,6 +750,8 @@ pub(crate) fn region_op_admitted(
         // properties, through `jit_obj_init_ic` with the call protocol (the
         // spread's getters are user code). MEM path only.
         Instr::ObjectSpread { .. } if const_strs.is_some() => {}
+        // A method naming its own class: `jit_load_class_value_ic`. MEM path.
+        Instr::LoadClassValue { .. } if const_strs.is_some() => {}
         Instr::InitDataProp { name, .. } if const_strs.is_some() && name <= 0xFF_FFFF => {}
         // Array and object literals: the helpers Tier C calls (allocation is
         // a safe point; the emitter refetches after it).

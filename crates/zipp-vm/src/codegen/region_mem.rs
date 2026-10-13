@@ -3875,6 +3875,24 @@ pub(crate) fn compile_region_mem(
                     ta_refetch,
                 );
             }
+            Instr::LoadClassValue { dst, class_id } if !py => {
+                // `jit_load_class_value_ic`: the class binding, or its TDZ
+                // ReferenceError through the call protocol.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_load_class_value_ic as usize,
+                    packed_fip,
+                    class_id as u64,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
             Instr::ToStr { dst, a } if !py => {
                 // `${a}`: `jit_to_str_ic`, with the call protocol.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;

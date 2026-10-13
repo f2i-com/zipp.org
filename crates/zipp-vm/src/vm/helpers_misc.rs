@@ -1168,6 +1168,39 @@ pub(crate) extern "win64" fn jit_obj_init_ic(
     })
 }
 
+/// Win64 helper for `LoadClassValue` (a method naming its own class, as in
+/// `return new Vec(...)` inside `class Vec`) in a compiled region or Tier C
+/// body: `class_values[packed_args]`, through a decorator's replacement, as
+/// the interpreter's arm reads it. Before the class value exists (its TDZ)
+/// the ReferenceError is thrown through the call protocol.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_load_class_value_ic(
+    vm: *mut core::ffi::c_void,
+    _caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        match vm.class_values.get(packed_args as usize).copied().flatten() {
+            Some(v) => match vm.heap.get(v.heap_index()) {
+                HeapObj::Class(c) => match &c.dec {
+                    Some(d) if d.replacement.is_heap() => d.replacement.bits(),
+                    _ => v.bits(),
+                },
+                _ => v.bits(),
+            },
+            None => vm.jit_thrown_to_sentinel(Thrown(
+                "ReferenceError: class binding accessed before initialization".into(),
+            )),
+        }
+    })
+}
+
 /// Win64 helper for `ToStr` (a template literal's `${v}`) in a compiled region
 /// or Tier C body: `Vm::to_str_value` on register `packed_args & 0xFFFF`. An
 /// object's `toString`/`valueOf` (or `@@toPrimitive`) is user code, so the

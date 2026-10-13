@@ -1053,7 +1053,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         // FuncProtos already obey these bounds; revalidate them here so a
         // malformed internal proto declines at the final native-code boundary.
         if !tierc_operands_in_bounds(instr, proto.reg_count, proto.code.len()) {
-            reject!("[tierC-reject] malformed operands at ip {ip}");
+            reject!("[tierC-reject] malformed operands at ip {ip}: {instr:?}");
             continue;
         }
         if py && (py_op_edges(instr).is_some() || py_body_op(instr)) {
@@ -1308,6 +1308,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             Instr::InstanceOfDyn { .. } => {}
             // `${v}`: the conversion's helper, with the call protocol.
             Instr::ToStr { .. } => {}
+            // A method naming its own class (`new C(...)` inside `class C`):
+            // the binding's helper, with the call protocol for its TDZ.
+            Instr::LoadClassValue { .. } => {}
             // Proper-tail-call PREFIX: the compiler always emits `TailCall`
             // immediately before an ordinary `Call`+`Return` of the same site
             // (compile/bindings.rs, compile/exprs.rs), and the interpreter's
@@ -1733,6 +1736,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             } => (Uses::range(arg_base, argc).plus(callee), Some(dst)),
             Instr::InstanceOfDyn { dst, val, ctor } => (u2(val, ctor), Some(dst)),
             Instr::ToStr { dst, a } => (u1(a), Some(dst)),
+            Instr::LoadClassValue { dst, .. } => (u0(), Some(dst)),
             Instr::CallWithThis {
                 dst,
                 callee,
@@ -5810,6 +5814,24 @@ pub(crate) fn compile_proto_mem(
                 if cross {
                     dynasm!(ops ; => cross_done);
                 }
+            }
+            Instr::LoadClassValue { dst, class_id } => {
+                // The class binding through `jit_load_class_value_ic`; see
+                // the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_load_class_value_ic as usize,
+                    packed_fip,
+                    class_id as u64,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
             }
             Instr::ToStr { dst, a } => {
                 // `${a}` through `jit_to_str_ic`; see the region arm.
