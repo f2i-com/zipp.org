@@ -2188,7 +2188,7 @@ impl<'p> Vm<'p> {
                     Instr::ObjectSpread { target, src } => {
                         let t = self.get(base, target);
                         let s = self.get(base, src);
-                        self.object_assign(&[t, s])?; // mutates target in place
+                        self.object_spread(t, s)?; // defines into the literal in place
                         ip += 1;
                     }
                     Instr::ObjectRest {

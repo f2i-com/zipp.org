@@ -38,6 +38,67 @@ impl<'p> Vm<'p> {
     /// `Object.assign(target, ...sources)`: copy each source's own enumerable
     /// keys (object keys, or an array's index strings) onto `target`; returns
     /// `target`. Primitive (incl. null/undefined) sources contribute nothing.
+    /// `{ ...src }` into `target`, the object literal under construction:
+    /// CopyDataProperties — each own enumerable property of `src`, in
+    /// [[OwnPropertyKeys]] order, its value read by [[Get]] (a getter runs, a
+    /// Proxy's traps fire) — with every value CREATED on the target as an own
+    /// data property (CreateDataPropertyOrThrow). It used to go through
+    /// `Object.assign`, whose [[Set]] let an inherited setter or read-only
+    /// property intercept the copy, and an own `"__proto__"` key of the
+    /// source (a `JSON.parse` result) replace the result's prototype.
+    ///
+    /// A plain source whose properties are all default data, onto an empty
+    /// literal, is copied whole (`ObjMap::spread_copy`).
+    pub(crate) fn object_spread(&mut self, target: Value, src: Value) -> Result<(), Thrown> {
+        if src.is_nullish() {
+            return Ok(());
+        }
+        let ti = target.heap_index();
+        if src.is_heap() && src.heap_index() != ti {
+            let copy = match (self.heap.get(src.heap_index()), self.heap.get(ti)) {
+                (HeapObj::Object(sm), HeapObj::Object(tm))
+                    if !sm.is_ctor
+                        && tm.keys.is_empty()
+                        && tm.extensible
+                        && tm.class.is_none()
+                        && !tm.class_proto =>
+                {
+                    sm.spread_copy()
+                }
+                _ => None,
+            };
+            if let Some(copy) = copy {
+                for &v in copy.vals_slice() {
+                    if v.is_heap() {
+                        self.heap.write_barrier_val(ti, v);
+                    }
+                }
+                if let HeapObj::Object(tm) = self.heap.get_mut(ti) {
+                    tm.assign_spread_copy(copy);
+                }
+                self.heap.bump_version(ti);
+                return Ok(());
+            }
+        }
+        // Everything else: the general CopyDataProperties (getters, proxies,
+        // strings, arrays, symbols, index order), then each property defined.
+        let m = self.with_host_roots(&[target], |vm| vm.copy_data_properties_rest(src, &[]))?;
+        let n = m.keys.len();
+        for i in 0..n {
+            let v = m.val_at(i);
+            if v.is_heap() {
+                self.heap.write_barrier_val(ti, v);
+            }
+            if let HeapObj::Object(tm) = self.heap.get_mut(ti) {
+                tm.define(&m.keys[i], v, crate::heap::PropAttr::data());
+            }
+        }
+        if n > 0 {
+            self.heap.bump_version(ti);
+        }
+        Ok(())
+    }
+
     pub(crate) fn object_assign(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // target = ToObject(arg0): a primitive boxes (so `Object.assign("x")`

@@ -2168,6 +2168,48 @@ impl ObjMap {
         m
     }
 
+    /// The map `{ ...self }` makes when `self`'s properties can be copied as
+    /// they stand: every one a default data property (writable, enumerable,
+    /// configurable) and none naming an element or a symbol, so the keys'
+    /// insertion order is their [[OwnPropertyKeys]] order. The same keys in
+    /// the same order (a planned list is shared, not copied), the same values,
+    /// the same shape and index. `None` otherwise: the caller copies property
+    /// by property.
+    pub(crate) fn spread_copy(&self) -> Option<ObjMap> {
+        if !matches!(self.attrs, PropAttrs::AllData { .. })
+            || self.has_element_key
+            || self.keys.iter().any(|k| k.starts_with("@@"))
+        {
+            return None;
+        }
+        let mut m = ObjMap::new();
+        m.keys = self.keys.clone();
+        m.vals = ValStore::Vec(self.vals_slice().to_vec());
+        m.attrs = PropAttrs::AllData {
+            len: self.keys.len() as u32,
+        };
+        m.shape = self.shape;
+        m.index = self.index.clone();
+        m.planned_append_failed = self.planned_append_failed;
+        Some(m)
+    }
+
+    /// Take `copy` (a [`ObjMap::spread_copy`]) as this empty literal's whole
+    /// property store, keeping its own object-level flags. A slab value cell
+    /// goes home first, as every structural replacement returns it.
+    pub(crate) fn assign_spread_copy(&mut self, copy: ObjMap) {
+        debug_assert!(self.keys.is_empty());
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.vals.strip_slab();
+        let (is_raw_json, sealed, frozen, extensible) =
+            (self.is_raw_json, self.sealed, self.frozen, self.extensible);
+        *self = copy;
+        self.is_raw_json = is_raw_json;
+        self.sealed = sealed;
+        self.frozen = frozen;
+        self.extensible = extensible;
+    }
+
     /// [`ObjMap::with_capacity`] without the key vector: for an instance a
     /// compiled constructor fills through the JIT's add ways, whose keys come
     /// from the shape's shared list (`append_data_shaped`), so a reserved key
