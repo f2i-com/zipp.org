@@ -730,6 +730,12 @@ pub(crate) fn region_op_admitted(
         // A template literal's `${v}`: `jit_to_str_ic`, with the call protocol
         // (an object's `toString` is user code).
         Instr::ToStr { .. } => {}
+        // Array destructuring, array spread and a spread call: the
+        // interpreter's code through `jit_iter_to_array_ic`,
+        // `jit_array_append_ic` and `jit_call_spread_ic`, with the call
+        // protocol (an iterator or the callee is user code). MEM path only.
+        Instr::IterToArray { count, .. } if const_strs.is_some() && count <= 0xFFFF => {}
+        Instr::ArrayAppend { .. } | Instr::CallSpread { .. } if const_strs.is_some() => {}
         // Array and object literals: the helpers Tier C calls (allocation is
         // a safe point; the emitter refetches after it).
         Instr::NewArray { .. }

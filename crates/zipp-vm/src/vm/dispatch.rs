@@ -2040,137 +2040,7 @@ impl<'p> Vm<'p> {
                     Instr::ArrayAppend { arr, val, spread } => {
                         let aidx = self.get(base, arr).heap_index();
                         let vv = self.get(base, val);
-                        // Nursery barrier (holder-grain): the literal under
-                        // construction is normally young, but a spread arm can
-                        // run user code (an iterator), whose safe points can
-                        // promote it mid-build — every later append is then an
-                        // old→young store. Old holder ⇒ one card per epoch.
-                        self.heap.write_barrier(aidx);
-                        if spread {
-                            // Spreading a LIVE-mapped arguments object: refresh
-                            // its dense slots from the formals first (the array
-                            // fast path below clones the dense store directly).
-                            if vv.is_heap() {
-                                self.args_sync_dense(vv.heap_index());
-                            }
-                            // Everything that is NOT one of the four inline fast
-                            // paths below (Array / Set / Str|Cons / Map) is drained
-                            // through the iterator protocol, which raises the
-                            // TypeError when the value has genuinely no
-                            // @@iterator. Naming the kinds explicitly instead left
-                            // `[...new Proxy([1,2],{})]`, `[...new String("ab")]`
-                            // and any object with a user-installed @@iterator
-                            // reporting "not iterable".
-                            // The inline paths stand in for the iterator only
-                            // while it is unobservable: the @@iterator read here
-                            // (GetIterator's one Get) is the kind's intrinsic and
-                            // its %XIteratorPrototype%.next is pristine. A
-                            // replaced @@iterator (own, subclass, patched
-                            // prototype) or a patched `next` spreads through the
-                            // protocol with the method already read.
-                            if vv.is_heap() && !self.builtin_iter_fast(vv, false) {
-                                let m = self.get_prop(vv, "@@iterator")?;
-                                if !self.builtin_iter_pristine(vv, m, false) {
-                                    let elems = self.iterate_with_method(vv, m)?;
-                                    if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                                        dst_items.extend(elems);
-                                    }
-                                    ip += 1;
-                                    continue;
-                                }
-                            }
-                            // A string spreads by CODE POINT, exactly: a lone
-                            // surrogate is its own one-unit string (the lossy
-                            // `char` view made it U+FFFD).
-                            if let Some(elems) = self.string_iter_values(vv, usize::MAX) {
-                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                                    dst_items.extend(elems);
-                                }
-                                ip += 1;
-                                continue;
-                            }
-                            // A TypedArray has no inline arm below: its element
-                            // count is the view's LIVE length (a length-tracking
-                            // view over a grown buffer yields the new elements)
-                            // and a detached or out-of-bounds view is the
-                            // iterator's TypeError, both of which the positional
-                            // walk behind `iterate_to_vec` already gets right.
-                            if vv.is_heap()
-                                && matches!(self.heap.get(vv.heap_index()), HeapObj::TypedArray { .. })
-                            {
-                                let elems = self.positional_iteration_elements(vv)?;
-                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                                    dst_items.extend(elems);
-                                }
-                                ip += 1;
-                                continue;
-                            }
-                            // Materialize the spread source's elements (array/set â†’
-                            // elements; map â†’ [k,v] entries) WITHOUT holding a heap
-                            // borrow across the fresh allocations. A string never
-                            // reaches here: `string_iter_values` above already
-                            // spread it by EXACT code point.
-                            let mut map_pairs: Option<Vec<(Value, Value)>> = None;
-                            let mut array_src: Option<u32> = None;
-                            if vv.is_heap() {
-                                match self.heap.get(vv.heap_index()) {
-                                    // Deferred like the cases below: a hole in the
-                                    // source resolves through the prototype chain,
-                                    // which can run a getter, so it must not happen
-                                    // under this borrow.
-                                    HeapObj::Array(_) => array_src = Some(vv.heap_index()),
-                                    HeapObj::Set(items) => {
-                                        // Skip tombstoned (deleted) slots.
-                                        let elems: Vec<Value> = items
-                                            .iter()
-                                            .copied()
-                                            .filter(|v| !v.is_hole())
-                                            .collect();
-                                        if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
-                                            d.extend(elems);
-                                        }
-                                    }
-                                    HeapObj::Map { keys, vals } => {
-                                        // Skip tombstoned (deleted) entries.
-                                        map_pairs = Some(
-                                            keys.iter()
-                                                .copied()
-                                                .zip(vals.iter().copied())
-                                                .filter(|(k, _)| !k.is_hole())
-                                                .collect(),
-                                        );
-                                    }
-                                    _ => {
-                                        return Err(Thrown(
-                                            "TypeError: spread value is not iterable".into(),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                return Err(Thrown(
-                                    "TypeError: spread value is not iterable".into(),
-                                ));
-                            }
-                            if let Some(src_idx) = array_src {
-                                let elems = self.spread_array_elements(src_idx)?;
-                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                                    dst_items.extend(elems);
-                                }
-                            }
-                            if let Some(pairs) = map_pairs {
-                                let elems: Vec<Value> = pairs
-                                    .into_iter()
-                                    .map(|(k, v)| {
-                                        Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v])))
-                                    })
-                                    .collect();
-                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                                    dst_items.extend(elems);
-                                }
-                            }
-                        } else if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                            dst_items.push(vv);
-                        }
+                        self.array_append_op(aidx, vv, spread)?;
                         ip += 1;
                     }
                     Instr::ArrayRest { dst, src, start } => {
@@ -9968,6 +9838,147 @@ impl<'p> Vm<'p> {
         }
         self.realm_tag_new(v.heap_index());
         v
+    }
+
+    /// `ArrayAppend { arr, val, spread }`: push `vv` onto the array literal
+    /// `aidx` under construction, or spread it (the iterator protocol, or
+    /// one of the inline paths while the iterator is unobservable). Shared by
+    /// the interpreter arm and the loop region's helper.
+    pub(crate) fn array_append_op(
+        &mut self,
+        aidx: u32,
+        vv: Value,
+        spread: bool,
+    ) -> Result<(), Thrown> {
+        // Nursery barrier (holder-grain): the literal under
+        // construction is normally young, but a spread arm can
+        // run user code (an iterator), whose safe points can
+        // promote it mid-build — every later append is then an
+        // old→young store. Old holder ⇒ one card per epoch.
+        self.heap.write_barrier(aidx);
+        if spread {
+            // Spreading a LIVE-mapped arguments object: refresh
+            // its dense slots from the formals first (the array
+            // fast path below clones the dense store directly).
+            if vv.is_heap() {
+                self.args_sync_dense(vv.heap_index());
+            }
+            // Everything that is NOT one of the four inline fast
+            // paths below (Array / Set / Str|Cons / Map) is drained
+            // through the iterator protocol, which raises the
+            // TypeError when the value has genuinely no
+            // @@iterator. Naming the kinds explicitly instead left
+            // `[...new Proxy([1,2],{})]`, `[...new String("ab")]`
+            // and any object with a user-installed @@iterator
+            // reporting "not iterable".
+            // The inline paths stand in for the iterator only
+            // while it is unobservable: the @@iterator read here
+            // (GetIterator's one Get) is the kind's intrinsic and
+            // its %XIteratorPrototype%.next is pristine. A
+            // replaced @@iterator (own, subclass, patched
+            // prototype) or a patched `next` spreads through the
+            // protocol with the method already read.
+            if vv.is_heap() && !self.builtin_iter_fast(vv, false) {
+                let m = self.get_prop(vv, "@@iterator")?;
+                if !self.builtin_iter_pristine(vv, m, false) {
+                    let elems = self.iterate_with_method(vv, m)?;
+                    if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                        dst_items.extend(elems);
+                    }
+                    return Ok(());
+                }
+            }
+            // A string spreads by CODE POINT, exactly: a lone
+            // surrogate is its own one-unit string (the lossy
+            // `char` view made it U+FFFD).
+            if let Some(elems) = self.string_iter_values(vv, usize::MAX) {
+                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                    dst_items.extend(elems);
+                }
+                return Ok(());
+            }
+            // A TypedArray has no inline arm below: its element
+            // count is the view's LIVE length (a length-tracking
+            // view over a grown buffer yields the new elements)
+            // and a detached or out-of-bounds view is the
+            // iterator's TypeError, both of which the positional
+            // walk behind `iterate_to_vec` already gets right.
+            if vv.is_heap()
+                && matches!(self.heap.get(vv.heap_index()), HeapObj::TypedArray { .. })
+            {
+                let elems = self.positional_iteration_elements(vv)?;
+                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                    dst_items.extend(elems);
+                }
+                return Ok(());
+            }
+            // Materialize the spread source's elements (array/set â†’
+            // elements; map â†’ [k,v] entries) WITHOUT holding a heap
+            // borrow across the fresh allocations. A string never
+            // reaches here: `string_iter_values` above already
+            // spread it by EXACT code point.
+            let mut map_pairs: Option<Vec<(Value, Value)>> = None;
+            let mut array_src: Option<u32> = None;
+            if vv.is_heap() {
+                match self.heap.get(vv.heap_index()) {
+                    // Deferred like the cases below: a hole in the
+                    // source resolves through the prototype chain,
+                    // which can run a getter, so it must not happen
+                    // under this borrow.
+                    HeapObj::Array(_) => array_src = Some(vv.heap_index()),
+                    HeapObj::Set(items) => {
+                        // Skip tombstoned (deleted) slots.
+                        let elems: Vec<Value> = items
+                            .iter()
+                            .copied()
+                            .filter(|v| !v.is_hole())
+                            .collect();
+                        if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
+                            d.extend(elems);
+                        }
+                    }
+                    HeapObj::Map { keys, vals } => {
+                        // Skip tombstoned (deleted) entries.
+                        map_pairs = Some(
+                            keys.iter()
+                                .copied()
+                                .zip(vals.iter().copied())
+                                .filter(|(k, _)| !k.is_hole())
+                                .collect(),
+                        );
+                    }
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: spread value is not iterable".into(),
+                        ));
+                    }
+                }
+            } else {
+                return Err(Thrown(
+                    "TypeError: spread value is not iterable".into(),
+                ));
+            }
+            if let Some(src_idx) = array_src {
+                let elems = self.spread_array_elements(src_idx)?;
+                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                    dst_items.extend(elems);
+                }
+            }
+            if let Some(pairs) = map_pairs {
+                let elems: Vec<Value> = pairs
+                    .into_iter()
+                    .map(|(k, v)| {
+                        Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v])))
+                    })
+                    .collect();
+                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                    dst_items.extend(elems);
+                }
+            }
+        } else if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+            dst_items.push(vv);
+        }
+        Ok(())
     }
 
     /// The cell heap-index captured at upvalue slot `idx` of the closure heap

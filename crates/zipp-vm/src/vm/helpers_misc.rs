@@ -1029,6 +1029,97 @@ pub(crate) extern "win64" fn jit_new_ic(
     })
 }
 
+/// Win64 helpers for array destructuring, array spread and a spread call in a
+/// compiled region: `IterToArray` (`packed_args` = `src | count << 16`),
+/// `ArrayAppend` (`arr | val << 16 | spread << 32`; the array's own bits come
+/// back, stored over its register unchanged) and `CallSpread`
+/// (`callee | args << 16`). Each runs the interpreter's code for the op; an
+/// iterator, a getter or the callee is user code, so the call protocol
+/// applies (a throw bails with the exception pending, the site refetches).
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_iter_to_array_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_spread_op_impl(0, caller_base_ptr, packed_args)
+    })
+}
+
+/// Win64 helper for a non-spread `ArrayAppend` (`[a, ...b, x]`'s `x`): push
+/// onto the literal under construction, as the interpreter's arm does. No
+/// user code and no heap allocation, so no call protocol: returns the
+/// array's bits, or `SELF_CALL_DEOPT` for anything but an Array.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_array_append_plain(
+    vm: *mut core::ffi::c_void,
+    arr_bits: u64,
+    val_bits: u64,
+) -> u64 {
+    let arr = Value::from_bits(arr_bits);
+    if !arr.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: exclusive view; the array's Vec is not cached across the call.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = arr.heap_index();
+    if !matches!(vm.heap.get(idx), HeapObj::Array(_)) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // The interpreter's holder-grain barrier (see `Vm::array_append_op`).
+    vm.heap.write_barrier(idx);
+    if let HeapObj::Array(items) = vm.heap.get_mut(idx) {
+        items.push(Value::from_bits(val_bits));
+    }
+    arr_bits
+}
+
+/// See [`jit_iter_to_array_ic`].
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_array_append_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_spread_op_impl(1, caller_base_ptr, packed_args)
+    })
+}
+
+/// See [`jit_iter_to_array_ic`].
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_call_spread_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    _packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_spread_op_impl(2, caller_base_ptr, packed_args)
+    })
+}
+
 /// Win64 helper for `ToStr` (a template literal's `${v}`) in a compiled region
 /// or Tier C body: `Vm::to_str_value` on register `packed_args & 0xFFFF`. An
 /// object's `toString`/`valueOf` (or `@@toPrimitive`) is user code, so the

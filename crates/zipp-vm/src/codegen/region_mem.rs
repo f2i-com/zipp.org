@@ -3720,6 +3720,77 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::IterToArray { dst, src, count } if !py => {
+                // `[a, b] = v`: `jit_iter_to_array_ic`, with the call protocol.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_to_array_ic as usize,
+                    packed_fip,
+                    src as u64 | (count as u64) << 16,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::ArrayAppend { arr, val, spread: false } if !py => {
+                // `[...v, x]`'s `x`: a plain push (`jit_array_append_plain`).
+                // The literal's storage grows, so pinned snapshots are
+                // re-derived as after a push.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(arr)]          // array bits
+                    ; mov r8, [rbx + dreg(val)]           // value bits
+                    ; mov rax, QWORD crate::vm::jit_array_append_plain as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::ArrayAppend { arr, val, spread } if !py => {
+                // `[...v]`: `jit_array_append_ic`, with the call protocol;
+                // the array's own bits come back into its register.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_array_append_ic as usize,
+                    packed_fip,
+                    arr as u64 | (val as u64) << 16 | (spread as u64) << 32,
+                    0,
+                    arr,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::CallSpread { dst, callee, args } if !py => {
+                // `f(...v)`: `jit_call_spread_ic`, with the call protocol.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_call_spread_ic as usize,
+                    packed_fip,
+                    callee as u64 | (args as u64) << 16,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
             Instr::ToStr { dst, a } if !py => {
                 // `${a}`: `jit_to_str_ic`, with the call protocol.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;

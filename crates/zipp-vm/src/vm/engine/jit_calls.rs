@@ -1050,6 +1050,75 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind [`jit_iter_to_array_ic`] (`op` 0),
+    /// [`jit_array_append_ic`] (1) and [`jit_call_spread_ic`] (2). Every
+    /// decline precedes the first effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_spread_op_impl(
+        &mut self,
+        op: u8,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let a = (packed_args & 0xFFFF) as u16;
+        let b = ((packed_args >> 16) & 0xFFFF) as u16;
+        // The array under construction (`ArrayAppend`) and the spread
+        // arguments (`CallSpread`) are compiler-made Arrays; anything else is
+        // malformed bytecode, which declines.
+        let array_reg = match op {
+            1 => Some(a),
+            2 => Some(b),
+            _ => None,
+        };
+        if let Some(r) = array_reg {
+            let v = self.get(base, r);
+            if !v.is_heap() || !matches!(self.heap.get(v.heap_index()), HeapObj::Array(_)) {
+                return SELF_CALL_DEOPT;
+            }
+        }
+        // The window's Values are roots, so the safe point may precede the
+        // operand reads; an op that allocates every iteration (a fresh array)
+        // then cannot starve the collector.
+        self.maybe_gc();
+        self.jit_call_depth += 1;
+        let r = match op {
+            0 => {
+                let s = self.get(base, a);
+                // A LIVE-mapped arguments source: refresh its dense slots
+                // first (the array fast path reads them directly).
+                if s.is_heap() {
+                    self.args_sync_dense(s.heap_index());
+                }
+                self.iter_to_array(s, (packed_args >> 16) as u32)
+            }
+            1 => {
+                let arr = self.get(base, a);
+                let vv = self.get(base, b);
+                self.array_append_op(arr.heap_index(), vv, (packed_args >> 32) & 1 != 0)
+                    .map(|()| arr)
+            }
+            _ => {
+                let callee = self.get(base, a);
+                let args = self.get(base, b);
+                let argv = self.array_snapshot(args.heap_index());
+                self.call_value(callee, Value::UNDEFINED, &argv)
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// The implementation behind [`jit_to_str_ic`]: `to_str_value` on the
     /// caller's register, the result's bits.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
