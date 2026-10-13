@@ -5,7 +5,7 @@
 //! of all Script value tables, so this table serves both properties.
 //!
 //! GENERATED from unicodetables.rs (Unicode 17.0.0); regenerate by unioning
-//! the tables referenced from script_value_ranges() and complementing over
+//! the tables of `SCRIPTS` (unicodetables.rs) and complementing over
 //! U+0000..=U+10FFFF. Vendored patch; see VENDORED.md (B3).
 use crate::codepointset::Interval;
 use crate::packed_intervals::{PackedIntervals, packed_intervals};

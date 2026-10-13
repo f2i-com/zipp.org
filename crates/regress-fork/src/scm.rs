@@ -2,7 +2,7 @@ use crate::bytesearch::{ByteArraySet, ByteSet, SmallArraySet, charset_contains};
 use crate::cursor;
 use crate::cursor::Direction;
 use crate::indexing::{ElementType, InputIndexer};
-use crate::insn::MAX_CHAR_SET_LENGTH;
+use crate::insn::{CompiledRegex, Insn, MAX_CHAR_SET_LENGTH};
 use crate::matchers::CharProperties;
 use crate::types::BracketContents;
 
@@ -144,15 +144,57 @@ impl<Input: InputIndexer, Dir: Direction, ArraySet: SmallArraySet> SingleCharMat
     }
 }
 
-/// A ByteSeq of length <= 4 may match a single char.
-pub struct MatchByteSeq<'a, const N: usize>(pub &'a [u8; N]);
+/// A byte sequence instruction may be the body of a one-character loop: the
+/// UTF-8 encoding of one character (at most four bytes).
+pub struct MatchByteSeq<'a>(pub &'a [u8]);
 
-impl<const N: usize, Input: InputIndexer, Dir: Direction> SingleCharMatcher<Input, Dir>
-    for MatchByteSeq<'_, N>
-{
+impl<Input: InputIndexer, Dir: Direction> SingleCharMatcher<Input, Dir> for MatchByteSeq<'_> {
     #[inline(always)]
     fn matches(&self, input: &Input, dir: Dir, pos: &mut Input::Position) -> bool {
-        debug_assert!(N <= 4, "This looks like it could match more than one char");
-        cursor::try_match_lit(input, dir, pos, self.0)
+        debug_assert!(
+            self.0.len() <= 4,
+            "This looks like it could match more than one char"
+        );
+        input.match_bytes(dir, pos, self.0)
+    }
+}
+
+/// Whichever one-character instruction `insn` is, decided per character: the
+/// body of a one-character loop that runs right to left (in a lookbehind).
+/// One matcher for every body keeps the loop machinery from being built
+/// again, for that direction, for each matcher type above.
+#[derive(Clone, Copy)]
+pub struct Dyn<'a> {
+    pub re: &'a CompiledRegex,
+    pub insn: &'a Insn,
+}
+
+impl<Input: InputIndexer, Dir: Direction> SingleCharMatcher<Input, Dir> for Dyn<'_> {
+    fn matches(&self, input: &Input, dir: Dir, pos: &mut Input::Position) -> bool {
+        match self.insn {
+            &Insn::Char(c) => match <Input::Element as ElementType>::try_from(c) {
+                Some(c) => Char::<Input> { c }.matches(input, dir, pos),
+                None => false,
+            },
+            &Insn::CharICase(c) => match <Input::Element as ElementType>::try_from(c) {
+                Some(c) => CharICase::<Input> { c }.matches(input, dir, pos),
+                None => false,
+            },
+            &Insn::Bracket(idx) => Bracket {
+                bc: &self.re.brackets[idx],
+            }
+            .matches(input, dir, pos),
+            Insn::AsciiBracket(bytes) => MatchByteSet { bytes }.matches(input, dir, pos),
+            Insn::MatchAny => MatchAny::new().matches(input, dir, pos),
+            Insn::MatchAnyExceptLineTerminator => {
+                MatchAnyExceptLineTerminator::new().matches(input, dir, pos)
+            }
+            Insn::CharSet(chars) => CharSet { chars }.matches(input, dir, pos),
+            &Insn::ByteSet2(bytes) => MatchByteArraySet(bytes).matches(input, dir, pos),
+            &Insn::ByteSet3(bytes) => MatchByteArraySet(bytes).matches(input, dir, pos),
+            &Insn::ByteSet4(bytes) => MatchByteArraySet(bytes).matches(input, dir, pos),
+            Insn::ByteSeq(seq) => MatchByteSeq(seq.bytes()).matches(input, dir, pos),
+            _ => unreachable!("Missing SCM"),
+        }
     }
 }

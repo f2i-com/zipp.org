@@ -30,11 +30,11 @@ impl Direction for Backward {
 /// \return whether we match some literal bytes.
 /// If so, update the position. If not, the position is unspecified.
 #[inline(always)]
-pub fn try_match_lit<const N: usize, Input: InputIndexer, Dir: Direction>(
+pub fn try_match_lit<Input: InputIndexer, Dir: Direction>(
     input: &Input,
     dir: Dir,
     pos: &mut Input::Position,
-    bytes: &[u8; N],
+    bytes: &[u8],
 ) -> bool {
     input.match_bytes(dir, pos, bytes)
 }

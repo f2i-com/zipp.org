@@ -131,9 +131,7 @@ to the architecture: regex uses finite automata while regress uses "classical ba
 
 # Architecture
 
-regress has a parser, intermediate representation, optimizer which acts on the IR, bytecode emitter, and two bytecode interpreters, referred to as "backends".
-
-The major interpreter is the "classical backtracking" which uses an explicit backtracking stack, similar to JS implementations. There is also the "PikeVM" pseudo-toy backend which is mainly used for testing and verification.
+regress has a parser, intermediate representation, optimizer which acts on the IR, bytecode emitter, and a bytecode interpreter: a "classical backtracking" matcher with an explicit backtracking stack, similar to JS implementations.
 
 # Crate features
 
@@ -283,5 +281,3 @@ mod unicode;
 mod unicodetables;
 mod unicodetables_unknown;
 
-#[cfg(feature = "backend-pikevm")]
-mod pikevm;

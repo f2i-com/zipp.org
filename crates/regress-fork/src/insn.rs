@@ -6,7 +6,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use std::sync::Arc;
 
 use crate::api;
-use crate::bytesearch::{AsciiBitmap, ByteArraySet, ByteBitmap};
+use crate::bytesearch::{AsciiBitmap, ByteArraySet, ByteBitmap, ByteSearcher};
 use crate::types::{BracketContents, CaptureGroupID, LoopID};
 extern crate memchr;
 use memchr::memmem;
@@ -31,6 +31,33 @@ pub struct LoopFields {
     pub max_iters: usize,
     pub greedy: bool,
     pub exit: JumpTarget,
+}
+
+/// The bytes of a literal byte sequence instruction: one to
+/// MAX_BYTE_SEQ_LENGTH of them, held inline.
+#[derive(Debug, Clone, Copy)]
+pub struct ByteSeq {
+    len: u8,
+    bytes: [u8; MAX_BYTE_SEQ_LENGTH],
+}
+
+impl ByteSeq {
+    /// \return the sequence of `bytes`, which must hold one to
+    /// MAX_BYTE_SEQ_LENGTH bytes.
+    pub fn new(bytes: &[u8]) -> Self {
+        assert!(!bytes.is_empty() && bytes.len() <= MAX_BYTE_SEQ_LENGTH);
+        let mut seq = ByteSeq {
+            len: bytes.len() as u8,
+            bytes: [0; MAX_BYTE_SEQ_LENGTH],
+        };
+        seq.bytes[..bytes.len()].copy_from_slice(bytes);
+        seq
+    }
+
+    #[inline(always)]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,26 +193,46 @@ pub enum Insn {
     ByteSet4(ByteArraySet<[u8; 4]>),
 
     /// Match a sequence of literal bytes.
-    ByteSeq1([u8; 1]),
-    ByteSeq2([u8; 2]),
-    ByteSeq3([u8; 3]),
-    ByteSeq4([u8; 4]),
-    ByteSeq5([u8; 5]),
-    ByteSeq6([u8; 6]),
-    ByteSeq7([u8; 7]),
-    ByteSeq8([u8; 8]),
-    ByteSeq9([u8; 9]),
-    ByteSeq10([u8; 10]),
-    ByteSeq11([u8; 11]),
-    ByteSeq12([u8; 12]),
-    ByteSeq13([u8; 13]),
-    ByteSeq14([u8; 14]),
-    ByteSeq15([u8; 15]),
-    ByteSeq16([u8; 16]),
+    ByteSeq(ByteSeq),
 
     /// An instruction that always fails, which may be produced in weird cases
     /// like an inverted bracket which matches everything.
     JustFail,
+
+    /// The wrapped instruction, run right to left: what a lookbehind's body
+    /// is made of. Only instructions whose effect depends on the direction
+    /// are wrapped (see [`Insn::runs_backward_wrapped`]); anchors, word
+    /// boundaries, jumps, loops and lookarounds read the same either way. The
+    /// matcher runs every other instruction forward, so it exists once per
+    /// input type rather than once per input type and direction.
+    Back(Box<Insn>),
+}
+
+impl Insn {
+    /// Whether this instruction must be wrapped in [`Insn::Back`] inside a
+    /// lookbehind: it consumes input, compares with a capture, or records
+    /// where a capture starts or ends.
+    pub fn runs_backward_wrapped(&self) -> bool {
+        matches!(
+            self,
+            Insn::Char(_)
+                | Insn::CharICase(_)
+                | Insn::MatchAny
+                | Insn::MatchAnyExceptLineTerminator
+                | Insn::Loop1CharBody { .. }
+                | Insn::BeginCaptureGroup(_)
+                | Insn::EndCaptureGroup(_)
+                | Insn::BackRef { .. }
+                | Insn::BackRefMulti { .. }
+                | Insn::Bracket(_)
+                | Insn::AsciiBracket(_)
+                | Insn::CharSet(_)
+                | Insn::ByteSet2(_)
+                | Insn::ByteSet3(_)
+                | Insn::ByteSet4(_)
+                | Insn::ByteSeq(_)
+        )
+    }
 }
 
 /// The peeled prefix start predicate.
@@ -209,6 +256,25 @@ pub enum StartPredicate {
     /// The regex is anchored to the start of the line/string.
     /// This avoids string searching entirely and only tries matching at the beginning.
     StartAnchored,
+}
+
+/// The search for a match's first byte, whichever form it takes. A search
+/// asks once per attempt, so deciding the form there costs next to nothing,
+/// and the search loop exists once per input type instead of once per form.
+impl ByteSearcher for StartPredicate {
+    #[inline(always)]
+    fn find_in(&self, bytes: &[u8]) -> Option<usize> {
+        match self {
+            StartPredicate::Arbitrary => Some(0),
+            StartPredicate::ByteSet1(set) => set.find_in(bytes),
+            StartPredicate::ByteSet2(set) => set.find_in(bytes),
+            StartPredicate::ByteSet3(set) => set.find_in(bytes),
+            StartPredicate::ByteSeq(finder) => finder.find_in(bytes),
+            StartPredicate::ByteBracket(bitmap) => bitmap.find_in(bytes),
+            // An anchored search makes one attempt and never searches.
+            StartPredicate::StartAnchored => Some(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +345,13 @@ impl CompiledRegex {
             }));
 
         for insn in &self.insns {
+            let insn = match insn {
+                Insn::Back(inner) => {
+                    bytes = bytes.saturating_add(core::mem::size_of::<Insn>());
+                    &**inner
+                }
+                insn => insn,
+            };
             if let Insn::BackRefMulti { groups, .. } = insn {
                 bytes =
                     bytes.saturating_add(groups.len().saturating_mul(core::mem::size_of::<u32>()));

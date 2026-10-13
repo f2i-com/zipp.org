@@ -704,8 +704,8 @@ fn table_for(re: &CompiledRegex, insn: &Insn, tables: &mut Vec<[u8; 256]>) -> Op
             build_table(tables, |b| !ASCIICharProperties::is_line_terminator(b))
         }
         // A 1-byte literal consumes exactly one byte, so it is loop-safe.
-        Insn::ByteSeq1(v) => {
-            let b0 = v[0];
+        Insn::ByteSeq(seq) if seq.bytes().len() == 1 => {
+            let b0 = seq.bytes()[0];
             build_table(tables, |b| b == b0)
         }
         _ => return None,
@@ -765,11 +765,6 @@ fn plan(re: &CompiledRegex) -> Option<Plan> {
             i += 1;
             continue;
         }
-        macro_rules! seq {
-            ($v:expr) => {{
-                nodes.push(Node::Seq($v.to_vec()));
-            }};
-        }
         match insn {
             Insn::Goal => nodes.push(Node::Goal),
             Insn::JustFail => nodes.push(Node::JustFail),
@@ -796,21 +791,7 @@ fn plan(re: &CompiledRegex) -> Option<Plan> {
                 });
                 nodes.push(Node::Wb { invert, w });
             }
-            Insn::ByteSeq2(v) => seq!(v),
-            Insn::ByteSeq3(v) => seq!(v),
-            Insn::ByteSeq4(v) => seq!(v),
-            Insn::ByteSeq5(v) => seq!(v),
-            Insn::ByteSeq6(v) => seq!(v),
-            Insn::ByteSeq7(v) => seq!(v),
-            Insn::ByteSeq8(v) => seq!(v),
-            Insn::ByteSeq9(v) => seq!(v),
-            Insn::ByteSeq10(v) => seq!(v),
-            Insn::ByteSeq11(v) => seq!(v),
-            Insn::ByteSeq12(v) => seq!(v),
-            Insn::ByteSeq13(v) => seq!(v),
-            Insn::ByteSeq14(v) => seq!(v),
-            Insn::ByteSeq15(v) => seq!(v),
-            Insn::ByteSeq16(v) => seq!(v),
+            Insn::ByteSeq(v) => nodes.push(Node::Seq(v.bytes().to_vec())),
             // Everything else — EnterLoop/LoopAgain (general loops with
             // loop-data bookkeeping and the ES empty-loop rule), BackRef,
             // BackRefMulti, Lookahead, Lookbehind — stays interpreted.
@@ -860,7 +841,9 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
     enum Handler {
         Alt(DynamicLabel, DynamicLabel),
         Greedy(DynamicLabel, DynamicLabel),
-        Lazy(DynamicLabel, DynamicLabel),
+        /// A lazy one-character loop's entry: handler, continuation, and
+        /// the body's byte table.
+        Lazy(DynamicLabel, DynamicLabel, usize),
     }
     let mut handlers: Vec<Handler> = Vec::new();
 
@@ -996,18 +979,21 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
                 hint,
             } => {
                 // Scan forward while the byte matches, bounded by
-                // min(len, pos + max). rax = cursor; after the scan,
+                // min(len, pos + max), or by min(len, pos + min) for a lazy
+                // loop, which takes further iterations only when the
+                // matcher backtracks into it. rax = cursor; after the scan,
                 // rdx = min_pos, rax = max_pos (mirrors run_scm_loop).
+                let scan = if greedy { max } else { min };
                 dynasm!(ops
                     ; lea r9, [=>tbl_labels[t]]
                     ; mov rax, rbx
                 );
-                if max >= i32::MAX as u64 {
+                if scan >= i32::MAX as u64 {
                     dynasm!(ops ; mov rcx, r13);
                 } else {
                     dynasm!(ops
                         ; mov rcx, rbx
-                        ; add rcx, max as i32
+                        ; add rcx, scan as i32
                         ; cmp rcx, r13
                         ; jbe >limok
                         ; mov rcx, r13
@@ -1035,7 +1021,43 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
                 } else {
                     dynasm!(ops ; mov rdx, rbx);
                 }
-                if greedy && possessive {
+                if !greedy {
+                    // Lazy (mirrors run_scm_loop): rax == rdx == min_pos.
+                    // r8 = the last position an iteration may end at,
+                    // min(len, start + max). The entry holds the position
+                    // reached and r8; it is pushed only if one more
+                    // iteration can match here.
+                    if max >= i32::MAX as u64 {
+                        dynasm!(ops ; mov r8, r13);
+                    } else {
+                        dynasm!(ops
+                            ; mov r8, rbx
+                            ; add r8, max as i32
+                            ; cmp r8, r13
+                            ; jbe >lazylim
+                            ; mov r8, r13
+                            ; lazylim:
+                        );
+                    }
+                    let h = ops.new_dynamic_label();
+                    handlers.push(Handler::Lazy(h, labels[ip + 2], t));
+                    dynasm!(ops
+                        ; cmp rdx, r8
+                        ; jae >nolazy
+                        ; movzx ecx, BYTE [r12 + rdx]
+                        ; cmp BYTE [r9 + rcx], 0
+                        ; je >nolazy
+                        ; cmp r14, r15
+                        ; ja ->overflow
+                        ; lea rcx, [=>h]
+                        ; mov [r14], rcx
+                        ; mov [r14 + 8], rdx
+                        ; mov [r14 + 16], r8
+                        ; add r14, 32
+                        ; nolazy:
+                        ; mov rbx, rdx
+                    );
+                } else if possessive {
                     // Provably-dead backtrack entry elided (possessify.rs);
                     // record the run end for the failed-attempt skip.
                     if hint {
@@ -1045,11 +1067,7 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
                 } else {
                     // rax/rdx are live (max_pos/min_pos): push via r8.
                     let h = ops.new_dynamic_label();
-                    if greedy {
-                        handlers.push(Handler::Greedy(h, labels[ip + 2]));
-                    } else {
-                        handlers.push(Handler::Lazy(h, labels[ip + 2]));
-                    }
+                    handlers.push(Handler::Greedy(h, labels[ip + 2]));
                     dynasm!(ops
                         ; cmp rdx, rax
                         ; je >nopush
@@ -1062,11 +1080,7 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
                         ; add r14, 32
                         ; nopush:
                     );
-                    if greedy {
-                        dynasm!(ops ; mov rbx, rax);
-                    } else {
-                        dynasm!(ops ; mov rbx, rdx);
-                    }
+                    dynasm!(ops ; mov rbx, rax);
                 }
             }
             &Node::Jump(t) => {
@@ -1228,21 +1242,26 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
                     ; jmp =>cont
                 );
             }
-            // NonGreedyLoop1Char: advance min one byte toward max, or pop.
-            Handler::Lazy(h, cont) => {
+            // NonGreedyLoop1Char: one more iteration at the position
+            // reached, if it is below the limit and the byte matches the
+            // body; otherwise pop.
+            Handler::Lazy(h, cont, t) => {
                 dynasm!(ops
                     ; =>h
                     ; mov rax, [r14 - 24]
-                    ; mov rcx, [r14 - 16]
-                    ; cmp rax, rcx
-                    ; jne >step
-                    ; sub r14, 32
-                    ; jmp ->bt
-                    ; step:
+                    ; cmp rax, [r14 - 16]
+                    ; jae >pop
+                    ; lea r9, [=>tbl_labels[t]]
+                    ; movzx edx, BYTE [r12 + rax]
+                    ; cmp BYTE [r9 + rdx], 0
+                    ; je >pop
                     ; add rax, 1
                     ; mov [r14 - 24], rax
                     ; mov rbx, rax
                     ; jmp =>cont
+                    ; pop:
+                    ; sub r14, 32
+                    ; jmp ->bt
                 );
             }
         }

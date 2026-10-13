@@ -3,7 +3,7 @@ use crate::codepointset::Interval;
 use crate::packed_intervals::direct_intervals;
 use crate::packed_intervals::{PackedIntervals, packed_intervals};
 use crate::packed_strings::{self, Generated, StringSet};
-use crate::unicode::FoldRange;
+use crate::unicode::{FoldRange, lookup_property_name};
 
 const ALPHABETIC: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
@@ -769,11 +769,6 @@ const ALPHABETIC: PackedIntervals = packed_intervals![
     Interval::new(201552, 210041),
 ];
 
-/// Return the code point ranges of the 'Alphabetic' Unicode property.
-pub(crate) fn alphabetic_ranges() -> &'static PackedIntervals {
-    &ALPHABETIC
-}
-
 const CASE_IGNORABLE: PackedIntervals = packed_intervals![
     Interval::new(39, 39),
     Interval::new(46, 46),
@@ -1241,11 +1236,6 @@ const CASE_IGNORABLE: PackedIntervals = packed_intervals![
     Interval::new(917760, 917999),
 ];
 
-/// Return the code point ranges of the 'Case_Ignorable' Unicode property.
-pub(crate) fn case_ignorable_ranges() -> &'static PackedIntervals {
-    &CASE_IGNORABLE
-}
-
 const CASED: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
     Interval::new(97, 122),
@@ -1406,11 +1396,6 @@ const CASED: PackedIntervals = packed_intervals![
     Interval::new(127312, 127337),
     Interval::new(127344, 127369),
 ];
-
-/// Return the code point ranges of the 'Cased' Unicode property.
-pub(crate) fn cased_ranges() -> &'static PackedIntervals {
-    &CASED
-}
 
 const CHANGES_WHEN_CASEFOLDED: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
@@ -2045,11 +2030,6 @@ const CHANGES_WHEN_CASEFOLDED: PackedIntervals = packed_intervals![
     Interval::new(125184, 125217),
 ];
 
-/// Return the code point ranges of the 'Changes_When_Casefolded' Unicode property.
-pub(crate) fn changes_when_casefolded_ranges() -> &'static PackedIntervals {
-    &CHANGES_WHEN_CASEFOLDED
-}
-
 const CHANGES_WHEN_CASEMAPPED: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
     Interval::new(97, 122),
@@ -2183,11 +2163,6 @@ const CHANGES_WHEN_CASEMAPPED: PackedIntervals = packed_intervals![
     Interval::new(93883, 93907),
     Interval::new(125184, 125251),
 ];
-
-/// Return the code point ranges of the 'Changes_When_Casemapped' Unicode property.
-pub(crate) fn changes_when_casemapped_ranges() -> &'static PackedIntervals {
-    &CHANGES_WHEN_CASEMAPPED
-}
 
 const CHANGES_WHEN_LOWERCASED: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
@@ -2809,11 +2784,6 @@ const CHANGES_WHEN_LOWERCASED: PackedIntervals = packed_intervals![
     Interval::new(93856, 93880),
     Interval::new(125184, 125217),
 ];
-
-/// Return the code point ranges of the 'Changes_When_Lowercased' Unicode property.
-pub(crate) fn changes_when_lowercased_ranges() -> &'static PackedIntervals {
-    &CHANGES_WHEN_LOWERCASED
-}
 
 const CHANGES_WHEN_TITLECASED: PackedIntervals = packed_intervals![
     Interval::new(97, 122),
@@ -3450,11 +3420,6 @@ const CHANGES_WHEN_TITLECASED: PackedIntervals = packed_intervals![
     Interval::new(93883, 93907),
     Interval::new(125218, 125251),
 ];
-
-/// Return the code point ranges of the 'Changes_When_Titlecased' Unicode property.
-pub(crate) fn changes_when_titlecased_ranges() -> &'static PackedIntervals {
-    &CHANGES_WHEN_TITLECASED
-}
 
 const CHANGES_WHEN_UPPERCASED: PackedIntervals = packed_intervals![
     Interval::new(97, 122),
@@ -4093,11 +4058,6 @@ const CHANGES_WHEN_UPPERCASED: PackedIntervals = packed_intervals![
     Interval::new(125218, 125251),
 ];
 
-/// Return the code point ranges of the 'Changes_When_Uppercased' Unicode property.
-pub(crate) fn changes_when_uppercased_ranges() -> &'static PackedIntervals {
-    &CHANGES_WHEN_UPPERCASED
-}
-
 const DEFAULT_IGNORABLE_CODE_POINT: PackedIntervals = packed_intervals![
     Interval::new(173, 173),
     Interval::new(847, 847),
@@ -4117,11 +4077,6 @@ const DEFAULT_IGNORABLE_CODE_POINT: PackedIntervals = packed_intervals![
     Interval::new(119155, 119162),
     Interval::new(917504, 921599),
 ];
-
-/// Return the code point ranges of the 'Default_Ignorable_Code_Point' Unicode property.
-pub(crate) fn default_ignorable_code_point_ranges() -> &'static PackedIntervals {
-    &DEFAULT_IGNORABLE_CODE_POINT
-}
 
 const GRAPHEME_BASE: PackedIntervals = packed_intervals![
     Interval::new(32, 126),
@@ -5030,11 +4985,6 @@ const GRAPHEME_BASE: PackedIntervals = packed_intervals![
     Interval::new(201552, 210041),
 ];
 
-/// Return the code point ranges of the 'Grapheme_Base' Unicode property.
-pub(crate) fn grapheme_base_ranges() -> &'static PackedIntervals {
-    &GRAPHEME_BASE
-}
-
 const GRAPHEME_EXTEND: PackedIntervals = packed_intervals![
     Interval::new(768, 879),
     Interval::new(1155, 1161),
@@ -5420,11 +5370,6 @@ const GRAPHEME_EXTEND: PackedIntervals = packed_intervals![
     Interval::new(917536, 917631),
     Interval::new(917760, 917999),
 ];
-
-/// Return the code point ranges of the 'Grapheme_Extend' Unicode property.
-pub(crate) fn grapheme_extend_ranges() -> &'static PackedIntervals {
-    &GRAPHEME_EXTEND
-}
 
 static ID_CONTINUE: PackedIntervals = direct_intervals![
     Interval::new(48, 57),
@@ -7069,11 +7014,6 @@ const MATH: PackedIntervals = packed_intervals![
     Interval::new(129232, 129240),
 ];
 
-/// Return the code point ranges of the 'Math' Unicode property.
-pub(crate) fn math_ranges() -> &'static PackedIntervals {
-    &MATH
-}
-
 const XID_CONTINUE: PackedIntervals = packed_intervals![
     Interval::new(48, 57),
     Interval::new(65, 90),
@@ -7883,11 +7823,6 @@ const XID_CONTINUE: PackedIntervals = packed_intervals![
     Interval::new(917760, 917999),
 ];
 
-/// Return the code point ranges of the 'XID_Continue' Unicode property.
-pub(crate) fn xid_continue_ranges() -> &'static PackedIntervals {
-    &XID_CONTINUE
-}
-
 const XID_START: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
     Interval::new(97, 122),
@@ -8582,21 +8517,11 @@ const XID_START: PackedIntervals = packed_intervals![
     Interval::new(201552, 210041),
 ];
 
-/// Return the code point ranges of the 'XID_Start' Unicode property.
-pub(crate) fn xid_start_ranges() -> &'static PackedIntervals {
-    &XID_START
-}
-
 const ASCII_HEX_DIGIT: PackedIntervals = packed_intervals![
     Interval::new(48, 57),
     Interval::new(65, 70),
     Interval::new(97, 102),
 ];
-
-/// Return the code point ranges of the 'ASCII_Hex_Digit' Unicode property.
-pub(crate) fn ascii_hex_digit_ranges() -> &'static PackedIntervals {
-    &ASCII_HEX_DIGIT
-}
 
 const BIDI_CONTROL: PackedIntervals = packed_intervals![
     Interval::new(1564, 1564),
@@ -8604,11 +8529,6 @@ const BIDI_CONTROL: PackedIntervals = packed_intervals![
     Interval::new(8234, 8238),
     Interval::new(8294, 8297),
 ];
-
-/// Return the code point ranges of the 'Bidi_Control' Unicode property.
-pub(crate) fn bidi_control_ranges() -> &'static PackedIntervals {
-    &BIDI_CONTROL
-}
 
 const DASH: PackedIntervals = packed_intervals![
     Interval::new(45, 45),
@@ -8637,11 +8557,6 @@ const DASH: PackedIntervals = packed_intervals![
     Interval::new(69293, 69293),
 ];
 
-/// Return the code point ranges of the 'Dash' Unicode property.
-pub(crate) fn dash_ranges() -> &'static PackedIntervals {
-    &DASH
-}
-
 const DEPRECATED: PackedIntervals = packed_intervals![
     Interval::new(329, 329),
     Interval::new(1651, 1651),
@@ -8652,11 +8567,6 @@ const DEPRECATED: PackedIntervals = packed_intervals![
     Interval::new(9001, 9002),
     Interval::new(917505, 917505),
 ];
-
-/// Return the code point ranges of the 'Deprecated' Unicode property.
-pub(crate) fn deprecated_ranges() -> &'static PackedIntervals {
-    &DEPRECATED
-}
 
 const DIACRITIC: PackedIntervals = packed_intervals![
     Interval::new(94, 94),
@@ -8881,11 +8791,6 @@ const DIACRITIC: PackedIntervals = packed_intervals![
     Interval::new(125256, 125258),
 ];
 
-/// Return the code point ranges of the 'Diacritic' Unicode property.
-pub(crate) fn diacritic_ranges() -> &'static PackedIntervals {
-    &DIACRITIC
-}
-
 const EXTENDER: PackedIntervals = packed_intervals![
     Interval::new(183, 183),
     Interval::new(720, 721),
@@ -8932,11 +8837,6 @@ const EXTENDER: PackedIntervals = packed_intervals![
     Interval::new(125252, 125254),
 ];
 
-/// Return the code point ranges of the 'Extender' Unicode property.
-pub(crate) fn extender_ranges() -> &'static PackedIntervals {
-    &EXTENDER
-}
-
 const HEX_DIGIT: PackedIntervals = packed_intervals![
     Interval::new(48, 57),
     Interval::new(65, 70),
@@ -8946,28 +8846,13 @@ const HEX_DIGIT: PackedIntervals = packed_intervals![
     Interval::new(65345, 65350),
 ];
 
-/// Return the code point ranges of the 'Hex_Digit' Unicode property.
-pub(crate) fn hex_digit_ranges() -> &'static PackedIntervals {
-    &HEX_DIGIT
-}
-
 const IDS_BINARY_OPERATOR: PackedIntervals = packed_intervals![
     Interval::new(12272, 12273),
     Interval::new(12276, 12285),
     Interval::new(12783, 12783),
 ];
 
-/// Return the code point ranges of the 'IDS_Binary_Operator' Unicode property.
-pub(crate) fn ids_binary_operator_ranges() -> &'static PackedIntervals {
-    &IDS_BINARY_OPERATOR
-}
-
 const IDS_TRINARY_OPERATOR: PackedIntervals = packed_intervals![Interval::new(12274, 12275)];
-
-/// Return the code point ranges of the 'IDS_Trinary_Operator' Unicode property.
-pub(crate) fn ids_trinary_operator_ranges() -> &'static PackedIntervals {
-    &IDS_TRINARY_OPERATOR
-}
 
 const IDEOGRAPHIC: PackedIntervals = packed_intervals![
     Interval::new(12294, 12295),
@@ -8993,17 +8878,7 @@ const IDEOGRAPHIC: PackedIntervals = packed_intervals![
     Interval::new(201552, 210041),
 ];
 
-/// Return the code point ranges of the 'Ideographic' Unicode property.
-pub(crate) fn ideographic_ranges() -> &'static PackedIntervals {
-    &IDEOGRAPHIC
-}
-
 const JOIN_CONTROL: PackedIntervals = packed_intervals![Interval::new(8204, 8205)];
-
-/// Return the code point ranges of the 'Join_Control' Unicode property.
-pub(crate) fn join_control_ranges() -> &'static PackedIntervals {
-    &JOIN_CONTROL
-}
 
 const LOGICAL_ORDER_EXCEPTION: PackedIntervals = packed_intervals![
     Interval::new(3648, 3652),
@@ -9014,11 +8889,6 @@ const LOGICAL_ORDER_EXCEPTION: PackedIntervals = packed_intervals![
     Interval::new(43705, 43705),
     Interval::new(43707, 43708),
 ];
-
-/// Return the code point ranges of the 'Logical_Order_Exception' Unicode property.
-pub(crate) fn logical_order_exception_ranges() -> &'static PackedIntervals {
-    &LOGICAL_ORDER_EXCEPTION
-}
 
 const LOWERCASE: PackedIntervals = packed_intervals![
     Interval::new(97, 122),
@@ -9700,11 +9570,6 @@ const LOWERCASE: PackedIntervals = packed_intervals![
     Interval::new(125218, 125251),
 ];
 
-/// Return the code point ranges of the 'Lowercase' Unicode property.
-pub(crate) fn lowercase_ranges() -> &'static PackedIntervals {
-    &LOWERCASE
-}
-
 const NONCHARACTER_CODE_POINT: PackedIntervals = packed_intervals![
     Interval::new(64976, 65007),
     Interval::new(65534, 65535),
@@ -9725,11 +9590,6 @@ const NONCHARACTER_CODE_POINT: PackedIntervals = packed_intervals![
     Interval::new(1048574, 1048575),
     Interval::new(1114110, 1114111),
 ];
-
-/// Return the code point ranges of the 'Noncharacter_Code_Point' Unicode property.
-pub(crate) fn noncharacter_code_point_ranges() -> &'static PackedIntervals {
-    &NONCHARACTER_CODE_POINT
-}
 
 const PATTERN_SYNTAX: PackedIntervals = packed_intervals![
     Interval::new(33, 47),
@@ -9762,11 +9622,6 @@ const PATTERN_SYNTAX: PackedIntervals = packed_intervals![
     Interval::new(65093, 65094),
 ];
 
-/// Return the code point ranges of the 'Pattern_Syntax' Unicode property.
-pub(crate) fn pattern_syntax_ranges() -> &'static PackedIntervals {
-    &PATTERN_SYNTAX
-}
-
 const PATTERN_WHITE_SPACE: PackedIntervals = packed_intervals![
     Interval::new(9, 13),
     Interval::new(32, 32),
@@ -9774,11 +9629,6 @@ const PATTERN_WHITE_SPACE: PackedIntervals = packed_intervals![
     Interval::new(8206, 8207),
     Interval::new(8232, 8233),
 ];
-
-/// Return the code point ranges of the 'Pattern_White_Space' Unicode property.
-pub(crate) fn pattern_white_space_ranges() -> &'static PackedIntervals {
-    &PATTERN_WHITE_SPACE
-}
 
 const QUOTATION_MARK: PackedIntervals = packed_intervals![
     Interval::new(34, 34),
@@ -9796,28 +9646,13 @@ const QUOTATION_MARK: PackedIntervals = packed_intervals![
     Interval::new(65378, 65379),
 ];
 
-/// Return the code point ranges of the 'Quotation_Mark' Unicode property.
-pub(crate) fn quotation_mark_ranges() -> &'static PackedIntervals {
-    &QUOTATION_MARK
-}
-
 const RADICAL: PackedIntervals = packed_intervals![
     Interval::new(11904, 11929),
     Interval::new(11931, 12019),
     Interval::new(12032, 12245),
 ];
 
-/// Return the code point ranges of the 'Radical' Unicode property.
-pub(crate) fn radical_ranges() -> &'static PackedIntervals {
-    &RADICAL
-}
-
 const REGIONAL_INDICATOR: PackedIntervals = packed_intervals![Interval::new(127462, 127487)];
-
-/// Return the code point ranges of the 'Regional_Indicator' Unicode property.
-pub(crate) fn regional_indicator_ranges() -> &'static PackedIntervals {
-    &REGIONAL_INDICATOR
-}
 
 const SENTENCE_TERMINAL: PackedIntervals = packed_intervals![
     Interval::new(33, 33),
@@ -9910,11 +9745,6 @@ const SENTENCE_TERMINAL: PackedIntervals = packed_intervals![
     Interval::new(121480, 121480),
 ];
 
-/// Return the code point ranges of the 'Sentence_Terminal' Unicode property.
-pub(crate) fn sentence_terminal_ranges() -> &'static PackedIntervals {
-    &SENTENCE_TERMINAL
-}
-
 const SOFT_DOTTED: PackedIntervals = packed_intervals![
     Interval::new(105, 106),
     Interval::new(303, 303),
@@ -9951,11 +9781,6 @@ const SOFT_DOTTED: PackedIntervals = packed_intervals![
     Interval::new(122956, 122957),
     Interval::new(122984, 122984),
 ];
-
-/// Return the code point ranges of the 'Soft_Dotted' Unicode property.
-pub(crate) fn soft_dotted_ranges() -> &'static PackedIntervals {
-    &SOFT_DOTTED
-}
 
 const TERMINAL_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(33, 33),
@@ -10076,11 +9901,6 @@ const TERMINAL_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(121479, 121482),
 ];
 
-/// Return the code point ranges of the 'Terminal_Punctuation' Unicode property.
-pub(crate) fn terminal_punctuation_ranges() -> &'static PackedIntervals {
-    &TERMINAL_PUNCTUATION
-}
-
 const UNIFIED_IDEOGRAPH: PackedIntervals = packed_intervals![
     Interval::new(13312, 19903),
     Interval::new(19968, 40959),
@@ -10099,11 +9919,6 @@ const UNIFIED_IDEOGRAPH: PackedIntervals = packed_intervals![
     Interval::new(196608, 201546),
     Interval::new(201552, 210041),
 ];
-
-/// Return the code point ranges of the 'Unified_Ideograph' Unicode property.
-pub(crate) fn unified_ideograph_ranges() -> &'static PackedIntervals {
-    &UNIFIED_IDEOGRAPH
-}
 
 const UPPERCASE: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
@@ -10768,22 +10583,12 @@ const UPPERCASE: PackedIntervals = packed_intervals![
     Interval::new(127344, 127369),
 ];
 
-/// Return the code point ranges of the 'Uppercase' Unicode property.
-pub(crate) fn uppercase_ranges() -> &'static PackedIntervals {
-    &UPPERCASE
-}
-
 const VARIATION_SELECTOR: PackedIntervals = packed_intervals![
     Interval::new(6155, 6157),
     Interval::new(6159, 6159),
     Interval::new(65024, 65039),
     Interval::new(917760, 917999),
 ];
-
-/// Return the code point ranges of the 'Variation_Selector' Unicode property.
-pub(crate) fn variation_selector_ranges() -> &'static PackedIntervals {
-    &VARIATION_SELECTOR
-}
 
 const WHITE_SPACE: PackedIntervals = packed_intervals![
     Interval::new(9, 13),
@@ -10797,11 +10602,6 @@ const WHITE_SPACE: PackedIntervals = packed_intervals![
     Interval::new(8287, 8287),
     Interval::new(12288, 12288),
 ];
-
-/// Return the code point ranges of the 'White_Space' Unicode property.
-pub(crate) fn white_space_ranges() -> &'static PackedIntervals {
-    &WHITE_SPACE
-}
 
 const EMOJI: PackedIntervals = packed_intervals![
     Interval::new(35, 35),
@@ -10957,11 +10757,6 @@ const EMOJI: PackedIntervals = packed_intervals![
     Interval::new(129775, 129784),
 ];
 
-/// Return the code point ranges of the 'Emoji' Unicode property.
-pub(crate) fn emoji_ranges() -> &'static PackedIntervals {
-    &EMOJI
-}
-
 const EMOJI_COMPONENT: PackedIntervals = packed_intervals![
     Interval::new(35, 35),
     Interval::new(42, 42),
@@ -10975,17 +10770,7 @@ const EMOJI_COMPONENT: PackedIntervals = packed_intervals![
     Interval::new(917536, 917631),
 ];
 
-/// Return the code point ranges of the 'Emoji_Component' Unicode property.
-pub(crate) fn emoji_component_ranges() -> &'static PackedIntervals {
-    &EMOJI_COMPONENT
-}
-
 const EMOJI_MODIFIER: PackedIntervals = packed_intervals![Interval::new(127995, 127999)];
-
-/// Return the code point ranges of the 'Emoji_Modifier' Unicode property.
-pub(crate) fn emoji_modifier_ranges() -> &'static PackedIntervals {
-    &EMOJI_MODIFIER
-}
 
 const EMOJI_MODIFIER_BASE: PackedIntervals = packed_intervals![
     Interval::new(9757, 9757),
@@ -11029,11 +10814,6 @@ const EMOJI_MODIFIER_BASE: PackedIntervals = packed_intervals![
     Interval::new(129731, 129733),
     Interval::new(129776, 129784),
 ];
-
-/// Return the code point ranges of the 'Emoji_Modifier_Base' Unicode property.
-pub(crate) fn emoji_modifier_base_ranges() -> &'static PackedIntervals {
-    &EMOJI_MODIFIER_BASE
-}
 
 const EMOJI_PRESENTATION: PackedIntervals = packed_intervals![
     Interval::new(8986, 8987),
@@ -11118,11 +10898,6 @@ const EMOJI_PRESENTATION: PackedIntervals = packed_intervals![
     Interval::new(129759, 129770),
     Interval::new(129775, 129784),
 ];
-
-/// Return the code point ranges of the 'Emoji_Presentation' Unicode property.
-pub(crate) fn emoji_presentation_ranges() -> &'static PackedIntervals {
-    &EMOJI_PRESENTATION
-}
 
 const EXTENDED_PICTOGRAPHIC: PackedIntervals = packed_intervals![
     Interval::new(169, 169),
@@ -11282,11 +11057,6 @@ const EXTENDED_PICTOGRAPHIC: PackedIntervals = packed_intervals![
     Interval::new(129646, 129791),
     Interval::new(130048, 131069),
 ];
-
-/// Return the code point ranges of the 'Extended_Pictographic' Unicode property.
-pub(crate) fn extended_pictographic_ranges() -> &'static PackedIntervals {
-    &EXTENDED_PICTOGRAPHIC
-}
 
 const CHANGES_WHEN_NFKC_CASEFOLDED: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
@@ -12139,11 +11909,6 @@ const CHANGES_WHEN_NFKC_CASEFOLDED: PackedIntervals = packed_intervals![
     Interval::new(917504, 921599),
 ];
 
-/// Return the code point ranges of the 'Changes_When_NFKC_Casefolded' Unicode property.
-pub(crate) fn changes_when_nfkc_casefolded_ranges() -> &'static PackedIntervals {
-    &CHANGES_WHEN_NFKC_CASEFOLDED
-}
-
 const BIDI_MIRRORED: PackedIntervals = packed_intervals![
     Interval::new(40, 41),
     Interval::new(60, 60),
@@ -12261,24 +12026,9 @@ const BIDI_MIRRORED: PackedIntervals = packed_intervals![
     Interval::new(120771, 120771),
 ];
 
-/// Return the code point ranges of the 'Bidi_Mirrored' Unicode property.
-pub(crate) fn bidi_mirrored_ranges() -> &'static PackedIntervals {
-    &BIDI_MIRRORED
-}
-
 pub(crate) const ASCII: PackedIntervals = packed_intervals![Interval::new(0, 127)];
 
-/// Return the code point ranges of the 'ASCII' Unicode property.
-pub(crate) fn ascii_ranges() -> &'static PackedIntervals {
-    &ASCII
-}
-
 pub(crate) const ANY: PackedIntervals = packed_intervals![Interval::new(0, 1114111)];
-
-/// Return the code point ranges of the 'ANY' Unicode property.
-pub(crate) fn any_ranges() -> &'static PackedIntervals {
-    &ANY
-}
 
 const ASSIGNED: PackedIntervals = packed_intervals![
     Interval::new(0, 887),
@@ -13018,185 +12768,69 @@ const ASSIGNED: PackedIntervals = packed_intervals![
     Interval::new(1048576, 1114109),
 ];
 
-/// Return the code point ranges of the 'ANY' Unicode property.
-pub(crate) fn assigned_ranges() -> &'static PackedIntervals {
-    &ASSIGNED
-}
+/// The binary properties `\p{...}` names: line i selects `BINARY_PROPERTIES[i]`.
+/// Each value is its names, each a length byte and the name, then a zero byte.
+const BINARY_PROPERTY_NAMES: &[u8] = b"\x05Alpha\x0AAlphabetic\0\x02CI\x0ECase_Ignorable\0\x05Cased\0\x04CWCF\x17Changes_When_Casefolded\0\x04CWCM\x17Changes_When_Casemapped\0\x03CWL\x17Changes_When_Lowercased\0\x03CWT\x17Changes_When_Titlecased\0\x03CWU\x17Changes_When_Uppercased\0\x02DI\x1CDefault_Ignorable_Code_Point\0\x07Gr_Base\x0DGrapheme_Base\0\x06Gr_Ext\x0FGrapheme_Extend\0\x03IDC\x0BID_Continue\0\x03IDS\x08ID_Start\0\x04Math\0\x04XIDC\x0CXID_Continue\0\x04XIDS\x09XID_Start\0\x04AHex\x0FASCII_Hex_Digit\0\x06Bidi_C\x0CBidi_Control\0\x04Dash\0\x03Dep\x0ADeprecated\0\x03Dia\x09Diacritic\0\x03Ext\x08Extender\0\x03Hex\x09Hex_Digit\0\x04IDSB\x13IDS_Binary_Operator\0\x04IDST\x14IDS_Trinary_Operator\0\x04Ideo\x0BIdeographic\0\x06Join_C\x0CJoin_Control\0\x03LOE\x17Logical_Order_Exception\0\x05Lower\x09Lowercase\0\x05NChar\x17Noncharacter_Code_Point\0\x07Pat_Syn\x0EPattern_Syntax\0\x06Pat_WS\x13Pattern_White_Space\0\x05QMark\x0EQuotation_Mark\0\x07Radical\0\x02RI\x12Regional_Indicator\0\x05STerm\x11Sentence_Terminal\0\x02SD\x0BSoft_Dotted\0\x04Term\x14Terminal_Punctuation\0\x05UIdeo\x11Unified_Ideograph\0\x05Upper\x09Uppercase\0\x02VS\x12Variation_Selector\0\x05space\x0BWhite_Space\0\x05Emoji\0\x05EComp\x0FEmoji_Component\0\x04EMod\x0EEmoji_Modifier\0\x05EBase\x13Emoji_Modifier_Base\0\x05EPres\x12Emoji_Presentation\0\x07ExtPict\x15Extended_Pictographic\0\x05CWKCF\x1CChanges_When_NFKC_Casefolded\0\x06Bidi_M\x0DBidi_Mirrored\0\x05ASCII\0\x03Any\0\x08Assigned";
 
-pub(crate) fn binary_property_ranges(value: &UnicodePropertyBinary) -> &'static PackedIntervals {
-    use UnicodePropertyBinary::*;
-    match value {
-        Alphabetic => alphabetic_ranges(),
-        CaseIgnorable => case_ignorable_ranges(),
-        Cased => cased_ranges(),
-        ChangesWhenCasefolded => changes_when_casefolded_ranges(),
-        ChangesWhenCasemapped => changes_when_casemapped_ranges(),
-        ChangesWhenLowercased => changes_when_lowercased_ranges(),
-        ChangesWhenTitlecased => changes_when_titlecased_ranges(),
-        ChangesWhenUppercased => changes_when_uppercased_ranges(),
-        DefaultIgnorableCodePoint => default_ignorable_code_point_ranges(),
-        GraphemeBase => grapheme_base_ranges(),
-        GraphemeExtend => grapheme_extend_ranges(),
-        IDContinue => id_continue_ranges(),
-        IDStart => id_start_ranges(),
-        Math => math_ranges(),
-        XIDContinue => xid_continue_ranges(),
-        XIDStart => xid_start_ranges(),
-        ASCIIHexDigit => ascii_hex_digit_ranges(),
-        BidiControl => bidi_control_ranges(),
-        Dash => dash_ranges(),
-        Deprecated => deprecated_ranges(),
-        Diacritic => diacritic_ranges(),
-        Extender => extender_ranges(),
-        HexDigit => hex_digit_ranges(),
-        IDSBinaryOperator => ids_binary_operator_ranges(),
-        IDSTrinaryOperator => ids_trinary_operator_ranges(),
-        Ideographic => ideographic_ranges(),
-        JoinControl => join_control_ranges(),
-        LogicalOrderException => logical_order_exception_ranges(),
-        Lowercase => lowercase_ranges(),
-        NoncharacterCodePoint => noncharacter_code_point_ranges(),
-        PatternSyntax => pattern_syntax_ranges(),
-        PatternWhiteSpace => pattern_white_space_ranges(),
-        QuotationMark => quotation_mark_ranges(),
-        Radical => radical_ranges(),
-        RegionalIndicator => regional_indicator_ranges(),
-        SentenceTerminal => sentence_terminal_ranges(),
-        SoftDotted => soft_dotted_ranges(),
-        TerminalPunctuation => terminal_punctuation_ranges(),
-        UnifiedIdeograph => unified_ideograph_ranges(),
-        Uppercase => uppercase_ranges(),
-        VariationSelector => variation_selector_ranges(),
-        WhiteSpace => white_space_ranges(),
-        Emoji => emoji_ranges(),
-        EmojiComponent => emoji_component_ranges(),
-        EmojiModifier => emoji_modifier_ranges(),
-        EmojiModifierBase => emoji_modifier_base_ranges(),
-        EmojiPresentation => emoji_presentation_ranges(),
-        ExtendedPictographic => extended_pictographic_ranges(),
-        ChangesWhenNFKCCasefolded => changes_when_nfkc_casefolded_ranges(),
-        BidiMirrored => bidi_mirrored_ranges(),
-        Ascii => ascii_ranges(),
-        Any => any_ranges(),
-        Assigned => assigned_ranges(),
-    }
-}
+static BINARY_PROPERTIES: [&PackedIntervals; 53] = [
+    &ALPHABETIC,
+    &CASE_IGNORABLE,
+    &CASED,
+    &CHANGES_WHEN_CASEFOLDED,
+    &CHANGES_WHEN_CASEMAPPED,
+    &CHANGES_WHEN_LOWERCASED,
+    &CHANGES_WHEN_TITLECASED,
+    &CHANGES_WHEN_UPPERCASED,
+    &DEFAULT_IGNORABLE_CODE_POINT,
+    &GRAPHEME_BASE,
+    &GRAPHEME_EXTEND,
+    &ID_CONTINUE,
+    &ID_START,
+    &MATH,
+    &XID_CONTINUE,
+    &XID_START,
+    &ASCII_HEX_DIGIT,
+    &BIDI_CONTROL,
+    &DASH,
+    &DEPRECATED,
+    &DIACRITIC,
+    &EXTENDER,
+    &HEX_DIGIT,
+    &IDS_BINARY_OPERATOR,
+    &IDS_TRINARY_OPERATOR,
+    &IDEOGRAPHIC,
+    &JOIN_CONTROL,
+    &LOGICAL_ORDER_EXCEPTION,
+    &LOWERCASE,
+    &NONCHARACTER_CODE_POINT,
+    &PATTERN_SYNTAX,
+    &PATTERN_WHITE_SPACE,
+    &QUOTATION_MARK,
+    &RADICAL,
+    &REGIONAL_INDICATOR,
+    &SENTENCE_TERMINAL,
+    &SOFT_DOTTED,
+    &TERMINAL_PUNCTUATION,
+    &UNIFIED_IDEOGRAPH,
+    &UPPERCASE,
+    &VARIATION_SELECTOR,
+    &WHITE_SPACE,
+    &EMOJI,
+    &EMOJI_COMPONENT,
+    &EMOJI_MODIFIER,
+    &EMOJI_MODIFIER_BASE,
+    &EMOJI_PRESENTATION,
+    &EXTENDED_PICTOGRAPHIC,
+    &CHANGES_WHEN_NFKC_CASEFOLDED,
+    &BIDI_MIRRORED,
+    &ASCII,
+    &ANY,
+    &ASSIGNED,
+];
 
-#[derive(Debug, Clone, Copy)]
-pub enum UnicodePropertyBinary {
-    Alphabetic,
-    CaseIgnorable,
-    Cased,
-    ChangesWhenCasefolded,
-    ChangesWhenCasemapped,
-    ChangesWhenLowercased,
-    ChangesWhenTitlecased,
-    ChangesWhenUppercased,
-    DefaultIgnorableCodePoint,
-    GraphemeBase,
-    GraphemeExtend,
-    IDContinue,
-    IDStart,
-    Math,
-    XIDContinue,
-    XIDStart,
-    ASCIIHexDigit,
-    BidiControl,
-    Dash,
-    Deprecated,
-    Diacritic,
-    Extender,
-    HexDigit,
-    IDSBinaryOperator,
-    IDSTrinaryOperator,
-    Ideographic,
-    JoinControl,
-    LogicalOrderException,
-    Lowercase,
-    NoncharacterCodePoint,
-    PatternSyntax,
-    PatternWhiteSpace,
-    QuotationMark,
-    Radical,
-    RegionalIndicator,
-    SentenceTerminal,
-    SoftDotted,
-    TerminalPunctuation,
-    UnifiedIdeograph,
-    Uppercase,
-    VariationSelector,
-    WhiteSpace,
-    Emoji,
-    EmojiComponent,
-    EmojiModifier,
-    EmojiModifierBase,
-    EmojiPresentation,
-    ExtendedPictographic,
-    ChangesWhenNFKCCasefolded,
-    BidiMirrored,
-    Ascii,
-    Any,
-    Assigned,
-}
-
-pub fn unicode_property_binary_from_str(s: &str) -> Option<UnicodePropertyBinary> {
-    use UnicodePropertyBinary::*;
-    match s {
-        "Alpha" | "Alphabetic" => Some(Alphabetic),
-        "CI" | "Case_Ignorable" => Some(CaseIgnorable),
-        "Cased" => Some(Cased),
-        "CWCF" | "Changes_When_Casefolded" => Some(ChangesWhenCasefolded),
-        "CWCM" | "Changes_When_Casemapped" => Some(ChangesWhenCasemapped),
-        "CWL" | "Changes_When_Lowercased" => Some(ChangesWhenLowercased),
-        "CWT" | "Changes_When_Titlecased" => Some(ChangesWhenTitlecased),
-        "CWU" | "Changes_When_Uppercased" => Some(ChangesWhenUppercased),
-        "DI" | "Default_Ignorable_Code_Point" => Some(DefaultIgnorableCodePoint),
-        "Gr_Base" | "Grapheme_Base" => Some(GraphemeBase),
-        "Gr_Ext" | "Grapheme_Extend" => Some(GraphemeExtend),
-        "IDC" | "ID_Continue" => Some(IDContinue),
-        "IDS" | "ID_Start" => Some(IDStart),
-        "Math" => Some(Math),
-        "XIDC" | "XID_Continue" => Some(XIDContinue),
-        "XIDS" | "XID_Start" => Some(XIDStart),
-        "AHex" | "ASCII_Hex_Digit" => Some(ASCIIHexDigit),
-        "Bidi_C" | "Bidi_Control" => Some(BidiControl),
-        "Dash" => Some(Dash),
-        "Dep" | "Deprecated" => Some(Deprecated),
-        "Dia" | "Diacritic" => Some(Diacritic),
-        "Ext" | "Extender" => Some(Extender),
-        "Hex" | "Hex_Digit" => Some(HexDigit),
-        "IDSB" | "IDS_Binary_Operator" => Some(IDSBinaryOperator),
-        "IDST" | "IDS_Trinary_Operator" => Some(IDSTrinaryOperator),
-        "Ideo" | "Ideographic" => Some(Ideographic),
-        "Join_C" | "Join_Control" => Some(JoinControl),
-        "LOE" | "Logical_Order_Exception" => Some(LogicalOrderException),
-        "Lower" | "Lowercase" => Some(Lowercase),
-        "NChar" | "Noncharacter_Code_Point" => Some(NoncharacterCodePoint),
-        "Pat_Syn" | "Pattern_Syntax" => Some(PatternSyntax),
-        "Pat_WS" | "Pattern_White_Space" => Some(PatternWhiteSpace),
-        "QMark" | "Quotation_Mark" => Some(QuotationMark),
-        "Radical" => Some(Radical),
-        "RI" | "Regional_Indicator" => Some(RegionalIndicator),
-        "STerm" | "Sentence_Terminal" => Some(SentenceTerminal),
-        "SD" | "Soft_Dotted" => Some(SoftDotted),
-        "Term" | "Terminal_Punctuation" => Some(TerminalPunctuation),
-        "UIdeo" | "Unified_Ideograph" => Some(UnifiedIdeograph),
-        "Upper" | "Uppercase" => Some(Uppercase),
-        "VS" | "Variation_Selector" => Some(VariationSelector),
-        "space" | "White_Space" => Some(WhiteSpace),
-        "Emoji" => Some(Emoji),
-        "EComp" | "Emoji_Component" => Some(EmojiComponent),
-        "EMod" | "Emoji_Modifier" => Some(EmojiModifier),
-        "EBase" | "Emoji_Modifier_Base" => Some(EmojiModifierBase),
-        "EPres" | "Emoji_Presentation" => Some(EmojiPresentation),
-        "ExtPict" | "Extended_Pictographic" => Some(ExtendedPictographic),
-        "CWKCF" | "Changes_When_NFKC_Casefolded" => Some(ChangesWhenNFKCCasefolded),
-        "Bidi_M" | "Bidi_Mirrored" => Some(BidiMirrored),
-        "ASCII" => Some(Ascii),
-        "Any" => Some(Any),
-        "Assigned" => Some(Assigned),
-        _ => None,
-    }
+/// The table of the binary property `name`.
+pub(crate) fn binary_property_from_str(name: &str) -> Option<&'static PackedIntervals> {
+    Some(BINARY_PROPERTIES[lookup_property_name(BINARY_PROPERTY_NAMES, name)?])
 }
 
 pub(crate) const FOLDS: [FoldRange; 208] = [
@@ -13499,11 +13133,6 @@ const CLOSE_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(65379, 65379),
 ];
 
-/// Return the code point ranges of the 'Close_Punctuation' Unicode property.
-pub(crate) fn close_punctuation_ranges() -> &'static PackedIntervals {
-    &CLOSE_PUNCTUATION
-}
-
 const CONNECTOR_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(95, 95),
     Interval::new(8255, 8256),
@@ -13513,17 +13142,7 @@ const CONNECTOR_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(65343, 65343),
 ];
 
-/// Return the code point ranges of the 'Connector_Punctuation' Unicode property.
-pub(crate) fn connector_punctuation_ranges() -> &'static PackedIntervals {
-    &CONNECTOR_PUNCTUATION
-}
-
 const CONTROL: PackedIntervals = packed_intervals![Interval::new(0, 31), Interval::new(127, 159)];
-
-/// Return the code point ranges of the 'Control' Unicode property.
-pub(crate) fn control_ranges() -> &'static PackedIntervals {
-    &CONTROL
-}
 
 const CURRENCY_SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(36, 36),
@@ -13549,11 +13168,6 @@ const CURRENCY_SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(126128, 126128),
 ];
 
-/// Return the code point ranges of the 'Currency_Symbol' Unicode property.
-pub(crate) fn currency_symbol_ranges() -> &'static PackedIntervals {
-    &CURRENCY_SYMBOL
-}
-
 const DASH_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(45, 45),
     Interval::new(1418, 1418),
@@ -13576,11 +13190,6 @@ const DASH_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(68974, 68974),
     Interval::new(69293, 69293),
 ];
-
-/// Return the code point ranges of the 'Dash_Punctuation' Unicode property.
-pub(crate) fn dash_punctuation_ranges() -> &'static PackedIntervals {
-    &DASH_PUNCTUATION
-}
 
 const DECIMAL_NUMBER: PackedIntervals = packed_intervals![
     Interval::new(48, 57),
@@ -13657,11 +13266,6 @@ const DECIMAL_NUMBER: PackedIntervals = packed_intervals![
     Interval::new(130032, 130041),
 ];
 
-/// Return the code point ranges of the 'Decimal_Number' Unicode property.
-pub(crate) fn decimal_number_ranges() -> &'static PackedIntervals {
-    &DECIMAL_NUMBER
-}
-
 const ENCLOSING_MARK: PackedIntervals = packed_intervals![
     Interval::new(1160, 1161),
     Interval::new(6846, 6846),
@@ -13669,11 +13273,6 @@ const ENCLOSING_MARK: PackedIntervals = packed_intervals![
     Interval::new(8418, 8420),
     Interval::new(42608, 42610),
 ];
-
-/// Return the code point ranges of the 'Enclosing_Mark' Unicode property.
-pub(crate) fn enclosing_mark_ranges() -> &'static PackedIntervals {
-    &ENCLOSING_MARK
-}
 
 const FINAL_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(187, 187),
@@ -13687,11 +13286,6 @@ const FINAL_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(11805, 11805),
     Interval::new(11809, 11809),
 ];
-
-/// Return the code point ranges of the 'Final_Punctuation' Unicode property.
-pub(crate) fn final_punctuation_ranges() -> &'static PackedIntervals {
-    &FINAL_PUNCTUATION
-}
 
 const FORMAT: PackedIntervals = packed_intervals![
     Interval::new(173, 173),
@@ -13717,11 +13311,6 @@ const FORMAT: PackedIntervals = packed_intervals![
     Interval::new(917536, 917631),
 ];
 
-/// Return the code point ranges of the 'Format' Unicode property.
-pub(crate) fn format_ranges() -> &'static PackedIntervals {
-    &FORMAT
-}
-
 const INITIAL_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(171, 171),
     Interval::new(8216, 8216),
@@ -13735,11 +13324,6 @@ const INITIAL_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(11804, 11804),
     Interval::new(11808, 11808),
 ];
-
-/// Return the code point ranges of the 'Initial_Punctuation' Unicode property.
-pub(crate) fn initial_punctuation_ranges() -> &'static PackedIntervals {
-    &INITIAL_PUNCTUATION
-}
 
 const LETTER_NUMBER: PackedIntervals = packed_intervals![
     Interval::new(5870, 5872),
@@ -13757,17 +13341,7 @@ const LETTER_NUMBER: PackedIntervals = packed_intervals![
     Interval::new(94196, 94198),
 ];
 
-/// Return the code point ranges of the 'Letter_Number' Unicode property.
-pub(crate) fn letter_number_ranges() -> &'static PackedIntervals {
-    &LETTER_NUMBER
-}
-
 const LINE_SEPARATOR: PackedIntervals = packed_intervals![Interval::new(8232, 8232)];
-
-/// Return the code point ranges of the 'Line_Separator' Unicode property.
-pub(crate) fn line_separator_ranges() -> &'static PackedIntervals {
-    &LINE_SEPARATOR
-}
 
 const LOWERCASE_LETTER: PackedIntervals = packed_intervals![
     Interval::new(97, 122),
@@ -14436,11 +14010,6 @@ const LOWERCASE_LETTER: PackedIntervals = packed_intervals![
     Interval::new(125218, 125251),
 ];
 
-/// Return the code point ranges of the 'Lowercase_Letter' Unicode property.
-pub(crate) fn lowercase_letter_ranges() -> &'static PackedIntervals {
-    &LOWERCASE_LETTER
-}
-
 const MATH_SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(43, 43),
     Interval::new(60, 62),
@@ -14510,11 +14079,6 @@ const MATH_SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(126704, 126705),
     Interval::new(129232, 129240),
 ];
-
-/// Return the code point ranges of the 'Math_Symbol' Unicode property.
-pub(crate) fn math_symbol_ranges() -> &'static PackedIntervals {
-    &MATH_SYMBOL
-}
 
 const MODIFIER_LETTER: PackedIntervals = packed_intervals![
     Interval::new(688, 705),
@@ -14598,11 +14162,6 @@ const MODIFIER_LETTER: PackedIntervals = packed_intervals![
     Interval::new(125259, 125259),
 ];
 
-/// Return the code point ranges of the 'Modifier_Letter' Unicode property.
-pub(crate) fn modifier_letter_ranges() -> &'static PackedIntervals {
-    &MODIFIER_LETTER
-}
-
 const MODIFIER_SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(94, 94),
     Interval::new(96, 96),
@@ -14636,11 +14195,6 @@ const MODIFIER_SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(65507, 65507),
     Interval::new(127995, 127999),
 ];
-
-/// Return the code point ranges of the 'Modifier_Symbol' Unicode property.
-pub(crate) fn modifier_symbol_ranges() -> &'static PackedIntervals {
-    &MODIFIER_SYMBOL
-}
 
 const NONSPACING_MARK: PackedIntervals = packed_intervals![
     Interval::new(768, 879),
@@ -15010,11 +14564,6 @@ const NONSPACING_MARK: PackedIntervals = packed_intervals![
     Interval::new(917760, 917999),
 ];
 
-/// Return the code point ranges of the 'Nonspacing_Mark' Unicode property.
-pub(crate) fn nonspacing_mark_ranges() -> &'static PackedIntervals {
-    &NONSPACING_MARK
-}
-
 const OPEN_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(40, 40),
     Interval::new(91, 91),
@@ -15096,11 +14645,6 @@ const OPEN_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(65375, 65375),
     Interval::new(65378, 65378),
 ];
-
-/// Return the code point ranges of the 'Open_Punctuation' Unicode property.
-pub(crate) fn open_punctuation_ranges() -> &'static PackedIntervals {
-    &OPEN_PUNCTUATION
-}
 
 const OTHER_LETTER: PackedIntervals = packed_intervals![
     Interval::new(170, 170),
@@ -15642,11 +15186,6 @@ const OTHER_LETTER: PackedIntervals = packed_intervals![
     Interval::new(201552, 210041),
 ];
 
-/// Return the code point ranges of the 'Other_Letter' Unicode property.
-pub(crate) fn other_letter_ranges() -> &'static PackedIntervals {
-    &OTHER_LETTER
-}
-
 const OTHER_NUMBER: PackedIntervals = packed_intervals![
     Interval::new(178, 179),
     Interval::new(185, 185),
@@ -15721,11 +15260,6 @@ const OTHER_NUMBER: PackedIntervals = packed_intervals![
     Interval::new(126255, 126269),
     Interval::new(127232, 127244),
 ];
-
-/// Return the code point ranges of the 'Other_Number' Unicode property.
-pub(crate) fn other_number_ranges() -> &'static PackedIntervals {
-    &OTHER_NUMBER
-}
 
 const OTHER_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(33, 35),
@@ -15924,11 +15458,6 @@ const OTHER_PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(125278, 125279),
 ];
 
-/// Return the code point ranges of the 'Other_Punctuation' Unicode property.
-pub(crate) fn other_punctuation_ranges() -> &'static PackedIntervals {
-    &OTHER_PUNCTUATION
-}
-
 const OTHER_SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(166, 166),
     Interval::new(169, 169),
@@ -16125,28 +15654,13 @@ const OTHER_SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(130042, 130042),
 ];
 
-/// Return the code point ranges of the 'Other_Symbol' Unicode property.
-pub(crate) fn other_symbol_ranges() -> &'static PackedIntervals {
-    &OTHER_SYMBOL
-}
-
 const PARAGRAPH_SEPARATOR: PackedIntervals = packed_intervals![Interval::new(8233, 8233)];
-
-/// Return the code point ranges of the 'Paragraph_Separator' Unicode property.
-pub(crate) fn paragraph_separator_ranges() -> &'static PackedIntervals {
-    &PARAGRAPH_SEPARATOR
-}
 
 const PRIVATE_USE: PackedIntervals = packed_intervals![
     Interval::new(57344, 63743),
     Interval::new(983040, 1048573),
     Interval::new(1048576, 1114109),
 ];
-
-/// Return the code point ranges of the 'Private_Use' Unicode property.
-pub(crate) fn private_use_ranges() -> &'static PackedIntervals {
-    &PRIVATE_USE
-}
 
 const SPACE_SEPARATOR: PackedIntervals = packed_intervals![
     Interval::new(32, 32),
@@ -16157,11 +15671,6 @@ const SPACE_SEPARATOR: PackedIntervals = packed_intervals![
     Interval::new(8287, 8287),
     Interval::new(12288, 12288),
 ];
-
-/// Return the code point ranges of the 'Space_Separator' Unicode property.
-pub(crate) fn space_separator_ranges() -> &'static PackedIntervals {
-    &SPACE_SEPARATOR
-}
 
 const SPACING_MARK: PackedIntervals = packed_intervals![
     Interval::new(2307, 2307),
@@ -16359,17 +15868,7 @@ const SPACING_MARK: PackedIntervals = packed_intervals![
     Interval::new(119149, 119154),
 ];
 
-/// Return the code point ranges of the 'Spacing_Mark' Unicode property.
-pub(crate) fn spacing_mark_ranges() -> &'static PackedIntervals {
-    &SPACING_MARK
-}
-
 const SURROGATE: PackedIntervals = packed_intervals![Interval::new(55296, 57343)];
-
-/// Return the code point ranges of the 'Surrogate' Unicode property.
-pub(crate) fn surrogate_ranges() -> &'static PackedIntervals {
-    &SURROGATE
-}
 
 const TITLECASE_LETTER: PackedIntervals = packed_intervals![
     Interval::new(453, 453),
@@ -16383,11 +15882,6 @@ const TITLECASE_LETTER: PackedIntervals = packed_intervals![
     Interval::new(8140, 8140),
     Interval::new(8188, 8188),
 ];
-
-/// Return the code point ranges of the 'Titlecase_Letter' Unicode property.
-pub(crate) fn titlecase_letter_ranges() -> &'static PackedIntervals {
-    &TITLECASE_LETTER
-}
 
 const UNASSIGNED: PackedIntervals = packed_intervals![
     Interval::new(888, 889),
@@ -17127,11 +16621,6 @@ const UNASSIGNED: PackedIntervals = packed_intervals![
     Interval::new(1114110, 1114111),
 ];
 
-/// Return the code point ranges of the 'Unassigned' Unicode property.
-pub(crate) fn unassigned_ranges() -> &'static PackedIntervals {
-    &UNASSIGNED
-}
-
 const UPPERCASE_LETTER: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
     Interval::new(192, 214),
@@ -17790,11 +17279,6 @@ const UPPERCASE_LETTER: PackedIntervals = packed_intervals![
     Interval::new(125184, 125217),
 ];
 
-/// Return the code point ranges of the 'Uppercase_Letter' Unicode property.
-pub(crate) fn uppercase_letter_ranges() -> &'static PackedIntervals {
-    &UPPERCASE_LETTER
-}
-
 const CASED_LETTER: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
     Interval::new(97, 122),
@@ -17941,11 +17425,6 @@ const CASED_LETTER: PackedIntervals = packed_intervals![
     Interval::new(122661, 122666),
     Interval::new(125184, 125251),
 ];
-
-/// Return the code point ranges of the 'Cased_Letter' Unicode property.
-pub(crate) fn cased_letter_ranges() -> &'static PackedIntervals {
-    &CASED_LETTER
-}
 
 const OTHER: PackedIntervals = packed_intervals![
     Interval::new(0, 31),
@@ -18691,11 +18170,6 @@ const OTHER: PackedIntervals = packed_intervals![
     Interval::new(918000, 1114111),
 ];
 
-/// Return the code point ranges of the 'Other' Unicode property.
-pub(crate) fn other_ranges() -> &'static PackedIntervals {
-    &OTHER
-}
-
 const LETTER: PackedIntervals = packed_intervals![
     Interval::new(65, 90),
     Interval::new(97, 122),
@@ -19383,11 +18857,6 @@ const LETTER: PackedIntervals = packed_intervals![
     Interval::new(201552, 210041),
 ];
 
-/// Return the code point ranges of the 'Letter' Unicode property.
-pub(crate) fn letter_ranges() -> &'static PackedIntervals {
-    &LETTER
-}
-
 const MARK: PackedIntervals = packed_intervals![
     Interval::new(768, 879),
     Interval::new(1155, 1161),
@@ -19718,11 +19187,6 @@ const MARK: PackedIntervals = packed_intervals![
     Interval::new(917760, 917999),
 ];
 
-/// Return the code point ranges of the 'Mark' Unicode property.
-pub(crate) fn mark_ranges() -> &'static PackedIntervals {
-    &MARK
-}
-
 const NUMBER: PackedIntervals = packed_intervals![
     Interval::new(48, 57),
     Interval::new(178, 179),
@@ -19871,11 +19335,6 @@ const NUMBER: PackedIntervals = packed_intervals![
     Interval::new(127232, 127244),
     Interval::new(130032, 130041),
 ];
-
-/// Return the code point ranges of the 'Number' Unicode property.
-pub(crate) fn number_ranges() -> &'static PackedIntervals {
-    &NUMBER
-}
 
 const PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(33, 35),
@@ -20078,11 +19537,6 @@ const PUNCTUATION: PackedIntervals = packed_intervals![
     Interval::new(124415, 124415),
     Interval::new(125278, 125279),
 ];
-
-/// Return the code point ranges of the 'Punctuation' Unicode property.
-pub(crate) fn punctuation_ranges() -> &'static PackedIntervals {
-    &PUNCTUATION
-}
 
 const SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(36, 36),
@@ -20329,11 +19783,6 @@ const SYMBOL: PackedIntervals = packed_intervals![
     Interval::new(130042, 130042),
 ];
 
-/// Return the code point ranges of the 'Symbol' Unicode property.
-pub(crate) fn symbol_ranges() -> &'static PackedIntervals {
-    &SYMBOL
-}
-
 const SEPARATOR: PackedIntervals = packed_intervals![
     Interval::new(32, 32),
     Interval::new(160, 160),
@@ -20345,144 +19794,54 @@ const SEPARATOR: PackedIntervals = packed_intervals![
     Interval::new(12288, 12288),
 ];
 
-/// Return the code point ranges of the 'Separator' Unicode property.
-pub(crate) fn separator_ranges() -> &'static PackedIntervals {
-    &SEPARATOR
-}
+/// General_Category value names: line i selects `GENERAL_CATEGORIES[i]`.
+/// Each value is its names, each a length byte and the name, then a zero byte.
+const GENERAL_CATEGORY_NAMES: &[u8] = b"\x02Pe\x11Close_Punctuation\0\x02Pc\x15Connector_Punctuation\0\x05cntrl\x02Cc\x07Control\0\x02Sc\x0FCurrency_Symbol\0\x02Pd\x10Dash_Punctuation\0\x05digit\x02Nd\x0EDecimal_Number\0\x02Me\x0EEnclosing_Mark\0\x02Pf\x11Final_Punctuation\0\x02Cf\x06Format\0\x02Pi\x13Initial_Punctuation\0\x02Nl\x0DLetter_Number\0\x02Zl\x0ELine_Separator\0\x02Ll\x10Lowercase_Letter\0\x02Sm\x0BMath_Symbol\0\x02Lm\x0FModifier_Letter\0\x02Sk\x0FModifier_Symbol\0\x02Mn\x0FNonspacing_Mark\0\x02Ps\x10Open_Punctuation\0\x02Lo\x0COther_Letter\0\x02No\x0COther_Number\0\x02Po\x11Other_Punctuation\0\x02So\x0COther_Symbol\0\x02Zp\x13Paragraph_Separator\0\x02Co\x0BPrivate_Use\0\x02Zs\x0FSpace_Separator\0\x02Mc\x0CSpacing_Mark\0\x02Cs\x09Surrogate\0\x02Lt\x10Titlecase_Letter\0\x02Cn\x0AUnassigned\0\x02Lu\x10Uppercase_Letter\0\x02LC\x0CCased_Letter\0\x01C\x05Other\0\x01L\x06Letter\0\x0ECombining_Mark\x01M\x04Mark\0\x01N\x06Number\0\x05punct\x01P\x0BPunctuation\0\x01S\x06Symbol\0\x01Z\x09Separator";
 
-pub(crate) fn general_category_property_value_ranges(
-    value: &UnicodePropertyValueGeneralCategory,
-) -> &'static PackedIntervals {
-    use UnicodePropertyValueGeneralCategory::*;
-    match value {
-        ClosePunctuation => close_punctuation_ranges(),
-        ConnectorPunctuation => connector_punctuation_ranges(),
-        Control => control_ranges(),
-        CurrencySymbol => currency_symbol_ranges(),
-        DashPunctuation => dash_punctuation_ranges(),
-        DecimalNumber => decimal_number_ranges(),
-        EnclosingMark => enclosing_mark_ranges(),
-        FinalPunctuation => final_punctuation_ranges(),
-        Format => format_ranges(),
-        InitialPunctuation => initial_punctuation_ranges(),
-        LetterNumber => letter_number_ranges(),
-        LineSeparator => line_separator_ranges(),
-        LowercaseLetter => lowercase_letter_ranges(),
-        MathSymbol => math_symbol_ranges(),
-        ModifierLetter => modifier_letter_ranges(),
-        ModifierSymbol => modifier_symbol_ranges(),
-        NonspacingMark => nonspacing_mark_ranges(),
-        OpenPunctuation => open_punctuation_ranges(),
-        OtherLetter => other_letter_ranges(),
-        OtherNumber => other_number_ranges(),
-        OtherPunctuation => other_punctuation_ranges(),
-        OtherSymbol => other_symbol_ranges(),
-        ParagraphSeparator => paragraph_separator_ranges(),
-        PrivateUse => private_use_ranges(),
-        SpaceSeparator => space_separator_ranges(),
-        SpacingMark => spacing_mark_ranges(),
-        Surrogate => surrogate_ranges(),
-        TitlecaseLetter => titlecase_letter_ranges(),
-        Unassigned => unassigned_ranges(),
-        UppercaseLetter => uppercase_letter_ranges(),
-        CasedLetter => cased_letter_ranges(),
-        Other => other_ranges(),
-        Letter => letter_ranges(),
-        Mark => mark_ranges(),
-        Number => number_ranges(),
-        Punctuation => punctuation_ranges(),
-        Symbol => symbol_ranges(),
-        Separator => separator_ranges(),
-    }
-}
+static GENERAL_CATEGORIES: [&PackedIntervals; 38] = [
+    &CLOSE_PUNCTUATION,
+    &CONNECTOR_PUNCTUATION,
+    &CONTROL,
+    &CURRENCY_SYMBOL,
+    &DASH_PUNCTUATION,
+    &DECIMAL_NUMBER,
+    &ENCLOSING_MARK,
+    &FINAL_PUNCTUATION,
+    &FORMAT,
+    &INITIAL_PUNCTUATION,
+    &LETTER_NUMBER,
+    &LINE_SEPARATOR,
+    &LOWERCASE_LETTER,
+    &MATH_SYMBOL,
+    &MODIFIER_LETTER,
+    &MODIFIER_SYMBOL,
+    &NONSPACING_MARK,
+    &OPEN_PUNCTUATION,
+    &OTHER_LETTER,
+    &OTHER_NUMBER,
+    &OTHER_PUNCTUATION,
+    &OTHER_SYMBOL,
+    &PARAGRAPH_SEPARATOR,
+    &PRIVATE_USE,
+    &SPACE_SEPARATOR,
+    &SPACING_MARK,
+    &SURROGATE,
+    &TITLECASE_LETTER,
+    &UNASSIGNED,
+    &UPPERCASE_LETTER,
+    &CASED_LETTER,
+    &OTHER,
+    &LETTER,
+    &MARK,
+    &NUMBER,
+    &PUNCTUATION,
+    &SYMBOL,
+    &SEPARATOR,
+];
 
-#[derive(Debug, Clone, Copy)]
-pub enum UnicodePropertyValueGeneralCategory {
-    ClosePunctuation,
-    ConnectorPunctuation,
-    Control,
-    CurrencySymbol,
-    DashPunctuation,
-    DecimalNumber,
-    EnclosingMark,
-    FinalPunctuation,
-    Format,
-    InitialPunctuation,
-    LetterNumber,
-    LineSeparator,
-    LowercaseLetter,
-    MathSymbol,
-    ModifierLetter,
-    ModifierSymbol,
-    NonspacingMark,
-    OpenPunctuation,
-    OtherLetter,
-    OtherNumber,
-    OtherPunctuation,
-    OtherSymbol,
-    ParagraphSeparator,
-    PrivateUse,
-    SpaceSeparator,
-    SpacingMark,
-    Surrogate,
-    TitlecaseLetter,
-    Unassigned,
-    UppercaseLetter,
-    CasedLetter,
-    Other,
-    Letter,
-    Mark,
-    Number,
-    Punctuation,
-    Symbol,
-    Separator,
-}
-
-pub fn unicode_property_value_general_category_from_str(
-    s: &str,
-) -> Option<UnicodePropertyValueGeneralCategory> {
-    use UnicodePropertyValueGeneralCategory::*;
-    match s {
-        "Pe" | "Close_Punctuation" => Some(ClosePunctuation),
-        "Pc" | "Connector_Punctuation" => Some(ConnectorPunctuation),
-        "cntrl" | "Cc" | "Control" => Some(Control),
-        "Sc" | "Currency_Symbol" => Some(CurrencySymbol),
-        "Pd" | "Dash_Punctuation" => Some(DashPunctuation),
-        "digit" | "Nd" | "Decimal_Number" => Some(DecimalNumber),
-        "Me" | "Enclosing_Mark" => Some(EnclosingMark),
-        "Pf" | "Final_Punctuation" => Some(FinalPunctuation),
-        "Cf" | "Format" => Some(Format),
-        "Pi" | "Initial_Punctuation" => Some(InitialPunctuation),
-        "Nl" | "Letter_Number" => Some(LetterNumber),
-        "Zl" | "Line_Separator" => Some(LineSeparator),
-        "Ll" | "Lowercase_Letter" => Some(LowercaseLetter),
-        "Sm" | "Math_Symbol" => Some(MathSymbol),
-        "Lm" | "Modifier_Letter" => Some(ModifierLetter),
-        "Sk" | "Modifier_Symbol" => Some(ModifierSymbol),
-        "Mn" | "Nonspacing_Mark" => Some(NonspacingMark),
-        "Ps" | "Open_Punctuation" => Some(OpenPunctuation),
-        "Lo" | "Other_Letter" => Some(OtherLetter),
-        "No" | "Other_Number" => Some(OtherNumber),
-        "Po" | "Other_Punctuation" => Some(OtherPunctuation),
-        "So" | "Other_Symbol" => Some(OtherSymbol),
-        "Zp" | "Paragraph_Separator" => Some(ParagraphSeparator),
-        "Co" | "Private_Use" => Some(PrivateUse),
-        "Zs" | "Space_Separator" => Some(SpaceSeparator),
-        "Mc" | "Spacing_Mark" => Some(SpacingMark),
-        "Cs" | "Surrogate" => Some(Surrogate),
-        "Lt" | "Titlecase_Letter" => Some(TitlecaseLetter),
-        "Cn" | "Unassigned" => Some(Unassigned),
-        "Lu" | "Uppercase_Letter" => Some(UppercaseLetter),
-        "LC" | "Cased_Letter" => Some(CasedLetter),
-        "C" | "Other" => Some(Other),
-        "L" | "Letter" => Some(Letter),
-        "Combining_Mark" | "M" | "Mark" => Some(Mark),
-        "N" | "Number" => Some(Number),
-        "punct" | "P" | "Punctuation" => Some(Punctuation),
-        "S" | "Symbol" => Some(Symbol),
-        "Z" | "Separator" => Some(Separator),
-        _ => None,
-    }
+/// The table of the General_Category value `name`.
+pub(crate) fn general_category_from_str(name: &str) -> Option<&'static PackedIntervals> {
+    Some(GENERAL_CATEGORIES[lookup_property_name(GENERAL_CATEGORY_NAMES, name)?])
 }
 
 const ADLAM: PackedIntervals = packed_intervals![
@@ -23249,727 +22608,372 @@ const COMMON_EXTENSIONS: PackedIntervals = packed_intervals![
     Interval::new(917536, 917631),
 ];
 
-#[derive(Debug, Clone, Copy)]
-pub enum UnicodePropertyValueScript {
-    Adlam,
-    CaucasianAlbanian,
-    Ahom,
-    Arabic,
-    ImperialAramaic,
-    Armenian,
-    Avestan,
-    Balinese,
-    Bamum,
-    BassaVah,
-    Batak,
-    Bengali,
-    BeriaErfe,
-    Bhaiksuki,
-    Bopomofo,
-    Brahmi,
-    Braille,
-    Buginese,
-    Buhid,
-    Chakma,
-    CanadianAboriginal,
-    Carian,
-    Cham,
-    Cherokee,
-    Chorasmian,
-    Coptic,
-    CyproMinoan,
-    Cypriot,
-    Cyrillic,
-    Devanagari,
-    DivesAkuru,
-    Dogra,
-    Deseret,
-    Duployan,
-    EgyptianHieroglyphs,
-    Elbasan,
-    Elymaic,
-    Ethiopic,
-    Garay,
-    Georgian,
-    Glagolitic,
-    GunjalaGondi,
-    MasaramGondi,
-    Gothic,
-    Grantha,
-    Greek,
-    Gujarati,
-    GurungKhema,
-    Gurmukhi,
-    Hangul,
-    Han,
-    Hanunoo,
-    Hatran,
-    Hebrew,
-    Hiragana,
-    AnatolianHieroglyphs,
-    PahawhHmong,
-    NyiakengPuachueHmong,
-    OldHungarian,
-    OldItalic,
-    Javanese,
-    KayahLi,
-    Katakana,
-    Kawi,
-    Kharoshthi,
-    Khmer,
-    Khojki,
-    KhitanSmallScript,
-    Kannada,
-    KiratRai,
-    Kaithi,
-    TaiTham,
-    Lao,
-    Latin,
-    Lepcha,
-    Limbu,
-    LinearA,
-    LinearB,
-    Lisu,
-    Lycian,
-    Lydian,
-    Mahajani,
-    Makasar,
-    Mandaic,
-    Manichaean,
-    Marchen,
-    Medefaidrin,
-    MendeKikakui,
-    MeroiticCursive,
-    MeroiticHieroglyphs,
-    Malayalam,
-    Modi,
-    Mongolian,
-    Mro,
-    MeeteiMayek,
-    Multani,
-    Myanmar,
-    NagMundari,
-    Nandinagari,
-    OldNorthArabian,
-    Nabataean,
-    Newa,
-    Nko,
-    Nushu,
-    Ogham,
-    OlChiki,
-    OlOnal,
-    OldTurkic,
-    Oriya,
-    Osage,
-    Osmanya,
-    OldUyghur,
-    Palmyrene,
-    PauCinHau,
-    OldPermic,
-    PhagsPa,
-    InscriptionalPahlavi,
-    PsalterPahlavi,
-    Phoenician,
-    Miao,
-    InscriptionalParthian,
-    Rejang,
-    HanifiRohingya,
-    Runic,
-    Samaritan,
-    OldSouthArabian,
-    Saurashtra,
-    SignWriting,
-    Shavian,
-    Sharada,
-    Siddham,
-    Sidetic,
-    Khudawadi,
-    Sinhala,
-    Sogdian,
-    OldSogdian,
-    SoraSompeng,
-    Soyombo,
-    Sundanese,
-    Sunuwar,
-    SylotiNagri,
-    Syriac,
-    Tagbanwa,
-    Takri,
-    TaiLe,
-    NewTaiLue,
-    Tamil,
-    Tangut,
-    TaiViet,
-    TaiYo,
-    Telugu,
-    Tifinagh,
-    Tagalog,
-    Thaana,
-    Thai,
-    Tibetan,
-    Tirhuta,
-    Tangsa,
-    Todhri,
-    TolongSiki,
-    Toto,
-    TuluTigalari,
-    Ugaritic,
-    Vai,
-    Vithkuqi,
-    WarangCiti,
-    Wancho,
-    OldPersian,
-    Cuneiform,
-    Yezidi,
-    Yi,
-    ZanabazarSquare,
-    Inherited,
-    Common,
-}
+/// Script value names: line i selects `SCRIPTS[i]` and `SCRIPT_EXTENSIONS[i]`.
+/// Each value is its names, each a length byte and the name, then a zero byte.
+const SCRIPT_NAMES: &[u8] = b"\x05Adlam\x04Adlm\0\x12Caucasian_Albanian\x04Aghb\0\x04Ahom\0\x06Arabic\x04Arab\0\x10Imperial_Aramaic\x04Armi\0\x08Armenian\x04Armn\0\x07Avestan\x04Avst\0\x08Balinese\x04Bali\0\x05Bamum\x04Bamu\0\x09Bassa_Vah\x04Bass\0\x05Batak\x04Batk\0\x07Bengali\x04Beng\0\x0ABeria_Erfe\x04Berf\0\x09Bhaiksuki\x04Bhks\0\x08Bopomofo\x04Bopo\0\x06Brahmi\x04Brah\0\x07Braille\x04Brai\0\x08Buginese\x04Bugi\0\x05Buhid\x04Buhd\0\x06Chakma\x04Cakm\0\x13Canadian_Aboriginal\x04Cans\0\x06Carian\x04Cari\0\x04Cham\0\x08Cherokee\x04Cher\0\x0AChorasmian\x04Chrs\0\x06Coptic\x04Copt\x04Qaac\0\x0CCypro_Minoan\x04Cpmn\0\x07Cypriot\x04Cprt\0\x08Cyrillic\x04Cyrl\0\x0ADevanagari\x04Deva\0\x0BDives_Akuru\x04Diak\0\x05Dogra\x04Dogr\0\x07Deseret\x04Dsrt\0\x08Duployan\x04Dupl\0\x14Egyptian_Hieroglyphs\x04Egyp\0\x07Elbasan\x04Elba\0\x07Elymaic\x04Elym\0\x08Ethiopic\x04Ethi\0\x05Garay\x04Gara\0\x08Georgian\x04Geor\0\x0AGlagolitic\x04Glag\0\x0DGunjala_Gondi\x04Gong\0\x0DMasaram_Gondi\x04Gonm\0\x06Gothic\x04Goth\0\x07Grantha\x04Gran\0\x05Greek\x04Grek\0\x08Gujarati\x04Gujr\0\x0CGurung_Khema\x04Gukh\0\x08Gurmukhi\x04Guru\0\x06Hangul\x04Hang\0\x03Han\x04Hani\0\x07Hanunoo\x04Hano\0\x06Hatran\x04Hatr\0\x06Hebrew\x04Hebr\0\x08Hiragana\x04Hira\0\x15Anatolian_Hieroglyphs\x04Hluw\0\x0CPahawh_Hmong\x04Hmng\0\x16Nyiakeng_Puachue_Hmong\x04Hmnp\0\x0DOld_Hungarian\x04Hung\0\x0AOld_Italic\x04Ital\0\x08Javanese\x04Java\0\x08Kayah_Li\x04Kali\0\x08Katakana\x04Kana\0\x04Kawi\0\x0AKharoshthi\x04Khar\0\x05Khmer\x04Khmr\0\x06Khojki\x04Khoj\0\x13Khitan_Small_Script\x04Kits\0\x07Kannada\x04Knda\0\x09Kirat_Rai\x04Krai\0\x06Kaithi\x04Kthi\0\x08Tai_Tham\x04Lana\0\x03Lao\x04Laoo\0\x05Latin\x04Latn\0\x06Lepcha\x04Lepc\0\x05Limbu\x04Limb\0\x08Linear_A\x04Lina\0\x08Linear_B\x04Linb\0\x04Lisu\0\x06Lycian\x04Lyci\0\x06Lydian\x04Lydi\0\x08Mahajani\x04Mahj\0\x07Makasar\x04Maka\0\x07Mandaic\x04Mand\0\x0AManichaean\x04Mani\0\x07Marchen\x04Marc\0\x0BMedefaidrin\x04Medf\0\x0DMende_Kikakui\x04Mend\0\x10Meroitic_Cursive\x04Merc\0\x14Meroitic_Hieroglyphs\x04Mero\0\x09Malayalam\x04Mlym\0\x04Modi\0\x09Mongolian\x04Mong\0\x03Mro\x04Mroo\0\x0CMeetei_Mayek\x04Mtei\0\x07Multani\x04Mult\0\x07Myanmar\x04Mymr\0\x0BNag_Mundari\x04Nagm\0\x0BNandinagari\x04Nand\0\x11Old_North_Arabian\x04Narb\0\x09Nabataean\x04Nbat\0\x04Newa\0\x03Nko\x04Nkoo\0\x05Nushu\x04Nshu\0\x05Ogham\x04Ogam\0\x08Ol_Chiki\x04Olck\0\x07Ol_Onal\x04Onao\0\x0AOld_Turkic\x04Orkh\0\x05Oriya\x04Orya\0\x05Osage\x04Osge\0\x07Osmanya\x04Osma\0\x0AOld_Uyghur\x04Ougr\0\x09Palmyrene\x04Palm\0\x0BPau_Cin_Hau\x04Pauc\0\x0AOld_Permic\x04Perm\0\x08Phags_Pa\x04Phag\0\x15Inscriptional_Pahlavi\x04Phli\0\x0FPsalter_Pahlavi\x04Phlp\0\x0APhoenician\x04Phnx\0\x04Miao\x04Plrd\0\x16Inscriptional_Parthian\x04Prti\0\x06Rejang\x04Rjng\0\x0FHanifi_Rohingya\x04Rohg\0\x05Runic\x04Runr\0\x09Samaritan\x04Samr\0\x11Old_South_Arabian\x04Sarb\0\x0ASaurashtra\x04Saur\0\x0BSignWriting\x04Sgnw\0\x07Shavian\x04Shaw\0\x07Sharada\x04Shrd\0\x07Siddham\x04Sidd\0\x07Sidetic\x04Sidt\0\x09Khudawadi\x04Sind\0\x07Sinhala\x04Sinh\0\x07Sogdian\x04Sogd\0\x0BOld_Sogdian\x04Sogo\0\x0CSora_Sompeng\x04Sora\0\x07Soyombo\x04Soyo\0\x09Sundanese\x04Sund\0\x07Sunuwar\x04Sunu\0\x0CSyloti_Nagri\x04Sylo\0\x06Syriac\x04Syrc\0\x08Tagbanwa\x04Tagb\0\x05Takri\x04Takr\0\x06Tai_Le\x04Tale\0\x0BNew_Tai_Lue\x04Talu\0\x05Tamil\x04Taml\0\x06Tangut\x04Tang\0\x08Tai_Viet\x04Tavt\0\x06Tai_Yo\x04Tayo\0\x06Telugu\x04Telu\0\x08Tifinagh\x04Tfng\0\x07Tagalog\x04Tglg\0\x06Thaana\x04Thaa\0\x04Thai\0\x07Tibetan\x04Tibt\0\x07Tirhuta\x04Tirh\0\x06Tangsa\x04Tnsa\0\x06Todhri\x04Todr\0\x0BTolong_Siki\x04Tols\0\x04Toto\0\x0DTulu_Tigalari\x04Tutg\0\x08Ugaritic\x04Ugar\0\x03Vai\x04Vaii\0\x08Vithkuqi\x04Vith\0\x0BWarang_Citi\x04Wara\0\x06Wancho\x04Wcho\0\x0BOld_Persian\x04Xpeo\0\x09Cuneiform\x04Xsux\0\x06Yezidi\x04Yezi\0\x02Yi\x04Yiii\0\x10Zanabazar_Square\x04Zanb\0\x09Inherited\x04Zinh\x04Qaai\0\x06Common\x04Zyyy";
 
-pub(crate) fn unicode_property_value_script_from_str(
-    s: &str,
-) -> Option<UnicodePropertyValueScript> {
-    use UnicodePropertyValueScript::*;
-    match s {
-        "Adlam" | "Adlm" => Some(Adlam),
-        "Caucasian_Albanian" | "Aghb" => Some(CaucasianAlbanian),
-        "Ahom" => Some(Ahom),
-        "Arabic" | "Arab" => Some(Arabic),
-        "Imperial_Aramaic" | "Armi" => Some(ImperialAramaic),
-        "Armenian" | "Armn" => Some(Armenian),
-        "Avestan" | "Avst" => Some(Avestan),
-        "Balinese" | "Bali" => Some(Balinese),
-        "Bamum" | "Bamu" => Some(Bamum),
-        "Bassa_Vah" | "Bass" => Some(BassaVah),
-        "Batak" | "Batk" => Some(Batak),
-        "Bengali" | "Beng" => Some(Bengali),
-        "Beria_Erfe" | "Berf" => Some(BeriaErfe),
-        "Bhaiksuki" | "Bhks" => Some(Bhaiksuki),
-        "Bopomofo" | "Bopo" => Some(Bopomofo),
-        "Brahmi" | "Brah" => Some(Brahmi),
-        "Braille" | "Brai" => Some(Braille),
-        "Buginese" | "Bugi" => Some(Buginese),
-        "Buhid" | "Buhd" => Some(Buhid),
-        "Chakma" | "Cakm" => Some(Chakma),
-        "Canadian_Aboriginal" | "Cans" => Some(CanadianAboriginal),
-        "Carian" | "Cari" => Some(Carian),
-        "Cham" => Some(Cham),
-        "Cherokee" | "Cher" => Some(Cherokee),
-        "Chorasmian" | "Chrs" => Some(Chorasmian),
-        "Coptic" | "Copt" | "Qaac" => Some(Coptic),
-        "Cypro_Minoan" | "Cpmn" => Some(CyproMinoan),
-        "Cypriot" | "Cprt" => Some(Cypriot),
-        "Cyrillic" | "Cyrl" => Some(Cyrillic),
-        "Devanagari" | "Deva" => Some(Devanagari),
-        "Dives_Akuru" | "Diak" => Some(DivesAkuru),
-        "Dogra" | "Dogr" => Some(Dogra),
-        "Deseret" | "Dsrt" => Some(Deseret),
-        "Duployan" | "Dupl" => Some(Duployan),
-        "Egyptian_Hieroglyphs" | "Egyp" => Some(EgyptianHieroglyphs),
-        "Elbasan" | "Elba" => Some(Elbasan),
-        "Elymaic" | "Elym" => Some(Elymaic),
-        "Ethiopic" | "Ethi" => Some(Ethiopic),
-        "Garay" | "Gara" => Some(Garay),
-        "Georgian" | "Geor" => Some(Georgian),
-        "Glagolitic" | "Glag" => Some(Glagolitic),
-        "Gunjala_Gondi" | "Gong" => Some(GunjalaGondi),
-        "Masaram_Gondi" | "Gonm" => Some(MasaramGondi),
-        "Gothic" | "Goth" => Some(Gothic),
-        "Grantha" | "Gran" => Some(Grantha),
-        "Greek" | "Grek" => Some(Greek),
-        "Gujarati" | "Gujr" => Some(Gujarati),
-        "Gurung_Khema" | "Gukh" => Some(GurungKhema),
-        "Gurmukhi" | "Guru" => Some(Gurmukhi),
-        "Hangul" | "Hang" => Some(Hangul),
-        "Han" | "Hani" => Some(Han),
-        "Hanunoo" | "Hano" => Some(Hanunoo),
-        "Hatran" | "Hatr" => Some(Hatran),
-        "Hebrew" | "Hebr" => Some(Hebrew),
-        "Hiragana" | "Hira" => Some(Hiragana),
-        "Anatolian_Hieroglyphs" | "Hluw" => Some(AnatolianHieroglyphs),
-        "Pahawh_Hmong" | "Hmng" => Some(PahawhHmong),
-        "Nyiakeng_Puachue_Hmong" | "Hmnp" => Some(NyiakengPuachueHmong),
-        "Old_Hungarian" | "Hung" => Some(OldHungarian),
-        "Old_Italic" | "Ital" => Some(OldItalic),
-        "Javanese" | "Java" => Some(Javanese),
-        "Kayah_Li" | "Kali" => Some(KayahLi),
-        "Katakana" | "Kana" => Some(Katakana),
-        "Kawi" => Some(Kawi),
-        "Kharoshthi" | "Khar" => Some(Kharoshthi),
-        "Khmer" | "Khmr" => Some(Khmer),
-        "Khojki" | "Khoj" => Some(Khojki),
-        "Khitan_Small_Script" | "Kits" => Some(KhitanSmallScript),
-        "Kannada" | "Knda" => Some(Kannada),
-        "Kirat_Rai" | "Krai" => Some(KiratRai),
-        "Kaithi" | "Kthi" => Some(Kaithi),
-        "Tai_Tham" | "Lana" => Some(TaiTham),
-        "Lao" | "Laoo" => Some(Lao),
-        "Latin" | "Latn" => Some(Latin),
-        "Lepcha" | "Lepc" => Some(Lepcha),
-        "Limbu" | "Limb" => Some(Limbu),
-        "Linear_A" | "Lina" => Some(LinearA),
-        "Linear_B" | "Linb" => Some(LinearB),
-        "Lisu" => Some(Lisu),
-        "Lycian" | "Lyci" => Some(Lycian),
-        "Lydian" | "Lydi" => Some(Lydian),
-        "Mahajani" | "Mahj" => Some(Mahajani),
-        "Makasar" | "Maka" => Some(Makasar),
-        "Mandaic" | "Mand" => Some(Mandaic),
-        "Manichaean" | "Mani" => Some(Manichaean),
-        "Marchen" | "Marc" => Some(Marchen),
-        "Medefaidrin" | "Medf" => Some(Medefaidrin),
-        "Mende_Kikakui" | "Mend" => Some(MendeKikakui),
-        "Meroitic_Cursive" | "Merc" => Some(MeroiticCursive),
-        "Meroitic_Hieroglyphs" | "Mero" => Some(MeroiticHieroglyphs),
-        "Malayalam" | "Mlym" => Some(Malayalam),
-        "Modi" => Some(Modi),
-        "Mongolian" | "Mong" => Some(Mongolian),
-        "Mro" | "Mroo" => Some(Mro),
-        "Meetei_Mayek" | "Mtei" => Some(MeeteiMayek),
-        "Multani" | "Mult" => Some(Multani),
-        "Myanmar" | "Mymr" => Some(Myanmar),
-        "Nag_Mundari" | "Nagm" => Some(NagMundari),
-        "Nandinagari" | "Nand" => Some(Nandinagari),
-        "Old_North_Arabian" | "Narb" => Some(OldNorthArabian),
-        "Nabataean" | "Nbat" => Some(Nabataean),
-        "Newa" => Some(Newa),
-        "Nko" | "Nkoo" => Some(Nko),
-        "Nushu" | "Nshu" => Some(Nushu),
-        "Ogham" | "Ogam" => Some(Ogham),
-        "Ol_Chiki" | "Olck" => Some(OlChiki),
-        "Ol_Onal" | "Onao" => Some(OlOnal),
-        "Old_Turkic" | "Orkh" => Some(OldTurkic),
-        "Oriya" | "Orya" => Some(Oriya),
-        "Osage" | "Osge" => Some(Osage),
-        "Osmanya" | "Osma" => Some(Osmanya),
-        "Old_Uyghur" | "Ougr" => Some(OldUyghur),
-        "Palmyrene" | "Palm" => Some(Palmyrene),
-        "Pau_Cin_Hau" | "Pauc" => Some(PauCinHau),
-        "Old_Permic" | "Perm" => Some(OldPermic),
-        "Phags_Pa" | "Phag" => Some(PhagsPa),
-        "Inscriptional_Pahlavi" | "Phli" => Some(InscriptionalPahlavi),
-        "Psalter_Pahlavi" | "Phlp" => Some(PsalterPahlavi),
-        "Phoenician" | "Phnx" => Some(Phoenician),
-        "Miao" | "Plrd" => Some(Miao),
-        "Inscriptional_Parthian" | "Prti" => Some(InscriptionalParthian),
-        "Rejang" | "Rjng" => Some(Rejang),
-        "Hanifi_Rohingya" | "Rohg" => Some(HanifiRohingya),
-        "Runic" | "Runr" => Some(Runic),
-        "Samaritan" | "Samr" => Some(Samaritan),
-        "Old_South_Arabian" | "Sarb" => Some(OldSouthArabian),
-        "Saurashtra" | "Saur" => Some(Saurashtra),
-        "SignWriting" | "Sgnw" => Some(SignWriting),
-        "Shavian" | "Shaw" => Some(Shavian),
-        "Sharada" | "Shrd" => Some(Sharada),
-        "Siddham" | "Sidd" => Some(Siddham),
-        "Sidetic" | "Sidt" => Some(Sidetic),
-        "Khudawadi" | "Sind" => Some(Khudawadi),
-        "Sinhala" | "Sinh" => Some(Sinhala),
-        "Sogdian" | "Sogd" => Some(Sogdian),
-        "Old_Sogdian" | "Sogo" => Some(OldSogdian),
-        "Sora_Sompeng" | "Sora" => Some(SoraSompeng),
-        "Soyombo" | "Soyo" => Some(Soyombo),
-        "Sundanese" | "Sund" => Some(Sundanese),
-        "Sunuwar" | "Sunu" => Some(Sunuwar),
-        "Syloti_Nagri" | "Sylo" => Some(SylotiNagri),
-        "Syriac" | "Syrc" => Some(Syriac),
-        "Tagbanwa" | "Tagb" => Some(Tagbanwa),
-        "Takri" | "Takr" => Some(Takri),
-        "Tai_Le" | "Tale" => Some(TaiLe),
-        "New_Tai_Lue" | "Talu" => Some(NewTaiLue),
-        "Tamil" | "Taml" => Some(Tamil),
-        "Tangut" | "Tang" => Some(Tangut),
-        "Tai_Viet" | "Tavt" => Some(TaiViet),
-        "Tai_Yo" | "Tayo" => Some(TaiYo),
-        "Telugu" | "Telu" => Some(Telugu),
-        "Tifinagh" | "Tfng" => Some(Tifinagh),
-        "Tagalog" | "Tglg" => Some(Tagalog),
-        "Thaana" | "Thaa" => Some(Thaana),
-        "Thai" => Some(Thai),
-        "Tibetan" | "Tibt" => Some(Tibetan),
-        "Tirhuta" | "Tirh" => Some(Tirhuta),
-        "Tangsa" | "Tnsa" => Some(Tangsa),
-        "Todhri" | "Todr" => Some(Todhri),
-        "Tolong_Siki" | "Tols" => Some(TolongSiki),
-        "Toto" => Some(Toto),
-        "Tulu_Tigalari" | "Tutg" => Some(TuluTigalari),
-        "Ugaritic" | "Ugar" => Some(Ugaritic),
-        "Vai" | "Vaii" => Some(Vai),
-        "Vithkuqi" | "Vith" => Some(Vithkuqi),
-        "Warang_Citi" | "Wara" => Some(WarangCiti),
-        "Wancho" | "Wcho" => Some(Wancho),
-        "Old_Persian" | "Xpeo" => Some(OldPersian),
-        "Cuneiform" | "Xsux" => Some(Cuneiform),
-        "Yezidi" | "Yezi" => Some(Yezidi),
-        "Yi" | "Yiii" => Some(Yi),
-        "Zanabazar_Square" | "Zanb" => Some(ZanabazarSquare),
-        "Inherited" | "Zinh" | "Qaai" => Some(Inherited),
-        "Common" | "Zyyy" => Some(Common),
-        _ => None,
-    }
-}
+static SCRIPTS: [&PackedIntervals; 174] = [
+    &ADLAM,
+    &CAUCASIAN_ALBANIAN,
+    &AHOM,
+    &ARABIC,
+    &IMPERIAL_ARAMAIC,
+    &ARMENIAN,
+    &AVESTAN,
+    &BALINESE,
+    &BAMUM,
+    &BASSA_VAH,
+    &BATAK,
+    &BENGALI,
+    &BERIA_ERFE,
+    &BHAIKSUKI,
+    &BOPOMOFO,
+    &BRAHMI,
+    &BRAILLE,
+    &BUGINESE,
+    &BUHID,
+    &CHAKMA,
+    &CANADIAN_ABORIGINAL,
+    &CARIAN,
+    &CHAM,
+    &CHEROKEE,
+    &CHORASMIAN,
+    &COPTIC,
+    &CYPRO_MINOAN,
+    &CYPRIOT,
+    &CYRILLIC,
+    &DEVANAGARI,
+    &DIVES_AKURU,
+    &DOGRA,
+    &DESERET,
+    &DUPLOYAN,
+    &EGYPTIAN_HIEROGLYPHS,
+    &ELBASAN,
+    &ELYMAIC,
+    &ETHIOPIC,
+    &GARAY,
+    &GEORGIAN,
+    &GLAGOLITIC,
+    &GUNJALA_GONDI,
+    &MASARAM_GONDI,
+    &GOTHIC,
+    &GRANTHA,
+    &GREEK,
+    &GUJARATI,
+    &GURUNG_KHEMA,
+    &GURMUKHI,
+    &HANGUL,
+    &HAN,
+    &HANUNOO,
+    &HATRAN,
+    &HEBREW,
+    &HIRAGANA,
+    &ANATOLIAN_HIEROGLYPHS,
+    &PAHAWH_HMONG,
+    &NYIAKENG_PUACHUE_HMONG,
+    &OLD_HUNGARIAN,
+    &OLD_ITALIC,
+    &JAVANESE,
+    &KAYAH_LI,
+    &KATAKANA,
+    &KAWI,
+    &KHAROSHTHI,
+    &KHMER,
+    &KHOJKI,
+    &KHITAN_SMALL_SCRIPT,
+    &KANNADA,
+    &KIRAT_RAI,
+    &KAITHI,
+    &TAI_THAM,
+    &LAO,
+    &LATIN,
+    &LEPCHA,
+    &LIMBU,
+    &LINEAR_A,
+    &LINEAR_B,
+    &LISU,
+    &LYCIAN,
+    &LYDIAN,
+    &MAHAJANI,
+    &MAKASAR,
+    &MANDAIC,
+    &MANICHAEAN,
+    &MARCHEN,
+    &MEDEFAIDRIN,
+    &MENDE_KIKAKUI,
+    &MEROITIC_CURSIVE,
+    &MEROITIC_HIEROGLYPHS,
+    &MALAYALAM,
+    &MODI,
+    &MONGOLIAN,
+    &MRO,
+    &MEETEI_MAYEK,
+    &MULTANI,
+    &MYANMAR,
+    &NAG_MUNDARI,
+    &NANDINAGARI,
+    &OLD_NORTH_ARABIAN,
+    &NABATAEAN,
+    &NEWA,
+    &NKO,
+    &NUSHU,
+    &OGHAM,
+    &OL_CHIKI,
+    &OL_ONAL,
+    &OLD_TURKIC,
+    &ORIYA,
+    &OSAGE,
+    &OSMANYA,
+    &OLD_UYGHUR,
+    &PALMYRENE,
+    &PAU_CIN_HAU,
+    &OLD_PERMIC,
+    &PHAGS_PA,
+    &INSCRIPTIONAL_PAHLAVI,
+    &PSALTER_PAHLAVI,
+    &PHOENICIAN,
+    &MIAO,
+    &INSCRIPTIONAL_PARTHIAN,
+    &REJANG,
+    &HANIFI_ROHINGYA,
+    &RUNIC,
+    &SAMARITAN,
+    &OLD_SOUTH_ARABIAN,
+    &SAURASHTRA,
+    &SIGNWRITING,
+    &SHAVIAN,
+    &SHARADA,
+    &SIDDHAM,
+    &SIDETIC,
+    &KHUDAWADI,
+    &SINHALA,
+    &SOGDIAN,
+    &OLD_SOGDIAN,
+    &SORA_SOMPENG,
+    &SOYOMBO,
+    &SUNDANESE,
+    &SUNUWAR,
+    &SYLOTI_NAGRI,
+    &SYRIAC,
+    &TAGBANWA,
+    &TAKRI,
+    &TAI_LE,
+    &NEW_TAI_LUE,
+    &TAMIL,
+    &TANGUT,
+    &TAI_VIET,
+    &TAI_YO,
+    &TELUGU,
+    &TIFINAGH,
+    &TAGALOG,
+    &THAANA,
+    &THAI,
+    &TIBETAN,
+    &TIRHUTA,
+    &TANGSA,
+    &TODHRI,
+    &TOLONG_SIKI,
+    &TOTO,
+    &TULU_TIGALARI,
+    &UGARITIC,
+    &VAI,
+    &VITHKUQI,
+    &WARANG_CITI,
+    &WANCHO,
+    &OLD_PERSIAN,
+    &CUNEIFORM,
+    &YEZIDI,
+    &YI,
+    &ZANABAZAR_SQUARE,
+    &INHERITED,
+    &COMMON,
+];
 
-pub(crate) fn script_value_ranges(value: &UnicodePropertyValueScript) -> &'static PackedIntervals {
-    use UnicodePropertyValueScript::*;
-    match value {
-        Adlam => &ADLAM,
-        CaucasianAlbanian => &CAUCASIAN_ALBANIAN,
-        Ahom => &AHOM,
-        Arabic => &ARABIC,
-        ImperialAramaic => &IMPERIAL_ARAMAIC,
-        Armenian => &ARMENIAN,
-        Avestan => &AVESTAN,
-        Balinese => &BALINESE,
-        Bamum => &BAMUM,
-        BassaVah => &BASSA_VAH,
-        Batak => &BATAK,
-        Bengali => &BENGALI,
-        BeriaErfe => &BERIA_ERFE,
-        Bhaiksuki => &BHAIKSUKI,
-        Bopomofo => &BOPOMOFO,
-        Brahmi => &BRAHMI,
-        Braille => &BRAILLE,
-        Buginese => &BUGINESE,
-        Buhid => &BUHID,
-        Chakma => &CHAKMA,
-        CanadianAboriginal => &CANADIAN_ABORIGINAL,
-        Carian => &CARIAN,
-        Cham => &CHAM,
-        Cherokee => &CHEROKEE,
-        Chorasmian => &CHORASMIAN,
-        Coptic => &COPTIC,
-        CyproMinoan => &CYPRO_MINOAN,
-        Cypriot => &CYPRIOT,
-        Cyrillic => &CYRILLIC,
-        Devanagari => &DEVANAGARI,
-        DivesAkuru => &DIVES_AKURU,
-        Dogra => &DOGRA,
-        Deseret => &DESERET,
-        Duployan => &DUPLOYAN,
-        EgyptianHieroglyphs => &EGYPTIAN_HIEROGLYPHS,
-        Elbasan => &ELBASAN,
-        Elymaic => &ELYMAIC,
-        Ethiopic => &ETHIOPIC,
-        Garay => &GARAY,
-        Georgian => &GEORGIAN,
-        Glagolitic => &GLAGOLITIC,
-        GunjalaGondi => &GUNJALA_GONDI,
-        MasaramGondi => &MASARAM_GONDI,
-        Gothic => &GOTHIC,
-        Grantha => &GRANTHA,
-        Greek => &GREEK,
-        Gujarati => &GUJARATI,
-        GurungKhema => &GURUNG_KHEMA,
-        Gurmukhi => &GURMUKHI,
-        Hangul => &HANGUL,
-        Han => &HAN,
-        Hanunoo => &HANUNOO,
-        Hatran => &HATRAN,
-        Hebrew => &HEBREW,
-        Hiragana => &HIRAGANA,
-        AnatolianHieroglyphs => &ANATOLIAN_HIEROGLYPHS,
-        PahawhHmong => &PAHAWH_HMONG,
-        NyiakengPuachueHmong => &NYIAKENG_PUACHUE_HMONG,
-        OldHungarian => &OLD_HUNGARIAN,
-        OldItalic => &OLD_ITALIC,
-        Javanese => &JAVANESE,
-        KayahLi => &KAYAH_LI,
-        Katakana => &KATAKANA,
-        Kawi => &KAWI,
-        Kharoshthi => &KHAROSHTHI,
-        Khmer => &KHMER,
-        Khojki => &KHOJKI,
-        KhitanSmallScript => &KHITAN_SMALL_SCRIPT,
-        Kannada => &KANNADA,
-        KiratRai => &KIRAT_RAI,
-        Kaithi => &KAITHI,
-        TaiTham => &TAI_THAM,
-        Lao => &LAO,
-        Latin => &LATIN,
-        Lepcha => &LEPCHA,
-        Limbu => &LIMBU,
-        LinearA => &LINEAR_A,
-        LinearB => &LINEAR_B,
-        Lisu => &LISU,
-        Lycian => &LYCIAN,
-        Lydian => &LYDIAN,
-        Mahajani => &MAHAJANI,
-        Makasar => &MAKASAR,
-        Mandaic => &MANDAIC,
-        Manichaean => &MANICHAEAN,
-        Marchen => &MARCHEN,
-        Medefaidrin => &MEDEFAIDRIN,
-        MendeKikakui => &MENDE_KIKAKUI,
-        MeroiticCursive => &MEROITIC_CURSIVE,
-        MeroiticHieroglyphs => &MEROITIC_HIEROGLYPHS,
-        Malayalam => &MALAYALAM,
-        Modi => &MODI,
-        Mongolian => &MONGOLIAN,
-        Mro => &MRO,
-        MeeteiMayek => &MEETEI_MAYEK,
-        Multani => &MULTANI,
-        Myanmar => &MYANMAR,
-        NagMundari => &NAG_MUNDARI,
-        Nandinagari => &NANDINAGARI,
-        OldNorthArabian => &OLD_NORTH_ARABIAN,
-        Nabataean => &NABATAEAN,
-        Newa => &NEWA,
-        Nko => &NKO,
-        Nushu => &NUSHU,
-        Ogham => &OGHAM,
-        OlChiki => &OL_CHIKI,
-        OlOnal => &OL_ONAL,
-        OldTurkic => &OLD_TURKIC,
-        Oriya => &ORIYA,
-        Osage => &OSAGE,
-        Osmanya => &OSMANYA,
-        OldUyghur => &OLD_UYGHUR,
-        Palmyrene => &PALMYRENE,
-        PauCinHau => &PAU_CIN_HAU,
-        OldPermic => &OLD_PERMIC,
-        PhagsPa => &PHAGS_PA,
-        InscriptionalPahlavi => &INSCRIPTIONAL_PAHLAVI,
-        PsalterPahlavi => &PSALTER_PAHLAVI,
-        Phoenician => &PHOENICIAN,
-        Miao => &MIAO,
-        InscriptionalParthian => &INSCRIPTIONAL_PARTHIAN,
-        Rejang => &REJANG,
-        HanifiRohingya => &HANIFI_ROHINGYA,
-        Runic => &RUNIC,
-        Samaritan => &SAMARITAN,
-        OldSouthArabian => &OLD_SOUTH_ARABIAN,
-        Saurashtra => &SAURASHTRA,
-        SignWriting => &SIGNWRITING,
-        Shavian => &SHAVIAN,
-        Sharada => &SHARADA,
-        Siddham => &SIDDHAM,
-        Sidetic => &SIDETIC,
-        Khudawadi => &KHUDAWADI,
-        Sinhala => &SINHALA,
-        Sogdian => &SOGDIAN,
-        OldSogdian => &OLD_SOGDIAN,
-        SoraSompeng => &SORA_SOMPENG,
-        Soyombo => &SOYOMBO,
-        Sundanese => &SUNDANESE,
-        Sunuwar => &SUNUWAR,
-        SylotiNagri => &SYLOTI_NAGRI,
-        Syriac => &SYRIAC,
-        Tagbanwa => &TAGBANWA,
-        Takri => &TAKRI,
-        TaiLe => &TAI_LE,
-        NewTaiLue => &NEW_TAI_LUE,
-        Tamil => &TAMIL,
-        Tangut => &TANGUT,
-        TaiViet => &TAI_VIET,
-        TaiYo => &TAI_YO,
-        Telugu => &TELUGU,
-        Tifinagh => &TIFINAGH,
-        Tagalog => &TAGALOG,
-        Thaana => &THAANA,
-        Thai => &THAI,
-        Tibetan => &TIBETAN,
-        Tirhuta => &TIRHUTA,
-        Tangsa => &TANGSA,
-        Todhri => &TODHRI,
-        TolongSiki => &TOLONG_SIKI,
-        Toto => &TOTO,
-        TuluTigalari => &TULU_TIGALARI,
-        Ugaritic => &UGARITIC,
-        Vai => &VAI,
-        Vithkuqi => &VITHKUQI,
-        WarangCiti => &WARANG_CITI,
-        Wancho => &WANCHO,
-        OldPersian => &OLD_PERSIAN,
-        Cuneiform => &CUNEIFORM,
-        Yezidi => &YEZIDI,
-        Yi => &YI,
-        ZanabazarSquare => &ZANABAZAR_SQUARE,
-        Inherited => &INHERITED,
-        Common => &COMMON,
-    }
-}
+static SCRIPT_EXTENSIONS: [&PackedIntervals; 174] = [
+    &ADLAM_EXTENSIONS,
+    &CAUCASIAN_ALBANIAN_EXTENSIONS,
+    &AHOM,
+    &ARABIC_EXTENSIONS,
+    &IMPERIAL_ARAMAIC,
+    &ARMENIAN_EXTENSIONS,
+    &AVESTAN_EXTENSIONS,
+    &BALINESE,
+    &BAMUM,
+    &BASSA_VAH,
+    &BATAK,
+    &BENGALI_EXTENSIONS,
+    &BERIA_ERFE,
+    &BHAIKSUKI,
+    &BOPOMOFO_EXTENSIONS,
+    &BRAHMI,
+    &BRAILLE,
+    &BUGINESE_EXTENSIONS,
+    &BUHID_EXTENSIONS,
+    &CHAKMA_EXTENSIONS,
+    &CANADIAN_ABORIGINAL,
+    &CARIAN_EXTENSIONS,
+    &CHAM,
+    &CHEROKEE_EXTENSIONS,
+    &CHORASMIAN,
+    &COPTIC_EXTENSIONS,
+    &CYPRO_MINOAN_EXTENSIONS,
+    &CYPRIOT_EXTENSIONS,
+    &CYRILLIC_EXTENSIONS,
+    &DEVANAGARI_EXTENSIONS,
+    &DIVES_AKURU,
+    &DOGRA_EXTENSIONS,
+    &DESERET,
+    &DUPLOYAN_EXTENSIONS,
+    &EGYPTIAN_HIEROGLYPHS,
+    &ELBASAN_EXTENSIONS,
+    &ELYMAIC,
+    &ETHIOPIC_EXTENSIONS,
+    &GARAY_EXTENSIONS,
+    &GEORGIAN_EXTENSIONS,
+    &GLAGOLITIC_EXTENSIONS,
+    &GUNJALA_GONDI_EXTENSIONS,
+    &MASARAM_GONDI_EXTENSIONS,
+    &GOTHIC_EXTENSIONS,
+    &GRANTHA_EXTENSIONS,
+    &GREEK_EXTENSIONS,
+    &GUJARATI_EXTENSIONS,
+    &GURUNG_KHEMA_EXTENSIONS,
+    &GURMUKHI_EXTENSIONS,
+    &HANGUL_EXTENSIONS,
+    &HAN_EXTENSIONS,
+    &HANUNOO_EXTENSIONS,
+    &HATRAN,
+    &HEBREW_EXTENSIONS,
+    &HIRAGANA_EXTENSIONS,
+    &ANATOLIAN_HIEROGLYPHS,
+    &PAHAWH_HMONG,
+    &NYIAKENG_PUACHUE_HMONG,
+    &OLD_HUNGARIAN_EXTENSIONS,
+    &OLD_ITALIC,
+    &JAVANESE_EXTENSIONS,
+    &KAYAH_LI_EXTENSIONS,
+    &KATAKANA_EXTENSIONS,
+    &KAWI,
+    &KHAROSHTHI,
+    &KHMER,
+    &KHOJKI_EXTENSIONS,
+    &KHITAN_SMALL_SCRIPT,
+    &KANNADA_EXTENSIONS,
+    &KIRAT_RAI,
+    &KAITHI_EXTENSIONS,
+    &TAI_THAM,
+    &LAO,
+    &LATIN_EXTENSIONS,
+    &LEPCHA,
+    &LIMBU_EXTENSIONS,
+    &LINEAR_A_EXTENSIONS,
+    &LINEAR_B_EXTENSIONS,
+    &LISU_EXTENSIONS,
+    &LYCIAN_EXTENSIONS,
+    &LYDIAN_EXTENSIONS,
+    &MAHAJANI_EXTENSIONS,
+    &MAKASAR,
+    &MANDAIC_EXTENSIONS,
+    &MANICHAEAN_EXTENSIONS,
+    &MARCHEN,
+    &MEDEFAIDRIN,
+    &MENDE_KIKAKUI,
+    &MEROITIC_CURSIVE,
+    &MEROITIC_HIEROGLYPHS_EXTENSIONS,
+    &MALAYALAM_EXTENSIONS,
+    &MODI_EXTENSIONS,
+    &MONGOLIAN_EXTENSIONS,
+    &MRO,
+    &MEETEI_MAYEK,
+    &MULTANI_EXTENSIONS,
+    &MYANMAR_EXTENSIONS,
+    &NAG_MUNDARI,
+    &NANDINAGARI_EXTENSIONS,
+    &OLD_NORTH_ARABIAN,
+    &NABATAEAN,
+    &NEWA_EXTENSIONS,
+    &NKO_EXTENSIONS,
+    &NUSHU,
+    &OGHAM,
+    &OL_CHIKI,
+    &OL_ONAL_EXTENSIONS,
+    &OLD_TURKIC_EXTENSIONS,
+    &ORIYA_EXTENSIONS,
+    &OSAGE_EXTENSIONS,
+    &OSMANYA,
+    &OLD_UYGHUR_EXTENSIONS,
+    &PALMYRENE,
+    &PAU_CIN_HAU,
+    &OLD_PERMIC_EXTENSIONS,
+    &PHAGS_PA_EXTENSIONS,
+    &INSCRIPTIONAL_PAHLAVI,
+    &PSALTER_PAHLAVI_EXTENSIONS,
+    &PHOENICIAN,
+    &MIAO,
+    &INSCRIPTIONAL_PARTHIAN,
+    &REJANG,
+    &HANIFI_ROHINGYA_EXTENSIONS,
+    &RUNIC_EXTENSIONS,
+    &SAMARITAN_EXTENSIONS,
+    &OLD_SOUTH_ARABIAN,
+    &SAURASHTRA,
+    &SIGNWRITING,
+    &SHAVIAN_EXTENSIONS,
+    &SHARADA_EXTENSIONS,
+    &SIDDHAM,
+    &SIDETIC,
+    &KHUDAWADI_EXTENSIONS,
+    &SINHALA_EXTENSIONS,
+    &SOGDIAN_EXTENSIONS,
+    &OLD_SOGDIAN,
+    &SORA_SOMPENG,
+    &SOYOMBO,
+    &SUNDANESE,
+    &SUNUWAR_EXTENSIONS,
+    &SYLOTI_NAGRI_EXTENSIONS,
+    &SYRIAC_EXTENSIONS,
+    &TAGBANWA_EXTENSIONS,
+    &TAKRI_EXTENSIONS,
+    &TAI_LE_EXTENSIONS,
+    &NEW_TAI_LUE,
+    &TAMIL_EXTENSIONS,
+    &TANGUT_EXTENSIONS,
+    &TAI_VIET,
+    &TAI_YO,
+    &TELUGU_EXTENSIONS,
+    &TIFINAGH_EXTENSIONS,
+    &TAGALOG_EXTENSIONS,
+    &THAANA_EXTENSIONS,
+    &THAI_EXTENSIONS,
+    &TIBETAN_EXTENSIONS,
+    &TIRHUTA_EXTENSIONS,
+    &TANGSA,
+    &TODHRI_EXTENSIONS,
+    &TOLONG_SIKI,
+    &TOTO_EXTENSIONS,
+    &TULU_TIGALARI_EXTENSIONS,
+    &UGARITIC,
+    &VAI,
+    &VITHKUQI,
+    &WARANG_CITI,
+    &WANCHO,
+    &OLD_PERSIAN,
+    &CUNEIFORM,
+    &YEZIDI_EXTENSIONS,
+    &YI_EXTENSIONS,
+    &ZANABAZAR_SQUARE,
+    &INHERITED_EXTENSIONS,
+    &COMMON_EXTENSIONS,
+];
 
-pub(crate) fn script_extensions_value_ranges(
-    value: &UnicodePropertyValueScript,
-) -> &'static PackedIntervals {
-    use UnicodePropertyValueScript::*;
-    match value {
-        Adlam => &ADLAM_EXTENSIONS,
-        CaucasianAlbanian => &CAUCASIAN_ALBANIAN_EXTENSIONS,
-        Ahom => &AHOM,
-        Arabic => &ARABIC_EXTENSIONS,
-        ImperialAramaic => &IMPERIAL_ARAMAIC,
-        Armenian => &ARMENIAN_EXTENSIONS,
-        Avestan => &AVESTAN_EXTENSIONS,
-        Balinese => &BALINESE,
-        Bamum => &BAMUM,
-        BassaVah => &BASSA_VAH,
-        Batak => &BATAK,
-        Bengali => &BENGALI_EXTENSIONS,
-        BeriaErfe => &BERIA_ERFE,
-        Bhaiksuki => &BHAIKSUKI,
-        Bopomofo => &BOPOMOFO_EXTENSIONS,
-        Brahmi => &BRAHMI,
-        Braille => &BRAILLE,
-        Buginese => &BUGINESE_EXTENSIONS,
-        Buhid => &BUHID_EXTENSIONS,
-        Chakma => &CHAKMA_EXTENSIONS,
-        CanadianAboriginal => &CANADIAN_ABORIGINAL,
-        Carian => &CARIAN_EXTENSIONS,
-        Cham => &CHAM,
-        Cherokee => &CHEROKEE_EXTENSIONS,
-        Chorasmian => &CHORASMIAN,
-        Coptic => &COPTIC_EXTENSIONS,
-        CyproMinoan => &CYPRO_MINOAN_EXTENSIONS,
-        Cypriot => &CYPRIOT_EXTENSIONS,
-        Cyrillic => &CYRILLIC_EXTENSIONS,
-        Devanagari => &DEVANAGARI_EXTENSIONS,
-        DivesAkuru => &DIVES_AKURU,
-        Dogra => &DOGRA_EXTENSIONS,
-        Deseret => &DESERET,
-        Duployan => &DUPLOYAN_EXTENSIONS,
-        EgyptianHieroglyphs => &EGYPTIAN_HIEROGLYPHS,
-        Elbasan => &ELBASAN_EXTENSIONS,
-        Elymaic => &ELYMAIC,
-        Ethiopic => &ETHIOPIC_EXTENSIONS,
-        Garay => &GARAY_EXTENSIONS,
-        Georgian => &GEORGIAN_EXTENSIONS,
-        Glagolitic => &GLAGOLITIC_EXTENSIONS,
-        GunjalaGondi => &GUNJALA_GONDI_EXTENSIONS,
-        MasaramGondi => &MASARAM_GONDI_EXTENSIONS,
-        Gothic => &GOTHIC_EXTENSIONS,
-        Grantha => &GRANTHA_EXTENSIONS,
-        Greek => &GREEK_EXTENSIONS,
-        Gujarati => &GUJARATI_EXTENSIONS,
-        GurungKhema => &GURUNG_KHEMA_EXTENSIONS,
-        Gurmukhi => &GURMUKHI_EXTENSIONS,
-        Hangul => &HANGUL_EXTENSIONS,
-        Han => &HAN_EXTENSIONS,
-        Hanunoo => &HANUNOO_EXTENSIONS,
-        Hatran => &HATRAN,
-        Hebrew => &HEBREW_EXTENSIONS,
-        Hiragana => &HIRAGANA_EXTENSIONS,
-        AnatolianHieroglyphs => &ANATOLIAN_HIEROGLYPHS,
-        PahawhHmong => &PAHAWH_HMONG,
-        NyiakengPuachueHmong => &NYIAKENG_PUACHUE_HMONG,
-        OldHungarian => &OLD_HUNGARIAN_EXTENSIONS,
-        OldItalic => &OLD_ITALIC,
-        Javanese => &JAVANESE_EXTENSIONS,
-        KayahLi => &KAYAH_LI_EXTENSIONS,
-        Katakana => &KATAKANA_EXTENSIONS,
-        Kawi => &KAWI,
-        Kharoshthi => &KHAROSHTHI,
-        Khmer => &KHMER,
-        Khojki => &KHOJKI_EXTENSIONS,
-        KhitanSmallScript => &KHITAN_SMALL_SCRIPT,
-        Kannada => &KANNADA_EXTENSIONS,
-        KiratRai => &KIRAT_RAI,
-        Kaithi => &KAITHI_EXTENSIONS,
-        TaiTham => &TAI_THAM,
-        Lao => &LAO,
-        Latin => &LATIN_EXTENSIONS,
-        Lepcha => &LEPCHA,
-        Limbu => &LIMBU_EXTENSIONS,
-        LinearA => &LINEAR_A_EXTENSIONS,
-        LinearB => &LINEAR_B_EXTENSIONS,
-        Lisu => &LISU_EXTENSIONS,
-        Lycian => &LYCIAN_EXTENSIONS,
-        Lydian => &LYDIAN_EXTENSIONS,
-        Mahajani => &MAHAJANI_EXTENSIONS,
-        Makasar => &MAKASAR,
-        Mandaic => &MANDAIC_EXTENSIONS,
-        Manichaean => &MANICHAEAN_EXTENSIONS,
-        Marchen => &MARCHEN,
-        Medefaidrin => &MEDEFAIDRIN,
-        MendeKikakui => &MENDE_KIKAKUI,
-        MeroiticCursive => &MEROITIC_CURSIVE,
-        MeroiticHieroglyphs => &MEROITIC_HIEROGLYPHS_EXTENSIONS,
-        Malayalam => &MALAYALAM_EXTENSIONS,
-        Modi => &MODI_EXTENSIONS,
-        Mongolian => &MONGOLIAN_EXTENSIONS,
-        Mro => &MRO,
-        MeeteiMayek => &MEETEI_MAYEK,
-        Multani => &MULTANI_EXTENSIONS,
-        Myanmar => &MYANMAR_EXTENSIONS,
-        NagMundari => &NAG_MUNDARI,
-        Nandinagari => &NANDINAGARI_EXTENSIONS,
-        OldNorthArabian => &OLD_NORTH_ARABIAN,
-        Nabataean => &NABATAEAN,
-        Newa => &NEWA_EXTENSIONS,
-        Nko => &NKO_EXTENSIONS,
-        Nushu => &NUSHU,
-        Ogham => &OGHAM,
-        OlChiki => &OL_CHIKI,
-        OlOnal => &OL_ONAL_EXTENSIONS,
-        OldTurkic => &OLD_TURKIC_EXTENSIONS,
-        Oriya => &ORIYA_EXTENSIONS,
-        Osage => &OSAGE_EXTENSIONS,
-        Osmanya => &OSMANYA,
-        OldUyghur => &OLD_UYGHUR_EXTENSIONS,
-        Palmyrene => &PALMYRENE,
-        PauCinHau => &PAU_CIN_HAU,
-        OldPermic => &OLD_PERMIC_EXTENSIONS,
-        PhagsPa => &PHAGS_PA_EXTENSIONS,
-        InscriptionalPahlavi => &INSCRIPTIONAL_PAHLAVI,
-        PsalterPahlavi => &PSALTER_PAHLAVI_EXTENSIONS,
-        Phoenician => &PHOENICIAN,
-        Miao => &MIAO,
-        InscriptionalParthian => &INSCRIPTIONAL_PARTHIAN,
-        Rejang => &REJANG,
-        HanifiRohingya => &HANIFI_ROHINGYA_EXTENSIONS,
-        Runic => &RUNIC_EXTENSIONS,
-        Samaritan => &SAMARITAN_EXTENSIONS,
-        OldSouthArabian => &OLD_SOUTH_ARABIAN,
-        Saurashtra => &SAURASHTRA,
-        SignWriting => &SIGNWRITING,
-        Shavian => &SHAVIAN_EXTENSIONS,
-        Sharada => &SHARADA_EXTENSIONS,
-        Siddham => &SIDDHAM,
-        Sidetic => &SIDETIC,
-        Khudawadi => &KHUDAWADI_EXTENSIONS,
-        Sinhala => &SINHALA_EXTENSIONS,
-        Sogdian => &SOGDIAN_EXTENSIONS,
-        OldSogdian => &OLD_SOGDIAN,
-        SoraSompeng => &SORA_SOMPENG,
-        Soyombo => &SOYOMBO,
-        Sundanese => &SUNDANESE,
-        Sunuwar => &SUNUWAR_EXTENSIONS,
-        SylotiNagri => &SYLOTI_NAGRI_EXTENSIONS,
-        Syriac => &SYRIAC_EXTENSIONS,
-        Tagbanwa => &TAGBANWA_EXTENSIONS,
-        Takri => &TAKRI_EXTENSIONS,
-        TaiLe => &TAI_LE_EXTENSIONS,
-        NewTaiLue => &NEW_TAI_LUE,
-        Tamil => &TAMIL_EXTENSIONS,
-        Tangut => &TANGUT_EXTENSIONS,
-        TaiViet => &TAI_VIET,
-        TaiYo => &TAI_YO,
-        Telugu => &TELUGU_EXTENSIONS,
-        Tifinagh => &TIFINAGH_EXTENSIONS,
-        Tagalog => &TAGALOG_EXTENSIONS,
-        Thaana => &THAANA_EXTENSIONS,
-        Thai => &THAI_EXTENSIONS,
-        Tibetan => &TIBETAN_EXTENSIONS,
-        Tirhuta => &TIRHUTA_EXTENSIONS,
-        Tangsa => &TANGSA,
-        Todhri => &TODHRI_EXTENSIONS,
-        TolongSiki => &TOLONG_SIKI,
-        Toto => &TOTO_EXTENSIONS,
-        TuluTigalari => &TULU_TIGALARI_EXTENSIONS,
-        Ugaritic => &UGARITIC,
-        Vai => &VAI,
-        Vithkuqi => &VITHKUQI,
-        WarangCiti => &WARANG_CITI,
-        Wancho => &WANCHO,
-        OldPersian => &OLD_PERSIAN,
-        Cuneiform => &CUNEIFORM,
-        Yezidi => &YEZIDI_EXTENSIONS,
-        Yi => &YI_EXTENSIONS,
-        ZanabazarSquare => &ZANABAZAR_SQUARE,
-        Inherited => &INHERITED_EXTENSIONS,
-        Common => &COMMON_EXTENSIONS,
-    }
+/// The table of the Script value `name`, or of its Script_Extensions.
+pub(crate) fn script_from_str(name: &str, extensions: bool) -> Option<&'static PackedIntervals> {
+    let index = lookup_property_name(SCRIPT_NAMES, name)?;
+    Some(if extensions {
+        SCRIPT_EXTENSIONS[index]
+    } else {
+        SCRIPTS[index]
+    })
 }
 
 pub(crate) const TO_UPPERCASE: [FoldRange; 202] = [
@@ -28354,49 +27358,23 @@ static STRING_LENGTHS: [u8; packed_strings::count_strings(&STRING_SETS)] =
 static STRING_CODE_POINTS: [u8; packed_strings::count_code_points(&STRING_SETS) * 3] =
     packed_strings::pack_code_points(&STRING_SETS);
 
-#[derive(Debug, Clone, Copy)]
-pub enum UnicodeStringProperty {
-    BasicEmoji,
-    EmojiKeycapSequence,
-    RGIEmojiFlagSequence,
-    RGIEmojiModifierSequence,
-    RGIEmojiTagSequence,
-    RGIEmojiZWJSequence,
-    RGIEmoji,
-}
+/// Property-of-strings names: line i selects the run `STRING_PROPERTY_RUNS[i]` of the sets.
+/// Each value is its names, each a length byte and the name, then a zero byte.
+const STRING_PROPERTY_NAMES: &[u8] = b"\x0BBasic_Emoji\0\x15Emoji_Keycap_Sequence\0\x17RGI_Emoji_Flag_Sequence\0\x1BRGI_Emoji_Modifier_Sequence\0\x16RGI_Emoji_Tag_Sequence\0\x16RGI_Emoji_ZWJ_Sequence\0\x09RGI_Emoji";
 
-pub(crate) fn string_property_sets(value: &UnicodeStringProperty) -> StringSet {
-    use UnicodeStringProperty::*;
-    // A property is a run of the sets; `RGI_Emoji` is all of them.
-    let (first, last) = match value {
-        BasicEmoji => (0, 1),
-        EmojiKeycapSequence => (1, 2),
-        RGIEmojiFlagSequence => (2, 3),
-        RGIEmojiModifierSequence => (3, 4),
-        RGIEmojiTagSequence => (4, 5),
-        RGIEmojiZWJSequence => (5, 6),
-        RGIEmoji => (0, 6),
-    };
-    StringSet::new(
+/// Each property of strings as a run of the sets; `RGI_Emoji` is all of them.
+const STRING_PROPERTY_RUNS: [(usize, usize); 7] =
+    [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (0, 6)];
+
+/// The strings of the property of strings `name`.
+pub(crate) fn string_property_from_str(name: &str) -> Option<StringSet> {
+    let (first, last) = STRING_PROPERTY_RUNS[lookup_property_name(STRING_PROPERTY_NAMES, name)?];
+    Some(StringSet::new(
         &STRING_LENGTHS,
         &STRING_CODE_POINTS,
         STRING_STARTS[first],
         STRING_STARTS[last],
-    )
-}
-
-pub fn unicode_string_property_from_str(s: &str) -> Option<UnicodeStringProperty> {
-    use UnicodeStringProperty::*;
-    match s {
-        "Basic_Emoji" => Some(BasicEmoji),
-        "Emoji_Keycap_Sequence" => Some(EmojiKeycapSequence),
-        "RGI_Emoji_Flag_Sequence" => Some(RGIEmojiFlagSequence),
-        "RGI_Emoji_Modifier_Sequence" => Some(RGIEmojiModifierSequence),
-        "RGI_Emoji_Tag_Sequence" => Some(RGIEmojiTagSequence),
-        "RGI_Emoji_ZWJ_Sequence" => Some(RGIEmojiZWJSequence),
-        "RGI_Emoji" => Some(RGIEmoji),
-        _ => None,
-    }
+    ))
 }
 
 // ZIPP packed-table round-trip tests.
@@ -29460,7 +28438,7 @@ fn all_packed_intervals_match_generated_source() {
 fn all_packed_string_sets_match_generated_source() {
     let mut all: Vec<Vec<u32>> = Vec::new();
     let generated: Vec<Vec<u32>> = BASIC_EMOJI.iter().map(|s| s.to_vec()).collect();
-    let set = string_property_sets(&UnicodeStringProperty::BasicEmoji);
+    let set = string_property_from_str("Basic_Emoji").unwrap();
     assert_eq!(
         set.iter().map(|s| s.to_vec()).collect::<Vec<_>>(),
         generated,
@@ -29473,7 +28451,7 @@ fn all_packed_string_sets_match_generated_source() {
     );
     all.extend(generated);
     let generated: Vec<Vec<u32>> = EMOJI_KEYCAP_SEQUENCE.iter().map(|s| s.to_vec()).collect();
-    let set = string_property_sets(&UnicodeStringProperty::EmojiKeycapSequence);
+    let set = string_property_from_str("Emoji_Keycap_Sequence").unwrap();
     assert_eq!(
         set.iter().map(|s| s.to_vec()).collect::<Vec<_>>(),
         generated,
@@ -29486,7 +28464,7 @@ fn all_packed_string_sets_match_generated_source() {
     );
     all.extend(generated);
     let generated: Vec<Vec<u32>> = RGI_EMOJI_FLAG_SEQUENCE.iter().map(|s| s.to_vec()).collect();
-    let set = string_property_sets(&UnicodeStringProperty::RGIEmojiFlagSequence);
+    let set = string_property_from_str("RGI_Emoji_Flag_Sequence").unwrap();
     assert_eq!(
         set.iter().map(|s| s.to_vec()).collect::<Vec<_>>(),
         generated,
@@ -29502,7 +28480,7 @@ fn all_packed_string_sets_match_generated_source() {
         .iter()
         .map(|s| s.to_vec())
         .collect();
-    let set = string_property_sets(&UnicodeStringProperty::RGIEmojiModifierSequence);
+    let set = string_property_from_str("RGI_Emoji_Modifier_Sequence").unwrap();
     assert_eq!(
         set.iter().map(|s| s.to_vec()).collect::<Vec<_>>(),
         generated,
@@ -29515,7 +28493,7 @@ fn all_packed_string_sets_match_generated_source() {
     );
     all.extend(generated);
     let generated: Vec<Vec<u32>> = RGI_EMOJI_TAG_SEQUENCE.iter().map(|s| s.to_vec()).collect();
-    let set = string_property_sets(&UnicodeStringProperty::RGIEmojiTagSequence);
+    let set = string_property_from_str("RGI_Emoji_Tag_Sequence").unwrap();
     assert_eq!(
         set.iter().map(|s| s.to_vec()).collect::<Vec<_>>(),
         generated,
@@ -29528,7 +28506,7 @@ fn all_packed_string_sets_match_generated_source() {
     );
     all.extend(generated);
     let generated: Vec<Vec<u32>> = RGI_EMOJI_ZWJ_SEQUENCE.iter().map(|s| s.to_vec()).collect();
-    let set = string_property_sets(&UnicodeStringProperty::RGIEmojiZWJSequence);
+    let set = string_property_from_str("RGI_Emoji_ZWJ_Sequence").unwrap();
     assert_eq!(
         set.iter().map(|s| s.to_vec()).collect::<Vec<_>>(),
         generated,
@@ -29540,7 +28518,7 @@ fn all_packed_string_sets_match_generated_source() {
         generated.iter().map(Vec::len).sum::<usize>()
     );
     all.extend(generated);
-    let whole = string_property_sets(&UnicodeStringProperty::RGIEmoji);
+    let whole = string_property_from_str("RGI_Emoji").unwrap();
     assert_eq!(
         whole.iter().map(|s| s.to_vec()).collect::<Vec<_>>(),
         all,

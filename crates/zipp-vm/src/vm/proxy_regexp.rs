@@ -276,6 +276,41 @@ fn regex_units_value(vm: &mut Vm<'_>, units: &[u16]) -> Result<Value, Thrown> {
     Ok(regex_wtf8_to_heap(vm, &mut reservation, bytes))
 }
 
+/// Append the UTF-16 code units of the WTF-8 buffer `bytes` to `units`,
+/// stopping (and returning false) before `units` would hold more than
+/// `limit`. The units are exactly `wtf8_units_iter`'s: each code point is
+/// decoded by the same `wtf8_decode` and an astral one becomes its surrogate
+/// pair. A run of ASCII is widened byte by byte without the iterator's
+/// per-unit state, which made the conversion of a non-ASCII subject as costly
+/// as the search it serves.
+fn push_wtf8_units(bytes: &[u8], units: &mut Vec<u16>, limit: usize) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        if units.len() == limit {
+            return false;
+        }
+        let b0 = bytes[i];
+        if b0 < 0x80 {
+            units.push(u16::from(b0));
+            i += 1;
+            continue;
+        }
+        let (cp, len) = crate::heap::wtf8_decode(bytes, i);
+        i += len;
+        if cp >= 0x10000 {
+            if units.len() + 2 > limit {
+                return false;
+            }
+            let v = cp - 0x10000;
+            units.push(0xD800 | (v >> 10) as u16);
+            units.push(0xDC00 | (v & 0x3FF) as u16);
+        } else {
+            units.push(cp as u16);
+        }
+    }
+    true
+}
+
 /// Copy a subject's exact UTF-16 view under the same transient-memory ceiling
 /// as the RegExp executor.  The safe profile must not use `collect()` here:
 /// that allocates before `MatchLimits` exists and can turn one compact WTF-8
@@ -332,13 +367,7 @@ fn regex_subject_units(
                 None
             }
             HeapObj::Str(js) => {
-                for unit in js.units_iter() {
-                    if units.len() == expected_units {
-                        overflow = true;
-                        break;
-                    }
-                    units.push(unit);
-                }
+                overflow = !push_wtf8_units(js.as_bytes(), &mut units, expected_units);
                 None
             }
             HeapObj::Cons { left, right, .. } => Some((*left, *right)),
@@ -4262,7 +4291,12 @@ impl<'p> Vm<'p> {
         self.heap.flatten(idx);
         match self.heap.get(idx) {
             HeapObj::Str(js) if js.is_ascii() => js.as_bytes().iter().map(|&b| b as u16).collect(),
-            HeapObj::Str(js) => js.units_iter().collect(),
+            HeapObj::Str(js) => {
+                let bytes = js.as_bytes();
+                let mut units = Vec::with_capacity(crate::heap::wtf8_units(bytes));
+                push_wtf8_units(bytes, &mut units, usize::MAX);
+                units
+            }
             _ => Vec::new(),
         }
     }
@@ -7318,4 +7352,59 @@ pub(crate) fn canonical_flags(flags: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod subject_unit_tests {
+    use super::push_wtf8_units;
+
+    /// Generalized UTF-8 of one code point, surrogates included.
+    fn push_cp(out: &mut Vec<u8>, cp: u32) {
+        match cp {
+            0..=0x7F => out.push(cp as u8),
+            0x80..=0x7FF => out.extend([0xC0 | (cp >> 6) as u8, 0x80 | (cp & 0x3F) as u8]),
+            0x800..=0xFFFF => out.extend([
+                0xE0 | (cp >> 12) as u8,
+                0x80 | ((cp >> 6) & 0x3F) as u8,
+                0x80 | (cp & 0x3F) as u8,
+            ]),
+            _ => out.extend([
+                0xF0 | (cp >> 18) as u8,
+                0x80 | ((cp >> 12) & 0x3F) as u8,
+                0x80 | ((cp >> 6) & 0x3F) as u8,
+                0x80 | (cp & 0x3F) as u8,
+            ]),
+        }
+    }
+
+    #[test]
+    fn subject_units_are_the_iterators() {
+        // Every boundary of every encoding length, lone high and low
+        // surrogates, a lone high then a lone low (two 3-byte sequences),
+        // and astral characters, in pseudo-random runs.
+        let interesting = [
+            0x00, 0x41, 0x7F, 0x80, 0xE9, 0x7FF, 0x800, 0x3A3, 0xD7FF, 0xD800, 0xDBFF, 0xDC00,
+            0xDFFF, 0xE000, 0xFEFF, 0xFFFF, 0x10000, 0x1F600, 0x10FFFF,
+        ];
+        let mut seed = 0x2545_F491u32;
+        for round in 0..2000 {
+            let mut bytes = Vec::new();
+            for _ in 0..(round % 40) {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                push_cp(&mut bytes, interesting[seed as usize % interesting.len()]);
+            }
+            let expected: Vec<u16> = crate::heap::wtf8_units_iter(&bytes).collect();
+            assert_eq!(crate::heap::wtf8_units(&bytes), expected.len());
+            let mut got = Vec::new();
+            assert!(push_wtf8_units(&bytes, &mut got, usize::MAX));
+            assert_eq!(got, expected, "{bytes:x?}");
+            for limit in 0..expected.len() {
+                let mut short = Vec::new();
+                assert!(!push_wtf8_units(&bytes, &mut short, limit), "limit {limit}");
+                assert!(short.len() <= limit && expected.starts_with(&short));
+            }
+        }
+    }
 }

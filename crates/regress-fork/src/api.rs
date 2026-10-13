@@ -14,8 +14,6 @@ use crate::{
     indexing::{InputIndexer, Ucs2Input, Utf16Input},
 };
 
-#[cfg(feature = "backend-pikevm")]
-use crate::pikevm;
 use crate::util::to_char_sat;
 
 #[cfg(not(feature = "std"))]
@@ -1428,7 +1426,7 @@ mod pattern_impl {
 pub use pattern_impl::*;
 
 // Support for using regress with different regex backends.
-// Currently there is only the classical backtracking, and PikeVM.
+// There is only the classical backtracking one.
 #[doc(hidden)]
 pub mod backends {
     use super::Regex;
@@ -1441,10 +1439,6 @@ pub mod backends {
     /// An Executor using the classical backtracking algorithm.
     pub type BacktrackExecutor<'r, 't> =
         super::classicalbacktrack::BacktrackExecutor<'r, indexing::Utf8Input<'t>>;
-
-    /// A Executor using the PikeVM executor.
-    #[cfg(feature = "backend-pikevm")]
-    pub type PikeVMExecutor<'r, 't> = super::pikevm::PikeVMExecutor<'r, indexing::Utf8Input<'t>>;
 
     /// An alias type to the default Executor.
     pub type DefaultExecutor<'r, 't> = BacktrackExecutor<'r, 't>;
