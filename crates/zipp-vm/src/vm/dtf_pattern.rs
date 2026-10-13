@@ -20,7 +20,7 @@
 //!
 //! Pattern selection receives the DateTimeFormat service's resolved locale data.
 
-use crate::vm::dtf_locale::{CalendarPatterns, DateTimeLocale};
+use crate::vm::dtf_locale::{CalPatterns, DateTimeLocale};
 
 /// One piece of a CLDR pattern: a literal run, or `count` repetitions of a
 /// field letter.
@@ -379,7 +379,7 @@ fn distance(cand: &str, want: &[(u8, char, usize)]) -> Option<u32> {
 /// time fields), with the skeleton it was matched under ("" when none was).
 fn best_half(
     data: &DateTimeLocale,
-    patterns: &CalendarPatterns,
+    patterns: &CalPatterns,
     want: &[(u8, char, usize)],
     hour12: bool,
 ) -> Option<(String, &'static str)> {
@@ -387,7 +387,7 @@ fn best_half(
         return None;
     }
     let mut best: Option<(u32, &'static str, &'static str)> = None;
-    for &(sk, pat) in patterns.available_formats {
+    for (sk, pat) in patterns.available_formats.pairs() {
         // `availableFormats` carries an `h…`/`H…` twin of every time pattern;
         // only the one matching the resolved hour cycle is a candidate.
         let f = pattern_fields(sk);
@@ -428,7 +428,7 @@ fn best_half(
         for (k, c, n) in missing {
             let Some((_, glue, name)) = data
                 .append_items
-                .iter()
+                .triples()
                 .find(|(l, ..)| l.chars().next().and_then(class_of) == Some(*k))
             else {
                 continue;
@@ -448,7 +448,7 @@ fn best_half(
 /// index of the glue that would join them. `formatRange` needs the halves apart.
 pub(crate) fn best_pattern_halves(
     data: &DateTimeLocale,
-    patterns: &CalendarPatterns,
+    patterns: &CalPatterns,
     req: &Request,
     hour12: bool,
 ) -> (String, String, usize) {
@@ -582,7 +582,7 @@ pub(crate) fn style_index(s: &str) -> Option<usize> {
 /// or None when CLDR has no row (the caller then formats both endpoints whole
 /// and joins them with `INTERVAL_FALLBACK`).
 pub(crate) fn interval_pattern(
-    patterns: &CalendarPatterns,
+    patterns: &CalPatterns,
     half: &[Item],
     hour12: bool,
     greatest: char,
@@ -607,7 +607,7 @@ pub(crate) fn interval_pattern(
     let req = &req;
     let gk = class_of(greatest)?;
     let mut best: Option<(u32, &str, &str)> = None;
-    for (sk, gd, pat) in patterns.interval_formats {
+    for (sk, gd, pat) in patterns.interval_formats.triples() {
         if class_of(gd.chars().next()?) != Some(gk) {
             continue;
         }

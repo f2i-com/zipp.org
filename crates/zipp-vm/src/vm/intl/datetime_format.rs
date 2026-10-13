@@ -14,7 +14,7 @@ impl<'p> Vm<'p> {
         crate::vm::dtf_locale::for_locale(&self.display(self.intl_slot(resolved, "locale")))
     }
 
-    fn dtf_patterns(&self, resolved: u32) -> crate::vm::dtf_locale::CalendarPatterns {
+    fn dtf_patterns(&self, resolved: u32) -> crate::vm::dtf_locale::CalPatterns {
         self.dtf_locale(resolved)
             .patterns(&self.display(self.intl_slot(resolved, "calendar")))
     }
@@ -765,7 +765,7 @@ impl<'p> Vm<'p> {
                 {
                     let data = self.dtf_locale(resolved);
                     if let Some((_, pattern)) =
-                        data.available_formats.iter().find(|(key, _)| *key == "hm")
+                        data.available_formats.pairs().find(|(key, _)| *key == "hm")
                     {
                         let alternate = dtf_pattern::parse_pattern(pattern);
                         if let Some(period) = alternate
@@ -977,14 +977,14 @@ impl<'p> Vm<'p> {
                         }
                         'r' => out.push(("relatedYear", y.to_string())),
                         'U' => {
-                            if let Some((_, names)) = self
+                            if let Some(name) = self
                                 .dtf_locale(resolved)
                                 .cyclic_years
                                 .iter()
                                 .find(|(id, _)| *id == cal_id)
+                                .and_then(|(_, names)| names.get((y - 4).rem_euclid(60) as usize))
                             {
-                                let index = (y - 4).rem_euclid(60) as usize;
-                                out.push(("yearName", names[index].to_string()));
+                                out.push(("yearName", name.to_string()));
                             }
                         }
                         'M' | 'L' => {
@@ -1395,7 +1395,6 @@ fn cal_era_name(
             return t
                 .get(idx)
                 .or_else(|| abbr.get(idx))
-                .copied()
                 .unwrap_or_default()
                 .to_string();
         }
@@ -1458,7 +1457,7 @@ fn cal_month_name(
                 (mo - 1) as usize
             };
         }
-        let name = t.get(i).copied().unwrap_or_default();
+        let name = t.get(i).unwrap_or_default();
         return if is_leap {
             leap_month_name(data, cal_id, name, width, standalone)
         } else {
