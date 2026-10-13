@@ -1,9 +1,7 @@
 use crate::codepointset::{CodePointSet, Interval};
 use crate::unicodetables::{
-    FOLDS, TO_UPPERCASE, binary_property_ranges, general_category_property_value_ranges,
-    script_extensions_value_ranges, script_value_ranges, string_property_sets,
-    unicode_property_binary_from_str, unicode_property_value_general_category_from_str,
-    unicode_property_value_script_from_str, unicode_string_property_from_str,
+    FOLDS, TO_UPPERCASE, binary_property_from_str, general_category_from_str, script_from_str,
+    string_property_from_str,
 };
 use crate::util::SliceHelp;
 #[cfg(not(feature = "std"))]
@@ -383,6 +381,31 @@ pub(crate) enum UnicodePropertyName {
     ScriptExtensions,
 }
 
+/// The index of the value of `table` that has the name `name`. A
+/// property-name table (unicodetables.rs) lists each value's names, each a
+/// length byte and the name, and ends each value with a zero byte, so a name
+/// of the wrong length is skipped without reading it. One loop over a few
+/// kilobytes of names replaces the `match`es over string literals the
+/// generator wrote, which compiled to several times that.
+pub(crate) fn lookup_property_name(table: &[u8], name: &str) -> Option<usize> {
+    let name = name.as_bytes();
+    let mut value = 0;
+    let mut at = 0;
+    while let Some(&len) = table.get(at) {
+        let len = len as usize;
+        at += 1;
+        if len == 0 {
+            value += 1;
+        } else {
+            if table.get(at..at + len) == Some(name) {
+                return Some(value);
+            }
+            at += len;
+        }
+    }
+    None
+}
+
 pub(crate) fn unicode_property_name_from_str(s: &str) -> Option<UnicodePropertyName> {
     use UnicodePropertyName::*;
 
@@ -412,40 +435,57 @@ pub(crate) fn unicode_property_from_str(
             &crate::unicodetables_unknown::SCRIPT_UNKNOWN,
         ));
     }
-    match name {
-        Some(UnicodePropertyName::GeneralCategory) => Some(PropertyEscapeKind::CharacterClass(
-            general_category_property_value_ranges(
-                &unicode_property_value_general_category_from_str(s)?,
-            ),
-        )),
-        Some(UnicodePropertyName::Script) => Some(PropertyEscapeKind::CharacterClass(
-            script_value_ranges(&unicode_property_value_script_from_str(s)?),
-        )),
-        Some(UnicodePropertyName::ScriptExtensions) => Some(PropertyEscapeKind::CharacterClass(
-            script_extensions_value_ranges(&unicode_property_value_script_from_str(s)?),
-        )),
+    let class = match name {
+        Some(UnicodePropertyName::GeneralCategory) => general_category_from_str(s)?,
+        Some(UnicodePropertyName::Script) => script_from_str(s, false)?,
+        Some(UnicodePropertyName::ScriptExtensions) => script_from_str(s, true)?,
         None => {
-            if let Some(value) = unicode_property_binary_from_str(s) {
-                return Some(PropertyEscapeKind::CharacterClass(binary_property_ranges(
-                    &value,
-                )));
+            if let Some(class) = binary_property_from_str(s) {
+                class
+            } else if unicode_sets && let Some(strings) = string_property_from_str(s) {
+                return Some(PropertyEscapeKind::StringSet(strings));
+            } else {
+                general_category_from_str(s)?
             }
-            if unicode_sets && let Some(value) = unicode_string_property_from_str(s) {
-                return Some(PropertyEscapeKind::StringSet(string_property_sets(&value)));
-            }
-            Some(PropertyEscapeKind::CharacterClass(
-                general_category_property_value_ranges(
-                    &unicode_property_value_general_category_from_str(s)?,
-                ),
-            ))
         }
-    }
+    };
+    Some(PropertyEscapeKind::CharacterClass(class))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn property_names_are_whole_aliases() {
+        let table = b"\x02Lu\x10Uppercase_Letter\0\x01L\x06Letter\0\x05cntrl\x02Cc\x07Control";
+        assert_eq!(lookup_property_name(table, "Lu"), Some(0));
+        assert_eq!(lookup_property_name(table, "Uppercase_Letter"), Some(0));
+        assert_eq!(lookup_property_name(table, "L"), Some(1));
+        assert_eq!(lookup_property_name(table, "Letter"), Some(1));
+        assert_eq!(lookup_property_name(table, "Cc"), Some(2));
+        assert_eq!(lookup_property_name(table, "Control"), Some(2));
+        for name in [
+            "",
+            "l",
+            "LuUppercase_Letter",
+            "Uppercase",
+            "Letters",
+            "\x02Lu",
+            "\0",
+        ] {
+            assert_eq!(lookup_property_name(table, name), None, "{name:?}");
+        }
+        // Every value of every kind resolves to its own table, in order.
+        assert!(binary_property_from_str("Alphabetic").is_some());
+        assert!(binary_property_from_str("Assigned").is_some());
+        assert!(general_category_from_str("Separator").is_some());
+        assert!(script_from_str("Zyyy", true).is_some());
+        assert!(script_from_str("Zzzz", false).is_none());
+        assert!(string_property_from_str("RGI_Emoji").is_some());
+        assert!(string_property_from_str("Emoji").is_none());
+    }
 
     // Map from folded char to the chars that folded to it.
     // If an entry is missing, it means either nothing folds to the char,

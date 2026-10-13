@@ -324,3 +324,17 @@ holding the position reached and the iterations left) tests the body at
 one more position. The regex JIT's lazy loops do the same. The positions
 tried, and so every result, are unchanged; the steps charged are not (see
 `tests/step_counts.rs`).
+
+## Property names are tables, not `match`es
+
+The generator wrote each kind of property (binary properties, General
+Category values, Script values, properties of strings) as an enum, a
+function mapping a name to it with a `match` over string literals, and a
+function mapping it to its table with another `match`. The name `match`es
+compiled to comparisons several times the size of the names (the Script
+one alone was 7.7 KB of Lite's code). Each kind is now a list of names, one
+line per value with its aliases separated by `|`, and an array of tables in
+the same order; `unicode::lookup_property_name` finds the line. After
+regenerating `unicodetables.rs` and running `tools/pack_regex_tables.py`,
+run `python crates/regress-fork/tools/pack_property_names.py` and rustfmt
+the file.
