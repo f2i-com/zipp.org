@@ -16,11 +16,12 @@ default (328 binaries), Python and safe-sandbox suites, the `-D warnings`
 profiles, the Python corpus in four modes, `cargo test -p zipp-cli`, and
 the Node boundary suite on all four modules.
 
-**0.0.23 has six defects this branch fixes** (iterators' own properties
-and replaced generator methods, object spread running setters and
-replacing the prototype, a Proxy's `ownKeys` twice per `for-in`, linear
-`pop`, torch's optimizer steps and random streams). A release that
-carries them should say so.
+**0.0.23 has nine wrong answers and one performance defect this branch
+fixes** (iterators' own properties and replaced generator methods,
+object spread running setters and replacing the prototype, a Proxy's
+`ownKeys` twice per `for-in`; torch's optimizer steps, random streams,
+float64 `rand` and GRU update; linear `pop`). A release that carries
+them should say so.
 
 What the pass did, against 0.0.23:
 
@@ -28,7 +29,8 @@ What the pass did, against 0.0.23:
   `instanceof`, switch on `typeof`, fill templates, pop, destructure,
   spread, list keys or run a `for-in` now compile, and so do functions
   with a rest parameter: those patterns 1.2 to 6 times faster.
-  Construction 2x. The 13 real rows are level with 0.0.23; the headline
+  Construction 2x. The 13 real rows are level with 0.0.23 (1.003x
+  [0.996, 1.010] on fresh copies; a first run read 1.011x); the headline
   ten are at 0.905x of Node 24 (`async-promise-chain` 1.14x and
   `polymorphic-objects` 1.05x still behind).
 - Python: 1.31x to 1.21x CPython 3.13 over the 36-program suite.
@@ -59,10 +61,10 @@ have the detail):
   with a hidden rest array, now that rest functions compile.
 - A closure's capture list is its own allocation; closure factories are
   4.4x Node, object spread 3.3x, spread calls 3.2x, Map/Set 2.9x.
-- `closure_make` and `regexp_test` probes read about 6% slower than
-  0.0.23; `polymorphic-objects` 2.1% (not the new outer-loop compile).
-  The modules' `regexp-matchall` and `regexp-unicode-compile` read 2 to
-  3.5% slower. None was run down.
+- `closure_make` (6%) and `regexp_test` (3%) probes are slower than
+  0.0.23 on fresh copies of both executables; the modules'
+  `regexp-matchall` and `regexp-unicode-compile` read 2 to 3.5% slower.
+  None was run down.
 - Python rows still above 2x CPython: `instance_new`, `str_methods`,
   `try_raise_catch`, `generator_iter`, `word_count`, `fstring`,
   `oo_simulation`, `super_call`, `sort_heapq`, `method_call`,

@@ -19,12 +19,14 @@ profile-guided) and the four modules built from it, against `5cffc37a`
 
 ## Outcome
 
-- **Six wrong answers in 0.0.23 are fixed** ([below](#defects-fixed)):
-  iterators lost their own properties and ignored a replaced generator
-  method, object spread ran setters and could replace the prototype, a
-  Proxy's `ownKeys` ran twice per `for-in` level, `pop` on a large array
-  was linear, and four torch behaviours (in-place optimizer steps,
-  PyTorch's random streams, float64 `rand`, GRU's update).
+- **Nine wrong answers in 0.0.23 are fixed, and one performance defect**
+  ([below](#defects-fixed)). JavaScript, five: iterators lost their own
+  properties, a replaced generator method was ignored, object spread ran
+  setters and could replace the prototype, and a Proxy's `ownKeys` ran
+  twice per `for-in` level. torch, four: optimizer steps replaced the
+  parameters, `randn`/`normal_` did not follow PyTorch's stream, float64
+  `rand` lost precision, GRU's update differed. And `pop` on a large
+  array took time proportional to its length.
 - **JavaScript: most of the loops that compiled nothing now compile.**
   A loop that builds literals, creates closures, tests `instanceof`,
   switches on `typeof`, fills a template, pops, destructures, spreads,
@@ -34,9 +36,11 @@ profile-guided) and the four modules built from it, against `5cffc37a`
   2x, `instanceof` 3.4x, object spread 6x, a `push`/`pop` loop 15
   minutes to 123 ms); the
   [probe table](#probes) has 43 patterns against 0.0.23 and Node 24.
-- **Native, the 13 real rows:** level with 0.0.23 (1.0111x [1.003, 1.016]
-  over the headline ten, 1.0065x [0.998, 1.011] over all 13); the pass's
-  work is in patterns these rows barely use. Against Node 24 the headline
+- **Native, the 13 real rows: level with 0.0.23.** A first A/B read
+  1.0111x [1.003, 1.016] over the headline ten, a small slowdown; it did
+  not replicate on fresh copies of both binaries, which read 1.0033x
+  [0.996, 1.010] (all 13: 0.9973x [0.992, 1.003]). The pass's work is in
+  patterns these rows barely use. Against Node 24 the headline
   ten are at **0.905x** [0.893, 0.912] and all 13 at 0.638x;
   `async-promise-chain` (1.14x) and `polymorphic-objects` (1.05x) are
   the two rows where Node is faster ([the tables](#native-measurements)).
@@ -61,8 +65,9 @@ profile-guided) and the four modules built from it, against `5cffc37a`
 
 ## Defects fixed
 
-Six wrong answers in 0.0.23 are fixed, each found by a differential
-program against Node 24 and pinned by the commit that fixes it:
+Nine wrong answers in 0.0.23 are fixed (five in JavaScript, four in
+torch), and one performance defect, each found by a differential program
+against Node 24 or PyTorch and pinned by the commit that fixes it:
 
 - **An iterator's own properties were dropped and a replaced generator
   `next`/`return`/`throw` was ignored** (`5723ea2a`). A user iterator
@@ -352,13 +357,21 @@ Geomean of the paired ratios: 1.0111x [1.003, 1.016] over the 10
 headline rows, 0.9914x [0.976, 1.007] over the 3 diagnostic rows and
 1.0065x [0.998, 1.011] over all 13.
 
-**`polymorphic-objects` is 2.1% slower** ([+0.7%, +3.0%]). Its outer
-dictionary loop compiles in this pass (it holds a `for-in`, which
-`175e7299` admits), but a same-binary switch (`ZIPP_NO_REGION_KEYLIST=1`,
-built for this check and not committed) moves the row by +0.0%
-[-1.7%, +2.6%], so the new compilation is not the cause. The row was
-not run down further; link layout alone moves single rows of a
-relinked build by this much.
+That headline interval lies above 1, so the run was repeated with fresh
+copies of both executables (one file can stay slow on its own on this
+machine) and 15 repetitions: 1.0033x [0.996, 1.010] over the headline
+ten, 0.9774x [0.969, 0.993] over the diagnostic three, 0.9973x
+[0.992, 1.003] over all 13, every row's interval but the two
+improved diagnostics' containing zero (`polymorphic-objects` +1.9%
+[-0.7%, +4.5%], `json-large` -1.5%, `map-set-heavy` +1.4%,
+`regex-log-scan` +1.4%). A third run of just the four rows that had read
+slowest, on another copy pair, put them at -0.2%, -3.0%, +0.3% and
++1.1%, all intervals containing zero. The rows are level with 0.0.23.
+
+`polymorphic-objects`' outer dictionary loop compiles in this pass (it
+holds a `for-in`, which `175e7299` admits); a same-binary switch
+(`ZIPP_NO_REGION_KEYLIST=1`, built for the check and not committed)
+moved the row by +0.0% [-1.7%, +2.6%].
 
 Against Node 24.19.0, 10 repetitions:
 
@@ -437,11 +450,14 @@ its. Every engine prints Node's checksum.
 The rows above 2x are the patterns Node serves by escape analysis and
 inlining (a closure factory, an arguments object, object spread, a spread
 call) or by a faster collection and string core (Map and Set, `replace`,
-templates). `closure_make` (+9%) and `regexp_test` (+11%) read slower than
-0.0.23; a rerun of nine put them at +6% each, with `closure_make`
-drifting up a few ms at each step from `ebfb8db1` on and `regexp_test`
-stepping at the regex merge, while the regex lane's own in-process
-`small-calls` case is level. Neither was run down.
+templates). Two rows are slower than 0.0.23, and stay slower on three
+fresh copies of each executable: `closure_make` by about 6% (171-177 ms
+to 184) and `regexp_test` by about 3% (97-98 to 100-102). Builds kept
+from the pass put `closure_make`'s step in 2 to 4 ms increments across
+several commits from `ebfb8db1` on (inlining the cell helper that commit
+split out changed nothing), and `regexp_test`'s at the regex merge,
+while the regex lane's own in-process `small-calls` case is level.
+Neither was run down.
 
 ## Python suite
 
