@@ -2757,7 +2757,10 @@ def _gru_step(gi, h, w_hh, b_hh):
     r = torch.sigmoid(i_r + h_r)
     z = torch.sigmoid(i_z + h_z)
     n = torch.tanh(i_n + r * h_n)
-    return (1 - z) * n + z * h
+    # PyTorch's CPU GRUCell: (hidden - new_gate) * input_gate + new_gate.
+    # Equal to (1 - z) * n + z * h in exact arithmetic, but rounded
+    # differently: this form gives PyTorch's float32 values.
+    return (h - n) * z + n
 
 
 def _lstm_step(gi, h, c, w_hh, b_hh, w_hr=None):

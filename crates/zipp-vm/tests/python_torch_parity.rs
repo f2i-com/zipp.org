@@ -137,3 +137,34 @@ state keeps the cached normal True
 embedding 0x1.8a7eb80000000p+0 -0x1.2c78a00000000p-2 -0x1.16e2920000000p+1 0x1.23096c0000000p-1 -0x1.15a3420000000p+0 -0x1.660a5a0000000p+0";
     assert_lines(source, expected);
 }
+
+/// GRU's hidden update is PyTorch's CPU form, (h - n) * z + n, not the
+/// algebraically equal (1 - z) * n + z * h, which rounds differently. The
+/// gates here come from biases alone (zero weights), so every input to the
+/// update is the same float32 value in both; GRUCell and a one-step nn.GRU
+/// then print PyTorch's bytes.
+#[test]
+fn gru_updates_the_hidden_state_as_pytorch_does() {
+    let source = r#"
+import torch
+
+H = 8
+cell = torch.nn.GRUCell(1, H)
+gru = torch.nn.GRU(1, H)
+bias = torch.tensor([0.0] * H + [0.75, -1.5, 0.25, 0.5, -0.5, 1.25, -2.25, -1.0] + [0.3, -0.7, 1.1, -0.2, 0.9, -1.3, 0.05, 0.6])
+with torch.no_grad():
+    for w in (cell.weight_ih, cell.weight_hh, cell.bias_hh, gru.weight_ih_l0, gru.weight_hh_l0, gru.bias_hh_l0):
+        w.zero_()
+    cell.bias_ih.copy_(bias)
+    gru.bias_ih_l0.copy_(bias)
+x = torch.zeros(3, 1)
+h = torch.tensor([[1.0, -2.0, 0.5, 3.0, -0.25, 1.5, -1.0, 0.75],
+                  [0.1, 0.2, -0.3, 0.4, -0.5, 0.6, -0.7, 0.8],
+                  [7.0, -3.5, 2.25, -0.125, 5.5, -6.0, 0.375, 4.0]])
+print(" ".join(v.hex() for v in cell(x, h).reshape(-1).tolist()))
+out, hn = gru(x.unsqueeze(0), h.unsqueeze(0))
+print(" ".join(v.hex() for v in out.reshape(-1).tolist()))
+"#;
+    let line = "0x1.8b97360000000p-1 -0x1.b7ca7c0000000p-1 0x1.435c8e0000000p-1 0x1.caf8ee0000000p+0 0x1.67eaaa0000000p-2 0x1.f2b5e60000000p-1 -0x1.9addce0000000p-5 0x1.304ad00000000p-1 0x1.4a801c0000000p-3 -0x1.d49d1c0000000p-2 0x1.7460500000000p-3 0x1.654eb80000000p-3 0x1.0744280000000p-2 0x1.190fbc0000000p-2 -0x1.61123c0000000p-6 0x1.372d5a0000000p-1 0x1.3640e20000000p+2 -0x1.21f2680000000p+0 0x1.9d89300000000p+0 -0x1.37f5fa0000000p-3 0x1.42dc080000000p+1 -0x1.36c3e00000000p+2 0x1.4b93300000000p-4 0x1.77e7c80000000p+0";
+    assert_lines(source, &format!("{line}\n{line}"));
+}
