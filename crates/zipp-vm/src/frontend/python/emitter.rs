@@ -1329,8 +1329,9 @@ impl<'a> Emitter<'a> {
     }
     /// Python truth of `value`: a JS boolean is its own truth (the common
     /// result of a comparison); an int or a str has the truth JavaScript
-    /// gives it (`0n` and `""` are false, as in Python); anything else asks
-    /// the runtime.
+    /// gives it (`0n` and `""` are false, as in Python); an exact list,
+    /// tuple, dict or set has a nonzero length (`PyLen`, whose slow edge is
+    /// the runtime's test); anything else asks the runtime.
     pub fn truth(&mut self, value: Reg) -> R<Reg> {
         let dst = self.alloc()?;
         let is_bool = self.typeof_is(value, "boolean")?;
@@ -1351,11 +1352,25 @@ impl<'a> Emitter<'a> {
         let end2 = self.jump()?;
         let here = self.here();
         self.patch(helper, here)?;
+        let mut ends = vec![end, end2];
+        if self.fast {
+            // A container's length: `0n` is false, any other int true.
+            let n = self.alloc()?;
+            let rt = self.r_rt;
+            let at = self.emit(Instr::PyLen { dst: n, v: value, rt, slow: 0 })?;
+            let not = self.alloc()?;
+            self.emit(Instr::Not { dst: not, a: n })?;
+            self.emit(Instr::Not { dst, a: not })?;
+            ends.push(self.jump()?);
+            let here = self.here();
+            self.patch_slow(at, here)?;
+        }
         let r = self.helper("truth", &[value])?;
         self.emit(Instr::Move { dst, src: r })?;
         let here = self.here();
-        self.patch(end, here)?;
-        self.patch(end2, here)?;
+        for j in ends {
+            self.patch(j, here)?;
+        }
         Ok(dst)
     }
     /// Whether `obj.<name>` may take the inline instance-attribute paths.

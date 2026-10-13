@@ -1083,7 +1083,10 @@ impl<'a> Emitter<'a> {
 
     /// Jumps taken when `value`'s truth equals `when`: a bool, an int or a
     /// str has the truth JavaScript gives it (`0n` and `""` are false, as
-    /// in Python), tested where it is; anything else asks the runtime.
+    /// in Python), tested where it is; an exact list, tuple, dict or set
+    /// has a nonzero length (`PyLen`, whose slow edge is the runtime's
+    /// test: `while heap:`, `if not seen:`); anything else asks the
+    /// runtime.
     pub fn jump_on_truth(&mut self, value: Reg, when: bool) -> R<Vec<usize>> {
         let jump = |e: &mut Self, cond: Reg| if when { e.jump_if_true(cond) } else { e.jump_if_false(cond) };
         let is_bool = self.typeof_is(value, "boolean")?;
@@ -1099,11 +1102,24 @@ impl<'a> Emitter<'a> {
         let over = self.jump()?;
         let here = self.here();
         self.patch(slow, here)?;
+        let mut taken_all = vec![taken];
+        let mut overs = vec![over];
+        if self.fast {
+            let n = self.alloc()?;
+            let rt = self.r_rt;
+            let at = self.emit(Instr::PyLen { dst: n, v: value, rt, slow: 0 })?;
+            taken_all.push(jump(self, n)?);
+            overs.push(self.jump()?);
+            let here = self.here();
+            self.patch_slow(at, here)?;
+        }
         let t = self.helper("truth", &[value])?;
-        let taken2 = jump(self, t)?;
+        taken_all.push(jump(self, t)?);
         let here = self.here();
-        self.patch(over, here)?;
-        Ok(vec![taken, taken2])
+        for j in overs {
+            self.patch(j, here)?;
+        }
+        Ok(taken_all)
     }
 
     /// A single comparison as a branch (see [`Emitter::branch`]).
