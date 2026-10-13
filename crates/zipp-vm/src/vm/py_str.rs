@@ -231,6 +231,10 @@ impl<'p> Vm<'p> {
 //   `insort_left` / `insort_right(a, x)` (see below).
 // * 18 / 19 `startswith` / `endswith(s, affix)`, `affix` a str (a tuple of
 //   them, and the forms with bounds, are `j<n>`'s).
+// * 20 `R.FJOIN.c<n>(...parts)`: an f-string's parts joined, each a str or
+//   an int (its decimal digits, as `str(i)` makes them), the record's
+//   `j<n>` (`out += part`, from "") in one allocation (see
+//   [`Vm::py_fstr_join`]).
 //
 // Results longer than the runtime's text limit (`MAX_TEXT` UTF-16 units)
 // take the `j<n>` path, which raises as it always did.
@@ -332,11 +336,9 @@ impl<'p> Vm<'p> {
             return Ok(v);
         }
         // The entry this one stands in for, with the same arguments.
-        let name = match args.len() {
-            1 => "j1",
-            2 => "j2",
-            3 => "j3",
-            _ => return Err(Thrown::from_static("TypeError: str method entry called with a wrong count")),
+        const FALLBACKS: [&str; 12] = ["j1", "j2", "j3", "j4", "j5", "j6", "j7", "j8", "j9", "j10", "j11", "j12"];
+        let Some(&name) = args.len().checked_sub(1).and_then(|i| FALLBACKS.get(i)) else {
+            return Err(Thrown::from_static("TypeError: str method entry called with a wrong count"));
         };
         let HeapObj::Object(m) = (if this.is_heap() { self.heap.get(this.heap_index()) } else { return Err(Thrown::from_static("TypeError: str method entry called on a non-builtin")) }) else {
             return Err(Thrown::from_static("TypeError: str method entry called on a non-builtin"));
@@ -361,6 +363,7 @@ impl<'p> Vm<'p> {
             (12, 2) => return self.py_heap_op(this, args, true, at),
             (14..=17, 2) => return self.py_bisect_op(this, args, op, at),
             (13, 1) => return self.py_heap_op(this, args, false, at),
+            (20, _) => return self.py_fstr_join(args),
             // `hash(s)` of a str: `strHash` (`runtime/types.js`), computed
             // by the function the engine's own tables hash a str key with,
             // so the two cannot differ. It fits the int kept in the value.
@@ -689,6 +692,101 @@ impl<'p> Vm<'p> {
         self.charge_steps(i64::try_from(total).unwrap_or(i64::MAX));
         Some(list)
     }
+
+    /// `R.FJOIN.c<n>(...parts)` (op 20): what its `j<n>` answers (`out +=
+    /// part` for each part, from "", then `rt.checkedText`) when every part
+    /// is a str with no lone surrogate (two could pair up across a join) or
+    /// an int of at most 128 bits (its decimal digits, which JavaScript's
+    /// ToString of a BigInt and Python's `str` agree on): the text in one
+    /// allocation, where the f-string's chain of `Add`s made the digits and
+    /// then each joined text. `None` (the `j<n>` path) for anything else,
+    /// and for a result past the runtime's text limit, which `j<n>` raises.
+    fn py_fstr_join(&mut self, args: &[Value]) -> Option<Value> {
+        // One str: the str itself (`"" + s`).
+        if let [one] = *args {
+            if one.is_heap() && self.heap.is_str_like(one.heap_index()) {
+                let idx = one.heap_index();
+                self.heap.flatten(idx);
+                return match self.heap.get(idx) {
+                    HeapObj::Str(s) if s.units() <= STRM_MAX_TEXT => Some(one),
+                    _ => None,
+                };
+            }
+        }
+        // First every str part is flattened where it lives and the size is
+        // known (an int's digits counted generously); then one buffer.
+        let mut total = 0usize;
+        let mut ascii = true;
+        for &a in args {
+            if a.small_bigint_val().is_some() {
+                total += 20;
+                continue;
+            }
+            if a.is_heap() && matches!(self.heap.get(a.heap_index()), HeapObj::BigInt(_)) {
+                total += 40;
+                continue;
+            }
+            let (idx, a_ascii) = self.py_strm_flat(a)?;
+            ascii &= a_ascii;
+            total += self.py_strm_bytes(idx).len();
+            if total > STRM_MAX_TEXT * 3 {
+                return None;
+            }
+        }
+        let mut out = Vec::with_capacity(total);
+        for &a in args {
+            if let Some(n) = a.small_bigint_val() {
+                push_decimal(&mut out, n as i128);
+                continue;
+            }
+            match self.heap.get(a.heap_index()) {
+                HeapObj::BigInt(n) => push_decimal(&mut out, *n),
+                HeapObj::Str(s) => out.extend_from_slice(s.as_bytes()),
+                _ => return None,
+            }
+        }
+        let n = out.len();
+        if ascii && n > STRM_MAX_TEXT {
+            return None;
+        }
+        let v = self.py_strm_new_as(out, ascii);
+        if !ascii {
+            if let HeapObj::Str(st) = self.heap.get(v.heap_index()) {
+                if st.units() > STRM_MAX_TEXT {
+                    return None;
+                }
+            }
+        }
+        self.charge_steps(i64::try_from(n).unwrap_or(i64::MAX));
+        Some(v)
+    }
+}
+
+/// The decimal digits of `n` (a `-` first when negative), appended.
+fn push_decimal(out: &mut Vec<u8>, n: i128) {
+    let mut buf = [0u8; 40];
+    let mut i = buf.len();
+    let mut m = n.unsigned_abs();
+    // The digits beyond 64 bits in 128-bit steps, the rest in 64-bit ones.
+    while m > u64::MAX as u128 {
+        i -= 1;
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+    }
+    let mut m = m as u64;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    out.extend_from_slice(&buf[i..]);
 }
 
 // ---- heapq (`__zipp_py_strm` ops 12 and 13) ------------------------------

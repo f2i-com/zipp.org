@@ -11,6 +11,9 @@ const LONG_CHAIN: usize = 16;
 /// Display and argument lists longer than this are built in chunks of this
 /// many elements, so a large literal needs a bounded number of registers.
 const CHUNK: usize = 256;
+/// The most parts of an f-string joined by the runtime's `R.FJOIN.c<n>`
+/// (its entries go to `c12`); a longer one joins with `Add`s.
+const FJOIN_MAX: usize = 12;
 
 /// What an operand is known to be from its syntax alone, so a fast path the
 /// operand can never take is not emitted (and a guard it always passes is
@@ -1271,10 +1274,17 @@ impl<'a> Emitter<'a> {
         // second when the first is a str, and every later one, since the
         // text joined so far is a str by then. Anything else (`f"{i}"`, the
         // first of `f"{a}{b}"`) still becomes a str of its own.
-        let first_raw = self.fast && values.len() > 1 && known(&values[1]);
+        //
+        // Up to `FJOIN_MAX` parts are joined by the runtime's
+        // `R.FJOIN.c<n>(...parts)` instead, a `PyCall` (the engine's native
+        // joins them in one allocation): every int part may stay an int
+        // there, since that join starts from "".
+        let fjoin = self.fast && !values.is_empty() && values.len() <= FJOIN_MAX && !(values.len() == 1 && known(&values[0]));
+        let first_raw = self.fast && (fjoin || (values.len() > 1 && known(&values[1])));
         let mut parts = Vec::new();
         for (k, v) in values.iter().enumerate() {
             let raw_int = match k {
+                _ if fjoin => true,
                 0 => first_raw,
                 1 => self.fast && (known(&values[0]) || !first_raw),
                 _ => self.fast,
@@ -1291,6 +1301,23 @@ impl<'a> Emitter<'a> {
         if !self.fast {
             let arr = self.array(&parts)?;
             return self.helper("strjoin", &[arr]);
+        }
+        if fjoin {
+            // The record's entry for the count, called with the record as
+            // `this` (as a builtin's is); a record without one (never, short
+            // of the runtime's own code changing it) joins through the
+            // helper, out of line.
+            let f = self.prop(self.r_rt, "FJOIN")?;
+            let (arg_base, argc) = self.arguments(&parts)?;
+            let dst = self.alloc()?;
+            let at = self.emit(Instr::PyCall { dst, f, arg_base, argc, slow: 0 })?;
+            self.defer_cold(Vec::new(), vec![at], move |e| {
+                let arr = e.array(&parts)?;
+                let r = e.helper("strjoin", &[arr])?;
+                e.emit(Instr::Move { dst, src: r })?;
+                Ok(())
+            });
+            return Ok(dst);
         }
         // Every part is a str: concatenate inline, and let the helper raise
         // MemoryError past the runtime's text limit.
