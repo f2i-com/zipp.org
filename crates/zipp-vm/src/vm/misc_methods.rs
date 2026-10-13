@@ -313,7 +313,13 @@ impl<'p> Vm<'p> {
         // compiled body would hand back the raw completion value instead.
         let is_strict = {
             let proto = self.func(fid as usize);
-            if proto.arguments_reg.is_some() || proto.is_async || proto.is_generator {
+            // A rest parameter's array is built by call setup too (and the
+            // window below drops the arguments past the parameters).
+            if proto.arguments_reg.is_some()
+                || proto.rest_reg.is_some()
+                || proto.is_async
+                || proto.is_generator
+            {
                 return None;
             }
             proto.is_strict

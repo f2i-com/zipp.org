@@ -490,8 +490,8 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let (lexical_this, is_strict, reg_count, params) = if SAME_PROTO_ARROW2 {
-            (true, true, expected_reg_count, 2)
+        let (lexical_this, is_strict, reg_count, params, rest_reg) = if SAME_PROTO_ARROW2 {
+            (true, true, expected_reg_count, 2, None)
         } else {
             let proto = self.func(fid as usize);
             (
@@ -499,8 +499,14 @@ impl<'p> Vm<'p> {
                 proto.is_strict,
                 (proto.reg_count as usize).max(1),
                 proto.param_count as usize,
+                proto.rest_reg,
             )
         };
+        // A rest body (Tier C compiles them): its array register must lie in
+        // the window, or the call takes the framed route, which builds it.
+        if rest_reg.is_some_and(|r| r as usize >= reg_count) {
+            return SELF_CALL_DEOPT;
+        }
         // OrdinaryCallBindThis for a plain `f()` (`this` = undefined): a strict
         // callee binds undefined; a sloppy one binds its realm's global object.
         let this_v = if lexical_this {
@@ -625,6 +631,19 @@ impl<'p> Vm<'p> {
             // SAFETY: args points to `argc` valid Value bits (the caller's
             // staged contiguous arg registers); n ≤ argc.
             self.regs[new_base + 1 + i] = Value::from_bits(unsafe { *args.add(i) });
+        }
+        // A rest parameter: the arguments past the parameters, in a fresh
+        // Array, as `setup_call` builds it. Written after the fill (the
+        // must-def analysis sees the register read before any def, so the
+        // fill zeroed it). The window is exposed, so the array is rooted the
+        // moment it lands; no safe point runs before the callee's own.
+        if let Some(rreg) = rest_reg {
+            let extra: Vec<Value> = (n..argc)
+                // SAFETY: as above; i < argc.
+                .map(|i| Value::from_bits(unsafe { *args.add(i) }))
+                .collect();
+            let arr = self.heap.alloc(HeapObj::Array(extra));
+            self.regs[new_base + rreg as usize] = Value::heap(arr);
         }
         // B272: a handler-op body runs FRAME-BACKED. Its `push_finally` /
         // `pop_finally` helpers write the ACTIVE frame's handler stack, so the

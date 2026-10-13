@@ -2136,7 +2136,11 @@ impl<'p> Vm<'p> {
             let callee = self.func(fid as usize);
             if callee.is_generator
                 || callee.is_async
-                || callee.rest_reg.is_some()
+                // A rest body's generic cross call builds its array
+                // (`jit_cross_call_impl`); the same-prototype arrow lane
+                // below and the CROSS3 arms do not, and exclude it.
+                || (callee.rest_reg.is_some()
+                    && !crate::codegen::tierc_rest_enabled())
                 || callee.arguments_reg.is_some()
                 // B213: handler-op bodies never received a cross entry, so a
                 // specialized attempt would decline on every call and the
@@ -2154,7 +2158,8 @@ impl<'p> Vm<'p> {
                 && crate::codegen::same_proto_cross2_enabled()
                 && argc == 2
                 && callee.lexical_this
-                && callee.param_count == 2)
+                && callee.param_count == 2
+                && callee.rest_reg.is_none())
                 .then_some(crate::codegen::SameProtoCross2Plan {
                     fid,
                     callee_regs: callee.reg_count.max(1),

@@ -963,6 +963,23 @@ fn emit_tierc_xorshift_registers(
     }
 }
 
+/// Same-binary switch: `ZIPP_NO_TIERC_REST=1` keeps every function with a rest
+/// parameter out of Tier C again (and so out of every frame-free entry).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn tierc_rest_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_REST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Tier C eligibility: is every op of `proto` in the v1 whole-function mem-path
 /// subset? Stricter than `region_can_compile` (no GetProp/SetProp/StrConcat/
 /// MathOp/Bitwise/Cell/etc. yet — those are later increments). Rejects
@@ -979,10 +996,15 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         }
         return false;
     }
-    // A rest parameter's array / the `arguments` object are built by the
-    // interpreter's call setup, not by emitted code — the native entry would skip
-    // them. Stay interpreted.
-    if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
+    // The `arguments` object is built by the interpreter's call setup, not by
+    // emitted code — a frame-free entry would skip it. Stay interpreted. A rest
+    // parameter's array is built by every entry: the call setups that push a
+    // frame, and the generic frame-free cross call (`jit_cross_call_impl`)
+    // from the arguments past the parameters; every other frame-free entry
+    // declines a rest body (CROSS3 plans, the same-prototype arrow lane,
+    // `call_compiled_windowed`, `native_cb_entry`, the leaf and method
+    // inliners).
+    if proto.arguments_reg.is_some() || (proto.rest_reg.is_some() && !tierc_rest_enabled()) {
         if crate::jitlog_enabled() {
             eprintln!("[tierC-reject] rest/arguments");
         }

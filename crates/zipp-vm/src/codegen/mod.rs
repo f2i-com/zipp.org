@@ -5584,7 +5584,7 @@ pub(crate) use plan::*;
 pub(crate) use plan_region::*;
 pub(crate) use proto_mem::*;
 pub(crate) use py::*;
-pub(crate) use proto_mem::{splice_body_defs, splice_uninit_mask};
+pub(crate) use proto_mem::{splice_body_defs, splice_uninit_mask, tierc_rest_enabled};
 pub(crate) use regalloc::*;
 pub(crate) use region_admit::*;
 pub(crate) use region_int::*;
