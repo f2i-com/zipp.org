@@ -3100,6 +3100,25 @@ pub(crate) fn compile_region_mem(
                         dynasm!(ops ; => dv_done);
                     }
                     emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else if argc == 0 && key == "pop" {
+                    // `arr.pop()`: `jit_array_pop` serves a plain dense Array
+                    // in place and declines anything else before any effect.
+                    // The array's storage shrinks, so pinned snapshots are
+                    // re-derived as after a push.
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; mov rax, QWORD crate::vm::jit_array_pop as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if let Some((snap, plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, plan, cache);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
                 } else if argc == 1 && matches!(key, "push" | "charCodeAt") {
                     // The whitelisted 1-arg builtins keep their dedicated win64
                     // helpers: receiver + arg0 bits in, result bits out, deopt

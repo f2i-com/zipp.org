@@ -2382,6 +2382,45 @@ pub(crate) extern "win64" fn jit_array_push(
     }
 }
 
+/// Win64 helper for a JIT'd `arr.pop()` in a region: removes and returns the
+/// last element (or `undefined` for an empty array), or `SELF_CALL_DEOPT`,
+/// having done nothing, for every receiver the interpreter's dense arm would
+/// not serve in place: not an Array, `pop` shadowed or replaced, any side
+/// table (attribute overrides, frozen, sealed, non-extensible, an arguments
+/// object), a non-writable or virtual length, a hole in the last slot, or an
+/// indexed or replaced prototype (whose Get could run user code).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_array_pop(vm: *mut core::ffi::c_void, arr_bits: u64) -> u64 {
+    let arr = Value::from_bits(arr_bits);
+    if !arr.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: exclusive view; the array's Vec is not cached across the call.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = arr.heap_index();
+    if !matches!(vm.heap.get(idx), HeapObj::Array(items)
+            if !items.last().is_some_and(|v| v.is_hole()))
+        || !vm.array_method_is_intrinsic("pop")
+        || vm.arr_props.contains_key(&idx)
+        || vm.array_js_len.contains_key(&idx)
+        || vm.array_length_nonwritable.contains(&idx)
+        || vm.array_proto_has_index
+        || vm.proto_of.contains_key(&idx)
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let value = match vm.heap.get_mut(idx) {
+        HeapObj::Array(items) => items.pop().unwrap_or(Value::UNDEFINED),
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    // As the interpreter's arm: a for-in snapshot's liveness guard sees it.
+    vm.heap.bump_version(idx);
+    value.bits()
+}
+
 /// Win64 helper: may `arr` take the register tier's inline `push` lane for the
 /// WHOLE life of a compiled region? Returns 1 (yes) or 0 (take `entry_bail`).
 ///

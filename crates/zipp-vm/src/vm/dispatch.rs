@@ -4623,6 +4623,14 @@ impl<'p> Vm<'p> {
                                                 if *argc == 0 && key == Some("next") {
                                                     continue;
                                                 }
+                                                // `a.pop()`: the builtin fallback
+                                                // pops a dense Array in place
+                                                // (`try_builtin_method`); a stack
+                                                // loop of push/pop ran on the
+                                                // interpreter for want of it.
+                                                if *argc == 0 && key == Some("pop") {
+                                                    continue;
+                                                }
                                                 // B82: `f.call(…)` (0-3 forwarded
                                                 // args) / `f.apply(this[, arr])`
                                                 // sites are served per-call by
