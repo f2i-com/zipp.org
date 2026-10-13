@@ -244,6 +244,9 @@ pub(crate) struct PyRt {
     pub(super) pins: Value,
     /// Instance attribute layouts (`vm::py_table::layout`).
     pub(crate) layouts: super::py_table::layout::Layouts,
+    /// Per code object: 0 not looked at yet, 1 not a store body, `k + 1` a
+    /// store body of `k` stores (`Vm::py_store_call`).
+    pub(super) store_bodies: Vec<u8>,
     /// The static key plans of the templates `Vm::py_alloc_like` has
     /// copied (a few), matched to a template's own plan by pointer: a
     /// record is then allocated from this reference, where a clone of the
@@ -369,6 +372,7 @@ impl PyRt {
             frames: Vec::new(),
             pins: Value::UNDEFINED,
             layouts: Default::default(),
+            store_bodies: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             plans: Vec::new(),
         }

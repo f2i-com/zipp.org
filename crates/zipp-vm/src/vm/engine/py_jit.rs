@@ -162,6 +162,14 @@ impl<'p> Vm<'p> {
                         }
                     };
                 }
+                // A plain callee whose body only stores its parameters into
+                // attributes of the first: the call made without its frame
+                // (`Vm::py_store_call`) when every store's site holds. No
+                // guest code runs.
+                if v.py_store_call_site(&e, fv, base, arg_base, argc) {
+                    v.set(base, dst, Value::NULL);
+                    return PY_NEXT;
+                }
             }
         }
         Self::jit_py_op(vm, regs, packed)

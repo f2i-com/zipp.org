@@ -22,6 +22,63 @@ use crate::value::Value;
 /// `BUILTIN` entry): the key is the site's cached constant, never freed.
 pub(super) const KEY_ROOTED: u32 = u32::MAX;
 
+/// Most attribute stores a store body ([`py_store_body_scan`]) is made of.
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+pub(super) const STORE_BODY_MAX: u8 = 8;
+
+/// Whether a store body's call may be made without its frame
+/// (`Vm::py_store_call`). On unless `ZIPP_NO_PY_STORE_CALLS` is set (the
+/// same-binary A/B). Read once per process.
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+fn py_store_calls_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PY_STORE_CALLS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// The number of stores (1 to [`STORE_BODY_MAX`]) when the code object
+/// `p`'s main code is exactly a store body: the runtime's load (which
+/// changes nothing but its register, past the parameters'), then
+/// `PySetAttr`s of parameters into attributes of the first parameter, then
+/// `return None`. Its out-of-line code (the stores' slow paths, the frame
+/// guard) runs only from those, so a call whose every store takes its
+/// fast path runs nothing else (see `Vm::py_store_call`). Plain functions
+/// only: no generator, coroutine, rest parameter or `arguments`.
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+pub(super) fn py_store_body_scan(p: &crate::bytecode::FuncProto) -> Option<u8> {
+    use crate::bytecode::Instr;
+    if !py_store_calls_enabled() || p.is_generator || p.is_async || p.rest_reg.is_some() || p.arguments_reg.is_some() || p.param_count == 0 {
+        return None;
+    }
+    let params = p.param_count;
+    let code = p.code.as_slice();
+    let Some(&Instr::LoadGlobal { dst: g, .. }) = code.first() else {
+        return None;
+    };
+    if g <= params {
+        return None;
+    }
+    let mut k = 0usize;
+    while let Some(&Instr::PySetAttr { obj: 1, val, .. }) = code.get(1 + k) {
+        if val == 0 || val > params || k >= STORE_BODY_MAX as usize {
+            return None;
+        }
+        k += 1;
+    }
+    match (code.get(1 + k), code.get(2 + k)) {
+        (Some(&Instr::LoadNull { dst }), Some(&Instr::Return { src })) if k > 0 && src == dst => Some(k as u8),
+        _ => None,
+    }
+}
+
 /// A property's Python getter or setter as `PyGetAttr` / `PySetAttr` calls
 /// it: the function record `f` (the callee's `this`), its positional entry
 /// `entry` (`f.c1` / `f.c2`), and that entry's code object and closure.
@@ -272,6 +329,133 @@ impl<'p> Vm<'p> {
                 self.py_attr_set_hit(a.fid, 1, o, v).then_some(Value::UNDEFINED)
             }
         }
+    }
+
+    /// A call of a store body ([`py_store_body_scan`]: `self.a = a; self.b
+    /// = b` and nothing else, the commonest `__init__` there is) made
+    /// without its frame: each store as its own site's cache entry makes it
+    /// (`Vm::py_attr_set_hit`), when every one of the entries holds for the
+    /// instance as the stores before it leave it, which is checked for all of
+    /// them before the first store is made. `false`, with nothing done, for
+    /// anything else (a site not run yet, another class or layout, a dict
+    /// that is not layout-mode storage), whereupon the frame is pushed as
+    /// before, and under `ZIPP_PY_PROF`, which counts the frame's call.
+    /// `args` are the callee's parameters, the instance first.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline(always)]
+    pub(super) fn py_store_call(&mut self, fid: u32, stores: usize, args: &[Value]) -> bool {
+        use crate::bytecode::Instr;
+        const MAX: usize = STORE_BODY_MAX as usize;
+        if stores == 0 || stores > MAX || super::prof_py::on() {
+            return false;
+        }
+        let code = self.func(fid as usize).code.as_slice();
+        let Some(&o) = args.first() else {
+            return false;
+        };
+        let Some((cls, dict)) = self.py_inst_parts(o) else {
+            return false;
+        };
+        if !cls.is_heap() {
+            return false;
+        }
+        let Some((mut l, mut n)) = self.py_attrs_of(dict) else {
+            return false;
+        };
+        let mut ents = [PyIc::default(); MAX];
+        let mut vals = [Value::UNDEFINED; MAX];
+        let mut stamp: Option<(u32, u64)> = None;
+        for i in 0..stores {
+            let Some(&Instr::PySetAttr { val, .. }) = code.get(1 + i) else {
+                return false;
+            };
+            let Some(&v) = (val as usize).checked_sub(1).and_then(|at| args.get(at)) else {
+                return false;
+            };
+            let e = self.py_ic(fid, 1 + i);
+            if e.a != cls.bits() {
+                return false;
+            }
+            if stamp != Some((e.hver, e.c)) {
+                if !self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                    return false;
+                }
+                stamp = Some((e.hver, e.c));
+            }
+            match e.kind {
+                ic::ATTR_SET_L if l == e.d && (e.pos as usize) < n => {}
+                ic::ATTR_APPEND_L if (l, n) == (e.d, e.pos as usize) => {
+                    l = e.b as u32;
+                    n += 1;
+                }
+                _ => return false,
+            }
+            ents[i] = e;
+            vals[i] = v;
+        }
+        let di = dict.heap_index();
+        for (e, &v) in ents[..stores].iter().zip(&vals[..stores]) {
+            if e.kind == ic::ATTR_SET_L {
+                self.py_attrs_put(di, e.pos as usize, v);
+            } else {
+                self.py_attrs_push(di, e.b as u32, v);
+            }
+        }
+        true
+    }
+
+    /// [`Vm::py_store_call`] for the `PyCall` whose site's cache entry is
+    /// `e`, of the record `f` with `argc` arguments in the caller's
+    /// registers `arg_base..` (at `base`), when the entry records a plain
+    /// callee the record still holds (as `Vm::py_lean_hit` reads it) whose
+    /// code object is a store body taking exactly those. For compiled
+    /// code's `jit_py_call`: the interpreter's call step is left as it was.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline(never)]
+    pub(super) fn py_store_call_site(&mut self, e: &PyIc, f: Value, base: usize, arg_base: u16, argc: u16) -> bool {
+        if e.kind != ic::CALL_ENTRY || e.c == 0 || e.a != f.bits() || !f.is_heap() {
+            return false;
+        }
+        let fi = f.heap_index();
+        if self.heap.version_of(fi) != e.hver {
+            return false;
+        }
+        let pos = e.pos as usize;
+        match self.heap.get(fi) {
+            HeapObj::Object(m) if pos < m.len() && !m.is_accessor_at(pos) && m.val_at(pos).bits() == e.b => {}
+            _ => return false,
+        }
+        // The entry's `c`: the code object's id, register count and
+        // parameter count (`Vm::py_call_target`).
+        let (fid, params) = (e.c as u32, (e.c >> 48) as u16);
+        if argc != params {
+            return false;
+        }
+        let Some(stores) = self.py_store_body(fid) else {
+            return false;
+        };
+        self.with_argv(base, arg_base, argc, |vm, argv| vm.py_store_call(fid, stores, argv))
+    }
+
+    /// The store count of the code object `fid` when it is a store body
+    /// ([`py_store_body_scan`]), found once per code object.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline]
+    fn py_store_body(&mut self, fid: u32) -> Option<usize> {
+        let f = fid as usize;
+        let known = self.py_rt.as_deref()?.store_bodies.get(f).copied().unwrap_or(0);
+        let s = if known != 0 {
+            known
+        } else {
+            let s = py_store_body_scan(self.func(f)).map_or(1, |k| k + 1);
+            let p = self.py_rt.as_deref_mut()?;
+            if p.store_bodies.len() <= f {
+                p.store_bodies.resize(f + 1, 0);
+            }
+            p.store_bodies[f] = s;
+            s
+        };
+        (s > 1).then(|| (s - 1) as usize)
     }
 
     /// Whether `name` is, for `cls`, a property with a Python accessor a
