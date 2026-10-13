@@ -358,15 +358,17 @@
         }
         return false;
     }
-    // The small float32/float64 add/sub/mul/div that most eager ops are,
-    // without the generic path's helper calls (each an interpreted frame):
-    // operands of one dtype (`want` null or that dtype), fewer than
-    // NATIVE_MIN elements, with equal shapes, or one of them a single
-    // element of rank no higher than the other's, or one of them the other's
-    // trailing dims (a bias). The loops are binaryTile's and binaryScalar's,
-    // element for element, and the result's shape is the operand's own
-    // shape object, as `binary` hands back. `undefined` when the case is not
-    // one of these (the caller takes `binary`).
+    // The float32/float64 add/sub/mul/div that most eager ops are, without
+    // the generic path's helper calls (each an interpreted frame): operands
+    // of one dtype (`want` null or that dtype), with equal shapes, or one
+    // of them a single element of rank no higher than the other's, or one
+    // of them the other's trailing dims (a bias). The loops are binaryTile's
+    // and binaryScalar's, element for element; from NATIVE_MIN elements the
+    // native loop runs instead, over the same pairs laid out flat (a [n]
+    // walk, or [n / k, k] for a bias of k), as `binary` would have called
+    // it. The result's shape is the operand's own shape object, as `binary`
+    // hands back. `undefined` when the case is not one of these (the caller
+    // takes `binary`).
     const FAST_BIN = { add: 1, sub: 2, mul: 3, div: 4 };
     function smallShape(py) {
         // The element count of a tuple/Size of ints, or -1.
@@ -395,6 +397,18 @@
         for (let k = lead; k < p.length; k++) if (p[k] !== q[off + k - lead]) return false;
         return true;
     }
+    // binaryFast's pairs for the native loop (FAST_BIN's codes are
+    // BIN_CODE's): mode 0 equal shapes, 1 / 2 a single element on the
+    // right / left, 3 / 4 a bias of nb / na elements on the right / left.
+    function binaryFlat(code, A, B, O, mode, n, na, nb) {
+        switch (mode) {
+            case 0: return NATIVE(N_BINARY, code, A, B, O, [n], [1], [1]);
+            case 1: return NATIVE(N_BINARY, code, A, B, O, [n], [1], [0]);
+            case 2: return NATIVE(N_BINARY, code, A, B, O, [n], [0], [1]);
+            case 3: return NATIVE(N_BINARY, code, A, B, O, [n / nb, nb], [nb, 1], [0, 1]);
+            default: return NATIVE(N_BINARY, code, A, B, O, [n / na, na], [0, 1], [na, 1]);
+        }
+    }
     function binaryFast(op, x, xpy, y, ypy, want) {
         const code = FAST_BIN[op];
         if (code === undefined || x === null || y === null || typeof x !== "object" || typeof y !== "object" || x.cls !== Storage || y.cls !== Storage) return undefined;
@@ -405,7 +419,7 @@
         let na = 1, nb = 1;
         for (let k = 0; k < p.length; k++) { const d = p[k]; if (typeof d !== "bigint") return undefined; na *= Number(d); }
         for (let k = 0; k < q.length; k++) { const d = q[k]; if (typeof d !== "bigint") return undefined; nb *= Number(d); }
-        if (na <= 0 || nb <= 0 || na >= NATIVE_MIN || nb >= NATIVE_MIN) return undefined;
+        if (na <= 0 || nb <= 0) return undefined;
         const A = x.data, B = y.data;
         if (A.length !== na || B.length !== nb) return undefined;
         let mode = -1;
@@ -421,7 +435,9 @@
             else return undefined;
         }
         const n = mode === 2 || mode === 4 ? nb : na, O = dt === "float32" ? new Float32Array(n) : new Float64Array(n);
-        if (mode === 0) {
+        if (n >= NATIVE_MIN && NATIVE !== null && binaryFlat(code, A, B, O, mode, n, na, nb)) {
+            // (the native loop wrote O)
+        } else if (mode === 0) {
             switch (code) {
                 case 1: for (let i = 0; i < n; i++) O[i] = A[i] + B[i]; break;
                 case 2: for (let i = 0; i < n; i++) O[i] = A[i] - B[i]; break;
@@ -470,9 +486,18 @@
         const dt = t.dtype;
         if (sd !== dt || (dt !== "float32" && dt !== "float64") || (want !== null && want !== dt) || (typeof v !== "number" && typeof v !== "bigint")) return undefined;
         const n = smallShape(tpy), A = t.data;
-        if (n <= 0 || n >= NATIVE_MIN || A.length !== n) return undefined;
+        if (n <= 0 || A.length !== n) return undefined;
         // (jsNumber's value of a Python float or int)
         const v0 = typeof v === "number" ? v : Number(v), y = dt === "float32" ? Math.fround(v0) : v0, O = dt === "float32" ? new Float32Array(n) : new Float64Array(n);
+        // From NATIVE_MIN elements the native loop, with the number in a
+        // one-element array of the dtype (the storage `binary_scalar`
+        // builds for it) broadcast over a flat [n] walk.
+        if (n >= NATIVE_MIN && NATIVE !== null) {
+            const Y = dt === "float32" ? new Float32Array(1) : new Float64Array(1);
+            Y[0] = y;
+            if (flip ? NATIVE(N_BINARY, code, Y, A, O, [n], [0], [1]) : NATIVE(N_BINARY, code, A, Y, O, [n], [1], [0]))
+                return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, tpy] };
+        }
         switch (code) {
             case 1: for (let i = 0; i < n; i++) O[i] = flip ? y + A[i] : A[i] + y; break;
             case 2: if (flip) for (let i = 0; i < n; i++) O[i] = y - A[i]; else for (let i = 0; i < n; i++) O[i] = A[i] - y; break;
