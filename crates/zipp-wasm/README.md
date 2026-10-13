@@ -251,10 +251,14 @@ diagnostic for a browser's GPU support.
 
 `build-variants.sh` and release packaging use `optimize-wasm.sh`, with
 [Binaryen 125](https://github.com/WebAssembly/binaryen/releases/tag/version_125)
-(`npm install --global binaryen@125.0.0`). The script tries `wasm-opt -O1 -O1`
-after stripping metadata: a second run of the same pipeline is smaller on both
-measures for every variant, while a third, `--converge`, and the passes that
-only shrink the raw module each cost Brotli bytes. Full builds keep the
+(`npm install --global binaryen@125.0.0`). After stripping metadata the
+script runs constant propagation and redundant-set elimination, then
+`wasm-opt -O1 -O1`: a second run of the same
+pipeline is smaller on both measures for every variant, while a third,
+`--converge`, and the passes that only shrink the raw module each cost Brotli
+bytes. It then lays the functions out by signature and body
+(`tests/node/order-functions.cjs`), which moves code without changing it and
+leaves each module 9 to 12 KB smaller after Brotli. Full builds keep the
 candidate only when it is
 smaller raw and no larger after Brotli quality 11. Lite passes
 `--prefer-raw-size`: a saving of at least 64 KiB raw may increase Brotli size

@@ -20,7 +20,7 @@
 //!
 //! Pattern selection receives the DateTimeFormat service's resolved locale data.
 
-use crate::vm::dtf_locale::{CalendarPatterns, DateTimeLocale};
+use crate::vm::dtf_locale::{CalPatterns, DateTimeLocale};
 
 /// One piece of a CLDR pattern: a literal run, or `count` repetitions of a
 /// field letter.
@@ -181,14 +181,38 @@ fn is_date_class(k: u8) -> bool {
 
 /// The skeleton fields of a pattern, as `(class, letter, count)` — the pattern's
 /// own spelling, which is what the width adjustment below rewrites.
+///
+/// The fields `parse_pattern` finds, read the same way, without building its
+/// literal strings: the pattern matchers call this on every candidate of a
+/// locale's tables for each request, and the literals were most of its work.
 fn pattern_fields(p: &str) -> Vec<(u8, char, usize)> {
-    parse_pattern(p)
-        .into_iter()
-        .filter_map(|i| match i {
-            Item::Field(c, n) => class_of(c).map(|k| (k, c, n)),
-            _ => None,
-        })
-        .collect()
+    let mut out = Vec::new();
+    let mut it = p.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\'' {
+            if it.peek() == Some(&'\'') {
+                it.next();
+                continue;
+            }
+            for q in it.by_ref() {
+                if q == '\'' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            let mut n = 1;
+            while it.peek() == Some(&c) {
+                it.next();
+                n += 1;
+            }
+            if let Some(k) = class_of(c) {
+                out.push((k, c, n));
+            }
+        }
+    }
+    out
 }
 
 /// The resolved DateTimeFormat components, as CLDR pattern letters. Each entry
@@ -355,7 +379,7 @@ fn distance(cand: &str, want: &[(u8, char, usize)]) -> Option<u32> {
 /// time fields), with the skeleton it was matched under ("" when none was).
 fn best_half(
     data: &DateTimeLocale,
-    patterns: &CalendarPatterns,
+    patterns: &CalPatterns,
     want: &[(u8, char, usize)],
     hour12: bool,
 ) -> Option<(String, &'static str)> {
@@ -363,7 +387,7 @@ fn best_half(
         return None;
     }
     let mut best: Option<(u32, &'static str, &'static str)> = None;
-    for &(sk, pat) in patterns.available_formats {
+    for (sk, pat) in patterns.available_formats.pairs() {
         // `availableFormats` carries an `h…`/`H…` twin of every time pattern;
         // only the one matching the resolved hour cycle is a candidate.
         let f = pattern_fields(sk);
@@ -404,7 +428,7 @@ fn best_half(
         for (k, c, n) in missing {
             let Some((_, glue, name)) = data
                 .append_items
-                .iter()
+                .triples()
                 .find(|(l, ..)| l.chars().next().and_then(class_of) == Some(*k))
             else {
                 continue;
@@ -424,7 +448,7 @@ fn best_half(
 /// index of the glue that would join them. `formatRange` needs the halves apart.
 pub(crate) fn best_pattern_halves(
     data: &DateTimeLocale,
-    patterns: &CalendarPatterns,
+    patterns: &CalPatterns,
     req: &Request,
     hour12: bool,
 ) -> (String, String, usize) {
@@ -558,7 +582,7 @@ pub(crate) fn style_index(s: &str) -> Option<usize> {
 /// or None when CLDR has no row (the caller then formats both endpoints whole
 /// and joins them with `INTERVAL_FALLBACK`).
 pub(crate) fn interval_pattern(
-    patterns: &CalendarPatterns,
+    patterns: &CalPatterns,
     half: &[Item],
     hour12: bool,
     greatest: char,
@@ -583,7 +607,7 @@ pub(crate) fn interval_pattern(
     let req = &req;
     let gk = class_of(greatest)?;
     let mut best: Option<(u32, &str, &str)> = None;
-    for (sk, gd, pat) in patterns.interval_formats {
+    for (sk, gd, pat) in patterns.interval_formats.triples() {
         if class_of(gd.chars().next()?) != Some(gk) {
             continue;
         }
@@ -693,5 +717,77 @@ pub(crate) fn day_period_name(data: &DateTimeLocale, key: &str, width: usize) ->
         "PM"
     } else {
         "AM"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `pattern_fields` returned when it filtered `parse_pattern`.
+    fn fields_via_items(p: &str) -> Vec<(u8, char, usize)> {
+        parse_pattern(p)
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::Field(c, n) => class_of(c).map(|k| (k, c, n)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn check(p: &str) {
+        assert_eq!(pattern_fields(p), fields_via_items(p), "{p:?}");
+    }
+
+    macro_rules! check_locale {
+        ($m:ident) => {{
+            use crate::vm::$m as m;
+            for (sk, pat) in m::AVAILABLE_FORMATS {
+                check(sk);
+                check(pat);
+            }
+            for (sk, gd, pat) in m::INTERVAL_FORMATS {
+                check(sk);
+                check(gd);
+                check(pat);
+            }
+            for p in m::DATE_FORMATS.iter().chain(&m::TIME_FORMATS) {
+                check(p);
+            }
+            for (_, ps) in m::CAL_DATE_FORMATS {
+                for p in ps {
+                    check(p);
+                }
+            }
+            for c in m::CAL_PATTERNS {
+                for (sk, pat) in c.available_formats {
+                    check(sk);
+                    check(pat);
+                }
+                for (sk, gd, pat) in c.interval_formats {
+                    check(sk);
+                    check(gd);
+                    check(pat);
+                }
+            }
+        }};
+    }
+
+    /// The direct scan finds exactly the fields the item parser did, on every
+    /// pattern and skeleton the five locales ship and on quoting edge cases.
+    #[test]
+    fn pattern_fields_match_the_item_parser() {
+        check_locale!(cldr_dtf_en);
+        check_locale!(cldr_de);
+        check_locale!(cldr_ja);
+        check_locale!(cldr_zh);
+        check_locale!(cldr_ar_eg);
+        for p in [
+            "", "'", "''", "'''", "''''", "'a'", "'a''b'", "h 'Uhr'", "h'h'h", "''h''",
+            "yyyy'年'MM", "y 'de' MMMM", "'unterminated", "HH:mm''ss", "d.M.y", "EEEE, d. MMMM y",
+            "ab'c", "x'y'z'", "QQQQ ww W", "\u{2009}h\u{202f}a",
+        ] {
+            check(p);
+        }
     }
 }

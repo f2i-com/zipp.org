@@ -118,16 +118,65 @@ pub(crate) fn is_combining_mark(c: char) -> bool {
     MARKS.rank(c).is_some()
 }
 
+/// A decomposition table's texts, stored as each text's length in bytes.
+/// The lengths are small and alike, where the 16-bit offsets to every text
+/// they replace were neither: those offsets were 6.1 KB of each module after
+/// Brotli. The offsets are summed from the lengths once, at the first
+/// lookup, so a lookup costs what it did. (The composition pairs keep their
+/// offsets: composing looks one up for every mark, and the one load more
+/// that a summed table costs there made NFC 6% slower; they are small.)
+#[derive(Clone, Copy)]
+enum Spans {
+    Canonical = 0,
+    Compatible = 1,
+}
+
+impl Spans {
+    /// The generated lengths.
+    fn lengths(self) -> &'static [u8] {
+        match self {
+            Spans::Canonical => tables::CANONICAL_LENGTHS,
+            Spans::Compatible => tables::COMPATIBLE_LENGTHS,
+        }
+    }
+
+    /// Where run `i` lies.
+    #[inline]
+    fn range(self, i: usize) -> Option<core::ops::Range<usize>> {
+        let all = match OFFSETS.get() {
+            Some(all) => all,
+            None => sum_offsets(),
+        };
+        let offsets = &all[self as usize];
+        Some(usize::from(*offsets.get(i)?)..usize::from(*offsets.get(i + 1)?))
+    }
+}
+
+/// Every text's start, and the end of the last, per [`Spans`] table.
+static OFFSETS: std::sync::OnceLock<[Vec<u16>; 2]> = std::sync::OnceLock::new();
+
+/// [`OFFSETS`], summed from the lengths on the first lookup.
+#[cold]
+#[inline(never)]
+fn sum_offsets() -> &'static [Vec<u16>; 2] {
+    OFFSETS.get_or_init(|| {
+        [Spans::Canonical, Spans::Compatible].map(|spans| {
+            let mut at = 0u16;
+            std::iter::once(0)
+                .chain(spans.lengths().iter().map(|&n| {
+                    at += u16::from(n);
+                    at
+                }))
+                .collect()
+        })
+    })
+}
+
 /// The text `c` maps to in a decomposition table.
 #[inline]
-fn mapped(
-    keys: &Ranked,
-    offsets: &'static [u16],
-    text: &'static str,
-    c: u32,
-) -> Option<&'static str> {
+fn mapped(keys: &Ranked, spans: Spans, text: &'static str, c: u32) -> Option<&'static str> {
     let at = keys.rank(c)?;
-    Some(&text[usize::from(offsets[at])..usize::from(offsets[at + 1])])
+    text.get(spans.range(at)?)
 }
 
 /// The full decomposition of `c`, canonical or compatibility, a character at
@@ -152,20 +201,13 @@ fn decompose(c: char, compatible: bool, mut emit: impl FnMut(char)) {
         .then(|| {
             mapped(
                 &COMPATIBLE,
-                tables::COMPATIBLE_OFFSETS,
+                Spans::Compatible,
                 tables::COMPATIBLE_TEXT,
                 code,
             )
         })
         .flatten()
-        .or_else(|| {
-            mapped(
-                &CANONICAL,
-                tables::CANONICAL_OFFSETS,
-                tables::CANONICAL_TEXT,
-                code,
-            )
-        });
+        .or_else(|| mapped(&CANONICAL, Spans::Canonical, tables::CANONICAL_TEXT, code));
     match text {
         Some(text) => text.chars().for_each(emit),
         None => emit(c),
@@ -221,12 +263,54 @@ pub(crate) struct Decompositions<'a> {
     ready: usize,
 }
 
+/// The longest run of marks `order` puts in order by insertion.
+const INSERTION_MAX: usize = 32;
+
 /// Put a run of marks in canonical order. The sort is stable, so marks of
 /// one class keep their order; most runs are of one mark or none.
+///
+/// Not the standard library's sort, whose stable instantiation for this
+/// element type was 4.3 KB of every WebAssembly module: an insertion sort
+/// orders the short runs real text has, and a longer one, which only crafted
+/// text has, is distributed by class (there are 256), so the work stays
+/// linear in the run however long it is.
 #[inline]
 fn order(run: &mut [(u8, char)]) {
-    if run.len() > 1 {
-        run.sort_by_key(|entry| entry.0);
+    if run.len() <= 1 {
+        return;
+    }
+    if run.len() <= INSERTION_MAX {
+        for i in 1..run.len() {
+            let entry = run[i];
+            let mut j = i;
+            while j > 0 && run[j - 1].0 > entry.0 {
+                run[j] = run[j - 1];
+                j -= 1;
+            }
+            run[j] = entry;
+        }
+        return;
+    }
+    order_by_counting(run);
+}
+
+/// `order` for a long run: a stable counting sort by class.
+#[inline(never)]
+fn order_by_counting(run: &mut [(u8, char)]) {
+    let mut start = [0usize; 256];
+    for &(class, _) in run.iter() {
+        start[usize::from(class)] += 1;
+    }
+    let mut at = 0;
+    for slot in start.iter_mut() {
+        let n = *slot;
+        *slot = at;
+        at += n;
+    }
+    for entry in run.to_vec() {
+        let slot = &mut start[usize::from(entry.0)];
+        run[*slot] = entry;
+        *slot += 1;
     }
 }
 
@@ -511,15 +595,21 @@ mod tests {
     /// A decomposition table: its keys, the text each maps to, and where.
     fn decomposition_table(prefix: &str, entries: &[(char, String)]) -> String {
         let keys: Vec<u32> = entries.iter().map(|entry| entry.0 as u32).collect();
-        let (mut offsets, mut text) = (Vec::new(), String::new());
-        for (_, mapping) in entries {
-            offsets.push(u16::try_from(text.len()).expect("the text fits 16-bit offsets"));
-            text.push_str(mapping);
-        }
-        offsets.push(u16::try_from(text.len()).expect("the text fits 16-bit offsets"));
+        let lengths: Vec<usize> = entries.iter().map(|entry| entry.1.len()).collect();
+        let text: String = entries.iter().map(|entry| entry.1.as_str()).collect();
         ranked(prefix, &keys)
-            + &numbers(&format!("{prefix}_OFFSETS"), "u16", &offsets)
+            + &spans(&format!("{prefix}_LENGTHS"), &lengths)
             + &string(&format!("{prefix}_TEXT"), &text)
+    }
+
+    /// The table of a [`Spans`]: runs of these lengths.
+    fn spans(name: &str, lengths: &[usize]) -> String {
+        u16::try_from(lengths.iter().sum::<usize>()).expect("the runs fit 16-bit offsets");
+        let lengths: Vec<u8> = lengths
+            .iter()
+            .map(|&n| u8::try_from(n).expect("a run is at most 255 long"))
+            .collect();
+        numbers(name, "u8", &lengths)
     }
 
     /// Every pair the crate composes, as (first, second, composite), sorted.
@@ -624,7 +714,7 @@ mod tests {
              // page; and the number of members before each 64 code points of each page.\n\n",
             version.0, version.1, version.2
         );
-        text += "// Canonical decompositions, fully decomposed: the characters that have one,\n// and each one's text from its offset to the next.\n";
+        text += "// Canonical decompositions, fully decomposed: the characters that have one,\n// each one's text's length in bytes, and the texts end to end.\n";
         text += &decomposition_table("CANONICAL", &canonical_entries);
         text += "\n// Compatibility decompositions that differ from the canonical one.\n";
         text += &decomposition_table("COMPATIBLE", &compatible_entries);
@@ -764,6 +854,78 @@ mod tests {
             assert!(nfkd(&s).eq(s.nfkd()), "NFKD of {s:?}");
             assert!(nfc(&s).eq(s.nfc()), "NFC of {s:?}");
             assert!(nfkc(&s).eq(s.nfkc()), "NFKC of {s:?}");
+        }
+    }
+
+    /// Every text of the two decomposition tables is where the 16-bit
+    /// offsets the lengths replaced put it: at the sum of the lengths before
+    /// it, and the texts end exactly at the end of the table.
+    #[test]
+    fn spans_give_every_run_where_offsets_did() {
+        for (name, spans, total) in [
+            ("canonical", Spans::Canonical, tables::CANONICAL_TEXT.len()),
+            ("compatible", Spans::Compatible, tables::COMPATIBLE_TEXT.len()),
+        ] {
+            let mut offset = 0usize;
+            for (i, &n) in spans.lengths().iter().enumerate() {
+                let end = offset + usize::from(n);
+                assert_eq!(spans.range(i), Some(offset..end), "{name} run {i}");
+                offset = end;
+            }
+            assert_eq!(offset, total, "{name}: the runs cover the table");
+            assert_eq!(spans.range(spans.lengths().len()), None, "{name}: past the end");
+        }
+    }
+
+    /// `order` is the standard stable sort by class, on both of its paths:
+    /// runs up to `INSERTION_MAX` and longer ones, with many equal classes.
+    #[test]
+    fn order_is_the_stable_sort_by_class() {
+        let mut seed = 0x0dde_2026_u64;
+        let mut random = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        for len in (0..80).chain([200, 1000, 5000]) {
+            for classes in [1usize, 2, 5, 40, 256] {
+                let run: Vec<(u8, char)> = (0..len)
+                    .map(|i| (random(classes) as u8, char::from_u32(0x300 + i as u32).unwrap()))
+                    .collect();
+                let mut want = run.clone();
+                want.sort_by_key(|entry| entry.0);
+                let mut got = run.clone();
+                order(&mut got);
+                assert_eq!(got, want, "len {len}, {classes} classes");
+            }
+        }
+    }
+
+    /// Long runs of marks, which go through the counting sort, normalize as
+    /// the crate does.
+    #[test]
+    fn long_runs_of_marks_agree_with_the_crate() {
+        let marks: Vec<char> = chars()
+            .filter(|&c| unicode_normalization::char::canonical_combining_class(c) != 0)
+            .collect();
+        let mut seed = 0x0004_c0a9_2026_u64;
+        let mut random = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        for len in [33, 64, 300, 2000] {
+            for _ in 0..20 {
+                let mut s = String::from("a");
+                for _ in 0..len {
+                    s.push(marks[random(marks.len())]);
+                }
+                assert!(nfd(&s).eq(s.nfd()), "NFD of a run of {len}");
+                assert!(nfc(&s).eq(s.nfc()), "NFC of a run of {len}");
+                assert!(nfkd(&s).eq(s.nfkd()), "NFKD of a run of {len}");
+            }
         }
     }
 }
