@@ -2439,6 +2439,46 @@ impl ObjMap {
         m
     }
 
+    /// The own properties of an `arguments` object (`Vm::build_arguments_object`):
+    /// `length` and `@@iterator` as hidden writable data, then `callee` with
+    /// `callee_attr`. The map three `define`s on a `new_side_table` leave,
+    /// with the key list shared through one plan instead of three new
+    /// strings and a growing key vector per call (planned keys materialize
+    /// on the first structural change, as a literal's do).
+    pub(crate) fn arguments_side_table(
+        length: Value,
+        iterator: Value,
+        callee: Value,
+        callee_attr: PropAttr,
+    ) -> ObjMap {
+        static PLAN: std::sync::OnceLock<StaticKeyPlan> = std::sync::OnceLock::new();
+        let plan = PLAN.get_or_init(|| {
+            StaticKeyPlan::new(vec![
+                "length".to_string(),
+                "@@iterator".to_string(),
+                "callee".to_string(),
+            ])
+        });
+        let hidden = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let mut m = ObjMap::new_side_table();
+        m.keys = PropKeys::Planned {
+            all: plan.clone(),
+            visible_len: 3,
+        };
+        m.vals = ValStore::Vec(vec![length, iterator, callee]);
+        m.attrs = PropAttrs::Mixed(vec![hidden, hidden, callee_attr]);
+        // `length` counts as an element-shadowing key (`key_names_element`),
+        // which is what makes the element paths decline an arguments object.
+        m.has_element_key = plan.keys().iter().any(|k| key_names_element(k));
+        m
+    }
+
     /// `new_side_table` with pre-sized vectors — for the regex match-result
     /// entry, which appends exactly `index`/`input`/`groups` (+`indices` with
     /// /d) per match. That site used `with_capacity`, whose shape starts at
@@ -9621,6 +9661,35 @@ pub(crate) mod gcoracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ObjMap::arguments_side_table` must leave exactly the map the three
+    /// `define`s it replaces built: every field, both callee forms.
+    #[test]
+    fn arguments_side_table_matches_three_defines() {
+        let hidden = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let poison = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            accessor: true,
+            setter: Value::int(7),
+        };
+        for callee_attr in [hidden, poison] {
+            let (len, iter, callee) = (Value::int(3), Value::int(5), Value::int(7));
+            let mut by_define = ObjMap::new_side_table();
+            by_define.define("length", len, hidden);
+            by_define.define("@@iterator", iter, hidden);
+            by_define.define("callee", callee, callee_attr);
+            let built = ObjMap::arguments_side_table(len, iter, callee, callee_attr);
+            assert_eq!(format!("{built:?}"), format!("{by_define:?}"));
+        }
+    }
 
     #[cfg(not(feature = "safe-sandbox"))]
     #[test]

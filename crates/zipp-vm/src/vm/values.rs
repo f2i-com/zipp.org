@@ -1737,61 +1737,38 @@ impl<'p> Vm<'p> {
         if obj_proto != 0 {
             self.proto_of.insert(idx, Value::heap(obj_proto));
         }
-        let m = self
-            .arr_props
-            .entry(idx)
-            .or_insert_with(ObjMap::new_side_table);
         // `length` is an ORDINARY data property of an arguments object
         // (writable, non-enumerable, configurable — it can hold any value and
         // be deleted), not the Array exotic length. Every Array-length special
         // case is guarded with !arguments_objs.contains.
-        m.define(
-            "length",
-            Value::num(argc as f64),
-            PropAttr {
-                writable: true,
+        let (callee_val, callee_attr) = if unmapped {
+            let poison = PropAttr {
+                writable: false,
                 enumerable: false,
-                configurable: true,
-                accessor: false,
-                setter: Value::UNDEFINED,
-            },
-        );
-        m.define(
-            "@@iterator",
-            array_values,
-            PropAttr {
-                writable: true,
-                enumerable: false,
-                configurable: true,
-                accessor: false,
-                setter: Value::UNDEFINED,
-            },
-        );
-        if unmapped {
-            m.define(
-                "callee",
-                thrower,
-                PropAttr {
-                    writable: false,
-                    enumerable: false,
-                    configurable: false,
-                    accessor: true,
-                    setter: thrower,
-                },
-            );
+                configurable: false,
+                accessor: true,
+                setter: thrower,
+            };
+            (thrower, poison)
         } else {
-            m.define(
-                "callee",
-                callee,
-                PropAttr {
-                    writable: true,
-                    enumerable: false,
-                    configurable: true,
-                    accessor: false,
-                    setter: Value::UNDEFINED,
-                },
-            );
-        }
+            let data = PropAttr {
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            (callee, data)
+        };
+        let props = ObjMap::arguments_side_table(
+            Value::num(argc as f64),
+            array_values,
+            callee_val,
+            callee_attr,
+        );
+        // A fresh index has no side-table entry yet (the slot's previous
+        // occupant's was pruned when it was freed).
+        self.arr_props.insert(idx, props);
         Value::heap(idx)
     }
 
