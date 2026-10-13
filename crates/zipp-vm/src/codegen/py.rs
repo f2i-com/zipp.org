@@ -947,6 +947,89 @@ pub(crate) fn emit_py_op(
             let keys = key as u64 | (gb as u64) << 32;
             emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(keys)], dst, labels, refetch);
         }
+        Instr::PyClassOf { dst, obj, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_class_of as usize;
+            emit_py_value_call(ops, h, [V::Reg(obj), V::None, V::None, V::None], dst, labels, refetch);
+        }
+        Instr::PyCaught { dst, e, line, rt, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_caught as usize;
+            emit_py_value_call(ops, h, [V::Reg(e), V::Reg(line), V::Reg(rt), V::None], dst, labels, refetch);
+        }
+        // An instance dict's entry (`PyDictGet`): as a value helper, with
+        // `PY_ABSENT_BITS` the fall-through that leaves `dst` untouched.
+        Instr::PyDictGet { dst, obj, key, absent, .. } if !crate::vm::prof_py::on() => {
+            let keys = key as u64 | (absent as u64) << 32;
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(obj)]
+                ; mov r8, QWORD site(func_id, ip) as i64
+                ; mov r9, QWORD keys as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_get as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; mov r10, QWORD PY_ABSENT_BITS as i64
+                ; cmp rax, r10
+                ; je => done
+                ; mov r10, QWORD CALL_THREW as i64
+                ; cmp rax, r10
+                ; je => labels.bail
+                ; mov [rbx + dreg(dst)], rax
+            );
+        }
+        // A dict's `.get` (`PyDictLookup`): as `PyGetItem`'s helper, its
+        // `absent` edge the second.
+        Instr::PyDictLookup { dst, d, k, rt, .. } if labels.target.is_some() && !crate::vm::prof_py::on() => {
+            let Some(absent) = labels.target else {
+                unreachable!("PyDictLookup carries an absent label");
+            };
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(d)]
+                ; mov r8, [rbx + dreg(k)]
+                ; mov r9, [rbx + dreg(rt)]
+                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_lookup as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; mov r10, QWORD PY_ABSENT_BITS as i64
+                ; cmp rax, r10
+                ; je => absent
+                ; mov [rbx + dreg(dst)], rax
+            );
+        }
+        // An exception stack's pop (`PyExcPop`): 0 is done.
+        Instr::PyExcPop { rt, .. } if !crate::vm::prof_py::on() => {
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(rt)]
+                ; mov rax, QWORD crate::vm::Vm::jit_py_exc_pop as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; test rax, rax
+                ; jz => done
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; jmp => labels.bail
+            );
+        }
         Instr::PyIsInstance { dst, v, t, rt, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_isinstance as usize;
             emit_py_value_call(ops, h, [V::Reg(v), V::Reg(t), V::Reg(rt), V::Imm(site(func_id, ip))], dst, labels, refetch);

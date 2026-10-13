@@ -419,6 +419,77 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `PyClassOf` from compiled code: `py_class_of` (see above).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_class_of(vm: *mut core::ffi::c_void, o: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_class_of(Value::from_bits(o)) {
+            Some(c) => c.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyDictGet` from compiled code: `py_dict_get` (see above); `keys` is
+    /// `key | absent << 32`. The value's bits, `PY_ABSENT_BITS` for the
+    /// fall-through that leaves `dst` untouched, `PY_SLOW_BITS`, or
+    /// `CALL_THREW` (the frame's ip the instruction's, as the step leaves
+    /// it).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_dict_get(vm: *mut core::ffi::c_void, o: u64, packed: u64, keys: u64) -> u64 {
+        use crate::vm::py_ops::PyDictGot;
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_dict_get((packed >> 32) as u32, Value::from_bits(o), keys as u32, (keys >> 32) != 0) {
+            Ok(PyDictGot::Value(v)) => v.bits(),
+            Ok(PyDictGot::Absent) => crate::codegen::PY_ABSENT_BITS,
+            Ok(PyDictGot::Slow) => crate::codegen::PY_SLOW_BITS,
+            Err(t) => {
+                vm.py_step_failed(packed as u32 as usize);
+                vm.jit_thrown_to_sentinel(t)
+            }
+        }
+    }
+
+    /// `PyDictLookup` from compiled code: `py_dict_lookup` (see above), as
+    /// `PyGetItem`'s helper answers: the value's bits, `PY_ABSENT_BITS` for
+    /// the `absent` edge, `PY_SLOW_BITS` for the `slow` edge.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_dict_lookup(vm: *mut core::ffi::c_void, d: u64, k: u64, rt: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_dict_lookup(Value::from_bits(d), Value::from_bits(k), Value::from_bits(rt)) {
+            Some(Some(v)) => v.bits(),
+            Some(None) => crate::codegen::PY_ABSENT_BITS,
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyCaught` from compiled code: `py_caught` (see above), answering the
+    /// exception's bits (the step's `dst`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_caught(vm: *mut core::ffi::c_void, e: u64, line: u64, rt: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        if vm.py_caught(Value::from_bits(e), Value::from_bits(line), Value::from_bits(rt)) {
+            e
+        } else {
+            crate::codegen::PY_SLOW_BITS
+        }
+    }
+
+    /// `PyExcPop` from compiled code: `py_exc_pop` (see above). 0 done,
+    /// `PY_SLOW_BITS` for the `slow` edge.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_exc_pop(vm: *mut core::ffi::c_void, rt: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        match vm.py_exc_pop(Value::from_bits(rt)) {
+            Some(()) => 0,
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
     /// `PyIsInstance` from compiled code: `py_isinstance` (see above), its
     /// answer as the bool the step stores.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]

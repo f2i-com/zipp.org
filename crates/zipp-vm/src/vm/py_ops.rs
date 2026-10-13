@@ -91,28 +91,23 @@ impl<'p> Vm<'p> {
         Ok(match *instr {
             Instr::PyClassOf { dst, obj, slow } => {
                 let o = self.get(base, obj);
-                match self.py_cls_of(o) {
-                    Some(c) if self.py_plain_rec(c) => {
+                match self.py_class_of(o) {
+                    Some(c) => {
                         self.set(base, dst, c);
                         ip + 1
                     }
-                    _ => slow as usize,
+                    None => slow as usize,
                 }
             }
             Instr::PyDictGet { dst, obj, key, absent, slow } => {
                 let o = self.get(base, obj);
-                let Some(map) = self.py_inst_map(o) else {
-                    return Ok(slow as usize);
-                };
-                let k = self.resolve_const_slot(func_id, key);
-                let v = self.map_method(map, "get", &[k])?.unwrap_or(Value::UNDEFINED);
-                match (v.is_undefined(), absent) {
-                    (false, false) => {
+                match self.py_dict_get(func_id, o, key, absent)? {
+                    PyDictGot::Value(v) => {
                         self.set(base, dst, v);
                         ip + 1
                     }
-                    (true, true) => ip + 1,
-                    _ => slow as usize,
+                    PyDictGot::Absent => ip + 1,
+                    PyDictGot::Slow => slow as usize,
                 }
             }
             Instr::PyCallEntry { dst, f, name, slow } => {
@@ -418,23 +413,9 @@ impl<'p> Vm<'p> {
                 return Err(Thrown(String::new()));
             }
             Instr::PyCaught { dst, e, line, rt, slow } => {
-                let (ev, rv) = (self.get(base, e), self.get(base, rt));
-                let Some(tb_slot) = self.py_exc_record(ev, rv, false).map(|(_, tb)| tb) else {
+                let (ev, lv, rv) = (self.get(base, e), self.get(base, line), self.get(base, rt));
+                if !self.py_caught(ev, lv, rv) {
                     return Ok(slow as usize);
-                };
-                let idx = ev.heap_index();
-                let tb = match self.heap.get(idx) {
-                    HeapObj::Object(m) => m.val_at(tb_slot),
-                    _ => return Ok(slow as usize),
-                };
-                if tb.is_number() && tb.as_f64() == -1.0 {
-                    let lv = self.get(base, line);
-                    if lv.is_heap() {
-                        self.heap.write_barrier_val(idx, lv);
-                    }
-                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                        m.set_val_at(tb_slot, lv);
-                    }
                 }
                 self.set(base, dst, ev);
                 ip + 1
@@ -1096,9 +1077,61 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// [`Instr::PyClassOf`]: the record `o`'s class when it is a plain
+    /// record; `None` for the slow edge.
+    #[inline]
+    pub(super) fn py_class_of(&self, o: Value) -> Option<Value> {
+        self.py_cls_of(o).filter(|&c| self.py_plain_rec(c))
+    }
+
+    /// [`Instr::PyDictGet`] of the string constant `key` (of `func_id`) in
+    /// the instance `o`'s attribute storage: what `map_method`'s `get`
+    /// answers for it, asked of layout-mode storage directly (the step went
+    /// through the method's name), sorted as the instruction's `absent`
+    /// flag sorts it.
+    pub(super) fn py_dict_get(&mut self, func_id: u32, o: Value, key: u32, absent: bool) -> Result<PyDictGot, Thrown> {
+        let Some(map) = self.py_inst_map(o) else {
+            return Ok(PyDictGot::Slow);
+        };
+        let k = self.resolve_const_slot(func_id, key);
+        let v = if matches!(self.heap.get(map), HeapObj::PyAttrs { .. }) {
+            self.py_attrs_get(Value::heap(map), k).flatten().unwrap_or(Value::UNDEFINED)
+        } else {
+            self.map_method(map, "get", &[k])?.unwrap_or(Value::UNDEFINED)
+        };
+        Ok(match (v.is_undefined(), absent) {
+            (false, false) => PyDictGot::Value(v),
+            (true, true) => PyDictGot::Absent,
+            _ => PyDictGot::Slow,
+        })
+    }
+
+    /// [`Instr::PyCaught`] for the exception `e` (the handler's `line`):
+    /// whether it is an exception record, its `tbline` then set to `line`
+    /// if it was -1; `false` (nothing done) for the slow edge.
+    pub(super) fn py_caught(&mut self, e: Value, line: Value, rt: Value) -> bool {
+        let Some(tb_slot) = self.py_exc_record(e, rt, false).map(|(_, tb)| tb) else {
+            return false;
+        };
+        let idx = e.heap_index();
+        let tb = match self.heap.get(idx) {
+            HeapObj::Object(m) => m.val_at(tb_slot),
+            _ => return false,
+        };
+        if tb.is_number() && tb.as_f64() == -1.0 {
+            if line.is_heap() {
+                self.heap.write_barrier_val(idx, line);
+            }
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.set_val_at(tb_slot, line);
+            }
+        }
+        true
+    }
+
     /// [`Instr::PyExcPop`]: `Some` when it popped (see the instruction).
     #[inline(never)]
-    fn py_exc_pop(&mut self, rt: Value) -> Option<()> {
+    pub(super) fn py_exc_pop(&mut self, rt: Value) -> Option<()> {
         let stack = self.py_rt_for(rt)?.excstack;
         if !stack.is_heap() {
             return None;
@@ -1264,7 +1297,7 @@ impl<'p> Vm<'p> {
 
     /// [`Instr::PyDictLookup`]: `Some(Some(value))`, `Some(None)` for no
     /// entry, `None` for the slow edge (the table's own lookup, `vm::py_table`).
-    fn py_dict_lookup(&mut self, d: Value, k: Value, rt: Value) -> Option<Option<Value>> {
+    pub(super) fn py_dict_lookup(&mut self, d: Value, k: Value, rt: Value) -> Option<Option<Value>> {
         if !d.is_heap() {
             return None;
         }
@@ -2354,6 +2387,15 @@ fn float_holds(op: PyCmpOp, x: f64, y: f64) -> bool {
         PyCmpOp::Eq => x == y,
         PyCmpOp::Ne => x != y,
     }
+}
+
+/// [`Vm::py_dict_get`]'s answer: the value for `dst`, the fall-through with
+/// `dst` untouched (an absent key the instruction expects absent), or the
+/// slow edge.
+pub(super) enum PyDictGot {
+    Value(Value),
+    Absent,
+    Slow,
 }
 
 /// [`Vm::py_call_target`]'s answer.
