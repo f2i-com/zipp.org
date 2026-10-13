@@ -320,6 +320,82 @@ fn mm_row_tail(row: &mut [f64], arow: &[f64], bv: &[f64], n: usize, j0: usize) {
     }
 }
 
+/// One float32 / float64 element of a little-endian chunk, as f64.
+#[inline(always)]
+fn le32(c: &[u8]) -> f64 {
+    f32::from_le_bytes(<[u8; 4]>::try_from(c).unwrap_or([0; 4])) as f64
+}
+
+#[inline(always)]
+fn le64(c: &[u8]) -> f64 {
+    f64::from_le_bytes(<[u8; 8]>::try_from(c).unwrap_or([0; 8]))
+}
+
+/// `out[i] = f(a[i], b[i])` over float32 (`kind` KIND_F32) or float64
+/// little-endian bytes, each element read as its f64 value and the result
+/// stored as `pt_write` stores it: the f64 loop over `pt_read` and
+/// `pt_write`, without their two f64 copies. `b_one`: `b` is one element,
+/// paired with every `a[i]`; `flip`: the pair is `f(b, a[i])`. (Chunks
+/// read through fixed-size arrays, so the loops vectorize.)
+#[inline(always)]
+fn bytes_map2(kind: u8, a: &[u8], b: &[u8], out: &mut [u8], b_one: bool, flip: bool, f: impl Fn(f64, f64) -> f64) {
+    if kind == KIND_F32 {
+        if b_one {
+            let y = le32(b.get(..4).unwrap_or(&[0; 4]));
+            if flip {
+                for (o, x) in out.chunks_exact_mut(4).zip(a.chunks_exact(4)) {
+                    o.copy_from_slice(&(f(y, le32(x)) as f32).to_le_bytes());
+                }
+            } else {
+                for (o, x) in out.chunks_exact_mut(4).zip(a.chunks_exact(4)) {
+                    o.copy_from_slice(&(f(le32(x), y) as f32).to_le_bytes());
+                }
+            }
+        } else {
+            for (o, (x, y)) in out.chunks_exact_mut(4).zip(a.chunks_exact(4).zip(b.chunks_exact(4))) {
+                o.copy_from_slice(&(f(le32(x), le32(y)) as f32).to_le_bytes());
+            }
+        }
+    } else if b_one {
+        let y = le64(b.get(..8).unwrap_or(&[0; 8]));
+        if flip {
+            for (o, x) in out.chunks_exact_mut(8).zip(a.chunks_exact(8)) {
+                o.copy_from_slice(&f(y, le64(x)).to_le_bytes());
+            }
+        } else {
+            for (o, x) in out.chunks_exact_mut(8).zip(a.chunks_exact(8)) {
+                o.copy_from_slice(&f(le64(x), y).to_le_bytes());
+            }
+        }
+    } else {
+        for (o, (x, y)) in out.chunks_exact_mut(8).zip(a.chunks_exact(8).zip(b.chunks_exact(8))) {
+            o.copy_from_slice(&f(le64(x), le64(y)).to_le_bytes());
+        }
+    }
+}
+
+/// `out[i] = f(a[i])` over float32/float64 bytes, as `bytes_map2`.
+#[inline(always)]
+fn bytes_map1(kind: u8, a: &[u8], out: &mut [u8], f: impl Fn(f64) -> f64) {
+    if kind == KIND_F32 {
+        for (o, x) in out.chunks_exact_mut(4).zip(a.chunks_exact(4)) {
+            o.copy_from_slice(&(f(le32(x)) as f32).to_le_bytes());
+        }
+    } else {
+        for (o, x) in out.chunks_exact_mut(8).zip(a.chunks_exact(8)) {
+            o.copy_from_slice(&f(le64(x)).to_le_bytes());
+        }
+    }
+}
+
+/// A zeroed byte buffer of `n`, or `None` when it cannot be allocated.
+fn zeroed_bytes(n: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, 0);
+    Some(v)
+}
+
 /// A zeroed `Vec` of `n`, or `None` when it cannot be allocated.
 fn zeroed(n: usize) -> Option<Vec<f64>> {
     let mut v = Vec::new();
@@ -499,6 +575,24 @@ pub(crate) trait Kernels: Host {
             _ => out.extend(bytes.iter().map(|&b| b as f64)),
         }
         Some(out)
+    }
+
+    /// The bytes of `v`'s elements.
+    fn pt_bytes(&self, v: View) -> Option<&[u8]> {
+        let lo = v.offset;
+        let hi = lo.checked_add(v.len.checked_mul(v.size())?)?;
+        self.bytes(v.buffer)?.get(lo..hi)
+    }
+
+    /// Store `bytes` (already in `v`'s element format) as `v`'s elements.
+    fn pt_write_bytes(&mut self, v: View, bytes: &[u8]) -> Option<()> {
+        let lo = v.offset;
+        let hi = lo.checked_add(v.len.checked_mul(v.size())?)?;
+        if bytes.len() != hi - lo {
+            return None;
+        }
+        self.bytes_mut(v.buffer)?.get_mut(lo..hi)?.copy_from_slice(bytes);
+        Some(())
     }
 
     /// The whole of `v`.
@@ -933,6 +1027,38 @@ pub(crate) trait Kernels: Host {
             return None;
         }
         let cost = self.pt_admit(n, n.saturating_add(va.len).saturating_add(vb.len))?;
+        // add/sub/mul/div of one float dtype over equal contiguous operands
+        // or one of them a single element: the same pairs and the same f64
+        // operation, read and stored straight from the bytes.
+        let op = int_arg(a, 0)?;
+        if n > 0 && (1..=4).contains(&op) && va.kind == vo.kind && vb.kind == vo.kind && matches!(vo.kind, KIND_F32 | KIND_F64) {
+            let contiguous = contiguous_strides(&shape);
+            let layout = if va.len == n && vb.len == n && sa == contiguous && sb == contiguous {
+                Some((false, false))
+            } else if va.len == n && sa == contiguous && vb.len == 1 && sb.iter().all(|&s| s == 0) {
+                Some((true, false))
+            } else if vb.len == n && sb == contiguous && va.len == 1 && sa.iter().all(|&s| s == 0) {
+                Some((true, true))
+            } else {
+                None
+            };
+            if let Some((one, flip)) = layout {
+                let mut out = zeroed_bytes(n.checked_mul(vo.size())?)?;
+                {
+                    let (x, y) = if flip { (self.pt_bytes(vb)?, self.pt_bytes(va)?) } else { (self.pt_bytes(va)?, self.pt_bytes(vb)?) };
+                    let kd = vo.kind;
+                    match op {
+                        1 => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p + q),
+                        2 => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p - q),
+                        3 => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p * q),
+                        _ => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p / q),
+                    }
+                }
+                self.pt_write_bytes(vo, &out)?;
+                self.pt_charge(cost);
+                return Some(());
+            }
+        }
         let mut out = zeroed(n)?;
         if n > 0 {
             if max_offset(&shape, &sa, 0)? >= va.len || max_offset(&shape, &sb, 0)? >= vb.len {
@@ -1263,6 +1389,28 @@ pub(crate) trait Kernels: Host {
             return None;
         }
         let cost = self.pt_admit(va.len, va.len)?;
+        // A float op on its own dtype: the same f64 function, read and
+        // stored straight from the bytes.
+        if va.kind == vo.kind && matches!(vo.kind, KIND_F32 | KIND_F64) && (op == 27 || unary_fn(op).is_some()) {
+            let mut out = zeroed_bytes(va.len.checked_mul(vo.size())?)?;
+            {
+                let x = self.pt_bytes(va)?;
+                let kd = vo.kind;
+                match op {
+                    27 => {
+                        let (lo, hi) = (num_arg(a, 3)?, num_arg(a, 4)?);
+                        bytes_map1(kd, x, &mut out, |x| if x < lo { lo } else if x > hi { hi } else { x });
+                    }
+                    1 => bytes_map1(kd, x, &mut out, |x| -x),
+                    2 => bytes_map1(kd, x, &mut out, |x| if x > 0.0 || x.is_nan() { x } else { 0.0 }),
+                    8 => bytes_map1(kd, x, &mut out, |x| x * x),
+                    _ => bytes_map1(kd, x, &mut out, unary_fn(op)?),
+                }
+            }
+            self.pt_write_bytes(vo, &out)?;
+            self.pt_charge(cost);
+            return Some(());
+        }
         let mut v = self.pt_read_all(va)?;
         if op == 27 {
             let (lo, hi) = (num_arg(a, 3)?, num_arg(a, 4)?);
