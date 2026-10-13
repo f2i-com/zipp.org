@@ -899,6 +899,35 @@ pub(crate) fn emit_py_op(
                 ; jmp => labels.bail
             );
         }
+        // A plain class's construction: likewise through `Vm::jit_py_new`,
+        // which reads the class and the runtime from the window and stores
+        // the instance, the `__init__` entry and its `this` there; 0 is
+        // done, anything but the slow edge's answer bails (nothing done).
+        Instr::PyNew { dst, entry, this_f, cls, rt, n, .. } if !crate::vm::prof_py::on() => {
+            let outs = dst as u64 | (entry as u64) << 16 | (this_f as u64) << 32;
+            let ins = cls as u64 | (rt as u64) << 16 | (n as u64) << 32;
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, rbx
+                ; mov r8, QWORD site(func_id, ip) as i64
+                ; mov r9, QWORD outs as i64
+                ; mov rax, QWORD ins as i64
+                ; mov [rsp + 32], rax
+                ; mov rax, QWORD crate::vm::Vm::jit_py_new as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; test rax, rax
+                ; jz => done
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; jmp => labels.bail
+            );
+        }
         // The instructions that only answer a value or take their slow edge:
         // each through its own helper (`vm/engine/py_jit.rs`), the step's
         // function over the operands with the site for its cache entry,

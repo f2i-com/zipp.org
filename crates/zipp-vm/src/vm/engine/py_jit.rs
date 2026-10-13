@@ -544,6 +544,41 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `PyNew` from compiled code: the step's arm (`py_new` over the class
+    /// and the runtime read from the window at `regs`, its three results
+    /// stored there) for the instruction at `site = (func_id << 32) | ip`,
+    /// without finding the instruction again: `outs` = `dst | entry << 16 |
+    /// this_f << 32`, `ins` = `cls | rt << 16 | n << 32`. 0 done,
+    /// `PY_SLOW_BITS` for the `slow` edge (nothing done), `SELF_CALL_DEOPT`
+    /// (nothing done) for a window that is not this VM's. A GC safe point,
+    /// as `jit_py_op` is.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_new(vm: *mut core::ffi::c_void, regs: *const u64, site: u64, outs: u64, ins: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let start = vm.regs.as_ptr() as usize;
+        let addr = regs as usize;
+        if addr < start || (addr - start) % 8 != 0 {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let base = (addr - start) / 8;
+        let (dst, entry, this_f) = (outs as u16, (outs >> 16) as u16, (outs >> 32) as u16);
+        let (cls, rt, n) = (ins as u16, (ins >> 16) as u16, (ins >> 32) as u16);
+        if [dst, entry, this_f, cls, rt].iter().any(|&r| base + r as usize >= vm.regs.len()) {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        vm.maybe_gc();
+        let (c, r) = (vm.get(base, cls), vm.get(base, rt));
+        match vm.py_new((site >> 32) as u32, site as u32 as usize, c, r, n as usize) {
+            Some((obj, e, t)) => {
+                vm.set(base, dst, obj);
+                vm.set(base, entry, e);
+                vm.set(base, this_f, t);
+                0
+            }
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
     /// `PyCompare`/`PyJumpCompare` beyond the inline paths: `py_compare`.
     /// 0 or 1 for the comparison's result, `PY_SLOW` (2) for the `slow` edge
     /// (nothing ran), `PY_BAIL` (3) when it threw (the exception is pending).
