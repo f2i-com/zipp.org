@@ -66,6 +66,7 @@ const OP_Q_MATMUL: u32 = 26;
 const OP_Q_CONV2D: u32 = 27;
 const OP_Q_REQUANT: u32 = 28;
 const OP_Q_FAKE: u32 = 29;
+const OP_ARANGE: u32 = 30;
 
 /// `x` as a store into an element of `kind` leaves it: the typed-array
 /// conversion (`helpers_numeric::ta_encode`), read back.
@@ -277,6 +278,46 @@ fn unary_fn(op: u32) -> Option<fn(f64) -> f64> {
     })
 }
 
+/// The output block a matmul keeps in registers: rows of A by columns of B.
+const MM_ROWS: usize = 4;
+const MM_COLS: usize = 4;
+
+/// Outputs (i..i+4, j..j+4) of an [m, k] @ [k, n] product, each the sum of
+/// its k products in p order from 0 in an f64 (the row loop's value): the
+/// four A values and the B row chunk are read once per p for all sixteen.
+fn mm_block(out: &mut [f64], av: &[f64], bv: &[f64], i: usize, j: usize, k: usize, n: usize) {
+    let a0 = &av[i * k..(i + 1) * k];
+    let a1 = &av[(i + 1) * k..(i + 2) * k];
+    let a2 = &av[(i + 2) * k..(i + 3) * k];
+    let a3 = &av[(i + 3) * k..(i + 4) * k];
+    let (mut c0, mut c1, mut c2, mut c3) = ([0.0f64; MM_COLS], [0.0f64; MM_COLS], [0.0f64; MM_COLS], [0.0f64; MM_COLS]);
+    for p in 0..k {
+        let b = &bv[p * n + j..p * n + j + MM_COLS];
+        let (x0, x1, x2, x3) = (a0[p], a1[p], a2[p], a3[p]);
+        for c in 0..MM_COLS {
+            c0[c] += x0 * b[c];
+            c1[c] += x1 * b[c];
+            c2[c] += x2 * b[c];
+            c3[c] += x3 * b[c];
+        }
+    }
+    out[i * n + j..i * n + j + MM_COLS].copy_from_slice(&c0);
+    out[(i + 1) * n + j..(i + 1) * n + j + MM_COLS].copy_from_slice(&c1);
+    out[(i + 2) * n + j..(i + 2) * n + j + MM_COLS].copy_from_slice(&c2);
+    out[(i + 3) * n + j..(i + 3) * n + j + MM_COLS].copy_from_slice(&c3);
+}
+
+/// Columns `j0..` of one output row (`row`, starting at column j0, zeroed):
+/// `row[j] += a[p] * b[p, j0 + j]` for p in order, the row loop.
+fn mm_row_tail(row: &mut [f64], arow: &[f64], bv: &[f64], n: usize, j0: usize) {
+    for (p, &x) in arow.iter().enumerate() {
+        let brow = &bv[p * n + j0..(p + 1) * n];
+        for (r, &y) in row.iter_mut().zip(brow) {
+            *r += x * y;
+        }
+    }
+}
+
 /// A zeroed `Vec` of `n`, or `None` when it cannot be allocated.
 fn zeroed(n: usize) -> Option<Vec<f64>> {
     let mut v = Vec::new();
@@ -405,6 +446,7 @@ match op {
         OP_Q_CONV2D => Outcome::ran(h.pt_q_conv2d(a).is_some()),
         OP_Q_REQUANT => Outcome::ran(h.pt_q_requant(a).is_some()),
         OP_Q_FAKE => Outcome::ran(h.pt_q_fake(a).is_some()),
+        OP_ARANGE => Outcome::ran(h.pt_arange(a).is_some()),
         _ => Outcome::Declined,
 }
 }
@@ -538,34 +580,60 @@ pub(crate) trait Kernels: Host {
         let (ao, bo, oo) = (int_arg(a, 3)?, int_arg(a, 4)?, int_arg(a, 5)?);
         let (m, k, n) = (int_arg(a, 6)?, int_arg(a, 7)?, int_arg(a, 8)?);
         let (mk, kn, mn) = (m.checked_mul(k)?, k.checked_mul(n)?, m.checked_mul(n)?);
-        let cost = self.pt_admit(mn.checked_mul(k)?.checked_add(mn)?, mk.saturating_add(kn).saturating_add(mn))?;
+        // (the transposed operand's [k, n] copy is working memory too)
+        let cost = self.pt_admit(mn.checked_mul(k)?.checked_add(mn)?, mk.saturating_add(kn).saturating_add(mn).saturating_add(if trans_b { kn } else { 0 }))?;
         let av = self.pt_read(va, ao, mk)?;
         let bv = self.pt_read(vb, bo, kn)?;
+        // B as [k, n] rows either way: the transposed operand's [n, k] rows
+        // laid out once, so both forms run the same loops below (element
+        // (i, j) is still the sum of its k products in p order).
+        let bv = if trans_b {
+            let mut t = zeroed(kn)?;
+            for j in 0..n {
+                for p in 0..k {
+                    t[p * n + j] = bv[j * k + p];
+                }
+            }
+            t
+        } else {
+            bv
+        };
         let mut out = zeroed(mn)?;
         let rows_per_poll = (POLL_UNITS / k.max(1).saturating_mul(n).max(1)).max(1);
-        for i in 0..m {
-            if i % rows_per_poll == rows_per_poll - 1 && self.interrupted() {
+        let mut since_poll = 0usize;
+        let mut i = 0;
+        // Blocks of MM_ROWS x MM_COLS outputs, each output a sum in an f64
+        // register that starts at 0 and adds its products in p order: what
+        // the row loop computes for it, with B's row and A's values read
+        // once per p for the whole block.
+        // (Narrow products keep the row loop: a block's setup costs more
+        // than it saves below two blocks a row.)
+        while n >= 2 * MM_COLS && i + MM_ROWS <= m {
+            since_poll += MM_ROWS;
+            if since_poll >= rows_per_poll {
+                since_poll = 0;
+                if self.interrupted() {
+                    return None;
+                }
+            }
+            let mut j = 0;
+            while j + MM_COLS <= n {
+                mm_block(&mut out, &av, &bv, i, j, k, n);
+                j += MM_COLS;
+            }
+            if j < n {
+                for r in 0..MM_ROWS {
+                    mm_row_tail(&mut out[(i + r) * n + j..(i + r + 1) * n], &av[(i + r) * k..(i + r + 1) * k], &bv, n, j);
+                }
+            }
+            i += MM_ROWS;
+        }
+        while i < m {
+            if self.interrupted() {
                 return None;
             }
-            let row = &mut out[i * n..(i + 1) * n];
-            let arow = &av[i * k..(i + 1) * k];
-            if trans_b {
-                for (j, r) in row.iter_mut().enumerate() {
-                    let brow = &bv[j * k..(j + 1) * k];
-                    let mut s = 0.0f64;
-                    for (&x, &y) in arow.iter().zip(brow) {
-                        s += x * y;
-                    }
-                    *r = s;
-                }
-                continue;
-            }
-            for (p, &x) in arow.iter().enumerate() {
-                let brow = &bv[p * n..(p + 1) * n];
-                for (r, &y) in row.iter_mut().zip(brow) {
-                    *r += x * y;
-                }
-            }
+            mm_row_tail(&mut out[i * n..(i + 1) * n], &av[i * k..(i + 1) * k], &bv, n, 0);
+            i += 1;
         }
         self.pt_write(vo, oo, &out)?;
         self.pt_charge(cost);
@@ -899,6 +967,27 @@ pub(crate) trait Kernels: Host {
 
     /// `(op, A, O, lo, hi)`: `O[i] = op(A[i])` (tensor.js's `unary`); op 27
     /// is `clamp` to `[lo, hi]`.
+    /// `(O, start, step)`: tensor.js's `arange` loop for a float32 or
+    /// float64 storage (the int64/int32 ones are float64 too): element i is
+    /// `start + i * step`, stored as the typed array stores it.
+    fn pt_arange(&mut self, a: &[Arg]) -> Option<()> {
+        let vo = self.pt_view(arg(a, 0))?;
+        if vo.kind != KIND_F32 && vo.kind != KIND_F64 {
+            return None;
+        }
+        let (start, step) = (num_arg(a, 1)?, num_arg(a, 2)?);
+        let n = vo.len;
+        let cost = self.pt_admit(n, n)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(n).ok()?;
+        for i in 0..n {
+            out.push(start + i as f64 * step);
+        }
+        self.pt_write(vo, 0, &out)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
     fn pt_unary(&mut self, a: &[Arg]) -> Option<()> {
         let op = u32::try_from(int_arg(a, 0)?).ok()?;
         let (va, vo) = (self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?);

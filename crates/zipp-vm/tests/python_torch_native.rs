@@ -328,6 +328,43 @@ for dt in ["float16", "bfloat16"]:
     both("half where mixed %s" % dt, lambda: _k.where(C, (6, 1, 7), A, (6, 5, 7), Fv, (5, 1)))
     both("half all_finite %s" % dt, lambda: _k.all_finite(A))
     both("half all_finite finite %s" % dt, lambda: _k.all_finite(_k.from_flat(dt, [i / 8.0 for i in range(100)])))
+# arange's native loop (N_ARANGE) against its inline JavaScript loop.
+for dt in ["float32", "float64", "int64", "int32"]:
+    for st, step, n in ((0, 1, 100), (3, -2, 70), (0.5, 0.1, 90), (-1e8, 3.7, 128), (1e7, 1e-3, 65), (0, 1, 63)):
+        if dt in ("int64", "int32") and (st != int(st) or step != int(step)):
+            continue
+        both("arange %s %s %s %d" % (dt, st, step, n), lambda: _k.arange(dt, st, step, n))
+# The small add/sub/mul/div loop (fewer than 64 elements, no helper calls)
+# against the same values in operands long enough for the native loop:
+# element i of the long result is element i % n of the short one.
+def tiled(dt, shape, seed, k):
+    return _k.from_flat(dt, values(numel(shape), seed, dt) * k)
+for op in ["add", "sub", "mul", "div"]:
+    for dt in FLOATS:
+        for sa, sb in [((5,), (5,)), ((3, 4), (3, 4)), ((3, 4), ()), ((3, 4), (1, 1)), ((), (2, 3)), ((1,), (2, 3)), ((7,), (1,)), ((), ())]:
+            seed += 1
+            A = storage(dt, sa, seed)
+            B = storage(dt, sb, seed + 1)
+            short = _k.binary(op, A, sa, B, sb)
+            n = numel(short[1])
+            k = 70
+            if sa == sb:
+                la, lsa, lb, lsb = tiled(dt, sa, seed, k), (numel(sa) * k,), tiled(dt, sb, seed + 1, k), (numel(sb) * k,)
+            elif numel(sb) == 1 and len(sb) <= len(sa):
+                la, lsa, lb, lsb = tiled(dt, sa, seed, k), (numel(sa) * k,), B, sb
+            else:
+                la, lsa, lb, lsb = A, sa, tiled(dt, sb, seed + 1, k), (numel(sb) * k,)
+            long = _k.binary(op, la, lsa, lb, lsb)
+            CASES[0] += 1
+            if _k.dtype(short[0]) != _k.dtype(long[0]) or _k.tobytes(short[0]) != _k.tobytes(long[0])[:len(_k.tobytes(short[0]))]:
+                BAD.append("small binary %s %s %s %s" % (op, dt, sa, sb))
+            for v in (2.5, -3, 0.1, 1e30):
+                for flip in (False, True):
+                    short = _k.binary_scalar(op, A, sa, v, dt, dt, flip)
+                    long = _k.binary_scalar(op, tiled(dt, sa, seed, k), (numel(sa) * k,), v, dt, dt, flip)
+                    CASES[0] += 1
+                    if _k.tobytes(short[0]) != _k.tobytes(long[0])[:len(_k.tobytes(short[0]))]:
+                        BAD.append("small binary_scalar %s %s %s %s %s" % (op, dt, sa, v, flip))
 # torch.fft's transforms (`vm::py_tensor::fft`): mode 0 complex -> complex,
 # 1 real -> onesided, 2 onesided -> real, 3 real -> all bins; lengths of
 # 2, 3 and 5, odd primes to 31 and Bluestein, inputs shorter and longer

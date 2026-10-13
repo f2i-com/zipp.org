@@ -6161,9 +6161,10 @@ def _nll_rows(lp, target, ignore_index):
 
 def _nll_rows_bw(g, args):
     # What the advanced index's and the negation's backwards give.
+    # (Two [n] indices: `_broadcast_indices` would hand them back as they
+    # are, with the shape (n,).)
     lp, target = args
-    indices, ishape = _broadcast_indices([arange(lp.shape[0]), target])
-    return (_index_put_add(lp.shape, indices, ishape, neg(g)),)
+    return (_index_put_add(lp.shape, [arange(len(target)), target], target.shape, neg(g)),)
 
 
 def _broadcast_indices(indices):

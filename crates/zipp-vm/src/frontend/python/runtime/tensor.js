@@ -38,7 +38,7 @@
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
         N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23,
-        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29;
+        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -359,12 +359,13 @@
     }
     // The small float32/float64 add/sub/mul/div that most eager ops are,
     // without the generic path's helper calls (each an interpreted frame):
-    // operands of one dtype (`want` null or that dtype) with equal shapes,
-    // or one of them a single element of rank no higher than the other's,
-    // and fewer than NATIVE_MIN elements. The loops are binaryTile's and
-    // binaryScalar's, element for element, and the result's shape is the
-    // operand's own shape object, as `binary` hands back. `undefined` when
-    // the case is not one of these (the caller takes `binary`).
+    // operands of one dtype (`want` null or that dtype), fewer than
+    // NATIVE_MIN elements, with equal shapes, or one of them a single
+    // element of rank no higher than the other's, or one of them the other's
+    // trailing dims (a bias). The loops are binaryTile's and binaryScalar's,
+    // element for element, and the result's shape is the operand's own
+    // shape object, as `binary` hands back. `undefined` when the case is not
+    // one of these (the caller takes `binary`).
     const FAST_BIN = { add: 1, sub: 2, mul: 3, div: 4 };
     function smallShape(py) {
         // The element count of a tuple/Size of ints, or -1.
@@ -381,29 +382,44 @@
         for (let k = 0; k < it.length; k++) if (it[k] !== 1n) return false;
         return true;
     }
+    function suffixOf(small, big) {
+        // Whether `small`, its leading 1s dropped, is `big`'s trailing dims
+        // and it has no more dims than `big` (suffixTile's form, with the
+        // result shaped as `big`).
+        const p = small.items, q = big.items;
+        if (p.length > q.length) return false;
+        let lead = 0;
+        while (lead < p.length && p[lead] === 1n) lead++;
+        const off = q.length - (p.length - lead);
+        for (let k = lead; k < p.length; k++) if (p[k] !== q[off + k - lead]) return false;
+        return true;
+    }
     function binaryFast(op, x, xpy, y, ypy, want) {
         const code = FAST_BIN[op];
         if (code === undefined || x === null || y === null || typeof x !== "object" || typeof y !== "object" || x.cls !== Storage || y.cls !== Storage) return undefined;
         const dt = x.dtype;
         if (y.dtype !== dt || (dt !== "float32" && dt !== "float64") || (want !== null && want !== dt)) return undefined;
-        const na = smallShape(xpy), nb = smallShape(ypy);
+        if (xpy === null || ypy === null || typeof xpy !== "object" || typeof ypy !== "object" || (xpy.cls !== SIZE && xpy.cls !== T.tuple) || (ypy.cls !== SIZE && ypy.cls !== T.tuple)) return undefined;
+        const p = xpy.items, q = ypy.items;
+        let na = 1, nb = 1;
+        for (let k = 0; k < p.length; k++) { const d = p[k]; if (typeof d !== "bigint") return undefined; na *= Number(d); }
+        for (let k = 0; k < q.length; k++) { const d = q[k]; if (typeof d !== "bigint") return undefined; nb *= Number(d); }
         if (na <= 0 || nb <= 0 || na >= NATIVE_MIN || nb >= NATIVE_MIN) return undefined;
         const A = x.data, B = y.data;
         if (A.length !== na || B.length !== nb) return undefined;
         let mode = -1;
-        if (na === nb) {
-            const p = xpy.items, q = ypy.items;
-            if (p.length === q.length) {
-                mode = 0;
-                for (let k = 0; k < p.length; k++) if (p[k] !== q[k]) { mode = -1; break; }
-            }
+        if (na === nb && p.length === q.length) {
+            mode = 0;
+            for (let k = 0; k < p.length; k++) if (p[k] !== q[k]) { mode = -1; break; }
         }
         if (mode < 0) {
             if (nb === 1 && onesOver(ypy, xpy)) mode = 1;
             else if (na === 1 && onesOver(xpy, ypy)) mode = 2;
+            else if (nb < na && suffixOf(ypy, xpy)) mode = 3;
+            else if (na < nb && suffixOf(xpy, ypy)) mode = 4;
             else return undefined;
         }
-        const n = mode === 2 ? nb : na, O = dt === "float32" ? new Float32Array(n) : new Float64Array(n);
+        const n = mode === 2 || mode === 4 ? nb : na, O = dt === "float32" ? new Float32Array(n) : new Float64Array(n);
         if (mode === 0) {
             switch (code) {
                 case 1: for (let i = 0; i < n; i++) O[i] = A[i] + B[i]; break;
@@ -419,7 +435,7 @@
                 case 3: for (let i = 0; i < n; i++) O[i] = A[i] * v; break;
                 default: for (let i = 0; i < n; i++) O[i] = A[i] / v;
             }
-        } else {
+        } else if (mode === 2) {
             const v = A[0];
             switch (code) {
                 case 1: for (let i = 0; i < n; i++) O[i] = B[i] + v; break;
@@ -427,8 +443,22 @@
                 case 3: for (let i = 0; i < n; i++) O[i] = B[i] * v; break;
                 default: for (let i = 0; i < n; i++) O[i] = v / B[i];
             }
+        } else if (mode === 3) {
+            switch (code) {
+                case 1: for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] + B[j]; break;
+                case 2: for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] - B[j]; break;
+                case 3: for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] * B[j]; break;
+                default: for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] / B[j];
+            }
+        } else {
+            switch (code) {
+                case 1: for (let i = 0; i < n;) for (let j = 0; j < na; j++, i++) O[i] = B[i] + A[j]; break;
+                case 2: for (let i = 0; i < n;) for (let j = 0; j < na; j++, i++) O[i] = A[j] - B[i]; break;
+                case 3: for (let i = 0; i < n;) for (let j = 0; j < na; j++, i++) O[i] = B[i] * A[j]; break;
+                default: for (let i = 0; i < n;) for (let j = 0; j < na; j++, i++) O[i] = A[j] / B[i];
+            }
         }
-        return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, mode === 2 ? ypy : xpy] };
+        return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, mode === 2 || mode === 4 ? ypy : xpy] };
     }
     // binary_scalar's small case: `t` (a float32/float64 storage of fewer
     // than NATIVE_MIN elements, the scalar's dtype and `want` its own) op the
@@ -1101,15 +1131,16 @@
         for (let d = 0; d < shape.length; d++) {
             const it = d < items.length ? items[d] : null;
             if (it === null) { starts.push(0); counts.push(shape[d]); steps.push(1); keep.push(true); continue; }
-            if (rt.isInt(it)) {
-                let i = Number(rt.asInt(it)); if (i < 0) i += shape[d];
+            if (typeof it === "bigint" || typeof it === "boolean") {
+                let i = Number(it); if (i < 0) i += shape[d];
                 if (i < 0 || i >= shape[d]) fail(E.IndexError, "index " + rt.asInt(it) + " is out of bounds for dimension " + d + " with size " + shape[d]);
                 starts.push(i); counts.push(1); steps.push(1); keep.push(false); continue;
             }
+            // (`Number(rt.asInt(v))` is `Number(v)`, as in `shapeOf`)
             const parts = it.items;
-            const step = parts[2] === null ? 1 : Number(rt.asInt(parts[2]));
+            const step = parts[2] === null ? 1 : Number(parts[2]);
             if (step <= 0) fail(E.ValueError, "step must be greater than zero");
-            let start = parts[0] === null ? 0 : Number(rt.asInt(parts[0])), stop = parts[1] === null ? shape[d] : Number(rt.asInt(parts[1]));
+            let start = parts[0] === null ? 0 : Number(parts[0]), stop = parts[1] === null ? shape[d] : Number(parts[1]);
             if (start < 0) start += shape[d]; if (stop < 0) stop += shape[d];
             start = Math.min(Math.max(start, 0), shape[d]); stop = Math.min(Math.max(stop, 0), shape[d]);
             const count = Math.max(0, Math.ceil((stop - start) / step));
@@ -1183,6 +1214,20 @@
         const restN = numel(rest), target = ish.concat(rest);
         const sv = bstrides(vshape, target), A = a.data, V = vals(v), dt = a.dtype, bf = dt === "bfloat16";
         const I = idx.items.map((s) => s.data);
+        if ((dt === "float32" || dt === "float64" || dt === "int64" || dt === "int32") && v.dtype === dt && numel(vshape) === numel(target) && V.length === numel(target)) {
+            // Values of the storage's dtype, not broadcast: the walk below
+            // in the same order, without its closure per element. castValue
+            // of the sum is what the typed-array store keeps for these
+            // dtypes (an int64/int32 sum of integers is one).
+            const nIdx = numel(ish);
+            for (let i = 0, y = 0; i < nIdx; i++) {
+                let base = 0;
+                for (let d = 0; d < k; d++) { let j = I[d][i]; if (j < 0) j += shape[d]; if (j < 0 || j >= shape[d]) fail(E.IndexError, "index out of bounds"); base += j * inS[d]; }
+                for (let r = 0; r < restN; r++, y++) A[base + r] = A[base + r] + V[y];
+            }
+            written(a);
+            return null;
+        }
         forEachBroadcast(target, new Array(target.length).fill(0), sv, (o, x, y) => {
             const i = Math.floor(o / restN), r = o - i * restN;
             let base = 0;
@@ -2013,18 +2058,29 @@
         for (let i = 1; i < 624; i++) { const prev = m[i - 1] ^ (m[i - 1] >>> 30); m[i] = (Math.imul(1812433253, prev) + i) >>> 0; }
         s.i = 624;
     }
-    function next32(s) {
+    function mtTwist(s) {
         const m = s.mt;
-        if (s.i >= 624) {
-            for (let k = 0; k < 624; k++) {
-                const y = (m[k] & 0x80000000) | (m[(k + 1) % 624] & 0x7fffffff);
-                m[k] = (m[(k + 397) % 624] ^ (y >>> 1) ^ ((y & 1) ? 0x9908b0df : 0)) >>> 0;
-            }
-            s.i = 0;
+        for (let k = 0; k < 624; k++) {
+            const y = (m[k] & 0x80000000) | (m[(k + 1) % 624] & 0x7fffffff);
+            m[k] = (m[(k + 397) % 624] ^ (y >>> 1) ^ ((y & 1) ? 0x9908b0df : 0)) >>> 0;
         }
-        let y = m[s.i++];
+        s.i = 0;
+    }
+    function next32(s) {
+        if (s.i >= 624) mtTwist(s);
+        let y = s.mt[s.i++];
         y ^= y >>> 11; y ^= (y << 7) & 0x9d2c5680; y ^= (y << 15) & 0xefc60000; y ^= y >>> 18;
         return y >>> 0;
+    }
+    // `n` words of next32 into W (a Uint32Array), the generator inline.
+    function next32Into(s, W, n) {
+        const m = s.mt;
+        for (let i = 0; i < n; i++) {
+            if (s.i >= 624) mtTwist(s);
+            let y = m[s.i++];
+            y ^= y >>> 11; y ^= (y << 7) & 0x9d2c5680; y ^= (y << 15) & 0xefc60000; y ^= y >>> 18;
+            W[i] = y;
+        }
     }
     // A uniform double in [0, 1) from 53 bits, as torch's random64 path.
     // (hi * 2**32 + lo) % 2**53, exactly: the low 21 bits of `hi` (the sum
@@ -2065,10 +2121,11 @@
     function rand(g, n, dtype) {
         // float32 uniform from 24 random bits, as torch's uniform_ for float;
         // float16 from 11 and bfloat16 from 8 (their mantissa digits).
-        const s = needGen(g), out = work(dtype, n), O = out.data;
-        if (dtype === "float16") for (let i = 0; i < n; i++) O[i] = (next32(s) & 0x7ff) * 0.00048828125;
-        else if (dtype === "bfloat16") for (let i = 0; i < n; i++) O[i] = (next32(s) & 0xff) * 0.00390625;
-        else for (let i = 0; i < n; i++) O[i] = (next32(s) & 0xffffff) * 5.9604644775390625e-8;
+        const s = needGen(g), out = work(dtype, n), O = out.data, W = new Uint32Array(n);
+        next32Into(s, W, n);
+        if (dtype === "float16") for (let i = 0; i < n; i++) O[i] = (W[i] & 0x7ff) * 0.00048828125;
+        else if (dtype === "bfloat16") for (let i = 0; i < n; i++) O[i] = (W[i] & 0xff) * 0.00390625;
+        else for (let i = 0; i < n; i++) O[i] = (W[i] & 0xffffff) * 5.9604644775390625e-8;
         return finish(out);
     }
     function randDouble(g, n) {
@@ -3095,6 +3152,7 @@
             // store is Math.fround); int64/int32 with integer start and step
             // hold integers Math.trunc keeps (torch.arange checks they are exact).
             if (d === "float32" || d === "float64" || ((d === "int64" || d === "int32") && Number.isInteger(st) && Number.isInteger(step))) {
+                if (n >= NATIVE_MIN && NATIVE !== null && NATIVE(N_ARANGE, O, st, step)) return s;
                 for (let i = 0; i < n; i++) O[i] = st + i * step;
                 return s;
             }
