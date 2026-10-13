@@ -221,12 +221,54 @@ pub(crate) struct Decompositions<'a> {
     ready: usize,
 }
 
+/// The longest run of marks `order` puts in order by insertion.
+const INSERTION_MAX: usize = 32;
+
 /// Put a run of marks in canonical order. The sort is stable, so marks of
 /// one class keep their order; most runs are of one mark or none.
+///
+/// Not the standard library's sort, whose stable instantiation for this
+/// element type was 4.3 KB of every WebAssembly module: an insertion sort
+/// orders the short runs real text has, and a longer one, which only crafted
+/// text has, is distributed by class (there are 256), so the work stays
+/// linear in the run however long it is.
 #[inline]
 fn order(run: &mut [(u8, char)]) {
-    if run.len() > 1 {
-        run.sort_by_key(|entry| entry.0);
+    if run.len() <= 1 {
+        return;
+    }
+    if run.len() <= INSERTION_MAX {
+        for i in 1..run.len() {
+            let entry = run[i];
+            let mut j = i;
+            while j > 0 && run[j - 1].0 > entry.0 {
+                run[j] = run[j - 1];
+                j -= 1;
+            }
+            run[j] = entry;
+        }
+        return;
+    }
+    order_by_counting(run);
+}
+
+/// `order` for a long run: a stable counting sort by class.
+#[inline(never)]
+fn order_by_counting(run: &mut [(u8, char)]) {
+    let mut start = [0usize; 256];
+    for &(class, _) in run.iter() {
+        start[usize::from(class)] += 1;
+    }
+    let mut at = 0;
+    for slot in start.iter_mut() {
+        let n = *slot;
+        *slot = at;
+        at += n;
+    }
+    for entry in run.to_vec() {
+        let slot = &mut start[usize::from(entry.0)];
+        run[*slot] = entry;
+        *slot += 1;
     }
 }
 
@@ -764,6 +806,58 @@ mod tests {
             assert!(nfkd(&s).eq(s.nfkd()), "NFKD of {s:?}");
             assert!(nfc(&s).eq(s.nfc()), "NFC of {s:?}");
             assert!(nfkc(&s).eq(s.nfkc()), "NFKC of {s:?}");
+        }
+    }
+
+    /// `order` is the standard stable sort by class, on both of its paths:
+    /// runs up to `INSERTION_MAX` and longer ones, with many equal classes.
+    #[test]
+    fn order_is_the_stable_sort_by_class() {
+        let mut seed = 0x0dde_2026_u64;
+        let mut random = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        for len in (0..80).chain([200, 1000, 5000]) {
+            for classes in [1usize, 2, 5, 40, 256] {
+                let run: Vec<(u8, char)> = (0..len)
+                    .map(|i| (random(classes) as u8, char::from_u32(0x300 + i as u32).unwrap()))
+                    .collect();
+                let mut want = run.clone();
+                want.sort_by_key(|entry| entry.0);
+                let mut got = run.clone();
+                order(&mut got);
+                assert_eq!(got, want, "len {len}, {classes} classes");
+            }
+        }
+    }
+
+    /// Long runs of marks, which go through the counting sort, normalize as
+    /// the crate does.
+    #[test]
+    fn long_runs_of_marks_agree_with_the_crate() {
+        let marks: Vec<char> = chars()
+            .filter(|&c| unicode_normalization::char::canonical_combining_class(c) != 0)
+            .collect();
+        let mut seed = 0x0004_c0a9_2026_u64;
+        let mut random = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        for len in [33, 64, 300, 2000] {
+            for _ in 0..20 {
+                let mut s = String::from("a");
+                for _ in 0..len {
+                    s.push(marks[random(marks.len())]);
+                }
+                assert!(nfd(&s).eq(s.nfd()), "NFD of a run of {len}");
+                assert!(nfc(&s).eq(s.nfc()), "NFC of a run of {len}");
+                assert!(nfkd(&s).eq(s.nfkd()), "NFKD of a run of {len}");
+            }
         }
     }
 }
