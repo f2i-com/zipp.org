@@ -1965,6 +1965,10 @@ impl<'p> Vm<'p> {
                 // reporting success; `defineProperty` already used this table.
                 | HeapObj::Generator { .. }
                 | HeapObj::AsyncGenerator(_)
+                // So are a built-in iterator and an iterator helper: `it.foo = 1`
+                // and an own `it.next = f` were dropped the same way.
+                | HeapObj::Iterator { .. }
+                | HeapObj::IterHelper { .. }
                 // An Intl service instance is exotic too, and a subclass of one
                 // must still take ordinary own properties
                 // (`class F extends Intl.ListFormat {}; f.x = 1`).

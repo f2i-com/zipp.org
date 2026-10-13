@@ -1470,7 +1470,33 @@ impl<'p> Vm<'p> {
                 self.array_method(idx, name, args)
             }
             HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
-            HeapObj::Generator { .. } => self.generator_method(idx, name, args),
+            // Only while the method resolves to the intrinsic: an own one, a
+            // replaced one on the function's `prototype` object or on
+            // %GeneratorPrototype% takes the caller's get + call instead.
+            HeapObj::Generator { .. } => {
+                if matches!(name, "next" | "return" | "throw")
+                    && !self.gen_method_pristine(idx, name)
+                {
+                    return Ok(None);
+                }
+                self.generator_method(idx, name, args)
+            }
+            // `it.next()` on a Map, Set, array or string iterator with no own
+            // `next` or replaced [[Prototype]], whose prototype still has the
+            // intrinsic `next`: the native itself, without the `next` lookup
+            // and the generic call it took. A loop of them was dominated by
+            // those two.
+            HeapObj::Iterator { proto, .. } if name == "next" => {
+                let proto = *proto;
+                if self.proto_of.get(&idx).is_some()
+                    || self.arr_props.get(&idx).is_some_and(|m| m.pos("next").is_some())
+                    || !self.builtin_iter_next_pristine(proto)
+                {
+                    return Ok(None);
+                }
+                self.call_native(crate::vm::native::ITER_NEXT, Value::heap(idx), args)
+                    .map(Some)
+            }
             HeapObj::AsyncGenerator(_) => Ok(self.async_generator_method(idx, name, args)),
             HeapObj::Promise { .. } => {
                 // `then`/`catch`/`finally` must resolve through the receiver's

@@ -2182,13 +2182,15 @@ impl<'p> Vm<'p> {
             HeapObj::FinalizationRegistry { .. } => {
                 self.exotic_own_or_proto(obj, self.finreg_proto, key)
             }
+            // Own properties first, then a replaced [[Prototype]], then the
+            // iterator's own prototype, as for the other exotic instances.
             HeapObj::Iterator { proto, .. } => {
                 let p = *proto;
-                self.proto_chain_get(p, key, obj)
+                self.exotic_own_or_proto(obj, p, key)
             }
             HeapObj::IterHelper { .. } => {
                 let p = self.iterator_helper_proto;
-                self.proto_chain_get(p, key, obj)
+                self.exotic_own_or_proto(obj, p, key)
             }
             // A generator instance delegates to its [[Prototype]] — the
             // callee's `prototype` object when one was installed at call time

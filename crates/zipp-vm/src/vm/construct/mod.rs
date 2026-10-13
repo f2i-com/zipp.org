@@ -13,4 +13,4 @@ mod inherit;
 mod iterate;
 mod modules_dispose;
 
-pub(crate) use iterate::IterProtoProof;
+pub(crate) use iterate::{GenNextProof, IterProtoProof};

@@ -10,6 +10,20 @@ use super::*;
 /// its heap version + 1, 0 = no proof; `next_slot`/`next_bits` the value
 /// proven) and, when `chain_len > 0`, that no `return` is reachable from it
 /// (`chain` holds the ancestors examined and their heap versions).
+/// The last proof that a generator's `next` is %GeneratorPrototype%'s
+/// intrinsic (`Vm::gen_method_pristine`): its first prototype `first` (heap
+/// version + 1, 0 = no proof), and the object `holder` whose own data slot
+/// `slot` held the native `bits`, at version `holder_ver`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GenNextProof {
+    first: u32,
+    first_ver: u32,
+    holder: u32,
+    holder_ver: u32,
+    slot: u32,
+    bits: u64,
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct IterProtoProof {
     proto: u32,
@@ -925,6 +939,102 @@ impl<'p> Vm<'p> {
         true
     }
 
+    /// Whether `proto`, a built-in iterator's [[Prototype]], is one of the
+    /// four %XIteratorPrototype%s with its intrinsic `next` still in place: a
+    /// `.next()` call on such an iterator is then exactly the `ITER_NEXT`
+    /// native (`it.next()` resolves `next` through the prototype chain alone).
+    pub(crate) fn builtin_iter_next_pristine(&self, proto: u32) -> bool {
+        let slot = if proto == self.array_iter_proto {
+            0
+        } else if proto == self.set_iter_proto {
+            1
+        } else if proto == self.map_iter_proto {
+            2
+        } else if proto == self.string_iter_proto {
+            3
+        } else {
+            return false;
+        };
+        proto != 0 && self.iter_proto_pristine(slot, false)
+    }
+
+    /// Whether `g.<name>()` (`next`, `return` or `throw`) on the generator
+    /// `idx` resolves to %GeneratorPrototype%'s intrinsic: no own property of
+    /// that name, and the first object on its chain that has one — the
+    /// generator function's `prototype` object, then %GeneratorPrototype%
+    /// itself — holds the matching native as a data property. A method call
+    /// or a `for-of` step that runs the generator directly is only right
+    /// then; a replaced `next` is called (Node calls it; this did not).
+    pub(crate) fn gen_method_pristine(&self, idx: u32, name: &str) -> bool {
+        use crate::vm::native::{GEN_NEXT, GEN_RETURN, GEN_THROW};
+        let id = match name {
+            "next" => GEN_NEXT,
+            "return" => GEN_RETURN,
+            "throw" => GEN_THROW,
+            _ => return false,
+        };
+        if !self.arr_props.is_empty()
+            && self.arr_props.get(&idx).is_some_and(|m| m.pos(name).is_some())
+        {
+            return false;
+        }
+        let first = match self.proto_of.get(&idx) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            Some(_) => return false,
+            None => self.gen_proto,
+        };
+        // `next`, the per-step question, from the memo of its last proof:
+        // the first prototype and the holder unchanged (versions) and the
+        // holder's `next` still the same value (an in-place overwrite moves
+        // no version).
+        let memo = self.gen_next_memo.get();
+        if id == GEN_NEXT
+            && memo.first_ver != 0
+            && memo.first == first
+            && self.heap.version_of(first).wrapping_add(1) == memo.first_ver
+            && self.heap.version_of(memo.holder) == memo.holder_ver
+            && matches!(self.heap.get(memo.holder), HeapObj::Object(m)
+                if (memo.slot as usize) < m.vals_len() && m.val_at(memo.slot as usize).bits() == memo.bits)
+        {
+            return true;
+        }
+        let mut cur = first;
+        // The function's `prototype` object, %GeneratorPrototype%, and
+        // %Iterator.prototype% at most; anything deeper is not the default
+        // chain.
+        for depth in 0..3 {
+            let HeapObj::Object(m) = self.heap.get(cur) else {
+                return false;
+            };
+            if m.is_ctor || m.class.is_some() {
+                return false;
+            }
+            if let Some(i) = m.pos(name) {
+                let v = m.val_at(i);
+                let ok = !m.attr_at(i).accessor
+                    && v.is_heap()
+                    && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == id);
+                // A proof made within two levels names everything it read.
+                if ok && id == GEN_NEXT && depth < 2 {
+                    self.gen_next_memo.set(GenNextProof {
+                        first,
+                        first_ver: self.heap.version_of(first).wrapping_add(1),
+                        holder: cur,
+                        holder_ver: self.heap.version_of(cur),
+                        slot: i as u32,
+                        bits: v.bits(),
+                    });
+                }
+                return ok;
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                _ => return false,
+            };
+        }
+        false
+    }
+
     /// For-of's [`Vm::builtin_iter_pristine`] proof for an Array receiver
     /// (the Tier-C GetIterator helper): %ArrayIteratorPrototype%'s `next` is
     /// pristine and no `return` is reachable from it.
@@ -1351,7 +1461,8 @@ impl<'p> Vm<'p> {
                 iter
             }
         };
-        let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. });
+        let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
+            && self.gen_method_pristine(iter.heap_index(), "next");
         let lim = max as usize;
         let mut out = Vec::new();
         let mut iter_done = false;
@@ -1787,7 +1898,10 @@ impl<'p> Vm<'p> {
     fn iterator_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
         // A generator is drained eagerly via repeated next() (spread / Array.from
         // produce a buffer; an infinite generator hangs here, matching V8).
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. }) {
+        if v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. })
+            && self.gen_method_pristine(v.heap_index(), "next")
+        {
             return self.drain_iterator_rooted(v, None);
         }
         // A user iterator object (one with a `next()` method) or a built-in
@@ -1795,7 +1909,8 @@ impl<'p> Vm<'p> {
         // %SegmentIterator% — the same reason `IterNext` carries it — because
         // without it `[...segmenter.segment(s)]` fell past this drain to the
         // positional plan below and reported the iterator "not iterable", even
-        // though `for-of` over the same object worked.
+        // though `for-of` over the same object worked. A generator whose `next`
+        // was replaced is drained through it here too.
         if v.is_heap()
             && matches!(
                 self.heap.get(v.heap_index()),
@@ -1804,6 +1919,7 @@ impl<'p> Vm<'p> {
                     | HeapObj::Iterator { .. }
                     | HeapObj::IterHelper { .. }
                     | HeapObj::Intl { .. }
+                    | HeapObj::Generator { .. }
             )
         {
             let next = self.get_prop(v, "next")?;

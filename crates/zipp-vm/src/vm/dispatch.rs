@@ -4650,6 +4650,18 @@ impl<'p> Vm<'p> {
                                                 {
                                                     continue; // dedicated DataView get* helper
                                                 }
+                                                // `it.next()` on a generator or a
+                                                // built-in iterator: the builtin
+                                                // fallback steps it directly
+                                                // (`generator_method`, the
+                                                // `ITER_NEXT` lane), so the loop
+                                                // around it — the `done`/`value`
+                                                // reads and the work — is worth
+                                                // compiling; it ran on the
+                                                // interpreter.
+                                                if *argc == 0 && key == Some("next") {
+                                                    continue;
+                                                }
                                                 // B82: `f.call(…)` (0-3 forwarded
                                                 // args) / `f.apply(this[, arr])`
                                                 // sites are served per-call by
@@ -8362,14 +8374,17 @@ impl<'p> Vm<'p> {
                                 self.display(it)
                             )));
                         }
+                        let gen_direct = matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. })
+                            && self.gen_method_pristine(it.heap_index(), "next");
                         let result = match self.heap.get(it.heap_index()) {
                             HeapObj::AsyncGenerator(_) => self
                                 .async_generator_method(it.heap_index(), "next", &[sent_v])
                                 .unwrap_or(Value::UNDEFINED),
-                            HeapObj::Generator { .. } => self
+                            HeapObj::Generator { .. } if gen_direct => self
                                 .generator_method(it.heap_index(), "next", &[sent_v])?
                                 .unwrap_or(Value::UNDEFINED),
-                            HeapObj::Object(_) => {
+                            // A generator whose `next` was replaced calls it.
+                            HeapObj::Object(_) | HeapObj::Generator { .. } => {
                                 if self.is_callable(nf) {
                                     self.call_value(nf, it, &[sent_v])?
                                 } else {
@@ -8720,15 +8735,20 @@ impl<'p> Vm<'p> {
                         // loop (the iterator record's [[NextMethod]]); built-in
                         // fast iterables perform no observable get.
                         let it = self.get(base, iter);
+                        // A generator's is read only when it is not the
+                        // intrinsic (a replaced `next`, which the loop then
+                        // calls); left undefined, `IterNext` steps the body.
                         let nv = if it.is_heap()
-                            && matches!(
+                            && (matches!(
                                 self.heap.get(it.heap_index()),
                                 HeapObj::Object(_)
                                     | HeapObj::Proxy { .. }
                                     | HeapObj::Iterator { .. }
                                     | HeapObj::IterHelper { .. }
                                     | HeapObj::Intl { .. }
-                            ) {
+                            ) || (matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. })
+                                && !self.gen_method_pristine(it.heap_index(), "next")))
+                        {
                             self.get_prop(it, "next")?
                         } else {
                             Value::UNDEFINED
@@ -8800,7 +8820,16 @@ impl<'p> Vm<'p> {
                         // dropped, it was a third of a generator-driven loop.
                         // A `yield*` step still hands over the inner result
                         // object itself, which is read below as before.
-                        if matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. }) {
+                        // A primed loop decided at `IterPrime` (its record's
+                        // [[NextMethod]] is read once: undefined there means the
+                        // intrinsic); an unprimed step asks now.
+                        if matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. })
+                            && if next != u16::MAX {
+                                self.get(base, next).is_undefined()
+                            } else {
+                                self.gen_method_pristine(it.heap_index(), "next")
+                            }
+                        {
                             let res = match self.generator_next_step(it.heap_index())? {
                                 Some(super::async_runtime::GenStep::Yield(v)) => {
                                     self.set(base, value_dst, v);
@@ -8847,6 +8876,9 @@ impl<'p> Vm<'p> {
                         // without it `for (v of segmenter.segment(s))` fell
                         // through to the positional walk below and reported the
                         // iterator itself as "not iterable".
+                        // A generator lands here when its `next` was replaced
+                        // (the arm above runs it directly only while it is the
+                        // intrinsic).
                         if matches!(
                             self.heap.get(it.heap_index()),
                             HeapObj::Object(_)
@@ -8854,6 +8886,7 @@ impl<'p> Vm<'p> {
                                 | HeapObj::Iterator { .. }
                                 | HeapObj::IterHelper { .. }
                                 | HeapObj::Intl { .. }
+                                | HeapObj::Generator { .. }
                         ) {
                             let next = if next != u16::MAX {
                                 self.get(base, next)
@@ -9023,17 +9056,22 @@ impl<'p> Vm<'p> {
                                 .async_generator_method(it.heap_index(), "next", &[])
                                 .unwrap_or(Value::UNDEFINED),
                             // Sync generator: `.next()` returns {value,done} (awaited = no-op tick).
-                            HeapObj::Generator { .. } => self
-                                .generator_method(it.heap_index(), "next", &[])?
-                                .unwrap_or(Value::UNDEFINED),
+                            HeapObj::Generator { .. }
+                                if self.gen_method_pristine(it.heap_index(), "next") =>
+                            {
+                                self.generator_method(it.heap_index(), "next", &[])?
+                                    .unwrap_or(Value::UNDEFINED)
+                            }
                             // A user iterator object (sync or async) with `.next()` —
                             // including a BUILTIN iterator / iterator helper handed
                             // over by a custom @@asyncIterator (driven through its
-                            // prototype `next`, same protocol).
+                            // prototype `next`, same protocol), and a generator
+                            // whose `next` was replaced.
                             HeapObj::Object(_)
                             | HeapObj::Proxy { .. }
                             | HeapObj::Iterator { .. }
-                            | HeapObj::IterHelper { .. } => {
+                            | HeapObj::IterHelper { .. }
+                            | HeapObj::Generator { .. } => {
                                 let next = self.get_prop(it, "next")?;
                                 if self.is_callable(next) {
                                     self.call_value(next, it, &[])?

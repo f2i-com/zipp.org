@@ -1426,6 +1426,37 @@ impl<'p> Vm<'p> {
         arg_base: u16,
         argc: u16,
     ) -> u64 {
+        // `it.next()` on a generator or a built-in iterator whose `next` is
+        // the intrinsic: the step itself, ahead of `try_builtin_method`'s
+        // cascade of receiver kinds (the same calls it ends in).
+        if argc == 0 && key == "next" && recv.is_heap() {
+            let idx = recv.heap_index();
+            let iter_proto = match self.heap.get(idx) {
+                HeapObj::Generator { .. } => None,
+                HeapObj::Iterator { proto, .. } => Some(*proto),
+                _ => Some(0),
+            };
+            let step = match iter_proto {
+                None if self.gen_method_pristine(idx, "next") => {
+                    Some(self.generator_method(idx, "next", &[]).map(|v| v.unwrap_or(Value::UNDEFINED)))
+                }
+                Some(p)
+                    if p != 0
+                        && self.proto_of.get(&idx).is_none()
+                        && !self.arr_props.get(&idx).is_some_and(|m| m.pos("next").is_some())
+                        && self.builtin_iter_next_pristine(p) =>
+                {
+                    Some(self.call_native(crate::vm::native::ITER_NEXT, recv, &[]))
+                }
+                _ => None,
+            };
+            if let Some(r) = step {
+                return match r {
+                    Ok(v) => v.bits(),
+                    Err(t) => self.jit_thrown_to_sentinel(t),
+                };
+            }
+        }
         match self.try_builtin_method(recv, key, base, arg_base, argc) {
             Ok(Some(v)) => return v.bits(),
             Ok(None) => {}

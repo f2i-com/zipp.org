@@ -512,6 +512,7 @@ impl<'p> Vm<'p> {
             default_string_iter: Value::UNDEFINED,
             default_ta_iter: Value::UNDEFINED,
             iter_proto_memo: Default::default(),
+            gen_next_memo: Default::default(),
             iter_method_memo: Default::default(),
             throw_type_error: Value::UNDEFINED,
             iterator_ctor: 0,

@@ -116,7 +116,10 @@ impl<'p> Vm<'p> {
 
     /// Pull one value from an iterator (calling its `.next()`), `Ok(None)` at end.
     pub(crate) fn iterator_step(&mut self, iter: Value) -> Result<Option<Value>, Thrown> {
-        if iter.is_heap() && matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. }) {
+        if iter.is_heap()
+            && matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
+            && self.gen_method_pristine(iter.heap_index(), "next")
+        {
             let res = self
                 .generator_method(iter.heap_index(), "next", &[])?
                 .unwrap_or(Value::UNDEFINED);
