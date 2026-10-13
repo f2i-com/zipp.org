@@ -755,7 +755,7 @@ def _scalar_result(dt, v):
         return int64 if dt is _bool_dtype else dt
     if isinstance(v, _float):
         return _default_dtype
-    if isinstance(v, (_list, _tuple)):
+    if (isinstance(v, _list) or isinstance(v, _tuple)):
         return _result_type(Tensor(_k.zeros(dt.name, 1), (1,), dt), tensor(v))
     if _cx_parts(v) is not None:
         return _combine_categories(dt, _default_complex())
@@ -2016,12 +2016,12 @@ class Tensor:
 
     # -- shape
     def reshape(self, *shape):
-        return reshape(self, *shape)
+        return _reshape(self, shape)
 
     def view(self, *shape):
         if len(shape) == 1 and isinstance(shape[0], dtype):
             return _view_dtype(self, shape[0])
-        return reshape(self, *shape)
+        return _reshape(self, shape)
 
     def reshape_as(self, other):
         return reshape(self, *other.shape)
@@ -2061,7 +2061,7 @@ class Tensor:
     moveaxis = movedim
 
     def expand(self, *sizes):
-        return expand(self, *sizes)
+        return _expand(self, sizes)
 
     def expand_as(self, other):
         return expand(self, *other.shape)
@@ -2157,7 +2157,7 @@ class Tensor:
         _check_cpu_device(kwargs.get("device"))
         target = kwargs.get("dtype")
         for a in args:
-            if isinstance(a, (_b.str, device)):
+            if (isinstance(a, _b.str) or isinstance(a, device)):
                 _check_cpu_device(a)
             if isinstance(a, dtype):
                 target = a
@@ -2620,11 +2620,11 @@ def _flatten_data(data):
     """Nested lists/tuples (or scalars) to a flat list and a shape."""
     if isinstance(data, Tensor):
         return (_cx_scalars(data._s) if data.dtype.is_complex else _k.to_list(data._s)), _tuple(data.shape), data.dtype
-    if isinstance(data, (_list, _tuple)):
+    if (isinstance(data, _list) or isinstance(data, _tuple)):
         if len(data) == 0:
             return [], (0,), None
         first = data[0]
-        if isinstance(first, (_list, _tuple)) or (isinstance(first, Tensor) and first.shape):
+        if (isinstance(first, _list) or isinstance(first, _tuple)) or (isinstance(first, Tensor) and first.shape):
             flat, shape, dt = [], None, None
             for row in data:
                 f, s, d = _flatten_data(row)
@@ -2642,7 +2642,7 @@ def _flatten_data(data):
                     raise ValueError("only one element tensors can be converted to Python scalars")
                 dt = _promote_types(dt, v.dtype)
                 v = v.item()
-            elif isinstance(v, (_list, _tuple)):
+            elif (isinstance(v, _list) or isinstance(v, _tuple)):
                 raise ValueError("expected a sequence of numbers, got a nested sequence")
             flat.append(v)
         if dt is not None:
@@ -2730,9 +2730,9 @@ def _as_tensor(v, like=None, dtype=None):
     an op wraps comes through here: torch.compile's prepare() watches it."""
     if isinstance(v, Tensor):
         return v
-    if dtype is not None and isinstance(v, (_int, _float, _b.bool)):
+    if dtype is not None and (isinstance(v, _int) or isinstance(v, _float) or isinstance(v, _b.bool)):
         return Tensor(_k.full(dtype.name, 1, v), _SCALAR_SHAPE, dtype)
-    if like is not None and like.dtype._inexact and isinstance(v, (_int, _float, _b.bool)):
+    if like is not None and like.dtype._inexact and (isinstance(v, _int) or isinstance(v, _float) or isinstance(v, _b.bool)):
         return Tensor(_k.full(like.dtype.name, 1, _float(v)), _SCALAR_SHAPE, like.dtype)
     return tensor(v)
 
@@ -2745,7 +2745,7 @@ def _shape_args(shape):
         return out
     if len(shape) == 1:
         s0 = shape[0]
-        if type(s0) is not _int and isinstance(s0, (_list, _tuple, Size)):
+        if type(s0) is not _int and (isinstance(s0, _list) or isinstance(s0, _tuple) or isinstance(s0, Size)):
             shape = s0
     # A tuple of plain ints is returned as it is; anything else (a bool, a
     # 0-d tensor, an int subclass) goes through int().
@@ -2902,7 +2902,7 @@ def arange(start=0, end=None, step=1, dtype=None, layout=None, device=None, requ
     if n < 0 or (step > 0 and start > end) or (step < 0 and start < end):
         raise RuntimeError("upper bound and larger bound inconsistent with step sign")
     n = _int(n)
-    if isinstance(start, (_int, _float)) and isinstance(step, (_int, _float)) and _b.max(_b.abs(start), _b.abs(n * step), _b.abs(start + n * step)) < 9007199254740992:
+    if (isinstance(start, _int) or isinstance(start, _float)) and (isinstance(step, _int) or isinstance(step, _float)) and _b.max(_b.abs(start), _b.abs(n * step), _b.abs(start + n * step)) < 9007199254740992:
         # Every element start + i * step is then exact in double precision
         # for int operands, and computed as Python computes it for floats:
         # the kernel's loop gives the list's values.
@@ -3893,7 +3893,7 @@ def repeat_interleave(input, repeats=None, dim=None, output_size=None):
         dim = 0
     rank = len(t.shape)
     dim = _norm_dim(dim, rank)
-    if isinstance(repeats, (Tensor, _list, _tuple)):
+    if (isinstance(repeats, Tensor) or isinstance(repeats, _list) or isinstance(repeats, _tuple)):
         counts = [_int(c) for c in (_k.to_list(repeats._s) if isinstance(repeats, Tensor) else repeats)]
         if len(counts) == 1:
             repeats = counts[0]
@@ -4524,7 +4524,7 @@ def _dims_arg(dim, rank):
     dim 0 or -1, which reduces nothing, as in PyTorch."""
     if dim is None:
         return None
-    if isinstance(dim, (_list, _tuple, Size)):
+    if (isinstance(dim, _list) or isinstance(dim, _tuple) or isinstance(dim, Size)):
         if rank == 0:
             for d in dim:
                 _norm_dim(_int(d), 1)
@@ -4538,7 +4538,7 @@ def _dims_arg(dim, rank):
 
 def _all_if_empty(dim):
     # sum/mean/amax take dim=() (or []) as every dim, as PyTorch still does.
-    return None if isinstance(dim, (_list, _tuple)) and not dim else dim
+    return None if (isinstance(dim, _list) or isinstance(dim, _tuple)) and not dim else dim
 
 
 def _reduce_nograd(op, a, dim, keepdim):
@@ -4555,11 +4555,11 @@ def _expand_back(g, a_shape, dims, keepdim):
             # expand below make, without the intermediate view. (A 1-element
             # target keeps that path, whose result shares g's storage.)
             return Tensor(_k.expand(g._s, g.shape, a_shape), a_shape, g.dtype)
-        return expand(g.reshape(*([1] * len(a_shape))), *a_shape)
+        return _expand(g.reshape(*([1] * len(a_shape))), (a_shape,))
     if not keepdim:
         for d in sorted(dims):
             g = g.unsqueeze(d)
-    return expand(g, *a_shape)
+    return _expand(g, (a_shape,))
 
 
 def _check_nonempty(a, dims, name):
@@ -5321,7 +5321,12 @@ def topk(input, k, dim=-1, largest=True, sorted=True):
 
 # ---- shape ops ---------------------------------------------------------------------------
 def reshape(input, *shape):
-    a = input
+    return _reshape(input, shape)
+
+
+def _reshape(a, shape):
+    """`reshape(a, *shape)` with the arguments as one tuple (the methods
+    and backward functions call this, which saves a star call)."""
     if (_graph_recording and getattr(a, "_zipp_graph", False)) or a.__class__ is _QTensor:
         return a.reshape(*shape)
     shape = _shape_args(shape)
@@ -5357,7 +5362,7 @@ def _view(a, shape):
 
 def _view_bw(g, args):
     a, = args
-    return (g.reshape(*a.shape),)
+    return (_reshape(g, (a.shape,)),)
 
 
 def flatten(input, start_dim=0, end_dim=-1):
@@ -5409,7 +5414,7 @@ def squeeze(input, dim=None):
     if dim is None:
         shape = _tuple(d for d in a.shape if d != 1)
     else:
-        dims = set(_norm_dim(_int(d), _b.max(rank, 1)) for d in (dim if isinstance(dim, (_list, _tuple)) else (dim,)))
+        dims = set(_norm_dim(_int(d), _b.max(rank, 1)) for d in (dim if (isinstance(dim, _list) or isinstance(dim, _tuple)) else (dim,)))
         shape = _tuple(s for i, s in enumerate(a.shape) if not (i in dims and s == 1))
     if shape == _tuple(a.shape):
         return a
@@ -5506,7 +5511,11 @@ moveaxis = movedim
 
 
 def expand(input, *sizes):
-    a = input
+    return _expand(input, sizes)
+
+
+def _expand(a, sizes):
+    """`expand(a, *sizes)` with the arguments as one tuple."""
     sizes = _shape_args(sizes)
     rank = len(a.shape)
     if len(sizes) < rank:
@@ -5802,15 +5811,15 @@ def unbind(input, dim=0):
 def roll(input, shifts, dims=None):
     a = input
     if dims is None:
-        if isinstance(shifts, (_list, _tuple)):
+        if (isinstance(shifts, _list) or isinstance(shifts, _tuple)):
             shifts = shifts[0]
         return roll(a.flatten(), shifts, 0).reshape(*a.shape)
-    if isinstance(shifts, (_list, _tuple)):
+    if (isinstance(shifts, _list) or isinstance(shifts, _tuple)):
         out = a
-        for s, d in zip(shifts, dims if isinstance(dims, (_list, _tuple)) else [dims]):
+        for s, d in zip(shifts, dims if (isinstance(dims, _list) or isinstance(dims, _tuple)) else [dims]):
             out = roll(out, s, d)
         return out
-    if isinstance(dims, (_list, _tuple)):
+    if (isinstance(dims, _list) or isinstance(dims, _tuple)):
         dims = dims[0]
     d = _norm_dim(dims, len(a.shape))
     if a.shape[d] == 0:
@@ -6081,7 +6090,7 @@ def _getitem(a, key):
                 raise IndexError("tensors used as indices must be long, int, byte or bool tensors")
             advanced.append((d, k if k.dtype is int64 else k.long()))
             spec.append(slice(None))
-        elif isinstance(k, (_list, _tuple)):
+        elif (isinstance(k, _list) or isinstance(k, _tuple)):
             advanced.append((d, tensor(k, dtype=int64)))
             spec.append(slice(None))
         elif isinstance(k, _b.bool):
@@ -6299,7 +6308,7 @@ def _setitem_into(dst, a, key, value):
     for k in items:
         if k is None or k is _EMPTY:
             return _setitem_general(dst, a, key, value)
-        if isinstance(k, Tensor) or isinstance(k, (_list, _tuple)):
+        if isinstance(k, Tensor) or (isinstance(k, _list) or isinstance(k, _tuple)):
             advanced.append((d, k.long() if isinstance(k, Tensor) else tensor(k, dtype=int64)))
             spec.append((None, None, None))
         elif isinstance(k, _int):
@@ -7356,7 +7365,7 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
                     pshape = p.shape
                     gshape = pg.shape
                     if gshape is not pshape and not _shape_eq(gshape, pshape) and ((gshape.__class__ is Size and pshape.__class__ is Size) or _tuple(gshape) != _tuple(pshape)):
-                        pg = _unbroadcast(pg, pshape) if _numel(gshape) >= _numel(pshape) else expand(pg, *pshape)
+                        pg = _unbroadcast(pg, pshape) if _numel(gshape) >= _numel(pshape) else _expand(pg, (pshape,))
                     pdt = p.dtype
                     if pg.dtype is not pdt and pg.dtype != pdt and pdt._inexact:
                         pg = _grad_as(pg, pdt)

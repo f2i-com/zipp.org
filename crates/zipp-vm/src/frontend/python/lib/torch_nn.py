@@ -212,7 +212,7 @@ class _BackwardHooks:
             for hook in list(state.module._backward_hooks.values()):
                 res = hook(state.module, grad_inputs, state.grad_outputs)
                 if res is not None:
-                    res = tuple(res) if isinstance(res, (tuple, list)) else (res,)
+                    res = tuple(res) if (isinstance(res, tuple) or isinstance(res, list)) else (res,)
                     if len(res) != len(grad_inputs):
                         raise RuntimeError("Backward hook returned an invalid number of grad_input, got %d, but expected %d" % (len(res), len(grad_inputs)))
                     grad_inputs = res
@@ -226,7 +226,7 @@ class _BackwardHooks:
 
     def setup_outputs(self, result):
         single = isinstance(result, Tensor)
-        items = [result] if single else list(result) if isinstance(result, (tuple, list)) else None
+        items = [result] if single else list(result) if (isinstance(result, tuple) or isinstance(result, list)) else None
         if items is None:
             return result
         live = [i for i, r in enumerate(items) if isinstance(r, Tensor) and r.requires_grad]
@@ -244,7 +244,7 @@ class _BackwardHooks:
             for hook in list(state.module._backward_pre_hooks.values()):
                 res = hook(state.module, grad_outputs)
                 if res is not None:
-                    grad_outputs = tuple(res) if isinstance(res, (tuple, list)) else (res,)
+                    grad_outputs = tuple(res) if (isinstance(res, tuple) or isinstance(res, list)) else (res,)
             state.grad_outputs = grad_outputs
             if state.input_positions is None:
                 grad_inputs = (None,) * state.n_inputs
@@ -707,7 +707,7 @@ class Module:
         torch._check_cpu_device(kwargs.get("device"))
         target = kwargs.get("dtype")
         for a in args:
-            if isinstance(a, (str, torch.device)):
+            if (isinstance(a, str) or isinstance(a, torch.device)):
                 torch._check_cpu_device(a)
             elif isinstance(a, torch.dtype):
                 target = a
@@ -1143,7 +1143,7 @@ class ModuleDict(Module):
                 self[key] = module
         else:
             for j, m in enumerate(modules):
-                if not isinstance(m, (list, tuple)):
+                if not (isinstance(m, list) or isinstance(m, tuple)):
                     raise TypeError("ModuleDict update sequence element #%d should be Iterable; is %s" % (j, type(m).__name__))
                 if len(m) != 2:
                     raise ValueError("ModuleDict update sequence element #%d has length %d; 2 is required" % (j, len(m)))
@@ -1347,7 +1347,7 @@ class Unflatten(Module):
     def __init__(self, dim, unflattened_size):
         super().__init__()
         if isinstance(dim, int):
-            if not isinstance(unflattened_size, (tuple, list)) or not all(isinstance(v, int) for v in unflattened_size):
+            if not (isinstance(unflattened_size, tuple) or isinstance(unflattened_size, list)) or not all(isinstance(v, int) for v in unflattened_size):
                 raise TypeError("unflattened_size must be tuple of ints, but found type %s" % type(unflattened_size).__name__)
         self.dim = dim
         self.unflattened_size = unflattened_size
@@ -2564,7 +2564,7 @@ class Upsample(Module):
         super().__init__()
         self.name = type(self).__name__
         self.size = size
-        self.scale_factor = float(scale_factor) if isinstance(scale_factor, (int, float)) else tuple(float(f) for f in scale_factor) if scale_factor else None
+        self.scale_factor = float(scale_factor) if (isinstance(scale_factor, int) or isinstance(scale_factor, float)) else tuple(float(f) for f in scale_factor) if scale_factor else None
         self.mode = mode
         self.align_corners = align_corners
         self.recompute_scale_factor = recompute_scale_factor
@@ -2638,7 +2638,7 @@ class _PadNd(Module):
         return F.pad(input, self.padding, self._mode)
 
     def extra_repr(self):
-        if self._mode == "constant" and not isinstance(self, (ZeroPad1d, ZeroPad2d, ZeroPad3d)):
+        if self._mode == "constant" and not (isinstance(self, ZeroPad1d) or isinstance(self, ZeroPad2d) or isinstance(self, ZeroPad3d)):
             return "padding=%s, value=%s" % (self.padding, self.value)
         return "%s" % (self.padding,)
 
@@ -2849,7 +2849,7 @@ class RNNBase(Module):
         self.dropout = float(dropout)
         self.bidirectional = bidirectional
         self.proj_size = proj_size
-        if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not 0 <= dropout <= 1:
+        if isinstance(dropout, bool) or not (isinstance(dropout, int) or isinstance(dropout, float)) or not 0 <= dropout <= 1:
             raise ValueError("dropout should be a number in range [0, 1] representing the probability of an element being zeroed")
         if not isinstance(hidden_size, int):
             raise TypeError("hidden_size should be of type int, got: %s" % type(hidden_size).__name__)
@@ -3599,7 +3599,7 @@ class LazyInstanceNorm3d(_LazyNormBase, _InstanceNorm):
 
 # ---- fractional max pooling, CTC and SyncBatchNorm -----------------------------------------
 def _float_tuple(value, n):
-    if isinstance(value, (tuple, list)):
+    if (isinstance(value, tuple) or isinstance(value, list)):
         return tuple(value)
     return (value,) * n
 
@@ -3611,7 +3611,7 @@ class _FractionalMaxPoolNd(Module):
         super().__init__()
         nd = self._nd
         name = type(self).__name__
-        if nd == 3 and ((isinstance(kernel_size, int) and kernel_size <= 0) or (isinstance(kernel_size, (tuple, list)) and not all(k > 0 for k in kernel_size))):
+        if nd == 3 and ((isinstance(kernel_size, int) and kernel_size <= 0) or ((isinstance(kernel_size, tuple) or isinstance(kernel_size, list)) and not all(k > 0 for k in kernel_size))):
             raise ValueError("kernel_size must greater than 0, but got %s" % (kernel_size,))
         self.kernel_size = F._ntuple(kernel_size, nd, "kernel_size")
         self.return_indices = return_indices

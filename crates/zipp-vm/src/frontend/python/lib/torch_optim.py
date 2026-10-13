@@ -305,7 +305,7 @@ class Optimizer:
         params = param_group["params"]
         if isinstance(params, torch.Tensor):
             params = [params]
-        elif isinstance(params, (set, frozenset)):
+        elif (isinstance(params, set) or isinstance(params, frozenset)):
             raise TypeError("optimizer parameters need to be organized in ordered collections, but the ordering of tensors in sets will change between runs. Please use a list instead.")
         else:
             params = list(params)
