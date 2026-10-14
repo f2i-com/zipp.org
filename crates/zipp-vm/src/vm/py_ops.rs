@@ -1372,6 +1372,10 @@ impl<'p> Vm<'p> {
             return None;
         }
         let tdict = self.py_rt_for(rt)?.t_dict;
+        // A dict record of the template's shape: its `map` read with it.
+        if let Some((_, map, _)) = self.py_dict_rec_fast(d, tdict) {
+            return self.py_table_get(map, k);
+        }
         if self.py_cls_of(d)?.bits() != tdict.bits() {
             return None;
         }
@@ -2268,6 +2272,26 @@ impl<'p> Vm<'p> {
         Some((items.heap_index(), i))
     }
 
+    /// For [`Instr::PyGetItem`] / [`Instr::PySetItem`]: a `dict` record of
+    /// the dict template's shape, its `map` and the slot of its `size`, read
+    /// in one pass (`py_item_kind` and `py_dict_field` read the record once
+    /// each). `None` for anything else, which those then decide.
+    #[inline(always)]
+    fn py_dict_rec_fast(&self, o: Value, dict: Value) -> Option<(u32, Value, usize)> {
+        if !o.is_heap() {
+            return None;
+        }
+        let p = self.py_rt.as_deref()?;
+        let (shape, slots) = (p.dict_shape, p.dict_slots);
+        let HeapObj::Object(m) = self.heap.get(o.heap_index()) else {
+            return None;
+        };
+        if m.is_ctor || shape == crate::shape::DICT || m.shape() != shape || m.val_at(0).bits() != dict.bits() {
+            return None;
+        }
+        Some((o.heap_index(), m.val_at(slots[0]), slots[1]))
+    }
+
     /// `o.items` and a valid index into it for `k`.
     fn py_seq_slot(&self, o: Value, k: Value) -> Option<(u32, usize)> {
         let (_, items) = self.py_seq_parts(o)?;
@@ -2294,6 +2318,10 @@ impl<'p> Vm<'p> {
             let v = vals[i];
             return Ok((v != Value::HOLE && !v.is_undefined()).then_some(Some(v)));
         }
+        // A dict record of the template's shape: its `map`, read with it.
+        if let Some((_, map, _)) = self.py_dict_rec_fast(o, dict) {
+            return Ok(self.py_table_get(map, k));
+        }
         let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
             return Ok(None);
         };
@@ -2314,11 +2342,14 @@ impl<'p> Vm<'p> {
     }
 
     pub(super) fn py_set_item(&mut self, o: Value, k: Value, v: Value, seq: Value, dict: Value) -> Result<bool, Thrown> {
-        // As `py_get_item`: the commonest case's record and index first.
+        // As `py_get_item`: the commonest cases' records first (a dict
+        // record's `map` and `size` slot read with it).
         let fast = self.py_seq_index_fast(o, k, seq);
-        let (idx, is_seq) = match fast {
-            Some((items, _)) => (items, true),
-            None => match self.py_item_kind(o, seq, dict) {
+        let dict_fast = if fast.is_none() { self.py_dict_rec_fast(o, dict) } else { None };
+        let (idx, is_seq) = match (fast, dict_fast) {
+            (Some((items, _)), _) => (items, true),
+            (None, Some((rec, _, _))) => (rec, false),
+            (None, None) => match self.py_item_kind(o, seq, dict) {
                 Some(kind) => kind,
                 None => return Ok(false),
             },
@@ -2343,8 +2374,12 @@ impl<'p> Vm<'p> {
             self.set_index(Value::heap(items), Value::int(i as i32), v, true)?;
             return Ok(true);
         }
-        let (Some((_, map)), Some((size_slot, _))) = (self.py_dict_field(idx, 0), self.py_dict_field(idx, 1)) else {
-            return Ok(false);
+        let (map, size_slot) = match dict_fast {
+            Some((_, map, size_slot)) => (map, size_slot),
+            None => match (self.py_dict_field(idx, 0), self.py_dict_field(idx, 1)) {
+                (Some((_, map)), Some((size_slot, _))) => (map, size_slot),
+                _ => return Ok(false),
+            },
         };
         // A key needing guest code, or a full table: the runtime's path.
         let Some(Ok(n)) = self.py_table_set(map, k, v) else {
