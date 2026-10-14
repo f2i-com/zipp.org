@@ -3632,6 +3632,9 @@ def _pow_backward(g, x, y, o):
     return (gx, gy)
 
 
+_SPOW = frozenset((2, 3, -2, 0.5, -0.5, -1, 1))
+
+
 def pow(input, exponent):
     a, b = input, exponent
     if _graph_recording and getattr(a, "_zipp_graph", False):
@@ -3645,6 +3648,11 @@ def pow(input, exponent):
             if e == 0:
                 return (zeros_like(x, dtype=g.dtype), None)
             return (mul(g, _cj(mul(pow(x, e - 1), e))), None)
+        # A float32/float64 tensor to a Python number: the kernel's `spow`,
+        # PyTorch's own forms of x**2, x**3, x**-2, x**0.5, x**-0.5, x**-1,
+        # x**1 (`pow` otherwise).
+        if (a.dtype is float32 or a.dtype is float64) and a.__class__ is not _SparseTensor and not _graph_recording and (b.__class__ is _float or b.__class__ is _int) and b in _SPOW:
+            return _binary("spow", a, b, "Pow", backward, ("x", ""))
         return _binary("pow", a, b, "Pow", backward, ("x", ""))
     return _binary("pow", a, b, "Pow", _pow_backward, ("xy", "xyo"))
 

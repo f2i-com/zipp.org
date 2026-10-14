@@ -764,7 +764,37 @@
     // `want`: the result dtype Python's type promotion chose (null: promote
     // the operands' dtypes). The kernel computes in double precision and
     // rounds on store.
+    // torch.pow with a Python-number exponent (`spow`, PyTorch's
+    // pow.Tensor_Scalar) of a float32/float64 tensor: the exponents
+    // PyTorch's CPU kernel specializes, computed as it computes them, each
+    // step rounded to the dtype (PowKernel.cpp): 2 x*x, 3 (x*x)*x, -2
+    // 1/(x*x), 0.5 sqrt, -0.5 1/sqrt, -1 1/x, 1 a copy. `undefined` for any
+    // other case (the caller computes Math.pow, as `pow` does).
+    function scalarPow(a, ashape, b, bshape, apy, want) {
+        const dt = a.dtype;
+        if ((dt !== "float32" && dt !== "float64") || b.dtype !== dt || (want !== null && want !== undefined && want !== dt) || bshape.length !== 0) return undefined;
+        const y = b.data[0];
+        let out;
+        if (y === 2) out = unary("square", a);
+        else if (y === 0.5) out = unary("sqrt", a);
+        else if (y === -1) out = unary("reciprocal", a);
+        else if (y === -2) out = unary("reciprocal", unary("square", a));
+        else if (y === -0.5) out = unary("reciprocal", unary("sqrt", a));
+        else if (y === 1) out = make(dt, a.data.slice());
+        else if (y === 3) {
+            const S = unary("square", a).data, A = a.data, n = A.length;
+            out = alloc(dt, n);
+            const O = out.data;
+            if (!(n >= NATIVE_SMALL && NATIVE !== null && NATIVE(N_BINARY, BIN_CODE.mul, S, A, O, [n], [1], [1]))) for (let i = 0; i < n; i++) O[i] = S[i] * A[i];
+        } else return undefined;
+        return tuple([out, out.data.length !== 0 && tupleShape(apy) ? apy : pyShape(ashape)]);
+    }
     function binary(op, a, ashape, b, bshape, apy, bpy, want) {
+        if (op === "spow") {
+            const r = scalarPow(a, ashape, b, bshape, apy, want);
+            if (r !== undefined) return r;
+            op = "pow";
+        }
         const shape = broadcastShape(ashape, bshape);
         let dtype = COMPARE.has(op) ? "bool" : (want ? want : promote(a.dtype, b.dtype));
         if ((op === "div" || op === "atan2") && !isFloatDtype(dtype)) dtype = "float32";

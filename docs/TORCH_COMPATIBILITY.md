@@ -1055,7 +1055,12 @@ float32 functions likewise compute in float64 and round once, so `sqrt` is
 correctly rounded and `exp`, `tanh`, `sigmoid` are within one rounding of the
 exact value, where PyTorch's vectorised float32 kernels (SLEEF, MKL) can land
 one ulp away. Formulas follow PyTorch's where the rounding depends on them (a
-GRU's update is `(h - n) * z + n`, as PyTorch's CPU cell computes it). The GPU graph
+GRU's update is `(h - n) * z + n`, as PyTorch's CPU cell computes it; `x ** e`
+with a Python-number exponent of 2, 3, -2, 0.5, -0.5, -1 or 1 is computed as
+PyTorch's CPU kernel computes it, `x*x`, `(x*x)*x`, `1/(x*x)`, `sqrt`, `1/sqrt`,
+`1/x` or a copy, rounded at each step, so it gives PyTorch's values wherever
+those operations do (not where PyTorch's `sqrt` misrounds); other exponents
+use `pow` and can differ in the last bit). The GPU graph
 reference (`zipp_gpu`) keeps float32 rounding after every step, matching the
 WebGPU/WebGL2 backends. Eager float32 `sum`, `mean`, `prod` (whole and per
 dimension) and `var`/`std` likewise accumulate in float64 and round once, so
