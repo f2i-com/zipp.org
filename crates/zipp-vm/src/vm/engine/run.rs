@@ -157,6 +157,11 @@ console.log("module-rec:" + sum);
     }
 }
 
+/// The largest assembled `new Function` source the compile cache keeps, and
+/// how many sources it keeps (see `Vm::do_eval`).
+const FN_CTOR_CACHE_MAX_SOURCE: usize = 64 * 1024;
+const FN_CTOR_CACHE_MAX_ENTRIES: usize = 4096;
+
 impl<'p> Vm<'p> {
     /// Run the top-level function (id 0) to completion.
     pub fn run(&mut self) -> Result<Value, Thrown> {
@@ -2070,6 +2075,43 @@ impl<'p> Vm<'p> {
             self.instrument_dynamic_code_attempt(code.len())
                 .map_err(|message| Thrown(message.into()))?;
         }
+        // `new Function(...)` compiles a fresh wrapper program around a
+        // function expression and runs it for the function object, so the
+        // same parameters and body compiled, installed and retained the same
+        // code again on every call: a loop doing `new Function(src)` (a syntax
+        // check, a template engine) grew the VM without bound
+        // (f2i-com/zipp.org#53). Outside any caller context (CreateDynamic-
+        // Function is never direct, sloppy unless its body says otherwise, and
+        // global-scoped) the result depends only on the assembled source, so
+        // a repeat re-runs the installed program, which makes a fresh function
+        // object over the same code, without parsing or compiling. Main realm
+        // only; bounded in source size and entries.
+        let fn_ctor_key: Option<&[u8]> = (fn_ctor
+            && !direct
+            && !force_strict
+            && this_override.is_none()
+            && inherit_super.is_none()
+            && caller_home_obj.is_none()
+            && caller_scope.is_none()
+            && eval_scope_idx.is_none()
+            && !var_env_global
+            && self.active_realm.is_none()
+            && self.realm_global_objs.is_empty())
+        .then(|| exact_src.unwrap_or(code.as_bytes()))
+        .filter(|key| key.len() <= FN_CTOR_CACHE_MAX_SOURCE);
+        if let Some(key) = fn_ctor_key {
+            if let Some(&base_func) = self.fn_ctor_cache.get(key) {
+                return self.execute_eval_program(
+                    base_func,
+                    None,
+                    None,
+                    caller_new_target,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
         // 1. Parse: the true Script goal plus what only the call site knows
         // (caller strictness, new.target / super validity). `import`/`export`
         // are rejected by the parser itself under this goal, so the old
@@ -2205,6 +2247,30 @@ impl<'p> Vm<'p> {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
+        if let Some(key) = fn_ctor_key {
+            let (_, base_func) = self.prepare_eval_program(
+                eval_prog,
+                false,
+                None,
+                var_env_global,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            if self.fn_ctor_cache.len() < FN_CTOR_CACHE_MAX_ENTRIES {
+                self.fn_ctor_cache.insert(key.into(), base_func);
+            }
+            return self.execute_eval_program(
+                base_func,
+                None,
+                caller_chain,
+                caller_new_target,
+                None,
+                None,
+                None,
+            );
+        }
         self.run_eval_program(
             eval_prog,
             this_override,

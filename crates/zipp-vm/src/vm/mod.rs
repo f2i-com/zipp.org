@@ -1713,6 +1713,9 @@ pub struct Vm<'p> {
     /// `pending_eval_frame`). Suppresses the "anonymous" wrapper's self-name
     /// binding (constructor-binding.js).
     pending_fn_ctor_eval: bool,
+    /// `new Function` & kin, by the exact source they assembled: the installed
+    /// eval program's base function, re-run on a repeat (see `do_eval`).
+    fn_ctor_cache: rustc_hash::FxHashMap<Box<[u8]>, u32>,
     /// Host policy for a VM that may execute its already-compiled main program
     /// but must not compile or load any additional source. This is independent
     /// of instrumentation and leaves every JIT tier enabled. All runtime source

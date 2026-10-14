@@ -67,6 +67,11 @@ impl<'p> Vm<'p> {
         self.funcs[id]
     }
 
+    /// Functions installed at run time (`eval`, `new Function`, modules).
+    pub(crate) fn runtime_function_count(&self) -> usize {
+        self.eval_funcs.len()
+    }
+
     /// Give a runtime-installed function the next unified id.
     pub(crate) fn install_func(&mut self, f: &'p crate::bytecode::FuncProto) {
         debug_assert_eq!(self.funcs.len(), self.main_func_count + self.eval_funcs.len());
@@ -268,6 +273,7 @@ impl<'p> Vm<'p> {
             pending_new_target: Value::UNDEFINED,
             pending_eval_frame: false,
             pending_fn_ctor_eval: false,
+            fn_ctor_cache: rustc_hash::FxHashMap::default(),
             external_code_disabled: false,
             pending_yield: None,
             pending_yield_handlers: Vec::new(),
@@ -926,6 +932,10 @@ impl<'p> Vm<'p> {
             |n, name| n.saturating_add(name.capacity()),
         );
         n = n.saturating_add(Self::hash_map_resident_bytes(&self.main_global_index));
+        n = self.fn_ctor_cache.keys().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.fn_ctor_cache)),
+            |n, key| n.saturating_add(key.len()),
+        );
         n = self.pool_slot_names.values().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.pool_slot_names)),
             |n, name| match name {

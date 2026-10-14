@@ -824,6 +824,13 @@ impl ScriptState {
         });
     }
 
+    /// How many functions this state has compiled at run time (`eval`,
+    /// `new Function`, [`Self::eval_in_context`], modules): code it keeps until
+    /// it is dropped. A repeated `new Function` source compiles once.
+    pub fn runtime_function_count(&self) -> usize {
+        self.vm().map_or(0, |vm| vm.runtime_function_count())
+    }
+
     /// Payload-aware resident heap estimate, in bytes.
     ///
     /// This includes retained capacities for the object table, strings, arrays,
