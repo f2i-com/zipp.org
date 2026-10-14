@@ -67,6 +67,23 @@ use super::{Microtask, Resume, Vm};
 use crate::heap::{GenState, HeapObj};
 use crate::value::Value;
 
+/// `ZIPP_NO_OLD_JOBS_SKIP=1`: a minor walks every queued job again (see
+/// `Vm::mark_roots`). The two sides of a one-binary A/B.
+#[inline]
+fn old_jobs_skip_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_OLD_JOBS_SKIP").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// RAII guard that suspends collection for its scope (decrements on drop, even
 /// across `?` early returns). Held by native built-ins that keep an un-rooted
 /// `Vec<Value>` of freshly-allocated objects while re-entering the interpreter
@@ -422,7 +439,7 @@ impl Vm<'_> {
             marks[idx as usize] = true;
         }
         let free_before = self.heap.free_indices().len();
-        self.mark_roots(&mut marks, &mut stack, n);
+        self.mark_roots(&mut marks, &mut stack, n, false);
         self.gc_major_tail(n, floor, free_before, marks, stack, stats, t_start);
     }
 
@@ -434,7 +451,12 @@ impl Vm<'_> {
     /// holders and pinned built-ins are boundary nodes whose young referents
     /// the remembered set supplies (see the module doc's completeness
     /// argument).
-    fn mark_roots(&mut self, marks: &mut Vec<bool>, stack: &mut Vec<u32>, n: usize) {
+    ///
+    /// `minor`: skip the queued jobs from before the last collection
+    /// (`microtasks_old`). Everything they hold is old, so a minor would find
+    /// every one of them pre-marked; a program that queues a million jobs
+    /// paid for walking all of them at every minor.
+    fn mark_roots(&mut self, marks: &mut Vec<bool>, stack: &mut Vec<u32>, n: usize, minor: bool) {
         let floor = self.gc_floor as usize;
         // Pinned built-ins: marked AND traced (a built-in proto may hold a user
         // object, e.g. `Array.prototype.foo = userObj`).
@@ -590,7 +612,12 @@ impl Vm<'_> {
             root_val!(*v);
         }
         // B214: the queue AND the in-flight task (see `current_microtask`).
-        for mt in self.microtasks.iter().chain(self.current_microtask.iter()) {
+        let fresh = if minor && old_jobs_skip_enabled() {
+            self.microtasks_old.min(self.microtasks.len())
+        } else {
+            0
+        };
+        for mt in self.microtasks.range(fresh..).chain(self.current_microtask.iter()) {
             match mt {
                 Microtask::Reaction {
                     callback,
@@ -1069,6 +1096,9 @@ impl Vm<'_> {
         };
         gcstats::record_major(swept_floated, n);
         self.heap.note_gc_done(n - free_after);
+        // Every queued job's Values were roots of this collection and are
+        // old now.
+        self.microtasks_old = self.microtasks.len();
         if self.heap.oracle_on() {
             // B6 oracle: this collection is now "the last GC" — survivors age out.
             self.heap.oracle_next_epoch();
@@ -1113,7 +1143,7 @@ impl Vm<'_> {
             );
         }
         let mut stack: Vec<u32> = Vec::with_capacity(1024);
-        self.mark_roots(&mut marks, &mut stack, n);
+        self.mark_roots(&mut marks, &mut stack, n, true);
         let t_roots = gcstats::now(stats);
         // Dirty OLD holders: scan their edge lists — the one thing an old
         // object contributes to young liveness. `trace_edges` on a marked
@@ -1189,6 +1219,9 @@ impl Vm<'_> {
         gcstats::record_minor(swept as u64, dirty.len() as u64, n);
         gcstats::record_budget(self.heap.young_budget() as u64);
         self.heap.note_minor_done(n - free_after);
+        // Every queued job's Values were roots of this collection and are
+        // old now (survivors are promoted).
+        self.microtasks_old = self.microtasks.len();
         if self.heap.oracle_on() {
             self.heap.oracle_next_epoch();
         }
@@ -1209,7 +1242,7 @@ impl Vm<'_> {
             marks[idx as usize] = true;
         }
         let mut stack: Vec<u32> = Vec::with_capacity(1024);
-        self.mark_roots(&mut marks, &mut stack, n);
+        self.mark_roots(&mut marks, &mut stack, n, false);
         while let Some(idx) = stack.pop() {
             self.trace_edges(idx, &mut marks, &mut stack, n);
         }

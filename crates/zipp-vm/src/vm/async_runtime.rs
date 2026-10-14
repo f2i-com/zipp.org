@@ -4165,6 +4165,9 @@ impl<'p> Vm<'p> {
         // The callback of the last reaction job the window path looked at.
         let mut last_callback = 0u64;
         while let Some(t) = self.microtasks.pop_front() {
+            // The job leaves from the front: one fewer job from before the
+            // last collection, if it was one (`microtasks_old`).
+            self.microtasks_old = self.microtasks_old.saturating_sub(1);
             // B214: the popped task's Values are kept reachable by ROOTING a
             // copy in `current_microtask` (traced by mark_roots) instead of
             // suspending GC for the task's whole scope — a top-level-await

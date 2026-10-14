@@ -236,6 +236,7 @@ impl<'p> Vm<'p> {
             cap_capture: None,
             microtasks: std::collections::VecDeque::new(),
             current_microtask: None,
+            microtasks_old: 0,
             promise_resolution_roots: Vec::new(),
             unhandled_rejections: Vec::new(),
             rejecting_thrown_job: false,

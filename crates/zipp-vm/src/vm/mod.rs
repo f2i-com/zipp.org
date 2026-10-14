@@ -1763,6 +1763,13 @@ pub struct Vm<'p> {
     /// the interpreter's ordinary safepoints work inside resumed bodies.
     /// Saved/restored around nested drains.
     current_microtask: Option<Microtask>,
+    /// How many jobs at the front of `microtasks` were already queued when
+    /// the last collection finished. Every Value they hold was a root of that
+    /// collection and survived it, so it is OLD now, and a job never changes
+    /// once queued: a minor's root walk skips them (see `Vm::mark_roots`).
+    /// The end of every collection sets it to the queue's length, and each
+    /// pop from the front takes one off. Jobs only ever leave from the front.
+    microtasks_old: usize,
     /// Heap Values held only in Rust by an in-flight Promise abstract operation:
     /// fresh targets, capability functions, and transient constructor results.
     /// Executors/callbacks/`then` getters may re-enter and collect, so keep a
