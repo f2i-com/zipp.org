@@ -1950,6 +1950,15 @@ impl<'a> FnCompiler<'a> {
             let n: &str = id;
             if !matches!(n, "undefined" | "NaN" | "Infinity") {
                 if let Binding::Global(idx) = self.resolve(n) {
+                    // An active `with` object that has the name answers first,
+                    // as for a plain read (`with (o) { typeof member }`).
+                    let objs = self.with_obj_regs(n);
+                    let end_jumps = if objs.is_empty() {
+                        Vec::new()
+                    } else {
+                        let nidx = self.string_name(n);
+                        self.emit_with_get_chain(nidx, &objs, dst)
+                    };
                     // A DECLARED top-level lexical still observes its TDZ
                     // through typeof (a ReferenceError) — only a name the
                     // compiler never saw declared degrades to "undefined" via
@@ -1962,6 +1971,10 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::LoadGlobalOrUndefinedDyn { dst, idx });
                     } else {
                         self.emit(Instr::LoadGlobalOrUndefined { dst, idx });
+                    }
+                    let end = self.here();
+                    for je in end_jumps {
+                        self.patch_jump(je, end);
                     }
                     return Ok(dst);
                 }
