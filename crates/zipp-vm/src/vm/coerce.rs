@@ -3116,7 +3116,9 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::Wrapped { .. }
                 | HeapObj::Native(_)
-                | HeapObj::NativeClosure { .. } => {
+                | HeapObj::NativeClosure { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. } => {
                     out.push_str("function");
                 }
                 HeapObj::Cell => {
@@ -3223,13 +3225,10 @@ impl<'p> Vm<'p> {
                 HeapObj::Promise { .. } => {
                     out.push_str("[object Promise]");
                 }
-                HeapObj::BoundResolver { .. } => {
-                    out.push_str("function");
-                }
                 HeapObj::AsyncState(_) => {
                     out.push_str("[object Promise]");
                 }
-                HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => {
+                HeapObj::Combinator { .. } => {
                     out.push_str("[object Object]");
                 }
                 HeapObj::Date(ms) => {
@@ -3470,6 +3469,11 @@ impl<'p> Vm<'p> {
             HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                 out.push_str("[Function (native)]");
             }
+            // A promise's resolve/reject and a combinator's element functions
+            // are anonymous built-ins, as node prints them.
+            HeapObj::BoundResolver { .. } | HeapObj::CombinatorResolver { .. } => {
+                out.push_str("[Function (anonymous)]");
+            }
             HeapObj::Cell => {
                 let inner = self.heap.cell_get(idx);
                 self.inspect_value_into(out, inner, true, depth + 1);
@@ -3670,14 +3674,11 @@ impl<'p> Vm<'p> {
                     out.push_str(" }");
                 }
             },
-            HeapObj::BoundResolver { .. } => {
-                out.push_str("[Function (anonymous)]");
-            }
             // Internal: never user-visible (an async call yields its Promise).
             HeapObj::AsyncState(_) => {
                 out.push_str("Promise { <pending> }");
             }
-            HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => {
+            HeapObj::Combinator { .. } => {
                 out.push_str("[object Object]");
             }
             // node renders a Date in console.log as its ISO string (unquoted).

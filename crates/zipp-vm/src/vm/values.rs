@@ -428,6 +428,8 @@ impl<'p> Vm<'p> {
                             | HeapObj::Wrapped { .. }
                             | HeapObj::Native(_)
                             | HeapObj::NativeClosure { .. }
+                            | HeapObj::BoundResolver { .. }
+                            | HeapObj::CombinatorResolver { .. }
                     ) && self
                         .fn_props
                         .get(&idx)
@@ -482,7 +484,9 @@ impl<'p> Vm<'p> {
                             | HeapObj::Closure { .. }
                             | HeapObj::Bound { .. }
                             | HeapObj::Native(_)
-                            | HeapObj::NativeClosure { .. } => self.fn_proto,
+                            | HeapObj::NativeClosure { .. }
+                            | HeapObj::BoundResolver { .. }
+                            | HeapObj::CombinatorResolver { .. } => self.fn_proto,
                             HeapObj::Boxed { kind: 0, .. } => self.str_proto,
                             HeapObj::Boxed { kind: 1, .. } => self.num_proto,
                             HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
@@ -1492,7 +1496,9 @@ impl<'p> Vm<'p> {
                     | HeapObj::Closure { .. }
                     | HeapObj::Bound { .. }
                     | HeapObj::Native(_)
-                    | HeapObj::NativeClosure { .. } => self.fn_proto,
+                    | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. } => self.fn_proto,
                     HeapObj::Boxed { kind: 0, .. } => self.str_proto,
                     HeapObj::Boxed { kind: 1, .. } => self.num_proto,
                     HeapObj::Boxed { kind: 2, .. } => self.bool_proto,

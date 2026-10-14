@@ -391,7 +391,9 @@ impl<'p> Vm<'p> {
                     | HeapObj::Closure { .. }
                     | HeapObj::Bound { .. }
                     | HeapObj::Native(_)
-                    | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
+                    | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. } => self.fn_props.get(&h),
                     _ => self.arr_props.get(&h),
                 };
                 side.and_then(|m| m.pos(&key).map(|i| m.attr_at(i).accessor))
@@ -436,7 +438,9 @@ impl<'p> Vm<'p> {
                         | HeapObj::Closure { .. }
                         | HeapObj::Bound { .. }
                         | HeapObj::Native(_)
-                        | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
+                        | HeapObj::NativeClosure { .. }
+                        | HeapObj::BoundResolver { .. }
+                        | HeapObj::CombinatorResolver { .. } => self.fn_props.get(&h),
                         _ => self.arr_props.get(&h),
                     };
                     match side.and_then(|m| {
@@ -3158,6 +3162,8 @@ impl<'p> Vm<'p> {
                     HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
                     HeapObj::Native(_)
                     | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. }
                     | HeapObj::Bound { .. }
                     | HeapObj::Wrapped { .. } => None,
                     // A constructor global (Array, Date, Temporal.Instant, …) is stored
@@ -3792,6 +3798,8 @@ impl<'p> Vm<'p> {
                                 | HeapObj::Bound { .. }
                                 | HeapObj::Native(_)
                                 | HeapObj::NativeClosure { .. }
+                                | HeapObj::BoundResolver { .. }
+                                | HeapObj::CombinatorResolver { .. }
                         ) {
                             self.fn_props.get(&a0.heap_index())
                         } else {
@@ -4004,6 +4012,8 @@ impl<'p> Vm<'p> {
                                     | HeapObj::Wrapped { .. }
                                     | HeapObj::Native(_)
                                     | HeapObj::NativeClosure { .. }
+                                    | HeapObj::BoundResolver { .. }
+                                    | HeapObj::CombinatorResolver { .. }
                             ) {
                                 if let Some(fm) = self.fn_props.get_mut(&idx) {
                                     match id {

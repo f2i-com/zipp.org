@@ -267,7 +267,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => {
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => {
                 self.fn_props.get(&pidx).map(enum_keys).unwrap_or_default()
             }
             // A boxed String (e.g. `Object.create(O, "abc")` → ToObject) exposes its
@@ -348,7 +350,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => side(self.fn_props.get(&pidx)),
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => side(self.fn_props.get(&pidx)),
             HeapObj::Boxed { kind: 0, value } => {
                 let n = self.heap.str_units(value.heap_index()).unwrap_or(0);
                 canonical_index_str(key).is_some_and(|i| i < n) || side(self.arr_props.get(&pidx))

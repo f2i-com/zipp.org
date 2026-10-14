@@ -918,6 +918,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Wrapped { .. }
                 | HeapObj::Native(_)
                 | HeapObj::NativeClosure { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. }
                 | HeapObj::Proxy { .. }
         ) {
             let k = self.key_of(key);

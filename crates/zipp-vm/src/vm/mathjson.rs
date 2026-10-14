@@ -1704,6 +1704,8 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Native(_)
             | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. }
             | HeapObj::Symbol { .. } => return Ok(false),
             HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
                 return Err(Thrown::from_static(

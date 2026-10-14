@@ -629,7 +629,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => self
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => self
                 .fn_props
                 .get(&idx)
                 .is_some_and(|m| m.pos(key).is_some()),
@@ -2267,6 +2269,8 @@ impl<'p> Vm<'p> {
                     | HeapObj::Wrapped { .. }
                     | HeapObj::Native(_)
                     | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. }
             ) =>
             {
                 // An own property in the fn_props bag (incl. an explicitly defined

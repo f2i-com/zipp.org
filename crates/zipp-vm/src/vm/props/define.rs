@@ -659,7 +659,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => 2,
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => 2,
             HeapObj::Str(_)
             | HeapObj::Cons { .. }
             | HeapObj::Symbol { .. }

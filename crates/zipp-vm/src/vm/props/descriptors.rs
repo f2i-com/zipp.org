@@ -378,7 +378,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => {
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => {
                 // A legacy sloppy function's own `caller`/`arguments`: a LIVE
                 // value read from the stack, reported with the fixed attributes
                 // engines give them (nothing about them is writable or
@@ -857,7 +859,9 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::Wrapped { .. }
                 | HeapObj::Native(_)
-                | HeapObj::NativeClosure { .. } => {
+                | HeapObj::NativeClosure { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. } => {
                     self.fn_props
                         .get(&obj.heap_index())
                         .map_or(Vec::new(), |m| {

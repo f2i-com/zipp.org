@@ -689,6 +689,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Wrapped { .. }
                 | HeapObj::Native(_)
                 | HeapObj::NativeClosure { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. }
         ) {
             if let Some(m) = self.fn_props.get(&idx) {
                 if let Some(p) = m.pos(key) {
@@ -737,7 +739,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => {
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => {
                 self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key))
             }
             // Every other exotic heap kind (TypedArray, DataView, ArrayBuffer,
@@ -1632,6 +1636,8 @@ impl<'p> Vm<'p> {
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
             | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. }
             | HeapObj::Class(_) => None,
             _ => self
                 .arr_props
@@ -1700,7 +1706,7 @@ impl<'p> Vm<'p> {
         // function props live in fn_props, so check via has_own_property).
         || (matches!(
             self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::BoundResolver { .. } | HeapObj::CombinatorResolver { .. }
         ) && !self.has_own_property(obj, key));
         if needs_proto_walk {
             let r = self.proto_chain_set(idx, key, val, obj)?;
@@ -1779,6 +1785,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Wrapped { .. }
                 | HeapObj::Native(_)
                 | HeapObj::NativeClosure { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. }
         ) {
             // `caller`/`arguments` on a restricted function (anything but a legacy
             // sloppy ordinary one) are the inherited %ThrowTypeError% accessors —
@@ -2197,6 +2205,8 @@ impl<'p> Vm<'p> {
                     | HeapObj::Wrapped { .. }
                     | HeapObj::Native(_)
                     | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. }
                     | HeapObj::Class(_) => None,
                     _ => self
                         .arr_props
@@ -2415,7 +2425,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => self.fn_props.get(&idx).and_then(side),
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => self.fn_props.get(&idx).and_then(side),
             _ => self.arr_props.get(&idx).and_then(side),
         }
     }

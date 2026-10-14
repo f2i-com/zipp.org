@@ -538,6 +538,8 @@ impl<'p> Vm<'p> {
                     | HeapObj::Bound { .. }
                     | HeapObj::Native(_)
                     | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. }
             )
         {
             let idx = obj.heap_index();
@@ -650,7 +652,9 @@ impl<'p> Vm<'p> {
                 | HeapObj::Closure { .. }
                 | HeapObj::Bound { .. }
                 | HeapObj::Native(_)
-                | HeapObj::NativeClosure { .. } => match self.fn_props.get(&obj.heap_index()) {
+                | HeapObj::NativeClosure { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. } => match self.fn_props.get(&obj.heap_index()) {
                     Some(m) => spec_key_order(&m.keys)
                         .into_iter()
                         .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(&m.keys[i]))

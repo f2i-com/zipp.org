@@ -930,7 +930,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => self
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => self
                 .fn_props
                 .get(&obj.heap_index())
                 .and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
