@@ -5850,6 +5850,7 @@ fn local_sroa_dst(i: &Instr) -> Option<u16> {
         | Instr::NewPlannedObject { dst, .. }
         | Instr::FinalizeObject { dst, .. }
         | Instr::NewArray { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
         | Instr::Print { dst, .. } => Some(dst),
         _ => None,
     }
@@ -5879,6 +5880,9 @@ fn local_sroa_supported_instr(i: &Instr) -> bool {
             | Instr::GetProp { .. }
             | Instr::NewArray { .. }
             | Instr::GetIndex { .. }
+            // `console.log(...)` reads `console` (a global) and its method
+            // before the print.
+            | Instr::LoadGlobal { .. }
             | Instr::Print { .. }
             | Instr::ReturnUndefined
     )

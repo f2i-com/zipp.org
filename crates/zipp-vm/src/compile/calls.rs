@@ -1372,7 +1372,32 @@ impl<'a> FnCompiler<'a> {
                         && !c.args.iter().any(|a| matches!(a, Arg::Spread(_)))
                     {
                         let save = self.next_reg;
-                        let (callee, this_v) = self.capture_member_callee(m)?;
+                        if dst >= self.next_reg {
+                            self.set_next_reg(dst.saturating_add(1));
+                        }
+                        let this_v = self.alloc_reg();
+                        let receiver = self.expr_into(&m.object, this_v)?;
+                        if receiver != this_v {
+                            self.emit(Instr::Move {
+                                dst: this_v,
+                                src: receiver,
+                            });
+                        }
+                        // The method goes in the call's own result register
+                        // when that is a temporary no argument reads, so the
+                        // call takes one frame register more than the print
+                        // it replaced, not two: the local-SROA lane keeps its
+                        // scalars in the registers a function never names.
+                        let named = dst < 2
+                            || self.scopes.iter().flatten().any(|(_, r)| *r == dst)
+                            || self.self_name.as_ref().is_some_and(|(_, r)| *r == dst);
+                        let callee = if named { self.alloc_reg() } else { dst };
+                        let name = self.string_name(prop);
+                        self.emit(Instr::GetProp {
+                            dst: callee,
+                            obj: this_v,
+                            name,
+                        });
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                         self.emit(Instr::Print {
                             dst,
