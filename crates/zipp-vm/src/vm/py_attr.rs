@@ -610,7 +610,7 @@ impl<'p> Vm<'p> {
     pub(super) fn py_attr_get(&mut self, func_id: u32, ip: usize, o: Value, key: u32, call: &mut Option<PyAccessor>) -> Option<Value> {
         let (cls, dict) = self.py_inst_parts(o)?;
         let ty = self.py_rt.as_deref()?.ty?;
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
         if cls.bits() == e.a && cls.is_heap() {
             match e.kind {
                 // The instance's layout puts the name at `pos`.
@@ -745,7 +745,7 @@ impl<'p> Vm<'p> {
             return Ok(false);
         }
         let di = dict.heap_index();
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
         // Layout mode: a value replaced at its slot, or appended.
         if cls.bits() == e.a && cls.is_heap() {
             match e.kind {
@@ -1012,7 +1012,7 @@ impl<'p> Vm<'p> {
         if !cls.is_heap() {
             return None;
         }
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
         if e.a == cls.bits() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
             if e.kind == ic::METHOD {
                 if let Some(f) = self.py_table_at(cls, ty.gm, e.b, e.pos) {
@@ -1119,7 +1119,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let ty = self.py_rt.as_deref()?.ty?;
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
         if self.py_not_plain(&e, cls, ty.ga) {
             return None;
         }
@@ -1166,6 +1166,7 @@ impl<'p> Vm<'p> {
         }
         let ty = self.py_rt.as_deref()?.ty?;
         let (fn_slot, fn_key, plain_slot, plain_key) = if set { (ty.sp, "sp", ty.sa, "sa") } else { (ty.gp, "gp", ty.ga, "ga") };
+        self.py_ic_class(func_id, ip, cls.bits());
         if let Some(e) = self.py_cls_ic(func_id, ip, ic::ATTR_FN, cls) {
             if let Some(f) = self.py_table_at(cls, fn_slot, e.b, e.pos) {
                 if self.py_plain_rec(f) {
@@ -1237,7 +1238,7 @@ impl<'p> Vm<'p> {
         // class, a factory function, a class with `__new__`, or one not
         // constructed yet, whose entry the runtime writes on its first
         // construction), with the same entry still there: declined at once.
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
         // The class this site constructed last, its keys as they were then:
         // its entries read at the slots found then (`py_new_hit`).
         if e.kind == ic::NEW && e.a == cls.bits() && self.heap.version_of(ci) == e.hver && py_new_hits_enabled() {
