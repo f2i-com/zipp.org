@@ -39,7 +39,7 @@ step("fib as reaction", function () {
 step("deep recursion", function () {
   var p = Promise.resolve(0);
   for (var i = 0; i < 300; i++) p = p.then(function (k) { return function () { return k; }; }(i)).then(addOne);
-  return p.then(function () { return Promise.resolve(5000).then(down); }).then(function (v) { L("down " + v); });
+  return p.then(function () { return Promise.resolve(3000).then(down); }).then(function (v) { L("down " + v); });
 });
 step("this is undefined", function () {
   return Promise.resolve(1).then(thisOf).then(function (v) { L("this " + v); });

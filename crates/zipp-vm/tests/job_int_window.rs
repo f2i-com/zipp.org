@@ -3,9 +3,10 @@
 //! now runs it frame-free there too (engine/run.rs): such a body calls no
 //! helper but its own self-call, which pushes the frames it needs. These
 //! chains drive that path through a hot chain, a bail past the entry (an int
-//! overflow to a double, a division), self-recursion (`fib`, and `down` deep
-//! enough to leave the native depth), a strict callback's `this`, a rejection
-//! handler and a mix of callbacks. Node 24.19.0's output, with the path on,
+//! overflow to a double, a division), self-recursion (`fib`, and `down` 3,000
+//! deep: past the native depth, within the checked profile's 4,096 frames), a
+//! strict callback's `this`, a rejection handler and a mix of callbacks.
+//! Node 24.19.0's output, with the path on,
 //! off (ZIPP_NO_JOB_INT_WINDOW=1), under ZIPP_GC_STRESS=1, ZIPP_NOJIT=1 and
 //! ZIPP_JIT_THRESHOLD=1.
 
@@ -15,7 +16,7 @@ const EXPECTED: &str = "-- chain\nchain 5000\n\
 -- overflow to double\ndbl 1099511627776\n\
 -- division bail\nhalf 0.03125\n\
 -- fib as reaction\nfib sum 164175\n\
--- deep recursion\ndown 5000\n\
+-- deep recursion\ndown 3000\n\
 -- this is undefined\nthis undefined\n\
 -- rejection callback\nrejected+1 11\n\
 -- mixed callbacks\nmixed 1340";
