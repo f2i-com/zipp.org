@@ -25,6 +25,26 @@ fn callvalue_flat_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_JOB_INT_WINDOW=1` makes `call_compiled_windowed` decline whenever
+/// the frame stack is empty, as it did for every body: a promise reaction's
+/// int-tier callback then takes a frame of its own again. The two sides of a
+/// one-binary A/B.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn job_int_window_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_JOB_INT_WINDOW").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 mod tier_a_module_pin_tests {
     use super::*;
@@ -1127,13 +1147,6 @@ impl<'p> Vm<'p> {
         closure: u32,
     ) -> Option<Result<Value, Thrown>> {
         if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
-            // A frame-free activation always has a frame under it: the
-            // compiled caller's, or the frame of the code that called the
-            // builtin. The helpers a native body calls rely on that (a frame
-            // call records the caller's resume point in the top frame). A job
-            // or a timer callback the host runs has none, and takes a frame
-            // of its own.
-            || self.frames.is_empty()
             || !self.jit_fused_ok()
             || self.jit_recurse_depth != 0
             || !self.pending_new_target.is_undefined()
@@ -1146,10 +1159,23 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
+        // A frame-free activation always has a frame under it: the compiled
+        // caller's, or the frame of the code that called the builtin. The
+        // helpers a Tier C body calls rely on that (a frame call records the
+        // caller's resume point in the top frame). A job or a timer callback
+        // the host runs has none, and takes a frame of its own. An int-tier
+        // body calls no helper but its own self-call, which pushes the frames
+        // it needs (`jit_self_call_impl`, `jit_self_call_at_impl`), so the
+        // host's jobs run it frame-free too: a promise reaction's callback.
+        let frameless = self.frames.is_empty();
+        if frameless && !job_int_window_enabled() {
+            return None;
+        }
         // A Tier C body's frame-free entry, run under an activation; or an
         // int-tier body, which needs neither a frame nor an activation and
         // only its self-binding rechecked (`try_run_jit`).
         let (entry, activate) = match self.jit.cross_entry(fid) {
+            Some(_) if frameless => return None,
             Some((entry, _, _, _)) => (entry, true),
             None => {
                 let body = self.jit.get(fid).filter(|body| body.int_tier())?;
