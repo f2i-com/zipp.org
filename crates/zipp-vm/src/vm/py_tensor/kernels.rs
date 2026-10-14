@@ -69,6 +69,12 @@ const OP_Q_FAKE: u32 = 29;
 const OP_ARANGE: u32 = 30;
 const OP_OPTIM: u32 = 31;
 const OP_CELL: u32 = 32;
+const OP_RNG: u32 = 33;
+const OP_MATMUL_TN: u32 = 35;
+/// (`OP_MATMUL` / `OP_MATMUL_NT` for `py_tensor`'s OP_MM_FAST)
+pub(super) const OP_MATMUL_PUB: u32 = OP_MATMUL;
+pub(super) const OP_MATMUL_NT_PUB: u32 = OP_MATMUL_NT;
+pub(super) const OP_MATMUL_TN_PUB: u32 = OP_MATMUL_TN;
 
 /// `x` as a store into an element of `kind` leaves it: the typed-array
 /// conversion (`helpers_numeric::ta_encode`), read back.
@@ -213,6 +219,7 @@ fn binary_fn(op: u32) -> Option<fn(f64, f64) -> f64> {
         17 => |x: f64, y: f64| math_unary(M::Floor, x / y),
         18 => |x: f64, y: f64| x - math_unary(M::Floor, x / y) * y,
         19 => |x: f64, y: f64| x.atan2(y),
+        20 => |g: f64, o: f64| if o <= 0.0 { 0.0 } else { g },
         _ => return None,
     })
 }
@@ -331,6 +338,80 @@ fn le64(c: &[u8]) -> f64 {
     f64::from_le_bytes(<[u8; 8]>::try_from(c).unwrap_or([0; 8]))
 }
 
+/// binaryFast's layouts over float32/float64 bytes (`py_tensor`'s
+/// OP_BIN_FAST) for arithmetic op `code` (1-4: add, sub, mul, div): mode 0
+/// `a` and `b` of one length, 1 `b` one element, 2 `a` one element, 3 `b` a
+/// bias tiled over `a` (`brow` bytes a row), 4 `a` a bias tiled over `b`
+/// (`arow` bytes a row); each element computed and stored as `bytes_map2`
+/// does.
+pub(super) fn arith_modes(kind: u8, code: u8, mode: u8, a: &[u8], b: &[u8], out: &mut [u8], brow: usize, arow: usize) {
+    match mode {
+        1 => arith_map2(kind, code, a, b, out, true, false),
+        2 => arith_map2(kind, code, b, a, out, true, true),
+        _ => {
+            // Row by row (mode 0: one row), the tiled operand whole.
+            let row = match mode {
+                3 => brow,
+                4 => arow,
+                _ => out.len(),
+            };
+            if row == 0 {
+                return;
+            }
+            for (r, o) in out.chunks_exact_mut(row).enumerate() {
+                let span = r * row..(r + 1) * row;
+                let x = if mode == 4 { Some(a) } else { a.get(span.clone()) };
+                let y = if mode == 3 { Some(b) } else { b.get(span) };
+                if let (Some(x), Some(y)) = (x, y) {
+                    arith_map2(kind, code, x, y, o, false, false);
+                }
+            }
+        }
+    }
+}
+
+/// `a op y`, or `y op a` when `flip`, over float32/float64 bytes for
+/// arithmetic op `code`, `y` a value of that kind (`py_tensor`'s
+/// OP_BIN_SCALAR_FAST).
+pub(super) fn arith_scalar(kind: u8, code: u8, a: &[u8], y: f64, flip: bool, out: &mut [u8]) {
+    let yb = if kind == KIND_F32 { (y as f32).to_le_bytes().to_vec() } else { y.to_le_bytes().to_vec() };
+    arith_map2(kind, code, a, &yb, out, true, flip);
+}
+
+/// The four arithmetic ops as functions, one type each.
+fn op_add(x: f64, y: f64) -> f64 {
+    x + y
+}
+
+fn op_sub(x: f64, y: f64) -> f64 {
+    x - y
+}
+
+fn op_mul(x: f64, y: f64) -> f64 {
+    x * y
+}
+
+fn op_div(x: f64, y: f64) -> f64 {
+    x / y
+}
+
+/// `bytes_map2` for arithmetic op `code` (1-4: add, sub, mul, div): every
+/// caller (`pt_binary`, `arith_modes`, `arith_scalar`) shares one copy of
+/// each op's loops.
+fn arith_map2(kind: u8, code: u8, a: &[u8], b: &[u8], out: &mut [u8], b_one: bool, flip: bool) {
+    match code {
+        1 => arith_loops(kind, a, b, out, b_one, flip, op_add),
+        2 => arith_loops(kind, a, b, out, b_one, flip, op_sub),
+        3 => arith_loops(kind, a, b, out, b_one, flip, op_mul),
+        _ => arith_loops(kind, a, b, out, b_one, flip, op_div),
+    }
+}
+
+#[inline(never)]
+fn arith_loops<F: Fn(f64, f64) -> f64>(kind: u8, a: &[u8], b: &[u8], out: &mut [u8], b_one: bool, flip: bool, f: F) {
+    bytes_map2(kind, a, b, out, b_one, flip, f);
+}
+
 /// `out[i] = f(a[i], b[i])` over float32 (`kind` KIND_F32) or float64
 /// little-endian bytes, each element read as its f64 value and the result
 /// stored as `pt_write` stores it: the f64 loop over `pt_read` and
@@ -394,6 +475,251 @@ fn zeroed_bytes(n: usize) -> Option<Vec<u8>> {
     v.try_reserve_exact(n).ok()?;
     v.resize(n, 0);
     Some(v)
+}
+
+// ---- random draws: tensor.js's MT19937 and PyTorch's CPU transforms --------------------
+
+/// 2**-24: a 24-bit uniform's scale.
+const F24: f64 = 1.0 / 16_777_216.0;
+
+/// tensor.js's generator state: 624 words and the position of the next.
+struct Mt {
+    w: [u32; 624],
+    i: usize,
+}
+
+impl Mt {
+    /// `mtTwist`: the 624 words regenerated in place, in order.
+    fn twist(&mut self) {
+        let m = &mut self.w;
+        for k in 0..624 {
+            let y = (m[k] & 0x8000_0000) | (m[(k + 1) % 624] & 0x7fff_ffff);
+            m[k] = m[(k + 397) % 624] ^ (y >> 1) ^ if y & 1 != 0 { 0x9908_b0df } else { 0 };
+        }
+        self.i = 0;
+    }
+
+    /// `next32`: the next tempered word.
+    fn next(&mut self) -> u32 {
+        if self.i >= 624 {
+            self.twist();
+        }
+        let mut y = self.w[self.i];
+        self.i += 1;
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c_5680;
+        y ^= (y << 15) & 0xefc6_0000;
+        y ^ (y >> 18)
+    }
+
+    /// `nextDouble`: 53 bits, the first word high.
+    fn next_double(&mut self) -> f64 {
+        let (hi, lo) = (self.next(), self.next());
+        ((hi & 0x1f_ffff) as f64 * 4_294_967_296.0 + lo as f64) / 9_007_199_254_740_992.0
+    }
+}
+
+// avx_mathfun's float32 constants, rounded from their double values as
+// tensor.js's `AVX` table rounds them (`Math.fround`).
+const AVX_SQRTHF: f32 = 0.707_106_781_186_547_524_f64 as f32;
+const AVX_MIN_NORM: f32 = 1.175_494_35e-38_f64 as f32;
+const AVX_P: [f32; 9] = [
+    7.037_683_629_2e-2_f64 as f32,
+    -1.151_461_031_0e-1_f64 as f32,
+    1.167_699_874_0e-1_f64 as f32,
+    -1.242_014_084_6e-1_f64 as f32,
+    1.424_932_278_7e-1_f64 as f32,
+    -1.666_805_766_5e-1_f64 as f32,
+    2.000_071_476_5e-1_f64 as f32,
+    -2.499_999_399_3e-1_f64 as f32,
+    3.333_333_117_4e-1_f64 as f32,
+];
+const AVX_Q1: f32 = -2.121_944_40e-4_f64 as f32;
+const AVX_Q2: f32 = 0.693_359_375_f64 as f32;
+const AVX_DP1: f32 = -0.785_156_25_f64 as f32;
+const AVX_DP2: f32 = -2.418_756_484_985_351_562_5e-4_f64 as f32;
+const AVX_DP3: f32 = -3.774_894_977_445_941_08e-8_f64 as f32;
+const AVX_S0: f32 = -1.951_529_589_1e-4_f64 as f32;
+const AVX_S1: f32 = 8.332_160_873_6e-3_f64 as f32;
+const AVX_S2: f32 = -1.666_665_461_1e-1_f64 as f32;
+const AVX_C0: f32 = 2.443_315_711_809_948e-5_f64 as f32;
+const AVX_C1: f32 = -1.388_731_625_493_765e-3_f64 as f32;
+const AVX_C2: f32 = 4.166_664_568_298_827e-2_f64 as f32;
+const AVX_FOPI: f32 = 1.273_239_544_735_16_f64 as f32;
+const AVX_TWO_PI: f32 = (2.0 * std::f64::consts::PI) as f32;
+
+/// tensor.js's `avxLog`: log256_ps for one positive float32 lane. Each
+/// float32 operation rounds as the JavaScript's `Math.fround` after the
+/// same double operation does.
+fn avx_log(x: f32) -> f32 {
+    let x = if x < AVX_MIN_NORM { AVX_MIN_NORM } else { x };
+    let u = x.to_bits();
+    let e0 = (u >> 23) as i32 - 0x7f;
+    let mut v = f32::from_bits((u & 0x807f_ffff) | 0x3f00_0000);
+    let mut e = e0 as f32 + 1.0;
+    let below = v < AVX_SQRTHF;
+    let tmp = if below { v } else { 0.0 };
+    v -= 1.0;
+    e -= if below { 1.0 } else { 0.0 };
+    v += tmp;
+    let z = v * v;
+    let mut y = AVX_P[0];
+    for p in &AVX_P[1..] {
+        y *= v;
+        y += *p;
+    }
+    y *= v;
+    y *= z;
+    y += e * AVX_Q1;
+    y -= z * 0.5;
+    v += y;
+    v + e * AVX_Q2
+}
+
+/// tensor.js's `avxSincos`: sincos256_ps for one float32 lane, (sin, cos).
+fn avx_sincos(x: f32) -> (f32, f32) {
+    let mut neg_sin = x < 0.0;
+    let mut x = x.abs();
+    let mut j = (x * AVX_FOPI).trunc() as i32;
+    j = (j + 1) & !1;
+    let y = j as f32;
+    let (swap_sin, first_poly) = (j & 4 != 0, j & 2 == 0);
+    x += y * AVX_DP1;
+    x += y * AVX_DP2;
+    x += y * AVX_DP3;
+    let neg_cos = !(j - 2) & 4 != 0;
+    neg_sin = neg_sin != swap_sin;
+    let z = x * x;
+    let mut yc = AVX_C0 * z;
+    yc += AVX_C1;
+    yc *= z;
+    yc += AVX_C2;
+    yc *= z;
+    yc *= z;
+    yc -= z * 0.5;
+    yc += 1.0;
+    let mut ys = AVX_S0 * z;
+    ys += AVX_S1;
+    ys *= z;
+    ys += AVX_S2;
+    ys *= z;
+    ys *= x;
+    ys += x;
+    let (sin2, sin1) = if first_poly { (ys, 0.0) } else { (0.0, yc) };
+    let s = sin1 + sin2;
+    let c = (yc - sin1) + (ys - sin2);
+    (if neg_sin { -s } else { s }, if neg_cos { -c } else { c })
+}
+
+/// tensor.js's `fmaF`: `a * b + c` for float32 values, rounded to float32
+/// once (the exact product in a double; the sum's rounding error decides a
+/// half-way case).
+fn fma_f(a: f64, b: f64, c: f64) -> f64 {
+    let fr = |x: f64| x as f32 as f64;
+    let (p, t) = (a * b, a * b + c);
+    let r = fr(t);
+    let d = t - r;
+    if d == 0.0 {
+        return r;
+    }
+    let other = r + 2.0 * d;
+    if fr(other) != other {
+        return r;
+    }
+    let bb = t - p;
+    let e = (p - (t - bb)) + (c - bb);
+    if e == 0.0 || (e > 0.0) != (d > 0.0) {
+        r
+    } else {
+        other
+    }
+}
+
+/// tensor.js's `avxBlock`: 16 float32 uniforms (as doubles) to normals.
+fn avx_block(d: &mut [f64], mean: f32, std: f32) {
+    for j in 0..8 {
+        let u1 = (1.0 - d[j]) as f32;
+        let u2 = d[j + 8] as f32;
+        let radius = (-2.0 * avx_log(u1)).sqrt();
+        let (s, c) = avx_sincos(AVX_TWO_PI * u2);
+        let (n1, n2) = (radius * c, radius * s);
+        d[j] = fma_f(n1 as f64, std as f64, mean as f64);
+        d[j + 8] = fma_f(n2 as f64, std as f64, mean as f64);
+    }
+}
+
+/// tensor.js's `normalBlock` for float64 (no rounding between operations).
+fn normal_block64(d: &mut [f64], mean: f64, std: f64) {
+    for j in 0..8 {
+        let (u1, u2) = (1.0 - d[j], d[j + 8]);
+        let radius = (-2.0 * math_unary(M::Log, u1)).sqrt();
+        let theta = 2.0 * std::f64::consts::PI * u2;
+        d[j] = radius * math_unary(M::Cos, theta) * std + mean;
+        d[j + 8] = radius * math_unary(M::Sin, theta) * std + mean;
+    }
+}
+
+/// `pt_optim`'s options: the flags, which state it uses, and the scalars.
+struct OptimState {
+    flags: usize,
+    use_m: bool,
+    use_w: bool,
+    first: bool,
+    s: [f64; 8],
+}
+
+/// `pt_optim`'s element loop (tensor.js's `optimStep`), every operation in
+/// its order, `q` rounding where a store into the parameter's kind rounds.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn optim_loop(q: impl Fn(f64) -> f64, st: &OptimState, adam: bool, p: &mut [f64], g: &[f64], m: &[f64], v: &[f64], w: &[f64], m2: &mut [f64], v2: &mut [f64], w2: &mut [f64]) {
+    let (flags, s) = (st.flags, st.s);
+    let neg = flags & 1 != 0;
+    let n = p.len();
+    if !adam {
+        let (lr, mom, damp1, wd) = (s[0], s[1], s[2], s[3]);
+        let (decay, nest) = (flags & 2 != 0, flags & 16 != 0);
+        for i in 0..n {
+            let pv = p[i];
+            let mut gv = if neg { -g[i] } else { g[i] };
+            if decay {
+                gv = q(gv + q(pv * wd));
+            }
+            if st.use_m {
+                // (the first step's buffer is the gradient's clone)
+                let b = if st.first { gv } else { q(q(m[i] * mom) + q(gv * damp1)) };
+                m2[i] = b;
+                gv = if nest { q(gv + q(b * mom)) } else { b };
+            }
+            p[i] = pv - q(gv * lr);
+        }
+    } else {
+        let (b1, ob1, b2, ob2, bc2, eps, ss, wd) = (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+        let decay = flags & 2 != 0;
+        let (coupled, decoupled) = (decay && flags & 4 == 0, decay && flags & 4 != 0);
+        for i in 0..n {
+            let pv = p[i];
+            let mut gv = if neg { -g[i] } else { g[i] };
+            let mut value = pv;
+            if coupled {
+                gv = q(gv + q(pv * wd));
+            } else if decoupled {
+                value = q(pv * wd);
+            }
+            let mv = q(q(m[i] * b1) + q(gv * ob1));
+            let vq = q(q(v[i] * b2) + q(q(gv * gv) * ob2));
+            m2[i] = mv;
+            v2[i] = vq;
+            let mut d = vq;
+            if st.use_w {
+                let wv = w[i];
+                d = if wv.is_nan() || vq.is_nan() { f64::NAN } else { js_max(wv, vq) };
+                w2[i] = d;
+            }
+            // (Math.sqrt is the correctly rounded square root, `M::Sqrt`)
+            p[i] = value - q(q(mv / q(q(q(d.sqrt()) / bc2) + eps)) * ss);
+        }
+    }
 }
 
 /// A zeroed `Vec` of `n`, or `None` when it cannot be allocated.
@@ -492,8 +818,9 @@ fn walk<const N: usize>(
 /// declines.
 pub(crate) fn run<H: Host + ?Sized>(h: &mut H, op: u32, a: &[Arg]) -> Outcome {
 match op {
-        OP_MATMUL => Outcome::ran(h.pt_matmul(a, false).is_some()),
-        OP_MATMUL_NT => Outcome::ran(h.pt_matmul(a, true).is_some()),
+        OP_MATMUL => Outcome::ran(h.pt_matmul(a, false, false).is_some()),
+        OP_MATMUL_NT => Outcome::ran(h.pt_matmul(a, false, true).is_some()),
+        OP_MATMUL_TN => Outcome::ran(h.pt_matmul(a, true, false).is_some()),
         OP_MAX_POOL2D => Outcome::ran(h.pt_max_pool2d(a, false).is_some()),
         OP_MAX_POOL2D_BACKWARD => Outcome::ran(h.pt_max_pool2d(a, true).is_some()),
         OP_CONV2D => Outcome::ran(h.pt_conv2d(a, false).is_some()),
@@ -527,6 +854,8 @@ match op {
         OP_ARANGE => Outcome::ran(h.pt_arange(a).is_some()),
         OP_OPTIM => Outcome::ran(h.pt_optim(a).is_some()),
         OP_CELL => Outcome::ran(h.pt_cell(a).is_some()),
+        OP_RNG => Outcome::ran(h.pt_rng(a).is_some()),
+        OP_LOCAL => Outcome::Answer(true),
         _ => Outcome::Declined,
 }
 }
@@ -668,9 +997,10 @@ pub(crate) trait Kernels: Host {
     /// `(A, B, O, aOff, bOff, oOff, m, k, n)`: one [m,k] @ [k,n] product of a
     /// batch, tensor.js's `matmul` loop: i-k-j order over one f64 row, each
     /// output rounded once on store. `trans_b`: B is stored as its [n,k]
-    /// transpose (the `transB` loop); element (i, j) still sums its k
-    /// products in p order from 0 in an f64, so it is the same value.
-    fn pt_matmul(&mut self, a: &[Arg], trans_b: bool) -> Option<()> {
+    /// transpose (the `transB` loop); `trans_a`: A as its [k,m] transpose
+    /// (`transA`). Element (i, j) still sums its k products in p order from
+    /// 0 in an f64, so it is the same value.
+    fn pt_matmul(&mut self, a: &[Arg], trans_a: bool, trans_b: bool) -> Option<()> {
         let (va, vb, vo) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?);
         if vo.buffer == va.buffer || vo.buffer == vb.buffer {
             return None;
@@ -679,8 +1009,24 @@ pub(crate) trait Kernels: Host {
         let (m, k, n) = (int_arg(a, 6)?, int_arg(a, 7)?, int_arg(a, 8)?);
         let (mk, kn, mn) = (m.checked_mul(k)?, k.checked_mul(n)?, m.checked_mul(n)?);
         // (the transposed operand's [k, n] copy is working memory too)
-        let cost = self.pt_admit(mn.checked_mul(k)?.checked_add(mn)?, mk.saturating_add(kn).saturating_add(mn).saturating_add(if trans_b { kn } else { 0 }))?;
+        let cost = self.pt_admit(
+            mn.checked_mul(k)?.checked_add(mn)?,
+            mk.saturating_add(kn).saturating_add(mn).saturating_add(if trans_b { kn } else { 0 }).saturating_add(if trans_a { mk } else { 0 }),
+        )?;
         let av = self.pt_read(va, ao, mk)?;
+        // A as [m, k] rows either way (the transposed operand's [k, m] rows
+        // laid out once, as B's below).
+        let av = if trans_a {
+            let mut t = zeroed(mk)?;
+            for p in 0..k {
+                for i in 0..m {
+                    t[i * k + p] = av[p * m + i];
+                }
+            }
+            t
+        } else {
+            av
+        };
         let bv = self.pt_read(vb, bo, kn)?;
         // B as [k, n] rows either way: the transposed operand's [n, k] rows
         // laid out once, so both forms run the same loops below (element
@@ -1046,13 +1392,7 @@ pub(crate) trait Kernels: Host {
                 let mut out = zeroed_bytes(n.checked_mul(vo.size())?)?;
                 {
                     let (x, y) = if flip { (self.pt_bytes(vb)?, self.pt_bytes(va)?) } else { (self.pt_bytes(va)?, self.pt_bytes(vb)?) };
-                    let kd = vo.kind;
-                    match op {
-                        1 => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p + q),
-                        2 => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p - q),
-                        3 => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p * q),
-                        _ => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p / q),
-                    }
+                    arith_map2(vo.kind, op as u8, x, y, &mut out, one, flip);
                 }
                 self.pt_write_bytes(vo, &out)?;
                 self.pt_charge(cost);
@@ -1174,51 +1514,13 @@ pub(crate) trait Kernels: Host {
         };
         let (m, v, w) = (read(vm)?, read(vv)?, read(vw)?);
         let (mut m2, mut v2, mut w2) = (zeroed(if use_m { n } else { 0 })?, zeroed(if adam { n } else { 0 })?, zeroed(if use_w { n } else { 0 })?);
-        let kd = vp.kind;
-        let q = |x: f64| stored(kd, x);
-        let neg = flags & 1 != 0;
-        if !adam {
-            let (lr, mom, damp1, wd) = (s[0], s[1], s[2], s[3]);
-            let (decay, nest) = (flags & 2 != 0, flags & 16 != 0);
-            for i in 0..n {
-                let pv = p[i];
-                let mut gv = if neg { -g[i] } else { g[i] };
-                if decay {
-                    gv = q(gv + q(pv * wd));
-                }
-                if use_m {
-                    // (the first step's buffer is the gradient's clone)
-                    let b = if first { gv } else { q(q(m[i] * mom) + q(gv * damp1)) };
-                    m2[i] = b;
-                    gv = if nest { q(gv + q(b * mom)) } else { b };
-                }
-                p[i] = pv - q(gv * lr);
-            }
+        // The update's loop for the parameter's kind: `q` rounds as a store
+        // into it does (`stored`), chosen once so the loop inlines it.
+        let st = OptimState { flags, use_m, use_w, first, s };
+        if vp.kind == KIND_F32 {
+            optim_loop(|x: f64| x as f32 as f64, &st, adam, &mut p, &g, &m, &v, &w, &mut m2, &mut v2, &mut w2);
         } else {
-            let (b1, ob1, b2, ob2, bc2, eps, ss, wd) = (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
-            let decay = flags & 2 != 0;
-            let (coupled, decoupled) = (decay && flags & 4 == 0, decay && flags & 4 != 0);
-            for i in 0..n {
-                let pv = p[i];
-                let mut gv = if neg { -g[i] } else { g[i] };
-                let mut value = pv;
-                if coupled {
-                    gv = q(gv + q(pv * wd));
-                } else if decoupled {
-                    value = q(pv * wd);
-                }
-                let mv = q(q(m[i] * b1) + q(gv * ob1));
-                let vq = q(q(v[i] * b2) + q(q(gv * gv) * ob2));
-                m2[i] = mv;
-                v2[i] = vq;
-                let mut d = vq;
-                if use_w {
-                    let wv = w[i];
-                    d = if wv.is_nan() || vq.is_nan() { f64::NAN } else { js_max(wv, vq) };
-                    w2[i] = d;
-                }
-                p[i] = value - q(q(mv / q(q(q(math_unary(M::Sqrt, d)) / bc2) + eps)) * ss);
-            }
+            optim_loop(|x: f64| x, &st, adam, &mut p, &g, &m, &v, &w, &mut m2, &mut v2, &mut w2);
         }
         self.pt_write(vp, 0, &p)?;
         for (view, vals) in [(vm2, &m2), (vv2, &v2), (vw2, &w2)] {
@@ -1376,6 +1678,99 @@ pub(crate) trait Kernels: Host {
                 self.pt_write(*view, 0, vals)?;
             }
         }
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(mode, MT, POS, O, mean, std)`: tensor.js's MT19937 draws into `O`,
+    /// word for word and value for value: `MT` the generator's 624 state
+    /// words (a Uint8Array over them), `POS` a one-element Float64Array
+    /// holding its position (0..=624); both are advanced in place.
+    /// - 0 `rand` float32: `(w & 0xffffff) * 2**-24` per word.
+    /// - 1 `randDouble`: `nextDouble`, 53 bits from two words.
+    /// - 2 `randn` float32, 16 or more: the AVX2 blocks (`avxBlock`).
+    /// - 3 `randn` float64, 16 or more: `normalBlock` in double.
+    /// - 4 `uniform` float32 from `a` to `b` (PyTorch's float arithmetic,
+    ///   the bounds rounded to float32); 5 `uniform` float64.
+    fn pt_rng(&mut self, a: &[Arg]) -> Option<()> {
+        let mode = int_arg(a, 0)?;
+        let (vm, vp, vo) = (self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?, self.pt_view(arg(a, 3))?);
+        let (mean, std) = (num_arg(a, 4)?, num_arg(a, 5)?);
+        let n = vo.len;
+        let want = match mode {
+            0 | 2 | 4 => KIND_F32,
+            1 | 3 | 5 => KIND_F64,
+            _ => return None,
+        };
+        if vm.kind != KIND_U8 || vm.len != 624 * 4 || vp.kind != KIND_F64 || vp.len != 1 || vo.kind != want || ((mode == 2 || mode == 3) && n < 16) {
+            return None;
+        }
+        if vm.buffer == vp.buffer || vm.buffer == vo.buffer || vp.buffer == vo.buffer {
+            return None;
+        }
+        let pos = self.pt_read(vp, 0, 1)?[0];
+        if !(0.0..=624.0).contains(&pos) || pos.fract() != 0.0 {
+            return None;
+        }
+        let normal = mode == 2 || mode == 3;
+        let cost = self.pt_admit(n.saturating_mul(if normal { 16 } else { 2 }), n.saturating_add(624))?;
+        let mut mt = Mt { w: [0u32; 624], i: pos as usize };
+        {
+            let bytes = self.bytes(vm.buffer)?.get(vm.offset..vm.offset.checked_add(624 * 4)?)?;
+            for (w, c) in mt.w.iter_mut().zip(bytes.chunks_exact(4)) {
+                *w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        let mut d = zeroed(n)?;
+        match mode {
+            0 => d.iter_mut().for_each(|x| *x = (mt.next() & 0xffffff) as f64 * F24),
+            1 => d.iter_mut().for_each(|x| *x = mt.next_double()),
+            4 => {
+                let (lo, hi) = (mean as f32, std as f32);
+                let dd = hi - lo;
+                d.iter_mut().for_each(|x| *x = ((((mt.next() & 0xffffff) as f64 * F24) as f32 * dd) + lo) as f64);
+            }
+            5 => {
+                let dd = std - mean;
+                d.iter_mut().for_each(|x| *x = mt.next_double() * dd + mean);
+            }
+            2 => {
+                let (mn, sd) = (mean as f32, std as f32);
+                d.iter_mut().for_each(|x| *x = (mt.next() & 0xffffff) as f64 * F24);
+                let mut b = 0;
+                while b + 16 <= n {
+                    avx_block(&mut d[b..b + 16], mn, sd);
+                    b += 16;
+                }
+                if n % 16 != 0 {
+                    let tail = &mut d[n - 16..];
+                    tail.iter_mut().for_each(|x| *x = (mt.next() & 0xffffff) as f64 * F24);
+                    avx_block(tail, mn, sd);
+                }
+            }
+            3 => {
+                d.iter_mut().for_each(|x| *x = mt.next_double());
+                let mut b = 0;
+                while b + 16 <= n {
+                    normal_block64(&mut d[b..b + 16], mean, std);
+                    b += 16;
+                }
+                if n % 16 != 0 {
+                    let tail = &mut d[n - 16..];
+                    tail.iter_mut().for_each(|x| *x = mt.next_double());
+                    normal_block64(tail, mean, std);
+                }
+            }
+            _ => return None,
+        }
+        self.pt_write(vo, 0, &d)?;
+        {
+            let bytes = self.bytes_mut(vm.buffer)?.get_mut(vm.offset..vm.offset + 624 * 4)?;
+            for (w, c) in mt.w.iter().zip(bytes.chunks_exact_mut(4)) {
+                c.copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        self.pt_write(vp, 0, &[mt.i as f64])?;
         self.pt_charge(cost);
         Some(())
     }

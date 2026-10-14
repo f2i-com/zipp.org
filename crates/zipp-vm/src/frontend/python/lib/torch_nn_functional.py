@@ -18,13 +18,30 @@ _inf = float("inf")
 
 # ---- argument helpers ----------------------------------------------------------------------
 def _ntuple(value, n, name="argument"):
+    # (built without generator expressions, which cost several
+    # microseconds each on this runtime: a module constructor calls this
+    # for each of its sizes)
     if (isinstance(value, tuple) or isinstance(value, list)):
         if len(value) == 1 and n > 1:
-            return tuple(int(value[0]) for _ in range(n))
+            return _repeat(value[0], n)
         if len(value) != n:
             raise ValueError("%s must be an int or a tuple of %d ints, got %r" % (name, n, value))
-        return tuple(int(v) for v in value)
-    return tuple(int(value) for _ in range(n))
+        return tuple([int(v) for v in value])
+    return _repeat(value, n)
+
+
+def _repeat(value, n):
+    # `tuple(int(value) for _ in range(n))`
+    if n == 2:
+        return (int(value), int(value))
+    if n == 1:
+        return (int(value),)
+    if n == 3:
+        return (int(value), int(value), int(value))
+    out = []
+    for _ in range(n):
+        out.append(int(value))
+    return tuple(out)
 
 
 def _single(value):
@@ -105,10 +122,14 @@ def _unbind(x, dim=0):
     hub.requires_grad = True
     hub._node = torch._Node(hub_backward, (x,), "UnbindBackward0")
 
+    # The hub reads only `slots`: the gradient each piece hands it just
+    # makes it run, so they share one zero instead of building their own.
+    zero = torch.zeros((), dtype=x.dtype)
+
     def report(i):
         def backward(g):
             slots[i] = g if slots[i] is None else slots[i] + g
-            return (torch.zeros((), dtype=g.dtype),)
+            return (zero,)
         return backward
     for i, p in enumerate(pieces):
         p.requires_grad = True
@@ -2279,6 +2300,26 @@ def triplet_margin_with_distance_loss(anchor, positive, negative, distance_funct
 
 
 # ---- attention -----------------------------------------------------------------------------
+# A causal attention's masked positions (above the diagonal) by (L, S), as
+# `torch.tril(torch.ones(L, S, dtype=torch.bool)).logical_not()` builds
+# them: once per size, not per call (only read, by masked_fill).
+_CAUSAL = {}
+
+
+def _causal_off(L, S):
+    if torch._graph_recording:
+        # (a captured program builds its own, as before)
+        return torch.tril(torch.ones(L, S, dtype=torch.bool)).logical_not()
+    key = (L, S)
+    mask = _CAUSAL.get(key)
+    if mask is None:
+        mask = torch.tril(torch.ones(L, S, dtype=torch.bool)).logical_not()
+        if len(_CAUSAL) >= 64:
+            _CAUSAL.clear()
+        _CAUSAL[key] = mask
+    return mask
+
+
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
     L, S = query.shape[-2], key.shape[-2]
     scale_factor = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
@@ -2291,8 +2332,7 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
     if is_causal:
         if attn_mask is not None:
             raise RuntimeError("_scaled_dot_product_attention: Explicit attn_mask should not be set when is_causal=True")
-        causal = torch.tril(torch.ones(L, S, dtype=torch.bool))
-        scores = scores.masked_fill(causal.logical_not(), -_inf)
+        scores = scores.masked_fill(_causal_off(L, S), -_inf)
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
             scores = scores.masked_fill(attn_mask.logical_not(), -_inf)

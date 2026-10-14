@@ -22,7 +22,7 @@
 use super::args::{Arg, Outcome, View};
 
 /// Bumped with any change to this layout, `Arg`, or the operation table.
-pub(crate) const WIRE_VERSION: u32 = 2;
+pub(crate) const WIRE_VERSION: u32 = 3;
 
 /// What `Vm::native_kernel_admits` decides from, as data.
 #[derive(Clone, Copy, Debug)]

@@ -5,6 +5,21 @@
 
 /// `all_finite`: answers a bool, or null when it declines.
 pub(crate) const OP_ALL_FINITE: u32 = 11;
+/// Whether the kernels run in the engine's own process (true) or across
+/// modules (`wire`, false): tensor.js takes the native loops for smaller
+/// operands when a call costs no request.
+pub(crate) const OP_LOCAL: u32 = 34;
+/// tensor.js's `binaryFast` (add/sub/mul/div of two float32/float64
+/// storages of the forms it takes) as one call that allocates the result's
+/// typed array: answered by the engine itself (`py_tensor`), never sent to
+/// the kernels or across modules.
+pub(crate) const OP_BIN_FAST: u32 = 36;
+/// `binaryScalarFast` (a storage and a Python number) the same way.
+pub(crate) const OP_BIN_SCALAR_FAST: u32 = 37;
+/// `_k.matmul` of two float32/float64 storages, the left of two or more
+/// dims and the right of two (optionally transposed): the product's typed
+/// array, allocated and computed in one call (`py_tensor`).
+pub(crate) const OP_MM_FAST: u32 = 38;
 
 // TypedArray kinds (`native::TA_KINDS`) a tensor storage can be. An int8
 // storage (Int8Array) reaches only the quantization kernels

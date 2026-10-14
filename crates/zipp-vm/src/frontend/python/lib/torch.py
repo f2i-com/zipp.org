@@ -164,6 +164,13 @@ def compile(model=None, *, backend="zipp_gpu", training=False):
     return compile_gpu(model, backend=backend, training=training)
 
 
+# Set when torch._gpu loads. It holds the GPU capture and the parameters a
+# prepared session keeps resident, so until it is loaded neither exists and
+# an eager optimizer step need not load it (its first import compiles some
+# 2800 lines).
+_gpu_loaded = False
+
+
 # How many compiled calls are recording. Only then can an operand be a graph
 # tensor, so eager ops test this before probing for one: the probe's miss
 # raised internally and cost more than the kernel on small tensors.
@@ -551,8 +558,22 @@ def _check_saved(node):
         now = _k.aversion(s)
         if now != version:
             shape = _list(t.shape)
-            owner = "" if t._node is None else ", which is output 0 of %s," % _grad_fn_name(t._node.name)
-            raise RuntimeError("one of the variables needed for gradient computation has been modified by an inplace operation: [torch.%s %s]%s is at version %d; expected version %d instead. Hint: the backtrace further above can show the operation that failed to compute its gradient." % (Tensor.type(t)[6:], shape, owner, now, version))
+            # As PyTorch names it: a saved output by the node that saved it
+            # (an in-place op since gave the tensor another history), a saved
+            # input by its history now, a leaf by nothing. (A saved tensor
+            # that is not among the node's inputs is its output.)
+            producer = node if node.parents and not _any_is(node.parents, t) else t._node
+            owner = "" if producer is None else ", which is output 0 of %s," % _grad_fn_name(producer.name)
+            # (anomaly detection, which PyTorch's other hint is for, is a
+            # no-op here)
+            raise RuntimeError("one of the variables needed for gradient computation has been modified by an inplace operation: [torch.%s %s]%s is at version %d; expected version %d instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False)." % (Tensor.type(t)[6:], shape, owner, now, version))
+
+
+def _any_is(items, x):
+    for v in items:
+        if v is x:
+            return True
+    return False
 
 
 def _grad_fn_name(name):
@@ -836,6 +857,12 @@ def _unbroadcast(grad, shape):
             if d == 1 and grad.shape[extra + i] != 1:
                 dims.append(extra + i)
     if dims:
+        if not _grad_enabled and grad.__class__ is Tensor and grad.dtype._inexact:
+            # What `grad.sum(dims, keepdim=True).reshape(shape)` computes
+            # outside create_graph (the dims are normalised already, the
+            # sum precise as `sum`'s), as one tensor of the target shape:
+            # the sum's storage is its own, so no view of it is needed.
+            return Tensor(_k.reduce("sum", grad._s, gshape, dims, True, True)[0], shape, grad.dtype)
         grad = grad.sum(dims, keepdim=True)
     return grad.reshape(shape)
 
@@ -1440,6 +1467,13 @@ class Tensor:
         return self._inplace_op(lerp, end, weight)
 
     def uniform_(self, a=0.0, b=1.0, generator=None):
+        dt = self.dtype
+        if (dt is float32 or dt is float64) and (type(a) is _float or type(a) is _int) and (type(b) is _float or type(b) is _int):
+            # PyTorch's uniform kernel, values and draws: x * (to - from) +
+            # from in the dtype's arithmetic (float32: with from and to
+            # rounded to float32 first, which `rand() * (b - a) + a` did not
+            # do for b - a).
+            return self._overwrite(Tensor(_k.uniform(_gen(generator), _numel(self.shape), dt.name, _float(a), _float(b)), self.shape, dt))
         return self._overwrite(rand(*self.shape, generator=generator, dtype=self.dtype if self.dtype.is_floating_point else None) * (b - a) + a)
 
     def normal_(self, mean=0.0, std=1.0, generator=None):
@@ -2866,7 +2900,11 @@ def full(size, fill_value, dtype=None, layout=None, device=None, requires_grad=F
 
 def empty(*size, dtype=None, layout=None, device=None, requires_grad=False, pin_memory=False, memory_format=None):
     _check_cpu_device(device)
-    return zeros(*size, dtype=dtype, requires_grad=requires_grad)
+    # zeros(*size, dtype=dtype, requires_grad=requires_grad), without the
+    # re-packed call
+    shape = _shape_args(size)
+    dt = _dtype_of(dtype) or _default_dtype
+    return Tensor(_k.zeros(dt.name, _numel(shape)), shape, dt, requires_grad)
 
 
 def zeros_like(input, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None):
@@ -3594,6 +3632,9 @@ def _pow_backward(g, x, y, o):
     return (gx, gy)
 
 
+_SPOW = frozenset((2, 3, -2, 0.5, -0.5, -1, 1))
+
+
 def pow(input, exponent):
     a, b = input, exponent
     if _graph_recording and getattr(a, "_zipp_graph", False):
@@ -3607,6 +3648,11 @@ def pow(input, exponent):
             if e == 0:
                 return (zeros_like(x, dtype=g.dtype), None)
             return (mul(g, _cj(mul(pow(x, e - 1), e))), None)
+        # A float32/float64 tensor to a Python number: the kernel's `spow`,
+        # PyTorch's own forms of x**2, x**3, x**-2, x**0.5, x**-0.5, x**-1,
+        # x**1 (`pow` otherwise).
+        if (a.dtype is float32 or a.dtype is float64) and a.__class__ is not _SparseTensor and not _graph_recording and (b.__class__ is _float or b.__class__ is _int) and b in _SPOW:
+            return _binary("spow", a, b, "Pow", backward, ("x", ""))
         return _binary("pow", a, b, "Pow", backward, ("x", ""))
     return _binary("pow", a, b, "Pow", _pow_backward, ("xy", "xyo"))
 
@@ -3857,6 +3903,11 @@ def _silu_grad(x):
 
 
 def _bw_relu(g, x, o):
+    if not _grad_enabled and g.__class__ is Tensor and o.__class__ is Tensor and g.dtype is o.dtype and (g.dtype is float32 or g.dtype is float64) and _shape_eq(g.shape, o.shape):
+        # `where(o <= 0, 0.0, g)` as one kernel (relu_bw), outside
+        # create_graph: the same values without the mask tensor.
+        storage, shape = _k.binary("relu_bw", g._s, g.shape, o._s, o.shape)
+        return Tensor(storage, g.shape, g.dtype)
     return where(o <= 0, 0.0, g)
 
 
@@ -5655,6 +5706,22 @@ def cat(tensors, dim=0):
 
         def backward(g):
             grads, start = [], 0
+            if not _grad_enabled and g.__class__ is Tensor:
+                # Each piece is `narrow(g, d, start, s)`'s slice, taken by
+                # the kernel directly (nothing to record outside
+                # create_graph; the starts and sizes are in range).
+                rank = len(g.shape)
+                whole = (None, None, None)
+                for t_, s in zip(tensors, sizes):
+                    if t_.requires_grad:
+                        spec = [whole] * rank
+                        spec[d] = (start, start + s, None)
+                        storage, shape = _k.slice(g._s, g.shape, spec)
+                        grads.append(Tensor(storage, shape, g.dtype))
+                    else:
+                        grads.append(None)
+                    start += s
+                return _tuple(grads)
             for t_, s in zip(tensors, sizes):
                 grads.append(narrow(g, d, start, s) if t_.requires_grad else None)
                 start += s
@@ -5955,18 +6022,40 @@ def trace(input):
     return sum(diagonal(input))
 
 
+# tril's and triu's masks by (rows, cols, diagonal, upper): six tensor ops
+# each, the same for every call of a size (an attention mask is rebuilt per
+# step). Only read (by `where`), so calls share them.
+_TRI_MASKS = {}
+
+
+def _tri_mask(r, c, diagonal, upper):
+    cache = diagonal.__class__ is _int and not _graph_recording
+    if cache:
+        key = (r, c, diagonal, upper)
+        mask = _TRI_MASKS.get(key)
+        if mask is not None:
+            return mask
+    if upper:
+        mask = (unsqueeze(arange(c), 0) >= unsqueeze(arange(r), 1) + diagonal)
+    else:
+        mask = (unsqueeze(arange(c), 0) <= unsqueeze(arange(r), 1) + diagonal)
+    if cache:
+        if len(_TRI_MASKS) >= 64:
+            _TRI_MASKS.clear()
+        _TRI_MASKS[key] = mask
+    return mask
+
+
 def tril(input, diagonal=0):
     a = input
     r, c = a.shape[-2], a.shape[-1]
-    mask = (unsqueeze(arange(c), 0) <= unsqueeze(arange(r), 1) + diagonal)
-    return where(mask, a, zeros((), dtype=a.dtype))
+    return where(_tri_mask(r, c, diagonal, False), a, zeros((), dtype=a.dtype))
 
 
 def triu(input, diagonal=0):
     a = input
     r, c = a.shape[-2], a.shape[-1]
-    mask = (unsqueeze(arange(c), 0) >= unsqueeze(arange(r), 1) + diagonal)
-    return where(mask, a, zeros((), dtype=a.dtype))
+    return where(_tri_mask(r, c, diagonal, True), a, zeros((), dtype=a.dtype))
 
 
 def tril_indices(row, col, offset=0, dtype=None, device=None, layout=None):
@@ -6676,15 +6765,35 @@ def _matmul_bw(g, args):
         gg = unsqueeze(g, -1)
     else:
         gg = g
+    # Outside create_graph, real operands are read transposed in place
+    # (`_mm_t`) instead of from a transposed copy: the same values.
+    plain = _mm_plain(gg, xs, ys)
     if ra:
-        gx = _unbroadcast(matmul(gg, _cj(transpose(ys, -1, -2))), xs.shape)
+        gx = _unbroadcast(_mm_t(gg, ys, True, False) if plain else matmul(gg, _cj(transpose(ys, -1, -2))), xs.shape)
         if len(x.shape) == 1:
             gx = gx.reshape(*x.shape)
     if rb:
-        gy = _unbroadcast(matmul(_cj(transpose(xs, -1, -2)), gg), ys.shape)
+        gy = _unbroadcast(_mm_t(xs, gg, False, True) if plain else matmul(_cj(transpose(xs, -1, -2)), gg), ys.shape)
         if len(y.shape) == 1:
             gy = gy.reshape(*y.shape)
     return (gx, gy)
+
+
+def _mm_plain(g, x, w):
+    """Whether a product's backward may take `_mm_t`: no graph recording
+    (not create_graph, not a compiled capture) and plain real tensors."""
+    return (not _grad_enabled and not _graph_recording and g.__class__ is Tensor and x.__class__ is Tensor and w.__class__ is Tensor
+            and not g.dtype.is_complex and not x.dtype.is_complex and not w.dtype.is_complex)
+
+
+def _mm_t(a, b, trans_b, trans_a):
+    """matmul(a, b.transpose(-1, -2)) (`trans_b`) or matmul(a.transpose(-1,
+    -2), b) (`trans_a`) for plain real tensors of two or more dims, the
+    kernel reading the operand transposed where it lies: each output sums
+    the same products in the same order as the product of the transposed
+    copy, so the values are that path's. Records nothing (see `_mm_plain`)."""
+    storage, shape = _k.matmul(a._s, a.shape, b._s, b.shape, trans_b, trans_a)
+    return Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
 
 
 def _max_pool2d(x, k, s, p, d, outs, replay):
@@ -6787,8 +6896,9 @@ def _linear_mm_bw(g, args):
         gx = _unbroadcast(matmul(g, Tensor(wsnap, wshape, wdt)), xs.shape)
     if rw:
         # g^T @ x sums, per element, the products x^T @ g sums, in
-        # the same order: the transposed path's value, transposed.
-        gw = _unbroadcast(matmul(transpose(g, -1, -2), xs), wshape)
+        # the same order: the transposed path's value, transposed. (g is
+        # read transposed in place when it can be: `_mm_t`.)
+        gw = _unbroadcast(_mm_t(g, xs, False, True) if _mm_plain(g, xs, xs) else matmul(transpose(g, -1, -2), xs), wshape)
     return (gx, gw)
 
 
@@ -7392,7 +7502,18 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
                     if pg.dtype is not pdt and pg.dtype != pdt and pdt._inexact:
                         pg = _grad_as(pg, pdt)
                     prior = p._pg
-                    p._pg = pg if prior is None else (add(prior, pg) if prior.__class__ is not _SparseTensor else _sp._buffer_add(prior, pg))
+                    if prior is None:
+                        p._pg = pg
+                    elif (not _grad_enabled and prior.__class__ is Tensor and pg.__class__ is Tensor and prior.dtype is pg.dtype
+                            and prior.dtype.is_floating_point and not _graph_recording):
+                        # `add(prior, pg)` outside create_graph, as `_binary`
+                        # computes it for two tensors of one floating dtype
+                        # (the shapes are the parent's both): the kernel and
+                        # its tensor, without add's and _binary's dispatch.
+                        storage, shape = _k.binary("add", prior._s, prior.shape, pg._s, pg.shape, None)
+                        p._pg = Tensor(storage, shape, prior.dtype)
+                    else:
+                        p._pg = add(prior, pg) if prior.__class__ is not _SparseTensor else _sp._buffer_add(prior, pg)
         finally:
             _grad_enabled = prev_mode
         return captured

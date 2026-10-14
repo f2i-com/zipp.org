@@ -107,17 +107,240 @@ impl Vm<'_> {
             return Ok(Value::bool(false));
         };
         let op = u32::try_from(op).unwrap_or(0);
+        if op == args::OP_BIN_FAST || op == args::OP_BIN_SCALAR_FAST || op == args::OP_MM_FAST {
+            #[cfg(not(feature = "python-no-torch"))]
+            return Ok(match op {
+                args::OP_BIN_FAST => self.pt_bin_fast(&args[1..]),
+                args::OP_BIN_SCALAR_FAST => self.pt_bin_scalar_fast(&args[1..]),
+                _ => self.pt_mm_fast(&args[1..]),
+            }
+            .unwrap_or(Value::bool(false)));
+            #[cfg(feature = "python-no-torch")]
+            return Ok(Value::bool(false));
+        }
         let a: Vec<Arg> = args[1..].iter().map(|&v| self.pt_arg(v)).collect();
         #[cfg(not(feature = "python-no-torch"))]
         let outcome = kernels::run(self, op, &a);
         #[cfg(feature = "python-no-torch")]
-        let outcome = self.pt_bridge(op, &a);
+        let outcome = if op == args::OP_LOCAL { Outcome::Answer(false) } else { self.pt_bridge(op, &a) };
         Ok(match outcome {
             Outcome::Done => Value::bool(true),
             Outcome::Declined => Value::bool(false),
             Outcome::Answer(b) => Value::bool(b),
             Outcome::Null => Value::NULL,
         })
+    }
+
+    /// `(code, A, B, xpy, ypy, RES)`: tensor.js's `binaryFast` for operands
+    /// it has checked (float32/float64 storages of one dtype; `xpy` and
+    /// `ypy` Size or tuple records): `A` op `B` (code 1-4: add, sub, mul,
+    /// div) into a new typed array of their kind, for equal shapes (mode 0),
+    /// a single element on the right or left (1, 2) or a bias of the right's
+    /// or left's trailing dims (3, 4), the mode written to `RES[0]` (the
+    /// result is shaped as `ypy` in modes 2 and 4, as `xpy` otherwise).
+    /// Each element is the f64 operation on the two values the JavaScript
+    /// loops and the native kernel read, stored as the typed array stores
+    /// it: the same bits. `None` (the caller runs its own path) for anything
+    /// else, or when the budget does not admit it; it is charged as a
+    /// kernel of that many elements.
+    #[cfg(not(feature = "python-no-torch"))]
+    fn pt_bin_fast(&mut self, a: &[Value]) -> Option<Value> {
+        use args::{KIND_F32, KIND_F64};
+        let code = match self.pt_arg(*a.first()?) {
+            Arg::Num(c) if c == 1.0 || c == 2.0 || c == 3.0 || c == 4.0 => c as u8,
+            _ => return None,
+        };
+        let view = |vm: &Self, v: Value| match vm.pt_arg(v) {
+            Arg::View(view) => Some(view),
+            _ => None,
+        };
+        let (va, vb, vr) = (view(self, *a.get(1)?)?, view(self, *a.get(2)?)?, view(self, *a.get(5)?)?);
+        if va.kind != vb.kind || !matches!(va.kind, KIND_F32 | KIND_F64) || vr.kind != KIND_F64 || vr.len != 1 {
+            return None;
+        }
+        let (p, q) = (self.pt_dims(*a.get(3)?)?, self.pt_dims(*a.get(4)?)?);
+        let numel = |d: &[i64]| d.iter().try_fold(1usize, |n, &k| n.checked_mul(usize::try_from(k).ok()?));
+        let (na, nb) = (numel(&p)?, numel(&q)?);
+        if na == 0 || nb == 0 || va.len != na || vb.len != nb {
+            return None;
+        }
+        // tensor.js's `onesOver` and `suffixOf`.
+        let ones_over = |small: &[i64], big: &[i64]| small.len() <= big.len() && small.iter().all(|&d| d == 1);
+        let suffix_of = |small: &[i64], big: &[i64]| {
+            if small.len() > big.len() {
+                return false;
+            }
+            let lead = small.iter().take_while(|&&d| d == 1).count();
+            let off = big.len() - (small.len() - lead);
+            small[lead..].iter().zip(&big[off..]).all(|(x, y)| x == y)
+        };
+        let mode: u8 = if na == nb && p == q {
+            0
+        } else if nb == 1 && ones_over(&q, &p) {
+            1
+        } else if na == 1 && ones_over(&p, &q) {
+            2
+        } else if nb < na && suffix_of(&q, &p) {
+            3
+        } else if na < nb && suffix_of(&p, &q) {
+            4
+        } else {
+            return None;
+        };
+        let n = if mode == 2 || mode == 4 { nb } else { na };
+        let size = if va.kind == KIND_F32 { 4 } else { 8 };
+        let cost = 16u64.saturating_add((n as u64).saturating_mul(4));
+        if !self.native_kernel_admits(cost, n.checked_mul(size)?) {
+            return None;
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(n.checked_mul(size)?).ok()?;
+        out.resize(n * size, 0u8);
+        {
+            let bytes = |v: View| -> Option<&[u8]> {
+                let HeapObj::ArrayBuffer { data, detached: false } = self.heap.get(v.buffer) else {
+                    return None;
+                };
+                data.get(v.offset..v.offset.checked_add(v.len.checked_mul(size)?)?)
+            };
+            let (ab, bb) = (bytes(va)?, bytes(vb)?);
+            let (brow, arow) = (nb * size, na * size);
+            kernels::arith_modes(va.kind, code, mode, ab, bb, &mut out, brow, arow);
+        }
+        let buf = self.alloc_array_buffer(out.len()).ok()?;
+        if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
+            data.copy_from_slice(&out);
+        }
+        let o = self.alloc_typed_array(buf, va.kind, 0, n);
+        if let HeapObj::ArrayBuffer { data, detached: false } = self.heap.get_mut(vr.buffer) {
+            if let Some(slot) = data.get_mut(vr.offset..vr.offset + 8) {
+                slot.copy_from_slice(&f64::from(mode).to_le_bytes());
+            }
+        }
+        self.charge_steps(cost as i64);
+        Some(o)
+    }
+
+    /// `(code, A, y, flip, tpy)`: tensor.js's `binaryScalarFast` for a
+    /// float32/float64 storage it has checked and the Python number `y`
+    /// (already rounded to the storage's dtype): `A[i]` op `y`, or `y` op
+    /// `A[i]` when `flip`, into a new typed array of A's kind, when `tpy`
+    /// (a Size or tuple record) holds A's element count. The values the
+    /// JavaScript loops and the native kernel compute; `None` for anything
+    /// else, or when the budget does not admit it.
+    #[cfg(not(feature = "python-no-torch"))]
+    fn pt_bin_scalar_fast(&mut self, a: &[Value]) -> Option<Value> {
+        use args::{KIND_F32, KIND_F64};
+        let code = match self.pt_arg(*a.first()?) {
+            Arg::Num(c) if c == 1.0 || c == 2.0 || c == 3.0 || c == 4.0 => c as u8,
+            _ => return None,
+        };
+        let Arg::View(va) = self.pt_arg(*a.get(1)?) else {
+            return None;
+        };
+        let (Arg::Num(y), Arg::Bool(flip)) = (self.pt_arg(*a.get(2)?), self.pt_arg(*a.get(3)?)) else {
+            return None;
+        };
+        if !matches!(va.kind, KIND_F32 | KIND_F64) {
+            return None;
+        }
+        let dims = self.pt_dims(*a.get(4)?)?;
+        let n = dims.iter().try_fold(1usize, |n, &k| n.checked_mul(usize::try_from(k).ok()?))?;
+        if n == 0 || va.len != n {
+            return None;
+        }
+        let size = if va.kind == KIND_F32 { 4 } else { 8 };
+        let cost = 16u64.saturating_add((n as u64).saturating_mul(4));
+        if !self.native_kernel_admits(cost, n.checked_mul(size)?) {
+            return None;
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(n.checked_mul(size)?).ok()?;
+        out.resize(n * size, 0u8);
+        {
+            let HeapObj::ArrayBuffer { data, detached: false } = self.heap.get(va.buffer) else {
+                return None;
+            };
+            let ab = data.get(va.offset..va.offset.checked_add(n * size)?)?;
+            kernels::arith_scalar(va.kind, code, ab, y, flip, &mut out);
+        }
+        let buf = self.alloc_array_buffer(out.len()).ok()?;
+        if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
+            data.copy_from_slice(&out);
+        }
+        let o = self.alloc_typed_array(buf, va.kind, 0, n);
+        self.charge_steps(cost as i64);
+        Some(o)
+    }
+
+    /// `(A, apy, B, bpy, transB, transA)`: `_k.matmul` of float32/float64
+    /// storages of one dtype, `A` of shape `apy` (two or more dims, its
+    /// leading ones a batch; or two stored as `[k, m]` when `transA`) and
+    /// `B` of `bpy` (two dims; stored as `[n, k]` when `transB`): the
+    /// kernel's product over the batch as one `[batch * m, k] @ [k, n]`
+    /// (each output still the sum of its k products in p order, as the
+    /// per-batch loop computes it) into a new typed array, shaped as `apy`
+    /// with its last dim `n` (`[m, n]` when `transA`). `None` for anything
+    /// else (a mismatch raises on the caller's path), or when the kernel
+    /// declines.
+    #[cfg(not(feature = "python-no-torch"))]
+    fn pt_mm_fast(&mut self, a: &[Value]) -> Option<Value> {
+        use args::{KIND_F32, KIND_F64};
+        let (Arg::View(va), Arg::View(vb), Arg::Bool(trans_b)) = (self.pt_arg(*a.first()?), self.pt_arg(*a.get(2)?), self.pt_arg(*a.get(4)?)) else {
+            return None;
+        };
+        if va.kind != vb.kind || !matches!(va.kind, KIND_F32 | KIND_F64) {
+            return None;
+        }
+        let (p, q) = (self.pt_dims(*a.get(1)?)?, self.pt_dims(*a.get(3)?)?);
+        if p.len() < 2 || q.len() != 2 || p.iter().chain(q.iter()).any(|&d| d <= 0) {
+            return None;
+        }
+        let trans_a = matches!(a.get(5).map(|&v| self.pt_arg(v)), Some(Arg::Bool(true)));
+        if trans_a && (trans_b || p.len() != 2) {
+            return None;
+        }
+        let dim = |d: i64| usize::try_from(d).ok();
+        let (rows, k) = if trans_a {
+            (dim(p[1])?, dim(p[0])?)
+        } else {
+            (p[..p.len() - 1].iter().try_fold(1usize, |n, &d| n.checked_mul(dim(d)?))?, dim(p[p.len() - 1])?)
+        };
+        let (kb, n) = if trans_b { (dim(q[1])?, dim(q[0])?) } else { (dim(q[0])?, dim(q[1])?) };
+        if kb != k || va.len != rows.checked_mul(k)? || vb.len != k.checked_mul(n)? {
+            return None;
+        }
+        let total = rows.checked_mul(n)?;
+        let size = if va.kind == KIND_F32 { 4 } else { 8 };
+        let buf = self.alloc_array_buffer(total.checked_mul(size)?).ok()?;
+        let o = self.alloc_typed_array(buf, va.kind, 0, total);
+        let vo = View { buffer: buf, kind: va.kind, offset: 0, len: total };
+        let num = |x: usize| Arg::Num(x as f64);
+        let args = [Arg::View(va), Arg::View(vb), Arg::View(vo), num(0), num(0), num(0), num(rows), num(k), num(n)];
+        let op = if trans_a {
+            kernels::OP_MATMUL_TN_PUB
+        } else if trans_b {
+            kernels::OP_MATMUL_NT_PUB
+        } else {
+            kernels::OP_MATMUL_PUB
+        };
+        match kernels::run(self, op, &args) {
+            Outcome::Done => Some(o),
+            _ => None,
+        }
+    }
+
+    /// A Size or tuple record's ints (immediate BigInts), or `None`.
+    #[cfg(not(feature = "python-no-torch"))]
+    fn pt_dims(&self, v: Value) -> Option<Vec<i64>> {
+        let (_, items) = self.py_seq_parts(v)?;
+        if !items.is_heap() {
+            return None;
+        }
+        let HeapObj::Array(vals) = self.heap.get(items.heap_index()) else {
+            return None;
+        };
+        vals.iter().map(|d| d.small_bigint_val()).collect()
     }
 
     /// An argument as the kernels see it: a number, a live typed-array view

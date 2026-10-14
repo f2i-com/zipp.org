@@ -290,6 +290,21 @@ class Module:
 
     # -- attribute registries ---------------------------------------------------------------
     def __setattr__(self, name, value):
+        if not isinstance(value, Tensor) and not isinstance(value, Module):
+            # A plain value (a hyper-parameter, a flag): the general path
+            # below only does more when a parameter, buffer or submodule of
+            # that name is registered. The registries are read as attributes
+            # (reading `self.__dict__` costs more than this whole test); one
+            # missing (before Module.__init__) takes the general path too.
+            try:
+                params = self._parameters
+                modules = self._modules
+                buffers = self._buffers
+            except AttributeError:
+                params = None
+            if params is not None and name not in params and name not in modules and name not in buffers:
+                object.__setattr__(self, name, value)
+                return
         d = self.__dict__
         params = d.get("_parameters")
         if isinstance(value, Parameter):

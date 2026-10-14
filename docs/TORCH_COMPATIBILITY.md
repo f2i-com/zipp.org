@@ -666,7 +666,11 @@ third-party ML packages is not supported; within the bundled `torch`:
   values bit for bit: Box-Muller with the cached second value below 16
   elements, and from 16 elements the vectorised fill PyTorch's x86 builds use (float16/bfloat16 tensors of 16 or
   more elements can differ by an ulp, and a PyTorch build without AVX2 draws
-  differently). `bernoulli` and dropout masks come from Zipp's stream (PyTorch
+  differently). `uniform_(from, to)` (so `nn.init.uniform_`,
+  `kaiming_uniform_`, `xavier_uniform_` and the initial weights of
+  nn.Linear and the convolutions) gives PyTorch's float32 and float64 values
+  bit for bit: `x * (to - from) + from` in the dtype's arithmetic, the bounds
+  rounded to it first. `bernoulli` and dropout masks come from Zipp's stream (PyTorch
   draws them through MKL), so they do not match PyTorch's masks.
   `get_state`/`set_state` and `torch.get_rng_state`/`set_rng_state` capture the
   full generator state in Zipp's own layout, not interchangeable with PyTorch's.
@@ -1051,7 +1055,12 @@ float32 functions likewise compute in float64 and round once, so `sqrt` is
 correctly rounded and `exp`, `tanh`, `sigmoid` are within one rounding of the
 exact value, where PyTorch's vectorised float32 kernels (SLEEF, MKL) can land
 one ulp away. Formulas follow PyTorch's where the rounding depends on them (a
-GRU's update is `(h - n) * z + n`, as PyTorch's CPU cell computes it). The GPU graph
+GRU's update is `(h - n) * z + n`, as PyTorch's CPU cell computes it; `x ** e`
+with a Python-number exponent of 2, 3, -2, 0.5, -0.5, -1 or 1 is computed as
+PyTorch's CPU kernel computes it, `x*x`, `(x*x)*x`, `1/(x*x)`, `sqrt`, `1/sqrt`,
+`1/x` or a copy, rounded at each step, so it gives PyTorch's values wherever
+those operations do (not where PyTorch's `sqrt` misrounds); other exponents
+use `pow` and can differ in the last bit). The GPU graph
 reference (`zipp_gpu`) keeps float32 rounding after every step, matching the
 WebGPU/WebGL2 backends. Eager float32 `sum`, `mean`, `prod` (whole and per
 dimension) and `var`/`std` likewise accumulate in float64 and round once, so

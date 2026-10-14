@@ -119,7 +119,7 @@ def both(label, fn):
 
 
 seed = 0
-for op in ["add", "sub", "mul", "div", "pow", "max", "min", "eq", "ne", "lt", "le", "gt", "ge", "and", "or", "xor", "floordiv", "mod", "atan2", "fmod"]:
+for op in ["add", "sub", "mul", "div", "pow", "max", "min", "eq", "ne", "lt", "le", "gt", "ge", "and", "or", "xor", "floordiv", "mod", "atan2", "fmod", "relu_bw"]:
     for dta in ["float32", "float64", "int64", "bool"]:
         for dtb in ["float32", "int64"]:
             for sa, sb in [((96,), (96,)), ((12, 8), (8,)), ((12, 8), (12, 1)), ((70,), ()), ((), (66,)), ((4, 1, 6), (1, 5, 6))]:
@@ -218,6 +218,39 @@ A = storage("float32", (8, 8), 5)
 both("matmul_t self", lambda: _k.matmul(A, (8, 8), A, (8, 8), True))
 both("matmul_t mismatch", lambda: _k.matmul(A, (8, 8), A, (4, 16), True))
 both("matmul_t 3-d", lambda: _k.matmul(A, (8, 8), A, (2, 4, 8), True))
+# matmul with a transposed left operand (transA, a product's backward) and
+# with a batched transposed right one (transB): the bytes of the product of
+# the transposed copy.
+def swap_last(shape):
+    perm = list(range(len(shape)))
+    perm[-1], perm[-2] = perm[-2], perm[-1]
+    return perm
+for dta in ["float32", "float64", "int64"]:
+    for dtb in ["float32", "float64"]:
+        for sa, sb in [((32, 16), (32, 20)), ((12, 4, 10), (4, 9)), ((2, 5, 7), (2, 5, 3)), ((3, 0), (3, 4)), ((0, 4), (0, 6)), ((70, 3), (70, 9)), ((2, 1, 6, 5), (3, 6, 4)), ((5, 7), (2, 5, 3))]:
+            seed += 1
+            A = storage(dta, sa, seed)
+            B = storage(dtb, sb, seed + 3)
+            both("matmul_ta %s %s %s %s" % (dta, dtb, sa, sb), lambda: _k.matmul(A, sa, B, sb, False, True))
+            for on in (False, True):
+                _k._native(on)
+                At, st = _k.permute(A, sa, swap_last(sa))
+                if image(_k.matmul(A, sa, B, sb, False, True)) != image(_k.matmul(At, st, B, sb)):
+                    BAD.append("matmul_ta vs transposed copy %s %s %s %s %s" % (dta, dtb, sa, sb, on))
+        for sa, sb in [((2, 5, 7), (2, 9, 7)), ((3, 4, 6), (5, 6)), ((4, 6), (3, 2, 6)), ((2, 1, 3, 70), (4, 5, 70)), ((2, 0, 3), (2, 4, 3))]:
+            seed += 1
+            A = storage(dta, sa, seed)
+            B = storage(dtb, sb, seed + 3)
+            both("matmul_tb %s %s %s %s" % (dta, dtb, sa, sb), lambda: _k.matmul(A, sa, B, sb, True))
+            for on in (False, True):
+                _k._native(on)
+                Bt, st = _k.permute(B, sb, swap_last(sb))
+                if image(_k.matmul(A, sa, B, sb, True)) != image(_k.matmul(A, sa, Bt, st)):
+                    BAD.append("matmul_tb vs transposed copy %s %s %s %s %s" % (dta, dtb, sa, sb, on))
+A = storage("float32", (8, 8), 5)
+both("matmul_ta mismatch", lambda: _k.matmul(A, (8, 8), A, (4, 16), False, True))
+both("matmul_ta 1-d", lambda: _k.matmul(A, (64,), A, (64,), False, True))
+both("matmul_ta both", lambda: _k.matmul(A, (8, 8), A, (8, 8), True, True))
 # max_pool2d and its gradient: dims (Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw).
 for dt in ["float32", "float64", "float16", "bfloat16"]:
     for kd in [(2, 2, 2, 2, 0, 0, 1, 1), (2, 2, 3, 3, 0, 0, 1, 1), (2, 2, 2, 3, 1, 1, 1, 1), (3, 3, 3, 3, 1, 1, 1, 1), (2, 2, 3, 3, 0, 0, 2, 2),
@@ -334,6 +367,44 @@ for dt in ["float32", "float64", "int64", "int32"]:
         if dt in ("int64", "int32") and (st != int(st) or step != int(step)):
             continue
         both("arange %s %s %s %d" % (dt, st, step, n), lambda: _k.arange(dt, st, step, n))
+# Operands of 16 to 63 elements, which the engine's own native loops take
+# (NATIVE_SMALL) where the JavaScript loops ran before.
+for op in ["add", "sub", "mul", "div", "pow", "max", "lt", "floordiv"]:
+    for dt in ["float32", "float64", "int64"]:
+        for sa, sb in [((16,), (16,)), ((4, 12), (4, 12)), ((4, 12), (12,)), ((12,), (4, 12)), ((63,), ()), ((), (17,)), ((3, 1, 6), (1, 5, 6)), ((5, 7), (5, 1))]:
+            seed += 1
+            A = storage(dt, sa, seed)
+            B = storage(dt, sb, seed + 1)
+            both("small binary %s %s %s %s" % (op, dt, sa, sb), lambda: _k.binary(op, A, sa, B, sb))
+        for flip in (False, True):
+            seed += 1
+            A = storage(dt, (4, 12), seed)
+            v = 3 if dt == "int64" else 2.5
+            both("small binary_scalar %s %s %s" % (op, dt, flip), lambda: _k.binary_scalar(op, A, (4, 12), v, dt, dt, flip))
+for op in ["neg", "relu", "exp", "log", "tanh", "sigmoid", "sqrt", "square", "abs", "gelu", "gelu_grad", "silu", "reciprocal"]:
+    for dt in ["float32", "float64"]:
+        for n in (16, 48, 63):
+            seed += 1
+            A = storage(dt, (n,), seed)
+            both("small unary %s %s %d" % (op, dt, n), lambda: _k.unary(op, A))
+for op in ["sum", "mean", "prod", "max", "argmax", "all"]:
+    for dt in ["float32", "float64", "int64"]:
+        for shape, dims in [((48,), None), ((4, 12), (0,)), ((4, 12), (1,)), ((2, 3, 8), (0, 1)), ((2, 3, 8), (1,))]:
+            for precise in (False, True):
+                seed += 1
+                A = storage(dt, shape, seed)
+                both("small reduce %s %s %s %s %s" % (op, dt, shape, dims, precise), lambda: _k.reduce(op, A, shape, dims, True, precise))
+for dt in ["float32", "float64", "int64", "bool"]:
+    seed += 1
+    A = storage(dt, (3, 4, 5), seed)
+    C = storage("bool", (3, 1, 5), seed + 1)
+    Bv = storage(dt, (4, 1), seed + 2)
+    I = _k.from_flat("int64", [2, 0, 1, 1, 0, 2])
+    both("small where %s" % dt, lambda: _k.where(C, (3, 1, 5), A, (3, 4, 5), Bv, (4, 1)))
+    both("small slice %s" % dt, lambda: _k.slice(A, (3, 4, 5), [None, (1, None, 1), (0, 5, 2)]))
+    both("small permute %s" % dt, lambda: _k.permute(A, (3, 4, 5), (2, 0, 1)))
+    both("small expand %s" % dt, lambda: _k.expand(Bv, (4, 1), (5, 4, 3)))
+    both("small index_select %s" % dt, lambda: _k.index_select(A, (3, 4, 5), 0, I))
 # The small add/sub/mul/div loop (fewer than 64 elements, no helper calls)
 # against the same values in operands long enough for the native loop:
 # element i of the long result is element i % n of the short one.
@@ -813,4 +884,459 @@ fn fused_recurrent_cells_give_the_composites_bytes() {
     assert!(out[0].contains("mismatches 0 []"), "{}", out[0]);
     let cases: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
     assert_eq!(cases, 120, "{}", out[0]);
+}
+
+/// The native MT19937 draws (`pt_rng`) against tensor.js's loops: the same
+/// generator from the same seed, native loops off then on, must draw the
+/// same bytes for rand / randn / normal_ / uniform_ in float32 and float64
+/// at every size (the blocks of 16, a size no multiple of 16, the twist
+/// every 624 words), leave the same generator state, and continue a stream
+/// restored with set_rng_state or drawn through another Generator.
+const DRAWS: &str = r#"
+import torch
+import _zipp_tensor as _k
+
+SIZES = list(range(1, 41)) + [47, 63, 64, 100, 255, 623, 624, 625, 1000, 1249]
+
+
+def draws(native):
+    _k._native(native)
+    out = []
+    for seed in (0, 12345):
+        torch.manual_seed(seed)
+        for n in SIZES:
+            out.append(torch.rand(n))
+            out.append(torch.randn(n))
+            out.append(torch.rand(n, dtype=torch.float64))
+            out.append(torch.randn(n, dtype=torch.float64))
+            t = torch.empty(n)
+            t.normal_(0.5, 2.0)
+            out.append(t)
+            t = torch.empty(n, dtype=torch.float64)
+            t.normal_(-1.25, 0.3)
+            out.append(t)
+            t.uniform_(-0.5, 0.25)
+            out.append(t)
+            t = torch.empty(n)
+            t.uniform_(0.1, 0.7)
+            out.append(t)
+            out.append(torch.randn(n, dtype=torch.float16))
+        out.append(torch.get_rng_state())
+        st = torch.get_rng_state()
+        a = torch.randn(40)
+        torch.set_rng_state(st)
+        out.append(a)
+        out.append(torch.randn(40))
+        g = torch.Generator().manual_seed(seed + 1)
+        out.append(torch.rand(700, generator=g))
+        out.append(torch.randn(33, generator=g))
+        out.append(g.get_state())
+    return [_k.tobytes(t._s) for t in out]
+
+
+ref = draws(False)
+got = draws(True)
+bad = [i for i in range(len(ref)) if ref[i] != got[i]]
+print("draws", len(ref), "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn native_random_draws_give_the_javascript_loops_bytes() {
+    let run = run(DRAWS, 20_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("mismatches 0 []"), "{}", out[0]);
+    let draws: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(draws, 2 * (50 * 9 + 6), "{}", out[0]);
+}
+
+/// A native draw is charged, below what the interpreted loop spends.
+#[test]
+fn native_random_draws_are_charged() {
+    let program = |native: bool| {
+        format!(
+            "import torch\nimport _zipp_tensor as _k\n_k._native({})\ntorch.manual_seed(1)\nprint(float(torch.randn(4096).sum()), float(torch.rand(4096).sum()))\n",
+            if native { "True" } else { "False" }
+        )
+    };
+    let native = run(&program(true), 2_000_000_000, false);
+    let interpreted = run(&program(false), 2_000_000_000, false);
+    assert_eq!(native.output.clone().unwrap(), interpreted.output.clone().unwrap());
+    assert!(native.steps + 100_000 < interpreted.steps, "{} vs {}", native.steps, interpreted.steps);
+}
+
+/// `_unbroadcast` outside create_graph sums with one kernel call into a
+/// tensor of the target shape; it must hold the bytes of the composite it
+/// replaces, `grad.sum(dims, keepdim=True).reshape(shape)`, for every
+/// broadcast form (leading dims, size-1 dims, both, a 0-d target), dtype
+/// and size, with the native loops off and on.
+const UNBROADCAST: &str = r#"
+import torch
+
+def pattern(shape, seed, dt):
+    n = 1
+    for d in shape:
+        n *= d
+    return torch.tensor([((i * 37 + seed * 11) % 23 - 11) / 7.0 + (i % 5) * 0.013 for i in range(n)], dtype=dt).reshape(shape)
+
+bad = []
+cases = 0
+for native in (False, True):
+    torch._k._native(native)
+    for dt in (torch.float32, torch.float64, torch.complex64):
+        for gs, ts in [((16, 64), (64,)), ((2, 16, 32), (32,)), ((4, 5), (1, 5)), ((4, 5), (4, 1)), ((3, 4, 5), (4, 1)), ((3, 4, 5), ()), ((2, 1, 6), (1, 6)), ((7,), (1,)), ((2, 3, 4), (1, 3, 1))]:
+            g = pattern(gs, len(gs) + len(ts), dt) if not dt.is_complex else torch.complex(pattern(gs, 1, torch.float32), pattern(gs, 2, torch.float32))
+            shape = torch.Size(ts)
+            with torch.no_grad():
+                got = torch._unbroadcast(g, shape)
+                dims = list(range(len(gs) - len(ts))) + [len(gs) - len(ts) + i for i, d in enumerate(ts) if d == 1 and gs[len(gs) - len(ts) + i] != 1]
+                ref = g.sum(dims, keepdim=True).reshape(shape)
+            cases += 1
+            if got.dtype is not ref.dtype or tuple(got.shape) != tuple(ref.shape) or torch._k.tobytes(got._s) != torch._k.tobytes(ref._s):
+                bad.append("%s %s %s %s" % (dt, gs, ts, native))
+print("cases", cases, "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn unbroadcast_sum_gives_the_composites_bytes() {
+    let run = run(UNBROADCAST, 2_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 54 mismatches 0 []"), "{}", out[0]);
+}
+
+/// ReLU's backward as one kernel (`relu_bw`) against the composite it
+/// replaces, `where(o <= 0, 0.0, g)`: the same bytes for float32 and float64
+/// at sizes on both sides of the native threshold, with signed zeros,
+/// infinities and NaN in the output and the gradient; and the gradient
+/// nn.ReLU / F.relu / Tensor.relu hand back through backward (also under
+/// create_graph, which keeps the composite).
+const RELU_BW: &str = r#"
+import torch
+
+INF = float("inf")
+NAN = float("nan")
+SPECIAL = [0.0, -0.0, 1.0, -1.0, 2.5, -1e-40, 1e-40, INF, -INF, NAN, 3e38, -3e38]
+
+
+def vals(n, seed):
+    out = []
+    for i in range(n):
+        j = (i * 5 + seed * 3) % 29
+        out.append(SPECIAL[j] if j < len(SPECIAL) else ((i * 37 + seed * 11) % 23 - 11) / 4.0)
+    return out
+
+
+bad = []
+cases = 0
+for dt in (torch.float32, torch.float64):
+    for shape in ((5,), (4, 12), (100,), (3, 5, 7)):
+        n = 1
+        for d in shape:
+            n *= d
+        for seed in range(3):
+            o = torch.tensor(vals(n, seed), dtype=dt).reshape(shape)
+            g = torch.tensor(vals(n, seed + 7), dtype=dt).reshape(shape)
+            for native in (False, True):
+                torch._k._native(native)
+                cases += 1
+                ref = torch.where(o <= 0, 0.0, g)
+                got = torch._bw_relu(g, None, o)
+                if got.dtype is not ref.dtype or tuple(got.shape) != tuple(ref.shape) or torch._k.tobytes(got._s) != torch._k.tobytes(ref._s):
+                    bad.append("%s %s %d %s" % (dt, shape, seed, native))
+torch._k._native(True)
+x = torch.tensor(vals(48, 2), dtype=torch.float32).reshape(4, 12).requires_grad_()
+w = torch.tensor(vals(48, 5), dtype=torch.float32).reshape(4, 12)
+(torch.relu(x) * w).sum().backward()
+ref = torch.where(torch.relu(x).detach() <= 0, 0.0, w)
+cases += 1
+if torch._k.tobytes(x.grad._s) != torch._k.tobytes(ref._s):
+    bad.append("backward")
+x.grad = None
+y = torch.relu(x)
+w2 = w.clone().requires_grad_()
+(gx,) = torch.autograd.grad((y * w2).sum(), [x], create_graph=True)
+cases += 1
+if torch._k.tobytes(gx._s) != torch._k.tobytes(ref._s) or gx.grad_fn is None:
+    bad.append("create_graph")
+print("cases", cases, "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn relu_backward_kernel_gives_the_composites_bytes() {
+    let run = run(RELU_BW, 2_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 50 mismatches 0 []"), "{}", out[0]);
+}
+
+/// A product's gradients read its operands transposed in place (`_mm_t`)
+/// outside create_graph; under create_graph they are the recorded composite
+/// (transposed copies and products). Both must give the same bytes: matmul
+/// of every rank pairing (1-d, 2-d, batched, broadcast), nn.Linear on 2-d
+/// and 3-d inputs, float32 and float64, native loops off and on.
+const MM_GRADS: &str = r#"
+import torch
+from torch import nn
+
+def pattern(shape, seed, dt):
+    n = 1
+    for d in shape:
+        n *= d
+    return torch.tensor([((i * 37 + seed * 11) % 23 - 11) / 7.0 + (i % 5) * 0.013 for i in range(n)], dtype=dt).reshape(shape)
+
+def grads(fn, leaves, create):
+    out = fn()
+    w = pattern(tuple(out.shape), 99, out.dtype)
+    gs = torch.autograd.grad((out * w).sum(), leaves, create_graph=create)
+    return [torch._k.tobytes(g.detach()._s) for g in gs]
+
+bad = []
+cases = 0
+for native in (False, True):
+    torch._k._native(native)
+    for dt in (torch.float32, torch.float64):
+        for sa, sb in [((5, 7), (7, 3)), ((16, 32), (32, 20)), ((7,), (7, 3)), ((5, 7), (7,)), ((7,), (7,)), ((2, 5, 7), (7, 3)), ((5, 7), (2, 7, 3)), ((2, 3, 4, 5), (3, 5, 6)), ((2, 1, 4, 5), (3, 5, 2))]:
+            a = pattern(sa, 1, dt).requires_grad_()
+            b = pattern(sb, 2, dt).requires_grad_()
+            cases += 1
+            if grads(lambda: a @ b, [a, b], False) != grads(lambda: a @ b, [a, b], True):
+                bad.append("matmul %s %s %s %s" % (dt, sa, sb, native))
+        for xs in ((16, 32), (2, 16, 32), (3, 1, 4, 32)):
+            lin = nn.Linear(32, 20).to(dt)
+            with torch.no_grad():
+                lin.weight.copy_(pattern((20, 32), 3, dt))
+                lin.bias.copy_(pattern((20,), 4, dt))
+            x = pattern(xs, 5, dt).requires_grad_()
+            cases += 1
+            if grads(lambda: lin(x), [x, lin.weight, lin.bias], False) != grads(lambda: lin(x), [x, lin.weight, lin.bias], True):
+                bad.append("linear %s %s %s" % (dt, xs, native))
+print("cases", cases, "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn transposed_in_place_product_gradients_give_the_composites_bytes() {
+    let run = run(MM_GRADS, 4_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 48 mismatches 0 []"), "{}", out[0]);
+}
+
+/// The ops the engine answers in one call when its kernels are its own
+/// (OP_BIN_FAST, OP_BIN_SCALAR_FAST, OP_MM_FAST: the result's typed array
+/// allocated and computed natively) against tensor.js's own paths (native
+/// loops off): the same bytes, or the same error, for add / sub / mul / div
+/// of two float32 or float64 tensors in every layout the fast path takes
+/// (equal shapes, a single element on either side, a bias of either side's
+/// trailing dims) and some it declines, with a Python number on either
+/// side, and products (batched left operands, transposed operands in place,
+/// F.linear, and the gradients through them), at sizes from one element,
+/// with signed zeros, subnormals, infinities and NaN.
+const FAST_PATHS: &str = r#"
+import torch
+import torch.nn.functional as F
+import _zipp_tensor as _k
+
+INF = float("inf")
+NAN = float("nan")
+SPECIAL = [0.0, -0.0, 1.0, -1.0, 1e-45, -3e-39, 3.4e38, 1e300, INF, -INF, NAN, 0.1, 7.0]
+
+
+def vals(n, seed, special):
+    out = []
+    for i in range(n):
+        j = (i * 7 + seed * 13) % 29
+        if special and j < len(SPECIAL) and (i + seed) % 3 == 0:
+            out.append(SPECIAL[j])
+        else:
+            out.append(((i * 37 + seed * 11) % 23 - 11) / 8.0 + (seed % 5) * 0.137)
+    return out
+
+
+def numel(shape):
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
+def make(shape, dt, seed, special):
+    return torch.tensor(vals(numel(shape), seed, special), dtype=dt).reshape(shape)
+
+
+def img(t):
+    return (str(t.dtype), tuple(t.shape), _k.tobytes(t._s))
+
+
+CASES = [0]
+BAD = []
+
+
+def both(label, fn):
+    CASES[0] += 1
+    res = []
+    for on in (False, True):
+        _k._native(on)
+        try:
+            res.append(("ok", fn()))
+        except Exception as e:
+            res.append(("err", type(e).__name__, str(e)))
+    _k._native(True)
+    if res[0] != res[1]:
+        BAD.append(label)
+
+
+OPS = {"add": lambda a, b: a + b, "sub": lambda a, b: a - b, "mul": lambda a, b: a * b, "div": lambda a, b: a / b}
+PAIRS = [((1,), (1,)), ((5,), (5,)), ((3, 4), (3, 4)), ((70,), (70,)), ((5,), ()), ((), (5,)), ((), ()),
+         ((1, 1), (3, 4)), ((3, 4), (1,)), ((2, 3, 4), (4,)), ((4,), (2, 3, 4)), ((2, 3, 4), (3, 4)),
+         ((3, 4), (2, 3, 4)), ((2, 3, 4), (1, 3, 4)), ((1, 3, 4), (2, 3, 4)), ((12, 8), (12, 1)),
+         ((1, 4), (4,)), ((3, 4), (4, 3)), ((3, 4), (1, 1, 4)), ((0, 4), (4,))]
+seed = 0
+for dt in (torch.float32, torch.float64):
+    for sa, sb in PAIRS:
+        for special in (False, True):
+            seed += 1
+            A, B = make(sa, dt, seed, special), make(sb, dt, seed + 1, special)
+            for name, f in OPS.items():
+                both("binary %s %s %s %s %s" % (name, dt, sa, sb, special), lambda: img(f(A, B)))
+    for n in (1, 3, 15, 16, 70):
+        seed += 1
+        A = make((n,), dt, seed, True)
+        for v in (2.5, -0.0, 3, 1e-45, 1e300, INF, NAN, 0.1, True):
+            for name, f in OPS.items():
+                both("scalar %s %s %s %r" % (name, dt, n, v), lambda: img(f(A, v)))
+                both("rscalar %s %s %s %r" % (name, dt, n, v), lambda: img(f(v, A)))
+    for sa, sb in [((3, 4), (4, 5)), ((1, 1), (1, 1)), ((2, 3, 4), (4, 5)), ((5, 4), (4, 1)), ((2, 2, 3, 4), (4, 2)),
+                   ((1, 7), (7, 1)), ((16, 9), (9, 17)), ((3, 4), (5, 2)), ((0, 4), (4, 3))]:
+        for special in (False, True):
+            seed += 1
+            A, B = make(sa, dt, seed, special), make(sb, dt, seed + 1, special)
+            both("matmul %s %s %s %s" % (dt, sa, sb, special), lambda: img(A @ B))
+            Bt = B.t().contiguous()
+            both("matmul transB %s %s %s %s" % (dt, sa, sb, special), lambda: _k.tobytes(_k.matmul(A._s, A.shape, Bt._s, Bt.shape, True)[0]))
+            both("linear %s %s %s %s" % (dt, sa, sb, special), lambda: img(F.linear(A, Bt)))
+            if len(sa) == 2:
+                At = A.t().contiguous()
+                both("matmul transA %s %s %s %s" % (dt, sa, sb, special), lambda: _k.tobytes(_k.matmul(At._s, At.shape, B._s, B.shape, False, True)[0]))
+    # A product's gradients (transposed operands read in place)
+    for sa, sb in [((3, 4), (4, 5)), ((2, 3, 4), (4, 5)), ((6, 9), (9, 2))]:
+        seed += 1
+        A0, B0 = make(sa, dt, seed, False), make(sb, dt, seed + 1, False)
+
+        def grads():
+            A = A0.clone().requires_grad_()
+            B = B0.clone().requires_grad_()
+            (A @ B).sin().sum().backward()
+            return img(A.grad), img(B.grad)
+        both("matmul grads %s %s %s" % (dt, sa, sb), grads)
+# mixed dtypes keep the general path
+for sa, sb in PAIRS[:6]:
+    seed += 1
+    A, B = make(sa, torch.float32, seed, True), make(sb, torch.float64, seed + 1, True)
+    for name, f in OPS.items():
+        both("mixed %s %s %s" % (name, sa, sb), lambda: img(f(A, B)))
+print("cases", CASES[0], "mismatches", len(BAD), BAD[:5])
+"#;
+
+#[test]
+fn engine_answered_ops_give_the_javascript_paths_bytes() {
+    let run = run(FAST_PATHS, 20_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 1206 mismatches 0 []"), "{}", out[0]);
+}
+
+/// tril / triu (their masks built once per size and diagonal) and causal
+/// scaled_dot_product_attention (its mask built once per size) give the
+/// bytes of the same results built afresh: tril / triu against masks from
+/// Python lists, for several shapes, diagonals and dtypes, twice each
+/// (with the first result written in place in between), and their
+/// gradients; causal attention against the same attention with the mask
+/// passed explicitly, outputs and gradients, square and not, float32 and
+/// float64.
+const CAUSAL: &str = r#"
+import torch
+import torch.nn.functional as F
+import _zipp_tensor as _k
+
+cases = 0
+bad = []
+
+
+def img(t):
+    return (str(t.dtype), tuple(t.shape), _k.tobytes(t._s))
+
+
+def ref_tri(x, diagonal, upper):
+    # The same values from Python lists: kept where the column is on the
+    # wanted side of the diagonal, 0 elsewhere.
+    r, c = x.shape[-2], x.shape[-1]
+    keep = [[(j - i >= diagonal) if upper else (j - i <= diagonal) for j in range(c)] for i in range(r)]
+    m = torch.tensor(keep, dtype=torch.bool)
+    return torch.where(m, x, torch.zeros((), dtype=x.dtype))
+
+
+def vals(n, seed):
+    return [((i * 37 + seed * 11) % 23 - 11) / 8.0 if (i + seed) % 7 else -0.0 for i in range(n)]
+
+
+seed = 0
+for shape in ((3, 4), (4, 4), (5, 2), (2, 3, 5), (1, 1), (2, 2, 3, 3)):
+    for diagonal in (-2, -1, 0, 1, 3):
+        for dt in (torch.float32, torch.float64, torch.int64, torch.bool):
+            seed += 1
+            n = 1
+            for d in shape:
+                n *= d
+            x = torch.tensor(vals(n, seed), dtype=torch.float64).reshape(shape).to(dt)
+            for upper in (False, True):
+                for rep in range(2):
+                    cases += 1
+                    got = torch.triu(x, diagonal) if upper else torch.tril(x, diagonal)
+                    if img(got) != img(ref_tri(x, diagonal, upper)):
+                        bad.append("%s %s %s %s %s" % ("triu" if upper else "tril", shape, diagonal, dt, rep))
+                    # a caller writing into the result does not reach the next call
+                    got.zero_() if dt is not torch.bool else got.logical_not_()
+# gradients through tril / triu
+for upper in (False, True):
+    x = torch.tensor(vals(12, 3), dtype=torch.float32).reshape(3, 4).requires_grad_()
+    for rep in range(2):
+        x.grad = None
+        y = torch.triu(x, 1) if upper else torch.tril(x, -1)
+        (y * torch.arange(12.0).reshape(3, 4)).sum().backward()
+        cases += 1
+        want = ref_tri(torch.arange(12.0).reshape(3, 4), 1 if upper else -1, upper)
+        if img(x.grad) != img(want):
+            bad.append("grad %s %s" % (upper, rep))
+# causal attention against the same attention with the mask spelled out
+for (L, S) in ((4, 4), (3, 5), (5, 3), (16, 16), (1, 1)):
+    for dt in (torch.float32, torch.float64):
+        seed += 1
+        q0 = torch.tensor(vals(2 * L * 8, seed), dtype=dt).reshape(1, 2, L, 8) / 3.0
+        k0 = torch.tensor(vals(2 * S * 8, seed + 1), dtype=dt).reshape(1, 2, S, 8) / 5.0
+        v0 = torch.tensor(vals(2 * S * 8, seed + 2), dtype=dt).reshape(1, 2, S, 8)
+        mask = torch.tensor([[j <= i for j in range(S)] for i in range(L)], dtype=torch.bool)
+
+        def run(causal):
+            q, k, v = q0.clone().requires_grad_(), k0.clone().requires_grad_(), v0.clone().requires_grad_()
+            if causal:
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            (out * out).sum().backward()
+            return [img(out), img(q.grad), img(k.grad), img(v.grad)]
+        ref = run(False)
+        for rep in range(2):
+            cases += 1
+            if run(True) != ref:
+                bad.append("sdpa %s %s %s %s" % (L, S, dt, rep))
+print("cases", cases, "mismatches", len(bad), bad[:5])
+"#;
+
+#[test]
+fn shared_triangle_masks_give_fresh_masks_bytes() {
+    let run = run(CAUSAL, 4_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 504 mismatches 0 []"), "{}", out[0]);
 }
