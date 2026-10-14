@@ -1195,6 +1195,23 @@ impl<'p> Vm<'p> {
 /// The positional entry names a class and its `__init__` carry (`c<n>`).
 const ENTRY_NAMES: [&str; 8] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"];
 
+/// Whether a `PyNew` site's [`ic::NEW`] entry is asked first
+/// (`Vm::py_new_hit`). On unless `ZIPP_NO_PY_NEW_HIT` is set (the
+/// same-binary A/B). Read once per process.
+fn py_new_hits_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PY_NEW_HIT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// An own data property `name` of the plain object `idx`, tried at the
     /// slot `hint` first; the slot it is found at.
@@ -1221,6 +1238,13 @@ impl<'p> Vm<'p> {
         // constructed yet, whose entry the runtime writes on its first
         // construction), with the same entry still there: declined at once.
         let e = self.py_ic(func_id, ip);
+        // The class this site constructed last, its keys as they were then:
+        // its entries read at the slots found then (`py_new_hit`).
+        if e.kind == ic::NEW && e.a == cls.bits() && self.heap.version_of(ci) == e.hver && py_new_hits_enabled() {
+            if let Some(r) = self.py_new_hit(func_id, ip, &e, cls, rt, n) {
+                return Some(r);
+            }
+        }
         if e.kind == ic::NEW_NO && e.a == cls.bits() && self.heap.version_of(ci) == e.hver {
             let same = e.pos == u32::MAX
                 || matches!(self.heap.get(ci), HeapObj::Object(m) if (e.pos as usize) < m.len() && m.val_at(e.pos as usize).bits() == e.b);
@@ -1239,7 +1263,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         // Where this site found the two entries last time (hints only).
-        let (entry_hint, init_hint) = if e.kind == ic::NEW { (e.pos as usize, e.hver as usize) } else { (0, 0) };
+        let (entry_hint, init_hint) = if e.kind == ic::NEW { (e.pos as usize, (e.c >> 32) as u16 as usize) } else { (0, 0) };
         let found = self.py_own_hinted(ci, entry_name, entry_hint);
         let Some((_, entry_slot)) = found.filter(|&(have, _)| want.is_heap() && have.bits() == want.bits()) else {
             // Keys unchanged and the entry (or its absence) the same: the
@@ -1253,7 +1277,7 @@ impl<'p> Vm<'p> {
             self.py_ic_put(func_id, ip, PyIc { kind: ic::NEW_NO, pos, hver, a: cls.bits(), b, ..PyIc::default() });
             return None;
         };
-        let init = self.py_hint_field(hint::CTOR_INIT, ci, "ctorInit")?;
+        let (init, ctor_init_slot) = self.py_hint_slot(hint::CTOR_INIT, ci, "ctorInit")?;
         let (entry, init_slot) = if init == Value::NULL {
             if n != 0 {
                 return None;
@@ -1277,11 +1301,86 @@ impl<'p> Vm<'p> {
         let cap = self.py_rt.as_deref().map_or(0, |p| p.layouts.presize(cls));
         let map = self.py_attrs_new(cap);
         let obj = self.py_alloc_like_ready(tmpl, inst_shape, &[cls, map])?;
-        if (entry_slot, init_slot) != (entry_hint, init_hint) {
-            if let (Ok(pos), Ok(hver)) = (u32::try_from(entry_slot), u32::try_from(init_slot)) {
-                self.py_ic_put(func_id, ip, PyIc { kind: ic::NEW, pos, hver, ..PyIc::default() });
+        // What a later construction at this site checks first (`py_new_hit`):
+        // the class and its heap version, the slots of its entry and its
+        // `ctorInit`, the `__init__` record, its heap version and its entry's
+        // slot, and the storage's presize.
+        let iver = if init.is_heap() { self.heap.version_of(init.heap_index()) } else { 0 };
+        if let (Ok(pos), Ok(d), Ok(islot)) = (u32::try_from(entry_slot), u32::try_from(ctor_init_slot), u16::try_from(init_slot)) {
+            let c = u64::from(iver) | (u64::from(islot) << 32) | ((cap.min(255) as u64) << 48);
+            let hver = self.heap.version_of(ci);
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::NEW, pos, hver, a: cls.bits(), b: init.bits(), c, d });
+        }
+        Some((obj, entry, init))
+    }
+
+    /// [`Vm::py_new`] at a site whose [`ic::NEW`] entry `e` names `cls`
+    /// with the heap version it has now (so its keys, and the slots the
+    /// entry names, are as they were): what the full step answers, with
+    /// nothing found by name. The class's entry for the count at its slot
+    /// is still the runtime's plain one (read afresh), its `ctorInit` still
+    /// the record the entry names, whose own heap version is the entry's
+    /// and whose entry for `n + 1` (at its slot) is callable now. `None`,
+    /// with nothing done, for anything else: the full step then decides.
+    #[inline]
+    fn py_new_hit(&mut self, func_id: u32, ip: usize, e: &PyIc, cls: Value, rt: Value, n: usize) -> Option<(Value, Value, Value)> {
+        let p = self.py_rt_for(rt)?;
+        let (ctors, tmpl, inst_shape) = (p.ctors, p.inst_tmpl, p.inst_shape);
+        let want = match ctors.is_heap().then(|| self.heap.get(ctors.heap_index())) {
+            Some(HeapObj::Array(items)) => *items.get(n)?,
+            _ => return None,
+        };
+        let (pos, islot) = (e.pos as usize, e.d as usize);
+        let init = match self.heap.get(cls.heap_index()) {
+            HeapObj::Object(m)
+                if !m.is_ctor
+                    && pos < m.len()
+                    && islot < m.len()
+                    && !m.is_accessor_at(pos)
+                    && !m.is_accessor_at(islot)
+                    && want.is_heap()
+                    && m.val_at(pos).bits() == want.bits()
+                    && m.val_at(islot).bits() == e.b =>
+            {
+                Value::from_bits(e.b)
+            }
+            _ => return None,
+        };
+        let entry = if init == Value::NULL {
+            if n != 0 {
+                return None;
+            }
+            Value::NULL
+        } else {
+            if !init.is_heap() || self.heap.version_of(init.heap_index()) != e.c as u32 {
+                return None;
+            }
+            let s = (e.c >> 32) as u16 as usize;
+            let v = match self.heap.get(init.heap_index()) {
+                HeapObj::Object(m) if !m.is_ctor && s < m.len() && !m.is_accessor_at(s) => m.val_at(s),
+                _ => return None,
+            };
+            if !self.py_callable_fn(v) {
+                return None;
+            }
+            v
+        };
+        if inst_shape == crate::shape::DICT || !self.py_alloc_like_ok(tmpl, inst_shape) {
+            return None;
+        }
+        // The storage presized as the entry says; until an instance of the
+        // class has grown (the first constructions), as the class says now,
+        // which the entry then keeps.
+        let mut cap = (e.c >> 48) as u8 as usize;
+        if cap == 0 {
+            cap = self.py_rt.as_deref().map_or(0, |p| p.layouts.presize(cls)).min(255);
+            if cap != 0 {
+                let c = (e.c & !(0xFF << 48)) | ((cap as u64) << 48);
+                self.py_ic_put(func_id, ip, PyIc { c, ..*e });
             }
         }
+        let map = self.py_attrs_new(cap);
+        let obj = self.py_alloc_like_ready(tmpl, inst_shape, &[cls, map])?;
         Some((obj, entry, init))
     }
 
