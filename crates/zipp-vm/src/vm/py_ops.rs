@@ -57,6 +57,26 @@ enum OrdRef {
 /// Instruction steps charged per key and per comparison of a native sort.
 const ORD_STEPS_PER_UNIT: u64 = 8;
 
+/// The widest tuple keys `Vm::py_ord_sort_columns` sorts by columns.
+const ORD_COLUMNS_MAX: usize = 4;
+
+/// Whether a native sort may compare its keys by columns
+/// (`Vm::py_ord_sort_columns`). On unless `ZIPP_NO_PY_SORT_COLUMNS` is set
+/// (the same-binary A/B). Read once per process.
+fn py_sort_columns_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PY_SORT_COLUMNS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// One operand, classified.
 #[derive(Clone, Copy)]
 enum Num {
@@ -1793,20 +1813,120 @@ impl<'p> Vm<'p> {
             }
         }
         let mut order: Vec<usize> = (0..n).collect();
-        let undecided = std::cell::Cell::new(false);
-        order.sort_by(|&i, &j| match self.py_ord_cmp(&keys[i], &keys[j]) {
-            Some(o) => o,
-            None => {
-                undecided.set(true);
-                std::cmp::Ordering::Equal
+        if !self.py_ord_sort_columns(&keys, &mut order) {
+            let undecided = std::cell::Cell::new(false);
+            order.sort_by(|&i, &j| match self.py_ord_cmp(&keys[i], &keys[j]) {
+                Some(o) => o,
+                None => {
+                    undecided.set(true);
+                    std::cmp::Ordering::Equal
+                }
+            });
+            if undecided.get() {
+                return Ok(Value::UNDEFINED);
             }
-        });
-        if undecided.get() {
-            return Ok(Value::UNDEFINED);
         }
         self.charge_steps(i64::try_from(cost).unwrap_or(i64::MAX));
         let out: Vec<Value> = order.into_iter().map(|i| Value::int(i as i32)).collect();
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
+    /// Sort `order` (the identity) by `keys` as [`Vm::py_ord_cmp`] orders
+    /// them, stably, when every key is of one form whose order needs no
+    /// case analysis per comparison: all ints of the fast tier, all floats
+    /// with no NaN, all strs, or all tuples of the same length (at most
+    /// [`ORD_COLUMNS_MAX`]) whose items at each place are all of one of
+    /// those kinds. The keys are then read once into columns and compared
+    /// column by column, which is what `py_ord_cmp` answers for such pairs
+    /// (two items of one kind compare as that kind, the first unequal pair
+    /// decides, equal tuples of one length are equal), without its match
+    /// on two keys of every kind for every comparison. `false`, with
+    /// `order` untouched, for any other set of keys.
+    fn py_ord_sort_columns(&self, keys: &[OrdKey], order: &mut [usize]) -> bool {
+        use super::bigint::BigVal;
+        enum Col<'h> {
+            Int(Vec<i128>),
+            Float(Vec<f64>),
+            Str(Vec<&'h [u8]>),
+        }
+        if !py_sort_columns_enabled() {
+            return false;
+        }
+        let Some(first) = keys.first() else {
+            return false;
+        };
+        // 0: the keys are themselves the items (no tuples).
+        let width = match first {
+            OrdKey::Seq(items) => items.len(),
+            _ => 0,
+        };
+        if width > ORD_COLUMNS_MAX {
+            return false;
+        }
+        // A key's item at place `c` (the key itself when keys are items).
+        fn item_at(k: &OrdKey, width: usize, c: usize) -> Option<&OrdKey> {
+            match k {
+                OrdKey::Seq(items) if width > 0 && items.len() == width => items.get(c),
+                OrdKey::Seq(_) => None,
+                _ if width == 0 => Some(k),
+                _ => None,
+            }
+        }
+        let item = |k, c| item_at(k, width, c);
+        let mut cols: Vec<Col<'_>> = Vec::with_capacity(width.max(1));
+        for c in 0..width.max(1) {
+            let col = match item(first, c) {
+                Some(OrdKey::Int(BigVal::Small(_))) => {
+                    let mut v = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        match item(k, c) {
+                            Some(OrdKey::Int(BigVal::Small(x))) => v.push(*x),
+                            _ => return false,
+                        }
+                    }
+                    Col::Int(v)
+                }
+                Some(OrdKey::Float(_)) => {
+                    let mut v = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        match item(k, c) {
+                            Some(OrdKey::Float(x)) if !x.is_nan() => v.push(*x),
+                            _ => return false,
+                        }
+                    }
+                    Col::Float(v)
+                }
+                Some(OrdKey::Str(_)) => {
+                    let mut v = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        match item(k, c) {
+                            Some(OrdKey::Str(s)) => match self.heap.get(*s) {
+                                HeapObj::Str(st) => v.push(st.as_bytes()),
+                                _ => return false,
+                            },
+                            _ => return false,
+                        }
+                    }
+                    Col::Str(v)
+                }
+                _ => return false,
+            };
+            cols.push(col);
+        }
+        order.sort_by(|&i, &j| {
+            for col in &cols {
+                let o = match col {
+                    Col::Int(v) => v[i].cmp(&v[j]),
+                    Col::Float(v) => v[i].partial_cmp(&v[j]).unwrap_or(std::cmp::Ordering::Equal),
+                    Col::Str(v) => v[i].cmp(v[j]),
+                };
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        true
     }
 
     fn py_ord_key(&mut self, v: Value, depth: u32) -> Option<OrdKey> {
