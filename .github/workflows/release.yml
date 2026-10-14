@@ -379,7 +379,7 @@ jobs:
           Compress-Archive -LiteralPath $bundlePath -DestinationPath $archivePath -CompressionLevel Optimal
 
       - name: Upload native release archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-native-${{ matrix.rust_target }}
           path: dist/zipp-${{ needs.validate.outputs.version }}-${{ matrix.rust_target }}${{ matrix.archive_suffix }}
@@ -737,7 +737,7 @@ jobs:
           )
 
       - name: Upload browser WebAssembly release archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-wasm-${{ matrix.suffix }}
           path: crates/zipp-wasm/dist/zipp-wasm-${{ needs.validate.outputs.version }}-${{ matrix.suffix }}.zip
@@ -834,7 +834,7 @@ jobs:
           )
 
       - name: Upload the torch package release archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-wasm-web-torch
           path: crates/zipp-wasm/dist/zipp-wasm-${{ needs.validate.outputs.version }}-web-torch.zip
