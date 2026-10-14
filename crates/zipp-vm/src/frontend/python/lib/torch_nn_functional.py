@@ -2300,6 +2300,26 @@ def triplet_margin_with_distance_loss(anchor, positive, negative, distance_funct
 
 
 # ---- attention -----------------------------------------------------------------------------
+# A causal attention's masked positions (above the diagonal) by (L, S), as
+# `torch.tril(torch.ones(L, S, dtype=torch.bool)).logical_not()` builds
+# them: once per size, not per call (only read, by masked_fill).
+_CAUSAL = {}
+
+
+def _causal_off(L, S):
+    if torch._graph_recording:
+        # (a captured program builds its own, as before)
+        return torch.tril(torch.ones(L, S, dtype=torch.bool)).logical_not()
+    key = (L, S)
+    mask = _CAUSAL.get(key)
+    if mask is None:
+        mask = torch.tril(torch.ones(L, S, dtype=torch.bool)).logical_not()
+        if len(_CAUSAL) >= 64:
+            _CAUSAL.clear()
+        _CAUSAL[key] = mask
+    return mask
+
+
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
     L, S = query.shape[-2], key.shape[-2]
     scale_factor = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
@@ -2312,8 +2332,7 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
     if is_causal:
         if attn_mask is not None:
             raise RuntimeError("_scaled_dot_product_attention: Explicit attn_mask should not be set when is_causal=True")
-        causal = torch.tril(torch.ones(L, S, dtype=torch.bool))
-        scores = scores.masked_fill(causal.logical_not(), -_inf)
+        scores = scores.masked_fill(_causal_off(L, S), -_inf)
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
             scores = scores.masked_fill(attn_mask.logical_not(), -_inf)

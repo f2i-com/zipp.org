@@ -1245,3 +1245,98 @@ fn engine_answered_ops_give_the_javascript_paths_bytes() {
     assert_eq!(out.len(), 1, "{out:#?}");
     assert!(out[0].contains("cases 1206 mismatches 0 []"), "{}", out[0]);
 }
+
+/// tril / triu (their masks built once per size and diagonal) and causal
+/// scaled_dot_product_attention (its mask built once per size) give the
+/// bytes of the same results built afresh: tril / triu against masks from
+/// Python lists, for several shapes, diagonals and dtypes, twice each
+/// (with the first result written in place in between), and their
+/// gradients; causal attention against the same attention with the mask
+/// passed explicitly, outputs and gradients, square and not, float32 and
+/// float64.
+const CAUSAL: &str = r#"
+import torch
+import torch.nn.functional as F
+import _zipp_tensor as _k
+
+cases = 0
+bad = []
+
+
+def img(t):
+    return (str(t.dtype), tuple(t.shape), _k.tobytes(t._s))
+
+
+def ref_tri(x, diagonal, upper):
+    # The same values from Python lists: kept where the column is on the
+    # wanted side of the diagonal, 0 elsewhere.
+    r, c = x.shape[-2], x.shape[-1]
+    keep = [[(j - i >= diagonal) if upper else (j - i <= diagonal) for j in range(c)] for i in range(r)]
+    m = torch.tensor(keep, dtype=torch.bool)
+    return torch.where(m, x, torch.zeros((), dtype=x.dtype))
+
+
+def vals(n, seed):
+    return [((i * 37 + seed * 11) % 23 - 11) / 8.0 if (i + seed) % 7 else -0.0 for i in range(n)]
+
+
+seed = 0
+for shape in ((3, 4), (4, 4), (5, 2), (2, 3, 5), (1, 1), (2, 2, 3, 3)):
+    for diagonal in (-2, -1, 0, 1, 3):
+        for dt in (torch.float32, torch.float64, torch.int64, torch.bool):
+            seed += 1
+            n = 1
+            for d in shape:
+                n *= d
+            x = torch.tensor(vals(n, seed), dtype=torch.float64).reshape(shape).to(dt)
+            for upper in (False, True):
+                for rep in range(2):
+                    cases += 1
+                    got = torch.triu(x, diagonal) if upper else torch.tril(x, diagonal)
+                    if img(got) != img(ref_tri(x, diagonal, upper)):
+                        bad.append("%s %s %s %s %s" % ("triu" if upper else "tril", shape, diagonal, dt, rep))
+                    # a caller writing into the result does not reach the next call
+                    got.zero_() if dt is not torch.bool else got.logical_not_()
+# gradients through tril / triu
+for upper in (False, True):
+    x = torch.tensor(vals(12, 3), dtype=torch.float32).reshape(3, 4).requires_grad_()
+    for rep in range(2):
+        x.grad = None
+        y = torch.triu(x, 1) if upper else torch.tril(x, -1)
+        (y * torch.arange(12.0).reshape(3, 4)).sum().backward()
+        cases += 1
+        want = ref_tri(torch.arange(12.0).reshape(3, 4), 1 if upper else -1, upper)
+        if img(x.grad) != img(want):
+            bad.append("grad %s %s" % (upper, rep))
+# causal attention against the same attention with the mask spelled out
+for (L, S) in ((4, 4), (3, 5), (5, 3), (16, 16), (1, 1)):
+    for dt in (torch.float32, torch.float64):
+        seed += 1
+        q0 = torch.tensor(vals(2 * L * 8, seed), dtype=dt).reshape(1, 2, L, 8) / 3.0
+        k0 = torch.tensor(vals(2 * S * 8, seed + 1), dtype=dt).reshape(1, 2, S, 8) / 5.0
+        v0 = torch.tensor(vals(2 * S * 8, seed + 2), dtype=dt).reshape(1, 2, S, 8)
+        mask = torch.tensor([[j <= i for j in range(S)] for i in range(L)], dtype=torch.bool)
+
+        def run(causal):
+            q, k, v = q0.clone().requires_grad_(), k0.clone().requires_grad_(), v0.clone().requires_grad_()
+            if causal:
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            (out * out).sum().backward()
+            return [img(out), img(q.grad), img(k.grad), img(v.grad)]
+        ref = run(False)
+        for rep in range(2):
+            cases += 1
+            if run(True) != ref:
+                bad.append("sdpa %s %s %s %s" % (L, S, dt, rep))
+print("cases", cases, "mismatches", len(bad), bad[:5])
+"#;
+
+#[test]
+fn shared_triangle_masks_give_fresh_masks_bytes() {
+    let run = run(CAUSAL, 4_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 504 mismatches 0 []"), "{}", out[0]);
+}

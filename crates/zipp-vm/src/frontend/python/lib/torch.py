@@ -6022,18 +6022,40 @@ def trace(input):
     return sum(diagonal(input))
 
 
+# tril's and triu's masks by (rows, cols, diagonal, upper): six tensor ops
+# each, the same for every call of a size (an attention mask is rebuilt per
+# step). Only read (by `where`), so calls share them.
+_TRI_MASKS = {}
+
+
+def _tri_mask(r, c, diagonal, upper):
+    cache = diagonal.__class__ is _int and not _graph_recording
+    if cache:
+        key = (r, c, diagonal, upper)
+        mask = _TRI_MASKS.get(key)
+        if mask is not None:
+            return mask
+    if upper:
+        mask = (unsqueeze(arange(c), 0) >= unsqueeze(arange(r), 1) + diagonal)
+    else:
+        mask = (unsqueeze(arange(c), 0) <= unsqueeze(arange(r), 1) + diagonal)
+    if cache:
+        if len(_TRI_MASKS) >= 64:
+            _TRI_MASKS.clear()
+        _TRI_MASKS[key] = mask
+    return mask
+
+
 def tril(input, diagonal=0):
     a = input
     r, c = a.shape[-2], a.shape[-1]
-    mask = (unsqueeze(arange(c), 0) <= unsqueeze(arange(r), 1) + diagonal)
-    return where(mask, a, zeros((), dtype=a.dtype))
+    return where(_tri_mask(r, c, diagonal, False), a, zeros((), dtype=a.dtype))
 
 
 def triu(input, diagonal=0):
     a = input
     r, c = a.shape[-2], a.shape[-1]
-    mask = (unsqueeze(arange(c), 0) >= unsqueeze(arange(r), 1) + diagonal)
-    return where(mask, a, zeros((), dtype=a.dtype))
+    return where(_tri_mask(r, c, diagonal, True), a, zeros((), dtype=a.dtype))
 
 
 def tril_indices(row, col, offset=0, dtype=None, device=None, layout=None):
