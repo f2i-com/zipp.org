@@ -1480,6 +1480,15 @@ impl<'p> Vm<'p> {
         {
             return v.bits();
         }
+        // An Int: its decimal string, polling the collector first when it
+        // allocates (the caller's window is the only holder of live values).
+        if v.is_int() {
+            let n = v.as_int();
+            if !(0..=99).contains(&n) {
+                self.maybe_gc();
+            }
+            return self.int_str_value(n).bits();
+        }
         if self.jit_call_depth >= JIT_REGION_CALL_MAX {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;

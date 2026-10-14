@@ -1179,6 +1179,9 @@ impl<'p> Vm<'p> {
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
             return Ok(v);
         }
+        if v.is_int() {
+            return Ok(self.int_str_value(v.as_int()));
+        }
         // An object's ToPrimitive result is kept as the string VALUE it is:
         // `String(['\uD800'])` is the array's join result, surrogate intact.
         // (Same protocol and order as `to_js_string`'s object path.)
@@ -1193,6 +1196,24 @@ impl<'p> Vm<'p> {
         };
         let s = self.to_js_string(v)?;
         Ok(self.alloc_str(s))
+    }
+
+    /// ToString of an Int as a heap string, the way `String(n)`'s compiled
+    /// lane makes it (`jit_int_string`): the interned single digit or
+    /// two-digit string for 0..=99, else one flat ASCII string formatted on
+    /// the stack. The general path formatted into a `String` and copied it
+    /// into the heap: two allocations for every `${i}`. No safe point here
+    /// (a caller may hold unrooted values); a compiled caller polls first.
+    pub(crate) fn int_str_value(&mut self, n: i32) -> Value {
+        if (0..=9).contains(&n) {
+            return Value::heap((b'0' as i32 + n) as u32);
+        }
+        if (10..=99).contains(&n) {
+            return Value::heap(crate::heap::INTERN_PAD2_START + n as u32);
+        }
+        let (digits, start) = fmt_i32_buf(n);
+        let text = crate::heap::JsStr::from_ascii(digits[start..].to_vec());
+        Value::heap(self.heap.alloc_js(text))
     }
 
     pub(crate) fn to_js_string(&mut self, v: Value) -> Result<String, Thrown> {
