@@ -1506,11 +1506,52 @@ impl<'p> Vm<'p> {
                     },
                 );
             }
-            if val.is_number() {
-                let n = val.as_f64();
-                if n >= 0.0 && n.fract() == 0.0 && (n as usize) <= crate::vm::MAX_DENSE_ARRAY_LEN {
+            // What an iteration of the object (`[...arguments]`, `for-of`,
+            // `Array.from`) will take its length to be: ToLength(ToNumber of
+            // the value), which for a number, a string, a boolean, null and
+            // undefined runs no user code, so the dense store can follow it
+            // now. An object or a symbol keeps the store as it is.
+            let iter_len = if val.is_number() {
+                Some(val.as_f64())
+            } else if !val.is_heap() || self.heap.is_str_like(val.heap_index()) {
+                self.to_number(val).ok()
+            } else {
+                None
+            }
+            .map(|x| if x.is_nan() || x <= 0.0 { 0.0 } else { x.floor() });
+            if let Some(n) = iter_len {
+                if (n as usize) <= crate::vm::MAX_DENSE_ARRAY_LEN {
+                    let n = n as usize;
+                    // The elements past a SMALLER length stay own properties
+                    // (`length` here is ordinary, it truncates nothing): they
+                    // move to the side table, where `array_index_override`
+                    // answers them, unless an index there already overrides
+                    // its dense slot. `arguments.length = 1` then
+                    // `arguments[1]` read undefined and Object.keys lost it.
+                    let dropped: Vec<(usize, Value)> = match self.heap.get(idx) {
+                        HeapObj::Array(items) if n < items.len() => items[n..]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| !v.is_hole())
+                            .map(|(k, v)| (n + k, *v))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    if !dropped.is_empty() {
+                        let m = self
+                            .arr_props
+                            .entry(idx)
+                            .or_insert_with(ObjMap::new_side_table);
+                        for (i, v) in dropped {
+                            let mut buf = [0u8; 20];
+                            let key = crate::heap::index_key(&mut buf, i);
+                            if m.pos(key).is_none() {
+                                m.define(key, v, PropAttr::data());
+                            }
+                        }
+                    }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        items.resize(n as usize, Value::HOLE);
+                        items.resize(n, Value::HOLE);
                     }
                 }
             }
