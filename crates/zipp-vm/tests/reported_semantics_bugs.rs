@@ -1,5 +1,5 @@
-//! Semantics bugs reported against `main` at 2cb7176f and a82ad0bb
-//! (f2i-com/zipp.org #41 to #50). Every expected line is what Node 24
+//! Semantics bugs reported against `main` at 2cb7176f, a82ad0bb and
+//! 0b3e9ba4 (f2i-com/zipp.org #41 to #54). Every expected line is what Node 24
 //! prints for the same source; the hot loops make the compiled paths
 //! answer too.
 
@@ -408,6 +408,101 @@ fn globals_named_through_the_eval_slot_map() {
             "getter",
             "ReferenceError",
             "fn true",
+        ]
+    );
+}
+
+/// #51: `globalThis.Math = Math` (a polyfill's `window.Promise = Promise`)
+/// writes the binding in place: it keeps a builtin's attributes and later
+/// reads, compiled or not, see the value.
+#[test]
+fn a_builtin_reassigned_on_the_global_object() {
+    let out = run_ok(
+        r#"
+        function readPi() { let s = 0; for (let i = 0; i < 3000; i++) s += Math.PI; return s | 0; }
+        console.log(readPi());
+        globalThis.Math = Math;
+        console.log(readPi(), JSON.stringify(Object.getOwnPropertyDescriptor(globalThis, "Math"), (k, v) => k === "value" ? typeof v : v));
+        const fake = { PI: 1 };
+        globalThis.Math = fake;
+        console.log(readPi(), Math === fake);
+        globalThis.JSON = JSON; globalThis.Promise = Promise;
+        console.log(typeof JSON.stringify, typeof Promise.resolve, Object.keys(globalThis).includes("Math"));
+        "#,
+    );
+    assert_eq!(
+        out,
+        [
+            "9424",
+            "9424 {\"value\":\"object\",\"writable\":true,\"enumerable\":false,\"configurable\":true}",
+            "3000 true",
+            "function function false",
+        ]
+    );
+}
+
+/// #52: only a call through the identifier `eval` can be a direct eval; a
+/// function that merely mentions `eval` keeps its fast scopes, and every
+/// form of direct eval still sees the caller's scope.
+#[test]
+fn naming_eval_is_not_a_direct_eval() {
+    let out = run_ok(
+        r#"
+        globalThis.g = "global";
+        function direct() { var g = "local"; return eval("g"); }
+        function parens() { var g = "local"; return (eval)("g"); }
+        function aliasOnly() { var g = "local"; const indirect = eval; return indirect("g"); }
+        function nested() { var g = "local"; return (function () { return eval("g"); })(); }
+        function nestedArrow() { var g = "local"; return (() => eval("g"))(); }
+        function declares() { eval("var made = 5"); return typeof made === "number" ? made : "none"; }
+        function rebound() { var eval = globalThis.eval; var g = "local"; return eval("g"); }
+        function shadowFn() { function eval(s) { return "fake:" + s; } var g = "local"; return eval("g"); }
+        function paramDefault(a = 1, b = eval("a + 1")) { return b; }
+        function mentionsOnly() { const ie = eval; let s = 0; for (let i = 0; i < 3000; i++) s += Math.PI; return [typeof ie, Math.round(s)].join(":"); }
+        function closureSeesEvalVar() { eval("var cv = 'from eval'"); return (function () { return cv; })(); }
+        console.log(direct(), parens(), aliasOnly(), nested(), nestedArrow(), declares(), rebound(), shadowFn(), paramDefault());
+        console.log(mentionsOnly(), closureSeesEvalVar());
+        const obj = { m() { var g = "method"; return eval("g"); }, get a() { var g = "getter"; return eval("g"); } };
+        class C { constructor() { var g = "ctor"; this.v = eval("g"); } static s() { var g = "static"; return eval("g"); } }
+        console.log(obj.m(), obj.a, new C().v, C.s());
+        "#,
+    );
+    assert_eq!(
+        out,
+        [
+            "local local global local local 5 local fake:g 2",
+            "function:9425 from eval",
+            "method getter ctor static",
+        ]
+    );
+}
+
+/// #54: a script's top-level `let`/`const` is initialized in its own binding
+/// whatever the global object's prototype chain holds under its name: a
+/// Proxy that denies it, or one (a browser window's `name`) that has it.
+#[test]
+fn a_top_level_lexical_with_a_proxy_on_the_global_chain() {
+    let out = run_ok(
+        r#"
+        const backing = { name: "win" };
+        Object.setPrototypeOf(globalThis, new Proxy(backing, {
+          has(t, k) { return k in t; },
+          set(t, k, v, r) { t[k] = String(v); return true; },
+        }));
+        let y = null;
+        y = 2;
+        let name = { a: 1 };
+        const status = "ok";
+        console.log(y, typeof name, name.a, status, backing.name);
+        for (let i = 0; i < 3000; i++) { y = i; }
+        console.log(y, backing.y === undefined);
+        "#,
+    );
+    assert_eq!(
+        out,
+        [
+            "2 object 1 ok win",
+            "2999 true",
         ]
     );
 }
