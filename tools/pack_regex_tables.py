@@ -32,11 +32,9 @@ STRING_POOL = """
 const STRING_SETS: [Generated; %(count)d] = [
 %(names)s
 ];
-const STRING_STARTS: [(usize, usize); %(count)d + 1] = packed_strings::set_starts(&STRING_SETS);
-static STRING_LENGTHS: [u8; packed_strings::count_strings(&STRING_SETS)] =
-    packed_strings::pack_lengths(&STRING_SETS);
-static STRING_CODE_POINTS: [u8; packed_strings::count_code_points(&STRING_SETS) * 3] =
-    packed_strings::pack_code_points(&STRING_SETS);
+const STRING_STARTS: [(usize, usize, usize); %(count)d + 1] = packed_strings::set_starts(&STRING_SETS);
+static STRING_POOL: [u8; packed_strings::encoded_len(&STRING_SETS)] =
+    packed_strings::encode(&STRING_SETS);
 """
 STRING_LOOKUP_NEW = """pub(crate) fn string_property_sets(value: &UnicodeStringProperty) -> StringSet {
     use UnicodeStringProperty::*;
@@ -46,8 +44,7 @@ STRING_LOOKUP_NEW = """pub(crate) fn string_property_sets(value: &UnicodeStringP
         RGIEmoji => (0, %(count)d),
     };
     StringSet::new(
-        &STRING_LENGTHS,
-        &STRING_CODE_POINTS,
+        &STRING_POOL,
         STRING_STARTS[first],
         STRING_STARTS[last],
     )

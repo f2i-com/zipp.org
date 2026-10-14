@@ -27388,11 +27388,9 @@ const STRING_SETS: [Generated; 6] = [
     RGI_EMOJI_TAG_SEQUENCE,
     RGI_EMOJI_ZWJ_SEQUENCE,
 ];
-const STRING_STARTS: [(usize, usize); 6 + 1] = packed_strings::set_starts(&STRING_SETS);
-static STRING_LENGTHS: [u8; packed_strings::count_strings(&STRING_SETS)] =
-    packed_strings::pack_lengths(&STRING_SETS);
-static STRING_CODE_POINTS: [u8; packed_strings::count_code_points(&STRING_SETS) * 3] =
-    packed_strings::pack_code_points(&STRING_SETS);
+const STRING_STARTS: [(usize, usize, usize); 6 + 1] = packed_strings::set_starts(&STRING_SETS);
+static STRING_POOL: [u8; packed_strings::encoded_len(&STRING_SETS)] =
+    packed_strings::encode(&STRING_SETS);
 
 /// Property-of-strings names: line i selects the run `STRING_PROPERTY_RUNS[i]` of the sets.
 /// Each value is its names, each a length byte and the name, then a zero byte.
@@ -27406,8 +27404,7 @@ const STRING_PROPERTY_RUNS: [(usize, usize); 7] =
 pub(crate) fn string_property_from_str(name: &str) -> Option<StringSet> {
     let (first, last) = STRING_PROPERTY_RUNS[lookup_property_name(STRING_PROPERTY_NAMES, name)?];
     Some(StringSet::new(
-        &STRING_LENGTHS,
-        &STRING_CODE_POINTS,
+        &STRING_POOL,
         STRING_STARTS[first],
         STRING_STARTS[last],
     ))
