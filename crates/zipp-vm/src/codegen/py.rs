@@ -1586,6 +1586,42 @@ pub(crate) struct PyRegionPlan {
     pub work: usize,
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_PY_HEADER_DOMINANCE=1` plans a Python region whose header
+    /// does not dominate its back-edge, as before (the same-binary A/B for
+    /// [`py_dominates`]'s test in [`py_region_plan`]).
+    fn py_header_dominance_enabled() = "ZIPP_NO_PY_HEADER_DOMINANCE"
+}
+
+/// Whether every path from the code's entry to `b` passes `h` (the code's
+/// own edges: each instruction's targets, a fused instruction's `slow` and
+/// second edges, a `PushHandler`'s catch target, and the fall-through).
+fn py_dominates(proto: &FuncProto, h: usize, b: usize) -> bool {
+    let code = &proto.code;
+    let n = code.len();
+    if h == 0 || b >= n {
+        return true;
+    }
+    let mut seen = vec![false; n];
+    let mut stack = vec![0usize];
+    seen[0] = true;
+    while let Some(ip) = stack.pop() {
+        if ip == b {
+            return false;
+        }
+        let i = &code[ip];
+        let falls = !matches!(i, Instr::Jump { .. } | Instr::Return { .. } | Instr::ReturnUndefined | Instr::Throw { .. });
+        let next = falls.then_some(ip + 1);
+        for t in control_targets(i).into_iter().flatten().map(|t| t as usize).chain(next) {
+            if t < n && t != h && !seen[t] {
+                seen[t] = true;
+                stack.push(t);
+            }
+        }
+    }
+    true
+}
+
 /// Decide whether the Python loop headed at `start` (the dispatcher's
 /// region `[start, end]`) compiles, and as what. Pure: it reads only the
 /// bytecode. A string-constant load counts as compilable here: the
@@ -1607,6 +1643,16 @@ pub(crate) fn py_region_plan(proto: &FuncProto, start: u32, end: u32, native: &[
         .find(|&ip| matches!(proto.code[ip], Instr::Jump { target } if target == start))
         .map(|ip| ip as u32)
         .ok_or_else(|| "no back-edge in the body".to_string())?;
+    // A loop's header comes before its back-edge on every path. A body with
+    // no frame guard (a lambda, a comprehension) has no main end to tell
+    // its out-of-line code by, and a slow path there that rejoins its fast
+    // path at an instruction before itself (a `rec[0]` lambda's subscript
+    // rejoining at its `return`) is a backward jump the code reaches
+    // without passing that instruction: no loop. It used to compile, deopt
+    // on every entry and be evicted.
+    if py_header_dominance_enabled() && !py_dominates(proto, start as usize, end as usize) {
+        return Err("no loop: the back-edge is reached without passing its header".into());
+    }
     // Every string constant counts as loadable (see above).
     let strings: FxHashMap<u32, u64> = proto
         .code
