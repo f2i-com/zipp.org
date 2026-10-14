@@ -794,6 +794,19 @@ impl<'p> Vm<'p> {
                     // A legacy sloppy function OWNS `caller`/`arguments`.
                     || self.fn_has_legacy_caller_prop(obj.heap_index(), key)
             }
+            // An integer-indexed exotic object: a CanonicalNumericIndexString
+            // is an own property exactly when it is a valid integer index (in
+            // range of a live buffer: "-0", "1.5" and an index past the end
+            // or on a detached buffer are not); every other key is an
+            // ordinary named property in the side table.
+            HeapObj::TypedArray { .. } => {
+                if self.is_canonical_numeric_index(key) {
+                    return self.ta_valid_index(obj.heap_index(), key).is_some();
+                }
+                self.arr_props
+                    .get(&obj.heap_index())
+                    .map_or(false, |m| m.pos(key).is_some())
+            }
             // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*, …)
             // keep their named own props in the arr_props side table; a boxed String
             // also owns the wrapped string's chars + `length`.
