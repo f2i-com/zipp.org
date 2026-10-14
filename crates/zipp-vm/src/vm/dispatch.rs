@@ -1264,6 +1264,25 @@ impl<'p> Vm<'p> {
                                     "ReferenceError: {name} is not defined"
                                 )));
                             }
+                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
+                            // A REAL own property of the global object shadows
+                            // the live slot (a defineProperty'd `var`): it is the
+                            // binding, and a strict write to a non-writable one is
+                            // a TypeError, never a slot write. StoreGlobal and
+                            // StoreGlobalStrict route the same way; this arm
+                            // (strict `x = v` after CheckGlobalResolvable, `x++`)
+                            // did not, so `"use strict"; x = 1` wrote through a
+                            // read-only `x`. The JIT gates refuse a shadowed slot
+                            // for this op (`global_store_slot_directly_routable`),
+                            // so compiled code never reaches one.
+                            let name = self.global_slot_name(idx).unwrap_or_default();
+                            if !self.global_name_is_lexical(&name) {
+                                let v = self.get(base, src);
+                                let gobj = Value::heap(self.global_this);
+                                self.set_prop(gobj, &name, v, true)?;
+                                ip += 1;
+                                continue;
+                            }
                         }
                         if !self.eval_const_globals.is_empty()
                             && self.eval_const_globals.contains(&idx)
