@@ -9561,7 +9561,11 @@ impl<'p> Vm<'p> {
     /// `Number.is*` tests, the `Promise` statics, `Object.defineProperty` and
     /// its siblings) applied to `args`, once the instruction's callee and
     /// receiver are proven the intrinsic (`static_fn_is_intrinsic`). Shared by
-    /// the interpreter's arm and compiled code (`jit_static_fn_ic`).
+    /// the interpreter's arm and compiled code (`jit_static_fn_ic`). Inlined
+    /// into both: the interpreter loop kept this body inline before it was
+    /// shared, and calling it out of line moved the loop's code enough to
+    /// cost every interpreted Python call about 5%.
+    #[inline(always)]
     pub(crate) fn static_fn_exec(
         &mut self,
         op: crate::bytecode::StaticFn,
