@@ -301,6 +301,53 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// [[Get]] of the array index `i` from the prototype `proto` up, for a
+    /// hole or an index past an Array's end: each level a plain object,
+    /// searched by number. `%Array.prototype%` is such a level here, though
+    /// the property caches keep away from it (`ic_obj_ok`): what they guard
+    /// against is its named methods, not its elements. `None`: an accessor
+    /// or an exotic level, which the caller's walk by key text serves.
+    fn hole_chain_get(&self, proto: u32, i: usize) -> Option<Value> {
+        if !index_key_fast_enabled()
+            || !self.deferred_ns_state.is_empty()
+            || !self.realm_global_objs.is_empty()
+        {
+            return None;
+        }
+        let mut cur = proto;
+        for _ in 0..64 {
+            if (cur == self.global_this && self.global_this != 0)
+                || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&cur))
+            {
+                return None;
+            }
+            match self.heap.get(cur) {
+                HeapObj::Object(m) if !m.is_ctor && m.class.is_none() => {
+                    if let Some(s) = m.element_pos(i) {
+                        if m.attr_at(s).accessor {
+                            return None; // the getter is user code
+                        }
+                        let v = m.val_at(s);
+                        return (!v.is_uninitialized()).then_some(v);
+                    }
+                }
+                _ => return None, // exotic link
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                // Explicit null prototype: a true chain miss.
+                Some(_) => return Some(Value::UNDEFINED),
+                None => {
+                    if self.obj_proto == 0 || cur == self.obj_proto {
+                        return Some(Value::UNDEFINED);
+                    }
+                    self.obj_proto
+                }
+            };
+        }
+        None
+    }
+
     /// `o[i] = v` for an array index `i` on the plain object `idx`: a store
     /// into its own writable data property, or the append of `i` when the
     /// object is extensible and class-less and no level of its chain holds an
@@ -585,15 +632,27 @@ impl<'p> Vm<'p> {
                     {
                         return Ok(Value::UNDEFINED);
                     }
-                    // The walk's key text is the canonical decimal of `i` for BOTH
-                    // key shapes, so spell it from `i` (no key_of allocation).
-                    let mut buf = [0u8; 20];
-                    let k = crate::heap::index_key(&mut buf, i);
                     let proto = match self.proto_of.get(&aidx) {
                         Some(&p) => p,
                         None if self.arr_proto != 0 => Value::heap(self.arr_proto),
                         None => Value::NULL,
                     };
+                    // Prototypes that are plain objects are searched for `i`
+                    // by number (`element_pos`), with nothing spelt: once an
+                    // index on %Array.prototype% has taken the shortcut above
+                    // away, every hole read spelt its index, hashed it and
+                    // searched both prototypes by text. A data property or a
+                    // chain miss is answered here; an accessor or an exotic
+                    // level takes the walk below.
+                    if proto.is_heap() {
+                        if let Some(v) = self.hole_chain_get(proto.heap_index(), i) {
+                            return Ok(v);
+                        }
+                    }
+                    // The walk's key text is the canonical decimal of `i` for BOTH
+                    // key shapes, so spell it from `i` (no key_of allocation).
+                    let mut buf = [0u8; 20];
+                    let k = crate::heap::index_key(&mut buf, i);
                     if proto.is_heap() {
                         return self.with_native_recursion_guard(|vm| vm.get_member(proto, k, obj));
                     }
