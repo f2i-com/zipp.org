@@ -1535,6 +1535,34 @@ impl<'p> Vm<'p> {
         }
         let p = self.py_rt_for(rt)?;
         let (tl, tt, td, ts) = (p.t_list.bits(), p.t_tuple.bits(), p.t_dict.bits(), p.t_set.bits());
+        // A record of the sequence or dict template's shape, read once (its
+        // class, then its items or its `size`, at their slots), as the
+        // general code below reads it in three passes.
+        let (seq_shape, dict_shape, size_slot) = (p.seq_shape, p.dict_shape, p.dict_slots[1]);
+        if let HeapObj::Object(m) = self.heap.get(v.heap_index()) {
+            let shape = m.shape();
+            if !m.is_ctor && shape != crate::shape::DICT {
+                let cls = m.val_at(0).bits();
+                if shape == seq_shape && (cls == tl || cls == tt) {
+                    let items = m.val_at(1);
+                    if !items.is_heap() {
+                        return None;
+                    }
+                    return match self.heap.get(items.heap_index()) {
+                        HeapObj::Array(a) => Some(a.len()),
+                        _ => None,
+                    };
+                }
+                if shape == dict_shape && (cls == td || cls == ts) {
+                    let size = m.val_at(size_slot);
+                    if !size.is_number() {
+                        return None;
+                    }
+                    let n = size.as_f64();
+                    return (n >= 0.0 && n.fract() == 0.0 && n < 9_007_199_254_740_992.0).then_some(n as usize);
+                }
+            }
+        }
         let cls = self.py_cls_of(v)?.bits();
         if cls == tl || cls == tt {
             let (_, items) = self.py_seq_parts(v)?;
