@@ -305,6 +305,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             shape_key_plans: Vec::new(),
             for_in_barren: rustc_hash::FxHashMap::default(),
+            for_in_silent: rustc_hash::FxHashMap::default(),
             regexp_string_iters: rustc_hash::FxHashMap::default(),
             matchall_batches: rustc_hash::FxHashMap::default(),
             matchall_caps_scratch: Vec::new(),

@@ -1872,6 +1872,11 @@ pub struct Vm<'p> {
     /// each key. Measured, `for (k in o)` on a one-key object cost 185ns against
     /// node's 3.
     for_in_barren: rustc_hash::FxHashMap<u32, u32>,
+    /// Prototype levels a `for-in` has found to contribute no key, keyed as
+    /// `for_in_barren` is, without its requirement that the level end the
+    /// chain: `%Array.prototype%`, below which an Array's own keys are the
+    /// whole list when `%Object.prototype%` is barren too.
+    for_in_silent: rustc_hash::FxHashMap<u32, u32>,
     /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index —
     /// see [`proxy_regexp::RegexpIterRec`] for the record's fields.
     // W11 (B124): FxHashMap — the fused matchAll step probes this map once
