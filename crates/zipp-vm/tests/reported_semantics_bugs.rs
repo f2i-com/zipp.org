@@ -131,7 +131,7 @@ fn replaced_console_methods_are_called() {
 }
 
 /// #44: `performance` is a global object whose `now` can be read and
-/// replaced, by a program or an embedder.
+/// replaced, by a program or an embedder, with a read-only `timeOrigin`.
 #[test]
 fn performance_is_a_real_object() {
     let out = run_ok(
@@ -151,6 +151,12 @@ fn performance_is_a_real_object() {
         console.log(performance.now());
         globalThis.performance = saved;
         var order = []; performance.now((order.push("arg"), 1)); console.log(order.join());
+        var origin = performance.timeOrigin;
+        console.log(typeof origin, origin > 1.7e12, Math.abs(origin + performance.now() - Date.now()) < 50,
+            "timeOrigin" in performance);
+        performance.timeOrigin = 5;
+        console.log(performance.timeOrigin === origin);
+        (function () { "use strict"; try { performance.timeOrigin = 5; console.log("no"); } catch (e) { console.log(e.constructor.name); } })();
         "#,
     );
     assert_eq!(
@@ -162,6 +168,9 @@ fn performance_is_a_real_object() {
             "true",
             "7",
             "arg",
+            "number true true true",
+            "true",
+            "TypeError",
         ]
     );
 }
