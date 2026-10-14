@@ -1543,7 +1543,11 @@ impl Vm<'_> {
     /// recycled index and turns dead finalization targets into cleanup cells.
     fn process_weak_references(&mut self, marks: &[bool], n: usize) {
         let mut weak_containers = std::mem::take(&mut self.weak_containers);
-        let mut invalidated_collections = Vec::new();
+        // An indexed WeakMap/WeakSet tombstones its dead entries and drops
+        // them from its index in place (`dead_indexed`), as `delete` does;
+        // compacting it would shift every later slot and cost an index rebuild
+        // over every entry at the next lookup. An unindexed one compacts.
+        let mut dead_indexed: Vec<(u32, Value, usize)> = Vec::new();
         let mut cleanup_jobs = Vec::new();
         weak_containers.retain(|&raw_idx| {
             let idx = raw_idx as usize;
@@ -1562,16 +1566,33 @@ impl Vm<'_> {
             if idx >= n || !marks[idx] {
                 continue;
             }
+            let indexed = self.collection_index.contains_key(&raw_idx);
+            let dead = |v: Value| {
+                v.is_heap() && ((v.heap_index() as usize) >= n || !marks[v.heap_index() as usize])
+            };
             match self.heap.get_mut(raw_idx) {
+                HeapObj::WeakMap { keys, vals } if indexed => {
+                    for pos in 0..keys.len() {
+                        if dead(keys[pos]) {
+                            dead_indexed.push((raw_idx, keys[pos], pos));
+                            keys[pos] = Value::HOLE;
+                            vals[pos] = Value::UNDEFINED;
+                        }
+                    }
+                }
+                HeapObj::WeakSet(items) if indexed => {
+                    for pos in 0..items.len() {
+                        if dead(items[pos]) {
+                            dead_indexed.push((raw_idx, items[pos], pos));
+                            items[pos] = Value::HOLE;
+                        }
+                    }
+                }
                 HeapObj::WeakMap { keys, vals } => {
-                    let before = keys.len();
                     let mut write = 0usize;
-                    for read in 0..before {
+                    for read in 0..keys.len() {
                         let key = keys[read];
-                        let live = key.is_heap()
-                            && (key.heap_index() as usize) < n
-                            && marks[key.heap_index() as usize];
-                        if live {
+                        if key.is_heap() && !dead(key) {
                             if write != read {
                                 keys[write] = key;
                                 vals[write] = vals[read];
@@ -1581,20 +1602,9 @@ impl Vm<'_> {
                     }
                     keys.truncate(write);
                     vals.truncate(write);
-                    if keys.len() != before {
-                        invalidated_collections.push(raw_idx);
-                    }
                 }
                 HeapObj::WeakSet(items) => {
-                    let before = items.len();
-                    items.retain(|value| {
-                        value.is_heap()
-                            && (value.heap_index() as usize) < n
-                            && marks[value.heap_index() as usize]
-                    });
-                    if items.len() != before {
-                        invalidated_collections.push(raw_idx);
-                    }
+                    items.retain(|&value| value.is_heap() && !dead(value));
                 }
                 HeapObj::WeakRef(target) => {
                     if target.is_heap()
@@ -1645,8 +1655,17 @@ impl Vm<'_> {
                 _ => {}
             }
         }
-        for idx in invalidated_collections {
-            self.collection_index.remove(&idx);
+        // The dead keys' objects are not swept yet, so hashing them to find
+        // their index entries reads live memory.
+        let mut touched: Vec<u32> = Vec::new();
+        for (idx, key, pos) in dead_indexed {
+            self.coll_index_remove(idx, key, pos);
+            if touched.last() != Some(&idx) {
+                touched.push(idx);
+            }
+        }
+        for idx in touched {
+            self.weak_coll_compact_if_sparse(idx);
         }
         for registry in cleanup_jobs {
             self.microtasks

@@ -659,11 +659,84 @@ impl<'p> Vm<'p> {
     }
 
     /// Drop collection `idx`'s index entirely. The correct-by-default escape
-    /// hatch for mutations that shift positions (WeakMap/WeakSet delete) or
-    /// replace a collection instance slot. Absent = linear; the index rebuilds
-    /// lazily on the next indexed lookup.
+    /// hatch for a mutation that replaces a collection instance slot. Absent =
+    /// linear; the index rebuilds lazily on the next indexed lookup.
     pub(crate) fn coll_index_invalidate(&mut self, idx: u32) {
         self.collection_index.remove(&idx);
+    }
+
+    /// Delete the entry at `pos` (its key `key`) of the WeakMap/WeakSet `idx`.
+    /// An indexed collection tombstones the slot and drops just that key from
+    /// its index, as a Map does; shifting the later slots instead meant
+    /// dropping the index and rebuilding it over every entry at the next
+    /// lookup, so alternating `delete` and `get` cost O(n) each. A small
+    /// unindexed collection (under [`INDEX_THRESHOLD`] slots) still shifts.
+    /// A weak collection is never iterated, so its tombstones need not keep
+    /// their places: [`Vm::weak_coll_compact_if_sparse`] drops them in bulk.
+    pub(crate) fn weak_coll_delete(&mut self, idx: u32, pos: usize, key: Value) {
+        if !self.collection_index.contains_key(&idx) {
+            match self.heap.get_mut(idx) {
+                HeapObj::WeakMap { keys, vals } => {
+                    keys.remove(pos);
+                    vals.remove(pos);
+                }
+                HeapObj::WeakSet(items) => {
+                    items.remove(pos);
+                }
+                _ => {}
+            }
+            return;
+        }
+        match self.heap.get_mut(idx) {
+            HeapObj::WeakMap { keys, vals } => {
+                keys[pos] = Value::HOLE;
+                vals[pos] = Value::UNDEFINED;
+            }
+            HeapObj::WeakSet(items) => items[pos] = Value::HOLE,
+            _ => return,
+        }
+        self.coll_index_remove(idx, key, pos);
+        self.weak_coll_compact_if_sparse(idx);
+    }
+
+    /// Drop an indexed WeakMap/WeakSet's tombstones once they outnumber its
+    /// live entries (and the index threshold), rebuilding the index over the
+    /// survivors. Each compaction follows at least as many deletions as it
+    /// moves entries, so a delete costs O(1) amortized.
+    pub(crate) fn weak_coll_compact_if_sparse(&mut self, idx: u32) {
+        let Some(live) = self.collection_index.get(&idx).map(|ix| ix.live) else {
+            return;
+        };
+        let len = match self.heap.get(idx) {
+            HeapObj::WeakMap { keys, .. } => keys.len(),
+            HeapObj::WeakSet(items) => items.len(),
+            _ => return,
+        };
+        if len - live <= live.max(INDEX_THRESHOLD) {
+            return;
+        }
+        match self.heap.get_mut(idx) {
+            HeapObj::WeakMap { keys, vals } => {
+                let mut write = 0;
+                for read in 0..keys.len() {
+                    if !keys[read].is_hole() {
+                        keys[write] = keys[read];
+                        vals[write] = vals[read];
+                        write += 1;
+                    }
+                }
+                keys.truncate(write);
+                vals.truncate(write);
+            }
+            HeapObj::WeakSet(items) => items.retain(|v| !v.is_hole()),
+            _ => return,
+        }
+        let rebuilt = match self.heap.get(idx) {
+            HeapObj::WeakMap { keys, .. } => CollIndex::build(&self.heap, keys),
+            HeapObj::WeakSet(items) => CollIndex::build(&self.heap, items),
+            _ => return,
+        };
+        self.collection_index.insert(idx, rebuilt);
     }
 }
 

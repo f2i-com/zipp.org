@@ -3736,13 +3736,7 @@ impl<'p> Vm<'p> {
             }
             "delete" => {
                 if let Some(i) = self.coll_find(idx, a0) {
-                    if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
-                        keys.remove(i);
-                        vals.remove(i);
-                    }
-                    // Vec::remove SHIFTS every later position: drop the whole
-                    // index (rebuilds lazily) rather than patch it.
-                    self.coll_index_invalidate(idx);
+                    self.weak_coll_delete(idx, i, a0);
                     return Ok(Value::bool(true));
                 }
                 Ok(Value::bool(false))
@@ -3785,12 +3779,7 @@ impl<'p> Vm<'p> {
             }
             "delete" => {
                 if let Some(i) = self.coll_find(idx, a0) {
-                    if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
-                        items.remove(i);
-                    }
-                    // Vec::remove SHIFTS every later position: drop the whole
-                    // index (rebuilds lazily) rather than patch it.
-                    self.coll_index_invalidate(idx);
+                    self.weak_coll_delete(idx, i, a0);
                     return Ok(Value::bool(true));
                 }
                 Ok(Value::bool(false))
