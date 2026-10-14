@@ -928,3 +928,43 @@ fn native_random_draws_are_charged() {
     assert_eq!(native.output.clone().unwrap(), interpreted.output.clone().unwrap());
     assert!(native.steps + 100_000 < interpreted.steps, "{} vs {}", native.steps, interpreted.steps);
 }
+
+/// `_unbroadcast` outside create_graph sums with one kernel call into a
+/// tensor of the target shape; it must hold the bytes of the composite it
+/// replaces, `grad.sum(dims, keepdim=True).reshape(shape)`, for every
+/// broadcast form (leading dims, size-1 dims, both, a 0-d target), dtype
+/// and size, with the native loops off and on.
+const UNBROADCAST: &str = r#"
+import torch
+
+def pattern(shape, seed, dt):
+    n = 1
+    for d in shape:
+        n *= d
+    return torch.tensor([((i * 37 + seed * 11) % 23 - 11) / 7.0 + (i % 5) * 0.013 for i in range(n)], dtype=dt).reshape(shape)
+
+bad = []
+cases = 0
+for native in (False, True):
+    torch._k._native(native)
+    for dt in (torch.float32, torch.float64, torch.complex64):
+        for gs, ts in [((16, 64), (64,)), ((2, 16, 32), (32,)), ((4, 5), (1, 5)), ((4, 5), (4, 1)), ((3, 4, 5), (4, 1)), ((3, 4, 5), ()), ((2, 1, 6), (1, 6)), ((7,), (1,)), ((2, 3, 4), (1, 3, 1))]:
+            g = pattern(gs, len(gs) + len(ts), dt) if not dt.is_complex else torch.complex(pattern(gs, 1, torch.float32), pattern(gs, 2, torch.float32))
+            shape = torch.Size(ts)
+            with torch.no_grad():
+                got = torch._unbroadcast(g, shape)
+                dims = list(range(len(gs) - len(ts))) + [len(gs) - len(ts) + i for i, d in enumerate(ts) if d == 1 and gs[len(gs) - len(ts) + i] != 1]
+                ref = g.sum(dims, keepdim=True).reshape(shape)
+            cases += 1
+            if got.dtype is not ref.dtype or tuple(got.shape) != tuple(ref.shape) or torch._k.tobytes(got._s) != torch._k.tobytes(ref._s):
+                bad.append("%s %s %s %s" % (dt, gs, ts, native))
+print("cases", cases, "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn unbroadcast_sum_gives_the_composites_bytes() {
+    let run = run(UNBROADCAST, 2_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 54 mismatches 0 []"), "{}", out[0]);
+}

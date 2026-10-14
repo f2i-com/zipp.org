@@ -843,6 +843,12 @@ def _unbroadcast(grad, shape):
             if d == 1 and grad.shape[extra + i] != 1:
                 dims.append(extra + i)
     if dims:
+        if not _grad_enabled and grad.__class__ is Tensor and grad.dtype._inexact:
+            # What `grad.sum(dims, keepdim=True).reshape(shape)` computes
+            # outside create_graph (the dims are normalised already, the
+            # sum precise as `sum`'s), as one tensor of the target shape:
+            # the sum's storage is its own, so no view of it is needed.
+            return Tensor(_k.reduce("sum", grad._s, gshape, dims, True, True)[0], shape, grad.dtype)
         grad = grad.sum(dims, keepdim=True)
     return grad.reshape(shape)
 
