@@ -123,6 +123,17 @@ impl<'p> Vm<'p> {
         if self.loader_module_func(func_id) {
             jit_module_functions_enabled()
         } else {
+            // A metered VM keeps eval code in the interpreter, as it always
+            // ran there: the native tiers charge a step budget only roughly
+            // (a counted loop with a branch is charged four steps more than
+            // the interpreter counts, a self-recursive function a quarter
+            // less) and poll a heap ceiling per native entry, so code run
+            // through `eval_in_context` under limits overshot by tens of
+            // megabytes and stopped at a different step.
+            #[cfg(feature = "instrument")]
+            if self.instr_rec.is_some() {
+                return false;
+            }
             jit_eval_functions_enabled()
         }
     }
