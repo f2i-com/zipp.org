@@ -14,15 +14,14 @@
 //! string. Times are seconds here; the callers scale to nanoseconds.
 
 use super::tzdata::{
-    FinalRule, Zone, FINALS, ID_END, ID_NAMES, ID_ZONE, PRIMARY_IDS, TRANS_BLOCK_DAY,
-    TRANS_BLOCK_POS,
-    TRANS_BLOCK_TOD, TRANS_BYTES, TRANS_OFFSET, TRANS_PALETTE, TRANS_TOD, ZONE_FIN_YEAR, ZONE_ID,
-    ZONE_INIT, ZONE_LAST_AT, ZONE_LAST_OFF, ZONE_NFIN, ZONE_NTR, ZONE_STD,
+    FinalRule, Zone, FINALS, ID_LEN, ID_NAMES, ID_ZONE, PRIMARY_IDS, TRANS_BLOCK_DAY,
+    TRANS_BLOCK_LEN, TRANS_BLOCK_TOD, TRANS_BYTES, TRANS_OFFSET, TRANS_PALETTE, TRANS_TOD,
+    ZONE_FIN_YEAR, ZONE_ID, ZONE_INIT, ZONE_LAST_AT, ZONE_LAST_OFF, ZONE_NFIN, ZONE_NTR, ZONE_STD,
 };
 
 /// The transitions of all zones form one list, stored in blocks of this many
 /// (see `tools/pack_tz_transitions.py`): an instant is read by decoding at
-/// most one block, with no expanded database or cache.
+/// most one block; only the blocks' positions are summed once ([`sums`]).
 const BLOCK: usize = 32;
 const DAY: i64 = 86400;
 
@@ -44,7 +43,7 @@ impl Cursor {
     fn new(block: usize) -> Self {
         let tod = TRANS_TOD[TRANS_BLOCK_TOD[block] as usize];
         Cursor {
-            pos: TRANS_BLOCK_POS[block] as usize,
+            pos: usize::from(sums().block_pos[block]),
             day: i64::from(TRANS_BLOCK_DAY[block]),
             tod,
             prev_tod: tod,
@@ -168,7 +167,7 @@ pub(crate) struct TzId {
 /// shipping the table is that an unknown name fails loudly instead of
 /// silently formatting as UTC.
 pub(crate) fn lookup(id: &str) -> Option<TzId> {
-    let (mut low, mut high) = (0, ID_END.len());
+    let (mut low, mut high) = (0, ID_LEN.len());
     while low < high {
         let mid = low + (high - low) / 2;
         match cmp_ascii_ci(id_name(mid), id) {
@@ -187,8 +186,53 @@ pub(crate) fn lookup(id: &str) -> Option<TzId> {
 
 /// Zone or Link name `i` of the identifier list.
 fn id_name(i: usize) -> &'static str {
-    let start = if i == 0 { 0 } else { ID_END[i - 1] as usize };
-    &ID_NAMES[start..ID_END[i] as usize]
+    let ends = &sums().id_end;
+    let start = if i == 0 { 0 } else { ends[i - 1] as usize };
+    &ID_NAMES[start..ends[i] as usize]
+}
+
+/// Where each transition block's bytes start in `TRANS_BYTES` and where each
+/// identifier ends in `ID_NAMES`: the running sums of `TRANS_BLOCK_LEN` and
+/// `ID_LEN`, taken at the first lookup rather than stored. Compressed on
+/// their own, the 16-bit positions were about 1.8 KB, the byte lengths are
+/// 0.6 KB.
+struct Sums {
+    block_pos: Vec<u16>,
+    id_end: Vec<u16>,
+}
+
+static SUMS: std::sync::OnceLock<Sums> = std::sync::OnceLock::new();
+
+fn sums() -> &'static Sums {
+    match SUMS.get() {
+        Some(sums) => sums,
+        None => take_sums(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn take_sums() -> &'static Sums {
+    SUMS.get_or_init(|| {
+        let mut at = 0u16;
+        let block_pos = TRANS_BLOCK_LEN
+            .iter()
+            .map(|&n| {
+                let start = at;
+                at += u16::from(n);
+                start
+            })
+            .collect();
+        let mut end = 0u16;
+        let id_end = ID_LEN
+            .iter()
+            .map(|&n| {
+                end += u16::from(n);
+                end
+            })
+            .collect();
+        Sums { block_pos, id_end }
+    })
 }
 
 /// Where each zone's transitions and final rules start. Zones keep both
@@ -574,7 +618,7 @@ mod tests {
                 row.name
             );
         }
-        assert_eq!(ID_ROWS.len(), ID_END.len());
+        assert_eq!(ID_ROWS.len(), ID_LEN.len());
         for (i, &(name, zone)) in ID_ROWS.iter().enumerate() {
             assert_eq!((id_name(i), ID_ZONE[i]), (name, zone), "identifier {i}");
             // Every name, in any case, finds itself and its zone.
@@ -583,7 +627,10 @@ mod tests {
                 assert_eq!((found.canonical, found.zone), (name, zone), "{spelling}");
             }
         }
-        assert_eq!(ID_END.last().map(|&end| end as usize), Some(ID_NAMES.len()));
+        assert_eq!(
+            sums().id_end.last().map(|&end| end as usize),
+            Some(ID_NAMES.len())
+        );
     }
 
     /// The generated primary identifier list is every zone's primary

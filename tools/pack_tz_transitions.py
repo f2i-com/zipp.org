@@ -16,7 +16,8 @@ time of day, because a zone's changes fall on a few times of day (02:00 local,
   zone into the next) and then its time of day: 0 when it is the time of the
   transition two before it in the same block (summer and winter alternate),
   else 1 + its TRANS_TOD index as a varint.
-- TRANS_BLOCK_POS: where each block's second transition starts in TRANS_BYTES.
+- TRANS_BLOCK_LEN: the bytes of each block's later transitions in TRANS_BYTES,
+  whose running sums (tzdb.rs takes them once) are where each block starts.
 - TRANS_OFFSET: one byte per transition, its offset's index in TRANS_PALETTE
   (the distinct offsets, ascending), so an offset is read without decoding.
 """
@@ -60,15 +61,18 @@ def encode_transitions(times, offsets):
             data.append(0)
         else:
             _varint(data, tindex[tod] + 1)
-    assert len(data) <= 65535, "widen TRANS_BLOCK_POS before updating tzdb"
+    assert len(data) <= 65535, "widen the block positions in tzdb.rs before updating tzdb"
+    block_len = [end - start for start, end in zip(block_pos, block_pos[1:] + [len(data)])]
+    assert all(n < 256 for n in block_len), "widen TRANS_BLOCK_LEN before updating tzdb"
     assert all(-(2**31) <= d < 2**31 for d in block_day)
     offset_index = [pindex[o] for o in offsets]
-    assert decode_transitions(block_day, block_tod, block_pos, tods, data, len(times)) == list(times)
-    return block_day, block_tod, block_pos, tods, palette, offset_index, data
+    assert decode_transitions(block_day, block_tod, block_len, tods, data, len(times)) == list(times)
+    return block_day, block_tod, block_len, tods, palette, offset_index, data
 
 
-def decode_transitions(block_day, block_tod, block_pos, tods, data, count):
+def decode_transitions(block_day, block_tod, block_len, tods, data, count):
     """The instants back from the encoded form, as tzdb.rs reads them."""
+    block_pos = [sum(block_len[:i]) for i in range(len(block_len))]
     out = []
     for block in range((count + BLOCK - 1) // BLOCK):
         pos, day = block_pos[block], block_day[block]
@@ -103,9 +107,9 @@ def decode_transitions(block_day, block_tod, block_pos, tods, data, count):
 
 def emit_packed_transitions(append, times, offsets):
     arrays = zip(
-        ("TRANS_BLOCK_DAY", "TRANS_BLOCK_TOD", "TRANS_BLOCK_POS", "TRANS_TOD", "TRANS_PALETTE",
+        ("TRANS_BLOCK_DAY", "TRANS_BLOCK_TOD", "TRANS_BLOCK_LEN", "TRANS_TOD", "TRANS_PALETTE",
          "TRANS_OFFSET", "TRANS_BYTES"),
-        ("i32", "u16", "u16", "u32", "i32", "u8", "u8"),
+        ("i32", "u16", "u8", "u32", "i32", "u8", "u8"),
         encode_transitions(times, offsets),
     )
     append("// Blocks of 32 transitions: each block's first instant as a day and a time")
