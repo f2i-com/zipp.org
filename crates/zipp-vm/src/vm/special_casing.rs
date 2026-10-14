@@ -225,6 +225,11 @@ pub(crate) fn transform_case_each(
                     });
                     true
                 }
+                // Final_Sigma holds in these languages too.
+                '\u{3A3}' => {
+                    emit(lower_sigma(s, i));
+                    true
+                }
                 _ => false,
             }
         };
@@ -449,16 +454,25 @@ pub(crate) fn str_to_lowercase(s: &str) -> String {
         if c.is_ascii() {
             out.push(c.to_ascii_lowercase());
         } else if c == '\u{3A3}' {
-            let before = s.get(..i).unwrap_or_default();
-            let after = s.get(i + c.len_utf8()..).unwrap_or_default();
-            let word_final = cased_past_ignorables(before.chars().rev())
-                && !cased_past_ignorables(after.chars());
-            out.push(if word_final { '\u{3C2}' } else { '\u{3C3}' });
+            out.push(lower_sigma(s, i));
         } else {
             push_mapped(&mut out, c, &CASE_LOWER);
         }
     }
     out
+}
+
+/// The lowercase of the capital sigma at byte `i` of `s`: the final form
+/// after a cased letter and not before one (case-ignorable characters
+/// skipped on both sides), the ordinary one otherwise.
+fn lower_sigma(s: &str, i: usize) -> char {
+    let before = s.get(..i).unwrap_or_default();
+    let after = s.get(i + '\u{3A3}'.len_utf8()..).unwrap_or_default();
+    if cased_past_ignorables(before.chars().rev()) && !cased_past_ignorables(after.chars()) {
+        '\u{3C2}'
+    } else {
+        '\u{3C3}'
+    }
 }
 
 /// Whether the first character of `chars` that is not case-ignorable is cased.
@@ -830,6 +844,25 @@ mod tests {
         );
         // Not after a Soft_Dotted letter: the dot stays.
         assert_eq!(transform_case("I\u{307}", "lt", true).unwrap(), "I\u{307}");
+    }
+
+    /// The language mappings keep the default `Final_Sigma` rule: a Greek
+    /// string lowercases in tr, az and lt as it does by default.
+    #[test]
+    fn final_sigma_in_the_language_mappings() {
+        for s in [
+            "\u{391}\u{3A3}",
+            "\u{3A3}",
+            "\u{391}\u{3A3}\u{391}",
+            "\u{391}\u{3A3} \u{3A3}\u{391}\u{3A3}.",
+            "A\u{3A3}'s \u{3A3}\u{308}x \u{3A3}\u{308}",
+        ] {
+            for lang in ["tr", "az", "lt"] {
+                assert_eq!(transform_case(s, lang, false).unwrap(), s.to_lowercase(), "{s:?} {lang}");
+            }
+        }
+        // Cased context is read from the source, so a Turkish I counts.
+        assert_eq!(transform_case("I\u{3A3}", "tr", false).unwrap(), "\u{131}\u{3C2}");
     }
 
     #[test]
