@@ -334,6 +334,36 @@ fn le64(c: &[u8]) -> f64 {
     f64::from_le_bytes(<[u8; 8]>::try_from(c).unwrap_or([0; 8]))
 }
 
+/// binaryFast's layouts over float32/float64 bytes (`py_tensor`'s
+/// OP_BIN_FAST): mode 0 `a` and `b` of one length, 1 `b` one element, 2 `a`
+/// one element, 3 `b` a bias tiled over `a` (`brow` bytes a row), 4 `a` a
+/// bias tiled over `b` (`arow` bytes a row); each element `f(a's, b's)`,
+/// computed and stored as `bytes_map2` does.
+pub(super) fn bytes_map_modes(kind: u8, mode: u8, a: &[u8], b: &[u8], out: &mut [u8], brow: usize, arow: usize, f: impl Fn(f64, f64) -> f64) {
+    match mode {
+        0 => bytes_map2(kind, a, b, out, false, false, f),
+        1 => bytes_map2(kind, a, b, out, true, false, f),
+        2 => bytes_map2(kind, b, a, out, true, true, f),
+        3 => {
+            for (o, x) in out.chunks_exact_mut(brow).zip(a.chunks_exact(brow)) {
+                bytes_map2(kind, x, b, o, false, false, &f);
+            }
+        }
+        _ => {
+            for (o, y) in out.chunks_exact_mut(arow).zip(b.chunks_exact(arow)) {
+                bytes_map2(kind, a, y, o, false, false, &f);
+            }
+        }
+    }
+}
+
+/// `out[i] = f(a[i], y)`, or `f(y, a[i])` when `flip`, over float32/float64
+/// bytes, `y` a value of that kind (`py_tensor`'s OP_BIN_SCALAR_FAST).
+pub(super) fn bytes_map_scalar(kind: u8, a: &[u8], y: f64, flip: bool, out: &mut [u8], f: impl Fn(f64, f64) -> f64) {
+    let yb = if kind == KIND_F32 { (y as f32).to_le_bytes().to_vec() } else { y.to_le_bytes().to_vec() };
+    bytes_map2(kind, a, &yb, out, true, flip, f);
+}
+
 /// `out[i] = f(a[i], b[i])` over float32 (`kind` KIND_F32) or float64
 /// little-endian bytes, each element read as its f64 value and the result
 /// stored as `pt_write` stores it: the f64 loop over `pt_read` and

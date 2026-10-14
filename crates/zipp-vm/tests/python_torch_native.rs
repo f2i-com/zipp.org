@@ -1121,3 +1121,127 @@ fn transposed_in_place_product_gradients_give_the_composites_bytes() {
     assert_eq!(out.len(), 1, "{out:#?}");
     assert!(out[0].contains("cases 48 mismatches 0 []"), "{}", out[0]);
 }
+
+/// The ops the engine answers in one call when its kernels are its own
+/// (OP_BIN_FAST, OP_BIN_SCALAR_FAST, OP_MM_FAST: the result's typed array
+/// allocated and computed natively) against tensor.js's own paths (native
+/// loops off): the same bytes, or the same error, for add / sub / mul / div
+/// of two float32 or float64 tensors in every layout the fast path takes
+/// (equal shapes, a single element on either side, a bias of either side's
+/// trailing dims) and some it declines, with a Python number on either
+/// side, and products (batched left operands, transposed operands in place,
+/// F.linear, and the gradients through them), at sizes from one element,
+/// with signed zeros, subnormals, infinities and NaN.
+const FAST_PATHS: &str = r#"
+import torch
+import torch.nn.functional as F
+import _zipp_tensor as _k
+
+INF = float("inf")
+NAN = float("nan")
+SPECIAL = [0.0, -0.0, 1.0, -1.0, 1e-45, -3e-39, 3.4e38, 1e300, INF, -INF, NAN, 0.1, 7.0]
+
+
+def vals(n, seed, special):
+    out = []
+    for i in range(n):
+        j = (i * 7 + seed * 13) % 29
+        if special and j < len(SPECIAL) and (i + seed) % 3 == 0:
+            out.append(SPECIAL[j])
+        else:
+            out.append(((i * 37 + seed * 11) % 23 - 11) / 8.0 + (seed % 5) * 0.137)
+    return out
+
+
+def numel(shape):
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
+def make(shape, dt, seed, special):
+    return torch.tensor(vals(numel(shape), seed, special), dtype=dt).reshape(shape)
+
+
+def img(t):
+    return (str(t.dtype), tuple(t.shape), _k.tobytes(t._s))
+
+
+CASES = [0]
+BAD = []
+
+
+def both(label, fn):
+    CASES[0] += 1
+    res = []
+    for on in (False, True):
+        _k._native(on)
+        try:
+            res.append(("ok", fn()))
+        except Exception as e:
+            res.append(("err", type(e).__name__, str(e)))
+    _k._native(True)
+    if res[0] != res[1]:
+        BAD.append(label)
+
+
+OPS = {"add": lambda a, b: a + b, "sub": lambda a, b: a - b, "mul": lambda a, b: a * b, "div": lambda a, b: a / b}
+PAIRS = [((1,), (1,)), ((5,), (5,)), ((3, 4), (3, 4)), ((70,), (70,)), ((5,), ()), ((), (5,)), ((), ()),
+         ((1, 1), (3, 4)), ((3, 4), (1,)), ((2, 3, 4), (4,)), ((4,), (2, 3, 4)), ((2, 3, 4), (3, 4)),
+         ((3, 4), (2, 3, 4)), ((2, 3, 4), (1, 3, 4)), ((1, 3, 4), (2, 3, 4)), ((12, 8), (12, 1)),
+         ((1, 4), (4,)), ((3, 4), (4, 3)), ((3, 4), (1, 1, 4)), ((0, 4), (4,))]
+seed = 0
+for dt in (torch.float32, torch.float64):
+    for sa, sb in PAIRS:
+        for special in (False, True):
+            seed += 1
+            A, B = make(sa, dt, seed, special), make(sb, dt, seed + 1, special)
+            for name, f in OPS.items():
+                both("binary %s %s %s %s %s" % (name, dt, sa, sb, special), lambda: img(f(A, B)))
+    for n in (1, 3, 15, 16, 70):
+        seed += 1
+        A = make((n,), dt, seed, True)
+        for v in (2.5, -0.0, 3, 1e-45, 1e300, INF, NAN, 0.1, True):
+            for name, f in OPS.items():
+                both("scalar %s %s %s %r" % (name, dt, n, v), lambda: img(f(A, v)))
+                both("rscalar %s %s %s %r" % (name, dt, n, v), lambda: img(f(v, A)))
+    for sa, sb in [((3, 4), (4, 5)), ((1, 1), (1, 1)), ((2, 3, 4), (4, 5)), ((5, 4), (4, 1)), ((2, 2, 3, 4), (4, 2)),
+                   ((1, 7), (7, 1)), ((16, 9), (9, 17)), ((3, 4), (5, 2)), ((0, 4), (4, 3))]:
+        for special in (False, True):
+            seed += 1
+            A, B = make(sa, dt, seed, special), make(sb, dt, seed + 1, special)
+            both("matmul %s %s %s %s" % (dt, sa, sb, special), lambda: img(A @ B))
+            Bt = B.t().contiguous()
+            both("matmul transB %s %s %s %s" % (dt, sa, sb, special), lambda: _k.tobytes(_k.matmul(A._s, A.shape, Bt._s, Bt.shape, True)[0]))
+            both("linear %s %s %s %s" % (dt, sa, sb, special), lambda: img(F.linear(A, Bt)))
+            if len(sa) == 2:
+                At = A.t().contiguous()
+                both("matmul transA %s %s %s %s" % (dt, sa, sb, special), lambda: _k.tobytes(_k.matmul(At._s, At.shape, B._s, B.shape, False, True)[0]))
+    # A product's gradients (transposed operands read in place)
+    for sa, sb in [((3, 4), (4, 5)), ((2, 3, 4), (4, 5)), ((6, 9), (9, 2))]:
+        seed += 1
+        A0, B0 = make(sa, dt, seed, False), make(sb, dt, seed + 1, False)
+
+        def grads():
+            A = A0.clone().requires_grad_()
+            B = B0.clone().requires_grad_()
+            (A @ B).sin().sum().backward()
+            return img(A.grad), img(B.grad)
+        both("matmul grads %s %s %s" % (dt, sa, sb), grads)
+# mixed dtypes keep the general path
+for sa, sb in PAIRS[:6]:
+    seed += 1
+    A, B = make(sa, torch.float32, seed, True), make(sb, torch.float64, seed + 1, True)
+    for name, f in OPS.items():
+        both("mixed %s %s %s" % (name, sa, sb), lambda: img(f(A, B)))
+print("cases", CASES[0], "mismatches", len(BAD), BAD[:5])
+"#;
+
+#[test]
+fn engine_answered_ops_give_the_javascript_paths_bytes() {
+    let run = run(FAST_PATHS, 20_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 1206 mismatches 0 []"), "{}", out[0]);
+}

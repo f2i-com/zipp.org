@@ -384,6 +384,10 @@
     // hands back. `undefined` when the case is not one of these (the caller
     // takes `binary`).
     const FAST_BIN = { add: 1, sub: 2, mul: 3, div: 4 };
+    // The engine answers binaryFast's whole path itself (`py_tensor`,
+    // OP_BIN_FAST: the result's typed array, its layout in BINF_MODE[0])
+    // when the kernels are its own; a module across the wire declines it.
+    const N_BIN_FAST = 36, N_BIN_SCALAR_FAST = 37, BINF_MODE = new Float64Array(1), BINF_LOCAL = NATIVE_SMALL < NATIVE_MIN;
     function smallShape(py) {
         // The element count of a tuple/Size of ints, or -1.
         if (py === null || typeof py !== "object" || (py.cls !== SIZE && py.cls !== T.tuple)) return -1;
@@ -429,6 +433,10 @@
         const dt = x.dtype;
         if (y.dtype !== dt || (dt !== "float32" && dt !== "float64") || (want !== null && want !== dt)) return undefined;
         if (xpy === null || ypy === null || typeof xpy !== "object" || typeof ypy !== "object" || (xpy.cls !== SIZE && xpy.cls !== T.tuple) || (ypy.cls !== SIZE && ypy.cls !== T.tuple)) return undefined;
+        if (BINF_LOCAL && NATIVE !== null) {
+            const O = NATIVE(N_BIN_FAST, code, x.data, y.data, xpy, ypy, BINF_MODE);
+            if (O !== false) { const m = BINF_MODE[0]; return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, m === 2 || m === 4 ? ypy : xpy] }; }
+        }
         const p = xpy.items, q = ypy.items;
         let na = 1, nb = 1;
         for (let k = 0; k < p.length; k++) { const d = p[k]; if (typeof d !== "bigint") return undefined; na *= Number(d); }
@@ -499,6 +507,11 @@
         if (code === undefined || t === null || typeof t !== "object" || t.cls !== Storage) return undefined;
         const dt = t.dtype;
         if (sd !== dt || (dt !== "float32" && dt !== "float64") || (want !== null && want !== dt) || (typeof v !== "number" && typeof v !== "bigint")) return undefined;
+        if (BINF_LOCAL && NATIVE !== null && tpy !== null && typeof tpy === "object" && (tpy.cls === SIZE || tpy.cls === T.tuple)) {
+            const v1 = typeof v === "number" ? v : Number(v);
+            const O = NATIVE(N_BIN_SCALAR_FAST, code, t.data, dt === "float32" ? Math.fround(v1) : v1, flip === true, tpy);
+            if (O !== false) return { cls: T.tuple, items: [{ cls: Storage, dtype: dt, data: O, version: 0, untracked: 0 }, tpy] };
+        }
         const n = smallShape(tpy), A = t.data;
         if (n <= 0 || A.length !== n) return undefined;
         // (jsNumber's value of a Python float or int)
