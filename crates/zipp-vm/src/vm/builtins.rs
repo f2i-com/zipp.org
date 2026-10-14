@@ -562,6 +562,51 @@ impl<'p> Vm<'p> {
         self.proto_intrinsic_bits(name, is_arr)
     }
 
+    /// Whether a Get of `name` on WeakMap / WeakSet `idx` resolves to the boot
+    /// native `want` (`WM_GET`, `WS_ADD`, ...): no own property of that name,
+    /// the default prototype in the running realm, and the prototype's data
+    /// slot holding that native. The weak twin of
+    /// [`Vm::collection_method_is_intrinsic`], for the compiled tiers' fused
+    /// `m.get(k)` lanes, which cannot know which collection they will meet.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn weak_collection_method_is_intrinsic(
+        &mut self,
+        idx: u32,
+        name: &str,
+        want: u16,
+    ) -> bool {
+        let proto = match self.heap.get(idx) {
+            HeapObj::WeakMap { .. } => self.weakmap_proto,
+            HeapObj::WeakSet(_) => self.weakset_proto,
+            _ => return false,
+        };
+        if proto == 0
+            || !self.realm_global_objs.is_empty()
+            || self.active_realm_proto(proto) != proto
+            || (!self.arr_props.is_empty()
+                && self
+                    .arr_props
+                    .get(&idx)
+                    .is_some_and(|props| props.pos(name).is_some()))
+            || (!self.proto_of.is_empty()
+                && self
+                    .proto_of
+                    .get(&idx)
+                    .is_some_and(|&actual| actual != Value::heap(proto)))
+        {
+            return false;
+        }
+        match self.heap.get(proto) {
+            HeapObj::Object(map) => map.pos(name).is_some_and(|slot| {
+                let v = map.val_at(slot);
+                !map.attr_at(slot).accessor
+                    && v.is_heap()
+                    && matches!(self.heap.get(v.heap_index()), HeapObj::Native(id) if *id == want)
+            }),
+            _ => false,
+        }
+    }
+
     /// B289: the Value bits of the intrinsic a Get of `name` on this Map
     /// (`kind` 4) or Set (`kind` 3) receiver resolves to — the full
     /// [`Vm::collection_method_is_intrinsic`] proof (own shadow, custom

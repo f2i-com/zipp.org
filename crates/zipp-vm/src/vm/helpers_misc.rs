@@ -673,6 +673,22 @@ pub(crate) extern "win64" fn jit_coll_lookup(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let idx = recv.heap_index();
+    // The same call on a WeakMap / WeakSet (`m.get(k)` cannot know which it
+    // will meet): served through its own intrinsic proof. Declining it bailed
+    // the compiled body to the interpreter on every call, so a function doing
+    // `bridge(wm.get(this))` ran its rest interpreted.
+    if let Some(id) = match (vm.heap.get(idx), op) {
+        (crate::heap::HeapObj::WeakMap { .. }, 0) => Some(crate::vm::native::WM_GET),
+        (crate::heap::HeapObj::WeakMap { .. }, 1) => Some(crate::vm::native::WM_HAS),
+        (crate::heap::HeapObj::WeakSet(_), 2) => Some(crate::vm::native::WS_HAS),
+        _ => None,
+    } {
+        let name = if id == crate::vm::native::WM_GET { "get" } else { "has" };
+        if !vm.weak_collection_method_is_intrinsic(idx, name, id) {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        return jit_weak_coll(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, key_bits, 0, id);
+    }
     let (name, kind) = match op {
         0 => ("get", 4),
         1 => ("has", 4),
@@ -736,6 +752,19 @@ pub(crate) extern "win64" fn jit_coll_mutate(
     let idx = recv.heap_index();
     if idx as usize >= vm.heap.len() {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // A WeakMap / WeakSet receiver of the same call: see `jit_coll_lookup`.
+    if let Some((id, name)) = match (vm.heap.get(idx), op) {
+        (HeapObj::WeakMap { .. }, 0) => Some((crate::vm::native::WM_SET, "set")),
+        (HeapObj::WeakMap { .. }, 3) => Some((crate::vm::native::WM_DELETE, "delete")),
+        (HeapObj::WeakSet(_), 2) => Some((crate::vm::native::WS_ADD, "add")),
+        (HeapObj::WeakSet(_), 4) => Some((crate::vm::native::WS_DELETE, "delete")),
+        _ => None,
+    } {
+        if !vm.weak_collection_method_is_intrinsic(idx, name, id) {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        return jit_weak_coll(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, key_bits, val_bits, id);
     }
     let (name, kind) = match op {
         0 => ("set", 4u8),
@@ -863,6 +892,7 @@ pub(crate) extern "win64" fn jit_captured_method(
     enum Lane {
         Lookup(u64),
         Mutate(u64),
+        Weak(u16),
         IndexOf,
         Substring(u64),
         HasOwnCall,
@@ -882,8 +912,38 @@ pub(crate) extern "win64" fn jit_captured_method(
                 let kind: u8 = match vm.heap.get(idx) {
                     HeapObj::Map { .. } => 4,
                     HeapObj::Set(_) => 3,
+                    HeapObj::WeakMap { .. } => 6,
+                    HeapObj::WeakSet(_) => 5,
                     _ => return SELF_CALL_DEOPT,
                 };
+                if kind >= 5 {
+                    // A WeakMap / WeakSet. Its methods are natives with ids of
+                    // their own, so the captured callee's id names the intrinsic
+                    // outright (with no child realm, every native is the main
+                    // realm's): calling it on the receiver is the call. A DOM
+                    // binding reads its wrapper-to-node WeakMap on every property
+                    // access, and this lane ran none of it: the generic call
+                    // tail cost 35-40 ns a `get` where a Map's took a few.
+                    let want = match (op, kind, argc) {
+                        (captured_op::GET, 6, 1) => crate::vm::native::WM_GET,
+                        (captured_op::HAS, 6, 1) => crate::vm::native::WM_HAS,
+                        (captured_op::SET, 6, 2) => crate::vm::native::WM_SET,
+                        (captured_op::DELETE, 6, 1) => crate::vm::native::WM_DELETE,
+                        (captured_op::ADD, 5, 1) => crate::vm::native::WS_ADD,
+                        (captured_op::HAS, 5, 1) => crate::vm::native::WS_HAS,
+                        (captured_op::DELETE, 5, 1) => crate::vm::native::WS_DELETE,
+                        _ => return SELF_CALL_DEOPT,
+                    };
+                    let callee = Value::from_bits(callee_bits);
+                    if !vm.realm_global_objs.is_empty()
+                        || !callee.is_heap()
+                        || callee.heap_index() as usize >= vm.heap.len()
+                        || !matches!(vm.heap.get(callee.heap_index()), HeapObj::Native(id) if *id == want)
+                    {
+                        return SELF_CALL_DEOPT;
+                    }
+                    Lane::Weak(want)
+                } else {
                 // The dedicated helpers' op numbering (see `jit_coll_lookup`
                 // and `jit_coll_mutate`); a triple without one declines.
                 let (name, lane) = match (op, kind, argc) {
@@ -900,6 +960,7 @@ pub(crate) extern "win64" fn jit_captured_method(
                     return SELF_CALL_DEOPT;
                 }
                 lane
+                }
             }
             captured_op::INDEX_OF | captured_op::SUBSTRING | captured_op::SLICE => {
                 if !matches!(vm.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. }) {
@@ -934,10 +995,49 @@ pub(crate) extern "win64" fn jit_captured_method(
         Lane::Mutate(o) => {
             jit_coll_mutate(vm, recv_bits, arg(0), if argc >= 2 { arg(1) } else { 0 }, o)
         }
+        Lane::Weak(id) => jit_weak_coll(vm, recv_bits, arg(0), if argc >= 2 { arg(1) } else { 0 }, id),
         Lane::IndexOf => jit_str_index_of(vm, recv_bits, arg(0)),
         Lane::Substring(mode) => jit_str_substring(vm, recv_bits, args as u64, mode),
         Lane::HasOwnCall => jit_has_own_call(vm, recv_bits, arg(0), arg(1)),
     }
+}
+
+/// The WeakMap / WeakSet arm of [`jit_captured_method`]: `weakmap_method` /
+/// `weakset_method` on a receiver whose brand and captured callee the caller
+/// proved. Only `set` / `add` can throw (a key that cannot be held weakly), so
+/// that is checked before anything is written and declines to the generic
+/// call, which raises the TypeError; the methods run no user code.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jit_weak_coll(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    key_bits: u64,
+    val_bits: u64,
+    id: u16,
+) -> u64 {
+    use crate::codegen::SELF_CALL_DEOPT;
+    // SAFETY: generated code passes its exclusive live VM pointer.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let recv = Value::from_bits(recv_bits);
+    let key = Value::from_bits(key_bits);
+    let val = Value::from_bits(val_bits);
+    if (key.is_heap() && key.heap_index() as usize >= vm.heap.len())
+        || (val.is_heap() && val.heap_index() as usize >= vm.heap.len())
+    {
+        return SELF_CALL_DEOPT;
+    }
+    let r = match id {
+        crate::vm::native::WM_GET => vm.weakmap_method(recv, "get", &[key]),
+        crate::vm::native::WM_HAS => vm.weakmap_method(recv, "has", &[key]),
+        crate::vm::native::WM_DELETE => vm.weakmap_method(recv, "delete", &[key]),
+        crate::vm::native::WM_SET if vm.can_be_held_weakly(key) => vm.weakmap_method(recv, "set", &[key, val]),
+        crate::vm::native::WS_HAS => vm.weakset_method(recv, "has", &[key]),
+        crate::vm::native::WS_DELETE => vm.weakset_method(recv, "delete", &[key]),
+        crate::vm::native::WS_ADD if vm.can_be_held_weakly(key) => vm.weakset_method(recv, "add", &[key]),
+        _ => return SELF_CALL_DEOPT,
+    };
+    // Unreachable after the checks above (the brand and the key are proven).
+    r.map_or(SELF_CALL_DEOPT, |v| v.bits())
 }
 
 /// Win64 helper for guarded primitive-string `toUpperCase()` in Tier C.
