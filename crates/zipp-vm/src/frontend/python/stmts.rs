@@ -1676,12 +1676,25 @@ impl<'a> Emitter<'a> {
         Ok(record)
     }
 
-    pub fn first_param_reg(&self) -> Option<Reg> {
-        let first = self.scope().params.first()?;
-        match self.scope().symbols.get(first) {
-            Some(SymKind::Cell) => None,
-            _ => self.locals.get(first).copied(),
+    /// The value of the code's first parameter for a zero-argument
+    /// `super()`: its register, or what its cell holds now when a nested
+    /// scope captures it (CPython takes the cell's contents too). `None`
+    /// for code without parameters.
+    pub fn first_param_value(&mut self) -> R<Option<Reg>> {
+        // In a comprehension, the enclosing code's (see `Scope::super_self`).
+        if let Some(name) = self.scope().super_self.clone() {
+            return self.load_name(&name).map(Some);
         }
+        let Some(first) = self.scope().params.first() else {
+            return Ok(None);
+        };
+        if self.scope().symbols.get(first) != Some(&SymKind::Cell) {
+            return Ok(self.locals.get(first).copied());
+        }
+        let Some(cell) = self.cells.get(first).copied() else {
+            return Ok(None);
+        };
+        self.cell_get(cell).map(Some)
     }
 }
 

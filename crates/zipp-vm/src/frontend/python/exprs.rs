@@ -1418,17 +1418,12 @@ impl<'a> Emitter<'a> {
         // parameter of the method it appears in.
         if let ast::Expr::Name(n) = c.func.as_ref() {
             if n.id.as_str() == "super" && c.args.is_empty() && c.keywords.is_empty() {
-                if let (Some(cell), Some(first)) =
-                    (self.cells.get("__class__").copied(), self.first_param_reg())
-                {
+                if let Some(cell) = self.cells.get("__class__").copied() {
+                    let Some(first) = self.first_param_value()? else {
+                        return Err(self.error(node, "super(): no arguments"));
+                    };
                     let cls = self.cell_get(cell)?;
                     return self.helper("superof", &[cls, first]);
-                }
-                if self.cells.contains_key("__class__") {
-                    return Err(self.error(
-                        node,
-                        "super(): the method's first parameter must be a plain local",
-                    ));
                 }
                 return Err(self.error(node, "super(): no enclosing class"));
             }
@@ -1629,7 +1624,10 @@ impl<'a> Emitter<'a> {
         {
             return Ok(None);
         }
-        let (Some(cell), Some(first)) = (self.cells.get("__class__").copied(), self.first_param_reg()) else {
+        let Some(cell) = self.cells.get("__class__").copied() else {
+            return Ok(None);
+        };
+        let Some(first) = self.first_param_value()? else {
             return Ok(None);
         };
         let cls = self.cell_get(cell)?;
