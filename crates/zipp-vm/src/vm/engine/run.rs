@@ -1708,8 +1708,13 @@ impl<'p> Vm<'p> {
         if self.global_this == 0 || obj_idx != self.global_this {
             return;
         }
-        if self.global_slot_of_name(key).is_some() {
+        if let Some(slot) = self.global_slot_of_name(key) {
             self.note_global_route_change();
+            // The property now IS the binding (a define, a delete, a getter
+            // or setter put on it): a spliced call keyed on the slot's
+            // generation (W12 `slot_guard`) must miss as well, or a hot loop
+            // keeps calling the function the slot held before.
+            self.bump_global_gen(slot);
         }
     }
 
