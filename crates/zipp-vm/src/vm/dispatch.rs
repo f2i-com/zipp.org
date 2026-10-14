@@ -10574,8 +10574,7 @@ impl<'p> Vm<'p> {
         let steps = 13u64.checked_mul(b)?.checked_sub(10)?;
         if let Some(rec) = self.instr_rec.as_ref() {
             let steps_i64 = i64::try_from(steps).ok()?;
-            if rec.exhaustion.is_some() || (rec.remaining != i64::MAX && rec.remaining < steps_i64)
-            {
+            if rec.exhaustion.is_some() || rec.remaining_now() < steps_i64 {
                 // The finite error path must still stop at its historical child
                 // opcode (and retain every scheduled resource audit), so only a
                 // completely payable pure activation is collapsed.

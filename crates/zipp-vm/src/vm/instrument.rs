@@ -475,6 +475,17 @@ pub(crate) struct Recorder {
     /// directly, a terminal state being sticky).
     #[cfg(not(feature = "meter-only"))]
     slow: bool,
+    /// The general profile's step countdown: dispatches the hook may still
+    /// take on its one-compare path before anything is due -- the next heap
+    /// poll, the budget's last step, or (at zero, whenever `slow` holds) every
+    /// step. `ticks` and a finite `remaining` lag behind by `window -
+    /// countdown` steps until [`Self::settle`] folds them in; every reader
+    /// that needs them exact settles first or reads [`Self::remaining_now`].
+    #[cfg(not(feature = "meter-only"))]
+    countdown: i64,
+    /// `countdown` as last scheduled; see there.
+    #[cfg(not(feature = "meter-only"))]
+    window: i64,
     /// The call depth the emitted rows imply. The prover recomputes this from
     /// the opcodes, so the two must agree — never emit a RETURN at depth 0.
     #[cfg(not(feature = "meter-only"))]
@@ -567,6 +578,10 @@ impl Recorder {
             #[cfg(not(feature = "meter-only"))]
             slow: false,
             #[cfg(not(feature = "meter-only"))]
+            countdown: 0,
+            #[cfg(not(feature = "meter-only"))]
+            window: 0,
+            #[cfg(not(feature = "meter-only"))]
             max_steps: usize::MAX,
             #[cfg(not(feature = "meter-only"))]
             truncated: false,
@@ -578,7 +593,8 @@ impl Recorder {
         }
     }
 
-    /// Recompute [`Self::slow`] from the fields it summarises.
+    /// Recompute [`Self::slow`] from the fields it summarises. A slow state
+    /// stops the countdown, so the very next step takes the full path.
     #[inline]
     pub(crate) fn refresh_slow(&mut self) {
         #[cfg(not(feature = "meter-only"))]
@@ -588,7 +604,72 @@ impl Recorder {
                 || self.abort.is_some()
                 || self.exhaustion.is_some()
                 || self.output_exhausted;
+            if self.slow {
+                self.settle();
+            }
         }
+    }
+
+    /// Steps taken on the countdown since the last [`Self::settle`].
+    #[inline]
+    fn elapsed(&self) -> i64 {
+        #[cfg(not(feature = "meter-only"))]
+        {
+            self.window - self.countdown
+        }
+        #[cfg(feature = "meter-only")]
+        {
+            0
+        }
+    }
+
+    /// Fold the countdown's steps into `ticks` and a finite `remaining`, and
+    /// stop it: the next step takes the full path, which schedules the next
+    /// countdown from the exact figures. Every change to the budget from
+    /// outside the dispatch hook (a native loan or refund, an off-loop
+    /// charge, a new limit, a terminal state) settles first.
+    #[inline]
+    pub(crate) fn settle(&mut self) {
+        #[cfg(not(feature = "meter-only"))]
+        {
+            let elapsed = self.window - self.countdown;
+            self.ticks = self.ticks.wrapping_add(elapsed as u64);
+            if self.remaining != i64::MAX {
+                self.remaining -= elapsed;
+            }
+            self.countdown = 0;
+            self.window = 0;
+        }
+    }
+
+    /// `remaining` with the countdown's steps taken off: exact at any point,
+    /// `i64::MAX` when unlimited.
+    #[inline]
+    pub(crate) fn remaining_now(&self) -> i64 {
+        if self.remaining == i64::MAX {
+            i64::MAX
+        } else {
+            self.remaining - self.elapsed()
+        }
+    }
+
+    /// After a full-path step: how many steps may follow on the countdown.
+    /// None while a slow state holds. Otherwise up to the step before the
+    /// next heap poll (`ticks & HEAP_AUDIT_MASK == 0`, which the full path
+    /// runs) and no more than a finite budget's remaining steps, so the step
+    /// that finds it empty is a full-path step too, exactly as before.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline]
+    fn schedule(&mut self) {
+        let mut steps = 0;
+        if !self.slow {
+            steps = (HEAP_AUDIT_MASK - (self.ticks & HEAP_AUDIT_MASK)) as i64;
+            if self.remaining != i64::MAX {
+                steps = steps.min(self.remaining.max(0));
+            }
+        }
+        self.countdown = steps;
+        self.window = steps;
     }
 
     /// Begin recording. `max_steps` bounds memory: at ~64 bytes a row, a hot
@@ -614,6 +695,7 @@ impl Recorder {
     /// the immutable finite starting balance; all other profiles keep its
     /// historical role as the interpreter-dispatch counter.
     pub(crate) fn set_step_limit(&mut self, max_steps: u64) {
+        self.settle();
         // Saturating, so `u64::MAX` keeps meaning "unlimited".
         self.remaining = max_steps.min(i64::MAX as u64) as i64;
         #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
@@ -651,13 +733,17 @@ impl Recorder {
             return self.used.wrapping_add((i64::MAX - self.remaining).max(0) as u64);
         }
         #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
-        self.used.wrapping_add(self.ticks).saturating_sub(self.steps_base)
+        self.used
+            .wrapping_add(self.ticks)
+            .wrapping_add(self.elapsed() as u64)
+            .saturating_sub(self.steps_base)
     }
 
     #[inline]
     fn exhaust(&mut self, cause: ResourceExhaustion) -> &'static str {
         // A terminal state is sticky: make the very next dispatch stop.
         self.stop = i64::MAX;
+        self.settle();
         #[cfg(not(feature = "meter-only"))]
         {
             self.slow = true;
@@ -675,7 +761,7 @@ impl Recorder {
         if self.remaining == i64::MAX {
             return None;
         }
-        Some(self.remaining.max(0) as u64)
+        Some(self.remaining_now().max(0) as u64)
     }
 
     #[inline]
@@ -1432,6 +1518,7 @@ impl super::Vm<'_> {
         let Some(rec) = self.instr_rec.as_mut() else {
             return 0;
         };
+        rec.settle();
         // Whole-function native entry happens before the interpreter's
         // `instrument_step` hook. Refuse the loan here as well, or a caught
         // dynamic/output failure from a prior entry could execute another
@@ -1542,6 +1629,7 @@ impl super::Vm<'_> {
         let Some(rec) = self.instr_rec.as_mut() else {
             return false;
         };
+        rec.settle();
         if rec.remaining == i64::MAX {
             return false;
         }
@@ -1577,6 +1665,7 @@ impl super::Vm<'_> {
             self.jit_steps = outer;
             return;
         };
+        rec.settle();
         let back = rec.remaining.clamp(0, outer);
         rec.remaining -= back;
         rec.used = rec.used.wrapping_add(back as u64);
@@ -1592,6 +1681,7 @@ impl super::Vm<'_> {
     pub(crate) fn meter_return(&mut self) {
         let unspent = self.jit_steps.max(0);
         if let Some(rec) = self.instr_rec.as_mut() {
+            rec.settle();
             if rec.remaining != i64::MAX {
                 rec.remaining += unspent;
                 // Zero means native code consumed its final permitted block
@@ -1717,6 +1807,7 @@ impl super::Vm<'_> {
     /// charges itself, and charging both would be double-counting.
     pub(crate) fn charge_steps(&mut self, n: i64) {
         if let Some(rec) = self.instr_rec.as_mut() {
+            rec.settle();
             let n = n.max(0);
             #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
             {
@@ -1886,11 +1977,42 @@ impl super::Vm<'_> {
             None => return Ok(()),
         };
 
-        // Keep the overwhelmingly common path -- metering without a trace, an
-        // abort flag or a terminal state -- small enough to live beside the
-        // opcode dispatch. The out-of-line path below handles every one of
-        // those (it checks the terminal states first); `slow` says whether
-        // any is present, so the common edge tests one flag, not five.
+        // The common edge is one decrement and one test: nothing is due for
+        // `countdown` more steps (see the field). When it runs out, the full
+        // path settles the count, runs the step exactly as before and
+        // schedules the next countdown.
+        rec.countdown -= 1;
+        if rec.countdown >= 0 {
+            return Ok(());
+        }
+        rec.countdown += 1;
+        self.instrument_step_due(base, ip, instr)
+    }
+
+    /// The general hook's full path: a heap poll, the budget's last step, or
+    /// a slow state is due.
+    #[cfg(not(feature = "meter-only"))]
+    #[cold]
+    #[inline(never)]
+    fn instrument_step_due(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
+        let result = self.instrument_step_full(base, ip, instr);
+        if let Some(rec) = self.instr_rec.as_mut() {
+            rec.schedule();
+        }
+        result
+    }
+
+    /// One step on the full path, from settled figures.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline]
+    fn instrument_step_full(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
+        let rec = match self.instr_rec.as_mut() {
+            Some(rec) => rec,
+            None => return Ok(()),
+        };
+        rec.settle();
+        // Trace rows, an abort flag and the terminal states are handled out
+        // of line (the terminal states first).
         if rec.slow {
             return self.instrument_step_slow(base, ip, instr);
         }
@@ -2811,7 +2933,7 @@ mod tests {
         exact
             .run()
             .expect("the final permitted instruction may halt");
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
         let mut short = crate::vm::Vm::new(program(src));
@@ -2978,7 +3100,7 @@ mod tests {
                 .expect("the exact final allowance succeeds"),
             crate::value::Value::int(832_040)
         );
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
         let mut short = ready(SRC, expected_steps as i64 - 1);
@@ -3107,7 +3229,7 @@ mod tests {
 
         let (mut exact, result) = exercise(exact_steps as i64, false);
         assert_eq!(result.expect("exact native call succeeds"), Value::int(9));
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
         let slot = exact.func(1).name_global.unwrap();
@@ -3147,8 +3269,8 @@ mod tests {
             (1..=ABORT_POLL).contains(&used),
             "the interpreter poll or an earlier native-entry poll must stop execution; used {used}"
         );
-        assert_eq!(abort_rec.remaining, ABORT_BUDGET - used as i64);
-        assert_eq!(used + abort_rec.remaining as u64, ABORT_BUDGET as u64);
+        assert_eq!(abort_rec.remaining_now(), ABORT_BUDGET - used as i64);
+        assert_eq!(used + abort_rec.remaining_now() as u64, ABORT_BUDGET as u64);
         assert_eq!(aborted.instrument_resource_limit_error(), Some(ABORT_MSG));
     }
 

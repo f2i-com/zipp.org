@@ -329,7 +329,7 @@ impl<'p> Vm<'p> {
         // the real exit instruction then fails exactly as before.
         if let Some(rec) = self.instr_rec.as_ref() {
             if rec.exhaustion.is_some()
-                || (rec.remaining != i64::MAX && rec.remaining < values.charge)
+                || rec.remaining_now() < values.charge
             {
                 return None;
             }
@@ -561,12 +561,12 @@ mod tests {
             invoke(&mut exact, slot).expect("exact run succeeds"),
             Value::int(72)
         );
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
 
         let (mut short, slot) = ready(STEPS - 1);
         let error = invoke(&mut short, slot).expect_err("Return must cross the boundary");
         assert!(error.0.contains("instruction budget"), "got {error:?}");
-        assert_eq!(short.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(short.instr_rec.as_ref().unwrap().remaining_now(), 0);
     }
 
     #[test]
