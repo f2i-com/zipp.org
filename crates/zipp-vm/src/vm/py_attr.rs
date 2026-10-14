@@ -540,6 +540,38 @@ impl<'p> Vm<'p> {
     // (which asks the full function, whose own first tests these are) when
     // one declines.
 
+    /// What the hit functions below read of the registry once: the
+    /// instance and exception templates' shapes and a class record's `ver`
+    /// slot.
+    #[inline(always)]
+    fn py_hit_keys(&self) -> Option<(u32, u32, usize)> {
+        let p = self.py_rt.as_deref()?;
+        Some((p.inst_shape, p.exc_shape, p.ty?.ver))
+    }
+
+    /// [`Vm::py_inst_parts`] for the hit functions, in their own code: a
+    /// record of the instance or exception template's shape read where it
+    /// is (as `py_inst_parts` reads it), any other through that function.
+    /// `o` is a heap value.
+    #[inline(always)]
+    fn py_hit_parts(&self, k: (u32, u32, usize), o: Value) -> Option<(Value, Value)> {
+        if let HeapObj::Object(m) = self.heap.get(o.heap_index()) {
+            let shape = m.shape();
+            if !m.is_ctor && shape != crate::shape::DICT && (shape == k.0 || shape == k.1) {
+                return Some((m.val_at(0), m.val_at(1)));
+            }
+        }
+        self.py_inst_parts(o)
+    }
+
+    /// [`Vm::py_cls_stamp_ok`] for the hit functions, in their own code
+    /// (`k.2` the class records' `ver` slot).
+    #[inline(always)]
+    fn py_hit_stamp(&self, k: (u32, u32, usize), cls: Value, hver: u32, ver: u64) -> bool {
+        let ci = cls.heap_index();
+        self.heap.version_of(ci) == hver && matches!(self.heap.get(ci), HeapObj::Object(m) if k.2 < m.len() && m.val_at(k.2).bits() == ver)
+    }
+
     /// [`Vm::py_attr_get`] at a site holding a layout-mode entry
     /// ([`ic::ATTR_GET_L`]) for the instance's class and layout.
     #[inline(never)]
@@ -547,15 +579,16 @@ impl<'p> Vm<'p> {
         // The entry's kind first: a site of another kind (a property, a
         // class attribute) declines before the instance is looked at.
         let e = self.py_ic(func_id, ip);
-        if e.kind != ic::ATTR_GET_L {
+        if e.kind != ic::ATTR_GET_L || !o.is_heap() {
             return None;
         }
-        let (cls, dict) = self.py_inst_parts(o)?;
+        let k = self.py_hit_keys()?;
+        let (cls, dict) = self.py_hit_parts(k, o)?;
         if cls.bits() != e.a || !cls.is_heap() || !dict.is_heap() {
             return None;
         }
         let v = self.py_attrs_at(dict, e.d, e.pos as usize)?;
-        self.py_cls_stamp_ok(cls, e.hver, e.c).then_some(v)
+        self.py_hit_stamp(k, cls, e.hver, e.c).then_some(v)
     }
 
     /// [`Vm::py_attr_set`] at a site holding a layout-mode entry: a value
@@ -565,10 +598,13 @@ impl<'p> Vm<'p> {
     pub(super) fn py_attr_set_hit(&mut self, func_id: u32, ip: usize, o: Value, v: Value) -> bool {
         // The entry's kind first, as `py_attr_get_hit`.
         let e = self.py_ic(func_id, ip);
-        if e.kind != ic::ATTR_SET_L && e.kind != ic::ATTR_APPEND_L {
+        if (e.kind != ic::ATTR_SET_L && e.kind != ic::ATTR_APPEND_L) || !o.is_heap() {
             return false;
         }
-        let Some((cls, dict)) = self.py_inst_parts(o) else {
+        let Some(k) = self.py_hit_keys() else {
+            return false;
+        };
+        let Some((cls, dict)) = self.py_hit_parts(k, o) else {
             return false;
         };
         if cls.bits() != e.a || !cls.is_heap() || !dict.is_heap() {
@@ -576,11 +612,11 @@ impl<'p> Vm<'p> {
         }
         let di = dict.heap_index();
         match e.kind {
-            ic::ATTR_SET_L if self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) && self.py_cls_stamp_ok(cls, e.hver, e.c) => {
+            ic::ATTR_SET_L if self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) && self.py_hit_stamp(k, cls, e.hver, e.c) => {
                 self.py_attrs_put(di, e.pos as usize, v);
                 true
             }
-            ic::ATTR_APPEND_L if self.py_attrs_of(dict) == Some((e.d, e.pos as usize)) && self.py_cls_stamp_ok(cls, e.hver, e.c) => {
+            ic::ATTR_APPEND_L if self.py_attrs_of(dict) == Some((e.d, e.pos as usize)) && self.py_hit_stamp(k, cls, e.hver, e.c) => {
                 self.py_attrs_push(di, e.b as u32, v);
                 true
             }
@@ -599,16 +635,17 @@ impl<'p> Vm<'p> {
         }
         let p = self.py_rt_for(rt)?;
         let (ty, t_str) = (p.ty?, p.t_str);
+        let k = self.py_hit_keys()?;
         let (cls, dict) = if self.heap.is_str_like(o.heap_index()) {
             (t_str, Value::UNDEFINED)
         } else {
-            self.py_inst_parts(o)?
+            self.py_hit_parts(k, o)?
         };
         if !cls.is_heap() {
             return None;
         }
         let e = self.py_ic(func_id, ip);
-        if e.a != cls.bits() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
+        if e.a != cls.bits() || !self.py_hit_stamp(k, cls, e.hver, e.c) {
             return None;
         }
         if e.kind == ic::METHOD {
