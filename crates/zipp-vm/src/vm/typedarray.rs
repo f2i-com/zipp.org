@@ -65,6 +65,10 @@ impl TaInterpNumericView {
     }
 }
 
+/// The `TA_KINDS` index of each numeric DataView getter, by its position in
+/// `DV_PROTO_METHODS`: the kinds `dataview_get_kind` pairs with them.
+const DV_GET_KINDS: [u8; 8] = [0, 1, 3, 4, 5, 6, 7, 8];
+
 /// Runtime kind id for the allocation-free, non-BigInt DataView getters.
 /// Keeping this as a direct match avoids a linear scan of all 22 get/set names
 /// on every interpreted call.
@@ -426,16 +430,13 @@ impl<'p> Vm<'p> {
         position: Value,
         little_endian: Value,
     ) -> Result<Option<Value>, Thrown> {
-        let Some((method, kind)) = dataview_get_kind(name) else {
+        let Some((method, _)) = dataview_get_kind(name) else {
             return Ok(None);
         };
-        let (buffer, byte_offset, byte_length, pristine_version) = match self.heap.get(view_idx) {
+        let pristine_version = match self.heap.get(view_idx) {
             HeapObj::DataView {
-                buffer,
-                pristine_version,
-                byte_offset,
-                byte_length,
-            } => (*buffer, *byte_offset, *byte_length, *pristine_version),
+                pristine_version, ..
+            } => *pristine_version,
             _ => return Ok(None),
         };
         // Restrict this leaf to the main realm. Generic builtin dispatch installs
@@ -469,7 +470,88 @@ impl<'p> Vm<'p> {
         if !intrinsic_live {
             return Ok(None);
         }
+        self.dataview_get_leaf(view_idx, method, position, little_endian)
+    }
 
+    /// What `Get(view, name)` finds when `name` is one of the numeric getters
+    /// and `view` is still default-constructed (no own property, the default
+    /// prototype): that prototype's slot, read in place. `None` sends the
+    /// caller to the ordinary lookup. The receiver has no shape for the
+    /// property cache to key on, so `dv.getUint32` otherwise walked to the
+    /// prototype and searched it by name on every read.
+    pub(crate) fn dataview_proto_read(&self, view_idx: u32, name: &str) -> Option<u64> {
+        let (method, _) = dataview_get_kind(name)?;
+        let HeapObj::DataView {
+            pristine_version, ..
+        } = self.heap.get(view_idx)
+        else {
+            return None;
+        };
+        // The same proof as `dataview_interp_get_fast`, less the callee's
+        // identity: a Get returns whatever the slot holds.
+        if self.heap.version_of(view_idx) != *pristine_version
+            || self.dataview_proto == 0
+            || self.dataview_proto_shape == crate::shape::DICT
+        {
+            return None;
+        }
+        match self.heap.get(self.dataview_proto) {
+            HeapObj::Object(map) if map.shape() == self.dataview_proto_shape && method < map.len() => {
+                Some(map.val_at(method).bits())
+            }
+            _ => None,
+        }
+    }
+
+    /// The split member-call form's DataView lane. `callee` is the Value the
+    /// call's `[[Get]]` already returned, so when it is the main realm's
+    /// intrinsic numeric getter the call is that getter's, whatever the
+    /// receiver or its prototype holds by now. `None`: nothing observable
+    /// happened and the caller makes the generic call.
+    pub(crate) fn dataview_captured_get(
+        &self,
+        view_idx: u32,
+        callee: Value,
+        position: Value,
+        little_endian: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        // Main realm only, as for the fused form's leaf: with no child realm
+        // the one Native of a getter's id is the main realm's.
+        if !self.realm_global_objs.is_empty() || !callee.is_heap() {
+            return Ok(None);
+        }
+        let HeapObj::Native(id) = self.heap.get(callee.heap_index()) else {
+            return Ok(None);
+        };
+        let method = id.wrapping_sub(native::DV_METHOD_BASE) as usize;
+        if method >= DV_GET_KINDS.len() {
+            return Ok(None);
+        }
+        self.dataview_get_leaf(view_idx, method, position, little_endian)
+    }
+
+    /// The numeric DataView getter `method` (its index in `DV_PROTO_METHODS`)
+    /// called on `view_idx`, for a caller that has proved that getter is the
+    /// function being called. `None` means no observable action was taken.
+    fn dataview_get_leaf(
+        &self,
+        view_idx: u32,
+        method: usize,
+        position: Value,
+        little_endian: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        let name = native::DV_PROTO_METHODS[method];
+        let kind = DV_GET_KINDS[method];
+        debug_assert_eq!(dataview_get_kind(name), Some((method, kind)));
+        let (buffer, byte_offset, byte_length) = match self.heap.get(view_idx) {
+            HeapObj::DataView {
+                buffer,
+                byte_offset,
+                byte_length,
+                ..
+            } => (*buffer, *byte_offset, *byte_length),
+            _ => return Ok(None),
+        };
         // The benchmark-hot offsets are already non-negative integral numbers.
         // Every other ToIndex shape (fraction, string/object coercion, NaN,
         // negative/huge value) falls back before doing observable work.

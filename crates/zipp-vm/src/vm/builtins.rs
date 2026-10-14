@@ -557,6 +557,8 @@ impl<'p> Vm<'p> {
                 }
                 return None;
             }
+            // `dv.getUint32` on a default-constructed DataView.
+            HeapObj::DataView { .. } => return self.dataview_proto_read(idx, name),
             _ => return None,
         };
         self.proto_intrinsic_bits(name, is_arr)
@@ -839,6 +841,19 @@ impl<'p> Vm<'p> {
                     return Ok(Some(self.perform_plain_promise_then(idx, on_fulfilled, on_rejected)));
                 }
                 return Ok(None);
+            }
+            // `dv.getUint32(o, le === 1)`: the captured callee's identity is
+            // the whole proof, so no prototype check is needed.
+            HeapObj::DataView { .. } => {
+                let arg = |i: u16| {
+                    if i < argc {
+                        self.regs[base + (arg_base + i) as usize]
+                    } else {
+                        Value::UNDEFINED
+                    }
+                };
+                let (position, little_endian) = (arg(0), arg(1));
+                return self.dataview_captured_get(idx, callee, position, little_endian);
             }
             _ => return Ok(None),
         };
