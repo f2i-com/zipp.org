@@ -1029,7 +1029,42 @@ impl<'p> Vm<'p> {
         let Some((fid, closure)) = self.ic_plain_fn(callee) else {
             return SELF_CALL_DEOPT;
         };
+        // A compiled body with a frame-free entry runs over a fresh window, as
+        // a builtin's callback does; anything else gets its frame.
+        if let Some(this) = self.frame_free_this(fid, callee, recv) {
+            let at = base + arg_base as usize;
+            self.jit_call_depth += 1;
+            let r = self.call_compiled_windowed(callee, this, WinArgs::Regs { at, argc }, fid, closure);
+            self.jit_call_depth -= 1;
+            if let Some(r) = r {
+                return match r {
+                    Ok(v) => v.bits(),
+                    Err(t) => self.jit_thrown_to_sentinel(t),
+                };
+            }
+        }
         self.jit_frame_call(fid, closure, recv, base, arg_base, argc, ip, callee)
+    }
+
+    /// OrdinaryCallBindThis for a frame-free call of the plain function `fid`
+    /// (`callee`) with the receiver `this`, as a frame's call setup binds it:
+    /// a strict function takes it as it is; a sloppy one takes the global
+    /// object of its realm for `undefined` or `null`, and an object as it is.
+    /// `None` for an arrow (its captured `this` is the setup's to bind) and
+    /// for a sloppy function given a primitive (the setup boxes it).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn frame_free_this(&self, fid: u32, callee: Value, this: Value) -> Option<Value> {
+        let proto = self.func(fid as usize);
+        if proto.lexical_this {
+            return None;
+        }
+        if proto.is_strict || self.is_object_value(this) {
+            return Some(this);
+        }
+        if this.is_nullish() && self.global_this != 0 {
+            return Some(Value::heap(self.callee_this_global(callee)));
+        }
+        None
     }
 
     /// The implementation behind `jit_new_ic`: the interpreter's `New` for a
@@ -1927,6 +1962,20 @@ impl<'p> Vm<'p> {
         if call_kind != 0 && !self.func(fid as usize).lexical_this {
             if let Some(bits) = self.try_method_inline(fid, this_v, base, arg_base, argc) {
                 return bits;
+            }
+        }
+        // A compiled body with a frame-free entry runs over a fresh window, as
+        // a builtin's callback does (`call_compiled_windowed`).
+        if let Some(this) = self.frame_free_this(fid, callee_v, this_v) {
+            let at = base + arg_base as usize;
+            self.jit_call_depth += 1;
+            let r = self.call_compiled_windowed(callee_v, this, WinArgs::Regs { at, argc }, fid, closure);
+            self.jit_call_depth -= 1;
+            if let Some(r) = r {
+                return match r {
+                    Ok(v) => v.bits(),
+                    Err(t) => self.jit_thrown_to_sentinel(t),
+                };
             }
         }
         // Push the callee frame exactly like the interpreter's Call/CallMethod
