@@ -17,6 +17,7 @@ _active = None
 # Parameters held by a live prepared session, by id: while one holds a
 # parameter, compiled calls and eager optimizer steps on it are refused.
 _resident = {}
+torch._gpu_loaded = True
 
 
 def active_capture():

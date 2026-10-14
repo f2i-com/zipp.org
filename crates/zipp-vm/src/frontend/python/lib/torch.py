@@ -164,6 +164,13 @@ def compile(model=None, *, backend="zipp_gpu", training=False):
     return compile_gpu(model, backend=backend, training=training)
 
 
+# Set when torch._gpu loads. It holds the GPU capture and the parameters a
+# prepared session keeps resident, so until it is loaded neither exists and
+# an eager optimizer step need not load it (its first import compiles some
+# 2800 lines).
+_gpu_loaded = False
+
+
 # How many compiled calls are recording. Only then can an operand be a graph
 # tensor, so eager ops test this before probing for one: the probe's miss
 # raised internally and cost more than the kernel on small tensors.

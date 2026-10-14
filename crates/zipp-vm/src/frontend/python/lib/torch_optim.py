@@ -152,6 +152,15 @@ def _with_step_hooks(step):
     return step_with_hooks
 
 
+def _gpu_capture():
+    """The GPU capture recording a training step, or None (always while
+    torch._gpu has not been loaded: see `torch._gpu_loaded`)."""
+    if not torch._gpu_loaded:
+        return None
+    from torch._gpu import active_capture
+    return active_capture()
+
+
 def _closure_loss(closure):
     # step() runs under no_grad; the closure re-evaluates the model and calls
     # backward(), so it runs with gradients enabled, as in PyTorch.
@@ -315,8 +324,7 @@ class Optimizer:
         return "\n".join(lines)
 
     def zero_grad(self, set_to_none=True):
-        from torch._gpu import active_capture
-        capture = active_capture()
+        capture = _gpu_capture()
         if capture is not None:
             return capture.zero_grad(self, set_to_none)
         for g in self.param_groups:
@@ -463,6 +471,8 @@ class Optimizer:
     def _eager(self, name=None):
         """Refuse parameters a prepared GPU session holds; for optimizers the
         GPU capture does not record, refuse capture too."""
+        if not torch._gpu_loaded:
+            return
         from torch._gpu import active_capture, eager_step
         if name is not None and active_capture() is not None:
             raise NotImplementedError("Compiled GPU training supports SGD, Adam and AdamW; %s is not captured" % name)
@@ -483,8 +493,7 @@ class SGD(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        from torch._gpu import active_capture
-        capture = active_capture()
+        capture = _gpu_capture()
         if capture is not None:
             return capture.sgd(self, closure)
         self._eager()
@@ -543,8 +552,7 @@ class Adam(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        from torch._gpu import active_capture
-        capture = active_capture()
+        capture = _gpu_capture()
         if capture is not None:
             if any(bool(g.get("decoupled_weight_decay", self._decoupled)) != self._decoupled for g in self.param_groups):
                 raise NotImplementedError("GPU Adam needs one decoupled_weight_decay setting for every parameter group")
