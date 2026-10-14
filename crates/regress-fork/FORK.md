@@ -332,9 +332,27 @@ Category values, Script values, properties of strings) as an enum, a
 function mapping a name to it with a `match` over string literals, and a
 function mapping it to its table with another `match`. The name `match`es
 compiled to comparisons several times the size of the names (the Script
-one alone was 7.7 KB of Lite's code). Each kind is now a list of names, one
-line per value with its aliases separated by `|`, and an array of tables in
-the same order; `unicode::lookup_property_name` finds the line. After
-regenerating `unicodetables.rs` and running `tools/pack_regex_tables.py`,
-run `python crates/regress-fork/tools/pack_property_names.py` and rustfmt
-the file.
+one alone was 7.7 KB of Lite's code). Each kind is now a byte string of its
+values' names (each name a length byte and the name, a zero byte after each
+value) and an array of tables in the same order;
+`unicode::lookup_property_name` finds the value. After regenerating
+`unicodetables.rs` and running `tools/pack_regex_tables.py`, run
+`python crates/regress-fork/tools/pack_property_names.py`, then
+`python crates/regress-fork/tools/derive_property_tables.py` (below), and
+rustfmt the file.
+
+## Derived and packed identifier tables
+
+Nine property tables are unions of others: the General_Category groups (L,
+LC, M, N, P, S, Z, C) of their categories, and Assigned the complement of
+Unassigned. They are stored as `derived_intervals!`, the tables they are
+made of and whether to complement, and built the first time a regex uses
+them (with `std`, kept in a `OnceLock` per table: merging the parts again
+for every compile made `\p{L}` compile 1.4 times slower); their interval
+literals stay in the source for the round-trip test and for the
+interval count the sandbox's expansion limit charges. ID_Start and
+ID_Continue are packed like every other table: `unicode::is_id_start_cp`
+and `is_id_continue_cp` (behind `regress::is_id_start` for the engine's
+lexer, and a named group's name) decode them once per process and binary
+search the result. `tools/derive_property_tables.py` makes both changes to
+the generator's output, after `pack_property_names.py`.

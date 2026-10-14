@@ -406,6 +406,29 @@ pub(crate) fn lookup_property_name(table: &[u8], name: &str) -> Option<usize> {
     None
 }
 
+/// Whether `cp` has the property `ID_Start`: the engine's lexer and a named
+/// group's first character ask.
+pub(crate) fn is_id_start_cp(cp: u32) -> bool {
+    #[cfg(feature = "std")]
+    {
+        static CACHE: std::sync::OnceLock<Vec<Interval>> = std::sync::OnceLock::new();
+        crate::unicodetables::id_start_ranges().contains_identifier(&CACHE, cp)
+    }
+    #[cfg(not(feature = "std"))]
+    crate::unicodetables::id_start_ranges().contains_identifier(cp)
+}
+
+/// Whether `cp` has the property `ID_Continue`.
+pub(crate) fn is_id_continue_cp(cp: u32) -> bool {
+    #[cfg(feature = "std")]
+    {
+        static CACHE: std::sync::OnceLock<Vec<Interval>> = std::sync::OnceLock::new();
+        crate::unicodetables::id_continue_ranges().contains_identifier(&CACHE, cp)
+    }
+    #[cfg(not(feature = "std"))]
+    crate::unicodetables::id_continue_ranges().contains_identifier(cp)
+}
+
 pub(crate) fn unicode_property_name_from_str(s: &str) -> Option<UnicodePropertyName> {
     use UnicodePropertyName::*;
 
@@ -456,6 +479,23 @@ pub(crate) fn unicode_property_from_str(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn identifier_lookups_agree_with_the_property_tables() {
+        // The lookups decode the packed tables once; every code point must
+        // answer as the tables do (the generated round-trip test pins the
+        // tables themselves).
+        let start = crate::unicodetables::id_start_ranges().original;
+        let cont = crate::unicodetables::id_continue_ranges().original;
+        for cp in (0..0x3_0000).chain(0xE_0000..0xE_0200) {
+            let in_start = crate::codepointset::interval_contains(start, cp);
+            let in_cont = crate::codepointset::interval_contains(cont, cp);
+            assert_eq!(is_id_start_cp(cp), in_start, "ID_Start {cp:#x}");
+            assert_eq!(is_id_continue_cp(cp), in_cont, "ID_Continue {cp:#x}");
+        }
+        assert!(is_id_start_cp('a' as u32) && !is_id_start_cp('1' as u32));
+        assert!(is_id_continue_cp('1' as u32) && !is_id_start_cp('$' as u32));
+    }
 
     #[test]
     fn property_names_are_whole_aliases() {

@@ -6,9 +6,10 @@ Category values, Script values, properties of strings), an enum, a function
 that maps a name to it with a `match` over string literals, and a function
 that maps it to its code point table with another `match`. Compiled, the
 name matches are a few kilobytes of comparisons each. This rewrites each kind
-as a list of names (one line per value, its aliases separated by `|`) and an
-array of tables in the same order; `unicode::lookup_property_name` finds the
-line. Run it from the repository root after tools/pack_regex_tables.py.
+as a byte string of names (each a length byte and the name, a zero byte after
+each value's names) and an array of tables in the same order;
+`unicode::lookup_property_name` finds the value. Run it from the repository
+root after tools/pack_regex_tables.py, then derive_property_tables.py.
 """
 from pathlib import Path
 import re

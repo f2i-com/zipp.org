@@ -11,7 +11,6 @@ use crate::{
     unicode::{
         self, PropertyEscapeKind, unicode_property_from_str, unicode_property_name_from_str,
     },
-    unicodetables::{id_continue_ranges, id_start_ranges},
     util::to_char_sat,
 };
 use core::{fmt, iter::Peekable};
@@ -2034,7 +2033,7 @@ where
                 }
             }
 
-            if id_start_ranges().contains_identifier(c.into()) || c == '$' || c == '_' {
+            if unicode::is_id_start_cp(c.into()) || c == '$' || c == '_' {
                 group_name.push(c);
             } else {
                 self.input = orig_input;
@@ -2064,7 +2063,7 @@ where
                     break;
                 }
 
-                if id_continue_ranges().contains_identifier(c.into()) || c == '$' || c == '_' || c == '\u{200C}' /* <ZWNJ> */ || c == '\u{200D}'
+                if unicode::is_id_continue_cp(c.into()) || c == '$' || c == '_' || c == '\u{200C}' /* <ZWNJ> */ || c == '\u{200D}'
                 /* <ZWJ> */
                 {
                     group_name.push(c);
