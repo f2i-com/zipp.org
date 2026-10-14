@@ -7442,7 +7442,18 @@ def _backward(roots, grads, accumulate=True, inputs=None, create_graph=False):
                     if pg.dtype is not pdt and pg.dtype != pdt and pdt._inexact:
                         pg = _grad_as(pg, pdt)
                     prior = p._pg
-                    p._pg = pg if prior is None else (add(prior, pg) if prior.__class__ is not _SparseTensor else _sp._buffer_add(prior, pg))
+                    if prior is None:
+                        p._pg = pg
+                    elif (not _grad_enabled and prior.__class__ is Tensor and pg.__class__ is Tensor and prior.dtype is pg.dtype
+                            and prior.dtype.is_floating_point and not _graph_recording):
+                        # `add(prior, pg)` outside create_graph, as `_binary`
+                        # computes it for two tensors of one floating dtype
+                        # (the shapes are the parent's both): the kernel and
+                        # its tensor, without add's and _binary's dispatch.
+                        storage, shape = _k.binary("add", prior._s, prior.shape, pg._s, pg.shape, None)
+                        p._pg = Tensor(storage, shape, prior.dtype)
+                    else:
+                        p._pg = add(prior, pg) if prior.__class__ is not _SparseTensor else _sp._buffer_add(prior, pg)
         finally:
             _grad_enabled = prev_mode
         return captured
