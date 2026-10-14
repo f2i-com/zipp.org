@@ -216,3 +216,115 @@ gen 7 0x1.7545080000000p-2 0x1.7b9c7c0000000p-2 0x1.4fffe40000000p-2 0x1.9d72100
 ";
     assert_lines(source, expected);
 }
+
+
+/// The error backward raises for a saved tensor written in place reads as
+/// PyTorch 2.11's: a saved output named by the node that saved it (not by
+/// the in-place op that wrote it since), a saved input by its history now,
+/// a leaf by nothing, and PyTorch's hint for anomaly detection being off.
+#[test]
+fn inplace_errors_on_saved_tensors_read_as_pytorchs() {
+    let source = r#"
+import torch
+
+
+def run(name, build):
+    try:
+        build().sum().backward()
+        print(name, "no error")
+    except RuntimeError as e:
+        print(name, str(e))
+
+
+def relu_out():
+    x = torch.tensor([1.0, -2.0, 3.0], requires_grad=True)
+    z = torch.relu(x * 2)
+    z.relu_()
+    return z
+
+
+def exp_out():
+    x = torch.tensor([1.0, -2.0, 3.0], requires_grad=True)
+    z = (x * 2).exp()
+    z.exp_()
+    return z
+
+
+def sigmoid_out_then_mul():
+    x = torch.tensor([1.0, -2.0, 3.0], requires_grad=True)
+    z = torch.sigmoid(x * 2)
+    z.mul_(2)
+    return z
+
+
+def sqrt_out_then_add():
+    x = torch.tensor([1.0, 4.0, 9.0], requires_grad=True)
+    z = (x + 0).sqrt()
+    z.add_(1)
+    return z
+
+
+def tanh_on_saved_input():
+    x = torch.tensor([1.0, -2.0, 3.0], requires_grad=True)
+    y = x * 2
+    z = y * y
+    y.tanh_()
+    return z
+
+
+def add_on_saved_input():
+    w = torch.tensor([1.0, 2.0], requires_grad=True)
+    v = w * 1
+    u = v * v
+    v.add_(1)
+    return u
+
+
+def leaf_without_grad():
+    a = torch.tensor([1.0, 2.0])
+    b = torch.tensor([3.0, 4.0], requires_grad=True)
+    c = a * b
+    a.add_(1)
+    return c
+
+
+def leaf_under_no_grad():
+    w = torch.tensor([1.0, 2.0], requires_grad=True)
+    u = w * w
+    with torch.no_grad():
+        w.add_(1)
+    return u
+
+
+def exp_chain():
+    x = torch.tensor([1.0, 2.0], requires_grad=True)
+    y = x.exp()
+    z = y.exp()
+    y.mul_(2)
+    return z
+
+
+def double_tensor():
+    x = torch.tensor([1.0, 2.0], dtype=torch.float64, requires_grad=True)
+    z = torch.sigmoid(x)
+    z.add_(1)
+    return z
+
+
+for f in (relu_out, exp_out, sigmoid_out_then_mul, sqrt_out_then_add, tanh_on_saved_input, add_on_saved_input, leaf_without_grad, leaf_under_no_grad, exp_chain, double_tensor):
+    run(f.__name__, f)
+"#;
+    let expected = "\
+relu_out one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [3]], which is output 0 of ReluBackward0, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+exp_out one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [3]], which is output 0 of ExpBackward0, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+sigmoid_out_then_mul one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [3]], which is output 0 of SigmoidBackward0, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+sqrt_out_then_add one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [3]], which is output 0 of SqrtBackward0, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+tanh_on_saved_input one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [3]], which is output 0 of TanhBackward0, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+add_on_saved_input one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [2]], which is output 0 of AddBackward0, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+leaf_without_grad one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [2]] is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+leaf_under_no_grad one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [2]] is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+exp_chain one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [2]], which is output 0 of ExpBackward0, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+double_tensor one of the variables needed for gradient computation has been modified by an inplace operation: [torch.DoubleTensor [2]], which is output 0 of SigmoidBackward0, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+";
+    assert_lines(source, expected);
+}

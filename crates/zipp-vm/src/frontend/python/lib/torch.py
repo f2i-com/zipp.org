@@ -558,8 +558,22 @@ def _check_saved(node):
         now = _k.aversion(s)
         if now != version:
             shape = _list(t.shape)
-            owner = "" if t._node is None else ", which is output 0 of %s," % _grad_fn_name(t._node.name)
-            raise RuntimeError("one of the variables needed for gradient computation has been modified by an inplace operation: [torch.%s %s]%s is at version %d; expected version %d instead. Hint: the backtrace further above can show the operation that failed to compute its gradient." % (Tensor.type(t)[6:], shape, owner, now, version))
+            # As PyTorch names it: a saved output by the node that saved it
+            # (an in-place op since gave the tensor another history), a saved
+            # input by its history now, a leaf by nothing. (A saved tensor
+            # that is not among the node's inputs is its output.)
+            producer = node if node.parents and not _any_is(node.parents, t) else t._node
+            owner = "" if producer is None else ", which is output 0 of %s," % _grad_fn_name(producer.name)
+            # (anomaly detection, which PyTorch's other hint is for, is a
+            # no-op here)
+            raise RuntimeError("one of the variables needed for gradient computation has been modified by an inplace operation: [torch.%s %s]%s is at version %d; expected version %d instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False)." % (Tensor.type(t)[6:], shape, owner, now, version))
+
+
+def _any_is(items, x):
+    for v in items:
+        if v is x:
+            return True
+    return False
 
 
 def _grad_fn_name(name):
