@@ -387,7 +387,7 @@
     // The engine answers binaryFast's whole path itself (`py_tensor`,
     // OP_BIN_FAST: the result's typed array, its layout in BINF_MODE[0])
     // when the kernels are its own; a module across the wire declines it.
-    const N_BIN_FAST = 36, N_BIN_SCALAR_FAST = 37, BINF_MODE = new Float64Array(1), BINF_LOCAL = NATIVE_SMALL < NATIVE_MIN;
+    const N_BIN_FAST = 36, N_BIN_SCALAR_FAST = 37, N_MM_FAST = 38, BINF_MODE = new Float64Array(1), BINF_LOCAL = NATIVE_SMALL < NATIVE_MIN;
     function smallShape(py) {
         // The element count of a tuple/Size of ints, or -1.
         if (py === null || typeof py !== "object" || (py.cls !== SIZE && py.cls !== T.tuple)) return -1;
@@ -3847,6 +3847,21 @@
         fn("pad_last", 5, (a) => padLast(needS(a[0]), shapeOf(a[1]), num(a[2]), num(a[3]), num(a[4])));
         fnp("matmul", 6, function (a0, a1, a2, a3, a4, a5) {
             const x = a0, y = a2, transB = a4 !== undefined && a4 !== null && rt.truth(a4), transA = a5 !== undefined && a5 !== null && rt.truth(a5);
+            // The common product (float32/float64 of one dtype, the left of
+            // two or more dims, or two when transposed, the right of two)
+            // answered by the engine in one call (OP_MM_FAST): its typed
+            // array, shaped as the left operand with its last dim the
+            // right's columns.
+            if (BINF_LOCAL && NATIVE !== null && x !== null && typeof x === "object" && y !== null && typeof y === "object" && x.cls === Storage && y.cls === Storage
+                && x.dtype === y.dtype && (x.dtype === "float32" || x.dtype === "float64") && a1 !== null && typeof a1 === "object" && a3 !== null && typeof a3 === "object"
+                && (a1.cls === SIZE || a1.cls === T.tuple) && (a3.cls === SIZE || a3.cls === T.tuple)) {
+                const O = NATIVE(N_MM_FAST, x.data, a1, y.data, a3, transB, transA);
+                if (O !== false) {
+                    const o = transA ? [a1.items[1], a3.items[1]] : a1.items.slice();
+                    if (!transA) o[o.length - 1] = a3.items[transB ? 0 : 1];
+                    return tuple([{ cls: Storage, dtype: x.dtype, data: O, version: 0, untracked: 0 }, SIZE === null ? tuple(o) : { cls: SIZE, items: o, dict: new Map() }]);
+                }
+            }
             if (!isStorage(x) || !isStorage(y)) {
                 needC(x); needC(y);
                 if (transB || transA) fail(E.RuntimeError, "matmul: a transposed complex operand is not supported");

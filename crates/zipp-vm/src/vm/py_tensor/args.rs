@@ -16,6 +16,10 @@ pub(crate) const OP_LOCAL: u32 = 34;
 pub(crate) const OP_BIN_FAST: u32 = 36;
 /// `binaryScalarFast` (a storage and a Python number) the same way.
 pub(crate) const OP_BIN_SCALAR_FAST: u32 = 37;
+/// `_k.matmul` of two float32/float64 storages, the left of two or more
+/// dims and the right of two (optionally transposed): the product's typed
+/// array, allocated and computed in one call (`py_tensor`).
+pub(crate) const OP_MM_FAST: u32 = 38;
 
 // TypedArray kinds (`native::TA_KINDS`) a tensor storage can be. An int8
 // storage (Int8Array) reaches only the quantization kernels

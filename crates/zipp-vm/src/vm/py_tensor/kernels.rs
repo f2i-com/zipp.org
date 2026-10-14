@@ -71,6 +71,10 @@ const OP_OPTIM: u32 = 31;
 const OP_CELL: u32 = 32;
 const OP_RNG: u32 = 33;
 const OP_MATMUL_TN: u32 = 35;
+/// (`OP_MATMUL` / `OP_MATMUL_NT` for `py_tensor`'s OP_MM_FAST)
+pub(super) const OP_MATMUL_PUB: u32 = OP_MATMUL;
+pub(super) const OP_MATMUL_NT_PUB: u32 = OP_MATMUL_NT;
+pub(super) const OP_MATMUL_TN_PUB: u32 = OP_MATMUL_TN;
 
 /// `x` as a store into an element of `kind` leaves it: the typed-array
 /// conversion (`helpers_numeric::ta_encode`), read back.

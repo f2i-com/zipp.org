@@ -107,9 +107,14 @@ impl Vm<'_> {
             return Ok(Value::bool(false));
         };
         let op = u32::try_from(op).unwrap_or(0);
-        if op == args::OP_BIN_FAST || op == args::OP_BIN_SCALAR_FAST {
+        if op == args::OP_BIN_FAST || op == args::OP_BIN_SCALAR_FAST || op == args::OP_MM_FAST {
             #[cfg(not(feature = "python-no-torch"))]
-            return Ok(if op == args::OP_BIN_FAST { self.pt_bin_fast(&args[1..]) } else { self.pt_bin_scalar_fast(&args[1..]) }.unwrap_or(Value::bool(false)));
+            return Ok(match op {
+                args::OP_BIN_FAST => self.pt_bin_fast(&args[1..]),
+                args::OP_BIN_SCALAR_FAST => self.pt_bin_scalar_fast(&args[1..]),
+                _ => self.pt_mm_fast(&args[1..]),
+            }
+            .unwrap_or(Value::bool(false)));
             #[cfg(feature = "python-no-torch")]
             return Ok(Value::bool(false));
         }
@@ -276,6 +281,63 @@ impl Vm<'_> {
         let o = self.alloc_typed_array(buf, va.kind, 0, n);
         self.charge_steps(cost as i64);
         Some(o)
+    }
+
+    /// `(A, apy, B, bpy, transB, transA)`: `_k.matmul` of float32/float64
+    /// storages of one dtype, `A` of shape `apy` (two or more dims, its
+    /// leading ones a batch; or two stored as `[k, m]` when `transA`) and
+    /// `B` of `bpy` (two dims; stored as `[n, k]` when `transB`): the
+    /// kernel's product over the batch as one `[batch * m, k] @ [k, n]`
+    /// (each output still the sum of its k products in p order, as the
+    /// per-batch loop computes it) into a new typed array, shaped as `apy`
+    /// with its last dim `n` (`[m, n]` when `transA`). `None` for anything
+    /// else (a mismatch raises on the caller's path), or when the kernel
+    /// declines.
+    #[cfg(not(feature = "python-no-torch"))]
+    fn pt_mm_fast(&mut self, a: &[Value]) -> Option<Value> {
+        use args::{KIND_F32, KIND_F64};
+        let (Arg::View(va), Arg::View(vb), Arg::Bool(trans_b)) = (self.pt_arg(*a.first()?), self.pt_arg(*a.get(2)?), self.pt_arg(*a.get(4)?)) else {
+            return None;
+        };
+        if va.kind != vb.kind || !matches!(va.kind, KIND_F32 | KIND_F64) {
+            return None;
+        }
+        let (p, q) = (self.pt_dims(*a.get(1)?)?, self.pt_dims(*a.get(3)?)?);
+        if p.len() < 2 || q.len() != 2 || p.iter().chain(q.iter()).any(|&d| d <= 0) {
+            return None;
+        }
+        let trans_a = matches!(a.get(5).map(|&v| self.pt_arg(v)), Some(Arg::Bool(true)));
+        if trans_a && (trans_b || p.len() != 2) {
+            return None;
+        }
+        let dim = |d: i64| usize::try_from(d).ok();
+        let (rows, k) = if trans_a {
+            (dim(p[1])?, dim(p[0])?)
+        } else {
+            (p[..p.len() - 1].iter().try_fold(1usize, |n, &d| n.checked_mul(dim(d)?))?, dim(p[p.len() - 1])?)
+        };
+        let (kb, n) = if trans_b { (dim(q[1])?, dim(q[0])?) } else { (dim(q[0])?, dim(q[1])?) };
+        if kb != k || va.len != rows.checked_mul(k)? || vb.len != k.checked_mul(n)? {
+            return None;
+        }
+        let total = rows.checked_mul(n)?;
+        let size = if va.kind == KIND_F32 { 4 } else { 8 };
+        let buf = self.alloc_array_buffer(total.checked_mul(size)?).ok()?;
+        let o = self.alloc_typed_array(buf, va.kind, 0, total);
+        let vo = View { buffer: buf, kind: va.kind, offset: 0, len: total };
+        let num = |x: usize| Arg::Num(x as f64);
+        let args = [Arg::View(va), Arg::View(vb), Arg::View(vo), num(0), num(0), num(0), num(rows), num(k), num(n)];
+        let op = if trans_a {
+            kernels::OP_MATMUL_TN_PUB
+        } else if trans_b {
+            kernels::OP_MATMUL_NT_PUB
+        } else {
+            kernels::OP_MATMUL_PUB
+        };
+        match kernels::run(self, op, &args) {
+            Outcome::Done => Some(o),
+            _ => None,
+        }
     }
 
     /// A Size or tuple record's ints (immediate BigInts), or `None`.
