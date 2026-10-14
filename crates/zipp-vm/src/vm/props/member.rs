@@ -125,24 +125,17 @@ impl<'p> Vm<'p> {
         let mut guard = 0u32;
         while cur != 0 && guard < 64 {
             guard += 1;
-            // `own_member` only sees ordinary storage, so a PROXY spliced into the
-            // chain (`Object.setPrototypeOf(Number.prototype, p); (5).x`) would be
-            // walked straight past and its `get` trap never run. Hand the rest of
-            // the chain to the ordinary member path, which runs the trap with the
-            // original receiver.
-            if matches!(self.heap.get(cur), HeapObj::Proxy { .. }) {
-                return self.with_native_recursion_guard(|vm| {
-                    vm.get_member(Value::heap(cur), key, receiver)
-                });
-            }
-            // An ARRAY spliced into the chain (`Object.setPrototypeOf(a, [..])`)
-            // keeps its named properties in the array side table and chains to
-            // %Array.prototype% (or its own recorded prototype) — neither of
-            // which `own_member` + `proto_of` see, so the walk stopped there and
-            // `a.push` read as undefined (test262
-            // Array/prototype/copyWithin/coerced-values-start-change-start).
-            // Hand the rest of the chain to the Array-aware member path.
-            if matches!(self.heap.get(cur), HeapObj::Array(_)) {
+            // `own_member` only sees ordinary storage, so anything else spliced
+            // into the chain would be walked straight past: a PROXY's `get` trap
+            // never run (`Object.setPrototypeOf(Number.prototype, p); (5).x`), an
+            // ARRAY's named properties and its chain to %Array.prototype% missed
+            // (`a.push` read as undefined, test262
+            // Array/prototype/copyWithin/coerced-values-start-change-start), a
+            // CLASS's statics and a function's own properties skipped
+            // (`Reflect.setPrototypeOf(fn, C); fn.s`). Hand the rest of the chain
+            // to the general member path, which knows each kind's storage and
+            // keeps the original receiver.
+            if !matches!(self.heap.get(cur), HeapObj::Object(_)) {
                 return self.with_native_recursion_guard(|vm| {
                     vm.get_member(Value::heap(cur), key, receiver)
                 });
@@ -705,9 +698,18 @@ impl<'p> Vm<'p> {
     /// own property in the generic `arr_props` side table (invoking a getter with
     /// `this = obj`), else delegate to the type's prototype. Lets these objects
     /// carry own properties defined via `Object.defineProperty`.
+    /// Whether a Map or Set's `size` is its live length without a lookup: no
+    /// replaced [[Prototype]] (a subclass's or `setPrototypeOf`'s, which may
+    /// define its own `size`) and no own `size` property.
+    fn plain_collection_size(&self, idx: u32) -> bool {
+        !self.proto_of.contains_key(&idx)
+            && self.arr_props.get(&idx).is_none_or(|m| m.pos("size").is_none())
+    }
+
     pub(crate) fn exotic_own_or_proto(
         &mut self,
         obj: Value,
+        receiver: Value,
         proto: u32,
         key: &str,
     ) -> Result<Value, Thrown> {
@@ -720,7 +722,7 @@ impl<'p> Vm<'p> {
                 return if v == Value::UNDEFINED {
                     Ok(Value::UNDEFINED)
                 } else {
-                    self.call_value(v, obj, &[])
+                    self.call_value(v, receiver, &[])
                 };
             }
             return Ok(v);
@@ -738,9 +740,10 @@ impl<'p> Vm<'p> {
             None => proto,
         };
         // Accessor-aware so an inherited getter on the type's prototype (e.g. a
-        // user-redefined `set`/`add`) is INVOKED with `obj` as the receiver, not
+        // user-redefined `set`/`add`) is INVOKED with the receiver (`obj` itself
+        // unless the read came up a chain or through `Reflect.get`), not
         // returned as the raw getter function.
-        self.proto_member_get(eff, key, obj)
+        self.proto_member_get(eff, key, receiver)
     }
 
     /// Resolve `key` for class instance `inst` (heap index; its own map has
@@ -2159,10 +2162,16 @@ impl<'p> Vm<'p> {
             // `map.size` / `set.size` — an accessor property, not a method.
             // Deleted entries are tombstoned (Value::HOLE) without shifting indices
             // (so live iterators/forEach stay valid), so size counts only live slots.
-            HeapObj::Map { .. } if key == "size" => {
+            // Only for the collection itself read directly, with its default
+            // prototype and no own `size`: an object inheriting from a Map, a
+            // `Reflect.get` receiver, a subclass's `get size()` or an own
+            // property take the general path, where the getter sees the
+            // receiver (and throws for one that is not a Map).
+            HeapObj::Map { .. } | HeapObj::Set(_)
+                if key == "size" && receiver == obj && self.plain_collection_size(obj.heap_index()) =>
+            {
                 Ok(len_value(self.coll_live_len(obj.heap_index())))
             }
-            HeapObj::Set(_) if key == "size" => Ok(len_value(self.coll_live_len(obj.heap_index()))),
             // A Python instance's attribute (or dict) storage answers as a
             // Map (`vm::py_table::layout`).
             #[cfg(feature = "python")]
@@ -2170,27 +2179,27 @@ impl<'p> Vm<'p> {
                 if key == "size" {
                     return Ok(len_value(self.py_store_len(obj.heap_index()).unwrap_or(0)));
                 }
-                self.exotic_own_or_proto(obj, self.map_proto, key)
+                self.exotic_own_or_proto(obj, receiver, self.map_proto, key)
             }
             // A method as a VALUE on a Map/Set/Date/Promise instance
             // (`new Map().set`, `d.getHours`) → the corresponding prototype.
-            HeapObj::Map { .. } => self.exotic_own_or_proto(obj, self.map_proto, key),
-            HeapObj::Set(_) => self.exotic_own_or_proto(obj, self.set_proto, key),
-            HeapObj::WeakMap { .. } => self.exotic_own_or_proto(obj, self.weakmap_proto, key),
-            HeapObj::WeakSet(_) => self.exotic_own_or_proto(obj, self.weakset_proto, key),
-            HeapObj::WeakRef(_) => self.exotic_own_or_proto(obj, self.weakref_proto, key),
+            HeapObj::Map { .. } => self.exotic_own_or_proto(obj, receiver, self.map_proto, key),
+            HeapObj::Set(_) => self.exotic_own_or_proto(obj, receiver, self.set_proto, key),
+            HeapObj::WeakMap { .. } => self.exotic_own_or_proto(obj, receiver, self.weakmap_proto, key),
+            HeapObj::WeakSet(_) => self.exotic_own_or_proto(obj, receiver, self.weakset_proto, key),
+            HeapObj::WeakRef(_) => self.exotic_own_or_proto(obj, receiver, self.weakref_proto, key),
             HeapObj::FinalizationRegistry { .. } => {
-                self.exotic_own_or_proto(obj, self.finreg_proto, key)
+                self.exotic_own_or_proto(obj, receiver, self.finreg_proto, key)
             }
             // Own properties first, then a replaced [[Prototype]], then the
             // iterator's own prototype, as for the other exotic instances.
             HeapObj::Iterator { proto, .. } => {
                 let p = *proto;
-                self.exotic_own_or_proto(obj, p, key)
+                self.exotic_own_or_proto(obj, receiver, p, key)
             }
             HeapObj::IterHelper { .. } => {
                 let p = self.iterator_helper_proto;
-                self.exotic_own_or_proto(obj, p, key)
+                self.exotic_own_or_proto(obj, receiver, p, key)
             }
             // A generator instance delegates to its [[Prototype]] — the
             // callee's `prototype` object when one was installed at call time
@@ -2230,10 +2239,10 @@ impl<'p> Vm<'p> {
                 };
                 // An assigned/defined own property (`new Object(42).charAt = …`)
                 // wins over the wrapped type's prototype.
-                self.exotic_own_or_proto(obj, proto, key)
+                self.exotic_own_or_proto(obj, receiver, proto, key)
             }
-            HeapObj::Date(_) => self.exotic_own_or_proto(obj, self.date_proto, key),
-            HeapObj::Promise { .. } => self.exotic_own_or_proto(obj, self.promise_proto, key),
+            HeapObj::Date(_) => self.exotic_own_or_proto(obj, receiver, self.date_proto, key),
+            HeapObj::Promise { .. } => self.exotic_own_or_proto(obj, receiver, self.promise_proto, key),
             // A Symbol: `.description` reads the wrapped description; methods
             // (toString/valueOf/constructor) resolve through Symbol.prototype.
             HeapObj::Symbol { desc, .. } => {
