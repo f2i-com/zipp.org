@@ -2551,6 +2551,13 @@ impl ObjMap {
         self.has_element_key || !self.extensible
     }
 
+    /// Whether every property has the default data attributes (writable,
+    /// enumerable, configurable, not an accessor).
+    #[inline]
+    pub(crate) fn attrs_all_data(&self) -> bool {
+        matches!(self.attrs, PropAttrs::AllData { .. })
+    }
+
     /// Whether any key here names an element — see [`ObjMap::has_element_key`].
     /// Unlike [`ObjMap::overlays_elements`] this ignores the integrity flags, for
     /// the one caller that is asking a pure key question (`array_index_override`).

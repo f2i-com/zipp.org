@@ -152,6 +152,10 @@ impl<'p> Vm<'p> {
                 }
                 continue;
             }
+            if !string_target && self.object_assign_plain(tidx, src.heap_index()) {
+                added_any = true;
+                continue;
+            }
             // CopyDataProperties: ? from.[[OwnPropertyKeys]]() (integer, string,
             // THEN symbol — symbols INCLUDED), and per key ? [[GetOwnProperty]]
             // (skip absent / non-enumerable) then ? [[Get]]. object_own_keys +
@@ -187,6 +191,103 @@ impl<'p> Vm<'p> {
             self.heap.bump_version(tidx);
         }
         Ok(target)
+    }
+
+    /// One source of `Object.assign` that is a plain object holding only
+    /// ordinary data properties (no index key, no symbol key, no accessor),
+    /// into a plain extensible target: its own keys are its insertion order
+    /// and each Get is its slot, so the copy is each key's Set made where it
+    /// is — a store into the target's own writable data property, or the
+    /// append of a key no level of the target's chain intercepts
+    /// (`plain_add_chain_clear`); an empty target takes the source's whole
+    /// store, as an object spread does. `false`, with nothing written, for
+    /// anything else (a Proxy, a getter, a setter or a read-only property in
+    /// the way, a class instance or prototype as the target, the global, a
+    /// namespace, Object.prototype or Array.prototype): the general loop
+    /// then performs it. The general path built every key's string, read a
+    /// descriptor object for it and ran `set_prop`: a microsecond for
+    /// `Object.assign({}, {a, b})`.
+    fn object_assign_plain(&mut self, tidx: u32, sidx: u32) -> bool {
+        if sidx == tidx
+            || !assign_plain_enabled()
+            || (tidx == self.global_this && self.global_this != 0)
+            || self.is_indexed_proto_anchor(tidx)
+            || !self.realm_global_objs.is_empty()
+            || !self.deferred_ns_state.is_empty()
+            || (!self.module_namespaces.is_empty()
+                && (self.module_namespaces.contains_key(&tidx)
+                    || self.module_namespaces.contains_key(&sidx)))
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&tidx))
+        {
+            return false;
+        }
+        let keys: Vec<String> = match self.heap.get(sidx) {
+            HeapObj::Object(sm)
+                if !sm.is_ctor
+                    && !sm.has_element_key()
+                    && sm.attrs_all_data()
+                    && !sm.keys.iter().any(|k| k.starts_with("@@") || k == "__proto__") =>
+            {
+                sm.keys.iter().cloned().collect()
+            }
+            _ => return false,
+        };
+        let target_ok = matches!(
+            self.heap.get(tidx),
+            HeapObj::Object(tm)
+                if tm.extensible && tm.class.is_none() && !tm.class_proto && !tm.is_ctor
+        );
+        if !target_ok || keys.iter().any(|k| !self.plain_add_chain_clear(tidx, k)) {
+            return false;
+        }
+        // Every key's Set is now an own store or an ordinary append.
+        let own_ok = match self.heap.get(tidx) {
+            HeapObj::Object(tm) => keys.iter().all(|k| match tm.pos(k) {
+                Some(i) => {
+                    let a = tm.attr_at(i);
+                    !a.accessor && a.writable && !tm.val_at(i).is_uninitialized()
+                }
+                None => true,
+            }),
+            _ => false,
+        };
+        if !own_ok {
+            return false;
+        }
+        let target_empty = matches!(self.heap.get(tidx), HeapObj::Object(tm) if tm.keys.is_empty());
+        if target_empty {
+            let copy = match self.heap.get(sidx) {
+                HeapObj::Object(sm) => sm.spread_copy(),
+                _ => None,
+            };
+            if let Some(copy) = copy {
+                for &v in copy.vals_slice() {
+                    if v.is_heap() {
+                        self.heap.write_barrier_val(tidx, v);
+                    }
+                }
+                if let HeapObj::Object(tm) = self.heap.get_mut(tidx) {
+                    tm.assign_spread_copy(copy);
+                }
+                return true;
+            }
+        }
+        let vals: Vec<Value> = match self.heap.get(sidx) {
+            HeapObj::Object(sm) => sm.vals_slice().to_vec(),
+            _ => return false,
+        };
+        for (k, v) in keys.into_iter().zip(vals) {
+            if v.is_heap() {
+                self.heap.write_barrier_val(tidx, v);
+            }
+            if let HeapObj::Object(tm) = self.heap.get_mut(tidx) {
+                match tm.pos(&k) {
+                    Some(i) => tm.set_val_at(i, v),
+                    None => tm.push_data(k, v),
+                }
+            }
+        }
+        true
     }
 
     /// Set(to, key, value, true) — STRICT, per CopyDataProperties: a setter is
@@ -2487,6 +2588,22 @@ impl<'p> Vm<'p> {
                 }
             }
             k += 1;
+        }
+    }
+}
+
+/// `ZIPP_NO_ASSIGN_PLAIN=1` sends every `Object.assign` source through the
+/// general loop again (`Vm::object_assign_plain`'s same-binary A/B).
+fn assign_plain_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ASSIGN_PLAIN").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
         }
     }
 }
