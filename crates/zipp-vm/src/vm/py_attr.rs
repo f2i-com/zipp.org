@@ -363,6 +363,11 @@ impl<'p> Vm<'p> {
             return false;
         };
         let mut ents = [PyIc::default(); MAX];
+        // The stores' entries, their sites' in a row (one look-up of the
+        // code object's table).
+        if !self.py_ic_run(fid, 1, &mut ents[..stores]) {
+            return false;
+        }
         let mut vals = [Value::UNDEFINED; MAX];
         let mut stamp: Option<(u32, u64)> = None;
         for i in 0..stores {
@@ -372,7 +377,7 @@ impl<'p> Vm<'p> {
             let Some(&v) = (val as usize).checked_sub(1).and_then(|at| args.get(at)) else {
                 return false;
             };
-            let e = self.py_ic(fid, 1 + i);
+            let e = ents[i];
             if e.a != cls.bits() {
                 return false;
             }
@@ -390,16 +395,29 @@ impl<'p> Vm<'p> {
                 }
                 _ => return false,
             }
-            ents[i] = e;
             vals[i] = v;
         }
+        // The stores, as `py_attrs_put` / `py_attrs_push` make them, with
+        // the storage's mirror republished once, after the last append (no
+        // code runs between them).
         let di = dict.heap_index();
+        let mut appended = false;
         for (e, &v) in ents[..stores].iter().zip(&vals[..stores]) {
-            if e.kind == ic::ATTR_SET_L {
-                self.py_attrs_put(di, e.pos as usize, v);
-            } else {
-                self.py_attrs_push(di, e.b as u32, v);
+            self.heap.write_barrier_val(di, v);
+            if let HeapObj::PyAttrs { layout, vals } = self.heap.get_mut(di) {
+                if e.kind == ic::ATTR_SET_L {
+                    if let Some(x) = vals.get_mut(e.pos as usize) {
+                        *x = v;
+                    }
+                } else {
+                    vals.push(v);
+                    *layout = e.b as u32;
+                    appended = true;
+                }
             }
+        }
+        if appended {
+            self.heap.refresh_mirror(di);
         }
         true
     }
@@ -416,6 +434,17 @@ impl<'p> Vm<'p> {
         if e.kind != ic::CALL_ENTRY || e.c == 0 || e.a != f.bits() || !f.is_heap() {
             return false;
         }
+        // The entry's `c`: the code object's id, register count and
+        // parameter count (`Vm::py_call_target`). Whether that code object
+        // is a store body first: every other plain call from compiled code
+        // asks, and is answered by one read.
+        let (fid, params) = (e.c as u32, (e.c >> 48) as u16);
+        if argc != params {
+            return false;
+        }
+        let Some(stores) = self.py_store_body(fid) else {
+            return false;
+        };
         let fi = f.heap_index();
         if self.heap.version_of(fi) != e.hver {
             return false;
@@ -425,15 +454,6 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) if pos < m.len() && !m.is_accessor_at(pos) && m.val_at(pos).bits() == e.b => {}
             _ => return false,
         }
-        // The entry's `c`: the code object's id, register count and
-        // parameter count (`Vm::py_call_target`).
-        let (fid, params) = (e.c as u32, (e.c >> 48) as u16);
-        if argc != params {
-            return false;
-        }
-        let Some(stores) = self.py_store_body(fid) else {
-            return false;
-        };
         self.with_argv(base, arg_base, argc, |vm, argv| vm.py_store_call(fid, stores, argv))
     }
 

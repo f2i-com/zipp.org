@@ -151,9 +151,8 @@ pub(super) mod ic {
 /// Alternate entries a site keeps (see `Vm::py_ic_class`).
 const ALT_WAYS: usize = 3;
 
-/// Whether entries of `kind` name, in `a`, the class (or the record) they
-/// hold for: the kinds a site meeting several of them in turn keeps
-/// alternates of.
+/// Whether entries of `kind` name, in `a`, the class they hold for: the
+/// kinds a site meeting several classes in turn keeps alternates of.
 fn keyed_by_a(kind: u8) -> bool {
     matches!(
         kind,
@@ -165,7 +164,6 @@ fn keyed_by_a(kind: u8) -> bool {
             | ic::ATTR_FN
             | ic::BUILTIN_METHOD
             | ic::NEW
-            | ic::CALL_ENTRY
             | ic::NOT_PLAIN
             | ic::ATTR_GET_L
             | ic::ATTR_SET_L
@@ -1087,6 +1085,24 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The cache entries of the sites at `ip`, `ip + 1`, ... (one per
+    /// element of `out`), each as [`Vm::py_ic`] answers it; `false` when the
+    /// function has no table yet or one of those ips is not a site.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline]
+    pub(super) fn py_ic_run(&self, func_id: u32, ip: usize, out: &mut [PyIc]) -> bool {
+        let Some(Some(f)) = self.py_rt.as_deref().and_then(|p| p.ics.get(func_id as usize)) else {
+            return false;
+        };
+        for (i, slot) in out.iter_mut().enumerate() {
+            match f.slot_of.get(ip + i) {
+                Some(&s) if s != u16::MAX => *slot = f.ents[s as usize],
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Record this site's cache entry.
     pub(super) fn py_ic_put(&mut self, func_id: u32, ip: usize, e: PyIc) {
         let code = &self.func(func_id as usize).code;
@@ -1154,7 +1170,7 @@ impl<'p> Vm<'p> {
     /// [`Vm::py_ic_class`] past the current entry: the alternate naming
     /// `key` exchanged with the current entry in place.
     #[inline(never)]
-    pub(super) fn py_ic_swap(&mut self, func_id: u32, ip: usize, key: u64) -> Option<PyIc> {
+    fn py_ic_swap(&mut self, func_id: u32, ip: usize, key: u64) -> Option<PyIc> {
         let p = self.py_rt.as_deref_mut()?;
         let fic = p.ics.get_mut(func_id as usize)?.as_deref_mut()?;
         let s = *fic.slot_of.get(ip)? as usize;
