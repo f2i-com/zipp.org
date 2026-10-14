@@ -163,12 +163,12 @@ pub use crate::api::*;
 /// the table behind `\p{ID_Start}` and a named group's first character. The
 /// engine's lexer asks here, so a module carries the property once.
 pub fn is_id_start(c: char) -> bool {
-    unicodetables::id_start_ranges().contains_identifier(c.into())
+    unicode::is_id_start_cp(c.into())
 }
 
 /// PATCH (see FORK.md): whether `c` has the Unicode property `ID_Continue`.
 pub fn is_id_continue(c: char) -> bool {
-    unicodetables::id_continue_ranges().contains_identifier(c.into())
+    unicode::is_id_continue_cp(c.into())
 }
 
 /// PATCH (see VENDORED.md): `ZIPP_RXSTATS=1` classical-backtrack counters —
@@ -280,4 +280,3 @@ mod types;
 mod unicode;
 mod unicodetables;
 mod unicodetables_unknown;
-

@@ -1,16 +1,23 @@
 //! Lossless storage for Unicode property tables. Decode only when the regex
 //! parser constructs its owned CodePointSet (which previously copied a slice).
 //! No decoding or extra indirection is added to regex matching.
-use crate::codepointset::Interval;
+use crate::codepointset::{CodePointSet, Interval};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
 pub(crate) struct PackedIntervals {
     pub(crate) bytes: &'static [u8],
     pub(crate) count: usize,
-    // Identifier predicates need binary search for each group-name character.
-    // Keep just those two tables directly indexed; packing is for expansion.
-    pub(crate) direct: Option<&'static [Interval]>,
+    // A table that is the union of others (a General_Category group), or the
+    // complement of that union (Assigned), is stored as those tables: `bytes`
+    // is empty and `count` is the number of intervals it has.
+    pub(crate) union_of: &'static [&'static PackedIntervals],
+    pub(crate) complement: bool,
+    /// A derived table's intervals, built the first time a regex uses it:
+    /// merging the parts costs more than decoding one packed table did, and
+    /// a pattern such as `\p{L}` is compiled again for every new RegExp.
+    #[cfg(feature = "std")]
+    pub(crate) cache: Option<&'static std::sync::OnceLock<Vec<Interval>>>,
     #[cfg(test)]
     pub(crate) original: &'static [Interval],
 }
@@ -22,10 +29,51 @@ impl PackedIntervals {
     }
 
     pub(crate) fn to_vec(&self) -> Vec<Interval> {
-        if let Some(direct) = self.direct {
-            return direct.to_vec();
+        if self.union_of.is_empty() {
+            let mut out = Vec::with_capacity(self.count);
+            self.decode_into(&mut out);
+            return out;
         }
-        let mut out = Vec::with_capacity(self.count);
+        #[cfg(feature = "std")]
+        if let Some(cache) = self.cache {
+            return cache.get_or_init(|| self.build_union()).clone();
+        }
+        self.build_union()
+    }
+
+    /// A derived table's intervals, built from its parts.
+    fn build_union(&self) -> Vec<Interval> {
+        // The parts are disjoint and each sorted: decode them all, sort once
+        // and join touching neighbours, the form the generator writes (and
+        // CodePointSet keeps).
+        let mut all = Vec::new();
+        for part in self.union_of {
+            part.decode_into(&mut all);
+        }
+        all.sort_unstable_by_key(|iv| iv.first);
+        let mut out: Vec<Interval> = Vec::with_capacity(all.len());
+        for iv in all {
+            match out.last_mut() {
+                Some(last) if iv.first <= last.last + 1 => last.last = last.last.max(iv.last),
+                _ => out.push(iv),
+            }
+        }
+        if self.complement {
+            out = CodePointSet::from_sorted_disjoint_intervals(out)
+                .inverted()
+                .intervals()
+                .to_vec();
+        }
+        debug_assert_eq!(out.len(), self.count);
+        out
+    }
+
+    /// Append this table's intervals (a derived table's are its parts').
+    fn decode_into(&self, out: &mut Vec<Interval>) {
+        if !self.union_of.is_empty() {
+            out.extend(self.to_vec());
+            return;
+        }
         let mut bytes = self.bytes.iter().copied();
         let mut next = 0;
         for _ in 0..self.count {
@@ -35,11 +83,25 @@ impl PackedIntervals {
             next = last + 1;
         }
         debug_assert!(bytes.next().is_none());
-        out
     }
 
+    /// Whether `cp` is in this table: a binary search over its intervals,
+    /// decoded into `cache` the first time. The identifier tables are asked
+    /// once per character of an identifier (the engine's lexer) or a group
+    /// name; packed like every other table, they decode once per process.
+    #[cfg(feature = "std")]
+    pub(crate) fn contains_identifier(
+        &self,
+        cache: &std::sync::OnceLock<Vec<Interval>>,
+        cp: u32,
+    ) -> bool {
+        crate::codepointset::interval_contains(cache.get_or_init(|| self.to_vec()), cp)
+    }
+
+    /// Without `std` there is no cache: decode on every lookup.
+    #[cfg(not(feature = "std"))]
     pub(crate) fn contains_identifier(&self, cp: u32) -> bool {
-        crate::codepointset::interval_contains(self.direct.expect("identifier table"), cp)
+        crate::codepointset::interval_contains(&self.to_vec(), cp)
     }
 }
 
@@ -121,7 +183,10 @@ macro_rules! packed_intervals {
                 crate::packed_intervals::packed_len(INPUT)
             }>(INPUT),
             count: INPUT.len(),
-            direct: None,
+            union_of: &[],
+            complement: false,
+            #[cfg(feature = "std")]
+            cache: None,
             #[cfg(test)]
             original: INPUT,
         }
@@ -129,17 +194,28 @@ macro_rules! packed_intervals {
 }
 pub(crate) use packed_intervals;
 
-macro_rules! direct_intervals {
-    ($($iv:expr),* $(,)?) => {{
+// A table stored as the union of `parts` (complemented if `complement`); the
+// literals stay for the interval count and the round-trip test, and only
+// const evaluation reads them.
+macro_rules! derived_intervals {
+    ([$($part:expr),* $(,)?], $complement:expr, $($iv:expr),* $(,)?) => {{
         const INPUT: &[crate::codepointset::Interval] = &[$($iv),*];
+        #[cfg(feature = "std")]
+        static CACHE: std::sync::OnceLock<Vec<crate::codepointset::Interval>> =
+            std::sync::OnceLock::new();
         crate::packed_intervals::PackedIntervals {
-            bytes: &[], count: INPUT.len(), direct: Some(INPUT),
+            bytes: &[],
+            count: INPUT.len(),
+            union_of: &[$($part),*],
+            complement: $complement,
+            #[cfg(feature = "std")]
+            cache: Some(&CACHE),
             #[cfg(test)]
             original: INPUT,
         }
     }};
 }
-pub(crate) use direct_intervals;
+pub(crate) use derived_intervals;
 
 #[cfg(test)]
 mod tests {

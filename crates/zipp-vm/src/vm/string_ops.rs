@@ -2299,13 +2299,9 @@ fn case_map_exact_len(bytes: &[u8], upper: bool) -> Result<usize, Thrown> {
         match std::str::from_utf8(rest) {
             Ok(s) => {
                 for c in s.chars() {
-                    let mapped_len: usize = if upper {
-                        c.to_uppercase().map(char::len_utf8).sum()
-                    } else {
-                        // `str::to_lowercase`'s contextual final sigma has the
-                        // same UTF-8 width as the ordinary sigma emitted here.
-                        c.to_lowercase().map(char::len_utf8).sum()
-                    };
+                    // The contextual final sigma has the same UTF-8 width as
+                    // the ordinary sigma counted here.
+                    let mapped_len = crate::vm::special_casing::mapped_len(c, upper);
                     total = checked_string_output_add(total, mapped_len)?;
                 }
                 break;
@@ -2314,11 +2310,7 @@ fn case_map_exact_len(bytes: &[u8], upper: bool) -> Result<usize, Thrown> {
                 let valid = e.valid_up_to();
                 let s = std::str::from_utf8(&rest[..valid]).unwrap();
                 for c in s.chars() {
-                    let mapped_len: usize = if upper {
-                        c.to_uppercase().map(char::len_utf8).sum()
-                    } else {
-                        c.to_lowercase().map(char::len_utf8).sum()
-                    };
+                    let mapped_len = crate::vm::special_casing::mapped_len(c, upper);
                     total = checked_string_output_add(total, mapped_len)?;
                 }
                 let skip = e.error_len().unwrap_or(rest.len() - valid);
@@ -2353,9 +2345,9 @@ fn case_map_exact(
         match std::str::from_utf8(rest) {
             Ok(s) => {
                 let mapped = if upper {
-                    s.to_uppercase()
+                    crate::vm::special_casing::str_to_uppercase(s)
                 } else {
-                    s.to_lowercase()
+                    crate::vm::special_casing::str_to_lowercase(s)
                 };
                 if out
                     .len()
@@ -2373,9 +2365,9 @@ fn case_map_exact(
                 // The valid prefix is UTF-8 by construction.
                 let s = std::str::from_utf8(&rest[..valid]).unwrap();
                 let mapped = if upper {
-                    s.to_uppercase()
+                    crate::vm::special_casing::str_to_uppercase(s)
                 } else {
-                    s.to_lowercase()
+                    crate::vm::special_casing::str_to_lowercase(s)
                 };
                 if out
                     .len()

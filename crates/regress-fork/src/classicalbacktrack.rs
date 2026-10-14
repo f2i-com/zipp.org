@@ -2554,14 +2554,94 @@ pub(crate) fn scan_ascii_drain_with_limits(
     }
 }
 
-impl<Input: InputIndexer> exec::MatchProducer for BacktrackExecutor<'_, Input> {
+/// The search step of each input type, compiled in this crate.
+///
+/// A caller's `Matches::next` is generic code the caller compiles, and above
+/// opt-level 1 rustc does not share a generic instance between crates. When
+/// the search step was that generic code, a caller that both iterated and
+/// made sticky attempts (`Regex::match_at_*`, compiled here) built the whole
+/// matcher twice per input type: `try_at_pos`, the loop and lookaround bodies
+/// and everything under them. Each impl below is generic over lifetimes only,
+/// so its body, and the matcher it instantiates, is compiled once, here.
+///
+/// With the native regex JIT (`rx-jit`, the CLI) the step stays generic, as
+/// it was: there the shared matcher ran the sticky tokenizer of
+/// bench/regex 1.13 to 1.16 times slower, and the bytes it saves are what
+/// the WebAssembly modules are measured by, not the CLI.
+pub trait SearchStep: InputIndexer {
+    /// [`exec::MatchProducer::next_match`] for this input type.
+    fn search_step(
+        ex: &mut BacktrackExecutor<'_, Self>,
+        pos: Self::Position,
+        next_start: &mut Option<Self::Position>,
+    ) -> Option<Match>;
+}
+
+#[cfg(not(feature = "rx-jit"))]
+macro_rules! search_step {
+    ($($input:ty),*) => {$(
+        impl SearchStep for $input {
+            fn search_step(
+                ex: &mut BacktrackExecutor<'_, Self>,
+                pos: Self::Position,
+                next_start: &mut Option<Self::Position>,
+            ) -> Option<Match> {
+                ex.next_match_impl(pos, next_start)
+            }
+        }
+    )*};
+}
+#[cfg(not(feature = "rx-jit"))]
+search_step!(AsciiInput<'_>, Utf8Input<'_>);
+#[cfg(all(feature = "utf16", not(feature = "rx-jit")))]
+search_step!(indexing::Utf16Input<'_>);
+#[cfg(all(
+    feature = "utf16",
+    not(feature = "compact-utf16"),
+    not(feature = "rx-jit")
+))]
+search_step!(indexing::Ucs2Input<'_>);
+
+#[cfg(feature = "rx-jit")]
+impl<Input: InputIndexer> SearchStep for Input {
+    #[inline]
+    fn search_step(
+        ex: &mut BacktrackExecutor<'_, Self>,
+        pos: Self::Position,
+        next_start: &mut Option<Self::Position>,
+    ) -> Option<Match> {
+        ex.next_match_impl(pos, next_start)
+    }
+}
+
+impl<Input: SearchStep> exec::MatchProducer for BacktrackExecutor<'_, Input> {
     type Position = Input::Position;
 
     fn initial_position(&self, offset: usize) -> Option<Self::Position> {
         self.input.try_move_right(self.input.left_end(), offset)
     }
 
+    #[inline]
     fn next_match(
+        &mut self,
+        pos: Input::Position,
+        next_start: &mut Option<Input::Position>,
+    ) -> Option<Match> {
+        Input::search_step(self, pos, next_start)
+    }
+
+    #[inline]
+    fn match_usage(&self) -> MatchUsage {
+        self.matcher.match_usage()
+    }
+}
+
+impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
+    // Out of line: at opt-level z (Lite) the inliner otherwise folds it and
+    // the prefix search into each input type's step (476 bytes more of Lite
+    // after Brotli, measured).
+    #[cfg_attr(not(feature = "rx-jit"), inline(never))]
+    fn next_match_impl(
         &mut self,
         pos: Input::Position,
         next_start: &mut Option<Input::Position>,
@@ -2580,11 +2660,6 @@ impl<Input: InputIndexer> exec::MatchProducer for BacktrackExecutor<'_, Input> {
             StartPredicate::StartAnchored => self.next_match_anchored(pos, next_start),
             search => self.next_match_with_prefix_search(pos, next_start, search),
         }
-    }
-
-    #[inline]
-    fn match_usage(&self) -> MatchUsage {
-        self.matcher.match_usage()
     }
 }
 

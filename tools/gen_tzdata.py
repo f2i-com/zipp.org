@@ -675,8 +675,8 @@ def main():
     a("];")
     a("")
     a("/// Every Zone and Link name, in ASCII-case-insensitive order, one after the")
-    a("/// other: name `i` ends at `ID_END[i]` and starts where name `i - 1` ends")
-    a("/// (the first at 0). The spelling is the canonical one, which is what")
+    a("/// other: name `i` is `ID_LEN[i]` bytes long and starts where name `i - 1`")
+    a("/// ends (the first at 0). The spelling is the canonical one, which is what")
     a("/// `timeZoneId` reports for a case-insensitive match.")
     a("pub(crate) static ID_NAMES: &str = concat!(")
     line = []
@@ -688,14 +688,12 @@ def main():
     if line:
         a("    " + " ".join(line))
     a(");")
-    ends, end = [], 0
-    for k in id_order:
-        end += len(k.encode())
-        ends.append(end)
-    assert end <= 65535, "widen ID_END before updating tzdb"
-    a("pub(crate) static ID_END: &[u16] = &[")
-    for i in range(0, len(ends), 16):
-        a("    " + " ".join("%d," % x for x in ends[i:i + 16]))
+    lens = [len(k.encode()) for k in id_order]
+    assert sum(lens) <= 65535, "widen the identifier ends in tzdb.rs before updating tzdb"
+    assert all(0 < n < 256 for n in lens), "widen ID_LEN before updating tzdb"
+    a("pub(crate) static ID_LEN: &[u8] = &[")
+    for i in range(0, len(lens), 16):
+        a("    " + " ".join("%d," % x for x in lens[i:i + 16]))
     a("];")
     a("/// The `ZONE_*` index each name denotes.")
     a("pub(crate) static ID_ZONE: &[u16] = &[")
@@ -715,7 +713,7 @@ def main():
     a("];")
     a("")
     a("/// The names and zones as the table held them before, as pairs; retained")
-    a("/// only to check `ID_NAMES`, `ID_END` and `ID_ZONE` against.")
+    a("/// only to check `ID_NAMES`, `ID_LEN` and `ID_ZONE` against.")
     a("#[cfg(test)]")
     a("pub(crate) static ID_ROWS: &[(&str, u16)] = &[")
     for k in id_order:

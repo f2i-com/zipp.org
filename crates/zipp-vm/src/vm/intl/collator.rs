@@ -208,7 +208,7 @@ fn collation_key_lengths(s: &str, opts: KeyOptions) -> Result<(usize, usize, usi
                 .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
             continue;
         }
-        for mapped in c.to_lowercase() {
+        for mapped in crate::vm::special_casing::to_lower(c) {
             primary = primary
                 .checked_add(mapped.len_utf8())
                 .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
@@ -265,7 +265,7 @@ fn collation_key(
             secondary.push(c);
             continue;
         }
-        primary.extend(c.to_lowercase());
+        primary.extend(crate::vm::special_casing::to_lower(c));
         case.push(u8::from(c.is_uppercase()));
     }
     if !run.is_empty() {

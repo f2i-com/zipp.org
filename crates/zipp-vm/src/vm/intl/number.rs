@@ -961,7 +961,7 @@ fn accounting_affixes() -> (&'static str, &'static str) {
 /// The number of minor-unit digits a currency formats with (ECMA-402
 /// CurrencyDigits): 2 unless the ISO 4217 table says otherwise.
 pub(crate) fn currency_digits(code: &str) -> i64 {
-    match code.to_uppercase().as_str() {
+    match crate::vm::special_casing::str_to_uppercase(code).as_str() {
         "BHD" | "IQD" | "JOD" | "KWD" | "LYD" | "OMR" | "TND" => 3,
         "BIF" | "CLP" | "DJF" | "GNF" | "ISK" | "JPY" | "KMF" | "KRW" | "PYG" | "RWF" | "UGX"
         | "UYI" | "VND" | "VUV" | "XAF" | "XOF" | "XPF" => 0,

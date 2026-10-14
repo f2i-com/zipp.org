@@ -989,7 +989,7 @@ fn parse_legacy_date(s: &str) -> f64 {
             let key: String = word
                 .chars()
                 .take(3)
-                .flat_map(|c| c.to_lowercase())
+                .flat_map(crate::vm::special_casing::to_lower)
                 .collect();
             if let Some(m) = MONTH.iter().position(|x| x.eq_ignore_ascii_case(&key)) {
                 if named_month.is_some() {
