@@ -945,6 +945,17 @@ pub(crate) fn emit_py_op(
         Instr::PyMethod { dst, obj, rt, key, gb, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_method as usize;
             let keys = key as u64 | (gb as u64) << 32;
+            // A planned site answers inline (`emit_py_method_inline`); a
+            // failed guard calls the helper, which first settles the
+            // class's mirror when the guard found it cleared.
+            let miss = ops.new_dynamic_label();
+            let settle = ops.new_dynamic_label();
+            if emit_py_method_inline(ops, ip, instr, miss, settle, done) {
+                dynasm!(ops ; => settle);
+                let settle_keys = keys | PY_METHOD_SETTLE;
+                emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(settle_keys)], dst, labels, refetch);
+                dynasm!(ops ; jmp => done ; => miss);
+            }
             emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(keys)], dst, labels, refetch);
         }
         Instr::PyClassOf { dst, obj, .. } if !crate::vm::prof_py::on() => {

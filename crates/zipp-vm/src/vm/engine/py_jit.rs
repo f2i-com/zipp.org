@@ -420,6 +420,12 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_method(vm: *mut core::ffi::c_void, o: u64, rt: u64, packed: u64, keys: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
+        // An inline site's guard found the receiver's class's mirror
+        // cleared (`codegen::emit_py_method_inline`): settled first.
+        if keys & crate::codegen::PY_METHOD_SETTLE != 0 {
+            vm.py_settle_class_of(Value::from_bits(o));
+        }
+        let keys = keys & !crate::codegen::PY_METHOD_SETTLE;
         vm.maybe_gc();
         match vm.py_method((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(o), Value::from_bits(rt), keys as u32, (keys >> 32) as u32) {
             Some(f) => f.bits(),

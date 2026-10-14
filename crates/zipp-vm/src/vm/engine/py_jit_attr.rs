@@ -43,6 +43,12 @@ impl<'p> Vm<'p> {
             return;
         }
         let o = self.get(base, obj);
+        self.py_settle_class_of(o);
+    }
+
+    /// Settle the hot mirror of the record `o`'s class (see
+    /// `jit_py_attr_miss`), when it is a record whose map is settled.
+    pub(crate) fn py_settle_class_of(&mut self, o: Value) {
         let Some((cls, _)) = self.py_inst_parts(o) else {
             return;
         };
@@ -79,6 +85,39 @@ impl<'p> Vm<'p> {
             let set = match instr {
                 Instr::PyGetAttr { .. } => false,
                 Instr::PySetAttr { .. } => true,
+                Instr::PyMethod { .. } if crate::codegen::py_method_inline_enabled() => {
+                    // A method found in the receiver's class's tables
+                    // (`Vm::py_method_plan`), answered inline while the
+                    // receiver, its class's stamp and its layout hold.
+                    let e = self.py_ic(func_id, ip);
+                    let Some((recv_shape, method, layout)) = self.py_method_plan(&e) else {
+                        continue;
+                    };
+                    let cls_shape = match self.heap.get(Value::from_bits(e.a).heap_index()) {
+                        HeapObj::Object(m) if m.shape() != crate::shape::DICT => m.shape(),
+                        _ => continue,
+                    };
+                    let Ok(ip) = u32::try_from(ip) else {
+                        continue;
+                    };
+                    plan.insert(
+                        ip,
+                        PyAttrInline {
+                            set: false,
+                            inst_shape: recv_shape,
+                            cls_bits: e.a,
+                            cls_shape,
+                            ver_slot,
+                            ver_bits: e.c,
+                            hver: e.hver,
+                            layout,
+                            slot: 0,
+                            store_lane: false,
+                            method: method.bits(),
+                        },
+                    );
+                    continue;
+                }
                 _ => continue,
             };
             let e = self.py_ic(func_id, ip);
@@ -110,6 +149,7 @@ impl<'p> Vm<'p> {
                     layout: e.d,
                     slot: e.pos,
                     store_lane,
+                    method: 0,
                 },
             );
         }

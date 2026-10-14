@@ -1067,6 +1067,48 @@ impl<'p> Vm<'p> {
         Some(b)
     }
 
+    /// For the JIT's inline `PyMethod` (`codegen::py_attr_inline`): what the
+    /// site's cache entry `e` answers while the receiver's class keeps the
+    /// entry's stamp, when it holds now: a user class's function (`gm`) for
+    /// an instance of the instance template's shape whose storage has the
+    /// layout the entry proved to lack the name, or a builtin method (`gb`)
+    /// of a list, tuple or dict record of the runtime's template shapes
+    /// (dict-less). `(receiver shape, method, layout or 0)`. The class's
+    /// tables only gain entries while its stamp holds (the runtime replaces
+    /// or clears them with a `ver` bump, see core.js `forgetName`), so the
+    /// method found now is the one the step finds for as long as the stamp
+    /// holds.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(super) fn py_method_plan(&self, e: &PyIc) -> Option<(u32, Value, u32)> {
+        let p = self.py_rt.as_deref()?;
+        let ty = p.ty?;
+        let cls = Value::from_bits(e.a);
+        if !cls.is_heap() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
+            return None;
+        }
+        match e.kind {
+            ic::METHOD if e.d != 0 && p.inst_shape != crate::shape::DICT => {
+                let f = self.py_table_at(cls, ty.gm, e.b, e.pos)?;
+                self.py_plain_rec(f).then_some((p.inst_shape, f, e.d))
+            }
+            ic::BUILTIN_METHOD => {
+                let shape = if cls.bits() == p.t_list.bits() || cls.bits() == p.t_tuple.bits() {
+                    p.seq_shape
+                } else if cls.bits() == p.t_dict.bits() {
+                    p.dict_shape
+                } else {
+                    return None;
+                };
+                if shape == crate::shape::DICT {
+                    return None;
+                }
+                let b = self.py_table_at(cls, ty.gb, e.b, e.pos)?;
+                self.py_plain_rec(b).then_some((shape, b, 0))
+            }
+            _ => None,
+        }
+    }
+
     /// The value for [`Instr::PyClassAttr`]: a plain class attribute
     /// (`gv[name]`) of an instance whose dict lacks the name (and whose
     /// class's `ga[name]` is `true`).
