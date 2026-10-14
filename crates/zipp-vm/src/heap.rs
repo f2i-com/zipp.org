@@ -6175,6 +6175,14 @@ pub struct Heap {
     /// small-object path that the count-based schedule already handles well
     /// pays one size read and nothing else.
     big_bytes_since_gc: usize,
+    /// Payload bytes allocated since the last collection, counted only while
+    /// no allocator reports blocks (`ALLOCATOR_REPORTS`). Without those
+    /// reports the byte schedule never fires and collections ran on slot
+    /// counts alone: a first one at `GC_MIN_THRESHOLD` slots, then one a young
+    /// budget apart, so objects carrying a kilobyte or two each piled up tens
+    /// of megabytes of garbage in an embedded VM between collections (an
+    /// array of 200 values per slot reached 90 MB before the first).
+    payload_since_gc: usize,
     /// Minor collections since the last major (the scheduling backstop).
     minors_since_major: u32,
     /// Maximum consecutive minor collections before the scheduling backstop
@@ -6407,6 +6415,15 @@ pub fn note_every_block(old_size: usize, new_size: usize) {
     note_block(old_size, new_size);
 }
 
+/// Whether the process's global allocator reports its blocks at all
+/// ([`note_large_block`] / [`note_every_block`]): the `zipp` CLI and the
+/// WebAssembly build install such an allocator, which drives the byte schedule
+/// (`footprint_bytes`). A library embedder's allocator usually does not, and
+/// the heap then schedules on the payload it allocates itself
+/// (`Heap::payload_since_gc`).
+static ALLOCATOR_REPORTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether the reports cover every block ([`note_every_block`]): then the
 /// figure is all the memory there is, and its not having risen means nothing
 /// grew.
@@ -6424,6 +6441,9 @@ pub(crate) fn every_block_footprint() -> Option<usize> {
 
 #[inline]
 fn note_block(old_size: usize, new_size: usize) {
+    if !ALLOCATOR_REPORTS.load(Ordering::Relaxed) {
+        ALLOCATOR_REPORTS.store(true, Ordering::Relaxed);
+    }
     if new_size > old_size {
         let grown = new_size - old_size;
         let now = ALLOCATOR_NET_BYTES.fetch_add(grown, Ordering::Relaxed) + grown;
@@ -6687,6 +6707,7 @@ impl Heap {
             // terms of collectable survivors rather than total prefix size.
             major_at: GC_MIN_THRESHOLD + INTERN_PREFIX_EXTRA as usize,
             big_bytes_since_gc: 0,
+            payload_since_gc: 0,
             footprint_gc_at: footprint_bytes().saturating_add(FOOTPRINT_STEP),
             footprint_at_look: footprint_bytes(),
             allocs_at_look: live,
@@ -7631,6 +7652,15 @@ impl Heap {
         // never arrived in time.
         let big = obj.birth_payload_bytes();
         debug_assert_eq!(big, obj.resident_payload_bytes());
+        // With no allocator reporting, weigh every payload: a minor once a
+        // footprint step of it has been allocated since the last collection.
+        if !ALLOCATOR_REPORTS.load(Ordering::Relaxed) {
+            self.payload_since_gc = self.payload_since_gc.saturating_add(big);
+            if self.payload_since_gc >= FOOTPRINT_STEP {
+                self.payload_since_gc = 0;
+                self.gc_requested = true;
+            }
+        }
         if big >= BIG_PAYLOAD_BYTES {
             self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(big);
             if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
@@ -8928,6 +8958,7 @@ impl Heap {
         self.minors_since_major = 0;
         self.major_due = false;
         self.big_bytes_since_gc = 0;
+        self.payload_since_gc = 0;
         if self.nursery {
             // Every survivor of a major is OLD (and the remembered set is
             // stale — its young referents were just promoted or swept).
@@ -8953,6 +8984,7 @@ impl Heap {
     /// one young budget of where today's collector would have collected.
     #[inline]
     pub fn note_minor_done(&mut self, live: usize) {
+        self.payload_since_gc = 0;
         self.courier_flush();
         self.swept_total = self.swept_total.wrapping_add(self.live.saturating_sub(live));
         self.live = live;
