@@ -26,6 +26,7 @@ export const engine_renewInstructionBudget: (a: number) => number;
 export const engine_resolveHostCallback: (a: number, b: number, c: any) => [number, number, number];
 export const engine_resourceUsage: (a: number) => [number, number, number];
 export const engine_setAccelBridge: (a: number, b: any) => [number, number];
+export const engine_setAppBridge: (a: number, b: any) => [number, number];
 export const engine_setClipboardBridge: (a: number, b: any) => [number, number];
 export const engine_setDbBridge: (a: number, b: any) => [number, number];
 export const engine_setFingerprintSeed: (a: number, b: number, c: number) => void;

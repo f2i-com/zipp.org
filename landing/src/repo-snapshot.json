@@ -1,53 +1,53 @@
 {
-  "generated_at": "2026-09-25T06:28:36.368Z",
+  "generated_at": "2026-10-14T10:21:04.657Z",
   "stale": false,
   "source": {
     "repo": "f2i-com/zipp.org",
     "branch": "main",
-    "commit": "9df6e2fdeb27d9b931bffba84e5714c4fd3d5f50"
+    "commit": "a82ad0bb01c4ad30956bcf710272b91c427cc559"
   },
   "repo": {
-    "stars": 6,
+    "stars": 7,
     "forks": 0,
-    "open_issues": 0,
-    "pushed_at": "2026-09-25T05:20:28Z",
+    "open_issues": 3,
+    "pushed_at": "2026-10-14T09:14:23Z",
     "license": "Apache-2.0"
   },
   "release": {
-    "tag": "v0.0.21",
-    "name": "ZIPP v0.0.21",
-    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.21",
-    "published_at": "2026-09-25T06:26:59Z"
+    "tag": "v0.0.24",
+    "name": "ZIPP v0.0.24",
+    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.24",
+    "published_at": "2026-10-14T09:53:42Z"
   },
   "releases": [
     {
-      "tag": "v0.0.21",
-      "name": "ZIPP v0.0.21",
-      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.21",
-      "published_at": "2026-09-25T06:26:59Z"
+      "tag": "v0.0.24",
+      "name": "ZIPP v0.0.24",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.24",
+      "published_at": "2026-10-14T09:53:42Z"
     },
     {
-      "tag": "v0.0.20",
-      "name": "ZIPP v0.0.20",
-      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.20",
-      "published_at": "2026-09-18T14:05:32Z"
+      "tag": "v0.0.23",
+      "name": "ZIPP v0.0.23",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.23",
+      "published_at": "2026-10-12T18:44:25Z"
     },
     {
-      "tag": "v0.0.19",
-      "name": "ZIPP v0.0.19",
-      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.19",
-      "published_at": "2026-09-16T15:21:23Z"
+      "tag": "v0.0.22",
+      "name": "ZIPP v0.0.22",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.22",
+      "published_at": "2026-10-10T10:11:36Z"
     }
   ],
   "commits": {
     "latest": {
-      "sha": "9df6e2fdeb27d9b931bffba84e5714c4fd3d5f50",
-      "message": "Keep the complex power table independent of the platform libm [skip ci]",
-      "date": "2026-09-25T05:20:11Z",
-      "url": "https://github.com/f2i-com/zipp.org/commit/9df6e2fdeb27d9b931bffba84e5714c4fd3d5f50"
+      "sha": "a82ad0bb01c4ad30956bcf710272b91c427cc559",
+      "message": "Prepare 0.0.24 [skip ci]",
+      "date": "2026-10-14T08:50:53Z",
+      "url": "https://github.com/f2i-com/zipp.org/commit/a82ad0bb01c4ad30956bcf710272b91c427cc559"
     }
   },
-  "version": "0.0.21",
+  "version": "0.0.24",
   "readme": {
     "test262_pct": 99.991,
     "test262_pass": 95671,

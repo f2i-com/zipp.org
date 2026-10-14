@@ -664,7 +664,7 @@ function Playground() {
   }
 
   // Warm on intent rather than on mount, so a visitor who never touches the
-  // playground is not made to download and compile 5.7 MB to scroll past it.
+  // playground is not made to download and compile 4.4 MB to scroll past it.
   useEffect(() => {
     const idle = window.requestIdleCallback?.bind(window)
     const handle = idle ? idle(() => prewarm(), { timeout: 4000 }) : undefined
@@ -843,7 +843,7 @@ function Playground() {
           </div>
         </div>
       </div>
-      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.21`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.21</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
+      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.24`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.24</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
     </section>
   )
 }

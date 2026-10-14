@@ -276,6 +276,23 @@ export class Engine {
      */
     setAccelBridge(bridge: any): void;
     /**
+     * Install the object backing `host.callSync(kind, ...args)`: operations
+     * the application defines, answered synchronously while the guest waits
+     * (a Worker host may block on shared memory to serve them from the page).
+     * Its `call(kind, args)` receives the kind without the `app.` prefix and
+     * the arguments as an array of strings; whatever it returns reaches the
+     * guest as JSON, like every other bridge reply, and a throw reaches it as
+     * an opaque failure (return errors as data to pass them on).
+     *
+     * Installing the bridge grants nothing: each operation is granted by
+     * name, `app.<kind>`, through `setSyncHostCapabilities`. Kinds are
+     * lowercase dotted names (`app.fs.read`); the host adapter decides their
+     * arguments, within the same argument-count and byte ceilings as every
+     * synchronous call. Treat kinds and arguments as guest-controlled: never
+     * turn a kind into a property name, a URL or a command.
+     */
+    setAppBridge(bridge: any): void;
+    /**
      * Install the object backing `navigator.clipboard.*`. Clipboard authority
      * is intentionally separate from local storage authority.
      */
@@ -373,7 +390,9 @@ export class Engine {
      * error (a program's own output ahead of the raise, a test report
      * ahead of its non-zero exit), in `takeConsole`'s tagged form. The one
      * method that answers on a disposed engine; it drains, and an engine
-     * that initialized returns an empty array.
+     * that initialized returns an empty array. Like `takeConsole` it pages:
+     * each call drains what fits one conversion, and calls continue until
+     * the array comes back empty.
      */
     takeFailedConsole(): any;
     /**
@@ -484,6 +503,7 @@ export interface InitOutput {
     readonly engine_resolveHostCallback: (a: number, b: number, c: any) => [number, number, number];
     readonly engine_resourceUsage: (a: number) => [number, number, number];
     readonly engine_setAccelBridge: (a: number, b: any) => [number, number];
+    readonly engine_setAppBridge: (a: number, b: any) => [number, number];
     readonly engine_setClipboardBridge: (a: number, b: any) => [number, number];
     readonly engine_setDbBridge: (a: number, b: any) => [number, number];
     readonly engine_setFingerprintSeed: (a: number, b: number, c: number) => void;

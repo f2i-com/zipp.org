@@ -1,10 +1,10 @@
 {
   "profile": {
     "engine": "zipp-wasm",
-    "version": "0.0.21",
+    "version": "0.0.24",
     "profileVersion": 2,
     "source": {
-      "sha": "9df6e2fdeb27d9b931bffba84e5714c4fd3d5f50",
+      "sha": "a82ad0bb01c4ad30956bcf710272b91c427cc559",
       "target": "wasm32-unknown-unknown"
     },
     "features": [
@@ -13,6 +13,8 @@
       "wasm-no-fs-loader",
       "wasm-single-agent"
     ],
+    "variant": "full",
+    "omittedFeatures": [],
     "languages": [
       "javascript",
       "python"
@@ -66,7 +68,7 @@
     }
   },
   "files": {
-    "zipp_wasm.js": "748c1f0dbfcae3f4e9868163d20b815417e3278fc91ec80dce56837318944679",
-    "zipp_wasm_bg.wasm": "d6bf575e88fd92b2b220567fbb631226e5fb2269be066a91a4831a929abe9b90"
+    "zipp_wasm.js": "2904d35fee41780ad802ef7d705d2ba9096e6eda8b6574e965bb47939b2504a4",
+    "zipp_wasm_bg.wasm": "22a691f983fd94c131238ef33abbee86c8a98cbc3981ccc0ff1aecce4991ef22"
   }
 }

@@ -7,7 +7,7 @@
     "image": "/zipp-og-card.png",
     "imageAlt": "A luminous purple-to-cyan lightning mark moving across a dark field",
     "repo": "https://github.com/f2i-com/zipp.org",
-    "homeDateModified": "2026-09-25",
+    "homeDateModified": "2026-10-14",
     "organization": {
       "name": "f2i",
       "url": "https://f2i.com"
@@ -145,7 +145,7 @@
         "ECMAScript Test262 engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-25",
+      "dateModified": "2026-10-14",
       "priority": "0.9",
       "sections": [
         {
@@ -153,7 +153,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Zipp began on 29 May 2026 as a small typed language and became a JavaScript engine the next day. Since then it has grown into roughly 345,000 lines of first-party Rust in the `zipp-vm` crate, plus a CLI, a WebAssembly embedding, a hardened sandbox runner and an experimental Python frontend that compiles to the same bytecode."
+              "text": "Zipp began on 29 May 2026 as a small typed language and became a JavaScript engine the next day. Since then it has grown into roughly 424,000 lines of Rust in the `zipp-vm` crate, tests included, plus a CLI, a WebAssembly embedding, a hardened sandbox runner and an experimental Python frontend that compiles to the same bytecode."
             },
             {
               "type": "p",
@@ -178,9 +178,9 @@
                   "note": "Node 30.4 ms, Bun 43.3 ms, Deno 82.6 ms on the same machine."
                 },
                 {
-                  "value": "1.32 MB",
+                  "value": "1.13 MB",
                   "label": "WebAssembly module on the wire (Brotli)",
-                  "note": "JavaScript-only build, 5.7 MB raw."
+                  "note": "JavaScript-only build, 4.4 MB raw. ZIPP Lite: 0.67 MB."
                 }
               ]
             },
@@ -327,7 +327,7 @@
             },
             {
               "type": "p",
-              "text": "The JavaScript-only module is 5,743,065 bytes raw and 1,321,465 bytes after Brotli; the build that also includes Python with torch built in is 9,390,219 bytes raw and 2,056,613 on the wire, and Python without torch 1,701,112. The JavaScript-only module is roughly three times the size of QuickJS-NG's WebAssembly reactor, a trade-off documented plainly on the [WebAssembly page](/wasm/), which also explains the Worker-termination deadline model and the resource limits."
+              "text": "In v0.0.24 the JavaScript-only module is 4,436,611 bytes raw and 1,134,510 bytes after Brotli, and ZIPP Lite, the JavaScript core without `Intl` and `Temporal` built for size, 2,450,526 and 671,116; the build that also includes Python with torch built in is 8,179,727 bytes raw and 1,898,473 on the wire, and Python without torch 1,523,924. The JavaScript-only module is a little under three times the size of QuickJS-NG's WebAssembly reactor, a trade-off documented plainly on the [WebAssembly page](/wasm/), which also explains the Worker-termination deadline model and the resource limits."
             }
           ]
         },
@@ -340,7 +340,7 @@
             },
             {
               "type": "p",
-              "text": "On the native benchmark suites, the 2 September 2026 capture puts Zipp at a geometric mean of 0.728× Node's wall time across thirty rows, with 21 rows faster than Node and nine slower, including React-style reconciliation at 1.58× and allocation-survival at 1.56×. The [benchmarks page](/benchmarks/) has every row, the hardware, compiler flags, competitor versions, bootstrap intervals, links to the raw JSON, and the later capture that regressed after a correctness fix."
+              "text": "On the native benchmark suites, the 2 September 2026 capture puts Zipp at a geometric mean of 0.728× Node's wall time across thirty rows, with 21 rows faster than Node and nine slower, including React-style reconciliation at 1.58× and allocation-survival at 1.56×. The [benchmarks page](/benchmarks/) has every row, the hardware, compiler flags, competitor versions, bootstrap intervals, links to the raw JSON, and the later capture that regressed after a correctness fix. Measured for v0.0.24 against Node 24 alone, in an ordinary release build rather than the canonical capture, the ten headline rows run in 0.88× Node's time, and Zipp's median is below Node's on all 13 real rows."
             }
           ]
         },
@@ -415,7 +415,7 @@
         "generational garbage collector Rust"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-25",
+      "dateModified": "2026-10-14",
       "sections": [
         {
           "heading": "The pipeline",
@@ -426,7 +426,7 @@
             },
             {
               "type": "table",
-              "caption": "Workspace crates (line counts at version 0.0.19, except `zipp-pyparse` and `zipp-gpu`, counted at v0.0.21)",
+              "caption": "Workspace crates (Rust lines at v0.0.24, tests included)",
               "head": [
                 "Crate",
                 "Role",
@@ -436,17 +436,17 @@
                 [
                   "`zipp-vm`",
                   "Lexer, parser, compiler, bytecode, interpreter, runtime, GC, native JITs, Python frontend",
-                  "368,240"
+                  "423,861"
                 ],
                 [
                   "`zipp-cli`",
                   "The `zipp` binary: `js`, `mjs`, `py`, `run`, `sandbox`",
-                  "4,900"
+                  "6,820"
                 ],
                 [
                   "`zipp-wasm`",
                   "Persistent-VM WebAssembly embedding for browser hosts (own workspace)",
-                  "3,595"
+                  "5,013"
                 ],
                 [
                   "`zipp-sandbox`",
@@ -455,18 +455,23 @@
                 ],
                 [
                   "`zipp-regress`",
-                  "Fork of the `regress` ECMAScript regex engine with a UTF-16 mode and an x86-64 regex JIT",
-                  "52,309"
+                  "Zipp's ECMAScript regex engine, grown from a fork of `regress`, with a UTF-16 mode and an x86-64 regex JIT",
+                  "49,077"
                 ],
                 [
                   "`zipp-pyparse`",
                   "Python lexer, parser and syntax tree used by the Python frontend",
-                  "11,573"
+                  "11,580"
                 ],
                 [
                   "`zipp-gpu`",
                   "Native GPU for `zipp py`: gpu-lab's runtime over a WebGPU shim backed by wgpu",
                   "4,078"
+                ],
+                [
+                  "`zipp-numparse`",
+                  "Decimal number parsing shared by the engine, the Python frontend and the WebAssembly modules",
+                  "1,343"
                 ]
               ]
             },
@@ -658,7 +663,7 @@
         "Rust Python runtime"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-25",
+      "dateModified": "2026-10-14",
       "sections": [
         {
           "heading": "How Python reaches the VM",
@@ -714,7 +719,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "On the command line Zipp compiles hot Python loops to x86-64 code. Over the 36 programs of `tools/python_bench.py` (geometric mean of work time against CPython 3.13) it runs at about 1.75× CPython's time with that JIT, from about 22× when the September speed work began; `range_loop`, `int_arith`, `float_arith`, `tuple_swap` and `global_read` are faster than CPython. Every benchmark checksum still equals CPython's."
+              "text": "On the command line Zipp compiles hot Python loops to x86-64 code. Over the 36 programs of `tools/python_bench.py` (geometric mean of work time against CPython 3.13) it runs at about 1.09× CPython's time with that JIT in v0.0.24, its 30 small programs level with CPython, from about 22× when the September speed work began; fifteen programs, among them `range_loop`, `float_arith`, `int_arith`, `global_read`, `dict_get`, `list_index` and `json_roundtrip`, are faster than CPython. Every benchmark checksum still equals CPython's."
             },
             {
               "type": "p",
@@ -731,7 +736,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Two WebAssembly variants include the Python frontend. `python` leaves torch out (1,701,112 bytes after Brotli) and adds it at run time from the 380,240-byte `zipp_torch.wasm` package through `addPythonPackage`, which checks the package's format, engine ABI hash and the SHA-256 of every file first; `all` has torch built in (2,056,613 bytes after Brotli). A browser host calls `engine.initSource(source, \"python\")` for one file or `engine.initPythonProject(files, entry, argv)` for a folder, then drains output and host requests. `prewarmPython()` compiles the Python runtime ahead of use; the playground calls it when idle, so the first Python run takes about 20 ms instead of 220."
+              "text": "Two WebAssembly variants include the Python frontend. `python` leaves torch out (1,523,924 bytes after Brotli in v0.0.24) and adds it at run time from the 401,430-byte `zipp_torch.wasm` package through `addPythonPackage`, which checks the package's format, engine ABI hash and the SHA-256 of every file first; `all` has torch built in (1,898,473 bytes after Brotli). A browser host calls `engine.initSource(source, \"python\")` for one file or `engine.initPythonProject(files, entry, argv)` for a folder, then drains output and host requests. `prewarmPython()` compiles the Python runtime ahead of use; the playground calls it when idle, so the first Python run takes about 20 ms instead of 220."
             },
             {
               "type": "code",
@@ -780,6 +785,10 @@
             {
               "type": "p",
               "text": "Each area is checked against values PyTorch 2.11 generated, and eager torch's heavy loops (matmul, convolution, elementwise ops, reductions, FFT, factorizations) run as native kernels that repeat the JavaScript fallback's arithmetic in the same order, byte for byte. Hugging Face's `modeling_qwen3.py`, `modeling_qwen2.py`, `modeling_llama.py`, `modeling_mistral.py` and `modeling_gpt_neo.py` run unmodified. `device=\"cuda\"` is rejected rather than silently ignored, and the [Torch compatibility guide](https://github.com/f2i-com/zipp.org/blob/main/docs/TORCH_COMPATIBILITY.md) lists what is still missing."
+            },
+            {
+              "type": "p",
+              "text": "Eager torch is fast enough to train small models on the command line: on one thread, warm, eight training and tensor programs take 4.2× PyTorch 2.11's time in v0.0.24, where v0.0.23 took 17×, and a program's first run is faster than PyTorch's on four of them, since PyTorch pays its own start-up. `randn`, `normal_` and `uniform_` match PyTorch's float32 and float64 streams bit for bit."
             }
           ]
         },
@@ -833,7 +842,7 @@
         "wasm-bindgen Rust engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-25",
+      "dateModified": "2026-10-14",
       "sections": [
         {
           "heading": "Why a JavaScript engine inside JavaScript",
@@ -849,11 +858,11 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The crate is built with `wasm-bindgen` 0.2.126 for the `web` target on Rust 1.92.0, with a 1 GiB link-time memory maximum and a 16 MiB stack, then stripped of name and producer sections and pre-compressed with Brotli at quality 11. There is deliberately no `wasm-opt` pass: measured, `-Oz` was 390 KB smaller raw but 22 KB larger on the wire and 2% slower."
+              "text": "The crate is built with `wasm-bindgen` 0.2.126 for the `web` target on Rust 1.92.0, with a 1 GiB link-time memory maximum and a 16 MiB stack, then stripped of name and producer sections and pre-compressed with Brotli at quality 11. Since v0.0.22 each module also goes through Binaryen 125: constant propagation, redundant-set elimination and `wasm-opt -O1` twice, then the functions are laid out by signature and body, which saves 9 to 12 KB of each module after Brotli. A full build keeps the result only when it is smaller raw and no larger after Brotli; `-Oz` was measured and rejected, smaller raw but larger on the wire and slower."
             },
             {
               "type": "table",
-              "caption": "Module sizes in the v0.0.21 release assets (Brotli-11 computed from each module)",
+              "caption": "Module sizes in the v0.0.24 release assets (Brotli-11 computed from each module)",
               "head": [
                 "Variant",
                 "Languages",
@@ -864,26 +873,32 @@
                 [
                   "`javascript` (default)",
                   "JavaScript",
-                  "5,743,065",
-                  "1,321,465"
+                  "4,436,611",
+                  "1,134,510"
+                ],
+                [
+                  "`lite`",
+                  "JavaScript core without `Intl` and `Temporal`, built for size",
+                  "2,450,526",
+                  "671,116"
                 ],
                 [
                   "`python`",
                   "JavaScript + Python, torch as a package",
-                  "7,460,508",
-                  "1,701,112"
+                  "6,148,141",
+                  "1,523,924"
                 ],
                 [
                   "`zipp_torch.wasm`",
                   "The torch package for `python`",
-                  "2,054,964",
-                  "380,240"
+                  "2,156,660",
+                  "401,430"
                 ],
                 [
                   "`all`",
                   "JavaScript + Python with torch built in",
-                  "9,390,219",
-                  "2,056,613"
+                  "8,179,727",
+                  "1,898,473"
                 ],
                 [
                   "QuickJS-NG v0.16.2 reactor, for scale",
@@ -895,7 +910,7 @@
             },
             {
               "type": "p",
-              "text": "Zipp's JavaScript-only module is about 3.76× QuickJS-NG's raw and 3.17× on the wire. A page that never imports torch can serve `python` and skip the package; one that does fetches it on demand, and the pair costs slightly more than `all` because the package carries its own copy of the kernels' support code. A Python-only variant was tried and came out 85 bytes larger than the combined module, so it does not exist. The engine is compiled with `safe-sandbox`, `meter-only`, `wasm-no-fs-loader` and `wasm-single-agent`, and `overflow-checks` stay on in release."
+              "text": "Zipp's JavaScript-only module is about 2.90× QuickJS-NG's raw and 2.72× on the wire, and ZIPP Lite 1.60× and 1.61×. A page that never imports torch can serve `python` and skip the package; one that does fetches it on demand, and the pair costs slightly more than `all` because the package carries its own copy of the kernels' support code. A Python-only variant was tried and came out 85 bytes larger than the combined module, so it does not exist. The engine is compiled with `safe-sandbox`, `meter-only`, `wasm-no-fs-loader` and `wasm-single-agent`, and `overflow-checks` stay on in release."
             }
           ]
         },
@@ -1009,7 +1024,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The WebAssembly build is an interpreter, so the native benchmark tables do not apply to it. The only cross-engine WebAssembly comparison in the repository is explicitly marked not publishable: on the five rows that could be compared, QuickJS-NG led four. Interpreter cliffs found in September 2026 were closed with measured before-and-after numbers, for example a 64K non-ASCII `charCodeAt` loop from 4,462 ms to 3.2 ms and a `join` with 300K retained strings from 8,423 ms to 138 ms. Details are on the [benchmarks page](/benchmarks/)."
+              "text": "The WebAssembly build is an interpreter, so the native benchmark tables do not apply to it. The only cross-engine WebAssembly comparison in the repository is explicitly marked not publishable: on the five rows that could be compared, QuickJS-NG led four. Interpreter cliffs found in September 2026 were closed with measured before-and-after numbers, for example a 64K non-ASCII `charCodeAt` loop from 4,462 ms to 3.2 ms and a `join` with 300K retained strings from 8,423 ms to 138 ms. In October the size passes profiled the modules themselves: four workloads that were quadratic in a string's length became linear (a sticky-regex tokenizer over 190 KB from 17.8 s to 164 ms), Lite stopped making every register access a call, and the JavaScript module ran the size pass's corpus in 0.84 to 0.86 of v0.0.22's time in v0.0.23, level again in v0.0.24 while 4% smaller. Details are on the [benchmarks page](/benchmarks/)."
             }
           ]
         },
@@ -1018,7 +1033,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Each [release](/releases/) ships `zipp-wasm-<version>-web.zip` (JavaScript) and `zipp-wasm-<version>-web-python.zip` (JavaScript and Python with torch built in); from v0.0.21 also `zipp-wasm-<version>-web-python-base.zip` (Python without torch) and `zipp-wasm-<version>-web-torch.zip`, the torch package and its loader. Each carries the wasm-bindgen glue, the module, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`; serve the module Brotli-compressed, since the sizes above are what it costs on the wire. The glue and the `.wasm` are one artifact in two files, so serve them with matching cache keys; this site stamps both URLs with a content hash so a cached glue can never meet a new module. Pin `zipp_torch.wasm` by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check."
+              "text": "Each [release](/releases/) ships `zipp-wasm-<version>-web.zip` (JavaScript) and `zipp-wasm-<version>-web-python.zip` (JavaScript and Python with torch built in); from v0.0.21 also `zipp-wasm-<version>-web-python-base.zip` (Python without torch) and `zipp-wasm-<version>-web-torch.zip`, the torch package and its loader; and from v0.0.22 `zipp-wasm-<version>-web-lite.zip`, ZIPP Lite. Each carries the wasm-bindgen glue, the module, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`; serve the module Brotli-compressed, since the sizes above are what it costs on the wire. The glue and the `.wasm` are one artifact in two files, so serve them with matching cache keys; this site stamps both URLs with a content hash so a cached glue can never meet a new module. Pin `zipp_torch.wasm` by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check, and since v0.0.24 the package's wire version is 3, so take it from the same release as the engine."
             }
           ]
         }
@@ -1569,7 +1584,7 @@
         "JavaScript startup time"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-14",
+      "dateModified": "2026-10-14",
       "priority": "0.9",
       "extraStructuredData": [
         {
@@ -2087,6 +2102,109 @@
           ]
         },
         {
+          "heading": "A release measurement for v0.0.24",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "For each release the 13 real rows are also measured against Node 24 alone, on the same Windows machine, in an ordinary release build rather than a profile-guided one. These are descriptive release checks, not the canonical four-engine capture above, and they are not compared with it. For v0.0.24 (`35e6d1dc`, 14 October 2026; Node 24.19.0, 10 interleaved repetitions, paired medians with bootstrap intervals, exact output on every row):"
+            },
+            {
+              "type": "table",
+              "caption": "v0.0.24 against Node 24, cold process medians",
+              "head": [
+                "Row",
+                "Node 24",
+                "Zipp",
+                "Zipp / Node"
+              ],
+              "rows": [
+                [
+                  "`async-promise-chain`",
+                  "333 ms",
+                  "315 ms",
+                  "0.94×"
+                ],
+                [
+                  "`class-prototype-hot`",
+                  "296 ms",
+                  "234 ms",
+                  "0.79×"
+                ],
+                [
+                  "`json-large`",
+                  "256 ms",
+                  "245 ms",
+                  "0.95×"
+                ],
+                [
+                  "`map-set-heavy`",
+                  "649 ms",
+                  "603 ms",
+                  "0.94×"
+                ],
+                [
+                  "`markdown-render`",
+                  "276 ms",
+                  "212 ms",
+                  "0.77×"
+                ],
+                [
+                  "`parse-large-js`",
+                  "272 ms",
+                  "246 ms",
+                  "0.90×"
+                ],
+                [
+                  "`polymorphic-objects`",
+                  "324 ms",
+                  "319 ms",
+                  "0.98×"
+                ],
+                [
+                  "`polymorphic-objects-v2`",
+                  "82 ms",
+                  "26 ms",
+                  "0.32×"
+                ],
+                [
+                  "`property-ic-shapes`",
+                  "255 ms",
+                  "10 ms",
+                  "0.04×"
+                ],
+                [
+                  "`regex-log-scan`",
+                  "478 ms",
+                  "443 ms",
+                  "0.94×"
+                ],
+                [
+                  "`sparse-array`",
+                  "78 ms",
+                  "74 ms",
+                  "0.94×"
+                ],
+                [
+                  "`sparse-array-v2`",
+                  "169 ms",
+                  "105 ms",
+                  "0.62×"
+                ],
+                [
+                  "`typedarray-math`",
+                  "201 ms",
+                  "141 ms",
+                  "0.70×"
+                ]
+              ]
+            },
+            {
+              "type": "p",
+              "text": "The geometric mean is 0.882× Node over the ten headline rows [0.873, 0.887] and 0.622× over all 13. Zipp's median is below Node's on every row; the strict sign test proves eight of them. Node's process start is about 30 ms of each of its times and Zipp's 7. Against v0.0.23 the same rows take 2.6% less time; `map-set-heavy` is the one row slower, by 2.8%. The [validation record](https://github.com/f2i-com/zipp.org/blob/main/docs/validation/2026-10-14-engine-size-round16-r2.md) has the paired intervals and the A/B."
+            }
+          ]
+        },
+        {
           "heading": "Reproduce it",
           "blocks": [
             {
@@ -2148,7 +2266,7 @@
         "sandboxed scripting"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-25",
+      "dateModified": "2026-10-14",
       "sections": [
         {
           "heading": "The embedding model",
@@ -2161,7 +2279,7 @@
               "type": "code",
               "caption": "Cargo.toml",
               "lang": "toml",
-              "code": "[dependencies]\nzipp-vm = { git = \"https://github.com/f2i-com/zipp.org\", tag = \"v0.0.21\" }"
+              "code": "[dependencies]\nzipp-vm = { git = \"https://github.com/f2i-com/zipp.org\", tag = \"v0.0.24\" }"
             },
             {
               "type": "code",
@@ -2446,7 +2564,7 @@
         "JavaScript engine written in Rust"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-25",
+      "dateModified": "2026-10-14",
       "sections": [
         {
           "heading": "At a glance",
@@ -2497,7 +2615,7 @@
                 ],
                 [
                   "WebAssembly build",
-                  "Yes, 1.32 MB on the wire (JavaScript-only)",
+                  "Yes, 1.13 MB on the wire (JavaScript-only; ZIPP Lite 0.67 MB)",
                   "Yes, about 0.42 MB on the wire (QuickJS-NG reactor)",
                   "Yes",
                   "Yes (Hermes in the browser is a niche path)",
@@ -2536,7 +2654,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "QuickJS is the engine to beat for footprint. Its WebAssembly reactor is 1,528,293 bytes raw and 417,087 after Brotli; Zipp's JavaScript-only module is 3.76× that raw and 3.17× on the wire. If your budget is under a megabyte on the wire, QuickJS wins, full stop. QuickJS also has years of production use, a C API that embeds in an afternoon, and QuickJS-NG as an actively maintained fork."
+              "text": "QuickJS is the engine to beat for footprint. Its WebAssembly reactor is 1,528,293 bytes raw and 417,087 after Brotli; Zipp's JavaScript-only module is 2.90× that raw and 2.72× on the wire, and ZIPP Lite, the JavaScript core without `Intl` and `Temporal`, 1.60× and 1.61×. If your budget is under about 0.6 MB on the wire, QuickJS wins, full stop. QuickJS also has years of production use, a C API that embeds in an afternoon, and QuickJS-NG as an actively maintained fork."
             },
             {
               "type": "p",
@@ -2626,11 +2744,11 @@
     },
     {
       "slug": "releases",
-      "title": "Zipp Releases: v0.0.1 to v0.0.21, Downloads and Notes",
-      "description": "Every Zipp release from v0.0.1 on 30 August 2026 to v0.0.21 on 25 September 2026, with what changed, how releases are gated, and what each download contains.",
+      "title": "Zipp Releases: v0.0.1 to v0.0.24, Downloads and Notes",
+      "description": "Every Zipp release from v0.0.1 on 30 August 2026 to v0.0.24 on 14 October 2026, with what changed, how releases are gated, and what each download contains.",
       "h1": "Zipp releases",
       "breadcrumb": "Releases",
-      "lede": "Zipp publishes GitHub Releases only: native x86-64 CLI archives for Windows and Linux, and WebAssembly archives. Twenty-one tags shipped between 30 August and 25 September 2026. This page lists them, explains what a release has to pass, and links the notes.",
+      "lede": "Zipp publishes GitHub Releases only: native x86-64 CLI archives for Windows and Linux, and WebAssembly archives. Twenty-four tags shipped between 30 August and 14 October 2026. This page lists them, explains what a release has to pass, and links the notes.",
       "keywords": [
         "Zipp releases",
         "Zipp download",
@@ -2639,56 +2757,59 @@
         "Zipp changelog"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-25",
+      "dateModified": "2026-10-14",
       "sections": [
         {
-          "heading": "Latest: v0.0.21, 25 September 2026",
+          "heading": "Latest: v0.0.24, 14 October 2026",
           "blocks": [
             {
               "type": "p",
-              "text": "Python on the command line runs at about 1.75× CPython 3.13's time with a new JIT tier, from about 22× when the work began. The torch layer grows to what ordinary training code uses, checked against PyTorch 2.11; torch becomes an optional WebAssembly package; and `zipp py` runs `torch.compile` graphs on a hardware GPU through wgpu, a small model's training step faster than PyTorch's eager CUDA on the same card."
+              "text": "Fixes for the eight issues @takahashim reported against v0.0.23's code (#32 to #34 and #41 to #45) and for further wrong results found against Node 24, CPython 3.13 and PyTorch; more of JavaScript running compiled; Python at 1.09× CPython 3.13's time, from 1.31×; torch at 4.2× PyTorch's warm time, from 17×; and WebAssembly engines 1.0% to 4.0% smaller on the wire."
             },
             {
               "type": "ul",
               "items": [
-                "Python speed: direct calls, per-VM inline caches, fused Python instructions, small integers in the value word, native dict, set and instance storage, and a JIT tier for hot loops. `range_loop`, `int_arith`, `float_arith`, `tuple_swap` and `global_read` beat CPython; a warm hello-world starts in about 20 ms.",
-                "Python compatibility: CPython's tracebacks and `traceback` module, complex numbers and `cmath`, and Python compiled directly from Zipp's own syntax tree (`zipp-pyparse`), with the RustPython fork removed.",
-                "Torch: about 200 more tensor functions, the common layers, losses, optimizers and schedulers, `torch.utils.data`, native `torch.linalg` and `torch.fft`, `torch.distributions`, half-precision, complex, sparse and quantized tensors, and single-process `torch.distributed`; GPT-Neo's modelling file now runs unmodified.",
-                "WebAssembly: `python` without torch (1.70 MB on the wire) plus the 0.38 MB `zipp_torch.wasm` package, beside `all` with torch built in (2.06 MB); `prewarmPython()` brings the first browser run to about 20 ms.",
-                "Native GPU: wgpu over Vulkan, Direct3D 12 or Metal, native replay of prepared steps, exact kernel fusion and a 128x128 matmul tile. On an RTX 5090 a small MLP's prepared step takes 0.27 ms (0.12 ms at eight per run) against 0.78 ms for PyTorch's eager CUDA. Graph protocol version 4 carries masks, dropout, slicing and gathers.",
-                "Engine: small BigInts as immediates (JavaScript BigInt code 2-4× faster), a compiler that emits the same bytecode on every run, and fixes to a JIT wrap, a destructuring TDZ case and nested budget loans; Test262 passes as before."
+                "Correctness: typed-array own indices, a non-writable function `prototype`, `hasOwnProperty` and its siblings through a Proxy or a replacement, a class on a prototype chain, `typeof` inside `with`, replaced `console` methods, a real `performance` object with `now()` and `timeOrigin`, and `newTarget.prototype` in a derived construction; besides those, a stale compiled call after a define on the global object, `arguments.length`, iterators' own properties, object spread's setters, the final sigma in Turkish, and torch's random streams and in-place optimizer steps.",
+                "JavaScript speed: loops holding literals, closures, destructuring, spread, `for-in`, `for-of`, `finally` or `pop`, functions with a rest parameter or `arguments`, and code calling the `Object` statics now compile; a constructor that only stores its arguments builds like a literal. The 13 native rows take 2.6% less time than in v0.0.23, and the headline ten run at 0.88× Node 24's time.",
+                "Python: 1.09× CPython 3.13 over the 36-program suite, the 30 small programs level with CPython and fifteen programs faster than it.",
+                "Torch: 4.2× PyTorch 2.11's warm one-thread time over eight programs, first runs faster than PyTorch's on four; `randn`, `normal_` and `uniform_` match PyTorch bit for bit. The torch package's wire version is 3, so take `web-torch` from the same release as `web-python-base`.",
+                "WebAssembly: the JavaScript module is 1.13 MB on the wire, ZIPP Lite 0.67 MB, Python without torch 1.52 MB and the complete engine 1.90 MB; the torch package 0.40 MB."
               ]
             },
             {
               "type": "table",
-              "caption": "v0.0.21 assets",
+              "caption": "v0.0.24 assets",
               "head": [
                 "Asset",
                 "Contents"
               ],
               "rows": [
                 [
-                  "`zipp-0.0.21-x86_64-pc-windows-msvc.zip`",
+                  "`zipp-0.0.24-x86_64-pc-windows-msvc.zip`",
                   "Native CLI for Windows, complete: JavaScript with the x86-64 JIT, Python with its JIT tier, torch and the native GPU path"
                 ],
                 [
-                  "`zipp-0.0.21-x86_64-unknown-linux-gnu.tar.gz`",
+                  "`zipp-0.0.24-x86_64-unknown-linux-gnu.tar.gz`",
                   "Native CLI for Linux, same contents"
                 ],
                 [
-                  "`zipp-wasm-0.0.21-web.zip`",
+                  "`zipp-wasm-0.0.24-web.zip`",
                   "JavaScript-only browser engine, TypeScript bindings and the Worker host SDK"
                 ],
                 [
-                  "`zipp-wasm-0.0.21-web-python-base.zip`",
+                  "`zipp-wasm-0.0.24-web-lite.zip`",
+                  "ZIPP Lite: the JavaScript core without `Intl` and `Temporal`, built for size, with the same bindings and host SDK"
+                ],
+                [
+                  "`zipp-wasm-0.0.24-web-python-base.zip`",
                   "JavaScript + Python without torch"
                 ],
                 [
-                  "`zipp-wasm-0.0.21-web-python.zip`",
+                  "`zipp-wasm-0.0.24-web-python.zip`",
                   "JavaScript + Python with torch built in, the browser GPU adapter, CPU WASM kernels and the Torch compatibility guide"
                 ],
                 [
-                  "`zipp-wasm-0.0.21-web-torch.zip`",
+                  "`zipp-wasm-0.0.24-web-torch.zip`",
                   "The torch package: `zipp_torch.wasm` and its `zipp_torch.js` loader, for `web-python-base`"
                 ],
                 [
@@ -2705,7 +2826,7 @@
             },
             {
               "type": "p",
-              "text": "[Release notes and downloads on GitHub](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.21) · [docs/releases/0.0.21.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.21.md) · [v0.0.20 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.20.md)"
+              "text": "[Release notes and downloads on GitHub](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.24) · [docs/releases/0.0.24.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.24.md) · [v0.0.23 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.23.md) · [v0.0.22 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.22.md)"
             }
           ]
         },
@@ -2716,7 +2837,7 @@
               "type": "code",
               "caption": "From a release archive",
               "lang": "shell",
-              "code": "# Linux\ncurl -LO https://github.com/f2i-com/zipp.org/releases/download/v0.0.21/zipp-0.0.21-x86_64-unknown-linux-gnu.tar.gz\ntar xzf zipp-0.0.21-x86_64-unknown-linux-gnu.tar.gz\necho 'console.log(\"hello\")' > hello.js\n./zipp-0.0.21-x86_64-unknown-linux-gnu/zipp js hello.js\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
+              "code": "# Linux\ncurl -LO https://github.com/f2i-com/zipp.org/releases/download/v0.0.24/zipp-0.0.24-x86_64-unknown-linux-gnu.tar.gz\ntar xzf zipp-0.0.24-x86_64-unknown-linux-gnu.tar.gz\necho 'console.log(\"hello\")' > hello.js\n./zipp-0.0.24-x86_64-unknown-linux-gnu/zipp js hello.js\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
             },
             {
               "type": "p",
@@ -2729,7 +2850,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Pushing a `vX.Y.Z` tag runs the release workflow. It refuses to publish unless the tag object matches the checkout; the root `Cargo.toml`, the WebAssembly crate and the landing page all carry the same version; and the reusable CI, the full security workflow (including the pinned Test262 corpus), the native build and the WebAssembly build all pass at that exact commit. A green `main` at some other revision is not a release gate. The job is retry-safe: it re-downloads existing assets, verifies `SHA256SUMS`, and checks that `BUILD-INFO.json` is not dirty and names the right commit before deciding to do nothing. A dispatched re-run may skip the two longest gate jobs - the native workspace suite and Test262 - only when the identical tree has been through them elsewhere; v0.0.19 was published that way, with both run locally on the tagged commit (308 test binaries, 2,453 tests; 95,680 of 95,680 corrected-core executions) and every other job in the workflow, and so was v0.0.20, whose JavaScript engine source had not changed since v0.0.19 passed them. From v0.0.21 the workflow also builds the torch package with the two engines it pairs with, and refuses to publish unless `python` plus the package prints exactly what `all` prints over the torch suites."
+              "text": "Pushing a `vX.Y.Z` tag runs the release workflow. It refuses to publish unless the tag object matches the checkout; the root `Cargo.toml`, the WebAssembly crate and the landing page all carry the same version; and the reusable CI, the full security workflow (including the pinned Test262 corpus), the native build and the WebAssembly build all pass at that exact commit. A green `main` at some other revision is not a release gate. The job is retry-safe: it re-downloads existing assets, verifies `SHA256SUMS`, and checks that `BUILD-INFO.json` is not dirty and names the right commit before deciding to do nothing. A dispatched re-run may skip the two longest gate jobs - the native workspace suite and Test262 - only when the identical tree has been through them elsewhere; v0.0.19 was published that way, with both run locally on the tagged commit (308 test binaries, 2,453 tests; 95,680 of 95,680 corrected-core executions) and every other job in the workflow, and so was v0.0.20, whose JavaScript engine source had not changed since v0.0.19 passed them. From v0.0.21 the workflow also builds the torch package with the two engines it pairs with, and refuses to publish unless `python` plus the package prints exactly what `all` prints over the torch suites. From v0.0.22 it also builds ZIPP Lite. v0.0.24's first run lost four gate jobs to GitHub runner shutdowns, and those jobs were re-run at the same commit before it published."
             }
           ]
         },
@@ -2745,6 +2866,21 @@
                 "Headline"
               ],
               "rows": [
+                [
+                  "[v0.0.24](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.24)",
+                  "2026-10-14",
+                  "Eight reported issues fixed; more of JavaScript compiled; Python at 1.09× CPython; torch at 4.2× PyTorch; smaller modules"
+                ],
+                [
+                  "[v0.0.23](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.23)",
+                  "2026-10-12",
+                  "Memory grown in place collected; builtins call compiled code directly; Python at 1.30× CPython; smaller modules"
+                ],
+                [
+                  "[v0.0.22](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.22)",
+                  "2026-10-10",
+                  "ZIPP Lite; an application bridge for hosts; member calls fast again under the strict call order; modules 11% to 15% smaller"
+                ],
                 [
                   "[v0.0.21](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.21)",
                   "2026-09-25",
@@ -2880,11 +3016,11 @@
     },
     {
       "slug": "journey",
-      "title": "The Zipp Story: A JavaScript Engine in Rust in 119 Days",
-      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 25 September 2026, mistakes included.",
+      "title": "The Zipp Story: A JavaScript Engine in Rust in 139 Days",
+      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 14 October 2026, mistakes included.",
       "h1": "The Zipp story",
       "breadcrumb": "The story",
-      "lede": "Zipp's repository has 2,120 commits over 119 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in six acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
+      "lede": "Zipp's repository has 2,477 commits over 139 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in seven acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
       "keywords": [
         "building a JavaScript engine",
         "JavaScript engine in Rust history",
@@ -2893,7 +3029,7 @@
         "solo compiler project"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-25",
+      "dateModified": "2026-10-14",
       "schemaType": "Article",
       "sections": [
         {
@@ -2903,22 +3039,22 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "2,120",
-                  "label": "Commits from 29 May to 25 September 2026",
-                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 351 in September"
+                  "value": "2,477",
+                  "label": "Commits from 29 May to 14 October 2026",
+                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 342 in October"
                 },
                 {
-                  "value": "21",
-                  "label": "Tagged releases in 26 days",
-                  "note": "v0.0.1 on 30 August to v0.0.21 on 25 September"
+                  "value": "24",
+                  "label": "Tagged releases in 46 days",
+                  "note": "v0.0.1 on 30 August to v0.0.24 on 14 October"
                 },
                 {
-                  "value": "376,941",
+                  "value": "452,901",
                   "label": "First-party lines of Rust",
-                  "note": "504,506 including the two vendored forks, counted at v0.0.19"
+                  "note": "501,978 with the regex engine that began as a fork, counted at v0.0.24"
                 },
                 {
-                  "value": "2",
+                  "value": "3",
                   "label": "Pull requests",
                   "note": "Everything else landed on a linear trunk"
                 }
@@ -3005,6 +3141,19 @@
             {
               "type": "p",
               "text": "From 22 September a round of fixes preceded a torch layer checked against PyTorch 2.11 area by area: tensors and autograd, `nn`, optimizers and schedulers, half precision, `linalg`, `fft`, `distributions`, complex, sparse and quantized tensors. On 23 September `zipp py` ran `torch.compile` graphs on a hardware GPU through wgpu. Then the Python frontend went from about 22× CPython 3.13's time to about 1.75× in three days, through fused instructions, a JIT tier, small integers in the value word and native dict, set and instance storage, while a prepared GPU step fell below PyTorch's eager CUDA on the same card. The Python parser became Zipp's own and the RustPython fork was deleted, and v0.0.21 was published on 25 September."
+            }
+          ]
+        },
+        {
+          "heading": "Act seven: smaller, faster, and outside reports (26 September to 14 October)",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The fortnight after v0.0.21 went into size and speed. An application bridge let hosts answer synchronous calls, and ZIPP Lite, the JavaScript core without `Intl` and `Temporal` built for size, arrived on 29 September. From 9 to 12 October four size passes and the first profile of the WebAssembly interpreter made four string workloads that were quadratic linear, won back the member-call speed the strict call order had cost, and took the browser modules 11% to 15% below v0.0.21's. v0.0.22 was published on 10 October with Lite as an asset, and v0.0.23 on 12 October, once memory that grows in place finally reached the collector and Python stood at 1.30× CPython."
+            },
+            {
+              "type": "p",
+              "text": "On 13 and 14 October the sixteenth pass compiled most of the loop shapes that still fell back to the interpreter, while four agents worked beside it on Python speed, torch, promises and module size: Python reached 1.09× CPython 3.13 and torch 4.2× PyTorch's warm time. The repository's first eight GitHub issues, all from @takahashim, each with a repro and a pointer into the source, were fixed with tests and answered, and v0.0.24 was published on 14 October."
             }
           ]
         },
@@ -3100,6 +3249,26 @@
                   "date": "2026-09-25",
                   "title": "Python at about 1.75× CPython; v0.0.21",
                   "text": "`f9347730`, `cff586d2`, `fd18aaf7`, `50e490b0`, `f954857c`."
+                },
+                {
+                  "date": "2026-09-29",
+                  "title": "ZIPP Lite and the application bridge",
+                  "text": "`13c33194`, `065446f2`, `76045145`."
+                },
+                {
+                  "date": "2026-10-10",
+                  "title": "The WebAssembly interpreter profiled; v0.0.22",
+                  "text": "`739603bc`, `4e8cb084`, `09bf2c18`, `4a9a9124`."
+                },
+                {
+                  "date": "2026-10-12",
+                  "title": "Memory grown in place collected; v0.0.23",
+                  "text": "`d24fe3e8`, `784e3eb2`, `621f798b`, `407b81cd`."
+                },
+                {
+                  "date": "2026-10-14",
+                  "title": "Compiled loops, eight reported bugs fixed; v0.0.24",
+                  "text": "`4515054f`, `9470f615`, `acca1331`, `6333c421`, `a82ad0bb`."
                 }
               ]
             }
@@ -3428,7 +3597,7 @@
         "Python in WebAssembly"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-25",
+      "dateModified": "2026-10-14",
       "sections": [
         {
           "heading": "The VM was already language-agnostic",
@@ -3500,7 +3669,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "When this article was first written, Python on Zipp was an interpreter over a JavaScript-shaped VM with every integer a BigInt, many times slower than CPython. The dedicated Python bytecodes it named as the next step have since landed, together with much more: fused Python-only instructions with per-VM inline caches, `PyCall` direct calls, integers within ±2^46 held in the value word, dicts, sets and instances in native storage with hidden-class layouts, and a Python JIT tier for hot loops on the command line. Over the 36 programs of the benchmark suite Zipp now runs at about 1.75× CPython 3.13's time with that JIT, from about 22× at the start of the work, and five of the programs beat CPython. WebAssembly and budgeted embedders stay interpreted."
+              "text": "When this article was first written, Python on Zipp was an interpreter over a JavaScript-shaped VM with every integer a BigInt, many times slower than CPython. The dedicated Python bytecodes it named as the next step have since landed, together with much more: fused Python-only instructions with per-VM inline caches, `PyCall` direct calls, integers within ±2^46 held in the value word, dicts, sets and instances in native storage with hidden-class layouts, and a Python JIT tier for hot loops on the command line. Over the 36 programs of the benchmark suite Zipp ran at about 1.75× CPython 3.13's time with that JIT when this was written, from about 22× at the start of the work, and five of the programs beat CPython; by v0.0.24 on 14 October it was 1.09×, with fifteen programs faster than CPython. WebAssembly and budgeted embedders stay interpreted."
             },
             {
               "type": "p",
@@ -4978,6 +5147,311 @@
           {
             "label": "Releases",
             "href": "/releases/"
+          }
+        ]
+      },
+      {
+        "slug": "zipp-lite-and-an-application-bridge",
+        "date": "2026-09-29",
+        "title": "ZIPP Lite, and an application bridge for hosts",
+        "summary": "Hosts can answer application-defined synchronous calls through an app bridge, and ZIPP Lite arrives: the JavaScript core without Intl and Temporal, built for size first.",
+        "tags": [
+          "wasm",
+          "size",
+          "embedding"
+        ],
+        "commits": [
+          "13c33194",
+          "065446f2",
+          "76045145",
+          "6b854cdc",
+          "40453bf5",
+          "85885bb6",
+          "51187ea6",
+          "ec0839ce"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "`13c33194` lets a host answer application-defined synchronous calls through an app bridge, merged with dependency updates as the repository's third pull request (#31). `065446f2` adds ZIPP Lite, a JavaScript-only WebAssembly build without `Intl` and `Temporal`, compiled for size rather than speed, and compacts tables every engine shares."
+          },
+          {
+            "type": "p",
+            "text": "The commits after it trim Lite's bytecode, its regex duplication, cold error paths, metering and constructor cloning, and the WebAssembly loader's overhead, each with a measured speed check beside the size it saves (`76045145`, `6b854cdc`, `40453bf5`, `85885bb6`, `51187ea6`, `ec0839ce`)."
+          }
+        ],
+        "related": [
+          {
+            "label": "WebAssembly",
+            "href": "/wasm/"
+          },
+          {
+            "label": "Embedding",
+            "href": "/embedding/"
+          }
+        ]
+      },
+      {
+        "slug": "member-calls-fast-again-and-compact-unicode-tables",
+        "date": "2026-10-09",
+        "title": "Member calls fast again, and compact Unicode tables",
+        "summary": "The native tiers serve the member calls the strict call order split apart, taking 11% off the 13 native rows; Unicode normalization moves to compact tables, and zipp py opens project files lazily.",
+        "tags": [
+          "performance",
+          "size",
+          "python",
+          "wasm"
+        ],
+        "commits": [
+          "739603bc",
+          "5c046753",
+          "d91ae358",
+          "131aa66c",
+          "0fb24b41",
+          "9df8019c",
+          "ba63d8a0",
+          "ee34f2cb",
+          "8d909598",
+          "5253e4e0"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Making specification-order method calls the default in v0.0.15 split a member call into a property read, the arguments and a call, and the native tiers had stopped serving the split form. `739603bc` serves Map, Set, string and `hasOwn.call` member calls through their intrinsic helpers again, `5c046753` caches a Map or Set method read in the native inline cache, and `d91ae358` answers `.length` from the internal slot: the 13 real rows take 10.95% less time, and the headline ten were at 0.982× Node 24 in an ordinary release build. `131aa66c` delay-loads the GPU runtime's system DLLs, so the Windows CLI starts in 6.3 ms instead of 8.9."
+          },
+          {
+            "type": "p",
+            "text": "The size passes went on beside it. `0fb24b41` builds WebAssembly without machine paths and runs `wasm-opt -O1` twice; `9df8019c` replaces the `unicode-normalization` crate's hashed tables with ranked bitmaps, and `ba63d8a0` packs the regex properties of strings into one pool: the four modules came out 1.6% to 4.4% smaller after Brotli. `ee34f2cb` reads a Python project's files only when the program opens them (a script run from this repository's root starts in 62 ms instead of 460), `8d909598` bounds the code cache, and `5253e4e0` leaves a finished program's heap to the process's exit."
+          }
+        ],
+        "related": [
+          {
+            "label": "Benchmarks",
+            "href": "/benchmarks/"
+          },
+          {
+            "label": "WebAssembly",
+            "href": "/wasm/"
+          }
+        ]
+      },
+      {
+        "slug": "the-webassembly-interpreter-profiled-and-v0-0-22",
+        "date": "2026-10-10",
+        "title": "The WebAssembly interpreter profiled, and v0.0.22",
+        "summary": "A first profile of the WebAssembly modules makes four quadratic string workloads linear, Lite stops making every register access a call, and v0.0.22 ships with ZIPP Lite as an asset.",
+        "tags": [
+          "wasm",
+          "size",
+          "performance",
+          "release"
+        ],
+        "commits": [
+          "4e8cb084",
+          "58735a8a",
+          "76420e1f",
+          "13b56e42",
+          "09bf2c18",
+          "4a5dc9ac",
+          "7190396a",
+          "cc074ade",
+          "4a9a9124",
+          "18a8d935"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The twelfth size pass profiled the modules for the first time. The checked profile now keeps a well-formed string's bytes as text (`4e8cb084`), flattens a rope before a RegExp exec (`58735a8a`), counts a compiled RegExp program toward the collection trigger (`76420e1f`) and shares the UTF-16 and UCS-2 regex matchers in every module (`13b56e42`): the JavaScript corpus takes 0.90 of the time, a sticky-regex tokenizer over 190 KB 164 ms instead of 17.8 s, and a loop that built and dropped large RegExps no longer dies of uncollected programs."
+          },
+          {
+            "type": "p",
+            "text": "The thirteenth made a Lite register access one bounds check instead of a call, which had been 38% of an integer loop (`09bf2c18`), so Lite runs its corpus in 0.61 of the time; shares the Python runtime's compiled functions between programs instead of copying them (`4a5dc9ac`); and stops copying the value of a statement nobody reads (`7190396a`). Two update-expression bugs were fixed in every build: `k++` on a `const` local changed the constant before throwing, and `f++` inside `function f` replaced the function (`cc074ade`). [v0.0.22](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.22) was published from `4a9a9124` on 10 October with modules 11% to 15% smaller than v0.0.21's, and ZIPP Lite joined it as a seventh asset the same day (`18a8d935`)."
+          }
+        ],
+        "related": [
+          {
+            "label": "WebAssembly",
+            "href": "/wasm/"
+          },
+          {
+            "label": "Releases",
+            "href": "/releases/"
+          }
+        ]
+      },
+      {
+        "slug": "memory-grown-in-place-and-v0-0-23",
+        "date": "2026-10-12",
+        "title": "Memory grown in place, compiled callbacks, and v0.0.23",
+        "summary": "Memory that grows in place reaches the collector, an appending loop stops rewriting typeof's strings, builtins call compiled functions without the interpreter loop, and v0.0.23 ships with Python at 1.30x CPython.",
+        "tags": [
+          "correctness",
+          "performance",
+          "python",
+          "release"
+        ],
+        "commits": [
+          "d24fe3e8",
+          "dcbfe67d",
+          "20123116",
+          "784e3eb2",
+          "1ba123a5",
+          "54a63349",
+          "649595f8",
+          "8b9b25c5",
+          "621f798b",
+          "60d7e502",
+          "2b217ea4",
+          "407b81cd"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Seven wrong results in v0.0.22 were found and fixed. The largest: memory that grows in place (an array pushed to a megabyte, an object gathering thousands of keys, a filling Map) allocates no new object, so a loop that built and dropped such things ran no collection; a browser engine ended the script at its heap ceiling, and natively 2,000 calls that each built an 80,000-element array held 1.2 GB. `d24fe3e8` reads what the allocator has outstanding and collects on that growth, and the same program peaks at 60 MB. `dcbfe67d` stops `var s = \"number\"; s += x` from rewriting the string `typeof` returns, and `20123116` unwraps a chain of bound functions in a loop instead of by recursion."
+          },
+          {
+            "type": "p",
+            "text": "On speed, `784e3eb2` and `1ba123a5` let builtins enter a compiled callback without the interpreter loop: six million capturing `map` and `forEach` callbacks take 79 ms where they took 232 (Node: 64). `54a63349` steps a generator in `for-of` without its result object, `649595f8` compiles `new` in memory regions and Tier C bodies, and `8b9b25c5` predicts a keyed access's slot from the receiver's shape and the key. Python went from 1.79× to 1.30× CPython 3.13, through small-int arithmetic settled in the dispatch loop (`621f798b`), callee frames pushed from the call site's cache (`60d7e502`) and a raise caught in its own frame (`2b217ea4`). [v0.0.23](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.23) shipped on 12 October."
+          }
+        ],
+        "related": [
+          {
+            "label": "Python",
+            "href": "/python/"
+          },
+          {
+            "label": "Releases",
+            "href": "/releases/"
+          }
+        ]
+      },
+      {
+        "slug": "compiled-loops-for-the-rest-of-javascript",
+        "date": "2026-10-14",
+        "title": "Compiled loops for the rest of JavaScript",
+        "summary": "Loops that build literals, create closures, destructure, spread, pop or hold a for-of compile now, with rest and arguments functions and the Object statics; construction and Object.assign run several times faster.",
+        "tags": [
+          "javascript",
+          "jit",
+          "performance"
+        ],
+        "commits": [
+          "4515054f",
+          "ebfb8db1",
+          "496e23b8",
+          "054f54d4",
+          "175e7299",
+          "85e8bd43",
+          "3a42a658",
+          "1e836768",
+          "9470f615",
+          "8d363095",
+          "e9e314f7"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A compiled loop declined whole when it held one instruction it had no arm for, and fell back to the interpreter. The sixteenth pass gave most of the remaining ones an arm, each through a helper that runs the interpreter's own code for the instruction: literals and `instanceof` and `typeof` tests (`4515054f`), closures (`ebfb8db1`), `pop` (`496e23b8`), destructuring, spread and spread calls (`054f54d4`), key lists and `for-in` (`175e7299`), then `for-of`, a `finally` and array constructors (`85e8bd43`). Functions with a rest parameter or that use `arguments` compile in Tier C (`3a42a658`), and so does code calling `Object.assign`, `String.fromCharCode`, the Promise combinators and the other statics (`1e836768`)."
+          },
+          {
+            "type": "p",
+            "text": "Construction got its own work: a constructor that only stores its arguments builds its object the way a literal is built (`9470f615`), and a compiled loop calls a compiled function without a frame (`8d363095`). Against v0.0.23, two million `new Vec(i, 1)` take 100 ms instead of 760, a million `Object.assign({}, src)` 140 ms instead of 830 (`e9e314f7` copies a plain source directly), and `async-promise-chain`, 1.14× Node at the start of the pass, 0.94×. The 13 native rows take 2.6% less time overall, and the headline ten run at 0.88× Node 24's time with Zipp's median below Node's on every row."
+          }
+        ],
+        "related": [
+          {
+            "label": "JavaScript engine",
+            "href": "/javascript-engine/"
+          },
+          {
+            "label": "Benchmarks",
+            "href": "/benchmarks/"
+          }
+        ]
+      },
+      {
+        "slug": "python-at-1-09x-cpython-and-torch-at-4-2x-pytorch",
+        "date": "2026-10-14",
+        "title": "Python at 1.09× CPython, torch at 4.2× PyTorch",
+        "summary": "Python on the command line runs at 1.09x CPython 3.13 with fifteen programs faster than CPython, and torch training and tensor programs at 4.2x PyTorch's warm time, from 17x.",
+        "tags": [
+          "python",
+          "torch",
+          "performance"
+        ],
+        "commits": [
+          "0c0fb3b5",
+          "8519dc28",
+          "93fac141",
+          "e7153c9f",
+          "a3476e76",
+          "c5374b88",
+          "05704850",
+          "79759baa",
+          "ce8e1494",
+          "832c3756",
+          "4c2c8ed2",
+          "69471503",
+          "10d8465e"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A store-only `__init__` now runs without its frame (`0c0fb3b5`), method lookups and construction sites answer inline for the class they last saw (`8519dc28`), sort keys of one form sort by columns (`93fac141`), a subscript reads a list's, tuple's or dict's record once (`e7153c9f`), `raise` has a compiled helper (`a3476e76`), and loops are planned only where the header dominates the back edge (`c5374b88`). Over the 36 programs Python runs at 1.09× CPython 3.13's time, from 1.31× at v0.0.23; the 30 small programs are level with CPython, and fifteen programs beat it. `05704850` fixed a zero-argument `super()` beside a lambda or inside a comprehension, and `79759baa` won back 5% on every interpreted Python call after a dispatch-loop change had cost it."
+          },
+          {
+            "type": "p",
+            "text": "Torch draws its random numbers natively (`ce8e1494`) and `uniform_` now rounds as PyTorch does (`832c3756`); add, sub, mul, div and the common matrix products are one engine call (`4c2c8ed2`, `69471503`), and powers are computed the way PyTorch's kernel computes them (`10d8465e`). On one thread, warm, eight training and tensor programs take 4.2× PyTorch 2.11's time, where v0.0.23 took 17×, and a program's first run is faster than PyTorch's on four of them."
+          }
+        ],
+        "related": [
+          {
+            "label": "Python",
+            "href": "/python/"
+          }
+        ]
+      },
+      {
+        "slug": "eight-reported-bugs-and-v0-0-24",
+        "date": "2026-10-14",
+        "title": "Eight reported bugs fixed, and v0.0.24",
+        "summary": "The repository's first eight GitHub issues, from typed-array own indices to a derived class's newTarget.prototype, are fixed with tests and answered, and v0.0.24 ships with smaller WebAssembly engines.",
+        "tags": [
+          "correctness",
+          "javascript",
+          "release"
+        ],
+        "commits": [
+          "8ce16ff8",
+          "5980d5a7",
+          "861cda39",
+          "acca1331",
+          "2ba3b5a0",
+          "18643638",
+          "6333c421",
+          "f229dc1c",
+          "35e6d1dc",
+          "ea1a9d8b",
+          "a82ad0bb"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The repository's first eight GitHub issues came from @takahashim, each with a minimal repro and a pointer into the source: a typed array's in-range indices were not own properties (#32, `8ce16ff8`); a function's `prototype` made non-writable stayed writable (#33, `5980d5a7`); `obj.hasOwnProperty(k)` ran the built-in for any receiver, skipping a Proxy's traps (#34, `861cda39`); a class on a function's prototype chain was walked past (#41, `acca1331`); `typeof name` inside `with` read the global (#42, `2ba3b5a0`); a replaced `console` method was never called, and there was no `performance` object (#43 and #44, `6333c421`, `f229dc1c`); and a derived construction read `newTarget.prototype` itself (#45, `18643638`). Each fix was checked against Node 24 with the JIT on and off and under GC stress, and pinned by a test."
+          },
+          {
+            "type": "p",
+            "text": "Differential programs found more: a global redefined with `Object.defineProperty(globalThis, …)` went on being called as the old function by a compiled loop (`ea1a9d8b`), `arguments.length = n` deleted elements, and `toLocaleLowerCase` in Turkish, Azerbaijani and Lithuanian missed the final sigma. The gates caught two regressions of the pass's own before release: a 5% cost on every interpreted Python call, and a compiled-loop optimization lost to the `console.log` change (`35e6d1dc`). [v0.0.24](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.24) was published on 14 October from `a82ad0bb`; its browser modules are 1.0% to 4.0% smaller on the wire than v0.0.23's, the JavaScript-only module 1.13 MB and ZIPP Lite 0.67 MB."
+          }
+        ],
+        "related": [
+          {
+            "label": "Releases",
+            "href": "/releases/"
+          },
+          {
+            "label": "JavaScript engine",
+            "href": "/javascript-engine/"
           }
         ]
       }

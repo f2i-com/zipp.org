@@ -470,6 +470,29 @@ export class Engine {
         }
     }
     /**
+     * Install the object backing `host.callSync(kind, ...args)`: operations
+     * the application defines, answered synchronously while the guest waits
+     * (a Worker host may block on shared memory to serve them from the page).
+     * Its `call(kind, args)` receives the kind without the `app.` prefix and
+     * the arguments as an array of strings; whatever it returns reaches the
+     * guest as JSON, like every other bridge reply, and a throw reaches it as
+     * an opaque failure (return errors as data to pass them on).
+     *
+     * Installing the bridge grants nothing: each operation is granted by
+     * name, `app.<kind>`, through `setSyncHostCapabilities`. Kinds are
+     * lowercase dotted names (`app.fs.read`); the host adapter decides their
+     * arguments, within the same argument-count and byte ceilings as every
+     * synchronous call. Treat kinds and arguments as guest-controlled: never
+     * turn a kind into a property name, a URL or a command.
+     * @param {any} bridge
+     */
+    setAppBridge(bridge) {
+        const ret = wasm.engine_setAppBridge(this.__wbg_ptr, bridge);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
      * Install the object backing `navigator.clipboard.*`. Clipboard authority
      * is intentionally separate from local storage authority.
      * @param {any} bridge
@@ -863,7 +886,7 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_isArray_f223cba83b7d1be6: function() { return handleError(function (arg0) {
+        __wbg_isArray_9f9aa2d4655aeb9c: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
@@ -871,7 +894,7 @@ function __wbg_get_imports() {
             const ret = ArrayBuffer.isView(arg0);
             return ret;
         },
-        __wbg_keys_dcfe5853d73c4bdd: function() { return handleError(function (arg0) {
+        __wbg_keys_6121cd4168d4a1fa: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -891,14 +914,14 @@ function __wbg_get_imports() {
             const ret = new Array();
             return ret;
         },
+        __wbg_new_ab3f08667dfc5c66: function() { return handleError(function (arg0) {
+            const ret = new Float32Array(arg0);
+            return ret;
+        }, arguments); },
         __wbg_new_da52cf8fe3429cb2: function() {
             const ret = new Object();
             return ret;
         },
-        __wbg_new_f33dcd5bec55ea1d: function() { return handleError(function (arg0) {
-            const ret = new Float32Array(arg0);
-            return ret;
-        }, arguments); },
         __wbg_new_from_slice_ddf8b82c4d6af38e: function(arg0, arg1) {
             const ret = new Float32Array(getArrayF32FromWasm0(arg0, arg1));
             return ret;
