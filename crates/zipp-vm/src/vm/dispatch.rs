@@ -1562,14 +1562,19 @@ impl<'p> Vm<'p> {
                             B::Shr => BigOp::Shr,
                             B::Ushr => BigOp::Ushr,
                         };
-                        // Int fast path (the hot `x & 31` shapes); everything else
-                        // takes the full ToNumeric path: BigInt &/|/^/<</>> on two
-                        // BigInts (incl. wrappers/objects whose ToPrimitive yields
-                        // one); `>>>` on BigInts is a TypeError AFTER coercion;
-                        // mixing is a TypeError.
-                        let r = if va.is_int() && vb.is_int() {
-                            let x = va.as_int();
-                            let y = vb.as_int();
+                        // Number fast path (the hot `x & 31` and `(r * n) | 0`
+                        // shapes: two ints, or a finite double whose ToInt32 is
+                        // a truncate and a wrap); everything else takes the
+                        // full ToNumeric path: BigInt &/|/^/<</>> on two BigInts
+                        // (incl. wrappers/objects whose ToPrimitive yields one);
+                        // `>>>` on BigInts is a TypeError AFTER coercion; mixing
+                        // is a TypeError.
+                        let ints = if va.is_int() && vb.is_int() {
+                            Some((va.as_int(), vb.as_int()))
+                        } else {
+                            number_int32(va).zip(number_int32(vb))
+                        };
+                        let r = if let Some((x, y)) = ints {
                             match op {
                                 B::And => Value::int(x & y),
                                 B::Or => Value::int(x | y),
@@ -10928,4 +10933,24 @@ impl<'p> Vm<'p> {
             && matches!(self.heap.get(v.heap_index()), HeapObj::Native(id) if *id == native_id)
             && (self.obj_realm.is_empty() || self.get_function_realm(v) == 0)
     }
+}
+
+/// ToInt32 of a Number value without the general coercion: an int is its
+/// own value, and a finite double below 2^63 in magnitude truncates toward
+/// zero and wraps to 32 bits, which is ToInt32's modulo exactly. `None` for
+/// NaN, the infinities, larger magnitudes and every non-number: those take
+/// the full ToNumeric path.
+#[inline(always)]
+fn number_int32(v: Value) -> Option<i32> {
+    if v.is_int() {
+        return Some(v.as_int());
+    }
+    if v.is_double() {
+        let d = v.as_f64();
+        // NaN fails the comparison.
+        if d.abs() < 9_223_372_036_854_775_808.0 {
+            return Some(d as i64 as i32);
+        }
+    }
+    None
 }
