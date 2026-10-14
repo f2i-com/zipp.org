@@ -2057,6 +2057,13 @@ impl<'a> FnCompiler<'a> {
                 op: UnaryOp::Minus | UnaryOp::Plus | UnaryOp::BitNot,
                 arg,
             } => self.provably_primitive(arg),
+            // Strict equality converts neither side: a boolean, whatever the
+            // operands hold.
+            Expr::Binary {
+                op: BinaryOp::StrictEq | BinaryOp::StrictNotEq,
+                left,
+                right,
+            } => self.arg_transparent_in(left, false) && self.arg_transparent_in(right, false),
             Expr::Binary { op, left, right } => {
                 !matches!(op, BinaryOp::In | BinaryOp::Instanceof)
                     && self.provably_primitive(left)
@@ -2107,6 +2114,12 @@ impl<'a> FnCompiler<'a> {
             // `in` probes (proxy `has`) and `instanceof` (Symbol.hasInstance)
             // run user code on ordinary operands; every other operator only
             // through an object operand's coercion.
+            // `le === 1` runs no user code and cannot throw, whatever `le` is.
+            Expr::Binary {
+                op: BinaryOp::StrictEq | BinaryOp::StrictNotEq,
+                left,
+                right,
+            } => self.arg_transparent_in(left, relaxed) && self.arg_transparent_in(right, relaxed),
             Expr::Binary { op, left, right } => {
                 !matches!(op, BinaryOp::In | BinaryOp::Instanceof)
                     && ((self.provably_primitive(left) && self.provably_primitive(right))
