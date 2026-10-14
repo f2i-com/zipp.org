@@ -192,7 +192,12 @@ pub(crate) fn enter(p: Phase) -> Guard {
     if !enabled() {
         return Guard(0, false);
     }
-    let prev = CURRENT.swap(p as u8, Ordering::Relaxed);
+    // A load and a store, not `swap`: an atomic read-modify-write is a locked
+    // instruction (about 20 cycles), and a reaction job crosses several
+    // guards, so the sampler measured its own tagging on call-heavy code. The
+    // engine thread is the only writer the sampler reads.
+    let prev = CURRENT.load(Ordering::Relaxed);
+    CURRENT.store(p as u8, Ordering::Relaxed);
     Guard(prev, true)
 }
 
