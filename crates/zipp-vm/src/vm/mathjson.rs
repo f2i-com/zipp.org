@@ -985,6 +985,15 @@ impl<'p> Vm<'p> {
         // The snapshot used to be a `Vec`, allocated and freed on EVERY fused
         // `Math.*` -- and four of the thirteen benchmark rows call `Math.imul`
         // once per element in their mixing functions.
+        //
+        // Those calls are nearly always two int32s, whose ToUint32 is their
+        // own bits: the product needs no snapshot and no coercion.
+        if matches!(op, crate::bytecode::MathFn::Imul) && argc >= 2 {
+            let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
+            if a.is_int() && b.is_int() {
+                return Ok(a.as_int().wrapping_mul(b.as_int()) as f64);
+            }
+        }
         self.with_argv(base, arg_base, argc, |vm, args| vm.eval_math_args(op, args))
     }
 
